@@ -31,7 +31,6 @@ type ClaudeStreamHandler struct {
 }
 
 func (p *ClaudeProvider) CreateChatCompletion(request *types.ChatCompletionRequest) (*types.ChatCompletionResponse, *types.OpenAIErrorWithStatusCode) {
-	request.OneOtherArg = p.GetOtherArg()
 	claudeRequest, errWithCode := ConvertFromChatOpenai(request)
 	if errWithCode != nil {
 		return nil, errWithCode
@@ -54,7 +53,6 @@ func (p *ClaudeProvider) CreateChatCompletion(request *types.ChatCompletionReque
 }
 
 func (p *ClaudeProvider) CreateChatCompletionStream(request *types.ChatCompletionRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
-	request.OneOtherArg = p.GetOtherArg()
 	claudeRequest, errWithCode := ConvertFromChatOpenai(request)
 	if errWithCode != nil {
 		return nil, errWithCode
@@ -108,13 +106,8 @@ func (p *ClaudeProvider) getChatRequest(claudeRequest *ClaudeRequest) (*http.Req
 		headers["anthropic-beta"] = "output-128k-2025-02-19"
 	}
 
-	// 创建请求
-	req, err := p.Requester.NewRequest(http.MethodPost, fullRequestURL, p.Requester.WithBody(claudeRequest), p.Requester.WithHeader(headers))
-	if err != nil {
-		return nil, common.ErrorWrapperLocal(err, "new_request_failed", http.StatusInternalServerError)
-	}
-
-	return req, nil
+	// 使用通用的 BuildRequestWithMerge 方法构建请求
+	return p.BuildRequestWithMerge(claudeRequest, fullRequestURL, headers)
 }
 
 func ConvertFromChatOpenai(request *types.ChatCompletionRequest) (*ClaudeRequest, *types.OpenAIErrorWithStatusCode) {
@@ -143,7 +136,7 @@ func ConvertFromChatOpenai(request *types.ChatCompletionRequest) (*ClaudeRequest
 	// 处理 system 字段（支持 cache_control）
 	systemMessage := ""
 	mgsLen := len(request.Messages) - 1
-	isThink := (request.OneOtherArg == "thinking" || request.Reasoning != nil)
+	isThink := (request.Reasoning != nil)
 
 	// 如果请求中已经有 system 字段（如数组格式带 cache_control），直接使用
 	if request.System != nil {
@@ -196,14 +189,10 @@ func ConvertFromChatOpenai(request *types.ChatCompletionRequest) (*ClaudeRequest
 		claudeRequest.ToolChoice = ConvertToolChoice(toolType, toolFunc)
 	}
 
-	if claudeRequest.MaxTokens == 0 {
-		claudeRequest.MaxTokens = config.ClaudeSettingsInstance.GetDefaultMaxTokens(request.Model)
-	}
-
-	// 如果是3-7 默认开启thinking
-	if request.OneOtherArg == "thinking" || request.Reasoning != nil {
+	// 如果请求中包含reasoning参数，开启thinking
+	if request.Reasoning != nil {
 		var opErr *types.OpenAIErrorWithStatusCode
-		claudeRequest.MaxTokens, claudeRequest.Thinking, opErr = getThinking(claudeRequest.MaxTokens, request.Reasoning)
+		claudeRequest.Thinking, claudeRequest.OutputConfig, opErr = getThinking(claudeRequest.MaxTokens, request.Reasoning)
 
 		if opErr != nil {
 			return nil, opErr
@@ -215,43 +204,29 @@ func ConvertFromChatOpenai(request *types.ChatCompletionRequest) (*ClaudeRequest
 	return &claudeRequest, nil
 }
 
-func getThinking(maxTokens int, reasoning *types.ChatReasoning) (newMaxtokens int, thinking *Thinking, err *types.OpenAIErrorWithStatusCode) {
-	newMaxtokens = maxTokens
-	thinking = &Thinking{
-		Type: "enabled",
-	}
+func getThinking(maxTokens int, reasoning *types.ChatReasoning) (thinking *Thinking, outputConfig *OutputConfig, err *types.OpenAIErrorWithStatusCode) {
 
-	if reasoning == nil || (reasoning.MaxTokens == 0 && reasoning.Effort == "") {
-		thinking.BudgetTokens = int(float64(maxTokens) * config.ClaudeSettingsInstance.BudgetTokensPercentage)
-	} else if reasoning.MaxTokens > 0 {
-		if reasoning.MaxTokens < 1024 {
-			err = common.StringErrorWrapper("budget_token must be greater than 1024", "budget_tokens_too_small", http.StatusBadRequest)
-			return
-		}
-
+	// thinking 逻辑
+	if reasoning != nil && reasoning.MaxTokens > 0 {
 		if reasoning.MaxTokens > maxTokens {
 			err = common.StringErrorWrapper(fmt.Sprintf("budget_token cannot be greater than the max_token, max_token: %d, budget_token: %d", maxTokens, reasoning.MaxTokens), "budget_tokens_too_large", http.StatusBadRequest)
 			return
 		}
-		thinking.BudgetTokens = reasoning.MaxTokens
+
+		thinking = &Thinking{
+			Type:         "enabled",
+			BudgetTokens: reasoning.MaxTokens,
+		}
 	} else {
-		switch reasoning.Effort {
-		case "low":
-			thinking.BudgetTokens = int(float64(maxTokens) * 0.2)
-		case "medium":
-			thinking.BudgetTokens = int(float64(maxTokens) * 0.5)
-		default:
-			thinking.BudgetTokens = int(float64(maxTokens) * 0.8)
+		thinking = &Thinking{
+			Type: "adaptive",
 		}
 	}
 
-	// 如果低于1024,则设置为1024
-	if thinking.BudgetTokens < 1024 {
-		thinking.BudgetTokens = 1024
-	}
-
-	if newMaxtokens <= thinking.BudgetTokens {
-		newMaxtokens = 1280
+	if reasoning != nil && reasoning.Effort != "" {
+		outputConfig = &OutputConfig{
+			Effort: reasoning.Effort,
+		}
 	}
 
 	return
