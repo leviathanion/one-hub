@@ -76,7 +76,6 @@ type BaseProvider struct {
 	Context         *gin.Context
 	Channel         *model.Channel
 	Requester       *requester.HTTPRequester
-	OtherArg        string
 	SupportResponse bool
 }
 
@@ -227,14 +226,6 @@ func (p *BaseProvider) GetRequester() *requester.HTTPRequester {
 	return p.Requester
 }
 
-func (p *BaseProvider) GetOtherArg() string {
-	return p.OtherArg
-}
-
-func (p *BaseProvider) SetOtherArg(otherArg string) {
-	p.OtherArg = otherArg
-}
-
 func (p *BaseProvider) GetSupportedResponse() bool {
 	return p.SupportResponse
 }
@@ -246,4 +237,157 @@ func (p *BaseProvider) GetRawBody() ([]byte, bool) {
 		}
 	}
 	return nil, false
+}
+
+// MergeCustomParams 将自定义参数合并到请求体 map 中
+func (p *BaseProvider) MergeCustomParams(requestMap map[string]interface{}, customParams map[string]interface{}) map[string]interface{} {
+	return ApplyCustomParams(requestMap, customParams, false)
+}
+
+// MergeExtraBodyFromRawRequest 从原始请求中合并额外字段（支持 AllowExtraBody）
+// 以用户原始请求为基础，用处理后的字段覆盖，这样额外字段自然保留
+func (p *BaseProvider) MergeExtraBodyFromRawRequest(requestMap map[string]interface{}) map[string]interface{} {
+	rawBody, ok := p.GetRawBody()
+	if !ok || rawBody == nil {
+		return requestMap
+	}
+
+	var rawRequest map[string]interface{}
+	err := json.Unmarshal(rawBody, &rawRequest)
+	if err != nil {
+		return requestMap
+	}
+
+	// 以原始请求为基础，用处理后的请求字段覆盖
+	for key, value := range requestMap {
+		rawRequest[key] = value
+	}
+
+	return rawRequest
+}
+
+// BuildRequestWithMerge 通用的请求体构建方法，支持 CustomParameter 和 AllowExtraBody
+// originalBody: 原始请求体（已转换后的供应商特定格式）
+// fullRequestURL: 完整的请求 URL
+// headers: 请求头
+// 返回构建好的 HTTP 请求
+func (p *BaseProvider) BuildRequestWithMerge(originalBody interface{}, fullRequestURL string, headers map[string]string) (*http.Request, *types.OpenAIErrorWithStatusCode) {
+	// 处理额外参数
+	customParams, err := p.CustomParameterHandler()
+	if err != nil {
+		return nil, common.ErrorWrapper(err, "custom_parameter_error", http.StatusInternalServerError)
+	}
+
+	// 检查是否需要合并额外字段（来自渠道配置的额外参数或用户请求中的 extra_body）
+	needMerge := customParams != nil || p.Channel.AllowExtraBody
+
+	if needMerge {
+		// 将请求体转换为 map，以便添加额外参数
+		var requestMap map[string]interface{}
+		requestBytes, err := json.Marshal(originalBody)
+		if err != nil {
+			return nil, common.ErrorWrapper(err, "marshal_request_failed", http.StatusInternalServerError)
+		}
+
+		err = json.Unmarshal(requestBytes, &requestMap)
+		if err != nil {
+			return nil, common.ErrorWrapper(err, "unmarshal_request_failed", http.StatusInternalServerError)
+		}
+
+		// 如果允许额外字段透传，从原始请求中获取额外字段
+		if p.Channel.AllowExtraBody {
+			requestMap = p.MergeExtraBodyFromRawRequest(requestMap)
+		}
+
+		// 处理自定义额外参数
+		if customParams != nil {
+			requestMap = p.MergeCustomParams(requestMap, customParams)
+		}
+
+		// 使用修改后的请求体创建请求
+		req, err := p.Requester.NewRequest(http.MethodPost, fullRequestURL, p.Requester.WithBody(requestMap), p.Requester.WithHeader(headers))
+		if err != nil {
+			return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
+		}
+
+		return req, nil
+	}
+
+	// 如果没有额外参数，使用原始请求体创建请求
+	req, err := p.Requester.NewRequest(http.MethodPost, fullRequestURL, p.Requester.WithBody(originalBody), p.Requester.WithHeader(headers))
+	if err != nil {
+		return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
+	}
+
+	return req, nil
+}
+
+// ApplyCustomParams 核心自定义参数合并逻辑
+// 参数说明：
+// - requestMap: 请求体 map
+// - customParams: 自定义参数
+// - skipPreAddCheck: 是否跳过 pre_add 检查（true=不检查 pre_add，直接处理）
+func ApplyCustomParams(requestMap map[string]interface{}, customParams map[string]interface{}, skipPreAddCheck bool) map[string]interface{} {
+	if customParams == nil || len(customParams) == 0 {
+		return requestMap
+	}
+
+	// 检查是否需要覆盖已有参数
+	shouldOverwrite := false
+	if overwriteValue, exists := customParams["overwrite"]; exists {
+		if boolValue, ok := overwriteValue.(bool); ok {
+			shouldOverwrite = boolValue
+		}
+	}
+
+	// 如果配置是 pre_add，且需要检查 pre_add，则跳过所有处理
+	if !skipPreAddCheck {
+		if preAdd, exists := customParams["pre_add"]; exists && preAdd == true {
+			return requestMap
+		}
+	}
+
+	// 检查是否按照模型粒度控制
+	perModel := false
+	if perModelValue, exists := customParams["per_model"]; exists {
+		if boolValue, ok := perModelValue.(bool); ok {
+			perModel = boolValue
+		}
+	}
+
+	customParamsModel := customParams
+	if perModel {
+		if modelValue, ok := requestMap["model"].(string); ok {
+			if v, exists := customParams[modelValue]; exists {
+				if modelConfig, ok := v.(map[string]interface{}); ok {
+					customParamsModel = modelConfig
+				} else {
+					customParamsModel = map[string]interface{}{}
+				}
+			} else {
+				customParamsModel = map[string]interface{}{}
+			}
+		}
+	}
+
+	// 添加额外参数
+	for key, value := range customParamsModel {
+		// 忽略 keys "stream", "overwrite", "per_model", "pre_add"
+		if key == "stream" || key == "overwrite" || key == "per_model" || key == "pre_add" {
+			continue
+		}
+
+		// 根据覆盖的设置决定如何添加参数
+		if shouldOverwrite {
+			// 覆盖模式：直接添加/覆盖参数
+			requestMap[key] = value
+		} else {
+			// 非覆盖模式：仅当参数不存在时添加
+			if _, exists := requestMap[key]; !exists {
+				requestMap[key] = value
+			}
+		}
+	}
+
+	return requestMap
 }

@@ -79,10 +79,10 @@ func (p *AliProvider) getAliChatRequest(request *types.ChatCompletionRequest) (*
 	}
 
 	aliRequest := p.convertFromChatOpenai(request)
-	// 创建请求
-	req, err := p.Requester.NewRequest(http.MethodPost, fullRequestURL, p.Requester.WithBody(aliRequest), p.Requester.WithHeader(headers))
-	if err != nil {
-		return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
+	// 使用通用的 BuildRequestWithMerge 处理 AllowExtraBody 和 CustomParameter 参数透传
+	req, errWithCode := p.BuildRequestWithMerge(aliRequest, fullRequestURL, headers)
+	if errWithCode != nil {
+		return nil, errWithCode
 	}
 
 	return req, nil
@@ -165,7 +165,6 @@ func (p *AliProvider) convertFromChatOpenai(request *types.ChatCompletionRequest
 		Parameters: AliParameters{
 			ResultFormat:      "message",
 			IncrementalOutput: request.Stream,
-			EnableThinking:    request.EnableThinking,
 		},
 	}
 
