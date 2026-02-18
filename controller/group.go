@@ -12,7 +12,7 @@ func GetGroups(c *gin.Context) {
 
 	userGroup := model.GlobalUserGroupRatio.GetAll()
 
-	for symbol, _ := range userGroup {
+	for symbol := range userGroup {
 		groupNames = append(groupNames, symbol)
 	}
 

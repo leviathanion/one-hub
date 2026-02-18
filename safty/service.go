@@ -62,7 +62,7 @@ func convertToString(data interface{}) (string, error) {
 // GetAllSafeToolsName 获取所有可用的安全检查器的名称
 func GetAllSafeToolsName() []string {
 	var toolsName = make([]string, 0)
-	for name, _ := range Tools {
+	for name := range Tools {
 		toolsName = append(toolsName, name)
 	}
 	return toolsName
