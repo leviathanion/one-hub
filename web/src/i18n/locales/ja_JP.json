@@ -989,18 +989,6 @@
           "placeholder": "1行ずつ入力してください"
         },
         "save": "設定を保存する"
-      },
-      "claudeSettings": {
-        "budgetTokensPercentage": {
-          "label": "デフォルトの考慮トークンパーセンテージ",
-          "placeholder": "デフォルトの考慮トークンパーセンテージを入力してください"
-        },
-        "defaultMaxTokens": {
-          "label": "MaxTokenのデフォルト数量",
-          "placeholder": "デフォルトのMaxToken数を入力してください。JSON形式で、defaultはデフォルト値を表します。例：{\"default\": 1000, \"claude-3-7-sonnet-latest\": 128000}"
-        },
-        "save": "クロードの設定を保存します",
-        "title": "クロードの設定"
       }
     },
     "otherSettings": {

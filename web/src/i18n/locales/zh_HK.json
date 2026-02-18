@@ -991,18 +991,6 @@
           "placeholder": "請輸入關鍵詞，每行一個"
         },
         "save": "保存設置"
-      },
-      "claudeSettings": {
-        "budgetTokensPercentage": {
-          "label": "預設思考Token百分比",
-          "placeholder": "請輸入預設思考 Token 百分比"
-        },
-        "defaultMaxTokens": {
-          "label": "默認MaxToken數量",
-          "placeholder": "請輸入默認MaxToken數量，以json格式表示，default代表默認值，例如：{\"default\": 1000, \"claude-3-7-sonnet-latest\": 128000}"
-        },
-        "save": "保留Claude設置",
-        "title": "克勞德設置"
       }
     },
     "otherSettings": {

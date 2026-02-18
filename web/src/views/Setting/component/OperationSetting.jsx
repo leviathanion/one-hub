@@ -1,31 +1,31 @@
-import { useState, useEffect, useContext } from 'react';
+import {useContext, useEffect, useState} from 'react';
 import SubCard from 'ui-component/cards/SubCard';
 import {
-  Stack,
-  FormControl,
-  InputLabel,
-  OutlinedInput,
-  Checkbox,
-  Button,
-  FormControlLabel,
-  TextField,
   Alert,
-  Select,
+  Button,
+  Checkbox,
+  Chip,
+  FormControl,
+  FormControlLabel,
+  InputLabel,
   MenuItem,
-  Chip
+  OutlinedInput,
+  Select,
+  Stack,
+  TextField
 } from '@mui/material';
-import { showSuccess, showError, verifyJSON } from 'utils/common';
-import { API } from 'utils/api';
-import { AdapterDayjs } from '@mui/x-date-pickers/AdapterDayjs';
-import { LocalizationProvider } from '@mui/x-date-pickers/LocalizationProvider';
-import { DatePicker } from '@mui/x-date-pickers/DatePicker';
+import {showError, showSuccess, verifyJSON} from 'utils/common';
+import {API} from 'utils/api';
+import {AdapterDayjs} from '@mui/x-date-pickers/AdapterDayjs';
+import {LocalizationProvider} from '@mui/x-date-pickers/LocalizationProvider';
+import {DatePicker} from '@mui/x-date-pickers/DatePicker';
 import ChatLinksDataGrid from './ChatLinksDataGrid';
 import dayjs from 'dayjs';
-import { LoadStatusContext } from 'contexts/StatusContext';
-import { useTranslation } from 'react-i18next';
+import {LoadStatusContext} from 'contexts/StatusContext';
+import {useTranslation} from 'react-i18next';
 import 'dayjs/locale/zh-cn';
-import { DateTimePicker } from '@mui/x-date-pickers';
-import { useSelector } from 'react-redux';
+import {DateTimePicker} from '@mui/x-date-pickers';
+import {useSelector} from 'react-redux';
 
 const OperationSetting = () => {
   const { t } = useTranslation();
@@ -64,8 +64,6 @@ const OperationSetting = () => {
     SafeToolName: '',
     SafeKeyWords: '',
     safeTools: [],
-    ClaudeBudgetTokensPercentage: 0,
-    ClaudeDefaultMaxTokens: '',
     GeminiOpenThink: ''
   });
   const [originInputs, setOriginInputs] = useState({});
@@ -300,19 +298,6 @@ const OperationSetting = () => {
             return;
           }
           break;
-        case 'claude':
-          if (originInputs.ClaudeBudgetTokensPercentage !== inputs.ClaudeBudgetTokensPercentage) {
-            await updateOption('ClaudeBudgetTokensPercentage', inputs.ClaudeBudgetTokensPercentage);
-          }
-          if (originInputs.ClaudeDefaultMaxTokens !== inputs.ClaudeDefaultMaxTokens) {
-            if (!verifyJSON(inputs.ClaudeDefaultMaxTokens)) {
-              showError('默认MaxToken数量不是合法的 JSON 字符串');
-              return;
-            }
-            await updateOption('ClaudeDefaultMaxTokens', inputs.ClaudeDefaultMaxTokens);
-          }
-          break;
-
         case 'gemini':
           if (originInputs.GeminiOpenThink !== inputs.GeminiOpenThink) {
             if (!verifyJSON(inputs.GeminiOpenThink)) {
@@ -918,52 +903,6 @@ const OperationSetting = () => {
               }}
             >
               {t('setting_index.operationSettings.disableChannelKeywordsSettings.save')}
-            </Button>
-          </Stack>
-        </Stack>
-      </SubCard>
-
-      <SubCard title={t('setting_index.operationSettings.claudeSettings.title')}>
-        <Stack spacing={2}>
-          <Stack justifyContent="flex-start" alignItems="flex-start" spacing={2}>
-            <FormControl fullWidth>
-              <InputLabel htmlFor="ClaudeBudgetTokensPercentage">
-                {t('setting_index.operationSettings.claudeSettings.budgetTokensPercentage.label')}
-              </InputLabel>
-              <OutlinedInput
-                id="ClaudeBudgetTokensPercentage"
-                name="ClaudeBudgetTokensPercentage"
-                type="number"
-                value={inputs.ClaudeBudgetTokensPercentage}
-                onChange={handleInputChange}
-                label={t('setting_index.operationSettings.claudeSettings.budgetTokensPercentage.label')}
-                placeholder={t('setting_index.operationSettings.claudeSettings.budgetTokensPercentage.placeholder')}
-                disabled={loading}
-              />
-            </FormControl>
-
-            <FormControl fullWidth>
-              <TextField
-                multiline
-                maxRows={15}
-                id="ClaudeDefaultMaxTokens"
-                label={t('setting_index.operationSettings.claudeSettings.defaultMaxTokens.label')}
-                value={inputs.ClaudeDefaultMaxTokens}
-                name="ClaudeDefaultMaxTokens"
-                onChange={handleTextFieldChange}
-                minRows={5}
-                placeholder={t('setting_index.operationSettings.claudeSettings.defaultMaxTokens.placeholder')}
-                disabled={loading}
-              />
-            </FormControl>
-
-            <Button
-              variant="contained"
-              onClick={() => {
-                submitConfig('claude').then();
-              }}
-            >
-              {t('setting_index.operationSettings.claudeSettings.save')}
             </Button>
           </Stack>
         </Stack>
