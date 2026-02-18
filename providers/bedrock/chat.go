@@ -10,7 +10,6 @@ import (
 )
 
 func (p *BedrockProvider) CreateChatCompletion(request *types.ChatCompletionRequest) (*types.ChatCompletionResponse, *types.OpenAIErrorWithStatusCode) {
-	request.OneOtherArg = p.GetOtherArg()
 	// 发送请求
 	response, errWithCode := p.Send(request)
 	if errWithCode != nil {
@@ -23,7 +22,6 @@ func (p *BedrockProvider) CreateChatCompletion(request *types.ChatCompletionRequ
 }
 
 func (p *BedrockProvider) CreateChatCompletionStream(request *types.ChatCompletionRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
-	request.OneOtherArg = p.GetOtherArg()
 	// 发送请求
 	response, errWithCode := p.Send(request)
 	if errWithCode != nil {
@@ -73,11 +71,13 @@ func (p *BedrockProvider) getChatRequest(request *types.ChatCompletionRequest) (
 		return nil, errWithCode
 	}
 
-	// 创建请求
-	req, err := p.Requester.NewRequest(http.MethodPost, fullRequestURL, p.Requester.WithBody(bedrockRequest), p.Requester.WithHeader(headers))
-	if err != nil {
-		return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
+	// 使用通用的 BuildRequestWithMerge 方法构建请求
+	req, errWithCode := p.BuildRequestWithMerge(bedrockRequest, fullRequestURL, headers)
+	if errWithCode != nil {
+		return nil, errWithCode
 	}
+
+	// Bedrock 需要签名
 	p.Sign(req)
 
 	return req, nil

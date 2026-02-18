@@ -5,7 +5,6 @@ import (
 	"one-api/model"
 	"one-api/relay/relay_util"
 	"one-api/types"
-	"strings"
 	"time"
 
 	providersBase "one-api/providers/base"
@@ -18,7 +17,6 @@ type relayBase struct {
 	provider       providersBase.ProviderInterface
 	originalModel  string
 	modelName      string
-	otherArg       string
 	allowHeartbeat bool
 	heartbeat      *relay_util.Heartbeat
 
@@ -60,23 +58,11 @@ func (r *relayBase) setProvider(modelName string) error {
 	r.provider = provider
 	r.modelName = modelName
 
-	r.provider.SetOtherArg(r.otherArg)
-
 	return nil
 }
 
-func (r *relayBase) getOtherArg() string {
-	return r.otherArg
-}
-
 func (r *relayBase) setOriginalModel(modelName string) {
-	// 使用#进行分隔模型名称， 将#后面的内容作为otherArg
-	parts := strings.Split(modelName, "#")
-	if len(parts) > 1 {
-		r.otherArg = parts[1]
-	}
-
-	r.originalModel = parts[0]
+	r.originalModel = modelName
 }
 
 func (r *relayBase) getContext() *gin.Context {

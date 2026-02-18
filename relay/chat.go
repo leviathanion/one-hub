@@ -50,15 +50,6 @@ func (r *relayChat) setRequest() error {
 		r.chatRequest.StreamOptions = nil
 	}
 
-	r.setOriginalModel(r.chatRequest.Model)
-
-	otherArg := r.getOtherArg()
-
-	if otherArg == "search" {
-		handleSearch(r.c, &r.chatRequest)
-		return nil
-	}
-
 	return nil
 }
 

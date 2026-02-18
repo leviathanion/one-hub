@@ -9,7 +9,6 @@ import (
 	"one-api/common/config"
 	"one-api/common/requester"
 	"one-api/types"
-	"regexp"
 	"strings"
 )
 
@@ -31,7 +30,6 @@ func (p *OpenAIProvider) CreateChatCompletion(request *types.ChatCompletionReque
 			return nil, errWithCode
 		}
 	}
-	otherProcessing(request, p.GetOtherArg())
 
 	req, errWithCode := p.GetRequestTextBody(config.RelayModeChatCompletions, request.Model, request)
 	if errWithCode != nil {
@@ -83,7 +81,7 @@ func (p *OpenAIProvider) CreateChatCompletionStream(request *types.ChatCompletio
 			return nil, errWithCode
 		}
 	}
-	otherProcessing(request, p.GetOtherArg())
+
 	streamOptions := request.StreamOptions
 	// 如果支持流式返回Usage 则需要更改配置：
 	if p.SupportStreamOptions {
@@ -206,24 +204,6 @@ func (h *OpenAIStreamHandler) HandlerChatStream(rawLine *[]byte, dataChan chan s
 		}
 	}
 	dataChan <- string(*rawLine)
-}
-
-func otherProcessing(request *types.ChatCompletionRequest, otherArg string) {
-	matched, _ := regexp.MatchString(`^o[1-9]`, request.Model)
-	if matched || strings.HasPrefix(request.Model, "gpt-5") {
-		if request.MaxTokens > 0 {
-			request.MaxCompletionTokens = request.MaxTokens
-			request.MaxTokens = 0
-		}
-
-		if request.Model != "gpt-5-chat-latest" {
-			request.Temperature = nil
-		}
-
-		if otherArg != "" {
-			request.ReasoningEffort = &otherArg
-		}
-	}
 }
 
 func getChatExtraBilling(request *types.ChatCompletionRequest) map[string]types.ExtraBilling {

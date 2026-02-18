@@ -37,8 +37,6 @@ type ProviderInterface interface {
 	GetChannel() *model.Channel
 	ModelMappingHandler(modelName string) (string, error)
 	GetRequester() *requester.HTTPRequester
-	SetOtherArg(otherArg string)
-	GetOtherArg() string
 	CustomParameterHandler() (map[string]interface{}, error)
 	GetSupportedResponse() bool
 }

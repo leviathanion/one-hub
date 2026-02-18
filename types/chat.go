@@ -211,15 +211,6 @@ type ChatCompletionRequest struct {
 	Verbosity           string                        `json:"verbosity,omitempty"` // 用于控制输出的详细程度
 
 	Reasoning *ChatReasoning `json:"reasoning,omitempty"`
-
-	// 考虑到后续一些模型逐步采用openai api格式扩展参数的方式进行服务提供，所以考虑把一些模型的特有参数放入可选参数
-	EnableThinking *bool `json:"enable_thinking,omitempty"` // qwen3 思考开关
-	ThinkingBudget *int  `json:"thinking_budget,omitempty"` // qwen3 思考长度，只有enable_thinking开启才生效
-	EnableSearch   *bool `json:"enable_search,omitempty"`   // qwen 搜索开关
-
-  Thinking *interface{} `json:"thinking,omitempty"` // thinking 思考开关，兼容火山引擎
-  
-	OneOtherArg string `json:"-"`
 }
 
 type ChatReasoning struct {
