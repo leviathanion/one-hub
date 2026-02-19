@@ -48,6 +48,9 @@ func (r *relayChat) setRequest() error {
 	}
 	r.chatRequest.MaxTokens = 0
 
+	// 归一化：统一 ReasoningEffort 和 Reasoning
+	r.chatRequest.NormalizeReasoning()
+
 	if r.chatRequest.Tools != nil {
 		r.c.Set("skip_only_chat", true)
 	}

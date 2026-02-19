@@ -111,9 +111,10 @@ func (r *OpenAIResponsesRequest) ToChatCompletionRequest() (*ChatCompletionReque
 
 		if r.Reasoning.Effort != nil {
 			chat.Reasoning.Effort = *r.Reasoning.Effort
-			chat.ReasoningEffort = r.Reasoning.Effort
 		}
 	}
+
+	chat.NormalizeReasoning()
 
 	if r.Text != nil && r.Text.Format != nil {
 		chat.ResponseFormat = &ChatCompletionResponseFormat{

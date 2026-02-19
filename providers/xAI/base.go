@@ -79,6 +79,7 @@ func requestHandler(request *types.ChatCompletionRequest) (errWithCode *types.Op
 
 	if strings.HasPrefix(request.Model, "grok-4") {
 		request.ReasoningEffort = nil
+		request.Reasoning = nil
 	}
 
 	return nil

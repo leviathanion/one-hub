@@ -219,6 +219,25 @@ type ChatReasoning struct {
 	Summary   *string `json:"summary,omitempty"`
 }
 
+// NormalizeReasoning 归一化 ReasoningEffort 和 Reasoning 字段，确保两者一致。
+// 优先级：Reasoning > ReasoningEffort
+// - 如果 Reasoning 存在，以 Reasoning 为准，并回填 ReasoningEffort
+// - 如果 Reasoning 不存在但 ReasoningEffort 存在，从 ReasoningEffort 构造 Reasoning
+func (r *ChatCompletionRequest) NormalizeReasoning() {
+	if r.Reasoning != nil {
+		if r.Reasoning.Effort != "" && r.ReasoningEffort == nil {
+			r.ReasoningEffort = &r.Reasoning.Effort
+		}
+		return
+	}
+
+	if r.ReasoningEffort != nil {
+		r.Reasoning = &ChatReasoning{
+			Effort: *r.ReasoningEffort,
+		}
+	}
+}
+
 type WebSearchOptions struct {
 	SearchContextSize string `json:"search_context_size,omitempty"`
 	UserLocation      any    `json:"user_location,omitempty"`
