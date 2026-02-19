@@ -94,14 +94,25 @@ type ResponsesTextFormat struct {
 func (r *OpenAIResponsesRequest) ToChatCompletionRequest() (*ChatCompletionRequest, error) {
 
 	chat := &ChatCompletionRequest{
-		Model:             r.Model,
-		MaxTokens:         r.MaxOutputTokens,
-		ParallelToolCalls: r.ParallelToolCalls,
-		Stream:            r.Stream,
-		Temperature:       r.Temperature,
+		Model:               r.Model,
+		MaxCompletionTokens: r.MaxOutputTokens,
+		ParallelToolCalls:   r.ParallelToolCalls,
+		Stream:              r.Stream,
+		Temperature:         r.Temperature,
 		// ResponseFormat:    r.Text,
 		ToolChoice: r.ToolChoice,
 		TopP:       r.TopP,
+	}
+
+	if r.Reasoning != nil {
+		chat.Reasoning = &ChatReasoning{
+			Summary: r.Reasoning.Summary,
+		}
+
+		if r.Reasoning.Effort != nil {
+			chat.Reasoning.Effort = *r.Reasoning.Effort
+			chat.ReasoningEffort = r.Reasoning.Effort
+		}
 	}
 
 	if r.Text != nil && r.Text.Format != nil {

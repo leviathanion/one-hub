@@ -123,7 +123,7 @@ func (p *XunfeiProvider) convertFromChatOpenai(request *types.ChatCompletionRequ
 	xunfeiRequest.Parameter.Chat.Domain = p.domain
 	xunfeiRequest.Parameter.Chat.Temperature = request.Temperature
 	xunfeiRequest.Parameter.Chat.TopK = request.N
-	xunfeiRequest.Parameter.Chat.MaxTokens = request.MaxTokens
+	xunfeiRequest.Parameter.Chat.MaxTokens = request.MaxCompletionTokens
 	xunfeiRequest.Payload.Message.Text = messages
 	return &xunfeiRequest
 }

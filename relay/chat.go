@@ -42,6 +42,12 @@ func (r *relayChat) setRequest() error {
 		return errors.New("max_tokens is invalid")
 	}
 
+	// 归一化：将 MaxTokens 统一到 MaxCompletionTokens
+	if r.chatRequest.MaxTokens > 0 && r.chatRequest.MaxCompletionTokens == 0 {
+		r.chatRequest.MaxCompletionTokens = r.chatRequest.MaxTokens
+	}
+	r.chatRequest.MaxTokens = 0
+
 	if r.chatRequest.Tools != nil {
 		r.c.Set("skip_only_chat", true)
 	}

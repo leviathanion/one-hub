@@ -32,11 +32,7 @@ func (c *CheckBaseProcess) GetRequest() *types.ChatCompletionRequest {
 		},
 	}
 
-	if strings.Contains(c.ModelName, "o1") {
-		req.MaxCompletionTokens = 1
-	} else {
-		req.MaxTokens = 1
-	}
+	req.MaxCompletionTokens = 1
 	return req
 }
 

@@ -99,8 +99,8 @@ func (p *AzureDatabricksProvider) convertRequest(request *types.ChatCompletionRe
 		Stream:   request.Stream,
 	}
 
-	if request.MaxTokens != 0 {
-		databricksRequest.MaxTokens = request.MaxTokens
+	if request.MaxCompletionTokens != 0 {
+		databricksRequest.MaxTokens = request.MaxCompletionTokens
 	}
 	if request.Temperature != nil {
 		databricksRequest.Temperature = float64(*request.Temperature)

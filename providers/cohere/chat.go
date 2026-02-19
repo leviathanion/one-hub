@@ -94,7 +94,7 @@ func ConvertFromChatOpenai(request *types.ChatCompletionRequest) (*V2ChatRequest
 
 	cohereRequest := V2ChatRequest{
 		Model:            request.Model,
-		MaxTokens:        &request.MaxTokens,
+		MaxTokens:        &request.MaxCompletionTokens,
 		Temperature:      request.Temperature,
 		P:                request.TopP,
 		K:                request.TopK,

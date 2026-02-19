@@ -458,7 +458,7 @@ func (c *ChatCompletionRequest) ToResponsesRequest() *OpenAIResponsesRequest {
 
 	res := &OpenAIResponsesRequest{
 		Model:             c.Model,
-		MaxOutputTokens:   c.MaxTokens,
+		MaxOutputTokens:   c.MaxCompletionTokens,
 		ParallelToolCalls: c.ParallelToolCalls,
 		Stream:            c.Stream,
 		Temperature:       c.Temperature,
@@ -490,10 +490,6 @@ func (c *ChatCompletionRequest) ToResponsesRequest() *OpenAIResponsesRequest {
 		}
 
 		res.Text.Verbosity = c.Verbosity
-	}
-
-	if c.MaxCompletionTokens > 0 && c.MaxTokens == 0 {
-		res.MaxOutputTokens = c.MaxCompletionTokens
 	}
 
 	if c.Reasoning != nil {

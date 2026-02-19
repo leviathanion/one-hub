@@ -112,7 +112,7 @@ func (p *CloudflareAIProvider) convertToChatOpenai(response *ChatRespone, reques
 func (p *CloudflareAIProvider) convertFromChatOpenai(request *types.ChatCompletionRequest) *ChatRequest {
 	chatRequest := &ChatRequest{
 		Stream:    request.Stream,
-		MaxTokens: request.MaxTokens,
+		MaxTokens: request.MaxCompletionTokens,
 		Messages:  make([]Message, 0, len(request.Messages)),
 	}
 

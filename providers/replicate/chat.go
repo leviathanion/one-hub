@@ -62,10 +62,6 @@ func convertFromChatOpenai(request *types.ChatCompletionRequest) *ReplicateReque
 	systemPrompt := ""
 	prompt := ""
 
-	if request.MaxTokens == 0 && request.MaxCompletionTokens > 0 {
-		request.MaxTokens = request.MaxCompletionTokens
-	}
-
 	for _, msg := range request.Messages {
 		if msg.Role == "system" {
 			systemPrompt += msg.StringContent() + "\n"
@@ -89,7 +85,7 @@ func convertFromChatOpenai(request *types.ChatCompletionRequest) *ReplicateReque
 		Stream: request.Stream,
 		Input: ReplicateChatRequest{
 			TopP:             request.TopP,
-			MaxTokens:        request.MaxTokens,
+			MaxTokens:        request.MaxCompletionTokens,
 			MinTokens:        0,
 			Temperature:      request.Temperature,
 			SystemPrompt:     systemPrompt,

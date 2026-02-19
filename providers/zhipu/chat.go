@@ -129,7 +129,7 @@ func (p *ZhipuProvider) convertFromChatOpenai(request *types.ChatCompletionReque
 		Model:      request.Model,
 		Messages:   request.Messages,
 		Stream:     request.Stream,
-		MaxTokens:  request.MaxTokens,
+		MaxTokens:  request.MaxCompletionTokens,
 		ToolChoice: request.ToolChoice,
 	}
 

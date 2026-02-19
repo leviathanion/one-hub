@@ -114,7 +114,7 @@ func ConvertFromChatOpenai(request *types.ChatCompletionRequest) (*ClaudeRequest
 	claudeRequest := ClaudeRequest{
 		Model:         request.Model,
 		Messages:      make([]Message, 0),
-		MaxTokens:     request.MaxTokens,
+		MaxTokens:     request.MaxCompletionTokens,
 		StopSequences: nil,
 		Temperature:   request.Temperature,
 		TopP:          request.TopP,
