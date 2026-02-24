@@ -72,7 +72,7 @@ func (p *BedrockProvider) getChatRequest(request *types.ChatCompletionRequest) (
 	}
 
 	// 使用通用的 BuildRequestWithMerge 方法构建请求
-	req, errWithCode := p.BuildRequestWithMerge(bedrockRequest, fullRequestURL, headers)
+	req, errWithCode := p.BuildRequestWithMerge(bedrockRequest, fullRequestURL, headers, request.Model)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}

@@ -613,6 +613,6 @@ func relayRerankResponseWithErr(c *gin.Context, err *types.OpenAIErrorWithStatus
 
 // mergeCustomParamsForPreMapping applies custom parameter logic similar to OpenAI provider
 // 专门用于 pre-mapping 阶段，跳过 pre_add 检查
-func mergeCustomParamsForPreMapping(requestMap map[string]interface{}, customParams map[string]interface{}) map[string]interface{} {
-	return providersBase.ApplyCustomParams(requestMap, customParams, true)
+func mergeCustomParamsForPreMapping(requestMap map[string]interface{}, customParams map[string]interface{}, modelName string) map[string]interface{} {
+	return providersBase.ApplyCustomParams(requestMap, customParams, modelName, true)
 }

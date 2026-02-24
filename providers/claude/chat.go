@@ -107,7 +107,7 @@ func (p *ClaudeProvider) getChatRequest(claudeRequest *ClaudeRequest) (*http.Req
 	}
 
 	// 使用通用的 BuildRequestWithMerge 方法构建请求
-	return p.BuildRequestWithMerge(claudeRequest, fullRequestURL, headers)
+	return p.BuildRequestWithMerge(claudeRequest, fullRequestURL, headers, claudeRequest.Model)
 }
 
 func ConvertFromChatOpenai(request *types.ChatCompletionRequest) (*ClaudeRequest, *types.OpenAIErrorWithStatusCode) {

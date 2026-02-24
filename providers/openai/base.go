@@ -199,5 +199,5 @@ func (p *OpenAIProvider) GetRequestTextBody(relayMode int, ModelName string, req
 	headers := p.GetRequestHeaders()
 
 	// 使用通用的 BuildRequestWithMerge 方法构建请求
-	return p.BuildRequestWithMerge(request, fullRequestURL, headers)
+	return p.BuildRequestWithMerge(request, fullRequestURL, headers, ModelName)
 }

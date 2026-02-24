@@ -240,8 +240,8 @@ func (p *BaseProvider) GetRawBody() ([]byte, bool) {
 }
 
 // MergeCustomParams 将自定义参数合并到请求体 map 中
-func (p *BaseProvider) MergeCustomParams(requestMap map[string]interface{}, customParams map[string]interface{}) map[string]interface{} {
-	return ApplyCustomParams(requestMap, customParams, false)
+func (p *BaseProvider) MergeCustomParams(requestMap map[string]interface{}, customParams map[string]interface{}, modelName string) map[string]interface{} {
+	return ApplyCustomParams(requestMap, customParams, modelName, false)
 }
 
 // MergeExtraBodyFromRawRequest 从原始请求中合并额外字段（支持 AllowExtraBody）
@@ -271,7 +271,7 @@ func (p *BaseProvider) MergeExtraBodyFromRawRequest(requestMap map[string]interf
 // fullRequestURL: 完整的请求 URL
 // headers: 请求头
 // 返回构建好的 HTTP 请求
-func (p *BaseProvider) BuildRequestWithMerge(originalBody interface{}, fullRequestURL string, headers map[string]string) (*http.Request, *types.OpenAIErrorWithStatusCode) {
+func (p *BaseProvider) BuildRequestWithMerge(originalBody interface{}, fullRequestURL string, headers map[string]string, modelName string) (*http.Request, *types.OpenAIErrorWithStatusCode) {
 	// 处理额外参数
 	customParams, err := p.CustomParameterHandler()
 	if err != nil {
@@ -301,7 +301,7 @@ func (p *BaseProvider) BuildRequestWithMerge(originalBody interface{}, fullReque
 
 		// 处理自定义额外参数
 		if customParams != nil {
-			requestMap = p.MergeCustomParams(requestMap, customParams)
+			requestMap = p.MergeCustomParams(requestMap, customParams, modelName)
 		}
 
 		// 使用修改后的请求体创建请求
@@ -327,7 +327,7 @@ func (p *BaseProvider) BuildRequestWithMerge(originalBody interface{}, fullReque
 // - requestMap: 请求体 map
 // - customParams: 自定义参数
 // - skipPreAddCheck: 是否跳过 pre_add 检查（true=不检查 pre_add，直接处理）
-func ApplyCustomParams(requestMap map[string]interface{}, customParams map[string]interface{}, skipPreAddCheck bool) map[string]interface{} {
+func ApplyCustomParams(requestMap map[string]interface{}, customParams map[string]interface{}, modelName string, skipPreAddCheck bool) map[string]interface{} {
 	if customParams == nil || len(customParams) == 0 {
 		return requestMap
 	}
@@ -357,16 +357,14 @@ func ApplyCustomParams(requestMap map[string]interface{}, customParams map[strin
 
 	customParamsModel := customParams
 	if perModel {
-		if modelValue, ok := requestMap["model"].(string); ok {
-			if v, exists := customParams[modelValue]; exists {
-				if modelConfig, ok := v.(map[string]interface{}); ok {
-					customParamsModel = modelConfig
-				} else {
-					customParamsModel = map[string]interface{}{}
-				}
+		if v, exists := customParams[modelName]; exists {
+			if modelConfig, ok := v.(map[string]interface{}); ok {
+				customParamsModel = modelConfig
 			} else {
 				customParamsModel = map[string]interface{}{}
 			}
+		} else {
+			customParamsModel = map[string]interface{}{}
 		}
 	}
 

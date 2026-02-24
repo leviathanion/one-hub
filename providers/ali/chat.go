@@ -80,7 +80,7 @@ func (p *AliProvider) getAliChatRequest(request *types.ChatCompletionRequest) (*
 
 	aliRequest := p.convertFromChatOpenai(request)
 	// 使用通用的 BuildRequestWithMerge 处理 AllowExtraBody 和 CustomParameter 参数透传
-	req, errWithCode := p.BuildRequestWithMerge(aliRequest, fullRequestURL, headers)
+	req, errWithCode := p.BuildRequestWithMerge(aliRequest, fullRequestURL, headers, request.Model)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}

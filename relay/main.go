@@ -207,7 +207,7 @@ func applyPreMappingBeforeRequest(c *gin.Context) {
 	}
 
 	// Apply custom parameter merging
-	modifiedRequestMap := mergeCustomParamsForPreMapping(requestMap, customParams)
+	modifiedRequestMap := mergeCustomParamsForPreMapping(requestMap, customParams, requestBody.Model)
 
 	// Convert back to JSON - if successful, use modified body; otherwise use original
 	if modifiedBodyBytes, err := json.Marshal(modifiedRequestMap); err == nil {
