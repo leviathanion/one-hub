@@ -261,7 +261,7 @@ const (
 	ChannelTypeCustom = 8
 	// ChannelTypeAILS           = 9
 	// ChannelTypeAIProxy        = 10
-	ChannelTypePaLM = 11
+	// ChannelTypePaLM = 11
 	// ChannelTypeAPI2GPT        = 12
 	// ChannelTypeAIGC2D         = 13
 	ChannelTypeAnthropic  = 14

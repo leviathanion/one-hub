@@ -30,7 +30,6 @@ import (
 	"one-api/providers/ollama"
 	"one-api/providers/openai"
 	"one-api/providers/openrouter"
-	"one-api/providers/palm"
 	"one-api/providers/recraftAI"
 	"one-api/providers/replicate"
 	"one-api/providers/siliconflow"
@@ -62,7 +61,7 @@ func init() {
 		config.ChannelTypeTencent:         tencent.TencentProviderFactory{},
 		config.ChannelTypeBaidu:           baidu.BaiduProviderFactory{},
 		config.ChannelTypeAnthropic:       claude.ClaudeProviderFactory{},
-		config.ChannelTypePaLM:            palm.PalmProviderFactory{},
+		// config.ChannelTypePaLM:            palm.PalmProviderFactory{},
 		config.ChannelTypeZhipu:           zhipu.ZhipuProviderFactory{},
 		config.ChannelTypeXunfei:          xunfei.XunfeiProviderFactory{},
 		config.ChannelTypeAzureSpeech:     azurespeech.AzureSpeechProviderFactory{},
