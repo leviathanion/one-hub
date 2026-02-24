@@ -370,6 +370,17 @@ func ApplyCustomParams(requestMap map[string]interface{}, customParams map[strin
 		}
 	}
 
+	// 处理参数删除
+	if removeParams, exists := customParamsModel["remove_params"]; exists {
+		if paramsList, ok := removeParams.([]interface{}); ok {
+			for _, param := range paramsList {
+				if paramName, ok := param.(string); ok {
+					removeNestedParam(requestMap, paramName)
+				}
+			}
+		}
+	}
+
 	// 添加额外参数
 	for key, value := range customParamsModel {
 		// 忽略 keys "stream", "overwrite", "per_model", "pre_add"
@@ -382,12 +393,78 @@ func ApplyCustomParams(requestMap map[string]interface{}, customParams map[strin
 			// 覆盖模式：直接添加/覆盖参数
 			requestMap[key] = value
 		} else {
-			// 非覆盖模式：仅当参数不存在时添加
-			if _, exists := requestMap[key]; !exists {
+			// 非覆盖模式：进行深度合并
+			if existingValue, exists := requestMap[key]; exists {
+				// 如果都是map类型，进行深度合并
+				if existingMap, ok := existingValue.(map[string]interface{}); ok {
+					if newMap, ok := value.(map[string]interface{}); ok {
+						requestMap[key] = DeepMergeMap(existingMap, newMap)
+						continue
+					}
+				}
+				// 如果不是map类型或类型不匹配，保持原值（不覆盖）
+			} else {
+				// 参数不存在时直接添加
 				requestMap[key] = value
 			}
 		}
 	}
 
 	return requestMap
+}
+
+// removeNestedParam removes a parameter from the map, supporting nested paths like "generationConfig.thinkingConfig"
+func removeNestedParam(requestMap map[string]interface{}, paramPath string) {
+	// 使用 "." 分割路径
+	parts := strings.Split(paramPath, ".")
+
+	// 如果只有一层,直接删除
+	if len(parts) == 1 {
+		delete(requestMap, paramPath)
+		return
+	}
+
+	// 处理嵌套路径
+	current := requestMap
+	for i := 0; i < len(parts)-1; i++ {
+		if next, ok := current[parts[i]].(map[string]interface{}); ok {
+			current = next
+		} else {
+			// 如果中间路径不存在或不是 map,则无法继续
+			return
+		}
+	}
+
+	// 删除最后一级的键
+	delete(current, parts[len(parts)-1])
+}
+
+// DeepMergeMap 深度合并两个map
+func DeepMergeMap(existing map[string]interface{}, new map[string]interface{}) map[string]interface{} {
+	result := make(map[string]interface{})
+
+	// 先复制现有的所有键值
+	for k, v := range existing {
+		result[k] = v
+	}
+
+	// 然后合并新的键值
+	for k, newValue := range new {
+		if existingValue, exists := result[k]; exists {
+			// 如果都是map类型，递归深度合并
+			if existingMap, ok := existingValue.(map[string]interface{}); ok {
+				if newMap, ok := newValue.(map[string]interface{}); ok {
+					result[k] = DeepMergeMap(existingMap, newMap)
+					continue
+				}
+			}
+			// 如果不是map类型，新值覆盖旧值
+			result[k] = newValue
+		} else {
+			// 键不存在，直接添加
+			result[k] = newValue
+		}
+	}
+
+	return result
 }
