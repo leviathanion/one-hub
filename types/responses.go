@@ -74,6 +74,7 @@ type OpenAIResponsesRequest struct {
 	TopLogProbs        any              `json:"top_logprobs,omitempty"` // The number of top log probabilities to return for each token in the response.
 	TopP               *float64         `json:"top_p,omitempty"`
 	Truncation         string           `json:"truncation,omitempty"`
+	ContextManagement  any              `json:"context_management,omitempty"`
 
 	ConvertChat bool `json:"-"`
 }
