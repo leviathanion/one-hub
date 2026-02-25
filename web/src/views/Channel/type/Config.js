@@ -564,6 +564,15 @@ const typeConfig = {
     inputLabel: {
       provider_models_list: '从OR获取模型列表'
     }
+  },
+  101: {
+    inputLabel: {
+      other: ''
+    },
+    prompt: {
+      key: '请输入完整的 OAuth2 凭证 JSON，或点击下方"OAuth 授权"按钮自动获取',
+      other: ''
+    }
   }
 };
 

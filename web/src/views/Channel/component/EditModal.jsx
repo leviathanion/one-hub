@@ -9,6 +9,7 @@ import {
   DialogTitle,
   DialogContent,
   DialogActions,
+  Alert,
   TextField,
   Button,
   Divider,
@@ -90,6 +91,11 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
   const [modelSelectorOpen, setModelSelectorOpen] = useState(false);
   const [tempFormikValues, setTempFormikValues] = useState(null);
   const [tempSetFieldValue, setTempSetFieldValue] = useState(null);
+  const [codexOAuthVisible, setCodexOAuthVisible] = useState(false);
+  const [codexAuthURL, setCodexAuthURL] = useState('');
+  const [codexSessionId, setCodexSessionId] = useState('');
+  const [codexAuthCode, setCodexAuthCode] = useState('');
+  const [codexSubmitting, setCodexSubmitting] = useState(false);
 
   const initChannel = (typeValue) => {
     if (typeConfig[typeValue]?.inputLabel) {
@@ -105,6 +111,79 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
     }
 
     return typeConfig[typeValue]?.input;
+  };
+
+  const handleCodexOAuth = async (proxy) => {
+    const trimmedProxy = proxy ? proxy.trim() : '';
+
+    try {
+      setCodexSubmitting(true);
+      const res = await API.post('/api/codex/oauth/start', {
+        channel_id: channelId || 0,
+        proxy: trimmedProxy
+      });
+
+      if (!res.data.success) {
+        showError(res.data.message || 'Failed to get authorization link');
+        setCodexSubmitting(false);
+        return;
+      }
+
+      const authURL = res.data.data.auth_url;
+      const sessionId = res.data.data.session_id;
+
+      setCodexAuthURL(authURL);
+      setCodexSessionId(sessionId);
+      setCodexOAuthVisible(true);
+      setCodexSubmitting(false);
+
+      window.open(authURL, '_blank');
+    } catch (error) {
+      showError('Failed to get authorization link: ' + (error.message || error));
+      setCodexSubmitting(false);
+    }
+  };
+
+  const handleCodexSubmitCode = async (setFieldValue) => {
+    if (!codexAuthCode || codexAuthCode.trim() === '') {
+      showError('Please enter the authorization code or callback URL');
+      return;
+    }
+
+    try {
+      setCodexSubmitting(true);
+      const res = await API.post('/api/codex/oauth/exchange-code', {
+        session_id: codexSessionId,
+        callback_url: codexAuthCode.trim()
+      });
+
+      if (!res.data.success) {
+        showError(res.data.message || 'Failed to exchange authorization code');
+        setCodexSubmitting(false);
+        return;
+      }
+
+      const credentials = res.data.data.credentials;
+      setFieldValue('key', credentials);
+      showSuccess('OAuth successful. Credentials have been filled in.');
+
+      setCodexOAuthVisible(false);
+      setCodexAuthURL('');
+      setCodexSessionId('');
+      setCodexAuthCode('');
+      setCodexSubmitting(false);
+    } catch (error) {
+      showError('Failed to exchange authorization code: ' + (error.message || error));
+      setCodexSubmitting(false);
+    }
+  };
+
+  const handleCodexCancelOAuth = () => {
+    setCodexOAuthVisible(false);
+    setCodexAuthURL('');
+    setCodexSessionId('');
+    setCodexAuthCode('');
+    setCodexSubmitting(false);
   };
 
   const handleTypeChange = (setFieldValue, typeValue, values) => {
@@ -821,6 +900,96 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                     </FormHelperText>
                   )}
                 </FormControl>
+
+                {values.type === 101 && !batchAdd && (
+                  <Box sx={{ mt: 2, mb: 2 }}>
+                    <Button
+                      variant="outlined"
+                      color="primary"
+                      fullWidth
+                      disabled={codexSubmitting}
+                      onClick={() => handleCodexOAuth(values.proxy)}
+                      startIcon={codexSubmitting ? null : <Icon icon="simple-icons:openai" />}
+                    >
+                      {codexSubmitting ? 'Getting authorization link...' : 'OAuth Authorization'}
+                    </Button>
+                    <Alert severity="info" sx={{ mt: 1 }}>
+                      After authorization, copy the full callback URL and paste it below.
+                    </Alert>
+
+                    <Dialog open={codexOAuthVisible} onClose={handleCodexCancelOAuth} maxWidth="md" fullWidth>
+                      <DialogTitle>Codex OAuth</DialogTitle>
+                      <DialogContent>
+                        <Box sx={{ mb: 2 }}>
+                          <Alert severity="info" sx={{ mb: 2 }}>
+                            <Typography variant="body2" component="div">
+                              <strong>Steps:</strong>
+                              <ol style={{ margin: '8px 0', paddingLeft: '20px' }}>
+                                <li>Open the authorization page.</li>
+                                <li>Sign in to OpenAI and approve access.</li>
+                                <li>Copy the full callback URL from the browser.</li>
+                                <li>Paste the URL below and submit.</li>
+                              </ol>
+                            </Typography>
+                          </Alert>
+
+                          <Box sx={{ mb: 2, display: 'flex', gap: 1 }}>
+                            <Button
+                              variant="contained"
+                              color="primary"
+                              fullWidth
+                              onClick={() => window.open(codexAuthURL, '_blank')}
+                              startIcon={<Icon icon="mdi:open-in-new" />}
+                            >
+                              Open Authorization Page
+                            </Button>
+                            <Button
+                              variant="outlined"
+                              color="secondary"
+                              onClick={() => {
+                                copy(codexAuthURL)
+                                  .then(() => {
+                                    showSuccess('Authorization link copied to clipboard');
+                                  })
+                                  .catch(() => {
+                                    showError('Copy failed, please copy manually');
+                                  });
+                              }}
+                              startIcon={<Icon icon="mdi:content-copy" />}
+                              sx={{ minWidth: '120px' }}
+                            >
+                              Copy Link
+                            </Button>
+                          </Box>
+
+                          <TextField
+                            fullWidth
+                            label="Callback URL or Authorization Code"
+                            placeholder="Paste the full callback URL here"
+                            value={codexAuthCode}
+                            onChange={(e) => setCodexAuthCode(e.target.value)}
+                            multiline
+                            rows={3}
+                            variant="outlined"
+                          />
+                        </Box>
+                      </DialogContent>
+                      <DialogActions>
+                        <Button onClick={handleCodexCancelOAuth} disabled={codexSubmitting}>
+                          Cancel
+                        </Button>
+                        <Button
+                          onClick={() => handleCodexSubmitCode(setFieldValue)}
+                          variant="contained"
+                          color="primary"
+                          disabled={codexSubmitting || !codexAuthCode}
+                        >
+                          {codexSubmitting ? 'Submitting...' : 'Submit'}
+                        </Button>
+                      </DialogActions>
+                    </Dialog>
+                  </Box>
+                )}
 
                 {inputPrompt.model_mapping && (
                   <FormControl

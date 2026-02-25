@@ -14,6 +14,7 @@ import (
 	"one-api/providers/bedrock"
 	"one-api/providers/claude"
 	"one-api/providers/cloudflareAI"
+	"one-api/providers/codex"
 	"one-api/providers/cohere"
 	"one-api/providers/coze"
 	"one-api/providers/deepseek"
@@ -55,12 +56,12 @@ var providerFactories = make(map[int]ProviderFactory)
 // 在程序启动时，添加所有的供应商工厂
 func init() {
 	providerFactories = map[int]ProviderFactory{
-		config.ChannelTypeOpenAI:          openai.OpenAIProviderFactory{},
-		config.ChannelTypeAzure:           azure.AzureProviderFactory{},
-		config.ChannelTypeAli:             ali.AliProviderFactory{},
-		config.ChannelTypeTencent:         tencent.TencentProviderFactory{},
-		config.ChannelTypeBaidu:           baidu.BaiduProviderFactory{},
-		config.ChannelTypeAnthropic:       claude.ClaudeProviderFactory{},
+		config.ChannelTypeOpenAI:    openai.OpenAIProviderFactory{},
+		config.ChannelTypeAzure:     azure.AzureProviderFactory{},
+		config.ChannelTypeAli:       ali.AliProviderFactory{},
+		config.ChannelTypeTencent:   tencent.TencentProviderFactory{},
+		config.ChannelTypeBaidu:     baidu.BaiduProviderFactory{},
+		config.ChannelTypeAnthropic: claude.ClaudeProviderFactory{},
 		// config.ChannelTypePaLM:            palm.PalmProviderFactory{},
 		config.ChannelTypeZhipu:           zhipu.ZhipuProviderFactory{},
 		config.ChannelTypeXunfei:          xunfei.XunfeiProviderFactory{},
@@ -74,6 +75,7 @@ func init() {
 		config.ChannelTypeBedrock:         bedrock.BedrockProviderFactory{},
 		config.ChannelTypeMidjourney:      midjourney.MidjourneyProviderFactory{},
 		config.ChannelTypeCloudflareAI:    cloudflareAI.CloudflareAIProviderFactory{},
+		config.ChannelTypeCodex:           codex.CodexProviderFactory{},
 		config.ChannelTypeCohere:          cohere.CohereProviderFactory{},
 		config.ChannelTypeStabilityAI:     stabilityAI.StabilityAIProviderFactory{},
 		config.ChannelTypeCoze:            coze.CozeProviderFactory{},

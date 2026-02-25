@@ -59,7 +59,7 @@ func (r *relayChat) setRequest() error {
 		r.chatRequest.StreamOptions = nil
 	}
 
-  r.setOriginalModel(r.chatRequest.Model)
+	r.setOriginalModel(r.chatRequest.Model)
 
 	return nil
 }

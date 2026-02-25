@@ -271,6 +271,13 @@ export const CHANNEL_OPTIONS = {
     color: 'orange',
     url: 'https://x.ai'
   },
+  101: {
+    key: 101,
+    text: 'Codex',
+    value: 101,
+    color: 'primary',
+    url: 'https://chatgpt.com/'
+  },
   8: {
     key: 8,
     text: '自定义渠道',
