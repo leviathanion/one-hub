@@ -7,6 +7,7 @@ import (
 
 	"one-api/common"
 	"one-api/common/requester"
+	"one-api/providers/openai"
 	"one-api/types"
 )
 
@@ -82,6 +83,37 @@ func (p *CodexProvider) CreateResponsesStream(request *types.OpenAIResponsesRequ
 	// Create stream handler.
 	handler := &CodexResponsesStreamHandler{
 		Usage: p.Usage,
+	}
+
+	// Convert Responses SSE to ChatCompletion stream when requested.
+	if request.ConvertChat {
+		chatHandler := openai.OpenAIResponsesStreamHandler{
+			Usage:  p.Usage,
+			Prefix: "data: ",
+			Model:  request.Model,
+		}
+
+		bridgeHandler := func(rawLine *[]byte, dataChan chan string, errChan chan error) {
+			if rawLine == nil || len(*rawLine) == 0 {
+				return
+			}
+
+			rawStr := strings.TrimSpace(string(*rawLine))
+			if !strings.HasPrefix(rawStr, "data:") {
+				return
+			}
+
+			// Normalize "data:{...}" and "data: {...}" to the expected "data: {...}".
+			dataLine := strings.TrimSpace(strings.TrimPrefix(rawStr, "data:"))
+			if dataLine == "" || dataLine == "[DONE]" {
+				return
+			}
+
+			normalized := []byte("data: " + dataLine)
+			chatHandler.HandlerChatStream(&normalized, dataChan, errChan)
+		}
+
+		return requester.RequestStream(p.Requester, resp, bridgeHandler)
 	}
 
 	// Use RequestNoTrimStream to preserve event lines.
@@ -341,8 +373,12 @@ func extractJSONFromSSE(sseData string) string {
 	lines := strings.Split(sseData, "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "data: ") {
-			return strings.TrimPrefix(line, "data: ")
+		if strings.HasPrefix(line, "data:") {
+			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if payload == "" || payload == "[DONE]" {
+				continue
+			}
+			return payload
 		}
 	}
 	return ""
@@ -392,7 +428,7 @@ func (h *CodexResponsesStreamHandler) HandlerResponsesStream(rawLine *[]byte, da
 	}
 
 	// Buffer non-data lines when inside an event.
-	if !strings.HasPrefix(rawStr, "data: ") {
+	if !strings.HasPrefix(rawStr, "data:") {
 		if h.eventBuffer.Len() > 0 {
 			h.eventBuffer.WriteString(rawStr)
 			h.eventBuffer.WriteString("\n")
@@ -404,7 +440,7 @@ func (h *CodexResponsesStreamHandler) HandlerResponsesStream(rawLine *[]byte, da
 	}
 
 	// Handle data line.
-	dataLine := strings.TrimPrefix(rawStr, "data: ")
+	dataLine := strings.TrimPrefix(rawStr, "data:")
 	dataLine = strings.TrimSpace(dataLine)
 
 	// Skip [DONE].
