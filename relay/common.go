@@ -328,7 +328,15 @@ func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface
 			case err := <-errChan:
 				if !errors.Is(err, io.EOF) {
 					// 处理错误情况
-					errMsg := "data: " + err.Error() + "\n\n"
+					errPayload := map[string]any{
+						"error": map[string]any{
+							"message": err.Error(),
+							"type":    "stream_error",
+							"code":    "stream_error",
+						},
+					}
+					errJSON, _ := json.Marshal(errPayload)
+					errMsg := "data: " + string(errJSON) + "\n\n"
 					select {
 					case <-c.Request.Context().Done():
 						// 客户端已断开，不执行任何操作，直接跳过
@@ -414,12 +422,19 @@ func responseGeneralStreamClient(c *gin.Context, stream requester.StreamReaderIn
 			case err := <-errChan:
 				if !errors.Is(err, io.EOF) {
 					// 处理错误情况
+					errPayload := map[string]any{
+						"type":    "error",
+						"code":    "stream_error",
+						"message": err.Error(),
+					}
+					errJSON, _ := json.Marshal(errPayload)
+					errEvent := "event: error\ndata: " + string(errJSON) + "\n\n"
 					select {
 					case <-c.Request.Context().Done():
 						// 客户端已断开，不执行任何操作，直接跳过
 					default:
 						// 客户端正常，发送错误信息
-						fmt.Fprint(c.Writer, err.Error())
+						fmt.Fprint(c.Writer, errEvent)
 						c.Writer.Flush()
 					}
 
