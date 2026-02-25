@@ -131,9 +131,141 @@ func (p *CodexProvider) adaptCodexCLI(request *types.OpenAIResponsesRequest) {
 		request.TopP = nil
 		request.MaxOutputTokens = 0
 
+		// Codex backend rejects system/developer roles in input messages.
+		mergeSystemInputMessagesForCodex(request)
+
 		// Set default Codex CLI instructions.
 		request.Instructions = CodexCLIInstructions
 	}
+}
+
+func mergeSystemInputMessagesForCodex(request *types.OpenAIResponsesRequest) {
+	inputs, err := request.ParseInput()
+	if err != nil || len(inputs) == 0 {
+		return
+	}
+
+	merged := make([]types.InputResponses, 0, len(inputs))
+	pendingSystemText := make([]string, 0, 2)
+
+	for _, input := range inputs {
+		if isSystemInputMessage(input) {
+			systemText := strings.TrimSpace(extractInputMessageText(input))
+			if systemText != "" {
+				pendingSystemText = append(pendingSystemText, systemText)
+			}
+			continue
+		}
+
+		if len(pendingSystemText) > 0 && isMergeableInputMessage(input) {
+			input = prependSystemTextToInputMessage(input, strings.Join(pendingSystemText, "\n\n"))
+			pendingSystemText = pendingSystemText[:0]
+		}
+
+		merged = append(merged, input)
+	}
+
+	// If no following message exists, keep system content as a user message.
+	if len(pendingSystemText) > 0 {
+		merged = append(merged, types.InputResponses{
+			Type: types.InputTypeMessage,
+			Role: types.ChatMessageRoleUser,
+			Content: []types.ContentResponses{
+				{
+					Type: types.ContentTypeInputText,
+					Text: strings.Join(pendingSystemText, "\n\n"),
+				},
+			},
+		})
+	}
+
+	request.Input = merged
+}
+
+func isSystemInputMessage(input types.InputResponses) bool {
+	if input.Type != "" && input.Type != types.InputTypeMessage {
+		return false
+	}
+
+	switch strings.ToLower(strings.TrimSpace(input.Role)) {
+	case types.ChatMessageRoleSystem, types.ChatMessageRoleDeveloper:
+		return true
+	default:
+		return false
+	}
+}
+
+func isMergeableInputMessage(input types.InputResponses) bool {
+	if input.Type != "" && input.Type != types.InputTypeMessage {
+		return false
+	}
+
+	return strings.ToLower(strings.TrimSpace(input.Role)) == types.ChatMessageRoleUser
+}
+
+func extractInputMessageText(input types.InputResponses) string {
+	if input.Content == nil {
+		return ""
+	}
+	if content, ok := input.Content.(string); ok {
+		return content
+	}
+
+	contentList, err := input.ParseContent()
+	if err != nil || len(contentList) == 0 {
+		return ""
+	}
+
+	textParts := make([]string, 0, len(contentList))
+	for _, content := range contentList {
+		if content.Type == types.ContentTypeInputText || content.Type == types.ContentTypeOutputText || content.Type == "" {
+			if strings.TrimSpace(content.Text) != "" {
+				textParts = append(textParts, content.Text)
+			}
+		}
+	}
+
+	return strings.Join(textParts, "\n")
+}
+
+func prependSystemTextToInputMessage(input types.InputResponses, systemText string) types.InputResponses {
+	systemText = strings.TrimSpace(systemText)
+	if systemText == "" {
+		return input
+	}
+
+	if content, ok := input.Content.(string); ok {
+		if strings.TrimSpace(content) == "" {
+			input.Content = systemText
+		} else {
+			input.Content = systemText + "\n\n" + content
+		}
+		return input
+	}
+
+	contentList, err := input.ParseContent()
+	if err != nil || len(contentList) == 0 {
+		input.Content = systemText
+		return input
+	}
+
+	if contentList[0].Type == types.ContentTypeInputText || contentList[0].Type == types.ContentTypeOutputText || contentList[0].Type == "" {
+		if strings.TrimSpace(contentList[0].Text) == "" {
+			contentList[0].Text = systemText
+		} else {
+			contentList[0].Text = systemText + "\n\n" + contentList[0].Text
+		}
+	} else {
+		contentList = append([]types.ContentResponses{
+			{
+				Type: types.ContentTypeInputText,
+				Text: systemText,
+			},
+		}, contentList...)
+	}
+
+	input.Content = contentList
+	return input
 }
 
 // collectResponsesStreamResponse aggregates stream to a response.
