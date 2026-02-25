@@ -3,6 +3,7 @@ package openai
 import (
 	"bytes"
 	"encoding/json"
+	"net/http"
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/requester"
@@ -19,6 +20,28 @@ type OpenAIResponsesStreamHandler struct {
 
 	searchType string
 	toolIndex  int
+}
+
+func (p *OpenAIProvider) buildResponsesOperationRequest(pathSuffix string, modelName string, request any) (*http.Request, *types.OpenAIErrorWithStatusCode) {
+	basePath, errWithCode := p.GetSupportedAPIUri(config.RelayModeResponses)
+	if errWithCode != nil {
+		return nil, errWithCode
+	}
+
+	fullPath := joinURLPath(basePath, pathSuffix)
+	fullRequestURL := p.GetFullRequestURL(fullPath, modelName)
+	headers := p.GetRequestHeaders()
+
+	return p.BuildRequestWithMerge(request, fullRequestURL, headers, modelName)
+}
+
+func joinURLPath(basePath string, suffix string) string {
+	basePath = strings.TrimRight(basePath, "/")
+	suffix = strings.TrimLeft(suffix, "/")
+	if suffix == "" {
+		return basePath
+	}
+	return basePath + "/" + suffix
 }
 
 func (p *OpenAIProvider) CreateResponses(request *types.OpenAIResponsesRequest) (openaiResponse *types.OpenAIResponsesResponses, errWithCode *types.OpenAIErrorWithStatusCode) {
@@ -77,6 +100,35 @@ func (p *OpenAIProvider) CreateResponsesStream(request *types.OpenAIResponsesReq
 	}
 
 	return requester.RequestNoTrimStream(p.Requester, resp, chatHandler.HandlerResponsesStream)
+}
+
+func (p *OpenAIProvider) CompactResponses(request *types.OpenAIResponsesRequest) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
+	req, errWithCode := p.buildResponsesOperationRequest("compact", request.Model, request)
+	if errWithCode != nil {
+		return nil, errWithCode
+	}
+	defer req.Body.Close()
+
+	response := &types.OpenAIResponsesResponses{}
+	_, errWithCode = p.Requester.SendRequest(req, response, false)
+	if errWithCode != nil {
+		return nil, errWithCode
+	}
+
+	if response.Usage == nil || response.Usage.OutputTokens == 0 {
+		response.Usage = &types.ResponsesUsage{
+			InputTokens:  p.Usage.PromptTokens,
+			OutputTokens: 0,
+			TotalTokens:  0,
+		}
+		response.Usage.OutputTokens = common.CountTokenText(response.GetContent(), request.Model)
+		response.Usage.TotalTokens = response.Usage.InputTokens + response.Usage.OutputTokens
+	}
+
+	*p.Usage = *response.Usage.ToOpenAIUsage()
+	getResponsesExtraBilling(response, p.Usage)
+
+	return response, nil
 }
 
 func (h *OpenAIResponsesStreamHandler) HandlerResponsesStream(rawLine *[]byte, dataChan chan string, errChan chan error) {

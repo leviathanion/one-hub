@@ -88,6 +88,10 @@ func (p *CodexProvider) CreateResponsesStream(request *types.OpenAIResponsesRequ
 	return requester.RequestNoTrimStream(p.Requester, resp, handler.HandlerResponsesStream)
 }
 
+func (p *CodexProvider) CompactResponses(request *types.OpenAIResponsesRequest) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
+	return nil, common.StringErrorWrapperLocal("The API interface is not supported", "unsupported_api", http.StatusNotImplemented)
+}
+
 // prepareCodexRequest prepares Codex request fields.
 func (p *CodexProvider) prepareCodexRequest(request *types.OpenAIResponsesRequest) {
 	// Normalize gpt-5-* model names.

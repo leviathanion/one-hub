@@ -10,6 +10,7 @@ import (
 	providersBase "one-api/providers/base"
 	"one-api/relay/relay_util"
 	"one-api/types"
+	"strings"
 	"time"
 
 	"github.com/bytedance/gopkg/util/gopool"
@@ -19,20 +20,32 @@ import (
 type relayResponses struct {
 	relayBase
 	responsesRequest types.OpenAIResponsesRequest
+	operation        responsesOperation
 }
 
 func NewRelayResponses(c *gin.Context) *relayResponses {
 	relay := &relayResponses{}
 	relay.c = c
+	relay.operation = detectResponsesOperation(c.Request.URL.Path)
 	return relay
 }
 
 func (r *relayResponses) setRequest() error {
-	if err := common.UnmarshalBodyReusable(r.c, &r.responsesRequest); err != nil {
-		return err
-	}
+	switch r.operation {
+	case responsesOperationCompact:
+		if err := common.UnmarshalBodyReusable(r.c, &r.responsesRequest); err != nil {
+			return err
+		}
+		r.setOriginalModel(r.responsesRequest.Model)
+		return nil
+	default:
+		if err := common.UnmarshalBodyReusable(r.c, &r.responsesRequest); err != nil {
+			return err
+		}
 
-	r.setOriginalModel(r.responsesRequest.Model)
+		r.setOriginalModel(r.responsesRequest.Model)
+		return nil
+	}
 
 	return nil
 }
@@ -42,6 +55,9 @@ func (r *relayResponses) getRequest() interface{} {
 }
 
 func (r *relayResponses) IsStream() bool {
+	if r.operation != responsesOperationCreate {
+		return false
+	}
 	return r.responsesRequest.Stream
 }
 
@@ -51,44 +67,65 @@ func (r *relayResponses) getPromptTokens() (int, error) {
 }
 
 func (r *relayResponses) send() (err *types.OpenAIErrorWithStatusCode, done bool) {
-	r.responsesRequest.Model = r.modelName
-	channel := r.provider.GetChannel()
-	responsesProvider, ok := r.provider.(providersBase.ResponsesInterface)
-	if !ok || channel.CompatibleResponse || !r.provider.GetSupportedResponse() {
-		// 做一层Chat的兼容
-		chatProvider, ok := r.provider.(providersBase.ChatInterface)
-		if !ok {
+	switch r.operation {
+	case responsesOperationCompact:
+		r.responsesRequest.Model = r.modelName
+		channel := r.provider.GetChannel()
+		responsesProvider, ok := r.provider.(providersBase.ResponsesInterface)
+		if !ok || channel.CompatibleResponse || !r.provider.GetSupportedResponse() {
 			err = common.StringErrorWrapperLocal("channel not implemented", "channel_error", http.StatusServiceUnavailable)
 			done = true
 			return
 		}
-
-		return r.compatibleSend(chatProvider)
-	}
-
-	if r.responsesRequest.Stream {
-		var response requester.StreamReaderInterface[string]
-		response, err = responsesProvider.CreateResponsesStream(&r.responsesRequest)
-		if err != nil {
-			return
-		}
-
-		doneStr := func() string {
-			return ""
-		}
-
-		firstResponseTime := responseGeneralStreamClient(r.c, response, doneStr)
-		r.SetFirstResponseTime(firstResponseTime)
-	} else {
 		var response *types.OpenAIResponsesResponses
-		response, err = responsesProvider.CreateResponses(&r.responsesRequest)
+		response, err = responsesProvider.CompactResponses(&r.responsesRequest)
 		if err != nil {
 			return
 		}
 		openErr := responseJsonClient(r.c, response)
-
 		if openErr != nil {
 			err = openErr
+		}
+	default:
+		r.responsesRequest.Model = r.modelName
+		channel := r.provider.GetChannel()
+		responsesProvider, ok := r.provider.(providersBase.ResponsesInterface)
+		if !ok || channel.CompatibleResponse || !r.provider.GetSupportedResponse() {
+			// 做一层Chat的兼容
+			chatProvider, ok := r.provider.(providersBase.ChatInterface)
+			if !ok {
+				err = common.StringErrorWrapperLocal("channel not implemented", "channel_error", http.StatusServiceUnavailable)
+				done = true
+				return
+			}
+
+			return r.compatibleSend(chatProvider)
+		}
+
+		if r.responsesRequest.Stream {
+			var response requester.StreamReaderInterface[string]
+			response, err = responsesProvider.CreateResponsesStream(&r.responsesRequest)
+			if err != nil {
+				return
+			}
+
+			doneStr := func() string {
+				return ""
+			}
+
+			firstResponseTime := responseGeneralStreamClient(r.c, response, doneStr)
+			r.SetFirstResponseTime(firstResponseTime)
+		} else {
+			var response *types.OpenAIResponsesResponses
+			response, err = responsesProvider.CreateResponses(&r.responsesRequest)
+			if err != nil {
+				return
+			}
+			openErr := responseJsonClient(r.c, response)
+
+			if openErr != nil {
+				err = openErr
+			}
 		}
 	}
 
@@ -193,4 +230,18 @@ func (r *relayResponses) chatToResponseStreamClient(stream requester.StreamReade
 	// 等待处理完成
 	<-done
 	return firstResponseTime
+}
+
+type responsesOperation int
+
+const (
+	responsesOperationCreate responsesOperation = iota
+	responsesOperationCompact
+)
+
+func detectResponsesOperation(path string) responsesOperation {
+	if strings.HasSuffix(path, "/compact") {
+		return responsesOperationCompact
+	}
+	return responsesOperationCreate
 }
