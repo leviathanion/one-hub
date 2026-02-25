@@ -18,8 +18,9 @@ type OpenAIResponsesStreamHandler struct {
 	Model     string
 	MessageID string
 
-	searchType string
-	toolIndex  int
+	searchType  string
+	toolIndex   int
+	hasToolCall bool
 }
 
 func (p *OpenAIProvider) buildResponsesOperationRequest(pathSuffix string, modelName string, request any) (*http.Request, *types.OpenAIErrorWithStatusCode) {
@@ -224,6 +225,8 @@ func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataCh
 
 	switch openaiResponse.Type {
 	case "response.created":
+		h.hasToolCall = false
+		h.toolIndex = 0
 		if openaiResponse.Response != nil {
 			if h.MessageID == "" {
 				h.MessageID = openaiResponse.Response.ID
@@ -270,6 +273,7 @@ func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataCh
 		})
 		needOutput = true
 	case "response.function_call_arguments.delta": // 处理函数调用参数的增量
+		h.hasToolCall = true
 		delta, ok := openaiResponse.Delta.(string)
 		if ok {
 			h.Usage.TextBuilder.WriteString(delta)
@@ -290,6 +294,7 @@ func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataCh
 		})
 		needOutput = true
 	case "response.function_call_arguments.done":
+		h.hasToolCall = true
 		h.toolIndex++
 	case "response.output_item.added":
 		if openaiResponse.Item != nil {
@@ -314,6 +319,7 @@ func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataCh
 				})
 				needOutput = true
 			case types.InputTypeFunctionCall:
+				h.hasToolCall = true
 				arguments := ""
 				if openaiResponse.Item.Arguments != nil {
 					arguments = *openaiResponse.Item.Arguments
@@ -339,16 +345,24 @@ func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataCh
 				needOutput = true
 			}
 		}
+	case "response.output_item.done":
+		if openaiResponse.Item != nil && openaiResponse.Item.Type == types.InputTypeFunctionCall {
+			h.hasToolCall = true
+		}
 	default:
 		if openaiResponse.Response != nil && openaiResponse.Response.Usage != nil {
 			usage := openaiResponse.Response.Usage
 			*h.Usage = *usage.ToOpenAIUsage()
 
 			getResponsesExtraBilling(openaiResponse.Response, h.Usage)
+			finishReason := types.ConvertResponsesStatusToChat(openaiResponse.Response.Status)
+			if finishReason == types.FinishReasonStop && shouldUseToolCallsFinishReason(openaiResponse.Response, h.hasToolCall) {
+				finishReason = types.FinishReasonToolCalls
+			}
 			chatRes.Choices = append(chatRes.Choices, types.ChatCompletionStreamChoice{
 				Index:        0,
 				Delta:        types.ChatCompletionStreamChoiceDelta{},
-				FinishReason: types.ConvertResponsesStatusToChat(openaiResponse.Response.Status),
+				FinishReason: finishReason,
 			})
 			needOutput = true
 
@@ -367,6 +381,24 @@ func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataCh
 	}
 
 	*rawLine = nil
+}
+
+func shouldUseToolCallsFinishReason(response *types.OpenAIResponsesResponses, hasToolCall bool) bool {
+	if hasToolCall {
+		return true
+	}
+
+	if response == nil {
+		return false
+	}
+
+	for _, output := range response.Output {
+		if output.Type == types.InputTypeFunctionCall {
+			return true
+		}
+	}
+
+	return false
 }
 
 func getResponsesExtraBilling(response *types.OpenAIResponsesResponses, usage *types.Usage) {
