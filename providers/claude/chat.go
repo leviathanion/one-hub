@@ -246,6 +246,23 @@ func ConvertToolChoice(toolType, toolFunc string) *ToolChoice {
 	return choice
 }
 
+func parseJSONObjectRawMessage(arguments string) (json.RawMessage, error) {
+	trimmed := strings.TrimSpace(arguments)
+	if trimmed == "" {
+		return nil, fmt.Errorf("tool arguments is empty")
+	}
+
+	if trimmed[0] != '{' || trimmed[len(trimmed)-1] != '}' {
+		return nil, fmt.Errorf("tool arguments must be a json object")
+	}
+
+	if !json.Valid([]byte(trimmed)) {
+		return nil, fmt.Errorf("tool arguments is invalid json")
+	}
+
+	return json.RawMessage(trimmed), nil
+}
+
 func convertMessageContent(msg *types.ChatCompletionMessage) (*Message, error) {
 	message := Message{
 		Role: convertRole(msg.Role),
@@ -255,8 +272,8 @@ func convertMessageContent(msg *types.ChatCompletionMessage) (*Message, error) {
 
 	if msg.ToolCalls != nil {
 		for _, toolCall := range msg.ToolCalls {
-			inputParam := make(map[string]any)
-			if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &inputParam); err != nil {
+			inputParam, err := parseJSONObjectRawMessage(toolCall.Function.Arguments)
+			if err != nil {
 				return nil, err
 			}
 			content = append(content, MessageContent{

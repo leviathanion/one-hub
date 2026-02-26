@@ -88,8 +88,27 @@ type GeminiPartCodeExecutionResult struct {
 }
 
 type GeminiFunctionCall struct {
-	Name string                 `json:"name,omitempty"`
-	Args map[string]interface{} `json:"args,omitempty"`
+	Name string          `json:"name,omitempty"`
+	Args json.RawMessage `json:"args,omitempty"`
+}
+
+var emptyGeminiToolArgs = json.RawMessage("{}")
+
+func normalizeGeminiToolArgs(arguments string) json.RawMessage {
+	trimmed := strings.TrimSpace(arguments)
+	if trimmed == "" {
+		return emptyGeminiToolArgs
+	}
+
+	if trimmed[0] != '{' || trimmed[len(trimmed)-1] != '}' {
+		return emptyGeminiToolArgs
+	}
+
+	if !json.Valid([]byte(trimmed)) {
+		return emptyGeminiToolArgs
+	}
+
+	return json.RawMessage(trimmed)
 }
 
 func (candidate *GeminiChatCandidate) ToOpenAIStreamChoice(request *types.ChatCompletionRequest) types.ChatCompletionStreamChoice {
@@ -439,10 +458,7 @@ func OpenAIToGeminiChatContent(openaiContents []types.ChatCompletionMessage) ([]
 			for _, toolCall := range openaiContent.ToolCalls {
 				toolCallId[toolCall.Id] = toolCall.Function.Name
 
-				args := map[string]interface{}{}
-				if toolCall.Function.Arguments != "" {
-					json.Unmarshal([]byte(toolCall.Function.Arguments), &args)
-				}
+				args := normalizeGeminiToolArgs(toolCall.Function.Arguments)
 
 				content.Parts = append(content.Parts, GeminiPart{
 					FunctionCall: &GeminiFunctionCall{
