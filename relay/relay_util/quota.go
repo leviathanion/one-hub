@@ -83,16 +83,17 @@ func (q *Quota) PreQuotaConsumption() *types.OpenAIErrorWithStatusCode {
 		return common.ErrorWrapper(errors.New("user quota is not enough"), "insufficient_user_quota", http.StatusPaymentRequired)
 	}
 
-	err = model.CacheDecreaseUserQuota(q.userId, q.preConsumedQuota)
-	if err != nil {
-		return common.ErrorWrapper(err, "decrease_user_quota_failed", http.StatusInternalServerError)
-	}
-
 	if userQuota > 100*q.preConsumedQuota {
 		// in this case, we do not pre-consume quota
 		// because the user has enough quota
 		q.preConsumedQuota = 0
 		// common.LogInfo(c.Request.Context(), fmt.Sprintf("user %d has enough quota %d, trusted and no need to pre-consume", userId, userQuota))
+		return nil
+	}
+
+	err = model.CacheDecreaseUserQuota(q.userId, q.preConsumedQuota)
+	if err != nil {
+		return common.ErrorWrapper(err, "decrease_user_quota_failed", http.StatusInternalServerError)
 	}
 
 	if q.preConsumedQuota > 0 {
@@ -151,10 +152,15 @@ func (q *Quota) completedQuotaConsumption(usage *types.Usage, tokenName string, 
 		if err != nil {
 			return errors.New("error consuming token remain quota: " + err.Error())
 		}
-		err = model.CacheUpdateUserQuota(q.userId)
-		if err != nil {
-			return errors.New("error consuming token remain quota: " + err.Error())
+
+		if config.RedisEnabled {
+			// Always reconcile against DB after a successful consume to heal any cache drift.
+			err = model.CacheUpdateUserQuota(q.userId)
+			if err != nil {
+				return errors.New("error refresh user quota cache: " + err.Error())
+			}
 		}
+
 		model.UpdateChannelUsedQuota(q.channelId, quota)
 	}
 
