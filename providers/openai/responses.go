@@ -23,6 +23,31 @@ type OpenAIResponsesStreamHandler struct {
 	hasToolCall bool
 }
 
+var (
+	responsesDataPrefix  = []byte("data:")
+	responsesDonePayload = []byte("[DONE]")
+	trackedUsageEvents   = map[string]struct{}{
+		"response.created":           {},
+		"response.output_text.delta": {},
+		"response.output_item.added": {},
+		"response.completed":         {},
+		"response.failed":            {},
+		"response.incomplete":        {},
+	}
+)
+
+type responsesUsageEvent struct {
+	Type     string                          `json:"type"`
+	Delta    json.RawMessage                 `json:"delta,omitempty"`
+	Item     *types.ResponsesOutput          `json:"item,omitempty"`
+	Response *types.OpenAIResponsesResponses `json:"response,omitempty"`
+}
+
+func shouldTrackResponsesUsageByType(eventType string) bool {
+	_, ok := trackedUsageEvents[eventType]
+	return ok
+}
+
 func (p *OpenAIProvider) buildResponsesOperationRequest(pathSuffix string, modelName string, request any) (*http.Request, *types.OpenAIErrorWithStatusCode) {
 	basePath, errWithCode := p.GetSupportedAPIUri(config.RelayModeResponses)
 	if errWithCode != nil {
@@ -142,21 +167,41 @@ func (h *OpenAIResponsesStreamHandler) HandlerResponsesStream(rawLine *[]byte, d
 	}
 
 	noSpaceLine := bytes.TrimSpace(*rawLine)
-	if strings.HasPrefix(string(noSpaceLine), "data: ") {
-		// 去除前缀
-		noSpaceLine = noSpaceLine[6:]
+	if !bytes.HasPrefix(noSpaceLine, responsesDataPrefix) {
+		dataChan <- rawStr
+		return
 	}
 
-	var openaiResponse types.OpenAIResponsesStreamResponses
-	err := json.Unmarshal(noSpaceLine, &openaiResponse)
-	if err != nil {
-		errChan <- common.ErrorToOpenAIError(err)
+	payload := bytes.TrimSpace(noSpaceLine[len(responsesDataPrefix):])
+
+	if len(payload) == 0 || bytes.Equal(payload, responsesDonePayload) {
+		dataChan <- rawStr
+		return
+	}
+
+	var eventMeta struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(payload, &eventMeta); err != nil || eventMeta.Type == "" {
+		dataChan <- rawStr
+		return
+	}
+
+	if !shouldTrackResponsesUsageByType(eventMeta.Type) {
+		dataChan <- rawStr
+		return
+	}
+
+	var openaiResponse responsesUsageEvent
+	if err := json.Unmarshal(payload, &openaiResponse); err != nil {
+		// Usage tracking should not break stream passthrough.
+		dataChan <- rawStr
 		return
 	}
 
 	switch openaiResponse.Type {
 	case "response.created":
-		if len(openaiResponse.Response.Tools) > 0 {
+		if openaiResponse.Response != nil && len(openaiResponse.Response.Tools) > 0 {
 			for _, tool := range openaiResponse.Response.Tools {
 				if tool.Type == types.APITollTypeWebSearchPreview {
 					h.searchType = "medium"
@@ -167,8 +212,8 @@ func (h *OpenAIResponsesStreamHandler) HandlerResponsesStream(rawLine *[]byte, d
 			}
 		}
 	case "response.output_text.delta":
-		delta, ok := openaiResponse.Delta.(string)
-		if ok {
+		var delta string
+		if len(openaiResponse.Delta) > 0 && json.Unmarshal(openaiResponse.Delta, &delta) == nil {
 			h.Usage.TextBuilder.WriteString(delta)
 		}
 	case "response.output_item.added":
@@ -190,7 +235,6 @@ func (h *OpenAIResponsesStreamHandler) HandlerResponsesStream(rawLine *[]byte, d
 			usage := openaiResponse.Response.Usage
 			*h.Usage = *usage.ToOpenAIUsage()
 			getResponsesExtraBilling(openaiResponse.Response, h.Usage)
-
 		}
 	}
 

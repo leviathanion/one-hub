@@ -92,6 +92,36 @@ func TestHandlerChatStreamStopFinishReasonWithoutToolCall(t *testing.T) {
 	}
 }
 
+func TestHandlerResponsesStreamIgnoreNonTrackedEventWithKeyword(t *testing.T) {
+	handler := OpenAIResponsesStreamHandler{
+		Usage:  &types.Usage{},
+		Prefix: "data: ",
+		Model:  "gpt-5",
+	}
+
+	dataChan := make(chan string, 1)
+	errChan := make(chan error, 1)
+
+	raw := `data: {"type":"response.reasoning.delta","delta":{"text":"contains response.completed text"}}`
+	line := []byte(raw)
+	handler.HandlerResponsesStream(&line, dataChan, errChan)
+
+	select {
+	case out := <-dataChan:
+		if out != raw {
+			t.Fatalf("expected passthrough %q, got %q", raw, out)
+		}
+	default:
+		t.Fatal("expected passthrough data, got none")
+	}
+
+	select {
+	case err := <-errChan:
+		t.Fatalf("unexpected stream error: %v", err)
+	default:
+	}
+}
+
 func mustReadChunk(t *testing.T, dataChan <-chan string) types.ChatCompletionStreamResponse {
 	t.Helper()
 
