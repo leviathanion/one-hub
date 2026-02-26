@@ -245,25 +245,27 @@ func (p *BaseProvider) MergeCustomParams(requestMap map[string]interface{}, cust
 }
 
 // MergeExtraBodyFromRawRequest 从原始请求中合并额外字段（支持 AllowExtraBody）
-// 以用户原始请求为基础，用处理后的字段覆盖，这样额外字段自然保留
-func (p *BaseProvider) MergeExtraBodyFromRawRequest(requestMap map[string]interface{}) map[string]interface{} {
+// 以用户原始请求为基础，再反序列化处理后的请求字段进行覆盖，
+// 这样额外字段自然保留，并减少中间 map 拷贝。
+func (p *BaseProvider) MergeExtraBodyFromRawRequest(requestBytes []byte) (map[string]interface{}, error) {
+	merged := make(map[string]interface{})
+
 	rawBody, ok := p.GetRawBody()
-	if !ok || rawBody == nil {
-		return requestMap
+	if ok && rawBody != nil {
+		if err := json.Unmarshal(rawBody, &merged); err != nil {
+			merged = make(map[string]interface{})
+		}
 	}
 
-	var rawRequest map[string]interface{}
-	err := json.Unmarshal(rawBody, &rawRequest)
-	if err != nil {
-		return requestMap
+	if len(requestBytes) == 0 {
+		return merged, nil
 	}
 
-	// 以原始请求为基础，用处理后的请求字段覆盖
-	for key, value := range requestMap {
-		rawRequest[key] = value
+	if err := json.Unmarshal(requestBytes, &merged); err != nil {
+		return nil, err
 	}
 
-	return rawRequest
+	return merged, nil
 }
 
 // BuildRequestWithMerge 通用的请求体构建方法，支持 CustomParameter 和 AllowExtraBody
@@ -282,21 +284,37 @@ func (p *BaseProvider) BuildRequestWithMerge(originalBody interface{}, fullReque
 	needMerge := customParams != nil || p.Channel.AllowExtraBody
 
 	if needMerge {
-		// 将请求体转换为 map，以便添加额外参数
 		var requestMap map[string]interface{}
-		requestBytes, err := json.Marshal(originalBody)
-		if err != nil {
-			return nil, common.ErrorWrapper(err, "marshal_request_failed", http.StatusInternalServerError)
-		}
+		if bodyMap, ok := originalBody.(map[string]interface{}); ok {
+			if p.Channel.AllowExtraBody {
+				requestMap, err = p.MergeExtraBodyFromRawRequest(nil)
+				if err != nil {
+					return nil, common.ErrorWrapper(err, "unmarshal_request_failed", http.StatusInternalServerError)
+				}
+			} else {
+				requestMap = make(map[string]interface{}, len(bodyMap))
+			}
+			for key, value := range bodyMap {
+				requestMap[key] = value
+			}
+		} else {
+			// 保留 struct -> JSON 这一步，以遵循 json tag/omitempty 语义。
+			requestBytes, err := json.Marshal(originalBody)
+			if err != nil {
+				return nil, common.ErrorWrapper(err, "marshal_request_failed", http.StatusInternalServerError)
+			}
 
-		err = json.Unmarshal(requestBytes, &requestMap)
-		if err != nil {
-			return nil, common.ErrorWrapper(err, "unmarshal_request_failed", http.StatusInternalServerError)
-		}
-
-		// 如果允许额外字段透传，从原始请求中获取额外字段
-		if p.Channel.AllowExtraBody {
-			requestMap = p.MergeExtraBodyFromRawRequest(requestMap)
+			if p.Channel.AllowExtraBody {
+				requestMap, err = p.MergeExtraBodyFromRawRequest(requestBytes)
+				if err != nil {
+					return nil, common.ErrorWrapper(err, "unmarshal_request_failed", http.StatusInternalServerError)
+				}
+			} else {
+				err = json.Unmarshal(requestBytes, &requestMap)
+				if err != nil {
+					return nil, common.ErrorWrapper(err, "unmarshal_request_failed", http.StatusInternalServerError)
+				}
+			}
 		}
 
 		// 处理自定义额外参数
@@ -304,8 +322,13 @@ func (p *BaseProvider) BuildRequestWithMerge(originalBody interface{}, fullReque
 			requestMap = p.MergeCustomParams(requestMap, customParams, modelName)
 		}
 
+		requestBytes, err := json.Marshal(requestMap)
+		if err != nil {
+			return nil, common.ErrorWrapper(err, "marshal_request_failed", http.StatusInternalServerError)
+		}
+
 		// 使用修改后的请求体创建请求
-		req, err := p.Requester.NewRequest(http.MethodPost, fullRequestURL, p.Requester.WithBody(requestMap), p.Requester.WithHeader(headers))
+		req, err := p.Requester.NewRequest(http.MethodPost, fullRequestURL, p.Requester.WithBody(requestBytes), p.Requester.WithHeader(headers))
 		if err != nil {
 			return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
 		}
