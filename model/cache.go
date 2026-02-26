@@ -100,6 +100,30 @@ func CacheDecreaseUserQuota(id int, quota int) error {
 	return err
 }
 
+var (
+	decreaseUserQuotaIfPresentScript = redis.NewScript(`
+		local key = KEYS[1]
+		local delta = tonumber(ARGV[1])
+		if redis.call("EXISTS", key) == 0 then
+			return 0
+		end
+		redis.call("DECRBY", key, delta)
+		return 1
+	`)
+)
+
+func CacheDecreaseUserQuotaIfPresent(id int, quota int) (bool, error) {
+	if !config.RedisEnabled {
+		return false, nil
+	}
+	key := fmt.Sprintf(UserQuotaCacheKey, id)
+	updated, err := decreaseUserQuotaIfPresentScript.Run(context.Background(), redis.GetRedisClient(), []string{key}, quota).Int64()
+	if err != nil {
+		return false, err
+	}
+	return updated == 1, nil
+}
+
 func CacheIsUserEnabled(userId int) (bool, error) {
 	if !config.RedisEnabled {
 		return IsUserEnabled(userId)
