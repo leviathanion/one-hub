@@ -402,9 +402,16 @@ func (converter *OpenAIResponsesStreamConverter) finalizeStream() {
 
 // 获取响应流字符串
 func (converter *OpenAIResponsesStreamConverter) sendStreamEvent(resp any, responseType string) {
-	respStr, _ := json.Marshal(resp)
+	respStr, err := json.Marshal(resp)
+	if err != nil {
+		return
+	}
 
-	fmt.Fprintf(converter.c.Writer, "event: %s\ndata: %s\n\n", responseType, string(respStr))
+	_, _ = converter.c.Writer.WriteString("event: ")
+	_, _ = converter.c.Writer.WriteString(responseType)
+	_, _ = converter.c.Writer.WriteString("\ndata: ")
+	_, _ = converter.c.Writer.Write(respStr)
+	_, _ = converter.c.Writer.WriteString("\n\n")
 	converter.c.Writer.Flush()
 }
 
