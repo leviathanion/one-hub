@@ -1,5 +1,5 @@
 import PropTypes from 'prop-types';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { CHANNEL_OPTIONS } from 'constants/ChannelConstants';
 import { useTheme } from '@mui/material/styles';
 import { API } from 'utils/api';
@@ -87,10 +87,12 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
   const [hasTag, setHasTag] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [inputValue, setInputValue] = useState('');
+  const [batchFileImporting, setBatchFileImporting] = useState(false);
   const removeDuplicates = (array) => [...new Set(array)];
   const [modelSelectorOpen, setModelSelectorOpen] = useState(false);
   const [tempFormikValues, setTempFormikValues] = useState(null);
   const [tempSetFieldValue, setTempSetFieldValue] = useState(null);
+  const batchFileInputRef = useRef(null);
   const [codexOAuthVisible, setCodexOAuthVisible] = useState(false);
   const [codexAuthURL, setCodexAuthURL] = useState('');
   const [codexSessionId, setCodexSessionId] = useState('');
@@ -251,6 +253,63 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
         // 合并模型列表
         tempSetFieldValue('models', [...existingModels, ...newModels]);
       }
+    }
+  };
+
+  const mergeBatchContent = (currentValue, importedValue) => {
+    if (!importedValue) {
+      return currentValue || '';
+    }
+
+    if (!currentValue) {
+      return importedValue;
+    }
+
+    const separator = currentValue.endsWith('\n') || importedValue.startsWith('\n') ? '' : '\n';
+    return `${currentValue}${separator}${importedValue}`;
+  };
+
+  const normalizeBatchFileContent = (content) =>
+    content
+      .replace(/^\uFEFF/, '')
+      .replace(/\r\n?/g, '\n')
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .join('\n');
+
+  const handleBatchFileImport = async (event, currentValue, setFieldValue) => {
+    const input = event.target;
+    const files = Array.from(input.files || []);
+
+    if (files.length === 0) {
+      return;
+    }
+
+    setBatchFileImporting(true);
+
+    try {
+      const contents = await Promise.all(
+        files.map(async (file) => {
+          const text = await file.text();
+          return normalizeBatchFileContent(text);
+        })
+      );
+
+      const mergedContent = contents.filter(Boolean).join('\n');
+
+      if (!mergedContent.trim()) {
+        showError(t('channel_edit.batchUploadEmpty'));
+        return;
+      }
+
+      setFieldValue('key', mergeBatchContent(currentValue, mergedContent));
+      showSuccess(t('channel_edit.batchUploadSuccess', { count: files.length }));
+    } catch (error) {
+      showError(t('channel_edit.batchUploadError', { message: error.message || error }));
+    } finally {
+      input.value = '';
+      setBatchFileImporting(false);
     }
   };
 
@@ -867,19 +926,58 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                       />
                     </>
                   ) : (
-                    <TextField
-                      multiline
-                      id="channel-key-label"
-                      label={customizeT(inputLabel.key)}
-                      value={values.key}
-                      name="key"
-                      onBlur={handleBlur}
-                      onChange={handleChange}
-                      aria-describedby="helper-text-channel-key-label"
-                      minRows={5}
-                      maxRows={15}
-                      placeholder={customizeT(inputPrompt.key) + t('channel_edit.batchKeytip')}
-                    />
+                    <Box>
+                      <TextField
+                        multiline
+                        fullWidth
+                        id="channel-key-label"
+                        label={customizeT(inputLabel.key)}
+                        value={values.key}
+                        name="key"
+                        onBlur={handleBlur}
+                        onChange={handleChange}
+                        aria-describedby="helper-text-channel-key-label"
+                        minRows={5}
+                        maxRows={15}
+                        placeholder={customizeT(inputPrompt.key) + t('channel_edit.batchKeytip')}
+                      />
+                      {channelId === 0 && (
+                        <>
+                          <input
+                            ref={batchFileInputRef}
+                            hidden
+                            multiple
+                            type="file"
+                            onChange={(event) => handleBatchFileImport(event, values.key, setFieldValue)}
+                          />
+                          <Box
+                            sx={{
+                              mt: 1,
+                              display: 'flex',
+                              gap: 1,
+                              alignItems: 'center',
+                              justifyContent: 'space-between',
+                              flexWrap: 'wrap'
+                            }}
+                          >
+                            <Button
+                              size="small"
+                              variant="outlined"
+                              disabled={batchFileImporting}
+                              startIcon={
+                                batchFileImporting ? <Icon icon="svg-spinners:3-dots-scale" /> : <Icon icon="solar:upload-bold-duotone" />
+                              }
+                              onClick={() => batchFileInputRef.current?.click()}
+                            >
+                              {t('channel_edit.batchUploadFiles')}
+                            </Button>
+                            <Typography variant="caption" color="text.secondary">
+                              {t('channel_edit.batchUploadFilesTip')}
+                            </Typography>
+                          </Box>
+                        </>
+                      )}
+                    </Box>
                   )}
 
                   {touched.key && errors.key ? (
