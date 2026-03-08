@@ -50,24 +50,42 @@ func NewOpenAIResponsesStreamConverter(c *gin.Context, request *types.OpenAIResp
 }
 
 func (converter *OpenAIResponsesStreamConverter) initializeResponse(request *types.OpenAIResponsesRequest) {
-	converter.responses = &types.OpenAIResponsesResponses{
-		Object: "response",
-		Text: types.TextResponses{
-			Format: struct {
-				Type string `json:"type"`
-			}{
-				Type: "text",
-			},
+	text := any(types.TextResponses{
+		Format: struct {
+			Type string `json:"type"`
+		}{
+			Type: "text",
 		},
-		MaxOutputTokens:   request.MaxOutputTokens,
-		ParallelToolCalls: request.ParallelToolCalls,
-		Temperature:       request.Temperature,
-		ToolChoice:        request.ToolChoice,
-		TopP:              request.TopP,
-		Truncation:        request.Truncation,
-		Tools:             request.Tools,
-		Output:            make([]types.ResponsesOutput, 0),
-		Status:            "in_progress",
+	})
+	if request.Text != nil {
+		text = request.Text
+	}
+
+	converter.responses = &types.OpenAIResponsesResponses{
+		Object:               "response",
+		Text:                 text,
+		MaxOutputTokens:      request.MaxOutputTokens,
+		MaxToolCalls:         request.MaxToolCalls,
+		Background:           request.Background,
+		Conversation:         request.Conversation,
+		Instructions:         request.Instructions,
+		Metadata:             request.Metadata,
+		ParallelToolCalls:    request.ParallelToolCalls,
+		PreviousResponseID:   request.PreviousResponseID,
+		Prompt:               request.Prompt,
+		PromptCacheKey:       request.PromptCacheKey,
+		PromptCacheRetention: request.PromptCacheRetention,
+		Reasoning:            request.Reasoning,
+		Temperature:          request.Temperature,
+		SafetyIdentifier:     request.SafetyIdentifier,
+		ServiceTier:          request.ServiceTier,
+		Store:                request.Store,
+		ToolChoice:           request.ToolChoice,
+		TopP:                 request.TopP,
+		Truncation:           request.Truncation,
+		Tools:                request.Tools,
+		Output:               make([]types.ResponsesOutput, 0),
+		Status:               "in_progress",
 	}
 }
 
@@ -107,6 +125,10 @@ func (converter *OpenAIResponsesStreamConverter) processChoices(choices []types.
 		nowStatus, ok := choice.FinishReason.(string)
 		if ok {
 			converter.nowStatus = types.ConvertChatStatusToResponses(nowStatus)
+		}
+
+		if isEmptyChoiceDelta(&choice) {
+			continue
 		}
 
 		currentType := converter.GetResponseType(&choice)
@@ -170,7 +192,7 @@ func (converter *OpenAIResponsesStreamConverter) createNewItem(choice types.Chat
 		}
 	case types.InputTypeReasoning:
 		converter.item.Role = choice.Delta.Role
-		converter.item.Summary = []types.SummaryResponses{}
+		converter.item.Summary = types.SummaryResponsesList{}
 	default:
 		converter.item.Role = choice.Delta.Role
 		converter.item.Content = []types.ContentResponses{}
@@ -201,7 +223,9 @@ func (converter *OpenAIResponsesStreamConverter) done() {
 	response.OutputIndex = &converter.outputIndex
 
 	converter.item.Status = converter.nowStatus
-	converter.item.Content = converter.content
+	if converter.lastResponseType == types.InputTypeMessage {
+		converter.item.Content = converter.content
+	}
 	response.Item = converter.item
 
 	if converter.item.Status == "" {
@@ -217,6 +241,8 @@ func (converter *OpenAIResponsesStreamConverter) done() {
 	converter.content = nil
 
 	converter.outputIndex++
+	converter.contentIndex = 0
+	converter.summaryIndex = 0
 }
 
 // 处理message类型的内容
@@ -297,14 +323,14 @@ func (converter *OpenAIResponsesStreamConverter) processReasoning(choice types.C
 		}
 
 		response := converter.buildStreamResponseWithItemID("response.reasoning_summary_part.added")
-		response.ContentIndex = &converter.contentIndex
+		response.SummaryIndex = &converter.summaryIndex
 		response.Part = converter.part
 		converter.sendStreamEvent(response, "response.reasoning_summary_part.added")
 	}
 
 	// 处理推理内容
 	response := converter.buildStreamResponseWithItemID("response.reasoning_summary_text.delta")
-	response.ContentIndex = &converter.contentIndex
+	response.SummaryIndex = &converter.summaryIndex
 	response.Delta = choice.Delta.ReasoningContent
 	converter.sendStreamEvent(response, "response.reasoning_summary_text.delta")
 
@@ -328,11 +354,8 @@ func (converter *OpenAIResponsesStreamConverter) doneReasoningPart() {
 	response.Part = &part
 	converter.sendStreamEvent(response, "response.reasoning_summary_part.done")
 
-	// contentIndex 递增
+	converter.addSummary()
 	converter.summaryIndex++
-	// 需要将数据添加到content中
-	converter.addContent()
-	// 清空 part
 	converter.part = nil
 }
 
@@ -374,6 +397,17 @@ func (converter *OpenAIResponsesStreamConverter) addContent() {
 	}
 
 	converter.content = append(converter.content, *converter.part)
+}
+
+func (converter *OpenAIResponsesStreamConverter) addSummary() {
+	if converter.part == nil || converter.item == nil {
+		return
+	}
+
+	converter.item.Summary = append(converter.item.Summary, types.SummaryResponses{
+		Type: converter.part.Type,
+		Text: converter.part.Text,
+	})
 }
 
 // 输出最终的数据
@@ -481,4 +515,19 @@ func (converter *OpenAIResponsesStreamConverter) GetResponseType(choice *types.C
 	}
 
 	return types.InputTypeMessage
+}
+
+func isEmptyChoiceDelta(choice *types.ChatCompletionStreamChoice) bool {
+	if choice == nil {
+		return true
+	}
+
+	return choice.Delta.Content == "" &&
+		choice.Delta.Role == "" &&
+		choice.Delta.FunctionCall == nil &&
+		len(choice.Delta.ToolCalls) == 0 &&
+		choice.Delta.ReasoningContent == "" &&
+		choice.Delta.Reasoning == "" &&
+		len(choice.Delta.Image) == 0 &&
+		len(choice.Delta.Images) == 0
 }
