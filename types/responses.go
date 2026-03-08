@@ -1,10 +1,13 @@
 package types
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"one-api/common/utils"
+	"reflect"
+	"strings"
 )
 
 const (
@@ -37,12 +40,13 @@ const (
 
 // input_text / input_image / input_file / output_text / refusal
 const (
-	ContentTypeInputText   = "input_text"
-	ContentTypeInputImage  = "input_image"
-	ContentTypeInputFile   = "input_file"
-	ContentTypeOutputText  = "output_text"
-	ContentTypeSummaryText = "summary_text"
-	ContentTypeRefusal     = "refusal"
+	ContentTypeInputText     = "input_text"
+	ContentTypeInputImage    = "input_image"
+	ContentTypeInputFile     = "input_file"
+	ContentTypeOutputText    = "output_text"
+	ContentTypeReasoningText = "reasoning_text"
+	ContentTypeSummaryText   = "summary_text"
+	ContentTypeRefusal       = "refusal"
 )
 
 // completed, failed, in_progress, cancelled, queued, or incomplete
@@ -56,25 +60,34 @@ const (
 )
 
 type OpenAIResponsesRequest struct {
-	Input              any              `json:"input,omitempty"`
-	Model              string           `json:"model" binding:"required"`
-	Include            any              `json:"include,omitempty"`
-	Instructions       string           `json:"instructions,omitempty"`
-	MaxOutputTokens    int              `json:"max_output_tokens,omitempty"`
-	MaxToolCalls       *int             `json:"max_tool_calls,omitempty"`
-	ParallelToolCalls  bool             `json:"parallel_tool_calls,omitempty"`
-	PreviousResponseID string           `json:"previous_response_id,omitempty"`
-	Reasoning          *ReasoningEffort `json:"reasoning,omitempty"`
-	Store              *bool            `json:"store,omitempty"` // 是否存储响应结果
-	Stream             bool             `json:"stream,omitempty"`
-	Temperature        *float64         `json:"temperature,omitempty"`
-	Text               *ResponsesText   `json:"text,omitempty"`
-	ToolChoice         any              `json:"tool_choice,omitempty"`
-	Tools              []ResponsesTools `json:"tools,omitempty"`
-	TopLogProbs        any              `json:"top_logprobs,omitempty"` // The number of top log probabilities to return for each token in the response.
-	TopP               *float64         `json:"top_p,omitempty"`
-	Truncation         string           `json:"truncation,omitempty"`
-	ContextManagement  any              `json:"context_management,omitempty"`
+	Input                any               `json:"input,omitempty"`
+	Model                string            `json:"model" binding:"required"`
+	Background           *bool             `json:"background,omitempty"`
+	Conversation         any               `json:"conversation,omitempty"`
+	Include              any               `json:"include,omitempty"`
+	Instructions         string            `json:"instructions,omitempty"`
+	MaxOutputTokens      int               `json:"max_output_tokens,omitempty"`
+	MaxToolCalls         *int              `json:"max_tool_calls,omitempty"`
+	Metadata             map[string]string `json:"metadata,omitempty"`
+	ParallelToolCalls    *bool             `json:"parallel_tool_calls,omitempty"`
+	PreviousResponseID   string            `json:"previous_response_id,omitempty"`
+	Prompt               any               `json:"prompt,omitempty"`
+	PromptCacheKey       string            `json:"prompt_cache_key,omitempty"`
+	PromptCacheRetention string            `json:"prompt_cache_retention,omitempty"`
+	Reasoning            *ReasoningEffort  `json:"reasoning,omitempty"`
+	SafetyIdentifier     string            `json:"safety_identifier,omitempty"`
+	ServiceTier          string            `json:"service_tier,omitempty"`
+	Store                *bool             `json:"store,omitempty"` // 是否存储响应结果
+	Stream               bool              `json:"stream,omitempty"`
+	StreamOptions        any               `json:"stream_options,omitempty"`
+	Temperature          *float64          `json:"temperature,omitempty"`
+	Text                 *ResponsesText    `json:"text,omitempty"`
+	ToolChoice           any               `json:"tool_choice,omitempty"`
+	Tools                []ResponsesTools  `json:"tools,omitempty"`
+	TopLogProbs          any               `json:"top_logprobs,omitempty"` // The number of top log probabilities to return for each token in the response.
+	TopP                 *float64          `json:"top_p,omitempty"`
+	Truncation           string            `json:"truncation,omitempty"`
+	ContextManagement    any               `json:"context_management,omitempty"`
 
 	ConvertChat bool `json:"-"`
 }
@@ -97,12 +110,14 @@ func (r *OpenAIResponsesRequest) ToChatCompletionRequest() (*ChatCompletionReque
 	chat := &ChatCompletionRequest{
 		Model:               r.Model,
 		MaxCompletionTokens: r.MaxOutputTokens,
-		ParallelToolCalls:   r.ParallelToolCalls,
 		Stream:              r.Stream,
 		Temperature:         r.Temperature,
 		// ResponseFormat:    r.Text,
 		ToolChoice: r.ToolChoice,
 		TopP:       r.TopP,
+	}
+	if r.ParallelToolCalls != nil {
+		chat.ParallelToolCalls = *r.ParallelToolCalls
 	}
 
 	if r.Reasoning != nil {
@@ -130,6 +145,10 @@ func (r *OpenAIResponsesRequest) ToChatCompletionRequest() (*ChatCompletionReque
 				Strict:      r.Text.Format.Strict,
 			}
 		}
+	}
+
+	if r.Text != nil && r.Text.Verbosity != "" {
+		chat.Verbosity = r.Text.Verbosity
 	}
 
 	if len(r.Tools) > 0 {
@@ -292,8 +311,8 @@ type InputResponses struct {
 	Arguments string `json:"arguments,omitempty"`
 
 	// reasoning
-	Summary          *SummaryResponses `json:"summary,omitempty"`
-	EncryptedContent *string           `json:"encrypted_content,omitempty"`
+	Summary          SummaryResponsesList `json:"summary,omitempty"`
+	EncryptedContent *string              `json:"encrypted_content,omitempty"`
 
 	// image_generation_call
 	Result any `json:"result,omitempty"`
@@ -428,6 +447,36 @@ type SummaryResponses struct {
 	Text string `json:"text"`
 }
 
+type SummaryResponsesList []SummaryResponses
+
+func (s *SummaryResponsesList) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		*s = nil
+		return nil
+	}
+
+	if trimmed[0] == '[' {
+		var list []SummaryResponses
+		if err := json.Unmarshal(trimmed, &list); err != nil {
+			return err
+		}
+		*s = SummaryResponsesList(list)
+		return nil
+	}
+
+	var item SummaryResponses
+	if err := json.Unmarshal(trimmed, &item); err != nil {
+		return err
+	}
+	*s = SummaryResponsesList{item}
+	return nil
+}
+
+func (s SummaryResponsesList) MarshalJSON() ([]byte, error) {
+	return json.Marshal([]SummaryResponses(s))
+}
+
 type ResponsesTools struct {
 	Type string `json:"type"`
 	// Web Search
@@ -467,6 +516,85 @@ type ResponsesTools struct {
 	PartialImages     any    `json:"partial_images,omitempty"`
 	Quality           string `json:"quality,omitempty"`
 	Size              string `json:"size,omitempty"`
+
+	rawFields map[string]json.RawMessage `json:"-"`
+}
+
+var responsesToolsJSONFields = collectJSONFieldNames(reflect.TypeOf(ResponsesTools{}))
+
+func (t *ResponsesTools) UnmarshalJSON(data []byte) error {
+	type responsesToolAlias ResponsesTools
+
+	var alias responsesToolAlias
+	if err := json.Unmarshal(data, &alias); err != nil {
+		return err
+	}
+
+	var rawFields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &rawFields); err != nil {
+		return err
+	}
+
+	*t = ResponsesTools(alias)
+	t.rawFields = rawFields
+	return nil
+}
+
+func (t ResponsesTools) MarshalJSON() ([]byte, error) {
+	type responsesToolAlias ResponsesTools
+
+	knownFieldsJSON, err := json.Marshal(responsesToolAlias(t))
+	if err != nil {
+		return nil, fmt.Errorf("marshal responses tool: %w", err)
+	}
+
+	var knownFields map[string]json.RawMessage
+	if err := json.Unmarshal(knownFieldsJSON, &knownFields); err != nil {
+		return nil, fmt.Errorf("decode marshaled responses tool: %w", err)
+	}
+
+	rawFields := make(map[string]json.RawMessage, len(t.rawFields)+len(knownFields))
+	for key, value := range t.rawFields {
+		rawFields[key] = value
+	}
+
+	for key := range responsesToolsJSONFields {
+		delete(rawFields, key)
+	}
+
+	for key, value := range knownFields {
+		rawFields[key] = value
+	}
+
+	return json.Marshal(rawFields)
+}
+
+func collectJSONFieldNames(t reflect.Type) map[string]struct{} {
+	fieldNames := make(map[string]struct{}, t.NumField())
+
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		if field.PkgPath != "" {
+			continue
+		}
+
+		tag := field.Tag.Get("json")
+		if tag == "-" {
+			continue
+		}
+
+		name := tag
+		if idx := strings.IndexByte(name, ','); idx >= 0 {
+			name = name[:idx]
+		}
+		if name == "" {
+			name = field.Name
+		}
+
+		fieldNames[name] = struct{}{}
+	}
+
+	return fieldNames
 }
 
 type ReasoningEffort struct {
@@ -476,25 +604,35 @@ type ReasoningEffort struct {
 }
 
 type OpenAIResponsesResponses struct {
-	CreatedAt          any               `json:"created_at,omitempty"`
-	Error              *OpenAIError      `json:"error,omitempty"`
-	ID                 string            `json:"id,omitempty"`
-	IncompleteDetail   *IncompleteDetail `json:"incomplete_details,omitempty"`
-	Instructions       any               `json:"instructions,omitempty"`
-	MaxOutputTokens    int               `json:"max_output_tokens,omitempty"`
-	Model              string            `json:"model"`
-	Object             string            `json:"object"`
-	Output             []ResponsesOutput `json:"output,omitempty"`
-	ParallelToolCalls  bool              `json:"parallel_tool_calls,omitempty"`
-	PreviousResponseID string            `json:"previous_response_id,omitempty"`
-	Reasoning          *ReasoningEffort  `json:"reasoning,omitempty"`
-	Status             string            `json:"status"`
-	Temperature        *float64          `json:"temperature,omitempty"`
-	Text               any               `json:"text,omitempty"`
-	ToolChoice         any               `json:"tool_choice,omitempty"`
-	Tools              []ResponsesTools  `json:"tools,omitempty"`
-	TopP               *float64          `json:"top_p,omitempty"`
-	Truncation         string            `json:"truncation,omitempty"`
+	Background           *bool             `json:"background,omitempty"`
+	CreatedAt            any               `json:"created_at,omitempty"`
+	Conversation         any               `json:"conversation,omitempty"`
+	Error                *OpenAIError      `json:"error,omitempty"`
+	ID                   string            `json:"id,omitempty"`
+	IncompleteDetail     *IncompleteDetail `json:"incomplete_details,omitempty"`
+	Instructions         any               `json:"instructions,omitempty"`
+	MaxOutputTokens      int               `json:"max_output_tokens,omitempty"`
+	MaxToolCalls         *int              `json:"max_tool_calls,omitempty"`
+	Metadata             map[string]string `json:"metadata,omitempty"`
+	Model                string            `json:"model"`
+	Object               string            `json:"object"`
+	Output               []ResponsesOutput `json:"output,omitempty"`
+	ParallelToolCalls    *bool             `json:"parallel_tool_calls,omitempty"`
+	PreviousResponseID   string            `json:"previous_response_id,omitempty"`
+	Prompt               any               `json:"prompt,omitempty"`
+	PromptCacheKey       string            `json:"prompt_cache_key,omitempty"`
+	PromptCacheRetention string            `json:"prompt_cache_retention,omitempty"`
+	Reasoning            *ReasoningEffort  `json:"reasoning,omitempty"`
+	SafetyIdentifier     string            `json:"safety_identifier,omitempty"`
+	ServiceTier          string            `json:"service_tier,omitempty"`
+	Status               string            `json:"status"`
+	Store                *bool             `json:"store,omitempty"`
+	Temperature          *float64          `json:"temperature,omitempty"`
+	Text                 any               `json:"text,omitempty"`
+	ToolChoice           any               `json:"tool_choice,omitempty"`
+	Tools                []ResponsesTools  `json:"tools,omitempty"`
+	TopP                 *float64          `json:"top_p,omitempty"`
+	Truncation           string            `json:"truncation,omitempty"`
 
 	Usage *ResponsesUsage `json:"usage,omitempty"`
 }
@@ -522,6 +660,16 @@ func (m ResponsesOutput) StringContent() string {
 	content, ok := m.Content.(string)
 	if ok {
 		return content
+	}
+	contentItems, ok := m.Content.([]ContentResponses)
+	if ok {
+		var contentStr string
+		for _, contentItem := range contentItems {
+			if contentItem.Text != "" {
+				contentStr += contentItem.Text
+			}
+		}
+		return contentStr
 	}
 	contentList, ok := m.Content.([]any)
 	if ok {
@@ -567,15 +715,15 @@ type ResponsesOutput struct {
 	Role    string `json:"role,omitempty"`
 	Content any    `json:"content,omitempty"`
 
-	Queries             any                `json:"queries,omitempty"`
-	Results             any                `json:"results,omitempty"`
-	Arguments           *string            `json:"arguments,omitempty"`
-	CallID              string             `json:"call_id,omitempty"`
-	Name                string             `json:"name,omitempty"`
-	Action              any                `json:"action,omitempty"`
-	PendingSafetyChecks any                `json:"pending_safety_checks,omitempty"`
-	Summary             []SummaryResponses `json:"summary,omitempty"`
-	EncryptedContent    *string            `json:"encrypted_content,omitempty"`
+	Queries             any                  `json:"queries,omitempty"`
+	Results             any                  `json:"results,omitempty"`
+	Arguments           *string              `json:"arguments,omitempty"`
+	CallID              string               `json:"call_id,omitempty"`
+	Name                string               `json:"name,omitempty"`
+	Action              any                  `json:"action,omitempty"`
+	PendingSafetyChecks any                  `json:"pending_safety_checks,omitempty"`
+	Summary             SummaryResponsesList `json:"summary,omitempty"`
+	EncryptedContent    *string              `json:"encrypted_content,omitempty"`
 
 	Code        any    `json:"code,omitempty"`
 	ContainerID string `json:"container_id,omitempty"`
@@ -731,27 +879,44 @@ func ConvertChatStatusToResponses(status string) string {
 }
 
 func (cc *ChatCompletionResponse) ToResponses(request *OpenAIResponsesRequest) *OpenAIResponsesResponses {
-	res := &OpenAIResponsesResponses{
-		CreatedAt: cc.Created,
-		ID:        cc.ID,
-		Model:     cc.Model,
-		Object:    "response",
-		Usage:     cc.Usage.ToResponsesUsage(),
-
-		Text: TextResponses{
-			Format: struct {
-				Type string `json:"type"`
-			}{
-				Type: "text",
-			},
+	text := any(TextResponses{
+		Format: struct {
+			Type string `json:"type"`
+		}{
+			Type: "text",
 		},
-		MaxOutputTokens:   request.MaxOutputTokens,
-		ParallelToolCalls: request.ParallelToolCalls,
-		Temperature:       request.Temperature,
-		ToolChoice:        request.ToolChoice,
-		TopP:              request.TopP,
-		Truncation:        request.Truncation,
-		Tools:             request.Tools,
+	})
+	if request.Text != nil {
+		text = request.Text
+	}
+
+	res := &OpenAIResponsesResponses{
+		CreatedAt:            cc.Created,
+		ID:                   cc.ID,
+		Model:                cc.Model,
+		Object:               "response",
+		Usage:                cc.Usage.ToResponsesUsage(),
+		Text:                 text,
+		MaxOutputTokens:      request.MaxOutputTokens,
+		MaxToolCalls:         request.MaxToolCalls,
+		Background:           request.Background,
+		Conversation:         request.Conversation,
+		Instructions:         request.Instructions,
+		Metadata:             request.Metadata,
+		ParallelToolCalls:    request.ParallelToolCalls,
+		PreviousResponseID:   request.PreviousResponseID,
+		Prompt:               request.Prompt,
+		PromptCacheKey:       request.PromptCacheKey,
+		PromptCacheRetention: request.PromptCacheRetention,
+		Reasoning:            request.Reasoning,
+		Temperature:          request.Temperature,
+		SafetyIdentifier:     request.SafetyIdentifier,
+		ServiceTier:          request.ServiceTier,
+		Store:                request.Store,
+		ToolChoice:           request.ToolChoice,
+		TopP:                 request.TopP,
+		Truncation:           request.Truncation,
+		Tools:                request.Tools,
 	}
 
 	status := ResponseStatusCompleted
@@ -798,7 +963,7 @@ func (cc *ChatCompletionResponse) ToResponses(request *OpenAIResponsesRequest) *
 					Type:   InputTypeReasoning,
 					ID:     fmt.Sprintf("msg_%s", utils.GetRandomString(48)),
 					Status: ResponseStatusCompleted,
-					Summary: []SummaryResponses{
+					Summary: SummaryResponsesList{
 						{
 							Type: "summary_text",
 							Text: choice.Message.ReasoningContent,

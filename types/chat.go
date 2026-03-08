@@ -295,10 +295,66 @@ type ChatCompletionFunction struct {
 }
 
 type ChatCompletionTool struct {
-	Type     string                 `json:"type"`
-	Function ChatCompletionFunction `json:"function,omitzero"`
+	Type          string                 `json:"type"`
+	Function      ChatCompletionFunction `json:"function,omitzero"`
+	ResponsesTool ResponsesTools         `json:"-"`
+}
 
-	ResponsesTools
+func (t *ChatCompletionTool) UnmarshalJSON(data []byte) error {
+	type chatCompletionToolPayload struct {
+		Type     string                 `json:"type"`
+		Function ChatCompletionFunction `json:"function"`
+	}
+
+	var payload chatCompletionToolPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return err
+	}
+
+	t.Type = payload.Type
+	t.Function = payload.Function
+
+	var rawFields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &rawFields); err != nil {
+		return err
+	}
+
+	if _, hasFunction := rawFields["function"]; hasFunction {
+		t.ResponsesTool = ResponsesTools{Type: payload.Type}
+		return nil
+	}
+
+	var responsesTool ResponsesTools
+	if err := json.Unmarshal(data, &responsesTool); err != nil {
+		return err
+	}
+	if responsesTool.Type == "" {
+		responsesTool.Type = payload.Type
+	}
+
+	t.ResponsesTool = responsesTool
+	return nil
+}
+
+func (t ChatCompletionTool) MarshalJSON() ([]byte, error) {
+	if t.Type == "function" || t.Function.Name != "" || t.Function.Description != "" || t.Function.Parameters != nil || t.Function.Strict != nil {
+		type chatCompletionToolPayload struct {
+			Type     string                 `json:"type"`
+			Function ChatCompletionFunction `json:"function"`
+		}
+
+		return json.Marshal(chatCompletionToolPayload{
+			Type:     t.Type,
+			Function: t.Function,
+		})
+	}
+
+	responsesTool := t.ResponsesTool
+	if responsesTool.Type == "" {
+		responsesTool.Type = t.Type
+	}
+
+	return json.Marshal(responsesTool)
 }
 
 type ChatCompletionChoice struct {
@@ -478,13 +534,21 @@ type MultimediaData struct {
 func (c *ChatCompletionRequest) ToResponsesRequest() *OpenAIResponsesRequest {
 
 	res := &OpenAIResponsesRequest{
-		Model:             c.Model,
-		MaxOutputTokens:   c.MaxCompletionTokens,
-		ParallelToolCalls: c.ParallelToolCalls,
-		Stream:            c.Stream,
-		Temperature:       c.Temperature,
-		ToolChoice:        c.ToolChoice,
-		TopP:              c.TopP,
+		Model:           c.Model,
+		MaxOutputTokens: c.MaxCompletionTokens,
+		Stream:          c.Stream,
+		Temperature:     c.Temperature,
+		ToolChoice:      c.ToolChoice,
+		TopP:            c.TopP,
+	}
+	if c.ParallelToolCalls {
+		res.ParallelToolCalls = &c.ParallelToolCalls
+	}
+	if c.Store != nil {
+		res.Store = c.Store
+	}
+	if c.Instructions != nil {
+		res.Instructions = *c.Instructions
 	}
 
 	if c.ResponseFormat != nil {
@@ -543,8 +607,8 @@ func (c *ChatCompletionRequest) ToResponsesRequest() *OpenAIResponsesRequest {
 				continue
 			}
 
-			tool.ResponsesTools.Type = tool.Type
-			resTools = append(resTools, tool.ResponsesTools)
+			tool.ResponsesTool.Type = tool.Type
+			resTools = append(resTools, tool.ResponsesTool)
 		}
 
 		if len(resTools) > 0 {
