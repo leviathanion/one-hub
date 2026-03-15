@@ -73,6 +73,8 @@ var allowedChannelOrderFields = map[string]bool{
 	"weight":        true,
 }
 
+var loadChannelByIDForChannelGroupRefresh = GetChannelById
+
 type SearchChannelsParams struct {
 	Channel
 	PaginationParams
@@ -148,6 +150,12 @@ func GetChannelsList(params *SearchChannelsParams) (*DataResult[Channel], error)
 func GetAllChannels() ([]*Channel, error) {
 	var channels []*Channel
 	err := DB.Order("id desc").Find(&channels).Error
+	return channels, err
+}
+
+func GetChannelsByTypeAndStatus(channelType int, status int) ([]*Channel, error) {
+	var channels []*Channel
+	err := DB.Where("type = ? AND status = ?", channelType, status).Order("id desc").Find(&channels).Error
 	return channels, err
 }
 
@@ -397,7 +405,9 @@ func UpdateChannelKey(id int, key string) error {
 	}
 
 	ClearChannelTokenCache(id)
-	ChannelGroup.Load()
+	if err := ChannelGroup.RefreshChannel(id); err != nil {
+		logger.SysError("failed to refresh channel state after key update: " + err.Error())
+	}
 
 	return nil
 }

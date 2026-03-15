@@ -247,6 +247,40 @@ func (cc *ChannelsChooser) GetChannel(channelId int) *Channel {
 
 var ChannelGroup = ChannelsChooser{}
 
+func normalizeChannelForChooser(channel *Channel) {
+	if channel == nil {
+		return
+	}
+
+	channel.SetProxy()
+	if channel.Weight == nil || *channel.Weight == 0 {
+		channel.Weight = &config.DefaultChannelWeight
+	}
+}
+
+func (cc *ChannelsChooser) RefreshChannel(channelID int) error {
+	if channelID <= 0 {
+		return nil
+	}
+
+	channel, err := loadChannelByIDForChannelGroupRefresh(channelID)
+	if err != nil {
+		return err
+	}
+	normalizeChannelForChooser(channel)
+
+	cc.Lock()
+	defer cc.Unlock()
+
+	if cc.Channels == nil {
+		return nil
+	}
+	if choice, ok := cc.Channels[channelID]; ok && choice != nil {
+		choice.Channel = channel
+	}
+	return nil
+}
+
 func (cc *ChannelsChooser) Load() {
 	var channels []*Channel
 	DB.Where("status = ?", config.ChannelStatusEnabled).Find(&channels)
@@ -264,10 +298,7 @@ func (cc *ChannelsChooser) Load() {
 
 	// 处理每个channel
 	for _, channel := range channels {
-		channel.SetProxy()
-		if *channel.Weight == 0 {
-			channel.Weight = &config.DefaultChannelWeight
-		}
+		normalizeChannelForChooser(channel)
 		newChannels[channel.Id] = &ChannelChoice{
 			Channel:       channel,
 			CooldownsTime: 0,
