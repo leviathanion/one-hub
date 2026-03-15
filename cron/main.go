@@ -1,11 +1,14 @@
 package cron
 
 import (
+	"context"
 	"github.com/spf13/viper"
+	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/logger"
 	"one-api/common/scheduler"
 	"one-api/model"
+	"one-api/providers/codex"
 	"time"
 
 	"github.com/go-co-op/gocron/v2"
@@ -32,7 +35,6 @@ func InitCron() {
 	)
 	if err != nil {
 		logger.SysError("Cron job error: " + err.Error())
-		return
 	}
 
 	if config.UserInvoiceMonth {
@@ -47,6 +49,9 @@ func InitCron() {
 				}
 			}),
 		)
+		if err != nil {
+			logger.SysError("Cron job error: " + err.Error())
+		}
 	}
 
 	// 每十分钟更新一次统计数据
@@ -58,6 +63,25 @@ func InitCron() {
 			logger.SysLog("10分钟统计数据")
 		}),
 	)
+	if err != nil {
+		logger.SysError("Cron job error: " + err.Error())
+	}
+
+	err = scheduler.Manager.AddJob(
+		"codex_auto_refresh",
+		gocron.DurationJob(codex.AutoRefreshInterval),
+		gocron.NewTask(func() {
+			codex.RunAutoRefreshWithTimeout(context.Background())
+		}),
+	)
+	if err != nil {
+		logger.SysError("Cron job error: " + err.Error())
+	}
+	if err == nil {
+		common.SafeGoroutine(func() {
+			codex.RunAutoRefreshWithTimeout(context.Background())
+		})
+	}
 
 	// 开启自动更新 并且设置了有效自动更新时间 同时自动更新模式不是system 则会从服务器拉取最新价格表
 	autoPriceUpdatesInterval := viper.GetInt("auto_price_updates_interval")
@@ -84,12 +108,6 @@ func InitCron() {
 		)
 		if err != nil {
 			logger.SysError("Cron job error: " + err.Error())
-			return
 		}
-	}
-
-	if err != nil {
-		logger.SysError("Cron job error: " + err.Error())
-		return
 	}
 }
