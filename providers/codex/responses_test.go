@@ -45,3 +45,42 @@ func TestCollectResponsesStreamResponseAcceptsDataWithoutSpace(t *testing.T) {
 		t.Fatalf("expected usage total tokens to be updated, got %d", provider.Usage.TotalTokens)
 	}
 }
+
+func TestAdaptCodexCLIAppliesMinimalDefaultInstructions(t *testing.T) {
+	provider := &CodexProvider{}
+	request := &types.OpenAIResponsesRequest{
+		Model:           "gpt-5",
+		Instructions:    "",
+		MaxOutputTokens: 512,
+		Temperature:     ptrFloat64(0.7),
+		TopP:            ptrFloat64(0.9),
+		Input: []types.InputResponses{
+			{
+				Type: types.InputTypeMessage,
+				Role: types.ChatMessageRoleUser,
+				Content: []types.ContentResponses{
+					{Type: types.ContentTypeInputText, Text: "hello"},
+				},
+			},
+		},
+	}
+
+	provider.adaptCodexCLI(request)
+
+	if request.Instructions != CodexCLIInstructions {
+		t.Fatalf("expected minimal default instructions %q, got %q", CodexCLIInstructions, request.Instructions)
+	}
+	if request.MaxOutputTokens != 0 {
+		t.Fatalf("expected max_output_tokens to be cleared, got %d", request.MaxOutputTokens)
+	}
+	if request.Temperature != nil {
+		t.Fatalf("expected temperature to be cleared")
+	}
+	if request.TopP != nil {
+		t.Fatalf("expected top_p to be cleared")
+	}
+}
+
+func ptrFloat64(v float64) *float64 {
+	return &v
+}

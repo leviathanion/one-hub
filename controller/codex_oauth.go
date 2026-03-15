@@ -28,15 +28,6 @@ const (
 	CodexOAuthStateCacheDuration = 10 * time.Minute
 )
 
-// Codex OAuth configuration constants.
-const (
-	CodexAuthorizeURL = "https://auth.openai.com/oauth/authorize"
-	CodexTokenURL     = "https://auth.openai.com/oauth/token"
-	CodexClientID     = "app_EMoamEEZ73f0CkXaXp7hrann"
-	CodexRedirectURI  = "http://localhost:1455/auth/callback"
-	CodexScopes       = "openid profile email offline_access"
-)
-
 // CodexOAuthStateData holds OAuth state data.
 type CodexOAuthStateData struct {
 	ChannelID    int    `json:"channel_id"`
@@ -108,16 +99,16 @@ func StartCodexOAuth(c *gin.Context) {
 	// Build OAuth authorization URL.
 	params := url.Values{}
 	params.Set("response_type", "code")
-	params.Set("client_id", CodexClientID)
-	params.Set("redirect_uri", CodexRedirectURI)
-	params.Set("scope", CodexScopes)
+	params.Set("client_id", codex.DefaultClientID)
+	params.Set("redirect_uri", codex.DefaultRedirectURI)
+	params.Set("scope", codex.DefaultScope)
 	params.Set("code_challenge", codeChallenge)
 	params.Set("code_challenge_method", "S256")
 	params.Set("state", state)
 	params.Set("id_token_add_organizations", "true")
 	params.Set("codex_cli_simplified_flow", "true")
 
-	authURL := fmt.Sprintf("%s?%s", CodexAuthorizeURL, params.Encode())
+	authURL := fmt.Sprintf("%s?%s", codex.AuthorizeEndpoint, params.Encode())
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
@@ -203,10 +194,13 @@ func CodexOAuthCallback(c *gin.Context) {
 	credentials := &codex.OAuth2Credentials{
 		AccessToken:  tokenResp.AccessToken,
 		RefreshToken: tokenResp.RefreshToken,
-		ClientID:     CodexClientID,
+		ClientID:     codex.DefaultClientID,
 		AccountID:    accountID,
 		TokenType:    tokenResp.TokenType,
 		ExpiresAt:    time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second),
+	}
+	if tokenResp.Scope != "" {
+		credentials.Scopes = strings.Fields(tokenResp.Scope)
 	}
 
 	// Serialize credentials.
@@ -295,13 +289,13 @@ func exchangeCodexCodeForToken(code, codeVerifier, state, proxyURL string) (*cod
 	// Prepare form-encoded request body.
 	requestBody := url.Values{}
 	requestBody.Set("grant_type", "authorization_code")
-	requestBody.Set("client_id", CodexClientID)
+	requestBody.Set("client_id", codex.DefaultClientID)
 	requestBody.Set("code", code)
-	requestBody.Set("redirect_uri", CodexRedirectURI)
+	requestBody.Set("redirect_uri", codex.DefaultRedirectURI)
 	requestBody.Set("code_verifier", codeVerifier)
 
 	// Build request.
-	req, err := http.NewRequest("POST", CodexTokenURL, strings.NewReader(requestBody.Encode()))
+	req, err := http.NewRequest("POST", codex.TokenEndpoint, strings.NewReader(requestBody.Encode()))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
