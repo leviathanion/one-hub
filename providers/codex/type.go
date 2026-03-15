@@ -56,14 +56,30 @@ type TokenRefreshError struct {
 	ErrorDescription string `json:"error_description"`
 }
 
+type oauth2CredentialsPayload struct {
+	AccessToken  string   `json:"access_token"`
+	RefreshToken string   `json:"refresh_token"`
+	ClientID     string   `json:"client_id,omitempty"`
+	AccountID    string   `json:"account_id,omitempty"`
+	ExpiresAt    any      `json:"expires_at,omitempty"`
+	TokenType    string   `json:"token_type,omitempty"`
+	Scopes       []string `json:"scopes,omitempty"`
+}
+
 // IsExpired reports whether token is expired (3 minute buffer).
 func (c *OAuth2Credentials) IsExpired() bool {
+	return c.NeedsRefreshWithin(3 * time.Minute)
+}
+
+// NeedsRefreshWithin reports whether the token should be refreshed within the given lead time.
+func (c *OAuth2Credentials) NeedsRefreshWithin(lead time.Duration) bool {
 	if c.ExpiresAt.IsZero() {
 		return true
 	}
-
-	buffer := 3 * time.Minute
-	return time.Now().Add(buffer).After(c.ExpiresAt)
+	if lead < 0 {
+		lead = 0
+	}
+	return time.Now().Add(lead).After(c.ExpiresAt)
 }
 
 // Refresh refreshes the access token.
@@ -71,6 +87,8 @@ func (c *OAuth2Credentials) Refresh(ctx context.Context, proxyURL string, maxRet
 	if c.RefreshToken == "" {
 		return fmt.Errorf("refresh token is empty")
 	}
+	hasContext := ctx != nil
+	ctx = ensureContext(ctx)
 
 	// Default client_id when missing.
 	clientID := c.ClientID
@@ -83,21 +101,29 @@ func (c *OAuth2Credentials) Refresh(ctx context.Context, proxyURL string, maxRet
 	data.Set("grant_type", "refresh_token")
 	data.Set("client_id", clientID)
 	data.Set("refresh_token", c.RefreshToken)
+	if scope := joinedScopes(c.Scopes); scope != "" {
+		data.Set("scope", scope)
+	}
 
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("token refresh canceled: %w", err)
+		}
 		if attempt > 0 {
 			// Exponential backoff, max 30s.
 			backoff := time.Duration(1<<uint(attempt-1)) * time.Second
 			if backoff > 30*time.Second {
 				backoff = 30 * time.Second
 			}
-			if ctx != nil {
+			if hasContext {
 				logger.LogError(ctx, fmt.Sprintf("[Codex] Token refresh retry %d/%d after %v", attempt, maxRetries, backoff))
 			} else {
 				logger.SysLog(fmt.Sprintf("[Codex] Token refresh retry %d/%d after %v", attempt, maxRetries, backoff))
 			}
-			time.Sleep(backoff)
+			if err := waitForRetry(ctx, backoff); err != nil {
+				return fmt.Errorf("token refresh canceled during backoff: %w", err)
+			}
 		}
 
 		// Create HTTP client.
@@ -116,7 +142,7 @@ func (c *OAuth2Credentials) Refresh(ctx context.Context, proxyURL string, maxRet
 		}
 
 		// Send refresh request.
-		req, err := http.NewRequest("POST", TokenEndpoint, strings.NewReader(data.Encode()))
+		req, err := http.NewRequestWithContext(ctx, "POST", TokenEndpoint, strings.NewReader(data.Encode()))
 		if err != nil {
 			lastErr = fmt.Errorf("failed to create refresh request: %w", err)
 			continue
@@ -178,7 +204,7 @@ func (c *OAuth2Credentials) Refresh(ctx context.Context, proxyURL string, maxRet
 
 		// Parse scope.
 		if tokenResp.Scope != "" {
-			c.Scopes = strings.Split(tokenResp.Scope, " ")
+			c.Scopes = strings.Fields(tokenResp.Scope)
 		}
 
 		// Compute expiry time.
@@ -186,7 +212,7 @@ func (c *OAuth2Credentials) Refresh(ctx context.Context, proxyURL string, maxRet
 			c.ExpiresAt = time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
 		}
 
-		if ctx != nil {
+		if hasContext {
 			logger.LogInfo(ctx, fmt.Sprintf("[Codex] Token refreshed successfully, expires at: %s", c.ExpiresAt.Format(time.RFC3339)))
 		} else {
 			logger.SysLog(fmt.Sprintf("[Codex] Token refreshed successfully, expires at: %s", c.ExpiresAt.Format(time.RFC3339)))
@@ -195,6 +221,45 @@ func (c *OAuth2Credentials) Refresh(ctx context.Context, proxyURL string, maxRet
 	}
 
 	return fmt.Errorf("token refresh failed after %d retries: %w", maxRetries, lastErr)
+}
+
+func ensureContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+func waitForRetry(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func joinedScopes(scopes []string) string {
+	if len(scopes) == 0 {
+		return ""
+	}
+
+	filtered := make([]string, 0, len(scopes))
+	for _, scope := range scopes {
+		scope = strings.TrimSpace(scope)
+		if scope == "" {
+			continue
+		}
+		filtered = append(filtered, scope)
+	}
+	return strings.Join(filtered, " ")
 }
 
 // extractAccountIDFromJWT extracts account_id from JWT access_token.
@@ -255,9 +320,69 @@ func (c *OAuth2Credentials) ToJSON() (string, error) {
 
 // FromJSON deserializes credentials.
 func FromJSON(jsonStr string) (*OAuth2Credentials, error) {
-	var creds OAuth2Credentials
-	if err := json.Unmarshal([]byte(jsonStr), &creds); err != nil {
+	var payload oauth2CredentialsPayload
+	decoder := json.NewDecoder(strings.NewReader(jsonStr))
+	decoder.UseNumber()
+	if err := decoder.Decode(&payload); err != nil {
 		return nil, err
 	}
-	return &creds, nil
+
+	creds := &OAuth2Credentials{
+		AccessToken:  payload.AccessToken,
+		RefreshToken: payload.RefreshToken,
+		ClientID:     payload.ClientID,
+		AccountID:    payload.AccountID,
+		TokenType:    payload.TokenType,
+		Scopes:       payload.Scopes,
+	}
+	if ts, ok := parseExpiryValue(payload.ExpiresAt); ok {
+		creds.ExpiresAt = ts
+	}
+
+	if creds.ExpiresAt.IsZero() {
+		var raw map[string]any
+		decoder = json.NewDecoder(strings.NewReader(jsonStr))
+		decoder.UseNumber()
+		if err := decoder.Decode(&raw); err == nil {
+			creds.ExpiresAt = parseCredentialExpiry(raw)
+		}
+	}
+
+	return creds, nil
+}
+
+func parseCredentialExpiry(raw map[string]any) time.Time {
+	for _, key := range []string{"expires_at", "expired", "expire", "expiresAt", "expiry", "expires"} {
+		value, ok := raw[key]
+		if !ok {
+			continue
+		}
+
+		if ts, ok := parseExpiryValue(value); ok {
+			return ts
+		}
+	}
+
+	return time.Time{}
+}
+
+func parseExpiryValue(value any) (time.Time, bool) {
+	switch v := value.(type) {
+	case string:
+		text := strings.TrimSpace(v)
+		if text == "" {
+			return time.Time{}, false
+		}
+		for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+			if ts, err := time.Parse(layout, text); err == nil {
+				return ts, true
+			}
+		}
+	case json.Number:
+		if unix, err := v.Int64(); err == nil && unix > 0 {
+			return time.Unix(unix, 0), true
+		}
+	}
+
+	return time.Time{}, false
 }
