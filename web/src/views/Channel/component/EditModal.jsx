@@ -88,11 +88,15 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
   const [expanded, setExpanded] = useState(false);
   const [inputValue, setInputValue] = useState('');
   const [batchFileImporting, setBatchFileImporting] = useState(false);
+  const [codexAuthFileImporting, setCodexAuthFileImporting] = useState(false);
+  const [codexBatchAuthFileImporting, setCodexBatchAuthFileImporting] = useState(false);
   const removeDuplicates = (array) => [...new Set(array)];
   const [modelSelectorOpen, setModelSelectorOpen] = useState(false);
   const [tempFormikValues, setTempFormikValues] = useState(null);
   const [tempSetFieldValue, setTempSetFieldValue] = useState(null);
   const batchFileInputRef = useRef(null);
+  const codexAuthFileInputRef = useRef(null);
+  const codexBatchAuthFileInputRef = useRef(null);
   const [codexOAuthVisible, setCodexOAuthVisible] = useState(false);
   const [codexAuthURL, setCodexAuthURL] = useState('');
   const [codexSessionId, setCodexSessionId] = useState('');
@@ -189,6 +193,10 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
   };
 
   const handleTypeChange = (setFieldValue, typeValue, values) => {
+    if (typeValue === 101) {
+      setBatchAdd(false);
+    }
+
     // 处理插件事务
     if (pluginList[typeValue]) {
       const newPluginValues = {};
@@ -313,9 +321,14 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
     }
   };
 
-  const submit = async (values, { setErrors, setStatus, setSubmitting }) => {
-    setSubmitting(true);
-    values = trims(values);
+  const prepareChannelPayload = (sourceValues) => {
+    const values = trims(JSON.parse(JSON.stringify(sourceValues)));
+    const modelMappingModel = [];
+
+    if (!Array.isArray(values.models) || values.models.length === 0) {
+      throw new Error(t('channel_edit.requiredModels'));
+    }
+
     if (values.base_url && values.base_url.endsWith('/')) {
       values.base_url = values.base_url.slice(0, values.base_url.length - 1);
     }
@@ -325,9 +338,6 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
     if (values.type === 18 && values.other === '') {
       values.other = 'v2.1';
     }
-    let res;
-
-    let modelMappingModel = [];
 
     if (values.model_mapping) {
       try {
@@ -348,10 +358,9 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
 
         values.model_mapping = JSON.stringify(cleanedMapping, null, 2);
       } catch (error) {
-        showError('Error parsing model_mapping:' + error.message);
+        throw new Error('Error parsing model_mapping: ' + error.message);
       }
     }
-    let modelHeadersKey = [];
 
     if (values.model_headers) {
       try {
@@ -366,23 +375,20 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
         for (const [key, value] of Object.entries(modelHeader)) {
           if (key && value && !(key in cleanedHeader)) {
             cleanedHeader[key] = value;
-            modelHeadersKey.push(key);
           }
         }
 
         values.model_headers = JSON.stringify(cleanedHeader, null, 2);
       } catch (error) {
-        showError('Error parsing model_headers:' + error.message);
+        throw new Error('Error parsing model_headers: ' + error.message);
       }
     }
 
     if (values.custom_parameter) {
       try {
-        // Validate that the custom_parameter is valid JSON
         JSON.parse(values.custom_parameter);
       } catch (error) {
-        showError('Error parsing custom_parameter: ' + error.message);
-        return;
+        throw new Error('Error parsing custom_parameter: ' + error.message);
       }
     }
 
@@ -390,18 +396,98 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
       values.disabled_stream = removeDuplicates(values.disabled_stream);
     }
 
-    // 获取现有的模型 ID
     const existingModelIds = values.models.map((model) => model.id);
-
-    // 找出在 modelMappingModel 中存在但不在 existingModelIds 中的模型
     const newModelIds = modelMappingModel.filter((id) => !existingModelIds.includes(id));
-
-    // 合并现有的模型 ID 和新的模型 ID，并去重
     const allUniqueModelIds = Array.from(new Set([...existingModelIds, ...newModelIds]));
 
-    // 创建新的 modelsStr
-    const modelsStr = allUniqueModelIds.join(',');
+    values.models = allUniqueModelIds.join(',');
     values.group = values.groups.join(',');
+
+    return values;
+  };
+
+  const handleCodexAuthFileImport = async (event, values, setFieldValue) => {
+    const input = event.target;
+    const [file] = Array.from(input.files || []);
+
+    if (!file) {
+      return;
+    }
+
+    setCodexAuthFileImporting(true);
+
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+
+      const res = await API.post('/api/codex/auth-files/parse', formData, {
+        headers: {
+          'Content-Type': 'multipart/form-data'
+        }
+      });
+
+      if (!res.data.success) {
+        showError(res.data.message || 'Failed to import auth file');
+        return;
+      }
+
+      const { credentials, suggested_name: suggestedName } = res.data.data;
+      setFieldValue('key', credentials);
+      if (!values.name && suggestedName) {
+        setFieldValue('name', suggestedName);
+      }
+      showSuccess('Auth file imported successfully');
+    } catch (error) {
+      showError(error.message || error);
+    } finally {
+      input.value = '';
+      setCodexAuthFileImporting(false);
+    }
+  };
+
+  const handleCodexBatchAuthFilesImport = async (event, values) => {
+    const input = event.target;
+    const files = Array.from(input.files || []);
+
+    if (files.length === 0) {
+      return;
+    }
+
+    setCodexBatchAuthFileImporting(true);
+
+    try {
+      const payload = prepareChannelPayload(values);
+      const formData = new FormData();
+      formData.append('channel', JSON.stringify(payload));
+      files.forEach((file) => {
+        formData.append('files', file);
+      });
+
+      const res = await API.post('/api/codex/auth-files/import', formData, {
+        headers: {
+          'Content-Type': 'multipart/form-data'
+        }
+      });
+
+      if (!res.data.success) {
+        showError(res.data.message || 'Failed to batch import auth files');
+        return;
+      }
+
+      showSuccess(`Imported ${res.data.data.count} Codex auth files`);
+      onOk(true);
+    } catch (error) {
+      showError(error.message || error);
+    } finally {
+      input.value = '';
+      setCodexBatchAuthFileImporting(false);
+    }
+  };
+
+  const submit = async (values, { setErrors, setStatus, setSubmitting }) => {
+    setSubmitting(true);
+    let res;
+    let payload;
 
     let baseApiUrl = '/api/channel/';
 
@@ -410,10 +496,20 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
     }
 
     try {
+      payload = prepareChannelPayload(values);
+    } catch (error) {
+      setSubmitting(false);
+      setStatus({ success: false });
+      showError(error.message);
+      setErrors({ submit: error.message });
+      return;
+    }
+
+    try {
       if (channelId) {
-        res = await API.put(baseApiUrl, { ...values, id: parseInt(channelId), models: modelsStr });
+        res = await API.put(baseApiUrl, { ...payload, id: parseInt(channelId) });
       } else {
-        res = await API.post(baseApiUrl, { ...values, models: modelsStr });
+        res = await API.post(baseApiUrl, payload);
       }
       const { success, message } = res.data;
       if (success) {
@@ -912,18 +1008,36 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                 <FormControl fullWidth error={Boolean(touched.key && errors.key)} sx={{ ...theme.typography.otherInput }}>
                   {!batchAdd ? (
                     <>
-                      <InputLabel htmlFor="channel-key-label">{customizeT(inputLabel.key)}</InputLabel>
-                      <OutlinedInput
-                        id="channel-key-label"
-                        label={customizeT(inputLabel.key)}
-                        type="text"
-                        value={values.key}
-                        name="key"
-                        onBlur={handleBlur}
-                        onChange={handleChange}
-                        inputProps={{}}
-                        aria-describedby="helper-text-channel-key-label"
-                      />
+                      {values.type === 101 ? (
+                        <TextField
+                          multiline
+                          fullWidth
+                          id="channel-key-label"
+                          label={customizeT(inputLabel.key)}
+                          value={values.key}
+                          name="key"
+                          onBlur={handleBlur}
+                          onChange={handleChange}
+                          aria-describedby="helper-text-channel-key-label"
+                          minRows={4}
+                          maxRows={12}
+                        />
+                      ) : (
+                        <>
+                          <InputLabel htmlFor="channel-key-label">{customizeT(inputLabel.key)}</InputLabel>
+                          <OutlinedInput
+                            id="channel-key-label"
+                            label={customizeT(inputLabel.key)}
+                            type="text"
+                            value={values.key}
+                            name="key"
+                            onBlur={handleBlur}
+                            onChange={handleChange}
+                            inputProps={{}}
+                            aria-describedby="helper-text-channel-key-label"
+                          />
+                        </>
+                      )}
                     </>
                   ) : (
                     <Box>
@@ -950,31 +1064,33 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                             type="file"
                             onChange={(event) => handleBatchFileImport(event, values.key, setFieldValue)}
                           />
-                          <Box
-                            sx={{
-                              mt: 1,
-                              display: 'flex',
-                              gap: 1,
-                              alignItems: 'center',
-                              justifyContent: 'space-between',
-                              flexWrap: 'wrap'
-                            }}
-                          >
-                            <Button
-                              size="small"
-                              variant="outlined"
-                              disabled={batchFileImporting}
-                              startIcon={
-                                batchFileImporting ? <Icon icon="svg-spinners:3-dots-scale" /> : <Icon icon="solar:upload-bold-duotone" />
-                              }
-                              onClick={() => batchFileInputRef.current?.click()}
+                          {values.type !== 101 && (
+                            <Box
+                              sx={{
+                                mt: 1,
+                                display: 'flex',
+                                gap: 1,
+                                alignItems: 'center',
+                                justifyContent: 'space-between',
+                                flexWrap: 'wrap'
+                              }}
                             >
-                              {t('channel_edit.batchUploadFiles')}
-                            </Button>
-                            <Typography variant="caption" color="text.secondary">
-                              {t('channel_edit.batchUploadFilesTip')}
-                            </Typography>
-                          </Box>
+                              <Button
+                                size="small"
+                                variant="outlined"
+                                disabled={batchFileImporting}
+                                startIcon={
+                                  batchFileImporting ? <Icon icon="svg-spinners:3-dots-scale" /> : <Icon icon="solar:upload-bold-duotone" />
+                                }
+                                onClick={() => batchFileInputRef.current?.click()}
+                              >
+                                {t('channel_edit.batchUploadFiles')}
+                              </Button>
+                              <Typography variant="caption" color="text.secondary">
+                                {t('channel_edit.batchUploadFilesTip')}
+                              </Typography>
+                            </Box>
+                          )}
                         </>
                       )}
                     </Box>
@@ -988,7 +1104,7 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                     <FormHelperText id="helper-tex-channel-key-label">
                       <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                         <span>{customizeT(inputPrompt.key)}</span>
-                        {channelId === 0 && (
+                        {channelId === 0 && values.type !== 101 && (
                           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
                             <Switch size="small" checked={Boolean(batchAdd)} onChange={(e) => setBatchAdd(e.target.checked)} />
                             <Typography variant="body2">{t('channel_edit.batchAdd')}</Typography>
@@ -1001,6 +1117,45 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
 
                 {values.type === 101 && !batchAdd && (
                   <Box sx={{ mt: 2, mb: 2 }}>
+                    <input
+                      ref={codexAuthFileInputRef}
+                      hidden
+                      type="file"
+                      accept=".json,application/json"
+                      onChange={(event) => handleCodexAuthFileImport(event, values, setFieldValue)}
+                    />
+                    {channelId === 0 && (
+                      <input
+                        ref={codexBatchAuthFileInputRef}
+                        hidden
+                        multiple
+                        type="file"
+                        accept=".json,application/json"
+                        onChange={(event) => handleCodexBatchAuthFilesImport(event, values)}
+                      />
+                    )}
+                    <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', mb: 2 }}>
+                      <Button
+                        variant="outlined"
+                        color="secondary"
+                        disabled={codexAuthFileImporting}
+                        onClick={() => codexAuthFileInputRef.current?.click()}
+                        startIcon={codexAuthFileImporting ? null : <Icon icon="solar:upload-bold-duotone" />}
+                      >
+                        {codexAuthFileImporting ? 'Importing auth file...' : 'Import Auth File'}
+                      </Button>
+                      {channelId === 0 && (
+                        <Button
+                          variant="outlined"
+                          color="secondary"
+                          disabled={codexBatchAuthFileImporting}
+                          onClick={() => codexBatchAuthFileInputRef.current?.click()}
+                          startIcon={codexBatchAuthFileImporting ? null : <Icon icon="solar:folder-with-files-bold-duotone" />}
+                        >
+                          {codexBatchAuthFileImporting ? 'Importing auth files...' : 'Batch Import Auth Files'}
+                        </Button>
+                      )}
+                    </Box>
                     <Button
                       variant="outlined"
                       color="primary"

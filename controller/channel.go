@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"one-api/common"
+	"one-api/common/config"
 	"one-api/common/utils"
 	"one-api/model"
 	"strconv"
@@ -66,13 +67,26 @@ func AddChannel(c *gin.Context) {
 		return
 	}
 	channel.CreatedTime = utils.GetTimestamp()
-	keys := strings.Split(channel.Key, "\n")
-
-	baseUrls := []string{}
-	if channel.BaseURL != nil && *channel.BaseURL != "" {
-		baseUrls = strings.Split(*channel.BaseURL, "\n")
+	channels := buildChannelsForCreate(channel)
+	err = model.BatchInsertChannels(channels)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
 	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+	})
+}
+
+func buildChannelsForCreate(channel model.Channel) []model.Channel {
+	keys := splitChannelKeysForCreate(channel)
+	baseUrls := splitBaseURLsForCreate(channel)
 	channels := make([]model.Channel, 0, len(keys))
+
 	for index, key := range keys {
 		if key == "" {
 			continue
@@ -91,18 +105,22 @@ func AddChannel(c *gin.Context) {
 
 		channels = append(channels, localChannel)
 	}
-	err = model.BatchInsertChannels(channels)
-	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": err.Error(),
-		})
-		return
+
+	return channels
+}
+
+func splitChannelKeysForCreate(channel model.Channel) []string {
+	if channel.Type == config.ChannelTypeCodex {
+		return []string{channel.Key}
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "",
-	})
+	return strings.Split(channel.Key, "\n")
+}
+
+func splitBaseURLsForCreate(channel model.Channel) []string {
+	if channel.BaseURL == nil || *channel.BaseURL == "" {
+		return nil
+	}
+	return strings.Split(*channel.BaseURL, "\n")
 }
 
 func DeleteChannel(c *gin.Context) {
