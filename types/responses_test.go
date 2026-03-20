@@ -38,6 +38,60 @@ func TestSummaryResponsesListUnmarshalSupportsArrayAndObject(t *testing.T) {
 	}
 }
 
+func TestInputResponsesMarshalKeepsEmptySummaryForReasoning(t *testing.T) {
+	input := InputResponses{
+		Type:    InputTypeReasoning,
+		ID:      "rs_1",
+		Status:  ResponseStatusCompleted,
+		Summary: SummaryResponsesList{},
+	}
+
+	data, err := json.Marshal(input)
+	if err != nil {
+		t.Fatalf("unexpected marshal error: %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("unexpected payload unmarshal error: %v", err)
+	}
+
+	summary, ok := payload["summary"].([]any)
+	if !ok {
+		t.Fatalf("expected summary array to be preserved, got %#v", payload["summary"])
+	}
+	if len(summary) != 0 {
+		t.Fatalf("expected empty summary array, got %#v", summary)
+	}
+}
+
+func TestResponsesOutputMarshalKeepsEmptySummaryForReasoning(t *testing.T) {
+	output := ResponsesOutput{
+		Type:    InputTypeReasoning,
+		ID:      "rs_1",
+		Status:  ResponseStatusCompleted,
+		Summary: SummaryResponsesList{},
+	}
+
+	data, err := json.Marshal(output)
+	if err != nil {
+		t.Fatalf("unexpected marshal error: %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("unexpected payload unmarshal error: %v", err)
+	}
+
+	summary, ok := payload["summary"].([]any)
+	if !ok {
+		t.Fatalf("expected summary array to be preserved, got %#v", payload["summary"])
+	}
+	if len(summary) != 0 {
+		t.Fatalf("expected empty summary array, got %#v", summary)
+	}
+}
+
 func TestResponsesOutputStringContentSupportsTypedSlices(t *testing.T) {
 	output := ResponsesOutput{
 		Type: InputTypeMessage,

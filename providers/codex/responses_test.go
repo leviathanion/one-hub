@@ -1,7 +1,9 @@
 package codex
 
 import (
+	"encoding/json"
 	"io"
+	"strings"
 	"testing"
 
 	"one-api/types"
@@ -43,6 +45,35 @@ func TestCollectResponsesStreamResponseAcceptsDataWithoutSpace(t *testing.T) {
 
 	if provider.Usage.TotalTokens != 8 {
 		t.Fatalf("expected usage total tokens to be updated, got %d", provider.Usage.TotalTokens)
+	}
+}
+
+func TestCollectResponsesStreamResponsePreservesEmptyReasoningSummary(t *testing.T) {
+	provider := &CodexProvider{}
+	provider.Usage = &types.Usage{}
+
+	stream := &fakeStringStream{
+		dataChan: make(chan string),
+		errChan:  make(chan error),
+	}
+
+	go func() {
+		stream.dataChan <- "event: response.completed\ndata:{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[{\"type\":\"reasoning\",\"id\":\"rs_1\",\"status\":\"completed\",\"summary\":[]}],\"usage\":{\"input_tokens\":3,\"output_tokens\":5,\"total_tokens\":8}}}\n"
+		stream.errChan <- io.EOF
+	}()
+
+	resp, errWithCode := provider.collectResponsesStreamResponse(stream)
+	if errWithCode != nil {
+		t.Fatalf("collectResponsesStreamResponse returned error: %v", errWithCode.Message)
+	}
+
+	data, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("unexpected marshal error: %v", err)
+	}
+
+	if !strings.Contains(string(data), "\"summary\":[]") {
+		t.Fatalf("expected marshaled response to preserve empty summary array, got %s", string(data))
 	}
 }
 

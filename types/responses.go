@@ -334,6 +334,27 @@ type InputResponses struct {
 	Input any `json:"input,omitempty"` // The input to the tool call. This can be a string or a list of ContentResponses.
 }
 
+func (i InputResponses) MarshalJSON() ([]byte, error) {
+	type inputResponsesAlias InputResponses
+
+	raw, err := json.Marshal(inputResponsesAlias(i))
+	if err != nil {
+		return nil, err
+	}
+
+	if i.Type != InputTypeReasoning {
+		return raw, nil
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, err
+	}
+
+	payload["summary"] = summaryResponsesForMarshal(i.Summary)
+	return json.Marshal(payload)
+}
+
 func (i *InputResponses) ParseContent() ([]ContentResponses, error) {
 	contents := make([]ContentResponses, 0)
 
@@ -475,6 +496,13 @@ func (s *SummaryResponsesList) UnmarshalJSON(data []byte) error {
 
 func (s SummaryResponsesList) MarshalJSON() ([]byte, error) {
 	return json.Marshal([]SummaryResponses(s))
+}
+
+func summaryResponsesForMarshal(summary SummaryResponsesList) []SummaryResponses {
+	if len(summary) == 0 {
+		return make([]SummaryResponses, 0)
+	}
+	return []SummaryResponses(summary)
 }
 
 type ResponsesTools struct {
@@ -739,6 +767,27 @@ type ResponsesOutput struct {
 	Result        any    `json:"result,omitempty"`         // The result of the image generation call.
 	Size          string `json:"size,omitempty"`           // The size of the image to be generated.
 	RevisedPrompt any    `json:"revised_prompt,omitempty"` // The revised prompt for the image generation call.
+}
+
+func (m ResponsesOutput) MarshalJSON() ([]byte, error) {
+	type responsesOutputAlias ResponsesOutput
+
+	raw, err := json.Marshal(responsesOutputAlias(m))
+	if err != nil {
+		return nil, err
+	}
+
+	if m.Type != InputTypeReasoning {
+		return raw, nil
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, err
+	}
+
+	payload["summary"] = summaryResponsesForMarshal(m.Summary)
+	return json.Marshal(payload)
 }
 
 type ResponsesOutputToolCall struct {
