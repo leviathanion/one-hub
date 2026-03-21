@@ -140,8 +140,9 @@ func RequestStream[T streamable](requester *HTTPRequester, resp *http.Response, 
 		handlerPrefix: handlerPrefix,
 		NoTrim:        false,
 
+		// Keep data unbuffered so terminal errors cannot overtake emitted chunks.
 		DataChan: make(chan T),
-		ErrChan:  make(chan error),
+		ErrChan:  make(chan error, 1),
 	}
 
 	return stream, nil
