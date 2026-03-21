@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
 )
 
@@ -173,62 +172,50 @@ func (r *relayResponses) chatToResponseStreamClient(stream requester.StreamReade
 	requester.SetEventStreamHeaders(r.c)
 	dataChan, errChan := stream.Recv()
 
-	// 创建一个done channel用于通知处理完成
-	done := make(chan struct{})
-
 	defer stream.Close()
+	streamWriter := relay_util.NewBufferedStreamWriter(r.c.Writer, 0)
+	relay_util.SetStreamWriter(r.c, streamWriter)
+	defer func() {
+		_ = streamWriter.Close()
+		relay_util.ClearStreamWriter(r.c)
+	}()
 	var isFirstResponse bool
 
 	converter := relay_util.NewOpenAIResponsesStreamConverter(r.c, &r.responsesRequest, r.provider.GetUsage())
 
-	// 在新的goroutine中处理stream数据
-	gopool.Go(func() {
-		defer close(done)
+	for {
+		select {
+		case data, ok := <-dataChan:
+			if !ok {
+				return firstResponseTime
+			}
 
-		for {
+			if !isFirstResponse {
+				firstResponseTime = time.Now()
+				isFirstResponse = true
+			}
+
 			select {
-			case data, ok := <-dataChan:
-				if !ok {
-					return
-				}
-
-				if !isFirstResponse {
-					firstResponseTime = time.Now()
-					isFirstResponse = true
-				}
-
-				// 尝试写入数据，如果客户端断开也继续处理
+			case <-r.c.Request.Context().Done():
+			default:
+				converter.ProcessStreamData(data)
+			}
+		case err := <-errChan:
+			if !errors.Is(err, io.EOF) {
 				select {
 				case <-r.c.Request.Context().Done():
-					// 客户端已断开，不执行任何操作，直接跳过
 				default:
-					// 客户端正常，发送数据
-					converter.ProcessStreamData(data)
+					converter.ProcessError(err.Error())
 				}
 
-			case err := <-errChan:
-				if !errors.Is(err, io.EOF) {
-					// 处理错误情况
-					select {
-					case <-r.c.Request.Context().Done():
-						// 客户端已断开，不执行任何操作，直接跳过
-					default:
-						// 客户端正常，发送错误信息
-						converter.ProcessError(err.Error())
-					}
-
-					logger.LogError(r.c.Request.Context(), "Stream err:"+err.Error())
-				} else {
-					// 要发送最后的完成状态
-					converter.ProcessStreamData("[DONE]")
-				}
-				return
+				logger.LogError(r.c.Request.Context(), "Stream err:"+err.Error())
+			} else {
+				converter.ProcessStreamData("[DONE]")
 			}
+			return firstResponseTime
 		}
-	})
+	}
 
-	// 等待处理完成
-	<-done
 	return firstResponseTime
 }
 

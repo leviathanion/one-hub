@@ -17,6 +17,7 @@ import (
 	"one-api/model"
 	"one-api/providers"
 	providersBase "one-api/providers/base"
+	"one-api/relay/relay_util"
 	"one-api/types"
 	"regexp"
 	"strings"
@@ -344,98 +345,74 @@ type StreamEndHandler func() string
 func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface[string], endHandler StreamEndHandler) (firstResponseTime time.Time, errWithOP *types.OpenAIErrorWithStatusCode) {
 	requester.SetEventStreamHeaders(c)
 	dataChan, errChan := stream.Recv()
-
-	// 创建一个done channel用于通知处理完成
-	done := make(chan struct{})
 	var finalErr *types.OpenAIErrorWithStatusCode
 
 	defer stream.Close()
+	streamWriter := relay_util.NewBufferedStreamWriter(c.Writer, 0)
+	defer streamWriter.Close()
 
 	var isFirstResponse bool
 
-	// 在新的goroutine中处理stream数据
-	go func() {
-		defer close(done)
+	for {
+		select {
+		case data, ok := <-dataChan:
+			if !ok {
+				return firstResponseTime, nil
+			}
 
-		for {
+			streamData := "data: " + data + "\n\n"
+			if !isFirstResponse {
+				firstResponseTime = time.Now()
+				isFirstResponse = true
+			}
+
 			select {
-			case data, ok := <-dataChan:
-				if !ok {
-					return
+			case <-c.Request.Context().Done():
+			default:
+				_, _ = streamWriter.WriteString(streamData)
+			}
+		case err := <-errChan:
+			if !errors.Is(err, io.EOF) {
+				errPayload := map[string]any{
+					"error": map[string]any{
+						"message": err.Error(),
+						"type":    "stream_error",
+						"code":    "stream_error",
+					},
 				}
-				streamData := "data: " + data + "\n\n"
-
-				if !isFirstResponse {
-					firstResponseTime = time.Now()
-					isFirstResponse = true
-				}
-
-				// 尝试写入数据，如果客户端断开也继续处理
+				errJSON, _ := json.Marshal(errPayload)
+				errMsg := "data: " + string(errJSON) + "\n\n"
 				select {
 				case <-c.Request.Context().Done():
-					// 客户端已断开，不执行任何操作，直接跳过
 				default:
-					// 客户端正常，发送数据
-					c.Writer.Write([]byte(streamData))
-					c.Writer.Flush()
+					_, _ = streamWriter.WriteString(errMsg)
 				}
 
-			case err := <-errChan:
-				if !errors.Is(err, io.EOF) {
-					// 处理错误情况
-					errPayload := map[string]any{
-						"error": map[string]any{
-							"message": err.Error(),
-							"type":    "stream_error",
-							"code":    "stream_error",
-						},
-					}
-					errJSON, _ := json.Marshal(errPayload)
-					errMsg := "data: " + string(errJSON) + "\n\n"
-					select {
-					case <-c.Request.Context().Done():
-						// 客户端已断开，不执行任何操作，直接跳过
-					default:
-						// 客户端正常，发送错误信息
-						c.Writer.Write([]byte(errMsg))
-						c.Writer.Flush()
-					}
-
-					finalErr = common.StringErrorWrapper(err.Error(), "stream_error", 900)
-					logger.LogError(c.Request.Context(), "Stream err:"+err.Error())
-				} else {
-					// 正常结束，处理endHandler
-					if finalErr == nil && endHandler != nil {
-						streamData := endHandler()
-						if streamData != "" {
-							select {
-							case <-c.Request.Context().Done():
-								// 客户端已断开，不执行任何操作，直接跳过
-							default:
-								// 客户端正常，发送数据
-								c.Writer.Write([]byte("data: " + streamData + "\n\n"))
-								c.Writer.Flush()
-							}
+				finalErr = common.StringErrorWrapper(err.Error(), "stream_error", 900)
+				logger.LogError(c.Request.Context(), "Stream err:"+err.Error())
+			} else {
+				if finalErr == nil && endHandler != nil {
+					streamData := endHandler()
+					if streamData != "" {
+						select {
+						case <-c.Request.Context().Done():
+						default:
+							_, _ = streamWriter.WriteString("data: " + streamData + "\n\n")
 						}
 					}
-
-					// 发送结束标记
-					streamData := "data: [DONE]\n\n"
-					select {
-					case <-c.Request.Context().Done():
-						// 客户端已断开，不执行任何操作，直接跳过
-					default:
-						c.Writer.Write([]byte(streamData))
-						c.Writer.Flush()
-					}
 				}
-				return
-			}
-		}
-	}()
 
-	// 等待处理完成
-	<-done
+				select {
+				case <-c.Request.Context().Done():
+				default:
+					_, _ = streamWriter.WriteString("data: [DONE]\n\n")
+				}
+			}
+			return firstResponseTime, nil
+		}
+	}
+
+	// Unreachable; the compiler still requires an explicit return here.
 	return firstResponseTime, nil
 }
 
@@ -443,81 +420,57 @@ func responseGeneralStreamClient(c *gin.Context, stream requester.StreamReaderIn
 	requester.SetEventStreamHeaders(c)
 	dataChan, errChan := stream.Recv()
 
-	// 创建一个done channel用于通知处理完成
-	done := make(chan struct{})
-	// var finalErr *types.OpenAIErrorWithStatusCode
-
 	defer stream.Close()
+	streamWriter := relay_util.NewBufferedStreamWriter(c.Writer, 0)
+	defer streamWriter.Close()
 	var isFirstResponse bool
 
-	// 在新的goroutine中处理stream数据
-	go func() {
-		defer close(done)
-
-		for {
+	for {
+		select {
+		case data, ok := <-dataChan:
+			if !ok {
+				return firstResponseTime
+			}
+			if !isFirstResponse {
+				firstResponseTime = time.Now()
+				isFirstResponse = true
+			}
 			select {
-			case data, ok := <-dataChan:
-				if !ok {
-					return
+			case <-c.Request.Context().Done():
+			default:
+				_, _ = streamWriter.WriteString(data)
+			}
+		case err := <-errChan:
+			if !errors.Is(err, io.EOF) {
+				errPayload := map[string]any{
+					"type":    "error",
+					"code":    "stream_error",
+					"message": err.Error(),
 				}
-				if !isFirstResponse {
-					firstResponseTime = time.Now()
-					isFirstResponse = true
-				}
-				// 尝试写入数据，如果客户端断开也继续处理
+				errJSON, _ := json.Marshal(errPayload)
+				errEvent := "event: error\ndata: " + string(errJSON) + "\n\n"
 				select {
 				case <-c.Request.Context().Done():
-					// 客户端已断开，不执行任何操作，直接跳过
 				default:
-					// 客户端正常，发送数据
-					fmt.Fprint(c.Writer, data)
-					c.Writer.Flush()
+					_, _ = streamWriter.WriteString(errEvent)
 				}
 
-			case err := <-errChan:
-				if !errors.Is(err, io.EOF) {
-					// 处理错误情况
-					errPayload := map[string]any{
-						"type":    "error",
-						"code":    "stream_error",
-						"message": err.Error(),
-					}
-					errJSON, _ := json.Marshal(errPayload)
-					errEvent := "event: error\ndata: " + string(errJSON) + "\n\n"
+				logger.LogError(c.Request.Context(), "Stream err:"+err.Error())
+			} else if endHandler != nil {
+				streamData := endHandler()
+				if streamData != "" {
 					select {
 					case <-c.Request.Context().Done():
-						// 客户端已断开，不执行任何操作，直接跳过
 					default:
-						// 客户端正常，发送错误信息
-						fmt.Fprint(c.Writer, errEvent)
-						c.Writer.Flush()
-					}
-
-					logger.LogError(c.Request.Context(), "Stream err:"+err.Error())
-				} else {
-					// 正常结束，处理endHandler
-					if endHandler != nil {
-						streamData := endHandler()
-						if streamData != "" {
-							select {
-							case <-c.Request.Context().Done():
-								// 客户端已断开，只记录数据
-							default:
-								// 客户端正常，发送数据
-								fmt.Fprint(c.Writer, streamData)
-								c.Writer.Flush()
-							}
-						}
+						_, _ = streamWriter.WriteString(streamData)
 					}
 				}
-				return
 			}
+			return firstResponseTime
 		}
-	}()
+	}
 
-	// 等待处理完成
-	<-done
-
+	// Unreachable; the compiler still requires an explicit return here.
 	return firstResponseTime
 }
 

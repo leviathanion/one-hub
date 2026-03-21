@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"one-api/common/utils"
 	"one-api/types"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -29,6 +30,8 @@ type OpenAIResponsesStreamConverter struct {
 	nowStatus         string
 	lastToolCallIndex int
 	usage             *types.Usage
+	partTextBuilder   strings.Builder
+	argsBuilder       strings.Builder
 }
 
 func NewOpenAIResponsesStreamConverter(c *gin.Context, request *types.OpenAIResponsesRequest, usage *types.Usage) *OpenAIResponsesStreamConverter {
@@ -186,7 +189,8 @@ func (converter *OpenAIResponsesStreamConverter) createNewItem(choice types.Chat
 	switch currentType {
 	case types.InputTypeFunctionCall:
 		if len(choice.Delta.ToolCalls) > 0 && choice.Delta.ToolCalls[0].Function != nil {
-			converter.item.Arguments = &choice.Delta.ToolCalls[0].Function.Arguments
+			converter.argsBuilder.Reset()
+			converter.item.Arguments = nil
 			converter.item.CallID = choice.Delta.ToolCalls[0].Id
 			converter.item.Name = choice.Delta.ToolCalls[0].Function.Name
 		}
@@ -262,6 +266,7 @@ func (converter *OpenAIResponsesStreamConverter) processMessage(choice types.Cha
 			Type: types.ContentTypeOutputText,
 			Text: "",
 		}
+		converter.partTextBuilder.Reset()
 
 		response := converter.buildStreamResponseWithItemID("response.content_part.added")
 		response.ContentIndex = &converter.contentIndex
@@ -276,7 +281,7 @@ func (converter *OpenAIResponsesStreamConverter) processMessage(choice types.Cha
 	converter.sendStreamEvent(response, "response.output_text.delta")
 
 	// 处理文本增量
-	converter.part.Text += choice.Delta.Content
+	converter.partTextBuilder.WriteString(choice.Delta.Content)
 }
 
 // 结束message part
@@ -285,6 +290,7 @@ func (converter *OpenAIResponsesStreamConverter) doneMessagePart() {
 	// 先结束掉 response.output_text.done
 	response := converter.buildStreamResponseWithItemID("response.output_text.done")
 	response.ContentIndex = &converter.contentIndex
+	converter.part.Text = converter.partTextBuilder.String()
 	text := converter.part.Text
 	response.Text = &text
 	converter.sendStreamEvent(response, "response.output_text.done")
@@ -321,6 +327,7 @@ func (converter *OpenAIResponsesStreamConverter) processReasoning(choice types.C
 			Type: types.ContentTypeSummaryText,
 			Text: "",
 		}
+		converter.partTextBuilder.Reset()
 
 		response := converter.buildStreamResponseWithItemID("response.reasoning_summary_part.added")
 		response.SummaryIndex = &converter.summaryIndex
@@ -335,7 +342,7 @@ func (converter *OpenAIResponsesStreamConverter) processReasoning(choice types.C
 	converter.sendStreamEvent(response, "response.reasoning_summary_text.delta")
 
 	// 处理文本增量
-	converter.part.Text += choice.Delta.ReasoningContent
+	converter.partTextBuilder.WriteString(choice.Delta.ReasoningContent)
 }
 
 // 结束reasoning part
@@ -343,6 +350,7 @@ func (converter *OpenAIResponsesStreamConverter) doneReasoningPart() {
 	// 先结束掉 response.reasoning_summary_text.done
 	response := converter.buildStreamResponseWithItemID("response.reasoning_summary_text.done")
 	response.SummaryIndex = &converter.summaryIndex
+	converter.part.Text = converter.partTextBuilder.String()
 	text := converter.part.Text
 	response.Text = &text
 	converter.sendStreamEvent(response, "response.reasoning_summary_text.done")
@@ -367,12 +375,11 @@ func (converter *OpenAIResponsesStreamConverter) processFunctionCall(choice type
 		tool := choice.Delta.ToolCalls[0]
 		response.Delta = tool.Function.Arguments
 
-		arguments := ""
-		if converter.item.Arguments != nil {
-			arguments = *converter.item.Arguments
+		if converter.argsBuilder.Len() == 0 && converter.item.Arguments != nil {
+			converter.argsBuilder.WriteString(*converter.item.Arguments)
 		}
-
-		arguments += tool.Function.Arguments
+		converter.argsBuilder.WriteString(tool.Function.Arguments)
+		arguments := converter.argsBuilder.String()
 		converter.item.Arguments = &arguments
 	}
 
@@ -382,6 +389,10 @@ func (converter *OpenAIResponsesStreamConverter) processFunctionCall(choice type
 // 结束function call
 func (converter *OpenAIResponsesStreamConverter) doneFunctionCall() {
 	response := converter.buildStreamResponseWithItemID("response.function_call_arguments.done")
+	if converter.item != nil && converter.argsBuilder.Len() > 0 {
+		arguments := converter.argsBuilder.String()
+		converter.item.Arguments = &arguments
+	}
 	response.Arguments = converter.item.Arguments
 
 	converter.sendStreamEvent(response, "response.function_call_arguments.done")
@@ -441,12 +452,12 @@ func (converter *OpenAIResponsesStreamConverter) sendStreamEvent(resp any, respo
 		return
 	}
 
-	_, _ = converter.c.Writer.WriteString("event: ")
-	_, _ = converter.c.Writer.WriteString(responseType)
-	_, _ = converter.c.Writer.WriteString("\ndata: ")
-	_, _ = converter.c.Writer.Write(respStr)
-	_, _ = converter.c.Writer.WriteString("\n\n")
-	converter.c.Writer.Flush()
+	writer := GetStreamWriter(converter.c)
+	_, _ = writer.WriteString("event: ")
+	_, _ = writer.WriteString(responseType)
+	_, _ = writer.WriteString("\ndata: ")
+	_, _ = writer.Write(respStr)
+	_, _ = writer.WriteString("\n\n")
 }
 
 // 错误响应

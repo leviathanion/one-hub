@@ -672,11 +672,11 @@ type TextResponses struct {
 }
 
 func (cc *OpenAIResponsesResponses) GetContent() string {
-	var content string
+	var content strings.Builder
 	for _, output := range cc.Output {
-		content += output.StringContent()
+		content.WriteString(output.StringContent())
 	}
-	return content
+	return content.String()
 }
 
 func (m ResponsesOutput) StringContent() string {
@@ -691,17 +691,17 @@ func (m ResponsesOutput) StringContent() string {
 	}
 	contentItems, ok := m.Content.([]ContentResponses)
 	if ok {
-		var contentStr string
+		var contentStr strings.Builder
 		for _, contentItem := range contentItems {
 			if contentItem.Text != "" {
-				contentStr += contentItem.Text
+				contentStr.WriteString(contentItem.Text)
 			}
 		}
-		return contentStr
+		return contentStr.String()
 	}
 	contentList, ok := m.Content.([]any)
 	if ok {
-		var contentStr string
+		var contentStr strings.Builder
 		for _, contentItem := range contentList {
 			contentMap, ok := contentItem.(map[string]any)
 			if !ok {
@@ -709,11 +709,11 @@ func (m ResponsesOutput) StringContent() string {
 			}
 
 			if subStr, ok := contentMap["text"].(string); ok && subStr != "" {
-				contentStr += subStr
+				contentStr.WriteString(subStr)
 			}
 
 		}
-		return contentStr
+		return contentStr.String()
 	}
 	return ""
 }
@@ -723,13 +723,13 @@ func (m ResponsesOutput) GetSummaryString() string {
 		return ""
 	}
 
-	summary := ""
+	var summary strings.Builder
 	for _, item := range m.Summary {
 		if item.Type == ContentTypeSummaryText {
-			summary += item.Text
+			summary.WriteString(item.Text)
 		}
 	}
-	return summary
+	return summary.String()
 }
 
 type IncompleteDetail struct {

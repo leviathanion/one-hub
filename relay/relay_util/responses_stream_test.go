@@ -150,6 +150,33 @@ func TestResponsesStreamConverterResetsPartIndexesPerOutputItem(t *testing.T) {
 	}
 }
 
+func TestResponsesStreamConverterFunctionArgumentsDoNotDuplicate(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest("GET", "/", nil)
+
+	converter := NewOpenAIResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: "gpt-5"}, &types.Usage{})
+
+	converter.ProcessStreamData(`{"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"gpt-5","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"lookup","arguments":"{\"a\":"}}]},"finish_reason":null}]}`)
+	converter.ProcessStreamData(`{"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"gpt-5","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"lookup","arguments":"1}"}}]},"finish_reason":"tool_calls"}]}`)
+	converter.ProcessStreamData("[DONE]")
+
+	events := parseSSEEvents(t, recorder.Body.String())
+	done := mustUnmarshalEvent(t, events, "response.function_call_arguments.done")
+	if done.Arguments == nil {
+		t.Fatal("expected arguments in function_call_arguments.done")
+	}
+	arguments, ok := done.Arguments.(string)
+	if !ok {
+		t.Fatalf("expected arguments to be a string, got %T", done.Arguments)
+	}
+	if arguments != `{"a":1}` {
+		t.Fatalf("expected merged arguments without duplication, got %q", arguments)
+	}
+}
+
 type sseEvent struct {
 	Event string
 	Data  string
