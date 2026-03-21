@@ -84,69 +84,25 @@ func GetTokenNum(tokenEncoder *tiktoken.Tiktoken, text string) int {
 }
 
 func CountTokenMessages(messages []types.ChatCompletionMessage, model string, preCostType int) int {
-
 	if preCostType == config.PreContNotAll {
 		return 0
 	}
 
 	tokenEncoder := GetTokenEncoder(model)
-	// Reference:
-	// https://github.com/openai/openai-cookbook/blob/main/examples/How_to_count_tokens_with_tiktoken.ipynb
-	// https://github.com/pkoukk/tiktoken-go/issues/6
-	//
-	// Every message follows <|start|>{role/name}\n{content}<|end|>\n
-	var tokensPerMessage int
-	var tokensPerName int
-	if model == "gpt-3.5-turbo-0301" {
-		tokensPerMessage = 4
-		tokensPerName = -1 // If there's a name, the role is omitted
-	} else {
-		tokensPerMessage = 3
-		tokensPerName = 1
-	}
+	tokensPerMessage, tokensPerName := getMessageTokenCosts(model)
 	tokenNum := 0
 	var textMsg strings.Builder
 
 	for _, message := range messages {
 		tokenNum += tokensPerMessage
-		switch v := message.Content.(type) {
-		case string:
-			textMsg.WriteString(v + "\n")
-		case []any:
-			for _, it := range v {
-				m := it.(map[string]any)
-				switch m["type"] {
-				case "text":
-					textMsg.WriteString(m["text"].(string) + "\n")
-				case "image_url":
-					if preCostType == config.PreCostNotImage {
-						continue
-					}
-					imageUrl, ok := m["image_url"].(map[string]any)
-					if !ok {
-						continue
-					}
-					url := imageUrl["url"].(string)
-					detail := ""
-					if imageUrl["detail"] != nil {
-						detail = imageUrl["detail"].(string)
-					}
-					countImageTokens := getCountImageFun(model)
-					imageTokens, err := countImageTokens(url, detail, model)
-					if err != nil {
-						//Due to the excessive length of the error information, only extract and record the most critical part.
-						logger.SysError("error counting image tokens: " + err.Error())
-					} else {
-						tokenNum += imageTokens
-					}
-				}
-			}
-		}
-		textMsg.WriteString(message.Role + "\n")
+		tokenNum += appendContentTokenData(&textMsg, message.Content, model, preCostType)
+		textMsg.WriteString(message.Role)
+		textMsg.WriteByte('\n')
 
 		if message.Name != nil {
 			tokenNum += tokensPerName
-			textMsg.WriteString(*message.Name + "\n")
+			textMsg.WriteString(*message.Name)
+			textMsg.WriteByte('\n')
 		}
 	}
 
@@ -159,34 +115,22 @@ func CountTokenMessages(messages []types.ChatCompletionMessage, model string, pr
 }
 
 func CountTokenInputMessages(input any, model string, preCostType int) int {
-
 	if preCostType == config.PreContNotAll {
 		return 0
 	}
 
 	tokenEncoder := GetTokenEncoder(model)
-	// Reference:
-	// https://github.com/openai/openai-cookbook/blob/main/examples/How_to_count_tokens_with_tiktoken.ipynb
-	// https://github.com/pkoukk/tiktoken-go/issues/6
-	//
-	// Every message follows <|start|>{role/name}\n{content}<|end|>\n
-	var tokensPerMessage int
-	var tokensPerName int
-	if model == "gpt-3.5-turbo-0301" {
-		tokensPerMessage = 4
-		tokensPerName = -1 // If there's a name, the role is omitted
-	} else {
-		tokensPerMessage = 3
-		tokensPerName = 1
-	}
-	tokenNum := 0
 
 	content, ok := input.(string)
 	if ok {
-		tokenNum = GetTokenNum(tokenEncoder, content)
+		tokenNum := GetTokenNum(tokenEncoder, content)
 		tokenNum += 3
 
 		return tokenNum
+	}
+
+	if messages, ok := responsesInputToMessagesFast(input); ok {
+		return CountTokenMessages(messages, model, preCostType)
 	}
 
 	jsonStr, err := json.Marshal(input)
@@ -195,7 +139,6 @@ func CountTokenInputMessages(input any, model string, preCostType int) int {
 		return 0
 	}
 
-	var textMsg strings.Builder
 	var messages []types.ChatCompletionMessage
 	err = json.Unmarshal(jsonStr, &messages)
 	if err != nil {
@@ -203,54 +146,7 @@ func CountTokenInputMessages(input any, model string, preCostType int) int {
 		return 0
 	}
 
-	for _, message := range messages {
-		tokenNum += tokensPerMessage
-		switch v := message.Content.(type) {
-		case string:
-			textMsg.WriteString(v + "\n")
-		case []any:
-			for _, it := range v {
-				m := it.(map[string]any)
-				switch m["type"] {
-				case "text":
-					textMsg.WriteString(m["text"].(string) + "\n")
-				case "image_url":
-					if preCostType == config.PreCostNotImage {
-						continue
-					}
-					imageUrl, ok := m["image_url"].(map[string]any)
-					if !ok {
-						continue
-					}
-					url := imageUrl["url"].(string)
-					detail := ""
-					if imageUrl["detail"] != nil {
-						detail = imageUrl["detail"].(string)
-					}
-					countImageTokens := getCountImageFun(model)
-					imageTokens, err := countImageTokens(url, detail, model)
-					if err != nil {
-						//Due to the excessive length of the error information, only extract and record the most critical part.
-						logger.SysError("error counting image tokens: " + err.Error())
-					} else {
-						tokenNum += imageTokens
-					}
-				}
-			}
-		}
-		textMsg.WriteString(message.Role + "\n")
-		if message.Name != nil {
-			tokenNum += tokensPerName
-			textMsg.WriteString(*message.Name + "\n")
-		}
-	}
-
-	if textMsg.Len() > 0 {
-		tokenNum += GetTokenNum(tokenEncoder, textMsg.String())
-	}
-
-	tokenNum += 3 // Every reply is primed with <|start|>assistant<|message|>
-	return tokenNum
+	return CountTokenMessages(messages, model, preCostType)
 }
 
 func CountTokenRerankMessages(messages types.RerankRequest, model string, preCostType int) int {
@@ -287,6 +183,200 @@ func CountTokenRerankMessages(messages types.RerankRequest, model string, preCos
 	}
 
 	return tokenNum
+}
+
+func getMessageTokenCosts(model string) (tokensPerMessage int, tokensPerName int) {
+	// Reference:
+	// https://github.com/openai/openai-cookbook/blob/main/examples/How_to_count_tokens_with_tiktoken.ipynb
+	// https://github.com/pkoukk/tiktoken-go/issues/6
+	if model == "gpt-3.5-turbo-0301" {
+		return 4, -1
+	}
+	return 3, 1
+}
+
+func appendContentTokenData(textMsg *strings.Builder, content any, model string, preCostType int) int {
+	tokenNum := 0
+	switch v := content.(type) {
+	case string:
+		textMsg.WriteString(v)
+		textMsg.WriteByte('\n')
+	case []any:
+		for _, item := range v {
+			tokenNum += appendContentPartTokenData(textMsg, item, model, preCostType)
+		}
+	case []types.ChatMessagePart:
+		for _, item := range v {
+			tokenNum += appendChatMessagePartTokenData(textMsg, item, model, preCostType)
+		}
+	case []types.ContentResponses:
+		for _, item := range v {
+			tokenNum += appendResponsesContentTokenData(textMsg, item, model, preCostType)
+		}
+	}
+	return tokenNum
+}
+
+func appendContentPartTokenData(textMsg *strings.Builder, item any, model string, preCostType int) int {
+	switch typed := item.(type) {
+	case map[string]any:
+		return appendMapContentPartTokenData(textMsg, typed, model, preCostType)
+	case types.ChatMessagePart:
+		return appendChatMessagePartTokenData(textMsg, typed, model, preCostType)
+	case types.ContentResponses:
+		return appendResponsesContentTokenData(textMsg, typed, model, preCostType)
+	default:
+		return 0
+	}
+}
+
+func appendMapContentPartTokenData(textMsg *strings.Builder, part map[string]any, model string, preCostType int) int {
+	switch part["type"] {
+	case "text", types.ContentTypeInputText, types.ContentTypeOutputText:
+		text, _ := part["text"].(string)
+		if text == "" {
+			return 0
+		}
+		textMsg.WriteString(text)
+		textMsg.WriteByte('\n')
+		return 0
+	case "image_url":
+		if preCostType == config.PreCostNotImage {
+			return 0
+		}
+		imageURL, ok := part["image_url"].(map[string]any)
+		if !ok {
+			return 0
+		}
+		return countImagePartTokens(imageURL["url"], imageURL["detail"], model)
+	case types.ContentTypeInputImage:
+		if preCostType == config.PreCostNotImage {
+			return 0
+		}
+		return countImagePartTokens(part["image_url"], part["detail"], model)
+	default:
+		return 0
+	}
+}
+
+func appendChatMessagePartTokenData(textMsg *strings.Builder, part types.ChatMessagePart, model string, preCostType int) int {
+	switch part.Type {
+	case types.ContentTypeText:
+		if part.Text == "" {
+			return 0
+		}
+		textMsg.WriteString(part.Text)
+		textMsg.WriteByte('\n')
+	case types.ContentTypeImageURL:
+		if preCostType == config.PreCostNotImage || part.ImageURL == nil {
+			return 0
+		}
+		return countImagePartTokens(part.ImageURL.URL, part.ImageURL.Detail, model)
+	}
+	return 0
+}
+
+func appendResponsesContentTokenData(textMsg *strings.Builder, part types.ContentResponses, model string, preCostType int) int {
+	switch part.Type {
+	case types.ContentTypeInputText, types.ContentTypeOutputText:
+		if part.Text == "" {
+			return 0
+		}
+		textMsg.WriteString(part.Text)
+		textMsg.WriteByte('\n')
+	case types.ContentTypeInputImage:
+		if preCostType == config.PreCostNotImage {
+			return 0
+		}
+		return countImagePartTokens(part.ImageUrl, part.Detail, model)
+	}
+	return 0
+}
+
+func countImagePartTokens(rawURL any, rawDetail any, model string) int {
+	url, _ := rawURL.(string)
+	if url == "" {
+		return 0
+	}
+
+	detail, _ := rawDetail.(string)
+	countImageTokens := getCountImageFun(model)
+	imageTokens, err := countImageTokens(url, detail, model)
+	if err != nil {
+		logger.SysError("error counting image tokens: " + err.Error())
+		return 0
+	}
+
+	return imageTokens
+}
+
+func responsesInputToMessagesFast(input any) ([]types.ChatCompletionMessage, bool) {
+	switch typed := input.(type) {
+	case []any:
+		messages := make([]types.ChatCompletionMessage, 0, len(typed))
+		for _, item := range typed {
+			itemMap, ok := item.(map[string]any)
+			if !ok {
+				return nil, false
+			}
+			message, ok := responsesItemToChatMessage(itemMap)
+			if !ok {
+				return nil, false
+			}
+			messages = append(messages, message)
+		}
+		return messages, true
+	case map[string]any:
+		message, ok := responsesItemToChatMessage(typed)
+		if !ok {
+			return nil, false
+		}
+		return []types.ChatCompletionMessage{message}, true
+	default:
+		return nil, false
+	}
+}
+
+func responsesItemToChatMessage(item map[string]any) (types.ChatCompletionMessage, bool) {
+	itemType, _ := item["type"].(string)
+	switch itemType {
+	case "", types.InputTypeMessage:
+		content, ok := item["content"]
+		if !ok {
+			return types.ChatCompletionMessage{}, false
+		}
+		role, _ := item["role"].(string)
+		return types.ChatCompletionMessage{
+			Role:    role,
+			Content: content,
+		}, true
+	case types.InputTypeFunctionCall:
+		callID, _ := item["call_id"].(string)
+		name, _ := item["name"].(string)
+		arguments, _ := item["arguments"].(string)
+		return types.ChatCompletionMessage{
+			Role: types.ChatMessageRoleAssistant,
+			ToolCalls: []*types.ChatCompletionToolCalls{
+				{
+					Id:   callID,
+					Type: "function",
+					Function: &types.ChatCompletionToolCallsFunction{
+						Name:      name,
+						Arguments: arguments,
+					},
+				},
+			},
+		}, true
+	case types.InputTypeFunctionCallOutput:
+		callID, _ := item["call_id"].(string)
+		return types.ChatCompletionMessage{
+			Role:       types.ChatMessageRoleTool,
+			ToolCallID: callID,
+			Content:    item["output"],
+		}, true
+	default:
+		return types.ChatCompletionMessage{}, false
+	}
 }
 
 func getCountImageFun(model string) CountImageFun {
