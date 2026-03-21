@@ -106,13 +106,10 @@ func (p *BaseProvider) CommonRequestHeaders(headers map[string]string) {
 		headers["Content-Type"] = "application/json"
 	}
 	// 自定义header
-	if p.Channel.ModelHeaders != nil {
-		var customHeaders map[string]string
-		err := json.Unmarshal([]byte(*p.Channel.ModelHeaders), &customHeaders)
-		if err == nil {
-			for key, value := range customHeaders {
-				headers[key] = value
-			}
+	customHeaders, err := p.Channel.GetModelHeadersMap()
+	if err == nil {
+		for key, value := range customHeaders {
+			headers[key] = value
 		}
 	}
 }
@@ -144,16 +141,12 @@ func (p *BaseProvider) GetChannel() *model.Channel {
 func (p *BaseProvider) ModelMappingHandler(modelName string) (string, error) {
 	p.OriginalModel = modelName
 
-	modelMapping := p.Channel.GetModelMapping()
-
-	if modelMapping == "" || modelMapping == "{}" {
-		return modelName, nil
-	}
-
-	modelMap := make(map[string]string)
-	err := json.Unmarshal([]byte(modelMapping), &modelMap)
+	modelMap, err := p.Channel.GetModelMappingMap()
 	if err != nil {
 		return "", err
+	}
+	if len(modelMap) == 0 {
+		return modelName, nil
 	}
 
 	if modelMap[modelName] != "" {
@@ -165,18 +158,7 @@ func (p *BaseProvider) ModelMappingHandler(modelName string) (string, error) {
 
 // CustomParameterHandler processes extra parameters from the channel and returns them as a map
 func (p *BaseProvider) CustomParameterHandler() (map[string]interface{}, error) {
-	customParameter := p.Channel.GetCustomParameter()
-	if customParameter == "" || customParameter == "{}" {
-		return nil, nil
-	}
-
-	customParams := make(map[string]interface{})
-	err := json.Unmarshal([]byte(customParameter), &customParams)
-	if err != nil {
-		return nil, err
-	}
-
-	return customParams, nil
+	return p.Channel.GetCustomParameterMap()
 }
 
 func (p *BaseProvider) GetAPIUri(relayMode int) string {
@@ -239,6 +221,21 @@ func (p *BaseProvider) GetRawBody() ([]byte, bool) {
 	return nil, false
 }
 
+func (p *BaseProvider) GetRawBodyMap() (map[string]interface{}, bool, error) {
+	if p.Context == nil {
+		return nil, false, nil
+	}
+
+	requestMap, err := common.CloneReusableBodyMap(p.Context)
+	if err != nil {
+		return nil, false, err
+	}
+	if requestMap == nil {
+		return nil, false, nil
+	}
+	return requestMap, true, nil
+}
+
 // MergeCustomParams 将自定义参数合并到请求体 map 中
 func (p *BaseProvider) MergeCustomParams(requestMap map[string]interface{}, customParams map[string]interface{}, modelName string) map[string]interface{} {
 	return ApplyCustomParams(requestMap, customParams, modelName, false)
@@ -250,11 +247,12 @@ func (p *BaseProvider) MergeCustomParams(requestMap map[string]interface{}, cust
 func (p *BaseProvider) MergeExtraBodyFromRawRequest(requestBytes []byte) (map[string]interface{}, error) {
 	merged := make(map[string]interface{})
 
-	rawBody, ok := p.GetRawBody()
-	if ok && rawBody != nil {
-		if err := json.Unmarshal(rawBody, &merged); err != nil {
-			merged = make(map[string]interface{})
-		}
+	rawMap, ok, err := p.GetRawBodyMap()
+	if err != nil {
+		return nil, err
+	}
+	if ok && rawMap != nil {
+		merged = rawMap
 	}
 
 	if len(requestBytes) == 0 {
