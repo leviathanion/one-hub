@@ -2,6 +2,7 @@ package relay
 
 import (
 	"encoding/json"
+	"one-api/common/config"
 	"one-api/model"
 	"one-api/relay/relay_util"
 	"one-api/types"
@@ -51,12 +52,21 @@ func (r *relayBase) IsStream() bool {
 }
 
 func (r *relayBase) setProvider(modelName string) error {
+	r.c.Set(config.GinRequestBodyReparseKey, false)
+
+	if provider, newModelName, ok := consumeCachedProviderSelection(r.c, modelName); ok {
+		r.provider = provider
+		r.modelName = newModelName
+		return nil
+	}
+
 	provider, modelName, fail := GetProvider(r.c, modelName)
 	if fail != nil {
 		return fail
 	}
 	r.provider = provider
 	r.modelName = modelName
+	_, _ = applyPreMappingForProvider(r.c, modelName, provider)
 
 	return nil
 }

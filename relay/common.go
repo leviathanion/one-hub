@@ -140,6 +140,61 @@ func GetProvider(c *gin.Context, modelName string) (provider providersBase.Provi
 	return
 }
 
+type cachedProviderSelection struct {
+	provider        providersBase.ProviderInterface
+	originalModel   string
+	newModelName    string
+	channelID       int
+	channelType     int
+	billingOriginal bool
+	skipOnlyChat    bool
+	isStream        bool
+}
+
+func cacheProviderSelection(c *gin.Context, originalModel string, provider providersBase.ProviderInterface, newModelName string) {
+	billingOriginalModel := c.GetBool("billing_original_model")
+	selection := &cachedProviderSelection{
+		provider:        provider,
+		originalModel:   originalModel,
+		newModelName:    newModelName,
+		channelID:       c.GetInt("channel_id"),
+		channelType:     c.GetInt("channel_type"),
+		billingOriginal: billingOriginalModel,
+		skipOnlyChat:    c.GetBool("skip_only_chat"),
+		isStream:        c.GetBool("is_stream"),
+	}
+	c.Set(config.GinProviderCacheKey, selection)
+}
+
+func consumeCachedProviderSelection(c *gin.Context, originalModel string) (providersBase.ProviderInterface, string, bool) {
+	cached, exists := c.Get(config.GinProviderCacheKey)
+	if !exists || cached == nil {
+		return nil, "", false
+	}
+
+	selection, ok := cached.(*cachedProviderSelection)
+	if !ok || selection == nil || selection.provider == nil || selection.originalModel != originalModel {
+		c.Set(config.GinProviderCacheKey, nil)
+		return nil, "", false
+	}
+
+	if selection.skipOnlyChat != c.GetBool("skip_only_chat") || selection.isStream != c.GetBool("is_stream") {
+		c.Set(config.GinProviderCacheKey, nil)
+		return nil, "", false
+	}
+
+	// Keep this restore list in sync with every provider-selection context write in GetProvider.
+	// Cache hits must restore the full selection context: channel_id, channel_type,
+	// original_model, new_model, and billing_original_model.
+	c.Set(config.GinProviderCacheKey, nil)
+	c.Set("channel_id", selection.channelID)
+	c.Set("channel_type", selection.channelType)
+	c.Set("original_model", selection.originalModel)
+	c.Set("new_model", selection.newModelName)
+	c.Set("billing_original_model", selection.billingOriginal)
+	return selection.provider, selection.newModelName, true
+}
+
 func fetchChannel(c *gin.Context, modelName string) (channel *model.Channel, fail error) {
 	channelId := c.GetInt("specific_channel_id")
 	ignore := c.GetBool("specific_channel_id_ignore")

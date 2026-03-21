@@ -30,6 +30,7 @@ func NewRelayCompletions(c *gin.Context) *relayCompletions {
 }
 
 func (r *relayCompletions) setRequest() error {
+	r.request = types.CompletionRequest{}
 	if err := common.UnmarshalBodyReusable(r.c, &r.request); err != nil {
 		return err
 	}

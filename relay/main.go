@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"one-api/common"
 	"one-api/common/config"
@@ -12,6 +11,7 @@ import (
 	"one-api/common/utils"
 	"one-api/metrics"
 	"one-api/model"
+	providersBase "one-api/providers/base"
 	"one-api/relay/relay_util"
 	"one-api/types"
 	"strings"
@@ -39,6 +39,11 @@ func Relay(c *gin.Context) {
 	c.Set("is_stream", relay.IsStream())
 	if err := relay.setProvider(relay.getOriginalModel()); err != nil {
 		openaiErr := common.StringErrorWrapperLocal(err.Error(), "one_hub_error", http.StatusServiceUnavailable)
+		relay.HandleJsonError(openaiErr)
+		return
+	}
+	if err := reparseRequestAfterProviderSelection(relay); err != nil {
+		openaiErr := common.StringErrorWrapperLocal(err.Error(), "one_hub_error", http.StatusBadRequest)
 		relay.HandleJsonError(openaiErr)
 		return
 	}
@@ -76,6 +81,11 @@ func Relay(c *gin.Context) {
 		}
 
 		if err := relay.setProvider(relay.getOriginalModel()); err != nil {
+			break
+		}
+		if err := reparseRequestAfterProviderSelection(relay); err != nil {
+			apiErr = common.StringErrorWrapperLocal(err.Error(), "one_hub_error", http.StatusBadRequest)
+			done = true
 			break
 		}
 
@@ -159,58 +169,124 @@ func shouldCooldowns(c *gin.Context, channel *model.Channel, apiErr *types.OpenA
 	c.Set("skip_channel_ids", skipChannelIds)
 }
 
+type preMappingRequestState struct {
+	Model        string          `json:"model"`
+	IsStream     bool            `json:"stream"`
+	Tools        json.RawMessage `json:"tools"`
+	SkipOnlyChat bool            `json:"-"`
+}
+
+func shouldApplyPreMapping(path string) bool {
+	return strings.HasPrefix(path, "/v1/chat/completions") || strings.HasPrefix(path, "/v1/completions")
+}
+
+func parsePreMappingRequestState(bodyBytes []byte) (preMappingRequestState, error) {
+	var state preMappingRequestState
+	if err := json.Unmarshal(bodyBytes, &state); err != nil {
+		return state, err
+	}
+
+	trimmedTools := strings.TrimSpace(string(state.Tools))
+	state.SkipOnlyChat = trimmedTools != "" && trimmedTools != "null"
+	return state, nil
+}
+
+func updatePreMappingSelectionContext(c *gin.Context, bodyBytes []byte) (preMappingRequestState, error) {
+	state, err := parsePreMappingRequestState(bodyBytes)
+	if err != nil {
+		return state, err
+	}
+
+	c.Set("is_stream", state.IsStream)
+	c.Set("skip_only_chat", state.SkipOnlyChat)
+	return state, nil
+}
+
+func applyPreMappingForProvider(c *gin.Context, modelName string, provider providersBase.ProviderInterface) (bool, error) {
+	if c == nil || provider == nil || !shouldApplyPreMapping(c.Request.URL.Path) {
+		return false, nil
+	}
+
+	currentBodyBytes, err := common.CacheRequestBody(c)
+	if err != nil {
+		return false, err
+	}
+
+	originalBodyBytes, ok := common.GetOriginalRequestBody(c)
+	if !ok {
+		originalBodyBytes = currentBodyBytes
+	}
+
+	finalBodyBytes := originalBodyBytes
+	var finalRequestMap map[string]interface{}
+
+	customParams, err := provider.CustomParameterHandler()
+	if err == nil && customParams != nil {
+		if preAdd, exists := customParams["pre_add"]; exists && preAdd == true {
+			requestMap := make(map[string]interface{})
+			if err := json.Unmarshal(originalBodyBytes, &requestMap); err == nil {
+				finalRequestMap = mergeCustomParamsForPreMapping(requestMap, customParams, modelName)
+				if modifiedBodyBytes, err := json.Marshal(finalRequestMap); err == nil {
+					finalBodyBytes = modifiedBodyBytes
+				} else {
+					finalRequestMap = nil
+				}
+			}
+		}
+	}
+
+	if finalRequestMap != nil {
+		common.SetReusableRequestBodyMap(c, finalBodyBytes, finalRequestMap)
+	} else {
+		common.SetReusableRequestBody(c, finalBodyBytes)
+	}
+
+	if _, err := updatePreMappingSelectionContext(c, finalBodyBytes); err != nil {
+		return false, nil
+	}
+
+	bodyChanged := !bytes.Equal(currentBodyBytes, finalBodyBytes)
+	c.Set(config.GinRequestBodyReparseKey, bodyChanged)
+	return bodyChanged, nil
+}
+
+func reparseRequestAfterProviderSelection(relay RelayBaseInterface) error {
+	c := relay.getContext()
+	if !c.GetBool(config.GinRequestBodyReparseKey) {
+		return nil
+	}
+
+	c.Set(config.GinRequestBodyReparseKey, false)
+	if err := relay.setRequest(); err != nil {
+		return err
+	}
+	c.Set("is_stream", relay.IsStream())
+	return nil
+}
+
 // applies pre-mapping before setRequest to ensure modifications take effect
 func applyPreMappingBeforeRequest(c *gin.Context) {
 	// check if this is a chat completion request that needs pre-mapping
 	path := c.Request.URL.Path
-	if !(strings.HasPrefix(path, "/v1/chat/completions") || strings.HasPrefix(path, "/v1/completions")) {
+	if !shouldApplyPreMapping(path) {
 		return
 	}
 
-	bodyBytes, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		return
-	}
-	c.Request.Body.Close()
-
-	// Use defer to ensure request body is always restored
-	var finalBodyBytes []byte = bodyBytes // default to original body
-	defer func() {
-		c.Request.Body = io.NopCloser(bytes.NewBuffer(finalBodyBytes))
-	}()
-
-	var requestBody struct {
-		Model string `json:"model"`
-	}
-	if err := json.Unmarshal(bodyBytes, &requestBody); err != nil || requestBody.Model == "" {
-		return
-	}
-
-	provider, _, err := GetProvider(c, requestBody.Model)
+	bodyBytes, err := common.CacheRequestBody(c)
 	if err != nil {
 		return
 	}
 
-	customParams, err := provider.CustomParameterHandler()
-	if err != nil || customParams == nil {
+	requestState, err := updatePreMappingSelectionContext(c, bodyBytes)
+	if err != nil || requestState.Model == "" {
 		return
 	}
 
-	preAdd, exists := customParams["pre_add"]
-	if !exists || preAdd != true {
+	provider, _, err := GetProvider(c, requestState.Model)
+	if err != nil {
 		return
 	}
-
-	var requestMap map[string]interface{}
-	if err := json.Unmarshal(bodyBytes, &requestMap); err != nil {
-		return
-	}
-
-	// Apply custom parameter merging
-	modifiedRequestMap := mergeCustomParamsForPreMapping(requestMap, customParams, requestBody.Model)
-
-	// Convert back to JSON - if successful, use modified body; otherwise use original
-	if modifiedBodyBytes, err := json.Marshal(modifiedRequestMap); err == nil {
-		finalBodyBytes = modifiedBodyBytes
-	}
+	cacheProviderSelection(c, requestState.Model, provider, c.GetString("new_model"))
+	_, _ = applyPreMappingForProvider(c, requestState.Model, provider)
+	c.Set(config.GinRequestBodyReparseKey, false)
 }

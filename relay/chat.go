@@ -34,6 +34,7 @@ func NewRelayChat(c *gin.Context) *relayChat {
 }
 
 func (r *relayChat) setRequest() error {
+	r.chatRequest = types.ChatCompletionRequest{}
 	if err := common.UnmarshalBodyReusable(r.c, &r.chatRequest); err != nil {
 		return err
 	}
