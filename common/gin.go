@@ -2,6 +2,7 @@ package common
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"one-api/common/config"
@@ -13,16 +14,93 @@ import (
 	"github.com/go-playground/validator/v10"
 )
 
-func UnmarshalBodyReusable(c *gin.Context, v any) error {
+func CacheRequestBody(c *gin.Context) ([]byte, error) {
+	if cached, exists := c.Get(config.GinRequestBodyKey); exists {
+		if requestBody, ok := cached.([]byte); ok {
+			if _, exists := c.Get(config.GinOriginalRequestBodyKey); !exists {
+				c.Set(config.GinOriginalRequestBodyKey, requestBody)
+			}
+			c.Request.Body = io.NopCloser(bytes.NewBuffer(requestBody))
+			return requestBody, nil
+		}
+	}
+
 	requestBody, err := io.ReadAll(c.Request.Body)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	err = c.Request.Body.Close()
+	if err = c.Request.Body.Close(); err != nil {
+		return nil, err
+	}
+
+	c.Set(config.GinOriginalRequestBodyKey, requestBody)
+	SetReusableRequestBody(c, requestBody)
+	return requestBody, nil
+}
+
+func SetReusableRequestBody(c *gin.Context, requestBody []byte) {
+	c.Set(config.GinRequestBodyKey, requestBody)
+	c.Set(config.GinRequestBodyMapKey, nil)
+	c.Request.Body = io.NopCloser(bytes.NewBuffer(requestBody))
+}
+
+func SetReusableRequestBodyMap(c *gin.Context, requestBody []byte, requestMap map[string]interface{}) {
+	c.Set(config.GinRequestBodyKey, requestBody)
+	c.Set(config.GinRequestBodyMapKey, requestMap)
+	c.Request.Body = io.NopCloser(bytes.NewBuffer(requestBody))
+}
+
+func GetOriginalRequestBody(c *gin.Context) ([]byte, bool) {
+	if cached, exists := c.Get(config.GinOriginalRequestBodyKey); exists {
+		if requestBody, ok := cached.([]byte); ok {
+			return requestBody, true
+		}
+	}
+	return nil, false
+}
+
+func GetReusableBodyMap(c *gin.Context) (map[string]interface{}, error) {
+	if cached, exists := c.Get(config.GinRequestBodyMapKey); exists {
+		if requestMap, ok := cached.(map[string]interface{}); ok && requestMap != nil {
+			return requestMap, nil
+		}
+	}
+
+	requestBody, err := CacheRequestBody(c)
+	if err != nil {
+		return nil, err
+	}
+	if len(requestBody) == 0 {
+		return nil, nil
+	}
+
+	requestMap := make(map[string]interface{})
+	if err = json.Unmarshal(requestBody, &requestMap); err != nil {
+		return nil, err
+	}
+
+	c.Set(config.GinRequestBodyMapKey, requestMap)
+	return requestMap, nil
+}
+
+func CloneReusableBodyMap(c *gin.Context) (map[string]interface{}, error) {
+	requestMap, err := GetReusableBodyMap(c)
+	if err != nil || requestMap == nil {
+		return nil, err
+	}
+
+	clone, ok := cloneJSONValue(requestMap).(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("clone reusable body map: unexpected value type %T", requestMap)
+	}
+	return clone, nil
+}
+
+func UnmarshalBodyReusable(c *gin.Context, v any) error {
+	requestBody, err := CacheRequestBody(c)
 	if err != nil {
 		return err
 	}
-	c.Set(config.GinRequestBodyKey, requestBody)
 
 	c.Request.Body = io.NopCloser(bytes.NewBuffer(requestBody))
 	err = c.ShouldBind(v)
@@ -36,6 +114,26 @@ func UnmarshalBodyReusable(c *gin.Context, v any) error {
 
 	// c.Request.Body = io.NopCloser(bytes.NewBuffer(requestBody))
 	return nil
+}
+
+func cloneJSONValue(value interface{}) interface{} {
+	// Only clones the standard Go shapes produced by json.Unmarshal.
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		cloned := make(map[string]interface{}, len(typed))
+		for key, item := range typed {
+			cloned[key] = cloneJSONValue(item)
+		}
+		return cloned
+	case []interface{}:
+		cloned := make([]interface{}, len(typed))
+		for i, item := range typed {
+			cloned[i] = cloneJSONValue(item)
+		}
+		return cloned
+	default:
+		return value
+	}
 }
 
 func ErrorWrapper(err error, code string, statusCode int) *types.OpenAIErrorWithStatusCode {
