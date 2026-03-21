@@ -3,6 +3,7 @@ package model
 import (
 	"crypto/md5"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -49,6 +50,17 @@ type Channel struct {
 
 	Plugin    *datatypes.JSONType[PluginType] `json:"plugin" form:"plugin" gorm:"type:json"`
 	DeletedAt gorm.DeletedAt                  `json:"-" gorm:"index"`
+
+	parsedModelMapping    map[string]string      `json:"-" gorm:"-"`
+	parsedModelHeaders    map[string]string      `json:"-" gorm:"-"`
+	parsedCustomParameter map[string]interface{} `json:"-" gorm:"-"`
+	modelMappingErr       error                  `json:"-" gorm:"-"`
+	modelHeadersErr       error                  `json:"-" gorm:"-"`
+	customParameterErr    error                  `json:"-" gorm:"-"`
+	runtimeConfigParsed   bool                   `json:"-" gorm:"-"`
+	lastModelMapping      string                 `json:"-" gorm:"-"`
+	lastModelHeaders      string                 `json:"-" gorm:"-"`
+	lastCustomParameter   string                 `json:"-" gorm:"-"`
 }
 
 func (c *Channel) AllowStream(modelName string) bool {
@@ -273,11 +285,106 @@ func (channel *Channel) GetModelMapping() string {
 	return *channel.ModelMapping
 }
 
+func (channel *Channel) GetModelMappingMap() (map[string]string, error) {
+	channel.ensureRuntimeConfigParsed()
+	if channel.modelMappingErr != nil {
+		return nil, channel.modelMappingErr
+	}
+	return channel.parsedModelMapping, nil
+}
+
 func (channel *Channel) GetCustomParameter() string {
 	if channel.CustomParameter == nil {
 		return ""
 	}
 	return *channel.CustomParameter
+}
+
+func (channel *Channel) GetCustomParameterMap() (map[string]interface{}, error) {
+	channel.ensureRuntimeConfigParsed()
+	if channel.customParameterErr != nil {
+		return nil, channel.customParameterErr
+	}
+	return channel.parsedCustomParameter, nil
+}
+
+func (channel *Channel) GetModelHeadersMap() (map[string]string, error) {
+	channel.ensureRuntimeConfigParsed()
+	if channel.modelHeadersErr != nil {
+		return nil, channel.modelHeadersErr
+	}
+	return channel.parsedModelHeaders, nil
+}
+
+func (channel *Channel) ensureRuntimeConfigParsed() {
+	// Not goroutine-safe; call this before the channel is shared across request goroutines.
+	if channel == nil {
+		return
+	}
+
+	modelHeaders := ""
+	if channel.ModelHeaders != nil {
+		modelHeaders = *channel.ModelHeaders
+	}
+
+	modelMapping := channel.GetModelMapping()
+	customParameter := channel.GetCustomParameter()
+
+	if channel.runtimeConfigParsed &&
+		channel.lastModelMapping == modelMapping &&
+		channel.lastModelHeaders == modelHeaders &&
+		channel.lastCustomParameter == customParameter {
+		return
+	}
+
+	channel.ParseRuntimeConfig()
+}
+
+func (channel *Channel) ParseRuntimeConfig() {
+	modelMapping := channel.GetModelMapping()
+	modelHeaders := ""
+	if channel.ModelHeaders != nil {
+		modelHeaders = *channel.ModelHeaders
+	}
+	customParameter := channel.GetCustomParameter()
+
+	channel.parsedModelMapping = nil
+	channel.parsedModelHeaders = nil
+	channel.parsedCustomParameter = nil
+	channel.modelMappingErr = nil
+	channel.modelHeadersErr = nil
+	channel.customParameterErr = nil
+	channel.runtimeConfigParsed = true
+	channel.lastModelMapping = modelMapping
+	channel.lastModelHeaders = modelHeaders
+	channel.lastCustomParameter = customParameter
+
+	if modelMapping != "" && modelMapping != "{}" {
+		modelMap := make(map[string]string)
+		if err := json.Unmarshal([]byte(modelMapping), &modelMap); err != nil {
+			channel.modelMappingErr = err
+		} else {
+			channel.parsedModelMapping = modelMap
+		}
+	}
+
+	if modelHeaders != "" && modelHeaders != "{}" {
+		headers := make(map[string]string)
+		if err := json.Unmarshal([]byte(modelHeaders), &headers); err != nil {
+			channel.modelHeadersErr = err
+		} else {
+			channel.parsedModelHeaders = headers
+		}
+	}
+
+	if customParameter != "" && customParameter != "{}" {
+		customParams := make(map[string]interface{})
+		if err := json.Unmarshal([]byte(customParameter), &customParams); err != nil {
+			channel.customParameterErr = err
+		} else {
+			channel.parsedCustomParameter = customParams
+		}
+	}
 }
 
 func (channel *Channel) Insert() error {

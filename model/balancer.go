@@ -253,6 +253,7 @@ func normalizeChannelForChooser(channel *Channel) {
 	}
 
 	channel.SetProxy()
+	channel.ParseRuntimeConfig()
 	if channel.Weight == nil || *channel.Weight == 0 {
 		channel.Weight = &config.DefaultChannelWeight
 	}

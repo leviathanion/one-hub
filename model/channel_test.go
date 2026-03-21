@@ -7,6 +7,42 @@ import (
 	"one-api/common/config"
 )
 
+func TestChannelRuntimeConfigParsesOnFirstGetterAccess(t *testing.T) {
+	modelMapping := `{"codex-mini":"codex-mini-latest"}`
+	modelHeaders := `{"x-test":"header"}`
+	customParameter := `{"temperature":0.2,"stream":true}`
+
+	channel := &Channel{
+		ModelMapping:    &modelMapping,
+		ModelHeaders:    &modelHeaders,
+		CustomParameter: &customParameter,
+	}
+
+	mapping, err := channel.GetModelMappingMap()
+	if err != nil {
+		t.Fatalf("expected model mapping to parse on demand, got %v", err)
+	}
+	if mapping["codex-mini"] != "codex-mini-latest" {
+		t.Fatalf("unexpected model mapping: %#v", mapping)
+	}
+
+	headers, err := channel.GetModelHeadersMap()
+	if err != nil {
+		t.Fatalf("expected model headers to parse on demand, got %v", err)
+	}
+	if headers["x-test"] != "header" {
+		t.Fatalf("unexpected model headers: %#v", headers)
+	}
+
+	params, err := channel.GetCustomParameterMap()
+	if err != nil {
+		t.Fatalf("expected custom parameters to parse on demand, got %v", err)
+	}
+	if params["temperature"] != 0.2 {
+		t.Fatalf("unexpected custom parameters: %#v", params)
+	}
+}
+
 func TestChannelsChooserRefreshChannelUpdatesTrackedKeyAndProxy(t *testing.T) {
 	originalLoader := loadChannelByIDForChannelGroupRefresh
 	t.Cleanup(func() {
@@ -53,12 +89,18 @@ func TestChannelsChooserRefreshChannelUpdatesTrackedKeyAndProxy(t *testing.T) {
 			t.Fatalf("unexpected channel refresh id: got %d want 7", id)
 		}
 		proxyTemplate := "http://proxy.example/%s"
+		modelMapping := `{"codex-mini":"codex-mini-latest"}`
+		modelHeaders := `{"x-test":"header"}`
+		customParameter := `{"pre_add":true,"temperature":0.2}`
 		return &Channel{
-			Id:       7,
-			Key:      "new-key",
-			Weight:   &zeroWeight,
-			Priority: &priority,
-			Proxy:    &proxyTemplate,
+			Id:              7,
+			Key:             "new-key",
+			Weight:          &zeroWeight,
+			Priority:        &priority,
+			Proxy:           &proxyTemplate,
+			ModelMapping:    &modelMapping,
+			ModelHeaders:    &modelHeaders,
+			CustomParameter: &customParameter,
 		}, nil
 	}
 
@@ -88,6 +130,18 @@ func TestChannelsChooserRefreshChannelUpdatesTrackedKeyAndProxy(t *testing.T) {
 	expectedChannel.SetProxy()
 	if choice.Channel.Proxy == nil || *choice.Channel.Proxy != *expectedChannel.Proxy {
 		t.Fatalf("expected proxy to be recomputed from refreshed key, got %v", choice.Channel.Proxy)
+	}
+	modelMapping, err := choice.Channel.GetModelMappingMap()
+	if err != nil || modelMapping["codex-mini"] != "codex-mini-latest" {
+		t.Fatalf("expected parsed model mapping to be available, got %v, %v", modelMapping, err)
+	}
+	modelHeaders, err := choice.Channel.GetModelHeadersMap()
+	if err != nil || modelHeaders["x-test"] != "header" {
+		t.Fatalf("expected parsed model headers to be available, got %v, %v", modelHeaders, err)
+	}
+	customParameter, err := choice.Channel.GetCustomParameterMap()
+	if err != nil || customParameter["temperature"] != 0.2 {
+		t.Fatalf("expected parsed custom parameters to be available, got %v, %v", customParameter, err)
 	}
 
 	if !reflect.DeepEqual(chooser.Rule, originalRule) {
