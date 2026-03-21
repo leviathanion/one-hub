@@ -51,12 +51,11 @@ func init() {
 		},
 		[]string{"type"},
 	)
-
 }
 
 // 记录 HTTP 请求
 func RecordHttp(c *gin.Context, duration time.Duration) {
-	go SafelyRecordMetric(func() {
+	SafelyRecordMetric(func() {
 		statusCode := strconv.Itoa(c.Writer.Status())
 
 		httpRequestsTotal.WithLabelValues(
@@ -84,7 +83,7 @@ func RecordProvider(c *gin.Context, statusCode int) {
 	channelType := c.GetInt("channel_type")
 	channelId := c.GetInt("channel_id")
 
-	go SafelyRecordMetric(func() {
+	SafelyRecordMetric(func() {
 		providerCounter.WithLabelValues(
 			strconv.Itoa(channelType),
 			strconv.Itoa(channelId),
