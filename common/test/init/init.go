@@ -1,7 +1,11 @@
 package init
 
-import "testing"
+import (
+	"one-api/common/requester"
+	"testing"
+)
 
 func init() {
 	testing.Init()
+	requester.InitHttpClient()
 }

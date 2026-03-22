@@ -15,6 +15,7 @@ import (
 	img "one-api/common/image"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	_ "golang.org/x/image/webp"
 )
 
@@ -54,11 +55,11 @@ func TestDecode(t *testing.T) {
 	for _, c := range cases {
 		t.Run("Decode:"+c.format, func(t *testing.T) {
 			resp, err := http.Get(c.url)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			defer resp.Body.Close()
 			reader := &CountingReader{reader: resp.Body}
 			img, format, err := image.Decode(reader)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			size := img.Bounds().Size()
 			assert.Equal(t, c.format, format)
 			assert.Equal(t, c.width, size.X)
@@ -76,11 +77,11 @@ func TestDecode(t *testing.T) {
 	for _, c := range cases {
 		t.Run("DecodeConfig:"+c.format, func(t *testing.T) {
 			resp, err := http.Get(c.url)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			defer resp.Body.Close()
 			reader := &CountingReader{reader: resp.Body}
 			config, format, err := image.DecodeConfig(reader)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			assert.Equal(t, c.format, format)
 			assert.Equal(t, c.width, config.Width)
 			assert.Equal(t, c.height, config.Height)
@@ -99,15 +100,15 @@ func TestBase64(t *testing.T) {
 	for _, c := range cases {
 		t.Run("Decode:"+c.format, func(t *testing.T) {
 			resp, err := http.Get(c.url)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			defer resp.Body.Close()
 			data, err := io.ReadAll(resp.Body)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			encoded := base64.StdEncoding.EncodeToString(data)
 			body := base64.NewDecoder(base64.StdEncoding, strings.NewReader(encoded))
 			reader := &CountingReader{reader: body}
 			img, format, err := image.Decode(reader)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			size := img.Bounds().Size()
 			assert.Equal(t, c.format, format)
 			assert.Equal(t, c.width, size.X)
@@ -125,15 +126,15 @@ func TestBase64(t *testing.T) {
 	for _, c := range cases {
 		t.Run("DecodeConfig:"+c.format, func(t *testing.T) {
 			resp, err := http.Get(c.url)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			defer resp.Body.Close()
 			data, err := io.ReadAll(resp.Body)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			encoded := base64.StdEncoding.EncodeToString(data)
 			body := base64.NewDecoder(base64.StdEncoding, strings.NewReader(encoded))
 			reader := &CountingReader{reader: body}
 			config, format, err := image.DecodeConfig(reader)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			assert.Equal(t, c.format, format)
 			assert.Equal(t, c.width, config.Width)
 			assert.Equal(t, c.height, config.Height)
@@ -157,10 +158,10 @@ func TestGetImageSizeFromBase64(t *testing.T) {
 	for i, c := range cases {
 		t.Run("Decode:"+strconv.Itoa(i), func(t *testing.T) {
 			resp, err := http.Get(c.url)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			defer resp.Body.Close()
 			data, err := io.ReadAll(resp.Body)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			encoded := base64.StdEncoding.EncodeToString(data)
 			width, height, err := img.GetImageSizeFromBase64(encoded)
 			assert.NoError(t, err)
@@ -174,14 +175,14 @@ func TestGetImageFromUrl(t *testing.T) {
 	for i, c := range cases {
 		t.Run("Decode:"+strconv.Itoa(i), func(t *testing.T) {
 			resp, err := http.Get(c.url)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			defer resp.Body.Close()
 			data, err := io.ReadAll(resp.Body)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			encoded := base64.StdEncoding.EncodeToString(data)
 
 			mimeType, base64Data, err := img.GetImageFromUrl(c.url)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			assert.Equal(t, encoded, base64Data)
 			assert.Equal(t, "image/"+c.format, mimeType)
 

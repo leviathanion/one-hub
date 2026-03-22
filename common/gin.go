@@ -25,6 +25,15 @@ func CacheRequestBody(c *gin.Context) ([]byte, error) {
 		}
 	}
 
+	if c == nil || c.Request == nil || c.Request.Body == nil {
+		requestBody := []byte{}
+		if c != nil {
+			c.Set(config.GinOriginalRequestBodyKey, requestBody)
+			SetReusableRequestBody(c, requestBody)
+		}
+		return requestBody, nil
+	}
+
 	requestBody, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		return nil, err

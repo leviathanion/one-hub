@@ -103,3 +103,39 @@ func TestCacheRequestBodyPreservesOriginalBodyAfterReuse(t *testing.T) {
 		t.Fatalf("unexpected original request body: got %s want %s", gotOriginal, originalBody)
 	}
 }
+
+func TestCacheRequestBodyHandlesNilRequestBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	req, err := http.NewRequest(http.MethodPost, "/", nil)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	req.Body = nil
+	ctx.Request = req
+
+	cachedBody, err := CacheRequestBody(ctx)
+	if err != nil {
+		t.Fatalf("expected nil request body to be handled, got %v", err)
+	}
+	if len(cachedBody) != 0 {
+		t.Fatalf("expected empty cached body, got %q", cachedBody)
+	}
+
+	gotMap, err := GetReusableBodyMap(ctx)
+	if err != nil {
+		t.Fatalf("expected nil request body map lookup to succeed, got %v", err)
+	}
+	if gotMap != nil {
+		t.Fatalf("expected no request body map, got %v", gotMap)
+	}
+
+	gotOriginal, ok := GetOriginalRequestBody(ctx)
+	if !ok {
+		t.Fatal("expected original request body cache to be set")
+	}
+	if len(gotOriginal) != 0 {
+		t.Fatalf("expected empty original request body, got %q", gotOriginal)
+	}
+}
