@@ -86,4 +86,6 @@ LOGS_FILENAME="one-hub.log"
 23. `AUTO_PRICE_UPDATES_INTERVAL` ：价格自动更新时间，单位分钟，仅`AUTO_PRICE_UPDATES_MODE`为`add`、`overwrite`时生效，系统将按照此时间周期性从价格更新服务器获取价格配置并更新系统价格。默认值：1440
 24. `UPDATE_PRICE_SERVICE` ：设置之后将使用指定的价格服务更新价格。不设置则使用系统默认价格服务`https://raw.githubusercontent.com/MartialBE/one-api/prices/prices.json`
 25. `USER_INVOICE_MONTH` ：是否开启用户月度账单功能，开启后系统每月1日凌晨生成用户上月数据汇总账单，数据量大的情况比较消耗资源，谨慎开启，默认`false`
-
+26. `OPENAI_REALTIME_SESSION_COMPAT`：OpenAI Realtime 会话兼容模式，可选值为 `true` 和 `false`，默认 `false`。
+    - 开启后，如果上游在 Realtime 会话中发送 `error` 事件，系统会先把原始错误事件转发给客户端，再立即关闭当前会话。
+    - 适合需要更接近上游原始 Realtime 断开语义的场景。

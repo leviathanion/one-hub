@@ -11,6 +11,12 @@
   - [编译流程](#编译流程-1)
   - [运行说明](#运行说明-1)
 - [Relay 压测脚本](./relay-performance-benchmark.md)
+- [Codex Realtime Best-Effort Affinity 方案](./codex-realtime-best-effort-affinity.md)
+- [Codex Realtime Preferred Channel 失败后的 Fresh Fallback 方案](./codex-realtime-preferred-channel-fallback.md)
+- [Codex Prompt Cache Affinity 预派生方案](./codex-prompt-cache-affinity-derivation.md)
+- [Channel Affinity 路由分组方案](./channel-affinity-routing-group.md)
+- [Channel Affinity Manager 生命周期方案](./channel-affinity-manager-lifecycle.md)
+- [Responses previous_response_id 请求级恢复方案](./responses-request-recovery.md)
 
 ## 本地构建
 

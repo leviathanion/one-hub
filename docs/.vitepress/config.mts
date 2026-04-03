@@ -40,6 +40,7 @@ export default defineConfig({
         text: '使用',
         items: [
           { text: '使用说明', link: '/use/index' },
+          { text: 'Codex 渠道', link: '/use/Codex' },
           { text: '添加 VertexAI', link: '/use/VertexAI' },
           { text: 'Rerank 接口', link: '/use/Rerank' },
           { text: '推理设置', link: '/use/reasoning' },
@@ -52,7 +53,13 @@ export default defineConfig({
       {
         text: '开发',
         items: [
-          { text: '开发说明', link: '/dev/index' }
+          { text: '开发说明', link: '/dev/index' },
+          { text: 'Codex Realtime Best-Effort Affinity', link: '/dev/codex-realtime-best-effort-affinity' },
+          { text: 'Codex Realtime Preferred Fallback', link: '/dev/codex-realtime-preferred-channel-fallback' },
+          { text: 'Codex Prompt Cache Affinity', link: '/dev/codex-prompt-cache-affinity-derivation' },
+          { text: 'Channel Affinity 路由分组', link: '/dev/channel-affinity-routing-group' },
+          { text: 'Channel Affinity Manager 生命周期', link: '/dev/channel-affinity-manager-lifecycle' },
+          { text: 'Responses Request Recovery', link: '/dev/responses-request-recovery' }
         ]
       },
       {

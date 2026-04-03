@@ -102,3 +102,7 @@ curl --request POST \
 	]
 }'
 ```
+
+## 进阶主题
+
+- [Codex 渠道](/use/Codex): Codex 的 `channel.Other` 配置、`prompt_cache_key_strategy`、`websocket_mode` 与 Realtime / `/responses/compact` 用法
