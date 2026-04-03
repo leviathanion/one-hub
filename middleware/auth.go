@@ -3,6 +3,7 @@ package middleware
 import (
 	"fmt"
 	"net/http"
+	"one-api/common/authutil"
 	"one-api/common/config"
 	"one-api/common/utils"
 	"one-api/model"
@@ -113,17 +114,13 @@ func RootAuth() func(c *gin.Context) {
 	}
 }
 
-func tokenAuth(c *gin.Context, key string) {
-	key = strings.TrimPrefix(key, "Bearer ")
-	key = strings.TrimPrefix(key, "sk-")
-
+func tokenAuth(c *gin.Context, credential authutil.Credential) {
+	key := credential.Value
 	if len(key) < 48 {
 		abortWithMessage(c, http.StatusUnauthorized, "无效的令牌")
 		return
 	}
 
-	parts := strings.Split(key, "#")
-	key = parts[0]
 	token, err := model.ValidateUserToken(key)
 	if err != nil {
 		abortWithMessage(c, http.StatusUnauthorized, err.Error())
@@ -141,19 +138,20 @@ func tokenAuth(c *gin.Context, key string) {
 		abortWithMessage(c, http.StatusForbidden, err.Error())
 		return
 	}
-	if len(parts) > 1 {
+	if len(credential.SelectorParts) > 0 {
 		if model.IsAdmin(token.UserId) {
-			if strings.HasPrefix(parts[1], "!") {
-				channelId := utils.String2Int(parts[1][1:])
+			selector := credential.SelectorParts[0]
+			if strings.HasPrefix(selector, "!") {
+				channelId := utils.String2Int(selector[1:])
 				c.Set("skip_channel_ids", []int{channelId})
 			} else {
-				channelId := utils.String2Int(parts[1])
+				channelId := utils.String2Int(selector)
 				if channelId == 0 {
 					abortWithMessage(c, http.StatusForbidden, "无效的渠道 Id")
 					return
 				}
 				c.Set("specific_channel_id", channelId)
-				if len(parts) == 3 && parts[2] == "ignore" {
+				if len(credential.SelectorParts) == 2 && credential.SelectorParts[1] == "ignore" {
 					c.Set("specific_channel_id_ignore", true)
 				}
 			}
@@ -208,23 +206,7 @@ func checkLimitIP(c *gin.Context) (error error) {
 
 func OpenaiAuth() func(c *gin.Context) {
 	return func(c *gin.Context) {
-		isWebSocket := c.GetHeader("Upgrade") == "websocket"
-		key := c.Request.Header.Get("Authorization")
-
-		if isWebSocket && key == "" {
-			protocols := c.Request.Header["Sec-Websocket-Protocol"]
-			if len(protocols) > 0 {
-				protocolList := strings.Split(protocols[0], ",")
-				for _, protocol := range protocolList {
-					protocol = strings.TrimSpace(protocol)
-					if strings.HasPrefix(protocol, "openai-insecure-api-key.") {
-						key = strings.TrimPrefix(protocol, "openai-insecure-api-key.")
-						break
-					}
-				}
-			}
-		}
-		tokenAuth(c, key)
+		tokenAuth(c, authutil.ExtractOpenAIRequestCredential(c.Request))
 	}
 }
 
@@ -234,7 +216,7 @@ func ClaudeAuth() func(c *gin.Context) {
 		if key == "" {
 			key = c.Request.Header.Get("Authorization")
 		}
-		tokenAuth(c, key)
+		tokenAuth(c, authutil.ParseCredential(key))
 	}
 }
 
@@ -249,7 +231,7 @@ func GeminiAuth() func(c *gin.Context) {
 				key = c.Request.Header.Get("Authorization")
 			}
 		}
-		tokenAuth(c, key)
+		tokenAuth(c, authutil.ParseCredential(key))
 	}
 }
 
@@ -271,7 +253,7 @@ func MjAuth() func(c *gin.Context) {
 		c.Set("mj_model", model)
 
 		key := c.Request.Header.Get("mj-api-secret")
-		tokenAuth(c, key)
+		tokenAuth(c, authutil.ParseCredential(key))
 	}
 }
 

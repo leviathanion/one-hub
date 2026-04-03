@@ -3,7 +3,9 @@ package middleware
 import (
 	"fmt"
 	"net/http"
+	"one-api/common/groupctx"
 	"one-api/model"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -27,23 +29,31 @@ func (gd *GroupDistributor) SetupGroups() error {
 	tokenGroup := gd.context.GetString("token_group")
 	backupGroup := gd.context.GetString("token_backup_group")
 
-	// 统一分组优先级逻辑
-	effectiveGroup := gd.determineEffectiveGroup(tokenGroup, backupGroup, userGroup)
-	gd.context.Set("token_group", effectiveGroup)
+	// 建立请求级别的实际路由分组，不回写 token 的声明分组。
+	effectiveGroup, groupSource := gd.determineEffectiveGroup(tokenGroup, backupGroup, userGroup)
+	groupctx.SetRoutingGroup(gd.context, effectiveGroup, groupSource)
+	gd.context.Set("is_backupGroup", false)
 
 	// 设置分组比例
 	return gd.setGroupRatio(effectiveGroup)
 }
 
-// determineEffectiveGroup 确定有效的分组
-func (gd *GroupDistributor) determineEffectiveGroup(tokenGroup, backupGroup, userGroup string) string {
+// determineEffectiveGroup 确定请求初始化阶段的有效分组。
+func (gd *GroupDistributor) determineEffectiveGroup(tokenGroup, backupGroup, userGroup string) (string, string) {
+	tokenGroup = strings.TrimSpace(tokenGroup)
+	backupGroup = strings.TrimSpace(backupGroup)
+	userGroup = strings.TrimSpace(userGroup)
+
 	if tokenGroup != "" {
-		return tokenGroup
+		return tokenGroup, groupctx.RoutingGroupSourceTokenGroup
+	}
+	if userGroup != "" {
+		return userGroup, groupctx.RoutingGroupSourceUserGroup
 	}
 	if backupGroup != "" {
-		return backupGroup
+		return backupGroup, groupctx.RoutingGroupSourceBackupGroup
 	}
-	return userGroup
+	return "", ""
 }
 
 // setGroupRatio 设置分组倍率
