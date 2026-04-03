@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"one-api/common"
 	"one-api/common/config"
+	"one-api/common/groupctx"
 	"one-api/common/logger"
 	"one-api/common/requester"
 	"one-api/common/utils"
@@ -25,6 +26,14 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+type realtimeChannelSelection struct {
+	preferredChannelID      int
+	ignorePreferredCooldown bool
+	strictPreferredChannel  bool
+	allowChannelTypes       []int
+	skipChannelIDs          []int
+}
 
 func Path2Relay(c *gin.Context, path string) RelayBaseInterface {
 	var relay RelayBaseInterface
@@ -112,6 +121,16 @@ func GetProvider(c *gin.Context, modelName string) (provider providersBase.Provi
 	if fail != nil {
 		return
 	}
+
+	return prepareProviderForChannel(c, modelName, channel)
+}
+
+func prepareProviderForChannel(c *gin.Context, modelName string, channel *model.Channel) (provider providersBase.ProviderInterface, newModelName string, fail error) {
+	if channel == nil {
+		fail = errors.New("channel not found")
+		return
+	}
+
 	c.Set("channel_id", channel.Id)
 	c.Set("channel_type", channel.Type)
 
@@ -197,13 +216,23 @@ func consumeCachedProviderSelection(c *gin.Context, originalModel string) (provi
 }
 
 func fetchChannel(c *gin.Context, modelName string) (channel *model.Channel, fail error) {
-	channelId := c.GetInt("specific_channel_id")
-	ignore := c.GetBool("specific_channel_id_ignore")
-	if channelId > 0 && !ignore {
-		return fetchChannelById(channelId)
+	channelId := explicitChannelPinID(c)
+	if channelId > 0 {
+		channel, err := fetchChannelById(channelId)
+		if err != nil {
+			return nil, err
+		}
+		return channel, nil
 	}
 
 	return fetchChannelByModel(c, modelName)
+}
+
+func explicitChannelPinID(c *gin.Context) int {
+	if c == nil || c.GetBool("specific_channel_id_ignore") {
+		return 0
+	}
+	return c.GetInt("specific_channel_id")
 }
 
 func fetchChannelById(channelId int) (*model.Channel, error) {
@@ -228,8 +257,8 @@ type GroupManager struct {
 // NewGroupManager 创建分组管理器
 func NewGroupManager(c *gin.Context) *GroupManager {
 	return &GroupManager{
-		primaryGroup: c.GetString("token_group"),
-		backupGroup:  c.GetString("token_backup_group"),
+		primaryGroup: groupctx.CurrentRoutingGroup(c),
+		backupGroup:  groupctx.BackupGroup(c),
 		context:      c,
 	}
 }
@@ -240,7 +269,11 @@ func (gm *GroupManager) TryWithGroups(modelName string, filters []model.Channels
 	if gm.primaryGroup != "" {
 		channel, err := gm.tryGroup(gm.primaryGroup, modelName, filters, operation)
 		if err == nil {
+			gm.context.Set("is_backupGroup", false)
 			return channel, nil
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
 		}
 		logger.LogError(gm.context.Request.Context(), fmt.Sprintf("主分组 %s 失败: %v", gm.primaryGroup, err))
 	}
@@ -250,12 +283,15 @@ func (gm *GroupManager) TryWithGroups(modelName string, filters []model.Channels
 		logger.LogInfo(gm.context.Request.Context(), fmt.Sprintf("尝试使用备用分组: %s", gm.backupGroup))
 		channel, err := gm.tryGroup(gm.backupGroup, modelName, filters, operation)
 		if err == nil {
-			// 更新上下文中的分组信息
+			groupctx.SetRoutingGroup(gm.context, gm.backupGroup, groupctx.RoutingGroupSourceBackupGroup)
 			gm.context.Set("is_backupGroup", true)
 			if err := gm.setGroupRatio(gm.backupGroup); err != nil {
 				return nil, fmt.Errorf("设置备用分组倍率失败: %v", err)
 			}
 			return channel, nil
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
 		}
 		logger.LogError(gm.context.Request.Context(), fmt.Sprintf("备用分组 %s 也失败: %v", gm.backupGroup, err))
 		return nil, gm.createGroupError(gm.backupGroup, modelName, channel)
@@ -291,23 +327,154 @@ func (gm *GroupManager) createGroupError(group string, modelName string, channel
 }
 
 func fetchChannelByModel(c *gin.Context, modelName string) (*model.Channel, error) {
+	return fetchChannelByModelWithSelection(c, modelName, currentRealtimeChannelSelection(c))
+}
+
+func currentRealtimeChannelSelection(c *gin.Context) realtimeChannelSelection {
+	selection := realtimeChannelSelection{
+		preferredChannelID:      currentPreferredChannelID(c),
+		ignorePreferredCooldown: currentChannelAffinityIgnorePreferredCooldown(c),
+		strictPreferredChannel:  currentChannelAffinityStrict(c),
+	}
+
+	if skipChannelIds, ok := utils.GetGinValue[[]int](c, "skip_channel_ids"); ok && len(skipChannelIds) > 0 {
+		selection.skipChannelIDs = append(selection.skipChannelIDs, skipChannelIds...)
+	}
+
+	if types, exists := c.Get("allow_channel_type"); exists {
+		if allowTypes, ok := types.([]int); ok && len(allowTypes) > 0 {
+			selection.allowChannelTypes = append(selection.allowChannelTypes, allowTypes...)
+		}
+	}
+
+	return selection
+}
+
+func preferredChannelWaitBudget() time.Duration {
+	if config.PreferredChannelWaitMilliseconds <= 0 {
+		return 0
+	}
+	return time.Duration(config.PreferredChannelWaitMilliseconds) * time.Millisecond
+}
+
+func preferredChannelWaitPollInterval() time.Duration {
+	if config.PreferredChannelWaitPollMilliseconds <= 0 {
+		return 50 * time.Millisecond
+	}
+	return time.Duration(config.PreferredChannelWaitPollMilliseconds) * time.Millisecond
+}
+
+func requestContextErr(c *gin.Context) error {
+	if c == nil || c.Request == nil {
+		return nil
+	}
+	return c.Request.Context().Err()
+}
+
+func recordPreferredChannelWaitMeta(c *gin.Context, budget, waited time.Duration, exhausted, canceled bool) {
+	mergeChannelAffinityMeta(c, map[string]any{
+		"channel_affinity_wait_triggered": true,
+		"channel_affinity_wait_budget_ms": budget.Milliseconds(),
+		"channel_affinity_waited_ms":      waited.Milliseconds(),
+		"channel_affinity_wait_exhausted": exhausted,
+		"channel_affinity_wait_canceled":  canceled,
+	})
+}
+
+func waitForPreferredChannelCooldown(c *gin.Context, group, modelName string, selection realtimeChannelSelection, filters []model.ChannelsFilterFunc) error {
+	if selection.preferredChannelID <= 0 || selection.ignorePreferredCooldown {
+		return nil
+	}
+
+	budget := preferredChannelWaitBudget()
+	if budget <= 0 {
+		return nil
+	}
+
+	eligible, err := model.ChannelGroup.PreferredChannelEligible(group, modelName, selection.preferredChannelID, filters...)
+	if err != nil || !eligible || !model.ChannelGroup.IsInCooldown(selection.preferredChannelID, modelName) {
+		return nil
+	}
+
+	pollInterval := preferredChannelWaitPollInterval()
+	if pollInterval <= 0 {
+		pollInterval = 50 * time.Millisecond
+	}
+
+	waitCtx := context.Background()
+	if c != nil && c.Request != nil {
+		waitCtx = c.Request.Context()
+	}
+	start := time.Now()
+	deadline := start.Add(budget)
+	if requestDeadline, ok := waitCtx.Deadline(); ok && requestDeadline.Before(deadline) {
+		deadline = requestDeadline
+	}
+	waitExhausted := false
+
+	for {
+		if err := waitCtx.Err(); err != nil {
+			recordPreferredChannelWaitMeta(c, budget, time.Since(start), waitExhausted, true)
+			return err
+		}
+		eligible, err := model.ChannelGroup.PreferredChannelEligible(group, modelName, selection.preferredChannelID, filters...)
+		if err != nil || !eligible || !model.ChannelGroup.IsInCooldown(selection.preferredChannelID, modelName) {
+			break
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			if err := waitCtx.Err(); err != nil {
+				recordPreferredChannelWaitMeta(c, budget, time.Since(start), waitExhausted, true)
+				return err
+			}
+			waitExhausted = true
+			break
+		}
+
+		sleepFor := pollInterval
+		if sleepFor > remaining {
+			sleepFor = remaining
+		}
+		timer := time.NewTimer(sleepFor)
+		select {
+		case <-waitCtx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			recordPreferredChannelWaitMeta(c, budget, time.Since(start), waitExhausted, true)
+			return waitCtx.Err()
+		case <-timer.C:
+		}
+	}
+
+	recordPreferredChannelWaitMeta(c, budget, time.Since(start), waitExhausted, false)
+	return nil
+}
+
+func fetchChannelByModelWithSelection(c *gin.Context, modelName string, selection realtimeChannelSelection) (*model.Channel, error) {
+	if err := requestContextErr(c); err != nil {
+		return nil, err
+	}
+
 	skipOnlyChat := c.GetBool("skip_only_chat")
 	isStream := c.GetBool("is_stream")
+	setChannelAffinitySelectedPreferred(c, false)
 
 	var filters []model.ChannelsFilterFunc
 	if skipOnlyChat {
 		filters = append(filters, model.FilterOnlyChat())
 	}
 
-	skipChannelIds, ok := utils.GetGinValue[[]int](c, "skip_channel_ids")
-	if ok {
-		filters = append(filters, model.FilterChannelId(skipChannelIds))
+	if len(selection.skipChannelIDs) > 0 {
+		filters = append(filters, model.FilterChannelId(selection.skipChannelIDs))
 	}
 
-	if types, exists := c.Get("allow_channel_type"); exists {
-		if allowTypes, ok := types.([]int); ok {
-			filters = append(filters, model.FilterChannelTypes(allowTypes))
-		}
+	if len(selection.allowChannelTypes) > 0 {
+		filters = append(filters, model.FilterChannelTypes(selection.allowChannelTypes))
 	}
 
 	if isStream {
@@ -317,7 +484,21 @@ func fetchChannelByModel(c *gin.Context, modelName string) (*model.Channel, erro
 	// 使用统一的分组管理器
 	groupManager := NewGroupManager(c)
 	return groupManager.TryWithGroups(modelName, filters, func(group string) (*model.Channel, error) {
-		return model.ChannelGroup.Next(group, modelName, filters...)
+		if err := waitForPreferredChannelCooldown(c, group, modelName, selection, filters); err != nil {
+			return nil, err
+		}
+		channel, err := model.ChannelGroup.NextWithPreferred(group, modelName, selection.preferredChannelID, selection.ignorePreferredCooldown, filters...)
+		if err != nil {
+			return nil, err
+		}
+		if selection.preferredChannelID > 0 && (channel == nil || channel.Id != selection.preferredChannelID) {
+			clearCurrentChannelAffinity(c)
+			if selection.strictPreferredChannel {
+				return nil, errors.New("preferred affinity channel is unavailable")
+			}
+		}
+		setChannelAffinitySelectedPreferred(c, channel != nil && selection.preferredChannelID > 0 && channel.Id == selection.preferredChannelID)
+		return channel, nil
 	})
 
 }
@@ -411,12 +592,13 @@ func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface
 			return firstResponseTime, nil
 		}
 	}
-
-	// Unreachable; the compiler still requires an explicit return here.
-	return firstResponseTime, nil
 }
 
 func responseGeneralStreamClient(c *gin.Context, stream requester.StreamReaderInterface[string], endHandler StreamEndHandler) (firstResponseTime time.Time) {
+	return responseGeneralStreamClientWithObserver(c, stream, endHandler, nil)
+}
+
+func responseGeneralStreamClientWithObserver(c *gin.Context, stream requester.StreamReaderInterface[string], endHandler StreamEndHandler, observer func(string)) (firstResponseTime time.Time) {
 	requester.SetEventStreamHeaders(c)
 	dataChan, errChan := stream.Recv()
 
@@ -434,6 +616,30 @@ func responseGeneralStreamClient(c *gin.Context, stream requester.StreamReaderIn
 			if !isFirstResponse {
 				firstResponseTime = time.Now()
 				isFirstResponse = true
+			}
+			if observer != nil {
+				observer(data)
+			}
+			select {
+			case <-c.Request.Context().Done():
+			default:
+				_, _ = streamWriter.WriteString(data)
+			}
+			continue
+		default:
+		}
+
+		select {
+		case data, ok := <-dataChan:
+			if !ok {
+				return firstResponseTime
+			}
+			if !isFirstResponse {
+				firstResponseTime = time.Now()
+				isFirstResponse = true
+			}
+			if observer != nil {
+				observer(data)
 			}
 			select {
 			case <-c.Request.Context().Done():
@@ -459,6 +665,9 @@ func responseGeneralStreamClient(c *gin.Context, stream requester.StreamReaderIn
 			} else if endHandler != nil {
 				streamData := endHandler()
 				if streamData != "" {
+					if observer != nil {
+						observer(streamData)
+					}
 					select {
 					case <-c.Request.Context().Done():
 					default:
@@ -469,9 +678,6 @@ func responseGeneralStreamClient(c *gin.Context, stream requester.StreamReaderIn
 			return firstResponseTime
 		}
 	}
-
-	// Unreachable; the compiler still requires an explicit return here.
-	return firstResponseTime
 }
 
 func responseMultipart(c *gin.Context, resp *http.Response) *types.OpenAIErrorWithStatusCode {
@@ -519,17 +725,13 @@ func responseCache(c *gin.Context, response string, isStream bool) {
 }
 
 func shouldRetry(c *gin.Context, apiErr *types.OpenAIErrorWithStatusCode, channelType int) bool {
-	channelId := c.GetInt("specific_channel_id")
-	ignore := c.GetBool("specific_channel_id_ignore")
-
 	if apiErr == nil {
 		return false
 	}
 
 	metrics.RecordProvider(c, apiErr.StatusCode)
 
-	if apiErr.LocalError ||
-		(channelId > 0 && !ignore) {
+	if apiErr.LocalError || explicitChannelPinID(c) > 0 {
 		return false
 	}
 

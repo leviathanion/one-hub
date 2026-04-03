@@ -7,39 +7,53 @@ import (
 	"net/http"
 	"one-api/common"
 	"one-api/common/config"
+	"one-api/common/groupctx"
 	"one-api/common/logger"
 	"one-api/model"
 	"one-api/types"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/datatypes"
 )
 
 type Quota struct {
-	modelName        string
-	promptTokens     int
-	price            model.Price
-	groupName        string
-	isBackupGroup    bool // 新增字段记录是否使用备用分组
-	backupGroupName  string
-	groupRatio       float64
-	inputRatio       float64
-	outputRatio      float64
-	preConsumedQuota int
-	cacheQuota       int
-	userId           int
-	channelId        int
-	tokenId          int
-	unlimitedQuota   bool
-	HandelStatus     bool
+	modelName          string
+	promptTokens       int
+	price              model.Price
+	groupName          string
+	tokenGroupName     string
+	isBackupGroup      bool // 新增字段记录是否使用备用分组
+	backupGroupName    string
+	routingGroupSource string
+	groupRatio         float64
+	inputRatio         float64
+	outputRatio        float64
+	preConsumedQuota   int
+	cacheQuota         int
+	userId             int
+	channelId          int
+	tokenId            int
+	unlimitedQuota     bool
+	HandelStatus       bool
 
 	startTime         time.Time
 	firstResponseTime time.Time
+	requestDuration   time.Duration
+	requestFrozen     bool
 	extraBillingData  map[string]ExtraBillingData
+	affinityMeta      map[string]any
+	requestContext    context.Context
+	tokenName         string
+	sourceIP          string
 }
 
 func NewQuota(c *gin.Context, modelName string, promptTokens int) *Quota {
 	isBackupGroup := c.GetBool("is_backupGroup")
+	requestContext := context.Background()
+	if c != nil && c.Request != nil {
+		requestContext = detachQuotaContext(c.Request.Context())
+	}
 
 	quota := &Quota{
 		modelName:      modelName,
@@ -50,17 +64,50 @@ func NewQuota(c *gin.Context, modelName string, promptTokens int) *Quota {
 		unlimitedQuota: c.GetBool("token_unlimited_quota"),
 		HandelStatus:   false,
 		isBackupGroup:  isBackupGroup, // 记录是否使用备用分组
+		requestContext: requestContext,
+		tokenName:      c.GetString("token_name"),
+		sourceIP:       c.ClientIP(),
+	}
+	if meta, ok := c.Get(config.GinChannelAffinityMetaKey); ok {
+		if typed, ok := meta.(map[string]any); ok && len(typed) > 0 {
+			quota.affinityMeta = make(map[string]any, len(typed))
+			for key, value := range typed {
+				quota.affinityMeta[key] = value
+			}
+		}
 	}
 
 	quota.price = *model.PricingInstance.GetPrice(quota.modelName)
-	quota.groupName = c.GetString("token_group")
-	quota.backupGroupName = c.GetString("token_backup_group")
+	quota.groupName = groupctx.CurrentRoutingGroup(c)
+	quota.tokenGroupName = groupctx.DeclaredTokenGroup(c)
+	quota.backupGroupName = groupctx.BackupGroup(c)
+	quota.routingGroupSource = groupctx.CurrentRoutingGroupSource(c)
 	quota.groupRatio = c.GetFloat64("group_ratio") // 这里的倍率已经在 common.go 中正确设置了
 	quota.inputRatio = quota.price.GetInput() * quota.groupRatio
 	quota.outputRatio = quota.price.GetOutput() * quota.groupRatio
 
 	return quota
 
+}
+
+func (q *Quota) Clone() *Quota {
+	if q == nil {
+		return nil
+	}
+
+	cloned := *q
+	cloned.price = cloneQuotaPrice(q.price)
+	cloned.preConsumedQuota = 0
+	cloned.cacheQuota = 0
+	cloned.HandelStatus = false
+	cloned.startTime = time.Time{}
+	cloned.firstResponseTime = time.Time{}
+	cloned.requestDuration = 0
+	cloned.requestFrozen = false
+	cloned.extraBillingData = nil
+	cloned.requestContext = detachQuotaContext(q.requestContext)
+
+	return &cloned
 }
 
 func (q *Quota) PreQuotaConsumption() *types.OpenAIErrorWithStatusCode {
@@ -117,7 +164,7 @@ func (q *Quota) UpdateUserRealtimeQuota(usage *types.UsageEvent, nowUsage *types
 	}
 
 	promptTokens, completionTokens := q.getComputeTokensByUsageEvent(nowUsage)
-	increaseQuota := q.GetTotalQuota(promptTokens, completionTokens, nil)
+	increaseQuota := q.GetTotalQuota(promptTokens, completionTokens, nowUsage.ExtraBilling)
 
 	cacheQuota, err := model.CacheIncreaseUserRealtimeQuota(q.userId, increaseQuota)
 	if err != nil {
@@ -197,15 +244,66 @@ func (q *Quota) Undo(c *gin.Context) {
 }
 
 func (q *Quota) Consume(c *gin.Context, usage *types.Usage, isStream bool) {
-	tokenName := c.GetString("token_name")
-	q.startTime = c.GetTime("requestStartTime")
+	if c != nil {
+		if q.requestContext == nil && c.Request != nil {
+			q.requestContext = detachQuotaContext(c.Request.Context())
+		}
+		if q.tokenName == "" {
+			q.tokenName = c.GetString("token_name")
+		}
+		if q.sourceIP == "" {
+			q.sourceIP = c.ClientIP()
+		}
+		if q.startTime.IsZero() {
+			q.startTime = c.GetTime("requestStartTime")
+		}
+	}
+	q.ConsumeUsage(usage, isStream)
+}
+
+func (q *Quota) ConsumeUsage(usage *types.Usage, isStream bool) {
+	tokenName := q.tokenName
+	q.requestContext = detachQuotaContext(q.requestContext)
+	if q.startTime.IsZero() {
+		q.startTime = time.Now()
+	}
+
 	// 如果没有报错，则消费配额
 	go func(ctx context.Context) {
-		err := q.completedQuotaConsumption(usage, tokenName, isStream, c.ClientIP(), ctx)
+		err := q.completedQuotaConsumption(usage, tokenName, isStream, q.sourceIP, ctx)
 		if err != nil {
 			logger.LogError(ctx, err.Error())
 		}
-	}(c.Request.Context())
+	}(q.requestContext)
+}
+
+func detachQuotaContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return context.WithoutCancel(ctx)
+}
+
+func cloneQuotaPrice(price model.Price) model.Price {
+	cloned := price
+	if price.ExtraRatios != nil {
+		raw := price.ExtraRatios.Data()
+		copied := make(map[string]float64, len(raw))
+		for key, value := range raw {
+			copied[key] = value
+		}
+		extraRatios := datatypes.NewJSONType(copied)
+		cloned.ExtraRatios = &extraRatios
+	}
+	if price.ModelInfo != nil {
+		modelInfo := *price.ModelInfo
+		modelInfo.InputModalities = append([]string(nil), price.ModelInfo.InputModalities...)
+		modelInfo.OutputModalities = append([]string(nil), price.ModelInfo.OutputModalities...)
+		modelInfo.Tags = append([]string(nil), price.ModelInfo.Tags...)
+		modelInfo.SupportUrl = append([]string(nil), price.ModelInfo.SupportUrl...)
+		cloned.ModelInfo = &modelInfo
+	}
+	return cloned
 }
 
 func (q *Quota) GetInputRatio() float64 {
@@ -214,13 +312,16 @@ func (q *Quota) GetInputRatio() float64 {
 
 func (q *Quota) GetLogMeta(usage *types.Usage) map[string]any {
 	meta := map[string]any{
-		"group_name":        q.groupName,
-		"backup_group_name": q.backupGroupName,
-		"is_backup_group":   q.isBackupGroup, // 添加是否使用备用分组的标识
-		"price_type":        q.price.Type,
-		"group_ratio":       q.groupRatio,
-		"input_ratio":       q.price.GetInput(),
-		"output_ratio":      q.price.GetOutput(),
+		"group_name":           q.groupName,
+		"using_group":          q.groupName,
+		"token_group":          q.tokenGroupName,
+		"backup_group_name":    q.backupGroupName,
+		"routing_group_source": q.routingGroupSource,
+		"is_backup_group":      q.isBackupGroup, // 添加是否使用备用分组的标识
+		"price_type":           q.price.Type,
+		"group_ratio":          q.groupRatio,
+		"input_ratio":          q.price.GetInput(),
+		"output_ratio":         q.price.GetOutput(),
 	}
 
 	firstResponseTime := q.GetFirstResponseTime()
@@ -241,11 +342,25 @@ func (q *Quota) GetLogMeta(usage *types.Usage) map[string]any {
 	if q.extraBillingData != nil {
 		meta["extra_billing"] = q.extraBillingData
 	}
+	if len(q.affinityMeta) > 0 {
+		for key, value := range q.affinityMeta {
+			meta[key] = value
+		}
+	}
 
 	return meta
 }
 
 func (q *Quota) getRequestTime() int {
+	if q.requestFrozen {
+		if q.requestDuration < 0 {
+			return 0
+		}
+		return int(q.requestDuration.Milliseconds())
+	}
+	if q.startTime.IsZero() {
+		return 0
+	}
 	return int(time.Since(q.startTime).Milliseconds())
 }
 
@@ -329,12 +444,33 @@ func (q *Quota) GetTotalQuotaByUsage(usage *types.Usage) (quota int) {
 }
 
 func (q *Quota) GetFirstResponseTime() int64 {
-	// 先判断 firstResponseTime 是否为0
-	if q.firstResponseTime.IsZero() {
+	if q.startTime.IsZero() || q.firstResponseTime.IsZero() || q.firstResponseTime.Before(q.startTime) {
 		return 0
 	}
 
 	return q.firstResponseTime.Sub(q.startTime).Milliseconds()
+}
+
+func (q *Quota) SeedTiming(startedAt, firstResponseAt, completedAt time.Time) {
+	if q == nil {
+		return
+	}
+	effectiveStart := q.startTime
+	if !startedAt.IsZero() {
+		q.startTime = startedAt
+		effectiveStart = startedAt
+	}
+	if !firstResponseAt.IsZero() && (effectiveStart.IsZero() || !firstResponseAt.Before(effectiveStart)) {
+		q.firstResponseTime = firstResponseAt
+	}
+	if !effectiveStart.IsZero() && !completedAt.IsZero() {
+		duration := completedAt.Sub(effectiveStart)
+		if duration < 0 {
+			duration = 0
+		}
+		q.requestDuration = duration
+		q.requestFrozen = true
+	}
 }
 
 func (q *Quota) SetFirstResponseTime(firstResponseTime time.Time) {
@@ -342,27 +478,33 @@ func (q *Quota) SetFirstResponseTime(firstResponseTime time.Time) {
 }
 
 type ExtraBillingData struct {
-	Type      string  `json:"type"`
-	CallCount int     `json:"call_count"`
-	Price     float64 `json:"price"`
+	ServiceType string  `json:"service_type,omitempty"`
+	Type        string  `json:"type"`
+	CallCount   int     `json:"call_count"`
+	Price       float64 `json:"price"`
 }
 
 func (q *Quota) GetExtraBillingData(extraBilling map[string]types.ExtraBilling) {
-	if extraBilling == nil {
+	if len(extraBilling) == 0 {
+		q.extraBillingData = nil
 		return
 	}
 
 	extraBillingData := make(map[string]ExtraBillingData)
-	for serviceType, value := range extraBilling {
-		extraBillingData[serviceType] = ExtraBillingData{
-			Type:      value.Type,
-			CallCount: value.CallCount,
-			Price:     getDefaultExtraServicePrice(serviceType, q.modelName, value.Type),
+	for billingKey, value := range extraBilling {
+		serviceType := types.ResolveExtraBillingServiceType(billingKey, value)
+		billingType := types.ResolveExtraBillingType(billingKey, value)
+		extraBillingData[billingKey] = ExtraBillingData{
+			ServiceType: serviceType,
+			Type:        billingType,
+			CallCount:   value.CallCount,
+			Price:       getDefaultExtraServicePrice(serviceType, q.modelName, billingType),
 		}
 
 	}
 
 	if len(extraBillingData) == 0 {
+		q.extraBillingData = nil
 		return
 	}
 

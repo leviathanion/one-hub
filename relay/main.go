@@ -20,6 +20,13 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+var (
+	relayHandlerFunc             = RelayHandler
+	processChannelRelayErrorFunc = processChannelRelayError
+	shouldRetryFunc              = shouldRetry
+	shouldCooldownsFunc          = shouldCooldowns
+)
+
 func Relay(c *gin.Context) {
 	relay := Path2Relay(c, c.Request.URL.Path)
 	if relay == nil {
@@ -53,17 +60,35 @@ func Relay(c *gin.Context) {
 		defer heartbeat.Close()
 	}
 
-	apiErr, done := RelayHandler(relay)
+	apiErr := executeRelayAttempts(relay)
+	if apiErr != nil {
+		if heartbeat != nil && heartbeat.IsSafeWriteStream() {
+			relay.HandleStreamError(apiErr)
+			return
+		}
+
+		relay.HandleJsonError(apiErr)
+	}
+}
+
+func executeRelayAttempts(relay RelayBaseInterface) *types.OpenAIErrorWithStatusCode {
+	c := relay.getContext()
+
+	apiErr, done := relayHandlerFunc(relay)
 	if apiErr == nil {
 		metrics.RecordProvider(c, 200)
-		return
+		return nil
+	}
+	if handledErr, handled := handleResponsesContinuationMiss(relay, apiErr); handled {
+		metrics.RecordProvider(c, apiErr.StatusCode)
+		return handledErr
 	}
 
 	channel := relay.getProvider().GetChannel()
-	go processChannelRelayError(c.Request.Context(), channel.Id, channel.Name, apiErr, channel.Type)
+	go processChannelRelayErrorFunc(c.Request.Context(), channel.Id, channel.Name, apiErr, channel.Type)
 
 	retryTimes := config.RetryTimes
-	if done || !shouldRetry(c, apiErr, channel.Type) {
+	if done || !shouldRetryFunc(c, apiErr, channel.Type) || shouldSkipRetryAfterAffinityFailure(c) {
 		logger.LogError(c.Request.Context(), fmt.Sprintf("relay error happen, status code is %d, won't retry in this case", apiErr.StatusCode))
 		retryTimes = 0
 	}
@@ -72,8 +97,7 @@ func Relay(c *gin.Context) {
 	timeout := time.Duration(config.RetryTimeOut) * time.Second
 
 	for i := retryTimes; i > 0; i-- {
-		// 冻结通道
-		shouldCooldowns(c, channel, apiErr)
+		shouldCooldownsFunc(c, channel, apiErr)
 
 		if time.Since(startTime) > timeout {
 			apiErr = common.StringErrorWrapperLocal("重试超时，上游负载已饱和，请稍后再试", "system_error", http.StatusTooManyRequests)
@@ -91,25 +115,38 @@ func Relay(c *gin.Context) {
 
 		channel = relay.getProvider().GetChannel()
 		logger.LogError(c.Request.Context(), fmt.Sprintf("using channel #%d(%s) to retry (remain times %d)", channel.Id, channel.Name, i))
-		apiErr, done = RelayHandler(relay)
+		apiErr, done = relayHandlerFunc(relay)
 		if apiErr == nil {
 			metrics.RecordProvider(c, 200)
-			return
+			return nil
 		}
-		go processChannelRelayError(c.Request.Context(), channel.Id, channel.Name, apiErr, channel.Type)
-		if done || !shouldRetry(c, apiErr, channel.Type) {
+		if handledErr, handled := handleResponsesContinuationMiss(relay, apiErr); handled {
+			metrics.RecordProvider(c, apiErr.StatusCode)
+			return handledErr
+		}
+		go processChannelRelayErrorFunc(c.Request.Context(), channel.Id, channel.Name, apiErr, channel.Type)
+		if done || !shouldRetryFunc(c, apiErr, channel.Type) || shouldSkipRetryAfterAffinityFailure(c) {
 			break
 		}
 	}
 
-	if apiErr != nil {
-		if heartbeat != nil && heartbeat.IsSafeWriteStream() {
-			relay.HandleStreamError(apiErr)
-			return
-		}
+	return apiErr
+}
 
-		relay.HandleJsonError(apiErr)
+func handleResponsesContinuationMiss(relay RelayBaseInterface, apiErr *types.OpenAIErrorWithStatusCode) (*types.OpenAIErrorWithStatusCode, bool) {
+	responsesRelay, ok := relay.(*relayResponses)
+	if !ok {
+		return apiErr, false
 	}
+
+	plan := responsesRelay.stalePreviousResponseHandlingPlan(apiErr)
+	if plan == nil {
+		return apiErr, false
+	}
+
+	responsesRelay.clearStalePreviousResponseAffinity()
+	mergeChannelAffinityMeta(responsesRelay.getContext(), plan.recoveryCandidateMeta)
+	return plan.clientError, true
 }
 
 func RelayHandler(relay RelayBaseInterface) (err *types.OpenAIErrorWithStatusCode, done bool) {

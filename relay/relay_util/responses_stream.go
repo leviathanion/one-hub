@@ -34,6 +34,10 @@ type OpenAIResponsesStreamConverter struct {
 	argsBuilder       strings.Builder
 }
 
+type OpenAIResponsesStreamObserver struct {
+	finalResponse *types.OpenAIResponsesResponses
+}
+
 func NewOpenAIResponsesStreamConverter(c *gin.Context, request *types.OpenAIResponsesRequest, usage *types.Usage) *OpenAIResponsesStreamConverter {
 	converter := &OpenAIResponsesStreamConverter{
 		sequenceNumber:    0,
@@ -50,6 +54,10 @@ func NewOpenAIResponsesStreamConverter(c *gin.Context, request *types.OpenAIResp
 	converter.initializeResponse(request)
 
 	return converter
+}
+
+func NewOpenAIResponsesStreamObserver() *OpenAIResponsesStreamObserver {
+	return &OpenAIResponsesStreamObserver{}
 }
 
 func (converter *OpenAIResponsesStreamConverter) initializeResponse(request *types.OpenAIResponsesRequest) {
@@ -120,6 +128,41 @@ func (converter *OpenAIResponsesStreamConverter) ProcessStreamData(jsonStr strin
 
 func (converter *OpenAIResponsesStreamConverter) ProcessError(jsonStr string) {
 	converter.sendError(jsonStr)
+}
+
+func (observer *OpenAIResponsesStreamObserver) ObserveRawLine(rawLine string) {
+	if observer == nil {
+		return
+	}
+
+	for _, line := range strings.Split(rawLine, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+
+		var event types.OpenAIResponsesStreamResponses
+		if err := json.Unmarshal([]byte(payload), &event); err != nil || event.Response == nil {
+			continue
+		}
+
+		responseCopy := *event.Response
+		if observer.finalResponse == nil || isResponsesTerminalEventType(event.Type) {
+			observer.finalResponse = &responseCopy
+		}
+	}
+}
+
+func (observer *OpenAIResponsesStreamObserver) FinalResponse() *types.OpenAIResponsesResponses {
+	if observer == nil {
+		return nil
+	}
+	return observer.finalResponse
 }
 
 // 处理choices
@@ -428,21 +471,36 @@ func (converter *OpenAIResponsesStreamConverter) finalizeStream() {
 	}
 
 	respType := "response.completed"
+	finalStatus := converter.nowStatus
 
-	switch converter.nowStatus {
+	switch finalStatus {
 	case types.ResponseStatusFailed:
 		respType = "response.failed"
 	case types.ResponseStatusIncomplete:
 		respType = "response.incomplete"
+	default:
+		finalStatus = types.ResponseStatusCompleted
 	}
 
 	response := converter.buildStreamResponse(respType)
 	response.Response = converter.responses
-	response.Response.Status = converter.nowStatus
+	response.Response.Status = finalStatus
 
-	response.Response.Usage = converter.usage.ToResponsesUsage()
+	if converter.usage != nil {
+		response.Response.Usage = converter.usage.ToResponsesUsage()
+	}
+	converter.isCompleted = true
 
 	converter.sendStreamEvent(response, respType)
+}
+
+func (converter *OpenAIResponsesStreamConverter) FinalResponse() *types.OpenAIResponsesResponses {
+	if converter == nil || !converter.isCompleted || converter.responses == nil {
+		return nil
+	}
+
+	response := *converter.responses
+	return &response
 }
 
 // 获取响应流字符串
@@ -541,4 +599,13 @@ func isEmptyChoiceDelta(choice *types.ChatCompletionStreamChoice) bool {
 		choice.Delta.Reasoning == "" &&
 		len(choice.Delta.Image) == 0 &&
 		len(choice.Delta.Images) == 0
+}
+
+func isResponsesTerminalEventType(eventType string) bool {
+	switch strings.TrimSpace(eventType) {
+	case "response.completed", "response.failed", "response.incomplete", "response.done":
+		return true
+	default:
+		return false
+	}
 }

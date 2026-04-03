@@ -177,6 +177,95 @@ func TestResponsesStreamConverterFunctionArgumentsDoNotDuplicate(t *testing.T) {
 	}
 }
 
+func TestResponsesStreamConverterFinalResponseAvailableAfterDone(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest("GET", "/", nil)
+
+	converter := NewOpenAIResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{
+		Model:          "gpt-5",
+		PromptCacheKey: "pc-stream-final",
+	}, &types.Usage{})
+
+	converter.ProcessStreamData(`{"id":"chatcmpl_final","object":"chat.completion.chunk","created":1,"model":"gpt-5","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}`)
+	converter.ProcessStreamData(`{"id":"chatcmpl_final","object":"chat.completion.chunk","created":1,"model":"gpt-5","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`)
+	converter.ProcessStreamData("[DONE]")
+
+	finalResponse := converter.FinalResponse()
+	if finalResponse == nil {
+		t.Fatal("expected final response to be available after stream completion")
+	}
+	if finalResponse.ID != "chatcmpl_final" {
+		t.Fatalf("expected final response id %q, got %q", "chatcmpl_final", finalResponse.ID)
+	}
+	if finalResponse.PromptCacheKey != "pc-stream-final" {
+		t.Fatalf("expected prompt_cache_key %q, got %q", "pc-stream-final", finalResponse.PromptCacheKey)
+	}
+	if finalResponse.Status != types.ResponseStatusCompleted {
+		t.Fatalf("expected final response status %q, got %q", types.ResponseStatusCompleted, finalResponse.Status)
+	}
+}
+
+func TestResponsesStreamObserverTracksTerminalResponse(t *testing.T) {
+	observer := NewOpenAIResponsesStreamObserver()
+
+	observer.ObserveRawLine("event: response.created\n")
+	observer.ObserveRawLine("data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_created\",\"object\":\"response\",\"prompt_cache_key\":\"pc-created\",\"status\":\"in_progress\"}}\n")
+	observer.ObserveRawLine("\n")
+	observer.ObserveRawLine("event: response.completed\n")
+	observer.ObserveRawLine("data: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"id\":\"resp_final\",\"object\":\"response\",\"prompt_cache_key\":\"pc-final\",\"status\":\"completed\"}}\n")
+	observer.ObserveRawLine("\n")
+	observer.ObserveRawLine("data: [DONE]\n")
+
+	finalResponse := observer.FinalResponse()
+	if finalResponse == nil {
+		t.Fatal("expected observer to keep terminal response")
+	}
+	if finalResponse.ID != "resp_final" {
+		t.Fatalf("expected terminal response id %q, got %q", "resp_final", finalResponse.ID)
+	}
+	if finalResponse.PromptCacheKey != "pc-final" {
+		t.Fatalf("expected terminal prompt_cache_key %q, got %q", "pc-final", finalResponse.PromptCacheKey)
+	}
+}
+
+func TestResponsesStreamHelperGuardBranches(t *testing.T) {
+	var nilObserver *OpenAIResponsesStreamObserver
+	nilObserver.ObserveRawLine("event: response.created\n")
+	if finalResponse := nilObserver.FinalResponse(); finalResponse != nil {
+		t.Fatalf("expected nil observer final response to stay nil, got %+v", finalResponse)
+	}
+
+	observer := NewOpenAIResponsesStreamObserver()
+	observer.ObserveRawLine("data: {not-json}\n")
+	if finalResponse := observer.FinalResponse(); finalResponse != nil {
+		t.Fatalf("expected invalid observer payloads to be ignored, got %+v", finalResponse)
+	}
+
+	var nilConverter *OpenAIResponsesStreamConverter
+	if finalResponse := nilConverter.FinalResponse(); finalResponse != nil {
+		t.Fatalf("expected nil converter final response to stay nil, got %+v", finalResponse)
+	}
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest("GET", "/", nil)
+	converter := NewOpenAIResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: "gpt-5"}, &types.Usage{})
+	if finalResponse := converter.FinalResponse(); finalResponse != nil {
+		t.Fatalf("expected incomplete converter not to expose a final response, got %+v", finalResponse)
+	}
+
+	if !isResponsesTerminalEventType("response.failed") {
+		t.Fatal("expected failed responses events to classify as terminal")
+	}
+	if isResponsesTerminalEventType("response.updated") {
+		t.Fatal("expected non-terminal responses events not to classify as terminal")
+	}
+}
+
 type sseEvent struct {
 	Event string
 	Data  string
