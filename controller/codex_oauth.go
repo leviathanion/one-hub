@@ -301,7 +301,7 @@ func exchangeCodexCodeForToken(code, codeVerifier, state, proxyURL string) (*cod
 	}
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", "codex_cli_rs/0.38.0 (Ubuntu 22.4.0; x86_64) WindowsTerminal")
+	req.Header.Set("User-Agent", codex.DefaultUserAgent())
 	req.Header.Set("Accept", "application/json")
 
 	// Create HTTP client.

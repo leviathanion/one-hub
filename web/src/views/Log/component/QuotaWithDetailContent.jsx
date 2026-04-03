@@ -76,10 +76,11 @@ export default function QuotaWithDetailContent({ item, userGroup, totalInputToke
 
   if (extraBilling && Object.keys(extraBilling).length > 0) {
     Object.entries(extraBilling).forEach(([key, data]) => {
+      const serviceType = data.service_type || key;
       if (data.type !== '') {
-        extraBillingSteps.push(`${key}[${data.type}] : $${data.price} x ${data.call_count}`);
+        extraBillingSteps.push(`${serviceType}[${data.type}] : $${data.price} x ${data.call_count}`);
       } else {
-        extraBillingSteps.push(`${key} : $${data.price} x ${data.call_count}`);
+        extraBillingSteps.push(`${serviceType} : $${data.price} x ${data.call_count}`);
       }
     });
   }

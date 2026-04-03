@@ -567,11 +567,12 @@ const typeConfig = {
   },
   101: {
     inputLabel: {
-      other: ''
+      other: 'Codex 配置(JSON)'
     },
     prompt: {
       key: '请输入完整的 OAuth2 凭证 JSON，或点击下方"OAuth 授权"按钮自动获取',
-      other: ''
+      other:
+        '可选。填写 Codex 渠道额外配置 JSON，对应后端 channel.Other。websocket_mode 也在这里配置，例如：{"websocket_mode":"auto"}。支持 auto / force / off：auto 优先 websocket，失败自动回退到 HTTP bridge；force 必须走 websocket；off 直接禁用 websocket。prompt_cache_key_strategy 默认 off，支持 auto / off / session_id / auth_header / token_id / user_id；auto 优先级为 x-session-id/session_id -> auth_header -> token_id -> user_id。Responses 与 Realtime 都会使用渠道亲和；Realtime 只支持同一渠道内 resume。'
     }
   }
 };

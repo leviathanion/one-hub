@@ -4,10 +4,14 @@ import (
 	"encoding/json"
 	"net/http"
 	"one-api/common/config"
+	commonredis "one-api/common/redis"
 	"one-api/common/utils"
 	"one-api/model"
+	"one-api/providers/codex"
+	runtimeaffinity "one-api/runtime/channelaffinity"
 	"one-api/safty"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -38,6 +42,70 @@ func GetSafeTools(c *gin.Context) {
 		"data":    safty.GetAllSafeToolsName(),
 	})
 	return
+}
+
+func GetChannelAffinityCache(c *gin.Context) {
+	settings := config.ChannelAffinitySettingsInstance.Clone()
+	manager := runtimeaffinity.ConfigureDefault(runtimeaffinity.ManagerOptions{
+		DefaultTTL:      time.Duration(settings.DefaultTTLSeconds) * time.Second,
+		JanitorInterval: time.Minute,
+		MaxEntries:      settings.MaxEntries,
+		RedisClient:     commonredis.GetRedisClient(),
+		RedisPrefix:     "one-hub:channel-affinity",
+	})
+	stats := manager.Stats()
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data": gin.H{
+			"enabled":                             settings.Enabled,
+			"default_ttl_seconds":                 settings.DefaultTTLSeconds,
+			"max_entries":                         settings.MaxEntries,
+			"rules_count":                         len(settings.Rules),
+			"rules":                               settings.Rules,
+			"backend":                             stats.Backend,
+			"local_entries":                       stats.LocalEntries,
+			"backend_entries":                     stats.BackendEntries,
+			"preferred_channel_wait_milliseconds": config.PreferredChannelWaitMilliseconds,
+			"preferred_channel_wait_poll_milliseconds": config.PreferredChannelWaitPollMilliseconds,
+		},
+	})
+}
+
+func ClearChannelAffinityCache(c *gin.Context) {
+	settings := config.ChannelAffinitySettingsInstance.Clone()
+	manager := runtimeaffinity.ConfigureDefault(runtimeaffinity.ManagerOptions{
+		DefaultTTL:      time.Duration(settings.DefaultTTLSeconds) * time.Second,
+		JanitorInterval: time.Minute,
+		MaxEntries:      settings.MaxEntries,
+		RedisClient:     commonredis.GetRedisClient(),
+		RedisPrefix:     "one-hub:channel-affinity",
+	})
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data": gin.H{
+			"cleared": manager.Clear(),
+		},
+	})
+}
+
+func GetExecutionSessionCache(c *gin.Context) {
+	stats := codex.GetExecutionSessionStats()
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data": gin.H{
+			"backend":                 stats.Backend,
+			"local_sessions":          stats.LocalSessions,
+			"local_bindings":          stats.LocalBindings,
+			"backend_bindings":        stats.BackendBindings,
+			"max_sessions":            stats.MaxSessions,
+			"max_sessions_per_caller": stats.MaxSessionsPerCaller,
+			"default_ttl_seconds":     stats.DefaultTTLSeconds,
+			"managed_provider":        "codex",
+		},
+	})
 }
 
 func UpdateOption(c *gin.Context) {

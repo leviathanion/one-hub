@@ -68,3 +68,10 @@ func TestParseCodexChannelTemplateRejectsEmptyModels(t *testing.T) {
 		t.Fatalf("expected empty models to be rejected")
 	}
 }
+
+func TestParseCodexChannelTemplateRejectsInvalidRuntimeConfigJSON(t *testing.T) {
+	_, err := parseCodexChannelTemplate(`{"type":101,"name":"codex","models":"gpt-5","group":"default","other":"{\"prompt_cache_key_strategy\":"}`)
+	if err == nil {
+		t.Fatal("expected invalid runtime config json to be rejected")
+	}
+}

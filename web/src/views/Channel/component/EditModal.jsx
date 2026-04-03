@@ -102,6 +102,44 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
   const [codexSessionId, setCodexSessionId] = useState('');
   const [codexAuthCode, setCodexAuthCode] = useState('');
   const [codexSubmitting, setCodexSubmitting] = useState(false);
+  const codexConfigExamples = [
+    {
+      title: '默认行为(不自动生成)',
+      value: `{
+  "prompt_cache_key_strategy": "off"
+}`
+    },
+    {
+      title: '开启自动生成(常用推荐)',
+      value: `{
+  "prompt_cache_key_strategy": "auto"
+}`
+    },
+    {
+      title: '按 session_id 绑定缓存',
+      value: `{
+  "prompt_cache_key_strategy": "session_id"
+}`
+    },
+    {
+      title: '同一用户多个令牌共享缓存',
+      value: `{
+  "prompt_cache_key_strategy": "user_id"
+}`
+    },
+    {
+      title: '每个令牌独立缓存',
+      value: `{
+  "prompt_cache_key_strategy": "token_id"
+}`
+    },
+    {
+      title: '按外部认证头共享缓存',
+      value: `{
+  "prompt_cache_key_strategy": "auth_header"
+}`
+    }
+  ];
 
   const initChannel = (typeValue) => {
     if (typeConfig[typeValue]?.inputLabel) {
@@ -385,11 +423,11 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
     }
 
     if (values.custom_parameter) {
-      try {
-        JSON.parse(values.custom_parameter);
-      } catch (error) {
-        throw new Error('Error parsing custom_parameter: ' + error.message);
-      }
+      values.custom_parameter = normalizeJSONObjectString('custom_parameter', values.custom_parameter);
+    }
+
+    if (values.type === 101 && values.other) {
+      values.other = normalizeJSONObjectString('other', values.other);
     }
 
     if (values.disabled_stream) {
@@ -609,6 +647,14 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
           data.custom_parameter = '';
         }
 
+        if (data.type === 101 && data.other !== '') {
+          try {
+            data.other = JSON.stringify(JSON.parse(data.other), null, 2);
+          } catch (error) {
+            console.log('Error parsing other JSON:', error);
+          }
+        }
+
         data.base_url = data.base_url ?? '';
         data.is_edit = true;
         if (data.plugin === null) {
@@ -626,6 +672,26 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
     } catch (error) {
       return;
     }
+  };
+
+  const normalizeJSONObjectString = (fieldName, value) => {
+    const trimmed = value?.trim();
+    if (!trimmed) {
+      return '';
+    }
+
+    let parsedJson;
+    try {
+      parsedJson = JSON.parse(trimmed);
+    } catch (error) {
+      throw new Error(`Error parsing ${fieldName}: ${error.message}`);
+    }
+
+    if (parsedJson === null || Array.isArray(parsedJson) || typeof parsedJson !== 'object') {
+      throw new Error(`${fieldName} must be a JSON object`);
+    }
+
+    return JSON.stringify(parsedJson, null, 2);
   };
 
   useEffect(() => {
@@ -772,28 +838,116 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                 )}
 
                 {inputPrompt.other && (
-                  <FormControl fullWidth error={Boolean(touched.other && errors.other)} sx={{ ...theme.typography.otherInput }}>
-                    <InputLabel htmlFor="channel-other-label">{customizeT(inputLabel.other)}</InputLabel>
-                    <OutlinedInput
-                      id="channel-other-label"
-                      label={customizeT(inputLabel.other)}
-                      type="text"
-                      value={values.other}
-                      name="other"
-                      disabled={hasTag}
-                      onBlur={handleBlur}
-                      onChange={handleChange}
-                      inputProps={{}}
-                      aria-describedby="helper-text-channel-other-label"
-                    />
-                    {touched.other && errors.other ? (
-                      <FormHelperText error id="helper-tex-channel-other-label">
-                        {errors.other}
-                      </FormHelperText>
-                    ) : (
-                      <FormHelperText id="helper-tex-channel-other-label"> {customizeT(inputPrompt.other)} </FormHelperText>
+                  <Box sx={{ ...theme.typography.otherInput }}>
+                    <FormControl fullWidth error={Boolean(touched.other && errors.other)}>
+                      <InputLabel htmlFor="channel-other-label">{customizeT(inputLabel.other)}</InputLabel>
+                      <OutlinedInput
+                        id="channel-other-label"
+                        label={customizeT(inputLabel.other)}
+                        type="text"
+                        multiline={values.type === 101}
+                        minRows={values.type === 101 ? 4 : undefined}
+                        value={values.other}
+                        name="other"
+                        disabled={hasTag}
+                        onBlur={handleBlur}
+                        onChange={handleChange}
+                        inputProps={{}}
+                        aria-describedby="helper-text-channel-other-label"
+                      />
+                      {touched.other && errors.other ? (
+                        <FormHelperText error id="helper-tex-channel-other-label">
+                          {errors.other}
+                        </FormHelperText>
+                      ) : (
+                        <FormHelperText id="helper-tex-channel-other-label"> {customizeT(inputPrompt.other)} </FormHelperText>
+                      )}
+                    </FormControl>
+
+                    {values.type === 101 && (
+                      <Alert severity="info" sx={{ mt: 1.5 }}>
+                        <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                          Codex 配置模板
+                        </Typography>
+                        <Typography variant="body2" component="div" sx={{ mb: 1.5 }}>
+                          直接复制下面任意一个 JSON 到{' '}
+                          <Box
+                            component="code"
+                            sx={{
+                              px: 0.5,
+                              py: 0.1,
+                              borderRadius: 0.5,
+                              backgroundColor: theme.palette.mode === 'dark' ? 'grey.800' : 'grey.200',
+                              fontSize: '0.75rem'
+                            }}
+                          >
+                            Codex 配置(JSON)
+                          </Box>{' '}
+                          中即可。不配置时默认等效于{' '}
+                          <Box
+                            component="code"
+                            sx={{
+                              px: 0.5,
+                              py: 0.1,
+                              borderRadius: 0.5,
+                              backgroundColor: theme.palette.mode === 'dark' ? 'grey.800' : 'grey.200',
+                              fontSize: '0.75rem'
+                            }}
+                          >
+                            off
+                          </Box>
+                          ；如果你会在请求体里自己传{' '}
+                          <Box
+                            component="code"
+                            sx={{
+                              px: 0.5,
+                              py: 0.1,
+                              borderRadius: 0.5,
+                              backgroundColor: theme.palette.mode === 'dark' ? 'grey.800' : 'grey.200',
+                              fontSize: '0.75rem'
+                            }}
+                          >
+                            prompt_cache_key
+                          </Box>
+                          ，保持默认即可；如需自动生成稳定 key，再显式设置{' '}
+                          <Box
+                            component="code"
+                            sx={{
+                              px: 0.5,
+                              py: 0.1,
+                              borderRadius: 0.5,
+                              backgroundColor: theme.palette.mode === 'dark' ? 'grey.800' : 'grey.200',
+                              fontSize: '0.75rem'
+                            }}
+                          >
+                            auto
+                          </Box>
+                          。
+                        </Typography>
+                        {codexConfigExamples.map((example) => (
+                          <Box key={example.title} sx={{ mb: 1.5, '&:last-child': { mb: 0 } }}>
+                            <Typography variant="caption" sx={{ display: 'block', mb: 0.5, fontWeight: 700 }}>
+                              {example.title}
+                            </Typography>
+                            <Box
+                              component="pre"
+                              sx={{
+                                m: 0,
+                                p: 1.25,
+                                borderRadius: 1,
+                                overflowX: 'auto',
+                                backgroundColor: theme.palette.mode === 'dark' ? 'grey.900' : 'grey.100',
+                                fontSize: '0.75rem',
+                                lineHeight: 1.5
+                              }}
+                            >
+                              {example.value}
+                            </Box>
+                          </Box>
+                        ))}
+                      </Alert>
                     )}
-                  </FormControl>
+                  </Box>
                 )}
 
                 <FormControl fullWidth sx={{ ...theme.typography.otherInput }}>

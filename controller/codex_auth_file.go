@@ -131,6 +131,9 @@ func parseCodexChannelTemplate(raw string) (model.Channel, error) {
 	if !hasConfiguredModels(channel.Models) {
 		return channel, fmt.Errorf("models cannot be empty")
 	}
+	if err := channel.ValidateRuntimeConfigJSON(); err != nil {
+		return channel, err
+	}
 
 	return channel, nil
 }
