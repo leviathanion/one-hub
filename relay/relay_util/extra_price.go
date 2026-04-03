@@ -54,15 +54,15 @@ func getModelTier(modelName string) string {
 // 获取默认的额外服务价格
 func getDefaultExtraServicePrice(serviceType, modelName, extraType string) float64 {
 	switch serviceType {
-	case types.APITollTypeWebSearchPreview:
+	case types.APIToolTypeWebSearchPreview:
 		tier := getModelTier(modelName)
 		return defaultExtraServicePrices.WebSearch[tier]
-	case types.APITollTypeFileSearch:
+	case types.APIToolTypeFileSearch:
 		return defaultExtraServicePrices.FileSearch
-	case types.APITollTypeCodeInterpreter:
+	case types.APIToolTypeCodeInterpreter:
 		return defaultExtraServicePrices.CodeInterpreter
 
-	case types.APITollTypeImageGeneration:
+	case types.APIToolTypeImageGeneration:
 		if extraType == "" {
 			return 0
 		}

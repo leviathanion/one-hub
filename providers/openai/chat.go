@@ -217,7 +217,7 @@ func getChatExtraBilling(request *types.ChatCompletionRequest) map[string]types.
 	}
 
 	return map[string]types.ExtraBilling{
-		types.APITollTypeWebSearchPreview: {
+		types.APIToolTypeWebSearchPreview: {
 			Type:      searchType,
 			CallCount: 1,
 		},

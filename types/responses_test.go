@@ -179,8 +179,8 @@ func TestChatCompletionToolRoundTripPreservesResponsesTool(t *testing.T) {
 		t.Fatalf("unexpected unmarshal error: %v", err)
 	}
 
-	if tool.Type != APITollTypeWebSearchPreview {
-		t.Fatalf("expected type %q, got %q", APITollTypeWebSearchPreview, tool.Type)
+	if tool.Type != APIToolTypeWebSearchPreview {
+		t.Fatalf("expected type %q, got %q", APIToolTypeWebSearchPreview, tool.Type)
 	}
 	if tool.ResponsesTool.SearchContextSize != "medium" {
 		t.Fatalf("expected search_context_size %q, got %q", "medium", tool.ResponsesTool.SearchContextSize)
@@ -198,8 +198,8 @@ func TestChatCompletionToolRoundTripPreservesResponsesTool(t *testing.T) {
 		t.Fatalf("unexpected payload unmarshal error: %v", err)
 	}
 
-	if payload["type"] != APITollTypeWebSearchPreview {
-		t.Fatalf("expected type %q, got %#v", APITollTypeWebSearchPreview, payload["type"])
+	if payload["type"] != APIToolTypeWebSearchPreview {
+		t.Fatalf("expected type %q, got %#v", APIToolTypeWebSearchPreview, payload["type"])
 	}
 	if payload["search_context_size"] != "high" {
 		t.Fatalf("expected updated search_context_size, got %#v", payload["search_context_size"])
@@ -238,6 +238,92 @@ func TestResponsesToolsMarshalJSONPreservesUnknownFieldsAndReturnsErrors(t *test
 	_, err = json.Marshal(tool)
 	if err == nil {
 		t.Fatal("expected marshal error for unsupported function parameter type")
+	}
+}
+
+func TestGetResponsesExtraBillingRecognizesNormalizedWebSearchAlias(t *testing.T) {
+	billing := GetResponsesExtraBilling(&OpenAIResponsesResponses{
+		Tools: []ResponsesTools{
+			{Type: APIToolTypeWebSearch, SearchContextSize: "high"},
+		},
+		Output: []ResponsesOutput{
+			{Type: InputTypeWebSearchCall, ID: "ws_1"},
+		},
+	})
+
+	entry, ok := billing[APIToolTypeWebSearchPreview]
+	if !ok {
+		t.Fatalf("expected normalized web_search alias to map to web search billing, got %+v", billing)
+	}
+	if entry.Type != "high" || entry.CallCount != 1 {
+		t.Fatalf("expected a single high web search charge, got %+v", entry)
+	}
+}
+
+func TestGetResponsesExtraBillingAccumulatesMultipleWebSearchCalls(t *testing.T) {
+	billing := GetResponsesExtraBilling(&OpenAIResponsesResponses{
+		Tools: []ResponsesTools{
+			{Type: APIToolTypeWebSearchPreview, SearchContextSize: "medium"},
+		},
+		Output: []ResponsesOutput{
+			{Type: InputTypeWebSearchCall, ID: "ws_1"},
+			{Type: InputTypeWebSearchCall, ID: "ws_2"},
+			{Type: InputTypeWebSearchCall, ID: "ws_3"},
+		},
+	})
+
+	entry, ok := billing[APIToolTypeWebSearchPreview]
+	if !ok {
+		t.Fatalf("expected web search billing entry, got %+v", billing)
+	}
+	if entry.Type != "medium" || entry.CallCount != 3 {
+		t.Fatalf("expected web search calls to accumulate to 3, got %+v", entry)
+	}
+}
+
+func TestGetResponsesExtraBillingSeparatesImageGenerationVariants(t *testing.T) {
+	billing := GetResponsesExtraBilling(&OpenAIResponsesResponses{
+		Output: []ResponsesOutput{
+			{Type: InputTypeImageGenerationCall, ID: "img_1", Quality: "low", Size: "1024x1024"},
+			{Type: InputTypeImageGenerationCall, ID: "img_2", Quality: "high", Size: "1536x1024"},
+		},
+	})
+
+	lowKey := BuildExtraBillingKey(APIToolTypeImageGeneration, "low-1024x1024")
+	highKey := BuildExtraBillingKey(APIToolTypeImageGeneration, "high-1536x1024")
+	if len(billing) != 2 {
+		t.Fatalf("expected image generation variants to be tracked separately, got %+v", billing)
+	}
+	if entry := billing[lowKey]; entry.ServiceType != APIToolTypeImageGeneration || entry.Type != "low-1024x1024" || entry.CallCount != 1 {
+		t.Fatalf("expected low image generation variant billing entry, got %+v", entry)
+	}
+	if entry := billing[highKey]; entry.ServiceType != APIToolTypeImageGeneration || entry.Type != "high-1536x1024" || entry.CallCount != 1 {
+		t.Fatalf("expected high image generation variant billing entry, got %+v", entry)
+	}
+}
+
+func TestResponsesToolTypeHelpersAndAdditionalBillingBranches(t *testing.T) {
+	if IsResponsesWebSearchToolType("custom-search") {
+		t.Fatal("expected unknown tool types not to classify as responses web search tools")
+	}
+	if got := NormalizeResponsesWebSearchToolType(""); got != "" {
+		t.Fatalf("expected empty responses web search tool type to stay empty, got %q", got)
+	}
+	if billing := GetResponsesExtraBilling(nil); billing != nil {
+		t.Fatalf("expected nil response billing lookup to stay nil, got %+v", billing)
+	}
+
+	billing := GetResponsesExtraBilling(&OpenAIResponsesResponses{
+		Output: []ResponsesOutput{
+			{Type: InputTypeCodeInterpreterCall, ID: "code_1"},
+			{Type: InputTypeFileSearchCall, ID: "file_1"},
+		},
+	})
+	if got := billing[APIToolTypeCodeInterpreter].CallCount; got != 1 {
+		t.Fatalf("expected code interpreter usage billing, got %+v", billing[APIToolTypeCodeInterpreter])
+	}
+	if got := billing[APIToolTypeFileSearch].CallCount; got != 1 {
+		t.Fatalf("expected file search usage billing, got %+v", billing[APIToolTypeFileSearch])
 	}
 }
 

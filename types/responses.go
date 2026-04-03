@@ -11,11 +11,34 @@ import (
 )
 
 const (
-	APITollTypeWebSearchPreview = "web_search_preview"
-	APITollTypeFileSearch       = "file_search"
-	APITollTypeCodeInterpreter  = "code_interpreter"
-	APITollTypeImageGeneration  = "image_generation"
+	APIToolTypeWebSearchPreview = "web_search_preview"
+	APIToolTypeWebSearch        = "web_search"
+	APIToolTypeFileSearch       = "file_search"
+	APIToolTypeCodeInterpreter  = "code_interpreter"
+	APIToolTypeImageGeneration  = "image_generation"
 )
+
+const apiToolTypeWebSearchPreview20250311 = "web_search_preview_2025_03_11"
+
+func IsResponsesWebSearchToolType(toolType string) bool {
+	switch strings.TrimSpace(toolType) {
+	case APIToolTypeWebSearchPreview, APIToolTypeWebSearch, apiToolTypeWebSearchPreview20250311:
+		return true
+	default:
+		return false
+	}
+}
+
+func NormalizeResponsesWebSearchToolType(toolType string) string {
+	trimmed := strings.TrimSpace(toolType)
+	if trimmed == "" {
+		return ""
+	}
+	if IsResponsesWebSearchToolType(trimmed) {
+		return APIToolTypeWebSearch
+	}
+	return trimmed
+}
 
 // message / file_search_call / computer_call / web_search_call / computer_call_output / function_call / function_call_output / reasoning / image_generation_call / code_interpreter_call / local_shell_call / local_shell_call_output / mcp_list_tools / mcp_approval_request / mcp_approval_response / mcp_call
 
@@ -861,6 +884,34 @@ type ResponsesUsageInputTokensDetails struct {
 	CachedTokens int `json:"cached_tokens"`
 	TextTokens   int `json:"text_tokens,omitempty"`
 	ImageTokens  int `json:"image_tokens,omitempty"`
+}
+
+func GetResponsesExtraBilling(response *OpenAIResponsesResponses) map[string]ExtraBilling {
+	if response == nil || len(response.Output) == 0 {
+		return nil
+	}
+
+	usage := &Usage{}
+	for _, output := range response.Output {
+		switch output.Type {
+		case InputTypeWebSearchCall:
+			searchType := "medium"
+			for _, tool := range response.Tools {
+				if IsResponsesWebSearchToolType(tool.Type) && tool.SearchContextSize != "" {
+					searchType = tool.SearchContextSize
+				}
+			}
+			usage.IncExtraBilling(APIToolTypeWebSearchPreview, searchType)
+		case InputTypeCodeInterpreterCall:
+			usage.IncExtraBilling(APIToolTypeCodeInterpreter, "")
+		case InputTypeFileSearchCall:
+			usage.IncExtraBilling(APIToolTypeFileSearch, "")
+		case InputTypeImageGenerationCall:
+			usage.IncExtraBilling(APIToolTypeImageGeneration, output.Quality+"-"+output.Size)
+		}
+	}
+
+	return cloneExtraBillingMap(usage.ExtraBilling)
 }
 
 func (u *ResponsesUsage) ToOpenAIUsage() *Usage {

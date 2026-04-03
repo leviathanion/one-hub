@@ -203,7 +203,7 @@ func (h *OpenAIResponsesStreamHandler) HandlerResponsesStream(rawLine *[]byte, d
 	case "response.created":
 		if openaiResponse.Response != nil && len(openaiResponse.Response.Tools) > 0 {
 			for _, tool := range openaiResponse.Response.Tools {
-				if tool.Type == types.APITollTypeWebSearchPreview {
+				if types.IsResponsesWebSearchToolType(tool.Type) {
 					h.searchType = "medium"
 					if tool.SearchContextSize != "" {
 						h.searchType = tool.SearchContextSize
@@ -223,11 +223,11 @@ func (h *OpenAIResponsesStreamHandler) HandlerResponsesStream(rawLine *[]byte, d
 				if h.searchType == "" {
 					h.searchType = "medium"
 				}
-				h.Usage.IncExtraBilling(types.APITollTypeWebSearchPreview, h.searchType)
+				h.Usage.IncExtraBilling(types.APIToolTypeWebSearchPreview, h.searchType)
 			case types.InputTypeCodeInterpreterCall:
-				h.Usage.IncExtraBilling(types.APITollTypeCodeInterpreter, "")
+				h.Usage.IncExtraBilling(types.APIToolTypeCodeInterpreter, "")
 			case types.InputTypeFileSearchCall:
-				h.Usage.IncExtraBilling(types.APITollTypeFileSearch, "")
+				h.Usage.IncExtraBilling(types.APIToolTypeFileSearch, "")
 			}
 		}
 	default:
@@ -279,7 +279,7 @@ func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataCh
 		}
 		if len(openaiResponse.Response.Tools) > 0 {
 			for _, tool := range openaiResponse.Response.Tools {
-				if tool.Type == types.APITollTypeWebSearchPreview {
+				if types.IsResponsesWebSearchToolType(tool.Type) {
 					h.searchType = "medium"
 					if tool.SearchContextSize != "" {
 						h.searchType = tool.SearchContextSize
@@ -347,11 +347,11 @@ func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataCh
 				if h.searchType == "" {
 					h.searchType = "medium"
 				}
-				h.Usage.IncExtraBilling(types.APITollTypeWebSearchPreview, h.searchType)
+				h.Usage.IncExtraBilling(types.APIToolTypeWebSearchPreview, h.searchType)
 			case types.InputTypeCodeInterpreterCall:
-				h.Usage.IncExtraBilling(types.APITollTypeCodeInterpreter, "")
+				h.Usage.IncExtraBilling(types.APIToolTypeCodeInterpreter, "")
 			case types.InputTypeFileSearchCall:
-				h.Usage.IncExtraBilling(types.APITollTypeFileSearch, "")
+				h.Usage.IncExtraBilling(types.APIToolTypeFileSearch, "")
 
 			case types.InputTypeMessage, types.InputTypeReasoning:
 				chatRes.Choices = append(chatRes.Choices, types.ChatCompletionStreamChoice{
@@ -449,30 +449,5 @@ func getResponsesExtraBilling(response *types.OpenAIResponsesResponses, usage *t
 	if usage == nil {
 		return
 	}
-
-	if len(response.Output) > 0 {
-		for _, output := range response.Output {
-			switch output.Type {
-			case types.InputTypeWebSearchCall:
-				searchType := "medium"
-				if len(response.Tools) > 0 {
-					for _, tool := range response.Tools {
-						if tool.Type == types.APITollTypeWebSearchPreview {
-							if tool.SearchContextSize != "" {
-								searchType = tool.SearchContextSize
-							}
-						}
-					}
-				}
-				usage.IncExtraBilling(types.APITollTypeWebSearchPreview, searchType)
-			case types.InputTypeCodeInterpreterCall:
-				usage.IncExtraBilling(types.APITollTypeCodeInterpreter, "")
-			case types.InputTypeFileSearchCall:
-				usage.IncExtraBilling(types.APITollTypeFileSearch, "")
-			case types.InputTypeImageGenerationCall:
-				imageType := output.Quality + "-" + output.Size
-				usage.IncExtraBilling(types.APITollTypeImageGeneration, imageType)
-			}
-		}
-	}
+	usage.MergeExtraBilling(types.GetResponsesExtraBilling(response))
 }

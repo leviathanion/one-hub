@@ -122,6 +122,75 @@ func TestHandlerResponsesStreamIgnoreNonTrackedEventWithKeyword(t *testing.T) {
 	}
 }
 
+func TestHandlerResponsesStreamTracksResponsesToolBilling(t *testing.T) {
+	handler := OpenAIResponsesStreamHandler{
+		Usage:  &types.Usage{},
+		Prefix: "data: ",
+		Model:  "gpt-5",
+	}
+
+	dataChan := make(chan string, 4)
+	errChan := make(chan error, 1)
+
+	created := []byte(`data: {"type":"response.created","response":{"tools":[{"type":"web_search_preview","search_context_size":"high"}]}}`)
+	handler.HandlerResponsesStream(&created, dataChan, errChan)
+
+	webSearch := []byte(`data: {"type":"response.output_item.added","item":{"type":"web_search_call"}}`)
+	handler.HandlerResponsesStream(&webSearch, dataChan, errChan)
+
+	codeInterpreter := []byte(`data: {"type":"response.output_item.added","item":{"type":"code_interpreter_call"}}`)
+	handler.HandlerResponsesStream(&codeInterpreter, dataChan, errChan)
+
+	fileSearch := []byte(`data: {"type":"response.output_item.added","item":{"type":"file_search_call"}}`)
+	handler.HandlerResponsesStream(&fileSearch, dataChan, errChan)
+
+	if got := handler.Usage.ExtraBilling[types.BuildExtraBillingKey(types.APIToolTypeWebSearchPreview, "high")].CallCount; got != 1 {
+		t.Fatalf("expected responses stream handler to track web search billing, got %+v", handler.Usage.ExtraBilling)
+	}
+	if got := handler.Usage.ExtraBilling[types.BuildExtraBillingKey(types.APIToolTypeCodeInterpreter, "")].CallCount; got != 1 {
+		t.Fatalf("expected responses stream handler to track code interpreter billing, got %+v", handler.Usage.ExtraBilling)
+	}
+	if got := handler.Usage.ExtraBilling[types.BuildExtraBillingKey(types.APIToolTypeFileSearch, "")].CallCount; got != 1 {
+		t.Fatalf("expected responses stream handler to track file search billing, got %+v", handler.Usage.ExtraBilling)
+	}
+
+	select {
+	case err := <-errChan:
+		t.Fatalf("unexpected stream error: %v", err)
+	default:
+	}
+}
+
+func TestHandlerChatStreamTracksAdditionalToolBilling(t *testing.T) {
+	handler := OpenAIResponsesStreamHandler{
+		Usage:  &types.Usage{},
+		Prefix: "data: ",
+		Model:  "gpt-5",
+	}
+
+	dataChan := make(chan string, 2)
+	errChan := make(chan error, 1)
+
+	codeInterpreter := []byte(`data: {"type":"response.output_item.added","item":{"type":"code_interpreter_call"}}`)
+	handler.HandlerChatStream(&codeInterpreter, dataChan, errChan)
+
+	fileSearch := []byte(`data: {"type":"response.output_item.added","item":{"type":"file_search_call"}}`)
+	handler.HandlerChatStream(&fileSearch, dataChan, errChan)
+
+	if got := handler.Usage.ExtraBilling[types.BuildExtraBillingKey(types.APIToolTypeCodeInterpreter, "")].CallCount; got != 1 {
+		t.Fatalf("expected chat stream handler to track code interpreter billing, got %+v", handler.Usage.ExtraBilling)
+	}
+	if got := handler.Usage.ExtraBilling[types.BuildExtraBillingKey(types.APIToolTypeFileSearch, "")].CallCount; got != 1 {
+		t.Fatalf("expected chat stream handler to track file search billing, got %+v", handler.Usage.ExtraBilling)
+	}
+
+	select {
+	case err := <-errChan:
+		t.Fatalf("unexpected stream error: %v", err)
+	default:
+	}
+}
+
 func mustReadChunk(t *testing.T, dataChan <-chan string) types.ChatCompletionStreamResponse {
 	t.Helper()
 
