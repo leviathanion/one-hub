@@ -27,7 +27,42 @@ import (
 const (
 	TokenCacheKey        = "api_token:codex"
 	refreshLockKeyPrefix = "codex:refresh-lock"
+	defaultUserAgent     = "codex_cli_rs/0.116.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
+	defaultOriginator    = "codex_cli_rs"
 )
+
+const (
+	codexPromptCacheStrategyAuto       = "auto"
+	codexPromptCacheStrategyOff        = "off"
+	codexPromptCacheStrategySessionID  = "session_id"
+	codexPromptCacheStrategyTokenID    = "token_id"
+	codexPromptCacheStrategyUserID     = "user_id"
+	codexPromptCacheStrategyAuthHeader = "auth_header"
+
+	codexWebsocketModeAuto  = "auto"
+	codexWebsocketModeForce = "force"
+	codexWebsocketModeOff   = "off"
+)
+
+type codexChannelOptions struct {
+	PromptCacheKeyStrategy        string `json:"prompt_cache_key_strategy"`
+	WebsocketMode                 string `json:"websocket_mode"`
+	ExecutionSessionTTLSeconds    int    `json:"execution_session_ttl_seconds"`
+	WebsocketRetryCooldownSeconds int    `json:"websocket_retry_cooldown_seconds"`
+	UserAgent                     string `json:"user_agent"`
+}
+
+func DefaultUserAgent() string {
+	return defaultUserAgent
+}
+
+func normalizeCodexModelName(modelName string) string {
+	modelName = strings.TrimSpace(modelName)
+	if strings.HasPrefix(modelName, "gpt-5-") && modelName != "gpt-5-codex" {
+		return "gpt-5"
+	}
+	return modelName
+}
 
 var channelRefreshLocks = struct {
 	mu    sync.Mutex
@@ -103,6 +138,10 @@ func parseCodexConfig(provider *CodexProvider) {
 type CodexProvider struct {
 	openai.OpenAIProvider
 	Credentials *OAuth2Credentials // OAuth2 credentials (with refresh_token).
+
+	channelOptionsMu     sync.Mutex
+	channelOptions       *codexChannelOptions
+	channelOptionsLoaded bool
 }
 
 func prepareChannelForProvider(channel *model.Channel) *model.Channel {
@@ -146,7 +185,11 @@ func (p *CodexProvider) syncRuntimeChannel(channel *model.Channel) {
 	}
 
 	if preparedChannel := prepareChannelForProvider(channel); preparedChannel != nil {
+		p.channelOptionsMu.Lock()
 		p.Channel = preparedChannel
+		p.channelOptions = nil
+		p.channelOptionsLoaded = false
+		p.channelOptionsMu.Unlock()
 	}
 	p.rebuildRequester()
 }
@@ -162,10 +205,69 @@ func (p *CodexProvider) syncRuntimeKey(key string) {
 	p.rebuildRequester()
 }
 
+func (p *CodexProvider) getChannelOptions() *codexChannelOptions {
+	if p == nil {
+		return nil
+	}
+
+	p.channelOptionsMu.Lock()
+	defer p.channelOptionsMu.Unlock()
+
+	if p.Channel == nil || strings.TrimSpace(p.Channel.Other) == "" {
+		return nil
+	}
+
+	if p.channelOptionsLoaded {
+		return p.channelOptions
+	}
+
+	p.channelOptionsLoaded = true
+
+	rawOptions, err := p.Channel.GetOtherMap()
+	if err != nil {
+		logger.LogError(p.channelLogContext(), fmt.Sprintf("failed to parse Codex channel Other JSON for channel #%d(%s): %v", p.Channel.Id, p.Channel.Name, err))
+		return nil
+	}
+	if len(rawOptions) == 0 {
+		return nil
+	}
+
+	payload, err := json.Marshal(rawOptions)
+	if err != nil {
+		logger.LogError(p.channelLogContext(), fmt.Sprintf("failed to normalize Codex channel Other JSON for channel #%d(%s): %v", p.Channel.Id, p.Channel.Name, err))
+		return nil
+	}
+
+	var options codexChannelOptions
+	if err := json.Unmarshal(payload, &options); err != nil {
+		logger.LogError(p.channelLogContext(), fmt.Sprintf("failed to decode Codex channel options for channel #%d(%s): %v", p.Channel.Id, p.Channel.Name, err))
+		return nil
+	}
+
+	p.channelOptions = &options
+	return p.channelOptions
+}
+
+func (p *CodexProvider) channelLogContext() context.Context {
+	if p != nil && p.Context != nil && p.Context.Request != nil {
+		return p.Context.Request.Context()
+	}
+	return context.Background()
+}
+
+func (p *CodexProvider) getLegacyUserAgentOverride() string {
+	options := p.getChannelOptions()
+	if options == nil {
+		return ""
+	}
+	return strings.TrimSpace(options.UserAgent)
+}
+
 func getConfig() base.ProviderConfig {
 	return base.ProviderConfig{
 		BaseURL:         "https://chatgpt.com",
 		ChatCompletions: "/backend-api/codex/responses",
+		ChatRealtime:    "/backend-api/codex/responses",
 		Responses:       "/backend-api/codex/responses",
 		ModelList:       "/backend-api/models",
 	}
@@ -224,9 +326,30 @@ func RequestErrorHandle(accessToken string) requester.HttpErrorHandler {
 	}
 }
 
-// getRequestHeadersInternal builds request headers.
-func (p *CodexProvider) getRequestHeadersInternal() (map[string]string, error) {
-	headers := make(map[string]string)
+func (p *CodexProvider) applyCommonRequestHeaders(headers *codexHeaderBag) {
+	if headers == nil {
+		return
+	}
+
+	if p.Context != nil {
+		headers.Set("Content-Type", p.Context.Request.Header.Get("Content-Type"))
+		headers.Set("Accept", p.Context.Request.Header.Get("Accept"))
+	}
+
+	if p.Channel != nil {
+		customHeaders, err := p.Channel.GetModelHeadersMap()
+		if err == nil {
+			for key, value := range customHeaders {
+				headers.Set(key, value)
+			}
+		}
+	}
+
+	headers.SetIfAbsent("Content-Type", "application/json")
+}
+
+func (p *CodexProvider) getRequestHeaderBag() (*codexHeaderBag, error) {
+	headers := newCodexHeaderBag()
 
 	// Pass through selected client headers.
 	if p.Context != nil {
@@ -234,7 +357,7 @@ func (p *CodexProvider) getRequestHeadersInternal() (map[string]string, error) {
 	}
 
 	// Apply channel ModelHeaders overrides.
-	p.CommonRequestHeaders(headers)
+	p.applyCommonRequestHeaders(headers)
 
 	// Fetch token.
 	token, err := p.GetToken()
@@ -248,20 +371,29 @@ func (p *CodexProvider) getRequestHeadersInternal() (map[string]string, error) {
 	}
 
 	// Set required headers.
-	headers["Authorization"] = "Bearer " + token
-	headers["Content-Type"] = "application/json"
+	headers.Set("Authorization", "Bearer "+token)
+	headers.Set("Content-Type", "application/json")
 
 	// Set chatgpt-account-id when available.
 	if p.Credentials != nil && p.Credentials.AccountID != "" {
-		headers["chatgpt-account-id"] = p.Credentials.AccountID
+		headers.Set("chatgpt-account-id", p.Credentials.AccountID)
 	}
 
 	return headers, nil
 }
 
+// getRequestHeadersInternal builds request headers.
+func (p *CodexProvider) getRequestHeadersInternal() (map[string]string, error) {
+	headers, err := p.getRequestHeaderBag()
+	if err != nil {
+		return nil, err
+	}
+	return headers.Map(), nil
+}
+
 // filterAndPassthroughClientHeaders passes through allow-listed headers.
-func (p *CodexProvider) filterAndPassthroughClientHeaders(headers map[string]string) {
-	if p.Context == nil {
+func (p *CodexProvider) filterAndPassthroughClientHeaders(headers *codexHeaderBag) {
+	if p.Context == nil || headers == nil {
 		return
 	}
 
@@ -270,25 +402,33 @@ func (p *CodexProvider) filterAndPassthroughClientHeaders(headers map[string]str
 		"openai-beta",
 		"session_id",
 		"x-session-id", // Support x-session-id.
+		"x-codex-turn-metadata",
+		"x-client-request-id",
+		"x-codex-turn-state",
+		"x-responsesapi-include-timing-metrics",
+		"x-codex-beta-features",
+		"originator",
 	}
 
 	// Pass through allow-listed headers.
 	for _, key := range allowedKeys {
 		value := p.Context.Request.Header.Get(key)
 		if value != "" {
-			headers[key] = value
+			headers.Set(key, value)
 		}
 	}
 }
 
 // GetRequestHeaders exposes request headers.
 func (p *CodexProvider) GetRequestHeaders() map[string]string {
-	headers, _ := p.getRequestHeadersInternal()
-	if headers == nil {
-		headers = make(map[string]string)
-		p.CommonRequestHeaders(headers)
+	headers, err := p.getRequestHeaderBag()
+	if err == nil && headers != nil {
+		return headers.Map()
 	}
-	return headers
+
+	fallback := newCodexHeaderBag()
+	p.applyCommonRequestHeaders(fallback)
+	return fallback.Map()
 }
 
 func (p *CodexProvider) handleTokenError(err error) *types.OpenAIErrorWithStatusCode {
@@ -342,9 +482,10 @@ func (p *CodexProvider) GetToken() (string, error) {
 		if fallbackToken := p.getCurrentValidToken(); fallbackToken != "" {
 			if fallbackToken == fallbackTokenBeforeRefresh && !expiresWithinLead(fallbackExpiresAtBeforeRefresh, 0) {
 				if fallbackChannelBeforeRefresh != nil {
-					p.Channel = fallbackChannelBeforeRefresh
+					p.syncRuntimeChannel(fallbackChannelBeforeRefresh)
+				} else {
+					p.rebuildRequester()
 				}
-				p.rebuildRequester()
 			}
 			if p.Context != nil {
 				logger.LogWarn(ctx, fmt.Sprintf("[Codex] Token refresh failed but current access token remains valid, using fallback: %s", err.Error()))
@@ -357,9 +498,10 @@ func (p *CodexProvider) GetToken() (string, error) {
 			p.Credentials.AccessToken = fallbackTokenBeforeRefresh
 			p.Credentials.AccountID = fallbackAccountIDBeforeRefresh
 			if fallbackChannelBeforeRefresh != nil {
-				p.Channel = fallbackChannelBeforeRefresh
+				p.syncRuntimeChannel(fallbackChannelBeforeRefresh)
+			} else {
+				p.rebuildRequester()
 			}
-			p.rebuildRequester()
 			if p.Context != nil {
 				logger.LogWarn(ctx, fmt.Sprintf("[Codex] Token refresh failed after credential reload but the prior access token remains valid, using fallback: %s", err.Error()))
 			} else {

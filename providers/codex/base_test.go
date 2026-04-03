@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -17,8 +18,11 @@ import (
 	"one-api/model"
 	"one-api/providers/base"
 	"one-api/providers/openai"
+	runtimesession "one-api/runtime/session"
+	"one-api/types"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -90,6 +94,581 @@ func requesterProxyAddr(t *testing.T, provider *CodexProvider) string {
 		return proxyAddr
 	}
 	return ""
+}
+
+func newTestCodexProviderWithContext(t *testing.T, key string, other string, headers map[string]string) *CodexProvider {
+	t.Helper()
+
+	channel := &model.Channel{
+		Id:    424299,
+		Key:   key,
+		Other: other,
+	}
+	channel.SetProxy()
+
+	provider, ok := CodexProviderFactory{}.Create(channel).(*CodexProvider)
+	if !ok || provider == nil {
+		t.Fatalf("expected Codex provider instance")
+	}
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	req, err := http.NewRequest(http.MethodPost, "/", nil)
+	if err != nil {
+		t.Fatalf("failed to build request: %v", err)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	ctx.Request = req
+	provider.Context = ctx
+
+	return provider
+}
+
+func TestGetResponsesRequestAddsCLICompatibleDefaultHeaders(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, "", nil)
+
+	req, errWithCode := provider.getResponsesRequest(&types.OpenAIResponsesRequest{
+		Model:  "gpt-5",
+		Stream: true,
+	})
+	if errWithCode != nil {
+		t.Fatalf("expected request build to succeed, got %v", errWithCode)
+	}
+
+	if got := req.Header.Get("Authorization"); got != "Bearer access-token" {
+		t.Fatalf("expected authorization header, got %q", got)
+	}
+	if got := req.Header.Get("Chatgpt-Account-Id"); got != "acct-123" {
+		t.Fatalf("expected account id header, got %q", got)
+	}
+	if got := req.Header.Get("User-Agent"); got != defaultUserAgent {
+		t.Fatalf("expected default user agent %q, got %q", defaultUserAgent, got)
+	}
+	if got := req.Header.Get("Originator"); got != defaultOriginator {
+		t.Fatalf("expected default originator %q, got %q", defaultOriginator, got)
+	}
+	if got := req.Header.Get("Session_id"); got == "" {
+		t.Fatalf("expected generated session header")
+	}
+	if got := req.Header.Get("Accept"); got != "text/event-stream" {
+		t.Fatalf("expected SSE accept header, got %q", got)
+	}
+	if got := req.Header.Get("Connection"); got != "Keep-Alive" {
+		t.Fatalf("expected keep-alive connection header, got %q", got)
+	}
+}
+
+func TestGetResponsesRequestPrefersIncomingCodexHeaders(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, "", map[string]string{
+		"Version":               "2026-03-28",
+		"X-Codex-Turn-Metadata": "turn-meta",
+		"X-Client-Request-Id":   "request-123",
+		"Originator":            "custom-originator",
+		"X-Session-Id":          "session-123",
+		"User-Agent":            "incoming-codex-ua",
+	})
+
+	req, errWithCode := provider.getResponsesRequest(&types.OpenAIResponsesRequest{
+		Model: "gpt-5",
+	})
+	if errWithCode != nil {
+		t.Fatalf("expected request build to succeed, got %v", errWithCode)
+	}
+
+	if got := req.Header.Get("Version"); got != "2026-03-28" {
+		t.Fatalf("expected version header passthrough, got %q", got)
+	}
+	if got := req.Header.Get("X-Codex-Turn-Metadata"); got != "turn-meta" {
+		t.Fatalf("expected turn metadata passthrough, got %q", got)
+	}
+	if got := req.Header.Get("X-Client-Request-Id"); got != "request-123" {
+		t.Fatalf("expected client request id passthrough, got %q", got)
+	}
+	if got := req.Header.Get("Originator"); got != "custom-originator" {
+		t.Fatalf("expected originator passthrough, got %q", got)
+	}
+	if got := req.Header.Get("X-Session-Id"); got != "session-123" {
+		t.Fatalf("expected session passthrough, got %q", got)
+	}
+	if got := req.Header.Get("User-Agent"); got != defaultUserAgent {
+		t.Fatalf("expected codex default user agent %q, got %q", defaultUserAgent, got)
+	}
+}
+
+func TestGetResponsesRequestPrefersChannelUserAgentOverIncomingClientUserAgent(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, "", map[string]string{
+		"User-Agent": "Mozilla/5.0",
+	})
+	provider.Channel.ModelHeaders = stringPtr(`{"User-Agent":"custom-codex-ua"}`)
+
+	req, errWithCode := provider.getResponsesRequest(&types.OpenAIResponsesRequest{
+		Model: "gpt-5",
+	})
+	if errWithCode != nil {
+		t.Fatalf("expected request build to succeed, got %v", errWithCode)
+	}
+
+	if got := req.Header.Get("User-Agent"); got != "custom-codex-ua" {
+		t.Fatalf("expected channel user agent override, got %q", got)
+	}
+}
+
+func TestGetResponsesRequestPreservesLegacyOtherUserAgentOverride(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, `{"user_agent":"legacy-codex-ua"}`, nil)
+
+	req, errWithCode := provider.getResponsesRequest(&types.OpenAIResponsesRequest{
+		Model: "gpt-5",
+	})
+	if errWithCode != nil {
+		t.Fatalf("expected request build to succeed, got %v", errWithCode)
+	}
+
+	if got := req.Header.Get("User-Agent"); got != "legacy-codex-ua" {
+		t.Fatalf("expected legacy other.user_agent override, got %q", got)
+	}
+}
+
+func TestGetResponsesRequestUsesPromptCacheKeyForConversationAndSession(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, "", nil)
+
+	req, errWithCode := provider.getResponsesRequest(&types.OpenAIResponsesRequest{
+		Model:          "gpt-5",
+		PromptCacheKey: "prompt-cache-123",
+	})
+	if errWithCode != nil {
+		t.Fatalf("expected request build to succeed, got %v", errWithCode)
+	}
+
+	if got := req.Header.Get("Conversation_id"); got != "prompt-cache-123" {
+		t.Fatalf("expected conversation header from prompt cache key, got %q", got)
+	}
+	if got := req.Header.Get("Session_id"); got != "prompt-cache-123" {
+		t.Fatalf("expected session header from prompt cache key, got %q", got)
+	}
+}
+
+func TestGetResponsesRequestWithSessionUsesPromptCacheKeyForSessionAndPreservesExecutionSessionHeader(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, "", nil)
+
+	req, errWithCode := provider.getResponsesRequestWithSession(&types.OpenAIResponsesRequest{
+		Model:          "gpt-5",
+		PromptCacheKey: "prompt-cache-123",
+	}, "execution-session-456")
+	if errWithCode != nil {
+		t.Fatalf("expected request build to succeed, got %v", errWithCode)
+	}
+
+	if got := req.Header.Get("Conversation_id"); got != "prompt-cache-123" {
+		t.Fatalf("expected conversation header from prompt cache key, got %q", got)
+	}
+	if got := req.Header.Get("Session_id"); got != "prompt-cache-123" {
+		t.Fatalf("expected bridge session header from prompt cache key, got %q", got)
+	}
+	if got := req.Header.Get("X-Session-Id"); got != "execution-session-456" {
+		t.Fatalf("expected execution session id to be preserved in x-session-id, got %q", got)
+	}
+}
+
+func TestGetResponsesRequestWithSessionBackfillsXSessionIDForSessionIDOnlyClients(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, "", map[string]string{
+		"session_id": "execution-session-456",
+	})
+
+	req, errWithCode := provider.getResponsesRequestWithSession(&types.OpenAIResponsesRequest{
+		Model:          "gpt-5",
+		PromptCacheKey: "prompt-cache-123",
+	}, "execution-session-456")
+	if errWithCode != nil {
+		t.Fatalf("expected request build to succeed, got %v", errWithCode)
+	}
+
+	if got := req.Header.Get("Conversation_id"); got != "prompt-cache-123" {
+		t.Fatalf("expected conversation header from prompt cache key, got %q", got)
+	}
+	if got := req.Header.Get("Session_id"); got != "prompt-cache-123" {
+		t.Fatalf("expected bridge session header from prompt cache key, got %q", got)
+	}
+	if got := req.Header.Get("X-Session-Id"); got != "execution-session-456" {
+		t.Fatalf("expected session_id-only clients to preserve execution session id in x-session-id, got %q", got)
+	}
+}
+
+func TestGetResponsesRequestUsesPromptCacheKeyForSessionWhenXSessionIDPresent(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, "", map[string]string{
+		"X-Session-Id": "execution-session-456",
+	})
+
+	req, errWithCode := provider.getResponsesRequest(&types.OpenAIResponsesRequest{
+		Model:          "gpt-5",
+		PromptCacheKey: "prompt-cache-123",
+	})
+	if errWithCode != nil {
+		t.Fatalf("expected request build to succeed, got %v", errWithCode)
+	}
+
+	if got := req.Header.Get("Conversation_id"); got != "prompt-cache-123" {
+		t.Fatalf("expected conversation header from prompt cache key, got %q", got)
+	}
+	if got := req.Header.Get("Session_id"); got != "prompt-cache-123" {
+		t.Fatalf("expected session header from prompt cache key even when x-session-id is present, got %q", got)
+	}
+	if got := req.Header.Get("X-Session-Id"); got != "execution-session-456" {
+		t.Fatalf("expected execution session id to remain in x-session-id, got %q", got)
+	}
+}
+
+func TestGetResponsesRequestBackfillsXSessionIDForSessionIDOnlyClientsWhenPromptCacheKeyOverridesSession(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, "", map[string]string{
+		"session_id": "execution-session-456",
+	})
+
+	req, errWithCode := provider.getResponsesRequest(&types.OpenAIResponsesRequest{
+		Model:          "gpt-5",
+		PromptCacheKey: "prompt-cache-123",
+	})
+	if errWithCode != nil {
+		t.Fatalf("expected request build to succeed, got %v", errWithCode)
+	}
+
+	if got := req.Header.Get("Conversation_id"); got != "prompt-cache-123" {
+		t.Fatalf("expected conversation header from prompt cache key, got %q", got)
+	}
+	if got := req.Header.Get("Session_id"); got != "prompt-cache-123" {
+		t.Fatalf("expected session header from prompt cache key, got %q", got)
+	}
+	if got := req.Header.Get("X-Session-Id"); got != "execution-session-456" {
+		t.Fatalf("expected session_id-only clients to preserve execution session id in x-session-id, got %q", got)
+	}
+}
+
+func TestBuildExecutionSessionMetadataPrefersXSessionIDOverConversationSessionID(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, "", map[string]string{
+		"session_id":   "conversation-session-123",
+		"X-Session-Id": "execution-session-456",
+	})
+	provider.Context.Set("token_id", 12345)
+
+	meta, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimesession.RealtimeOpenOptions{})
+	if errWithCode != nil {
+		t.Fatalf("expected execution session metadata to build, got %v", errWithCode)
+	}
+
+	expectedBindingKey := runtimesession.BuildBindingKey("token:12345", runtimesession.BindingScopeChatRealtime, "execution-session-456")
+	if meta.BindingKey != expectedBindingKey {
+		t.Fatalf("expected binding key from x-session-id, got %q", meta.BindingKey)
+	}
+	if !meta.ClientSuppliedID {
+		t.Fatal("expected explicit x-session-id to be marked as client supplied")
+	}
+	if meta.SessionID == "" {
+		t.Fatal("expected generated upstream execution session id")
+	}
+	channelID, compatibilityHash, upstreamSessionID, ok := parseCodexExecutionSessionKey(meta.Key)
+	if !ok {
+		t.Fatalf("expected parsable execution session key, got %q", meta.Key)
+	}
+	if channelID != provider.Channel.Id {
+		t.Fatalf("expected session key channel #%d, got #%d", provider.Channel.Id, channelID)
+	}
+	if compatibilityHash != provider.buildRealtimeCompatibilityHash("gpt-5", provider.readRealtimeUpstreamIdentity()) {
+		t.Fatalf("expected compatibility hash to match current channel handshake policy, got %q", compatibilityHash)
+	}
+	if upstreamSessionID != meta.SessionID {
+		t.Fatalf("expected execution key session id %q to match metadata, got %q", meta.SessionID, upstreamSessionID)
+	}
+}
+
+func TestBuildExecutionSessionMetadataUsesResolvedUpstreamSessionIDWhenProvided(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, "", nil)
+	provider.Context.Set("token_id", 12346)
+
+	first, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimesession.RealtimeOpenOptions{
+		ResolvedUpstreamSessionID: "upstream-session-456",
+	})
+	if errWithCode != nil {
+		t.Fatalf("expected first execution session metadata to build, got %v", errWithCode)
+	}
+	second, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimesession.RealtimeOpenOptions{
+		ResolvedUpstreamSessionID: "upstream-session-456",
+	})
+	if errWithCode != nil {
+		t.Fatalf("expected second execution session metadata to build, got %v", errWithCode)
+	}
+
+	if first.SessionID != "upstream-session-456" || second.SessionID != "upstream-session-456" {
+		t.Fatalf("expected resolved upstream session id to be preserved, got %q and %q", first.SessionID, second.SessionID)
+	}
+	if first.ClientSuppliedID || second.ClientSuppliedID {
+		t.Fatal("expected resolved upstream session id not to be marked as client supplied")
+	}
+	if first.Key != second.Key {
+		t.Fatalf("expected explicit upstream execution session key to remain stable, got %q then %q", first.Key, second.Key)
+	}
+}
+
+func TestBuildExecutionSessionMetadataSeparatesCapacityNamespaceFromCallerNamespace(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, "", map[string]string{
+		"X-Session-Id": "execution-session-789",
+	})
+	provider.Context.Set("id", 77)
+	provider.Context.Set("token_id", 12347)
+
+	meta, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimesession.RealtimeOpenOptions{})
+	if errWithCode != nil {
+		t.Fatalf("expected execution session metadata to build, got %v", errWithCode)
+	}
+	if meta.CallerNS != "token:12347" {
+		t.Fatalf("expected caller namespace to remain token-scoped for binding isolation, got %q", meta.CallerNS)
+	}
+	if meta.CapacityNS != "user:77" {
+		t.Fatalf("expected capacity namespace to be user-scoped, got %q", meta.CapacityNS)
+	}
+}
+
+func TestBuildExecutionSessionMetadataNormalizesFallbackCallerNamespaceFromCanonicalAuth(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	providerA := newTestCodexProviderWithContext(t, key, "", map[string]string{
+		"Authorization": "bearer sk-shared-auth-token#7#ignore",
+	})
+	providerB := newTestCodexProviderWithContext(t, key, "", map[string]string{
+		"x-api-key": "shared-auth-token",
+	})
+
+	metaA, errWithCode := providerA.buildExecutionSessionMetadata("gpt-5", runtimesession.RealtimeOpenOptions{})
+	if errWithCode != nil {
+		t.Fatalf("expected providerA metadata to build, got %v", errWithCode)
+	}
+	metaB, errWithCode := providerB.buildExecutionSessionMetadata("gpt-5", runtimesession.RealtimeOpenOptions{})
+	if errWithCode != nil {
+		t.Fatalf("expected providerB metadata to build, got %v", errWithCode)
+	}
+
+	if metaA.CallerNS == "" || metaA.CallerNS == "anonymous" {
+		t.Fatalf("expected auth-derived caller namespace, got %q", metaA.CallerNS)
+	}
+	if metaA.CallerNS != metaB.CallerNS {
+		t.Fatalf("expected caller namespace normalization to be transport-agnostic, got %q and %q", metaA.CallerNS, metaB.CallerNS)
+	}
+}
+
+func TestBuildExecutionSessionMetadataRejectsInvalidSessionID(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, "", map[string]string{
+		"X-Session-Id": "bad/session",
+	})
+
+	_, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimesession.RealtimeOpenOptions{})
+	if errWithCode == nil {
+		t.Fatal("expected invalid execution session id to be rejected")
+	}
+	if errWithCode.Code != "invalid_session_id" {
+		t.Fatalf("expected invalid_session_id code, got %v", errWithCode.Code)
+	}
+}
+
+func TestBuildExecutionSessionMetadataRejectsOverlongSessionID(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, "", map[string]string{
+		"X-Session-Id": strings.Repeat("a", codexRealtimeSessionIDMaxLen+1),
+	})
+
+	_, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimesession.RealtimeOpenOptions{})
+	if errWithCode == nil {
+		t.Fatal("expected overlong execution session id to be rejected")
+	}
+	if errWithCode.Code != "invalid_session_id" {
+		t.Fatalf("expected invalid_session_id code, got %v", errWithCode.Code)
+	}
+}
+
+func TestPrepareCodexRequestDefaultsToOffForPromptCacheKeyGeneration(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, "", nil)
+	provider.Context.Set("token_id", 12345)
+
+	request := &types.OpenAIResponsesRequest{Model: "gpt-5"}
+	provider.prepareCodexRequest(request)
+
+	if request.PromptCacheKey != "" {
+		t.Fatalf("expected prompt cache key generation to default off, got %q", request.PromptCacheKey)
+	}
+}
+
+func TestPrepareCodexRequestGeneratesStablePromptCacheKeyFromTokenIDWhenAutoEnabled(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, `{"prompt_cache_key_strategy":"auto"}`, nil)
+	provider.Context.Set("token_id", 12345)
+
+	requestA := &types.OpenAIResponsesRequest{Model: "gpt-5"}
+	requestB := &types.OpenAIResponsesRequest{Model: "gpt-5"}
+
+	provider.prepareCodexRequest(requestA)
+	provider.prepareCodexRequest(requestB)
+
+	expected := uuid.NewSHA1(uuid.NameSpaceOID, []byte("one-hub:codex:prompt-cache:token:"+strconv.Itoa(12345))).String()
+	if requestA.PromptCacheKey != expected {
+		t.Fatalf("expected prompt cache key %q, got %q", expected, requestA.PromptCacheKey)
+	}
+	if requestB.PromptCacheKey != expected {
+		t.Fatalf("expected stable prompt cache key %q on repeat call, got %q", expected, requestB.PromptCacheKey)
+	}
+}
+
+func TestPrepareCodexRequestGeneratesStablePromptCacheKeyFromSessionIDWhenStrategyEnabled(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, `{"prompt_cache_key_strategy":"session_id"}`, map[string]string{
+		"X-Session-Id": "client-session-123",
+	})
+	provider.Context.Set("token_id", 12345)
+	provider.Context.Set("id", 678)
+
+	request := &types.OpenAIResponsesRequest{Model: "gpt-5"}
+	provider.prepareCodexRequest(request)
+
+	expected := uuid.NewSHA1(uuid.NameSpaceOID, []byte("one-hub:codex:prompt-cache:session:client-session-123")).String()
+	if request.PromptCacheKey != expected {
+		t.Fatalf("expected session-scoped prompt cache key %q, got %q", expected, request.PromptCacheKey)
+	}
+}
+
+func TestPrepareCodexRequestPreservesExplicitPromptCacheKey(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, "", nil)
+	provider.Context.Set("token_id", 12345)
+
+	request := &types.OpenAIResponsesRequest{
+		Model:          "gpt-5",
+		PromptCacheKey: "user-provided-cache-key",
+	}
+
+	provider.prepareCodexRequest(request)
+
+	if request.PromptCacheKey != "user-provided-cache-key" {
+		t.Fatalf("expected explicit prompt cache key to survive, got %q", request.PromptCacheKey)
+	}
+}
+
+func TestPrepareCodexRequestCanDisableStablePromptCacheKeyGeneration(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, `{"prompt_cache_key_strategy":"off"}`, nil)
+	provider.Context.Set("token_id", 12345)
+
+	request := &types.OpenAIResponsesRequest{Model: "gpt-5"}
+	provider.prepareCodexRequest(request)
+
+	if request.PromptCacheKey != "" {
+		t.Fatalf("expected prompt cache key generation to be disabled, got %q", request.PromptCacheKey)
+	}
+}
+
+func TestPrepareCodexRequestCanForceUserScopedPromptCacheKey(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, `{"prompt_cache_key_strategy":"user_id"}`, nil)
+	provider.Context.Set("token_id", 12345)
+	provider.Context.Set("id", 678)
+
+	request := &types.OpenAIResponsesRequest{Model: "gpt-5"}
+	provider.prepareCodexRequest(request)
+
+	expected := uuid.NewSHA1(uuid.NameSpaceOID, []byte("one-hub:codex:prompt-cache:user:678")).String()
+	if request.PromptCacheKey != expected {
+		t.Fatalf("expected user-scoped prompt cache key %q, got %q", expected, request.PromptCacheKey)
+	}
+}
+
+func TestPrepareCodexRequestCanForceAuthHeaderPromptCacheKey(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, `{"prompt_cache_key_strategy":"auth_header"}`, map[string]string{
+		"Authorization": "Bearer sk-test-auth-header",
+	})
+	provider.Context.Set("token_id", 12345)
+
+	request := &types.OpenAIResponsesRequest{Model: "gpt-5"}
+	provider.prepareCodexRequest(request)
+
+	expected := uuid.NewSHA1(uuid.NameSpaceOID, []byte("one-hub:codex:prompt-cache:auth:test-auth-header")).String()
+	if request.PromptCacheKey != expected {
+		t.Fatalf("expected auth-scoped prompt cache key %q, got %q", expected, request.PromptCacheKey)
+	}
+}
+
+func TestPrepareCodexRequestAuthHeaderStrategyNormalizesWebsocketCredentialSelectors(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, `{"prompt_cache_key_strategy":"auth_header"}`, map[string]string{
+		"Connection":             "Upgrade",
+		"Upgrade":                "websocket",
+		"Sec-WebSocket-Protocol": "realtime, openai-insecure-api-key.sk-test-auth-header#42#ignore",
+	})
+
+	request := &types.OpenAIResponsesRequest{Model: "gpt-5"}
+	provider.prepareCodexRequest(request)
+
+	expected := uuid.NewSHA1(uuid.NameSpaceOID, []byte("one-hub:codex:prompt-cache:auth:test-auth-header")).String()
+	if request.PromptCacheKey != expected {
+		t.Fatalf("expected websocket auth to normalize to %q, got %q", expected, request.PromptCacheKey)
+	}
+}
+
+func TestGetResponsesRequestGeneratesStablePromptCacheHeadersFromTokenID(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, `{"prompt_cache_key_strategy":"auto"}`, nil)
+	provider.Context.Set("token_id", 99)
+
+	req, errWithCode := provider.getResponsesRequest(&types.OpenAIResponsesRequest{
+		Model: "gpt-5",
+	})
+	if errWithCode != nil {
+		t.Fatalf("expected request build to succeed, got %v", errWithCode)
+	}
+
+	expected := uuid.NewSHA1(uuid.NameSpaceOID, []byte("one-hub:codex:prompt-cache:token:99")).String()
+	if got := req.Header.Get("Conversation_id"); got != expected {
+		t.Fatalf("expected generated conversation header %q, got %q", expected, got)
+	}
+	if got := req.Header.Get("Session_id"); got != expected {
+		t.Fatalf("expected generated session header %q, got %q", expected, got)
+	}
+}
+
+func TestGetResponsesRequestAutoPromptCachePreservesSessionIDOnlyExecutionSession(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, `{"prompt_cache_key_strategy":"auto"}`, map[string]string{
+		"session_id": "execution-session-456",
+	})
+	provider.Context.Set("token_id", 99)
+
+	req, errWithCode := provider.getResponsesRequest(&types.OpenAIResponsesRequest{
+		Model: "gpt-5",
+	})
+	if errWithCode != nil {
+		t.Fatalf("expected request build to succeed, got %v", errWithCode)
+	}
+
+	expected := uuid.NewSHA1(uuid.NameSpaceOID, []byte("one-hub:codex:prompt-cache:session:execution-session-456")).String()
+	if got := req.Header.Get("Conversation_id"); got != expected {
+		t.Fatalf("expected generated conversation header %q, got %q", expected, got)
+	}
+	if got := req.Header.Get("Session_id"); got != expected {
+		t.Fatalf("expected generated session header %q, got %q", expected, got)
+	}
+	if got := req.Header.Get("X-Session-Id"); got != "execution-session-456" {
+		t.Fatalf("expected session_id-only execution session to be preserved in x-session-id, got %q", got)
+	}
 }
 
 func TestGetTokenFallsBackToStillValidAccessTokenWhenRefreshFails(t *testing.T) {
@@ -483,6 +1062,163 @@ func TestSaveCredentialsToDatabaseReloadsRuntimeChannelState(t *testing.T) {
 	}
 	if proxyAddr := requesterProxyAddr(t, provider); proxyAddr != *expectedChannel.Proxy {
 		t.Fatalf("expected requester proxy %q, got %q", *expectedChannel.Proxy, proxyAddr)
+	}
+}
+
+func TestLoadLatestCredentialsFromDatabaseReloadsChannelOptions(t *testing.T) {
+	logger.SetupLogger()
+
+	initialCreds := &OAuth2Credentials{
+		AccessToken:  "initial-access-token",
+		RefreshToken: "initial-refresh-token",
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}
+	initialKey, err := initialCreds.ToJSON()
+	if err != nil {
+		t.Fatalf("failed to serialize initial credentials: %v", err)
+	}
+
+	sharedChannel := &model.Channel{
+		Id:    424253,
+		Key:   initialKey,
+		Other: `{"websocket_mode":"off","prompt_cache_key_strategy":"off","execution_session_ttl_seconds":60,"user_agent":"legacy-codex-ua-old"}`,
+	}
+
+	provider, ok := CodexProviderFactory{}.Create(sharedChannel).(*CodexProvider)
+	if !ok || provider == nil {
+		t.Fatalf("expected Codex provider instance")
+	}
+
+	if got := provider.getWebsocketMode(); got != codexWebsocketModeOff {
+		t.Fatalf("expected initial websocket mode off, got %q", got)
+	}
+	if got := provider.getExecutionSessionTTL(); got != time.Minute {
+		t.Fatalf("expected initial execution session TTL %s, got %s", time.Minute, got)
+	}
+	if got := provider.getPromptCacheKeyStrategy(); got != codexPromptCacheStrategyOff {
+		t.Fatalf("expected initial prompt cache strategy off, got %q", got)
+	}
+	if got := provider.getLegacyUserAgentOverride(); got != "legacy-codex-ua-old" {
+		t.Fatalf("expected initial legacy user agent override, got %q", got)
+	}
+
+	latestCreds := &OAuth2Credentials{
+		AccessToken:  "latest-access-token",
+		RefreshToken: "latest-refresh-token",
+		ExpiresAt:    time.Now().Add(2 * time.Hour),
+	}
+	latestKey, err := latestCreds.ToJSON()
+	if err != nil {
+		t.Fatalf("failed to serialize latest credentials: %v", err)
+	}
+
+	originalLoadLatestChannelByID := loadLatestChannelByID
+	loadLatestChannelByID = func(channelID int) (*model.Channel, error) {
+		if channelID != sharedChannel.Id {
+			t.Fatalf("unexpected channel id lookup: got %d want %d", channelID, sharedChannel.Id)
+		}
+		return &model.Channel{
+			Id:    channelID,
+			Key:   latestKey,
+			Other: `{"websocket_mode":"force","prompt_cache_key_strategy":"auth_header","execution_session_ttl_seconds":180,"user_agent":"legacy-codex-ua-new"}`,
+		}, nil
+	}
+	t.Cleanup(func() {
+		loadLatestChannelByID = originalLoadLatestChannelByID
+	})
+
+	if err := provider.loadLatestCredentialsFromDatabase(); err != nil {
+		t.Fatalf("expected runtime channel reload to succeed, got %v", err)
+	}
+
+	if got := provider.getWebsocketMode(); got != codexWebsocketModeForce {
+		t.Fatalf("expected reloaded websocket mode force, got %q", got)
+	}
+	if got := provider.getExecutionSessionTTL(); got != 3*time.Minute {
+		t.Fatalf("expected reloaded execution session TTL %s, got %s", 3*time.Minute, got)
+	}
+	if got := provider.getPromptCacheKeyStrategy(); got != codexPromptCacheStrategyAuthHeader {
+		t.Fatalf("expected reloaded prompt cache strategy auth_header, got %q", got)
+	}
+	if got := provider.getLegacyUserAgentOverride(); got != "legacy-codex-ua-new" {
+		t.Fatalf("expected reloaded legacy user agent override, got %q", got)
+	}
+}
+
+func TestLoadLatestCredentialsFromDatabaseReloadsChannelOptionsAfterInvalidOther(t *testing.T) {
+	logger.SetupLogger()
+
+	initialCreds := &OAuth2Credentials{
+		AccessToken:  "initial-access-token",
+		RefreshToken: "initial-refresh-token",
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}
+	initialKey, err := initialCreds.ToJSON()
+	if err != nil {
+		t.Fatalf("failed to serialize initial credentials: %v", err)
+	}
+
+	sharedChannel := &model.Channel{
+		Id:    424254,
+		Key:   initialKey,
+		Other: `{"websocket_mode":`,
+	}
+
+	provider, ok := CodexProviderFactory{}.Create(sharedChannel).(*CodexProvider)
+	if !ok || provider == nil {
+		t.Fatalf("expected Codex provider instance")
+	}
+
+	if got := provider.getWebsocketMode(); got != codexWebsocketModeAuto {
+		t.Fatalf("expected invalid initial options to fall back to auto websocket mode, got %q", got)
+	}
+	if !provider.channelOptionsLoaded {
+		t.Fatalf("expected invalid initial options to mark cache as loaded")
+	}
+	if provider.channelOptions != nil {
+		t.Fatalf("expected invalid initial options to leave cached options nil")
+	}
+
+	latestCreds := &OAuth2Credentials{
+		AccessToken:  "latest-access-token",
+		RefreshToken: "latest-refresh-token",
+		ExpiresAt:    time.Now().Add(2 * time.Hour),
+	}
+	latestKey, err := latestCreds.ToJSON()
+	if err != nil {
+		t.Fatalf("failed to serialize latest credentials: %v", err)
+	}
+
+	originalLoadLatestChannelByID := loadLatestChannelByID
+	loadLatestChannelByID = func(channelID int) (*model.Channel, error) {
+		if channelID != sharedChannel.Id {
+			t.Fatalf("unexpected channel id lookup: got %d want %d", channelID, sharedChannel.Id)
+		}
+		return &model.Channel{
+			Id:    channelID,
+			Key:   latestKey,
+			Other: `{"websocket_mode":"force","prompt_cache_key_strategy":"user_id","execution_session_ttl_seconds":240,"user_agent":"legacy-codex-ua-recovered"}`,
+		}, nil
+	}
+	t.Cleanup(func() {
+		loadLatestChannelByID = originalLoadLatestChannelByID
+	})
+
+	if err := provider.loadLatestCredentialsFromDatabase(); err != nil {
+		t.Fatalf("expected runtime channel reload to succeed, got %v", err)
+	}
+
+	if got := provider.getWebsocketMode(); got != codexWebsocketModeForce {
+		t.Fatalf("expected reloaded websocket mode force, got %q", got)
+	}
+	if got := provider.getExecutionSessionTTL(); got != 4*time.Minute {
+		t.Fatalf("expected reloaded execution session TTL %s, got %s", 4*time.Minute, got)
+	}
+	if got := provider.getPromptCacheKeyStrategy(); got != codexPromptCacheStrategyUserID {
+		t.Fatalf("expected reloaded prompt cache strategy user_id, got %q", got)
+	}
+	if got := provider.getLegacyUserAgentOverride(); got != "legacy-codex-ua-recovered" {
+		t.Fatalf("expected reloaded legacy user agent override, got %q", got)
 	}
 }
 

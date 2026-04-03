@@ -1,10 +1,13 @@
 package codex
 
 import (
-	"encoding/json"
+	"net/url"
+	"strings"
 
 	"one-api/common/requester"
 	"one-api/types"
+
+	"github.com/google/uuid"
 )
 
 // CreateChatCompletion builds a non-streamed response via streaming.
@@ -39,54 +42,82 @@ func (p *CodexProvider) CreateChatCompletionStream(request *types.ChatCompletion
 
 // chatToResponsesRequest converts ChatCompletionRequest to OpenAIResponsesRequest.
 func (p *CodexProvider) chatToResponsesRequest(request *types.ChatCompletionRequest) *types.OpenAIResponsesRequest {
-	// Use standard conversion.
-	responsesRequest := request.ToResponsesRequest()
-
-	// Normalize gpt-5-* model names.
-	if len(responsesRequest.Model) > 6 && responsesRequest.Model[:6] == "gpt-5-" && responsesRequest.Model != "gpt-5-codex" {
-		responsesRequest.Model = "gpt-5"
-	}
-
-	// Codex requires store=false.
-	storeFalse := false
-	responsesRequest.Store = &storeFalse
-
-	// Prefer temperature over top_p when both set.
-	if responsesRequest.Temperature != nil && responsesRequest.TopP != nil {
-		responsesRequest.TopP = nil
-	}
-
-	// Adapt to Codex CLI format.
-	p.adaptCodexCLI(responsesRequest)
-
-	return responsesRequest
+	return request.ToResponsesRequest()
 }
 
 // applyDefaultHeaders adds Codex defaults without overriding existing values.
-func (p *CodexProvider) applyDefaultHeaders(headers map[string]string) {
+func (p *CodexProvider) applyDefaultHeaders(headers *codexHeaderBag) {
+	if headers == nil {
+		return
+	}
+
 	// Set Host if missing.
-	if _, exists := headers["Host"]; !exists {
-		headers["Host"] = "chatgpt.com"
+	if !headers.Has("Host") {
+		if host := p.defaultCodexHostHeader(); host != "" {
+			headers.Set("Host", host)
+		}
 	}
 
 	// Set User-Agent if missing.
-	if _, exists := headers["User-Agent"]; !exists {
-		// Try custom UA from channel.Other.
-		if p.Channel.Other != "" {
-			var config map[string]string
-			if err := json.Unmarshal([]byte(p.Channel.Other), &config); err == nil {
-				if userAgent, exists := config["user_agent"]; exists && userAgent != "" {
-					headers["User-Agent"] = userAgent
-					return
-				}
-			}
+	if !headers.Has("User-Agent") {
+		if userAgent := p.getLegacyUserAgentOverride(); userAgent != "" {
+			headers.Set("User-Agent", userAgent)
+		} else {
+			headers.Set("User-Agent", defaultUserAgent)
 		}
-		// Default UA.
-		headers["User-Agent"] = "codex_cli_rs/0.38.0 (Ubuntu 22.4.0; x86_64) WindowsTerminal"
+	}
+
+	// Match Codex CLI behavior when the caller does not pin a session.
+	if !headers.Has("session_id") && !headers.Has("x-session-id") {
+		headers.Set("session_id", uuid.NewString())
+	}
+
+	// Set Originator when missing to mimic Codex CLI requests.
+	if !headers.Has("Originator") {
+		headers.Set("Originator", defaultOriginator)
+	}
+
+	// Keep the connection alive for SSE/non-SSE Codex responses.
+	if !headers.Has("Connection") {
+		headers.Set("Connection", "Keep-Alive")
 	}
 
 	// Set Accept if missing.
-	if _, exists := headers["Accept"]; !exists {
-		headers["Accept"] = "application/json"
+	if !headers.Has("Accept") {
+		headers.Set("Accept", "application/json")
+	}
+}
+
+func (p *CodexProvider) defaultCodexHostHeader() string {
+	baseURL := strings.TrimSpace(p.GetBaseURL())
+	if baseURL == "" {
+		return ""
+	}
+
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return ""
+	}
+
+	return strings.TrimSpace(parsed.Host)
+}
+
+func hasHeader(headers map[string]string, key string) bool {
+	return newCodexHeaderBagFromMap(headers).Has(key)
+}
+
+func getHeaderValue(headers map[string]string, key string) string {
+	return newCodexHeaderBagFromMap(headers).Get(key)
+}
+
+func replaceHeader(headers map[string]string, key, value string) {
+	if headers == nil {
+		return
+	}
+	bag := newCodexHeaderBagFromMap(headers)
+	bag.Set(key, value)
+	clear(headers)
+	for headerKey, headerValue := range bag.Map() {
+		headers[headerKey] = headerValue
 	}
 }
