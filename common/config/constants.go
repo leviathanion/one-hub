@@ -25,6 +25,7 @@ var ChatLinks = ""
 var AnalyticsCode = ""
 var QuotaPerUnit = 500 * 1000.0 // $0.002 / 1K tokens
 var DisplayInCurrencyEnabled = true
+var OpenAIRealtimeSessionCompatMode = false
 
 // 是否开启用户月账单功能
 var UserInvoiceMonth = false
@@ -189,6 +190,8 @@ var RetryTimeOut = 10
 
 var DefaultChannelWeight = uint(1)
 var RetryCooldownSeconds = 5
+var PreferredChannelWaitMilliseconds = 0
+var PreferredChannelWaitPollMilliseconds = 50
 
 var CFWorkerImageUrl = ""
 var CFWorkerImageKey = ""

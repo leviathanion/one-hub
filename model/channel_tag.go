@@ -75,6 +75,10 @@ func UpdateChannelsTag(tag string, channel *Channel) error {
 	if err != nil {
 		return err
 	}
+	channel.Type = channelTag.Type
+	if err := channel.ValidateRuntimeConfigJSONWithType(channelTag.Type); err != nil {
+		return err
+	}
 
 	if channel.Key == "" {
 		return errors.New("key不能为空")

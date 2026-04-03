@@ -51,16 +51,19 @@ type Channel struct {
 	Plugin    *datatypes.JSONType[PluginType] `json:"plugin" form:"plugin" gorm:"type:json"`
 	DeletedAt gorm.DeletedAt                  `json:"-" gorm:"index"`
 
-	parsedModelMapping    map[string]string      `json:"-" gorm:"-"`
-	parsedModelHeaders    map[string]string      `json:"-" gorm:"-"`
-	parsedCustomParameter map[string]interface{} `json:"-" gorm:"-"`
-	modelMappingErr       error                  `json:"-" gorm:"-"`
-	modelHeadersErr       error                  `json:"-" gorm:"-"`
-	customParameterErr    error                  `json:"-" gorm:"-"`
-	runtimeConfigParsed   bool                   `json:"-" gorm:"-"`
-	lastModelMapping      string                 `json:"-" gorm:"-"`
-	lastModelHeaders      string                 `json:"-" gorm:"-"`
-	lastCustomParameter   string                 `json:"-" gorm:"-"`
+	parsedModelMapping    map[string]string          `json:"-" gorm:"-"`
+	parsedModelHeaders    map[string]string          `json:"-" gorm:"-"`
+	parsedCustomParameter map[string]interface{}     `json:"-" gorm:"-"`
+	parsedOther           map[string]json.RawMessage `json:"-" gorm:"-"`
+	modelMappingErr       error                      `json:"-" gorm:"-"`
+	modelHeadersErr       error                      `json:"-" gorm:"-"`
+	customParameterErr    error                      `json:"-" gorm:"-"`
+	otherErr              error                      `json:"-" gorm:"-"`
+	runtimeConfigParsed   bool                       `json:"-" gorm:"-"`
+	lastModelMapping      string                     `json:"-" gorm:"-"`
+	lastModelHeaders      string                     `json:"-" gorm:"-"`
+	lastCustomParameter   string                     `json:"-" gorm:"-"`
+	lastOther             string                     `json:"-" gorm:"-"`
 }
 
 func (c *Channel) AllowStream(modelName string) bool {
@@ -195,6 +198,11 @@ func BatchDeleteChannel(ids []int) (int64, error) {
 }
 
 func BatchInsertChannels(channels []Channel) error {
+	for i := range channels {
+		if err := channels[i].ValidateRuntimeConfigJSON(); err != nil {
+			return err
+		}
+	}
 	err := DB.Omit("UsedQuota").Create(&channels).Error
 	if err != nil {
 		return err
@@ -308,6 +316,14 @@ func (channel *Channel) GetCustomParameterMap() (map[string]interface{}, error) 
 	return channel.parsedCustomParameter, nil
 }
 
+func (channel *Channel) GetOtherMap() (map[string]json.RawMessage, error) {
+	channel.ensureRuntimeConfigParsed()
+	if channel.otherErr != nil {
+		return nil, channel.otherErr
+	}
+	return channel.parsedOther, nil
+}
+
 func (channel *Channel) GetModelHeadersMap() (map[string]string, error) {
 	channel.ensureRuntimeConfigParsed()
 	if channel.modelHeadersErr != nil {
@@ -329,11 +345,13 @@ func (channel *Channel) ensureRuntimeConfigParsed() {
 
 	modelMapping := channel.GetModelMapping()
 	customParameter := channel.GetCustomParameter()
+	other := strings.TrimSpace(channel.Other)
 
 	if channel.runtimeConfigParsed &&
 		channel.lastModelMapping == modelMapping &&
 		channel.lastModelHeaders == modelHeaders &&
-		channel.lastCustomParameter == customParameter {
+		channel.lastCustomParameter == customParameter &&
+		channel.lastOther == other {
 		return
 	}
 
@@ -347,17 +365,21 @@ func (channel *Channel) ParseRuntimeConfig() {
 		modelHeaders = *channel.ModelHeaders
 	}
 	customParameter := channel.GetCustomParameter()
+	other := strings.TrimSpace(channel.Other)
 
 	channel.parsedModelMapping = nil
 	channel.parsedModelHeaders = nil
 	channel.parsedCustomParameter = nil
+	channel.parsedOther = nil
 	channel.modelMappingErr = nil
 	channel.modelHeadersErr = nil
 	channel.customParameterErr = nil
+	channel.otherErr = nil
 	channel.runtimeConfigParsed = true
 	channel.lastModelMapping = modelMapping
 	channel.lastModelHeaders = modelHeaders
 	channel.lastCustomParameter = customParameter
+	channel.lastOther = other
 
 	if modelMapping != "" && modelMapping != "{}" {
 		modelMap := make(map[string]string)
@@ -385,9 +407,21 @@ func (channel *Channel) ParseRuntimeConfig() {
 			channel.parsedCustomParameter = customParams
 		}
 	}
+
+	if other != "" && other != "{}" {
+		otherMap := make(map[string]json.RawMessage)
+		if err := json.Unmarshal([]byte(other), &otherMap); err != nil {
+			channel.otherErr = err
+		} else {
+			channel.parsedOther = otherMap
+		}
+	}
 }
 
 func (channel *Channel) Insert() error {
+	if err := channel.ValidateRuntimeConfigJSON(); err != nil {
+		return err
+	}
 	err := DB.Omit("UsedQuota").Create(channel).Error
 	if err == nil {
 		ChannelGroup.Load()
@@ -409,6 +443,12 @@ func (channel *Channel) Update(overwrite bool) error {
 
 func (channel *Channel) UpdateRaw(overwrite bool) error {
 	var err error
+	if err = channel.hydratePersistedTypeForUpdate(); err != nil {
+		return err
+	}
+	if err = channel.ValidateRuntimeConfigJSON(); err != nil {
+		return err
+	}
 
 	if overwrite {
 		err = DB.Model(channel).Select("*").Omit("UsedQuota").Updates(channel).Error
@@ -420,6 +460,20 @@ func (channel *Channel) UpdateRaw(overwrite bool) error {
 	}
 	DB.Model(channel).First(channel, "id = ?", channel.Id)
 	return err
+}
+
+func (channel *Channel) hydratePersistedTypeForUpdate() error {
+	if channel == nil || channel.Id <= 0 || channel.Type != config.ChannelTypeUnknown {
+		return nil
+	}
+
+	persisted, err := GetChannelById(channel.Id)
+	if err != nil {
+		return err
+	}
+
+	channel.Type = persisted.Type
+	return nil
 }
 
 func (channel *Channel) UpdateResponseTime(responseTime int64) {

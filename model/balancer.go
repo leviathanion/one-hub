@@ -31,6 +31,15 @@ type ChannelsChooser struct {
 
 type ChannelsFilterFunc func(channelId int, choice *ChannelChoice) bool
 
+func FilterFunc(fn func(channelId int, choice *ChannelChoice) bool) ChannelsFilterFunc {
+	return func(channelId int, choice *ChannelChoice) bool {
+		if fn == nil {
+			return false
+		}
+		return fn(channelId, choice)
+	}
+}
+
 func FilterChannelId(skipChannelIds []int) ChannelsFilterFunc {
 	return func(channelId int, _ *ChannelChoice) bool {
 		return utils.Contains(channelId, skipChannelIds)
@@ -181,9 +190,29 @@ func (cc *ChannelsChooser) balancer(channelIds []int, filters []ChannelsFilterFu
 	return nil
 }
 
-func (cc *ChannelsChooser) Next(group, modelName string, filters ...ChannelsFilterFunc) (*Channel, error) {
-	cc.RLock()
-	defer cc.RUnlock()
+func (cc *ChannelsChooser) preferredChannel(channelIds []int, preferredChannelID int, ignoreCooldown bool, filters []ChannelsFilterFunc, modelName string) *Channel {
+	if preferredChannelID <= 0 || !utils.Contains(preferredChannelID, channelIds) {
+		return nil
+	}
+
+	choice, ok := cc.Channels[preferredChannelID]
+	if !ok || choice.Disable {
+		return nil
+	}
+	if !ignoreCooldown && cc.IsInCooldown(preferredChannelID, modelName) {
+		return nil
+	}
+
+	for _, filter := range filters {
+		if filter(preferredChannelID, choice) {
+			return nil
+		}
+	}
+
+	return choice.Channel
+}
+
+func (cc *ChannelsChooser) channelsPriority(group, modelName string) ([][]int, error) {
 	if _, ok := cc.Rule[group]; !ok {
 		return nil, errors.New("group not found")
 	}
@@ -201,6 +230,24 @@ func (cc *ChannelsChooser) Next(group, modelName string, filters ...ChannelsFilt
 		return nil, errors.New("channel not found")
 	}
 
+	return channelsPriority, nil
+}
+
+func (cc *ChannelsChooser) NextWithPreferred(group, modelName string, preferredChannelID int, ignorePreferredCooldown bool, filters ...ChannelsFilterFunc) (*Channel, error) {
+	cc.RLock()
+	defer cc.RUnlock()
+
+	channelsPriority, err := cc.channelsPriority(group, modelName)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, priority := range channelsPriority {
+		if channel := cc.preferredChannel(priority, preferredChannelID, ignorePreferredCooldown, filters, modelName); channel != nil {
+			return channel, nil
+		}
+	}
+
 	for _, priority := range channelsPriority {
 		channel := cc.balancer(priority, filters, modelName)
 		if channel != nil {
@@ -209,6 +256,45 @@ func (cc *ChannelsChooser) Next(group, modelName string, filters ...ChannelsFilt
 	}
 
 	return nil, errors.New("channel not found")
+}
+
+func (cc *ChannelsChooser) PreferredChannelEligible(group, modelName string, preferredChannelID int, filters ...ChannelsFilterFunc) (bool, error) {
+	if preferredChannelID <= 0 {
+		return false, nil
+	}
+
+	cc.RLock()
+	defer cc.RUnlock()
+
+	channelsPriority, err := cc.channelsPriority(group, modelName)
+	if err != nil {
+		return false, err
+	}
+
+	for _, priority := range channelsPriority {
+		if !utils.Contains(preferredChannelID, priority) {
+			continue
+		}
+
+		choice, ok := cc.Channels[preferredChannelID]
+		if !ok || choice == nil || choice.Channel == nil || choice.Disable {
+			return false, nil
+		}
+
+		for _, filter := range filters {
+			if filter(preferredChannelID, choice) {
+				return false, nil
+			}
+		}
+
+		return true, nil
+	}
+
+	return false, nil
+}
+
+func (cc *ChannelsChooser) Next(group, modelName string, filters ...ChannelsFilterFunc) (*Channel, error) {
+	return cc.NextWithPreferred(group, modelName, 0, false, filters...)
 }
 
 func (cc *ChannelsChooser) GetGroupModels(group string) ([]string, error) {

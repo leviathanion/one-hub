@@ -17,6 +17,7 @@ func InitConf() {
 	RequestInterval = time.Duration(viper.GetInt("polling_interval")) * time.Second
 	SessionSecret = utils.GetOrDefault("session_secret", SessionSecret)
 	UserInvoiceMonth = viper.GetBool("user_invoice_month")
+	OpenAIRealtimeSessionCompatMode = viper.GetBool("openai.realtime_session_compat")
 	GitHubProxy = viper.GetString("github_proxy")
 	MCP_ENABLE = viper.GetBool("mcp.enable") != false
 	UPTIMEKUMA_ENABLE = viper.GetBool("uptime_kuma.enable") != false
@@ -47,6 +48,7 @@ func defaultConfig() {
 	viper.SetDefault("language", "zh_CN")
 	viper.SetDefault("favicon", "")
 	viper.SetDefault("user_invoice_month", false)
+	viper.SetDefault("openai.realtime_session_compat", false)
 	viper.SetDefault("mcp.enable", false)
 	viper.SetDefault("uptime_kuma.enable", false)
 	viper.SetDefault("uptime_kuma.domain", "")

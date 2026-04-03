@@ -89,6 +89,8 @@ func InitOptionMap() {
 	config.GlobalOption.RegisterFloat("QuotaPerUnit", &config.QuotaPerUnit)
 	config.GlobalOption.RegisterInt("RetryTimes", &config.RetryTimes)
 	config.GlobalOption.RegisterInt("RetryCooldownSeconds", &config.RetryCooldownSeconds)
+	config.GlobalOption.RegisterInt("PreferredChannelWaitMilliseconds", &config.PreferredChannelWaitMilliseconds)
+	config.GlobalOption.RegisterInt("PreferredChannelWaitPollMilliseconds", &config.PreferredChannelWaitPollMilliseconds)
 
 	config.GlobalOption.RegisterBool("MjNotifyEnabled", &config.MjNotifyEnabled)
 	config.GlobalOption.RegisterString("ChatImageRequestProxy", &config.ChatImageRequestProxy)

@@ -154,3 +154,102 @@ func TestChannelsChooserRefreshChannelUpdatesTrackedKeyAndProxy(t *testing.T) {
 		t.Fatalf("expected model group state to remain unchanged")
 	}
 }
+
+func TestChannelValidateRuntimeConfigJSONRejectsInvalidCodexOther(t *testing.T) {
+	channel := &Channel{
+		Type:  config.ChannelTypeCodex,
+		Other: `{"prompt_cache_key_strategy":`,
+	}
+	if err := channel.ValidateRuntimeConfigJSON(); err == nil {
+		t.Fatal("expected invalid Codex other JSON to be rejected")
+	}
+}
+
+func TestChannelValidateRuntimeConfigJSONAllowsPlainOtherForNonCodexChannels(t *testing.T) {
+	channel := &Channel{
+		Type:  3,
+		Other: "2024-05-01-preview",
+	}
+	if err := channel.ValidateRuntimeConfigJSON(); err != nil {
+		t.Fatalf("expected non-Codex plain other field to remain valid, got %v", err)
+	}
+}
+
+func TestChannelInsertAndHydrateValidationBranches(t *testing.T) {
+	useTestChannelDB(t)
+
+	if err := BatchInsertChannels([]Channel{
+		{
+			Type:   config.ChannelTypeCodex,
+			Name:   "bad-batch",
+			Key:    "sk-batch",
+			Group:  "default",
+			Models: "gpt-5",
+			Other:  `{"prompt_cache_key_strategy":`,
+		},
+	}); err == nil {
+		t.Fatal("expected batch inserts to reject invalid Codex runtime config")
+	}
+
+	if err := (&Channel{
+		Type:   config.ChannelTypeCodex,
+		Name:   "bad-insert",
+		Key:    "sk-insert",
+		Group:  "default",
+		Models: "gpt-5",
+		Other:  `{"prompt_cache_key_strategy":`,
+	}).Insert(); err == nil {
+		t.Fatal("expected insert to reject invalid Codex runtime config")
+	}
+
+	if err := (&Channel{}).hydratePersistedTypeForUpdate(); err != nil {
+		t.Fatalf("expected hydratePersistedTypeForUpdate to ignore zero-value channels, got %v", err)
+	}
+
+	if err := (&Channel{
+		Id:     9999,
+		Name:   "missing",
+		Key:    "sk-missing",
+		Group:  "default",
+		Models: "gpt-5",
+	}).UpdateRaw(false); err == nil {
+		t.Fatal("expected updates for missing channels to fail while hydrating the persisted type")
+	}
+}
+
+func TestChannelGetOtherMapParsesAndReparsesOtherJSON(t *testing.T) {
+	channel := &Channel{
+		Other: `{"prompt_cache_key_strategy":"token_id"}`,
+	}
+
+	other, err := channel.GetOtherMap()
+	if err != nil {
+		t.Fatalf("expected valid other json to parse, got %v", err)
+	}
+	if got := string(other["prompt_cache_key_strategy"]); got != `"token_id"` {
+		t.Fatalf("expected parsed prompt cache strategy, got %s", got)
+	}
+
+	channel.Other = `{"websocket_mode":"force"}`
+	other, err = channel.GetOtherMap()
+	if err != nil {
+		t.Fatalf("expected runtime config reparse after other change, got %v", err)
+	}
+	if got := string(other["websocket_mode"]); got != `"force"` {
+		t.Fatalf("expected reparsed websocket mode, got %s", got)
+	}
+}
+
+func TestChannelGetOtherMapReturnsParseErrors(t *testing.T) {
+	channel := &Channel{
+		Other: `{"prompt_cache_key_strategy":`,
+	}
+
+	other, err := channel.GetOtherMap()
+	if err == nil {
+		t.Fatal("expected invalid other json to return a parse error")
+	}
+	if other != nil {
+		t.Fatalf("expected invalid other json not to return parsed data, got %+v", other)
+	}
+}
