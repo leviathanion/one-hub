@@ -4,10 +4,10 @@ import (
 	"net/http"
 	"one-api/common/requester"
 	"one-api/model"
+	runtimesession "one-api/runtime/session"
 	"one-api/types"
 
 	"github.com/gin-gonic/gin"
-	"github.com/gorilla/websocket"
 )
 
 type Requestable interface {
@@ -128,9 +128,14 @@ type RerankInterface interface {
 	CreateRerank(request *types.RerankRequest) (*types.RerankResponse, *types.OpenAIErrorWithStatusCode)
 }
 
-type RealtimeInterface interface {
+type RealtimeSessionProvider interface {
 	ProviderInterface
-	CreateChatRealtime(modelName string) (*websocket.Conn, requester.MessageHandler, *types.OpenAIErrorWithStatusCode)
+	OpenRealtimeSession(modelName string) (runtimesession.RealtimeSession, *types.OpenAIErrorWithStatusCode)
+}
+
+type RealtimeSessionProviderWithOptions interface {
+	RealtimeSessionProvider
+	OpenRealtimeSessionWithOptions(modelName string, options runtimesession.RealtimeOpenOptions) (runtimesession.RealtimeSession, *types.OpenAIErrorWithStatusCode)
 }
 
 type ResponsesInterface interface {
