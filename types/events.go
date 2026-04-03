@@ -17,12 +17,17 @@ type Event struct {
 	EventId     string         `json:"event_id"`
 	Type        string         `json:"type"`
 	Response    *ResponseEvent `json:"response,omitempty"`
+	Session     *SessionEvent  `json:"session,omitempty"`
 	ErrorDetail *EventError    `json:"error,omitempty"`
 }
 
 type EventError struct {
 	OpenAIError
 	EventId string `json:"event_id"`
+}
+
+type SessionEvent struct {
+	ID string `json:"id"`
 }
 
 func NewErrorEvent(eventId, errType, code, message string) *Event {
@@ -40,6 +45,20 @@ func NewErrorEvent(eventId, errType, code, message string) *Event {
 				Code:    code,
 				Message: message,
 			},
+		},
+	}
+}
+
+func NewSessionCreatedEvent(eventId, sessionID string) *Event {
+	if eventId == "" {
+		eventId = fmt.Sprintf("event_%d", utils.GetRandomInt(3))
+	}
+
+	return &Event{
+		EventId: eventId,
+		Type:    EventTypeSessionCreated,
+		Session: &SessionEvent{
+			ID: sessionID,
 		},
 	}
 }
@@ -75,7 +94,19 @@ type UsageEvent struct {
 	InputTokenDetails  PromptTokensDetails     `json:"input_token_details,omitempty"`
 	OutputTokenDetails CompletionTokensDetails `json:"output_token_details,omitempty"`
 
-	ExtraTokens map[string]int `json:"-"`
+	ExtraTokens  map[string]int          `json:"-"`
+	ExtraBilling map[string]ExtraBilling `json:"-"`
+}
+
+func (u *UsageEvent) Clone() *UsageEvent {
+	if u == nil {
+		return nil
+	}
+
+	cloned := *u
+	cloned.ExtraTokens = cloneExtraTokensMap(u.ExtraTokens)
+	cloned.ExtraBilling = cloneExtraBillingMap(u.ExtraBilling)
+	return &cloned
 }
 
 func (u *UsageEvent) GetExtraTokens() map[string]int {
@@ -107,6 +138,52 @@ func (u *UsageEvent) SetExtraTokens(key string, value int) {
 	u.ExtraTokens[key] = value
 }
 
+func (u *UsageEvent) MergeExtraBilling(extraBilling map[string]ExtraBilling) {
+	if len(extraBilling) == 0 {
+		return
+	}
+	if u.ExtraBilling == nil {
+		u.ExtraBilling = make(map[string]ExtraBilling, len(extraBilling))
+	}
+	for key, value := range extraBilling {
+		serviceType := ResolveExtraBillingServiceType(key, value)
+		bType := ResolveExtraBillingType(key, value)
+		key = BuildExtraBillingKey(serviceType, bType)
+		if key == "" {
+			continue
+		}
+		billing := u.ExtraBilling[key]
+		if billing.ServiceType == "" {
+			billing.ServiceType = serviceType
+		}
+		if billing.Type == "" {
+			billing.Type = bType
+		}
+		billing.CallCount += value.CallCount
+		u.ExtraBilling[key] = billing
+	}
+}
+
+func (u *UsageEvent) IncExtraBilling(key string, bType string) {
+	key = BuildExtraBillingKey(key, bType)
+	if key == "" {
+		return
+	}
+	if u.ExtraBilling == nil {
+		u.ExtraBilling = make(map[string]ExtraBilling)
+	}
+
+	billing := u.ExtraBilling[key]
+	if billing.ServiceType == "" {
+		billing.ServiceType = ResolveExtraBillingServiceType(key, billing)
+	}
+	if billing.Type == "" {
+		billing.Type = ResolveExtraBillingType(key, ExtraBilling{Type: bType})
+	}
+	billing.CallCount++
+	u.ExtraBilling[key] = billing
+}
+
 func (u *UsageEvent) ToChatUsage() *Usage {
 	return &Usage{
 		PromptTokens:            u.InputTokens,
@@ -114,6 +191,8 @@ func (u *UsageEvent) ToChatUsage() *Usage {
 		TotalTokens:             u.TotalTokens,
 		PromptTokensDetails:     u.InputTokenDetails,
 		CompletionTokensDetails: u.OutputTokenDetails,
+		ExtraTokens:             cloneExtraTokensMap(u.ExtraTokens),
+		ExtraBilling:            cloneExtraBillingMap(u.ExtraBilling),
 	}
 }
 
@@ -128,4 +207,6 @@ func (u *UsageEvent) Merge(other *UsageEvent) {
 
 	u.InputTokenDetails.Merge(&other.InputTokenDetails)
 	u.OutputTokenDetails.Merge(&other.OutputTokenDetails)
+	u.ExtraTokens = mergeExtraTokensMap(u.ExtraTokens, other.ExtraTokens)
+	u.MergeExtraBilling(other.ExtraBilling)
 }

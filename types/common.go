@@ -20,8 +20,88 @@ type Usage struct {
 }
 
 type ExtraBilling struct {
-	Type      string `json:"type"`
-	CallCount int    `json:"call_count"`
+	ServiceType string `json:"service_type,omitempty"`
+	Type        string `json:"type"`
+	CallCount   int    `json:"call_count"`
+}
+
+const extraBillingVariantSeparator = "|"
+
+func cloneExtraTokensMap(extraTokens map[string]int) map[string]int {
+	if len(extraTokens) == 0 {
+		return nil
+	}
+
+	cloned := make(map[string]int, len(extraTokens))
+	for key, value := range extraTokens {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func mergeExtraTokensMap(dst map[string]int, src map[string]int) map[string]int {
+	if len(src) == 0 {
+		return dst
+	}
+	if dst == nil {
+		dst = make(map[string]int, len(src))
+	}
+	for key, value := range src {
+		dst[key] += value
+	}
+	return dst
+}
+
+func cloneExtraBillingMap(extraBilling map[string]ExtraBilling) map[string]ExtraBilling {
+	if len(extraBilling) == 0 {
+		return nil
+	}
+
+	cloned := make(map[string]ExtraBilling, len(extraBilling))
+	for key, value := range extraBilling {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func BuildExtraBillingKey(serviceType, bType string) string {
+	serviceType = strings.TrimSpace(serviceType)
+	bType = strings.TrimSpace(bType)
+	if serviceType == "" {
+		return ""
+	}
+	if !extraBillingVariantKeyed(serviceType) || bType == "" {
+		return serviceType
+	}
+	return serviceType + extraBillingVariantSeparator + bType
+}
+
+func ResolveExtraBillingServiceType(key string, billing ExtraBilling) string {
+	if serviceType := strings.TrimSpace(billing.ServiceType); serviceType != "" {
+		return serviceType
+	}
+	serviceType, _, _ := strings.Cut(strings.TrimSpace(key), extraBillingVariantSeparator)
+	return strings.TrimSpace(serviceType)
+}
+
+func ResolveExtraBillingType(key string, billing ExtraBilling) string {
+	if bType := strings.TrimSpace(billing.Type); bType != "" {
+		return bType
+	}
+	_, bType, ok := strings.Cut(strings.TrimSpace(key), extraBillingVariantSeparator)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(bType)
+}
+
+func extraBillingVariantKeyed(serviceType string) bool {
+	switch strings.TrimSpace(serviceType) {
+	case APIToolTypeImageGeneration:
+		return true
+	default:
+		return false
+	}
 }
 
 func (u *Usage) GetExtraTokens() map[string]int {
@@ -90,6 +170,32 @@ func (u *Usage) SetExtraTokens(key string, value int) {
 	}
 
 	u.ExtraTokens[key] = value
+}
+
+func (u *Usage) MergeExtraBilling(extraBilling map[string]ExtraBilling) {
+	if len(extraBilling) == 0 {
+		return
+	}
+	if u.ExtraBilling == nil {
+		u.ExtraBilling = make(map[string]ExtraBilling, len(extraBilling))
+	}
+	for key, value := range extraBilling {
+		serviceType := ResolveExtraBillingServiceType(key, value)
+		bType := ResolveExtraBillingType(key, value)
+		key = BuildExtraBillingKey(serviceType, bType)
+		if key == "" {
+			continue
+		}
+		billing := u.ExtraBilling[key]
+		if billing.ServiceType == "" {
+			billing.ServiceType = serviceType
+		}
+		if billing.Type == "" {
+			billing.Type = bType
+		}
+		billing.CallCount += value.CallCount
+		u.ExtraBilling[key] = billing
+	}
 }
 
 type PromptTokensDetails struct {
@@ -166,17 +272,21 @@ type StreamOptions struct {
 }
 
 func (u *Usage) IncExtraBilling(key string, bType string) {
+	key = BuildExtraBillingKey(key, bType)
+	if key == "" {
+		return
+	}
 	if u.ExtraBilling == nil {
 		u.ExtraBilling = make(map[string]ExtraBilling)
-		if _, ok := u.ExtraTokens[key]; !ok {
-			u.ExtraBilling[key] = ExtraBilling{
-				Type:      bType,
-				CallCount: 0,
-			}
-		}
 	}
 
 	billing := u.ExtraBilling[key]
+	if billing.ServiceType == "" {
+		billing.ServiceType = ResolveExtraBillingServiceType(key, billing)
+	}
+	if billing.Type == "" {
+		billing.Type = ResolveExtraBillingType(key, ExtraBilling{Type: bType})
+	}
 	billing.CallCount++
 	u.ExtraBilling[key] = billing
 }
