@@ -416,7 +416,7 @@ func (p *CodexProvider) OpenRealtimeSessionWithOptions(modelName string, options
 		if errWithCode := p.ensureRealtimeTransportLocked(exec, state, time.Now()); errWithCode != nil {
 			state.attachment = staleAttachment
 			state.ownerSeq = staleOwnerSeq
-			state.turnObserver = staleTurnObserver
+			state.turnObserver = codexGuardTurnObserver(staleTurnObserver)
 			state.turnObserverFactory = staleTurnObserverFactory
 			exec.Attached = wasAttached && staleAttachment != nil
 
@@ -714,7 +714,7 @@ func (s *codexManagedRealtimeSession) SetTurnObserverFactory(factory runtimesess
 	}
 	state.turnObserverFactory = factory
 	if s.exec.Inflight && state.turnObserver == nil && factory != nil {
-		state.turnObserver = factory()
+		state.turnObserver = codexGuardTurnObserver(factory())
 	}
 	s.exec.Unlock()
 }
@@ -1828,7 +1828,7 @@ func beginCodexTurnLocked(state *codexManagedRuntimeState, now time.Time) {
 	state.turnAccumulator = newCodexTurnUsageAccumulator()
 	state.turnFinalized = false
 	if state.turnObserverFactory != nil {
-		state.turnObserver = state.turnObserverFactory()
+		state.turnObserver = codexGuardTurnObserver(state.turnObserverFactory())
 	} else {
 		state.turnObserver = nil
 	}
@@ -1913,6 +1913,13 @@ func observeCodexTurnUsage(observer runtimesession.TurnObserver, usage *types.Us
 		return nil
 	}
 	return observer.ObserveTurnUsage(usage.Clone())
+}
+
+func codexGuardTurnObserver(observer runtimesession.TurnObserver) runtimesession.TurnObserver {
+	if observer == nil {
+		return nil
+	}
+	return runtimesession.GuardTurnObserver(observer)
 }
 
 func codexRealtimeTurnUsageError(err error) error {

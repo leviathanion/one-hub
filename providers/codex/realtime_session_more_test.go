@@ -174,6 +174,29 @@ func TestCodexRealtimeAttachmentTurnAndErrorHelpers(t *testing.T) {
 		t.Fatalf("expected finalizeCodexTurnLocked nil guard, observer=%+v payload=%+v", observer, payload)
 	}
 
+	guardedRecorder := &recordingTurnObserver{}
+	state = &codexManagedRuntimeState{
+		turnObserverFactory: func() runtimesession.TurnObserver { return guardedRecorder },
+	}
+	beginCodexTurnLocked(state, time.Now())
+	if state.turnObserver == nil {
+		t.Fatal("expected beginCodexTurnLocked to wrap a factory-produced turn observer")
+	}
+	if err := state.turnObserver.ObserveTurnUsage(&types.UsageEvent{TotalTokens: 1}); err != nil {
+		t.Fatalf("expected guarded begin-turn observer to pass through usage, got %v", err)
+	}
+	state.turnObserver.FinalizeTurn(runtimesession.TurnFinalizePayload{SessionID: "session-guarded", TurnSeq: 1})
+	state.turnObserver.FinalizeTurn(runtimesession.TurnFinalizePayload{SessionID: "session-guarded", TurnSeq: 2})
+	if err := state.turnObserver.ObserveTurnUsage(&types.UsageEvent{TotalTokens: 2}); err != nil {
+		t.Fatalf("expected guarded begin-turn observer to no-op after finalize, got %v", err)
+	}
+	if got := guardedRecorder.observeCount(); got != 1 {
+		t.Fatalf("expected guarded begin-turn observer to suppress post-finalize usage, got %d observations", got)
+	}
+	if got := guardedRecorder.finalizeCount(); got != 1 {
+		t.Fatalf("expected guarded begin-turn observer to finalize once, got %d", got)
+	}
+
 	recorder := &recordingTurnObserver{}
 	if err := observeCodexTurnUsage(nil, &types.UsageEvent{InputTokens: 1}); err != nil {
 		t.Fatalf("expected nil turn observer usage observe to be ignored, got %v", err)
@@ -360,9 +383,24 @@ func TestCodexManagedRealtimeSessionGuardBranches(t *testing.T) {
 	state.turnObserver = nil
 	state.turnObserverFactory = nil
 	exec.Inflight = true
-	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return &recordingTurnObserver{} })
+	seededRecorder := &recordingTurnObserver{}
+	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return seededRecorder })
 	if state.turnObserverFactory == nil || state.turnObserver == nil {
 		t.Fatalf("expected SetTurnObserverFactory to seed observer for inflight owned session, state=%+v", state)
+	}
+	if err := state.turnObserver.ObserveTurnUsage(&types.UsageEvent{TotalTokens: 1}); err != nil {
+		t.Fatalf("expected seeded turn observer to pass through usage, got %v", err)
+	}
+	state.turnObserver.FinalizeTurn(runtimesession.TurnFinalizePayload{SessionID: "session-managed", TurnSeq: 1})
+	state.turnObserver.FinalizeTurn(runtimesession.TurnFinalizePayload{SessionID: "session-managed", TurnSeq: 2})
+	if err := state.turnObserver.ObserveTurnUsage(&types.UsageEvent{TotalTokens: 2}); err != nil {
+		t.Fatalf("expected seeded turn observer to no-op after finalize, got %v", err)
+	}
+	if got := seededRecorder.observeCount(); got != 1 {
+		t.Fatalf("expected seeded turn observer to suppress post-finalize usage, got %d observations", got)
+	}
+	if got := seededRecorder.finalizeCount(); got != 1 {
+		t.Fatalf("expected seeded turn observer to finalize once, got %d", got)
 	}
 	exec.Inflight = false
 
