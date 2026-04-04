@@ -48,6 +48,11 @@ func (t *SunoTask) Init() *base.TaskError {
 		return base.StringTaskError(http.StatusInternalServerError, "get_origin_task_failed", err.Error(), true)
 	}
 
+	t.InitTask()
+	if t.Task != nil {
+		t.Task.Action = t.Action
+	}
+
 	return nil
 }
 
@@ -79,14 +84,13 @@ func (t *SunoTask) Relay() *base.TaskError {
 		return base.StringTaskError(http.StatusInternalServerError, "submit_failed", resp.Message, false)
 	}
 
-	t.Response = resp
-
-	t.InitTask()
-	if resp.Data != nil {
-		t.Task.TaskID = *resp.Data
+	if resp.Data == nil || strings.TrimSpace(*resp.Data) == "" {
+		return base.StringTaskError(http.StatusInternalServerError, "submit_failed", "provider submit response missing task id", false)
 	}
+
+	t.Response = resp
+	t.Task.TaskID = strings.TrimSpace(*resp.Data)
 	t.Task.ChannelId = t.Provider.Channel.Id
-	t.Task.Action = t.Action
 
 	return nil
 }
@@ -172,13 +176,15 @@ func updateSunoTaskAll(ctx context.Context, channelId int, taskIds []string, tas
 
 	channel := model.ChannelGroup.GetChannel(channelId)
 	if channel == nil {
-		err := model.TaskBulkUpdate(taskIds, map[string]any{
-			"fail_reason": fmt.Sprintf("获取渠道信息失败，请联系管理员，渠道ID：%d", channelId),
-			"status":      "FAILURE",
-			"progress":    100,
-		})
-		if err != nil {
-			logger.SysError(fmt.Sprintf("UpdateTask error: %v", err))
+		reason := fmt.Sprintf("获取渠道信息失败，请联系管理员，渠道ID：%d", channelId)
+		for _, taskID := range taskIds {
+			task := taskM[taskID]
+			if task == nil {
+				continue
+			}
+			if err := base.FailTaskWithSettlement(ctx, task, reason); err != nil {
+				logger.SysError(fmt.Sprintf("UpdateTask error: %v", err))
+			}
 		}
 		return fmt.Errorf("channel not found")
 	}
@@ -186,13 +192,14 @@ func updateSunoTaskAll(ctx context.Context, channelId int, taskIds []string, tas
 	providers := providers.GetProvider(channel, nil)
 	sunoProvider, ok := providers.(*sunoProvider.SunoProvider)
 	if !ok {
-		err := model.TaskBulkUpdate(taskIds, map[string]any{
-			"fail_reason": "获取供应商失败，请联系管理员",
-			"status":      "FAILURE",
-			"progress":    100,
-		})
-		if err != nil {
-			logger.SysError(fmt.Sprintf("UpdateTask error: %v", err))
+		for _, taskID := range taskIds {
+			task := taskM[taskID]
+			if task == nil {
+				continue
+			}
+			if err := base.FailTaskWithSettlement(ctx, task, "获取供应商失败，请联系管理员"); err != nil {
+				logger.SysError(fmt.Sprintf("UpdateTask error: %v", err))
+			}
 		}
 		return fmt.Errorf("provider not found")
 	}
@@ -211,6 +218,7 @@ func updateSunoTaskAll(ctx context.Context, channelId int, taskIds []string, tas
 		if !checkTaskNeedUpdate(task, responseItem) {
 			continue
 		}
+		task.TaskID = responseItem.TaskID
 
 		task.Status = lo.If(model.TaskStatus(responseItem.Status) != "", model.TaskStatus(responseItem.Status)).Else(task.Status)
 		task.FailReason = lo.If(responseItem.FailReason != "", responseItem.FailReason).Else(task.FailReason)
@@ -220,19 +228,37 @@ func updateSunoTaskAll(ctx context.Context, channelId int, taskIds []string, tas
 
 		if responseItem.FailReason != "" || task.Status == model.TaskStatusFailure {
 			logger.LogError(ctx, task.TaskID+" 构建失败，"+task.FailReason)
-			task.Progress = 100
-			quota := task.Quota
-			if quota > 0 {
-				err := model.IncreaseUserQuota(task.UserId, quota)
-				if err != nil {
-					logger.LogError(ctx, "fail to increase user quota: "+err.Error())
-				}
-				logContent := fmt.Sprintf("异步任务执行失败 %s，补偿 %s", task.TaskID, common.LogQuota(quota))
-				model.RecordLog(task.UserId, model.LogTypeSystem, logContent)
+			settleResult, settleErr := base.FinalizeTaskSettlement(ctx, task, false)
+			if settleErr != nil {
+				logger.LogError(ctx, "finalize failed task settlement: "+settleErr.Error())
+				continue
 			}
+			if !settleResult.Handled {
+				quota := task.Quota
+				if quota > 0 {
+					err := model.IncreaseUserQuota(task.UserId, quota)
+					if err != nil {
+						logger.LogError(ctx, "fail to increase user quota: "+err.Error())
+					}
+					logContent := fmt.Sprintf("异步任务执行失败 %s，补偿 %s", task.TaskID, common.LogQuota(quota))
+					model.RecordLog(task.UserId, model.LogTypeSystem, logContent)
+				}
+			}
+			if !settleResult.PersistTask {
+				continue
+			}
+			task.Progress = 100
 		}
 
 		if responseItem.Status == model.TaskStatusSuccess {
+			settleResult, settleErr := base.FinalizeTaskSettlement(ctx, task, true)
+			if settleErr != nil {
+				logger.LogError(ctx, "finalize success task settlement: "+settleErr.Error())
+				continue
+			}
+			if !settleResult.PersistTask {
+				continue
+			}
 			task.Progress = 100
 		}
 

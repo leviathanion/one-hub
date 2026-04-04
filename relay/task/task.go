@@ -6,6 +6,7 @@ import (
 	"one-api/common"
 	"one-api/common/logger"
 	"one-api/model"
+	"one-api/relay/task/base"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +17,8 @@ var (
 	lock       sync.Mutex
 	cond       = sync.NewCond(&lock)
 )
+
+const emptyTaskIDSweepDelay = time.Minute
 
 func InitTask() {
 	common.SafeGoroutine(func() {
@@ -79,26 +82,31 @@ func UpdateTaskBulk() {
 			}
 			taskChannelM := make(map[int][]string)
 			taskM := make(map[string]*model.Task)
-			nullTaskIds := make([]int64, 0)
+			nullTaskIds := make([]*model.Task, 0)
 			for _, task := range tasks {
-				if task.TaskID == "" {
-					// 统计失败的未完成任务
-					nullTaskIds = append(nullTaskIds, task.ID)
+				trackingHandle := base.TaskTrackingHandle(task)
+				if trackingHandle == "" {
+					if !shouldSweepEmptyTaskID(task) {
+						continue
+					}
+					nullTaskIds = append(nullTaskIds, task)
 					continue
 				}
-				taskM[task.TaskID] = task
-				taskChannelM[task.ChannelId] = append(taskChannelM[task.ChannelId], task.TaskID)
+				taskM[trackingHandle] = task
+				taskChannelM[task.ChannelId] = append(taskChannelM[task.ChannelId], trackingHandle)
 			}
 
 			if len(nullTaskIds) > 0 {
-				err := model.TaskBulkUpdateByID(nullTaskIds, map[string]any{
-					"status":   "FAILURE",
-					"progress": 100,
-				})
-				if err != nil {
-					logger.LogError(ctx, fmt.Sprintf("Fix null task_id task error: %v", err))
-				} else {
-					logger.LogInfo(ctx, fmt.Sprintf("Fix null task_id task success: %v", nullTaskIds))
+				failedTaskIDs := make([]int64, 0, len(nullTaskIds))
+				for _, task := range nullTaskIds {
+					if err := base.FailTaskWithSettlement(ctx, task, "task_id 为空，无法继续同步任务状态"); err != nil {
+						logger.LogError(ctx, fmt.Sprintf("Fix null task_id task error: %v", err))
+						continue
+					}
+					failedTaskIDs = append(failedTaskIDs, task.ID)
+				}
+				if len(failedTaskIDs) > 0 {
+					logger.LogInfo(ctx, fmt.Sprintf("Fix null task_id task success: %v", failedTaskIDs))
 				}
 			}
 			if len(taskChannelM) == 0 {
@@ -108,6 +116,19 @@ func UpdateTaskBulk() {
 		}
 		time.Sleep(time.Duration(15) * time.Second)
 	}
+}
+
+func shouldSweepEmptyTaskID(task *model.Task) bool {
+	if task == nil || base.TaskTrackingHandle(task) != "" {
+		return false
+	}
+	if !base.TaskAcceptedWithoutTrackingHandle(task) {
+		return false
+	}
+	if task.SubmitTime <= 0 {
+		return true
+	}
+	return time.Now().Unix()-task.SubmitTime >= int64(emptyTaskIDSweepDelay/time.Second)
 }
 
 func UpdateTaskByPlatform(ctx context.Context,

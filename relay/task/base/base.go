@@ -38,6 +38,9 @@ type TaskInterface interface {
 }
 
 func (t *TaskBase) InitTask() {
+	if t.Task != nil || t.C == nil {
+		return
+	}
 	userID := t.C.GetInt("id")
 	tokenId := t.C.GetInt("token_id")
 	t.Task = &model.Task{

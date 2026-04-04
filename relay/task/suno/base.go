@@ -3,6 +3,7 @@ package suno
 import (
 	"fmt"
 	"one-api/model"
+	taskbase "one-api/relay/task/base"
 	"one-api/types"
 	"regexp"
 
@@ -23,7 +24,7 @@ func TaskModel2Dto(task *model.Task) *types.TaskDto {
 	progress := fmt.Sprintf("%d%%", task.Progress)
 
 	taskDto := &types.TaskDto{
-		TaskID:     task.TaskID,
+		TaskID:     taskbase.TaskTrackingHandle(task),
 		Action:     task.Action,
 		Status:     string(task.Status),
 		FailReason: task.FailReason,

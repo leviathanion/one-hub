@@ -2,15 +2,17 @@ package model
 
 import (
 	"errors"
+	"fmt"
 
 	"gorm.io/datatypes"
-	"gorm.io/gorm"
 )
 
 const (
 	TaskPlatformSuno  = "suno"
 	TaskPlatformKling = "kling"
 )
+
+var ErrTaskLookupConflict = errors.New("task lookup conflict")
 
 type TaskStatus string
 
@@ -50,6 +52,19 @@ func GetTaskByTaskIds(platform string, userId int, taskIds []string) (task []*Ta
 	// 最多返回100个任务
 	err = DB.Omit("channel_id", "quota", "user_id").Where("platform = ? and user_id = ? and task_id in (?)", platform, userId, taskIds).Limit(100).
 		Find(&task).Error
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{}, len(task))
+	for _, item := range task {
+		if item == nil {
+			continue
+		}
+		if _, ok := seen[item.TaskID]; ok {
+			return nil, fmt.Errorf("%w: platform=%s user_id=%d task_id=%s", ErrTaskLookupConflict, platform, userId, item.TaskID)
+		}
+		seen[item.TaskID] = struct{}{}
+	}
 
 	return
 }
@@ -61,22 +76,38 @@ func GetTaskActionByTaskIds(platform string, taskIds []string) (task []*Task, er
 }
 
 func GetTaskByTaskId(platform string, userId int, taskId string) (task *Task, err error) {
-	task = &Task{}
-	err = DB.Where("platform = ? and user_id = ? and task_id = ?", platform, userId, taskId).First(task).Error
-
-	if errors.Is(err, gorm.ErrRecordNotFound) {
+	var tasks []*Task
+	err = DB.Where("platform = ? and user_id = ? and task_id = ?", platform, userId, taskId).Limit(2).Find(&tasks).Error
+	if err != nil {
+		return nil, err
+	}
+	if len(tasks) == 0 {
 		return nil, nil
 	}
+	if len(tasks) > 1 {
+		return nil, fmt.Errorf("%w: platform=%s user_id=%d task_id=%s", ErrTaskLookupConflict, platform, userId, taskId)
+	}
 
-	return
+	return tasks[0], nil
 }
 
-func (Task *Task) Insert() error {
-	return DB.Create(Task).Error
+func (task *Task) Insert() error {
+	return DB.Create(task).Error
 }
 
-func (Task *Task) Update() error {
-	return DB.Save(Task).Error
+func (task *Task) Update() error {
+	return DB.Save(task).Error
+}
+
+func (task *Task) UpdateFields(params map[string]any) error {
+	if task.ID == 0 {
+		return errors.New("task id 为空！")
+	}
+	return DB.Model(&Task{}).Where("id = ?", task.ID).Updates(params).Error
+}
+
+func (task *Task) Delete() error {
+	return DB.Delete(task).Error
 }
 
 func TaskBulkUpdate(TaskIds []string, params map[string]any) error {
