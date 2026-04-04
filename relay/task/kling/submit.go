@@ -185,7 +185,7 @@ func updateKlingTaskAll(ctx context.Context, channelId int, taskIds []string, ta
 		return fmt.Errorf("provider not found")
 	}
 
-	taskActions, err := model.GetTaskActionByTaskIds("Kling", taskIds)
+	taskActions, err := getKlingTaskActionsForSync(taskIds)
 	if err != nil {
 		return fmt.Errorf("get task action failed: %v", err)
 	}
@@ -259,6 +259,10 @@ func updateKlingTaskAll(ctx context.Context, channelId int, taskIds []string, ta
 	}
 
 	return nil
+}
+
+func getKlingTaskActionsForSync(taskIDs []string) ([]*model.Task, error) {
+	return model.GetTaskActionByTaskIds(model.TaskPlatformKling, taskIDs)
 }
 
 func checkTaskNeedUpdate(oldTask *model.Task, newTask *types.TaskDto) bool {
