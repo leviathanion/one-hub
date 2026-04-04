@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"one-api/common"
 	"one-api/common/config"
+	"one-api/common/groupctx"
 	"one-api/common/utils"
 	"one-api/model"
 	"one-api/providers/claude"
@@ -27,11 +28,15 @@ type OpenAIModels struct {
 	OwnedBy *string `json:"owned_by"`
 }
 
+func modelsGroupName(c *gin.Context) string {
+	// Model-list handlers should expose the request's effective routing scope.
+	// Backup groups remain a fallback path and are not advertised unless they are
+	// already the current routing truth for this request.
+	return groupctx.CurrentRoutingGroup(c)
+}
+
 func ListModelsByToken(c *gin.Context) {
-	groupName := c.GetString("token_group")
-	if groupName == "" {
-		groupName = c.GetString("group")
-	}
+	groupName := modelsGroupName(c)
 
 	if groupName == "" {
 		common.AbortWithMessage(c, http.StatusServiceUnavailable, "分组不存在")
@@ -72,10 +77,7 @@ func ListModelsByToken(c *gin.Context) {
 
 // https://generativelanguage.googleapis.com/v1beta/models?key=xxxxxxx
 func ListGeminiModelsByToken(c *gin.Context) {
-	groupName := c.GetString("token_group")
-	if groupName == "" {
-		groupName = c.GetString("group")
-	}
+	groupName := modelsGroupName(c)
 
 	if groupName == "" {
 		common.AbortWithMessage(c, http.StatusServiceUnavailable, "分组不存在")
@@ -112,10 +114,7 @@ func ListGeminiModelsByToken(c *gin.Context) {
 }
 
 func ListClaudeModelsByToken(c *gin.Context) {
-	groupName := c.GetString("token_group")
-	if groupName == "" {
-		groupName = c.GetString("group")
-	}
+	groupName := modelsGroupName(c)
 
 	if groupName == "" {
 		common.AbortWithMessage(c, http.StatusServiceUnavailable, "分组不存在")
