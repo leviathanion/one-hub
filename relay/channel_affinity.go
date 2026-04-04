@@ -208,6 +208,10 @@ func recordCurrentChannelAffinity(c *gin.Context, kind channelAffinityKind, chan
 		return
 	}
 	state := currentChannelAffinityState(c)
+	if explicitChannelPinID(c) > 0 {
+		refreshChannelAffinityMeta(c, state, channelID)
+		return
+	}
 	if state == nil || state.Kind != kind {
 		key := currentChannelAffinityKey(c)
 		if key == "" {
@@ -237,6 +241,9 @@ func recordResponsesChannelAffinity(c *gin.Context, channelID int, response *typ
 		return
 	}
 	recordCurrentChannelAffinity(c, channelAffinityKindResponses, channelID)
+	if explicitChannelPinID(c) > 0 {
+		return
+	}
 
 	state := currentChannelAffinityState(c)
 	if state == nil || state.Kind != channelAffinityKindResponses || response == nil {

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"one-api/common/config"
+	"one-api/common/logger"
 	"one-api/common/requester"
 	"one-api/model"
 	providersBase "one-api/providers/base"
@@ -18,11 +19,16 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"go.uber.org/zap"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
 
 type relayTestRealtimeSession struct{}
+
+func init() {
+	logger.Logger = zap.NewNop()
+}
 
 func (relayTestRealtimeSession) SendClient(context.Context, int, []byte) error { return nil }
 func (relayTestRealtimeSession) Recv(context.Context) (int, []byte, *types.UsageEvent, error) {
@@ -171,6 +177,11 @@ func TestRelayModeChatRealtimeGetProviderUsesAffinityChannel(t *testing.T) {
 
 func TestRelayModeChatRealtimeGetProviderFallsBackWhenAffinityChannelUnavailable(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	originalLogger := logger.Logger
+	logger.Logger = zap.NewNop()
+	t.Cleanup(func() {
+		logger.Logger = originalLogger
+	})
 
 	channelGroupSnapshot := snapshotChannelGroup()
 	t.Cleanup(func() {
@@ -387,6 +398,13 @@ func TestRelayModeChatRealtimeGetProviderPinnedChannelOverridesAffinity(t *testi
 		t.Fatalf("expected pinned channel fixture to persist, got %v", err)
 	}
 
+	seedCtx := newRelayTestContext(map[string]string{
+		"X-Session-Id": sessionID,
+	})
+	seedCtx.Set("token_id", 301)
+	rememberChannelAffinityKey(seedCtx, channelAffinityKindRealtime, sessionID)
+	recordCurrentChannelAffinity(seedCtx, channelAffinityKindRealtime, affinityChannelID)
+
 	ctx := newRelayTestContext(map[string]string{
 		"X-Session-Id": sessionID,
 	})
@@ -394,7 +412,6 @@ func TestRelayModeChatRealtimeGetProviderPinnedChannelOverridesAffinity(t *testi
 	ctx.Set("specific_channel_id", pinnedChannelID)
 	ctx.Set("specific_channel_id_ignore", false)
 	rememberChannelAffinityKey(ctx, channelAffinityKindRealtime, sessionID)
-	recordCurrentChannelAffinity(ctx, channelAffinityKindRealtime, affinityChannelID)
 
 	relay := &RelayModeChatRealtime{
 		relayBase: relayBase{
@@ -415,8 +432,8 @@ func TestRelayModeChatRealtimeGetProviderPinnedChannelOverridesAffinity(t *testi
 	if got := relay.provider.GetChannel().Id; got != pinnedChannelID {
 		t.Fatalf("expected pinned realtime routing to stay on channel #%d, got #%d", pinnedChannelID, got)
 	}
-	if got, ok := lookupChannelAffinity(ctx, channelAffinityKindRealtime, sessionID); !ok || got != pinnedChannelID {
-		t.Fatalf("expected pinned channel to rewrite affinity onto #%d, got channel=%d ok=%v", pinnedChannelID, got, ok)
+	if got, ok := lookupChannelAffinity(seedCtx, channelAffinityKindRealtime, sessionID); !ok || got != affinityChannelID {
+		t.Fatalf("expected pinned request not to rewrite shared affinity, got channel=%d ok=%v", got, ok)
 	}
 }
 

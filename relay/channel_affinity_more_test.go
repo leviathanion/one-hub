@@ -261,6 +261,19 @@ func TestChannelAffinityEvaluationLookupAndHelperFunctions(t *testing.T) {
 	if pinnedState == nil || pinnedState.Hit {
 		t.Fatalf("expected explicit pin to skip affinity hit selection, got %#v", pinnedState)
 	}
+	applyChannelAffinityState(explicitPinCtx, pinnedState)
+	recordResponsesChannelAffinity(explicitPinCtx, 999, &types.OpenAIResponsesResponses{
+		ID:             "resp-pinned-1",
+		PromptCacheKey: request.PromptCacheKey,
+	})
+	promptTemplateAfterPin := newChannelAffinityTemplate(ctx, channelAffinityKindResponses, "gpt-5", settings.Rules[0], "request_field", config.ChannelAffinityAliasPromptCacheKey, settings.DefaultTTLSeconds)
+	if _, ok := manager.Get(promptTemplateAfterPin.BuildKey(request.PromptCacheKey)); ok {
+		t.Fatal("expected explicit pin response writeback not to recreate shared prompt cache affinity")
+	}
+	responseIDTemplate := newChannelAffinityTemplate(ctx, channelAffinityKindResponses, "gpt-5", settings.Rules[1], "request_field", config.ChannelAffinityAliasResponseID, settings.DefaultTTLSeconds)
+	if _, ok := manager.Get(responseIDTemplate.BuildKey("resp-pinned-1")); ok {
+		t.Fatal("expected explicit pin response writeback not to persist derived response id affinity")
+	}
 
 	if got := extractChannelAffinityValue(ctx, channelAffinityInput{ResponsesRequest: request, RealtimeSessionID: "session-fallback"}, config.ChannelAffinityKeySource{Source: "request_field", Key: "prompt_cache_key"}); got != "pc-1" {
 		t.Fatalf("expected request field extraction, got %q", got)
