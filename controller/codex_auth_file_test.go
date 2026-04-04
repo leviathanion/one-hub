@@ -75,3 +75,10 @@ func TestParseCodexChannelTemplateRejectsInvalidRuntimeConfigJSON(t *testing.T) 
 		t.Fatal("expected invalid runtime config json to be rejected")
 	}
 }
+
+func TestParseCodexChannelTemplateRejectsUnsupportedCodexOtherFields(t *testing.T) {
+	_, err := parseCodexChannelTemplate(`{"type":101,"name":"codex","models":"gpt-5","group":"default","other":"{\"user_agent_regex\":\"^Codex/\"}"}`)
+	if err == nil {
+		t.Fatal("expected unsupported Codex other fields to be rejected")
+	}
+}

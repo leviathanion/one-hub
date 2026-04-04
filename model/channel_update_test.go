@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"one-api/common/config"
+	"one-api/common/logger"
 
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -134,5 +135,68 @@ func TestUpdateChannelsTagRejectsInvalidCodexOtherWhenTypeOmitted(t *testing.T) 
 	}
 	if persisted.Other != "" {
 		t.Fatalf("expected rejected tag update not to mutate other, got %q", persisted.Other)
+	}
+}
+
+func TestBatchUpdateChannelsAzureApiRejectsUnsupportedCodexOtherWhenTypeOmitted(t *testing.T) {
+	useTestChannelDB(t)
+	logger.SetupLogger()
+
+	insertTestChannel(t, &Channel{
+		Id:     1,
+		Type:   config.ChannelTypeCodex,
+		Name:   "codex-batch",
+		Key:    "sk-batch",
+		Group:  "default",
+		Models: "gpt-5",
+	})
+
+	if _, err := BatchUpdateChannelsAzureApi(&BatchChannelsParams{
+		Ids:   []int{1},
+		Value: `{"user_agent_regex":"^Codex/"}`,
+	}); err == nil {
+		t.Fatal("expected batch other update to reject unsupported Codex fields when payload omits type")
+	}
+
+	persisted, err := GetChannelById(1)
+	if err != nil {
+		t.Fatalf("expected persisted Codex channel lookup to succeed, got %v", err)
+	}
+	if persisted.Other != "" {
+		t.Fatalf("expected rejected batch update not to mutate other, got %q", persisted.Other)
+	}
+}
+
+func TestBatchUpdateChannelsAzureApiAllowsPlainOtherForAzureChannels(t *testing.T) {
+	useTestChannelDB(t)
+	logger.SetupLogger()
+
+	insertTestChannel(t, &Channel{
+		Id:     1,
+		Type:   3,
+		Name:   "azure-batch",
+		Key:    "sk-azure",
+		Group:  "default",
+		Models: "gpt-4o",
+		Other:  "2024-05-01-preview",
+	})
+
+	count, err := BatchUpdateChannelsAzureApi(&BatchChannelsParams{
+		Ids:   []int{1},
+		Value: "2024-06-01",
+	})
+	if err != nil {
+		t.Fatalf("expected Azure batch other update to stay valid, got %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly one Azure channel update, got %d", count)
+	}
+
+	persisted, err := GetChannelById(1)
+	if err != nil {
+		t.Fatalf("expected persisted Azure channel lookup to succeed, got %v", err)
+	}
+	if persisted.Other != "2024-06-01" {
+		t.Fatalf("expected Azure batch update to persist plain other value, got %q", persisted.Other)
 	}
 }

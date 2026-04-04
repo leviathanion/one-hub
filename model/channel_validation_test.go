@@ -66,3 +66,66 @@ func TestChannelRuntimeConfigValidationBranches(t *testing.T) {
 		t.Fatalf("expected non-object optional json payload to fail validation, got %v", err)
 	}
 }
+
+func TestValidateCodexChannelOtherAcceptsDocumentedFields(t *testing.T) {
+	channel := &Channel{
+		Type: config.ChannelTypeCodex,
+		Other: `{
+			"prompt_cache_key_strategy":" AUTO ",
+			"websocket_mode":" force ",
+			"execution_session_ttl_seconds":600,
+			"websocket_retry_cooldown_seconds":120,
+			"user_agent":"Codex/1.0"
+		}`,
+	}
+	if err := channel.ValidateRuntimeConfigJSON(); err != nil {
+		t.Fatalf("expected documented Codex other fields to validate, got %v", err)
+	}
+}
+
+func TestValidateCodexChannelOtherRejectsUnsupportedOrInvalidFields(t *testing.T) {
+	cases := []struct {
+		name     string
+		other    string
+		contains string
+	}{
+		{
+			name:     "unsupported field",
+			other:    `{"user_agent_regex":"^Codex/"}`,
+			contains: "other.user_agent_regex",
+		},
+		{
+			name:     "invalid websocket mode",
+			other:    `{"websocket_mode":"weird"}`,
+			contains: "other.websocket_mode",
+		},
+		{
+			name:     "invalid prompt cache strategy",
+			other:    `{"prompt_cache_key_strategy":"weird"}`,
+			contains: "other.prompt_cache_key_strategy",
+		},
+		{
+			name:     "non-positive execution session ttl",
+			other:    `{"execution_session_ttl_seconds":0}`,
+			contains: "other.execution_session_ttl_seconds",
+		},
+		{
+			name:     "invalid user agent type",
+			other:    `{"user_agent":123}`,
+			contains: "other.user_agent",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			channel := &Channel{
+				Type:  config.ChannelTypeCodex,
+				Other: tc.other,
+			}
+			err := channel.ValidateRuntimeConfigJSON()
+			if err == nil || !strings.Contains(err.Error(), tc.contains) {
+				t.Fatalf("expected Codex other validation error containing %q, got %v", tc.contains, err)
+			}
+		})
+	}
+}

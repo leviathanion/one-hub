@@ -218,6 +218,20 @@ type BatchChannelsParams struct {
 }
 
 func BatchUpdateChannelsAzureApi(params *BatchChannelsParams) (int64, error) {
+	var channels []Channel
+	if err := DB.Select("id, type").Find(&channels, "id IN ?", params.Ids).Error; err != nil {
+		return 0, err
+	}
+	for i := range channels {
+		channel := Channel{
+			Type:  channels[i].Type,
+			Other: params.Value,
+		}
+		if err := channel.ValidateRuntimeConfigJSON(); err != nil {
+			return 0, err
+		}
+	}
+
 	db := DB.Model(&Channel{}).Where("id IN ?", params.Ids).Update("other", params.Value)
 	if db.Error != nil {
 		return 0, db.Error
