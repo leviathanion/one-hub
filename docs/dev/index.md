@@ -1,7 +1,21 @@
 # 开发与贡献
 
+## 文档收敛说明
+
+`docs/dev` 里原先有多份渠道亲和与 usage 设计文档，主题重复，而且取舍分叉。
+
+现在把它们收敛成三份主题文档与一份独立工具文档：
+
+| 文档 | 主题 | 说明 |
+| --- | --- | --- |
+| [Channel Affinity 统一方案](./channel-affinity-architecture.md) | 渠道路由、responses affinity、Codex realtime affinity | 以当前代码实际采用的方案为准 |
+| [Billing / Usage 结算统一方案](./billing-settlement-architecture.md) | usage / settlement / finalize | 在多份提案中选出的最终推荐方案 |
+| [one-hub Async Task 极简协调方案](./task-coordination-architecture.md) | async task、identity、fetch、sweeper、finalize | 统一说明 one-hub 当前 async task 的能力边界、数据模型与落地取舍 |
+| [Relay 压测脚本](./relay-performance-benchmark.md) | 热路径压测工具与口径 | 独立保留 |
+
 ## 目录
 
+- [文档收敛说明](#文档收敛说明)
 - [本地构建](#本地构建)
   - [环境配置](#环境配置)
   - [编译流程](#编译流程)
@@ -10,13 +24,6 @@
   - [环境配置](#环境配置-1)
   - [编译流程](#编译流程-1)
   - [运行说明](#运行说明-1)
-- [Relay 压测脚本](./relay-performance-benchmark.md)
-- [Codex Realtime Best-Effort Affinity 方案](./codex-realtime-best-effort-affinity.md)
-- [Codex Realtime Preferred Channel 失败后的 Fresh Fallback 方案](./codex-realtime-preferred-channel-fallback.md)
-- [Codex Prompt Cache Affinity 预派生方案](./codex-prompt-cache-affinity-derivation.md)
-- [Channel Affinity 路由分组方案](./channel-affinity-routing-group.md)
-- [Channel Affinity Manager 生命周期方案](./channel-affinity-manager-lifecycle.md)
-- [Responses previous_response_id 请求级恢复方案](./responses-request-recovery.md)
 
 ## 本地构建
 
