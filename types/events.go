@@ -123,8 +123,36 @@ func (u *UsageEvent) GetExtraTokens() map[string]int {
 		u.ExtraTokens[config.UsageExtraInputAudio] = u.InputTokenDetails.AudioTokens
 	}
 
+	if u.InputTokenDetails.TextTokens > 0 && u.ExtraTokens[config.UsageExtraInputTextTokens] == 0 {
+		u.ExtraTokens[config.UsageExtraInputTextTokens] = u.InputTokenDetails.TextTokens
+	}
+
+	if u.InputTokenDetails.CachedWriteTokens > 0 && u.ExtraTokens[config.UsageExtraCachedWrite] == 0 {
+		u.ExtraTokens[config.UsageExtraCachedWrite] = u.InputTokenDetails.CachedWriteTokens
+	}
+
+	if u.InputTokenDetails.CachedReadTokens > 0 && u.ExtraTokens[config.UsageExtraCachedRead] == 0 {
+		u.ExtraTokens[config.UsageExtraCachedRead] = u.InputTokenDetails.CachedReadTokens
+	}
+
+	if u.InputTokenDetails.ImageTokens > 0 && u.ExtraTokens[config.UsageExtraInputImageTokens] == 0 {
+		u.ExtraTokens[config.UsageExtraInputImageTokens] = u.InputTokenDetails.ImageTokens
+	}
+
 	if u.OutputTokenDetails.AudioTokens > 0 && u.ExtraTokens[config.UsageExtraOutputAudio] == 0 {
 		u.ExtraTokens[config.UsageExtraOutputAudio] = u.OutputTokenDetails.AudioTokens
+	}
+
+	if u.OutputTokenDetails.TextTokens > 0 && u.ExtraTokens[config.UsageExtraOutputTextTokens] == 0 {
+		u.ExtraTokens[config.UsageExtraOutputTextTokens] = u.OutputTokenDetails.TextTokens
+	}
+
+	if u.OutputTokenDetails.ReasoningTokens > 0 && u.ExtraTokens[config.UsageExtraReasoning] == 0 {
+		u.ExtraTokens[config.UsageExtraReasoning] = u.OutputTokenDetails.ReasoningTokens
+	}
+
+	if u.OutputTokenDetails.ImageTokens > 0 && u.ExtraTokens[config.UsageExtraOutputImageTokens] == 0 {
+		u.ExtraTokens[config.UsageExtraOutputImageTokens] = u.OutputTokenDetails.ImageTokens
 	}
 
 	return u.ExtraTokens

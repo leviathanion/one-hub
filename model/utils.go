@@ -75,6 +75,19 @@ func addNewRecord(type_ int, id int, value int) {
 	}
 }
 
+func takeBatchUpdateRecord(type_ int, id int) int {
+	if id == 0 {
+		return 0
+	}
+
+	batchUpdateLocks[type_].Lock()
+	defer batchUpdateLocks[type_].Unlock()
+
+	value := batchUpdateStores[type_][id]
+	delete(batchUpdateStores[type_], id)
+	return value
+}
+
 func batchUpdate() {
 	logger.SysLog("batch update started")
 	for i := 0; i < BatchUpdateTypeCount; i++ {

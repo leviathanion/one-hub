@@ -486,3 +486,84 @@ func PostConsumeTokenQuotaWithInfo(tokenId int, userId int, unlimitedQuota bool,
 	}
 	return nil
 }
+
+func ApplyTokenUserQuotaDeltaDirect(tokenId int, userId int, unlimitedQuota bool, quota int) (err error) {
+	pendingUserQuota, pendingTokenQuota := takePendingQuotaBatchAdjustments(userId, tokenId, unlimitedQuota)
+	if quota == 0 && pendingUserQuota == 0 && pendingTokenQuota == 0 {
+		return nil
+	}
+
+	restorePending := true
+	defer func() {
+		if restorePending {
+			restorePendingQuotaBatchAdjustments(userId, tokenId, unlimitedQuota, pendingUserQuota, pendingTokenQuota)
+		}
+	}()
+
+	tx := DB.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+			panic(r)
+		}
+	}()
+
+	userQuotaChange := pendingUserQuota - quota
+	if userQuotaChange != 0 {
+		err = tx.Model(&User{}).Where("id = ?", userId).Update("quota", gorm.Expr("quota + ?", userQuotaChange)).Error
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+
+	if !unlimitedQuota {
+		tokenQuotaChange := pendingTokenQuota - quota
+		tokenUpdate := map[string]interface{}{
+			"accessed_time": utils.GetTimestamp(),
+		}
+		if tokenQuotaChange != 0 {
+			tokenUpdate["remain_quota"] = gorm.Expr("remain_quota + ?", tokenQuotaChange)
+			tokenUpdate["used_quota"] = gorm.Expr("used_quota - ?", tokenQuotaChange)
+		}
+
+		err = tx.Model(&Token{}).Where("id = ?", tokenId).Updates(tokenUpdate).Error
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+
+	if err = tx.Commit().Error; err != nil {
+		return err
+	}
+
+	restorePending = false
+	return nil
+}
+
+func takePendingQuotaBatchAdjustments(userId int, tokenId int, unlimitedQuota bool) (int, int) {
+	if !config.BatchUpdateEnabled {
+		return 0, 0
+	}
+
+	pendingUserQuota := takeBatchUpdateRecord(BatchUpdateTypeUserQuota, userId)
+	pendingTokenQuota := 0
+	if !unlimitedQuota {
+		pendingTokenQuota = takeBatchUpdateRecord(BatchUpdateTypeTokenQuota, tokenId)
+	}
+	return pendingUserQuota, pendingTokenQuota
+}
+
+func restorePendingQuotaBatchAdjustments(userId int, tokenId int, unlimitedQuota bool, pendingUserQuota int, pendingTokenQuota int) {
+	if pendingUserQuota != 0 {
+		addNewRecord(BatchUpdateTypeUserQuota, userId, pendingUserQuota)
+	}
+	if !unlimitedQuota && pendingTokenQuota != 0 {
+		addNewRecord(BatchUpdateTypeTokenQuota, tokenId, pendingTokenQuota)
+	}
+}

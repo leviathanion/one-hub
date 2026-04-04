@@ -2,6 +2,7 @@ package relay_util
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -10,12 +11,17 @@ import (
 	"one-api/common/config"
 	"one-api/common/groupctx"
 	"one-api/common/logger"
+	commonredis "one-api/common/redis"
+	"one-api/internal/billing"
+	"one-api/internal/testutil/fakeredis"
 	"one-api/model"
 	"one-api/types"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 	"gorm.io/datatypes"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 )
 
 type quotaMoreContextKey string
@@ -57,7 +63,7 @@ func TestNewQuotaDetachesContextAndCopiesAffinityMetadata(t *testing.T) {
 	if quota == nil {
 		t.Fatal("expected NewQuota to build quota state")
 	}
-	if quota.userId != 11 || quota.channelId != 22 || quota.tokenId != 33 || !quota.unlimitedQuota {
+	if quota.userId != 11 || quota.channelId != 22 || quota.tokenId != 33 || quota.callerNS != "token:33" || !quota.unlimitedQuota {
 		t.Fatalf("expected quota identity fields to be copied from gin context, got %+v", quota)
 	}
 	if !quota.isBackupGroup || quota.tokenName != "token-alpha" || quota.groupName != "team-b" || quota.tokenGroupName != "team-a" || quota.backupGroupName != "team-b" {
@@ -128,9 +134,11 @@ func TestQuotaComputationMetadataAndRealtimeHelpers(t *testing.T) {
 	usageEvent := &types.UsageEvent{
 		InputTokens:  8,
 		OutputTokens: 3,
-		ExtraTokens: map[string]int{
-			config.UsageExtraInputAudio: 4,
-			config.UsageExtraReasoning:  2,
+		InputTokenDetails: types.PromptTokensDetails{
+			AudioTokens: 4,
+		},
+		OutputTokenDetails: types.CompletionTokensDetails{
+			ReasoningTokens: 2,
 		},
 	}
 	eventPromptTokens, eventCompletionTokens := quota.getComputeTokensByUsageEvent(usageEvent)
@@ -193,6 +201,128 @@ func TestQuotaComputationMetadataAndRealtimeHelpers(t *testing.T) {
 	}
 }
 
+func useQuotaReserveTestDB(t *testing.T) {
+	t.Helper()
+
+	logger.Logger = zap.NewNop()
+
+	originalDB := model.DB
+	testDB, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("expected in-memory sqlite database, got %v", err)
+	}
+	if err := testDB.AutoMigrate(&model.User{}, &model.Token{}); err != nil {
+		t.Fatalf("expected quota reserve schema migration to succeed, got %v", err)
+	}
+
+	model.DB = testDB
+	t.Cleanup(func() {
+		model.DB = originalDB
+	})
+}
+
+func insertQuotaReserveFixtures(t *testing.T, quota int) {
+	t.Helper()
+
+	if err := model.DB.Create(&model.User{
+		Id:          1,
+		Username:    "alice",
+		Password:    "password123",
+		AccessToken: "access-token-1",
+		Quota:       quota,
+		Group:       "default",
+		Status:      config.UserStatusEnabled,
+		Role:        config.RoleCommonUser,
+		DisplayName: "Alice",
+		CreatedTime: 1,
+	}).Error; err != nil {
+		t.Fatalf("expected user fixture to persist, got %v", err)
+	}
+	if err := model.DB.Session(&gorm.Session{SkipHooks: true}).Create(&model.Token{
+		Id:          1,
+		UserId:      1,
+		Key:         "token-key-1",
+		Name:        "token-alpha",
+		RemainQuota: quota,
+		Group:       "default",
+	}).Error; err != nil {
+		t.Fatalf("expected token fixture to persist, got %v", err)
+	}
+}
+
+func TestForcePreConsumeBypassesTrustedSkipForAsyncTasks(t *testing.T) {
+	useQuotaReserveTestDB(t)
+	insertQuotaReserveFixtures(t, 200000)
+
+	originalPricing := model.PricingInstance
+	originalBatch := config.BatchUpdateEnabled
+	originalRedisEnabled := config.RedisEnabled
+	model.PricingInstance = &model.Pricing{
+		Prices: map[string]*model.Price{
+			"task-model": {
+				Model: "task-model",
+				Type:  model.TimesPriceType,
+				Input: 1,
+			},
+		},
+	}
+	config.BatchUpdateEnabled = false
+	config.RedisEnabled = false
+	t.Cleanup(func() {
+		model.PricingInstance = originalPricing
+		config.BatchUpdateEnabled = originalBatch
+		config.RedisEnabled = originalRedisEnabled
+	})
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/tasks", nil)
+	ctx.Request.RemoteAddr = "203.0.113.10:1234"
+	ctx.Set("id", 1)
+	ctx.Set("channel_id", 1)
+	ctx.Set("token_id", 1)
+	ctx.Set("token_unlimited_quota", false)
+	ctx.Set("token_name", "token-alpha")
+	ctx.Set("group_ratio", 1.0)
+
+	trustedQuota := NewQuota(ctx, "task-model", 1000)
+	if errWithCode := trustedQuota.PreQuotaConsumption(); errWithCode != nil {
+		t.Fatalf("expected trusted pre-consume check to succeed, got %+v", errWithCode)
+	}
+
+	var user model.User
+	var token model.Token
+	if err := model.DB.First(&user, 1).Error; err != nil {
+		t.Fatalf("expected trusted user lookup to succeed, got %v", err)
+	}
+	if err := model.DB.First(&token, 1).Error; err != nil {
+		t.Fatalf("expected trusted token lookup to succeed, got %v", err)
+	}
+	if user.Quota != 200000 || token.RemainQuota != 200000 || token.UsedQuota != 0 {
+		t.Fatalf("expected trusted path to skip reserve, got user=%d token_remain=%d token_used=%d", user.Quota, token.RemainQuota, token.UsedQuota)
+	}
+
+	forcedQuota := NewQuota(ctx, "task-model", 1000)
+	forcedQuota.ForcePreConsume()
+	if errWithCode := forcedQuota.PreQuotaConsumption(); errWithCode != nil {
+		t.Fatalf("expected forced async reserve to succeed, got %+v", errWithCode)
+	}
+
+	if err := model.DB.First(&user, 1).Error; err != nil {
+		t.Fatalf("expected forced user lookup to succeed, got %v", err)
+	}
+	if err := model.DB.First(&token, 1).Error; err != nil {
+		t.Fatalf("expected forced token lookup to succeed, got %v", err)
+	}
+	if user.Quota != 199000 {
+		t.Fatalf("expected forced async reserve to debit user quota immediately, got %d", user.Quota)
+	}
+	if token.RemainQuota != 199000 || token.UsedQuota != 1000 {
+		t.Fatalf("expected forced async reserve to debit token quota immediately, got remain=%d used=%d", token.RemainQuota, token.UsedQuota)
+	}
+}
+
 func TestQuotaAdditionalNilAndRequestTimeBranches(t *testing.T) {
 	var nilQuota *Quota
 	if cloned := nilQuota.Clone(); cloned != nil {
@@ -210,5 +340,96 @@ func TestQuotaAdditionalNilAndRequestTimeBranches(t *testing.T) {
 
 	if got := (&Quota{}).getRequestTime(); got != 0 {
 		t.Fatalf("expected zero-value quotas to report zero request time, got %d", got)
+	}
+}
+
+func TestConsumeUsageSettlementReconcilesRealtimeQuotaOnError(t *testing.T) {
+	logger.Logger = zap.NewNop()
+
+	server, err := fakeredis.Start()
+	if err != nil {
+		t.Fatalf("expected fake redis server to start, got %v", err)
+	}
+	defer server.Close()
+	server.RegisterLuaScript(`
+		local key = KEYS[1]
+		local increment = tonumber(ARGV[1])
+		local expiration = tonumber(ARGV[2])
+
+		local exists = redis.call("EXISTS", key)
+		if exists == 0 then
+			if increment < 0 then
+				return 0
+			end
+			redis.call("SET", key, "0", "EX", expiration)
+		end
+
+		local newValue = redis.call("INCRBY", key, increment)
+		redis.call("EXPIRE", key, expiration)
+
+		return newValue
+	`, func(keys, args []string) int64 {
+		currentRaw, exists := server.GetRaw(keys[0])
+		currentValue := int64(0)
+		if exists {
+			fmt.Sscanf(currentRaw, "%d", &currentValue)
+		}
+		var increment int64
+		fmt.Sscanf(args[0], "%d", &increment)
+		if !exists && increment < 0 {
+			return 0
+		}
+		newValue := currentValue + increment
+		server.SetRaw(keys[0], fmt.Sprintf("%d", newValue))
+		return newValue
+	})
+
+	originalRedisEnabled := config.RedisEnabled
+	originalRedisClient := commonredis.RDB
+	originalDB := model.DB
+	config.RedisEnabled = true
+	commonredis.RDB = server.Client()
+	testDB, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("expected in-memory sqlite database, got %v", err)
+	}
+	model.DB = testDB
+	t.Cleanup(func() {
+		config.RedisEnabled = originalRedisEnabled
+		commonredis.RDB = originalRedisClient
+		model.DB = originalDB
+	})
+
+	realtimeKey := fmt.Sprintf(model.UserRealtimeQuotaKey, 1)
+	server.SetRaw(realtimeKey, "80")
+
+	quota := &Quota{
+		modelName:      "gpt-5",
+		price:          model.Price{Type: model.TokensPriceType, Input: 1, Output: 1},
+		inputRatio:     1,
+		outputRatio:    1,
+		userId:         1,
+		tokenId:        1,
+		channelId:      1,
+		cacheQuota:     80,
+		requestContext: context.Background(),
+	}
+
+	err = quota.ConsumeUsageWithIdentity(
+		&types.Usage{PromptTokens: 10, CompletionTokens: 10, TotalTokens: 20},
+		false,
+		billing.SettlementRequestKindRealtimeTurn,
+		"session-1:1:finalize",
+		false,
+	)
+	if err == nil {
+		t.Fatal("expected settlement to fail against an unmigrated database")
+	}
+
+	if quota.cacheQuota != 0 {
+		t.Fatalf("expected failed settlement to reconcile realtime cache, got %d", quota.cacheQuota)
+	}
+	if got, _ := server.GetRaw(realtimeKey); got != "0" {
+		t.Fatalf("expected realtime quota key to be cleared after settlement failure, got %q", got)
 	}
 }

@@ -123,3 +123,27 @@ func TestRealtimeTurnObserverFinalizeSeedsTimingWithoutPanicking(t *testing.T) {
 		t.Fatalf("expected finalize to preserve first response timing, got %d", observer.quota.GetFirstResponseTime())
 	}
 }
+
+func TestBuildRealtimeTurnSettlementIdentityIncludesCallerAndChannel(t *testing.T) {
+	payload := runtimesession.TurnFinalizePayload{
+		SessionID: "session-shared",
+		TurnSeq:   7,
+	}
+
+	first := buildRealtimeTurnSettlementIdentity(&Quota{callerNS: "token:1", channelId: 2}, payload)
+	second := buildRealtimeTurnSettlementIdentity(&Quota{callerNS: "token:2", channelId: 2}, payload)
+	third := buildRealtimeTurnSettlementIdentity(&Quota{callerNS: "token:1", channelId: 3}, payload)
+
+	if first == "" {
+		t.Fatal("expected realtime settlement identity to be built for valid session finalize payload")
+	}
+	if first == second {
+		t.Fatalf("expected caller namespace to separate realtime settlement identity, got %q", first)
+	}
+	if first == third {
+		t.Fatalf("expected channel id to separate realtime settlement identity, got %q", first)
+	}
+	if got := buildRealtimeTurnSettlementIdentity(&Quota{callerNS: "token:1", channelId: 2}, runtimesession.TurnFinalizePayload{SessionID: "session-shared"}); got != "" {
+		t.Fatalf("expected missing turn sequence to disable realtime settlement dedupe identity, got %q", got)
+	}
+}

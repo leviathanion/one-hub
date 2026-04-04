@@ -6,11 +6,14 @@ import (
 	"math"
 	"net/http"
 	"one-api/common"
+	"one-api/common/authutil"
 	"one-api/common/config"
 	"one-api/common/groupctx"
 	"one-api/common/logger"
+	"one-api/internal/billing"
 	"one-api/model"
 	"one-api/types"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -34,6 +37,7 @@ type Quota struct {
 	userId             int
 	channelId          int
 	tokenId            int
+	callerNS           string
 	unlimitedQuota     bool
 	HandelStatus       bool
 
@@ -46,6 +50,7 @@ type Quota struct {
 	requestContext    context.Context
 	tokenName         string
 	sourceIP          string
+	forcePreConsume   bool
 }
 
 func NewQuota(c *gin.Context, modelName string, promptTokens int) *Quota {
@@ -61,6 +66,7 @@ func NewQuota(c *gin.Context, modelName string, promptTokens int) *Quota {
 		userId:         c.GetInt("id"),
 		channelId:      c.GetInt("channel_id"),
 		tokenId:        c.GetInt("token_id"),
+		callerNS:       readQuotaCallerNamespace(c),
 		unlimitedQuota: c.GetBool("token_unlimited_quota"),
 		HandelStatus:   false,
 		isBackupGroup:  isBackupGroup, // 记录是否使用备用分组
@@ -90,6 +96,21 @@ func NewQuota(c *gin.Context, modelName string, promptTokens int) *Quota {
 
 }
 
+func readQuotaCallerNamespace(c *gin.Context) string {
+	if c != nil {
+		if tokenID := c.GetInt("token_id"); tokenID > 0 {
+			return "token:" + strconv.Itoa(tokenID)
+		}
+		if userID := c.GetInt("id"); userID > 0 {
+			return "user:" + strconv.Itoa(userID)
+		}
+		if namespace := authutil.StableRequestCredentialNamespace(c.Request); namespace != "" {
+			return namespace
+		}
+	}
+	return "anonymous"
+}
+
 func (q *Quota) Clone() *Quota {
 	if q == nil {
 		return nil
@@ -108,6 +129,15 @@ func (q *Quota) Clone() *Quota {
 	cloned.requestContext = detachQuotaContext(q.requestContext)
 
 	return &cloned
+}
+
+// Detached async tasks must hold quota synchronously because final settlement can
+// be delayed or retried outside the submit request lifecycle.
+func (q *Quota) ForcePreConsume() {
+	if q == nil {
+		return
+	}
+	q.forcePreConsume = true
 }
 
 func (q *Quota) PreQuotaConsumption() *types.OpenAIErrorWithStatusCode {
@@ -130,7 +160,7 @@ func (q *Quota) PreQuotaConsumption() *types.OpenAIErrorWithStatusCode {
 		return common.ErrorWrapper(errors.New("user quota is not enough"), "insufficient_user_quota", http.StatusPaymentRequired)
 	}
 
-	if userQuota > 100*q.preConsumedQuota {
+	if !q.forcePreConsume && userQuota > 100*q.preConsumedQuota {
 		// in this case, we do not pre-consume quota
 		// because the user has enough quota
 		q.preConsumedQuota = 0
@@ -184,53 +214,6 @@ func (q *Quota) UpdateUserRealtimeQuota(usage *types.UsageEvent, nowUsage *types
 	return nil
 }
 
-func (q *Quota) completedQuotaConsumption(usage *types.Usage, tokenName string, isStream bool, sourceIp string, ctx context.Context) error {
-	defer func() {
-		if q.cacheQuota > 0 {
-			model.CacheDecreaseUserRealtimeQuota(q.userId, q.cacheQuota)
-		}
-	}()
-
-	quota := q.GetTotalQuotaByUsage(usage)
-
-	if quota > 0 {
-		quotaDelta := quota - q.preConsumedQuota
-		err := model.PostConsumeTokenQuotaWithInfo(q.tokenId, q.userId, q.unlimitedQuota, quotaDelta)
-		if err != nil {
-			return errors.New("error consuming token remain quota: " + err.Error())
-		}
-
-		if config.RedisEnabled {
-			// Always reconcile against DB after a successful consume to heal any cache drift.
-			err = model.CacheUpdateUserQuota(q.userId)
-			if err != nil {
-				return errors.New("error refresh user quota cache: " + err.Error())
-			}
-		}
-
-		model.UpdateChannelUsedQuota(q.channelId, quota)
-	}
-
-	model.RecordConsumeLog(
-		ctx,
-		q.userId,
-		q.channelId,
-		usage.PromptTokens,
-		usage.CompletionTokens,
-		q.modelName,
-		tokenName,
-		quota,
-		"",
-		q.getRequestTime(),
-		isStream,
-		q.GetLogMeta(usage),
-		sourceIp,
-	)
-	model.UpdateUserUsedQuotaAndRequestCount(q.userId, quota)
-
-	return nil
-}
-
 func (q *Quota) Undo(c *gin.Context) {
 	if q.HandelStatus {
 		go func(ctx context.Context) {
@@ -262,19 +245,83 @@ func (q *Quota) Consume(c *gin.Context, usage *types.Usage, isStream bool) {
 }
 
 func (q *Quota) ConsumeUsage(usage *types.Usage, isStream bool) {
-	tokenName := q.tokenName
+	if err := q.consumeUsageSettlement(usage, isStream, billing.SettlementRequestKindUnary, "", false); err != nil {
+		logger.LogError(q.requestContext, err.Error())
+	}
+}
+
+func (q *Quota) ConsumeUsageWithIdentity(usage *types.Usage, isStream bool, requestKind billing.SettlementRequestKind, identity string, deduplicate bool) error {
+	return q.consumeUsageSettlement(usage, isStream, requestKind, identity, deduplicate)
+}
+
+func (q *Quota) BuildSettlementEnvelope(usage *types.Usage, isStream bool, requestKind billing.SettlementRequestKind, identity string, deduplicate bool) *billing.SettlementEnvelope {
+	if q == nil {
+		return nil
+	}
+
+	if usage == nil {
+		usage = &types.Usage{}
+	}
+
+	finalQuota := q.GetTotalQuotaByUsage(usage)
+	return &billing.SettlementEnvelope{
+		Command: billing.SettlementCommand{
+			Identity:         identity,
+			RequestKind:      requestKind,
+			UserID:           q.userId,
+			TokenID:          q.tokenId,
+			ChannelID:        q.channelId,
+			ModelName:        q.modelName,
+			PreConsumedQuota: q.preConsumedQuota,
+			FinalQuota:       finalQuota,
+			UsageSummary:     billing.NewUsageSummary(usage),
+			UnlimitedQuota:   q.unlimitedQuota,
+		},
+		Options: billing.SettlementOptions{
+			Deduplicate: deduplicate,
+			Cleanup: billing.SettlementCleanup{
+				RealtimeQuotaDelta:    q.cacheQuota,
+				RefreshUserQuotaCache: config.RedisEnabled,
+			},
+			Projection: billing.SettlementProjection{
+				TokenName:   q.tokenName,
+				RequestTime: q.getRequestTime(),
+				IsStream:    isStream,
+				Metadata:    q.GetLogMeta(usage),
+				SourceIP:    q.sourceIP,
+			},
+		},
+	}
+}
+
+func (q *Quota) consumeUsageSettlement(usage *types.Usage, isStream bool, requestKind billing.SettlementRequestKind, identity string, deduplicate bool) error {
+	if q == nil {
+		return nil
+	}
+
 	q.requestContext = detachQuotaContext(q.requestContext)
 	if q.startTime.IsZero() {
 		q.startTime = time.Now()
 	}
 
-	// 如果没有报错，则消费配额
-	go func(ctx context.Context) {
-		err := q.completedQuotaConsumption(usage, tokenName, isStream, q.sourceIP, ctx)
-		if err != nil {
-			logger.LogError(ctx, err.Error())
+	envelope := q.BuildSettlementEnvelope(usage, isStream, requestKind, identity, deduplicate)
+	if envelope == nil {
+		return nil
+	}
+
+	result, err := billing.ApplySettlement(q.requestContext, envelope.Command, &envelope.Options)
+	if err != nil {
+		q.reconcileRealtimeQuotaCache()
+		return errors.New("error applying settlement: " + err.Error())
+	}
+	if result.TruthApplied {
+		if q.cacheQuota > 0 {
+			q.cacheQuota = 0
 		}
-	}(q.requestContext)
+		return nil
+	}
+	q.reconcileRealtimeQuotaCache()
+	return nil
 }
 
 func detachQuotaContext(ctx context.Context) context.Context {
@@ -282,6 +329,18 @@ func detachQuotaContext(ctx context.Context) context.Context {
 		return context.Background()
 	}
 	return context.WithoutCancel(ctx)
+}
+
+func (q *Quota) reconcileRealtimeQuotaCache() {
+	if q == nil || q.cacheQuota <= 0 {
+		return
+	}
+
+	if _, err := model.CacheDecreaseUserRealtimeQuota(q.userId, q.cacheQuota); err != nil {
+		logger.LogError(q.requestContext, "error reconcile realtime quota cache: "+err.Error())
+		return
+	}
+	q.cacheQuota = 0
 }
 
 func cloneQuotaPrice(price model.Price) model.Price {
