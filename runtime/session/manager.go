@@ -14,6 +14,10 @@ type CleanupFunc func(*ExecutionSession)
 
 var ErrCapacityExceeded = errors.New("execution session capacity exceeded")
 var ErrCallerCapacityExceeded = errors.New("execution session caller capacity exceeded")
+var errRestartDecision = errors.New("execution session restart decision")
+
+const defaultExecutionSessionRevocationTimeout = 200 * time.Millisecond
+const finalLatestTruthReobserveBudget = 2
 
 type ManagerOptions struct {
 	DefaultTTL           time.Duration
@@ -23,6 +27,7 @@ type ManagerOptions struct {
 	MaxSessionsPerCaller int
 	RedisClient          *redis.Client
 	RedisPrefix          string
+	RevocationTimeout    time.Duration
 }
 
 type Stats struct {
@@ -41,15 +46,14 @@ type Manager struct {
 	bindings      map[string]*Binding
 	index         map[string]map[string]struct{}
 	capacityIndex map[string]map[string]struct{}
+	remoteMu      sync.RWMutex
 
 	defaultTTL           time.Duration
 	janitorInterval      time.Duration
 	maxSessions          int
 	maxSessionsPerCaller int
 	cleanup              CleanupFunc
-	redisClient          *redis.Client
-	redisPrefix          string
-	backend              bindingBackend
+	remoteConfig         managerRemoteConfig
 	stopCh               chan struct{}
 	stopOnce             sync.Once
 }
@@ -57,6 +61,16 @@ type Manager struct {
 type pendingBindingDelete struct {
 	bindingKey string
 	sessionKey string
+}
+
+type managerRemoteConfig struct {
+	backend           bindingBackend
+	revocationTimeout time.Duration
+}
+
+type revocationCandidate struct {
+	sessionKey string
+	session    *ExecutionSession
 }
 
 func NewManager(defaultTTL, janitorInterval time.Duration, cleanup CleanupFunc) *Manager {
@@ -78,10 +92,11 @@ func NewManagerWithOptions(options ManagerOptions) *Manager {
 		maxSessions:          options.MaxSessions,
 		maxSessionsPerCaller: options.MaxSessionsPerCaller,
 		cleanup:              options.Cleanup,
-		redisClient:          options.RedisClient,
-		redisPrefix:          normalizeSessionRedisPrefix(options.RedisPrefix),
-		backend:              newRedisBindingBackend(options.RedisClient, options.RedisPrefix),
-		stopCh:               make(chan struct{}),
+		remoteConfig: managerRemoteConfig{
+			backend:           newRedisBindingBackend(options.RedisClient, options.RedisPrefix),
+			revocationTimeout: normalizeRevocationTimeout(options.RevocationTimeout),
+		},
+		stopCh: make(chan struct{}),
 	}
 
 	if options.JanitorInterval > 0 {
@@ -91,45 +106,89 @@ func NewManagerWithOptions(options ManagerOptions) *Manager {
 	return m
 }
 
+func normalizeRevocationTimeout(timeout time.Duration) time.Duration {
+	if timeout <= 0 {
+		return defaultExecutionSessionRevocationTimeout
+	}
+	return timeout
+}
+
+func (m *Manager) remoteConfigSnapshot() managerRemoteConfig {
+	if m == nil {
+		return managerRemoteConfig{revocationTimeout: defaultExecutionSessionRevocationTimeout}
+	}
+	m.remoteMu.RLock()
+	defer m.remoteMu.RUnlock()
+	return m.remoteConfig
+}
+
+func (m *Manager) configureRemote(client *redis.Client, prefix string, revocationTimeout time.Duration) {
+	if m == nil {
+		return
+	}
+	m.remoteMu.Lock()
+	m.remoteConfig = managerRemoteConfig{
+		backend:           newRedisBindingBackend(client, prefix),
+		revocationTimeout: normalizeRevocationTimeout(revocationTimeout),
+	}
+	m.remoteMu.Unlock()
+}
+
+func (m *Manager) revocationContext(timeout time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), normalizeRevocationTimeout(timeout))
+}
+
+func (m *Manager) checkRevocationWithConfig(config managerRemoteConfig, sessionKey string) RevocationStatus {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return RevocationNotRevoked
+	}
+	if m == nil || config.backend == nil {
+		return RevocationNotRevoked
+	}
+	ctx, cancel := m.revocationContext(config.revocationTimeout)
+	defer cancel()
+	return config.backend.RevocationStatus(ctx, sessionKey)
+}
+
+func (m *Manager) revocationStatusesWithConfig(config managerRemoteConfig, sessionKeys []string) []RevocationStatus {
+	statuses := make([]RevocationStatus, len(sessionKeys))
+	if len(sessionKeys) == 0 {
+		return statuses
+	}
+	if m == nil || config.backend == nil {
+		for i := range statuses {
+			statuses[i] = RevocationNotRevoked
+		}
+		return statuses
+	}
+
+	if bulk, ok := config.backend.(bulkRevocationBackend); ok {
+		ctx, cancel := m.revocationContext(config.revocationTimeout)
+		result, err := bulk.RevocationStatuses(ctx, sessionKeys)
+		cancel()
+		if err == nil && len(result) == len(sessionKeys) {
+			return result
+		}
+		for i := range statuses {
+			statuses[i] = RevocationUnknown
+		}
+		return statuses
+	}
+
+	for i, sessionKey := range sessionKeys {
+		statuses[i] = m.checkRevocationWithConfig(config, sessionKey)
+	}
+	return statuses
+}
+
 func (m *Manager) GetOrCreate(meta Metadata) (*ExecutionSession, bool, error) {
-	now := time.Now()
-	toCleanup := make([]*ExecutionSession, 0, 1)
-	pendingDeletes := make([]pendingBindingDelete, 0, 1)
-
-	m.mu.Lock()
-	sess, created, err := m.getOrCreateLocked(meta, now, &toCleanup, &pendingDeletes)
-	m.mu.Unlock()
-
-	m.applyPendingBindingDeletes(pendingDeletes)
-	m.cleanupSessions(toCleanup)
+	sess, created, _, err := m.getOrCreateInternal(meta, false)
 	return sess, created, err
 }
 
 func (m *Manager) AcquireOrCreate(meta Metadata) (*ExecutionSession, bool, func(), error) {
-	now := time.Now()
-	toCleanup := make([]*ExecutionSession, 0, 1)
-	pendingDeletes := make([]pendingBindingDelete, 0, 1)
-
-	m.mu.Lock()
-	sess, created, err := m.getOrCreateLocked(meta, now, &toCleanup, &pendingDeletes)
-	if err != nil {
-		m.mu.Unlock()
-		m.applyPendingBindingDeletes(pendingDeletes)
-		m.cleanupSessions(toCleanup)
-		return nil, false, nil, err
-	}
-	sess.reserveLease()
-	m.mu.Unlock()
-
-	m.applyPendingBindingDeletes(pendingDeletes)
-	m.cleanupSessions(toCleanup)
-
-	var releaseOnce sync.Once
-	return sess, created, func() {
-		releaseOnce.Do(func() {
-			sess.releaseLease()
-		})
-	}, nil
+	return m.getOrCreateInternal(meta, true)
 }
 
 func (m *Manager) AcquireExisting(sessionKey string) (*ExecutionSession, func(), bool) {
@@ -137,17 +196,38 @@ func (m *Manager) AcquireExisting(sessionKey string) (*ExecutionSession, func(),
 		return nil, nil, false
 	}
 
+	config := m.remoteConfigSnapshot()
 	now := time.Now()
 	toCleanup := make([]*ExecutionSession, 0, 1)
 	pendingDeletes := make([]pendingBindingDelete, 0, 1)
 
 	m.mu.Lock()
-	sess := m.sessions[sessionKey]
+	sess := m.liveLocalSessionLocked(sessionKey, now, &toCleanup, &pendingDeletes)
 	if sess == nil {
 		m.mu.Unlock()
+		m.applyPendingBindingDeletes(pendingDeletes)
+		m.cleanupSessions(toCleanup)
 		return nil, nil, false
 	}
-	if m.sessionExpiredLocked(sess, now) {
+	if config.backend == nil {
+		sess.reserveLease()
+		m.mu.Unlock()
+		return sess, newLeaseRelease(sess), true
+	}
+	expected := sess
+	m.mu.Unlock()
+
+	status := m.checkRevocationWithConfig(config, sessionKey)
+
+	m.mu.Lock()
+	sess = m.sessions[sessionKey]
+	if sess != expected {
+		m.mu.Unlock()
+		m.applyPendingBindingDeletes(pendingDeletes)
+		m.cleanupSessions(toCleanup)
+		return nil, nil, false
+	}
+	if status == RevocationRevoked || m.sessionLocallyExpiredLocked(sess, time.Now()) {
 		if removed, deletes := m.deleteSessionLocked(sessionKey); removed != nil {
 			toCleanup = append(toCleanup, removed)
 			pendingDeletes = append(pendingDeletes, deletes...)
@@ -160,93 +240,18 @@ func (m *Manager) AcquireExisting(sessionKey string) (*ExecutionSession, func(),
 	sess.reserveLease()
 	m.mu.Unlock()
 
-	var releaseOnce sync.Once
-	return sess, func() {
-		releaseOnce.Do(func() {
-			sess.releaseLease()
-		})
-	}, true
+	m.applyPendingBindingDeletes(pendingDeletes)
+	m.cleanupSessions(toCleanup)
+	return sess, newLeaseRelease(sess), true
 }
 
 func (m *Manager) GetOrCreateBound(meta Metadata) (*ExecutionSession, bool, *Binding, error) {
-	now := time.Now()
-	toCleanup := make([]*ExecutionSession, 0, 1)
-	pendingDeletes := make([]pendingBindingDelete, 0, 1)
-
-	m.mu.Lock()
-	binding := m.liveLocalBindingLocked(meta.BindingKey, now, &toCleanup, &pendingDeletes)
-	if binding != nil && binding.SessionKey != meta.Key {
-		copyBinding := *binding
-		m.mu.Unlock()
-		m.applyPendingBindingDeletes(pendingDeletes)
-		m.cleanupSessions(toCleanup)
-		return nil, false, &copyBinding, nil
-	}
-
-	sess, created, err := m.getOrCreateLocked(meta, now, &toCleanup, &pendingDeletes)
-	if err != nil {
-		m.mu.Unlock()
-		m.applyPendingBindingDeletes(pendingDeletes)
-		m.cleanupSessions(toCleanup)
-		return nil, false, nil, err
-	}
-	if strings.TrimSpace(meta.BindingKey) != "" {
-		if strings.TrimSpace(sess.BindingKey) == "" {
-			sess.BindingKey = meta.BindingKey
-		}
-		if binding == nil || binding.SessionKey != sess.Key {
-			m.upsertBindingLocked(sess)
-		}
-	}
-	m.mu.Unlock()
-
-	m.applyPendingBindingDeletes(pendingDeletes)
-	m.cleanupSessions(toCleanup)
-	return sess, created, nil, nil
+	sess, created, conflict, _, err := m.getOrCreateBoundInternal(meta, false)
+	return sess, created, conflict, err
 }
 
 func (m *Manager) AcquireOrCreateBound(meta Metadata) (*ExecutionSession, bool, *Binding, func(), error) {
-	now := time.Now()
-	toCleanup := make([]*ExecutionSession, 0, 1)
-	pendingDeletes := make([]pendingBindingDelete, 0, 1)
-
-	m.mu.Lock()
-	binding := m.liveLocalBindingLocked(meta.BindingKey, now, &toCleanup, &pendingDeletes)
-	if binding != nil && binding.SessionKey != meta.Key {
-		copyBinding := *binding
-		m.mu.Unlock()
-		m.applyPendingBindingDeletes(pendingDeletes)
-		m.cleanupSessions(toCleanup)
-		return nil, false, &copyBinding, nil, nil
-	}
-
-	sess, created, err := m.getOrCreateLocked(meta, now, &toCleanup, &pendingDeletes)
-	if err != nil {
-		m.mu.Unlock()
-		m.applyPendingBindingDeletes(pendingDeletes)
-		m.cleanupSessions(toCleanup)
-		return nil, false, nil, nil, err
-	}
-	if strings.TrimSpace(meta.BindingKey) != "" {
-		if strings.TrimSpace(sess.BindingKey) == "" {
-			sess.BindingKey = meta.BindingKey
-		}
-		if binding == nil || binding.SessionKey != sess.Key {
-			m.upsertBindingLocked(sess)
-		}
-	}
-	sess.reserveLease()
-	m.mu.Unlock()
-
-	m.applyPendingBindingDeletes(pendingDeletes)
-	m.cleanupSessions(toCleanup)
-
-	var releaseOnce sync.Once
-	return sess, created, nil, func() {
-		releaseOnce.Do(func() {
-			sess.releaseLease()
-		})
-	}, nil
+	return m.getOrCreateBoundInternal(meta, true)
 }
 
 func (m *Manager) Delete(key string) *ExecutionSession {
@@ -347,16 +352,16 @@ func (m *Manager) Close() {
 	})
 }
 
+func (m *Manager) ConfigureRemote(client *redis.Client, prefix string, revocationTimeout time.Duration) {
+	m.configureRemote(client, prefix, revocationTimeout)
+}
+
 func (m *Manager) ConfigureRedis(client *redis.Client, prefix string) {
 	if m == nil {
 		return
 	}
-
-	m.mu.Lock()
-	m.redisClient = client
-	m.redisPrefix = normalizeSessionRedisPrefix(prefix)
-	m.backend = newRedisBindingBackend(client, prefix)
-	m.mu.Unlock()
+	config := m.remoteConfigSnapshot()
+	m.configureRemote(client, prefix, config.revocationTimeout)
 }
 
 func (m *Manager) Stats() Stats {
@@ -373,12 +378,12 @@ func (m *Manager) Stats() Stats {
 		MaxSessionsPerCaller: m.maxSessionsPerCaller,
 		DefaultTTLSeconds:    int64(m.defaultTTL / time.Second),
 	}
-	hasRedis := m.backend != nil
 	m.mu.RUnlock()
 
-	if hasRedis {
+	config := m.remoteConfigSnapshot()
+	if config.backend != nil {
 		stats.Backend = "redis"
-		stats.BackendBindings = m.backend.CountBindings(context.Background())
+		stats.BackendBindings = config.backend.CountBindings(context.Background())
 	}
 
 	return stats
@@ -391,10 +396,7 @@ func (m *Manager) Sweep(now time.Time) int {
 
 	toCleanup := make([]*ExecutionSession, 0)
 	pendingDeletes := make([]pendingBindingDelete, 0)
-
-	m.mu.Lock()
-	m.collectExpiredSessionsLocked(now, &toCleanup, &pendingDeletes)
-	m.mu.Unlock()
+	m.collectExpiredSessions(now, m.remoteConfigSnapshot(), &toCleanup, &pendingDeletes)
 
 	m.applyPendingBindingDeletes(pendingDeletes)
 	m.cleanupSessions(toCleanup)
@@ -429,104 +431,77 @@ func (m *Manager) ResolveBinding(bindingKey string) (*Binding, ResolveStatus) {
 		return nil, ResolveMiss
 	}
 
-	if m.backend != nil {
-		return m.backend.ResolveBinding(context.Background(), bindingKey)
+	config := m.remoteConfigSnapshot()
+	if config.backend != nil {
+		return config.backend.ResolveBinding(context.Background(), bindingKey)
 	}
-
-	now := time.Now()
-	toCleanup := make([]*ExecutionSession, 0, 1)
-	pendingDeletes := make([]pendingBindingDelete, 0, 1)
-
-	m.mu.Lock()
-	binding := m.liveLocalBindingLocked(bindingKey, now, &toCleanup, &pendingDeletes)
-	if binding == nil {
-		m.mu.Unlock()
-		m.applyPendingBindingDeletes(pendingDeletes)
-		m.cleanupSessions(toCleanup)
-		return nil, ResolveMiss
-	}
-	copyBinding := *binding
-	m.mu.Unlock()
-
+	binding, pendingDeletes, toCleanup := m.resolveLiveLocalBinding(bindingKey, config)
 	m.applyPendingBindingDeletes(pendingDeletes)
 	m.cleanupSessions(toCleanup)
-	return &copyBinding, ResolveHit
+	if binding == nil {
+		return nil, ResolveMiss
+	}
+	return binding, ResolveHit
 }
 
 func (m *Manager) ResolveLocal(bindingKey string) (*Binding, bool) {
 	if strings.TrimSpace(bindingKey) == "" {
 		return nil, false
 	}
-
-	now := time.Now()
-	toCleanup := make([]*ExecutionSession, 0, 1)
-	pendingDeletes := make([]pendingBindingDelete, 0, 1)
-
-	m.mu.Lock()
-	binding := m.liveLocalBindingLocked(bindingKey, now, &toCleanup, &pendingDeletes)
-	if binding == nil {
-		m.mu.Unlock()
-		m.applyPendingBindingDeletes(pendingDeletes)
-		m.cleanupSessions(toCleanup)
-		return nil, false
-	}
-	copyBinding := *binding
-	m.mu.Unlock()
-
+	binding, pendingDeletes, toCleanup := m.resolveLiveLocalBinding(bindingKey, m.remoteConfigSnapshot())
 	m.applyPendingBindingDeletes(pendingDeletes)
 	m.cleanupSessions(toCleanup)
-	return &copyBinding, true
+	return binding, binding != nil
 }
 
 func (m *Manager) CheckRevocation(sessionKey string) RevocationStatus {
-	if strings.TrimSpace(sessionKey) == "" {
-		return RevocationNotRevoked
-	}
-	if m == nil || m.backend == nil {
-		return RevocationNotRevoked
-	}
-	return m.backend.RevocationStatus(context.Background(), sessionKey)
+	return m.checkRevocationWithConfig(m.remoteConfigSnapshot(), sessionKey)
 }
 
 func (m *Manager) CreateBindingIfAbsent(binding *Binding, ttl time.Duration) BindingWriteStatus {
 	if binding == nil {
 		return BindingWriteBackendError
 	}
-	if m == nil || m.backend == nil {
+	config := m.remoteConfigSnapshot()
+	if m == nil || config.backend == nil {
 		return BindingWriteApplied
 	}
-	return m.backend.CreateBindingIfAbsent(context.Background(), binding, ttl)
+	return config.backend.CreateBindingIfAbsent(context.Background(), binding, ttl)
 }
 
 func (m *Manager) ReplaceBindingIfSessionMatches(bindingKey, expectedSessionKey string, replacement *Binding, ttl time.Duration) BindingWriteStatus {
 	if replacement == nil {
 		return BindingWriteBackendError
 	}
-	if m == nil || m.backend == nil {
+	config := m.remoteConfigSnapshot()
+	if m == nil || config.backend == nil {
 		return BindingWriteApplied
 	}
-	return m.backend.ReplaceBindingIfSessionMatches(context.Background(), bindingKey, expectedSessionKey, replacement, ttl)
+	return config.backend.ReplaceBindingIfSessionMatches(context.Background(), bindingKey, expectedSessionKey, replacement, ttl)
 }
 
 func (m *Manager) DeleteBindingIfSessionMatches(bindingKey, expectedSessionKey string) BindingWriteStatus {
-	if m == nil || m.backend == nil {
+	config := m.remoteConfigSnapshot()
+	if m == nil || config.backend == nil {
 		return BindingWriteApplied
 	}
-	return m.backend.DeleteBindingIfSessionMatches(context.Background(), bindingKey, expectedSessionKey)
+	return config.backend.DeleteBindingIfSessionMatches(context.Background(), bindingKey, expectedSessionKey)
 }
 
 func (m *Manager) TouchBindingIfSessionMatches(bindingKey, expectedSessionKey string, ttl time.Duration) BindingWriteStatus {
-	if m == nil || m.backend == nil {
+	config := m.remoteConfigSnapshot()
+	if m == nil || config.backend == nil {
 		return BindingWriteApplied
 	}
-	return m.backend.TouchBindingIfSessionMatches(context.Background(), bindingKey, expectedSessionKey, ttl)
+	return config.backend.TouchBindingIfSessionMatches(context.Background(), bindingKey, expectedSessionKey, ttl)
 }
 
 func (m *Manager) DeleteBindingAndRevokeIfSessionMatches(bindingKey, expectedSessionKey string, revokeTTL time.Duration) BindingWriteStatus {
-	if m == nil || m.backend == nil {
+	config := m.remoteConfigSnapshot()
+	if m == nil || config.backend == nil {
 		return BindingWriteApplied
 	}
-	return m.backend.DeleteBindingAndRevokeIfSessionMatches(context.Background(), bindingKey, expectedSessionKey, revokeTTL)
+	return config.backend.DeleteBindingAndRevokeIfSessionMatches(context.Background(), bindingKey, expectedSessionKey, revokeTTL)
 }
 
 func (m *Manager) RevocationTTLForSession(sessionKey string) time.Duration {
@@ -600,31 +575,6 @@ func (m *Manager) upsertBindingLocked(sess *ExecutionSession) {
 	m.addBindingIndexLocked(sess.Key, bindingKey)
 }
 
-func (m *Manager) getOrCreateLocked(meta Metadata, now time.Time, toCleanup *[]*ExecutionSession, pendingDeletes *[]pendingBindingDelete) (*ExecutionSession, bool, error) {
-	if sess := m.sessions[meta.Key]; sess != nil {
-		if !m.sessionExpiredLocked(sess, now) {
-			return sess, false, nil
-		}
-		if removed, deletes := m.deleteSessionLocked(meta.Key); removed != nil {
-			*toCleanup = append(*toCleanup, removed)
-			*pendingDeletes = append(*pendingDeletes, deletes...)
-		}
-	}
-
-	if err := m.ensureCallerCapacityLocked(capacityNamespaceForMetadata(meta), now, toCleanup, pendingDeletes); err != nil {
-		return nil, false, err
-	}
-	if err := m.ensureCapacityLocked(now, toCleanup, pendingDeletes); err != nil {
-		return nil, false, err
-	}
-
-	sess := NewExecutionSession(meta)
-	m.sessions[meta.Key] = sess
-	m.addCapacityIndexLocked(sess)
-	m.upsertBindingLocked(sess)
-	return sess, true, nil
-}
-
 func (m *Manager) liveLocalBindingLocked(bindingKey string, now time.Time, toCleanup *[]*ExecutionSession, pendingDeletes *[]pendingBindingDelete) *Binding {
 	if strings.TrimSpace(bindingKey) == "" {
 		return nil
@@ -635,32 +585,36 @@ func (m *Manager) liveLocalBindingLocked(bindingKey string, now time.Time, toCle
 		return nil
 	}
 
-	sess := m.sessions[binding.SessionKey]
+	sess := m.liveLocalSessionLocked(binding.SessionKey, now, toCleanup, pendingDeletes)
 	if sess == nil {
-		m.removeBindingIndexLocked(binding.SessionKey, bindingKey)
-		delete(m.bindings, bindingKey)
+		if current := m.bindings[bindingKey]; current != nil && current.SessionKey == binding.SessionKey {
+			m.removeBindingIndexLocked(binding.SessionKey, bindingKey)
+			delete(m.bindings, bindingKey)
+		}
 		return nil
 	}
+	return binding
+}
 
-	if !m.sessionExpiredLocked(sess, now) {
-		return binding
+func (m *Manager) liveLocalSessionLocked(sessionKey string, now time.Time, toCleanup *[]*ExecutionSession, pendingDeletes *[]pendingBindingDelete) *ExecutionSession {
+	if strings.TrimSpace(sessionKey) == "" {
+		return nil
 	}
-
-	if removed, deletes := m.deleteSessionLocked(binding.SessionKey); removed != nil {
-		*toCleanup = append(*toCleanup, removed)
-		*pendingDeletes = append(*pendingDeletes, deletes...)
+	sess := m.sessions[sessionKey]
+	if sess == nil {
+		return nil
 	}
+	if !m.sessionLocallyExpiredLocked(sess, now) {
+		return sess
+	}
+	m.appendDeletedSessionLocked(sessionKey, toCleanup, pendingDeletes)
 	return nil
 }
 
-func (m *Manager) sessionExpiredLocked(sess *ExecutionSession, now time.Time) bool {
+func (m *Manager) sessionLocallyExpiredLocked(sess *ExecutionSession, now time.Time) bool {
 	if sess == nil {
 		return true
 	}
-	if m.CheckRevocation(sess.Key) == RevocationRevoked {
-		return true
-	}
-
 	if !sess.TryLock() {
 		return false
 	}
@@ -669,46 +623,649 @@ func (m *Manager) sessionExpiredLocked(sess *ExecutionSession, now time.Time) bo
 	return expired
 }
 
-func (m *Manager) collectExpiredSessionsLocked(now time.Time, toCleanup *[]*ExecutionSession, pendingDeletes *[]pendingBindingDelete) {
+func (m *Manager) collectExpiredSessionsLocked(now time.Time, toCleanup *[]*ExecutionSession, pendingDeletes *[]pendingBindingDelete) []revocationCandidate {
+	candidates := make([]revocationCandidate, 0, len(m.sessions))
 	for key, sess := range m.sessions {
-		if !m.sessionExpiredLocked(sess, now) {
+		if !m.sessionLocallyExpiredLocked(sess, now) {
+			candidates = append(candidates, revocationCandidate{sessionKey: key, session: sess})
 			continue
 		}
-		if removed, deletes := m.deleteSessionLocked(key); removed != nil {
-			*toCleanup = append(*toCleanup, removed)
-			*pendingDeletes = append(*pendingDeletes, deletes...)
+		m.appendDeletedSessionLocked(key, toCleanup, pendingDeletes)
+	}
+	return candidates
+}
+
+func (m *Manager) collectExpiredSessions(now time.Time, config managerRemoteConfig, toCleanup *[]*ExecutionSession, pendingDeletes *[]pendingBindingDelete) {
+	if m == nil {
+		return
+	}
+
+	m.mu.Lock()
+	candidates := m.collectExpiredSessionsLocked(now, toCleanup, pendingDeletes)
+	m.mu.Unlock()
+
+	if config.backend == nil || len(candidates) == 0 {
+		return
+	}
+
+	sessionKeys := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		sessionKeys = append(sessionKeys, candidate.sessionKey)
+	}
+	statuses := m.revocationStatusesWithConfig(config, sessionKeys)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for i, candidate := range candidates {
+		if i >= len(statuses) {
+			break
+		}
+		current := m.sessions[candidate.sessionKey]
+		if current != candidate.session {
+			continue
+		}
+		if statuses[i] != RevocationRevoked && !m.sessionLocallyExpiredLocked(current, now) {
+			continue
+		}
+		m.appendDeletedSessionLocked(candidate.sessionKey, toCleanup, pendingDeletes)
+	}
+}
+
+func (m *Manager) appendDeletedSessionLocked(sessionKey string, toCleanup *[]*ExecutionSession, pendingDeletes *[]pendingBindingDelete) *ExecutionSession {
+	removed, deletes := m.deleteSessionLocked(sessionKey)
+	if removed != nil {
+		*toCleanup = append(*toCleanup, removed)
+		*pendingDeletes = append(*pendingDeletes, deletes...)
+	}
+	return removed
+}
+
+func newLeaseRelease(sess *ExecutionSession) func() {
+	var releaseOnce sync.Once
+	return func() {
+		releaseOnce.Do(func() {
+			sess.releaseLease()
+		})
+	}
+}
+
+func observeBudgetForAttempt(allowRestart bool) int {
+	if allowRestart {
+		return 1
+	}
+	return finalLatestTruthReobserveBudget
+}
+
+func bindingObservationSessionKey(binding *Binding) string {
+	if binding == nil {
+		return ""
+	}
+	return strings.TrimSpace(binding.SessionKey)
+}
+
+func bindingMatchesObservedSessionKey(current *Binding, observedSessionKey string) bool {
+	observedSessionKey = strings.TrimSpace(observedSessionKey)
+	if observedSessionKey == "" {
+		return current == nil
+	}
+	return current != nil && current.SessionKey == observedSessionKey
+}
+
+func (m *Manager) observeReusableSession(sessionKey string, config managerRemoteConfig, reserveLease bool, toCleanup *[]*ExecutionSession, pendingDeletes *[]pendingBindingDelete) (*ExecutionSession, bool) {
+	now := time.Now()
+	m.mu.Lock()
+	sess := m.liveLocalSessionLocked(sessionKey, now, toCleanup, pendingDeletes)
+	if sess == nil {
+		m.mu.Unlock()
+		return nil, false
+	}
+	if config.backend == nil {
+		if reserveLease {
+			sess.reserveLease()
+		}
+		m.mu.Unlock()
+		return sess, false
+	}
+
+	expected := sess
+	m.mu.Unlock()
+	status := m.checkRevocationWithConfig(config, sessionKey)
+
+	m.mu.Lock()
+	current := m.sessions[sessionKey]
+	if current != expected {
+		m.mu.Unlock()
+		return nil, true
+	}
+	if status == RevocationRevoked || m.sessionLocallyExpiredLocked(current, time.Now()) {
+		m.appendDeletedSessionLocked(sessionKey, toCleanup, pendingDeletes)
+		m.mu.Unlock()
+		return nil, false
+	}
+	if reserveLease {
+		// Reserve under m.mu so sweep cannot delete the exact object we are about
+		// to return before the lease becomes visible.
+		current.reserveLease()
+	}
+	m.mu.Unlock()
+	return current, false
+}
+
+func (m *Manager) observeReusableSessionLatestTruth(sessionKey string, config managerRemoteConfig, reserveLease bool, toCleanup *[]*ExecutionSession, pendingDeletes *[]pendingBindingDelete) *ExecutionSession {
+	for observe := 0; observe < finalLatestTruthReobserveBudget; observe++ {
+		sess, changed := m.observeReusableSession(sessionKey, config, reserveLease, toCleanup, pendingDeletes)
+		if !changed {
+			return sess
 		}
 	}
+	return nil
 }
 
-func (m *Manager) ensureCapacityLocked(now time.Time, toCleanup *[]*ExecutionSession, pendingDeletes *[]pendingBindingDelete) error {
-	if m == nil || m.maxSessions <= 0 {
-		return nil
-	}
-	if len(m.sessions) < m.maxSessions {
-		return nil
+func (m *Manager) observeLiveLocalBinding(bindingKey string, config managerRemoteConfig, toCleanup *[]*ExecutionSession, pendingDeletes *[]pendingBindingDelete) (*Binding, bool) {
+	if strings.TrimSpace(bindingKey) == "" {
+		return nil, false
 	}
 
-	m.collectExpiredSessionsLocked(now, toCleanup, pendingDeletes)
-	if len(m.sessions) < m.maxSessions {
-		return nil
+	now := time.Now()
+	m.mu.Lock()
+	binding := m.liveLocalBindingLocked(bindingKey, now, toCleanup, pendingDeletes)
+	if binding == nil {
+		m.mu.Unlock()
+		return nil, false
 	}
-	return ErrCapacityExceeded
+	if config.backend == nil {
+		copyBinding := *binding
+		m.mu.Unlock()
+		return &copyBinding, false
+	}
+
+	expectedSessionKey := binding.SessionKey
+	expectedSession := m.sessions[expectedSessionKey]
+	m.mu.Unlock()
+
+	status := m.checkRevocationWithConfig(config, expectedSessionKey)
+
+	m.mu.Lock()
+	currentBinding := m.bindings[bindingKey]
+	if currentBinding == nil || currentBinding.SessionKey != expectedSessionKey || m.sessions[expectedSessionKey] != expectedSession {
+		m.mu.Unlock()
+		return nil, true
+	}
+	if status == RevocationRevoked || m.sessionLocallyExpiredLocked(expectedSession, time.Now()) {
+		m.appendDeletedSessionLocked(expectedSessionKey, toCleanup, pendingDeletes)
+		m.mu.Unlock()
+		return nil, false
+	}
+	copyBinding := *currentBinding
+	m.mu.Unlock()
+	return &copyBinding, false
 }
 
-func (m *Manager) ensureCallerCapacityLocked(capacityNS string, now time.Time, toCleanup *[]*ExecutionSession, pendingDeletes *[]pendingBindingDelete) error {
-	if m == nil || m.maxSessionsPerCaller <= 0 || strings.TrimSpace(capacityNS) == "" {
-		return nil
+func (m *Manager) observeLiveLocalBindingLatestTruth(bindingKey string, config managerRemoteConfig, toCleanup *[]*ExecutionSession, pendingDeletes *[]pendingBindingDelete) *Binding {
+	for observe := 0; observe < finalLatestTruthReobserveBudget; observe++ {
+		binding, changed := m.observeLiveLocalBinding(bindingKey, config, toCleanup, pendingDeletes)
+		if !changed {
+			return binding
+		}
 	}
-	if len(m.capacityIndex[capacityNS]) < m.maxSessionsPerCaller {
-		return nil
+	return nil
+}
+
+func (m *Manager) getOrCreateInternal(meta Metadata, reserveLease bool) (*ExecutionSession, bool, func(), error) {
+	config := m.remoteConfigSnapshot()
+	toCleanup := make([]*ExecutionSession, 0, 1)
+	pendingDeletes := make([]pendingBindingDelete, 0, 1)
+
+	var (
+		sess    *ExecutionSession
+		created bool
+		err     error
+	)
+
+	for attempt := 0; attempt < 2; attempt++ {
+		sess, created, err = m.getOrCreateAttempt(meta, config, reserveLease, attempt == 0, &toCleanup, &pendingDeletes)
+		if err != errRestartDecision {
+			break
+		}
 	}
 
-	m.collectExpiredSessionsLocked(now, toCleanup, pendingDeletes)
-	if len(m.capacityIndex[capacityNS]) < m.maxSessionsPerCaller {
-		return nil
+	m.applyPendingBindingDeletes(pendingDeletes)
+	m.cleanupSessions(toCleanup)
+	if err != nil {
+		return nil, false, nil, err
 	}
-	return ErrCallerCapacityExceeded
+	if !reserveLease {
+		return sess, created, nil, nil
+	}
+	return sess, created, newLeaseRelease(sess), nil
+}
+
+func (m *Manager) getOrCreateAttempt(meta Metadata, config managerRemoteConfig, reserveLease, allowRestart bool, toCleanup *[]*ExecutionSession, pendingDeletes *[]pendingBindingDelete) (*ExecutionSession, bool, error) {
+	capacityNS := capacityNamespaceForMetadata(meta)
+	for observe := 0; observe < observeBudgetForAttempt(allowRestart); observe++ {
+		if sess, changed := m.observeReusableSession(meta.Key, config, reserveLease, toCleanup, pendingDeletes); changed {
+			if allowRestart {
+				return nil, false, errRestartDecision
+			}
+			continue
+		} else if sess != nil {
+			return sess, false, nil
+		}
+
+		m.mu.Lock()
+		needsCollect := (m.maxSessions > 0 && len(m.sessions) >= m.maxSessions) ||
+			(m.maxSessionsPerCaller > 0 && strings.TrimSpace(capacityNS) != "" && len(m.capacityIndex[capacityNS]) >= m.maxSessionsPerCaller)
+		m.mu.Unlock()
+
+		if needsCollect {
+			// Phase 1 removes locally expired sessions under m.mu; phase 2 checks
+			// revocation outside the lock. Remote binding deletes still happen after
+			// unlock, so collect shortens the critical section without pretending the
+			// whole cleanup path is constant-time wall clock.
+			m.collectExpiredSessions(time.Now(), config, toCleanup, pendingDeletes)
+		}
+
+		m.mu.Lock()
+		current := m.liveLocalSessionLocked(meta.Key, time.Now(), toCleanup, pendingDeletes)
+		if current != nil {
+			if config.backend != nil {
+				m.mu.Unlock()
+				if allowRestart {
+					return nil, false, errRestartDecision
+				}
+				continue
+			}
+			if reserveLease {
+				current.reserveLease()
+			}
+			m.mu.Unlock()
+			return current, false, nil
+		}
+		m.mu.Unlock()
+
+		m.mu.Lock()
+		if m.maxSessionsPerCaller > 0 && strings.TrimSpace(capacityNS) != "" && len(m.capacityIndex[capacityNS]) >= m.maxSessionsPerCaller {
+			m.mu.Unlock()
+			return nil, false, ErrCallerCapacityExceeded
+		}
+		if m.maxSessions > 0 && len(m.sessions) >= m.maxSessions {
+			m.mu.Unlock()
+			return nil, false, ErrCapacityExceeded
+		}
+		sess := NewExecutionSession(meta)
+		m.sessions[meta.Key] = sess
+		m.addCapacityIndexLocked(sess)
+		m.upsertBindingLocked(sess)
+		if reserveLease {
+			sess.reserveLease()
+		}
+		m.mu.Unlock()
+		return sess, true, nil
+	}
+
+	if config.backend != nil {
+		if sess := m.observeReusableSessionLatestTruth(meta.Key, config, reserveLease, toCleanup, pendingDeletes); sess != nil {
+			return sess, false, nil
+		}
+	}
+
+	m.mu.Lock()
+	sess := m.liveLocalSessionLocked(meta.Key, time.Now(), toCleanup, pendingDeletes)
+	if sess != nil {
+		if config.backend != nil {
+			m.mu.Unlock()
+			if latest := m.observeReusableSessionLatestTruth(meta.Key, config, reserveLease, toCleanup, pendingDeletes); latest != nil {
+				return latest, false, nil
+			}
+			m.mu.Lock()
+			sess = m.liveLocalSessionLocked(meta.Key, time.Now(), toCleanup, pendingDeletes)
+		}
+	}
+	if sess != nil {
+		if reserveLease {
+			sess.reserveLease()
+		}
+		m.mu.Unlock()
+		return sess, false, nil
+	}
+	if m.maxSessionsPerCaller > 0 && strings.TrimSpace(capacityNS) != "" && len(m.capacityIndex[capacityNS]) >= m.maxSessionsPerCaller {
+		m.mu.Unlock()
+		return nil, false, ErrCallerCapacityExceeded
+	}
+	if m.maxSessions > 0 && len(m.sessions) >= m.maxSessions {
+		m.mu.Unlock()
+		return nil, false, ErrCapacityExceeded
+	}
+	sess = NewExecutionSession(meta)
+	m.sessions[meta.Key] = sess
+	m.addCapacityIndexLocked(sess)
+	m.upsertBindingLocked(sess)
+	if reserveLease {
+		sess.reserveLease()
+	}
+	m.mu.Unlock()
+	return sess, true, nil
+}
+
+func (m *Manager) getOrCreateBoundInternal(meta Metadata, reserveLease bool) (*ExecutionSession, bool, *Binding, func(), error) {
+	config := m.remoteConfigSnapshot()
+	toCleanup := make([]*ExecutionSession, 0, 1)
+	pendingDeletes := make([]pendingBindingDelete, 0, 1)
+
+	var (
+		sess     *ExecutionSession
+		created  bool
+		conflict *Binding
+		err      error
+	)
+
+	for attempt := 0; attempt < 2; attempt++ {
+		sess, created, conflict, err = m.getOrCreateBoundAttempt(meta, config, reserveLease, attempt == 0, &toCleanup, &pendingDeletes)
+		if err != errRestartDecision {
+			break
+		}
+	}
+
+	m.applyPendingBindingDeletes(pendingDeletes)
+	m.cleanupSessions(toCleanup)
+	if err != nil {
+		return nil, false, nil, nil, err
+	}
+	if conflict != nil || !reserveLease {
+		return sess, created, conflict, nil, nil
+	}
+	return sess, created, nil, newLeaseRelease(sess), nil
+}
+
+func (m *Manager) getOrCreateBoundAttempt(meta Metadata, config managerRemoteConfig, reserveLease, allowRestart bool, toCleanup *[]*ExecutionSession, pendingDeletes *[]pendingBindingDelete) (*ExecutionSession, bool, *Binding, error) {
+	capacityNS := capacityNamespaceForMetadata(meta)
+	hasBinding := strings.TrimSpace(meta.BindingKey) != ""
+
+	for observe := 0; observe < observeBudgetForAttempt(allowRestart); observe++ {
+		binding, bindingChanged := m.observeLiveLocalBinding(meta.BindingKey, config, toCleanup, pendingDeletes)
+		if bindingChanged {
+			if allowRestart {
+				return nil, false, nil, errRestartDecision
+			}
+			continue
+		}
+		if binding != nil && binding.SessionKey != meta.Key {
+			return nil, false, binding, nil
+		}
+		observedBindingSessionKey := bindingObservationSessionKey(binding)
+
+		sess, changed := m.observeReusableSession(meta.Key, config, false, toCleanup, pendingDeletes)
+		if changed {
+			if allowRestart {
+				return nil, false, nil, errRestartDecision
+			}
+			continue
+		}
+		if sess == nil {
+			m.mu.Lock()
+			needsCollect := (m.maxSessions > 0 && len(m.sessions) >= m.maxSessions) ||
+				(m.maxSessionsPerCaller > 0 && strings.TrimSpace(capacityNS) != "" && len(m.capacityIndex[capacityNS]) >= m.maxSessionsPerCaller)
+			m.mu.Unlock()
+
+			if needsCollect {
+				m.collectExpiredSessions(time.Now(), config, toCleanup, pendingDeletes)
+			}
+
+			m.mu.Lock()
+			current := m.liveLocalSessionLocked(meta.Key, time.Now(), toCleanup, pendingDeletes)
+			m.mu.Unlock()
+			if current != nil {
+				if config.backend != nil {
+					if allowRestart {
+						return nil, false, nil, errRestartDecision
+					}
+					continue
+				}
+				sess = current
+			}
+		}
+
+		if sess == nil {
+			m.mu.Lock()
+			currentBinding := m.liveLocalBindingLocked(meta.BindingKey, time.Now(), toCleanup, pendingDeletes)
+			if config.backend != nil && !bindingMatchesObservedSessionKey(currentBinding, observedBindingSessionKey) {
+				m.mu.Unlock()
+				if allowRestart {
+					return nil, false, nil, errRestartDecision
+				}
+				continue
+			}
+			if currentBinding != nil && currentBinding.SessionKey != meta.Key {
+				copyBinding := *currentBinding
+				m.mu.Unlock()
+				if allowRestart {
+					return nil, false, nil, errRestartDecision
+				}
+				return nil, false, &copyBinding, nil
+			}
+			if m.maxSessionsPerCaller > 0 && strings.TrimSpace(capacityNS) != "" && len(m.capacityIndex[capacityNS]) >= m.maxSessionsPerCaller {
+				m.mu.Unlock()
+				return nil, false, nil, ErrCallerCapacityExceeded
+			}
+			if m.maxSessions > 0 && len(m.sessions) >= m.maxSessions {
+				m.mu.Unlock()
+				return nil, false, nil, ErrCapacityExceeded
+			}
+
+			sess = NewExecutionSession(meta)
+			m.sessions[meta.Key] = sess
+			m.addCapacityIndexLocked(sess)
+			m.upsertBindingLocked(sess)
+			if reserveLease {
+				sess.reserveLease()
+			}
+			m.mu.Unlock()
+			return sess, true, nil, nil
+		}
+
+		m.mu.Lock()
+		currentBinding := m.liveLocalBindingLocked(meta.BindingKey, time.Now(), toCleanup, pendingDeletes)
+		if config.backend != nil && !bindingMatchesObservedSessionKey(currentBinding, observedBindingSessionKey) {
+			m.mu.Unlock()
+			if allowRestart {
+				return nil, false, nil, errRestartDecision
+			}
+			continue
+		}
+		if currentBinding != nil && currentBinding.SessionKey != meta.Key {
+			copyBinding := *currentBinding
+			m.mu.Unlock()
+			if allowRestart {
+				return nil, false, nil, errRestartDecision
+			}
+			return nil, false, &copyBinding, nil
+		}
+		if m.sessions[meta.Key] != sess {
+			m.mu.Unlock()
+			if allowRestart {
+				return nil, false, nil, errRestartDecision
+			}
+			continue
+		}
+		if hasBinding {
+			if strings.TrimSpace(sess.BindingKey) == "" {
+				sess.BindingKey = meta.BindingKey
+			}
+			if currentBinding == nil || currentBinding.SessionKey != sess.Key {
+				m.upsertBindingLocked(sess)
+			}
+		}
+		if reserveLease {
+			sess.reserveLease()
+		}
+		m.mu.Unlock()
+		return sess, false, nil, nil
+	}
+
+	for finalObserve := 0; finalObserve < observeBudgetForAttempt(false); finalObserve++ {
+		observedBindingSessionKey := ""
+		if config.backend != nil {
+			binding := m.observeLiveLocalBindingLatestTruth(meta.BindingKey, config, toCleanup, pendingDeletes)
+			if binding != nil && binding.SessionKey != meta.Key {
+				return nil, false, binding, nil
+			}
+			observedBindingSessionKey = bindingObservationSessionKey(binding)
+		}
+
+		m.mu.Lock()
+		currentBinding := m.liveLocalBindingLocked(meta.BindingKey, time.Now(), toCleanup, pendingDeletes)
+		if config.backend != nil && !bindingMatchesObservedSessionKey(currentBinding, observedBindingSessionKey) {
+			m.mu.Unlock()
+			continue
+		}
+		if currentBinding != nil && currentBinding.SessionKey != meta.Key {
+			copyBinding := *currentBinding
+			m.mu.Unlock()
+			return nil, false, &copyBinding, nil
+		}
+		sess := m.liveLocalSessionLocked(meta.Key, time.Now(), toCleanup, pendingDeletes)
+		if config.backend != nil {
+			m.mu.Unlock()
+			latest := m.observeReusableSessionLatestTruth(meta.Key, config, false, toCleanup, pendingDeletes)
+			m.mu.Lock()
+			currentBinding = m.liveLocalBindingLocked(meta.BindingKey, time.Now(), toCleanup, pendingDeletes)
+			if !bindingMatchesObservedSessionKey(currentBinding, observedBindingSessionKey) {
+				m.mu.Unlock()
+				continue
+			}
+			if currentBinding != nil && currentBinding.SessionKey != meta.Key {
+				copyBinding := *currentBinding
+				m.mu.Unlock()
+				return nil, false, &copyBinding, nil
+			}
+			if latest != nil && m.sessions[meta.Key] == latest {
+				sess = latest
+			} else {
+				sess = m.liveLocalSessionLocked(meta.Key, time.Now(), toCleanup, pendingDeletes)
+			}
+		}
+		if sess == nil {
+			needsCollect := (m.maxSessions > 0 && len(m.sessions) >= m.maxSessions) ||
+				(m.maxSessionsPerCaller > 0 && strings.TrimSpace(capacityNS) != "" && len(m.capacityIndex[capacityNS]) >= m.maxSessionsPerCaller)
+			m.mu.Unlock()
+
+			if needsCollect {
+				m.collectExpiredSessions(time.Now(), config, toCleanup, pendingDeletes)
+			}
+
+			m.mu.Lock()
+			sess = m.liveLocalSessionLocked(meta.Key, time.Now(), toCleanup, pendingDeletes)
+			currentBinding = m.liveLocalBindingLocked(meta.BindingKey, time.Now(), toCleanup, pendingDeletes)
+			if config.backend != nil && !bindingMatchesObservedSessionKey(currentBinding, observedBindingSessionKey) {
+				m.mu.Unlock()
+				continue
+			}
+			if currentBinding != nil && currentBinding.SessionKey != meta.Key {
+				copyBinding := *currentBinding
+				m.mu.Unlock()
+				return nil, false, &copyBinding, nil
+			}
+			if sess != nil {
+				if hasBinding && strings.TrimSpace(sess.BindingKey) == "" {
+					sess.BindingKey = meta.BindingKey
+					m.upsertBindingLocked(sess)
+				}
+				if reserveLease {
+					sess.reserveLease()
+				}
+				m.mu.Unlock()
+				return sess, false, nil, nil
+			}
+			if m.maxSessionsPerCaller > 0 && strings.TrimSpace(capacityNS) != "" && len(m.capacityIndex[capacityNS]) >= m.maxSessionsPerCaller {
+				m.mu.Unlock()
+				return nil, false, nil, ErrCallerCapacityExceeded
+			}
+			if m.maxSessions > 0 && len(m.sessions) >= m.maxSessions {
+				m.mu.Unlock()
+				return nil, false, nil, ErrCapacityExceeded
+			}
+
+			sess = NewExecutionSession(meta)
+			m.sessions[meta.Key] = sess
+			m.addCapacityIndexLocked(sess)
+			m.upsertBindingLocked(sess)
+			if reserveLease {
+				sess.reserveLease()
+			}
+			m.mu.Unlock()
+			return sess, true, nil, nil
+		}
+
+		if hasBinding {
+			if strings.TrimSpace(sess.BindingKey) == "" {
+				sess.BindingKey = meta.BindingKey
+			}
+			if currentBinding == nil || currentBinding.SessionKey != sess.Key {
+				m.upsertBindingLocked(sess)
+			}
+		}
+		if reserveLease {
+			sess.reserveLease()
+		}
+		m.mu.Unlock()
+		return sess, false, nil, nil
+	}
+
+	m.mu.Lock()
+	currentBinding := m.liveLocalBindingLocked(meta.BindingKey, time.Now(), toCleanup, pendingDeletes)
+	if currentBinding != nil && currentBinding.SessionKey != meta.Key {
+		copyBinding := *currentBinding
+		m.mu.Unlock()
+		return nil, false, &copyBinding, nil
+	}
+	sess := m.liveLocalSessionLocked(meta.Key, time.Now(), toCleanup, pendingDeletes)
+	if sess == nil {
+		if m.maxSessionsPerCaller > 0 && strings.TrimSpace(capacityNS) != "" && len(m.capacityIndex[capacityNS]) >= m.maxSessionsPerCaller {
+			m.mu.Unlock()
+			return nil, false, nil, ErrCallerCapacityExceeded
+		}
+		if m.maxSessions > 0 && len(m.sessions) >= m.maxSessions {
+			m.mu.Unlock()
+			return nil, false, nil, ErrCapacityExceeded
+		}
+
+		sess = NewExecutionSession(meta)
+		m.sessions[meta.Key] = sess
+		m.addCapacityIndexLocked(sess)
+		m.upsertBindingLocked(sess)
+		if reserveLease {
+			sess.reserveLease()
+		}
+		m.mu.Unlock()
+		return sess, true, nil, nil
+	}
+	if hasBinding {
+		if strings.TrimSpace(sess.BindingKey) == "" {
+			sess.BindingKey = meta.BindingKey
+		}
+		if currentBinding == nil || currentBinding.SessionKey != sess.Key {
+			m.upsertBindingLocked(sess)
+		}
+	}
+	if reserveLease {
+		sess.reserveLease()
+	}
+	m.mu.Unlock()
+	return sess, false, nil, nil
+}
+
+func (m *Manager) resolveLiveLocalBinding(bindingKey string, config managerRemoteConfig) (*Binding, []pendingBindingDelete, []*ExecutionSession) {
+	toCleanup := make([]*ExecutionSession, 0, 1)
+	pendingDeletes := make([]pendingBindingDelete, 0, 1)
+
+	for attempt := 0; attempt < 2; attempt++ {
+		binding, changed := m.observeLiveLocalBinding(bindingKey, config, &toCleanup, &pendingDeletes)
+		if !changed {
+			return binding, pendingDeletes, toCleanup
+		}
+	}
+	return nil, pendingDeletes, toCleanup
 }
 
 func (m *Manager) deleteSessionLocked(sessionKey string) (*ExecutionSession, []pendingBindingDelete) {

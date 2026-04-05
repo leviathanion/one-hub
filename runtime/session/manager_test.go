@@ -12,6 +12,7 @@ import (
 type stubBindingBackend struct {
 	resolveBindingFn                     func(context.Context, string) (*Binding, ResolveStatus)
 	revocationStatusFn                   func(context.Context, string) RevocationStatus
+	revocationStatusesFn                 func(context.Context, []string) ([]RevocationStatus, error)
 	createBindingIfAbsentFn              func(context.Context, *Binding, time.Duration) BindingWriteStatus
 	replaceBindingIfSessionMatchesFn     func(context.Context, string, string, *Binding, time.Duration) BindingWriteStatus
 	deleteBindingIfSessionMatchesFn      func(context.Context, string, string) BindingWriteStatus
@@ -32,6 +33,17 @@ func (s *stubBindingBackend) RevocationStatus(ctx context.Context, sessionKey st
 		return s.revocationStatusFn(ctx, sessionKey)
 	}
 	return RevocationNotRevoked
+}
+
+func (s *stubBindingBackend) RevocationStatuses(ctx context.Context, sessionKeys []string) ([]RevocationStatus, error) {
+	if s != nil && s.revocationStatusesFn != nil {
+		return s.revocationStatusesFn(ctx, sessionKeys)
+	}
+	statuses := make([]RevocationStatus, len(sessionKeys))
+	for i, sessionKey := range sessionKeys {
+		statuses[i] = s.RevocationStatus(ctx, sessionKey)
+	}
+	return statuses, nil
 }
 
 func (s *stubBindingBackend) CreateBindingIfAbsent(ctx context.Context, binding *Binding, ttl time.Duration) BindingWriteStatus {
@@ -74,6 +86,16 @@ func (s *stubBindingBackend) CountBindings(ctx context.Context) int64 {
 		return s.countBindingsFn(ctx)
 	}
 	return 0
+}
+
+func setTestBackend(manager *Manager, backend bindingBackend) {
+	if manager == nil {
+		return
+	}
+	manager.remoteMu.Lock()
+	manager.remoteConfig.backend = backend
+	manager.remoteConfig.revocationTimeout = normalizeRevocationTimeout(manager.remoteConfig.revocationTimeout)
+	manager.remoteMu.Unlock()
 }
 
 func TestManagerGetOrCreateReusesExistingSession(t *testing.T) {
@@ -724,11 +746,11 @@ func TestManagerAcquireOrCreateBoundKeepsLeasedSessionAliveAcrossSweep(t *testin
 
 func TestManagerResolveBindingDoesNotFallbackToLocalOnBackendError(t *testing.T) {
 	manager := NewManager(time.Minute, 0, nil)
-	manager.backend = &stubBindingBackend{
+	setTestBackend(manager, &stubBindingBackend{
 		resolveBindingFn: func(context.Context, string) (*Binding, ResolveStatus) {
 			return nil, ResolveBackendError
 		},
-	}
+	})
 
 	bindingKey := BuildBindingKey("token:1", BindingScopeChatRealtime, "session-backend-error")
 	meta := Metadata{
@@ -756,11 +778,11 @@ func TestManagerResolveBindingDoesNotFallbackToLocalOnBackendError(t *testing.T)
 
 func TestManagerTouchBindingConditionMismatchClearsLocalBinding(t *testing.T) {
 	manager := NewManager(time.Minute, 0, nil)
-	manager.backend = &stubBindingBackend{
+	setTestBackend(manager, &stubBindingBackend{
 		touchBindingIfSessionMatchesFn: func(context.Context, string, string, time.Duration) BindingWriteStatus {
 			return BindingWriteConditionMismatch
 		},
-	}
+	})
 
 	bindingKey := BuildBindingKey("token:1", BindingScopeChatRealtime, "session-touch-mismatch")
 	meta := Metadata{
@@ -785,11 +807,11 @@ func TestManagerTouchBindingConditionMismatchClearsLocalBinding(t *testing.T) {
 
 func TestManagerTouchBindingBackendErrorPreservesLiveSessionAndMarksUncertain(t *testing.T) {
 	manager := NewManager(time.Minute, 0, nil)
-	manager.backend = &stubBindingBackend{
+	setTestBackend(manager, &stubBindingBackend{
 		touchBindingIfSessionMatchesFn: func(context.Context, string, string, time.Duration) BindingWriteStatus {
 			return BindingWriteBackendError
 		},
-	}
+	})
 
 	bindingKey := BuildBindingKey("token:1", BindingScopeChatRealtime, "session-touch-backend-error")
 	meta := Metadata{
