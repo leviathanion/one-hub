@@ -21,6 +21,7 @@ import (
 	"one-api/cron"
 	"one-api/middleware"
 	"one-api/model"
+	"one-api/providers/codex"
 	"one-api/relay/task"
 	"one-api/router"
 	"one-api/safty"
@@ -59,6 +60,7 @@ func main() {
 	defer model.CloseDB()
 	// Initialize Redis
 	redis.InitRedisClient()
+	codex.InitExecutionSessionManager()
 	cache.InitCacheManager()
 	// Initialize options
 	model.InitOptionMap()

@@ -37,6 +37,8 @@ user_invoice_month: false #是否开启用户月账单功能
 github_proxy: "" #github登录请求代理例如socks://127.0.0.1:10808
 openai:
   realtime_session_compat: false # OpenAI Realtime 兼容模式；开启后，上游 error 事件会在转发后立即关闭当前会话
+codex:
+  execution_session_revocation_timeout_ms: 200 # Codex execution session revocation 查询超时；超时会收敛为 unknown，并跳过本次 resume
 
 # 令牌设置
 user_token_secret: "" # 用户令牌密钥, 请设置至少32位的随机字符串，修改后用户令牌将无法验证，例如：vWVmFxp5YIOXuHhEod8jBcqiw0zKP2fk

@@ -7,9 +7,10 @@ import (
 	"testing"
 	"time"
 
-	commonredis "one-api/common/redis"
 	"one-api/internal/testutil/fakeredis"
 	runtimesession "one-api/runtime/session"
+
+	"github.com/spf13/viper"
 )
 
 func withCodexExecutionManager(t *testing.T, manager *runtimesession.Manager) {
@@ -381,17 +382,11 @@ func TestCodexAcquireLocalOnlyExecutionSessionBranches(t *testing.T) {
 }
 
 func TestExecutionSessionStatsUsesConfiguredRedisBackend(t *testing.T) {
-	manager, server, _ := newCodexFakeRedisManager(t)
-	originalRedis := commonredis.RDB
-	commonredis.RDB = server.Client()
-	t.Cleanup(func() {
-		commonredis.RDB = originalRedis
-	})
+	manager, _, _ := newCodexFakeRedisManager(t)
 
 	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, map[string]string{"X-Session-Id": "stats"})
 	provider.Context.Set("token_id", 416)
 	meta := codexTestMeta(t, provider)
-	manager.ConfigureRedis(server.Client(), "one-hub:execution-session")
 	if exec, _, err := manager.GetOrCreate(meta); err != nil {
 		t.Fatalf("expected execution session fixture, got %v", err)
 	} else if status := manager.CreateBindingIfAbsent(exec.BuildBinding(), time.Minute); status != runtimesession.BindingWriteApplied {
@@ -401,6 +396,20 @@ func TestExecutionSessionStatsUsesConfiguredRedisBackend(t *testing.T) {
 	stats := ExecutionSessionStats()
 	if stats.Backend != "redis" || stats.BackendBindings < 1 {
 		t.Fatalf("expected execution session stats to reflect redis backend, got %+v", stats)
+	}
+}
+
+func TestCodexExecutionSessionRevocationTimeoutConfig(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+
+	if got := codexExecutionSessionRevocationTimeout(); got != 200*time.Millisecond {
+		t.Fatalf("expected default codex execution session revocation timeout 200ms, got %s", got)
+	}
+
+	viper.Set("codex.execution_session_revocation_timeout_ms", 850)
+	if got := codexExecutionSessionRevocationTimeout(); got != 850*time.Millisecond {
+		t.Fatalf("expected configured codex execution session revocation timeout 850ms, got %s", got)
 	}
 }
 
@@ -467,13 +476,7 @@ func TestCodexRealtimeSessionIDAndErrorHelpers(t *testing.T) {
 }
 
 func TestCodexRealtimeAdminAndIdentityHelpers(t *testing.T) {
-	manager, server, _ := newCodexFakeRedisManager(t)
-	originalRedis := commonredis.RDB
-	commonredis.RDB = server.Client()
-	t.Cleanup(func() {
-		commonredis.RDB = originalRedis
-	})
-	manager.ConfigureRedis(server.Client(), "one-hub:execution-session")
+	manager, _, _ := newCodexFakeRedisManager(t)
 
 	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_retry_cooldown_seconds":15,"websocket_mode":"weird"}`, map[string]string{"X-Session-Id": "admin-stats"})
 	provider.Context.Set("token_id", 417)

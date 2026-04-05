@@ -26,12 +26,14 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/spf13/viper"
 )
 
 const codexRealtimeProtocolName = "codex-responses-ws"
 const codexRealtimeReadTimeout = 2 * time.Minute
 const codexRealtimeSessionIDMaxLen = 128
 const codexRealtimeGeneratedSessionIDContextKey = "codex_generated_execution_session_id"
+const codexExecutionSessionRedisPrefix = "one-hub:execution-session"
 
 var codexRealtimeOutboundBackpressureTimeout = 5 * time.Second
 
@@ -105,7 +107,8 @@ var codexExecutionSessions = runtimesession.NewManagerWithOptions(runtimesession
 	MaxSessions:          defaultExecutionSessionCap,
 	MaxSessionsPerCaller: defaultExecutionSessionCallerCap,
 	RedisClient:          commonredis.GetRedisClient(),
-	RedisPrefix:          "one-hub:execution-session",
+	RedisPrefix:          codexExecutionSessionRedisPrefix,
+	RevocationTimeout:    codexExecutionSessionRevocationTimeout(),
 })
 
 type codexRealtimeOpenPlan struct {
@@ -313,13 +316,23 @@ func (p *CodexProvider) OpenRealtimeSession(modelName string) (runtimesession.Re
 	return p.OpenRealtimeSessionWithOptions(modelName, runtimesession.RealtimeOpenOptions{})
 }
 
+func codexExecutionSessionRevocationTimeout() time.Duration {
+	timeoutMS := viper.GetInt("codex.execution_session_revocation_timeout_ms")
+	if timeoutMS <= 0 {
+		timeoutMS = 200
+	}
+	return time.Duration(timeoutMS) * time.Millisecond
+}
+
+func InitExecutionSessionManager() {
+	codexExecutionSessions.ConfigureRemote(commonredis.GetRedisClient(), codexExecutionSessionRedisPrefix, codexExecutionSessionRevocationTimeout())
+}
+
 func ExecutionSessionStats() runtimesession.Stats {
-	codexExecutionSessions.ConfigureRedis(commonredis.GetRedisClient(), "one-hub:execution-session")
 	return codexExecutionSessions.Stats()
 }
 
 func (p *CodexProvider) OpenRealtimeSessionWithOptions(modelName string, options runtimesession.RealtimeOpenOptions) (runtimesession.RealtimeSession, *types.OpenAIErrorWithStatusCode) {
-	codexExecutionSessions.ConfigureRedis(commonredis.GetRedisClient(), "one-hub:execution-session")
 	normalizedModelName := normalizeCodexModelName(modelName)
 	meta, errWithCode := p.buildExecutionSessionMetadata(normalizedModelName, options)
 	if errWithCode != nil {

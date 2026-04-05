@@ -49,6 +49,7 @@ func defaultConfig() {
 	viper.SetDefault("favicon", "")
 	viper.SetDefault("user_invoice_month", false)
 	viper.SetDefault("openai.realtime_session_compat", false)
+	viper.SetDefault("codex.execution_session_revocation_timeout_ms", 200)
 	viper.SetDefault("mcp.enable", false)
 	viper.SetDefault("uptime_kuma.enable", false)
 	viper.SetDefault("uptime_kuma.domain", "")

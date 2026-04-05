@@ -31,6 +31,9 @@ func TestInitConfLoadsRealtimeSessionCompatFlagAndDefaults(t *testing.T) {
 	if viper.GetBool("openai.realtime_session_compat") {
 		t.Fatal("expected realtime session compat mode default to be disabled")
 	}
+	if got := viper.GetInt("codex.execution_session_revocation_timeout_ms"); got != 200 {
+		t.Fatalf("expected codex execution session revocation timeout default 200ms, got %d", got)
+	}
 
 	viper.Set("openai.realtime_session_compat", true)
 	viper.Set("user_invoice_month", true)
