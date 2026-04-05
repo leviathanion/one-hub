@@ -10,6 +10,7 @@ lastUpdated: true
 ## 文档状态
 
 - 状态：V1 主干已部分实现，后续实现与重构以本文为准
+- 当前现状：这份文档同时承担“已落地边界说明”和“后续收敛基线”两种角色，代码还未完全统一到单一 settle contract
 - 目标：在不新增表、不引入独立 billing service 的前提下，统一 unary / realtime / async task 的最终扣费边界
 
 ## 设计目标边界

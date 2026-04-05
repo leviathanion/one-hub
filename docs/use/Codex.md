@@ -380,6 +380,31 @@ curl --request PUT \
 - 同一个调用方带着同一个 `session_id` / `x-session-id` 回到同一个渠道时，可以复用之前的 execution session
 - 超过 TTL 后，runtime 会清理空闲 session，释放上游连接
 
+### 全局 `codex.execution_session_revocation_timeout_ms`
+
+配置位置：
+
+- 服务端配置文件，例如 `config.yaml`
+- 环境变量 `CODEX_EXECUTION_SESSION_REVOCATION_TIMEOUT_MS`
+
+默认值：`200` 毫秒。
+
+作用：
+
+- 控制 Codex execution session manager 做 revocation 查询时的超时
+- 超时或 backend error 会收敛为 `unknown`
+- `unknown` 不会 resume 旧 session，而是走 fresh/local-only 路径
+
+trade-off：
+
+- 值越短，最坏等待时间越小，但 `unknown` 比例会上升，resume 命中率会下降
+- 值越长，resume 命中率通常更高，但会增加 revocation probe 的尾延迟
+
+注意：
+
+- 这是全局 manager 拨盘，不是 `渠道 -> Codex 配置(JSON)` 的字段
+- 它影响的是 revocation probe，不改变 `execution_session_ttl_seconds` 的本地空闲回收语义
+
 ### `websocket_retry_cooldown_seconds`
 
 当 Codex websocket 握手失败，或者 session 内 websocket 发送失败后，runtime 会进入 bridge 冷却时间。默认 `120` 秒。

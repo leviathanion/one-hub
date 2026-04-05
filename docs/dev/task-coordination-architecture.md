@@ -10,6 +10,7 @@ lastUpdated: true
 ## 文档状态
 
 - 状态：V0.9 去 `202` 收敛版
+- 当前现状：当前代码目标仍是最小 task 协调，不承诺完整 task coordinator 语义；本文主要用于固定能力边界与接受的尾损
 - 目标：在不新增接口、不新增 task 专用表的前提下，让 async task 方案尽量贴近当前代码，并把实现复杂度压到最低
 - 前提：明确接受少量任务误杀、误退款、重复提交、上游其实成功但本地最终仍可能无法自动找回，甚至最终丢失；也接受极端情况下 provider 已 accepted 但 submit 返回 5xx、后续按现有 fetch 仍可能查不到任务；对 detached finalize，则接受 Redis gate 不可用时退化成弱防重 fail-open，但不为此改动现有共享结算逻辑
 

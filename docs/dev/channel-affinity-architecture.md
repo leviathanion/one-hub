@@ -10,6 +10,7 @@ lastUpdated: true
 ## 文档状态
 
 - 状态：已选型，按当前代码实现收敛
+- 当前现状：本文描述的是当前线上代码采用的 affinity 组合范式，不是待定提案
 - 范围：request 路由分组、responses affinity、Codex prompt-cache pre-routing、Codex realtime affinity、preferred channel fallback、responses continuation miss
 
 

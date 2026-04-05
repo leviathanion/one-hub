@@ -4,18 +4,30 @@
 
 `docs/dev` 里原先有多份渠道亲和与 usage 设计文档，主题重复，而且取舍分叉。
 
-现在把它们收敛成三份主题文档与一份独立工具文档：
+现在把它们收敛成四份主题文档与一份独立工具文档：
 
 | 文档 | 主题 | 说明 |
 | --- | --- | --- |
 | [Channel Affinity 统一方案](./channel-affinity-architecture.md) | 渠道路由、responses affinity、Codex realtime affinity | 以当前代码实际采用的方案为准 |
 | [Billing / Usage 结算统一方案](./billing-settlement-architecture.md) | usage / settlement / finalize | 在多份提案中选出的最终推荐方案 |
 | [one-hub Async Task 极简协调方案](./task-coordination-architecture.md) | async task、identity、fetch、sweeper、finalize | 统一说明 one-hub 当前 async task 的能力边界、数据模型与落地取舍 |
+| [Execution Session Revocation 并发修复方案](./execution-session-revocation-refactor.md) | `runtime/session` 锁边界、revocation、Sweep、容量回收 | 说明 session manager revocation 检查的最终重构方向 |
 | [Relay 压测脚本](./relay-performance-benchmark.md) | 热路径压测工具与口径 | 独立保留 |
+
+## 当前现状
+
+| 文档 | 当前状态 | 说明 |
+| --- | --- | --- |
+| [Channel Affinity 统一方案](./channel-affinity-architecture.md) | 已选型 | 当前代码已按该方案收敛，用于解释现有 routing / affinity 行为 |
+| [Billing / Usage 结算统一方案](./billing-settlement-architecture.md) | V1 主干部分实现 | 现状与后续收敛目标共用同一份文档，后续实现继续以本文边界为准 |
+| [one-hub Async Task 极简协调方案](./task-coordination-architecture.md) | V0.9 收敛方案 | 当前目标仍是最小 task 协调，不是完整 task coordinator |
+| [Execution Session Revocation 并发修复方案](./execution-session-revocation-refactor.md) | 已实现并接入主流程 | `runtime/session` revocation 锁外化、批量 sweep 检查与 Codex execution session timeout 配置已落地 |
+| [Relay 压测脚本](./relay-performance-benchmark.md) | 可直接使用 | 对应 `hack/bench/relay_bench.go`，用于热路径压测与指标对照 |
 
 ## 目录
 
 - [文档收敛说明](#文档收敛说明)
+- [当前现状](#当前现状)
 - [本地构建](#本地构建)
   - [环境配置](#环境配置)
   - [编译流程](#编译流程)
