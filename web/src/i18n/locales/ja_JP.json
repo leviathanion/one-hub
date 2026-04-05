@@ -435,6 +435,7 @@
     "typeLabel": "タイプ",
     "userLabel": "ユーザー",
     "sourceIp": "Source IP",
+    "userAgent": "User-Agent",
     "logType": {
       "all": "すべて",
       "recharge": "チャージ",

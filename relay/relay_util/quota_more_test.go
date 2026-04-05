@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,6 +45,7 @@ func TestNewQuotaDetachesContextAndCopiesAffinityMetadata(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/realtime", nil).WithContext(reqCtx)
 	ctx.Request.RemoteAddr = "203.0.113.5:1234"
+	ctx.Request.Header.Set("User-Agent", "  Codex/1.2  ")
 	ctx.Set("id", 11)
 	ctx.Set("channel_id", 22)
 	ctx.Set("token_id", 33)
@@ -68,6 +70,9 @@ func TestNewQuotaDetachesContextAndCopiesAffinityMetadata(t *testing.T) {
 	}
 	if !quota.isBackupGroup || quota.tokenName != "token-alpha" || quota.groupName != "team-b" || quota.tokenGroupName != "team-a" || quota.backupGroupName != "team-b" {
 		t.Fatalf("expected quota group metadata to be copied, got %+v", quota)
+	}
+	if quota.userAgent != "Codex/1.2" {
+		t.Fatalf("expected quota user-agent to be normalized from request headers, got %q", quota.userAgent)
 	}
 	if quota.routingGroupSource != groupctx.RoutingGroupSourceBackupGroup {
 		t.Fatalf("expected quota to copy routing group source, got %+v", quota)
@@ -113,6 +118,7 @@ func TestQuotaComputationMetadataAndRealtimeHelpers(t *testing.T) {
 		outputRatio:        2.5,
 		affinityMeta:       map[string]any{"channel_affinity_hit": true},
 		extraBillingData:   map[string]ExtraBillingData{"web_search": {ServiceType: types.APIToolTypeWebSearchPreview, CallCount: 1, Price: 0.01}},
+		userAgent:          "Codex/1.2",
 	}
 
 	usage := &types.Usage{
@@ -174,6 +180,9 @@ func TestQuotaComputationMetadataAndRealtimeHelpers(t *testing.T) {
 	if meta["routing_group_source"] != groupctx.RoutingGroupSourceBackupGroup {
 		t.Fatalf("expected routing group source in log meta, got %#v", meta)
 	}
+	if meta["user_agent"] != "Codex/1.2" {
+		t.Fatalf("expected normalized user-agent in log meta, got %#v", meta)
+	}
 	if meta["channel_affinity_hit"] != true || meta["first_response"] != firstResponseAt.Sub(startedAt).Milliseconds() {
 		t.Fatalf("expected timing and affinity metadata in log meta, got %#v", meta)
 	}
@@ -198,6 +207,38 @@ func TestQuotaComputationMetadataAndRealtimeHelpers(t *testing.T) {
 	quota.GetExtraBillingData(nil)
 	if quota.extraBillingData != nil {
 		t.Fatalf("expected empty extra billing to clear metadata, got %+v", quota.extraBillingData)
+	}
+}
+
+func TestQuotaNormalizesAndTruncatesUserAgent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	logger.Logger = zap.NewNop()
+
+	originalPricing := model.PricingInstance
+	model.PricingInstance = &model.Pricing{Prices: map[string]*model.Price{}}
+	t.Cleanup(func() {
+		model.PricingInstance = originalPricing
+	})
+
+	longUA := strings.Repeat("A", 540)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/realtime", nil)
+	ctx.Request.Header.Set("User-Agent", longUA)
+
+	quota := NewQuota(ctx, "gpt-5", 1)
+	if quota == nil {
+		t.Fatal("expected quota to be created")
+	}
+	if len([]rune(quota.userAgent)) != 512 {
+		t.Fatalf("expected user-agent to be truncated to 512 characters, got %d", len([]rune(quota.userAgent)))
+	}
+
+	meta := quota.GetLogMeta(&types.Usage{})
+	got, _ := meta["user_agent"].(string)
+	if len([]rune(got)) != 512 {
+		t.Fatalf("expected user-agent metadata to preserve truncation, got %d characters", len([]rune(got)))
 	}
 }
 

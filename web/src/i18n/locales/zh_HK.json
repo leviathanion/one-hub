@@ -440,6 +440,7 @@
     "typeLabel": "類型",
     "userLabel": "用戶",
     "sourceIp": "Source IP",
+    "userAgent": "User-Agent",
     "logType": {
       "all": "全部",
       "recharge": "充值",

@@ -161,6 +161,9 @@ func TestApplySettlementProjectionUsesFinalQuota(t *testing.T) {
 			TokenName:   "token-alpha",
 			RequestTime: 321,
 			SourceIP:    "203.0.113.9",
+			Metadata: map[string]any{
+				"user_agent": "Codex/1.2",
+			},
 		},
 	}
 
@@ -190,6 +193,9 @@ func TestApplySettlementProjectionUsesFinalQuota(t *testing.T) {
 	}
 	if log.Quota != 250 || log.PromptTokens != 10 || log.CompletionTokens != 20 {
 		t.Fatalf("expected consume log to record final quota and usage, got %+v", log)
+	}
+	if log.Metadata.Data()["user_agent"] != "Codex/1.2" {
+		t.Fatalf("expected consume log to persist metadata user-agent, got %#v", log.Metadata.Data())
 	}
 }
 

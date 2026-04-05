@@ -71,6 +71,7 @@ export default function Log() {
     completion: true,
     quota: true,
     source_ip: true,
+    user_agent: true,
     detail: true
   });
   const [columnMenuAnchor, setColumnMenuAnchor] = useState(null);
@@ -305,6 +306,7 @@ export default function Log() {
                 { id: 'completion', label: t('logPage.outputLabel') },
                 { id: 'quota', label: t('logPage.quotaLabel') },
                 { id: 'source_ip', label: t('logPage.sourceIp') },
+                { id: 'user_agent', label: t('logPage.userAgent') },
                 { id: 'detail', label: t('logPage.detailLabel') }
               ].map(
                 (column) =>
@@ -399,6 +401,12 @@ export default function Log() {
                     label: t('logPage.sourceIp'),
                     disableSort: true,
                     hide: !columnVisibility.source_ip
+                  },
+                  {
+                    id: 'user_agent',
+                    label: t('logPage.userAgent'),
+                    disableSort: true,
+                    hide: !columnVisibility.user_agent
                   },
                   {
                     id: 'detail',

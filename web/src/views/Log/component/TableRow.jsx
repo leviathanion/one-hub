@@ -6,7 +6,7 @@ import Badge from '@mui/material/Badge';
 
 import { TableRow, TableCell, Stack, Collapse, Tooltip, Typography } from '@mui/material';
 
-import { timestamp2string, renderQuota } from 'utils/common';
+import { copy, timestamp2string, renderQuota } from 'utils/common';
 import Label from 'ui-component/Label';
 import { useLogType } from '../type/LogType';
 import { useTranslation } from 'react-i18next';
@@ -172,6 +172,7 @@ export default function LogTableRow({ item, userIsAdmin, userGroup, columnVisibi
           </TableCell>
         )}
         {columnVisibility.source_ip && <TableCell sx={{ p: '10px 8px' }}>{item.source_ip || ''}</TableCell>}
+        {columnVisibility.user_agent && <TableCell sx={{ p: '10px 8px' }}>{viewUserAgent(item.metadata?.user_agent, t('logPage.userAgent'))}</TableCell>}
         {columnVisibility.detail && (
           <TableCell sx={{ p: '10px 8px' }}>{viewLogContent(item, t, totalInputTokens, totalOutputTokens)}</TableCell>
         )}
@@ -234,6 +235,25 @@ function viewModelName(model_name, isStream) {
     <Label color="primary" variant="outlined" copyText={model_name}>
       {model_name}
     </Label>
+  );
+}
+
+function viewUserAgent(userAgent, copyName) {
+  if (!userAgent) {
+    return '';
+  }
+
+  return (
+    <Tooltip title={userAgent} placement="top" arrow>
+      <Typography
+        variant="body2"
+        noWrap
+        sx={{ maxWidth: 280, display: 'block', cursor: 'pointer' }}
+        onClick={() => copy(userAgent, copyName)}
+      >
+        {userAgent}
+      </Typography>
+    </Tooltip>
   );
 }
 

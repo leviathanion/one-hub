@@ -458,6 +458,7 @@
     "typeLabel": "Type",
     "userLabel": "User",
     "sourceIp": "Source IP",
+    "userAgent": "User-Agent",
     "unknown": "Unknown",
     "logType": {
       "all": "All",

@@ -10,6 +10,7 @@ import (
 	"one-api/common/config"
 	"one-api/common/groupctx"
 	"one-api/common/logger"
+	"one-api/common/utils"
 	"one-api/internal/billing"
 	"one-api/model"
 	"one-api/types"
@@ -50,6 +51,7 @@ type Quota struct {
 	requestContext    context.Context
 	tokenName         string
 	sourceIP          string
+	userAgent         string
 	forcePreConsume   bool
 }
 
@@ -73,6 +75,9 @@ func NewQuota(c *gin.Context, modelName string, promptTokens int) *Quota {
 		requestContext: requestContext,
 		tokenName:      c.GetString("token_name"),
 		sourceIP:       c.ClientIP(),
+	}
+	if c.Request != nil {
+		quota.userAgent = utils.NormalizeUserAgent(c.Request.UserAgent())
 	}
 	if meta, ok := c.Get(config.GinChannelAffinityMetaKey); ok {
 		if typed, ok := meta.(map[string]any); ok && len(typed) > 0 {
@@ -236,6 +241,9 @@ func (q *Quota) Consume(c *gin.Context, usage *types.Usage, isStream bool) {
 		}
 		if q.sourceIP == "" {
 			q.sourceIP = c.ClientIP()
+		}
+		if q.userAgent == "" && c.Request != nil {
+			q.userAgent = utils.NormalizeUserAgent(c.Request.UserAgent())
 		}
 		if q.startTime.IsZero() {
 			q.startTime = c.GetTime("requestStartTime")
@@ -407,6 +415,8 @@ func (q *Quota) GetLogMeta(usage *types.Usage) map[string]any {
 		}
 	}
 
+	// Display-only trade-off: keep user-agent in JSON metadata until query use cases justify a dedicated column.
+	meta = utils.AppendUserAgentMetadata(meta, q.userAgent)
 	return meta
 }
 
