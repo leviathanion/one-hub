@@ -111,6 +111,49 @@ func TestRedisBindingBackendResolveAndRevocationPaths(t *testing.T) {
 	}
 }
 
+func TestRedisBindingBackendBulkRevocationStatuses(t *testing.T) {
+	backend, server := newSessionFakeRedisBackend(t)
+	ctx := context.Background()
+
+	revokedA := "channel:7/hash-a/session-revoked-a"
+	revokedB := "channel:7/hash-a/session-revoked-b"
+	notRevoked := "channel:7/hash-a/session-live"
+
+	server.SetRaw(backend.redisRevocationKey(revokedA), "1")
+	server.SetRaw(backend.redisRevocationKey(revokedB), "1")
+
+	statuses, err := backend.RevocationStatuses(ctx, []string{
+		revokedA,
+		"  ",
+		notRevoked,
+		revokedB,
+		revokedA,
+	})
+	if err != nil {
+		t.Fatalf("expected bulk revocation lookup to succeed, got %v", err)
+	}
+
+	expected := []RevocationStatus{
+		RevocationRevoked,
+		RevocationNotRevoked,
+		RevocationNotRevoked,
+		RevocationRevoked,
+		RevocationRevoked,
+	}
+	if len(statuses) != len(expected) {
+		t.Fatalf("expected %d bulk statuses, got %d", len(expected), len(statuses))
+	}
+	for i := range expected {
+		if statuses[i] != expected[i] {
+			t.Fatalf("expected bulk status[%d]=%q, got %q", i, expected[i], statuses[i])
+		}
+	}
+
+	if statuses, err = backend.RevocationStatuses(ctx, nil); err != nil || len(statuses) != 0 {
+		t.Fatalf("expected empty bulk revocation lookup to succeed with empty result, statuses=%v err=%v", statuses, err)
+	}
+}
+
 func TestRedisBindingBackendWriteHelpersAndCount(t *testing.T) {
 	backend, server := newSessionFakeRedisBackend(t)
 	ctx := context.Background()
@@ -192,6 +235,9 @@ func TestRedisBindingBackendHelperAndFailureBranches(t *testing.T) {
 	if status := nilBackend.RevocationStatus(ctx, "session"); status != RevocationUnknown {
 		t.Fatalf("expected nil backend revocation lookup to be unknown, got %q", status)
 	}
+	if statuses, err := nilBackend.RevocationStatuses(ctx, []string{"session"}); err == nil || len(statuses) != 0 {
+		t.Fatalf("expected nil backend bulk revocation lookup to error, statuses=%v err=%v", statuses, err)
+	}
 	if status := nilBackend.CreateBindingIfAbsent(ctx, testBinding("binding", "session"), time.Minute); status != BindingWriteBackendError {
 		t.Fatalf("expected nil backend create to fail, got %q", status)
 	}
@@ -211,6 +257,9 @@ func TestRedisBindingBackendHelperAndFailureBranches(t *testing.T) {
 	}
 	if status := failing.RevocationStatus(ctx, ""); status != RevocationNotRevoked {
 		t.Fatalf("expected empty revocation lookup to be not revoked, got %q", status)
+	}
+	if statuses, err := failing.RevocationStatuses(ctx, []string{"session"}); err == nil || len(statuses) != 0 {
+		t.Fatalf("expected failing backend bulk revocation lookup to error, statuses=%v err=%v", statuses, err)
 	}
 	if status := failing.CreateBindingIfAbsent(ctx, testBinding("binding", "session"), time.Minute); status != BindingWriteBackendError {
 		t.Fatalf("expected failing backend create to error, got %q", status)

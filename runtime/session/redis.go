@@ -254,6 +254,47 @@ func (b *redisBindingBackend) RevocationStatus(ctx context.Context, sessionKey s
 	return RevocationNotRevoked
 }
 
+func (b *redisBindingBackend) RevocationStatuses(ctx context.Context, sessionKeys []string) ([]RevocationStatus, error) {
+	statuses := make([]RevocationStatus, len(sessionKeys))
+	if len(sessionKeys) == 0 {
+		return statuses, nil
+	}
+	if b == nil || b.client == nil {
+		return nil, redis.Nil
+	}
+
+	pipe := b.client.Pipeline()
+
+	commands := make([]*redis.IntCmd, len(sessionKeys))
+	for i, sessionKey := range sessionKeys {
+		sessionKey = strings.TrimSpace(sessionKey)
+		if sessionKey == "" {
+			statuses[i] = RevocationNotRevoked
+			continue
+		}
+		commands[i] = pipe.Exists(ctx, b.redisRevocationKey(sessionKey))
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return nil, err
+	}
+
+	for i, cmd := range commands {
+		if cmd == nil {
+			continue
+		}
+		exists, err := cmd.Result()
+		if err != nil {
+			return nil, err
+		}
+		if exists > 0 {
+			statuses[i] = RevocationRevoked
+			continue
+		}
+		statuses[i] = RevocationNotRevoked
+	}
+	return statuses, nil
+}
+
 func (b *redisBindingBackend) CreateBindingIfAbsent(ctx context.Context, binding *Binding, ttl time.Duration) BindingWriteStatus {
 	if b == nil || b.client == nil {
 		return BindingWriteBackendError

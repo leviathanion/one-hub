@@ -15,3 +15,7 @@ type bindingBackend interface {
 	DeleteBindingAndRevokeIfSessionMatches(ctx context.Context, bindingKey, expectedSessionKey string, revokeTTL time.Duration) BindingWriteStatus
 	CountBindings(ctx context.Context) int64
 }
+
+type bulkRevocationBackend interface {
+	RevocationStatuses(ctx context.Context, sessionKeys []string) ([]RevocationStatus, error)
+}
