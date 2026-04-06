@@ -3,8 +3,11 @@ package model
 import (
 	"fmt"
 	"one-api/common"
+	"sort"
 	"strings"
 	"time"
+
+	"gorm.io/gorm"
 )
 
 type Statistics struct {
@@ -16,7 +19,41 @@ type Statistics struct {
 	Quota            int       `json:"quota"`
 	PromptTokens     int       `json:"prompt_tokens"`
 	CompletionTokens int       `json:"completion_tokens"`
+	CacheTokens      int       `json:"cache_tokens"`
+	CacheReadTokens  int       `json:"cache_read_tokens"`
+	CacheWriteTokens int       `json:"cache_write_tokens"`
+	CacheHitCount    int       `json:"cache_hit_count"`
 	RequestTime      int       `json:"request_time"`
+}
+
+type UserDashboard struct {
+	Series              []*LogStatisticGroupModel `json:"series"`
+	TodayTokenBreakdown DashboardTokenBreakdown   `json:"todayTokenBreakdown"`
+	TodayCacheHitRate   DashboardCacheHitRate     `json:"todayCacheHitRate"`
+}
+
+type DashboardTokenBreakdown struct {
+	RequestCount     int64 `json:"requestCount"`
+	InputTokens      int64 `json:"inputTokens"`
+	OutputTokens     int64 `json:"outputTokens"`
+	CacheTokens      int64 `json:"cacheTokens"`
+	CacheReadTokens  int64 `json:"cacheReadTokens"`
+	CacheWriteTokens int64 `json:"cacheWriteTokens"`
+	TotalTokens      int64 `json:"totalTokens"`
+}
+
+type DashboardCacheHitRate struct {
+	RequestCount  int64                        `json:"requestCount"`
+	CacheHitCount int64                        `json:"cacheHitCount"`
+	HitRate       float64                      `json:"hitRate"`
+	Models        []DashboardCacheHitRateModel `json:"models"`
+}
+
+type DashboardCacheHitRateModel struct {
+	ModelName     string  `json:"modelName"`
+	RequestCount  int64   `json:"requestCount"`
+	CacheHitCount int64   `json:"cacheHitCount"`
+	HitRate       float64 `json:"hitRate"`
 }
 
 func GetUserModelStatisticsByPeriod(userId int, startTime, endTime string) (LogStatistic []*LogStatisticGroupModel, err error) {
@@ -34,6 +71,10 @@ func GetUserModelStatisticsByPeriod(userId int, startTime, endTime string) (LogS
 		sum(quota) as quota,
 		sum(prompt_tokens) as prompt_tokens,
 		sum(completion_tokens) as completion_tokens,
+		sum(cache_tokens) as cache_tokens,
+		sum(cache_read_tokens) as cache_read_tokens,
+		sum(cache_write_tokens) as cache_write_tokens,
+		sum(cache_hit_count) as cache_hit_count,
 		sum(request_time) as request_time
 		FROM statistics
 		WHERE user_id= ?
@@ -42,6 +83,89 @@ func GetUserModelStatisticsByPeriod(userId int, startTime, endTime string) (LogS
 		ORDER BY date, model_name
 	`, userId, startTime, endTime).Scan(&LogStatistic).Error
 	return
+}
+
+func GetUserDashboardStatisticsByPeriod(userId int, startTime, endTime, today string) (*UserDashboard, error) {
+	series, err := GetUserModelStatisticsByPeriod(userId, startTime, endTime)
+	if err != nil {
+		return nil, err
+	}
+	return buildUserDashboard(series, today), nil
+}
+
+func buildUserDashboard(series []*LogStatisticGroupModel, today string) *UserDashboard {
+	dashboard := &UserDashboard{
+		Series: series,
+	}
+	if today == "" {
+		today = time.Now().Format("2006-01-02")
+	}
+
+	modelRates := make(map[string]*DashboardCacheHitRateModel)
+	for _, item := range series {
+		if item == nil || item.Date != today {
+			continue
+		}
+
+		inputTokens := normalizeInputTokens(item.PromptTokens, item.CacheTokens, item.CacheReadTokens, item.CacheWriteTokens)
+		dashboard.TodayTokenBreakdown.RequestCount += item.RequestCount
+		dashboard.TodayTokenBreakdown.InputTokens += inputTokens
+		dashboard.TodayTokenBreakdown.OutputTokens += item.CompletionTokens
+		dashboard.TodayTokenBreakdown.CacheTokens += item.CacheTokens
+		dashboard.TodayTokenBreakdown.CacheReadTokens += item.CacheReadTokens
+		dashboard.TodayTokenBreakdown.CacheWriteTokens += item.CacheWriteTokens
+
+		dashboard.TodayCacheHitRate.RequestCount += item.RequestCount
+		dashboard.TodayCacheHitRate.CacheHitCount += item.CacheHitCount
+
+		modelRate, ok := modelRates[item.ModelName]
+		if !ok {
+			modelRate = &DashboardCacheHitRateModel{
+				ModelName: item.ModelName,
+			}
+			modelRates[item.ModelName] = modelRate
+		}
+		modelRate.RequestCount += item.RequestCount
+		modelRate.CacheHitCount += item.CacheHitCount
+	}
+
+	dashboard.TodayTokenBreakdown.TotalTokens = dashboard.TodayTokenBreakdown.InputTokens +
+		dashboard.TodayTokenBreakdown.OutputTokens +
+		dashboard.TodayTokenBreakdown.CacheTokens +
+		dashboard.TodayTokenBreakdown.CacheReadTokens +
+		dashboard.TodayTokenBreakdown.CacheWriteTokens
+	dashboard.TodayCacheHitRate.HitRate = calculateCacheHitRate(
+		dashboard.TodayCacheHitRate.CacheHitCount,
+		dashboard.TodayCacheHitRate.RequestCount,
+	)
+
+	if len(modelRates) > 0 {
+		dashboard.TodayCacheHitRate.Models = make([]DashboardCacheHitRateModel, 0, len(modelRates))
+		for _, modelRate := range modelRates {
+			modelRate.HitRate = calculateCacheHitRate(modelRate.CacheHitCount, modelRate.RequestCount)
+			dashboard.TodayCacheHitRate.Models = append(dashboard.TodayCacheHitRate.Models, *modelRate)
+		}
+		sort.Slice(dashboard.TodayCacheHitRate.Models, func(i, j int) bool {
+			return dashboard.TodayCacheHitRate.Models[i].ModelName < dashboard.TodayCacheHitRate.Models[j].ModelName
+		})
+	}
+
+	return dashboard
+}
+
+func normalizeInputTokens(promptTokens, cacheTokens, cacheReadTokens, cacheWriteTokens int64) int64 {
+	inputTokens := promptTokens - cacheTokens - cacheReadTokens - cacheWriteTokens
+	if inputTokens < 0 {
+		return 0
+	}
+	return inputTokens
+}
+
+func calculateCacheHitRate(cacheHitCount, requestCount int64) float64 {
+	if requestCount <= 0 {
+		return 0
+	}
+	return float64(cacheHitCount) / float64(requestCount)
 }
 
 type MultiUserStatistic struct {
@@ -191,6 +315,10 @@ func GetChannelExpensesStatisticsByPeriod(startTime, endTime, groupType string, 
         sum(quota) as quota,
         sum(prompt_tokens) as prompt_tokens,
         sum(completion_tokens) as completion_tokens,
+        sum(cache_tokens) as cache_tokens,
+        sum(cache_read_tokens) as cache_read_tokens,
+        sum(cache_write_tokens) as cache_write_tokens,
+        sum(cache_hit_count) as cache_hit_count,
         sum(request_time) as request_time,`
 
 	var sql string
@@ -238,66 +366,123 @@ const (
 	StatisticsUpdateTypeALL       StatisticsUpdateType = 3
 )
 
-func UpdateStatistics(updateType StatisticsUpdateType) error {
-	sql := `
-	%s statistics (date, user_id, channel_id, model_name, request_count, quota, prompt_tokens, completion_tokens, request_time)
-	SELECT 
-		%s as date,
-		user_id,
-		channel_id,
-		model_name, 
-		count(1) as request_count,
-		sum(quota) as quota,
-		sum(prompt_tokens) as prompt_tokens,
-		sum(completion_tokens) as completion_tokens,
-		sum(request_time) as request_time
-	FROM logs
-	WHERE
-		type = 2
-		%s
-	GROUP BY date, channel_id, user_id, model_name
-	ORDER BY date, model_name
-	%s
-	`
-
-	sqlPrefix := ""
-	sqlWhere := ""
-	sqlDate := ""
-	sqlSuffix := ""
+func statisticsInsertPrefix() string {
 	if common.UsingSQLite {
-		sqlPrefix = "INSERT OR REPLACE INTO"
-		sqlDate = "strftime('%Y-%m-%d', datetime(created_at, 'unixepoch', '+8 hours'))"
-		sqlSuffix = ""
-	} else if common.UsingPostgreSQL {
-		sqlPrefix = "INSERT INTO"
-		sqlDate = "DATE_TRUNC('day', TO_TIMESTAMP(created_at))::DATE"
-		sqlSuffix = `ON CONFLICT (date, user_id, channel_id, model_name) DO UPDATE SET
-		request_count = EXCLUDED.request_count,
-		quota = EXCLUDED.quota,
-		prompt_tokens = EXCLUDED.prompt_tokens,
-		completion_tokens = EXCLUDED.completion_tokens,
-		request_time = EXCLUDED.request_time`
-	} else {
-		sqlPrefix = "INSERT INTO"
-		sqlDate = "DATE_FORMAT(FROM_UNIXTIME(created_at), '%Y-%m-%d')"
-		sqlSuffix = `ON DUPLICATE KEY UPDATE
-		request_count = VALUES(request_count),
-		quota = VALUES(quota),
-		prompt_tokens = VALUES(prompt_tokens),
-		completion_tokens = VALUES(completion_tokens),
-		request_time = VALUES(request_time)`
+		return "INSERT OR REPLACE INTO"
 	}
+	return "INSERT INTO"
+}
+
+func statisticsDateExpression() string {
+	if common.UsingSQLite {
+		return "strftime('%Y-%m-%d', datetime(created_at, 'unixepoch', '+8 hours'))"
+	}
+	if common.UsingPostgreSQL {
+		return "DATE_TRUNC('day', TO_TIMESTAMP(created_at))::DATE"
+	}
+	return "DATE_FORMAT(FROM_UNIXTIME(created_at), '%Y-%m-%d')"
+}
+
+func withStatisticsRebuildTransaction(tx *gorm.DB, rebuild func(*gorm.DB) error) error {
+	if tx == nil {
+		tx = DB
+	}
+	// Trade-off: readers may wait briefly on the rebuild transaction, but they never observe an empty replacement window.
+	return tx.Transaction(func(innerTx *gorm.DB) error {
+		return rebuild(innerTx)
+	})
+}
+
+func rebuildAllStatistics(tx *gorm.DB) error {
+	return withStatisticsRebuildTransaction(tx, func(innerTx *gorm.DB) error {
+		if err := innerTx.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&Statistics{}).Error; err != nil {
+			return err
+		}
+		return insertStatisticsRange(innerTx, 0, 0)
+	})
+}
+
+func rebuildStatisticsByCreatedAtRange(tx *gorm.DB, startTimestamp, endTimestamp int64) error {
+	startDate := time.Unix(startTimestamp, 0).In(time.Local).Format("2006-01-02")
+	endDate := startDate
+	if endTimestamp > startTimestamp {
+		endDate = time.Unix(endTimestamp-1, 0).In(time.Local).Format("2006-01-02")
+	}
+	return withStatisticsRebuildTransaction(tx, func(innerTx *gorm.DB) error {
+		if err := innerTx.Where("date BETWEEN ? AND ?", startDate, endDate).Delete(&Statistics{}).Error; err != nil {
+			return err
+		}
+		return insertStatisticsRange(innerTx, startTimestamp, endTimestamp)
+	})
+}
+
+func insertStatisticsRange(tx *gorm.DB, startTimestamp, endTimestamp int64) error {
+	if tx == nil {
+		tx = DB
+	}
+	whereParts := []string{"type = ?"}
+	args := []interface{}{LogTypeConsume}
+	if startTimestamp > 0 {
+		whereParts = append(whereParts, "created_at >= ?")
+		args = append(args, startTimestamp)
+	}
+	if endTimestamp > 0 {
+		whereParts = append(whereParts, "created_at < ?")
+		args = append(args, endTimestamp)
+	}
+
+	sql := fmt.Sprintf(`
+		%s statistics (
+			date,
+			user_id,
+			channel_id,
+			model_name,
+			request_count,
+			quota,
+			prompt_tokens,
+			completion_tokens,
+			cache_tokens,
+			cache_read_tokens,
+			cache_write_tokens,
+			cache_hit_count,
+			request_time
+		)
+		SELECT
+			%s as date,
+			user_id,
+			channel_id,
+			model_name,
+			count(1) as request_count,
+			sum(quota) as quota,
+			sum(prompt_tokens) as prompt_tokens,
+			sum(completion_tokens) as completion_tokens,
+			sum(cache_tokens) as cache_tokens,
+			sum(cache_read_tokens) as cache_read_tokens,
+			sum(cache_write_tokens) as cache_write_tokens,
+			sum(case when cache_tokens > 0 or cache_read_tokens > 0 then 1 else 0 end) as cache_hit_count,
+			sum(request_time) as request_time
+		FROM logs
+		WHERE %s
+		GROUP BY date, channel_id, user_id, model_name
+		ORDER BY date, model_name
+	`, statisticsInsertPrefix(), statisticsDateExpression(), strings.Join(whereParts, " AND "))
+
+	return tx.Exec(sql, args...).Error
+}
+
+func UpdateStatistics(updateType StatisticsUpdateType) error {
 	now := time.Now()
 	todayTimestamp := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).Unix()
 
 	switch updateType {
 	case StatisticsUpdateTypeToDay:
-		sqlWhere = fmt.Sprintf("AND created_at >= %d", todayTimestamp)
+		return rebuildStatisticsByCreatedAtRange(nil, todayTimestamp, todayTimestamp+86400)
 	case StatisticsUpdateTypeYesterday:
 		yesterdayTimestamp := todayTimestamp - 86400
-		sqlWhere = fmt.Sprintf("AND created_at >= %d AND created_at < %d", yesterdayTimestamp, todayTimestamp)
+		return rebuildStatisticsByCreatedAtRange(nil, yesterdayTimestamp, todayTimestamp)
+	case StatisticsUpdateTypeALL:
+		return rebuildAllStatistics(nil)
+	default:
+		return rebuildAllStatistics(nil)
 	}
-
-	err := DB.Exec(fmt.Sprintf(sql, sqlPrefix, sqlDate, sqlWhere, sqlSuffix)).Error
-	return err
 }

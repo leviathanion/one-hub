@@ -14,6 +14,8 @@ import QuotaLogWeek from './component/QuotaLogWeek';
 import QuickStartCard from './component/QuickStartCard';
 import RPM from './component/RPM';
 import StatusPanel from './component/StatusPanel';
+import TodayTokenBreakdownCard from './component/TodayTokenBreakdownCard';
+import CacheHitRateCard from './component/CacheHitRateCard';
 import { useSelector } from 'react-redux';
 
 // TabPanel component for tab content
@@ -51,18 +53,20 @@ const Dashboard = () => {
       if (success) {
         if (data) {
           setDashboardData(data);
-          let lineData = getLineDataGroup(data);
+          const series = data.series || [];
+          let lineData = getLineDataGroup(series);
           setRequestChart(getLineCardOption(lineData, 'RequestCount'));
           setQuotaChart(getLineCardOption(lineData, 'Quota'));
           setTokenChart(getLineCardOption(lineData, 'PromptTokens'));
-          setStatisticalData(getBarDataGroup(data));
-          setModelUsageData(getModelUsageData(data));
+          setStatisticalData(getBarDataGroup(series));
+          setModelUsageData(getModelUsageData(series));
         }
       } else {
         showError(message);
       }
       setLoading(false);
     } catch (error) {
+      setLoading(false);
       return;
     }
   };
@@ -119,12 +123,23 @@ const Dashboard = () => {
 
       <Grid item xs={12}>
         <Grid container spacing={gridSpacing}>
+          <Grid item lg={6} xs={12}>
+            <TodayTokenBreakdownCard isLoading={isLoading} data={dashboardData?.todayTokenBreakdown} />
+          </Grid>
+          <Grid item lg={6} xs={12}>
+            <CacheHitRateCard isLoading={isLoading} data={dashboardData?.todayCacheHitRate} />
+          </Grid>
+        </Grid>
+      </Grid>
+
+      <Grid item xs={12}>
+        <Grid container spacing={gridSpacing}>
           <Grid item lg={8} xs={12}>
             {/* 7日模型消费统计 */}
             <ApexCharts isLoading={isLoading} chartDatas={statisticalData} title={t('dashboard_index.week_model_statistics')} />
             <Box mt={2}>
               {/* 7日消费统计 */}
-              <QuotaLogWeek data={dashboardData} />
+              <QuotaLogWeek data={dashboardData?.series || []} />
             </Box>
           </Grid>
 
@@ -214,6 +229,9 @@ const Dashboard = () => {
 
 // 新增函数来处理模型使用数据
 function getModelUsageData(data) {
+  if (!Array.isArray(data)) {
+    return [];
+  }
   const modelUsage = {};
   data.forEach((item) => {
     if (!modelUsage[item.ModelName]) {
@@ -230,6 +248,9 @@ function getModelUsageData(data) {
 export default Dashboard;
 
 function getLineDataGroup(statisticalData) {
+  if (!Array.isArray(statisticalData)) {
+    return [];
+  }
   let groupedData = statisticalData.reduce((acc, cur) => {
     if (!acc[cur.Date]) {
       acc[cur.Date] = {
@@ -263,6 +284,9 @@ function getLineDataGroup(statisticalData) {
 }
 
 function getBarDataGroup(data) {
+  if (!Array.isArray(data)) {
+    return null;
+  }
   const lastSevenDays = getLastSevenDays();
   const result = [];
   const map = new Map();

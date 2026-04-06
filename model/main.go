@@ -83,6 +83,7 @@ func chooseDB() (*gorm.DB, error) {
 		logger.SysLog("using MySQL as database")
 		// mysql 时区设置
 		dsn = dsnAddArg(dsn, "loc", localTimezone)
+		dsn = dsnAddArg(dsn, "time_zone", mysqlSessionTimezoneValue(time.Now(), time.Local))
 		// dsn = dsnAddArg(dsn, "parseTime", "true")
 		return gorm.Open(mysql.Open(dsn), &gorm.Config{
 			PrepareStmt: true, // precompile SQL
@@ -258,4 +259,23 @@ func dsnAddArg(dsn string, arg string, value string) string {
 		}
 	}
 	return dsn
+}
+
+func mysqlSessionTimezoneValue(now time.Time, location *time.Location) string {
+	if location == nil {
+		location = time.Local
+	}
+
+	// Trade-off: use the current local UTC offset so MySQL session grouping matches the app's
+	// dashboard day boundary without requiring timezone tables on the database server.
+	_, offsetSeconds := now.In(location).Zone()
+	sign := "+"
+	if offsetSeconds < 0 {
+		sign = "-"
+		offsetSeconds = -offsetSeconds
+	}
+
+	hours := offsetSeconds / 3600
+	minutes := (offsetSeconds % 3600) / 60
+	return fmt.Sprintf("'%s%02d:%02d'", sign, hours, minutes)
 }

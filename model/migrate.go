@@ -6,6 +6,7 @@ import (
 	"one-api/common/logger"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-gormigrate/gormigrate/v2"
 	"gorm.io/datatypes"
@@ -95,10 +96,7 @@ func migrationBefore(db *gorm.DB) error {
 		return nil
 	}
 
-	m := gormigrate.New(db, gormigrate.DefaultOptions, []*gormigrate.Migration{
-		removeKeyIndexMigration(),
-		changeTokenKeyColumnType(),
-	})
+	m := gormigrate.New(db, gormigrate.DefaultOptions, beforeAutoMigrateMigrations())
 	return m.Migrate()
 }
 
@@ -106,8 +104,7 @@ func addStatistics() *gormigrate.Migration {
 	return &gormigrate.Migration{
 		ID: "202408100001",
 		Migrate: func(tx *gorm.DB) error {
-			go UpdateStatistics(StatisticsUpdateTypeALL)
-			return nil
+			return rebuildAllStatistics(tx)
 		},
 		Rollback: func(tx *gorm.DB) error {
 			return nil
@@ -239,15 +236,17 @@ func addOldTokenMaxId() *gormigrate.Migration {
 		ID: "202411300002",
 		Migrate: func(tx *gorm.DB) error {
 			var token Token
-			tx.Last(&token)
+			_ = tx.Last(&token).Error
 			tokenMaxId := token.Id
 			option := Option{
 				Key: "OldTokenMaxId",
 			}
 
-			DB.FirstOrCreate(&option, Option{Key: "OldTokenMaxId"})
+			if err := tx.FirstOrCreate(&option, Option{Key: "OldTokenMaxId"}).Error; err != nil {
+				return err
+			}
 			option.Value = strconv.Itoa(tokenMaxId)
-			return DB.Save(&option).Error
+			return tx.Save(&option).Error
 		},
 		Rollback: func(tx *gorm.DB) error {
 			return tx.Rollback().Error
@@ -443,19 +442,148 @@ func migrateTokenLimitsStructure() *gormigrate.Migration {
 		},
 	}
 }
-func migrationAfter(db *gorm.DB) error {
-	// 从库不执行
-	if !config.IsMasterNode {
-		logger.SysLog("从库不执行迁移后操作")
-		return nil
+
+func extractMetadataTokenValue(metadata map[string]any, key string) int {
+	if len(metadata) == 0 {
+		return 0
 	}
-	m := gormigrate.New(db, gormigrate.DefaultOptions, []*gormigrate.Migration{
+	if value, ok := metadata[key]; ok {
+		return normalizeMetadataInt(value)
+	}
+	extraTokens, ok := metadata["extra_tokens"]
+	if !ok {
+		return 0
+	}
+	switch typed := extraTokens.(type) {
+	case map[string]any:
+		return normalizeMetadataInt(typed[key])
+	case map[string]int:
+		return typed[key]
+	}
+	return 0
+}
+
+func normalizeMetadataInt(value any) int {
+	switch typed := value.(type) {
+	case nil:
+		return 0
+	case int:
+		return typed
+	case int8:
+		return int(typed)
+	case int16:
+		return int(typed)
+	case int32:
+		return int(typed)
+	case int64:
+		return int(typed)
+	case uint:
+		return int(typed)
+	case uint8:
+		return int(typed)
+	case uint16:
+		return int(typed)
+	case uint32:
+		return int(typed)
+	case uint64:
+		return int(typed)
+	case float32:
+		return int(typed)
+	case float64:
+		return int(typed)
+	case json.Number:
+		number, err := typed.Int64()
+		if err == nil {
+			return int(number)
+		}
+	case string:
+		number, err := strconv.Atoi(strings.TrimSpace(typed))
+		if err == nil {
+			return number
+		}
+	}
+	return 0
+}
+
+func backfillLogCacheTokensFromMetadata(tx *gorm.DB, startTimestamp, endTimestamp int64) error {
+	var logs []Log
+	return tx.Select("id", "metadata", "cache_tokens", "cache_read_tokens", "cache_write_tokens").
+		Where("type = ? AND created_at >= ? AND created_at < ?", LogTypeConsume, startTimestamp, endTimestamp).
+		FindInBatches(&logs, 200, func(batchTx *gorm.DB, batch int) error {
+			for _, log := range logs {
+				metadata := log.Metadata.Data()
+				cacheTokens := extractMetadataTokenValue(metadata, config.UsageExtraCache)
+				cacheReadTokens := extractMetadataTokenValue(metadata, config.UsageExtraCachedRead)
+				cacheWriteTokens := extractMetadataTokenValue(metadata, config.UsageExtraCachedWrite)
+				if cacheTokens == log.CacheTokens && cacheReadTokens == log.CacheReadTokens && cacheWriteTokens == log.CacheWriteTokens {
+					continue
+				}
+				if err := batchTx.Model(&Log{}).Where("id = ?", log.Id).Updates(map[string]any{
+					"cache_tokens":       cacheTokens,
+					"cache_read_tokens":  cacheReadTokens,
+					"cache_write_tokens": cacheWriteTokens,
+				}).Error; err != nil {
+					return err
+				}
+			}
+			return nil
+		}).Error
+}
+
+func dashboardCacheTokenWindow() (int64, int64) {
+	now := time.Now()
+	windowStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).AddDate(0, 0, -7).Unix()
+	windowEnd := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).Add(24 * time.Hour).Unix()
+	return windowStart, windowEnd
+}
+
+func addDashboardCacheTokenMigration() *gormigrate.Migration {
+	return &gormigrate.Migration{
+		ID: "202604060001",
+		Migrate: func(tx *gorm.DB) error {
+			if !tx.Migrator().HasTable("logs") || !tx.Migrator().HasTable("statistics") {
+				return nil
+			}
+
+			windowStart, windowEnd := dashboardCacheTokenWindow()
+
+			// Trade-off: only backfill the active dashboard window on startup to keep upgrades bounded.
+			if err := backfillLogCacheTokensFromMetadata(tx, windowStart, windowEnd); err != nil {
+				return err
+			}
+			return rebuildStatisticsByCreatedAtRange(tx, windowStart, windowEnd)
+		},
+		Rollback: func(tx *gorm.DB) error {
+			return nil
+		},
+	}
+}
+
+func beforeAutoMigrateMigrations() []*gormigrate.Migration {
+	return []*gormigrate.Migration{
+		removeKeyIndexMigration(),
+		changeTokenKeyColumnType(),
+	}
+}
+
+func afterAutoMigrateMigrations() []*gormigrate.Migration {
+	return []*gormigrate.Migration{
 		addStatistics(),
 		changeChannelApiVersion(),
 		initUserGroup(),
 		addOldTokenMaxId(),
 		addExtraRatios(),
 		migrateTokenLimitsStructure(),
-	})
+		addDashboardCacheTokenMigration(),
+	}
+}
+
+func migrationAfter(db *gorm.DB) error {
+	// 从库不执行
+	if !config.IsMasterNode {
+		logger.SysLog("从库不执行迁移后操作")
+		return nil
+	}
+	m := gormigrate.New(db, gormigrate.DefaultOptions, afterAutoMigrateMigrations())
 	return m.Migrate()
 }

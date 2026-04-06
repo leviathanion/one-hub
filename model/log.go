@@ -23,6 +23,9 @@ type Log struct {
 	Quota            int                                `json:"quota" gorm:"default:0"`
 	PromptTokens     int                                `json:"prompt_tokens" gorm:"default:0"`
 	CompletionTokens int                                `json:"completion_tokens" gorm:"default:0"`
+	CacheTokens      int                                `json:"cache_tokens" gorm:"default:0"`
+	CacheReadTokens  int                                `json:"cache_read_tokens" gorm:"default:0"`
+	CacheWriteTokens int                                `json:"cache_write_tokens" gorm:"default:0"`
 	ChannelId        int                                `json:"channel_id" gorm:"index"`
 	RequestTime      int                                `json:"request_time" gorm:"default:0"`
 	IsStream         bool                               `json:"is_stream" gorm:"default:false"`
@@ -85,6 +88,9 @@ func RecordConsumeLog(
 	channelId int,
 	promptTokens int,
 	completionTokens int,
+	cacheTokens int,
+	cacheReadTokens int,
+	cacheWriteTokens int,
 	modelName string,
 	tokenName string,
 	quota int,
@@ -108,6 +114,9 @@ func RecordConsumeLog(
 		Content:          content,
 		PromptTokens:     promptTokens,
 		CompletionTokens: completionTokens,
+		CacheTokens:      cacheTokens,
+		CacheReadTokens:  cacheReadTokens,
+		CacheWriteTokens: cacheWriteTokens,
 		TokenName:        tokenName,
 		ModelName:        modelName,
 		Quota:            quota,
@@ -258,6 +267,10 @@ type LogStatistic struct {
 	Quota            int64  `gorm:"column:quota"`
 	PromptTokens     int64  `gorm:"column:prompt_tokens"`
 	CompletionTokens int64  `gorm:"column:completion_tokens"`
+	CacheTokens      int64  `gorm:"column:cache_tokens"`
+	CacheReadTokens  int64  `gorm:"column:cache_read_tokens"`
+	CacheWriteTokens int64  `gorm:"column:cache_write_tokens"`
+	CacheHitCount    int64  `gorm:"column:cache_hit_count"`
 	RequestTime      int64  `gorm:"column:request_time"`
 }
 

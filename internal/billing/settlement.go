@@ -280,6 +280,10 @@ func runSettlementCleanup(ctx context.Context, cmd SettlementCommand, opts Settl
 
 func runSettlementProjection(ctx context.Context, cmd SettlementCommand, opts SettlementOptions) {
 	usage := cmd.UsageSummary.ToUsage()
+	extraTokens := usage.GetExtraTokens()
+	cacheTokens := extraTokens[config.UsageExtraCache]
+	cacheReadTokens := extraTokens[config.UsageExtraCachedRead]
+	cacheWriteTokens := extraTokens[config.UsageExtraCachedWrite]
 
 	model.RecordConsumeLog(
 		ctx,
@@ -287,6 +291,9 @@ func runSettlementProjection(ctx context.Context, cmd SettlementCommand, opts Se
 		cmd.ChannelID,
 		usage.PromptTokens,
 		usage.CompletionTokens,
+		cacheTokens,
+		cacheReadTokens,
+		cacheWriteTokens,
 		cmd.ModelName,
 		opts.Projection.TokenName,
 		cmd.FinalQuota,

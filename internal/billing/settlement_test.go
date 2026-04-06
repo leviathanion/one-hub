@@ -10,6 +10,7 @@ import (
 	commonredis "one-api/common/redis"
 	"one-api/internal/testutil/fakeredis"
 	"one-api/model"
+	"one-api/types"
 
 	"go.uber.org/zap"
 	"gorm.io/driver/sqlite"
@@ -154,6 +155,13 @@ func TestApplySettlementProjectionUsesFinalQuota(t *testing.T) {
 			PromptTokens:     10,
 			CompletionTokens: 20,
 			TotalTokens:      30,
+			PromptTokensDetails: types.PromptTokensDetails{
+				CachedTokens: 3,
+			},
+			ExtraTokens: map[string]int{
+				config.UsageExtraCachedRead:  4,
+				config.UsageExtraCachedWrite: 2,
+			},
 		},
 	}
 	opts := SettlementOptions{
@@ -193,6 +201,9 @@ func TestApplySettlementProjectionUsesFinalQuota(t *testing.T) {
 	}
 	if log.Quota != 250 || log.PromptTokens != 10 || log.CompletionTokens != 20 {
 		t.Fatalf("expected consume log to record final quota and usage, got %+v", log)
+	}
+	if log.CacheTokens != 3 || log.CacheReadTokens != 4 || log.CacheWriteTokens != 2 {
+		t.Fatalf("expected consume log to persist cache token breakdown, got %+v", log)
 	}
 	if log.Metadata.Data()["user_agent"] != "Codex/1.2" {
 		t.Fatalf("expected consume log to persist metadata user-agent, got %#v", log.Metadata.Data())
