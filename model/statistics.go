@@ -1,6 +1,7 @@
 package model
 
 import (
+	"errors"
 	"fmt"
 	"one-api/common"
 	"sort"
@@ -26,10 +27,18 @@ type Statistics struct {
 	RequestTime      int       `json:"request_time"`
 }
 
+type DashboardDateRange struct {
+	Start string `json:"start"`
+	End   string `json:"end"`
+	Today string `json:"today"`
+}
+
 type UserDashboard struct {
-	Series              []*LogStatisticGroupModel `json:"series"`
-	TodayTokenBreakdown DashboardTokenBreakdown   `json:"todayTokenBreakdown"`
-	TodayCacheHitRate   DashboardCacheHitRate     `json:"todayCacheHitRate"`
+	DateRange                  DashboardDateRange          `json:"dateRange"`
+	Series                     []*LogStatisticGroupModel   `json:"series"`
+	TodayTokenBreakdown        DashboardTokenBreakdown     `json:"todayTokenBreakdown"`
+	TodayCacheHitRate          DashboardCacheHitRate       `json:"todayCacheHitRate"`
+	CacheOverviewFilterOptions DashboardCacheFilterOptions `json:"cacheOverviewFilterOptions"`
 }
 
 type DashboardTokenBreakdown struct {
@@ -54,6 +63,110 @@ type DashboardCacheHitRateModel struct {
 	RequestCount  int64   `json:"requestCount"`
 	CacheHitCount int64   `json:"cacheHitCount"`
 	HitRate       float64 `json:"hitRate"`
+}
+
+type DashboardCacheOverviewFilters struct {
+	ModelName string `json:"model_name"`
+	ChannelId int    `json:"channel_id"`
+}
+
+type DashboardChannelOption struct {
+	Id   int    `json:"id" gorm:"column:id"`
+	Name string `json:"name" gorm:"column:name"`
+}
+
+type DashboardCacheFilterOptions struct {
+	Models   []string                 `json:"models"`
+	Channels []DashboardChannelOption `json:"channels"`
+}
+
+type DashboardCacheOverview struct {
+	DateRange           DashboardDateRange          `json:"dateRange"`
+	TodayTokenBreakdown DashboardTokenBreakdown     `json:"todayTokenBreakdown"`
+	TodayCacheHitRate   DashboardCacheHitRate       `json:"todayCacheHitRate"`
+	FilterOptions       DashboardCacheFilterOptions `json:"filterOptions"`
+}
+
+const dashboardSnapshotLookbackDays = 6
+const DashboardSnapshotMismatchCode = "DASHBOARD_SNAPSHOT_MISMATCH"
+
+type DashboardSnapshotMismatchError struct {
+	Expected DashboardDateRange
+	Actual   DashboardDateRange
+}
+
+func (e *DashboardSnapshotMismatchError) Error() string {
+	return fmt.Sprintf(
+		"dateRange must match the current dashboard snapshot (expected start=%s end=%s today=%s, got start=%s end=%s today=%s)",
+		e.Expected.Start,
+		e.Expected.End,
+		e.Expected.Today,
+		e.Actual.Start,
+		e.Actual.End,
+		e.Actual.Today,
+	)
+}
+
+func IsDashboardSnapshotMismatchError(err error) bool {
+	var mismatchErr *DashboardSnapshotMismatchError
+	return errors.As(err, &mismatchErr)
+}
+
+func BuildDashboardDateRange(now time.Time) DashboardDateRange {
+	toDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	today := toDay.Format("2006-01-02")
+
+	// The dashboard renders today plus the previous six calendar days, and the
+	// statistics table stores dates without a time component, so the query
+	// window should stay inclusive on these YYYY-MM-DD boundaries.
+	return DashboardDateRange{
+		Start: toDay.AddDate(0, 0, -dashboardSnapshotLookbackDays).Format("2006-01-02"),
+		End:   today,
+		Today: today,
+	}
+}
+
+func NormalizeDashboardDateRange(dateRange DashboardDateRange) (DashboardDateRange, error) {
+	if dateRange.Start == "" || dateRange.End == "" || dateRange.Today == "" {
+		return DashboardDateRange{}, fmt.Errorf("dateRange.start, dateRange.end, and dateRange.today are required")
+	}
+
+	start, err := time.ParseInLocation("2006-01-02", dateRange.Start, time.Local)
+	if err != nil {
+		return DashboardDateRange{}, fmt.Errorf("invalid dateRange.start: %w", err)
+	}
+	end, err := time.ParseInLocation("2006-01-02", dateRange.End, time.Local)
+	if err != nil {
+		return DashboardDateRange{}, fmt.Errorf("invalid dateRange.end: %w", err)
+	}
+	today, err := time.ParseInLocation("2006-01-02", dateRange.Today, time.Local)
+	if err != nil {
+		return DashboardDateRange{}, fmt.Errorf("invalid dateRange.today: %w", err)
+	}
+	if end.Before(start) {
+		return DashboardDateRange{}, fmt.Errorf("dateRange.end must not be before dateRange.start")
+	}
+	if !end.Equal(today) {
+		return DashboardDateRange{}, fmt.Errorf("dateRange.end must equal dateRange.today")
+	}
+
+	return DashboardDateRange{
+		Start: start.Format("2006-01-02"),
+		End:   end.Format("2006-01-02"),
+		Today: today.Format("2006-01-02"),
+	}, nil
+}
+
+func ValidateDashboardDateRangeMatchesSnapshot(dateRange DashboardDateRange, now time.Time) error {
+	expected := BuildDashboardDateRange(now)
+	if dateRange == expected {
+		return nil
+	}
+
+	return &DashboardSnapshotMismatchError{
+		Expected: expected,
+		Actual:   dateRange,
+	}
 }
 
 func GetUserModelStatisticsByPeriod(userId int, startTime, endTime string) (LogStatistic []*LogStatisticGroupModel, err error) {
@@ -85,17 +198,130 @@ func GetUserModelStatisticsByPeriod(userId int, startTime, endTime string) (LogS
 	return
 }
 
-func GetUserDashboardStatisticsByPeriod(userId int, startTime, endTime, today string) (*UserDashboard, error) {
-	series, err := GetUserModelStatisticsByPeriod(userId, startTime, endTime)
+func GetUserDashboardStatisticsByPeriod(userId int, dateRange DashboardDateRange) (*UserDashboard, error) {
+	series, err := GetUserModelStatisticsByPeriod(userId, dateRange.Start, dateRange.End)
 	if err != nil {
 		return nil, err
 	}
-	return buildUserDashboard(series, today), nil
+	filterOptions, err := GetUserDashboardCacheFilterOptions(userId, dateRange)
+	if err != nil {
+		return nil, err
+	}
+	dashboard := buildUserDashboard(series, dateRange.Today)
+	dashboard.DateRange = dateRange
+	dashboard.CacheOverviewFilterOptions = *filterOptions
+	return dashboard, nil
+}
+
+// GetUserDashboardCacheOverview serves the cache overview module as a
+// today-only snapshot. The surrounding dashboard request still carries the
+// shared seven-day dateRange contract, but this module's metrics and filter
+// options must come from the same today slice so every exposed filter can
+// produce meaningful today cards.
+func GetUserDashboardCacheOverview(userId int, dateRange DashboardDateRange, filters DashboardCacheOverviewFilters) (*DashboardCacheOverview, error) {
+	series, err := getUserModelStatisticsByPeriodWithFilters(userId, dateRange.Today, dateRange.Today, filters)
+	if err != nil {
+		return nil, err
+	}
+
+	filterOptions, err := GetUserDashboardCacheFilterOptions(userId, dateRange)
+	if err != nil {
+		return nil, err
+	}
+
+	dashboard := buildUserDashboard(series, dateRange.Today)
+	return &DashboardCacheOverview{
+		DateRange:           dateRange,
+		TodayTokenBreakdown: dashboard.TodayTokenBreakdown,
+		TodayCacheHitRate:   dashboard.TodayCacheHitRate,
+		FilterOptions:       *filterOptions,
+	}, nil
+}
+
+func getUserModelStatisticsByPeriodWithFilters(userId int, startTime, endTime string, filters DashboardCacheOverviewFilters) (logStatistic []*LogStatisticGroupModel, err error) {
+	dateStr := "date"
+	if common.UsingPostgreSQL {
+		dateStr = "TO_CHAR(date, 'YYYY-MM-DD') as date"
+	} else if common.UsingSQLite {
+		dateStr = "strftime('%Y-%m-%d', date) as date"
+	}
+
+	var whereClause strings.Builder
+	whereClause.WriteString("WHERE user_id = ? AND date BETWEEN ? AND ?")
+	args := []interface{}{userId, startTime, endTime}
+	if filters.ModelName != "" {
+		whereClause.WriteString(" AND model_name = ?")
+		args = append(args, filters.ModelName)
+	}
+	if filters.ChannelId != 0 {
+		whereClause.WriteString(" AND channel_id = ?")
+		args = append(args, filters.ChannelId)
+	}
+
+	query := `
+		SELECT ` + dateStr + `,
+		model_name,
+		sum(request_count) as request_count,
+		sum(quota) as quota,
+		sum(prompt_tokens) as prompt_tokens,
+		sum(completion_tokens) as completion_tokens,
+		sum(cache_tokens) as cache_tokens,
+		sum(cache_read_tokens) as cache_read_tokens,
+		sum(cache_write_tokens) as cache_write_tokens,
+		sum(cache_hit_count) as cache_hit_count,
+		sum(request_time) as request_time
+		FROM statistics
+		` + whereClause.String() + `
+		GROUP BY date, model_name
+		ORDER BY date, model_name
+	`
+
+	err = DB.Raw(query, args...).Scan(&logStatistic).Error
+	return
+}
+
+func GetUserDashboardCacheFilterOptions(userId int, dateRange DashboardDateRange) (*DashboardCacheFilterOptions, error) {
+	filterOptions := &DashboardCacheFilterOptions{
+		Models:   make([]string, 0),
+		Channels: make([]DashboardChannelOption, 0),
+	}
+
+	if err := DB.Model(&Statistics{}).
+		Where("user_id = ? AND date = ? AND model_name <> ''", userId, dateRange.Today).
+		Distinct().
+		Order("model_name").
+		Pluck("model_name", &filterOptions.Models).Error; err != nil {
+		return nil, err
+	}
+
+	// User dashboard filters are visible to every authenticated user, so keep
+	// internal channel metadata admin-only and expose only stable channel ids.
+	err := DB.Table("statistics").
+		Select("statistics.channel_id as id").
+		Where("statistics.user_id = ? AND statistics.date = ? AND statistics.channel_id <> 0", userId, dateRange.Today).
+		Group("statistics.channel_id").
+		Order("statistics.channel_id").
+		Scan(&filterOptions.Channels).Error
+	if err != nil {
+		return nil, err
+	}
+
+	if filterOptions.Models == nil {
+		filterOptions.Models = make([]string, 0)
+	}
+	if filterOptions.Channels == nil {
+		filterOptions.Channels = make([]DashboardChannelOption, 0)
+	}
+
+	return filterOptions, nil
 }
 
 func buildUserDashboard(series []*LogStatisticGroupModel, today string) *UserDashboard {
 	dashboard := &UserDashboard{
 		Series: series,
+		TodayCacheHitRate: DashboardCacheHitRate{
+			Models: make([]DashboardCacheHitRateModel, 0),
+		},
 	}
 	if today == "" {
 		today = time.Now().Format("2006-01-02")

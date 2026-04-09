@@ -284,14 +284,9 @@ func GetRateRealtime(c *gin.Context) {
 
 func GetUserDashboard(c *gin.Context) {
 	id := c.GetInt("id")
+	dateRange := model.BuildDashboardDateRange(time.Now())
 
-	now := time.Now()
-	toDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	today := toDay.Format("2006-01-02")
-	endOfDay := toDay.Add(-time.Second).Add(time.Hour * 24).Format("2006-01-02")
-	startOfDay := toDay.AddDate(0, 0, -7).Format("2006-01-02")
-
-	dashboards, err := model.GetUserDashboardStatisticsByPeriod(id, startOfDay, endOfDay, today)
+	dashboards, err := model.GetUserDashboardStatisticsByPeriod(id, dateRange)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,

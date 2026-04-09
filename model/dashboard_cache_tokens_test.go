@@ -1,6 +1,7 @@
 package model
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"testing"
@@ -131,6 +132,242 @@ func TestBuildUserDashboardSeparatesCacheTokens(t *testing.T) {
 	}
 	if dashboard.TodayCacheHitRate.Models[1].RequestCount != 1 || dashboard.TodayCacheHitRate.Models[1].CacheHitCount != 1 {
 		t.Fatalf("expected per-model cache hit stats to be aggregated, got %+v", dashboard.TodayCacheHitRate.Models[1])
+	}
+}
+
+func TestGetUserDashboardCacheOverviewAppliesFiltersAndKeepsChannelNamesPrivate(t *testing.T) {
+	useDashboardMigrationTestDB(t)
+
+	if err := DB.Create([]*Channel{
+		{Id: 1, Name: "Alpha"},
+		{Id: 2, Name: "Beta"},
+		{Id: 3, Name: "Gamma"},
+	}).Error; err != nil {
+		t.Fatalf("expected channel fixtures to persist, got %v", err)
+	}
+
+	insertSQL := `
+		INSERT INTO statistics
+		(date, user_id, channel_id, model_name, request_count, quota, prompt_tokens, completion_tokens, cache_tokens, cache_read_tokens, cache_write_tokens, cache_hit_count, request_time)
+		VALUES
+		(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?),
+		(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?),
+		(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?),
+		(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?),
+		(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?),
+		(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`
+	if err := DB.Exec(insertSQL,
+		"2026-04-06", 1, 1, "gpt-4.1", 2, 20, 120, 30, 0, 40, 10, 1, 50,
+		"2026-04-06", 1, 2, "gpt-4.1", 1, 10, 60, 15, 5, 0, 0, 1, 25,
+		"2026-04-06", 1, 2, "gpt-4o", 4, 40, 40, 8, 0, 0, 0, 0, 70,
+		"2026-04-05", 1, 1, "gpt-4.1", 9, 90, 900, 90, 9, 9, 9, 9, 90,
+		"2026-04-05", 1, 3, "gpt-4.1-mini", 7, 70, 700, 70, 7, 7, 7, 7, 70,
+		"2026-04-06", 2, 1, "gpt-4.1", 99, 99, 99, 99, 99, 99, 99, 99, 99,
+	).Error; err != nil {
+		t.Fatalf("expected statistics fixtures to persist, got %v", err)
+	}
+
+	dateRange := DashboardDateRange{
+		Start: "2026-03-31",
+		End:   "2026-04-06",
+		Today: "2026-04-06",
+	}
+
+	overview, err := GetUserDashboardCacheOverview(1, dateRange, DashboardCacheOverviewFilters{
+		ModelName: "gpt-4.1",
+	})
+	if err != nil {
+		t.Fatalf("expected cache overview lookup to succeed, got %v", err)
+	}
+
+	if overview.TodayTokenBreakdown.RequestCount != 3 {
+		t.Fatalf("expected filtered request count to be 3, got %+v", overview.TodayTokenBreakdown)
+	}
+	if overview.TodayTokenBreakdown.InputTokens != 125 {
+		t.Fatalf("expected filtered input tokens to be 125, got %+v", overview.TodayTokenBreakdown)
+	}
+	if overview.TodayTokenBreakdown.CacheTokens != 5 || overview.TodayTokenBreakdown.CacheReadTokens != 40 || overview.TodayTokenBreakdown.CacheWriteTokens != 10 {
+		t.Fatalf("expected filtered cache token totals to match model slice, got %+v", overview.TodayTokenBreakdown)
+	}
+	if math.Abs(overview.TodayCacheHitRate.HitRate-(2.0/3.0)) > 1e-9 {
+		t.Fatalf("expected filtered hit rate to be 2/3, got %+v", overview.TodayCacheHitRate)
+	}
+	if len(overview.FilterOptions.Models) != 2 || overview.FilterOptions.Models[0] != "gpt-4.1" || overview.FilterOptions.Models[1] != "gpt-4o" {
+		t.Fatalf("expected filter models to stay unfiltered and sorted, got %+v", overview.FilterOptions.Models)
+	}
+	for _, modelName := range overview.FilterOptions.Models {
+		if modelName == "gpt-4.1-mini" {
+			t.Fatalf("expected historical-only models to be omitted from today filter options, got %+v", overview.FilterOptions.Models)
+		}
+	}
+	if len(overview.FilterOptions.Channels) != 2 || overview.FilterOptions.Channels[0].Id != 1 || overview.FilterOptions.Channels[1].Id != 2 {
+		t.Fatalf("expected filter channels to expose only stable ids, got %+v", overview.FilterOptions.Channels)
+	}
+	for _, channel := range overview.FilterOptions.Channels {
+		if channel.Id == 3 {
+			t.Fatalf("expected historical-only channels to be omitted from today filter options, got %+v", overview.FilterOptions.Channels)
+		}
+	}
+	if overview.FilterOptions.Channels[0].Name != "" || overview.FilterOptions.Channels[1].Name != "" {
+		t.Fatalf("expected filter channels not to leak internal names, got %+v", overview.FilterOptions.Channels)
+	}
+	if overview.DateRange != dateRange {
+		t.Fatalf("expected cache overview to echo the snapshot date range, got %+v", overview.DateRange)
+	}
+
+	channelOverview, err := GetUserDashboardCacheOverview(1, dateRange, DashboardCacheOverviewFilters{
+		ChannelId: 2,
+	})
+	if err != nil {
+		t.Fatalf("expected channel-filtered cache overview lookup to succeed, got %v", err)
+	}
+
+	if channelOverview.TodayTokenBreakdown.RequestCount != 5 {
+		t.Fatalf("expected channel filter request count to be 5, got %+v", channelOverview.TodayTokenBreakdown)
+	}
+	if math.Abs(channelOverview.TodayCacheHitRate.HitRate-0.2) > 1e-9 {
+		t.Fatalf("expected channel filter hit rate to be 0.2, got %+v", channelOverview.TodayCacheHitRate)
+	}
+
+	intersectionOverview, err := GetUserDashboardCacheOverview(1, dateRange, DashboardCacheOverviewFilters{
+		ModelName: "gpt-4.1",
+		ChannelId: 2,
+	})
+	if err != nil {
+		t.Fatalf("expected model+channel filtered cache overview lookup to succeed, got %v", err)
+	}
+
+	if intersectionOverview.TodayTokenBreakdown.RequestCount != 1 || intersectionOverview.TodayTokenBreakdown.TotalTokens != 75 {
+		t.Fatalf("expected intersection filter to isolate a single statistics row, got %+v", intersectionOverview.TodayTokenBreakdown)
+	}
+	if math.Abs(intersectionOverview.TodayCacheHitRate.HitRate-1.0) > 1e-9 {
+		t.Fatalf("expected intersection hit rate to be 1, got %+v", intersectionOverview.TodayCacheHitRate)
+	}
+}
+
+func TestGetUserDashboardCacheOverviewReturnsEmptyTodayScopeWhenTodayHasNoData(t *testing.T) {
+	useDashboardMigrationTestDB(t)
+
+	if err := DB.Exec(`
+		INSERT INTO statistics
+		(date, user_id, channel_id, model_name, request_count, quota, prompt_tokens, completion_tokens, cache_tokens, cache_read_tokens, cache_write_tokens, cache_hit_count, request_time)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		"2026-04-05", 1, 2, "gpt-4.1", 3, 30, 300, 30, 3, 3, 3, 1, 30,
+	).Error; err != nil {
+		t.Fatalf("expected historical statistics fixture to persist, got %v", err)
+	}
+
+	overview, err := GetUserDashboardCacheOverview(1, DashboardDateRange{
+		Start: "2026-03-31",
+		End:   "2026-04-06",
+		Today: "2026-04-06",
+	}, DashboardCacheOverviewFilters{})
+	if err != nil {
+		t.Fatalf("expected cache overview lookup to succeed, got %v", err)
+	}
+
+	if overview.TodayTokenBreakdown != (DashboardTokenBreakdown{}) {
+		t.Fatalf("expected today token breakdown to stay empty when today has no data, got %+v", overview.TodayTokenBreakdown)
+	}
+	if overview.TodayCacheHitRate.RequestCount != 0 || overview.TodayCacheHitRate.CacheHitCount != 0 || overview.TodayCacheHitRate.HitRate != 0 {
+		t.Fatalf("expected today cache hit rate to stay empty when today has no data, got %+v", overview.TodayCacheHitRate)
+	}
+	if overview.TodayCacheHitRate.Models == nil {
+		t.Fatalf("expected model hit rate slice to be initialized, got nil")
+	}
+	if len(overview.TodayCacheHitRate.Models) != 0 {
+		t.Fatalf("expected no model hit rate rows when today has no data, got %+v", overview.TodayCacheHitRate.Models)
+	}
+	if overview.FilterOptions.Models == nil || len(overview.FilterOptions.Models) != 0 {
+		t.Fatalf("expected today-scoped model options to be an empty slice, got %+v", overview.FilterOptions.Models)
+	}
+	if overview.FilterOptions.Channels == nil || len(overview.FilterOptions.Channels) != 0 {
+		t.Fatalf("expected today-scoped channel options to be an empty slice, got %+v", overview.FilterOptions.Channels)
+	}
+}
+
+func TestGetUserDashboardCacheFilterOptionsKeepsEmptyChannelSliceSerializable(t *testing.T) {
+	useDashboardMigrationTestDB(t)
+
+	if err := DB.Exec(`
+		INSERT INTO statistics
+		(date, user_id, channel_id, model_name, request_count, quota, prompt_tokens, completion_tokens, cache_tokens, cache_read_tokens, cache_write_tokens, cache_hit_count, request_time)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		"2026-04-06", 1, 0, "gpt-4.1", 1, 10, 20, 5, 0, 0, 0, 0, 10,
+	).Error; err != nil {
+		t.Fatalf("expected statistics fixture to persist, got %v", err)
+	}
+
+	filterOptions, err := GetUserDashboardCacheFilterOptions(1, DashboardDateRange{
+		Start: "2026-03-31",
+		End:   "2026-04-06",
+		Today: "2026-04-06",
+	})
+	if err != nil {
+		t.Fatalf("expected cache filter options lookup to succeed, got %v", err)
+	}
+
+	if filterOptions.Models == nil || len(filterOptions.Models) != 1 || filterOptions.Models[0] != "gpt-4.1" {
+		t.Fatalf("expected model options to include the persisted model, got %+v", filterOptions.Models)
+	}
+	if filterOptions.Channels == nil {
+		t.Fatalf("expected channels slice to be initialized to an empty slice, got nil")
+	}
+	if len(filterOptions.Channels) != 0 {
+		t.Fatalf("expected no channel options for channel_id=0 only data, got %+v", filterOptions.Channels)
+	}
+
+	payload, err := json.Marshal(filterOptions)
+	if err != nil {
+		t.Fatalf("expected cache filter options to marshal, got %v", err)
+	}
+	if string(payload) != `{"models":["gpt-4.1"],"channels":[]}` {
+		t.Fatalf("expected channels to serialize as an empty array, got %s", payload)
+	}
+}
+
+func TestGetUserDashboardStatisticsByPeriodIncludesCacheOverviewFilterOptions(t *testing.T) {
+	useDashboardMigrationTestDB(t)
+
+	if err := DB.Exec(`
+		INSERT INTO statistics
+		(date, user_id, channel_id, model_name, request_count, quota, prompt_tokens, completion_tokens, cache_tokens, cache_read_tokens, cache_write_tokens, cache_hit_count, request_time)
+		VALUES
+		(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?),
+		(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?),
+		(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?),
+		(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		"2026-04-06", 1, 1, "gpt-4.1", 2, 20, 20, 2, 0, 0, 0, 1, 20,
+		"2026-04-06", 1, 2, "gpt-4o", 3, 30, 30, 3, 0, 0, 0, 0, 30,
+		"2026-04-05", 1, 3, "historical-only", 4, 40, 40, 4, 0, 0, 0, 0, 40,
+		"2026-04-06", 2, 9, "other-user", 5, 50, 50, 5, 0, 0, 0, 0, 50,
+	).Error; err != nil {
+		t.Fatalf("expected statistics fixtures to persist, got %v", err)
+	}
+
+	dashboard, err := GetUserDashboardStatisticsByPeriod(1, DashboardDateRange{
+		Start: "2026-03-31",
+		End:   "2026-04-06",
+		Today: "2026-04-06",
+	})
+	if err != nil {
+		t.Fatalf("expected dashboard lookup to succeed, got %v", err)
+	}
+
+	if len(dashboard.CacheOverviewFilterOptions.Models) != 2 || dashboard.CacheOverviewFilterOptions.Models[0] != "gpt-4.1" || dashboard.CacheOverviewFilterOptions.Models[1] != "gpt-4o" {
+		t.Fatalf("expected today-scoped model options in dashboard payload, got %+v", dashboard.CacheOverviewFilterOptions.Models)
+	}
+	if len(dashboard.CacheOverviewFilterOptions.Channels) != 2 || dashboard.CacheOverviewFilterOptions.Channels[0].Id != 1 || dashboard.CacheOverviewFilterOptions.Channels[1].Id != 2 {
+		t.Fatalf("expected today-scoped channel ids in dashboard payload, got %+v", dashboard.CacheOverviewFilterOptions.Channels)
+	}
+	for _, channel := range dashboard.CacheOverviewFilterOptions.Channels {
+		if channel.Name != "" {
+			t.Fatalf("expected dashboard filter options to keep channel names private, got %+v", dashboard.CacheOverviewFilterOptions.Channels)
+		}
 	}
 }
 
