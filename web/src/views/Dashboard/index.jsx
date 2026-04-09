@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react';
-import { Grid, Box, Stack, Typography, Button } from '@mui/material';
+import PropTypes from 'prop-types';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Grid, Box, Stack, Typography, Button, FormControl, InputLabel, MenuItem, Select } from '@mui/material';
 import { gridSpacing } from 'store/constant';
 import StatisticalLineChartCard from './component/StatisticalLineChartCard';
 import ApexCharts from 'ui-component/chart/ApexCharts';
@@ -18,6 +19,18 @@ import TodayTokenBreakdownCard from './component/TodayTokenBreakdownCard';
 import CacheHitRateCard from './component/CacheHitRateCard';
 import { useSelector } from 'react-redux';
 
+const initialCacheFilters = {
+  model_name: '',
+  channel_id: ''
+};
+
+const emptyCacheFilterOptions = {
+  models: [],
+  channels: []
+};
+
+const dashboardSnapshotMismatchCode = 'DASHBOARD_SNAPSHOT_MISMATCH';
+
 // TabPanel component for tab content
 function TabPanel(props) {
   const { children, value, index, ...other } = props;
@@ -28,6 +41,12 @@ function TabPanel(props) {
     </div>
   );
 }
+
+TabPanel.propTypes = {
+  children: PropTypes.node,
+  value: PropTypes.number,
+  index: PropTypes.number
+};
 
 const Dashboard = () => {
   const [isLoading, setLoading] = useState(true);
@@ -40,25 +59,50 @@ const Dashboard = () => {
   const [currentTab, setCurrentTab] = useState(0);
 
   const [dashboardData, setDashboardData] = useState(null);
+  const [dashboardDateRange, setDashboardDateRange] = useState(null);
+  const [cacheOverviewData, setCacheOverviewData] = useState(null);
+  const [cacheFilterOptions, setCacheFilterOptions] = useState(emptyCacheFilterOptions);
+  const [cacheOverviewLoading, setCacheOverviewLoading] = useState(false);
+  const [cacheFilters, setCacheFilters] = useState(initialCacheFilters);
+  const cacheOverviewRequestIdRef = useRef(0);
+  const cacheOverviewResolvedQueryRef = useRef(null);
+  const [cacheOverviewResolvedQuery, setCacheOverviewResolvedQuery] = useState(null);
   const siteInfo = useSelector((state) => state.siteInfo);
 
   const handleTabChange = (newValue) => {
     setCurrentTab(newValue);
   };
 
-  const userDashboard = async () => {
+  const userDashboard = useCallback(async ({ resetCacheFilters = false, showLoading = false } = {}) => {
+    if (showLoading) {
+      setLoading(true);
+    }
+
     try {
       const res = await API.get('/api/user/dashboard');
       const { success, message, data } = res.data;
       if (success) {
         if (data) {
-          setDashboardData(data);
+          const nextDashboardDateRange = normalizeDashboardDateRange(data?.dateRange);
+          const nextResolvedQuery = buildCacheOverviewQuery(initialCacheFilters, nextDashboardDateRange);
           const series = data.series || [];
-          let lineData = getLineDataGroup(series);
+          let lineData = getLineDataGroup(series, nextDashboardDateRange);
+
+          setDashboardData(data);
+          setDashboardDateRange(nextDashboardDateRange);
+          setCacheFilterOptions(normalizeCacheFilterOptions(data?.cacheOverviewFilterOptions));
+          setCacheOverviewData(buildCacheOverviewFallbackData(data));
+          setCacheOverviewResolvedQuery(nextResolvedQuery);
+          cacheOverviewResolvedQueryRef.current = nextResolvedQuery;
+
+          if (resetCacheFilters) {
+            setCacheFilters(cloneCacheFilters(initialCacheFilters));
+          }
+
           setRequestChart(getLineCardOption(lineData, 'RequestCount'));
           setQuotaChart(getLineCardOption(lineData, 'Quota'));
           setTokenChart(getLineCardOption(lineData, 'PromptTokens'));
-          setStatisticalData(getBarDataGroup(series));
+          setStatisticalData(getBarDataGroup(series, nextDashboardDateRange));
           setModelUsageData(getModelUsageData(series));
         }
       } else {
@@ -69,11 +113,101 @@ const Dashboard = () => {
       setLoading(false);
       return;
     }
-  };
+  }, []);
+
+  const fetchCacheOverview = useCallback(
+    async (filters, dateRange) => {
+      const requestId = cacheOverviewRequestIdRef.current + 1;
+      const requestedQuery = buildCacheOverviewQuery(filters, dateRange);
+      cacheOverviewRequestIdRef.current = requestId;
+      setCacheOverviewLoading(true);
+      let shouldRollbackToResolvedQuery = false;
+      let shouldRefreshDashboard = false;
+
+      try {
+        // Cache cards must stay anchored to the same snapshot as the base dashboard.
+        const res = await API.post('/api/user/dashboard/modules/query', {
+          dateRange,
+          modules: [
+            {
+              name: 'cache_overview',
+              filters: buildCacheOverviewFilters(filters)
+            }
+          ]
+        });
+        const { success, message, data, code } = res.data;
+        const nextCacheOverview = data?.modules?.cache_overview;
+
+        if (requestId !== cacheOverviewRequestIdRef.current) {
+          return;
+        }
+
+        if (success && nextCacheOverview) {
+          setCacheOverviewData(nextCacheOverview);
+          setCacheOverviewResolvedQuery(requestedQuery);
+          cacheOverviewResolvedQueryRef.current = requestedQuery;
+          return;
+        }
+
+        if (!success && code === dashboardSnapshotMismatchCode) {
+          shouldRefreshDashboard = true;
+          return;
+        }
+
+        if (!success && message) {
+          showError(message);
+        }
+        shouldRollbackToResolvedQuery = true;
+      } catch (error) {
+        if (requestId !== cacheOverviewRequestIdRef.current) {
+          return;
+        }
+        if (error?.message) {
+          showError(error.message);
+        }
+        shouldRollbackToResolvedQuery = true;
+      } finally {
+        if (requestId === cacheOverviewRequestIdRef.current) {
+          if (shouldRollbackToResolvedQuery && cacheOverviewResolvedQueryRef.current?.filters) {
+            setCacheFilters((current) => {
+              const resolvedFilters = cacheOverviewResolvedQueryRef.current.filters;
+              if (isSameCacheFilters(current, resolvedFilters)) {
+                return current;
+              }
+              return cloneCacheFilters(resolvedFilters);
+            });
+          }
+          setCacheOverviewLoading(false);
+        }
+
+        if (shouldRefreshDashboard) {
+          void userDashboard({ resetCacheFilters: true, showLoading: true });
+        }
+      }
+    },
+    [userDashboard]
+  );
 
   useEffect(() => {
-    userDashboard();
-  }, []);
+    userDashboard({ resetCacheFilters: true });
+  }, [userDashboard]);
+
+  useEffect(() => {
+    const nextFilters = {
+      model_name: cacheFilters.model_name,
+      channel_id: cacheFilters.channel_id
+    };
+    const nextQuery = buildCacheOverviewQuery(nextFilters, dashboardDateRange);
+    if (!nextQuery || isSameCacheOverviewQuery(nextQuery, cacheOverviewResolvedQuery)) {
+      return;
+    }
+    fetchCacheOverview(nextFilters, nextQuery.dateRange);
+  }, [cacheFilters.channel_id, cacheFilters.model_name, cacheOverviewResolvedQuery, dashboardDateRange, fetchCacheOverview]);
+
+  const selectedCacheOverviewQuery = buildCacheOverviewQuery(cacheFilters, dashboardDateRange);
+  const isCacheOverviewFresh = isSameCacheOverviewQuery(selectedCacheOverviewQuery, cacheOverviewResolvedQuery);
+  const isCacheOverviewLoading = (isLoading && !cacheOverviewData) || Boolean(selectedCacheOverviewQuery && !isCacheOverviewFresh);
+  const areCacheFiltersDisabled = isLoading || !dashboardDateRange || (cacheOverviewLoading && !cacheOverviewData);
 
   // Dashboard content
   const dashboardContent = (
@@ -122,12 +256,63 @@ const Dashboard = () => {
       </Grid>
 
       <Grid item xs={12}>
+        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2} justifyContent="flex-end" mb={2}>
+          <FormControl size="small" sx={{ minWidth: { xs: '100%', sm: 180 } }}>
+            <InputLabel id="dashboard-model-filter-label">{t('dashboard_index.model')}</InputLabel>
+            <Select
+              labelId="dashboard-model-filter-label"
+              label={t('dashboard_index.model')}
+              displayEmpty
+              value={cacheFilters.model_name}
+              disabled={areCacheFiltersDisabled}
+              onChange={(event) => {
+                setCacheFilters((current) => ({
+                  ...current,
+                  model_name: event.target.value
+                }));
+              }}
+            >
+              <MenuItem value="">{t('dashboard_index.all_models')}</MenuItem>
+              {cacheFilterOptions.models.map((modelName) => (
+                <MenuItem key={modelName} value={modelName}>
+                  {modelName}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+
+          <FormControl size="small" sx={{ minWidth: { xs: '100%', sm: 220 } }}>
+            <InputLabel id="dashboard-channel-filter-label">{t('dashboard_index.channel')}</InputLabel>
+            <Select
+              labelId="dashboard-channel-filter-label"
+              label={t('dashboard_index.channel')}
+              displayEmpty
+              value={cacheFilters.channel_id}
+              disabled={areCacheFiltersDisabled}
+              onChange={(event) => {
+                const value = event.target.value;
+                setCacheFilters((current) => ({
+                  ...current,
+                  channel_id: value === '' ? '' : Number(value)
+                }));
+              }}
+            >
+              <MenuItem value="">{t('dashboard_index.all_channels')}</MenuItem>
+              {cacheFilterOptions.channels.map((channel) => (
+                <MenuItem key={channel.id} value={channel.id}>
+                  {renderChannelOption(channel)}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+        </Stack>
+
         <Grid container spacing={gridSpacing}>
           <Grid item lg={6} xs={12}>
-            <TodayTokenBreakdownCard isLoading={isLoading} data={dashboardData?.todayTokenBreakdown} />
+            <TodayTokenBreakdownCard isLoading={isCacheOverviewLoading} data={cacheOverviewData?.todayTokenBreakdown} />
           </Grid>
           <Grid item lg={6} xs={12}>
-            <CacheHitRateCard isLoading={isLoading} data={dashboardData?.todayCacheHitRate} />
+            <CacheHitRateCard isLoading={isCacheOverviewLoading} data={cacheOverviewData?.todayCacheHitRate} />
           </Grid>
         </Grid>
       </Grid>
@@ -139,7 +324,7 @@ const Dashboard = () => {
             <ApexCharts isLoading={isLoading} chartDatas={statisticalData} title={t('dashboard_index.week_model_statistics')} />
             <Box mt={2}>
               {/* 7日消费统计 */}
-              <QuotaLogWeek data={dashboardData?.series || []} />
+              <QuotaLogWeek data={dashboardData?.series || []} dateRange={dashboardDateRange} />
             </Box>
           </Grid>
 
@@ -247,7 +432,94 @@ function getModelUsageData(data) {
 }
 export default Dashboard;
 
-function getLineDataGroup(statisticalData) {
+function buildCacheOverviewFallbackData(dashboardData) {
+  if (!dashboardData) {
+    return null;
+  }
+
+  return {
+    dateRange: normalizeDashboardDateRange(dashboardData?.dateRange),
+    todayTokenBreakdown: dashboardData.todayTokenBreakdown,
+    todayCacheHitRate: dashboardData.todayCacheHitRate
+  };
+}
+
+function normalizeDashboardDateRange(dateRange) {
+  if (!dateRange?.start || !dateRange?.end || !dateRange?.today) {
+    return null;
+  }
+
+  return {
+    start: dateRange.start,
+    end: dateRange.end,
+    today: dateRange.today
+  };
+}
+
+function normalizeCacheFilterOptions(filterOptions) {
+  return {
+    models: Array.isArray(filterOptions?.models) ? filterOptions.models : emptyCacheFilterOptions.models,
+    channels: Array.isArray(filterOptions?.channels) ? filterOptions.channels : emptyCacheFilterOptions.channels
+  };
+}
+
+function buildCacheOverviewFilters(filters) {
+  const payload = {};
+  if (filters.model_name) {
+    payload.model_name = filters.model_name;
+  }
+  if (filters.channel_id !== '') {
+    payload.channel_id = filters.channel_id;
+  }
+  return payload;
+}
+
+function buildCacheOverviewQuery(filters, dateRange) {
+  if (!dateRange) {
+    return null;
+  }
+
+  return {
+    filters: cloneCacheFilters(filters),
+    dateRange: {
+      start: dateRange.start,
+      end: dateRange.end,
+      today: dateRange.today
+    }
+  };
+}
+
+function isSameCacheFilters(left, right) {
+  return left?.model_name === right?.model_name && left?.channel_id === right?.channel_id;
+}
+
+function isSameDashboardDateRange(left, right) {
+  return left?.start === right?.start && left?.end === right?.end && left?.today === right?.today;
+}
+
+function isSameCacheOverviewQuery(left, right) {
+  if (!left || !right) {
+    return false;
+  }
+
+  return isSameCacheFilters(left.filters, right.filters) && isSameDashboardDateRange(left.dateRange, right.dateRange);
+}
+
+function cloneCacheFilters(filters) {
+  return {
+    model_name: filters?.model_name || '',
+    channel_id: filters?.channel_id ?? ''
+  };
+}
+
+function renderChannelOption(channel) {
+  if (!channel?.name) {
+    return `${channel?.id || ''}`;
+  }
+  return `${channel.id} (${channel.name})`;
+}
+
+function getLineDataGroup(statisticalData, dateRange) {
   if (!Array.isArray(statisticalData)) {
     return [];
   }
@@ -267,7 +539,7 @@ function getLineDataGroup(statisticalData) {
     acc[cur.Date].CompletionTokens += cur.CompletionTokens;
     return acc;
   }, {});
-  let lastSevenDays = getLastSevenDays();
+  let lastSevenDays = getLastSevenDays(dateRange?.today);
   return lastSevenDays.map((Date) => {
     if (!groupedData[Date]) {
       return {
@@ -283,11 +555,11 @@ function getLineDataGroup(statisticalData) {
   });
 }
 
-function getBarDataGroup(data) {
+function getBarDataGroup(data, dateRange) {
   if (!Array.isArray(data)) {
     return null;
   }
-  const lastSevenDays = getLastSevenDays();
+  const lastSevenDays = getLastSevenDays(dateRange?.today);
   const result = [];
   const map = new Map();
   let totalCosts = 0;

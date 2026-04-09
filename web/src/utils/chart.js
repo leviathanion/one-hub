@@ -1,7 +1,8 @@
-export function getLastSevenDays() {
+export function getLastSevenDays(anchorDate) {
+  const baseDate = parseAnchorDate(anchorDate);
   const dates = [];
   for (let i = 6; i >= 0; i--) {
-    const d = new Date();
+    const d = new Date(baseDate);
     d.setDate(d.getDate() - i);
     const month = '' + (d.getMonth() + 1);
     const day = '' + d.getDate();
@@ -11,6 +12,22 @@ export function getLastSevenDays() {
     dates.push(formattedDate);
   }
   return dates;
+}
+
+function parseAnchorDate(anchorDate) {
+  if (!anchorDate) {
+    return new Date();
+  }
+  if (anchorDate instanceof Date) {
+    return new Date(anchorDate.getTime());
+  }
+  if (typeof anchorDate === 'string') {
+    const [year, month, day] = anchorDate.split('-').map(Number);
+    if (year && month && day) {
+      return new Date(year, month - 1, day);
+    }
+  }
+  return new Date(anchorDate);
 }
 
 export function getTodayDay() {

@@ -7,13 +7,10 @@ import { useTranslation } from 'react-i18next';
 import SubCard from 'ui-component/cards/SubCard';
 
 const normalizeInputTokens = (promptTokens, cacheTokens, cacheReadTokens, cacheWriteTokens) => {
-  return Math.max(
-    Number(promptTokens || 0) - Number(cacheTokens || 0) - Number(cacheReadTokens || 0) - Number(cacheWriteTokens || 0),
-    0
-  );
+  return Math.max(Number(promptTokens || 0) - Number(cacheTokens || 0) - Number(cacheReadTokens || 0) - Number(cacheWriteTokens || 0), 0);
 };
 
-const QuotaLogWeek = ({ data }) => {
+const QuotaLogWeek = ({ data, dateRange }) => {
   const [logData, setLogData] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
   const { t } = useTranslation();
@@ -23,7 +20,7 @@ const QuotaLogWeek = ({ data }) => {
     if (Array.isArray(data) && data.length > 0) {
       setIsHasData(true);
       // 处理数据，按日期分组
-      const lastSevenDays = getLastSevenDays();
+      const lastSevenDays = getLastSevenDays(dateRange?.today);
       const processedData = lastSevenDays
         .map((date) => {
           const dayData = data.filter((item) => item.Date === date);
@@ -57,7 +54,7 @@ const QuotaLogWeek = ({ data }) => {
       setLogData([]);
     }
     setIsLoading(false);
-  }, [data]);
+  }, [data, dateRange?.today]);
 
   return (
     <SubCard title={t('dashboard_index.week_consumption_log')} contentSX={{ p: 0 }}>
@@ -110,5 +107,10 @@ const QuotaLogWeek = ({ data }) => {
 export default QuotaLogWeek;
 
 QuotaLogWeek.propTypes = {
-  data: PropTypes.array
+  data: PropTypes.array,
+  dateRange: PropTypes.shape({
+    start: PropTypes.string,
+    end: PropTypes.string,
+    today: PropTypes.string
+  })
 };
