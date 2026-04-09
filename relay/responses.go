@@ -2,6 +2,7 @@ package relay
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"one-api/common"
@@ -222,6 +223,10 @@ func shouldRecoverStalePreviousResponse(apiErr *types.OpenAIErrorWithStatusCode)
 }
 
 func (r *relayResponses) compatibleSend(chatProvider providersBase.ChatInterface) (errWithCode *types.OpenAIErrorWithStatusCode, done bool) {
+	if errWithCode = r.statefulCompatibilityFallbackError(); errWithCode != nil {
+		return errWithCode, false
+	}
+
 	chatReq, err := r.responsesRequest.ToChatCompletionRequest()
 	if err != nil {
 		return common.ErrorWrapperLocal(err, "invalid_claude_config", http.StatusInternalServerError), true
@@ -257,6 +262,65 @@ func (r *relayResponses) compatibleSend(chatProvider providersBase.ChatInterface
 	}
 
 	return
+}
+
+// Fail closed instead of silently degrading stateful Responses requests to Chat
+// Completions. store=true, previous_response_id, and conversation all depend on
+// response-native state semantics that cannot be preserved across compatibility
+// fallback, especially once multi-channel routing may move follow-up requests to
+// a different upstream account or region.
+func (r *relayResponses) statefulCompatibilityFallbackError() *types.OpenAIErrorWithStatusCode {
+	if r == nil {
+		return nil
+	}
+
+	param, description := responsesStatefulFallbackRequirement(&r.responsesRequest)
+	if param == "" {
+		return nil
+	}
+
+	return &types.OpenAIErrorWithStatusCode{
+		OpenAIError: types.OpenAIError{
+			Message: fmt.Sprintf("%s requires native /v1/responses support on the selected channel; one-hub will not degrade this request to /v1/chat/completions because that would change response state semantics.", description),
+			Type:    "channel_error",
+			Param:   param,
+			Code:    "responses_native_support_required",
+		},
+		StatusCode: http.StatusServiceUnavailable,
+	}
+}
+
+func responsesStatefulFallbackRequirement(request *types.OpenAIResponsesRequest) (param string, description string) {
+	if request == nil {
+		return "", ""
+	}
+
+	if request.Store != nil && *request.Store {
+		return "store", "responses request with store=true"
+	}
+
+	if strings.TrimSpace(request.PreviousResponseID) != "" {
+		return "previous_response_id", "responses request with previous_response_id"
+	}
+
+	if hasMeaningfulResponsesConversation(request.Conversation) {
+		return "conversation", "responses request with conversation state"
+	}
+
+	return "", ""
+}
+
+func hasMeaningfulResponsesConversation(conversation any) bool {
+	switch value := conversation.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(value) != ""
+	case map[string]any:
+		return len(value) > 0
+	default:
+		return true
+	}
 }
 
 // 将chat转换成兼容的responses流处理

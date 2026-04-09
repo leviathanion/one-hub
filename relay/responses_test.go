@@ -83,7 +83,9 @@ type compatibleStreamChatProvider struct {
 
 type compatibleResponsesChatProvider struct {
 	providersBase.BaseProvider
-	response *types.ChatCompletionResponse
+	response          *types.ChatCompletionResponse
+	createCalls       int
+	createStreamCalls int
 }
 
 func (p *compatibleStreamChatProvider) GetRequestHeaders() map[string]string {
@@ -103,10 +105,12 @@ func (p *compatibleResponsesChatProvider) GetRequestHeaders() map[string]string 
 }
 
 func (p *compatibleResponsesChatProvider) CreateChatCompletion(*types.ChatCompletionRequest) (*types.ChatCompletionResponse, *types.OpenAIErrorWithStatusCode) {
+	p.createCalls++
 	return p.response, nil
 }
 
 func (p *compatibleResponsesChatProvider) CreateChatCompletionStream(*types.ChatCompletionRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+	p.createStreamCalls++
 	return nil, nil
 }
 
@@ -894,5 +898,96 @@ func TestRelayResponsesSetRequestAndCompactSuccessBranches(t *testing.T) {
 	close(closedStream.dataChan)
 	if firstResponseTime, finalResponse := streamRelay.chatToResponseStreamClient(closedStream); !firstResponseTime.IsZero() || finalResponse != nil {
 		t.Fatalf("expected closed response stream to return zero time and no final response payload, time=%v final=%#v", firstResponseTime, finalResponse)
+	}
+}
+
+func TestRelayResponsesCompatibleFallbackRejectsStatefulResponses(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	storeTrue := true
+	testCases := []struct {
+		name          string
+		request       types.OpenAIResponsesRequest
+		expectedParam string
+	}{
+		{
+			name: "store true",
+			request: types.OpenAIResponsesRequest{
+				Model: "gpt-5",
+				Input: "hello",
+				Store: &storeTrue,
+			},
+			expectedParam: "store",
+		},
+		{
+			name: "previous response id",
+			request: types.OpenAIResponsesRequest{
+				Model:              "gpt-5",
+				Input:              "hello",
+				PreviousResponseID: "resp_prev",
+			},
+			expectedParam: "previous_response_id",
+		},
+		{
+			name: "conversation state",
+			request: types.OpenAIResponsesRequest{
+				Model:        "gpt-5",
+				Input:        "hello",
+				Conversation: map[string]any{"id": "conv_123"},
+			},
+			expectedParam: "conversation",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+			provider := &compatibleResponsesChatProvider{
+				BaseProvider: providersBase.BaseProvider{
+					Channel: &model.Channel{Id: 88},
+				},
+				response: &types.ChatCompletionResponse{
+					ID:     "chatcmpl_unused",
+					Object: "chat.completion",
+					Model:  "gpt-5",
+				},
+			}
+
+			relay := &relayResponses{
+				relayBase: relayBase{
+					c:         ctx,
+					provider:  provider,
+					modelName: "gpt-5",
+				},
+				responsesRequest: tc.request,
+				operation:        responsesOperationCreate,
+			}
+
+			errWithCode, done := relay.sendCurrentProvider()
+			if errWithCode == nil {
+				t.Fatal("expected stateful responses compatibility fallback to be rejected")
+			}
+			if done {
+				t.Fatal("expected stateful fallback rejection to remain retryable")
+			}
+			if errWithCode.StatusCode != http.StatusServiceUnavailable {
+				t.Fatalf("expected status 503, got %d", errWithCode.StatusCode)
+			}
+			if errWithCode.LocalError {
+				t.Fatal("expected stateful fallback rejection not to be marked local")
+			}
+			if errWithCode.Param != tc.expectedParam {
+				t.Fatalf("expected param %q, got %q", tc.expectedParam, errWithCode.Param)
+			}
+			if errWithCode.Code != "responses_native_support_required" {
+				t.Fatalf("expected error code responses_native_support_required, got %q", errWithCode.Code)
+			}
+			if provider.createCalls != 0 || provider.createStreamCalls != 0 {
+				t.Fatalf("expected chat fallback not to be attempted, got create=%d stream=%d", provider.createCalls, provider.createStreamCalls)
+			}
+		})
 	}
 }
