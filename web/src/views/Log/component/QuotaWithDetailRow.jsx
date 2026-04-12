@@ -2,62 +2,39 @@ import { Box, Typography, IconButton } from '@mui/material';
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import { renderQuota } from 'utils/common';
 import PropTypes from 'prop-types';
-
-function getGroupRatio(metadata) {
-  return metadata?.group_ratio ?? 1;
-}
-
-// Helper function to calculate the original quota based on actual price and group ratio
-export function calculateOriginalQuota(item) {
-  // If we don't have the necessary data, return the metadata value or 0
-  if (!item?.quota || item?.metadata?.group_ratio === undefined || item?.metadata?.group_ratio === null) {
-    return item.metadata?.original_quota || item.metadata?.origin_quota || 0;
-  }
-
-  const quota = item.quota || 0;
-  const groupRatio = getGroupRatio(item.metadata);
-
-  // Simple formula: original price = actual price / group ratio
-  // Avoid division by zero
-  if (groupRatio === 0) {
-    return quota;
-  }
-
-  // Calculate original quota by dividing actual quota by group ratio
-  const calculatedOriginalQuota = quota / groupRatio;
-
-  // Return the calculated original quota or the metadata value if the calculation is 0
-  return calculatedOriginalQuota || item.metadata?.original_quota || item.metadata?.origin_quota || 0;
-}
+import { calculateOriginalQuota, getGroupRatio } from './quotaDetail';
 
 // QuotaWithDetailRow is only responsible for the price in the main row and the small triangle
 export default function QuotaWithDetailRow({ item, open, setOpen }) {
   const groupRatio = getGroupRatio(item?.metadata);
-  // Calculate the original quota based on the formula
   const originalQuota = calculateOriginalQuota(item);
-  // Ensure quota has a fallback value
   const quota = item.quota || 0;
+  const showOriginalQuota = originalQuota > 0 && Math.abs(originalQuota - quota) > 1e-9;
+  const originalQuotaDecoration = quota < originalQuota ? 'line-through' : 'none';
+
   return (
     <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
       <Box onClick={() => setOpen((o) => !o)} sx={{ display: 'flex', flexDirection: 'column', mr: 1, cursor: 'pointer' }}>
-        {groupRatio < 1 ? (
+        {showOriginalQuota ? (
           <>
             <Typography
               variant="caption"
               sx={{
                 color: (theme) => theme.palette.text.secondary,
-                textDecoration: 'line-through',
+                textDecoration: originalQuotaDecoration,
                 fontSize: 12
               }}
             >
               {renderQuota(originalQuota, 6)}
             </Typography>
-            <Typography sx={{ color: (theme) => theme.palette.success.main, fontWeight: 500, fontSize: 13 }}>
+            <Typography
+              sx={{ color: (theme) => theme.palette[quota > originalQuota ? 'warning' : 'success'].main, fontWeight: 500, fontSize: 13 }}
+            >
               {renderQuota(quota, 6)}
             </Typography>
           </>
         ) : (
-          <Typography sx={{ color: (theme) => theme.palette.success.main, fontWeight: 500, fontSize: 13 }}>
+          <Typography sx={{ color: (theme) => theme.palette[groupRatio > 1 ? 'warning' : 'success'].main, fontWeight: 500, fontSize: 13 }}>
             {renderQuota(quota, 6)}
           </Typography>
         )}
