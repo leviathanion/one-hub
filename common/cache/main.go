@@ -17,6 +17,7 @@ import (
 )
 
 var (
+	cacheClient   *cacheM.Cache[any]
 	kvCache       *marshaler.Marshaler
 	ctx           = context.Background()
 	sfGroup       singleflight.Group
@@ -34,6 +35,7 @@ func InitCacheManager() {
 		client = cacheM.New[any](freecacheStore)
 	}
 
+	cacheClient = client
 	kvCache = marshaler.New(client)
 }
 
@@ -54,7 +56,23 @@ func SetCache(key string, value any, expiration time.Duration) error {
 }
 
 func DeleteCache(key string) error {
-	return kvCache.Delete(ctx, key)
+	if kvCache == nil || cacheClient == nil {
+		return nil
+	}
+
+	err := kvCache.Delete(ctx, key)
+	if err == nil {
+		return nil
+	}
+
+	// The underlying stores disagree on delete-miss behavior: Redis treats deleting a
+	// missing key as success while freecache returns a generic error. Normalize that
+	// contract here so callers can treat cache invalidation as an idempotent no-op.
+	if _, getErr := cacheClient.Get(ctx, key); errors.Is(getErr, store.NotFound{}) {
+		return nil
+	}
+
+	return err
 }
 
 func GetOrSetCache[T any](key string, expiration time.Duration, fn func() (T, error), timeout time.Duration) (T, error) {
