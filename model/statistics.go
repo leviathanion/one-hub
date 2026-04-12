@@ -210,11 +210,19 @@ func GetUserModelStatisticsByPeriod(userId int, startTime, endTime string) (LogS
 }
 
 func GetUserDashboardStatisticsByPeriod(userId int, dateRange DashboardDateRange) (*UserDashboard, error) {
+	return getUserDashboardStatisticsByPeriod(userId, dateRange, false)
+}
+
+func GetUserDashboardStatisticsByPeriodWithChannelNames(userId int, dateRange DashboardDateRange) (*UserDashboard, error) {
+	return getUserDashboardStatisticsByPeriod(userId, dateRange, true)
+}
+
+func getUserDashboardStatisticsByPeriod(userId int, dateRange DashboardDateRange, includeChannelNames bool) (*UserDashboard, error) {
 	series, err := GetUserModelStatisticsByPeriod(userId, dateRange.Start, dateRange.End)
 	if err != nil {
 		return nil, err
 	}
-	filterOptions, err := GetUserDashboardCacheFilterOptions(userId, dateRange)
+	filterOptions, err := getUserDashboardCacheFilterOptions(userId, dateRange, includeChannelNames)
 	if err != nil {
 		return nil, err
 	}
@@ -231,12 +239,29 @@ func GetUserDashboardStatisticsByPeriod(userId int, dateRange DashboardDateRange
 // Trade-off: the filter dropdowns may include options that are empty on the
 // currently selected day, but they stay expressive for historical inspection.
 func GetUserDashboardCacheOverview(userId int, dateRange DashboardDateRange, filters DashboardCacheOverviewFilters) (*DashboardCacheOverview, error) {
+	return getUserDashboardCacheOverview(userId, dateRange, filters, false)
+}
+
+func GetUserDashboardCacheOverviewWithChannelNames(
+	userId int,
+	dateRange DashboardDateRange,
+	filters DashboardCacheOverviewFilters,
+) (*DashboardCacheOverview, error) {
+	return getUserDashboardCacheOverview(userId, dateRange, filters, true)
+}
+
+func getUserDashboardCacheOverview(
+	userId int,
+	dateRange DashboardDateRange,
+	filters DashboardCacheOverviewFilters,
+	includeChannelNames bool,
+) (*DashboardCacheOverview, error) {
 	series, err := getUserModelStatisticsByPeriodWithFilters(userId, dateRange.Start, dateRange.End, filters)
 	if err != nil {
 		return nil, err
 	}
 
-	filterOptions, err := GetUserDashboardCacheFilterOptions(userId, dateRange)
+	filterOptions, err := getUserDashboardCacheFilterOptions(userId, dateRange, includeChannelNames)
 	if err != nil {
 		return nil, err
 	}
@@ -293,6 +318,18 @@ func getUserModelStatisticsByPeriodWithFilters(userId int, startTime, endTime st
 }
 
 func GetUserDashboardCacheFilterOptions(userId int, dateRange DashboardDateRange) (*DashboardCacheFilterOptions, error) {
+	return getUserDashboardCacheFilterOptions(userId, dateRange, false)
+}
+
+func GetUserDashboardCacheFilterOptionsWithChannelNames(userId int, dateRange DashboardDateRange) (*DashboardCacheFilterOptions, error) {
+	return getUserDashboardCacheFilterOptions(userId, dateRange, true)
+}
+
+func getUserDashboardCacheFilterOptions(
+	userId int,
+	dateRange DashboardDateRange,
+	includeChannelNames bool,
+) (*DashboardCacheFilterOptions, error) {
 	filterOptions := &DashboardCacheFilterOptions{
 		Models:   make([]string, 0),
 		Channels: make([]DashboardChannelOption, 0),
@@ -306,10 +343,20 @@ func GetUserDashboardCacheFilterOptions(userId int, dateRange DashboardDateRange
 		return nil, err
 	}
 
-	// User dashboard filters are visible to every authenticated user, so keep
-	// internal channel metadata admin-only and expose only stable channel ids.
-	err := DB.Table("statistics").
-		Select("statistics.channel_id as id").
+	query := DB.Table("statistics")
+	// Trade-off: channel names make the dashboard filter usable for admins, but
+	// ordinary users should not learn internal routing metadata. Callers opt into
+	// names explicitly, and the LEFT JOIN preserves historical channel ids even
+	// if the underlying channel row has been deleted or is otherwise unavailable.
+	if includeChannelNames {
+		query = query.
+			Select("statistics.channel_id as id, COALESCE(MAX(channels.name), '') as name").
+			Joins("LEFT JOIN channels ON statistics.channel_id = channels.id")
+	} else {
+		query = query.Select("statistics.channel_id as id")
+	}
+
+	err := query.
 		Where("statistics.user_id = ? AND statistics.date BETWEEN ? AND ? AND statistics.channel_id <> 0", userId, dateRange.Start, dateRange.End).
 		Group("statistics.channel_id").
 		Order("statistics.channel_id").

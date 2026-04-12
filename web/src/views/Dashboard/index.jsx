@@ -540,7 +540,7 @@ function renderChannelOption(channel) {
   if (!channel?.name) {
     return `${channel?.id || ''}`;
   }
-  return `${channel.id} (${channel.name})`;
+  return `${channel.id}-${channel.name}`;
 }
 
 function buildCacheOverviewDataFromSeries(series, dateRange) {

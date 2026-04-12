@@ -240,6 +240,8 @@ func GetUser(c *gin.Context) {
 
 const API_LIMIT_KEY = "api-limiter:%d"
 
+var userDashboardNow = time.Now
+
 func GetRateRealtime(c *gin.Context) {
 	id := c.GetInt("id")
 	user, err := model.GetUserById(id, false)
@@ -284,9 +286,15 @@ func GetRateRealtime(c *gin.Context) {
 
 func GetUserDashboard(c *gin.Context) {
 	id := c.GetInt("id")
-	dateRange := model.BuildDashboardDateRange(time.Now())
+	dateRange := model.BuildDashboardDateRange(userDashboardNow())
 
-	dashboards, err := model.GetUserDashboardStatisticsByPeriod(id, dateRange)
+	var dashboards *model.UserDashboard
+	var err error
+	if shouldIncludeDashboardChannelNames(c) {
+		dashboards, err = model.GetUserDashboardStatisticsByPeriodWithChannelNames(id, dateRange)
+	} else {
+		dashboards, err = model.GetUserDashboardStatisticsByPeriod(id, dateRange)
+	}
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,

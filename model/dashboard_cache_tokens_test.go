@@ -251,6 +251,56 @@ func TestGetUserDashboardCacheOverviewAppliesFiltersAndKeepsChannelNamesPrivate(
 	}
 }
 
+func TestGetUserDashboardCacheOverviewWithChannelNamesIncludesAdminVisibleNamesAndMissingChannels(t *testing.T) {
+	useDashboardMigrationTestDB(t)
+
+	if err := DB.Create([]*Channel{
+		{Id: 1, Name: "Alpha"},
+		{Id: 2, Name: "Beta"},
+	}).Error; err != nil {
+		t.Fatalf("expected channel fixtures to persist, got %v", err)
+	}
+
+	if err := DB.Exec(`
+		INSERT INTO statistics
+		(date, user_id, channel_id, model_name, request_count, quota, prompt_tokens, completion_tokens, cache_tokens, cache_read_tokens, cache_write_tokens, cache_hit_count, request_time)
+		VALUES
+		(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?),
+		(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?),
+		(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?),
+		(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		"2026-04-06", 1, 1, "gpt-4.1", 2, 20, 20, 2, 0, 0, 0, 1, 20,
+		"2026-04-06", 1, 2, "gpt-4o", 3, 30, 30, 3, 0, 0, 0, 0, 30,
+		"2026-04-05", 1, 9, "historical-only", 4, 40, 40, 4, 0, 0, 0, 0, 40,
+		"2026-04-06", 2, 1, "other-user", 5, 50, 50, 5, 0, 0, 0, 0, 50,
+	).Error; err != nil {
+		t.Fatalf("expected statistics fixtures to persist, got %v", err)
+	}
+
+	overview, err := GetUserDashboardCacheOverviewWithChannelNames(1, DashboardDateRange{
+		Start: "2026-03-31",
+		End:   "2026-04-06",
+		Today: "2026-04-06",
+	}, DashboardCacheOverviewFilters{})
+	if err != nil {
+		t.Fatalf("expected cache overview lookup to succeed, got %v", err)
+	}
+
+	if len(overview.FilterOptions.Channels) != 3 {
+		t.Fatalf("expected 3 channel options, got %+v", overview.FilterOptions.Channels)
+	}
+	if overview.FilterOptions.Channels[0].Id != 1 || overview.FilterOptions.Channels[0].Name != "Alpha" {
+		t.Fatalf("expected channel 1 to expose its admin-visible name, got %+v", overview.FilterOptions.Channels[0])
+	}
+	if overview.FilterOptions.Channels[1].Id != 2 || overview.FilterOptions.Channels[1].Name != "Beta" {
+		t.Fatalf("expected channel 2 to expose its admin-visible name, got %+v", overview.FilterOptions.Channels[1])
+	}
+	if overview.FilterOptions.Channels[2].Id != 9 || overview.FilterOptions.Channels[2].Name != "" {
+		t.Fatalf("expected missing channel rows to fall back to id-only options, got %+v", overview.FilterOptions.Channels[2])
+	}
+}
+
 func TestGetUserDashboardCacheOverviewReturnsEmptyDayRowsWhenSomeDaysHaveNoData(t *testing.T) {
 	useDashboardMigrationTestDB(t)
 
@@ -375,6 +425,56 @@ func TestGetUserDashboardStatisticsByPeriodIncludesCacheOverviewFilterOptions(t 
 		if channel.Name != "" {
 			t.Fatalf("expected dashboard filter options to keep channel names private, got %+v", dashboard.CacheOverviewFilterOptions.Channels)
 		}
+	}
+}
+
+func TestGetUserDashboardStatisticsByPeriodWithChannelNamesIncludesCacheOverviewFilterOptions(t *testing.T) {
+	useDashboardMigrationTestDB(t)
+
+	if err := DB.Create([]*Channel{
+		{Id: 1, Name: "Alpha"},
+		{Id: 2, Name: "Beta"},
+	}).Error; err != nil {
+		t.Fatalf("expected channel fixtures to persist, got %v", err)
+	}
+
+	if err := DB.Exec(`
+		INSERT INTO statistics
+		(date, user_id, channel_id, model_name, request_count, quota, prompt_tokens, completion_tokens, cache_tokens, cache_read_tokens, cache_write_tokens, cache_hit_count, request_time)
+		VALUES
+		(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?),
+		(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?),
+		(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?),
+		(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		"2026-04-06", 1, 1, "gpt-4.1", 2, 20, 20, 2, 0, 0, 0, 1, 20,
+		"2026-04-06", 1, 2, "gpt-4o", 3, 30, 30, 3, 0, 0, 0, 0, 30,
+		"2026-04-05", 1, 9, "historical-only", 4, 40, 40, 4, 0, 0, 0, 0, 40,
+		"2026-04-06", 2, 1, "other-user", 5, 50, 50, 5, 0, 0, 0, 0, 50,
+	).Error; err != nil {
+		t.Fatalf("expected statistics fixtures to persist, got %v", err)
+	}
+
+	dashboard, err := GetUserDashboardStatisticsByPeriodWithChannelNames(1, DashboardDateRange{
+		Start: "2026-03-31",
+		End:   "2026-04-06",
+		Today: "2026-04-06",
+	})
+	if err != nil {
+		t.Fatalf("expected dashboard lookup to succeed, got %v", err)
+	}
+
+	if len(dashboard.CacheOverviewFilterOptions.Channels) != 3 {
+		t.Fatalf("expected three channel options in dashboard payload, got %+v", dashboard.CacheOverviewFilterOptions.Channels)
+	}
+	if dashboard.CacheOverviewFilterOptions.Channels[0].Id != 1 || dashboard.CacheOverviewFilterOptions.Channels[0].Name != "Alpha" {
+		t.Fatalf("expected channel 1 to include its admin-visible name, got %+v", dashboard.CacheOverviewFilterOptions.Channels[0])
+	}
+	if dashboard.CacheOverviewFilterOptions.Channels[1].Id != 2 || dashboard.CacheOverviewFilterOptions.Channels[1].Name != "Beta" {
+		t.Fatalf("expected channel 2 to include its admin-visible name, got %+v", dashboard.CacheOverviewFilterOptions.Channels[1])
+	}
+	if dashboard.CacheOverviewFilterOptions.Channels[2].Id != 9 || dashboard.CacheOverviewFilterOptions.Channels[2].Name != "" {
+		t.Fatalf("expected missing channels to stay selectable by id, got %+v", dashboard.CacheOverviewFilterOptions.Channels[2])
 	}
 }
 

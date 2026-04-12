@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"one-api/common"
+	"one-api/common/config"
 	"one-api/model"
 	"time"
 
@@ -14,6 +15,10 @@ import (
 const dashboardModuleCacheOverview = "cache_overview"
 
 var dashboardModuleNow = time.Now
+
+func shouldIncludeDashboardChannelNames(c *gin.Context) bool {
+	return c.GetInt("role") >= config.RoleAdminUser
+}
 
 type DashboardModuleQueryRequest struct {
 	DateRange *model.DashboardDateRange `json:"dateRange,omitempty"`
@@ -90,6 +95,7 @@ func QueryUserDashboardModules(c *gin.Context) {
 	}
 
 	modules := make(map[string]any, len(req.Modules))
+	includeChannelNames := shouldIncludeDashboardChannelNames(c)
 	for _, moduleQuery := range req.Modules {
 		switch moduleQuery.Name {
 		case dashboardModuleCacheOverview:
@@ -101,7 +107,12 @@ func QueryUserDashboardModules(c *gin.Context) {
 				}
 			}
 
-			cacheOverview, err := model.GetUserDashboardCacheOverview(userId, dateRange, filters)
+			var cacheOverview *model.DashboardCacheOverview
+			if includeChannelNames {
+				cacheOverview, err = model.GetUserDashboardCacheOverviewWithChannelNames(userId, dateRange, filters)
+			} else {
+				cacheOverview, err = model.GetUserDashboardCacheOverview(userId, dateRange, filters)
+			}
 			if err != nil {
 				common.APIRespondWithError(c, http.StatusOK, err)
 				return
