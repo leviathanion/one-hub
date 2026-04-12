@@ -2,26 +2,26 @@
 
 ## 文档收敛说明
 
-`docs/dev` 里原先有多份渠道亲和与 usage 设计文档，主题重复，而且取舍分叉。
+`docs/dev` 里原先有多份渠道亲和、usage 与 async task 设计文档，主题重复，而且不少内容混杂了“当前实现”和“未来草案”两种口径。
 
-现在把它们收敛成四份主题文档与一份独立工具文档：
+现在收敛成四份“当前架构说明”与一份独立工具文档：
 
 | 文档 | 主题 | 说明 |
 | --- | --- | --- |
-| [Channel Affinity 统一方案](./channel-affinity-architecture.md) | 渠道路由、responses affinity、Codex realtime affinity | 以当前代码实际采用的方案为准 |
-| [Billing / Usage 结算统一方案](./billing-settlement-architecture.md) | usage / settlement / finalize | 在多份提案中选出的最终推荐方案 |
-| [one-hub Async Task 极简协调方案](./task-coordination-architecture.md) | async task、identity、fetch、sweeper、finalize | 统一说明 one-hub 当前 async task 的能力边界、数据模型与落地取舍 |
-| [Execution Session Revocation 并发修复方案](./execution-session-revocation-refactor.md) | `runtime/session` 锁边界、revocation、Sweep、容量回收 | 说明 session manager revocation 检查的最终重构方向 |
+| [Channel Affinity 架构设计方案](./channel-affinity-architecture.md) | 渠道路由、responses affinity、Codex realtime affinity | 当前 routing / affinity 架构说明 |
+| [Billing / Usage 结算架构](./billing-settlement-architecture.md) | usage / settlement / finalize | 当前统一结算架构说明 |
+| [one-hub Async Task 架构设计](./task-coordination-architecture.md) | async task、identity、fetch、sweeper、finalize | 当前异步任务架构说明 |
+| [Execution Session Revocation 架构设计方案](./execution-session-revocation-refactor.md) | `runtime/session` 锁边界、revocation、Sweep、容量回收 | 当前 session manager revocation 架构说明 |
 | [Relay 压测脚本](./relay-performance-benchmark.md) | 热路径压测工具与口径 | 独立保留 |
 
 ## 当前现状
 
 | 文档 | 当前状态 | 说明 |
 | --- | --- | --- |
-| [Channel Affinity 统一方案](./channel-affinity-architecture.md) | 已选型 | 当前代码已按该方案收敛，用于解释现有 routing / affinity 行为 |
-| [Billing / Usage 结算统一方案](./billing-settlement-architecture.md) | V1 主干部分实现 | 现状与后续收敛目标共用同一份文档，后续实现继续以本文边界为准 |
-| [one-hub Async Task 极简协调方案](./task-coordination-architecture.md) | V0.9 收敛方案 | 当前目标仍是最小 task 协调，不是完整 task coordinator |
-| [Execution Session Revocation 并发修复方案](./execution-session-revocation-refactor.md) | 已实现并接入主流程 | `runtime/session` revocation 锁外化、批量 sweep 检查与 Codex execution session timeout 配置已落地 |
+| [Channel Affinity 架构设计方案](./channel-affinity-architecture.md) | 当前实现 | 当前代码已按该方案收敛，用于解释现有 routing / affinity 行为 |
+| [Billing / Usage 结算架构](./billing-settlement-architecture.md) | 当前实现 | `Quota -> SettlementEnvelope -> ApplySettlement` 已成为统一结算主链路 |
+| [one-hub Async Task 架构设计](./task-coordination-architecture.md) | 当前实现 | `tasks` 行、settlement snapshot、local fetch、sweeper、finalize 已形成稳定边界 |
+| [Execution Session Revocation 架构设计方案](./execution-session-revocation-refactor.md) | 当前实现 | `runtime/session` revocation 锁外化、批量 sweep 检查与 Codex execution session timeout 配置已落地 |
 | [Relay 压测脚本](./relay-performance-benchmark.md) | 可直接使用 | 对应 `hack/bench/relay_bench.go`，用于热路径压测与指标对照 |
 
 ## 目录

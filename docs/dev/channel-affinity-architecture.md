@@ -1,439 +1,376 @@
 ---
-title: "Channel Affinity 统一方案"
+title: "Channel Affinity 架构设计方案"
 layout: doc
 outline: deep
 lastUpdated: true
 ---
 
-# Channel Affinity 统一方案
+# Channel Affinity 架构设计方案
 
 ## 文档状态
 
-- 状态：已选型，按当前代码实现收敛
-- 当前现状：本文描述的是当前线上代码采用的 affinity 组合范式，不是待定提案
-- 范围：request 路由分组、responses affinity、Codex prompt-cache pre-routing、Codex realtime affinity、preferred channel fallback、responses continuation miss
+- 状态：正式方案，已选型并已按当前代码落地
+- 目标：统一描述 one-hub 在 `responses`、Codex `realtime`、路由分组、fallback 与 continuation miss 上的 affinity 架构
+- 文档口径：既保留选型说明，也明确当前实现 contract；不再把任何中间过渡形态视为目标方案
+- 范围：`common/groupctx`、`common/config/channel_affinity.go`、`relay/channel_affinity.go`、`runtime/channelaffinity`、Codex routing hint 与 realtime affinity
+- 非范围：strict distributed owner、跨节点 fencing token、全局 cooldown 协议、无 replay 前提下的 continuation 自动恢复
 
+## 真实问题与设计目标
 
-## 当前代码采用的总方案
+从第一性原理看，这里要解决的不是“做一个形式上最强的一致性系统”，而是三个更具体的问题：
 
-当前 one-hub 采用的是一套 availability-first 的 channel affinity 方案，核心决策如下：
+1. 让跨请求路由尽可能命中同一渠道，从而提高 `responses` continuation 命中率、Codex prompt cache 命中率和 realtime session 复用率。
+2. 在 fallback、Redis 抖动、provider 差异和渠道瞬时失败存在时，系统仍然要保留可服务的降级路径。
+3. 在缺少 replay、lease、fencing、node-aware ingress 等基础设施时，不伪装成具备更强保证。
 
-1. 把声明分组和实际路由分组拆开，使用 request-scoped `routing_group`
-2. channel affinity manager 在首次初始化时带完整 options 创建，`JanitorInterval` 只在构造期生效
-3. responses 的稳定 routing hint 必须在 provider 选择前可见，Codex 的 `prompt_cache_key` 通过 `request_hint` 预派生
-4. Codex realtime 采用 best-effort shared binding，而不是 strict distributed owner 协调
-5. preferred channel same-channel open 失败后，只在当前请求内排除该 channel，再做 fresh reroute
-6. `previous_response_id` 命中 continuation miss 时，外层清理 stale affinity 并返回显式错误，不做无 replay 能力的自动恢复
+因此当前方案明确选择 `availability-first` 的 affinity 模型：把必须成为路由真相的状态前移并做实，把只能作为共享提示的状态保持为 best-effort hint，把没有语义等价恢复前提的错误直接 fail-close。
 
-这六点不是互相独立的 patch，而是同一条 routing / affinity 主线的统一边界。
+## 已选型结论
 
-## 范式定位
+### 1. 路由作用域采用显式 `routing_group`，不复用声明态 `token_group`
 
-当前代码采用的不是单一 pattern，而是一条明确的组合范式：
+已选方案：
 
-`availability-first channel affinity = explicit effective routing scope + construction-time lifecycle + routing-visible stable hint + CAS-protected shared hint store + request-scoped failure isolation + correctness-first recovery boundary`
+- `token_group` 只表示令牌声明的主分组。
+- `routing_group` 表示当前请求真实参与选路、affinity、quota、日志和元数据的分组。
+- 初始化阶段由 `middleware/distributor.go` 建立首个 `routing_group`。
+- fallback 到备用分组时只更新 `routing_group`，不回写 `token_group`。
 
-对应到当前实现，就是六个局部最佳范式的拼接：
+选择原因：
 
-1. 用显式 `routing_group` 建模“当前真实生效的路由作用域”，而不是复用声明字段
-2. 把 affinity manager janitor 视为构造期确定生命周期的后台 worker，而不是普通热更新配置
-3. 把所有会影响 affinity 命中的稳定 key 提前暴露到 routing 阶段，而不是留到 provider 内部事后生成
-4. 把 realtime affinity 建模成 `shared resume hint + local runtime ownership`，而不是 strict distributed owner lock
-5. 把 preferred channel 失败后的影响范围限制在当前请求，而不是放大成跨请求全局事实
-6. 把 continuation miss 当成 correctness 边界问题，而不是普通 retry / fallback 问题
+- fallback 之后如果 affinity 仍按旧 `token_group` 计算，系统内部会同时存在两套“当前分组”定义，后续的 quota、日志、亲和键都可能错位。
+- 路由作用域是运行时事实，不是声明配置；必须单独建模。
 
-这套范式的核心不是“每处都追求更强一致性”，而是：
+### 2. Affinity manager 的 janitor 生命周期在构造期确定
 
-- 哪些状态必须成为 routing truth，就显式前移
-- 哪些状态只是共享 hint，就接受 best-effort 语义
-- 哪些失败缺少语义等价恢复前提，就显式 fail-close
+已选方案：
 
-## 统一设计
+- `runtime/channelaffinity.ConfigureDefault(...)` 首次调用时用完整 `ManagerOptions` 创建默认 manager。
+- `UpdateOptions(...)` 只更新 `DefaultTTL`、`MaxEntries`、Redis backend/prefix 这类运行期可调参数。
+- `JanitorInterval` 明确是构造期配置，后续热更新不会启动或停止 janitor goroutine。
 
-### 1. 路由分组语义
+选择原因：
 
-当前设计明确区分两种分组：
+- 后台清理 worker 的存在与否属于生命周期问题，不应该隐藏在运行期配置更新里。
+- 这样可以把 manager 的并发语义收敛到“构造期确定 worker，运行期只调参数”，避免隐式副作用。
 
-- `token_group`
-  - token 声明的原始主分组
-- `routing_group`
-  - 当前请求实际用于选路、affinity scope、quota / log / meta 的分组
+### 3. 会影响 affinity 命中的稳定 hint 必须在 provider 选择前可见
 
-初始化时：
+已选方案：
 
-- `middleware/distributor.go` 会建立第一版 `routing_group`
-- token 有主分组时，`routing_group = token_group`
-- 没有 token 主分组时，退到 `user_group`
+- `responses` 请求在 `relay/channel_affinity.go` 的 `prepareResponsesChannelAffinity(...)` 阶段先调用 `requesthints.ResolveResponses(...)`。
+- Codex routing hint 通过 `providers/codex/routing_hint.go` 生成 `responses.prompt_cache_key`。
+- affinity lookup 和 provider 最终请求都消费同一个 hint；provider 不再在选路之后独占生成 `prompt_cache_key`。
 
-fallback 到备用分组时：
+选择原因：
 
-- `relay/common.go` 只更新 `routing_group`
-- `token_group` 保持声明值不变
+- 如果稳定 hint 只在 provider 内部事后生成，记录 affinity 和命中 affinity 发生在两个时间层，路由阶段无法看到真正的 sticky identity。
+- 对 prompt cache 这类会直接影响渠道选择的键，必须在选路之前固定下来。
 
-因此当前语义是：
+### 4. Codex realtime 采用“共享 binding hint + 本地 runtime owner”，不做 strict distributed owner
 
-- affinity scope 读 `routing_group`
-- quota / log / meta 也读 `routing_group`
-- `token_group` 只保留“声明配置”语义
+已选方案：
 
-### 2. Affinity manager 生命周期
+- Redis binding 表示共享 resume hint。
+- 本地 `runtime/session` 中的 execution session 才是真实执行体和本地 owner。
+- revocation key 用来阻止已废弃 session key 再次进入 resume 路径。
+- `ResolveBinding` / `CheckRevocation` / CAS 写入共同决定 resume、fresh open、replace 和 local-only promotion。
 
-当前默认 manager 的生命周期边界已经确定：
+选择原因：
 
-- `ConfigureDefault(...)` 首次调用时，直接用完整 `ManagerOptions` 创建默认 manager
-- 如果默认 manager 已存在，后续只更新 runtime-tunable 选项
-- `JanitorInterval` 明确是 construction-time config
+- 如果把 Redis binding 直接当成 strict owner，就必须进一步解决 lease、heartbeat、fencing、node-aware handoff 等问题；当前系统没有也不需要为此付出复杂度。
+- 当前业务真正需要的是“尽量复用，遇到不确定时保守降级”，而不是跨节点强一致 owner 协议。
 
-这意味着：
+### 5. Preferred channel 失败后的影响范围限定在当前请求
 
-- janitor goroutine 的生命周期不通过 `UpdateOptions(...)` 热切换
-- `UpdateOptions(...)` 只负责轻量参数
-- `Stats().LocalEntries` 依赖首次构造时是否正确启动 janitor
+已选方案：
 
-### 3. Responses routing hint
+- affinity 命中后先尝试同渠道打开。
+- 若同渠道打开失败且当前不是 strict affinity，则只把该渠道写入当前请求的 `skip_channel_ids`。
+- 后续 fresh reroute 复用已有选路逻辑，但不写入 Redis，不做全局 quarantine。
 
-当前方案要求所有会影响 channel affinity 的稳定 key，都必须在 provider 选择前可见。
+选择原因：
 
-对 Codex responses，当前实现是：
+- 单次打开失败只能说明该次尝试不可用，不能推出“这个渠道对所有后续请求都不可用”。
+- 失败隔离保持在 request scope，可以保住可用性，同时避免污染共享事实。
 
-1. `relay/channel_affinity.go` 在 `prepareResponsesChannelAffinity(...)` 中先做 `requesthints.ResolveResponses(...)`
-2. `providers/codex/routing_hint.go` 根据 `CodexRoutingHintSetting` 生成 `responses.prompt_cache_key`
-3. affinity 引擎通过 generic `request_hint` source 参与 lookup
-4. `providers/codex/promptcache.go` 在真正发上游请求时优先复用 relay 已派生的 key
+### 6. `previous_response_id` continuation miss 按 correctness 边界处理，不做隐式自动恢复
 
-因此当前采用的不是“provider 内部事后生成 prompt_cache_key”的方案，而是“routing-visible hint pre-derivation”。
+已选方案：
+
+- 当上游返回 `previous_response_not_found` 时，外层统一清理本次请求涉及的 affinity binding。
+- 记录“可恢复候选”元数据，但直接返回显式 `409 conflict` 错误给客户端。
+- 不自动清空 `previous_response_id`，不在无 replay 能力前提下做静默重放。
+
+选择原因：
+
+- continuation 不是普通 hint，而是有语义锚点的状态续接。
+- 没有完整 replay 能力时，自动恢复会导致上下文漂移和语义错误；宁可显式失败，也不能伪造正确性。
+
+### 7. 显式 pin 是 request-local override，不属于 shared affinity
+
+已选方案：
+
+- 存在 `specific_channel_id` 这类显式 pin 时，跳过 shared affinity lookup。
+- 请求成功后也不回写 shared affinity。
+- 日志和元数据可以记录本次 pin 到的渠道，但不能把 pin 结果提升为跨请求共享事实。
+
+选择原因：
+
+- pin 表达的是“这次请求就走这里”，不是“后续未 pin 的请求也应走这里”。
+- 如果 pin 成功会回写共享状态，调试、回放、手工续接会污染正常请求的路由结果。
+
+## 架构总览
+
+当前架构可以概括为：
+
+`availability-first channel affinity = 显式路由作用域 + 构造期确定的 manager 生命周期 + 选路可见的稳定 hint + shared binding hint + 请求级失败隔离 + correctness-first continuation 边界`
+
+这套架构由四层组成：
+
+1. 作用域层：`groupctx.CurrentRoutingGroup(...)` 定义请求当前真实选路作用域。
+2. 规则层：`ChannelAffinitySettings` 定义哪些请求、哪些键、哪些上下文维度参与 affinity。
+3. 存储层：`runtime/channelaffinity.Manager` 提供本地内存 + 可选 Redis 的 hybrid affinity record 存储。
+4. 协议层：`responses`、Codex routing hint、Codex realtime、fallback 与 continuation miss 共同消费同一套 affinity contract。
+
+## 配置与数据模型
+
+### 默认规则
+
+`common/config/channel_affinity.go` 当前内置三条默认规则：
+
+1. `responses-continuation`
+   - kind: `responses`
+   - key source: `request_field.previous_response_id`
+   - strict: `true`
+   - `record_on_success: true`
+2. `responses-prompt-cache-key`
+   - kind: `responses`
+   - key source: `request_field.prompt_cache_key`
+   - key source: `request_hint.responses.prompt_cache_key`
+   - `record_on_success: true`
+3. `realtime-session`
+   - kind: `realtime`
+   - key source: `header.x-session-id`
+   - key source: `header.session_id`
+   - `record_on_success: true`
+
+规则支持：
+
+- `ModelRegex`
+- `PathRegex`
+- `UserAgentRegex`
+- `IncludeGroup`
+- `IncludeModel`
+- `IncludePath`
+- `IncludeRuleName`
+- `Strict`
+- `SkipRetryOnFailure`
+- `IgnorePreferredCooldown`
+- `RecordOnSuccess`
+- `TTLSeconds`
+
+### Affinity key 模板
+
+单个 affinity key 由 `channelAffinityTemplate` 生成，输入由以下部分拼接：
+
+- `scope`
+- `kind`
+- `alias`
+- 可选 `rule:<name>`
+- 可选 `group:<routing_group>`
+- 可选 `model:<model>`
+- 可选 `path:<path>`
+- `sha256(value)[:16]`
+
+设计含义：
+
+- 原始 value 不直接落键，避免明文暴露 `session_id` / `prompt_cache_key` / `response_id`。
+- 同一 value 在不同 routing scope、不同规则、不同模型下天然隔离。
+- `ResumeFingerprint` 进一步补充“值相同但恢复语义不同”的情况；当前 `responses` 用模型名作为 fingerprint。
+
+### 存储模型
+
+`runtime/channelaffinity.Record` 目前包含：
+
+- `ChannelID`
+- `ResumeFingerprint`
+- `UpdatedAt`
+
+manager 支持：
+
+- 本地内存读写
+- 可选 Redis 持久化
+- TTL 过期
+- 本地 `MaxEntries` 容量控制
+- Redis 过期清理与超量裁剪
+
+## 核心流程
+
+### 1. 请求初始化与路由作用域建立
+
+`middleware/distributor.go` 在请求进入主链路时：
+
+1. 读取 `token_group`、`token_backup_group` 和用户组。
+2. 根据优先级建立首个 `routing_group`。
+3. 设置 `routing_group_source`。
+4. 按当前 `routing_group` 计算 group ratio。
+
+之后所有 affinity 相关逻辑都通过 `groupctx.CurrentRoutingGroup(...)` 读取有效作用域。
+
+### 2. Responses affinity
+
+请求进入 `responses` 路径时：
+
+1. `prepareResponsesChannelAffinity(...)` 先解析 request hints。
+2. 遍历规则并提取 `previous_response_id`、`prompt_cache_key` 或派生 hint。
+3. 基于规则模板生成 request bindings。
+4. 若命中历史 affinity record，则设置 `preferred_channel_id`、`strict`、`skip_retry_on_failure` 等上下文状态。
+5. 请求成功后：
+   - `recordCurrentChannelAffinity(...)` 记录当前请求命中的 lookup binding。
+   - `recordResponsesChannelAffinity(...)` 进一步把响应里的 `response.id` 与 `prompt_cache_key` 回写为后续请求可复用的 binding。
+
+关键约束：
+
+- `request_hint` 只解决“选路前可见的稳定 identity”问题，不改变 provider 的最终请求语义。
+- 如果请求已显式 pin 渠道，则只记录元数据，不写共享 affinity。
+
+### 3. Codex prompt-cache pre-routing
+
+Codex 的 `responses.prompt_cache_key` 派生由 `providers/codex/routing_hint.go` 提供：
+
+1. 仅当客户端未显式提供 `prompt_cache_key` 时才派生。
+2. 按 `prompt_cache_key_strategy` 生成稳定 key。
+3. 将结果写入 `request_hints`。
+4. affinity 和最终 provider 请求都读取同一个结果。
+
+当前选型不是“provider 内部晚生成”，而是“路由阶段先派生，provider 阶段复用”。
 
 ### 4. Codex realtime affinity
 
-当前 realtime 采用的是 best-effort affinity，而不是强 owner 协调。
+Codex realtime 的共享亲和逻辑由 `providers/codex/realtime_session.go` 和 `runtime/session` 共同实现。
 
-共享状态：
+主流程如下：
 
-- Redis binding 作为 shared resume hint
-- revocation key 用于阻止已明确废弃的旧 session key 再次进入 resume 路径
+1. `buildExecutionSessionMetadata(...)` 基于 caller namespace、client session id、channel id、兼容性哈希构建：
+   - `BindingKey`
+   - `ExecutionSession.Key`
+   - `CompatibilityHash`
+2. `planRealtimeOpen(...)` 读取 shared binding：
+   - `ResolveMiss`：计划 `create_if_absent`
+   - `ResolveHit + compatible + not_revoked`：计划 resume
+   - `ResolveHit + revoked`：计划 `replace_if_matches`
+   - `ResolveHit + incompatible`：计划 `replace_if_matches`
+   - `ResolveBackendError` 或 `RevocationUnknown`：不 resume，也不宣称自己有新的 shared owner
+3. 打开新 session 后，如果是 local-only，则通过 `codexMaybePromoteExecutionSession(...)` 尝试 piggyback promotion。
 
-本地状态：
+一致性边界：
 
-- runtime session 是真实执行体
-- 本地 binding/index 是 near-cache
-- Redis 不确定时允许先创建 fresh local session
-
-关键语义：
-
-- Redis `hit + compatible + not_revoked` 时，优先尝试 resume
-- Redis `miss` 时 fresh，并尝试 publish
-- Redis `backend_error` 时不继续 resume 旧 key，直接 fresh，默认降级为 local-only
-- publish / replace 失败时保留当前 local session，但不宣称其成为新的 shared binding
-
-当前代码已经实现了：
-
-- `ResolveStatus`
-- `RevocationStatus`
-- `BindingWriteStatus`
-- CAS 风格的 binding create / replace / delete / touch / revoke
-- local-only session 的 piggyback promotion
-
-当前代码明确没有实现：
-
-- owner lease
-- fencing token
-- strict global handoff
-
-### 4.1 显式 pin / manual override 不是 shared affinity
-
-本文前文讨论的 shared affinity，前提都是“这是可复用的稳定 routing hint”。
-
-`specific_channel_id` 这类显式 pin 不属于这类 hint，它是 request-local routing override。
-
-因此必须补一条硬约束：
-
-- 显式 pin 存在时，要同时跳过 shared affinity lookup 和 shared affinity writeback
-- `record_on_success` 不能因为一次 pinned request 成功，就把该 channel 回写成后续普通请求的共享 affinity
-- 这条约束同时适用于 responses 的 `prompt_cache_key` / `previous_response_id` 派生 binding，以及 realtime session binding
-- 可以记录 request log / meta，说明本次请求是被 pin 到哪个 channel，但不能把这个 override 提升为 shared fact
-
-原因很简单：
-
-- 显式 pin 只表达“这次请求就走这里”
-- 它不表达“后续未 pin 的请求也应该优先走这里”
-- 否则一个临时调试、回放、强制同渠道续接请求，就会污染跨请求共享路由结果
-
-如果产品以后真的需要“pin success 顺便重置 shared affinity”，那必须是单独的显式开关或 API，而不能是普通 pin 的隐式副作用。
+- Redis binding 是 shared hint，不是 owner lease。
+- `VisibilityLocalOnly` 表示本地可继续服务，但不宣称自己已成为新的共享 binding。
+- publish/write 失败时优先保住本地可用性，而不是为了追求共享状态强一致而放弃服务。
 
 ### 5. Preferred channel fallback
 
-当前采用的不是全局 quarantine，而是请求级 exclusion。
+当 affinity 命中某个 preferred channel 时：
 
-当 realtime affinity 命中 preferred channel 后：
+1. 请求优先尝试该 channel。
+2. 若打开失败且规则不是 strict affinity：
+   - 将该 channel 写入当前请求的 `skip_channel_ids`
+   - 清除“本次已选 preferred”的选择状态
+   - 重新走正常 fresh reroute
+3. 若规则是 strict affinity：
+   - 不 reroute
+   - 按原错误返回
 
-1. 先在同 channel 上做 open
-2. same-channel open 失败且当前不是 strict affinity 时
-3. 把失败的 `preferredChannelID` 写入当前请求的 `skip_channel_ids`
-4. 后续 fresh reroute 复用现有选路逻辑跳过这个 channel
+这保证了：
 
-这样做的边界很清楚：
+- strict affinity 明确承担正确性优先；
+- 非 strict affinity 明确承担可用性优先；
+- 失败影响只局限在当前请求。
 
-- 只影响当前请求
-- 不写 Redis
-- 不做 channel 级 cooldown
-- 不把单次失败放大成全局共享状态判断
+### 6. Continuation miss 处理
 
-### 6. Responses continuation miss
+`relay/main.go` 在外层统一处理 `responses` continuation miss：
 
-`previous_response_id` 不是普通 affinity hint，而是 continuation anchor。
-
-当前采用的处理方式是：
-
-1. `relay/responses.go` 只负责识别 `previous_response_not_found`
-2. `relay/main.go` 在外层统一处理 continuation miss
-3. 清理 stale affinity
-4. 记录 recovery-candidate meta
-5. 返回显式错误给客户端
+1. 判断上游错误是否等价于 `previous_response_not_found`。
+2. 清理当前请求的所有 affinity binding。
+3. 重新准备请求级 affinity 状态，避免 stale binding 残留。
+4. 记录恢复候选元数据。
+5. 返回本地构造的显式 `409 conflict` 错误。
 
 当前明确不做：
 
-- 在 `send()` 内部 reroute
-- 自动清空 `previous_response_id` 再重发
-- 在无 replay 能力前提下做语义漂移的自动恢复
+- 自动去掉 `previous_response_id` 并重试。
+- 静默回放。
+- 把 continuation miss 视为普通渠道错误并走通用 retry/cooldown。
 
-## 为什么当前代码采用这套组合
+## 一致性模型
 
-从第一性原理看，one-hub 在这条链路上要解决的真实问题，不是“做出一套形式上最强的一致性协议”，而是：
+当前 Channel Affinity 采用以下一致性边界：
 
-1. affinity 必须真正提升选路命中率、prompt cache 命中率与 session 复用率
-2. fallback、provider 差异和 Redis 抖动出现时，系统仍要保留可继续服务的退化路径
-3. 在缺少 replay、lease、fencing、node-aware ingress 等基础设施时，不能伪装成自己具备更强保证
+- `routing_group` 是请求内的 routing truth。
+- affinity record 是跨请求共享 hint，而不是分布式 owner 协议。
+- Redis/backend 抖动允许 false miss，不允许把 request-local override 升级成 shared fact。
+- continuation miss 缺少 replay 能力时直接 fail-close。
 
-因此当前代码选择的不是“把所有状态都做强”，而是“只把必须成为 truth 的部分做强，把其余部分限制在 hint 或 request scope 内”。
+换句话说：
 
-具体原因如下：
+- 对必须成为“当前请求真实作用域”的状态，选择强语义。
+- 对跨请求共享但不值得引入分布式协议的状态，选择 best-effort。
+- 对缺少语义等价恢复基础的错误，选择 correctness-first。
 
-### 1. `routing_group` 必须绑定真实选路结果
+## Trade-off
 
-如果 fallback 后请求已经落到备用组，但 affinity、quota、日志还继续读取旧 `token_group`，系统内部就会同时存在两套“当前组”定义。
+### 当前方案获得了什么
 
-这不是实现细节问题，而是 scope truth 没有被显式建模。
+- fallback 后的 routing、quota、日志和 affinity 作用域一致。
+- prompt cache key 等稳定 hint 在选路前可见，命中率更高。
+- realtime 在 Redis 抖动或共享状态不确定时仍可 local-only 继续服务。
+- preferred channel 失败不会被放大成全局污染。
+- continuation miss 不会因为错误的自动恢复导致上下文漂移。
 
-所以当前代码采用：
+### 当前方案牺牲了什么
 
-- `token_group` 保留声明语义
-- `routing_group` 承担真实 routing / affinity / quota scope
+- 不提供 strict distributed owner，也不承诺跨节点单 owner handoff。
+- Redis/backend 异常时可能出现 false miss，导致 fresh route 或 local-only open 增加。
+- 显式 pin 不会“顺便刷新”共享 affinity；这降低了操作便利性，但换来共享状态不被污染。
+- continuation miss 需要客户端显式 replay，不能透明恢复。
 
-这对应的最佳范式是：
+### 为什么这是当前最佳点位
 
-- `explicit effective scope`
-
-### 2. janitor 生命周期应在构造期确定
-
-janitor goroutine 本质上是后台 worker，不是普通配置字段。把它藏进 `UpdateOptions(...)` 会让“是否启动清理器”变成一个隐式副作用。
-
-所以当前代码采用：
-
-- 首次构造默认 manager 时就带完整 options
-- `JanitorInterval` 只在构造期生效
-- runtime update 只更新轻量参数
-
-这对应的最佳范式是：
-
-- `construction-time lifecycle for singleton background worker`
-
-### 3. 稳定 routing hint 必须在 provider 选择前可见
-
-`prompt_cache_key` 会影响 prompt cache route 命中。如果它只在 provider 内部事后生成，那么“记录 affinity”与“命中 affinity”就会发生在不同时间层。
-
-所以当前代码采用：
-
-- request normalization 阶段先做 hint resolve
-- relay 与 provider 复用同一派生结果
-- provider 只负责消费最终 key，而不再独占决定 key
-
-这对应的最佳范式是：
-
-- `routing-visible stable identity`
-
-### 4. realtime affinity 的真实角色是共享 hint，不是 owner 锁
-
-如果把 Redis binding 当成 strict owner，系统就必须进一步解决 lease、fencing、heartbeat、node-aware handoff 等问题。当前代码和产品承诺都没有走到那一步。
-
-而当前真正需要保证的只有：
-
-- stale 状态不能 blind overwrite / blind delete 新 binding
-- Redis 不确定时不要继续 resume 旧 key
-- 当前请求尽量还能继续
-
-所以当前代码采用：
-
-- `shared resume hint store`
-- `CAS-protected binding mutation`
-- uncertain 时 fresh，并允许降级为 `local-only`
-
-这对应的最佳范式是：
-
-- `availability-first shared hint store + local near-cache`
-
-### 5. preferred channel 失败不应立刻升级为全局判断
-
-单次请求在 preferred channel 上 open 失败，只能说明“这次没成功”，不能推出“全局 binding 一定 stale”或“这个 channel 对所有请求都应 cooldown”。
-
-所以当前代码采用：
-
-- 在当前请求内排除失败的 preferred channel
-- 后续 fresh reroute 走既有负载均衡
-- 只在新的成功结果出现后再改写 affinity
-
-这对应的最佳范式是：
-
-- `bounded fallback with request-scoped failure isolation`
-
-### 6. continuation miss 在无 replay 能力前提下必须保守处理
-
-`previous_response_id` 是 continuation anchor，不是普通 retry hint。没有 canonical transcript / compaction replay 能力时，自动清空它再重发，本质上是在做语义漂移的自动恢复。
-
-所以当前代码采用：
-
-- 外层 orchestration 统一识别 continuation miss
-- 清理 stale affinity
-- 返回显式错误，而不是在 `send()` 内偷偷 reroute
-
-这对应的最佳范式是：
-
-- `correctness-first recovery boundary`
-
-综合起来，当前组合成立的原因很简单：
-
-- 真实生效 scope 显式化
-- 影响路由的稳定 identity 前移
-- 共享状态只承担 hint 职责
-- 单次失败不升级成全局事实
-- 缺少等价恢复前提时明确报错
-
-这正是当前代码复杂度、收益和真实承诺之间最稳的平衡点。
-
-## Trade-Off 与最佳范式映射
-
-| 决策 | 对应最佳范式 | 收益 | 代价 | 当前为何接受 |
-| --- | --- | --- | --- | --- |
-| 拆分 `token_group` / `routing_group` | `explicit effective scope` | affinity、quota、日志与真实选路一致 | 多一个 request-scoped 字段与 helper | 这是修复 fallback 语义错位的最小正确建模 |
-| `JanitorInterval` 只在构造期生效 | `construction-time lifecycle` | 生命周期清晰，不在热路径里隐式启停 goroutine | 热更间隔需要整实例替换 | janitor 是 worker，不值得为它引入复杂热切换状态机 |
-| `prompt_cache_key` 预派生 | `routing-visible stable identity` | 第二次请求开始即可在 provider 选择前命中 affinity | relay 需要看见一小部分 provider-local strategy | 只上移稳定 key 派生，比 speculative provider selection 成本低得多 |
-| 显式 pin 视为 request-local override | `explicit effective scope + non-promotable override` | 避免临时 pin 污染后续未 pin 请求的 shared affinity | pinned success 不能顺带“预热”共享 affinity | 单次显式 override 不能被提升成跨请求共享事实 |
-| realtime 采用 best-effort shared binding | `CAS-protected shared hint store + local near-cache` | Redis 抖动时当前请求仍可继续，且 stale 状态不易写坏共享 binding | 接受 dual-active window、`local-only`、非严格 handoff | 产品真实承诺是 session reuse 优化，不是分布式 owner 协议 |
-| preferred channel 失败后只做请求级 exclusion | `bounded fallback / failure isolation` | 避免同一请求重复打到同一失败 channel | 不能顺带提供跨请求 quarantine | 单次失败不足以推导全局健康结论 |
-| continuation miss 显式报错 | `correctness-first recovery boundary` | 避免隐藏 reroute、usage/quota 漂移与语义错位 | 用户体验更保守，客户端可能要带完整上下文重发 | 在无 replay 能力前，保守失败比伪恢复更正确 |
+- 再往强一致方向走，必须引入 lease、fencing、跨节点 owner 协调和 replay 协议，复杂度明显上升。
+- 当前系统的真实收益主要来自“更高命中率 + 更稳降级路径”，而不是全链路强一致。
+- 因此当前点位是：在 routing truth、request scope 和 correctness boundary 上做强，在 shared hint 上保持克制。
 
 ## 当前实现落点
 
-- `common/groupctx/routing_group.go`
-- `middleware/distributor.go`
-- `runtime/channelaffinity/default_manager.go`
-- `runtime/channelaffinity/manager.go`
-- `internal/requesthints/request_hints.go`
-- `providers/codex/routing_hint.go`
-- `providers/codex/promptcache.go`
-- `runtime/session/types.go`
-- `runtime/session/redis.go`
-- `runtime/session/manager.go`
-- `providers/codex/realtime_session.go`
-- `relay/realtime.go`
-- `relay/responses.go`
-- `relay/main.go`
+关键代码入口：
+
+- 路由作用域：`common/groupctx/routing_group.go`
+- 请求初始化：`middleware/distributor.go`
+- affinity 配置：`common/config/channel_affinity.go`
+- affinity 主链路：`relay/channel_affinity.go`
+- affinity 存储：`runtime/channelaffinity/manager.go`
+- request hints：`internal/requesthints/request_hints.go`
+- Codex routing hint：`providers/codex/routing_hint.go`
+- Codex realtime affinity：`providers/codex/realtime_session.go`
+- continuation miss：`relay/responses.go`、`relay/main.go`
 
 ## 明确不采用的方案
 
-为了避免后续文档再次分叉，下面这些方向明确不是当前方案：
-
-1. 不再让 `token_group` 同时承担声明分组和当前生效分组
-2. 不在 `UpdateOptions(...)` 里热切换 janitor 生命周期
-3. 不把 Codex 自动 `prompt_cache_key` 继续留在 provider 内部事后生成
-4. 不把 realtime affinity 升级成 strict distributed owner 协调
-5. 不对 preferred channel 做跨请求全局 quarantine
-6. 不在 `send()` 内部偷偷处理 `previous_response_id` 恢复
+- 不把 `token_group` 当作运行时真实路由作用域。
+- 不把 janitor 生命周期做成热更新副作用。
+- 不把 `prompt_cache_key` 的最终生成延后到 provider 选择之后。
+- 不把 Redis binding 解释成 strict distributed owner。
+- 不把单次 preferred channel 失败升级为全局 cooldown 或 quarantine。
+- 不在无 replay 能力前提下对 `previous_response_id` 做自动恢复。
 
 ## 后续扩展边界
 
-如果以后要继续增强，这几件事必须单独设计，而不是继续往当前方案里硬塞：
+如果未来业务目标升级，可以在不破坏当前主线的前提下继续扩展：
 
-1. replay-capable 的 `previous_response_id` 自动恢复
-2. 更强的 node-aware routing / handoff
-3. lease / fencing token 级别的 realtime ownership
-4. 跨请求的 channel quarantine / cooldown 语义
-
-## 参考资料
-
-这些资料用于约束当前方案的边界与 trade-off，不意味着 one-hub 需要把自己实现成其中任一系统的完整版。
-
-### 外部资料
-
-#### 路由分组与 sticky scope
-
-- HAProxy Session persistence
-  - https://www.haproxy.com/documentation/haproxy-configuration-tutorials/proxying-essentials/session-persistence/
-- HAProxy Sticky Sessions
-  - https://www.haproxy.com/blog/enable-sticky-sessions-in-haproxy
-
-#### 生命周期与后台 worker
-
-- ABP Background Workers
-  - https://abp.io/docs/10.0/framework/infrastructure/background-workers
-- `patrickmn/go-cache` package docs
-  - https://pkg.go.dev/github.com/patrickmn/go-cache
-
-#### Prompt cache 与 conversation state
-
-- OpenAI Prompt Caching
-  - https://developers.openai.com/api/docs/guides/prompt-caching
-- OpenAI Conversation State
-  - https://developers.openai.com/api/docs/guides/conversation-state
-- OpenAI Conversation State (Responses)
-  - https://platform.openai.com/docs/guides/conversation-state?api-mode=responses
-- OpenAI Compaction guide
-  - https://developers.openai.com/api/docs/guides/compaction
-
-#### Realtime shared hint / distributed systems
-
-- Google Cloud Load Balancing, Backend services overview
-  - https://cloud.google.com/load-balancing/docs/backend-service
-- Google Cloud Run, Session Affinity
-  - https://cloud.google.com/run/docs/configuring/session-affinity
-- Google App Engine flexible, WebSockets and session affinity
-  - https://cloud.google.com/appengine/docs/flexible/using-websockets-and-session-affinity
-- etcd API guarantees
-  - https://etcd.io/docs/v3.5/learning/api_guarantees/
-- etcd API
-  - https://etcd.io/docs/v3.7/learning/api/
-- Redis distributed locks
-  - https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/
-- Kubernetes client-go leader election
-  - https://pkg.go.dev/k8s.io/client-go/tools/leaderelection
-- Hazelcast FencedLock
-  - https://docs.hazelcast.com/hazelcast/5.0/data-structures/fencedlock
-- Hazelcast CP session configuration
-  - https://docs.hazelcast.com/hazelcast/5.0/cp-subsystem/configuration
-
-#### Fallback / retry / recovery 语义
-
-- AWS Builders Library: Avoiding fallback in distributed systems
-  - https://aws.amazon.com/builders-library/avoiding-fallback-in-distributed-systems/
-- AWS Builders Library: Making retries safe with idempotent APIs
-  - https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-apis/
-- AWS Builders Library: Timeouts, retries, and backoff with jitter
-  - https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/
-- Kubernetes Session Affinity
-  - https://kubernetes.io/docs/reference/networking/virtual-ips/#session-affinity
-- YARP Session Affinity
-  - https://learn.microsoft.com/aspnet/core/fundamentals/servers/yarp/session-affinity
-
-### 相邻实现参考
-
-- `../sub2api/backend/internal/repository/gateway_cache.go`
-- `../sub2api/backend/internal/service/request_metadata.go`
-- `../sub2api/backend/internal/service/openai_gateway_service.go`
-- `../sub2api/backend/internal/service/openai_gateway_service_test.go`
-- `../sub2api/backend/internal/service/openai_ws_forwarder.go`
-- `../sub2api/backend/internal/service/openai_ws_protocol_forward_test.go`
-- `../new-api/service/channel_affinity.go`
-- `../new-api/setting/operation_setting/channel_affinity_setting.go`
-- `../new-api/relay/common/override_test.go`
-- `../CLIProxyAPI/sdk/cliproxy/usage/manager.go`
-- `../CLIProxyAPI/sdk/api/handlers/openai/openai_responses_websocket.go`
-- `../CLIProxyAPI/sdk/api/handlers/openai/openai_responses_websocket_test.go`
+- 为 shared binding 增加更强的 owner 协调协议。
+- 为 continuation 提供显式 replay 协议后，再讨论自动恢复。
+- 为 pin 增加单独的“重置 shared affinity”显式开关，而不是隐式副作用。
+- 按业务域拆分更多 request hint resolver，但仍必须满足“选路前可见”的约束。

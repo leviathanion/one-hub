@@ -1,169 +1,82 @@
 ---
-title: "Billing / Usage 结算统一方案"
+title: "Billing / Usage 结算架构"
 layout: doc
 outline: deep
 lastUpdated: true
 ---
 
-# Billing / Usage 结算统一方案
+# Billing / Usage 结算架构
 
 ## 文档状态
 
-- 状态：V1 主干已部分实现，后续实现与重构以本文为准
-- 当前现状：这份文档同时承担“已落地边界说明”和“后续收敛基线”两种角色，代码还未完全统一到单一 settle contract
-- 目标：在不新增表、不引入独立 billing service 的前提下，统一 unary / realtime / async task 的最终扣费边界
+- 状态：当前实现
+- 适用范围：unary request、Codex realtime turn、async task
+- 目的：说明当前代码已经采用的结算架构、边界和 trade-off，而不是下一阶段的实现草案
 
-## 设计目标边界
+## 这套架构真正解决什么
 
-这份设计首先不是精确记账系统设计。
+从第一性原理看，one-hub 的 billing 目标不是做一套财务级账本，而是把“最终扣多少、在哪一处落真相、重复 finalize 如何收敛”固定下来。
 
-one-hub 当前这套 billing / usage 机制，主要目标是：
+当前代码解决的是三件事：
 
-1. 给配额控制提供一个稳定的最终扣费边界
-2. 给运营和产品分析提供尽量稳定的 usage 统计口径
-3. 避免 retry、async finalize、projection 失败带来的大幅重复统计或大幅漏统
+1. 预扣和最终结算分离，但最终 truth 只走一条入口
+2. unary、realtime、async task 三类请求共用同一套 settlement contract
+3. detached finalize 场景在可接受复杂度内做幂等防重，而不是为此引入独立 ledger service
 
-它不是为了追求逐请求、逐分、逐厘都完全精确的账务系统。
+当前代码明确不解决：
 
-明确允许的现实约束是：
+1. crash-safe exactly-once ledger
+2. 独立 billing service / reconciliation service
+3. 财务语义的双分录账本
+4. 所有 projection 绝对不丢
 
-- 允许非常小范围的多记或少记
-- 允许个别请求在极端异常下出现轻微偏差
-- 允许 projection 滞后或偶发缺失
+这不是缺陷，而是当前复杂度预算下的明确取舍。
 
-但不允许：
+## 当前实现的总链路
 
-- 同一请求被系统性重复多扣、多记
-- 某条路径长期稳定性偏高或偏低，形成系统性偏差
-- 小误差持续累积成肉眼可见的统计失真
-- 为了追求账本级精确，引入明显高于收益的表、状态机、服务拆分
+当前结算链路已经收敛为：
 
-换句话说，V1 追求的是：
+`Quota -> SettlementEnvelope -> ApplySettlement -> truth / cleanup / projection`
 
-- bounded error
-- stable aggregation
-- low-complexity correctness
+对应模块：
 
-而不是：
+| 模块 | 职责 |
+| --- | --- |
+| `relay/relay_util/quota.go` | 计算价格、预扣额度、冻结结算快照 |
+| `internal/billing/settlement.go` | 统一结算入口、Redis gate、防重、truth / cleanup / projection 分层 |
+| `relay/relay_util/realtime_turn_observer.go` | realtime turn finalize 归一到 settlement |
+| `relay/task/base/settlement.go` | async task snapshot 冻结与 finalize |
+| `model/token.go` | `ApplyTokenUserQuotaDeltaDirect`，同步落 user/token truth |
 
-- financial-grade exact accounting
-- crash-safe exactly-once ledger semantics
+## 核心分层
 
-## 结论先行
+### 1. reserve 仍然是请求路径行为
 
-如果只追求边际收益最大的方案，V1 就只做下面四件事：
+当前代码保留了原有 reserve 模型：
 
-1. 保留现有 reserve 模型，不重写 `PreQuotaConsumption()` / `Undo()`
-2. 所有最终扣费统一走一个同步入口 `ApplySettlement`
-3. 明确区分 truth、cleanup、projection，禁止混写
-4. async 场景只复用现有 `Task` JSON 字段和 Redis，不新增任何持久化账务模型
+- `Quota.PreQuotaConsumption()`
+- `Quota.Undo()`
 
-同时明确一个前提：
+它仍然是 attempt-scoped，而不是 request-scoped global reserve。
 
-- 这套方案追求“小偏差内稳定可用”，不是“绝对精确记账”
+当前保留这套模型的原因很直接：
 
-这版方案允许的偏差只有三类：
+1. 现有 relay 路径已经全面依赖它
+2. async task 必须在 submit 时先冻结可回补的额度上下文
+3. 全量重写 reserve 生命周期，牵动的范围远大于收益
 
-1. 一个进程内收口对象 `SettlementCommand`
-2. detached finalize 场景下的 Redis 幂等 gate
-3. async task 场景下复用 `Task.Properties` / `Task.Data` 保存最小 snapshot
+async task 额外调用 `ForcePreConsume()`，强制在 submit 时持有预扣额度，因为 finalize 发生在脱离原请求的异步路径上。
 
-除此之外，V1 明确不做：
+### 2. `SettlementEnvelope` 是冻结后的最小结算快照
 
-1. 不做 billing ledger / settlement history 新表
-2. 不做 request-scoped single reserve
-3. 不做 full double-entry accounting
-4. 不做独立 reconciliation service
-5. 不承诺 crash-safe exactly-once
+当前代码不再把最终结算所需信息散落在多条路径里，而是先由 `Quota.BuildSettlementEnvelope(...)` 冻结：
 
-## 问题本质
+- `SettlementCommand`
+- `SettlementOptions`
 
-当前 one-hub 的主要问题不是价格公式，而是最终扣费边界分散。
-
-具体表现为：
-
-- reserve 与 finalize 混在不同路径里
-- retry 后 `channel_id`、`group_ratio`、model mapping 可能漂移
-- realtime / async task 的 finalize 生命周期脱离原始请求
-- `logs`、`used_quota`、`request_count` 这类 projection 很容易被误当成账务真相
-
-从第一性原理看，系统先要保证的只有三件事：
-
-1. 最终到底扣了多少
-2. user / token truth 为什么只落一次
-3. projection 失败为什么不会破坏 truth
-
-只要这三件事站稳，后面 reserve 是否优雅、是否做 ledger、是否追求更强幂等，都可以延后。
-
-进一步说，这里“站稳”指的是：
-
-- 在绝大多数正常路径下，统计口径稳定
-- 在异常路径下，误差被限制在很小范围内
-- 不出现大规模、系统性、可持续放大的偏差
-
-## 现有模型已经足够
-
-V1 的关键判断是：现有表已经足够承载这一版能力，不需要新增表。
-
-### truth
-
-账务真相只落在现有列上：
-
-- `users.quota`
-- `tokens.remain_quota`
-- `tokens.used_quota`
-
-### projection
-
-统计与审计继续落在现有列 / 表上：
-
-- `users.used_quota`
-- `users.request_count`
-- `channels.used_quota`
-- `logs`
-
-### async snapshot
-
-异步 finalize 所需上下文只复用现有 JSON 字段：
-
-- `tasks.properties`
-- `tasks.data`
-
-因此 V1 不是“数据库不变但系统模型大改”，而只是把现有扣费流程收口。
-
-这里的 “truth” 也不是财务语义上的绝对账本真相，而是 one-hub 在当前复杂度预算下用于：
-
-- quota 控制
-- 最终消费落点
-- 统计基线
-
-的一组最小可信字段。
-
-## 核心设计
-
-### 1. `types.Usage` 是最终结算输入
-
-所有 token-based 流程在进入最终扣费前，都统一归一到 `types.Usage`。
-
-边界如下：
-
-- `types.Usage`
-  - 最终结算输入
-- `types.UsageEvent`
-  - realtime 增量观测类型，只在 finalize 前存在
-- provider / transport 层 DTO
-  - 只停留在协议层，不进入 settlement truth
-
-V1 不再引入新的 canonical usage model。
-
-### 2. `SettlementCommand` 只是进程内收口对象
-
-`SettlementCommand` 的目的很简单：把最终结算需要的最小 truth 信息收拢到一个参数对象里。
-
-建议字段：
+`SettlementCommand` 是当前系统里的最小 truth 输入，核心字段包括：
 
 - `identity`
-- `fingerprint`
 - `request_kind`
 - `user_id`
 - `token_id`
@@ -174,318 +87,208 @@ V1 不再引入新的 canonical usage model。
 - `usage_summary`
 - `unlimited_quota`
 
-它的边界必须写死：
+`SettlementOptions` 则承载非 truth 的附属动作：
 
-- 它不是新表
-- 它不是新账本
-- 它不是长期存活的领域模型
-- 富日志、调试信息、埋点统计不进入它
+- `Deduplicate`
+- `Cleanup`
+- `Projection`
+
+这意味着当前系统已经把“扣费真相”和“日志/缓存/统计”在参数层拆开，而不是继续混写在调用方里。
 
 ### 3. `ApplySettlement` 是唯一 truth 入口
 
-所有最终扣费必须统一走：
+当前代码已经把最终扣费统一到：
 
-- `ApplySettlement(cmd, opts)`
+```go
+ApplySettlement(ctx, cmd, opts)
+```
 
-这个入口只负责三层事情。
+该入口的执行顺序固定为：
 
-#### 3.1 truth
+1. 归一化 `SettlementCommand`
+2. 如需要，先尝试拿 Redis gate
+3. 同步执行 truth 写入
+4. truth 成功后执行 cleanup
+5. truth 成功后执行 projection
 
-truth 只做一件事：
-
-- 同步落 user / token 最终 delta
-
-公式固定为：
+其中 truth 公式已经固定：
 
 `delta = final_quota - pre_consumed_quota`
 
-要求：
+这一步不会走 batch projection，而是直接调用 `model.ApplyTokenUserQuotaDeltaDirect(...)` 同步落库。
 
-- 必须同步执行
-- 必须直接写 DB
-- 不允许受 `BatchUpdateEnabled` 影响
+### 4. truth / cleanup / projection 已经分层
 
-这里坚持同步 direct write，不是因为要做精确账本，而是因为这是当前复杂度下最便宜、最稳的“止血点”：
+当前代码里三层边界已经明确。
 
-- 可以明显减少重复扣费和漏回补
-- 可以让 quota 控制和统计基线至少落在同一条边界上
-- 不需要为了一点点精度提升，再额外引入新表和新服务
+#### truth
 
-#### 3.2 cleanup
+truth 只负责 quota 真相：
 
-cleanup 只处理派生缓存，例如：
+- `users.quota`
+- `tokens.remain_quota`
+- `tokens.used_quota`
 
-- realtime quota cache reconcile
+特点：
+
+- 同步执行
+- 直接写 DB
+- 不依赖 `BatchUpdateEnabled`
+- 失败时直接让 settlement 失败
+
+#### cleanup
+
+cleanup 只处理派生缓存：
+
+- realtime quota cache 回收
 - user quota cache refresh
 
-要求：
+特点：
 
-- 只能在 truth 成功后执行
-- cleanup 失败只告警
-- cleanup 失败不回滚 truth
+- 只在 truth 成功后执行
+- 失败只记录日志
+- 不回滚 truth
 
-#### 3.3 projection
+#### projection
 
-projection 只处理统计和审计，例如：
+projection 只处理统计和审计：
 
 - `RecordConsumeLog`
 - `channels.used_quota`
 - `users.used_quota`
 - `users.request_count`
 
-要求：
+特点：
 
-- projection 不参与 settlement success 判定
-- projection 失败不回滚 truth
-- projection 的统计口径使用 `final_quota`，不是 `delta`
+- 只在 truth 成功后执行
+- 失败只记录日志
+- 不回滚 truth
+- 统计口径使用 `final_quota`，不是 `delta`
 
-最后一条非常重要。
+这一点非常关键：`delta` 用来修正 reserve，`final_quota` 才代表这次请求最终消费了多少。
 
-truth 的职责是纠正 reserve 和最终费用之间的差值；
-projection 的职责是记录本次请求最终花了多少。
+## 三类请求如何接入当前架构
 
-如果 projection 偶发失败，V1 接受有限偏差；
-但如果 projection 统计口径本身错了，例如拿 `delta` 记最终消费，那就会制造持续性系统偏差，这不接受。
+### Unary Request
 
-### 4. 保留当前 reserve 模型
+普通请求路径的现状是：
 
-V1 不重写 reserve 生命周期。
+1. `Quota.PreQuotaConsumption()` 执行预扣
+2. provider 返回 usage 后，`Quota.ConsumeUsage(...)`
+3. `Quota` 内部构造 `SettlementEnvelope`
+4. `ApplySettlement(...)` 同步完成最终结算
 
-仍然保留当前 attempt-scoped 语义：
+因此 unary 已经不再是“边算边扣”的散乱路径，而是先 reserve，再统一 settle。
 
-- `PreQuotaConsumption()`
-- `Undo()`
+### Realtime Turn
 
-原因不是它完美，而是它的替代成本太高：
+Codex realtime 当前采用 observer 方式接入：
 
-- retry 语义会一起被牵动
-- realtime / task finalize 也会一起被牵动
-- 迁移和回归测试成本远高于收益
+1. turn 进行中，`RealtimeTurnObserver.ObserveTurnUsage(...)` 只更新 realtime quota cache
+2. turn 结束时，`FinalizeTurn(...)` 冻结最终 usage 与 timing
+3. 生成 identity：`caller=<ns>|channel=<id>|session=<sid>|turn=<seq>|finalize`
+4. 调用 `Quota.ConsumeUsageWithIdentity(...)`
+5. 最终仍落到 `ApplySettlement(...)`
 
-所以 V1 只解决：
+当前 trade-off：
 
-- 最终怎么算一次
-- 最终怎么扣一次
+- turn 内实时配额控制依赖缓存，不是每个 usage event 都直接落 truth
+- 最终 truth 只在 finalize 时统一落一次
+- duplicate terminal event 依靠 identity + fingerprint 去重
 
-不解决：
+### Async Task
 
-- reserve 是否优雅
-- retry 期间 quota 是否抖动
-- reserve 是否应该 request-scoped
+async task 不是在 finalize 时重算 live config，而是在 submit 时冻结结算快照：
 
-这也是一个有意识的精度取舍：
+1. submit 前强制 `ForcePreConsume()`
+2. `BuildTaskSettlementSnapshotProperties(...)` 构造 `SettlementEnvelope`
+3. snapshot 持久化到 `tasks.properties`
+4. 任务完成或失败时，`FinalizeTaskSettlement(...)` 从 snapshot 恢复 command/options
+5. success 使用原始 `final_quota`
+6. failure 把 `final_quota` 改成 `0`，完成 reserve 回补
 
-- reserve 过程允许存在很小的暂态误差
-- 但最终 settlement 边界必须尽量稳定
-- 不为了消灭暂态误差，引入远超收益的复杂生命周期重构
+这意味着 async task 的价格、预扣和最终结算上下文，已经与 submit 时刻绑定，而不是依赖 finalize 时的 live pricing。
 
-### 5. Redis gate 只用于 detached finalize
+## Redis gate 的实际职责
 
-Redis gate 不是通用能力，只用于脱离原始请求生命周期、存在重复 finalize 风险的路径：
+当前 gate 不是通用账本能力，只在 detached finalize 场景做防重：
 
 - realtime turn finalize
 - async task finalize
 
-不用于：
+触发条件：
 
-- 普通 unary HTTP 成功路径
+1. `opts.Deduplicate = true`
+2. `identity` 非空
+3. Redis 已启用且 client 可用
 
-identity 建议：
+gate 行为：
 
-- realtime：`session_id + turn_seq + phase`
-- task：优先 `Task.ID + phase`
-- 如果拿不到本地行 ID，最少退化到 `user_id + platform + task_id + phase`
+- key 不存在：写入 fingerprint，允许本次 settlement 执行
+- key 已存在且 fingerprint 相同：视为重复 finalize，直接 no-op
+- key 已存在且 fingerprint 不同：视为 identity 冲突，拒绝复用
+- gate backend 出错：记录告警，fail-open，继续执行 settlement
 
-identity 还必须满足一个硬约束：
+当前 TTL 固定为 `24h`。
 
-- detached finalize 的 identity 不能为空串
-- `identity = ""` 只能视为实现未完成或异常保护失效，不能作为 steady-state 语义
-- 对 async task，如果第三方 `task_id` 可能为空，提交路径就必须先拿到本地稳定 identity，优先使用 `Task.ID`
+### 当前 trade-off
 
-这里必须明确：
+- 获得什么：大多数 detached finalize 的重复触发不会双扣、双退或重复 projection
+- 牺牲什么：Redis 抖动时系统会退化成弱防重，而不是中断主流程
+- 为什么当前最合适：结算 truth 不能因为外部 gate 故障被整体阻断；one-hub 当前更看重 availability + bounded duplication，而不是强一致外部协调
 
-- Redis gate 只是防重辅助
-- 它不是账务真相
-- 它不能演变成 Redis 版 billing ledger
-- 不允许因为不同业务路径的风控强度不同，就分裂出第二条 settlement truth 入口
+## Async snapshot 的当前数据模型
 
-对于 gate 不可用时怎么降级，必须先明确系统到底是要分路径选 policy，还是统一复用共享入口的现有行为。
+当前 async task 复用 `tasks.properties` 保存：
 
-当前 one-hub 为了不影响现有结算逻辑，统一沿用共享 `ApplySettlement` 的 `best_effort` 行为：
+- `SettlementEnvelope`
+- settlement status：`reserved / committed / rolled_back`
+- tracking：`provider_accepted`、`provider_task_id`
 
-- `best_effort`
-  - 记录告警后继续执行 truth
-  - 适用于业务上接受“弱防重但不中断”的 detached finalize 路径
-  - 这是当前 async task / realtime detached finalize 的统一选择
+不新增账务表，也不新增 task ledger。
 
-如果 Redis 不可用：
+### 当前 trade-off
 
-- unary HTTP 继续工作，因为它本来不依赖 Redis gate
-- detached finalize 继续执行 truth，但退化成弱防重
-- 文档里必须明确这是降级，不伪装成 exactly-once
+- 获得什么：submit 时的价格、预扣、token/user/channel/model 上下文被稳定冻结
+- 牺牲什么：snapshot 和 tracking 共用一份 JSON，仍然需要控制写源数量
+- 为什么当前最合适：当前 async task 只有 submit 和 sweeper/finalize 两类写源，没有必要引入第二套持久化模型
 
-这意味着：
+## 当前架构的关键不变量
 
-- Redis gate 的价值是抑制“大偏差”
-- 不是把系统推到“零偏差”
+1. 所有最终扣费都必须经过 `ApplySettlement(...)`
+2. truth 必须先于 cleanup / projection
+3. projection 统计口径必须使用 `final_quota`
+4. detached finalize 的 identity 不能为空串
+5. async task finalize 必须优先使用本地 `tasks.id` 构造 identity
+6. gate backend 故障时允许 fail-open，但不能生成第二套 truth 路径
+7. task snapshot 一旦从 `reserved` 进入终态，就不能再按另一份 finalize 结果覆盖 truth
 
-### 6. Task snapshot 只复用现有 JSON 字段
+## 兼容与回退路径
 
-async task 的问题不是“怎么算”，而是 finalize 发生时 live config 可能已经变了。
+当前代码仍保留少量兼容分支，但这些都不是主路径：
 
-所以 submit 成功后，需要把 finalize 所需的最小上下文写进现有 JSON 字段，而不是等任务完成时再根据实时配置重算。
+1. legacy task 没有 snapshot 时，失败回补仍可能走旧的 refund 兼容逻辑
+2. gate 不可用时，detached finalize 退化成弱防重
+3. projection 失败时，truth 不回滚
 
-建议最少保存：
+这些兼容分支存在的原因不是它们理想，而是为了保证当前系统在存量行为下可演进收敛。
 
-- `identity`
-- `fingerprint`
-- `reserve_quota`
-- `model_name`
-- `channel_id`
-- `token_id`
-- `user_id`
-- `final_quota` 或等价的价格快照
-- `settlement_status`
+## 当前架构不做什么
 
-这里也必须明确边界：
+1. 不新增 settlement ledger / history 表
+2. 不把 `logs` 当成 truth
+3. 不让 projection 成败决定 settlement 成败
+4. 不把 Redis gate 扩散到所有 unary 请求
+5. 不在 async finalize 时依赖 live pricing / live config 重算
+6. 不承诺 crash-safe exactly-once
 
-- snapshot 只是复用 `Task.Properties` / `Task.Data`
-- 它不是新的 task 子表
-- `settlement_status` 只是 JSON 里的轻量标记
-- 它不能升级成一套新的持久化状态机
+## 结论
 
-### 6.1 Async submit 的 durable acceptance 边界
+当前代码里的 billing / usage 已经不是“实现草案”，而是一套已落地的统一结算架构：
 
-V1 虽然不做 ledger，但 async submit 仍然必须定义清楚本地 durable acceptance 边界。
+- reserve 仍留在请求路径
+- settlement truth 收敛到 `ApplySettlement`
+- realtime 和 async finalize 通过 identity + Redis gate 做弱一致防重
+- projection 与 truth 明确解耦
 
-如果系统要对外承诺“accepted 后可稳定找回”，那必须满足下面这些约束：
-
-- provider 已 accepted 之后，在向客户端返回成功前，必须已经存在可持久读取的本地 `Task` 行、snapshot 与 settlement identity
-- 不能出现“远端任务继续执行、本地无记录、reserve 未回补、客户端只看到普通 5xx 可重试”的 silent orphan task
-- provider accepted 之后的首次本地持久化，不能只是“再尝试插一行”；如果这一步失败却没有 durable reconcile handle，这条路径就是不完整的
-
-在“不新增表”的前提下，优先选择的最小正确形态是：
-
-1. 先准备本地 `Task` 占位行，拿到稳定 `Task.ID`
-2. provider submit
-3. provider accepted 后，把最小 settlement snapshot 冻结到这条本地行
-4. 后续 finalize 全部基于这条已存在的本地行进行
-
-如果实现暂时做不到这条边界，就不能再假设系统具备“accepted 后仍可稳定找回”的能力。
-
-在 one-hub 当前这版极简方案里，处理方式是更保守地承认边界：
-
-- provider accepted 后的本地落库失败，仍可能表现为 5xx
-- 后续按现有 fetch / continue，也可能直接查不到任务
-- 这属于明确接受的尾损，不为它额外引入新的 reconcile contract、submit 第三态或公共查询句柄
-
-这不是理想语义，但它比“为了极小概率尾损再扩状态机和接口”更符合当前复杂度预算。
-
-### 6.2 存量任务兼容 / rollout guardrail
-
-没有 settlement snapshot 的旧 task 是迁移债务，不是 steady-state 正确路径。
-
-因此 rollout 必须遵守：
-
-- 旧 task 的 fallback finalize 只能作为兼容兜底，不能长期成为主路径
-- fallback rollback 必须保持 user truth 与 token truth 的对称性，不能只退 `users.quota`
-- `IncreaseUserQuota(...)` 但不恢复 `tokens.remain_quota / used_quota` 的 user-only refund 是禁止的，因为这会把 truth 永久打歪
-- 如果旧 task 上缺少精确回补所需信息，应进入显式 repair-needed / reconcile 路径，而不是静默接受部分回补
-
-## 三类请求的生命周期
-
-### Unary HTTP
-
-流程：
-
-1. `PreQuotaConsumption()`
-2. provider 执行与 retry
-3. 成功后归一 usage
-4. 构造 `SettlementCommand`
-5. `ApplySettlement`
-6. 失败则 `Undo()`
-
-这一条路径不需要 Redis gate。
-
-### Realtime
-
-流程：
-
-1. 累积 `UsageEvent`
-2. finalize 时归一到 `types.Usage`
-3. 构造 `SettlementCommand`
-4. 如有重复 finalize 风险，则先过 Redis gate
-5. `ApplySettlement`
-
-这条路径的重点是：增量观测和最终结算必须分开。
-
-### Async Task
-
-流程：
-
-1. 预扣额度，并准备稳定本地 task identity，优先先拿到本地 `Task.ID`
-2. provider submit
-3. provider accepted 后，立即把最小 settlement snapshot durable 到本地 `Task.Properties` / `Task.Data`
-4. completion / failure 时读取 snapshot
-5. 如存在重复 finalize 风险，则仍走同一个 `ApplySettlement` 入口，并沿用共享 `best_effort` gate policy
-6. success 用已保存的最终金额结算
-7. failure 用 `final_quota = 0` 结算，完成 reserve 回补
-
-这条路径的重点是：finalize 不能依赖 submit 之后可能漂移的 live config。
-
-## 复杂度控制规则
-
-为了把复杂度控制在收益拐点以内，后续演进必须遵守下面这些硬约束：
-
-1. 如果现有列和 JSON 字段还能表达，就不新增表
-2. 如果 `ApplySettlement` 还能兜住，就不新增第二条 truth 编排路径
-3. 如果问题只发生在 detached finalize，就不要把 Redis gate 扩散到所有请求
-4. 如果 projection 可以失败后补偿，就不要把 projection 拉进 truth 事务
-5. 如果 async task 已保存 snapshot，就不要在 finalize 时依赖 live pricing / live config 重算
-6. 如果一个方案只是把误差从“很小”继续压到“极小”，但会显著增加模型复杂度，就拒绝它
-
-## 为什么这是边际收益最大的点
-
-这版设计的收益主要来自四点：
-
-1. correctness 明显提升，因为最终扣费边界统一了
-2. schema 成本为零，因为不新增表
-3. 迁移成本可控，因为 reserve 模型不动
-4. realtime / async task 这两条最容易重复扣费的路径也被纳入同一套边界
-
-而它刻意放弃的东西，恰好是高复杂度低短期收益的部分：
-
-1. request-scoped single reserve
-2. full ledger
-3. crash-safe exactly-once
-4. billing service 拆分
-
-所以这是当前 one-hub 最合适的复杂度/收益平衡点。
-
-更直接地说：
-
-- 如果目标是做精确记账，这套方案一定不够
-- 但如果目标是“控制小偏差、保证统计可用、压住复杂度”，这套方案正好落在收益最优点
-
-## 参考实现位置
-
-当前代码里与本文对应的核心位置如下：
-
-- `internal/billing/settlement.go`
-- `relay/relay_util/quota.go`
-- `relay/task/base/settlement.go`
-- `model/token.go`
-
-## 测试要求
-
-至少要覆盖下面这些行为：
-
-1. truth path 不受 `BatchUpdateEnabled` 影响
-2. projection 使用 `final_quota`，不是 `delta`
-3. detached finalize 在 gate 正常可用时，相同 identity 下不会双扣；gate 不可用时退化成弱防重
-4. task finalize 使用 submit 时保存的 snapshot，而不是漂移后的 live config
-5. task failure 能把 reserve 正确回补
-6. 异常路径即使出现偏差，也不会形成明显系统性放大
-7. provider accepted 后的本地持久化失败，会被明确归类为两种之一：要么满足 durable acceptance 边界并可稳定找回，要么被文档和日志显式承认为 5xx / not found / 丢失尾损，而不是隐含成未说明语义
-8. async task / realtime detached finalize 的 identity 不会为空
-9. 兼容旧 task 的 fallback rollback 仍然保持 user/token truth 对称
+这套方案不是最强一致的，但在当前 one-hub 的复杂度预算里，它已经把最重要的边界固定住了：truth 只有一条路，重复 finalize 有收敛点，异步任务不再依赖漂移的 live config 结算。
