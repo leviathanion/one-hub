@@ -80,11 +80,22 @@ type DashboardCacheFilterOptions struct {
 	Channels []DashboardChannelOption `json:"channels"`
 }
 
+type DashboardTokenBreakdownDay struct {
+	Date string `json:"date"`
+	DashboardTokenBreakdown
+}
+
+type DashboardCacheHitRateDay struct {
+	Date string `json:"date"`
+	DashboardCacheHitRate
+}
+
 type DashboardCacheOverview struct {
-	DateRange           DashboardDateRange          `json:"dateRange"`
-	TodayTokenBreakdown DashboardTokenBreakdown     `json:"todayTokenBreakdown"`
-	TodayCacheHitRate   DashboardCacheHitRate       `json:"todayCacheHitRate"`
-	FilterOptions       DashboardCacheFilterOptions `json:"filterOptions"`
+	DateRange           DashboardDateRange           `json:"dateRange"`
+	AvailableDates      []string                     `json:"availableDates"`
+	TokenBreakdownByDay []DashboardTokenBreakdownDay `json:"tokenBreakdownByDay"`
+	CacheHitRateByDay   []DashboardCacheHitRateDay   `json:"cacheHitRateByDay"`
+	FilterOptions       DashboardCacheFilterOptions  `json:"filterOptions"`
 }
 
 const dashboardSnapshotLookbackDays = 6
@@ -213,13 +224,14 @@ func GetUserDashboardStatisticsByPeriod(userId int, dateRange DashboardDateRange
 	return dashboard, nil
 }
 
-// GetUserDashboardCacheOverview serves the cache overview module as a
-// today-only snapshot. The surrounding dashboard request still carries the
-// shared seven-day dateRange contract, but this module's metrics and filter
-// options must come from the same today slice so every exposed filter can
-// produce meaningful today cards.
+// GetUserDashboardCacheOverview serves the cache overview module as the
+// dashboard's full seven-day snapshot. The UI defaults to today but can switch
+// to any day in the snapshot without another round trip, so the backend returns
+// one row per day and keeps filter options scoped to the same seven-day window.
+// Trade-off: the filter dropdowns may include options that are empty on the
+// currently selected day, but they stay expressive for historical inspection.
 func GetUserDashboardCacheOverview(userId int, dateRange DashboardDateRange, filters DashboardCacheOverviewFilters) (*DashboardCacheOverview, error) {
-	series, err := getUserModelStatisticsByPeriodWithFilters(userId, dateRange.Today, dateRange.Today, filters)
+	series, err := getUserModelStatisticsByPeriodWithFilters(userId, dateRange.Start, dateRange.End, filters)
 	if err != nil {
 		return nil, err
 	}
@@ -229,11 +241,11 @@ func GetUserDashboardCacheOverview(userId int, dateRange DashboardDateRange, fil
 		return nil, err
 	}
 
-	dashboard := buildUserDashboard(series, dateRange.Today)
 	return &DashboardCacheOverview{
 		DateRange:           dateRange,
-		TodayTokenBreakdown: dashboard.TodayTokenBreakdown,
-		TodayCacheHitRate:   dashboard.TodayCacheHitRate,
+		AvailableDates:      buildDashboardDateList(dateRange),
+		TokenBreakdownByDay: buildDashboardTokenBreakdownByDay(series, dateRange),
+		CacheHitRateByDay:   buildDashboardCacheHitRateByDay(series, dateRange),
 		FilterOptions:       *filterOptions,
 	}, nil
 }
@@ -287,7 +299,7 @@ func GetUserDashboardCacheFilterOptions(userId int, dateRange DashboardDateRange
 	}
 
 	if err := DB.Model(&Statistics{}).
-		Where("user_id = ? AND date = ? AND model_name <> ''", userId, dateRange.Today).
+		Where("user_id = ? AND date BETWEEN ? AND ? AND model_name <> ''", userId, dateRange.Start, dateRange.End).
 		Distinct().
 		Order("model_name").
 		Pluck("model_name", &filterOptions.Models).Error; err != nil {
@@ -298,7 +310,7 @@ func GetUserDashboardCacheFilterOptions(userId int, dateRange DashboardDateRange
 	// internal channel metadata admin-only and expose only stable channel ids.
 	err := DB.Table("statistics").
 		Select("statistics.channel_id as id").
-		Where("statistics.user_id = ? AND statistics.date = ? AND statistics.channel_id <> 0", userId, dateRange.Today).
+		Where("statistics.user_id = ? AND statistics.date BETWEEN ? AND ? AND statistics.channel_id <> 0", userId, dateRange.Start, dateRange.End).
 		Group("statistics.channel_id").
 		Order("statistics.channel_id").
 		Scan(&filterOptions.Channels).Error
@@ -377,6 +389,93 @@ func buildUserDashboard(series []*LogStatisticGroupModel, today string) *UserDas
 	}
 
 	return dashboard
+}
+
+func buildDashboardDateList(dateRange DashboardDateRange) []string {
+	start, err := time.ParseInLocation("2006-01-02", dateRange.Start, time.Local)
+	if err != nil {
+		return []string{}
+	}
+	end, err := time.ParseInLocation("2006-01-02", dateRange.End, time.Local)
+	if err != nil || end.Before(start) {
+		return []string{}
+	}
+
+	dates := make([]string, 0, int(end.Sub(start).Hours()/24)+1)
+	for current := start; !current.After(end); current = current.AddDate(0, 0, 1) {
+		dates = append(dates, current.Format("2006-01-02"))
+	}
+	return dates
+}
+
+func buildDashboardTokenBreakdownByDay(series []*LogStatisticGroupModel, dateRange DashboardDateRange) []DashboardTokenBreakdownDay {
+	dates := buildDashboardDateList(dateRange)
+	byDate := make(map[string]*DashboardTokenBreakdownDay, len(dates))
+	rows := make([]DashboardTokenBreakdownDay, 0, len(dates))
+	for _, date := range dates {
+		row := DashboardTokenBreakdownDay{Date: date}
+		rows = append(rows, row)
+		byDate[date] = &rows[len(rows)-1]
+	}
+
+	for _, item := range series {
+		if item == nil {
+			continue
+		}
+		row, ok := byDate[item.Date]
+		if !ok {
+			continue
+		}
+
+		inputTokens := normalizeInputTokens(item.PromptTokens, item.CacheTokens, item.CacheReadTokens, item.CacheWriteTokens)
+		row.RequestCount += item.RequestCount
+		row.InputTokens += inputTokens
+		row.OutputTokens += item.CompletionTokens
+		row.CacheTokens += item.CacheTokens
+		row.CacheReadTokens += item.CacheReadTokens
+		row.CacheWriteTokens += item.CacheWriteTokens
+	}
+
+	for i := range rows {
+		rows[i].TotalTokens = rows[i].InputTokens + rows[i].OutputTokens + rows[i].CacheTokens + rows[i].CacheReadTokens + rows[i].CacheWriteTokens
+	}
+
+	return rows
+}
+
+func buildDashboardCacheHitRateByDay(series []*LogStatisticGroupModel, dateRange DashboardDateRange) []DashboardCacheHitRateDay {
+	dates := buildDashboardDateList(dateRange)
+	byDate := make(map[string]*DashboardCacheHitRateDay, len(dates))
+	rows := make([]DashboardCacheHitRateDay, 0, len(dates))
+	for _, date := range dates {
+		row := DashboardCacheHitRateDay{
+			Date: date,
+			DashboardCacheHitRate: DashboardCacheHitRate{
+				Models: make([]DashboardCacheHitRateModel, 0),
+			},
+		}
+		rows = append(rows, row)
+		byDate[date] = &rows[len(rows)-1]
+	}
+
+	for _, item := range series {
+		if item == nil {
+			continue
+		}
+		row, ok := byDate[item.Date]
+		if !ok {
+			continue
+		}
+
+		row.RequestCount += item.RequestCount
+		row.CacheHitCount += item.CacheHitCount
+	}
+
+	for i := range rows {
+		rows[i].HitRate = calculateCacheHitRate(rows[i].CacheHitCount, rows[i].RequestCount)
+	}
+
+	return rows
 }
 
 func normalizeInputTokens(promptTokens, cacheTokens, cacheReadTokens, cacheWriteTokens int64) int64 {

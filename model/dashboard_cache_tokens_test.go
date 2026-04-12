@@ -181,33 +181,34 @@ func TestGetUserDashboardCacheOverviewAppliesFiltersAndKeepsChannelNamesPrivate(
 		t.Fatalf("expected cache overview lookup to succeed, got %v", err)
 	}
 
-	if overview.TodayTokenBreakdown.RequestCount != 3 {
-		t.Fatalf("expected filtered request count to be 3, got %+v", overview.TodayTokenBreakdown)
+	if len(overview.AvailableDates) != 7 || overview.AvailableDates[0] != "2026-03-31" || overview.AvailableDates[6] != "2026-04-06" {
+		t.Fatalf("expected seven dashboard dates, got %+v", overview.AvailableDates)
 	}
-	if overview.TodayTokenBreakdown.InputTokens != 125 {
-		t.Fatalf("expected filtered input tokens to be 125, got %+v", overview.TodayTokenBreakdown)
+	if len(overview.TokenBreakdownByDay) != 7 {
+		t.Fatalf("expected seven token breakdown rows, got %+v", overview.TokenBreakdownByDay)
 	}
-	if overview.TodayTokenBreakdown.CacheTokens != 5 || overview.TodayTokenBreakdown.CacheReadTokens != 40 || overview.TodayTokenBreakdown.CacheWriteTokens != 10 {
-		t.Fatalf("expected filtered cache token totals to match model slice, got %+v", overview.TodayTokenBreakdown)
+	if overview.TokenBreakdownByDay[5].Date != "2026-04-05" || overview.TokenBreakdownByDay[5].RequestCount != 9 {
+		t.Fatalf("expected historical rows to stay available in the seven-day snapshot, got %+v", overview.TokenBreakdownByDay[5])
 	}
-	if math.Abs(overview.TodayCacheHitRate.HitRate-(2.0/3.0)) > 1e-9 {
-		t.Fatalf("expected filtered hit rate to be 2/3, got %+v", overview.TodayCacheHitRate)
+	todayBreakdown := overview.TokenBreakdownByDay[6]
+	if todayBreakdown.RequestCount != 3 {
+		t.Fatalf("expected filtered today request count to be 3, got %+v", todayBreakdown)
 	}
-	if len(overview.FilterOptions.Models) != 2 || overview.FilterOptions.Models[0] != "gpt-4.1" || overview.FilterOptions.Models[1] != "gpt-4o" {
+	if todayBreakdown.InputTokens != 125 {
+		t.Fatalf("expected filtered today input tokens to be 125, got %+v", todayBreakdown)
+	}
+	if todayBreakdown.CacheTokens != 5 || todayBreakdown.CacheReadTokens != 40 || todayBreakdown.CacheWriteTokens != 10 {
+		t.Fatalf("expected filtered today cache token totals to match model slice, got %+v", todayBreakdown)
+	}
+	todayHitRate := overview.CacheHitRateByDay[6]
+	if math.Abs(todayHitRate.HitRate-(2.0/3.0)) > 1e-9 {
+		t.Fatalf("expected filtered today hit rate to be 2/3, got %+v", todayHitRate)
+	}
+	if len(overview.FilterOptions.Models) != 3 || overview.FilterOptions.Models[0] != "gpt-4.1" || overview.FilterOptions.Models[1] != "gpt-4.1-mini" || overview.FilterOptions.Models[2] != "gpt-4o" {
 		t.Fatalf("expected filter models to stay unfiltered and sorted, got %+v", overview.FilterOptions.Models)
 	}
-	for _, modelName := range overview.FilterOptions.Models {
-		if modelName == "gpt-4.1-mini" {
-			t.Fatalf("expected historical-only models to be omitted from today filter options, got %+v", overview.FilterOptions.Models)
-		}
-	}
-	if len(overview.FilterOptions.Channels) != 2 || overview.FilterOptions.Channels[0].Id != 1 || overview.FilterOptions.Channels[1].Id != 2 {
+	if len(overview.FilterOptions.Channels) != 3 || overview.FilterOptions.Channels[0].Id != 1 || overview.FilterOptions.Channels[1].Id != 2 || overview.FilterOptions.Channels[2].Id != 3 {
 		t.Fatalf("expected filter channels to expose only stable ids, got %+v", overview.FilterOptions.Channels)
-	}
-	for _, channel := range overview.FilterOptions.Channels {
-		if channel.Id == 3 {
-			t.Fatalf("expected historical-only channels to be omitted from today filter options, got %+v", overview.FilterOptions.Channels)
-		}
 	}
 	if overview.FilterOptions.Channels[0].Name != "" || overview.FilterOptions.Channels[1].Name != "" {
 		t.Fatalf("expected filter channels not to leak internal names, got %+v", overview.FilterOptions.Channels)
@@ -223,11 +224,13 @@ func TestGetUserDashboardCacheOverviewAppliesFiltersAndKeepsChannelNamesPrivate(
 		t.Fatalf("expected channel-filtered cache overview lookup to succeed, got %v", err)
 	}
 
-	if channelOverview.TodayTokenBreakdown.RequestCount != 5 {
-		t.Fatalf("expected channel filter request count to be 5, got %+v", channelOverview.TodayTokenBreakdown)
+	channelTodayBreakdown := channelOverview.TokenBreakdownByDay[6]
+	if channelTodayBreakdown.RequestCount != 5 {
+		t.Fatalf("expected channel filter request count to be 5, got %+v", channelTodayBreakdown)
 	}
-	if math.Abs(channelOverview.TodayCacheHitRate.HitRate-0.2) > 1e-9 {
-		t.Fatalf("expected channel filter hit rate to be 0.2, got %+v", channelOverview.TodayCacheHitRate)
+	channelTodayHitRate := channelOverview.CacheHitRateByDay[6]
+	if math.Abs(channelTodayHitRate.HitRate-0.2) > 1e-9 {
+		t.Fatalf("expected channel filter hit rate to be 0.2, got %+v", channelTodayHitRate)
 	}
 
 	intersectionOverview, err := GetUserDashboardCacheOverview(1, dateRange, DashboardCacheOverviewFilters{
@@ -238,15 +241,17 @@ func TestGetUserDashboardCacheOverviewAppliesFiltersAndKeepsChannelNamesPrivate(
 		t.Fatalf("expected model+channel filtered cache overview lookup to succeed, got %v", err)
 	}
 
-	if intersectionOverview.TodayTokenBreakdown.RequestCount != 1 || intersectionOverview.TodayTokenBreakdown.TotalTokens != 75 {
-		t.Fatalf("expected intersection filter to isolate a single statistics row, got %+v", intersectionOverview.TodayTokenBreakdown)
+	intersectionTodayBreakdown := intersectionOverview.TokenBreakdownByDay[6]
+	if intersectionTodayBreakdown.RequestCount != 1 || intersectionTodayBreakdown.TotalTokens != 75 {
+		t.Fatalf("expected intersection filter to isolate a single statistics row, got %+v", intersectionTodayBreakdown)
 	}
-	if math.Abs(intersectionOverview.TodayCacheHitRate.HitRate-1.0) > 1e-9 {
-		t.Fatalf("expected intersection hit rate to be 1, got %+v", intersectionOverview.TodayCacheHitRate)
+	intersectionTodayHitRate := intersectionOverview.CacheHitRateByDay[6]
+	if math.Abs(intersectionTodayHitRate.HitRate-1.0) > 1e-9 {
+		t.Fatalf("expected intersection hit rate to be 1, got %+v", intersectionTodayHitRate)
 	}
 }
 
-func TestGetUserDashboardCacheOverviewReturnsEmptyTodayScopeWhenTodayHasNoData(t *testing.T) {
+func TestGetUserDashboardCacheOverviewReturnsEmptyDayRowsWhenSomeDaysHaveNoData(t *testing.T) {
 	useDashboardMigrationTestDB(t)
 
 	if err := DB.Exec(`
@@ -268,23 +273,25 @@ func TestGetUserDashboardCacheOverviewReturnsEmptyTodayScopeWhenTodayHasNoData(t
 		t.Fatalf("expected cache overview lookup to succeed, got %v", err)
 	}
 
-	if overview.TodayTokenBreakdown != (DashboardTokenBreakdown{}) {
-		t.Fatalf("expected today token breakdown to stay empty when today has no data, got %+v", overview.TodayTokenBreakdown)
+	if len(overview.TokenBreakdownByDay) != 7 || len(overview.CacheHitRateByDay) != 7 {
+		t.Fatalf("expected each day in the snapshot to be represented, got token=%+v cache=%+v", overview.TokenBreakdownByDay, overview.CacheHitRateByDay)
 	}
-	if overview.TodayCacheHitRate.RequestCount != 0 || overview.TodayCacheHitRate.CacheHitCount != 0 || overview.TodayCacheHitRate.HitRate != 0 {
-		t.Fatalf("expected today cache hit rate to stay empty when today has no data, got %+v", overview.TodayCacheHitRate)
+	if overview.TokenBreakdownByDay[5].RequestCount != 3 || overview.TokenBreakdownByDay[5].Date != "2026-04-05" {
+		t.Fatalf("expected populated historical day to be preserved, got %+v", overview.TokenBreakdownByDay[5])
 	}
-	if overview.TodayCacheHitRate.Models == nil {
-		t.Fatalf("expected model hit rate slice to be initialized, got nil")
+	emptyTodayBreakdown := overview.TokenBreakdownByDay[6]
+	if emptyTodayBreakdown.Date != "2026-04-06" || emptyTodayBreakdown.DashboardTokenBreakdown != (DashboardTokenBreakdown{}) {
+		t.Fatalf("expected today token breakdown to stay empty when today has no data, got %+v", emptyTodayBreakdown)
 	}
-	if len(overview.TodayCacheHitRate.Models) != 0 {
-		t.Fatalf("expected no model hit rate rows when today has no data, got %+v", overview.TodayCacheHitRate.Models)
+	emptyTodayHitRate := overview.CacheHitRateByDay[6]
+	if emptyTodayHitRate.Date != "2026-04-06" || emptyTodayHitRate.RequestCount != 0 || emptyTodayHitRate.CacheHitCount != 0 || emptyTodayHitRate.HitRate != 0 {
+		t.Fatalf("expected today cache hit rate to stay empty when today has no data, got %+v", emptyTodayHitRate)
 	}
-	if overview.FilterOptions.Models == nil || len(overview.FilterOptions.Models) != 0 {
-		t.Fatalf("expected today-scoped model options to be an empty slice, got %+v", overview.FilterOptions.Models)
+	if overview.FilterOptions.Models == nil || len(overview.FilterOptions.Models) != 1 || overview.FilterOptions.Models[0] != "gpt-4.1" {
+		t.Fatalf("expected seven-day model options to include historical data, got %+v", overview.FilterOptions.Models)
 	}
-	if overview.FilterOptions.Channels == nil || len(overview.FilterOptions.Channels) != 0 {
-		t.Fatalf("expected today-scoped channel options to be an empty slice, got %+v", overview.FilterOptions.Channels)
+	if overview.FilterOptions.Channels == nil || len(overview.FilterOptions.Channels) != 1 || overview.FilterOptions.Channels[0].Id != 2 {
+		t.Fatalf("expected seven-day channel options to include historical data, got %+v", overview.FilterOptions.Channels)
 	}
 }
 
@@ -358,11 +365,11 @@ func TestGetUserDashboardStatisticsByPeriodIncludesCacheOverviewFilterOptions(t 
 		t.Fatalf("expected dashboard lookup to succeed, got %v", err)
 	}
 
-	if len(dashboard.CacheOverviewFilterOptions.Models) != 2 || dashboard.CacheOverviewFilterOptions.Models[0] != "gpt-4.1" || dashboard.CacheOverviewFilterOptions.Models[1] != "gpt-4o" {
-		t.Fatalf("expected today-scoped model options in dashboard payload, got %+v", dashboard.CacheOverviewFilterOptions.Models)
+	if len(dashboard.CacheOverviewFilterOptions.Models) != 3 || dashboard.CacheOverviewFilterOptions.Models[0] != "gpt-4.1" || dashboard.CacheOverviewFilterOptions.Models[1] != "gpt-4o" || dashboard.CacheOverviewFilterOptions.Models[2] != "historical-only" {
+		t.Fatalf("expected seven-day model options in dashboard payload, got %+v", dashboard.CacheOverviewFilterOptions.Models)
 	}
-	if len(dashboard.CacheOverviewFilterOptions.Channels) != 2 || dashboard.CacheOverviewFilterOptions.Channels[0].Id != 1 || dashboard.CacheOverviewFilterOptions.Channels[1].Id != 2 {
-		t.Fatalf("expected today-scoped channel ids in dashboard payload, got %+v", dashboard.CacheOverviewFilterOptions.Channels)
+	if len(dashboard.CacheOverviewFilterOptions.Channels) != 3 || dashboard.CacheOverviewFilterOptions.Channels[0].Id != 1 || dashboard.CacheOverviewFilterOptions.Channels[1].Id != 2 || dashboard.CacheOverviewFilterOptions.Channels[2].Id != 3 {
+		t.Fatalf("expected seven-day channel ids in dashboard payload, got %+v", dashboard.CacheOverviewFilterOptions.Channels)
 	}
 	for _, channel := range dashboard.CacheOverviewFilterOptions.Channels {
 		if channel.Name != "" {
