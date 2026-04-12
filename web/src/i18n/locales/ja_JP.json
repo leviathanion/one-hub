@@ -343,6 +343,7 @@
     "amount": "金額",
     "tokens": "Tokens(入力/出力)",
     "tokens_breakdown": "Tokens(入力/出力/キャッシュ/キャッシュ読込/キャッシュ書込)",
+    "token_breakdown": "Token 内訳",
     "cache_tokens": "キャッシュ Tokens",
     "today_token_breakdown": "今日の Token 内訳",
     "today_cache_hit_rate": "今日のキャッシュヒット率",

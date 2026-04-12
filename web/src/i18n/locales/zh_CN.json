@@ -101,6 +101,7 @@
     "amount": "金额",
     "tokens": "Tokens(输入/输出)",
     "tokens_breakdown": "Tokens(输入/输出/缓存/缓存读/缓存写)",
+    "token_breakdown": "Token 明细",
     "cache_tokens": "缓存 Token",
     "today_token_breakdown": "今日 Token 明细",
     "today_cache_hit_rate": "今日缓存命中率",

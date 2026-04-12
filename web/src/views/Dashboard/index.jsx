@@ -64,6 +64,7 @@ const Dashboard = () => {
   const [cacheFilterOptions, setCacheFilterOptions] = useState(emptyCacheFilterOptions);
   const [cacheOverviewLoading, setCacheOverviewLoading] = useState(false);
   const [cacheFilters, setCacheFilters] = useState(initialCacheFilters);
+  const [selectedCacheDate, setSelectedCacheDate] = useState('');
   const cacheOverviewRequestIdRef = useRef(0);
   const cacheOverviewResolvedQueryRef = useRef(null);
   const [cacheOverviewResolvedQuery, setCacheOverviewResolvedQuery] = useState(null);
@@ -143,7 +144,7 @@ const Dashboard = () => {
         }
 
         if (success && nextCacheOverview) {
-          setCacheOverviewData(nextCacheOverview);
+          setCacheOverviewData(normalizeCacheOverviewData(nextCacheOverview, dateRange));
           setCacheOverviewResolvedQuery(requestedQuery);
           cacheOverviewResolvedQueryRef.current = requestedQuery;
           return;
@@ -208,6 +209,10 @@ const Dashboard = () => {
   const isCacheOverviewFresh = isSameCacheOverviewQuery(selectedCacheOverviewQuery, cacheOverviewResolvedQuery);
   const isCacheOverviewLoading = (isLoading && !cacheOverviewData) || Boolean(selectedCacheOverviewQuery && !isCacheOverviewFresh);
   const areCacheFiltersDisabled = isLoading || !dashboardDateRange || (cacheOverviewLoading && !cacheOverviewData);
+  const cacheOverviewAvailableDates = getCacheOverviewAvailableDates(cacheOverviewData, dashboardDateRange);
+  const resolvedSelectedCacheDate = resolveSelectedCacheDate(selectedCacheDate, cacheOverviewAvailableDates, dashboardDateRange?.today);
+  const selectedTokenBreakdown = getCacheOverviewTokenBreakdown(cacheOverviewData, resolvedSelectedCacheDate);
+  const selectedCacheHitRate = getCacheOverviewCacheHitRate(cacheOverviewData, resolvedSelectedCacheDate);
 
   // Dashboard content
   const dashboardContent = (
@@ -257,6 +262,25 @@ const Dashboard = () => {
 
       <Grid item xs={12}>
         <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2} justifyContent="flex-end" mb={2}>
+          <FormControl size="small" sx={{ minWidth: { xs: '100%', sm: 180 } }}>
+            <InputLabel id="dashboard-date-filter-label">{t('dashboard_index.date')}</InputLabel>
+            <Select
+              labelId="dashboard-date-filter-label"
+              label={t('dashboard_index.date')}
+              value={resolvedSelectedCacheDate}
+              disabled={areCacheFiltersDisabled || cacheOverviewAvailableDates.length === 0}
+              onChange={(event) => {
+                setSelectedCacheDate(event.target.value);
+              }}
+            >
+              {cacheOverviewAvailableDates.map((date) => (
+                <MenuItem key={date} value={date}>
+                  {date}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+
           <FormControl size="small" sx={{ minWidth: { xs: '100%', sm: 180 } }}>
             <InputLabel id="dashboard-model-filter-label">{t('dashboard_index.model')}</InputLabel>
             <Select
@@ -309,10 +333,10 @@ const Dashboard = () => {
 
         <Grid container spacing={gridSpacing}>
           <Grid item lg={6} xs={12}>
-            <TodayTokenBreakdownCard isLoading={isCacheOverviewLoading} data={cacheOverviewData?.todayTokenBreakdown} />
+            <TodayTokenBreakdownCard isLoading={isCacheOverviewLoading} data={selectedTokenBreakdown} />
           </Grid>
           <Grid item lg={6} xs={12}>
-            <CacheHitRateCard isLoading={isCacheOverviewLoading} data={cacheOverviewData?.todayCacheHitRate} />
+            <CacheHitRateCard isLoading={isCacheOverviewLoading} data={selectedCacheHitRate} />
           </Grid>
         </Grid>
       </Grid>
@@ -437,11 +461,7 @@ function buildCacheOverviewFallbackData(dashboardData) {
     return null;
   }
 
-  return {
-    dateRange: normalizeDashboardDateRange(dashboardData?.dateRange),
-    todayTokenBreakdown: dashboardData.todayTokenBreakdown,
-    todayCacheHitRate: dashboardData.todayCacheHitRate
-  };
+  return buildCacheOverviewDataFromSeries(dashboardData?.series, normalizeDashboardDateRange(dashboardData?.dateRange));
 }
 
 function normalizeDashboardDateRange(dateRange) {
@@ -517,6 +537,149 @@ function renderChannelOption(channel) {
     return `${channel?.id || ''}`;
   }
   return `${channel.id} (${channel.name})`;
+}
+
+function buildCacheOverviewDataFromSeries(series, dateRange) {
+  const availableDates = getLastSevenDays(dateRange?.today);
+  const tokenRows = availableDates.map((date) => ({
+    date,
+    requestCount: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    totalTokens: 0
+  }));
+  const cacheRows = availableDates.map((date) => ({
+    date,
+    requestCount: 0,
+    cacheHitCount: 0,
+    hitRate: 0
+  }));
+  const tokenRowsByDate = new Map(tokenRows.map((row) => [row.date, row]));
+  const cacheRowsByDate = new Map(cacheRows.map((row) => [row.date, row]));
+
+  if (Array.isArray(series)) {
+    series.forEach((item) => {
+      const tokenRow = tokenRowsByDate.get(item?.Date);
+      const cacheRow = cacheRowsByDate.get(item?.Date);
+      if (!tokenRow || !cacheRow) {
+        return;
+      }
+
+      const cacheTokens = Number(item?.CacheTokens || 0);
+      const cacheReadTokens = Number(item?.CacheReadTokens || 0);
+      const cacheWriteTokens = Number(item?.CacheWriteTokens || 0);
+      const promptTokens = Number(item?.PromptTokens || 0);
+      const completionTokens = Number(item?.CompletionTokens || 0);
+      const inputTokens = Math.max(0, promptTokens - cacheTokens - cacheReadTokens - cacheWriteTokens);
+
+      tokenRow.requestCount += Number(item?.RequestCount || 0);
+      tokenRow.inputTokens += inputTokens;
+      tokenRow.outputTokens += completionTokens;
+      tokenRow.cacheTokens += cacheTokens;
+      tokenRow.cacheReadTokens += cacheReadTokens;
+      tokenRow.cacheWriteTokens += cacheWriteTokens;
+
+      cacheRow.requestCount += Number(item?.RequestCount || 0);
+      cacheRow.cacheHitCount += Number(item?.CacheHitCount || 0);
+    });
+  }
+
+  tokenRows.forEach((row) => {
+    row.totalTokens = row.inputTokens + row.outputTokens + row.cacheTokens + row.cacheReadTokens + row.cacheWriteTokens;
+  });
+  cacheRows.forEach((row) => {
+    row.hitRate = row.requestCount > 0 ? row.cacheHitCount / row.requestCount : 0;
+  });
+
+  return {
+    dateRange,
+    availableDates,
+    tokenBreakdownByDay: tokenRows,
+    cacheHitRateByDay: cacheRows
+  };
+}
+
+function normalizeCacheOverviewData(cacheOverviewData, dateRange) {
+  if (!cacheOverviewData) {
+    return null;
+  }
+
+  const normalizedDateRange = normalizeDashboardDateRange(cacheOverviewData?.dateRange) || dateRange;
+  const fallbackData = buildCacheOverviewDataFromSeries([], normalizedDateRange);
+  const availableDates =
+    Array.isArray(cacheOverviewData?.availableDates) && cacheOverviewData.availableDates.length > 0
+      ? cacheOverviewData.availableDates
+      : fallbackData.availableDates;
+  const tokenBreakdownByDay = mergeCacheOverviewRows(cacheOverviewData?.tokenBreakdownByDay, availableDates, createEmptyTokenBreakdownRow);
+  const cacheHitRateByDay = mergeCacheOverviewRows(cacheOverviewData?.cacheHitRateByDay, availableDates, createEmptyCacheHitRateRow);
+
+  return {
+    dateRange: normalizedDateRange,
+    availableDates,
+    tokenBreakdownByDay,
+    cacheHitRateByDay
+  };
+}
+
+function mergeCacheOverviewRows(rows, availableDates, createEmptyRow) {
+  const normalizedRows = Array.isArray(rows) ? rows : [];
+  const rowsByDate = new Map(normalizedRows.filter((row) => row?.date).map((row) => [row.date, row]));
+  return availableDates.map((date) => ({
+    ...createEmptyRow(date),
+    ...(rowsByDate.get(date) || {})
+  }));
+}
+
+function createEmptyTokenBreakdownRow(date) {
+  return {
+    date,
+    requestCount: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    totalTokens: 0
+  };
+}
+
+function createEmptyCacheHitRateRow(date) {
+  return {
+    date,
+    requestCount: 0,
+    cacheHitCount: 0,
+    hitRate: 0
+  };
+}
+
+function getCacheOverviewAvailableDates(cacheOverviewData, dateRange) {
+  if (Array.isArray(cacheOverviewData?.availableDates) && cacheOverviewData.availableDates.length > 0) {
+    return cacheOverviewData.availableDates;
+  }
+  return getLastSevenDays(dateRange?.today);
+}
+
+function resolveSelectedCacheDate(selectedDate, availableDates, fallbackDate) {
+  if (selectedDate && availableDates.includes(selectedDate)) {
+    return selectedDate;
+  }
+  if (fallbackDate && availableDates.includes(fallbackDate)) {
+    return fallbackDate;
+  }
+  return availableDates[availableDates.length - 1] || '';
+}
+
+function getCacheOverviewTokenBreakdown(cacheOverviewData, selectedDate) {
+  const row = cacheOverviewData?.tokenBreakdownByDay?.find((item) => item?.date === selectedDate);
+  return row || createEmptyTokenBreakdownRow(selectedDate);
+}
+
+function getCacheOverviewCacheHitRate(cacheOverviewData, selectedDate) {
+  const row = cacheOverviewData?.cacheHitRateByDay?.find((item) => item?.date === selectedDate);
+  return row || createEmptyCacheHitRateRow(selectedDate);
 }
 
 function getLineDataGroup(statisticalData, dateRange) {

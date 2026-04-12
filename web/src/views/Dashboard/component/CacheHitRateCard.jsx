@@ -11,11 +11,11 @@ function formatPercent(value) {
   return `${(Number(value || 0) * 100).toFixed(2)}%`;
 }
 
-const CacheHitRateCard = ({ isLoading, data }) => {
+const CacheHitRateCard = ({ isLoading, data, title }) => {
   const { t } = useTranslation();
 
   return (
-    <SubCard title={t('dashboard_index.today_cache_hit_rate')} sx={{ height: '100%' }}>
+    <SubCard title={title || t('dashboard_index.cache_hit_rate')} sx={{ height: '100%' }}>
       <Stack spacing={2.5}>
         <Box>
           {isLoading ? (
@@ -61,6 +61,7 @@ const CacheHitRateCard = ({ isLoading, data }) => {
 
 CacheHitRateCard.propTypes = {
   isLoading: PropTypes.bool,
+  title: PropTypes.string,
   data: PropTypes.shape({
     requestCount: PropTypes.number,
     cacheHitCount: PropTypes.number,

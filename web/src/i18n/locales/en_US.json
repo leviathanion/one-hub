@@ -366,6 +366,7 @@
     "amount": "Amount",
     "tokens": "Tokens(input/output)",
     "tokens_breakdown": "Tokens(input/output/cache/cache read/cache write)",
+    "token_breakdown": "Token Breakdown",
     "cache_tokens": "Cache Tokens",
     "today_token_breakdown": "Today's Token Breakdown",
     "today_cache_hit_rate": "Today's Cache Hit Rate",

@@ -15,11 +15,11 @@ function formatInteger(value) {
   return Number(value || 0).toLocaleString();
 }
 
-const TodayTokenBreakdownCard = ({ isLoading, data }) => {
+const TodayTokenBreakdownCard = ({ isLoading, data, title }) => {
   const { t } = useTranslation();
 
   return (
-    <SubCard title={t('dashboard_index.today_token_breakdown')} sx={{ height: '100%' }}>
+    <SubCard title={title || t('dashboard_index.token_breakdown')} sx={{ height: '100%' }}>
       <Stack spacing={2.5}>
         <Stack direction="row" alignItems="flex-start" justifyContent="space-between" spacing={2}>
           <Box>
@@ -69,6 +69,7 @@ const TodayTokenBreakdownCard = ({ isLoading, data }) => {
 
 TodayTokenBreakdownCard.propTypes = {
   isLoading: PropTypes.bool,
+  title: PropTypes.string,
   data: PropTypes.shape({
     requestCount: PropTypes.number,
     inputTokens: PropTypes.number,

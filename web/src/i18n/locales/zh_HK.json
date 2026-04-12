@@ -347,6 +347,7 @@
     "amount": "金額",
     "tokens": "Tokens(輸入/輸出)",
     "tokens_breakdown": "Tokens(輸入/輸出/快取/快取讀取/快取寫入)",
+    "token_breakdown": "Token 明細",
     "cache_tokens": "快取 Token",
     "today_token_breakdown": "今日 Token 明細",
     "today_cache_hit_rate": "今日快取命中率",
