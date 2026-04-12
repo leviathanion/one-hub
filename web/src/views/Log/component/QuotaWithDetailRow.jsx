@@ -3,15 +3,19 @@ import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import { renderQuota } from 'utils/common';
 import PropTypes from 'prop-types';
 
+function getGroupRatio(metadata) {
+  return metadata?.group_ratio ?? 1;
+}
+
 // Helper function to calculate the original quota based on actual price and group ratio
 export function calculateOriginalQuota(item) {
   // If we don't have the necessary data, return the metadata value or 0
-  if (!item?.quota || !item?.metadata?.group_ratio) {
+  if (!item?.quota || item?.metadata?.group_ratio === undefined || item?.metadata?.group_ratio === null) {
     return item.metadata?.original_quota || item.metadata?.origin_quota || 0;
   }
 
   const quota = item.quota || 0;
-  const groupRatio = item.metadata?.group_ratio || 1;
+  const groupRatio = getGroupRatio(item.metadata);
 
   // Simple formula: original price = actual price / group ratio
   // Avoid division by zero
@@ -28,7 +32,7 @@ export function calculateOriginalQuota(item) {
 
 // QuotaWithDetailRow is only responsible for the price in the main row and the small triangle
 export default function QuotaWithDetailRow({ item, open, setOpen }) {
-  const groupRatio = item?.metadata?.group_ratio || 1;
+  const groupRatio = getGroupRatio(item?.metadata);
   // Calculate the original quota based on the formula
   const originalQuota = calculateOriginalQuota(item);
   // Ensure quota has a fallback value

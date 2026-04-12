@@ -172,7 +172,9 @@ export default function LogTableRow({ item, userIsAdmin, userGroup, columnVisibi
           </TableCell>
         )}
         {columnVisibility.source_ip && <TableCell sx={{ p: '10px 8px' }}>{item.source_ip || ''}</TableCell>}
-        {columnVisibility.user_agent && <TableCell sx={{ p: '10px 8px' }}>{viewUserAgent(item.metadata?.user_agent, t('logPage.userAgent'))}</TableCell>}
+        {columnVisibility.user_agent && (
+          <TableCell sx={{ p: '10px 8px' }}>{viewUserAgent(item.metadata?.user_agent, t('logPage.userAgent'))}</TableCell>
+        )}
         {columnVisibility.detail && (
           <TableCell sx={{ p: '10px 8px' }}>{viewLogContent(item, t, totalInputTokens, totalOutputTokens)}</TableCell>
         )}
@@ -426,7 +428,7 @@ function viewLogContent(item, t) {
   }
 
   // Ensure we have valid values with appropriate defaults
-  const groupDiscount = item?.metadata?.group_ratio || 1;
+  const groupDiscount = item?.metadata?.group_ratio ?? 1;
   const priceType = item?.metadata?.price_type || '';
   const originalCompletionRatio = item?.metadata?.output_ratio || 0;
   const originalInputRatio = item?.metadata?.input_ratio || 0;

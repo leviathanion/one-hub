@@ -32,9 +32,12 @@ export function calculatePrice(ratio, groupDiscount, isTimes) {
   return priceString;
 }
 
+function getGroupRatio(metadata) {
+  return metadata?.group_ratio ?? 1;
+}
+
 // QuotaWithDetailContent is responsible for rendering the detailed content
 export default function QuotaWithDetailContent({ item, userGroup, totalInputTokens, totalOutputTokens }) {
-  console.log(item);
   const { t } = useTranslation();
   // Calculate the original quota based on the formula
   const originalQuota = calculateOriginalQuota(item);
@@ -52,7 +55,7 @@ export default function QuotaWithDetailContent({ item, userGroup, totalInputToke
     (item.metadata?.output_ratio ? `$${calculatePrice(item.metadata.output_ratio, 1, false)} /M` : '$0 /M');
 
   // Calculate actual prices based on ratios and group discount
-  const groupRatio = item.metadata?.group_ratio || 1;
+  const groupRatio = getGroupRatio(item.metadata);
   const inputPrice =
     item.metadata?.input_price || (item.metadata?.input_ratio ? `$${calculatePrice(item.metadata.input_ratio, groupRatio, false)} ` : '$0');
   const outputPrice =
