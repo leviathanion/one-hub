@@ -282,7 +282,9 @@ const Dashboard = () => {
           </FormControl>
 
           <FormControl size="small" sx={{ minWidth: { xs: '100%', sm: 180 } }}>
-            <InputLabel id="dashboard-model-filter-label">{t('dashboard_index.model')}</InputLabel>
+            <InputLabel id="dashboard-model-filter-label" shrink>
+              {t('dashboard_index.model')}
+            </InputLabel>
             <Select
               labelId="dashboard-model-filter-label"
               label={t('dashboard_index.model')}
@@ -306,7 +308,9 @@ const Dashboard = () => {
           </FormControl>
 
           <FormControl size="small" sx={{ minWidth: { xs: '100%', sm: 220 } }}>
-            <InputLabel id="dashboard-channel-filter-label">{t('dashboard_index.channel')}</InputLabel>
+            <InputLabel id="dashboard-channel-filter-label" shrink>
+              {t('dashboard_index.channel')}
+            </InputLabel>
             <Select
               labelId="dashboard-channel-filter-label"
               label={t('dashboard_index.channel')}
