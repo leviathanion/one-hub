@@ -90,6 +90,12 @@ var allowedChannelOrderFields = map[string]bool{
 
 var loadChannelByIDForChannelGroupRefresh = GetChannelById
 
+const (
+	codexTokenCacheKeyPrefix        = "api_token:codex"
+	codexUsagePreviewCacheKeyPrefix = "codex:usage:preview"
+	codexUsageDetailCacheKeyPrefix  = "codex:usage:detail"
+)
+
 type SearchChannelsParams struct {
 	Channel
 	PaginationParams
@@ -174,6 +180,15 @@ func GetChannelsByTypeAndStatus(channelType int, status int) ([]*Channel, error)
 	return channels, err
 }
 
+func GetChannelsByIDs(ids []int) ([]*Channel, error) {
+	var channels []*Channel
+	if len(ids) == 0 {
+		return channels, nil
+	}
+	err := DB.Where("id IN ?", ids).Find(&channels).Error
+	return channels, err
+}
+
 func GetChannelById(id int) (*Channel, error) {
 	channel := Channel{Id: id}
 	err := DB.First(&channel, "id = ?", id).Error
@@ -192,9 +207,51 @@ func DeleteChannelTag(channelId int) error {
 	return err
 }
 
+func codexChannelIDsFromRows(channels []Channel) []int {
+	channelIDs := make([]int, 0, len(channels))
+	for _, channel := range channels {
+		if channel.Type == config.ChannelTypeCodex && channel.Id > 0 {
+			channelIDs = append(channelIDs, channel.Id)
+		}
+	}
+	return channelIDs
+}
+
+func deleteChannelsMatching(scope func(*gorm.DB) *gorm.DB) (int64, error) {
+	tx := DB.Begin()
+	if tx.Error != nil {
+		return 0, tx.Error
+	}
+
+	var channels []Channel
+	if err := scope(tx.Model(&Channel{})).Select("id", "type").Find(&channels).Error; err != nil {
+		tx.Rollback()
+		return 0, err
+	}
+
+	result := scope(tx).Delete(&Channel{})
+	if result.Error != nil {
+		tx.Rollback()
+		return 0, result.Error
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		return 0, err
+	}
+
+	// Delete-path invalidation is not a trade-off; it is a lifecycle invariant.
+	// These derived caches are keyed by channel id, so leaving them behind risks a
+	// later channel with the same id inheriting another account's cached Codex data.
+	ClearChannelCodexDerivedCaches(codexChannelIDsFromRows(channels))
+	ChannelGroup.Load()
+
+	return result.RowsAffected, nil
+}
+
 func BatchDeleteChannel(ids []int) (int64, error) {
-	result := DB.Where("id IN ?", ids).Delete(&Channel{})
-	return result.RowsAffected, result.Error
+	return deleteChannelsMatching(func(db *gorm.DB) *gorm.DB {
+		return db.Where("id IN ?", ids)
+	})
 }
 
 func BatchInsertChannels(channels []Channel) error {
@@ -222,6 +279,7 @@ func BatchUpdateChannelsAzureApi(params *BatchChannelsParams) (int64, error) {
 	if err := DB.Select("id, type").Find(&channels, "id IN ?", params.Ids).Error; err != nil {
 		return 0, err
 	}
+	codexChannelIDs := make([]int, 0, len(channels))
 	for i := range channels {
 		channel := Channel{
 			Type:  channels[i].Type,
@@ -229,6 +287,9 @@ func BatchUpdateChannelsAzureApi(params *BatchChannelsParams) (int64, error) {
 		}
 		if err := channel.ValidateRuntimeConfigJSON(); err != nil {
 			return 0, err
+		}
+		if channels[i].Type == config.ChannelTypeCodex {
+			codexChannelIDs = append(codexChannelIDs, channels[i].Id)
 		}
 	}
 
@@ -238,6 +299,7 @@ func BatchUpdateChannelsAzureApi(params *BatchChannelsParams) (int64, error) {
 	}
 
 	if db.RowsAffected > 0 {
+		ClearChannelCodexDerivedCaches(codexChannelIDs)
 		ChannelGroup.Load()
 	}
 	return db.RowsAffected, nil
@@ -472,6 +534,7 @@ func (channel *Channel) UpdateRaw(overwrite bool) error {
 	if err != nil {
 		return err
 	}
+	ClearChannelCodexDerivedCache(channel.Id)
 	DB.Model(channel).First(channel, "id = ?", channel.Id)
 	return err
 }
@@ -511,10 +574,9 @@ func (channel *Channel) UpdateBalance(balance float64) {
 }
 
 func (channel *Channel) Delete() error {
-	err := DB.Delete(channel).Error
-	if err == nil {
-		ChannelGroup.Load()
-	}
+	_, err := deleteChannelsMatching(func(db *gorm.DB) *gorm.DB {
+		return db.Where("id = ?", channel.Id)
+	})
 	return err
 }
 
@@ -560,16 +622,62 @@ func updateChannelUsedQuota(id int, quota int) {
 	}
 }
 
-func ClearChannelTokenCache(channelId int) {
-	cacheKeys := []string{
-		fmt.Sprintf("api_token:codex:%d", channelId),
-	}
-
+func clearChannelCacheKeys(cacheKeys []string) {
 	for _, key := range cacheKeys {
 		if err := cache.DeleteCache(key); err != nil {
-			logger.SysError(fmt.Sprintf("failed to clear token cache %s: %v", key, err))
+			logger.SysError(fmt.Sprintf("failed to clear cache %s: %v", key, err))
 		}
 	}
+}
+
+func ClearChannelTokenCache(channelId int) {
+	cacheKeys := []string{
+		fmt.Sprintf("%s:%d", codexTokenCacheKeyPrefix, channelId),
+	}
+
+	clearChannelCacheKeys(cacheKeys)
+}
+
+func ClearChannelCodexUsageCache(channelId int) {
+	cacheKeys := []string{
+		fmt.Sprintf("%s:%d", codexUsagePreviewCacheKeyPrefix, channelId),
+		fmt.Sprintf("%s:%d", codexUsageDetailCacheKeyPrefix, channelId),
+	}
+
+	clearChannelCacheKeys(cacheKeys)
+}
+
+func ClearChannelCodexDerivedCaches(channelIds []int) {
+	if len(channelIds) == 0 {
+		return
+	}
+
+	cacheKeys := make([]string, 0, len(channelIds)*3)
+	seen := make(map[int]struct{}, len(channelIds))
+	for _, channelId := range channelIds {
+		if channelId <= 0 {
+			continue
+		}
+		if _, ok := seen[channelId]; ok {
+			continue
+		}
+		seen[channelId] = struct{}{}
+		// We intentionally over-invalidate Codex derived caches here. Usage data depends
+		// on runtime credentials plus request-shaping fields such as baseURL, proxy,
+		// model headers, and other provider options. A 1-minute cache miss is cheaper
+		// than trying to diff those fields precisely and serving stale admin usage data.
+		cacheKeys = append(cacheKeys,
+			fmt.Sprintf("%s:%d", codexTokenCacheKeyPrefix, channelId),
+			fmt.Sprintf("%s:%d", codexUsagePreviewCacheKeyPrefix, channelId),
+			fmt.Sprintf("%s:%d", codexUsageDetailCacheKeyPrefix, channelId),
+		)
+	}
+
+	clearChannelCacheKeys(cacheKeys)
+}
+
+func ClearChannelCodexDerivedCache(channelId int) {
+	ClearChannelCodexDerivedCaches([]int{channelId})
 }
 
 func UpdateChannelKey(id int, key string) error {
@@ -579,7 +687,7 @@ func UpdateChannelKey(id int, key string) error {
 		return err
 	}
 
-	ClearChannelTokenCache(id)
+	ClearChannelCodexDerivedCache(id)
 	if err := ChannelGroup.RefreshChannel(id); err != nil {
 		logger.SysError("failed to refresh channel state after key update: " + err.Error())
 	}
@@ -588,8 +696,9 @@ func UpdateChannelKey(id int, key string) error {
 }
 
 func DeleteDisabledChannel() (int64, error) {
-	result := DB.Where("status = ? or status = ?", config.ChannelStatusAutoDisabled, config.ChannelStatusManuallyDisabled).Delete(&Channel{})
-	return result.RowsAffected, result.Error
+	return deleteChannelsMatching(func(db *gorm.DB) *gorm.DB {
+		return db.Where("status = ? or status = ?", config.ChannelStatusAutoDisabled, config.ChannelStatusManuallyDisabled)
+	})
 }
 
 type ChannelStatistics struct {

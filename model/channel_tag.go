@@ -8,6 +8,8 @@ import (
 	"one-api/common/config"
 	"strings"
 	"time"
+
+	"gorm.io/gorm"
 )
 
 type SearchChannelsTagParams struct {
@@ -74,6 +76,10 @@ func UpdateChannelsTag(tag string, channel *Channel) error {
 	channelTag, err := GetChannelsTag(tag)
 	if err != nil {
 		return err
+	}
+	existingMemberIDs := make([]int, 0, len(channelTag.KeyMap))
+	for _, id := range channelTag.KeyMap {
+		existingMemberIDs = append(existingMemberIDs, id)
 	}
 	channel.Type = channelTag.Type
 	if err := channel.ValidateRuntimeConfigJSONWithType(channelTag.Type); err != nil {
@@ -170,7 +176,13 @@ func UpdateChannelsTag(tag string, channel *Channel) error {
 		return err
 	}
 
-	tx.Commit()
+	if err = tx.Commit().Error; err != nil {
+		return err
+	}
+
+	if channel.Type == config.ChannelTypeCodex {
+		ClearChannelCodexDerivedCaches(existingMemberIDs)
+	}
 
 	ChannelGroup.Load()
 
@@ -182,21 +194,12 @@ func DeleteChannelsTag(tag string, delDisabled bool) error {
 		return nil
 	}
 
-	tx := DB.Begin()
-
-	if delDisabled {
-		tx = tx.Where("(status = ? or status = ?)", config.ChannelStatusAutoDisabled, config.ChannelStatusManuallyDisabled)
-	}
-
-	err := tx.Where("tag = ?", tag).Delete(&Channel{}).Error
-	if err != nil {
-		tx.Rollback()
-		return err
-	}
-
-	tx.Commit()
-	ChannelGroup.Load()
-
+	_, err := deleteChannelsMatching(func(db *gorm.DB) *gorm.DB {
+		if delDisabled {
+			db = db.Where("(status = ? or status = ?)", config.ChannelStatusAutoDisabled, config.ChannelStatusManuallyDisabled)
+		}
+		return db.Where("tag = ?", tag)
+	})
 	return err
 }
 

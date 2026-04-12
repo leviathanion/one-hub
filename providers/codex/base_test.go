@@ -1470,6 +1470,261 @@ func TestAcquireDistributedRefreshLockTimesOutAndThrottlesDatabaseReloads(t *tes
 	}
 }
 
+func TestForceRefreshTokenTreatsChangedDatabaseTokenAsPeerHandled(t *testing.T) {
+	cache.InitCacheManager()
+
+	originalRedisEnabled := config.RedisEnabled
+	config.RedisEnabled = true
+	t.Cleanup(func() {
+		config.RedisEnabled = originalRedisEnabled
+	})
+
+	originalRedisClient := commonredis.RDB
+	commonredis.RDB = redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
+	t.Cleanup(func() {
+		commonredis.RDB = originalRedisClient
+	})
+
+	originalSetNX := acquireDistributedRefreshLockSetNX
+	acquireDistributedRefreshLockSetNX = func(ctx context.Context, key string, value any, ttl time.Duration) (bool, error) {
+		return false, nil
+	}
+	t.Cleanup(func() {
+		acquireDistributedRefreshLockSetNX = originalSetNX
+	})
+
+	latestCreds := &OAuth2Credentials{
+		AccessToken:  "peer-refreshed-access-token",
+		RefreshToken: "peer-refreshed-refresh-token",
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}
+	initialCreds := &OAuth2Credentials{
+		AccessToken:  "stale-401-token",
+		RefreshToken: "refresh-token",
+		ExpiresAt:    time.Now().Add(-time.Minute),
+	}
+	latestKey, err := latestCreds.ToJSON()
+	if err != nil {
+		t.Fatalf("failed to serialize latest credentials: %v", err)
+	}
+	initialKey, err := initialCreds.ToJSON()
+	if err != nil {
+		t.Fatalf("failed to serialize initial credentials: %v", err)
+	}
+
+	loadCount := 0
+	originalLoadLatestChannelByID := loadLatestChannelByID
+	loadLatestChannelByID = func(channelID int) (*model.Channel, error) {
+		loadCount++
+		if channelID != 424254 {
+			t.Fatalf("unexpected channel id lookup: got %d want %d", channelID, 424254)
+		}
+		key := latestKey
+		if loadCount == 1 {
+			key = initialKey
+		}
+		return &model.Channel{
+			Id:  channelID,
+			Key: key,
+		}, nil
+	}
+	t.Cleanup(func() {
+		loadLatestChannelByID = originalLoadLatestChannelByID
+	})
+
+	refreshCalls := 0
+	originalRefreshCredentials := refreshOAuthCredentials
+	refreshOAuthCredentials = func(creds *OAuth2Credentials, ctx context.Context, proxyURL string, maxRetries int) error {
+		refreshCalls++
+		return nil
+	}
+	t.Cleanup(func() {
+		refreshOAuthCredentials = originalRefreshCredentials
+	})
+
+	provider := &CodexProvider{
+		OpenAIProvider: openai.OpenAIProvider{
+			BaseProvider: base.BaseProvider{
+				Channel: &model.Channel{Id: 424254},
+			},
+		},
+		Credentials: &OAuth2Credentials{
+			AccessToken:  "stale-401-token",
+			RefreshToken: "refresh-token",
+			ExpiresAt:    time.Now().Add(-time.Minute),
+		},
+	}
+
+	refreshed, err := provider.forceRefreshToken(context.Background())
+	if err != nil {
+		t.Fatalf("expected peer refresh detection to avoid an error, got %v", err)
+	}
+	if !refreshed {
+		t.Fatalf("expected force refresh path to treat the peer update as handled")
+	}
+	if refreshCalls != 0 {
+		t.Fatalf("expected no local refresh once another request already persisted new credentials, got %d refresh calls", refreshCalls)
+	}
+	if provider.Credentials.AccessToken != "peer-refreshed-access-token" {
+		t.Fatalf("expected provider credentials to adopt the peer-refreshed token, got %q", provider.Credentials.AccessToken)
+	}
+	if cachedToken := provider.getCachedToken(0); cachedToken != "peer-refreshed-access-token" {
+		t.Fatalf("expected handled-by-peer path to recache the refreshed token, got %q", cachedToken)
+	}
+	if loadCount < 2 {
+		t.Fatalf("expected forced refresh coordination to reload credentials before and during peer detection, got %d loads", loadCount)
+	}
+}
+
+func TestForceRefreshTokenTreatsReloadedCredentialsAsPeerHandledWithoutRedis(t *testing.T) {
+	cache.InitCacheManager()
+
+	channelID := 424255
+	cacheKey := tokenCacheKey(channelID)
+	_ = cache.DeleteCache(cacheKey)
+	defer cache.DeleteCache(cacheKey)
+
+	latestCreds := &OAuth2Credentials{
+		AccessToken:  "peer-refreshed-access-token",
+		RefreshToken: "peer-refreshed-refresh-token",
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}
+	latestKey, err := latestCreds.ToJSON()
+	if err != nil {
+		t.Fatalf("failed to serialize latest credentials: %v", err)
+	}
+
+	loadCount := 0
+	originalLoadLatestChannelByID := loadLatestChannelByID
+	loadLatestChannelByID = func(id int) (*model.Channel, error) {
+		loadCount++
+		if id != channelID {
+			t.Fatalf("unexpected channel id lookup: got %d want %d", id, channelID)
+		}
+		return &model.Channel{Id: id, Key: latestKey}, nil
+	}
+	t.Cleanup(func() {
+		loadLatestChannelByID = originalLoadLatestChannelByID
+	})
+
+	refreshCalls := 0
+	originalRefreshCredentials := refreshOAuthCredentials
+	refreshOAuthCredentials = func(creds *OAuth2Credentials, ctx context.Context, proxyURL string, maxRetries int) error {
+		refreshCalls++
+		return nil
+	}
+	t.Cleanup(func() {
+		refreshOAuthCredentials = originalRefreshCredentials
+	})
+
+	provider := &CodexProvider{
+		OpenAIProvider: openai.OpenAIProvider{
+			BaseProvider: base.BaseProvider{
+				Channel: &model.Channel{Id: channelID},
+			},
+		},
+		Credentials: &OAuth2Credentials{
+			AccessToken:  "stale-401-token",
+			RefreshToken: "refresh-token",
+			ExpiresAt:    time.Now().Add(-time.Minute),
+		},
+	}
+
+	refreshed, err := provider.forceRefreshToken(context.Background())
+	if err != nil {
+		t.Fatalf("expected local peer detection to avoid an error, got %v", err)
+	}
+	if !refreshed {
+		t.Fatalf("expected forced refresh to treat newly loaded credentials as handled")
+	}
+	if refreshCalls != 0 {
+		t.Fatalf("expected no local refresh after reloading newer credentials, got %d refresh calls", refreshCalls)
+	}
+	if provider.Credentials.AccessToken != "peer-refreshed-access-token" {
+		t.Fatalf("expected provider credentials to reload the peer-refreshed token, got %q", provider.Credentials.AccessToken)
+	}
+	if cachedToken := provider.getCachedToken(0); cachedToken != "peer-refreshed-access-token" {
+		t.Fatalf("expected reloaded credentials to be recached, got %q", cachedToken)
+	}
+	if loadCount != 1 {
+		t.Fatalf("expected only the initial reload to be needed without redis coordination, got %d loads", loadCount)
+	}
+}
+
+func TestForceRefreshTokenTreatsChangedRefreshStateAsPeerHandled(t *testing.T) {
+	cache.InitCacheManager()
+
+	channelID := 424256
+	cacheKey := tokenCacheKey(channelID)
+	_ = cache.DeleteCache(cacheKey)
+	defer cache.DeleteCache(cacheKey)
+
+	accessToken := "stable-access-token"
+	latestCreds := &OAuth2Credentials{
+		AccessToken:  accessToken,
+		RefreshToken: "peer-rotated-refresh-token",
+		ExpiresAt:    time.Now().Add(2 * time.Hour),
+	}
+	latestKey, err := latestCreds.ToJSON()
+	if err != nil {
+		t.Fatalf("failed to serialize latest credentials: %v", err)
+	}
+
+	originalLoadLatestChannelByID := loadLatestChannelByID
+	loadLatestChannelByID = func(id int) (*model.Channel, error) {
+		if id != channelID {
+			t.Fatalf("unexpected channel id lookup: got %d want %d", id, channelID)
+		}
+		return &model.Channel{Id: id, Key: latestKey}, nil
+	}
+	t.Cleanup(func() {
+		loadLatestChannelByID = originalLoadLatestChannelByID
+	})
+
+	refreshCalls := 0
+	originalRefreshCredentials := refreshOAuthCredentials
+	refreshOAuthCredentials = func(creds *OAuth2Credentials, ctx context.Context, proxyURL string, maxRetries int) error {
+		refreshCalls++
+		return nil
+	}
+	t.Cleanup(func() {
+		refreshOAuthCredentials = originalRefreshCredentials
+	})
+
+	provider := &CodexProvider{
+		OpenAIProvider: openai.OpenAIProvider{
+			BaseProvider: base.BaseProvider{
+				Channel: &model.Channel{Id: channelID},
+			},
+		},
+		Credentials: &OAuth2Credentials{
+			AccessToken:  accessToken,
+			RefreshToken: "stale-refresh-token",
+			ExpiresAt:    time.Now().Add(-time.Minute),
+		},
+	}
+
+	refreshed, err := provider.forceRefreshToken(context.Background())
+	if err != nil {
+		t.Fatalf("expected changed refresh state to be treated as handled, got %v", err)
+	}
+	if !refreshed {
+		t.Fatalf("expected forced refresh to stop once refresh state changed in storage")
+	}
+	if refreshCalls != 0 {
+		t.Fatalf("expected no extra refresh when only refresh token/expiry changed, got %d refresh calls", refreshCalls)
+	}
+	if provider.Credentials.RefreshToken != "peer-rotated-refresh-token" {
+		t.Fatalf("expected provider credentials to reload the rotated refresh token, got %q", provider.Credentials.RefreshToken)
+	}
+	if !provider.Credentials.ExpiresAt.Equal(latestCreds.ExpiresAt) {
+		t.Fatalf("expected provider expiry to reload from storage, got %s want %s", provider.Credentials.ExpiresAt, latestCreds.ExpiresAt)
+	}
+	if cachedToken := provider.getCachedToken(0); cachedToken != accessToken {
+		t.Fatalf("expected unchanged access token to be recached after peer handling, got %q", cachedToken)
+	}
+}
+
 func TestAcquireChannelRefreshLockCleansUpUnusedEntry(t *testing.T) {
 	channelID := 424244
 

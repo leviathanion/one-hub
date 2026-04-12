@@ -1,9 +1,12 @@
 package model
 
 import (
+	"errors"
 	"fmt"
 	"testing"
+	"time"
 
+	"one-api/common/cache"
 	"one-api/common/config"
 	"one-api/common/logger"
 
@@ -33,6 +36,58 @@ func insertTestChannel(t *testing.T, channel *Channel) {
 	t.Helper()
 	if err := DB.Create(channel).Error; err != nil {
 		t.Fatalf("expected channel fixture to persist, got %v", err)
+	}
+}
+
+func stringPtr(value string) *string {
+	return &value
+}
+
+func primeChannelDerivedCaches(t *testing.T, channelID int) {
+	t.Helper()
+
+	cacheEntries := map[string]string{
+		fmt.Sprintf("%s:%d", codexTokenCacheKeyPrefix, channelID):        "cached-token",
+		fmt.Sprintf("%s:%d", codexUsagePreviewCacheKeyPrefix, channelID): "cached-preview",
+		fmt.Sprintf("%s:%d", codexUsageDetailCacheKeyPrefix, channelID):  "cached-detail",
+	}
+
+	for key, value := range cacheEntries {
+		if err := cache.SetCache(key, value, time.Minute); err != nil {
+			t.Fatalf("expected cache priming to succeed for %s, got %v", key, err)
+		}
+	}
+}
+
+func assertChannelDerivedCachesCleared(t *testing.T, channelID int) {
+	t.Helper()
+
+	cacheKeys := []string{
+		fmt.Sprintf("%s:%d", codexTokenCacheKeyPrefix, channelID),
+		fmt.Sprintf("%s:%d", codexUsagePreviewCacheKeyPrefix, channelID),
+		fmt.Sprintf("%s:%d", codexUsageDetailCacheKeyPrefix, channelID),
+	}
+
+	for _, key := range cacheKeys {
+		if _, err := cache.GetCache[string](key); !errors.Is(err, cache.CacheNotFound) {
+			t.Fatalf("expected cache key %s to be cleared, got err=%v", key, err)
+		}
+	}
+}
+
+func assertChannelDerivedCachesPresent(t *testing.T, channelID int) {
+	t.Helper()
+
+	cacheKeys := []string{
+		fmt.Sprintf("%s:%d", codexTokenCacheKeyPrefix, channelID),
+		fmt.Sprintf("%s:%d", codexUsagePreviewCacheKeyPrefix, channelID),
+		fmt.Sprintf("%s:%d", codexUsageDetailCacheKeyPrefix, channelID),
+	}
+
+	for _, key := range cacheKeys {
+		if _, err := cache.GetCache[string](key); err != nil {
+			t.Fatalf("expected cache key %s to still exist, got err=%v", key, err)
+		}
 	}
 }
 
@@ -106,6 +161,229 @@ func TestChannelUpdateRawOverwritePreservesPersistedTypeWhenTypeOmitted(t *testi
 	}
 }
 
+func TestChannelUpdateRawClearsCodexDerivedCaches(t *testing.T) {
+	useTestChannelDB(t)
+	cache.InitCacheManager()
+	logger.SetupLogger()
+
+	insertTestChannel(t, &Channel{
+		Id:     1,
+		Type:   config.ChannelTypeCodex,
+		Name:   "codex",
+		Key:    "sk-codex",
+		Group:  "default",
+		Models: "gpt-5",
+	})
+	primeChannelDerivedCaches(t, 1)
+
+	update := &Channel{
+		Id:   1,
+		Name: "codex-updated",
+	}
+	if err := update.UpdateRaw(false); err != nil {
+		t.Fatalf("expected channel update to succeed, got %v", err)
+	}
+
+	assertChannelDerivedCachesCleared(t, 1)
+}
+
+func TestChannelUpdateRawIgnoresMissingCodexDerivedCaches(t *testing.T) {
+	useTestChannelDB(t)
+	cache.InitCacheManager()
+
+	insertTestChannel(t, &Channel{
+		Id:     1,
+		Type:   config.ChannelTypeAzure,
+		Name:   "azure",
+		Key:    "sk-azure",
+		Group:  "default",
+		Models: "gpt-4o",
+	})
+
+	update := &Channel{
+		Id:   1,
+		Name: "azure-updated",
+	}
+	if err := update.UpdateRaw(false); err != nil {
+		t.Fatalf("expected channel update to ignore missing derived caches, got %v", err)
+	}
+}
+
+func TestUpdateChannelKeyClearsCodexDerivedCaches(t *testing.T) {
+	useTestChannelDB(t)
+	cache.InitCacheManager()
+	logger.SetupLogger()
+
+	insertTestChannel(t, &Channel{
+		Id:     1,
+		Type:   config.ChannelTypeCodex,
+		Name:   "codex",
+		Key:    "sk-codex",
+		Group:  "default",
+		Models: "gpt-5",
+	})
+	primeChannelDerivedCaches(t, 1)
+
+	if err := UpdateChannelKey(1, "sk-codex-updated"); err != nil {
+		t.Fatalf("expected key update to succeed, got %v", err)
+	}
+
+	assertChannelDerivedCachesCleared(t, 1)
+}
+
+func TestChannelDeleteClearsCodexDerivedCaches(t *testing.T) {
+	useTestChannelDB(t)
+	cache.InitCacheManager()
+	logger.SetupLogger()
+
+	insertTestChannel(t, &Channel{
+		Id:     1,
+		Type:   config.ChannelTypeCodex,
+		Name:   "codex-delete",
+		Key:    "sk-delete",
+		Group:  "default",
+		Models: "gpt-5",
+	})
+	primeChannelDerivedCaches(t, 1)
+
+	channel := &Channel{Id: 1}
+	if err := channel.Delete(); err != nil {
+		t.Fatalf("expected channel delete to succeed, got %v", err)
+	}
+
+	assertChannelDerivedCachesCleared(t, 1)
+}
+
+func TestBatchDeleteChannelClearsCodexDerivedCachesOnlyForCodexRows(t *testing.T) {
+	useTestChannelDB(t)
+	cache.InitCacheManager()
+	logger.SetupLogger()
+
+	insertTestChannel(t, &Channel{
+		Id:     1,
+		Type:   config.ChannelTypeCodex,
+		Name:   "codex-batch-delete",
+		Key:    "sk-delete-1",
+		Group:  "default",
+		Models: "gpt-5",
+	})
+	insertTestChannel(t, &Channel{
+		Id:     2,
+		Type:   3,
+		Name:   "azure-batch-delete",
+		Key:    "sk-delete-2",
+		Group:  "default",
+		Models: "gpt-4o",
+	})
+	primeChannelDerivedCaches(t, 1)
+	primeChannelDerivedCaches(t, 2)
+
+	rows, err := BatchDeleteChannel([]int{1, 2})
+	if err != nil {
+		t.Fatalf("expected batch delete to succeed, got %v", err)
+	}
+	if rows != 2 {
+		t.Fatalf("expected two channels to be deleted, got %d", rows)
+	}
+
+	assertChannelDerivedCachesCleared(t, 1)
+	assertChannelDerivedCachesPresent(t, 2)
+}
+
+func TestDeleteDisabledChannelClearsCodexDerivedCachesOnlyForDeletedRows(t *testing.T) {
+	useTestChannelDB(t)
+	cache.InitCacheManager()
+	logger.SetupLogger()
+
+	insertTestChannel(t, &Channel{
+		Id:     1,
+		Type:   config.ChannelTypeCodex,
+		Status: config.ChannelStatusAutoDisabled,
+		Name:   "codex-disabled",
+		Key:    "sk-disabled",
+		Group:  "default",
+		Models: "gpt-5",
+	})
+	insertTestChannel(t, &Channel{
+		Id:     2,
+		Type:   config.ChannelTypeCodex,
+		Status: config.ChannelStatusEnabled,
+		Name:   "codex-enabled",
+		Key:    "sk-enabled",
+		Group:  "default",
+		Models: "gpt-5",
+	})
+	insertTestChannel(t, &Channel{
+		Id:     3,
+		Type:   3,
+		Status: config.ChannelStatusManuallyDisabled,
+		Name:   "azure-disabled",
+		Key:    "sk-azure-disabled",
+		Group:  "default",
+		Models: "gpt-4o",
+	})
+	primeChannelDerivedCaches(t, 1)
+	primeChannelDerivedCaches(t, 2)
+	primeChannelDerivedCaches(t, 3)
+
+	rows, err := DeleteDisabledChannel()
+	if err != nil {
+		t.Fatalf("expected delete disabled channels to succeed, got %v", err)
+	}
+	if rows != 2 {
+		t.Fatalf("expected exactly two disabled channels to be deleted, got %d", rows)
+	}
+
+	assertChannelDerivedCachesCleared(t, 1)
+	assertChannelDerivedCachesPresent(t, 2)
+	assertChannelDerivedCachesPresent(t, 3)
+}
+
+func TestDeleteChannelsTagClearsCodexDerivedCaches(t *testing.T) {
+	useTestChannelDB(t)
+	cache.InitCacheManager()
+	logger.SetupLogger()
+
+	insertTestChannel(t, &Channel{
+		Id:     1,
+		Type:   config.ChannelTypeCodex,
+		Name:   "codex-tag-delete-1",
+		Key:    "sk-tag-delete-1",
+		Group:  "default",
+		Models: "gpt-5",
+		Tag:    "codex-team",
+	})
+	insertTestChannel(t, &Channel{
+		Id:     2,
+		Type:   config.ChannelTypeCodex,
+		Name:   "codex-tag-delete-2",
+		Key:    "sk-tag-delete-2",
+		Group:  "default",
+		Models: "gpt-5",
+		Tag:    "codex-team",
+	})
+	insertTestChannel(t, &Channel{
+		Id:     3,
+		Type:   config.ChannelTypeCodex,
+		Name:   "codex-other-tag",
+		Key:    "sk-other-tag",
+		Group:  "default",
+		Models: "gpt-5",
+		Tag:    "other-team",
+	})
+	primeChannelDerivedCaches(t, 1)
+	primeChannelDerivedCaches(t, 2)
+	primeChannelDerivedCaches(t, 3)
+
+	if err := DeleteChannelsTag("codex-team", false); err != nil {
+		t.Fatalf("expected tag delete to succeed, got %v", err)
+	}
+
+	assertChannelDerivedCachesCleared(t, 1)
+	assertChannelDerivedCachesCleared(t, 2)
+	assertChannelDerivedCachesPresent(t, 3)
+}
+
 func TestUpdateChannelsTagRejectsInvalidCodexOtherWhenTypeOmitted(t *testing.T) {
 	useTestChannelDB(t)
 
@@ -138,6 +416,48 @@ func TestUpdateChannelsTagRejectsInvalidCodexOtherWhenTypeOmitted(t *testing.T) 
 	}
 }
 
+func TestUpdateChannelsTagClearsCodexDerivedCaches(t *testing.T) {
+	useTestChannelDB(t)
+	cache.InitCacheManager()
+	logger.SetupLogger()
+
+	insertTestChannel(t, &Channel{
+		Id:      1,
+		Type:    config.ChannelTypeCodex,
+		Name:    "codex-tag",
+		Key:     "sk-tagged",
+		Group:   "default",
+		Models:  "gpt-5",
+		Tag:     "codex-team",
+		BaseURL: stringPtr("https://old.example"),
+	})
+	insertTestChannel(t, &Channel{
+		Id:      2,
+		Type:    config.ChannelTypeCodex,
+		Name:    "codex-tag-2",
+		Key:     "sk-tagged-2",
+		Group:   "default",
+		Models:  "gpt-5",
+		Tag:     "codex-team",
+		BaseURL: stringPtr("https://old.example"),
+	})
+	primeChannelDerivedCaches(t, 1)
+	primeChannelDerivedCaches(t, 2)
+
+	if err := UpdateChannelsTag("codex-team", &Channel{
+		Name:    "codex-tag",
+		Key:     "sk-tagged\nsk-tagged-2",
+		Group:   "default",
+		Models:  "gpt-5",
+		BaseURL: stringPtr("https://new.example"),
+	}); err != nil {
+		t.Fatalf("expected tag update to succeed, got %v", err)
+	}
+
+	assertChannelDerivedCachesCleared(t, 1)
+	assertChannelDerivedCachesCleared(t, 2)
+}
+
 func TestBatchUpdateChannelsAzureApiRejectsUnsupportedCodexOtherWhenTypeOmitted(t *testing.T) {
 	useTestChannelDB(t)
 	logger.SetupLogger()
@@ -164,6 +484,56 @@ func TestBatchUpdateChannelsAzureApiRejectsUnsupportedCodexOtherWhenTypeOmitted(
 	}
 	if persisted.Other != "" {
 		t.Fatalf("expected rejected batch update not to mutate other, got %q", persisted.Other)
+	}
+}
+
+func TestBatchUpdateChannelsAzureApiClearsCodexDerivedCaches(t *testing.T) {
+	useTestChannelDB(t)
+	cache.InitCacheManager()
+	logger.SetupLogger()
+
+	insertTestChannel(t, &Channel{
+		Id:     1,
+		Type:   config.ChannelTypeCodex,
+		Name:   "codex-batch",
+		Key:    "sk-batch",
+		Group:  "default",
+		Models: "gpt-5",
+		Other:  `{"user_agent":"old-agent"}`,
+	})
+	insertTestChannel(t, &Channel{
+		Id:     2,
+		Type:   3,
+		Name:   "azure-batch",
+		Key:    "sk-azure",
+		Group:  "default",
+		Models: "gpt-4o",
+		Other:  "2024-05-01-preview",
+	})
+	primeChannelDerivedCaches(t, 1)
+	primeChannelDerivedCaches(t, 2)
+
+	count, err := BatchUpdateChannelsAzureApi(&BatchChannelsParams{
+		Ids:   []int{1, 2},
+		Value: `{"user_agent":"new-agent"}`,
+	})
+	if err != nil {
+		t.Fatalf("expected batch update to succeed, got %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("expected both rows to update, got %d", count)
+	}
+
+	assertChannelDerivedCachesCleared(t, 1)
+
+	for _, key := range []string{
+		fmt.Sprintf("%s:%d", codexTokenCacheKeyPrefix, 2),
+		fmt.Sprintf("%s:%d", codexUsagePreviewCacheKeyPrefix, 2),
+		fmt.Sprintf("%s:%d", codexUsageDetailCacheKeyPrefix, 2),
+	} {
+		if _, err := cache.GetCache[string](key); err != nil {
+			t.Fatalf("expected non-Codex batch update not to clear cache key %s, got %v", key, err)
+		}
 	}
 }
 

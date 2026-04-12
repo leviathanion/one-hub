@@ -72,13 +72,16 @@ var channelRefreshLocks = struct {
 }
 
 var (
-	refreshLockTTL                     = 3 * time.Minute
-	refreshLockPollInterval            = 200 * time.Millisecond
-	refreshLockReleaseTimeout          = 3 * time.Second
-	refreshCredentialReloadInterval    = 2 * time.Second
-	legacyCredentialExpiryFallback     = time.Hour
-	loadLatestChannelByID              = model.GetChannelById
-	updateChannelKey                   = model.UpdateChannelKey
+	refreshLockTTL                  = 3 * time.Minute
+	refreshLockPollInterval         = 200 * time.Millisecond
+	refreshLockReleaseTimeout       = 3 * time.Second
+	refreshCredentialReloadInterval = 2 * time.Second
+	legacyCredentialExpiryFallback  = time.Hour
+	loadLatestChannelByID           = model.GetChannelById
+	updateChannelKey                = model.UpdateChannelKey
+	refreshOAuthCredentials         = func(creds *OAuth2Credentials, ctx context.Context, proxyURL string, maxRetries int) error {
+		return creds.Refresh(ctx, proxyURL, maxRetries)
+	}
 	acquireDistributedRefreshLockSetNX = func(ctx context.Context, key string, value any, ttl time.Duration) (bool, error) {
 		client := commonredis.GetRedisClient()
 		if client == nil {
@@ -565,12 +568,7 @@ func (p *CodexProvider) refreshTokenIfNeeded(ctx context.Context, lead time.Dura
 		return false, nil
 	}
 
-	proxyURL := ""
-	if p.Channel != nil && p.Channel.Proxy != nil && *p.Channel.Proxy != "" {
-		proxyURL = *p.Channel.Proxy
-	}
-
-	if err := p.Credentials.Refresh(ctx, proxyURL, 3); err != nil {
+	if err := p.refreshCredentials(ctx); err != nil {
 		return false, err
 	}
 
@@ -584,6 +582,85 @@ func (p *CodexProvider) refreshTokenIfNeeded(ctx context.Context, lead time.Dura
 
 	p.cacheCurrentToken()
 	return true, nil
+}
+
+func (p *CodexProvider) forceRefreshToken(ctx context.Context) (bool, error) {
+	if p == nil || p.Credentials == nil || p.Channel == nil {
+		return false, fmt.Errorf("credentials not configured")
+	}
+	if p.Credentials.RefreshToken == "" {
+		return false, nil
+	}
+
+	releaseLocalLock := acquireChannelRefreshLock(p.channelID())
+	defer releaseLocalLock()
+
+	previousCredentialsVersion := credentialsVersion(p.Credentials)
+	// Trade-off: once upstream has replied 401/403 for this token, we prefer to stop
+	// serving the cached token immediately even if that briefly hurts cache hit rate.
+	// Safety wins here, but every handled-by-peer path below must recache the latest
+	// token so this deliberate invalidation does not leave the channel cold.
+	if err := cache.DeleteCache(tokenCacheKey(p.channelID())); err != nil {
+		if ctx != nil {
+			logger.LogWarn(ctx, fmt.Sprintf("[Codex] failed to clear token cache for forced refresh on channel %d: %s", p.channelID(), err.Error()))
+		} else {
+			logger.SysError(fmt.Sprintf("[Codex] failed to clear token cache for forced refresh on channel %d: %s", p.channelID(), err.Error()))
+		}
+	}
+
+	if err := p.loadLatestCredentialsFromDatabase(); err != nil {
+		if ctx != nil {
+			logger.LogWarn(ctx, fmt.Sprintf("[Codex] Failed to load latest credentials for forced refresh on channel %d: %s", p.channelID(), err.Error()))
+		} else {
+			logger.SysError(fmt.Sprintf("[Codex] Failed to load latest credentials for forced refresh on channel %d: %s", p.channelID(), err.Error()))
+		}
+	}
+	if p.Credentials == nil || p.Credentials.RefreshToken == "" {
+		return false, nil
+	}
+	if p.credentialsChangedSince(previousCredentialsVersion, false) {
+		p.cacheCurrentToken()
+		return true, nil
+	}
+
+	lock, handledByPeer, err := p.acquireDistributedForceRefreshLock(ctx, previousCredentialsVersion)
+	if err != nil {
+		return false, err
+	}
+	if handledByPeer {
+		p.cacheCurrentToken()
+		return true, nil
+	}
+	if lock != nil {
+		defer lock.Release()
+	}
+	if p.credentialsChangedSince(previousCredentialsVersion, true) {
+		p.cacheCurrentToken()
+		return true, nil
+	}
+
+	if err := p.refreshCredentials(ctx); err != nil {
+		return false, err
+	}
+
+	if err := p.saveCredentialsToDatabase(ctx); err != nil {
+		if ctx != nil {
+			logger.LogError(ctx, fmt.Sprintf("Failed to save force-refreshed credentials to database: %s", err.Error()))
+		} else {
+			logger.SysError("Failed to save force-refreshed credentials to database: " + err.Error())
+		}
+	}
+
+	p.cacheCurrentToken()
+	return true, nil
+}
+
+func (p *CodexProvider) refreshCredentials(ctx context.Context) error {
+	proxyURL := ""
+	if p.Channel != nil && p.Channel.Proxy != nil && *p.Channel.Proxy != "" {
+		proxyURL = *p.Channel.Proxy
+	}
+	return refreshOAuthCredentials(p.Credentials, ctx, proxyURL, 3)
 }
 
 func (p *CodexProvider) cacheCurrentToken() {
@@ -684,6 +761,12 @@ type cachedAccessToken struct {
 	ExpiresAt   time.Time `json:"expires_at,omitempty"`
 }
 
+type credentialVersionSnapshot struct {
+	AccessToken  string
+	RefreshToken string
+	ExpiresAt    int64
+}
+
 func acquireChannelRefreshLock(channelID int) func() {
 	if channelID <= 0 {
 		return func() {}
@@ -718,6 +801,38 @@ func (p *CodexProvider) channelID() int {
 		return 0
 	}
 	return p.Channel.Id
+}
+
+func credentialsVersion(creds *OAuth2Credentials) credentialVersionSnapshot {
+	if creds == nil {
+		return credentialVersionSnapshot{}
+	}
+
+	expiresAt := int64(0)
+	if !creds.ExpiresAt.IsZero() {
+		expiresAt = creds.ExpiresAt.UTC().Unix()
+	}
+
+	return credentialVersionSnapshot{
+		AccessToken:  strings.TrimSpace(creds.AccessToken),
+		RefreshToken: strings.TrimSpace(creds.RefreshToken),
+		ExpiresAt:    expiresAt,
+	}
+}
+
+func (p *CodexProvider) credentialsChangedSince(previous credentialVersionSnapshot, reloadFromDatabase bool) bool {
+	if reloadFromDatabase {
+		if err := p.loadLatestCredentialsFromDatabase(); err != nil {
+			return false
+		}
+	}
+
+	current := credentialsVersion(p.Credentials)
+	if current == (credentialVersionSnapshot{}) {
+		return false
+	}
+
+	return current != previous
 }
 
 func (p *CodexProvider) getCachedToken(lead time.Duration) string {
@@ -848,6 +963,44 @@ func (p *CodexProvider) acquireDistributedRefreshLock(ctx context.Context, lead 
 		}
 		if err := waitForRetry(requestCtx, refreshLockPollInterval); err != nil {
 			return nil, false, fmt.Errorf("waiting for another instance to finish refresh: %w", err)
+		}
+	}
+}
+
+func (p *CodexProvider) acquireDistributedForceRefreshLock(ctx context.Context, previousCredentialsVersion credentialVersionSnapshot) (*distributedRefreshLock, bool, error) {
+	if !config.RedisEnabled || commonredis.GetRedisClient() == nil || p.channelID() <= 0 {
+		return nil, false, nil
+	}
+
+	requestCtx, cancel := context.WithTimeout(ensureContext(ctx), refreshLockTTL)
+	defer cancel()
+
+	lock := &distributedRefreshLock{
+		key:   refreshLockKey(p.channelID()),
+		value: uuid.NewString(),
+	}
+	nextCredentialReloadAt := time.Time{}
+
+	for {
+		acquired, err := acquireDistributedRefreshLockSetNX(requestCtx, lock.key, lock.value, refreshLockTTL)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to acquire distributed forced refresh lock for channel %d: %w", p.channelID(), err)
+		}
+		if acquired {
+			return lock, false, nil
+		}
+
+		shouldReloadCredentials := nextCredentialReloadAt.IsZero() || !time.Now().Before(nextCredentialReloadAt)
+		if shouldReloadCredentials {
+			if p.credentialsChangedSince(previousCredentialsVersion, true) {
+				p.cacheCurrentToken()
+				return nil, true, nil
+			}
+			nextCredentialReloadAt = time.Now().Add(refreshCredentialReloadInterval)
+		}
+
+		if err := waitForRetry(requestCtx, refreshLockPollInterval); err != nil {
+			return nil, false, fmt.Errorf("waiting for another instance to finish forced refresh: %w", err)
 		}
 	}
 }
