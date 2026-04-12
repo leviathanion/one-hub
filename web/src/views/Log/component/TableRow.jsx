@@ -13,6 +13,7 @@ import { useTranslation } from 'react-i18next';
 import QuotaWithDetailRow from './QuotaWithDetailRow';
 import QuotaWithDetailContent from './QuotaWithDetailContent';
 import { calculatePrice } from './QuotaWithDetailContent';
+import { calculateTokenBreakdown } from './quotaDetail';
 import { styled } from '@mui/material/styles';
 
 function renderType(type, logTypes, t) {
@@ -83,7 +84,7 @@ export default function LogTableRow({ item, userIsAdmin, userGroup, columnVisibi
     request_ts_str = `${request_ts.toFixed(2)} t/s`;
   }
 
-  const { totalInputTokens, totalOutputTokens, show, tokenDetails } = useMemo(() => calculateTokens(item), [item]);
+  const { totalInputTokens, totalOutputTokens, show, tokenDetails } = useMemo(() => calculateTokenBreakdown(item), [item]);
 
   // 计算当前显示的列数
   const colCount = Object.values(columnVisibility).filter(Boolean).length;
@@ -298,117 +299,6 @@ function viewInput(item, t, totalInputTokens, totalOutputTokens, show, tokenDeta
       </Tooltip>
     </Badge>
   );
-}
-
-function calculateTokens(item) {
-  const { prompt_tokens, completion_tokens, metadata } = item;
-
-  if (!prompt_tokens || !metadata) {
-    return {
-      totalInputTokens: prompt_tokens || 0,
-      totalOutputTokens: completion_tokens || 0,
-      show: false,
-      tokenDetails: []
-    };
-  }
-
-  let totalInputTokens = prompt_tokens;
-  let totalOutputTokens = completion_tokens;
-  let show = false;
-
-  const input_audio_tokens = metadata?.input_audio_tokens_ratio || 1;
-  const output_audio_tokens = metadata?.output_audio_tokens_ratio || 1;
-  const input_image_tokens = metadata?.input_image_tokens_ratio || 1;
-  const output_image_tokens = metadata?.output_image_tokens_ratio || 1;
-
-  const cached_ratio = metadata?.cached_tokens_ratio || 1;
-  const cached_write_ratio = metadata?.cached_write_tokens_ratio || 1;
-  const cached_read_ratio = metadata?.cached_read_tokens_ratio || 1;
-  const reasoning_tokens = metadata?.reasoning_tokens_ratio || 1;
-  const input_text_tokens_ratio = metadata?.input_text_tokens_ratio || 1;
-  const output_text_tokens_ratio = metadata?.output_text_tokens_ratio || 1;
-
-  const tokenDetails = [
-    {
-      key: 'input_text_tokens',
-      label: 'logPage.inputTextTokens',
-      rate: input_text_tokens_ratio,
-      labelParams: { ratio: input_text_tokens_ratio }
-    },
-    {
-      key: 'output_text_tokens',
-      label: 'logPage.outputTextTokens',
-      rate: output_text_tokens_ratio,
-      labelParams: { ratio: output_text_tokens_ratio }
-    },
-    {
-      key: 'input_audio_tokens',
-      label: 'logPage.inputAudioTokens',
-      rate: input_audio_tokens,
-      labelParams: { ratio: input_audio_tokens }
-    },
-    {
-      key: 'output_audio_tokens',
-      label: 'logPage.outputAudioTokens',
-      rate: output_audio_tokens,
-      labelParams: { ratio: output_audio_tokens }
-    },
-    { key: 'cached_tokens', label: 'logPage.cachedTokens', rate: cached_ratio, labelParams: { ratio: cached_ratio } },
-    {
-      key: 'cached_write_tokens',
-      label: 'logPage.cachedWriteTokens',
-      rate: cached_write_ratio,
-      labelParams: { ratio: cached_write_ratio }
-    },
-    { key: 'cached_read_tokens', label: 'logPage.cachedReadTokens', rate: cached_read_ratio, labelParams: { ratio: cached_read_ratio } },
-    { key: 'reasoning_tokens', label: 'logPage.reasoningTokens', rate: reasoning_tokens, labelParams: { ratio: reasoning_tokens } },
-    {
-      key: 'input_image_tokens',
-      label: 'logPage.inputImageTokens',
-      rate: input_image_tokens,
-      labelParams: { ratio: input_image_tokens }
-    },
-    {
-      key: 'output_image_tokens',
-      label: 'logPage.outputImageTokens',
-      rate: output_image_tokens,
-      labelParams: { ratio: output_image_tokens }
-    }
-  ]
-    .filter(({ key }) => metadata[key] > 0)
-    .map(({ key, label, rate, labelParams }) => {
-      const tokens = Math.ceil(metadata[key] * (rate - 1));
-
-      // Check if this token type affects input or output totals
-      const isInputToken = [
-        'input_text_tokens',
-        'output_text_tokens',
-        'input_audio_tokens',
-        'cached_tokens',
-        'cached_write_tokens',
-        'cached_read_tokens',
-        'input_image_tokens'
-      ].includes(key);
-
-      const isOutputToken = ['output_audio_tokens', 'reasoning_tokens', 'output_image_tokens'].includes(key);
-
-      if (isInputToken) {
-        totalInputTokens += tokens;
-        show = true;
-      } else if (isOutputToken) {
-        totalOutputTokens += tokens;
-        show = true;
-      }
-
-      return { key, label, tokens, value: metadata[key], rate, labelParams };
-    });
-
-  return {
-    totalInputTokens,
-    totalOutputTokens,
-    show,
-    tokenDetails
-  };
 }
 
 function viewLogContent(item, t) {
