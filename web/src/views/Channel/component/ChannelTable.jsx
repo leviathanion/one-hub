@@ -14,6 +14,7 @@ import { fetchChannelData } from '../ChannelList';
 import { API } from 'utils/api';
 import { showError, showSuccess, trims } from 'utils/common';
 import { useTranslation } from 'react-i18next';
+import { useCodexUsageStore } from './useCodexUsageStore';
 
 export default function ChannelTable({ tag }) {
   const { t } = useTranslation();
@@ -25,6 +26,8 @@ export default function ChannelTable({ tag }) {
   const [searching, setSearching] = useState(false);
   const [channels, setChannels] = useState([]);
   const [refreshFlag, setRefreshFlag] = useState(false);
+  const codexUsage = useCodexUsageStore();
+  const { prefetchPreviews } = codexUsage;
 
   const handleSort = (event, id) => {
     const isAsc = orderBy === id && order === 'asc';
@@ -136,6 +139,16 @@ export default function ChannelTable({ tag }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [page, rowsPerPage, order, orderBy, refreshFlag]);
 
+  useEffect(() => {
+    const controller = new AbortController();
+
+    if (Array.isArray(channels) && channels.length > 0) {
+      prefetchPreviews(channels, controller.signal, { includeTaggedMembers: true }).catch(() => undefined);
+    }
+
+    return () => controller.abort();
+  }, [channels, prefetchPreviews]);
+
   return (
     <>
       {searching && <LinearProgress />}
@@ -155,7 +168,7 @@ export default function ChannelTable({ tag }) {
                 { id: 'type', label: t('channel_index.type'), disableSort: false },
                 { id: 'status', label: t('channel_index.status'), disableSort: false },
                 { id: 'response_time', label: t('channel_index.responseTime'), disableSort: false },
-                { id: 'used', label: t('channel_index.usedBalance'), disableSort: false },
+                { id: 'used', label: t('channel_index.usedBalance'), disableSort: true },
                 { id: 'priority', label: t('channel_index.priority'), disableSort: false, width: '80px' },
                 { id: 'weight', label: t('channel_index.weight'), disableSort: false, width: '80px' },
                 { id: 'action', label: t('userPage.action'), disableSort: true }
@@ -163,7 +176,13 @@ export default function ChannelTable({ tag }) {
             />
             <TableBody>
               {channels.map((row) => (
-                <ChannelTableRow item={row} key={'channelsTag' + row.id} hideEdit={true} manageChannel={manageChannel} />
+                <ChannelTableRow
+                  item={row}
+                  key={'channelsTag' + row.id}
+                  hideEdit={true}
+                  manageChannel={manageChannel}
+                  codexUsage={codexUsage}
+                />
               ))}
             </TableBody>
           </Table>

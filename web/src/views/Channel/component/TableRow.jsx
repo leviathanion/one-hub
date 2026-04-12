@@ -1,5 +1,5 @@
 import PropTypes from 'prop-types';
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 
 import { showInfo, showError, showSuccess } from 'utils/common';
 import { API } from 'utils/api';
@@ -55,6 +55,8 @@ import KeyboardArrowUpIcon from '@mui/icons-material/KeyboardArrowUp';
 import { copy, renderQuota } from 'utils/common';
 import { ChannelCheck } from './ChannelCheck';
 import { PAGE_SIZE_OPTIONS, getPageSize, savePageSize } from 'constants';
+import CodexUsageDialog from './CodexUsageDialog';
+import { formatCodexWindowSummary, getCodexUsageWindow, isCodexChannel, resolveCodexUsageRatio } from './codexUsage';
 
 const StyledMenu = styled((props) => (
   <Menu
@@ -106,8 +108,46 @@ function statusInfo(t, status) {
   }
 }
 
-export default function ChannelTableRow({ item, manageChannel, onRefresh, groupOptions, modelOptions, prices }) {
+function codexUsageColor(ratio) {
+  if (ratio == null) {
+    return 'text.secondary';
+  }
+  if (ratio >= 0.9) {
+    return 'error.main';
+  }
+  if (ratio >= 0.7) {
+    return 'warning.main';
+  }
+  return 'success.main';
+}
+
+function CodexUsageInline({ snapshot, onOpenDetails, detailTitle }) {
+  const fiveHourWindow = getCodexUsageWindow(snapshot, 'five_hour');
+  const weeklyWindow = getCodexUsageWindow(snapshot, 'weekly');
+
+  return (
+    <Stack direction="row" spacing={0.5} alignItems="center" justifyContent="center">
+      <Stack spacing={0.25} alignItems="center">
+        <Typography variant="caption" sx={{ fontWeight: 600, color: codexUsageColor(resolveCodexUsageRatio(fiveHourWindow)) }}>
+          {`5h ${formatCodexWindowSummary(fiveHourWindow)}`}
+        </Typography>
+        <Typography variant="caption" sx={{ fontWeight: 600, color: codexUsageColor(resolveCodexUsageRatio(weeklyWindow)) }}>
+          {`7d ${formatCodexWindowSummary(weeklyWindow)}`}
+        </Typography>
+      </Stack>
+      <Tooltip title={detailTitle} placement="top">
+        <IconButton size="small" sx={{ p: 0.25 }} onClick={onOpenDetails}>
+          <Icon icon="solar:info-circle-bold-duotone" width={16} />
+        </IconButton>
+      </Tooltip>
+    </Stack>
+  );
+}
+
+export default function ChannelTableRow({ item, manageChannel, onRefresh, groupOptions, modelOptions, prices, codexUsage }) {
   const { t } = useTranslation();
+  const { prefetchPreviews, invalidateSnapshots, refreshDetail, getPreviewSnapshot, getDetailSnapshot, isDetailLoading, getDetailError } =
+    codexUsage;
   const popover = usePopover();
   const confirmDelete = useBoolean();
   const check = useBoolean();
@@ -131,14 +171,17 @@ export default function ChannelTableRow({ item, manageChannel, onRefresh, groupO
   const [tagPage, setTagPage] = useState(0);
   const [tagRowsPerPage, setTagRowsPerPage] = useState(() => getPageSize('channelTag'));
   const tagModelPopover = usePopover();
+  const tagChannelsRef = useRef([]);
 
   const batchConfirm = useBoolean();
 
   const tagStatusConfirm = useBoolean();
   const [statusChangeAction, setStatusChangeAction] = useState('');
+  const codexUsageDialog = useBoolean();
 
   const [responseTimeData, setResponseTimeData] = useState({ test_time: item.test_time, response_time: item.response_time });
   const [itemBalance, setItemBalance] = useState(item.balance);
+  const [codexUsageTarget, setCodexUsageTarget] = useState(null);
 
   const [openRow, setOpenRow] = useState(false);
   let modelMap = [];
@@ -165,6 +208,33 @@ export default function ChannelTableRow({ item, manageChannel, onRefresh, groupO
       setIsTagChannelsLoading(false);
     }
   }, [item.tag, t]);
+
+  const tagChannelMembershipKey = Array.isArray(tagChannels)
+    ? tagChannels
+        .map((channel) => Number(channel?.id))
+        .filter((channelID) => Number.isInteger(channelID) && channelID > 0)
+        .sort((left, right) => left - right)
+        .join(',')
+    : '';
+  tagChannelsRef.current = tagChannels;
+
+  const invalidateQuickEditSnapshots = useCallback(() => {
+    const channelIDs = item.tag
+      ? Array.from(
+          new Set(
+            (tagChannelsRef.current || [])
+              .map((channel) => Number(channel?.id))
+              .filter((channelID) => Number.isInteger(channelID) && channelID > 0)
+          )
+        )
+      : [item.id];
+
+    if (channelIDs.length > 0) {
+      invalidateSnapshots(channelIDs);
+    }
+
+    return channelIDs;
+  }, [invalidateSnapshots, item.id, item.tag]);
 
   const handleChangeTagPage = (event, newPage) => {
     setTagPage(newPage);
@@ -242,11 +312,14 @@ export default function ChannelTableRow({ item, manageChannel, onRefresh, groupO
   };
 
   const executeBatchDelete = async () => {
+    const deletedChannelIDs = selectedChannels.slice();
+
     try {
       // 这里需要实现批量删除的API调用
-      const { success, message } = await manageChannel(0, 'batch_delete', selectedChannels, false);
+      const { success, message } = await manageChannel(0, 'batch_delete', deletedChannelIDs, false);
       if (success) {
         showInfo(t('channel_row.batchDeleteSuccess'));
+        invalidateSnapshots(deletedChannelIDs);
         setSelectedChannels([]);
         fetchTagChannels(); // 重新获取数据
         onRefresh(false); // 刷新父组件数据
@@ -264,13 +337,31 @@ export default function ChannelTableRow({ item, manageChannel, onRefresh, groupO
     }
   }, [openRow, item.tag, fetchTagChannels]);
 
+  // Trade-off: prefetches are keyed by tag membership instead of the full tagChannels
+  // object graph. That avoids refetching previews when unrelated row fields change,
+  // while still reloading as soon as members are added or removed.
+  useEffect(() => {
+    const controller = new AbortController();
+
+    if (!openRow || !tagChannelMembershipKey) {
+      return () => controller.abort();
+    }
+
+    prefetchPreviews(tagChannelsRef.current, controller.signal, { includeTaggedMembers: true }).catch(() => undefined);
+
+    return () => controller.abort();
+  }, [openRow, prefetchPreviews, tagChannelMembershipKey]);
+
   const handleTestModel = (event) => {
     setOpenTest(event.currentTarget);
   };
 
   const handleDeleteRow = useCallback(async () => {
-    await manageChannel(item.id, 'delete', '');
-  }, [manageChannel, item.id]);
+    const { success } = await manageChannel(item.id, 'delete', '');
+    if (success) {
+      invalidateSnapshots([item.id]);
+    }
+  }, [invalidateSnapshots, manageChannel, item.id]);
 
   const handleStatus = async () => {
     const switchVlue = statusSwitch === 1 ? 2 : 1;
@@ -321,6 +412,23 @@ export default function ChannelTableRow({ item, manageChannel, onRefresh, groupO
     setItemBalance(item.balance);
     setResponseTimeData({ test_time: item.test_time, response_time: item.response_time });
   }, [item]);
+
+  const handleOpenCodexUsage = useCallback(
+    (channel) => {
+      if (!channel?.id) {
+        return;
+      }
+      setCodexUsageTarget(channel);
+      codexUsageDialog.onTrue();
+      refreshDetail(channel.id);
+    },
+    [codexUsageDialog, refreshDetail]
+  );
+
+  const currentCodexSnapshot = getPreviewSnapshot(item.id);
+  const codexUsageDialogSnapshot = getDetailSnapshot(codexUsageTarget?.id);
+  const codexUsageDialogLoading = isDetailLoading(codexUsageTarget?.id);
+  const codexUsageDialogError = getDetailError(codexUsageTarget?.id);
 
   return (
     <>
@@ -429,7 +537,7 @@ export default function ChannelTableRow({ item, manageChannel, onRefresh, groupO
           
         </TableCell> */}
         <TableCell>
-          {!item.tag && (
+          {!item.tag && !isCodexChannel(item) && (
             <Stack spacing={0.5} alignItems="center">
               <Typography variant="body1">{renderQuota(item.used_quota)}</Typography>
               <Typography
@@ -445,6 +553,13 @@ export default function ChannelTableRow({ item, manageChannel, onRefresh, groupO
                 {renderBalance(item.type, itemBalance)}
               </Typography>
             </Stack>
+          )}
+          {!item.tag && isCodexChannel(item) && (
+            <CodexUsageInline
+              snapshot={currentCodexSnapshot}
+              detailTitle={t('channel_row.codexOpenDetails')}
+              onOpenDetails={() => handleOpenCodexUsage(item)}
+            />
           )}
         </TableCell>
 
@@ -980,31 +1095,39 @@ export default function ChannelTableRow({ item, manageChannel, onRefresh, groupO
                                       </Stack>
                                     </TableCell>
                                     <TableCell sx={{ textAlign: 'center' }}>
-                                      <Tooltip title={t('channel_row.clickUpdateQuota')} placement="top">
-                                        <Box sx={{ cursor: 'pointer' }} onClick={() => manageChannel(channel.id, 'update_balance')}>
-                                          <Stack direction="column" spacing={0.5} alignItems="center" justifyContent="center">
-                                            <Typography
-                                              variant="body2"
-                                              sx={{
-                                                fontSize: '0.8rem',
-                                                fontWeight: 500,
-                                                '&:hover': { textDecoration: 'underline' }
-                                              }}
-                                            >
-                                              {renderQuota(channel.used_quota)}
-                                            </Typography>
-                                            <Typography
-                                              variant="caption"
-                                              sx={{
-                                                color: 'success.main',
-                                                fontWeight: 600
-                                              }}
-                                            >
-                                              ${channel.balance}
-                                            </Typography>
-                                          </Stack>
-                                        </Box>
-                                      </Tooltip>
+                                      {isCodexChannel(channel) ? (
+                                        <CodexUsageInline
+                                          snapshot={getPreviewSnapshot(channel.id)}
+                                          detailTitle={t('channel_row.codexOpenDetails')}
+                                          onOpenDetails={() => handleOpenCodexUsage(channel)}
+                                        />
+                                      ) : (
+                                        <Tooltip title={t('channel_row.clickUpdateQuota')} placement="top">
+                                          <Box sx={{ cursor: 'pointer' }} onClick={() => manageChannel(channel.id, 'update_balance')}>
+                                            <Stack direction="column" spacing={0.5} alignItems="center" justifyContent="center">
+                                              <Typography
+                                                variant="body2"
+                                                sx={{
+                                                  fontSize: '0.8rem',
+                                                  fontWeight: 500,
+                                                  '&:hover': { textDecoration: 'underline' }
+                                                }}
+                                              >
+                                                {renderQuota(channel.used_quota)}
+                                              </Typography>
+                                              <Typography
+                                                variant="caption"
+                                                sx={{
+                                                  color: 'success.main',
+                                                  fontWeight: 600
+                                                }}
+                                              >
+                                                ${channel.balance}
+                                              </Typography>
+                                            </Stack>
+                                          </Box>
+                                        </Tooltip>
+                                      )}
                                     </TableCell>
                                     <TableCell sx={{ textAlign: 'center' }}>
                                       <ResponseTimeLabel test_time={channel.test_time} response_time={channel.response_time} />
@@ -1175,10 +1298,13 @@ export default function ChannelTableRow({ item, manageChannel, onRefresh, groupO
                 manageChannel(currentTestingChannel.id, 'delete', '')
                   .then(({ success }) => {
                     if (success) {
+                      const deletedChannelID = currentTestingChannel.id;
                       // 从本地列表中移除
-                      setTagChannels((prev) => prev.filter((c) => c.id !== currentTestingChannel.id));
+                      setTagChannels((prev) => prev.filter((c) => c.id !== deletedChannelID));
                       // 减少总数
                       setTotalTagChannels((prev) => prev - 1);
+                      setSelectedChannels((prev) => prev.filter((channelID) => channelID !== deletedChannelID));
+                      invalidateSnapshots([deletedChannelID]);
                       // 重置当前选中的渠道
                       setCurrentTestingChannel(null);
                       showSuccess(t('common.deleteSuccess'));
@@ -1215,6 +1341,7 @@ export default function ChannelTableRow({ item, manageChannel, onRefresh, groupO
               manageChannel(item.tag, 'delete', '', true)
                 .then(({ success }) => {
                   if (success) {
+                    invalidateSnapshots(tagChannels.map((channel) => channel.id));
                     showInfo(t('channel_row.deleteTagSuccess', { tag: item.tag }));
                     onRefresh(false); // 刷新父组件数据
                   }
@@ -1274,6 +1401,12 @@ export default function ChannelTableRow({ item, manageChannel, onRefresh, groupO
         open={quickEdit.value}
         onCancel={quickEdit.onFalse}
         onOk={() => {
+          const affectedChannelIDs = invalidateQuickEditSnapshots();
+
+          if (item.tag && affectedChannelIDs.length > 0) {
+            prefetchPreviews(tagChannelsRef.current, undefined, { includeTaggedMembers: true }).catch(() => undefined);
+          }
+
           onRefresh(false);
           quickEdit.onFalse();
         }}
@@ -1405,12 +1538,23 @@ export default function ChannelTableRow({ item, manageChannel, onRefresh, groupO
                   if (res && res.data) {
                     const { success, message } = res.data;
                     if (success) {
+                      const updatedChannel = {
+                        ...currentTestingChannel,
+                        name: editedChannel.name,
+                        key: editedChannel.key
+                      };
+                      const credentialsChanged = editedChannel.key !== currentTestingChannel.key;
+
                       showSuccess(t('channel_edit.editSuccess'));
 
                       // 更新本地状态
                       setTagChannels((prev) =>
                         prev.map((c) => (c.id === channelId ? { ...c, name: editedChannel.name, key: editedChannel.key } : c))
                       );
+                      if (credentialsChanged) {
+                        invalidateSnapshots([channelId]);
+                        prefetchPreviews([updatedChannel], undefined, { includeTaggedMembers: true }).catch(() => undefined);
+                      }
 
                       onRefresh(false); // 刷新父组件数据
                     } else {
@@ -1434,6 +1578,19 @@ export default function ChannelTableRow({ item, manageChannel, onRefresh, groupO
           </Button>
         </DialogActions>
       </Dialog>
+
+      <CodexUsageDialog
+        open={codexUsageDialog.value}
+        record={codexUsageTarget}
+        snapshot={codexUsageDialogSnapshot}
+        loading={codexUsageDialogLoading}
+        errorText={codexUsageDialogError}
+        onRefresh={() => refreshDetail(codexUsageTarget?.id)}
+        onClose={() => {
+          codexUsageDialog.onFalse();
+          setCodexUsageTarget(null);
+        }}
+      />
     </>
   );
 }
@@ -1444,7 +1601,8 @@ ChannelTableRow.propTypes = {
   onRefresh: PropTypes.func,
   groupOptions: PropTypes.array,
   modelOptions: PropTypes.array,
-  prices: PropTypes.array
+  prices: PropTypes.array,
+  codexUsage: PropTypes.object
 };
 
 function renderBalance(type, balance) {
@@ -1457,3 +1615,9 @@ function renderBalance(type, balance) {
       return <>${balance.toFixed(2)}</>;
   }
 }
+
+CodexUsageInline.propTypes = {
+  snapshot: PropTypes.object,
+  onOpenDetails: PropTypes.func,
+  detailTitle: PropTypes.string
+};

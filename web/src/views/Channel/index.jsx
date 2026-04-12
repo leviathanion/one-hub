@@ -22,6 +22,7 @@ import { PAGE_SIZE_OPTIONS, getPageSize, savePageSize } from 'constants';
 import TableToolBar from './component/TableToolBar';
 import BatchModal from './component/BatchModal';
 import { useTranslation } from 'react-i18next';
+import { useCodexUsageStore } from './component/useCodexUsageStore';
 
 import { useBoolean } from 'hooks/use-boolean';
 import ConfirmDialog from 'ui-component/confirm-dialog';
@@ -95,6 +96,8 @@ export default function ChannelList() {
   const [editChannelId, setEditChannelId] = useState(0);
   const [openBatchModal, setOpenBatchModal] = useState(false);
   const [prices, setPrices] = useState([]);
+  const codexUsage = useCodexUsageStore();
+  const { prefetchPreviews, invalidateSnapshots } = codexUsage;
 
   const handleSort = (event, id) => {
     const isAsc = orderBy === id && order === 'asc';
@@ -319,6 +322,10 @@ export default function ChannelList() {
 
   const handleOkModal = (status) => {
     if (status === true) {
+      const updatedChannelId = editChannelId;
+      if (updatedChannelId > 0) {
+        invalidateSnapshots([updatedChannelId]);
+      }
       handleCloseModal();
       handleRefresh(false);
     }
@@ -385,6 +392,16 @@ export default function ChannelList() {
   useEffect(() => {
     fetchData(page, rowsPerPage, searchKeyword, order, orderBy);
   }, [page, rowsPerPage, searchKeyword, order, orderBy, refreshFlag]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+
+    if (Array.isArray(channels) && channels.length > 0) {
+      prefetchPreviews(channels, controller.signal).catch(() => undefined);
+    }
+
+    return () => controller.abort();
+  }, [channels, prefetchPreviews]);
 
   useEffect(() => {
     fetchGroups().then();
@@ -534,6 +551,7 @@ export default function ChannelList() {
                   onRefresh={handleRefresh}
                   modelOptions={modelOptions}
                   prices={prices}
+                  codexUsage={codexUsage}
                 />
               ))}
             </TableBody>
