@@ -154,6 +154,62 @@ export function formatCodexResetAt(windowData) {
   }
 }
 
+export function formatCodexResetCountdown(windowData, t, nowSeconds = Date.now() / 1000) {
+  if (typeof t !== 'function') {
+    return '--';
+  }
+
+  const resetInSeconds = readOptionalFiniteNumber(windowData?.resets_in_seconds);
+  const resetAt = readOptionalFiniteNumber(windowData?.resets_at);
+
+  let remainingSeconds = null;
+  if (resetAt != null && resetAt > 0) {
+    remainingSeconds = Math.ceil(resetAt - nowSeconds);
+  } else if (resetInSeconds != null) {
+    remainingSeconds = Math.ceil(resetInSeconds);
+  }
+
+  if (remainingSeconds == null) {
+    return '--';
+  }
+  if (remainingSeconds <= 0) {
+    return t('channel_row.codexResetReached');
+  }
+
+  const daySeconds = 24 * 60 * 60;
+  const hourSeconds = 60 * 60;
+  const minuteSeconds = 60;
+
+  if (remainingSeconds < minuteSeconds) {
+    return `${remainingSeconds}${t('channel_row.codexDurationSecondShort')}`;
+  }
+
+  if (remainingSeconds < hourSeconds) {
+    const minutes = Math.floor(remainingSeconds / minuteSeconds);
+    const seconds = remainingSeconds % minuteSeconds;
+    if (seconds === 0) {
+      return `${minutes}${t('channel_row.codexDurationMinuteShort')}`;
+    }
+    return `${minutes}${t('channel_row.codexDurationMinuteShort')} ${seconds}${t('channel_row.codexDurationSecondShort')}`;
+  }
+
+  if (remainingSeconds < daySeconds) {
+    const hours = Math.floor(remainingSeconds / hourSeconds);
+    const minutes = Math.floor((remainingSeconds % hourSeconds) / minuteSeconds);
+    if (minutes === 0) {
+      return `${hours}${t('channel_row.codexDurationHourShort')}`;
+    }
+    return `${hours}${t('channel_row.codexDurationHourShort')} ${minutes}${t('channel_row.codexDurationMinuteShort')}`;
+  }
+
+  const days = Math.floor(remainingSeconds / daySeconds);
+  const hours = Math.floor((remainingSeconds % daySeconds) / hourSeconds);
+  if (hours === 0) {
+    return `${days}${t('channel_row.codexDurationDayShort')}`;
+  }
+  return `${days}${t('channel_row.codexDurationDayShort')} ${hours}${t('channel_row.codexDurationHourShort')}`;
+}
+
 export function formatCodexFetchedAt(snapshot) {
   const fetchedAt = Number(snapshot?.fetched_at);
   if (!Number.isFinite(fetchedAt) || fetchedAt <= 0) {

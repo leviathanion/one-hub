@@ -1,4 +1,5 @@
 import PropTypes from 'prop-types';
+import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Icon } from '@iconify/react';
 
@@ -27,6 +28,7 @@ import {
   formatCodexFetchedAt,
   formatCodexPlanType,
   formatCodexResetAt,
+  formatCodexResetCountdown,
   formatCodexWindowSummary,
   getCodexUsageWindow,
   resolveCodexUsageRatio
@@ -55,7 +57,7 @@ function usageToneColor(theme, ratio) {
   return theme.palette.success.main;
 }
 
-function UsageWindowCard({ title, windowData }) {
+function UsageWindowCard({ t, title, windowData, nowSeconds }) {
   const ratio = resolveCodexUsageRatio(windowData);
   const progressValue = ratio == null ? 0 : Math.min(100, Math.max(0, ratio * 100));
   const ratioLabel = ratio == null ? '--' : `${Math.round(ratio * 100)}%`;
@@ -92,7 +94,10 @@ function UsageWindowCard({ title, windowData }) {
             {windowData ? `${windowData.window_seconds || '--'}s` : '--'}
           </Typography>
           <Typography variant="caption" color="text.secondary">
-            {formatCodexResetAt(windowData)}
+            {`${t('channel_row.codexResetTime')}: ${formatCodexResetAt(windowData)}`}
+          </Typography>
+          <Typography variant="caption" color="text.secondary">
+            {`${t('channel_row.codexResetIn')}: ${formatCodexResetCountdown(windowData, t, nowSeconds)}`}
           </Typography>
         </Stack>
       </Stack>
@@ -102,10 +107,26 @@ function UsageWindowCard({ title, windowData }) {
 
 export default function CodexUsageDialog({ open, record, snapshot, loading, errorText, onRefresh, onClose }) {
   const { t } = useTranslation();
+  const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1000));
   const statusMeta = usageStatusMeta(t, snapshot);
   const fiveHourWindow = getCodexUsageWindow(snapshot, 'five_hour');
   const weeklyWindow = getCodexUsageWindow(snapshot, 'weekly');
   const rawPayload = snapshot?.raw == null ? '' : typeof snapshot.raw === 'string' ? snapshot.raw : JSON.stringify(snapshot.raw, null, 2);
+
+  useEffect(() => {
+    if (!open) {
+      return undefined;
+    }
+
+    setNowSeconds(Math.floor(Date.now() / 1000));
+    const timer = window.setInterval(() => {
+      setNowSeconds(Math.floor(Date.now() / 1000));
+    }, 1000);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [open]);
 
   return (
     <Dialog open={open} onClose={onClose} fullWidth maxWidth="md">
@@ -176,10 +197,10 @@ export default function CodexUsageDialog({ open, record, snapshot, loading, erro
 
             <Grid container spacing={2}>
               <Grid item xs={12} md={6}>
-                <UsageWindowCard title={t('channel_row.codex5hWindow')} windowData={fiveHourWindow} />
+                <UsageWindowCard t={t} title={t('channel_row.codex5hWindow')} windowData={fiveHourWindow} nowSeconds={nowSeconds} />
               </Grid>
               <Grid item xs={12} md={6}>
-                <UsageWindowCard title={t('channel_row.codexWeeklyWindow')} windowData={weeklyWindow} />
+                <UsageWindowCard t={t} title={t('channel_row.codexWeeklyWindow')} windowData={weeklyWindow} nowSeconds={nowSeconds} />
               </Grid>
             </Grid>
 
@@ -225,6 +246,8 @@ CodexUsageDialog.propTypes = {
 };
 
 UsageWindowCard.propTypes = {
+  t: PropTypes.func,
   title: PropTypes.string,
-  windowData: PropTypes.object
+  windowData: PropTypes.object,
+  nowSeconds: PropTypes.number
 };
