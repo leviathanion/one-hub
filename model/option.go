@@ -8,6 +8,12 @@ import (
 	"time"
 )
 
+const (
+	automaticRecoverIntervalLegacyOptionKey = "AutomaticEnableChannelRecoverFrequency"
+	automaticRecoverEnabledOptionKey        = "AutomaticRecoverChannelsEnabled"
+	automaticRecoverIntervalOptionKey       = "AutomaticRecoverChannelsIntervalMinutes"
+)
+
 type Option struct {
 	Key   string `json:"key" gorm:"primaryKey"`
 	Value string `json:"value"`
@@ -37,6 +43,8 @@ func InitOptionMap() {
 	config.GlobalOption.RegisterBool("RegisterEnabled", &config.RegisterEnabled)
 	config.GlobalOption.RegisterBool("AutomaticDisableChannelEnabled", &config.AutomaticDisableChannelEnabled)
 	config.GlobalOption.RegisterBool("AutomaticEnableChannelEnabled", &config.AutomaticEnableChannelEnabled)
+	config.GlobalOption.RegisterBool(automaticRecoverEnabledOptionKey, &config.AutomaticRecoverChannelsEnabled)
+	config.GlobalOption.RegisterInt(automaticRecoverIntervalOptionKey, &config.AutomaticRecoverChannelsIntervalMinutes)
 	config.GlobalOption.RegisterBool("ApproximateTokenEnabled", &config.ApproximateTokenEnabled)
 	config.GlobalOption.RegisterBool("LogConsumeEnabled", &config.LogConsumeEnabled)
 	config.GlobalOption.RegisterBool("DisplayInCurrencyEnabled", &config.DisplayInCurrencyEnabled)
@@ -136,12 +144,45 @@ func InitOptionMap() {
 
 func loadOptionsFromDatabase() {
 	options, _ := AllOption()
+	options = migrateAutomaticRecoverOptions(options)
 	for _, option := range options {
 		err := config.GlobalOption.Set(option.Key, option.Value)
 		if err != nil {
 			logger.SysError("failed to update option map: " + err.Error())
 		}
 	}
+}
+
+func migrateAutomaticRecoverOptions(options []*Option) []*Option {
+	optionByKey := make(map[string]*Option, len(options))
+	for _, option := range options {
+		optionByKey[option.Key] = option
+	}
+
+	if _, exists := optionByKey[automaticRecoverIntervalOptionKey]; exists {
+		return options
+	}
+
+	legacyOption, exists := optionByKey[automaticRecoverIntervalLegacyOptionKey]
+	if !exists || legacyOption.Value == "" {
+		return options
+	}
+
+	migratedOption := &Option{
+		Key:   automaticRecoverIntervalOptionKey,
+		Value: legacyOption.Value,
+	}
+	if err := DB.Save(migratedOption).Error; err != nil {
+		if logger.Logger != nil {
+			logger.SysError("failed to migrate automatic recover interval option: " + err.Error())
+		}
+		return append(options, migratedOption)
+	}
+
+	if logger.Logger != nil {
+		logger.SysLog("migrated legacy automatic recover interval option to AutomaticRecoverChannelsIntervalMinutes")
+	}
+	return append(options, migratedOption)
 }
 
 func SyncOptions(frequency int) {

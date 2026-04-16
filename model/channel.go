@@ -180,6 +180,12 @@ func GetChannelsByTypeAndStatus(channelType int, status int) ([]*Channel, error)
 	return channels, err
 }
 
+func GetChannelsByStatus(status int) ([]*Channel, error) {
+	var channels []*Channel
+	err := DB.Where("status = ?", status).Order("id desc").Find(&channels).Error
+	return channels, err
+}
+
 func GetChannelsByIDs(ids []int) ([]*Channel, error) {
 	var channels []*Channel
 	if len(ids) == 0 {
@@ -593,18 +599,51 @@ func (channel *Channel) StatusToStr() string {
 	return "禁用"
 }
 
-func UpdateChannelStatusById(id int, status int) {
+func updateChannelStatus(id int, targetStatus int, applyScope func(*gorm.DB) *gorm.DB) (bool, error) {
 	tx := DB.Begin()
-	err := tx.Model(&Channel{}).Where("id = ?", id).Update("status", status).Error
-	if err != nil {
-		logger.SysError("failed to update channel status: " + err.Error())
-		tx.Rollback()
-		return
+	if tx.Error != nil {
+		logger.SysError("failed to begin channel status update transaction: " + tx.Error.Error())
+		return false, tx.Error
 	}
 
-	tx.Commit()
+	query := tx.Model(&Channel{}).Where("id = ?", id)
+	if applyScope != nil {
+		query = applyScope(query)
+	}
 
-	go ChannelGroup.ChangeStatus(id, status == config.ChannelStatusEnabled)
+	result := query.Update("status", targetStatus)
+	if result.Error != nil {
+		logger.SysError("failed to update channel status: " + result.Error.Error())
+		tx.Rollback()
+		return false, result.Error
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		logger.SysError("failed to commit channel status update: " + err.Error())
+		return false, err
+	}
+
+	updated := result.RowsAffected > 0
+	if updated {
+		go ChannelGroup.ChangeStatus(id, targetStatus == config.ChannelStatusEnabled)
+	}
+
+	return updated, nil
+}
+
+func UpdateChannelStatusById(id int, status int) {
+	if _, err := updateChannelStatus(id, status, nil); err != nil {
+		return
+	}
+}
+
+// Automatic background probes must not override an operator's manual state change.
+// Compare-and-set keeps that trade-off explicit: we may skip a stale recovery/disable
+// result, but we never silently rewrite a newer status chosen by an admin.
+func UpdateChannelStatusIfCurrent(id int, currentStatus int, targetStatus int) (bool, error) {
+	return updateChannelStatus(id, targetStatus, func(db *gorm.DB) *gorm.DB {
+		return db.Where("status = ?", currentStatus)
+	})
 }
 
 func UpdateChannelUsedQuota(id int, quota int) {

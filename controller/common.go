@@ -70,6 +70,21 @@ func DisableChannel(channelId int, channelName string, reason string, sendNotify
 	notify.Send(subject, content)
 }
 
+func AutoDisableChannel(channelId int, channelName string, reason string, sendNotify bool) (bool, error) {
+	updated, err := model.UpdateChannelStatusIfCurrent(channelId, config.ChannelStatusEnabled, config.ChannelStatusAutoDisabled)
+	if err != nil || !updated {
+		return updated, err
+	}
+	if !sendNotify {
+		return true, nil
+	}
+
+	subject := fmt.Sprintf("通道「%s」（#%d）已被禁用", channelName, channelId)
+	content := fmt.Sprintf("通道「%s」（#%d）已被禁用，原因：%s", channelName, channelId, reason)
+	notify.Send(subject, content)
+	return true, nil
+}
+
 // enable & notify
 func EnableChannel(channelId int, channelName string, sendNotify bool) {
 	model.UpdateChannelStatusById(channelId, config.ChannelStatusEnabled)
@@ -80,6 +95,21 @@ func EnableChannel(channelId int, channelName string, sendNotify bool) {
 	subject := fmt.Sprintf("通道「%s」（#%d）已被启用", channelName, channelId)
 	content := fmt.Sprintf("通道「%s」（#%d）已被启用", channelName, channelId)
 	notify.Send(subject, content)
+}
+
+func AutoEnableChannel(channelId int, channelName string, sendNotify bool) (bool, error) {
+	updated, err := model.UpdateChannelStatusIfCurrent(channelId, config.ChannelStatusAutoDisabled, config.ChannelStatusEnabled)
+	if err != nil || !updated {
+		return updated, err
+	}
+	if !sendNotify {
+		return true, nil
+	}
+
+	subject := fmt.Sprintf("通道「%s」（#%d）已被启用", channelName, channelId)
+	content := fmt.Sprintf("通道「%s」（#%d）已被启用", channelName, channelId)
+	notify.Send(subject, content)
+	return true, nil
 }
 
 func RelayNotFound(c *gin.Context) {

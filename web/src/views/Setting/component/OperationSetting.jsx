@@ -1,4 +1,4 @@
-import {useContext, useEffect, useState} from 'react';
+import { useContext, useEffect, useState } from 'react';
 import SubCard from 'ui-component/cards/SubCard';
 import {
   Alert,
@@ -14,18 +14,18 @@ import {
   Stack,
   TextField
 } from '@mui/material';
-import {showError, showSuccess, verifyJSON} from 'utils/common';
-import {API} from 'utils/api';
-import {AdapterDayjs} from '@mui/x-date-pickers/AdapterDayjs';
-import {LocalizationProvider} from '@mui/x-date-pickers/LocalizationProvider';
-import {DatePicker} from '@mui/x-date-pickers/DatePicker';
+import { showError, showSuccess, verifyJSON } from 'utils/common';
+import { API } from 'utils/api';
+import { AdapterDayjs } from '@mui/x-date-pickers/AdapterDayjs';
+import { LocalizationProvider } from '@mui/x-date-pickers/LocalizationProvider';
+import { DatePicker } from '@mui/x-date-pickers/DatePicker';
 import ChatLinksDataGrid from './ChatLinksDataGrid';
 import dayjs from 'dayjs';
-import {LoadStatusContext} from 'contexts/StatusContext';
-import {useTranslation} from 'react-i18next';
+import { LoadStatusContext } from 'contexts/StatusContext';
+import { useTranslation } from 'react-i18next';
 import 'dayjs/locale/zh-cn';
-import {DateTimePicker} from '@mui/x-date-pickers';
-import {useSelector} from 'react-redux';
+import { DateTimePicker } from '@mui/x-date-pickers';
+import { useSelector } from 'react-redux';
 
 const OperationSetting = () => {
   const { t } = useTranslation();
@@ -43,6 +43,8 @@ const OperationSetting = () => {
     QuotaPerUnit: 0,
     AutomaticDisableChannelEnabled: '',
     AutomaticEnableChannelEnabled: '',
+    AutomaticRecoverChannelsEnabled: '',
+    AutomaticRecoverChannelsIntervalMinutes: 10,
     ChannelDisableThreshold: 0,
     LogConsumeEnabled: '',
     DisplayInCurrencyEnabled: '',
@@ -140,15 +142,16 @@ const OperationSetting = () => {
     if (key.endsWith('Enabled')) {
       value = inputs[key] === 'true' ? 'false' : 'true';
     }
+    const normalizedValue = typeof value === 'number' || typeof value === 'boolean' ? String(value) : value;
 
     try {
       const res = await API.put('/api/option/', {
         key,
-        value
+        value: normalizedValue
       });
       const { success, message } = res.data;
       if (success) {
-        setInputs((inputs) => ({ ...inputs, [key]: value }));
+        setInputs((inputs) => ({ ...inputs, [key]: normalizedValue }));
         getOptions();
         await loadStatus();
       } else {
@@ -165,6 +168,13 @@ const OperationSetting = () => {
     let { name, value } = event.target;
 
     if (name.endsWith('Enabled')) {
+      if (name === 'AutomaticRecoverChannelsEnabled' && inputs[name] !== 'true' && Number(inputs.AutomaticRecoverChannelsIntervalMinutes) <= 0) {
+        const fallbackInterval = '10';
+        setInputs((prev) => ({ ...prev, AutomaticRecoverChannelsIntervalMinutes: fallbackInterval }));
+        if (originInputs['AutomaticRecoverChannelsIntervalMinutes'] !== fallbackInterval) {
+          await updateOption('AutomaticRecoverChannelsIntervalMinutes', fallbackInterval);
+        }
+      }
       await updateOption(name, value);
       showSuccess('设置成功！');
     } else {
@@ -185,11 +195,22 @@ const OperationSetting = () => {
     try {
       switch (group) {
         case 'monitor':
+          if (inputs.ChannelDisableThreshold < 0 || inputs.QuotaRemindThreshold < 0 || inputs.AutomaticRecoverChannelsIntervalMinutes < 0) {
+            showError('最长响应时间、额度提醒阈值、自动恢复探测间隔不能为负数');
+            return;
+          }
+          if (inputs.AutomaticRecoverChannelsEnabled === 'true' && inputs.AutomaticRecoverChannelsIntervalMinutes <= 0) {
+            showError('后台自动恢复探测已开启时，探测间隔必须大于 0');
+            return;
+          }
           if (originInputs['ChannelDisableThreshold'] !== inputs.ChannelDisableThreshold) {
             await updateOption('ChannelDisableThreshold', inputs.ChannelDisableThreshold);
           }
           if (originInputs['QuotaRemindThreshold'] !== inputs.QuotaRemindThreshold) {
             await updateOption('QuotaRemindThreshold', inputs.QuotaRemindThreshold);
+          }
+          if (originInputs['AutomaticRecoverChannelsIntervalMinutes'] !== inputs.AutomaticRecoverChannelsIntervalMinutes) {
+            await updateOption('AutomaticRecoverChannelsIntervalMinutes', inputs.AutomaticRecoverChannelsIntervalMinutes);
           }
           break;
         case 'chatlinks':
@@ -677,6 +698,21 @@ const OperationSetting = () => {
               />
             </FormControl>
             <FormControl fullWidth>
+              <InputLabel htmlFor="AutomaticRecoverChannelsIntervalMinutes">
+                {t('setting_index.operationSettings.monitoringSettings.automaticRecoverChannelsIntervalMinutes.label')}
+              </InputLabel>
+              <OutlinedInput
+                id="AutomaticRecoverChannelsIntervalMinutes"
+                name="AutomaticRecoverChannelsIntervalMinutes"
+                type="number"
+                value={inputs.AutomaticRecoverChannelsIntervalMinutes}
+                onChange={handleInputChange}
+                label={t('setting_index.operationSettings.monitoringSettings.automaticRecoverChannelsIntervalMinutes.label')}
+                placeholder={t('setting_index.operationSettings.monitoringSettings.automaticRecoverChannelsIntervalMinutes.placeholder')}
+                disabled={loading || inputs.AutomaticRecoverChannelsEnabled !== 'true'}
+              />
+            </FormControl>
+            <FormControl fullWidth>
               <InputLabel htmlFor="QuotaRemindThreshold">
                 {t('setting_index.operationSettings.monitoringSettings.quotaRemindThreshold.label')}
               </InputLabel>
@@ -712,6 +748,18 @@ const OperationSetting = () => {
               />
             }
           />
+          <FormControlLabel
+            label={t('setting_index.operationSettings.monitoringSettings.automaticRecoverChannels')}
+            control={
+              <Checkbox
+                checked={inputs.AutomaticRecoverChannelsEnabled === 'true'}
+                onChange={handleInputChange}
+                name="AutomaticRecoverChannelsEnabled"
+              />
+            }
+          />
+          <Alert severity="info">{t('setting_index.operationSettings.monitoringSettings.automaticEnableChannelTip')}</Alert>
+          <Alert severity="warning">{t('setting_index.operationSettings.monitoringSettings.automaticRecoverChannelsTip')}</Alert>
           <Button
             variant="contained"
             onClick={() => {

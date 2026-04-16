@@ -231,6 +231,64 @@ func TestUpdateChannelKeyClearsCodexDerivedCaches(t *testing.T) {
 	assertChannelDerivedCachesCleared(t, 1)
 }
 
+func TestUpdateChannelStatusIfCurrentUpdatesMatchingStatus(t *testing.T) {
+	useTestChannelDB(t)
+
+	insertTestChannel(t, &Channel{
+		Id:     1,
+		Status: config.ChannelStatusAutoDisabled,
+		Name:   "status-match",
+		Key:    "sk-match",
+		Group:  "default",
+		Models: "gpt-5",
+	})
+
+	updated, err := UpdateChannelStatusIfCurrent(1, config.ChannelStatusAutoDisabled, config.ChannelStatusEnabled)
+	if err != nil {
+		t.Fatalf("expected conditional status update to succeed, got %v", err)
+	}
+	if !updated {
+		t.Fatal("expected conditional status update to report a change")
+	}
+
+	channel, err := GetChannelById(1)
+	if err != nil {
+		t.Fatalf("expected channel lookup to succeed, got %v", err)
+	}
+	if channel.Status != config.ChannelStatusEnabled {
+		t.Fatalf("expected matching conditional status update to persist, got %d", channel.Status)
+	}
+}
+
+func TestUpdateChannelStatusIfCurrentSkipsStaleStatus(t *testing.T) {
+	useTestChannelDB(t)
+
+	insertTestChannel(t, &Channel{
+		Id:     2,
+		Status: config.ChannelStatusManuallyDisabled,
+		Name:   "status-stale",
+		Key:    "sk-stale",
+		Group:  "default",
+		Models: "gpt-5",
+	})
+
+	updated, err := UpdateChannelStatusIfCurrent(2, config.ChannelStatusAutoDisabled, config.ChannelStatusEnabled)
+	if err != nil {
+		t.Fatalf("expected stale conditional status update to return cleanly, got %v", err)
+	}
+	if updated {
+		t.Fatal("expected stale conditional status update not to report a change")
+	}
+
+	channel, err := GetChannelById(2)
+	if err != nil {
+		t.Fatalf("expected channel lookup to succeed, got %v", err)
+	}
+	if channel.Status != config.ChannelStatusManuallyDisabled {
+		t.Fatalf("expected stale conditional status update to preserve manual status, got %d", channel.Status)
+	}
+}
+
 func TestChannelDeleteClearsCodexDerivedCaches(t *testing.T) {
 	useTestChannelDB(t)
 	cache.InitCacheManager()

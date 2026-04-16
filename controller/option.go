@@ -2,6 +2,7 @@ package controller
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"one-api/common/config"
 	commonredis "one-api/common/redis"
@@ -10,11 +11,30 @@ import (
 	"one-api/providers/codex"
 	runtimeaffinity "one-api/runtime/channelaffinity"
 	"one-api/safty"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 )
+
+type optionUpdateRequest struct {
+	Key   string `json:"key"`
+	Value any    `json:"value"`
+}
+
+func normalizeOptionValue(raw any) (string, error) {
+	switch value := raw.(type) {
+	case string:
+		return value, nil
+	case json.Number:
+		return value.String(), nil
+	case bool:
+		return strconv.FormatBool(value), nil
+	default:
+		return "", errors.New("unsupported option value type")
+	}
+}
 
 func GetOptions(c *gin.Context) {
 	var options []*model.Option
@@ -109,14 +129,36 @@ func GetExecutionSessionCache(c *gin.Context) {
 }
 
 func UpdateOption(c *gin.Context) {
-	var option model.Option
-	err := json.NewDecoder(c.Request.Body).Decode(&option)
+	var request optionUpdateRequest
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.UseNumber()
+	err := decoder.Decode(&request)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"message": "无效的参数",
 		})
 		return
+	}
+	value, err := normalizeOptionValue(request.Value)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": "无效的参数",
+		})
+		return
+	}
+	option := model.Option{
+		Key:   request.Key,
+		Value: value,
+	}
+	if option.Key == "AutomaticEnableChannelRecoverFrequency" {
+		option.Key = "AutomaticRecoverChannelsIntervalMinutes"
+	}
+	shouldResetAutomaticRecoverSchedule := false
+	if option.Key == "AutomaticRecoverChannelsEnabled" {
+		nextEnabled := option.Value == "true"
+		shouldResetAutomaticRecoverSchedule = nextEnabled != config.AutomaticRecoverChannelsEnabled
 	}
 	switch option.Key {
 	case "GitHubOAuthEnabled":
@@ -159,6 +201,37 @@ func UpdateOption(c *gin.Context) {
 			})
 			return
 		}
+	case "AutomaticRecoverChannelsEnabled":
+		if option.Value == "true" && config.AutomaticRecoverChannelsIntervalMinutes <= 0 {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "无法启用后台自动恢复探测，请先将探测间隔设置为大于 0 的分钟数！",
+			})
+			return
+		}
+	case "AutomaticRecoverChannelsIntervalMinutes":
+		interval, convErr := strconv.Atoi(option.Value)
+		if convErr != nil {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "自动恢复探测间隔必须是整数！",
+			})
+			return
+		}
+		if interval < 0 {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "自动恢复探测间隔不能为负数！",
+			})
+			return
+		}
+		if config.AutomaticRecoverChannelsEnabled && interval <= 0 {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "后台自动恢复探测已开启，探测间隔必须大于 0！",
+			})
+			return
+		}
 	}
 	err = model.UpdateOption(option.Key, option.Value)
 	if err != nil {
@@ -167,6 +240,12 @@ func UpdateOption(c *gin.Context) {
 			"message": err.Error(),
 		})
 		return
+	}
+	if shouldResetAutomaticRecoverSchedule {
+		// Only enablement transitions reset the schedule. The due check already
+		// uses the live interval value, and resetting on every interval change
+		// would make increasing the interval trigger an unexpected immediate probe.
+		resetAutomaticRecoverSchedule()
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,

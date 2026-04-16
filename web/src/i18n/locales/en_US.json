@@ -957,6 +957,13 @@
           "label": "Quota Reminder Threshold",
           "placeholder": "When below this quota, an email will be sent to remind the user"
         },
+        "automaticRecoverChannels": "Enable Background Auto-Recovery Probes",
+        "automaticRecoverChannelsIntervalMinutes": {
+          "label": "Auto-Recover Probe Interval",
+          "placeholder": "In minutes. Used only when background auto-recovery probes are enabled"
+        },
+        "automaticEnableChannelTip": "This only allows an auto-disabled channel to be re-enabled after an existing channel probe path already returned healthy. It does not start background probes by itself.",
+        "automaticRecoverChannelsTip": "When enabled, the server sends additional background probe requests to auto-disabled channels at a fixed interval and restores them only after a healthy result within the maximum response time. Channels without a test model are skipped, and this increases upstream request volume and potential cost.",
         "saveMonitoringSettings": "Save Monitoring Settings",
         "title": "Monitoring Settings"
       },

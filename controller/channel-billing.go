@@ -2,9 +2,11 @@ package controller
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"one-api/common/config"
+	"one-api/common/logger"
 	"one-api/model"
 	"one-api/providers"
 	providersBase "one-api/providers/base"
@@ -122,7 +124,9 @@ func updateAllChannelsBalance() error {
 		} else {
 			// err is nil & balance <= 0 means quota is used up
 			if balance <= 0 {
-				DisableChannel(channel.Id, channel.Name, "余额不足", true)
+				if _, err = AutoDisableChannel(channel.Id, channel.Name, "余额不足", true); err != nil {
+					logger.SysError(fmt.Sprintf("failed to auto disable channel #%d(%s): %s", channel.Id, channel.Name, err.Error()))
+				}
 			}
 		}
 		time.Sleep(config.RequestInterval)
