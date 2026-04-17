@@ -1029,6 +1029,33 @@
         "save": "無効なチャネルキーワード設定を保存します",
         "title": "チャネルキーワード設定を無効にする"
       },
+      "codexSettings": {
+        "title": "Codex 高度な設定",
+        "description": "これらの設定は個別の Codex チャネルではなく、グローバル option として保存されます。CodexRoutingHintSetting と ChannelAffinitySetting には JSON を直接入力でき、空欄の場合はバックエンドのデフォルト値に戻ります。待機時間の単位はどちらもミリ秒です。",
+        "preferredChannelWaitMilliseconds": {
+          "label": "優先チャネル待機時間（ミリ秒）",
+          "placeholder": "例：250"
+        },
+        "preferredChannelWaitPollMilliseconds": {
+          "label": "優先チャネルのポーリング待機時間（ミリ秒）",
+          "placeholder": "例：50"
+        },
+        "codexRoutingHintSetting": {
+          "label": "CodexRoutingHintSetting",
+          "placeholder": "{\n  \"prompt_cache_key_strategy\": \"auto\",\n  \"model_regex\": \"^gpt-5$\"\n}"
+        },
+        "channelAffinitySetting": {
+          "label": "ChannelAffinitySetting",
+          "placeholder": "{\n  \"enabled\": true,\n  \"default_ttl_seconds\": 3600,\n  \"max_entries\": 50000,\n  \"rules\": []\n}"
+        },
+        "errors": {
+          "invalidWaitMilliseconds": "優先チャネル待機時間は 0 以上の整数で入力してください",
+          "invalidWaitPollMilliseconds": "優先チャネルのポーリング待機時間は 0 以上の整数で入力してください",
+          "invalidRoutingHintJson": "CodexRoutingHintSetting は有効な JSON である必要があります",
+          "invalidChannelAffinityJson": "ChannelAffinitySetting は有効な JSON である必要があります"
+        },
+        "save": "Codex 高度な設定を保存"
+      },
       "safetySettings": {
         "title": "システムセキュリティ設定",
         "enableSafe": "プロンプトのセキュリティチェックを有効にする",
@@ -1076,6 +1103,17 @@
         "newVersion": "新しいバージョン",
         "viewGitHub": "GitHubで表示する"
       }
+    },
+    "secretOptions": {
+      "configured": "設定済み",
+      "notConfigured": "未設定",
+      "pendingReplace": "置き換え予定",
+      "pendingClear": "クリア予定",
+      "clear": "クリア",
+      "undoClear": "クリアを取り消す",
+      "replacePlaceholder": "空欄のままにすると現在のシークレットを保持します。新しい値を入力して保存すると置き換えられます",
+      "pendingClearPlaceholder": "保存するとこのシークレットはクリアされます",
+      "clearBlocked": "このシークレットをクリアする前に、まず {{feature}} をオフにするか、同じ保存操作で無効化してください。"
     },
     "systemSettings": {
       "configureEmailDomainWhitelist": {

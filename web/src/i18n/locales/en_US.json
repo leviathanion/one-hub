@@ -1041,6 +1041,33 @@
         "save": "Save disabled channel keyword settings",
         "title": "Disable channel keyword settings"
       },
+      "codexSettings": {
+        "title": "Codex Advanced Settings",
+        "description": "These settings are stored as global options rather than per-channel Codex configuration. CodexRoutingHintSetting and ChannelAffinitySetting accept raw JSON, and blank values fall back to backend defaults. Both wait values are in milliseconds.",
+        "preferredChannelWaitMilliseconds": {
+          "label": "Preferred Channel Wait (ms)",
+          "placeholder": "e.g. 250"
+        },
+        "preferredChannelWaitPollMilliseconds": {
+          "label": "Preferred Channel Poll Wait (ms)",
+          "placeholder": "e.g. 50"
+        },
+        "codexRoutingHintSetting": {
+          "label": "CodexRoutingHintSetting",
+          "placeholder": "{\n  \"prompt_cache_key_strategy\": \"auto\",\n  \"model_regex\": \"^gpt-5$\"\n}"
+        },
+        "channelAffinitySetting": {
+          "label": "ChannelAffinitySetting",
+          "placeholder": "{\n  \"enabled\": true,\n  \"default_ttl_seconds\": 3600,\n  \"max_entries\": 50000,\n  \"rules\": []\n}"
+        },
+        "errors": {
+          "invalidWaitMilliseconds": "Preferred channel wait must be a non-negative integer",
+          "invalidWaitPollMilliseconds": "Preferred channel poll wait must be a non-negative integer",
+          "invalidRoutingHintJson": "CodexRoutingHintSetting must be valid JSON",
+          "invalidChannelAffinityJson": "ChannelAffinitySetting must be valid JSON"
+        },
+        "save": "Save Codex Advanced Settings"
+      },
       "safetySettings": {
         "title": "System Safety Settings",
         "enableSafe": "Enable Prompt Safety Check",
@@ -1088,6 +1115,17 @@
         "newVersion": "New Version",
         "viewGitHub": "View on GitHub"
       }
+    },
+    "secretOptions": {
+      "configured": "Configured",
+      "notConfigured": "Not configured",
+      "pendingReplace": "Pending replace",
+      "pendingClear": "Pending clear",
+      "clear": "Clear",
+      "undoClear": "Undo clear",
+      "replacePlaceholder": "Leave blank to keep the current secret. Enter a new value and save to replace it",
+      "pendingClearPlaceholder": "This secret will be cleared after you save",
+      "clearBlocked": "Turn off {{feature}} first, or disable it in the same save before clearing this secret."
     },
     "systemSettings": {
       "configureEmailDomainWhitelist": {

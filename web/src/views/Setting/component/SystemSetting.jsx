@@ -23,47 +23,66 @@ import { API } from 'utils/api';
 import { createFilterOptions } from '@mui/material/Autocomplete';
 import { LoadStatusContext } from 'contexts/StatusContext';
 import { useTranslation } from 'react-i18next';
+import SecretOptionField from './SecretOptionField';
+import {
+  SYSTEM_SECRET_OPTION_KEYS,
+  buildSecretOptionUpdates,
+  createInitialSecretStates,
+  getSecretClearBlockedMessage,
+  mergeSecretStatesFromMeta,
+  markSecretOptionForClear,
+  resetSecretOptionAction,
+  updateSecretOptionDraft
+} from './secretOptionState.mjs';
+import {
+  buildSystemProviderSectionUpdates,
+  getSystemProviderSectionConfig,
+  SYSTEM_PROVIDER_TOGGLE_KEYS
+} from './systemProviderSections.mjs';
 
 const filter = createFilterOptions();
+const defaultInputs = {
+  PasswordLoginEnabled: '',
+  PasswordRegisterEnabled: '',
+  EmailVerificationEnabled: '',
+  GitHubOAuthEnabled: '',
+  GitHubClientId: '',
+  GitHubClientSecret: '',
+  GitHubOldIdCloseEnabled: '',
+  LarkAuthEnabled: '',
+  LarkClientId: '',
+  LarkClientSecret: '',
+  OIDCAuthEnabled: '',
+  OIDCClientId: '',
+  OIDCClientSecret: '',
+  OIDCIssuer: '',
+  OIDCScopes: '',
+  OIDCUsernameClaims: '',
+  Notice: '',
+  SMTPServer: '',
+  SMTPPort: '',
+  SMTPAccount: '',
+  SMTPFrom: '',
+  SMTPToken: '',
+  ServerAddress: '',
+  Footer: '',
+  WeChatAuthEnabled: '',
+  WeChatServerAddress: '',
+  WeChatServerToken: '',
+  WeChatAccountQRCodeImageURL: '',
+  TurnstileCheckEnabled: '',
+  TurnstileSiteKey: '',
+  TurnstileSecretKey: '',
+  RegisterEnabled: '',
+  EmailDomainRestrictionEnabled: '',
+  EmailDomainWhitelist: ''
+};
+
 const SystemSetting = () => {
   const { t } = useTranslation();
-  let [inputs, setInputs] = useState({
-    PasswordLoginEnabled: '',
-    PasswordRegisterEnabled: '',
-    EmailVerificationEnabled: '',
-    GitHubOAuthEnabled: '',
-    GitHubClientId: '',
-    GitHubClientSecret: '',
-    GitHubOldIdCloseEnabled: '',
-    LarkAuthEnabled: '',
-    LarkClientId: '',
-    LarkClientSecret: '',
-    OIDCAuthEnabled: '',
-    OIDCClientId: '',
-    OIDCClientSecret: '',
-    OIDCIssuer: '',
-    OIDCScopes: '',
-    OIDCUsernameClaims: '',
-    Notice: '',
-    SMTPServer: '',
-    SMTPPort: '',
-    SMTPAccount: '',
-    SMTPFrom: '',
-    SMTPToken: '',
-    ServerAddress: '',
-    Footer: '',
-    WeChatAuthEnabled: '',
-    WeChatServerAddress: '',
-    WeChatServerToken: '',
-    WeChatAccountQRCodeImageURL: '',
-    TurnstileCheckEnabled: '',
-    TurnstileSiteKey: '',
-    TurnstileSecretKey: '',
-    RegisterEnabled: '',
-    EmailDomainRestrictionEnabled: '',
-    EmailDomainWhitelist: []
-  });
+  let [inputs, setInputs] = useState(() => ({ ...defaultInputs, EmailDomainWhitelist: [] }));
   const [originInputs, setOriginInputs] = useState({});
+  const [secretStates, setSecretStates] = useState(() => createInitialSecretStates(SYSTEM_SECRET_OPTION_KEYS));
   let [loading, setLoading] = useState(false);
   const [EmailDomainWhitelist, setEmailDomainWhitelist] = useState([]);
   const [showPasswordWarningModal, setShowPasswordWarningModal] = useState(false);
@@ -72,19 +91,21 @@ const SystemSetting = () => {
   const getOptions = async () => {
     try {
       const res = await API.get('/api/option/');
-      const { success, message, data } = res.data;
+      const { success, message, data, meta } = res.data;
       if (success) {
-        let newInputs = {};
+        let newInputs = { ...defaultInputs };
         data.forEach((item) => {
           newInputs[item.key] = item.value;
         });
+        const emailDomains = (newInputs.EmailDomainWhitelist || '').split(',');
         setInputs({
           ...newInputs,
-          EmailDomainWhitelist: newInputs.EmailDomainWhitelist.split(',')
+          EmailDomainWhitelist: emailDomains
         });
         setOriginInputs(newInputs);
+        setSecretStates(mergeSecretStatesFromMeta(SYSTEM_SECRET_OPTION_KEYS, meta?.sensitive_options));
 
-        setEmailDomainWhitelist(newInputs.EmailDomainWhitelist.split(','));
+        setEmailDomainWhitelist(emailDomains);
       } else {
         showError(message);
       }
@@ -97,19 +118,29 @@ const SystemSetting = () => {
     getOptions().then();
   }, []);
 
+  const normalizeOptionPayloadValue = (value) => {
+    if (typeof value === 'number' || typeof value === 'boolean') {
+      return String(value);
+    }
+    return value;
+  };
+
+  const getRequestErrorMessage = (error, fallbackMessage) => {
+    return error?.response?.data?.message || error?.message || fallbackMessage;
+  };
+
+  const refreshSettings = async () => {
+    await getOptions();
+    await loadStatus();
+  };
+
   const updateOption = async (key, value) => {
     setLoading(true);
     switch (key) {
       case 'PasswordLoginEnabled':
       case 'PasswordRegisterEnabled':
       case 'EmailVerificationEnabled':
-      case 'GitHubOAuthEnabled':
       case 'GitHubOldIdCloseEnabled':
-      case 'WeChatAuthEnabled':
-      case 'LarkAuthEnabled':
-      case 'OIDCAuthEnabled':
-      case 'TurnstileCheckEnabled':
-      case 'EmailDomainRestrictionEnabled':
       case 'RegisterEnabled':
         value = inputs[key] === 'true' ? 'false' : 'true';
         break;
@@ -120,7 +151,7 @@ const SystemSetting = () => {
     try {
       const res = await API.put('/api/option/', {
         key,
-        value
+        value: normalizeOptionPayloadValue(value)
       });
       const { success, message } = res.data;
       if (success) {
@@ -131,18 +162,132 @@ const SystemSetting = () => {
           ...inputs,
           [key]: value
         }));
-        getOptions();
-        await loadStatus();
+        await refreshSettings();
         showSuccess('设置成功！');
       } else {
         showError(message);
       }
     } catch (error) {
+      showError(getRequestErrorMessage(error, '设置失败'));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const putOptionBatchOrThrow = async (updates) => {
+    try {
+      const res = await API.put('/api/option/batch', { updates });
+      const { success, message } = res.data;
+      if (!success) {
+        throw new Error(message || '设置失败');
+      }
+    } catch (error) {
+      throw new Error(getRequestErrorMessage(error, '设置失败'));
+    }
+  };
+
+  const buildBatchUpdates = (keys, options = {}, sourceInputs = inputs) => {
+    const { transformers = {} } = options;
+
+    return keys.flatMap((key) => {
+      const transform = transformers[key];
+      const nextValue = transform ? transform(sourceInputs[key]) : sourceInputs[key];
+
+      if (originInputs[key] === nextValue) {
+        return [];
+      }
+
+      return [
+        {
+          key,
+          value: normalizeOptionPayloadValue(nextValue)
+        }
+      ];
+    });
+  };
+
+  const assertSecretUpdatesAllowed = (secretKeys = [], sourceInputs = inputs) => {
+    for (const key of secretKeys) {
+      const blockedMessage = getSecretClearBlockedMessage(key, sourceInputs, t);
+      if (blockedMessage && buildSecretOptionUpdates([key], secretStates).some((update) => update.value === '')) {
+        throw new Error(blockedMessage);
+      }
+    }
+  };
+
+  const submitPreparedUpdates = async (updates, options = {}) => {
+    const { secretKeys = [], sourceInputs = inputs } = options;
+
+    setLoading(true);
+    try {
+      assertSecretUpdatesAllowed(secretKeys, sourceInputs);
+      if (updates.length > 0) {
+        await putOptionBatchOrThrow(updates);
+      }
+      await refreshSettings();
+      showSuccess('设置成功！');
+    } catch (error) {
+      showError(error.message || '设置失败');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const submitOptionBatch = async (keys, options = {}, sourceInputs = inputs) => {
+    const secretKeys = options.secretKeys || [];
+    const regularKeys = keys.filter((key) => !secretKeys.includes(key));
+    const updates = [...buildBatchUpdates(regularKeys, options, sourceInputs), ...buildSecretOptionUpdates(secretKeys, secretStates)];
+
+    await submitPreparedUpdates(updates, { secretKeys, sourceInputs });
+  };
+
+  const submitProviderSection = async (toggleKey, sourceInputs = inputs) => {
+    const sectionConfig = getSystemProviderSectionConfig(toggleKey);
+    if (!sectionConfig) {
+      showError('设置失败');
       return;
     }
 
-    setLoading(false);
+    const updates = buildSystemProviderSectionUpdates(sectionConfig, {
+      originInputs,
+      sourceInputs,
+      secretStates,
+      normalizeOptionPayloadValue
+    });
+
+    await submitPreparedUpdates(updates, {
+      secretKeys: sectionConfig.secretKeys,
+      sourceInputs
+    });
   };
+
+  const deferredBooleanFields = new Set(['EmailDomainRestrictionEnabled', ...SYSTEM_PROVIDER_TOGGLE_KEYS]);
+
+  const deferredFields = new Set([
+    'Notice',
+    'ServerAddress',
+    'SMTPServer',
+    'SMTPPort',
+    'SMTPAccount',
+    'SMTPFrom',
+    'SMTPToken',
+    'GitHubClientId',
+    'GitHubClientSecret',
+    'OIDCClientId',
+    'OIDCClientSecret',
+    'OIDCIssuer',
+    'OIDCScopes',
+    'OIDCUsernameClaims',
+    'WeChatServerAddress',
+    'WeChatServerToken',
+    'WeChatAccountQRCodeImageURL',
+    'TurnstileSiteKey',
+    'TurnstileSecretKey',
+    'EmailDomainWhitelist',
+    'LarkClientId',
+    'LarkClientSecret',
+    ...deferredBooleanFields
+  ]);
 
   const handleInputChange = async (event) => {
     let { name, value } = event.target;
@@ -152,26 +297,14 @@ const SystemSetting = () => {
       setShowPasswordWarningModal(true);
       return;
     }
-    if (
-      name === 'Notice' ||
-      name.startsWith('SMTP') ||
-      name === 'ServerAddress' ||
-      name === 'GitHubClientId' ||
-      name === 'GitHubClientSecret' ||
-      name === 'OIDCClientId' ||
-      name === 'OIDCClientSecret' ||
-      name === 'OIDCIssuer' ||
-      name === 'OIDCScopes' ||
-      name === 'OIDCUsernameClaims' ||
-      name === 'WeChatServerAddress' ||
-      name === 'WeChatServerToken' ||
-      name === 'WeChatAccountQRCodeImageURL' ||
-      name === 'TurnstileSiteKey' ||
-      name === 'TurnstileSecretKey' ||
-      name === 'EmailDomainWhitelist' ||
-      name === 'LarkClientId' ||
-      name === 'LarkClientSecret'
-    ) {
+    if (SYSTEM_SECRET_OPTION_KEYS.includes(name)) {
+      setSecretStates((prev) => updateSecretOptionDraft(prev, name, value));
+      return;
+    }
+    if (deferredFields.has(name)) {
+      if (deferredBooleanFields.has(name)) {
+        value = inputs[name] === 'true' ? 'false' : 'true';
+      }
       setInputs((inputs) => ({ ...inputs, [name]: value }));
     } else {
       await updateOption(name, value);
@@ -179,92 +312,38 @@ const SystemSetting = () => {
   };
 
   const submitServerAddress = async () => {
-    let ServerAddress = removeTrailingSlash(inputs.ServerAddress);
-    await updateOption('ServerAddress', ServerAddress);
+    await submitOptionBatch(['ServerAddress'], {
+      transformers: {
+        ServerAddress: (value) => removeTrailingSlash(value)
+      }
+    });
   };
 
   const submitSMTP = async () => {
-    if (originInputs['SMTPServer'] !== inputs.SMTPServer) {
-      await updateOption('SMTPServer', inputs.SMTPServer);
-    }
-    if (originInputs['SMTPAccount'] !== inputs.SMTPAccount) {
-      await updateOption('SMTPAccount', inputs.SMTPAccount);
-    }
-    if (originInputs['SMTPFrom'] !== inputs.SMTPFrom) {
-      await updateOption('SMTPFrom', inputs.SMTPFrom);
-    }
-    if (originInputs['SMTPPort'] !== inputs.SMTPPort && inputs.SMTPPort !== '') {
-      await updateOption('SMTPPort', inputs.SMTPPort);
-    }
-    if (originInputs['SMTPToken'] !== inputs.SMTPToken && inputs.SMTPToken !== '') {
-      await updateOption('SMTPToken', inputs.SMTPToken);
-    }
+    await submitOptionBatch(['SMTPServer', 'SMTPAccount', 'SMTPFrom', 'SMTPPort', 'SMTPToken'], {
+      secretKeys: ['SMTPToken']
+    });
   };
 
   const submitEmailDomainWhitelist = async () => {
-    await updateOption('EmailDomainWhitelist', inputs.EmailDomainWhitelist.join(','));
+    await submitOptionBatch(['EmailDomainRestrictionEnabled', 'EmailDomainWhitelist'], {
+      transformers: {
+        EmailDomainWhitelist: (value) => value.join(',')
+      }
+    });
   };
 
-  const submitWeChat = async () => {
-    if (originInputs['WeChatServerAddress'] !== inputs.WeChatServerAddress) {
-      await updateOption('WeChatServerAddress', removeTrailingSlash(inputs.WeChatServerAddress));
+  const handleSecretClear = (key, sourceInputs = inputs) => {
+    const blockedMessage = getSecretClearBlockedMessage(key, sourceInputs, t);
+    if (blockedMessage) {
+      showError(blockedMessage);
+      return;
     }
-    if (originInputs['WeChatAccountQRCodeImageURL'] !== inputs.WeChatAccountQRCodeImageURL) {
-      await updateOption('WeChatAccountQRCodeImageURL', inputs.WeChatAccountQRCodeImageURL);
-    }
-    if (originInputs['WeChatServerToken'] !== inputs.WeChatServerToken && inputs.WeChatServerToken !== '') {
-      await updateOption('WeChatServerToken', inputs.WeChatServerToken);
-    }
+    setSecretStates((prev) => markSecretOptionForClear(prev, key));
   };
 
-  const submitGitHubOAuth = async () => {
-    if (originInputs['GitHubClientId'] !== inputs.GitHubClientId) {
-      await updateOption('GitHubClientId', inputs.GitHubClientId);
-    }
-    if (originInputs['GitHubClientSecret'] !== inputs.GitHubClientSecret && inputs.GitHubClientSecret !== '') {
-      await updateOption('GitHubClientSecret', inputs.GitHubClientSecret);
-    }
-  };
-
-  const submitOIDCOAuth = async () => {
-    // 检查并更新 OIDCClientId
-    if (originInputs['OIDCClientId'] !== inputs.OIDCClientId) {
-      await updateOption('OIDCClientId', inputs.OIDCClientId);
-    }
-    // 检查并更新 OIDCClientSecret
-    if (originInputs['OIDCClientSecret'] !== inputs.OIDCClientSecret && inputs.OIDCClientSecret !== '') {
-      await updateOption('OIDCClientSecret', inputs.OIDCClientSecret);
-    }
-    // 检查并更新 OIDCIssuer
-    if (originInputs['OIDCIssuer'] !== inputs.OIDCIssuer) {
-      await updateOption('OIDCIssuer', inputs.OIDCIssuer);
-    }
-    // 检查并更新 OIDCScopes
-    if (originInputs['OIDCScopes'] !== inputs.OIDCScopes) {
-      await updateOption('OIDCScopes', inputs.OIDCScopes);
-    }
-    // 检查并更新 OIDCUsernameClaims
-    if (originInputs['OIDCUsernameClaims'] !== inputs.OIDCUsernameClaims) {
-      await updateOption('OIDCUsernameClaims', inputs.OIDCUsernameClaims);
-    }
-  };
-
-  const submitTurnstile = async () => {
-    if (originInputs['TurnstileSiteKey'] !== inputs.TurnstileSiteKey) {
-      await updateOption('TurnstileSiteKey', inputs.TurnstileSiteKey);
-    }
-    if (originInputs['TurnstileSecretKey'] !== inputs.TurnstileSecretKey && inputs.TurnstileSecretKey !== '') {
-      await updateOption('TurnstileSecretKey', inputs.TurnstileSecretKey);
-    }
-  };
-
-  const submitLarkOAuth = async () => {
-    if (originInputs['LarkClientId'] !== inputs.LarkClientId) {
-      await updateOption('LarkClientId', inputs.LarkClientId);
-    }
-    if (originInputs['LarkClientSecret'] !== inputs.LarkClientSecret && inputs.LarkClientSecret !== '') {
-      await updateOption('LarkClientSecret', inputs.LarkClientSecret);
-    }
+  const handleSecretReset = (key) => {
+    setSecretStates((prev) => resetSecretOptionAction(prev, key));
   };
 
   return (
@@ -330,40 +409,8 @@ const SystemSetting = () => {
             </Grid>
             <Grid xs={12} md={3}>
               <FormControlLabel
-                label={t('setting_index.systemSettings.configureLoginRegister.gitHubOAuth')}
-                control={<Checkbox checked={inputs.GitHubOAuthEnabled === 'true'} onChange={handleInputChange} name="GitHubOAuthEnabled" />}
-              />
-            </Grid>
-            <Grid xs={12} md={3}>
-              <FormControlLabel
-                label={t('setting_index.systemSettings.configureLoginRegister.weChatAuth')}
-                control={<Checkbox checked={inputs.WeChatAuthEnabled === 'true'} onChange={handleInputChange} name="WeChatAuthEnabled" />}
-              />
-            </Grid>
-            <Grid xs={12} md={3}>
-              <FormControlLabel
-                label={t('setting_index.systemSettings.configureLoginRegister.larkAuth')}
-                control={<Checkbox checked={inputs.LarkAuthEnabled === 'true'} onChange={handleInputChange} name="LarkAuthEnabled" />}
-              />
-            </Grid>
-            <Grid xs={12} md={3}>
-              <FormControlLabel
-                label={t('setting_index.systemSettings.configureLoginRegister.oidcAuth')}
-                control={<Checkbox checked={inputs.OIDCAuthEnabled === 'true'} onChange={handleInputChange} name="OIDCAuthEnabled" />}
-              />
-            </Grid>
-            <Grid xs={12} md={3}>
-              <FormControlLabel
                 label={t('setting_index.systemSettings.configureLoginRegister.registerEnabled')}
                 control={<Checkbox checked={inputs.RegisterEnabled === 'true'} onChange={handleInputChange} name="RegisterEnabled" />}
-              />
-            </Grid>
-            <Grid xs={12} md={3}>
-              <FormControlLabel
-                label={t('setting_index.systemSettings.configureLoginRegister.turnstileCheck')}
-                control={
-                  <Checkbox checked={inputs.TurnstileCheckEnabled === 'true'} onChange={handleInputChange} name="TurnstileCheckEnabled" />
-                }
               />
             </Grid>
 
@@ -509,18 +556,18 @@ const SystemSetting = () => {
               </FormControl>
             </Grid>
             <Grid xs={12} md={4}>
-              <FormControl fullWidth>
-                <InputLabel htmlFor="SMTPToken">{t('setting_index.systemSettings.configureSMTP.smtpToken')}</InputLabel>
-                <OutlinedInput
-                  id="SMTPToken"
-                  name="SMTPToken"
-                  value={inputs.SMTPToken || ''}
-                  onChange={handleInputChange}
-                  label={t('setting_index.systemSettings.configureSMTP.smtpToken')}
-                  placeholder={t('setting_index.systemSettings.configureSMTP.smtpTokenPlaceholder')}
-                  disabled={loading}
-                />
-              </FormControl>
+              <SecretOptionField
+                id="SMTPToken"
+                name="SMTPToken"
+                label={t('setting_index.systemSettings.configureSMTP.smtpToken')}
+                placeholder={t('setting_index.systemSettings.configureSMTP.smtpTokenPlaceholder')}
+                secretState={secretStates.SMTPToken}
+                onChange={handleInputChange}
+                onClear={() => handleSecretClear('SMTPToken')}
+                onReset={() => handleSecretReset('SMTPToken')}
+                disabled={loading}
+                t={t}
+              />
             </Grid>
             <Grid xs={12}>
               <Button variant="contained" onClick={submitSMTP}>
@@ -545,6 +592,12 @@ const SystemSetting = () => {
         >
           <Grid container spacing={{ xs: 3, sm: 2, md: 4 }}>
             <Grid xs={12}>
+              <FormControlLabel
+                label={t('setting_index.systemSettings.configureLoginRegister.gitHubOAuth')}
+                control={<Checkbox checked={inputs.GitHubOAuthEnabled === 'true'} onChange={handleInputChange} name="GitHubOAuthEnabled" />}
+              />
+            </Grid>
+            <Grid xs={12}>
               <Alert severity="info" sx={{ wordWrap: 'break-word' }}>
                 {t('setting_index.systemSettings.configureGitHubOAuthApp.alert1')} <b>{inputs.ServerAddress}</b>
                 {t('setting_index.systemSettings.configureGitHubOAuthApp.alert2')} <b>{`${inputs.ServerAddress}/oauth/github`}</b>
@@ -565,23 +618,21 @@ const SystemSetting = () => {
               </FormControl>
             </Grid>
             <Grid xs={12} md={6}>
-              <FormControl fullWidth>
-                <InputLabel htmlFor="GitHubClientSecret">
-                  {t('setting_index.systemSettings.configureGitHubOAuthApp.clientSecret')}
-                </InputLabel>
-                <OutlinedInput
-                  id="GitHubClientSecret"
-                  name="GitHubClientSecret"
-                  value={inputs.GitHubClientSecret || ''}
-                  onChange={handleInputChange}
-                  label={t('setting_index.systemSettings.configureGitHubOAuthApp.clientSecret')}
-                  placeholder={t('setting_index.systemSettings.configureGitHubOAuthApp.clientSecretPlaceholder')}
-                  disabled={loading}
-                />
-              </FormControl>
+              <SecretOptionField
+                id="GitHubClientSecret"
+                name="GitHubClientSecret"
+                label={t('setting_index.systemSettings.configureGitHubOAuthApp.clientSecret')}
+                placeholder={t('setting_index.systemSettings.configureGitHubOAuthApp.clientSecretPlaceholder')}
+                secretState={secretStates.GitHubClientSecret}
+                onChange={handleInputChange}
+                onClear={() => handleSecretClear('GitHubClientSecret')}
+                onReset={() => handleSecretReset('GitHubClientSecret')}
+                disabled={loading}
+                t={t}
+              />
             </Grid>
             <Grid xs={12}>
-              <Button variant="contained" onClick={submitGitHubOAuth}>
+              <Button variant="contained" onClick={() => submitProviderSection('GitHubOAuthEnabled')}>
                 {t('setting_index.systemSettings.configureGitHubOAuthApp.saveButton')}
               </Button>
             </Grid>
@@ -601,6 +652,12 @@ const SystemSetting = () => {
           }
         >
           <Grid container spacing={{ xs: 3, sm: 2, md: 4 }}>
+            <Grid xs={12}>
+              <FormControlLabel
+                label={t('setting_index.systemSettings.configureLoginRegister.weChatAuth')}
+                control={<Checkbox checked={inputs.WeChatAuthEnabled === 'true'} onChange={handleInputChange} name="WeChatAuthEnabled" />}
+              />
+            </Grid>
             <Grid xs={12} md={4}>
               <FormControl fullWidth>
                 <InputLabel htmlFor="WeChatServerAddress">
@@ -618,18 +675,18 @@ const SystemSetting = () => {
               </FormControl>
             </Grid>
             <Grid xs={12} md={4}>
-              <FormControl fullWidth>
-                <InputLabel htmlFor="WeChatServerToken">{t('setting_index.systemSettings.configureWeChatServer.accessToken')}</InputLabel>
-                <OutlinedInput
-                  id="WeChatServerToken"
-                  name="WeChatServerToken"
-                  value={inputs.WeChatServerToken || ''}
-                  onChange={handleInputChange}
-                  label={t('setting_index.systemSettings.configureWeChatServer.accessToken')}
-                  placeholder={t('setting_index.systemSettings.configureWeChatServer.accessTokenPlaceholder')}
-                  disabled={loading}
-                />
-              </FormControl>
+              <SecretOptionField
+                id="WeChatServerToken"
+                name="WeChatServerToken"
+                label={t('setting_index.systemSettings.configureWeChatServer.accessToken')}
+                placeholder={t('setting_index.systemSettings.configureWeChatServer.accessTokenPlaceholder')}
+                secretState={secretStates.WeChatServerToken}
+                onChange={handleInputChange}
+                onClear={() => handleSecretClear('WeChatServerToken')}
+                onReset={() => handleSecretReset('WeChatServerToken')}
+                disabled={loading}
+                t={t}
+              />
             </Grid>
             <Grid xs={12} md={4}>
               <FormControl fullWidth>
@@ -648,7 +705,7 @@ const SystemSetting = () => {
               </FormControl>
             </Grid>
             <Grid xs={12}>
-              <Button variant="contained" onClick={submitWeChat}>
+              <Button variant="contained" onClick={() => submitProviderSection('WeChatAuthEnabled')}>
                 {t('setting_index.systemSettings.configureWeChatServer.saveButton')}
               </Button>
             </Grid>
@@ -670,6 +727,12 @@ const SystemSetting = () => {
         >
           <Grid container spacing={{ xs: 3, sm: 2, md: 4 }}>
             <Grid xs={12}>
+              <FormControlLabel
+                label={t('setting_index.systemSettings.configureLoginRegister.larkAuth')}
+                control={<Checkbox checked={inputs.LarkAuthEnabled === 'true'} onChange={handleInputChange} name="LarkAuthEnabled" />}
+              />
+            </Grid>
+            <Grid xs={12}>
               <Alert severity="info" sx={{ wordWrap: 'break-word' }}>
                 {t('setting_index.systemSettings.configureFeishuAuthorization.alert1')} <code>{inputs.ServerAddress}</code>
                 {t('setting_index.systemSettings.configureFeishuAuthorization.alert2')} <code>{`${inputs.ServerAddress}/oauth/lark`}</code>
@@ -690,23 +753,21 @@ const SystemSetting = () => {
               </FormControl>
             </Grid>
             <Grid xs={12} md={6}>
-              <FormControl fullWidth>
-                <InputLabel htmlFor="LarkClientSecret">
-                  {t('setting_index.systemSettings.configureFeishuAuthorization.appSecret')}
-                </InputLabel>
-                <OutlinedInput
-                  id="LarkClientSecret"
-                  name="LarkClientSecret"
-                  value={inputs.LarkClientSecret || ''}
-                  onChange={handleInputChange}
-                  label={t('setting_index.systemSettings.configureFeishuAuthorization.appSecret')}
-                  placeholder={t('setting_index.systemSettings.configureFeishuAuthorization.appSecretPlaceholder')}
-                  disabled={loading}
-                />
-              </FormControl>
+              <SecretOptionField
+                id="LarkClientSecret"
+                name="LarkClientSecret"
+                label={t('setting_index.systemSettings.configureFeishuAuthorization.appSecret')}
+                placeholder={t('setting_index.systemSettings.configureFeishuAuthorization.appSecretPlaceholder')}
+                secretState={secretStates.LarkClientSecret}
+                onChange={handleInputChange}
+                onClear={() => handleSecretClear('LarkClientSecret')}
+                onReset={() => handleSecretReset('LarkClientSecret')}
+                disabled={loading}
+                t={t}
+              />
             </Grid>
             <Grid xs={12}>
-              <Button variant="contained" onClick={submitLarkOAuth}>
+              <Button variant="contained" onClick={() => submitProviderSection('LarkAuthEnabled')}>
                 {t('setting_index.systemSettings.configureFeishuAuthorization.saveButton')}
               </Button>
             </Grid>
@@ -726,6 +787,14 @@ const SystemSetting = () => {
           }
         >
           <Grid container spacing={{ xs: 3, sm: 2, md: 4 }}>
+            <Grid xs={12}>
+              <FormControlLabel
+                label={t('setting_index.systemSettings.configureLoginRegister.turnstileCheck')}
+                control={
+                  <Checkbox checked={inputs.TurnstileCheckEnabled === 'true'} onChange={handleInputChange} name="TurnstileCheckEnabled" />
+                }
+              />
+            </Grid>
             <Grid xs={12} md={6}>
               <FormControl fullWidth>
                 <InputLabel htmlFor="TurnstileSiteKey">{t('setting_index.systemSettings.configureTurnstile.siteKey')}</InputLabel>
@@ -741,22 +810,21 @@ const SystemSetting = () => {
               </FormControl>
             </Grid>
             <Grid xs={12} md={6}>
-              <FormControl fullWidth>
-                <InputLabel htmlFor="TurnstileSecretKey">{t('setting_index.systemSettings.configureTurnstile.secretKey')}</InputLabel>
-                <OutlinedInput
-                  id="TurnstileSecretKey"
-                  name="TurnstileSecretKey"
-                  type="password"
-                  value={inputs.TurnstileSecretKey || ''}
-                  onChange={handleInputChange}
-                  label={t('setting_index.systemSettings.configureTurnstile.secretKey')}
-                  placeholder={t('setting_index.systemSettings.configureTurnstile.secretKeyPlaceholder')}
-                  disabled={loading}
-                />
-              </FormControl>
+              <SecretOptionField
+                id="TurnstileSecretKey"
+                name="TurnstileSecretKey"
+                label={t('setting_index.systemSettings.configureTurnstile.secretKey')}
+                placeholder={t('setting_index.systemSettings.configureTurnstile.secretKeyPlaceholder')}
+                secretState={secretStates.TurnstileSecretKey}
+                onChange={handleInputChange}
+                onClear={() => handleSecretClear('TurnstileSecretKey')}
+                onReset={() => handleSecretReset('TurnstileSecretKey')}
+                disabled={loading}
+                t={t}
+              />
             </Grid>
             <Grid xs={12}>
-              <Button variant="contained" onClick={submitTurnstile}>
+              <Button variant="contained" onClick={() => submitProviderSection('TurnstileCheckEnabled')}>
                 {t('setting_index.systemSettings.configureTurnstile.saveButton')}
               </Button>
             </Grid>
@@ -768,6 +836,12 @@ const SystemSetting = () => {
           subTitle={<span>{t('setting_index.systemSettings.configureOIDCAuthorization.subTitle')}</span>}
         >
           <Grid container spacing={{ xs: 3, sm: 2, md: 4 }}>
+            <Grid xs={12}>
+              <FormControlLabel
+                label={t('setting_index.systemSettings.configureLoginRegister.oidcAuth')}
+                control={<Checkbox checked={inputs.OIDCAuthEnabled === 'true'} onChange={handleInputChange} name="OIDCAuthEnabled" />}
+              />
+            </Grid>
             <Grid xs={12}>
               <Alert severity="info" sx={{ wordWrap: 'break-word' }}>
                 {t('setting_index.systemSettings.configureOIDCAuthorization.alert1')} <b>{inputs.ServerAddress}</b>
@@ -791,20 +865,18 @@ const SystemSetting = () => {
             </Grid>
 
             <Grid xs={12} md={6}>
-              <FormControl fullWidth>
-                <InputLabel htmlFor="OIDCClientSecret">
-                  {t('setting_index.systemSettings.configureOIDCAuthorization.clientSecret')}
-                </InputLabel>
-                <OutlinedInput
-                  id="OIDCClientSecret"
-                  name="OIDCClientSecret"
-                  value={inputs.OIDCClientSecret || ''}
-                  onChange={handleInputChange}
-                  label={t('setting_index.systemSettings.configureOIDCAuthorization.clientSecret')}
-                  placeholder={t('setting_index.systemSettings.configureOIDCAuthorization.clientSecretPlaceholder')}
-                  disabled={loading}
-                />
-              </FormControl>
+              <SecretOptionField
+                id="OIDCClientSecret"
+                name="OIDCClientSecret"
+                label={t('setting_index.systemSettings.configureOIDCAuthorization.clientSecret')}
+                placeholder={t('setting_index.systemSettings.configureOIDCAuthorization.clientSecretPlaceholder')}
+                secretState={secretStates.OIDCClientSecret}
+                onChange={handleInputChange}
+                onClear={() => handleSecretClear('OIDCClientSecret')}
+                onReset={() => handleSecretReset('OIDCClientSecret')}
+                disabled={loading}
+                t={t}
+              />
             </Grid>
 
             <Grid xs={12} md={6}>
@@ -855,7 +927,7 @@ const SystemSetting = () => {
             </Grid>
 
             <Grid xs={12}>
-              <Button variant="contained" onClick={submitOIDCOAuth}>
+              <Button variant="contained" onClick={() => submitProviderSection('OIDCAuthEnabled')}>
                 {t('setting_index.systemSettings.configureOIDCAuthorization.saveButton')}
               </Button>
             </Grid>

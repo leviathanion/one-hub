@@ -1031,6 +1031,33 @@
         "save": "保留停用通道關鍵字設置",
         "title": "停用通道關鍵詞設置"
       },
+      "codexSettings": {
+        "title": "Codex 高級配置",
+        "description": "這些配置走全局 option，不屬於單個 Codex 通道。CodexRoutingHintSetting 和 ChannelAffinitySetting 支持直接填寫 JSON，留空時會回到後端默認值。兩個等待時間單位都是毫秒。",
+        "preferredChannelWaitMilliseconds": {
+          "label": "首選通道等待時間（毫秒）",
+          "placeholder": "例如：250"
+        },
+        "preferredChannelWaitPollMilliseconds": {
+          "label": "首選通道輪詢等待時間（毫秒）",
+          "placeholder": "例如：50"
+        },
+        "codexRoutingHintSetting": {
+          "label": "CodexRoutingHintSetting",
+          "placeholder": "{\n  \"prompt_cache_key_strategy\": \"auto\",\n  \"model_regex\": \"^gpt-5$\"\n}"
+        },
+        "channelAffinitySetting": {
+          "label": "ChannelAffinitySetting",
+          "placeholder": "{\n  \"enabled\": true,\n  \"default_ttl_seconds\": 3600,\n  \"max_entries\": 50000,\n  \"rules\": []\n}"
+        },
+        "errors": {
+          "invalidWaitMilliseconds": "Codex 首選通道等待時間必須是非負整數",
+          "invalidWaitPollMilliseconds": "Codex 首選通道輪詢等待時間必須是非負整數",
+          "invalidRoutingHintJson": "CodexRoutingHintSetting 不是合法的 JSON 字符串",
+          "invalidChannelAffinityJson": "ChannelAffinitySetting 不是合法的 JSON 字符串"
+        },
+        "save": "保存 Codex 高級配置"
+      },
       "safetySettings": {
         "title": "系統安全設置",
         "enableSafe": "開啟 Prompt 安全檢查",
@@ -1078,6 +1105,17 @@
         "newVersion": "新版本",
         "viewGitHub": "去 GitHub 查看"
       }
+    },
+    "secretOptions": {
+      "configured": "已配置",
+      "notConfigured": "未配置",
+      "pendingReplace": "待替換",
+      "pendingClear": "待清空",
+      "clear": "清空",
+      "undoClear": "撤銷清空",
+      "replacePlaceholder": "留空表示保持當前敏感值不變，輸入新值並保存後會替換",
+      "pendingClearPlaceholder": "保存後將清空該敏感值",
+      "clearBlocked": "請先關閉 {{feature}}，或在同一次保存中一起關閉後再清空該敏感值。"
     },
     "systemSettings": {
       "configureEmailDomainWhitelist": {

@@ -26,61 +26,92 @@ import { useTranslation } from 'react-i18next';
 import 'dayjs/locale/zh-cn';
 import { DateTimePicker } from '@mui/x-date-pickers';
 import { useSelector } from 'react-redux';
+import SecretOptionField from './SecretOptionField';
+import {
+  OPERATION_SECRET_OPTION_KEYS,
+  buildSecretOptionUpdates,
+  createInitialSecretStates,
+  mergeSecretStatesFromMeta,
+  markSecretOptionForClear,
+  resetSecretOptionAction,
+  updateSecretOptionDraft
+} from './secretOptionState.mjs';
+
+const defaultInputs = {
+  QuotaForNewUser: 0,
+  QuotaForInviter: 0,
+  QuotaForInvitee: 0,
+  QuotaRemindThreshold: 0,
+  PreConsumedQuota: 0,
+  TopUpLink: '',
+  ChatLink: '',
+  ChatLinks: '',
+  QuotaPerUnit: 0,
+  AutomaticDisableChannelEnabled: '',
+  AutomaticEnableChannelEnabled: '',
+  AutomaticRecoverChannelsEnabled: '',
+  AutomaticRecoverChannelsIntervalMinutes: 10,
+  ChannelDisableThreshold: 0,
+  LogConsumeEnabled: '',
+  DisplayInCurrencyEnabled: '',
+  ApproximateTokenEnabled: '',
+  RetryTimes: 0,
+  RetryTimeOut: 0,
+  RetryCooldownSeconds: 0,
+  MjNotifyEnabled: '',
+  ChatImageRequestProxy: '',
+  PaymentUSDRate: 0,
+  PaymentMinAmount: 1,
+  RechargeDiscount: '',
+  CFWorkerImageUrl: '',
+  CFWorkerImageKey: '',
+  ClaudeAPIEnabled: '',
+  GeminiAPIEnabled: '',
+  DisableChannelKeywords: '',
+  EnableSafe: '',
+  SafeToolName: '',
+  SafeKeyWords: '',
+  safeTools: [],
+  GeminiOpenThink: '',
+  CodexRoutingHintSetting: '',
+  ChannelAffinitySetting: '',
+  PreferredChannelWaitMilliseconds: 0,
+  PreferredChannelWaitPollMilliseconds: 50
+};
 
 const OperationSetting = () => {
   const { t } = useTranslation();
   const siteInfo = useSelector((state) => state.siteInfo);
   let now = new Date();
-  let [inputs, setInputs] = useState({
-    QuotaForNewUser: 0,
-    QuotaForInviter: 0,
-    QuotaForInvitee: 0,
-    QuotaRemindThreshold: 0,
-    PreConsumedQuota: 0,
-    TopUpLink: '',
-    ChatLink: '',
-    ChatLinks: '',
-    QuotaPerUnit: 0,
-    AutomaticDisableChannelEnabled: '',
-    AutomaticEnableChannelEnabled: '',
-    AutomaticRecoverChannelsEnabled: '',
-    AutomaticRecoverChannelsIntervalMinutes: 10,
-    ChannelDisableThreshold: 0,
-    LogConsumeEnabled: '',
-    DisplayInCurrencyEnabled: '',
-    ApproximateTokenEnabled: '',
-    RetryTimes: 0,
-    RetryTimeOut: 0,
-    RetryCooldownSeconds: 0,
-    MjNotifyEnabled: '',
-    ChatImageRequestProxy: '',
-    PaymentUSDRate: 0,
-    PaymentMinAmount: 1,
-    RechargeDiscount: '',
-    CFWorkerImageUrl: '',
-    CFWorkerImageKey: '',
-    ClaudeAPIEnabled: '',
-    GeminiAPIEnabled: '',
-    DisableChannelKeywords: '',
-    EnableSafe: '',
-    SafeToolName: '',
-    SafeKeyWords: '',
-    safeTools: [],
-    GeminiOpenThink: ''
-  });
+  let [inputs, setInputs] = useState(() => ({ ...defaultInputs }));
   const [originInputs, setOriginInputs] = useState({});
+  const [secretStates, setSecretStates] = useState(() => createInitialSecretStates(OPERATION_SECRET_OPTION_KEYS));
   let [loading, setLoading] = useState(false);
   let [historyTimestamp, setHistoryTimestamp] = useState(now.getTime() / 1000 - 30 * 24 * 3600); // a month ago new Date().getTime() / 1000 + 3600
   let [invoiceMonth, setInvoiceMonth] = useState(now.getTime()); // a month ago new Date().getTime() / 1000 + 3600
   const loadStatus = useContext(LoadStatusContext);
   const [safeToolsLoading, setSafeToolsLoading] = useState(true);
 
+  const formatJSONObjectOption = (value) => {
+    if (typeof value !== 'string') {
+      return value;
+    }
+    if (!value.trim() || !verifyJSON(value)) {
+      return value;
+    }
+    try {
+      return JSON.stringify(JSON.parse(value), null, 2);
+    } catch (error) {
+      return value;
+    }
+  };
+
   const getOptions = async () => {
     try {
       const res = await API.get('/api/option/');
-      const { success, message, data } = res.data;
+      const { success, message, data, meta } = res.data;
       if (success) {
-        let newInputs = { ...inputs }; // 保留现有的 inputs 内容，包括 safeTools
+        let newInputs = { ...defaultInputs };
         data.forEach((item) => {
           if (item.key === 'RechargeDiscount') {
             item.value = JSON.stringify(JSON.parse(item.value), null, 2);
@@ -92,11 +123,15 @@ const OperationSetting = () => {
               console.error('解析SafeKeyWords失败:', e);
             }
           }
+          if (item.key === 'CodexRoutingHintSetting' || item.key === 'ChannelAffinitySetting') {
+            item.value = formatJSONObjectOption(item.value);
+          }
           newInputs[item.key] = item.value;
         });
         // 确保不会覆盖 safeTools
         setInputs((prev) => ({ ...newInputs, safeTools: prev.safeTools }));
         setOriginInputs(newInputs);
+        setSecretStates(mergeSecretStatesFromMeta(OPERATION_SECRET_OPTION_KEYS, meta?.sensitive_options));
       } else {
         showError(message);
       }
@@ -135,14 +170,30 @@ const OperationSetting = () => {
       await getOptions();
     };
     initData();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const updateOption = async (key, value) => {
-    setLoading(true);
-    if (key.endsWith('Enabled')) {
-      value = inputs[key] === 'true' ? 'false' : 'true';
+  const normalizeOptionPayloadValue = (value) => {
+    if (typeof value === 'number' || typeof value === 'boolean') {
+      return String(value);
     }
-    const normalizedValue = typeof value === 'number' || typeof value === 'boolean' ? String(value) : value;
+    return value;
+  };
+
+  const getRequestErrorMessage = (error, fallbackMessage) => {
+    return error?.response?.data?.message || error?.message || fallbackMessage;
+  };
+
+  const refreshSettings = async (includeSafeTools = true) => {
+    if (includeSafeTools) {
+      await getSafeTools();
+    }
+    await getOptions();
+    await loadStatus();
+  };
+
+  const putOptionOrThrow = async (key, value) => {
+    const normalizedValue = normalizeOptionPayloadValue(value);
 
     try {
       const res = await API.put('/api/option/', {
@@ -150,33 +201,103 @@ const OperationSetting = () => {
         value: normalizedValue
       });
       const { success, message } = res.data;
-      if (success) {
-        setInputs((inputs) => ({ ...inputs, [key]: normalizedValue }));
-        getOptions();
-        await loadStatus();
-      } else {
-        showError(message);
+      if (!success) {
+        throw new Error(message || '保存失败');
       }
     } catch (error) {
-      return;
+      throw new Error(getRequestErrorMessage(error, '保存失败'));
+    }
+  };
+
+  const putOptionBatchOrThrow = async (updates) => {
+    try {
+      const res = await API.put('/api/option/batch', { updates });
+      const { success, message } = res.data;
+      if (!success) {
+        throw new Error(message || '保存失败');
+      }
+    } catch (error) {
+      throw new Error(getRequestErrorMessage(error, '保存失败'));
+    }
+  };
+
+  const buildOptionUpdates = (keys) => {
+    return keys
+      .filter((key) => originInputs[key] !== inputs[key])
+      .map((key) => ({
+        key,
+        value: normalizeOptionPayloadValue(inputs[key])
+      }));
+  };
+
+  const isNonNegativeIntegerString = (value) => /^(0|[1-9]\d*)$/.test(String(value ?? '').trim());
+
+  const validateCodexConfig = () => {
+    if (
+      originInputs.PreferredChannelWaitMilliseconds !== inputs.PreferredChannelWaitMilliseconds &&
+      !isNonNegativeIntegerString(inputs.PreferredChannelWaitMilliseconds)
+    ) {
+      throw new Error(t('setting_index.operationSettings.codexSettings.errors.invalidWaitMilliseconds'));
     }
 
-    setLoading(false);
+    if (
+      originInputs.PreferredChannelWaitPollMilliseconds !== inputs.PreferredChannelWaitPollMilliseconds &&
+      !isNonNegativeIntegerString(inputs.PreferredChannelWaitPollMilliseconds)
+    ) {
+      throw new Error(t('setting_index.operationSettings.codexSettings.errors.invalidWaitPollMilliseconds'));
+    }
+
+    if (
+      originInputs.CodexRoutingHintSetting !== inputs.CodexRoutingHintSetting &&
+      inputs.CodexRoutingHintSetting.trim() !== '' &&
+      !verifyJSON(inputs.CodexRoutingHintSetting)
+    ) {
+      throw new Error(t('setting_index.operationSettings.codexSettings.errors.invalidRoutingHintJson'));
+    }
+
+    if (
+      originInputs.ChannelAffinitySetting !== inputs.ChannelAffinitySetting &&
+      inputs.ChannelAffinitySetting.trim() !== '' &&
+      !verifyJSON(inputs.ChannelAffinitySetting)
+    ) {
+      throw new Error(t('setting_index.operationSettings.codexSettings.errors.invalidChannelAffinityJson'));
+    }
   };
 
   const handleInputChange = async (event) => {
     let { name, value } = event.target;
 
+    if (OPERATION_SECRET_OPTION_KEYS.includes(name)) {
+      setSecretStates((prev) => updateSecretOptionDraft(prev, name, value));
+      return;
+    }
     if (name.endsWith('Enabled')) {
-      if (name === 'AutomaticRecoverChannelsEnabled' && inputs[name] !== 'true' && Number(inputs.AutomaticRecoverChannelsIntervalMinutes) <= 0) {
-        const fallbackInterval = '10';
-        setInputs((prev) => ({ ...prev, AutomaticRecoverChannelsIntervalMinutes: fallbackInterval }));
-        if (originInputs['AutomaticRecoverChannelsIntervalMinutes'] !== fallbackInterval) {
-          await updateOption('AutomaticRecoverChannelsIntervalMinutes', fallbackInterval);
+      if (name === 'AutomaticRecoverChannelsEnabled') {
+        const nextValue = inputs[name] === 'true' ? 'false' : 'true';
+        const nextInputs = {
+          [name]: nextValue
+        };
+        if (nextValue === 'true' && Number(inputs.AutomaticRecoverChannelsIntervalMinutes) <= 0) {
+          nextInputs.AutomaticRecoverChannelsIntervalMinutes = '10';
         }
+        setInputs((prev) => ({
+          ...prev,
+          ...nextInputs
+        }));
+        return;
       }
-      await updateOption(name, value);
-      showSuccess('设置成功！');
+
+      setLoading(true);
+      try {
+        const nextValue = inputs[name] === 'true' ? 'false' : 'true';
+        await putOptionOrThrow(name, nextValue);
+        await refreshSettings(false);
+        showSuccess('设置成功！');
+      } catch (error) {
+        showError(error.message || '设置失败');
+      } finally {
+        setLoading(false);
+      }
     } else {
       setInputs((inputs) => ({ ...inputs, [name]: value }));
     }
@@ -204,13 +325,19 @@ const OperationSetting = () => {
             return;
           }
           if (originInputs['ChannelDisableThreshold'] !== inputs.ChannelDisableThreshold) {
-            await updateOption('ChannelDisableThreshold', inputs.ChannelDisableThreshold);
+            await putOptionOrThrow('ChannelDisableThreshold', inputs.ChannelDisableThreshold);
           }
           if (originInputs['QuotaRemindThreshold'] !== inputs.QuotaRemindThreshold) {
-            await updateOption('QuotaRemindThreshold', inputs.QuotaRemindThreshold);
+            await putOptionOrThrow('QuotaRemindThreshold', inputs.QuotaRemindThreshold);
           }
-          if (originInputs['AutomaticRecoverChannelsIntervalMinutes'] !== inputs.AutomaticRecoverChannelsIntervalMinutes) {
-            await updateOption('AutomaticRecoverChannelsIntervalMinutes', inputs.AutomaticRecoverChannelsIntervalMinutes);
+          {
+            const automaticRecoverUpdates = buildOptionUpdates([
+              'AutomaticRecoverChannelsEnabled',
+              'AutomaticRecoverChannelsIntervalMinutes'
+            ]);
+            if (automaticRecoverUpdates.length > 0) {
+              await putOptionBatchOrThrow(automaticRecoverUpdates);
+            }
           }
           break;
         case 'chatlinks':
@@ -219,21 +346,21 @@ const OperationSetting = () => {
               showError('links不是合法的 JSON 字符串');
               return;
             }
-            await updateOption('ChatLinks', inputs.ChatLinks);
+            await putOptionOrThrow('ChatLinks', inputs.ChatLinks);
           }
           break;
         case 'quota':
           if (originInputs['QuotaForNewUser'] !== inputs.QuotaForNewUser) {
-            await updateOption('QuotaForNewUser', inputs.QuotaForNewUser);
+            await putOptionOrThrow('QuotaForNewUser', inputs.QuotaForNewUser);
           }
           if (originInputs['QuotaForInvitee'] !== inputs.QuotaForInvitee) {
-            await updateOption('QuotaForInvitee', inputs.QuotaForInvitee);
+            await putOptionOrThrow('QuotaForInvitee', inputs.QuotaForInvitee);
           }
           if (originInputs['QuotaForInviter'] !== inputs.QuotaForInviter) {
-            await updateOption('QuotaForInviter', inputs.QuotaForInviter);
+            await putOptionOrThrow('QuotaForInviter', inputs.QuotaForInviter);
           }
           if (originInputs['PreConsumedQuota'] !== inputs.PreConsumedQuota) {
-            await updateOption('PreConsumedQuota', inputs.PreConsumedQuota);
+            await putOptionOrThrow('PreConsumedQuota', inputs.PreConsumedQuota);
           }
           break;
         case 'general':
@@ -243,44 +370,41 @@ const OperationSetting = () => {
           }
 
           if (originInputs['TopUpLink'] !== inputs.TopUpLink) {
-            await updateOption('TopUpLink', inputs.TopUpLink);
+            await putOptionOrThrow('TopUpLink', inputs.TopUpLink);
           }
           if (originInputs['ChatLink'] !== inputs.ChatLink) {
-            await updateOption('ChatLink', inputs.ChatLink);
+            await putOptionOrThrow('ChatLink', inputs.ChatLink);
           }
           if (originInputs['QuotaPerUnit'] !== inputs.QuotaPerUnit) {
-            await updateOption('QuotaPerUnit', inputs.QuotaPerUnit);
+            await putOptionOrThrow('QuotaPerUnit', inputs.QuotaPerUnit);
           }
           if (originInputs['RetryTimes'] !== inputs.RetryTimes) {
-            await updateOption('RetryTimes', inputs.RetryTimes);
+            await putOptionOrThrow('RetryTimes', inputs.RetryTimes);
           }
           if (originInputs['RetryCooldownSeconds'] !== inputs.RetryCooldownSeconds) {
-            await updateOption('RetryCooldownSeconds', inputs.RetryCooldownSeconds);
+            await putOptionOrThrow('RetryCooldownSeconds', inputs.RetryCooldownSeconds);
           }
           if (originInputs['RetryTimeOut'] !== inputs.RetryTimeOut) {
-            await updateOption('RetryTimeOut', inputs.RetryTimeOut);
+            await putOptionOrThrow('RetryTimeOut', inputs.RetryTimeOut);
           }
           break;
         case 'other':
-          if (originInputs['ChatImageRequestProxy'] !== inputs.ChatImageRequestProxy) {
-            await updateOption('ChatImageRequestProxy', inputs.ChatImageRequestProxy);
+          {
+            const updates = [
+              ...buildOptionUpdates(['ChatImageRequestProxy', 'CFWorkerImageUrl']),
+              ...buildSecretOptionUpdates(['CFWorkerImageKey'], secretStates)
+            ];
+            if (updates.length > 0) {
+              await putOptionBatchOrThrow(updates);
+            }
           }
-
-          if (originInputs['CFWorkerImageUrl'] !== inputs.CFWorkerImageUrl) {
-            await updateOption('CFWorkerImageUrl', inputs.CFWorkerImageUrl);
-          }
-
-          if (originInputs['CFWorkerImageKey'] !== inputs.CFWorkerImageKey) {
-            await updateOption('CFWorkerImageKey', inputs.CFWorkerImageKey);
-          }
-
           break;
         case 'payment':
           if (originInputs['PaymentUSDRate'] !== inputs.PaymentUSDRate) {
-            await updateOption('PaymentUSDRate', inputs.PaymentUSDRate);
+            await putOptionOrThrow('PaymentUSDRate', inputs.PaymentUSDRate);
           }
           if (originInputs['PaymentMinAmount'] !== inputs.PaymentMinAmount) {
-            await updateOption('PaymentMinAmount', inputs.PaymentMinAmount);
+            await putOptionOrThrow('PaymentMinAmount', inputs.PaymentMinAmount);
           }
           if (originInputs['RechargeDiscount'] !== inputs.RechargeDiscount) {
             try {
@@ -288,7 +412,7 @@ const OperationSetting = () => {
                 showError('固定金额充值折扣不是合法的 JSON 字符串');
                 return;
               }
-              await updateOption('RechargeDiscount', inputs.RechargeDiscount);
+              await putOptionOrThrow('RechargeDiscount', inputs.RechargeDiscount);
             } catch (error) {
               showError('固定金额充值折扣处理失败: ' + error.message);
               return;
@@ -298,19 +422,19 @@ const OperationSetting = () => {
         case 'DisableChannelKeywords':
           if (originInputs.DisableChannelKeywords !== inputs.DisableChannelKeywords) {
             // DisableChannelKeywords 已经是字符串格式，无需解析
-            await updateOption('DisableChannelKeywords', inputs.DisableChannelKeywords);
+            await putOptionOrThrow('DisableChannelKeywords', inputs.DisableChannelKeywords);
           }
           break;
         case 'safety':
           try {
             if (originInputs.EnableSafe !== inputs.EnableSafe) {
-              await updateOption('EnableSafe', inputs.EnableSafe);
+              await putOptionOrThrow('EnableSafe', inputs.EnableSafe);
             }
             if (originInputs.SafeToolName !== inputs.SafeToolName) {
-              await updateOption('SafeToolName', inputs.SafeToolName);
+              await putOptionOrThrow('SafeToolName', inputs.SafeToolName);
             }
             if (originInputs.SafeKeyWords !== inputs.SafeKeyWords) {
-              await updateOption('SafeKeyWords', inputs.SafeKeyWords);
+              await putOptionOrThrow('SafeKeyWords', inputs.SafeKeyWords);
             }
           } catch (error) {
             console.error('安全设置提交错误:', error);
@@ -325,13 +449,23 @@ const OperationSetting = () => {
               showError('GeminiOpenThink 不是合法的 JSON 字符串');
               return;
             }
-            await updateOption('GeminiOpenThink', inputs.GeminiOpenThink);
+            await putOptionOrThrow('GeminiOpenThink', inputs.GeminiOpenThink);
           }
+          break;
+        case 'codex':
+          validateCodexConfig();
+          await putOptionBatchOrThrow(
+            buildOptionUpdates([
+              'PreferredChannelWaitMilliseconds',
+              'PreferredChannelWaitPollMilliseconds',
+              'CodexRoutingHintSetting',
+              'ChannelAffinitySetting'
+            ])
+          );
           break;
       }
 
-      await getOptions();
-      await getSafeTools();
+      await refreshSettings();
       showSuccess('保存成功！');
     } catch (error) {
       showError('保存失败：' + (error.message || '未知错误'));
@@ -381,6 +515,14 @@ const OperationSetting = () => {
     } catch (error) {
       return;
     }
+  };
+
+  const handleSecretClear = (key) => {
+    setSecretStates((prev) => markSecretOptionForClear(prev, key));
+  };
+
+  const handleSecretReset = (key) => {
+    setSecretStates((prev) => resetSecretOptionAction(prev, key));
   };
 
   return (
@@ -557,18 +699,18 @@ const OperationSetting = () => {
               />
             </FormControl>
 
-            <FormControl>
-              <InputLabel htmlFor="CFWorkerImageKey">{t('setting_index.operationSettings.otherSettings.CFWorkerImageUrl.key')}</InputLabel>
-              <OutlinedInput
-                id="CFWorkerImageKey"
-                name="CFWorkerImageKey"
-                value={inputs.CFWorkerImageKey}
-                onChange={handleInputChange}
-                label={t('setting_index.operationSettings.otherSettings.CFWorkerImageUrl.key')}
-                placeholder={t('setting_index.operationSettings.otherSettings.CFWorkerImageUrl.key')}
-                disabled={loading}
-              />
-            </FormControl>
+            <SecretOptionField
+              id="CFWorkerImageKey"
+              name="CFWorkerImageKey"
+              label={t('setting_index.operationSettings.otherSettings.CFWorkerImageUrl.key')}
+              placeholder={t('setting_index.operationSettings.otherSettings.CFWorkerImageUrl.key')}
+              secretState={secretStates.CFWorkerImageKey}
+              onChange={handleInputChange}
+              onClear={() => handleSecretClear('CFWorkerImageKey')}
+              onReset={() => handleSecretReset('CFWorkerImageKey')}
+              disabled={loading}
+              t={t}
+            />
           </Stack>
           <Button
             variant="contained"
@@ -983,6 +1125,82 @@ const OperationSetting = () => {
               {t('setting_index.operationSettings.geminiSettings.save')}
             </Button>
           </Stack>
+        </Stack>
+      </SubCard>
+
+      <SubCard title={t('setting_index.operationSettings.codexSettings.title')}>
+        <Stack spacing={2}>
+          <Alert severity="info">{t('setting_index.operationSettings.codexSettings.description')}</Alert>
+          <Stack direction={{ sm: 'column', md: 'row' }} spacing={{ xs: 3, sm: 2, md: 4 }}>
+            <FormControl fullWidth>
+              <InputLabel htmlFor="PreferredChannelWaitMilliseconds">
+                {t('setting_index.operationSettings.codexSettings.preferredChannelWaitMilliseconds.label')}
+              </InputLabel>
+              <OutlinedInput
+                id="PreferredChannelWaitMilliseconds"
+                name="PreferredChannelWaitMilliseconds"
+                type="number"
+                value={inputs.PreferredChannelWaitMilliseconds}
+                onChange={handleInputChange}
+                label={t('setting_index.operationSettings.codexSettings.preferredChannelWaitMilliseconds.label')}
+                placeholder={t('setting_index.operationSettings.codexSettings.preferredChannelWaitMilliseconds.placeholder')}
+                inputProps={{ min: 0, step: 1, inputMode: 'numeric' }}
+                disabled={loading}
+              />
+            </FormControl>
+            <FormControl fullWidth>
+              <InputLabel htmlFor="PreferredChannelWaitPollMilliseconds">
+                {t('setting_index.operationSettings.codexSettings.preferredChannelWaitPollMilliseconds.label')}
+              </InputLabel>
+              <OutlinedInput
+                id="PreferredChannelWaitPollMilliseconds"
+                name="PreferredChannelWaitPollMilliseconds"
+                type="number"
+                value={inputs.PreferredChannelWaitPollMilliseconds}
+                onChange={handleInputChange}
+                label={t('setting_index.operationSettings.codexSettings.preferredChannelWaitPollMilliseconds.label')}
+                placeholder={t('setting_index.operationSettings.codexSettings.preferredChannelWaitPollMilliseconds.placeholder')}
+                inputProps={{ min: 0, step: 1, inputMode: 'numeric' }}
+                disabled={loading}
+              />
+            </FormControl>
+          </Stack>
+          <FormControl fullWidth>
+            <TextField
+              multiline
+              maxRows={20}
+              id="CodexRoutingHintSetting"
+              label={t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.label')}
+              value={inputs.CodexRoutingHintSetting}
+              name="CodexRoutingHintSetting"
+              onChange={handleTextFieldChange}
+              minRows={6}
+              placeholder={t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.placeholder')}
+              disabled={loading}
+            />
+          </FormControl>
+          <FormControl fullWidth>
+            <TextField
+              multiline
+              maxRows={24}
+              id="ChannelAffinitySetting"
+              label={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.label')}
+              value={inputs.ChannelAffinitySetting}
+              name="ChannelAffinitySetting"
+              onChange={handleTextFieldChange}
+              minRows={10}
+              placeholder={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.placeholder')}
+              disabled={loading}
+            />
+          </FormControl>
+          <Button
+            variant="contained"
+            onClick={() => {
+              submitConfig('codex').then();
+            }}
+          >
+            {t('setting_index.operationSettings.codexSettings.save')}
+          </Button>
         </Stack>
       </SubCard>
 
