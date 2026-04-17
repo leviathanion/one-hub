@@ -7,7 +7,7 @@ lastUpdated: true
 
 # Codex 渠道
 
-本文说明 `one-hub` 中 Codex 渠道的后台配置方式，以及 `channel.Other` 可选配置项。
+本文说明 `one-hub` 中 Codex 渠道的后台配置方式，以及 `channel.Other` 和全局 Codex 高级项的配置方法。
 
 多数用户只需要在 Web 后台完成配置：`渠道 -> 新建渠道 -> Codex`。本文优先按页面操作说明，再补充少量系统级注意事项。
 
@@ -104,22 +104,98 @@ Codex 渠道当前通过 OpenAI 兼容接口使用，支持以下路径：
 - `PreferredChannelWaitMilliseconds`
 - `PreferredChannelWaitPollMilliseconds`
 
-当前版本的 Web 后台没有为这些全局高级项提供专门输入框。大多数用户保持默认值即可。
+当前版本已经可以直接在 Web 后台配置这些项。页面入口是：
+
+- `设置 -> 运营设置 -> Codex 高级配置`
+
+这 4 项仍然属于根管理员全局选项，底层依旧走 `options` 表和 `/api/option/` 接口存储；前端页面只是把它们接到了现有全局选项保存链路上。
 
 如果你只是通过 Web 页面正常创建 Codex 渠道，一般不需要额外配置这些项。只有你明确要调优 Responses/Realtime 的渠道亲和、等待首选渠道回归等行为时，才需要额外调整。
 
 注意：按当前实现，这几项都属于根管理员全局选项，走 `options` 表和 `/api/option/` 接口存储，不是 `channel.Other`，也没有接入 `config.yaml` / 环境变量读取链路。也就是说，像 `CODEX_ROUTING_HINT_SETTING` 这样的环境变量当前不会生效。
 
+页面上这 4 个字段的填写方式如下：
+
+- `PreferredChannelWaitMilliseconds`
+  数字输入框，单位毫秒。表示在首选渠道暂时不可用时，是否额外等待它回归。
+- `PreferredChannelWaitPollMilliseconds`
+  数字输入框，单位毫秒。表示等待首选渠道期间的轮询间隔。
+- `CodexRoutingHintSetting`
+  JSON 文本框。用于控制 routing 层是否在 provider 选择前派生稳定的 hint，例如 Responses 的 `prompt_cache_key`。
+- `ChannelAffinitySetting`
+  JSON 文本框。用于控制渠道亲和缓存自身的开关、TTL、容量和规则。
+
+其中两个 JSON 文本框支持直接留空；留空时会回退到后端默认值。
+
+如果你完全不额外修改这 4 个全局项，当前默认等效于：
+
+- `PreferredChannelWaitMilliseconds: 0`
+- `PreferredChannelWaitPollMilliseconds: 50`
+- `CodexRoutingHintSetting`
+
+```json
+{
+  "prompt_cache_key_strategy": "off",
+  "model_regex": "",
+  "user_agent_regex": ""
+}
+```
+
+- `ChannelAffinitySetting`
+  等效于下文的“模板 1：默认推荐模板”，也就是当前代码内置默认值
+
+### `CodexRoutingHintSetting` 完整配置
+
+当前 `CodexRoutingHintSetting` 的完整字段如下：
+
+| 字段 | 是否必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `prompt_cache_key_strategy` | 否 | `off` | 控制 routing 层是否在 provider 选择前派生稳定的 `responses.prompt_cache_key` |
+| `model_regex` | 否 | 空 | 只对匹配该模型名正则的请求生效 |
+| `user_agent_regex` | 否 | 空 | 只对匹配该 `User-Agent` 正则的请求生效 |
+
+`prompt_cache_key_strategy` 当前支持的完整取值为：
+
+- `off`
+  默认值，不生成 routing hint。
+- `auto`
+  自动按优先级选稳定身份：`session_id` -> 外部认证头 -> token id -> user id。
+- `session_id`
+  固定按 `x-session-id` / `session_id` 派生。
+- `token_id`
+  固定按 one-hub token id 派生。
+- `user_id`
+  固定按 one-hub user id 派生。
+- `auth_header`
+  固定按外部认证头派生。
+
+完整默认值等效于：
+
+```json
+{
+  "prompt_cache_key_strategy": "off",
+  "model_regex": "",
+  "user_agent_regex": ""
+}
+```
+
 ### `CodexRoutingHintSetting` 怎么配置
 
 这是最容易被误解的一项，因为它名字像“系统配置”，但实际不是写进 `config.example.yaml` 的。
 
-当前正确的配置位置是：
+当前可用的配置位置是：
 
-1. 根管理员登录后的全局选项接口 `PUT /api/option/`
-2. 或者直接写数据库 `options` 表中的 `CodexRoutingHintSetting`
+1. 根管理员登录后的 Web 页面：`设置 -> 运营设置 -> Codex 高级配置`
+2. 根管理员登录后的全局选项接口 `PUT /api/option/`
+3. 直接写数据库 `options` 表中的 `CodexRoutingHintSetting`
+
+如果只是人工维护，优先用 Web 页面即可；只有批量变更、自动化部署或排障时，才更适合直接调接口或改库。
+
+如果要一次同时改多个互相关联的字段，优先用 `PUT /api/option/batch` 保证原子更新；`PUT /api/option/` 更适合单项调整，或在已有错误配置上逐项修复。
 
 它的值本身是一个 JSON 对象，但通过 `/api/option/` 提交时，`value` 字段仍然要用字符串传，也就是“JSON 字符串里再包一层 JSON”。
+
+如果你在 Web 页面里填写，则直接粘贴普通 JSON 即可，不需要再额外转义一层字符串。
 
 示例：把 Responses 的 pre-routing prompt cache affinity 打开，并只对 `gpt-5` 生效：
 
@@ -159,6 +235,469 @@ curl --request PUT \
   决定 Codex provider 最终向上游写什么 `prompt_cache_key`
 
 最佳实践是两个地方保持同一套策略，例如都用 `auto`。这样 routing 命中的 key 和最终写给上游的 key 会一致。
+
+### `ChannelAffinitySetting` 完整配置
+
+`ChannelAffinitySetting` 是分层 JSON，不只是顶层 4 个字段。当前完整结构如下。
+
+补充两个容易误解的行为：
+
+- `rules` 会按数组顺序依次评估
+  每条命中的规则都可能贡献 request binding / record-on-success recorder；如果某个 binding 已经命中历史 record，则第一个命中的 record 会成为本次请求的 preferred channel。
+- `include_group`、`include_model`、`include_path`、`include_rule_name`
+  这些字段不是“匹配条件”，而是“affinity key 分区条件”。打开后，同一个输入值会在不同 group / model / path / 规则名下生成不同的 affinity key，避免串用。
+
+顶层字段：
+
+| 字段 | 是否必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `enabled` | 否 | `true` | 全局总开关。`false` 时本次请求不会读取 affinity，也不会写回新的 affinity 记录 |
+| `default_ttl_seconds` | 否 | `3600` | 默认记录保留时长。某条规则未设置 `ttl_seconds`，或填了 `0/负数` 时，回退到这里 |
+| `max_entries` | 否 | `50000` | 本地内存 affinity 缓存的最大条目数，用于限制单机内存占用；若启用 Redis，Redis 仍会按各条记录自己的 TTL 维护 |
+| `rules` | 否 | 内置 3 条默认规则 | 规则列表。决定“哪些请求参与 affinity”“从请求里取哪个值做 affinity identity”“命中后采用什么复用/回写策略” |
+
+`rules[*]` 字段：
+
+| 字段 | 是否必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `name` | 建议填写 | 空 | 规则名。主要用于调试和 key 分区；当 `include_rule_name=true` 时会拼进 affinity key，让两条规则即使取到同一个值也互不污染 |
+| `enabled` | 否 | `false` | 规则开关。`false` 时该规则既不参与命中，也不会在成功后回写记录 |
+| `kind` | 是 | 空 | 规则适用的请求类型。`responses` 只匹配 `/v1/responses` 这类请求；`realtime` 只匹配 `/v1/realtime` |
+| `model_regex` | 否 | 空 | 请求模型名的过滤条件。只有模型名匹配正则时，这条规则才会参与评估 |
+| `path_regex` | 否 | 空 | 请求路径的过滤条件。用于把规则限制在某些 API 路径上，例如只作用于 `/v1/responses` |
+| `user_agent_regex` | 否 | 空 | 请求 `User-Agent` 的过滤条件。用于只对特定客户端打开 affinity |
+| `include_group` | 否 | `false` | 将当前 routing group 拼进 affinity key。适合不同 group 不应共享 affinity 的场景 |
+| `include_model` | 否 | `false` | 将模型名拼进 affinity key。适合不同模型即使带同一个 `prompt_cache_key` / `session_id` 也要隔离的场景 |
+| `include_path` | 否 | `false` | 将请求路径拼进 affinity key。适合相同 identity 在不同 API 路径下不应复用同一渠道的场景 |
+| `include_rule_name` | 否 | `false` | 将规则名拼进 affinity key。适合多条规则读取到相同 identity 时仍保持彼此隔离 |
+| `ignore_preferred_cooldown` | 否 | `false` | 命中 affinity 后，选路时是否忽略 preferred channel 当前 cooldown。开启后更偏向“强行回原渠道” |
+| `strict` | 否 | `false` | 命中 affinity 后，如果最终拿不到那个 preferred channel，是否直接失败而不是回退到别的渠道。开启后亲和更强，但可用性更低 |
+| `skip_retry_on_failure` | 否 | `false` | 命中 affinity 的首选渠道后，如果这次调用失败，是否跳过后续常规重试/切换。适合 continuation 这类“换渠道也大概率无意义”的场景 |
+| `record_on_success` | 否 | `false` | 当前请求成功后，是否把本次 identity -> channel 的映射写回 affinity 缓存。关闭后这条规则只读不写 |
+| `ttl_seconds` | 否 | `0` | 这条规则自己写出的 affinity 记录保留多久。填 `0` 或负数表示使用顶层 `default_ttl_seconds` |
+| `key_sources` | 是 | 空 | 这条规则从哪里提取 affinity identity。可以配置多个来源，按顺序逐个尝试；取到值后会生成 binding/key |
+
+`rules[*].key_sources[*]` 字段：
+
+| 字段 | 是否必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `source` | 是 | 空 | 取值来源，当前支持 `request_field`、`header`、`query`、`request_hint` |
+| `key` | 是 | 空 | 在该来源里实际读取哪个字段，例如请求头名、请求体字段名、query 参数名 |
+| `alias` | 否 | 空 | 这个来源在 affinity key 里的逻辑名。它决定 key 的“identity 类型”，例如 `prompt_cache_key`、`response_id`、`session_id` |
+| `value_regex` | 否 | 空 | 对取出的原始值再做一层过滤。只有值匹配正则时才会参与 affinity；不匹配就当成“没取到值” |
+
+`source` 语义补充：
+
+- `request_field`
+  当前主要用于 Responses 请求体，内置支持 `prompt_cache_key`、`previous_response_id`，以及 `metadata.<key>`。
+- `header`
+  从请求头读取，例如 `x-session-id`。若 `alias=session_id` 且请求头里没值，realtime 还会回退到 runtime 已解析出的 session id。
+- `query`
+  从 URL query 读取。
+- `request_hint`
+  从 one-hub 内部 request hint 读取，例如 `responses.prompt_cache_key`。这类值通常是 routing 层或 provider 层在请求处理中派生出来的稳定 identity。
+
+完整默认值等效于：
+
+```json
+{
+  "enabled": true,
+  "default_ttl_seconds": 3600,
+  "max_entries": 50000,
+  "rules": [
+    {
+      "name": "responses-continuation",
+      "enabled": true,
+      "kind": "responses",
+      "path_regex": "^/v1/responses(?:/compact)?$",
+      "include_group": true,
+      "include_model": false,
+      "include_path": false,
+      "include_rule_name": true,
+      "ignore_preferred_cooldown": false,
+      "strict": true,
+      "skip_retry_on_failure": true,
+      "record_on_success": true,
+      "ttl_seconds": 0,
+      "key_sources": [
+        {
+          "source": "request_field",
+          "key": "previous_response_id",
+          "alias": "response_id"
+        }
+      ]
+    },
+    {
+      "name": "responses-prompt-cache-key",
+      "enabled": true,
+      "kind": "responses",
+      "path_regex": "^/v1/responses(?:/compact)?$",
+      "include_group": true,
+      "include_model": true,
+      "include_path": false,
+      "include_rule_name": true,
+      "ignore_preferred_cooldown": false,
+      "strict": false,
+      "skip_retry_on_failure": false,
+      "record_on_success": true,
+      "ttl_seconds": 0,
+      "key_sources": [
+        {
+          "source": "request_field",
+          "key": "prompt_cache_key",
+          "alias": "prompt_cache_key"
+        },
+        {
+          "source": "request_hint",
+          "key": "responses.prompt_cache_key",
+          "alias": "prompt_cache_key"
+        }
+      ]
+    },
+    {
+      "name": "realtime-session",
+      "enabled": true,
+      "kind": "realtime",
+      "path_regex": "^/v1/realtime$",
+      "include_group": true,
+      "include_model": false,
+      "include_path": false,
+      "include_rule_name": true,
+      "ignore_preferred_cooldown": false,
+      "strict": false,
+      "skip_retry_on_failure": false,
+      "record_on_success": true,
+      "ttl_seconds": 0,
+      "key_sources": [
+        {
+          "source": "header",
+          "key": "x-session-id",
+          "alias": "session_id"
+        },
+        {
+          "source": "header",
+          "key": "session_id",
+          "alias": "session_id"
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `ChannelAffinitySetting` 配置模板
+
+下面这些模板都可以直接粘到：
+
+- `设置 -> 运营设置 -> Codex 高级配置 -> ChannelAffinitySetting`
+
+如果你只是想微调某一部分，也可以只提交部分字段；未填写的字段会沿用默认值。
+
+#### 模板 1：默认推荐模板
+
+这就是当前“不额外修改 `ChannelAffinitySetting`”时的内置默认配置。
+
+适用场景：
+
+- 你希望开启基础 affinity
+- Responses continuation 要尽量回原渠道
+- prompt cache key 和 realtime session 保持常规复用
+- 更关注稳妥，不想过早把策略调得太激进
+
+trade-off：
+
+- 获得：行为最接近当前内置默认值，风险最低
+- 牺牲：不会强行等待或强行绑定 preferred channel
+
+```json
+{
+  "enabled": true,
+  "default_ttl_seconds": 3600,
+  "max_entries": 50000,
+  "rules": [
+    {
+      "name": "responses-continuation",
+      "enabled": true,
+      "kind": "responses",
+      "path_regex": "^/v1/responses(?:/compact)?$",
+      "include_group": true,
+      "include_rule_name": true,
+      "strict": true,
+      "skip_retry_on_failure": true,
+      "record_on_success": true,
+      "key_sources": [
+        {
+          "source": "request_field",
+          "key": "previous_response_id",
+          "alias": "response_id"
+        }
+      ]
+    },
+    {
+      "name": "responses-prompt-cache-key",
+      "enabled": true,
+      "kind": "responses",
+      "path_regex": "^/v1/responses(?:/compact)?$",
+      "include_group": true,
+      "include_model": true,
+      "include_rule_name": true,
+      "record_on_success": true,
+      "key_sources": [
+        {
+          "source": "request_field",
+          "key": "prompt_cache_key",
+          "alias": "prompt_cache_key"
+        },
+        {
+          "source": "request_hint",
+          "key": "responses.prompt_cache_key",
+          "alias": "prompt_cache_key"
+        }
+      ]
+    },
+    {
+      "name": "realtime-session",
+      "enabled": true,
+      "kind": "realtime",
+      "path_regex": "^/v1/realtime$",
+      "include_group": true,
+      "include_rule_name": true,
+      "record_on_success": true,
+      "key_sources": [
+        {
+          "source": "header",
+          "key": "x-session-id",
+          "alias": "session_id"
+        },
+        {
+          "source": "header",
+          "key": "session_id",
+          "alias": "session_id"
+        }
+      ]
+    }
+  ]
+}
+```
+
+#### 模板 2：Responses continuation 强亲和
+
+适用场景：
+
+- 你明确把 `previous_response_id` 看成“必须接着同一条上游会话继续”
+- 一旦原渠道不可用，宁可直接失败，也不希望 silently 切到别的渠道
+
+trade-off：
+
+- 获得：continuation 语义最强，不容易串到别的渠道
+- 牺牲：可用性下降，原渠道挂了就更容易直接报错
+
+建议同时配合：
+
+- `PreferredChannelWaitMilliseconds: 250`
+- `PreferredChannelWaitPollMilliseconds: 50`
+
+```json
+{
+  "enabled": true,
+  "default_ttl_seconds": 3600,
+  "max_entries": 50000,
+  "rules": [
+    {
+      "name": "responses-continuation-strict",
+      "enabled": true,
+      "kind": "responses",
+      "path_regex": "^/v1/responses(?:/compact)?$",
+      "include_group": true,
+      "include_model": true,
+      "include_rule_name": true,
+      "ignore_preferred_cooldown": true,
+      "strict": true,
+      "skip_retry_on_failure": true,
+      "record_on_success": true,
+      "ttl_seconds": 1800,
+      "key_sources": [
+        {
+          "source": "request_field",
+          "key": "previous_response_id",
+          "alias": "response_id"
+        }
+      ]
+    }
+  ]
+}
+```
+
+#### 模板 3：Responses prompt cache 弱亲和
+
+适用场景：
+
+- 你希望同一个 `prompt_cache_key` 尽量复用同一渠道
+- 但不希望因为 affinity 把请求“锁死”在某个渠道上
+- 更看重吞吐和可用性，而不是强一致恢复
+
+trade-off：
+
+- 获得：大多数情况下能复用同一渠道，命中缓存更稳定
+- 牺牲：preferred channel 不可用时会自动切换，亲和性不是强约束
+
+```json
+{
+  "enabled": true,
+  "default_ttl_seconds": 1800,
+  "max_entries": 50000,
+  "rules": [
+    {
+      "name": "responses-prompt-cache-soft",
+      "enabled": true,
+      "kind": "responses",
+      "path_regex": "^/v1/responses(?:/compact)?$",
+      "include_group": true,
+      "include_model": true,
+      "include_rule_name": true,
+      "strict": false,
+      "skip_retry_on_failure": false,
+      "record_on_success": true,
+      "ttl_seconds": 1800,
+      "key_sources": [
+        {
+          "source": "request_field",
+          "key": "prompt_cache_key",
+          "alias": "prompt_cache_key"
+        },
+        {
+          "source": "request_hint",
+          "key": "responses.prompt_cache_key",
+          "alias": "prompt_cache_key"
+        }
+      ]
+    }
+  ]
+}
+```
+
+#### 模板 4：Realtime session 强复用
+
+适用场景：
+
+- 你把 `x-session-id` / `session_id` 当成强 resume identity
+- websocket / realtime 会话恢复必须尽量回到原渠道
+- 比起自动降级，更希望优先保持会话连续性
+
+trade-off：
+
+- 获得：同一 realtime session 更倾向持续绑定同一渠道
+- 牺牲：渠道处于 cooldown 或短时故障时，更可能等待或直接失败
+
+建议同时配合：
+
+- `PreferredChannelWaitMilliseconds: 500`
+- `PreferredChannelWaitPollMilliseconds: 50`
+
+```json
+{
+  "enabled": true,
+  "default_ttl_seconds": 7200,
+  "max_entries": 50000,
+  "rules": [
+    {
+      "name": "realtime-session-strict",
+      "enabled": true,
+      "kind": "realtime",
+      "path_regex": "^/v1/realtime$",
+      "include_group": true,
+      "include_rule_name": true,
+      "ignore_preferred_cooldown": true,
+      "strict": true,
+      "skip_retry_on_failure": true,
+      "record_on_success": true,
+      "ttl_seconds": 7200,
+      "key_sources": [
+        {
+          "source": "header",
+          "key": "x-session-id",
+          "alias": "session_id"
+        },
+        {
+          "source": "header",
+          "key": "session_id",
+          "alias": "session_id"
+        }
+      ]
+    }
+  ]
+}
+```
+
+#### 模板 5：按 group + model 严格隔离
+
+适用场景：
+
+- 你的不同 group 或不同模型之间绝不能共享 affinity
+- 同一用户可能跨组、跨模型访问，但你要完全隔离渠道复用痕迹
+
+trade-off：
+
+- 获得：隔离性最好，不容易出现跨模型/跨组串用
+- 牺牲：缓存复用面更窄，命中率会下降
+
+```json
+{
+  "enabled": true,
+  "default_ttl_seconds": 1800,
+  "max_entries": 50000,
+  "rules": [
+    {
+      "name": "responses-prompt-cache-isolated",
+      "enabled": true,
+      "kind": "responses",
+      "path_regex": "^/v1/responses(?:/compact)?$",
+      "include_group": true,
+      "include_model": true,
+      "include_path": true,
+      "include_rule_name": true,
+      "record_on_success": true,
+      "ttl_seconds": 1800,
+      "key_sources": [
+        {
+          "source": "request_field",
+          "key": "prompt_cache_key",
+          "alias": "prompt_cache_key"
+        },
+        {
+          "source": "request_hint",
+          "key": "responses.prompt_cache_key",
+          "alias": "prompt_cache_key"
+        }
+      ]
+    },
+    {
+      "name": "realtime-session-isolated",
+      "enabled": true,
+      "kind": "realtime",
+      "path_regex": "^/v1/realtime$",
+      "include_group": true,
+      "include_model": true,
+      "include_path": true,
+      "include_rule_name": true,
+      "record_on_success": true,
+      "ttl_seconds": 7200,
+      "key_sources": [
+        {
+          "source": "header",
+          "key": "x-session-id",
+          "alias": "session_id"
+        },
+        {
+          "source": "header",
+          "key": "session_id",
+          "alias": "session_id"
+        }
+      ]
+    }
+  ]
+}
+```
 
 ## 推荐模板
 
