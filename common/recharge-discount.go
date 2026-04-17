@@ -28,8 +28,12 @@ func UpdateSafeKeywordByJSONString(jsonStr string) error {
 	return json.Unmarshal([]byte(jsonStr), &SafeKeyword)
 }
 func UpdateRechargeDiscountByJSONString(jsonStr string) error {
-	RechargeDiscount = make(map[string]float64)
-	return json.Unmarshal([]byte(jsonStr), &RechargeDiscount)
+	next := make(map[string]float64)
+	if err := json.Unmarshal([]byte(jsonStr), &next); err != nil {
+		return err
+	}
+	RechargeDiscount = next
+	return nil
 }
 
 func GetRechargeDiscount(name string) float64 {

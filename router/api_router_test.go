@@ -16,6 +16,7 @@ func TestSetApiRouterRegistersNewOptionAdminEndpoints(t *testing.T) {
 		"GET /api/option/channel_affinity_cache":    false,
 		"GET /api/option/execution_session_cache":   false,
 		"DELETE /api/option/channel_affinity_cache": false,
+		"PUT /api/option/batch":                     false,
 		"POST /api/user/dashboard/modules/query":    false,
 	}
 

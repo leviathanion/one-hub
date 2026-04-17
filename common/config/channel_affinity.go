@@ -2,6 +2,8 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -47,10 +49,15 @@ type ChannelAffinitySettings struct {
 var ChannelAffinitySettingsInstance = DefaultChannelAffinitySettings()
 
 func init() {
-	GlobalOption.RegisterCustom("ChannelAffinitySetting", func() string {
+	GlobalOption.RegisterCustomOptionWithValidator("ChannelAffinitySetting", func() string {
 		return ChannelAffinitySettingsInstance.JSONString()
 	}, func(value string) error {
 		return ChannelAffinitySettingsInstance.SetFromJSON(value)
+	}, func(value string) error {
+		settings := DefaultChannelAffinitySettings()
+		return settings.SetFromJSON(value)
+	}, OptionMetadata{
+		Visibility: OptionVisibilityPublic,
 	}, ChannelAffinitySettingsInstance.JSONString())
 }
 
@@ -139,6 +146,9 @@ func (s *ChannelAffinitySettings) SetFromJSON(data string) error {
 		return err
 	}
 	settings.Normalize()
+	if err := settings.Validate(); err != nil {
+		return err
+	}
 	*s = settings
 	return nil
 }
@@ -186,6 +196,8 @@ func (s *ChannelAffinitySettings) Normalize() {
 func (r *ChannelAffinityRule) Normalize() {
 	r.Name = strings.TrimSpace(r.Name)
 	r.Kind = strings.ToLower(strings.TrimSpace(r.Kind))
+	r.ModelRegex = strings.TrimSpace(r.ModelRegex)
+	r.PathRegex = strings.TrimSpace(r.PathRegex)
 	r.UserAgentRegex = strings.TrimSpace(r.UserAgentRegex)
 	if !r.Enabled {
 		return
@@ -208,4 +220,35 @@ func normalizeChannelAffinityAlias(alias, fallback string) string {
 		return normalized
 	}
 	return strings.ToLower(strings.TrimSpace(fallback))
+}
+
+func (s ChannelAffinitySettings) Validate() error {
+	for ruleIndex, rule := range s.Rules {
+		if err := validateChannelAffinityRegex(fmt.Sprintf("rules[%d].model_regex", ruleIndex), rule.ModelRegex); err != nil {
+			return err
+		}
+		if err := validateChannelAffinityRegex(fmt.Sprintf("rules[%d].path_regex", ruleIndex), rule.PathRegex); err != nil {
+			return err
+		}
+		if err := validateChannelAffinityRegex(fmt.Sprintf("rules[%d].user_agent_regex", ruleIndex), rule.UserAgentRegex); err != nil {
+			return err
+		}
+		for sourceIndex, source := range rule.KeySources {
+			if err := validateChannelAffinityRegex(fmt.Sprintf("rules[%d].key_sources[%d].value_regex", ruleIndex, sourceIndex), source.ValueRegex); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func validateChannelAffinityRegex(fieldName, pattern string) error {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return nil
+	}
+	if _, err := regexp.Compile(pattern); err != nil {
+		return fmt.Errorf("%s 必须是合法的正则表达式: %w", fieldName, err)
+	}
+	return nil
 }

@@ -108,6 +108,7 @@ func SetApiRouter(router *gin.Engine) {
 		{
 			optionRoute.GET("/", controller.GetOptions)
 			optionRoute.PUT("/", controller.UpdateOption)
+			optionRoute.PUT("/batch", controller.UpdateOptionBatch)
 			optionRoute.GET("/telegram", controller.GetTelegramMenuList)
 			optionRoute.POST("/telegram", controller.AddOrUpdateTelegramMenu)
 			optionRoute.GET("/telegram/status", controller.GetTelegramBotStatus)

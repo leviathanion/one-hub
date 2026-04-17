@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestChannelAffinitySettingsDefaultsCloneAndRoundTrip(t *testing.T) {
 	settings := DefaultChannelAffinitySettings()
@@ -118,4 +121,48 @@ func TestChannelAffinitySettingsSetFromJSONNormalizesRulesAndAliases(t *testing.
 	if err := settings.SetFromJSON("{"); err == nil {
 		t.Fatal("expected invalid JSON to fail")
 	}
+}
+
+func TestChannelAffinitySettingsSetFromJSONRejectsInvalidRegex(t *testing.T) {
+	t.Run("rule regex", func(t *testing.T) {
+		var settings ChannelAffinitySettings
+		err := settings.SetFromJSON(`{
+			"rules": [
+				{
+					"name": "broken",
+					"enabled": true,
+					"kind": "responses",
+					"model_regex": "["
+				}
+			]
+		}`)
+		if err == nil {
+			t.Fatal("expected invalid regex to fail")
+		}
+		if !strings.Contains(err.Error(), "rules[0].model_regex") {
+			t.Fatalf("expected field-specific regex error, got %v", err)
+		}
+	})
+
+	t.Run("key source regex", func(t *testing.T) {
+		var settings ChannelAffinitySettings
+		err := settings.SetFromJSON(`{
+			"rules": [
+				{
+					"name": "broken",
+					"enabled": true,
+					"kind": "responses",
+					"key_sources": [
+						{"source": "header", "key": "x-session-id", "value_regex": "["}
+					]
+				}
+			]
+		}`)
+		if err == nil {
+			t.Fatal("expected invalid key source regex to fail")
+		}
+		if !strings.Contains(err.Error(), "rules[0].key_sources[0].value_regex") {
+			t.Fatalf("expected value_regex field-specific error, got %v", err)
+		}
+	})
 }

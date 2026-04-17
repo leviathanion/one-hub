@@ -2,6 +2,7 @@ package codex
 
 import (
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
 	"sync"
@@ -26,10 +27,15 @@ var (
 )
 
 func init() {
-	config.GlobalOption.RegisterCustom("CodexRoutingHintSetting", func() string {
+	config.GlobalOption.RegisterCustomOptionWithValidator("CodexRoutingHintSetting", func() string {
 		return RoutingHintSettingsInstance.JSONString()
 	}, func(value string) error {
 		return RoutingHintSettingsInstance.SetFromJSON(value)
+	}, func(value string) error {
+		settings := DefaultRoutingHintSettings()
+		return settings.SetFromJSON(value)
+	}, config.OptionMetadata{
+		Visibility: config.OptionVisibilityPublic,
 	}, RoutingHintSettingsInstance.JSONString())
 
 	requesthints.RegisterResponsesResolver(codexResponsesHintResolver{})
@@ -55,6 +61,9 @@ func (s *RoutingHintSettings) SetFromJSON(data string) error {
 		return err
 	}
 	settings.Normalize()
+	if err := settings.Validate(); err != nil {
+		return err
+	}
 	*s = settings
 	return nil
 }
@@ -74,6 +83,27 @@ func (s *RoutingHintSettings) Normalize() {
 	s.PromptCacheKeyStrategy = normalizePromptCacheStrategy(s.PromptCacheKeyStrategy)
 	s.ModelRegex = strings.TrimSpace(s.ModelRegex)
 	s.UserAgentRegex = strings.TrimSpace(s.UserAgentRegex)
+}
+
+func (s RoutingHintSettings) Validate() error {
+	if err := validateRoutingHintRegex("model_regex", s.ModelRegex); err != nil {
+		return err
+	}
+	if err := validateRoutingHintRegex("user_agent_regex", s.UserAgentRegex); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateRoutingHintRegex(fieldName, pattern string) error {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return nil
+	}
+	if _, err := regexp.Compile(pattern); err != nil {
+		return fmt.Errorf("%s 必须是合法的正则表达式: %w", fieldName, err)
+	}
+	return nil
 }
 
 type codexResponsesHintResolver struct{}

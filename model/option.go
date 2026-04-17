@@ -1,11 +1,16 @@
 package model
 
 import (
+	"encoding/json"
+	"fmt"
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/logger"
 	"strings"
+	"sync"
 	"time"
+
+	"gorm.io/gorm"
 )
 
 const (
@@ -13,6 +18,9 @@ const (
 	automaticRecoverEnabledOptionKey        = "AutomaticRecoverChannelsEnabled"
 	automaticRecoverIntervalOptionKey       = "AutomaticRecoverChannelsIntervalMinutes"
 )
+
+var loggedUnknownOptionKeys sync.Map
+var loggedInvalidOptionLoadErrors sync.Map
 
 type Option struct {
 	Key   string `json:"key" gorm:"primaryKey"`
@@ -31,113 +39,135 @@ func GetOption(key string) (option Option, err error) {
 }
 
 func InitOptionMap() {
+	publicOption := func() config.OptionMetadata {
+		return config.OptionMetadata{Visibility: config.OptionVisibilityPublic}
+	}
+	publicGroupedOption := func(group string) config.OptionMetadata {
+		metadata := publicOption()
+		metadata.Group = group
+		return metadata
+	}
+	sensitiveOption := func() config.OptionMetadata {
+		return config.OptionMetadata{Visibility: config.OptionVisibilitySensitive}
+	}
+	sensitiveGroupedOption := func(group string) config.OptionMetadata {
+		metadata := sensitiveOption()
+		metadata.Group = group
+		return metadata
+	}
 
-	config.GlobalOption.RegisterBool("PasswordLoginEnabled", &config.PasswordLoginEnabled)
-	config.GlobalOption.RegisterBool("PasswordRegisterEnabled", &config.PasswordRegisterEnabled)
-	config.GlobalOption.RegisterBool("EmailVerificationEnabled", &config.EmailVerificationEnabled)
-	config.GlobalOption.RegisterBool("GitHubOAuthEnabled", &config.GitHubOAuthEnabled)
-	config.GlobalOption.RegisterBool("WeChatAuthEnabled", &config.WeChatAuthEnabled)
-	config.GlobalOption.RegisterBool("LarkAuthEnabled", &config.LarkAuthEnabled)
-	config.GlobalOption.RegisterBool("OIDCAuthEnabled", &config.OIDCAuthEnabled)
-	config.GlobalOption.RegisterBool("TurnstileCheckEnabled", &config.TurnstileCheckEnabled)
-	config.GlobalOption.RegisterBool("RegisterEnabled", &config.RegisterEnabled)
-	config.GlobalOption.RegisterBool("AutomaticDisableChannelEnabled", &config.AutomaticDisableChannelEnabled)
-	config.GlobalOption.RegisterBool("AutomaticEnableChannelEnabled", &config.AutomaticEnableChannelEnabled)
-	config.GlobalOption.RegisterBool(automaticRecoverEnabledOptionKey, &config.AutomaticRecoverChannelsEnabled)
-	config.GlobalOption.RegisterInt(automaticRecoverIntervalOptionKey, &config.AutomaticRecoverChannelsIntervalMinutes)
-	config.GlobalOption.RegisterBool("ApproximateTokenEnabled", &config.ApproximateTokenEnabled)
-	config.GlobalOption.RegisterBool("LogConsumeEnabled", &config.LogConsumeEnabled)
-	config.GlobalOption.RegisterBool("DisplayInCurrencyEnabled", &config.DisplayInCurrencyEnabled)
-	config.GlobalOption.RegisterFloat("ChannelDisableThreshold", &config.ChannelDisableThreshold)
-	config.GlobalOption.RegisterBool("EmailDomainRestrictionEnabled", &config.EmailDomainRestrictionEnabled)
+	config.GlobalOption.RegisterBoolOption("PasswordLoginEnabled", &config.PasswordLoginEnabled, publicOption())
+	config.GlobalOption.RegisterBoolOption("PasswordRegisterEnabled", &config.PasswordRegisterEnabled, publicOption())
+	config.GlobalOption.RegisterBoolOption("EmailVerificationEnabled", &config.EmailVerificationEnabled, publicOption())
+	config.GlobalOption.RegisterBoolOption("GitHubOAuthEnabled", &config.GitHubOAuthEnabled, publicGroupedOption(config.OptionGroupGitHubOAuth))
+	config.GlobalOption.RegisterBoolOption("WeChatAuthEnabled", &config.WeChatAuthEnabled, publicGroupedOption(config.OptionGroupWeChatAuth))
+	config.GlobalOption.RegisterBoolOption("LarkAuthEnabled", &config.LarkAuthEnabled, publicGroupedOption(config.OptionGroupLarkOAuth))
+	config.GlobalOption.RegisterBoolOption("OIDCAuthEnabled", &config.OIDCAuthEnabled, publicGroupedOption(config.OptionGroupOIDCAuth))
+	config.GlobalOption.RegisterBoolOption("TurnstileCheckEnabled", &config.TurnstileCheckEnabled, publicGroupedOption(config.OptionGroupTurnstile))
+	config.GlobalOption.RegisterBoolOption("RegisterEnabled", &config.RegisterEnabled, publicOption())
+	config.GlobalOption.RegisterBoolOption("AutomaticDisableChannelEnabled", &config.AutomaticDisableChannelEnabled, publicOption())
+	config.GlobalOption.RegisterBoolOption("AutomaticEnableChannelEnabled", &config.AutomaticEnableChannelEnabled, publicOption())
+	config.GlobalOption.RegisterBoolOption(automaticRecoverEnabledOptionKey, &config.AutomaticRecoverChannelsEnabled, publicGroupedOption(config.OptionGroupAutomaticRecoverChannel))
+	config.GlobalOption.RegisterIntOption(automaticRecoverIntervalOptionKey, &config.AutomaticRecoverChannelsIntervalMinutes, config.OptionMetadata{
+		Visibility: config.OptionVisibilityPublic,
+		Aliases:    []string{automaticRecoverIntervalLegacyOptionKey},
+		Group:      config.OptionGroupAutomaticRecoverChannel,
+	})
+	config.GlobalOption.RegisterBoolOption("ApproximateTokenEnabled", &config.ApproximateTokenEnabled, publicOption())
+	config.GlobalOption.RegisterBoolOption("LogConsumeEnabled", &config.LogConsumeEnabled, publicOption())
+	config.GlobalOption.RegisterBoolOption("DisplayInCurrencyEnabled", &config.DisplayInCurrencyEnabled, publicOption())
+	config.GlobalOption.RegisterFloatOption("ChannelDisableThreshold", &config.ChannelDisableThreshold, publicOption())
+	config.GlobalOption.RegisterBoolOption("EmailDomainRestrictionEnabled", &config.EmailDomainRestrictionEnabled, publicGroupedOption(config.OptionGroupEmailDomainRestriction))
 
-	config.GlobalOption.RegisterCustom("EmailDomainWhitelist", func() string {
+	config.GlobalOption.RegisterCustomOption("EmailDomainWhitelist", func() string {
 		return strings.Join(config.EmailDomainWhitelist, ",")
 	}, func(value string) error {
 		config.EmailDomainWhitelist = strings.Split(value, ",")
 		return nil
-	}, "")
+	}, publicGroupedOption(config.OptionGroupEmailDomainRestriction), "")
 
-	config.GlobalOption.RegisterString("SMTPServer", &config.SMTPServer)
-	config.GlobalOption.RegisterString("SMTPFrom", &config.SMTPFrom)
-	config.GlobalOption.RegisterInt("SMTPPort", &config.SMTPPort)
-	config.GlobalOption.RegisterString("SMTPAccount", &config.SMTPAccount)
-	config.GlobalOption.RegisterString("SMTPToken", &config.SMTPToken)
-	config.GlobalOption.RegisterValue("Notice")
-	config.GlobalOption.RegisterValue("About")
-	config.GlobalOption.RegisterValue("HomePageContent")
-	config.GlobalOption.RegisterString("Footer", &config.Footer)
-	config.GlobalOption.RegisterString("SystemName", &config.SystemName)
-	config.GlobalOption.RegisterString("Logo", &config.Logo)
-	config.GlobalOption.RegisterString("AnalyticsCode", &config.AnalyticsCode)
-	config.GlobalOption.RegisterString("ServerAddress", &config.ServerAddress)
-	config.GlobalOption.RegisterString("GitHubClientId", &config.GitHubClientId)
-	config.GlobalOption.RegisterString("GitHubClientSecret", &config.GitHubClientSecret)
+	config.GlobalOption.RegisterStringOption("SMTPServer", &config.SMTPServer, publicOption())
+	config.GlobalOption.RegisterStringOption("SMTPFrom", &config.SMTPFrom, publicOption())
+	config.GlobalOption.RegisterIntOption("SMTPPort", &config.SMTPPort, publicOption())
+	config.GlobalOption.RegisterStringOption("SMTPAccount", &config.SMTPAccount, publicOption())
+	config.GlobalOption.RegisterStringOption("SMTPToken", &config.SMTPToken, sensitiveOption())
+	config.GlobalOption.RegisterValueOption("Notice", publicOption())
+	config.GlobalOption.RegisterValueOption("About", publicOption())
+	config.GlobalOption.RegisterValueOption("HomePageContent", publicOption())
+	config.GlobalOption.RegisterStringOption("Footer", &config.Footer, publicOption())
+	config.GlobalOption.RegisterStringOption("SystemName", &config.SystemName, publicOption())
+	config.GlobalOption.RegisterStringOption("Logo", &config.Logo, publicOption())
+	config.GlobalOption.RegisterStringOption("AnalyticsCode", &config.AnalyticsCode, publicOption())
+	config.GlobalOption.RegisterStringOption("ServerAddress", &config.ServerAddress, publicOption())
+	config.GlobalOption.RegisterStringOption("GitHubClientId", &config.GitHubClientId, publicGroupedOption(config.OptionGroupGitHubOAuth))
+	config.GlobalOption.RegisterStringOption("GitHubClientSecret", &config.GitHubClientSecret, sensitiveGroupedOption(config.OptionGroupGitHubOAuth))
+	config.GlobalOption.RegisterStringOption("LarkClientId", &config.LarkClientId, publicGroupedOption(config.OptionGroupLarkOAuth))
+	config.GlobalOption.RegisterStringOption("LarkClientSecret", &config.LarkClientSecret, sensitiveGroupedOption(config.OptionGroupLarkOAuth))
+	config.GlobalOption.RegisterStringOption("OIDCClientId", &config.OIDCClientId, publicGroupedOption(config.OptionGroupOIDCAuth))
+	config.GlobalOption.RegisterStringOption("OIDCClientSecret", &config.OIDCClientSecret, sensitiveGroupedOption(config.OptionGroupOIDCAuth))
+	config.GlobalOption.RegisterStringOption("OIDCIssuer", &config.OIDCIssuer, publicGroupedOption(config.OptionGroupOIDCAuth))
+	config.GlobalOption.RegisterStringOption("OIDCScopes", &config.OIDCScopes, publicGroupedOption(config.OptionGroupOIDCAuth))
+	config.GlobalOption.RegisterStringOption("OIDCUsernameClaims", &config.OIDCUsernameClaims, publicGroupedOption(config.OptionGroupOIDCAuth))
+	config.GlobalOption.RegisterStringOption("WeChatServerAddress", &config.WeChatServerAddress, publicGroupedOption(config.OptionGroupWeChatAuth))
+	config.GlobalOption.RegisterStringOption("WeChatServerToken", &config.WeChatServerToken, sensitiveGroupedOption(config.OptionGroupWeChatAuth))
+	config.GlobalOption.RegisterStringOption("WeChatAccountQRCodeImageURL", &config.WeChatAccountQRCodeImageURL, publicOption())
+	config.GlobalOption.RegisterStringOption("TurnstileSiteKey", &config.TurnstileSiteKey, publicGroupedOption(config.OptionGroupTurnstile))
+	config.GlobalOption.RegisterStringOption("TurnstileSecretKey", &config.TurnstileSecretKey, sensitiveGroupedOption(config.OptionGroupTurnstile))
+	config.GlobalOption.RegisterIntOption("QuotaForNewUser", &config.QuotaForNewUser, publicOption())
+	config.GlobalOption.RegisterIntOption("QuotaForInviter", &config.QuotaForInviter, publicOption())
+	config.GlobalOption.RegisterIntOption("QuotaForInvitee", &config.QuotaForInvitee, publicOption())
+	config.GlobalOption.RegisterIntOption("QuotaRemindThreshold", &config.QuotaRemindThreshold, publicOption())
+	config.GlobalOption.RegisterIntOption("PreConsumedQuota", &config.PreConsumedQuota, publicOption())
+	config.GlobalOption.RegisterStringOption("TopUpLink", &config.TopUpLink, publicOption())
+	config.GlobalOption.RegisterStringOption("ChatLink", &config.ChatLink, publicOption())
+	config.GlobalOption.RegisterStringOption("ChatLinks", &config.ChatLinks, publicOption())
+	config.GlobalOption.RegisterFloatOption("QuotaPerUnit", &config.QuotaPerUnit, publicOption())
+	config.GlobalOption.RegisterIntOption("RetryTimes", &config.RetryTimes, publicOption())
+	config.GlobalOption.RegisterIntOption("RetryCooldownSeconds", &config.RetryCooldownSeconds, publicOption())
+	config.GlobalOption.RegisterIntOption("PreferredChannelWaitMilliseconds", &config.PreferredChannelWaitMilliseconds, publicOption())
+	config.GlobalOption.RegisterIntOption("PreferredChannelWaitPollMilliseconds", &config.PreferredChannelWaitPollMilliseconds, publicOption())
+	config.GlobalOption.RegisterBoolOption("MjNotifyEnabled", &config.MjNotifyEnabled, publicOption())
+	config.GlobalOption.RegisterStringOption("ChatImageRequestProxy", &config.ChatImageRequestProxy, publicOption())
+	config.GlobalOption.RegisterFloatOption("PaymentUSDRate", &config.PaymentUSDRate, publicOption())
+	config.GlobalOption.RegisterIntOption("PaymentMinAmount", &config.PaymentMinAmount, publicOption())
 
-	config.GlobalOption.RegisterString("OIDCClientId", &config.OIDCClientId)
-	config.GlobalOption.RegisterString("OIDCClientSecret", &config.OIDCClientSecret)
-	config.GlobalOption.RegisterString("OIDCIssuer", &config.OIDCIssuer)
-	config.GlobalOption.RegisterString("OIDCScopes", &config.OIDCScopes)
-	config.GlobalOption.RegisterString("OIDCUsernameClaims", &config.OIDCUsernameClaims)
-
-	config.GlobalOption.RegisterString("WeChatServerAddress", &config.WeChatServerAddress)
-	config.GlobalOption.RegisterString("WeChatServerToken", &config.WeChatServerToken)
-	config.GlobalOption.RegisterString("WeChatAccountQRCodeImageURL", &config.WeChatAccountQRCodeImageURL)
-	config.GlobalOption.RegisterString("TurnstileSiteKey", &config.TurnstileSiteKey)
-	config.GlobalOption.RegisterString("TurnstileSecretKey", &config.TurnstileSecretKey)
-	config.GlobalOption.RegisterInt("QuotaForNewUser", &config.QuotaForNewUser)
-	config.GlobalOption.RegisterInt("QuotaForInviter", &config.QuotaForInviter)
-	config.GlobalOption.RegisterInt("QuotaForInvitee", &config.QuotaForInvitee)
-	config.GlobalOption.RegisterInt("QuotaRemindThreshold", &config.QuotaRemindThreshold)
-	config.GlobalOption.RegisterInt("PreConsumedQuota", &config.PreConsumedQuota)
-
-	config.GlobalOption.RegisterString("TopUpLink", &config.TopUpLink)
-	config.GlobalOption.RegisterString("ChatLink", &config.ChatLink)
-	config.GlobalOption.RegisterString("ChatLinks", &config.ChatLinks)
-	config.GlobalOption.RegisterFloat("QuotaPerUnit", &config.QuotaPerUnit)
-	config.GlobalOption.RegisterInt("RetryTimes", &config.RetryTimes)
-	config.GlobalOption.RegisterInt("RetryCooldownSeconds", &config.RetryCooldownSeconds)
-	config.GlobalOption.RegisterInt("PreferredChannelWaitMilliseconds", &config.PreferredChannelWaitMilliseconds)
-	config.GlobalOption.RegisterInt("PreferredChannelWaitPollMilliseconds", &config.PreferredChannelWaitPollMilliseconds)
-
-	config.GlobalOption.RegisterBool("MjNotifyEnabled", &config.MjNotifyEnabled)
-	config.GlobalOption.RegisterString("ChatImageRequestProxy", &config.ChatImageRequestProxy)
-	config.GlobalOption.RegisterFloat("PaymentUSDRate", &config.PaymentUSDRate)
-	config.GlobalOption.RegisterInt("PaymentMinAmount", &config.PaymentMinAmount)
-
-	config.GlobalOption.RegisterCustom("RechargeDiscount", func() string {
+	config.GlobalOption.RegisterCustomOptionWithValidator("RechargeDiscount", func() string {
 		return common.RechargeDiscount2JSONString()
 	}, func(value string) error {
+		if err := common.UpdateRechargeDiscountByJSONString(value); err != nil {
+			return err
+		}
 		config.RechargeDiscount = value
-		common.UpdateRechargeDiscountByJSONString(value)
 		return nil
-	}, "")
+	}, func(value string) error {
+		preview := make(map[string]float64)
+		return json.Unmarshal([]byte(value), &preview)
+	}, publicOption(), "")
 
-	config.GlobalOption.RegisterString("CFWorkerImageUrl", &config.CFWorkerImageUrl)
-	config.GlobalOption.RegisterString("CFWorkerImageKey", &config.CFWorkerImageKey)
-	config.GlobalOption.RegisterInt("OldTokenMaxId", &config.OldTokenMaxId)
-	config.GlobalOption.RegisterBool("GitHubOldIdCloseEnabled", &config.GitHubOldIdCloseEnabled)
+	config.GlobalOption.RegisterStringOption("CFWorkerImageUrl", &config.CFWorkerImageUrl, publicOption())
+	config.GlobalOption.RegisterStringOption("CFWorkerImageKey", &config.CFWorkerImageKey, sensitiveOption())
+	config.GlobalOption.RegisterIntOption("OldTokenMaxId", &config.OldTokenMaxId, publicOption())
+	config.GlobalOption.RegisterBoolOption("GitHubOldIdCloseEnabled", &config.GitHubOldIdCloseEnabled, publicOption())
+	config.GlobalOption.RegisterBoolOption("GeminiAPIEnabled", &config.GeminiAPIEnabled, publicOption())
+	config.GlobalOption.RegisterBoolOption("ClaudeAPIEnabled", &config.ClaudeAPIEnabled, publicOption())
 
-	config.GlobalOption.RegisterBool("GeminiAPIEnabled", &config.GeminiAPIEnabled)
-	config.GlobalOption.RegisterBool("ClaudeAPIEnabled", &config.ClaudeAPIEnabled)
-
-	config.GlobalOption.RegisterCustom("DisableChannelKeywords", func() string {
+	config.GlobalOption.RegisterCustomOption("DisableChannelKeywords", func() string {
 		return common.DisableChannelKeywordsInstance.GetKeywords()
 	}, func(value string) error {
 		common.DisableChannelKeywordsInstance.Load(value)
 		return nil
-	}, common.GetDefaultDisableChannelKeywords())
+	}, publicOption(), common.GetDefaultDisableChannelKeywords())
 
-	config.GlobalOption.RegisterInt("RetryTimeOut", &config.RetryTimeOut)
+	config.GlobalOption.RegisterIntOption("RetryTimeOut", &config.RetryTimeOut, publicOption())
 
-	config.GlobalOption.RegisterBool("EnableSafe", &config.EnableSafe)
-	config.GlobalOption.RegisterString("SafeToolName", &config.SafeToolName)
-	config.GlobalOption.RegisterCustom("SafeKeyWords", func() string {
+	config.GlobalOption.RegisterBoolOption("EnableSafe", &config.EnableSafe, publicOption())
+	config.GlobalOption.RegisterStringOption("SafeToolName", &config.SafeToolName, publicOption())
+	config.GlobalOption.RegisterCustomOption("SafeKeyWords", func() string {
 		return strings.Join(config.SafeKeyWords, "\n")
 	}, func(value string) error {
 		config.SafeKeyWords = strings.Split(value, "\n")
 		return nil
-	}, "")
+	}, publicOption(), "")
 
 	loadOptionsFromDatabase()
 }
@@ -145,12 +175,26 @@ func InitOptionMap() {
 func loadOptionsFromDatabase() {
 	options, _ := AllOption()
 	options = migrateAutomaticRecoverOptions(options)
+	loadedOptions := make(map[string]string, len(options))
 	for _, option := range options {
-		err := config.GlobalOption.Set(option.Key, option.Value)
-		if err != nil {
-			logger.SysError("failed to update option map: " + err.Error())
+		normalizedKey := config.GlobalOption.NormalizeKey(option.Key)
+		if !config.GlobalOption.IsRegistered(normalizedKey) {
+			logUnknownOptionKeyOnce(option.Key)
+			continue
 		}
+		loadedOptions[normalizedKey] = option.Value
 	}
+	for key, value := range loadedOptions {
+		err := config.GlobalOption.Set(key, value)
+		if err != nil {
+			if shouldLogInvalidOptionLoadError(key, err) && logger.Logger != nil {
+				logger.SysError("failed to update option map for key " + key + ": " + err.Error())
+			}
+			continue
+		}
+		clearLoggedInvalidOptionLoadError(key)
+	}
+	clearStaleLoggedInvalidOptionLoadErrors(loadedOptions)
 }
 
 func migrateAutomaticRecoverOptions(options []*Option) []*Option {
@@ -159,30 +203,59 @@ func migrateAutomaticRecoverOptions(options []*Option) []*Option {
 		optionByKey[option.Key] = option
 	}
 
-	if _, exists := optionByKey[automaticRecoverIntervalOptionKey]; exists {
-		return options
-	}
-
 	legacyOption, exists := optionByKey[automaticRecoverIntervalLegacyOptionKey]
-	if !exists || legacyOption.Value == "" {
+	if !exists {
 		return options
 	}
 
-	migratedOption := &Option{
-		Key:   automaticRecoverIntervalOptionKey,
-		Value: legacyOption.Value,
-	}
-	if err := DB.Save(migratedOption).Error; err != nil {
-		if logger.Logger != nil {
-			logger.SysError("failed to migrate automatic recover interval option: " + err.Error())
+	canonicalOption, hasCanonical := optionByKey[automaticRecoverIntervalOptionKey]
+	if !hasCanonical && strings.TrimSpace(legacyOption.Value) != "" {
+		migratedOption := &Option{
+			Key:   automaticRecoverIntervalOptionKey,
+			Value: legacyOption.Value,
 		}
-		return append(options, migratedOption)
+		if err := DB.Save(migratedOption).Error; err != nil {
+			if logger.Logger != nil {
+				logger.SysError("failed to migrate automatic recover interval option: " + err.Error())
+			}
+		} else {
+			canonicalOption = migratedOption
+			hasCanonical = true
+			if logger.Logger != nil {
+				logger.SysLog("migrated legacy automatic recover interval option to AutomaticRecoverChannelsIntervalMinutes")
+			}
+		}
 	}
 
-	if logger.Logger != nil {
-		logger.SysLog("migrated legacy automatic recover interval option to AutomaticRecoverChannelsIntervalMinutes")
+	if hasCanonical {
+		if err := DB.Delete(&Option{}, "key = ?", automaticRecoverIntervalLegacyOptionKey).Error; err != nil {
+			if logger.Logger != nil {
+				logger.SysError("failed to delete legacy automatic recover interval option: " + err.Error())
+			}
+		}
 	}
-	return append(options, migratedOption)
+
+	migratedOptions := make([]*Option, 0, len(options)+1)
+	hasCanonicalInSlice := false
+	for _, option := range options {
+		switch option.Key {
+		case automaticRecoverIntervalLegacyOptionKey:
+			if hasCanonical {
+				continue
+			}
+			migratedOptions = append(migratedOptions, option)
+		case automaticRecoverIntervalOptionKey:
+			hasCanonicalInSlice = true
+			migratedOptions = append(migratedOptions, option)
+		default:
+			migratedOptions = append(migratedOptions, option)
+		}
+	}
+
+	if hasCanonical && !hasCanonicalInSlice && canonicalOption != nil {
+		migratedOptions = append(migratedOptions, canonicalOption)
+	}
+	return migratedOptions
 }
 
 func SyncOptions(frequency int) {
@@ -194,17 +267,82 @@ func SyncOptions(frequency int) {
 }
 
 func UpdateOption(key string, value string) error {
-	// Save to database first
-	option := Option{
-		Key: key,
+	normalizedKey := config.GlobalOption.NormalizeKey(key)
+	prepared, err := config.PrepareOptionUpdates([]config.OptionUpdate{{
+		Key:   key,
+		Value: value,
+	}}, config.OptionGroupValidationStrict)
+	if err != nil {
+		return err
 	}
-	// https://gorm.io/docs/update.html#Save-All-Fields
-	DB.FirstOrCreate(&option, Option{Key: key})
-	option.Value = value
-	// Save is a combination function.
-	// If save value does not contain primary key, it will execute Create,
-	// otherwise it will execute Update (with all fields).
-	DB.Save(&option)
-	// Update OptionMap
-	return config.GlobalOption.Set(key, value)
+	if len(prepared.Updates) == 0 {
+		return SaveOptionsTx(DB, []Option{{
+			Key:   normalizedKey,
+			Value: value,
+		}})
+	}
+	if err := SaveOptionsTx(DB, []Option{{
+		Key:   prepared.Updates[0].Key,
+		Value: prepared.Updates[0].Value,
+	}}); err != nil {
+		return err
+	}
+	return config.GlobalOption.Set(prepared.Updates[0].Key, prepared.Updates[0].Value)
+}
+
+func SaveOptionsTx(tx *gorm.DB, options []Option) error {
+	for i := range options {
+		key := config.GlobalOption.NormalizeKey(options[i].Key)
+		if !config.GlobalOption.IsRegistered(key) {
+			return fmt.Errorf("未知的配置项：%s", key)
+		}
+		option := Option{
+			Key: key,
+		}
+		if err := tx.FirstOrCreate(&option, Option{Key: key}).Error; err != nil {
+			return err
+		}
+		option.Value = options[i].Value
+		if err := tx.Save(&option).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func logUnknownOptionKeyOnce(key string) {
+	if _, loaded := loggedUnknownOptionKeys.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	if logger.Logger != nil {
+		logger.SysLog("skipping unknown option key during option sync: " + key)
+	}
+}
+
+func shouldLogInvalidOptionLoadError(key string, err error) bool {
+	message := err.Error()
+	previous, exists := loggedInvalidOptionLoadErrors.Load(key)
+	if exists && previous == message {
+		return false
+	}
+	loggedInvalidOptionLoadErrors.Store(key, message)
+	return true
+}
+
+func clearLoggedInvalidOptionLoadError(key string) {
+	loggedInvalidOptionLoadErrors.Delete(key)
+}
+
+func clearStaleLoggedInvalidOptionLoadErrors(loadedOptions map[string]string) {
+	loggedInvalidOptionLoadErrors.Range(func(rawKey, _ any) bool {
+		key, ok := rawKey.(string)
+		if !ok {
+			loggedInvalidOptionLoadErrors.Delete(rawKey)
+			return true
+		}
+		if _, exists := loadedOptions[key]; !exists {
+			loggedInvalidOptionLoadErrors.Delete(key)
+		}
+		return true
+	})
 }

@@ -11,26 +11,38 @@ var GeminiSettingsInstance = GeminiSettings{
 }
 
 func init() {
-	GlobalOption.RegisterCustom("GeminiOpenThink", func() string {
+	GlobalOption.RegisterCustomOptionWithValidator("GeminiOpenThink", func() string {
 		return GeminiSettingsInstance.GetOpenThinkJSONString()
 	}, func(value string) error {
-		GeminiSettingsInstance.SetOpenThink(value)
-		return nil
+		return GeminiSettingsInstance.SetOpenThink(value)
+	}, func(value string) error {
+		return ValidateGeminiOpenThink(value)
+	}, OptionMetadata{
+		Visibility: OptionVisibilityPublic,
 	}, "")
 }
 
-func (c *GeminiSettings) SetOpenThink(data string) {
+func ValidateGeminiOpenThink(data string) error {
 	if data == "" {
-		c.OpenThink = map[string]bool{}
-		return
+		return nil
 	}
 
 	var openThink map[string]bool
-	err := json.Unmarshal([]byte(data), &openThink)
-	if err != nil {
-		return
+	return json.Unmarshal([]byte(data), &openThink)
+}
+
+func (c *GeminiSettings) SetOpenThink(data string) error {
+	if data == "" {
+		c.OpenThink = map[string]bool{}
+		return nil
+	}
+
+	var openThink map[string]bool
+	if err := json.Unmarshal([]byte(data), &openThink); err != nil {
+		return err
 	}
 	c.OpenThink = openThink
+	return nil
 }
 
 func (c *GeminiSettings) GetOpenThink(model string) bool {
