@@ -19,6 +19,7 @@ import (
 	"one-api/common/webauthn"
 	"one-api/controller"
 	"one-api/cron"
+	"one-api/metrics"
 	"one-api/middleware"
 	"one-api/model"
 	"one-api/providers/codex"
@@ -42,6 +43,7 @@ var indexPage []byte
 func main() {
 	cli.InitCli()
 	config.InitConf()
+	metrics.InitRequestBodyDecodeMetrics()
 	if viper.GetString("log_level") == "debug" {
 		config.Debug = true
 	}

@@ -26,6 +26,11 @@ var AnalyticsCode = ""
 var QuotaPerUnit = 500 * 1000.0 // $0.002 / 1K tokens
 var DisplayInCurrencyEnabled = true
 var OpenAIRealtimeSessionCompatMode = false
+var RequestBodyDecodeEnabled = true
+var RequestBodyDecodeMaxWireBytes int64 = 64 << 20
+var RequestBodyDecodeMaxDecodedBytes int64 = 64 << 20
+var RequestBodyDecodeMaxExpansionRatio int64 = 64
+var RequestBodyDecodeMaxLayers = 2
 
 // 是否开启用户月账单功能
 var UserInvoiceMonth = false

@@ -1,6 +1,7 @@
 package router
 
 import (
+	"one-api/common/surface"
 	"one-api/middleware"
 	"one-api/relay"
 	"one-api/relay/midjourney"
@@ -33,36 +34,50 @@ func setOpenAIRouter(router *gin.Engine) {
 	relayV1Router := router.Group("/v1")
 	relayV1Router.Use(middleware.RelayPanicRecover(), middleware.OpenaiAuth(), middleware.Distribute(), middleware.DynamicRedisRateLimiter())
 	{
-		relayV1Router.POST("/completions", relay.Relay)
-		relayV1Router.POST("/chat/completions", relay.Relay)
-		relayV1Router.POST("/responses", relay.Relay)
-		relayV1Router.POST("/responses/compact", relay.Relay)
-		// relayV1Router.POST("/edits", controller.Relay)
-		relayV1Router.POST("/images/generations", relay.Relay)
-		relayV1Router.POST("/images/edits", relay.Relay)
-		relayV1Router.POST("/images/variations", relay.Relay)
-		relayV1Router.POST("/embeddings", relay.Relay)
-		// relayV1Router.POST("/engines/:model/embeddings", controller.RelayEmbeddings)
-		relayV1Router.POST("/audio/transcriptions", relay.Relay)
-		relayV1Router.POST("/audio/translations", relay.Relay)
-		relayV1Router.POST("/audio/speech", relay.Relay)
-		relayV1Router.POST("/moderations", relay.Relay)
-		relayV1Router.POST("/rerank", relay.RelayRerank)
 		relayV1Router.GET("/realtime", relay.ChatRealtime)
+	}
 
-		relayV1Router.Use(middleware.SpecifiedChannel())
-		{
-			relayV1Router.Any("/files", relay.RelayOnly)
-			relayV1Router.Any("/files/*any", relay.RelayOnly)
-			relayV1Router.Any("/fine_tuning/*any", relay.RelayOnly)
-			relayV1Router.Any("/assistants", relay.RelayOnly)
-			relayV1Router.Any("/assistants/*any", relay.RelayOnly)
-			relayV1Router.Any("/threads", relay.RelayOnly)
-			relayV1Router.Any("/threads/*any", relay.RelayOnly)
-			relayV1Router.Any("/batches/*any", relay.RelayOnly)
-			relayV1Router.Any("/vector_stores/*any", relay.RelayOnly)
-			relayV1Router.DELETE("/models/:model", relay.RelayOnly)
-		}
+	// Trade-off: only structured relay endpoints opt into request-body decode.
+	// That keeps auth/rate limiting ahead of decompression and preserves raw
+	// pass-through contracts plus NoRoute behavior for everything else.
+	structuredRelayV1Router := relayV1Router.Group("")
+	structuredRelayV1Router.Use(middleware.NormalizeEncodedRequestBodyWithFailureResponder(surface.OpenAIRequestBodyDecodeFailure))
+	{
+		structuredRelayV1Router.POST("/completions", relay.Relay)
+		structuredRelayV1Router.POST("/chat/completions", relay.Relay)
+		structuredRelayV1Router.POST("/responses", relay.Relay)
+		structuredRelayV1Router.POST("/responses/compact", relay.Relay)
+		// structuredRelayV1Router.POST("/edits", controller.Relay)
+		structuredRelayV1Router.POST("/images/generations", relay.Relay)
+		structuredRelayV1Router.POST("/images/edits", relay.Relay)
+		structuredRelayV1Router.POST("/images/variations", relay.Relay)
+		structuredRelayV1Router.POST("/embeddings", relay.Relay)
+		// structuredRelayV1Router.POST("/engines/:model/embeddings", controller.RelayEmbeddings)
+		structuredRelayV1Router.POST("/audio/transcriptions", relay.Relay)
+		structuredRelayV1Router.POST("/audio/translations", relay.Relay)
+		structuredRelayV1Router.POST("/audio/speech", relay.Relay)
+		structuredRelayV1Router.POST("/moderations", relay.Relay)
+	}
+
+	rerankRelayV1Router := relayV1Router.Group("")
+	rerankRelayV1Router.Use(middleware.NormalizeEncodedRequestBodyWithFailureResponder(surface.RerankRequestBodyDecodeFailure))
+	{
+		rerankRelayV1Router.POST("/rerank", relay.RelayRerank)
+	}
+
+	rawRelayV1Router := relayV1Router.Group("")
+	rawRelayV1Router.Use(middleware.SpecifiedChannel())
+	{
+		rawRelayV1Router.Any("/files", relay.RelayOnly)
+		rawRelayV1Router.Any("/files/*any", relay.RelayOnly)
+		rawRelayV1Router.Any("/fine_tuning/*any", relay.RelayOnly)
+		rawRelayV1Router.Any("/assistants", relay.RelayOnly)
+		rawRelayV1Router.Any("/assistants/*any", relay.RelayOnly)
+		rawRelayV1Router.Any("/threads", relay.RelayOnly)
+		rawRelayV1Router.Any("/threads/*any", relay.RelayOnly)
+		rawRelayV1Router.Any("/batches/*any", relay.RelayOnly)
+		rawRelayV1Router.Any("/vector_stores/*any", relay.RelayOnly)
+		rawRelayV1Router.DELETE("/models/:model", relay.RelayOnly)
 	}
 }
 
@@ -81,20 +96,25 @@ func registerMjRouterGroup(relayMjRouter *gin.RouterGroup) {
 	relayMjRouter.GET("/image/:id", midjourney.RelayMidjourneyImage)
 	relayMjRouter.Use(middleware.RelayMJPanicRecover(), middleware.MjAuth(), middleware.Distribute(), middleware.DynamicRedisRateLimiter())
 	{
-		relayMjRouter.POST("/submit/action", midjourney.RelayMidjourney)
-		relayMjRouter.POST("/submit/shorten", midjourney.RelayMidjourney)
-		relayMjRouter.POST("/submit/modal", midjourney.RelayMidjourney)
-		relayMjRouter.POST("/submit/imagine", midjourney.RelayMidjourney)
-		relayMjRouter.POST("/submit/change", midjourney.RelayMidjourney)
-		relayMjRouter.POST("/submit/simple-change", midjourney.RelayMidjourney)
-		relayMjRouter.POST("/submit/describe", midjourney.RelayMidjourney)
-		relayMjRouter.POST("/submit/blend", midjourney.RelayMidjourney)
-		relayMjRouter.POST("/notify", midjourney.RelayMidjourney)
 		relayMjRouter.GET("/task/:id/fetch", midjourney.RelayMidjourney)
 		relayMjRouter.GET("/task/:id/image-seed", midjourney.RelayMidjourney)
-		relayMjRouter.POST("/task/list-by-condition", midjourney.RelayMidjourney)
-		relayMjRouter.POST("/insight-face/swap", midjourney.RelayMidjourney)
-		relayMjRouter.POST("/submit/upload-discord-images", midjourney.RelayMidjourney)
+	}
+
+	structuredRelayMjRouter := relayMjRouter.Group("")
+	structuredRelayMjRouter.Use(middleware.NormalizeEncodedRequestBodyWithFailureResponder(surface.MidjourneyRequestBodyDecodeFailure))
+	{
+		structuredRelayMjRouter.POST("/submit/action", midjourney.RelayMidjourney)
+		structuredRelayMjRouter.POST("/submit/shorten", midjourney.RelayMidjourney)
+		structuredRelayMjRouter.POST("/submit/modal", midjourney.RelayMidjourney)
+		structuredRelayMjRouter.POST("/submit/imagine", midjourney.RelayMidjourney)
+		structuredRelayMjRouter.POST("/submit/change", midjourney.RelayMidjourney)
+		structuredRelayMjRouter.POST("/submit/simple-change", midjourney.RelayMidjourney)
+		structuredRelayMjRouter.POST("/submit/describe", midjourney.RelayMidjourney)
+		structuredRelayMjRouter.POST("/submit/blend", midjourney.RelayMidjourney)
+		structuredRelayMjRouter.POST("/notify", midjourney.RelayMidjourney)
+		structuredRelayMjRouter.POST("/task/list-by-condition", midjourney.RelayMidjourney)
+		structuredRelayMjRouter.POST("/insight-face/swap", midjourney.RelayMidjourney)
+		structuredRelayMjRouter.POST("/submit/upload-discord-images", midjourney.RelayMidjourney)
 	}
 }
 
@@ -102,9 +122,14 @@ func setSunoRouter(router *gin.Engine) {
 	relaySunoRouter := router.Group("/suno")
 	relaySunoRouter.Use(middleware.RelaySunoPanicRecover(), middleware.OpenaiAuth(), middleware.Distribute(), middleware.DynamicRedisRateLimiter())
 	{
-		relaySunoRouter.POST("/submit/:action", task.RelayTaskSubmit)
-		relaySunoRouter.POST("/fetch", suno.GetFetch)
 		relaySunoRouter.GET("/fetch/:id", suno.GetFetchByID)
+	}
+
+	structuredRelaySunoRouter := relaySunoRouter.Group("")
+	structuredRelaySunoRouter.Use(middleware.NormalizeEncodedRequestBodyWithFailureResponder(surface.TaskRequestBodyDecodeFailure))
+	{
+		structuredRelaySunoRouter.POST("/submit/:action", task.RelayTaskSubmit)
+		structuredRelaySunoRouter.POST("/fetch", suno.GetFetch)
 	}
 }
 
@@ -113,8 +138,13 @@ func setClaudeRouter(router *gin.Engine) {
 	relayV1Router := relayClaudeRouter.Group("/v1")
 	relayV1Router.Use(middleware.APIEnabled("claude"), middleware.RelayCluadePanicRecover(), middleware.ClaudeAuth(), middleware.Distribute(), middleware.DynamicRedisRateLimiter())
 	{
-		relayV1Router.POST("/messages", relay.Relay)
 		relayV1Router.GET("/models", relay.ListClaudeModelsByToken)
+	}
+
+	structuredRelayClaudeV1Router := relayV1Router.Group("")
+	structuredRelayClaudeV1Router.Use(middleware.NormalizeEncodedRequestBodyWithFailureResponder(surface.ClaudeRequestBodyDecodeFailure))
+	{
+		structuredRelayClaudeV1Router.POST("/messages", relay.Relay)
 	}
 }
 
@@ -122,8 +152,13 @@ func setGeminiRouter(router *gin.Engine) {
 	relayGeminiRouter := router.Group("/gemini")
 	relayGeminiRouter.Use(middleware.APIEnabled("gemini"), middleware.RelayGeminiPanicRecover(), middleware.GeminiAuth(), middleware.Distribute(), middleware.DynamicRedisRateLimiter())
 	{
-		relayGeminiRouter.POST("/:version/models/:model", relay.Relay)
 		relayGeminiRouter.GET("/:version/models", relay.ListGeminiModelsByToken)
+	}
+
+	structuredRelayGeminiRouter := relayGeminiRouter.Group("")
+	structuredRelayGeminiRouter.Use(middleware.NormalizeEncodedRequestBodyWithFailureResponder(surface.GeminiRequestBodyDecodeFailure))
+	{
+		structuredRelayGeminiRouter.POST("/:version/models/:model", relay.Relay)
 	}
 }
 
@@ -148,6 +183,8 @@ func setKlingRouter(router *gin.Engine) {
 
 	relayKlingRouter.Use(middleware.DynamicRedisRateLimiter())
 	{
-		relayKlingRouter.POST("/v1/:class/:action", task.RelayTaskSubmit)
+		structuredRelayKlingRouter := relayKlingRouter.Group("")
+		structuredRelayKlingRouter.Use(middleware.NormalizeEncodedRequestBodyWithFailureResponder(surface.TaskRequestBodyDecodeFailure))
+		structuredRelayKlingRouter.POST("/v1/:class/:action", task.RelayTaskSubmit)
 	}
 }

@@ -213,12 +213,17 @@ func (p *BaseProvider) GetSupportedResponse() bool {
 }
 
 func (p *BaseProvider) GetRawBody() ([]byte, bool) {
-	if raw, exists := p.Context.Get(config.GinRequestBodyKey); exists {
-		if bytes, ok := raw.([]byte); ok {
-			return bytes, true
-		}
+	if p.Context == nil {
+		return nil, false
 	}
-	return nil, false
+	if body, ok := common.GetCanonicalRequestBody(p.Context); ok {
+		return body, true
+	}
+	body, err := common.CacheRequestBody(p.Context)
+	if err != nil {
+		return nil, false
+	}
+	return body, true
 }
 
 func (p *BaseProvider) GetRawBodyMap() (map[string]interface{}, bool, error) {

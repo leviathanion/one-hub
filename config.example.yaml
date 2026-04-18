@@ -37,6 +37,12 @@ user_invoice_month: false #是否开启用户月账单功能
 github_proxy: "" #github登录请求代理例如socks://127.0.0.1:10808
 openai:
   realtime_session_compat: false # OpenAI Realtime 兼容模式；开启后，上游 error 事件会在转发后立即关闭当前会话
+request_body_decode:
+  enabled: true # 是否启用支持该能力的 Relay 结构化路由入站 Content-Encoding 规范化
+  max_wire_bytes: 67108864 # 压缩后的请求体最大字节数，限制入口层内存占用
+  max_decoded_bytes: 67108864 # 整个解码链共享的最大解压字节数，超过直接拒绝
+  max_expansion_ratio: 64 # 相对原始 wire body 的整链最大膨胀倍数，用于防止多层压缩炸弹
+  max_layers: 2 # 允许的 Content-Encoding 链最大层数
 codex:
   execution_session_revocation_timeout_ms: 200 # Codex execution session revocation 查询超时；超时会收敛为 unknown，并跳过本次 resume
 

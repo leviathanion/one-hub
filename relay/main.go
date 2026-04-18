@@ -38,19 +38,19 @@ func Relay(c *gin.Context) {
 	applyPreMappingBeforeRequest(c)
 
 	if err := relay.setRequest(); err != nil {
-		openaiErr := common.StringErrorWrapperLocal(err.Error(), "one_hub_error", http.StatusBadRequest)
+		openaiErr := wrapRelaySetupError(relay, "request", err, "one_hub_error", http.StatusBadRequest)
 		relay.HandleJsonError(openaiErr)
 		return
 	}
 
 	c.Set("is_stream", relay.IsStream())
 	if err := relay.setProvider(relay.getOriginalModel()); err != nil {
-		openaiErr := common.StringErrorWrapperLocal(err.Error(), "one_hub_error", http.StatusServiceUnavailable)
+		openaiErr := wrapRelaySetupError(relay, "provider", err, "one_hub_error", http.StatusServiceUnavailable)
 		relay.HandleJsonError(openaiErr)
 		return
 	}
 	if err := reparseRequestAfterProviderSelection(relay); err != nil {
-		openaiErr := common.StringErrorWrapperLocal(err.Error(), "one_hub_error", http.StatusBadRequest)
+		openaiErr := wrapRelaySetupError(relay, "reparse", err, "one_hub_error", http.StatusBadRequest)
 		relay.HandleJsonError(openaiErr)
 		return
 	}
@@ -69,6 +69,15 @@ func Relay(c *gin.Context) {
 
 		relay.HandleJsonError(apiErr)
 	}
+}
+
+func wrapRelaySetupError(relay RelayBaseInterface, stage string, err error, defaultCode string, statusCode int) *types.OpenAIErrorWithStatusCode {
+	if wrapper, ok := relay.(relaySetupErrorWrapper); ok {
+		if wrapped := wrapper.WrapSetupError(stage, err); wrapped != nil {
+			return wrapped
+		}
+	}
+	return common.StringErrorWrapperLocal(err.Error(), defaultCode, statusCode)
 }
 
 func executeRelayAttempts(relay RelayBaseInterface) *types.OpenAIErrorWithStatusCode {
@@ -283,17 +292,17 @@ func applyPreMappingForProvider(c *gin.Context, modelName string, provider provi
 	}
 
 	bodyChanged := !bytes.Equal(currentBodyBytes, finalBodyBytes)
-	c.Set(config.GinRequestBodyReparseKey, bodyChanged)
+	common.SetRequestBodyReparseNeeded(c, bodyChanged)
 	return bodyChanged, nil
 }
 
 func reparseRequestAfterProviderSelection(relay RelayBaseInterface) error {
 	c := relay.getContext()
-	if !c.GetBool(config.GinRequestBodyReparseKey) {
+	if !common.GetRequestBodyReparseNeeded(c) {
 		return nil
 	}
 
-	c.Set(config.GinRequestBodyReparseKey, false)
+	common.SetRequestBodyReparseNeeded(c, false)
 	if err := relay.setRequest(); err != nil {
 		return err
 	}
@@ -325,5 +334,5 @@ func applyPreMappingBeforeRequest(c *gin.Context) {
 	}
 	cacheProviderSelection(c, requestState.Model, provider, c.GetString("new_model"))
 	_, _ = applyPreMappingForProvider(c, requestState.Model, provider)
-	c.Set(config.GinRequestBodyReparseKey, false)
+	common.SetRequestBodyReparseNeeded(c, false)
 }

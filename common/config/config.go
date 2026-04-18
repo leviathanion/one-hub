@@ -18,6 +18,11 @@ func InitConf() {
 	SessionSecret = utils.GetOrDefault("session_secret", SessionSecret)
 	UserInvoiceMonth = viper.GetBool("user_invoice_month")
 	OpenAIRealtimeSessionCompatMode = viper.GetBool("openai.realtime_session_compat")
+	RequestBodyDecodeEnabled = viper.GetBool("request_body_decode.enabled")
+	RequestBodyDecodeMaxWireBytes = viper.GetInt64("request_body_decode.max_wire_bytes")
+	RequestBodyDecodeMaxDecodedBytes = viper.GetInt64("request_body_decode.max_decoded_bytes")
+	RequestBodyDecodeMaxExpansionRatio = viper.GetInt64("request_body_decode.max_expansion_ratio")
+	RequestBodyDecodeMaxLayers = viper.GetInt("request_body_decode.max_layers")
 	GitHubProxy = viper.GetString("github_proxy")
 	MCP_ENABLE = viper.GetBool("mcp.enable") != false
 	UPTIMEKUMA_ENABLE = viper.GetBool("uptime_kuma.enable") != false
@@ -49,6 +54,11 @@ func defaultConfig() {
 	viper.SetDefault("favicon", "")
 	viper.SetDefault("user_invoice_month", false)
 	viper.SetDefault("openai.realtime_session_compat", false)
+	viper.SetDefault("request_body_decode.enabled", true)
+	viper.SetDefault("request_body_decode.max_wire_bytes", int64(64<<20))
+	viper.SetDefault("request_body_decode.max_decoded_bytes", int64(64<<20))
+	viper.SetDefault("request_body_decode.max_expansion_ratio", int64(64))
+	viper.SetDefault("request_body_decode.max_layers", 2)
 	viper.SetDefault("codex.execution_session_revocation_timeout_ms", 200)
 	viper.SetDefault("mcp.enable", false)
 	viper.SetDefault("uptime_kuma.enable", false)

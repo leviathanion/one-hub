@@ -99,7 +99,7 @@ func TestApplyPreMappingBeforeRequestReSelectsProviderWhenToolsAreInjected(t *te
 		t.Fatalf("expected provider to be re-selected onto non-OnlyChat channel, got %d", got)
 	}
 
-	if !ctx.GetBool(config.GinRequestBodyReparseKey) {
+	if !common.GetRequestBodyReparseNeeded(ctx) {
 		t.Fatal("expected provider re-selection to request a body reparse")
 	}
 

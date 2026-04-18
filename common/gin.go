@@ -7,6 +7,7 @@ import (
 	"io"
 	"one-api/common/config"
 	"one-api/common/logger"
+	"one-api/common/requestbody"
 	"one-api/types"
 	"strings"
 
@@ -14,22 +15,106 @@ import (
 	"github.com/go-playground/validator/v10"
 )
 
-func CacheRequestBody(c *gin.Context) ([]byte, error) {
-	if cached, exists := c.Get(config.GinRequestBodyKey); exists {
-		if requestBody, ok := cached.([]byte); ok {
-			if _, exists := c.Get(config.GinOriginalRequestBodyKey); !exists {
-				c.Set(config.GinOriginalRequestBodyKey, requestBody)
-			}
-			c.Request.Body = io.NopCloser(bytes.NewBuffer(requestBody))
-			return requestBody, nil
+type CanonicalRequestState struct {
+	// OriginalBody keeps the normalized client payload before any provider-
+	// specific request rewrites. Pre-mapping needs this stable baseline so a
+	// provider re-selection can rebuild the body idempotently.
+	OriginalBody []byte
+	WireBody     []byte
+	Body         []byte
+	BodyMap      map[string]interface{}
+	DecodeMeta   *requestbody.DecodeMeta
+}
+
+func ensureCanonicalRequestState(c *gin.Context) *CanonicalRequestState {
+	if c == nil {
+		return nil
+	}
+	if cached, exists := c.Get(config.GinCanonicalRequestStateKey); exists {
+		if state, ok := cached.(*CanonicalRequestState); ok && state != nil {
+			return state
 		}
+	}
+
+	state := &CanonicalRequestState{}
+	if cached, exists := c.Get(config.GinRequestBodyKey); exists {
+		if body, ok := cached.([]byte); ok {
+			state.Body = body
+		}
+	}
+	if cached, exists := c.Get(config.GinOriginalRequestBodyKey); exists {
+		if body, ok := cached.([]byte); ok {
+			state.OriginalBody = body
+		}
+	}
+	if cached, exists := c.Get(config.GinWireRequestBodyKey); exists {
+		if body, ok := cached.([]byte); ok {
+			state.WireBody = body
+		}
+	}
+	if cached, exists := c.Get(config.GinRequestBodyMapKey); exists {
+		if bodyMap, ok := cached.(map[string]interface{}); ok {
+			state.BodyMap = bodyMap
+		}
+	}
+	if cached, exists := c.Get(config.GinRequestBodyDecodeMetaKey); exists {
+		if meta, ok := cached.(*requestbody.DecodeMeta); ok {
+			state.DecodeMeta = meta
+		}
+	}
+	c.Set(config.GinCanonicalRequestStateKey, state)
+	return state
+}
+
+func persistCanonicalRequestState(c *gin.Context, state *CanonicalRequestState) {
+	if c == nil || state == nil {
+		return
+	}
+	c.Set(config.GinCanonicalRequestStateKey, state)
+	c.Set(config.GinRequestBodyKey, state.Body)
+	c.Set(config.GinOriginalRequestBodyKey, state.OriginalBody)
+	c.Set(config.GinWireRequestBodyKey, state.WireBody)
+	c.Set(config.GinRequestBodyMapKey, state.BodyMap)
+	c.Set(config.GinRequestBodyDecodeMetaKey, state.DecodeMeta)
+}
+
+func replaceReusableRequestBody(c *gin.Context, requestBody []byte) {
+	if c == nil || c.Request == nil {
+		return
+	}
+	c.Request.Body = io.NopCloser(bytes.NewBuffer(requestBody))
+}
+
+func setCanonicalRequestBodyState(c *gin.Context, state *CanonicalRequestState, requestBody []byte, requestMap map[string]interface{}) {
+	if state == nil {
+		return
+	}
+	if requestBody == nil {
+		requestBody = []byte{}
+	}
+	if state.OriginalBody == nil {
+		state.OriginalBody = requestBody
+	}
+	state.Body = requestBody
+	state.BodyMap = requestMap
+	persistCanonicalRequestState(c, state)
+	replaceReusableRequestBody(c, requestBody)
+}
+
+func CacheRequestBody(c *gin.Context) ([]byte, error) {
+	if state := ensureCanonicalRequestState(c); state != nil && state.Body != nil {
+		if state.OriginalBody == nil {
+			state.OriginalBody = state.Body
+		}
+		persistCanonicalRequestState(c, state)
+		replaceReusableRequestBody(c, state.Body)
+		return state.Body, nil
 	}
 
 	if c == nil || c.Request == nil || c.Request.Body == nil {
 		requestBody := []byte{}
-		if c != nil {
-			c.Set(config.GinOriginalRequestBodyKey, requestBody)
-			SetReusableRequestBody(c, requestBody)
+		if state := ensureCanonicalRequestState(c); state != nil {
+			setCanonicalRequestBodyState(c, state, requestBody, nil)
 		}
 		return requestBody, nil
 	}
@@ -42,37 +127,113 @@ func CacheRequestBody(c *gin.Context) ([]byte, error) {
 		return nil, err
 	}
 
-	c.Set(config.GinOriginalRequestBodyKey, requestBody)
-	SetReusableRequestBody(c, requestBody)
+	state := ensureCanonicalRequestState(c)
+	if state != nil {
+		setCanonicalRequestBodyState(c, state, requestBody, nil)
+	}
 	return requestBody, nil
 }
 
 func SetReusableRequestBody(c *gin.Context, requestBody []byte) {
-	c.Set(config.GinRequestBodyKey, requestBody)
-	c.Set(config.GinRequestBodyMapKey, nil)
-	c.Request.Body = io.NopCloser(bytes.NewBuffer(requestBody))
+	state := ensureCanonicalRequestState(c)
+	if state == nil {
+		return
+	}
+	setCanonicalRequestBodyState(c, state, requestBody, nil)
+}
+
+// SetCanonicalRequestBody stores the request body shape that downstream
+// business logic should observe. This is intentionally the decoded body after
+// transport-level normalization so existing bind/reparse helpers keep a stable,
+// directly parseable JSON contract. Keep this as a compatibility wrapper and
+// prefer SetDecodedRequestState when transport normalization also needs wire
+// bytes and decode metadata to stay in sync.
+func SetCanonicalRequestBody(c *gin.Context, requestBody []byte) {
+	SetReusableRequestBody(c, requestBody)
 }
 
 func SetReusableRequestBodyMap(c *gin.Context, requestBody []byte, requestMap map[string]interface{}) {
-	c.Set(config.GinRequestBodyKey, requestBody)
-	c.Set(config.GinRequestBodyMapKey, requestMap)
-	c.Request.Body = io.NopCloser(bytes.NewBuffer(requestBody))
+	state := ensureCanonicalRequestState(c)
+	if state == nil {
+		return
+	}
+	setCanonicalRequestBodyState(c, state, requestBody, requestMap)
+}
+
+func GetCanonicalRequestBody(c *gin.Context) ([]byte, bool) {
+	state := ensureCanonicalRequestState(c)
+	if state == nil || state.Body == nil {
+		return nil, false
+	}
+	return state.Body, true
 }
 
 func GetOriginalRequestBody(c *gin.Context) ([]byte, bool) {
-	if cached, exists := c.Get(config.GinOriginalRequestBodyKey); exists {
-		if requestBody, ok := cached.([]byte); ok {
-			return requestBody, true
-		}
+	state := ensureCanonicalRequestState(c)
+	if state == nil || state.OriginalBody == nil {
+		return nil, false
 	}
-	return nil, false
+	return state.OriginalBody, true
+}
+
+// SetDecodedRequestState atomically seeds the canonical request state after
+// transport-level decoding so every downstream consumer observes the same
+// decoded body without rereading c.Request.Body.
+func SetDecodedRequestState(c *gin.Context, wireBody []byte, decodedBody []byte, meta *requestbody.DecodeMeta) {
+	state := ensureCanonicalRequestState(c)
+	if state == nil {
+		return
+	}
+	if decodedBody == nil {
+		decodedBody = []byte{}
+	}
+	state.OriginalBody = decodedBody
+	state.Body = decodedBody
+	state.WireBody = wireBody
+	state.BodyMap = nil
+	state.DecodeMeta = meta
+	persistCanonicalRequestState(c, state)
+	replaceReusableRequestBody(c, decodedBody)
+}
+
+func SetWireRequestBody(c *gin.Context, requestBody []byte) {
+	state := ensureCanonicalRequestState(c)
+	if state == nil {
+		return
+	}
+	state.WireBody = requestBody
+	persistCanonicalRequestState(c, state)
+}
+
+func GetWireRequestBody(c *gin.Context) ([]byte, bool) {
+	state := ensureCanonicalRequestState(c)
+	if state == nil || state.WireBody == nil {
+		return nil, false
+	}
+	return state.WireBody, true
+}
+
+func SetRequestBodyDecodeMeta(c *gin.Context, meta *requestbody.DecodeMeta) {
+	state := ensureCanonicalRequestState(c)
+	if state == nil {
+		return
+	}
+	state.DecodeMeta = meta
+	persistCanonicalRequestState(c, state)
+}
+
+func GetRequestBodyDecodeMeta(c *gin.Context) (*requestbody.DecodeMeta, bool) {
+	state := ensureCanonicalRequestState(c)
+	if state == nil || state.DecodeMeta == nil {
+		return nil, false
+	}
+	return state.DecodeMeta, true
 }
 
 func GetReusableBodyMap(c *gin.Context) (map[string]interface{}, error) {
-	if cached, exists := c.Get(config.GinRequestBodyMapKey); exists {
-		if requestMap, ok := cached.(map[string]interface{}); ok && requestMap != nil {
-			return requestMap, nil
-		}
+	state := ensureCanonicalRequestState(c)
+	if state != nil && state.BodyMap != nil {
+		return state.BodyMap, nil
 	}
 
 	requestBody, err := CacheRequestBody(c)
@@ -88,7 +249,10 @@ func GetReusableBodyMap(c *gin.Context) (map[string]interface{}, error) {
 		return nil, err
 	}
 
-	c.Set(config.GinRequestBodyMapKey, requestMap)
+	if state != nil {
+		state.BodyMap = requestMap
+		persistCanonicalRequestState(c, state)
+	}
 	return requestMap, nil
 }
 
@@ -123,6 +287,20 @@ func UnmarshalBodyReusable(c *gin.Context, v any) error {
 
 	// c.Request.Body = io.NopCloser(bytes.NewBuffer(requestBody))
 	return nil
+}
+
+func SetRequestBodyReparseNeeded(c *gin.Context, needed bool) {
+	if c == nil {
+		return
+	}
+	c.Set(config.GinRequestBodyReparseKey, needed)
+}
+
+func GetRequestBodyReparseNeeded(c *gin.Context) bool {
+	if c == nil {
+		return false
+	}
+	return c.GetBool(config.GinRequestBodyReparseKey)
 }
 
 func cloneJSONValue(value interface{}) interface{} {
