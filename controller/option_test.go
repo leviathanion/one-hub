@@ -23,8 +23,6 @@ func useControllerTestOptionDB(t *testing.T) {
 
 	originalDB := model.DB
 	originalOptionManager := config.GlobalOption
-	originalAutomaticRecoverEnabled := config.AutomaticRecoverChannelsEnabled
-	originalAutomaticRecoverInterval := config.AutomaticRecoverChannelsIntervalMinutes
 	originalGitHubOAuthEnabled := config.GitHubOAuthEnabled
 	originalGitHubClientID := config.GitHubClientId
 	originalGitHubClientSecret := config.GitHubClientSecret
@@ -83,8 +81,6 @@ func useControllerTestOptionDB(t *testing.T) {
 	config.TurnstileSecretKey = ""
 	config.EmailDomainRestrictionEnabled = false
 	config.EmailDomainWhitelist = append([]string(nil), originalEmailDomainWhitelist...)
-	config.AutomaticRecoverChannelsEnabled = false
-	config.AutomaticRecoverChannelsIntervalMinutes = 10
 	model.InitOptionMap()
 	config.GlobalOption.RegisterCustomOptionWithValidator("ChannelAffinitySetting", func() string {
 		return config.ChannelAffinitySettingsInstance.JSONString()
@@ -141,8 +137,6 @@ func useControllerTestOptionDB(t *testing.T) {
 		config.TurnstileSecretKey = originalTurnstileSecretKey
 		config.EmailDomainRestrictionEnabled = originalEmailDomainRestrictionEnabled
 		config.EmailDomainWhitelist = append([]string(nil), originalEmailDomainWhitelist...)
-		config.AutomaticRecoverChannelsEnabled = originalAutomaticRecoverEnabled
-		config.AutomaticRecoverChannelsIntervalMinutes = originalAutomaticRecoverInterval
 	})
 }
 
@@ -554,188 +548,6 @@ func TestClearChannelAffinityCacheReturnsClearedCount(t *testing.T) {
 	}
 	if payload.Data["cleared"] != float64(2) {
 		t.Fatalf("expected cleared=2, got %#v", payload.Data["cleared"])
-	}
-}
-
-func TestUpdateOptionRejectsEnablingAutomaticRecoverWithoutPositiveInterval(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	useControllerTestOptionDB(t)
-
-	config.AutomaticRecoverChannelsIntervalMinutes = 0
-
-	body := bytes.NewBufferString(`{"key":"AutomaticRecoverChannelsEnabled","value":"true"}`)
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/option/", body)
-
-	UpdateOption(ctx)
-
-	var payload struct {
-		Success bool   `json:"success"`
-		Message string `json:"message"`
-	}
-	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("expected valid json payload, got %v", err)
-	}
-	if payload.Success {
-		t.Fatalf("expected enablement validation failure, got %#v", payload)
-	}
-	if payload.Message == "" {
-		t.Fatalf("expected validation message, got %#v", payload)
-	}
-}
-
-func TestUpdateOptionRejectsZeroAutomaticRecoverIntervalWhileRecoveryEnabled(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	useControllerTestOptionDB(t)
-
-	if err := model.UpdateOption("AutomaticRecoverChannelsIntervalMinutes", "10"); err != nil {
-		t.Fatalf("expected recover interval seed to persist, got %v", err)
-	}
-	if err := model.UpdateOption("AutomaticRecoverChannelsEnabled", "true"); err != nil {
-		t.Fatalf("expected recover enablement seed to persist, got %v", err)
-	}
-
-	body := bytes.NewBufferString(`{"key":"AutomaticRecoverChannelsIntervalMinutes","value":0}`)
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/option/", body)
-
-	UpdateOption(ctx)
-
-	var payload struct {
-		Success bool           `json:"success"`
-		Message string         `json:"message"`
-		Data    map[string]any `json:"data"`
-	}
-	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("expected valid json payload, got %v", err)
-	}
-	if payload.Success {
-		t.Fatalf("expected zero interval update to fail while recovery enabled, got %#v", payload)
-	}
-	if payload.Data["failed_key"] != "AutomaticRecoverChannelsIntervalMinutes" {
-		t.Fatalf("expected failed_key AutomaticRecoverChannelsIntervalMinutes, got %#v", payload.Data["failed_key"])
-	}
-	if got := config.GlobalOption.Get("AutomaticRecoverChannelsIntervalMinutes"); got != "10" {
-		t.Fatalf("expected failed interval update to preserve value 10, got %q", got)
-	}
-
-	storedOption, err := model.GetOption("AutomaticRecoverChannelsIntervalMinutes")
-	if err != nil {
-		t.Fatalf("expected stored interval option lookup to succeed, got %v", err)
-	}
-	if storedOption.Value != "10" {
-		t.Fatalf("expected stored interval value 10, got %q", storedOption.Value)
-	}
-}
-
-func TestUpdateOptionResetsAutomaticRecoverScheduleWhenEnablementChanges(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	useControllerTestOptionDB(t)
-
-	originalRecover := recoverAutoDisabledChannelsFunc
-	originalNow := currentTimeFunc
-	t.Cleanup(func() {
-		recoverAutoDisabledChannelsFunc = originalRecover
-		currentTimeFunc = originalNow
-		resetAutomaticRecoverSchedule()
-	})
-
-	now := time.Date(2026, 4, 16, 9, 0, 0, 0, time.UTC)
-	currentTimeFunc = func() time.Time {
-		return now
-	}
-	recoverRuns := 0
-	recoverAutoDisabledChannelsFunc = func() error {
-		recoverRuns++
-		return nil
-	}
-
-	automaticRecoverStateLock.Lock()
-	automaticRecoverLastRunAt = now
-	automaticRecoverStateLock.Unlock()
-	config.AutomaticRecoverChannelsEnabled = false
-	config.AutomaticRecoverChannelsIntervalMinutes = 10
-
-	body := bytes.NewBufferString(`{"key":"AutomaticRecoverChannelsEnabled","value":"true"}`)
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/option/", body)
-
-	UpdateOption(ctx)
-
-	var payload struct {
-		Success bool `json:"success"`
-	}
-	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("expected valid json payload, got %v", err)
-	}
-	if !payload.Success {
-		t.Fatalf("expected enablement update to succeed, got %#v", payload)
-	}
-
-	AutomaticRecoverChannelsTick()
-	if recoverRuns != 1 {
-		t.Fatalf("expected re-enabled recovery schedule to run immediately, got %d runs", recoverRuns)
-	}
-}
-
-func TestUpdateOptionMapsLegacyAutomaticRecoverIntervalKey(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	useControllerTestOptionDB(t)
-
-	body := bytes.NewBufferString(`{"key":"AutomaticEnableChannelRecoverFrequency","value":"21"}`)
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/option/", body)
-
-	UpdateOption(ctx)
-
-	var payload struct {
-		Success bool `json:"success"`
-	}
-	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("expected valid json payload, got %v", err)
-	}
-	if !payload.Success {
-		t.Fatalf("expected success payload, got %#v", payload)
-	}
-	if got := config.GlobalOption.Get("AutomaticRecoverChannelsIntervalMinutes"); got != "21" {
-		t.Fatalf("expected legacy key write to update new interval option, got %q", got)
-	}
-
-	storedOption, err := model.GetOption("AutomaticRecoverChannelsIntervalMinutes")
-	if err != nil {
-		t.Fatalf("expected stored new interval option lookup to succeed, got %v", err)
-	}
-	if storedOption.Value != "21" {
-		t.Fatalf("expected stored new interval option value 21, got %q", storedOption.Value)
-	}
-}
-
-func TestUpdateOptionAcceptsNumericAutomaticRecoverIntervalValue(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	useControllerTestOptionDB(t)
-
-	body := bytes.NewBufferString(`{"key":"AutomaticRecoverChannelsIntervalMinutes","value":10}`)
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/option/", body)
-
-	UpdateOption(ctx)
-
-	var payload struct {
-		Success bool `json:"success"`
-	}
-	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("expected valid json payload, got %v", err)
-	}
-	if !payload.Success {
-		t.Fatalf("expected numeric value payload to succeed, got %#v", payload)
-	}
-	if got := config.GlobalOption.Get("AutomaticRecoverChannelsIntervalMinutes"); got != "10" {
-		t.Fatalf("expected numeric value to persist as string 10, got %q", got)
 	}
 }
 

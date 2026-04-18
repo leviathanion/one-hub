@@ -11,9 +11,8 @@ type OptionUpdate struct {
 }
 
 type PreparedOptionUpdates struct {
-	Updates                             []OptionUpdate
-	UpdatedKeys                         []string
-	ShouldResetAutomaticRecoverSchedule bool
+	Updates     []OptionUpdate
+	UpdatedKeys []string
 }
 
 type OptionGroupValidationMode int
@@ -102,20 +101,6 @@ var optionGroupRules = map[string]optionGroupRule{
 			return nil
 		},
 	},
-	OptionGroupAutomaticRecoverChannel: {
-		ErrorKey:     "AutomaticRecoverChannelsIntervalMinutes",
-		ErrorMessage: "后台自动恢复探测已开启，探测间隔必须大于 0！",
-		Violations: func(values map[string]string) []string {
-			if values["AutomaticRecoverChannelsEnabled"] != "true" {
-				return nil
-			}
-			interval, err := strconv.Atoi(values["AutomaticRecoverChannelsIntervalMinutes"])
-			if err != nil || interval <= 0 {
-				return []string{"AutomaticRecoverChannelsIntervalMinutes"}
-			}
-			return nil
-		},
-	},
 }
 
 func PrepareOptionUpdates(requests []OptionUpdate, validationMode OptionGroupValidationMode) (*PreparedOptionUpdates, error) {
@@ -163,35 +148,14 @@ func PrepareOptionUpdates(requests []OptionUpdate, validationMode OptionGroupVal
 		return nil, err
 	}
 
-	shouldResetAutomaticRecoverSchedule := false
-	if _, exists := seenKeys["AutomaticRecoverChannelsEnabled"]; exists {
-		shouldResetAutomaticRecoverSchedule = (stagedValues["AutomaticRecoverChannelsEnabled"] == "true") != AutomaticRecoverChannelsEnabled
-	}
-
 	return &PreparedOptionUpdates{
-		Updates:                             updates,
-		UpdatedKeys:                         updatedKeys,
-		ShouldResetAutomaticRecoverSchedule: shouldResetAutomaticRecoverSchedule,
+		Updates:     updates,
+		UpdatedKeys: updatedKeys,
 	}, nil
 }
 
 func validateOptionValue(key, value string) error {
 	switch key {
-	case "AutomaticRecoverChannelsIntervalMinutes":
-		interval, err := strconv.Atoi(value)
-		if err != nil {
-			return &OptionValidationError{
-				Key:     key,
-				Message: "自动恢复探测间隔必须是整数！",
-			}
-		}
-		if interval < 0 {
-			return &OptionValidationError{
-				Key:     key,
-				Message: "自动恢复探测间隔不能为负数！",
-			}
-		}
-		return nil
 	case "PreferredChannelWaitMilliseconds":
 		wait, err := strconv.Atoi(value)
 		if err != nil {

@@ -7,7 +7,6 @@ import (
 	"one-api/common/config"
 	"one-api/common/logger"
 	"one-api/common/scheduler"
-	"one-api/controller"
 	"one-api/model"
 	"one-api/providers/codex"
 	"time"
@@ -82,17 +81,6 @@ func InitCron() {
 		common.SafeGoroutine(func() {
 			codex.RunAutoRefreshWithTimeout(context.Background())
 		})
-	}
-
-	err = scheduler.Manager.AddJob(
-		"recover_auto_disabled_channels",
-		gocron.DurationJob(time.Minute),
-		gocron.NewTask(func() {
-			controller.AutomaticRecoverChannelsTick()
-		}),
-	)
-	if err != nil {
-		logger.SysError("Cron job error: " + err.Error())
 	}
 
 	// 开启自动更新 并且设置了有效自动更新时间 同时自动更新模式不是system 则会从服务器拉取最新价格表

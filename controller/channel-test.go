@@ -29,15 +29,12 @@ var (
 	responseRegex   = regexp.MustCompile(`(?:^o[1-9])`)
 	noSupportRegex  = regexp.MustCompile(`(?:^tts|rerank|whisper|speech|^mj_|^chirp)`)
 
-	probeChannelFunc                = probeChannel
-	recoverAutoDisabledChannelsFunc = recoverAutoDisabledChannels
-	currentTimeFunc                 = time.Now
+	probeChannelFunc = probeChannel
+	currentTimeFunc  = time.Now
 )
 
 var (
-	fullChannelProbeRunningErr           = errors.New("通道测试已在运行中")
-	autoRecoverProbeRunningErr           = errors.New("自动恢复测试已在运行中")
-	autoRecoverInterruptedByFullProbeErr = errors.New("自动恢复被全量测试抢占")
+	fullChannelProbeRunningErr = errors.New("通道测试已在运行中")
 )
 
 type channelProbeResult struct {
@@ -238,26 +235,6 @@ func finishFullChannelProbeTask() {
 	channelProbeStateLock.Unlock()
 }
 
-func startAutoRecoverProbeTask() error {
-	channelProbeStateLock.Lock()
-	defer channelProbeStateLock.Unlock()
-
-	if autoRecoverProbeRunning {
-		return autoRecoverProbeRunningErr
-	}
-	if fullChannelProbeRunning {
-		return fullChannelProbeRunningErr
-	}
-	autoRecoverProbeRunning = true
-	return nil
-}
-
-func finishAutoRecoverProbeTask() {
-	channelProbeStateLock.Lock()
-	autoRecoverProbeRunning = false
-	channelProbeStateLock.Unlock()
-}
-
 func isFullChannelProbeRunning() bool {
 	channelProbeStateLock.Lock()
 	defer channelProbeStateLock.Unlock()
@@ -318,15 +295,6 @@ func TestChannel(c *gin.Context) {
 
 var channelProbeStateLock sync.Mutex
 var fullChannelProbeRunning bool = false
-var autoRecoverProbeRunning bool = false
-var automaticRecoverStateLock sync.Mutex
-var automaticRecoverLastRunAt time.Time
-
-func resetAutomaticRecoverSchedule() {
-	automaticRecoverStateLock.Lock()
-	automaticRecoverLastRunAt = time.Time{}
-	automaticRecoverStateLock.Unlock()
-}
 
 func testAllChannels(isNotify bool) error {
 	if err := startFullChannelProbeTask(); err != nil {
@@ -457,131 +425,4 @@ func AutomaticallyTestChannels(frequency int) {
 		}
 		logger.SysLog("channel test started")
 	}
-}
-
-func recoverAutoDisabledChannels() error {
-	if err := startAutoRecoverProbeTask(); err != nil {
-		return err
-	}
-	defer finishAutoRecoverProbeTask()
-
-	channels, err := model.GetChannelsByStatus(config.ChannelStatusAutoDisabled)
-	if err != nil {
-		return err
-	}
-
-	disableThreshold := channelDisableThresholdMilliseconds()
-	recoveredCount := 0
-	skippedCount := 0
-	failedCount := 0
-
-	for _, channel := range channels {
-		if isFullChannelProbeRunning() {
-			logger.SysLog(fmt.Sprintf("stop auto-recover probe before channel #%d(%s): full channel probe task started", channel.Id, channel.Name))
-			return autoRecoverInterruptedByFullProbeErr
-		}
-
-		time.Sleep(config.RequestInterval)
-		if isFullChannelProbeRunning() {
-			logger.SysLog(fmt.Sprintf("stop auto-recover probe after wait for channel #%d(%s): full channel probe task started", channel.Id, channel.Name))
-			return autoRecoverInterruptedByFullProbeErr
-		}
-
-		if channel.TestModel == "" {
-			skippedCount++
-			logger.SysLog(fmt.Sprintf("skip auto-recover probe for channel #%d(%s): missing test_model", channel.Id, channel.Name))
-			continue
-		}
-
-		result := probeChannelFunc(channel, "")
-		if result.err != nil {
-			failedCount++
-			logger.SysLog(fmt.Sprintf("auto-recover probe failed for channel #%d(%s): %s", channel.Id, channel.Name, result.err.Error()))
-			continue
-		}
-		if result.exceedsThreshold(disableThreshold) {
-			failedCount++
-			logger.SysLog(fmt.Sprintf("auto-recover probe kept channel #%d(%s) disabled: response time %.2fs exceeds threshold %.2fs", channel.Id, channel.Name, result.consumedSeconds(), float64(disableThreshold)/1000.0))
-			continue
-		}
-		if !result.isHealthy() {
-			failedCount++
-			continue
-		}
-
-		updated, err := AutoEnableChannel(channel.Id, channel.Name, false)
-		if err != nil {
-			failedCount++
-			logger.SysError(fmt.Sprintf("auto-recover failed to enable channel #%d(%s): %s", channel.Id, channel.Name, err.Error()))
-			continue
-		}
-		if !updated {
-			skippedCount++
-			logger.SysLog(fmt.Sprintf("skip auto-recover enable for channel #%d(%s): status changed while probing", channel.Id, channel.Name))
-			continue
-		}
-
-		channel.UpdateResponseTime(result.milliseconds)
-		recoveredCount++
-	}
-
-	logger.SysLog(fmt.Sprintf("auto-recover probe finished: scanned=%d recovered=%d skipped=%d failed=%d", len(channels), recoveredCount, skippedCount, failedCount))
-	return nil
-}
-
-func automaticRecoverDue(frequency int, now time.Time) bool {
-	automaticRecoverStateLock.Lock()
-	defer automaticRecoverStateLock.Unlock()
-
-	if frequency <= 0 {
-		return false
-	}
-	if automaticRecoverLastRunAt.IsZero() {
-		return true
-	}
-	return now.Sub(automaticRecoverLastRunAt) >= time.Duration(frequency)*time.Minute
-}
-
-func markAutomaticRecoverRun(now time.Time) {
-	automaticRecoverStateLock.Lock()
-	automaticRecoverLastRunAt = now
-	automaticRecoverStateLock.Unlock()
-}
-
-// Use a fixed scheduler tick and read the live option value at runtime so the
-// recovery interval can change without restarting the process.
-func AutomaticRecoverChannelsTick() {
-	if !config.AutomaticRecoverChannelsEnabled {
-		return
-	}
-
-	frequency := config.AutomaticRecoverChannelsIntervalMinutes
-	now := currentTimeFunc()
-	if !automaticRecoverDue(frequency, now) {
-		return
-	}
-	if isFullChannelProbeRunning() {
-		logger.SysLog("skip auto-recover probe: full channel probe task is running")
-		return
-	}
-
-	err := recoverAutoDisabledChannelsFunc()
-	if err != nil {
-		if errors.Is(err, fullChannelProbeRunningErr) {
-			logger.SysLog("skip auto-recover probe: full channel probe task is running")
-			return
-		}
-		if errors.Is(err, autoRecoverProbeRunningErr) {
-			logger.SysLog("skip auto-recover probe: another auto-recover probe task is running")
-			return
-		}
-		if errors.Is(err, autoRecoverInterruptedByFullProbeErr) {
-			logger.SysLog("skip auto-recover probe: full channel probe task took priority")
-			return
-		}
-		logger.SysError("auto-recover probe failed: " + err.Error())
-		return
-	}
-
-	markAutomaticRecoverRun(currentTimeFunc())
 }

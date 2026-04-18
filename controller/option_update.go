@@ -89,10 +89,6 @@ func persistOptionUpdates(prepared *config.PreparedOptionUpdates) error {
 		}
 	}
 
-	if prepared.ShouldResetAutomaticRecoverSchedule {
-		resetAutomaticRecoverSchedule()
-	}
-
 	return nil
 }
 

@@ -58,11 +58,10 @@ func TestOptionManagerRejectsUnspecifiedVisibilityMetadata(t *testing.T) {
 func TestOptionManagerNormalizesAliasesAndFiltersSensitiveValues(t *testing.T) {
 	manager := NewOptionManager()
 
-	recoverInterval := 10
-	manager.RegisterIntOption("AutomaticRecoverChannelsIntervalMinutes", &recoverInterval, OptionMetadata{
+	waitMilliseconds := 10
+	manager.RegisterIntOption("PreferredChannelWaitMilliseconds", &waitMilliseconds, OptionMetadata{
 		Visibility: OptionVisibilityPublic,
-		Aliases:    []string{"AutomaticEnableChannelRecoverFrequency"},
-		Group:      OptionGroupAutomaticRecoverChannel,
+		Aliases:    []string{"LegacyPreferredChannelWaitMilliseconds"},
 	})
 
 	secret := ""
@@ -71,14 +70,14 @@ func TestOptionManagerNormalizesAliasesAndFiltersSensitiveValues(t *testing.T) {
 		Group:      OptionGroupGitHubOAuth,
 	})
 
-	if normalized := manager.NormalizeKey(" AutomaticEnableChannelRecoverFrequency "); normalized != "AutomaticRecoverChannelsIntervalMinutes" {
+	if normalized := manager.NormalizeKey(" LegacyPreferredChannelWaitMilliseconds "); normalized != "PreferredChannelWaitMilliseconds" {
 		t.Fatalf("expected alias normalization to map legacy key, got %q", normalized)
 	}
-	if err := manager.Set("AutomaticEnableChannelRecoverFrequency", "27"); err != nil {
+	if err := manager.Set("LegacyPreferredChannelWaitMilliseconds", "27"); err != nil {
 		t.Fatalf("expected alias set to succeed, got %v", err)
 	}
-	if recoverInterval != 27 {
-		t.Fatalf("expected alias set to update target value, got %d", recoverInterval)
+	if waitMilliseconds != 27 {
+		t.Fatalf("expected alias set to update target value, got %d", waitMilliseconds)
 	}
 
 	if err := manager.Set("GitHubClientSecret", "super-secret"); err != nil {
@@ -86,19 +85,19 @@ func TestOptionManagerNormalizesAliasesAndFiltersSensitiveValues(t *testing.T) {
 	}
 
 	publicOptions := manager.GetPublic()
-	if publicOptions["AutomaticRecoverChannelsIntervalMinutes"] != "27" {
+	if publicOptions["PreferredChannelWaitMilliseconds"] != "27" {
 		t.Fatalf("expected public options to include interval, got %#v", publicOptions)
 	}
 	if _, exists := publicOptions["GitHubClientSecret"]; exists {
 		t.Fatalf("expected sensitive options to be hidden from public options, got %#v", publicOptions)
 	}
 
-	metadata, exists := manager.GetMetadata("AutomaticEnableChannelRecoverFrequency")
+	metadata, exists := manager.GetMetadata("LegacyPreferredChannelWaitMilliseconds")
 	if !exists {
 		t.Fatal("expected alias metadata lookup to succeed")
 	}
-	if metadata.Group != OptionGroupAutomaticRecoverChannel {
-		t.Fatalf("expected alias metadata group %q, got %q", OptionGroupAutomaticRecoverChannel, metadata.Group)
+	if metadata.Group != "" {
+		t.Fatalf("expected alias metadata group to stay empty, got %q", metadata.Group)
 	}
 
 	statuses := manager.GetSensitiveStatuses()

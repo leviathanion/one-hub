@@ -13,12 +13,6 @@ import (
 	"gorm.io/gorm"
 )
 
-const (
-	automaticRecoverIntervalLegacyOptionKey = "AutomaticEnableChannelRecoverFrequency"
-	automaticRecoverEnabledOptionKey        = "AutomaticRecoverChannelsEnabled"
-	automaticRecoverIntervalOptionKey       = "AutomaticRecoverChannelsIntervalMinutes"
-)
-
 var loggedUnknownOptionKeys sync.Map
 var loggedInvalidOptionLoadErrors sync.Map
 
@@ -67,12 +61,6 @@ func InitOptionMap() {
 	config.GlobalOption.RegisterBoolOption("RegisterEnabled", &config.RegisterEnabled, publicOption())
 	config.GlobalOption.RegisterBoolOption("AutomaticDisableChannelEnabled", &config.AutomaticDisableChannelEnabled, publicOption())
 	config.GlobalOption.RegisterBoolOption("AutomaticEnableChannelEnabled", &config.AutomaticEnableChannelEnabled, publicOption())
-	config.GlobalOption.RegisterBoolOption(automaticRecoverEnabledOptionKey, &config.AutomaticRecoverChannelsEnabled, publicGroupedOption(config.OptionGroupAutomaticRecoverChannel))
-	config.GlobalOption.RegisterIntOption(automaticRecoverIntervalOptionKey, &config.AutomaticRecoverChannelsIntervalMinutes, config.OptionMetadata{
-		Visibility: config.OptionVisibilityPublic,
-		Aliases:    []string{automaticRecoverIntervalLegacyOptionKey},
-		Group:      config.OptionGroupAutomaticRecoverChannel,
-	})
 	config.GlobalOption.RegisterBoolOption("ApproximateTokenEnabled", &config.ApproximateTokenEnabled, publicOption())
 	config.GlobalOption.RegisterBoolOption("LogConsumeEnabled", &config.LogConsumeEnabled, publicOption())
 	config.GlobalOption.RegisterBoolOption("DisplayInCurrencyEnabled", &config.DisplayInCurrencyEnabled, publicOption())
@@ -174,7 +162,6 @@ func InitOptionMap() {
 
 func loadOptionsFromDatabase() {
 	options, _ := AllOption()
-	options = migrateAutomaticRecoverOptions(options)
 	loadedOptions := make(map[string]string, len(options))
 	for _, option := range options {
 		normalizedKey := config.GlobalOption.NormalizeKey(option.Key)
@@ -195,67 +182,6 @@ func loadOptionsFromDatabase() {
 		clearLoggedInvalidOptionLoadError(key)
 	}
 	clearStaleLoggedInvalidOptionLoadErrors(loadedOptions)
-}
-
-func migrateAutomaticRecoverOptions(options []*Option) []*Option {
-	optionByKey := make(map[string]*Option, len(options))
-	for _, option := range options {
-		optionByKey[option.Key] = option
-	}
-
-	legacyOption, exists := optionByKey[automaticRecoverIntervalLegacyOptionKey]
-	if !exists {
-		return options
-	}
-
-	canonicalOption, hasCanonical := optionByKey[automaticRecoverIntervalOptionKey]
-	if !hasCanonical && strings.TrimSpace(legacyOption.Value) != "" {
-		migratedOption := &Option{
-			Key:   automaticRecoverIntervalOptionKey,
-			Value: legacyOption.Value,
-		}
-		if err := DB.Save(migratedOption).Error; err != nil {
-			if logger.Logger != nil {
-				logger.SysError("failed to migrate automatic recover interval option: " + err.Error())
-			}
-		} else {
-			canonicalOption = migratedOption
-			hasCanonical = true
-			if logger.Logger != nil {
-				logger.SysLog("migrated legacy automatic recover interval option to AutomaticRecoverChannelsIntervalMinutes")
-			}
-		}
-	}
-
-	if hasCanonical {
-		if err := DB.Delete(&Option{}, "key = ?", automaticRecoverIntervalLegacyOptionKey).Error; err != nil {
-			if logger.Logger != nil {
-				logger.SysError("failed to delete legacy automatic recover interval option: " + err.Error())
-			}
-		}
-	}
-
-	migratedOptions := make([]*Option, 0, len(options)+1)
-	hasCanonicalInSlice := false
-	for _, option := range options {
-		switch option.Key {
-		case automaticRecoverIntervalLegacyOptionKey:
-			if hasCanonical {
-				continue
-			}
-			migratedOptions = append(migratedOptions, option)
-		case automaticRecoverIntervalOptionKey:
-			hasCanonicalInSlice = true
-			migratedOptions = append(migratedOptions, option)
-		default:
-			migratedOptions = append(migratedOptions, option)
-		}
-	}
-
-	if hasCanonical && !hasCanonicalInSlice && canonicalOption != nil {
-		migratedOptions = append(migratedOptions, canonicalOption)
-	}
-	return migratedOptions
 }
 
 func SyncOptions(frequency int) {

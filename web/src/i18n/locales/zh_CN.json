@@ -864,13 +864,7 @@
         },
         "automaticDisableChannel": "失败时自动禁用通道",
         "automaticEnableChannel": "成功时自动启用通道",
-        "automaticRecoverChannels": "启用后台自动恢复探测",
-        "automaticRecoverChannelsIntervalMinutes": {
-          "label": "自动恢复探测间隔",
-          "placeholder": "单位分钟；开启后台自动恢复探测后按该间隔执行"
-        },
-        "automaticEnableChannelTip": "仅当现有通道探测流程已经跑到成功结果时，才允许把“自动禁用”通道恢复为启用；它本身不会主动发起后台探测。",
-        "automaticRecoverChannelsTip": "开启后，系统会按固定间隔对“自动禁用”通道发起额外后台探测；探测成功且未超过最长响应时间时自动恢复。未配置测速模型的通道会直接跳过，这会增加上游请求量与潜在成本。",
+        "automaticEnableChannelTip": "仅当现有通道探测流程得到成功结果时，才会把“自动禁用”通道恢复为启用；手动禁用的通道会保持禁用。",
         "saveMonitoringSettings": "保存监控设置"
       },
       "quotaSettings": {

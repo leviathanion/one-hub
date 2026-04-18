@@ -36,13 +36,12 @@ type SensitiveOptionStatus struct {
 }
 
 const (
-	OptionGroupGitHubOAuth             = "github_oauth"
-	OptionGroupLarkOAuth               = "lark_oauth"
-	OptionGroupOIDCAuth                = "oidc_auth"
-	OptionGroupWeChatAuth              = "wechat_auth"
-	OptionGroupTurnstile               = "turnstile"
-	OptionGroupEmailDomainRestriction  = "email_domain_restriction"
-	OptionGroupAutomaticRecoverChannel = "automatic_recover_channels"
+	OptionGroupGitHubOAuth            = "github_oauth"
+	OptionGroupLarkOAuth              = "lark_oauth"
+	OptionGroupOIDCAuth               = "oidc_auth"
+	OptionGroupWeChatAuth             = "wechat_auth"
+	OptionGroupTurnstile              = "turnstile"
+	OptionGroupEmailDomainRestriction = "email_domain_restriction"
 )
 
 type optionEntry struct {

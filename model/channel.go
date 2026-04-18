@@ -637,7 +637,7 @@ func UpdateChannelStatusById(id int, status int) {
 	}
 }
 
-// Automatic background probes must not override an operator's manual state change.
+// Automated probe results must not override an operator's manual state change.
 // Compare-and-set keeps that trade-off explicit: we may skip a stale recovery/disable
 // result, but we never silently rewrite a newer status chosen by an admin.
 func UpdateChannelStatusIfCurrent(id int, currentStatus int, targetStatus int) (bool, error) {

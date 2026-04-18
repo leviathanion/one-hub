@@ -49,8 +49,6 @@ const defaultInputs = {
   QuotaPerUnit: 0,
   AutomaticDisableChannelEnabled: '',
   AutomaticEnableChannelEnabled: '',
-  AutomaticRecoverChannelsEnabled: '',
-  AutomaticRecoverChannelsIntervalMinutes: 10,
   ChannelDisableThreshold: 0,
   LogConsumeEnabled: '',
   DisplayInCurrencyEnabled: '',
@@ -272,21 +270,6 @@ const OperationSetting = () => {
       return;
     }
     if (name.endsWith('Enabled')) {
-      if (name === 'AutomaticRecoverChannelsEnabled') {
-        const nextValue = inputs[name] === 'true' ? 'false' : 'true';
-        const nextInputs = {
-          [name]: nextValue
-        };
-        if (nextValue === 'true' && Number(inputs.AutomaticRecoverChannelsIntervalMinutes) <= 0) {
-          nextInputs.AutomaticRecoverChannelsIntervalMinutes = '10';
-        }
-        setInputs((prev) => ({
-          ...prev,
-          ...nextInputs
-        }));
-        return;
-      }
-
       setLoading(true);
       try {
         const nextValue = inputs[name] === 'true' ? 'false' : 'true';
@@ -316,12 +299,8 @@ const OperationSetting = () => {
     try {
       switch (group) {
         case 'monitor':
-          if (inputs.ChannelDisableThreshold < 0 || inputs.QuotaRemindThreshold < 0 || inputs.AutomaticRecoverChannelsIntervalMinutes < 0) {
-            showError('最长响应时间、额度提醒阈值、自动恢复探测间隔不能为负数');
-            return;
-          }
-          if (inputs.AutomaticRecoverChannelsEnabled === 'true' && inputs.AutomaticRecoverChannelsIntervalMinutes <= 0) {
-            showError('后台自动恢复探测已开启时，探测间隔必须大于 0');
+          if (inputs.ChannelDisableThreshold < 0 || inputs.QuotaRemindThreshold < 0) {
+            showError('最长响应时间、额度提醒阈值不能为负数');
             return;
           }
           if (originInputs['ChannelDisableThreshold'] !== inputs.ChannelDisableThreshold) {
@@ -329,15 +308,6 @@ const OperationSetting = () => {
           }
           if (originInputs['QuotaRemindThreshold'] !== inputs.QuotaRemindThreshold) {
             await putOptionOrThrow('QuotaRemindThreshold', inputs.QuotaRemindThreshold);
-          }
-          {
-            const automaticRecoverUpdates = buildOptionUpdates([
-              'AutomaticRecoverChannelsEnabled',
-              'AutomaticRecoverChannelsIntervalMinutes'
-            ]);
-            if (automaticRecoverUpdates.length > 0) {
-              await putOptionBatchOrThrow(automaticRecoverUpdates);
-            }
           }
           break;
         case 'chatlinks':
@@ -840,21 +810,6 @@ const OperationSetting = () => {
               />
             </FormControl>
             <FormControl fullWidth>
-              <InputLabel htmlFor="AutomaticRecoverChannelsIntervalMinutes">
-                {t('setting_index.operationSettings.monitoringSettings.automaticRecoverChannelsIntervalMinutes.label')}
-              </InputLabel>
-              <OutlinedInput
-                id="AutomaticRecoverChannelsIntervalMinutes"
-                name="AutomaticRecoverChannelsIntervalMinutes"
-                type="number"
-                value={inputs.AutomaticRecoverChannelsIntervalMinutes}
-                onChange={handleInputChange}
-                label={t('setting_index.operationSettings.monitoringSettings.automaticRecoverChannelsIntervalMinutes.label')}
-                placeholder={t('setting_index.operationSettings.monitoringSettings.automaticRecoverChannelsIntervalMinutes.placeholder')}
-                disabled={loading || inputs.AutomaticRecoverChannelsEnabled !== 'true'}
-              />
-            </FormControl>
-            <FormControl fullWidth>
               <InputLabel htmlFor="QuotaRemindThreshold">
                 {t('setting_index.operationSettings.monitoringSettings.quotaRemindThreshold.label')}
               </InputLabel>
@@ -890,18 +845,7 @@ const OperationSetting = () => {
               />
             }
           />
-          <FormControlLabel
-            label={t('setting_index.operationSettings.monitoringSettings.automaticRecoverChannels')}
-            control={
-              <Checkbox
-                checked={inputs.AutomaticRecoverChannelsEnabled === 'true'}
-                onChange={handleInputChange}
-                name="AutomaticRecoverChannelsEnabled"
-              />
-            }
-          />
           <Alert severity="info">{t('setting_index.operationSettings.monitoringSettings.automaticEnableChannelTip')}</Alert>
-          <Alert severity="warning">{t('setting_index.operationSettings.monitoringSettings.automaticRecoverChannelsTip')}</Alert>
           <Button
             variant="contained"
             onClick={() => {
