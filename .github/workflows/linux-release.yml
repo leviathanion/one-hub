@@ -40,7 +40,12 @@ jobs:
         run: |
           sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+          # go-sqlite3 requires CGO, so the cross toolchain also needs the arm64
+          # glibc development headers/static libs instead of only the compiler.
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu \
+            libc6-dev-arm64-cross \
+            linux-libc-dev-arm64-cross
       - name: Build Backend (arm64)
         run: |
           CC=aarch64-linux-gnu-gcc CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -ldflags "-s -w -X 'one-api/common/config.Version=$VERSION' -extldflags '-static'" -o one-api-arm64
