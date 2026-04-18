@@ -343,6 +343,9 @@ func TestCompactResponsesUsesCompactEndpoint(t *testing.T) {
 	if _, exists := raw["include"]; exists {
 		t.Fatalf("expected compact request body to omit include, got %s", string(bodyBytes))
 	}
+	if _, exists := raw["store"]; exists {
+		t.Fatalf("expected compact request body to omit store, got %s", string(bodyBytes))
+	}
 
 	if resp.Object != "response.compaction" {
 		t.Fatalf("expected compaction object, got %q", resp.Object)

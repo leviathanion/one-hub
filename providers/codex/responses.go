@@ -330,18 +330,22 @@ func (p *CodexProvider) prepareCodexCompactRequest(request *types.OpenAIResponse
 // prepareCodexRequestWithReasoning prepares Codex request fields.
 //
 // Trade-off: Codex regular Responses calls still need
-// `include=["reasoning.encrypted_content"]` so resumed reasoning state can flow
-// through the proxy, but the dedicated `/responses/compact` payload in the
-// upstream Codex client is a different schema and current upstream rejects
-// `include` there. Keep the include on normal responses and explicitly strip it
-// from compact requests instead of trying to infer support dynamically per
-// upstream response.
+// `store=false` and `include=["reasoning.encrypted_content"]` so resumed
+// reasoning state can flow through the proxy, but the dedicated
+// `/responses/compact` payload is a different schema and current upstream
+// rejects those structured fields there. Keep them on normal responses and
+// explicitly strip them from compact requests instead of trying to infer
+// support dynamically per upstream response.
 func (p *CodexProvider) prepareCodexRequestWithReasoning(request *types.OpenAIResponsesRequest, includeReasoning bool) {
 	request.Model = normalizeCodexModelName(request.Model)
 
-	// Codex requires store=false.
-	storeFalse := false
-	request.Store = &storeFalse
+	if includeReasoning {
+		// Codex regular responses require store=false.
+		storeFalse := false
+		request.Store = &storeFalse
+	} else {
+		request.Store = nil
+	}
 
 	// Prefer temperature over top_p when both set.
 	if request.Temperature != nil && request.TopP != nil {

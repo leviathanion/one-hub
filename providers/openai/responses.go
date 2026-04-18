@@ -183,20 +183,29 @@ func (p *OpenAIProvider) buildCompactResponsesRequest(request *types.OpenAIRespo
 }
 
 func (p *OpenAIProvider) buildCompactRequestBody(request *types.OpenAIResponsesRequest) (map[string]interface{}, *types.OpenAIErrorWithStatusCode) {
-	requestBytes, err := json.Marshal(request)
-	if err != nil {
-		return nil, common.ErrorWrapper(err, "marshal_request_failed", http.StatusInternalServerError)
+	// Trade-off: `/responses/compact` has a materially narrower structured
+	// request schema than ordinary `/responses`. Start from the documented
+	// compact-safe fields only, then reattach unknown extra-body fields and let
+	// `custom_parameter` override last. This keeps normal typed request fields
+	// like `store`/`include` from leaking into compact while preserving operator
+	// passthrough semantics for intentionally-added custom keys.
+	bodyMap := make(map[string]interface{}, 6)
+	bodyMap["model"] = request.Model
+	if request.Input != nil {
+		bodyMap["input"] = request.Input
 	}
-
-	bodyMap := make(map[string]interface{})
-	if err := json.Unmarshal(requestBytes, &bodyMap); err != nil {
-		return nil, common.ErrorWrapper(err, "unmarshal_request_failed", http.StatusInternalServerError)
+	if request.Instructions != "" {
+		bodyMap["instructions"] = request.Instructions
 	}
-
-	// Compact accepts a narrower structured schema than ordinary responses:
-	// keep known compact fields from the typed request, but drop `include`
-	// before reattaching user extra-body fields and channel overrides.
-	delete(bodyMap, "include")
+	if request.PreviousResponseID != "" {
+		bodyMap["previous_response_id"] = request.PreviousResponseID
+	}
+	if request.PromptCacheKey != "" {
+		bodyMap["prompt_cache_key"] = request.PromptCacheKey
+	}
+	if request.PromptCacheRetention != "" {
+		bodyMap["prompt_cache_retention"] = request.PromptCacheRetention
+	}
 
 	if p.Channel.AllowExtraBody {
 		rawMap, ok, err := p.GetRawBodyMap()

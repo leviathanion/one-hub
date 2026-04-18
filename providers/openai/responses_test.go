@@ -245,6 +245,38 @@ func TestCompactResponsesOmitsStructuredInclude(t *testing.T) {
 	}
 }
 
+func TestCompactResponsesOmitsStructuredStoreButKeepsCompactFields(t *testing.T) {
+	store := false
+	body, _ := captureCompactRequestBody(t, nil, &types.OpenAIResponsesRequest{
+		Model:                "gpt-5",
+		Input:                "hello",
+		Instructions:         "summarize",
+		PreviousResponseID:   "resp_prev",
+		PromptCacheKey:       "cache-key",
+		PromptCacheRetention: "7d",
+		Store:                &store,
+	})
+
+	if _, exists := body["store"]; exists {
+		t.Fatalf("expected compact request body to omit structured store, got %#v", body["store"])
+	}
+	if body["model"] != "gpt-5" || body["input"] != "hello" {
+		t.Fatalf("expected compact request body to keep core compact fields, got %#v", body)
+	}
+	if body["instructions"] != "summarize" {
+		t.Fatalf("expected compact request body to preserve instructions, got %#v", body["instructions"])
+	}
+	if body["previous_response_id"] != "resp_prev" {
+		t.Fatalf("expected compact request body to preserve previous_response_id, got %#v", body["previous_response_id"])
+	}
+	if body["prompt_cache_key"] != "cache-key" {
+		t.Fatalf("expected compact request body to preserve prompt_cache_key, got %#v", body["prompt_cache_key"])
+	}
+	if body["prompt_cache_retention"] != "7d" {
+		t.Fatalf("expected compact request body to preserve prompt_cache_retention, got %#v", body["prompt_cache_retention"])
+	}
+}
+
 func TestCompactResponsesPreservesUnknownAllowExtraBodyFieldsButNotKnownInclude(t *testing.T) {
 	rawBody := []byte(`{"model":"gpt-5","input":"hello","include":["raw-include"],"experimental_feature":"enabled"}`)
 	rawMap := make(map[string]interface{})
