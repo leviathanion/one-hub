@@ -727,12 +727,14 @@ func overrideRequestBodyDecodeConfig(t *testing.T, enabled bool, maxWireBytes, m
 	originalEnabled := config.RequestBodyDecodeEnabled
 	originalMaxWireBytes := config.RequestBodyDecodeMaxWireBytes
 	originalMaxDecodedBytes := config.RequestBodyDecodeMaxDecodedBytes
+	originalMaxDecoderWindowBytes := config.RequestBodyDecodeMaxDecoderWindowBytes
 	originalMaxExpansionRatio := config.RequestBodyDecodeMaxExpansionRatio
 	originalMaxLayers := config.RequestBodyDecodeMaxLayers
 
 	config.RequestBodyDecodeEnabled = enabled
 	config.RequestBodyDecodeMaxWireBytes = maxWireBytes
 	config.RequestBodyDecodeMaxDecodedBytes = maxDecodedBytes
+	config.RequestBodyDecodeMaxDecoderWindowBytes = 1 << 20
 	config.RequestBodyDecodeMaxExpansionRatio = maxExpansionRatio
 	config.RequestBodyDecodeMaxLayers = maxLayers
 
@@ -740,6 +742,7 @@ func overrideRequestBodyDecodeConfig(t *testing.T, enabled bool, maxWireBytes, m
 		config.RequestBodyDecodeEnabled = originalEnabled
 		config.RequestBodyDecodeMaxWireBytes = originalMaxWireBytes
 		config.RequestBodyDecodeMaxDecodedBytes = originalMaxDecodedBytes
+		config.RequestBodyDecodeMaxDecoderWindowBytes = originalMaxDecoderWindowBytes
 		config.RequestBodyDecodeMaxExpansionRatio = originalMaxExpansionRatio
 		config.RequestBodyDecodeMaxLayers = originalMaxLayers
 	}

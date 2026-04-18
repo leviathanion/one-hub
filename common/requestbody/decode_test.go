@@ -14,10 +14,11 @@ func TestDecodeBodyZstdSuccess(t *testing.T) {
 	compressed := mustCompressZstd(t, plain)
 
 	wireBody, decodedBody, meta, err := DecodeBody(bytes.NewReader(compressed), "zstd", Limits{
-		MaxWireBytes:      1 << 20,
-		MaxDecodedBytes:   1 << 20,
-		MaxExpansionRatio: 64,
-		MaxEncodingLayers: 2,
+		MaxWireBytes:          1 << 20,
+		MaxDecodedBytes:       1 << 20,
+		MaxDecoderWindowBytes: 1 << 20,
+		MaxExpansionRatio:     64,
+		MaxEncodingLayers:     2,
 	})
 	if err != nil {
 		t.Fatalf("expected zstd body to decode, got %v", err)
@@ -233,10 +234,11 @@ func TestDecodeBodyRejectsZstdWindowBeyondConfiguredLimit(t *testing.T) {
 	compressed := mustCompressZstdWithOptions(t, plain, zstd.WithWindowSize(1<<20), zstd.WithSingleSegment(false))
 
 	_, _, _, err := DecodeBody(bytes.NewReader(compressed), "zstd", Limits{
-		MaxWireBytes:      int64(len(compressed) + 1),
-		MaxDecodedBytes:   64 << 10,
-		MaxExpansionRatio: 64,
-		MaxEncodingLayers: 2,
+		MaxWireBytes:          int64(len(compressed) + 1),
+		MaxDecodedBytes:       64 << 10,
+		MaxDecoderWindowBytes: 64 << 10,
+		MaxExpansionRatio:     64,
+		MaxEncodingLayers:     2,
 	})
 	if err == nil {
 		t.Fatal("expected oversized zstd window to fail")
@@ -248,6 +250,52 @@ func TestDecodeBodyRejectsZstdWindowBeyondConfiguredLimit(t *testing.T) {
 	}
 	if decodeErr.Kind != ErrorKindBodyTooLarge {
 		t.Fatalf("expected body too large error kind, got %s", decodeErr.Kind)
+	}
+}
+
+func TestDecodeBodyAllowsConfiguredWindowAboveDecodedLimit(t *testing.T) {
+	plain := bytes.Repeat([]byte("c"), 4096)
+	compressed := mustCompressZstdWithOptions(t, plain, zstd.WithWindowSize(1<<20), zstd.WithSingleSegment(false))
+
+	_, decodedBody, _, err := DecodeBody(bytes.NewReader(compressed), "zstd", Limits{
+		MaxWireBytes:          int64(len(compressed) + 1),
+		MaxDecodedBytes:       64 << 10,
+		MaxDecoderWindowBytes: 1 << 20,
+		MaxExpansionRatio:     512,
+		MaxEncodingLayers:     2,
+	})
+	if err != nil {
+		t.Fatalf("expected configured zstd window to decode, got %v", err)
+	}
+	if !bytes.Equal(decodedBody, plain) {
+		t.Fatalf("unexpected decoded body length: got %d want %d", len(decodedBody), len(plain))
+	}
+}
+
+func TestDecodeBodyStillRejectsDecodedSizeWhenWindowBudgetIsHigher(t *testing.T) {
+	plain := bytes.Repeat([]byte("e"), 96<<10)
+	compressed := mustCompressZstdWithOptions(t, plain, zstd.WithWindowSize(1<<20), zstd.WithSingleSegment(false))
+
+	_, _, _, err := DecodeBody(bytes.NewReader(compressed), "zstd", Limits{
+		MaxWireBytes:          int64(len(compressed) + 1),
+		MaxDecodedBytes:       64 << 10,
+		MaxDecoderWindowBytes: 1 << 20,
+		MaxExpansionRatio:     4096,
+		MaxEncodingLayers:     2,
+	})
+	if err == nil {
+		t.Fatal("expected decoded size limit to fail even with a larger window budget")
+	}
+
+	decodeErr, ok := err.(*DecodeError)
+	if !ok {
+		t.Fatalf("expected DecodeError, got %T", err)
+	}
+	if decodeErr.Kind != ErrorKindBodyTooLarge {
+		t.Fatalf("expected body too large error kind, got %s", decodeErr.Kind)
+	}
+	if !strings.Contains(decodeErr.Message, "size limit") {
+		t.Fatalf("expected decoded size error message, got %q", decodeErr.Message)
 	}
 }
 

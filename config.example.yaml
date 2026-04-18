@@ -40,7 +40,8 @@ openai:
 request_body_decode:
   enabled: true # 是否启用支持该能力的 Relay 结构化路由入站 Content-Encoding 规范化
   max_wire_bytes: 67108864 # 压缩后的请求体最大字节数，限制入口层内存占用
-  max_decoded_bytes: 67108864 # 整个解码链共享的最大解压字节数，超过直接拒绝
+  max_decoded_bytes: 67108864 # 解码后的明文最大字节数；超过直接拒绝，不再隐式决定 zstd decoder window
+  max_decoder_window_bytes: 134217728 # zstd decoder 允许的最大 window；默认 128MiB 以兼容 Codex，代价是单请求允许更大的解码窗口内存预算
   max_expansion_ratio: 64 # 相对原始 wire body 的整链最大膨胀倍数，用于防止多层压缩炸弹
   max_layers: 2 # 允许的 Content-Encoding 链最大层数
 codex:

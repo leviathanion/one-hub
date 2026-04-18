@@ -11,6 +11,7 @@ func TestInitConfLoadsRealtimeSessionCompatFlagAndDefaults(t *testing.T) {
 	originalDecodeEnabled := RequestBodyDecodeEnabled
 	originalDecodeMaxWireBytes := RequestBodyDecodeMaxWireBytes
 	originalDecodeMaxDecodedBytes := RequestBodyDecodeMaxDecodedBytes
+	originalDecodeMaxDecoderWindowBytes := RequestBodyDecodeMaxDecoderWindowBytes
 	originalDecodeMaxExpansionRatio := RequestBodyDecodeMaxExpansionRatio
 	originalDecodeMaxLayers := RequestBodyDecodeMaxLayers
 	originalUserInvoiceMonth := UserInvoiceMonth
@@ -27,6 +28,7 @@ func TestInitConfLoadsRealtimeSessionCompatFlagAndDefaults(t *testing.T) {
 		RequestBodyDecodeEnabled = originalDecodeEnabled
 		RequestBodyDecodeMaxWireBytes = originalDecodeMaxWireBytes
 		RequestBodyDecodeMaxDecodedBytes = originalDecodeMaxDecodedBytes
+		RequestBodyDecodeMaxDecoderWindowBytes = originalDecodeMaxDecoderWindowBytes
 		RequestBodyDecodeMaxExpansionRatio = originalDecodeMaxExpansionRatio
 		RequestBodyDecodeMaxLayers = originalDecodeMaxLayers
 		UserInvoiceMonth = originalUserInvoiceMonth
@@ -53,6 +55,9 @@ func TestInitConfLoadsRealtimeSessionCompatFlagAndDefaults(t *testing.T) {
 	if got := viper.GetInt64("request_body_decode.max_decoded_bytes"); got != 64<<20 {
 		t.Fatalf("expected request body decode max_decoded_bytes default 64MiB, got %d", got)
 	}
+	if got := viper.GetInt64("request_body_decode.max_decoder_window_bytes"); got != 128<<20 {
+		t.Fatalf("expected request body decode max_decoder_window_bytes default 128MiB, got %d", got)
+	}
 	if got := viper.GetInt64("request_body_decode.max_expansion_ratio"); got != 64 {
 		t.Fatalf("expected request body decode max_expansion_ratio default 64, got %d", got)
 	}
@@ -64,6 +69,7 @@ func TestInitConfLoadsRealtimeSessionCompatFlagAndDefaults(t *testing.T) {
 	viper.Set("request_body_decode.enabled", false)
 	viper.Set("request_body_decode.max_wire_bytes", int64(2<<20))
 	viper.Set("request_body_decode.max_decoded_bytes", int64(1<<20))
+	viper.Set("request_body_decode.max_decoder_window_bytes", int64(8<<20))
 	viper.Set("request_body_decode.max_expansion_ratio", int64(8))
 	viper.Set("request_body_decode.max_layers", 1)
 	viper.Set("user_invoice_month", true)
@@ -81,8 +87,8 @@ func TestInitConfLoadsRealtimeSessionCompatFlagAndDefaults(t *testing.T) {
 	if RequestBodyDecodeEnabled {
 		t.Fatal("expected InitConf to load request body decode enabled=false from viper")
 	}
-	if RequestBodyDecodeMaxWireBytes != 2<<20 || RequestBodyDecodeMaxDecodedBytes != 1<<20 || RequestBodyDecodeMaxExpansionRatio != 8 || RequestBodyDecodeMaxLayers != 1 {
-		t.Fatalf("expected InitConf to load request body decode limits, got wire=%d bytes=%d ratio=%d layers=%d", RequestBodyDecodeMaxWireBytes, RequestBodyDecodeMaxDecodedBytes, RequestBodyDecodeMaxExpansionRatio, RequestBodyDecodeMaxLayers)
+	if RequestBodyDecodeMaxWireBytes != 2<<20 || RequestBodyDecodeMaxDecodedBytes != 1<<20 || RequestBodyDecodeMaxDecoderWindowBytes != 8<<20 || RequestBodyDecodeMaxExpansionRatio != 8 || RequestBodyDecodeMaxLayers != 1 {
+		t.Fatalf("expected InitConf to load request body decode limits, got wire=%d bytes=%d window=%d ratio=%d layers=%d", RequestBodyDecodeMaxWireBytes, RequestBodyDecodeMaxDecodedBytes, RequestBodyDecodeMaxDecoderWindowBytes, RequestBodyDecodeMaxExpansionRatio, RequestBodyDecodeMaxLayers)
 	}
 	if !UserInvoiceMonth {
 		t.Fatal("expected InitConf to load user_invoice_month from viper")

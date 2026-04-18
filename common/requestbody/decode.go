@@ -46,10 +46,11 @@ func (e *DecodeError) StatusCode() int {
 }
 
 type Limits struct {
-	MaxWireBytes      int64
-	MaxDecodedBytes   int64
-	MaxExpansionRatio int64
-	MaxEncodingLayers int
+	MaxWireBytes          int64
+	MaxDecodedBytes       int64
+	MaxDecoderWindowBytes int64
+	MaxExpansionRatio     int64
+	MaxEncodingLayers     int
 }
 
 type DecodeMeta struct {
@@ -79,19 +80,26 @@ func (zstdDecoder) Name() string {
 }
 
 func (zstdDecoder) Decode(input []byte, budget decodeBudget) ([]byte, error) {
-	decodeWindowBudget := budget.maxDecodedBytes
+	decodeWindowBudget := budget.maxDecoderWindowBytes
 	if decodeWindowBudget < zstd.MinWindowSize {
-		// Trade-off: the library requires MaxWindow >= 1KiB, but we still pin
-		// MaxMemory to the exact effective budget so valid oversized frames fail
-		// as 413 while malformed payloads still surface as 400 invalid input.
+		// Trade-off: zstd frames cannot use a window smaller than 1KiB, so values
+		// below that collapse to the format minimum instead of inventing a tighter
+		// limit that no valid frame can satisfy.
 		decodeWindowBudget = zstd.MinWindowSize
+	}
+	decodeMemoryBudget := budget.maxDecoderMemoryBytes
+	if decodeMemoryBudget < decodeWindowBudget {
+		decodeMemoryBudget = decodeWindowBudget
 	}
 
 	reader, err := zstd.NewReader(
 		bytes.NewReader(input),
 		zstd.WithDecoderConcurrency(1),
 		zstd.WithDecoderLowmem(true),
-		zstd.WithDecoderMaxMemory(uint64(budget.maxDecodedBytes)),
+		// klauspost/compress uses MaxMemory as a streaming-window ceiling too, so
+		// keeping it pinned to maxDecodedBytes would still reject small cleartext
+		// requests whose frame advertises a larger history window.
+		zstd.WithDecoderMaxMemory(uint64(decodeMemoryBudget)),
 		zstd.WithDecoderMaxWindow(uint64(decodeWindowBudget)),
 	)
 	if err != nil {
@@ -221,8 +229,10 @@ func readWireBody(reader io.Reader, maxWireBytes int64) ([]byte, error) {
 }
 
 type decodeBudget struct {
-	maxDecodedBytes    int64
-	limitedByExpansion bool
+	maxDecodedBytes       int64
+	maxDecoderWindowBytes int64
+	maxDecoderMemoryBytes int64
+	limitedByExpansion    bool
 }
 
 func readDecodedBytes(reader io.Reader, budget decodeBudget) ([]byte, error) {
@@ -304,6 +314,13 @@ func configuredDecodedLimit(limits Limits) int64 {
 	return 64 << 20
 }
 
+func configuredDecoderWindowLimit(limits Limits) int64 {
+	if limits.MaxDecoderWindowBytes > 0 {
+		return limits.MaxDecoderWindowBytes
+	}
+	return 128 << 20
+}
+
 func configuredExpansionLimit(inputBytes int64, limits Limits) (int64, bool) {
 	if limits.MaxExpansionRatio <= 0 || inputBytes <= 0 {
 		return 0, false
@@ -317,12 +334,14 @@ func buildChainDecodeBudget(wireBytes int64, limits Limits) decodeBudget {
 	// is larger than the final cleartext, but it keeps CPU/memory bounded and
 	// prevents multi-layer encodings from resetting the expansion allowance.
 	decodeBudget := decodeBudget{
-		maxDecodedBytes: configuredDecodedLimit(limits),
+		maxDecodedBytes:       configuredDecodedLimit(limits),
+		maxDecoderWindowBytes: configuredDecoderWindowLimit(limits),
 	}
 	if expansionLimit, ok := configuredExpansionLimit(wireBytes, limits); ok && expansionLimit <= decodeBudget.maxDecodedBytes {
 		decodeBudget.maxDecodedBytes = expansionLimit
 		decodeBudget.limitedByExpansion = true
 	}
+	decodeBudget.maxDecoderMemoryBytes = maxInt64(decodeBudget.maxDecodedBytes, decodeBudget.maxDecoderWindowBytes)
 	return decodeBudget
 }
 
@@ -355,4 +374,11 @@ func saturatingMultiply(left, right int64) int64 {
 		return 1<<63 - 1
 	}
 	return left * right
+}
+
+func maxInt64(left, right int64) int64 {
+	if left >= right {
+		return left
+	}
+	return right
 }

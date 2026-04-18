@@ -54,10 +54,11 @@ func NormalizeEncodedRequestBodyWithFailureResponder(responder RequestBodyDecode
 		// Coupling them creates false 413s when operators tighten only the
 		// decoded-body safety budget.
 		wireBody, decodedBody, meta, err := requestbody.DecodeBody(originalBody, contentEncoding, requestbody.Limits{
-			MaxWireBytes:      config.RequestBodyDecodeMaxWireBytes,
-			MaxDecodedBytes:   config.RequestBodyDecodeMaxDecodedBytes,
-			MaxExpansionRatio: config.RequestBodyDecodeMaxExpansionRatio,
-			MaxEncodingLayers: config.RequestBodyDecodeMaxLayers,
+			MaxWireBytes:          config.RequestBodyDecodeMaxWireBytes,
+			MaxDecodedBytes:       config.RequestBodyDecodeMaxDecodedBytes,
+			MaxDecoderWindowBytes: config.RequestBodyDecodeMaxDecoderWindowBytes,
+			MaxExpansionRatio:     config.RequestBodyDecodeMaxExpansionRatio,
+			MaxEncodingLayers:     config.RequestBodyDecodeMaxLayers,
 		})
 		closeOriginalRequestBody(c, originalBody)
 		if err != nil {

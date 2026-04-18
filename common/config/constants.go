@@ -29,6 +29,7 @@ var OpenAIRealtimeSessionCompatMode = false
 var RequestBodyDecodeEnabled = true
 var RequestBodyDecodeMaxWireBytes int64 = 64 << 20
 var RequestBodyDecodeMaxDecodedBytes int64 = 64 << 20
+var RequestBodyDecodeMaxDecoderWindowBytes int64 = 128 << 20
 var RequestBodyDecodeMaxExpansionRatio int64 = 64
 var RequestBodyDecodeMaxLayers = 2
 

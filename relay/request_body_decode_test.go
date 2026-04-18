@@ -19,12 +19,14 @@ func TestRelayResponsesSetRequestSupportsEncodedBody(t *testing.T) {
 	originalEnabled := config.RequestBodyDecodeEnabled
 	originalMaxWireBytes := config.RequestBodyDecodeMaxWireBytes
 	originalMaxDecodedBytes := config.RequestBodyDecodeMaxDecodedBytes
+	originalMaxDecoderWindowBytes := config.RequestBodyDecodeMaxDecoderWindowBytes
 	originalMaxExpansionRatio := config.RequestBodyDecodeMaxExpansionRatio
 	originalMaxLayers := config.RequestBodyDecodeMaxLayers
 	t.Cleanup(func() {
 		config.RequestBodyDecodeEnabled = originalEnabled
 		config.RequestBodyDecodeMaxWireBytes = originalMaxWireBytes
 		config.RequestBodyDecodeMaxDecodedBytes = originalMaxDecodedBytes
+		config.RequestBodyDecodeMaxDecoderWindowBytes = originalMaxDecoderWindowBytes
 		config.RequestBodyDecodeMaxExpansionRatio = originalMaxExpansionRatio
 		config.RequestBodyDecodeMaxLayers = originalMaxLayers
 	})
@@ -32,6 +34,7 @@ func TestRelayResponsesSetRequestSupportsEncodedBody(t *testing.T) {
 	config.RequestBodyDecodeEnabled = true
 	config.RequestBodyDecodeMaxWireBytes = 1 << 20
 	config.RequestBodyDecodeMaxDecodedBytes = 1 << 20
+	config.RequestBodyDecodeMaxDecoderWindowBytes = 1 << 20
 	config.RequestBodyDecodeMaxExpansionRatio = 64
 	config.RequestBodyDecodeMaxLayers = 2
 	logger.Logger = zap.NewNop()
@@ -73,6 +76,59 @@ func TestRelayResponsesSetRequestSupportsEncodedBody(t *testing.T) {
 	}
 }
 
+func TestRelayResponsesSetRequestSupportsEncodedBodyWithLargerZstdWindow(t *testing.T) {
+	originalEnabled := config.RequestBodyDecodeEnabled
+	originalMaxWireBytes := config.RequestBodyDecodeMaxWireBytes
+	originalMaxDecodedBytes := config.RequestBodyDecodeMaxDecodedBytes
+	originalMaxDecoderWindowBytes := config.RequestBodyDecodeMaxDecoderWindowBytes
+	originalMaxExpansionRatio := config.RequestBodyDecodeMaxExpansionRatio
+	originalMaxLayers := config.RequestBodyDecodeMaxLayers
+	t.Cleanup(func() {
+		config.RequestBodyDecodeEnabled = originalEnabled
+		config.RequestBodyDecodeMaxWireBytes = originalMaxWireBytes
+		config.RequestBodyDecodeMaxDecodedBytes = originalMaxDecodedBytes
+		config.RequestBodyDecodeMaxDecoderWindowBytes = originalMaxDecoderWindowBytes
+		config.RequestBodyDecodeMaxExpansionRatio = originalMaxExpansionRatio
+		config.RequestBodyDecodeMaxLayers = originalMaxLayers
+	})
+
+	config.RequestBodyDecodeEnabled = true
+	config.RequestBodyDecodeMaxWireBytes = 1 << 20
+	config.RequestBodyDecodeMaxDecodedBytes = 64 << 10
+	config.RequestBodyDecodeMaxDecoderWindowBytes = 1 << 20
+	config.RequestBodyDecodeMaxExpansionRatio = 64
+	config.RequestBodyDecodeMaxLayers = 2
+	logger.Logger = zap.NewNop()
+
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	structuredRoutes := engine.Group("/v1")
+	structuredRoutes.Use(middleware.NormalizeEncodedRequestBody())
+	structuredRoutes.POST("/responses", func(c *gin.Context) {
+		relay := NewRelayResponses(c)
+		if err := relay.setRequest(); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"model": relay.responsesRequest.Model,
+			"input": relay.responsesRequest.Input,
+		})
+	})
+
+	plain := []byte(`{"model":"gpt-5","input":"hello relay with larger window"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(mustCompressRelayBodyWithOptions(t, plain, zstd.WithWindowSize(1<<20), zstd.WithSingleSegment(false))))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "zstd")
+
+	resp := httptest.NewRecorder()
+	engine.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected relay responses setRequest to accept configured zstd window, got status=%d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
 func mustCompressRelayBody(t *testing.T, plain []byte) []byte {
 	t.Helper()
 
@@ -88,4 +144,14 @@ func mustCompressRelayBody(t *testing.T, plain []byte) []byte {
 		t.Fatalf("failed to close relay zstd writer: %v", err)
 	}
 	return buf.Bytes()
+}
+
+func mustCompressRelayBodyWithOptions(t *testing.T, plain []byte, opts ...zstd.EOption) []byte {
+	t.Helper()
+
+	encoder, err := zstd.NewWriter(nil, opts...)
+	if err != nil {
+		t.Fatalf("failed to create zstd encoder: %v", err)
+	}
+	return encoder.EncodeAll(plain, nil)
 }
