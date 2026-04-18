@@ -1,10 +1,20 @@
 package openai
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"one-api/common"
+	"one-api/common/config"
+	"one-api/common/requester"
+	"one-api/model"
 	"one-api/types"
+
+	"github.com/gin-gonic/gin"
 )
 
 func TestHandlerChatStreamToolCallsFinishReasonFromToolEvent(t *testing.T) {
@@ -221,4 +231,105 @@ func mustGetFinishReason(t *testing.T, chunk types.ChatCompletionStreamResponse)
 	}
 
 	return finishReason
+}
+
+func TestCompactResponsesOmitsStructuredInclude(t *testing.T) {
+	body, _ := captureCompactRequestBody(t, nil, &types.OpenAIResponsesRequest{
+		Model:   "gpt-5",
+		Input:   "hello",
+		Include: []string{"reasoning.encrypted_content"},
+	})
+
+	if _, exists := body["include"]; exists {
+		t.Fatalf("expected compact request body to omit structured include, got %#v", body["include"])
+	}
+}
+
+func TestCompactResponsesPreservesUnknownAllowExtraBodyFieldsButNotKnownInclude(t *testing.T) {
+	rawBody := []byte(`{"model":"gpt-5","input":"hello","include":["raw-include"],"experimental_feature":"enabled"}`)
+	rawMap := make(map[string]interface{})
+	if err := json.Unmarshal(rawBody, &rawMap); err != nil {
+		t.Fatalf("failed to decode raw body: %v", err)
+	}
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(rawBody))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	common.SetReusableRequestBodyMap(ctx, rawBody, rawMap)
+
+	body, _ := captureCompactRequestBody(t, func(provider *OpenAIProvider) {
+		provider.Channel.AllowExtraBody = true
+		provider.SetContext(ctx)
+	}, &types.OpenAIResponsesRequest{
+		Model: "gpt-5",
+		Input: "hello",
+	})
+
+	if _, exists := body["include"]; exists {
+		t.Fatalf("expected compact request body to drop known include from raw extra body, got %#v", body["include"])
+	}
+	if got := body["experimental_feature"]; got != "enabled" {
+		t.Fatalf("expected compact request body to preserve unknown extra field, got %#v", got)
+	}
+}
+
+func TestCompactResponsesCustomParameterCanRestoreIncludeWithPreAdd(t *testing.T) {
+	customParameter := `{"pre_add":true,"overwrite":true,"include":["from_custom"]}`
+	body, _ := captureCompactRequestBody(t, func(provider *OpenAIProvider) {
+		provider.Channel.CustomParameter = &customParameter
+	}, &types.OpenAIResponsesRequest{
+		Model:   "gpt-5",
+		Input:   "hello",
+		Include: []string{"from_client"},
+	})
+
+	includeValues, ok := body["include"].([]interface{})
+	if !ok || len(includeValues) != 1 || includeValues[0] != "from_custom" {
+		t.Fatalf("expected custom_parameter to restore include after compact cleanup, got %#v", body["include"])
+	}
+}
+
+func captureCompactRequestBody(t *testing.T, configure func(*OpenAIProvider), request *types.OpenAIResponsesRequest) (map[string]interface{}, *OpenAIProvider) {
+	t.Helper()
+
+	var bodyBytes []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		bodyBytes, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_1","object":"response","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`))
+	}))
+	t.Cleanup(server.Close)
+
+	originalHTTPClient := requester.HTTPClient
+	requester.HTTPClient = server.Client()
+	t.Cleanup(func() {
+		requester.HTTPClient = originalHTTPClient
+	})
+
+	proxy := ""
+	provider := CreateOpenAIProvider(&model.Channel{
+		Type:  config.ChannelTypeOpenAI,
+		Key:   "sk-test",
+		Proxy: &proxy,
+	}, server.URL)
+	provider.Usage = &types.Usage{}
+
+	if configure != nil {
+		configure(provider)
+	}
+
+	if _, errWithCode := provider.CompactResponses(request); errWithCode != nil {
+		t.Fatalf("CompactResponses returned error: %v", errWithCode.Message)
+	}
+
+	requestBody := make(map[string]interface{})
+	if err := json.Unmarshal(bodyBytes, &requestBody); err != nil {
+		t.Fatalf("failed to decode compact request body: %v", err)
+	}
+
+	return requestBody, provider
 }

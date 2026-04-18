@@ -311,9 +311,10 @@ func TestCompactResponsesUsesCompactEndpoint(t *testing.T) {
 	provider.Channel.BaseURL = &server.URL
 
 	resp, errWithCode := provider.CompactResponses(&types.OpenAIResponsesRequest{
-		Model:  "gpt-5",
-		Input:  "hello",
-		Stream: true,
+		Model:   "gpt-5",
+		Input:   "hello",
+		Stream:  true,
+		Include: []string{"reasoning.encrypted_content", "custom.include"},
 	})
 	if errWithCode != nil {
 		t.Fatalf("CompactResponses returned error: %v", errWithCode.Message)
@@ -339,19 +340,8 @@ func TestCompactResponsesUsesCompactEndpoint(t *testing.T) {
 	if _, exists := raw["truncation"]; exists {
 		t.Fatalf("expected compact request body to omit truncation, got %s", string(bodyBytes))
 	}
-	includeValues, ok := raw["include"].([]any)
-	if !ok || len(includeValues) == 0 {
-		t.Fatalf("expected compact request body to include normalized include field, got %s", string(bodyBytes))
-	}
-	foundEncryptedContent := false
-	for _, item := range includeValues {
-		if item == codexReasoningEncryptedContentInclude {
-			foundEncryptedContent = true
-			break
-		}
-	}
-	if !foundEncryptedContent {
-		t.Fatalf("expected compact request body to request reasoning encrypted content, got %s", string(bodyBytes))
+	if _, exists := raw["include"]; exists {
+		t.Fatalf("expected compact request body to omit include, got %s", string(bodyBytes))
 	}
 
 	if resp.Object != "response.compaction" {

@@ -293,7 +293,7 @@ func (p *CodexProvider) CreateResponsesStream(request *types.OpenAIResponsesRequ
 }
 
 func (p *CodexProvider) CompactResponses(request *types.OpenAIResponsesRequest) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
-	p.prepareCodexRequest(request)
+	p.prepareCodexCompactRequest(request)
 	request.Stream = false
 
 	req, errWithCode := p.getResponsesOperationRequest(request, "compact")
@@ -317,8 +317,26 @@ func (p *CodexProvider) CompactResponses(request *types.OpenAIResponsesRequest) 
 	return response, nil
 }
 
-// prepareCodexRequest prepares Codex request fields.
+// prepareCodexRequest prepares Codex request fields for ordinary responses.
 func (p *CodexProvider) prepareCodexRequest(request *types.OpenAIResponsesRequest) {
+	p.prepareCodexRequestWithReasoning(request, true)
+}
+
+// prepareCodexCompactRequest prepares Codex request fields for compact requests.
+func (p *CodexProvider) prepareCodexCompactRequest(request *types.OpenAIResponsesRequest) {
+	p.prepareCodexRequestWithReasoning(request, false)
+}
+
+// prepareCodexRequestWithReasoning prepares Codex request fields.
+//
+// Trade-off: Codex regular Responses calls still need
+// `include=["reasoning.encrypted_content"]` so resumed reasoning state can flow
+// through the proxy, but the dedicated `/responses/compact` payload in the
+// upstream Codex client is a different schema and current upstream rejects
+// `include` there. Keep the include on normal responses and explicitly strip it
+// from compact requests instead of trying to infer support dynamically per
+// upstream response.
+func (p *CodexProvider) prepareCodexRequestWithReasoning(request *types.OpenAIResponsesRequest, includeReasoning bool) {
 	request.Model = normalizeCodexModelName(request.Model)
 
 	// Codex requires store=false.
@@ -335,7 +353,11 @@ func (p *CodexProvider) prepareCodexRequest(request *types.OpenAIResponsesReques
 	request.Truncation = ""
 
 	ensureStablePromptCacheKey(request, p.Context, p.getPromptCacheKeyStrategy())
-	ensureCodexIncludes(request)
+	if includeReasoning {
+		ensureCodexIncludes(request)
+	} else {
+		request.Include = nil
+	}
 	normalizeCodexBuiltinTools(request)
 
 	// Adapt to Codex CLI format.

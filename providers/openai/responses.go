@@ -8,7 +8,9 @@ import (
 	"one-api/common/config"
 	"one-api/common/requester"
 	"one-api/common/utils"
+	providersBase "one-api/providers/base"
 	"one-api/types"
+	"reflect"
 	"strings"
 )
 
@@ -34,6 +36,7 @@ var (
 		"response.failed":            {},
 		"response.incomplete":        {},
 	}
+	responsesRequestJSONFields = collectJSONFieldNames(reflect.TypeOf(types.OpenAIResponsesRequest{}))
 )
 
 type responsesUsageEvent struct {
@@ -129,7 +132,7 @@ func (p *OpenAIProvider) CreateResponsesStream(request *types.OpenAIResponsesReq
 }
 
 func (p *OpenAIProvider) CompactResponses(request *types.OpenAIResponsesRequest) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
-	req, errWithCode := p.buildResponsesOperationRequest("compact", request.Model, request)
+	req, errWithCode := p.buildCompactResponsesRequest(request)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -155,6 +158,111 @@ func (p *OpenAIProvider) CompactResponses(request *types.OpenAIResponsesRequest)
 	getResponsesExtraBilling(response, p.Usage)
 
 	return response, nil
+}
+
+func (p *OpenAIProvider) buildCompactResponsesRequest(request *types.OpenAIResponsesRequest) (*http.Request, *types.OpenAIErrorWithStatusCode) {
+	basePath, errWithCode := p.GetSupportedAPIUri(config.RelayModeResponses)
+	if errWithCode != nil {
+		return nil, errWithCode
+	}
+
+	fullRequestURL := p.GetFullRequestURL(joinURLPath(basePath, "compact"), request.Model)
+	headers := p.GetRequestHeaders()
+
+	bodyMap, errWithCode := p.buildCompactRequestBody(request)
+	if errWithCode != nil {
+		return nil, errWithCode
+	}
+
+	req, err := p.Requester.NewRequest(http.MethodPost, fullRequestURL, p.Requester.WithBody(bodyMap), p.Requester.WithHeader(headers))
+	if err != nil {
+		return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
+	}
+
+	return req, nil
+}
+
+func (p *OpenAIProvider) buildCompactRequestBody(request *types.OpenAIResponsesRequest) (map[string]interface{}, *types.OpenAIErrorWithStatusCode) {
+	requestBytes, err := json.Marshal(request)
+	if err != nil {
+		return nil, common.ErrorWrapper(err, "marshal_request_failed", http.StatusInternalServerError)
+	}
+
+	bodyMap := make(map[string]interface{})
+	if err := json.Unmarshal(requestBytes, &bodyMap); err != nil {
+		return nil, common.ErrorWrapper(err, "unmarshal_request_failed", http.StatusInternalServerError)
+	}
+
+	// Compact accepts a narrower structured schema than ordinary responses:
+	// keep known compact fields from the typed request, but drop `include`
+	// before reattaching user extra-body fields and channel overrides.
+	delete(bodyMap, "include")
+
+	if p.Channel.AllowExtraBody {
+		rawMap, ok, err := p.GetRawBodyMap()
+		if err != nil {
+			return nil, common.ErrorWrapper(err, "unmarshal_request_failed", http.StatusInternalServerError)
+		}
+		if ok && rawMap != nil {
+			for key, value := range rawMap {
+				if responsesRequestJSONFields[key] {
+					continue
+				}
+				bodyMap[key] = value
+			}
+		}
+	}
+
+	customParams, err := p.CustomParameterHandler()
+	if err != nil {
+		return nil, common.ErrorWrapper(err, "custom_parameter_error", http.StatusInternalServerError)
+	}
+	if customParams != nil {
+		bodyMap = providersBase.ApplyCustomParams(bodyMap, customParams, request.Model, true)
+	}
+
+	return bodyMap, nil
+}
+
+func collectJSONFieldNames(t reflect.Type) map[string]bool {
+	fields := make(map[string]bool)
+	if t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct {
+		return fields
+	}
+
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		if field.PkgPath != "" && !field.Anonymous {
+			continue
+		}
+
+		tag := strings.TrimSpace(field.Tag.Get("json"))
+		name := field.Name
+		if tag != "" {
+			parts := strings.Split(tag, ",")
+			switch parts[0] {
+			case "-":
+				continue
+			case "":
+			default:
+				name = parts[0]
+			}
+		}
+
+		if field.Anonymous && (tag == "" || tag == ",omitempty") {
+			for nested := range collectJSONFieldNames(field.Type) {
+				fields[nested] = true
+			}
+			continue
+		}
+
+		fields[name] = true
+	}
+
+	return fields
 }
 
 func (h *OpenAIResponsesStreamHandler) HandlerResponsesStream(rawLine *[]byte, dataChan chan string, errChan chan error) {
