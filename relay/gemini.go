@@ -1,12 +1,12 @@
 package relay
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/requester"
+	"one-api/common/surface"
 	"one-api/providers/gemini"
 	"one-api/safty"
 	"one-api/types"
@@ -28,6 +28,7 @@ func NewRelayGeminiOnly(c *gin.Context) *relayGeminiOnly {
 		relayBase: relayBase{
 			allowHeartbeat: true,
 			c:              c,
+			contract:       surface.GeminiContract(),
 		},
 	}
 
@@ -135,27 +136,18 @@ func (r *relayGeminiOnly) send() (err *types.OpenAIErrorWithStatusCode, done boo
 }
 
 func (r *relayGeminiOnly) GetError(err *types.OpenAIErrorWithStatusCode) (int, any) {
-	newErr := FilterOpenAIErr(r.c, err)
-
+	newErr := surface.NormalizeOpenAIError(r.c, err)
 	geminiErr := gemini.OpenaiErrToGeminiErr(&newErr)
 
 	return newErr.StatusCode, geminiErr.GeminiErrorResponse
 }
 
 func (r *relayGeminiOnly) HandleJsonError(err *types.OpenAIErrorWithStatusCode) {
-	statusCode, response := r.GetError(err)
-	r.c.JSON(statusCode, response)
+	r.relayBase.HandleJsonError(err)
 }
 
 func (r *relayGeminiOnly) HandleStreamError(err *types.OpenAIErrorWithStatusCode) {
-	_, response := r.GetError(err)
-
-	str, jsonErr := json.Marshal(response)
-	if jsonErr != nil {
-		return
-	}
-	r.c.Writer.Write([]byte("data: " + string(str) + "\n\n"))
-	r.c.Writer.Flush()
+	r.relayBase.HandleStreamError(err)
 }
 
 func CountGeminiTokenMessages(request *gemini.GeminiChatRequest, preCostType int) (int, error) {

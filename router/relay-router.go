@@ -165,13 +165,24 @@ func setGeminiRouter(router *gin.Engine) {
 func setRecraftRouter(router *gin.Engine) {
 	relayRecraftRouter := router.Group("/recraftAI/v1")
 	relayRecraftRouter.Use(middleware.RelayPanicRecover(), middleware.OpenaiAuth(), middleware.Distribute(), middleware.DynamicRedisRateLimiter())
+
+	// Trade-off: /images/generations still goes through the OpenAI-compatible
+	// image relay, so keep its decode-failure envelope stable while restoring the
+	// native Recraft flat error shape for the raw pass-through endpoints below.
+	recraftGenerationsRouter := relayRecraftRouter.Group("")
+	recraftGenerationsRouter.Use(middleware.NormalizeEncodedRequestBodyWithFailureResponder(surface.OpenAIRequestBodyDecodeFailure))
 	{
-		relayRecraftRouter.POST("/images/generations", relay.Relay)
-		relayRecraftRouter.POST("/images/vectorize", relay.RelayRecraftAI)
-		relayRecraftRouter.POST("/images/removeBackground", relay.RelayRecraftAI)
-		relayRecraftRouter.POST("/images/clarityUpscale", relay.RelayRecraftAI)
-		relayRecraftRouter.POST("/images/generativeUpscale", relay.RelayRecraftAI)
-		relayRecraftRouter.POST("/styles", relay.RelayRecraftAI)
+		recraftGenerationsRouter.POST("/images/generations", relay.Relay)
+	}
+
+	recraftNativeRouter := relayRecraftRouter.Group("")
+	recraftNativeRouter.Use(middleware.NormalizeEncodedRequestBodyWithFailureResponder(surface.RecraftRequestBodyDecodeFailure))
+	{
+		recraftNativeRouter.POST("/images/vectorize", relay.Relay)
+		recraftNativeRouter.POST("/images/removeBackground", relay.Relay)
+		recraftNativeRouter.POST("/images/clarityUpscale", relay.Relay)
+		recraftNativeRouter.POST("/images/generativeUpscale", relay.Relay)
+		recraftNativeRouter.POST("/styles", relay.Relay)
 	}
 }
 

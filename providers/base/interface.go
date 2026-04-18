@@ -112,6 +112,11 @@ type ModelListInterface interface {
 	GetModelList() ([]string, error)
 }
 
+type RawRelayInterface interface {
+	ProviderInterface
+	CreateRelay(requestURL string) (*http.Response, *types.OpenAIErrorWithStatusCode)
+}
+
 // 余额接口
 type BalanceInterface interface {
 	Balance() (float64, error)

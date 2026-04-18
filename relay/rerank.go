@@ -6,6 +6,7 @@ import (
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/logger"
+	"one-api/common/surface"
 	providersBase "one-api/providers/base"
 	"one-api/types"
 
@@ -14,14 +15,19 @@ import (
 
 func RelayRerank(c *gin.Context) {
 	relay := NewRelayRerank(c)
+	contract := surface.RerankContract()
 
 	if err := relay.setRequest(); err != nil {
-		common.AbortWithErr(c, http.StatusBadRequest, &types.RerankError{Detail: err.Error()})
+		surfaceErr := surface.NewLocalError(http.StatusBadRequest, err.Error(), "invalid_request")
+		surface.LogLocalError(c, surfaceErr)
+		contract.RenderJSONError(c, surfaceErr)
 		return
 	}
 
 	if err := relay.setProvider(relay.getOriginalModel()); err != nil {
-		common.AbortWithErr(c, http.StatusServiceUnavailable, &types.RerankError{Detail: err.Error()})
+		surfaceErr := surface.NewLocalError(http.StatusServiceUnavailable, err.Error(), "provider_not_found")
+		surface.LogLocalError(c, surfaceErr)
+		contract.RenderJSONError(c, surfaceErr)
 		return
 	}
 
@@ -62,7 +68,9 @@ func RelayRerank(c *gin.Context) {
 		if apiErr.StatusCode == http.StatusTooManyRequests {
 			apiErr.OpenAIError.Message = "当前分组上游负载已饱和，请稍后再试"
 		}
-		relayRerankResponseWithErr(c, apiErr)
+		surfaceErr := surface.FromOpenAIError(apiErr)
+		surface.LogLocalError(c, surfaceErr)
+		contract.RenderJSONError(c, surfaceErr)
 	}
 }
 

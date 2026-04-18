@@ -1,11 +1,11 @@
 package relay
 
 import (
-	"encoding/json"
 	"net/http"
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/requester"
+	"one-api/common/surface"
 	"one-api/providers/claude"
 	"one-api/safty"
 	"one-api/types"
@@ -27,6 +27,7 @@ func NewRelayClaudeOnly(c *gin.Context) *relayClaudeOnly {
 		relayBase: relayBase{
 			allowHeartbeat: true,
 			c:              c,
+			contract:       surface.ClaudeContract(),
 		},
 	}
 
@@ -119,27 +120,18 @@ func (r *relayClaudeOnly) send() (err *types.OpenAIErrorWithStatusCode, done boo
 }
 
 func (r *relayClaudeOnly) GetError(err *types.OpenAIErrorWithStatusCode) (int, any) {
-	newErr := FilterOpenAIErr(r.c, err)
-
+	newErr := surface.NormalizeOpenAIError(r.c, err)
 	claudeErr := claude.OpenaiErrToClaudeErr(&newErr)
 
 	return newErr.StatusCode, claudeErr.ClaudeError
 }
 
 func (r *relayClaudeOnly) HandleJsonError(err *types.OpenAIErrorWithStatusCode) {
-	statusCode, response := r.GetError(err)
-	r.c.JSON(statusCode, response)
+	r.relayBase.HandleJsonError(err)
 }
 
 func (r *relayClaudeOnly) HandleStreamError(err *types.OpenAIErrorWithStatusCode) {
-	_, response := r.GetError(err)
-
-	str, jsonErr := json.Marshal(response)
-	if jsonErr != nil {
-		return
-	}
-	r.c.Writer.Write([]byte("event: error\ndata: " + string(str) + "\n\n"))
-	r.c.Writer.Flush()
+	r.relayBase.HandleStreamError(err)
 }
 
 func CountTokenMessages(request *claude.ClaudeRequest, preCostType int) (int, error) {

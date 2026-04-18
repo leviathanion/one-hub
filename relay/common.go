@@ -12,6 +12,7 @@ import (
 	"one-api/common/groupctx"
 	"one-api/common/logger"
 	"one-api/common/requester"
+	"one-api/common/surface"
 	"one-api/common/utils"
 	"one-api/controller"
 	"one-api/metrics"
@@ -20,7 +21,6 @@ import (
 	providersBase "one-api/providers/base"
 	"one-api/relay/relay_util"
 	"one-api/types"
-	"regexp"
 	"strings"
 	"time"
 
@@ -63,6 +63,8 @@ func Path2Relay(c *gin.Context, path string) RelayBaseInterface {
 		relay = NewRelayGeminiOnly(c)
 	} else if strings.HasPrefix(path, "/v1/responses") {
 		relay = NewRelayResponses(c)
+	} else if IsRecraftNativePath(path) {
+		relay = NewRelayRecraftNative(c)
 	}
 
 	return relay
@@ -778,64 +780,20 @@ func processChannelRelayError(ctx context.Context, channelId int, channelName st
 	}
 }
 
-var (
-	requestIdRegex = regexp.MustCompile(`\(request id: [^\)]+\)`)
-	quotaKeywords  = []string{"余额", "额度", "quota", "无可用渠道", "令牌"}
-)
-
 func FilterOpenAIErr(c *gin.Context, err *types.OpenAIErrorWithStatusCode) (errWithStatusCode types.OpenAIErrorWithStatusCode) {
-	newErr := types.OpenAIErrorWithStatusCode{}
-	if err != nil {
-		newErr = *err
-	}
-
-	if newErr.StatusCode == http.StatusTooManyRequests {
-		newErr.OpenAIError.Message = "当前分组上游负载已饱和，请稍后再试"
-	}
-
-	// 如果message中已经包含 request id: 则不再添加
-	if strings.Contains(newErr.Message, "(request id:") {
-		newErr.Message = requestIdRegex.ReplaceAllString(newErr.Message, "")
-	}
-
-	requestId := c.GetString(logger.RequestIdKey)
-	newErr.OpenAIError.Message = utils.MessageWithRequestId(newErr.OpenAIError.Message, requestId)
-
-	if !newErr.LocalError && newErr.OpenAIError.Type == "one_hub_error" || strings.HasSuffix(newErr.OpenAIError.Type, "_api_error") {
-		newErr.OpenAIError.Type = "system_error"
-		if utils.ContainsString(newErr.Message, quotaKeywords) {
-			newErr.Message = "上游负载已饱和，请稍后再试"
-			newErr.StatusCode = http.StatusTooManyRequests
-		}
-	}
-
-	if code, ok := newErr.OpenAIError.Code.(string); ok && code == "bad_response_status_code" && !strings.Contains(newErr.OpenAIError.Message, "bad response status code") {
-		newErr.OpenAIError.Message = fmt.Sprintf("Provider API error: bad response status code %s", newErr.OpenAIError.Param)
-	}
-
-	return newErr
+	return surface.NormalizeOpenAIError(c, err)
 }
 
 func relayResponseWithOpenAIErr(c *gin.Context, err *types.OpenAIErrorWithStatusCode) {
-	c.JSON(err.StatusCode, gin.H{
-		"error": err.OpenAIError,
-	})
+	surfaceErr := surface.FromOpenAIError(err)
+	surface.LogLocalError(c, surfaceErr)
+	surface.OpenAIContract().RenderJSONError(c, surfaceErr)
 }
 
 func relayRerankResponseWithErr(c *gin.Context, err *types.OpenAIErrorWithStatusCode) {
-	// 如果message中已经包含 request id: 则不再添加
-	if !strings.Contains(err.Message, "request id:") {
-		requestId := c.GetString(logger.RequestIdKey)
-		err.OpenAIError.Message = utils.MessageWithRequestId(err.OpenAIError.Message, requestId)
-	}
-
-	if err.OpenAIError.Type == "new_api_error" || err.OpenAIError.Type == "one_api_error" {
-		err.OpenAIError.Type = "system_error"
-	}
-
-	c.JSON(err.StatusCode, gin.H{
-		"detail": err.OpenAIError.Message,
-	})
+	surfaceErr := surface.FromOpenAIError(err)
+	surface.LogLocalError(c, surfaceErr)
+	surface.RerankContract().RenderJSONError(c, surfaceErr)
 }
 
 // mergeCustomParamsForPreMapping applies custom parameter logic similar to OpenAI provider

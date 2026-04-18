@@ -1,8 +1,8 @@
 package relay
 
 import (
-	"encoding/json"
-	"one-api/common/config"
+	"one-api/common"
+	"one-api/common/surface"
 	"one-api/model"
 	"one-api/relay/relay_util"
 	"one-api/types"
@@ -18,6 +18,7 @@ type relayBase struct {
 	provider       providersBase.ProviderInterface
 	originalModel  string
 	modelName      string
+	contract       surface.Contract
 	allowHeartbeat bool
 	heartbeat      *relay_util.Heartbeat
 
@@ -43,6 +44,10 @@ type RelayBaseInterface interface {
 	SetHeartbeat(isStream bool) *relay_util.Heartbeat
 }
 
+type relaySetupErrorWrapper interface {
+	WrapSetupError(stage string, err error) *types.OpenAIErrorWithStatusCode
+}
+
 func (r *relayBase) getRequest() interface{} {
 	return nil
 }
@@ -52,7 +57,7 @@ func (r *relayBase) IsStream() bool {
 }
 
 func (r *relayBase) setProvider(modelName string) error {
-	r.c.Set(config.GinRequestBodyReparseKey, false)
+	common.SetRequestBodyReparseNeeded(r.c, false)
 
 	if provider, newModelName, ok := consumeCachedProviderSelection(r.c, modelName); ok {
 		r.provider = provider
@@ -69,6 +74,13 @@ func (r *relayBase) setProvider(modelName string) error {
 	_, _ = applyPreMappingForProvider(r.c, modelName, provider)
 
 	return nil
+}
+
+func (r *relayBase) getContract() surface.Contract {
+	if r.contract != nil {
+		return r.contract
+	}
+	return surface.OpenAIContract()
 }
 
 func (r *relayBase) setOriginalModel(modelName string) {
@@ -105,27 +117,22 @@ func (r *relayBase) SetFirstResponseTime(firstResponseTime time.Time) {
 }
 
 func (r *relayBase) GetError(err *types.OpenAIErrorWithStatusCode) (int, any) {
-	newErr := FilterOpenAIErr(r.c, err)
+	newErr := surface.NormalizeOpenAIError(r.c, err)
 	return newErr.StatusCode, types.OpenAIErrorResponse{
 		Error: newErr.OpenAIError,
 	}
 }
 
 func (r *relayBase) HandleJsonError(err *types.OpenAIErrorWithStatusCode) {
-	statusCode, response := r.GetError(err)
-	r.c.JSON(statusCode, response)
+	surfaceErr := surface.FromOpenAIError(err)
+	surface.LogLocalError(r.c, surfaceErr)
+	r.getContract().RenderJSONError(r.c, surfaceErr)
 }
 
 func (r *relayBase) HandleStreamError(err *types.OpenAIErrorWithStatusCode) {
-	_, response := r.GetError(err)
-
-	str, jsonErr := json.Marshal(response)
-	if jsonErr != nil {
-		return
-	}
-
-	r.c.Writer.Write([]byte("data: " + string(str) + "\n\n"))
-	r.c.Writer.Flush()
+	surfaceErr := surface.FromOpenAIError(err)
+	surface.LogLocalError(r.c, surfaceErr)
+	r.getContract().RenderStreamError(r.c, surfaceErr)
 }
 
 func (r *relayBase) SetHeartbeat(isStream bool) *relay_util.Heartbeat {

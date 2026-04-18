@@ -2,89 +2,22 @@ package relay
 
 import (
 	"errors"
-	"fmt"
 	"net/http"
 	"one-api/common"
 	"one-api/common/config"
-	"one-api/common/logger"
-	"one-api/metrics"
-	"one-api/providers/recraftAI"
-	"one-api/relay/relay_util"
+	"one-api/common/surface"
+	providersBase "one-api/providers/base"
 	"one-api/types"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 )
 
+var allowRecraftChannelType = []int{config.ChannelTypeRecraft}
+var getRecraftRawProviderFunc = getRecraftRawProvider
+
 func RelayRecraftAI(c *gin.Context) {
-	model := Path2RecraftAIModel(c.Request.URL.Path)
-
-	usage := &types.Usage{
-		PromptTokens: 1,
-	}
-
-	recraftProvider, err := getRecraftProvider(c, model)
-	if err != nil {
-		common.AbortWithMessage(c, http.StatusServiceUnavailable, err.Error())
-		return
-	}
-
-	recraftProvider.SetUsage(usage)
-
-	quota := relay_util.NewQuota(c, model, 1)
-	if err := quota.PreQuotaConsumption(); err != nil {
-		common.AbortWithMessage(c, http.StatusServiceUnavailable, err.Error())
-		return
-	}
-
-	requestURL := strings.Replace(c.Request.URL.Path, "/recraftAI", "", 1)
-	response, apiErr := recraftProvider.CreateRelay(requestURL)
-	if apiErr == nil {
-		quota.Consume(c, usage, false)
-
-		metrics.RecordProvider(c, 200)
-		errWithCode := responseMultipart(c, response)
-		logger.LogError(c.Request.Context(), fmt.Sprintf("relay error happen %v, won't retry in this case", errWithCode))
-		return
-	}
-
-	channel := recraftProvider.GetChannel()
-	go processChannelRelayError(c.Request.Context(), channel.Id, channel.Name, apiErr, channel.Type)
-
-	retryTimes := config.RetryTimes
-	if !shouldRetry(c, apiErr, channel.Type) {
-		logger.LogError(c.Request.Context(), fmt.Sprintf("relay error happen, status code is %d, won't retry in this case", apiErr.StatusCode))
-		retryTimes = 0
-	}
-
-	for i := retryTimes; i > 0; i-- {
-		shouldCooldowns(c, channel, apiErr)
-		if recraftProvider, err = getRecraftProvider(c, model); err != nil {
-			continue
-		}
-
-		channel = recraftProvider.GetChannel()
-		logger.LogError(c.Request.Context(), fmt.Sprintf("using channel #%d(%s) to retry (remain times %d)", channel.Id, channel.Name, i))
-
-		response, apiErr := recraftProvider.CreateRelay(requestURL)
-		if apiErr == nil {
-			quota.Consume(c, usage, false)
-
-			metrics.RecordProvider(c, 200)
-			errWithCode := responseMultipart(c, response)
-			logger.LogError(c.Request.Context(), fmt.Sprintf("relay error happen %v, won't retry in this case", errWithCode))
-			return
-		}
-
-		go processChannelRelayError(c.Request.Context(), channel.Id, channel.Name, apiErr, channel.Type)
-		if !shouldRetry(c, apiErr, channel.Type) {
-			break
-		}
-	}
-
-	quota.Undo(c)
-	newErrWithCode := FilterOpenAIErr(c, apiErr)
-	common.AbortWithErr(c, newErrWithCode.StatusCode, &newErrWithCode.OpenAIError)
+	Relay(c)
 }
 
 func Path2RecraftAIModel(path string) string {
@@ -94,17 +27,115 @@ func Path2RecraftAIModel(path string) string {
 	return "recraft_" + lastPart
 }
 
-func getRecraftProvider(c *gin.Context, model string) (*recraftAI.RecraftProvider, error) {
-	provider, _, fail := GetProvider(c, model)
+func IsRecraftNativePath(path string) bool {
+	switch path {
+	case "/recraftAI/v1/images/vectorize",
+		"/recraftAI/v1/images/removeBackground",
+		"/recraftAI/v1/images/clarityUpscale",
+		"/recraftAI/v1/images/generativeUpscale",
+		"/recraftAI/v1/styles":
+		return true
+	default:
+		return false
+	}
+}
+
+type relayRecraftNative struct {
+	relayBase
+	requestURL string
+}
+
+func NewRelayRecraftNative(c *gin.Context) *relayRecraftNative {
+	c.Set("allow_channel_type", allowRecraftChannelType)
+	return &relayRecraftNative{
+		relayBase: relayBase{
+			c:        c,
+			contract: surface.RecraftContract(),
+		},
+	}
+}
+
+func (r *relayRecraftNative) setRequest() error {
+	if !IsRecraftNativePath(r.c.Request.URL.Path) {
+		return errors.New("unsupported recraft endpoint")
+	}
+
+	r.requestURL = strings.TrimPrefix(r.c.Request.URL.Path, "/recraftAI")
+	r.setOriginalModel(Path2RecraftAIModel(r.c.Request.URL.Path))
+	return nil
+}
+
+func (r *relayRecraftNative) setProvider(modelName string) error {
+	common.SetRequestBodyReparseNeeded(r.c, false)
+
+	if provider, newModelName, ok := consumeCachedProviderSelection(r.c, modelName); ok {
+		rawProvider, rawOK := provider.(providersBase.RawRelayInterface)
+		if !rawOK {
+			return errors.New("provider not found")
+		}
+		r.provider = rawProvider
+		r.modelName = newModelName
+		return nil
+	}
+
+	provider, newModelName, fail := getRecraftRawProviderFunc(r.c, modelName)
 	if fail != nil {
-		// common.AbortWithMessage(c, http.StatusServiceUnavailable, fail.Error())
-		return nil, fail
+		return fail
 	}
 
-	recraftProvider, ok := provider.(*recraftAI.RecraftProvider)
+	r.provider = provider
+	r.modelName = newModelName
+	_, _ = applyPreMappingForProvider(r.c, modelName, provider)
+	return nil
+}
+
+func (r *relayRecraftNative) getPromptTokens() (int, error) {
+	return 1, nil
+}
+
+func (r *relayRecraftNative) WrapSetupError(stage string, err error) *types.OpenAIErrorWithStatusCode {
+	switch stage {
+	case "request":
+		return common.StringErrorWrapperLocal(err.Error(), "invalid_request", http.StatusBadRequest)
+	case "provider":
+		return common.StringErrorWrapperLocal(err.Error(), "provider_not_found", http.StatusServiceUnavailable)
+	case "reparse":
+		return common.StringErrorWrapperLocal(err.Error(), "one_hub_error", http.StatusBadRequest)
+	default:
+		return nil
+	}
+}
+
+func (r *relayRecraftNative) send() (err *types.OpenAIErrorWithStatusCode, done bool) {
+	rawProvider, ok := r.provider.(providersBase.RawRelayInterface)
 	if !ok {
-		return nil, errors.New("provider not found")
+		err = common.StringErrorWrapperLocal("channel not implemented", "channel_error", http.StatusServiceUnavailable)
+		done = true
+		return
 	}
 
-	return recraftProvider, nil
+	response, err := rawProvider.CreateRelay(r.requestURL)
+	if err != nil {
+		return
+	}
+
+	err = responseMultipart(r.c, response)
+	if err != nil {
+		done = true
+	}
+	return
+}
+
+func getRecraftRawProvider(c *gin.Context, model string) (providersBase.RawRelayInterface, string, error) {
+	provider, newModelName, fail := GetProvider(c, model)
+	if fail != nil {
+		return nil, "", fail
+	}
+
+	rawProvider, ok := provider.(providersBase.RawRelayInterface)
+	if !ok {
+		return nil, "", errors.New("provider not found")
+	}
+
+	return rawProvider, newModelName, nil
 }

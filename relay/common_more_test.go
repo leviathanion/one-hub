@@ -40,6 +40,7 @@ func TestPath2RelayAndLimitModelHelpers(t *testing.T) {
 		"/claude",
 		"/gemini",
 		"/v1/responses",
+		"/recraftAI/v1/styles",
 	}
 	for _, path := range paths {
 		if relay := Path2Relay(ginCtx, path); relay == nil {
