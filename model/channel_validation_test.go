@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"one-api/common/config"
+
+	"gorm.io/datatypes"
 )
 
 func testStringPtr(value string) *string {
@@ -80,6 +82,43 @@ func TestValidateCodexChannelOtherAcceptsDocumentedFields(t *testing.T) {
 	}
 	if err := channel.ValidateRuntimeConfigJSON(); err != nil {
 		t.Fatalf("expected documented Codex other fields to validate, got %v", err)
+	}
+}
+
+func TestValidateCustomChannelClaudePlugin(t *testing.T) {
+	validPlugin := datatypes.NewJSONType(PluginType{
+		"claude": {
+			"enabled":  true,
+			"base_url": "https://provider.example.com",
+		},
+	})
+	channel := &Channel{
+		Type:   config.ChannelTypeCustom,
+		Plugin: &validPlugin,
+	}
+	if err := channel.ValidateRuntimeConfigJSON(); err != nil {
+		t.Fatalf("expected valid custom Claude plugin config, got %v", err)
+	}
+
+	invalidEnabledPlugin := datatypes.NewJSONType(PluginType{
+		"claude": {
+			"enabled": "true",
+		},
+	})
+	channel.Plugin = &invalidEnabledPlugin
+	if err := channel.ValidateRuntimeConfigJSON(); err == nil || !strings.Contains(err.Error(), "plugin.claude.enabled") {
+		t.Fatalf("expected invalid Claude enabled flag to fail validation, got %v", err)
+	}
+
+	invalidBaseURLPlugin := datatypes.NewJSONType(PluginType{
+		"claude": {
+			"enabled":  true,
+			"base_url": "https://provider.example.com/v1/messages",
+		},
+	})
+	channel.Plugin = &invalidBaseURLPlugin
+	if err := channel.ValidateRuntimeConfigJSON(); err != nil {
+		t.Fatalf("expected Claude base_url ending with /v1/messages to be normalized instead of rejected, got %v", err)
 	}
 }
 

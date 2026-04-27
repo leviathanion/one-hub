@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"slices"
 	"strings"
 
@@ -75,6 +76,12 @@ func (c *Channel) AllowStream(modelName string) bool {
 }
 
 type PluginType map[string]map[string]interface{}
+
+const (
+	customClaudePluginKey        = "claude"
+	customClaudeEnabledPluginKey = "enabled"
+	customClaudeBaseURLPluginKey = "base_url"
+)
 
 var allowedChannelOrderFields = map[string]bool{
 	"id":            true,
@@ -366,6 +373,83 @@ func (channel *Channel) GetBaseURL() string {
 		return ""
 	}
 	return *channel.BaseURL
+}
+
+func (channel *Channel) CustomClaudeRelayEnabled() bool {
+	if channel == nil || channel.Type != config.ChannelTypeCustom || channel.Plugin == nil {
+		return false
+	}
+
+	claudeConfig, ok := channel.Plugin.Data()[customClaudePluginKey]
+	if !ok || claudeConfig == nil {
+		return false
+	}
+
+	enabled, ok := claudeConfig[customClaudeEnabledPluginKey].(bool)
+	return ok && enabled
+}
+
+func (channel *Channel) ResolveCustomClaudeBaseURL(defaultBaseURL string) (string, error) {
+	if channel == nil {
+		return "", fmt.Errorf("channel is nil")
+	}
+	if channel.Type != config.ChannelTypeCustom {
+		return "", fmt.Errorf("channel is not a custom channel")
+	}
+	if !channel.CustomClaudeRelayEnabled() {
+		return "", fmt.Errorf("plugin.claude.enabled must be true for Claude relay")
+	}
+
+	baseURL := ""
+	baseURLField := "plugin.claude.base_url"
+	if channel.Plugin != nil {
+		if claudeConfig, ok := channel.Plugin.Data()[customClaudePluginKey]; ok && claudeConfig != nil {
+			if rawBaseURL, exists := claudeConfig[customClaudeBaseURLPluginKey]; exists && rawBaseURL != nil {
+				value, ok := rawBaseURL.(string)
+				if !ok {
+					return "", fmt.Errorf("plugin.claude.base_url must be a string")
+				}
+				baseURL = strings.TrimSpace(value)
+			}
+		}
+	}
+
+	if baseURL == "" {
+		baseURL = strings.TrimSpace(channel.GetBaseURL())
+		baseURLField = "base_url"
+	}
+	if baseURL == "" {
+		baseURL = strings.TrimSpace(defaultBaseURL)
+		baseURLField = "plugin.claude.default_base_url"
+	}
+	if baseURL == "" {
+		return "", nil
+	}
+
+	return normalizeClaudeBaseURL(baseURLField, baseURL)
+}
+
+func normalizeClaudeBaseURL(fieldName, rawBaseURL string) (string, error) {
+	trimmed := strings.TrimRight(strings.TrimSpace(rawBaseURL), "/")
+	if trimmed == "" {
+		return "", nil
+	}
+
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("%s must be an absolute http(s) base URL", fieldName)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", fmt.Errorf("%s must use http or https", fieldName)
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", fmt.Errorf("%s must not include query or fragment", fieldName)
+	}
+
+	// Keep path suffixes exactly as configured. The Claude provider appends its
+	// endpoint path later, so users must supply the upstream base path they mean
+	// instead of relying on this layer to correct duplicated endpoint segments.
+	return trimmed, nil
 }
 
 func (channel *Channel) GetModelMapping() string {

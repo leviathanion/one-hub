@@ -313,6 +313,38 @@ func (cc *ChannelsChooser) GetGroupModels(group string) ([]string, error) {
 	return models, nil
 }
 
+func (cc *ChannelsChooser) ModelHasChannel(group string, modelName string, filters ...ChannelsFilterFunc) bool {
+	cc.RLock()
+	defer cc.RUnlock()
+
+	channelsPriority, err := cc.channelsPriority(group, modelName)
+	if err != nil {
+		return false
+	}
+
+	for _, priority := range channelsPriority {
+		for _, channelId := range priority {
+			choice, ok := cc.Channels[channelId]
+			if !ok || choice == nil || choice.Channel == nil || choice.Disable {
+				continue
+			}
+
+			isSkip := false
+			for _, filter := range filters {
+				if filter(channelId, choice) {
+					isSkip = true
+					break
+				}
+			}
+			if !isSkip {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 func (cc *ChannelsChooser) GetModelsGroups() map[string]map[string]bool {
 	cc.RLock()
 	defer cc.RUnlock()

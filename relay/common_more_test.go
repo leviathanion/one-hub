@@ -14,10 +14,13 @@ import (
 	"one-api/common/groupctx"
 	"one-api/common/logger"
 	"one-api/model"
+	claudeprovider "one-api/providers/claude"
+	"one-api/providers/openai"
 	"one-api/types"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
+	"gorm.io/datatypes"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -340,6 +343,168 @@ func TestRelayCommonStreamingAndRetryHelpers(t *testing.T) {
 	}
 	if shouldRetry(newRelayTestContext(nil), &types.OpenAIErrorWithStatusCode{StatusCode: http.StatusTooManyRequests, LocalError: true}, config.ChannelTypeCodex) {
 		t.Fatal("expected local realtime errors to disable retries")
+	}
+}
+
+func TestFetchChannelByModelWithSelectionFiltersCustomClaudeRelayChannels(t *testing.T) {
+	channelGroupSnapshot := snapshotChannelGroup()
+	t.Cleanup(func() {
+		restoreChannelGroup(channelGroupSnapshot)
+	})
+
+	weight := uint(1)
+	proxy := ""
+	modelName := "claude-3-5-sonnet-20241022"
+	disabledPlugin := datatypes.NewJSONType(model.PluginType{
+		"claude": {
+			"enabled": false,
+		},
+	})
+	invalidPlugin := datatypes.NewJSONType(model.PluginType{
+		"claude": {
+			"enabled":  true,
+			"base_url": "://bad-url",
+		},
+	})
+
+	model.ChannelGroup = model.ChannelsChooser{
+		Channels: map[int]*model.ChannelChoice{
+			71: {
+				Channel: &model.Channel{
+					Id:     71,
+					Type:   config.ChannelTypeCustom,
+					Status: config.ChannelStatusEnabled,
+					Group:  "default",
+					Models: modelName,
+					Weight: &weight,
+					Proxy:  &proxy,
+					Plugin: &disabledPlugin,
+				},
+			},
+			73: {
+				Channel: &model.Channel{
+					Id:     73,
+					Type:   config.ChannelTypeCustom,
+					Status: config.ChannelStatusEnabled,
+					Group:  "default",
+					Models: modelName,
+					Weight: &weight,
+					Proxy:  &proxy,
+					Plugin: &invalidPlugin,
+				},
+			},
+			72: {
+				Channel: &model.Channel{
+					Id:     72,
+					Type:   config.ChannelTypeAnthropic,
+					Status: config.ChannelStatusEnabled,
+					Group:  "default",
+					Models: modelName,
+					Weight: &weight,
+					Proxy:  &proxy,
+				},
+			},
+		},
+		Rule: map[string]map[string][][]int{
+			"default": {
+				modelName: {{71, 73, 72}},
+			},
+		},
+		ModelGroup: map[string]map[string]bool{
+			modelName: {
+				"default": true,
+			},
+		},
+	}
+
+	ctx := newRelayTestContext(nil)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/claude/v1/messages", nil)
+	ctx.Set("token_group", "default")
+	ctx.Set("allow_channel_type", AllowChannelType)
+
+	channel, err := fetchChannelByModelWithSelection(ctx, modelName, currentRealtimeChannelSelection(ctx))
+	if err != nil {
+		t.Fatalf("expected Claude channel lookup to succeed, got %v", err)
+	}
+	if channel == nil || channel.Id != 72 {
+		t.Fatalf("expected disabled and invalid custom Claude channels to be filtered out, got %#v", channel)
+	}
+}
+
+func TestPrepareProviderForCustomClaudeRelay(t *testing.T) {
+	weight := uint(1)
+	proxy := ""
+	plugin := datatypes.NewJSONType(model.PluginType{
+		"claude": {
+			"enabled":  true,
+			"base_url": "https://claude-proxy.example.com/api",
+		},
+	})
+	channel := &model.Channel{
+		Id:     81,
+		Type:   config.ChannelTypeCustom,
+		Key:    "sk-custom",
+		Status: config.ChannelStatusEnabled,
+		Group:  "default",
+		Models: "claude-3-5-sonnet-20241022",
+		Weight: &weight,
+		BaseURL: func() *string {
+			baseURL := "https://openai-proxy.example.com"
+			return &baseURL
+		}(),
+		Proxy:  &proxy,
+		Plugin: &plugin,
+	}
+
+	claudeCtx := newRelayTestContext(nil)
+	claudeCtx.Request = httptest.NewRequest(http.MethodPost, "/claude/v1/messages", nil)
+	claudeCtx.Request.Header.Set("anthropic-version", "2024-01-01")
+	provider, newModelName, err := prepareProviderForChannel(claudeCtx, "claude-3-5-sonnet-20241022", channel)
+	if err != nil {
+		t.Fatalf("expected custom Claude relay provider selection to succeed, got %v", err)
+	}
+	claudeProvider, ok := provider.(*claudeprovider.ClaudeProvider)
+	if !ok {
+		t.Fatalf("expected Claude provider for custom Claude relay, got %T", provider)
+	}
+	if newModelName != "claude-3-5-sonnet-20241022" {
+		t.Fatalf("unexpected mapped model name: %q", newModelName)
+	}
+	if fullURL := claudeProvider.GetFullRequestURL("/v1/messages"); fullURL != "https://claude-proxy.example.com/api/v1/messages" {
+		t.Fatalf("unexpected Claude request URL: %q", fullURL)
+	}
+	headers := claudeProvider.GetRequestHeaders()
+	if headers["x-api-key"] != "sk-custom" || headers["anthropic-version"] != "2024-01-01" {
+		t.Fatalf("unexpected Claude request headers: %#v", headers)
+	}
+
+	openAICtx := newRelayTestContext(nil)
+	openAICtx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	provider, _, err = prepareProviderForChannel(openAICtx, "claude-3-5-sonnet-20241022", channel)
+	if err != nil {
+		t.Fatalf("expected normal custom channel provider selection to succeed, got %v", err)
+	}
+	if _, ok := provider.(*openai.OpenAIProvider); !ok {
+		t.Fatalf("expected normal custom channel requests to keep using OpenAI-compatible provider, got %T", provider)
+	}
+
+	invalidPlugin := datatypes.NewJSONType(model.PluginType{
+		"claude": {
+			"enabled":  true,
+			"base_url": "https://claude-proxy.example.com/v1/messages",
+		},
+	})
+	channel.Plugin = &invalidPlugin
+	provider, _, err = prepareProviderForChannel(claudeCtx, "claude-3-5-sonnet-20241022", channel)
+	if err != nil {
+		t.Fatalf("expected full /v1/messages Claude URL to pass through unchanged, got %v", err)
+	}
+	claudeProvider, ok = provider.(*claudeprovider.ClaudeProvider)
+	if !ok {
+		t.Fatalf("expected Claude provider after preserving full Claude URL, got %T", provider)
+	}
+	if fullURL := claudeProvider.GetFullRequestURL("/v1/messages"); fullURL != "https://claude-proxy.example.com/v1/messages/v1/messages" {
+		t.Fatalf("unexpected preserved Claude request URL: %q", fullURL)
 	}
 }
 

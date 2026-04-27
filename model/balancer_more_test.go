@@ -83,6 +83,30 @@ func TestChannelsChooserFilterHelpersAndCooldownLifecycle(t *testing.T) {
 	}
 }
 
+func TestChannelsChooserModelHasChannel(t *testing.T) {
+	chooser := &ChannelsChooser{
+		Channels: map[int]*ChannelChoice{
+			1: {Channel: testWeightedChannel(1, config.ChannelTypeCustom)},
+			2: {Channel: testWeightedChannel(2, config.ChannelTypeOpenAI), Disable: true},
+		},
+		Rule: map[string]map[string][][]int{
+			"default": {
+				"custom-model": {{1, 2}},
+			},
+		},
+	}
+
+	if !chooser.ModelHasChannel("default", "custom-model") {
+		t.Fatal("expected model with available channel to be reported")
+	}
+	if chooser.ModelHasChannel("default", "missing-model") {
+		t.Fatal("expected missing model to have no channel")
+	}
+	if chooser.ModelHasChannel("default", "custom-model", FilterChannelTypes([]int{config.ChannelTypeOpenAI})) {
+		t.Fatal("expected filters to exclude the only enabled matching channel")
+	}
+}
+
 func TestChannelsChooserPreferredSelectionAndPriorityRouting(t *testing.T) {
 	chooser := &ChannelsChooser{
 		Channels: map[int]*ChannelChoice{

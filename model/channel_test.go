@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"one-api/common/config"
+
+	"gorm.io/datatypes"
 )
 
 func TestChannelRuntimeConfigParsesOnFirstGetterAccess(t *testing.T) {
@@ -172,6 +174,73 @@ func TestChannelValidateRuntimeConfigJSONAllowsPlainOtherForNonCodexChannels(t *
 	}
 	if err := channel.ValidateRuntimeConfigJSON(); err != nil {
 		t.Fatalf("expected non-Codex plain other field to remain valid, got %v", err)
+	}
+}
+
+func TestCustomClaudeRelayConfigHelpers(t *testing.T) {
+	plugin := datatypes.NewJSONType(PluginType{
+		"claude": {
+			"enabled":  true,
+			"base_url": "https://proxy.example.com/root/",
+		},
+	})
+	channel := &Channel{
+		Type:   config.ChannelTypeCustom,
+		Plugin: &plugin,
+	}
+
+	if !channel.CustomClaudeRelayEnabled() {
+		t.Fatal("expected custom Claude relay to be enabled")
+	}
+
+	baseURL, err := channel.ResolveCustomClaudeBaseURL("https://api.anthropic.com")
+	if err != nil {
+		t.Fatalf("expected plugin Claude base_url to resolve, got %v", err)
+	}
+	if baseURL != "https://proxy.example.com/root" {
+		t.Fatalf("unexpected resolved plugin Claude base_url: %q", baseURL)
+	}
+
+	channel.Plugin = func() *datatypes.JSONType[PluginType] {
+		fallbackPlugin := datatypes.NewJSONType(PluginType{
+			"claude": {
+				"enabled": true,
+			},
+		})
+		return &fallbackPlugin
+	}()
+	channel.BaseURL = testStringPtr("https://channel-base.example.com/api/")
+
+	baseURL, err = channel.ResolveCustomClaudeBaseURL("https://api.anthropic.com")
+	if err != nil {
+		t.Fatalf("expected channel base_url fallback to resolve, got %v", err)
+	}
+	if baseURL != "https://channel-base.example.com/api" {
+		t.Fatalf("unexpected channel base_url fallback: %q", baseURL)
+	}
+
+	channel.BaseURL = nil
+	baseURL, err = channel.ResolveCustomClaudeBaseURL("https://api.anthropic.com")
+	if err != nil {
+		t.Fatalf("expected default Claude base_url fallback to resolve, got %v", err)
+	}
+	if baseURL != "https://api.anthropic.com" {
+		t.Fatalf("unexpected default Claude base_url fallback: %q", baseURL)
+	}
+
+	channel.Plugin = func() *datatypes.JSONType[PluginType] {
+		disabledPlugin := datatypes.NewJSONType(PluginType{
+			"claude": {
+				"enabled": false,
+			},
+		})
+		return &disabledPlugin
+	}()
+	if channel.CustomClaudeRelayEnabled() {
+		t.Fatal("expected disabled custom Claude relay to be reported as disabled")
+	}
+	if _, err := channel.ResolveCustomClaudeBaseURL("https://api.anthropic.com"); err == nil {
+		t.Fatal("expected disabled custom Claude relay to reject resolution")
 	}
 }
 

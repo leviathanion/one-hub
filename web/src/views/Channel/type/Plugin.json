@@ -315,6 +315,24 @@
           "required": false
         }
       }
+    },
+    "claude": {
+      "name": "Claude API",
+      "description": "开启后，该自定义渠道可参与 /claude/v1/messages 路由；base_url 可选，留空时回退到渠道 API 地址",
+      "params": {
+        "enabled": {
+          "name": "启用 Claude API",
+          "description": "开启后，复用当前渠道 Key 透传 Claude Messages 请求",
+          "type": "bool",
+          "required": false
+        },
+        "base_url": {
+          "name": "Claude Base URL",
+          "description": "可选，优先使用该地址；通常填写根地址例如 https://provider.example.com",
+          "type": "string",
+          "required": false
+        }
+      }
     }
   },
   "20": {

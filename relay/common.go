@@ -19,6 +19,7 @@ import (
 	"one-api/model"
 	"one-api/providers"
 	providersBase "one-api/providers/base"
+	"one-api/providers/claude"
 	"one-api/relay/relay_util"
 	"one-api/types"
 	"strings"
@@ -34,6 +35,8 @@ type realtimeChannelSelection struct {
 	allowChannelTypes       []int
 	skipChannelIDs          []int
 }
+
+const defaultClaudeBaseURL = "https://api.anthropic.com"
 
 func Path2Relay(c *gin.Context, path string) RelayBaseInterface {
 	var relay RelayBaseInterface
@@ -136,11 +139,21 @@ func prepareProviderForChannel(c *gin.Context, modelName string, channel *model.
 	c.Set("channel_id", channel.Id)
 	c.Set("channel_type", channel.Type)
 
-	provider = providers.GetProvider(channel, c)
+	if strings.HasPrefix(c.Request.URL.Path, "/claude") && channel.Type == config.ChannelTypeCustom {
+		baseURL, err := channel.ResolveCustomClaudeBaseURL(defaultClaudeBaseURL)
+		if err != nil {
+			fail = err
+			return
+		}
+		provider = claude.CreateClaudeProvider(channel, baseURL)
+	} else {
+		provider = providers.GetProvider(channel, c)
+	}
 	if provider == nil {
 		fail = errors.New("channel not found")
 		return
 	}
+	provider.SetContext(c)
 	provider.SetOriginalModel(modelName)
 	c.Set("original_model", modelName)
 
@@ -332,6 +345,29 @@ func fetchChannelByModel(c *gin.Context, modelName string) (*model.Channel, erro
 	return fetchChannelByModelWithSelection(c, modelName, currentRealtimeChannelSelection(c))
 }
 
+func isClaudeRouteEligibleChannel(channel *model.Channel) bool {
+	if channel == nil {
+		return false
+	}
+
+	switch channel.Type {
+	case config.ChannelTypeAnthropic, config.ChannelTypeVertexAI, config.ChannelTypeBedrock:
+		return true
+	case config.ChannelTypeCustom:
+		_, err := channel.ResolveCustomClaudeBaseURL(defaultClaudeBaseURL)
+		return err == nil
+	default:
+		return false
+	}
+}
+
+func filterNonClaudeRouteEligibleChannel(_ int, choice *model.ChannelChoice) bool {
+	if choice == nil || choice.Channel == nil {
+		return true
+	}
+	return !isClaudeRouteEligibleChannel(choice.Channel)
+}
+
 func currentRealtimeChannelSelection(c *gin.Context) realtimeChannelSelection {
 	selection := realtimeChannelSelection{
 		preferredChannelID:      currentPreferredChannelID(c),
@@ -477,6 +513,9 @@ func fetchChannelByModelWithSelection(c *gin.Context, modelName string, selectio
 
 	if len(selection.allowChannelTypes) > 0 {
 		filters = append(filters, model.FilterChannelTypes(selection.allowChannelTypes))
+	}
+	if strings.HasPrefix(c.Request.URL.Path, "/claude") {
+		filters = append(filters, model.FilterFunc(filterNonClaudeRouteEligibleChannel))
 	}
 
 	if isStream {

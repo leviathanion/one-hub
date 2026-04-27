@@ -33,6 +33,11 @@ func (channel *Channel) ValidateRuntimeConfigJSONWithType(channelType int) error
 	if err := validateOptionalJSONObject("custom_parameter", channel.GetCustomParameter()); err != nil {
 		return err
 	}
+	if channelType == config.ChannelTypeCustom {
+		if err := validateCustomChannelClaudePlugin(channel); err != nil {
+			return err
+		}
+	}
 	if channelType == config.ChannelTypeCodex {
 		if err := validateCodexChannelOther(channel.Other); err != nil {
 			return err
@@ -126,6 +131,36 @@ func validateCodexPositiveIntField(fieldName string, raw json.RawMessage) error 
 		return fmt.Errorf("%s must be greater than 0", fieldName)
 	}
 	return nil
+}
+
+func validateCustomChannelClaudePlugin(channel *Channel) error {
+	if channel == nil || channel.Plugin == nil {
+		return nil
+	}
+
+	claudeConfig, ok := channel.Plugin.Data()[customClaudePluginKey]
+	if !ok || claudeConfig == nil {
+		return nil
+	}
+
+	if rawEnabled, exists := claudeConfig[customClaudeEnabledPluginKey]; exists {
+		if _, ok := rawEnabled.(bool); !ok {
+			return fmt.Errorf("plugin.claude.enabled must be a boolean")
+		}
+	}
+
+	rawBaseURL, exists := claudeConfig[customClaudeBaseURLPluginKey]
+	if !exists || rawBaseURL == nil {
+		return nil
+	}
+
+	baseURL, ok := rawBaseURL.(string)
+	if !ok {
+		return fmt.Errorf("plugin.claude.base_url must be a string")
+	}
+
+	_, err := normalizeClaudeBaseURL("plugin.claude.base_url", baseURL)
+	return err
 }
 
 func normalizeCodexPromptCacheStrategyValidation(value string) string {

@@ -15,17 +15,29 @@ type ClaudeProviderFactory struct{}
 
 // 创建 ClaudeProvider
 func (f ClaudeProviderFactory) Create(channel *model.Channel) base.ProviderInterface {
+	return CreateClaudeProvider(channel, "")
+}
+
+func CreateClaudeProvider(channel *model.Channel, baseURL string) *ClaudeProvider {
+	claudeConfig := getConfig()
+	baseURLOverride := ""
+	if strings.TrimSpace(baseURL) != "" {
+		baseURLOverride = strings.TrimSpace(baseURL)
+		claudeConfig.BaseURL = baseURLOverride
+	}
 	return &ClaudeProvider{
 		BaseProvider: base.BaseProvider{
-			Config:    getConfig(),
+			Config:    claudeConfig,
 			Channel:   channel,
 			Requester: requester.NewHTTPRequester(*channel.Proxy, RequestErrorHandle),
 		},
+		BaseURLOverride: baseURLOverride,
 	}
 }
 
 type ClaudeProvider struct {
 	base.BaseProvider
+	BaseURLOverride string
 }
 
 func getConfig() base.ProviderConfig {
@@ -63,6 +75,13 @@ func errorHandle(claudeError *ClaudeError) *types.OpenAIError {
 	}
 }
 
+func (p *ClaudeProvider) GetBaseURL() string {
+	if strings.TrimSpace(p.BaseURLOverride) != "" {
+		return strings.TrimSpace(p.BaseURLOverride)
+	}
+	return p.BaseProvider.GetBaseURL()
+}
+
 // 获取请求头
 func (p *ClaudeProvider) GetRequestHeaders() (headers map[string]string) {
 	headers = make(map[string]string)
@@ -84,6 +103,10 @@ func (p *ClaudeProvider) GetFullRequestURL(requestURL string) string {
 		requestURL = strings.TrimPrefix(requestURL, "/v1")
 	}
 
+	// base_url is treated as the upstream base path, not a full endpoint that
+	// this layer sanitizes. If an admin configures /v1/messages here, the final
+	// URL intentionally includes the endpoint twice so the bad base path remains
+	// visible instead of being silently corrected.
 	return fmt.Sprintf("%s%s", baseURL, requestURL)
 }
 

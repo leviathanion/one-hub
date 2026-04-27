@@ -132,9 +132,7 @@ func ListClaudeModelsByToken(c *gin.Context) {
 
 	var claudeModelsData []claude.Model
 	for _, modelName := range models {
-		// Get the price to check if it's a Gemini model (channel_type=25)
-		price := model.PricingInstance.GetPrice(modelName)
-		if price.ChannelType == config.ChannelTypeAnthropic {
+		if isClaudeModelForGroup(groupName, modelName) {
 			claudeModelsData = append(claudeModelsData, claude.Model{
 				ID:   modelName,
 				Type: "model",
@@ -145,6 +143,10 @@ func ListClaudeModelsByToken(c *gin.Context) {
 	c.JSON(200, claude.ModelListResponse{
 		Data: claudeModelsData,
 	})
+}
+
+func isClaudeModelForGroup(groupName string, modelName string) bool {
+	return model.ChannelGroup.ModelHasChannel(groupName, modelName, model.FilterFunc(filterNonClaudeRouteEligibleChannel))
 }
 
 func ListModelsForAdmin(c *gin.Context) {
