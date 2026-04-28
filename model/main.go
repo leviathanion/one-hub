@@ -25,7 +25,9 @@ func SetupDB() {
 	if err != nil {
 		logger.FatalLog("failed to initialize database: " + err.Error())
 	}
-	ChannelGroup.Load()
+	if err := ChannelGroup.Load(); err != nil {
+		logger.FatalLog("failed to load channels: " + err.Error())
+	}
 	GlobalUserGroupRatio.Load()
 	config.RootUserEmail = GetRootUserEmail()
 	NewModelOwnedBys()

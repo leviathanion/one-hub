@@ -184,9 +184,8 @@ func UpdateChannelsTag(tag string, channel *Channel) error {
 		ClearChannelCodexDerivedCaches(existingMemberIDs)
 	}
 
-	ChannelGroup.Load()
-
-	return err
+	refreshChannelGroupAfterMutation("update channel tag", delIds)
+	return nil
 }
 
 func DeleteChannelsTag(tag string, delDisabled bool) error {
@@ -208,13 +207,25 @@ func ChangeChannelsTagStatus(tag string, status int) error {
 		return nil
 	}
 
+	var failClosedChannelIDs []int
+	if status != config.ChannelStatusEnabled {
+		// Batch disabling a tag is a lifecycle change, so collect IDs before the
+		// update and fail-close them after commit. Batch enabling intentionally does
+		// not locally patch routing indexes; it converges through Load() to keep one
+		// source of truth for Rule/Match/ModelGroup construction.
+		var channels []Channel
+		if err := DB.Select("id").Where("tag = ?", tag).Find(&channels).Error; err != nil {
+			return err
+		}
+		failClosedChannelIDs = channelIDsFromRows(channels)
+	}
+
 	err := DB.Model(&Channel{}).Where("tag = ?", tag).Update("status", status).Error
 	if err != nil {
 		return err
 	}
 
-	ChannelGroup.Load()
-
+	refreshChannelGroupAfterMutation("change channel tag status", failClosedChannelIDs)
 	return nil
 }
 
@@ -224,6 +235,6 @@ func UpdateChannelsTagPriority(tag string, value int) error {
 		return err
 	}
 
-	ChannelGroup.Load()
+	refreshChannelGroupAfterMutation("update channel tag priority", nil)
 	return nil
 }

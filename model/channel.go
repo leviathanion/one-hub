@@ -230,6 +230,37 @@ func codexChannelIDsFromRows(channels []Channel) []int {
 	return channelIDs
 }
 
+func channelIDsFromRows(channels []Channel) []int {
+	channelIDs := make([]int, 0, len(channels))
+	for _, channel := range channels {
+		if channel.Id > 0 {
+			channelIDs = append(channelIDs, channel.Id)
+		}
+	}
+	return channelIDs
+}
+
+func refreshChannelGroupAfterMutation(reason string, failClosedChannelIDs []int) {
+	// Cache-aside trade-off: a post-commit rebuild keeps routing accurate without
+	// coupling API success to an in-memory refresh. Destructive/status mutations
+	// fail closed in the old snapshot first. Non-lifecycle route edits remain
+	// eventually consistent if the reload fails; keeping that trade-off explicit
+	// avoids model/group-scoped tombstones for a low-frequency admin path.
+	//
+	// What this guarantees: if this process disables/deletes a channel, it stops
+	// routing to that channel immediately, even when the following DB reload fails.
+	// That preserves sibling-channel fallback in the same tag/group/model.
+	//
+	// What it does not guarantee: cross-node instant consistency, or instant removal
+	// of model/group/tag route edits when the DB read fails. Those stronger
+	// guarantees require distributed coordination or route tombstones with expiry and
+	// versioning, which are more complex than the original failure justifies.
+	ChannelGroup.failClosedChannels(failClosedChannelIDs)
+	if err := ChannelGroup.Load(); err != nil {
+		logger.SysError(fmt.Sprintf("failed to refresh channel group after %s; routing snapshot marked dirty: %s", reason, err.Error()))
+	}
+}
+
 func deleteChannelsMatching(scope func(*gorm.DB) *gorm.DB) (int64, error) {
 	tx := DB.Begin()
 	if tx.Error != nil {
@@ -256,7 +287,7 @@ func deleteChannelsMatching(scope func(*gorm.DB) *gorm.DB) (int64, error) {
 	// These derived caches are keyed by channel id, so leaving them behind risks a
 	// later channel with the same id inheriting another account's cached Codex data.
 	ClearChannelCodexDerivedCaches(codexChannelIDsFromRows(channels))
-	ChannelGroup.Load()
+	refreshChannelGroupAfterMutation("delete channels", channelIDsFromRows(channels))
 
 	return result.RowsAffected, nil
 }
@@ -278,7 +309,7 @@ func BatchInsertChannels(channels []Channel) error {
 		return err
 	}
 
-	ChannelGroup.Load()
+	refreshChannelGroupAfterMutation("insert channels", nil)
 	return nil
 }
 
@@ -313,7 +344,7 @@ func BatchUpdateChannelsAzureApi(params *BatchChannelsParams) (int64, error) {
 
 	if db.RowsAffected > 0 {
 		ClearChannelCodexDerivedCaches(codexChannelIDs)
-		ChannelGroup.Load()
+		refreshChannelGroupAfterMutation("batch update channel runtime config", nil)
 	}
 	return db.RowsAffected, nil
 }
@@ -342,7 +373,7 @@ func BatchDelModelChannels(params *BatchChannelsParams) (int64, error) {
 	}
 
 	if count > 0 {
-		ChannelGroup.Load()
+		refreshChannelGroupAfterMutation("batch delete channel model", nil)
 	}
 
 	return count, nil
@@ -590,7 +621,7 @@ func (channel *Channel) Insert() error {
 	}
 	err := DB.Omit("UsedQuota").Create(channel).Error
 	if err == nil {
-		ChannelGroup.Load()
+		refreshChannelGroupAfterMutation("insert channel", nil)
 	}
 
 	return err
@@ -601,7 +632,11 @@ func (channel *Channel) Update(overwrite bool) error {
 	err := channel.UpdateRaw(overwrite)
 
 	if err == nil {
-		ChannelGroup.Load()
+		var failClosedChannelIDs []int
+		if channel.Status != 0 && channel.Status != config.ChannelStatusEnabled {
+			failClosedChannelIDs = []int{channel.Id}
+		}
+		refreshChannelGroupAfterMutation("update channel", failClosedChannelIDs)
 	}
 
 	return err
@@ -709,7 +744,21 @@ func updateChannelStatus(id int, targetStatus int, applyScope func(*gorm.DB) *go
 
 	updated := result.RowsAffected > 0
 	if updated {
-		go ChannelGroup.ChangeStatus(id, targetStatus == config.ChannelStatusEnabled)
+		// Status changes are routing-index changes, not just per-channel flags.
+		// A disabled channel may be absent from Channels after a prior Load, and an
+		// enabled channel may be the last member of a group/model rule. Full reload is
+		// deliberately cheaper and safer than maintaining Rule/Match/ModelGroup
+		// incrementally on this low-frequency lifecycle path.
+		//
+		// Trade-off: disabling fails closed immediately; enabling waits for a
+		// successful reload instead of locally patching every routing index. That can
+		// delay re-enable during DB read failures, but avoids a second incremental
+		// routing implementation that can diverge from Load().
+		var failClosedChannelIDs []int
+		if targetStatus != config.ChannelStatusEnabled {
+			failClosedChannelIDs = []int{id}
+		}
+		refreshChannelGroupAfterMutation("update channel status", failClosedChannelIDs)
 	}
 
 	return updated, nil
@@ -812,6 +861,7 @@ func UpdateChannelKey(id int, key string) error {
 
 	ClearChannelCodexDerivedCache(id)
 	if err := ChannelGroup.RefreshChannel(id); err != nil {
+		ChannelGroup.markDirty()
 		logger.SysError("failed to refresh channel state after key update: " + err.Error())
 	}
 

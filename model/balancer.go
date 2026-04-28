@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,10 +22,37 @@ type ChannelChoice struct {
 
 type ChannelsChooser struct {
 	sync.RWMutex
-	Channels  map[int]*ChannelChoice
-	Rule      map[string]map[string][][]int // group -> model -> priority -> channelIds
-	Match     []string
-	Cooldowns sync.Map
+	// Serialize DB snapshot/build/publish so an older reload cannot overwrite a
+	// newer snapshot. Reads keep using the previous routing while reload builds.
+	//
+	// Trade-off: this protects process-local ordering without blocking routing
+	// reads on DB I/O. During reload, readers may briefly see the previous
+	// snapshot, which is acceptable for admin/config changes. Lifecycle changes
+	// that must fail closed are handled separately by publishGeneration.
+	reloadMu sync.Mutex
+	// Dirty state is versioned instead of boolean. A successful load only marks the
+	// generation it observed as clean, so a concurrent mutation cannot be erased by
+	// an older in-flight reload.
+	//
+	// Trade-off: while dirty and DB is unhealthy, reads may synchronously retry a
+	// serialized reload. This keeps recovery simple and immediate for the original
+	// stale-cache problem. If DB outages make routing latency unacceptable, add a
+	// small retry backoff here rather than expanding route tombstones.
+	dirtyGeneration atomic.Uint64
+	cleanGeneration atomic.Uint64
+	// publishGeneration is bumped before fail-closed lifecycle mutations publish to
+	// the current snapshot. A Load that started earlier must not overwrite that local
+	// disable with stale DB rows. This is deliberately process-local; cross-node
+	// consistency still converges through DB reloads instead of a distributed lock.
+	//
+	// Trade-off: we guarantee "this process will not keep routing to a channel it
+	// just disabled/deleted" without taking a distributed lock. Other nodes may lag
+	// until they observe the DB change, which matches the existing cache-aside model.
+	publishGeneration atomic.Uint64
+	Channels          map[int]*ChannelChoice
+	Rule              map[string]map[string][][]int // group -> model -> priority -> channelIds
+	Match             []string
+	Cooldowns         sync.Map
 
 	ModelGroup map[string]map[string]bool
 }
@@ -132,6 +160,33 @@ func (cc *ChannelsChooser) Enable(channelId int) {
 	cc.Channels[channelId].Disable = false
 }
 
+func (cc *ChannelsChooser) failClosedChannels(channelIds []int) {
+	if len(channelIds) == 0 {
+		return
+	}
+
+	// Lifecycle mutations fail closed before the DB snapshot reload. This fixes the
+	// important failure mode where an auto-disabled channel stayed routable until a
+	// later tag edit forced a successful rebuild.
+	//
+	// Trade-off: this only marks known channel IDs in the current process snapshot.
+	// We intentionally do not add model/group scoped tombstones because route edits
+	// are low-frequency admin operations and tombstones would need expiry/versioning
+	// to avoid keeping channels dark after a cross-node re-enable.
+	cc.publishGeneration.Add(1)
+	cc.Lock()
+	defer cc.Unlock()
+	for _, channelId := range channelIds {
+		if channelId <= 0 {
+			continue
+		}
+		if choice, ok := cc.Channels[channelId]; ok && choice != nil {
+			choice.Disable = true
+		}
+	}
+	cc.markDirty()
+}
+
 func (cc *ChannelsChooser) ChangeStatus(channelId int, status bool) {
 	if status {
 		cc.Enable(channelId)
@@ -234,6 +289,8 @@ func (cc *ChannelsChooser) channelsPriority(group, modelName string) ([][]int, e
 }
 
 func (cc *ChannelsChooser) NextWithPreferred(group, modelName string, preferredChannelID int, ignorePreferredCooldown bool, filters ...ChannelsFilterFunc) (*Channel, error) {
+	cc.reloadIfDirty()
+
 	cc.RLock()
 	defer cc.RUnlock()
 
@@ -262,6 +319,8 @@ func (cc *ChannelsChooser) PreferredChannelEligible(group, modelName string, pre
 	if preferredChannelID <= 0 {
 		return false, nil
 	}
+
+	cc.reloadIfDirty()
 
 	cc.RLock()
 	defer cc.RUnlock()
@@ -298,6 +357,8 @@ func (cc *ChannelsChooser) Next(group, modelName string, filters ...ChannelsFilt
 }
 
 func (cc *ChannelsChooser) GetGroupModels(group string) ([]string, error) {
+	cc.reloadIfDirty()
+
 	cc.RLock()
 	defer cc.RUnlock()
 
@@ -314,6 +375,8 @@ func (cc *ChannelsChooser) GetGroupModels(group string) ([]string, error) {
 }
 
 func (cc *ChannelsChooser) ModelHasChannel(group string, modelName string, filters ...ChannelsFilterFunc) bool {
+	cc.reloadIfDirty()
+
 	cc.RLock()
 	defer cc.RUnlock()
 
@@ -346,6 +409,8 @@ func (cc *ChannelsChooser) ModelHasChannel(group string, modelName string, filte
 }
 
 func (cc *ChannelsChooser) GetModelsGroups() map[string]map[string]bool {
+	cc.reloadIfDirty()
+
 	cc.RLock()
 	defer cc.RUnlock()
 
@@ -353,6 +418,8 @@ func (cc *ChannelsChooser) GetModelsGroups() map[string]map[string]bool {
 }
 
 func (cc *ChannelsChooser) GetChannel(channelId int) *Channel {
+	cc.reloadIfDirty()
+
 	cc.RLock()
 	defer cc.RUnlock()
 
@@ -400,9 +467,63 @@ func (cc *ChannelsChooser) RefreshChannel(channelID int) error {
 	return nil
 }
 
-func (cc *ChannelsChooser) Load() {
+func (cc *ChannelsChooser) markDirty() {
+	cc.dirtyGeneration.Add(1)
+}
+
+func (cc *ChannelsChooser) isDirty() bool {
+	return cc.dirtyGeneration.Load() != cc.cleanGeneration.Load()
+}
+
+func (cc *ChannelsChooser) markCleanIfUnchanged(dirtyGeneration uint64) {
+	if cc.dirtyGeneration.Load() == dirtyGeneration {
+		cc.cleanGeneration.Store(dirtyGeneration)
+	}
+}
+
+func (cc *ChannelsChooser) reloadIfDirty() {
+	if !cc.isDirty() {
+		return
+	}
+
+	// Dirty reloads are retried by the next routing read so a failed post-mutation
+	// refresh can self-heal without requiring another admin save. reloadMu keeps the
+	// retry serialized.
+	//
+	// Trade-off: there is no backoff here. That keeps recovery immediate and the
+	// code small, but a long DB outage can add latency to reads while dirty. Prefer
+	// adding bounded backoff here if this becomes operationally visible; do not move
+	// route correctness into more cache-side tombstone state unless there is a real
+	// product requirement for stronger consistency.
+	cc.reloadMu.Lock()
+	defer cc.reloadMu.Unlock()
+	if !cc.isDirty() {
+		return
+	}
+
+	_ = cc.loadLocked()
+}
+
+func (cc *ChannelsChooser) Load() error {
+	cc.reloadMu.Lock()
+	defer cc.reloadMu.Unlock()
+
+	return cc.loadLocked()
+}
+
+func (cc *ChannelsChooser) loadLocked() error {
+	loadDirtyGeneration := cc.dirtyGeneration.Load()
+	loadPublishGeneration := cc.publishGeneration.Load()
+
 	var channels []*Channel
-	DB.Where("status = ?", config.ChannelStatusEnabled).Find(&channels)
+	if err := DB.Where("status = ?", config.ChannelStatusEnabled).Find(&channels).Error; err != nil {
+		// Never publish a partial/empty routing table after a DB read failure. The
+		// previous snapshot is safer, especially after lifecycle fail-close already
+		// removed the just-disabled channel locally.
+		cc.markDirty()
+		logger.SysError("failed to load channels: " + err.Error())
+		return err
+	}
 
 	newGroup := make(map[string]map[string][][]int)
 	newChannels := make(map[int]*ChannelChoice)
@@ -496,10 +617,22 @@ func (cc *ChannelsChooser) Load() {
 
 	// 更新ChannelsChooser
 	cc.Lock()
+	if cc.publishGeneration.Load() != loadPublishGeneration {
+		// A lifecycle mutation fail-closed a channel after this load started. Even
+		// if this DB snapshot is internally valid, publishing it could re-enable the
+		// locally disabled/deleted channel for a short window. Keep the current
+		// snapshot and let the dirty retry perform a fresh load.
+		cc.Unlock()
+		cc.markDirty()
+		logger.SysLog("channels Load skipped stale snapshot")
+		return nil
+	}
 	cc.Rule = newGroup
 	cc.Channels = newChannels
 	cc.Match = newMatchList
 	cc.ModelGroup = newModelGroup
 	cc.Unlock()
+	cc.markCleanIfUnchanged(loadDirtyGeneration)
 	logger.SysLog("channels Load success")
+	return nil
 }

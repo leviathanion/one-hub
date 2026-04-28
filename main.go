@@ -163,7 +163,9 @@ func SyncChannelCache(frequency int) {
 	for {
 		time.Sleep(time.Duration(frequency) * time.Second)
 		logger.SysLog("syncing channels from database")
-		model.ChannelGroup.Load()
+		if err := model.ChannelGroup.Load(); err != nil {
+			logger.SysError("failed to sync channels from database: " + err.Error())
+		}
 		model.GlobalUserGroupRatio.Load()
 		model.PricingInstance.Init()
 		model.ModelOwnedBysInstance.Load()
