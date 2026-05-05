@@ -357,6 +357,30 @@ type InputResponses struct {
 	Input any `json:"input,omitempty"` // The input to the tool call. This can be a string or a list of ContentResponses.
 }
 
+func (i *InputResponses) UnmarshalJSON(data []byte) error {
+	type inputResponsesAlias InputResponses
+	type inputResponsesPayload struct {
+		*inputResponsesAlias
+		Arguments json.RawMessage `json:"arguments"`
+	}
+
+	alias := inputResponsesAlias(*i)
+	payload := inputResponsesPayload{inputResponsesAlias: &alias}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return err
+	}
+
+	*i = InputResponses(alias)
+	if payload.Arguments != nil {
+		arguments, _, err := responsesArgumentsString(payload.Arguments)
+		if err != nil {
+			return fmt.Errorf("decode responses input arguments: %w", err)
+		}
+		i.Arguments = arguments
+	}
+	return nil
+}
+
 func (i InputResponses) MarshalJSON() ([]byte, error) {
 	type inputResponsesAlias InputResponses
 
@@ -547,13 +571,15 @@ type ResponsesTools struct {
 	Description string `json:"description,omitempty"`
 	Parameters  any    `json:"parameters,omitempty"`
 	Strict      *bool  `json:"strict,omitempty"`
+	Execution   string `json:"execution,omitempty"`
 
 	//MCP
-	ServerLabel     string `json:"server_label,omitempty"`
-	ServerURL       string `json:"server_url,omitempty"`
-	AllowedTools    any    `json:"allowed_tools,omitempty"`
-	Headers         any    `json:"headers,omitempty"`
-	RequireApproval any    `json:"require_approval,omitempty"`
+	ServerLabel     string           `json:"server_label,omitempty"`
+	ServerURL       string           `json:"server_url,omitempty"`
+	AllowedTools    any              `json:"allowed_tools,omitempty"`
+	Headers         any              `json:"headers,omitempty"`
+	RequireApproval any              `json:"require_approval,omitempty"`
+	Tools           []ResponsesTools `json:"tools,omitempty"`
 
 	// Code interpreter
 	Container any `json:"container,omitempty"`
@@ -617,7 +643,29 @@ func (t ResponsesTools) MarshalJSON() ([]byte, error) {
 		rawFields[key] = value
 	}
 
+	if t.stripsDescription() {
+		delete(rawFields, "description")
+	}
+
 	return json.Marshal(rawFields)
+}
+
+func (t ResponsesTools) stripsDescription() bool {
+	toolType := strings.TrimSpace(t.Type)
+	// Preserve description for unknown/custom tools so rawFields remains forward-compatible;
+	// strip it only for known hosted Responses tools that do not accept the field.
+	if IsResponsesWebSearchToolType(toolType) {
+		return true
+	}
+
+	switch toolType {
+	case "tool_search":
+		return strings.TrimSpace(t.Execution) != "client"
+	case APIToolTypeFileSearch, APIToolTypeCodeInterpreter, APIToolTypeImageGeneration, "computer_use_preview", "mcp":
+		return true
+	default:
+		return false
+	}
 }
 
 func collectJSONFieldNames(t reflect.Type) map[string]struct{} {
@@ -792,6 +840,34 @@ type ResponsesOutput struct {
 	RevisedPrompt any    `json:"revised_prompt,omitempty"` // The revised prompt for the image generation call.
 }
 
+func (m *ResponsesOutput) UnmarshalJSON(data []byte) error {
+	type responsesOutputAlias ResponsesOutput
+	type responsesOutputPayload struct {
+		*responsesOutputAlias
+		Arguments json.RawMessage `json:"arguments"`
+	}
+
+	alias := responsesOutputAlias(*m)
+	payload := responsesOutputPayload{responsesOutputAlias: &alias}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return err
+	}
+
+	*m = ResponsesOutput(alias)
+	if payload.Arguments != nil {
+		arguments, present, err := responsesArgumentsString(payload.Arguments)
+		if err != nil {
+			return fmt.Errorf("decode responses output arguments: %w", err)
+		}
+		if present {
+			m.Arguments = &arguments
+		} else {
+			m.Arguments = nil
+		}
+	}
+	return nil
+}
+
 func (m ResponsesOutput) MarshalJSON() ([]byte, error) {
 	type responsesOutputAlias ResponsesOutput
 
@@ -811,6 +887,23 @@ func (m ResponsesOutput) MarshalJSON() ([]byte, error) {
 
 	payload["summary"] = summaryResponsesForMarshal(m.Summary)
 	return json.Marshal(payload)
+}
+
+func responsesArgumentsString(data json.RawMessage) (string, bool, error) {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return "", false, nil
+	}
+
+	if trimmed[0] != '"' {
+		return string(trimmed), true, nil
+	}
+
+	var arguments string
+	if err := json.Unmarshal(trimmed, &arguments); err != nil {
+		return "", false, err
+	}
+	return arguments, true, nil
 }
 
 type ResponsesOutputToolCall struct {

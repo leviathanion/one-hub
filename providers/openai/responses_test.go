@@ -48,6 +48,34 @@ func TestHandlerChatStreamToolCallsFinishReasonFromToolEvent(t *testing.T) {
 	}
 }
 
+func TestHandlerChatStreamToolCallArgumentsAcceptJSONObject(t *testing.T) {
+	handler := OpenAIResponsesStreamHandler{
+		Usage:  &types.Usage{},
+		Prefix: "data: ",
+		Model:  "gpt-5",
+	}
+
+	dataChan := make(chan string, 2)
+	errChan := make(chan error, 1)
+
+	added := []byte(`data: {"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1","status":"in_progress","call_id":"call_1","name":"lookup","arguments":{"city":"Paris","days":0}}}`)
+	handler.HandlerChatStream(&added, dataChan, errChan)
+
+	chunk := mustReadChunk(t, dataChan)
+	if len(chunk.Choices) != 1 || len(chunk.Choices[0].Delta.ToolCalls) != 1 || chunk.Choices[0].Delta.ToolCalls[0].Function == nil {
+		t.Fatalf("expected one tool call chunk, got %#v", chunk.Choices)
+	}
+	if got := chunk.Choices[0].Delta.ToolCalls[0].Function.Arguments; got != `{"city":"Paris","days":0}` {
+		t.Fatalf("expected normalized object arguments, got %q", got)
+	}
+
+	select {
+	case err := <-errChan:
+		t.Fatalf("unexpected stream error: %v", err)
+	default:
+	}
+}
+
 func TestHandlerChatStreamToolCallsFinishReasonFromResponseOutput(t *testing.T) {
 	handler := OpenAIResponsesStreamHandler{
 		Usage:  &types.Usage{},

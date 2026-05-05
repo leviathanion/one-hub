@@ -112,6 +112,113 @@ func TestResponsesOutputStringContentSupportsTypedSlices(t *testing.T) {
 	}
 }
 
+func TestResponsesInputFunctionArgumentsAcceptJSONValues(t *testing.T) {
+	data := []byte(`{
+		"model":"gpt-5",
+		"input":[
+			{"type":"function_call","call_id":"call_object","name":"lookup","arguments":{"city":"Paris","days":0,"strict":false}},
+			{"type":"function_call","call_id":"call_array","name":"batch","arguments":[{"id":1}]},
+			{"type":"function_call","call_id":"call_null","name":"empty","arguments":null}
+		]
+	}`)
+
+	var request OpenAIResponsesRequest
+	if err := json.Unmarshal(data, &request); err != nil {
+		t.Fatalf("unexpected unmarshal error: %v", err)
+	}
+
+	chat, err := request.ToChatCompletionRequest()
+	if err != nil {
+		t.Fatalf("unexpected conversion error: %v", err)
+	}
+
+	if len(chat.Messages) != 3 {
+		t.Fatalf("expected three converted tool call messages, got %d", len(chat.Messages))
+	}
+	testCases := []struct {
+		index int
+		want  string
+	}{
+		{index: 0, want: `{"city":"Paris","days":0,"strict":false}`},
+		{index: 1, want: `[{"id":1}]`},
+		{index: 2, want: ""},
+	}
+	for _, testCase := range testCases {
+		message := chat.Messages[testCase.index]
+		if len(message.ToolCalls) != 1 || message.ToolCalls[0].Function == nil {
+			t.Fatalf("expected tool call at message %d, got %#v", testCase.index, message.ToolCalls)
+		}
+		if got := message.ToolCalls[0].Function.Arguments; got != testCase.want {
+			t.Fatalf("expected arguments %q at message %d, got %q", testCase.want, testCase.index, got)
+		}
+	}
+}
+
+func TestResponsesOutputFunctionArgumentsAcceptJSONValues(t *testing.T) {
+	var response OpenAIResponsesResponses
+	data := []byte(`{
+		"id":"resp_1",
+		"model":"gpt-5",
+		"status":"completed",
+		"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0},
+		"output":[
+			{"type":"function_call","id":"fc_object","status":"completed","call_id":"call_object","name":"lookup","arguments":{"city":"Paris","days":0,"strict":false}},
+			{"type":"function_call","id":"fc_string","status":"completed","call_id":"call_string","name":"weather","arguments":"{\"city\":\"Berlin\"}"},
+			{"type":"function_call","id":"fc_missing","status":"completed","call_id":"call_missing","name":"missing"}
+		]
+	}`)
+
+	if err := json.Unmarshal(data, &response); err != nil {
+		t.Fatalf("unexpected unmarshal error: %v", err)
+	}
+
+	if response.Output[0].Arguments == nil {
+		t.Fatal("expected object arguments to be present")
+	}
+	if got := *response.Output[0].Arguments; got != `{"city":"Paris","days":0,"strict":false}` {
+		t.Fatalf("expected object arguments to be normalized, got %q", got)
+	}
+	if response.Output[1].Arguments == nil {
+		t.Fatal("expected string arguments to be present")
+	}
+	if got := *response.Output[1].Arguments; got != `{"city":"Berlin"}` {
+		t.Fatalf("expected string arguments to be decoded once, got %q", got)
+	}
+	if response.Output[2].Arguments != nil {
+		t.Fatalf("expected missing arguments to stay nil, got %q", *response.Output[2].Arguments)
+	}
+
+	chat := response.ToChat()
+	if len(chat.Choices) != 1 || len(chat.Choices[0].Message.ToolCalls) != 3 {
+		t.Fatalf("expected three chat tool calls, got %#v", chat.Choices)
+	}
+	if got := chat.Choices[0].Message.ToolCalls[0].Function.Arguments; got != `{"city":"Paris","days":0,"strict":false}` {
+		t.Fatalf("expected object arguments in chat conversion, got %q", got)
+	}
+	if got := chat.Choices[0].Message.ToolCalls[1].Function.Arguments; got != `{"city":"Berlin"}` {
+		t.Fatalf("expected string arguments in chat conversion, got %q", got)
+	}
+	if got := chat.Choices[0].Message.ToolCalls[2].Function.Arguments; got != "" {
+		t.Fatalf("expected missing arguments to convert to empty string, got %q", got)
+	}
+}
+
+func TestChatToolCallFunctionArgumentsAcceptJSONValues(t *testing.T) {
+	var message ChatCompletionMessage
+	data := []byte(`{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":{"city":"Paris","days":0}}}]}`)
+
+	if err := json.Unmarshal(data, &message); err != nil {
+		t.Fatalf("unexpected unmarshal error: %v", err)
+	}
+
+	if len(message.ToolCalls) != 1 || message.ToolCalls[0].Function == nil {
+		t.Fatalf("expected one tool call, got %#v", message.ToolCalls)
+	}
+	if got := message.ToolCalls[0].Function.Arguments; got != `{"city":"Paris","days":0}` {
+		t.Fatalf("expected object arguments to be normalized, got %q", got)
+	}
+}
+
 func TestChatCompletionToolUnmarshalPreservesFunctionDefinition(t *testing.T) {
 	var tool ChatCompletionTool
 	data := []byte(`{"type":"function","function":{"name":"lookup","description":"resolve a record","parameters":{"type":"object","properties":{"id":{"type":"string"}}}}}`)
@@ -238,6 +345,154 @@ func TestResponsesToolsMarshalJSONPreservesUnknownFieldsAndReturnsErrors(t *test
 	_, err = json.Marshal(tool)
 	if err == nil {
 		t.Fatal("expected marshal error for unsupported function parameter type")
+	}
+}
+
+func TestResponsesToolsMarshalJSONPreservesDescriptionForUnknownToolTypes(t *testing.T) {
+	var tool ResponsesTools
+	if err := json.Unmarshal([]byte(`{"type":"vendor_tool","description":"vendor-defined tool","vendor_extension":{"enabled":true}}`), &tool); err != nil {
+		t.Fatalf("unexpected unmarshal error: %v", err)
+	}
+
+	data, err := json.Marshal(tool)
+	if err != nil {
+		t.Fatalf("unexpected marshal error: %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("unexpected payload unmarshal error: %v", err)
+	}
+
+	if payload["description"] != "vendor-defined tool" {
+		t.Fatalf("expected unknown tool description to be preserved, got %#v", payload)
+	}
+	if _, ok := payload["vendor_extension"]; !ok {
+		t.Fatalf("expected vendor_extension to be preserved, got %#v", payload)
+	}
+}
+
+func TestResponsesToolsMarshalJSONStripsDescriptionForServerTools(t *testing.T) {
+	clientExecution := "client"
+	testCases := []struct {
+		name            string
+		tool            ResponsesTools
+		wantDescription bool
+	}{
+		{
+			name: "function keeps description",
+			tool: ResponsesTools{
+				Type:        "function",
+				Name:        "lookup",
+				Description: "resolve a record",
+			},
+			wantDescription: true,
+		},
+		{
+			name: "namespace keeps description",
+			tool: ResponsesTools{
+				Type:        "namespace",
+				Name:        "browser",
+				Description: "browser namespace",
+			},
+			wantDescription: true,
+		},
+		{
+			name: "client tool search keeps description",
+			tool: ResponsesTools{
+				Type:        "tool_search",
+				Description: "client-side search",
+				Execution:   clientExecution,
+			},
+			wantDescription: true,
+		},
+		{
+			name: "server tool search strips description",
+			tool: ResponsesTools{
+				Type:        "tool_search",
+				Description: "hosted search",
+			},
+			wantDescription: false,
+		},
+		{
+			name: "web search strips description",
+			tool: ResponsesTools{
+				Type:              APIToolTypeWebSearchPreview,
+				Description:       "hosted search",
+				SearchContextSize: "medium",
+			},
+			wantDescription: false,
+		},
+		{
+			name: "unknown tool keeps description",
+			tool: ResponsesTools{
+				Type:        "vendor_tool",
+				Description: "vendor-defined tool",
+			},
+			wantDescription: true,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			data, err := json.Marshal(testCase.tool)
+			if err != nil {
+				t.Fatalf("unexpected marshal error: %v", err)
+			}
+
+			var payload map[string]any
+			if err := json.Unmarshal(data, &payload); err != nil {
+				t.Fatalf("unexpected payload unmarshal error: %v", err)
+			}
+
+			_, hasDescription := payload["description"]
+			if hasDescription != testCase.wantDescription {
+				t.Fatalf("expected description presence %v, got payload %#v", testCase.wantDescription, payload)
+			}
+		})
+	}
+}
+
+func TestResponsesToolsMarshalJSONStripsNestedServerToolDescription(t *testing.T) {
+	tool := ResponsesTools{
+		Type:        "namespace",
+		Name:        "browser",
+		Description: "browser namespace",
+		Tools: []ResponsesTools{
+			{
+				Type:        APIToolTypeFileSearch,
+				Description: "hosted file search",
+				Filters:     map[string]any{"type": "eq"},
+			},
+		},
+	}
+
+	data, err := json.Marshal(tool)
+	if err != nil {
+		t.Fatalf("unexpected marshal error: %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("unexpected payload unmarshal error: %v", err)
+	}
+
+	if _, ok := payload["description"]; !ok {
+		t.Fatalf("expected namespace description to be preserved, got %#v", payload)
+	}
+	tools, ok := payload["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("expected nested tools, got %#v", payload["tools"])
+	}
+	nested, ok := tools[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected nested tool payload, got %T", tools[0])
+	}
+	if _, ok := nested["description"]; ok {
+		t.Fatalf("expected nested server tool description to be stripped, got %#v", nested)
+	}
+	if _, ok := nested["filters"]; !ok {
+		t.Fatalf("expected nested known fields to be preserved, got %#v", nested)
 	}
 }
 

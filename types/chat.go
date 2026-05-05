@@ -37,6 +37,30 @@ type ChatCompletionToolCallsFunction struct {
 	Arguments string `json:"arguments"`
 }
 
+func (f *ChatCompletionToolCallsFunction) UnmarshalJSON(data []byte) error {
+	type chatCompletionToolCallsFunctionAlias ChatCompletionToolCallsFunction
+	type chatCompletionToolCallsFunctionPayload struct {
+		*chatCompletionToolCallsFunctionAlias
+		Arguments json.RawMessage `json:"arguments"`
+	}
+
+	alias := chatCompletionToolCallsFunctionAlias(*f)
+	payload := chatCompletionToolCallsFunctionPayload{chatCompletionToolCallsFunctionAlias: &alias}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return err
+	}
+
+	*f = ChatCompletionToolCallsFunction(alias)
+	if payload.Arguments != nil {
+		arguments, _, err := responsesArgumentsString(payload.Arguments)
+		if err != nil {
+			return err
+		}
+		f.Arguments = arguments
+	}
+	return nil
+}
+
 type ChatCompletionToolCalls struct {
 	Id       string                           `json:"id,omitempty"`
 	Type     string                           `json:"type,omitempty"`
