@@ -17,6 +17,7 @@ import (
 	"one-api/types"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -56,7 +57,15 @@ type Quota struct {
 	sourceIP          string
 	userAgent         string
 	forcePreConsume   bool
+	logProtocol       string
 }
+
+const (
+	LogProtocolHTTP        = "http"
+	LogProtocolHTTPStream  = "http_stream"
+	LogProtocolRealtimeWS  = "realtime_ws"
+	LogProtocolResponsesWS = "responses_ws"
+)
 
 func NewQuota(c *gin.Context, modelName string, promptTokens int) *Quota {
 	isBackupGroup := c.GetBool("is_backupGroup")
@@ -441,7 +450,7 @@ func (q *Quota) buildSettlementEnvelopeWithFinalQuotaFloor(usage *types.Usage, i
 				TokenName:   q.tokenName,
 				RequestTime: q.getRequestTime(),
 				IsStream:    isStream,
-				Metadata:    q.GetLogMeta(usage),
+				Metadata:    q.getLogMetaForSettlement(usage, isStream),
 				SourceIP:    q.sourceIP,
 			},
 		},
@@ -538,6 +547,20 @@ func (q *Quota) GetInputRatio() float64 {
 	return q.inputRatio
 }
 
+func (q *Quota) SetLogProtocol(protocol string) {
+	if q == nil {
+		return
+	}
+	q.logProtocol = strings.TrimSpace(protocol)
+}
+
+func logProtocolForStream(isStream bool) string {
+	if isStream {
+		return LogProtocolHTTPStream
+	}
+	return LogProtocolHTTP
+}
+
 func (q *Quota) GetLogMeta(usage *types.Usage) map[string]any {
 	meta := map[string]any{
 		"group_name":           q.groupName,
@@ -550,6 +573,10 @@ func (q *Quota) GetLogMeta(usage *types.Usage) map[string]any {
 		"group_ratio":          q.groupRatio,
 		"input_ratio":          q.price.GetInput(),
 		"output_ratio":         q.price.GetOutput(),
+	}
+
+	if protocol := strings.TrimSpace(q.logProtocol); protocol != "" {
+		meta["protocol"] = protocol
 	}
 
 	firstResponseTime := q.GetFirstResponseTime()
@@ -578,6 +605,14 @@ func (q *Quota) GetLogMeta(usage *types.Usage) map[string]any {
 
 	// Display-only trade-off: keep user-agent in JSON metadata until query use cases justify a dedicated column.
 	meta = utils.AppendUserAgentMetadata(meta, q.userAgent)
+	return meta
+}
+
+func (q *Quota) getLogMetaForSettlement(usage *types.Usage, isStream bool) map[string]any {
+	meta := q.GetLogMeta(usage)
+	if _, ok := meta["protocol"]; !ok {
+		meta["protocol"] = logProtocolForStream(isStream)
+	}
 	return meta
 }
 

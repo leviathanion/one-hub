@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"one-api/internal/billing"
 	"one-api/model"
 	"one-api/types"
 
@@ -68,6 +69,29 @@ func TestQuotaSeedTimingRejectsInvalidBounds(t *testing.T) {
 	}
 	if got := quota.getRequestTime(); got != 0 {
 		t.Fatalf("expected invalid request duration to clamp to zero, got %d", got)
+	}
+}
+
+func TestQuotaSettlementMetadataProtocolDefaultsAndOverrides(t *testing.T) {
+	quota := &Quota{}
+
+	httpEnvelope := quota.BuildSettlementEnvelope(&types.Usage{}, false, billing.SettlementRequestKindUnary, "", false)
+	if got := httpEnvelope.Options.Projection.Metadata["protocol"]; got != LogProtocolHTTP {
+		t.Fatalf("expected non-stream settlement protocol %q, got %#v", LogProtocolHTTP, got)
+	}
+
+	streamEnvelope := quota.BuildSettlementEnvelope(&types.Usage{}, true, billing.SettlementRequestKindUnary, "", false)
+	if got := streamEnvelope.Options.Projection.Metadata["protocol"]; got != LogProtocolHTTPStream {
+		t.Fatalf("expected stream settlement protocol %q, got %#v", LogProtocolHTTPStream, got)
+	}
+
+	quota.SetLogProtocol(LogProtocolRealtimeWS)
+	realtimeEnvelope := quota.BuildSettlementEnvelope(&types.Usage{}, true, billing.SettlementRequestKindRealtimeTurn, "", false)
+	if got := realtimeEnvelope.Options.Projection.Metadata["protocol"]; got != LogProtocolRealtimeWS {
+		t.Fatalf("expected explicit realtime settlement protocol %q, got %#v", LogProtocolRealtimeWS, got)
+	}
+	if !realtimeEnvelope.Options.Projection.IsStream {
+		t.Fatal("expected realtime settlement projection to preserve is_stream=true")
 	}
 }
 

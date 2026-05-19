@@ -173,6 +173,11 @@ func RelayHandler(relay RelayBaseInterface) (err *types.OpenAIErrorWithStatusCod
 	relay.getProvider().SetUsage(usage)
 
 	quota := relay_util.NewQuota(relay.getContext(), relay.getModelName(), promptTokens)
+	if relay.IsStream() {
+		quota.SetLogProtocol(relay_util.LogProtocolHTTPStream)
+	} else {
+		quota.SetLogProtocol(relay_util.LogProtocolHTTP)
+	}
 	if err = quota.PreQuotaConsumption(); err != nil {
 		done = true
 		return
