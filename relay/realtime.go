@@ -215,6 +215,7 @@ func ChatRealtime(c *gin.Context) {
 	}
 
 	relay.quota = relay_util.NewQuota(relay.getContext(), relay.getModelName(), 0)
+	relay.quota.SetLogProtocol(relay_util.LogProtocolRealtimeWS)
 	if relay.session != nil {
 		// Realtime quota observation lives in the provider session turn observer.
 		relay.session.SetTurnObserverFactory(relay_util.NewRealtimeTurnObserverFactory(relay.quota))

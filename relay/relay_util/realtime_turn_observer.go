@@ -85,7 +85,7 @@ func (o *RealtimeTurnObserver) FinalizeTurn(payload runtimesession.TurnFinalizeP
 
 	o.quota.SeedTiming(payload.StartedAt, payload.FirstResponseAt, payload.CompletedAt)
 	identity := buildRealtimeTurnSettlementIdentity(o.quota, payload)
-	if err := o.quota.ConsumeUsageWithIdentity(finalUsage.ToChatUsage(), false, billing.SettlementRequestKindRealtimeTurn, identity, true); err != nil {
+	if err := o.quota.ConsumeUsageWithIdentity(finalUsage.ToChatUsage(), true, billing.SettlementRequestKindRealtimeTurn, identity, true); err != nil {
 		logger.LogError(o.quota.requestContext, "realtime finalize settlement failed: "+err.Error())
 		return
 	}
