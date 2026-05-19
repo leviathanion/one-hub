@@ -78,7 +78,7 @@ export default function LogTableRow({ item, userIsAdmin, userGroup, columnVisibi
 
   let request_ts = 0;
   let request_ts_str = '';
-  if (first_time > 0 && item.completion_tokens > 0) {
+  if (item.is_stream && first_time > 0 && item.completion_tokens > 0 && stream_time > 0) {
     // Using the completion_tokens directly since we already checked it's > 0
     request_ts = item.completion_tokens / stream_time;
     request_ts_str = `${request_ts.toFixed(2)} t/s`;
@@ -144,7 +144,7 @@ export default function LogTableRow({ item, userIsAdmin, userGroup, columnVisibi
           </TableCell>
         )}
         {columnVisibility.type && <TableCell sx={{ p: '10px 8px' }}>{renderType(item.type, LogType, t)}</TableCell>}
-        {columnVisibility.model_name && <TableCell sx={{ p: '10px 8px' }}>{viewModelName(item.model_name, item.is_stream)}</TableCell>}
+        {columnVisibility.model_name && <TableCell sx={{ p: '10px 8px' }}>{viewModelName(item.model_name, item)}</TableCell>}
 
         {columnVisibility.duration && (
           <TableCell sx={{ p: '10px 8px' }}>
@@ -207,37 +207,47 @@ LogTableRow.propTypes = {
   columnVisibility: PropTypes.object
 };
 
-function viewModelName(model_name, isStream) {
+function getLogProtocol(item) {
+  return item?.metadata?.protocol || (item?.is_stream ? 'http_stream' : 'http');
+}
+
+function getProtocolBadgeLabel(protocol) {
+  switch (protocol) {
+    case 'http_stream':
+      return 'HTTP Stream';
+    case 'realtime_ws':
+      return 'Realtime WS';
+    case 'responses_ws':
+      return 'Responses WS';
+    case 'http':
+    default:
+      return 'HTTP';
+  }
+}
+
+function viewModelName(model_name, item) {
   if (!model_name) {
     return '';
   }
 
-  if (isStream) {
-    return (
-      <Badge
-        badgeContent="Stream"
-        color="primary"
-        sx={{
-          '& .MuiBadge-badge': {
-            fontSize: '0.55rem',
-            height: '16px',
-            minWidth: '16px',
-            padding: '0 4px',
-            top: '-3px'
-          }
-        }}
-      >
-        <Label color="primary" variant="outlined" copyText={model_name}>
-          {model_name}
-        </Label>
-      </Badge>
-    );
-  }
-
   return (
-    <Label color="primary" variant="outlined" copyText={model_name}>
-      {model_name}
-    </Label>
+    <Badge
+      badgeContent={getProtocolBadgeLabel(getLogProtocol(item))}
+      color={item?.is_stream ? 'primary' : 'default'}
+      sx={{
+        '& .MuiBadge-badge': {
+          fontSize: '0.55rem',
+          height: '16px',
+          minWidth: '16px',
+          padding: '0 4px',
+          top: '-3px'
+        }
+      }}
+    >
+      <Label color="primary" variant="outlined" copyText={model_name}>
+        {model_name}
+      </Label>
+    </Badge>
   );
 }
 
