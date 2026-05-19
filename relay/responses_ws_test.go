@@ -1822,7 +1822,7 @@ func TestResponsesWSSubsequentModelMismatchRejectsBeforeAdmission(t *testing.T) 
 	actor.state = responsesWSStateIdle
 	actor.pendingTurnPhase = responsesWSPendingTurnNone
 
-	actor.startSubsequentTurn([]byte(`{"type":"response.create","model":"gpt-4","input":[]}`))
+	actor.startSubsequentTurn([]byte(`{"type":"response.create","model":"gpt-4","input":[]}`), time.Now())
 
 	if actor.pendingAttempt != nil || actor.pendingTurnPhase != responsesWSPendingTurnNone || actor.state != responsesWSStateIdle {
 		t.Fatalf("expected model mismatch before attempt creation, state=%v phase=%v pending=%+v", actor.state, actor.pendingTurnPhase, actor.pendingAttempt)
@@ -1860,7 +1860,7 @@ func TestResponsesWSSubsequentRPMFailureDoesNotCreateAttempt(t *testing.T) {
 	actor.state = responsesWSStateIdle
 	actor.pendingTurnPhase = responsesWSPendingTurnNone
 
-	actor.startSubsequentTurn([]byte(`{"type":"response.create","model":"gpt-5","input":[]}`))
+	actor.startSubsequentTurn([]byte(`{"type":"response.create","model":"gpt-5","input":[]}`), time.Now())
 
 	if actor.pendingAttempt != nil || actor.pendingTurnPhase != responsesWSPendingTurnNone || actor.state != responsesWSStateIdle {
 		t.Fatalf("expected RPM failure before attempt creation, state=%v phase=%v pending=%+v", actor.state, actor.pendingTurnPhase, actor.pendingAttempt)
@@ -2587,6 +2587,62 @@ func TestResponsesWSActorCancelledTerminalFinalizesAndClearsActiveTurn(t *testin
 	}
 	if got := atomic.LoadInt32(&conn.writeCount); got != 1 {
 		t.Fatalf("expected cancelled provider frame to be forwarded once, got %d", got)
+	}
+}
+
+func TestResponsesWSSettlementLogMarksStreamProtocolAndTiming(t *testing.T) {
+	ctx := setupResponsesWSQuotaFixture(t, 1000)
+	startedAt := time.Now().Add(-1 * time.Second)
+	firstResponseAt := startedAt.Add(250 * time.Millisecond)
+	completedAt := startedAt.Add(700 * time.Millisecond)
+	attempt, apiErr := PrepareResponsesWSTurnAttempt(ResponsesWSTurnAttemptInput{
+		Context:           ctx,
+		SelectedChannelID: 17,
+		BillingModel:      "gpt-5",
+		PromptModel:       "gpt-5",
+		Request:           &types.OpenAIResponsesRequest{Model: "gpt-5", Input: []types.ChatCompletionMessage{}},
+		StartedAt:         startedAt,
+	})
+	if apiErr != nil {
+		t.Fatalf("expected attempt preparation to succeed, got %v", apiErr)
+	}
+	if apiErr := attempt.PreConsumeQuota(); apiErr != nil {
+		t.Fatalf("expected quota preconsume to succeed, got %v", apiErr)
+	}
+	attempt.MarkFirstProviderResponse(firstResponseAt)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	bridge := NewResponsesWSIOBridge(conn, actor)
+	actor.SetBridge(bridge)
+	actor.activeAttempt = attempt
+	actor.activeChannelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		Kind:        ProviderDownstreamFrame,
+		MessageType: websocket.TextMessage,
+		Payload:     []byte(`{"type":"response.completed","response":{"id":"resp_done","status":"completed","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}`),
+		Origin:      runtimesession.RealtimePayloadOriginProvider,
+		ReceivedAt:  completedAt,
+	})
+
+	var log model.Log
+	if err := model.DB.Order("id desc").First(&log).Error; err != nil {
+		t.Fatalf("expected consume log to be written, got %v", err)
+	}
+	if !log.IsStream {
+		t.Fatal("expected responses websocket log to set is_stream=true")
+	}
+	if log.RequestTime != 700 {
+		t.Fatalf("expected responses websocket log to record provider completion request time 700ms, got %d", log.RequestTime)
+	}
+	meta := log.Metadata.Data()
+	if got := meta["protocol"]; got != relay_util.LogProtocolResponsesWS {
+		t.Fatalf("expected responses websocket protocol metadata %q, got %#v", relay_util.LogProtocolResponsesWS, got)
+	}
+	if got := meta["first_response"]; got != float64(250) && got != int64(250) && got != int(250) {
+		t.Fatalf("expected first_response metadata 250ms, got %#v", got)
 	}
 }
 

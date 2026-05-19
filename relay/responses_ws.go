@@ -63,6 +63,7 @@ type ResponsesWSEvent interface{ responsesWSEvent() }
 type ResponsesWSEventClientFrame struct {
 	MessageType int
 	Payload     []byte
+	ReceivedAt  time.Time
 }
 
 func (ResponsesWSEventClientFrame) responsesWSEvent() {}
@@ -102,6 +103,7 @@ type ResponsesWSEventProviderDownstream struct {
 	Usage                     *types.UsageEvent
 	Err                       error
 	Origin                    runtimesession.RealtimePayloadOrigin
+	ReceivedAt                time.Time
 }
 
 func (ResponsesWSEventProviderDownstream) responsesWSEvent() {}
@@ -113,6 +115,7 @@ func (ResponsesWSEventClientClosed) responsesWSEvent() {}
 type ResponsesWSEventFirstTurnSetup struct {
 	Frame        *responsesws.RawResponsesCreateFrame
 	PendingLease middleware.ResponsesWSLease
+	ReceivedAt   time.Time
 }
 
 func (ResponsesWSEventFirstTurnSetup) responsesWSEvent() {}
@@ -177,6 +180,7 @@ type ResponsesWSTurnAttemptInput struct {
 	BillingModel      string
 	PromptModel       string
 	Request           *types.OpenAIResponsesRequest
+	StartedAt         time.Time
 }
 
 type responsesWSOpenResult struct {
@@ -221,6 +225,9 @@ type ResponsesWSTurnAttempt struct {
 	SendOutcome            ResponsesWSSendOutcome
 	Usage                  *types.Usage
 	BillingEvidence        BillingEvidence
+	StartedAt              time.Time
+	FirstResponseAt        time.Time
+	CompletedAt            time.Time
 	snapshot               *ResponsesWSRequestSnapshot
 }
 
@@ -246,17 +253,22 @@ func PrepareResponsesWSTurnAttempt(input ResponsesWSTurnAttemptInput) (*Response
 	if snapshot == nil {
 		snapshot = NewResponsesWSRequestSnapshot(input.Context)
 	}
+	startedAt := input.StartedAt
+	if startedAt.IsZero() {
+		startedAt = time.Now()
+	}
+	quota := relay_util.NewQuota(input.Context, input.BillingModel, promptTokens)
+	quota.SetLogProtocol(relay_util.LogProtocolResponsesWS)
 	return &ResponsesWSTurnAttempt{
 		OpeningID:         input.OpeningID,
 		Admission:         input.Admission,
 		Candidate:         input.Candidate,
 		SelectedChannelID: input.SelectedChannelID,
 		Session:           input.Session,
-		Quota: func() *relay_util.Quota {
-			return relay_util.NewQuota(input.Context, input.BillingModel, promptTokens)
-		}(),
-		Usage:    usage,
-		snapshot: snapshot.Clone(),
+		Quota:             quota,
+		Usage:             usage,
+		StartedAt:         startedAt,
+		snapshot:          snapshot.Clone(),
 	}, nil
 }
 
@@ -326,6 +338,39 @@ func (a *ResponsesWSTurnAttempt) MarkProviderAcceptedTurnEvidence() {
 	a.BillingEvidence = BillingEvidenceProviderAcceptedTurnEvidence
 }
 
+func (a *ResponsesWSTurnAttempt) MarkFirstProviderResponse(now time.Time) {
+	if a == nil || !a.FirstResponseAt.IsZero() {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	a.FirstResponseAt = now
+}
+
+func (a *ResponsesWSTurnAttempt) MarkCompleted(now time.Time) {
+	if a == nil || !a.CompletedAt.IsZero() {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	a.CompletedAt = now
+}
+
+func (a *ResponsesWSTurnAttempt) SeedQuotaTiming(now time.Time) {
+	if a == nil || a.Quota == nil {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if a.CompletedAt.IsZero() {
+		a.MarkCompleted(now)
+	}
+	a.Quota.SeedTiming(a.StartedAt, a.FirstResponseAt, a.CompletedAt)
+}
+
 func (a *ResponsesWSTurnAttempt) RollbackBeforeLocalWriteOK(reason string) error {
 	if a == nil {
 		return nil
@@ -371,16 +416,17 @@ func (a *ResponsesWSTurnAttempt) finalizeQuota(c *gin.Context, preservePreConsum
 	}
 	hasUsage := responsesWSUsageHasBillableEvidence(a.Usage)
 	identity := a.settlementIdentity()
+	a.SeedQuotaTiming(time.Now())
 	if preservePreConsumed && !hasUsage {
 		// Trade-off: once a turn has reached a send/active state, absence of a
 		// terminal usage frame is not proof that the provider did no work. Keep
 		// the pre-consumed floor to avoid making ambiguous completed work free;
 		// explicit NotSent/pre-send paths still rollback before finalization.
-		if err := a.Quota.ConsumeAtLeastPreConsumedWithIdentity(c, a.Usage, false, billing.SettlementRequestKindRealtimeTurn, identity, identity != ""); err != nil {
+		if err := a.Quota.ConsumeAtLeastPreConsumedWithIdentity(c, a.Usage, true, billing.SettlementRequestKindRealtimeTurn, identity, identity != ""); err != nil {
 			logger.LogError(context.Background(), "responses websocket quota floor settlement failed: "+err.Error())
 		}
 	} else {
-		if err := a.Quota.ConsumeWithIdentity(c, a.Usage, false, billing.SettlementRequestKindRealtimeTurn, identity, identity != ""); err != nil {
+		if err := a.Quota.ConsumeWithIdentity(c, a.Usage, true, billing.SettlementRequestKindRealtimeTurn, identity, identity != ""); err != nil {
 			logger.LogError(context.Background(), "responses websocket quota settlement failed: "+err.Error())
 		}
 	}
@@ -516,6 +562,7 @@ func (b *ResponsesWSIOBridge) StartClientReadPump() {
 		})
 		for {
 			mt, payload, err := b.conn.ReadMessage()
+			receivedAt := time.Now()
 			if err != nil {
 				if errors.Is(err, websocket.ErrReadLimit) {
 					b.actor.PostReliable(ResponsesWSEventProxyLocalError{
@@ -542,7 +589,7 @@ func (b *ResponsesWSIOBridge) StartClientReadPump() {
 				return
 			}
 			b.actor.markActivity()
-			b.actor.PostReliable(ResponsesWSEventClientFrame{MessageType: mt, Payload: payload})
+			b.actor.PostReliable(ResponsesWSEventClientFrame{MessageType: mt, Payload: payload, ReceivedAt: receivedAt})
 		}
 	}()
 }
@@ -604,6 +651,7 @@ func (b *ResponsesWSIOBridge) ArmProviderRecvPump(upstreamSessionGeneration stri
 		})
 		for {
 			mt, payload, usage, origin, err := session.Recv(b.ctx)
+			receivedAt := time.Now()
 			if responsesWSRecvHasProviderActivity(payload, usage, err) {
 				b.actor.markActivity()
 			}
@@ -614,6 +662,7 @@ func (b *ResponsesWSIOBridge) ArmProviderRecvPump(upstreamSessionGeneration stri
 					Kind:                      ProviderDownstreamUsage,
 					Usage:                     usage,
 					Origin:                    runtimesession.RealtimePayloadOriginProvider,
+					ReceivedAt:                receivedAt,
 				})
 			}
 			if err != nil {
@@ -630,6 +679,7 @@ func (b *ResponsesWSIOBridge) ArmProviderRecvPump(upstreamSessionGeneration stri
 						Payload:                   payload,
 						Err:                       err,
 						Origin:                    origin,
+						ReceivedAt:                receivedAt,
 					})
 				}
 				deliveredClientErrorPayload := false
@@ -661,6 +711,7 @@ func (b *ResponsesWSIOBridge) ArmProviderRecvPump(upstreamSessionGeneration stri
 				MessageType:               mt,
 				Payload:                   payload,
 				Origin:                    runtimesession.RealtimePayloadOriginProvider,
+				ReceivedAt:                receivedAt,
 			})
 		}
 	}()
@@ -843,6 +894,7 @@ type ResponsesWSSessionActor struct {
 	pendingTurnPhase          responsesWSPendingTurnPhase
 	openingID                 string
 	firstFrame                *responsesws.RawResponsesCreateFrame
+	firstTurnStartedAt        time.Time
 	firstTurnAdmission        *ResponsesWSTurnAdmission
 	pendingAttempt            *ResponsesWSTurnAttempt
 	pendingProviderEvents     []ResponsesWSEventProviderDownstream
@@ -949,6 +1001,7 @@ func (a *ResponsesWSSessionActor) ReserveFirstTurnOpening(frame *responsesws.Raw
 	a.openingID = uuid.NewString()
 	a.pendingTurnPhase = responsesWSPendingTurnOpening
 	a.firstFrame = frame
+	a.firstTurnStartedAt = time.Time{}
 	a.firstTurnAdmission = NewResponsesWSTurnAdmission()
 	a.state = responsesWSStateOpening
 	return a.openingID
@@ -1238,6 +1291,9 @@ func (a *ResponsesWSSessionActor) handleFirstTurnSetup(event ResponsesWSEventFir
 	}
 
 	openingID := a.ReserveFirstTurnOpening(event.Frame)
+	if !event.ReceivedAt.IsZero() {
+		a.firstTurnStartedAt = event.ReceivedAt
+	}
 	if a.isClientGone() {
 		a.releasePendingLease()
 		a.close("client_closed_before_first_turn_setup")
@@ -1437,6 +1493,7 @@ func (a *ResponsesWSSessionActor) prepareAndSendFirstTurn(openResult *responsesW
 		BillingModel:      openResult.BillingModel,
 		PromptModel:       openResult.ProviderModel,
 		Request:           &a.firstFrame.Projection,
+		StartedAt:         a.firstTurnStartedAt,
 	})
 	if apiErr != nil {
 		a.writeProxyLocal(responsesWSErrorFromOpenAI(apiErr))
@@ -1519,7 +1576,7 @@ func (a *ResponsesWSSessionActor) handleClientFrame(event ResponsesWSEventClient
 			return
 		}
 		a.resetBusyRejects()
-		a.startSubsequentTurn(event.Payload)
+		a.startSubsequentTurn(event.Payload, event.ReceivedAt)
 	case "response.cancel":
 		if a.session == nil {
 			a.writeProxyLocal(responsesWSErrorPayload(http.StatusConflict, "session_closed", "responses websocket session is not open"))
@@ -1554,7 +1611,7 @@ func (a *ResponsesWSSessionActor) resetBusyRejects() {
 	a.busyRejects = 0
 }
 
-func (a *ResponsesWSSessionActor) startSubsequentTurn(raw []byte) {
+func (a *ResponsesWSSessionActor) startSubsequentTurn(raw []byte, receivedAt time.Time) {
 	frame, err := responsesws.ParseRawResponsesCreateFrame(raw)
 	if err != nil {
 		logger.LogError(context.Background(), "responses websocket subsequent frame parse failed: "+err.Error())
@@ -1610,6 +1667,7 @@ func (a *ResponsesWSSessionActor) startSubsequentTurn(raw []byte) {
 		BillingModel:      billingModel,
 		PromptModel:       providerModel,
 		Request:           &request,
+		StartedAt:         receivedAt,
 	})
 	if apiErr != nil {
 		a.writeProxyLocal(responsesWSErrorFromOpenAI(apiErr))
@@ -1830,13 +1888,23 @@ func (a *ResponsesWSSessionActor) handleProviderDownstream(event ResponsesWSEven
 		a.writeProxyLocal(event.Payload)
 		return
 	}
+	receivedAt := event.ReceivedAt
+	if receivedAt.IsZero() {
+		receivedAt = time.Now()
+	}
 	if a.pendingAttempt != nil {
 		a.pendingProviderEvidenceSeen = true
 		a.pendingAttempt.MarkProviderAcceptedTurnEvidence()
+		if event.Kind == ProviderDownstreamFrame && event.MessageType != websocket.CloseMessage && len(event.Payload) > 0 {
+			a.pendingAttempt.MarkFirstProviderResponse(receivedAt)
+		}
 		a.bufferPendingProviderEvent(event)
 		return
 	}
 	if event.MessageType == websocket.CloseMessage {
+		if a.activeAttempt != nil {
+			a.activeAttempt.MarkCompleted(receivedAt)
+		}
 		a.finalizeActiveAttempt()
 		a.clearActiveTurn()
 		a.markDownstreamCloseSent()
@@ -1851,10 +1919,14 @@ func (a *ResponsesWSSessionActor) handleProviderDownstream(event ResponsesWSEven
 		a.failClosed("responses_ws_provider_event_without_turn")
 		return
 	}
+	if event.Kind == ProviderDownstreamFrame && event.MessageType != websocket.CloseMessage && len(event.Payload) > 0 {
+		a.activeAttempt.MarkFirstProviderResponse(receivedAt)
+	}
 
 	payload := event.Payload
 	classified := responsesws.ClassifyResponsesWSEvent(payload)
 	if classified.Malformed {
+		a.activeAttempt.MarkCompleted(receivedAt)
 		a.handleMalformedProviderFrame(classified)
 		return
 	}
@@ -1872,6 +1944,7 @@ func (a *ResponsesWSSessionActor) handleProviderDownstream(event ResponsesWSEven
 		classified.Kind == responsesws.ResponsesFailedTerminal ||
 		classified.Kind == responsesws.ResponsesCancelledTerminal
 	if isTerminal {
+		a.activeAttempt.MarkCompleted(receivedAt)
 		a.finalizeActiveAttempt()
 		a.applyActiveTerminalSideEffects(classified)
 	}
@@ -2152,6 +2225,7 @@ func ResponsesWebSocket(c *gin.Context) {
 		return
 	}
 	mt, raw, err := userConn.ReadMessage()
+	firstFrameReceivedAt := time.Now()
 	if err != nil {
 		writer := requester.NewWSClientWriter(userConn, config.RealtimeWebsocketWriteTimeout)
 		_ = writer.WriteMessage(websocket.TextMessage, responsesWSErrorPayload(http.StatusBadRequest, "invalid_event", "frame is too large or invalid; send smaller audio chunks"))
@@ -2193,7 +2267,7 @@ func ResponsesWebSocket(c *gin.Context) {
 	defer armResponsesWSMaxLifetime(actor)()
 	bridge.StartClientReadPump()
 	bridge.StartClientPingLoop()
-	if !actor.PostReliable(ResponsesWSEventFirstTurnSetup{Frame: frame, PendingLease: pendingLease}) {
+	if !actor.PostReliable(ResponsesWSEventFirstTurnSetup{Frame: frame, PendingLease: pendingLease, ReceivedAt: firstFrameReceivedAt}) {
 		pendingLease.Release()
 		actor.requestCloseIntent("first_turn_setup_not_queued")
 	}
