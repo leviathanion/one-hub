@@ -454,7 +454,7 @@ func TestCodexRealtimeWSReaderForwardsProviderCloseCode(t *testing.T) {
 
 func TestPrepareCodexRealtimeCreatePayloadPreservesUnknownResponseFields(t *testing.T) {
 	provider := &CodexProvider{}
-	eventID, request, encoded, err := provider.prepareCodexRealtimeCreatePayload([]byte(`{"type":"response.create","event_id":"evt_raw","response":{"model":"gpt-5","input":"hi","temperature":0.7,"top_p":0.9,"context_management":{"mode":"unsupported"},"truncation":"auto","unknown_number":12345678901234567890,"future_object":{"enabled":true}}}`), "gpt-5")
+	eventID, request, encoded, err := provider.prepareCodexRealtimeCreatePayload([]byte(`{"type":"response.create","event_id":"evt_raw","model":"gpt-5","input":"hi","temperature":0.7,"top_p":0.9,"context_management":{"mode":"unsupported"},"truncation":"auto","unknown_number":12345678901234567890,"future_object":{"enabled":true}}`), "gpt-5")
 	if err != nil {
 		t.Fatalf("expected realtime create payload prepare to succeed, got %v", err)
 	}
@@ -462,13 +462,9 @@ func TestPrepareCodexRealtimeCreatePayloadPreservesUnknownResponseFields(t *test
 		t.Fatalf("unexpected prepared event id/request: event_id=%q request=%+v", eventID, request)
 	}
 
-	var envelope map[string]json.RawMessage
-	if err := json.Unmarshal(encoded, &envelope); err != nil {
-		t.Fatalf("decode prepared envelope: %v", err)
-	}
 	var response map[string]json.RawMessage
-	if err := json.Unmarshal(envelope["response"], &response); err != nil {
-		t.Fatalf("decode prepared response: %v", err)
+	if err := json.Unmarshal(encoded, &response); err != nil {
+		t.Fatalf("decode prepared response.create payload: %v", err)
 	}
 	if string(response["unknown_number"]) != `12345678901234567890` {
 		t.Fatalf("expected unknown numeric field to be preserved, got %s", response["unknown_number"])
@@ -578,16 +574,16 @@ func TestCodexManagedRealtimeSessionGuardBranches(t *testing.T) {
 	}
 
 	if err := session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","event_id":"evt_missing"}`)); err == nil {
-		t.Fatal("expected missing response.create payload to be rejected")
+		t.Fatal("expected missing response.create model to be rejected")
 	}
 
 	exec.Inflight = true
-	if err := session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","event_id":"evt_busy","response":{"input":[]}}`)); err == nil {
+	if err := session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","event_id":"evt_busy","input":[]}`)); err == nil {
 		t.Fatal("expected inflight response.create to be rejected as busy")
 	}
 	exec.Inflight = false
 
-	if err := session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","event_id":"evt_mismatch","response":{"model":"o4-mini","input":[]}}`)); err == nil {
+	if err := session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","event_id":"evt_mismatch","model":"o4-mini","input":[]}`)); err == nil {
 		t.Fatal("expected mismatched response.create model to be rejected")
 	}
 
@@ -1020,7 +1016,7 @@ func TestCodexRequireWSWriteFailureUsesAmbiguousWriteCode(t *testing.T) {
 		context.Background(),
 		exec,
 		state,
-		[]byte(`{"type":"response.create","response":{"model":"gpt-5","input":"hi"}}`),
+		[]byte(`{"type":"response.create","model":"gpt-5","input":"hi"}`),
 		"evt_write_fail",
 		&types.OpenAIResponsesRequest{Model: "gpt-5", Input: "hi"},
 		0,
@@ -1070,7 +1066,7 @@ func TestCodexResponsesWSCreateWriteDoesNotHoldExecLock(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","event_id":"evt_write_lock","response":{"model":"gpt-5","input":"hi"}}`))
+		done <- session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","event_id":"evt_write_lock","model":"gpt-5","input":"hi"}`))
 	}()
 
 	deadline := time.After(time.Second)
@@ -1140,7 +1136,7 @@ func TestCodexManagedRealtimeSessionAdmitsTurnBeforeUpstreamWrite(t *testing.T) 
 
 	done := make(chan error, 1)
 	go func() {
-		done <- session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","event_id":"evt_admit_first","response":{"model":"gpt-5","input":"hi"}}`))
+		done <- session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","event_id":"evt_admit_first","model":"gpt-5","input":"hi"}`))
 	}()
 
 	var err error

@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -624,6 +625,42 @@ func TestResponsesWSFirstTurnSetupSkipsOpenAfterClientClosed(t *testing.T) {
 	}
 	if !actor.closed.Load() {
 		t.Fatalf("expected actor to close after client close")
+	}
+}
+
+func TestResponsesWSProviderPayloadKeepsCodexCreateModelTopLevel(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Set("channel_type", config.ChannelTypeCodex)
+
+	frame, err := responsesws.ParseRawResponsesCreateFrame([]byte(`{"type":"response.create","event_id":"evt_codex","model":"gpt-5","input":"hi","generate":true,"unknown_number":12345678901234567890}`))
+	if err != nil {
+		t.Fatalf("parse frame: %v", err)
+	}
+	request := frame.Projection
+
+	payload, err := responsesWSProviderPayload(ctx, frame, &request, "gpt-5-mini")
+	if err != nil {
+		t.Fatalf("build provider payload: %v", err)
+	}
+
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &got); err != nil {
+		t.Fatalf("decode provider payload: %v", err)
+	}
+	if string(got["model"]) != `"gpt-5-mini"` {
+		t.Fatalf("expected top-level mapped model, got %s", got["model"])
+	}
+	if _, exists := got["response"]; exists {
+		t.Fatalf("did not expect Codex WS payload to nest response fields: %s", payload)
+	}
+	if string(got["event_id"]) != `"evt_codex"` || string(got["generate"]) != `true` {
+		t.Fatalf("expected event_id and unknown fields to stay top-level, got %s", payload)
+	}
+	if string(got["unknown_number"]) != `12345678901234567890` {
+		t.Fatalf("expected raw numeric field to be preserved, got %s", got["unknown_number"])
 	}
 }
 

@@ -189,13 +189,8 @@ func TestCodexRealtimeHandlerBackfillsMissingTerminalUsageFromSeededRequest(t *t
 	})
 
 	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", nil)
-	var requestEvent codexRealtimeClientEvent
-	err := json.Unmarshal([]byte(`{"type":"response.create","event_id":"evt_seed","response":{"model":"gpt-5","input":"hello"}}`), &requestEvent)
-	if err != nil {
-		t.Fatalf("expected realtime request seed payload to parse, got %v", err)
-	}
 	accumulator := newCodexTurnUsageAccumulator()
-	accumulator.SeedPromptFromRequest(requestEvent.Response, provider.Channel.PreCost)
+	accumulator.SeedPromptFromRequest(&types.OpenAIResponsesRequest{Model: "gpt-5", Input: "hello"}, provider.Channel.PreCost)
 
 	payload := []byte(`{
 		"type":"response.completed",
@@ -382,7 +377,7 @@ func TestCodexManagedRealtimeSkipsBootstrapFrameOnNewWebsocket(t *testing.T) {
 	defer session.Detach("test_close")
 	defer cleanupCodexManagedSession(t, provider, "gpt-5")
 
-	createEvent := []byte(`{"type":"response.create","event_id":"evt_create","response":{"model":"gpt-5","input":"hello"}}`)
+	createEvent := []byte(`{"type":"response.create","event_id":"evt_create","model":"gpt-5","input":"hello"}`)
 	if err := session.SendClient(context.Background(), websocket.TextMessage, createEvent); err != nil {
 		t.Fatalf("expected websocket dispatch to succeed, got %v", err)
 	}
@@ -1367,7 +1362,7 @@ func TestCodexManagedRealtimeWebsocketNormalizesCodexRequestBeforeDispatch(t *te
 	defer session.Detach("test_close")
 	defer cleanupCodexManagedSession(t, provider, "gpt-5-mini")
 
-	createEvent := []byte(`{"type":"response.create","event_id":"evt_normalize","response":{"model":"gpt-5-mini","input":"hello","include":"output_text.annotations","temperature":0.2,"top_p":0.9,"truncation":"auto","context_management":{"mode":"manual"},"tools":[{"type":"web_search_preview"}],"tool_choice":{"type":"web_search_preview_2025_03_11"}}}`)
+	createEvent := []byte(`{"type":"response.create","event_id":"evt_normalize","model":"gpt-5-mini","input":"hello","include":"output_text.annotations","temperature":0.2,"top_p":0.9,"truncation":"auto","context_management":{"mode":"manual"},"tools":[{"type":"web_search_preview"}],"tool_choice":{"type":"web_search_preview_2025_03_11"}}`)
 	if err := session.SendClient(context.Background(), websocket.TextMessage, createEvent); err != nil {
 		t.Fatalf("expected websocket dispatch to succeed, got %v", err)
 	}
@@ -1381,40 +1376,36 @@ func TestCodexManagedRealtimeWebsocketNormalizesCodexRequestBeforeDispatch(t *te
 		t.Fatalf("timed out waiting for upstream websocket request")
 	}
 
-	response, ok := event["response"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected response payload map, got %T", event["response"])
-	}
-	if got := response["model"]; got != "gpt-5" {
+	if got := event["model"]; got != "gpt-5" {
 		t.Fatalf("expected websocket request model to normalize to gpt-5, got %#v", got)
 	}
-	if got, ok := response["store"].(bool); !ok || got {
-		t.Fatalf("expected websocket request store=false, got %#v", response["store"])
+	if got, ok := event["store"].(bool); !ok || got {
+		t.Fatalf("expected websocket request store=false, got %#v", event["store"])
 	}
-	if _, ok := response["top_p"]; ok {
-		t.Fatalf("expected websocket request to drop top_p when temperature is set, got %#v", response["top_p"])
+	if _, ok := event["top_p"]; ok {
+		t.Fatalf("expected websocket request to drop top_p when temperature is set, got %#v", event["top_p"])
 	}
-	if _, ok := response["truncation"]; ok {
-		t.Fatalf("expected websocket request to strip truncation, got %#v", response["truncation"])
+	if _, ok := event["truncation"]; ok {
+		t.Fatalf("expected websocket request to strip truncation, got %#v", event["truncation"])
 	}
-	if _, ok := response["context_management"]; ok {
-		t.Fatalf("expected websocket request to strip context_management, got %#v", response["context_management"])
+	if _, ok := event["context_management"]; ok {
+		t.Fatalf("expected websocket request to strip context_management, got %#v", event["context_management"])
 	}
-	if got, ok := response["prompt_cache_key"].(string); !ok || strings.TrimSpace(got) == "" {
-		t.Fatalf("expected websocket request to include generated prompt_cache_key, got %#v", response["prompt_cache_key"])
+	if got, ok := event["prompt_cache_key"].(string); !ok || strings.TrimSpace(got) == "" {
+		t.Fatalf("expected websocket request to include generated prompt_cache_key, got %#v", event["prompt_cache_key"])
 	}
 
-	includes, ok := response["include"].([]any)
+	includes, ok := event["include"].([]any)
 	if !ok || len(includes) != 2 {
-		t.Fatalf("expected websocket request includes to normalize, got %#v", response["include"])
+		t.Fatalf("expected websocket request includes to normalize, got %#v", event["include"])
 	}
 	if includes[0] != "output_text.annotations" || includes[1] != codexReasoningEncryptedContentInclude {
 		t.Fatalf("unexpected websocket request includes %#v", includes)
 	}
 
-	tools, ok := response["tools"].([]any)
+	tools, ok := event["tools"].([]any)
 	if !ok || len(tools) != 1 {
-		t.Fatalf("expected websocket request tools to survive normalization, got %#v", response["tools"])
+		t.Fatalf("expected websocket request tools to survive normalization, got %#v", event["tools"])
 	}
 	firstTool, ok := tools[0].(map[string]any)
 	if !ok {
@@ -1424,9 +1415,9 @@ func TestCodexManagedRealtimeWebsocketNormalizesCodexRequestBeforeDispatch(t *te
 		t.Fatalf("expected websocket request tool alias to normalize, got %#v", got)
 	}
 
-	toolChoice, ok := response["tool_choice"].(map[string]any)
+	toolChoice, ok := event["tool_choice"].(map[string]any)
 	if !ok {
-		t.Fatalf("expected websocket request tool_choice map, got %T", response["tool_choice"])
+		t.Fatalf("expected websocket request tool_choice map, got %T", event["tool_choice"])
 	}
 	if got := toolChoice["type"]; got != "web_search" {
 		t.Fatalf("expected websocket request tool_choice alias to normalize, got %#v", got)
@@ -1467,7 +1458,7 @@ func TestCodexManagedRealtimeFallsBackToHTTPBridgeInAutoMode(t *testing.T) {
 	defer session.Detach("test_close")
 	defer cleanupCodexManagedSession(t, provider, "gpt-5")
 
-	createEvent := []byte(`{"type":"response.create","event_id":"evt_bridge","response":{"model":"gpt-5","input":"hello"}}`)
+	createEvent := []byte(`{"type":"response.create","event_id":"evt_bridge","model":"gpt-5","input":"hello"}`)
 	if err := session.SendClient(context.Background(), websocket.TextMessage, createEvent); err != nil {
 		t.Fatalf("expected bridge dispatch to succeed, got %v", err)
 	}
@@ -1883,7 +1874,7 @@ func TestCodexManagedRealtimeRejectsConcurrentResponseCreate(t *testing.T) {
 	defer session.Detach("test_close")
 	defer cleanupCodexManagedSession(t, provider, "gpt-5")
 
-	createEvent := []byte(`{"type":"response.create","event_id":"evt_busy","response":{"model":"gpt-5","input":"hello"}}`)
+	createEvent := []byte(`{"type":"response.create","event_id":"evt_busy","model":"gpt-5","input":"hello"}`)
 	if err := session.SendClient(context.Background(), websocket.TextMessage, createEvent); err != nil {
 		t.Fatalf("expected first response.create to succeed, got %v", err)
 	}
@@ -2109,7 +2100,7 @@ func TestCodexManagedRealtimeClosesWebsocketAfterProviderErrorFrame(t *testing.T
 	defer session.Detach("test_close")
 	defer cleanupCodexManagedSession(t, provider, "gpt-5")
 
-	createEvent := []byte(`{"type":"response.create","event_id":"evt_error","response":{"model":"gpt-5","input":"hello"}}`)
+	createEvent := []byte(`{"type":"response.create","event_id":"evt_error","model":"gpt-5","input":"hello"}`)
 	if err := session.SendClient(context.Background(), websocket.TextMessage, createEvent); err != nil {
 		t.Fatalf("expected first websocket dispatch to succeed, got %v", err)
 	}
@@ -2204,7 +2195,7 @@ func TestCodexManagedRealtimeReconnectReceivesInflightWebsocketResponse(t *testi
 		t.Fatalf("expected managed realtime websocket session to open, got %v", errWithCode)
 	}
 
-	createEvent := []byte(`{"type":"response.create","event_id":"evt_inflight","response":{"model":"gpt-5","input":"hello"}}`)
+	createEvent := []byte(`{"type":"response.create","event_id":"evt_inflight","model":"gpt-5","input":"hello"}`)
 	if err := sessionA.SendClient(context.Background(), websocket.TextMessage, createEvent); err != nil {
 		t.Fatalf("expected websocket dispatch to succeed, got %v", err)
 	}
@@ -3037,7 +3028,7 @@ func TestCodexManagedRealtimeWebsocketCarriesUsageOnFailedTerminalEvent(t *testi
 	recorder := &recordingTurnObserver{}
 	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return recorder })
 
-	createEvent := []byte(`{"type":"response.create","event_id":"evt_failed","response":{"model":"gpt-5","input":"hello"}}`)
+	createEvent := []byte(`{"type":"response.create","event_id":"evt_failed","model":"gpt-5","input":"hello"}`)
 	if err := session.SendClient(context.Background(), websocket.TextMessage, createEvent); err != nil {
 		t.Fatalf("expected websocket dispatch to succeed, got %v", err)
 	}
@@ -3118,7 +3109,7 @@ func TestCodexManagedRealtimeWebsocketBackfillsMissingTerminalUsage(t *testing.T
 	recorder := &recordingTurnObserver{}
 	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return recorder })
 
-	createEvent := []byte(`{"type":"response.create","event_id":"evt_backfilled","response":{"model":"gpt-5","input":"hello"}}`)
+	createEvent := []byte(`{"type":"response.create","event_id":"evt_backfilled","model":"gpt-5","input":"hello"}`)
 	if err := session.SendClient(context.Background(), websocket.TextMessage, createEvent); err != nil {
 		t.Fatalf("expected websocket dispatch to succeed, got %v", err)
 	}
@@ -3315,7 +3306,7 @@ func TestCodexManagedRealtimeWebsocketDuplicateTerminalEventsDoNotDoubleBill(t *
 	recorder := &recordingTurnObserver{}
 	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return recorder })
 
-	createEvent := []byte(`{"type":"response.create","event_id":"evt_duplicate","response":{"model":"gpt-5","input":"hello"}}`)
+	createEvent := []byte(`{"type":"response.create","event_id":"evt_duplicate","model":"gpt-5","input":"hello"}`)
 	if err := session.SendClient(context.Background(), websocket.TextMessage, createEvent); err != nil {
 		t.Fatalf("expected websocket dispatch to succeed, got %v", err)
 	}
@@ -3490,7 +3481,7 @@ func TestCodexDetachDeletesGeneratedExecutionSessionAfterInflightTurnCompletes(t
 		t.Fatalf("expected missing x-session-id not to create a resumable binding, got %q", managed.exec.BindingKey)
 	}
 
-	createEvent := []byte(`{"type":"response.create","event_id":"evt_detached_terminal","response":{"model":"gpt-5","input":"hello"}}`)
+	createEvent := []byte(`{"type":"response.create","event_id":"evt_detached_terminal","model":"gpt-5","input":"hello"}`)
 	if err := session.SendClient(context.Background(), websocket.TextMessage, createEvent); err != nil {
 		t.Fatalf("expected websocket dispatch to succeed, got %v", err)
 	}

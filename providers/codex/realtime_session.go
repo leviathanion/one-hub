@@ -43,10 +43,9 @@ const codexExecutionSessionRedisPrefix = "one-hub:execution-session"
 var codexRealtimeOutboundBackpressureTimeout = 5 * time.Second
 
 type codexRealtimeClientEvent struct {
-	Type       string                        `json:"type"`
-	EventID    string                        `json:"event_id,omitempty"`
-	ResponseID string                        `json:"response_id,omitempty"`
-	Response   *types.OpenAIResponsesRequest `json:"response,omitempty"`
+	Type       string `json:"type"`
+	EventID    string `json:"event_id,omitempty"`
+	ResponseID string `json:"response_id,omitempty"`
 }
 
 var codexRealtimePreparedResponseOverrideFields = []string{
@@ -546,10 +545,6 @@ func (s *codexManagedRealtimeSession) SendClient(ctx context.Context, mt int, pa
 
 	switch strings.TrimSpace(event.Type) {
 	case "response.create":
-		if event.Response == nil {
-			unlockExec()
-			return newCodexRealtimeClientError(event.EventID, "invalid_event", "response payload is required")
-		}
 		if s.exec.Inflight {
 			unlockExec()
 			return newCodexRealtimeClientError(event.EventID, "session_busy", "execution session already has an inflight response")
@@ -2356,25 +2351,16 @@ func (p *CodexProvider) prepareCodexRealtimeCreatePayload(payload []byte, sessio
 		return "", nil, nil, newCodexRealtimeClientError("", "invalid_event", codexRealtimeStaticErrorMessage("invalid_event"))
 	}
 	eventID := codexRawString(envelope["event_id"])
-	responseRaw, ok := envelope["response"]
-	if !ok || len(responseRaw) == 0 || strings.TrimSpace(string(responseRaw)) == "null" {
-		return eventID, nil, nil, newCodexRealtimeClientError(eventID, "invalid_event", "response payload is required")
-	}
-	responseObject := map[string]json.RawMessage{}
-	if err := json.Unmarshal(responseRaw, &responseObject); err != nil {
-		logCodexRealtimeInternalError("codex realtime response.create object decode failed: " + err.Error())
-		return eventID, nil, nil, newCodexRealtimeClientError(eventID, "invalid_event", codexRealtimeStaticErrorMessage("invalid_event"))
-	}
 
 	var request types.OpenAIResponsesRequest
-	decoder := json.NewDecoder(strings.NewReader(string(responseRaw)))
+	decoder := json.NewDecoder(strings.NewReader(string(payload)))
 	decoder.UseNumber()
 	if err := decoder.Decode(&request); err != nil {
 		logCodexRealtimeInternalError("codex realtime response.create request decode failed: " + err.Error())
 		return eventID, nil, nil, newCodexRealtimeClientError(eventID, "invalid_event", codexRealtimeStaticErrorMessage("invalid_event"))
 	}
-	if request.Model == "" {
-		request.Model = sessionModel
+	if strings.TrimSpace(request.Model) == "" {
+		return eventID, nil, nil, newCodexRealtimeClientError(eventID, "invalid_event", "model is required in response.create payload")
 	}
 	request.Model = normalizeCodexModelName(request.Model)
 	if request.Model != sessionModel {
@@ -2393,26 +2379,18 @@ func (p *CodexProvider) prepareCodexRealtimeCreatePayload(payload []byte, sessio
 		return eventID, nil, nil, newCodexRealtimeClientError(eventID, "invalid_event", codexRealtimeStaticErrorMessage("invalid_event"))
 	}
 
-	mergedResponse := cloneCodexRawObject(responseObject)
+	mergedEnvelope := cloneCodexRawObject(envelope)
 	// Passthrough trade-off: only fields Codex preparation intentionally mutates
-	// are overwritten. Other known and unknown fields keep their original raw JSON
-	// shape so realtime round-trips do not collapse client-specific encodings.
+	// are overwritten. Other known and unknown top-level fields keep their original
+	// raw JSON shape so realtime round-trips do not collapse client-specific encodings.
 	for _, key := range codexRealtimePreparedResponseOverrideFields {
 		if value, ok := preparedFields[key]; ok {
-			mergedResponse[key] = append(json.RawMessage(nil), value...)
+			mergedEnvelope[key] = append(json.RawMessage(nil), value...)
 		} else {
-			delete(mergedResponse, key)
+			delete(mergedEnvelope, key)
 		}
 	}
-	encodedResponse, err := json.Marshal(mergedResponse)
-	if err != nil {
-		logCodexRealtimeInternalError("codex realtime merged response marshal failed: " + err.Error())
-		return eventID, nil, nil, newCodexRealtimeClientError(eventID, "invalid_event", codexRealtimeStaticErrorMessage("invalid_event"))
-	}
-
-	encodedEnvelope := cloneCodexRawObject(envelope)
-	encodedEnvelope["response"] = encodedResponse
-	encodedPayload, err := json.Marshal(encodedEnvelope)
+	encodedPayload, err := json.Marshal(mergedEnvelope)
 	if err != nil {
 		logCodexRealtimeInternalError("codex realtime envelope marshal failed: " + err.Error())
 		return eventID, nil, nil, newCodexRealtimeClientError(eventID, "invalid_event", codexRealtimeStaticErrorMessage("invalid_event"))

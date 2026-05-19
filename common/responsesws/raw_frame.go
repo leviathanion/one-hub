@@ -69,39 +69,6 @@ func (f *RawResponsesCreateFrame) CloneForModel(model string) ([]byte, error) {
 	return json.Marshal(object)
 }
 
-func (f *RawResponsesCreateFrame) CodexNestedPayload(model string) ([]byte, error) {
-	if f == nil {
-		return nil, errors.New("responses create frame is required")
-	}
-	raw, err := f.CloneForModel(model)
-	if err != nil {
-		return nil, err
-	}
-	object, err := decodeTopLevelObjectNoDuplicateKeys(raw)
-	if err != nil {
-		return nil, err
-	}
-
-	response := make(map[string]json.RawMessage, len(object))
-	for key, value := range object {
-		switch strings.TrimSpace(key) {
-		case "type", "event_id":
-			continue
-		default:
-			response[key] = append(json.RawMessage(nil), value...)
-		}
-	}
-
-	payload := map[string]any{
-		"type":     "response.create",
-		"response": response,
-	}
-	if eventID := rawStringField(object, "event_id"); eventID != "" {
-		payload["event_id"] = eventID
-	}
-	return json.Marshal(payload)
-}
-
 func decodeTopLevelObjectNoDuplicateKeys(raw []byte) (map[string]json.RawMessage, error) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()

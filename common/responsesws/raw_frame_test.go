@@ -56,31 +56,3 @@ func TestRawResponsesCreateFrameCloneForSameModelReturnsRawFrame(t *testing.T) {
 		t.Fatalf("expected no-op model clone to return raw frame\nwant: %s\n got: %s", string(frame.Raw), string(cloned))
 	}
 }
-
-func TestRawResponsesCreateFrameCodexNestedPayloadPreservesUnknownValues(t *testing.T) {
-	frame, err := ParseRawResponsesCreateFrame([]byte(`{"type":"response.create","event_id":"evt_1","model":"gpt-5","input":"hi","generate":true}`))
-	if err != nil {
-		t.Fatalf("parse frame: %v", err)
-	}
-	nested, err := frame.CodexNestedPayload("gpt-5-mini")
-	if err != nil {
-		t.Fatalf("build nested payload: %v", err)
-	}
-	var got struct {
-		Type     string                     `json:"type"`
-		EventID  string                     `json:"event_id"`
-		Response map[string]json.RawMessage `json:"response"`
-	}
-	if err := json.Unmarshal(nested, &got); err != nil {
-		t.Fatalf("decode nested payload: %v", err)
-	}
-	if got.Type != "response.create" || got.EventID != "evt_1" {
-		t.Fatalf("unexpected envelope: %+v", got)
-	}
-	if string(got.Response["model"]) != `"gpt-5-mini"` || string(got.Response["generate"]) != `true` {
-		t.Fatalf("expected model rewrite and unknown field preservation, got %+v", got.Response)
-	}
-	if _, exists := got.Response["type"]; exists {
-		t.Fatal("did not expect event type to be nested into response payload")
-	}
-}

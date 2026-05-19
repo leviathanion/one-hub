@@ -2475,9 +2475,6 @@ func responsesWSProviderPayload(c *gin.Context, frame *responsesws.RawResponsesC
 	if providerModel == "" {
 		return nil, errors.New("mapped responses websocket model is required")
 	}
-	if c != nil && c.GetInt("channel_type") == config.ChannelTypeCodex {
-		return frame.CodexNestedPayload(providerModel)
-	}
 	return frame.CloneForModel(providerModel)
 }
 
