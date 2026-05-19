@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"one-api/common"
 	"one-api/common/config"
@@ -23,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -1068,7 +1071,7 @@ func (a *ResponsesWSSessionActor) markClientClosed(err error) {
 	if a == nil {
 		return
 	}
-	if err != nil {
+	if err != nil && !isResponsesWSExpectedClientDisconnectError(err) {
 		logger.LogInfo(context.Background(), fmt.Sprintf("responses websocket client closed: %T: %v", err, err))
 	}
 	a.clientClosed.Store(true)
@@ -1080,6 +1083,33 @@ func (a *ResponsesWSSessionActor) markClientClosed(err error) {
 
 func (a *ResponsesWSSessionActor) isClientGone() bool {
 	return a == nil || a.closed.Load() || a.clientClosed.Load()
+}
+
+func isResponsesWSExpectedClientDisconnectError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Codex and browsers commonly exit without completing the websocket close
+	// handshake. Suppressing these transport-level disconnects keeps normal
+	// shutdowns out of info logs; cleanup and quota finalization still run.
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED) {
+		return true
+	}
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		switch closeErr.Code {
+		case websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived, websocket.CloseAbnormalClosure:
+			return true
+		}
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	if strings.Contains(message, "broken pipe") || strings.Contains(message, "connection reset by peer") || strings.Contains(message, "software caused connection abort") {
+		return true
+	}
+	return false
 }
 
 func (a *ResponsesWSSessionActor) setSetupCancel(cancel context.CancelFunc) {
@@ -2022,7 +2052,7 @@ func (a *ResponsesWSSessionActor) clearActiveTurn() {
 }
 
 func (a *ResponsesWSSessionActor) handleClientClosed(err error) {
-	if err != nil {
+	if err != nil && !isResponsesWSExpectedClientDisconnectError(err) {
 		logger.LogInfo(context.Background(), fmt.Sprintf("responses websocket client close event: %T: %v", err, err))
 	}
 	a.close("client_closed")

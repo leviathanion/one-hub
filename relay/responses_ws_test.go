@@ -884,6 +884,48 @@ func TestResponsesWSClientCloseBeforeOpenReleasesActiveLease(t *testing.T) {
 	}
 }
 
+func TestResponsesWSExpectedClientDisconnectErrorClassification(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "codex exit abnormal close eof",
+			err:  &websocket.CloseError{Code: websocket.CloseAbnormalClosure, Text: "unexpected EOF"},
+			want: true,
+		},
+		{
+			name: "normal close",
+			err:  &websocket.CloseError{Code: websocket.CloseNormalClosure, Text: "bye"},
+			want: true,
+		},
+		{
+			name: "raw unexpected eof",
+			err:  io.ErrUnexpectedEOF,
+			want: true,
+		},
+		{
+			name: "message too big remains visible",
+			err:  &websocket.CloseError{Code: websocket.CloseMessageTooBig, Text: "too large"},
+			want: false,
+		},
+		{
+			name: "application read error remains visible",
+			err:  errors.New("frame decode failed"),
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isResponsesWSExpectedClientDisconnectError(tt.err); got != tt.want {
+				t.Fatalf("expected classification %v, got %v for %v", tt.want, got, tt.err)
+			}
+		})
+	}
+}
+
 func TestResponsesWSFirstTurnFailureAfterAttachAbortsSessionOnce(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	installResponsesWSTestAPILimiter(t, 60)
