@@ -346,6 +346,26 @@ func (m *Manager) DeleteIf(key string, expected *ExecutionSession) *ExecutionSes
 	return sess
 }
 
+func (m *Manager) DeleteIfWithoutCleanup(key string, expected *ExecutionSession) *ExecutionSession {
+	if key == "" || expected == nil {
+		return nil
+	}
+
+	m.mu.Lock()
+	sess := m.sessions[key]
+	if sess != expected {
+		m.mu.Unlock()
+		return nil
+	}
+	pendingDeletes := make([]pendingBindingDelete, 0, 1)
+	sess, deletes := m.deleteSessionLocked(key)
+	pendingDeletes = append(pendingDeletes, deletes...)
+	m.mu.Unlock()
+
+	m.applyPendingBindingDeletes(pendingDeletes)
+	return sess
+}
+
 func (m *Manager) Close() {
 	m.stopOnce.Do(func() {
 		close(m.stopCh)

@@ -37,6 +37,28 @@ user_invoice_month: false #是否开启用户月账单功能
 github_proxy: "" #github登录请求代理例如socks://127.0.0.1:10808
 openai:
   realtime_session_compat: false # OpenAI Realtime 兼容模式；开启后，上游 error 事件会在转发后立即关闭当前会话
+cors:
+  allow_origins: [] # 前端域名白名单；为空时使用旧版兼容模式：允许任意 Origin 且允许凭据，生产建议显式配置白名单
+  allow_headers: [] # 追加允许的 CORS 请求头；allow_origins 为空时兼容旧行为允许任意请求头
+  allow_credentials: true # 仅在 allow_origins 非空时生效
+realtime:
+  allowed_origins: [] # WebSocket Origin 白名单；为空时回退到 cors.allow_origins，若两者都为空则兼容旧行为允许任意 Origin；生产建议配置白名单
+  unsafe_allow_credential_subprotocol_any_origin: false # 仅兼容旧浏览器直连；true 时 openai-insecure-api-key.* 子协议可在空/通配 Origin 白名单下使用
+  websocket_read_limit: 16777216 # WebSocket 单帧读取上限，默认 16MiB；超限连接会返回静态 invalid_event 后关闭
+  websocket_ping_interval_ms: 25000 # 服务端主动 Ping 周期，默认 25 秒；<=0 仅建议测试禁用
+  websocket_write_timeout_ms: 10000 # WebSocket 写超时，默认 10 秒
+responses_ws:
+  connect_per_credential_per_minute: 30 # 每个 credential 每分钟允许的 ResponsesWS 建连尝试数；per minute，窗口/Redis 共享语义同 API RPM limiter，Redis 关闭时进程内限流；显式 -1 表示不限
+  pending_per_credential: 1 # Upgrade 后等待首帧/建连的单凭据 pending 上限
+  active_per_credential: 8 # 单凭据已建立 ResponsesWS 连接上限；显式 -1 表示无限
+  active_per_group: 128 # 单分组已建立 ResponsesWS 连接上限；显式 -1 表示无限
+  active_global: 1024 # 全局已建立 ResponsesWS 连接上限；显式 -1 表示无限
+  active_lease_redis_fail_open: true # Redis active lease 出错时是否回退进程内计数；多实例容量会短暂失真，false 则拒绝新 active lease
+  first_frame_timeout_ms: 5000 # Upgrade 后等待首个 response.create 的超时
+  idle_timeout_ms: 1800000 # 已建立 ResponsesWS 连接空闲超时
+  max_lifetime_ms: 3600000 # 单个 ResponsesWS 连接最长存活时间；显式 0 使用默认 1 小时
+  pending_provider_events_max_bytes: 2097152 # send 结果确认前可缓存的上游事件字节上限，默认 2MiB
+  allow_anonymous_capacity_bucket: false # 仅测试/本地诊断可开启；生产缺少 token/user 时不进入共享 anonymous bucket
 request_body_decode:
   enabled: true # 是否启用支持该能力的 Relay 结构化路由入站 Content-Encoding 规范化
   max_wire_bytes: 67108864 # 压缩后的请求体最大字节数，限制入口层内存占用

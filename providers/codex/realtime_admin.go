@@ -5,5 +5,5 @@ import (
 )
 
 func GetExecutionSessionStats() runtimesession.Stats {
-	return codexExecutionSessions.Stats()
+	return currentCodexExecutionSessions().Stats()
 }

@@ -47,6 +47,8 @@ const (
 type codexChannelOptions struct {
 	PromptCacheKeyStrategy        string `json:"prompt_cache_key_strategy"`
 	WebsocketMode                 string `json:"websocket_mode"`
+	SelfHosted                    bool   `json:"self_hosted"`
+	ResponsesWSSelfHosted         bool   `json:"responses_ws_self_hosted"`
 	ExecutionSessionTTLSeconds    int    `json:"execution_session_ttl_seconds"`
 	WebsocketRetryCooldownSeconds int    `json:"websocket_retry_cooldown_seconds"`
 	UserAgent                     string `json:"user_agent"`

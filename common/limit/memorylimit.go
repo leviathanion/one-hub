@@ -24,6 +24,7 @@ type MemoryLimiter struct {
 	// For cleanup
 	cleanupInterval time.Duration
 	stopCleanup     chan struct{}
+	stopOnce        sync.Once
 }
 
 // windowData stores data for fixed window rate limiting
@@ -76,10 +77,15 @@ func (l *MemoryLimiter) Allow(keyPrefix string) bool {
 
 // AllowN checks if n requests are allowed.
 func (l *MemoryLimiter) AllowN(keyPrefix string, n int) bool {
+	allowed, _ := l.AllowNWithError(keyPrefix, n)
+	return allowed
+}
+
+func (l *MemoryLimiter) AllowNWithError(keyPrefix string, n int) (bool, error) {
 	if l.isTokenBucket {
-		return l.allowTokenBucket(keyPrefix, n)
+		return l.allowTokenBucket(keyPrefix, n), nil
 	}
-	return l.allowFixedWindow(keyPrefix, n)
+	return l.allowFixedWindow(keyPrefix, n), nil
 }
 
 // GetCurrentRate returns the current rate for the given key.
@@ -256,7 +262,12 @@ func (l *MemoryLimiter) removeExpiredEntries() {
 
 // Stop stops the cleanup goroutine.
 func (l *MemoryLimiter) Stop() {
-	close(l.stopCleanup)
+	if l == nil {
+		return
+	}
+	l.stopOnce.Do(func() {
+		close(l.stopCleanup)
+	})
 }
 
 // minValue returns the minimum of two float64 values.

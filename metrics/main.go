@@ -19,6 +19,8 @@ var (
 	panicCounter             *prometheus.CounterVec
 	requestBodyDecodeCounter *prometheus.CounterVec
 	requestBodyDecodedBytes  *prometheus.HistogramVec
+	responsesWSConnectLimit  *prometheus.CounterVec
+	responsesWSRedisFallback *prometheus.CounterVec
 	requestBodyDecodeOnce    sync.Once
 )
 
@@ -81,6 +83,20 @@ func init() {
 			Help: "Total number of request body decode attempts.",
 		},
 		[]string{"encoding", "outcome"},
+	)
+	responsesWSConnectLimit = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "responses_ws_connection_rate_limited_total",
+			Help: "Total number of Responses WebSocket connection attempts rejected by the connection rate limiter.",
+		},
+		[]string{"group", "credential_kind"},
+	)
+	responsesWSRedisFallback = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "responses_ws_connection_limiter_redis_fallback_total",
+			Help: "Total number of Responses WebSocket connection limiter fail-open fallbacks from Redis to in-process storage.",
+		},
+		[]string{"reason"},
 	)
 }
 
@@ -152,6 +168,18 @@ func RecordRequestBodyDecode(encoding, outcome string, decodedBytes int) {
 		if outcome == "success" && decodedBytes >= 0 && requestBodyDecodedBytes != nil {
 			requestBodyDecodedBytes.WithLabelValues(encoding).Observe(float64(decodedBytes))
 		}
+	})
+}
+
+func RecordResponsesWSConnectionRateLimited(group, credentialKind string) {
+	SafelyRecordMetric(func() {
+		responsesWSConnectLimit.WithLabelValues(group, credentialKind).Inc()
+	})
+}
+
+func RecordResponsesWSConnectionLimiterRedisFallback(reason string) {
+	SafelyRecordMetric(func() {
+		responsesWSRedisFallback.WithLabelValues(reason).Inc()
 	})
 }
 

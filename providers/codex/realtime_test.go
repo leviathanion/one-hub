@@ -73,13 +73,30 @@ func resolveTestRealtimeBinding(c *gin.Context) (*runtimesession.Binding, bool) 
 		return nil, false
 	}
 	bindingKey := runtimesession.BuildBindingKey(readCodexRealtimeCallerNamespace(c), runtimesession.BindingScopeChatRealtime, sessionID)
-	return codexExecutionSessions.Resolve(bindingKey)
+	return currentCodexExecutionSessions().Resolve(bindingKey)
 }
 
 func TestCodexRealtimeBootstrapMessageDetection(t *testing.T) {
 	payload := []byte(`{"type":"session.created","session":{"id":"execution-session-456"}}`)
 	if !isCodexRealtimeBootstrapMessage(websocket.TextMessage, payload) {
 		t.Fatal("expected Codex realtime bootstrap detector to match session.created events")
+	}
+}
+
+func TestCodexRealtimeHandlerLogsMalformedJSONAndContinues(t *testing.T) {
+	provider := &CodexProvider{}
+	shouldContinue, usage, newMessage, err := provider.handleRealtimeSupplierMessage(websocket.TextMessage, []byte(`{"type":`), nil, "gpt-5")
+	if err != nil {
+		t.Fatalf("expected malformed provider JSON to be ignored without handler error, got %v", err)
+	}
+	if !shouldContinue || usage != nil || newMessage != nil {
+		t.Fatalf("expected malformed provider JSON to be ignored, continue=%v usage=%+v message=%s", shouldContinue, usage, string(newMessage))
+	}
+
+	longPayload := []byte(strings.Repeat("x", codexRealtimeMalformedPayloadLogLimit+8))
+	snippet := codexRealtimePayloadSnippet(longPayload)
+	if len(snippet) <= codexRealtimeMalformedPayloadLogLimit || !strings.Contains(snippet, "truncated") {
+		t.Fatalf("expected malformed payload snippet to be bounded and marked truncated, got len=%d snippet suffix=%q", len(snippet), snippet[len(snippet)-20:])
 	}
 }
 
@@ -373,7 +390,7 @@ func TestCodexManagedRealtimeSkipsBootstrapFrameOnNewWebsocket(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	_, payload, _, err := session.Recv(ctx)
+	_, payload, _, _, err := session.Recv(ctx)
 	if err != nil {
 		t.Fatalf("expected post-bootstrap response, got %v", err)
 	}
@@ -432,7 +449,7 @@ func TestCodexManagedRealtimeReplacementReaderPreservesBootstrapOwnership(t *tes
 	exec.Transport = runtimesession.TransportModeResponsesWS
 	provider.startRealtimeWSReaderLocked(exec, state)
 	replaced := clearCodexManagedWebsocketLocked(state)
-	if replaced != conn1 {
+	if replaced.conn != conn1 {
 		exec.Unlock()
 		t.Fatalf("expected websocket replacement to clear the original connection")
 	}
@@ -1232,7 +1249,7 @@ func TestCodexManagedRealtimeReclaimsAttachedExecutionSession(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	_, _, _, err := sessionA.Recv(ctx)
+	_, _, _, _, err := sessionA.Recv(ctx)
 	if !errors.Is(err, runtimesession.ErrSessionClosed) {
 		t.Fatalf("expected reclaimed attachment to close the stale session, got %v", err)
 	}
@@ -1458,7 +1475,7 @@ func TestCodexManagedRealtimeFallsBackToHTTPBridgeInAutoMode(t *testing.T) {
 	var usage *types.UsageEvent
 	var completed bool
 	for i := 0; i < 2; i++ {
-		_, payload, eventUsage, err := session.Recv(context.Background())
+		_, payload, eventUsage, _, err := session.Recv(context.Background())
 		if err != nil {
 			t.Fatalf("expected bridge event, got %v", err)
 		}
@@ -1647,10 +1664,10 @@ func TestCodexRealtimeForceFreshReplacesBindingWithoutStaleConflict(t *testing.T
 	if !managedA.exec.IsClosed() {
 		t.Fatal("expected force-fresh open to close the stale execution session immediately")
 	}
-	if removed := codexExecutionSessions.DeleteIf(oldKey, managedA.exec); removed != nil {
+	if removed := currentCodexExecutionSessions().DeleteIf(oldKey, managedA.exec); removed != nil {
 		t.Fatalf("expected stale execution session key %q to already be removed from the manager", oldKey)
 	}
-	if binding, ok := codexExecutionSessions.Resolve(managedA.exec.BindingKey); !ok || binding == nil || binding.SessionKey != managedB.exec.Key {
+	if binding, ok := currentCodexExecutionSessions().Resolve(managedA.exec.BindingKey); !ok || binding == nil || binding.SessionKey != managedB.exec.Key {
 		t.Fatalf("expected stale binding key to resolve only to the replacement execution session, got %+v", binding)
 	}
 
@@ -1669,17 +1686,12 @@ func TestCodexRealtimeForceFreshReplacesBindingWithoutStaleConflict(t *testing.T
 }
 
 func TestCodexRealtimeForceFreshReleasesPerCallerCapacity(t *testing.T) {
-	originalManager := codexExecutionSessions
 	testManager := runtimesession.NewManagerWithOptions(runtimesession.ManagerOptions{
 		DefaultTTL:           time.Minute,
 		MaxSessions:          8,
 		MaxSessionsPerCaller: 1,
 	})
-	codexExecutionSessions = testManager
-	t.Cleanup(func() {
-		codexExecutionSessions = originalManager
-		testManager.Close()
-	})
+	replaceCodexExecutionSessionsForTest(t, testManager)
 
 	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, map[string]string{
 		"X-Session-Id": "force-fresh-capacity-session",
@@ -1710,7 +1722,7 @@ func TestCodexRealtimeForceFreshReleasesPerCallerCapacity(t *testing.T) {
 	}
 	defer managedB.Detach("test_close")
 
-	if removed := codexExecutionSessions.DeleteIf(managedA.exec.Key, managedA.exec); removed != nil {
+	if removed := currentCodexExecutionSessions().DeleteIf(managedA.exec.Key, managedA.exec); removed != nil {
 		t.Fatalf("expected force-fresh reopen to free the stale execution session capacity slot, removed=%+v", removed)
 	}
 
@@ -1832,7 +1844,7 @@ func TestCodexManagedRealtimeForceModeBypassesBridgeCooldown(t *testing.T) {
 		exec.Unlock()
 		t.Fatal("expected force mode redial to attach a websocket connection")
 	}
-	wsConn = clearCodexManagedWebsocketLocked(state)
+	wsConn = clearCodexManagedWebsocketLocked(state).conn
 	exec.Unlock()
 
 	if wsConn != nil {
@@ -2017,7 +2029,7 @@ func TestCodexManagedRealtimeBridgeCancelEnqueuesCancelledEvent(t *testing.T) {
 		t.Fatalf("timed out waiting for bridge stream close")
 	}
 
-	_, payload, usage, err := session.Recv(context.Background())
+	_, payload, usage, _, err := session.Recv(context.Background())
 	if err != nil {
 		t.Fatalf("expected cancelled event after bridge cancel, got %v", err)
 	}
@@ -2102,7 +2114,7 @@ func TestCodexManagedRealtimeClosesWebsocketAfterProviderErrorFrame(t *testing.T
 		t.Fatalf("expected first websocket dispatch to succeed, got %v", err)
 	}
 
-	_, payload, _, err := session.Recv(context.Background())
+	_, payload, _, _, err := session.Recv(context.Background())
 	if err != nil {
 		t.Fatalf("expected provider error event after first dispatch, got %v", err)
 	}
@@ -2120,7 +2132,7 @@ func TestCodexManagedRealtimeClosesWebsocketAfterProviderErrorFrame(t *testing.T
 		t.Fatalf("expected second websocket dispatch to redial cleanly, got %v", err)
 	}
 
-	_, payload, _, err = session.Recv(context.Background())
+	_, payload, _, _, err = session.Recv(context.Background())
 	if err != nil {
 		t.Fatalf("expected response from redialed websocket, got %v", err)
 	}
@@ -2207,7 +2219,7 @@ func TestCodexManagedRealtimeReconnectReceivesInflightWebsocketResponse(t *testi
 
 	ctxClosed, cancelClosed := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancelClosed()
-	_, _, _, err := sessionA.Recv(ctxClosed)
+	_, _, _, _, err := sessionA.Recv(ctxClosed)
 	if !errors.Is(err, runtimesession.ErrSessionClosed) {
 		t.Fatalf("expected detached websocket session to close locally, got %v", err)
 	}
@@ -2230,7 +2242,7 @@ func TestCodexManagedRealtimeReconnectReceivesInflightWebsocketResponse(t *testi
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	_, payload, _, err := sessionB.Recv(ctx)
+	_, payload, _, _, err := sessionB.Recv(ctx)
 	if err != nil {
 		t.Fatalf("expected reattached session to receive inflight websocket response, got %v", err)
 	}
@@ -2279,7 +2291,7 @@ func TestCodexManagedRealtimeRecvPrefersBufferedFramesAfterAttachmentClose(t *te
 	attachment.close()
 
 	session := &codexManagedRealtimeSession{attachment: attachment}
-	messageType, payload, usage, err := session.Recv(context.Background())
+	messageType, payload, usage, _, err := session.Recv(context.Background())
 	if err != nil {
 		t.Fatalf("expected buffered outbound to survive attachment close, got %v", err)
 	}
@@ -2293,7 +2305,7 @@ func TestCodexManagedRealtimeRecvPrefersBufferedFramesAfterAttachmentClose(t *te
 		t.Fatalf("expected buffered payload not to invent usage, got %+v", usage)
 	}
 
-	_, payload, usage, err = session.Recv(context.Background())
+	_, payload, usage, _, err = session.Recv(context.Background())
 	if !errors.Is(err, runtimesession.ErrSessionClosed) {
 		t.Fatalf("expected closed attachment to stop Recv after buffered outbound is drained, got %v", err)
 	}
@@ -2681,7 +2693,7 @@ func TestPumpRealtimeHTTPBridgeIgnoresNonTerminalUsageSnapshots(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	_, payload, usage, err := session.Recv(ctx)
+	_, payload, usage, _, err := session.Recv(ctx)
 	if err != nil {
 		t.Fatalf("expected first bridge payload, got %v", err)
 	}
@@ -2692,7 +2704,7 @@ func TestPumpRealtimeHTTPBridgeIgnoresNonTerminalUsageSnapshots(t *testing.T) {
 		t.Fatalf("expected non-terminal bridge usage snapshot to be ignored, got %+v", usage)
 	}
 
-	_, payload, usage, err = session.Recv(ctx)
+	_, payload, usage, _, err = session.Recv(ctx)
 	if err != nil {
 		t.Fatalf("expected terminal bridge payload, got %v", err)
 	}
@@ -2720,6 +2732,75 @@ func TestPumpRealtimeHTTPBridgeIgnoresNonTerminalUsageSnapshots(t *testing.T) {
 	finalizePayload := recorder.lastPayload()
 	if finalizePayload.Usage == nil || finalizePayload.Usage.TotalTokens != 8 {
 		t.Fatalf("expected finalized bridge usage to preserve the terminal total once, got %+v", finalizePayload.Usage)
+	}
+}
+
+func TestPumpRealtimeHTTPBridgeBackpressureCleansBusySession(t *testing.T) {
+	originalTimeout := codexRealtimeOutboundBackpressureTimeout
+	codexRealtimeOutboundBackpressureTimeout = 10 * time.Millisecond
+	defer func() {
+		codexRealtimeOutboundBackpressureTimeout = originalTimeout
+	}()
+
+	provider := &CodexProvider{}
+	stream := &fakeStringStream{
+		dataChan: make(chan string),
+		errChan:  make(chan error, 1),
+		closed:   make(chan struct{}),
+	}
+	exec := runtimesession.NewExecutionSession(runtimesession.Metadata{
+		Key:       "token:1/managed-bridge-backpressure-session",
+		SessionID: "managed-bridge-backpressure-session",
+		CallerNS:  "token:1",
+		ChannelID: 424300,
+		Model:     "gpt-5",
+		Protocol:  codexRealtimeProtocolName,
+	})
+	attachment := newCodexAttachmentWithCapacity(1)
+	if !enqueueCodexOutbound(attachment, codexRealtimeOutbound{messageType: websocket.TextMessage, payload: []byte(`{"type":"response.created"}`)}) {
+		t.Fatal("expected initial outbound fill to succeed")
+	}
+	recorder := &recordingTurnObserver{}
+
+	exec.Lock()
+	state := getCodexManagedRuntimeStateLocked(exec)
+	assignCodexAttachmentOwnerLocked(state, attachment)
+	state.bridgeStream = stream
+	state.turnObserverFactory = func() runtimesession.TurnObserver { return recorder }
+	beginCodexTurnLocked(state, time.Now())
+	exec.Attached = true
+	exec.Inflight = true
+	exec.Transport = runtimesession.TransportModeResponsesHTTPBridge
+	exec.State = runtimesession.SessionStateActive
+	exec.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		provider.pumpRealtimeHTTPBridge(exec, stream)
+		close(done)
+	}()
+
+	stream.dataChan <- "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_backpressure\",\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":5,\"total_tokens\":8}}}\n\n"
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for bridge pump to exit after outbound backpressure")
+	}
+	waitForCodexAttachmentClosed(t, attachment, time.Second)
+
+	exec.Lock()
+	inflight := exec.Inflight
+	sessionState := exec.State
+	exec.Unlock()
+	if inflight || sessionState == runtimesession.SessionStateActive {
+		t.Fatalf("expected backpressure cleanup to clear busy session state, inflight=%v state=%s", inflight, sessionState)
+	}
+	if got := recorder.finalizeCount(); got != 1 {
+		t.Fatalf("expected backpressured terminal turn to finalize once, got %d", got)
+	}
+	if payload := recorder.lastPayload(); payload.Usage == nil || payload.Usage.TotalTokens != 8 {
+		t.Fatalf("expected finalized usage to survive backpressure cleanup, got %+v", payload.Usage)
 	}
 }
 
@@ -2771,7 +2852,7 @@ func TestPumpRealtimeHTTPBridgePropagatesTurnUsageObserverErrors(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	messageType, payload, usage, err := session.Recv(ctx)
+	messageType, payload, usage, _, err := session.Recv(ctx)
 	if err == nil {
 		t.Fatal("expected turn usage observer error to reach the managed session")
 	}
@@ -2894,7 +2975,7 @@ func TestPumpRealtimeHTTPBridgeBackfillsMissingTerminalUsage(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	_, payload, usage, err := session.Recv(ctx)
+	_, payload, usage, _, err := session.Recv(ctx)
 	if err != nil {
 		t.Fatalf("expected terminal bridge payload, got %v", err)
 	}
@@ -2964,7 +3045,7 @@ func TestCodexManagedRealtimeWebsocketCarriesUsageOnFailedTerminalEvent(t *testi
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	_, payload, usage, err := session.Recv(ctx)
+	_, payload, usage, _, err := session.Recv(ctx)
 	if err != nil {
 		t.Fatalf("expected failed terminal payload, got %v", err)
 	}
@@ -3045,7 +3126,7 @@ func TestCodexManagedRealtimeWebsocketBackfillsMissingTerminalUsage(t *testing.T
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	_, payload, usage, err := session.Recv(ctx)
+	_, payload, usage, _, err := session.Recv(ctx)
 	if err != nil {
 		t.Fatalf("expected completed terminal payload, got %v", err)
 	}
@@ -3243,7 +3324,7 @@ func TestCodexManagedRealtimeWebsocketDuplicateTerminalEventsDoNotDoubleBill(t *
 	defer cancel()
 
 	for _, want := range []string{"response.completed", "response.done"} {
-		_, payload, _, err := session.Recv(ctx)
+		_, payload, _, _, err := session.Recv(ctx)
 		if err != nil {
 			t.Fatalf("expected duplicate terminal payload %q, got %v", want, err)
 		}
@@ -3279,15 +3360,10 @@ func TestCodexManagedRealtimeWebsocketDuplicateTerminalEventsDoNotDoubleBill(t *
 }
 
 func TestCodexOpenRealtimeSessionReleasesLeaseOnModelMismatch(t *testing.T) {
-	originalManager := codexExecutionSessions
 	testManager := runtimesession.NewManagerWithOptions(runtimesession.ManagerOptions{
-		DefaultTTL: time.Millisecond,
+		DefaultTTL: time.Minute,
 	})
-	codexExecutionSessions = testManager
-	t.Cleanup(func() {
-		codexExecutionSessions = originalManager
-		testManager.Close()
-	})
+	replaceCodexExecutionSessionsForTest(t, testManager)
 
 	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"force"}`, map[string]string{
 		"X-Session-Id": "managed-model-mismatch-session",
@@ -3308,7 +3384,7 @@ func TestCodexOpenRealtimeSessionReleasesLeaseOnModelMismatch(t *testing.T) {
 	exec.Attached = false
 	exec.Inflight = false
 	exec.State = runtimesession.SessionStateIdle
-	exec.IdleTTL = time.Millisecond
+	exec.IdleTTL = time.Minute
 	exec.Touch(time.Now())
 	exec.Unlock()
 	releaseLease()
@@ -3338,15 +3414,10 @@ func TestCodexOpenRealtimeSessionReleasesLeaseOnModelMismatch(t *testing.T) {
 }
 
 func TestCodexDetachDeletesGeneratedExecutionSessionImmediately(t *testing.T) {
-	originalManager := codexExecutionSessions
 	testManager := runtimesession.NewManagerWithOptions(runtimesession.ManagerOptions{
 		DefaultTTL: time.Minute,
 	})
-	codexExecutionSessions = testManager
-	t.Cleanup(func() {
-		codexExecutionSessions = originalManager
-		testManager.Close()
-	})
+	replaceCodexExecutionSessionsForTest(t, testManager)
 
 	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, nil)
 	provider.Context.Set("token_id", 119)
@@ -3376,15 +3447,10 @@ func TestCodexDetachDeletesGeneratedExecutionSessionImmediately(t *testing.T) {
 }
 
 func TestCodexDetachDeletesGeneratedExecutionSessionAfterInflightTurnCompletes(t *testing.T) {
-	originalManager := codexExecutionSessions
 	testManager := runtimesession.NewManagerWithOptions(runtimesession.ManagerOptions{
 		DefaultTTL: time.Minute,
 	})
-	codexExecutionSessions = testManager
-	t.Cleanup(func() {
-		codexExecutionSessions = originalManager
-		testManager.Close()
-	})
+	replaceCodexExecutionSessionsForTest(t, testManager)
 
 	allowTerminalEvent := make(chan struct{})
 	upgrader := websocket.Upgrader{}
@@ -3449,17 +3515,12 @@ func TestCodexDetachDeletesGeneratedExecutionSessionAfterInflightTurnCompletes(t
 }
 
 func TestCodexOpenRealtimeSessionEnforcesPerCallerCapacity(t *testing.T) {
-	originalManager := codexExecutionSessions
 	testManager := runtimesession.NewManagerWithOptions(runtimesession.ManagerOptions{
 		DefaultTTL:           time.Minute,
 		MaxSessions:          8,
 		MaxSessionsPerCaller: 1,
 	})
-	codexExecutionSessions = testManager
-	t.Cleanup(func() {
-		codexExecutionSessions = originalManager
-		testManager.Close()
-	})
+	replaceCodexExecutionSessionsForTest(t, testManager)
 
 	providerA := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, map[string]string{
 		"X-Session-Id": "caller-cap-session-a",
@@ -3582,15 +3643,10 @@ func cloneTestUsageEvent(usage *types.UsageEvent) *types.UsageEvent {
 }
 
 func TestCodexRealtimeReopenLocalOnlySessionPromotesToShared(t *testing.T) {
-	originalManager := codexExecutionSessions
 	testManager := runtimesession.NewManagerWithOptions(runtimesession.ManagerOptions{
 		DefaultTTL: time.Minute,
 	})
-	codexExecutionSessions = testManager
-	t.Cleanup(func() {
-		codexExecutionSessions = originalManager
-		testManager.Close()
-	})
+	replaceCodexExecutionSessionsForTest(t, testManager)
 
 	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, map[string]string{
 		"X-Session-Id": "local-only-promote-session",
@@ -3641,14 +3697,14 @@ func TestCodexRealtimeReopenLocalOnlySessionPromotesToShared(t *testing.T) {
 func cleanupCodexManagedSession(t *testing.T, provider *CodexProvider, model string) {
 	t.Helper()
 	if binding, ok := resolveTestRealtimeBinding(provider.Context); ok && binding != nil {
-		codexExecutionSessions.Delete(binding.SessionKey)
+		currentCodexExecutionSessions().Delete(binding.SessionKey)
 		return
 	}
 	meta, errWithCode := provider.buildExecutionSessionMetadata(model, runtimesession.RealtimeOpenOptions{})
 	if errWithCode != nil {
 		return
 	}
-	codexExecutionSessions.Delete(meta.Key)
+	currentCodexExecutionSessions().Delete(meta.Key)
 }
 
 func stringPtr(value string) *string {

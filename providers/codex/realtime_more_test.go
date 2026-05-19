@@ -1,11 +1,15 @@
 package codex
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"one-api/common/logger"
+	"one-api/common/requester"
 	"one-api/types"
 
 	"github.com/gorilla/websocket"
@@ -22,8 +26,11 @@ func TestCodexRealtimeHelperFunctionsAndCompatibilityHeaders(t *testing.T) {
 	if wsURL, err := buildCodexRealtimeURL("https://example.com/backend-api/codex/responses?model=gpt-5"); err != nil || wsURL != "wss://example.com/backend-api/codex/responses?model=gpt-5" {
 		t.Fatalf("expected https codex realtime url rewrite, url=%q err=%v", wsURL, err)
 	}
-	if wsURL, err := buildCodexRealtimeURL("http://example.com/backend-api/codex/responses"); err != nil || wsURL != "ws://example.com/backend-api/codex/responses" {
-		t.Fatalf("expected http codex realtime url rewrite, url=%q err=%v", wsURL, err)
+	if _, err := buildCodexRealtimeURL("http://example.com/backend-api/codex/responses"); err == nil {
+		t.Fatal("expected plaintext codex realtime url to be rejected by default")
+	}
+	if wsURL, err := buildCodexRealtimeURLWithPolicy("http://127.0.0.1:8080/backend-api/codex/responses", true, false); err != nil || wsURL != "ws://127.0.0.1:8080/backend-api/codex/responses" {
+		t.Fatalf("expected self-hosted http codex realtime url rewrite, url=%q err=%v", wsURL, err)
 	}
 	if _, err := buildCodexRealtimeURL("://bad"); err == nil {
 		t.Fatal("expected invalid realtime url parse to fail")
@@ -183,6 +190,74 @@ func TestCodexRealtimeConnectionPlanningAndDialPaths(t *testing.T) {
 		}
 		if errWithCode == nil || errWithCode.Code != "ws_request_failed" {
 			t.Fatalf("expected ws_request_failed for nil plan, got %+v", errWithCode)
+		}
+	})
+
+	t.Run("dial honors cancellable context", func(t *testing.T) {
+		release := make(chan struct{})
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+		}))
+		defer server.Close()
+		defer close(release)
+
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", nil)
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+		defer cancel()
+
+		done := make(chan *types.OpenAIErrorWithStatusCode, 1)
+		go func() {
+			conn, errWithCode := provider.dialChatRealtimeConnWithContext(ctx, &codexRealtimeConnPlan{
+				wsURL: "ws" + server.URL[len("http"):],
+			})
+			if conn != nil {
+				_ = conn.Close()
+			}
+			done <- errWithCode
+		}()
+
+		select {
+		case errWithCode := <-done:
+			if errWithCode == nil || errWithCode.Code != "ws_request_failed" {
+				t.Fatalf("expected cancelled websocket dial to map to ws_request_failed, got %+v", errWithCode)
+			}
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("expected cancellable websocket dial to return promptly")
+		}
+	})
+
+	t.Run("handshake status mapping preserves provider semantics", func(t *testing.T) {
+		cases := []struct {
+			name       string
+			statusCode int
+			wantCode   string
+			wantStatus int
+		}{
+			{"unauthorized", http.StatusUnauthorized, "provider_authentication_failed", http.StatusUnauthorized},
+			{"rate limited", http.StatusTooManyRequests, "provider_rate_limit_exceeded", http.StatusTooManyRequests},
+			{"not found unsupported", http.StatusNotFound, "responses_ws_unsupported_for_channel", http.StatusUpgradeRequired},
+			{"upgrade required unsupported", http.StatusUpgradeRequired, "responses_ws_unsupported_for_channel", http.StatusUpgradeRequired},
+			{"server error", http.StatusBadGateway, "provider_ws_request_failed", http.StatusBadGateway},
+		}
+		for _, tc := range cases {
+			errWithCode := mapCodexRealtimeWSDialError(&requester.WSDialHandshakeError{
+				URL:        "wss://provider.example/realtime",
+				StatusCode: tc.statusCode,
+				Err:        errors.New("handshake failed"),
+			})
+			gotCode, _ := errWithCode.Code.(string)
+			if gotCode != tc.wantCode || errWithCode.StatusCode != tc.wantStatus {
+				t.Fatalf("%s: expected %s/%d, got code=%v status=%d", tc.name, tc.wantCode, tc.wantStatus, errWithCode.Code, errWithCode.StatusCode)
+			}
+		}
+
+		errWithCode := mapCodexRealtimeWSDialError(errors.New("dial tcp: no route"))
+		gotCode, _ := errWithCode.Code.(string)
+		if gotCode != "ws_request_failed" || errWithCode.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("expected transport errors without HTTP status to remain ws_request_failed, got %+v", errWithCode)
 		}
 	})
 

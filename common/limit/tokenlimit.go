@@ -73,6 +73,11 @@ func (lim *TokenLimiter) Allow(keyPrefix string) bool {
 // Use this method if you intend to drop / skip events that exceed the rate.
 // Otherwise, use Reserve or Wait.
 func (lim *TokenLimiter) AllowN(keyPrefix string, n int) bool {
+	allowed, _ := lim.AllowNWithError(keyPrefix, n)
+	return allowed
+}
+
+func (lim *TokenLimiter) AllowNWithError(keyPrefix string, n int) (bool, error) {
 	return lim.reserveN(context.Background(), keyPrefix, n)
 }
 
@@ -139,7 +144,7 @@ func (lim *TokenLimiter) GetCurrentRate(keyPrefix string) (int, error) {
 	return realTimeRPM, nil
 }
 
-func (lim *TokenLimiter) reserveN(ctx context.Context, keyPrefix string, n int) bool {
+func (lim *TokenLimiter) reserveN(ctx context.Context, keyPrefix string, n int) (bool, error) {
 	tokenKey := fmt.Sprintf(tokenFormat, keyPrefix)
 	timestampKey := fmt.Sprintf(timestampFormat, keyPrefix)
 	counterKey := fmt.Sprintf(counterFormat, keyPrefix)
@@ -162,25 +167,25 @@ func (lim *TokenLimiter) reserveN(ctx context.Context, keyPrefix string, n int) 
 	// redis allowed == false
 	// Lua boolean false -> r Nil bulk reply
 	if errors.Is(err, redis.Nil) {
-		return false
+		return false, nil
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		logger.SysError(fmt.Sprintf("fail to use rate limiter: %s", err))
-		return false
+		return false, err
 	}
 	if err != nil {
-		logger.SysError(fmt.Sprintf("fail to use rate limiter: %s, use in-process limiter for rescue", err))
-		return false
+		logger.SysError(fmt.Sprintf("fail to use redis rate limiter: %s", err))
+		return false, err
 	}
 
 	// Lua脚本返回的是布尔值，在Redis中布尔true会转为1，false会返回nil
 	switch v := resp.(type) {
 	case int64:
-		return v == 1
+		return v == 1, nil
 	case bool:
-		return v
+		return v, nil
 	default:
-		logger.SysError(fmt.Sprintf("unexpected return type from redis script: %T %v, use in-process limiter for rescue", resp, resp))
-		return false
+		logger.SysError(fmt.Sprintf("unexpected return type from redis script: %T %v", resp, resp))
+		return false, fmt.Errorf("unexpected return type from redis script: %T", resp)
 	}
 }

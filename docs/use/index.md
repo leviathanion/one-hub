@@ -105,4 +105,6 @@ curl --request POST \
 
 ## 进阶主题
 
+- [Realtime 配置](/use/realtime): `/v1/realtime` WebSocket 配置项、Origin 白名单、安全策略
+- [ResponsesWS 配置](/use/responses-ws): `GET /v1/responses` WebSocket 容量控制、超时管理、缓冲区
 - [Codex 渠道](/use/Codex): Codex 的 `channel.Other` 配置、`prompt_cache_key_strategy`、`websocket_mode` 与 Realtime / `/responses/compact` 用法

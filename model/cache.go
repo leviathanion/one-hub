@@ -8,6 +8,8 @@ import (
 	"one-api/common/logger"
 	"one-api/common/redis"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -23,6 +25,156 @@ var (
 
 	OldUserTokensCacheKey = "old_user_tokens_cache"
 )
+
+var userQuotaCacheRepairQueue = map[int]userQuotaCacheRepairJob{}
+var userQuotaCacheRepairQueueMu sync.Mutex
+var userQuotaCacheRepairWorkerOnce sync.Once
+
+const (
+	userQuotaCacheRepairInitialBackoff = time.Minute
+	userQuotaCacheRepairMaxBackoff     = 30 * time.Minute
+)
+
+type userQuotaCacheRepairJob struct {
+	RefreshUserQuota   bool
+	RealtimeQuotaDelta int
+	LastReason         string
+	RetryCount         int
+	NextAttemptAt      time.Time
+}
+
+func EnqueueUserQuotaCacheRepair(userID int, reason string) {
+	if userID <= 0 {
+		return
+	}
+	enqueueUserQuotaCacheRepairJob(userID, userQuotaCacheRepairJob{
+		RefreshUserQuota: true,
+		LastReason:       strings.TrimSpace(reason),
+	})
+}
+
+func EnqueueUserRealtimeQuotaCacheDecreaseRepair(userID int, delta int, reason string) {
+	if userID <= 0 || delta <= 0 {
+		return
+	}
+	enqueueUserQuotaCacheRepairJob(userID, userQuotaCacheRepairJob{
+		RealtimeQuotaDelta: delta,
+		LastReason:         strings.TrimSpace(reason),
+	})
+}
+
+func enqueueUserQuotaCacheRepairJob(userID int, job userQuotaCacheRepairJob) {
+	if userID <= 0 {
+		return
+	}
+	userQuotaCacheRepairQueueMu.Lock()
+	defer userQuotaCacheRepairQueueMu.Unlock()
+	if userQuotaCacheRepairQueue == nil {
+		userQuotaCacheRepairQueue = map[int]userQuotaCacheRepairJob{}
+	}
+
+	existing := userQuotaCacheRepairQueue[userID]
+	existing.RefreshUserQuota = existing.RefreshUserQuota || job.RefreshUserQuota
+	existing.RealtimeQuotaDelta += job.RealtimeQuotaDelta
+	if reason := strings.TrimSpace(job.LastReason); reason != "" {
+		existing.LastReason = reason
+	}
+	if job.RetryCount > existing.RetryCount {
+		existing.RetryCount = job.RetryCount
+	}
+	if existing.NextAttemptAt.IsZero() || (!job.NextAttemptAt.IsZero() && job.NextAttemptAt.After(existing.NextAttemptAt)) {
+		existing.NextAttemptAt = job.NextAttemptAt
+	}
+	if !existing.RefreshUserQuota && existing.RealtimeQuotaDelta <= 0 {
+		delete(userQuotaCacheRepairQueue, userID)
+		return
+	}
+	userQuotaCacheRepairQueue[userID] = existing
+}
+
+func StartUserQuotaCacheRepairWorker(ctx context.Context, interval time.Duration) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	userQuotaCacheRepairWorkerOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					RepairQueuedUserQuotaCachesOnce(ctx)
+				}
+			}
+		}()
+	})
+}
+
+func RepairQueuedUserQuotaCachesOnce(ctx context.Context) int {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	repaired := 0
+
+	userQuotaCacheRepairQueueMu.Lock()
+	jobs := userQuotaCacheRepairQueue
+	userQuotaCacheRepairQueue = map[int]userQuotaCacheRepairJob{}
+	userQuotaCacheRepairQueueMu.Unlock()
+
+	for userID, job := range jobs {
+		if userID <= 0 {
+			continue
+		}
+		now := time.Now()
+		if !job.NextAttemptAt.IsZero() && now.Before(job.NextAttemptAt) {
+			enqueueUserQuotaCacheRepairJob(userID, job)
+			continue
+		}
+		failed := userQuotaCacheRepairJob{LastReason: job.LastReason}
+		if job.RefreshUserQuota {
+			if err := CacheUpdateUserQuota(userID); err != nil {
+				logger.LogError(ctx, fmt.Sprintf("error repair user quota cache user=%d reason=%s: %v", userID, job.LastReason, err))
+				failed.RefreshUserQuota = true
+			}
+		}
+		if job.RealtimeQuotaDelta > 0 {
+			if _, err := CacheDecreaseUserRealtimeQuota(userID, job.RealtimeQuotaDelta); err != nil {
+				logger.LogError(ctx, fmt.Sprintf("error repair realtime quota cache user=%d delta=%d reason=%s: %v", userID, job.RealtimeQuotaDelta, job.LastReason, err))
+				failed.RealtimeQuotaDelta = job.RealtimeQuotaDelta
+			}
+		}
+		if failed.RefreshUserQuota || failed.RealtimeQuotaDelta > 0 {
+			failed.RetryCount = job.RetryCount + 1
+			failed.NextAttemptAt = now.Add(userQuotaCacheRepairBackoff(failed.RetryCount))
+			enqueueUserQuotaCacheRepairJob(userID, failed)
+			continue
+		}
+		repaired++
+	}
+	return repaired
+}
+
+func userQuotaCacheRepairBackoff(retryCount int) time.Duration {
+	if retryCount <= 1 {
+		return userQuotaCacheRepairInitialBackoff
+	}
+	backoff := userQuotaCacheRepairInitialBackoff
+	for i := 1; i < retryCount; i++ {
+		if backoff >= userQuotaCacheRepairMaxBackoff/2 {
+			return userQuotaCacheRepairMaxBackoff
+		}
+		backoff *= 2
+	}
+	if backoff > userQuotaCacheRepairMaxBackoff {
+		return userQuotaCacheRepairMaxBackoff
+	}
+	return backoff
+}
 
 func CacheGetTokenByKey(key string) (*Token, error) {
 	if !config.RedisEnabled {
@@ -90,6 +242,13 @@ func CacheUpdateUserQuota(id int) error {
 	}
 	err = redis.RedisSet(fmt.Sprintf(UserQuotaCacheKey, id), fmt.Sprintf("%d", quota), time.Duration(TokenCacheSeconds)*time.Second)
 	return err
+}
+
+func CacheInvalidateUserQuota(id int) error {
+	if !config.RedisEnabled {
+		return nil
+	}
+	return redis.RedisDel(fmt.Sprintf(UserQuotaCacheKey, id))
 }
 
 func CacheDecreaseUserQuota(id int, quota int) error {
@@ -169,6 +328,16 @@ func CacheDecreaseUserRealtimeQuota(id int, quota int) (int64, error) {
 	if !config.RedisEnabled {
 		return 0, nil
 	}
+	if quota > 0 {
+		key := fmt.Sprintf(UserRealtimeQuotaKey, id)
+		exists, err := redis.RedisExists(key)
+		if err != nil {
+			return 0, fmt.Errorf("检查用户实时配额缓存失败: %w", err)
+		}
+		if !exists {
+			return 0, fmt.Errorf("用户实时配额缓存不存在: user_id=%d", id)
+		}
+	}
 	return CacheUpdateUserRealtimeQuota(id, -quota)
 }
 
@@ -209,6 +378,15 @@ func CacheUpdateUserRealtimeQuota(id int, quota int) (int64, error) {
 	newValue, err := updateQuotaScript.Run(context.Background(), redis.GetRedisClient(), []string{key}, quota, int(UserRealtimeQuotaExpiration.Seconds())).Int64()
 	if err != nil {
 		return 0, fmt.Errorf("更新用户配额失败: %w", err)
+	}
+	if quota < 0 && newValue == 0 {
+		exists, existsErr := redis.RedisExists(key)
+		if existsErr != nil {
+			return 0, fmt.Errorf("检查用户实时配额缓存失败: %w", existsErr)
+		}
+		if !exists {
+			return 0, fmt.Errorf("用户实时配额缓存不存在: user_id=%d", id)
+		}
 	}
 
 	return newValue, nil

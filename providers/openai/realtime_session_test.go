@@ -45,6 +45,42 @@ type failingOpenAIRealtimeObserver struct {
 	observeErr error
 }
 
+type failingAdmissionOpenAIRealtimeObserver struct {
+	recordingOpenAIRealtimeObserver
+	mu            sync.Mutex
+	admitErr      error
+	admitCount    int
+	rollbackCount int
+}
+
+type recordingOpenAIReadDeadlineConn struct {
+	net.Conn
+	mu            sync.Mutex
+	readDeadlines []time.Time
+}
+
+func (c *recordingOpenAIReadDeadlineConn) SetReadDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.readDeadlines = append(c.readDeadlines, t)
+	c.mu.Unlock()
+	return c.Conn.SetReadDeadline(t)
+}
+
+func (c *recordingOpenAIReadDeadlineConn) lastReadDeadline() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.readDeadlines) == 0 {
+		return time.Time{}
+	}
+	return c.readDeadlines[len(c.readDeadlines)-1]
+}
+
+func (c *recordingOpenAIReadDeadlineConn) readDeadlineCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.readDeadlines)
+}
+
 func (r *recordingOpenAIRealtimeObserver) ObserveTurnUsage(usage *types.UsageEvent) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -78,6 +114,15 @@ func (r *recordingOpenAIRealtimeObserver) lastPayload() runtimesession.TurnFinal
 		return runtimesession.TurnFinalizePayload{}
 	}
 	return r.finalized[len(r.finalized)-1]
+}
+
+func (r *recordingOpenAIRealtimeObserver) payloadAt(index int) runtimesession.TurnFinalizePayload {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if index < 0 || index >= len(r.finalized) {
+		return runtimesession.TurnFinalizePayload{}
+	}
+	return r.finalized[index]
 }
 
 func (r *recordingOpenAIRealtimeObserver) lastObservedUsage() *types.UsageEvent {
@@ -140,6 +185,27 @@ func (o *blockingOpenAIRealtimeObserver) releaseObserve() {
 func (r *failingOpenAIRealtimeObserver) ObserveTurnUsage(usage *types.UsageEvent) error {
 	_ = r.recordingOpenAIRealtimeObserver.ObserveTurnUsage(usage)
 	return r.observeErr
+}
+
+func (r *failingAdmissionOpenAIRealtimeObserver) AdmitTurn() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.admitCount++
+	return r.admitErr
+}
+
+func (r *failingAdmissionOpenAIRealtimeObserver) RollbackTurnAdmission(reason string) error {
+	_ = reason
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rollbackCount++
+	return nil
+}
+
+func (r *failingAdmissionOpenAIRealtimeObserver) counts() (int, int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.admitCount, r.rollbackCount
 }
 
 func waitForOpenAIRealtimeFinalize(t *testing.T, recorder *recordingOpenAIRealtimeObserver, want int, timeout time.Duration) {
@@ -225,7 +291,7 @@ func TestOpenAIRealtimeSessionForwardsBootstrapAndFinalizesTurn(t *testing.T) {
 	recorder := &recordingOpenAIRealtimeObserver{}
 	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return recorder })
 
-	messageType, payload, usage, err := session.Recv(context.Background())
+	messageType, payload, usage, _, err := session.Recv(context.Background())
 	if err != nil {
 		t.Fatalf("expected bootstrap recv without error, got %v", err)
 	}
@@ -240,7 +306,7 @@ func TestOpenAIRealtimeSessionForwardsBootstrapAndFinalizesTurn(t *testing.T) {
 		t.Fatalf("expected response.create send to succeed, got %v", err)
 	}
 
-	_, payload, usage, err = session.Recv(context.Background())
+	_, payload, usage, _, err = session.Recv(context.Background())
 	if err != nil {
 		t.Fatalf("expected terminal recv without error, got %v", err)
 	}
@@ -298,7 +364,7 @@ func TestOpenAIRealtimeSessionDeduplicatesUsageSnapshots(t *testing.T) {
 		t.Fatalf("expected response.create send to succeed, got %v", err)
 	}
 
-	_, payload, usage, err := session.Recv(context.Background())
+	_, payload, usage, _, err := session.Recv(context.Background())
 	if err != nil {
 		t.Fatalf("expected snapshot response.created recv without error, got %v", err)
 	}
@@ -309,7 +375,7 @@ func TestOpenAIRealtimeSessionDeduplicatesUsageSnapshots(t *testing.T) {
 		t.Fatalf("expected first usage delta to equal initial snapshot, got %+v", usage)
 	}
 
-	_, payload, usage, err = session.Recv(context.Background())
+	_, payload, usage, _, err = session.Recv(context.Background())
 	if err != nil {
 		t.Fatalf("expected snapshot response.done recv without error, got %v", err)
 	}
@@ -365,7 +431,7 @@ func TestOpenAIRealtimeSessionPropagatesObserverUsageErrors(t *testing.T) {
 		t.Fatalf("expected response.create send to succeed, got %v", err)
 	}
 
-	messageType, payload, usage, err := session.Recv(context.Background())
+	messageType, payload, usage, _, err := session.Recv(context.Background())
 	if err == nil {
 		t.Fatal("expected observer usage error to terminate the session")
 	}
@@ -373,15 +439,14 @@ func TestOpenAIRealtimeSessionPropagatesObserverUsageErrors(t *testing.T) {
 		t.Fatalf("expected websocket text payload, got %d", messageType)
 	}
 	if !strings.Contains(string(payload), `"response.done"`) {
-		t.Fatalf("expected terminal response payload before observer error, got %q", payload)
+		t.Fatalf("expected provider terminal response payload before quota error, got %q", payload)
 	}
 	if usage == nil || usage.TotalTokens != 8 {
 		t.Fatalf("expected terminal usage to remain attached to the forwarded payload, got %+v", usage)
 	}
-
 	errorPayload := string(runtimesession.ClientPayloadFromError(err))
-	if !strings.Contains(errorPayload, "user quota is not enough") || !strings.Contains(errorPayload, "system_error") {
-		t.Fatalf("expected structured quota error payload, got %q", errorPayload)
+	if !strings.Contains(errorPayload, `"code":"quota_exhausted"`) {
+		t.Fatalf("expected client-visible quota error payload, got err=%v payload=%q", err, errorPayload)
 	}
 
 	waitForOpenAIRealtimeFinalize(t, &observer.recordingOpenAIRealtimeObserver, 1, 2*time.Second)
@@ -390,10 +455,51 @@ func TestOpenAIRealtimeSessionPropagatesObserverUsageErrors(t *testing.T) {
 	}
 	finalized := observer.lastPayload()
 	if finalized.TerminationReason != "quota_exhausted" {
-		t.Fatalf("expected quota observer failure to finalize with quota_exhausted, got %q", finalized.TerminationReason)
+		t.Fatalf("expected observer failure to finalize as quota_exhausted, got %q", finalized.TerminationReason)
 	}
 	if finalized.Usage == nil || finalized.Usage.TotalTokens != 8 {
 		t.Fatalf("expected finalized usage to preserve the terminal snapshot, got %+v", finalized.Usage)
+	}
+}
+
+func TestOpenAIRealtimeSessionAdmissionFailureDoesNotWriteUpstream(t *testing.T) {
+	receivedPayload := make(chan []byte, 1)
+	server := newOpenAIRealtimeTestServer(t, func(conn *websocket.Conn) {
+		_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		_, payload, err := conn.ReadMessage()
+		if err == nil {
+			receivedPayload <- payload
+		}
+	})
+	defer server.Close()
+
+	provider := newOpenAIRealtimeTestProvider(server.URL)
+	session, errWithCode := provider.OpenRealtimeSession("gpt-4o-realtime-preview")
+	if errWithCode != nil {
+		t.Fatalf("expected realtime session to open, got %v", errWithCode)
+	}
+	defer session.Abort("test_cleanup")
+
+	observer := &failingAdmissionOpenAIRealtimeObserver{admitErr: errors.New("user quota is not enough")}
+	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return observer })
+
+	err := session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","response":{"input":[]}}`))
+	if err == nil {
+		t.Fatal("expected admission failure to reject response.create")
+	}
+	errorPayload := string(runtimesession.ClientPayloadFromError(err))
+	if !strings.Contains(errorPayload, `"code":"quota_exhausted"`) {
+		t.Fatalf("expected client-visible quota error payload, got err=%v payload=%q", err, errorPayload)
+	}
+	admitCount, rollbackCount := observer.counts()
+	if admitCount != 1 || rollbackCount != 1 {
+		t.Fatalf("expected one admission and rollback, got admit=%d rollback=%d", admitCount, rollbackCount)
+	}
+
+	select {
+	case payload := <-receivedPayload:
+		t.Fatalf("expected admission failure not to write upstream, got %q", payload)
+	case <-time.After(300 * time.Millisecond):
 	}
 }
 
@@ -422,7 +528,7 @@ func TestOpenAIRealtimeSessionPassesThroughErrorEventsWithoutClosing(t *testing.
 		session.Abort("test_cleanup")
 	}()
 
-	_, payload, usage, err := session.Recv(context.Background())
+	_, payload, usage, _, err := session.Recv(context.Background())
 	if err != nil {
 		t.Fatalf("expected raw upstream error event to be forwarded without closing session, got %v", err)
 	}
@@ -433,7 +539,7 @@ func TestOpenAIRealtimeSessionPassesThroughErrorEventsWithoutClosing(t *testing.
 		t.Fatalf("expected raw upstream error event payload, got %q", payload)
 	}
 
-	_, payload, usage, err = session.Recv(context.Background())
+	_, payload, usage, _, err = session.Recv(context.Background())
 	if err != nil {
 		t.Fatalf("expected session to remain open after upstream error event, got %v", err)
 	}
@@ -488,7 +594,7 @@ func TestOpenAIRealtimeSessionErrorEventFinalizesTurnAndReleasesSessionBusy(t *t
 		t.Fatalf("expected first response.create send to succeed, got %v", err)
 	}
 
-	_, payload, usage, err := session.Recv(context.Background())
+	_, payload, usage, _, err := session.Recv(context.Background())
 	if err != nil {
 		t.Fatalf("expected upstream error event to be forwarded without closing the session, got %v", err)
 	}
@@ -504,7 +610,7 @@ func TestOpenAIRealtimeSessionErrorEventFinalizesTurnAndReleasesSessionBusy(t *t
 	}
 
 	waitForOpenAIRealtimeFinalize(t, recorder, 1, 2*time.Second)
-	if got := recorder.lastPayload().TerminationReason; got != types.EventTypeError {
+	if got := recorder.payloadAt(0).TerminationReason; got != types.EventTypeError {
 		t.Fatalf("expected superseded error turn to finalize with reason %q, got %q", types.EventTypeError, got)
 	}
 
@@ -514,7 +620,7 @@ func TestOpenAIRealtimeSessionErrorEventFinalizesTurnAndReleasesSessionBusy(t *t
 		t.Fatal("timed out waiting for upstream to receive the second response.create request")
 	}
 
-	_, payload, usage, err = session.Recv(context.Background())
+	_, payload, usage, _, err = session.Recv(context.Background())
 	if err != nil {
 		t.Fatalf("expected recovery response.done without error, got %v", err)
 	}
@@ -581,7 +687,7 @@ func TestOpenAIRealtimeSessionIgnoresLateFinalizedResponseUsageAfterNewTurnStart
 		t.Fatalf("expected first response.create send to succeed, got %v", err)
 	}
 
-	_, payload, usage, err := session.Recv(context.Background())
+	_, payload, usage, _, err := session.Recv(context.Background())
 	if err != nil {
 		t.Fatalf("expected first response.created without error, got %v", err)
 	}
@@ -592,7 +698,7 @@ func TestOpenAIRealtimeSessionIgnoresLateFinalizedResponseUsageAfterNewTurnStart
 		t.Fatalf("expected first response.created not to carry usage, got %+v", usage)
 	}
 
-	_, payload, usage, err = session.Recv(context.Background())
+	_, payload, usage, _, err = session.Recv(context.Background())
 	if err != nil {
 		t.Fatalf("expected passthrough error event without closing the session, got %v", err)
 	}
@@ -616,7 +722,7 @@ func TestOpenAIRealtimeSessionIgnoresLateFinalizedResponseUsageAfterNewTurnStart
 		t.Fatalf("expected first finalized turn to use error termination, got %q", firstFinalize.TerminationReason)
 	}
 
-	_, payload, usage, err = session.Recv(context.Background())
+	_, payload, usage, _, err = session.Recv(context.Background())
 	if err != nil {
 		t.Fatalf("expected second response.created without error, got %v", err)
 	}
@@ -627,7 +733,7 @@ func TestOpenAIRealtimeSessionIgnoresLateFinalizedResponseUsageAfterNewTurnStart
 		t.Fatalf("expected second response.created not to carry usage, got %+v", usage)
 	}
 
-	_, payload, usage, err = session.Recv(context.Background())
+	_, payload, usage, _, err = session.Recv(context.Background())
 	if err != nil {
 		t.Fatalf("expected late finalized response.done without session error, got %v", err)
 	}
@@ -646,7 +752,7 @@ func TestOpenAIRealtimeSessionIgnoresLateFinalizedResponseUsageAfterNewTurnStart
 
 	close(allowCurrentDone)
 
-	_, payload, usage, err = session.Recv(context.Background())
+	_, payload, usage, _, err = session.Recv(context.Background())
 	if err != nil {
 		t.Fatalf("expected current response.done without error, got %v", err)
 	}
@@ -707,7 +813,7 @@ func TestOpenAIRealtimeSessionKeepsActiveTurnWhenResponseIDChangesMidTurn(t *tes
 	}
 
 	for _, want := range []string{`"resp_initial"`, `"resp_reissued"`} {
-		_, payload, usage, err := session.Recv(context.Background())
+		_, payload, usage, _, err := session.Recv(context.Background())
 		if err != nil {
 			t.Fatalf("expected response.created payload %s without error, got %v", want, err)
 		}
@@ -719,7 +825,7 @@ func TestOpenAIRealtimeSessionKeepsActiveTurnWhenResponseIDChangesMidTurn(t *tes
 		}
 	}
 
-	_, payload, usage, err := session.Recv(context.Background())
+	_, payload, usage, _, err := session.Recv(context.Background())
 	if err != nil {
 		t.Fatalf("expected reissued response.done without error, got %v", err)
 	}
@@ -799,7 +905,7 @@ func TestOpenAIRealtimeSessionIgnoresLateResponseIDSeenEarlierInFinalizedTurn(t 
 	}
 
 	for _, want := range []string{`"resp_initial"`, `"resp_reissued"`} {
-		_, payload, usage, err := session.Recv(context.Background())
+		_, payload, usage, _, err := session.Recv(context.Background())
 		if err != nil {
 			t.Fatalf("expected response.created payload %s without error, got %v", want, err)
 		}
@@ -811,7 +917,7 @@ func TestOpenAIRealtimeSessionIgnoresLateResponseIDSeenEarlierInFinalizedTurn(t 
 		}
 	}
 
-	_, payload, usage, err := session.Recv(context.Background())
+	_, payload, usage, _, err := session.Recv(context.Background())
 	if err != nil {
 		t.Fatalf("expected reissued response.done without error, got %v", err)
 	}
@@ -834,7 +940,7 @@ func TestOpenAIRealtimeSessionIgnoresLateResponseIDSeenEarlierInFinalizedTurn(t 
 		t.Fatalf("expected second response.create send to succeed, got %v", err)
 	}
 
-	_, payload, usage, err = session.Recv(context.Background())
+	_, payload, usage, _, err = session.Recv(context.Background())
 	if err != nil {
 		t.Fatalf("expected current response.created without error, got %v", err)
 	}
@@ -845,7 +951,7 @@ func TestOpenAIRealtimeSessionIgnoresLateResponseIDSeenEarlierInFinalizedTurn(t 
 		t.Fatalf("expected current response.created not to carry usage, got %+v", usage)
 	}
 
-	_, payload, usage, err = session.Recv(context.Background())
+	_, payload, usage, _, err = session.Recv(context.Background())
 	if err != nil {
 		t.Fatalf("expected late initial response.done without error, got %v", err)
 	}
@@ -864,7 +970,7 @@ func TestOpenAIRealtimeSessionIgnoresLateResponseIDSeenEarlierInFinalizedTurn(t 
 
 	close(allowCurrentDone)
 
-	_, payload, usage, err = session.Recv(context.Background())
+	_, payload, usage, _, err = session.Recv(context.Background())
 	if err != nil {
 		t.Fatalf("expected current response.done without error, got %v", err)
 	}
@@ -884,7 +990,7 @@ func TestOpenAIRealtimeSessionIgnoresLateResponseIDSeenEarlierInFinalizedTurn(t 
 	}
 }
 
-func TestOpenAIRealtimeSessionCompatModeClosesOnUpstreamErrorEvent(t *testing.T) {
+func TestOpenAIRealtimeSessionCompatModePassesThroughNonFatalErrorEvent(t *testing.T) {
 	originalCompatMode := config.OpenAIRealtimeSessionCompatMode
 	config.OpenAIRealtimeSessionCompatMode = true
 	defer func() {
@@ -905,9 +1011,9 @@ func TestOpenAIRealtimeSessionCompatModeClosesOnUpstreamErrorEvent(t *testing.T)
 	}
 	defer session.Abort("test_cleanup")
 
-	_, payload, usage, err := session.Recv(context.Background())
-	if err == nil {
-		t.Fatal("expected compat mode to surface upstream error as terminal error")
+	_, payload, usage, _, err := session.Recv(context.Background())
+	if err != nil {
+		t.Fatalf("expected non-fatal compat error to pass through without closing, got %v", err)
 	}
 	if usage != nil {
 		t.Fatalf("expected compat mode error event not to carry usage, got %+v", usage)
@@ -989,7 +1095,7 @@ func TestOpenAIRealtimeSessionRejectsConcurrentResponseCreate(t *testing.T) {
 
 	close(allowDone)
 
-	_, payload, usage, err := session.Recv(context.Background())
+	_, payload, usage, _, err := session.Recv(context.Background())
 	if err != nil {
 		t.Fatalf("expected first turn to still finalize successfully, got %v", err)
 	}
@@ -1016,6 +1122,81 @@ func TestOpenAIRealtimeSessionRejectsConcurrentResponseCreate(t *testing.T) {
 
 	if got := len(upstreamCreates); got != 1 {
 		t.Fatalf("expected only one upstream response.create to be forwarded, got %d", got)
+	}
+}
+
+func TestOpenAIResponsesWSStartTurnUsesTimerWithoutMutatingReadDeadline(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade failed: %v", err)
+			return
+		}
+		defer conn.Close()
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	var recordingConn *recordingOpenAIReadDeadlineConn
+	dialer := websocket.Dialer{
+		NetDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			rawConn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			recordingConn = &recordingOpenAIReadDeadlineConn{Conn: rawConn}
+			return recordingConn, nil
+		},
+	}
+	wsURL := "ws" + server.URL[len("http"):]
+	conn, _, err := dialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("failed to dial recording websocket: %v", err)
+	}
+	defer conn.Close()
+	if recordingConn == nil {
+		t.Fatal("expected websocket dial to use recording connection")
+	}
+
+	session := newOpenAIRealtimeHelperSession()
+	session.conn = conn
+	session.responsesWS = true
+	if err := session.setReadDeadlineForCurrentState(); err != nil {
+		t.Fatalf("expected idle read deadline refresh to succeed, got %v", err)
+	}
+	idleDeadline := recordingConn.lastReadDeadline()
+	if idleDeadline.IsZero() {
+		t.Fatal("expected idle read deadline to be recorded")
+	}
+	deadlineCount := recordingConn.readDeadlineCount()
+
+	startedTurn, _, err := session.startTurn()
+	if err != nil {
+		t.Fatalf("expected startTurn to succeed, got %v", err)
+	}
+	if startedTurn == nil {
+		t.Fatal("expected startTurn to return active turn")
+	}
+	if got := recordingConn.readDeadlineCount(); got != deadlineCount {
+		t.Fatalf("expected startTurn not to call SetReadDeadline from writer path, before=%d after=%d", deadlineCount, got)
+	}
+	if got := recordingConn.lastReadDeadline(); !got.Equal(idleDeadline) {
+		t.Fatalf("expected read deadline to remain owned by read path, idle=%s got=%s", idleDeadline, got)
+	}
+	session.turnReadMu.Lock()
+	timerArmed := session.turnReadTimer != nil
+	session.turnReadMu.Unlock()
+	if !timerArmed {
+		t.Fatal("expected active turn read timeout timer to be armed")
+	}
+
+	session.rollbackTurn(startedTurn)
+	session.turnReadMu.Lock()
+	timerStopped := session.turnReadTimer == nil
+	session.turnReadMu.Unlock()
+	if !timerStopped {
+		t.Fatal("expected rollback to stop active turn read timeout timer")
 	}
 }
 
@@ -1116,7 +1297,7 @@ func TestOpenAIRealtimeSessionAbortFinalizesInflightTurn(t *testing.T) {
 		t.Fatal("timed out waiting for in-flight abort response")
 	}
 
-	_, payload, usage, err := session.Recv(context.Background())
+	_, payload, usage, _, err := session.Recv(context.Background())
 	if err != nil {
 		t.Fatalf("expected in-flight payload before abort, got %v", err)
 	}
@@ -1169,7 +1350,7 @@ func TestOpenAIRealtimeSessionUpstreamCloseFinalizesInflightTurn(t *testing.T) {
 		t.Fatalf("expected upstream-close response.create send to succeed, got %v", err)
 	}
 
-	_, payload, usage, err := session.Recv(context.Background())
+	_, payload, usage, _, err := session.Recv(context.Background())
 	if err != nil {
 		t.Fatalf("expected in-flight payload before upstream close, got %v", err)
 	}
@@ -1239,7 +1420,7 @@ func TestOpenAIRealtimeSessionCloseFinalizesInflightTurn(t *testing.T) {
 		t.Fatal("timed out waiting for local close response")
 	}
 
-	_, payload, usage, err := session.Recv(context.Background())
+	_, payload, usage, _, err := session.Recv(context.Background())
 	if err != nil {
 		t.Fatalf("expected in-flight payload before local close, got %v", err)
 	}
@@ -1349,6 +1530,7 @@ func newOpenAIRealtimeTestProvider(serverURL string) *OpenAIProvider {
 	proxy := ""
 	channel := &model.Channel{
 		Key:   "sk-test",
+		Other: `{"responses_ws_self_hosted":true}`,
 		Proxy: &proxy,
 	}
 	return CreateOpenAIProvider(channel, serverURL)

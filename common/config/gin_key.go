@@ -12,4 +12,6 @@ const (
 	GinChannelAffinityMetaKey   = "channel_affinity_meta"
 	GinRoutingGroupKey          = "routing_group"
 	GinRoutingGroupSourceKey    = "routing_group_source"
+	GinResponsesWSClientIPKey   = "responses_ws_client_ip"
+	GinResponsesWSUserAgentKey  = "responses_ws_user_agent"
 )

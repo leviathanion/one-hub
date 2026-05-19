@@ -6,16 +6,20 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"one-api/common/config"
 	"one-api/common/logger"
+	"one-api/common/requester"
 	"one-api/model"
 	runtimesession "one-api/runtime/session"
 	"one-api/types"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"github.com/spf13/viper"
 	"go.uber.org/zap"
 )
 
@@ -66,11 +70,15 @@ func TestOpenAIRealtimeSessionHelperNormalizationAndIDs(t *testing.T) {
 	provider := &OpenAIProvider{}
 	provider.Context = ctx
 
-	if got := readOpenAIRealtimeSessionID(provider); got != "client-session" {
-		t.Fatalf("expected request session id, got %q", got)
+	if got, errWithCode := readOpenAIRealtimeSessionID(provider); errWithCode != nil || got != "client-session" {
+		t.Fatalf("expected request session id, got %q err=%v", got, errWithCode)
 	}
-	if got := readOpenAIRealtimeSessionID(&OpenAIProvider{}); got == "" {
-		t.Fatal("expected helper to generate fallback realtime session id")
+	if got, errWithCode := readOpenAIRealtimeSessionID(&OpenAIProvider{}); errWithCode != nil || got == "" {
+		t.Fatalf("expected helper to generate fallback realtime session id, got %q err=%v", got, errWithCode)
+	}
+	ctx.Request.Header.Set("X-Session-Id", strings.Repeat("x", runtimesession.ClientSessionIDMaxLen+1))
+	if _, errWithCode := readOpenAIRealtimeSessionID(provider); errWithCode == nil || errWithCode.Code != "invalid_session_id" {
+		t.Fatalf("expected invalid session id to be rejected, got %v", errWithCode)
 	}
 
 	binaryPayload := []byte{1, 2, 3}
@@ -125,6 +133,27 @@ func TestOpenAIRealtimeSessionHelperNormalizationAndIDs(t *testing.T) {
 		t.Fatalf("expected explicit response model to win, got %q", got)
 	}
 
+	rawPreseeded := []byte(`{"type":"response.create","response":{"model":"o1","input":[],"unknown_number":12345678901234567890}}`)
+	if normalized, _, err := normalizeOpenAIRealtimeClientPayload(rawPreseeded, websocket.TextMessage, "gpt-4o", false); err != nil || string(normalized) != string(rawPreseeded) {
+		t.Fatalf("expected preseeded response.create to remain byte-identical, normalized=%q err=%v", string(normalized), err)
+	}
+
+	withUnknownNumber, _, err := normalizeOpenAIRealtimeClientPayload([]byte(`{"type":"response.create","response":{"input":[],"unknown_number":12345678901234567890}}`), websocket.TextMessage, "gpt-4o", false)
+	if err != nil {
+		t.Fatalf("expected raw-message normalization to succeed, got %v", err)
+	}
+	var rawMessage map[string]json.RawMessage
+	if err := json.Unmarshal(withUnknownNumber, &rawMessage); err != nil {
+		t.Fatalf("failed to decode raw-message normalized payload: %v", err)
+	}
+	responseRaw := map[string]json.RawMessage{}
+	if err := json.Unmarshal(rawMessage["response"], &responseRaw); err != nil {
+		t.Fatalf("failed to decode normalized response payload: %v", err)
+	}
+	if string(responseRaw["unknown_number"]) != "12345678901234567890" {
+		t.Fatalf("expected unknown numeric field to preserve raw precision, got %s", responseRaw["unknown_number"])
+	}
+
 	cancelPayload, eventType, err := normalizeOpenAIRealtimeClientPayload([]byte(`{"type":"response.cancel"}`), websocket.TextMessage, "gpt-4o", false)
 	if err != nil || eventType != "response.cancel" || string(cancelPayload) != `{"type":"response.cancel"}` {
 		t.Fatalf("expected non-response.create realtime payload to pass through, payload=%q event=%q err=%v", string(cancelPayload), eventType, err)
@@ -143,6 +172,245 @@ func TestOpenAIRealtimeSessionHelperNormalizationAndIDs(t *testing.T) {
 	responseEvent := &types.ResponseEvent{Usage: &types.UsageEvent{TotalTokens: 9}}
 	if usage := openAIRealtimeResponseUsage(responseEvent); usage == nil || usage.TotalTokens != 9 {
 		t.Fatalf("expected response usage passthrough, got %+v", usage)
+	}
+}
+
+func TestOpenAIRealtimeReadLoopRecoversPanicAndClosesSession(t *testing.T) {
+	originalLogger := logger.Logger
+	logger.Logger = zap.NewNop()
+	t.Cleanup(func() {
+		logger.Logger = originalLogger
+	})
+
+	session := &openAIRealtimeSession{
+		model:     "gpt-5",
+		sessionID: "panic-session",
+		recvCh:    make(chan openAIRealtimeOutbound, 1),
+		closed:    make(chan struct{}),
+		detached:  make(chan struct{}),
+	}
+
+	session.readLoop()
+
+	select {
+	case <-session.closed:
+	default:
+		t.Fatal("expected read loop panic recovery to close the session")
+	}
+
+	var gotPanicPayload bool
+	for outbound := range session.recvCh {
+		if strings.Contains(string(outbound.payload), "provider_panic") {
+			gotPanicPayload = true
+		}
+	}
+	if !gotPanicPayload {
+		t.Fatal("expected read loop panic recovery to enqueue a provider_panic payload")
+	}
+}
+
+func TestOpenAIRealtimePingControlWriteDoesNotWaitForBusinessWriteLock(t *testing.T) {
+	conn, cleanup := newOpenAIRealtimeConnPair(t)
+	defer cleanup()
+
+	session := newOpenAIRealtimeHelperSession()
+	session.conn = conn
+	session.configureConn()
+	if session.controlWriter == nil {
+		t.Fatal("expected openai realtime session to configure control frame writer")
+	}
+	defer session.close("test_done")
+
+	session.writeMu.Lock()
+	defer session.writeMu.Unlock()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- conn.PingHandler()("ping")
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("ping control write waited for business write lock")
+	}
+}
+
+func TestOpenAIResponsesWSDefersReadUntilRecvAndFiltersSessionCreated(t *testing.T) {
+	releaseDone := make(chan struct{})
+	server := newOpenAIRealtimeTestServer(t, func(conn *websocket.Conn) {
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"id":"sess_private"}}`)); err != nil {
+			t.Errorf("failed to write private bootstrap event: %v", err)
+			return
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_visible","status":"in_progress"}}`)); err != nil {
+			t.Errorf("failed to write visible responses event: %v", err)
+			return
+		}
+		<-releaseDone
+	})
+	defer server.Close()
+
+	provider := newOpenAIRealtimeTestProvider(server.URL)
+	session, errWithCode := provider.OpenRealtimeSessionWithOptions("gpt-5", runtimesession.RealtimeOpenOptions{
+		PreferredTransport: runtimesession.TransportModeResponsesWS,
+		RequireWS:          true,
+	})
+	if errWithCode != nil {
+		t.Fatalf("expected responses websocket session to open, got %v", errWithCode)
+	}
+	defer func() {
+		close(releaseDone)
+		session.Abort("test_cleanup")
+	}()
+
+	typed := session.(*openAIRealtimeSession)
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case outbound := <-typed.recvCh:
+		t.Fatalf("expected ResponsesWS provider read to be deferred until Recv, got queued payload %q", outbound.payload)
+	default:
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, payload, _, _, err := session.Recv(ctx)
+	if err != nil {
+		t.Fatalf("expected first Recv to return provider event, got %v", err)
+	}
+	if strings.Contains(string(payload), "session.created") {
+		t.Fatalf("expected private session.created bootstrap to be filtered, got %q", payload)
+	}
+	if !strings.Contains(string(payload), "response.created") || !strings.Contains(string(payload), "resp_visible") {
+		t.Fatalf("expected visible responses event, got %q", payload)
+	}
+}
+
+func TestOpenAIRequireWSOnlyUsesResponsesWSWithoutCompatMode(t *testing.T) {
+	originalCompatMode := config.OpenAIRealtimeSessionCompatMode
+	config.OpenAIRealtimeSessionCompatMode = true
+	defer func() {
+		config.OpenAIRealtimeSessionCompatMode = originalCompatMode
+	}()
+
+	releaseDone := make(chan struct{})
+	server := newOpenAIRealtimeTestServer(t, func(conn *websocket.Conn) {
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"id":"sess_private"}}`)); err != nil {
+			t.Errorf("failed to write private bootstrap event: %v", err)
+			return
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_visible","status":"in_progress"}}`)); err != nil {
+			t.Errorf("failed to write visible responses event: %v", err)
+			return
+		}
+		<-releaseDone
+	})
+	defer server.Close()
+
+	provider := newOpenAIRealtimeTestProvider(server.URL)
+	session, errWithCode := provider.OpenRealtimeSessionWithOptions("gpt-5", runtimesession.RealtimeOpenOptions{
+		RequireWS: true,
+	})
+	if errWithCode != nil {
+		t.Fatalf("expected RequireWS responses websocket session to open, got %v", errWithCode)
+	}
+	defer func() {
+		close(releaseDone)
+		session.Abort("test_cleanup")
+	}()
+
+	typed := session.(*openAIRealtimeSession)
+	if !typed.responsesWS {
+		t.Fatalf("expected RequireWS to select ResponsesWS")
+	}
+	if typed.compatMode {
+		t.Fatalf("expected ResponsesWS compat mode to be derived from !responsesWS")
+	}
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case outbound := <-typed.recvCh:
+		t.Fatalf("expected RequireWS ResponsesWS read to be deferred until Recv, got queued payload %q", outbound.payload)
+	default:
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, payload, _, _, err := session.Recv(ctx)
+	if err != nil {
+		t.Fatalf("expected first Recv to return provider event, got %v", err)
+	}
+	if strings.Contains(string(payload), "session.created") {
+		t.Fatalf("expected private session.created bootstrap to be filtered, got %q", payload)
+	}
+	if !strings.Contains(string(payload), "response.created") || !strings.Contains(string(payload), "resp_visible") {
+		t.Fatalf("expected visible responses event, got %q", payload)
+	}
+}
+
+func TestOpenAIResponsesWSReadTimeoutFollowsTurnState(t *testing.T) {
+	session := newOpenAIRealtimeHelperSession()
+	session.responsesWS = true
+	if got := session.currentReadTimeout(); got != config.ResponsesWSIdleTimeout() {
+		t.Fatalf("expected idle ResponsesWS read timeout to use configured idle timeout, got %s", got)
+	}
+
+	session.turn = newOpenAIRealtimeTurnState(1, time.Now(), nil)
+	if got := session.currentReadTimeout(); got != openAIRealtimeReadTimeout {
+		t.Fatalf("expected active ResponsesWS turn to use realtime read timeout, got %s", got)
+	}
+
+	outbound, shouldClose := session.observeSupplierMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_done","status":"completed"}}`))
+	if shouldClose {
+		t.Fatalf("expected terminal ResponsesWS event to keep session open, outbound=%+v", outbound)
+	}
+	if session.turn != nil {
+		t.Fatalf("expected terminal ResponsesWS event to clear active turn")
+	}
+	if got := session.currentReadTimeout(); got != config.ResponsesWSIdleTimeout() {
+		t.Fatalf("expected post-terminal ResponsesWS read timeout to return to idle timeout, got %s", got)
+	}
+}
+
+func TestOpenAIRealtimeConfigureConnAppliesUpstreamReadLimit(t *testing.T) {
+	const limit = int64(64)
+	const oversizedPayloadBytes = 512
+
+	previousLimit := viper.Get("realtime.websocket_read_limit")
+	viper.Set("realtime.websocket_read_limit", limit)
+	t.Cleanup(func() {
+		viper.Set("realtime.websocket_read_limit", previousLimit)
+	})
+
+	releaseWrite := make(chan struct{})
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade failed: %v", err)
+			return
+		}
+		defer conn.Close()
+		<-releaseWrite
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(strings.Repeat("x", oversizedPayloadBytes))); err != nil {
+			t.Errorf("failed to write oversized websocket frame: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + server.URL[len("http"):]
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("failed to dial helper websocket: %v", err)
+	}
+	defer conn.Close()
+
+	session := &openAIRealtimeSession{conn: conn}
+	session.configureConn()
+	close(releaseWrite)
+
+	_, payload, err := conn.ReadMessage()
+	if err == nil {
+		t.Fatalf("expected oversized upstream websocket frame to hit read limit, got payload length %d", len(payload))
 	}
 }
 
@@ -239,10 +507,10 @@ func TestOpenAIRealtimeSessionSelectionAndFinalizationHelpers(t *testing.T) {
 }
 
 func TestOpenAIRealtimeSessionQueueLifecycleAndSendClientGuards(t *testing.T) {
-	if messageType, payload, usage, err, handled := (*openAIRealtimeSession)(nil).recvQueuedOutbound(); !handled || !errors.Is(err, runtimesession.ErrSessionClosed) || messageType != 0 || payload != nil || usage != nil {
+	if messageType, payload, usage, _, err, handled := (*openAIRealtimeSession)(nil).recvQueuedOutbound(); !handled || !errors.Is(err, runtimesession.ErrSessionClosed) || messageType != 0 || payload != nil || usage != nil {
 		t.Fatalf("expected nil session queue read to report session closed, type=%d payload=%v usage=%v err=%v handled=%v", messageType, payload, usage, err, handled)
 	}
-	if messageType, payload, usage, err := decodeOpenAIRealtimeOutbound(openAIRealtimeOutbound{}, false); !errors.Is(err, runtimesession.ErrSessionClosed) || messageType != 0 || payload != nil || usage != nil {
+	if messageType, payload, usage, _, err := decodeOpenAIRealtimeOutbound(openAIRealtimeOutbound{}, false); !errors.Is(err, runtimesession.ErrSessionClosed) || messageType != 0 || payload != nil || usage != nil {
 		t.Fatalf("expected closed outbound decode to report session closed, type=%d payload=%v usage=%v err=%v", messageType, payload, usage, err)
 	}
 	if terminal, reason := openAIRealtimeTurnTerminal(types.EventTypeResponseDone, nil); !terminal || reason != types.EventTypeResponseDone {
@@ -253,25 +521,25 @@ func TestOpenAIRealtimeSessionQueueLifecycleAndSendClientGuards(t *testing.T) {
 	if handled := session.enqueueOutbound(openAIRealtimeOutbound{messageType: websocket.TextMessage, payload: []byte("queued")}); !handled {
 		t.Fatal("expected enqueueOutbound to queue active outbound")
 	}
-	if messageType, payload, _, err, handled := session.recvQueuedOutbound(); !handled || err != nil || messageType != websocket.TextMessage || string(payload) != "queued" {
+	if messageType, payload, _, _, err, handled := session.recvQueuedOutbound(); !handled || err != nil || messageType != websocket.TextMessage || string(payload) != "queued" {
 		t.Fatalf("expected queued outbound recv, type=%d payload=%q err=%v handled=%v", messageType, string(payload), err, handled)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, _, _, err := session.Recv(ctx); !errors.Is(err, context.Canceled) {
+	if _, _, _, _, err := session.Recv(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected canceled Recv to return context cancellation, got %v", err)
 	}
 
 	detachedSession := newOpenAIRealtimeHelperSession()
 	close(detachedSession.detached)
-	if _, _, _, err := detachedSession.Recv(context.Background()); !errors.Is(err, runtimesession.ErrSessionClosed) {
+	if _, _, _, _, err := detachedSession.Recv(context.Background()); !errors.Is(err, runtimesession.ErrSessionClosed) {
 		t.Fatalf("expected detached Recv to return session closed, got %v", err)
 	}
 
 	closedSession := newOpenAIRealtimeHelperSession()
 	close(closedSession.closed)
-	if _, _, _, err := closedSession.Recv(context.Background()); !errors.Is(err, runtimesession.ErrSessionClosed) {
+	if _, _, _, _, err := closedSession.Recv(context.Background()); !errors.Is(err, runtimesession.ErrSessionClosed) {
 		t.Fatalf("expected closed Recv to return session closed, got %v", err)
 	}
 
@@ -313,6 +581,25 @@ func TestOpenAIRealtimeSessionQueueLifecycleAndSendClientGuards(t *testing.T) {
 	close(closedEnqueueSession.closed)
 	if handled := closedEnqueueSession.enqueueOutbound(openAIRealtimeOutbound{}); handled {
 		t.Fatal("expected closed realtime session enqueue to fail")
+	}
+
+	backpressuredSession := &openAIRealtimeSession{
+		recvCh:   make(chan openAIRealtimeOutbound, 1),
+		closed:   make(chan struct{}),
+		detached: make(chan struct{}),
+	}
+	backpressuredSession.recvCh <- openAIRealtimeOutbound{messageType: websocket.TextMessage}
+	originalOutboundTimeout := openAIRealtimeOutboundBackpressureTimeout
+	openAIRealtimeOutboundBackpressureTimeout = 10 * time.Millisecond
+	t.Cleanup(func() {
+		openAIRealtimeOutboundBackpressureTimeout = originalOutboundTimeout
+	})
+	start := time.Now()
+	if handled := backpressuredSession.enqueueOutbound(openAIRealtimeOutbound{messageType: websocket.TextMessage}); handled {
+		t.Fatal("expected backpressured realtime session enqueue to fail")
+	}
+	if elapsed := time.Since(start); elapsed < openAIRealtimeOutboundBackpressureTimeout {
+		t.Fatalf("expected enqueue to wait for bounded backpressure timeout, elapsed=%s", elapsed)
 	}
 
 	(&openAIRealtimeSession{}).configureConn()
@@ -365,6 +652,44 @@ func TestOpenAIRealtimeSessionQueueLifecycleAndSendClientGuards(t *testing.T) {
 	}
 }
 
+func TestOpenAIRealtimeActiveTurnTimeoutQueuesClientVisibleError(t *testing.T) {
+	session := newOpenAIRealtimeHelperSession()
+	session.responsesWS = true
+	startedTurn, finalizers, err := session.startTurn()
+	if err != nil || startedTurn == nil || len(finalizers) != 0 {
+		t.Fatalf("expected active turn fixture, turn=%+v finalizers=%d err=%v", startedTurn, len(finalizers), err)
+	}
+
+	session.turnReadMu.Lock()
+	generation := session.turnReadGen
+	session.turnReadMu.Unlock()
+	session.handleActiveTurnReadTimeout(startedTurn.seq, generation)
+
+	select {
+	case outbound := <-session.recvCh:
+		if outbound.messageType != websocket.TextMessage {
+			t.Fatalf("expected websocket text error frame, got type=%d", outbound.messageType)
+		}
+		if !strings.Contains(string(outbound.payload), "provider_read_timeout") {
+			t.Fatalf("expected provider_read_timeout payload, got %s", string(outbound.payload))
+		}
+		if outbound.origin != runtimesession.RealtimePayloadOriginProxyLocal {
+			t.Fatalf("expected proxy-local timeout payload, got origin=%v", outbound.origin)
+		}
+		if !errors.Is(outbound.err, runtimesession.ErrSessionClosed) {
+			t.Fatalf("expected timeout outbound to close session, got err=%v", outbound.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected active turn timeout to enqueue a client-visible error frame")
+	}
+
+	select {
+	case <-session.closed:
+	default:
+		t.Fatal("expected active turn timeout to close the session")
+	}
+}
+
 func TestOpenAIRealtimeSessionReadRealtimeConnHeaders(t *testing.T) {
 	proxy := ""
 	provider := CreateOpenAIProvider(&model.Channel{Key: "sk-test", Proxy: &proxy}, "https://api.openai.com")
@@ -406,7 +731,7 @@ func TestOpenAIRealtimeSessionConnectionErrorsAndAzureHeaders(t *testing.T) {
 
 	t.Run("request failures wrap websocket dial errors", func(t *testing.T) {
 		proxy := ""
-		provider := CreateOpenAIProvider(&model.Channel{Key: "sk-test", Proxy: &proxy}, "http://127.0.0.1:1")
+		provider := CreateOpenAIProvider(&model.Channel{Key: "sk-test", Proxy: &proxy, Other: `{"self_hosted":true}`}, "http://127.0.0.1:1")
 
 		conn, errWithCode := provider.openRealtimeConn("gpt-4o-realtime-preview")
 		if conn != nil {
@@ -419,9 +744,11 @@ func TestOpenAIRealtimeSessionConnectionErrorsAndAzureHeaders(t *testing.T) {
 
 	t.Run("azure websocket auth uses api key header", func(t *testing.T) {
 		headerCh := make(chan http.Header, 1)
+		urlCh := make(chan string, 1)
 		upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			headerCh <- r.Header.Clone()
+			urlCh <- r.URL.String()
 			conn, err := upgrader.Upgrade(w, r, nil)
 			if err != nil {
 				t.Errorf("upgrade failed: %v", err)
@@ -439,6 +766,10 @@ func TestOpenAIRealtimeSessionConnectionErrorsAndAzureHeaders(t *testing.T) {
 			Proxy: &proxy,
 		}, server.URL)
 		provider.IsAzure = true
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/realtime", nil)
+		ctx.Set("responses_ws_self_hosted", true)
+		provider.Context = ctx
 
 		conn, errWithCode := provider.openRealtimeConn("gpt-4o-realtime-preview")
 		if errWithCode != nil {
@@ -455,10 +786,308 @@ func TestOpenAIRealtimeSessionConnectionErrorsAndAzureHeaders(t *testing.T) {
 		if got := headers.Get("Authorization"); got != "" {
 			t.Fatalf("expected azure websocket auth not to use bearer auth header, got %q", got)
 		}
-		if got := headers.Get("Openai-Beta"); got != "realtime=v1" {
-			t.Fatalf("expected realtime beta header to be attached, got %q", got)
+		if got := headers.Get("Openai-Beta"); got != "" {
+			t.Fatalf("expected realtime beta header to be opt-in, got %q", got)
+		}
+		if got := <-urlCh; got != "/openai/realtime?api-version=2024-10-01-preview&deployment=gpt-4o-realtime-preview" {
+			t.Fatalf("expected azure preview realtime websocket URL, got %q", got)
 		}
 	})
+
+	t.Run("realtime beta header is preserved only when channel config opts in", func(t *testing.T) {
+		headerCh := make(chan http.Header, 1)
+		upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			headerCh <- r.Header.Clone()
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				t.Errorf("upgrade failed: %v", err)
+				return
+			}
+			defer conn.Close()
+			<-r.Context().Done()
+		}))
+		defer server.Close()
+
+		proxy := ""
+		modelHeaders := `{"OpenAI-Beta":"realtime=v1"}`
+		provider := CreateOpenAIProvider(&model.Channel{
+			Key:          "sk-test",
+			Proxy:        &proxy,
+			Other:        `{"self_hosted":true}`,
+			ModelHeaders: &modelHeaders,
+		}, server.URL)
+
+		conn, errWithCode := provider.openRealtimeConn("gpt-4o-realtime-preview")
+		if errWithCode != nil {
+			t.Fatalf("expected realtime websocket to connect, got %v", errWithCode)
+		}
+		if err := conn.Close(); err != nil {
+			t.Fatalf("expected realtime websocket close to succeed, got %v", err)
+		}
+
+		headers := <-headerCh
+		if got := headers.Get("Openai-Beta"); got != "realtime=v1" {
+			t.Fatalf("expected configured realtime beta header to be preserved, got %q", got)
+		}
+	})
+
+	t.Run("responses websocket merges custom headers", func(t *testing.T) {
+		headerCh := make(chan http.Header, 1)
+		upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			headerCh <- r.Header.Clone()
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				t.Errorf("upgrade failed: %v", err)
+				return
+			}
+			defer conn.Close()
+			<-r.Context().Done()
+		}))
+		defer server.Close()
+
+		proxy := ""
+		modelHeaders := `{"OpenAI-Organization":"org-test","X-Gateway-Auth":"gateway-token"}`
+		provider := CreateOpenAIProvider(&model.Channel{
+			Key:          "sk-test",
+			Proxy:        &proxy,
+			Other:        `{"responses_ws_self_hosted":true}`,
+			ModelHeaders: &modelHeaders,
+		}, server.URL)
+
+		conn, errWithCode := provider.openResponsesWSConn("gpt-5")
+		if errWithCode != nil {
+			t.Fatalf("expected responses websocket to connect, got %v", errWithCode)
+		}
+		if err := conn.Close(); err != nil {
+			t.Fatalf("expected responses websocket close to succeed, got %v", err)
+		}
+
+		headers := <-headerCh
+		if got := headers.Get("Authorization"); got != "Bearer sk-test" {
+			t.Fatalf("expected responses websocket to authenticate with bearer header, got %q", got)
+		}
+		if got := headers.Get("Openai-Organization"); got != "org-test" {
+			t.Fatalf("expected responses websocket to preserve organization header, got %q", got)
+		}
+		if got := headers.Get("X-Gateway-Auth"); got != "gateway-token" {
+			t.Fatalf("expected responses websocket to preserve custom gateway header, got %q", got)
+		}
+	})
+
+	t.Run("azure responses websocket auth uses api key header", func(t *testing.T) {
+		headerCh := make(chan http.Header, 1)
+		upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			headerCh <- r.Header.Clone()
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				t.Errorf("upgrade failed: %v", err)
+				return
+			}
+			defer conn.Close()
+			<-r.Context().Done()
+		}))
+		defer server.Close()
+
+		proxy := ""
+		modelHeaders := `{"X-Gateway-Auth":"azure-gateway","Authorization":"Bearer should-not-send"}`
+		provider := CreateOpenAIProvider(&model.Channel{
+			Key:          "azure-key",
+			Other:        "2024-10-01-preview",
+			Proxy:        &proxy,
+			ModelHeaders: &modelHeaders,
+		}, server.URL)
+		provider.IsAzure = true
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+		ctx.Set("responses_ws_self_hosted", true)
+		provider.Context = ctx
+
+		conn, errWithCode := provider.openResponsesWSConn("gpt-5")
+		if errWithCode != nil {
+			t.Fatalf("expected azure responses websocket to connect, got %v", errWithCode)
+		}
+		if err := conn.Close(); err != nil {
+			t.Fatalf("expected azure responses websocket close to succeed, got %v", err)
+		}
+
+		headers := <-headerCh
+		if got := headers.Get("Api-Key"); got != "azure-key" {
+			t.Fatalf("expected azure responses websocket to authenticate with api-key header, got %q", got)
+		}
+		if got := headers.Get("Authorization"); got != "" {
+			t.Fatalf("expected azure responses websocket auth not to use bearer auth header, got %q", got)
+		}
+		if got := headers.Get("X-Gateway-Auth"); got != "azure-gateway" {
+			t.Fatalf("expected azure responses websocket to preserve non-auth custom header, got %q", got)
+		}
+	})
+}
+
+func TestOpenAIResponsesWSURLConstruction(t *testing.T) {
+	proxy := ""
+	provider := CreateOpenAIProvider(&model.Channel{Key: "sk-test", Proxy: &proxy}, "https://api.openai.com")
+	got, errWithCode := provider.responsesWSURL("gpt-5")
+	if errWithCode != nil {
+		t.Fatalf("expected official responses websocket URL, got %v", errWithCode)
+	}
+	if got != "wss://api.openai.com/v1/responses" {
+		t.Fatalf("expected official responses websocket URL, got %q", got)
+	}
+
+	disabled := CreateOpenAIProvider(&model.Channel{Key: "sk-test", Type: config.ChannelTypeCustom, Proxy: &proxy}, "https://compat.example")
+	disabled.Config.Responses = ""
+	got, errWithCode = disabled.responsesWSURL("gpt-5")
+	if errWithCode == nil || errWithCode.Code != "unsupported_api" || got != "" {
+		t.Fatalf("expected disabled responses API to block websocket URL construction, url=%q err=%+v", got, errWithCode)
+	}
+
+	azureClassic := CreateOpenAIProvider(&model.Channel{Key: "azure-key", Other: "2024-10-01-preview", Type: config.ChannelTypeAzure, Proxy: &proxy}, "https://resource.openai.azure.com")
+	azureClassic.IsAzure = true
+	azureClassic.Config.Responses = "/responses"
+	got, errWithCode = azureClassic.responsesWSURL("gpt-5")
+	if errWithCode != nil {
+		t.Fatalf("expected classic azure responses websocket URL, got %v", errWithCode)
+	}
+	if got != "wss://resource.openai.azure.com/openai/deployments/gpt-5/responses?api-version=2024-10-01-preview" {
+		t.Fatalf("expected classic azure deployment responses websocket URL, got %q", got)
+	}
+
+	azureV1 := CreateOpenAIProvider(&model.Channel{Key: "azure-key", Type: config.ChannelTypeAzureV1, Proxy: &proxy}, "https://resource.openai.azure.com")
+	azureV1.IsAzure = true
+	got, errWithCode = azureV1.responsesWSURL("gpt-5")
+	if errWithCode != nil {
+		t.Fatalf("expected azure v1 responses websocket URL, got %v", errWithCode)
+	}
+	if got != "wss://resource.openai.azure.com/openai/v1/responses" {
+		t.Fatalf("expected azure v1 resource-level responses websocket URL, got %q", got)
+	}
+
+	azureGateway := CreateOpenAIProvider(&model.Channel{Key: "azure-key", Type: config.ChannelTypeAzureV1, Proxy: &proxy}, "https://resource.openai.azure.com/gateway")
+	azureGateway.IsAzure = true
+	got, errWithCode = azureGateway.responsesWSURL("gpt-5")
+	if errWithCode != nil {
+		t.Fatalf("expected azure v1 gateway responses websocket URL, got %v", errWithCode)
+	}
+	if got != "wss://resource.openai.azure.com/gateway/openai/v1/responses" {
+		t.Fatalf("expected azure v1 gateway prefix to be preserved, got %q", got)
+	}
+
+	deployment := CreateOpenAIProvider(&model.Channel{Key: "azure-key", Type: config.ChannelTypeAzureV1, Proxy: &proxy}, "https://resource.openai.azure.com/openai/deployments/gpt-5")
+	deployment.IsAzure = true
+	got, errWithCode = deployment.responsesWSURL("gpt-5")
+	if errWithCode == nil || errWithCode.Code != "invalid_azure_responses_ws_base_url" || got != "" {
+		t.Fatalf("expected deployment-path azure v1 base URL to fail locally, url=%q err=%+v", got, errWithCode)
+	}
+}
+
+func TestOpenAIRealtimeWSURLConstruction(t *testing.T) {
+	proxy := "http://proxy.invalid"
+	provider := CreateOpenAIProvider(&model.Channel{Key: "sk-test", Proxy: &proxy}, "https://api.openai.com")
+	got, errWithCode := provider.realtimeWSURL("gpt-4o-realtime-preview")
+	if errWithCode != nil {
+		t.Fatalf("expected official realtime websocket URL, got %v", errWithCode)
+	}
+	if got != "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview" {
+		t.Fatalf("expected official realtime websocket URL, got %q", got)
+	}
+
+	disabled := CreateOpenAIProvider(&model.Channel{Key: "sk-test", Type: config.ChannelTypeCustom, Proxy: &proxy}, "https://compat.example")
+	disabled.Config.ChatRealtime = ""
+	got, errWithCode = disabled.realtimeWSURL("gpt-4o")
+	if errWithCode == nil || errWithCode.Code != "unsupported_api" || got != "" {
+		t.Fatalf("expected disabled realtime API to block websocket URL construction, url=%q err=%+v", got, errWithCode)
+	}
+
+	azureClassic := CreateOpenAIProvider(&model.Channel{Key: "azure-key", Other: "2024-10-01-preview", Type: config.ChannelTypeAzure, Proxy: &proxy}, "https://resource.openai.azure.com")
+	azureClassic.IsAzure = true
+	got, errWithCode = azureClassic.realtimeWSURL("gpt-4o-realtime-preview")
+	if errWithCode != nil {
+		t.Fatalf("expected classic azure realtime websocket URL, got %v", errWithCode)
+	}
+	if got != "wss://resource.openai.azure.com/openai/realtime?api-version=2024-10-01-preview&deployment=gpt-4o-realtime-preview" {
+		t.Fatalf("expected classic azure preview realtime websocket URL, got %q", got)
+	}
+
+	azureV1 := CreateOpenAIProvider(&model.Channel{Key: "azure-key", Type: config.ChannelTypeAzureV1, Proxy: &proxy}, "https://resource.openai.azure.com")
+	azureV1.IsAzure = true
+	got, errWithCode = azureV1.realtimeWSURL("gpt-4o")
+	if errWithCode != nil {
+		t.Fatalf("expected azure v1 realtime websocket URL, got %v", errWithCode)
+	}
+	if got != "wss://resource.openai.azure.com/openai/v1/realtime?model=gpt-4o" {
+		t.Fatalf("expected azure v1 resource-level realtime websocket URL, got %q", got)
+	}
+
+	azureGateway := CreateOpenAIProvider(&model.Channel{Key: "azure-key", Type: config.ChannelTypeAzureV1, Proxy: &proxy}, "https://resource.openai.azure.com/gateway")
+	azureGateway.IsAzure = true
+	got, errWithCode = azureGateway.realtimeWSURL("gpt-4o")
+	if errWithCode != nil {
+		t.Fatalf("expected azure v1 gateway realtime websocket URL, got %v", errWithCode)
+	}
+	if got != "wss://resource.openai.azure.com/gateway/openai/v1/realtime?model=gpt-4o" {
+		t.Fatalf("expected azure v1 gateway prefix to be preserved, got %q", got)
+	}
+
+	deployment := CreateOpenAIProvider(&model.Channel{Key: "azure-key", Type: config.ChannelTypeAzureV1, Proxy: &proxy}, "https://resource.openai.azure.com/openai/deployments/gpt-4o")
+	deployment.IsAzure = true
+	got, errWithCode = deployment.realtimeWSURL("gpt-4o")
+	if errWithCode == nil || errWithCode.Code != "invalid_azure_realtime_base_url" || got != "" {
+		t.Fatalf("expected deployment-path azure v1 base URL to fail locally, url=%q err=%+v", got, errWithCode)
+	}
+}
+
+func TestMapOpenAIResponsesWSDialErrorPreservesHandshakeStatus(t *testing.T) {
+	originalLogger := logger.Logger
+	logger.Logger = zap.NewNop()
+	t.Cleanup(func() {
+		logger.Logger = originalLogger
+	})
+
+	cases := []struct {
+		name       string
+		statusCode int
+		wantCode   string
+		wantStatus int
+	}{
+		{"unauthorized", http.StatusUnauthorized, "provider_authentication_failed", http.StatusUnauthorized},
+		{"rate limited", http.StatusTooManyRequests, "provider_rate_limit_exceeded", http.StatusTooManyRequests},
+		{"not found unsupported", http.StatusNotFound, "responses_ws_unsupported_for_channel", http.StatusUpgradeRequired},
+		{"upgrade required unsupported", http.StatusUpgradeRequired, "responses_ws_unsupported_for_channel", http.StatusUpgradeRequired},
+		{"server error", http.StatusBadGateway, "provider_ws_request_failed", http.StatusBadGateway},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			errWithCode := mapOpenAIResponsesWSDialError(&requester.WSDialHandshakeError{
+				URL:        "wss://provider.example/v1/responses?api_key=secret",
+				StatusCode: tc.statusCode,
+				Header:     http.Header{"Retry-After": []string{"2"}},
+				Err:        errors.New("handshake failed"),
+			})
+			if errWithCode == nil {
+				t.Fatalf("expected mapped error")
+			}
+			gotCode, _ := errWithCode.Code.(string)
+			if gotCode != tc.wantCode || errWithCode.StatusCode != tc.wantStatus {
+				t.Fatalf("expected %s/%d, got code=%v status=%d", tc.wantCode, tc.wantStatus, errWithCode.Code, errWithCode.StatusCode)
+			}
+			if strings.Contains(errWithCode.Message, "provider.example") || strings.Contains(errWithCode.Message, "secret") {
+				t.Fatalf("expected mapped client message to omit upstream URL, got %q", errWithCode.Message)
+			}
+		})
+	}
+
+	errWithCode := mapOpenAIResponsesWSDialError(errors.New("dial tcp: no route"))
+	if errWithCode == nil {
+		t.Fatalf("expected mapped transport error")
+	}
+	gotCode, _ := errWithCode.Code.(string)
+	if gotCode != "ws_request_failed" || errWithCode.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected transport errors without HTTP status to remain ws_request_failed, got %+v", errWithCode)
+	}
 }
 
 func TestOpenAIRealtimeSessionAdditionalHelperBranches(t *testing.T) {
@@ -480,8 +1109,11 @@ func TestOpenAIRealtimeSessionAdditionalHelperBranches(t *testing.T) {
 	}
 
 	session.compatMode = true
-	if outbound, shouldClose := session.observeSupplierMessage(websocket.TextMessage, []byte(`{"type":"error","error":{"type":"invalid_request_error","code":"bad_request","message":"boom"}}`)); !shouldClose || !errors.Is(outbound.err, runtimesession.ErrSessionClosed) {
-		t.Fatalf("expected compat mode upstream errors to close the session, outbound=%+v should_close=%v", outbound, shouldClose)
+	if outbound, shouldClose := session.observeSupplierMessage(websocket.TextMessage, []byte(`{"type":"error","error":{"type":"invalid_request_error","code":"bad_request","message":"boom"}}`)); shouldClose || outbound.err != nil {
+		t.Fatalf("expected non-fatal compat mode upstream errors to pass through, outbound=%+v should_close=%v", outbound, shouldClose)
+	}
+	if outbound, shouldClose := session.observeSupplierMessage(websocket.TextMessage, []byte(`{"type":"error","error":{"type":"server_error","code":"session_expired","message":"boom"}}`)); !shouldClose || !errors.Is(outbound.err, runtimesession.ErrSessionClosed) {
+		t.Fatalf("expected fatal compat mode upstream errors to close the session, outbound=%+v should_close=%v", outbound, shouldClose)
 	}
 
 	session.compatMode = false

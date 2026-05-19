@@ -46,6 +46,11 @@ func (l *SlidingWindowLimiter) Allow(keyPrefix string) bool {
 
 // AllowN 检查是否允许n个请求通过
 func (l *SlidingWindowLimiter) AllowN(keyPrefix string, n int) bool {
+	allowed, _ := l.AllowNWithError(keyPrefix, n)
+	return allowed
+}
+
+func (l *SlidingWindowLimiter) AllowNWithError(keyPrefix string, n int) (bool, error) {
 	return l.reserveN(context.Background(), keyPrefix, n)
 }
 
@@ -83,7 +88,7 @@ func (l *SlidingWindowLimiter) GetCurrentRate(keyPrefix string) (int, error) {
 }
 
 // reserveN 预留N个请求位置
-func (l *SlidingWindowLimiter) reserveN(ctx context.Context, keyPrefix string, n int) bool {
+func (l *SlidingWindowLimiter) reserveN(ctx context.Context, keyPrefix string, n int) (bool, error) {
 	slidingKey := fmt.Sprintf(slidingWindowFormat, keyPrefix)
 	nowSec := time.Now().Unix()
 
@@ -98,18 +103,18 @@ func (l *SlidingWindowLimiter) reserveN(ctx context.Context, keyPrefix string, n
 	)
 
 	if err != nil {
-		return false
+		return false, err
 	}
 
 	resultArray, ok := result.([]interface{})
 	if !ok || len(resultArray) < 1 {
-		return false
+		return false, fmt.Errorf("无法转换滑动窗口结果")
 	}
 
 	allowed, ok := resultArray[0].(int64)
 	if !ok {
-		return false
+		return false, fmt.Errorf("无法转换滑动窗口允许结果")
 	}
 
-	return allowed == 1
+	return allowed == 1, nil
 }

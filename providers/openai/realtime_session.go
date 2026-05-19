@@ -3,14 +3,20 @@ package openai
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"one-api/common"
+	"one-api/common/authutil"
 	"one-api/common/config"
+	"one-api/common/logger"
 	"one-api/common/requester"
+	"one-api/common/responsesws"
 	runtimesession "one-api/runtime/session"
 	"one-api/types"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -23,10 +29,13 @@ const openAIRealtimeReadTimeout = 2 * time.Minute
 const openAIRealtimeDetachGraceTimeout = 30 * time.Second
 const openAIRealtimeFinalizedResponseIDLimit = 16
 
+var openAIRealtimeOutboundBackpressureTimeout = 5 * time.Second
+
 type openAIRealtimeOutbound struct {
 	messageType int
 	payload     []byte
 	usage       *types.UsageEvent
+	origin      runtimesession.RealtimePayloadOrigin
 	err         error
 }
 
@@ -52,18 +61,24 @@ type openAIRealtimeSession struct {
 	conn       *websocket.Conn
 	compatMode bool
 
-	recvCh       chan openAIRealtimeOutbound
-	closed       chan struct{}
-	detached     chan struct{}
-	closeOnce    sync.Once
-	detachOnce   sync.Once
-	detachLog    sync.Once
-	writeMu      sync.Mutex
-	detachTimer  *time.Timer
-	detachMu     sync.Mutex
-	mu           sync.Mutex
-	detachReason string
+	recvCh        chan openAIRealtimeOutbound
+	closed        chan struct{}
+	detached      chan struct{}
+	closeOnce     sync.Once
+	detachOnce    sync.Once
+	detachLog     sync.Once
+	writeMu       sync.Mutex
+	detachTimer   *time.Timer
+	detachMu      sync.Mutex
+	readLoopOnce  sync.Once
+	mu            sync.Mutex
+	detachReason  string
+	turnReadMu    sync.Mutex
+	turnReadTimer *time.Timer
+	turnReadGen   int64
+	controlWriter *requester.WSControlFrameWriter
 
+	responsesWS         bool
 	turnSeq             int64
 	turn                *openAIRealtimeTurnState
 	pendingTurns        []openAIRealtimePendingTurn
@@ -72,65 +87,350 @@ type openAIRealtimeSession struct {
 }
 
 func (p *OpenAIProvider) OpenRealtimeSession(modelName string) (runtimesession.RealtimeSession, *types.OpenAIErrorWithStatusCode) {
-	conn, errWithCode := p.openRealtimeConn(modelName)
+	return p.OpenRealtimeSessionWithOptions(modelName, runtimesession.RealtimeOpenOptions{})
+}
+
+func (p *OpenAIProvider) OpenRealtimeSessionWithOptions(modelName string, options runtimesession.RealtimeOpenOptions) (runtimesession.RealtimeSession, *types.OpenAIErrorWithStatusCode) {
+	conn, errWithCode := p.openRealtimeConnWithOptions(modelName, options)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
 
+	responsesWS := options.PreferredTransport == runtimesession.TransportModeResponsesWS || options.RequireWS
+	sessionID, sessionIDErr := readOpenAIRealtimeSessionID(p)
+	if sessionIDErr != nil {
+		_ = conn.Close()
+		return nil, sessionIDErr
+	}
 	session := &openAIRealtimeSession{
-		provider:   p,
-		model:      strings.TrimSpace(modelName),
-		sessionID:  readOpenAIRealtimeSessionID(p),
-		conn:       conn,
-		compatMode: config.OpenAIRealtimeSessionCompatMode,
-		recvCh:     make(chan openAIRealtimeOutbound, 128),
-		closed:     make(chan struct{}),
-		detached:   make(chan struct{}),
+		provider:    p,
+		model:       strings.TrimSpace(modelName),
+		sessionID:   sessionID,
+		conn:        conn,
+		responsesWS: responsesWS,
+		compatMode:  !responsesWS && config.OpenAIRealtimeSessionCompatMode,
+		recvCh:      make(chan openAIRealtimeOutbound, 128),
+		closed:      make(chan struct{}),
+		detached:    make(chan struct{}),
 	}
 	session.configureConn()
-	go session.readLoop()
+	if !session.responsesWS {
+		session.startReadLoop()
+	}
 	return session, nil
 }
 
+func (p *OpenAIProvider) openRealtimeConnWithOptions(modelName string, options runtimesession.RealtimeOpenOptions) (*websocket.Conn, *types.OpenAIErrorWithStatusCode) {
+	if options.PreferredTransport == runtimesession.TransportModeResponsesWS || options.RequireWS {
+		return p.openResponsesWSConnWithContext(options.Context, modelName)
+	}
+	return p.openRealtimeConn(modelName)
+}
+
 func (p *OpenAIProvider) openRealtimeConn(modelName string) (*websocket.Conn, *types.OpenAIErrorWithStatusCode) {
-	url, errWithCode := p.GetSupportedAPIUri(config.RelayModeChatRealtime)
+	fullRequestURL, errWithCode := p.realtimeWSURL(modelName)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
 
-	fullRequestURL := p.GetFullRequestURL(url, modelName)
-	httpHeaders := make(http.Header)
+	proxyAddr := ""
+	if p.Channel != nil && p.Channel.Proxy != nil {
+		proxyAddr = *p.Channel.Proxy
+	}
+	httpHeaders := httpHeaderFromOpenAIHeaders(p.GetRequestHeaders())
 	if p.IsAzure {
+		httpHeaders.Del("Authorization")
 		httpHeaders.Set("api-key", p.Channel.Key)
 	} else {
 		httpHeaders.Set("Authorization", fmt.Sprintf("Bearer %s", p.Channel.Key))
 	}
-	httpHeaders.Set("OpenAI-Beta", "realtime=v1")
+
+	wsRequester := requester.NewWSRequester(proxyAddr)
+	wsConn, err := wsRequester.NewRequestContextWithSubprotocols(context.Background(), fullRequestURL, httpHeaders, openAIUpstreamWebsocketSubprotocols(p))
+	if err != nil {
+		return nil, mapOpenAIRealtimeWSDialError(err)
+	}
+	return wsConn, nil
+}
+
+func (p *OpenAIProvider) realtimeWSURL(modelName string) (string, *types.OpenAIErrorWithStatusCode) {
+	apiPath, errWithCode := p.GetSupportedAPIUri(config.RelayModeChatRealtime)
+	if errWithCode != nil {
+		return "", errWithCode
+	}
+
+	if p.IsAzure {
+		if p.Channel != nil && p.Channel.Type == config.ChannelTypeAzureV1 {
+			return p.azureV1RealtimeWSURL(modelName)
+		}
+		return p.azurePreviewRealtimeWSURL(modelName)
+	}
+
+	rawURL := p.GetFullRequestURL(apiPath, "")
+	withModel, err := appendOpenAIRealtimeModelQuery(rawURL, modelName)
+	if err != nil {
+		return "", common.ErrorWrapperLocal(err, "ws_request_failed", http.StatusInternalServerError)
+	}
+	return p.realtimeWSURLFromHTTP(withModel)
+}
+
+func (p *OpenAIProvider) azureV1RealtimeWSURL(modelName string) (string, *types.OpenAIErrorWithStatusCode) {
+	baseURL := strings.TrimRight(strings.TrimSpace(p.GetBaseURL()), "/")
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return "", common.ErrorWrapperLocal(err, "ws_request_failed", http.StatusInternalServerError)
+	}
+	if strings.Contains(parsed.Path, "/openai/deployments/") {
+		return "", common.StringErrorWrapperLocal("Azure v1 Realtime requires a resource-level base URL, not a deployment path", "invalid_azure_realtime_base_url", http.StatusBadRequest)
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/") + "/openai/v1/realtime"
+	query := parsed.Query()
+	if strings.TrimSpace(modelName) != "" {
+		query.Set("model", strings.TrimSpace(modelName))
+	}
+	parsed.RawQuery = query.Encode()
+	return p.realtimeWSURLFromHTTP(parsed.String())
+}
+
+func (p *OpenAIProvider) azurePreviewRealtimeWSURL(modelName string) (string, *types.OpenAIErrorWithStatusCode) {
+	baseURL := strings.TrimRight(strings.TrimSpace(p.GetBaseURL()), "/")
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return "", common.ErrorWrapperLocal(err, "ws_request_failed", http.StatusInternalServerError)
+	}
+	if strings.Contains(parsed.Path, "/openai/deployments/") {
+		return "", common.StringErrorWrapperLocal("Azure Realtime requires a resource-level base URL, not a deployment path", "invalid_azure_realtime_base_url", http.StatusBadRequest)
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/") + "/openai/realtime"
+	query := parsed.Query()
+	apiVersion := ""
+	if p != nil && p.Channel != nil {
+		apiVersion = strings.TrimSpace(p.Channel.Other)
+	}
+	if apiVersion != "" {
+		query.Set("api-version", apiVersion)
+	}
+	if strings.TrimSpace(modelName) != "" {
+		query.Set("deployment", strings.TrimSpace(modelName))
+	}
+	parsed.RawQuery = query.Encode()
+	return p.realtimeWSURLFromHTTP(parsed.String())
+}
+
+func (p *OpenAIProvider) realtimeWSURLFromHTTP(rawURL string) (string, *types.OpenAIErrorWithStatusCode) {
+	proxyAddr := ""
+	if p != nil && p.Channel != nil && p.Channel.Proxy != nil {
+		proxyAddr = *p.Channel.Proxy
+	}
+	validated, err := requester.ValidateUpstreamRealtimeURL(rawURL, requester.UpstreamRealtimeURLPolicy{
+		AllowSelfHosted: openAIResponsesWSSelfHosted(p),
+		ResolveHost:     proxyAddr == "",
+	})
+	if err != nil {
+		return "", common.StringErrorWrapperLocal(err.Error(), "ws_request_failed", requester.UpstreamRealtimeURLStatusCode(err))
+	}
+	return validated, nil
+}
+
+func appendOpenAIRealtimeModelQuery(rawURL string, modelName string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return "", err
+	}
+	query := parsed.Query()
+	if strings.TrimSpace(modelName) != "" {
+		query.Set("model", strings.TrimSpace(modelName))
+	}
+	parsed.RawQuery = query.Encode()
+	return parsed.String(), nil
+}
+
+func (p *OpenAIProvider) openResponsesWSConn(modelName string) (*websocket.Conn, *types.OpenAIErrorWithStatusCode) {
+	return p.openResponsesWSConnWithContext(context.Background(), modelName)
+}
+
+func (p *OpenAIProvider) openResponsesWSConnWithContext(ctx context.Context, modelName string) (*websocket.Conn, *types.OpenAIErrorWithStatusCode) {
+	fullRequestURL, errWithCode := p.responsesWSURL(modelName)
+	if errWithCode != nil {
+		return nil, errWithCode
+	}
+
+	httpHeaders := httpHeaderFromOpenAIHeaders(p.GetRequestHeaders())
+	if p.IsAzure {
+		httpHeaders.Del("Authorization")
+		httpHeaders.Set("api-key", p.Channel.Key)
+	} else {
+		httpHeaders.Set("Authorization", fmt.Sprintf("Bearer %s", p.Channel.Key))
+	}
 
 	proxyAddr := ""
 	if p.Channel != nil && p.Channel.Proxy != nil {
 		proxyAddr = *p.Channel.Proxy
 	}
 	wsRequester := requester.NewWSRequester(proxyAddr)
-	wsConn, err := wsRequester.NewRequest(fullRequestURL, httpHeaders)
+	wsConn, err := wsRequester.NewRequestContextWithSubprotocols(ctx, fullRequestURL, httpHeaders, openAIUpstreamWebsocketSubprotocols(p))
 	if err != nil {
-		return nil, common.ErrorWrapper(err, "ws_request_failed", http.StatusInternalServerError)
+		return nil, mapOpenAIResponsesWSDialError(err)
 	}
 	return wsConn, nil
 }
 
-func readOpenAIRealtimeSessionID(p *OpenAIProvider) string {
-	if p != nil && p.Context != nil && p.Context.Request != nil {
-		if sessionID := runtimesession.ReadClientSessionID(p.Context.Request); sessionID != "" {
-			return sessionID
+func httpHeaderFromOpenAIHeaders(headers map[string]string) http.Header {
+	httpHeaders := make(http.Header, len(headers))
+	for key, value := range headers {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		httpHeaders.Set(key, value)
+	}
+	return httpHeaders
+}
+
+func (p *OpenAIProvider) responsesWSURL(modelName string) (string, *types.OpenAIErrorWithStatusCode) {
+	if p == nil {
+		return "", common.StringErrorWrapperLocal("provider is required", "ws_request_failed", http.StatusInternalServerError)
+	}
+	if p.IsAzure && p.Channel != nil && p.Channel.Type == config.ChannelTypeAzureV1 {
+		return p.azureV1ResponsesWSURL()
+	}
+
+	apiPath, apiErr := p.GetSupportedAPIUri(config.RelayModeResponses)
+	if apiErr != nil {
+		return "", apiErr
+	}
+	return p.responsesWSURLFromHTTP(p.GetFullRequestURL(apiPath, modelName))
+}
+
+func (p *OpenAIProvider) azureV1ResponsesWSURL() (string, *types.OpenAIErrorWithStatusCode) {
+	baseURL := strings.TrimRight(strings.TrimSpace(p.GetBaseURL()), "/")
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return "", common.ErrorWrapperLocal(err, "ws_request_failed", http.StatusInternalServerError)
+	}
+	if strings.Contains(parsed.Path, "/openai/deployments/") {
+		return "", common.StringErrorWrapperLocal("Azure v1 ResponsesWS requires a resource-level base URL, not a deployment path", "invalid_azure_responses_ws_base_url", http.StatusBadRequest)
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/") + "/openai/v1/responses"
+	parsed.RawQuery = ""
+	return p.responsesWSURLFromHTTP(parsed.String())
+}
+
+func responsesWSURLFromHTTP(rawURL string) (string, *types.OpenAIErrorWithStatusCode) {
+	return responsesWSURLFromHTTPWithPolicy(rawURL, false)
+}
+
+func (p *OpenAIProvider) responsesWSURLFromHTTP(rawURL string) (string, *types.OpenAIErrorWithStatusCode) {
+	proxyAddr := ""
+	if p != nil && p.Channel != nil && p.Channel.Proxy != nil {
+		proxyAddr = *p.Channel.Proxy
+	}
+	return responsesWSURLFromHTTPWithPolicyAndResolve(rawURL, openAIResponsesWSSelfHosted(p), proxyAddr == "")
+}
+
+func responsesWSURLFromHTTPWithPolicy(rawURL string, allowSelfHosted bool) (string, *types.OpenAIErrorWithStatusCode) {
+	return responsesWSURLFromHTTPWithPolicyAndResolve(rawURL, allowSelfHosted, true)
+}
+
+func responsesWSURLFromHTTPWithPolicyAndResolve(rawURL string, allowSelfHosted bool, resolveHost bool) (string, *types.OpenAIErrorWithStatusCode) {
+	validated, err := requester.ValidateUpstreamRealtimeURL(rawURL, requester.UpstreamRealtimeURLPolicy{
+		AllowSelfHosted: allowSelfHosted,
+		ResolveHost:     resolveHost,
+	})
+	if err != nil {
+		return "", common.StringErrorWrapperLocal(err.Error(), "ws_request_failed", requester.UpstreamRealtimeURLStatusCode(err))
+	}
+	return validated, nil
+}
+
+func openAIResponsesWSSelfHosted(p *OpenAIProvider) bool {
+	if p == nil {
+		return false
+	}
+	if p.Context != nil && p.Context.GetBool("responses_ws_self_hosted") {
+		return true
+	}
+	if p.Channel == nil {
+		return false
+	}
+	other, err := p.Channel.GetOtherMap()
+	if err != nil {
+		return false
+	}
+	for _, key := range []string{"responses_ws_self_hosted", "self_hosted"} {
+		if raw, ok := other[key]; ok && strings.EqualFold(strings.TrimSpace(string(raw)), "true") {
+			return true
 		}
 	}
-	return uuid.NewString()
+	return false
+}
+
+func openAIUpstreamWebsocketSubprotocols(p *OpenAIProvider) []string {
+	if p == nil || p.Context == nil || p.Context.Request == nil {
+		return nil
+	}
+	return authutil.AllowedOpenAIUpstreamWebsocketSubprotocols(p.Context.Request)
+}
+
+func mapOpenAIResponsesWSDialError(err error) *types.OpenAIErrorWithStatusCode {
+	var handshake *requester.WSDialHandshakeError
+	if errors.As(err, &handshake) && handshake != nil {
+		switch handshake.StatusCode {
+		case http.StatusNotFound, http.StatusUpgradeRequired:
+			return common.StringErrorWrapperLocal("channel does not support Responses websocket transport", "responses_ws_unsupported_for_channel", http.StatusUpgradeRequired)
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return common.StringErrorWrapperLocal("provider authentication failed", "provider_authentication_failed", handshake.StatusCode)
+		case http.StatusTooManyRequests:
+			return common.StringErrorWrapperLocal("provider rate limit exceeded", "provider_rate_limit_exceeded", http.StatusTooManyRequests)
+		default:
+			if handshake.StatusCode >= 500 {
+				return common.StringErrorWrapperLocal("provider websocket request failed", "provider_ws_request_failed", handshake.StatusCode)
+			}
+		}
+	}
+	logOpenAIRealtimeInternalError("openai responses websocket dial failed: " + err.Error())
+	return common.StringErrorWrapperLocal("websocket request failed", "ws_request_failed", http.StatusInternalServerError)
+}
+
+func mapOpenAIRealtimeWSDialError(err error) *types.OpenAIErrorWithStatusCode {
+	var handshake *requester.WSDialHandshakeError
+	if errors.As(err, &handshake) && handshake != nil {
+		switch handshake.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return common.StringErrorWrapperLocal("provider authentication failed", "provider_authentication_failed", handshake.StatusCode)
+		case http.StatusTooManyRequests:
+			return common.StringErrorWrapperLocal("provider rate limit exceeded", "provider_rate_limit_exceeded", http.StatusTooManyRequests)
+		default:
+			if handshake.StatusCode >= 500 {
+				return common.StringErrorWrapperLocal("provider websocket request failed", "provider_ws_request_failed", handshake.StatusCode)
+			}
+		}
+	}
+	logOpenAIRealtimeInternalError("openai realtime websocket dial failed: " + err.Error())
+	return common.StringErrorWrapperLocal("websocket request failed", "ws_request_failed", http.StatusInternalServerError)
+}
+
+func readOpenAIRealtimeSessionID(p *OpenAIProvider) (string, *types.OpenAIErrorWithStatusCode) {
+	if p != nil && p.Context != nil && p.Context.Request != nil {
+		if sessionID := runtimesession.ReadClientSessionID(p.Context.Request); sessionID != "" {
+			if err := runtimesession.ValidateClientSessionID(sessionID); err != nil {
+				logOpenAIRealtimeInternalError("invalid realtime session id rejected: " + err.Error())
+				return "", common.StringErrorWrapperLocal("invalid realtime session id", "invalid_session_id", http.StatusBadRequest)
+			}
+			return sessionID, nil
+		}
+	}
+	return uuid.NewString(), nil
 }
 
 func (s *openAIRealtimeSession) SendClient(ctx context.Context, mt int, payload []byte) error {
 	if s == nil || s.conn == nil || s.isDetached() {
 		return runtimesession.ErrSessionClosed
+	}
+	select {
+	case <-ctx.Done():
+		return runtimesession.ErrSessionClosed
+	default:
 	}
 
 	normalizedPayload, eventType, err := normalizeOpenAIRealtimeClientPayload(payload, mt, s.model, s.compatMode)
@@ -147,37 +447,65 @@ func (s *openAIRealtimeSession) SendClient(ctx context.Context, mt int, payload 
 			return err
 		}
 		runOpenAIRealtimeFinalizers(finalizers)
+		if err := runtimesession.AdmitTurn(startedTurn.observer); err != nil {
+			s.rollbackOpenAIRealtimeTurnAdmission(startedTurn, "turn_admission_failed")
+			s.rollbackTurn(startedTurn)
+			return openAIRealtimeClientPayloadErrorFromObserver(err)
+		}
 	}
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if err := s.conn.WriteMessage(mt, normalizedPayload); err != nil {
+	select {
+	case <-ctx.Done():
 		if startedTurn != nil {
+			s.rollbackOpenAIRealtimeTurnAdmission(startedTurn, "context_cancelled_before_write")
 			s.rollbackTurn(startedTurn)
 		}
-		return types.NewErrorEvent("", "system_error", "ws_write_failed", err.Error())
+		return runtimesession.ErrSessionClosed
+	default:
+	}
+	if err := requester.WithWSWriteDeadline(s.conn, config.RealtimeWebsocketWriteTimeout, func() error {
+		return s.conn.WriteMessage(mt, normalizedPayload)
+	}); err != nil {
+		if startedTurn != nil && !s.responsesWS {
+			s.rollbackOpenAIRealtimeTurnAdmission(startedTurn, "write_failed")
+			s.rollbackTurn(startedTurn)
+		}
+		logOpenAIRealtimeInternalError("openai realtime websocket write failed: " + err.Error())
+		return types.NewErrorEvent("", "system_error", "ws_write_failed", "upstream websocket write failed")
 	}
 	return nil
 }
 
-func (s *openAIRealtimeSession) Recv(ctx context.Context) (int, []byte, *types.UsageEvent, error) {
-	if messageType, payload, usage, err, handled := s.recvQueuedOutbound(); handled {
-		return messageType, payload, usage, err
+func (s *openAIRealtimeSession) Recv(ctx context.Context) (int, []byte, *types.UsageEvent, runtimesession.RealtimePayloadOrigin, error) {
+	s.startReadLoop()
+	if messageType, payload, usage, origin, err, handled := s.recvQueuedOutbound(); handled {
+		return messageType, payload, usage, origin, err
 	}
 
 	select {
 	case <-ctx.Done():
-		return 0, nil, nil, ctx.Err()
+		return 0, nil, nil, runtimesession.RealtimePayloadOriginProxyLocal, ctx.Err()
 	case <-s.detached:
-		return 0, nil, nil, runtimesession.ErrSessionClosed
+		return 0, nil, nil, runtimesession.RealtimePayloadOriginProxyLocal, runtimesession.ErrSessionClosed
 	case <-s.closed:
-		if messageType, payload, usage, err, handled := s.recvQueuedOutbound(); handled {
-			return messageType, payload, usage, err
+		if messageType, payload, usage, origin, err, handled := s.recvQueuedOutbound(); handled {
+			return messageType, payload, usage, origin, err
 		}
-		return 0, nil, nil, runtimesession.ErrSessionClosed
+		return 0, nil, nil, runtimesession.RealtimePayloadOriginProxyLocal, runtimesession.ErrSessionClosed
 	case outbound, ok := <-s.recvCh:
 		return decodeOpenAIRealtimeOutbound(outbound, ok)
 	}
+}
+
+func (s *openAIRealtimeSession) startReadLoop() {
+	if s == nil || s.conn == nil {
+		return
+	}
+	s.readLoopOnce.Do(func() {
+		go s.readLoop()
+	})
 }
 
 func (s *openAIRealtimeSession) Detach(reason string) {
@@ -215,36 +543,79 @@ func (s *openAIRealtimeSession) configureConn() {
 	if s == nil || s.conn == nil {
 		return
 	}
+	requester.ApplyWSReadLimit(s.conn, config.RealtimeWebsocketReadLimit)
+	logCtx := context.Background()
+	if s.provider != nil && s.provider.Context != nil && s.provider.Context.Request != nil {
+		logCtx = s.provider.Context.Request.Context()
+	}
+	if s.controlWriter != nil {
+		s.controlWriter.Stop()
+		s.controlWriter.Wait()
+	}
+	writer := requester.NewWSControlFrameWriter(s.conn, requester.WSControlFrameWriterOptions{
+		Label:      "openai realtime upstream",
+		LogContext: logCtx,
+	})
+	s.controlWriter = writer
 	s.conn.SetPingHandler(func(appData string) error {
-		s.writeMu.Lock()
-		defer s.writeMu.Unlock()
-		return s.conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(10*time.Second))
+		if err := s.setReadDeadlineForCurrentState(); err != nil {
+			return err
+		}
+		return writer.EnqueuePong(appData)
 	})
 	s.conn.SetPongHandler(func(string) error {
-		return s.conn.SetReadDeadline(time.Now().Add(openAIRealtimeReadTimeout))
+		return s.setReadDeadlineForCurrentState()
 	})
 }
 
 func (s *openAIRealtimeSession) readLoop() {
 	defer close(s.recvCh)
-	defer s.close("upstream_closed")
-
-	for {
-		_ = s.conn.SetReadDeadline(time.Now().Add(openAIRealtimeReadTimeout))
-		messageType, payload, err := s.conn.ReadMessage()
-		if err != nil {
-			providerErr := types.NewErrorEvent("", "provider_error", "provider_connection_closed", err.Error())
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			logOpenAIRealtimeInternalError(fmt.Sprintf("openai realtime read loop panic session=%s provider=%s: %v", s.sessionID, s.model, recovered))
+			logOpenAIRealtimeInternalError(fmt.Sprintf("stacktrace from panic: %s", string(debug.Stack())))
+			providerErr := types.NewErrorEvent("", "provider_error", "provider_panic", "upstream realtime reader failed")
 			s.enqueueOutbound(openAIRealtimeOutbound{
 				messageType: websocket.TextMessage,
 				payload:     []byte(providerErr.Error()),
+				origin:      runtimesession.RealtimePayloadOriginProxyLocal,
+				err:         runtimesession.ErrSessionClosed,
+			})
+		}
+		s.close("upstream_closed")
+	}()
+
+	for {
+		_ = s.setReadDeadlineForCurrentState()
+		messageType, payload, err := s.conn.ReadMessage()
+		if err != nil {
+			var closeErr *websocket.CloseError
+			if errors.As(err, &closeErr) {
+				s.enqueueOutbound(openAIRealtimeOutbound{
+					messageType: websocket.CloseMessage,
+					payload:     requester.SafeWSCloseMessage(closeErr.Code, closeErr.Text),
+					origin:      runtimesession.RealtimePayloadOriginProvider,
+					err:         runtimesession.ErrSessionClosed,
+				})
+				return
+			}
+			logOpenAIRealtimeInternalError("openai realtime websocket read failed: " + err.Error())
+			providerErr := types.NewErrorEvent("", "provider_error", "provider_connection_closed", "upstream websocket connection closed")
+			s.enqueueOutbound(openAIRealtimeOutbound{
+				messageType: websocket.TextMessage,
+				payload:     []byte(providerErr.Error()),
+				origin:      runtimesession.RealtimePayloadOriginProxyLocal,
 				err:         runtimesession.ErrSessionClosed,
 			})
 			return
 		}
+		s.refreshActiveTurnReadTimeout()
 
 		outbound, shouldClose := s.observeSupplierMessage(messageType, payload)
-		if !s.enqueueOutbound(outbound) {
-			return
+		if len(outbound.payload) > 0 || outbound.usage != nil || outbound.err != nil {
+			if !s.enqueueOutbound(outbound) {
+				return
+			}
 		}
 		if shouldClose {
 			return
@@ -252,8 +623,117 @@ func (s *openAIRealtimeSession) readLoop() {
 	}
 }
 
+func (s *openAIRealtimeSession) currentReadTimeout() time.Duration {
+	if s == nil || !s.responsesWS {
+		return openAIRealtimeReadTimeout
+	}
+	if s.hasActiveTurn() {
+		return openAIRealtimeReadTimeout
+	}
+	return config.ResponsesWSIdleTimeout()
+}
+
+func (s *openAIRealtimeSession) hasActiveTurn() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.turn != nil
+}
+
+func (s *openAIRealtimeSession) activeTurnState() *openAIRealtimeTurnState {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.turn
+}
+
+func (s *openAIRealtimeSession) hasActiveTurnSeq(seq int64) bool {
+	if s == nil || seq <= 0 {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.turn != nil && s.turn.seq == seq
+}
+
+func (s *openAIRealtimeSession) refreshActiveTurnReadTimeout() {
+	if s == nil || !s.responsesWS {
+		return
+	}
+	s.armActiveTurnReadTimeout(s.activeTurnState())
+}
+
+func (s *openAIRealtimeSession) armActiveTurnReadTimeout(turn *openAIRealtimeTurnState) {
+	if s == nil || !s.responsesWS || turn == nil || openAIRealtimeReadTimeout <= 0 {
+		return
+	}
+	seq := turn.seq
+	s.turnReadMu.Lock()
+	defer s.turnReadMu.Unlock()
+	s.turnReadGen++
+	generation := s.turnReadGen
+	if s.turnReadTimer != nil {
+		s.turnReadTimer.Stop()
+	}
+	s.turnReadTimer = time.AfterFunc(openAIRealtimeReadTimeout, func() {
+		s.handleActiveTurnReadTimeout(seq, generation)
+	})
+}
+
+func (s *openAIRealtimeSession) stopActiveTurnReadTimeout() {
+	if s == nil {
+		return
+	}
+	s.turnReadMu.Lock()
+	defer s.turnReadMu.Unlock()
+	s.turnReadGen++
+	if s.turnReadTimer != nil {
+		s.turnReadTimer.Stop()
+		s.turnReadTimer = nil
+	}
+}
+
+func (s *openAIRealtimeSession) handleActiveTurnReadTimeout(seq int64, generation int64) {
+	if s == nil {
+		return
+	}
+	s.turnReadMu.Lock()
+	currentGeneration := s.turnReadGen
+	s.turnReadMu.Unlock()
+	if generation != currentGeneration || !s.hasActiveTurnSeq(seq) {
+		return
+	}
+	providerErr := types.NewErrorEvent("", "provider_error", "provider_read_timeout", "upstream realtime turn timed out")
+	s.enqueueOutbound(openAIRealtimeOutbound{
+		messageType: websocket.TextMessage,
+		payload:     []byte(providerErr.Error()),
+		origin:      runtimesession.RealtimePayloadOriginProxyLocal,
+		err:         runtimesession.ErrSessionClosed,
+	})
+	s.close("provider_read_timeout")
+}
+
+func (s *openAIRealtimeSession) setReadDeadlineForCurrentState() error {
+	if s == nil || s.conn == nil {
+		return nil
+	}
+	timeout := s.currentReadTimeout()
+	if timeout <= 0 {
+		return s.conn.SetReadDeadline(time.Time{})
+	}
+	return s.conn.SetReadDeadline(time.Now().Add(timeout))
+}
+
 func (s *openAIRealtimeSession) observeSupplierMessage(messageType int, payload []byte) (openAIRealtimeOutbound, bool) {
-	outbound := openAIRealtimeOutbound{messageType: messageType, payload: payload}
+	outbound := openAIRealtimeOutbound{
+		messageType: messageType,
+		payload:     payload,
+		origin:      runtimesession.RealtimePayloadOriginProvider,
+	}
 	if messageType != websocket.TextMessage {
 		return outbound, false
 	}
@@ -262,13 +742,16 @@ func (s *openAIRealtimeSession) observeSupplierMessage(messageType int, payload 
 	if err := json.Unmarshal(payload, &event); err != nil {
 		return outbound, false
 	}
-	if s.compatMode && event.IsError() {
+	eventType := strings.TrimSpace(event.Type)
+	if s.compatMode && event.IsError() && openAIRealtimeFatalErrorEvent(&event) {
 		outbound.err = runtimesession.ErrSessionClosed
 		return outbound, true
 	}
+	if s.responsesWS && eventType == types.EventTypeSessionCreated {
+		return openAIRealtimeOutbound{}, false
+	}
 
 	receivedAt := time.Now()
-	eventType := strings.TrimSpace(event.Type)
 	terminal, terminationReason := openAIRealtimeTurnTerminal(eventType, &event)
 	usage := openAIRealtimeResponseUsage(event.Response).Clone()
 	responseID := ""
@@ -298,9 +781,10 @@ func (s *openAIRealtimeSession) observeSupplierMessage(messageType int, payload 
 		outbound.usage = usageDelta.Clone()
 		if observer != nil {
 			if err := observer.ObserveTurnUsage(usageDelta.Clone()); err != nil {
+				logOpenAIRealtimeInternalError("openai realtime observer usage error: " + err.Error())
 				runOpenAIRealtimeFinalizers(s.finalizeObservedTurnState(turnState, "quota_exhausted", receivedAt))
-				quotaErr := types.NewErrorEvent("", "system_error", "system_error", err.Error())
-				outbound.err = runtimesession.NewClientPayloadError(quotaErr, []byte(quotaErr.Error()))
+				outbound.err = openAIRealtimeClientPayloadErrorFromObserver(err)
+				outbound.origin = runtimesession.RealtimePayloadOriginProxyLocal
 				return outbound, true
 			}
 		}
@@ -317,10 +801,91 @@ func (s *openAIRealtimeSession) observeSupplierMessage(messageType int, payload 
 	return outbound, false
 }
 
+func logOpenAIRealtimeInternalError(message string) {
+	if logger.Logger != nil {
+		logger.SysError(message)
+		return
+	}
+	log.Printf("[SYS] | %s", message)
+}
+
+func openAIRealtimeClientPayloadErrorFromObserver(err error) error {
+	if err == nil {
+		return nil
+	}
+	if payload := runtimesession.ClientPayloadFromError(err); len(payload) > 0 {
+		return err
+	}
+	var event *types.Event
+	if errors.As(err, &event) && event != nil && event.IsError() {
+		return err
+	}
+
+	code := "quota_exhausted"
+	var apiErr *types.OpenAIErrorWithStatusCode
+	if errors.As(err, &apiErr) && apiErr != nil {
+		code = openAIRealtimeErrorCodeString(apiErr.Code, code)
+	}
+	event = types.NewErrorEvent("", "system_error", code, openAIRealtimeObserverErrorMessage(code))
+	return runtimesession.NewClientPayloadError(event, []byte(event.Error()))
+}
+
+func openAIRealtimeErrorCodeString(code any, fallback string) string {
+	switch typed := code.(type) {
+	case string:
+		if trimmed := strings.TrimSpace(typed); trimmed != "" {
+			return trimmed
+		}
+	case nil:
+	default:
+		if trimmed := strings.TrimSpace(fmt.Sprint(typed)); trimmed != "" && trimmed != "<nil>" {
+			return trimmed
+		}
+	}
+	return fallback
+}
+
+func openAIRealtimeObserverErrorMessage(code string) string {
+	switch strings.TrimSpace(code) {
+	case "insufficient_user_quota", "quota_exhausted":
+		return "realtime quota limit exceeded"
+	case "pre_consume_token_quota_failed":
+		return "realtime token quota is not enough"
+	case "invalid_model_price":
+		return "realtime model price is invalid"
+	default:
+		return "realtime quota check failed"
+	}
+}
+
+func openAIRealtimeFatalErrorEvent(event *types.Event) bool {
+	if event == nil || !event.IsError() {
+		return false
+	}
+	switch openAIRealtimeEventErrorCode(event) {
+	case "session_expired", "rate_limit_exceeded", "server_error", "internal_error":
+		return true
+	default:
+		return false
+	}
+}
+
+func openAIRealtimeEventErrorCode(event *types.Event) string {
+	if event == nil || event.ErrorDetail == nil {
+		return ""
+	}
+	switch code := event.ErrorDetail.Code.(type) {
+	case string:
+		return strings.TrimSpace(code)
+	default:
+		return ""
+	}
+}
+
 func (s *openAIRealtimeSession) startTurn() (*openAIRealtimeTurnState, []openAIRealtimeFinalizedTurn, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.turn != nil {
+		s.mu.Unlock()
 		return nil, nil, newOpenAIRealtimeClientError("session_busy", "realtime session already has an inflight response")
 	}
 	finalized := s.finalizePendingTurnsLocked("", time.Now())
@@ -330,21 +895,42 @@ func (s *openAIRealtimeSession) startTurn() (*openAIRealtimeTurnState, []openAIR
 		observer = runtimesession.GuardTurnObserver(s.turnObserverFactory())
 	}
 	s.turn = newOpenAIRealtimeTurnState(s.turnSeq, time.Now(), observer)
-	return s.turn, finalized, nil
+	startedTurn := s.turn
+	s.mu.Unlock()
+	s.armActiveTurnReadTimeout(startedTurn)
+	return startedTurn, finalized, nil
 }
 
 func (s *openAIRealtimeSession) rollbackTurn(turn *openAIRealtimeTurnState) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	cleared := false
 	if s.turn == turn {
 		s.turn = nil
+		cleared = true
+	}
+	s.mu.Unlock()
+	if cleared {
+		s.stopActiveTurnReadTimeout()
+	}
+}
+
+func (s *openAIRealtimeSession) rollbackOpenAIRealtimeTurnAdmission(turn *openAIRealtimeTurnState, reason string) {
+	if turn == nil || turn.observer == nil {
+		return
+	}
+	if err := runtimesession.RollbackTurnAdmission(turn.observer, reason); err != nil {
+		logOpenAIRealtimeInternalError("openai realtime turn admission rollback failed: " + err.Error())
 	}
 }
 
 func (s *openAIRealtimeSession) finalizeTurn(reason string, now time.Time) (runtimesession.TurnObserver, runtimesession.TurnFinalizePayload) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.finalizeTurnLocked(reason, now)
+	observer, payload := s.finalizeTurnLocked(reason, now)
+	s.mu.Unlock()
+	if payload.TurnSeq > 0 {
+		s.stopActiveTurnReadTimeout()
+	}
+	return observer, payload
 }
 
 func (s *openAIRealtimeSession) finalizeTurnLocked(reason string, now time.Time) (runtimesession.TurnObserver, runtimesession.TurnFinalizePayload) {
@@ -369,7 +955,12 @@ func (s *openAIRealtimeSession) close(reason string) {
 			})
 		}
 		finalized = append(finalized, s.finalizePendingTurns(strings.TrimSpace(reason), now)...)
+		s.stopActiveTurnReadTimeout()
 		s.stopDetachTimer()
+		if s.controlWriter != nil {
+			s.controlWriter.Stop()
+			s.controlWriter.Wait()
+		}
 		if s.conn != nil {
 			_ = s.conn.Close()
 		}
@@ -390,24 +981,24 @@ func (s *openAIRealtimeSession) isDetached() bool {
 	}
 }
 
-func (s *openAIRealtimeSession) recvQueuedOutbound() (int, []byte, *types.UsageEvent, error, bool) {
+func (s *openAIRealtimeSession) recvQueuedOutbound() (int, []byte, *types.UsageEvent, runtimesession.RealtimePayloadOrigin, error, bool) {
 	if s == nil {
-		return 0, nil, nil, runtimesession.ErrSessionClosed, true
+		return 0, nil, nil, runtimesession.RealtimePayloadOriginProxyLocal, runtimesession.ErrSessionClosed, true
 	}
 	select {
 	case outbound, ok := <-s.recvCh:
-		messageType, payload, usage, err := decodeOpenAIRealtimeOutbound(outbound, ok)
-		return messageType, payload, usage, err, true
+		messageType, payload, usage, origin, err := decodeOpenAIRealtimeOutbound(outbound, ok)
+		return messageType, payload, usage, origin, err, true
 	default:
-		return 0, nil, nil, nil, false
+		return 0, nil, nil, runtimesession.RealtimePayloadOriginProxyLocal, nil, false
 	}
 }
 
-func decodeOpenAIRealtimeOutbound(outbound openAIRealtimeOutbound, ok bool) (int, []byte, *types.UsageEvent, error) {
+func decodeOpenAIRealtimeOutbound(outbound openAIRealtimeOutbound, ok bool) (int, []byte, *types.UsageEvent, runtimesession.RealtimePayloadOrigin, error) {
 	if !ok {
-		return 0, nil, nil, runtimesession.ErrSessionClosed
+		return 0, nil, nil, runtimesession.RealtimePayloadOriginProxyLocal, runtimesession.ErrSessionClosed
 	}
-	return outbound.messageType, outbound.payload, outbound.usage, outbound.err
+	return outbound.messageType, outbound.payload, outbound.usage, outbound.origin, outbound.err
 }
 
 func runOpenAIRealtimeFinalizers(finalized []openAIRealtimeFinalizedTurn) {
@@ -420,12 +1011,24 @@ func runOpenAIRealtimeFinalizers(finalized []openAIRealtimeFinalizedTurn) {
 
 func openAIRealtimeTurnTerminal(eventType string, event *types.Event) (bool, string) {
 	if event != nil && event.IsError() {
-		return true, types.EventTypeError
+		status := ""
+		if event.Response != nil {
+			status = event.Response.Status
+		}
+		classified := responsesws.ClassifyResponsesWSTerminalStatus(eventType, status, true, false, "")
+		return classified.Kind != responsesws.ResponsesNonTerminal, types.EventTypeError
 	}
-	if strings.TrimSpace(eventType) == types.EventTypeResponseDone {
-		return true, types.EventTypeResponseDone
+	status := ""
+	if event != nil {
+		if event.Response != nil {
+			status = event.Response.Status
+		}
 	}
-	return false, ""
+	classified := responsesws.ClassifyResponsesWSTerminalStatus(eventType, status, false, false, "")
+	if classified.Kind == responsesws.ResponsesNonTerminal {
+		return false, ""
+	}
+	return true, types.EventTypeResponseDone
 }
 
 func (s *openAIRealtimeSession) selectSupplierTurnLocked(responseID string) openAIRealtimeTurnSelection {
@@ -466,20 +1069,21 @@ func (s *openAIRealtimeSession) releaseTurnStateForRecovery(turnState *openAIRea
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if s.turn == turnState {
 		s.pendingTurns = append(s.pendingTurns, openAIRealtimePendingTurn{
 			state:  s.turn,
 			reason: strings.TrimSpace(reason),
 		})
 		s.turn = nil
+		s.mu.Unlock()
+		s.stopActiveTurnReadTimeout()
 		return
 	}
 
 	if index := s.pendingTurnIndexLocked(turnState); index >= 0 && strings.TrimSpace(reason) != "" {
 		s.pendingTurns[index].reason = strings.TrimSpace(reason)
 	}
+	s.mu.Unlock()
 }
 
 func (s *openAIRealtimeSession) finalizeObservedTurnState(turnState *openAIRealtimeTurnState, reason string, now time.Time) []openAIRealtimeFinalizedTurn {
@@ -488,10 +1092,10 @@ func (s *openAIRealtimeSession) finalizeObservedTurnState(turnState *openAIRealt
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if s.turn == turnState {
 		observer, payload := s.finalizeTurnLocked(reason, now)
+		s.mu.Unlock()
+		s.stopActiveTurnReadTimeout()
 		if observer == nil {
 			return nil
 		}
@@ -503,12 +1107,15 @@ func (s *openAIRealtimeSession) finalizeObservedTurnState(turnState *openAIRealt
 
 	index := s.pendingTurnIndexLocked(turnState)
 	if index < 0 {
+		s.mu.Unlock()
 		return nil
 	}
 
 	pending := s.pendingTurns[index]
 	s.pendingTurns = append(append([]openAIRealtimePendingTurn(nil), s.pendingTurns[:index]...), s.pendingTurns[index+1:]...)
-	return s.finalizePendingTurn(pending, reason, now)
+	finalized := s.finalizePendingTurn(pending, reason, now)
+	s.mu.Unlock()
+	return finalized
 }
 
 func (s *openAIRealtimeSession) pendingTurnIndexLocked(turnState *openAIRealtimeTurnState) int {
@@ -574,6 +1181,14 @@ func (s *openAIRealtimeSession) enqueueOutbound(outbound openAIRealtimeOutbound)
 	default:
 	}
 
+	var timer *time.Timer
+	var timerC <-chan time.Time
+	if openAIRealtimeOutboundBackpressureTimeout > 0 {
+		timer = time.NewTimer(openAIRealtimeOutboundBackpressureTimeout)
+		defer timer.Stop()
+		timerC = timer.C
+	}
+
 	select {
 	case <-s.closed:
 		return false
@@ -581,6 +1196,9 @@ func (s *openAIRealtimeSession) enqueueOutbound(outbound openAIRealtimeOutbound)
 		return s.discardDetachedOutbound()
 	case s.recvCh <- outbound:
 		return true
+	case <-timerC:
+		logOpenAIRealtimeInternalError("openai realtime outbound queue backpressure timeout")
+		return false
 	}
 }
 
@@ -635,13 +1253,12 @@ func normalizeOpenAIRealtimeClientPayload(payload []byte, messageType int, model
 		return payload, "", nil
 	}
 
-	var message map[string]any
+	var message map[string]json.RawMessage
 	if err := json.Unmarshal(payload, &message); err != nil {
 		return payload, "", nil
 	}
 
-	eventType, _ := message["type"].(string)
-	eventType = strings.TrimSpace(eventType)
+	eventType := rawJSONString(message["type"])
 	if compatMode {
 		return payload, eventType, nil
 	}
@@ -654,13 +1271,25 @@ func normalizeOpenAIRealtimeClientPayload(payload []byte, messageType int, model
 		return payload, eventType, nil
 	}
 
-	if response, ok := message["response"].(map[string]any); ok {
-		if strings.TrimSpace(anyToString(response["model"])) == "" {
-			response["model"] = trimmedModel
-			message["response"] = response
+	encodedModel, err := json.Marshal(trimmedModel)
+	if err != nil {
+		return payload, eventType, nil
+	}
+
+	if response, ok := rawJSONObject(message["response"]); ok {
+		if rawJSONString(response["model"]) != "" {
+			return payload, eventType, nil
 		}
-	} else if strings.TrimSpace(anyToString(message["model"])) == "" {
-		message["model"] = trimmedModel
+		response["model"] = encodedModel
+		encodedResponse, err := json.Marshal(response)
+		if err != nil {
+			return payload, eventType, nil
+		}
+		message["response"] = encodedResponse
+	} else if rawJSONString(message["model"]) == "" {
+		message["model"] = encodedModel
+	} else {
+		return payload, eventType, nil
 	}
 
 	normalized, err := json.Marshal(message)
@@ -668,6 +1297,28 @@ func normalizeOpenAIRealtimeClientPayload(payload []byte, messageType int, model
 		return payload, eventType, nil
 	}
 	return normalized, eventType, nil
+}
+
+func rawJSONObject(raw json.RawMessage) (map[string]json.RawMessage, bool) {
+	if len(raw) == 0 {
+		return nil, false
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
+		return nil, false
+	}
+	return object, true
+}
+
+func rawJSONString(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(value)
 }
 
 func (s *openAIRealtimeSession) rememberFinalizedResponseIDsLocked(responseIDs ...string) {

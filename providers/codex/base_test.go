@@ -122,6 +122,7 @@ func newTestCodexProviderWithContext(t *testing.T, key string, other string, hea
 		req.Header.Set(k, v)
 	}
 	ctx.Request = req
+	ctx.Set("responses_ws_self_hosted", true)
 	provider.Context = ctx
 
 	return provider
@@ -484,7 +485,7 @@ func TestBuildExecutionSessionMetadataRejectsInvalidSessionID(t *testing.T) {
 func TestBuildExecutionSessionMetadataRejectsOverlongSessionID(t *testing.T) {
 	key := `{"access_token":"access-token","account_id":"acct-123"}`
 	provider := newTestCodexProviderWithContext(t, key, "", map[string]string{
-		"X-Session-Id": strings.Repeat("a", codexRealtimeSessionIDMaxLen+1),
+		"X-Session-Id": strings.Repeat("a", runtimesession.ClientSessionIDMaxLen+1),
 	})
 
 	_, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimesession.RealtimeOpenOptions{})

@@ -1,21 +1,24 @@
 package codex
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
-	"net/url"
 	"strings"
 
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/logger"
 	"one-api/common/requester"
+	"one-api/common/responsesws"
 	"one-api/types"
 
 	"github.com/gorilla/websocket"
 )
 
 const codexResponsesWebsocketBetaHeaderValue = "responses_websockets=2026-02-06"
+const codexRealtimeMalformedPayloadLogLimit = 4096
 
 type codexRealtimeConnPlan struct {
 	wsURL   string
@@ -23,11 +26,15 @@ type codexRealtimeConnPlan struct {
 }
 
 func (p *CodexProvider) createChatRealtimeConn(modelName, sessionID string) (*websocket.Conn, *types.OpenAIErrorWithStatusCode) {
+	return p.createChatRealtimeConnWithContext(context.Background(), modelName, sessionID)
+}
+
+func (p *CodexProvider) createChatRealtimeConnWithContext(ctx context.Context, modelName, sessionID string) (*websocket.Conn, *types.OpenAIErrorWithStatusCode) {
 	plan, errWithCode := p.prepareChatRealtimeConn(modelName, sessionID)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
-	return p.dialChatRealtimeConn(plan)
+	return p.dialChatRealtimeConnWithContext(ctx, plan)
 }
 
 func (p *CodexProvider) prepareChatRealtimeConn(modelName, sessionID string) (*codexRealtimeConnPlan, *types.OpenAIErrorWithStatusCode) {
@@ -37,9 +44,10 @@ func (p *CodexProvider) prepareChatRealtimeConn(modelName, sessionID string) (*c
 	}
 
 	httpURL := p.GetFullRequestURL(urlPath, modelName)
-	wsURL, err := buildCodexRealtimeURL(httpURL)
+	proxyAddr := channelProxyValue(p.Channel)
+	wsURL, err := buildCodexRealtimeURLWithPolicy(httpURL, p.codexRealtimeSelfHosted(), proxyAddr == "")
 	if err != nil {
-		return nil, common.ErrorWrapper(err, "ws_request_failed", http.StatusInternalServerError)
+		return nil, common.StringErrorWrapperLocal(err.Error(), "ws_request_failed", requester.UpstreamRealtimeURLStatusCode(err))
 	}
 
 	headers, err := p.getRealtimeHeaders(sessionID)
@@ -54,31 +62,74 @@ func (p *CodexProvider) prepareChatRealtimeConn(modelName, sessionID string) (*c
 }
 
 func (p *CodexProvider) dialChatRealtimeConn(plan *codexRealtimeConnPlan) (*websocket.Conn, *types.OpenAIErrorWithStatusCode) {
+	return p.dialChatRealtimeConnWithContext(context.Background(), plan)
+}
+
+func (p *CodexProvider) dialChatRealtimeConnWithContext(ctx context.Context, plan *codexRealtimeConnPlan) (*websocket.Conn, *types.OpenAIErrorWithStatusCode) {
 	if plan == nil {
 		return nil, common.StringErrorWrapperLocal("realtime websocket plan is required", "ws_request_failed", http.StatusInternalServerError)
 	}
 
 	wsRequester := requester.NewWSRequester(channelProxyValue(p.Channel))
-	wsConn, err := wsRequester.NewRequest(plan.wsURL, wsRequester.WithHeader(plan.headers))
+	wsConn, err := wsRequester.NewRequestContext(ctx, plan.wsURL, wsRequester.WithHeader(plan.headers))
 	if err != nil {
-		return nil, common.ErrorWrapper(err, "ws_request_failed", http.StatusInternalServerError)
+		return nil, mapCodexRealtimeWSDialError(err)
 	}
 
 	return wsConn, nil
 }
 
+func mapCodexRealtimeWSDialError(err error) *types.OpenAIErrorWithStatusCode {
+	var handshake *requester.WSDialHandshakeError
+	if errors.As(err, &handshake) && handshake != nil {
+		switch handshake.StatusCode {
+		case http.StatusNotFound, http.StatusUpgradeRequired:
+			return common.StringErrorWrapperLocal("channel does not support Responses websocket transport", "responses_ws_unsupported_for_channel", http.StatusUpgradeRequired)
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return common.StringErrorWrapperLocal("provider authentication failed", "provider_authentication_failed", handshake.StatusCode)
+		case http.StatusTooManyRequests:
+			return common.StringErrorWrapperLocal("provider rate limit exceeded", "provider_rate_limit_exceeded", http.StatusTooManyRequests)
+		default:
+			if handshake.StatusCode >= 500 {
+				return common.StringErrorWrapperLocal("provider websocket request failed", "provider_ws_request_failed", handshake.StatusCode)
+			}
+		}
+	}
+	logger.LogError(context.Background(), "codex realtime websocket dial failed: "+err.Error())
+	return common.StringErrorWrapperLocal("websocket request failed", "ws_request_failed", http.StatusInternalServerError)
+}
+
 func buildCodexRealtimeURL(httpURL string) (string, error) {
-	parsed, err := url.Parse(strings.TrimSpace(httpURL))
+	return buildCodexRealtimeURLWithPolicy(httpURL, false, false)
+}
+
+func buildCodexRealtimeURLWithPolicy(httpURL string, allowSelfHosted bool, resolveHost bool) (string, error) {
+	return requester.ValidateUpstreamRealtimeURL(httpURL, requester.UpstreamRealtimeURLPolicy{
+		AllowSelfHosted: allowSelfHosted,
+		ResolveHost:     resolveHost,
+	})
+}
+
+func (p *CodexProvider) codexRealtimeSelfHosted() bool {
+	if p == nil {
+		return false
+	}
+	if p.Context != nil && p.Context.GetBool("responses_ws_self_hosted") {
+		return true
+	}
+	if p.Channel == nil {
+		return false
+	}
+	other, err := p.Channel.GetOtherMap()
 	if err != nil {
-		return "", err
+		return false
 	}
-	switch strings.ToLower(parsed.Scheme) {
-	case "http":
-		parsed.Scheme = "ws"
-	case "https":
-		parsed.Scheme = "wss"
+	for _, key := range []string{"responses_ws_self_hosted", "self_hosted"} {
+		if raw, ok := other[key]; ok && strings.EqualFold(strings.TrimSpace(string(raw)), "true") {
+			return true
+		}
 	}
-	return parsed.String(), nil
+	return false
 }
 
 var codexRealtimeCompatibilityHeaderKeys = []string{
@@ -162,24 +213,17 @@ func applyCodexExecutionSessionHeader(headers *codexHeaderBag, sessionID string)
 }
 
 func isCodexRealtimeTerminalStatus(status string) bool {
-	switch strings.TrimSpace(status) {
-	case types.ResponseStatusCompleted, types.ResponseStatusFailed, types.ResponseStatusIncomplete, types.ResponseStatusCancelled:
-		return true
-	default:
-		return false
-	}
+	classified := responsesws.ClassifyResponsesWSTerminalStatus(types.EventTypeResponseDone, status, false, false, "")
+	return classified.Kind != responsesws.ResponsesNonTerminal
 }
 
 func isCodexRealtimeTerminalEvent(event *types.OpenAIResponsesStreamResponses) bool {
 	if event == nil {
 		return false
 	}
-
-	switch strings.TrimSpace(event.Type) {
-	case "response.completed", "response.failed", "response.incomplete", types.EventTypeResponseDone:
+	if responsesws.ClassifyResponsesWSTerminal(event.Type, event.Response, event.Type == "error").Kind != responsesws.ResponsesNonTerminal {
 		return true
 	}
-
 	return event.Response != nil && isCodexRealtimeTerminalStatus(event.Response.Status)
 }
 
@@ -203,6 +247,7 @@ func (p *CodexProvider) handleRealtimeSupplierMessage(messageType int, message [
 
 	var event types.OpenAIResponsesStreamResponses
 	if err := json.Unmarshal(message, &event); err != nil {
+		logger.LogError(context.Background(), "codex realtime supplier message unmarshal failed: "+err.Error()+" payload="+codexRealtimePayloadSnippet(message))
 		return true, nil, nil, nil
 	}
 
@@ -228,6 +273,13 @@ func (p *CodexProvider) handleRealtimeSupplierMessage(messageType int, message [
 	}
 
 	return true, nil, nil, nil
+}
+
+func codexRealtimePayloadSnippet(payload []byte) string {
+	if len(payload) <= codexRealtimeMalformedPayloadLogLimit {
+		return string(payload)
+	}
+	return string(payload[:codexRealtimeMalformedPayloadLogLimit]) + "...(truncated)"
 }
 
 func (p *CodexProvider) getPassthroughRealtimeHeader(key string) string {

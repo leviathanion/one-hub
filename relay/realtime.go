@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/logger"
 	"one-api/common/requester"
 	"one-api/common/utils"
 	"one-api/metrics"
+	"one-api/middleware"
 	"one-api/model"
 	providersBase "one-api/providers/base"
 	"one-api/relay/relay_util"
@@ -21,6 +23,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"github.com/spf13/viper"
 )
 
 type RelayModeChatRealtime struct {
@@ -32,9 +35,153 @@ type RelayModeChatRealtime struct {
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
-		return true
+		return realtimeWebSocketOriginAllowed(r)
 	},
-	Subprotocols: []string{"realtime"},
+	EnableCompression: false,
+}
+
+var responsesWSUpgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return realtimeWebSocketOriginAllowed(r)
+	},
+	EnableCompression: false,
+}
+
+func realtimeWebSocketOriginAllowed(r *http.Request) bool {
+	return validateRealtimeWebSocketOrigin(r) == nil
+}
+
+func validateRealtimeWebSocketOrigin(r *http.Request) *types.OpenAIErrorWithStatusCode {
+	if r == nil {
+		return common.StringErrorWrapperLocal("websocket request is required", "invalid_request", http.StatusBadRequest)
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	hasCredentialSubprotocol := requestHasOpenAIInsecureAPIKeySubprotocol(r)
+	if origin == "" {
+		if hasCredentialSubprotocol {
+			return common.StringErrorWrapperLocal("origin is required when using insecure websocket API key subprotocol", "realtime_origin_required", http.StatusForbidden)
+		}
+		return nil
+	}
+	allowed := configuredRealtimeAllowedOrigins()
+	if len(allowed) == 0 {
+		if hasCredentialSubprotocol && !viper.GetBool("realtime.unsafe_allow_credential_subprotocol_any_origin") {
+			return common.StringErrorWrapperLocal("explicit websocket origin allowlist is required when using insecure websocket API key subprotocol", "realtime_origin_allowlist_required", http.StatusForbidden)
+		}
+		return nil
+	}
+	parsedOrigin, err := url.Parse(origin)
+	if err != nil || parsedOrigin.Scheme == "" || parsedOrigin.Host == "" {
+		return common.StringErrorWrapperLocal("invalid websocket origin", "invalid_origin", http.StatusForbidden)
+	}
+	if parsedOrigin.Scheme != "http" && parsedOrigin.Scheme != "https" {
+		return common.StringErrorWrapperLocal("invalid websocket origin", "invalid_origin", http.StatusForbidden)
+	}
+	for _, candidate := range allowed {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "*" {
+			if hasCredentialSubprotocol && !viper.GetBool("realtime.unsafe_allow_credential_subprotocol_any_origin") {
+				return common.StringErrorWrapperLocal("wildcard origin is not allowed with insecure websocket API key subprotocol", "realtime_origin_not_allowed", http.StatusForbidden)
+			}
+			return nil
+		}
+		if strings.EqualFold(candidate, origin) {
+			return nil
+		}
+	}
+	return common.StringErrorWrapperLocal("websocket origin is not allowed", "realtime_origin_not_allowed", http.StatusForbidden)
+}
+
+func configuredRealtimeAllowedOrigins() []string {
+	raw := viper.GetStringSlice("realtime.allowed_origins")
+	if len(raw) == 0 {
+		if single := strings.TrimSpace(viper.GetString("realtime.allowed_origins")); single != "" {
+			raw = strings.Split(single, ",")
+		}
+	}
+	origins := make([]string, 0, len(raw))
+	for _, origin := range raw {
+		trimmed := strings.TrimSpace(origin)
+		if trimmed != "" {
+			origins = append(origins, trimmed)
+		}
+	}
+	if len(origins) > 0 {
+		return origins
+	}
+	return middleware.ConfiguredCORSAllowOrigins()
+}
+
+func websocketUpgradeResponseHeader(r *http.Request) http.Header {
+	selected := selectWebSocketSubprotocol(r)
+	if selected == "" {
+		return nil
+	}
+	header := make(http.Header)
+	header.Set("Sec-Websocket-Protocol", selected)
+	return header
+}
+
+func selectWebSocketSubprotocol(r *http.Request) string {
+	protocols := allowedClientWebSocketSubprotocols(r)
+	if len(protocols) == 0 {
+		return ""
+	}
+	for _, protocol := range protocols {
+		if protocol == "realtime" {
+			return protocol
+		}
+	}
+	for _, protocol := range protocols {
+		if isEchoableWebSocketSubprotocol(protocol) {
+			return protocol
+		}
+	}
+	return ""
+}
+
+func isEchoableWebSocketSubprotocol(protocol string) bool {
+	protocol = strings.TrimSpace(protocol)
+	if protocol == "" {
+		return false
+	}
+	if strings.HasPrefix(strings.ToLower(protocol), "openai-insecure-api-key.") {
+		return false
+	}
+	return true
+}
+
+func allowedClientWebSocketSubprotocols(r *http.Request) []string {
+	if r == nil {
+		return nil
+	}
+	clientProtocols := websocket.Subprotocols(r)
+	allowed := make([]string, 0, len(clientProtocols))
+	for _, protocol := range clientProtocols {
+		protocol = strings.TrimSpace(protocol)
+		lower := strings.ToLower(protocol)
+		switch {
+		case protocol == "realtime":
+			allowed = append(allowed, protocol)
+		case protocol == "openai-beta.realtime-v1":
+			allowed = append(allowed, protocol)
+		case strings.HasPrefix(lower, "openai-insecure-api-key."):
+			allowed = append(allowed, protocol)
+		}
+	}
+	return allowed
+}
+
+func requestHasOpenAIInsecureAPIKeySubprotocol(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	for _, protocol := range websocket.Subprotocols(r) {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(protocol)), "openai-insecure-api-key.") {
+			return true
+		}
+	}
+	return false
 }
 
 func ChatRealtime(c *gin.Context) {
@@ -43,10 +190,14 @@ func ChatRealtime(c *gin.Context) {
 		common.AbortWithMessage(c, http.StatusBadRequest, "model_name_required")
 		return
 	}
+	if apiErr := validateRealtimeWebSocketOrigin(c.Request); apiErr != nil {
+		common.AbortWithErr(c, apiErr.StatusCode, apiErr)
+		return
+	}
 
-	userConn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	userConn, err := upgrader.Upgrade(c.Writer, c.Request, websocketUpgradeResponseHeader(c.Request))
 	if err != nil {
-		fmt.Println("upgrade failed", err)
+		logger.SysError("realtime websocket upgrade failed: " + err.Error())
 		common.AbortWithMessage(c, http.StatusInternalServerError, "upgrade_failed")
 		return
 	}
@@ -123,7 +274,29 @@ func buildRealtimeErrorPayload(apiErr *types.OpenAIErrorWithStatusCode) []byte {
 		errType = "system_error"
 	}
 
-	return []byte(types.NewErrorEvent("", errType, openAIErrorCodeString(apiErr.Code, "system_error"), apiErr.Message).Error())
+	code := openAIErrorCodeString(apiErr.Code, "system_error")
+	message := apiErr.Message
+	if apiErr.LocalError || strings.TrimSpace(message) == "" || apiErr.StatusCode >= http.StatusInternalServerError {
+		message = realtimeStaticErrorMessage(code)
+	}
+	return []byte(types.NewErrorEvent("", errType, code, message).Error())
+}
+
+func realtimeStaticErrorMessage(code string) string {
+	switch strings.TrimSpace(code) {
+	case "invalid_session_id":
+		return "invalid realtime session id"
+	case "provider_authentication_failed":
+		return "provider authentication failed"
+	case "provider_rate_limit_exceeded":
+		return "provider rate limit exceeded"
+	case "provider_ws_request_failed", "ws_request_failed":
+		return "websocket request failed"
+	case "session_binding_mismatch", "session_closed", "session_model_mismatch":
+		return "realtime session is unavailable"
+	default:
+		return "realtime request failed"
+	}
 }
 
 func (r *RelayModeChatRealtime) writeAbortPayload(payload []byte, code string) {
@@ -293,6 +466,9 @@ func openRealtimeSessionWithOptions(provider providersBase.ProviderInterface, mo
 	if providerWithOptions, ok := provider.(providersBase.RealtimeSessionProviderWithOptions); ok {
 		return providerWithOptions.OpenRealtimeSessionWithOptions(modelName, options)
 	}
+	if options.RequireWS {
+		return nil, common.StringErrorWrapperLocal("channel does not support Responses websocket transport", "responses_ws_unsupported_for_channel", http.StatusUpgradeRequired)
+	}
 	realtimeProvider, ok := provider.(providersBase.RealtimeSessionProvider)
 	if !ok {
 		return nil, common.StringErrorWrapperLocal("channel not implemented", "channel_error", http.StatusServiceUnavailable)
@@ -302,7 +478,7 @@ func openRealtimeSessionWithOptions(provider providersBase.ProviderInterface, mo
 
 func openRealtimeSessionWithFreshFallback(provider providersBase.ProviderInterface, modelName string, options runtimesession.RealtimeOpenOptions) (runtimesession.RealtimeSession, *types.OpenAIErrorWithStatusCode) {
 	realtimeSession, apiErr := openRealtimeSessionWithOptions(provider, modelName, options)
-	if apiErr == nil || options.ForceFresh || !shouldForceFreshRealtimeSession(apiErr) {
+	if apiErr == nil || options.RequireWS || options.ForceFresh || !shouldForceFreshRealtimeSession(apiErr) {
 		return realtimeSession, apiErr
 	}
 

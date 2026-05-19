@@ -579,6 +579,22 @@ func (s *Server) handlerForScript(script string) func(keys, args []string) int64
 			}
 			return 2
 		}
+	case strings.Contains(script, `redis.call("DECR", KEYS[1])`) && strings.Contains(script, `redis.call("DEL", KEYS[1])`):
+		return func(keys, args []string) int64 {
+			if len(keys) == 0 {
+				return 0
+			}
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			current, _ := strconv.ParseInt(s.values[keys[0]], 10, 64)
+			current--
+			if current <= 0 {
+				delete(s.values, keys[0])
+			} else {
+				s.values[keys[0]] = strconv.FormatInt(current, 10)
+			}
+			return current
+		}
 	default:
 		return nil
 	}

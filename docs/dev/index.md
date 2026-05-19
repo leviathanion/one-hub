@@ -4,12 +4,14 @@
 
 `docs/dev` 里原先有多份渠道亲和、usage 与 async task 设计文档，主题重复，而且不少内容混杂了“当前实现”和“未来草案”两种口径。
 
-现在收敛成四份“当前架构说明”与一份独立工具文档：
+现在收敛成若干份“当前架构说明”、一份 WebSocket 目标重构方案与一份独立工具文档：
 
 | 文档 | 主题 | 说明 |
 | --- | --- | --- |
 | [Channel Affinity 架构设计方案](./channel-affinity-architecture.md) | 渠道路由、responses affinity、Codex realtime affinity | 当前 routing / affinity 架构说明 |
 | [Billing / Usage 结算架构](./billing-settlement-architecture.md) | usage / settlement / finalize | 当前统一结算架构说明 |
+| [ResponsesWS 架构说明](./responses-ws-architecture.md) | `/v1/responses` WebSocket、actor、quota、upstream snapshot、fallback | 当前 ResponsesWS ingress 架构说明 |
+| [WebSocket Transport 复用方案](./websocket-transport-architecture.md) | `/v1/realtime` 与 ResponsesWS 的底层 I/O 复用 | 当前实现；共享 WebSocket safety primitives，不抽大一统 relay core |
 | [one-hub Async Task 架构设计](./task-coordination-architecture.md) | async task、identity、fetch、sweeper、finalize | 当前异步任务架构说明 |
 | [Execution Session Revocation 架构设计方案](./execution-session-revocation-refactor.md) | `runtime/session` 锁边界、revocation、Sweep、容量回收 | 当前 session manager revocation 架构说明 |
 | [Relay 压测脚本](./relay-performance-benchmark.md) | 热路径压测工具与口径 | 独立保留 |
@@ -20,6 +22,8 @@
 | --- | --- | --- |
 | [Channel Affinity 架构设计方案](./channel-affinity-architecture.md) | 当前实现 | 当前代码已按该方案收敛，用于解释现有 routing / affinity 行为 |
 | [Billing / Usage 结算架构](./billing-settlement-architecture.md) | 当前实现 | `Quota -> SettlementEnvelope -> ApplySettlement` 已成为统一结算主链路 |
+| [ResponsesWS 架构说明](./responses-ws-architecture.md) | 当前实现 | `GET /v1/responses` WebSocket ingress、actor/attempt、upstream snapshot、RequireWS、capability、fallback 和容量配置 |
+| [WebSocket Transport 复用方案](./websocket-transport-architecture.md) | 当前实现 | 只共享 writer、deadline、read limit、close、activity、error writer、active counter guard 等 safety primitives；不预先新建 `wsrelay` 包，不抽 callback pump |
 | [one-hub Async Task 架构设计](./task-coordination-architecture.md) | 当前实现 | `tasks` 行、settlement snapshot、local fetch、sweeper、finalize 已形成稳定边界 |
 | [Execution Session Revocation 架构设计方案](./execution-session-revocation-refactor.md) | 当前实现 | `runtime/session` revocation 锁外化、批量 sweep 检查与 Codex execution session timeout 配置已落地 |
 | [Relay 压测脚本](./relay-performance-benchmark.md) | 可直接使用 | 对应 `hack/bench/relay_bench.go`，用于热路径压测与指标对照 |

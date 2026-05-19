@@ -3,7 +3,6 @@ package types
 import (
 	"encoding/json"
 	"fmt"
-	"one-api/common/config"
 	"one-api/common/utils"
 )
 
@@ -110,51 +109,7 @@ func (u *UsageEvent) Clone() *UsageEvent {
 }
 
 func (u *UsageEvent) GetExtraTokens() map[string]int {
-	if u.ExtraTokens == nil {
-		u.ExtraTokens = make(map[string]int)
-	}
-
-	// 组装，已有的数据
-	if u.InputTokenDetails.CachedTokens > 0 && u.ExtraTokens[config.UsageExtraCache] == 0 {
-		u.ExtraTokens[config.UsageExtraCache] = u.InputTokenDetails.CachedTokens
-	}
-
-	if u.InputTokenDetails.AudioTokens > 0 && u.ExtraTokens[config.UsageExtraInputAudio] == 0 {
-		u.ExtraTokens[config.UsageExtraInputAudio] = u.InputTokenDetails.AudioTokens
-	}
-
-	if u.InputTokenDetails.TextTokens > 0 && u.ExtraTokens[config.UsageExtraInputTextTokens] == 0 {
-		u.ExtraTokens[config.UsageExtraInputTextTokens] = u.InputTokenDetails.TextTokens
-	}
-
-	if u.InputTokenDetails.CachedWriteTokens > 0 && u.ExtraTokens[config.UsageExtraCachedWrite] == 0 {
-		u.ExtraTokens[config.UsageExtraCachedWrite] = u.InputTokenDetails.CachedWriteTokens
-	}
-
-	if u.InputTokenDetails.CachedReadTokens > 0 && u.ExtraTokens[config.UsageExtraCachedRead] == 0 {
-		u.ExtraTokens[config.UsageExtraCachedRead] = u.InputTokenDetails.CachedReadTokens
-	}
-
-	if u.InputTokenDetails.ImageTokens > 0 && u.ExtraTokens[config.UsageExtraInputImageTokens] == 0 {
-		u.ExtraTokens[config.UsageExtraInputImageTokens] = u.InputTokenDetails.ImageTokens
-	}
-
-	if u.OutputTokenDetails.AudioTokens > 0 && u.ExtraTokens[config.UsageExtraOutputAudio] == 0 {
-		u.ExtraTokens[config.UsageExtraOutputAudio] = u.OutputTokenDetails.AudioTokens
-	}
-
-	if u.OutputTokenDetails.TextTokens > 0 && u.ExtraTokens[config.UsageExtraOutputTextTokens] == 0 {
-		u.ExtraTokens[config.UsageExtraOutputTextTokens] = u.OutputTokenDetails.TextTokens
-	}
-
-	if u.OutputTokenDetails.ReasoningTokens > 0 && u.ExtraTokens[config.UsageExtraReasoning] == 0 {
-		u.ExtraTokens[config.UsageExtraReasoning] = u.OutputTokenDetails.ReasoningTokens
-	}
-
-	if u.OutputTokenDetails.ImageTokens > 0 && u.ExtraTokens[config.UsageExtraOutputImageTokens] == 0 {
-		u.ExtraTokens[config.UsageExtraOutputImageTokens] = u.OutputTokenDetails.ImageTokens
-	}
-
+	u.ExtraTokens = fillExtraTokensFromDetails(u.ExtraTokens, u.InputTokenDetails, u.OutputTokenDetails)
 	return u.ExtraTokens
 }
 
@@ -167,49 +122,11 @@ func (u *UsageEvent) SetExtraTokens(key string, value int) {
 }
 
 func (u *UsageEvent) MergeExtraBilling(extraBilling map[string]ExtraBilling) {
-	if len(extraBilling) == 0 {
-		return
-	}
-	if u.ExtraBilling == nil {
-		u.ExtraBilling = make(map[string]ExtraBilling, len(extraBilling))
-	}
-	for key, value := range extraBilling {
-		serviceType := ResolveExtraBillingServiceType(key, value)
-		bType := ResolveExtraBillingType(key, value)
-		key = BuildExtraBillingKey(serviceType, bType)
-		if key == "" {
-			continue
-		}
-		billing := u.ExtraBilling[key]
-		if billing.ServiceType == "" {
-			billing.ServiceType = serviceType
-		}
-		if billing.Type == "" {
-			billing.Type = bType
-		}
-		billing.CallCount += value.CallCount
-		u.ExtraBilling[key] = billing
-	}
+	u.ExtraBilling = mergeExtraBillingMap(u.ExtraBilling, extraBilling)
 }
 
 func (u *UsageEvent) IncExtraBilling(key string, bType string) {
-	key = BuildExtraBillingKey(key, bType)
-	if key == "" {
-		return
-	}
-	if u.ExtraBilling == nil {
-		u.ExtraBilling = make(map[string]ExtraBilling)
-	}
-
-	billing := u.ExtraBilling[key]
-	if billing.ServiceType == "" {
-		billing.ServiceType = ResolveExtraBillingServiceType(key, billing)
-	}
-	if billing.Type == "" {
-		billing.Type = ResolveExtraBillingType(key, ExtraBilling{Type: bType})
-	}
-	billing.CallCount++
-	u.ExtraBilling[key] = billing
+	u.ExtraBilling = incExtraBillingMap(u.ExtraBilling, key, bType)
 }
 
 func (u *UsageEvent) ToChatUsage() *Usage {

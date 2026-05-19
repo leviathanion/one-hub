@@ -155,6 +155,15 @@ func TestQuotaComputationMetadataAndRealtimeHelpers(t *testing.T) {
 	if total := quota.GetTotalQuota(0, 0, nil); total != 0 {
 		t.Fatalf("expected zero token usage to produce zero quota, got %d", total)
 	}
+	if total := quota.GetTotalQuota(0, 0, map[string]types.ExtraBilling{
+		types.APIToolTypeWebSearchPreview: {
+			ServiceType: types.APIToolTypeWebSearchPreview,
+			Type:        "medium",
+			CallCount:   1,
+		},
+	}); total != 0 {
+		t.Fatalf("expected zero-token extra-billing-only usage to produce zero quota under legacy rules, got %d", total)
+	}
 	if total := quota.GetTotalQuotaByUsage(usage); total <= 0 {
 		t.Fatalf("expected token usage to produce positive quota, got %d", total)
 	}
@@ -162,6 +171,12 @@ func TestQuotaComputationMetadataAndRealtimeHelpers(t *testing.T) {
 	timesQuota := &Quota{price: model.Price{Type: model.TimesPriceType}, inputRatio: 1.25}
 	if total := timesQuota.GetTotalQuota(2, 3, nil); total != 1250 {
 		t.Fatalf("expected times pricing to ignore tokens and scale on input ratio, got %d", total)
+	}
+	if err := timesQuota.UpdateUserRealtimeQuota(&types.UsageEvent{}, &types.UsageEvent{InputTokens: 1, OutputTokens: 1}); err != nil {
+		t.Fatalf("expected times pricing realtime deltas to skip hard-cap quota increments, got %v", err)
+	}
+	if timesQuota.cacheQuota != 0 {
+		t.Fatalf("expected times pricing realtime deltas not to increase realtime cache quota, got %d", timesQuota.cacheQuota)
 	}
 
 	startedAt := time.Unix(1700000000, 0)
@@ -288,6 +303,262 @@ func insertQuotaReserveFixtures(t *testing.T, quota int) {
 		Group:       "default",
 	}).Error; err != nil {
 		t.Fatalf("expected token fixture to persist, got %v", err)
+	}
+}
+
+func TestQuotaNonRedisRealtimeHardCapRejectsOverBudgetUsage(t *testing.T) {
+	useQuotaReserveTestDB(t)
+	insertQuotaReserveFixtures(t, 5)
+
+	originalRedisEnabled := config.RedisEnabled
+	config.RedisEnabled = false
+	t.Cleanup(func() {
+		config.RedisEnabled = originalRedisEnabled
+	})
+
+	quota := &Quota{
+		userId:      1,
+		price:       model.Price{Type: model.TokensPriceType, Input: 1, Output: 1},
+		inputRatio:  1,
+		outputRatio: 1,
+	}
+	observed := &types.UsageEvent{}
+	err := quota.UpdateUserRealtimeQuota(observed, &types.UsageEvent{InputTokens: 3, OutputTokens: 4, TotalTokens: 7})
+	if err == nil || !strings.Contains(err.Error(), "user quota is not enough") {
+		t.Fatalf("expected non-redis realtime hard cap to reject over-budget usage, got %v", err)
+	}
+	if observed.InputTokens != 3 || observed.OutputTokens != 4 || observed.TotalTokens != 7 {
+		t.Fatalf("expected hard-cap check to preserve observed usage merge, got %+v", observed)
+	}
+}
+
+func TestPreQuotaConsumptionRollbackableIsIdempotent(t *testing.T) {
+	useQuotaReserveTestDB(t)
+	insertQuotaReserveFixtures(t, 1000)
+
+	originalPricing := model.PricingInstance
+	originalBatch := config.BatchUpdateEnabled
+	originalRedisEnabled := config.RedisEnabled
+	originalPreConsumedQuota := config.PreConsumedQuota
+	model.PricingInstance = &model.Pricing{
+		Prices: map[string]*model.Price{
+			"gpt-5": {Model: "gpt-5", Type: model.TokensPriceType, Input: 1, Output: 1},
+		},
+	}
+	config.BatchUpdateEnabled = false
+	config.RedisEnabled = false
+	config.PreConsumedQuota = 500
+	t.Cleanup(func() {
+		model.PricingInstance = originalPricing
+		config.BatchUpdateEnabled = originalBatch
+		config.RedisEnabled = originalRedisEnabled
+		config.PreConsumedQuota = originalPreConsumedQuota
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ctx.Set("id", 1)
+	ctx.Set("token_id", 1)
+	ctx.Set("group_ratio", 1.0)
+
+	quota := NewQuota(ctx, "gpt-5", 100)
+	if apiErr := quota.PreQuotaConsumptionRollbackable(); apiErr != nil {
+		t.Fatalf("expected first preconsume to succeed, got %+v", apiErr)
+	}
+	if apiErr := quota.PreQuotaConsumptionRollbackable(); apiErr != nil {
+		t.Fatalf("expected repeated preconsume to be a no-op, got %+v", apiErr)
+	}
+
+	var user model.User
+	if err := model.DB.First(&user, 1).Error; err != nil {
+		t.Fatalf("expected user lookup to succeed, got %v", err)
+	}
+	var token model.Token
+	if err := model.DB.First(&token, 1).Error; err != nil {
+		t.Fatalf("expected token lookup to succeed, got %v", err)
+	}
+	if user.Quota != 400 || token.RemainQuota != 400 || token.UsedQuota != 600 {
+		t.Fatalf("expected repeated preconsume to debit exactly once, user=%d token_remain=%d token_used=%d", user.Quota, token.RemainQuota, token.UsedQuota)
+	}
+}
+
+func TestConsumeSettlementSuccessClearsPreConsumeRollbackState(t *testing.T) {
+	useQuotaReserveTestDB(t)
+	insertQuotaReserveFixtures(t, 1000)
+
+	originalPricing := model.PricingInstance
+	originalBatch := config.BatchUpdateEnabled
+	originalRedisEnabled := config.RedisEnabled
+	originalLogConsume := config.LogConsumeEnabled
+	originalPreConsumedQuota := config.PreConsumedQuota
+	model.PricingInstance = &model.Pricing{
+		Prices: map[string]*model.Price{
+			"gpt-5": {Model: "gpt-5", Type: model.TokensPriceType, Input: 1, Output: 1},
+		},
+	}
+	config.BatchUpdateEnabled = false
+	config.RedisEnabled = false
+	config.LogConsumeEnabled = false
+	config.PreConsumedQuota = 500
+	t.Cleanup(func() {
+		model.PricingInstance = originalPricing
+		config.BatchUpdateEnabled = originalBatch
+		config.RedisEnabled = originalRedisEnabled
+		config.LogConsumeEnabled = originalLogConsume
+		config.PreConsumedQuota = originalPreConsumedQuota
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ctx.Set("id", 1)
+	ctx.Set("token_id", 1)
+	ctx.Set("group_ratio", 1.0)
+
+	quota := NewQuota(ctx, "gpt-5", 100)
+	if apiErr := quota.PreQuotaConsumptionRollbackable(); apiErr != nil {
+		t.Fatalf("expected preconsume to succeed, got %+v", apiErr)
+	}
+	if !quota.HasPreConsumedSideEffect() {
+		t.Fatal("expected preconsume side effect before settlement")
+	}
+
+	if err := quota.ConsumeWithIdentity(ctx, &types.Usage{PromptTokens: 800, TotalTokens: 800}, false, billing.SettlementRequestKindUnary, "", false); err != nil {
+		t.Fatalf("expected settlement to succeed, got %v", err)
+	}
+	if quota.HasPreConsumedSideEffect() {
+		t.Fatalf("expected successful settlement to clear rollback state, truth=%v cache=%v", quota.PreconsumeTruthApplied, quota.PreconsumeCacheApplied)
+	}
+	if err := quota.UndoSynchronously(ctx); err != nil {
+		t.Fatalf("expected post-settlement undo to be a no-op, got %v", err)
+	}
+
+	var user model.User
+	if err := model.DB.First(&user, 1).Error; err != nil {
+		t.Fatalf("expected user lookup to succeed, got %v", err)
+	}
+	var token model.Token
+	if err := model.DB.First(&token, 1).Error; err != nil {
+		t.Fatalf("expected token lookup to succeed, got %v", err)
+	}
+	if user.Quota != 200 || user.UsedQuota != 800 || user.RequestCount != 1 {
+		t.Fatalf("expected final quota to stay settled after undo, quota=%d used=%d requests=%d", user.Quota, user.UsedQuota, user.RequestCount)
+	}
+	if token.RemainQuota != 200 || token.UsedQuota != 800 {
+		t.Fatalf("expected final token quota to stay settled after undo, remain=%d used=%d", token.RemainQuota, token.UsedQuota)
+	}
+}
+
+func TestPreQuotaConsumptionRollbackableRollsBackTruthWhenCacheReserveFails(t *testing.T) {
+	useQuotaReserveTestDB(t)
+	insertQuotaReserveFixtures(t, 1000)
+
+	server, err := fakeredis.Start()
+	if err != nil {
+		t.Fatalf("expected fake redis server to start, got %v", err)
+	}
+	defer server.Close()
+	server.FailNext("DECRBY", "ERR cache unavailable")
+
+	originalPricing := model.PricingInstance
+	originalRedisEnabled := config.RedisEnabled
+	originalRedisClient := commonredis.RDB
+	model.PricingInstance = &model.Pricing{
+		Prices: map[string]*model.Price{
+			"gpt-5": {Model: "gpt-5", Type: model.TokensPriceType, Input: 1, Output: 1},
+		},
+	}
+	config.RedisEnabled = true
+	commonredis.RDB = server.Client()
+	t.Cleanup(func() {
+		model.PricingInstance = originalPricing
+		config.RedisEnabled = originalRedisEnabled
+		commonredis.RDB = originalRedisClient
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ctx.Set("id", 1)
+	ctx.Set("token_id", 1)
+	ctx.Set("group_ratio", 1.0)
+
+	quota := NewQuota(ctx, "gpt-5", 100)
+	apiErr := quota.PreQuotaConsumptionRollbackable()
+	if apiErr == nil || apiErr.Code != "decrease_user_quota_failed" {
+		t.Fatalf("expected cache reserve failure to surface a quota cache error, got %+v", apiErr)
+	}
+	if quota.PreconsumeTruthApplied || quota.PreconsumeCacheApplied {
+		t.Fatalf("expected failed cache reserve to roll back all preconsume state, got truth=%v cache=%v", quota.PreconsumeTruthApplied, quota.PreconsumeCacheApplied)
+	}
+
+	var user model.User
+	var token model.Token
+	if err := model.DB.First(&user, 1).Error; err != nil {
+		t.Fatalf("expected user lookup to succeed, got %v", err)
+	}
+	if err := model.DB.First(&token, 1).Error; err != nil {
+		t.Fatalf("expected token lookup to succeed, got %v", err)
+	}
+	if user.Quota != 1000 || token.RemainQuota != 1000 || token.UsedQuota != 0 {
+		t.Fatalf("expected failed cache reserve to restore truth state, user=%+v token=%+v", user, token)
+	}
+}
+
+func TestPreQuotaConsumptionRollsBackTruthWhenCacheReserveFails(t *testing.T) {
+	useQuotaReserveTestDB(t)
+	insertQuotaReserveFixtures(t, 1000)
+
+	server, err := fakeredis.Start()
+	if err != nil {
+		t.Fatalf("expected fake redis server to start, got %v", err)
+	}
+	defer server.Close()
+	server.FailNext("DECRBY", "ERR cache unavailable")
+
+	originalPricing := model.PricingInstance
+	originalRedisEnabled := config.RedisEnabled
+	originalRedisClient := commonredis.RDB
+	model.PricingInstance = &model.Pricing{
+		Prices: map[string]*model.Price{
+			"gpt-5": {Model: "gpt-5", Type: model.TokensPriceType, Input: 1, Output: 1},
+		},
+	}
+	config.RedisEnabled = true
+	commonredis.RDB = server.Client()
+	t.Cleanup(func() {
+		model.PricingInstance = originalPricing
+		config.RedisEnabled = originalRedisEnabled
+		commonredis.RDB = originalRedisClient
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	ctx.Set("id", 1)
+	ctx.Set("token_id", 1)
+	ctx.Set("group_ratio", 1.0)
+
+	quota := NewQuota(ctx, "gpt-5", 100)
+	apiErr := quota.PreQuotaConsumption()
+	if apiErr == nil || apiErr.Code != "decrease_user_quota_failed" {
+		t.Fatalf("expected ordinary preconsume cache failure to surface a quota cache error, got %+v", apiErr)
+	}
+	if quota.PreconsumeTruthApplied || quota.PreconsumeCacheApplied {
+		t.Fatalf("expected ordinary preconsume failure to roll back all state, got truth=%v cache=%v", quota.PreconsumeTruthApplied, quota.PreconsumeCacheApplied)
+	}
+
+	var user model.User
+	var token model.Token
+	if err := model.DB.First(&user, 1).Error; err != nil {
+		t.Fatalf("expected user lookup to succeed, got %v", err)
+	}
+	if err := model.DB.First(&token, 1).Error; err != nil {
+		t.Fatalf("expected token lookup to succeed, got %v", err)
+	}
+	if user.Quota != 1000 || token.RemainQuota != 1000 || token.UsedQuota != 0 {
+		t.Fatalf("expected ordinary preconsume failure to restore truth state, user=%+v token=%+v", user, token)
 	}
 }
 
@@ -472,5 +743,89 @@ func TestConsumeUsageSettlementReconcilesRealtimeQuotaOnError(t *testing.T) {
 	}
 	if got, _ := server.GetRaw(realtimeKey); got != "0" {
 		t.Fatalf("expected realtime quota key to be cleared after settlement failure, got %q", got)
+	}
+}
+
+func TestConsumeUsageSettlementFailurePreservesPreConsumedTruth(t *testing.T) {
+	logger.Logger = zap.NewNop()
+	gin.SetMode(gin.TestMode)
+
+	originalDB := model.DB
+	originalPricing := model.PricingInstance
+	originalBatchUpdate := config.BatchUpdateEnabled
+	originalRedisEnabled := config.RedisEnabled
+	testDB, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("expected in-memory sqlite database, got %v", err)
+	}
+	if err := testDB.AutoMigrate(&model.User{}, &model.Token{}, &model.Log{}); err != nil {
+		t.Fatalf("expected schema migration to succeed, got %v", err)
+	}
+	model.DB = testDB
+	model.PricingInstance = &model.Pricing{
+		Prices: map[string]*model.Price{
+			"gpt-5": {Model: "gpt-5", Type: model.TokensPriceType, Input: 1, Output: 1},
+		},
+	}
+	config.BatchUpdateEnabled = false
+	config.RedisEnabled = false
+	t.Cleanup(func() {
+		model.DB = originalDB
+		model.PricingInstance = originalPricing
+		config.BatchUpdateEnabled = originalBatchUpdate
+		config.RedisEnabled = originalRedisEnabled
+	})
+
+	if err := model.DB.Create(&model.User{Id: 1, Username: "alice", Quota: 1000, Status: config.UserStatusEnabled, CreatedTime: 1}).Error; err != nil {
+		t.Fatalf("expected user fixture to persist, got %v", err)
+	}
+	if err := model.DB.Session(&gorm.Session{SkipHooks: true}).Create(&model.Token{Id: 1, UserId: 1, Key: "token-key", RemainQuota: 1000}).Error; err != nil {
+		t.Fatalf("expected token fixture to persist, got %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/realtime", nil)
+	ctx.Set("id", 1)
+	ctx.Set("token_id", 1)
+	ctx.Set("group_ratio", 1.0)
+
+	quota := NewQuota(ctx, "gpt-5", 100)
+	if apiErr := quota.PreQuotaConsumptionRollbackable(); apiErr != nil {
+		t.Fatalf("expected preconsume to succeed, got %v", apiErr)
+	}
+	if !quota.PreconsumeTruthApplied {
+		t.Fatal("expected preconsume truth side effect before settlement")
+	}
+	var preUser model.User
+	var preToken model.Token
+	if err := model.DB.First(&preUser, 1).Error; err != nil {
+		t.Fatalf("expected preconsume user lookup to succeed, got %v", err)
+	}
+	if err := model.DB.First(&preToken, 1).Error; err != nil {
+		t.Fatalf("expected preconsume token lookup to succeed, got %v", err)
+	}
+	if err := model.DB.Exec(`CREATE TRIGGER fail_user_quota_decrease BEFORE UPDATE OF quota ON users WHEN NEW.quota < OLD.quota BEGIN SELECT RAISE(FAIL, 'blocked quota decrease'); END;`).Error; err != nil {
+		t.Fatalf("expected failure trigger to install, got %v", err)
+	}
+
+	err = quota.ConsumeWithIdentity(ctx, &types.Usage{PromptTokens: 800, TotalTokens: 800}, false, billing.SettlementRequestKindRealtimeTurn, "settlement-fail", false)
+	if err == nil {
+		t.Fatal("expected settlement to fail")
+	}
+	if !quota.PreconsumeTruthApplied {
+		t.Fatal("expected failed settlement to preserve preconsume truth")
+	}
+
+	var user model.User
+	var token model.Token
+	if err := model.DB.First(&user, 1).Error; err != nil {
+		t.Fatalf("expected user lookup to succeed, got %v", err)
+	}
+	if err := model.DB.First(&token, 1).Error; err != nil {
+		t.Fatalf("expected token lookup to succeed, got %v", err)
+	}
+	if user.Quota != preUser.Quota || token.RemainQuota != preToken.RemainQuota || token.UsedQuota != preToken.UsedQuota {
+		t.Fatalf("expected failed settlement to keep preconsume truth, before_user=%+v after_user=%+v before_token=%+v after_token=%+v", preUser, user, preToken, token)
 	}
 }

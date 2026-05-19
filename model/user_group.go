@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"one-api/common/config"
 	"one-api/common/limit"
+	"one-api/common/logger"
 	"one-api/common/redis"
 	"sync"
 )
@@ -127,11 +128,29 @@ func (cgrm *UserGroupRatio) Load() {
 	}
 
 	cgrm.Lock()
-	defer cgrm.Unlock()
+	oldLimiters := cgrm.APILimiter
 
 	cgrm.UserGroup = newUserGroups
 	cgrm.APILimiter = newAPILimiter
 	cgrm.PublicGroup = publicGroup
+	cgrm.Unlock()
+
+	stopUserGroupAPILimiters(oldLimiters)
+}
+
+func stopUserGroupAPILimiters(limiters map[string]limit.RateLimiter) {
+	for symbol, limiter := range limiters {
+		if stopper, ok := limiter.(interface{ Stop() }); ok && stopper != nil {
+			func() {
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						logger.SysError(fmt.Sprintf("panic stopping api limiter for group %s: %v", symbol, recovered))
+					}
+				}()
+				stopper.Stop()
+			}()
+		}
+	}
 }
 
 func (cgrm *UserGroupRatio) GetBySymbol(symbol string) *UserGroup {

@@ -64,7 +64,7 @@ lastUpdated: true
 
 选择原因：
 
-- 如果稳定 hint 只在 provider 内部事后生成，记录 affinity 和命中 affinity 发生在两个时间层，路由阶段无法看到真正的 sticky identity。
+- 如果稳定 hint 只在 provider 内部事后生成，记录 affinity 和命中 affinity 发生在两个时间层，路由阶段无法看到真正的稳定亲和键。
 - 对 prompt cache 这类会直接影响渠道选择的键，必须在选路之前固定下来。
 
 ### 4. Codex realtime 采用“共享 binding hint + 本地 runtime owner”，不做 strict distributed owner
@@ -304,6 +304,8 @@ Codex realtime 的共享亲和逻辑由 `providers/codex/realtime_session.go` �
 - 自动去掉 `previous_response_id` 并重试。
 - 静默回放。
 - 把 continuation miss 视为普通渠道错误并走通用 retry/cooldown。
+
+ResponsesWS 也遵守同一 correctness 边界，但错误交互形态不同：actor 在当前 upstream session 内透传或规范化为 WS error frame，并记录连接建立时的 upstream snapshot；不得因为 `previous_response_not_found` 重新选 channel/key、重放业务事件或清空 `previous_response_id` 后继续发送。
 
 ## 一致性模型
 

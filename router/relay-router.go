@@ -31,8 +31,14 @@ func setOpenAIRouter(router *gin.Engine) {
 		modelsRouter.GET("", relay.ListModelsByToken)
 		modelsRouter.GET("/:model", relay.RetrieveModel)
 	}
-	relayV1Router := router.Group("/v1")
-	relayV1Router.Use(middleware.RelayPanicRecover(), middleware.OpenaiAuth(), middleware.Distribute(), middleware.DynamicRedisRateLimiter())
+	relayV1Shared := router.Group("/v1")
+	relayV1Shared.Use(middleware.RelayPanicRecover(), middleware.OpenaiAuth(), middleware.Distribute())
+	{
+		relayV1Shared.GET("/responses", relay.ResponsesWebSocket)
+	}
+
+	relayV1Router := relayV1Shared.Group("")
+	relayV1Router.Use(middleware.DynamicRedisRateLimiter())
 	{
 		relayV1Router.GET("/realtime", relay.ChatRealtime)
 	}

@@ -21,6 +21,8 @@ var (
 	ErrTokenStatusUnavailable = errors.New("令牌状态不可用")
 	ErrTokenInvalid           = errors.New("无效的令牌")
 	ErrTokenQuotaGet          = errors.New("获取令牌额度失败")
+	ErrUserQuotaInsufficient  = errors.New("user quota is not enough")
+	ErrTokenQuotaInsufficient = errors.New("token quota is not enough")
 )
 
 type Token struct {
@@ -407,33 +409,23 @@ func PreConsumeTokenQuota(tokenId int, quota int) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
+	if quota == 0 {
+		return nil
+	}
 	token, err := GetTokenById(tokenId)
 	if err != nil {
 		return err
 	}
-	if !token.UnlimitedQuota && token.RemainQuota < quota {
-		return errors.New("令牌额度不足")
-	}
 	userQuota, err := GetUserQuota(token.UserId)
 	if err != nil {
 		return err
-	}
-	if userQuota < quota {
-		return errors.New("用户额度不足")
 	}
 	quotaTooLow := userQuota >= config.QuotaRemindThreshold && userQuota-quota < config.QuotaRemindThreshold
 	noMoreQuota := userQuota-quota <= 0
 	if quotaTooLow || noMoreQuota {
 		go sendQuotaWarningEmail(token.UserId, userQuota, noMoreQuota)
 	}
-	if !token.UnlimitedQuota {
-		err = DecreaseTokenQuota(tokenId, quota)
-		if err != nil {
-			return err
-		}
-	}
-	err = DecreaseUserQuota(token.UserId, quota)
-	return err
+	return ApplyTokenUserQuotaDeltaDirect(tokenId, token.UserId, token.UnlimitedQuota, quota)
 }
 
 func sendQuotaWarningEmail(userId int, userQuota int, noMoreQuota bool) {
@@ -514,8 +506,7 @@ func ApplyTokenUserQuotaDeltaDirect(tokenId int, userId int, unlimitedQuota bool
 
 	userQuotaChange := pendingUserQuota - quota
 	if userQuotaChange != 0 {
-		err = tx.Model(&User{}).Where("id = ?", userId).Update("quota", gorm.Expr("quota + ?", userQuotaChange)).Error
-		if err != nil {
+		if err = applyUserQuotaChangeDirect(tx, userId, userQuotaChange); err != nil {
 			tx.Rollback()
 			return err
 		}
@@ -531,18 +522,50 @@ func ApplyTokenUserQuotaDeltaDirect(tokenId int, userId int, unlimitedQuota bool
 			tokenUpdate["used_quota"] = gorm.Expr("used_quota - ?", tokenQuotaChange)
 		}
 
-		err = tx.Model(&Token{}).Where("id = ?", tokenId).Updates(tokenUpdate).Error
-		if err != nil {
+		if err = applyTokenQuotaChangeDirect(tx, tokenId, tokenQuotaChange, tokenUpdate); err != nil {
 			tx.Rollback()
 			return err
 		}
 	}
 
+	// Once the SQL commit is attempted after all local guards succeeded, pending
+	// batch reserves must not be replayed on a post-commit panic. If Commit
+	// reports an error, restore the pending adjustments for the next flush.
+	restorePending = false
 	if err = tx.Commit().Error; err != nil {
+		restorePending = true
 		return err
 	}
+	return nil
+}
 
-	restorePending = false
+func applyUserQuotaChangeDirect(tx *gorm.DB, userId int, quotaChange int) error {
+	query := tx.Model(&User{}).Where("id = ?", userId)
+	if quotaChange < 0 {
+		query = query.Where("quota >= ?", -quotaChange)
+	}
+	result := query.Update("quota", gorm.Expr("quota + ?", quotaChange))
+	if result.Error != nil {
+		return result.Error
+	}
+	if quotaChange < 0 && result.RowsAffected == 0 {
+		return ErrUserQuotaInsufficient
+	}
+	return nil
+}
+
+func applyTokenQuotaChangeDirect(tx *gorm.DB, tokenId int, quotaChange int, tokenUpdate map[string]interface{}) error {
+	query := tx.Model(&Token{}).Where("id = ?", tokenId)
+	if quotaChange < 0 {
+		query = query.Where("remain_quota >= ?", -quotaChange)
+	}
+	result := query.Updates(tokenUpdate)
+	if result.Error != nil {
+		return result.Error
+	}
+	if quotaChange < 0 && result.RowsAffected == 0 {
+		return ErrTokenQuotaInsufficient
+	}
 	return nil
 }
 

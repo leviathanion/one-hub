@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"fmt"
 	"net/http"
@@ -50,6 +51,7 @@ func main() {
 
 	logger.SetupLogger()
 	logger.SysLog("One Hub " + config.Version + " started")
+	middleware.WarnResponsesWSAnonymousCapacityBucketIfEnabled()
 
 	// Initialize user token
 	err := common.InitUserToken()
@@ -62,6 +64,7 @@ func main() {
 	defer model.CloseDB()
 	// Initialize Redis
 	redis.InitRedisClient()
+	model.StartUserQuotaCacheRepairWorker(context.Background(), time.Minute)
 	codex.InitExecutionSessionManager()
 	cache.InitCacheManager()
 	// Initialize options

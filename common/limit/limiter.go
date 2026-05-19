@@ -6,3 +6,8 @@ type RateLimiter interface {
 	AllowN(keyPrefix string, n int) bool
 	GetCurrentRate(keyPrefix string) (int, error) // 返回当前已使用的速率
 }
+
+type ErrorAwareRateLimiter interface {
+	RateLimiter
+	AllowNWithError(keyPrefix string, n int) (bool, error)
+}

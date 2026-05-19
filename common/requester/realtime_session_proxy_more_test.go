@@ -29,6 +29,15 @@ func TestRealtimeSessionProxyHelperMethodsAndErrorClassification(t *testing.T) {
 		t.Fatalf("expected Close to detach session with proxy_closed, got %q", got)
 	}
 
+	coordinated := NewRealtimeSessionProxy(nil, newFakeRealtimeSession(), time.Second)
+	coordinated.started.Store(true)
+	go coordinated.coordinate()
+	coordinated.Close()
+	coordinated.Wait()
+	if got := coordinated.session.(*fakeRealtimeSession).lastCloseReason(); got != "proxy_closed" {
+		t.Fatalf("expected started Close to route through external close intent, got %q", got)
+	}
+
 	proxy.markActivity(time.Time{})
 	if proxy.lastActivityUnixNano.Load() == 0 {
 		t.Fatal("expected markActivity to backfill zero timestamps")
@@ -57,8 +66,8 @@ func TestRealtimeSessionProxyHelperMethodsAndErrorClassification(t *testing.T) {
 	if payload := string(proxyErrorPayload(structuredErr)); !strings.Contains(payload, `"code":"session_busy"`) {
 		t.Fatalf("expected structured proxy error payload, got %q", payload)
 	}
-	if payload := string(proxyErrorPayload(errors.New("boom"))); !strings.Contains(payload, `"message":"boom"`) {
-		t.Fatalf("expected generic proxy error payload, got %q", payload)
+	if payload := string(proxyErrorPayload(errors.New("boom"))); !strings.Contains(payload, `"message":"realtime proxy request failed"`) {
+		t.Fatalf("expected static generic proxy error payload, got %q", payload)
 	}
 
 	if !isRecoverableRealtimeProxyError(structuredErr) {
@@ -75,7 +84,7 @@ func TestRealtimeSessionProxyHelperMethodsAndErrorClassification(t *testing.T) {
 		t.Fatal("expected normal websocket closure to classify as disconnect")
 	}
 	if !isRealtimeDisconnectError(errors.New("broken pipe")) || !isRealtimeDisconnectError(errors.New("connection reset by peer")) {
-		t.Fatal("expected socket reset strings to classify as disconnects")
+		t.Fatal("expected common socket reset strings to classify as disconnects")
 	}
 	if isRealtimeDisconnectError(errors.New("something else")) {
 		t.Fatal("expected unrelated errors not to classify as disconnects")
@@ -120,5 +129,25 @@ func TestRealtimeSessionProxyHelperMethodsAndErrorClassification(t *testing.T) {
 	case <-idleDone:
 	case <-time.After(time.Second):
 		t.Fatal("expected idleWatchdog with non-positive timeout to return immediately")
+	}
+}
+
+func TestRealtimeSessionProxyCloseDownstreamClosesAfterWriteCloseError(t *testing.T) {
+	conn := &recordingWSWriterConn{controlErr: errors.New("write close failed")}
+	proxy := NewRealtimeSessionProxy(nil, newFakeRealtimeSession(), time.Second)
+	proxy.writer = NewWSClientWriter(conn, func() time.Duration { return time.Second })
+
+	proxy.closeDownstream(websocket.CloseNormalClosure, "idle_timeout")
+
+	if len(conn.controls) != 0 {
+		t.Fatalf("expected failed close frame write not to record controls, got %d", len(conn.controls))
+	}
+	if conn.closeCount != 1 {
+		t.Fatalf("expected writer Close to run after WriteClose failure, got %d", conn.closeCount)
+	}
+	select {
+	case <-proxy.ctx.Done():
+	default:
+		t.Fatal("expected closeDownstream to cancel proxy context")
 	}
 }

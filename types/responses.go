@@ -974,9 +974,12 @@ type ResponsesUsageOutputTokensDetails struct {
 }
 
 type ResponsesUsageInputTokensDetails struct {
-	CachedTokens int `json:"cached_tokens"`
-	TextTokens   int `json:"text_tokens,omitempty"`
-	ImageTokens  int `json:"image_tokens,omitempty"`
+	AudioTokens       int `json:"audio_tokens,omitempty"`
+	CachedTokens      int `json:"cached_tokens"`
+	CachedReadTokens  int `json:"cached_read_tokens,omitempty"`
+	CachedWriteTokens int `json:"cached_write_tokens,omitempty"`
+	TextTokens        int `json:"text_tokens,omitempty"`
+	ImageTokens       int `json:"image_tokens,omitempty"`
 }
 
 func GetResponsesExtraBilling(response *OpenAIResponsesResponses) map[string]ExtraBilling {
@@ -1019,7 +1022,10 @@ func (u *ResponsesUsage) ToOpenAIUsage() *Usage {
 	}
 
 	if u.InputTokensDetails != nil {
+		usage.PromptTokensDetails.AudioTokens = u.InputTokensDetails.AudioTokens
 		usage.PromptTokensDetails.CachedTokens = u.InputTokensDetails.CachedTokens
+		usage.PromptTokensDetails.CachedReadTokens = u.InputTokensDetails.CachedReadTokens
+		usage.PromptTokensDetails.CachedWriteTokens = u.InputTokensDetails.CachedWriteTokens
 		usage.PromptTokensDetails.TextTokens = u.InputTokensDetails.TextTokens
 		usage.PromptTokensDetails.ImageTokens = u.InputTokensDetails.ImageTokens
 	}
@@ -1041,9 +1047,12 @@ func (u *Usage) ToResponsesUsage() *ResponsesUsage {
 	}
 
 	responsesUsage.InputTokensDetails = &ResponsesUsageInputTokensDetails{
-		CachedTokens: u.PromptTokensDetails.CachedTokens,
-		TextTokens:   u.PromptTokensDetails.TextTokens,
-		ImageTokens:  u.PromptTokensDetails.ImageTokens,
+		AudioTokens:       u.PromptTokensDetails.AudioTokens,
+		CachedTokens:      u.PromptTokensDetails.CachedTokens,
+		CachedReadTokens:  u.PromptTokensDetails.CachedReadTokens,
+		CachedWriteTokens: u.PromptTokensDetails.CachedWriteTokens,
+		TextTokens:        u.PromptTokensDetails.TextTokens,
+		ImageTokens:       u.PromptTokensDetails.ImageTokens,
 	}
 
 	return responsesUsage

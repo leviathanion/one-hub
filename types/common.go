@@ -2,7 +2,6 @@ package types
 
 import (
 	"encoding/json"
-	"fmt"
 	"one-api/common/config"
 	"strings"
 )
@@ -104,63 +103,83 @@ func extraBillingVariantKeyed(serviceType string) bool {
 	}
 }
 
+func fillExtraTokensFromDetails(extraTokens map[string]int, input PromptTokensDetails, output CompletionTokensDetails) map[string]int {
+	if extraTokens == nil {
+		extraTokens = make(map[string]int)
+	}
+
+	// Adapter contract: callers that emit incremental usage must populate
+	// ExtraTokens with the delta first. Detail fields are treated as snapshots
+	// and only fill missing keys; this preserves explicit adapter values.
+	fillMissingPositiveExtraToken(extraTokens, config.UsageExtraCache, input.CachedTokens)
+	fillMissingPositiveExtraToken(extraTokens, config.UsageExtraInputAudio, input.AudioTokens)
+	fillMissingPositiveExtraToken(extraTokens, config.UsageExtraInputTextTokens, input.TextTokens)
+	fillMissingPositiveExtraToken(extraTokens, config.UsageExtraCachedWrite, input.CachedWriteTokens)
+	fillMissingPositiveExtraToken(extraTokens, config.UsageExtraCachedRead, input.CachedReadTokens)
+	fillMissingPositiveExtraToken(extraTokens, config.UsageExtraInputImageTokens, input.ImageTokens)
+	fillMissingPositiveExtraToken(extraTokens, config.UsageExtraOutputImageTokens, output.ImageTokens)
+	fillMissingPositiveExtraToken(extraTokens, config.UsageExtraOutputAudio, output.AudioTokens)
+	fillMissingPositiveExtraToken(extraTokens, config.UsageExtraOutputTextTokens, output.TextTokens)
+	fillMissingPositiveExtraToken(extraTokens, config.UsageExtraReasoning, output.ReasoningTokens)
+	return extraTokens
+}
+
+func fillMissingPositiveExtraToken(extraTokens map[string]int, key string, value int) {
+	if value > 0 && extraTokens[key] == 0 {
+		extraTokens[key] = value
+	}
+}
+
+func mergeExtraBillingMap(dst map[string]ExtraBilling, extraBilling map[string]ExtraBilling) map[string]ExtraBilling {
+	if len(extraBilling) == 0 {
+		return dst
+	}
+	if dst == nil {
+		dst = make(map[string]ExtraBilling, len(extraBilling))
+	}
+	for key, value := range extraBilling {
+		serviceType := ResolveExtraBillingServiceType(key, value)
+		bType := ResolveExtraBillingType(key, value)
+		key = BuildExtraBillingKey(serviceType, bType)
+		if key == "" {
+			continue
+		}
+		billing := dst[key]
+		if billing.ServiceType == "" {
+			billing.ServiceType = serviceType
+		}
+		if billing.Type == "" {
+			billing.Type = bType
+		}
+		billing.CallCount += value.CallCount
+		dst[key] = billing
+	}
+	return dst
+}
+
+func incExtraBillingMap(dst map[string]ExtraBilling, key string, bType string) map[string]ExtraBilling {
+	key = BuildExtraBillingKey(key, bType)
+	if key == "" {
+		return dst
+	}
+	if dst == nil {
+		dst = make(map[string]ExtraBilling)
+	}
+
+	billing := dst[key]
+	if billing.ServiceType == "" {
+		billing.ServiceType = ResolveExtraBillingServiceType(key, billing)
+	}
+	if billing.Type == "" {
+		billing.Type = ResolveExtraBillingType(key, ExtraBilling{Type: bType})
+	}
+	billing.CallCount++
+	dst[key] = billing
+	return dst
+}
+
 func (u *Usage) GetExtraTokens() map[string]int {
-	if u.ExtraTokens == nil {
-		u.ExtraTokens = make(map[string]int)
-	}
-
-	// 组装，已有的数据
-
-	// 缓存数据
-	if u.PromptTokensDetails.CachedTokens > 0 && u.ExtraTokens[config.UsageExtraCache] == 0 {
-		u.ExtraTokens[config.UsageExtraCache] = u.PromptTokensDetails.CachedTokens
-	}
-
-	// 输入音频
-	if u.PromptTokensDetails.AudioTokens > 0 && u.ExtraTokens[config.UsageExtraInputAudio] == 0 {
-		u.ExtraTokens[config.UsageExtraInputAudio] = u.PromptTokensDetails.AudioTokens
-	}
-
-	// 输入文字
-	if u.PromptTokensDetails.TextTokens > 0 && u.ExtraTokens[config.UsageExtraInputTextTokens] == 0 {
-		u.ExtraTokens[config.UsageExtraInputTextTokens] = u.PromptTokensDetails.TextTokens
-	}
-
-	// 缓存写入
-	if u.PromptTokensDetails.CachedWriteTokens > 0 && u.ExtraTokens[config.UsageExtraCachedWrite] == 0 {
-		u.ExtraTokens[config.UsageExtraCachedWrite] = u.PromptTokensDetails.CachedWriteTokens
-	}
-
-	// 缓存读取
-	if u.PromptTokensDetails.CachedReadTokens > 0 && u.ExtraTokens[config.UsageExtraCachedRead] == 0 {
-		u.ExtraTokens[config.UsageExtraCachedRead] = u.PromptTokensDetails.CachedReadTokens
-	}
-
-	// 输入图像
-	if u.PromptTokensDetails.ImageTokens > 0 && u.ExtraTokens[config.UsageExtraInputImageTokens] == 0 {
-		u.ExtraTokens[config.UsageExtraInputImageTokens] = u.PromptTokensDetails.ImageTokens
-	}
-
-	// 输出图像
-	if u.CompletionTokensDetails.ImageTokens > 0 && u.ExtraTokens[config.UsageExtraOutputImageTokens] == 0 {
-		u.ExtraTokens[config.UsageExtraOutputImageTokens] = u.CompletionTokensDetails.ImageTokens
-	}
-
-	// 输出音频
-	if u.CompletionTokensDetails.AudioTokens > 0 && u.ExtraTokens[config.UsageExtraOutputAudio] == 0 {
-		u.ExtraTokens[config.UsageExtraOutputAudio] = u.CompletionTokensDetails.AudioTokens
-	}
-
-	// 输出文字
-	if u.CompletionTokensDetails.TextTokens > 0 && u.ExtraTokens[config.UsageExtraOutputTextTokens] == 0 {
-		u.ExtraTokens[config.UsageExtraOutputTextTokens] = u.CompletionTokensDetails.TextTokens
-	}
-
-	// 推理
-	if u.CompletionTokensDetails.ReasoningTokens > 0 && u.ExtraTokens[config.UsageExtraReasoning] == 0 {
-		u.ExtraTokens[config.UsageExtraReasoning] = u.CompletionTokensDetails.ReasoningTokens
-	}
-
+	u.ExtraTokens = fillExtraTokensFromDetails(u.ExtraTokens, u.PromptTokensDetails, u.CompletionTokensDetails)
 	return u.ExtraTokens
 }
 
@@ -173,29 +192,7 @@ func (u *Usage) SetExtraTokens(key string, value int) {
 }
 
 func (u *Usage) MergeExtraBilling(extraBilling map[string]ExtraBilling) {
-	if len(extraBilling) == 0 {
-		return
-	}
-	if u.ExtraBilling == nil {
-		u.ExtraBilling = make(map[string]ExtraBilling, len(extraBilling))
-	}
-	for key, value := range extraBilling {
-		serviceType := ResolveExtraBillingServiceType(key, value)
-		bType := ResolveExtraBillingType(key, value)
-		key = BuildExtraBillingKey(serviceType, bType)
-		if key == "" {
-			continue
-		}
-		billing := u.ExtraBilling[key]
-		if billing.ServiceType == "" {
-			billing.ServiceType = serviceType
-		}
-		if billing.Type == "" {
-			billing.Type = bType
-		}
-		billing.CallCount += value.CallCount
-		u.ExtraBilling[key] = billing
-	}
+	u.ExtraBilling = mergeExtraBillingMap(u.ExtraBilling, extraBilling)
 }
 
 type PromptTokensDetails struct {
@@ -261,7 +258,6 @@ func (e *OpenAIError) Error() string {
 	// 转换为JSON
 	bytes, _ := json.Marshal(response)
 
-	fmt.Println("e", string(bytes))
 	return string(bytes)
 }
 
@@ -280,21 +276,5 @@ type StreamOptions struct {
 }
 
 func (u *Usage) IncExtraBilling(key string, bType string) {
-	key = BuildExtraBillingKey(key, bType)
-	if key == "" {
-		return
-	}
-	if u.ExtraBilling == nil {
-		u.ExtraBilling = make(map[string]ExtraBilling)
-	}
-
-	billing := u.ExtraBilling[key]
-	if billing.ServiceType == "" {
-		billing.ServiceType = ResolveExtraBillingServiceType(key, billing)
-	}
-	if billing.Type == "" {
-		billing.Type = ResolveExtraBillingType(key, ExtraBilling{Type: bType})
-	}
-	billing.CallCount++
-	u.ExtraBilling[key] = billing
+	u.ExtraBilling = incExtraBillingMap(u.ExtraBilling, key, bType)
 }

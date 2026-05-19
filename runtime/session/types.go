@@ -115,6 +115,13 @@ func ClientPayloadFromError(err error) []byte {
 	return append([]byte(nil), payloadErr.payload...)
 }
 
+type RealtimePayloadOrigin int
+
+const (
+	RealtimePayloadOriginProxyLocal RealtimePayloadOrigin = iota
+	RealtimePayloadOriginProvider
+)
+
 type Metadata struct {
 	Key               string
 	BindingKey        string
@@ -137,7 +144,7 @@ type RealtimeSession interface {
 	// authoritative wire frame to deliver first. Callers must not blindly turn
 	// err into another websocket error frame; only ClientPayloadError carries an
 	// additional client-visible payload that should be emitted after payload.
-	Recv(ctx context.Context) (mt int, payload []byte, usage *types.UsageEvent, err error)
+	Recv(ctx context.Context) (mt int, payload []byte, usage *types.UsageEvent, origin RealtimePayloadOrigin, err error)
 	// Detach releases the current downstream attachment without force-closing the
 	// upstream provider transport. Implementations may continue draining and
 	// finalizing turn state after Detach, and may explicitly stop queueing new
@@ -157,9 +164,12 @@ type GracefulDetachCapable interface {
 }
 
 type RealtimeOpenOptions struct {
+	Context                   context.Context
 	ClientSessionID           string
 	ResolvedUpstreamSessionID string
 	ForceFresh                bool
+	PreferredTransport        TransportMode
+	RequireWS                 bool
 }
 
 type TurnFinalizePayload struct {
@@ -179,6 +189,13 @@ type TurnObserver interface {
 	FinalizeTurn(payload TurnFinalizePayload)
 }
 
+// TurnAdmissionObserver is an optional extension for observers that must reserve
+// local resources before a turn is sent upstream.
+type TurnAdmissionObserver interface {
+	AdmitTurn() error
+	RollbackTurnAdmission(reason string) error
+}
+
 type TurnObserverFunc func(payload TurnFinalizePayload)
 
 func (f TurnObserverFunc) ObserveTurnUsage(usage *types.UsageEvent) error {
@@ -190,6 +207,20 @@ func (f TurnObserverFunc) FinalizeTurn(payload TurnFinalizePayload) {
 	if f != nil {
 		f(payload)
 	}
+}
+
+func AdmitTurn(observer TurnObserver) error {
+	if admission, ok := observer.(TurnAdmissionObserver); ok {
+		return admission.AdmitTurn()
+	}
+	return nil
+}
+
+func RollbackTurnAdmission(observer TurnObserver, reason string) error {
+	if admission, ok := observer.(TurnAdmissionObserver); ok {
+		return admission.RollbackTurnAdmission(reason)
+	}
+	return nil
 }
 
 type TurnObserverFactory func() TurnObserver
@@ -221,6 +252,32 @@ func (o *guardedTurnObserver) ObserveTurnUsage(usage *types.UsageEvent) error {
 		return nil
 	}
 	return o.observer.ObserveTurnUsage(usage)
+}
+
+func (o *guardedTurnObserver) AdmitTurn() error {
+	if o == nil {
+		return nil
+	}
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.finalized || o.observer == nil {
+		return nil
+	}
+	return AdmitTurn(o.observer)
+}
+
+func (o *guardedTurnObserver) RollbackTurnAdmission(reason string) error {
+	if o == nil {
+		return nil
+	}
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.finalized || o.observer == nil {
+		return nil
+	}
+	return RollbackTurnAdmission(o.observer, reason)
 }
 
 func (o *guardedTurnObserver) FinalizeTurn(payload TurnFinalizePayload) {
@@ -335,6 +392,18 @@ func (s *ExecutionSession) MarkClosed(reason string) {
 	}
 }
 
+func (s *ExecutionSession) MarkClosedBestEffort(reason string) {
+	if s == nil {
+		return
+	}
+	if s.TryLock() {
+		s.MarkClosed(reason)
+		s.Unlock()
+		return
+	}
+	s.closed.Store(true)
+}
+
 func (s *ExecutionSession) Reopen() {
 	if s == nil {
 		return
@@ -350,6 +419,10 @@ func (s *ExecutionSession) Touch(now time.Time) {
 	s.LastUsedAt = now
 }
 
+// IsExpired reports whether the session is eligible for janitor cleanup.
+// Callers MUST hold s.mu (or call via s.TryLock) because Attached / Inflight /
+// LastUsedAt / IdleTTL are mutated under that mutex elsewhere; reading them
+// here without the lock would be a data race.
 func (s *ExecutionSession) IsExpired(now time.Time, defaultTTL time.Duration) bool {
 	if now.IsZero() {
 		now = time.Now()

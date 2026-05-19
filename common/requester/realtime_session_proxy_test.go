@@ -63,10 +63,10 @@ func (s *fakeRealtimeSession) SendClient(ctx context.Context, mt int, payload []
 	return err
 }
 
-func (s *fakeRealtimeSession) Recv(ctx context.Context) (int, []byte, *types.UsageEvent, error) {
+func (s *fakeRealtimeSession) Recv(ctx context.Context) (int, []byte, *types.UsageEvent, runtimesession.RealtimePayloadOrigin, error) {
 	select {
 	case result := <-s.recvResults:
-		return result.messageType, result.payload, result.usage, result.err
+		return result.messageType, result.payload, result.usage, runtimesession.RealtimePayloadOriginProvider, result.err
 	default:
 	}
 
@@ -80,11 +80,11 @@ func (s *fakeRealtimeSession) Recv(ctx context.Context) (int, []byte, *types.Usa
 		if s.recvBlocked != nil {
 			<-s.recvBlocked
 		}
-		return 0, nil, nil, ctx.Err()
+		return 0, nil, nil, runtimesession.RealtimePayloadOriginProxyLocal, ctx.Err()
 	case result := <-s.recvResults:
-		return result.messageType, result.payload, result.usage, result.err
+		return result.messageType, result.payload, result.usage, runtimesession.RealtimePayloadOriginProvider, result.err
 	case <-s.closed:
-		return 0, nil, nil, runtimesession.ErrSessionClosed
+		return 0, nil, nil, runtimesession.RealtimePayloadOriginProxyLocal, runtimesession.ErrSessionClosed
 	}
 }
 
@@ -156,9 +156,9 @@ func (s *panicRealtimeSession) SendClient(ctx context.Context, mt int, payload [
 	return nil
 }
 
-func (s *panicRealtimeSession) Recv(ctx context.Context) (int, []byte, *types.UsageEvent, error) {
+func (s *panicRealtimeSession) Recv(ctx context.Context) (int, []byte, *types.UsageEvent, runtimesession.RealtimePayloadOrigin, error) {
 	<-ctx.Done()
-	return 0, nil, nil, ctx.Err()
+	return 0, nil, nil, runtimesession.RealtimePayloadOriginProxyLocal, ctx.Err()
 }
 
 func (s *panicRealtimeSession) Detach(reason string) {
@@ -408,8 +408,8 @@ func TestRealtimeSessionProxyWrapsGenericSendErrorsAsStructuredJSON(t *testing.T
 	if event.Type != types.EventTypeError {
 		t.Fatalf("expected structured error event, got %q", event.Type)
 	}
-	if event.ErrorDetail == nil || event.ErrorDetail.Message != "boom" {
-		t.Fatalf("expected structured proxy error payload to preserve message, got %+v", event.ErrorDetail)
+	if event.ErrorDetail == nil || event.ErrorDetail.Message != "realtime proxy request failed" {
+		t.Fatalf("expected structured proxy error payload to use static message, got %+v", event.ErrorDetail)
 	}
 
 	select {

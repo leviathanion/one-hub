@@ -3,14 +3,17 @@ package requester
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
+	"one-api/common/config"
 	runtimesession "one-api/runtime/session"
 	"one-api/types"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -24,22 +27,25 @@ type realtimeProxyExit struct {
 
 type RealtimeSessionProxy struct {
 	userConn *websocket.Conn
+	writer   *WSClientWriter
 	session  runtimesession.RealtimeSession
 	timeout  time.Duration
 
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	done           chan struct{}
-	userClosed     chan struct{}
-	supplierClosed chan struct{}
-	exitCh         chan realtimeProxyExit
-	doneOnce       sync.Once
-	closeOnce      sync.Once
-	workers        sync.WaitGroup
-	writeMu        sync.Mutex
+	done              chan struct{}
+	userClosed        chan struct{}
+	supplierClosed    chan struct{}
+	exitCh            chan realtimeProxyExit
+	doneOnce          sync.Once
+	closeOnce         sync.Once
+	externalCloseOnce sync.Once
+	workers           sync.WaitGroup
 
+	started              atomic.Bool
 	dropDownstreamWrites atomic.Bool
+	exitDropLogged       atomic.Bool
 	lastActivityUnixNano atomic.Int64
 }
 
@@ -48,8 +54,13 @@ func NewRealtimeSessionProxy(userConn *websocket.Conn, session runtimesession.Re
 		timeout = 2 * time.Minute
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	var writer *WSClientWriter
+	if userConn != nil {
+		writer = NewWSClientWriter(userConn, config.RealtimeWebsocketWriteTimeout)
+	}
 	proxy := &RealtimeSessionProxy{
 		userConn:       userConn,
+		writer:         writer,
 		session:        session,
 		timeout:        timeout,
 		ctx:            ctx,
@@ -57,17 +68,22 @@ func NewRealtimeSessionProxy(userConn *websocket.Conn, session runtimesession.Re
 		done:           make(chan struct{}),
 		userClosed:     make(chan struct{}),
 		supplierClosed: make(chan struct{}),
-		exitCh:         make(chan realtimeProxyExit, 4),
+		exitCh:         make(chan realtimeProxyExit, 6),
 	}
 	proxy.markActivity(time.Now())
+	proxy.configureUserConn()
 	return proxy
 }
 
 func (p *RealtimeSessionProxy) Start() {
-	p.workers.Add(3)
+	// Lifecycle calls are owned by the relay handler and must be serialized by
+	// the caller; Close is idempotent, but Start racing with Close is unsupported.
+	p.started.Store(true)
+	p.workers.Add(4)
 	go p.runWorker(p.userToSession)
 	go p.runWorker(p.sessionToUser)
 	go p.runWorker(p.idleWatchdog)
+	go p.runWorker(p.clientPingLoop)
 	go p.coordinate()
 }
 
@@ -76,9 +92,18 @@ func (p *RealtimeSessionProxy) Wait() {
 }
 
 func (p *RealtimeSessionProxy) Close() {
+	// See Start for the lifecycle serialization contract.
+	if p.started.Load() {
+		p.externalCloseOnce.Do(func() {
+			p.emitExit(realtimeProxyExit{source: "external", err: context.Canceled, graceful: true})
+		})
+		return
+	}
 	p.closeOnce.Do(func() {
 		p.cancel()
-		if p.userConn != nil {
+		if p.writer != nil {
+			_ = p.writer.Close()
+		} else if p.userConn != nil {
 			_ = p.userConn.Close()
 		}
 		if p.session != nil {
@@ -103,6 +128,9 @@ func (p *RealtimeSessionProxy) userToSession() {
 	for {
 		messageType, message, err := p.userConn.ReadMessage()
 		if err != nil {
+			if errors.Is(err, websocket.ErrReadLimit) && !p.dropDownstreamWrites.Load() {
+				_ = p.writeUserMessage(websocket.TextMessage, []byte(types.NewErrorEvent("", "invalid_request_error", "invalid_event", "frame is too large or invalid; send smaller audio chunks").Error()))
+			}
 			p.emitExit(realtimeProxyExit{source: "user", err: err, graceful: isRealtimeDisconnectError(err)})
 			return
 		}
@@ -110,7 +138,7 @@ func (p *RealtimeSessionProxy) userToSession() {
 
 		if err := p.session.SendClient(p.ctx, messageType, message); err != nil {
 			if payload := proxyErrorPayload(err); payload != nil && !p.dropDownstreamWrites.Load() {
-				if writeErr := p.writeUserMessage(websocket.TextMessage, payload); writeErr != nil {
+				if writeErr := WriteWSLocalError(p.writer, payload); writeErr != nil {
 					p.emitExit(realtimeProxyExit{source: "user", err: writeErr})
 					return
 				}
@@ -128,10 +156,15 @@ func (p *RealtimeSessionProxy) sessionToUser() {
 	defer close(p.supplierClosed)
 
 	for {
-		messageType, payload, _, err := p.session.Recv(p.ctx)
+		messageType, payload, _, _, err := p.session.Recv(p.ctx)
 		if err != nil {
 			if !p.dropDownstreamWrites.Load() && len(payload) > 0 {
 				_ = p.writeUserMessage(messageType, payload)
+			} else if !p.dropDownstreamWrites.Load() {
+				var closeErr *websocket.CloseError
+				if errors.As(err, &closeErr) {
+					_ = p.writeUserMessage(websocket.CloseMessage, SafeWSCloseMessage(closeErr.Code, closeErr.Text))
+				}
 			}
 			if !p.dropDownstreamWrites.Load() {
 				if errorPayload := runtimesession.ClientPayloadFromError(err); errorPayload != nil {
@@ -179,6 +212,26 @@ func (p *RealtimeSessionProxy) idleWatchdog() {
 	}
 }
 
+func (p *RealtimeSessionProxy) clientPingLoop() {
+	interval := config.RealtimeWebsocketPingInterval()
+	if p == nil || p.writer == nil || interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.ctx.Done():
+			return
+		case <-ticker.C:
+			if err := p.writer.WriteControl(websocket.PingMessage, nil); err != nil {
+				p.emitExit(realtimeProxyExit{source: "user", err: err, graceful: isRealtimeDisconnectError(err)})
+				return
+			}
+		}
+	}
+}
+
 func (p *RealtimeSessionProxy) coordinate() {
 	defer p.finishCoordinate()
 
@@ -201,15 +254,19 @@ func (p *RealtimeSessionProxy) coordinate() {
 		default:
 			p.session.Detach(reason)
 		}
-		p.cancel()
-		if p.userConn != nil {
-			_ = p.userConn.Close()
-		}
+		p.closeDownstream(websocket.CloseNormalClosure, reason)
 	})
 }
 
 func (p *RealtimeSessionProxy) runWorker(fn func()) {
-	defer p.workers.Done()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			log.Printf("realtime proxy worker panic: %v", recovered)
+			p.emitExit(realtimeProxyExit{source: "proxy_panic", err: fmt.Errorf("proxy_panic: %v", recovered)})
+			p.emergencyShutdown("proxy_panic")
+		}
+		p.workers.Done()
+	}()
 	fn()
 }
 
@@ -217,6 +274,9 @@ func (p *RealtimeSessionProxy) emitExit(exit realtimeProxyExit) {
 	select {
 	case p.exitCh <- exit:
 	default:
+		if p != nil && p.exitDropLogged.CompareAndSwap(false, true) {
+			log.Printf("realtime proxy exit signal dropped: source=%s err=%v", exit.source, exit.err)
+		}
 	}
 }
 
@@ -242,13 +302,35 @@ func (p *RealtimeSessionProxy) emergencyShutdown(reason string) {
 	if p.cancel != nil {
 		p.cancel()
 	}
-	if p.userConn != nil {
+	if p.writer != nil {
+		_ = p.writer.Close()
+	} else if p.userConn != nil {
 		_ = p.userConn.Close()
 	}
 	if p.session != nil {
 		p.safeSessionAction("abort", func() {
 			p.session.Abort(strings.TrimSpace(reason))
 		})
+	}
+}
+
+func (p *RealtimeSessionProxy) closeDownstream(code int, reason string) {
+	if p == nil {
+		return
+	}
+	if p.writer != nil {
+		_ = p.writer.WriteClose(code, reason)
+		if p.cancel != nil {
+			p.cancel()
+		}
+		_ = p.writer.Close()
+		return
+	}
+	if p.cancel != nil {
+		p.cancel()
+	}
+	if p.userConn != nil {
+		_ = p.userConn.Close()
 	}
 }
 
@@ -259,6 +341,17 @@ func (p *RealtimeSessionProxy) safeSessionAction(label string, fn func()) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			log.Printf("realtime proxy session %s panic: %v", strings.TrimSpace(label), recovered)
+			if p.cancel != nil {
+				p.cancel()
+			}
+			if p.writer != nil {
+				_ = p.writer.Close()
+			} else if p.userConn != nil {
+				_ = p.userConn.Close()
+			}
+			if !p.started.Load() {
+				p.signalDone()
+			}
 		}
 	}()
 	fn()
@@ -271,12 +364,28 @@ func (p *RealtimeSessionProxy) markActivity(now time.Time) {
 	p.lastActivityUnixNano.Store(now.UnixNano())
 }
 
+func (p *RealtimeSessionProxy) configureUserConn() {
+	if p == nil || p.userConn == nil {
+		return
+	}
+	ApplyWSReadLimit(p.userConn, config.RealtimeWebsocketReadLimit)
+	p.refreshUserReadDeadline()
+	InstallWSActivityHandlers(p.userConn, func() {
+		p.markActivity(time.Now())
+		p.refreshUserReadDeadline()
+	})
+}
+
 func (p *RealtimeSessionProxy) detachReason(source string) string {
 	switch strings.TrimSpace(source) {
 	case "supplier":
 		return "supplier_closed"
 	case "idle":
 		return "idle_timeout"
+	case "external":
+		return "proxy_closed"
+	case "proxy_panic":
+		return "proxy_panic"
 	default:
 		return "user_closed"
 	}
@@ -292,10 +401,28 @@ func proxyErrorPayload(err error) []byte {
 
 	var event *types.Event
 	if errors.As(err, &event) && event != nil && event.IsError() {
-		return []byte(event.Error())
+		code := "system_error"
+		if event.ErrorDetail != nil && event.ErrorDetail.Code != nil {
+			code = strings.TrimSpace(fmt.Sprint(event.ErrorDetail.Code))
+		}
+		return []byte(types.NewErrorEvent("", "system_error", code, realtimeProxyStaticErrorMessage(code)).Error())
 	}
 
-	return []byte(types.NewErrorEvent("", "system_error", "system_error", err.Error()).Error())
+	log.Printf("realtime proxy internal error: %v", err)
+	return []byte(types.NewErrorEvent("", "system_error", "system_error", realtimeProxyStaticErrorMessage("system_error")).Error())
+}
+
+func realtimeProxyStaticErrorMessage(code string) string {
+	switch strings.TrimSpace(code) {
+	case "session_busy":
+		return "realtime session is busy"
+	case "ws_write_failed":
+		return "upstream websocket write failed"
+	case "provider_connection_closed":
+		return "upstream websocket connection closed"
+	default:
+		return "realtime proxy request failed"
+	}
 }
 
 func isRecoverableRealtimeProxyError(err error) bool {
@@ -304,13 +431,26 @@ func isRecoverableRealtimeProxyError(err error) bool {
 	}
 
 	var event *types.Event
-	return errors.As(err, &event) && event.IsError()
+	if !errors.As(err, &event) || event == nil || !event.IsError() || event.ErrorDetail == nil {
+		return false
+	}
+	code := strings.TrimSpace(fmt.Sprint(event.ErrorDetail.Code))
+	switch code {
+	case "invalid_event", "unsupported_client_event", "session_busy":
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *RealtimeSessionProxy) writeUserMessage(messageType int, payload []byte) error {
-	p.writeMu.Lock()
-	defer p.writeMu.Unlock()
-	return p.userConn.WriteMessage(messageType, payload)
+	if p == nil || p.writer == nil {
+		return net.ErrClosed
+	}
+	if messageType == websocket.CloseMessage {
+		return p.writer.WriteControl(websocket.CloseMessage, payload)
+	}
+	return p.writer.WriteMessage(messageType, payload)
 }
 
 func isRealtimeDisconnectError(err error) bool {
@@ -318,6 +458,9 @@ func isRealtimeDisconnectError(err error) bool {
 		return false
 	}
 	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED) {
 		return true
 	}
 	var closeErr *websocket.CloseError
@@ -328,7 +471,22 @@ func isRealtimeDisconnectError(err error) bool {
 		}
 	}
 	message := strings.ToLower(strings.TrimSpace(err.Error()))
-	return strings.Contains(message, "broken pipe") || strings.Contains(message, "connection reset by peer")
+	if strings.Contains(message, "broken pipe") || strings.Contains(message, "connection reset by peer") || strings.Contains(message, "software caused connection abort") {
+		return true
+	}
+	return false
+}
+
+func (p *RealtimeSessionProxy) refreshUserReadDeadline() {
+	if p == nil || p.userConn == nil {
+		return
+	}
+	interval := config.RealtimeWebsocketPingInterval()
+	if interval <= 0 {
+		_ = p.userConn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+		return
+	}
+	_ = p.userConn.SetReadDeadline(time.Now().Add(2 * interval))
 }
 
 func sessionSupportsGracefulDetach(session runtimesession.RealtimeSession) bool {

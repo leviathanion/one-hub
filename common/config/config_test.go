@@ -2,6 +2,7 @@ package config
 
 import (
 	"testing"
+	"time"
 
 	"github.com/spf13/viper"
 )
@@ -45,6 +46,15 @@ func TestInitConfLoadsRealtimeSessionCompatFlagAndDefaults(t *testing.T) {
 	}
 	if got := viper.GetInt("codex.execution_session_revocation_timeout_ms"); got != 200 {
 		t.Fatalf("expected codex execution session revocation timeout default 200ms, got %d", got)
+	}
+	if viper.GetBool("realtime.unsafe_allow_credential_subprotocol_any_origin") {
+		t.Fatal("expected credential subprotocol unsafe origin compatibility to be disabled by default")
+	}
+	if got := viper.GetInt("realtime.websocket_ping_interval_ms"); got != 25000 {
+		t.Fatalf("expected realtime websocket ping interval default 25000ms, got %d", got)
+	}
+	if !viper.GetBool("responses_ws.active_lease_redis_fail_open") {
+		t.Fatal("expected ResponsesWS active lease Redis fail-open compatibility to be enabled by default")
 	}
 	if !viper.GetBool("request_body_decode.enabled") {
 		t.Fatal("expected request body decode to be enabled by default")
@@ -101,5 +111,36 @@ func TestInitConfLoadsRealtimeSessionCompatFlagAndDefaults(t *testing.T) {
 	}
 	if UPTIMEKUMA_DOMAIN != "status.example.com" || UPTIMEKUMA_STATUS_PAGE_NAME != "main" {
 		t.Fatalf("expected InitConf to load nested uptime kuma strings, got domain=%q page=%q", UPTIMEKUMA_DOMAIN, UPTIMEKUMA_STATUS_PAGE_NAME)
+	}
+}
+
+func TestRealtimeWebsocketPingIntervalExplicitNonPositiveDisables(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(func() {
+		viper.Reset()
+	})
+
+	if got := RealtimeWebsocketPingInterval(); got != 25*time.Second {
+		t.Fatalf("expected unset ping interval to use default 25s, got %s", got)
+	}
+
+	defaultConfig()
+	if got := RealtimeWebsocketPingInterval(); got != 25*time.Second {
+		t.Fatalf("expected configured default ping interval to be 25s, got %s", got)
+	}
+
+	viper.Set("realtime.websocket_ping_interval_ms", 0)
+	if got := RealtimeWebsocketPingInterval(); got != 0 {
+		t.Fatalf("expected explicit zero ping interval to disable pings, got %s", got)
+	}
+
+	viper.Set("realtime.websocket_ping_interval_ms", -1)
+	if got := RealtimeWebsocketPingInterval(); got != 0 {
+		t.Fatalf("expected explicit negative ping interval to disable pings, got %s", got)
+	}
+
+	viper.Set("realtime.websocket_ping_interval_ms", 1250)
+	if got := RealtimeWebsocketPingInterval(); got != 1250*time.Millisecond {
+		t.Fatalf("expected explicit ping interval to be applied, got %s", got)
 	}
 }

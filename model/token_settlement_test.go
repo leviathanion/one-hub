@@ -1,6 +1,7 @@
 package model
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 
@@ -166,5 +167,117 @@ func TestApplyTokenUserQuotaDeltaDirectFlushesPendingBatchReserveAtZeroDelta(t *
 	}
 	if token.RemainQuota != 900 || token.UsedQuota != 100 {
 		t.Fatalf("expected zero-delta settlement to flush token reserve into DB, got remain=%d used=%d", token.RemainQuota, token.UsedQuota)
+	}
+}
+
+func TestApplyTokenUserQuotaDeltaDirectRejectsInsufficientUserQuotaAtomically(t *testing.T) {
+	useTokenSettlementTestDB(t)
+	insertTokenSettlementFixtures(t)
+
+	if err := DB.Model(&User{}).Where("id = ?", 1).Update("quota", 100).Error; err != nil {
+		t.Fatalf("expected user quota fixture update to succeed, got %v", err)
+	}
+	if err := DB.Model(&Token{}).Where("id = ?", 1).Updates(map[string]interface{}{"remain_quota": 500, "used_quota": 0}).Error; err != nil {
+		t.Fatalf("expected token quota fixture update to succeed, got %v", err)
+	}
+
+	err := ApplyTokenUserQuotaDeltaDirect(1, 1, false, 150)
+	if !errors.Is(err, ErrUserQuotaInsufficient) {
+		t.Fatalf("expected insufficient user quota error, got %v", err)
+	}
+
+	var user User
+	var token Token
+	if err := DB.First(&user, 1).Error; err != nil {
+		t.Fatalf("expected user lookup after failed settlement to succeed, got %v", err)
+	}
+	if err := DB.First(&token, 1).Error; err != nil {
+		t.Fatalf("expected token lookup after failed settlement to succeed, got %v", err)
+	}
+	if user.Quota != 100 {
+		t.Fatalf("expected failed settlement not to debit user quota, got %d", user.Quota)
+	}
+	if token.RemainQuota != 500 || token.UsedQuota != 0 {
+		t.Fatalf("expected failed settlement not to mutate token quota, got remain=%d used=%d", token.RemainQuota, token.UsedQuota)
+	}
+}
+
+func TestApplyTokenUserQuotaDeltaDirectRollsBackUserDebitWhenTokenGuardFails(t *testing.T) {
+	useTokenSettlementTestDB(t)
+	insertTokenSettlementFixtures(t)
+
+	if err := DB.Model(&User{}).Where("id = ?", 1).Update("quota", 500).Error; err != nil {
+		t.Fatalf("expected user quota fixture update to succeed, got %v", err)
+	}
+	if err := DB.Model(&Token{}).Where("id = ?", 1).Updates(map[string]interface{}{"remain_quota": 100, "used_quota": 0}).Error; err != nil {
+		t.Fatalf("expected token quota fixture update to succeed, got %v", err)
+	}
+
+	err := ApplyTokenUserQuotaDeltaDirect(1, 1, false, 150)
+	if !errors.Is(err, ErrTokenQuotaInsufficient) {
+		t.Fatalf("expected insufficient token quota error, got %v", err)
+	}
+
+	var user User
+	var token Token
+	if err := DB.First(&user, 1).Error; err != nil {
+		t.Fatalf("expected user lookup after failed settlement to succeed, got %v", err)
+	}
+	if err := DB.First(&token, 1).Error; err != nil {
+		t.Fatalf("expected token lookup after failed settlement to succeed, got %v", err)
+	}
+	if user.Quota != 500 {
+		t.Fatalf("expected transaction rollback to restore user quota, got %d", user.Quota)
+	}
+	if token.RemainQuota != 100 || token.UsedQuota != 0 {
+		t.Fatalf("expected failed token guard not to mutate token quota, got remain=%d used=%d", token.RemainQuota, token.UsedQuota)
+	}
+}
+
+func TestApplyTokenUserQuotaDeltaDirectRestoresPendingBatchReserveOnGuardFailure(t *testing.T) {
+	useTokenSettlementTestDB(t)
+	insertTokenSettlementFixtures(t)
+
+	originalBatch := config.BatchUpdateEnabled
+	config.BatchUpdateEnabled = true
+	resetBatchUpdateStoresForTest()
+	t.Cleanup(func() {
+		config.BatchUpdateEnabled = originalBatch
+		resetBatchUpdateStoresForTest()
+	})
+
+	if err := DB.Model(&User{}).Where("id = ?", 1).Update("quota", 100).Error; err != nil {
+		t.Fatalf("expected user quota fixture update to succeed, got %v", err)
+	}
+	if err := DB.Model(&Token{}).Where("id = ?", 1).Updates(map[string]interface{}{"remain_quota": 100, "used_quota": 0}).Error; err != nil {
+		t.Fatalf("expected token quota fixture update to succeed, got %v", err)
+	}
+	if err := DecreaseUserQuota(1, 80); err != nil {
+		t.Fatalf("expected user reserve enqueue to succeed, got %v", err)
+	}
+	if err := DecreaseTokenQuota(1, 80); err != nil {
+		t.Fatalf("expected token reserve enqueue to succeed, got %v", err)
+	}
+
+	err := ApplyTokenUserQuotaDeltaDirect(1, 1, false, 50)
+	if !errors.Is(err, ErrUserQuotaInsufficient) {
+		t.Fatalf("expected insufficient user quota error, got %v", err)
+	}
+
+	batchUpdate()
+
+	var user User
+	var token Token
+	if err := DB.First(&user, 1).Error; err != nil {
+		t.Fatalf("expected user lookup after batch flush to succeed, got %v", err)
+	}
+	if err := DB.First(&token, 1).Error; err != nil {
+		t.Fatalf("expected token lookup after batch flush to succeed, got %v", err)
+	}
+	if user.Quota != 20 {
+		t.Fatalf("expected restored pending user reserve to flush after failed direct settlement, got %d", user.Quota)
+	}
+	if token.RemainQuota != 20 || token.UsedQuota != 80 {
+		t.Fatalf("expected restored pending token reserve to flush after failed direct settlement, got remain=%d used=%d", token.RemainQuota, token.UsedQuota)
 	}
 }

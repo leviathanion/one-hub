@@ -42,6 +42,11 @@ func (l *CountLimiter) Allow(keyPrefix string) bool {
 }
 
 func (l *CountLimiter) AllowN(keyPrefix string, n int) bool {
+	allowed, _ := l.AllowNWithError(keyPrefix, n)
+	return allowed
+}
+
+func (l *CountLimiter) AllowNWithError(keyPrefix string, n int) (bool, error) {
 	return l.reserveN(context.Background(), keyPrefix, n)
 }
 
@@ -75,7 +80,7 @@ func (l *CountLimiter) GetCurrentRate(keyPrefix string) (int, error) {
 	return int(count), nil
 }
 
-func (l *CountLimiter) reserveN(ctx context.Context, keyPrefix string, n int) bool {
+func (l *CountLimiter) reserveN(ctx context.Context, keyPrefix string, n int) (bool, error) {
 	countKey := fmt.Sprintf(countFormat, keyPrefix)
 
 	result, err := redis.ScriptRunCtx(ctx,
@@ -89,8 +94,12 @@ func (l *CountLimiter) reserveN(ctx context.Context, keyPrefix string, n int) bo
 	)
 
 	if err != nil {
-		return false
+		return false, err
 	}
 
-	return result.(int64) == 1
+	count, ok := result.(int64)
+	if !ok {
+		return false, fmt.Errorf("无法转换计数结果")
+	}
+	return count == 1, nil
 }

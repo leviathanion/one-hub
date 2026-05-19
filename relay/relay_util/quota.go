@@ -3,6 +3,7 @@ package relay_util
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"one-api/common"
@@ -14,6 +15,7 @@ import (
 	"one-api/internal/billing"
 	"one-api/model"
 	"one-api/types"
+	"runtime/debug"
 	"strconv"
 	"time"
 
@@ -22,25 +24,26 @@ import (
 )
 
 type Quota struct {
-	modelName          string
-	promptTokens       int
-	price              model.Price
-	groupName          string
-	tokenGroupName     string
-	isBackupGroup      bool // 新增字段记录是否使用备用分组
-	backupGroupName    string
-	routingGroupSource string
-	groupRatio         float64
-	inputRatio         float64
-	outputRatio        float64
-	preConsumedQuota   int
-	cacheQuota         int
-	userId             int
-	channelId          int
-	tokenId            int
-	callerNS           string
-	unlimitedQuota     bool
-	HandelStatus       bool
+	modelName              string
+	promptTokens           int
+	price                  model.Price
+	groupName              string
+	tokenGroupName         string
+	isBackupGroup          bool // 新增字段记录是否使用备用分组
+	backupGroupName        string
+	routingGroupSource     string
+	groupRatio             float64
+	inputRatio             float64
+	outputRatio            float64
+	preConsumedQuota       int
+	cacheQuota             int
+	userId                 int
+	channelId              int
+	tokenId                int
+	callerNS               string
+	unlimitedQuota         bool
+	PreconsumeTruthApplied bool
+	PreconsumeCacheApplied bool
 
 	startTime         time.Time
 	firstResponseTime time.Time
@@ -70,14 +73,19 @@ func NewQuota(c *gin.Context, modelName string, promptTokens int) *Quota {
 		tokenId:        c.GetInt("token_id"),
 		callerNS:       readQuotaCallerNamespace(c),
 		unlimitedQuota: c.GetBool("token_unlimited_quota"),
-		HandelStatus:   false,
 		isBackupGroup:  isBackupGroup, // 记录是否使用备用分组
 		requestContext: requestContext,
 		tokenName:      c.GetString("token_name"),
-		sourceIP:       c.ClientIP(),
+		sourceIP:       c.GetString(config.GinResponsesWSClientIPKey),
+	}
+	if quota.sourceIP == "" {
+		quota.sourceIP = c.ClientIP()
 	}
 	if c.Request != nil {
-		quota.userAgent = utils.NormalizeUserAgent(c.Request.UserAgent())
+		quota.userAgent = c.GetString(config.GinResponsesWSUserAgentKey)
+		if quota.userAgent == "" {
+			quota.userAgent = utils.NormalizeUserAgent(c.Request.UserAgent())
+		}
 	}
 	if meta, ok := c.Get(config.GinChannelAffinityMetaKey); ok {
 		if typed, ok := meta.(map[string]any); ok && len(typed) > 0 {
@@ -125,7 +133,8 @@ func (q *Quota) Clone() *Quota {
 	cloned.price = cloneQuotaPrice(q.price)
 	cloned.preConsumedQuota = 0
 	cloned.cacheQuota = 0
-	cloned.HandelStatus = false
+	cloned.PreconsumeTruthApplied = false
+	cloned.PreconsumeCacheApplied = false
 	cloned.startTime = time.Time{}
 	cloned.firstResponseTime = time.Time{}
 	cloned.requestDuration = 0
@@ -146,12 +155,17 @@ func (q *Quota) ForcePreConsume() {
 }
 
 func (q *Quota) PreQuotaConsumption() *types.OpenAIErrorWithStatusCode {
-	if q.price.Type == model.TimesPriceType {
-		q.preConsumedQuota = int(1000 * q.inputRatio)
-	} else if q.price.Input != 0 || q.price.Output != 0 {
-		q.preConsumedQuota = int(float64(q.promptTokens)*q.inputRatio) + config.PreConsumedQuota
-	}
+	return q.PreQuotaConsumptionRollbackable()
+}
 
+func (q *Quota) PreQuotaConsumptionRollbackable() *types.OpenAIErrorWithStatusCode {
+	if q == nil {
+		return common.StringErrorWrapperLocal("quota transaction is required", "quota_transaction_missing", http.StatusInternalServerError)
+	}
+	if q.HasPreConsumedSideEffect() {
+		return nil
+	}
+	q.preparePreConsumedQuota()
 	if q.preConsumedQuota == 0 {
 		return nil
 	}
@@ -160,46 +174,68 @@ func (q *Quota) PreQuotaConsumption() *types.OpenAIErrorWithStatusCode {
 	if err != nil {
 		return common.ErrorWrapper(err, "get_user_quota_failed", http.StatusInternalServerError)
 	}
-
 	if userQuota < q.preConsumedQuota {
 		return common.ErrorWrapper(errors.New("user quota is not enough"), "insufficient_user_quota", http.StatusPaymentRequired)
 	}
-
 	if !q.forcePreConsume && userQuota > 100*q.preConsumedQuota {
-		// in this case, we do not pre-consume quota
-		// because the user has enough quota
 		q.preConsumedQuota = 0
-		// common.LogInfo(c.Request.Context(), fmt.Sprintf("user %d has enough quota %d, trusted and no need to pre-consume", userId, userQuota))
 		return nil
 	}
 
-	err = model.CacheDecreaseUserQuota(q.userId, q.preConsumedQuota)
+	token, err := model.GetTokenById(q.tokenId)
 	if err != nil {
+		return common.ErrorWrapper(err, "pre_consume_token_quota_failed", http.StatusForbidden)
+	}
+	if !token.UnlimitedQuota && token.RemainQuota < q.preConsumedQuota {
+		return common.ErrorWrapper(errors.New("令牌额度不足"), "pre_consume_token_quota_failed", http.StatusForbidden)
+	}
+
+	if err := model.ApplyTokenUserQuotaDeltaDirect(q.tokenId, q.userId, q.unlimitedQuota, q.preConsumedQuota); err != nil {
+		return common.ErrorWrapper(err, "pre_consume_token_quota_failed", http.StatusForbidden)
+	}
+	q.PreconsumeTruthApplied = true
+
+	if err := model.CacheDecreaseUserQuota(q.userId, q.preConsumedQuota); err != nil {
+		rollbackErr := q.undoSynchronouslyWithContext(detachQuotaContext(q.requestContext))
+		if rollbackErr != nil {
+			return common.ErrorWrapper(errors.New(err.Error()+"; rollback failed: "+rollbackErr.Error()), "decrease_user_quota_failed", http.StatusInternalServerError)
+		}
 		return common.ErrorWrapper(err, "decrease_user_quota_failed", http.StatusInternalServerError)
 	}
-
-	if q.preConsumedQuota > 0 {
-		err := model.PreConsumeTokenQuota(q.tokenId, q.preConsumedQuota)
-		if err != nil {
-			return common.ErrorWrapper(err, "pre_consume_token_quota_failed", http.StatusForbidden)
-		}
-		q.HandelStatus = true
-	}
-
+	q.PreconsumeCacheApplied = true
 	return nil
+}
+
+func (q *Quota) HasPreConsumedSideEffect() bool {
+	return q != nil && (q.PreconsumeTruthApplied || q.PreconsumeCacheApplied)
+}
+
+func (q *Quota) preparePreConsumedQuota() {
+	if q == nil {
+		return
+	}
+	q.preConsumedQuota = 0
+	if q.price.Type == model.TimesPriceType {
+		q.preConsumedQuota = int(1000 * q.inputRatio)
+	} else if q.price.Input != 0 || q.price.Output != 0 {
+		q.preConsumedQuota = int(float64(q.promptTokens)*q.inputRatio) + config.PreConsumedQuota
+	}
 }
 
 // 更新用户实时配额
 func (q *Quota) UpdateUserRealtimeQuota(usage *types.UsageEvent, nowUsage *types.UsageEvent) error {
 	usage.Merge(nowUsage)
 
-	// 不开启Redis，则不更新实时配额
-	if !config.RedisEnabled {
+	if q.price.Type == model.TimesPriceType {
 		return nil
 	}
 
-	promptTokens, completionTokens := q.getComputeTokensByUsageEvent(nowUsage)
-	increaseQuota := q.GetTotalQuota(promptTokens, completionTokens, nowUsage.ExtraBilling)
+	// 不开启Redis，则不更新实时配额
+	if !config.RedisEnabled {
+		return q.checkNonRedisRealtimeHardCap(usage)
+	}
+
+	increaseQuota := q.GetTotalQuotaByUsageEvent(nowUsage)
 
 	cacheQuota, err := model.CacheIncreaseUserRealtimeQuota(q.userId, increaseQuota)
 	if err != nil {
@@ -219,19 +255,101 @@ func (q *Quota) UpdateUserRealtimeQuota(usage *types.UsageEvent, nowUsage *types
 	return nil
 }
 
-func (q *Quota) Undo(c *gin.Context) {
-	if q.HandelStatus {
-		go func(ctx context.Context) {
-			// return pre-consumed quota
-			err := model.PostConsumeTokenQuotaWithInfo(q.tokenId, q.userId, q.unlimitedQuota, -q.preConsumedQuota)
-			if err != nil {
-				logger.LogError(ctx, "error return pre-consumed quota: "+err.Error())
-			}
-		}(c.Request.Context())
+func (q *Quota) checkNonRedisRealtimeHardCap(usage *types.UsageEvent) error {
+	if q == nil || q.unlimitedQuota || usage == nil || q.userId <= 0 {
+		return nil
 	}
+	currentQuota := q.GetTotalQuotaByUsageEvent(usage)
+	if currentQuota <= 0 {
+		return nil
+	}
+	userQuota, err := model.GetUserQuota(q.userId)
+	if err != nil {
+		return err
+	}
+	if userQuota < currentQuota {
+		return errors.New("user quota is not enough")
+	}
+	return nil
+}
+
+func (q *Quota) Undo(c *gin.Context) {
+	if q == nil || !q.HasPreConsumedSideEffect() {
+		return
+	}
+	ctx := q.rollbackContext(c)
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				logger.LogError(ctx, fmt.Sprintf("panic returning pre-consumed quota: %v", recovered))
+				logger.LogError(ctx, "stacktrace from panic: "+string(debug.Stack()))
+			}
+		}()
+		if err := q.undoSynchronouslyWithContext(ctx); err != nil {
+			logger.LogError(ctx, "error return pre-consumed quota: "+err.Error())
+		}
+	}()
+}
+
+func (q *Quota) UndoSynchronously(c *gin.Context) error {
+	if q == nil {
+		return nil
+	}
+	return q.undoSynchronouslyWithContext(q.rollbackContext(c))
+}
+
+func (q *Quota) undoSynchronouslyWithContext(ctx context.Context) error {
+	if q == nil || !q.HasPreConsumedSideEffect() {
+		return nil
+	}
+	if q.PreconsumeTruthApplied {
+		if err := model.ApplyTokenUserQuotaDeltaDirect(q.tokenId, q.userId, q.unlimitedQuota, -q.preConsumedQuota); err != nil {
+			return err
+		}
+	}
+	q.PreconsumeTruthApplied = false
+	if err := model.CacheUpdateUserQuota(q.userId); err != nil {
+		logger.LogError(ctx, "error refresh user quota cache after rollback: "+err.Error())
+		if delErr := model.CacheInvalidateUserQuota(q.userId); delErr != nil {
+			model.EnqueueUserQuotaCacheRepair(q.userId, "rollback_refresh_and_invalidate_failed")
+			return errors.New("error refresh user quota cache: " + err.Error() + "; error invalidate user quota cache: " + delErr.Error())
+		}
+	}
+	q.PreconsumeCacheApplied = false
+	return nil
+}
+
+func (q *Quota) rollbackContext(c *gin.Context) context.Context {
+	if c != nil && c.Request != nil {
+		return detachQuotaContext(c.Request.Context())
+	}
+	return detachQuotaContext(q.requestContext)
 }
 
 func (q *Quota) Consume(c *gin.Context, usage *types.Usage, isStream bool) {
+	q.prepareConsumeContext(c)
+	q.ConsumeUsage(usage, isStream)
+}
+
+func (q *Quota) ConsumeAtLeastPreConsumed(c *gin.Context, usage *types.Usage, isStream bool) {
+	q.prepareConsumeContext(c)
+	q.ConsumeUsageAtLeastPreConsumed(usage, isStream)
+}
+
+func (q *Quota) ConsumeAtLeastPreConsumedWithIdentity(c *gin.Context, usage *types.Usage, isStream bool, requestKind billing.SettlementRequestKind, identity string, deduplicate bool) error {
+	q.prepareConsumeContext(c)
+	return q.ConsumeUsageAtLeastPreConsumedWithIdentity(usage, isStream, requestKind, identity, deduplicate)
+}
+
+func (q *Quota) ConsumeWithIdentity(c *gin.Context, usage *types.Usage, isStream bool, requestKind billing.SettlementRequestKind, identity string, deduplicate bool) error {
+	q.prepareConsumeContext(c)
+	return q.ConsumeUsageWithIdentity(usage, isStream, requestKind, identity, deduplicate)
+}
+
+func (q *Quota) prepareConsumeContext(c *gin.Context) {
+	if q == nil {
+		return
+	}
 	if c != nil {
 		if q.requestContext == nil && c.Request != nil {
 			q.requestContext = detachQuotaContext(c.Request.Context())
@@ -240,16 +358,21 @@ func (q *Quota) Consume(c *gin.Context, usage *types.Usage, isStream bool) {
 			q.tokenName = c.GetString("token_name")
 		}
 		if q.sourceIP == "" {
-			q.sourceIP = c.ClientIP()
+			q.sourceIP = c.GetString(config.GinResponsesWSClientIPKey)
+			if q.sourceIP == "" {
+				q.sourceIP = c.ClientIP()
+			}
 		}
 		if q.userAgent == "" && c.Request != nil {
-			q.userAgent = utils.NormalizeUserAgent(c.Request.UserAgent())
+			q.userAgent = c.GetString(config.GinResponsesWSUserAgentKey)
+			if q.userAgent == "" {
+				q.userAgent = utils.NormalizeUserAgent(c.Request.UserAgent())
+			}
 		}
 		if q.startTime.IsZero() {
 			q.startTime = c.GetTime("requestStartTime")
 		}
 	}
-	q.ConsumeUsage(usage, isStream)
 }
 
 func (q *Quota) ConsumeUsage(usage *types.Usage, isStream bool) {
@@ -258,11 +381,31 @@ func (q *Quota) ConsumeUsage(usage *types.Usage, isStream bool) {
 	}
 }
 
+func (q *Quota) ConsumeUsageAtLeastPreConsumed(usage *types.Usage, isStream bool) {
+	if q == nil {
+		return
+	}
+	if err := q.consumeUsageSettlementWithFinalQuotaFloor(usage, isStream, billing.SettlementRequestKindUnary, "", false, q.preConsumedQuota); err != nil {
+		logger.LogError(q.requestContext, err.Error())
+	}
+}
+
+func (q *Quota) ConsumeUsageAtLeastPreConsumedWithIdentity(usage *types.Usage, isStream bool, requestKind billing.SettlementRequestKind, identity string, deduplicate bool) error {
+	if q == nil {
+		return nil
+	}
+	return q.consumeUsageSettlementWithFinalQuotaFloor(usage, isStream, requestKind, identity, deduplicate, q.preConsumedQuota)
+}
+
 func (q *Quota) ConsumeUsageWithIdentity(usage *types.Usage, isStream bool, requestKind billing.SettlementRequestKind, identity string, deduplicate bool) error {
 	return q.consumeUsageSettlement(usage, isStream, requestKind, identity, deduplicate)
 }
 
 func (q *Quota) BuildSettlementEnvelope(usage *types.Usage, isStream bool, requestKind billing.SettlementRequestKind, identity string, deduplicate bool) *billing.SettlementEnvelope {
+	return q.buildSettlementEnvelopeWithFinalQuotaFloor(usage, isStream, requestKind, identity, deduplicate, 0)
+}
+
+func (q *Quota) buildSettlementEnvelopeWithFinalQuotaFloor(usage *types.Usage, isStream bool, requestKind billing.SettlementRequestKind, identity string, deduplicate bool, finalQuotaFloor int) *billing.SettlementEnvelope {
 	if q == nil {
 		return nil
 	}
@@ -272,6 +415,9 @@ func (q *Quota) BuildSettlementEnvelope(usage *types.Usage, isStream bool, reque
 	}
 
 	finalQuota := q.GetTotalQuotaByUsage(usage)
+	if finalQuota < finalQuotaFloor {
+		finalQuota = finalQuotaFloor
+	}
 	return &billing.SettlementEnvelope{
 		Command: billing.SettlementCommand{
 			Identity:         identity,
@@ -303,6 +449,10 @@ func (q *Quota) BuildSettlementEnvelope(usage *types.Usage, isStream bool, reque
 }
 
 func (q *Quota) consumeUsageSettlement(usage *types.Usage, isStream bool, requestKind billing.SettlementRequestKind, identity string, deduplicate bool) error {
+	return q.consumeUsageSettlementWithFinalQuotaFloor(usage, isStream, requestKind, identity, deduplicate, 0)
+}
+
+func (q *Quota) consumeUsageSettlementWithFinalQuotaFloor(usage *types.Usage, isStream bool, requestKind billing.SettlementRequestKind, identity string, deduplicate bool, finalQuotaFloor int) error {
 	if q == nil {
 		return nil
 	}
@@ -312,20 +462,30 @@ func (q *Quota) consumeUsageSettlement(usage *types.Usage, isStream bool, reques
 		q.startTime = time.Now()
 	}
 
-	envelope := q.BuildSettlementEnvelope(usage, isStream, requestKind, identity, deduplicate)
+	envelope := q.buildSettlementEnvelopeWithFinalQuotaFloor(usage, isStream, requestKind, identity, deduplicate, finalQuotaFloor)
 	if envelope == nil {
 		return nil
 	}
 
 	result, err := billing.ApplySettlement(q.requestContext, envelope.Command, &envelope.Options)
 	if err != nil {
+		// Settlement is called after the provider-side request is considered
+		// admitted. If applying the final delta fails, keep any pre-consumed
+		// truth quota instead of refunding completed upstream work. Explicit
+		// no-send paths still use Undo/RollbackBeforeLocalWriteOK before this
+		// point, where provider absence is provable.
 		q.reconcileRealtimeQuotaCache()
 		return errors.New("error applying settlement: " + err.Error())
 	}
+	if result.Deduplicated {
+		return nil
+	}
 	if result.TruthApplied {
-		if q.cacheQuota > 0 {
+		if q.cacheQuota > 0 && !result.CleanupFailed {
 			q.cacheQuota = 0
 		}
+		q.PreconsumeTruthApplied = false
+		q.PreconsumeCacheApplied = false
 		return nil
 	}
 	q.reconcileRealtimeQuotaCache()
@@ -346,6 +506,7 @@ func (q *Quota) reconcileRealtimeQuotaCache() {
 
 	if _, err := model.CacheDecreaseUserRealtimeQuota(q.userId, q.cacheQuota); err != nil {
 		logger.LogError(q.requestContext, "error reconcile realtime quota cache: "+err.Error())
+		model.EnqueueUserRealtimeQuotaCacheDecreaseRepair(q.userId, q.cacheQuota, "realtime_quota_reconcile_failed")
 		return
 	}
 	q.cacheQuota = 0
@@ -508,7 +669,18 @@ func (q *Quota) getComputeTokensByUsageEvent(usage *types.UsageEvent) (promptTok
 
 // 通过 usage 获取消费配额
 func (q *Quota) GetTotalQuotaByUsage(usage *types.Usage) (quota int) {
+	if usage == nil {
+		return q.GetTotalQuota(0, 0, nil)
+	}
 	promptTokens, completionTokens := q.getComputeTokensByUsage(usage)
+	return q.GetTotalQuota(promptTokens, completionTokens, usage.ExtraBilling)
+}
+
+func (q *Quota) GetTotalQuotaByUsageEvent(usage *types.UsageEvent) (quota int) {
+	if usage == nil {
+		return q.GetTotalQuota(0, 0, nil)
+	}
+	promptTokens, completionTokens := q.getComputeTokensByUsageEvent(usage)
 	return q.GetTotalQuota(promptTokens, completionTokens, usage.ExtraBilling)
 }
 

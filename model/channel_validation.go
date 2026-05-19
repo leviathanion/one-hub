@@ -87,6 +87,10 @@ func validateCodexChannelOther(raw string) error {
 			if err := validateCodexEnumField(fieldName, value, normalizeCodexWebsocketModeValidation, "auto, force, off"); err != nil {
 				return err
 			}
+		case "self_hosted", "responses_ws_self_hosted":
+			if err := validateCodexBoolField(fieldName, value); err != nil {
+				return err
+			}
 		case "execution_session_ttl_seconds", "websocket_retry_cooldown_seconds":
 			if err := validateCodexPositiveIntField(fieldName, value); err != nil {
 				return err
@@ -100,6 +104,14 @@ func validateCodexChannelOther(raw string) error {
 		}
 	}
 
+	return nil
+}
+
+func validateCodexBoolField(fieldName string, raw json.RawMessage) error {
+	var value bool
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return fmt.Errorf("%s must be a boolean: %w", fieldName, err)
+	}
 	return nil
 }
 

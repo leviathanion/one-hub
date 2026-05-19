@@ -15,12 +15,7 @@ import (
 
 func withCodexExecutionManager(t *testing.T, manager *runtimesession.Manager) {
 	t.Helper()
-	originalManager := codexExecutionSessions
-	codexExecutionSessions = manager
-	t.Cleanup(func() {
-		codexExecutionSessions = originalManager
-		manager.Close()
-	})
+	replaceCodexExecutionSessionsForTest(t, manager)
 }
 
 func newCodexFakeRedisManager(t *testing.T) (*runtimesession.Manager, *fakeredis.Server, string) {

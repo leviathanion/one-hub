@@ -12,9 +12,11 @@ import (
 )
 
 type RealtimeTurnObserver struct {
-	mu            sync.Mutex
-	quota         *Quota
-	observedUsage types.UsageEvent
+	mu             sync.Mutex
+	quota          *Quota
+	observedUsage  types.UsageEvent
+	preconsumeOnce sync.Once
+	preconsumeErr  error
 }
 
 func (o *RealtimeTurnObserver) Quota() *Quota {
@@ -31,7 +33,34 @@ func (o *RealtimeTurnObserver) ObserveTurnUsage(usage *types.UsageEvent) error {
 
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if err := o.ensurePreConsumedLocked(); err != nil {
+		return err
+	}
 	return o.quota.UpdateUserRealtimeQuota(&o.observedUsage, usage)
+}
+
+func (o *RealtimeTurnObserver) AdmitTurn() error {
+	if o == nil || o.quota == nil {
+		return nil
+	}
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.ensurePreConsumedLocked()
+}
+
+func (o *RealtimeTurnObserver) RollbackTurnAdmission(reason string) error {
+	_ = reason
+	if o == nil || o.quota == nil {
+		return nil
+	}
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if !o.quota.HasPreConsumedSideEffect() {
+		return nil
+	}
+	return o.quota.UndoSynchronously(nil)
 }
 
 func (o *RealtimeTurnObserver) FinalizeTurn(payload runtimesession.TurnFinalizePayload) {
@@ -41,6 +70,10 @@ func (o *RealtimeTurnObserver) FinalizeTurn(payload runtimesession.TurnFinalizeP
 
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if err := o.ensurePreConsumedLocked(); err != nil {
+		logger.LogError(o.quota.requestContext, "realtime preconsume failed before finalize: "+err.Error())
+		return
+	}
 
 	finalUsage := payload.Usage.Clone()
 	if finalUsage == nil {
@@ -56,6 +89,19 @@ func (o *RealtimeTurnObserver) FinalizeTurn(payload runtimesession.TurnFinalizeP
 		logger.LogError(o.quota.requestContext, "realtime finalize settlement failed: "+err.Error())
 		return
 	}
+}
+
+func (o *RealtimeTurnObserver) ensurePreConsumedLocked() error {
+	if o == nil || o.quota == nil {
+		return nil
+	}
+	o.preconsumeOnce.Do(func() {
+		o.quota.ForcePreConsume()
+		if errWithCode := o.quota.PreQuotaConsumptionRollbackable(); errWithCode != nil {
+			o.preconsumeErr = errWithCode
+		}
+	})
+	return o.preconsumeErr
 }
 
 func buildRealtimeTurnSettlementIdentity(quota *Quota, payload runtimesession.TurnFinalizePayload) string {
@@ -85,6 +131,7 @@ func NewRealtimeTurnObserverFactory(quotaTemplate *Quota) runtimesession.TurnObs
 		var quota *Quota
 		if quotaTemplate != nil {
 			quota = quotaTemplate.Clone()
+			quota.ForcePreConsume()
 		}
 		return &RealtimeTurnObserver{quota: quota}
 	}

@@ -19,6 +19,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"github.com/spf13/viper"
 	"go.uber.org/zap"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -31,8 +32,8 @@ func init() {
 }
 
 func (relayTestRealtimeSession) SendClient(context.Context, int, []byte) error { return nil }
-func (relayTestRealtimeSession) Recv(context.Context) (int, []byte, *types.UsageEvent, error) {
-	return 0, nil, nil, nil
+func (relayTestRealtimeSession) Recv(context.Context) (int, []byte, *types.UsageEvent, runtimesession.RealtimePayloadOrigin, error) {
+	return 0, nil, nil, runtimesession.RealtimePayloadOriginProxyLocal, nil
 }
 func (relayTestRealtimeSession) Detach(string) {}
 func (relayTestRealtimeSession) Abort(string)  {}
@@ -124,6 +125,131 @@ func TestRealtimeClientSessionIDFromRequestPrefersExplicitHeader(t *testing.T) {
 
 	if got := realtimeClientSessionIDFromRequest(req); got != "execution-session-456" {
 		t.Fatalf("expected x-session-id to win, got %q", got)
+	}
+}
+
+func TestRealtimeWebSocketOriginPolicy(t *testing.T) {
+	originalAllowed := viper.Get("realtime.allowed_origins")
+	originalCORSAllowed := viper.Get("cors.allow_origins")
+	originalUnsafe := viper.Get("realtime.unsafe_allow_credential_subprotocol_any_origin")
+	t.Cleanup(func() {
+		viper.Set("realtime.allowed_origins", originalAllowed)
+		viper.Set("cors.allow_origins", originalCORSAllowed)
+		viper.Set("realtime.unsafe_allow_credential_subprotocol_any_origin", originalUnsafe)
+	})
+
+	tests := []struct {
+		name        string
+		allowed     []string
+		corsAllowed []string
+		origin      string
+		protocols   string
+		unsafe      bool
+		wantAllowed bool
+	}{
+		{name: "server call without origin", wantAllowed: true},
+		{name: "origin allowed when allowlist empty", origin: "https://app.example", wantAllowed: true},
+		{name: "credential subprotocol rejects empty allowlist", origin: "https://app.example", protocols: "openai-insecure-api-key.sk-test", wantAllowed: false},
+		{name: "credential subprotocol unsafe opt-out allows empty allowlist", origin: "https://app.example", protocols: "openai-insecure-api-key.sk-test", unsafe: true, wantAllowed: true},
+		{name: "exact origin allowed", allowed: []string{"https://app.example"}, origin: "https://app.example", wantAllowed: true},
+		{name: "cors allowlist fallback allows origin", corsAllowed: []string{"https://app.example"}, origin: "https://app.example", wantAllowed: true},
+		{name: "unlisted origin rejected", allowed: []string{"https://app.example"}, origin: "https://evil.example", wantAllowed: false},
+		{name: "wildcard allows non credential origin", allowed: []string{"*"}, origin: "https://app.example", wantAllowed: true},
+		{name: "wildcard rejects credential subprotocol", allowed: []string{"*"}, origin: "https://app.example", protocols: "realtime, openai-insecure-api-key.sk-test", wantAllowed: false},
+		{name: "credential subprotocol requires origin", allowed: []string{"https://app.example"}, protocols: "openai-insecure-api-key.sk-test", wantAllowed: false},
+		{name: "credential subprotocol accepts exact origin", allowed: []string{"https://app.example"}, origin: "https://app.example", protocols: "openai-insecure-api-key.sk-test, realtime", wantAllowed: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			viper.Set("realtime.allowed_origins", tt.allowed)
+			viper.Set("cors.allow_origins", tt.corsAllowed)
+			viper.Set("realtime.unsafe_allow_credential_subprotocol_any_origin", tt.unsafe)
+			req := httptest.NewRequest(http.MethodGet, "/v1/realtime", nil)
+			if tt.origin != "" {
+				req.Header.Set("Origin", tt.origin)
+			}
+			if tt.protocols != "" {
+				req.Header.Set("Sec-WebSocket-Protocol", tt.protocols)
+			}
+			if got := realtimeWebSocketOriginAllowed(req); got != tt.wantAllowed {
+				t.Fatalf("origin policy allowed=%v, want %v", got, tt.wantAllowed)
+			}
+		})
+	}
+}
+
+func TestRealtimeHandlersRejectOriginBeforeUpgrade(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	originalAllowed := viper.Get("realtime.allowed_origins")
+	t.Cleanup(func() {
+		viper.Set("realtime.allowed_origins", originalAllowed)
+	})
+	viper.Set("realtime.allowed_origins", []string{"https://app.example"})
+
+	router := gin.New()
+	router.GET("/v1/realtime", ChatRealtime)
+	router.GET("/v1/responses", ResponsesWebSocket)
+
+	for _, path := range []string{"/v1/realtime?model=gpt-5", "/v1/responses"} {
+		recorder := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Origin", "https://evil.example")
+		router.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusForbidden {
+			t.Fatalf("expected %s to reject invalid origin with 403, got %d", path, recorder.Code)
+		}
+		if !strings.Contains(recorder.Body.String(), "realtime_origin_not_allowed") && !strings.Contains(recorder.Body.String(), "websocket origin is not allowed") {
+			t.Fatalf("expected %s to return an explicit origin error, got %s", path, recorder.Body.String())
+		}
+	}
+}
+
+func TestWebSocketSubprotocolNegotiationOnlyAllowsKnownValues(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/v1/realtime", nil)
+	req.Header.Set("Sec-WebSocket-Protocol", "evil-auth, openai-beta.realtime-v1, openai-insecure-api-key.sk-client, realtime")
+
+	allowed := allowedClientWebSocketSubprotocols(req)
+	if strings.Join(allowed, ",") != "openai-beta.realtime-v1,openai-insecure-api-key.sk-client,realtime" {
+		t.Fatalf("unexpected allowed protocols: %#v", allowed)
+	}
+	if got := selectWebSocketSubprotocol(req); got != "realtime" {
+		t.Fatalf("expected realtime to be negotiated when present, got %q", got)
+	}
+}
+
+func TestWebSocketSubprotocolNegotiationNeverEchoesCredential(t *testing.T) {
+	tests := []struct {
+		name      string
+		protocols string
+		want      string
+	}{
+		{
+			name:      "credential only is never echoed",
+			protocols: "openai-insecure-api-key.sk-secret",
+			want:      "",
+		},
+		{
+			name:      "credential with beta picks beta",
+			protocols: "openai-insecure-api-key.sk-secret, openai-beta.realtime-v1",
+			want:      "openai-beta.realtime-v1",
+		},
+		{
+			name:      "realtime always wins over credential",
+			protocols: "openai-insecure-api-key.sk-secret, realtime",
+			want:      "realtime",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/v1/realtime", nil)
+			req.Header.Set("Sec-WebSocket-Protocol", tt.protocols)
+			if got := selectWebSocketSubprotocol(req); got != tt.want {
+				t.Fatalf("selectWebSocketSubprotocol() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 

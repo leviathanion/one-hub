@@ -157,6 +157,7 @@ type SettlementResult struct {
 	TruthApplied        bool `json:"truth_applied"`
 	Deduplicated        bool `json:"deduplicated"`
 	FingerprintConflict bool `json:"fingerprint_conflict"`
+	CleanupFailed       bool `json:"cleanup_failed,omitempty"`
 }
 
 type settlementFingerprintPayload struct {
@@ -221,7 +222,9 @@ func ApplySettlement(ctx context.Context, cmd SettlementCommand, opts *Settlemen
 	}
 	result.TruthApplied = true
 
-	runSettlementCleanup(ctx, cmd, *opts)
+	if !runSettlementCleanup(ctx, cmd, *opts) {
+		result.CleanupFailed = true
+	}
 	runSettlementProjection(ctx, cmd, *opts)
 	return result, nil
 }
@@ -265,17 +268,23 @@ func releaseSettlementGate(ctx context.Context, gateKey string) {
 	}
 }
 
-func runSettlementCleanup(ctx context.Context, cmd SettlementCommand, opts SettlementOptions) {
+func runSettlementCleanup(ctx context.Context, cmd SettlementCommand, opts SettlementOptions) bool {
+	ok := true
 	if opts.Cleanup.RealtimeQuotaDelta > 0 {
 		if _, err := model.CacheDecreaseUserRealtimeQuota(cmd.UserID, opts.Cleanup.RealtimeQuotaDelta); err != nil {
 			logger.LogError(ctx, "settlement realtime quota cleanup failed: "+err.Error())
+			model.EnqueueUserRealtimeQuotaCacheDecreaseRepair(cmd.UserID, opts.Cleanup.RealtimeQuotaDelta, "settlement_realtime_quota_cleanup_failed")
+			ok = false
 		}
 	}
 	if opts.Cleanup.RefreshUserQuotaCache {
 		if err := model.CacheUpdateUserQuota(cmd.UserID); err != nil {
 			logger.LogError(ctx, "settlement user quota cache refresh failed: "+err.Error())
+			model.EnqueueUserQuotaCacheRepair(cmd.UserID, "settlement_user_quota_cache_refresh_failed")
+			ok = false
 		}
 	}
+	return ok
 }
 
 func runSettlementProjection(ctx context.Context, cmd SettlementCommand, opts SettlementOptions) {

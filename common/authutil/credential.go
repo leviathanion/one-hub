@@ -74,6 +74,21 @@ func ExtractOpenAIWebsocketCredential(req *http.Request) Credential {
 	return Credential{}
 }
 
+func AllowedOpenAIUpstreamWebsocketSubprotocols(req *http.Request) []string {
+	if req == nil {
+		return nil
+	}
+	allowed := make([]string, 0, len(websocket.Subprotocols(req)))
+	for _, protocol := range websocket.Subprotocols(req) {
+		protocol = strings.TrimSpace(protocol)
+		switch protocol {
+		case "realtime", "openai-beta.realtime-v1":
+			allowed = append(allowed, protocol)
+		}
+	}
+	return allowed
+}
+
 func extractRequestCredential(req *http.Request, headerKeys []string, includeOpenAIWebsocket bool) Credential {
 	if req == nil {
 		return Credential{}
