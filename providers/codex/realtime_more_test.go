@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -147,6 +148,19 @@ func TestCodexRealtimeHelperFunctionsAndCompatibilityHeaders(t *testing.T) {
 	if shouldContinue, usage, rewritten, err := provider.handleRealtimeSupplierMessage(websocket.TextMessage, []byte(`{"type":"error"}`), nil, "gpt-5"); shouldContinue || usage != nil || rewritten != nil || err == nil {
 		t.Fatalf("expected provider error events to stop the bridge, continue=%v usage=%+v rewritten=%v err=%v", shouldContinue, usage, rewritten, err)
 	}
+
+	nestedErrorPayload := []byte(`{"type":"error","status":429,"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"slow down","param":"model"},"response":{"id":"resp_error_1"}}`)
+	shouldContinue, usage, rewritten, err := provider.handleRealtimeSupplierMessage(websocket.TextMessage, nestedErrorPayload, nil, "gpt-5")
+	if shouldContinue || usage != nil || rewritten != nil || err == nil {
+		t.Fatalf("expected nested provider error event to stop the bridge, continue=%v usage=%+v rewritten=%v err=%v", shouldContinue, usage, rewritten, err)
+	}
+	event, ok := err.(*types.Event)
+	if !ok || event.ErrorDetail == nil {
+		t.Fatalf("expected provider error to be returned as types.Event, got %T %v", err, err)
+	}
+	if event.ErrorDetail.Type != "rate_limit_error" || event.ErrorDetail.Code != "rate_limit_exceeded" || event.ErrorDetail.Message != "slow down" {
+		t.Fatalf("expected nested provider error detail to be preserved, got %+v", event.ErrorDetail)
+	}
 }
 
 func TestCodexRealtimeConnectionPlanningAndDialPaths(t *testing.T) {
@@ -258,6 +272,35 @@ func TestCodexRealtimeConnectionPlanningAndDialPaths(t *testing.T) {
 		gotCode, _ := errWithCode.Code.(string)
 		if gotCode != "ws_request_failed" || errWithCode.StatusCode != http.StatusInternalServerError {
 			t.Fatalf("expected transport errors without HTTP status to remain ws_request_failed, got %+v", errWithCode)
+		}
+	})
+
+	t.Run("handshake diagnostic log sanitizes url and includes response context", func(t *testing.T) {
+		message := codexRealtimeWSDialFailureLogMessage(&requester.WSDialHandshakeError{
+			URL:           "wss://provider.example/backend-api/codex/responses?api_key=secret#fragment",
+			StatusCode:    http.StatusBadGateway,
+			Header:        http.Header{"X-Request-Id": []string{"req_123"}, "Cf-Ray": []string{"ray_456"}, "Retry-After": []string{"3"}},
+			BodySnippet:   []byte("bad gateway\nupstream said no"),
+			BodyTruncated: true,
+			Err:           errors.New("websocket: bad handshake"),
+		})
+		for _, expected := range []string{
+			"status=502",
+			"url=wss://provider.example/backend-api/codex/responses",
+			"x_request_id=req_123",
+			"cf_ray=ray_456",
+			"retry_after=3",
+			"body_truncated=true",
+			"bad gateway\\nupstream said no",
+		} {
+			if !strings.Contains(message, expected) {
+				t.Fatalf("expected diagnostic log to contain %q, got %q", expected, message)
+			}
+		}
+		for _, forbidden := range []string{"api_key=secret", "#fragment"} {
+			if strings.Contains(message, forbidden) {
+				t.Fatalf("expected diagnostic log to redact %q, got %q", forbidden, message)
+			}
 		}
 	})
 

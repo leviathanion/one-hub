@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"one-api/common"
@@ -19,6 +21,7 @@ import (
 
 const codexResponsesWebsocketBetaHeaderValue = "responses_websockets=2026-02-06"
 const codexRealtimeMalformedPayloadLogLimit = 4096
+const codexRealtimeDiagnosticValueLogLimit = 4096
 
 type codexRealtimeConnPlan struct {
 	wsURL   string
@@ -80,6 +83,8 @@ func (p *CodexProvider) dialChatRealtimeConnWithContext(ctx context.Context, pla
 }
 
 func mapCodexRealtimeWSDialError(err error) *types.OpenAIErrorWithStatusCode {
+	logCodexRealtimeWSDialFailure(err)
+
 	var handshake *requester.WSDialHandshakeError
 	if errors.As(err, &handshake) && handshake != nil {
 		switch handshake.StatusCode {
@@ -95,8 +100,74 @@ func mapCodexRealtimeWSDialError(err error) *types.OpenAIErrorWithStatusCode {
 			}
 		}
 	}
-	logger.LogError(context.Background(), "codex realtime websocket dial failed: "+err.Error())
 	return common.StringErrorWrapperLocal("websocket request failed", "ws_request_failed", http.StatusInternalServerError)
+}
+
+func logCodexRealtimeWSDialFailure(err error) {
+	if err == nil {
+		return
+	}
+	logger.LogError(context.Background(), codexRealtimeWSDialFailureLogMessage(err))
+}
+
+func codexRealtimeWSDialFailureLogMessage(err error) string {
+	var handshake *requester.WSDialHandshakeError
+	if !errors.As(err, &handshake) || handshake == nil {
+		return "codex realtime websocket dial failed: cause=" + codexRealtimeLogValue(err.Error())
+	}
+
+	body := codexRealtimeLogValue(string(handshake.BodySnippet))
+	if body == "" && handshake.BodyReadErr != nil {
+		body = "body_read_failed:" + codexRealtimeLogValue(handshake.BodyReadErr.Error())
+	}
+	return fmt.Sprintf(
+		"codex realtime websocket dial failed: status=%d url=%s server=%s via=%s cf_ray=%s x_request_id=%s openai_request_id=%s retry_after=%s body_truncated=%v body=%s cause=%s",
+		handshake.StatusCode,
+		codexRealtimeWSURLForLog(handshake.URL),
+		codexRealtimeHeaderForLog(handshake.Header, "server"),
+		codexRealtimeHeaderForLog(handshake.Header, "via"),
+		codexRealtimeHeaderForLog(handshake.Header, "cf-ray"),
+		codexRealtimeHeaderForLog(handshake.Header, "x-request-id"),
+		codexRealtimeHeaderForLog(handshake.Header, "x-openai-request-id"),
+		codexRealtimeHeaderForLog(handshake.Header, "retry-after"),
+		handshake.BodyTruncated,
+		body,
+		codexRealtimeLogValue(handshake.Error()),
+	)
+}
+
+func codexRealtimeWSURLForLog(rawURL string) string {
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return ""
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Host == "" {
+		return codexRealtimeLogValue(trimmed)
+	}
+	parsed.User = nil
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return codexRealtimeLogValue(parsed.String())
+}
+
+func codexRealtimeHeaderForLog(header http.Header, key string) string {
+	if header == nil {
+		return ""
+	}
+	return codexRealtimeLogValue(header.Get(key))
+}
+
+func codexRealtimeLogValue(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	trimmed = strings.NewReplacer("\r", "\\r", "\n", "\\n", "\t", "\\t").Replace(trimmed)
+	if len(trimmed) <= codexRealtimeDiagnosticValueLogLimit {
+		return trimmed
+	}
+	return trimmed[:codexRealtimeDiagnosticValueLogLimit] + "...(truncated)"
 }
 
 func buildCodexRealtimeURL(httpURL string) (string, error) {
@@ -252,16 +323,9 @@ func (p *CodexProvider) handleRealtimeSupplierMessage(messageType int, message [
 	}
 
 	if event.Type == "error" {
-		code := "provider_error"
-		if event.Code != nil && strings.TrimSpace(*event.Code) != "" {
-			code = strings.TrimSpace(*event.Code)
-		}
-		messageText := "provider websocket error"
-		if event.Message != nil && strings.TrimSpace(*event.Message) != "" {
-			messageText = strings.TrimSpace(*event.Message)
-		}
-		logger.SysError("codex realtime error: " + messageText)
-		return false, nil, nil, types.NewErrorEvent("", "provider_error", code, messageText)
+		detail := codexRealtimeProviderErrorDetailFromPayload(&event, message)
+		logger.SysError(codexRealtimeProviderErrorLogMessage(detail, message))
+		return false, nil, nil, types.NewErrorEvent("", detail.Type, detail.Code, detail.Message)
 	}
 
 	if accumulator != nil {
@@ -273,6 +337,133 @@ func (p *CodexProvider) handleRealtimeSupplierMessage(messageType int, message [
 	}
 
 	return true, nil, nil, nil
+}
+
+type codexRealtimeProviderErrorDetail struct {
+	Type       string
+	Code       string
+	Message    string
+	Param      string
+	Status     int
+	ResponseID string
+}
+
+type codexRealtimeProviderErrorPayload struct {
+	Status   int                             `json:"status,omitempty"`
+	Code     *string                         `json:"code,omitempty"`
+	Message  *string                         `json:"message,omitempty"`
+	Param    any                             `json:"param,omitempty"`
+	Error    *types.OpenAIError              `json:"error,omitempty"`
+	Response *types.OpenAIResponsesResponses `json:"response,omitempty"`
+}
+
+func codexRealtimeProviderErrorDetailFromPayload(event *types.OpenAIResponsesStreamResponses, payload []byte) codexRealtimeProviderErrorDetail {
+	detail := codexRealtimeProviderErrorDetail{
+		Type:    "provider_error",
+		Code:    "provider_error",
+		Message: "provider websocket error",
+	}
+	if event != nil {
+		if event.Response != nil {
+			detail.ResponseID = strings.TrimSpace(event.Response.ID)
+			applyCodexRealtimeOpenAIErrorDetail(&detail, event.Response.Error)
+		}
+		if event.Code != nil {
+			if code := strings.TrimSpace(*event.Code); code != "" {
+				detail.Code = code
+			}
+		}
+		if event.Message != nil {
+			if message := strings.TrimSpace(*event.Message); message != "" {
+				detail.Message = message
+			}
+		}
+		if event.Param != nil {
+			if param := codexRealtimeAnyString(*event.Param); param != "" {
+				detail.Param = param
+			}
+		}
+	}
+
+	var wire codexRealtimeProviderErrorPayload
+	if len(payload) > 0 && json.Unmarshal(payload, &wire) == nil {
+		if wire.Status > 0 {
+			detail.Status = wire.Status
+		}
+		applyCodexRealtimeOpenAIErrorDetail(&detail, wire.Error)
+		if wire.Response != nil {
+			if responseID := strings.TrimSpace(wire.Response.ID); responseID != "" {
+				detail.ResponseID = responseID
+			}
+			applyCodexRealtimeOpenAIErrorDetail(&detail, wire.Response.Error)
+		}
+		if wire.Code != nil {
+			if code := strings.TrimSpace(*wire.Code); code != "" {
+				detail.Code = code
+			}
+		}
+		if wire.Message != nil {
+			if message := strings.TrimSpace(*wire.Message); message != "" {
+				detail.Message = message
+			}
+		}
+		if param := codexRealtimeAnyString(wire.Param); param != "" {
+			detail.Param = param
+		}
+	}
+
+	if strings.TrimSpace(detail.Type) == "" {
+		detail.Type = "provider_error"
+	}
+	if strings.TrimSpace(detail.Code) == "" {
+		detail.Code = "provider_error"
+	}
+	if strings.TrimSpace(detail.Message) == "" {
+		detail.Message = "provider websocket error"
+	}
+	return detail
+}
+
+func applyCodexRealtimeOpenAIErrorDetail(detail *codexRealtimeProviderErrorDetail, openAIError *types.OpenAIError) {
+	if detail == nil || openAIError == nil {
+		return
+	}
+	if errType := strings.TrimSpace(openAIError.Type); errType != "" {
+		detail.Type = errType
+	}
+	if code := codexRealtimeErrorCodeString(openAIError.Code, ""); code != "" {
+		detail.Code = code
+	}
+	if message := strings.TrimSpace(openAIError.Message); message != "" {
+		detail.Message = message
+	}
+	if param := strings.TrimSpace(openAIError.Param); param != "" {
+		detail.Param = param
+	}
+}
+
+func codexRealtimeAnyString(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(typed)
+	default:
+		return strings.TrimSpace(fmt.Sprint(typed))
+	}
+}
+
+func codexRealtimeProviderErrorLogMessage(detail codexRealtimeProviderErrorDetail, payload []byte) string {
+	return fmt.Sprintf(
+		"codex realtime error: type=%s code=%s status=%d message=%s param=%s response_id=%s payload=%s",
+		codexRealtimeLogValue(detail.Type),
+		codexRealtimeLogValue(detail.Code),
+		detail.Status,
+		codexRealtimeLogValue(detail.Message),
+		codexRealtimeLogValue(detail.Param),
+		codexRealtimeLogValue(detail.ResponseID),
+		codexRealtimeLogValue(codexRealtimePayloadSnippet(payload)),
+	)
 }
 
 func codexRealtimePayloadSnippet(payload []byte) string {
