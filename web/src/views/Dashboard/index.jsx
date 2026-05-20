@@ -340,7 +340,7 @@ const Dashboard = () => {
             <TodayTokenBreakdownCard isLoading={isCacheOverviewLoading} data={selectedTokenBreakdown} />
           </Grid>
           <Grid item lg={6} xs={12}>
-            <CacheHitRateCard isLoading={isCacheOverviewLoading} data={selectedCacheHitRate} />
+            <CacheHitRateCard isLoading={isCacheOverviewLoading} data={selectedCacheHitRate} tokenData={selectedTokenBreakdown} />
           </Grid>
         </Grid>
       </Grid>
