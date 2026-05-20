@@ -157,8 +157,8 @@ ResponsesWS 使用两类连接 lease：
 
 | lease | 默认 | 生命周期 |
 | --- | --- | --- |
-| `responses_ws.pending_per_credential` | `1` (`-1` = unlimited) | Upgrade 前获取，首帧校验、active lease 和 first-turn RPM admission 完成后释放；早退由 defer 兜底 |
-| `responses_ws.active_per_credential` | `8` | 打开首个 upstream session 前获取，actor close/handler return 后释放 |
+| `responses_ws.pending_per_credential` | `96` (`-1` = unlimited) | Upgrade 前获取，首帧校验、active lease 和 first-turn RPM admission 完成后释放；早退由 defer 兜底 |
+| `responses_ws.active_per_credential` | `128` | 打开首个 upstream session 前获取，actor close/handler return 后释放 |
 | `responses_ws.active_per_group` | `128` | 同 active lease |
 | `responses_ws.active_global` | `1024` | 同 active lease |
 
@@ -172,30 +172,30 @@ active lease 不随首帧发送成功释放，因为 established websocket 可�
 
 | 配置 | 默认 | 语义 |
 | --- | --- | --- |
-| `responses_ws.connect_per_credential_per_minute` | `30` | 每个 credential 每分钟允许的 ResponsesWS 建连尝试数；单位是 per minute，窗口/Redis 共享语义与 API RPM limiter 一致；显式 `-1` 表示关闭 |
+| `responses_ws.connect_per_credential_per_minute` | `600` | 每个 credential 每分钟允许的 ResponsesWS 建连尝试数；单位是 per minute，窗口/Redis 共享语义与 API RPM limiter 一致；显式 `-1` 表示关闭 |
 | `responses_ws.allow_anonymous_capacity_bucket` | `false` | 缺 token/user 时是否进入共享 `responses-ws-connect:anonymous` 桶；仅测试/本地诊断使用，生产保持 `false` |
 
 入口位置：`middleware.AllowResponsesWSConnectionAttempt` 在 `relay.ResponsesWebSocket` 中位于 `EnsureCurrentUserRequestAllowed` 之后、`AcquireResponsesWSPendingSlot` 之前调用；默认值由 `common/config/config.go` 启动时通过 `viper.SetDefault` 注入。
 
 - 调用顺序固定为：`EnsureCurrentUserRequestAllowed(c)` → `AllowResponsesWSConnectionAttempt(c)` → `AcquireResponsesWSPendingSlot(c)` → Upgrade。连接级限流失败时返回 `429 responses_ws_connection_rate_limited`，不得占用 pending/active lease。
-- 限流 key 复用 `responsesWSCredentialKey(c)`：优先 token，其次 user，再其次稳定 auth namespace。`responses_ws.allow_anonymous_capacity_bucket=true` 时所有匿名请求共享 `responses-ws-connect:anonymous` 桶，因此默认 `30/min` 是全局匿名桶，不是 per-client。
+- 限流 key 复用 `responsesWSCredentialKey(c)`：优先 token，其次 user，再其次稳定 auth namespace。`responses_ws.allow_anonymous_capacity_bucket=true` 时所有匿名请求共享 `responses-ws-connect:anonymous` 桶，因此默认 `600/min` 是全局匿名桶，不是 per-client。
 - 故障模式 fail-open：Redis 不可用或 limiter 调用异常时退回进程内 limiter，并在降级路径 `logger.Warn` 一次。Trade-off：Redis 抖动期间会暂时失去跨实例共享，但避免把基础设施抖动放大成 handshake 全 429。
 - 指标 counter `responses_ws_connection_rate_limited_total`，标签只允许低基数维度（`group`、`credential_kind`），不要直接把 credential id 放进标签。
-- 默认值维持 `30/min`。按常见断线重连指数退避 `1/2/4/8/16/32s` 估算，一分钟约 6 次重连，默认值仍有约 5 倍余量；若未来降到 `10/min`，需要重新评估移动网络和代理抖动下的误伤风险。
+- 默认值维持 `600/min`。这是为单 token 多人多设备场景预留重连风暴余量；代价是错误客户端或攻击流量能在一分钟内占用更多握手资源，所以部署侧仍应配合上游网关、API RPM 和 active lease 使用。
 
 ## 时间与大小配置
 
 | 配置 | 默认 |
 | --- | --- |
-| `realtime.websocket_read_limit` | `16 MiB` |
+| `realtime.websocket_read_limit` | `32 MiB` |
 | `realtime.websocket_ping_interval_ms` | `25000`（`<=0` 显式禁用，仅建议测试使用） |
 | `realtime.websocket_write_timeout_ms` | `10000` |
-| `responses_ws.first_frame_timeout_ms` | `5000` |
+| `responses_ws.first_frame_timeout_ms` | `30000` |
 | `responses_ws.idle_timeout_ms` | `1800000` |
 | `responses_ws.max_lifetime_ms` | `3600000` |
 | `responses_ws.pending_provider_events_max_bytes` | `2097152` |
 
-首帧读取成功后会清除 first-frame read deadline，后续 idle 由 actor watchdog 与服务端 ping/pong activity 维护；总连接寿命墙用于回收长期挂起连接，pending provider buffer 上限用于限制 send 结果确认前的内存占用。Trade-off：16 MiB 默认 read limit 降低长音频帧误伤，但会提高单连接峰值内存预算；超限后 gorilla 连接不可复用，因此实现返回静态 `invalid_event` 后关闭连接。
+首帧读取成功后会清除 first-frame read deadline，后续 idle 由 actor watchdog 与服务端 ping/pong activity 维护；总连接寿命墙用于回收长期挂起连接，pending provider buffer 上限用于限制 send 结果确认前的内存占用。Trade-off：32 MiB 默认 read limit 降低 Codex 大上下文/文件负载误伤，但会提高单连接峰值内存预算；超限后 gorilla 连接不可复用，因此实现返回静态 `invalid_event` 后关闭连接。
 
 ## Turn 事务
 

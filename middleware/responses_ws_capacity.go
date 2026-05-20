@@ -24,9 +24,9 @@ import (
 )
 
 const (
-	defaultResponsesWSConnectPerCredentialPerMinute = 300
-	defaultResponsesWSPendingPerCredential          = 16
-	defaultResponsesWSActivePerCredential           = 32
+	defaultResponsesWSConnectPerCredentialPerMinute = 600
+	defaultResponsesWSPendingPerCredential          = 96
+	defaultResponsesWSActivePerCredential           = 128
 	defaultResponsesWSActivePerGroup                = 128
 	defaultResponsesWSActiveGlobal                  = 1024
 	responsesWSConnectLimiterKeyPrefix              = "responses-ws-connect:"

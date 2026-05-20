@@ -9,7 +9,7 @@ import (
 func RealtimeWebsocketReadLimit() int64 {
 	limit := viper.GetInt64("realtime.websocket_read_limit")
 	if limit <= 0 {
-		return 16 << 20
+		return 32 << 20
 	}
 	return limit
 }
@@ -36,7 +36,7 @@ func RealtimeWebsocketPingInterval() time.Duration {
 func ResponsesWSFirstFrameTimeout() time.Duration {
 	timeoutMS := viper.GetInt("responses_ws.first_frame_timeout_ms")
 	if timeoutMS <= 0 {
-		return 5 * time.Second
+		return 30 * time.Second
 	}
 	return time.Duration(timeoutMS) * time.Millisecond
 }

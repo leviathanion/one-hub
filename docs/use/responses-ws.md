@@ -42,15 +42,15 @@ ResponsesWS 是一个 **turn-based** WebSocket 入口：一条连接上可以发
 # config.yaml
 responses_ws:
   # ---- 容量控制 ----
-  connect_per_credential_per_minute: 30     # 每分钟每凭据建连尝试上限
-  pending_per_credential: 1                 # 等待首帧的 pending 槽位；-1 表示不限
-  active_per_credential: 8                  # 单凭据已建立连接上限
+  connect_per_credential_per_minute: 600    # 每分钟每凭据建连尝试上限
+  pending_per_credential: 96                # 等待首帧的 pending 槽位；-1 表示不限
+  active_per_credential: 128                # 单凭据已建立连接上限
   active_per_group: 128                     # 单分组已建立连接上限
   active_global: 1024                       # 全局已建立连接上限
   active_lease_redis_fail_open: true        # Redis 故障时是否放行
 
   # ---- 超时管理 ----
-  first_frame_timeout_ms: 5000              # 首帧超时
+  first_frame_timeout_ms: 30000             # 首帧超时
   idle_timeout_ms: 1800000                  # 空闲超时（30 分钟）
   max_lifetime_ms: 3600000                  # 最大存活时间（1 小时）
 
@@ -90,20 +90,20 @@ ResponsesWS 使用三级容量控制，逐级检查：
 
 | 值 | 行为 | 影响 |
 |----|------|------|
-| `30`（默认） | 每分钟 30 次 | 覆盖正常用户交互频率 |
-| `60` | 每分钟 60 次 | 高频场景（调试、自动化测试） |
+| `600`（默认） | 每分钟 600 次 | 支持单 token 多人多设备和短时重连风暴 |
+| `60` | 每分钟 60 次 | 更保守的小团队场景 |
 | `-1` | 不限 | 凭据可无限建连；风险：恶意凭据可发起连接洪水 |
 
 **示例**：
 
 ```yaml
 responses_ws:
-  connect_per_credential_per_minute: 30
+  connect_per_credential_per_minute: 600
 ```
 
 **对系统的影响**：
 - Redis 可用时：分布式限流，多实例共享计数。
-- Redis 不可用时：回退为进程内限流，多实例各算各的（总限流 = 实例数 × 30）。
+- Redis 不可用时：回退为进程内限流，多实例各算各的（总限流 = 实例数 × 配置值）。
 - 超限返回 `429 Too Many Requests`。
 
 ---
@@ -122,19 +122,19 @@ responses_ws:
 
 | 值 | 行为 | 影响 |
 |----|------|------|
-| `1`（默认） | 每凭据 1 个 pending 槽位 | 保守防守；正常客户端升级后立即发首帧 |
-| `3` | 3 个并发 pending | 多标签页同时打开的场景 |
+| `96`（默认） | 每凭据 96 个 pending 槽位 | 支持共享 token 下多设备同时启动，同时保留有限防守 |
+| `16` | 16 个并发 pending | 小团队或低并发场景 |
 | `-1` | 不限 | 关闭 pending 保护；风险：恶意客户端可升级大量连接但不发首帧 |
 
 **示例**：
 
 ```yaml
 responses_ws:
-  pending_per_credential: 1
+  pending_per_credential: 96
 ```
 
 **对系统的影响**：
-- 正常客户端：Upgrade 后毫秒级发送首帧 → pending 瞬间释放，1 个槽位足够。
+- 正常客户端：Upgrade 后通常很快发送首帧，pending 会在首帧校验和 active lease 建立后释放。
 - `-1`：无防守，配合 `connect_per_credential_per_minute` 高频攻击时，数千空连接占用文件描述符和内存。
 
 ---
@@ -153,15 +153,15 @@ responses_ws:
 
 | 值 | 行为 | 影响 |
 |----|------|------|
-| `8`（默认） | 单凭据最多 8 条 | 覆盖多标签页 + 高频交互 |
-| `16` | 16 条 | 大型团队共享同一凭据 |
+| `128`（默认） | 单凭据最多 128 条 | 覆盖 10 人每人 6 设备，并为重连和多窗口预留余量 |
+| `32` | 32 条 | 小团队共享同一凭据 |
 | `-1` | 不限 | 不限制；风险：单凭据可耗尽全局连接 |
 
 **示例**：
 
 ```yaml
 responses_ws:
-  active_per_credential: 8
+  active_per_credential: 128
 ```
 
 **对系统的影响**：
@@ -281,15 +281,15 @@ responses_ws:
 
 | 值 | 行为 | 影响 |
 |----|------|------|
-| `5000`（默认） | 5 秒 | 覆盖正常网络延迟 |
-| `10000` | 10 秒 | 慢速客户端、移动网络 |
+| `30000`（默认） | 30 秒 | 覆盖慢速客户端、移动网络和首帧准备较慢的场景 |
+| `10000` | 10 秒 | 更快回收异常连接 |
 | `2000` | 2 秒 | 快速回收悬挂连接 |
 
 **示例**：
 
 ```yaml
 responses_ws:
-  first_frame_timeout_ms: 5000
+  first_frame_timeout_ms: 30000
 ```
 
 **对系统的影响**：
