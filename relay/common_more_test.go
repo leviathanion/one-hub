@@ -346,6 +346,56 @@ func TestRelayCommonStreamingAndRetryHelpers(t *testing.T) {
 	}
 }
 
+func TestProcessProviderPayloadAPIErrorBestEffortControlPlane(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	originalLogger := logger.Logger
+	logger.Logger = zap.NewNop()
+	t.Cleanup(func() {
+		logger.Logger = originalLogger
+	})
+
+	originalProcess := processChannelRelayErrorFunc
+	errCh := make(chan *types.OpenAIErrorWithStatusCode, 1)
+	processChannelRelayErrorFunc = func(_ context.Context, channelID int, channelName string, apiErr *types.OpenAIErrorWithStatusCode, channelType int) {
+		if channelID != 77 || channelName != "provider-control" || channelType != config.ChannelTypeOpenAI {
+			t.Errorf("unexpected channel context id=%d name=%q type=%d", channelID, channelName, channelType)
+		}
+		errCh <- apiErr
+	}
+	t.Cleanup(func() {
+		processChannelRelayErrorFunc = originalProcess
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/realtime?model=gpt-5", nil)
+	ctx.Set("original_model", "gpt-5")
+	ctx.Set("channel_type", config.ChannelTypeOpenAI)
+	ctx.Set("channel_id", 77)
+
+	channel := &model.Channel{Id: 77, Name: "provider-control", Type: config.ChannelTypeOpenAI}
+	processProviderPayloadAPIError(ctx, channel, []byte(`{`), "test_malformed")
+	processProviderPayloadAPIError(ctx, channel, []byte(`{"type":"response.output_text.delta","status_code":503,"message":"metadata"}`), "test_non_error")
+	processProviderPayloadAPIError(ctx, nil, []byte(`{"type":"error","error":{"type":"usage_limit_reached","message":"usage limit reached"}}`), "test_no_channel")
+
+	select {
+	case apiErr := <-errCh:
+		t.Fatalf("expected malformed, non-error, and nil-channel payloads not to reach channel relay handling, got %#v", apiErr)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	processProviderPayloadAPIError(ctx, channel, []byte(`{"type":"error","error":{"type":"usage_limit_reached","message":"usage limit reached"}}`), "test_provider_error")
+	select {
+	case apiErr := <-errCh:
+		if apiErr == nil || apiErr.StatusCode != http.StatusTooManyRequests || apiErr.Type != "usage_limit_reached" {
+			t.Fatalf("expected parsed usage-limit provider error, got %#v", apiErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for provider error control-plane handling")
+	}
+}
+
 func TestFetchChannelByModelWithSelectionFiltersCustomClaudeRelayChannels(t *testing.T) {
 	channelGroupSnapshot := snapshotChannelGroup()
 	t.Cleanup(func() {

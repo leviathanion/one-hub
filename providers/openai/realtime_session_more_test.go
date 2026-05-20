@@ -1112,8 +1112,8 @@ func TestOpenAIRealtimeSessionAdditionalHelperBranches(t *testing.T) {
 	if outbound, shouldClose := session.observeSupplierMessage(websocket.TextMessage, []byte(`{"type":"error","error":{"type":"invalid_request_error","code":"bad_request","message":"boom"}}`)); shouldClose || outbound.err != nil {
 		t.Fatalf("expected non-fatal compat mode upstream errors to pass through, outbound=%+v should_close=%v", outbound, shouldClose)
 	}
-	if outbound, shouldClose := session.observeSupplierMessage(websocket.TextMessage, []byte(`{"type":"error","error":{"type":"server_error","code":"session_expired","message":"boom"}}`)); !shouldClose || !errors.Is(outbound.err, runtimesession.ErrSessionClosed) {
-		t.Fatalf("expected fatal compat mode upstream errors to close the session, outbound=%+v should_close=%v", outbound, shouldClose)
+	if outbound, shouldClose := session.observeSupplierMessage(websocket.TextMessage, []byte(`{"type":"error","error":{"type":"server_error","code":"session_expired","message":"boom"}}`)); shouldClose || outbound.err != nil {
+		t.Fatalf("expected compat mode upstream errors to pass through without closing the session, outbound=%+v should_close=%v", outbound, shouldClose)
 	}
 
 	session.compatMode = false

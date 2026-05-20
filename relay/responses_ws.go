@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -669,6 +670,7 @@ func (b *ResponsesWSIOBridge) ArmProviderRecvPump(upstreamSessionGeneration stri
 				})
 			}
 			if err != nil {
+				deliveredPayload := len(payload) > 0
 				if len(payload) > 0 {
 					kind := ProviderDownstreamRecvError
 					if origin == runtimesession.RealtimePayloadOriginProvider {
@@ -687,15 +689,18 @@ func (b *ResponsesWSIOBridge) ArmProviderRecvPump(upstreamSessionGeneration stri
 				}
 				deliveredClientErrorPayload := false
 				if errorPayload := runtimesession.ClientPayloadFromError(err); len(errorPayload) > 0 {
-					deliveredClientErrorPayload = true
-					b.actor.PostReliable(ResponsesWSEventProxyLocalError{
-						UpstreamSessionGeneration: upstreamSessionGeneration,
-						ChannelID:                 selectedChannelID,
-						Payload:                   errorPayload,
-						Recoverable:               false,
-					})
+					deliveredClientErrorPayload = len(payload) > 0 && bytes.Equal(errorPayload, payload)
+					if !deliveredClientErrorPayload {
+						deliveredClientErrorPayload = true
+						b.actor.PostReliable(ResponsesWSEventProxyLocalError{
+							UpstreamSessionGeneration: upstreamSessionGeneration,
+							ChannelID:                 selectedChannelID,
+							Payload:                   errorPayload,
+							Recoverable:               false,
+						})
+					}
 				}
-				if !deliveredClientErrorPayload {
+				if !deliveredPayload && !deliveredClientErrorPayload {
 					b.actor.PostReliable(ResponsesWSEventTimeout{
 						Reason:                    "provider_closed",
 						UpstreamSessionGeneration: upstreamSessionGeneration,
@@ -1982,6 +1987,49 @@ func (a *ResponsesWSSessionActor) handleProviderDownstream(event ResponsesWSEven
 		a.close("client_write_failed")
 		return
 	}
+	a.processProviderPayloadAPIError(payload, event.ChannelID, "responses_ws_provider_frame")
+}
+
+func (a *ResponsesWSSessionActor) processProviderPayloadAPIError(payload []byte, channelID int, source string) {
+	if a == nil || len(payload) == 0 {
+		return
+	}
+	apiErr := runtimesession.ProviderAPIErrorFromPayload(payload)
+	if apiErr == nil {
+		return
+	}
+	channel := a.providerPayloadChannel(channelID)
+	processProviderAPIError(a.Context(), channel, apiErr, source)
+}
+
+func (a *ResponsesWSSessionActor) providerPayloadChannel(channelID int) *model.Channel {
+	if a == nil {
+		return nil
+	}
+	ctx := a.Context()
+	if ctx != nil {
+		if raw, ok := ctx.Get("responses_ws_selected_channel"); ok {
+			if channel, ok := raw.(*model.Channel); ok && channel != nil {
+				return channel
+			}
+		}
+		if raw, ok := ctx.Get("responses_ws_selected_channel_snapshot"); ok {
+			if snapshot, ok := raw.(*SelectedChannelSnapshot); ok && snapshot != nil && snapshot.Channel != nil {
+				return snapshot.Channel
+			}
+		}
+	}
+	if channelID <= 0 {
+		channelID = a.sessionChannelID
+	}
+	if channelID <= 0 {
+		return nil
+	}
+	channel, err := fetchChannelById(channelID)
+	if err != nil {
+		return nil
+	}
+	return channel
 }
 
 func (a *ResponsesWSSessionActor) handleMalformedProviderFrame(classified responsesws.ResponsesTerminalResult) {

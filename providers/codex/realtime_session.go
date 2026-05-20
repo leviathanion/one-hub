@@ -1379,7 +1379,7 @@ func (p *CodexProvider) startRealtimeWSReaderLocked(exec *runtimesession.Executi
 				if wasCurrent && wasInflight && currentAttachment != nil {
 					outbound := codexRealtimeOutbound{
 						messageType: websocket.TextMessage,
-						payload:     []byte(newCodexRealtimeProviderError("", "provider_connection_closed", codexRealtimeStaticErrorMessage("provider_connection_closed")).Error()),
+						payload:     codexRealtimeProviderErrorEventPayload("", "provider_connection_closed", codexRealtimeStaticErrorMessage("provider_connection_closed")),
 						origin:      runtimesession.RealtimePayloadOriginProxyLocal,
 					}
 					var closeErr *websocket.CloseError
@@ -1523,10 +1523,14 @@ func (p *CodexProvider) startRealtimeWSReaderLocked(exec *runtimesession.Executi
 
 			if handlerErr != nil {
 				if attachment != nil {
+					errorPayload := runtimesession.ClientPayloadFromError(handlerErr)
+					if len(errorPayload) == 0 {
+						errorPayload = []byte(handlerErr.Error())
+					}
 					_ = enqueueCodexOutbound(attachment, codexRealtimeOutbound{
 						messageType: websocket.TextMessage,
-						payload:     []byte(handlerErr.Error()),
-						origin:      runtimesession.RealtimePayloadOriginProvider,
+						payload:     errorPayload,
+						origin:      runtimesession.RealtimePayloadOriginProxyLocal,
 					})
 				}
 				return
@@ -1784,9 +1788,9 @@ func (p *CodexProvider) pumpRealtimeHTTPBridge(exec *runtimesession.ExecutionSes
 
 			if err != nil && ownsBridge && attachment != nil {
 				logCodexRealtimeInternalError("codex realtime bridge stream failed: " + err.Error())
-				payload := []byte(newCodexRealtimeProviderError("", "bridge_stream_failed", codexRealtimeStaticErrorMessage("bridge_stream_failed")).Error())
+				payload := codexRealtimeProviderErrorEventPayload("", "bridge_stream_failed", codexRealtimeStaticErrorMessage("bridge_stream_failed"))
 				if shouldReportTruncatedBridge {
-					payload = []byte(newCodexRealtimeProviderError("", "bridge_stream_failed", "provider bridge stream closed before a terminal response event").Error())
+					payload = codexRealtimeProviderErrorEventPayload("", "bridge_stream_failed", "provider bridge stream closed before a terminal response event")
 				}
 				if !errors.Is(err, io.EOF) || shouldReportTruncatedBridge {
 					_ = enqueueCodexOutbound(attachment, codexRealtimeOutbound{
@@ -2459,6 +2463,10 @@ func newCodexRealtimeClientError(eventID, code, message string) error {
 
 func newCodexRealtimeProviderError(eventID, code, message string) error {
 	return types.NewErrorEvent(eventID, "provider_error", code, message)
+}
+
+func codexRealtimeProviderErrorEventPayload(eventID, code, message string) []byte {
+	return []byte(types.NewErrorEvent(eventID, "provider_error", code, message).Error())
 }
 
 func codexRealtimeClientPayloadErrorFromObserver(eventID string, err error) error {

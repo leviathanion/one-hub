@@ -575,9 +575,10 @@ func (s *openAIRealtimeSession) readLoop() {
 			logOpenAIRealtimeInternalError(fmt.Sprintf("openai realtime read loop panic session=%s provider=%s: %v", s.sessionID, s.model, recovered))
 			logOpenAIRealtimeInternalError(fmt.Sprintf("stacktrace from panic: %s", string(debug.Stack())))
 			providerErr := types.NewErrorEvent("", "provider_error", "provider_panic", "upstream realtime reader failed")
+			payload := []byte(providerErr.Error())
 			s.enqueueOutbound(openAIRealtimeOutbound{
 				messageType: websocket.TextMessage,
-				payload:     []byte(providerErr.Error()),
+				payload:     payload,
 				origin:      runtimesession.RealtimePayloadOriginProxyLocal,
 				err:         runtimesession.ErrSessionClosed,
 			})
@@ -601,9 +602,10 @@ func (s *openAIRealtimeSession) readLoop() {
 			}
 			logOpenAIRealtimeInternalError("openai realtime websocket read failed: " + err.Error())
 			providerErr := types.NewErrorEvent("", "provider_error", "provider_connection_closed", "upstream websocket connection closed")
+			payload := []byte(providerErr.Error())
 			s.enqueueOutbound(openAIRealtimeOutbound{
 				messageType: websocket.TextMessage,
-				payload:     []byte(providerErr.Error()),
+				payload:     payload,
 				origin:      runtimesession.RealtimePayloadOriginProxyLocal,
 				err:         runtimesession.ErrSessionClosed,
 			})
@@ -708,9 +710,10 @@ func (s *openAIRealtimeSession) handleActiveTurnReadTimeout(seq int64, generatio
 		return
 	}
 	providerErr := types.NewErrorEvent("", "provider_error", "provider_read_timeout", "upstream realtime turn timed out")
+	payload := []byte(providerErr.Error())
 	s.enqueueOutbound(openAIRealtimeOutbound{
 		messageType: websocket.TextMessage,
-		payload:     []byte(providerErr.Error()),
+		payload:     payload,
 		origin:      runtimesession.RealtimePayloadOriginProxyLocal,
 		err:         runtimesession.ErrSessionClosed,
 	})
@@ -743,10 +746,6 @@ func (s *openAIRealtimeSession) observeSupplierMessage(messageType int, payload 
 		return outbound, false
 	}
 	eventType := strings.TrimSpace(event.Type)
-	if s.compatMode && event.IsError() && openAIRealtimeFatalErrorEvent(&event) {
-		outbound.err = runtimesession.ErrSessionClosed
-		return outbound, true
-	}
 	if s.responsesWS && eventType == types.EventTypeSessionCreated {
 		return openAIRealtimeOutbound{}, false
 	}
@@ -855,30 +854,6 @@ func openAIRealtimeObserverErrorMessage(code string) string {
 		return "realtime model price is invalid"
 	default:
 		return "realtime quota check failed"
-	}
-}
-
-func openAIRealtimeFatalErrorEvent(event *types.Event) bool {
-	if event == nil || !event.IsError() {
-		return false
-	}
-	switch openAIRealtimeEventErrorCode(event) {
-	case "session_expired", "rate_limit_exceeded", "server_error", "internal_error":
-		return true
-	default:
-		return false
-	}
-}
-
-func openAIRealtimeEventErrorCode(event *types.Event) string {
-	if event == nil || event.ErrorDetail == nil {
-		return ""
-	}
-	switch code := event.ErrorDetail.Code.(type) {
-	case string:
-		return strings.TrimSpace(code)
-	default:
-		return ""
 	}
 }
 

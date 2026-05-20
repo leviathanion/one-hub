@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -107,7 +108,12 @@ func logCodexRealtimeWSDialFailure(err error) {
 	if err == nil {
 		return
 	}
-	logger.LogError(context.Background(), codexRealtimeWSDialFailureLogMessage(err))
+	message := codexRealtimeWSDialFailureLogMessage(err)
+	if logger.Logger != nil {
+		logger.LogError(context.Background(), message)
+		return
+	}
+	log.Printf("%s", message)
 }
 
 func codexRealtimeWSDialFailureLogMessage(err error) string {
@@ -325,7 +331,7 @@ func (p *CodexProvider) handleRealtimeSupplierMessage(messageType int, message [
 	if event.Type == "error" {
 		detail := codexRealtimeProviderErrorDetailFromPayload(&event, message)
 		logger.SysError(codexRealtimeProviderErrorLogMessage(detail, message))
-		return false, nil, nil, types.NewErrorEvent("", detail.Type, detail.Code, detail.Message)
+		return true, nil, nil, nil
 	}
 
 	if accumulator != nil {
@@ -349,18 +355,20 @@ type codexRealtimeProviderErrorDetail struct {
 }
 
 type codexRealtimeProviderErrorPayload struct {
-	Status   int                             `json:"status,omitempty"`
-	Code     *string                         `json:"code,omitempty"`
-	Message  *string                         `json:"message,omitempty"`
-	Param    any                             `json:"param,omitempty"`
-	Error    *types.OpenAIError              `json:"error,omitempty"`
-	Response *types.OpenAIResponsesResponses `json:"response,omitempty"`
+	Type       *string                         `json:"type,omitempty"`
+	Status     int                             `json:"status,omitempty"`
+	StatusCode int                             `json:"status_code,omitempty"`
+	Code       *string                         `json:"code,omitempty"`
+	Message    *string                         `json:"message,omitempty"`
+	Param      any                             `json:"param,omitempty"`
+	Error      *types.OpenAIError              `json:"error,omitempty"`
+	Response   *types.OpenAIResponsesResponses `json:"response,omitempty"`
 }
 
 func codexRealtimeProviderErrorDetailFromPayload(event *types.OpenAIResponsesStreamResponses, payload []byte) codexRealtimeProviderErrorDetail {
 	detail := codexRealtimeProviderErrorDetail{
 		Type:    "provider_error",
-		Code:    "provider_error",
+		Code:    "",
 		Message: "provider websocket error",
 	}
 	if event != nil {
@@ -389,6 +397,13 @@ func codexRealtimeProviderErrorDetailFromPayload(event *types.OpenAIResponsesStr
 	if len(payload) > 0 && json.Unmarshal(payload, &wire) == nil {
 		if wire.Status > 0 {
 			detail.Status = wire.Status
+		} else if wire.StatusCode > 0 {
+			detail.Status = wire.StatusCode
+		}
+		if wire.Type != nil {
+			if errType := strings.TrimSpace(*wire.Type); errType != "" && errType != "error" {
+				detail.Type = errType
+			}
 		}
 		applyCodexRealtimeOpenAIErrorDetail(&detail, wire.Error)
 		if wire.Response != nil {
@@ -414,6 +429,9 @@ func codexRealtimeProviderErrorDetailFromPayload(event *types.OpenAIResponsesStr
 
 	if strings.TrimSpace(detail.Type) == "" {
 		detail.Type = "provider_error"
+	}
+	if strings.TrimSpace(detail.Code) == "" || (detail.Code == "provider_error" && detail.Type != "provider_error") {
+		detail.Code = detail.Type
 	}
 	if strings.TrimSpace(detail.Code) == "" {
 		detail.Code = "provider_error"

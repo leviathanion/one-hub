@@ -2,6 +2,7 @@ package session
 
 import (
 	stderrors "errors"
+	"net/http"
 	"testing"
 	"time"
 
@@ -43,6 +44,124 @@ func TestClientPayloadErrorHelpersWithCauseAndNilReceiver(t *testing.T) {
 	}
 	if payload := ClientPayloadFromError(baseErr); payload != nil {
 		t.Fatalf("expected non-payload errors to return nil payload, got %q", string(payload))
+	}
+}
+
+func TestProviderAPIErrorFromPayloadParsesNestedProviderPayload(t *testing.T) {
+	payload := []byte(`{"type":"error","status_code":429,"error":{"type":"usage_limit_reached","message":"monthly usage limit reached","param":"account"},"headers":{"x-ratelimit-reset":"60"}}`)
+	apiErr := ProviderAPIErrorFromPayload(payload)
+	if apiErr == nil {
+		t.Fatal("expected provider api error")
+	}
+	if apiErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected status 429, got %d", apiErr.StatusCode)
+	}
+	if apiErr.Code != "usage_limit_reached" || apiErr.Type != "usage_limit_reached" {
+		t.Fatalf("expected usage_limit_reached code/type, got code=%v type=%q", apiErr.Code, apiErr.Type)
+	}
+	if apiErr.LocalError {
+		t.Fatal("expected provider api errors to stay non-local")
+	}
+}
+
+func TestProviderAPIErrorFromPayloadParsesTopLevelProviderPayload(t *testing.T) {
+	apiErr := ProviderAPIErrorFromPayload([]byte(`{"code":"invalid_api_key","message":"bad key"}`))
+	if apiErr == nil {
+		t.Fatal("expected top-level provider api error")
+	}
+	if apiErr.StatusCode != http.StatusUnauthorized || apiErr.Type != "authentication_error" || apiErr.Code != "invalid_api_key" {
+		t.Fatalf("expected top-level invalid_api_key to normalize to auth/401, got %#v", apiErr)
+	}
+
+	statusOnly := ProviderAPIErrorFromPayload([]byte(`{"status_code":"503","message":"provider unavailable"}`))
+	if statusOnly == nil {
+		t.Fatal("expected top-level status/message provider api error")
+	}
+	if statusOnly.StatusCode != http.StatusServiceUnavailable || statusOnly.Code != "upstream_error" {
+		t.Fatalf("expected top-level status/message to preserve status and use upstream code, got %#v", statusOnly)
+	}
+
+	statusWithoutMessage := ProviderAPIErrorFromPayload([]byte(`{"status_code":503}`))
+	if statusWithoutMessage == nil {
+		t.Fatal("expected top-level status-only provider api error")
+	}
+	if statusWithoutMessage.StatusCode != http.StatusServiceUnavailable || statusWithoutMessage.Message == "" {
+		t.Fatalf("expected top-level status-only error to preserve status and default message, got %#v", statusWithoutMessage)
+	}
+}
+
+func TestProviderAPIErrorFromPayloadDefaultsUnknownAndRateLimitStatuses(t *testing.T) {
+	unknown := ProviderAPIErrorFromPayload([]byte(`{"type":"error","message":"provider failed"}`))
+	if unknown == nil {
+		t.Fatal("expected unknown provider payload to parse")
+	}
+	if unknown.StatusCode != http.StatusBadGateway || unknown.Code != "upstream_error" {
+		t.Fatalf("expected unknown provider error to default to 502/upstream_error, got status=%d code=%v", unknown.StatusCode, unknown.Code)
+	}
+
+	rateLimited := ProviderAPIErrorFromPayload([]byte(`{"type":"error","error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"slow down"}}`))
+	if rateLimited == nil {
+		t.Fatal("expected rate limit provider payload to parse")
+	}
+	if rateLimited.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected rate limit payload to default to 429, got %d", rateLimited.StatusCode)
+	}
+
+	typedRateLimit := ProviderAPIErrorFromPayload([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`))
+	if typedRateLimit == nil || typedRateLimit.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected rate_limit_error type to default to 429, got %#v", typedRateLimit)
+	}
+
+	invalidRequest := ProviderAPIErrorFromPayload([]byte(`{"type":"error","error":{"type":"invalid_request_error","code":"bad_input","message":"bad input"}}`))
+	if invalidRequest == nil || invalidRequest.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected invalid_request_error type with provider-specific code to default to 400, got %#v", invalidRequest)
+	}
+}
+
+func TestProviderAPIErrorFromPayloadIgnoresNonErrorProviderFrames(t *testing.T) {
+	payloads := [][]byte{
+		[]byte(`{"type":"response.output_text.delta","delta":"hello"}`),
+		[]byte(`{"type":"response.output_text.done","message":"done"}`),
+		[]byte(`{"type":"response.completed","response":{"id":"resp_1","status":"completed"}}`),
+		[]byte(`{"type":"session.created","session":{"id":"sess_1"}}`),
+		[]byte(`{"type":"response.output_text.delta","status_code":503,"message":"transient provider metadata"}`),
+		[]byte(`{"type":"session.created","error":{"message":"nested non-error metadata"}}`),
+	}
+	for _, payload := range payloads {
+		if apiErr := ProviderAPIErrorFromPayload(payload); apiErr != nil {
+			t.Fatalf("expected non-error provider frame to be ignored, got %#v for payload %s", apiErr, payload)
+		}
+	}
+}
+
+func TestProviderAPIErrorFromPayloadIgnoresFailedTerminalWithoutErrorObject(t *testing.T) {
+	payloads := [][]byte{
+		[]byte(`{"type":"response.failed","response":{"id":"resp_1","status":"failed"}}`),
+		[]byte(`{"type":"response.completed","response":{"id":"resp_2","status":"incomplete"}}`),
+	}
+	for _, payload := range payloads {
+		if apiErr := ProviderAPIErrorFromPayload(payload); apiErr != nil {
+			t.Fatalf("expected failed terminal without explicit error detail to be ignored, got %#v for %s", apiErr, payload)
+		}
+	}
+}
+
+func TestProviderAPIErrorFromPayloadParsesFailedTerminalWithResponseError(t *testing.T) {
+	payload := []byte(`{"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"type":"invalid_request_error","code":"bad_input","message":"bad input"}}}`)
+	apiErr := ProviderAPIErrorFromPayload(payload)
+	if apiErr == nil {
+		t.Fatalf("expected failed terminal with response error to parse, got nil")
+	}
+	if apiErr.StatusCode != http.StatusBadRequest || apiErr.Code != "bad_input" {
+		t.Fatalf("expected failed terminal response error to normalize, got status=%d code=%v", apiErr.StatusCode, apiErr.Code)
+	}
+
+	incomplete := ProviderAPIErrorFromPayload([]byte(`{"type":"response.incomplete","response":{"id":"resp_2","status":"incomplete","error":{"code":"rate_limit_exceeded","message":"slow down"}}}`))
+	if incomplete == nil {
+		t.Fatal("expected incomplete terminal response error to parse")
+	}
+	if incomplete.StatusCode != http.StatusTooManyRequests || incomplete.Type != "rate_limit_error" {
+		t.Fatalf("expected incomplete rate limit response error to normalize to 429/rate_limit_error, got %#v", incomplete)
 	}
 }
 

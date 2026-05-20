@@ -229,8 +229,12 @@ func ChatRealtime(c *gin.Context) {
 		SupplierClosed() <-chan struct{}
 	}
 
-	var proxy realtimeProxy
-	proxy = requester.NewRealtimeSessionProxy(relay.userConn, relay.session, time.Minute*2)
+	proxyImpl := requester.NewRealtimeSessionProxy(relay.userConn, relay.session, time.Minute*2)
+	proxyImpl.SetProviderPayloadObserver(func(messageType int, payload []byte) {
+		_ = messageType
+		processProviderPayloadAPIError(relay.c, relay.provider.GetChannel(), payload, "chat_realtime_provider_frame")
+	})
+	var proxy realtimeProxy = proxyImpl
 
 	proxy.Start()
 	go func() {

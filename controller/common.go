@@ -8,6 +8,7 @@ import (
 	"one-api/common/notify"
 	"one-api/model"
 	"one-api/types"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -38,15 +39,18 @@ func ShouldDisableChannel(channelType int, err *types.OpenAIErrorWithStatusCode)
 		return true
 	}
 
+	code := openAIErrorCodeString(err.OpenAIError.Code)
+	errType := strings.TrimSpace(err.OpenAIError.Type)
+
 	// 错误代码检查
-	switch err.OpenAIError.Code {
-	case "invalid_api_key", "account_deactivated", "billing_not_active":
+	switch code {
+	case "usage_limit_reached", "insufficient_quota", "invalid_api_key", "account_deactivated", "billing_not_active", "provider_authentication_failed":
 		return true
 	}
 
 	// 错误类型检查
-	switch err.OpenAIError.Type {
-	case "insufficient_quota", "authentication_error", "permission_error", "forbidden":
+	switch errType {
+	case "usage_limit_reached", "insufficient_quota", "authentication_error", "permission_error", "forbidden":
 		return true
 	}
 
@@ -55,7 +59,22 @@ func ShouldDisableChannel(channelType int, err *types.OpenAIErrorWithStatusCode)
 		return true
 	}
 
+	if code == "rate_limit_exceeded" || errType == "rate_limit_error" || code == "invalid_request_error" || errType == "invalid_request_error" {
+		return false
+	}
+
 	return common.DisableChannelKeywordsInstance.IsContains(err.OpenAIError.Message)
+}
+
+func openAIErrorCodeString(code any) string {
+	switch typed := code.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case nil:
+		return ""
+	default:
+		return strings.TrimSpace(fmt.Sprint(typed))
+	}
 }
 
 // disable & notify

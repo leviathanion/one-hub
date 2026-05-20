@@ -2045,9 +2045,9 @@ func TestCodexManagedRealtimeBridgeCancelEnqueuesCancelledEvent(t *testing.T) {
 	}
 }
 
-func TestCodexManagedRealtimeClosesWebsocketAfterProviderErrorFrame(t *testing.T) {
+func TestCodexManagedRealtimeKeepsWebsocketAfterProviderErrorFrame(t *testing.T) {
 	var connections atomic.Int32
-	firstClosed := make(chan struct{}, 1)
+	secondRequestOnFirstConn := make(chan struct{}, 1)
 	upgrader := websocket.Upgrader{}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2067,23 +2067,23 @@ func TestCodexManagedRealtimeClosesWebsocketAfterProviderErrorFrame(t *testing.T
 			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","code":"upstream_failed","message":"upstream failed"}`)); err != nil {
 				return
 			}
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+			select {
+			case secondRequestOnFirstConn <- struct{}{}:
+			default:
+			}
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_recovered","status":"completed"}}`)); err != nil {
+				return
+			}
 		} else {
 			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_recovered","status":"completed"}}`)); err != nil {
 				return
 			}
 		}
 
-		for {
-			if _, _, err := conn.ReadMessage(); err != nil {
-				if connectionID == 1 {
-					select {
-					case firstClosed <- struct{}{}:
-					default:
-					}
-				}
-				return
-			}
-		}
+		_, _, _ = conn.ReadMessage()
 	}))
 	defer server.Close()
 
@@ -2113,26 +2113,25 @@ func TestCodexManagedRealtimeClosesWebsocketAfterProviderErrorFrame(t *testing.T
 		t.Fatalf("expected provider error event payload, got %q", got)
 	}
 
-	select {
-	case <-firstClosed:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("expected provider error frame to close the abandoned upstream websocket")
+	if err := session.SendClient(context.Background(), websocket.TextMessage, createEvent); err != nil {
+		t.Fatalf("expected second websocket dispatch to reuse the open provider websocket, got %v", err)
 	}
 
-	if err := session.SendClient(context.Background(), websocket.TextMessage, createEvent); err != nil {
-		t.Fatalf("expected second websocket dispatch to redial cleanly, got %v", err)
+	select {
+	case <-secondRequestOnFirstConn:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("expected provider error frame not to close the upstream websocket")
 	}
 
 	_, payload, _, _, err = session.Recv(context.Background())
 	if err != nil {
-		t.Fatalf("expected response from redialed websocket, got %v", err)
+		t.Fatalf("expected response from reused websocket, got %v", err)
 	}
 	if got := string(payload); !containsAll(got, "response.completed", "resp_recovered") {
-		t.Fatalf("expected completed event from replacement websocket, got %q", got)
+		t.Fatalf("expected completed event from reused websocket, got %q", got)
 	}
-	waitForAtomicCount(t, &connections, 2, 2*time.Second, "expected replacement websocket dial after provider error")
-	if got := connections.Load(); got != 2 {
-		t.Fatalf("expected replacement websocket dial after provider error, got %d connections", got)
+	if got := connections.Load(); got != 1 {
+		t.Fatalf("expected no replacement websocket dial after provider error, got %d connections", got)
 	}
 }
 

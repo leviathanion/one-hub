@@ -2028,6 +2028,132 @@ func TestResponsesWSTerminalSideEffectsSurviveClientWriteFailure(t *testing.T) {
 	}
 }
 
+func TestResponsesWSFailedTerminalDoesNotCloseSessionForTurnScopedError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	ctx.Set("responses_ws_selected_channel", &model.Channel{Id: 17, Type: config.ChannelTypeOpenAI})
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := &ResponsesWSTurnAttempt{AttemptID: "attempt-failed", SelectedChannelID: 17, Usage: &types.Usage{}}
+	actor.activeAttempt = attempt
+	actor.activeTurn = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
+	actor.activeChannelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		MessageType:               websocket.TextMessage,
+		Payload:                   []byte(`{"type":"response.failed","response":{"id":"resp_failed","status":"failed","error":{"type":"invalid_request_error","code":"bad_input","message":"bad input"}}}`),
+		Origin:                    runtimesession.RealtimePayloadOriginProvider,
+	})
+
+	if actor.closed.Load() {
+		t.Fatal("expected turn-scoped provider failed terminal to keep websocket session open")
+	}
+	if actor.activeAttempt != nil || actor.state != responsesWSStateIdle {
+		t.Fatalf("expected failed terminal to clear only the active turn, state=%v active=%+v", actor.state, actor.activeAttempt)
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "response.failed") || !strings.Contains(got, "bad_input") {
+		t.Fatalf("expected failed terminal payload to be forwarded, got %q", got)
+	}
+}
+
+func TestResponsesWSIncompleteTerminalWithoutErrorDoesNotCloseSession(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	ctx.Set("responses_ws_selected_channel", &model.Channel{Id: 17, Type: config.ChannelTypeOpenAI})
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	actor.activeAttempt = &ResponsesWSTurnAttempt{AttemptID: "attempt-incomplete", SelectedChannelID: 17, Usage: &types.Usage{}}
+	actor.activeTurn = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
+	actor.activeChannelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		MessageType:               websocket.TextMessage,
+		Payload:                   []byte(`{"type":"response.completed","response":{"id":"resp_incomplete","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}`),
+		Origin:                    runtimesession.RealtimePayloadOriginProvider,
+	})
+
+	if actor.closed.Load() {
+		t.Fatal("expected incomplete terminal without explicit error detail to keep websocket session open")
+	}
+	if actor.activeAttempt != nil || actor.state != responsesWSStateIdle {
+		t.Fatalf("expected incomplete terminal to clear only the active turn, state=%v active=%+v", actor.state, actor.activeAttempt)
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "response.failed") || !strings.Contains(got, "max_output_tokens") {
+		t.Fatalf("expected incomplete terminal payload to be forwarded, got %q", got)
+	}
+}
+
+func TestResponsesWSFailedTerminalProcessesProviderErrorWithoutClosingSession(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	originalProcess := processChannelRelayErrorFunc
+	errCh := make(chan *types.OpenAIErrorWithStatusCode, 1)
+	processChannelRelayErrorFunc = func(_ context.Context, _ int, _ string, apiErr *types.OpenAIErrorWithStatusCode, _ int) {
+		errCh <- apiErr
+	}
+	defer func() {
+		processChannelRelayErrorFunc = originalProcess
+	}()
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	ctx.Set("original_model", "gpt-test")
+	ctx.Set("channel_type", config.ChannelTypeOpenAI)
+	ctx.Set("channel_id", 17)
+	ctx.Set("responses_ws_selected_channel", &model.Channel{Id: 17, Name: "provider-error", Type: config.ChannelTypeOpenAI})
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	actor.activeAttempt = &ResponsesWSTurnAttempt{AttemptID: "attempt-limit", SelectedChannelID: 17, Usage: &types.Usage{}}
+	actor.activeTurn = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
+	actor.activeChannelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		MessageType:               websocket.TextMessage,
+		Payload:                   []byte(`{"type":"response.failed","response":{"id":"resp_limit","status":"failed","error":{"type":"usage_limit_reached","message":"monthly usage limit reached"}}}`),
+		Origin:                    runtimesession.RealtimePayloadOriginProvider,
+	})
+
+	if actor.closed.Load() {
+		t.Fatal("expected provider api error not to close websocket session")
+	}
+	select {
+	case apiErr := <-errCh:
+		if apiErr == nil || apiErr.StatusCode != http.StatusTooManyRequests || apiErr.Type != "usage_limit_reached" {
+			t.Fatalf("expected parsed usage limit provider error, got %#v", apiErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for provider error control-plane handling")
+	}
+}
+
 func TestResponsesWSCloseReplaysBufferedTerminalForUsage(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -2105,6 +2231,43 @@ func TestResponsesWSProviderRecvPumpEmitsClientPayloadErrorAfterProviderPayload(
 	}
 	if localErr.Recoverable {
 		t.Fatalf("expected provider recv client payload error to be non-recoverable")
+	}
+}
+
+func TestResponsesWSProviderRecvPumpDoesNotEmitTimeoutAfterProviderErrorPayload(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	bridge := NewResponsesWSIOBridge(nil, actor)
+	defer bridge.Close()
+
+	session := &responsesWSRecvSequenceSession{responses: make(chan responsesWSRecvResult, 1)}
+	payload := []byte(`{"type":"error","error":{"type":"usage_limit_reached","message":"usage limit reached"}}`)
+	bridge.ArmProviderRecvPump("session-provider-error-payload", 17, session)
+	session.responses <- responsesWSRecvResult{
+		messageType: websocket.TextMessage,
+		payload:     payload,
+		origin:      runtimesession.RealtimePayloadOriginProvider,
+		err:         errors.New("provider closed after error payload"),
+	}
+
+	first := readResponsesWSEvent(t, actor)
+	downstream, ok := first.(ResponsesWSEventProviderDownstream)
+	if !ok || downstream.Kind != ProviderDownstreamFrame || downstream.Origin != runtimesession.RealtimePayloadOriginProvider {
+		t.Fatalf("expected provider payload event, got %#v", first)
+	}
+	if got := string(downstream.Payload); got != string(payload) {
+		t.Fatalf("expected provider payload to be preserved, got %q", got)
+	}
+
+	select {
+	case event := <-actor.events:
+		t.Fatalf("expected no duplicate proxy-local timeout/error event, got %#v", event)
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 

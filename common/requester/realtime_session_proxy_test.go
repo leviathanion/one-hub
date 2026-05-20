@@ -36,6 +36,7 @@ type fakeRealtimeRecvResult struct {
 	messageType int
 	payload     []byte
 	usage       *types.UsageEvent
+	origin      runtimesession.RealtimePayloadOrigin
 	err         error
 }
 
@@ -66,7 +67,7 @@ func (s *fakeRealtimeSession) SendClient(ctx context.Context, mt int, payload []
 func (s *fakeRealtimeSession) Recv(ctx context.Context) (int, []byte, *types.UsageEvent, runtimesession.RealtimePayloadOrigin, error) {
 	select {
 	case result := <-s.recvResults:
-		return result.messageType, result.payload, result.usage, runtimesession.RealtimePayloadOriginProvider, result.err
+		return result.messageType, result.payload, result.usage, fakeRealtimeRecvOrigin(result), result.err
 	default:
 	}
 
@@ -82,10 +83,17 @@ func (s *fakeRealtimeSession) Recv(ctx context.Context) (int, []byte, *types.Usa
 		}
 		return 0, nil, nil, runtimesession.RealtimePayloadOriginProxyLocal, ctx.Err()
 	case result := <-s.recvResults:
-		return result.messageType, result.payload, result.usage, runtimesession.RealtimePayloadOriginProvider, result.err
+		return result.messageType, result.payload, result.usage, fakeRealtimeRecvOrigin(result), result.err
 	case <-s.closed:
 		return 0, nil, nil, runtimesession.RealtimePayloadOriginProxyLocal, runtimesession.ErrSessionClosed
 	}
+}
+
+func fakeRealtimeRecvOrigin(result fakeRealtimeRecvResult) runtimesession.RealtimePayloadOrigin {
+	if result.origin == runtimesession.RealtimePayloadOriginProxyLocal {
+		return runtimesession.RealtimePayloadOriginProxyLocal
+	}
+	return runtimesession.RealtimePayloadOriginProvider
 }
 
 func (s *fakeRealtimeSession) Detach(reason string) {
@@ -147,6 +155,11 @@ func (s *fakeRealtimeSession) enqueueRecv(messageType int, payload []byte, usage
 		usage:       usage,
 		err:         err,
 	}
+}
+
+func (s *fakeRealtimeSession) enqueueRecvResult(result fakeRealtimeRecvResult) {
+	result.payload = append([]byte(nil), result.payload...)
+	s.recvResults <- result
 }
 
 func (s *panicRealtimeSession) SendClient(ctx context.Context, mt int, payload []byte) error {
@@ -361,6 +374,76 @@ func TestRealtimeSessionProxyDoesNotDuplicateTerminalErrorPayload(t *testing.T) 
 	case <-serverDone:
 	case <-time.After(2 * time.Second):
 		t.Fatalf("timed out waiting for proxy shutdown after terminal error payload")
+	}
+}
+
+func TestRealtimeSessionProxyDoesNotCloseOnTurnScopedFailedProviderFrame(t *testing.T) {
+	session := newFakeRealtimeSession()
+	failedPayload := []byte(`{"type":"response.failed","response":{"id":"resp_failed","status":"failed","error":{"type":"invalid_request_error","code":"bad_input","message":"bad input"}}}`)
+	successPayload := []byte(`{"type":"response.completed","response":{"id":"resp_ok","status":"completed"}}`)
+	session.enqueueRecvResult(fakeRealtimeRecvResult{
+		messageType: websocket.TextMessage,
+		payload:     failedPayload,
+		origin:      runtimesession.RealtimePayloadOriginProvider,
+	})
+	session.enqueueRecvResult(fakeRealtimeRecvResult{
+		messageType: websocket.TextMessage,
+		payload:     successPayload,
+		origin:      runtimesession.RealtimePayloadOriginProvider,
+	})
+
+	upgrader := websocket.Upgrader{}
+	serverDone := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade failed: %v", err)
+			close(serverDone)
+			return
+		}
+		defer conn.Close()
+
+		proxy := NewRealtimeSessionProxy(conn, session, time.Second)
+		proxy.Start()
+		proxy.Wait()
+		close(serverDone)
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	clientConn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer clientConn.Close()
+
+	_, payload, err := clientConn.ReadMessage()
+	if err != nil {
+		t.Fatalf("failed to read failed turn payload: %v", err)
+	}
+	if got := string(payload); got != string(failedPayload) {
+		t.Fatalf("expected failed turn payload, got %q", got)
+	}
+
+	_, payload, err = clientConn.ReadMessage()
+	if err != nil {
+		t.Fatalf("expected session to stay open for next provider frame, got %v", err)
+	}
+	if got := string(payload); got != string(successPayload) {
+		t.Fatalf("expected follow-up provider payload after failed turn, got %q", got)
+	}
+
+	if got := session.closeReasonCount(); got != 0 {
+		t.Fatalf("expected turn-scoped provider failure not to detach session, got %d close calls", got)
+	}
+
+	if err := clientConn.Close(); err != nil {
+		t.Fatalf("failed to close client websocket: %v", err)
+	}
+	select {
+	case <-serverDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for proxy shutdown")
 	}
 }
 

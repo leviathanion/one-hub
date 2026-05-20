@@ -145,21 +145,18 @@ func TestCodexRealtimeHelperFunctionsAndCompatibilityHeaders(t *testing.T) {
 	if shouldContinue, usage, rewritten, err := provider.handleRealtimeSupplierMessage(websocket.TextMessage, []byte("bad-json"), nil, "gpt-5"); !shouldContinue || usage != nil || rewritten != nil || err != nil {
 		t.Fatalf("expected invalid realtime supplier json to be ignored, continue=%v usage=%+v rewritten=%v err=%v", shouldContinue, usage, rewritten, err)
 	}
-	if shouldContinue, usage, rewritten, err := provider.handleRealtimeSupplierMessage(websocket.TextMessage, []byte(`{"type":"error"}`), nil, "gpt-5"); shouldContinue || usage != nil || rewritten != nil || err == nil {
-		t.Fatalf("expected provider error events to stop the bridge, continue=%v usage=%+v rewritten=%v err=%v", shouldContinue, usage, rewritten, err)
+	if shouldContinue, usage, rewritten, err := provider.handleRealtimeSupplierMessage(websocket.TextMessage, []byte(`{"type":"error"}`), nil, "gpt-5"); !shouldContinue || usage != nil || rewritten != nil || err != nil {
+		t.Fatalf("expected provider error events to pass through unchanged, continue=%v usage=%+v rewritten=%v err=%v", shouldContinue, usage, rewritten, err)
 	}
 
 	nestedErrorPayload := []byte(`{"type":"error","status":429,"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"slow down","param":"model"},"response":{"id":"resp_error_1"}}`)
 	shouldContinue, usage, rewritten, err := provider.handleRealtimeSupplierMessage(websocket.TextMessage, nestedErrorPayload, nil, "gpt-5")
-	if shouldContinue || usage != nil || rewritten != nil || err == nil {
-		t.Fatalf("expected nested provider error event to stop the bridge, continue=%v usage=%+v rewritten=%v err=%v", shouldContinue, usage, rewritten, err)
+	if !shouldContinue || usage != nil || rewritten != nil || err != nil {
+		t.Fatalf("expected nested provider error event to pass through unchanged, continue=%v usage=%+v rewritten=%v err=%v", shouldContinue, usage, rewritten, err)
 	}
-	event, ok := err.(*types.Event)
-	if !ok || event.ErrorDetail == nil {
-		t.Fatalf("expected provider error to be returned as types.Event, got %T %v", err, err)
-	}
-	if event.ErrorDetail.Type != "rate_limit_error" || event.ErrorDetail.Code != "rate_limit_exceeded" || event.ErrorDetail.Message != "slow down" {
-		t.Fatalf("expected nested provider error detail to be preserved, got %+v", event.ErrorDetail)
+	detail := codexRealtimeProviderErrorDetailFromPayload(nil, nestedErrorPayload)
+	if detail.Type != "rate_limit_error" || detail.Code != "rate_limit_exceeded" || detail.Message != "slow down" {
+		t.Fatalf("expected nested provider error detail to be preserved for logging, got %+v", detail)
 	}
 }
 

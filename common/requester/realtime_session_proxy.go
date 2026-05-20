@@ -1,6 +1,7 @@
 package requester
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -25,6 +26,8 @@ type realtimeProxyExit struct {
 	graceful bool
 }
 
+type RealtimeProviderPayloadObserver func(messageType int, payload []byte)
+
 type RealtimeSessionProxy struct {
 	userConn *websocket.Conn
 	writer   *WSClientWriter
@@ -47,6 +50,8 @@ type RealtimeSessionProxy struct {
 	dropDownstreamWrites atomic.Bool
 	exitDropLogged       atomic.Bool
 	lastActivityUnixNano atomic.Int64
+
+	providerPayloadObserver RealtimeProviderPayloadObserver
 }
 
 func NewRealtimeSessionProxy(userConn *websocket.Conn, session runtimesession.RealtimeSession, timeout time.Duration) *RealtimeSessionProxy {
@@ -89,6 +94,13 @@ func (p *RealtimeSessionProxy) Start() {
 
 func (p *RealtimeSessionProxy) Wait() {
 	<-p.done
+}
+
+func (p *RealtimeSessionProxy) SetProviderPayloadObserver(observer RealtimeProviderPayloadObserver) {
+	if p == nil {
+		return
+	}
+	p.providerPayloadObserver = observer
 }
 
 func (p *RealtimeSessionProxy) Close() {
@@ -156,10 +168,14 @@ func (p *RealtimeSessionProxy) sessionToUser() {
 	defer close(p.supplierClosed)
 
 	for {
-		messageType, payload, _, _, err := p.session.Recv(p.ctx)
+		messageType, payload, _, origin, err := p.session.Recv(p.ctx)
 		if err != nil {
+			deliveredPayload := false
 			if !p.dropDownstreamWrites.Load() && len(payload) > 0 {
-				_ = p.writeUserMessage(messageType, payload)
+				if writeErr := p.writeUserMessage(messageType, payload); writeErr == nil {
+					deliveredPayload = true
+					p.observeProviderPayload(messageType, payload, origin)
+				}
 			} else if !p.dropDownstreamWrites.Load() {
 				var closeErr *websocket.CloseError
 				if errors.As(err, &closeErr) {
@@ -168,7 +184,9 @@ func (p *RealtimeSessionProxy) sessionToUser() {
 			}
 			if !p.dropDownstreamWrites.Load() {
 				if errorPayload := runtimesession.ClientPayloadFromError(err); errorPayload != nil {
-					_ = p.writeUserMessage(websocket.TextMessage, errorPayload)
+					if !(deliveredPayload && bytes.Equal(errorPayload, payload)) {
+						_ = p.writeUserMessage(websocket.TextMessage, errorPayload)
+					}
 				}
 			}
 			p.emitExit(realtimeProxyExit{source: "supplier", err: err, graceful: errors.Is(err, runtimesession.ErrSessionClosed) || errors.Is(err, context.Canceled)})
@@ -183,6 +201,7 @@ func (p *RealtimeSessionProxy) sessionToUser() {
 			p.emitExit(realtimeProxyExit{source: "supplier", err: err, graceful: isRealtimeDisconnectError(err)})
 			return
 		}
+		p.observeProviderPayload(messageType, payload, origin)
 	}
 }
 
@@ -284,6 +303,18 @@ func (p *RealtimeSessionProxy) signalDone() {
 	p.doneOnce.Do(func() {
 		close(p.done)
 	})
+}
+
+func (p *RealtimeSessionProxy) observeProviderPayload(messageType int, payload []byte, origin runtimesession.RealtimePayloadOrigin) {
+	if p == nil || origin != runtimesession.RealtimePayloadOriginProvider || len(payload) == 0 || p.providerPayloadObserver == nil {
+		return
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			log.Printf("realtime proxy provider payload observer panic: %v", recovered)
+		}
+	}()
+	p.providerPayloadObserver(messageType, append([]byte(nil), payload...))
 }
 
 func (p *RealtimeSessionProxy) finishCoordinate() {

@@ -21,6 +21,7 @@ import (
 	providersBase "one-api/providers/base"
 	"one-api/providers/claude"
 	"one-api/relay/relay_util"
+	runtimesession "one-api/runtime/session"
 	"one-api/types"
 	"strings"
 	"time"
@@ -817,6 +818,36 @@ func processChannelRelayError(ctx context.Context, channelId int, channelName st
 			logger.LogError(ctx, fmt.Sprintf("failed to auto disable channel #%d(%s): %s", channelId, channelName, disableErr.Error()))
 		}
 	}
+}
+
+func processProviderPayloadAPIError(c *gin.Context, channel *model.Channel, payload []byte, source string) {
+	if c == nil || len(payload) == 0 {
+		return
+	}
+	apiErr := runtimesession.ProviderAPIErrorFromPayload(payload)
+	if apiErr == nil {
+		return
+	}
+	processProviderAPIError(c, channel, apiErr, source)
+}
+
+func processProviderAPIError(c *gin.Context, channel *model.Channel, apiErr *types.OpenAIErrorWithStatusCode, source string) {
+	if c == nil || apiErr == nil {
+		return
+	}
+	metrics.RecordProvider(c, apiErr.StatusCode)
+	if channel == nil {
+		return
+	}
+	ctx := context.Background()
+	if c.Request != nil {
+		ctx = c.Request.Context()
+	}
+	source = strings.TrimSpace(source)
+	if source != "" {
+		logger.LogError(ctx, fmt.Sprintf("provider api error source=%s channel #%d(%s): status=%d code=%v message=%s", source, channel.Id, channel.Name, apiErr.StatusCode, apiErr.Code, apiErr.Message))
+	}
+	go processChannelRelayErrorFunc(ctx, channel.Id, channel.Name, apiErr, channel.Type)
 }
 
 func FilterOpenAIErr(c *gin.Context, err *types.OpenAIErrorWithStatusCode) (errWithStatusCode types.OpenAIErrorWithStatusCode) {

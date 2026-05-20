@@ -132,6 +132,40 @@ func TestRealtimeSessionProxyHelperMethodsAndErrorClassification(t *testing.T) {
 	}
 }
 
+func TestRealtimeSessionProxyProviderPayloadObserver(t *testing.T) {
+	proxy := NewRealtimeSessionProxy(nil, newFakeRealtimeSession(), time.Second)
+
+	payload := []byte(`{"type":"error","error":{"type":"usage_limit_reached","message":"usage limit reached"}}`)
+	calls := 0
+	var got []byte
+	proxy.SetProviderPayloadObserver(func(messageType int, observed []byte) {
+		calls++
+		if messageType != websocket.TextMessage {
+			t.Fatalf("expected text message observer, got %d", messageType)
+		}
+		got = observed
+		observed[0] = '!'
+	})
+
+	proxy.observeProviderPayload(websocket.TextMessage, payload, runtimesession.RealtimePayloadOriginProvider)
+	proxy.observeProviderPayload(websocket.TextMessage, []byte(`{"type":"error"}`), runtimesession.RealtimePayloadOriginProxyLocal)
+
+	if calls != 1 {
+		t.Fatalf("expected only provider-origin payload to be observed, got %d calls", calls)
+	}
+	if string(got) != `!"type":"error","error":{"type":"usage_limit_reached","message":"usage limit reached"}}` {
+		t.Fatalf("expected observer to receive mutable copy, got %q", got)
+	}
+	if string(payload) != `{"type":"error","error":{"type":"usage_limit_reached","message":"usage limit reached"}}` {
+		t.Fatalf("expected original payload to remain unchanged, got %q", payload)
+	}
+
+	proxy.SetProviderPayloadObserver(func(int, []byte) {
+		panic("observer failure")
+	})
+	proxy.observeProviderPayload(websocket.TextMessage, payload, runtimesession.RealtimePayloadOriginProvider)
+}
+
 func TestRealtimeSessionProxyCloseDownstreamClosesAfterWriteCloseError(t *testing.T) {
 	conn := &recordingWSWriterConn{controlErr: errors.New("write close failed")}
 	proxy := NewRealtimeSessionProxy(nil, newFakeRealtimeSession(), time.Second)
