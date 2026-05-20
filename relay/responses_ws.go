@@ -233,6 +233,7 @@ type ResponsesWSTurnAttempt struct {
 	FirstResponseAt        time.Time
 	CompletedAt            time.Time
 	snapshot               *ResponsesWSRequestSnapshot
+	providerAPIErrorKeys   map[string]struct{}
 }
 
 func PrepareResponsesWSTurnAttempt(input ResponsesWSTurnAttemptInput) (*ResponsesWSTurnAttempt, *types.OpenAIErrorWithStatusCode) {
@@ -1981,13 +1982,16 @@ func (a *ResponsesWSSessionActor) handleProviderDownstream(event ResponsesWSEven
 	if isTerminal {
 		a.activeAttempt.MarkCompleted(receivedAt)
 		a.finalizeActiveAttempt()
+		a.processProviderPayloadAPIError(payload, event.ChannelID, "responses_ws_provider_frame")
 		a.applyActiveTerminalSideEffects(classified)
 	}
 	if err := a.bridge.WriteClientFrame(event.MessageType, payload, ResponsesWSWriteProvider); err != nil {
 		a.close("client_write_failed")
 		return
 	}
-	a.processProviderPayloadAPIError(payload, event.ChannelID, "responses_ws_provider_frame")
+	if !isTerminal {
+		a.processProviderPayloadAPIError(payload, event.ChannelID, "responses_ws_provider_frame")
+	}
 }
 
 func (a *ResponsesWSSessionActor) processProviderPayloadAPIError(payload []byte, channelID int, source string) {
@@ -1998,8 +2002,51 @@ func (a *ResponsesWSSessionActor) processProviderPayloadAPIError(payload []byte,
 	if apiErr == nil {
 		return
 	}
+	if !a.markProviderAPIErrorSeen(apiErr, source) {
+		return
+	}
 	channel := a.providerPayloadChannel(channelID)
 	processProviderAPIError(a.Context(), channel, apiErr, source)
+}
+
+func (a *ResponsesWSSessionActor) markProviderAPIErrorSeen(apiErr *types.OpenAIErrorWithStatusCode, source string) bool {
+	if a == nil || apiErr == nil {
+		return true
+	}
+	attempt := a.activeAttempt
+	if attempt == nil {
+		attempt = a.pendingAttempt
+	}
+	if attempt == nil {
+		return true
+	}
+	// Trade-off: dedupe only within the current turn attempt. This suppresses
+	// repeated provider frames for the same failure without hiding the same
+	// provider-side error if a later user turn fails independently.
+	key := providerAPIErrorDedupeKey(apiErr, source)
+	if _, ok := attempt.providerAPIErrorKeys[key]; ok {
+		return false
+	}
+	if attempt.providerAPIErrorKeys == nil {
+		attempt.providerAPIErrorKeys = make(map[string]struct{}, 1)
+	}
+	attempt.providerAPIErrorKeys[key] = struct{}{}
+	return true
+}
+
+func providerAPIErrorDedupeKey(apiErr *types.OpenAIErrorWithStatusCode, source string) string {
+	if apiErr == nil {
+		return ""
+	}
+	return fmt.Sprintf(
+		"%s|%d|%s|%v|%s|%s",
+		strings.TrimSpace(source),
+		apiErr.StatusCode,
+		strings.TrimSpace(apiErr.Type),
+		apiErr.Code,
+		strings.TrimSpace(apiErr.Message),
+		strings.TrimSpace(apiErr.Param),
+	)
 }
 
 func (a *ResponsesWSSessionActor) providerPayloadChannel(channelID int) *model.Channel {

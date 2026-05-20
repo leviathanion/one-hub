@@ -2301,6 +2301,64 @@ func TestResponsesWSFailedTerminalProcessesProviderErrorWithoutClosingSession(t 
 	}
 }
 
+func TestResponsesWSProviderAPIErrorDedupesWithinTurn(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	originalLogger := logger.Logger
+	logger.Logger = zap.NewNop()
+	t.Cleanup(func() {
+		logger.Logger = originalLogger
+	})
+
+	originalProcess := processChannelRelayErrorFunc
+	errCh := make(chan *types.OpenAIErrorWithStatusCode, 2)
+	processChannelRelayErrorFunc = func(_ context.Context, _ int, _ string, apiErr *types.OpenAIErrorWithStatusCode, _ int) {
+		errCh <- apiErr
+	}
+	t.Cleanup(func() {
+		processChannelRelayErrorFunc = originalProcess
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	ctx.Set("responses_ws_selected_channel", &model.Channel{Id: 17, Name: "provider-error", Type: config.ChannelTypeOpenAI})
+
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.activeAttempt = &ResponsesWSTurnAttempt{AttemptID: "attempt-limit", SelectedChannelID: 17}
+
+	payload := []byte(`{"type":"error","error":{"type":"usage_limit_reached","message":"usage limit reached"}}`)
+	actor.processProviderPayloadAPIError(payload, 17, "responses_ws_provider_frame")
+	actor.processProviderPayloadAPIError(payload, 17, "responses_ws_provider_frame")
+
+	select {
+	case apiErr := <-errCh:
+		if apiErr == nil || apiErr.StatusCode != http.StatusTooManyRequests || apiErr.Type != "usage_limit_reached" {
+			t.Fatalf("expected parsed usage-limit provider error, got %#v", apiErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first provider error control-plane handling")
+	}
+
+	select {
+	case apiErr := <-errCh:
+		t.Fatalf("expected duplicate provider error to be suppressed, got %#v", apiErr)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	actor.activeAttempt = &ResponsesWSTurnAttempt{AttemptID: "attempt-limit-next", SelectedChannelID: 17}
+	actor.processProviderPayloadAPIError(payload, 17, "responses_ws_provider_frame")
+
+	select {
+	case apiErr := <-errCh:
+		if apiErr == nil || apiErr.StatusCode != http.StatusTooManyRequests || apiErr.Type != "usage_limit_reached" {
+			t.Fatalf("expected next turn to process provider error independently, got %#v", apiErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for next-turn provider error control-plane handling")
+	}
+}
+
 func TestResponsesWSCloseReplaysBufferedTerminalForUsage(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

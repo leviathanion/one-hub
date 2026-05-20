@@ -330,7 +330,7 @@ func (p *CodexProvider) handleRealtimeSupplierMessage(messageType int, message [
 
 	if event.Type == "error" {
 		detail := codexRealtimeProviderErrorDetailFromPayload(&event, message)
-		logger.SysError(codexRealtimeProviderErrorLogMessage(detail, message))
+		logger.SysDebug(codexRealtimeProviderErrorLogMessage(detail, message))
 		return true, nil, nil, nil
 	}
 
