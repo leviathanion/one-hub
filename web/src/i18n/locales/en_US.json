@@ -497,6 +497,7 @@
     "totalInputTokens": "Total input tokens",
     "totalOutputTokens": "Total output tokens",
     "typeLabel": "Type",
+    "protocolLabel": "Protocol",
     "userLabel": "User",
     "sourceIp": "Source IP",
     "userAgent": "User-Agent",

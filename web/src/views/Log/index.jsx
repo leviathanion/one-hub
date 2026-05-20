@@ -65,6 +65,7 @@ export default function Log() {
     group: true,
     token_name: true,
     type: true,
+    protocol: true,
     model_name: true,
     duration: true,
     message: true,
@@ -300,6 +301,7 @@ export default function Log() {
                 { id: 'group', label: t('logPage.groupLabel') },
                 { id: 'token_name', label: t('logPage.tokenLabel') },
                 { id: 'type', label: t('logPage.typeLabel') },
+                { id: 'protocol', label: t('logPage.protocolLabel') },
                 { id: 'model_name', label: t('logPage.modelLabel') },
                 { id: 'duration', label: t('logPage.durationLabel') },
                 { id: 'message', label: t('logPage.inputLabel') },
@@ -364,6 +366,12 @@ export default function Log() {
                     label: t('logPage.typeLabel'),
                     disableSort: false,
                     hide: !columnVisibility.type
+                  },
+                  {
+                    id: 'protocol',
+                    label: t('logPage.protocolLabel'),
+                    disableSort: true,
+                    hide: !columnVisibility.protocol
                   },
                   {
                     id: 'model_name',

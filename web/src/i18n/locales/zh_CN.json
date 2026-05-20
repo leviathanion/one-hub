@@ -393,6 +393,7 @@
     "userLabel": "用户",
     "tokenLabel": "令牌",
     "typeLabel": "类型",
+    "protocolLabel": "协议",
     "modelLabel": "模型",
     "durationLabel": "耗时",
     "durationTooltip": "t/s：输出Token的数量除以总生成时间，表示生成速度",

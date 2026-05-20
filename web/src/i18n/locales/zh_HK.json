@@ -479,6 +479,7 @@
     "totalInputTokens": "計算輸入Tokens",
     "totalOutputTokens": "計算輸出Tokens",
     "typeLabel": "類型",
+    "protocolLabel": "協議",
     "userLabel": "用戶",
     "sourceIp": "Source IP",
     "userAgent": "User-Agent",

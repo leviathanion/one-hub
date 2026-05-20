@@ -86,8 +86,10 @@ export default function LogTableRow({ item, userIsAdmin, userGroup, columnVisibi
 
   const { totalInputTokens, totalOutputTokens, show, tokenDetails } = useMemo(() => calculateTokenBreakdown(item), [item]);
 
-  // 计算当前显示的列数
-  const colCount = Object.values(columnVisibility).filter(Boolean).length;
+  // 计算当前实际渲染的列数，用于展开行跨列。
+  const colCount = Object.entries(columnVisibility).filter(
+    ([column, visible]) => visible && (userIsAdmin || (column !== 'channel_id' && column !== 'user_id'))
+  ).length;
 
   // 展开状态（仅type=2时才有展开）
   const [open, setOpen] = useState(false);
@@ -144,7 +146,8 @@ export default function LogTableRow({ item, userIsAdmin, userGroup, columnVisibi
           </TableCell>
         )}
         {columnVisibility.type && <TableCell sx={{ p: '10px 8px' }}>{renderType(item.type, LogType, t)}</TableCell>}
-        {columnVisibility.model_name && <TableCell sx={{ p: '10px 8px' }}>{viewModelName(item.model_name, item)}</TableCell>}
+        {columnVisibility.protocol && <TableCell sx={{ p: '10px 8px' }}>{viewProtocol(item)}</TableCell>}
+        {columnVisibility.model_name && <TableCell sx={{ p: '10px 8px' }}>{viewModelName(item.model_name)}</TableCell>}
 
         {columnVisibility.duration && (
           <TableCell sx={{ p: '10px 8px' }}>
@@ -225,29 +228,37 @@ function getProtocolBadgeLabel(protocol) {
   }
 }
 
-function viewModelName(model_name, item) {
+function getProtocolLabelColor(protocol) {
+  switch (protocol) {
+    case 'http_stream':
+      return 'primary';
+    case 'realtime_ws':
+    case 'responses_ws':
+      return 'secondary';
+    case 'http':
+    default:
+      return 'default';
+  }
+}
+
+function viewProtocol(item) {
+  const protocol = getLogProtocol(item);
+  return (
+    <Label color={getProtocolLabelColor(protocol)} variant="soft">
+      {getProtocolBadgeLabel(protocol)}
+    </Label>
+  );
+}
+
+function viewModelName(model_name) {
   if (!model_name) {
     return '';
   }
 
   return (
-    <Badge
-      badgeContent={getProtocolBadgeLabel(getLogProtocol(item))}
-      color={item?.is_stream ? 'primary' : 'default'}
-      sx={{
-        '& .MuiBadge-badge': {
-          fontSize: '0.55rem',
-          height: '16px',
-          minWidth: '16px',
-          padding: '0 4px',
-          top: '-3px'
-        }
-      }}
-    >
-      <Label color="primary" variant="outlined" copyText={model_name}>
-        {model_name}
-      </Label>
-    </Badge>
+    <Label color="primary" variant="outlined" copyText={model_name}>
+      {model_name}
+    </Label>
   );
 }
 

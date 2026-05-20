@@ -474,6 +474,7 @@
     "totalInputTokens": "Total input tokens",
     "totalOutputTokens": "Total output tokens",
     "typeLabel": "タイプ",
+    "protocolLabel": "プロトコル",
     "userLabel": "ユーザー",
     "sourceIp": "Source IP",
     "userAgent": "User-Agent",
