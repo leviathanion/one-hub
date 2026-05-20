@@ -21,12 +21,12 @@ function formatRatio(numerator, denominator) {
 
 function getCacheTokenHitStats(tokenData) {
   const cacheHitTokens = toNumber(tokenData?.cacheTokens) + toNumber(tokenData?.cacheReadTokens);
-  const inputTokens = toNumber(tokenData?.inputTokens);
+  const totalInputTokens = toNumber(tokenData?.inputTokens) + cacheHitTokens;
 
   return {
     cacheHitTokens,
-    inputTokens,
-    hitRate: inputTokens > 0 ? cacheHitTokens / inputTokens : 0
+    inputTokens: totalInputTokens,
+    hitRate: totalInputTokens > 0 ? cacheHitTokens / totalInputTokens : 0
   };
 }
 
