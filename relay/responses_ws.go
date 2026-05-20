@@ -1551,7 +1551,7 @@ func (a *ResponsesWSSessionActor) prepareAndSendFirstTurn(openResult *responsesW
 			return
 		}
 		logger.LogError(context.Background(), "responses websocket rewrite failed: "+err.Error())
-		a.writeProxyLocal(responsesWSErrorPayload(http.StatusBadRequest, "invalid_event", responsesWSStaticErrorMessage("invalid_event")))
+		a.writeProxyLocal(responsesWSErrorPayload(http.StatusInternalServerError, "responses_ws_payload_rewrite_failed", responsesWSStaticErrorMessage("responses_ws_payload_rewrite_failed")))
 		a.close("rewrite_failed")
 		return
 	}
@@ -1596,7 +1596,7 @@ func (a *ResponsesWSSessionActor) handleClientFrame(event ResponsesWSEventClient
 	}
 	if err := json.Unmarshal(event.Payload, &envelope); err != nil {
 		logger.LogError(context.Background(), "responses websocket client frame parse failed: "+err.Error())
-		a.writeProxyLocal(responsesWSErrorPayload(http.StatusBadRequest, "invalid_event", responsesWSStaticErrorMessage("invalid_event")))
+		a.writeProxyLocal(responsesWSErrorPayload(http.StatusBadRequest, "invalid_event", err.Error()))
 		return
 	}
 	switch strings.TrimSpace(envelope.Type) {
@@ -1650,7 +1650,7 @@ func (a *ResponsesWSSessionActor) startSubsequentTurn(raw []byte, receivedAt tim
 	frame, err := responsesws.ParseRawResponsesCreateFrame(raw)
 	if err != nil {
 		logger.LogError(context.Background(), "responses websocket subsequent frame parse failed: "+err.Error())
-		a.writeProxyLocal(responsesWSErrorPayload(http.StatusBadRequest, "invalid_event", responsesWSStaticErrorMessage("invalid_event")))
+		a.writeProxyLocal(responsesWSErrorPayload(http.StatusBadRequest, "invalid_event", err.Error()))
 		return
 	}
 	ctx := a.Context()
@@ -1719,7 +1719,7 @@ func (a *ResponsesWSSessionActor) startSubsequentTurn(raw []byte, receivedAt tim
 			return
 		}
 		logger.LogError(context.Background(), "responses websocket rewrite failed: "+err.Error())
-		a.writeProxyLocal(responsesWSErrorPayload(http.StatusBadRequest, "invalid_event", responsesWSStaticErrorMessage("invalid_event")))
+		a.writeProxyLocal(responsesWSErrorPayload(http.StatusInternalServerError, "responses_ws_payload_rewrite_failed", responsesWSStaticErrorMessage("responses_ws_payload_rewrite_failed")))
 		return
 	}
 	if apiErr := attempt.PreConsumeQuota(); apiErr != nil {
@@ -2306,7 +2306,7 @@ func ResponsesWebSocket(c *gin.Context) {
 	firstFrameReceivedAt := time.Now()
 	if err != nil {
 		writer := requester.NewWSClientWriter(userConn, config.RealtimeWebsocketWriteTimeout)
-		_ = writer.WriteMessage(websocket.TextMessage, responsesWSErrorPayload(http.StatusBadRequest, "invalid_event", "frame is too large or invalid; send smaller audio chunks"))
+		_ = writer.WriteMessage(websocket.TextMessage, responsesWSErrorPayload(http.StatusBadRequest, "invalid_event", responsesWSFirstFrameReadErrorMessage(err)))
 		_ = writer.Close()
 		return
 	}
@@ -2630,6 +2630,19 @@ func responsesWSProviderPayload(c *gin.Context, frame *responsesws.RawResponsesC
 	return frame.CloneForModel(providerModel)
 }
 
+// Raw first-frame read errors can include private socket addresses. Keep code
+// stable for clients, but use a precise client-safe message for diagnosis.
+func responsesWSFirstFrameReadErrorMessage(err error) string {
+	if errors.Is(err, websocket.ErrReadLimit) {
+		return "frame is too large or invalid; send smaller audio chunks"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout waiting for first websocket frame"
+	}
+	return "websocket read failed before first frame"
+}
+
 func responsesWSCurrentModelNames(c *gin.Context) (providerModel string, billingModel string) {
 	if c == nil {
 		return "", ""
@@ -2772,6 +2785,8 @@ func responsesWSStaticErrorMessage(code string) string {
 		return "quota rollback failed"
 	case "responses_ws_attempt_failed":
 		return "responses websocket turn attempt failed"
+	case "responses_ws_payload_rewrite_failed":
+		return "internal payload rewrite failed"
 	case "responses_ws_send_queue_full":
 		return "responses websocket upstream send queue is full"
 	case "previous_response_not_found":

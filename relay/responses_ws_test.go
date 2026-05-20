@@ -110,6 +110,29 @@ func readResponsesWSEvent(t *testing.T, actor *ResponsesWSSessionActor) Response
 	}
 }
 
+func assertResponsesWSErrorPayload(t *testing.T, payload string, status int, code string, messageContains string) {
+	t.Helper()
+	var event struct {
+		Status int `json:"status"`
+		Error  struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(payload), &event); err != nil {
+		t.Fatalf("expected websocket error payload to decode, got err=%v payload=%q", err, payload)
+	}
+	if event.Status != status {
+		t.Fatalf("expected status %d, got %d payload=%q", status, event.Status, payload)
+	}
+	if event.Error.Code != code {
+		t.Fatalf("expected code %q, got %q payload=%q", code, event.Error.Code, payload)
+	}
+	if messageContains != "" && !strings.Contains(event.Error.Message, messageContains) {
+		t.Fatalf("expected message to contain %q, got %q payload=%q", messageContains, event.Error.Message, payload)
+	}
+}
+
 func intSliceContains(values []int, target int) bool {
 	for _, value := range values {
 		if value == target {
@@ -529,7 +552,7 @@ func TestResponsesWebSocketOversizedFirstFrameClosesOrReturnsInvalidEvent(t *tes
 	}
 	_, payload, err := conn.ReadMessage()
 	if err == nil {
-		if !strings.Contains(string(payload), "invalid_event") {
+		if !strings.Contains(string(payload), "invalid_event") || !strings.Contains(string(payload), "frame is too large or invalid") {
 			t.Fatalf("expected oversized frame guidance payload, got %q", payload)
 		}
 		return
@@ -537,6 +560,49 @@ func TestResponsesWebSocketOversizedFirstFrameClosesOrReturnsInvalidEvent(t *tes
 	var closeErr *websocket.CloseError
 	if !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseMessageTooBig {
 		t.Fatalf("expected oversized frame close or invalid_event payload, err=%v payload=%q", err, payload)
+	}
+}
+
+func TestResponsesWebSocketFirstFrameTimeoutReturnsSafeInvalidEventMessage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logger.Logger = zap.NewNop()
+	setResponsesWSTestRedisEnabled(t, false)
+	setResponsesWSTestViperInt(t, "responses_ws.connect_per_credential_per_minute", -1)
+	setResponsesWSTestViperInt(t, "responses_ws.first_frame_timeout_ms", 10)
+	installResponsesWSTestAPILimiter(t, 60)
+
+	router := gin.New()
+	handlerDone := make(chan struct{})
+	router.GET("/v1/responses", func(c *gin.Context) {
+		defer close(handlerDone)
+		c.Set("id", 7)
+		c.Set("token_id", nextResponsesWSConnectionAttemptTokenID())
+		c.Set("group", "default")
+		ResponsesWebSocket(c)
+	})
+	server := httptest.NewServer(router)
+	defer server.Close()
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("expected websocket connection to upgrade, got %v", err)
+	}
+	defer conn.Close()
+
+	_, payload, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("expected first-frame timeout payload before close, got err=%v", err)
+	}
+	got := string(payload)
+	assertResponsesWSErrorPayload(t, got, http.StatusBadRequest, "invalid_event", "timeout waiting for first websocket frame")
+	if strings.Contains(got, "tcp") || strings.Contains(got, "127.0.0.1") || strings.Contains(got, "172.") {
+		t.Fatalf("expected safe timeout message without socket details, got %q", got)
+	}
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first-frame timeout handler to exit")
 	}
 }
 
@@ -975,6 +1041,8 @@ func TestResponsesWSFirstTurnFailureAfterAttachAbortsSessionOnce(t *testing.T) {
 	if !actor.closed.Load() {
 		t.Fatal("expected actor to close after first-turn rewrite failure")
 	}
+	got, _ := conn.lastWrite.Load().(string)
+	assertResponsesWSErrorPayload(t, got, http.StatusInternalServerError, "responses_ws_payload_rewrite_failed", "internal payload rewrite failed")
 }
 
 func TestResponsesWSFirstTurnRetryOpenDoesNotBlockActorLoop(t *testing.T) {
@@ -1872,6 +1940,85 @@ func TestResponsesWSSubsequentModelMismatchRejectsBeforeAdmission(t *testing.T) 
 	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, `"code":"responses_ws_model_mismatch"`) {
 		t.Fatalf("expected model mismatch error, got %q", got)
 	}
+}
+
+func TestResponsesWSClientFrameParseErrorUsesJSONErrorMessage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+
+	actor.handleClientFrame(ResponsesWSEventClientFrame{
+		MessageType: websocket.TextMessage,
+		Payload:     []byte(`{"type":`),
+	})
+
+	got, _ := conn.lastWrite.Load().(string)
+	assertResponsesWSErrorPayload(t, got, http.StatusBadRequest, "invalid_event", "unexpected end of JSON input")
+}
+
+func TestResponsesWSSubsequentFrameParseErrorUsesParserMessage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+
+	actor.startSubsequentTurn([]byte(`{"type":"response.cancel","model":"gpt-5"}`), time.Now())
+
+	got, _ := conn.lastWrite.Load().(string)
+	assertResponsesWSErrorPayload(t, got, http.StatusBadRequest, "invalid_event", `unsupported responses websocket event type "response.cancel"`)
+}
+
+func TestResponsesWSSubsequentRewriteFailureUsesInternalErrorCode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	installResponsesWSTestAPILimiter(t, 60)
+	originalPricing := model.PricingInstance
+	model.PricingInstance = &model.Pricing{Prices: map[string]*model.Price{
+		"gpt-5": {
+			Model:  "gpt-5",
+			Type:   model.TokensPriceType,
+			Input:  1,
+			Output: 1,
+		},
+	}}
+	t.Cleanup(func() {
+		model.PricingInstance = originalPricing
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	ctx.Set("id", 7)
+	ctx.Set("group", "default")
+	ctx.Set("group_ratio", 1.0)
+	ctx.Set("original_model", "gpt-5")
+	ctx.Set("billing_original_model", true)
+	ctx.Set("responses_ws_selected_channel", &model.Channel{Id: 17, Type: config.ChannelTypeOpenAI})
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	actor.state = responsesWSStateIdle
+	actor.pendingTurnPhase = responsesWSPendingTurnNone
+
+	actor.startSubsequentTurn([]byte(`{"type":"response.create","model":"gpt-5","input":[]}`), time.Now())
+
+	if actor.pendingAttempt != nil || actor.pendingTurnPhase != responsesWSPendingTurnNone || actor.state != responsesWSStateIdle {
+		t.Fatalf("expected rewrite rollback to clear pending turn, state=%v phase=%v pending=%+v", actor.state, actor.pendingTurnPhase, actor.pendingAttempt)
+	}
+	got, _ := conn.lastWrite.Load().(string)
+	assertResponsesWSErrorPayload(t, got, http.StatusInternalServerError, "responses_ws_payload_rewrite_failed", "internal payload rewrite failed")
 }
 
 func TestResponsesWSSubsequentRPMFailureDoesNotCreateAttempt(t *testing.T) {
