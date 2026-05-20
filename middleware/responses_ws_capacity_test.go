@@ -581,6 +581,25 @@ func TestAcquireResponsesWSPendingSlotReleaseIsIdempotent(t *testing.T) {
 	lease.Release()
 }
 
+func TestAcquireResponsesWSPendingSlotUnlimited(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	resetResponsesWSCapacityForTest(t)
+	setViperForTest(t, "responses_ws.pending_per_credential", -1)
+
+	ctx := newResponsesWSCapacityTestContext(101, 7, "default")
+	leases := make([]ResponsesWSLease, 0, 16)
+	for i := 0; i < 16; i++ {
+		lease, apiErr := AcquireResponsesWSPendingSlot(ctx)
+		if apiErr != nil {
+			t.Fatalf("expected -1 to disable pending limit, got %v at attempt %d", apiErr, i+1)
+		}
+		leases = append(leases, lease)
+	}
+	for _, lease := range leases {
+		lease.Release()
+	}
+}
+
 func TestAcquireResponsesWSActiveLeaseConcurrentCredentialLimit(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	resetResponsesWSCapacityForTest(t)

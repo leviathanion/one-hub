@@ -157,7 +157,7 @@ ResponsesWS 使用两类连接 lease：
 
 | lease | 默认 | 生命周期 |
 | --- | --- | --- |
-| `responses_ws.pending_per_credential` | `1` | Upgrade 前获取，首帧校验、active lease 和 first-turn RPM admission 完成后释放；早退由 defer 兜底 |
+| `responses_ws.pending_per_credential` | `1` (`-1` = unlimited) | Upgrade 前获取，首帧校验、active lease 和 first-turn RPM admission 完成后释放；早退由 defer 兜底 |
 | `responses_ws.active_per_credential` | `8` | 打开首个 upstream session 前获取，actor close/handler return 后释放 |
 | `responses_ws.active_per_group` | `128` | 同 active lease |
 | `responses_ws.active_global` | `1024` | 同 active lease |

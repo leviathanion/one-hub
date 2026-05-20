@@ -43,7 +43,7 @@ ResponsesWS 是一个 **turn-based** WebSocket 入口：一条连接上可以发
 responses_ws:
   # ---- 容量控制 ----
   connect_per_credential_per_minute: 30     # 每分钟每凭据建连尝试上限
-  pending_per_credential: 1                 # 等待首帧的 pending 槽位
+  pending_per_credential: 1                 # 等待首帧的 pending 槽位；-1 表示不限
   active_per_credential: 8                  # 单凭据已建立连接上限
   active_per_group: 128                     # 单分组已建立连接上限
   active_global: 1024                       # 全局已建立连接上限

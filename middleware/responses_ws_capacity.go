@@ -24,8 +24,9 @@ import (
 )
 
 const (
-	defaultResponsesWSConnectPerCredentialPerMinute = 30
-	defaultResponsesWSActivePerCredential           = 8
+	defaultResponsesWSConnectPerCredentialPerMinute = 300
+	defaultResponsesWSPendingPerCredential          = 16
+	defaultResponsesWSActivePerCredential           = 32
 	defaultResponsesWSActivePerGroup                = 128
 	defaultResponsesWSActiveGlobal                  = 1024
 	responsesWSConnectLimiterKeyPrefix              = "responses-ws-connect:"
@@ -112,10 +113,7 @@ func AllowResponsesWSConnectionAttempt(c *gin.Context) *types.OpenAIErrorWithSta
 }
 
 func AcquireResponsesWSPendingSlot(c *gin.Context) (ResponsesWSLease, *types.OpenAIErrorWithStatusCode) {
-	limit := viper.GetInt("responses_ws.pending_per_credential")
-	if limit <= 0 {
-		limit = 1
-	}
+	limit := responsesWSConfiguredLimit("responses_ws.pending_per_credential", defaultResponsesWSPendingPerCredential)
 	credential, apiErr := responsesWSCredentialKey(c)
 	if apiErr != nil {
 		return nil, apiErr
@@ -458,7 +456,7 @@ func acquireResponsesWSCounter(counters map[string]int, key string, limit int, s
 	responsesWSCapacity.Lock()
 	defer responsesWSCapacity.Unlock()
 
-	if limit > 0 && counters[key] >= limit {
+	if limit >= 0 && counters[key] >= limit {
 		return nil, common.StringErrorWrapperLocal(message, code, status)
 	}
 	counters[key]++

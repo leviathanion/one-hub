@@ -49,7 +49,7 @@ realtime:
   websocket_write_timeout_ms: 10000 # WebSocket 写超时，默认 10 秒
 responses_ws:
   connect_per_credential_per_minute: 30 # 每个 credential 每分钟允许的 ResponsesWS 建连尝试数；per minute，窗口/Redis 共享语义同 API RPM limiter，Redis 关闭时进程内限流；显式 -1 表示不限
-  pending_per_credential: 1 # Upgrade 后等待首帧/建连的单凭据 pending 上限
+  pending_per_credential: 1 # Upgrade 后等待首帧/建连的单凭据 pending 上限；显式 -1 表示不限
   active_per_credential: 8 # 单凭据已建立 ResponsesWS 连接上限；显式 -1 表示无限
   active_per_group: 128 # 单分组已建立 ResponsesWS 连接上限；显式 -1 表示无限
   active_global: 1024 # 全局已建立 ResponsesWS 连接上限；显式 -1 表示无限
