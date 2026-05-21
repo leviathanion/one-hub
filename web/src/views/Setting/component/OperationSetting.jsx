@@ -2,18 +2,27 @@ import { useContext, useEffect, useState } from 'react';
 import SubCard from 'ui-component/cards/SubCard';
 import {
   Alert,
+  Box,
   Button,
   Checkbox,
   Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
   FormControl,
   FormControlLabel,
+  IconButton,
   InputLabel,
   MenuItem,
   OutlinedInput,
   Select,
   Stack,
-  TextField
+  TextField,
+  Tooltip,
+  Typography
 } from '@mui/material';
+import HelpOutlineIcon from '@mui/icons-material/HelpOutline';
 import { showError, showSuccess, verifyJSON } from 'utils/common';
 import { API } from 'utils/api';
 import { AdapterDayjs } from '@mui/x-date-pickers/AdapterDayjs';
@@ -77,6 +86,73 @@ const defaultInputs = {
   PreferredChannelWaitPollMilliseconds: 50
 };
 
+const CODEX_ROUTING_HINT_RECOMMENDED_TEMPLATE = JSON.stringify(
+  {
+    prompt_cache_key_strategy: 'auto',
+    model_regex: '^gpt-5$'
+  },
+  null,
+  2
+);
+
+const CODEX_ROUTING_HINT_DEFAULT_TEMPLATE = JSON.stringify(
+  {
+    prompt_cache_key_strategy: 'off',
+    model_regex: '',
+    user_agent_regex: ''
+  },
+  null,
+  2
+);
+
+const CHANNEL_AFFINITY_DEFAULT_TEMPLATE = JSON.stringify(
+  {
+    enabled: true,
+    default_ttl_seconds: 3600,
+    max_entries: 50000
+  },
+  null,
+  2
+);
+
+const codexHelpTopics = {
+  PreferredChannelWaitMilliseconds: [
+    'meaning',
+    'legalValues',
+    'defaultValue',
+    'recommended',
+    'impact',
+    'risk'
+  ],
+  PreferredChannelWaitPollMilliseconds: [
+    'meaning',
+    'legalValues',
+    'defaultValue',
+    'recommended',
+    'impact',
+    'risk'
+  ],
+  CodexRoutingHintSetting: [
+    'meaning',
+    'legalValues',
+    'strategies',
+    'filters',
+    'recommended',
+    'impact',
+    'risk'
+  ],
+  ChannelAffinitySetting: [
+    'meaning',
+    'topLevel',
+    'ruleFields',
+    'keySources',
+    'defaults',
+    'recommended',
+    'impact',
+    'risk'
+  ]
+};
+
 const OperationSetting = () => {
   const { t } = useTranslation();
   const siteInfo = useSelector((state) => state.siteInfo);
@@ -85,6 +161,7 @@ const OperationSetting = () => {
   const [originInputs, setOriginInputs] = useState({});
   const [secretStates, setSecretStates] = useState(() => createInitialSecretStates(OPERATION_SECRET_OPTION_KEYS));
   let [loading, setLoading] = useState(false);
+  const [codexHelpTopic, setCodexHelpTopic] = useState(null);
   let [historyTimestamp, setHistoryTimestamp] = useState(now.getTime() / 1000 - 30 * 24 * 3600); // a month ago new Date().getTime() / 1000 + 3600
   let [invoiceMonth, setInvoiceMonth] = useState(now.getTime()); // a month ago new Date().getTime() / 1000 + 3600
   const loadStatus = useContext(LoadStatusContext);
@@ -284,6 +361,64 @@ const OperationSetting = () => {
     } else {
       setInputs((inputs) => ({ ...inputs, [name]: value }));
     }
+  };
+
+  const applyCodexTemplate = (name, value) => {
+    setInputs((inputs) => ({ ...inputs, [name]: value }));
+  };
+
+  const codexHelpPrefix = 'setting_index.operationSettings.codexSettings.helpDialog';
+
+  const openCodexHelp = (topic) => {
+    setCodexHelpTopic(topic);
+  };
+
+  const closeCodexHelp = () => {
+    setCodexHelpTopic(null);
+  };
+
+  const renderCodexHelpButton = (topic) => (
+    <Tooltip title={t(`${codexHelpPrefix}.open`)}>
+      <IconButton size="small" color="primary" onClick={() => openCodexHelp(topic)} disabled={loading}>
+        <HelpOutlineIcon fontSize="inherit" />
+      </IconButton>
+    </Tooltip>
+  );
+
+  const renderCodexFieldTitle = (topic, label) => (
+    <Stack direction="row" alignItems="center" spacing={0.5} sx={{ mb: 0.75 }}>
+      <Typography variant="subtitle2">{label}</Typography>
+      {renderCodexHelpButton(topic)}
+    </Stack>
+  );
+
+  const renderCodexHelpDialog = () => {
+    if (!codexHelpTopic) {
+      return null;
+    }
+
+    return (
+      <Dialog open={Boolean(codexHelpTopic)} onClose={closeCodexHelp} maxWidth="md" fullWidth>
+        <DialogTitle>{t(`${codexHelpPrefix}.${codexHelpTopic}.title`)}</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={2}>
+            {(codexHelpTopics[codexHelpTopic] || []).map((section) => (
+              <Box key={section}>
+                <Typography variant="subtitle2" sx={{ mb: 0.75 }}>
+                  {t(`${codexHelpPrefix}.${codexHelpTopic}.${section}.title`)}
+                </Typography>
+                <Typography variant="body2" sx={{ whiteSpace: 'pre-line' }}>
+                  {t(`${codexHelpPrefix}.${codexHelpTopic}.${section}.body`)}
+                </Typography>
+              </Box>
+            ))}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={closeCodexHelp}>{t(`${codexHelpPrefix}.close`)}</Button>
+        </DialogActions>
+      </Dialog>
+    );
   };
 
   const handleTextFieldChange = (event) => {
@@ -1077,41 +1212,83 @@ const OperationSetting = () => {
       <SubCard title={t('setting_index.operationSettings.codexSettings.title')}>
         <Stack spacing={2}>
           <Alert severity="info">{t('setting_index.operationSettings.codexSettings.description')}</Alert>
+          <Alert severity="warning">{t('setting_index.operationSettings.codexSettings.globalWarning')}</Alert>
           <Stack direction={{ sm: 'column', md: 'row' }} spacing={{ xs: 3, sm: 2, md: 4 }}>
             <FormControl fullWidth>
-              <InputLabel htmlFor="PreferredChannelWaitMilliseconds">
-                {t('setting_index.operationSettings.codexSettings.preferredChannelWaitMilliseconds.label')}
-              </InputLabel>
+              {renderCodexFieldTitle(
+                'PreferredChannelWaitMilliseconds',
+                t('setting_index.operationSettings.codexSettings.preferredChannelWaitMilliseconds.label')
+              )}
               <OutlinedInput
                 id="PreferredChannelWaitMilliseconds"
                 name="PreferredChannelWaitMilliseconds"
                 type="number"
                 value={inputs.PreferredChannelWaitMilliseconds}
                 onChange={handleInputChange}
-                label={t('setting_index.operationSettings.codexSettings.preferredChannelWaitMilliseconds.label')}
                 placeholder={t('setting_index.operationSettings.codexSettings.preferredChannelWaitMilliseconds.placeholder')}
-                inputProps={{ min: 0, step: 1, inputMode: 'numeric' }}
+                inputProps={{
+                  min: 0,
+                  step: 1,
+                  inputMode: 'numeric',
+                  'aria-label': t('setting_index.operationSettings.codexSettings.preferredChannelWaitMilliseconds.label')
+                }}
                 disabled={loading}
               />
+              <Alert severity="info" sx={{ mt: 1 }}>
+                {t('setting_index.operationSettings.codexSettings.preferredChannelWaitMilliseconds.help')}
+              </Alert>
             </FormControl>
             <FormControl fullWidth>
-              <InputLabel htmlFor="PreferredChannelWaitPollMilliseconds">
-                {t('setting_index.operationSettings.codexSettings.preferredChannelWaitPollMilliseconds.label')}
-              </InputLabel>
+              {renderCodexFieldTitle(
+                'PreferredChannelWaitPollMilliseconds',
+                t('setting_index.operationSettings.codexSettings.preferredChannelWaitPollMilliseconds.label')
+              )}
               <OutlinedInput
                 id="PreferredChannelWaitPollMilliseconds"
                 name="PreferredChannelWaitPollMilliseconds"
                 type="number"
                 value={inputs.PreferredChannelWaitPollMilliseconds}
                 onChange={handleInputChange}
-                label={t('setting_index.operationSettings.codexSettings.preferredChannelWaitPollMilliseconds.label')}
                 placeholder={t('setting_index.operationSettings.codexSettings.preferredChannelWaitPollMilliseconds.placeholder')}
-                inputProps={{ min: 0, step: 1, inputMode: 'numeric' }}
+                inputProps={{
+                  min: 0,
+                  step: 1,
+                  inputMode: 'numeric',
+                  'aria-label': t('setting_index.operationSettings.codexSettings.preferredChannelWaitPollMilliseconds.label')
+                }}
                 disabled={loading}
               />
+              <Alert severity="info" sx={{ mt: 1 }}>
+                {t('setting_index.operationSettings.codexSettings.preferredChannelWaitPollMilliseconds.help')}
+              </Alert>
             </FormControl>
           </Stack>
           <FormControl fullWidth>
+            {renderCodexFieldTitle(
+              'CodexRoutingHintSetting',
+              t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.label')
+            )}
+            <Alert severity="info" sx={{ mb: 1 }}>
+              {t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.help')}
+            </Alert>
+            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ mb: 1 }}>
+              <Button
+                variant="outlined"
+                size="small"
+                onClick={() => applyCodexTemplate('CodexRoutingHintSetting', CODEX_ROUTING_HINT_RECOMMENDED_TEMPLATE)}
+                disabled={loading}
+              >
+                {t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.useRecommended')}
+              </Button>
+              <Button
+                variant="outlined"
+                size="small"
+                onClick={() => applyCodexTemplate('CodexRoutingHintSetting', CODEX_ROUTING_HINT_DEFAULT_TEMPLATE)}
+                disabled={loading}
+              >
+                {t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.useDefault')}
+              </Button>
+            </Stack>
             <TextField
               multiline
               maxRows={20}
@@ -1126,6 +1303,26 @@ const OperationSetting = () => {
             />
           </FormControl>
           <FormControl fullWidth>
+            {renderCodexFieldTitle(
+              'ChannelAffinitySetting',
+              t('setting_index.operationSettings.codexSettings.channelAffinitySetting.label')
+            )}
+            <Alert severity="info" sx={{ mb: 1 }}>
+              {t('setting_index.operationSettings.codexSettings.channelAffinitySetting.help')}
+            </Alert>
+            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ mb: 1 }}>
+              <Button
+                variant="outlined"
+                size="small"
+                onClick={() => applyCodexTemplate('ChannelAffinitySetting', CHANNEL_AFFINITY_DEFAULT_TEMPLATE)}
+                disabled={loading}
+              >
+                {t('setting_index.operationSettings.codexSettings.channelAffinitySetting.useDefault')}
+              </Button>
+              <Button variant="outlined" size="small" onClick={() => applyCodexTemplate('ChannelAffinitySetting', '')} disabled={loading}>
+                {t('setting_index.operationSettings.codexSettings.channelAffinitySetting.useBlankDefault')}
+              </Button>
+            </Stack>
             <TextField
               multiline
               maxRows={24}
@@ -1147,6 +1344,7 @@ const OperationSetting = () => {
           >
             {t('setting_index.operationSettings.codexSettings.save')}
           </Button>
+          {renderCodexHelpDialog()}
         </Stack>
       </SubCard>
 
