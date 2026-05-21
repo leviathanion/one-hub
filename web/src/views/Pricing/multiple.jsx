@@ -303,7 +303,7 @@ export default function Multiple({ prices, reloadData, ownedby, noPriceModels })
       {/* 数据表格 */}
       <Card>
         <PerfectScrollbar component="div">
-          <TableContainer sx={{ overflow: 'unset' }}>
+          <TableContainer sx={{ overflowX: 'auto' }}>
             <Table
               sx={{
                 minWidth: 800,

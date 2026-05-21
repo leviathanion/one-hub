@@ -21,6 +21,7 @@ export default function componentStyleOverrides(theme) {
         body, #root, #root__layout {
           display: flex;
           flex: 1 1 auto;
+          min-width: 0;
           min-height: 100%;
           flex-direction: column;
         }
@@ -160,6 +161,27 @@ export default function componentStyleOverrides(theme) {
         }
       }
     },
+    MuiButtonGroup: {
+      styleOverrides: {
+        root: {
+          maxWidth: '100%',
+          '@media (max-width: 600px)': {
+            '&:not(.MuiButtonGroup-sizeSmall)': {
+              flexWrap: 'wrap',
+              gap: '8px',
+              '& .MuiButton-root': {
+                flex: '1 1 160px'
+              },
+              '& .MuiButtonGroup-grouped': {
+                borderRadius: `${theme?.customization?.borderRadius || 8}px !important`,
+                borderLeftWidth: '1px !important',
+                marginLeft: '0 !important'
+              }
+            }
+          }
+        }
+      }
+    },
     MuiPaper: {
       defaultProps: {
         elevation: 0
@@ -189,6 +211,9 @@ export default function componentStyleOverrides(theme) {
           overflow: 'hidden',
           '& .MuiTableContainer-root': {
             borderRadius: 0
+          },
+          '@media (max-width: 600px)': {
+            borderRadius: `${theme?.customization?.borderRadius || 8}px`
           }
         }
       }
@@ -215,6 +240,17 @@ export default function componentStyleOverrides(theme) {
             margin: '-24px',
             width: 'calc(100% + 48px)',
             maxWidth: 'calc(100% + 48px)'
+          },
+          '@media (max-width: 600px)': {
+            padding: '16px',
+            '&:last-child': {
+              paddingBottom: '16px'
+            },
+            '& .MuiTableContainer-root': {
+              margin: '-16px',
+              width: 'calc(100% + 32px)',
+              maxWidth: 'calc(100% + 32px)'
+            }
           }
         }
       }
@@ -573,8 +609,14 @@ export default function componentStyleOverrides(theme) {
           scrollbarWidth: 'thin',
           overflowX: 'auto',
           overflowY: 'auto',
+          maxWidth: '100%',
+          WebkitOverflowScrolling: 'touch',
           borderRadius: `${theme?.customization?.borderRadius || 8}px`,
-          boxShadow: 'none'
+          boxShadow: 'none',
+          '@media (max-width: 900px)': {
+            overflowX: 'auto !important',
+            maxWidth: '100vw'
+          }
         }
       }
     },
@@ -670,10 +712,36 @@ export default function componentStyleOverrides(theme) {
           margin: 0
         },
         toolbar: {
-          height: 64
+          minHeight: 64,
+          height: 'auto',
+          '@media (max-width: 600px)': {
+            minHeight: 56,
+            alignItems: 'center',
+            justifyContent: 'center',
+            flexWrap: 'wrap',
+            gap: '8px',
+            padding: '8px 12px',
+            '& .MuiTablePagination-spacer': {
+              display: 'none'
+            }
+          }
         },
         actions: {
-          marginRight: 8
+          marginRight: 8,
+          '@media (max-width: 600px)': {
+            marginLeft: 0,
+            marginRight: 0
+          }
+        },
+        selectLabel: {
+          '@media (max-width: 600px)': {
+            margin: 0
+          }
+        },
+        displayedRows: {
+          '@media (max-width: 600px)': {
+            margin: 0
+          }
         },
         select: {
           paddingLeft: 8,

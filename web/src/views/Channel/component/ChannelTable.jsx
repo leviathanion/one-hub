@@ -153,7 +153,7 @@ export default function ChannelTable({ tag }) {
     <>
       {searching && <LinearProgress />}
       <PerfectScrollbar component="div">
-        <TableContainer>
+        <TableContainer sx={{ overflowX: 'auto' }}>
           <Table sx={{ minWidth: 800 }}>
             <KeywordTableHead
               order={order}

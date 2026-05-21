@@ -38,7 +38,7 @@ export default function TableToolBar({ filterName, handleFilterName }) {
             placeholder="UUID"
           />
         </FormControl>
-        <FormControl sx={{ minWidth: '22%' }}>
+        <FormControl sx={{ minWidth: { xs: '100%', sm: '22%' } }}>
           <InputLabel htmlFor="channel-type-label">{t('paymentGatewayPage.tableHeaders.type')}</InputLabel>
           <Select
             id="channel-type-label"

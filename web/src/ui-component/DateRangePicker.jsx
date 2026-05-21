@@ -50,7 +50,7 @@ export default class DateRangePicker extends React.Component {
     const { startOpen, endOpen, startDate, endDate, localeText } = this.state;
 
     return (
-      <Stack direction="row" spacing={2} alignItems="center" sx={{ width: '100%' }}>
+      <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2} alignItems="center" sx={{ width: '100%' }}>
         <LocalizationProvider dateAdapter={AdapterDayjs} adapterLocale={'zh-cn'}>
           <DatePicker
             label={localeText?.start || ''}
@@ -73,7 +73,7 @@ export default class DateRangePicker extends React.Component {
             views={this.views}
             sx={{ flex: 1 }}
           />
-          <Typography variant="body" sx={{ px: 1 }}>
+          <Typography variant="body" sx={{ display: { xs: 'none', sm: 'block' }, px: 1 }}>
             {' '}
             –{' '}
           </Typography>

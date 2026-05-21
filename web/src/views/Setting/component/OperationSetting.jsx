@@ -759,10 +759,11 @@ const OperationSetting = () => {
                 />
               </LocalizationProvider>
             </FormControl>
-            <Stack direction="row" spacing={2}>
+            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2} sx={{ width: '100%' }}>
               <Button
                 variant="contained"
                 color="success"
+                sx={{ width: { xs: '100%', sm: 'auto' } }}
                 onClick={() => {
                   if (invoiceMonth) {
                     genInvoiceMonth().then();
@@ -776,6 +777,7 @@ const OperationSetting = () => {
               <Button
                 variant="contained"
                 color="warning"
+                sx={{ width: { xs: '100%', sm: 'auto' } }}
                 onClick={() => {
                   if (invoiceMonth) {
                     updateInvoiceMonth().then();

@@ -457,7 +457,7 @@ const EditModal = ({
   // 渲染单位类型切换按钮组
   const renderUnitTypeToggle = () => (
     <FormControl fullWidth sx={{ ...theme.typography.otherInput }}>
-      <Stack direction="row" spacing={2}>
+      <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
         <ToggleButtonGroup
           value={unitType}
           onChange={(event, newUnitType) => {
@@ -578,7 +578,7 @@ const EditModal = ({
 
     return (
       <FormControl fullWidth sx={{ ...theme.typography.otherInput }}>
-        <Stack direction="row" spacing={2}>
+        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
           <ToggleButtonGroup
             value={singleMode ? inputs.locked : values?.locked}
             onChange={handleLockChange}

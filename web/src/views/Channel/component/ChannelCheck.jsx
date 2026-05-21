@@ -189,19 +189,24 @@ export function ChannelCheck({ item, open, onClose }) {
 
       <DialogContent sx={{ py: 3 }}>
         <Box sx={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
-          <Stack direction="row" spacing={2}>
+          <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
             <Button
               variant="contained"
               onClick={() => getProviderModels(item)}
               disabled={providerModelsLoad}
               startIcon={<Icon icon="solar:refresh-bold" />}
+              sx={{ width: { xs: '100%', sm: 'auto' } }}
             >
               获取可用模型
             </Button>
-            <Button onClick={handleSelectAll} startIcon={<Icon icon="solar:check-square-bold" />}>
+            <Button
+              onClick={handleSelectAll}
+              startIcon={<Icon icon="solar:check-square-bold" />}
+              sx={{ width: { xs: '100%', sm: 'auto' } }}
+            >
               全选
             </Button>
-            <Button onClick={handleUnselectAll} startIcon={<Icon icon="solar:square-bold" />}>
+            <Button onClick={handleUnselectAll} startIcon={<Icon icon="solar:square-bold" />} sx={{ width: { xs: '100%', sm: 'auto' } }}>
               反选
             </Button>
           </Stack>

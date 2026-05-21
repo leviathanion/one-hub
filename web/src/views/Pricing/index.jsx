@@ -185,7 +185,13 @@ const Pricing = () => {
 
   return (
     <Stack spacing={3}>
-      <Stack direction="row" alignItems="center" justifyContent="space-between" mb={5}>
+      <Stack
+        direction={{ xs: 'column', sm: 'row' }}
+        alignItems={{ xs: 'stretch', sm: 'center' }}
+        justifyContent="space-between"
+        spacing={{ xs: 2, sm: 0 }}
+        mb={5}
+      >
         <Stack direction="column" spacing={1}>
           <Typography variant="h2">{t('pricingPage.title')}</Typography>
           <Typography variant="subtitle1" color="text.secondary">

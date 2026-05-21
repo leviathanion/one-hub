@@ -16,16 +16,21 @@ export default function TableToolBar({ placeholder }) {
   return (
     <Toolbar
       sx={{
-        height: 80,
+        minHeight: { xs: 64, sm: 80 },
+        height: 'auto',
         display: 'flex',
+        flexWrap: 'wrap',
         justifyContent: 'space-between',
-        p: (theme) => theme.spacing(0, 1, 0, 3)
+        py: { xs: 2, sm: 0 },
+        pl: { xs: 2, sm: 3 },
+        pr: { xs: 2, sm: 1 }
       }}
     >
       <OutlinedInput
         id="keyword"
         name="keyword"
         sx={{
+          width: '100%',
           minWidth: '100%',
           '& .MuiInputAdornment-root:hover': {
             '& .search-icon': {

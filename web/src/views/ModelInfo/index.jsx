@@ -123,7 +123,13 @@ export default function ModelInfo() {
 
   return (
     <>
-      <Stack direction="row" alignItems="center" justifyContent="space-between" mb={5}>
+      <Stack
+        direction={{ xs: 'column', sm: 'row' }}
+        alignItems={{ xs: 'stretch', sm: 'center' }}
+        justifyContent="space-between"
+        spacing={{ xs: 2, sm: 0 }}
+        mb={5}
+      >
         <Stack direction="column" spacing={1}>
           <Typography variant="h2">模型详情</Typography>
           <Typography variant="subtitle1" color="text.secondary">
@@ -131,7 +137,7 @@ export default function ModelInfo() {
           </Typography>
         </Stack>
 
-        <Stack direction="row" spacing={2}>
+        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
           <Button
             variant="outlined"
             color="primary"
@@ -154,8 +160,11 @@ export default function ModelInfo() {
         <Toolbar
           sx={{
             textAlign: 'right',
-            height: 50,
+            minHeight: { xs: 56, sm: 50 },
+            height: 'auto',
             display: 'flex',
+            flexWrap: 'wrap',
+            gap: 1,
             justifyContent: 'space-between',
             p: (theme) => theme.spacing(0, 1, 0, 3)
           }}
@@ -172,11 +181,11 @@ export default function ModelInfo() {
             onChange={handleSearch}
             placeholder="搜索模型标识、名称、模态或标签..."
             startAdornment={<Icon icon="eva:search-fill" style={{ color: 'text.disabled', width: 20, height: 20, marginRight: 8 }} />}
-            sx={{ height: 40, width: 600 }}
+            sx={{ height: 40, width: { xs: '100%', sm: 600 }, maxWidth: '100%' }}
           />
         </Toolbar>
         <PerfectScrollbar component="div">
-          <TableContainer sx={{ overflow: 'unset' }}>
+          <TableContainer sx={{ overflowX: 'auto' }}>
             <Table sx={{ minWidth: 800 }}>
               <KeywordTableHead
                 headLabel={[

@@ -125,7 +125,13 @@ export default function Task() {
 
   return (
     <>
-      <Stack direction="row" alignItems="center" justifyContent="space-between" mb={5}>
+      <Stack
+        direction={{ xs: 'column', sm: 'row' }}
+        alignItems={{ xs: 'stretch', sm: 'center' }}
+        justifyContent="space-between"
+        spacing={{ xs: 2, sm: 0 }}
+        mb={5}
+      >
         <Stack direction="column" spacing={1}>
           <Typography variant="h2">{t('taskPage.title')}</Typography>
           <Typography variant="subtitle1" color="text.secondary">
@@ -140,8 +146,11 @@ export default function Task() {
         <Toolbar
           sx={{
             textAlign: 'right',
-            height: 50,
+            minHeight: { xs: 56, sm: 50 },
+            height: 'auto',
             display: 'flex',
+            flexWrap: 'wrap',
+            gap: 1,
             justifyContent: 'space-between',
             p: (theme) => theme.spacing(0, 1, 0, 3)
           }}
@@ -160,7 +169,7 @@ export default function Task() {
         </Toolbar>
         {searching && <LinearProgress />}
         <PerfectScrollbar component="div">
-          <TableContainer sx={{ overflow: 'unset' }}>
+          <TableContainer sx={{ overflowX: 'auto' }}>
             <Table sx={{ minWidth: 800 }}>
               <KeywordTableHead
                 order={order}

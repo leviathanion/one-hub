@@ -207,7 +207,13 @@ export default function MultiUserStats() {
 
   return (
     <>
-      <Stack direction="row" alignItems="center" justifyContent="space-between" mb={5}>
+      <Stack
+        direction={{ xs: 'column', sm: 'row' }}
+        alignItems={{ xs: 'stretch', sm: 'center' }}
+        justifyContent="space-between"
+        spacing={{ xs: 2, sm: 0 }}
+        mb={5}
+      >
         <Stack direction="column" spacing={1}>
           <Typography variant="h2">多用户令牌统计</Typography>
           <Typography variant="subtitle1" color="text.secondary">
@@ -231,7 +237,7 @@ export default function MultiUserStats() {
           />
 
           <LocalizationProvider dateAdapter={AdapterDayjs}>
-            <Stack direction="row" spacing={2}>
+            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
               <DatePicker
                 label="开始日期"
                 value={startDate}
@@ -249,12 +255,13 @@ export default function MultiUserStats() {
             </Stack>
           </LocalizationProvider>
 
-          <Stack direction="row" spacing={2}>
+          <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
             <Button
               variant="contained"
               onClick={handleSearch}
               disabled={searching}
               startIcon={<Icon icon="solar:magnifer-bold-duotone" width={20} />}
+              sx={{ width: { xs: '100%', sm: 'auto' } }}
             >
               查询统计
             </Button>
@@ -263,6 +270,7 @@ export default function MultiUserStats() {
               onClick={handleExportCSV}
               disabled={searching || statistics.length === 0}
               startIcon={<Icon icon="solar:download-bold-duotone" width={20} />}
+              sx={{ width: { xs: '100%', sm: 'auto' } }}
             >
               导出CSV
             </Button>

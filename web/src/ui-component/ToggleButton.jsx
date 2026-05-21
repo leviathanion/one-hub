@@ -7,6 +7,9 @@ const StyledToggleButtonGroup = styled(MuiToggleButtonGroup)(({ theme }) => ({
   border: `1px solid ${theme.palette.divider}`,
   borderRadius: '8px',
   padding: '2px',
+  maxWidth: '100%',
+  flexWrap: 'wrap',
+  gap: '2px',
   '& .MuiToggleButton-root': {
     border: 'none',
     borderRadius: '6px',

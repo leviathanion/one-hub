@@ -237,6 +237,7 @@ const ChatLinksDataGrid = ({ links, onChange }) => {
     <Box
       sx={{
         width: '100%',
+        overflowX: 'auto',
         '& .actions': {
           color: 'text.secondary'
         },
@@ -249,6 +250,7 @@ const ChatLinksDataGrid = ({ links, onChange }) => {
         autoHeight
         rows={rows}
         columns={modelRatioColumns}
+        sx={{ minWidth: { xs: 920, md: '100%' } }}
         editMode="row"
         hideFooter
         disableRowSelectionOnClick

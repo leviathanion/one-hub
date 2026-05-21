@@ -97,16 +97,26 @@ export default function InvoiceDetail() {
 
   return (
     <Container maxWidth="lg" sx={{ mt: 6, mb: 6 }}>
-      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 4 }}>
+      <Box
+        sx={{
+          display: 'flex',
+          flexDirection: { xs: 'column', sm: 'row' },
+          alignItems: { xs: 'stretch', sm: 'center' },
+          justifyContent: 'space-between',
+          gap: 2,
+          mb: 4
+        }}
+      >
         <Typography variant="h2">{t('invoice_index.invoice')}</Typography>
-        <Stack direction="row" spacing={2}>
+        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
           <Button
             variant="outlined"
             startIcon={<Icon icon="solar:arrow-left-bold-duotone" width={18} />}
             onClick={handleReturn}
             sx={{
               borderRadius: '8px',
-              px: 2
+              px: 2,
+              width: { xs: '100%', sm: 'auto' }
             }}
           >
             {t('back')}
