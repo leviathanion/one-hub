@@ -1030,21 +1030,154 @@
       "codexSettings": {
         "title": "Codex 高度な設定",
         "description": "これらの設定は個別の Codex チャネルではなく、グローバル option として保存されます。CodexRoutingHintSetting と ChannelAffinitySetting には JSON を直接入力でき、空欄の場合はバックエンドのデフォルト値に戻ります。待機時間の単位はどちらもミリ秒です。",
+        "globalWarning": "これらの設定はすべてのユーザーとすべての Codex チャネルに影響します。affinity / prompt_cache_key を調整しない場合は、推奨テンプレートを使い、ChannelAffinitySetting はデフォルトのままにしてください。",
         "preferredChannelWaitMilliseconds": {
           "label": "優先チャネル待機時間（ミリ秒）",
-          "placeholder": "例：250"
+          "placeholder": "例：250",
+          "help": "履歴 affinity の優先チャネルがクールダウン中の場合に、最大でどれだけ待つかを指定します。0 は待機なしです。250-500ms は同一チャネル再利用率を上げますが、遅延が増えます。"
         },
         "preferredChannelWaitPollMilliseconds": {
           "label": "優先チャネルのポーリング待機時間（ミリ秒）",
-          "placeholder": "例：50"
+          "placeholder": "例：50",
+          "help": "待機中に優先チャネルの復帰を確認する間隔です。通常は 50ms のままで十分です。小さすぎるとポーリング負荷が増え、大きすぎると復帰検知が遅くなります。"
         },
         "codexRoutingHintSetting": {
           "label": "CodexRoutingHintSetting",
-          "placeholder": "{\n  \"prompt_cache_key_strategy\": \"auto\",\n  \"model_regex\": \"^gpt-5$\"\n}"
+          "placeholder": "{\n  \"prompt_cache_key_strategy\": \"auto\",\n  \"model_regex\": \"^gpt-5$\"\n}",
+          "help": "Codex チャネル選択前に one-hub が安定した prompt_cache_key hint を生成するかを制御します。auto は session_id、認証ヘッダー、token id、user id の順で使います。off は生成しません。",
+          "useRecommended": "推奨テンプレートを使用",
+          "useDefault": "off テンプレートを使用"
         },
         "channelAffinitySetting": {
           "label": "ChannelAffinitySetting",
-          "placeholder": "{\n  \"enabled\": true,\n  \"default_ttl_seconds\": 3600,\n  \"max_entries\": 50000,\n  \"rules\": []\n}"
+          "placeholder": "{\n  \"enabled\": true,\n  \"default_ttl_seconds\": 3600,\n  \"max_entries\": 50000\n}",
+          "help": "チャネル affinity キャッシュとルールを制御します。組み込みのデフォルトルールは Responses continuation、prompt_cache_key、Realtime session をすでにカバーしています。rules: [] はルールを消すため指定しないでください。",
+          "useDefault": "デフォルトルールテンプレートを使用",
+          "useBlankDefault": "空欄でバックエンドデフォルト"
+        },
+        "helpDialog": {
+          "open": "設定ヘルプを表示",
+          "close": "閉じる",
+          "PreferredChannelWaitMilliseconds": {
+            "title": "優先チャネル待機時間（ミリ秒）",
+            "meaning": {
+              "title": "何をする設定か",
+              "body": "channel affinity が過去の優先チャネルを見つけたものの、そのチャネルが cooldown 中の場合に、one-hub が復帰を短時間待つかどうかを制御します。"
+            },
+            "legalValues": {
+              "title": "有効な値",
+              "body": "0 以上の整数、単位はミリ秒です。\n0 は待機しないことを意味します。\n例：0、250、500。"
+            },
+            "defaultValue": {
+              "title": "デフォルト",
+              "body": "0。デフォルトでは待機せず、低遅延と可用性を優先します。"
+            },
+            "recommended": {
+              "title": "設定方法",
+              "body": "迷う場合は 0 のままにします。\nCodex continuation、prompt cache、realtime session を元のチャネルへ戻しやすくしたい場合は 250 を試します。\n同一チャネル再利用をより重視し、追加遅延を許容できる場合のみ 500 を検討します。"
+            },
+            "impact": {
+              "title": "影響",
+              "body": "値が大きいほど、履歴チャネルの復帰を待つ機会が増え、同一チャネル再利用率が上がります。ただしリクエストがその分待つ可能性があります。"
+            },
+            "risk": {
+              "title": "リスクとトレードオフ",
+              "body": "大きすぎる値は tail latency を増やします。この設定は利用不能なチャネルを利用可能にするものではありません。待機後は strict / non-strict のルールに従って失敗またはフォールバックします。"
+            }
+          },
+          "PreferredChannelWaitPollMilliseconds": {
+            "title": "優先チャネルのポーリング待機時間（ミリ秒）",
+            "meaning": {
+              "title": "何をする設定か",
+              "body": "優先チャネルが cooldown から復帰するのを待っている間、この間隔で復帰状態を確認します。"
+            },
+            "legalValues": {
+              "title": "有効な値",
+              "body": "0 以上の整数、単位はミリ秒です。\n0 または負数の場合、実行時には 50ms に戻ります。\n例：25、50、100。"
+            },
+            "defaultValue": {
+              "title": "デフォルト",
+              "body": "50。"
+            },
+            "recommended": {
+              "title": "設定方法",
+              "body": "通常は 50 のままで十分です。\n待機予算が短く、より早く復帰を検知したい場合のみ 25 を検討します。\nインスタンス負荷が高い場合は 100 を検討できます。"
+            },
+            "impact": {
+              "title": "影響",
+              "body": "小さいほど復帰検知は速くなりますが、ポーリング回数が増えます。大きいほど負荷は下がりますが、最大で 1 ポーリング分余計に待つ可能性があります。"
+            },
+            "risk": {
+              "title": "リスクとトレードオフ",
+              "body": "PreferredChannelWaitMilliseconds が 0 より大きく、優先チャネルが cooldown 中の場合だけ有効です。単独で調整しても通常は効果がありません。"
+            }
+          },
+          "CodexRoutingHintSetting": {
+            "title": "CodexRoutingHintSetting",
+            "meaning": {
+              "title": "何をする設定か",
+              "body": "Codex チャネルを選択する前に、Responses リクエスト向けの安定した responses.prompt_cache_key hint を one-hub が生成するかを制御します。この hint は ChannelAffinitySetting に読み取られ、同じ identity のリクエストを同じチャネルへ戻しやすくします。"
+            },
+            "legalValues": {
+              "title": "有効な JSON フィールド",
+              "body": "prompt_cache_key_strategy：off、auto、session_id、auth_header、token_id、user_id。\nmodel_regex：任意、有効な正規表現。マッチしたモデルだけに適用します。\nuser_agent_regex：任意、有効な正規表現。マッチした User-Agent だけに適用します。"
+            },
+            "strategies": {
+              "title": "strategy の選び方",
+              "body": "off：routing hint を生成しません。\nauto：session_id -> auth_header -> token_id -> user_id の順で安定 identity を選びます。推奨です。\nsession_id：x-session-id / session_id のみ。\nauth_header：リクエスト認証情報のみ。\ntoken_id：one-hub token のみ。\nuser_id：one-hub ユーザーのみ。"
+            },
+            "filters": {
+              "title": "フィルタ",
+              "body": "model_regex と user_agent_regex が空の場合、すべての Responses リクエストに適用されます。\n範囲を絞るには正規表現を使います。例：model_regex に ^gpt-5$ を設定します。"
+            },
+            "recommended": {
+              "title": "設定方法",
+              "body": "推奨テンプレート：{\"prompt_cache_key_strategy\":\"auto\",\"model_regex\":\"^gpt-5$\"}\n影響範囲が不明な場合は、まずモデルで絞り、確認後に広げます。"
+            },
+            "impact": {
+              "title": "影響",
+              "body": "リクエストが prompt_cache_key を明示していない場合でも、ルーティング段階で安定 key を得られ、provider 選択前に channel affinity を命中させられます。"
+            },
+            "risk": {
+              "title": "リスクとトレードオフ",
+              "body": "token_id や user_id は同じ token / ユーザーのトラフィックを同じチャネルへ寄せやすくし、再利用は強くなりますが負荷が集中する可能性があります。Codex チャネル側の prompt_cache_key_strategy も同じ方針に揃えることを推奨します。"
+            }
+          },
+          "ChannelAffinitySetting": {
+            "title": "ChannelAffinitySetting",
+            "meaning": {
+              "title": "何をする設定か",
+              "body": "チャネル affinity キャッシュを制御します。どのリクエストで identity -> channel を記録し、次回同じ identity が来たときに前回成功したチャネルを優先するかを決めます。"
+            },
+            "topLevel": {
+              "title": "トップレベルフィールド",
+              "body": "enabled：全体スイッチ。\ndefault_ttl_seconds：記録のデフォルト保持秒数。\nmax_entries：ローカルメモリキャッシュの最大件数。\nrules：ルール一覧。rules を省略すると backend デフォルトを使い、rules: [] は全ルールを消します。"
+            },
+            "ruleFields": {
+              "title": "rules フィールド",
+              "body": "name：ルール名。\nenabled：有効かどうか。\nkind：responses または realtime。\nmodel_regex / path_regex / user_agent_regex：マッチ条件。\ninclude_group / include_model / include_path / include_rule_name：affinity key に含める分離次元。\nstrict：優先チャネルが使えない場合にフォールバックせず失敗させるか。\nskip_retry_on_failure：優先チャネル失敗後に retry を省略するか。\nrecord_on_success：成功後に affinity 記録を書き戻すか。\nttl_seconds：このルールの記録保持秒数。"
+            },
+            "keySources": {
+              "title": "key_sources フィールド",
+              "body": "source：request_field、header、query、request_hint。\nkey：読み取るフィールド名。\nalias：identity 種別名。例：prompt_cache_key、response_id、session_id。\nvalue_regex：任意。取得した値をさらにフィルタします。"
+            },
+            "defaults": {
+              "title": "デフォルトルール",
+              "body": "デフォルトでは 3 つのルールがあります：\nresponses-continuation：previous_response_id で元チャネルへ戻します。strict=true。\nresponses-prompt-cache-key：prompt_cache_key または responses.prompt_cache_key hint を使います。\nrealtime-session：x-session-id / session_id を使います。"
+            },
+            "recommended": {
+              "title": "設定方法",
+              "body": "ほとんどのケースで rules は変更しないでください。\n容量や TTL だけを変える場合は enabled、default_ttl_seconds、max_entries だけを設定します。\nbackend デフォルトへ戻す最も安全な方法は空欄にすることです。"
+            },
+            "impact": {
+              "title": "影響",
+              "body": "continuation、prompt cache、realtime session が元チャネルへ戻りやすくなり、チャネルをまたいだコンテキスト喪失や cache miss を減らします。"
+            },
+            "risk": {
+              "title": "リスクとトレードオフ",
+              "body": "strict=true は一貫性を高めますが可用性を下げます。ignore_preferred_cooldown=true はより強く元チャネルへ戻そうとします。rules: [] は全デフォルト affinity ルールを無効化します。変更前に現在の設定をコピーしてください。"
+            }
+          }
         },
         "errors": {
           "invalidWaitMilliseconds": "優先チャネル待機時間は 0 以上の整数で入力してください",

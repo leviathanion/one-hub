@@ -943,21 +943,154 @@
       "codexSettings": {
         "title": "Codex 高级配置",
         "description": "这些配置走全局 option，不属于单个 Codex 渠道。CodexRoutingHintSetting 和 ChannelAffinitySetting 支持直接填写 JSON，留空时会回到后端默认值。两个等待时间单位都是毫秒。",
+        "globalWarning": "这些配置会影响所有用户和所有 Codex 渠道。不了解 affinity / prompt_cache_key 时，建议只使用推荐模板，ChannelAffinitySetting 保持默认。",
         "preferredChannelWaitMilliseconds": {
           "label": "首选渠道等待时间（毫秒）",
-          "placeholder": "例如：250"
+          "placeholder": "例如：250",
+          "help": "命中历史亲和渠道但该渠道正在冷却时，最多等待多久。0 表示不等待；250-500ms 可提高回原渠道概率，但会增加请求延迟。"
         },
         "preferredChannelWaitPollMilliseconds": {
           "label": "首选渠道轮询等待时间（毫秒）",
-          "placeholder": "例如：50"
+          "placeholder": "例如：50",
+          "help": "等待首选渠道恢复时的检查间隔。通常保持 50ms；过小会增加轮询开销，过大会让等待更钝。"
         },
         "codexRoutingHintSetting": {
           "label": "CodexRoutingHintSetting",
-          "placeholder": "{\n  \"prompt_cache_key_strategy\": \"auto\",\n  \"model_regex\": \"^gpt-5$\"\n}"
+          "placeholder": "{\n  \"prompt_cache_key_strategy\": \"auto\",\n  \"model_regex\": \"^gpt-5$\"\n}",
+          "help": "控制 one-hub 是否在选择 Codex 渠道前自动生成稳定的 prompt_cache_key hint。推荐 auto：优先直接使用 previous_response_id，其次 session_id、认证头、token id、user id。off 表示不生成。",
+          "useRecommended": "使用推荐模板",
+          "useDefault": "使用关闭模板"
         },
         "channelAffinitySetting": {
           "label": "ChannelAffinitySetting",
-          "placeholder": "{\n  \"enabled\": true,\n  \"default_ttl_seconds\": 3600,\n  \"max_entries\": 50000,\n  \"rules\": []\n}"
+          "placeholder": "{\n  \"enabled\": true,\n  \"default_ttl_seconds\": 3600,\n  \"max_entries\": 50000\n}",
+          "help": "控制渠道亲和缓存和规则。默认规则已覆盖 Responses continuation、prompt_cache_key 和 Realtime session；不要填写 rules: []，那会清空规则。",
+          "useDefault": "使用默认规则模板",
+          "useBlankDefault": "留空使用后端默认"
+        },
+        "helpDialog": {
+          "open": "查看配置说明",
+          "close": "关闭",
+          "PreferredChannelWaitMilliseconds": {
+            "title": "首选渠道等待时间（毫秒）",
+            "meaning": {
+              "title": "这个配置做什么",
+              "body": "当请求通过 channel affinity 命中了一个历史首选渠道，但这个渠道当前处于 cooldown 时，one-hub 是否愿意等它一小段时间恢复。"
+            },
+            "legalValues": {
+              "title": "合法值",
+              "body": "非负整数，单位毫秒。\n0 表示不等待。\n示例：0、250、500。"
+            },
+            "defaultValue": {
+              "title": "默认值",
+              "body": "0。默认不等待，优先保证低延迟和可用性。"
+            },
+            "recommended": {
+              "title": "怎么配",
+              "body": "不确定时填 0。\n如果你希望 Codex continuation、prompt cache 或 realtime session 更容易回到原渠道，可试 250。\n对同渠道复用要求更强、能接受额外延迟时再考虑 500。"
+            },
+            "impact": {
+              "title": "配置后的影响",
+              "body": "值越大，命中历史渠道后等待它恢复的机会越多，同渠道复用概率越高；同时请求可能多等这段时间。"
+            },
+            "risk": {
+              "title": "风险和取舍",
+              "body": "过大会抬高尾延迟。这个配置不会让不可用渠道变可用，等待耗尽后仍会按 strict / 非 strict 规则决定失败或回退。"
+            }
+          },
+          "PreferredChannelWaitPollMilliseconds": {
+            "title": "首选渠道轮询等待时间（毫秒）",
+            "meaning": {
+              "title": "这个配置做什么",
+              "body": "当系统正在等待首选渠道退出 cooldown 时，按这个间隔检查一次渠道是否恢复。"
+            },
+            "legalValues": {
+              "title": "合法值",
+              "body": "非负整数，单位毫秒。\n如果填 0 或负数，运行时会回退到 50ms。\n示例：25、50、100。"
+            },
+            "defaultValue": {
+              "title": "默认值",
+              "body": "50。"
+            },
+            "recommended": {
+              "title": "怎么配",
+              "body": "保持 50 即可。\n只有在你明确知道等待预算很短且希望更快发现恢复时，才考虑 25。\n如果实例压力较大，可考虑 100。"
+            },
+            "impact": {
+              "title": "配置后的影响",
+              "body": "值越小，发现首选渠道恢复越快，但轮询次数越多；值越大，开销更低，但可能多等一个轮询周期。"
+            },
+            "risk": {
+              "title": "风险和取舍",
+              "body": "这个值只在 PreferredChannelWaitMilliseconds 大于 0 且命中的首选渠道正在 cooldown 时生效。单独调它通常没有意义。"
+            }
+          },
+          "CodexRoutingHintSetting": {
+            "title": "CodexRoutingHintSetting",
+            "meaning": {
+              "title": "这个配置做什么",
+              "body": "控制 one-hub 是否在选择 Codex 渠道前，为 Responses 请求自动派生稳定的 responses.prompt_cache_key hint。这个 hint 会被 ChannelAffinitySetting 读取，用来让同一身份的请求优先回到同一渠道。"
+            },
+            "legalValues": {
+              "title": "合法 JSON 字段",
+              "body": "prompt_cache_key_strategy：off、auto、session_id、auth_header、token_id、user_id。\nmodel_regex：可选，合法正则；只对匹配模型生效。\nuser_agent_regex：可选，合法正则；只对匹配 User-Agent 生效。"
+            },
+            "strategies": {
+              "title": "strategy 怎么选",
+              "body": "off：不生成 routing hint。\nauto：按 previous_response_id -> session_id -> auth_header -> token_id -> user_id 选择稳定身份；previous_response_id 直接作为 prompt_cache_key，推荐。\nsession_id：只按 x-session-id / session_id。\nauth_header：只按请求认证信息。\ntoken_id：只按 one-hub token。\nuser_id：只按 one-hub 用户。"
+            },
+            "filters": {
+              "title": "过滤条件",
+              "body": "model_regex 和 user_agent_regex 都为空时，对所有 Responses 请求生效。\n如果只想对 Codex CLI 或指定模型生效，可以加正则，例如 model_regex 使用 ^gpt-5$。"
+            },
+            "recommended": {
+              "title": "怎么配",
+              "body": "推荐模板：{\"prompt_cache_key_strategy\":\"auto\",\"model_regex\":\"^gpt-5$\"}\n如果你不确定影响范围，先限制模型；确认没问题后再放宽。"
+            },
+            "impact": {
+              "title": "配置后的影响",
+              "body": "开启后，请求没显式传 prompt_cache_key 时，路由阶段也能获得稳定 key，从而在选择 provider 前命中 channel affinity。"
+            },
+            "risk": {
+              "title": "风险和取舍",
+              "body": "选择 token_id 或 user_id 会让同 token / 同用户的请求更倾向同一渠道，复用更强但负载可能更集中。建议同时让 Codex 渠道的 prompt_cache_key_strategy 保持同样策略，避免路由 hint 和上游实际 key 不一致。"
+            }
+          },
+          "ChannelAffinitySetting": {
+            "title": "ChannelAffinitySetting",
+            "meaning": {
+              "title": "这个配置做什么",
+              "body": "控制渠道亲和缓存：哪些请求会记录 identity -> channel，下一次相同 identity 是否优先回到上次成功的渠道。"
+            },
+            "topLevel": {
+              "title": "顶层字段",
+              "body": "enabled：总开关。\ndefault_ttl_seconds：记录默认保留秒数。\nmax_entries：本地内存缓存最大条数。\nrules：规则列表；不填 rules 会使用后端默认规则，填 rules: [] 会清空规则。"
+            },
+            "ruleFields": {
+              "title": "rules 字段",
+              "body": "name：规则名。\nenabled：是否启用。\nkind：responses 或 realtime。\nmodel_regex / path_regex / user_agent_regex：匹配条件。\ninclude_group / include_model / include_path / include_rule_name：是否把这些维度拼进 affinity key。\nstrict：首选渠道不可用时是否直接失败。\nskip_retry_on_failure：首选渠道失败后是否跳过重试。\nrecord_on_success：成功后是否写回亲和记录。\nttl_seconds：本规则记录保留秒数。"
+            },
+            "keySources": {
+              "title": "key_sources 字段",
+              "body": "source：request_field、header、query、request_hint。\nkey：要读取的字段名。\nalias：identity 类型名，例如 prompt_cache_key、response_id、session_id。\nvalue_regex：可选，对取到的值再做过滤。"
+            },
+            "defaults": {
+              "title": "默认规则",
+              "body": "默认包含三条规则：\nresponses-continuation：按 previous_response_id 回原渠道，strict=true。\nresponses-prompt-cache-key：按 prompt_cache_key 或 responses.prompt_cache_key hint 回原渠道。\nrealtime-session：按 x-session-id / session_id 回原渠道。"
+            },
+            "recommended": {
+              "title": "怎么配",
+              "body": "大多数场景不要改 rules。\n只想调整容量或 TTL 时，只填 enabled、default_ttl_seconds、max_entries 即可。\n想恢复默认，留空最稳。"
+            },
+            "impact": {
+              "title": "配置后的影响",
+              "body": "开启后，continuation、prompt cache、realtime session 更容易命中原渠道，减少跨渠道上下文丢失或缓存失效。"
+            },
+            "risk": {
+              "title": "风险和取舍",
+              "body": "strict=true 会提升一致性但降低可用性；ignore_preferred_cooldown=true 会更激进地回原渠道；rules: [] 会关闭所有默认亲和规则。修改前建议先复制当前配置。"
+            }
+          }
         },
         "errors": {
           "invalidWaitMilliseconds": "Codex 首选渠道等待时间必须是非负整数",

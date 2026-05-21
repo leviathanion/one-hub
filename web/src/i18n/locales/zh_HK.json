@@ -1032,21 +1032,154 @@
       "codexSettings": {
         "title": "Codex 高級配置",
         "description": "這些配置走全局 option，不屬於單個 Codex 通道。CodexRoutingHintSetting 和 ChannelAffinitySetting 支持直接填寫 JSON，留空時會回到後端默認值。兩個等待時間單位都是毫秒。",
+        "globalWarning": "這些配置會影響所有用戶和所有 Codex 通道。不了解 affinity / prompt_cache_key 時，建議只使用推薦模板，ChannelAffinitySetting 保持默認。",
         "preferredChannelWaitMilliseconds": {
           "label": "首選通道等待時間（毫秒）",
-          "placeholder": "例如：250"
+          "placeholder": "例如：250",
+          "help": "命中歷史親和通道但該通道正在冷卻時，最多等待多久。0 表示不等待；250-500ms 可提高回原通道概率，但會增加請求延遲。"
         },
         "preferredChannelWaitPollMilliseconds": {
           "label": "首選通道輪詢等待時間（毫秒）",
-          "placeholder": "例如：50"
+          "placeholder": "例如：50",
+          "help": "等待首選通道恢復時的檢查間隔。通常保持 50ms；過小會增加輪詢開銷，過大會讓等待更鈍。"
         },
         "codexRoutingHintSetting": {
           "label": "CodexRoutingHintSetting",
-          "placeholder": "{\n  \"prompt_cache_key_strategy\": \"auto\",\n  \"model_regex\": \"^gpt-5$\"\n}"
+          "placeholder": "{\n  \"prompt_cache_key_strategy\": \"auto\",\n  \"model_regex\": \"^gpt-5$\"\n}",
+          "help": "控制 one-hub 是否在選擇 Codex 通道前自動生成穩定的 prompt_cache_key hint。推薦 auto：優先按 session_id，其次認證頭、token id、user id。off 表示不生成。",
+          "useRecommended": "使用推薦模板",
+          "useDefault": "使用關閉模板"
         },
         "channelAffinitySetting": {
           "label": "ChannelAffinitySetting",
-          "placeholder": "{\n  \"enabled\": true,\n  \"default_ttl_seconds\": 3600,\n  \"max_entries\": 50000,\n  \"rules\": []\n}"
+          "placeholder": "{\n  \"enabled\": true,\n  \"default_ttl_seconds\": 3600,\n  \"max_entries\": 50000\n}",
+          "help": "控制通道親和緩存和規則。默認規則已覆蓋 Responses continuation、prompt_cache_key 和 Realtime session；不要填寫 rules: []，那會清空規則。",
+          "useDefault": "使用默認規則模板",
+          "useBlankDefault": "留空使用後端默認"
+        },
+        "helpDialog": {
+          "open": "查看配置說明",
+          "close": "關閉",
+          "PreferredChannelWaitMilliseconds": {
+            "title": "首選通道等待時間（毫秒）",
+            "meaning": {
+              "title": "這個配置做什麼",
+              "body": "當請求通過 channel affinity 命中一個歷史首選通道，但該通道目前處於 cooldown 時，one-hub 是否願意等它一小段時間恢復。"
+            },
+            "legalValues": {
+              "title": "合法值",
+              "body": "非負整數，單位毫秒。\n0 表示不等待。\n示例：0、250、500。"
+            },
+            "defaultValue": {
+              "title": "默認值",
+              "body": "0。默認不等待，優先保證低延遲和可用性。"
+            },
+            "recommended": {
+              "title": "怎麼配",
+              "body": "不確定時填 0。\n如果你希望 Codex continuation、prompt cache 或 realtime session 更容易回到原通道，可試 250。\n對同通道復用要求更強、能接受額外延遲時再考慮 500。"
+            },
+            "impact": {
+              "title": "配置後的影響",
+              "body": "值越大，命中歷史通道後等待它恢復的機會越多，同通道復用概率越高；同時請求可能多等這段時間。"
+            },
+            "risk": {
+              "title": "風險和取捨",
+              "body": "過大會抬高尾延遲。這個配置不會讓不可用通道變可用，等待耗盡後仍會按 strict / 非 strict 規則決定失敗或回退。"
+            }
+          },
+          "PreferredChannelWaitPollMilliseconds": {
+            "title": "首選通道輪詢等待時間（毫秒）",
+            "meaning": {
+              "title": "這個配置做什麼",
+              "body": "當系統正在等待首選通道退出 cooldown 時，按這個間隔檢查一次通道是否恢復。"
+            },
+            "legalValues": {
+              "title": "合法值",
+              "body": "非負整數，單位毫秒。\n如果填 0 或負數，運行時會回退到 50ms。\n示例：25、50、100。"
+            },
+            "defaultValue": {
+              "title": "默認值",
+              "body": "50。"
+            },
+            "recommended": {
+              "title": "怎麼配",
+              "body": "保持 50 即可。\n只有在你明確知道等待預算很短且希望更快發現恢復時，才考慮 25。\n如果實例壓力較大，可考慮 100。"
+            },
+            "impact": {
+              "title": "配置後的影響",
+              "body": "值越小，發現首選通道恢復越快，但輪詢次數越多；值越大，開銷更低，但可能多等一個輪詢週期。"
+            },
+            "risk": {
+              "title": "風險和取捨",
+              "body": "這個值只在 PreferredChannelWaitMilliseconds 大於 0 且命中的首選通道正在 cooldown 時生效。單獨調它通常沒有意義。"
+            }
+          },
+          "CodexRoutingHintSetting": {
+            "title": "CodexRoutingHintSetting",
+            "meaning": {
+              "title": "這個配置做什麼",
+              "body": "控制 one-hub 是否在選擇 Codex 通道前，為 Responses 請求自動派生穩定的 responses.prompt_cache_key hint。這個 hint 會被 ChannelAffinitySetting 讀取，用來讓同一身份的請求優先回到同一通道。"
+            },
+            "legalValues": {
+              "title": "合法 JSON 字段",
+              "body": "prompt_cache_key_strategy：off、auto、session_id、auth_header、token_id、user_id。\nmodel_regex：可選，合法正則；只對匹配模型生效。\nuser_agent_regex：可選，合法正則；只對匹配 User-Agent 生效。"
+            },
+            "strategies": {
+              "title": "strategy 怎麼選",
+              "body": "off：不生成 routing hint。\nauto：按 session_id -> auth_header -> token_id -> user_id 選擇穩定身份，推薦。\nsession_id：只按 x-session-id / session_id。\nauth_header：只按請求認證信息。\ntoken_id：只按 one-hub token。\nuser_id：只按 one-hub 用戶。"
+            },
+            "filters": {
+              "title": "過濾條件",
+              "body": "model_regex 和 user_agent_regex 都為空時，對所有 Responses 請求生效。\n如果只想對 Codex CLI 或指定模型生效，可以加正則，例如 model_regex 使用 ^gpt-5$。"
+            },
+            "recommended": {
+              "title": "怎麼配",
+              "body": "推薦模板：{\"prompt_cache_key_strategy\":\"auto\",\"model_regex\":\"^gpt-5$\"}\n如果你不確定影響範圍，先限制模型；確認沒問題後再放寬。"
+            },
+            "impact": {
+              "title": "配置後的影響",
+              "body": "開啟後，請求沒顯式傳 prompt_cache_key 時，路由階段也能獲得穩定 key，從而在選擇 provider 前命中 channel affinity。"
+            },
+            "risk": {
+              "title": "風險和取捨",
+              "body": "選擇 token_id 或 user_id 會讓同 token / 同用戶的請求更傾向同一通道，復用更強但負載可能更集中。建議同時讓 Codex 通道的 prompt_cache_key_strategy 保持同樣策略，避免路由 hint 和上游實際 key 不一致。"
+            }
+          },
+          "ChannelAffinitySetting": {
+            "title": "ChannelAffinitySetting",
+            "meaning": {
+              "title": "這個配置做什麼",
+              "body": "控制通道親和緩存：哪些請求會記錄 identity -> channel，下一次相同 identity 是否優先回到上次成功的通道。"
+            },
+            "topLevel": {
+              "title": "頂層字段",
+              "body": "enabled：總開關。\ndefault_ttl_seconds：記錄默認保留秒數。\nmax_entries：本地內存緩存最大條數。\nrules：規則列表；不填 rules 會使用後端默認規則，填 rules: [] 會清空規則。"
+            },
+            "ruleFields": {
+              "title": "rules 字段",
+              "body": "name：規則名。\nenabled：是否啟用。\nkind：responses 或 realtime。\nmodel_regex / path_regex / user_agent_regex：匹配條件。\ninclude_group / include_model / include_path / include_rule_name：是否把這些維度拼進 affinity key。\nstrict：首選通道不可用時是否直接失敗。\nskip_retry_on_failure：首選通道失敗後是否跳過重試。\nrecord_on_success：成功後是否寫回親和記錄。\nttl_seconds：本規則記錄保留秒數。"
+            },
+            "keySources": {
+              "title": "key_sources 字段",
+              "body": "source：request_field、header、query、request_hint。\nkey：要讀取的字段名。\nalias：identity 類型名，例如 prompt_cache_key、response_id、session_id。\nvalue_regex：可選，對取到的值再做過濾。"
+            },
+            "defaults": {
+              "title": "默認規則",
+              "body": "默認包含三條規則：\nresponses-continuation：按 previous_response_id 回原通道，strict=true。\nresponses-prompt-cache-key：按 prompt_cache_key 或 responses.prompt_cache_key hint 回原通道。\nrealtime-session：按 x-session-id / session_id 回原通道。"
+            },
+            "recommended": {
+              "title": "怎麼配",
+              "body": "大多數場景不要改 rules。\n只想調整容量或 TTL 時，只填 enabled、default_ttl_seconds、max_entries 即可。\n想恢復默認，留空最穩。"
+            },
+            "impact": {
+              "title": "配置後的影響",
+              "body": "開啟後，continuation、prompt cache、realtime session 更容易命中原通道，減少跨通道上下文丟失或緩存失效。"
+            },
+            "risk": {
+              "title": "風險和取捨",
+              "body": "strict=true 會提升一致性但降低可用性；ignore_preferred_cooldown=true 會更激進地回原通道；rules: [] 會關閉所有默認親和規則。修改前建議先複製當前配置。"
+            }
+          }
         },
         "errors": {
           "invalidWaitMilliseconds": "Codex 首選通道等待時間必須是非負整數",

@@ -1042,21 +1042,154 @@
       "codexSettings": {
         "title": "Codex Advanced Settings",
         "description": "These settings are stored as global options rather than per-channel Codex configuration. CodexRoutingHintSetting and ChannelAffinitySetting accept raw JSON, and blank values fall back to backend defaults. Both wait values are in milliseconds.",
+        "globalWarning": "These settings affect all users and all Codex channels. If you are not tuning affinity or prompt_cache_key behavior, use the recommended template and keep ChannelAffinitySetting on defaults.",
         "preferredChannelWaitMilliseconds": {
           "label": "Preferred Channel Wait (ms)",
-          "placeholder": "e.g. 250"
+          "placeholder": "e.g. 250",
+          "help": "When a historical affinity channel is in cooldown, this is the maximum time to wait for it. 0 means no wait; 250-500ms can improve same-channel reuse but adds latency."
         },
         "preferredChannelWaitPollMilliseconds": {
           "label": "Preferred Channel Poll Wait (ms)",
-          "placeholder": "e.g. 50"
+          "placeholder": "e.g. 50",
+          "help": "How often to check whether the preferred channel has recovered while waiting. 50ms is usually enough; lower values add polling overhead, higher values react more slowly."
         },
         "codexRoutingHintSetting": {
           "label": "CodexRoutingHintSetting",
-          "placeholder": "{\n  \"prompt_cache_key_strategy\": \"auto\",\n  \"model_regex\": \"^gpt-5$\"\n}"
+          "placeholder": "{\n  \"prompt_cache_key_strategy\": \"auto\",\n  \"model_regex\": \"^gpt-5$\"\n}",
+          "help": "Controls whether one-hub derives a stable prompt_cache_key hint before Codex channel selection. auto directly prefers previous_response_id, then session_id, auth header, token id, and user id. off disables hint generation.",
+          "useRecommended": "Use recommended template",
+          "useDefault": "Use off template"
         },
         "channelAffinitySetting": {
           "label": "ChannelAffinitySetting",
-          "placeholder": "{\n  \"enabled\": true,\n  \"default_ttl_seconds\": 3600,\n  \"max_entries\": 50000,\n  \"rules\": []\n}"
+          "placeholder": "{\n  \"enabled\": true,\n  \"default_ttl_seconds\": 3600,\n  \"max_entries\": 50000\n}",
+          "help": "Controls the channel affinity cache and rules. The built-in default rules already cover Responses continuation, prompt_cache_key, and Realtime session. Do not set rules: []; that clears the rules.",
+          "useDefault": "Use default-rule template",
+          "useBlankDefault": "Blank for backend default"
+        },
+        "helpDialog": {
+          "open": "View configuration help",
+          "close": "Close",
+          "PreferredChannelWaitMilliseconds": {
+            "title": "Preferred Channel Wait (ms)",
+            "meaning": {
+              "title": "What it does",
+              "body": "When channel affinity finds a historical preferred channel but that channel is currently in cooldown, this controls whether one-hub waits briefly for it to recover."
+            },
+            "legalValues": {
+              "title": "Valid values",
+              "body": "Non-negative integer, in milliseconds.\n0 means no waiting.\nExamples: 0, 250, 500."
+            },
+            "defaultValue": {
+              "title": "Default",
+              "body": "0. By default, one-hub does not wait, which favors lower latency and availability."
+            },
+            "recommended": {
+              "title": "How to set it",
+              "body": "Use 0 if unsure.\nTry 250 if you want Codex continuation, prompt cache, or realtime session traffic to return to the original channel more often.\nOnly consider 500 when same-channel reuse matters more than the added latency."
+            },
+            "impact": {
+              "title": "Effect",
+              "body": "Higher values give the preferred channel more time to leave cooldown, improving same-channel reuse. Requests may wait up to this budget."
+            },
+            "risk": {
+              "title": "Risk and trade-off",
+              "body": "Large values increase tail latency. Waiting does not make an unavailable channel usable; after the budget is exhausted, strict / non-strict affinity still decides whether to fail or fall back."
+            }
+          },
+          "PreferredChannelWaitPollMilliseconds": {
+            "title": "Preferred Channel Poll Wait (ms)",
+            "meaning": {
+              "title": "What it does",
+              "body": "While waiting for the preferred channel to leave cooldown, one-hub checks recovery at this interval."
+            },
+            "legalValues": {
+              "title": "Valid values",
+              "body": "Non-negative integer, in milliseconds.\nIf set to 0 or a negative value, runtime falls back to 50ms.\nExamples: 25, 50, 100."
+            },
+            "defaultValue": {
+              "title": "Default",
+              "body": "50."
+            },
+            "recommended": {
+              "title": "How to set it",
+              "body": "Keep 50 in most cases.\nUse 25 only when the wait budget is short and faster recovery detection matters.\nUse 100 if the instance is under pressure and lower polling overhead matters."
+            },
+            "impact": {
+              "title": "Effect",
+              "body": "Lower values detect recovery faster but poll more often. Higher values reduce polling overhead but may wait up to one extra poll interval."
+            },
+            "risk": {
+              "title": "Risk and trade-off",
+              "body": "This only matters when PreferredChannelWaitMilliseconds is greater than 0 and the preferred channel is in cooldown. Tuning it alone usually has no effect."
+            }
+          },
+          "CodexRoutingHintSetting": {
+            "title": "CodexRoutingHintSetting",
+            "meaning": {
+              "title": "What it does",
+              "body": "Controls whether one-hub derives a stable responses.prompt_cache_key hint before selecting a Codex channel. ChannelAffinitySetting can then read that hint and prefer the same channel for the same identity."
+            },
+            "legalValues": {
+              "title": "Valid JSON fields",
+              "body": "prompt_cache_key_strategy: off, auto, session_id, auth_header, token_id, user_id.\nmodel_regex: optional valid regex; applies only to matching models.\nuser_agent_regex: optional valid regex; applies only to matching User-Agent values."
+            },
+            "strategies": {
+              "title": "Choosing a strategy",
+              "body": "off: do not generate a routing hint.\nauto: prefer previous_response_id, then session_id, auth_header, token_id, and user_id; previous_response_id is used directly as prompt_cache_key. Recommended.\nsession_id: only x-session-id / session_id.\nauth_header: only request credential identity.\ntoken_id: only one-hub token.\nuser_id: only one-hub user."
+            },
+            "filters": {
+              "title": "Filters",
+              "body": "When model_regex and user_agent_regex are blank, the setting applies to all Responses requests.\nUse regex filters to limit scope, for example model_regex: ^gpt-5$."
+            },
+            "recommended": {
+              "title": "How to set it",
+              "body": "Recommended template: {\"prompt_cache_key_strategy\":\"auto\",\"model_regex\":\"^gpt-5$\"}\nIf the scope is unclear, start with a model filter and broaden it after verification."
+            },
+            "impact": {
+              "title": "Effect",
+              "body": "When a request does not explicitly send prompt_cache_key, routing can still get a stable key and hit channel affinity before provider selection."
+            },
+            "risk": {
+              "title": "Risk and trade-off",
+              "body": "token_id and user_id make traffic from the same token or user prefer the same channel, which improves reuse but may concentrate load. Keep the Codex channel prompt_cache_key_strategy aligned with this setting to avoid routing hint and upstream key mismatch."
+            }
+          },
+          "ChannelAffinitySetting": {
+            "title": "ChannelAffinitySetting",
+            "meaning": {
+              "title": "What it does",
+              "body": "Controls the channel affinity cache: which requests record identity -> channel, and whether later requests with the same identity prefer the previously successful channel."
+            },
+            "topLevel": {
+              "title": "Top-level fields",
+              "body": "enabled: global switch.\ndefault_ttl_seconds: default record lifetime in seconds.\nmax_entries: local memory cache limit.\nrules: rule list. Omitting rules keeps backend defaults; setting rules: [] clears all rules."
+            },
+            "ruleFields": {
+              "title": "rules fields",
+              "body": "name: rule name.\nenabled: whether the rule is active.\nkind: responses or realtime.\nmodel_regex / path_regex / user_agent_regex: match filters.\ninclude_group / include_model / include_path / include_rule_name: dimensions included in the affinity key.\nstrict: fail instead of falling back when the preferred channel is unavailable.\nskip_retry_on_failure: skip retry after preferred channel failure.\nrecord_on_success: write affinity records after success.\nttl_seconds: record lifetime for this rule."
+            },
+            "keySources": {
+              "title": "key_sources fields",
+              "body": "source: request_field, header, query, request_hint.\nkey: field name to read.\nalias: identity type, such as prompt_cache_key, response_id, session_id.\nvalue_regex: optional regex filter for the extracted value."
+            },
+            "defaults": {
+              "title": "Default rules",
+              "body": "responses-continuation: uses previous_response_id and returns to the original channel with strict=true.\nresponses-prompt-cache-key: uses prompt_cache_key or responses.prompt_cache_key hint.\nrealtime-session: uses x-session-id / session_id."
+            },
+            "recommended": {
+              "title": "How to set it",
+              "body": "Do not change rules in most cases.\nIf you only need to tune capacity or TTL, set only enabled, default_ttl_seconds, and max_entries.\nBlank is the safest way to restore backend defaults."
+            },
+            "impact": {
+              "title": "Effect",
+              "body": "Continuation, prompt cache, and realtime sessions are more likely to return to the original channel, reducing cross-channel context loss or cache misses."
+            },
+            "risk": {
+              "title": "Risk and trade-off",
+              "body": "strict=true improves consistency but reduces availability. ignore_preferred_cooldown=true returns to the original channel more aggressively. rules: [] disables all default affinity rules. Copy the current config before changing rules."
+            }
+          }
         },
         "errors": {
           "invalidWaitMilliseconds": "Preferred channel wait must be a non-negative integer",
