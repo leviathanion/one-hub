@@ -1040,9 +1040,11 @@
         "title": "Disable channel keyword settings"
       },
       "codexSettings": {
-        "title": "Codex Advanced Settings",
-        "description": "These settings are stored as global options rather than per-channel Codex configuration. CodexRoutingHintSetting and ChannelAffinitySetting accept raw JSON, and blank values fall back to backend defaults. Both wait values are in milliseconds.",
-        "globalWarning": "These settings affect all users and all Codex channels. If you are not tuning affinity or prompt_cache_key behavior, use the recommended template and keep ChannelAffinitySetting on defaults.",
+        "title": "Routing Affinity and Codex Hints",
+        "description": "These settings are stored as global options rather than per-channel configuration. ChannelAffinitySetting is the general routing affinity rule set; CodexRoutingHintSetting only derives prompt_cache_key hints for Codex Responses. Blank values fall back to backend defaults, and both wait values are in milliseconds.",
+        "globalWarning": "These settings affect all users and requests that match the rules. If you are not tuning affinity or prompt_cache_key behavior, keep ChannelAffinitySetting on defaults and enable CodexRoutingHintSetting only when Codex prompt-cache pre-routing is needed.",
+        "affinitySectionTitle": "General Channel Affinity",
+        "codexHintSectionTitle": "Codex Routing Hint",
         "preferredChannelWaitMilliseconds": {
           "label": "Preferred Channel Wait (ms)",
           "placeholder": "e.g. 250",
@@ -1056,14 +1058,14 @@
         "codexRoutingHintSetting": {
           "label": "CodexRoutingHintSetting",
           "placeholder": "{\n  \"prompt_cache_key_strategy\": \"auto\",\n  \"model_regex\": \"^gpt-5$\"\n}",
-          "help": "Controls whether one-hub derives a stable prompt_cache_key hint before Codex channel selection. auto directly prefers previous_response_id, then session_id, auth header, token id, and user id. off disables hint generation.",
+          "help": "Codex-specific setting: controls whether one-hub derives a stable prompt_cache_key hint before Codex channel selection. ChannelAffinitySetting request_hint rules can read the generated hint. auto is recommended; off disables hint generation.",
           "useRecommended": "Use recommended template",
           "useDefault": "Use off template"
         },
         "channelAffinitySetting": {
           "label": "ChannelAffinitySetting",
           "placeholder": "{\n  \"enabled\": true,\n  \"default_ttl_seconds\": 3600,\n  \"max_entries\": 50000\n}",
-          "help": "Controls the channel affinity cache and rules. The built-in default rules already cover Responses continuation, prompt_cache_key, and Realtime session. Do not set rules: []; that clears the rules.",
+          "help": "General routing affinity setting: controls which Responses / Realtime requests record identity -> channel, and whether the same identity later prefers the previously successful channel. Do not set rules: []; that clears the rules.",
           "useDefault": "Use default-rule template",
           "useBlankDefault": "Blank for backend default"
         },
@@ -1144,7 +1146,7 @@
             },
             "recommended": {
               "title": "How to set it",
-              "body": "Recommended template: {\"prompt_cache_key_strategy\":\"auto\",\"model_regex\":\"^gpt-5$\"}\nIf the scope is unclear, start with a model filter and broaden it after verification."
+              "body": "Recommended template: {\"prompt_cache_key_strategy\":\"auto\",\"model_regex\":\"^gpt-5$\"}\nThis is a Codex-specific hint generation strategy. If the scope is unclear, start with a model filter and broaden it after verification."
             },
             "impact": {
               "title": "Effect",
@@ -1159,7 +1161,7 @@
             "title": "ChannelAffinitySetting",
             "meaning": {
               "title": "What it does",
-              "body": "Controls the channel affinity cache: which requests record identity -> channel, and whether later requests with the same identity prefer the previously successful channel."
+              "body": "Controls the general channel affinity cache: which Responses / Realtime requests record identity -> channel, and whether later requests with the same identity prefer the previously successful channel. It is not limited to Codex channel types."
             },
             "topLevel": {
               "title": "Top-level fields",
@@ -1197,7 +1199,7 @@
           "invalidRoutingHintJson": "CodexRoutingHintSetting must be valid JSON",
           "invalidChannelAffinityJson": "ChannelAffinitySetting must be valid JSON"
         },
-        "save": "Save Codex Advanced Settings"
+        "save": "Save Routing Affinity Settings"
       },
       "safetySettings": {
         "title": "System Safety Settings",

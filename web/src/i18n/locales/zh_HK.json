@@ -1030,9 +1030,11 @@
         "title": "停用通道關鍵詞設置"
       },
       "codexSettings": {
-        "title": "Codex 高級配置",
-        "description": "這些配置走全局 option，不屬於單個 Codex 通道。CodexRoutingHintSetting 和 ChannelAffinitySetting 支持直接填寫 JSON，留空時會回到後端默認值。兩個等待時間單位都是毫秒。",
-        "globalWarning": "這些配置會影響所有用戶和所有 Codex 通道。不了解 affinity / prompt_cache_key 時，建議只使用推薦模板，ChannelAffinitySetting 保持默認。",
+        "title": "路由親和與 Codex Hint",
+        "description": "這些配置走全局 option，不屬於單個通道。ChannelAffinitySetting 是通用路由親和規則；CodexRoutingHintSetting 只負責為 Codex Responses 派生 prompt_cache_key hint。留空時會回到後端默認值，兩個等待時間單位都是毫秒。",
+        "globalWarning": "這些配置會影響所有用戶以及匹配規則的請求。不了解 affinity / prompt_cache_key 時，建議 ChannelAffinitySetting 保持默認，只在需要 Codex prompt cache 預路由命中時啟用 CodexRoutingHintSetting。",
+        "affinitySectionTitle": "通用 Channel Affinity",
+        "codexHintSectionTitle": "Codex Routing Hint",
         "preferredChannelWaitMilliseconds": {
           "label": "首選通道等待時間（毫秒）",
           "placeholder": "例如：250",
@@ -1046,14 +1048,14 @@
         "codexRoutingHintSetting": {
           "label": "CodexRoutingHintSetting",
           "placeholder": "{\n  \"prompt_cache_key_strategy\": \"auto\",\n  \"model_regex\": \"^gpt-5$\"\n}",
-          "help": "控制 one-hub 是否在選擇 Codex 通道前自動生成穩定的 prompt_cache_key hint。推薦 auto：優先按 session_id，其次認證頭、token id、user id。off 表示不生成。",
+          "help": "Codex 專用配置：控制 one-hub 是否在選擇 Codex 通道前自動生成穩定的 prompt_cache_key hint。生成的 hint 可被 ChannelAffinitySetting 的 request_hint 規則讀取。推薦 auto；off 表示不生成。",
           "useRecommended": "使用推薦模板",
           "useDefault": "使用關閉模板"
         },
         "channelAffinitySetting": {
           "label": "ChannelAffinitySetting",
           "placeholder": "{\n  \"enabled\": true,\n  \"default_ttl_seconds\": 3600,\n  \"max_entries\": 50000\n}",
-          "help": "控制通道親和緩存和規則。默認規則已覆蓋 Responses continuation、prompt_cache_key 和 Realtime session；不要填寫 rules: []，那會清空規則。",
+          "help": "通用路由親和配置：控制哪些 Responses / Realtime 請求會記錄 identity -> channel，以及下次相同 identity 是否優先回到上次成功的通道。不要填寫 rules: []，那會清空規則。",
           "useDefault": "使用默認規則模板",
           "useBlankDefault": "留空使用後端默認"
         },
@@ -1134,7 +1136,7 @@
             },
             "recommended": {
               "title": "怎麼配",
-              "body": "推薦模板：{\"prompt_cache_key_strategy\":\"auto\",\"model_regex\":\"^gpt-5$\"}\n如果你不確定影響範圍，先限制模型；確認沒問題後再放寬。"
+              "body": "推薦模板：{\"prompt_cache_key_strategy\":\"auto\",\"model_regex\":\"^gpt-5$\"}\n這是 Codex 專用 hint 生成策略。如果你不確定影響範圍，先限制模型；確認沒問題後再放寬。"
             },
             "impact": {
               "title": "配置後的影響",
@@ -1149,7 +1151,7 @@
             "title": "ChannelAffinitySetting",
             "meaning": {
               "title": "這個配置做什麼",
-              "body": "控制通道親和緩存：哪些請求會記錄 identity -> channel，下一次相同 identity 是否優先回到上次成功的通道。"
+              "body": "控制通用通道親和緩存：哪些 Responses / Realtime 請求會記錄 identity -> channel，下一次相同 identity 是否優先回到上次成功的通道。它不限定通道類型必須是 Codex。"
             },
             "topLevel": {
               "title": "頂層字段",
@@ -1182,12 +1184,12 @@
           }
         },
         "errors": {
-          "invalidWaitMilliseconds": "Codex 首選通道等待時間必須是非負整數",
-          "invalidWaitPollMilliseconds": "Codex 首選通道輪詢等待時間必須是非負整數",
+          "invalidWaitMilliseconds": "首選通道等待時間必須是非負整數",
+          "invalidWaitPollMilliseconds": "首選通道輪詢等待時間必須是非負整數",
           "invalidRoutingHintJson": "CodexRoutingHintSetting 不是合法的 JSON 字符串",
           "invalidChannelAffinityJson": "ChannelAffinitySetting 不是合法的 JSON 字符串"
         },
-        "save": "保存 Codex 高級配置"
+        "save": "保存路由親和配置"
       },
       "safetySettings": {
         "title": "系統安全設置",

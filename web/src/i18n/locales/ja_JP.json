@@ -1028,9 +1028,11 @@
         "title": "チャネルキーワード設定を無効にする"
       },
       "codexSettings": {
-        "title": "Codex 高度な設定",
-        "description": "これらの設定は個別の Codex チャネルではなく、グローバル option として保存されます。CodexRoutingHintSetting と ChannelAffinitySetting には JSON を直接入力でき、空欄の場合はバックエンドのデフォルト値に戻ります。待機時間の単位はどちらもミリ秒です。",
-        "globalWarning": "これらの設定はすべてのユーザーとすべての Codex チャネルに影響します。affinity / prompt_cache_key を調整しない場合は、推奨テンプレートを使い、ChannelAffinitySetting はデフォルトのままにしてください。",
+        "title": "Routing Affinity と Codex Hint",
+        "description": "これらの設定は個別チャネルではなく、グローバル option として保存されます。ChannelAffinitySetting は汎用ルーティング affinity ルールで、CodexRoutingHintSetting は Codex Responses 向けの prompt_cache_key hint 生成だけを担当します。空欄の場合はバックエンドのデフォルト値に戻り、待機時間の単位はどちらもミリ秒です。",
+        "globalWarning": "これらの設定はすべてのユーザーと、ルールにマッチするリクエストに影響します。affinity / prompt_cache_key を調整しない場合は ChannelAffinitySetting をデフォルトのままにし、Codex prompt cache の pre-routing 命中が必要な場合だけ CodexRoutingHintSetting を有効にしてください。",
+        "affinitySectionTitle": "汎用 Channel Affinity",
+        "codexHintSectionTitle": "Codex Routing Hint",
         "preferredChannelWaitMilliseconds": {
           "label": "優先チャネル待機時間（ミリ秒）",
           "placeholder": "例：250",
@@ -1044,14 +1046,14 @@
         "codexRoutingHintSetting": {
           "label": "CodexRoutingHintSetting",
           "placeholder": "{\n  \"prompt_cache_key_strategy\": \"auto\",\n  \"model_regex\": \"^gpt-5$\"\n}",
-          "help": "Codex チャネル選択前に one-hub が安定した prompt_cache_key hint を生成するかを制御します。auto は session_id、認証ヘッダー、token id、user id の順で使います。off は生成しません。",
+          "help": "Codex 専用設定です。Codex チャネル選択前に one-hub が安定した prompt_cache_key hint を生成するかを制御します。生成された hint は ChannelAffinitySetting の request_hint ルールで読み取れます。auto を推奨します。off は生成しません。",
           "useRecommended": "推奨テンプレートを使用",
           "useDefault": "off テンプレートを使用"
         },
         "channelAffinitySetting": {
           "label": "ChannelAffinitySetting",
           "placeholder": "{\n  \"enabled\": true,\n  \"default_ttl_seconds\": 3600,\n  \"max_entries\": 50000\n}",
-          "help": "チャネル affinity キャッシュとルールを制御します。組み込みのデフォルトルールは Responses continuation、prompt_cache_key、Realtime session をすでにカバーしています。rules: [] はルールを消すため指定しないでください。",
+          "help": "汎用 routing affinity 設定です。どの Responses / Realtime リクエストで identity -> channel を記録し、次回同じ identity が来たときに前回成功したチャネルを優先するかを制御します。rules: [] はルールを消すため指定しないでください。",
           "useDefault": "デフォルトルールテンプレートを使用",
           "useBlankDefault": "空欄でバックエンドデフォルト"
         },
@@ -1132,7 +1134,7 @@
             },
             "recommended": {
               "title": "設定方法",
-              "body": "推奨テンプレート：{\"prompt_cache_key_strategy\":\"auto\",\"model_regex\":\"^gpt-5$\"}\n影響範囲が不明な場合は、まずモデルで絞り、確認後に広げます。"
+              "body": "推奨テンプレート：{\"prompt_cache_key_strategy\":\"auto\",\"model_regex\":\"^gpt-5$\"}\nこれは Codex 専用の hint 生成戦略です。影響範囲が不明な場合は、まずモデルで絞り、確認後に広げます。"
             },
             "impact": {
               "title": "影響",
@@ -1147,7 +1149,7 @@
             "title": "ChannelAffinitySetting",
             "meaning": {
               "title": "何をする設定か",
-              "body": "チャネル affinity キャッシュを制御します。どのリクエストで identity -> channel を記録し、次回同じ identity が来たときに前回成功したチャネルを優先するかを決めます。"
+              "body": "汎用チャネル affinity キャッシュを制御します。どの Responses / Realtime リクエストで identity -> channel を記録し、次回同じ identity が来たときに前回成功したチャネルを優先するかを決めます。Codex チャネルタイプだけに限定されるものではありません。"
             },
             "topLevel": {
               "title": "トップレベルフィールド",
@@ -1185,7 +1187,7 @@
           "invalidRoutingHintJson": "CodexRoutingHintSetting は有効な JSON である必要があります",
           "invalidChannelAffinityJson": "ChannelAffinitySetting は有効な JSON である必要があります"
         },
-        "save": "Codex 高度な設定を保存"
+        "save": "Routing Affinity 設定を保存"
       },
       "safetySettings": {
         "title": "システムセキュリティ設定",

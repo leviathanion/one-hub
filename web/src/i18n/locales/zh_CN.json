@@ -941,9 +941,11 @@
         "save": "保存Gemini设置"
       },
       "codexSettings": {
-        "title": "Codex 高级配置",
-        "description": "这些配置走全局 option，不属于单个 Codex 渠道。CodexRoutingHintSetting 和 ChannelAffinitySetting 支持直接填写 JSON，留空时会回到后端默认值。两个等待时间单位都是毫秒。",
-        "globalWarning": "这些配置会影响所有用户和所有 Codex 渠道。不了解 affinity / prompt_cache_key 时，建议只使用推荐模板，ChannelAffinitySetting 保持默认。",
+        "title": "路由亲和与 Codex Hint",
+        "description": "这些配置走全局 option，不属于单个渠道。ChannelAffinitySetting 是通用路由亲和规则；CodexRoutingHintSetting 只负责为 Codex Responses 派生 prompt_cache_key hint。留空时会回到后端默认值，两个等待时间单位都是毫秒。",
+        "globalWarning": "这些配置会影响所有用户以及匹配规则的请求。不了解 affinity / prompt_cache_key 时，建议 ChannelAffinitySetting 保持默认，只在需要 Codex prompt cache 预路由命中时启用 CodexRoutingHintSetting。",
+        "affinitySectionTitle": "通用 Channel Affinity",
+        "codexHintSectionTitle": "Codex Routing Hint",
         "preferredChannelWaitMilliseconds": {
           "label": "首选渠道等待时间（毫秒）",
           "placeholder": "例如：250",
@@ -957,14 +959,14 @@
         "codexRoutingHintSetting": {
           "label": "CodexRoutingHintSetting",
           "placeholder": "{\n  \"prompt_cache_key_strategy\": \"auto\",\n  \"model_regex\": \"^gpt-5$\"\n}",
-          "help": "控制 one-hub 是否在选择 Codex 渠道前自动生成稳定的 prompt_cache_key hint。推荐 auto：优先直接使用 previous_response_id，其次 session_id、认证头、token id、user id。off 表示不生成。",
+          "help": "Codex 专用配置：控制 one-hub 是否在选择 Codex 渠道前自动生成稳定的 prompt_cache_key hint。生成的 hint 可被 ChannelAffinitySetting 的 request_hint 规则读取。推荐 auto；off 表示不生成。",
           "useRecommended": "使用推荐模板",
           "useDefault": "使用关闭模板"
         },
         "channelAffinitySetting": {
           "label": "ChannelAffinitySetting",
           "placeholder": "{\n  \"enabled\": true,\n  \"default_ttl_seconds\": 3600,\n  \"max_entries\": 50000\n}",
-          "help": "控制渠道亲和缓存和规则。默认规则已覆盖 Responses continuation、prompt_cache_key 和 Realtime session；不要填写 rules: []，那会清空规则。",
+          "help": "通用路由亲和配置：控制哪些 Responses / Realtime 请求会记录 identity -> channel，以及下次相同 identity 是否优先回到上次成功的渠道。不要填写 rules: []，那会清空规则。",
           "useDefault": "使用默认规则模板",
           "useBlankDefault": "留空使用后端默认"
         },
@@ -1045,7 +1047,7 @@
             },
             "recommended": {
               "title": "怎么配",
-              "body": "推荐模板：{\"prompt_cache_key_strategy\":\"auto\",\"model_regex\":\"^gpt-5$\"}\n如果你不确定影响范围，先限制模型；确认没问题后再放宽。"
+              "body": "推荐模板：{\"prompt_cache_key_strategy\":\"auto\",\"model_regex\":\"^gpt-5$\"}\n这是 Codex 专用 hint 生成策略。如果你不确定影响范围，先限制模型；确认没问题后再放宽。"
             },
             "impact": {
               "title": "配置后的影响",
@@ -1060,7 +1062,7 @@
             "title": "ChannelAffinitySetting",
             "meaning": {
               "title": "这个配置做什么",
-              "body": "控制渠道亲和缓存：哪些请求会记录 identity -> channel，下一次相同 identity 是否优先回到上次成功的渠道。"
+              "body": "控制通用渠道亲和缓存：哪些 Responses / Realtime 请求会记录 identity -> channel，下一次相同 identity 是否优先回到上次成功的渠道。它不限定渠道类型必须是 Codex。"
             },
             "topLevel": {
               "title": "顶层字段",
@@ -1093,12 +1095,12 @@
           }
         },
         "errors": {
-          "invalidWaitMilliseconds": "Codex 首选渠道等待时间必须是非负整数",
-          "invalidWaitPollMilliseconds": "Codex 首选渠道轮询等待时间必须是非负整数",
+          "invalidWaitMilliseconds": "首选渠道等待时间必须是非负整数",
+          "invalidWaitPollMilliseconds": "首选渠道轮询等待时间必须是非负整数",
           "invalidRoutingHintJson": "CodexRoutingHintSetting 不是合法的 JSON 字符串",
           "invalidChannelAffinityJson": "ChannelAffinitySetting 不是合法的 JSON 字符串"
         },
-        "save": "保存 Codex 高级配置"
+        "save": "保存路由亲和配置"
       },
       "safetySettings": {
         "title": "系统安全设置",

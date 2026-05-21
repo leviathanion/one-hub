@@ -1213,6 +1213,9 @@ const OperationSetting = () => {
         <Stack spacing={2}>
           <Alert severity="info">{t('setting_index.operationSettings.codexSettings.description')}</Alert>
           <Alert severity="warning">{t('setting_index.operationSettings.codexSettings.globalWarning')}</Alert>
+          <Typography variant="subtitle1" sx={{ fontWeight: 600 }}>
+            {t('setting_index.operationSettings.codexSettings.affinitySectionTitle')}
+          </Typography>
           <Stack direction={{ sm: 'column', md: 'row' }} spacing={{ xs: 3, sm: 2, md: 4 }}>
             <FormControl fullWidth>
               {renderCodexFieldTitle(
@@ -1265,6 +1268,43 @@ const OperationSetting = () => {
           </Stack>
           <FormControl fullWidth>
             {renderCodexFieldTitle(
+              'ChannelAffinitySetting',
+              t('setting_index.operationSettings.codexSettings.channelAffinitySetting.label')
+            )}
+            <Alert severity="info" sx={{ mb: 1 }}>
+              {t('setting_index.operationSettings.codexSettings.channelAffinitySetting.help')}
+            </Alert>
+            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ mb: 1 }}>
+              <Button
+                variant="outlined"
+                size="small"
+                onClick={() => applyCodexTemplate('ChannelAffinitySetting', CHANNEL_AFFINITY_DEFAULT_TEMPLATE)}
+                disabled={loading}
+              >
+                {t('setting_index.operationSettings.codexSettings.channelAffinitySetting.useDefault')}
+              </Button>
+              <Button variant="outlined" size="small" onClick={() => applyCodexTemplate('ChannelAffinitySetting', '')} disabled={loading}>
+                {t('setting_index.operationSettings.codexSettings.channelAffinitySetting.useBlankDefault')}
+              </Button>
+            </Stack>
+            <TextField
+              multiline
+              maxRows={24}
+              id="ChannelAffinitySetting"
+              label={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.label')}
+              value={inputs.ChannelAffinitySetting}
+              name="ChannelAffinitySetting"
+              onChange={handleTextFieldChange}
+              minRows={10}
+              placeholder={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.placeholder')}
+              disabled={loading}
+            />
+          </FormControl>
+          <Typography variant="subtitle1" sx={{ fontWeight: 600, pt: 1 }}>
+            {t('setting_index.operationSettings.codexSettings.codexHintSectionTitle')}
+          </Typography>
+          <FormControl fullWidth>
+            {renderCodexFieldTitle(
               'CodexRoutingHintSetting',
               t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.label')
             )}
@@ -1299,40 +1339,6 @@ const OperationSetting = () => {
               onChange={handleTextFieldChange}
               minRows={6}
               placeholder={t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.placeholder')}
-              disabled={loading}
-            />
-          </FormControl>
-          <FormControl fullWidth>
-            {renderCodexFieldTitle(
-              'ChannelAffinitySetting',
-              t('setting_index.operationSettings.codexSettings.channelAffinitySetting.label')
-            )}
-            <Alert severity="info" sx={{ mb: 1 }}>
-              {t('setting_index.operationSettings.codexSettings.channelAffinitySetting.help')}
-            </Alert>
-            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ mb: 1 }}>
-              <Button
-                variant="outlined"
-                size="small"
-                onClick={() => applyCodexTemplate('ChannelAffinitySetting', CHANNEL_AFFINITY_DEFAULT_TEMPLATE)}
-                disabled={loading}
-              >
-                {t('setting_index.operationSettings.codexSettings.channelAffinitySetting.useDefault')}
-              </Button>
-              <Button variant="outlined" size="small" onClick={() => applyCodexTemplate('ChannelAffinitySetting', '')} disabled={loading}>
-                {t('setting_index.operationSettings.codexSettings.channelAffinitySetting.useBlankDefault')}
-              </Button>
-            </Stack>
-            <TextField
-              multiline
-              maxRows={24}
-              id="ChannelAffinitySetting"
-              label={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.label')}
-              value={inputs.ChannelAffinitySetting}
-              name="ChannelAffinitySetting"
-              onChange={handleTextFieldChange}
-              minRows={10}
-              placeholder={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.placeholder')}
               disabled={loading}
             />
           </FormControl>
