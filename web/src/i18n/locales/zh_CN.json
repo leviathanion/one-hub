@@ -957,18 +957,52 @@
           "help": "等待首选渠道恢复时的检查间隔。通常保持 50ms；过小会增加轮询开销，过大会让等待更钝。"
         },
         "codexRoutingHintSetting": {
-          "label": "CodexRoutingHintSetting",
-          "placeholder": "{\n  \"prompt_cache_key_strategy\": \"auto\",\n  \"model_regex\": \"^gpt-5$\"\n}",
+          "label": "Codex 高级配置",
+          "placeholder": "",
           "help": "Codex 专用配置：控制 one-hub 是否在选择 Codex 渠道前自动生成稳定的 prompt_cache_key hint。生成的 hint 可被 ChannelAffinitySetting 的 request_hint 规则读取。推荐 auto；off 表示不生成。",
           "useRecommended": "使用推荐模板",
-          "useDefault": "使用关闭模板"
+          "useDefault": "使用关闭模板",
+          "fields": {
+            "strategy": "Prompt cache key 策略",
+            "modelRegex": "模型匹配正则",
+            "userAgentRegex": "User-Agent 匹配正则"
+          }
         },
         "channelAffinitySetting": {
-          "label": "ChannelAffinitySetting",
-          "placeholder": "{\n  \"enabled\": true,\n  \"default_ttl_seconds\": 3600,\n  \"max_entries\": 50000\n}",
+          "label": "渠道亲和配置",
+          "placeholder": "",
           "help": "通用路由亲和配置：控制哪些 Responses / Realtime 请求会记录 identity -> channel，以及下次相同 identity 是否优先回到上次成功的渠道。不要填写 rules: []，那会清空规则。",
           "useDefault": "使用默认规则模板",
-          "useBlankDefault": "留空使用后端默认"
+          "useBlankDefault": "留空使用后端默认",
+          "rulesTitle": "亲和规则",
+          "keySourcesTitle": "Key 来源",
+          "addRule": "添加规则",
+          "removeRule": "删除规则",
+          "addKeySource": "添加 Key 来源",
+          "removeKeySource": "删除 Key 来源",
+          "fields": {
+            "enabled": "启用",
+            "defaultTTL": "默认 TTL（秒）",
+            "maxEntries": "最大缓存条数",
+            "ruleName": "规则名",
+            "kind": "请求类型",
+            "modelRegex": "模型正则",
+            "pathRegex": "路径正则",
+            "userAgentRegex": "User-Agent 正则",
+            "include_group": "Key 包含用户组",
+            "include_model": "Key 包含模型",
+            "include_path": "Key 包含路径",
+            "include_rule_name": "Key 包含规则名",
+            "ignore_preferred_cooldown": "忽略首选渠道冷却",
+            "strict": "严格回原渠道",
+            "skip_retry_on_failure": "首选失败后跳过重试",
+            "record_on_success": "成功后记录",
+            "ruleTTL": "规则 TTL（秒，可空）",
+            "source": "来源",
+            "key": "字段 Key",
+            "alias": "Alias",
+            "valueRegex": "值过滤正则"
+          }
         },
         "helpDialog": {
           "open": "查看配置说明",
@@ -1098,7 +1132,10 @@
           "invalidWaitMilliseconds": "首选渠道等待时间必须是非负整数",
           "invalidWaitPollMilliseconds": "首选渠道轮询等待时间必须是非负整数",
           "invalidRoutingHintJson": "CodexRoutingHintSetting 不是合法的 JSON 字符串",
-          "invalidChannelAffinityJson": "ChannelAffinitySetting 不是合法的 JSON 字符串"
+          "invalidChannelAffinityJson": "ChannelAffinitySetting 不是合法的 JSON 字符串",
+          "invalidDefaultTTL": "渠道亲和默认 TTL 必须是非负整数",
+          "invalidMaxEntries": "渠道亲和最大缓存条数必须是非负整数",
+          "invalidRuleTTL": "第 {{index}} 条亲和规则的 TTL 必须是非负整数"
         },
         "save": "保存路由亲和配置"
       },

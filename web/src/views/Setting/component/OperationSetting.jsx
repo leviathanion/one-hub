@@ -6,6 +6,7 @@ import {
   Button,
   Checkbox,
   Chip,
+  Divider,
   Dialog,
   DialogActions,
   DialogContent,
@@ -22,6 +23,8 @@ import {
   Tooltip,
   Typography
 } from '@mui/material';
+import AddIcon from '@mui/icons-material/Add';
+import DeleteIcon from '@mui/icons-material/DeleteOutlined';
 import HelpOutlineIcon from '@mui/icons-material/HelpOutline';
 import { showError, showSuccess, verifyJSON } from 'utils/common';
 import { API } from 'utils/api';
@@ -86,24 +89,120 @@ const defaultInputs = {
   PreferredChannelWaitPollMilliseconds: 50
 };
 
-const CODEX_ROUTING_HINT_RECOMMENDED_TEMPLATE = JSON.stringify(
-  {
-    prompt_cache_key_strategy: 'auto',
-    model_regex: '^gpt-5$'
-  },
+const CODEX_ROUTING_HINT_RECOMMENDED = {
+  prompt_cache_key_strategy: 'auto',
+  model_regex: '^gpt-5$',
+  user_agent_regex: ''
+};
+
+const CODEX_ROUTING_HINT_DEFAULT = {
+  prompt_cache_key_strategy: 'off',
+  model_regex: '',
+  user_agent_regex: ''
+};
+
+const CODEX_ROUTING_HINT_DEFAULT_TEMPLATE = JSON.stringify(
+  CODEX_ROUTING_HINT_DEFAULT,
   null,
   2
 );
 
-const CODEX_ROUTING_HINT_DEFAULT_TEMPLATE = JSON.stringify(
+const DEFAULT_CHANNEL_AFFINITY_RULES = [
   {
-    prompt_cache_key_strategy: 'off',
+    name: 'responses-continuation',
+    enabled: true,
+    kind: 'responses',
     model_regex: '',
-    user_agent_regex: ''
+    path_regex: '^/v1/responses(?:/compact)?$',
+    user_agent_regex: '',
+    include_group: true,
+    include_model: false,
+    include_path: false,
+    include_rule_name: true,
+    ignore_preferred_cooldown: false,
+    strict: true,
+    skip_retry_on_failure: true,
+    record_on_success: true,
+    ttl_seconds: '',
+    key_sources: [
+      {
+        source: 'request_field',
+        key: 'previous_response_id',
+        alias: 'response_id',
+        value_regex: ''
+      }
+    ]
   },
-  null,
-  2
-);
+  {
+    name: 'responses-prompt-cache-key',
+    enabled: true,
+    kind: 'responses',
+    model_regex: '',
+    path_regex: '^/v1/responses(?:/compact)?$',
+    user_agent_regex: '',
+    include_group: true,
+    include_model: true,
+    include_path: false,
+    include_rule_name: true,
+    ignore_preferred_cooldown: false,
+    strict: false,
+    skip_retry_on_failure: false,
+    record_on_success: true,
+    ttl_seconds: '',
+    key_sources: [
+      {
+        source: 'request_field',
+        key: 'prompt_cache_key',
+        alias: 'prompt_cache_key',
+        value_regex: ''
+      },
+      {
+        source: 'request_hint',
+        key: 'responses.prompt_cache_key',
+        alias: 'prompt_cache_key',
+        value_regex: ''
+      }
+    ]
+  },
+  {
+    name: 'realtime-session',
+    enabled: true,
+    kind: 'realtime',
+    model_regex: '',
+    path_regex: '^/v1/realtime$',
+    user_agent_regex: '',
+    include_group: true,
+    include_model: false,
+    include_path: false,
+    include_rule_name: true,
+    ignore_preferred_cooldown: false,
+    strict: false,
+    skip_retry_on_failure: false,
+    record_on_success: true,
+    ttl_seconds: '',
+    key_sources: [
+      {
+        source: 'header',
+        key: 'x-session-id',
+        alias: 'session_id',
+        value_regex: ''
+      },
+      {
+        source: 'header',
+        key: 'session_id',
+        alias: 'session_id',
+        value_regex: ''
+      }
+    ]
+  }
+];
+
+const DEFAULT_CHANNEL_AFFINITY = {
+  enabled: true,
+  default_ttl_seconds: 3600,
+  max_entries: 50000,
+  rules: DEFAULT_CHANNEL_AFFINITY_RULES
+};
 
 const CHANNEL_AFFINITY_DEFAULT_TEMPLATE = JSON.stringify(
   {
@@ -114,6 +213,146 @@ const CHANNEL_AFFINITY_DEFAULT_TEMPLATE = JSON.stringify(
   null,
   2
 );
+
+const PROMPT_CACHE_STRATEGIES = ['off', 'auto', 'session_id', 'auth_header', 'token_id', 'user_id'];
+const CHANNEL_AFFINITY_KINDS = ['responses', 'realtime'];
+const CHANNEL_AFFINITY_KEY_SOURCES = ['request_field', 'header', 'query', 'request_hint'];
+const CHANNEL_AFFINITY_BOOLEAN_FIELDS = [
+  'enabled',
+  'include_group',
+  'include_model',
+  'include_path',
+  'include_rule_name',
+  'ignore_preferred_cooldown',
+  'strict',
+  'skip_retry_on_failure',
+  'record_on_success'
+];
+
+const cloneJSON = (value) => JSON.parse(JSON.stringify(value));
+
+const parseJSONObjectOption = (value, fallback) => {
+  if (typeof value !== 'string' || value.trim() === '') {
+    return cloneJSON(fallback);
+  }
+  try {
+    const parsed = JSON.parse(value);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed;
+    }
+  } catch (error) {
+    return cloneJSON(fallback);
+  }
+  return cloneJSON(fallback);
+};
+
+const cleanObject = (value) => {
+  if (Array.isArray(value)) {
+    return value.map(cleanObject);
+  }
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+  return Object.entries(value).reduce((acc, [key, raw]) => {
+    const cleaned = cleanObject(raw);
+    if (cleaned === '' || cleaned === null || cleaned === undefined) {
+      return acc;
+    }
+    acc[key] = cleaned;
+    return acc;
+  }, {});
+};
+
+const serializeJSONObjectOption = (value) => JSON.stringify(cleanObject(value), null, 2);
+
+const normalizeOptionalPositiveInt = (value) => {
+  const trimmed = String(value ?? '').trim();
+  if (trimmed === '') {
+    return '';
+  }
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : value;
+};
+
+const serializeCodexRoutingHintForm = (form) => serializeJSONObjectOption(form);
+
+const serializeChannelAffinityForm = (form) => {
+  const prepared = {
+    ...form,
+    default_ttl_seconds: normalizeOptionalPositiveInt(form.default_ttl_seconds),
+    max_entries: normalizeOptionalPositiveInt(form.max_entries),
+    rules: (form.rules || []).map((rule) => ({
+      ...rule,
+      ttl_seconds: normalizeOptionalPositiveInt(rule.ttl_seconds),
+      key_sources: rule.key_sources || []
+    }))
+  };
+  return serializeJSONObjectOption(prepared);
+};
+
+const parseCodexRoutingHintForm = (value) => {
+  const parsed = parseJSONObjectOption(value, CODEX_ROUTING_HINT_DEFAULT);
+  const strategy = PROMPT_CACHE_STRATEGIES.includes(parsed.prompt_cache_key_strategy) ? parsed.prompt_cache_key_strategy : 'off';
+  return {
+    prompt_cache_key_strategy: strategy,
+    model_regex: parsed.model_regex || '',
+    user_agent_regex: parsed.user_agent_regex || ''
+  };
+};
+
+const normalizeChannelAffinityKeySource = (source = {}) => ({
+  source: CHANNEL_AFFINITY_KEY_SOURCES.includes(source.source) ? source.source : 'request_field',
+  key: source.key || '',
+  alias: source.alias || '',
+  value_regex: source.value_regex || ''
+});
+
+const normalizeChannelAffinityRule = (rule = {}) => {
+  const normalized = {
+    name: rule.name || '',
+    enabled: rule.enabled !== false,
+    kind: CHANNEL_AFFINITY_KINDS.includes(rule.kind) ? rule.kind : 'responses',
+    model_regex: rule.model_regex || '',
+    path_regex: rule.path_regex || '',
+    user_agent_regex: rule.user_agent_regex || '',
+    include_group: Boolean(rule.include_group),
+    include_model: Boolean(rule.include_model),
+    include_path: Boolean(rule.include_path),
+    include_rule_name: Boolean(rule.include_rule_name),
+    ignore_preferred_cooldown: Boolean(rule.ignore_preferred_cooldown),
+    strict: Boolean(rule.strict),
+    skip_retry_on_failure: Boolean(rule.skip_retry_on_failure),
+    record_on_success: rule.record_on_success !== false,
+    ttl_seconds: rule.ttl_seconds || '',
+    key_sources: Array.isArray(rule.key_sources) ? rule.key_sources.map(normalizeChannelAffinityKeySource) : []
+  };
+  if (normalized.key_sources.length === 0) {
+    normalized.key_sources = [normalizeChannelAffinityKeySource()];
+  }
+  return normalized;
+};
+
+const parseChannelAffinityForm = (value) => {
+  const parsed = parseJSONObjectOption(value, DEFAULT_CHANNEL_AFFINITY);
+  const parsedRules = Array.isArray(parsed.rules) ? parsed.rules : DEFAULT_CHANNEL_AFFINITY_RULES;
+  return {
+    enabled: parsed.enabled !== false,
+    default_ttl_seconds: parsed.default_ttl_seconds || 3600,
+    max_entries: parsed.max_entries || 50000,
+    rules: parsedRules.map(normalizeChannelAffinityRule)
+  };
+};
+
+const createBlankChannelAffinityRule = () =>
+  normalizeChannelAffinityRule({
+    name: '',
+    enabled: true,
+    kind: 'responses',
+    include_group: true,
+    include_rule_name: true,
+    record_on_success: true,
+    key_sources: [normalizeChannelAffinityKeySource()]
+  });
 
 const codexHelpTopics = {
   PreferredChannelWaitMilliseconds: [
@@ -157,7 +396,12 @@ const OperationSetting = () => {
   const { t } = useTranslation();
   const siteInfo = useSelector((state) => state.siteInfo);
   let now = new Date();
-  let [inputs, setInputs] = useState(() => ({ ...defaultInputs }));
+  let [inputs, setInputs] = useState(() => ({
+    ...defaultInputs,
+    codexRoutingHintForm: cloneJSON(CODEX_ROUTING_HINT_DEFAULT),
+    channelAffinityForm: cloneJSON(DEFAULT_CHANNEL_AFFINITY),
+    channelAffinityBackendDefault: false
+  }));
   const [originInputs, setOriginInputs] = useState({});
   const [secretStates, setSecretStates] = useState(() => createInitialSecretStates(OPERATION_SECRET_OPTION_KEYS));
   let [loading, setLoading] = useState(false);
@@ -181,6 +425,13 @@ const OperationSetting = () => {
     }
   };
 
+  const buildCodexFormInputs = (sourceInputs) => ({
+    ...sourceInputs,
+    codexRoutingHintForm: parseCodexRoutingHintForm(sourceInputs.CodexRoutingHintSetting),
+    channelAffinityForm: parseChannelAffinityForm(sourceInputs.ChannelAffinitySetting),
+    channelAffinityBackendDefault: String(sourceInputs.ChannelAffinitySetting ?? '').trim() === ''
+  });
+
   const getOptions = async () => {
     try {
       const res = await API.get('/api/option/');
@@ -198,13 +449,12 @@ const OperationSetting = () => {
               console.error('解析SafeKeyWords失败:', e);
             }
           }
-          if (item.key === 'CodexRoutingHintSetting' || item.key === 'ChannelAffinitySetting') {
-            item.value = formatJSONObjectOption(item.value);
-          }
           newInputs[item.key] = item.value;
         });
+        newInputs.CodexRoutingHintSetting = formatJSONObjectOption(newInputs.CodexRoutingHintSetting);
+        newInputs.ChannelAffinitySetting = formatJSONObjectOption(newInputs.ChannelAffinitySetting);
         // 确保不会覆盖 safeTools
-        setInputs((prev) => ({ ...newInputs, safeTools: prev.safeTools }));
+        setInputs((prev) => ({ ...buildCodexFormInputs(newInputs), safeTools: prev.safeTools }));
         setOriginInputs(newInputs);
         setSecretStates(mergeSecretStatesFromMeta(OPERATION_SECRET_OPTION_KEYS, meta?.sensitive_options));
       } else {
@@ -305,6 +555,31 @@ const OperationSetting = () => {
       }));
   };
 
+  const buildCodexOptionUpdates = () => {
+    const codexRoutingHintSetting = serializeCodexRoutingHintForm(inputs.codexRoutingHintForm);
+    const channelAffinitySetting = inputs.channelAffinityBackendDefault ? '' : serializeChannelAffinityForm(inputs.channelAffinityForm);
+    const codexInputs = {
+      ...inputs,
+      CodexRoutingHintSetting: codexRoutingHintSetting,
+      ChannelAffinitySetting: channelAffinitySetting
+    };
+
+    return [
+      ...['PreferredChannelWaitMilliseconds', 'PreferredChannelWaitPollMilliseconds']
+        .filter((key) => originInputs[key] !== inputs[key])
+        .map((key) => ({
+          key,
+          value: normalizeOptionPayloadValue(inputs[key])
+        })),
+      ...['CodexRoutingHintSetting', 'ChannelAffinitySetting']
+        .filter((key) => originInputs[key] !== codexInputs[key])
+        .map((key) => ({
+          key,
+          value: codexInputs[key]
+        }))
+    ];
+  };
+
   const isNonNegativeIntegerString = (value) => /^(0|[1-9]\d*)$/.test(String(value ?? '').trim());
 
   const validateCodexConfig = () => {
@@ -322,21 +597,19 @@ const OperationSetting = () => {
       throw new Error(t('setting_index.operationSettings.codexSettings.errors.invalidWaitPollMilliseconds'));
     }
 
-    if (
-      originInputs.CodexRoutingHintSetting !== inputs.CodexRoutingHintSetting &&
-      inputs.CodexRoutingHintSetting.trim() !== '' &&
-      !verifyJSON(inputs.CodexRoutingHintSetting)
-    ) {
-      throw new Error(t('setting_index.operationSettings.codexSettings.errors.invalidRoutingHintJson'));
+    if (!isNonNegativeIntegerString(inputs.channelAffinityForm.default_ttl_seconds)) {
+      throw new Error(t('setting_index.operationSettings.codexSettings.errors.invalidDefaultTTL'));
     }
 
-    if (
-      originInputs.ChannelAffinitySetting !== inputs.ChannelAffinitySetting &&
-      inputs.ChannelAffinitySetting.trim() !== '' &&
-      !verifyJSON(inputs.ChannelAffinitySetting)
-    ) {
-      throw new Error(t('setting_index.operationSettings.codexSettings.errors.invalidChannelAffinityJson'));
+    if (!isNonNegativeIntegerString(inputs.channelAffinityForm.max_entries)) {
+      throw new Error(t('setting_index.operationSettings.codexSettings.errors.invalidMaxEntries'));
     }
+
+    inputs.channelAffinityForm.rules.forEach((rule, index) => {
+      if (String(rule.ttl_seconds ?? '').trim() !== '' && !isNonNegativeIntegerString(rule.ttl_seconds)) {
+        throw new Error(t('setting_index.operationSettings.codexSettings.errors.invalidRuleTTL', { index: index + 1 }));
+      }
+    });
   };
 
   const handleInputChange = async (event) => {
@@ -363,8 +636,127 @@ const OperationSetting = () => {
     }
   };
 
+  const updateCodexRoutingHintForm = (field, value) => {
+    setInputs((prev) => ({
+      ...prev,
+      codexRoutingHintForm: {
+        ...prev.codexRoutingHintForm,
+        [field]: value
+      }
+    }));
+  };
+
+  const updateChannelAffinityForm = (field, value) => {
+    setInputs((prev) => ({
+      ...prev,
+      channelAffinityBackendDefault: false,
+      channelAffinityForm: {
+        ...prev.channelAffinityForm,
+        [field]: value
+      }
+    }));
+  };
+
+  const updateChannelAffinityRule = (ruleIndex, field, value) => {
+    setInputs((prev) => ({
+      ...prev,
+      channelAffinityBackendDefault: false,
+      channelAffinityForm: {
+        ...prev.channelAffinityForm,
+        rules: prev.channelAffinityForm.rules.map((rule, index) => (index === ruleIndex ? { ...rule, [field]: value } : rule))
+      }
+    }));
+  };
+
+  const addChannelAffinityRule = () => {
+    setInputs((prev) => ({
+      ...prev,
+      channelAffinityBackendDefault: false,
+      channelAffinityForm: {
+        ...prev.channelAffinityForm,
+        rules: [...prev.channelAffinityForm.rules, createBlankChannelAffinityRule()]
+      }
+    }));
+  };
+
+  const removeChannelAffinityRule = (ruleIndex) => {
+    setInputs((prev) => ({
+      ...prev,
+      channelAffinityBackendDefault: false,
+      channelAffinityForm: {
+        ...prev.channelAffinityForm,
+        rules: prev.channelAffinityForm.rules.filter((_, index) => index !== ruleIndex)
+      }
+    }));
+  };
+
+  const updateChannelAffinityKeySource = (ruleIndex, sourceIndex, field, value) => {
+    setInputs((prev) => ({
+      ...prev,
+      channelAffinityBackendDefault: false,
+      channelAffinityForm: {
+        ...prev.channelAffinityForm,
+        rules: prev.channelAffinityForm.rules.map((rule, index) => {
+          if (index !== ruleIndex) {
+            return rule;
+          }
+          return {
+            ...rule,
+            key_sources: rule.key_sources.map((source, keySourceIndex) =>
+              keySourceIndex === sourceIndex ? { ...source, [field]: value } : source
+            )
+          };
+        })
+      }
+    }));
+  };
+
+  const addChannelAffinityKeySource = (ruleIndex) => {
+    setInputs((prev) => ({
+      ...prev,
+      channelAffinityBackendDefault: false,
+      channelAffinityForm: {
+        ...prev.channelAffinityForm,
+        rules: prev.channelAffinityForm.rules.map((rule, index) =>
+          index === ruleIndex ? { ...rule, key_sources: [...rule.key_sources, normalizeChannelAffinityKeySource()] } : rule
+        )
+      }
+    }));
+  };
+
+  const removeChannelAffinityKeySource = (ruleIndex, sourceIndex) => {
+    setInputs((prev) => ({
+      ...prev,
+      channelAffinityBackendDefault: false,
+      channelAffinityForm: {
+        ...prev.channelAffinityForm,
+        rules: prev.channelAffinityForm.rules.map((rule, index) => {
+          if (index !== ruleIndex || rule.key_sources.length <= 1) {
+            return rule;
+          }
+          return {
+            ...rule,
+            key_sources: rule.key_sources.filter((_, keySourceIndex) => keySourceIndex !== sourceIndex)
+          };
+        })
+      }
+    }));
+  };
+
   const applyCodexTemplate = (name, value) => {
-    setInputs((inputs) => ({ ...inputs, [name]: value }));
+    setInputs((inputs) => {
+      if (name === 'CodexRoutingHintSetting') {
+        return { ...inputs, codexRoutingHintForm: parseCodexRoutingHintForm(value) };
+      }
+      if (name === 'ChannelAffinitySetting') {
+        return {
+          ...inputs,
+          channelAffinityForm: parseChannelAffinityForm(value),
+          channelAffinityBackendDefault: String(value ?? '').trim() === ''
+        };
+      }
+      return { ...inputs, [name]: value };
+    });
   };
 
   const codexHelpPrefix = 'setting_index.operationSettings.codexSettings.helpDialog';
@@ -559,14 +951,7 @@ const OperationSetting = () => {
           break;
         case 'codex':
           validateCodexConfig();
-          await putOptionBatchOrThrow(
-            buildOptionUpdates([
-              'PreferredChannelWaitMilliseconds',
-              'PreferredChannelWaitPollMilliseconds',
-              'CodexRoutingHintSetting',
-              'ChannelAffinitySetting'
-            ])
-          );
+          await putOptionBatchOrThrow(buildCodexOptionUpdates());
           break;
       }
 
@@ -1287,18 +1672,212 @@ const OperationSetting = () => {
                 {t('setting_index.operationSettings.codexSettings.channelAffinitySetting.useBlankDefault')}
               </Button>
             </Stack>
-            <TextField
-              multiline
-              maxRows={24}
-              id="ChannelAffinitySetting"
-              label={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.label')}
-              value={inputs.ChannelAffinitySetting}
-              name="ChannelAffinitySetting"
-              onChange={handleTextFieldChange}
-              minRows={10}
-              placeholder={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.placeholder')}
-              disabled={loading}
-            />
+            <Stack spacing={2}>
+              <Stack direction={{ xs: 'column', md: 'row' }} spacing={2}>
+                <FormControlLabel
+                  control={
+                    <Checkbox
+                      checked={Boolean(inputs.channelAffinityForm.enabled)}
+                      onChange={(event) => updateChannelAffinityForm('enabled', event.target.checked)}
+                      disabled={loading}
+                    />
+                  }
+                  label={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.fields.enabled')}
+                />
+                <TextField
+                  fullWidth
+                  type="number"
+                  label={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.fields.defaultTTL')}
+                  value={inputs.channelAffinityForm.default_ttl_seconds}
+                  onChange={(event) => updateChannelAffinityForm('default_ttl_seconds', event.target.value)}
+                  inputProps={{ min: 0, step: 1, inputMode: 'numeric' }}
+                  disabled={loading}
+                />
+                <TextField
+                  fullWidth
+                  type="number"
+                  label={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.fields.maxEntries')}
+                  value={inputs.channelAffinityForm.max_entries}
+                  onChange={(event) => updateChannelAffinityForm('max_entries', event.target.value)}
+                  inputProps={{ min: 0, step: 1, inputMode: 'numeric' }}
+                  disabled={loading}
+                />
+              </Stack>
+
+              <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} alignItems={{ xs: 'stretch', sm: 'center' }}>
+                <Typography variant="subtitle2" sx={{ flexGrow: 1 }}>
+                  {t('setting_index.operationSettings.codexSettings.channelAffinitySetting.rulesTitle')}
+                </Typography>
+                <Button variant="outlined" size="small" startIcon={<AddIcon />} onClick={addChannelAffinityRule} disabled={loading}>
+                  {t('setting_index.operationSettings.codexSettings.channelAffinitySetting.addRule')}
+                </Button>
+              </Stack>
+
+              {inputs.channelAffinityForm.rules.map((rule, ruleIndex) => (
+                <Box
+                  key={`${rule.name || 'rule'}-${ruleIndex}`}
+                  sx={{
+                    border: '1px solid',
+                    borderColor: 'divider',
+                    borderRadius: 1,
+                    p: 2
+                  }}
+                >
+                  <Stack spacing={2}>
+                    <Stack direction={{ xs: 'column', md: 'row' }} spacing={2} alignItems={{ xs: 'stretch', md: 'center' }}>
+                      <TextField
+                        fullWidth
+                        label={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.fields.ruleName')}
+                        value={rule.name}
+                        onChange={(event) => updateChannelAffinityRule(ruleIndex, 'name', event.target.value)}
+                        disabled={loading}
+                      />
+                      <TextField
+                        select
+                        fullWidth
+                        label={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.fields.kind')}
+                        value={rule.kind}
+                        onChange={(event) => updateChannelAffinityRule(ruleIndex, 'kind', event.target.value)}
+                        disabled={loading}
+                      >
+                        {CHANNEL_AFFINITY_KINDS.map((kind) => (
+                          <MenuItem key={kind} value={kind}>
+                            {kind}
+                          </MenuItem>
+                        ))}
+                      </TextField>
+                      <IconButton
+                        color="error"
+                        onClick={() => removeChannelAffinityRule(ruleIndex)}
+                        disabled={loading || inputs.channelAffinityForm.rules.length <= 1}
+                        aria-label={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.removeRule')}
+                      >
+                        <DeleteIcon />
+                      </IconButton>
+                    </Stack>
+
+                    <Stack direction={{ xs: 'column', md: 'row' }} spacing={2}>
+                      <TextField
+                        fullWidth
+                        label={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.fields.modelRegex')}
+                        value={rule.model_regex}
+                        onChange={(event) => updateChannelAffinityRule(ruleIndex, 'model_regex', event.target.value)}
+                        disabled={loading}
+                      />
+                      <TextField
+                        fullWidth
+                        label={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.fields.pathRegex')}
+                        value={rule.path_regex}
+                        onChange={(event) => updateChannelAffinityRule(ruleIndex, 'path_regex', event.target.value)}
+                        disabled={loading}
+                      />
+                      <TextField
+                        fullWidth
+                        label={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.fields.userAgentRegex')}
+                        value={rule.user_agent_regex}
+                        onChange={(event) => updateChannelAffinityRule(ruleIndex, 'user_agent_regex', event.target.value)}
+                        disabled={loading}
+                      />
+                    </Stack>
+
+                    <Stack direction={{ xs: 'column', md: 'row' }} spacing={1} sx={{ flexWrap: 'wrap' }}>
+                      {CHANNEL_AFFINITY_BOOLEAN_FIELDS.map((field) => (
+                        <FormControlLabel
+                          key={field}
+                          control={
+                            <Checkbox
+                              checked={Boolean(rule[field])}
+                              onChange={(event) => updateChannelAffinityRule(ruleIndex, field, event.target.checked)}
+                              disabled={loading}
+                            />
+                          }
+                          label={t(`setting_index.operationSettings.codexSettings.channelAffinitySetting.fields.${field}`)}
+                        />
+                      ))}
+                    </Stack>
+
+                    <TextField
+                      type="number"
+                      label={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.fields.ruleTTL')}
+                      value={rule.ttl_seconds}
+                      onChange={(event) => updateChannelAffinityRule(ruleIndex, 'ttl_seconds', event.target.value)}
+                      inputProps={{ min: 0, step: 1, inputMode: 'numeric' }}
+                      disabled={loading}
+                      sx={{ maxWidth: { xs: '100%', md: 260 } }}
+                    />
+
+                    <Divider />
+                    <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} alignItems={{ xs: 'stretch', sm: 'center' }}>
+                      <Typography variant="subtitle2" sx={{ flexGrow: 1 }}>
+                        {t('setting_index.operationSettings.codexSettings.channelAffinitySetting.keySourcesTitle')}
+                      </Typography>
+                      <Button
+                        variant="outlined"
+                        size="small"
+                        startIcon={<AddIcon />}
+                        onClick={() => addChannelAffinityKeySource(ruleIndex)}
+                        disabled={loading}
+                      >
+                        {t('setting_index.operationSettings.codexSettings.channelAffinitySetting.addKeySource')}
+                      </Button>
+                    </Stack>
+
+                    {rule.key_sources.map((source, sourceIndex) => (
+                      <Stack
+                        key={`${source.source}-${source.key}-${sourceIndex}`}
+                        direction={{ xs: 'column', md: 'row' }}
+                        spacing={1.5}
+                        alignItems={{ xs: 'stretch', md: 'center' }}
+                      >
+                        <TextField
+                          select
+                          fullWidth
+                          label={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.fields.source')}
+                          value={source.source}
+                          onChange={(event) => updateChannelAffinityKeySource(ruleIndex, sourceIndex, 'source', event.target.value)}
+                          disabled={loading}
+                        >
+                          {CHANNEL_AFFINITY_KEY_SOURCES.map((sourceOption) => (
+                            <MenuItem key={sourceOption} value={sourceOption}>
+                              {sourceOption}
+                            </MenuItem>
+                          ))}
+                        </TextField>
+                        <TextField
+                          fullWidth
+                          label={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.fields.key')}
+                          value={source.key}
+                          onChange={(event) => updateChannelAffinityKeySource(ruleIndex, sourceIndex, 'key', event.target.value)}
+                          disabled={loading}
+                        />
+                        <TextField
+                          fullWidth
+                          label={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.fields.alias')}
+                          value={source.alias}
+                          onChange={(event) => updateChannelAffinityKeySource(ruleIndex, sourceIndex, 'alias', event.target.value)}
+                          disabled={loading}
+                        />
+                        <TextField
+                          fullWidth
+                          label={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.fields.valueRegex')}
+                          value={source.value_regex}
+                          onChange={(event) => updateChannelAffinityKeySource(ruleIndex, sourceIndex, 'value_regex', event.target.value)}
+                          disabled={loading}
+                        />
+                        <IconButton
+                          color="error"
+                          onClick={() => removeChannelAffinityKeySource(ruleIndex, sourceIndex)}
+                          disabled={loading || rule.key_sources.length <= 1}
+                          aria-label={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.removeKeySource')}
+                        >
+                          <DeleteIcon />
+                        </IconButton>
+                      </Stack>
+                    ))}
+                  </Stack>
+                </Box>
+              ))}
+            </Stack>
           </FormControl>
           <Typography variant="subtitle1" sx={{ fontWeight: 600, pt: 1 }}>
             {t('setting_index.operationSettings.codexSettings.codexHintSectionTitle')}
@@ -1315,7 +1894,7 @@ const OperationSetting = () => {
               <Button
                 variant="outlined"
                 size="small"
-                onClick={() => applyCodexTemplate('CodexRoutingHintSetting', CODEX_ROUTING_HINT_RECOMMENDED_TEMPLATE)}
+                onClick={() => applyCodexTemplate('CodexRoutingHintSetting', JSON.stringify(CODEX_ROUTING_HINT_RECOMMENDED, null, 2))}
                 disabled={loading}
               >
                 {t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.useRecommended')}
@@ -1329,18 +1908,39 @@ const OperationSetting = () => {
                 {t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.useDefault')}
               </Button>
             </Stack>
-            <TextField
-              multiline
-              maxRows={20}
-              id="CodexRoutingHintSetting"
-              label={t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.label')}
-              value={inputs.CodexRoutingHintSetting}
-              name="CodexRoutingHintSetting"
-              onChange={handleTextFieldChange}
-              minRows={6}
-              placeholder={t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.placeholder')}
-              disabled={loading}
-            />
+            <Stack direction={{ xs: 'column', md: 'row' }} spacing={2}>
+              <TextField
+                select
+                fullWidth
+                id="CodexRoutingHintStrategy"
+                label={t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.fields.strategy')}
+                value={inputs.codexRoutingHintForm.prompt_cache_key_strategy}
+                onChange={(event) => updateCodexRoutingHintForm('prompt_cache_key_strategy', event.target.value)}
+                disabled={loading}
+              >
+                {PROMPT_CACHE_STRATEGIES.map((strategy) => (
+                  <MenuItem key={strategy} value={strategy}>
+                    {strategy}
+                  </MenuItem>
+                ))}
+              </TextField>
+              <TextField
+                fullWidth
+                id="CodexRoutingHintModelRegex"
+                label={t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.fields.modelRegex')}
+                value={inputs.codexRoutingHintForm.model_regex}
+                onChange={(event) => updateCodexRoutingHintForm('model_regex', event.target.value)}
+                disabled={loading}
+              />
+              <TextField
+                fullWidth
+                id="CodexRoutingHintUserAgentRegex"
+                label={t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.fields.userAgentRegex')}
+                value={inputs.codexRoutingHintForm.user_agent_regex}
+                onChange={(event) => updateCodexRoutingHintForm('user_agent_regex', event.target.value)}
+                disabled={loading}
+              />
+            </Stack>
           </FormControl>
           <Button
             variant="contained"

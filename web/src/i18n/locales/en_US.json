@@ -1056,18 +1056,52 @@
           "help": "How often to check whether the preferred channel has recovered while waiting. 50ms is usually enough; lower values add polling overhead, higher values react more slowly."
         },
         "codexRoutingHintSetting": {
-          "label": "CodexRoutingHintSetting",
-          "placeholder": "{\n  \"prompt_cache_key_strategy\": \"auto\",\n  \"model_regex\": \"^gpt-5$\"\n}",
+          "label": "Codex Advanced Configuration",
+          "placeholder": "",
           "help": "Codex-specific setting: controls whether one-hub derives a stable prompt_cache_key hint before Codex channel selection. ChannelAffinitySetting request_hint rules can read the generated hint. auto is recommended; off disables hint generation.",
           "useRecommended": "Use recommended template",
-          "useDefault": "Use off template"
+          "useDefault": "Use off template",
+          "fields": {
+            "strategy": "Prompt cache key strategy",
+            "modelRegex": "Model regex",
+            "userAgentRegex": "User-Agent regex"
+          }
         },
         "channelAffinitySetting": {
-          "label": "ChannelAffinitySetting",
-          "placeholder": "{\n  \"enabled\": true,\n  \"default_ttl_seconds\": 3600,\n  \"max_entries\": 50000\n}",
+          "label": "Channel Affinity Configuration",
+          "placeholder": "",
           "help": "General routing affinity setting: controls which Responses / Realtime requests record identity -> channel, and whether the same identity later prefers the previously successful channel. Do not set rules: []; that clears the rules.",
           "useDefault": "Use default-rule template",
-          "useBlankDefault": "Blank for backend default"
+          "useBlankDefault": "Blank for backend default",
+          "rulesTitle": "Affinity Rules",
+          "keySourcesTitle": "Key Sources",
+          "addRule": "Add rule",
+          "removeRule": "Remove rule",
+          "addKeySource": "Add key source",
+          "removeKeySource": "Remove key source",
+          "fields": {
+            "enabled": "Enabled",
+            "defaultTTL": "Default TTL (seconds)",
+            "maxEntries": "Max cache entries",
+            "ruleName": "Rule name",
+            "kind": "Request kind",
+            "modelRegex": "Model regex",
+            "pathRegex": "Path regex",
+            "userAgentRegex": "User-Agent regex",
+            "include_group": "Key includes group",
+            "include_model": "Key includes model",
+            "include_path": "Key includes path",
+            "include_rule_name": "Key includes rule name",
+            "ignore_preferred_cooldown": "Ignore preferred cooldown",
+            "strict": "Strict affinity",
+            "skip_retry_on_failure": "Skip retry after preferred failure",
+            "record_on_success": "Record on success",
+            "ruleTTL": "Rule TTL (seconds, optional)",
+            "source": "Source",
+            "key": "Field key",
+            "alias": "Alias",
+            "valueRegex": "Value regex"
+          }
         },
         "helpDialog": {
           "open": "View configuration help",
@@ -1197,7 +1231,10 @@
           "invalidWaitMilliseconds": "Preferred channel wait must be a non-negative integer",
           "invalidWaitPollMilliseconds": "Preferred channel poll wait must be a non-negative integer",
           "invalidRoutingHintJson": "CodexRoutingHintSetting must be valid JSON",
-          "invalidChannelAffinityJson": "ChannelAffinitySetting must be valid JSON"
+          "invalidChannelAffinityJson": "ChannelAffinitySetting must be valid JSON",
+          "invalidDefaultTTL": "Channel affinity default TTL must be a non-negative integer",
+          "invalidMaxEntries": "Channel affinity max entries must be a non-negative integer",
+          "invalidRuleTTL": "Affinity rule {{index}} TTL must be a non-negative integer"
         },
         "save": "Save Routing Affinity Settings"
       },
