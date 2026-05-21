@@ -57,7 +57,9 @@ responses_ws:
   first_frame_timeout_ms: 30000 # Upgrade 后等待首个 response.create 的超时
   idle_timeout_ms: 1800000 # 已建立 ResponsesWS 连接空闲超时
   max_lifetime_ms: 3600000 # 单个 ResponsesWS 连接最长存活时间；显式 0 使用默认 1 小时
+  client_pong_timeout_ms: 300000 # 已建立 ResponsesWS 连接的客户端活性超时，默认 5 分钟；0 禁用 watchdog，仅依赖 idle/max lifetime 回收
   pending_provider_events_max_bytes: 2097152 # send 结果确认前可缓存的上游事件字节上限，默认 2MiB
+  unsupported_scan_limit: 1 # 首选渠道不支持 WS 时扫描候选数，默认跟随 RetryTimes（通常为 1）；0 回退到 RetryTimes
   allow_anonymous_capacity_bucket: false # 仅测试/本地诊断可开启；生产缺少 token/user 时不进入共享 anonymous bucket
 request_body_decode:
   enabled: true # 是否启用支持该能力的 Relay 结构化路由入站 Content-Encoding 规范化

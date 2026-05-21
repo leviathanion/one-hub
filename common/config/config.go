@@ -62,6 +62,7 @@ func defaultConfig() {
 	viper.SetDefault("responses_ws.connect_per_credential_per_minute", 600)
 	viper.SetDefault("responses_ws.active_lease_redis_fail_open", true)
 	viper.SetDefault("responses_ws.first_frame_timeout_ms", 30000)
+	viper.SetDefault("responses_ws.client_pong_timeout_ms", 300000)
 	viper.SetDefault("responses_ws.idle_timeout_ms", 1800000)
 	viper.SetDefault("responses_ws.max_lifetime_ms", 3600000)
 	viper.SetDefault("responses_ws.pending_provider_events_max_bytes", 2<<20)

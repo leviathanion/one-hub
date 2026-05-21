@@ -144,3 +144,34 @@ func TestRealtimeWebsocketPingIntervalExplicitNonPositiveDisables(t *testing.T) 
 		t.Fatalf("expected explicit ping interval to be applied, got %s", got)
 	}
 }
+
+func TestResponsesWSClientPongTimeoutDefaultsAndExplicitDisable(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(func() {
+		viper.Reset()
+	})
+
+	if got := ResponsesWSClientPongTimeout(); got != 5*time.Minute {
+		t.Fatalf("expected unset client pong timeout to use default 5m, got %s", got)
+	}
+
+	defaultConfig()
+	if got := ResponsesWSClientPongTimeout(); got != 5*time.Minute {
+		t.Fatalf("expected configured default client pong timeout to be 5m, got %s", got)
+	}
+
+	viper.Set("responses_ws.client_pong_timeout_ms", 0)
+	if got := ResponsesWSClientPongTimeout(); got != 0 {
+		t.Fatalf("expected explicit zero client pong timeout to disable watchdog, got %s", got)
+	}
+
+	viper.Set("responses_ws.client_pong_timeout_ms", -1)
+	if got := ResponsesWSClientPongTimeout(); got != 0 {
+		t.Fatalf("expected explicit negative client pong timeout to disable watchdog, got %s", got)
+	}
+
+	viper.Set("responses_ws.client_pong_timeout_ms", 1500)
+	if got := ResponsesWSClientPongTimeout(); got != 1500*time.Millisecond {
+		t.Fatalf("expected explicit client pong timeout to be applied, got %s", got)
+	}
+}

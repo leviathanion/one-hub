@@ -41,6 +41,17 @@ func ResponsesWSFirstFrameTimeout() time.Duration {
 	return time.Duration(timeoutMS) * time.Millisecond
 }
 
+func ResponsesWSClientPongTimeout() time.Duration {
+	if !viper.IsSet("responses_ws.client_pong_timeout_ms") {
+		return 5 * time.Minute
+	}
+	timeoutMS := viper.GetInt("responses_ws.client_pong_timeout_ms")
+	if timeoutMS <= 0 {
+		return 0
+	}
+	return time.Duration(timeoutMS) * time.Millisecond
+}
+
 func ResponsesWSIdleTimeout() time.Duration {
 	timeoutMS := viper.GetInt("responses_ws.idle_timeout_ms")
 	if timeoutMS <= 0 {

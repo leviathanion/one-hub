@@ -508,15 +508,16 @@ func recoverResponsesWSGoroutine(label string, onPanic func(reason string)) {
 }
 
 type ResponsesWSIOBridge struct {
-	ctx          context.Context
-	cancel       context.CancelFunc
-	conn         RealtimeUserConn
-	writer       *requester.WSClientWriter
-	actor        *ResponsesWSSessionActor
-	armed        sync.Map
-	sendCommands chan responsesWSSendCommand
-	sendOnce     sync.Once
-	wg           sync.WaitGroup
+	ctx                         context.Context
+	cancel                      context.CancelFunc
+	conn                        RealtimeUserConn
+	writer                      *requester.WSClientWriter
+	actor                       *ResponsesWSSessionActor
+	armed                       sync.Map
+	sendCommands                chan responsesWSSendCommand
+	sendOnce                    sync.Once
+	clientInboundActivityUnixNS atomic.Int64
+	wg                          sync.WaitGroup
 }
 
 func NewResponsesWSIOBridge(conn RealtimeUserConn, actor *ResponsesWSSessionActor) *ResponsesWSIOBridge {
@@ -540,15 +541,41 @@ func (b *ResponsesWSIOBridge) configureConn() {
 		return
 	}
 	requester.ApplyWSReadLimit(b.conn, config.RealtimeWebsocketReadLimit)
-	b.refreshReadDeadline()
+	b.markClientInboundActivity(time.Now())
+	b.clearEstablishedReadDeadline()
 	if control, ok := b.conn.(RealtimeControlFrameConn); ok {
 		requester.InstallWSActivityHandlers(control, func() {
-			if b.actor != nil {
-				b.actor.markActivity()
-			}
-			b.refreshReadDeadline()
+			b.markClientInboundActivity(time.Now())
 		})
 	}
+}
+
+func (b *ResponsesWSIOBridge) markClientInboundActivity(now time.Time) {
+	if b == nil {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	b.clientInboundActivityUnixNS.Store(now.UnixNano())
+}
+
+func (b *ResponsesWSIOBridge) lastClientInboundActivity() time.Time {
+	if b == nil {
+		return time.Time{}
+	}
+	last := b.clientInboundActivityUnixNS.Load()
+	if last <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, last)
+}
+
+func (b *ResponsesWSIOBridge) clearEstablishedReadDeadline() {
+	if b == nil || b.conn == nil {
+		return
+	}
+	_ = b.conn.SetReadDeadline(time.Time{})
 }
 
 func (b *ResponsesWSIOBridge) StartClientReadPump() {
@@ -593,6 +620,7 @@ func (b *ResponsesWSIOBridge) StartClientReadPump() {
 				b.actor.PostReliable(ResponsesWSEventClientClosed{Err: err})
 				return
 			}
+			b.markClientInboundActivity(receivedAt)
 			b.actor.markActivity()
 			b.actor.PostReliable(ResponsesWSEventClientFrame{MessageType: mt, Payload: payload, ReceivedAt: receivedAt})
 		}
@@ -607,6 +635,7 @@ func (b *ResponsesWSIOBridge) StartClientPingLoop() {
 	if interval <= 0 {
 		return
 	}
+	pongTimeout := config.ResponsesWSClientPongTimeout()
 	b.wg.Add(1)
 	go func() {
 		defer b.wg.Done()
@@ -622,6 +651,12 @@ func (b *ResponsesWSIOBridge) StartClientPingLoop() {
 			case <-b.ctx.Done():
 				return
 			case <-ticker.C:
+				if pongTimeout > 0 && time.Since(b.lastClientInboundActivity()) >= pongTimeout {
+					if b.actor != nil {
+						b.actor.PostReliable(ResponsesWSEventTimeout{Reason: "client_pong_timeout"})
+					}
+					return
+				}
 				if err := b.writer.WriteControl(websocket.PingMessage, nil); err != nil {
 					if b.actor != nil {
 						b.actor.markClientClosed(err)
@@ -852,18 +887,6 @@ func (b *ResponsesWSIOBridge) Close() {
 		_ = b.conn.Close()
 	}
 	b.wg.Wait()
-}
-
-func (b *ResponsesWSIOBridge) refreshReadDeadline() {
-	if b == nil || b.conn == nil {
-		return
-	}
-	interval := config.RealtimeWebsocketPingInterval()
-	if interval <= 0 {
-		_ = b.conn.SetReadDeadline(time.Time{})
-		return
-	}
-	_ = b.conn.SetReadDeadline(time.Now().Add(2 * interval))
 }
 
 type responsesWSSessionState int

@@ -42,14 +42,18 @@ type responsesWSReadResult struct {
 }
 
 type responsesWSFakeUserConn struct {
-	reads        chan responsesWSReadResult
-	readLimit    int64
-	writeErr     error
-	writeCount   int32
-	closeCount   int32
-	controlCount int32
-	lastWrite    atomic.Value
-	lastControl  atomic.Value
+	reads           chan responsesWSReadResult
+	readLimit       int64
+	writeErr        error
+	controlErr      error
+	writeCount      int32
+	closeCount      int32
+	controlCount    int32
+	lastControlType int32
+	lastWrite       atomic.Value
+	lastControl     atomic.Value
+	deadlineMu      sync.Mutex
+	readDeadlines   []time.Time
 }
 
 func (c *responsesWSFakeUserConn) ReadMessage() (int, []byte, error) {
@@ -70,16 +74,62 @@ func (c *responsesWSFakeUserConn) SetReadLimit(limit int64) {
 	c.readLimit = limit
 }
 
-func (c *responsesWSFakeUserConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *responsesWSFakeUserConn) SetReadDeadline(deadline time.Time) error {
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+	c.readDeadlines = append(c.readDeadlines, deadline)
+	return nil
+}
 func (c *responsesWSFakeUserConn) SetWriteDeadline(time.Time) error { return nil }
 func (c *responsesWSFakeUserConn) Close() error {
 	atomic.AddInt32(&c.closeCount, 1)
 	return nil
 }
-func (c *responsesWSFakeUserConn) WriteControl(_ int, payload []byte, _ time.Time) error {
+func (c *responsesWSFakeUserConn) WriteControl(messageType int, payload []byte, _ time.Time) error {
 	atomic.AddInt32(&c.controlCount, 1)
+	atomic.StoreInt32(&c.lastControlType, int32(messageType))
 	c.lastControl.Store(string(payload))
+	if c.controlErr != nil {
+		return c.controlErr
+	}
 	return nil
+}
+
+func (c *responsesWSFakeUserConn) readDeadlineSnapshot() []time.Time {
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+	return append([]time.Time(nil), c.readDeadlines...)
+}
+
+type responsesWSFakeControlUserConn struct {
+	responsesWSFakeUserConn
+	handlerMu   sync.Mutex
+	pingHandler func(string) error
+	pongHandler func(string) error
+}
+
+func (c *responsesWSFakeControlUserConn) PingHandler() func(string) error {
+	c.handlerMu.Lock()
+	defer c.handlerMu.Unlock()
+	return c.pingHandler
+}
+
+func (c *responsesWSFakeControlUserConn) SetPingHandler(handler func(string) error) {
+	c.handlerMu.Lock()
+	defer c.handlerMu.Unlock()
+	c.pingHandler = handler
+}
+
+func (c *responsesWSFakeControlUserConn) PongHandler() func(string) error {
+	c.handlerMu.Lock()
+	defer c.handlerMu.Unlock()
+	return c.pongHandler
+}
+
+func (c *responsesWSFakeControlUserConn) SetPongHandler(handler func(string) error) {
+	c.handlerMu.Lock()
+	defer c.handlerMu.Unlock()
+	c.pongHandler = handler
 }
 
 type responsesWSTestProxyLocalReadError struct {
@@ -603,6 +653,190 @@ func TestResponsesWebSocketFirstFrameTimeoutReturnsSafeInvalidEventMessage(t *te
 	case <-handlerDone:
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for first-frame timeout handler to exit")
+	}
+}
+
+func TestResponsesWSBridgeClearsEstablishedReadDeadline(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	NewResponsesWSIOBridge(conn, actor)
+
+	deadlines := conn.readDeadlineSnapshot()
+	if len(deadlines) == 0 {
+		t.Fatal("expected bridge configuration to clear the established read deadline")
+	}
+	for _, deadline := range deadlines {
+		if !deadline.IsZero() {
+			t.Fatalf("expected established ResponsesWS bridge to avoid hard read deadline, got %s", deadline)
+		}
+	}
+}
+
+func TestResponsesWSControlFrameRefreshesClientLivenessNotBusinessIdle(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeControlUserConn{
+		responsesWSFakeUserConn: responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)},
+	}
+	actor := NewResponsesWSSessionActor(ctx)
+	bridge := NewResponsesWSIOBridge(conn, actor)
+
+	old := time.Now().Add(-time.Hour)
+	bridge.markClientInboundActivity(old)
+	actor.lastActivityUnixNano.Store(old.UnixNano())
+
+	pongHandler := conn.PongHandler()
+	if pongHandler == nil {
+		t.Fatal("expected bridge to install pong handler")
+	}
+	if err := pongHandler(""); err != nil {
+		t.Fatalf("expected pong handler to succeed, got %v", err)
+	}
+	if !bridge.lastClientInboundActivity().After(old) {
+		t.Fatalf("expected pong to refresh client liveness timestamp, old=%s got=%s", old, bridge.lastClientInboundActivity())
+	}
+	if got := time.Unix(0, actor.lastActivityUnixNano.Load()); !got.Equal(old) {
+		t.Fatalf("expected pong not to refresh business idle timestamp, old=%s got=%s", old, got)
+	}
+
+	if pingHandler := conn.PingHandler(); pingHandler == nil {
+		t.Fatal("expected bridge to install ping handler")
+	}
+}
+
+func TestResponsesWSClientFrameRefreshesClientLivenessAndBusinessIdle(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 2)}
+	actor := NewResponsesWSSessionActor(ctx)
+	bridge := NewResponsesWSIOBridge(conn, actor)
+
+	old := time.Now().Add(-time.Hour)
+	bridge.markClientInboundActivity(old)
+	actor.lastActivityUnixNano.Store(old.UnixNano())
+
+	conn.reads <- responsesWSReadResult{messageType: websocket.TextMessage, payload: []byte(`{"type":"response.create"}`)}
+	conn.reads <- responsesWSReadResult{err: io.EOF}
+	bridge.StartClientReadPump()
+
+	event := readResponsesWSEvent(t, actor)
+	if _, ok := event.(ResponsesWSEventClientFrame); !ok {
+		t.Fatalf("expected first read pump event to be client frame, got %T", event)
+	}
+	if !bridge.lastClientInboundActivity().After(old) {
+		t.Fatalf("expected client frame to refresh client liveness timestamp, old=%s got=%s", old, bridge.lastClientInboundActivity())
+	}
+	if got := time.Unix(0, actor.lastActivityUnixNano.Load()); !got.After(old) {
+		t.Fatalf("expected client frame to refresh business idle timestamp, old=%s got=%s", old, got)
+	}
+}
+
+func TestResponsesWSPingLoopClosesWithClientPongTimeoutReason(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setResponsesWSTestViperInt(t, "realtime.websocket_ping_interval_ms", 5)
+	setResponsesWSTestViperInt(t, "responses_ws.client_pong_timeout_ms", 10)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	bridge := NewResponsesWSIOBridge(conn, actor)
+	actor.SetBridge(bridge)
+	bridge.markClientInboundActivity(time.Now().Add(-time.Hour))
+	bridge.StartClientPingLoop()
+
+	event := readResponsesWSEvent(t, actor)
+	timeoutEvent, ok := event.(ResponsesWSEventTimeout)
+	if !ok {
+		t.Fatalf("expected client pong timeout event, got %T", event)
+	}
+	if timeoutEvent.Reason != "client_pong_timeout" {
+		t.Fatalf("expected client_pong_timeout reason, got %q", timeoutEvent.Reason)
+	}
+	actor.close(timeoutEvent.Reason)
+
+	if got := atomic.LoadInt32(&conn.lastControlType); got != websocket.CloseMessage {
+		t.Fatalf("expected final control frame to be websocket close, got %d", got)
+	}
+	if got := conn.lastControl.Load(); !strings.Contains(fmt.Sprint(got), "client_pong_timeout") {
+		t.Fatalf("expected close reason client_pong_timeout, got %#v", got)
+	}
+}
+
+func TestResponsesWSPingLoopDisabledWatchdogStillSendsPings(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setResponsesWSTestViperInt(t, "realtime.websocket_ping_interval_ms", 5)
+	setResponsesWSTestViperInt(t, "responses_ws.client_pong_timeout_ms", 0)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	bridge := NewResponsesWSIOBridge(conn, actor)
+	actor.SetBridge(bridge)
+	bridge.markClientInboundActivity(time.Now().Add(-time.Hour))
+	bridge.StartClientPingLoop()
+
+	// Wait for at least one ping to be sent, then cancel context to stop the loop
+	time.Sleep(50 * time.Millisecond)
+	bridge.cancel()
+
+	if got := atomic.LoadInt32(&conn.controlCount); got < 1 {
+		t.Fatalf("expected at least one ping to be sent when watchdog is disabled, got %d control writes", got)
+	}
+
+	// verify no timeout event was posted (only pings should happen, no timeout)
+	select {
+	case event := <-actor.events:
+		if _, ok := event.(ResponsesWSEventTimeout); ok {
+			t.Fatal("expected no timeout event when client pong watchdog is disabled")
+		}
+	default:
+	}
+}
+
+func TestResponsesWSPingLoopWriteControlErrorPostsClientClosed(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setResponsesWSTestViperInt(t, "realtime.websocket_ping_interval_ms", 5)
+	setResponsesWSTestViperInt(t, "responses_ws.client_pong_timeout_ms", 300000)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	writeErr := errors.New("simulated WriteControl failure")
+	conn := &responsesWSFakeUserConn{
+		reads:      make(chan responsesWSReadResult, 1),
+		controlErr: writeErr,
+	}
+	actor := NewResponsesWSSessionActor(ctx)
+	bridge := NewResponsesWSIOBridge(conn, actor)
+	actor.SetBridge(bridge)
+	bridge.markClientInboundActivity(time.Now())
+	bridge.StartClientPingLoop()
+
+	event := readResponsesWSEvent(t, actor)
+	closedEvent, ok := event.(ResponsesWSEventClientClosed)
+	if !ok {
+		t.Fatalf("expected client closed event on WriteControl error, got %T", event)
+	}
+	if closedEvent.Err != writeErr {
+		t.Fatalf("expected WriteControl error %v propagated, got %v", writeErr, closedEvent.Err)
 	}
 }
 

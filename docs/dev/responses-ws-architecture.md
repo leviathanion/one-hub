@@ -120,9 +120,9 @@ actor 后续 turn 使用当前 upstream session 和该 snapshot 做日志、诊�
 38. 上游 provider websocket 写也必须有 deadline。实际写上游 frame 的 adapter 在写锁内设置 `SetWriteDeadline(now+RealtimeWebsocketWriteTimeout())`，写后清零；deadline/partial write 失败默认映射为 `SendOutcomeAmbiguous`。
 39. proxy-local error frame 不能触发 terminal sniff、active turn cleanup 或 affinity clear。
 40. `session.Recv` 返回的 payload 来源必须通过类型表达：没有 provider-origin proof 的 `Recv` error payload 一律按 proxy-local 写；provider-origin `payload + err` 必须端到端保真，先 primary payload，再把 `ClientPayloadError` 携带的 client payload 作为 proxy-local error 补发；若 err 不携带 `ClientPayloadError`，则在 primary payload 之后投递 provider close/timeout。
-41. gorilla read deadline 持续作用于后续 reads；5 秒 first-frame deadline 只覆盖首帧读取，首帧成功后必须 `SetReadDeadline(time.Time{})` 或替换为正式 idle/read 策略。
-42. gorilla ping/pong control frames 必须刷新 connection activity。
-43. ResponsesWS established session 的 idle 语义以 `ResponsesWSIdleTimeout` 和 active-turn 状态为准。provider data frame、usage event、provider-originated error 都必须刷新 actor activity。OpenAI ResponsesWS 的 gorilla read-side API 只属于 read loop / read handler，writer 路径的 turn 状态变化不调用 `SetReadDeadline`，active-turn 短超时由 session timer 表达。
+41. gorilla read deadline 一旦设置会持续作用于后续 reads；first-frame deadline 只覆盖首帧读取，首帧成功后必须 `SetReadDeadline(time.Time{})`，established 阶段不得重新套用 `2 * realtime.websocket_ping_interval_ms` 这类隐式 read deadline。
+42. gorilla ping/pong control frames 必须刷新 connection liveness，但不能刷新 actor business idle；普通客户端 data frame 才同时刷新 connection liveness 和 actor activity。
+43. ResponsesWS established session 的 idle 语义以 `ResponsesWSIdleTimeout` 和业务 activity 为准。provider data frame、usage event、provider-originated error、客户端 data frame 都必须刷新 actor activity。OpenAI ResponsesWS 的 gorilla read-side API 只属于 read loop / read handler，writer 路径的 turn 状态变化不调用 `SetReadDeadline`，active-turn 无 provider/client data activity 时由业务 idle/后续独立 turn timer 关闭，不能复用客户端 socket read deadline。
 44. handler 的 live `gin.Context` 不跨 goroutine 读写。turn prepare/record/clear 使用稳定 input 或 `c.Copy()`。
 45. actor mailbox 事件必须分级：`SendResult`、actor 自身 panic/timeout 这类账本 proof / fail-closed 事件必须可靠投递；普通 provider data frame 可以受 mailbox backpressure 影响，但丢弃时必须最终投递 backpressure timeout 或关闭连接。
 46. `pendingProviderEvents` 必须同时有事件数和字节数上限；上限触发时 fail closed，不能靠 mailbox 长度推导内存边界。
@@ -139,7 +139,7 @@ actor 后续 turn 使用当前 upstream session 和该 snapshot 做日志、诊�
 | `ResponsesAffinityManager` | responses-kind affinity 的 candidate、commit、record、clear 门面；所有调用来自 actor，所有 stale binding 清理必须带 owner 条件。 |
 | `ResponsesTerminalClassifier` | 把 provider-originated 下行事件分类成 `non_terminal / success_terminal / failed_terminal`，并给出有限 normalize 结果；放在 `common/responsesws` 供 relay 和 provider 共用。 |
 | `RawResponsesProtocolForwarder` | parse、projection、rewrite 和 provider adapter；raw bytes 是 no-op passthrough 的转发真相，`map[string]json.RawMessage` 承诺 JSON value 语义保留，不承诺 byte-for-byte transcript。实现在 `common/responsesws/raw_frame.go` 和 `common/responsesws/terminal_classifier.go`。 |
-| `ResponsesWSConnectionLimiter` | 提供 `AcquireResponsesWSPendingSlot` / `AcquireResponsesWSActiveLease`，pending slot 默认按 credential 限 1，active lease 三层（credential/group/global）可配置。 |
+| `ResponsesWSConnectionLimiter` | 提供 `AcquireResponsesWSPendingSlot` / `AcquireResponsesWSActiveLease`，pending slot 默认按 credential 限 96，active lease 三层（credential/group/global）可配置。 |
 
 ## 与 WebSocket 底层复用的关系
 
@@ -161,6 +161,7 @@ ResponsesWS 使用两类连接 lease：
 | `responses_ws.active_per_credential` | `128` | 打开首个 upstream session 前获取，actor close/handler return 后释放 |
 | `responses_ws.active_per_group` | `128` | 同 active lease |
 | `responses_ws.active_global` | `1024` | 同 active lease |
+| `responses_ws.active_lease_redis_fail_open` | `true` | Redis 不可用时是否 fallback 进程内计数；`false` 则拒绝新 active lease |
 
 active lease 不随首帧发送成功释放，因为 established websocket 可能 idle 很久。首帧 retry 其它候选 channel 复用同一个 active lease。
 
@@ -191,11 +192,12 @@ active lease 不随首帧发送成功释放，因为 established websocket 可�
 | `realtime.websocket_ping_interval_ms` | `25000`（`<=0` 显式禁用，仅建议测试使用） |
 | `realtime.websocket_write_timeout_ms` | `10000` |
 | `responses_ws.first_frame_timeout_ms` | `30000` |
+| `responses_ws.client_pong_timeout_ms` | `300000` |
 | `responses_ws.idle_timeout_ms` | `1800000` |
 | `responses_ws.max_lifetime_ms` | `3600000` |
 | `responses_ws.pending_provider_events_max_bytes` | `2097152` |
 
-首帧读取成功后会清除 first-frame read deadline，后续 idle 由 actor watchdog 与服务端 ping/pong activity 维护；总连接寿命墙用于回收长期挂起连接，pending provider buffer 上限用于限制 send 结果确认前的内存占用。Trade-off：32 MiB 默认 read limit 降低 Codex 大上下文/文件负载误伤，但会提高单连接峰值内存预算；超限后 gorilla 连接不可复用，因此实现返回静态 `invalid_event` 后关闭连接。
+首帧读取成功后会清除 first-frame read deadline，established 阶段的客户端连接活性由服务端 ping 和 `responses_ws.client_pong_timeout_ms` watchdog 维护，所有客户端入站 data/control frame 都刷新该 liveness；业务 idle 由 actor watchdog 维护，只由客户端 data frame 与 provider frame/usage/error 刷新。总连接寿命墙用于回收长期挂起连接，pending provider buffer 上限用于限制 send 结果确认前的内存占用。Trade-off：32 MiB 默认 read limit 降低 Codex 大上下文/文件负载误伤，但会提高单连接峰值内存预算；超限后 gorilla 连接不可复用，因此实现返回静态 `invalid_event` 后关闭连接。
 
 ## Turn 事务
 
@@ -352,7 +354,7 @@ Provider 边界以 [OpenAI Responses WebSocket mode](https://developers.openai.c
 
 ### Read timeout 分层
 
-OpenAI ResponsesWS 的 read timeout 分两层：read loop 在读侧设置 gorilla read deadline；writer 侧 start/rollback turn 只 arm/stop active-turn timer。timer 到期时以 `provider_read_timeout` 关闭 session。Trade-off：writer 侧不会即时改写 gorilla deadline；收益是保持 gorilla read-side 单 goroutine 归属，同时 active turn 无 provider activity 仍能有界结束。
+OpenAI ResponsesWS 的 timeout 分层：首帧用 gorilla read deadline 限制握手悬挂；首帧成功后立即清除 gorilla read deadline；客户端连接活性由 ping/pong liveness watchdog 判断，超时原因固定为 `client_pong_timeout`；业务 idle 由 actor watchdog 判断，provider frame、usage、provider-originated error 和客户端 data frame 刷新 actor activity。Trade-off：不再用 `2 * realtime.websocket_ping_interval_ms` 隐式杀 established 连接，代价是断开的客户端最多保留到 `responses_ws.client_pong_timeout_ms` 才回收；收益是长 Codex/ResponsesWS turn 不会因为下游 pong 抖动被 50 秒 socket deadline 误杀。
 
 ## 失败矩阵
 

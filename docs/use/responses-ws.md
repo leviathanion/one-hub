@@ -22,6 +22,7 @@ ResponsesWS 是一个 **turn-based** WebSocket 入口：一条连接上可以发
 | `responses_ws.active_global` | `config.yaml` | 重启服务 |
 | `responses_ws.active_lease_redis_fail_open` | `config.yaml` | 重启服务 |
 | `responses_ws.first_frame_timeout_ms` | `config.yaml` | 重启服务 |
+| `responses_ws.client_pong_timeout_ms` | `config.yaml` | 重启服务 |
 | `responses_ws.idle_timeout_ms` | `config.yaml` | 重启服务 |
 | `responses_ws.max_lifetime_ms` | `config.yaml` | 重启服务 |
 | `responses_ws.pending_provider_events_max_bytes` | `config.yaml` | 重启服务 |
@@ -51,6 +52,7 @@ responses_ws:
 
   # ---- 超时管理 ----
   first_frame_timeout_ms: 30000             # 首帧超时
+  client_pong_timeout_ms: 300000            # 客户端 pong/入站活性超时（5 分钟）
   idle_timeout_ms: 1800000                  # 空闲超时（30 分钟）
   max_lifetime_ms: 3600000                  # 最大存活时间（1 小时）
 
@@ -81,7 +83,7 @@ ResponsesWS 使用三级容量控制，逐级检查：
 | 属性 | 值 |
 |------|-----|
 | 类型 | `int` |
-| 默认值 | `30` |
+| 默认值 | `600` |
 | 必填 | 否 |
 
 **作用**：每个凭据每分钟允许发起的 WebSocket 建连尝试次数（Upgrade 握手即计数，不保证最终升级成功）。防止单凭据高频建连耗尽服务端资源。
@@ -113,7 +115,7 @@ responses_ws:
 | 属性 | 值 |
 |------|-----|
 | 类型 | `int` |
-| 默认值 | `1` |
+| 默认值 | `96` |
 | 必填 | 否 |
 
 **作用**：WebSocket Upgrade 成功后、首个 `response.create` 到达前的 pending 槽位上限。每个凭据同时只能有一个连接处于"已升级但未发首帧"状态。这是针对"升级后不发首帧就挂起"的防守。
@@ -144,7 +146,7 @@ responses_ws:
 | 属性 | 值 |
 |------|-----|
 | 类型 | `int` |
-| 默认值 | `8` |
+| 默认值 | `128` |
 | 必填 | 否 |
 
 **作用**：单个凭据同时可维持的**已建立** ResponsesWS 连接数上限。established 定义为已打开上游 session。
@@ -272,10 +274,10 @@ responses_ws:
 | 属性 | 值 |
 |------|-----|
 | 类型 | `int`（毫秒） |
-| 默认值 | `5000`（5 秒） |
+| 默认值 | `30000`（30 秒） |
 | 必填 | 否 |
 
-**作用**：WebSocket Upgrade 成功后等待首个 `response.create` 的最大时间。超时后连接被关闭。只覆盖首帧读取阶段；首帧成功后 `ReadDeadline` 被清除，连接进入 idle 超时管理。
+**作用**：WebSocket Upgrade 成功后等待首个 `response.create` 的最大时间。超时后连接被关闭。只覆盖首帧读取阶段；首帧成功后 `ReadDeadline` 被清除，连接进入 client liveness 和业务 idle 超时管理。
 
 **可配置值**：
 
@@ -299,6 +301,47 @@ responses_ws:
 
 ---
 
+#### `responses_ws.client_pong_timeout_ms` 🏷️ config.yaml
+
+| 属性 | 值 |
+|------|-----|
+| 类型 | `int`（毫秒） |
+| 默认值 | `300000`（5 分钟） |
+| 必填 | 否 |
+
+**作用**：已建立 ResponsesWS 连接的客户端活性超时。服务端仍按 `realtime.websocket_ping_interval_ms` 发送 ping；客户端 data frame、ping、pong 都会刷新活性时间。超过此时间没有任何客户端入站活动时，连接以 `client_pong_timeout` 关闭。
+
+**可配置值**：
+
+| 值 | 行为 | 影响 |
+|----|------|------|
+| `300000`（默认） | 5 分钟 | 适合跨境链路、移动网络和长 Codex turn |
+| `120000` | 2 分钟 | 更快回收断开的客户端 |
+| `0` | 禁用 client-pong watchdog | 仅建议本地诊断，断开客户端会依赖 idle/max lifetime 回收 |
+
+**示例**：
+
+```yaml
+responses_ws:
+  client_pong_timeout_ms: 300000
+```
+
+**对系统的影响**：
+- 过小：跨境链路或中间代理短暂抖动时，长 turn 可能被误关。
+- 过大：真实断开的客户端会更久占用 active lease。
+- 该超时不代表业务 idle；ping/pong 不会延长 `responses_ws.idle_timeout_ms`。
+
+**与 ping 间隔的关系**：
+- `client_pong_timeout_ms` 应至少为 `realtime.websocket_ping_interval_ms` 的 2–3 倍。默认值 300s 相对 25s ping 间隔有 12 倍余量，安全。
+- 若调小至与 ping 间隔相近（如 30s），单个丢包或网络抖动就可能触发误关。
+
+**排障信号**：
+- 超时关闭码：`1000`（正常关闭），关闭原因字符串：`"client_pong_timeout"`
+- 日志：搜索 `"client_pong_timeout"` 可定位所有因客户端活性超时关闭的连接
+- 若用户频繁报告断连：先排查客户端是否正确回复 pong；若非客户端问题，适当调大 `client_pong_timeout_ms`
+
+---
+
 #### `responses_ws.idle_timeout_ms` 🏷️ config.yaml
 
 | 属性 | 值 |
@@ -307,7 +350,7 @@ responses_ws:
 | 默认值 | `1800000`（30 分钟） |
 | 必填 | 否 |
 
-**作用**：已建立连接的空闲超时。连接上无客户端帧、无上游事件、无 turn 活动超过此时间后，连接被关闭。**active-turn 期间不计入 idle**（active-turn 有独立的 session timer 管理）。
+**作用**：已建立连接的业务空闲超时。连接上无客户端 data frame、无上游 provider frame/usage/error 超过此时间后，连接被关闭。ping/pong control frame 只刷新客户端连接活性，不刷新业务 idle。
 
 **可配置值**：
 
@@ -577,6 +620,7 @@ Codex 渠道作为 ResponsesWS 上游时的 `channel.Other` 配置，详见 [Cod
 | 写超时 | `realtime.websocket_write_timeout_ms` | 同（复用同一 writer primitive） |
 | 读上限 | `realtime.websocket_read_limit` | 同（复用同一 read limit primitive） |
 | Ping 间隔 | `realtime.websocket_ping_interval_ms` | 同 |
+| Pong 超时 | 无（依赖 socket read deadline） | `responses_ws.client_pong_timeout_ms` |
 
 ## 相关文档
 
