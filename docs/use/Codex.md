@@ -159,7 +159,7 @@ Codex 渠道当前通过 OpenAI 兼容接口使用，支持以下路径：
 - `off`
   默认值，不生成 routing hint。
 - `auto`
-  自动按优先级选稳定身份：`session_id` -> 外部认证头 -> token id -> user id。
+  自动按优先级选稳定身份：`previous_response_id` -> `session_id` -> 外部认证头 -> token id -> user id。其中 `previous_response_id` 会直接作为 `prompt_cache_key` 使用，不做额外编码或哈希。
 - `session_id`
   固定按 `x-session-id` / `session_id` 派生。
 - `token_id`
@@ -854,7 +854,7 @@ trade-off：
 | 策略 | 稳定身份来源 | 适用场景 |
 | --- | --- | --- |
 | `off` | 不自动生成 | 默认行为，或希望完全由客户端自己控制 |
-| `auto` | 显式 `prompt_cache_key` -> `x-session-id/session_id` -> 请求头认证值 -> `token_id` -> `user_id` | 大多数场景的推荐配置 |
+| `auto` | 显式 `prompt_cache_key` -> `previous_response_id` -> `x-session-id/session_id` -> 请求头认证值 -> `token_id` -> `user_id` | 大多数场景的推荐配置；`previous_response_id` 会直接复用为 `prompt_cache_key` |
 | `session_id` | 请求头中的 `x-session-id` / `session_id` | 客户端稳定传会话 ID，希望按会话维度粘住缓存 |
 | `token_id` | One Hub 令牌 ID | 希望每个令牌独立维护缓存 |
 | `user_id` | One Hub 用户 ID | 同一用户多个令牌共享缓存 |

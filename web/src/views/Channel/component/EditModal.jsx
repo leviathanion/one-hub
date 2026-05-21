@@ -18,6 +18,7 @@ import {
   FormControl,
   InputLabel,
   OutlinedInput,
+  InputAdornment,
   ButtonGroup,
   Container,
   Autocomplete,
@@ -27,6 +28,7 @@ import {
   FormControlLabel,
   Typography,
   Tooltip,
+  IconButton,
   Collapse,
   Box,
   Chip,
@@ -102,17 +104,45 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
   const [codexSessionId, setCodexSessionId] = useState('');
   const [codexAuthCode, setCodexAuthCode] = useState('');
   const [codexSubmitting, setCodexSubmitting] = useState(false);
+  const [codexConfigHelpOpen, setCodexConfigHelpOpen] = useState(false);
+  const codexConfigFields = [
+    ['prompt_cache_key_strategy', 'off', 'auto / off / session_id / auth_header / token_id / user_id', '未显式传 prompt_cache_key 时如何自动生成稳定值'],
+    ['websocket_mode', 'auto', 'auto / force / off', '控制 Realtime 优先 websocket、强制 websocket，或禁用 websocket'],
+    ['execution_session_ttl_seconds', '600', '正整数秒', 'execution session 空闲保留时长'],
+    ['websocket_retry_cooldown_seconds', '120', '正整数秒', 'websocket 失败后切回 HTTP bridge 的冷却时间'],
+    ['self_hosted', 'false', 'true / false', '允许 Codex Realtime 使用私有或本地自建上游'],
+    ['responses_ws_self_hosted', 'false', 'true / false', '允许 Responses websocket 使用私有或本地自建上游'],
+    ['user_agent', '内置 Codex CLI UA', '字符串', '覆盖向 Codex 上游发送的 User-Agent']
+  ];
   const codexConfigExamples = [
     {
-      title: '默认行为(不自动生成)',
+      title: '默认行为：不自动生成 prompt_cache_key',
       value: `{
   "prompt_cache_key_strategy": "off"
 }`
     },
     {
-      title: '开启自动生成(常用推荐)',
+      title: '常用：自动生成稳定 prompt_cache_key',
       value: `{
   "prompt_cache_key_strategy": "auto"
+}`
+    },
+    {
+      title: 'Realtime：优先 websocket，失败回退 HTTP bridge',
+      value: `{
+  "websocket_mode": "auto"
+}`
+    },
+    {
+      title: 'Realtime：必须走 websocket',
+      value: `{
+  "websocket_mode": "force"
+}`
+    },
+    {
+      title: 'Realtime：禁用 websocket',
+      value: `{
+  "websocket_mode": "off"
 }`
     },
     {
@@ -137,6 +167,21 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
       title: '按外部认证头共享缓存',
       value: `{
   "prompt_cache_key_strategy": "auth_header"
+}`
+    },
+    {
+      title: '自建或内网上游：显式放开私有地址',
+      value: `{
+  "websocket_mode": "auto",
+  "self_hosted": true,
+  "responses_ws_self_hosted": true
+}`
+    },
+    {
+      title: '进阶：调整 session TTL 与 websocket 冷却',
+      value: `{
+  "execution_session_ttl_seconds": 600,
+  "websocket_retry_cooldown_seconds": 120
 }`
     }
   ];
@@ -852,6 +897,23 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                         disabled={hasTag}
                         onBlur={handleBlur}
                         onChange={handleChange}
+                        endAdornment={
+                          values.type === 101 ? (
+                            <InputAdornment position="end" sx={{ alignSelf: values.type === 101 ? 'flex-start' : 'center', mt: 0.5 }}>
+                              <Tooltip title="查看 Codex 配置帮助">
+                                <IconButton
+                                  aria-label="查看 Codex 配置帮助"
+                                  edge="end"
+                                  size="small"
+                                  type="button"
+                                  onClick={() => setCodexConfigHelpOpen(true)}
+                                >
+                                  <Icon icon="solar:question-circle-bold-duotone" width={20} />
+                                </IconButton>
+                              </Tooltip>
+                            </InputAdornment>
+                          ) : null
+                        }
                         inputProps={{}}
                         aria-describedby="helper-text-channel-other-label"
                       />
@@ -865,87 +927,70 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                     </FormControl>
 
                     {values.type === 101 && (
-                      <Alert severity="info" sx={{ mt: 1.5 }}>
-                        <Typography variant="subtitle2" sx={{ mb: 1 }}>
-                          Codex 配置模板
-                        </Typography>
-                        <Typography variant="body2" component="div" sx={{ mb: 1.5 }}>
-                          直接复制下面任意一个 JSON 到{' '}
-                          <Box
-                            component="code"
-                            sx={{
-                              px: 0.5,
-                              py: 0.1,
-                              borderRadius: 0.5,
-                              backgroundColor: theme.palette.mode === 'dark' ? 'grey.800' : 'grey.200',
-                              fontSize: '0.75rem'
-                            }}
-                          >
-                            Codex 配置(JSON)
-                          </Box>{' '}
-                          中即可。不配置时默认等效于{' '}
-                          <Box
-                            component="code"
-                            sx={{
-                              px: 0.5,
-                              py: 0.1,
-                              borderRadius: 0.5,
-                              backgroundColor: theme.palette.mode === 'dark' ? 'grey.800' : 'grey.200',
-                              fontSize: '0.75rem'
-                            }}
-                          >
-                            off
+                      <Dialog open={codexConfigHelpOpen} onClose={() => setCodexConfigHelpOpen(false)} fullWidth maxWidth="md">
+                        <DialogTitle>Codex 配置帮助</DialogTitle>
+                        <DialogContent dividers>
+                          <Typography variant="body2" sx={{ mb: 2 }}>
+                            这里填写的是渠道级 JSON，对应后端 channel.Other。留空可用默认值；如果你已经在请求里显式传
+                            prompt_cache_key，通常不需要配置 prompt_cache_key_strategy。
+                          </Typography>
+                          <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                            支持字段
+                          </Typography>
+                          <Box sx={{ display: 'grid', gap: 1, mb: 2 }}>
+                            {codexConfigFields.map(([field, defaultValue, accepted, description]) => (
+                              <Box
+                                key={field}
+                                sx={{
+                                  display: 'grid',
+                                  gridTemplateColumns: { xs: '1fr', sm: '210px 120px 1fr' },
+                                  gap: 1,
+                                  p: 1,
+                                  borderRadius: 1,
+                                  backgroundColor: theme.palette.mode === 'dark' ? 'grey.900' : 'grey.50'
+                                }}
+                              >
+                                <Typography component="code" variant="caption" sx={{ fontWeight: 700 }}>
+                                  {field}
+                                </Typography>
+                                <Typography variant="caption">默认：{defaultValue}</Typography>
+                                <Typography variant="caption">
+                                  {accepted}；{description}
+                                </Typography>
+                              </Box>
+                            ))}
                           </Box>
-                          ；如果你会在请求体里自己传{' '}
-                          <Box
-                            component="code"
-                            sx={{
-                              px: 0.5,
-                              py: 0.1,
-                              borderRadius: 0.5,
-                              backgroundColor: theme.palette.mode === 'dark' ? 'grey.800' : 'grey.200',
-                              fontSize: '0.75rem'
-                            }}
-                          >
-                            prompt_cache_key
+                          <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                            可复制模板
+                          </Typography>
+                          <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' }, gap: 1.5 }}>
+                            {codexConfigExamples.map((example) => (
+                              <Box key={example.title}>
+                                <Typography variant="caption" sx={{ display: 'block', mb: 0.5, fontWeight: 700 }}>
+                                  {example.title}
+                                </Typography>
+                                <Box
+                                  component="pre"
+                                  sx={{
+                                    m: 0,
+                                    p: 1.25,
+                                    borderRadius: 1,
+                                    overflowX: 'auto',
+                                    backgroundColor: theme.palette.mode === 'dark' ? 'grey.900' : 'grey.100',
+                                    fontSize: '0.75rem',
+                                    lineHeight: 1.5
+                                  }}
+                                >
+                                  {example.value}
+                                </Box>
+                              </Box>
+                            ))}
                           </Box>
-                          ，保持默认即可；如需自动生成稳定 key，再显式设置{' '}
-                          <Box
-                            component="code"
-                            sx={{
-                              px: 0.5,
-                              py: 0.1,
-                              borderRadius: 0.5,
-                              backgroundColor: theme.palette.mode === 'dark' ? 'grey.800' : 'grey.200',
-                              fontSize: '0.75rem'
-                            }}
-                          >
-                            auto
-                          </Box>
-                          。
-                        </Typography>
-                        {codexConfigExamples.map((example) => (
-                          <Box key={example.title} sx={{ mb: 1.5, '&:last-child': { mb: 0 } }}>
-                            <Typography variant="caption" sx={{ display: 'block', mb: 0.5, fontWeight: 700 }}>
-                              {example.title}
-                            </Typography>
-                            <Box
-                              component="pre"
-                              sx={{
-                                m: 0,
-                                p: 1.25,
-                                borderRadius: 1,
-                                overflowX: 'auto',
-                                backgroundColor: theme.palette.mode === 'dark' ? 'grey.900' : 'grey.100',
-                                fontSize: '0.75rem',
-                                lineHeight: 1.5
-                              }}
-                            >
-                              {example.value}
-                            </Box>
-                          </Box>
-                        ))}
-                      </Alert>
+                        </DialogContent>
+                        <DialogActions>
+                          <Button onClick={() => setCodexConfigHelpOpen(false)}>关闭</Button>
+                        </DialogActions>
+                      </Dialog>
                     )}
                   </Box>
                 )}

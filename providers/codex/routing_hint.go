@@ -126,7 +126,7 @@ func (codexResponsesHintResolver) ResolveResponsesHints(ctx *gin.Context, reques
 		return nil
 	}
 
-	key := promptCacheKeyForStrategy(ctx, settings.PromptCacheKeyStrategy)
+	key := promptCacheKeyForRequestStrategy(request, ctx, settings.PromptCacheKeyStrategy)
 	if key == "" {
 		return nil
 	}

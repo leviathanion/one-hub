@@ -42,6 +42,15 @@ func promptCacheKeyForStrategy(ctx *gin.Context, strategy string) string {
 	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(identity)).String()
 }
 
+func promptCacheKeyForRequestStrategy(request *types.OpenAIResponsesRequest, ctx *gin.Context, strategy string) string {
+	if normalizePromptCacheStrategy(strategy) == codexPromptCacheStrategyAuto {
+		if previousResponseID := strings.TrimSpace(requestPreviousResponseID(request)); previousResponseID != "" {
+			return previousResponseID
+		}
+	}
+	return promptCacheKeyForStrategy(ctx, strategy)
+}
+
 func ensureStablePromptCacheKey(request *types.OpenAIResponsesRequest, ctx *gin.Context, strategy string) {
 	if request == nil || strings.TrimSpace(request.PromptCacheKey) != "" {
 		return
@@ -52,7 +61,14 @@ func ensureStablePromptCacheKey(request *types.OpenAIResponsesRequest, ctx *gin.
 		return
 	}
 
-	request.PromptCacheKey = promptCacheKeyForStrategy(ctx, strategy)
+	request.PromptCacheKey = promptCacheKeyForRequestStrategy(request, ctx, strategy)
+}
+
+func requestPreviousResponseID(request *types.OpenAIResponsesRequest) string {
+	if request == nil {
+		return ""
+	}
+	return strings.TrimSpace(request.PreviousResponseID)
 }
 
 func codexPromptCacheIdentity(ctx *gin.Context, strategy string) string {

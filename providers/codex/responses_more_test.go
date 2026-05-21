@@ -260,6 +260,9 @@ func TestCodexResponsesIncludePromptCacheAndSystemMessageHelpers(t *testing.T) {
 	if got := codexPromptCacheIdentity(ctx, codexPromptCacheStrategyAuto); got != "one-hub:codex:prompt-cache:session:session-xyz" {
 		t.Fatalf("expected auto strategy to prefer session identity, got %q", got)
 	}
+	if got := promptCacheKeyForRequestStrategy(&types.OpenAIResponsesRequest{PreviousResponseID: "resp-auto-direct"}, ctx, codexPromptCacheStrategyAuto); got != "resp-auto-direct" {
+		t.Fatalf("expected auto strategy to use previous_response_id directly, got %q", got)
+	}
 
 	stableKeyRequest := &types.OpenAIResponsesRequest{}
 	ensureStablePromptCacheKey(stableKeyRequest, ctx, codexPromptCacheStrategyUserID)
@@ -299,9 +302,15 @@ func TestCodexResponsesRoutingHintResolver(t *testing.T) {
 
 	request := &types.OpenAIResponsesRequest{Model: "gpt-5"}
 	hints := requesthints.ResolveResponses(ctx, request)
-	expectedKey := promptCacheKeyForStrategy(ctx, codexPromptCacheStrategyAuto)
+	expectedKey := promptCacheKeyForRequestStrategy(request, ctx, codexPromptCacheStrategyAuto)
 	if got := hints[requesthints.ResponsesPromptCacheKey]; got != expectedKey {
 		t.Fatalf("expected resolver to publish derived prompt cache key %q, got %#v", expectedKey, hints)
+	}
+
+	requesthints.Set(ctx, nil)
+	previousRequest := &types.OpenAIResponsesRequest{Model: "gpt-5", PreviousResponseID: "resp_hint_direct"}
+	if hints := requesthints.ResolveResponses(ctx, previousRequest); hints[requesthints.ResponsesPromptCacheKey] != "resp_hint_direct" {
+		t.Fatalf("expected resolver to publish previous_response_id directly, got %#v", hints)
 	}
 
 	requesthints.Set(ctx, nil)
@@ -330,8 +339,12 @@ func TestCodexPromptCacheAutoPriorityFallsBackAcrossSignals(t *testing.T) {
 	})
 	sessionCtx.Set("token_id", 11)
 	sessionCtx.Set("id", 22)
-	if got := codexPromptCacheIdentity(sessionCtx, codexPromptCacheStrategyAuto); got != "one-hub:codex:prompt-cache:session:session-priority" {
-		t.Fatalf("expected session id to win auto priority, got %q", got)
+	previousRequest := &types.OpenAIResponsesRequest{PreviousResponseID: "resp-priority"}
+	if got := promptCacheKeyForRequestStrategy(previousRequest, sessionCtx, codexPromptCacheStrategyAuto); got != "resp-priority" {
+		t.Fatalf("expected previous_response_id to win auto priority directly, got %q", got)
+	}
+	if got := promptCacheKeyForRequestStrategy(&types.OpenAIResponsesRequest{}, sessionCtx, codexPromptCacheStrategyAuto); got != uuid.NewSHA1(uuid.NameSpaceOID, []byte("one-hub:codex:prompt-cache:session:session-priority")).String() {
+		t.Fatalf("expected session id to win auto priority when previous_response_id is absent, got %q", got)
 	}
 
 	authCtx := newCtx(map[string]string{

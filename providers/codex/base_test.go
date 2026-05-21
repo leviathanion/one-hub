@@ -530,6 +530,26 @@ func TestPrepareCodexRequestGeneratesStablePromptCacheKeyFromTokenIDWhenAutoEnab
 	}
 }
 
+func TestPrepareCodexRequestAutoUsesPreviousResponseIDAsPromptCacheKey(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, `{"prompt_cache_key_strategy":"auto"}`, map[string]string{
+		"X-Session-Id": "client-session-123",
+	})
+	provider.Context.Set("token_id", 12345)
+	provider.Context.Set("id", 678)
+
+	request := &types.OpenAIResponsesRequest{
+		Model:              "gpt-5",
+		PreviousResponseID: "resp_previous_123",
+	}
+
+	provider.prepareCodexRequest(request)
+
+	if request.PromptCacheKey != "resp_previous_123" {
+		t.Fatalf("expected auto strategy to use previous_response_id directly, got %q", request.PromptCacheKey)
+	}
+}
+
 func TestPrepareCodexRequestGeneratesStablePromptCacheKeyFromSessionIDWhenStrategyEnabled(t *testing.T) {
 	key := `{"access_token":"access-token","account_id":"acct-123"}`
 	provider := newTestCodexProviderWithContext(t, key, `{"prompt_cache_key_strategy":"session_id"}`, map[string]string{
