@@ -99,6 +99,7 @@
     "addModelMapping": "モデルマッピングの追加",
     "addModelMappingByJson": "モデルマッピング（JSON）の追加",
     "addSuccess": "無事作成されました！",
+    "addError": "作成に失敗しました",
     "batchAdd": "バッチで追加",
     "batchBaseurlTip": "1 行に 1 つずつ、順序は次のキーに対応します。対応するキーが一致しない場合は、最初のキーがデフォルトで使用されます。",
     "batchKeytip": "、1 行に 1 つのキー",
@@ -274,6 +275,7 @@
     "refreshList": "リストを更新する",
     "tag": "タグ",
     "tagChannelList": "タグチャネルリスト",
+    "addTagChannel": "タグチャネルを追加",
     "tagChannelsConfirm": "すべてのチャネルで{{action}}タグ{{tag}}を確認しますか？",
     "tagChannelsError": "アクション{{action}}のラベルチャネルが失敗しました: {{message}}",
     "tagChannelsSuccess": "タグチャネル{{action}}が成功しました",
@@ -1029,10 +1031,53 @@
       },
       "codexSettings": {
         "title": "Routing Affinity と Codex Hint",
+        "globalOptionBadge": "グローバル Option",
+        "decisionTitle": "まず目的を選び、必要な箇所だけ調整",
         "description": "これらの設定は個別チャネルではなく、グローバル option として保存されます。ChannelAffinitySetting は汎用ルーティング affinity ルールで、CodexRoutingHintSetting は Codex Responses 向けの prompt_cache_key hint 生成だけを担当します。空欄の場合はバックエンドのデフォルト値に戻り、待機時間の単位はどちらもミリ秒です。",
         "globalWarning": "これらの設定はすべてのユーザーと、ルールにマッチするリクエストに影響します。affinity / prompt_cache_key を調整しない場合は ChannelAffinitySetting をデフォルトのままにし、Codex prompt cache の pre-routing 命中が必要な場合だけ CodexRoutingHintSetting を有効にしてください。",
+        "waitSectionTitle": "優先チャネル待機",
         "affinitySectionTitle": "汎用 Channel Affinity",
         "codexHintSectionTitle": "Codex Routing Hint",
+        "quickActions": {
+          "recommended": {
+            "title": "Codex 推奨を有効化",
+            "body": "auto hint を有効化し、affinity はバックエンド既定ルール、待機予算は 250 / 50ms にします。"
+          },
+          "safeDefault": {
+            "title": "安全な既定値に戻す",
+            "body": "hint を無効化し、affinity はバックエンド既定値、待機予算は 0 / 50ms に戻します。"
+          }
+        },
+        "summary": {
+          "affinityMode": "Affinity モード",
+          "backendDefault": "バックエンド既定",
+          "customOverride": "カスタム上書き",
+          "customEnabled": "カスタム有効",
+          "customDisabled": "カスタム無効",
+          "hintStrategy": "Codex Hint",
+          "hintScope": "モデル範囲：{{scope}}",
+          "allModels": "すべてのモデル",
+          "waitBudget": "待機 / ポーリング",
+          "waitBudgetDetail": "1 つ目は最大待機時間、2 つ目は確認間隔です。",
+          "storage": "保存先",
+          "globalOption": "グローバル設定",
+          "storageDetail": "options テーブルに保存され、ルールに一致する全リクエストへ影響します。",
+          "ruleCount": "{{count}} / {{total}} 件のルールが有効"
+        },
+        "flow": {
+          "request": {
+            "title": "リクエスト ID",
+            "body": "previous_response_id、prompt_cache_key、session、認証情報から安定 ID を読み取ります。"
+          },
+          "hint": {
+            "title": "Codex Hint",
+            "body": "リクエストが prompt_cache_key を送らない場合に responses.prompt_cache_key を事前生成できます。"
+          },
+          "affinity": {
+            "title": "Routing Affinity",
+            "body": "ChannelAffinitySetting が ID を読み取り、前回成功したチャネルを優先します。"
+          }
+        },
         "preferredChannelWaitMilliseconds": {
           "label": "優先チャネル待機時間（ミリ秒）",
           "placeholder": "例：250",
@@ -1048,14 +1093,72 @@
           "placeholder": "{\n  \"prompt_cache_key_strategy\": \"auto\",\n  \"model_regex\": \"^gpt-5$\"\n}",
           "help": "Codex 専用設定です。Codex チャネル選択前に one-hub が安定した prompt_cache_key hint を生成するかを制御します。生成された hint は ChannelAffinitySetting の request_hint ルールで読み取れます。auto を推奨します。off は生成しません。",
           "useRecommended": "推奨テンプレートを使用",
-          "useDefault": "off テンプレートを使用"
+          "useDefault": "off テンプレートを使用",
+          "fields": {
+            "strategy": "Prompt cache key 戦略",
+            "modelRegex": "モデル一致正規表現",
+            "userAgentRegex": "User-Agent 一致正規表現"
+          },
+          "strategyDescriptions": {
+            "off": "routing hint を生成せず、既定動作を維持します。",
+            "auto": "推奨。continuation、session、認証、token、user の順に安定 ID を選びます。",
+            "session_id": "x-session-id / session_id のみから生成します。クライアントが明示的に session を持つ場合向けです。",
+            "auth_header": "リクエスト認証情報のみから生成します。外部認証情報が安定している場合向けです。",
+            "token_id": "one-hub token のみから生成します。再利用は強いですが負荷集中の可能性があります。",
+            "user_id": "one-hub ユーザーのみから生成します。最も粗い粒度で、負荷集中に注意が必要です。"
+          }
         },
         "channelAffinitySetting": {
           "label": "ChannelAffinitySetting",
           "placeholder": "{\n  \"enabled\": true,\n  \"default_ttl_seconds\": 3600,\n  \"max_entries\": 50000\n}",
           "help": "汎用 routing affinity 設定です。どの Responses / Realtime リクエストで identity -> channel を記録し、次回同じ identity が来たときに前回成功したチャネルを優先するかを制御します。rules: [] はルールを消すため指定しないでください。",
           "useDefault": "デフォルトルールテンプレートを使用",
-          "useBlankDefault": "空欄でバックエンドデフォルト"
+          "useBlankDefault": "空欄でバックエンドデフォルト",
+          "rulesTitle": "Affinity ルール",
+          "keySourcesTitle": "Key ソース",
+          "addRule": "ルールを追加",
+          "removeRule": "ルールを削除",
+          "addKeySource": "Key ソースを追加",
+          "removeKeySource": "Key ソースを削除",
+          "backendDefaultAlert": "空文字列として保存し、実行時はバックエンド内蔵の既定ルールを使います。これが最も安全です。",
+          "customAlert": "カスタム JSON として保存します。今後バックエンドの既定ルールが変わっても、この設定は自動では置き換わりません。",
+          "advancedTitle": "高度な Affinity ルール",
+          "advancedDescription": "identity ソース、strict 動作、マッチ範囲を変える必要がある場合だけ開いてください。多くの場合は既定ルールで十分です。",
+          "rulesHelp": "ルールは、どのリクエストが identity -> channel を記録し、次回同じ identity が元チャネルへ戻るかを決めます。",
+          "emptyRulesWarning": "rules が空です。保存するとすべての affinity ルールが消え、continuation / prompt cache / realtime session は既定 affinity に命中しません。",
+          "unnamedRule": "無名ルール",
+          "ruleEnabled": "有効",
+          "ruleDisabled": "無効",
+          "strictBadge": "Strict",
+          "noKeySource": "Key ソース未設定",
+          "booleanGroups": {
+            "dimensions": "Key 分離ディメンション",
+            "fallback": "失敗とクールダウン動作",
+            "writeback": "記録書き戻し"
+          },
+          "fields": {
+            "enabled": "有効",
+            "defaultTTL": "既定 TTL（秒）",
+            "maxEntries": "最大キャッシュ件数",
+            "ruleName": "ルール名",
+            "kind": "リクエスト種別",
+            "modelRegex": "モデル正規表現",
+            "pathRegex": "パス正規表現",
+            "userAgentRegex": "User-Agent 正規表現",
+            "include_group": "Key にグループを含める",
+            "include_model": "Key にモデルを含める",
+            "include_path": "Key にパスを含める",
+            "include_rule_name": "Key にルール名を含める",
+            "ignore_preferred_cooldown": "優先チャネルのクールダウンを無視",
+            "strict": "Strict affinity",
+            "skip_retry_on_failure": "優先チャネル失敗後の retry をスキップ",
+            "record_on_success": "成功時に記録",
+            "ruleTTL": "ルール TTL（秒、省略可）",
+            "source": "ソース",
+            "key": "フィールド Key",
+            "alias": "Alias",
+            "valueRegex": "値フィルタ正規表現"
+          }
         },
         "helpDialog": {
           "open": "設定ヘルプを表示",
@@ -1185,7 +1288,10 @@
           "invalidWaitMilliseconds": "優先チャネル待機時間は 0 以上の整数で入力してください",
           "invalidWaitPollMilliseconds": "優先チャネルのポーリング待機時間は 0 以上の整数で入力してください",
           "invalidRoutingHintJson": "CodexRoutingHintSetting は有効な JSON である必要があります",
-          "invalidChannelAffinityJson": "ChannelAffinitySetting は有効な JSON である必要があります"
+          "invalidChannelAffinityJson": "ChannelAffinitySetting は有効な JSON である必要があります",
+          "invalidDefaultTTL": "Channel affinity 既定 TTL は 0 以上の整数で入力してください",
+          "invalidMaxEntries": "Channel affinity 最大キャッシュ件数は 0 以上の整数で入力してください",
+          "invalidRuleTTL": "{{index}} 件目の affinity ルール TTL は 0 以上の整数で入力してください"
         },
         "save": "Routing Affinity 設定を保存"
       },

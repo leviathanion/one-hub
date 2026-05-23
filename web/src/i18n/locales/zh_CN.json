@@ -209,6 +209,7 @@
     "modelListError": "获取模型列表失败",
     "editSuccess": "更新成功!",
     "addSuccess": "创建成功！",
+    "addError": "创建失败",
     "batchAdd": "批量添加",
     "isEnable": "是否启用",
     "batchBaseurlTip": "，一行一个,顺序对应下面的key，如果对应不上则默认使用第一个",
@@ -942,10 +943,53 @@
       },
       "codexSettings": {
         "title": "路由亲和与 Codex Hint",
+        "globalOptionBadge": "全局 Option",
+        "decisionTitle": "先选择目标，再改细节",
         "description": "这些配置走全局 option，不属于单个渠道。ChannelAffinitySetting 是通用路由亲和规则；CodexRoutingHintSetting 只负责为 Codex Responses 派生 prompt_cache_key hint。留空时会回到后端默认值，两个等待时间单位都是毫秒。",
         "globalWarning": "这些配置会影响所有用户以及匹配规则的请求。不了解 affinity / prompt_cache_key 时，建议 ChannelAffinitySetting 保持默认，只在需要 Codex prompt cache 预路由命中时启用 CodexRoutingHintSetting。",
+        "waitSectionTitle": "首选渠道等待",
         "affinitySectionTitle": "通用 Channel Affinity",
         "codexHintSectionTitle": "Codex Routing Hint",
+        "quickActions": {
+          "recommended": {
+            "title": "启用 Codex 推荐",
+            "body": "开启 auto hint，路由亲和使用后端默认规则，等待预算设为 250 / 50ms。"
+          },
+          "safeDefault": {
+            "title": "恢复稳妥默认",
+            "body": "关闭 hint，路由亲和回到后端默认，等待预算设为 0 / 50ms。"
+          }
+        },
+        "summary": {
+          "affinityMode": "亲和模式",
+          "backendDefault": "后端默认",
+          "customOverride": "自定义覆盖",
+          "customEnabled": "自定义启用",
+          "customDisabled": "自定义关闭",
+          "hintStrategy": "Codex Hint",
+          "hintScope": "模型范围：{{scope}}",
+          "allModels": "全部模型",
+          "waitBudget": "等待 / 轮询",
+          "waitBudgetDetail": "第一个值是最多等待多久，第二个值是检查间隔。",
+          "storage": "保存位置",
+          "globalOption": "全局配置",
+          "storageDetail": "保存到 options 表，会影响匹配规则的所有请求。",
+          "ruleCount": "{{count}} / {{total}} 条规则启用"
+        },
+        "flow": {
+          "request": {
+            "title": "请求身份",
+            "body": "从 previous_response_id、prompt_cache_key、session 或认证信息里取稳定身份。"
+          },
+          "hint": {
+            "title": "Codex Hint",
+            "body": "当请求没显式传 prompt_cache_key 时，可提前派生 responses.prompt_cache_key。"
+          },
+          "affinity": {
+            "title": "路由亲和",
+            "body": "ChannelAffinitySetting 读取身份并优先回到上次成功的渠道。"
+          }
+        },
         "preferredChannelWaitMilliseconds": {
           "label": "首选渠道等待时间（毫秒）",
           "placeholder": "例如：250",
@@ -966,6 +1010,14 @@
             "strategy": "Prompt cache key 策略",
             "modelRegex": "模型匹配正则",
             "userAgentRegex": "User-Agent 匹配正则"
+          },
+          "strategyDescriptions": {
+            "off": "不生成 routing hint，保持默认行为。",
+            "auto": "推荐；按 continuation、session、认证、token、user 的顺序选择稳定身份。",
+            "session_id": "只按 x-session-id / session_id 派生，适合客户端明确维护会话。",
+            "auth_header": "只按请求认证信息派生，适合外部凭证稳定的客户端。",
+            "token_id": "只按 one-hub token 派生，复用强但可能集中负载。",
+            "user_id": "只按 one-hub 用户派生，复用最粗粒度，需注意负载集中。"
           }
         },
         "channelAffinitySetting": {
@@ -980,6 +1032,22 @@
           "removeRule": "删除规则",
           "addKeySource": "添加 Key 来源",
           "removeKeySource": "删除 Key 来源",
+          "backendDefaultAlert": "当前会保存为空字符串，运行时使用后端内置默认规则。这是最稳妥的选择。",
+          "customAlert": "当前会保存自定义 JSON，后续后端默认规则变化不会自动覆盖这份配置。",
+          "advancedTitle": "高级亲和规则",
+          "advancedDescription": "只有需要改 identity 来源、strict 行为或匹配范围时才展开。大多数场景保留默认规则即可。",
+          "rulesHelp": "规则决定哪些请求会写入 identity -> channel，以及下一次相同 identity 是否回到原渠道。",
+          "emptyRulesWarning": "当前 rules 为空，保存后会清空所有亲和规则，continuation / prompt cache / realtime session 都不会命中默认亲和。",
+          "unnamedRule": "未命名规则",
+          "ruleEnabled": "启用",
+          "ruleDisabled": "停用",
+          "strictBadge": "严格",
+          "noKeySource": "未配置 Key 来源",
+          "booleanGroups": {
+            "dimensions": "Key 隔离维度",
+            "fallback": "失败与冷却策略",
+            "writeback": "记录写回"
+          },
           "fields": {
             "enabled": "启用",
             "defaultTTL": "默认 TTL（秒）",
@@ -1511,6 +1579,7 @@
     "weightUpdateError": "权重更新失败: {{message}}",
     "deleteTagAndChannels": "删除标签及其所有渠道",
     "tagChannelList": "标签渠道列表",
+    "addTagChannel": "新增标签渠道",
     "refreshList": "刷新列表",
     "noTagChannels": "没有找到标签渠道",
     "deleteTag": "删除标签",

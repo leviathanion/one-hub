@@ -111,6 +111,7 @@
     "addModelMapping": "Add model mapping",
     "addModelMappingByJson": "Add model mapping (JSON)",
     "addSuccess": "Created successfully!",
+    "addError": "Creation failed",
     "batchAdd": "Add in batches",
     "batchBaseurlTip": ", one per line, the order corresponds to the following keys. If the corresponding key cannot be matched, the first one will be used by default.",
     "batchKeytip": ", one key per line",
@@ -296,6 +297,7 @@
     "refreshList": "Refresh list",
     "tag": "Tags",
     "tagChannelList": "Tag channel list",
+    "addTagChannel": "Add tag channel",
     "tagChannelsConfirm": "Are you sure you want to {{action}} all channels under the tag {{tag}}?",
     "tagChannelsError": "Channel {{action}} failed: {{message}}",
     "tagChannelsSuccess": "The tag channel {{action}} is successful.",
@@ -1041,10 +1043,53 @@
       },
       "codexSettings": {
         "title": "Routing Affinity and Codex Hints",
+        "globalOptionBadge": "Global Option",
+        "decisionTitle": "Pick the goal first, then tune details",
         "description": "These settings are stored as global options rather than per-channel configuration. ChannelAffinitySetting is the general routing affinity rule set; CodexRoutingHintSetting only derives prompt_cache_key hints for Codex Responses. Blank values fall back to backend defaults, and both wait values are in milliseconds.",
         "globalWarning": "These settings affect all users and requests that match the rules. If you are not tuning affinity or prompt_cache_key behavior, keep ChannelAffinitySetting on defaults and enable CodexRoutingHintSetting only when Codex prompt-cache pre-routing is needed.",
+        "waitSectionTitle": "Preferred Channel Waiting",
         "affinitySectionTitle": "General Channel Affinity",
         "codexHintSectionTitle": "Codex Routing Hint",
+        "quickActions": {
+          "recommended": {
+            "title": "Enable Codex recommendation",
+            "body": "Turns on auto hints, keeps backend affinity rules, and sets wait budget to 250 / 50ms."
+          },
+          "safeDefault": {
+            "title": "Restore safe default",
+            "body": "Turns hints off, restores backend affinity defaults, and sets wait budget to 0 / 50ms."
+          }
+        },
+        "summary": {
+          "affinityMode": "Affinity mode",
+          "backendDefault": "Backend default",
+          "customOverride": "Custom override",
+          "customEnabled": "Custom enabled",
+          "customDisabled": "Custom disabled",
+          "hintStrategy": "Codex Hint",
+          "hintScope": "Model scope: {{scope}}",
+          "allModels": "All models",
+          "waitBudget": "Wait / poll",
+          "waitBudgetDetail": "The first value is the max wait; the second is the check interval.",
+          "storage": "Stored as",
+          "globalOption": "Global option",
+          "storageDetail": "Saved in the options table and affects all requests matched by the rules.",
+          "ruleCount": "{{count}} / {{total}} rules enabled"
+        },
+        "flow": {
+          "request": {
+            "title": "Request identity",
+            "body": "Reads stable identity from previous_response_id, prompt_cache_key, session, or credentials."
+          },
+          "hint": {
+            "title": "Codex Hint",
+            "body": "Can derive responses.prompt_cache_key before routing when the request does not send one."
+          },
+          "affinity": {
+            "title": "Routing affinity",
+            "body": "ChannelAffinitySetting reads the identity and prefers the last successful channel."
+          }
+        },
         "preferredChannelWaitMilliseconds": {
           "label": "Preferred Channel Wait (ms)",
           "placeholder": "e.g. 250",
@@ -1065,6 +1110,14 @@
             "strategy": "Prompt cache key strategy",
             "modelRegex": "Model regex",
             "userAgentRegex": "User-Agent regex"
+          },
+          "strategyDescriptions": {
+            "off": "Do not generate routing hints; keep the default behavior.",
+            "auto": "Recommended; chooses stable identity from continuation, session, auth, token, then user.",
+            "session_id": "Only derive from x-session-id / session_id, for clients that maintain sessions.",
+            "auth_header": "Only derive from request credentials, for stable external credentials.",
+            "token_id": "Only derive from the one-hub token; stronger reuse but possible load concentration.",
+            "user_id": "Only derive from the one-hub user; broadest reuse, with load concentration risk."
           }
         },
         "channelAffinitySetting": {
@@ -1079,6 +1132,22 @@
           "removeRule": "Remove rule",
           "addKeySource": "Add key source",
           "removeKeySource": "Remove key source",
+          "backendDefaultAlert": "This saves a blank value, so runtime uses the backend's built-in default rules. This is the safest option.",
+          "customAlert": "This saves custom JSON. Future backend default-rule changes will not automatically replace this config.",
+          "advancedTitle": "Advanced Affinity Rules",
+          "advancedDescription": "Open only when you need to change identity sources, strict behavior, or match scope. Defaults fit most cases.",
+          "rulesHelp": "Rules decide which requests record identity -> channel and whether later matching identity returns to that channel.",
+          "emptyRulesWarning": "rules is empty. Saving will clear all affinity rules, so continuation / prompt cache / realtime sessions will not hit default affinity.",
+          "unnamedRule": "Unnamed rule",
+          "ruleEnabled": "Enabled",
+          "ruleDisabled": "Disabled",
+          "strictBadge": "Strict",
+          "noKeySource": "No key source configured",
+          "booleanGroups": {
+            "dimensions": "Key isolation dimensions",
+            "fallback": "Failure and cooldown behavior",
+            "writeback": "Record writeback"
+          },
           "fields": {
             "enabled": "Enabled",
             "defaultTTL": "Default TTL (seconds)",

@@ -102,6 +102,7 @@
     "addModelMapping": "添加模型映射",
     "addModelMappingByJson": "添加模型映射(JSON)",
     "addSuccess": "創建成功！",
+    "addError": "創建失敗",
     "batchAdd": "批量添加",
     "batchBaseurlTip": "，一行一個，順序對應下面的key，如果對應不上則默認使用第一個",
     "batchKeytip": "，一行一個密鑰",
@@ -278,6 +279,7 @@
     "refreshList": "更新列表",
     "tag": "標籤",
     "tagChannelList": "標籤渠道列表",
+    "addTagChannel": "新增標籤渠道",
     "tagChannelsConfirm": "確定要{{action}}標籤 {{tag}} 下的所有渠道嗎？",
     "tagChannelsError": "標籤渠道{{action}}失敗: {{message}}",
     "tagChannelsSuccess": "標籤渠道{{action}}成功",
@@ -1031,10 +1033,53 @@
       },
       "codexSettings": {
         "title": "路由親和與 Codex Hint",
+        "globalOptionBadge": "全局 Option",
+        "decisionTitle": "先選擇目標，再改細節",
         "description": "這些配置走全局 option，不屬於單個通道。ChannelAffinitySetting 是通用路由親和規則；CodexRoutingHintSetting 只負責為 Codex Responses 派生 prompt_cache_key hint。留空時會回到後端默認值，兩個等待時間單位都是毫秒。",
         "globalWarning": "這些配置會影響所有用戶以及匹配規則的請求。不了解 affinity / prompt_cache_key 時，建議 ChannelAffinitySetting 保持默認，只在需要 Codex prompt cache 預路由命中時啟用 CodexRoutingHintSetting。",
+        "waitSectionTitle": "首選通道等待",
         "affinitySectionTitle": "通用 Channel Affinity",
         "codexHintSectionTitle": "Codex Routing Hint",
+        "quickActions": {
+          "recommended": {
+            "title": "啟用 Codex 推薦",
+            "body": "開啟 auto hint，路由親和使用後端默認規則，等待預算設為 250 / 50ms。"
+          },
+          "safeDefault": {
+            "title": "恢復穩妥默認",
+            "body": "關閉 hint，路由親和回到後端默認，等待預算設為 0 / 50ms。"
+          }
+        },
+        "summary": {
+          "affinityMode": "親和模式",
+          "backendDefault": "後端默認",
+          "customOverride": "自定義覆蓋",
+          "customEnabled": "自定義啟用",
+          "customDisabled": "自定義關閉",
+          "hintStrategy": "Codex Hint",
+          "hintScope": "模型範圍：{{scope}}",
+          "allModels": "全部模型",
+          "waitBudget": "等待 / 輪詢",
+          "waitBudgetDetail": "第一個值是最多等待多久，第二個值是檢查間隔。",
+          "storage": "保存位置",
+          "globalOption": "全局配置",
+          "storageDetail": "保存到 options 表，會影響匹配規則的所有請求。",
+          "ruleCount": "{{count}} / {{total}} 條規則啟用"
+        },
+        "flow": {
+          "request": {
+            "title": "請求身份",
+            "body": "從 previous_response_id、prompt_cache_key、session 或認證信息裏取穩定身份。"
+          },
+          "hint": {
+            "title": "Codex Hint",
+            "body": "當請求未顯式傳 prompt_cache_key 時，可提前派生 responses.prompt_cache_key。"
+          },
+          "affinity": {
+            "title": "路由親和",
+            "body": "ChannelAffinitySetting 讀取身份並優先回到上次成功的通道。"
+          }
+        },
         "preferredChannelWaitMilliseconds": {
           "label": "首選通道等待時間（毫秒）",
           "placeholder": "例如：250",
@@ -1050,14 +1095,72 @@
           "placeholder": "{\n  \"prompt_cache_key_strategy\": \"auto\",\n  \"model_regex\": \"^gpt-5$\"\n}",
           "help": "Codex 專用配置：控制 one-hub 是否在選擇 Codex 通道前自動生成穩定的 prompt_cache_key hint。生成的 hint 可被 ChannelAffinitySetting 的 request_hint 規則讀取。推薦 auto；off 表示不生成。",
           "useRecommended": "使用推薦模板",
-          "useDefault": "使用關閉模板"
+          "useDefault": "使用關閉模板",
+          "fields": {
+            "strategy": "Prompt cache key 策略",
+            "modelRegex": "模型匹配正則",
+            "userAgentRegex": "User-Agent 匹配正則"
+          },
+          "strategyDescriptions": {
+            "off": "不生成 routing hint，保持默認行為。",
+            "auto": "推薦；按 continuation、session、認證、token、user 的順序選擇穩定身份。",
+            "session_id": "只按 x-session-id / session_id 派生，適合客戶端明確維護會話。",
+            "auth_header": "只按請求認證信息派生，適合外部憑證穩定的客戶端。",
+            "token_id": "只按 one-hub token 派生，復用強但可能集中負載。",
+            "user_id": "只按 one-hub 用戶派生，復用最粗粒度，需注意負載集中。"
+          }
         },
         "channelAffinitySetting": {
           "label": "ChannelAffinitySetting",
           "placeholder": "{\n  \"enabled\": true,\n  \"default_ttl_seconds\": 3600,\n  \"max_entries\": 50000\n}",
           "help": "通用路由親和配置：控制哪些 Responses / Realtime 請求會記錄 identity -> channel，以及下次相同 identity 是否優先回到上次成功的通道。不要填寫 rules: []，那會清空規則。",
           "useDefault": "使用默認規則模板",
-          "useBlankDefault": "留空使用後端默認"
+          "useBlankDefault": "留空使用後端默認",
+          "rulesTitle": "親和規則",
+          "keySourcesTitle": "Key 來源",
+          "addRule": "添加規則",
+          "removeRule": "刪除規則",
+          "addKeySource": "添加 Key 來源",
+          "removeKeySource": "刪除 Key 來源",
+          "backendDefaultAlert": "當前會保存為空字符串，運行時使用後端內置默認規則。這是最穩妥的選擇。",
+          "customAlert": "當前會保存自定義 JSON，後續後端默認規則變化不會自動覆蓋這份配置。",
+          "advancedTitle": "高級親和規則",
+          "advancedDescription": "只有需要改 identity 來源、strict 行為或匹配範圍時才展開。大多數場景保留默認規則即可。",
+          "rulesHelp": "規則決定哪些請求會寫入 identity -> channel，以及下一次相同 identity 是否回到原通道。",
+          "emptyRulesWarning": "當前 rules 為空，保存後會清空所有親和規則，continuation / prompt cache / realtime session 都不會命中默認親和。",
+          "unnamedRule": "未命名規則",
+          "ruleEnabled": "啟用",
+          "ruleDisabled": "停用",
+          "strictBadge": "嚴格",
+          "noKeySource": "未配置 Key 來源",
+          "booleanGroups": {
+            "dimensions": "Key 隔離維度",
+            "fallback": "失敗與冷卻策略",
+            "writeback": "記錄寫回"
+          },
+          "fields": {
+            "enabled": "啟用",
+            "defaultTTL": "默認 TTL（秒）",
+            "maxEntries": "最大緩存條數",
+            "ruleName": "規則名",
+            "kind": "請求類型",
+            "modelRegex": "模型正則",
+            "pathRegex": "路徑正則",
+            "userAgentRegex": "User-Agent 正則",
+            "include_group": "Key 包含用戶組",
+            "include_model": "Key 包含模型",
+            "include_path": "Key 包含路徑",
+            "include_rule_name": "Key 包含規則名",
+            "ignore_preferred_cooldown": "忽略首選通道冷卻",
+            "strict": "嚴格回原通道",
+            "skip_retry_on_failure": "首選失敗後跳過重試",
+            "record_on_success": "成功後記錄",
+            "ruleTTL": "規則 TTL（秒，可空）",
+            "source": "來源",
+            "key": "字段 Key",
+            "alias": "Alias",
+            "valueRegex": "值過濾正則"
+          }
         },
         "helpDialog": {
           "open": "查看配置說明",
@@ -1187,7 +1290,10 @@
           "invalidWaitMilliseconds": "首選通道等待時間必須是非負整數",
           "invalidWaitPollMilliseconds": "首選通道輪詢等待時間必須是非負整數",
           "invalidRoutingHintJson": "CodexRoutingHintSetting 不是合法的 JSON 字符串",
-          "invalidChannelAffinityJson": "ChannelAffinitySetting 不是合法的 JSON 字符串"
+          "invalidChannelAffinityJson": "ChannelAffinitySetting 不是合法的 JSON 字符串",
+          "invalidDefaultTTL": "通道親和默認 TTL 必須是非負整數",
+          "invalidMaxEntries": "通道親和最大緩存條數必須是非負整數",
+          "invalidRuleTTL": "第 {{index}} 條親和規則的 TTL 必須是非負整數"
         },
         "save": "保存路由親和配置"
       },

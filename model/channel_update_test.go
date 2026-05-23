@@ -3,6 +3,7 @@ package model
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1023,6 +1024,210 @@ func TestUpdateChannelsTagRejectsInvalidCodexOtherWhenTypeOmitted(t *testing.T) 
 	}
 	if persisted.Other != "" {
 		t.Fatalf("expected rejected tag update not to mutate other, got %q", persisted.Other)
+	}
+}
+
+func TestAddChannelToTagCreatesMemberWithInheritedConfig(t *testing.T) {
+	useTestChannelDB(t)
+
+	priority := int64(7)
+	weight := uint(3)
+	insertTestChannel(t, &Channel{
+		Id:                 1,
+		Type:               config.ChannelTypeOpenAI,
+		Name:               "tagged-one",
+		Key:                "sk-one",
+		Status:             config.ChannelStatusEnabled,
+		Weight:             &weight,
+		Balance:            12.5,
+		BalanceUpdatedTime: 111,
+		UsedQuota:          222,
+		ResponseTime:       333,
+		TestTime:           444,
+		Group:              "legacy",
+		Models:             "gpt-old",
+		Tag:                "member-team",
+		BaseURL:            stringPtr("https://old.example"),
+		Other:              "legacy-other",
+		ModelMapping:       stringPtr(`{"old":"model"}`),
+		ModelHeaders:       stringPtr(`{"X-Old":"1"}`),
+		CustomParameter:    stringPtr(`{"old":true}`),
+		Proxy:              stringPtr("http://proxy-%s.example"),
+		TestModel:          "gpt-old",
+		OnlyChat:           true,
+		PreCost:            config.PreCostNotImage,
+		CompatibleResponse: true,
+		AllowExtraBody:     true,
+		Priority:           &priority,
+	})
+
+	added, err := AddChannelToTag("member-team", &Channel{
+		Key: "sk-two",
+	})
+	if err != nil {
+		t.Fatalf("expected tag member create to succeed, got %v", err)
+	}
+
+	if added.Id == 0 {
+		t.Fatal("expected inserted channel id to be returned")
+	}
+	if added.Name != "tagged-one_1" {
+		t.Fatalf("expected generated member name to follow existing tag rule, got %q", added.Name)
+	}
+	if added.Key != "sk-two" || added.Tag != "member-team" || added.Type != config.ChannelTypeOpenAI {
+		t.Fatalf("unexpected added channel identity: %+v", added)
+	}
+	if added.Models != "gpt-old" || added.Group != "legacy" || added.TestModel != "gpt-old" || !added.AllowExtraBody {
+		t.Fatalf("expected new member to inherit tag config, got %+v", added)
+	}
+	if added.Status != config.ChannelStatusEnabled || added.Priority == nil || *added.Priority != priority || added.Weight == nil || *added.Weight != weight {
+		t.Fatalf("expected lifecycle/routing fields to inherit representative values, got %+v", added)
+	}
+	if added.UsedQuota != 0 || added.ResponseTime != 0 || added.TestTime != 0 || added.Balance != 0 || added.BalanceUpdatedTime != 0 {
+		t.Fatalf("expected runtime counters to reset, got %+v", added)
+	}
+	if added.Proxy == nil || *added.Proxy != "http://proxy-%s.example" {
+		t.Fatalf("expected stored proxy template to remain unexpanded, got %+v", added.Proxy)
+	}
+	if ChannelGroup.GetChannel(added.Id) == nil {
+		t.Fatal("expected routing cache to include added tag member")
+	}
+}
+
+func TestAddChannelToTagAllowsDuplicateDisplayName(t *testing.T) {
+	useTestChannelDB(t)
+
+	insertTestChannel(t, &Channel{
+		Id:     1,
+		Type:   config.ChannelTypeOpenAI,
+		Name:   "same-name",
+		Key:    "sk-one",
+		Group:  "default",
+		Models: "gpt-old",
+		Tag:    "name-team",
+	})
+
+	added, err := AddChannelToTag("name-team", &Channel{
+		Name: "same-name",
+		Key:  "sk-two",
+	})
+	if err != nil {
+		t.Fatalf("expected duplicate display name to remain allowed, got %v", err)
+	}
+	if added.Name != "same-name" {
+		t.Fatalf("expected submitted display name to be preserved, got %q", added.Name)
+	}
+}
+
+func TestAddChannelToTagRejectsMissingTagEmptyDuplicateAndMultilineKey(t *testing.T) {
+	useTestChannelDB(t)
+
+	insertTestChannel(t, &Channel{
+		Id:     1,
+		Type:   config.ChannelTypeOpenAI,
+		Name:   "tagged-one",
+		Key:    "sk-one",
+		Group:  "default",
+		Models: "gpt-old",
+		Tag:    "member-team",
+	})
+
+	if _, err := AddChannelToTag("missing-team", &Channel{Key: "sk-two"}); err == nil {
+		t.Fatal("expected missing tag to be rejected")
+	}
+	if _, err := AddChannelToTag("member-team", &Channel{}); err == nil {
+		t.Fatal("expected empty key to be rejected")
+	}
+	if _, err := AddChannelToTag("member-team", &Channel{Key: "sk-one"}); err == nil {
+		t.Fatal("expected duplicate key to be rejected")
+	}
+	if _, err := AddChannelToTag("member-team", &Channel{Key: "sk-two\nsk-three"}); err == nil {
+		t.Fatal("expected single-member create to reject multiline non-Codex key")
+	}
+}
+
+func TestAddChannelToTagNormalizesCodexJSONKeyAndRejectsDuplicate(t *testing.T) {
+	useTestChannelDB(t)
+
+	insertTestChannel(t, &Channel{
+		Id:     1,
+		Type:   config.ChannelTypeCodex,
+		Name:   "codex-one",
+		Key:    `{"access_token":"old-token","refresh_token":"old-refresh"}`,
+		Group:  "default",
+		Models: "gpt-5",
+		Tag:    "codex-team",
+		Other:  `{"prompt_cache_key_strategy":"auto"}`,
+	})
+
+	prettyKey := "{\n  \"access_token\": \"new-token\",\n  \"refresh_token\": \"new-refresh\"\n}"
+	added, err := AddChannelToTag("codex-team", &Channel{Key: prettyKey})
+	if err != nil {
+		t.Fatalf("expected pretty Codex JSON key to be accepted, got %v", err)
+	}
+	if strings.Contains(added.Key, "\n") {
+		t.Fatalf("expected Codex key to be compacted, got %q", added.Key)
+	}
+	if added.Key != `{"access_token":"new-token","refresh_token":"new-refresh"}` {
+		t.Fatalf("unexpected compacted Codex key: %q", added.Key)
+	}
+
+	if _, err := AddChannelToTag("codex-team", &Channel{Key: prettyKey}); err == nil {
+		t.Fatal("expected duplicate pretty Codex JSON key to be rejected")
+	}
+}
+
+func TestUpdateChannelsTagNormalizesSingleCodexPrettyJSONKey(t *testing.T) {
+	useTestChannelDB(t)
+
+	insertTestChannel(t, &Channel{
+		Id:     1,
+		Type:   config.ChannelTypeCodex,
+		Name:   "codex-one",
+		Key:    `{"access_token":"old-token","refresh_token":"old-refresh"}`,
+		Group:  "default",
+		Models: "gpt-5",
+		Tag:    "codex-team",
+	})
+
+	prettyExistingKey := "{\n  \"access_token\": \"old-token\",\n  \"refresh_token\": \"old-refresh\"\n}"
+	if err := UpdateChannelsTag("codex-team", &Channel{
+		Key:    prettyExistingKey,
+		Group:  "default",
+		Models: "gpt-5",
+		Tag:    "codex-team",
+	}); err != nil {
+		t.Fatalf("expected tag update to accept single pretty Codex JSON key, got %v", err)
+	}
+
+	channels, err := GetChannelsByTag("codex-team")
+	if err != nil {
+		t.Fatalf("expected tagged channel lookup to succeed, got %v", err)
+	}
+	if len(channels) != 1 {
+		t.Fatalf("expected duplicate-normalized pretty key not to add/delete members, got %d", len(channels))
+	}
+	if channels[0].Id != 1 || channels[0].Key != `{"access_token":"old-token","refresh_token":"old-refresh"}` {
+		t.Fatalf("expected existing compact key to be preserved, got %+v", channels[0])
+	}
+}
+
+func TestAddChannelToTagRejectsInvalidInheritedCodexOther(t *testing.T) {
+	useTestChannelDB(t)
+
+	insertTestChannel(t, &Channel{
+		Id:     1,
+		Type:   config.ChannelTypeCodex,
+		Name:   "codex-one",
+		Key:    `{"access_token":"old-token"}`,
+		Group:  "default",
+		Models: "gpt-5",
+		Tag:    "codex-team",
+		Other:  `{"unsupported":true}`,
+	})
+
+	if _, err := AddChannelToTag("codex-team", &Channel{Key: `{"access_token":"new-token"}`}); err == nil {
+		t.Fatal("expected invalid inherited Codex other config to be rejected")
 	}
 }
 

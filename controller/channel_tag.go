@@ -94,6 +94,32 @@ func UpdateChannelsTag(c *gin.Context) {
 	})
 }
 
+func AddChannelToTag(c *gin.Context) {
+	tag := c.Param("tag")
+	if tag == "" {
+		common.AbortWithMessage(c, http.StatusOK, "tag is required")
+		return
+	}
+
+	channel := model.Channel{}
+	if err := c.ShouldBindJSON(&channel); err != nil {
+		common.APIRespondWithError(c, http.StatusOK, err)
+		return
+	}
+
+	addedChannel, err := model.AddChannelToTag(tag, &channel)
+	if err != nil {
+		common.APIRespondWithError(c, http.StatusOK, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data":    addedChannel,
+	})
+}
+
 func DeleteChannelsTag(c *gin.Context) {
 	tag := c.Param("tag")
 	if tag == "" {

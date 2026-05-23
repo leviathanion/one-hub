@@ -57,6 +57,7 @@ import { ChannelCheck } from './ChannelCheck';
 import { PAGE_SIZE_OPTIONS, getPageSize, savePageSize } from 'constants';
 import CodexUsageDialog from './CodexUsageDialog';
 import { formatCodexWindowSummary, getCodexUsageWindow, isCodexChannel, resolveCodexUsageRatio } from './codexUsage';
+import TagChannelCreateDialog from './TagChannelCreateDialog';
 
 const StyledMenu = styled((props) => (
   <Menu
@@ -163,6 +164,7 @@ export default function ChannelTableRow({ item, manageChannel, onRefresh, groupO
   const tagDeleteConfirm = useBoolean();
   const quickEdit = useBoolean();
   const simpleChannelEdit = useBoolean();
+  const tagChannelCreate = useBoolean();
   const [totalTagChannels, setTotalTagChannels] = useState(0);
   const [isTagChannelsLoading, setIsTagChannelsLoading] = useState(false);
   const [tagChannels, setTagChannels] = useState([]);
@@ -199,6 +201,7 @@ export default function ChannelTableRow({ item, manageChannel, onRefresh, groupO
         const data = response.data.data || [];
         setTagChannels(data);
         setTotalTagChannels(data.length);
+        return data;
       } else {
         showError(t('channel_row.getTagChannelsError', { message: response.data.message }));
       }
@@ -207,6 +210,8 @@ export default function ChannelTableRow({ item, manageChannel, onRefresh, groupO
     } finally {
       setIsTagChannelsLoading(false);
     }
+
+    return null;
   }, [item.tag, t]);
 
   const tagChannelMembershipKey = Array.isArray(tagChannels)
@@ -256,6 +261,20 @@ export default function ChannelTableRow({ item, manageChannel, onRefresh, groupO
       setSelectedChannels([]);
     } else {
       setSelectedChannels(tagChannels.map((channel) => channel.id));
+    }
+  };
+
+  const handleTagChannelCreated = async (channel) => {
+    if (channel?.id) {
+      setSelectedChannels([]);
+      if (isCodexChannel(channel)) {
+        prefetchPreviews([channel], undefined, { includeTaggedMembers: true }).catch(() => undefined);
+      }
+    }
+
+    await fetchTagChannels();
+    if (typeof onRefresh === 'function') {
+      onRefresh(false);
     }
   };
 
@@ -996,17 +1015,28 @@ export default function ChannelTableRow({ item, manageChannel, onRefresh, groupO
                         </Tooltip>
                       </Stack>
 
-                      {selectedChannels.length > 0 && (
+                      <Stack direction="row" spacing={1} alignItems="center">
                         <Button
-                          variant="contained"
-                          color="error"
-                          startIcon={<Icon icon="solar:trash-bin-trash-bold" />}
-                          onClick={handleBatchDelete}
+                          variant="outlined"
+                          color="primary"
+                          startIcon={<Icon icon="solar:add-circle-line-duotone" />}
+                          onClick={tagChannelCreate.onTrue}
                           size="small"
                         >
-                          {t('channel_row.batchDelete')} ({selectedChannels.length})
+                          {t('channel_row.addTagChannel')}
                         </Button>
-                      )}
+                        {selectedChannels.length > 0 && (
+                          <Button
+                            variant="contained"
+                            color="error"
+                            startIcon={<Icon icon="solar:trash-bin-trash-bold" />}
+                            onClick={handleBatchDelete}
+                            size="small"
+                          >
+                            {t('channel_row.batchDelete')} ({selectedChannels.length})
+                          </Button>
+                        )}
+                      </Stack>
                     </Stack>
 
                     {isTagChannelsLoading ? (
@@ -1578,6 +1608,14 @@ export default function ChannelTableRow({ item, manageChannel, onRefresh, groupO
           </Button>
         </DialogActions>
       </Dialog>
+
+      <TagChannelCreateDialog
+        open={tagChannelCreate.value}
+        tag={item.tag || ''}
+        representative={item}
+        onClose={tagChannelCreate.onFalse}
+        onCreated={handleTagChannelCreated}
+      />
 
       <CodexUsageDialog
         open={codexUsageDialog.value}

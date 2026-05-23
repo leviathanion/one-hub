@@ -1,6 +1,7 @@
 package model
 
 import (
+	"bytes"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
@@ -132,6 +133,108 @@ func applyChannelTagConfigFields(dst *Channel, src *Channel, fields []channelTag
 	}
 }
 
+func normalizeChannelTagKey(key string, channelType int) (string, error) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return "", nil
+	}
+
+	if channelType != config.ChannelTypeCodex {
+		return key, nil
+	}
+
+	if !strings.HasPrefix(key, "{") {
+		if strings.Contains(key, "\n") {
+			return "", errors.New("Codex key must be a JSON object or single-line token")
+		}
+		return key, nil
+	}
+
+	var parsed map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(key), &parsed); err != nil {
+		return "", fmt.Errorf("Codex key must be a valid JSON object or single-line token: %w", err)
+	}
+	if parsed == nil {
+		return "", errors.New("Codex key must be a JSON object")
+	}
+
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, []byte(key)); err != nil {
+		return "", err
+	}
+	return compact.String(), nil
+}
+
+func splitChannelTagKeys(keyText string, channelType int) ([]string, error) {
+	keyText = strings.TrimSpace(keyText)
+	if keyText == "" {
+		return nil, nil
+	}
+
+	if channelType == config.ChannelTypeCodex {
+		if key, err := normalizeChannelTagKey(keyText, channelType); err == nil && key != "" {
+			return []string{key}, nil
+		}
+	}
+
+	lines := strings.Split(keyText, "\n")
+	keys := make([]string, 0, len(lines))
+	for _, line := range lines {
+		key, err := normalizeChannelTagKey(line, channelType)
+		if err != nil {
+			return nil, err
+		}
+		if key == "" {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	return keys, nil
+}
+
+func channelTagKeyDigest(key string) string {
+	keyMd5 := md5.Sum([]byte(key))
+	return hex.EncodeToString(keyMd5[:])
+}
+
+func normalizeExistingChannelTagKey(key string, channelType int) string {
+	normalized, err := normalizeChannelTagKey(key, channelType)
+	if err != nil || normalized == "" {
+		return strings.TrimSpace(key)
+	}
+	return normalized
+}
+
+func buildChannelTagMember(channelTag *ChannelTagCollection, channel *Channel, fields []channelTagConfigField, key string, name string, memberIndex int) Channel {
+	addChannel := channelTag.Channel
+	if channel != nil && len(fields) > 0 {
+		applyChannelTagConfigFields(&addChannel, channel, fields)
+	}
+
+	if name == "" {
+		baseName := ""
+		if channel != nil {
+			baseName = strings.TrimSpace(channel.Name)
+		}
+		if baseName == "" {
+			baseName = channelTag.Name
+		}
+		name = fmt.Sprintf("%s_%d", baseName, memberIndex)
+	}
+
+	addChannel.Id = 0
+	addChannel.Name = name
+	addChannel.Key = key
+	addChannel.Balance = 0
+	addChannel.BalanceUpdatedTime = 0
+	addChannel.UsedQuota = 0
+	addChannel.ResponseTime = 0
+	addChannel.CreatedTime = time.Now().Unix()
+	addChannel.TestTime = 0
+	addChannel.DeletedAt = gorm.DeletedAt{}
+	return addChannel
+}
+
 func GetChannelsTag(tag string) (*ChannelTagCollection, error) {
 	var channelTag ChannelTagCollection
 
@@ -150,10 +253,9 @@ func GetChannelsTag(tag string) (*ChannelTagCollection, error) {
 
 	channelTag.KeyMap = make(map[string]int)
 	for _, c := range channels {
-		keyMd5 := md5.Sum([]byte(c.Key))
-		keyMd5Str := hex.EncodeToString(keyMd5[:])
-		channelTag.KeyMap[keyMd5Str] = c.Id
-		channelTag.Key += c.Key + "\n"
+		key := normalizeExistingChannelTagKey(c.Key, channelTag.Type)
+		channelTag.KeyMap[channelTagKeyDigest(key)] = c.Id
+		channelTag.Key += key + "\n"
 	}
 
 	channelTag.Key = strings.TrimRight(channelTag.Key, "\n")
@@ -188,13 +290,15 @@ func UpdateChannelsTagWithSubmittedFields(tag string, channel *Channel, submitte
 
 	newKeysMap := make(map[string]bool)
 
-	keys := strings.Split(channel.Key, "\n")
+	keys, err := splitChannelTagKeys(channel.Key, channelTag.Type)
+	if err != nil {
+		return err
+	}
 	for _, key := range keys {
-		if key == "" {
+		keyMd5Str := channelTagKeyDigest(key)
+		if newKeysMap[keyMd5Str] {
 			continue
 		}
-		keyMd5 := md5.Sum([]byte(key))
-		keyMd5Str := hex.EncodeToString(keyMd5[:])
 		newKeysMap[keyMd5Str] = true
 
 		// 如果key不在现有的KeyMap中，则添加到addKeys
@@ -233,18 +337,7 @@ func UpdateChannelsTagWithSubmittedFields(tag string, channel *Channel, submitte
 			// Partial tag updates only carry changed config fields. New members
 			// start from the existing tag representative, then receive the
 			// submitted tag-level overlay; runtime counters are reset below.
-			addChannel := channelTag.Channel
-			applyChannelTagConfigFields(&addChannel, channel, configFields)
-			addChannel.Id = 0
-			addChannel.Name = fmt.Sprintf("%s_%d", baseName, maxKey)
-			addChannel.Key = key
-			addChannel.Balance = 0
-			addChannel.BalanceUpdatedTime = 0
-			addChannel.UsedQuota = 0
-			addChannel.ResponseTime = 0
-			addChannel.CreatedTime = time.Now().Unix()
-			addChannel.TestTime = 0
-			addChannel.DeletedAt = gorm.DeletedAt{}
+			addChannel := buildChannelTagMember(channelTag, channel, configFields, key, fmt.Sprintf("%s_%d", baseName, maxKey), maxKey)
 			addChannels = append(addChannels, addChannel)
 			maxKey++
 		}
@@ -274,6 +367,48 @@ func UpdateChannelsTagWithSubmittedFields(tag string, channel *Channel, submitte
 
 	refreshChannelGroupAfterMutation("update channel tag", delIds)
 	return nil
+}
+
+func AddChannelToTag(tag string, channel *Channel) (*Channel, error) {
+	if strings.TrimSpace(tag) == "" {
+		return nil, errors.New("tag is required")
+	}
+	if channel == nil {
+		return nil, errors.New("channel is required")
+	}
+
+	channelTag, err := GetChannelsTag(tag)
+	if err != nil {
+		return nil, err
+	}
+
+	key, err := normalizeChannelTagKey(channel.Key, channelTag.Type)
+	if err != nil {
+		return nil, err
+	}
+	if key == "" {
+		return nil, errors.New("key不能为空")
+	}
+	if strings.Contains(key, "\n") {
+		return nil, errors.New("key只能包含一个渠道")
+	}
+	if _, ok := channelTag.KeyMap[channelTagKeyDigest(key)]; ok {
+		return nil, errors.New("key已存在")
+	}
+
+	newChannel := buildChannelTagMember(channelTag, nil, nil, key, strings.TrimSpace(channel.Name), len(channelTag.KeyMap))
+	if err := newChannel.ValidateRuntimeConfigJSONWithType(channelTag.Type); err != nil {
+		return nil, err
+	}
+	if err := DB.Omit("UsedQuota").Create(&newChannel).Error; err != nil {
+		return nil, err
+	}
+
+	if newChannel.Type == config.ChannelTypeCodex {
+		ClearChannelCodexDerivedCache(newChannel.Id)
+	}
+	refreshChannelGroupAfterMutation("add channel to tag", nil)
+	return &newChannel, nil
 }
 
 func DeleteChannelsTag(tag string, delDisabled bool) error {

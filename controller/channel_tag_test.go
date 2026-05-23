@@ -89,3 +89,41 @@ func TestUpdateChannelsTagUsesSubmittedFieldsForSync(t *testing.T) {
 		t.Fatalf("expected omitted config fields to remain, got other=%q test_model=%q group=%q", persisted.Other, persisted.TestModel, persisted.Group)
 	}
 }
+
+func TestAddChannelToTagReturnsCreatedChannel(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	useControllerChannelTagTestDB(t)
+
+	if err := model.DB.Create(&model.Channel{
+		Id:     1,
+		Type:   config.ChannelTypeOpenAI,
+		Name:   "tagged-one",
+		Key:    "sk-one",
+		Group:  "default",
+		Models: "gpt-old",
+		Tag:    "member-team",
+	}).Error; err != nil {
+		t.Fatalf("expected channel fixture to persist, got %v", err)
+	}
+
+	body := bytes.NewBufferString(`{"name":"created-member","key":"sk-two"}`)
+	ctx, recorder := commonTest.GetContext(http.MethodPost, "/api/channel_tag/member-team/channel", commonTest.RequestJSONConfig(), body)
+	ctx.Params = gin.Params{{Key: "tag", Value: "member-team"}}
+
+	AddChannelToTag(ctx)
+
+	var resp struct {
+		Success bool          `json:"success"`
+		Message string        `json:"message"`
+		Data    model.Channel `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("expected JSON response, got %v", err)
+	}
+	if !resp.Success {
+		t.Fatalf("expected success response, got %s", recorder.Body.String())
+	}
+	if resp.Data.Id == 0 || resp.Data.Name != "created-member" || resp.Data.Key != "sk-two" || resp.Data.Tag != "member-team" {
+		t.Fatalf("expected created channel data in response, got %+v", resp.Data)
+	}
+}
