@@ -344,6 +344,16 @@ func TestRelayCommonStreamingAndRetryHelpers(t *testing.T) {
 	if shouldRetry(newRelayTestContext(nil), &types.OpenAIErrorWithStatusCode{StatusCode: http.StatusTooManyRequests, LocalError: true}, config.ChannelTypeCodex) {
 		t.Fatal("expected local realtime errors to disable retries")
 	}
+	if shouldRetry(newRelayTestContext(nil), &types.OpenAIErrorWithStatusCode{
+		OpenAIError: types.OpenAIError{
+			Code:  "previous_response_not_found",
+			Param: "previous_response_id",
+		},
+		StatusCode: http.StatusConflict,
+		LocalError: true,
+	}, config.ChannelTypeCodex) {
+		t.Fatal("expected local stale continuation errors to disable retries")
+	}
 }
 
 func TestProcessProviderPayloadAPIErrorBestEffortControlPlane(t *testing.T) {

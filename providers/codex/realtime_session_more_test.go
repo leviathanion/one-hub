@@ -718,6 +718,9 @@ func TestCodexResponsesWSStaleContinuationPreflightFailClosed(t *testing.T) {
 	if apiErr == nil || codexRealtimeErrorCodeString(apiErr.Code, "") != "previous_response_not_found" || apiErr.Param != "previous_response_id" || apiErr.StatusCode != http.StatusConflict {
 		t.Fatalf("expected open-time stale guard before reconnect dial, got %+v", apiErr)
 	}
+	if !apiErr.LocalError {
+		t.Fatal("expected open-time stale guard to be marked local so relay retries fail closed")
+	}
 }
 
 func TestCodexResponsesWSSendClientStaleContinuationPreservesLastResponseID(t *testing.T) {

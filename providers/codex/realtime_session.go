@@ -1684,6 +1684,7 @@ func codexStaleResponsesWSContinuationOpenAIErrorLocked(state *codexManagedRunti
 			Param:   "previous_response_id",
 		},
 		StatusCode: http.StatusConflict,
+		LocalError: true,
 	}
 }
 
