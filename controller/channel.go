@@ -66,6 +66,21 @@ func AddChannel(c *gin.Context) {
 		})
 		return
 	}
+	tagExists, err := model.ChannelTagExists(channel.Tag)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	if tagExists {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "标签已存在，请到标签编辑里新增 key",
+		})
+		return
+	}
 	channel.CreatedTime = utils.GetTimestamp()
 	channels := buildChannelsForCreate(channel)
 	err = model.BatchInsertChannels(channels)

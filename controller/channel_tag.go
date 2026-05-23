@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"one-api/common"
@@ -66,14 +67,23 @@ func UpdateChannelsTag(c *gin.Context) {
 		common.AbortWithMessage(c, http.StatusOK, "tag is required")
 		return
 	}
-	channel := model.Channel{}
-	err := c.ShouldBindJSON(&channel)
+	rawBody, err := c.GetRawData()
 	if err != nil {
 		common.APIRespondWithError(c, http.StatusOK, err)
 		return
 	}
+	submittedFields, err := model.ParseChannelTagSubmittedFields(rawBody)
+	if err != nil {
+		common.APIRespondWithError(c, http.StatusOK, err)
+		return
+	}
+	channel := model.Channel{}
+	if err := json.Unmarshal(rawBody, &channel); err != nil {
+		common.APIRespondWithError(c, http.StatusOK, err)
+		return
+	}
 
-	err = model.UpdateChannelsTag(tag, &channel)
+	err = model.UpdateChannelsTagWithSubmittedFields(tag, &channel, submittedFields)
 	if err != nil {
 		common.APIRespondWithError(c, http.StatusOK, err)
 		return

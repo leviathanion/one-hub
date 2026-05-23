@@ -28,28 +28,28 @@ type Channel struct {
 	CreatedTime        int64   `json:"created_time" gorm:"bigint"`
 	TestTime           int64   `json:"test_time" gorm:"bigint"`
 	ResponseTime       int     `json:"response_time"` // in milliseconds
-	BaseURL            *string `json:"base_url" gorm:"column:base_url;default:''"`
-	Other              string  `json:"other" form:"other"`
+	BaseURL            *string `json:"base_url" gorm:"column:base_url;default:''" tag_config:"sync"`
+	Other              string  `json:"other" form:"other" tag_config:"sync"`
 	Balance            float64 `json:"balance"` // in USD
 	BalanceUpdatedTime int64   `json:"balance_updated_time" gorm:"bigint"`
-	Models             string  `json:"models" form:"models"`
-	Group              string  `json:"group" form:"group" gorm:"type:varchar(32);default:'default'"`
-	Tag                string  `json:"tag" form:"tag" gorm:"type:varchar(32);default:''"`
+	Models             string  `json:"models" form:"models" tag_config:"sync"`
+	Group              string  `json:"group" form:"group" gorm:"type:varchar(32);default:'default'" tag_config:"sync"`
+	Tag                string  `json:"tag" form:"tag" gorm:"type:varchar(32);default:''" tag_config:"sync"`
 	UsedQuota          int64   `json:"used_quota" gorm:"bigint;default:0"`
-	ModelMapping       *string `json:"model_mapping" gorm:"type:text"`
-	ModelHeaders       *string `json:"model_headers" gorm:"type:varchar(1024);default:''"`
-	CustomParameter    *string `json:"custom_parameter" gorm:"type:varchar(1024);default:''"`
+	ModelMapping       *string `json:"model_mapping" gorm:"type:text" tag_config:"sync"`
+	ModelHeaders       *string `json:"model_headers" gorm:"type:varchar(1024);default:''" tag_config:"sync"`
+	CustomParameter    *string `json:"custom_parameter" gorm:"type:varchar(1024);default:''" tag_config:"sync"`
 	Priority           *int64  `json:"priority" gorm:"bigint;default:0"`
-	Proxy              *string `json:"proxy" gorm:"type:varchar(255);default:''"`
-	TestModel          string  `json:"test_model" form:"test_model" gorm:"type:varchar(50);default:''"`
-	OnlyChat           bool    `json:"only_chat" form:"only_chat" gorm:"default:false"`
-	PreCost            int     `json:"pre_cost" form:"pre_cost" gorm:"default:1"`
-	CompatibleResponse bool    `json:"compatible_response" gorm:"default:false"`
-	AllowExtraBody     bool    `json:"allow_extra_body" form:"allow_extra_body" gorm:"default:false"`
+	Proxy              *string `json:"proxy" gorm:"type:varchar(255);default:''" tag_config:"sync"`
+	TestModel          string  `json:"test_model" form:"test_model" gorm:"type:varchar(50);default:''" tag_config:"sync"`
+	OnlyChat           bool    `json:"only_chat" form:"only_chat" gorm:"default:false" tag_config:"sync"`
+	PreCost            int     `json:"pre_cost" form:"pre_cost" gorm:"default:1" tag_config:"sync"`
+	CompatibleResponse bool    `json:"compatible_response" gorm:"default:false" tag_config:"sync"`
+	AllowExtraBody     bool    `json:"allow_extra_body" form:"allow_extra_body" gorm:"default:false" tag_config:"sync"`
 
-	DisabledStream *datatypes.JSONSlice[string] `json:"disabled_stream,omitempty" gorm:"type:json"`
+	DisabledStream *datatypes.JSONSlice[string] `json:"disabled_stream,omitempty" gorm:"type:json" tag_config:"sync"`
 
-	Plugin    *datatypes.JSONType[PluginType] `json:"plugin" form:"plugin" gorm:"type:json"`
+	Plugin    *datatypes.JSONType[PluginType] `json:"plugin" form:"plugin" gorm:"type:json" tag_config:"sync"`
 	DeletedAt gorm.DeletedAt                  `json:"-" gorm:"index"`
 
 	parsedModelMapping    map[string]string          `json:"-" gorm:"-"`

@@ -11,6 +11,7 @@ import (
 	"one-api/common/config"
 	"one-api/common/logger"
 
+	"gorm.io/datatypes"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -1025,6 +1026,390 @@ func TestUpdateChannelsTagRejectsInvalidCodexOtherWhenTypeOmitted(t *testing.T) 
 	}
 }
 
+func TestUpdateChannelsTagSynchronizesSubmittedTagConfigZeroValues(t *testing.T) {
+	useTestChannelDB(t)
+
+	priority := int64(9)
+	weight := uint(3)
+	oldDisabledStream := datatypes.JSONSlice[string]{"gpt-old"}
+	insertTestChannel(t, &Channel{
+		Id:                 1,
+		Type:               config.ChannelTypeOpenAI,
+		Name:               "tagged-one",
+		Key:                "sk-one",
+		Status:             config.ChannelStatusManuallyDisabled,
+		Weight:             &weight,
+		Balance:            12.5,
+		BalanceUpdatedTime: 111,
+		UsedQuota:          222,
+		ResponseTime:       333,
+		TestTime:           444,
+		Group:              "legacy",
+		Models:             "gpt-old",
+		Tag:                "sync-team",
+		BaseURL:            stringPtr("https://old.example"),
+		Other:              "legacy-other",
+		ModelMapping:       stringPtr(`{"old":"model"}`),
+		ModelHeaders:       stringPtr(`{"X-Old":"1"}`),
+		CustomParameter:    stringPtr(`{"old":true}`),
+		Proxy:              stringPtr("http://old-proxy"),
+		TestModel:          "gpt-old",
+		OnlyChat:           true,
+		PreCost:            config.PreCostNotImage,
+		CompatibleResponse: true,
+		AllowExtraBody:     true,
+		DisabledStream:     &oldDisabledStream,
+		Priority:           &priority,
+	})
+	insertTestChannel(t, &Channel{
+		Id:                 2,
+		Type:               config.ChannelTypeOpenAI,
+		Name:               "tagged-two",
+		Key:                "sk-two",
+		Status:             config.ChannelStatusEnabled,
+		Weight:             &weight,
+		Balance:            23.5,
+		BalanceUpdatedTime: 555,
+		UsedQuota:          666,
+		ResponseTime:       777,
+		TestTime:           888,
+		Group:              "legacy",
+		Models:             "gpt-old",
+		Tag:                "sync-team",
+		BaseURL:            stringPtr("https://old.example"),
+		Other:              "legacy-other",
+		ModelMapping:       stringPtr(`{"old":"model"}`),
+		ModelHeaders:       stringPtr(`{"X-Old":"1"}`),
+		CustomParameter:    stringPtr(`{"old":true}`),
+		Proxy:              stringPtr("http://old-proxy"),
+		TestModel:          "gpt-old",
+		OnlyChat:           true,
+		PreCost:            config.PreCostNotImage,
+		CompatibleResponse: true,
+		AllowExtraBody:     true,
+		DisabledStream:     &oldDisabledStream,
+		Priority:           &priority,
+	})
+
+	empty := ""
+	emptyObject := "{}"
+	emptyDisabledStream := datatypes.JSONSlice[string]{}
+	if err := UpdateChannelsTag("sync-team", &Channel{
+		Name:               "ignored-name",
+		Key:                "sk-one\nsk-two",
+		Status:             config.ChannelStatusEnabled,
+		Group:              "default",
+		Models:             "gpt-new",
+		Tag:                "sync-team",
+		BaseURL:            &empty,
+		Other:              "",
+		ModelMapping:       &emptyObject,
+		ModelHeaders:       &emptyObject,
+		CustomParameter:    &empty,
+		Proxy:              &empty,
+		TestModel:          "",
+		OnlyChat:           false,
+		PreCost:            config.PreCostDefault,
+		CompatibleResponse: false,
+		AllowExtraBody:     false,
+		DisabledStream:     &emptyDisabledStream,
+	}); err != nil {
+		t.Fatalf("expected tag update to succeed, got %v", err)
+	}
+
+	channels, err := GetChannelsByTag("sync-team")
+	if err != nil {
+		t.Fatalf("expected tagged channels lookup to succeed, got %v", err)
+	}
+	if len(channels) != 2 {
+		t.Fatalf("expected two tagged channels, got %d", len(channels))
+	}
+	for _, channel := range channels {
+		if channel.Models != "gpt-new" || channel.Group != "default" {
+			t.Fatalf("expected routing config to sync, got models=%q group=%q", channel.Models, channel.Group)
+		}
+		if channel.BaseURL == nil || *channel.BaseURL != "" || channel.Other != "" || channel.TestModel != "" {
+			t.Fatalf("expected string config to clear, got base_url=%v other=%q test_model=%q", channel.BaseURL, channel.Other, channel.TestModel)
+		}
+		if channel.ModelMapping == nil || *channel.ModelMapping != "{}" {
+			t.Fatalf("expected model_mapping to clear to {}, got %#v", channel.ModelMapping)
+		}
+		if channel.ModelHeaders == nil || *channel.ModelHeaders != "{}" {
+			t.Fatalf("expected model_headers to clear to {}, got %#v", channel.ModelHeaders)
+		}
+		if channel.CustomParameter == nil || *channel.CustomParameter != "" {
+			t.Fatalf("expected custom_parameter to clear, got %#v", channel.CustomParameter)
+		}
+		if channel.Proxy == nil || *channel.Proxy != "" {
+			t.Fatalf("expected proxy to clear, got %#v", channel.Proxy)
+		}
+		if channel.OnlyChat || channel.CompatibleResponse || channel.AllowExtraBody {
+			t.Fatalf("expected bool config to clear, got only_chat=%v compatible_response=%v allow_extra_body=%v", channel.OnlyChat, channel.CompatibleResponse, channel.AllowExtraBody)
+		}
+		if channel.PreCost != config.PreCostDefault {
+			t.Fatalf("expected pre_cost to sync, got %d", channel.PreCost)
+		}
+		if channel.DisabledStream == nil || len(*channel.DisabledStream) != 0 {
+			t.Fatalf("expected disabled_stream to clear, got %#v", channel.DisabledStream)
+		}
+		if channel.Name != "tagged-one" && channel.Name != "tagged-two" {
+			t.Fatalf("expected name to remain channel-local, got %q", channel.Name)
+		}
+		if channel.Weight == nil || *channel.Weight != weight {
+			t.Fatalf("expected weight to remain channel-local, got %#v", channel.Weight)
+		}
+		if channel.Id == 1 && (channel.Status != config.ChannelStatusManuallyDisabled || channel.Balance != 12.5 || channel.UsedQuota != 222 || channel.ResponseTime != 333 || channel.TestTime != 444) {
+			t.Fatalf("expected runtime fields to remain channel-local for channel 1, got %+v", channel)
+		}
+		if channel.Id == 2 && (channel.Status != config.ChannelStatusEnabled || channel.Balance != 23.5 || channel.UsedQuota != 666 || channel.ResponseTime != 777 || channel.TestTime != 888) {
+			t.Fatalf("expected runtime fields to remain channel-local for channel 2, got %+v", channel)
+		}
+	}
+}
+
+func TestUpdateChannelsTagWithSubmittedFieldsPreservesOmittedTagConfig(t *testing.T) {
+	useTestChannelDB(t)
+
+	insertTestChannel(t, &Channel{
+		Id:                 1,
+		Type:               config.ChannelTypeOpenAI,
+		Name:               "tagged-one",
+		Key:                "sk-one",
+		Group:              "legacy",
+		Models:             "gpt-old",
+		Tag:                "partial-team",
+		Other:              "legacy-other",
+		TestModel:          "gpt-old",
+		OnlyChat:           true,
+		CompatibleResponse: true,
+		AllowExtraBody:     true,
+	})
+
+	if err := UpdateChannelsTagWithSubmittedFields("partial-team", &Channel{
+		Key:            "sk-one",
+		Models:         "gpt-new",
+		Other:          "",
+		TestModel:      "",
+		AllowExtraBody: false,
+	}, ChannelTagSubmittedFields{"models": struct{}{}}); err != nil {
+		t.Fatalf("expected partial tag update to succeed, got %v", err)
+	}
+
+	persisted, err := GetChannelById(1)
+	if err != nil {
+		t.Fatalf("expected persisted tagged channel lookup to succeed, got %v", err)
+	}
+	if persisted.Models != "gpt-new" {
+		t.Fatalf("expected submitted models update, got %q", persisted.Models)
+	}
+	if persisted.Group != "legacy" || persisted.Other != "legacy-other" || persisted.TestModel != "gpt-old" {
+		t.Fatalf("expected omitted string fields to remain, got group=%q other=%q test_model=%q", persisted.Group, persisted.Other, persisted.TestModel)
+	}
+	if !persisted.OnlyChat || !persisted.CompatibleResponse || !persisted.AllowExtraBody {
+		t.Fatalf("expected omitted bool fields to remain true, got only_chat=%v compatible_response=%v allow_extra_body=%v", persisted.OnlyChat, persisted.CompatibleResponse, persisted.AllowExtraBody)
+	}
+}
+
+func TestUpdateChannelsTagPartialSubmitNewMemberInheritsExistingTagConfig(t *testing.T) {
+	useTestChannelDB(t)
+
+	oldDisabledStream := datatypes.JSONSlice[string]{"gpt-old"}
+	oldPlugin := datatypes.NewJSONType(PluginType{
+		"claude": {
+			"enabled":  true,
+			"base_url": "https://old-plugin.example.com",
+		},
+	})
+	insertTestChannel(t, &Channel{
+		Id:                 1,
+		Type:               config.ChannelTypeCustom,
+		Name:               "tagged-one",
+		Key:                "sk-one",
+		Status:             config.ChannelStatusManuallyDisabled,
+		Group:              "legacy",
+		Models:             "gpt-old",
+		Tag:                "partial-member-team",
+		BaseURL:            stringPtr("https://old.example"),
+		Other:              "legacy-other",
+		ModelMapping:       stringPtr(`{"old":"model"}`),
+		ModelHeaders:       stringPtr(`{"X-Old":"1"}`),
+		CustomParameter:    stringPtr(`{"old":true}`),
+		Proxy:              stringPtr("http://old-proxy"),
+		TestModel:          "gpt-old",
+		OnlyChat:           true,
+		PreCost:            config.PreCostNotImage,
+		CompatibleResponse: true,
+		AllowExtraBody:     true,
+		DisabledStream:     &oldDisabledStream,
+		Plugin:             &oldPlugin,
+	})
+
+	if err := UpdateChannelsTagWithSubmittedFields("partial-member-team", &Channel{
+		Key:    "sk-one\nsk-two",
+		Models: "gpt-new",
+	}, ChannelTagSubmittedFields{
+		"key":    struct{}{},
+		"models": struct{}{},
+	}); err != nil {
+		t.Fatalf("expected partial tag update with new key to succeed, got %v", err)
+	}
+
+	channels, err := GetChannelsByTag("partial-member-team")
+	if err != nil {
+		t.Fatalf("expected tagged channels lookup to succeed, got %v", err)
+	}
+	if len(channels) != 2 {
+		t.Fatalf("expected two tagged channels after member add, got %d", len(channels))
+	}
+
+	channelsByKey := make(map[string]*Channel, len(channels))
+	for _, channel := range channels {
+		channelsByKey[channel.Key] = channel
+	}
+	for _, key := range []string{"sk-one", "sk-two"} {
+		channel := channelsByKey[key]
+		if channel == nil {
+			t.Fatalf("expected tagged channel for key %q", key)
+		}
+		if channel.Models != "gpt-new" {
+			t.Fatalf("expected submitted models to sync for %q, got %q", key, channel.Models)
+		}
+		if channel.Group != "legacy" || channel.Other != "legacy-other" || channel.TestModel != "gpt-old" {
+			t.Fatalf("expected omitted string config to be inherited for %q, got group=%q other=%q test_model=%q", key, channel.Group, channel.Other, channel.TestModel)
+		}
+		if channel.BaseURL == nil || *channel.BaseURL != "https://old.example" {
+			t.Fatalf("expected omitted base_url to be inherited for %q, got %#v", key, channel.BaseURL)
+		}
+		if channel.Proxy == nil || *channel.Proxy != "http://old-proxy" {
+			t.Fatalf("expected omitted proxy to be inherited for %q, got %#v", key, channel.Proxy)
+		}
+		if channel.CustomParameter == nil || *channel.CustomParameter != `{"old":true}` {
+			t.Fatalf("expected omitted custom_parameter to be inherited for %q, got %#v", key, channel.CustomParameter)
+		}
+		if !channel.OnlyChat || !channel.CompatibleResponse || !channel.AllowExtraBody {
+			t.Fatalf("expected omitted bool config to be inherited for %q, got only_chat=%v compatible_response=%v allow_extra_body=%v", key, channel.OnlyChat, channel.CompatibleResponse, channel.AllowExtraBody)
+		}
+		if channel.DisabledStream == nil || len(*channel.DisabledStream) != 1 || (*channel.DisabledStream)[0] != "gpt-old" {
+			t.Fatalf("expected omitted disabled_stream to be inherited for %q, got %#v", key, channel.DisabledStream)
+		}
+		if channel.Plugin == nil || channel.Plugin.Data()["claude"]["base_url"] != "https://old-plugin.example.com" {
+			t.Fatalf("expected omitted plugin to be inherited for %q, got %#v", key, channel.Plugin)
+		}
+	}
+
+	added := channelsByKey["sk-two"]
+	if added.Balance != 0 || added.UsedQuota != 0 || added.ResponseTime != 0 || added.TestTime != 0 {
+		t.Fatalf("expected new member runtime fields to be reset, got %+v", added)
+	}
+}
+
+func TestUpdateChannelsTagWithSubmittedFieldsWritesNilPointersAndPlugin(t *testing.T) {
+	useTestChannelDB(t)
+
+	oldPlugin := datatypes.NewJSONType(PluginType{
+		"claude": {
+			"enabled":  true,
+			"base_url": "https://old-plugin.example.com",
+		},
+	})
+	insertTestChannel(t, &Channel{
+		Id:      1,
+		Type:    config.ChannelTypeCustom,
+		Name:    "tagged-one",
+		Key:     "sk-one",
+		Group:   "legacy",
+		Models:  "gpt-old",
+		Tag:     "nil-plugin-team",
+		BaseURL: stringPtr("https://old.example"),
+		Proxy:   stringPtr("http://old-proxy"),
+		Plugin:  &oldPlugin,
+	})
+
+	newPlugin := datatypes.NewJSONType(PluginType{
+		"claude": {
+			"enabled":  true,
+			"base_url": "https://new-plugin.example.com",
+		},
+	})
+	if err := UpdateChannelsTagWithSubmittedFields("nil-plugin-team", &Channel{
+		Key:     "sk-one",
+		BaseURL: nil,
+		Proxy:   nil,
+		Plugin:  &newPlugin,
+	}, ChannelTagSubmittedFields{
+		"base_url": struct{}{},
+		"proxy":    struct{}{},
+		"plugin":   struct{}{},
+	}); err != nil {
+		t.Fatalf("expected nil pointer and plugin tag update to succeed, got %v", err)
+	}
+
+	persisted, err := GetChannelById(1)
+	if err != nil {
+		t.Fatalf("expected persisted tagged channel lookup to succeed, got %v", err)
+	}
+	if persisted.BaseURL != nil {
+		t.Fatalf("expected submitted base_url=null to write NULL, got %#v", persisted.BaseURL)
+	}
+	if persisted.Proxy != nil {
+		t.Fatalf("expected submitted proxy=null to write NULL, got %#v", persisted.Proxy)
+	}
+	if persisted.Plugin == nil {
+		t.Fatal("expected submitted plugin config to sync")
+	}
+	claudeConfig := persisted.Plugin.Data()["claude"]
+	if claudeConfig["base_url"] != "https://new-plugin.example.com" {
+		t.Fatalf("expected submitted plugin config to sync, got %#v", persisted.Plugin.Data())
+	}
+}
+
+func TestUpdateChannelsTagNewMembersInheritSubmittedTagConfig(t *testing.T) {
+	useTestChannelDB(t)
+
+	insertTestChannel(t, &Channel{
+		Id:     1,
+		Type:   config.ChannelTypeOpenAI,
+		Name:   "tagged-one",
+		Key:    "sk-one",
+		Group:  "legacy",
+		Models: "gpt-old",
+		Tag:    "member-team",
+	})
+
+	if err := UpdateChannelsTag("member-team", &Channel{
+		Name:           "member-team",
+		Key:            "sk-one\nsk-two",
+		Group:          "default",
+		Models:         "gpt-new",
+		Tag:            "member-team",
+		TestModel:      "gpt-new",
+		AllowExtraBody: true,
+	}); err != nil {
+		t.Fatalf("expected tag update with new key to succeed, got %v", err)
+	}
+
+	channels, err := GetChannelsByTag("member-team")
+	if err != nil {
+		t.Fatalf("expected tagged channels lookup to succeed, got %v", err)
+	}
+	if len(channels) != 2 {
+		t.Fatalf("expected two tagged channels after member add, got %d", len(channels))
+	}
+	var added *Channel
+	for _, channel := range channels {
+		if channel.Key == "sk-two" {
+			added = channel
+			break
+		}
+	}
+	if added == nil {
+		t.Fatal("expected new key to create a tagged channel")
+	}
+	if added.Models != "gpt-new" || added.Group != "default" || added.TestModel != "gpt-new" || !added.AllowExtraBody {
+		t.Fatalf("expected new member to inherit tag config, got %+v", added)
+	}
+}
+
 func TestUpdateChannelsTagClearsCodexDerivedCaches(t *testing.T) {
 	useTestChannelDB(t)
 	cache.InitCacheManager()
@@ -1058,6 +1443,7 @@ func TestUpdateChannelsTagClearsCodexDerivedCaches(t *testing.T) {
 		Key:     "sk-tagged\nsk-tagged-2",
 		Group:   "default",
 		Models:  "gpt-5",
+		Tag:     "codex-team",
 		BaseURL: stringPtr("https://new.example"),
 	}); err != nil {
 		t.Fatalf("expected tag update to succeed, got %v", err)
