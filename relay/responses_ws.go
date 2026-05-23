@@ -53,11 +53,12 @@ const (
 )
 
 const (
-	responsesWSEventQueueSize           = 128
-	responsesWSSendQueueSize            = 64
-	responsesWSPendingProviderEventsMax = 32
-	responsesWSBusyRejectLimit          = 16
-	responsesWSBusyRejectWindow         = 10 * time.Second
+	responsesWSEventQueueSize               = 128
+	responsesWSSendQueueSize                = 64
+	responsesWSPendingProviderEventsMax     = 32
+	responsesWSBusyRejectLimit              = 16
+	responsesWSBusyRejectWindow             = 10 * time.Second
+	responsesWSPreviousResponseIDContextKey = "responses_ws_previous_response_id"
 )
 
 var errResponsesWSSendQueueFull = errors.New("responses websocket upstream send queue is full")
@@ -1708,6 +1709,10 @@ func (a *ResponsesWSSessionActor) startSubsequentTurn(raw []byte, receivedAt tim
 		a.RefreshContext(ctx)
 		ctx = a.Context()
 	}
+	if err := a.preflightResponsesWSSend(ctx, frame.EventID, &request); err != nil {
+		a.handleResponsesWSPreflightError(err)
+		return
+	}
 	admission := NewResponsesWSTurnAdmission()
 	if apiErr := admission.AllowRPMOnce(func() *types.OpenAIErrorWithStatusCode {
 		return middleware.AllowCurrentUserRequest(ctx)
@@ -1763,6 +1768,33 @@ func (a *ResponsesWSSessionActor) startSubsequentTurn(raw []byte, receivedAt tim
 	}
 }
 
+func (a *ResponsesWSSessionActor) preflightResponsesWSSend(c *gin.Context, eventID string, request *types.OpenAIResponsesRequest) error {
+	if a == nil || a.session == nil || request == nil {
+		return nil
+	}
+	preflight, ok := a.session.(runtimesession.ResponsesWSSendPreflightCapable)
+	if !ok {
+		return nil
+	}
+	ctx := context.Background()
+	if c != nil && c.Request != nil {
+		ctx = c.Request.Context()
+	}
+	return preflight.PreflightResponsesWSSend(ctx, eventID, request)
+}
+
+func (a *ResponsesWSSessionActor) handleResponsesWSPreflightError(err error) {
+	if err == nil {
+		return
+	}
+	a.writeProxyLocal(responsesWSErrorFromErr(err))
+	if errors.Is(err, runtimesession.ErrStaleResponsesWSContinuation) {
+		a.close("previous_response_not_found")
+		return
+	}
+	a.close("responses_ws_preflight_failed")
+}
+
 func (a *ResponsesWSSessionActor) postSendQueueFull(attemptID string, selectedChannelID int) {
 	if a == nil {
 		return
@@ -1813,6 +1845,9 @@ func (a *ResponsesWSSessionActor) handleSendResult(event ResponsesWSEventSendRes
 		a.state = responsesWSStateIdle
 		if event.Err != nil {
 			a.writeProxyLocal(responsesWSErrorFromErr(event.Err))
+			if errors.Is(event.Err, runtimesession.ErrStaleResponsesWSContinuation) {
+				a.close("previous_response_not_found")
+			}
 		}
 	case SendOutcomeAmbiguous:
 		hadProviderEvidence := a.hasPendingProviderEvidence()
@@ -2447,6 +2482,7 @@ func openAndPrimeResponsesWSSessionWithContext(openCtx context.Context, c *gin.C
 		return nil, common.StringErrorWrapperLocal("request is required", "invalid_request_error", http.StatusBadRequest)
 	}
 	markResponsesWSStreamRequest(c)
+	setResponsesWSOpenPreviousResponseID(c, request.PreviousResponseID)
 	if openCtx == nil {
 		openCtx = context.Background()
 	}
@@ -2490,9 +2526,10 @@ func openAndPrimeResponsesWSSessionWithContext(openCtx context.Context, c *gin.C
 		provider := relay.getProvider()
 		channel := provider.GetChannel()
 		session, apiErr := openRealtimeSessionWithOptions(provider, relay.modelName, runtimesession.RealtimeOpenOptions{
-			Context:            openCtx,
-			PreferredTransport: runtimesession.TransportModeResponsesWS,
-			RequireWS:          true,
+			Context:                       openCtx,
+			PreferredTransport:            runtimesession.TransportModeResponsesWS,
+			RequireWS:                     true,
+			ResponsesWSPreviousResponseID: responsesWSOpenPreviousResponseID(c),
 		})
 		if apiErr == nil {
 			metrics.RecordProvider(c, 200)
@@ -2597,9 +2634,10 @@ func openResponsesWSSelectedChannelWithContext(openCtx context.Context, c *gin.C
 		candidate.SelectedChannelID = channel.Id
 	}
 	session, apiErr := openRealtimeSessionWithOptions(provider, mappedModel, runtimesession.RealtimeOpenOptions{
-		Context:            openCtx,
-		PreferredTransport: runtimesession.TransportModeResponsesWS,
-		RequireWS:          true,
+		Context:                       openCtx,
+		PreferredTransport:            runtimesession.TransportModeResponsesWS,
+		RequireWS:                     true,
+		ResponsesWSPreviousResponseID: responsesWSOpenPreviousResponseID(c),
 	})
 	if apiErr != nil {
 		return nil, apiErr
@@ -2619,6 +2657,19 @@ func markResponsesWSStreamRequest(c *gin.Context) {
 	if c != nil {
 		c.Set("is_stream", true)
 	}
+}
+
+func setResponsesWSOpenPreviousResponseID(c *gin.Context, previousResponseID string) {
+	if c != nil {
+		c.Set(responsesWSPreviousResponseIDContextKey, strings.TrimSpace(previousResponseID))
+	}
+}
+
+func responsesWSOpenPreviousResponseID(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	return strings.TrimSpace(c.GetString(responsesWSPreviousResponseIDContextKey))
 }
 
 func attachResponsesWSSelectedChannelSnapshot(snapshot *ResponsesWSRequestSnapshot, channel *model.Channel, providerModel string, billingModel string) {
@@ -2743,7 +2794,7 @@ func responsesWSSendOutcomeFromError(err error) ResponsesWSSendOutcome {
 	if err == nil {
 		return SendOutcomeLocalWriteOK
 	}
-	if errors.Is(err, runtimesession.ErrSessionClosed) {
+	if errors.Is(err, runtimesession.ErrSessionClosed) || errors.Is(err, runtimesession.ErrStaleResponsesWSContinuation) {
 		return SendOutcomeNotSent
 	}
 	var event *types.Event
@@ -2760,6 +2811,10 @@ func responsesWSSendOutcomeFromError(err error) ResponsesWSSendOutcome {
 }
 
 func responsesWSErrorPayload(status int, code string, message string) []byte {
+	return responsesWSErrorPayloadWithParam(status, code, message, "")
+}
+
+func responsesWSErrorPayloadWithParam(status int, code string, message string, param string) []byte {
 	payload := map[string]any{
 		"type":   "error",
 		"status": status,
@@ -2769,8 +2824,15 @@ func responsesWSErrorPayload(status int, code string, message string) []byte {
 			"message": message,
 		},
 	}
+	if strings.TrimSpace(param) != "" {
+		payload["error"].(map[string]any)["param"] = strings.TrimSpace(param)
+	}
 	encoded, _ := json.Marshal(payload)
 	return encoded
+}
+
+func responsesWSPreviousResponseNotFoundPayload() []byte {
+	return responsesWSErrorPayloadWithParam(http.StatusConflict, "previous_response_not_found", responsesWSStaticErrorMessage("previous_response_not_found"), "previous_response_id")
 }
 
 func responsesWSFallbackPayload() []byte {
@@ -2835,6 +2897,9 @@ func responsesWSErrorFromErr(err error) []byte {
 	if payload := runtimesession.ClientPayloadFromError(err); len(payload) > 0 {
 		return payload
 	}
+	if errors.Is(err, runtimesession.ErrStaleResponsesWSContinuation) {
+		return responsesWSPreviousResponseNotFoundPayload()
+	}
 	var event *types.Event
 	if errors.As(err, &event) && event != nil && event.IsError() {
 		code := openAIErrorCodeString(event.ErrorDetail.Code, "upstream_error")
@@ -2874,6 +2939,9 @@ func responsesWSStaticErrorMessage(code string) string {
 
 func isResponsesContinuationMissError(err error) bool {
 	if err == nil {
+		return false
+	}
+	if errors.Is(err, runtimesession.ErrStaleResponsesWSContinuation) {
 		return false
 	}
 	payload := responsesWSErrorFromErr(err)

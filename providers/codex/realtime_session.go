@@ -470,7 +470,7 @@ func (p *CodexProvider) OpenRealtimeSessionWithOptions(modelName string, options
 		}
 		exec.Attached = true
 
-		if errWithCode := p.ensureRealtimeTransportWithContextLocked(options.Context, exec, state, time.Now()); errWithCode != nil {
+		if errWithCode := p.ensureRealtimeTransportWithContextLocked(options.Context, exec, state, time.Now(), options.ResponsesWSPreviousResponseID); errWithCode != nil {
 			state.attachment = staleAttachment
 			state.ownerSeq = staleOwnerSeq
 			state.requireWS = staleRequireWS
@@ -559,6 +559,10 @@ func (s *codexManagedRealtimeSession) SendClient(ctx context.Context, mt int, pa
 			unlockExec()
 			return err
 		}
+		if err := codexCheckStaleResponsesWSContinuationLocked(state, eventID, request); err != nil {
+			unlockExec()
+			return err
+		}
 
 		s.exec.LastResponseID = ""
 		s.exec.Inflight = true
@@ -566,7 +570,7 @@ func (s *codexManagedRealtimeSession) SendClient(ctx context.Context, mt int, pa
 		now := time.Now()
 		s.exec.Touch(now)
 
-		if err := s.provider.ensureRealtimeTransportWithContextLocked(ctx, s.exec, state, time.Now()); err != nil {
+		if err := s.provider.ensureRealtimeTransportWithContextLocked(ctx, s.exec, state, time.Now(), ""); err != nil {
 			s.exec.Inflight = false
 			s.exec.State = runtimesession.SessionStateIdle
 			resetCodexTurnLocked(state)
@@ -695,6 +699,21 @@ func (s *codexManagedRealtimeSession) SendClient(ctx context.Context, mt int, pa
 		unlockExec()
 		return newCodexRealtimeClientError(event.EventID, "unsupported_client_event", "unsupported realtime client event")
 	}
+}
+
+func (s *codexManagedRealtimeSession) PreflightResponsesWSSend(ctx context.Context, eventID string, request *types.OpenAIResponsesRequest) error {
+	_ = ctx
+	if s == nil || s.exec == nil {
+		return runtimesession.ErrSessionClosed
+	}
+
+	s.exec.Lock()
+	defer s.exec.Unlock()
+	state := getCodexManagedRuntimeStateLocked(s.exec)
+	if !codexManagedSessionOwnsAttachmentLocked(state, s.ownerSeq, s.attachment) {
+		return runtimesession.ErrSessionClosed
+	}
+	return codexCheckStaleResponsesWSContinuationLocked(state, eventID, request)
 }
 
 func (s *codexManagedRealtimeSession) Recv(ctx context.Context) (int, []byte, *types.UsageEvent, runtimesession.RealtimePayloadOrigin, error) {
@@ -1224,10 +1243,10 @@ func readCodexRealtimeCapacityNamespace(c *gin.Context) string {
 }
 
 func (p *CodexProvider) ensureRealtimeTransportLocked(exec *runtimesession.ExecutionSession, state *codexManagedRuntimeState, now time.Time) *types.OpenAIErrorWithStatusCode {
-	return p.ensureRealtimeTransportWithContextLocked(context.Background(), exec, state, now)
+	return p.ensureRealtimeTransportWithContextLocked(context.Background(), exec, state, now, "")
 }
 
-func (p *CodexProvider) ensureRealtimeTransportWithContextLocked(ctx context.Context, exec *runtimesession.ExecutionSession, state *codexManagedRuntimeState, now time.Time) *types.OpenAIErrorWithStatusCode {
+func (p *CodexProvider) ensureRealtimeTransportWithContextLocked(ctx context.Context, exec *runtimesession.ExecutionSession, state *codexManagedRuntimeState, now time.Time, previousResponseID string) *types.OpenAIErrorWithStatusCode {
 	mode := p.getWebsocketMode()
 	requireWS := state != nil && state.requireWS
 	if mode == codexWebsocketModeOff {
@@ -1267,6 +1286,10 @@ func (p *CodexProvider) ensureRealtimeTransportWithContextLocked(ctx context.Con
 			exec.Transport = runtimesession.TransportModeResponsesHTTPBridge
 			return nil
 		}
+	}
+
+	if errWithCode := codexStaleResponsesWSContinuationOpenAIErrorLocked(state, previousResponseID); errWithCode != nil {
+		return errWithCode
 	}
 
 	plan, errWithCode := p.prepareChatRealtimeConn(exec.Model, exec.SessionID)
@@ -1555,7 +1578,13 @@ func (p *CodexProvider) startRealtimeWSReaderLocked(exec *runtimesession.Executi
 }
 
 func (p *CodexProvider) sendRealtimeWSEventLocked(ctx context.Context, exec *runtimesession.ExecutionSession, state *codexManagedRuntimeState, payload []byte, eventID string, request *types.OpenAIResponsesRequest, ownerSeq uint64, attachment *codexAttachment) error {
-	if errWithCode := p.ensureRealtimeTransportWithContextLocked(ctx, exec, state, time.Now()); errWithCode != nil {
+	if err := codexCheckStaleResponsesWSContinuationLocked(state, eventID, request); err != nil {
+		exec.Inflight = false
+		exec.State = runtimesession.SessionStateIdle
+		return err
+	}
+
+	if errWithCode := p.ensureRealtimeTransportWithContextLocked(ctx, exec, state, time.Now(), ""); errWithCode != nil {
 		exec.Inflight = false
 		exec.State = runtimesession.SessionStateIdle
 		return codexRealtimeErrorFromOpenAIError(eventID, errWithCode)
@@ -1600,7 +1629,7 @@ func (p *CodexProvider) sendRealtimeWSEventLocked(ctx context.Context, exec *run
 	}
 	closeCodexClearedWebsocket(clearedToClose)
 
-	if errWithCode := p.ensureRealtimeTransportWithContextLocked(ctx, exec, state, time.Now()); errWithCode == nil && exec.Transport == runtimesession.TransportModeResponsesWS && state.wsConn != nil {
+	if errWithCode := p.ensureRealtimeTransportWithContextLocked(ctx, exec, state, time.Now(), ""); errWithCode == nil && exec.Transport == runtimesession.TransportModeResponsesWS && state.wsConn != nil {
 		retryConn := state.wsConn
 		if err := writeCodexRealtimeWSMessageWithExecUnlocked(exec, state, retryConn, websocket.TextMessage, payload); err == nil {
 			return nil
@@ -1629,6 +1658,41 @@ func (p *CodexProvider) sendRealtimeWSEventLocked(ctx context.Context, exec *run
 	exec.Inflight = false
 	exec.State = runtimesession.SessionStateIdle
 	return newCodexRealtimeProviderError(eventID, "ws_request_failed", "failed to deliver realtime websocket request")
+}
+
+func codexCheckStaleResponsesWSContinuationLocked(state *codexManagedRuntimeState, eventID string, request *types.OpenAIResponsesRequest) error {
+	if request == nil || !codexShouldFailStaleResponsesWSContinuationLocked(state, request.PreviousResponseID) {
+		return nil
+	}
+
+	// Trade-off: a disconnected Codex Responses websocket cannot prove that the
+	// upstream still knows the requested previous_response_id. Replaying local
+	// transcript state would add billing, concurrency, and semantic ambiguity, so
+	// the managed WS path fails closed and leaves affinity/cache bindings intact.
+	return codexStaleResponsesWSContinuationError(eventID)
+}
+
+func codexStaleResponsesWSContinuationOpenAIErrorLocked(state *codexManagedRuntimeState, previousResponseID string) *types.OpenAIErrorWithStatusCode {
+	if !codexShouldFailStaleResponsesWSContinuationLocked(state, previousResponseID) {
+		return nil
+	}
+	return &types.OpenAIErrorWithStatusCode{
+		OpenAIError: types.OpenAIError{
+			Type:    "invalid_request_error",
+			Code:    "previous_response_not_found",
+			Message: "previous response was not found",
+			Param:   "previous_response_id",
+		},
+		StatusCode: http.StatusConflict,
+	}
+}
+
+func codexShouldFailStaleResponsesWSContinuationLocked(state *codexManagedRuntimeState, previousResponseID string) bool {
+	return state != nil &&
+		strings.TrimSpace(previousResponseID) != "" &&
+		state.requireWS &&
+		state.wsConnGeneration > 0 &&
+		state.wsConn == nil
 }
 
 func (p *CodexProvider) startRealtimeHTTPBridgeLocked(exec *runtimesession.ExecutionSession, state *codexManagedRuntimeState, request *types.OpenAIResponsesRequest, eventID string) error {
@@ -2463,6 +2527,26 @@ func newCodexRealtimeClientError(eventID, code, message string) error {
 
 func newCodexRealtimeProviderError(eventID, code, message string) error {
 	return types.NewErrorEvent(eventID, "provider_error", code, message)
+}
+
+func codexStaleResponsesWSContinuationError(eventID string) error {
+	_ = eventID
+	return runtimesession.NewClientPayloadError(runtimesession.ErrStaleResponsesWSContinuation, codexResponsesWSPreviousResponseNotFoundPayload())
+}
+
+func codexResponsesWSPreviousResponseNotFoundPayload() []byte {
+	payload := map[string]any{
+		"type":   "error",
+		"status": http.StatusConflict,
+		"error": map[string]any{
+			"type":    "invalid_request_error",
+			"code":    "previous_response_not_found",
+			"message": "previous response was not found",
+			"param":   "previous_response_id",
+		},
+	}
+	encoded, _ := json.Marshal(payload)
+	return encoded
 }
 
 func codexRealtimeProviderErrorEventPayload(eventID, code, message string) []byte {

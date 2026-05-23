@@ -358,6 +358,7 @@ func TestBuildExecutionSessionMetadataPrefersXSessionIDOverConversationSessionID
 	key := `{"access_token":"access-token","account_id":"acct-123"}`
 	provider := newTestCodexProviderWithContext(t, key, "", map[string]string{
 		"session_id":   "conversation-session-123",
+		"Session-Id":   "native-session-789",
 		"X-Session-Id": "execution-session-456",
 	})
 	provider.Context.Set("token_id", 12345)
@@ -389,6 +390,28 @@ func TestBuildExecutionSessionMetadataPrefersXSessionIDOverConversationSessionID
 	}
 	if upstreamSessionID != meta.SessionID {
 		t.Fatalf("expected execution key session id %q to match metadata, got %q", meta.SessionID, upstreamSessionID)
+	}
+}
+
+func TestBuildExecutionSessionMetadataUsesNativeSessionID(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, "", map[string]string{
+		"session_id": "legacy-session-123",
+		"Session-Id": "native-session-789",
+	})
+	provider.Context.Set("token_id", 12345)
+
+	meta, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimesession.RealtimeOpenOptions{})
+	if errWithCode != nil {
+		t.Fatalf("expected execution session metadata to build, got %v", errWithCode)
+	}
+
+	expectedBindingKey := runtimesession.BuildBindingKey("token:12345", runtimesession.BindingScopeChatRealtime, "native-session-789")
+	if meta.BindingKey != expectedBindingKey {
+		t.Fatalf("expected binding key from native session-id, got %q", meta.BindingKey)
+	}
+	if !meta.ClientSuppliedID {
+		t.Fatal("expected native session-id to be marked as client supplied")
 	}
 }
 
@@ -564,6 +587,22 @@ func TestPrepareCodexRequestGeneratesStablePromptCacheKeyFromSessionIDWhenStrate
 	expected := uuid.NewSHA1(uuid.NameSpaceOID, []byte("one-hub:codex:prompt-cache:session:client-session-123")).String()
 	if request.PromptCacheKey != expected {
 		t.Fatalf("expected session-scoped prompt cache key %q, got %q", expected, request.PromptCacheKey)
+	}
+}
+
+func TestPrepareCodexRequestGeneratesStablePromptCacheKeyFromNativeSessionID(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, `{"prompt_cache_key_strategy":"session_id"}`, map[string]string{
+		"Session-Id": "native-session-123",
+		"session_id": "legacy-session-456",
+	})
+
+	request := &types.OpenAIResponsesRequest{Model: "gpt-5"}
+	provider.prepareCodexRequest(request)
+
+	expected := uuid.NewSHA1(uuid.NameSpaceOID, []byte("one-hub:codex:prompt-cache:session:native-session-123")).String()
+	if request.PromptCacheKey != expected {
+		t.Fatalf("expected native session-id prompt cache key %q, got %q", expected, request.PromptCacheKey)
 	}
 }
 

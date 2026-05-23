@@ -193,12 +193,28 @@ func intSliceContains(values []int, target int) bool {
 }
 
 type responsesWSTestSession struct {
-	abortReason string
-	abortCh     chan string
-	abortCount  int32
+	abortReason      string
+	abortCh          chan string
+	abortCount       int32
+	preflightErr     error
+	preflightCalls   int32
+	preflightEventID string
+	preflightRequest *types.OpenAIResponsesRequest
 }
 
 func (s *responsesWSTestSession) SendClient(context.Context, int, []byte) error { return nil }
+
+func (s *responsesWSTestSession) PreflightResponsesWSSend(_ context.Context, eventID string, request *types.OpenAIResponsesRequest) error {
+	atomic.AddInt32(&s.preflightCalls, 1)
+	s.preflightEventID = eventID
+	if request != nil {
+		cloned := *request
+		s.preflightRequest = &cloned
+	} else {
+		s.preflightRequest = nil
+	}
+	return s.preflightErr
+}
 
 func (s *responsesWSTestSession) Recv(context.Context) (int, []byte, *types.UsageEvent, runtimesession.RealtimePayloadOrigin, error) {
 	return 0, nil, nil, runtimesession.RealtimePayloadOriginProxyLocal, runtimesession.ErrSessionClosed
@@ -2293,6 +2309,59 @@ func TestResponsesWSSubsequentRPMFailureDoesNotCreateAttempt(t *testing.T) {
 	}
 }
 
+func TestResponsesWSSubsequentStalePreflightRejectsBeforeRPMAndCloses(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	originalPricing := model.PricingInstance
+	model.PricingInstance = &model.Pricing{Prices: map[string]*model.Price{
+		"gpt-5": {
+			Model: "gpt-5",
+		},
+	}}
+	t.Cleanup(func() {
+		model.PricingInstance = originalPricing
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	ctx.Set("group", "responses-ws-missing-limiter")
+	ctx.Set("original_model", "gpt-5")
+	ctx.Set("new_model", "gpt-5")
+	ctx.Set("responses_ws_selected_channel", &model.Channel{Id: 17, Type: config.ChannelTypeOpenAI})
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	session := &responsesWSTestSession{preflightErr: runtimesession.NewClientPayloadError(runtimesession.ErrStaleResponsesWSContinuation, responsesWSPreviousResponseNotFoundPayload())}
+	actor.AttachUpstreamSession(session, 17)
+	actor.state = responsesWSStateIdle
+	actor.pendingTurnPhase = responsesWSPendingTurnNone
+
+	actor.startSubsequentTurn([]byte(`{"type":"response.create","event_id":"evt_stale","model":"gpt-5","previous_response_id":"resp_old","input":[]}`), time.Now())
+
+	if got := atomic.LoadInt32(&session.preflightCalls); got != 1 {
+		t.Fatalf("expected stale preflight once, got %d", got)
+	}
+	if session.preflightEventID != "evt_stale" || session.preflightRequest == nil || session.preflightRequest.PreviousResponseID != "resp_old" {
+		t.Fatalf("expected preflight request to carry event and previous response, event=%q request=%+v", session.preflightEventID, session.preflightRequest)
+	}
+	if actor.pendingAttempt != nil || actor.pendingTurnPhase != responsesWSPendingTurnNone {
+		t.Fatalf("expected stale preflight before attempt creation, phase=%v pending=%+v", actor.pendingTurnPhase, actor.pendingAttempt)
+	}
+	if !actor.closed.Load() {
+		t.Fatal("expected stale preflight to close downstream session")
+	}
+	got, _ := conn.lastWrite.Load().(string)
+	assertResponsesWSErrorPayload(t, got, http.StatusConflict, "previous_response_not_found", "previous response was not found")
+	if !strings.Contains(got, `"param":"previous_response_id"`) {
+		t.Fatalf("expected previous_response_id param in stale payload, got %q", got)
+	}
+	if strings.Contains(got, "api_requests_not_allowed") {
+		t.Fatalf("expected stale preflight before RPM limiter, got %q", got)
+	}
+}
+
 func TestResponsesWSBusyCreateBudgetClosesAbusiveClient(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -3001,6 +3070,17 @@ func TestResponsesWSSendOutcomeFromErrorClassifiesWriteFailureAmbiguous(t *testi
 	}
 	if got := responsesWSSendOutcomeFromError(runtimesession.ErrSessionClosed); got != SendOutcomeNotSent {
 		t.Fatalf("expected closed session before write to be not-sent, got %v", got)
+	}
+	if got := responsesWSSendOutcomeFromError(runtimesession.ErrStaleResponsesWSContinuation); got != SendOutcomeNotSent {
+		t.Fatalf("expected stale local continuation guard to be not-sent, got %v", got)
+	}
+	if isResponsesContinuationMissError(runtimesession.ErrStaleResponsesWSContinuation) {
+		t.Fatal("expected local stale continuation guard not to clear provider affinity")
+	}
+	payload := string(responsesWSErrorFromErr(runtimesession.ErrStaleResponsesWSContinuation))
+	assertResponsesWSErrorPayload(t, payload, http.StatusConflict, "previous_response_not_found", "previous response was not found")
+	if !strings.Contains(payload, `"param":"previous_response_id"`) {
+		t.Fatalf("expected previous_response_id param in stale payload, got %q", payload)
 	}
 }
 

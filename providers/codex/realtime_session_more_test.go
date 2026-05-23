@@ -665,6 +665,97 @@ func TestCodexManagedRealtimeSessionGuardBranches(t *testing.T) {
 	}
 }
 
+func TestCodexResponsesWSStaleContinuationPreflightFailClosed(t *testing.T) {
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"force"}`, nil)
+	exec := runtimesession.NewExecutionSession(runtimesession.Metadata{
+		Key:       "channel:1/hash-a/session-stale-preflight",
+		SessionID: "session-stale-preflight",
+		Model:     "gpt-5",
+		IdleTTL:   time.Minute,
+	})
+	exec.LastResponseID = "resp_last"
+	attachment := newCodexAttachment()
+	state := getCodexManagedRuntimeStateLocked(exec)
+	state.attachment = attachment
+	state.ownerSeq = 1
+	state.requireWS = true
+	state.wsConnGeneration = 1
+	exec.Attached = true
+
+	session := &codexManagedRealtimeSession{
+		provider:   provider,
+		exec:       exec,
+		attachment: attachment,
+		ownerSeq:   1,
+	}
+
+	err := session.PreflightResponsesWSSend(context.Background(), "evt_stale", &types.OpenAIResponsesRequest{
+		Model:              "gpt-5",
+		PreviousResponseID: "resp_old",
+	})
+	if !errors.Is(err, runtimesession.ErrStaleResponsesWSContinuation) {
+		t.Fatalf("expected stale continuation sentinel, got %v", err)
+	}
+	payload := runtimesession.ClientPayloadFromError(err)
+	if !strings.Contains(string(payload), `"status":409`) ||
+		!strings.Contains(string(payload), `"code":"previous_response_not_found"`) ||
+		!strings.Contains(string(payload), `"param":"previous_response_id"`) {
+		t.Fatalf("expected local previous_response_not_found payload, got %q", payload)
+	}
+	if exec.LastResponseID != "resp_last" {
+		t.Fatalf("expected stale guard not to clear LastResponseID, got %q", exec.LastResponseID)
+	}
+	if state.wsConnGeneration != 1 || state.wsConn != nil {
+		t.Fatalf("expected stale guard to leave websocket generation/binding state intact, state=%+v", state)
+	}
+	if err := session.PreflightResponsesWSSend(context.Background(), "evt_fresh", &types.OpenAIResponsesRequest{Model: "gpt-5"}); err != nil {
+		t.Fatalf("expected request without previous_response_id to allow reconnect path, got %v", err)
+	}
+
+	exec.Lock()
+	apiErr := provider.ensureRealtimeTransportWithContextLocked(context.Background(), exec, state, time.Now(), "resp_old")
+	exec.Unlock()
+	if apiErr == nil || codexRealtimeErrorCodeString(apiErr.Code, "") != "previous_response_not_found" || apiErr.Param != "previous_response_id" || apiErr.StatusCode != http.StatusConflict {
+		t.Fatalf("expected open-time stale guard before reconnect dial, got %+v", apiErr)
+	}
+}
+
+func TestCodexResponsesWSSendClientStaleContinuationPreservesLastResponseID(t *testing.T) {
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"force"}`, nil)
+	exec := runtimesession.NewExecutionSession(runtimesession.Metadata{
+		Key:       "channel:1/hash-a/session-stale-send",
+		SessionID: "session-stale-send",
+		Model:     "gpt-5",
+		IdleTTL:   time.Minute,
+	})
+	exec.LastResponseID = "resp_last"
+	attachment := newCodexAttachment()
+	state := getCodexManagedRuntimeStateLocked(exec)
+	state.attachment = attachment
+	state.ownerSeq = 1
+	state.requireWS = true
+	state.wsConnGeneration = 1
+	exec.Attached = true
+
+	session := &codexManagedRealtimeSession{
+		provider:   provider,
+		exec:       exec,
+		attachment: attachment,
+		ownerSeq:   1,
+	}
+
+	err := session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","event_id":"evt_stale_send","model":"gpt-5","previous_response_id":"resp_old","input":"hi"}`))
+	if !errors.Is(err, runtimesession.ErrStaleResponsesWSContinuation) {
+		t.Fatalf("expected stale continuation sentinel, got %v", err)
+	}
+	if exec.LastResponseID != "resp_last" {
+		t.Fatalf("expected SendClient stale guard not to clear LastResponseID, got %q", exec.LastResponseID)
+	}
+	if exec.Inflight || exec.State != runtimesession.SessionStateIdle {
+		t.Fatalf("expected stale guard to reject before inflight mutation, inflight=%v state=%s", exec.Inflight, exec.State)
+	}
+}
+
 func TestCodexRealtimePingControlWriteDoesNotWaitForBusinessWriteLock(t *testing.T) {
 	conn, cleanup := newCodexRealtimeConnPair(t)
 	defer cleanup()

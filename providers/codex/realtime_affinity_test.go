@@ -431,6 +431,16 @@ func TestCodexRealtimeSessionIDAndErrorHelpers(t *testing.T) {
 		t.Fatalf("expected legacy session_id header to populate x-session-id, session=%q generated=%v header=%q err=%v", sessionID, generated, fallbackReq.Header.Get("x-session-id"), err)
 	}
 
+	nativeReq, err := http.NewRequest(http.MethodGet, "/", nil)
+	if err != nil {
+		t.Fatalf("failed to build native request: %v", err)
+	}
+	nativeReq.Header.Set("Session-Id", "native-session")
+	nativeReq.Header.Set("session_id", "legacy-session")
+	if sessionID, generated, err := ensureCodexRealtimeExecutionSessionID(nativeReq); err != nil || generated || sessionID != "native-session" || nativeReq.Header.Get("x-session-id") != "native-session" {
+		t.Fatalf("expected native session-id header to populate x-session-id, session=%q generated=%v header=%q err=%v", sessionID, generated, nativeReq.Header.Get("x-session-id"), err)
+	}
+
 	generatedReq, err := http.NewRequest(http.MethodGet, "/", nil)
 	if err != nil {
 		t.Fatalf("failed to build generated request: %v", err)

@@ -70,6 +70,7 @@ const (
 )
 
 var ErrSessionClosed = errors.New("realtime session closed")
+var ErrStaleResponsesWSContinuation = errors.New("stale responses websocket continuation")
 
 // ClientPayloadError marks an error that carries an explicit client-facing
 // websocket payload. Callers should forward Payload as-is after delivering any
@@ -156,6 +157,13 @@ type RealtimeSession interface {
 	SetTurnObserverFactory(factory TurnObserverFactory)
 }
 
+// ResponsesWSSendPreflightCapable lets a provider fail a ResponsesWS
+// response.create before relay-side RPM/quota admission. It is intentionally
+// optional so non-managed realtime sessions keep the existing send path.
+type ResponsesWSSendPreflightCapable interface {
+	PreflightResponsesWSSend(ctx context.Context, eventID string, request *types.OpenAIResponsesRequest) error
+}
+
 // GracefulDetachCapable lets sessions opt into downstream detach-on-close
 // semantics when the client disconnects gracefully. Sessions that do not
 // implement this interface, or return false, are aborted instead.
@@ -164,12 +172,13 @@ type GracefulDetachCapable interface {
 }
 
 type RealtimeOpenOptions struct {
-	Context                   context.Context
-	ClientSessionID           string
-	ResolvedUpstreamSessionID string
-	ForceFresh                bool
-	PreferredTransport        TransportMode
-	RequireWS                 bool
+	Context                       context.Context
+	ClientSessionID               string
+	ResolvedUpstreamSessionID     string
+	ForceFresh                    bool
+	PreferredTransport            TransportMode
+	RequireWS                     bool
+	ResponsesWSPreviousResponseID string
 }
 
 type TurnFinalizePayload struct {

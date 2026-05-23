@@ -15,6 +15,9 @@ func ReadClientSessionID(req *http.Request) string {
 	if sessionID := strings.TrimSpace(req.Header.Get("x-session-id")); sessionID != "" {
 		return sessionID
 	}
+	if sessionID := strings.TrimSpace(req.Header.Get("session-id")); sessionID != "" {
+		return sessionID
+	}
 	return strings.TrimSpace(req.Header.Get("session_id"))
 }
 
