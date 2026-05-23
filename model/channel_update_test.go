@@ -1146,6 +1146,42 @@ func TestAddChannelToTagRejectsMissingTagEmptyDuplicateAndMultilineKey(t *testin
 	}
 }
 
+func TestUpdateChannelsTagRejectsWhitespaceOnlyKeyWithoutDeletingMembers(t *testing.T) {
+	useTestChannelDB(t)
+
+	insertTestChannel(t, &Channel{
+		Id:     1,
+		Type:   config.ChannelTypeOpenAI,
+		Name:   "tagged-one",
+		Key:    "sk-one",
+		Group:  "default",
+		Models: "gpt-old",
+		Tag:    "whitespace-team",
+	})
+	insertTestChannel(t, &Channel{
+		Id:     2,
+		Type:   config.ChannelTypeOpenAI,
+		Name:   "tagged-two",
+		Key:    "sk-two",
+		Group:  "default",
+		Models: "gpt-old",
+		Tag:    "whitespace-team",
+	})
+
+	err := UpdateChannelsTag("whitespace-team", &Channel{Key: " \n\t "})
+	if err == nil || !strings.Contains(err.Error(), "key不能为空") {
+		t.Fatalf("expected whitespace-only key to be rejected, got %v", err)
+	}
+
+	channels, err := GetChannelsByTag("whitespace-team")
+	if err != nil {
+		t.Fatalf("expected tagged channels lookup to succeed, got %v", err)
+	}
+	if len(channels) != 2 {
+		t.Fatalf("expected rejected whitespace update to preserve members, got %d", len(channels))
+	}
+}
+
 func TestAddChannelToTagNormalizesCodexJSONKeyAndRejectsDuplicate(t *testing.T) {
 	useTestChannelDB(t)
 

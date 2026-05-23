@@ -294,6 +294,9 @@ func UpdateChannelsTagWithSubmittedFields(tag string, channel *Channel, submitte
 	if err != nil {
 		return err
 	}
+	if len(keys) == 0 {
+		return errors.New("key不能为空")
+	}
 	for _, key := range keys {
 		keyMd5Str := channelTagKeyDigest(key)
 		if newKeysMap[keyMd5Str] {
