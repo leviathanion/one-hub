@@ -59,6 +59,14 @@ func TestDialSecurityPolicy(t *testing.T) {
 	if _, err := DialManaged(context.Background(), "wss://192.168.0.1/ws", nil, Config{}); !errors.Is(err, ErrPrivateAddrBlocked) {
 		t.Fatalf("default 192.168.x err=%v, want ErrPrivateAddrBlocked", err)
 	}
+	if _, err := DialManaged(context.Background(), "wss://127.0.0.1/ws", nil, Config{},
+		WithDialSecurityPolicy(DialSecurityPolicy{AllowPrivateIP: true}),
+		WithNetDialContext(func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("dial attempted")
+		}),
+	); errors.Is(err, ErrPrivateAddrBlocked) {
+		t.Fatalf("AllowPrivateIP err=%v, want loopback allowed before dial", err)
+	}
 	if _, err := DialManaged(context.Background(), "wss://10.0.0.1/ws", nil, Config{},
 		WithDialSecurityPolicy(DialSecurityPolicy{AllowPrivateIP: true}),
 		WithNetDialContext(func(context.Context, string, string) (net.Conn, error) {
@@ -71,6 +79,19 @@ func TestDialSecurityPolicy(t *testing.T) {
 		WithDialSecurityPolicy(DialSecurityPolicy{AllowPrivateIP: true}),
 	); !errors.Is(err, ErrPrivateAddrBlocked) {
 		t.Fatalf("metadata err=%v, want ErrPrivateAddrBlocked", err)
+	}
+	if _, err := DialManaged(context.Background(), "wss://[fd00:ec2::254]/ws", nil, Config{},
+		WithDialSecurityPolicy(DialSecurityPolicy{AllowPrivateIP: true}),
+	); !errors.Is(err, ErrPrivateAddrBlocked) {
+		t.Fatalf("IPv6 metadata err=%v, want ErrPrivateAddrBlocked", err)
+	}
+	if _, err := DialManaged(context.Background(), "wss://169.254.169.254/ws", nil, Config{},
+		WithDialSecurityPolicy(DialSecurityPolicy{
+			AllowPrivateIP: true,
+			HostFilter:     func(string, []net.IP) bool { return true },
+		}),
+	); !errors.Is(err, ErrPrivateAddrBlocked) {
+		t.Fatalf("metadata with HostFilter err=%v, want ErrPrivateAddrBlocked", err)
 	}
 
 	var dialed bool
@@ -111,7 +132,10 @@ func TestDialErrorHasDiagnosticsAndRedactsHeaders(t *testing.T) {
 	if !errors.As(err, &dialErr) {
 		t.Fatalf("err=%T %v, want *DialError", err, err)
 	}
-	if dialErr.URL != rawURL || dialErr.StatusCode != http.StatusUnauthorized || dialErr.CloseInfo.Kind != CloseKindDialFailed {
+	if strings.Contains(dialErr.URL, "?") || strings.Contains(dialErr.URL, "secret") {
+		t.Fatalf("DialError.URL leaked sensitive URL data: %q", dialErr.URL)
+	}
+	if dialErr.StatusCode != http.StatusUnauthorized || dialErr.CloseInfo.Kind != CloseKindDialFailed {
 		t.Fatalf("unexpected DialError diagnostics: %+v", dialErr)
 	}
 	if got := dialErr.Header.Get("Authorization"); got != "[REDACTED]" {
@@ -146,8 +170,8 @@ func TestDialErrorRedactsURLUserInfoAndQuery(t *testing.T) {
 			t.Fatalf("DialError.Error leaked %q in %q", leaked, msg)
 		}
 	}
-	if dialErr.URL == "" || !strings.Contains(dialErr.URL, "secret-key") {
-		t.Fatalf("DialError.URL should retain structured diagnostic URL, got %q", dialErr.URL)
+	if safeURL := dialErr.SafeURL(); safeURL == "" || strings.Contains(safeURL, "secret-key") {
+		t.Fatalf("DialError.SafeURL() = %q, want redacted diagnostic URL", safeURL)
 	}
 }
 

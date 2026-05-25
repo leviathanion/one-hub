@@ -58,13 +58,10 @@ func dialCodexManagedTestConn(t *testing.T, wsURL string) *wsconn.ManagedConn {
 	conn, err := wsconn.DialManaged(context.Background(), wsURL, nil, wsconn.Config{
 		Label:        "codex realtime test upstream",
 		ReadLimit:    config.RealtimeWebsocketReadLimit(),
-		WriteTimeout: config.RealtimeWebsocketWriteTimeout,
+		WriteTimeout: codexRealtimeTestWriteTimeout(),
 	}, wsconn.WithDialSecurityPolicy(wsconn.DialSecurityPolicy{
 		AllowInsecureWS: true,
 		AllowPrivateIP:  true,
-		HostFilter: func(string, []net.IP) bool {
-			return true
-		},
 	}))
 	if err != nil {
 		t.Fatalf("failed to dial managed test websocket: %v", err)
@@ -578,23 +575,20 @@ func TestCodexManagedRealtimeReplacementReaderPreservesBootstrapOwnership(t *tes
 	exec.Unlock()
 
 	serverConn1.Close()
-	time.Sleep(100 * time.Millisecond)
-
-	exec.Lock()
-	state = getCodexManagedRuntimeStateLocked(exec)
-	if state.wsConn != conn2 {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		exec.Lock()
+		state = getCodexManagedRuntimeStateLocked(exec)
+		replacementPreserved := state.wsConn == conn2 && state.wsReaderConn == conn2 && state.skipBootstrapConn == conn2
 		exec.Unlock()
-		t.Fatalf("expected replacement websocket to remain current")
+		if replacementPreserved {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for stale reader cleanup to preserve replacement websocket")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	if state.wsReaderConn != conn2 {
-		exec.Unlock()
-		t.Fatalf("expected stale reader cleanup to preserve the replacement reader owner")
-	}
-	if state.skipBootstrapConn != conn2 {
-		exec.Unlock()
-		t.Fatalf("expected stale reader cleanup to preserve replacement bootstrap ownership")
-	}
-	exec.Unlock()
 
 	if err := serverConn2.WriteMessage(wsconn.TextMessage, []byte(`{"type":"session.created","event_id":"evt_replacement_bootstrap"}`)); err != nil {
 		t.Fatalf("expected replacement bootstrap frame to be delivered, got %v", err)
@@ -2473,9 +2467,12 @@ func TestPumpRealtimeHTTPBridgeFinalizesTurnOnlyAfterTerminalEvent(t *testing.T)
 	}()
 
 	session.Detach("test_detach")
-	time.Sleep(50 * time.Millisecond)
-	if got := recorder.finalizeCount(); got != 0 {
-		t.Fatalf("expected detach to avoid finalizing the inflight turn, got %d finalizations", got)
+	detachObservationDeadline := time.Now().Add(50 * time.Millisecond)
+	for time.Now().Before(detachObservationDeadline) {
+		if got := recorder.finalizeCount(); got != 0 {
+			t.Fatalf("expected detach to avoid finalizing the inflight turn, got %d finalizations", got)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 
 	replacementAttachment := newCodexAttachment()

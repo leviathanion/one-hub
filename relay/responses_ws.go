@@ -135,15 +135,17 @@ func newResponsesWSBridgeForTest(writer responsesWSClientWriter, actor *Response
 }
 
 func responsesWSClientWSConfig() wsconn.Config {
+	inboundActivityTimeout := config.ResponsesWebsocketClientInboundActivityTimeout()
+	writeTimeout := config.RealtimeWebsocketWriteTimeout()
 	return wsconn.Config{
 		Label:           "client-responses-ws",
 		PingInterval:    config.ResponsesWebsocketClientPingInterval(),
 		PongMissTimeout: config.ResponsesWebsocketClientPongMissTimeout(),
 		InboundActivityTimeout: func() time.Duration {
-			return config.ResponsesWebsocketClientInboundActivityTimeout()
+			return inboundActivityTimeout
 		},
 		ReadLimit:    config.RealtimeWebsocketReadLimit(),
-		WriteTimeout: config.RealtimeWebsocketWriteTimeout,
+		WriteTimeout: func() time.Duration { return writeTimeout },
 	}
 }
 

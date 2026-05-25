@@ -25,6 +25,11 @@ import (
 	"go.uber.org/zap"
 )
 
+func codexRealtimeTestWriteTimeout() func() time.Duration {
+	timeout := config.RealtimeWebsocketWriteTimeout()
+	return func() time.Duration { return timeout }
+}
+
 func newCodexRealtimeConnPair(t *testing.T) (*wsconn.ManagedConn, func()) {
 	t.Helper()
 
@@ -34,13 +39,10 @@ func newCodexRealtimeConnPair(t *testing.T) (*wsconn.ManagedConn, func()) {
 	conn, err := wsconn.DialManaged(context.Background(), wsURL, nil, wsconn.Config{
 		Label:        "codex realtime test upstream",
 		ReadLimit:    config.RealtimeWebsocketReadLimit(),
-		WriteTimeout: config.RealtimeWebsocketWriteTimeout,
+		WriteTimeout: codexRealtimeTestWriteTimeout(),
 	}, wsconn.WithDialSecurityPolicy(wsconn.DialSecurityPolicy{
 		AllowInsecureWS: true,
 		AllowPrivateIP:  true,
-		HostFilter: func(string, []net.IP) bool {
-			return true
-		},
 	}))
 	if err != nil {
 		cleanupServer()
@@ -58,13 +60,10 @@ func newCodexRealtimeConnPairFromURL(t *testing.T, wsURL string) (*wsconn.Manage
 	conn, err := wsconn.DialManaged(context.Background(), wsURL, nil, wsconn.Config{
 		Label:        "codex realtime test upstream",
 		ReadLimit:    config.RealtimeWebsocketReadLimit(),
-		WriteTimeout: config.RealtimeWebsocketWriteTimeout,
+		WriteTimeout: codexRealtimeTestWriteTimeout(),
 	}, wsconn.WithDialSecurityPolicy(wsconn.DialSecurityPolicy{
 		AllowInsecureWS: true,
 		AllowPrivateIP:  true,
-		HostFilter: func(string, []net.IP) bool {
-			return true
-		},
 	}))
 	if err != nil {
 		t.Fatalf("failed to dial helper websocket: %v", err)
@@ -205,11 +204,12 @@ func TestCodexTurnReadTimeoutIgnoresStaleConnectionGeneration(t *testing.T) {
 	state.turnSeq = 2
 	exec.Unlock()
 
-	time.Sleep(50 * time.Millisecond)
+	timer := time.NewTimer(50 * time.Millisecond)
+	defer timer.Stop()
 	select {
 	case <-oldConn.Done():
 		t.Fatalf("stale turn timer closed old websocket: %+v", oldConn.CloseInfo())
-	default:
+	case <-timer.C:
 	}
 	select {
 	case <-newConn.Done():

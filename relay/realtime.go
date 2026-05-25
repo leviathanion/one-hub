@@ -188,13 +188,17 @@ func ChatRealtime(c *gin.Context) {
 		return
 	}
 
+	inboundActivityTimeout := config.RealtimeWebsocketClientInboundActivityTimeout()
+	writeTimeout := config.RealtimeWebsocketWriteTimeout()
 	userConn, err := wsconn.AcceptManaged(c.Writer, c.Request, wsconn.Config{
-		Label:                  "client-realtime",
-		PingInterval:           config.RealtimeWebsocketClientPingInterval(),
-		PongMissTimeout:        config.RealtimeWebsocketClientPongMissTimeout(),
-		InboundActivityTimeout: config.RealtimeWebsocketClientInboundActivityTimeout,
-		ReadLimit:              config.RealtimeWebsocketReadLimit(),
-		WriteTimeout:           config.RealtimeWebsocketWriteTimeout,
+		Label:           "client-realtime",
+		PingInterval:    config.RealtimeWebsocketClientPingInterval(),
+		PongMissTimeout: config.RealtimeWebsocketClientPongMissTimeout(),
+		InboundActivityTimeout: func() time.Duration {
+			return inboundActivityTimeout
+		},
+		ReadLimit:    config.RealtimeWebsocketReadLimit(),
+		WriteTimeout: func() time.Duration { return writeTimeout },
 	}, wsconn.AcceptOptions{
 		CheckOrigin:       realtimeWebSocketOriginAllowed,
 		ResponseHeader:    websocketUpgradeResponseHeader(c.Request),

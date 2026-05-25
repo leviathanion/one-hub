@@ -2,7 +2,6 @@ package relay
 
 import (
 	"context"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -370,7 +369,6 @@ func TestWebSocketUpgradeDoesNotEchoCredentialSubprotocol(t *testing.T) {
 				wsconn.WithDialSecurityPolicy(wsconn.DialSecurityPolicy{
 					AllowInsecureWS: true,
 					AllowPrivateIP:  true,
-					HostFilter:      func(string, []net.IP) bool { return true },
 				}),
 			)
 			if err != nil {

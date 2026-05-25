@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -96,15 +95,17 @@ func codexRealtimeHTTPHeader(headers map[string]string) http.Header {
 }
 
 func codexRealtimeWSConfig() wsconn.Config {
+	inboundActivityTimeout := config.RealtimeWebsocketClientInboundActivityTimeout()
+	writeTimeout := config.RealtimeWebsocketWriteTimeout()
 	return wsconn.Config{
 		Label:           "codex realtime upstream",
 		PingInterval:    config.RealtimeWebsocketPingInterval(),
 		PongMissTimeout: config.RealtimeWebsocketClientPongMissTimeout(),
 		InboundActivityTimeout: func() time.Duration {
-			return config.RealtimeWebsocketClientInboundActivityTimeout()
+			return inboundActivityTimeout
 		},
 		ReadLimit:    config.RealtimeWebsocketReadLimit(),
-		WriteTimeout: config.RealtimeWebsocketWriteTimeout,
+		WriteTimeout: func() time.Duration { return writeTimeout },
 	}
 }
 
@@ -112,11 +113,6 @@ func codexRealtimeDialOptions(proxyAddr string, allowSelfHosted bool) []wsconn.D
 	policy := wsconn.DialSecurityPolicy{
 		AllowInsecureWS: allowSelfHosted,
 		AllowPrivateIP:  allowSelfHosted,
-	}
-	if allowSelfHosted {
-		policy.HostFilter = func(host string, ips []net.IP) bool {
-			return true
-		}
 	}
 	options := []wsconn.DialOption{
 		wsconn.WithHandshakeTimeout(config.ConnectTimeout()),
@@ -179,7 +175,7 @@ func codexRealtimeWSDialFailureLogMessage(err error) string {
 	return fmt.Sprintf(
 		"codex realtime websocket dial failed: status=%d url=%s server=%s via=%s cf_ray=%s x_request_id=%s openai_request_id=%s retry_after=%s body_truncated=%v body=%s cause=%s",
 		dialErr.StatusCode,
-		codexRealtimeWSURLForLog(dialErr.URL),
+		codexRealtimeWSURLForLog(dialErr.SafeURL()),
 		codexRealtimeHeaderForLog(dialErr.Header, "server"),
 		codexRealtimeHeaderForLog(dialErr.Header, "via"),
 		codexRealtimeHeaderForLog(dialErr.Header, "cf-ray"),

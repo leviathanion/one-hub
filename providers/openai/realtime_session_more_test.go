@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -36,6 +35,22 @@ func newOpenAIRealtimeHelperSession() *openAIRealtimeSession {
 	}
 }
 
+func openAIRealtimeTestWriteTimeout() func() time.Duration {
+	timeout := config.RealtimeWebsocketWriteTimeout()
+	return func() time.Duration { return timeout }
+}
+
+func assertNoOpenAIRealtimeOutbound(t *testing.T, ch <-chan openAIRealtimeOutbound, wait time.Duration) {
+	t.Helper()
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case outbound := <-ch:
+		t.Fatalf("expected no queued outbound payload, got %q", outbound.payload)
+	case <-timer.C:
+	}
+}
+
 func newOpenAIRealtimeConnPair(t *testing.T) (*wsconn.ManagedConn, func()) {
 	t.Helper()
 
@@ -45,7 +60,7 @@ func newOpenAIRealtimeConnPair(t *testing.T) (*wsconn.ManagedConn, func()) {
 	conn := dialOpenAIRealtimeManagedTestConn(t, wsURL, wsconn.Config{
 		Label:        "openai realtime test upstream",
 		ReadLimit:    config.RealtimeWebsocketReadLimit(),
-		WriteTimeout: config.RealtimeWebsocketWriteTimeout,
+		WriteTimeout: openAIRealtimeTestWriteTimeout(),
 	})
 
 	return conn, func() {
@@ -59,9 +74,6 @@ func dialOpenAIRealtimeManagedTestConn(t *testing.T, wsURL string, cfg wsconn.Co
 	conn, err := wsconn.DialManaged(context.Background(), wsURL, nil, cfg, wsconn.WithDialSecurityPolicy(wsconn.DialSecurityPolicy{
 		AllowInsecureWS: true,
 		AllowPrivateIP:  true,
-		HostFilter: func(host string, ips []net.IP) bool {
-			return true
-		},
 	}))
 	if err != nil {
 		t.Fatalf("failed to dial helper websocket: %v", err)
@@ -132,7 +144,7 @@ func TestOpenAIRealtimeReadLoopForwardsProviderCloseCode(t *testing.T) {
 	conn := dialOpenAIRealtimeManagedTestConn(t, wsURL, wsconn.Config{
 		Label:        "openai realtime close test upstream",
 		ReadLimit:    config.RealtimeWebsocketReadLimit(),
-		WriteTimeout: config.RealtimeWebsocketWriteTimeout,
+		WriteTimeout: openAIRealtimeTestWriteTimeout(),
 	})
 	defer conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_cleanup"})
 
@@ -367,12 +379,7 @@ func TestOpenAIResponsesWSDefersReadUntilRecvAndFiltersSessionCreated(t *testing
 	}()
 
 	typed := session.(*openAIRealtimeSession)
-	time.Sleep(50 * time.Millisecond)
-	select {
-	case outbound := <-typed.recvCh:
-		t.Fatalf("expected ResponsesWS provider read to be deferred until Recv, got queued payload %q", outbound.payload)
-	default:
-	}
+	assertNoOpenAIRealtimeOutbound(t, typed.recvCh, 50*time.Millisecond)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -428,12 +435,7 @@ func TestOpenAIRequireWSOnlyUsesResponsesWSWithoutCompatMode(t *testing.T) {
 	if typed.compatMode {
 		t.Fatalf("expected ResponsesWS compat mode to be derived from !responsesWS")
 	}
-	time.Sleep(50 * time.Millisecond)
-	select {
-	case outbound := <-typed.recvCh:
-		t.Fatalf("expected RequireWS ResponsesWS read to be deferred until Recv, got queued payload %q", outbound.payload)
-	default:
-	}
+	assertNoOpenAIRealtimeOutbound(t, typed.recvCh, 50*time.Millisecond)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -496,7 +498,7 @@ func TestOpenAIRealtimeConfigureConnAppliesUpstreamReadLimit(t *testing.T) {
 	conn := dialOpenAIRealtimeManagedTestConn(t, wsURL, wsconn.Config{
 		Label:        "openai realtime read limit test upstream",
 		ReadLimit:    config.RealtimeWebsocketReadLimit(),
-		WriteTimeout: config.RealtimeWebsocketWriteTimeout,
+		WriteTimeout: openAIRealtimeTestWriteTimeout(),
 	})
 	defer conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_cleanup"})
 
@@ -1181,6 +1183,15 @@ func TestOpenAIRealtimeWSURLConstruction(t *testing.T) {
 	got, errWithCode = deployment.realtimeWSURL("gpt-4o")
 	if errWithCode == nil || errWithCode.Code != "invalid_azure_realtime_base_url" || got != "" {
 		t.Fatalf("expected deployment-path azure v1 base URL to fail locally, url=%q err=%+v", got, errWithCode)
+	}
+}
+
+func TestOpenAIRealtimeSelfHostedDialOptionsStillBlockMetadataIP(t *testing.T) {
+	_, err := wsconn.DialManaged(context.Background(), "ws://169.254.169.254/v1/realtime", nil, wsconn.Config{},
+		openAIRealtimeDialOptions("", true, nil)...,
+	)
+	if !errors.Is(err, wsconn.ErrPrivateAddrBlocked) {
+		t.Fatalf("expected self-hosted dial options to block metadata IP, got %v", err)
 	}
 }
 

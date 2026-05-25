@@ -68,6 +68,7 @@ func WithDialSecurityPolicy(p DialSecurityPolicy) DialOption {
 }
 
 type DialError struct {
+	// URL is safe for diagnostics: userinfo, query, and fragment are removed.
 	URL           string
 	StatusCode    int
 	Header        http.Header
@@ -82,11 +83,18 @@ func (e *DialError) Error() string {
 	if e == nil {
 		return ""
 	}
-	safeURL := redactedURLForError(e.URL)
+	safeURL := e.SafeURL()
 	if e.StatusCode > 0 {
 		return fmt.Sprintf("wsconn: dial %s failed with status %d: %v", safeURL, e.StatusCode, e.Err)
 	}
 	return fmt.Sprintf("wsconn: dial %s failed: %v", safeURL, e.Err)
+}
+
+func (e *DialError) SafeURL() string {
+	if e == nil {
+		return ""
+	}
+	return redactedURLForError(e.URL)
 }
 
 func (e *DialError) Unwrap() error {
@@ -129,7 +137,7 @@ func DialManaged(ctx context.Context, rawURL string, header http.Header, cfg Con
 			return nil, err
 		}
 	}
-	conn, resp, err := dialer.DialContext(ctx, rawURL, redactedHeaderClone(header, dc.security))
+	conn, resp, err := dialer.DialContext(ctx, rawURL, headerClone(header))
 	if err != nil {
 		return nil, newDialError(rawURL, resp, err, dc.security)
 	}
@@ -159,6 +167,9 @@ func validateDialTarget(ctx context.Context, rawURL string, policy DialSecurityP
 		return nil
 	}
 	ips, _ := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	if containsMetadataIP(host, ips) {
+		return fmt.Errorf("%w: %s", ErrPrivateAddrBlocked, host)
+	}
 	if policy.HostFilter != nil {
 		if !policy.HostFilter(host, ips) {
 			return fmt.Errorf("%w: %s", ErrPrivateAddrBlocked, host)
@@ -177,16 +188,40 @@ func isBlockedIP(ip net.IP, allowPrivate bool) bool {
 	if ip == nil {
 		return false
 	}
+	if isMetadataIP(ip) {
+		return true
+	}
+	if allowPrivate {
+		return false
+	}
 	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
 		return true
 	}
-	if ip.Equal(net.ParseIP("169.254.169.254")) {
-		return true
-	}
-	if ip.IsPrivate() && !allowPrivate {
+	if ip.IsPrivate() {
 		return true
 	}
 	return false
+}
+
+func containsMetadataIP(host string, ips []net.IP) bool {
+	if isMetadataIP(net.ParseIP(host)) {
+		return true
+	}
+	for _, ip := range ips {
+		if isMetadataIP(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func isMetadataIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	return ip.Equal(net.ParseIP("169.254.169.254")) ||
+		ip.Equal(net.ParseIP("100.100.100.200")) ||
+		ip.Equal(net.ParseIP("fd00:ec2::254"))
 }
 
 func normalizeDialHandshakeTimeout(d time.Duration) time.Duration {
@@ -247,7 +282,7 @@ func newDialError(rawURL string, resp *http.Response, err error, policy DialSecu
 		limit = 4 << 10
 	}
 	e := &DialError{
-		URL:        rawURL,
+		URL:        redactedURLForError(rawURL),
 		StatusCode: resp.StatusCode,
 		Header:     redactHeaders(resp.Header.Clone(), policy),
 		Err:        err,
@@ -268,7 +303,7 @@ func newDialError(rawURL string, resp *http.Response, err error, policy DialSecu
 	return e
 }
 
-func redactedHeaderClone(header http.Header, policy DialSecurityPolicy) http.Header {
+func headerClone(header http.Header) http.Header {
 	if header == nil {
 		return nil
 	}

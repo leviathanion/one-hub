@@ -96,18 +96,18 @@ func (c *recordingReadLimitConn) SetReadLimit(limit int64) {
 	c.limit = limit
 }
 
-func TestApplyReadLimitUsesConfiguredLimitAndFallback(t *testing.T) {
+func TestReadLimitApplicationUsesConfiguredLimitAndFallback(t *testing.T) {
 	conn := &recordingReadLimitConn{}
 
-	if got := ApplyReadLimit(conn, func() int64 { return 4096 }); got != 4096 || conn.limit != 4096 {
+	if got := applyReadLimit(conn, func() int64 { return 4096 }); got != 4096 || conn.limit != 4096 {
 		t.Fatalf("expected configured read limit 4096, got return=%d applied=%d", got, conn.limit)
 	}
 
-	if got := ApplyReadLimit(conn, func() int64 { return 0 }); got != defaultReadLimit || conn.limit != defaultReadLimit {
+	if got := applyReadLimit(conn, func() int64 { return 0 }); got != defaultReadLimit || conn.limit != defaultReadLimit {
 		t.Fatalf("expected fallback read limit, got return=%d applied=%d", got, conn.limit)
 	}
 
-	if got := ApplyReadLimit(nil, func() int64 { return 4096 }); got != 0 {
+	if got := applyReadLimit(nil, func() int64 { return 4096 }); got != 0 {
 		t.Fatalf("expected nil conn to return 0, got %d", got)
 	}
 }

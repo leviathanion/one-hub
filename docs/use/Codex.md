@@ -909,7 +909,7 @@ trade-off：
 
 - `auto` 适合大多数场景，优先吃到 websocket 的低延迟；如果上游暂时不支持或握手失败，会自动回退
 - `force` 适合你明确要求上游必须支持 realtime websocket 的场景；任何 websocket 建连失败都会直接返回错误
-- 默认只允许 `wss` 公网 Realtime 上游，并拒绝 loopback、内网、link-local 和云 metadata IP。私有/本地自建上游必须在 Codex 配置中显式设置 `"self_hosted": true` 或 `"responses_ws_self_hosted": true`；代价是你需要自行保证链路可信，尤其是明文 `ws` 会暴露 bearer 凭据。
+- 默认只允许 `wss` 公网 Realtime 上游，并拒绝 loopback、内网、link-local 和云 metadata IP。私有/本地自建上游必须在 Codex 配置中显式设置 `"self_hosted": true` 或 `"responses_ws_self_hosted": true`；开启后会允许本机/内网自建地址和明文 `ws`，但云 metadata IP 仍会被硬拦截。代价是你需要自行保证链路可信，尤其是明文 `ws` 会暴露 bearer 凭据。
 - `off` 适合网络环境对 websocket 不友好，或者你希望行为更稳定、更容易排查时使用
 
 ### `execution_session_ttl_seconds`

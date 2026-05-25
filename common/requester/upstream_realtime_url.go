@@ -84,12 +84,15 @@ func ValidateUpstreamRealtimeURL(rawURL string, policy UpstreamRealtimeURLPolicy
 		return "", upstreamRealtimeURLValidationError(ErrUpstreamRealtimeURLUnsupported, http.StatusInternalServerError)
 	}
 
+	host := parsed.Hostname()
+	policyHost, err := normalizeUpstreamRealtimePolicyHost(host)
+	if err != nil {
+		return "", upstreamRealtimeURLValidationError(ErrUpstreamRealtimeURLInvalid, http.StatusBadRequest)
+	}
+	if UpstreamRealtimeMetadataHostBlocked(policyHost) {
+		return "", upstreamRealtimeURLValidationError(ErrUpstreamRealtimeURLHostBlocked, http.StatusBadRequest)
+	}
 	if !policy.AllowSelfHosted {
-		host := parsed.Hostname()
-		policyHost, err := normalizeUpstreamRealtimePolicyHost(host)
-		if err != nil {
-			return "", upstreamRealtimeURLValidationError(ErrUpstreamRealtimeURLInvalid, http.StatusBadRequest)
-		}
 		if UpstreamRealtimeHostBlocked(policyHost) {
 			return "", upstreamRealtimeURLValidationError(ErrUpstreamRealtimeURLHostBlocked, http.StatusBadRequest)
 		}
@@ -101,6 +104,14 @@ func ValidateUpstreamRealtimeURL(rawURL string, policy UpstreamRealtimeURLPolicy
 			if blocked {
 				return "", upstreamRealtimeURLValidationError(ErrUpstreamRealtimeURLHostBlocked, http.StatusBadRequest)
 			}
+		}
+	} else if policy.ResolveHost {
+		blocked, err := upstreamRealtimeResolvedMetadataHostBlocked(policyHost)
+		if err != nil {
+			return "", upstreamRealtimeURLValidationError(ErrUpstreamRealtimeURLResolveFailed, http.StatusBadRequest)
+		}
+		if blocked {
+			return "", upstreamRealtimeURLValidationError(ErrUpstreamRealtimeURLHostBlocked, http.StatusBadRequest)
 		}
 	}
 
@@ -133,6 +144,14 @@ func UpstreamRealtimeHostBlocked(host string) bool {
 	return false
 }
 
+func UpstreamRealtimeMetadataHostBlocked(host string) bool {
+	host = strings.TrimSuffix(strings.TrimSpace(strings.ToLower(host)), ".")
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return UpstreamRealtimeMetadataIPBlocked(ip)
+	}
+	return false
+}
+
 func UpstreamRealtimeIPBlocked(ip netip.Addr) bool {
 	if !ip.IsValid() {
 		return true
@@ -145,8 +164,19 @@ func UpstreamRealtimeIPBlocked(ip netip.Addr) bool {
 		ip.IsLinkLocalUnicast() ||
 		ip.IsLinkLocalMulticast() ||
 		ip.IsPrivate() ||
-		ip == netip.MustParseAddr("169.254.169.254") ||
-		ip == netip.MustParseAddr("100.100.100.200")
+		UpstreamRealtimeMetadataIPBlocked(ip)
+}
+
+func UpstreamRealtimeMetadataIPBlocked(ip netip.Addr) bool {
+	if !ip.IsValid() {
+		return false
+	}
+	if ip.Is4In6() {
+		ip = ip.Unmap()
+	}
+	return ip == netip.MustParseAddr("169.254.169.254") ||
+		ip == netip.MustParseAddr("100.100.100.200") ||
+		ip == netip.MustParseAddr("fd00:ec2::254")
 }
 
 func upstreamRealtimeResolvedHostBlocked(host string) (bool, error) {
@@ -161,6 +191,24 @@ func upstreamRealtimeResolvedHostBlocked(host string) (bool, error) {
 	}
 	for _, addr := range addrs {
 		if UpstreamRealtimeIPBlocked(addr) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func upstreamRealtimeResolvedMetadataHostBlocked(host string) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), upstreamRealtimeURLLookupTimeout)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return false, err
+	}
+	if len(addrs) == 0 {
+		return false, net.ErrClosed
+	}
+	for _, addr := range addrs {
+		if UpstreamRealtimeMetadataIPBlocked(addr) {
 			return true, nil
 		}
 	}

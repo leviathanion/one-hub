@@ -66,7 +66,7 @@ func (c *ManagedConn) runtimeInboundActivityTimeout() time.Duration {
 	if d < 0 {
 		// Fail open: a runtime config bug may leave dead connections alive
 		// longer, but it avoids immediately closing every active connection.
-		logWarnf("wsconn: InboundActivityTimeout returned negative; disabling watchdog")
+		logWarnf("wsconn[%s]: InboundActivityTimeout returned negative; disabling watchdog", c.label())
 		return 0
 	}
 	return d

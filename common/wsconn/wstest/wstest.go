@@ -1,7 +1,6 @@
 package wstest
 
 import (
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -43,7 +42,6 @@ func Pair(t testing.TB, opts ...Option) (client, server *wsconn.ManagedConn) {
 		wsconn.WithDialSecurityPolicy(wsconn.DialSecurityPolicy{
 			AllowInsecureWS: true,
 			AllowPrivateIP:  true,
-			HostFilter:      func(string, []net.IP) bool { return true },
 		}),
 	)
 	if err != nil {

@@ -251,7 +251,7 @@ func WithNetDialContext(f func(ctx context.Context,
 // 业务通过 errors.As(err, &wsconn.DialError{}) 根据 StatusCode 做错误分类
 // （404/426/401/403/429/5xx）。
 type DialError struct {
-    URL           string       // 结构化诊断字段保留原始 URL；禁止直接写入日志
+    URL           string       // 脱敏诊断 URL；已移除 userinfo / query / fragment
     StatusCode    int
     Header        http.Header
     BodySnippet   []byte
@@ -262,10 +262,11 @@ type DialError struct {
 }
 
 func (e *DialError) Error() string
+func (e *DialError) SafeURL() string
 func (e *DialError) Unwrap() error
 
-`DialError.Error()` 只输出脱敏 URL：必须移除 userinfo、query、fragment。`DialError.URL` 可保留原始
-URL 作为结构化字段供受控诊断使用，但日志路径只能使用 `Error()` 或显式脱敏后的值。
+`DialError.Error()` 和 `DialError.URL` 都只使用脱敏 URL：必须移除 userinfo、query、fragment。
+取舍是牺牲少量现场诊断细节，换取公共字段被 `%+v` 或结构化日志直接打印时也不泄漏凭据。
 
 // 出站：dial + 包装一体化。握手失败时返回 *DialError；
 // 成功时 ManagedConn 已就绪可立即读写。
@@ -284,10 +285,11 @@ type DialSecurityPolicy struct {
     MaxBodySnippet  int64    // 默认 4 KiB；DialError.BodySnippet 上限
     RedactHeaders   []string // 进入 DialError 前需擦除的 header，默认含 Authorization / Cookie / Sec-WebSocket-Protocol
 
-    // HostFilter 是 host/ip 准入的最终决策；返回 false 即拒绝。
+    // HostFilter 是 host/ip 准入的补充决策；返回 false 即拒绝。
     // 默认 nil = 应用内置规则（拒 RFC 1918 / loopback / link-local / metadata IP 169.254.169.254）；
-    // AllowPrivateIP=true 时内置规则放过 RFC 1918 段，但 metadata IP 仍拒。
-    // 业务可注入自定义 filter 覆盖默认（例如 self-hosted 白名单、企业 VPN 段允许、严格 SaaS 拒所有内网）。
+    // AllowPrivateIP=true 时内置规则放过 self-hosted 常用的 loopback / RFC 1918 / link-local，
+    // 但 metadata IP 仍在 HostFilter 之前硬拒。
+    // 业务可注入自定义 filter 收紧默认（例如 self-hosted 白名单、企业 VPN 段允许、严格 SaaS 拒所有内网）。
     // wsconn 不感知 provider / channel 语义，所有特定策略通过这个 hook 注入。
     HostFilter func(host string, ips []net.IP) bool
 }
@@ -794,21 +796,21 @@ data message 的 activity 刷新只能在 `ReadMessage` 返回完整 message 之
 ### CloseInfo（first-write-wins）
 
 ```go
-type CloseKind int
+type CloseKind string
 
 const (
-    CloseKindUnknown CloseKind = iota
-    CloseKindNormal              // 业务主动有序关闭；可携带 1000，也可携带 protocol reject / unsupported data 等非 1000 合法 code
-    CloseKindGracefulShutdown    // 业务优雅关闭（detach / server graceful），发送 close frame
-    CloseKindAbort               // 业务强制关闭，跳过 close frame 立即释放
-    CloseKindBackpressure        // backpressure (actor channel 满)；best-effort 发 1013 Try Again Later
-    CloseKindPeerClose           // 对端发了 close frame（gorilla 默认 handler 已自动回执）
-    CloseKindPongMiss            // PongMissTimeout 触发
-    CloseKindInboundIdle         // InboundActivityTimeout 触发
-    CloseKindReadError           // 读 IO 失败（含 ErrReadLimit、deadline、网络异常）
-    CloseKindWriteError          // 写 IO 失败
-    CloseKindHandlerPanic        // MessagePump 的 Handle 函数 panic
-    CloseKindDialFailed          // 仅出现在 DialError.CloseInfo 中，不会附加到 ManagedConn
+    CloseKindUnknown          CloseKind = ""
+    CloseKindNormal           CloseKind = "normal"            // 业务主动有序关闭；可携带 1000，也可携带 protocol reject / unsupported data 等非 1000 合法 code
+    CloseKindGracefulShutdown CloseKind = "graceful_shutdown" // 业务优雅关闭（detach / server graceful），发送 close frame
+    CloseKindAbort            CloseKind = "abort"             // 业务强制关闭，跳过 close frame 立即释放
+    CloseKindBackpressure     CloseKind = "backpressure"      // backpressure (actor channel 满)；best-effort 发 1013 Try Again Later
+    CloseKindPeerClose        CloseKind = "peer_close"        // 对端发了 close frame（gorilla 默认 handler 已自动回执）
+    CloseKindPongMiss         CloseKind = "pong_miss"         // PongMissTimeout 触发
+    CloseKindInboundIdle      CloseKind = "inbound_idle"      // InboundActivityTimeout 触发
+    CloseKindReadError        CloseKind = "read_error"        // 读 IO 失败（含 ErrReadLimit、deadline、网络异常）
+    CloseKindWriteError       CloseKind = "write_error"       // 写 IO 失败
+    CloseKindHandlerPanic     CloseKind = "handler_panic"     // MessagePump 的 Handle 函数 panic
+    CloseKindDialFailed       CloseKind = "dial_failed"       // 仅出现在 DialError.CloseInfo 中，不会附加到 ManagedConn
 )
 
 type CloseInfo struct {
@@ -1073,16 +1075,16 @@ func IsUpgrade(r *http.Request) bool
 
 1. **TLS verify 默认开启**；想关闭必须显式 `WithTLSConfig(&tls.Config{InsecureSkipVerify: true})`，方便 grep 审计
 2. **默认拒绝 `ws://`**：scheme 不在 `{wss}` 时 `DialManaged` 返回 `ErrInsecureScheme`，本地/测试需 `WithDialSecurityPolicy(DialSecurityPolicy{AllowInsecureWS: true})` 显式打开
-3. **默认拒绝私网/loopback/metadata 地址**：解析 host 后通过 `HostFilter`（默认 = wsconn 内置规则）判定；命中 RFC 1918 / loopback / link-local / 169.254.169.254 metadata IP 返回 `ErrPrivateAddrBlocked`。部署可在 policy 里 `AllowPrivateIP: true` 放过 RFC 1918，**metadata IP 即便 AllowPrivateIP=true 仍默认拒**（防 SSRF 抓 cloud metadata）
+3. **默认拒绝私网/loopback/metadata 地址**：解析 host 后通过 wsconn 内置规则判定；命中 RFC 1918 / loopback / link-local / metadata IP 返回 `ErrPrivateAddrBlocked`。部署可在 policy 里 `AllowPrivateIP: true` 放过 self-hosted 常用的 loopback / RFC 1918 / link-local，**metadata IP 即便 AllowPrivateIP=true 或 HostFilter 自定义同意也仍拒**（防 SSRF 抓 cloud metadata）
 4. **proxy fail-closed**：`WithProxyURL("")` 表示"不走 proxy"；非空但解析失败、scheme 不支持时 `DialManaged` 返回 `ErrInvalidProxyURL`，**绝不静默退化为直连**。`socks5h` 属于历史兼容的 SOCKS remote-DNS proxy scheme，必须和 `socks5` 一起保留在白名单。当前 `common/requester/ws_client.go:30-34` 是 fail-open 路径，配置 proxy 但解析失败时返回裸 dialer 直连目标，违反"通过 proxy 出网"的部署约束。新方案必须 fail-closed 才能让该约束真正生效
-5. **`DialError.Error()` 输出脱敏**：永远不输出 Authorization / Cookie / Sec-WebSocket-Protocol 值，也不输出 URL userinfo / query / fragment；这些 header 在写入 `DialError.Header` 前被 redact 为 `"[REDACTED]"`，原始 URL 只保留在 `DialError.URL` 结构化字段中
+5. **`DialError.Error()` / `DialError.URL` 输出脱敏**：永远不输出 Authorization / Cookie / Sec-WebSocket-Protocol 值，也不输出 URL userinfo / query / fragment；这些 header 在写入 `DialError.Header` 前被 redact 为 `"[REDACTED]"`，URL 字段也只保留脱敏后的结构化诊断值
 6. **`BodySnippet` 限长**：默认 4 KiB（与现有 `wsDialBodySnippetLimit` 对齐）；超过即截断并设 `BodyTruncated = true`
 7. **DialOption 全部纯 Go 类型**：禁止 `WithDialer(*websocket.Dialer)`、`WithGorillaHeader(http.Header)` 等暴露 gorilla 的选项；允许 `WithProxyURL(string)`、`WithSubprotocols(...string)`、`WithHandshakeTimeout(time.Duration)`、`WithTLSConfig(*tls.Config)`、`WithNetDialContext(...)`
 8. **出站握手超时默认有界**：未传 `WithHandshakeTimeout` 或传入非正值时，`DialManaged` 使用 wsconn 内置 5s 默认值；生产 upstream 调用方显式传 `config.ConnectTimeout()`，恢复旧 websocket requester 受 `connect_timeout` 控制的行为
 
 #### HostFilter 注入模型
 
-`HostFilter func(host string, ips []net.IP) bool` 是 host/ip 准入的**最终决策点**。AllowPrivateIP / metadata IP 这类内置规则只是 wsconn 提供的默认实现，调用方可以注入自定义 filter 完全覆盖：
+`HostFilter func(host string, ips []net.IP) bool` 是 host/ip 准入的**补充决策点**。AllowPrivateIP 放宽 self-hosted 常用地址；metadata IP 是硬拦截，调用方不能通过 HostFilter 覆盖。这样保留了自建部署可用性，同时避免一个恒真 filter 把最危险的云 metadata SSRF 防线打穿：
 
 ```go
 // 示例：self-hosted 部署允许特定 VPN 段
@@ -1101,14 +1103,14 @@ policy := wsconn.DialSecurityPolicy{
 }
 ```
 
-wsconn **不感知**任何 provider / channel / metadata-source 语义。所有特定准入策略通过这个 hook 由 provider 或部署配置注入。这条边界保证 wsconn 不会因为接入新 provider 而长出业务知识。
+wsconn **不感知**任何 provider / channel 语义。除 metadata IP 硬拦截外，特定准入策略通过这个 hook 由 provider 或部署配置注入。这条边界保证 wsconn 不会因为接入新 provider 而长出业务知识。
 
 policy 字段在 wsconn 内被两次使用：
 
 - dial 之前：scheme 检查、地址解析 + HostFilter 准入判定
 - dial 失败构造 DialError 时：header redact + body 截断
 
-provider endpoint allowlist、metadata-source 段定义、企业代理 DNS 策略都**不在 wsconn 范围** —— 通过 HostFilter 注入或在 provider/配置层处理。wsconn 只提供安全默认 + 脱敏 hook + filter 注入点。
+provider endpoint allowlist、企业代理 DNS 策略都**不在 wsconn 范围** —— 通过 HostFilter 注入或在 provider/配置层处理。wsconn 只提供 metadata 硬底线、安全默认、脱敏 hook 和 filter 注入点。
 
 ## 架构契约
 
@@ -1883,7 +1885,7 @@ if !actor.PostReliable(FirstTurnSetup{Frame: parsed, ReceivedAt: time.Now()}) {
 
 现有 `common/requester/ws_*.go`（`ws_client.go`、`ws_writer.go`、`ws_close.go`、`ws_activity.go`、`ws_read.go`、`ws_control_writer.go`、`ws_error.go`、`ws_requester.go`、`ws_reader.go`、`ws_active_guard.go`）及同包的 `realtime_session_proxy.go`：
 
-- 内容被吸收进 `common/wsconn/`（拆分为 `managed.go`、`pump.go`、`accept.go`、`dial.go`、`close.go`、`message.go`、`http.go`、`writer.go`、`control.go`、`watchdog.go`、`dialer.go`）
+- 内容被吸收进 `common/wsconn/`（拆分为 `managed.go`、`pump.go`、`accept.go`、`dial.go`、`close.go`、`message.go`、`http.go`、`control.go`、`watchdog.go`）
 - 原 `common/requester/ws_*.go` 文件**删除**，不留兼容 wrapper
 - `realtime_session_proxy.go` 的 IO 部分迁入 wsconn，业务部分（provider session 编排）回到 `providers/openai`、`providers/codex` 对应实现
 
@@ -2210,8 +2212,8 @@ func WithClock(clock wsconn.Clock) Option
     - 回调在 close 锁内同步调用是 bug：通过 wsconn 内部 invariant assert 检测（仅 -race / debug build 启用）
 13. **WriteMessage 出错后归类**：模拟底层 write error → 断言 `CloseInfo.Kind == CloseKindWriteError`；验证 release-then-close 序列下不出现 deadlock
 14. **AcceptManaged 错误路径**：握手失败资源不泄漏；`AcceptOptions` 各字段均能透传到内部构造的 gorilla Upgrader
-15. **DialManaged 错误路径**：握手失败时返回 `*wsconn.DialError`，`errors.As(err, &dialErr)` 能拿到完整的 URL/StatusCode/Header/BodySnippet/CloseInfo 字段；`dialErr.CloseInfo.Kind == CloseKindDialFailed`
-    - `DialError.URL` 保留原始 URL；`DialError.Error()` 不得输出 URL userinfo / query / fragment
+15. **DialManaged 错误路径**：握手失败时返回 `*wsconn.DialError`，`errors.As(err, &dialErr)` 能拿到脱敏 URL、StatusCode、Header、BodySnippet、CloseInfo 字段；`dialErr.CloseInfo.Kind == CloseKindDialFailed`
+    - `DialError.URL` 与 `DialError.Error()` 均不得输出 URL userinfo / query / fragment
 16. **Close reason 截断**：reason > 123 字节时按 UTF-8 边界截断；含多字节字符时不切到 rune 中间；含无效 UTF-8 字节时丢弃。close frame 仍然合法
 17. **DialOption 无 gorilla 类型暴露**：`go vet` / 文档检查所有导出 DialOption 函数签名，禁止出现 `*websocket.Dialer` 等 gorilla 类型
 18. **Config 校验测试**：
@@ -2258,7 +2260,7 @@ func WithClock(clock wsconn.Clock) Option
 26. **DialSecurityPolicy 默认与脱敏**：
     - 默认 policy 下 `ws://example` 返回 `ErrInsecureScheme`；带 `WithDialSecurityPolicy(AllowInsecureWS: true)` 后允许
     - 默认 policy 下私网地址（127.0.0.1 / 10.x / 192.168.x）返回 `ErrPrivateAddrBlocked`；带 `AllowPrivateIP: true` 后允许
-    - 默认 policy 下 169.254.169.254（云厂商 metadata IP）返回 `ErrPrivateAddrBlocked`，即使开了 `AllowPrivateIP` 也只在 `HostFilter` 自定义同意时放行
+    - 默认 policy 下 169.254.169.254（云厂商 metadata IP）返回 `ErrPrivateAddrBlocked`，即使开了 `AllowPrivateIP` 或 `HostFilter` 自定义同意也仍拒绝
     - DialError.Error() 输出不含 `Authorization` / `Cookie` / `Sec-WebSocket-Protocol` 的值，也不含 URL userinfo / query / fragment
     - dial 失败 body 大小超过 `MaxBodySnippet`：`BodySnippet` 长度被截至限值且 `BodyTruncated = true`
 27. **Proxy fail-closed**：
@@ -2324,7 +2326,7 @@ func WithClock(clock wsconn.Clock) Option
 |---|---|
 | 直接 import gorilla 的生产文件 | 14 个 |
 | 直接 import gorilla 的测试文件 | 13 个 |
-| 新增 `common/wsconn/` 文件 | ~12 个（含 managed.go / pump.go / accept.go / dial.go / close.go / message.go / writer.go / control.go / watchdog.go / pong.go / clock.go / http.go） |
+| 新增 `common/wsconn/` 文件 | ~11 个（含 managed.go / pump.go / accept.go / dial.go / close.go / message.go / control.go / watchdog.go / pong.go / clock.go / http.go） |
 | 新增 `common/wsconn/wstest/` 文件 | ~4 个 |
 | 新增 `relay/responses_ws/ingress.go` | **0**（Ingress 设计撤销，由 ReadInitial + `actor.onClientFrame` 直接覆盖） |
 | `runtime/session/types.go` 接口改造（typed Frame / RecvEvent / ProviderClose） | ~80 行新增类型定义 + **~200+ 行**调用点更新（3 个 provider 的 SendClient/Recv 实现、2 个 relay handler、所有 RealtimeSession 测试与 mock） |

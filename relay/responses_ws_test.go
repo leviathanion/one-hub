@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"one-api/common"
@@ -144,14 +143,16 @@ func dialResponsesWSTestManagedConn(t *testing.T, wsURL string) *wsconn.ManagedC
 func dialResponsesWSTestManagedConnErr(wsURL string) (*wsconn.ManagedConn, error) {
 	return wsconn.DialManaged(context.Background(), wsURL, nil, wsconn.Config{
 		Label:        "responses ws test client",
-		WriteTimeout: config.RealtimeWebsocketWriteTimeout,
+		WriteTimeout: responsesWSTestWriteTimeout(),
 	}, wsconn.WithDialSecurityPolicy(wsconn.DialSecurityPolicy{
 		AllowInsecureWS: true,
 		AllowPrivateIP:  true,
-		HostFilter: func(string, []net.IP) bool {
-			return true
-		},
 	}))
+}
+
+func responsesWSTestWriteTimeout() func() time.Duration {
+	timeout := config.RealtimeWebsocketWriteTimeout()
+	return func() time.Duration { return timeout }
 }
 
 func waitResponsesWSTestManagedClose(t *testing.T, conn *wsconn.ManagedConn) wsconn.CloseInfo {

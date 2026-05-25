@@ -41,10 +41,7 @@ type readLimitConn interface {
 	SetReadLimit(int64)
 }
 
-// ApplyReadLimit applies a configured websocket read limit to conn and returns
-// the installed value. It exists for legacy gorilla paths while callers migrate
-// to ManagedConn.Config.ReadLimit.
-func ApplyReadLimit(conn readLimitConn, readLimit func() int64) int64 {
+func applyReadLimit(conn readLimitConn, readLimit func() int64) int64 {
 	if conn == nil {
 		return 0
 	}
@@ -79,6 +76,13 @@ func validateConfig(cfg Config) error {
 		return fmt.Errorf("%w: InboundActivityTimeout must be >= 0", ErrInvalidConfig)
 	}
 	return nil
+}
+
+func (c *ManagedConn) label() string {
+	if c == nil || c.cfg.Label == "" {
+		return "unlabeled"
+	}
+	return c.cfg.Label
 }
 
 type ManagedConn struct {
@@ -148,7 +152,7 @@ func (c *ManagedConn) Close(info CloseInfo) {
 		return
 	}
 	if info.Kind == CloseKindUnknown {
-		logWarnf("wsconn: Close called with unknown kind; falling back to abort")
+		logWarnf("wsconn[%s]: Close called with unknown kind; falling back to abort", c.label())
 		info.Kind = CloseKindAbort
 	}
 	info.At = c.clock.Now()
@@ -217,7 +221,7 @@ func (c *ManagedConn) waitControlWriterDone() {
 	select {
 	case <-c.control.done:
 	case <-timer.Chan():
-		logWarnf("wsconn: control writer cleanup wait timed out")
+		logWarnf("wsconn[%s]: control writer cleanup wait timed out", c.label())
 	}
 }
 
@@ -267,7 +271,7 @@ func (c *ManagedConn) runtimeWriteTimeout() time.Duration {
 	}
 	d := c.cfg.WriteTimeout()
 	if d < 0 {
-		logWarnf("wsconn: WriteTimeout returned negative; falling back to default")
+		logWarnf("wsconn[%s]: WriteTimeout returned negative; falling back to default", c.label())
 		return defaultWriteTimeout
 	}
 	return d

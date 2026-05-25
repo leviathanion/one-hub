@@ -159,6 +159,15 @@ func TestCodexRealtimeHelperFunctionsAndCompatibilityHeaders(t *testing.T) {
 	}
 }
 
+func TestCodexRealtimeSelfHostedDialOptionsStillBlockMetadataIP(t *testing.T) {
+	_, err := wsconn.DialManaged(context.Background(), "ws://169.254.169.254/backend-api/codex/responses", nil, wsconn.Config{},
+		codexRealtimeDialOptions("", true)...,
+	)
+	if !errors.Is(err, wsconn.ErrPrivateAddrBlocked) {
+		t.Fatalf("expected self-hosted dial options to block metadata IP, got %v", err)
+	}
+}
+
 func TestCodexRealtimeConnectionPlanningAndDialPaths(t *testing.T) {
 	originalLogger := logger.Logger
 	logger.Logger = zap.NewNop()

@@ -32,6 +32,18 @@ func TestValidateUpstreamRealtimeURLPolicy(t *testing.T) {
 		}
 	})
 
+	t.Run("self hosted still rejects metadata hosts", func(t *testing.T) {
+		for _, rawURL := range []string{
+			"http://169.254.169.254/latest/meta-data",
+			"http://100.100.100.200/latest/meta-data",
+			"http://[fd00:ec2::254]/latest/meta-data",
+		} {
+			if _, err := ValidateUpstreamRealtimeURL(rawURL, UpstreamRealtimeURLPolicy{AllowSelfHosted: true}); err == nil {
+				t.Fatalf("expected self-hosted metadata upstream %s to be rejected", rawURL)
+			}
+		}
+	})
+
 	for _, rawURL := range []string{
 		"https://127.0.0.1/v1/realtime",
 		"https://localhost/v1/realtime",
@@ -41,6 +53,7 @@ func TestValidateUpstreamRealtimeURLPolicy(t *testing.T) {
 		"https://192.168.1.2/v1/realtime",
 		"https://169.254.169.254/latest/meta-data",
 		"https://100.100.100.200/latest/meta-data",
+		"https://[fd00:ec2::254]/latest/meta-data",
 		"https://[fe80::1]/v1/realtime",
 	} {
 		t.Run("blocked "+rawURL, func(t *testing.T) {
