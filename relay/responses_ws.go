@@ -2167,7 +2167,7 @@ func ResponsesWebSocket(c *gin.Context) {
 		CheckOrigin:       realtimeWebSocketOriginAllowed,
 		ResponseHeader:    websocketUpgradeResponseHeader(c.Request),
 		EnableCompression: false,
-		Subprotocols:      allowedClientWebSocketSubprotocols(c.Request),
+		Subprotocols:      echoableClientWebSocketSubprotocols(c.Request),
 	})
 	if err != nil {
 		common.AbortWithMessage(c, http.StatusInternalServerError, "upgrade_failed")

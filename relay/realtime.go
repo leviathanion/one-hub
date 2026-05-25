@@ -107,6 +107,14 @@ func websocketUpgradeResponseHeader(r *http.Request) http.Header {
 	return header
 }
 
+func echoableClientWebSocketSubprotocols(r *http.Request) []string {
+	selected := selectWebSocketSubprotocol(r)
+	if selected == "" {
+		return nil
+	}
+	return []string{selected}
+}
+
 func selectWebSocketSubprotocol(r *http.Request) string {
 	protocols := allowedClientWebSocketSubprotocols(r)
 	if len(protocols) == 0 {
@@ -190,7 +198,7 @@ func ChatRealtime(c *gin.Context) {
 	}, wsconn.AcceptOptions{
 		CheckOrigin:       realtimeWebSocketOriginAllowed,
 		ResponseHeader:    websocketUpgradeResponseHeader(c.Request),
-		Subprotocols:      allowedClientWebSocketSubprotocols(c.Request),
+		Subprotocols:      echoableClientWebSocketSubprotocols(c.Request),
 		EnableCompression: false,
 	})
 	if err != nil {

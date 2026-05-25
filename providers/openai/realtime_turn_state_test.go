@@ -116,6 +116,49 @@ func TestOpenAIRealtimeTurnStateLifecycleAndFinalize(t *testing.T) {
 	}
 }
 
+func TestOpenAIRealtimeTurnStateEmitsDurationOnlyUsage(t *testing.T) {
+	state := newOpenAIRealtimeTurnState(1, time.Unix(1700000000, 0), nil)
+	firstDelta := state.applyUsageSnapshot(&types.UsageEvent{
+		Source:          types.UsageSourceInputAudioTranscription,
+		BillingBasis:    types.UsageBillingBasisDuration,
+		ProviderEventID: "evt_duration_1",
+		ItemID:          "item_duration_1",
+		DurationSeconds: 2.5,
+	})
+	if firstDelta == nil ||
+		firstDelta.Source != types.UsageSourceInputAudioTranscription ||
+		firstDelta.BillingBasis != types.UsageBillingBasisDuration ||
+		firstDelta.ProviderEventID != "evt_duration_1" ||
+		firstDelta.ItemID != "item_duration_1" ||
+		firstDelta.DurationSeconds != 2.5 {
+		t.Fatalf("expected duration-only usage delta, got %+v", firstDelta)
+	}
+
+	if noDelta := state.applyUsageSnapshot(&types.UsageEvent{
+		Source:          types.UsageSourceInputAudioTranscription,
+		BillingBasis:    types.UsageBillingBasisDuration,
+		ProviderEventID: "evt_duration_1",
+		ItemID:          "item_duration_1",
+		DurationSeconds: 2.5,
+	}); noDelta != nil {
+		t.Fatalf("expected repeated duration snapshot not to emit a delta, got %+v", noDelta)
+	}
+
+	nextDelta := state.applyUsageSnapshot(&types.UsageEvent{
+		Source:          types.UsageSourceInputAudioTranscription,
+		BillingBasis:    types.UsageBillingBasisDuration,
+		ProviderEventID: "evt_duration_2",
+		ItemID:          "item_duration_2",
+		DurationSeconds: 4,
+	})
+	if nextDelta == nil ||
+		nextDelta.ProviderEventID != "evt_duration_2" ||
+		nextDelta.ItemID != "item_duration_2" ||
+		nextDelta.DurationSeconds != 1.5 {
+		t.Fatalf("expected incremental duration delta, got %+v", nextDelta)
+	}
+}
+
 func TestOpenAIRealtimeTurnStateHelpersAndUsageSnapshots(t *testing.T) {
 	if got := newOpenAIRealtimeTurnState(1, time.Time{}, nil); got == nil || got.startedAt.IsZero() {
 		t.Fatal("expected zero start time to be backfilled")
@@ -218,12 +261,21 @@ func TestOpenAIRealtimeTurnStateHelpersAndUsageSnapshots(t *testing.T) {
 	if openAIRealtimeUsageHasValue(&types.UsageEvent{}) {
 		t.Fatal("expected zero usage to be considered empty")
 	}
+	if !openAIRealtimeUsageHasValue(&types.UsageEvent{DurationSeconds: 0.25}) {
+		t.Fatal("expected duration seconds to count as usage")
+	}
 
 	if usageEventField(nil, func(usage *types.UsageEvent) int { return usage.TotalTokens }) != 0 {
 		t.Fatal("expected nil usageEventField to return zero")
 	}
 	if usageEventField(base, nil) != 0 {
 		t.Fatal("expected nil getter to return zero")
+	}
+	if usageEventFloatField(nil, func(usage *types.UsageEvent) float64 { return usage.DurationSeconds }) != 0 {
+		t.Fatal("expected nil usageEventFloatField to return zero")
+	}
+	if usageEventFloatField(base, nil) != 0 {
+		t.Fatal("expected nil usageEventFloatField getter to return zero")
 	}
 	if promptTokenDetailsField(nil) != (types.PromptTokensDetails{}) {
 		t.Fatal("expected nil prompt details field to be zero-valued")
@@ -240,6 +292,12 @@ func TestOpenAIRealtimeTurnStateHelpersAndUsageSnapshots(t *testing.T) {
 	}
 	if deltaOpenAIRealtimeUsageInt(3, 5) != 0 || deltaOpenAIRealtimeUsageInt(8, 5) != 3 {
 		t.Fatal("expected delta helper to clamp negative deltas")
+	}
+	if maxOpenAIRealtimeUsageFloat(4.5, 2.5) != 4.5 || maxOpenAIRealtimeUsageFloat(4.5, 5.5) != 5.5 {
+		t.Fatal("expected float max helper to choose larger duration")
+	}
+	if deltaOpenAIRealtimeUsageFloat(3.5, 5.5) != 0 || deltaOpenAIRealtimeUsageFloat(8.5, 5.5) != 3 {
+		t.Fatal("expected float delta helper to clamp negative durations")
 	}
 	if !openAIRealtimePromptTokenDetailsHasValue(types.PromptTokensDetails{CachedReadTokens: 1}) {
 		t.Fatal("expected prompt token details value detection")

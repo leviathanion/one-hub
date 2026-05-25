@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 func TestConfigValidation(t *testing.T) {
@@ -293,6 +295,16 @@ func TestProxyURLFailClosed(t *testing.T) {
 	}
 	if dialed {
 		t.Fatalf("proxy parse failure attempted direct dial")
+	}
+}
+
+func TestProxyURLAcceptsSocks5H(t *testing.T) {
+	var dialer websocket.Dialer
+	if err := applyProxy(&dialer, "socks5h://127.0.0.1:1080", nil); err != nil {
+		t.Fatalf("applyProxy socks5h err=%v, want nil", err)
+	}
+	if dialer.NetDialContext == nil {
+		t.Fatal("expected socks5h proxy to install NetDialContext")
 	}
 }
 

@@ -150,6 +150,7 @@ func mergeOpenAIRealtimeUsageSnapshot(base, update *types.UsageEvent) *types.Usa
 	merged.OutputTokenDetails = maxOpenAIRealtimeCompletionTokenDetails(merged.OutputTokenDetails, update.OutputTokenDetails)
 	merged.ExtraTokens = maxOpenAIRealtimeExtraTokens(merged.ExtraTokens, update.ExtraTokens)
 	merged.ExtraBilling = maxOpenAIRealtimeExtraBilling(merged.ExtraBilling, update.ExtraBilling)
+	merged.DurationSeconds = maxOpenAIRealtimeUsageFloat(merged.DurationSeconds, update.DurationSeconds)
 	copyOpenAIRealtimeUsageAttribution(merged, update)
 	return merged
 }
@@ -167,6 +168,7 @@ func deltaOpenAIRealtimeUsageSnapshot(snapshot, accounted *types.UsageEvent) *ty
 		OutputTokenDetails: deltaOpenAIRealtimeCompletionTokenDetails(snapshot.OutputTokenDetails, completionTokenDetailsField(accounted)),
 		ExtraTokens:        deltaOpenAIRealtimeExtraTokens(snapshot.ExtraTokens, usageEventExtraTokens(accounted)),
 		ExtraBilling:       deltaOpenAIRealtimeExtraBilling(snapshot.ExtraBilling, usageEventExtraBilling(accounted)),
+		DurationSeconds:    deltaOpenAIRealtimeUsageFloat(snapshot.DurationSeconds, usageEventFloatField(accounted, func(usage *types.UsageEvent) float64 { return usage.DurationSeconds })),
 	}
 	if !openAIRealtimeUsageHasValue(delta) {
 		return nil
@@ -184,7 +186,6 @@ func copyOpenAIRealtimeUsageAttribution(dst, src *types.UsageEvent) {
 	dst.ProviderEventID = src.ProviderEventID
 	dst.ResponseID = src.ResponseID
 	dst.ItemID = src.ItemID
-	dst.DurationSeconds = src.DurationSeconds
 }
 
 func openAIRealtimeUsageHasValue(usage *types.UsageEvent) bool {
@@ -194,6 +195,9 @@ func openAIRealtimeUsageHasValue(usage *types.UsageEvent) bool {
 	if usage.InputTokens > 0 || usage.OutputTokens > 0 || usage.TotalTokens > 0 {
 		return true
 	}
+	if usage.DurationSeconds > 0 {
+		return true
+	}
 	if openAIRealtimePromptTokenDetailsHasValue(usage.InputTokenDetails) || openAIRealtimeCompletionTokenDetailsHasValue(usage.OutputTokenDetails) {
 		return true
 	}
@@ -201,6 +205,13 @@ func openAIRealtimeUsageHasValue(usage *types.UsageEvent) bool {
 }
 
 func usageEventField(usage *types.UsageEvent, get func(*types.UsageEvent) int) int {
+	if usage == nil || get == nil {
+		return 0
+	}
+	return get(usage)
+}
+
+func usageEventFloatField(usage *types.UsageEvent, get func(*types.UsageEvent) float64) float64 {
 	if usage == nil || get == nil {
 		return 0
 	}
@@ -243,6 +254,20 @@ func maxOpenAIRealtimeUsageInt(current, next int) int {
 }
 
 func deltaOpenAIRealtimeUsageInt(current, previous int) int {
+	if current <= previous {
+		return 0
+	}
+	return current - previous
+}
+
+func maxOpenAIRealtimeUsageFloat(current, next float64) float64 {
+	if next > current {
+		return next
+	}
+	return current
+}
+
+func deltaOpenAIRealtimeUsageFloat(current, previous float64) float64 {
 	if current <= previous {
 		return 0
 	}

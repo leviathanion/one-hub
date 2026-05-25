@@ -22,6 +22,7 @@ import (
 	"one-api/types"
 
 	"github.com/gin-gonic/gin"
+	gorillawebsocket "github.com/gorilla/websocket"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 	"gorm.io/driver/sqlite"
@@ -291,6 +292,10 @@ func TestWebSocketSubprotocolNegotiationOnlyAllowsKnownValues(t *testing.T) {
 	if got := selectWebSocketSubprotocol(req); got != "realtime" {
 		t.Fatalf("expected realtime to be negotiated when present, got %q", got)
 	}
+	echoable := echoableClientWebSocketSubprotocols(req)
+	if strings.Join(echoable, ",") != "realtime" {
+		t.Fatalf("unexpected echoable protocols: %#v", echoable)
+	}
 }
 
 func TestWebSocketSubprotocolNegotiationNeverEchoesCredential(t *testing.T) {
@@ -322,6 +327,60 @@ func TestWebSocketSubprotocolNegotiationNeverEchoesCredential(t *testing.T) {
 			req.Header.Set("Sec-WebSocket-Protocol", tt.protocols)
 			if got := selectWebSocketSubprotocol(req); got != tt.want {
 				t.Fatalf("selectWebSocketSubprotocol() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWebSocketUpgradeDoesNotEchoCredentialSubprotocol(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := wsconn.AcceptManaged(w, r, wsconn.Config{Label: "subprotocol-test"}, wsconn.AcceptOptions{
+			CheckOrigin:    func(*http.Request) bool { return true },
+			ResponseHeader: websocketUpgradeResponseHeader(r),
+			Subprotocols:   echoableClientWebSocketSubprotocols(r),
+		})
+		if err != nil {
+			return
+		}
+		conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort})
+	}))
+	defer server.Close()
+
+	tests := []struct {
+		name      string
+		protocols []string
+		want      string
+	}{
+		{
+			name:      "credential before realtime",
+			protocols: []string{"openai-insecure-api-key.sk-secret", "realtime"},
+			want:      "realtime",
+		},
+		{
+			name:      "credential only",
+			protocols: []string{"openai-insecure-api-key.sk-secret"},
+			want:      "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dialer := gorillawebsocket.Dialer{Subprotocols: tt.protocols}
+			conn, resp, err := dialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+			if err != nil {
+				t.Fatalf("websocket dial failed: %v", err)
+			}
+			defer conn.Close()
+			if got := conn.Subprotocol(); got != tt.want {
+				t.Fatalf("negotiated subprotocol=%q, want %q", got, tt.want)
+			}
+			if resp != nil {
+				if got := resp.Header.Get("Sec-WebSocket-Protocol"); got != tt.want {
+					t.Fatalf("response subprotocol=%q, want %q", got, tt.want)
+				}
+				if strings.Contains(resp.Header.Get("Sec-WebSocket-Protocol"), "openai-insecure-api-key.") {
+					t.Fatalf("response leaked credential subprotocol: %q", resp.Header.Get("Sec-WebSocket-Protocol"))
+				}
 			}
 		})
 	}

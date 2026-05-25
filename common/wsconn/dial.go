@@ -220,7 +220,7 @@ func applyProxy(dialer *websocket.Dialer, rawURL string, base func(context.Conte
 	switch strings.ToLower(u.Scheme) {
 	case "http", "https":
 		dialer.Proxy = func(*http.Request) (*url.URL, error) { return u, nil }
-	case "socks5":
+	case "socks5", "socks5h":
 		proxyDialer, err := proxy.FromURL(u, proxy.Direct)
 		if err != nil {
 			return fmt.Errorf("%w: %v", ErrInvalidProxyURL, err)

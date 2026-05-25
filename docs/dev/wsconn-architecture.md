@@ -238,7 +238,7 @@ type DialOption func(*dialConfig)
 //     ErrInvalidProxyURL，**不退化为直连**（旧 common/requester/ws_client.go:30-34
 //     是 fail-open 行为，在配置错误时静默直连，这条改成 fail-closed 才能让
 //     "通过 proxy 出网"的部署约束真正生效）
-//   - scheme 支持的范围在 wsconn 内白名单（http/https/socks5），其它走 Err
+//   - scheme 支持的范围在 wsconn 内白名单（http/https/socks5/socks5h），其它走 Err
 func WithProxyURL(rawURL string) DialOption
 func WithSubprotocols(protos ...string) DialOption
 func WithHandshakeTimeout(d time.Duration) DialOption // d <= 0 使用 wsconn 默认 5s；生产调用方应传 config.ConnectTimeout()
@@ -1074,7 +1074,7 @@ func IsUpgrade(r *http.Request) bool
 1. **TLS verify 默认开启**；想关闭必须显式 `WithTLSConfig(&tls.Config{InsecureSkipVerify: true})`，方便 grep 审计
 2. **默认拒绝 `ws://`**：scheme 不在 `{wss}` 时 `DialManaged` 返回 `ErrInsecureScheme`，本地/测试需 `WithDialSecurityPolicy(DialSecurityPolicy{AllowInsecureWS: true})` 显式打开
 3. **默认拒绝私网/loopback/metadata 地址**：解析 host 后通过 `HostFilter`（默认 = wsconn 内置规则）判定；命中 RFC 1918 / loopback / link-local / 169.254.169.254 metadata IP 返回 `ErrPrivateAddrBlocked`。部署可在 policy 里 `AllowPrivateIP: true` 放过 RFC 1918，**metadata IP 即便 AllowPrivateIP=true 仍默认拒**（防 SSRF 抓 cloud metadata）
-4. **proxy fail-closed**：`WithProxyURL("")` 表示"不走 proxy"；非空但解析失败、scheme 不支持时 `DialManaged` 返回 `ErrInvalidProxyURL`，**绝不静默退化为直连**。当前 `common/requester/ws_client.go:30-34` 是 fail-open 路径，配置 proxy 但解析失败时返回裸 dialer 直连目标，违反"通过 proxy 出网"的部署约束。新方案必须 fail-closed 才能让该约束真正生效
+4. **proxy fail-closed**：`WithProxyURL("")` 表示"不走 proxy"；非空但解析失败、scheme 不支持时 `DialManaged` 返回 `ErrInvalidProxyURL`，**绝不静默退化为直连**。`socks5h` 属于历史兼容的 SOCKS remote-DNS proxy scheme，必须和 `socks5` 一起保留在白名单。当前 `common/requester/ws_client.go:30-34` 是 fail-open 路径，配置 proxy 但解析失败时返回裸 dialer 直连目标，违反"通过 proxy 出网"的部署约束。新方案必须 fail-closed 才能让该约束真正生效
 5. **`DialError.Error()` 输出脱敏**：永远不输出 Authorization / Cookie / Sec-WebSocket-Protocol 值，也不输出 URL userinfo / query / fragment；这些 header 在写入 `DialError.Header` 前被 redact 为 `"[REDACTED]"`，原始 URL 只保留在 `DialError.URL` 结构化字段中
 6. **`BodySnippet` 限长**：默认 4 KiB（与现有 `wsDialBodySnippetLimit` 对齐）；超过即截断并设 `BodyTruncated = true`
 7. **DialOption 全部纯 Go 类型**：禁止 `WithDialer(*websocket.Dialer)`、`WithGorillaHeader(http.Header)` 等暴露 gorilla 的选项；允许 `WithProxyURL(string)`、`WithSubprotocols(...string)`、`WithHandshakeTimeout(time.Duration)`、`WithTLSConfig(*tls.Config)`、`WithNetDialContext(...)`
