@@ -2,10 +2,12 @@ package relay
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"one-api/common"
@@ -13,6 +15,8 @@ import (
 	ratelimit "one-api/common/limit"
 	"one-api/common/logger"
 	"one-api/common/responsesws"
+	"one-api/common/wsconn"
+	"one-api/common/wsconn/wstest"
 	"one-api/middleware"
 	"one-api/relay/relay_util"
 	runtimeaffinity "one-api/runtime/channelaffinity"
@@ -27,7 +31,6 @@ import (
 	"one-api/model"
 
 	"github.com/gin-gonic/gin"
-	"github.com/gorilla/websocket"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 	"gorm.io/datatypes"
@@ -42,18 +45,20 @@ type responsesWSReadResult struct {
 }
 
 type responsesWSFakeUserConn struct {
-	reads           chan responsesWSReadResult
-	readLimit       int64
-	writeErr        error
-	controlErr      error
-	writeCount      int32
-	closeCount      int32
-	controlCount    int32
-	lastControlType int32
-	lastWrite       atomic.Value
-	lastControl     atomic.Value
-	deadlineMu      sync.Mutex
-	readDeadlines   []time.Time
+	reads        chan responsesWSReadResult
+	writeErr     error
+	writeCount   int32
+	closeCount   int32
+	controlCount int32
+	lastWrite    atomic.Value
+	lastControl  atomic.Value
+}
+
+func NewResponsesWSIOBridge(conn *responsesWSFakeUserConn, actor *ResponsesWSSessionActor) *ResponsesWSIOBridge {
+	if conn == nil {
+		return newResponsesWSBridgeForTest(nil, actor)
+	}
+	return newResponsesWSBridgeForTest(conn, actor)
 }
 
 func (c *responsesWSFakeUserConn) ReadMessage() (int, []byte, error) {
@@ -61,7 +66,12 @@ func (c *responsesWSFakeUserConn) ReadMessage() (int, []byte, error) {
 	return result.messageType, result.payload, result.err
 }
 
-func (c *responsesWSFakeUserConn) WriteMessage(_ int, payload []byte) error {
+func (c *responsesWSFakeUserConn) WriteFrame(messageType int, payload []byte, _ ResponsesWSWriteMode) error {
+	if messageType == responsesWSCloseMessageType {
+		code, reason := parseResponsesWSClosePayload(payload)
+		c.CloseWithCode(code, reason)
+		return nil
+	}
 	atomic.AddInt32(&c.writeCount, 1)
 	if c.writeErr != nil {
 		return c.writeErr
@@ -70,83 +80,13 @@ func (c *responsesWSFakeUserConn) WriteMessage(_ int, payload []byte) error {
 	return nil
 }
 
-func (c *responsesWSFakeUserConn) SetReadLimit(limit int64) {
-	c.readLimit = limit
-}
-
-func (c *responsesWSFakeUserConn) SetReadDeadline(deadline time.Time) error {
-	c.deadlineMu.Lock()
-	defer c.deadlineMu.Unlock()
-	c.readDeadlines = append(c.readDeadlines, deadline)
-	return nil
-}
-func (c *responsesWSFakeUserConn) SetWriteDeadline(time.Time) error { return nil }
-func (c *responsesWSFakeUserConn) Close() error {
-	atomic.AddInt32(&c.closeCount, 1)
-	return nil
-}
-func (c *responsesWSFakeUserConn) WriteControl(messageType int, payload []byte, _ time.Time) error {
+func (c *responsesWSFakeUserConn) CloseWithCode(code int, reason string) {
 	atomic.AddInt32(&c.controlCount, 1)
-	atomic.StoreInt32(&c.lastControlType, int32(messageType))
-	c.lastControl.Store(string(payload))
-	if c.controlErr != nil {
-		return c.controlErr
-	}
-	return nil
+	c.lastControl.Store(string(wsconn.SafeCloseMessage(wsconn.SanitizeWireCloseCode(code), reason)))
 }
 
-func (c *responsesWSFakeUserConn) readDeadlineSnapshot() []time.Time {
-	c.deadlineMu.Lock()
-	defer c.deadlineMu.Unlock()
-	return append([]time.Time(nil), c.readDeadlines...)
-}
-
-type responsesWSFakeControlUserConn struct {
-	responsesWSFakeUserConn
-	handlerMu   sync.Mutex
-	pingHandler func(string) error
-	pongHandler func(string) error
-}
-
-func (c *responsesWSFakeControlUserConn) PingHandler() func(string) error {
-	c.handlerMu.Lock()
-	defer c.handlerMu.Unlock()
-	return c.pingHandler
-}
-
-func (c *responsesWSFakeControlUserConn) SetPingHandler(handler func(string) error) {
-	c.handlerMu.Lock()
-	defer c.handlerMu.Unlock()
-	c.pingHandler = handler
-}
-
-func (c *responsesWSFakeControlUserConn) PongHandler() func(string) error {
-	c.handlerMu.Lock()
-	defer c.handlerMu.Unlock()
-	return c.pongHandler
-}
-
-func (c *responsesWSFakeControlUserConn) SetPongHandler(handler func(string) error) {
-	c.handlerMu.Lock()
-	defer c.handlerMu.Unlock()
-	c.pongHandler = handler
-}
-
-type responsesWSTestProxyLocalReadError struct {
-	payload     []byte
-	recoverable bool
-}
-
-func (e responsesWSTestProxyLocalReadError) Error() string {
-	return "proxy-local read error"
-}
-
-func (e responsesWSTestProxyLocalReadError) ProxyLocalPayload() []byte {
-	return e.payload
-}
-
-func (e responsesWSTestProxyLocalReadError) Recoverable() bool {
-	return e.recoverable
+func (c *responsesWSFakeUserConn) Abort(string) {
+	atomic.AddInt32(&c.closeCount, 1)
 }
 
 func readResponsesWSEvent(t *testing.T, actor *ResponsesWSSessionActor) ResponsesWSEvent {
@@ -192,6 +132,46 @@ func intSliceContains(values []int, target int) bool {
 	return false
 }
 
+func dialResponsesWSTestManagedConn(t *testing.T, wsURL string) *wsconn.ManagedConn {
+	t.Helper()
+	conn, err := dialResponsesWSTestManagedConnErr(wsURL)
+	if err != nil {
+		t.Fatalf("expected websocket connection to upgrade, got %v", err)
+	}
+	return conn
+}
+
+func dialResponsesWSTestManagedConnErr(wsURL string) (*wsconn.ManagedConn, error) {
+	return wsconn.DialManaged(context.Background(), wsURL, nil, wsconn.Config{
+		Label:        "responses ws test client",
+		WriteTimeout: config.RealtimeWebsocketWriteTimeout,
+	}, wsconn.WithDialSecurityPolicy(wsconn.DialSecurityPolicy{
+		AllowInsecureWS: true,
+		AllowPrivateIP:  true,
+		HostFilter: func(string, []net.IP) bool {
+			return true
+		},
+	}))
+}
+
+func waitResponsesWSTestManagedClose(t *testing.T, conn *wsconn.ManagedConn) wsconn.CloseInfo {
+	t.Helper()
+	done := make(chan wsconn.CloseInfo, 1)
+	go wsconn.Pump{
+		Conn: conn,
+		OnClose: func(info wsconn.CloseInfo) {
+			done <- info
+		},
+	}.Run(context.Background())
+	select {
+	case info := <-done:
+		return info
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for websocket close")
+		return wsconn.CloseInfo{}
+	}
+}
+
 type responsesWSTestSession struct {
 	abortReason      string
 	abortCh          chan string
@@ -202,7 +182,7 @@ type responsesWSTestSession struct {
 	preflightRequest *types.OpenAIResponsesRequest
 }
 
-func (s *responsesWSTestSession) SendClient(context.Context, int, []byte) error { return nil }
+func (s *responsesWSTestSession) SendClient(context.Context, runtimesession.Frame) error { return nil }
 
 func (s *responsesWSTestSession) PreflightResponsesWSSend(_ context.Context, eventID string, request *types.OpenAIResponsesRequest) error {
 	atomic.AddInt32(&s.preflightCalls, 1)
@@ -216,8 +196,8 @@ func (s *responsesWSTestSession) PreflightResponsesWSSend(_ context.Context, eve
 	return s.preflightErr
 }
 
-func (s *responsesWSTestSession) Recv(context.Context) (int, []byte, *types.UsageEvent, runtimesession.RealtimePayloadOrigin, error) {
-	return 0, nil, nil, runtimesession.RealtimePayloadOriginProxyLocal, runtimesession.ErrSessionClosed
+func (s *responsesWSTestSession) Recv(context.Context) (runtimesession.RecvEvent, error) {
+	return runtimesession.RecvEvent{}, runtimesession.ErrSessionClosed
 }
 
 func (s *responsesWSTestSession) Detach(string) {}
@@ -236,31 +216,46 @@ func (s *responsesWSTestSession) Abort(reason string) {
 func (s *responsesWSTestSession) SetTurnObserverFactory(runtimesession.TurnObserverFactory) {}
 
 type responsesWSRecvResult struct {
-	messageType int
-	payload     []byte
-	usage       *types.UsageEvent
-	origin      runtimesession.RealtimePayloadOrigin
-	err         error
+	messageType   int
+	payload       []byte
+	providerClose *runtimesession.ProviderClose
+	usage         *types.UsageEvent
+	origin        runtimesession.RealtimePayloadOrigin
+	err           error
+	topErr        error
 }
 
 type responsesWSRecvSequenceSession struct {
 	responses chan responsesWSRecvResult
 }
 
-func (s *responsesWSRecvSequenceSession) SendClient(context.Context, int, []byte) error {
+func (s *responsesWSRecvSequenceSession) SendClient(context.Context, runtimesession.Frame) error {
 	return nil
 }
 
-func (s *responsesWSRecvSequenceSession) Recv(ctx context.Context) (int, []byte, *types.UsageEvent, runtimesession.RealtimePayloadOrigin, error) {
+func (s *responsesWSRecvSequenceSession) Recv(ctx context.Context) (runtimesession.RecvEvent, error) {
 	select {
 	case result := <-s.responses:
+		if result.topErr != nil {
+			return runtimesession.RecvEvent{}, result.topErr
+		}
 		origin := result.origin
 		if origin == runtimesession.RealtimePayloadOriginProxyLocal && result.err == nil && len(result.payload) > 0 {
 			origin = runtimesession.RealtimePayloadOriginProvider
 		}
-		return result.messageType, result.payload, result.usage, origin, result.err
+		event := runtimesession.RecvEvent{
+			ProviderClose: result.providerClose,
+			Usage:         result.usage,
+			Origin:        origin,
+			Err:           result.err,
+		}
+		if len(result.payload) > 0 {
+			frame := responsesWSSessionFrameFromMessage(result.messageType, result.payload)
+			event.Frame = &frame
+		}
+		return event, nil
 	case <-ctx.Done():
-		return 0, nil, nil, runtimesession.RealtimePayloadOriginProxyLocal, ctx.Err()
+		return runtimesession.RecvEvent{}, ctx.Err()
 	}
 }
 
@@ -521,23 +516,20 @@ func TestResponsesWebSocketConnectionLimitRejectsBeforeUpgradeAndPending(t *test
 	defer server.Close()
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
 
-	firstConn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		t.Fatalf("expected first websocket connection to upgrade, got %v", err)
-	}
+	firstConn := dialResponsesWSTestManagedConn(t, wsURL)
 
-	_, response, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	_, err := dialResponsesWSTestManagedConnErr(wsURL)
 	if err == nil {
 		t.Fatal("expected second websocket connection to be rejected by connection limiter")
 	}
-	if response == nil || response.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("expected 429 from connection limiter, got response=%v err=%v", response, err)
+	var dialErr *wsconn.DialError
+	if !errors.As(err, &dialErr) || dialErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 from connection limiter, got err=%v", err)
 	}
-	body, _ := io.ReadAll(response.Body)
-	if !strings.Contains(string(body), "too many responses websocket connection attempts") {
-		t.Fatalf("expected connection limiter response before pending acquisition, body=%q", string(body))
+	if !strings.Contains(string(dialErr.BodySnippet), "too many responses websocket connection attempts") {
+		t.Fatalf("expected connection limiter response before pending acquisition, body=%q", string(dialErr.BodySnippet))
 	}
-	_ = firstConn.Close()
+	firstConn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_cleanup"})
 	select {
 	case <-firstHandlerDone:
 	case <-time.After(time.Second):
@@ -600,12 +592,9 @@ func TestResponsesWebSocketOversizedFirstFrameClosesOrReturnsInvalidEvent(t *tes
 	defer server.Close()
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
 
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		t.Fatalf("expected websocket connection to upgrade, got %v", err)
-	}
+	conn := dialResponsesWSTestManagedConn(t, wsURL)
 	defer func() {
-		_ = conn.Close()
+		conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_cleanup"})
 		select {
 		case <-handlerDone:
 		case <-time.After(time.Second):
@@ -613,18 +602,18 @@ func TestResponsesWebSocketOversizedFirstFrameClosesOrReturnsInvalidEvent(t *tes
 		}
 	}()
 
-	if err := conn.WriteMessage(websocket.TextMessage, []byte(strings.Repeat("x", 1024))); err != nil {
+	if err := conn.WriteMessage(wsconn.TextMessage, []byte(strings.Repeat("x", 1024))); err != nil {
 		t.Fatalf("expected oversized first frame write to reach server, got %v", err)
 	}
-	_, payload, err := conn.ReadMessage()
+	_, payload, err := conn.ReadInitial(context.Background())
 	if err == nil {
 		if !strings.Contains(string(payload), "invalid_event") || !strings.Contains(string(payload), "frame is too large or invalid") {
 			t.Fatalf("expected oversized frame guidance payload, got %q", payload)
 		}
 		return
 	}
-	var closeErr *websocket.CloseError
-	if !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseMessageTooBig {
+	var closeErr *wsconn.CloseError
+	if !errors.As(err, &closeErr) || closeErr.Code != wsconn.CloseMessageTooBig {
 		t.Fatalf("expected oversized frame close or invalid_event payload, err=%v payload=%q", err, payload)
 	}
 }
@@ -650,13 +639,10 @@ func TestResponsesWebSocketFirstFrameTimeoutReturnsSafeInvalidEventMessage(t *te
 	defer server.Close()
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
 
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		t.Fatalf("expected websocket connection to upgrade, got %v", err)
-	}
-	defer conn.Close()
+	conn := dialResponsesWSTestManagedConn(t, wsURL)
+	defer conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_cleanup"})
 
-	_, payload, err := conn.ReadMessage()
+	_, payload, err := conn.ReadInitial(context.Background())
 	if err != nil {
 		t.Fatalf("expected first-frame timeout payload before close, got err=%v", err)
 	}
@@ -672,187 +658,84 @@ func TestResponsesWebSocketFirstFrameTimeoutReturnsSafeInvalidEventMessage(t *te
 	}
 }
 
-func TestResponsesWSBridgeClearsEstablishedReadDeadline(t *testing.T) {
+func TestResponsesWebSocketBinaryFirstFrameClosesUnsupportedData(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	logger.Logger = zap.NewNop()
+	setResponsesWSTestRedisEnabled(t, false)
+	setResponsesWSTestViperInt(t, "responses_ws.connect_per_credential_per_minute", -1)
+	setResponsesWSTestViperInt(t, "responses_ws.first_frame_timeout_ms", 30000)
+	installResponsesWSTestAPILimiter(t, 60)
 
-	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
-	actor := NewResponsesWSSessionActor(ctx)
-	NewResponsesWSIOBridge(conn, actor)
+	router := gin.New()
+	handlerDone := make(chan struct{})
+	router.GET("/v1/responses", func(c *gin.Context) {
+		defer close(handlerDone)
+		c.Set("id", 7)
+		c.Set("token_id", nextResponsesWSConnectionAttemptTokenID())
+		c.Set("group", "default")
+		ResponsesWebSocket(c)
+	})
+	server := httptest.NewServer(router)
+	defer server.Close()
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
 
-	deadlines := conn.readDeadlineSnapshot()
-	if len(deadlines) == 0 {
-		t.Fatal("expected bridge configuration to clear the established read deadline")
+	conn := dialResponsesWSTestManagedConn(t, wsURL)
+	defer conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_cleanup"})
+
+	if err := conn.WriteMessage(wsconn.BinaryMessage, []byte{1, 2, 3}); err != nil {
+		t.Fatalf("expected binary first frame write to reach server, got %v", err)
 	}
-	for _, deadline := range deadlines {
-		if !deadline.IsZero() {
-			t.Fatalf("expected established ResponsesWS bridge to avoid hard read deadline, got %s", deadline)
-		}
+	closeInfo := waitResponsesWSTestManagedClose(t, conn)
+	if closeInfo.Code != wsconn.CloseUnsupportedData || closeInfo.Reason != "text_only" {
+		t.Fatalf("expected unsupported-data close with text_only reason, got %+v", closeInfo)
 	}
-}
-
-func TestResponsesWSControlFrameRefreshesClientLivenessNotBusinessIdle(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
-
-	conn := &responsesWSFakeControlUserConn{
-		responsesWSFakeUserConn: responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)},
-	}
-	actor := NewResponsesWSSessionActor(ctx)
-	bridge := NewResponsesWSIOBridge(conn, actor)
-
-	old := time.Now().Add(-time.Hour)
-	bridge.markClientInboundActivity(old)
-	actor.lastActivityUnixNano.Store(old.UnixNano())
-
-	pongHandler := conn.PongHandler()
-	if pongHandler == nil {
-		t.Fatal("expected bridge to install pong handler")
-	}
-	if err := pongHandler(""); err != nil {
-		t.Fatalf("expected pong handler to succeed, got %v", err)
-	}
-	if !bridge.lastClientInboundActivity().After(old) {
-		t.Fatalf("expected pong to refresh client liveness timestamp, old=%s got=%s", old, bridge.lastClientInboundActivity())
-	}
-	if got := time.Unix(0, actor.lastActivityUnixNano.Load()); !got.Equal(old) {
-		t.Fatalf("expected pong not to refresh business idle timestamp, old=%s got=%s", old, got)
-	}
-
-	if pingHandler := conn.PingHandler(); pingHandler == nil {
-		t.Fatal("expected bridge to install ping handler")
-	}
-}
-
-func TestResponsesWSClientFrameRefreshesClientLivenessAndBusinessIdle(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
-
-	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 2)}
-	actor := NewResponsesWSSessionActor(ctx)
-	bridge := NewResponsesWSIOBridge(conn, actor)
-
-	old := time.Now().Add(-time.Hour)
-	bridge.markClientInboundActivity(old)
-	actor.lastActivityUnixNano.Store(old.UnixNano())
-
-	conn.reads <- responsesWSReadResult{messageType: websocket.TextMessage, payload: []byte(`{"type":"response.create"}`)}
-	conn.reads <- responsesWSReadResult{err: io.EOF}
-	bridge.StartClientReadPump()
-
-	event := readResponsesWSEvent(t, actor)
-	if _, ok := event.(ResponsesWSEventClientFrame); !ok {
-		t.Fatalf("expected first read pump event to be client frame, got %T", event)
-	}
-	if !bridge.lastClientInboundActivity().After(old) {
-		t.Fatalf("expected client frame to refresh client liveness timestamp, old=%s got=%s", old, bridge.lastClientInboundActivity())
-	}
-	if got := time.Unix(0, actor.lastActivityUnixNano.Load()); !got.After(old) {
-		t.Fatalf("expected client frame to refresh business idle timestamp, old=%s got=%s", old, got)
-	}
-}
-
-func TestResponsesWSPingLoopClosesWithClientPongTimeoutReason(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	setResponsesWSTestViperInt(t, "realtime.websocket_ping_interval_ms", 5)
-	setResponsesWSTestViperInt(t, "responses_ws.client_pong_timeout_ms", 10)
-
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
-
-	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
-	actor := NewResponsesWSSessionActor(ctx)
-	bridge := NewResponsesWSIOBridge(conn, actor)
-	actor.SetBridge(bridge)
-	bridge.markClientInboundActivity(time.Now().Add(-time.Hour))
-	bridge.StartClientPingLoop()
-
-	event := readResponsesWSEvent(t, actor)
-	timeoutEvent, ok := event.(ResponsesWSEventTimeout)
-	if !ok {
-		t.Fatalf("expected client pong timeout event, got %T", event)
-	}
-	if timeoutEvent.Reason != "client_pong_timeout" {
-		t.Fatalf("expected client_pong_timeout reason, got %q", timeoutEvent.Reason)
-	}
-	actor.close(timeoutEvent.Reason)
-
-	if got := atomic.LoadInt32(&conn.lastControlType); got != websocket.CloseMessage {
-		t.Fatalf("expected final control frame to be websocket close, got %d", got)
-	}
-	if got := conn.lastControl.Load(); !strings.Contains(fmt.Sprint(got), "client_pong_timeout") {
-		t.Fatalf("expected close reason client_pong_timeout, got %#v", got)
-	}
-}
-
-func TestResponsesWSPingLoopDisabledWatchdogStillSendsPings(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	setResponsesWSTestViperInt(t, "realtime.websocket_ping_interval_ms", 5)
-	setResponsesWSTestViperInt(t, "responses_ws.client_pong_timeout_ms", 0)
-
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
-
-	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
-	actor := NewResponsesWSSessionActor(ctx)
-	bridge := NewResponsesWSIOBridge(conn, actor)
-	actor.SetBridge(bridge)
-	bridge.markClientInboundActivity(time.Now().Add(-time.Hour))
-	bridge.StartClientPingLoop()
-
-	// Wait for at least one ping to be sent, then cancel context to stop the loop
-	time.Sleep(50 * time.Millisecond)
-	bridge.cancel()
-
-	if got := atomic.LoadInt32(&conn.controlCount); got < 1 {
-		t.Fatalf("expected at least one ping to be sent when watchdog is disabled, got %d control writes", got)
-	}
-
-	// verify no timeout event was posted (only pings should happen, no timeout)
 	select {
-	case event := <-actor.events:
-		if _, ok := event.(ResponsesWSEventTimeout); ok {
-			t.Fatal("expected no timeout event when client pong watchdog is disabled")
-		}
-	default:
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for binary first-frame handler to exit")
 	}
 }
 
-func TestResponsesWSPingLoopWriteControlErrorPostsClientClosed(t *testing.T) {
+func TestResponsesWebSocketInvalidJSONFirstFrameWritesErrorThenPolicyClose(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	setResponsesWSTestViperInt(t, "realtime.websocket_ping_interval_ms", 5)
-	setResponsesWSTestViperInt(t, "responses_ws.client_pong_timeout_ms", 300000)
+	logger.Logger = zap.NewNop()
+	setResponsesWSTestRedisEnabled(t, false)
+	setResponsesWSTestViperInt(t, "responses_ws.connect_per_credential_per_minute", -1)
+	setResponsesWSTestViperInt(t, "responses_ws.first_frame_timeout_ms", 30000)
+	installResponsesWSTestAPILimiter(t, 60)
 
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	router := gin.New()
+	handlerDone := make(chan struct{})
+	router.GET("/v1/responses", func(c *gin.Context) {
+		defer close(handlerDone)
+		c.Set("id", 7)
+		c.Set("token_id", nextResponsesWSConnectionAttemptTokenID())
+		c.Set("group", "default")
+		ResponsesWebSocket(c)
+	})
+	server := httptest.NewServer(router)
+	defer server.Close()
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
 
-	writeErr := errors.New("simulated WriteControl failure")
-	conn := &responsesWSFakeUserConn{
-		reads:      make(chan responsesWSReadResult, 1),
-		controlErr: writeErr,
+	conn := dialResponsesWSTestManagedConn(t, wsURL)
+	defer conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_cleanup"})
+
+	if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":`)); err != nil {
+		t.Fatalf("expected invalid JSON first frame write to reach server, got %v", err)
 	}
-	actor := NewResponsesWSSessionActor(ctx)
-	bridge := NewResponsesWSIOBridge(conn, actor)
-	actor.SetBridge(bridge)
-	bridge.markClientInboundActivity(time.Now())
-	bridge.StartClientPingLoop()
-
-	event := readResponsesWSEvent(t, actor)
-	closedEvent, ok := event.(ResponsesWSEventClientClosed)
-	if !ok {
-		t.Fatalf("expected client closed event on WriteControl error, got %T", event)
+	_, payload, err := conn.ReadInitial(context.Background())
+	if err != nil {
+		t.Fatalf("expected invalid_response_create payload before close, got err=%v", err)
 	}
-	if closedEvent.Err != writeErr {
-		t.Fatalf("expected WriteControl error %v propagated, got %v", writeErr, closedEvent.Err)
+	assertResponsesWSErrorPayload(t, string(payload), http.StatusBadRequest, "invalid_response_create", "invalid response.create")
+	closeInfo := waitResponsesWSTestManagedClose(t, conn)
+	if closeInfo.Code != wsconn.ClosePolicyViolation || closeInfo.Reason != "invalid_response_create" {
+		t.Fatalf("expected policy-violation close with invalid_response_create reason, got %+v", closeInfo)
+	}
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for invalid JSON first-frame handler to exit")
 	}
 }
 
@@ -1208,12 +1091,17 @@ func TestResponsesWSExpectedClientDisconnectErrorClassification(t *testing.T) {
 	}{
 		{
 			name: "codex exit abnormal close eof",
-			err:  &websocket.CloseError{Code: websocket.CloseAbnormalClosure, Text: "unexpected EOF"},
+			err:  &wsconn.CloseError{Code: wsconn.CloseAbnormalClosure, Reason: "unexpected EOF"},
 			want: true,
 		},
 		{
 			name: "normal close",
-			err:  &websocket.CloseError{Code: websocket.CloseNormalClosure, Text: "bye"},
+			err:  &wsconn.CloseError{Code: wsconn.CloseNormalClosure, Reason: "bye"},
+			want: true,
+		},
+		{
+			name: "managed normal close",
+			err:  &wsconn.CloseError{Code: wsconn.CloseNormalClosure, Reason: "bye"},
 			want: true,
 		},
 		{
@@ -1223,7 +1111,7 @@ func TestResponsesWSExpectedClientDisconnectErrorClassification(t *testing.T) {
 		},
 		{
 			name: "message too big remains visible",
-			err:  &websocket.CloseError{Code: websocket.CloseMessageTooBig, Text: "too large"},
+			err:  &wsconn.CloseError{Code: wsconn.CloseMessageTooBig, Reason: "too large"},
 			want: false,
 		},
 		{
@@ -1479,9 +1367,11 @@ func TestOpenAndPrimeResponsesWSNonStrictUnsupportedPreferredFallsBack(t *testin
 	unsupportedServer := httptest.NewServer(http.NotFoundHandler())
 	defer unsupportedServer.Close()
 
-	upgraded := make(chan *websocket.Conn, 1)
+	upgraded := make(chan *wsconn.ManagedConn, 1)
 	fallbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
+		conn, err := wsconn.AcceptManaged(w, r, wsconn.Config{Label: "responses ws fallback test accept"}, wsconn.AcceptOptions{
+			CheckOrigin: func(*http.Request) bool { return true },
+		})
 		if err != nil {
 			t.Errorf("fallback upgrade failed: %v", err)
 			return
@@ -1562,7 +1452,7 @@ func TestOpenAndPrimeResponsesWSNonStrictUnsupportedPreferredFallsBack(t *testin
 	}
 	select {
 	case conn := <-upgraded:
-		_ = conn.Close()
+		conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_cleanup"})
 	case <-time.After(time.Second):
 		t.Fatalf("expected fallback websocket server to be used")
 	}
@@ -1728,6 +1618,91 @@ func TestResponsesWSActorBackpressurePostsEventInsteadOfClosingDirectly(t *testi
 	t.Fatalf("expected queued backpressure timeout event")
 }
 
+func TestResponsesWSOnClientFrameCopiesPayloadAndPostsNonBlocking(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	payload := []byte(`{"type":"response.cancel"}`)
+
+	actor.onClientFrame(context.Background(), wsconn.TextMessage, payload)
+	payload[0] = '['
+
+	event := readResponsesWSEvent(t, actor)
+	clientFrame, ok := event.(ResponsesWSEventClientFrame)
+	if !ok {
+		t.Fatalf("expected client frame event, got %T", event)
+	}
+	if clientFrame.MessageType != int(wsconn.TextMessage) || string(clientFrame.Payload) != `{"type":"response.cancel"}` {
+		t.Fatalf("unexpected client frame event: %+v payload=%q", clientFrame, clientFrame.Payload)
+	}
+	if clientFrame.ReceivedAt.IsZero() {
+		t.Fatal("expected client frame received time")
+	}
+}
+
+func TestResponsesWSOnClientFrameDropsAfterActorDone(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.finish()
+
+	actor.onClientFrame(context.Background(), wsconn.TextMessage, []byte(`{"type":"response.cancel"}`))
+
+	select {
+	case event := <-actor.events:
+		t.Fatalf("expected client frame after actor done to be discarded, got %#v", event)
+	default:
+	}
+}
+
+func TestResponsesWSOnClientFrameBackpressureRequestsCloseAndClosesManagedConn(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	client, server := wstest.Pair(t)
+	defer server.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort})
+
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetClientConn(client)
+	for i := 0; i < cap(actor.events); i++ {
+		actor.events <- ResponsesWSEventTimeout{Reason: "preloaded"}
+	}
+
+	actor.onClientFrame(context.Background(), wsconn.TextMessage, []byte(`{"type":"response.cancel"}`))
+
+	var closeIntentSeen bool
+	for i := 0; i < cap(actor.events)+1; i++ {
+		event := <-actor.events
+		if closeIntent, ok := event.(ResponsesWSEventCloseIntent); ok && closeIntent.Reason == "client_frame_backpressure" {
+			closeIntentSeen = true
+			break
+		}
+	}
+	if !closeIntentSeen {
+		t.Fatal("expected client frame backpressure close intent")
+	}
+	select {
+	case <-client.Done():
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for managed client close")
+	}
+	info := client.CloseInfo()
+	if info.Kind != wsconn.CloseKindBackpressure || info.Code != wsconn.CloseTryAgainLater || info.Reason != "client_frame_backpressure" {
+		t.Fatalf("expected managed client backpressure close info, got %+v", info)
+	}
+}
+
 func TestResponsesWSSendResultReliableWhenMailboxFull(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -1736,7 +1711,6 @@ func TestResponsesWSSendResultReliableWhenMailboxFull(t *testing.T) {
 	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
 
 	actor := NewResponsesWSSessionActor(ctx)
-	bridge := NewResponsesWSIOBridge(nil, actor)
 	session := &responsesWSTestSession{}
 	for i := 0; i < cap(actor.events); i++ {
 		actor.events <- ResponsesWSEventTimeout{Reason: "preloaded"}
@@ -1744,11 +1718,11 @@ func TestResponsesWSSendResultReliableWhenMailboxFull(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		bridge.handleSendCommand(responsesWSSendCommand{
+		actor.handleSendCommand(responsesWSSendCommand{
 			AttemptID:         "attempt-reliable",
 			SelectedChannelID: 17,
 			Session:           session,
-			MessageType:       websocket.TextMessage,
+			MessageType:       responsesWSTextMessageType,
 			Payload:           []byte(`{"type":"response.cancel"}`),
 		})
 		close(done)
@@ -1894,60 +1868,6 @@ func TestResponsesWSActorStoresContextSnapshot(t *testing.T) {
 	}
 }
 
-func TestResponsesWSClientReadPumpProxyLocalReadErrorDelivery(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
-
-	actor := NewResponsesWSSessionActor(ctx)
-	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 3)}
-	bridge := NewResponsesWSIOBridge(conn, actor)
-	defer bridge.Close()
-
-	if conn.readLimit != config.RealtimeWebsocketReadLimit() {
-		t.Fatalf("expected bridge to install read limit before reads, got %d", conn.readLimit)
-	}
-
-	bridge.StartClientReadPump()
-	conn.reads <- responsesWSReadResult{err: responsesWSTestProxyLocalReadError{
-		payload:     []byte(`{"type":"error","error":{"code":"invalid_event"}}`),
-		recoverable: true,
-	}}
-	event := readResponsesWSEvent(t, actor)
-	localErr, ok := event.(ResponsesWSEventProxyLocalError)
-	if !ok {
-		t.Fatalf("expected proxy-local error event, got %T", event)
-	}
-	if !localErr.Recoverable || string(localErr.Payload) == "" {
-		t.Fatalf("expected recoverable proxy-local payload, got %#v", localErr)
-	}
-
-	conn.reads <- responsesWSReadResult{messageType: websocket.TextMessage, payload: []byte(`{"type":"response.cancel"}`)}
-	event = readResponsesWSEvent(t, actor)
-	frame, ok := event.(ResponsesWSEventClientFrame)
-	if !ok {
-		t.Fatalf("expected client frame after recoverable read error, got %T", event)
-	}
-	if frame.MessageType != websocket.TextMessage || string(frame.Payload) != `{"type":"response.cancel"}` {
-		t.Fatalf("unexpected forwarded client frame: %#v", frame)
-	}
-
-	conn.reads <- responsesWSReadResult{err: responsesWSTestProxyLocalReadError{
-		payload:     []byte(`{"type":"error","error":{"code":"fatal_event"}}`),
-		recoverable: false,
-	}}
-	event = readResponsesWSEvent(t, actor)
-	localErr, ok = event.(ResponsesWSEventProxyLocalError)
-	if !ok {
-		t.Fatalf("expected final proxy-local error event, got %T", event)
-	}
-	if localErr.Recoverable {
-		t.Fatalf("expected non-recoverable proxy-local error")
-	}
-}
-
 func TestResponsesWSNoTurnProviderEventFailsClosedAndAbortsSession(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -1965,7 +1885,7 @@ func TestResponsesWSNoTurnProviderEventFailsClosedAndAbortsSession(t *testing.T)
 		UpstreamSessionGeneration: upstreamSessionGeneration,
 		ChannelID:                 17,
 		Kind:                      ProviderDownstreamFrame,
-		MessageType:               websocket.TextMessage,
+		MessageType:               responsesWSTextMessageType,
 		Payload:                   []byte(`{"type":"response.completed","response":{"id":"resp_no_turn"}}`),
 		Origin:                    runtimesession.RealtimePayloadOriginProvider,
 	})
@@ -2000,7 +1920,7 @@ func TestResponsesWSProviderCloseAfterTerminalIsForwarded(t *testing.T) {
 		UpstreamSessionGeneration: upstreamSessionGeneration,
 		ChannelID:                 17,
 		Kind:                      ProviderDownstreamFrame,
-		MessageType:               websocket.CloseMessage,
+		MessageType:               responsesWSCloseMessageType,
 		Payload:                   []byte("bye"),
 		Origin:                    runtimesession.RealtimePayloadOriginProvider,
 	})
@@ -2013,6 +1933,173 @@ func TestResponsesWSProviderCloseAfterTerminalIsForwarded(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&conn.controlCount); got != 1 {
 		t.Fatalf("expected provider close frame to be forwarded once, got %d", got)
+	}
+}
+
+func TestResponsesWSProviderClosedFinalizesActiveAttemptAndForwardsSanitizedCode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := setupResponsesWSQuotaFixture(t, 1000)
+	attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	bridge := NewResponsesWSIOBridge(conn, actor)
+	actor.SetBridge(bridge)
+	session := &responsesWSTestSession{}
+	generation := actor.AttachUpstreamSession(session, 17)
+	lease := &responsesWSTestLease{}
+	actor.activeLease = lease
+	actor.activeAttempt = attempt
+	actor.activeChannelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.handleProviderClosed(ResponsesWSEventProviderClosed{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Code:                      4408,
+		Reason:                    "quota exhausted",
+		Err:                       errors.New("provider close"),
+		ReceivedAt:                time.Now(),
+	})
+
+	if !actor.closed.Load() {
+		t.Fatal("expected provider close to close actor")
+	}
+	if actor.activeAttempt != nil || actor.activeChannelID != 0 || actor.state != responsesWSStateClosed {
+		t.Fatalf("expected provider close to clear active turn, active=%v channel=%d state=%v", actor.activeAttempt != nil, actor.activeChannelID, actor.state)
+	}
+	if !attempt.QuotaFinalized || attempt.RolledBack {
+		t.Fatalf("expected provider close to finalize quota without rollback, finalized=%v rolled=%v", attempt.QuotaFinalized, attempt.RolledBack)
+	}
+	if got := atomic.LoadInt32(&lease.releases); got != 1 {
+		t.Fatalf("expected provider close to release active lease once, got %d", got)
+	}
+	if got := atomic.LoadInt32(&conn.controlCount); got != 1 {
+		t.Fatalf("expected one downstream close frame, got %d", got)
+	}
+	payload, _ := conn.lastControl.Load().(string)
+	if len(payload) < 2 {
+		t.Fatalf("expected downstream close payload, got %q", payload)
+	}
+	if code := int(binary.BigEndian.Uint16([]byte(payload)[:2])); code != 4408 {
+		t.Fatalf("expected provider close code 4408 to be forwarded, got %d", code)
+	}
+	if reason := payload[2:]; reason != "quota exhausted" {
+		t.Fatalf("expected provider close reason to be forwarded, got %q", reason)
+	}
+	if session.abortReason != "provider_closed" {
+		t.Fatalf("expected provider close to abort upstream session during actor close, got %q", session.abortReason)
+	}
+}
+
+func TestResponsesWSProviderClosedUsesManagedClientCloseWhenAvailable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := setupResponsesWSQuotaFixture(t, 1000)
+	attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+
+	client, server := wstest.Pair(t)
+	defer client.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort})
+	defer server.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort})
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	bridge := NewResponsesWSIOBridge(conn, actor)
+	actor.SetBridge(bridge)
+	actor.SetClientConn(server)
+	session := &responsesWSTestSession{}
+	generation := actor.AttachUpstreamSession(session, 17)
+	lease := &responsesWSTestLease{}
+	actor.activeLease = lease
+	actor.activeAttempt = attempt
+	actor.activeChannelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.handleProviderClosed(ResponsesWSEventProviderClosed{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Code:                      4408,
+		Reason:                    "quota exhausted",
+		Err:                       errors.New("provider close"),
+		ReceivedAt:                time.Now(),
+	})
+
+	_, _, err := client.ReadInitial(context.Background())
+	var closeErr *wsconn.CloseError
+	if !errors.As(err, &closeErr) {
+		t.Fatalf("expected managed client to observe close error, got %T %v", err, err)
+	}
+	if closeErr.Code != 4408 || closeErr.Reason != "quota exhausted" {
+		t.Fatalf("expected managed client close 4408 quota exhausted, got %+v", closeErr)
+	}
+	if got := atomic.LoadInt32(&conn.controlCount); got != 0 {
+		t.Fatalf("expected managed close path not to write bridge close frame, got %d", got)
+	}
+	if got := atomic.LoadInt32(&lease.releases); got != 1 {
+		t.Fatalf("expected provider close to release active lease once, got %d", got)
+	}
+	if !attempt.QuotaFinalized || attempt.RolledBack {
+		t.Fatalf("expected provider close to finalize quota without rollback, finalized=%v rolled=%v", attempt.QuotaFinalized, attempt.RolledBack)
+	}
+	if session.abortReason != "provider_closed" {
+		t.Fatalf("expected provider close to abort upstream session during actor close, got %q", session.abortReason)
+	}
+}
+
+func TestResponsesWSProviderClosedDuringPendingAttemptIsBuffered(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	bridge := NewResponsesWSIOBridge(conn, actor)
+	actor.SetBridge(bridge)
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	actor.pendingAttempt = &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-provider-close-pending",
+		SelectedChannelID: 17,
+		Usage:             &types.Usage{},
+	}
+	actor.state = responsesWSStatePendingSend
+
+	actor.handleProviderClosed(ResponsesWSEventProviderClosed{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Code:                      4408,
+		Reason:                    "quota exhausted",
+		ReceivedAt:                time.Now(),
+	})
+
+	if actor.closed.Load() {
+		t.Fatal("expected pending provider close to be buffered without closing actor")
+	}
+	if got := atomic.LoadInt32(&conn.controlCount); got != 0 {
+		t.Fatalf("expected no downstream close while provider close is pending, got %d", got)
+	}
+	if !actor.hasPendingProviderEvidence() || len(actor.pendingProviderEvents) != 1 {
+		t.Fatalf("expected provider close to be buffered as pending evidence, evidence=%v events=%d", actor.hasPendingProviderEvidence(), len(actor.pendingProviderEvents))
+	}
+	buffered := actor.pendingProviderEvents[0]
+	if buffered.MessageType != responsesWSCloseMessageType || buffered.Origin != runtimesession.RealtimePayloadOriginProvider {
+		t.Fatalf("expected buffered provider close frame, got %+v", buffered)
+	}
+	if len(buffered.Payload) < 2 {
+		t.Fatalf("expected buffered close payload, got %q", buffered.Payload)
+	}
+	if code := int(binary.BigEndian.Uint16(buffered.Payload[:2])); code != 4408 {
+		t.Fatalf("expected buffered provider close code 4408, got %d", code)
+	}
+}
+
+func TestResponsesWSProviderClosedInvalidCodeIsSanitized(t *testing.T) {
+	payload := responsesWSProviderClosePayload(1006, "abnormal")
+	if len(payload) < 2 {
+		t.Fatalf("expected close payload, got %q", payload)
+	}
+	if code := int(binary.BigEndian.Uint16(payload[:2])); code != int(wsconn.CloseInternalServerErr) {
+		t.Fatalf("expected invalid provider code to sanitize to 1011, got %d", code)
 	}
 }
 
@@ -2041,7 +2128,7 @@ func TestResponsesWSAmbiguousSendWithBufferedProviderEventWaitsForTerminal(t *te
 		UpstreamSessionGeneration: upstreamSessionGeneration,
 		ChannelID:                 17,
 		Kind:                      ProviderDownstreamFrame,
-		MessageType:               websocket.TextMessage,
+		MessageType:               responsesWSTextMessageType,
 		Payload:                   []byte(`{"type":"response.completed","response":{"id":"resp_buffered"}}`),
 		Origin:                    runtimesession.RealtimePayloadOriginProvider,
 	})
@@ -2095,10 +2182,9 @@ func TestResponsesWSNotSentWithUsageOnlyProviderEvidenceFailsClosed(t *testing.T
 	actor.pendingAttempt = attempt
 	actor.state = responsesWSStatePendingSend
 
-	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+	actor.handleProviderUsageObserved(ResponsesWSEventProviderUsageObserved{
 		UpstreamSessionGeneration: upstreamSessionGeneration,
 		ChannelID:                 17,
-		Kind:                      ProviderDownstreamUsage,
 		Usage:                     &types.UsageEvent{InputTokens: 4, OutputTokens: 2, TotalTokens: 6},
 		Origin:                    runtimesession.RealtimePayloadOriginProvider,
 	})
@@ -2204,7 +2290,7 @@ func TestResponsesWSClientFrameParseErrorUsesJSONErrorMessage(t *testing.T) {
 	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
 
 	actor.handleClientFrame(ResponsesWSEventClientFrame{
-		MessageType: websocket.TextMessage,
+		MessageType: responsesWSTextMessageType,
 		Payload:     []byte(`{"type":`),
 	})
 
@@ -2377,7 +2463,7 @@ func TestResponsesWSBusyCreateBudgetClosesAbusiveClient(t *testing.T) {
 
 	for i := 0; i < responsesWSBusyRejectLimit+1; i++ {
 		actor.handleClientFrame(ResponsesWSEventClientFrame{
-			MessageType: websocket.TextMessage,
+			MessageType: responsesWSTextMessageType,
 			Payload:     []byte(`{"type":"response.create","model":"gpt-5","input":"hi"}`),
 		})
 	}
@@ -2409,7 +2495,7 @@ func TestResponsesWSPendingProviderBufferHasByteCap(t *testing.T) {
 		UpstreamSessionGeneration: generation,
 		ChannelID:                 17,
 		Kind:                      ProviderDownstreamFrame,
-		MessageType:               websocket.TextMessage,
+		MessageType:               responsesWSTextMessageType,
 		Payload:                   []byte(strings.Repeat("x", config.ResponsesWSPendingProviderEventsMaxBytes()+1)),
 		Origin:                    runtimesession.RealtimePayloadOriginProvider,
 	})
@@ -2465,7 +2551,7 @@ func TestResponsesWSTerminalSideEffectsSurviveClientWriteFailure(t *testing.T) {
 		UpstreamSessionGeneration: generation,
 		ChannelID:                 17,
 		Kind:                      ProviderDownstreamFrame,
-		MessageType:               websocket.TextMessage,
+		MessageType:               responsesWSTextMessageType,
 		Payload:                   []byte(`{"type":"response.completed","response":{"id":"resp_write_failed","status":"completed","usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}}`),
 		Origin:                    runtimesession.RealtimePayloadOriginProvider,
 	})
@@ -2500,7 +2586,7 @@ func TestResponsesWSFailedTerminalDoesNotCloseSessionForTurnScopedError(t *testi
 		UpstreamSessionGeneration: generation,
 		ChannelID:                 17,
 		Kind:                      ProviderDownstreamFrame,
-		MessageType:               websocket.TextMessage,
+		MessageType:               responsesWSTextMessageType,
 		Payload:                   []byte(`{"type":"response.failed","response":{"id":"resp_failed","status":"failed","error":{"type":"invalid_request_error","code":"bad_input","message":"bad input"}}}`),
 		Origin:                    runtimesession.RealtimePayloadOriginProvider,
 	})
@@ -2537,7 +2623,7 @@ func TestResponsesWSIncompleteTerminalWithoutErrorDoesNotCloseSession(t *testing
 		UpstreamSessionGeneration: generation,
 		ChannelID:                 17,
 		Kind:                      ProviderDownstreamFrame,
-		MessageType:               websocket.TextMessage,
+		MessageType:               responsesWSTextMessageType,
 		Payload:                   []byte(`{"type":"response.completed","response":{"id":"resp_incomplete","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}`),
 		Origin:                    runtimesession.RealtimePayloadOriginProvider,
 	})
@@ -2586,7 +2672,7 @@ func TestResponsesWSFailedTerminalProcessesProviderErrorWithoutClosingSession(t 
 		UpstreamSessionGeneration: generation,
 		ChannelID:                 17,
 		Kind:                      ProviderDownstreamFrame,
-		MessageType:               websocket.TextMessage,
+		MessageType:               responsesWSTextMessageType,
 		Payload:                   []byte(`{"type":"response.failed","response":{"id":"resp_limit","status":"failed","error":{"type":"usage_limit_reached","message":"monthly usage limit reached"}}}`),
 		Origin:                    runtimesession.RealtimePayloadOriginProvider,
 	})
@@ -2683,7 +2769,7 @@ func TestResponsesWSCloseReplaysBufferedTerminalForUsage(t *testing.T) {
 	actor.pendingProviderEvents = []ResponsesWSEventProviderDownstream{{
 		ChannelID:   17,
 		Kind:        ProviderDownstreamFrame,
-		MessageType: websocket.TextMessage,
+		MessageType: responsesWSTextMessageType,
 		Payload:     []byte(`{"type":"response.completed","response":{"id":"resp_close_buffered","status":"completed","usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}}}`),
 		Origin:      runtimesession.RealtimePayloadOriginProvider,
 	}}
@@ -2714,7 +2800,7 @@ func TestResponsesWSProviderRecvPumpEmitsClientPayloadErrorAfterProviderPayload(
 	quotaErr := types.NewErrorEvent("evt_quota", "system_error", "system_error", "user quota is not enough")
 	bridge.ArmProviderRecvPump("session-payload-error", 17, session)
 	session.responses <- responsesWSRecvResult{
-		messageType: websocket.TextMessage,
+		messageType: responsesWSTextMessageType,
 		payload:     []byte(`{"type":"response.output_text.delta","delta":"hi"}`),
 		origin:      runtimesession.RealtimePayloadOriginProvider,
 		err:         runtimesession.NewClientPayloadError(quotaErr, []byte(quotaErr.Error())),
@@ -2757,7 +2843,7 @@ func TestResponsesWSProviderRecvPumpDoesNotEmitTimeoutAfterProviderErrorPayload(
 	payload := []byte(`{"type":"error","error":{"type":"usage_limit_reached","message":"usage limit reached"}}`)
 	bridge.ArmProviderRecvPump("session-provider-error-payload", 17, session)
 	session.responses <- responsesWSRecvResult{
-		messageType: websocket.TextMessage,
+		messageType: responsesWSTextMessageType,
 		payload:     payload,
 		origin:      runtimesession.RealtimePayloadOriginProvider,
 		err:         errors.New("provider closed after error payload"),
@@ -2775,6 +2861,145 @@ func TestResponsesWSProviderRecvPumpDoesNotEmitTimeoutAfterProviderErrorPayload(
 	select {
 	case event := <-actor.events:
 		t.Fatalf("expected no duplicate proxy-local timeout/error event, got %#v", event)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestResponsesWSProviderRecvPumpEmitsProviderBusinessErrorForRecvEventErr(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	bridge := NewResponsesWSIOBridge(nil, actor)
+	defer bridge.Close()
+
+	businessErr := errors.New("provider parse failed")
+	session := &responsesWSRecvSequenceSession{responses: make(chan responsesWSRecvResult, 1)}
+	bridge.ArmProviderRecvPump("session-business-error", 17, session)
+	session.responses <- responsesWSRecvResult{err: businessErr}
+
+	event := readResponsesWSEvent(t, actor)
+	providerErr, ok := event.(ResponsesWSEventProviderBusinessError)
+	if !ok {
+		t.Fatalf("expected provider business error event, got %#v", event)
+	}
+	if providerErr.UpstreamSessionGeneration != "session-business-error" || providerErr.ChannelID != 17 || !errors.Is(providerErr.Err, businessErr) {
+		t.Fatalf("expected provider business error metadata and error to be preserved, got %+v", providerErr)
+	}
+}
+
+func TestResponsesWSProviderRecvPumpEmitsProviderRecvFailedForTopLevelRecvError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	bridge := NewResponsesWSIOBridge(nil, actor)
+	defer bridge.Close()
+
+	recvErr := errors.New("provider recv failed")
+	session := &responsesWSRecvSequenceSession{responses: make(chan responsesWSRecvResult, 1)}
+	bridge.ArmProviderRecvPump("session-recv-failed", 17, session)
+	session.responses <- responsesWSRecvResult{topErr: recvErr}
+
+	event := readResponsesWSEvent(t, actor)
+	recvFailed, ok := event.(ResponsesWSEventProviderRecvFailed)
+	if !ok {
+		t.Fatalf("expected provider recv failed event, got %#v", event)
+	}
+	if recvFailed.UpstreamSessionGeneration != "session-recv-failed" || recvFailed.ChannelID != 17 || !errors.Is(recvFailed.Err, recvErr) {
+		t.Fatalf("expected provider recv failed metadata and error to be preserved, got %+v", recvFailed)
+	}
+
+	select {
+	case event := <-actor.events:
+		t.Fatalf("expected recv loop to exit after top-level error, got extra event %#v", event)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestResponsesWSProviderRecvPumpEmitsFrameBeforeProviderBusinessErrorPayload(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	bridge := NewResponsesWSIOBridge(nil, actor)
+	defer bridge.Close()
+
+	providerErr := types.NewErrorEvent("evt_provider", "system_error", "provider_error", "provider failed")
+	session := &responsesWSRecvSequenceSession{responses: make(chan responsesWSRecvResult, 1)}
+	bridge.ArmProviderRecvPump("session-frame-business-error", 17, session)
+	session.responses <- responsesWSRecvResult{
+		messageType: responsesWSTextMessageType,
+		payload:     []byte(`{"type":"response.output_text.delta","delta":"hi"}`),
+		origin:      runtimesession.RealtimePayloadOriginProvider,
+		err:         runtimesession.NewClientPayloadError(providerErr, []byte(providerErr.Error())),
+	}
+
+	first := readResponsesWSEvent(t, actor)
+	downstream, ok := first.(ResponsesWSEventProviderDownstream)
+	if !ok || downstream.Kind != ProviderDownstreamFrame || downstream.Err != nil {
+		t.Fatalf("expected clean provider frame first, got %#v", first)
+	}
+	if got := string(downstream.Payload); !strings.Contains(got, "response.output_text.delta") {
+		t.Fatalf("expected provider frame payload to be preserved, got %q", got)
+	}
+
+	second := readResponsesWSEvent(t, actor)
+	localErr, ok := second.(ResponsesWSEventProxyLocalError)
+	if !ok {
+		t.Fatalf("expected client payload error after provider frame, got %#v", second)
+	}
+	if !strings.Contains(string(localErr.Payload), "provider failed") {
+		t.Fatalf("expected provider error payload, got %q", localErr.Payload)
+	}
+}
+
+func TestResponsesWSProviderRecvPumpEmitsProviderClosedEvent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	bridge := NewResponsesWSIOBridge(nil, actor)
+	defer bridge.Close()
+
+	session := &responsesWSRecvSequenceSession{responses: make(chan responsesWSRecvResult, 1)}
+	bridge.ArmProviderRecvPump("session-provider-close", 17, session)
+	session.responses <- responsesWSRecvResult{
+		providerClose: &runtimesession.ProviderClose{
+			Code:   4408,
+			Reason: "quota exhausted",
+			Err:    runtimesession.ErrSessionClosed,
+		},
+		origin: runtimesession.RealtimePayloadOriginProvider,
+	}
+
+	event := readResponsesWSEvent(t, actor)
+	closed, ok := event.(ResponsesWSEventProviderClosed)
+	if !ok {
+		t.Fatalf("expected provider closed event, got %#v", event)
+	}
+	if closed.UpstreamSessionGeneration != "session-provider-close" || closed.ChannelID != 17 {
+		t.Fatalf("expected provider close routing metadata, got %+v", closed)
+	}
+	if closed.Code != 4408 || closed.Reason != "quota exhausted" || !errors.Is(closed.Err, runtimesession.ErrSessionClosed) {
+		t.Fatalf("expected provider close fields to be preserved, got %+v", closed)
+	}
+
+	select {
+	case event := <-actor.events:
+		t.Fatalf("expected provider close not to emit timeout or extra event, got %#v", event)
 	case <-time.After(100 * time.Millisecond):
 	}
 }
@@ -2797,7 +3022,7 @@ func TestResponsesWSProviderRecvPumpMarksActivityForProviderEvents(t *testing.T)
 
 	session.responses <- responsesWSRecvResult{usage: &types.UsageEvent{TotalTokens: 1}}
 	event := readResponsesWSEvent(t, actor)
-	if downstream, ok := event.(ResponsesWSEventProviderDownstream); !ok || downstream.Kind != ProviderDownstreamUsage {
+	if usage, ok := event.(ResponsesWSEventProviderUsageObserved); !ok || usage.Usage == nil || usage.Usage.TotalTokens != 1 {
 		t.Fatalf("expected provider usage event, got %#v", event)
 	}
 	if got := time.Unix(0, actor.lastActivityUnixNano.Load()); !got.After(old) {
@@ -2807,7 +3032,7 @@ func TestResponsesWSProviderRecvPumpMarksActivityForProviderEvents(t *testing.T)
 	old = time.Now().Add(-time.Hour)
 	actor.lastActivityUnixNano.Store(old.UnixNano())
 	session.responses <- responsesWSRecvResult{
-		messageType: websocket.TextMessage,
+		messageType: responsesWSTextMessageType,
 		payload:     []byte(`{"type":"response.output_text.delta","delta":"hi"}`),
 	}
 	event = readResponsesWSEvent(t, actor)
@@ -2816,6 +3041,439 @@ func TestResponsesWSProviderRecvPumpMarksActivityForProviderEvents(t *testing.T)
 	}
 	if got := time.Unix(0, actor.lastActivityUnixNano.Load()); !got.After(old) {
 		t.Fatalf("expected provider frame to refresh activity, got %s old %s", got, old)
+	}
+}
+
+func TestResponsesWSProviderRecvPumpPostsInputAudioTranscriptionUsageOnly(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	bridge := NewResponsesWSIOBridge(nil, actor)
+	defer bridge.Close()
+	session := &responsesWSRecvSequenceSession{responses: make(chan responsesWSRecvResult, 1)}
+
+	bridge.ArmProviderRecvPump("session-transcription-usage", 17, session)
+	session.responses <- responsesWSRecvResult{
+		usage: &types.UsageEvent{
+			InputTokens:     7,
+			TotalTokens:     7,
+			Source:          types.UsageSourceInputAudioTranscription,
+			BillingBasis:    types.UsageBillingBasisTokens,
+			ItemID:          "item_1",
+			ProviderEventID: "evt_transcription",
+		},
+		origin: runtimesession.RealtimePayloadOriginProvider,
+	}
+
+	event := readResponsesWSEvent(t, actor)
+	usageEvent, ok := event.(ResponsesWSEventProviderUsageObserved)
+	if !ok || usageEvent.Usage == nil {
+		t.Fatalf("expected ProviderUsageObserved, got %#v", event)
+	}
+	if usageEvent.Usage.Source != types.UsageSourceInputAudioTranscription ||
+		usageEvent.Usage.BillingBasis != types.UsageBillingBasisTokens ||
+		usageEvent.Usage.ItemID != "item_1" ||
+		usageEvent.Usage.TotalTokens != 7 {
+		t.Fatalf("expected transcription usage-only event to preserve attribution, got %+v", usageEvent.Usage)
+	}
+	select {
+	case extra := <-actor.events:
+		t.Fatalf("expected no downstream frame event for usage-only transcription, got %#v", extra)
+	default:
+	}
+}
+
+func TestResponsesWSProviderRecvPumpKeepsFrameAndUsageTogether(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	bridge := NewResponsesWSIOBridge(nil, actor)
+	defer bridge.Close()
+	session := &responsesWSRecvSequenceSession{responses: make(chan responsesWSRecvResult, 1)}
+
+	bridge.ArmProviderRecvPump("session-frame-usage", 17, session)
+	session.responses <- responsesWSRecvResult{
+		messageType: responsesWSTextMessageType,
+		payload:     []byte(`{"type":"response.output_text.delta","delta":"hi"}`),
+		usage:       &types.UsageEvent{InputTokens: 4, OutputTokens: 2, TotalTokens: 6},
+		origin:      runtimesession.RealtimePayloadOriginProvider,
+	}
+
+	event := readResponsesWSEvent(t, actor)
+	downstream, ok := event.(ResponsesWSEventProviderDownstream)
+	if !ok {
+		t.Fatalf("expected provider downstream event, got %#v", event)
+	}
+	if downstream.Kind != ProviderDownstreamFrame || downstream.Usage == nil || downstream.Usage.TotalTokens != 6 {
+		t.Fatalf("expected frame and usage in one event, got %+v", downstream)
+	}
+	select {
+	case event := <-actor.events:
+		t.Fatalf("expected no separate usage event after frame+usage, got %#v", event)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestResponsesWSSessionFrameMessageMappingIsTextBinaryOnly(t *testing.T) {
+	textFrame := responsesWSSessionFrameFromMessage(responsesWSTextMessageType, []byte("text"))
+	if textFrame.Kind() != runtimesession.FrameKindText || string(textFrame.Payload()) != "text" {
+		t.Fatalf("expected websocket text to map to session text frame, got kind=%v payload=%q", textFrame.Kind(), textFrame.Payload())
+	}
+	mt, payload := responsesWSMessageFromSessionFrame(textFrame)
+	if mt != responsesWSTextMessageType || string(payload) != "text" {
+		t.Fatalf("expected session text frame to map to websocket text, mt=%d payload=%q", mt, payload)
+	}
+
+	binaryFrame := responsesWSSessionFrameFromMessage(responsesWSBinaryMessageType, []byte{1, 2, 3})
+	if binaryFrame.Kind() != runtimesession.FrameKindBinary || string(binaryFrame.Payload()) != string([]byte{1, 2, 3}) {
+		t.Fatalf("expected websocket binary to map to session binary frame, got kind=%v payload=%v", binaryFrame.Kind(), binaryFrame.Payload())
+	}
+	mt, payload = responsesWSMessageFromSessionFrame(binaryFrame)
+	if mt != responsesWSBinaryMessageType || string(payload) != string([]byte{1, 2, 3}) {
+		t.Fatalf("expected session binary frame to map to websocket binary, mt=%d payload=%v", mt, payload)
+	}
+}
+
+func TestResponsesWSProviderRecvPumpKeepsTerminalStatusFramesWithUsage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cases := []struct {
+		name    string
+		payload []byte
+	}{
+		{
+			name:    "failed",
+			payload: []byte(`{"type":"response.done","response":{"id":"resp_failed","status":"failed","error":{"type":"invalid_request_error","code":"bad_input","message":"bad input"},"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}`),
+		},
+		{
+			name:    "incomplete",
+			payload: []byte(`{"type":"response.done","response":{"id":"resp_incomplete","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}`),
+		},
+		{
+			name:    "cancelled",
+			payload: []byte(`{"type":"response.done","response":{"id":"resp_cancelled","status":"cancelled","usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}`),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+			actor := NewResponsesWSSessionActor(ctx)
+			bridge := NewResponsesWSIOBridge(nil, actor)
+			defer bridge.Close()
+			session := &responsesWSRecvSequenceSession{responses: make(chan responsesWSRecvResult, 1)}
+
+			bridge.ArmProviderRecvPump("session-terminal-"+tc.name, 17, session)
+			session.responses <- responsesWSRecvResult{
+				messageType: responsesWSTextMessageType,
+				payload:     tc.payload,
+				usage:       &types.UsageEvent{InputTokens: 4, OutputTokens: 2, TotalTokens: 6},
+				origin:      runtimesession.RealtimePayloadOriginProvider,
+			}
+
+			event := readResponsesWSEvent(t, actor)
+			downstream, ok := event.(ResponsesWSEventProviderDownstream)
+			if !ok {
+				t.Fatalf("expected terminal status to arrive as provider downstream frame, got %#v", event)
+			}
+			if downstream.Kind != ProviderDownstreamFrame || downstream.Usage == nil || downstream.Usage.TotalTokens != 6 {
+				t.Fatalf("expected terminal status frame with usage, got %+v", downstream)
+			}
+			if got := string(downstream.Payload); !strings.Contains(got, `"status":"`+tc.name+`"`) {
+				t.Fatalf("expected terminal status payload to be preserved, got %q", got)
+			}
+
+			select {
+			case event := <-actor.events:
+				t.Fatalf("expected no provider business error after terminal status frame, got %#v", event)
+			case <-time.After(100 * time.Millisecond):
+			}
+		})
+	}
+}
+
+func TestResponsesWSProviderDownstreamFrameWithUsageMergesBeforeWrite(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-frame-usage",
+		SelectedChannelID: 17,
+		Usage:             &types.Usage{},
+	}
+	actor.activeAttempt = attempt
+	actor.activeChannelID = 17
+	actor.state = responsesWSStateInFlight
+
+	payload := []byte(`{"type":"response.output_text.delta","delta":"hi"}`)
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		MessageType:               responsesWSTextMessageType,
+		Payload:                   payload,
+		Usage:                     &types.UsageEvent{InputTokens: 4, OutputTokens: 2, TotalTokens: 6},
+		Origin:                    runtimesession.RealtimePayloadOriginProvider,
+	})
+
+	if got := atomic.LoadInt32(&conn.writeCount); got != 1 {
+		t.Fatalf("expected provider frame to be written once, got %d writes", got)
+	}
+	if got, _ := conn.lastWrite.Load().(string); got != string(payload) {
+		t.Fatalf("expected provider frame payload to be forwarded, got %q", got)
+	}
+	if attempt.Usage.PromptTokens != 4 || attempt.Usage.CompletionTokens != 2 || attempt.Usage.TotalTokens != 6 {
+		t.Fatalf("expected attached usage to merge into active attempt, got %+v", attempt.Usage)
+	}
+	if attempt.CompletedAt.IsZero() == false || attempt.QuotaFinalized || actor.activeAttempt != attempt {
+		t.Fatalf("expected non-terminal frame+usage not to complete/finalize/clear turn, completed=%s finalized=%v active=%v", attempt.CompletedAt, attempt.QuotaFinalized, actor.activeAttempt == attempt)
+	}
+}
+
+func TestResponsesWSProviderUsageObservedOnlyUpdatesSettlementState(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-usage-observed",
+		SelectedChannelID: 17,
+		Usage:             &types.Usage{},
+	}
+	actor.activeAttempt = attempt
+	actor.activeChannelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.handleProviderUsageObserved(ResponsesWSEventProviderUsageObserved{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Usage:                     &types.UsageEvent{InputTokens: 4, OutputTokens: 2, TotalTokens: 6},
+		Origin:                    runtimesession.RealtimePayloadOriginProvider,
+		ReceivedAt:                time.Now(),
+	})
+
+	if got := atomic.LoadInt32(&conn.writeCount); got != 0 {
+		t.Fatalf("expected usage-only event not to write downstream, got %d writes", got)
+	}
+	if got := atomic.LoadInt32(&conn.controlCount); got != 0 {
+		t.Fatalf("expected usage-only event not to write close control, got %d controls", got)
+	}
+	if !attempt.CompletedAt.IsZero() {
+		t.Fatalf("expected usage-only event not to mark turn completed, got %s", attempt.CompletedAt)
+	}
+	if attempt.QuotaFinalized {
+		t.Fatal("expected usage-only event not to finalize quota")
+	}
+	if actor.activeAttempt != attempt || actor.activeChannelID != 17 || actor.state != responsesWSStateInFlight {
+		t.Fatalf("expected usage-only event not to clear active turn, active=%v channel=%d state=%v", actor.activeAttempt == attempt, actor.activeChannelID, actor.state)
+	}
+	if attempt.Usage.PromptTokens != 4 || attempt.Usage.CompletionTokens != 2 || attempt.Usage.TotalTokens != 6 {
+		t.Fatalf("expected usage-only event to merge settlement usage, got %+v", attempt.Usage)
+	}
+}
+
+func TestResponsesWSProviderUsageObservedDropsUnpricedInputAudioTranscription(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	originalPricing := model.PricingInstance
+	model.PricingInstance = &model.Pricing{Prices: map[string]*model.Price{
+		"gpt-5": {
+			Model:  "gpt-5",
+			Type:   model.TokensPriceType,
+			Input:  1,
+			Output: 1,
+		},
+	}}
+	t.Cleanup(func() {
+		model.PricingInstance = originalPricing
+	})
+
+	var recordedSource string
+	var recordedModel string
+	originalRecorder := recordUsageObservedUnbilled
+	recordUsageObservedUnbilled = func(source, model string) {
+		recordedSource = source
+		recordedModel = model
+	}
+	t.Cleanup(func() {
+		recordUsageObservedUnbilled = originalRecorder
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	ctx.Set("group_ratio", 1.0)
+	ctx.Set("channel_id", 17)
+	ctx.Set("channel_type", config.ChannelTypeOpenAI)
+	ctx.Set("original_model", "gpt-5")
+	ctx.Set("new_model", "gpt-5")
+	ctx.Set("billing_original_model", true)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-transcription-unpriced",
+		SelectedChannelID: 17,
+		Quota:             relay_util.NewQuota(ctx, "gpt-5", 0),
+		Usage:             &types.Usage{},
+	}
+	actor.activeAttempt = attempt
+	actor.activeChannelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.handleProviderUsageObserved(ResponsesWSEventProviderUsageObserved{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Usage: &types.UsageEvent{
+			InputTokens:  4,
+			TotalTokens:  4,
+			Source:       types.UsageSourceInputAudioTranscription,
+			BillingBasis: types.UsageBillingBasisTokens,
+		},
+		Origin:     runtimesession.RealtimePayloadOriginProvider,
+		ReceivedAt: time.Now(),
+	})
+
+	if recordedSource != string(types.UsageSourceInputAudioTranscription) || recordedModel != "gpt-5" {
+		t.Fatalf("expected unbilled transcription metric labels, source=%q model=%q", recordedSource, recordedModel)
+	}
+	if got := atomic.LoadInt32(&conn.writeCount); got != 0 {
+		t.Fatalf("expected unpriced transcription usage not to write downstream, got %d writes", got)
+	}
+	if attempt.Usage.PromptTokens != 0 || attempt.Usage.CompletionTokens != 0 || attempt.Usage.TotalTokens != 0 {
+		t.Fatalf("expected unpriced transcription usage not to enter settlement, got %+v", attempt.Usage)
+	}
+	if !attempt.CompletedAt.IsZero() || attempt.QuotaFinalized || actor.activeAttempt != attempt || actor.state != responsesWSStateInFlight {
+		t.Fatalf("expected unpriced transcription usage not to mutate lifecycle, completed=%s finalized=%v active=%v state=%v", attempt.CompletedAt, attempt.QuotaFinalized, actor.activeAttempt == attempt, actor.state)
+	}
+}
+
+func TestResponsesWSProviderUsageObservedMergesPricedInputAudioTranscription(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	extraRatios := datatypes.NewJSONType(map[string]float64{
+		config.UsageExtraInputAudioTranscription: 1,
+	})
+	originalPricing := model.PricingInstance
+	model.PricingInstance = &model.Pricing{Prices: map[string]*model.Price{
+		"gpt-5": {
+			Model:       "gpt-5",
+			Type:        model.TokensPriceType,
+			Input:       1,
+			Output:      1,
+			ExtraRatios: &extraRatios,
+		},
+	}}
+	t.Cleanup(func() {
+		model.PricingInstance = originalPricing
+	})
+
+	metricCalls := 0
+	originalRecorder := recordUsageObservedUnbilled
+	recordUsageObservedUnbilled = func(source, model string) {
+		metricCalls++
+	}
+	t.Cleanup(func() {
+		recordUsageObservedUnbilled = originalRecorder
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	ctx.Set("group_ratio", 1.0)
+	ctx.Set("channel_id", 17)
+	ctx.Set("channel_type", config.ChannelTypeOpenAI)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-transcription-priced",
+		SelectedChannelID: 17,
+		Quota:             relay_util.NewQuota(ctx, "gpt-5", 0),
+		Usage:             &types.Usage{},
+	}
+	actor.activeAttempt = attempt
+	actor.activeChannelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.handleProviderUsageObserved(ResponsesWSEventProviderUsageObserved{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Usage: &types.UsageEvent{
+			InputTokens:  4,
+			TotalTokens:  4,
+			Source:       types.UsageSourceInputAudioTranscription,
+			BillingBasis: types.UsageBillingBasisTokens,
+		},
+		Origin:     runtimesession.RealtimePayloadOriginProvider,
+		ReceivedAt: time.Now(),
+	})
+
+	if metricCalls != 0 {
+		t.Fatalf("expected priced transcription usage not to record unbilled metric, got %d calls", metricCalls)
+	}
+	if attempt.Usage.PromptTokens != 4 || attempt.Usage.TotalTokens != 4 {
+		t.Fatalf("expected priced transcription usage to merge into settlement, got %+v", attempt.Usage)
+	}
+}
+
+func TestResponsesWSProviderUsageObservedWithoutTurnHasNoQuotaSemantics(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	actor.state = responsesWSStateIdle
+
+	actor.handleProviderUsageObserved(ResponsesWSEventProviderUsageObserved{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Usage:                     &types.UsageEvent{InputTokens: 4, OutputTokens: 2, TotalTokens: 6},
+		Origin:                    runtimesession.RealtimePayloadOriginProvider,
+		ReceivedAt:                time.Now(),
+	})
+
+	if actor.pendingAttempt != nil || actor.activeAttempt != nil || actor.pendingProviderEvidenceSeen || len(actor.pendingProviderEvents) != 0 {
+		t.Fatalf("expected orphan usage not to create turn quota state, pending=%v active=%v evidence=%v events=%d", actor.pendingAttempt != nil, actor.activeAttempt != nil, actor.pendingProviderEvidenceSeen, len(actor.pendingProviderEvents))
+	}
+	if got := atomic.LoadInt32(&conn.writeCount); got != 0 {
+		t.Fatalf("expected orphan usage not to write downstream, got %d writes", got)
+	}
+	if actor.closed.Load() || actor.state != responsesWSStateIdle {
+		t.Fatalf("expected orphan usage not to close or mutate actor lifecycle, closed=%v state=%v", actor.closed.Load(), actor.state)
 	}
 }
 
@@ -2839,8 +3497,8 @@ func TestResponsesWSProviderRecvPumpDeletesArmedGenerationOnExit(t *testing.T) {
 
 	session.responses <- responsesWSRecvResult{err: runtimesession.ErrSessionClosed}
 	event := readResponsesWSEvent(t, actor)
-	if timeout, ok := event.(ResponsesWSEventTimeout); !ok || timeout.UpstreamSessionGeneration != generation {
-		t.Fatalf("expected provider close timeout event, got %#v", event)
+	if providerErr, ok := event.(ResponsesWSEventProviderBusinessError); !ok || providerErr.UpstreamSessionGeneration != generation {
+		t.Fatalf("expected provider business error event, got %#v", event)
 	}
 
 	deadline := time.After(time.Second)
@@ -3298,7 +3956,7 @@ func TestResponsesWSActorCancelledTerminalFinalizesAndClearsActiveTurn(t *testin
 
 	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
 		Kind:        ProviderDownstreamFrame,
-		MessageType: websocket.TextMessage,
+		MessageType: responsesWSTextMessageType,
 		Payload:     []byte(`{"type":"response.cancelled","response":{"id":"resp_cancel","status":"cancelled","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}`),
 		Origin:      runtimesession.RealtimePayloadOriginProvider,
 	})
@@ -3345,7 +4003,7 @@ func TestResponsesWSSettlementLogMarksStreamProtocolAndTiming(t *testing.T) {
 
 	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
 		Kind:        ProviderDownstreamFrame,
-		MessageType: websocket.TextMessage,
+		MessageType: responsesWSTextMessageType,
 		Payload:     []byte(`{"type":"response.completed","response":{"id":"resp_done","status":"completed","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}`),
 		Origin:      runtimesession.RealtimePayloadOriginProvider,
 		ReceivedAt:  completedAt,
@@ -3467,7 +4125,7 @@ func TestResponsesWSSameSessionTwoMessagesAccumulateQuota(t *testing.T) {
 		actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
 			ChannelID:   17,
 			Kind:        ProviderDownstreamFrame,
-			MessageType: websocket.TextMessage,
+			MessageType: responsesWSTextMessageType,
 			Payload: []byte(fmt.Sprintf(
 				`{"type":"response.completed","response":{"id":%q,"status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`,
 				responseID,
@@ -3551,7 +4209,7 @@ func TestResponsesWSMalformedProviderFramePreservesPreConsumedFloor(t *testing.T
 		UpstreamSessionGeneration: generation,
 		ChannelID:                 17,
 		Kind:                      ProviderDownstreamFrame,
-		MessageType:               websocket.TextMessage,
+		MessageType:               responsesWSTextMessageType,
 		Payload:                   []byte(`{"type":`),
 		Origin:                    runtimesession.RealtimePayloadOriginProvider,
 	})

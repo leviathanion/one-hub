@@ -11,7 +11,6 @@ import (
 	ratelimit "one-api/common/limit"
 	"one-api/common/logger"
 	"one-api/common/redis"
-	"one-api/common/requester"
 	"one-api/metrics"
 	"one-api/types"
 	"strconv"
@@ -45,15 +44,20 @@ type responsesWSStopper interface {
 }
 
 type responsesWSLease struct {
-	guard *requester.WSActiveCounterGuard
-	lost  <-chan struct{}
+	release func()
+	once    sync.Once
+	lost    <-chan struct{}
 }
 
 func (l *responsesWSLease) Release() {
 	if l == nil {
 		return
 	}
-	l.guard.Release()
+	l.once.Do(func() {
+		if l.release != nil {
+			l.release()
+		}
+	})
 }
 
 func (l *responsesWSLease) Lost() <-chan struct{} {
@@ -65,8 +69,8 @@ func (l *responsesWSLease) Lost() <-chan struct{} {
 
 func newResponsesWSLease(release func(), lost <-chan struct{}) *responsesWSLease {
 	return &responsesWSLease{
-		guard: requester.NewWSActiveCounterGuard(release),
-		lost:  lost,
+		release: release,
+		lost:    lost,
 	}
 }
 

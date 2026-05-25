@@ -542,7 +542,6 @@ func fetchChannelByModelWithSelection(c *gin.Context, modelName string, selectio
 		setChannelAffinitySelectedPreferred(c, channel != nil && selection.preferredChannelID > 0 && channel.Id == selection.preferredChannelID)
 		return channel, nil
 	})
-
 }
 
 func responseJsonClient(c *gin.Context, data interface{}) *types.OpenAIErrorWithStatusCode {
@@ -568,7 +567,6 @@ type StreamEndHandler func() string
 func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface[string], endHandler StreamEndHandler) (firstResponseTime time.Time, errWithOP *types.OpenAIErrorWithStatusCode) {
 	requester.SetEventStreamHeaders(c)
 	dataChan, errChan := stream.Recv()
-	var finalErr *types.OpenAIErrorWithStatusCode
 
 	defer stream.Close()
 	streamWriter := relay_util.NewBufferedStreamWriter(c.Writer, 0)
@@ -611,10 +609,9 @@ func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface
 					_, _ = streamWriter.WriteString(errMsg)
 				}
 
-				finalErr = common.StringErrorWrapper(err.Error(), "stream_error", 900)
 				logger.LogError(c.Request.Context(), "Stream err:"+err.Error())
 			} else {
-				if finalErr == nil && endHandler != nil {
+				if endHandler != nil {
 					streamData := endHandler()
 					if streamData != "" {
 						select {
@@ -753,19 +750,6 @@ func responseCustom(c *gin.Context, response *types.AudioResponseWrapper) *types
 	return nil
 }
 
-func responseCache(c *gin.Context, response string, isStream bool) {
-	if isStream {
-		requester.SetEventStreamHeaders(c)
-		c.Stream(func(w io.Writer) bool {
-			fmt.Fprint(w, response)
-			return false
-		})
-	} else {
-		c.Data(http.StatusOK, "application/json", []byte(response))
-	}
-
-}
-
 func shouldRetry(c *gin.Context, apiErr *types.OpenAIErrorWithStatusCode, channelType int) bool {
 	if apiErr == nil {
 		return false
@@ -862,12 +846,6 @@ func relayResponseWithOpenAIErr(c *gin.Context, err *types.OpenAIErrorWithStatus
 	surfaceErr := surface.FromOpenAIError(err)
 	surface.LogLocalError(c, surfaceErr)
 	surface.OpenAIContract().RenderJSONError(c, surfaceErr)
-}
-
-func relayRerankResponseWithErr(c *gin.Context, err *types.OpenAIErrorWithStatusCode) {
-	surfaceErr := surface.FromOpenAIError(err)
-	surface.LogLocalError(c, surfaceErr)
-	surface.RerankContract().RenderJSONError(c, surfaceErr)
 }
 
 // mergeCustomParamsForPreMapping applies custom parameter logic similar to OpenAI provider

@@ -61,5 +61,4 @@ func CheckChat(t *testing.T, response *types.ChatCompletionResponse, modelName s
 	assert.Equal(t, response.Usage.PromptTokens, usage.PromptTokens)
 	assert.Equal(t, response.Usage.CompletionTokens, usage.CompletionTokens)
 	assert.Equal(t, response.Usage.TotalTokens, usage.TotalTokens)
-
 }

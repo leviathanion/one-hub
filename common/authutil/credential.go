@@ -2,9 +2,8 @@ package authutil
 
 import (
 	"net/http"
+	"one-api/common/wsconn"
 	"strings"
-
-	"github.com/gorilla/websocket"
 )
 
 const openAIInsecureAPIKeyProtocolPrefix = "openai-insecure-api-key."
@@ -78,8 +77,8 @@ func AllowedOpenAIUpstreamWebsocketSubprotocols(req *http.Request) []string {
 	if req == nil {
 		return nil
 	}
-	allowed := make([]string, 0, len(websocket.Subprotocols(req)))
-	for _, protocol := range websocket.Subprotocols(req) {
+	allowed := make([]string, 0, len(wsconn.Subprotocols(req)))
+	for _, protocol := range wsconn.Subprotocols(req) {
 		protocol = strings.TrimSpace(protocol)
 		switch protocol {
 		case "realtime", "openai-beta.realtime-v1":
@@ -100,7 +99,7 @@ func extractRequestCredential(req *http.Request, headerKeys []string, includeOpe
 		}
 	}
 
-	if includeOpenAIWebsocket && websocket.IsWebSocketUpgrade(req) {
+	if includeOpenAIWebsocket && wsconn.IsUpgrade(req) {
 		return ExtractOpenAIWebsocketCredential(req)
 	}
 

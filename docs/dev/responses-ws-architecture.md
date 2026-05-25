@@ -37,7 +37,7 @@ ResponsesWS 入口要同时满足五个事实：
 ### 连接容量
 
 6. API RPM 不等于连接数。Upgrade 不消耗 RPM。
-7. pending first-frame slot 只保护"升级后迟迟不发首帧"的 socket，默认按 credential 限 1。pending lease 的 `Release` 必须幂等；获取成功后立即安装 `defer pendingLease.Release()`。
+7. pending first-frame slot 只保护"升级后迟迟不发首帧"的 socket，默认按 credential 限 96。pending lease 的 `Release` 必须幂等；获取成功后立即安装 `defer pendingLease.Release()`。
 8. active ResponsesWS connection/session lease 是独立容量限制，按 credential、group 和 global 三层可配置；它由 actor 在打开首个 upstream session 前获取并挂到 actor 生命周期。
 9. active lease 不得在第一帧成功发送后释放——连接可以 idle 30 分钟，established WS 必须由 active lease 持有到连接结束。
 
@@ -263,7 +263,7 @@ Terminal side effects 顺序是 actor contract：先 merge terminal usage 并 fi
 2. 若 channel 明确不支持 ResponsesWS：fresh 或非 strict preferred affinity skip 当前 channel；pinned 或 strict owner affinity 写 wrapped fallback frame。
 3. 用 `RealtimeOpenOptions{PreferredTransport: TransportModeResponsesWS, RequireWS: true}` 打开 upstream session，禁止 HTTP bridge fallback。
 4. actor 记录 `sessionChannelID`，只表示物理 session owner，不写共享 affinity。
-5. actor 冻结本连接的 upstream snapshot：channel、resolved base URL、key fingerprint、原始/上游/billing model、billing flag 与 pre-cost。后续结算、日志和 continuation miss 诊断使用 snapshot，不重新读取 live channel 配置推导本连接事实。
+5. actor 冻结本连接的 upstream snapshot：channel、resolved base URL、原始/上游/billing model、billing flag 与 pre-cost；不存储 `key_fingerprint`。后续结算、日志和 continuation miss 诊断使用 snapshot，不重新读取 live channel 配置推导本连接事实。
 6. `PrepareResponsesWSTurnAttempt(...)` 完成 prompt-token 估算、quota 对象创建和 passive sink 准备，不执行 quota/RPM 副作用。
 7. attempt 带 `openingID`，actor 调 `attempt.BeginCandidate(...)`，进入 `pending_prepare` 并分配 `AttemptID`。
 8. 用 `RawResponsesCreateFrame` rewrite mapped protocol model；失败走 `RollbackBeforeLocalWriteOK("rewrite_failed")`。

@@ -21,6 +21,7 @@ var (
 	requestBodyDecodedBytes  *prometheus.HistogramVec
 	responsesWSConnectLimit  *prometheus.CounterVec
 	responsesWSRedisFallback *prometheus.CounterVec
+	usageObservedUnbilled    *prometheus.CounterVec
 	requestBodyDecodeOnce    sync.Once
 )
 
@@ -97,6 +98,13 @@ func init() {
 			Help: "Total number of Responses WebSocket connection limiter fail-open fallbacks from Redis to in-process storage.",
 		},
 		[]string{"reason"},
+	)
+	usageObservedUnbilled = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "usage_observed_unbilled",
+			Help: "Total number of provider usage observations intentionally excluded from settlement because pricing is not configured.",
+		},
+		[]string{"source", "model"},
 	)
 }
 
@@ -180,6 +188,12 @@ func RecordResponsesWSConnectionRateLimited(group, credentialKind string) {
 func RecordResponsesWSConnectionLimiterRedisFallback(reason string) {
 	SafelyRecordMetric(func() {
 		responsesWSRedisFallback.WithLabelValues(reason).Inc()
+	})
+}
+
+func RecordUsageObservedUnbilled(source, model string) {
+	SafelyRecordMetric(func() {
+		usageObservedUnbilled.WithLabelValues(source, model).Inc()
 	})
 }
 

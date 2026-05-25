@@ -339,15 +339,6 @@ func (f *responsesWSFakeRedis) valuePrefix(prefix string) int64 {
 	return total
 }
 
-func (f *responsesWSFakeRedis) expireNow(keys ...string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	for _, key := range keys {
-		delete(f.values, key)
-		delete(f.expires, key)
-	}
-}
-
 func (f *responsesWSFakeRedis) expirePrefix(prefix string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -9,8 +9,8 @@ import (
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/logger"
-	"one-api/common/requester"
 	"one-api/common/utils"
+	"one-api/common/wsconn"
 	"one-api/metrics"
 	"one-api/middleware"
 	"one-api/model"
@@ -22,29 +22,14 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/gorilla/websocket"
 	"github.com/spf13/viper"
 )
 
 type RelayModeChatRealtime struct {
 	relayBase
-	userConn *websocket.Conn
+	userConn *wsconn.ManagedConn
 	session  runtimesession.RealtimeSession
 	quota    *relay_util.Quota
-}
-
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return realtimeWebSocketOriginAllowed(r)
-	},
-	EnableCompression: false,
-}
-
-var responsesWSUpgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return realtimeWebSocketOriginAllowed(r)
-	},
-	EnableCompression: false,
 }
 
 func realtimeWebSocketOriginAllowed(r *http.Request) bool {
@@ -155,7 +140,7 @@ func allowedClientWebSocketSubprotocols(r *http.Request) []string {
 	if r == nil {
 		return nil
 	}
-	clientProtocols := websocket.Subprotocols(r)
+	clientProtocols := wsconn.Subprotocols(r)
 	allowed := make([]string, 0, len(clientProtocols))
 	for _, protocol := range clientProtocols {
 		protocol = strings.TrimSpace(protocol)
@@ -176,7 +161,7 @@ func requestHasOpenAIInsecureAPIKeySubprotocol(r *http.Request) bool {
 	if r == nil {
 		return false
 	}
-	for _, protocol := range websocket.Subprotocols(r) {
+	for _, protocol := range wsconn.Subprotocols(r) {
 		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(protocol)), "openai-insecure-api-key.") {
 			return true
 		}
@@ -195,13 +180,24 @@ func ChatRealtime(c *gin.Context) {
 		return
 	}
 
-	userConn, err := upgrader.Upgrade(c.Writer, c.Request, websocketUpgradeResponseHeader(c.Request))
+	userConn, err := wsconn.AcceptManaged(c.Writer, c.Request, wsconn.Config{
+		Label:                  "client-realtime",
+		PingInterval:           config.RealtimeWebsocketClientPingInterval(),
+		PongMissTimeout:        config.RealtimeWebsocketClientPongMissTimeout(),
+		InboundActivityTimeout: config.RealtimeWebsocketClientInboundActivityTimeout,
+		ReadLimit:              config.RealtimeWebsocketReadLimit(),
+		WriteTimeout:           config.RealtimeWebsocketWriteTimeout,
+	}, wsconn.AcceptOptions{
+		CheckOrigin:       realtimeWebSocketOriginAllowed,
+		ResponseHeader:    websocketUpgradeResponseHeader(c.Request),
+		Subprotocols:      allowedClientWebSocketSubprotocols(c.Request),
+		EnableCompression: false,
+	})
 	if err != nil {
 		logger.SysError("realtime websocket upgrade failed: " + err.Error())
 		common.AbortWithMessage(c, http.StatusInternalServerError, "upgrade_failed")
 		return
 	}
-
 	relay := &RelayModeChatRealtime{
 		relayBase: relayBase{
 			c: c,
@@ -221,36 +217,26 @@ func ChatRealtime(c *gin.Context) {
 		relay.session.SetTurnObserverFactory(relay_util.NewRealtimeTurnObserverFactory(relay.quota))
 	}
 
-	type realtimeProxy interface {
-		Start()
-		Wait()
-		Close()
-		UserClosed() <-chan struct{}
-		SupplierClosed() <-chan struct{}
+	bridge := newRealtimeRelayActor(relay.userConn, relay.session, time.Minute*2)
+	bridge.providerPayloadObserver = func(_ wsconn.MessageType, payload []byte) {
+		processProviderPayloadAPIError(relay.c, relay.provider.GetChannel(), payload, "chat_realtime_provider_frame")
 	}
 
-	proxyImpl := requester.NewRealtimeSessionProxy(relay.userConn, relay.session, time.Minute*2)
-	proxyImpl.SetProviderPayloadObserver(func(messageType int, payload []byte) {
-		_ = messageType
-		processProviderPayloadAPIError(relay.c, relay.provider.GetChannel(), payload, "chat_realtime_provider_frame")
-	})
-	var proxy realtimeProxy = proxyImpl
-
-	proxy.Start()
+	bridge.Start()
 	go func() {
 		var closedBy string
 		select {
-		case <-proxy.UserClosed():
+		case <-bridge.UserClosed():
 			closedBy = "user"
-		case <-proxy.SupplierClosed():
+		case <-bridge.SupplierClosed():
 			closedBy = "provider"
 		}
 
 		logger.LogInfo(relay.c.Request.Context(), fmt.Sprintf("连接由%s关闭", closedBy))
 	}()
 
-	proxy.Wait()
-	proxy.Close()
+	bridge.Wait()
+	bridge.Close()
 }
 
 func (r *RelayModeChatRealtime) abortWithMessage(message string) {
@@ -314,12 +300,10 @@ func (r *RelayModeChatRealtime) writeAbortPayload(payload []byte, code string) {
 		ctx = r.c.Request.Context()
 	}
 
-	if err := r.userConn.WriteMessage(websocket.TextMessage, payload); err != nil {
+	if err := r.userConn.WriteMessage(wsconn.TextMessage, payload); err != nil {
 		logger.LogError(ctx, fmt.Sprintf("write realtime abort payload failed (code=%s): %v", strings.TrimSpace(code), err))
 	}
-	if err := r.userConn.Close(); err != nil {
-		logger.LogError(ctx, fmt.Sprintf("close realtime websocket failed after abort (code=%s): %v", strings.TrimSpace(code), err))
-	}
+	r.userConn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindNormal, Code: wsconn.CloseNormalClosure, Reason: strings.TrimSpace(code)})
 }
 
 func openAIErrorCodeString(code any, fallback string) string {

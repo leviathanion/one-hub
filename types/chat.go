@@ -102,7 +102,6 @@ func (m ChatCompletionMessage) StringContent() string {
 			if subStr, ok := contentMap["text"].(string); ok && subStr != "" {
 				contentStr += subStr
 			}
-
 		}
 		return contentStr
 	}
@@ -147,7 +146,6 @@ func (m *ChatCompletionMessage) FuncToToolCalls() {
 
 // 将ToolCalls转换为FunctionCall
 func (m *ChatCompletionMessage) ToolToFuncCalls() {
-
 	if m.FunctionCall != nil {
 		return
 	}
@@ -497,7 +495,6 @@ type ChatCompletionStreamChoiceDelta struct {
 }
 
 func (m *ChatCompletionStreamChoiceDelta) ToolToFuncCalls() {
-
 	if m.FunctionCall != nil {
 		return
 	}
@@ -556,7 +553,6 @@ type MultimediaData struct {
 }
 
 func (c *ChatCompletionRequest) ToResponsesRequest() *OpenAIResponsesRequest {
-
 	res := &OpenAIResponsesRequest{
 		Model:           c.Model,
 		MaxOutputTokens: c.MaxCompletionTokens,
@@ -590,7 +586,6 @@ func (c *ChatCompletionRequest) ToResponsesRequest() *OpenAIResponsesRequest {
 			res.Text.Format.Description = c.ResponseFormat.JsonSchema.Description
 			res.Text.Format.Strict = c.ResponseFormat.JsonSchema.Strict
 		}
-
 	}
 
 	if c.Verbosity != "" {

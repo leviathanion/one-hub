@@ -22,7 +22,9 @@ ResponsesWS 是一个 **turn-based** WebSocket 入口：一条连接上可以发
 | `responses_ws.active_global` | `config.yaml` | 重启服务 |
 | `responses_ws.active_lease_redis_fail_open` | `config.yaml` | 重启服务 |
 | `responses_ws.first_frame_timeout_ms` | `config.yaml` | 重启服务 |
-| `responses_ws.client_pong_timeout_ms` | `config.yaml` | 重启服务 |
+| `responses_websocket_client_ping_interval_ms` | `config.yaml` | 重启服务 |
+| `responses_websocket_client_pong_miss_timeout_ms` | `config.yaml` | 重启服务 |
+| `responses_websocket_client_inbound_activity_timeout_ms` | `config.yaml` | 重启服务 |
 | `responses_ws.idle_timeout_ms` | `config.yaml` | 重启服务 |
 | `responses_ws.max_lifetime_ms` | `config.yaml` | 重启服务 |
 | `responses_ws.pending_provider_events_max_bytes` | `config.yaml` | 重启服务 |
@@ -52,9 +54,12 @@ responses_ws:
 
   # ---- 超时管理 ----
   first_frame_timeout_ms: 30000             # 首帧超时
-  client_pong_timeout_ms: 300000            # 客户端 pong/入站活性超时（5 分钟）
   idle_timeout_ms: 1800000                  # 空闲超时（30 分钟）
   max_lifetime_ms: 3600000                  # 最大存活时间（1 小时）
+
+responses_websocket_client_ping_interval_ms: 25000              # 客户端连接主动 Ping 周期
+responses_websocket_client_pong_miss_timeout_ms: 0              # 发出 ping 后未收到对应 pong 的超时；0 禁用
+responses_websocket_client_inbound_activity_timeout_ms: 300000  # 任意客户端入站活动超时（5 分钟）
 
   # ---- 缓冲区 ----
   pending_provider_events_max_bytes: 2097152 # 待确认上游事件缓冲区上限（2 MiB）
@@ -301,30 +306,33 @@ responses_ws:
 
 ---
 
-#### `responses_ws.client_pong_timeout_ms` 🏷️ config.yaml
+#### ResponsesWS 客户端 liveness 🏷️ config.yaml
 
 | 属性 | 值 |
 |------|-----|
 | 类型 | `int`（毫秒） |
-| 默认值 | `300000`（5 分钟） |
+| 默认值 | ping interval `25000`；pong miss `0`；inbound activity `300000` |
 | 必填 | 否 |
 
-**作用**：已建立 ResponsesWS 连接的客户端活性超时。服务端仍按 `realtime.websocket_ping_interval_ms` 发送 ping；客户端 data frame、ping、pong 都会刷新活性时间。超过此时间没有任何客户端入站活动时，连接以 `client_pong_timeout` 关闭。
+**作用**：已建立 ResponsesWS 连接的传输层 liveness 拆为两个独立语义。`responses_websocket_client_pong_miss_timeout_ms` 只表示发出 ping 后未收到对应 pong；`responses_websocket_client_inbound_activity_timeout_ms` 表示多久没有任何客户端入站 control frame 或完整 data frame。当前 ResponsesWS established 阶段使用 inbound activity watchdog；超过该时间没有任何客户端入站活动时，连接以 `client_pong_timeout` 关闭。
 
 **可配置值**：
 
-| 值 | 行为 | 影响 |
-|----|------|------|
-| `300000`（默认） | 5 分钟 | 适合跨境链路、移动网络和长 Codex turn |
-| `120000` | 2 分钟 | 更快回收断开的客户端 |
-| `0` | 禁用 client-pong watchdog | 仅建议本地诊断，断开客户端会依赖 idle/max lifetime 回收 |
+| 配置项 | 默认值 | 行为 |
+|--------|--------|------|
+| `responses_websocket_client_ping_interval_ms` | `25000` | 服务端主动 ping 周期；`<=0` 禁用主动 ping |
+| `responses_websocket_client_pong_miss_timeout_ms` | `0` | 对应 pong 缺失判死；当前 relay 迁移完成前保持禁用 |
+| `responses_websocket_client_inbound_activity_timeout_ms` | `300000` | 客户端入站活性超时；`0` 禁用 watchdog |
 
 **示例**：
 
 ```yaml
-responses_ws:
-  client_pong_timeout_ms: 300000
+responses_websocket_client_ping_interval_ms: 25000
+responses_websocket_client_pong_miss_timeout_ms: 0
+responses_websocket_client_inbound_activity_timeout_ms: 300000
 ```
+
+旧配置名 `responses_ws.client_pong_timeout_ms` 不再读取；升级时需要改为 `responses_websocket_client_inbound_activity_timeout_ms`。
 
 **对系统的影响**：
 - 过小：跨境链路或中间代理短暂抖动时，长 turn 可能被误关。
@@ -332,13 +340,13 @@ responses_ws:
 - 该超时不代表业务 idle；ping/pong 不会延长 `responses_ws.idle_timeout_ms`。
 
 **与 ping 间隔的关系**：
-- `client_pong_timeout_ms` 应至少为 `realtime.websocket_ping_interval_ms` 的 2–3 倍。默认值 300s 相对 25s ping 间隔有 12 倍余量，安全。
+- `responses_websocket_client_inbound_activity_timeout_ms` 应至少为 `responses_websocket_client_ping_interval_ms` 的 2–3 倍。默认值 300s 相对 25s ping 间隔有 12 倍余量，安全。
 - 若调小至与 ping 间隔相近（如 30s），单个丢包或网络抖动就可能触发误关。
 
 **排障信号**：
 - 超时关闭码：`1000`（正常关闭），关闭原因字符串：`"client_pong_timeout"`
 - 日志：搜索 `"client_pong_timeout"` 可定位所有因客户端活性超时关闭的连接
-- 若用户频繁报告断连：先排查客户端是否正确回复 pong；若非客户端问题，适当调大 `client_pong_timeout_ms`
+- 若用户频繁报告断连：先排查客户端是否正确回复 pong；若非客户端问题，适当调大 `responses_websocket_client_inbound_activity_timeout_ms`
 
 ---
 
@@ -619,8 +627,8 @@ Codex 渠道作为 ResponsesWS 上游时的 `channel.Other` 配置，详见 [Cod
 | 容量控制 | 无专用容量限制 | 三级 active lease + pending slot |
 | 写超时 | `realtime.websocket_write_timeout_ms` | 同（复用同一 writer primitive） |
 | 读上限 | `realtime.websocket_read_limit` | 同（复用同一 read limit primitive） |
-| Ping 间隔 | `realtime.websocket_ping_interval_ms` | 同 |
-| Pong 超时 | 无（依赖 socket read deadline） | `responses_ws.client_pong_timeout_ms` |
+| Ping 间隔 | `realtime.websocket_ping_interval_ms` | `responses_websocket_client_ping_interval_ms` |
+| Pong 超时 | 无（依赖 socket read deadline） | `responses_websocket_client_pong_miss_timeout_ms` |
 
 ## 相关文档
 

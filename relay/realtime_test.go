@@ -5,11 +5,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"one-api/common/config"
 	"one-api/common/logger"
 	"one-api/common/requester"
+	"one-api/common/wsconn"
+	"one-api/common/wsconn/wstest"
 	"one-api/model"
 	providersBase "one-api/providers/base"
 	"one-api/providers/codex"
@@ -18,7 +22,6 @@ import (
 	"one-api/types"
 
 	"github.com/gin-gonic/gin"
-	"github.com/gorilla/websocket"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 	"gorm.io/driver/sqlite"
@@ -31,14 +34,62 @@ func init() {
 	logger.Logger = zap.NewNop()
 }
 
-func (relayTestRealtimeSession) SendClient(context.Context, int, []byte) error { return nil }
-func (relayTestRealtimeSession) Recv(context.Context) (int, []byte, *types.UsageEvent, runtimesession.RealtimePayloadOrigin, error) {
-	return 0, nil, nil, runtimesession.RealtimePayloadOriginProxyLocal, nil
+func (relayTestRealtimeSession) SendClient(context.Context, runtimesession.Frame) error { return nil }
+func (relayTestRealtimeSession) Recv(context.Context) (runtimesession.RecvEvent, error) {
+	return runtimesession.RecvEvent{}, nil
 }
 func (relayTestRealtimeSession) Detach(string) {}
 func (relayTestRealtimeSession) Abort(string)  {}
 func (relayTestRealtimeSession) SetTurnObserverFactory(runtimesession.TurnObserverFactory) {
 }
+
+type relayActorTestSession struct {
+	sendCh chan runtimesession.Frame
+	recvCh chan runtimesession.RecvEvent
+
+	mu            sync.Mutex
+	detachReasons []string
+	abortReasons  []string
+}
+
+func newRelayActorTestSession() *relayActorTestSession {
+	return &relayActorTestSession{
+		sendCh: make(chan runtimesession.Frame, 8),
+		recvCh: make(chan runtimesession.RecvEvent, 8),
+	}
+}
+
+func (s *relayActorTestSession) SendClient(ctx context.Context, frame runtimesession.Frame) error {
+	select {
+	case s.sendCh <- frame:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *relayActorTestSession) Recv(ctx context.Context) (runtimesession.RecvEvent, error) {
+	select {
+	case event := <-s.recvCh:
+		return event, nil
+	case <-ctx.Done():
+		return runtimesession.RecvEvent{}, ctx.Err()
+	}
+}
+
+func (s *relayActorTestSession) Detach(reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.detachReasons = append(s.detachReasons, reason)
+}
+
+func (s *relayActorTestSession) Abort(reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.abortReasons = append(s.abortReasons, reason)
+}
+
+func (s *relayActorTestSession) SetTurnObserverFactory(runtimesession.TurnObserverFactory) {}
 
 type relayTestBaseProvider struct {
 	channel *model.Channel
@@ -79,43 +130,66 @@ func (p *relayTestRealtimeProvider) OpenRealtimeSessionWithOptions(modelName str
 	return relayTestRealtimeSession{}, nil
 }
 
-func newRelayWebsocketPair(t *testing.T) (*websocket.Conn, *websocket.Conn) {
+type relayTestClientFrame struct {
+	messageType wsconn.MessageType
+	payload     []byte
+}
+
+type relayTestManagedClient struct {
+	conn   *wsconn.ManagedConn
+	frames chan relayTestClientFrame
+	closed chan wsconn.CloseInfo
+}
+
+func newRelayWebsocketPair(t *testing.T) (*wsconn.ManagedConn, *relayTestManagedClient) {
 	t.Helper()
 
-	serverConnCh := make(chan *websocket.Conn, 1)
-	serverErrCh := make(chan error, 1)
-	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			serverErrCh <- err
-			return
-		}
-		serverConnCh <- conn
-	}))
-	t.Cleanup(func() {
-		testServer.Close()
-	})
-
-	wsURL := "ws" + strings.TrimPrefix(testServer.URL, "http")
-	clientConn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		t.Fatalf("failed to dial websocket test server: %v", err)
+	clientConn, serverConn := wstest.Pair(t)
+	client := &relayTestManagedClient{
+		conn:   clientConn,
+		frames: make(chan relayTestClientFrame, 8),
+		closed: make(chan wsconn.CloseInfo, 1),
 	}
+	go wsconn.Pump{
+		Conn: clientConn,
+		Handle: func(_ context.Context, messageType wsconn.MessageType, payload []byte) {
+			client.frames <- relayTestClientFrame{messageType: messageType, payload: append([]byte(nil), payload...)}
+		},
+		OnClose: func(info wsconn.CloseInfo) {
+			client.closed <- info
+		},
+	}.Run(context.Background())
 	t.Cleanup(func() {
-		_ = clientConn.Close()
+		clientConn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_done"})
+		serverConn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_done"})
 	})
+	return serverConn, client
+}
 
+func (c *relayTestManagedClient) readFrame(t *testing.T) relayTestClientFrame {
+	t.Helper()
 	select {
-	case err := <-serverErrCh:
-		t.Fatalf("failed to upgrade websocket on test server: %v", err)
-	case serverConn := <-serverConnCh:
-		t.Cleanup(func() {
-			_ = serverConn.Close()
-		})
-		return serverConn, clientConn
+	case frame := <-c.frames:
+		return frame
+	case info := <-c.closed:
+		t.Fatalf("expected downstream frame before close, got close %+v", info)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for downstream frame")
 	}
+	return relayTestClientFrame{}
+}
 
-	return nil, nil
+func (c *relayTestManagedClient) readClose(t *testing.T) wsconn.CloseInfo {
+	t.Helper()
+	select {
+	case info := <-c.closed:
+		return info
+	case frame := <-c.frames:
+		t.Fatalf("expected downstream close before frame, got frame %+v", frame)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for downstream close")
+	}
+	return wsconn.CloseInfo{}
 }
 
 func TestRealtimeClientSessionIDFromRequestPrefersExplicitHeader(t *testing.T) {
@@ -600,7 +674,7 @@ func TestRelayModeChatRealtimeGetProviderStrictAffinityUnavailableAborts(t *test
 
 	model.ChannelGroup = buildRealtimeTestChannelGroup(defaultChannelID)
 
-	serverConn, clientConn := newRelayWebsocketPair(t)
+	serverConn, client := newRelayWebsocketPair(t)
 	ctx := newRelayTestContext(map[string]string{
 		"X-Session-Id": sessionID,
 	})
@@ -624,15 +698,12 @@ func TestRelayModeChatRealtimeGetProviderStrictAffinityUnavailableAborts(t *test
 		t.Fatal("expected strict affinity miss to abort realtime provider selection")
 	}
 
-	messageType, payload, err := clientConn.ReadMessage()
-	if err != nil {
-		t.Fatalf("expected strict affinity abort payload, got %v", err)
+	frame := client.readFrame(t)
+	if frame.messageType != wsconn.TextMessage {
+		t.Fatalf("expected websocket abort payload, got type=%d", frame.messageType)
 	}
-	if messageType != websocket.TextMessage {
-		t.Fatalf("expected websocket abort payload, got type=%d", messageType)
-	}
-	if !strings.Contains(string(payload), "preferred realtime channel is unavailable") {
-		t.Fatalf("expected strict affinity abort message, got %s", payload)
+	if !strings.Contains(string(frame.payload), "preferred realtime channel is unavailable") {
+		t.Fatalf("expected strict affinity abort message, got %s", frame.payload)
 	}
 }
 
@@ -878,7 +949,7 @@ func TestRealtimeHelperFunctionsAndFallbacks(t *testing.T) {
 func TestRelayModeChatRealtimeAbortAndStateHelpers(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	serverConn, clientConn := newRelayWebsocketPair(t)
+	serverConn, client := newRelayWebsocketPair(t)
 	ctx := newRelayTestContext(nil)
 	relay := &RelayModeChatRealtime{
 		relayBase: relayBase{c: ctx},
@@ -893,19 +964,16 @@ func TestRelayModeChatRealtimeAbortAndStateHelpers(t *testing.T) {
 		},
 	})
 
-	messageType, payload, err := clientConn.ReadMessage()
-	if err != nil {
-		t.Fatalf("expected abort payload to reach websocket client, got %v", err)
+	frame := client.readFrame(t)
+	if frame.messageType != wsconn.TextMessage {
+		t.Fatalf("expected text abort payload, got type=%d", frame.messageType)
 	}
-	if messageType != websocket.TextMessage {
-		t.Fatalf("expected text abort payload, got type=%d", messageType)
-	}
-	if !strings.Contains(string(payload), `"code":"quota_exhausted"`) || !strings.Contains(string(payload), `"message":"quota exhausted"`) {
-		t.Fatalf("unexpected abort payload: %s", payload)
+	if !strings.Contains(string(frame.payload), `"code":"quota_exhausted"`) || !strings.Contains(string(frame.payload), `"message":"quota exhausted"`) {
+		t.Fatalf("unexpected abort payload: %s", frame.payload)
 	}
 
-	if _, _, err := clientConn.ReadMessage(); err == nil {
-		t.Fatal("expected websocket connection to close after abort payload")
+	if info := client.readClose(t); info.Kind != wsconn.CloseKindPeerClose || info.Code != wsconn.CloseNormalClosure || info.Reason != "quota_exhausted" {
+		t.Fatalf("expected websocket connection to close after abort payload, got %+v", info)
 	}
 
 	var nilRelay *RelayModeChatRealtime
@@ -969,6 +1037,114 @@ func TestFetchPreferredRealtimeChannelValidation(t *testing.T) {
 	model.ChannelGroup = buildRealtimeTestChannelGroup(11)
 	if _, err := fetchPreferredRealtimeChannel(ctx, "gpt-5", 22); err == nil {
 		t.Fatal("expected unavailable preferred channel to return an error")
+	}
+}
+
+func TestRealtimeRelayActorClientFrameBackpressureClosesTryAgainLater(t *testing.T) {
+	actorConn, peerConn := wstest.Pair(t)
+	session := newRelayActorTestSession()
+	actor := newRealtimeRelayActor(actorConn, session, time.Second)
+	for i := 0; i < cap(actor.clientFrames); i++ {
+		actor.clientFrames <- realtimeRelayClientFrame{mt: wsconn.TextMessage, payload: []byte(`{"type":"noop"}`)}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		actor.clientPump()
+	}()
+
+	if err := peerConn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.cancel"}`)); err != nil {
+		t.Fatalf("expected peer write to reach actor pump, got %v", err)
+	}
+	select {
+	case <-actorConn.Done():
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for actor connection to close on backpressure")
+	}
+	info := actorConn.CloseInfo()
+	if info.Kind != wsconn.CloseKindBackpressure || info.Code != wsconn.CloseTryAgainLater || info.Reason != "client_frame_backpressure" {
+		t.Fatalf("expected backpressure close 1013, got %+v", info)
+	}
+	peerConn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_done"})
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for client pump to exit")
+	}
+}
+
+func TestRealtimeRelayActorProviderFrameWritesDownstream(t *testing.T) {
+	serverConn, client := newRelayWebsocketPair(t)
+	actor := newRealtimeRelayActor(serverConn, newRelayActorTestSession(), time.Second)
+
+	textFrame := runtimesession.NewTextFrame([]byte(`{"type":"response.text.delta","delta":"hi"}`))
+	if !actor.deliverEventFrame(runtimesession.RecvEvent{
+		Frame:  &textFrame,
+		Origin: runtimesession.RealtimePayloadOriginProvider,
+	}) {
+		t.Fatal("expected text provider frame to be delivered")
+	}
+	frame := client.readFrame(t)
+	if frame.messageType != wsconn.TextMessage || string(frame.payload) != string(textFrame.Payload()) {
+		t.Fatalf("unexpected downstream text frame mt=%d payload=%s", frame.messageType, frame.payload)
+	}
+
+	binaryFrame := runtimesession.NewBinaryFrame([]byte{1, 2, 3})
+	if !actor.deliverEventFrame(runtimesession.RecvEvent{
+		Frame:  &binaryFrame,
+		Origin: runtimesession.RealtimePayloadOriginProvider,
+	}) {
+		t.Fatal("expected binary provider frame to be delivered")
+	}
+	frame = client.readFrame(t)
+	if frame.messageType != wsconn.BinaryMessage || string(frame.payload) != string(binaryFrame.Payload()) {
+		t.Fatalf("unexpected downstream binary frame mt=%d payload=%v", frame.messageType, frame.payload)
+	}
+}
+
+func TestRealtimeRelayActorProviderClosePreservesPrivateWireCode(t *testing.T) {
+	serverConn, client := newRelayWebsocketPair(t)
+	actor := newRealtimeRelayActor(serverConn, newRelayActorTestSession(), time.Second)
+
+	exit := actor.providerCloseExit(&runtimesession.ProviderClose{
+		Code:   4408,
+		Reason: "session_expired",
+	}, nil)
+	if !exit.hasDownstreamClose || exit.downstreamCloseCode != wsconn.CloseCode(4408) {
+		t.Fatalf("expected provider close 4408 to sanitize without replacement, got %+v", exit)
+	}
+	actor.closeDownstream(exit.downstreamCloseCode, exit.downstreamCloseReason)
+
+	if info := client.readClose(t); info.Code != wsconn.CloseCode(4408) || info.Reason != "session_expired" {
+		t.Fatalf("expected downstream close 4408 session_expired, got %+v", info)
+	}
+}
+
+func TestRealtimeRelayActorProviderCloseClosesDownstreamAtRecvPoint(t *testing.T) {
+	serverConn, client := newRelayWebsocketPair(t)
+	session := newRelayActorTestSession()
+	actor := newRealtimeRelayActor(serverConn, session, time.Second)
+	actor.workers.Add(1)
+	go actor.runWorker(actor.sessionToClient)
+
+	session.recvCh <- runtimesession.RecvEvent{
+		ProviderClose: &runtimesession.ProviderClose{
+			Code:   4408,
+			Reason: "session_expired",
+			Err:    runtimesession.ErrSessionClosed,
+		},
+	}
+
+	if info := client.readClose(t); info.Code != wsconn.CloseCode(4408) || info.Reason != "session_expired" {
+		t.Fatalf("expected Recv ProviderClose to close downstream with 4408 session_expired, got %+v", info)
+	}
+
+	actor.cancel()
+	select {
+	case <-actor.supplierClosed:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for supplier worker to exit")
 	}
 }
 

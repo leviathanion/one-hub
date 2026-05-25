@@ -65,7 +65,6 @@ func (pc *ProviderConfig) SetAPIUri(customMapping map[string]interface{}) {
 		}
 
 		*relayModeMap[keyInt] = value
-
 	}
 }
 

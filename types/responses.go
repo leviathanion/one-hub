@@ -129,7 +129,6 @@ type ResponsesTextFormat struct {
 }
 
 func (r *OpenAIResponsesRequest) ToChatCompletionRequest() (*ChatCompletionRequest, error) {
-
 	chat := &ChatCompletionRequest{
 		Model:               r.Model,
 		MaxCompletionTokens: r.MaxOutputTokens,
@@ -189,7 +188,6 @@ func (r *OpenAIResponsesRequest) ToChatCompletionRequest() (*ChatCompletionReque
 					Strict:      tool.Strict,
 				},
 			})
-
 		}
 
 		if len(chatTools) > 0 {
@@ -485,7 +483,6 @@ func (c *ContentResponses) ToChatContent() (*ChatMessagePart, error) {
 	default:
 		return nil, nil
 	}
-
 }
 
 type RefusalResponses struct {
@@ -751,7 +748,6 @@ func (cc *OpenAIResponsesResponses) GetContent() string {
 }
 
 func (m ResponsesOutput) StringContent() string {
-
 	if m.Type != "message" {
 		return ""
 	}
@@ -782,7 +778,6 @@ func (m ResponsesOutput) StringContent() string {
 			if subStr, ok := contentMap["text"].(string); ok && subStr != "" {
 				contentStr.WriteString(subStr)
 			}
-
 		}
 		return contentStr.String()
 	}
@@ -1192,7 +1187,6 @@ func (cc *ChatCompletionResponse) ToResponses(request *OpenAIResponsesRequest) *
 				})
 			}
 		}
-
 	}
 
 	res.Status = status
@@ -1246,7 +1240,6 @@ func (r *OpenAIResponsesResponses) ToChat() *ChatCompletionResponse {
 		if output.Status == ResponseStatusFailed || output.Status == ResponseStatusIncomplete {
 			choice.FinishReason = ConvertResponsesStatusToChat(output.Status)
 		}
-
 	}
 
 	resp.Choices = append(resp.Choices, choice)

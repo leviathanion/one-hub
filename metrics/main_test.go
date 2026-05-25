@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"one-api/common/config"
+
+	dto "github.com/prometheus/client_model/go"
 )
 
 func TestRequestBodyDecodedBytesBucketsCoverDefaultDecodeLimit(t *testing.T) {
@@ -40,4 +42,30 @@ func TestRequestBodyDecodedBytesBucketsFollowCurrentDecodeLimit(t *testing.T) {
 	if higherTopBucket <= lowerTopBucket {
 		t.Fatalf("expected raised decode limit to expand histogram coverage, got lower=%.0f higher=%.0f", lowerTopBucket, higherTopBucket)
 	}
+}
+
+func TestRecordUsageObservedUnbilledIncrementsCounter(t *testing.T) {
+	source := "input_audio_transcription"
+	model := "metrics-test-model"
+	counter := usageObservedUnbilled.WithLabelValues(source, model)
+	before := readCounterValue(t, counter)
+
+	RecordUsageObservedUnbilled(source, model)
+
+	after := readCounterValue(t, counter)
+	if after != before+1 {
+		t.Fatalf("expected usage_observed_unbilled to increment by 1, before=%v after=%v", before, after)
+	}
+}
+
+func readCounterValue(t *testing.T, metric interface{ Write(*dto.Metric) error }) float64 {
+	t.Helper()
+	var pb dto.Metric
+	if err := metric.Write(&pb); err != nil {
+		t.Fatalf("expected metric write to succeed: %v", err)
+	}
+	if pb.Counter == nil || pb.Counter.Value == nil {
+		t.Fatal("expected counter metric value")
+	}
+	return *pb.Counter.Value
 }

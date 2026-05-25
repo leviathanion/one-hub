@@ -118,7 +118,6 @@ func executeRelayAttempts(relay RelayBaseInterface) *types.OpenAIErrorWithStatus
 		}
 		if err := reparseRequestAfterProviderSelection(relay); err != nil {
 			apiErr = common.StringErrorWrapperLocal(err.Error(), "one_hub_error", http.StatusBadRequest)
-			done = true
 			break
 		}
 

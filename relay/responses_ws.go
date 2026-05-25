@@ -3,6 +3,7 @@ package relay
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,14 +13,10 @@ import (
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/logger"
-	"one-api/common/requester"
 	"one-api/common/responsesws"
-	"one-api/internal/billing"
-	"one-api/metrics"
+	"one-api/common/wsconn"
 	"one-api/middleware"
 	"one-api/model"
-	providersBase "one-api/providers/base"
-	"one-api/relay/relay_util"
 	runtimesession "one-api/runtime/session"
 	"one-api/types"
 	"runtime/debug"
@@ -31,456 +28,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/gorilla/websocket"
-	"github.com/spf13/viper"
 )
-
-type ResponsesWSSendOutcome int
-
-const (
-	SendOutcomeUnknown ResponsesWSSendOutcome = iota
-	SendOutcomeNotSent
-	SendOutcomeLocalWriteOK
-	SendOutcomeAmbiguous
-)
-
-type BillingEvidence int
-
-const (
-	BillingEvidenceNone BillingEvidence = iota
-	BillingEvidenceProviderUsageSeen
-	BillingEvidenceProviderAcceptedTurnEvidence
-)
-
-const (
-	responsesWSEventQueueSize               = 128
-	responsesWSSendQueueSize                = 64
-	responsesWSPendingProviderEventsMax     = 32
-	responsesWSBusyRejectLimit              = 16
-	responsesWSBusyRejectWindow             = 10 * time.Second
-	responsesWSPreviousResponseIDContextKey = "responses_ws_previous_response_id"
-)
-
-var errResponsesWSSendQueueFull = errors.New("responses websocket upstream send queue is full")
-
-type ResponsesWSEvent interface{ responsesWSEvent() }
-
-type ResponsesWSEventClientFrame struct {
-	MessageType int
-	Payload     []byte
-	ReceivedAt  time.Time
-}
-
-func (ResponsesWSEventClientFrame) responsesWSEvent() {}
-
-type ResponsesWSEventSendResult struct {
-	AttemptID         string
-	SelectedChannelID int
-	Outcome           ResponsesWSSendOutcome
-	Err               error
-}
-
-func (ResponsesWSEventSendResult) responsesWSEvent() {}
-
-type ResponsesWSProviderDownstreamKind int
-
-const (
-	ProviderDownstreamFrame ResponsesWSProviderDownstreamKind = iota
-	ProviderDownstreamUsage
-	ProviderDownstreamRecvError
-)
-
-type ResponsesWSEventProxyLocalError struct {
-	UpstreamSessionGeneration string
-	ChannelID                 int
-	Payload                   []byte
-	Recoverable               bool
-}
-
-func (ResponsesWSEventProxyLocalError) responsesWSEvent() {}
-
-type ResponsesWSEventProviderDownstream struct {
-	UpstreamSessionGeneration string
-	ChannelID                 int
-	Kind                      ResponsesWSProviderDownstreamKind
-	MessageType               int
-	Payload                   []byte
-	Usage                     *types.UsageEvent
-	Err                       error
-	Origin                    runtimesession.RealtimePayloadOrigin
-	ReceivedAt                time.Time
-}
-
-func (ResponsesWSEventProviderDownstream) responsesWSEvent() {}
-
-type ResponsesWSEventClientClosed struct{ Err error }
-
-func (ResponsesWSEventClientClosed) responsesWSEvent() {}
-
-type ResponsesWSEventFirstTurnSetup struct {
-	Frame        *responsesws.RawResponsesCreateFrame
-	PendingLease middleware.ResponsesWSLease
-	ReceivedAt   time.Time
-}
-
-func (ResponsesWSEventFirstTurnSetup) responsesWSEvent() {}
-
-type ResponsesWSEventFirstTurnOpenResult struct {
-	OpeningID  string
-	Snapshot   *ResponsesWSRequestSnapshot
-	OpenResult *responsesWSOpenResult
-	Err        *types.OpenAIErrorWithStatusCode
-	Adopted    chan bool
-}
-
-func (ResponsesWSEventFirstTurnOpenResult) responsesWSEvent() {}
-
-type ResponsesWSEventTimeout struct {
-	Reason                    string
-	UpstreamSessionGeneration string
-	ChannelID                 int
-}
-
-func (ResponsesWSEventTimeout) responsesWSEvent() {}
-
-type ResponsesWSEventCloseIntent struct {
-	Reason string
-}
-
-func (ResponsesWSEventCloseIntent) responsesWSEvent() {}
-
-type ResponsesWSTurnAdmission struct {
-	RPMAllowed bool
-}
-
-func NewResponsesWSTurnAdmission() *ResponsesWSTurnAdmission {
-	return &ResponsesWSTurnAdmission{}
-}
-
-func (a *ResponsesWSTurnAdmission) AllowRPMOnce(allow func() *types.OpenAIErrorWithStatusCode) *types.OpenAIErrorWithStatusCode {
-	if a == nil {
-		return common.StringErrorWrapperLocal("turn admission is required", "responses_ws_admission_missing", http.StatusInternalServerError)
-	}
-	if a.RPMAllowed {
-		return nil
-	}
-	if allow == nil {
-		return common.StringErrorWrapperLocal("request limiter is not configured", "rate_limiter_missing", http.StatusInternalServerError)
-	}
-	if err := allow(); err != nil {
-		return err
-	}
-	a.RPMAllowed = true
-	return nil
-}
-
-type ResponsesWSTurnAttemptInput struct {
-	Context           *gin.Context
-	Snapshot          *ResponsesWSRequestSnapshot
-	OpeningID         string
-	Admission         *ResponsesWSTurnAdmission
-	Candidate         *ResponsesTurnAffinity
-	SelectedChannelID int
-	Session           runtimesession.RealtimeSession
-	BillingModel      string
-	PromptModel       string
-	Request           *types.OpenAIResponsesRequest
-	StartedAt         time.Time
-}
-
-type responsesWSOpenResult struct {
-	Session       runtimesession.RealtimeSession
-	Provider      providersBase.ProviderInterface
-	ProviderModel string
-	BillingModel  string
-	Channel       *model.Channel
-	Candidate     *ResponsesTurnAffinity
-}
-
-type SelectedChannelSnapshot struct {
-	ChannelID            int
-	ChannelType          int
-	PreCost              int
-	ProviderModel        string
-	BillingModel         string
-	OriginalModel        string
-	BillingOriginalModel bool
-	Channel              *model.Channel
-}
-
-var openAndPrimeResponsesWSSessionForActor = openAndPrimeResponsesWSSessionWithContext
-
-type ResponsesWSTurnAttempt struct {
-	OpeningID              string
-	AttemptID              string
-	Admission              *ResponsesWSTurnAdmission
-	Candidate              *ResponsesTurnAffinity
-	SelectedChannelID      int
-	Session                runtimesession.RealtimeSession
-	Quota                  *relay_util.Quota
-	QuotaPreconsumed       bool
-	PreconsumeAttempted    bool
-	PreconsumeTruthApplied bool
-	PreconsumeCacheApplied bool
-	QuotaFinalized         bool
-	RolledBack             bool
-	RollbackErr            error
-	QuotaEventSinkAttached bool
-	CandidateBegun         bool
-	SendOutcome            ResponsesWSSendOutcome
-	Usage                  *types.Usage
-	BillingEvidence        BillingEvidence
-	StartedAt              time.Time
-	FirstResponseAt        time.Time
-	CompletedAt            time.Time
-	snapshot               *ResponsesWSRequestSnapshot
-	providerAPIErrorKeys   map[string]struct{}
-}
-
-func PrepareResponsesWSTurnAttempt(input ResponsesWSTurnAttemptInput) (*ResponsesWSTurnAttempt, *types.OpenAIErrorWithStatusCode) {
-	if input.Context == nil || input.Request == nil {
-		return nil, common.StringErrorWrapperLocal("responses websocket turn context is required", "invalid_request_error", http.StatusBadRequest)
-	}
-	promptModel := strings.TrimSpace(input.PromptModel)
-	if promptModel == "" {
-		promptModel = input.BillingModel
-	}
-	channelPreCost := 0
-	if channel, ok := input.Context.Get("responses_ws_selected_channel"); ok {
-		if typed, ok := channel.(*model.Channel); ok && typed != nil {
-			channelPreCost = typed.PreCost
-		}
-	}
-	promptTokens := common.CountTokenInputMessages(input.Request.Input, promptModel, channelPreCost)
-	// The local prompt estimate is only the quota pre-consume ledger. Final
-	// billing usage starts empty and is filled from provider usage/terminal events.
-	usage := &types.Usage{}
-	snapshot := input.Snapshot
-	if snapshot == nil {
-		snapshot = NewResponsesWSRequestSnapshot(input.Context)
-	}
-	startedAt := input.StartedAt
-	if startedAt.IsZero() {
-		startedAt = time.Now()
-	}
-	quota := relay_util.NewQuota(input.Context, input.BillingModel, promptTokens)
-	quota.SetLogProtocol(relay_util.LogProtocolResponsesWS)
-	return &ResponsesWSTurnAttempt{
-		OpeningID:         input.OpeningID,
-		Admission:         input.Admission,
-		Candidate:         input.Candidate,
-		SelectedChannelID: input.SelectedChannelID,
-		Session:           input.Session,
-		Quota:             quota,
-		Usage:             usage,
-		StartedAt:         startedAt,
-		snapshot:          snapshot.Clone(),
-	}, nil
-}
-
-func (a *ResponsesWSTurnAttempt) Context() *gin.Context {
-	if a == nil || a.snapshot == nil {
-		return nil
-	}
-	return a.snapshot.Context()
-}
-
-func (a *ResponsesWSTurnAttempt) BeginCandidate(actor *ResponsesWSSessionActor) error {
-	if a == nil || actor == nil {
-		return errors.New("responses websocket attempt and actor are required")
-	}
-	if a.CandidateBegun {
-		return nil
-	}
-	a.AttemptID = uuid.NewString()
-	a.CandidateBegun = true
-	actor.pendingAttempt = a
-	actor.pendingProviderEvents = nil
-	actor.pendingProviderBytes = 0
-	actor.pendingProviderEvidenceSeen = false
-	return nil
-}
-
-func (a *ResponsesWSTurnAttempt) PreConsumeQuota() *types.OpenAIErrorWithStatusCode {
-	if a == nil || a.Quota == nil {
-		return common.StringErrorWrapperLocal("quota transaction is required", "quota_transaction_missing", http.StatusInternalServerError)
-	}
-	err := a.Quota.PreQuotaConsumptionRollbackable()
-	a.PreconsumeAttempted = true
-	if a.Quota.HasPreConsumedSideEffect() {
-		a.QuotaPreconsumed = true
-		a.PreconsumeTruthApplied = a.Quota.PreconsumeTruthApplied
-		a.PreconsumeCacheApplied = a.Quota.PreconsumeCacheApplied
-	}
-	return err
-}
-
-func (a *ResponsesWSTurnAttempt) CommitLocalWriteOK() {
-	if a == nil {
-		return
-	}
-	a.SendOutcome = SendOutcomeLocalWriteOK
-}
-
-func (a *ResponsesWSTurnAttempt) CommitAmbiguousAdmission(reason string) {
-	if a == nil {
-		return
-	}
-	_ = reason
-	a.SendOutcome = SendOutcomeAmbiguous
-}
-
-func (a *ResponsesWSTurnAttempt) MarkProviderUsageSeen() {
-	if a == nil {
-		return
-	}
-	a.BillingEvidence = BillingEvidenceProviderUsageSeen
-}
-
-func (a *ResponsesWSTurnAttempt) MarkProviderAcceptedTurnEvidence() {
-	if a == nil || a.BillingEvidence == BillingEvidenceProviderUsageSeen {
-		return
-	}
-	a.BillingEvidence = BillingEvidenceProviderAcceptedTurnEvidence
-}
-
-func (a *ResponsesWSTurnAttempt) MarkFirstProviderResponse(now time.Time) {
-	if a == nil || !a.FirstResponseAt.IsZero() {
-		return
-	}
-	if now.IsZero() {
-		now = time.Now()
-	}
-	a.FirstResponseAt = now
-}
-
-func (a *ResponsesWSTurnAttempt) MarkCompleted(now time.Time) {
-	if a == nil || !a.CompletedAt.IsZero() {
-		return
-	}
-	if now.IsZero() {
-		now = time.Now()
-	}
-	a.CompletedAt = now
-}
-
-func (a *ResponsesWSTurnAttempt) SeedQuotaTiming(now time.Time) {
-	if a == nil || a.Quota == nil {
-		return
-	}
-	if now.IsZero() {
-		now = time.Now()
-	}
-	if a.CompletedAt.IsZero() {
-		a.MarkCompleted(now)
-	}
-	a.Quota.SeedTiming(a.StartedAt, a.FirstResponseAt, a.CompletedAt)
-}
-
-func (a *ResponsesWSTurnAttempt) RollbackBeforeLocalWriteOK(reason string) error {
-	if a == nil {
-		return nil
-	}
-	_ = reason
-	if a.QuotaPreconsumed && a.Quota != nil {
-		ctx := a.Context()
-		if err := a.Quota.UndoSynchronously(ctx); err != nil {
-			a.RollbackErr = err
-			logCtx := context.Background()
-			if ctx != nil && ctx.Request != nil {
-				logCtx = ctx.Request.Context()
-			}
-			logger.LogError(logCtx, "responses websocket quota rollback failed: "+err.Error())
-			return err
-		}
-	}
-	a.QuotaPreconsumed = false
-	a.PreconsumeTruthApplied = false
-	a.PreconsumeCacheApplied = false
-	a.RolledBack = true
-	a.RollbackErr = nil
-	return nil
-}
-
-func (a *ResponsesWSTurnAttempt) FinalizeQuota(c *gin.Context) {
-	if c == nil {
-		c = a.Context()
-	}
-	a.finalizeQuota(c, false)
-}
-
-func (a *ResponsesWSTurnAttempt) FinalizeQuotaPreservingPreConsumed(c *gin.Context) {
-	if c == nil {
-		c = a.Context()
-	}
-	a.finalizeQuota(c, true)
-}
-
-func (a *ResponsesWSTurnAttempt) finalizeQuota(c *gin.Context, preservePreConsumed bool) {
-	if a == nil || a.Quota == nil || a.QuotaFinalized || a.RolledBack {
-		return
-	}
-	hasUsage := responsesWSUsageHasBillableEvidence(a.Usage)
-	identity := a.settlementIdentity()
-	a.SeedQuotaTiming(time.Now())
-	if preservePreConsumed && !hasUsage {
-		// Trade-off: once a turn has reached a send/active state, absence of a
-		// terminal usage frame is not proof that the provider did no work. Keep
-		// the pre-consumed floor to avoid making ambiguous completed work free;
-		// explicit NotSent/pre-send paths still rollback before finalization.
-		if err := a.Quota.ConsumeAtLeastPreConsumedWithIdentity(c, a.Usage, true, billing.SettlementRequestKindRealtimeTurn, identity, identity != ""); err != nil {
-			logger.LogError(context.Background(), "responses websocket quota floor settlement failed: "+err.Error())
-		}
-	} else {
-		if err := a.Quota.ConsumeWithIdentity(c, a.Usage, true, billing.SettlementRequestKindRealtimeTurn, identity, identity != ""); err != nil {
-			logger.LogError(context.Background(), "responses websocket quota settlement failed: "+err.Error())
-		}
-	}
-	a.QuotaFinalized = true
-}
-
-func (a *ResponsesWSTurnAttempt) settlementIdentity() string {
-	if a == nil {
-		return ""
-	}
-	if a.AttemptID == "" {
-		a.AttemptID = uuid.NewString()
-	}
-	parts := make([]string, 0, 3)
-	if a.OpeningID != "" {
-		parts = append(parts, "opening="+a.OpeningID)
-	}
-	if a.AttemptID != "" {
-		parts = append(parts, "attempt="+a.AttemptID)
-	}
-	if a.SelectedChannelID != 0 {
-		parts = append(parts, fmt.Sprintf("channel=%d", a.SelectedChannelID))
-	}
-	return strings.Join(parts, "|") + "|finalize"
-}
-
-type RealtimeUserConn interface {
-	ReadMessage() (int, []byte, error)
-	WriteMessage(int, []byte) error
-	SetReadLimit(int64)
-	SetReadDeadline(time.Time) error
-	SetWriteDeadline(time.Time) error
-	WriteControl(messageType int, data []byte, deadline time.Time) error
-	Close() error
-}
-
-type RealtimeControlFrameConn interface {
-	PingHandler() func(string) error
-	SetPingHandler(func(string) error)
-	PongHandler() func(string) error
-	SetPongHandler(func(string) error)
-}
-
-type RealtimeProxyLocalReadError interface {
-	error
-	ProxyLocalPayload() []byte
-	Recoverable() bool
-}
 
 type ResponsesWSWriteMode int
 
@@ -497,6 +45,53 @@ type responsesWSSendCommand struct {
 	Payload           []byte
 }
 
+type responsesWSClientWriter interface {
+	WriteFrame(mt int, payload []byte, mode ResponsesWSWriteMode) error
+	CloseWithCode(code int, reason string)
+	Abort(reason string)
+}
+
+type responsesWSManagedClientWriter struct {
+	conn *wsconn.ManagedConn
+}
+
+func newResponsesWSManagedClientWriter(conn *wsconn.ManagedConn) *responsesWSManagedClientWriter {
+	if conn == nil {
+		return nil
+	}
+	return &responsesWSManagedClientWriter{conn: conn}
+}
+
+func (w *responsesWSManagedClientWriter) WriteFrame(mt int, payload []byte, _ ResponsesWSWriteMode) error {
+	if w == nil || w.conn == nil || len(payload) == 0 {
+		return nil
+	}
+	if mt == responsesWSCloseMessageType {
+		code, reason := parseResponsesWSClosePayload(payload)
+		w.CloseWithCode(code, reason)
+		return nil
+	}
+	return w.conn.WriteMessage(wsconn.MessageType(mt), payload)
+}
+
+func (w *responsesWSManagedClientWriter) CloseWithCode(code int, reason string) {
+	if w == nil || w.conn == nil {
+		return
+	}
+	w.conn.Close(wsconn.CloseInfo{
+		Kind:   wsconn.CloseKindNormal,
+		Code:   wsconn.SanitizeWireCloseCode(code),
+		Reason: reason,
+	})
+}
+
+func (w *responsesWSManagedClientWriter) Abort(reason string) {
+	if w == nil || w.conn == nil {
+		return
+	}
+	w.conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: strings.TrimSpace(reason)})
+}
+
 func recoverResponsesWSGoroutine(label string, onPanic func(reason string)) {
 	if recovered := recover(); recovered != nil {
 		reason := "responses_ws_" + strings.TrimSpace(label) + "_panic"
@@ -509,165 +104,52 @@ func recoverResponsesWSGoroutine(label string, onPanic func(reason string)) {
 }
 
 type ResponsesWSIOBridge struct {
-	ctx                         context.Context
-	cancel                      context.CancelFunc
-	conn                        RealtimeUserConn
-	writer                      *requester.WSClientWriter
-	actor                       *ResponsesWSSessionActor
-	armed                       sync.Map
-	sendCommands                chan responsesWSSendCommand
-	sendOnce                    sync.Once
-	clientInboundActivityUnixNS atomic.Int64
-	wg                          sync.WaitGroup
+	ctx    context.Context
+	cancel context.CancelFunc
+	writer responsesWSClientWriter
+	actor  *ResponsesWSSessionActor
+	armed  sync.Map
+	wg     sync.WaitGroup
 }
 
-func NewResponsesWSIOBridge(conn RealtimeUserConn, actor *ResponsesWSSessionActor) *ResponsesWSIOBridge {
+func NewResponsesWSManagedBridge(conn *wsconn.ManagedConn, actor *ResponsesWSSessionActor) *ResponsesWSIOBridge {
 	ctx, cancel := context.WithCancel(context.Background())
 	bridge := &ResponsesWSIOBridge{
-		ctx:          ctx,
-		cancel:       cancel,
-		conn:         conn,
-		actor:        actor,
-		sendCommands: make(chan responsesWSSendCommand, responsesWSSendQueueSize),
+		ctx:    ctx,
+		cancel: cancel,
+		writer: newResponsesWSManagedClientWriter(conn),
+		actor:  actor,
 	}
-	if conn != nil {
-		bridge.writer = requester.NewWSClientWriter(conn, config.RealtimeWebsocketWriteTimeout)
-	}
-	bridge.configureConn()
+	bridge.markClientInboundActivity(time.Now())
 	return bridge
 }
 
-func (b *ResponsesWSIOBridge) configureConn() {
-	if b == nil || b.conn == nil {
-		return
+func newResponsesWSBridgeForTest(writer responsesWSClientWriter, actor *ResponsesWSSessionActor) *ResponsesWSIOBridge {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &ResponsesWSIOBridge{
+		ctx:    ctx,
+		cancel: cancel,
+		writer: writer,
+		actor:  actor,
 	}
-	requester.ApplyWSReadLimit(b.conn, config.RealtimeWebsocketReadLimit)
-	b.markClientInboundActivity(time.Now())
-	b.clearEstablishedReadDeadline()
-	if control, ok := b.conn.(RealtimeControlFrameConn); ok {
-		requester.InstallWSActivityHandlers(control, func() {
-			b.markClientInboundActivity(time.Now())
-		})
+}
+
+func responsesWSClientWSConfig() wsconn.Config {
+	return wsconn.Config{
+		Label:           "client-responses-ws",
+		PingInterval:    config.ResponsesWebsocketClientPingInterval(),
+		PongMissTimeout: config.ResponsesWebsocketClientPongMissTimeout(),
+		InboundActivityTimeout: func() time.Duration {
+			return config.ResponsesWebsocketClientInboundActivityTimeout()
+		},
+		ReadLimit:    config.RealtimeWebsocketReadLimit(),
+		WriteTimeout: config.RealtimeWebsocketWriteTimeout,
 	}
 }
 
 func (b *ResponsesWSIOBridge) markClientInboundActivity(now time.Time) {
-	if b == nil {
-		return
-	}
-	if now.IsZero() {
-		now = time.Now()
-	}
-	b.clientInboundActivityUnixNS.Store(now.UnixNano())
-}
-
-func (b *ResponsesWSIOBridge) lastClientInboundActivity() time.Time {
-	if b == nil {
-		return time.Time{}
-	}
-	last := b.clientInboundActivityUnixNS.Load()
-	if last <= 0 {
-		return time.Time{}
-	}
-	return time.Unix(0, last)
-}
-
-func (b *ResponsesWSIOBridge) clearEstablishedReadDeadline() {
-	if b == nil || b.conn == nil {
-		return
-	}
-	_ = b.conn.SetReadDeadline(time.Time{})
-}
-
-func (b *ResponsesWSIOBridge) StartClientReadPump() {
-	if b == nil || b.conn == nil || b.actor == nil {
-		return
-	}
-	b.wg.Add(1)
-	go func() {
-		defer b.wg.Done()
-		defer recoverResponsesWSGoroutine("client_read_pump", func(reason string) {
-			if b.actor != nil {
-				err := errors.New(reason)
-				b.actor.markClientClosed(err)
-				b.actor.PostReliable(ResponsesWSEventClientClosed{Err: err})
-			}
-		})
-		for {
-			mt, payload, err := b.conn.ReadMessage()
-			receivedAt := time.Now()
-			if err != nil {
-				if errors.Is(err, websocket.ErrReadLimit) {
-					b.actor.PostReliable(ResponsesWSEventProxyLocalError{
-						Payload:     responsesWSErrorPayload(http.StatusBadRequest, "invalid_event", "frame is too large or invalid; send smaller audio chunks"),
-						Recoverable: false,
-					})
-					b.actor.markClientClosed(err)
-					return
-				}
-				var proxyLocalErr RealtimeProxyLocalReadError
-				if errors.As(err, &proxyLocalErr) {
-					b.actor.PostReliable(ResponsesWSEventProxyLocalError{
-						Payload:     proxyLocalErr.ProxyLocalPayload(),
-						Recoverable: proxyLocalErr.Recoverable(),
-					})
-					if proxyLocalErr.Recoverable() {
-						continue
-					}
-					b.actor.markClientClosed(err)
-					return
-				}
-				b.actor.markClientClosed(err)
-				b.actor.PostReliable(ResponsesWSEventClientClosed{Err: err})
-				return
-			}
-			b.markClientInboundActivity(receivedAt)
-			b.actor.markActivity()
-			b.actor.PostReliable(ResponsesWSEventClientFrame{MessageType: mt, Payload: payload, ReceivedAt: receivedAt})
-		}
-	}()
-}
-
-func (b *ResponsesWSIOBridge) StartClientPingLoop() {
-	if b == nil || b.conn == nil || b.writer == nil {
-		return
-	}
-	interval := config.RealtimeWebsocketPingInterval()
-	if interval <= 0 {
-		return
-	}
-	pongTimeout := config.ResponsesWSClientPongTimeout()
-	b.wg.Add(1)
-	go func() {
-		defer b.wg.Done()
-		defer recoverResponsesWSGoroutine("client_ping_loop", func(reason string) {
-			if b.actor != nil {
-				b.actor.PostReliable(ResponsesWSEventClientClosed{Err: errors.New(reason)})
-			}
-		})
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-b.ctx.Done():
-				return
-			case <-ticker.C:
-				if pongTimeout > 0 && time.Since(b.lastClientInboundActivity()) >= pongTimeout {
-					if b.actor != nil {
-						b.actor.PostReliable(ResponsesWSEventTimeout{Reason: "client_pong_timeout"})
-					}
-					return
-				}
-				if err := b.writer.WriteControl(websocket.PingMessage, nil); err != nil {
-					if b.actor != nil {
-						b.actor.markClientClosed(err)
-						b.actor.PostReliable(ResponsesWSEventClientClosed{Err: err})
-					}
-					return
-				}
-			}
-		}
-	}()
+	_ = b
+	_ = now
 }
 
 func (b *ResponsesWSIOBridge) ArmProviderRecvPump(upstreamSessionGeneration string, selectedChannelID int, session runtimesession.RealtimeSession) {
@@ -691,42 +173,54 @@ func (b *ResponsesWSIOBridge) ArmProviderRecvPump(upstreamSessionGeneration stri
 			}
 		})
 		for {
-			mt, payload, usage, origin, err := session.Recv(b.ctx)
+			event, err := session.Recv(b.ctx)
 			receivedAt := time.Now()
-			if responsesWSRecvHasProviderActivity(payload, usage, err) {
+			if responsesWSRecvHasProviderActivity(event, err) {
 				b.actor.markActivity()
 			}
-			if usage != nil {
-				b.actor.PostReliable(ResponsesWSEventProviderDownstream{
+			if event.ProviderClose != nil {
+				b.actor.PostReliable(ResponsesWSEventProviderClosed{
 					UpstreamSessionGeneration: upstreamSessionGeneration,
 					ChannelID:                 selectedChannelID,
-					Kind:                      ProviderDownstreamUsage,
-					Usage:                     usage,
-					Origin:                    runtimesession.RealtimePayloadOriginProvider,
+					Code:                      event.ProviderClose.Code,
+					Reason:                    event.ProviderClose.Reason,
+					Err:                       event.ProviderClose.Err,
+					ReceivedAt:                receivedAt,
+				})
+				return
+			}
+			hasFrame := event.Frame != nil && len(event.Frame.Payload()) > 0
+			if event.Usage != nil && !hasFrame {
+				b.actor.PostReliable(ResponsesWSEventProviderUsageObserved{
+					UpstreamSessionGeneration: upstreamSessionGeneration,
+					ChannelID:                 selectedChannelID,
+					Usage:                     event.Usage,
+					Origin:                    event.Origin,
 					ReceivedAt:                receivedAt,
 				})
 			}
 			if err != nil {
-				deliveredPayload := len(payload) > 0
-				if len(payload) > 0 {
-					kind := ProviderDownstreamRecvError
-					if origin == runtimesession.RealtimePayloadOriginProvider {
-						kind = ProviderDownstreamFrame
-					}
+				deliveredPayload := hasFrame
+				if deliveredPayload {
+					mt, payload := responsesWSMessageFromSessionFrame(*event.Frame)
 					b.actor.PostReliable(ResponsesWSEventProviderDownstream{
 						UpstreamSessionGeneration: upstreamSessionGeneration,
 						ChannelID:                 selectedChannelID,
-						Kind:                      kind,
+						Kind:                      ProviderDownstreamFrame,
 						MessageType:               mt,
 						Payload:                   payload,
-						Err:                       err,
-						Origin:                    origin,
+						Usage:                     event.Usage,
+						Origin:                    event.Origin,
 						ReceivedAt:                receivedAt,
 					})
 				}
 				deliveredClientErrorPayload := false
 				if errorPayload := runtimesession.ClientPayloadFromError(err); len(errorPayload) > 0 {
-					deliveredClientErrorPayload = len(payload) > 0 && bytes.Equal(errorPayload, payload)
+					var deliveredFramePayload []byte
+					if event.Frame != nil {
+						deliveredFramePayload = event.Frame.Payload()
+					}
+					deliveredClientErrorPayload = deliveredPayload && bytes.Equal(errorPayload, deliveredFramePayload)
 					if !deliveredClientErrorPayload {
 						deliveredClientErrorPayload = true
 						b.actor.PostReliable(ResponsesWSEventProxyLocalError{
@@ -738,66 +232,109 @@ func (b *ResponsesWSIOBridge) ArmProviderRecvPump(upstreamSessionGeneration stri
 					}
 				}
 				if !deliveredPayload && !deliveredClientErrorPayload {
-					b.actor.PostReliable(ResponsesWSEventTimeout{
-						Reason:                    "provider_closed",
+					b.actor.PostReliable(ResponsesWSEventProviderRecvFailed{
 						UpstreamSessionGeneration: upstreamSessionGeneration,
 						ChannelID:                 selectedChannelID,
+						Err:                       err,
 					})
 				}
 				return
 			}
-			if len(payload) == 0 {
+			if event.Err != nil {
+				deliveredPayload := hasFrame
+				if deliveredPayload {
+					mt, payload := responsesWSMessageFromSessionFrame(*event.Frame)
+					b.actor.PostReliable(ResponsesWSEventProviderDownstream{
+						UpstreamSessionGeneration: upstreamSessionGeneration,
+						ChannelID:                 selectedChannelID,
+						Kind:                      ProviderDownstreamFrame,
+						MessageType:               mt,
+						Payload:                   payload,
+						Usage:                     event.Usage,
+						Origin:                    event.Origin,
+						ReceivedAt:                receivedAt,
+					})
+				}
+				deliveredClientErrorPayload := false
+				if errorPayload := runtimesession.ClientPayloadFromError(event.Err); len(errorPayload) > 0 {
+					var deliveredFramePayload []byte
+					if event.Frame != nil {
+						deliveredFramePayload = event.Frame.Payload()
+					}
+					deliveredClientErrorPayload = deliveredPayload && bytes.Equal(errorPayload, deliveredFramePayload)
+					if !deliveredClientErrorPayload {
+						deliveredClientErrorPayload = true
+						b.actor.PostReliable(ResponsesWSEventProxyLocalError{
+							UpstreamSessionGeneration: upstreamSessionGeneration,
+							ChannelID:                 selectedChannelID,
+							Payload:                   errorPayload,
+							Recoverable:               false,
+						})
+					}
+				}
+				if !deliveredPayload && !deliveredClientErrorPayload {
+					b.actor.PostReliable(ResponsesWSEventProviderBusinessError{
+						UpstreamSessionGeneration: upstreamSessionGeneration,
+						ChannelID:                 selectedChannelID,
+						Err:                       event.Err,
+					})
+				}
+				return
+			}
+			if !hasFrame {
 				continue
 			}
+			mt, payload := responsesWSMessageFromSessionFrame(*event.Frame)
 			b.actor.PostReliable(ResponsesWSEventProviderDownstream{
 				UpstreamSessionGeneration: upstreamSessionGeneration,
 				ChannelID:                 selectedChannelID,
 				Kind:                      ProviderDownstreamFrame,
 				MessageType:               mt,
 				Payload:                   payload,
-				Origin:                    runtimesession.RealtimePayloadOriginProvider,
+				Usage:                     event.Usage,
+				Origin:                    event.Origin,
 				ReceivedAt:                receivedAt,
 			})
 		}
 	}()
 }
 
-func responsesWSRecvHasProviderActivity(payload []byte, usage *types.UsageEvent, err error) bool {
-	if usage != nil || len(payload) > 0 {
+func responsesWSRecvHasProviderActivity(event runtimesession.RecvEvent, err error) bool {
+	if event.Usage != nil || event.Frame != nil && len(event.Frame.Payload()) > 0 || event.Err != nil || event.ProviderClose != nil {
 		return true
 	}
 	return err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, runtimesession.ErrSessionClosed)
 }
 
-func (b *ResponsesWSIOBridge) startSendWorker() {
-	if b == nil {
+func (a *ResponsesWSSessionActor) startSendWorker() {
+	if a == nil {
 		return
 	}
-	b.sendOnce.Do(func() {
-		b.wg.Add(1)
+	a.sendOnce.Do(func() {
+		a.sendWG.Add(1)
 		go func() {
-			defer b.wg.Done()
+			defer a.sendWG.Done()
 			defer recoverResponsesWSGoroutine("send_worker", func(reason string) {
-				if b.actor != nil {
-					b.actor.PostReliable(ResponsesWSEventTimeout{Reason: reason})
+				if a != nil {
+					a.PostReliable(ResponsesWSEventTimeout{Reason: reason})
 				}
 			})
 			for {
 				select {
-				case <-b.ctx.Done():
+				case <-a.done:
 					return
-				case command := <-b.sendCommands:
-					b.handleSendCommand(command)
+				case command := <-a.sendCommands:
+					a.handleSendCommand(command)
 				}
 			}
 		}()
 	})
 }
 
-func (b *ResponsesWSIOBridge) handleSendCommand(command responsesWSSendCommand) {
+func (a *ResponsesWSSessionActor) handleSendCommand(command responsesWSSendCommand) {
 	defer recoverResponsesWSGoroutine("send_command", func(reason string) {
-		if b.actor != nil {
-			b.actor.PostReliable(ResponsesWSEventSendResult{
+		if a != nil {
+			a.PostReliable(ResponsesWSEventSendResult{
 				AttemptID:         command.AttemptID,
 				SelectedChannelID: command.SelectedChannelID,
 				Outcome:           SendOutcomeAmbiguous,
@@ -806,9 +343,9 @@ func (b *ResponsesWSIOBridge) handleSendCommand(command responsesWSSendCommand) 
 		}
 	})
 	select {
-	case <-b.ctx.Done():
-		if b.actor != nil {
-			b.actor.PostReliable(ResponsesWSEventSendResult{
+	case <-a.done:
+		if a != nil {
+			a.PostReliable(ResponsesWSEventSendResult{
 				AttemptID:         command.AttemptID,
 				SelectedChannelID: command.SelectedChannelID,
 				Outcome:           SendOutcomeNotSent,
@@ -818,9 +355,13 @@ func (b *ResponsesWSIOBridge) handleSendCommand(command responsesWSSendCommand) 
 		return
 	default:
 	}
-	err := command.Session.SendClient(b.ctx, command.MessageType, command.Payload)
-	if b.actor != nil {
-		b.actor.PostReliable(ResponsesWSEventSendResult{
+	ctx := context.Background()
+	if actorCtx := a.Context(); actorCtx != nil && actorCtx.Request != nil {
+		ctx = actorCtx.Request.Context()
+	}
+	err := command.Session.SendClient(ctx, responsesWSSessionFrameFromMessage(command.MessageType, command.Payload))
+	if a != nil {
+		a.PostReliable(ResponsesWSEventSendResult{
 			AttemptID:         command.AttemptID,
 			SelectedChannelID: command.SelectedChannelID,
 			Outcome:           responsesWSSendOutcomeFromError(err),
@@ -829,11 +370,30 @@ func (b *ResponsesWSIOBridge) handleSendCommand(command responsesWSSendCommand) 
 	}
 }
 
-func (b *ResponsesWSIOBridge) SendProviderFrame(attemptID string, selectedChannelID int, session runtimesession.RealtimeSession, mt int, payload []byte) bool {
-	if b == nil || session == nil {
+func responsesWSSessionFrameFromMessage(messageType int, payload []byte) runtimesession.Frame {
+	if messageType == responsesWSBinaryMessageType {
+		return runtimesession.NewBinaryFrame(payload)
+	}
+	return runtimesession.NewTextFrame(payload)
+}
+
+func responsesWSMessageFromSessionFrame(frame runtimesession.Frame) (int, []byte) {
+	if frame.Kind() == runtimesession.FrameKindBinary {
+		return responsesWSBinaryMessageType, frame.Payload()
+	}
+	return responsesWSTextMessageType, frame.Payload()
+}
+
+func responsesWSProviderClosePayload(code int, reason string) []byte {
+	sanitized := wsconn.SanitizeWireCloseCode(code)
+	return wsconn.SafeCloseMessage(sanitized, responsesWSCloseReason(reason))
+}
+
+func (a *ResponsesWSSessionActor) SendProviderFrame(attemptID string, selectedChannelID int, session runtimesession.RealtimeSession, mt int, payload []byte) bool {
+	if a == nil || session == nil {
 		return false
 	}
-	b.startSendWorker()
+	a.startSendWorker()
 	command := responsesWSSendCommand{
 		AttemptID:         attemptID,
 		SelectedChannelID: selectedChannelID,
@@ -842,9 +402,9 @@ func (b *ResponsesWSIOBridge) SendProviderFrame(attemptID string, selectedChanne
 		Payload:           payload,
 	}
 	select {
-	case <-b.ctx.Done():
+	case <-a.done:
 		return false
-	case b.sendCommands <- command:
+	case a.sendCommands <- command:
 		return true
 	default:
 		return false
@@ -852,23 +412,23 @@ func (b *ResponsesWSIOBridge) SendProviderFrame(attemptID string, selectedChanne
 }
 
 func (b *ResponsesWSIOBridge) WriteClientFrame(mt int, payload []byte, mode ResponsesWSWriteMode) error {
-	if b == nil || b.writer == nil || len(payload) == 0 {
+	if b == nil || len(payload) == 0 {
 		return nil
 	}
-	if mode == ResponsesWSWriteProxyLocal && mt == websocket.TextMessage {
-		return requester.WriteWSLocalError(b.writer, payload)
+	if b.writer == nil {
+		return nil
 	}
-	if mt == websocket.CloseMessage {
-		return b.writer.WriteControl(websocket.CloseMessage, payload)
-	}
-	return b.writer.WriteMessage(mt, payload)
+	return b.writer.WriteFrame(mt, payload, mode)
 }
 
 func (b *ResponsesWSIOBridge) WriteCloseControl(code int, reason string) {
-	if b == nil || b.writer == nil {
+	if b == nil {
 		return
 	}
-	_ = b.writer.WriteClose(code, reason)
+	if b.writer == nil {
+		return
+	}
+	b.writer.CloseWithCode(code, reason)
 }
 
 func (b *ResponsesWSIOBridge) AbortSession(session runtimesession.RealtimeSession, reason string) {
@@ -883,11 +443,17 @@ func (b *ResponsesWSIOBridge) Close() {
 	}
 	b.cancel()
 	if b.writer != nil {
-		_ = b.writer.Close()
-	} else if b.conn != nil {
-		_ = b.conn.Close()
+		b.writer.Abort("bridge_closed")
 	}
 	b.wg.Wait()
+}
+
+func parseResponsesWSClosePayload(payload []byte) (int, string) {
+	if len(payload) < 2 {
+		return int(wsconn.CloseNormalClosure), ""
+	}
+	code := int(binary.BigEndian.Uint16(payload[:2]))
+	return code, string(payload[2:])
 }
 
 type responsesWSSessionState int
@@ -915,6 +481,7 @@ type ResponsesWSSessionActor struct {
 	done     chan struct{}
 	doneOnce sync.Once
 	bridge   *ResponsesWSIOBridge
+	client   *wsconn.ManagedConn
 	snapshot *ResponsesWSRequestSnapshot
 
 	leaseMu                   sync.Mutex
@@ -944,6 +511,9 @@ type ResponsesWSSessionActor struct {
 	clientClosed                atomic.Bool
 	backpressurePosted          atomic.Bool
 	downstreamCloseSent         atomic.Bool
+	sendCommands                chan responsesWSSendCommand
+	sendOnce                    sync.Once
+	sendWG                      sync.WaitGroup
 	lastActivityUnixNano        atomic.Int64
 	busyRejectWindowStart       time.Time
 	busyRejects                 int
@@ -953,9 +523,10 @@ type ResponsesWSSessionActor struct {
 
 func NewResponsesWSSessionActor(c *gin.Context) *ResponsesWSSessionActor {
 	actor := &ResponsesWSSessionActor{
-		events: make(chan ResponsesWSEvent, responsesWSEventQueueSize),
-		done:   make(chan struct{}),
-		state:  responsesWSStateOpening,
+		events:       make(chan ResponsesWSEvent, responsesWSEventQueueSize),
+		done:         make(chan struct{}),
+		sendCommands: make(chan responsesWSSendCommand, responsesWSSendQueueSize),
+		state:        responsesWSStateOpening,
 	}
 	actor.RefreshContext(c)
 	actor.markActivity()
@@ -982,6 +553,13 @@ func (a *ResponsesWSSessionActor) Context() *gin.Context {
 
 func (a *ResponsesWSSessionActor) SetBridge(bridge *ResponsesWSIOBridge) {
 	a.bridge = bridge
+}
+
+func (a *ResponsesWSSessionActor) SetClientConn(conn *wsconn.ManagedConn) {
+	if a == nil {
+		return
+	}
+	a.client = conn
 }
 
 func (a *ResponsesWSSessionActor) Start() {
@@ -1128,10 +706,10 @@ func isResponsesWSExpectedClientDisconnectError(err error) bool {
 	if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED) {
 		return true
 	}
-	var closeErr *websocket.CloseError
-	if errors.As(err, &closeErr) {
-		switch closeErr.Code {
-		case websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived, websocket.CloseAbnormalClosure:
+	var managedCloseErr *wsconn.CloseError
+	if errors.As(err, &managedCloseErr) {
+		switch managedCloseErr.Code {
+		case wsconn.CloseNormalClosure, wsconn.CloseGoingAway, wsconn.CloseNoStatusReceived, wsconn.CloseAbnormalClosure:
 			return true
 		}
 	}
@@ -1312,6 +890,14 @@ func (a *ResponsesWSSessionActor) handleEvent(event ResponsesWSEvent) {
 		a.handleSendResult(typed)
 	case ResponsesWSEventProviderDownstream:
 		a.handleProviderDownstream(typed)
+	case ResponsesWSEventProviderUsageObserved:
+		a.handleProviderUsageObserved(typed)
+	case ResponsesWSEventProviderBusinessError:
+		a.handleProviderBusinessError(typed)
+	case ResponsesWSEventProviderRecvFailed:
+		a.handleProviderRecvFailed(typed)
+	case ResponsesWSEventProviderClosed:
+		a.handleProviderClosed(typed)
 	case ResponsesWSEventProxyLocalError:
 		if typed.UpstreamSessionGeneration != "" && typed.UpstreamSessionGeneration != a.upstreamSessionGeneration {
 			return
@@ -1498,7 +1084,7 @@ func (a *ResponsesWSSessionActor) handleFirstTurnOpenResult(event ResponsesWSEve
 			a.writeProxyLocal(responsesWSFallbackPayload())
 			if a.bridge != nil {
 				a.markDownstreamCloseSent()
-				a.bridge.WriteCloseControl(websocket.CloseNormalClosure, "responses_ws_unsupported_for_channel")
+				a.bridge.WriteCloseControl(int(wsconn.CloseNormalClosure), "responses_ws_unsupported_for_channel")
 			}
 		} else {
 			a.writeProxyLocal(responsesWSErrorFromOpenAI(event.Err))
@@ -1606,13 +1192,13 @@ func (a *ResponsesWSSessionActor) prepareAndSendFirstTurn(openResult *responsesW
 	a.MarkPendingSend()
 	a.providerRecvArmed = true
 	a.bridge.ArmProviderRecvPump(upstreamSessionGeneration, openResult.Channel.Id, openResult.Session)
-	if !a.bridge.SendProviderFrame(attempt.AttemptID, openResult.Channel.Id, openResult.Session, websocket.TextMessage, payload) {
+	if !a.SendProviderFrame(attempt.AttemptID, openResult.Channel.Id, openResult.Session, responsesWSTextMessageType, payload) {
 		a.postSendQueueFull(attempt.AttemptID, openResult.Channel.Id)
 	}
 }
 
 func (a *ResponsesWSSessionActor) handleClientFrame(event ResponsesWSEventClientFrame) {
-	if event.MessageType != websocket.TextMessage {
+	if event.MessageType != responsesWSTextMessageType {
 		a.writeProxyLocal(responsesWSErrorPayload(http.StatusBadRequest, "invalid_event", "only text websocket events are supported"))
 		return
 	}
@@ -1642,12 +1228,46 @@ func (a *ResponsesWSSessionActor) handleClientFrame(event ResponsesWSEventClient
 			a.writeProxyLocal(responsesWSErrorPayload(http.StatusConflict, "session_closed", "responses websocket session is not open"))
 			return
 		}
-		if !a.bridge.SendProviderFrame("", a.sessionChannelID, a.session, event.MessageType, event.Payload) {
+		if !a.SendProviderFrame("", a.sessionChannelID, a.session, event.MessageType, event.Payload) {
 			a.writeProxyLocal(responsesWSErrorPayload(http.StatusServiceUnavailable, "responses_ws_send_queue_full", responsesWSStaticErrorMessage("responses_ws_send_queue_full")))
 		}
 	default:
 		a.writeProxyLocal(responsesWSErrorPayload(http.StatusBadRequest, "unsupported_client_event", "unsupported responses websocket client event"))
 	}
+}
+
+func (a *ResponsesWSSessionActor) onClientFrame(ctx context.Context, mt wsconn.MessageType, payload []byte) {
+	if a == nil {
+		return
+	}
+	select {
+	case <-a.done:
+		return
+	default:
+	}
+	cloned := append([]byte(nil), payload...)
+	a.markActivity()
+	event := ResponsesWSEventClientFrame{
+		MessageType: int(mt),
+		Payload:     cloned,
+		ReceivedAt:  time.Now(),
+	}
+	select {
+	case a.events <- event:
+	case <-a.done:
+		return
+	default:
+		a.requestCloseIntent("client_frame_backpressure")
+		if a.client != nil {
+			a.client.Close(wsconn.CloseInfo{
+				Kind:   wsconn.CloseKindBackpressure,
+				Code:   wsconn.CloseTryAgainLater,
+				Reason: "client_frame_backpressure",
+				Err:    errResponsesWSClientFrameBackpressure,
+			})
+		}
+	}
+	_ = ctx
 }
 
 func (a *ResponsesWSSessionActor) recordBusyReject() bool {
@@ -1763,7 +1383,7 @@ func (a *ResponsesWSSessionActor) startSubsequentTurn(raw []byte, receivedAt tim
 		a.providerRecvArmed = true
 		a.bridge.ArmProviderRecvPump(a.upstreamSessionGeneration, a.sessionChannelID, a.session)
 	}
-	if !a.bridge.SendProviderFrame(attempt.AttemptID, a.sessionChannelID, a.session, websocket.TextMessage, payload) {
+	if !a.SendProviderFrame(attempt.AttemptID, a.sessionChannelID, a.session, responsesWSTextMessageType, payload) {
 		a.postSendQueueFull(attempt.AttemptID, a.sessionChannelID)
 	}
 }
@@ -1965,19 +1585,6 @@ func (a *ResponsesWSSessionActor) handleProviderDownstream(event ResponsesWSEven
 			"responses websocket provider downstream carried err: kind=%d origin=%d msg_type=%d err=%s",
 			event.Kind, event.Origin, event.MessageType, event.Err.Error()))
 	}
-	if event.Kind == ProviderDownstreamUsage && event.Usage != nil {
-		if a.pendingAttempt != nil {
-			a.pendingProviderEvidenceSeen = true
-			a.pendingAttempt.MarkProviderUsageSeen()
-			mergeResponsesWSUsageEvent(a.pendingAttempt.Usage, event.Usage)
-			return
-		}
-		if a.activeAttempt != nil {
-			a.activeAttempt.MarkProviderUsageSeen()
-			mergeResponsesWSUsageEvent(a.activeAttempt.Usage, event.Usage)
-		}
-		return
-	}
 	if event.Origin != runtimesession.RealtimePayloadOriginProvider {
 		a.writeProxyLocal(event.Payload)
 		return
@@ -1989,20 +1596,24 @@ func (a *ResponsesWSSessionActor) handleProviderDownstream(event ResponsesWSEven
 	if a.pendingAttempt != nil {
 		a.pendingProviderEvidenceSeen = true
 		a.pendingAttempt.MarkProviderAcceptedTurnEvidence()
-		if event.Kind == ProviderDownstreamFrame && event.MessageType != websocket.CloseMessage && len(event.Payload) > 0 {
+		if event.Usage != nil {
+			a.pendingAttempt.MarkProviderUsageSeen()
+			mergeResponsesWSUsageEvent(a.pendingAttempt.Usage, event.Usage)
+		}
+		if event.Kind == ProviderDownstreamFrame && event.MessageType != responsesWSCloseMessageType && len(event.Payload) > 0 {
 			a.pendingAttempt.MarkFirstProviderResponse(receivedAt)
 		}
 		a.bufferPendingProviderEvent(event)
 		return
 	}
-	if event.MessageType == websocket.CloseMessage {
+	if event.MessageType == responsesWSCloseMessageType {
 		if a.activeAttempt != nil {
 			a.activeAttempt.MarkCompleted(receivedAt)
 		}
 		a.finalizeActiveAttempt()
 		a.clearActiveTurn()
 		a.markDownstreamCloseSent()
-		if err := a.bridge.WriteClientFrame(websocket.CloseMessage, event.Payload, ResponsesWSWriteProvider); err != nil {
+		if err := a.bridge.WriteClientFrame(responsesWSCloseMessageType, event.Payload, ResponsesWSWriteProvider); err != nil {
 			a.close("client_write_failed")
 			return
 		}
@@ -2013,7 +1624,7 @@ func (a *ResponsesWSSessionActor) handleProviderDownstream(event ResponsesWSEven
 		a.failClosed("responses_ws_provider_event_without_turn")
 		return
 	}
-	if event.Kind == ProviderDownstreamFrame && event.MessageType != websocket.CloseMessage && len(event.Payload) > 0 {
+	if event.Kind == ProviderDownstreamFrame && event.MessageType != responsesWSCloseMessageType && len(event.Payload) > 0 {
 		a.activeAttempt.MarkFirstProviderResponse(receivedAt)
 	}
 
@@ -2034,6 +1645,10 @@ func (a *ResponsesWSSessionActor) handleProviderDownstream(event ResponsesWSEven
 		}
 		mergeResponsesWSTerminalResponse(a.activeAttempt.Usage, classified.Response)
 	}
+	if event.Usage != nil {
+		a.activeAttempt.MarkProviderUsageSeen()
+		mergeResponsesWSUsageEvent(a.activeAttempt.Usage, event.Usage)
+	}
 	isTerminal := classified.Kind == responsesws.ResponsesSuccessTerminal ||
 		classified.Kind == responsesws.ResponsesFailedTerminal ||
 		classified.Kind == responsesws.ResponsesCancelledTerminal
@@ -2050,6 +1665,158 @@ func (a *ResponsesWSSessionActor) handleProviderDownstream(event ResponsesWSEven
 	if !isTerminal {
 		a.processProviderPayloadAPIError(payload, event.ChannelID, "responses_ws_provider_frame")
 	}
+}
+
+func (a *ResponsesWSSessionActor) handleProviderUsageObserved(event ResponsesWSEventProviderUsageObserved) {
+	if event.UpstreamSessionGeneration != "" && event.UpstreamSessionGeneration != a.upstreamSessionGeneration {
+		return
+	}
+	if event.ChannelID > 0 && event.ChannelID != a.sessionChannelID {
+		a.failClosed("responses_ws_provider_channel_mismatch")
+		return
+	}
+	if event.Usage == nil {
+		return
+	}
+	if a.shouldDropUnpricedProviderUsage(event.Usage) {
+		return
+	}
+	if a.pendingAttempt != nil {
+		a.pendingProviderEvidenceSeen = true
+		a.pendingAttempt.MarkProviderUsageSeen()
+		mergeResponsesWSUsageEvent(a.pendingAttempt.Usage, event.Usage)
+		return
+	}
+	if a.activeAttempt != nil {
+		a.activeAttempt.MarkProviderUsageSeen()
+		mergeResponsesWSUsageEvent(a.activeAttempt.Usage, event.Usage)
+	}
+}
+
+func (a *ResponsesWSSessionActor) shouldDropUnpricedProviderUsage(usage *types.UsageEvent) bool {
+	if usage == nil || usage.Source != types.UsageSourceInputAudioTranscription {
+		return false
+	}
+	modelName := a.billingModelName()
+	if transcriptionPricingConfigured(modelName) {
+		return false
+	}
+	recordUsageObservedUnbilled(string(types.UsageSourceInputAudioTranscription), modelName)
+	return true
+}
+
+func (a *ResponsesWSSessionActor) billingModelName() string {
+	if a == nil {
+		return ""
+	}
+	if a.pendingAttempt != nil && a.pendingAttempt.Quota != nil {
+		return strings.TrimSpace(a.pendingAttempt.Quota.ModelName())
+	}
+	if a.activeAttempt != nil && a.activeAttempt.Quota != nil {
+		return strings.TrimSpace(a.activeAttempt.Quota.ModelName())
+	}
+	_, billingModel := responsesWSCurrentModelNames(a.Context())
+	return strings.TrimSpace(billingModel)
+}
+
+func transcriptionPricingConfigured(modelName string) bool {
+	if model.PricingInstance == nil {
+		return false
+	}
+	price := model.PricingInstance.GetPrice(strings.TrimSpace(modelName))
+	if price == nil || price.ExtraRatios == nil {
+		return false
+	}
+	ratios := price.ExtraRatios.Data()
+	_, ok := ratios[config.UsageExtraInputAudioTranscription]
+	return ok
+}
+
+func (a *ResponsesWSSessionActor) handleProviderBusinessError(event ResponsesWSEventProviderBusinessError) {
+	if event.UpstreamSessionGeneration != "" && event.UpstreamSessionGeneration != a.upstreamSessionGeneration {
+		return
+	}
+	if event.ChannelID > 0 && event.ChannelID != a.sessionChannelID {
+		a.failClosed("responses_ws_provider_channel_mismatch")
+		return
+	}
+	if event.Err != nil {
+		a.writeProxyLocal(responsesWSErrorFromErr(event.Err))
+	}
+	a.close("provider_business_error")
+}
+
+func (a *ResponsesWSSessionActor) handleProviderRecvFailed(event ResponsesWSEventProviderRecvFailed) {
+	if event.UpstreamSessionGeneration != "" && event.UpstreamSessionGeneration != a.upstreamSessionGeneration {
+		return
+	}
+	if event.ChannelID > 0 && event.ChannelID != a.sessionChannelID {
+		a.failClosed("responses_ws_provider_channel_mismatch")
+		return
+	}
+	if payload := runtimesession.ClientPayloadFromError(event.Err); len(payload) > 0 {
+		a.writeProxyLocal(payload)
+	}
+	a.close("provider_recv_failed")
+}
+
+func (a *ResponsesWSSessionActor) handleProviderClosed(event ResponsesWSEventProviderClosed) {
+	if event.UpstreamSessionGeneration != "" && event.UpstreamSessionGeneration != a.upstreamSessionGeneration {
+		return
+	}
+	if event.ChannelID > 0 && event.ChannelID != a.sessionChannelID {
+		a.failClosed("responses_ws_provider_channel_mismatch")
+		return
+	}
+	receivedAt := event.ReceivedAt
+	if receivedAt.IsZero() {
+		receivedAt = time.Now()
+	}
+	if a.pendingAttempt != nil {
+		a.pendingProviderEvidenceSeen = true
+		a.pendingAttempt.MarkProviderAcceptedTurnEvidence()
+		a.bufferPendingProviderEvent(ResponsesWSEventProviderDownstream{
+			UpstreamSessionGeneration: event.UpstreamSessionGeneration,
+			ChannelID:                 event.ChannelID,
+			Kind:                      ProviderDownstreamFrame,
+			MessageType:               responsesWSCloseMessageType,
+			Payload:                   responsesWSProviderClosePayload(event.Code, event.Reason),
+			Err:                       event.Err,
+			Origin:                    runtimesession.RealtimePayloadOriginProvider,
+			ReceivedAt:                receivedAt,
+		})
+		return
+	}
+	if a.activeAttempt != nil {
+		a.activeAttempt.MarkCompleted(receivedAt)
+	}
+	a.finalizeActiveAttempt()
+	a.clearActiveTurn()
+	a.markDownstreamCloseSent()
+	if a.closeProviderDownstream(event) {
+		a.close("provider_closed")
+		return
+	}
+	if a.bridge != nil {
+		if err := a.bridge.WriteClientFrame(responsesWSCloseMessageType, responsesWSProviderClosePayload(event.Code, event.Reason), ResponsesWSWriteProvider); err != nil {
+			a.close("client_write_failed")
+			return
+		}
+	}
+	a.close("provider_closed")
+}
+
+func (a *ResponsesWSSessionActor) closeProviderDownstream(event ResponsesWSEventProviderClosed) bool {
+	if a == nil || a.client == nil {
+		return false
+	}
+	a.client.Close(wsconn.CloseInfo{
+		Kind:   wsconn.CloseKindGracefulShutdown,
+		Code:   wsconn.SanitizeWireCloseCode(event.Code),
+		Reason: event.Reason,
+		Err:    event.Err,
+	})
+	return true
 }
 
 func (a *ResponsesWSSessionActor) processProviderPayloadAPIError(payload []byte, channelID int, source string) {
@@ -2148,7 +1915,7 @@ func (a *ResponsesWSSessionActor) handleMalformedProviderFrame(classified respon
 	payload := responsesWSErrorPayload(http.StatusBadGateway, "responses_ws_provider_protocol_error", message)
 	a.finalizeActiveAttempt()
 	a.clearActiveTurn()
-	if err := a.bridge.WriteClientFrame(websocket.TextMessage, payload, ResponsesWSWriteProvider); err != nil {
+	if err := a.bridge.WriteClientFrame(responsesWSTextMessageType, payload, ResponsesWSWriteProvider); err != nil {
 		a.close("client_write_failed")
 		return
 	}
@@ -2219,7 +1986,7 @@ func (a *ResponsesWSSessionActor) writeProxyLocal(payload []byte) {
 	if a == nil || a.bridge == nil || len(payload) == 0 {
 		return
 	}
-	if err := a.bridge.WriteClientFrame(websocket.TextMessage, payload, ResponsesWSWriteProxyLocal); err != nil {
+	if err := a.bridge.WriteClientFrame(responsesWSTextMessageType, payload, ResponsesWSWriteProxyLocal); err != nil {
 		a.markClientClosed(err)
 		a.requestCloseIntent("client_write_failed")
 	}
@@ -2352,11 +2119,10 @@ func (a *ResponsesWSSessionActor) close(reason string) {
 	if a.session != nil && a.bridge != nil {
 		a.bridge.AbortSession(a.session, reason)
 	}
-	if a.bridge != nil && a.bridge.conn != nil {
+	if a.bridge != nil && a.bridge.writer != nil {
 		if !a.downstreamCloseSent.Swap(true) {
-			a.bridge.WriteCloseControl(websocket.CloseNormalClosure, responsesWSCloseReason(reason))
+			a.bridge.WriteCloseControl(int(wsconn.CloseNormalClosure), responsesWSCloseReason(reason))
 		}
-		_ = a.bridge.conn.Close()
 	}
 	a.state = responsesWSStateClosed
 	a.finish()
@@ -2369,7 +2135,7 @@ func (a *ResponsesWSSessionActor) markDownstreamCloseSent() {
 }
 
 func responsesWSCloseReason(reason string) string {
-	return requester.SafeWSCloseReason(strings.TrimSpace(reason))
+	return wsconn.SafeCloseReason(strings.TrimSpace(reason))
 }
 
 func ResponsesWebSocket(c *gin.Context) {
@@ -2381,7 +2147,7 @@ func ResponsesWebSocket(c *gin.Context) {
 		common.AbortWithMessage(c, apiErr.StatusCode, apiErr.Message)
 		return
 	}
-	if !websocket.IsWebSocketUpgrade(c.Request) {
+	if !wsconn.IsUpgrade(c.Request) {
 		common.AbortWithMessage(c, http.StatusUpgradeRequired, "websocket_upgrade_required")
 		return
 	}
@@ -2397,36 +2163,33 @@ func ResponsesWebSocket(c *gin.Context) {
 	}
 	defer pendingLease.Release()
 
-	userConn, err := responsesWSUpgrader.Upgrade(c.Writer, c.Request, websocketUpgradeResponseHeader(c.Request))
+	clientConn, err := wsconn.AcceptManaged(c.Writer, c.Request, responsesWSClientWSConfig(), wsconn.AcceptOptions{
+		CheckOrigin:       realtimeWebSocketOriginAllowed,
+		ResponseHeader:    websocketUpgradeResponseHeader(c.Request),
+		EnableCompression: false,
+		Subprotocols:      allowedClientWebSocketSubprotocols(c.Request),
+	})
 	if err != nil {
 		common.AbortWithMessage(c, http.StatusInternalServerError, "upgrade_failed")
 		return
 	}
-	requester.ApplyWSReadLimit(userConn, config.RealtimeWebsocketReadLimit)
-	if err := userConn.SetReadDeadline(time.Now().Add(config.ResponsesWSFirstFrameTimeout())); err != nil {
-		_ = userConn.Close()
-		return
-	}
-	mt, raw, err := userConn.ReadMessage()
+	firstCtx, cancelFirstFrame := context.WithTimeout(c.Request.Context(), config.ResponsesWSFirstFrameTimeout())
+	mt, raw, err := clientConn.ReadInitial(firstCtx)
+	cancelFirstFrame()
 	firstFrameReceivedAt := time.Now()
 	if err != nil {
-		writer := requester.NewWSClientWriter(userConn, config.RealtimeWebsocketWriteTimeout)
-		_ = writer.WriteMessage(websocket.TextMessage, responsesWSErrorPayload(http.StatusBadRequest, "invalid_event", responsesWSFirstFrameReadErrorMessage(err)))
-		_ = writer.Close()
+		_ = clientConn.WriteMessage(wsconn.TextMessage, responsesWSErrorPayload(http.StatusBadRequest, "invalid_event", responsesWSFirstFrameReadErrorMessage(err)))
+		clientConn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "first_frame_read_failed", Err: err})
 		return
 	}
-	_ = userConn.SetReadDeadline(time.Time{})
-	if mt != websocket.TextMessage {
-		writer := requester.NewWSClientWriter(userConn, config.RealtimeWebsocketWriteTimeout)
-		_ = writer.WriteClose(websocket.CloseUnsupportedData, "only text frames are supported")
-		_ = writer.Close()
+	if mt != wsconn.TextMessage {
+		clientConn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindNormal, Code: wsconn.CloseUnsupportedData, Reason: "text_only"})
 		return
 	}
 	frame, err := responsesws.ParseRawResponsesCreateFrame(raw)
 	if err != nil {
-		writer := requester.NewWSClientWriter(userConn, config.RealtimeWebsocketWriteTimeout)
-		_ = writer.WriteClose(websocket.ClosePolicyViolation, "invalid response.create")
-		_ = writer.Close()
+		_ = clientConn.WriteMessage(wsconn.TextMessage, responsesWSErrorPayload(http.StatusBadRequest, "invalid_response_create", "invalid response.create"))
+		clientConn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindNormal, Code: wsconn.ClosePolicyViolation, Reason: "invalid_response_create", Err: err})
 		return
 	}
 
@@ -2443,13 +2206,18 @@ func ResponsesWebSocket(c *gin.Context) {
 			panic(recovered)
 		}
 	}()
-	bridge := NewResponsesWSIOBridge(userConn, actor)
+	bridge := NewResponsesWSManagedBridge(clientConn, actor)
 	defer bridge.Close()
 	actor.SetBridge(bridge)
+	actor.SetClientConn(clientConn)
 	actor.Start()
 	defer armResponsesWSMaxLifetime(actor)()
-	bridge.StartClientReadPump()
-	bridge.StartClientPingLoop()
+	pump := wsconn.Pump{
+		Conn:    clientConn,
+		Handle:  actor.onClientFrame,
+		OnClose: func(info wsconn.CloseInfo) { actor.PostReliable(ResponsesWSEventClientClosed{Err: info.Err}) },
+	}
+	go pump.Run(c.Request.Context())
 	if !actor.PostReliable(ResponsesWSEventFirstTurnSetup{Frame: frame, PendingLease: pendingLease, ReceivedAt: firstFrameReceivedAt}) {
 		pendingLease.Release()
 		actor.requestCloseIntent("first_turn_setup_not_queued")
@@ -2471,601 +2239,4 @@ func armResponsesWSMaxLifetime(actor *ResponsesWSSessionActor) func() {
 	return func() {
 		timer.Stop()
 	}
-}
-
-func openAndPrimeResponsesWSSession(c *gin.Context, request *types.OpenAIResponsesRequest) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
-	return openAndPrimeResponsesWSSessionWithContext(context.Background(), c, request)
-}
-
-func openAndPrimeResponsesWSSessionWithContext(openCtx context.Context, c *gin.Context, request *types.OpenAIResponsesRequest) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
-	if c == nil || request == nil {
-		return nil, common.StringErrorWrapperLocal("request is required", "invalid_request_error", http.StatusBadRequest)
-	}
-	markResponsesWSStreamRequest(c)
-	setResponsesWSOpenPreviousResponseID(c, request.PreviousResponseID)
-	if openCtx == nil {
-		openCtx = context.Background()
-	}
-	candidate, err := PrepareResponsesTurnAffinity(ResponsesAffinityInput{Context: c, Request: request})
-	if err != nil {
-		logger.LogError(context.Background(), "responses websocket affinity preparation failed: "+err.Error())
-		return nil, common.StringErrorWrapperLocal(responsesWSStaticErrorMessage("responses_affinity_conflict"), "responses_affinity_conflict", http.StatusConflict)
-	}
-	relay := &relayBase{c: c}
-	relay.setOriginalModel(request.Model)
-
-	if candidate != nil && candidate.ExplicitPinID > 0 {
-		return openResponsesWSSpecificChannelWithContext(openCtx, c, request.Model, candidate, candidate.ExplicitPinID)
-	}
-	if preferred := currentPreferredChannelID(c); preferred > 0 {
-		openResult, openErr := openResponsesWSPreferredChannelWithContext(openCtx, c, request.Model, candidate, preferred)
-		if openErr == nil {
-			return openResult, nil
-		}
-		if currentChannelAffinityStrict(c) {
-			return nil, openErr
-		}
-		relay.skipChannelID(preferred)
-	}
-
-	retryTimes := realtimeOpenRetryBudget()
-	var lastErr *types.OpenAIErrorWithStatusCode
-	var lastNonUnsupportedErr *types.OpenAIErrorWithStatusCode
-	providerAttempted := false
-	unsupportedScans := 0
-	unsupportedScanLimit := responsesWSUnsupportedScanLimit()
-	for i := retryTimes; i > 0; i-- {
-		if err := relay.setProvider(request.Model); err != nil {
-			if !providerAttempted && lastErr == nil {
-				logger.LogError(context.Background(), "responses websocket channel selection failed: "+err.Error())
-				lastErr = common.StringErrorWrapperLocal("channel selection failed", "channel_error", http.StatusServiceUnavailable)
-			}
-			break
-		}
-		providerAttempted = true
-		provider := relay.getProvider()
-		channel := provider.GetChannel()
-		session, apiErr := openRealtimeSessionWithOptions(provider, relay.modelName, runtimesession.RealtimeOpenOptions{
-			Context:                       openCtx,
-			PreferredTransport:            runtimesession.TransportModeResponsesWS,
-			RequireWS:                     true,
-			ResponsesWSPreviousResponseID: responsesWSOpenPreviousResponseID(c),
-		})
-		if apiErr == nil {
-			metrics.RecordProvider(c, 200)
-			return &responsesWSOpenResult{
-				Session:       session,
-				Provider:      provider,
-				ProviderModel: relay.modelName,
-				BillingModel:  relay.getModelName(),
-				Channel:       channel,
-				Candidate:     candidate,
-			}, nil
-		}
-		lastErr = apiErr
-		if openAIErrorCodeString(apiErr.Code, "") == "responses_ws_unsupported_for_channel" {
-			relay.skipChannelID(channel.Id)
-			unsupportedScans++
-			if unsupportedScans < unsupportedScanLimit {
-				i++
-			}
-			continue
-		}
-		lastNonUnsupportedErr = apiErr
-		if !shouldRetry(c, apiErr, channel.Type) {
-			break
-		}
-		relay.skipChannelID(channel.Id)
-	}
-	if lastNonUnsupportedErr != nil {
-		return nil, lastNonUnsupportedErr
-	}
-	if lastErr == nil {
-		lastErr = common.StringErrorWrapperLocal("channel does not support Responses websocket transport", "responses_ws_unsupported_for_channel", http.StatusUpgradeRequired)
-	}
-	return nil, lastErr
-}
-
-func responsesWSUnsupportedScanLimit() int {
-	configured := config.RetryTimes
-	if configured <= 0 {
-		configured = 1
-	}
-	if viper.IsSet("responses_ws.unsupported_scan_limit") {
-		if value := viper.GetInt("responses_ws.unsupported_scan_limit"); value > 0 {
-			configured = value
-		}
-	}
-	model.ChannelGroup.RLock()
-	channelCount := len(model.ChannelGroup.Channels)
-	model.ChannelGroup.RUnlock()
-	if channelCount > 0 && channelCount < configured {
-		return channelCount
-	}
-	return configured
-}
-
-func openResponsesWSSpecificChannel(c *gin.Context, modelName string, candidate *ResponsesTurnAffinity, channelID int) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
-	return openResponsesWSSpecificChannelWithContext(context.Background(), c, modelName, candidate, channelID)
-}
-
-func openResponsesWSSpecificChannelWithContext(openCtx context.Context, c *gin.Context, modelName string, candidate *ResponsesTurnAffinity, channelID int) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
-	markResponsesWSStreamRequest(c)
-	channel, err := fetchChannelById(channelID)
-	if err != nil {
-		logger.LogError(context.Background(), "responses websocket pinned channel fetch failed: "+err.Error())
-		return nil, common.StringErrorWrapperLocal("channel selection failed", "channel_error", http.StatusServiceUnavailable)
-	}
-	return openResponsesWSSelectedChannelWithContext(openCtx, c, modelName, candidate, channel)
-}
-
-func openResponsesWSPreferredChannel(c *gin.Context, modelName string, candidate *ResponsesTurnAffinity, channelID int) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
-	return openResponsesWSPreferredChannelWithContext(context.Background(), c, modelName, candidate, channelID)
-}
-
-func openResponsesWSPreferredChannelWithContext(openCtx context.Context, c *gin.Context, modelName string, candidate *ResponsesTurnAffinity, channelID int) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
-	markResponsesWSStreamRequest(c)
-	channel, err := fetchPreferredRealtimeChannel(c, modelName, channelID)
-	if err != nil {
-		logger.LogError(context.Background(), "responses websocket preferred channel fetch failed: "+err.Error())
-		return nil, common.StringErrorWrapperLocal("channel selection failed", "channel_error", http.StatusServiceUnavailable)
-	}
-	return openResponsesWSSelectedChannelWithContext(openCtx, c, modelName, candidate, channel)
-}
-
-func openResponsesWSSelectedChannel(c *gin.Context, modelName string, candidate *ResponsesTurnAffinity, channel *model.Channel) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
-	return openResponsesWSSelectedChannelWithContext(context.Background(), c, modelName, candidate, channel)
-}
-
-func openResponsesWSSelectedChannelWithContext(openCtx context.Context, c *gin.Context, modelName string, candidate *ResponsesTurnAffinity, channel *model.Channel) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
-	if channel == nil {
-		return nil, common.StringErrorWrapperLocal("channel not found", "channel_error", http.StatusServiceUnavailable)
-	}
-	markResponsesWSStreamRequest(c)
-	if openCtx == nil {
-		openCtx = context.Background()
-	}
-	provider, mappedModel, err := prepareProviderForChannel(c, modelName, channel)
-	if err != nil {
-		logger.LogError(context.Background(), "responses websocket provider preparation failed: "+err.Error())
-		return nil, common.StringErrorWrapperLocal("channel selection failed", "channel_error", http.StatusServiceUnavailable)
-	}
-	if candidate != nil {
-		candidate.SelectedChannelID = channel.Id
-	}
-	session, apiErr := openRealtimeSessionWithOptions(provider, mappedModel, runtimesession.RealtimeOpenOptions{
-		Context:                       openCtx,
-		PreferredTransport:            runtimesession.TransportModeResponsesWS,
-		RequireWS:                     true,
-		ResponsesWSPreviousResponseID: responsesWSOpenPreviousResponseID(c),
-	})
-	if apiErr != nil {
-		return nil, apiErr
-	}
-	metrics.RecordProvider(c, 200)
-	return &responsesWSOpenResult{
-		Session:       session,
-		Provider:      provider,
-		ProviderModel: mappedModel,
-		BillingModel:  responsesWSBillingModel(c, modelName, mappedModel),
-		Channel:       channel,
-		Candidate:     candidate,
-	}, nil
-}
-
-func markResponsesWSStreamRequest(c *gin.Context) {
-	if c != nil {
-		c.Set("is_stream", true)
-	}
-}
-
-func setResponsesWSOpenPreviousResponseID(c *gin.Context, previousResponseID string) {
-	if c != nil {
-		c.Set(responsesWSPreviousResponseIDContextKey, strings.TrimSpace(previousResponseID))
-	}
-}
-
-func responsesWSOpenPreviousResponseID(c *gin.Context) string {
-	if c == nil {
-		return ""
-	}
-	return strings.TrimSpace(c.GetString(responsesWSPreviousResponseIDContextKey))
-}
-
-func attachResponsesWSSelectedChannelSnapshot(snapshot *ResponsesWSRequestSnapshot, channel *model.Channel, providerModel string, billingModel string) {
-	if snapshot == nil || channel == nil {
-		return
-	}
-	selected := &SelectedChannelSnapshot{
-		ChannelID:            channel.Id,
-		ChannelType:          channel.Type,
-		PreCost:              channel.PreCost,
-		ProviderModel:        strings.TrimSpace(providerModel),
-		BillingModel:         strings.TrimSpace(billingModel),
-		OriginalModel:        strings.TrimSpace(snapshot.GetString("original_model")),
-		BillingOriginalModel: snapshotBool(snapshot, "billing_original_model"),
-		Channel:              channel,
-	}
-	snapshot.Set("responses_ws_selected_channel_snapshot", selected)
-	snapshot.Set("responses_ws_selected_channel", channel)
-	snapshot.Set("channel_id", selected.ChannelID)
-	snapshot.Set("channel_type", selected.ChannelType)
-	snapshot.Set("new_model", selected.ProviderModel)
-	snapshot.Set("billing_original_model", selected.BillingOriginalModel)
-}
-
-func clearResponsesWSSelectedChannelSnapshot(snapshot *ResponsesWSRequestSnapshot) {
-	if snapshot == nil {
-		return
-	}
-	snapshot.Delete(
-		"responses_ws_selected_channel_snapshot",
-		"responses_ws_selected_channel",
-		"channel_id",
-		"channel_type",
-		"new_model",
-		"billing_original_model",
-	)
-}
-
-func snapshotBool(snapshot *ResponsesWSRequestSnapshot, key string) bool {
-	value, ok := snapshot.Get(key)
-	if !ok {
-		return false
-	}
-	typed, _ := value.(bool)
-	return typed
-}
-
-func (r *relayBase) skipChannelID(channelID int) {
-	if r == nil || r.c == nil || channelID <= 0 {
-		return
-	}
-	skipChannelIds, ok := r.c.Get("skip_channel_ids")
-	if !ok {
-		r.c.Set("skip_channel_ids", []int{channelID})
-		return
-	}
-	typed, ok := skipChannelIds.([]int)
-	if !ok {
-		r.c.Set("skip_channel_ids", []int{channelID})
-		return
-	}
-	r.c.Set("skip_channel_ids", append(typed, channelID))
-}
-
-func responsesWSProviderPayload(c *gin.Context, frame *responsesws.RawResponsesCreateFrame, request *types.OpenAIResponsesRequest, mappedModel string) ([]byte, error) {
-	if request == nil {
-		return nil, errors.New("responses websocket request is required")
-	}
-	// Raw frame remains the serialization source so unknown fields and exact JSON
-	// shapes survive provider rewrite; the corrected typed request owns the model
-	// validation shared by affinity, quota estimate, and payload rewrite.
-	if strings.TrimSpace(request.Model) == "" {
-		return nil, errors.New("response.create model is required")
-	}
-	providerModel := strings.TrimSpace(mappedModel)
-	if providerModel == "" {
-		return nil, errors.New("mapped responses websocket model is required")
-	}
-	return frame.CloneForModel(providerModel)
-}
-
-// Raw first-frame read errors can include private socket addresses. Keep code
-// stable for clients, but use a precise client-safe message for diagnosis.
-func responsesWSFirstFrameReadErrorMessage(err error) string {
-	if errors.Is(err, websocket.ErrReadLimit) {
-		return "frame is too large or invalid; send smaller audio chunks"
-	}
-	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
-		return "timeout waiting for first websocket frame"
-	}
-	return "websocket read failed before first frame"
-}
-
-func responsesWSCurrentModelNames(c *gin.Context) (providerModel string, billingModel string) {
-	if c == nil {
-		return "", ""
-	}
-	providerModel = strings.TrimSpace(c.GetString("new_model"))
-	originalModel := strings.TrimSpace(c.GetString("original_model"))
-	billingModel = responsesWSBillingModel(c, originalModel, providerModel)
-	return providerModel, billingModel
-}
-
-func responsesWSBillingModel(c *gin.Context, originalModel string, providerModel string) string {
-	if c != nil && c.GetBool("billing_original_model") && strings.TrimSpace(originalModel) != "" {
-		return strings.TrimSpace(originalModel)
-	}
-	return strings.TrimSpace(providerModel)
-}
-
-func responsesWSSubsequentModelMismatch(requestModel string, lockedSessionModel string) string {
-	requestModel = strings.TrimSpace(requestModel)
-	lockedSessionModel = strings.TrimSpace(lockedSessionModel)
-	if requestModel == "" || lockedSessionModel == "" || requestModel == lockedSessionModel {
-		return ""
-	}
-	return fmt.Sprintf("responses websocket session is locked to model %q", lockedSessionModel)
-}
-
-func responsesWSSendOutcomeFromError(err error) ResponsesWSSendOutcome {
-	if err == nil {
-		return SendOutcomeLocalWriteOK
-	}
-	if errors.Is(err, runtimesession.ErrSessionClosed) || errors.Is(err, runtimesession.ErrStaleResponsesWSContinuation) {
-		return SendOutcomeNotSent
-	}
-	var event *types.Event
-	if errors.As(err, &event) && event != nil && event.IsError() {
-		code := openAIErrorCodeString(event.ErrorDetail.Code, "")
-		switch code {
-		case "previous_response_not_found", "invalid_event", "responses_ws_unsupported_for_channel":
-			return SendOutcomeNotSent
-		default:
-			return SendOutcomeAmbiguous
-		}
-	}
-	return SendOutcomeAmbiguous
-}
-
-func responsesWSErrorPayload(status int, code string, message string) []byte {
-	return responsesWSErrorPayloadWithParam(status, code, message, "")
-}
-
-func responsesWSErrorPayloadWithParam(status int, code string, message string, param string) []byte {
-	payload := map[string]any{
-		"type":   "error",
-		"status": status,
-		"error": map[string]any{
-			"type":    "invalid_request_error",
-			"code":    code,
-			"message": message,
-		},
-	}
-	if strings.TrimSpace(param) != "" {
-		payload["error"].(map[string]any)["param"] = strings.TrimSpace(param)
-	}
-	encoded, _ := json.Marshal(payload)
-	return encoded
-}
-
-func responsesWSPreviousResponseNotFoundPayload() []byte {
-	return responsesWSErrorPayloadWithParam(http.StatusConflict, "previous_response_not_found", responsesWSStaticErrorMessage("previous_response_not_found"), "previous_response_id")
-}
-
-func responsesWSFallbackPayload() []byte {
-	return responsesWSErrorPayload(http.StatusUpgradeRequired, "responses_ws_unsupported_for_channel", "channel does not support Responses websocket transport")
-}
-
-func responsesWSErrorFromOpenAI(apiErr *types.OpenAIErrorWithStatusCode) []byte {
-	if apiErr == nil {
-		return responsesWSErrorPayload(http.StatusInternalServerError, "system_error", "system error")
-	}
-	errType := strings.TrimSpace(apiErr.Type)
-	if errType == "" {
-		errType = "one_hub_error"
-	}
-	code := openAIErrorCodeString(apiErr.Code, "system_error")
-	message := responsesWSClientMessageFromOpenAI(apiErr, code)
-	param := responsesWSClientParamFromOpenAI(apiErr)
-	payload := map[string]any{
-		"type":   "error",
-		"status": apiErr.StatusCode,
-		"error": map[string]any{
-			"type":    errType,
-			"code":    code,
-			"message": message,
-			"param":   param,
-		},
-	}
-	encoded, _ := json.Marshal(payload)
-	return encoded
-}
-
-func responsesWSClientMessageFromOpenAI(apiErr *types.OpenAIErrorWithStatusCode, code string) string {
-	if apiErr == nil {
-		return responsesWSStaticErrorMessage("system_error")
-	}
-	if !apiErr.LocalError && strings.TrimSpace(apiErr.Message) != "" && apiErr.StatusCode < http.StatusInternalServerError {
-		return apiErr.Message
-	}
-	return responsesWSStaticErrorMessage(code)
-}
-
-func responsesWSClientParamFromOpenAI(apiErr *types.OpenAIErrorWithStatusCode) string {
-	if apiErr == nil || apiErr.LocalError {
-		return ""
-	}
-	param := strings.TrimSpace(apiErr.Param)
-	if param == "" {
-		return ""
-	}
-	switch param {
-	case "model", "input", "instructions", "tools", "tool_choice", "temperature", "top_p", "max_output_tokens", "previous_response_id", "metadata", "stream":
-		return param
-	default:
-		return ""
-	}
-}
-
-func responsesWSErrorFromErr(err error) []byte {
-	if err == nil {
-		return nil
-	}
-	if payload := runtimesession.ClientPayloadFromError(err); len(payload) > 0 {
-		return payload
-	}
-	if errors.Is(err, runtimesession.ErrStaleResponsesWSContinuation) {
-		return responsesWSPreviousResponseNotFoundPayload()
-	}
-	var event *types.Event
-	if errors.As(err, &event) && event != nil && event.IsError() {
-		code := openAIErrorCodeString(event.ErrorDetail.Code, "upstream_error")
-		message := responsesWSStaticErrorMessage(code)
-		return responsesWSErrorPayload(http.StatusBadGateway, code, message)
-	}
-	logger.LogError(context.Background(), "responses websocket upstream error: "+err.Error())
-	return responsesWSErrorPayload(http.StatusBadGateway, "upstream_error", responsesWSStaticErrorMessage("upstream_error"))
-}
-
-func responsesWSStaticErrorMessage(code string) string {
-	switch strings.TrimSpace(code) {
-	case "invalid_event":
-		return "invalid response.create event"
-	case "responses_affinity_conflict":
-		return "responses affinity conflict"
-	case "quota_rollback_failed":
-		return "quota rollback failed"
-	case "responses_ws_attempt_failed":
-		return "responses websocket turn attempt failed"
-	case "responses_ws_payload_rewrite_failed":
-		return "internal payload rewrite failed"
-	case "responses_ws_send_queue_full":
-		return "responses websocket upstream send queue is full"
-	case "previous_response_not_found":
-		return "previous response was not found"
-	case "provider_connection_closed":
-		return "upstream websocket connection closed"
-	case "ws_write_failed":
-		return "upstream websocket write failed"
-	case "upstream_error":
-		return "upstream websocket request failed"
-	default:
-		return "responses websocket request failed"
-	}
-}
-
-func isResponsesContinuationMissError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, runtimesession.ErrStaleResponsesWSContinuation) {
-		return false
-	}
-	payload := responsesWSErrorFromErr(err)
-	if len(payload) == 0 {
-		return false
-	}
-	return responsesws.ClassifyResponsesWSEvent(payload).ContinuationMiss || strings.Contains(strings.ToLower(err.Error()), "previous_response_not_found")
-}
-
-func mergeResponsesWSUsageEvent(usage *types.Usage, event *types.UsageEvent) {
-	if usage == nil || event == nil {
-		return
-	}
-	usage.PromptTokens += event.InputTokens
-	usage.CompletionTokens += event.OutputTokens
-	usage.TotalTokens += event.TotalTokens
-	usage.PromptTokensDetails.Merge(&event.InputTokenDetails)
-	usage.CompletionTokensDetails.Merge(&event.OutputTokenDetails)
-	usage.ExtraTokens = mergeIntMaps(usage.ExtraTokens, event.ExtraTokens)
-	usage.MergeExtraBilling(event.ExtraBilling)
-}
-
-func mergeResponsesWSResponsesUsage(usage *types.Usage, responseUsage *types.ResponsesUsage) {
-	if usage == nil || responseUsage == nil {
-		return
-	}
-	if responseUsage.InputTokens > 0 {
-		usage.PromptTokens = responseUsage.InputTokens
-	}
-	if responseUsage.OutputTokens > 0 {
-		usage.CompletionTokens = responseUsage.OutputTokens
-	}
-	if responseUsage.TotalTokens > 0 {
-		usage.TotalTokens = responseUsage.TotalTokens
-	}
-	if responseUsage.InputTokensDetails != nil {
-		overwritePositiveInt(&usage.PromptTokensDetails.AudioTokens, responseUsage.InputTokensDetails.AudioTokens)
-		overwritePositiveInt(&usage.PromptTokensDetails.CachedTokens, responseUsage.InputTokensDetails.CachedTokens)
-		overwritePositiveInt(&usage.PromptTokensDetails.CachedReadTokens, responseUsage.InputTokensDetails.CachedReadTokens)
-		overwritePositiveInt(&usage.PromptTokensDetails.CachedWriteTokens, responseUsage.InputTokensDetails.CachedWriteTokens)
-		overwritePositiveInt(&usage.PromptTokensDetails.TextTokens, responseUsage.InputTokensDetails.TextTokens)
-		overwritePositiveInt(&usage.PromptTokensDetails.ImageTokens, responseUsage.InputTokensDetails.ImageTokens)
-	}
-	if responseUsage.OutputTokensDetails != nil {
-		overwritePositiveInt(&usage.CompletionTokensDetails.ReasoningTokens, responseUsage.OutputTokensDetails.ReasoningTokens)
-	}
-}
-
-func overwritePositiveInt(dst *int, src int) {
-	if dst != nil && src > 0 {
-		*dst = src
-	}
-}
-
-func mergeResponsesWSTerminalResponse(usage *types.Usage, response *types.OpenAIResponsesResponses) {
-	if usage == nil || response == nil {
-		return
-	}
-	mergeResponsesWSResponsesUsage(usage, response.Usage)
-	// Terminal response output is the fallback source for Responses tool billing.
-	// Provider UsageEvents can already contain the same charges, so merge by max
-	// count per normalized key rather than adding and risking double billing.
-	usage.ExtraBilling = mergeExtraBillingMapsMax(usage.ExtraBilling, types.GetResponsesExtraBilling(response))
-}
-
-func responsesWSUsageHasBillableEvidence(usage *types.Usage) bool {
-	if usage == nil {
-		return false
-	}
-	if usage.PromptTokens > 0 || usage.CompletionTokens > 0 || usage.TotalTokens > 0 {
-		return true
-	}
-	if len(usage.GetExtraTokens()) > 0 {
-		return true
-	}
-	for _, extra := range usage.ExtraBilling {
-		if extra.CallCount > 0 {
-			return true
-		}
-	}
-	return false
-}
-
-func mergeIntMaps(dst map[string]int, src map[string]int) map[string]int {
-	if len(src) == 0 {
-		return dst
-	}
-	if dst == nil {
-		dst = make(map[string]int, len(src))
-	}
-	for key, value := range src {
-		dst[key] += value
-	}
-	return dst
-}
-
-func mergeExtraBillingMapsMax(dst map[string]types.ExtraBilling, src map[string]types.ExtraBilling) map[string]types.ExtraBilling {
-	if len(src) == 0 {
-		return dst
-	}
-	if dst == nil {
-		dst = make(map[string]types.ExtraBilling, len(src))
-	}
-	for key, value := range src {
-		serviceType := types.ResolveExtraBillingServiceType(key, value)
-		bType := types.ResolveExtraBillingType(key, value)
-		normalizedKey := types.BuildExtraBillingKey(serviceType, bType)
-		if normalizedKey == "" {
-			continue
-		}
-		value.ServiceType = serviceType
-		value.Type = bType
-		if existing, ok := dst[normalizedKey]; ok && existing.CallCount >= value.CallCount {
-			continue
-		}
-		dst[normalizedKey] = value
-	}
-	return dst
-}
-
-func logResponsesWSError(c *gin.Context, message string) {
-	ctx := context.Background()
-	if c != nil && c.Request != nil {
-		ctx = c.Request.Context()
-	}
-	logger.LogError(ctx, message)
 }
