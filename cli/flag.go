@@ -53,7 +53,6 @@ func InitCli() {
 	if err := viper.ReadInConfig(); err != nil {
 		panic(err)
 	}
-
 }
 
 func help() {

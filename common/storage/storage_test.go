@@ -22,12 +22,23 @@ func InitConfig() {
 	viper.ReadInConfig()
 	requester.InitHttpClient()
 }
+
+func skipIfMissing(t *testing.T, name string, values ...string) {
+	t.Helper()
+	for _, value := range values {
+		if value == "" {
+			t.Skipf("skip %s integration test: storage credentials are not configured", name)
+		}
+	}
+}
+
 func TestALIOSSUpload(t *testing.T) {
 	InitConfig()
 	endpoint := viper.GetString("storage.alioss.endpoint")
 	accessKeyId := viper.GetString("storage.alioss.accessKeyId")
 	accessKeySecret := viper.GetString("storage.alioss.accessKeySecret")
 	bucketName := viper.GetString("storage.alioss.bucketName")
+	skipIfMissing(t, "alioss", endpoint, accessKeyId, accessKeySecret, bucketName)
 	aliUpload := drives.NewAliOSSUpload(endpoint, accessKeyId, accessKeySecret, bucketName)
 
 	image, err := base64.StdEncoding.DecodeString(testImageB64)
@@ -43,6 +54,7 @@ func TestALIOSSUpload(t *testing.T) {
 func TestSMMSUpload(t *testing.T) {
 	InitConfig()
 	smSecret := viper.GetString("storage.smms.secret")
+	skipIfMissing(t, "smms", smSecret)
 	smUpload := drives.NewSMUpload(smSecret)
 
 	image, err := base64.StdEncoding.DecodeString(testImageB64)
@@ -59,6 +71,7 @@ func TestSMMSUpload(t *testing.T) {
 func TestImgurUpload(t *testing.T) {
 	InitConfig()
 	imgurClientId := viper.GetString("storage.imgur.client_id")
+	skipIfMissing(t, "imgur", imgurClientId)
 	imgurUpload := drives.NewImgurUpload(imgurClientId)
 
 	image, err := base64.StdEncoding.DecodeString(testImageB64)

@@ -32,7 +32,6 @@ func (c *CurrentTime) GetTool() *protocol.Tool {
 
 // HandleRequest 处理当前时间工具的请求
 func (c *CurrentTime) HandleRequest(_ context.Context, _ *protocol.CallToolRequest) (*protocol.CallToolResult, error) {
-
 	// 获取当前时间
 	var currentTime time.Time
 	currentTime = time.Now()

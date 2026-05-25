@@ -55,7 +55,6 @@ func (p *GeminiProvider) CreateChatCompletion(request *types.ChatCompletionReque
 }
 
 func (p *GeminiProvider) CreateChatCompletionStream(request *types.ChatCompletionRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
-
 	channel := p.GetChannel()
 	if p.UseOpenaiAPI {
 		return p.OpenAIProvider.CreateChatCompletionStream(request)
@@ -124,7 +123,6 @@ func (p *GeminiProvider) getChatRequest(geminiRequest *GeminiChatRequest, isRela
 }
 
 func ConvertFromChatOpenai(request *types.ChatCompletionRequest) (*GeminiChatRequest, *types.OpenAIErrorWithStatusCode) {
-
 	threshold := "BLOCK_NONE"
 
 	// if strings.HasPrefix(request.Model, "gemini-2.0") && !strings.Contains(request.Model, "thinking") {
@@ -378,7 +376,6 @@ func (h *GeminiStreamHandler) HandlerStream(rawLine *[]byte, dataChan chan strin
 	}
 
 	h.convertToOpenaiStream(&geminiResponse, dataChan)
-
 }
 
 func (h *GeminiStreamHandler) convertToOpenaiStream(geminiResponse *GeminiChatResponse, dataChan chan string) {
@@ -439,13 +436,6 @@ func (h *GeminiStreamHandler) convertToOpenaiStream(geminiResponse *GeminiChatRe
 
 	usage.TextBuilder = h.Usage.TextBuilder
 	*h.Usage = usage
-}
-
-const tokenThreshold = 1000000
-
-var modelAdjustRatios = map[string]int{
-	"gemini-1.5-pro":   2,
-	"gemini-1.5-flash": 2,
 }
 
 // func adjustTokenCounts(modelName string, usage *GeminiUsageMetadata) {
@@ -541,5 +531,4 @@ func (p *GeminiProvider) pluginHandle(request *GeminiChatRequest) {
 	request.Tools = append(request.Tools, GeminiChatTools{
 		CodeExecution: &GeminiCodeExecution{},
 	})
-
 }

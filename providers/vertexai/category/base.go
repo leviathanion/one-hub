@@ -22,7 +22,6 @@ type Category struct {
 var CategoryMap = map[string]*Category{}
 
 func GetCategory(modelName string) (*Category, error) {
-
 	category := ""
 
 	if strings.HasPrefix(modelName, "gemini") {
@@ -36,7 +35,6 @@ func GetCategory(modelName string) (*Category, error) {
 	}
 
 	return CategoryMap[category], nil
-
 }
 
 type ChatCompletionConvert func(*types.ChatCompletionRequest) (any, *types.OpenAIErrorWithStatusCode)

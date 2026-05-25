@@ -115,7 +115,13 @@ func NewQuota(c *gin.Context, modelName string, promptTokens int) *Quota {
 	quota.outputRatio = quota.price.GetOutput() * quota.groupRatio
 
 	return quota
+}
 
+func (q *Quota) ModelName() string {
+	if q == nil {
+		return ""
+	}
+	return q.modelName
 }
 
 func readQuotaCallerNamespace(c *gin.Context) string {
@@ -776,7 +782,6 @@ func (q *Quota) GetExtraBillingData(extraBilling map[string]types.ExtraBilling) 
 			CallCount:   value.CallCount,
 			Price:       getDefaultExtraServicePrice(serviceType, q.modelName, billingType),
 		}
-
 	}
 
 	if len(extraBillingData) == 0 {

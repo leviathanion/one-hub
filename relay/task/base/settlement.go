@@ -167,7 +167,7 @@ func buildTaskSettlementIdentity(task *model.Task) string {
 	if task.ID > 0 {
 		return fmt.Sprintf("task:%d:finalize", task.ID)
 	}
- 
+
 	platform := strings.TrimSpace(task.Platform)
 	taskID := strings.TrimSpace(task.TaskID)
 	if platform == "" || taskID == "" {

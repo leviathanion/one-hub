@@ -172,7 +172,6 @@ func (p *Pricing) updateRawPrice(modelName string, price *Price) error {
 
 // UpdatePrice updates the price of a model
 func (p *Pricing) UpdatePrice(modelName string, price *Price) error {
-
 	if err := p.updateRawPrice(modelName, price); err != nil {
 		return err
 	}
@@ -513,7 +512,6 @@ func (p *Pricing) BatchSetPrices(batchPrices *BatchPrices, originalModels []stri
 			tx.Rollback()
 			return err
 		}
-
 	}
 	tx.Commit()
 

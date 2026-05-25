@@ -123,7 +123,6 @@ func (converter *OpenAIResponsesStreamConverter) ProcessStreamData(jsonStr strin
 	}
 
 	converter.processChoices(response.Choices)
-
 }
 
 func (converter *OpenAIResponsesStreamConverter) ProcessError(jsonStr string) {
@@ -185,7 +184,6 @@ func (converter *OpenAIResponsesStreamConverter) processChoices(choices []types.
 		}
 
 		if currentType == types.InputTypeFunctionCall {
-
 			if len(choice.Delta.ToolCalls) > 0 && converter.lastToolCallIndex != choice.Delta.ToolCalls[0].Index {
 				needNewOutputItem = true
 				converter.lastToolCallIndex = choice.Delta.ToolCalls[0].Index
@@ -252,7 +250,6 @@ func (converter *OpenAIResponsesStreamConverter) createNewItem(choice types.Chat
 
 // 结束
 func (converter *OpenAIResponsesStreamConverter) done() {
-
 	switch converter.lastResponseType {
 	case types.InputTypeMessage:
 		if converter.part != nil {
@@ -300,7 +297,6 @@ func (converter *OpenAIResponsesStreamConverter) processMessage(choice types.Cha
 		if converter.part != nil {
 			converter.doneMessagePart()
 		}
-
 	}
 
 	if converter.part == nil {
@@ -329,7 +325,6 @@ func (converter *OpenAIResponsesStreamConverter) processMessage(choice types.Cha
 
 // 结束message part
 func (converter *OpenAIResponsesStreamConverter) doneMessagePart() {
-
 	// 先结束掉 response.output_text.done
 	response := converter.buildStreamResponseWithItemID("response.output_text.done")
 	response.ContentIndex = &converter.contentIndex
@@ -361,7 +356,6 @@ func (converter *OpenAIResponsesStreamConverter) processReasoning(choice types.C
 		if converter.part != nil {
 			converter.doneReasoningPart()
 		}
-
 	}
 
 	if converter.part == nil {

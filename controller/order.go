@@ -175,7 +175,6 @@ func PaymentCallback(c *gin.Context) {
 	}
 
 	model.RecordQuotaLog(order.UserId, model.LogTypeTopup, order.Quota, c.ClientIP(), fmt.Sprintf("在线充值成功，充值积分: %d，支付金额：%.2f %s", order.Quota, order.OrderAmount, order.OrderCurrency))
-
 }
 
 func CheckOrderStatus(c *gin.Context) {

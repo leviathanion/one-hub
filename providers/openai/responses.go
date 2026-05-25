@@ -51,19 +51,6 @@ func shouldTrackResponsesUsageByType(eventType string) bool {
 	return ok
 }
 
-func (p *OpenAIProvider) buildResponsesOperationRequest(pathSuffix string, modelName string, request any) (*http.Request, *types.OpenAIErrorWithStatusCode) {
-	basePath, errWithCode := p.GetSupportedAPIUri(config.RelayModeResponses)
-	if errWithCode != nil {
-		return nil, errWithCode
-	}
-
-	fullPath := joinURLPath(basePath, pathSuffix)
-	fullRequestURL := p.GetFullRequestURL(fullPath, modelName)
-	headers := p.GetRequestHeaders()
-
-	return p.BuildRequestWithMerge(request, fullRequestURL, headers, modelName)
-}
-
 func joinURLPath(basePath string, suffix string) string {
 	basePath = strings.TrimRight(basePath, "/")
 	suffix = strings.TrimLeft(suffix, "/")
@@ -526,7 +513,6 @@ func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataCh
 				FinishReason: finishReason,
 			})
 			needOutput = true
-
 		}
 	}
 

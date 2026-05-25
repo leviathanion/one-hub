@@ -10,7 +10,6 @@ import (
 	"one-api/common/storage"
 	"one-api/common/utils"
 	"one-api/types"
-	"regexp"
 	"strings"
 
 	goahocorasick "github.com/anknown/ahocorasick"
@@ -26,7 +25,6 @@ const (
 )
 
 var ImageSymbolAcMachines = &goahocorasick.Machine{}
-var imageRegex = regexp.MustCompile(`\!\[one-hub-gemini-image\]\((.*?)\)`)
 
 func init() {
 	ImageSymbolAcMachines.Build([][]rune{[]rune(GeminiImageSymbol)})
@@ -226,7 +224,6 @@ func (candidate *GeminiChatCandidate) ToOpenAIChoice(request *types.ChatCompleti
 			choice.Message.ToolCalls = append(choice.Message.ToolCalls, part.FunctionCall.ToOpenAITool())
 		} else if part.InlineData != nil {
 			if strings.HasPrefix(part.InlineData.MimeType, "image/") {
-
 				images = append(images, types.MultimediaData{
 					Data: part.InlineData.Data,
 				})
@@ -466,7 +463,6 @@ func OpenAIToGeminiChatContent(openaiContents []types.ChatCompletionMessage) ([]
 						Args: args,
 					},
 				})
-
 			}
 			text := openaiContent.StringContent()
 			if text != "" {
@@ -565,7 +561,6 @@ func OpenAIToGeminiChatContent(openaiContents []types.ChatCompletionMessage) ([]
 							Text: openaiPart.Text,
 						})
 					}
-
 				} else if openaiPart.Type == types.ContentTypeImageURL {
 					imageNum += 1
 					if imageNum > GeminiVisionMaxImageNum {
@@ -585,7 +580,6 @@ func OpenAIToGeminiChatContent(openaiContents []types.ChatCompletionMessage) ([]
 			}
 		}
 		contents = append(contents, content)
-
 	}
 
 	return contents, strings.Join(systemContent, "\n"), nil

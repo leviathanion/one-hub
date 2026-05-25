@@ -134,7 +134,6 @@ func (p *MidjourneyProvider) Send(timeout int, requestURL string) (*MidjourneyRe
 		StatusCode: statusCode,
 		Response:   midjResponse,
 	}, responseBody, nil
-
 }
 
 func (p *MidjourneyProvider) GetRequestHeaders() (headers map[string]string) {

@@ -64,7 +64,6 @@ type StatisticsDetail struct {
 }
 
 func GetStatisticsDetail(c *gin.Context) {
-
 	statisticsDetail := &StatisticsDetail{}
 	userStatistics, err := model.GetStatisticsUser()
 	if err == nil {

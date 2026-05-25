@@ -121,13 +121,11 @@ func RelayTaskSubmit(c *gin.Context) {
 		if !taskAdaptor.ShouldRetry(c, taskErr) {
 			break
 		}
-
 	}
 
 	if taskErr != nil {
 		taskAdaptor.HandleError(taskErr)
 	}
-
 }
 
 func prepareTaskAttemptQuota(c *gin.Context, taskAdaptor base.TaskInterface) (*relay_util.Quota, *base.TaskError) {

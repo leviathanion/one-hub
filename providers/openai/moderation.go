@@ -7,7 +7,6 @@ import (
 )
 
 func (p *OpenAIProvider) CreateModeration(request *types.ModerationRequest) (*types.ModerationResponse, *types.OpenAIErrorWithStatusCode) {
-
 	req, errWithCode := p.GetRequestTextBody(config.RelayModeModerations, request.Model, request)
 	if errWithCode != nil {
 		return nil, errWithCode

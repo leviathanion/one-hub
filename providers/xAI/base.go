@@ -70,7 +70,6 @@ func usageHandler(usage *types.Usage) (ForcedFormatting bool) {
 }
 
 func requestHandler(request *types.ChatCompletionRequest) (errWithCode *types.OpenAIErrorWithStatusCode) {
-
 	if strings.HasPrefix(request.Model, "grok-4") || strings.HasPrefix(request.Model, "grok-3-mini") || strings.HasPrefix(request.Model, "grok-3-mini-fast") {
 		request.Stop = nil
 		request.FrequencyPenalty = nil

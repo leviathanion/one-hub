@@ -13,19 +13,6 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func shouldEnableChannel(err error, openAIErr *types.OpenAIErrorWithStatusCode) bool {
-	if !config.AutomaticEnableChannelEnabled {
-		return false
-	}
-	if err != nil {
-		return false
-	}
-	if openAIErr != nil {
-		return false
-	}
-	return true
-}
-
 func ShouldDisableChannel(channelType int, err *types.OpenAIErrorWithStatusCode) bool {
 	if !config.AutomaticDisableChannelEnabled || err == nil || err.LocalError {
 		return false

@@ -58,7 +58,6 @@ func (p *ReplicateProvider) CreateChatCompletion(request *types.ChatCompletionRe
 }
 
 func convertFromChatOpenai(request *types.ChatCompletionRequest) *ReplicateRequest[ReplicateChatRequest] {
-
 	systemPrompt := ""
 	prompt := ""
 
@@ -97,7 +96,6 @@ func convertFromChatOpenai(request *types.ChatCompletionRequest) *ReplicateReque
 }
 
 func (p *ReplicateProvider) convertToChatOpenai(response *ReplicateResponse[[]string]) (*types.ChatCompletionResponse, *types.OpenAIErrorWithStatusCode) {
-
 	responseText := ""
 	if response.Output != nil {
 		for _, text := range response.Output {
@@ -190,7 +188,6 @@ func (p *ReplicateProvider) CreateChatCompletionStream(request *types.ChatComple
 
 func (h *ReplicateStreamHandler) HandlerChatStream(rawLine *[]byte, dataChan chan string, errChan chan error) {
 	if strings.HasPrefix(string(*rawLine), "event: done") {
-
 		// 获取用量
 		replicateResponse := getPredictionResponse[[]string](h.Provider, h.ID)
 

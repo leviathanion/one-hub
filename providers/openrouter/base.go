@@ -15,7 +15,6 @@ type OpenRouterProviderFactory struct{}
 // 创建 OpenRouterProvider
 // https://platform.-ai.com/docs/api
 func (f OpenRouterProviderFactory) Create(channel *model.Channel) base.ProviderInterface {
-
 	return &OpenRouterProvider{
 		OpenAIProvider: openai.OpenAIProvider{
 			BaseProvider: base.BaseProvider{

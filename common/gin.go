@@ -367,7 +367,6 @@ func StringErrorWrapperLocal(err string, code string, statusCode int) *types.Ope
 	openaiErr := StringErrorWrapper(err, code, statusCode)
 	openaiErr.LocalError = true
 	return openaiErr
-
 }
 
 func AbortWithMessage(c *gin.Context, statusCode int, message string) {
@@ -408,7 +407,6 @@ func StringRerankErrorWrapperLocal(err string, code string, statusCode int) *typ
 	rerankError := StringRerankErrorWrapper(err, code, statusCode)
 	rerankError.LocalError = true
 	return rerankError
-
 }
 
 func OpenAIErrorToRerankError(err *types.OpenAIErrorWithStatusCode) *types.RerankErrorWithStatusCode {

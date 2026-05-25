@@ -18,6 +18,7 @@ import (
 	"one-api/common/storage"
 	"one-api/common/telegram"
 	"one-api/common/webauthn"
+	"one-api/common/wsconn"
 	"one-api/controller"
 	"one-api/cron"
 	"one-api/metrics"
@@ -27,6 +28,9 @@ import (
 	"one-api/relay/task"
 	"one-api/router"
 	"one-api/safty"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/gin-contrib/sessions"
@@ -151,9 +155,28 @@ func initHttpServer() {
 	router.SetRouter(server, buildFS, indexPage)
 	port := viper.GetString("port")
 
-	err := server.Run(":" + port)
-	if err != nil {
-		logger.FatalLog("failed to start HTTP server: " + err.Error())
+	httpServer := &http.Server{
+		Addr:    ":" + port,
+		Handler: server,
+	}
+	go func() {
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.FatalLog("failed to start HTTP server: " + err.Error())
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	<-stop
+	signal.Stop(stop)
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := wsconn.ShutdownActive(shutdownCtx); err != nil {
+		logger.SysError("failed to drain active websocket connections: " + err.Error())
+	}
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		logger.FatalLog("failed to shutdown HTTP server: " + err.Error())
 	}
 }
 

@@ -106,7 +106,6 @@ func DeleteUserGroup(c *gin.Context) {
 		"success": true,
 		"message": "",
 	})
-
 }
 
 func ChangeUserGroupEnable(c *gin.Context) {

@@ -19,10 +19,20 @@ func InitConfig() {
 	requester.InitHttpClient()
 }
 
+func skipIfMissing(t *testing.T, name string, values ...string) {
+	t.Helper()
+	for _, value := range values {
+		if value == "" {
+			t.Skipf("skip %s integration test: notification credentials are not configured", name)
+		}
+	}
+}
+
 func TestDingTalkSend(t *testing.T) {
 	InitConfig()
 	access_token := viper.GetString("notify.dingtalk.token")
 	secret := viper.GetString("notify.dingtalk.secret")
+	skipIfMissing(t, "dingtalk", access_token, secret)
 	dingTalk := channel.NewDingTalk(access_token, secret)
 
 	err := dingTalk.Send(context.Background(), "Test Title", "*Test Message*")
@@ -34,6 +44,7 @@ func TestDingTalkSendWithKeyWord(t *testing.T) {
 	InitConfig()
 	access_token := viper.GetString("notify.dingtalk.token")
 	keyWord := viper.GetString("notify.dingtalk.keyWord")
+	skipIfMissing(t, "dingtalk keyword", access_token, keyWord)
 
 	dingTalk := channel.NewDingTalkWithKeyWord(access_token, keyWord)
 
@@ -56,6 +67,7 @@ func TestLarkSend(t *testing.T) {
 	InitConfig()
 	access_token := viper.GetString("notify.lark.token")
 	secret := viper.GetString("notify.lark.secret")
+	skipIfMissing(t, "lark", access_token, secret)
 	dingTalk := channel.NewLark(access_token, secret)
 
 	err := dingTalk.Send(context.Background(), "Test Title", "*Test Message*")
@@ -67,6 +79,7 @@ func TestLarkSendWithKeyWord(t *testing.T) {
 	InitConfig()
 	access_token := viper.GetString("notify.lark.token")
 	keyWord := viper.GetString("notify.lark.keyWord")
+	skipIfMissing(t, "lark keyword", access_token, keyWord)
 
 	dingTalk := channel.NewLarkWithKeyWord(access_token, keyWord)
 
@@ -88,6 +101,7 @@ func TestLarkSendError(t *testing.T) {
 func TestPushdeerSend(t *testing.T) {
 	InitConfig()
 	pushkey := viper.GetString("notify.pushdeer.pushkey")
+	skipIfMissing(t, "pushdeer", pushkey)
 	dingTalk := channel.NewPushdeer(pushkey, "")
 
 	err := dingTalk.Send(context.Background(), "Test Title", "*Test Message*")
@@ -110,6 +124,7 @@ func TestTelegramSend(t *testing.T) {
 	secret := viper.GetString("notify.telegram.bot_api_key")
 	chatID := viper.GetString("notify.telegram.chat_id")
 	httpProxy := viper.GetString("notify.telegram.http_proxy")
+	skipIfMissing(t, "telegram", secret, chatID)
 	dingTalk := channel.NewTelegram(secret, chatID, httpProxy)
 
 	err := dingTalk.Send(context.Background(), "Test Title", "*Test Message*")

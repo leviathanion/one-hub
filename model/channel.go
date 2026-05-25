@@ -389,7 +389,6 @@ func (c *Channel) SetProxy() {
 		idStr := hex.EncodeToString(md5Str[:])
 		*c.Proxy = strings.Replace(*c.Proxy, "%s", idStr, 1)
 	}
-
 }
 
 func (channel *Channel) GetPriority() int64 {
@@ -628,7 +627,6 @@ func (channel *Channel) Insert() error {
 }
 
 func (channel *Channel) Update(overwrite bool) error {
-
 	err := channel.UpdateRaw(overwrite)
 
 	if err == nil {

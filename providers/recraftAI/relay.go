@@ -7,7 +7,6 @@ import (
 )
 
 func (p *RecraftProvider) CreateRelay(url string) (*http.Response, *types.OpenAIErrorWithStatusCode) {
-
 	// 获取请求地址
 	fullRequestURL := p.GetFullRequestURL(url)
 	if fullRequestURL == "" {

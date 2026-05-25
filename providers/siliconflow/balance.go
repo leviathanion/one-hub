@@ -18,7 +18,6 @@ type UserInfo struct {
 }
 
 func (p *SiliconflowProvider) Balance() (float64, error) {
-
 	fullRequestURL := p.GetFullRequestURL("/v1/user/info", "")
 	headers := p.GetRequestHeaders()
 

@@ -32,7 +32,6 @@ func InitALIOSSStorage() {
 	}
 	bucketName := viper.GetString("storage.alioss.bucketName")
 	if bucketName == "" {
-
 		return
 	}
 

@@ -75,7 +75,6 @@ func (w *WeChatPay) Pay(config *types.PayConfig, gatewayConfig string) (*types.P
 }
 
 func (w *WeChatPay) HandleCallback(c *gin.Context, gatewayConfig string) (*types.PayNotify, error) {
-
 	wxpayConfig, err := getWeChatConfig(gatewayConfig)
 	if err != nil {
 		// 接收失败，返回4XX或5XX状态码以及应答报文
@@ -104,7 +103,7 @@ func (w *WeChatPay) HandleCallback(c *gin.Context, gatewayConfig string) (*types
 	}
 	if *transaction.TradeState != "SUCCESS" {
 		c.Status(http.StatusNoContent)
-		return nil, fmt.Errorf("tradeNo: %s, TransactionId: %s,  err: %v", transaction.OutTradeNo, transaction.TransactionId, err)
+		return nil, fmt.Errorf("tradeNo: %s, TransactionId: %s,  err: %v", *transaction.OutTradeNo, *transaction.TransactionId, err)
 	}
 
 	payNotify := &types.PayNotify{
@@ -113,7 +112,6 @@ func (w *WeChatPay) HandleCallback(c *gin.Context, gatewayConfig string) (*types
 	}
 	c.Status(http.StatusNoContent)
 	return payNotify, nil
-
 }
 
 func getWeChatConfig(gatewayConfig string) (*WeChatConfig, error) {

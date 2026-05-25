@@ -47,8 +47,7 @@ func GetRedemptionById(id int) (*Redemption, error) {
 		return nil, errors.New("id 为空！")
 	}
 	redemption := Redemption{Id: id}
-	var err error = nil
-	err = DB.First(&redemption, "id = ?", id).Error
+	err := DB.First(&redemption, "id = ?", id).Error
 	return &redemption, err
 }
 

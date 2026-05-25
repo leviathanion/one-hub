@@ -16,7 +16,6 @@ type BalanceInfo struct {
 }
 
 func (p *DeepseekProvider) Balance() (float64, error) {
-
 	fullRequestURL := p.GetFullRequestURL("/user/balance", "")
 	headers := p.GetRequestHeaders()
 

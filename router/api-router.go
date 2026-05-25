@@ -153,7 +153,6 @@ func SetApiRouter(router *gin.Engine) {
 			userGroup.PUT("/enable/:id", controller.ChangeUserGroupEnable)
 			userGroup.PUT("/", controller.UpdateUserGroup)
 			userGroup.DELETE("/:id", controller.DeleteUserGroup)
-
 		}
 		channelRoute := apiRouter.Group("/channel")
 		channelRoute.Use(middleware.AdminAuth())
@@ -200,7 +199,6 @@ func SetApiRouter(router *gin.Engine) {
 			channelTagRoute.DELETE("/:tag/disabled", controller.DeleteDisabledChannelsTag)
 			channelTagRoute.PUT("/:tag/priority", controller.UpdateChannelsTagPriority)
 			channelTagRoute.PUT("/:tag/status/:status", controller.ChangeChannelsTagStatus)
-
 		}
 
 		tokenRoute := apiRouter.Group("/token")
@@ -261,7 +259,6 @@ func SetApiRouter(router *gin.Engine) {
 			pricesRoute.PUT("/multiple/delete", controller.BatchDeletePrices)
 			pricesRoute.POST("/sync", controller.SyncPricing)
 			pricesRoute.GET("/updateService", controller.GetUpdatePriceService)
-
 		}
 
 		paymentRoute := apiRouter.Group("/payment")
@@ -289,5 +286,4 @@ func SetApiRouter(router *gin.Engine) {
 	{
 		sseRouter.POST("/channel/check", middleware.AdminAuth(), controller.CheckChannel)
 	}
-
 }

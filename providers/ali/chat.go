@@ -154,7 +154,6 @@ func (p *AliProvider) convertFromChatOpenai(request *types.ChatCompletionRequest
 				Role:    strings.ToLower(message.Role),
 			})
 		}
-
 	}
 
 	aliChatRequest := &AliChatRequest{
@@ -220,7 +219,6 @@ func (h *aliStreamHandler) handlerStream(rawLine *[]byte, dataChan chan string, 
 	}
 
 	h.convertToOpenaiStream(&aliResponse, dataChan)
-
 }
 
 func (h *aliStreamHandler) convertToOpenaiStream(aliResponse *AliChatResponse, dataChan chan string) {

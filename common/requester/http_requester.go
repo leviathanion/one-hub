@@ -189,7 +189,6 @@ func (r *HTTPRequester) IsFailureStatusCode(resp *http.Response) bool {
 
 // 处理错误响应
 func HandleErrorResp(resp *http.Response, toOpenAIError HttpErrorHandler, isPrefix bool) *types.OpenAIErrorWithStatusCode {
-
 	openAIErrorWithStatusCode := &types.OpenAIErrorWithStatusCode{
 		StatusCode: resp.StatusCode,
 		OpenAIError: types.OpenAIError{

@@ -64,5 +64,4 @@ func GetFetchByID(c *gin.Context) {
 		Code: "success",
 		Data: data,
 	})
-
 }

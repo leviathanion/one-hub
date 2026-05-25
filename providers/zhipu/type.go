@@ -2,7 +2,6 @@ package zhipu
 
 import (
 	"one-api/types"
-	"time"
 )
 
 type ZhipuWebSearch struct {
@@ -282,9 +281,4 @@ type ZhipuImageGenerationResponse struct {
 	Model string                         `json:"model"`
 	Data  []types.ImageResponseDataInner `json:"data,omitempty"`
 	ZhipuResponseError
-}
-
-type zhipuTokenData struct {
-	Token      string
-	ExpiryTime time.Time
 }

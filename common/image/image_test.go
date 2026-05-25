@@ -1,13 +1,17 @@
 package image_test
 
 import (
+	"bytes"
 	"encoding/base64"
 	"image"
-	_ "image/gif"
-	_ "image/jpeg"
-	_ "image/png"
+	"image/color"
+	"image/gif"
+	"image/jpeg"
+	"image/png"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -16,7 +20,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	_ "golang.org/x/image/webp"
 )
 
 type CountingReader struct {
@@ -31,19 +34,79 @@ func (r *CountingReader) Read(p []byte) (n int, err error) {
 }
 
 var (
+	cases []struct {
+		url    string
+		format string
+		width  int
+		height int
+	}
+)
+
+func TestMain(m *testing.M) {
+	server := newImageFixtureServer()
+	defer server.Close()
 	cases = []struct {
 		url    string
 		format string
 		width  int
 		height int
 	}{
-		{"https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg", "jpeg", 2560, 1669},
-		{"https://upload.wikimedia.org/wikipedia/commons/9/97/Basshunter_live_performances.png", "png", 4500, 2592},
-		{"https://upload.wikimedia.org/wikipedia/commons/c/c6/TO_THE_ONE_SOMETHINGNESS.webp", "webp", 984, 985},
-		{"https://upload.wikimedia.org/wikipedia/commons/d/d0/01_Das_Sandberg-Modell.gif", "gif", 1917, 1533},
-		{"https://upload.wikimedia.org/wikipedia/commons/6/62/102Cervus.jpg", "jpeg", 270, 230},
+		{server.URL + "/fixture.jpg", "jpeg", 32, 21},
+		{server.URL + "/fixture.png", "png", 45, 26},
+		{server.URL + "/fixture.gif", "gif", 19, 15},
 	}
-)
+	os.Exit(m.Run())
+}
+
+func newImageFixtureServer() *httptest.Server {
+	fixtures := map[string]struct {
+		contentType string
+		data        []byte
+	}{
+		"/fixture.jpg": {"image/jpeg", encodeTestImage("jpeg", 32, 21)},
+		"/fixture.png": {"image/png", encodeTestImage("png", 45, 26)},
+		"/fixture.gif": {"image/gif", encodeTestImage("gif", 19, 15)},
+		"/not-image":   {"text/plain", []byte("not an image")},
+	}
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fixture, ok := fixtures[r.URL.Path]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", fixture.contentType)
+		_, _ = w.Write(fixture.data)
+	}))
+}
+
+func encodeTestImage(format string, width int, height int) []byte {
+	rect := image.Rect(0, 0, width, height)
+	palette := []color.Color{color.RGBA{R: 0x20, G: 0x80, B: 0xc0, A: 0xff}}
+	img := image.NewPaletted(rect, palette)
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			img.SetColorIndex(x, y, 0)
+		}
+	}
+	var buf bytes.Buffer
+	switch format {
+	case "jpeg":
+		if err := jpeg.Encode(&buf, img, nil); err != nil {
+			panic(err)
+		}
+	case "png":
+		if err := png.Encode(&buf, img); err != nil {
+			panic(err)
+		}
+	case "gif":
+		if err := gif.Encode(&buf, img, nil); err != nil {
+			panic(err)
+		}
+	default:
+		panic("unknown image test format")
+	}
+	return buf.Bytes()
+}
 
 func TestDecode(t *testing.T) {
 	// Bytes read: varies sometimes
@@ -194,8 +257,7 @@ func TestGetImageFromUrl(t *testing.T) {
 		})
 	}
 
-	url := "https://raw.githubusercontent.com/MartialBE/one-api/main/README.md"
-	_, _, err := img.GetImageFromUrl(url)
+	_, _, err := img.GetImageFromUrl("ftp://example.invalid/image.png")
 	assert.Error(t, err)
 	encodedBase64 := "data:image/text;base64,"
 	_, _, err = img.GetImageFromUrl(encodedBase64)

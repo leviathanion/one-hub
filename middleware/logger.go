@@ -13,7 +13,6 @@ import (
 )
 
 func SetUpLogger(server *gin.Engine) {
-
 	server.Use(GinzapWithConfig())
 }
 

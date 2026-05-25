@@ -41,7 +41,6 @@ type streamReader[T streamable] struct {
 func (stream *streamReader[T]) Recv() (<-chan T, <-chan error) {
 	gopool.Go(func() {
 		defer func() {
-
 			if r := recover(); r != nil {
 				logger.SysError(fmt.Sprintf("Panic in streamReader.processLines: %v", r))
 				logger.SysError(fmt.Sprintf("stacktrace from panic: %s", string(debug.Stack())))

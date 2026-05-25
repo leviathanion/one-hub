@@ -150,7 +150,6 @@ func (r *relayChat) send() (err *types.OpenAIErrorWithStatusCode, done bool) {
 		}
 
 		err = responseJsonClient(r.c, response)
-
 	}
 
 	if err != nil {

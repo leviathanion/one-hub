@@ -162,7 +162,6 @@ func getLogLevel() zapcore.Level {
 	default:
 		return zap.InfoLevel
 	}
-
 }
 
 func getLogDir() string {

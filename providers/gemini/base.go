@@ -131,7 +131,6 @@ func (p *GeminiProvider) GetFullRequestURL(requestURL string, modelName string) 
 	}
 
 	return fmt.Sprintf("%s/%s/models/%s:%s", baseURL, version, modelName, requestURL)
-
 }
 
 // 获取请求头

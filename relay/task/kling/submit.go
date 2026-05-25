@@ -136,7 +136,6 @@ func (t *KlingTask) actionValidate() (err error) {
 
 func (t *KlingTask) ShouldRetry(c *gin.Context, err *base.TaskError) bool {
 	return false
-
 }
 
 func (t *KlingTask) UpdateTaskStatus(ctx context.Context, taskChannelM map[int][]string, taskM map[string]*model.Task) error {
@@ -266,7 +265,6 @@ func getKlingTaskActionsForSync(taskIDs []string) ([]*model.Task, error) {
 }
 
 func checkTaskNeedUpdate(oldTask *model.Task, newTask *types.TaskDto) bool {
-
 	if oldTask.SubmitTime != newTask.SubmitTime {
 		return true
 	}

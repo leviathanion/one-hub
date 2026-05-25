@@ -97,7 +97,6 @@ func (p *HunyuanProvider) convertToChatOpenai(response *ChatCompletionsResponse,
 			Message:      types.ChatCompletionMessage{Role: choice.Message.Role, Content: choice.Message.Content},
 			FinishReason: choice.FinishReason,
 		})
-
 	}
 
 	*p.Usage = *openaiResponse.Usage
@@ -106,7 +105,6 @@ func (p *HunyuanProvider) convertToChatOpenai(response *ChatCompletionsResponse,
 }
 
 func convertFromChatOpenai(request *types.ChatCompletionRequest) *ChatCompletionsRequest {
-
 	messages := make([]*Message, 0, len(request.Messages))
 	for _, message := range request.Messages {
 		messages = append(messages, &Message{
@@ -149,7 +147,6 @@ func (h *tunyuanStreamHandler) handlerStream(rawLine *[]byte, dataChan chan stri
 	}
 
 	h.convertToOpenaiStream(&tunyuanChatResponse, dataChan)
-
 }
 
 func (h *tunyuanStreamHandler) convertToOpenaiStream(tunyuanChatResponse *ChatCompletionsResponseParams, dataChan chan string) {

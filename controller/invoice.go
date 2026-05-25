@@ -2,11 +2,13 @@ package controller
 
 import (
 	"fmt"
-	"github.com/gin-gonic/gin"
 	"net/http"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
 	"one-api/common"
 	"one-api/model"
-	"time"
 )
 
 func GenInvoice(c *gin.Context) {

@@ -92,5 +92,4 @@ func (p *GroqProvider) getChatRequestBody(request *types.ChatCompletionRequest) 
 	if request.N != nil && *request.N > 1 {
 		request.N = utils.GetPointer(1)
 	}
-
 }

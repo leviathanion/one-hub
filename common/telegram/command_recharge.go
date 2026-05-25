@@ -29,7 +29,6 @@ func commandRechargeStart(b *gotgbot.Bot, ctx *ext.Context) error {
 		return fmt.Errorf("failed to send recharge start message: %w", err)
 	}
 	return handlers.NextConversationState("recharge_token")
-
 }
 
 func commandRechargeToken(b *gotgbot.Bot, ctx *ext.Context) error {

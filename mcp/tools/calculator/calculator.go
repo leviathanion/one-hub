@@ -5,6 +5,7 @@ package calculator
 import (
 	"context"
 	"fmt"
+
 	"github.com/ThinkInAIXYZ/go-mcp/protocol"
 )
 

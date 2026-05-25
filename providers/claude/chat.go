@@ -205,7 +205,6 @@ func ConvertFromChatOpenai(request *types.ChatCompletionRequest) (*ClaudeRequest
 }
 
 func getThinking(maxTokens int, reasoning *types.ChatReasoning) (thinking *Thinking, outputConfig *OutputConfig, err *types.OpenAIErrorWithStatusCode) {
-
 	// thinking 逻辑
 	if reasoning != nil && reasoning.MaxTokens > 0 {
 		if reasoning.MaxTokens > maxTokens {
@@ -398,7 +397,6 @@ func ConvertToChatOpenai(provider base.ProviderInterface, response *ClaudeRespon
 
 			choices = append(choices, choice)
 		}
-
 	}
 
 	if len(choices) == 0 {

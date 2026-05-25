@@ -81,7 +81,6 @@ func (p *AzureSpeechProvider) getRequestBody(request *types.SpeechAudioRequest) 
 	ssml := CreateSSML(request.Input, voice, role)
 
 	return bytes.NewBufferString(ssml)
-
 }
 
 func (p *AzureSpeechProvider) CreateSpeech(request *types.SpeechAudioRequest) (*http.Response, *types.OpenAIErrorWithStatusCode) {

@@ -47,8 +47,7 @@ func GetTelegramMenuById(id int) (*TelegramMenu, error) {
 		return nil, errors.New("id 为空！")
 	}
 	telegramMenu := TelegramMenu{Id: id}
-	var err error = nil
-	err = DB.First(&telegramMenu, "id = ?", id).Error
+	err := DB.First(&telegramMenu, "id = ?", id).Error
 	return &telegramMenu, err
 }
 

@@ -3,16 +3,17 @@ package controller
 import (
 	"embed"
 	"fmt"
-	"github.com/spf13/viper"
 	"io"
 	"net/http"
-	"one-api/common/logger"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/spf13/viper"
+
+	"one-api/common/logger"
 )
 
 // 缓存

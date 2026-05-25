@@ -532,7 +532,6 @@ func CountTokenImage(input interface{}) (int, error) {
 }
 
 func calculateToken(model string, size string, n int, quality, style string) (int, error) {
-
 	imageCostRatio := 1.0
 	hasValidSize := false
 

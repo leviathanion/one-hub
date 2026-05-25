@@ -18,7 +18,6 @@ type baiduStreamHandler struct {
 }
 
 func (p *BaiduProvider) CreateChatCompletion(request *types.ChatCompletionRequest) (*types.ChatCompletionResponse, *types.OpenAIErrorWithStatusCode) {
-
 	if p.UseOpenaiAPI {
 		if modelNameConvert, ok := modelNameMap[request.Model]; ok {
 			request.Model = modelNameConvert
@@ -43,7 +42,6 @@ func (p *BaiduProvider) CreateChatCompletion(request *types.ChatCompletionReques
 }
 
 func (p *BaiduProvider) CreateChatCompletionStream(request *types.ChatCompletionRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
-
 	if p.UseOpenaiAPI {
 		if modelNameConvert, ok := modelNameMap[request.Model]; ok {
 			request.Model = modelNameConvert
@@ -172,7 +170,6 @@ func convertFromChatOpenai(request *types.ChatCompletionRequest) *BaiduChatReque
 
 	if request.ResponseFormat != nil {
 		baiduChatRequest.ResponseFormat = request.ResponseFormat.Type
-
 	}
 
 	for _, message := range request.Messages {

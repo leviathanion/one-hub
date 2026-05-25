@@ -70,7 +70,6 @@ func updateChannelBalance(channel *model.Channel) (float64, error) {
 	}
 
 	return balanceProvider.Balance()
-
 }
 
 func UpdateChannelBalance(c *gin.Context) {

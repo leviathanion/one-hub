@@ -35,7 +35,6 @@ func commandBindStart(b *gotgbot.Bot, ctx *ext.Context) error {
 		return fmt.Errorf("failed to send bind start message: %w", err)
 	}
 	return handlers.NextConversationState("token")
-
 }
 
 func commandBindToken(b *gotgbot.Bot, ctx *ext.Context) error {

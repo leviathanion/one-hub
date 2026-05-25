@@ -34,7 +34,6 @@ func (c *Client) FormPay(args *PayArgs) (string, map[string]string, error) {
 	domain := strings.TrimSuffix(c.PayDomain, "/")
 
 	return domain + FormSubmitUrl, formPayArgs, nil
-
 }
 
 func (c *Client) Verify(params map[string]string) (*PaymentResult, bool) {

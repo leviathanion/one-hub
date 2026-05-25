@@ -264,7 +264,6 @@ func addExtraRatios() *gormigrate.Migration {
 			option, err := GetOption("ExtraTokenPriceJson")
 			if err == nil {
 				extraTokenPriceJson = option.Value
-
 			} else {
 				extraTokenPriceJson = GetDefaultExtraRatio()
 			}

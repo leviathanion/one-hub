@@ -19,7 +19,6 @@ type BalanceInfo struct {
 }
 
 func (p *MoonshotProvider) Balance() (float64, error) {
-
 	fullRequestURL := p.GetFullRequestURL("/v1/users/me/balance", "")
 	headers := p.GetRequestHeaders()
 

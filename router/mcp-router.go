@@ -3,6 +3,7 @@ package router
 import (
 	"github.com/gin-contrib/gzip"
 	"github.com/gin-gonic/gin"
+
 	"one-api/common/logger"
 	"one-api/mcp"
 	"one-api/middleware"
@@ -35,5 +36,4 @@ func SetMcpRouter(router *gin.Engine) {
 			return
 		}
 	}()
-
 }

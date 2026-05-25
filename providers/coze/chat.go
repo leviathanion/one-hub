@@ -131,7 +131,6 @@ func (p *CozeProvider) convertFromChatOpenai(request *types.ChatCompletionReques
 				ContentType: "text",
 			})
 		}
-
 	}
 
 	return chatRequest
@@ -194,5 +193,4 @@ func (h *CozeStreamHandler) convertToOpenaiStream(chatResponse *CozeStreamRespon
 	streamResponse.Choices = []types.ChatCompletionStreamChoice{choice}
 	responseBody, _ := json.Marshal(streamResponse)
 	dataChan <- string(responseBody)
-
 }

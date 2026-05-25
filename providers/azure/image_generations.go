@@ -11,7 +11,6 @@ import (
 )
 
 func (p *AzureProvider) CreateImageGenerations(request *types.ImageRequest) (*types.ImageResponse, *types.OpenAIErrorWithStatusCode) {
-
 	req, errWithCode := p.GetRequestTextBody(config.RelayModeImagesGenerations, request.Model, request)
 	if errWithCode != nil {
 		return nil, errWithCode
@@ -55,7 +54,6 @@ func (p *AzureProvider) CreateImageGenerations(request *types.ImageRequest) (*ty
 	}
 
 	return response, nil
-
 }
 
 func (p *AzureProvider) ResponseAzureImageHandler(resp *http.Response, azure *ImageAzureResponse) (OpenAIResponse *types.ImageResponse, errWithCode *types.OpenAIErrorWithStatusCode) {

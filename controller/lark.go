@@ -73,7 +73,6 @@ func getLarkAppAccessToken() (string, error) {
 		return "", errors.New(appAccessTokenResponse.Msg)
 	}
 	return appAccessTokenResponse.AppAccessToken, nil
-
 }
 
 func getLarkUserAccessToken(code string) (string, error) {

@@ -179,5 +179,4 @@ func (h *CloudflareAIStreamHandler) convertToOpenaiStream(chatResponse *ChatResu
 	streamResponse.Choices = []types.ChatCompletionStreamChoice{choice}
 	responseBody, _ := json.Marshal(streamResponse)
 	dataChan <- string(responseBody)
-
 }

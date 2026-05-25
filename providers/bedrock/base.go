@@ -23,7 +23,6 @@ type BedrockProviderFactory struct{}
 
 // 创建 BedrockProvider
 func (f BedrockProviderFactory) Create(channel *model.Channel) base.ProviderInterface {
-
 	bedrockProvider := &BedrockProvider{
 		BaseProvider: base.BaseProvider{
 			Config:    getConfig(),

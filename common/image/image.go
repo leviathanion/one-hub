@@ -109,7 +109,6 @@ func GetImageSizeFromUrl(url string) (width, height int, err error) {
 }
 
 func GetImageSize(image string) (width, height int, err error) {
-
 	switch {
 	case strings.HasPrefix(image, "data:image/"):
 		return GetImageSizeFromBase64(image)

@@ -49,7 +49,6 @@ func (p *MiniMaxProvider) GetVoiceMap() map[string][]string {
 }
 
 func (p *MiniMaxProvider) getRequestBody(request *types.SpeechAudioRequest) *SpeechRequest {
-
 	var voice, emotion string
 	voiceMap := p.GetVoiceMap()
 	if voiceMap[request.Voice] != nil {

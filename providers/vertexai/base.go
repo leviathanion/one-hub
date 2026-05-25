@@ -147,7 +147,6 @@ func (p *VertexAIProvider) GetToken() (string, error) {
 }
 
 func RequestErrorHandle(otherErr requester.HttpErrorHandler) requester.HttpErrorHandler {
-
 	return func(resp *http.Response) *types.OpenAIError {
 		requestBody, _ := io.ReadAll(resp.Body)
 		resp.Body = io.NopCloser(bytes.NewBuffer(requestBody))

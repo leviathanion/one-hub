@@ -65,7 +65,6 @@ func (s *PaymentService) HandleCallback(c *gin.Context, gatewayConfig string) (*
 	payNotify, err := s.gateway.HandleCallback(c, gatewayConfig)
 	if err != nil {
 		logger.SysError(fmt.Sprintf("%s payment callback error: %v", s.gateway.Name(), err))
-
 	}
 
 	return payNotify, err

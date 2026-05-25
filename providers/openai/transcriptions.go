@@ -114,7 +114,6 @@ func (p *OpenAIProvider) getRequestAudioBody(relayMode int, ModelName string, re
 }
 
 func audioMultipartForm(request *types.AudioRequest, b requester.FormBuilder) error {
-
 	err := b.CreateFormFile("file", request.File)
 	if err != nil {
 		return fmt.Errorf("creating form file: %w", err)

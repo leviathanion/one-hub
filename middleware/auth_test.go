@@ -155,7 +155,7 @@ func TestTokenAuthAdminSelectorBranches(t *testing.T) {
 		Value:         adminToken.Key,
 		SelectorParts: []string{"!7"},
 	})
-	gotValue, ok := skipCtx.Get("skip_channel_ids")
+	gotValue, _ := skipCtx.Get("skip_channel_ids")
 	got, ok := gotValue.([]int)
 	if !ok || len(got) != 1 || got[0] != 7 {
 		t.Fatalf("expected admin skip selector to populate skip_channel_ids, got %+v", got)

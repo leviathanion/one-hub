@@ -272,7 +272,6 @@ func updateSunoTaskAll(ctx context.Context, channelId int, taskIds []string, tas
 }
 
 func checkTaskNeedUpdate(oldTask *model.Task, newTask sunoProvider.SunoDataResponse) bool {
-
 	if oldTask.SubmitTime != newTask.SubmitTime {
 		return true
 	}

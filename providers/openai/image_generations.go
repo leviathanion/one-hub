@@ -38,7 +38,6 @@ func (p *OpenAIProvider) CreateImageGenerations(request *types.ImageRequest) (*t
 	}
 
 	return &response.ImageResponse, nil
-
 }
 
 func IsWithinRange(element string, value int) bool {

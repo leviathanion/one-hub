@@ -25,7 +25,6 @@ func CheckImg(c *gin.Context) {
 	}
 
 	check_channel.CheckImageResponse(c)
-
 }
 
 type checkChannelRequest struct {

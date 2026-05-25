@@ -119,5 +119,4 @@ func (h *OpenAIStreamHandler) handlerCompletionStream(rawLine *[]byte, dataChan 
 	}
 
 	h.Usage.TextBuilder.WriteString(openaiResponse.getResponseText())
-
 }

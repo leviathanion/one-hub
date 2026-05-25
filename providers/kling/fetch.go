@@ -41,9 +41,8 @@ func (s *KlingProvider) GetFetchs(class, action string, ids []string) (response 
 			continue
 		}
 
-		data := "{}"
 		taskResultJSON, _ := json.Marshal(task)
-		data = string(taskResultJSON)
+		data := string(taskResultJSON)
 		response = append(response, &types.TaskDto{
 			TaskID:     task.TaskID,
 			Action:     action,

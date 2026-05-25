@@ -9,7 +9,6 @@ type Response struct {
 }
 
 func (p *RecraftProvider) Balance() (float64, error) {
-
 	fullRequestURL := p.GetFullRequestURL("/v1/users/me")
 	headers := p.GetRequestHeaders()
 

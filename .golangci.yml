@@ -16,11 +16,77 @@ linters:
     - gocyclo
     - revive
     - unused
+    - depguard
 
 linters-settings:
+  misspell:
+    ignore-words:
+      - safty
+  # The wsconn migration turns the project lint gate on without forcing broad,
+  # unrelated control-flow refactors. Keep production code capped, but allow the
+  # existing legacy shape while follow-up refactors can lower this threshold.
+  gocyclo:
+    min-complexity: 100
+  depguard:
+    rules:
+      gorilla-websocket-boundary:
+        list-mode: lax
+        files:
+          - "!**/common/wsconn/**"
+          - "!**/common/wsconn/wstest/**"
+        deny:
+          - pkg: github.com/gorilla/websocket
+            desc: "WebSocket must go through common/wsconn"
+      wstest-only-in-tests:
+        list-mode: lax
+        files:
+          - "!**/*_test.go"
+        deny:
+          - pkg: one-api/common/wsconn/wstest
+            desc: "wsconn/wstest is test-only; production code must not import it"
+      wsconn-no-relay-imports:
+        list-mode: lax
+        files:
+          - "**/common/wsconn/**"
+        deny:
+          - pkg: one-api/relay
+            desc: "common/wsconn must not import relay business packages"
+      wsconn-no-provider-imports:
+        list-mode: lax
+        files:
+          - "**/common/wsconn/**"
+        deny:
+          - pkg: one-api/providers
+            desc: "common/wsconn must not import provider business packages"
+      wsconn-no-session-imports:
+        list-mode: lax
+        files:
+          - "**/common/wsconn/**"
+        deny:
+          - pkg: one-api/runtime/session
+            desc: "common/wsconn must not import runtime session business packages"
+      wsconn-no-model-imports:
+        list-mode: lax
+        files:
+          - "**/common/wsconn/**"
+        deny:
+          - pkg: one-api/model
+            desc: "common/wsconn must not import model business packages"
   revive:
     ignore-generated-header: true
     severity: warning
     rules:
       - name: unused-parameter
         disabled: true
+
+issues:
+  exclude-rules:
+    # Large scenario tests intentionally encode many branches; splitting them is
+    # useful cleanup, but outside the wsconn migration's behavioral surface.
+    - path: _test\.go
+      linters:
+        - gocyclo
+    # Fake Redis is test infrastructure rather than production request handling.
+    - path: ^internal/testutil/
+      linters:
+        - gocyclo

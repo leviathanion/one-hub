@@ -40,7 +40,6 @@ func (a *S3Upload) Name() string {
 }
 
 func (a *S3Upload) Upload(data []byte, s3Key string) (string, error) {
-
 	// 创建 S3 会话
 	sess, err := session.NewSession(&aws.Config{
 		Credentials: credentials.NewStaticCredentials(

@@ -117,7 +117,6 @@ func (l *Lark) Send(ctx context.Context, title, message string) error {
 	}
 
 	return nil
-
 }
 
 func (l *Lark) sign(timestamp int64) string {

@@ -81,7 +81,6 @@ func (p *SiliconflowProvider) GetFullRequestURL(requestURL string, modelName str
 	baseURL := strings.TrimSuffix(p.GetBaseURL(), "/")
 
 	if requestURL == p.Config.ImagesGenerations {
-
 		requestURL = fmt.Sprintf(requestURL, modelName)
 	}
 

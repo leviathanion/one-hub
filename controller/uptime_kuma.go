@@ -1,12 +1,14 @@
 package controller
 
 import (
-	"github.com/gin-gonic/gin"
 	"io"
 	"net/http"
-	"one-api/common/config"
 	"strconv"
 	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"one-api/common/config"
 )
 
 func UptimeKumaStatusPage(c *gin.Context) {

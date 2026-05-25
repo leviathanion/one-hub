@@ -664,7 +664,6 @@ func GetModelUsageByUser(usernames []string, startTime, endTime string) ([]*Mode
 }
 
 func GetChannelExpensesStatisticsByPeriod(startTime, endTime, groupType string, userID int) (LogStatistics []*LogStatisticGroupChannel, err error) {
-
 	var whereClause strings.Builder
 	whereClause.WriteString("WHERE date BETWEEN ? AND ?")
 	args := []interface{}{startTime, endTime}
@@ -708,9 +707,8 @@ func GetChannelExpensesStatisticsByPeriod(startTime, endTime, groupType string, 
             JOIN prices ON statistics.model_name = prices.model
 			JOIN model_owned_by ON prices.channel_type = model_owned_by.id
             %s
-            GROUP BY date, model_owned_by.name
-            ORDER BY date, model_owned_by.name`
-
+	            GROUP BY date, model_owned_by.name
+	            ORDER BY date, model_owned_by.name`
 	} else {
 		sql = baseSelect + `
             MAX(channels.name) as channel

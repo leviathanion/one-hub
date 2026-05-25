@@ -6,20 +6,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"golang.org/x/net/proxy"
 	"net"
 	"net/http"
 	"net/url"
-	"one-api/common/config"
-	"one-api/common/logger"
-	"one-api/common/utils"
-	"one-api/model"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-contrib/sessions"
 	"github.com/gin-gonic/gin"
+	"golang.org/x/net/proxy"
+
+	"one-api/common/config"
+	"one-api/common/logger"
+	"one-api/common/utils"
+	"one-api/model"
 )
 
 type GitHubOAuthResponse struct {
@@ -302,7 +303,6 @@ func GitHubOAuth(c *gin.Context) {
 			})
 			return
 		}
-
 	} else {
 		// 如果用户存在，则更新用户
 		user.GitHubId = githubUser.Login

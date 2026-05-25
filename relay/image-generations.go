@@ -1,12 +1,14 @@
 package relay
 
 import (
-	"github.com/gin-gonic/gin"
 	"net/http"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+
 	"one-api/common"
 	providersBase "one-api/providers/base"
 	"one-api/types"
-	"strings"
 )
 
 type relayImageGenerations struct {

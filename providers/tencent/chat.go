@@ -179,7 +179,6 @@ func (h *tencentStreamHandler) handlerStream(rawLine *[]byte, dataChan chan stri
 	}
 
 	h.convertToOpenaiStream(&tencentChatResponse, dataChan)
-
 }
 
 func (h *tencentStreamHandler) convertToOpenaiStream(tencentChatResponse *TencentChatResponse, dataChan chan string) {
@@ -201,5 +200,4 @@ func (h *tencentStreamHandler) convertToOpenaiStream(tencentChatResponse *Tencen
 	dataChan <- string(responseBody)
 
 	h.Usage.TextBuilder.WriteString(tencentChatResponse.Choices[0].Delta.Content)
-
 }
