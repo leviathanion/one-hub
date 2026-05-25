@@ -241,7 +241,7 @@ type DialOption func(*dialConfig)
 //   - scheme 支持的范围在 wsconn 内白名单（http/https/socks5），其它走 Err
 func WithProxyURL(rawURL string) DialOption
 func WithSubprotocols(protos ...string) DialOption
-func WithHandshakeTimeout(d time.Duration) DialOption
+func WithHandshakeTimeout(d time.Duration) DialOption // d <= 0 使用 wsconn 默认 5s；生产调用方应传 config.ConnectTimeout()
 func WithTLSConfig(cfg *tls.Config) DialOption
 func WithNetDialContext(f func(ctx context.Context,
                                network, addr string) (net.Conn, error)) DialOption
@@ -251,7 +251,7 @@ func WithNetDialContext(f func(ctx context.Context,
 // 业务通过 errors.As(err, &wsconn.DialError{}) 根据 StatusCode 做错误分类
 // （404/426/401/403/429/5xx）。
 type DialError struct {
-    URL           string
+    URL           string       // 结构化诊断字段保留原始 URL；禁止直接写入日志
     StatusCode    int
     Header        http.Header
     BodySnippet   []byte
@@ -263,6 +263,9 @@ type DialError struct {
 
 func (e *DialError) Error() string
 func (e *DialError) Unwrap() error
+
+`DialError.Error()` 只输出脱敏 URL：必须移除 userinfo、query、fragment。`DialError.URL` 可保留原始
+URL 作为结构化字段供受控诊断使用，但日志路径只能使用 `Error()` 或显式脱敏后的值。
 
 // 出站：dial + 包装一体化。握手失败时返回 *DialError；
 // 成功时 ManagedConn 已就绪可立即读写。
@@ -1072,9 +1075,10 @@ func IsUpgrade(r *http.Request) bool
 2. **默认拒绝 `ws://`**：scheme 不在 `{wss}` 时 `DialManaged` 返回 `ErrInsecureScheme`，本地/测试需 `WithDialSecurityPolicy(DialSecurityPolicy{AllowInsecureWS: true})` 显式打开
 3. **默认拒绝私网/loopback/metadata 地址**：解析 host 后通过 `HostFilter`（默认 = wsconn 内置规则）判定；命中 RFC 1918 / loopback / link-local / 169.254.169.254 metadata IP 返回 `ErrPrivateAddrBlocked`。部署可在 policy 里 `AllowPrivateIP: true` 放过 RFC 1918，**metadata IP 即便 AllowPrivateIP=true 仍默认拒**（防 SSRF 抓 cloud metadata）
 4. **proxy fail-closed**：`WithProxyURL("")` 表示"不走 proxy"；非空但解析失败、scheme 不支持时 `DialManaged` 返回 `ErrInvalidProxyURL`，**绝不静默退化为直连**。当前 `common/requester/ws_client.go:30-34` 是 fail-open 路径，配置 proxy 但解析失败时返回裸 dialer 直连目标，违反"通过 proxy 出网"的部署约束。新方案必须 fail-closed 才能让该约束真正生效
-5. **`DialError.Error()` 输出脱敏**：永远不输出 Authorization / Cookie / Sec-WebSocket-Protocol 值；这些 header 在写入 `DialError.Header` 前被 redact 为 `"[REDACTED]"`
+5. **`DialError.Error()` 输出脱敏**：永远不输出 Authorization / Cookie / Sec-WebSocket-Protocol 值，也不输出 URL userinfo / query / fragment；这些 header 在写入 `DialError.Header` 前被 redact 为 `"[REDACTED]"`，原始 URL 只保留在 `DialError.URL` 结构化字段中
 6. **`BodySnippet` 限长**：默认 4 KiB（与现有 `wsDialBodySnippetLimit` 对齐）；超过即截断并设 `BodyTruncated = true`
 7. **DialOption 全部纯 Go 类型**：禁止 `WithDialer(*websocket.Dialer)`、`WithGorillaHeader(http.Header)` 等暴露 gorilla 的选项；允许 `WithProxyURL(string)`、`WithSubprotocols(...string)`、`WithHandshakeTimeout(time.Duration)`、`WithTLSConfig(*tls.Config)`、`WithNetDialContext(...)`
+8. **出站握手超时默认有界**：未传 `WithHandshakeTimeout` 或传入非正值时，`DialManaged` 使用 wsconn 内置 5s 默认值；生产 upstream 调用方显式传 `config.ConnectTimeout()`，恢复旧 websocket requester 受 `connect_timeout` 控制的行为
 
 #### HostFilter 注入模型
 
@@ -2207,6 +2211,7 @@ func WithClock(clock wsconn.Clock) Option
 13. **WriteMessage 出错后归类**：模拟底层 write error → 断言 `CloseInfo.Kind == CloseKindWriteError`；验证 release-then-close 序列下不出现 deadlock
 14. **AcceptManaged 错误路径**：握手失败资源不泄漏；`AcceptOptions` 各字段均能透传到内部构造的 gorilla Upgrader
 15. **DialManaged 错误路径**：握手失败时返回 `*wsconn.DialError`，`errors.As(err, &dialErr)` 能拿到完整的 URL/StatusCode/Header/BodySnippet/CloseInfo 字段；`dialErr.CloseInfo.Kind == CloseKindDialFailed`
+    - `DialError.URL` 保留原始 URL；`DialError.Error()` 不得输出 URL userinfo / query / fragment
 16. **Close reason 截断**：reason > 123 字节时按 UTF-8 边界截断；含多字节字符时不切到 rune 中间；含无效 UTF-8 字节时丢弃。close frame 仍然合法
 17. **DialOption 无 gorilla 类型暴露**：`go vet` / 文档检查所有导出 DialOption 函数签名，禁止出现 `*websocket.Dialer` 等 gorilla 类型
 18. **Config 校验测试**：
@@ -2254,7 +2259,7 @@ func WithClock(clock wsconn.Clock) Option
     - 默认 policy 下 `ws://example` 返回 `ErrInsecureScheme`；带 `WithDialSecurityPolicy(AllowInsecureWS: true)` 后允许
     - 默认 policy 下私网地址（127.0.0.1 / 10.x / 192.168.x）返回 `ErrPrivateAddrBlocked`；带 `AllowPrivateIP: true` 后允许
     - 默认 policy 下 169.254.169.254（云厂商 metadata IP）返回 `ErrPrivateAddrBlocked`，即使开了 `AllowPrivateIP` 也只在 `HostFilter` 自定义同意时放行
-    - DialError.Error() 输出不含 `Authorization` / `Cookie` / `Sec-WebSocket-Protocol` 的值
+    - DialError.Error() 输出不含 `Authorization` / `Cookie` / `Sec-WebSocket-Protocol` 的值，也不含 URL userinfo / query / fragment
     - dial 失败 body 大小超过 `MaxBodySnippet`：`BodySnippet` 长度被截至限值且 `BodyTruncated = true`
 27. **Proxy fail-closed**：
     - `WithProxyURL("")` 不使用 proxy（直连），与现状一致

@@ -22,6 +22,14 @@ func RealtimeWebsocketWriteTimeout() time.Duration {
 	return time.Duration(timeoutMS) * time.Millisecond
 }
 
+func ConnectTimeout() time.Duration {
+	timeoutSec := viper.GetInt("connect_timeout")
+	if timeoutSec <= 0 {
+		return 5 * time.Second
+	}
+	return time.Duration(timeoutSec) * time.Second
+}
+
 func RealtimeWebsocketPingInterval() time.Duration {
 	if !viper.IsSet("realtime.websocket_ping_interval_ms") {
 		return 25 * time.Second

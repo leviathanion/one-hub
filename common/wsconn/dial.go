@@ -22,6 +22,8 @@ var (
 	ErrInvalidProxyURL    = errors.New("wsconn: invalid proxy url")
 )
 
+const defaultDialHandshakeTimeout = 5 * time.Second
+
 type DialSecurityPolicy struct {
 	AllowInsecureWS bool
 	AllowPrivateIP  bool
@@ -80,10 +82,11 @@ func (e *DialError) Error() string {
 	if e == nil {
 		return ""
 	}
+	safeURL := redactedURLForError(e.URL)
 	if e.StatusCode > 0 {
-		return fmt.Sprintf("wsconn: dial %s failed with status %d: %v", e.URL, e.StatusCode, e.Err)
+		return fmt.Sprintf("wsconn: dial %s failed with status %d: %v", safeURL, e.StatusCode, e.Err)
 	}
-	return fmt.Sprintf("wsconn: dial %s failed: %v", e.URL, e.Err)
+	return fmt.Sprintf("wsconn: dial %s failed: %v", safeURL, e.Err)
 }
 
 func (e *DialError) Unwrap() error {
@@ -109,13 +112,14 @@ func DialManaged(ctx context.Context, rawURL string, header http.Header, cfg Con
 	if err := validateDialTarget(ctx, rawURL, dc.security); err != nil {
 		return nil, err
 	}
+	handshakeTimeout := normalizeDialHandshakeTimeout(dc.handshakeTimeout)
 	netDial := dc.netDialContext
 	if netDial == nil {
-		d := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+		d := &net.Dialer{Timeout: handshakeTimeout, KeepAlive: 30 * time.Second}
 		netDial = d.DialContext
 	}
 	dialer := websocket.Dialer{
-		HandshakeTimeout: dc.handshakeTimeout,
+		HandshakeTimeout: handshakeTimeout,
 		Subprotocols:     append([]string(nil), dc.subprotocols...),
 		TLSClientConfig:  dc.tlsConfig,
 		NetDialContext:   netDial,
@@ -145,10 +149,10 @@ func validateDialTarget(ctx context.Context, rawURL string, policy DialSecurityP
 	case "wss":
 	case "ws":
 		if !policy.AllowInsecureWS {
-			return fmt.Errorf("%w: %s", ErrInsecureScheme, rawURL)
+			return fmt.Errorf("%w: %s", ErrInsecureScheme, redactedURLForError(rawURL))
 		}
 	default:
-		return fmt.Errorf("%w: %s", ErrInsecureScheme, rawURL)
+		return fmt.Errorf("%w: %s", ErrInsecureScheme, redactedURLForError(rawURL))
 	}
 	host := u.Hostname()
 	if host == "" {
@@ -183,6 +187,29 @@ func isBlockedIP(ip net.IP, allowPrivate bool) bool {
 		return true
 	}
 	return false
+}
+
+func normalizeDialHandshakeTimeout(d time.Duration) time.Duration {
+	if d <= 0 {
+		return defaultDialHandshakeTimeout
+	}
+	return d
+}
+
+func redactedURLForError(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "<redacted>"
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.ForceQuery = false
+	u.Fragment = ""
+	u.RawFragment = ""
+	if u.Scheme == "" && u.Host == "" && u.Path == "" {
+		return "<redacted>"
+	}
+	return u.String()
 }
 
 func applyProxy(dialer *websocket.Dialer, rawURL string, base func(context.Context, string, string) (net.Conn, error)) error {

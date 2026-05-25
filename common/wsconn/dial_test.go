@@ -97,7 +97,7 @@ func TestDialErrorHasDiagnosticsAndRedactsHeaders(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	rawURL := "ws" + strings.TrimPrefix(ts.URL, "http")
+	rawURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/realtime?authorization=secret-token&signature=secret-sig"
 	_, err := DialManaged(context.Background(), rawURL, nil, Config{},
 		WithDialSecurityPolicy(DialSecurityPolicy{
 			AllowInsecureWS: true,
@@ -125,7 +125,67 @@ func TestDialErrorHasDiagnosticsAndRedactsHeaders(t *testing.T) {
 		t.Fatalf("snippet=%q truncated=%v, want limited body", dialErr.BodySnippet, dialErr.BodyTruncated)
 	}
 	if strings.Contains(dialErr.Error(), "secret") {
-		t.Fatalf("DialError.Error leaked sensitive header value: %q", dialErr.Error())
+		t.Fatalf("DialError.Error leaked sensitive value: %q", dialErr.Error())
+	}
+	if strings.Contains(dialErr.Error(), "?") {
+		t.Fatalf("DialError.Error leaked query string: %q", dialErr.Error())
+	}
+}
+
+func TestDialErrorRedactsURLUserInfoAndQuery(t *testing.T) {
+	dialErr := &DialError{
+		URL: "wss://user:secret-pass@upstream.example.test/realtime?api_key=secret-key&signature=secret-sig",
+		Err: errors.New("bad handshake"),
+	}
+
+	msg := dialErr.Error()
+	for _, leaked := range []string{"user", "secret", "api_key", "signature", "?"} {
+		if strings.Contains(msg, leaked) {
+			t.Fatalf("DialError.Error leaked %q in %q", leaked, msg)
+		}
+	}
+	if dialErr.URL == "" || !strings.Contains(dialErr.URL, "secret-key") {
+		t.Fatalf("DialError.URL should retain structured diagnostic URL, got %q", dialErr.URL)
+	}
+}
+
+func TestDialManagedAppliesDefaultAndOverrideHandshakeTimeout(t *testing.T) {
+	tests := []struct {
+		name string
+		opt  DialOption
+		want time.Duration
+	}{
+		{name: "default", want: defaultDialHandshakeTimeout},
+		{name: "override", opt: WithHandshakeTimeout(1200 * time.Millisecond), want: 1200 * time.Millisecond},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got time.Duration
+			start := time.Now()
+			opts := []DialOption{
+				WithDialSecurityPolicy(DialSecurityPolicy{HostFilter: func(string, []net.IP) bool { return true }}),
+				WithNetDialContext(func(ctx context.Context, _, _ string) (net.Conn, error) {
+					deadline, ok := ctx.Deadline()
+					if !ok {
+						t.Fatalf("net dial context has no handshake deadline")
+					}
+					got = deadline.Sub(start)
+					return nil, errors.New("dial attempted")
+				}),
+			}
+			if tt.opt != nil {
+				opts = append(opts, tt.opt)
+			}
+
+			_, err := DialManaged(context.Background(), "wss://127.0.0.1/realtime", nil, Config{}, opts...)
+			if err == nil {
+				t.Fatalf("DialManaged err=nil, want dial failure")
+			}
+			if got < tt.want-250*time.Millisecond || got > tt.want+250*time.Millisecond {
+				t.Fatalf("handshake timeout deadline=%s, want about %s", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -226,6 +286,7 @@ func TestProxyURLFailClosed(t *testing.T) {
 			dialed = true
 			return nil, errors.New("unexpected direct dial")
 		}),
+		WithDialSecurityPolicy(DialSecurityPolicy{HostFilter: func(string, []net.IP) bool { return true }}),
 	)
 	if !errors.Is(err, ErrInvalidProxyURL) {
 		t.Fatalf("err=%v, want ErrInvalidProxyURL", err)

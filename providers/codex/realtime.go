@@ -118,7 +118,10 @@ func codexRealtimeDialOptions(proxyAddr string, allowSelfHosted bool) []wsconn.D
 			return true
 		}
 	}
-	options := []wsconn.DialOption{wsconn.WithDialSecurityPolicy(policy)}
+	options := []wsconn.DialOption{
+		wsconn.WithHandshakeTimeout(config.ConnectTimeout()),
+		wsconn.WithDialSecurityPolicy(policy),
+	}
 	if strings.TrimSpace(proxyAddr) != "" {
 		options = append(options, wsconn.WithProxyURL(proxyAddr))
 	}

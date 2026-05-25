@@ -163,6 +163,32 @@ func TestRealtimeWebsocketPingIntervalExplicitNonPositiveDisables(t *testing.T) 
 	}
 }
 
+func TestConnectTimeoutUsesConfiguredSecondsWithFallback(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(func() {
+		viper.Reset()
+	})
+
+	if got := ConnectTimeout(); got != 5*time.Second {
+		t.Fatalf("expected unset connect timeout to use default 5s, got %s", got)
+	}
+
+	defaultConfig()
+	if got := ConnectTimeout(); got != 5*time.Second {
+		t.Fatalf("expected configured default connect timeout to be 5s, got %s", got)
+	}
+
+	viper.Set("connect_timeout", 12)
+	if got := ConnectTimeout(); got != 12*time.Second {
+		t.Fatalf("expected connect timeout override to be 12s, got %s", got)
+	}
+
+	viper.Set("connect_timeout", 0)
+	if got := ConnectTimeout(); got != 5*time.Second {
+		t.Fatalf("expected non-positive connect timeout to fall back to 5s, got %s", got)
+	}
+}
+
 func TestSplitWebsocketClientLivenessConfig(t *testing.T) {
 	viper.Reset()
 	t.Cleanup(func() {

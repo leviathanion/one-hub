@@ -304,6 +304,7 @@ func openAIRealtimeDialOptions(proxyAddr string, allowSelfHosted bool, subprotoc
 		}
 	}
 	options := []wsconn.DialOption{
+		wsconn.WithHandshakeTimeout(config.ConnectTimeout()),
 		wsconn.WithSubprotocols(subprotocols...),
 		wsconn.WithDialSecurityPolicy(policy),
 	}

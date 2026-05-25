@@ -1072,7 +1072,7 @@ func TestOpenAIRealtimeSessionConnectionErrorsAndAzureHeaders(t *testing.T) {
 }
 
 func TestOpenAIResponsesWSURLConstruction(t *testing.T) {
-	proxy := ""
+	proxy := "http://proxy.example"
 	provider := CreateOpenAIProvider(&model.Channel{Key: "sk-test", Proxy: &proxy}, "https://api.openai.com")
 	got, errWithCode := provider.responsesWSURL("gpt-5")
 	if errWithCode != nil {

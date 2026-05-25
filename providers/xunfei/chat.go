@@ -82,7 +82,10 @@ func (p *XunfeiProvider) getChatRequest(request *types.ChatCompletionRequest) (*
 	if p != nil && p.Channel != nil && p.Channel.Proxy != nil {
 		proxyAddr = *p.Channel.Proxy
 	}
-	wsConn, err := wsconn.DialManaged(context.Background(), authUrl, nil, xunfeiWSConfig(), wsconn.WithProxyURL(proxyAddr))
+	wsConn, err := wsconn.DialManaged(context.Background(), authUrl, nil, xunfeiWSConfig(),
+		wsconn.WithHandshakeTimeout(config.ConnectTimeout()),
+		wsconn.WithProxyURL(proxyAddr),
+	)
 	if err != nil {
 		return nil, common.ErrorWrapper(err, "ws_request_failed", http.StatusInternalServerError)
 	}
