@@ -161,7 +161,7 @@ Codex 渠道当前通过 OpenAI 兼容接口使用，支持以下路径：
 - `auto`
   自动按优先级选稳定身份：`previous_response_id` -> `session_id` -> 外部认证头 -> token id -> user id。其中 `previous_response_id` 会直接作为 `prompt_cache_key` 使用，不做额外编码或哈希。
 - `session_id`
-  固定按 `x-session-id` / `session_id` 派生。
+  固定按 `x-session-id` / `session-id` / `session_id` 派生。
 - `token_id`
   固定按 one-hub token id 派生。
 - `user_id`
@@ -580,7 +580,7 @@ trade-off：
 
 适用场景：
 
-- 你把 `x-session-id` / `session_id` 当成强 resume identity
+- 你把 `x-session-id` / `session-id` / `session_id` 当成强 resume identity
 - websocket / realtime 会话恢复必须尽量回到原渠道
 - 比起自动降级，更希望优先保持会话连续性
 
@@ -754,7 +754,7 @@ trade-off：
 `auto` 的实际优先级是：
 
 1. 显式请求字段 `prompt_cache_key`
-2. 请求头 `x-session-id` / `session_id`
+2. 请求头 `x-session-id` / `session-id` / `session_id`
 3. 外部认证头
 4. One Hub 令牌 ID
 5. One Hub 用户 ID
@@ -854,8 +854,8 @@ trade-off：
 | 策略 | 稳定身份来源 | 适用场景 |
 | --- | --- | --- |
 | `off` | 不自动生成 | 默认行为，或希望完全由客户端自己控制 |
-| `auto` | 显式 `prompt_cache_key` -> `previous_response_id` -> `x-session-id/session_id` -> 请求头认证值 -> `token_id` -> `user_id` | 大多数场景的推荐配置；`previous_response_id` 会直接复用为 `prompt_cache_key` |
-| `session_id` | 请求头中的 `x-session-id` / `session_id` | 客户端稳定传会话 ID，希望按会话维度粘住缓存 |
+| `auto` | 显式 `prompt_cache_key` -> `previous_response_id` -> `x-session-id/session-id/session_id` -> 请求头认证值 -> `token_id` -> `user_id` | 大多数场景的推荐配置；`previous_response_id` 会直接复用为 `prompt_cache_key` |
+| `session_id` | 请求头中的 `x-session-id` / `session-id` / `session_id` | 客户端稳定传会话 ID，希望按会话维度粘住缓存 |
 | `token_id` | One Hub 令牌 ID | 希望每个令牌独立维护缓存 |
 | `user_id` | One Hub 用户 ID | 同一用户多个令牌共享缓存 |
 | `auth_header` | 请求头中的认证值 | 想按外部调用凭证划分缓存身份 |
@@ -918,7 +918,7 @@ trade-off：
 
 作用：
 
-- 同一个调用方带着同一个 `session_id` / `x-session-id` 回到同一个渠道时，可以复用之前的 execution session
+- 同一个调用方带着同一个 `x-session-id` / `session-id` / `session_id` 回到同一个渠道时，可以复用之前的 execution session
 - 超过 TTL 后，runtime 会清理空闲 session，释放上游连接
 
 ### 全局 `codex.execution_session_revocation_timeout_ms`
@@ -968,7 +968,9 @@ Codex realtime 现在采用 channel affinity + same-channel resume 语义：
 
 ## Realtime `session_id` 规则
 
-Codex realtime 会读取请求头中的 `x-session-id`，如果没有则读取 `session_id`。
+Codex realtime 会按 `x-session-id` -> `session-id` -> `session_id` 的优先级读取请求头。
+
+`x-session-id` 第一优先级是有意选择：one-hub 把它视为集成方 canonical identity，高于客户端协议层 native `session-id` 和历史兼容的 `session_id`。
 
 这个值用于建立 `caller namespace + session_id` 的 affinity key，不是全局共享的会话标识。
 
@@ -980,6 +982,6 @@ Codex realtime 会读取请求头中的 `x-session-id`，如果没有则读取 `
 
 建议客户端直接使用 UUID 或其它稳定的短 ID。
 
-如果客户端希望 Realtime 会话可恢复，应该稳定传入同一个 `x-session-id` 或 `session_id`。
+如果客户端希望 Realtime 会话可恢复，应该稳定传入同一个 `x-session-id`、`session-id` 或 `session_id`。
 
-如果客户端完全不传 `x-session-id` / `session_id`，one-hub 会为当前请求生成临时的上游 session id，但不会建立可恢复的 resume binding。也就是说，这种请求只适合当前连接使用，后续不能依赖它继续恢复到同一个 Codex Realtime 会话。
+如果客户端完全不传 `x-session-id` / `session-id` / `session_id`，one-hub 会为当前请求生成临时的上游 session id，但不会建立可恢复的 resume binding。也就是说，这种请求只适合当前连接使用，后续不能依赖它继续恢复到同一个 Codex Realtime 会话。

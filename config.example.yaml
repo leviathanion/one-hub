@@ -47,6 +47,12 @@ realtime:
   websocket_read_limit: 33554432 # WebSocket 单帧读取上限，默认 32MiB；超限连接会返回静态 invalid_event 后关闭
   websocket_ping_interval_ms: 25000 # 服务端主动 Ping 周期，默认 25 秒；<=0 仅建议测试禁用
   websocket_write_timeout_ms: 10000 # WebSocket 写超时，默认 10 秒
+realtime_websocket_client_ping_interval_ms: 25000 # Realtime 客户端连接主动 Ping 周期，默认 25 秒；<=0 禁用
+realtime_websocket_client_pong_miss_timeout_ms: 0 # Realtime 发出 ping 后未收到对应 pong 的超时；0 禁用
+realtime_websocket_client_inbound_activity_timeout_ms: 0 # Realtime 任意客户端入站活动超时；0 禁用
+responses_websocket_client_ping_interval_ms: 25000 # ResponsesWS 客户端连接主动 Ping 周期，默认 25 秒；<=0 禁用
+responses_websocket_client_pong_miss_timeout_ms: 0 # ResponsesWS 发出 ping 后未收到对应 pong 的超时；0 禁用
+responses_websocket_client_inbound_activity_timeout_ms: 300000 # ResponsesWS 客户端入站活性超时，默认 5 分钟；0 禁用 watchdog，仅依赖 idle/max lifetime 回收
 responses_ws:
   connect_per_credential_per_minute: 600 # 每个 credential 每分钟允许的 ResponsesWS 建连尝试数；per minute，窗口/Redis 共享语义同 API RPM limiter，Redis 关闭时进程内限流；显式 -1 表示不限
   pending_per_credential: 96 # Upgrade 后等待首帧/建连的单凭据 pending 上限；显式 -1 表示不限
@@ -57,7 +63,6 @@ responses_ws:
   first_frame_timeout_ms: 30000 # Upgrade 后等待首个 response.create 的超时
   idle_timeout_ms: 1800000 # 已建立 ResponsesWS 连接空闲超时
   max_lifetime_ms: 3600000 # 单个 ResponsesWS 连接最长存活时间；显式 0 使用默认 1 小时
-  client_pong_timeout_ms: 300000 # 已建立 ResponsesWS 连接的客户端活性超时，默认 5 分钟；0 禁用 watchdog，仅依赖 idle/max lifetime 回收
   pending_provider_events_max_bytes: 2097152 # send 结果确认前可缓存的上游事件字节上限，默认 2MiB
   unsupported_scan_limit: 1 # 首选渠道不支持 WS 时扫描候选数，默认跟随 RetryTimes（通常为 1）；0 回退到 RetryTimes
   allow_anonymous_capacity_bucket: false # 仅测试/本地诊断可开启；生产缺少 token/user 时不进入共享 anonymous bucket

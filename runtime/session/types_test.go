@@ -6,6 +6,51 @@ import (
 	"testing"
 )
 
+func TestFrameConstructorsAndPayloadOwnershipContract(t *testing.T) {
+	payload := []byte("hello")
+	frame := NewTextFrame(payload)
+	if frame.IsZero() {
+		t.Fatal("expected constructed text frame not to be zero")
+	}
+	if frame.Kind() != FrameKindText {
+		t.Fatalf("expected text frame kind, got %v", frame.Kind())
+	}
+	if string(frame.Payload()) != "hello" {
+		t.Fatalf("expected payload hello, got %q", frame.Payload())
+	}
+	cloned := frame.ClonePayload()
+	cloned[0] = 'H'
+	if string(frame.Payload()) != "hello" {
+		t.Fatalf("ClonePayload mutated original payload, got %q", frame.Payload())
+	}
+	if !((Frame{}).IsZero()) {
+		t.Fatal("expected zero Frame to report IsZero")
+	}
+	if NewBinaryFrame([]byte{1}).Kind() != FrameKindBinary {
+		t.Fatal("expected binary frame kind")
+	}
+}
+
+func TestFrameConstructorsAreOnlyNormalKinds(t *testing.T) {
+	frames := []Frame{
+		NewTextFrame([]byte("text")),
+		NewBinaryFrame([]byte{0x01}),
+	}
+	for _, frame := range frames {
+		switch frame.Kind() {
+		case FrameKindText, FrameKindBinary:
+		default:
+			t.Fatalf("expected constructor to produce only text/binary kind, got %v", frame.Kind())
+		}
+		if frame.IsZero() {
+			t.Fatalf("expected constructed frame not to be zero: %+v", frame)
+		}
+		if !frame.valid() {
+			t.Fatalf("expected constructed frame to be valid: %+v", frame)
+		}
+	}
+}
+
 func TestClientPayloadErrorWithoutCauseDoesNotUnwrapAsSessionClosed(t *testing.T) {
 	err := NewClientPayloadError(nil, []byte(`{"type":"error","error":{"message":"payload only"}}`))
 	if err == nil {

@@ -13,11 +13,10 @@ import (
 	"time"
 
 	"one-api/common/config"
+	"one-api/common/wsconn"
 	"one-api/model"
 	runtimesession "one-api/runtime/session"
 	"one-api/types"
-
-	"github.com/gorilla/websocket"
 )
 
 type recordingOpenAIRealtimeObserver struct {
@@ -45,40 +44,32 @@ type failingOpenAIRealtimeObserver struct {
 	observeErr error
 }
 
+func openAITestTextFrame(payload []byte) runtimesession.Frame {
+	return runtimesession.NewTextFrame(payload)
+}
+
+func openAITestRecv(ctx context.Context, session runtimesession.RealtimeSession) (wsconn.MessageType, []byte, *types.UsageEvent, runtimesession.RealtimePayloadOrigin, error) {
+	event, err := session.Recv(ctx)
+	if err != nil {
+		return 0, nil, nil, runtimesession.RealtimePayloadOriginProxyLocal, err
+	}
+	messageType := wsconn.TextMessage
+	var payload []byte
+	if event.Frame != nil {
+		if event.Frame.Kind() == runtimesession.FrameKindBinary {
+			messageType = wsconn.BinaryMessage
+		}
+		payload = event.Frame.Payload()
+	}
+	return messageType, payload, event.Usage, event.Origin, event.Err
+}
+
 type failingAdmissionOpenAIRealtimeObserver struct {
 	recordingOpenAIRealtimeObserver
 	mu            sync.Mutex
 	admitErr      error
 	admitCount    int
 	rollbackCount int
-}
-
-type recordingOpenAIReadDeadlineConn struct {
-	net.Conn
-	mu            sync.Mutex
-	readDeadlines []time.Time
-}
-
-func (c *recordingOpenAIReadDeadlineConn) SetReadDeadline(t time.Time) error {
-	c.mu.Lock()
-	c.readDeadlines = append(c.readDeadlines, t)
-	c.mu.Unlock()
-	return c.Conn.SetReadDeadline(t)
-}
-
-func (c *recordingOpenAIReadDeadlineConn) lastReadDeadline() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if len(c.readDeadlines) == 0 {
-		return time.Time{}
-	}
-	return c.readDeadlines[len(c.readDeadlines)-1]
-}
-
-func (c *recordingOpenAIReadDeadlineConn) readDeadlineCount() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return len(c.readDeadlines)
 }
 
 func (r *recordingOpenAIRealtimeObserver) ObserveTurnUsage(usage *types.UsageEvent) error {
@@ -222,7 +213,7 @@ func waitForOpenAIRealtimeFinalize(t *testing.T, recorder *recordingOpenAIRealti
 
 func TestOpenAIRealtimeSessionNormalizesResponseCreateModel(t *testing.T) {
 	receivedPayload := make(chan []byte, 1)
-	server := newOpenAIRealtimeTestServer(t, func(conn *websocket.Conn) {
+	server := newOpenAIRealtimeTestServer(t, func(conn *openAIRealtimeTestConn) {
 		_, payload, err := conn.ReadMessage()
 		if err != nil {
 			t.Errorf("failed to read upstream request: %v", err)
@@ -239,7 +230,7 @@ func TestOpenAIRealtimeSessionNormalizesResponseCreateModel(t *testing.T) {
 	}
 	defer session.Abort("test_cleanup")
 
-	if err := session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","response":{"input":[]}}`)); err != nil {
+	if err := session.SendClient(context.Background(), openAITestTextFrame([]byte(`{"type":"response.create","response":{"input":[]}}`))); err != nil {
 		t.Fatalf("expected normalized response.create to send, got %v", err)
 	}
 
@@ -260,8 +251,8 @@ func TestOpenAIRealtimeSessionNormalizesResponseCreateModel(t *testing.T) {
 
 func TestOpenAIRealtimeSessionForwardsBootstrapAndFinalizesTurn(t *testing.T) {
 	releaseDone := make(chan struct{})
-	server := newOpenAIRealtimeTestServer(t, func(conn *websocket.Conn) {
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"id":"sess_123"}}`)); err != nil {
+	server := newOpenAIRealtimeTestServer(t, func(conn *openAIRealtimeTestConn) {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"session.created","session":{"id":"sess_123"}}`)); err != nil {
 			t.Errorf("failed to write bootstrap event: %v", err)
 			return
 		}
@@ -270,7 +261,7 @@ func TestOpenAIRealtimeSessionForwardsBootstrapAndFinalizesTurn(t *testing.T) {
 			t.Errorf("failed to read response.create request: %v", err)
 			return
 		}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_123","status":"completed","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_123","status":"completed","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`)); err != nil {
 			t.Errorf("failed to write terminal response event: %v", err)
 			return
 		}
@@ -291,22 +282,22 @@ func TestOpenAIRealtimeSessionForwardsBootstrapAndFinalizesTurn(t *testing.T) {
 	recorder := &recordingOpenAIRealtimeObserver{}
 	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return recorder })
 
-	messageType, payload, usage, _, err := session.Recv(context.Background())
+	messageType, payload, usage, _, err := openAITestRecv(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected bootstrap recv without error, got %v", err)
 	}
-	if messageType != websocket.TextMessage || !strings.Contains(string(payload), `"session.created"`) {
+	if messageType != wsconn.TextMessage || !strings.Contains(string(payload), `"session.created"`) {
 		t.Fatalf("expected first recv to be session.created, got type=%d payload=%q", messageType, payload)
 	}
 	if usage != nil {
 		t.Fatalf("expected bootstrap not to carry usage, got %+v", usage)
 	}
 
-	if err := session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","response":{"input":[]}}`)); err != nil {
+	if err := session.SendClient(context.Background(), openAITestTextFrame([]byte(`{"type":"response.create","response":{"input":[]}}`))); err != nil {
 		t.Fatalf("expected response.create send to succeed, got %v", err)
 	}
 
-	_, payload, usage, _, err = session.Recv(context.Background())
+	_, payload, usage, _, err = openAITestRecv(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected terminal recv without error, got %v", err)
 	}
@@ -329,17 +320,17 @@ func TestOpenAIRealtimeSessionForwardsBootstrapAndFinalizesTurn(t *testing.T) {
 
 func TestOpenAIRealtimeSessionDeduplicatesUsageSnapshots(t *testing.T) {
 	releaseDone := make(chan struct{})
-	server := newOpenAIRealtimeTestServer(t, func(conn *websocket.Conn) {
+	server := newOpenAIRealtimeTestServer(t, func(conn *openAIRealtimeTestConn) {
 		_, _, err := conn.ReadMessage()
 		if err != nil {
 			t.Errorf("failed to read response.create request: %v", err)
 			return
 		}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_snapshot","status":"in_progress","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_snapshot","status":"in_progress","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`)); err != nil {
 			t.Errorf("failed to write snapshot response.created event: %v", err)
 			return
 		}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_snapshot","status":"completed","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_snapshot","status":"completed","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`)); err != nil {
 			t.Errorf("failed to write snapshot response.done event: %v", err)
 			return
 		}
@@ -360,11 +351,11 @@ func TestOpenAIRealtimeSessionDeduplicatesUsageSnapshots(t *testing.T) {
 	recorder := &recordingOpenAIRealtimeObserver{}
 	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return recorder })
 
-	if err := session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","response":{"input":[]}}`)); err != nil {
+	if err := session.SendClient(context.Background(), openAITestTextFrame([]byte(`{"type":"response.create","response":{"input":[]}}`))); err != nil {
 		t.Fatalf("expected response.create send to succeed, got %v", err)
 	}
 
-	_, payload, usage, _, err := session.Recv(context.Background())
+	_, payload, usage, _, err := openAITestRecv(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected snapshot response.created recv without error, got %v", err)
 	}
@@ -375,7 +366,7 @@ func TestOpenAIRealtimeSessionDeduplicatesUsageSnapshots(t *testing.T) {
 		t.Fatalf("expected first usage delta to equal initial snapshot, got %+v", usage)
 	}
 
-	_, payload, usage, _, err = session.Recv(context.Background())
+	_, payload, usage, _, err = openAITestRecv(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected snapshot response.done recv without error, got %v", err)
 	}
@@ -400,13 +391,13 @@ func TestOpenAIRealtimeSessionDeduplicatesUsageSnapshots(t *testing.T) {
 
 func TestOpenAIRealtimeSessionPropagatesObserverUsageErrors(t *testing.T) {
 	releaseDone := make(chan struct{})
-	server := newOpenAIRealtimeTestServer(t, func(conn *websocket.Conn) {
+	server := newOpenAIRealtimeTestServer(t, func(conn *openAIRealtimeTestConn) {
 		_, _, err := conn.ReadMessage()
 		if err != nil {
 			t.Errorf("failed to read response.create request: %v", err)
 			return
 		}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_quota","status":"completed","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_quota","status":"completed","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`)); err != nil {
 			t.Errorf("failed to write quota terminal response event: %v", err)
 			return
 		}
@@ -427,15 +418,15 @@ func TestOpenAIRealtimeSessionPropagatesObserverUsageErrors(t *testing.T) {
 	observer := &failingOpenAIRealtimeObserver{observeErr: errors.New("user quota is not enough")}
 	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return observer })
 
-	if err := session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","response":{"input":[]}}`)); err != nil {
+	if err := session.SendClient(context.Background(), openAITestTextFrame([]byte(`{"type":"response.create","response":{"input":[]}}`))); err != nil {
 		t.Fatalf("expected response.create send to succeed, got %v", err)
 	}
 
-	messageType, payload, usage, _, err := session.Recv(context.Background())
-	if err == nil {
-		t.Fatal("expected observer usage error to terminate the session")
+	messageType, payload, usage, _, err := openAITestRecv(context.Background(), session)
+	if err != nil {
+		t.Fatalf("expected terminal payload before observer usage error, got %v", err)
 	}
-	if messageType != websocket.TextMessage {
+	if messageType != wsconn.TextMessage {
 		t.Fatalf("expected websocket text payload, got %d", messageType)
 	}
 	if !strings.Contains(string(payload), `"response.done"`) {
@@ -443,6 +434,13 @@ func TestOpenAIRealtimeSessionPropagatesObserverUsageErrors(t *testing.T) {
 	}
 	if usage == nil || usage.TotalTokens != 8 {
 		t.Fatalf("expected terminal usage to remain attached to the forwarded payload, got %+v", usage)
+	}
+	_, _, usage, _, err = openAITestRecv(context.Background(), session)
+	if err == nil {
+		t.Fatal("expected observer usage error to terminate the session after terminal payload")
+	}
+	if usage != nil {
+		t.Fatalf("expected observer usage error event not to carry usage, got %+v", usage)
 	}
 	errorPayload := string(runtimesession.ClientPayloadFromError(err))
 	if !strings.Contains(errorPayload, `"code":"quota_exhausted"`) {
@@ -464,7 +462,7 @@ func TestOpenAIRealtimeSessionPropagatesObserverUsageErrors(t *testing.T) {
 
 func TestOpenAIRealtimeSessionAdmissionFailureDoesNotWriteUpstream(t *testing.T) {
 	receivedPayload := make(chan []byte, 1)
-	server := newOpenAIRealtimeTestServer(t, func(conn *websocket.Conn) {
+	server := newOpenAIRealtimeTestServer(t, func(conn *openAIRealtimeTestConn) {
 		_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 		_, payload, err := conn.ReadMessage()
 		if err == nil {
@@ -483,7 +481,7 @@ func TestOpenAIRealtimeSessionAdmissionFailureDoesNotWriteUpstream(t *testing.T)
 	observer := &failingAdmissionOpenAIRealtimeObserver{admitErr: errors.New("user quota is not enough")}
 	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return observer })
 
-	err := session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","response":{"input":[]}}`))
+	err := session.SendClient(context.Background(), openAITestTextFrame([]byte(`{"type":"response.create","response":{"input":[]}}`)))
 	if err == nil {
 		t.Fatal("expected admission failure to reject response.create")
 	}
@@ -505,12 +503,12 @@ func TestOpenAIRealtimeSessionAdmissionFailureDoesNotWriteUpstream(t *testing.T)
 
 func TestOpenAIRealtimeSessionPassesThroughErrorEventsWithoutClosing(t *testing.T) {
 	releaseDone := make(chan struct{})
-	server := newOpenAIRealtimeTestServer(t, func(conn *websocket.Conn) {
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","error":{"type":"invalid_request_error","code":"bad_input","message":"bad request"}}`)); err != nil {
+	server := newOpenAIRealtimeTestServer(t, func(conn *openAIRealtimeTestConn) {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"error","error":{"type":"invalid_request_error","code":"bad_input","message":"bad request"}}`)); err != nil {
 			t.Errorf("failed to write upstream error event: %v", err)
 			return
 		}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_after_error","status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_after_error","status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)); err != nil {
 			t.Errorf("failed to write post-error terminal event: %v", err)
 			return
 		}
@@ -528,7 +526,7 @@ func TestOpenAIRealtimeSessionPassesThroughErrorEventsWithoutClosing(t *testing.
 		session.Abort("test_cleanup")
 	}()
 
-	_, payload, usage, _, err := session.Recv(context.Background())
+	_, payload, usage, _, err := openAITestRecv(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected raw upstream error event to be forwarded without closing session, got %v", err)
 	}
@@ -539,7 +537,7 @@ func TestOpenAIRealtimeSessionPassesThroughErrorEventsWithoutClosing(t *testing.
 		t.Fatalf("expected raw upstream error event payload, got %q", payload)
 	}
 
-	_, payload, usage, _, err = session.Recv(context.Background())
+	_, payload, usage, _, err = openAITestRecv(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected session to remain open after upstream error event, got %v", err)
 	}
@@ -554,12 +552,12 @@ func TestOpenAIRealtimeSessionPassesThroughErrorEventsWithoutClosing(t *testing.
 func TestOpenAIRealtimeSessionErrorEventFinalizesTurnAndReleasesSessionBusy(t *testing.T) {
 	releaseDone := make(chan struct{})
 	secondCreateSeen := make(chan struct{}, 1)
-	server := newOpenAIRealtimeTestServer(t, func(conn *websocket.Conn) {
+	server := newOpenAIRealtimeTestServer(t, func(conn *openAIRealtimeTestConn) {
 		if _, _, err := conn.ReadMessage(); err != nil {
 			t.Errorf("failed to read first response.create request: %v", err)
 			return
 		}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","error":{"type":"invalid_request_error","code":"bad_input","message":"bad request"}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"error","error":{"type":"invalid_request_error","code":"bad_input","message":"bad request"}}`)); err != nil {
 			t.Errorf("failed to write terminal error event: %v", err)
 			return
 		}
@@ -568,7 +566,7 @@ func TestOpenAIRealtimeSessionErrorEventFinalizesTurnAndReleasesSessionBusy(t *t
 			return
 		}
 		secondCreateSeen <- struct{}{}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_recovered","status":"completed","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_recovered","status":"completed","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`)); err != nil {
 			t.Errorf("failed to write recovery response.done event: %v", err)
 			return
 		}
@@ -590,11 +588,11 @@ func TestOpenAIRealtimeSessionErrorEventFinalizesTurnAndReleasesSessionBusy(t *t
 	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return recorder })
 
 	createPayload := []byte(`{"type":"response.create","response":{"input":[]}}`)
-	if err := session.SendClient(context.Background(), websocket.TextMessage, createPayload); err != nil {
+	if err := session.SendClient(context.Background(), openAITestTextFrame(createPayload)); err != nil {
 		t.Fatalf("expected first response.create send to succeed, got %v", err)
 	}
 
-	_, payload, usage, _, err := session.Recv(context.Background())
+	_, payload, usage, _, err := openAITestRecv(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected upstream error event to be forwarded without closing the session, got %v", err)
 	}
@@ -605,7 +603,7 @@ func TestOpenAIRealtimeSessionErrorEventFinalizesTurnAndReleasesSessionBusy(t *t
 		t.Fatalf("expected passthrough error payload, got %q", payload)
 	}
 
-	if err := session.SendClient(context.Background(), websocket.TextMessage, createPayload); err != nil {
+	if err := session.SendClient(context.Background(), openAITestTextFrame(createPayload)); err != nil {
 		t.Fatalf("expected error event to release session_busy for the next response.create, got %v", err)
 	}
 
@@ -620,7 +618,7 @@ func TestOpenAIRealtimeSessionErrorEventFinalizesTurnAndReleasesSessionBusy(t *t
 		t.Fatal("timed out waiting for upstream to receive the second response.create request")
 	}
 
-	_, payload, usage, _, err = session.Recv(context.Background())
+	_, payload, usage, _, err = openAITestRecv(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected recovery response.done without error, got %v", err)
 	}
@@ -635,16 +633,16 @@ func TestOpenAIRealtimeSessionErrorEventFinalizesTurnAndReleasesSessionBusy(t *t
 func TestOpenAIRealtimeSessionIgnoresLateFinalizedResponseUsageAfterNewTurnStarts(t *testing.T) {
 	releaseDone := make(chan struct{})
 	allowCurrentDone := make(chan struct{})
-	server := newOpenAIRealtimeTestServer(t, func(conn *websocket.Conn) {
+	server := newOpenAIRealtimeTestServer(t, func(conn *openAIRealtimeTestConn) {
 		if _, _, err := conn.ReadMessage(); err != nil {
 			t.Errorf("failed to read first response.create request: %v", err)
 			return
 		}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_old","status":"in_progress"}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_old","status":"in_progress"}}`)); err != nil {
 			t.Errorf("failed to write first response.created event: %v", err)
 			return
 		}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","error":{"type":"invalid_request_error","code":"bad_input","message":"bad request"}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"error","error":{"type":"invalid_request_error","code":"bad_input","message":"bad request"}}`)); err != nil {
 			t.Errorf("failed to write terminal error event: %v", err)
 			return
 		}
@@ -652,16 +650,16 @@ func TestOpenAIRealtimeSessionIgnoresLateFinalizedResponseUsageAfterNewTurnStart
 			t.Errorf("failed to read second response.create request: %v", err)
 			return
 		}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_new","status":"in_progress"}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_new","status":"in_progress"}}`)); err != nil {
 			t.Errorf("failed to write second response.created event: %v", err)
 			return
 		}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_old","status":"completed","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_old","status":"completed","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`)); err != nil {
 			t.Errorf("failed to write late finalized response.done event: %v", err)
 			return
 		}
 		<-allowCurrentDone
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_new","status":"completed","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_new","status":"completed","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`)); err != nil {
 			t.Errorf("failed to write recovery response.done event: %v", err)
 			return
 		}
@@ -683,11 +681,11 @@ func TestOpenAIRealtimeSessionIgnoresLateFinalizedResponseUsageAfterNewTurnStart
 	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return recorder })
 
 	createPayload := []byte(`{"type":"response.create","response":{"input":[]}}`)
-	if err := session.SendClient(context.Background(), websocket.TextMessage, createPayload); err != nil {
+	if err := session.SendClient(context.Background(), openAITestTextFrame(createPayload)); err != nil {
 		t.Fatalf("expected first response.create send to succeed, got %v", err)
 	}
 
-	_, payload, usage, _, err := session.Recv(context.Background())
+	_, payload, usage, _, err := openAITestRecv(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected first response.created without error, got %v", err)
 	}
@@ -698,7 +696,7 @@ func TestOpenAIRealtimeSessionIgnoresLateFinalizedResponseUsageAfterNewTurnStart
 		t.Fatalf("expected first response.created not to carry usage, got %+v", usage)
 	}
 
-	_, payload, usage, _, err = session.Recv(context.Background())
+	_, payload, usage, _, err = openAITestRecv(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected passthrough error event without closing the session, got %v", err)
 	}
@@ -709,7 +707,7 @@ func TestOpenAIRealtimeSessionIgnoresLateFinalizedResponseUsageAfterNewTurnStart
 		t.Fatalf("expected passthrough error event not to carry usage, got %+v", usage)
 	}
 
-	if err := session.SendClient(context.Background(), websocket.TextMessage, createPayload); err != nil {
+	if err := session.SendClient(context.Background(), openAITestTextFrame(createPayload)); err != nil {
 		t.Fatalf("expected second response.create send to succeed, got %v", err)
 	}
 
@@ -722,7 +720,7 @@ func TestOpenAIRealtimeSessionIgnoresLateFinalizedResponseUsageAfterNewTurnStart
 		t.Fatalf("expected first finalized turn to use error termination, got %q", firstFinalize.TerminationReason)
 	}
 
-	_, payload, usage, _, err = session.Recv(context.Background())
+	_, payload, usage, _, err = openAITestRecv(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected second response.created without error, got %v", err)
 	}
@@ -733,7 +731,7 @@ func TestOpenAIRealtimeSessionIgnoresLateFinalizedResponseUsageAfterNewTurnStart
 		t.Fatalf("expected second response.created not to carry usage, got %+v", usage)
 	}
 
-	_, payload, usage, _, err = session.Recv(context.Background())
+	_, payload, usage, _, err = openAITestRecv(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected late finalized response.done without session error, got %v", err)
 	}
@@ -752,7 +750,7 @@ func TestOpenAIRealtimeSessionIgnoresLateFinalizedResponseUsageAfterNewTurnStart
 
 	close(allowCurrentDone)
 
-	_, payload, usage, _, err = session.Recv(context.Background())
+	_, payload, usage, _, err = openAITestRecv(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected current response.done without error, got %v", err)
 	}
@@ -774,20 +772,20 @@ func TestOpenAIRealtimeSessionIgnoresLateFinalizedResponseUsageAfterNewTurnStart
 
 func TestOpenAIRealtimeSessionKeepsActiveTurnWhenResponseIDChangesMidTurn(t *testing.T) {
 	releaseDone := make(chan struct{})
-	server := newOpenAIRealtimeTestServer(t, func(conn *websocket.Conn) {
+	server := newOpenAIRealtimeTestServer(t, func(conn *openAIRealtimeTestConn) {
 		if _, _, err := conn.ReadMessage(); err != nil {
 			t.Errorf("failed to read response.create request: %v", err)
 			return
 		}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_initial","status":"in_progress"}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_initial","status":"in_progress"}}`)); err != nil {
 			t.Errorf("failed to write initial response.created event: %v", err)
 			return
 		}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_reissued","status":"in_progress"}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_reissued","status":"in_progress"}}`)); err != nil {
 			t.Errorf("failed to write reissued response.created event: %v", err)
 			return
 		}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_reissued","status":"completed","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_reissued","status":"completed","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}`)); err != nil {
 			t.Errorf("failed to write reissued response.done event: %v", err)
 			return
 		}
@@ -808,12 +806,12 @@ func TestOpenAIRealtimeSessionKeepsActiveTurnWhenResponseIDChangesMidTurn(t *tes
 	recorder := &recordingOpenAIRealtimeObserver{}
 	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return recorder })
 
-	if err := session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","response":{"input":[]}}`)); err != nil {
+	if err := session.SendClient(context.Background(), openAITestTextFrame([]byte(`{"type":"response.create","response":{"input":[]}}`))); err != nil {
 		t.Fatalf("expected response.create send to succeed, got %v", err)
 	}
 
 	for _, want := range []string{`"resp_initial"`, `"resp_reissued"`} {
-		_, payload, usage, _, err := session.Recv(context.Background())
+		_, payload, usage, _, err := openAITestRecv(context.Background(), session)
 		if err != nil {
 			t.Fatalf("expected response.created payload %s without error, got %v", want, err)
 		}
@@ -825,7 +823,7 @@ func TestOpenAIRealtimeSessionKeepsActiveTurnWhenResponseIDChangesMidTurn(t *tes
 		}
 	}
 
-	_, payload, usage, _, err := session.Recv(context.Background())
+	_, payload, usage, _, err := openAITestRecv(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected reissued response.done without error, got %v", err)
 	}
@@ -848,20 +846,20 @@ func TestOpenAIRealtimeSessionKeepsActiveTurnWhenResponseIDChangesMidTurn(t *tes
 func TestOpenAIRealtimeSessionIgnoresLateResponseIDSeenEarlierInFinalizedTurn(t *testing.T) {
 	releaseDone := make(chan struct{})
 	allowCurrentDone := make(chan struct{})
-	server := newOpenAIRealtimeTestServer(t, func(conn *websocket.Conn) {
+	server := newOpenAIRealtimeTestServer(t, func(conn *openAIRealtimeTestConn) {
 		if _, _, err := conn.ReadMessage(); err != nil {
 			t.Errorf("failed to read first response.create request: %v", err)
 			return
 		}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_initial","status":"in_progress"}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_initial","status":"in_progress"}}`)); err != nil {
 			t.Errorf("failed to write initial response.created event: %v", err)
 			return
 		}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_reissued","status":"in_progress"}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_reissued","status":"in_progress"}}`)); err != nil {
 			t.Errorf("failed to write reissued response.created event: %v", err)
 			return
 		}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_reissued","status":"completed","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_reissued","status":"completed","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}`)); err != nil {
 			t.Errorf("failed to write reissued response.done event: %v", err)
 			return
 		}
@@ -869,16 +867,16 @@ func TestOpenAIRealtimeSessionIgnoresLateResponseIDSeenEarlierInFinalizedTurn(t 
 			t.Errorf("failed to read second response.create request: %v", err)
 			return
 		}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_current","status":"in_progress"}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_current","status":"in_progress"}}`)); err != nil {
 			t.Errorf("failed to write current response.created event: %v", err)
 			return
 		}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_initial","status":"completed","usage":{"input_tokens":7,"output_tokens":1,"total_tokens":8}}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_initial","status":"completed","usage":{"input_tokens":7,"output_tokens":1,"total_tokens":8}}}`)); err != nil {
 			t.Errorf("failed to write late initial response.done event: %v", err)
 			return
 		}
 		<-allowCurrentDone
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_current","status":"completed","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_current","status":"completed","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`)); err != nil {
 			t.Errorf("failed to write current response.done event: %v", err)
 			return
 		}
@@ -900,12 +898,12 @@ func TestOpenAIRealtimeSessionIgnoresLateResponseIDSeenEarlierInFinalizedTurn(t 
 	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return recorder })
 
 	createPayload := []byte(`{"type":"response.create","response":{"input":[]}}`)
-	if err := session.SendClient(context.Background(), websocket.TextMessage, createPayload); err != nil {
+	if err := session.SendClient(context.Background(), openAITestTextFrame(createPayload)); err != nil {
 		t.Fatalf("expected first response.create send to succeed, got %v", err)
 	}
 
 	for _, want := range []string{`"resp_initial"`, `"resp_reissued"`} {
-		_, payload, usage, _, err := session.Recv(context.Background())
+		_, payload, usage, _, err := openAITestRecv(context.Background(), session)
 		if err != nil {
 			t.Fatalf("expected response.created payload %s without error, got %v", want, err)
 		}
@@ -917,7 +915,7 @@ func TestOpenAIRealtimeSessionIgnoresLateResponseIDSeenEarlierInFinalizedTurn(t 
 		}
 	}
 
-	_, payload, usage, _, err := session.Recv(context.Background())
+	_, payload, usage, _, err := openAITestRecv(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected reissued response.done without error, got %v", err)
 	}
@@ -936,11 +934,11 @@ func TestOpenAIRealtimeSessionIgnoresLateResponseIDSeenEarlierInFinalizedTurn(t 
 		t.Fatalf("expected first finalized turn to preserve reissued response id, got %q", got)
 	}
 
-	if err := session.SendClient(context.Background(), websocket.TextMessage, createPayload); err != nil {
+	if err := session.SendClient(context.Background(), openAITestTextFrame(createPayload)); err != nil {
 		t.Fatalf("expected second response.create send to succeed, got %v", err)
 	}
 
-	_, payload, usage, _, err = session.Recv(context.Background())
+	_, payload, usage, _, err = openAITestRecv(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected current response.created without error, got %v", err)
 	}
@@ -951,7 +949,7 @@ func TestOpenAIRealtimeSessionIgnoresLateResponseIDSeenEarlierInFinalizedTurn(t 
 		t.Fatalf("expected current response.created not to carry usage, got %+v", usage)
 	}
 
-	_, payload, usage, _, err = session.Recv(context.Background())
+	_, payload, usage, _, err = openAITestRecv(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected late initial response.done without error, got %v", err)
 	}
@@ -970,7 +968,7 @@ func TestOpenAIRealtimeSessionIgnoresLateResponseIDSeenEarlierInFinalizedTurn(t 
 
 	close(allowCurrentDone)
 
-	_, payload, usage, _, err = session.Recv(context.Background())
+	_, payload, usage, _, err = openAITestRecv(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected current response.done without error, got %v", err)
 	}
@@ -997,8 +995,8 @@ func TestOpenAIRealtimeSessionCompatModePassesThroughNonFatalErrorEvent(t *testi
 		config.OpenAIRealtimeSessionCompatMode = originalCompatMode
 	}()
 
-	server := newOpenAIRealtimeTestServer(t, func(conn *websocket.Conn) {
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","error":{"type":"invalid_request_error","code":"bad_input","message":"bad request"}}`)); err != nil {
+	server := newOpenAIRealtimeTestServer(t, func(conn *openAIRealtimeTestConn) {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"error","error":{"type":"invalid_request_error","code":"bad_input","message":"bad request"}}`)); err != nil {
 			t.Errorf("failed to write upstream error event: %v", err)
 		}
 	})
@@ -1011,7 +1009,7 @@ func TestOpenAIRealtimeSessionCompatModePassesThroughNonFatalErrorEvent(t *testi
 	}
 	defer session.Abort("test_cleanup")
 
-	_, payload, usage, _, err := session.Recv(context.Background())
+	_, payload, usage, _, err := openAITestRecv(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected non-fatal compat error to pass through without closing, got %v", err)
 	}
@@ -1028,7 +1026,7 @@ func TestOpenAIRealtimeSessionRejectsConcurrentResponseCreate(t *testing.T) {
 	checkedOverlap := make(chan struct{})
 	releaseDone := make(chan struct{})
 	upstreamCreates := make(chan []byte, 2)
-	server := newOpenAIRealtimeTestServer(t, func(conn *websocket.Conn) {
+	server := newOpenAIRealtimeTestServer(t, func(conn *openAIRealtimeTestConn) {
 		defer func() {
 			select {
 			case <-checkedOverlap:
@@ -1046,7 +1044,7 @@ func TestOpenAIRealtimeSessionRejectsConcurrentResponseCreate(t *testing.T) {
 
 		<-allowDone
 
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_serialized","status":"completed","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_serialized","status":"completed","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}`)); err != nil {
 			t.Errorf("failed to write serialized response.done event: %v", err)
 			return
 		}
@@ -1081,11 +1079,11 @@ func TestOpenAIRealtimeSessionRejectsConcurrentResponseCreate(t *testing.T) {
 	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return recorder })
 
 	createPayload := []byte(`{"type":"response.create","response":{"input":[]}}`)
-	if err := session.SendClient(context.Background(), websocket.TextMessage, createPayload); err != nil {
+	if err := session.SendClient(context.Background(), openAITestTextFrame(createPayload)); err != nil {
 		t.Fatalf("expected first response.create send to succeed, got %v", err)
 	}
 
-	err := session.SendClient(context.Background(), websocket.TextMessage, createPayload)
+	err := session.SendClient(context.Background(), openAITestTextFrame(createPayload))
 	if err == nil {
 		t.Fatal("expected second inflight response.create to fail")
 	}
@@ -1095,7 +1093,7 @@ func TestOpenAIRealtimeSessionRejectsConcurrentResponseCreate(t *testing.T) {
 
 	close(allowDone)
 
-	_, payload, usage, _, err := session.Recv(context.Background())
+	_, payload, usage, _, err := openAITestRecv(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected first turn to still finalize successfully, got %v", err)
 	}
@@ -1126,63 +1124,14 @@ func TestOpenAIRealtimeSessionRejectsConcurrentResponseCreate(t *testing.T) {
 }
 
 func TestOpenAIResponsesWSStartTurnUsesTimerWithoutMutatingReadDeadline(t *testing.T) {
-	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			t.Errorf("upgrade failed: %v", err)
-			return
-		}
-		defer conn.Close()
-		<-r.Context().Done()
-	}))
-	defer server.Close()
-
-	var recordingConn *recordingOpenAIReadDeadlineConn
-	dialer := websocket.Dialer{
-		NetDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			rawConn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
-			if err != nil {
-				return nil, err
-			}
-			recordingConn = &recordingOpenAIReadDeadlineConn{Conn: rawConn}
-			return recordingConn, nil
-		},
-	}
-	wsURL := "ws" + server.URL[len("http"):]
-	conn, _, err := dialer.Dial(wsURL, nil)
-	if err != nil {
-		t.Fatalf("failed to dial recording websocket: %v", err)
-	}
-	defer conn.Close()
-	if recordingConn == nil {
-		t.Fatal("expected websocket dial to use recording connection")
-	}
-
 	session := newOpenAIRealtimeHelperSession()
-	session.conn = conn
 	session.responsesWS = true
-	if err := session.setReadDeadlineForCurrentState(); err != nil {
-		t.Fatalf("expected idle read deadline refresh to succeed, got %v", err)
-	}
-	idleDeadline := recordingConn.lastReadDeadline()
-	if idleDeadline.IsZero() {
-		t.Fatal("expected idle read deadline to be recorded")
-	}
-	deadlineCount := recordingConn.readDeadlineCount()
-
 	startedTurn, _, err := session.startTurn()
 	if err != nil {
 		t.Fatalf("expected startTurn to succeed, got %v", err)
 	}
 	if startedTurn == nil {
 		t.Fatal("expected startTurn to return active turn")
-	}
-	if got := recordingConn.readDeadlineCount(); got != deadlineCount {
-		t.Fatalf("expected startTurn not to call SetReadDeadline from writer path, before=%d after=%d", deadlineCount, got)
-	}
-	if got := recordingConn.lastReadDeadline(); !got.Equal(idleDeadline) {
-		t.Fatalf("expected read deadline to remain owned by read path, idle=%s got=%s", idleDeadline, got)
 	}
 	session.turnReadMu.Lock()
 	timerArmed := session.turnReadTimer != nil
@@ -1200,20 +1149,16 @@ func TestOpenAIResponsesWSStartTurnUsesTimerWithoutMutatingReadDeadline(t *testi
 	}
 }
 
-func TestOpenAIRealtimeSessionDetachContinuesTurnFinalization(t *testing.T) {
-	releaseDone := make(chan struct{})
-	server := newOpenAIRealtimeTestServer(t, func(conn *websocket.Conn) {
+func TestOpenAIRealtimeSessionDetachClosesUpstreamWithNormalClosure(t *testing.T) {
+	closeInfoCh := make(chan wsconn.CloseInfo, 1)
+	server := newOpenAIRealtimeTestServer(t, func(conn *openAIRealtimeTestConn) {
 		_, _, err := conn.ReadMessage()
 		if err != nil {
 			t.Errorf("failed to read detached response.create request: %v", err)
 			return
 		}
-		time.Sleep(50 * time.Millisecond)
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_detached","status":"completed","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}`)); err != nil {
-			t.Errorf("failed to write detached terminal response event: %v", err)
-			return
-		}
-		<-releaseDone
+		<-conn.conn.Done()
+		closeInfoCh <- conn.conn.CloseInfo()
 	})
 	defer server.Close()
 
@@ -1223,7 +1168,6 @@ func TestOpenAIRealtimeSessionDetachContinuesTurnFinalization(t *testing.T) {
 		t.Fatalf("expected realtime session to open, got %v", errWithCode)
 	}
 	defer func() {
-		close(releaseDone)
 		session.Abort("test_cleanup")
 	}()
 
@@ -1232,24 +1176,19 @@ func TestOpenAIRealtimeSessionDetachContinuesTurnFinalization(t *testing.T) {
 		t.Fatalf("expected concrete openAI realtime session, got %T", session)
 	}
 
-	recorder := &recordingOpenAIRealtimeObserver{}
-	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return recorder })
-
-	if err := session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","response":{"input":[]}}`)); err != nil {
+	if err := session.SendClient(context.Background(), openAITestTextFrame([]byte(`{"type":"response.create","response":{"input":[]}}`))); err != nil {
 		t.Fatalf("expected detached response.create send to succeed, got %v", err)
 	}
 
 	session.Detach("test_detach")
 
-	waitForOpenAIRealtimeFinalize(t, recorder, 1, 2*time.Second)
-	if recorder.finalizeCount() != 1 {
-		t.Fatalf("expected detached session to finalize exactly one turn, got %d", recorder.finalizeCount())
-	}
-	if got := recorder.lastPayload().LastResponseID; got != "resp_detached" {
-		t.Fatalf("expected detached turn finalization to preserve response id, got %q", got)
-	}
-	if usage := recorder.lastPayload().Usage; usage == nil || usage.TotalTokens != 5 {
-		t.Fatalf("expected detached turn finalization to preserve usage, got %+v", usage)
+	select {
+	case info := <-closeInfoCh:
+		if info.Kind != wsconn.CloseKindPeerClose || info.Code != wsconn.CloseNormalClosure || info.Reason != "test_detach" {
+			t.Fatalf("expected upstream peer close 1000 from Detach, got %+v", info)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for upstream Detach close")
 	}
 	if queued := len(concrete.recvCh); queued != 0 {
 		t.Fatalf("expected detached session to avoid queueing downstream events, got %d buffered frames", queued)
@@ -1259,13 +1198,13 @@ func TestOpenAIRealtimeSessionDetachContinuesTurnFinalization(t *testing.T) {
 func TestOpenAIRealtimeSessionAbortFinalizesInflightTurn(t *testing.T) {
 	serverReady := make(chan struct{})
 	releaseDone := make(chan struct{})
-	server := newOpenAIRealtimeTestServer(t, func(conn *websocket.Conn) {
+	server := newOpenAIRealtimeTestServer(t, func(conn *openAIRealtimeTestConn) {
 		_, _, err := conn.ReadMessage()
 		if err != nil {
 			t.Errorf("failed to read abort response.create request: %v", err)
 			return
 		}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_abort","status":"in_progress","usage":{"input_tokens":2,"output_tokens":0,"total_tokens":2}}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_abort","status":"in_progress","usage":{"input_tokens":2,"output_tokens":0,"total_tokens":2}}}`)); err != nil {
 			t.Errorf("failed to write abort response.created event: %v", err)
 			return
 		}
@@ -1287,7 +1226,7 @@ func TestOpenAIRealtimeSessionAbortFinalizesInflightTurn(t *testing.T) {
 	recorder := &recordingOpenAIRealtimeObserver{}
 	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return recorder })
 
-	if err := session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","response":{"input":[]}}`)); err != nil {
+	if err := session.SendClient(context.Background(), openAITestTextFrame([]byte(`{"type":"response.create","response":{"input":[]}}`))); err != nil {
 		t.Fatalf("expected abort response.create send to succeed, got %v", err)
 	}
 
@@ -1297,7 +1236,7 @@ func TestOpenAIRealtimeSessionAbortFinalizesInflightTurn(t *testing.T) {
 		t.Fatal("timed out waiting for in-flight abort response")
 	}
 
-	_, payload, usage, _, err := session.Recv(context.Background())
+	_, payload, usage, _, err := openAITestRecv(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected in-flight payload before abort, got %v", err)
 	}
@@ -1323,13 +1262,13 @@ func TestOpenAIRealtimeSessionAbortFinalizesInflightTurn(t *testing.T) {
 }
 
 func TestOpenAIRealtimeSessionUpstreamCloseFinalizesInflightTurn(t *testing.T) {
-	server := newOpenAIRealtimeTestServer(t, func(conn *websocket.Conn) {
+	server := newOpenAIRealtimeTestServer(t, func(conn *openAIRealtimeTestConn) {
 		_, _, err := conn.ReadMessage()
 		if err != nil {
 			t.Errorf("failed to read upstream-close response.create request: %v", err)
 			return
 		}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_upstream_closed","status":"in_progress","usage":{"input_tokens":4,"output_tokens":0,"total_tokens":4}}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_upstream_closed","status":"in_progress","usage":{"input_tokens":4,"output_tokens":0,"total_tokens":4}}}`)); err != nil {
 			t.Errorf("failed to write upstream-close response.created event: %v", err)
 			return
 		}
@@ -1346,11 +1285,11 @@ func TestOpenAIRealtimeSessionUpstreamCloseFinalizesInflightTurn(t *testing.T) {
 	recorder := &recordingOpenAIRealtimeObserver{}
 	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return recorder })
 
-	if err := session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","response":{"input":[]}}`)); err != nil {
+	if err := session.SendClient(context.Background(), openAITestTextFrame([]byte(`{"type":"response.create","response":{"input":[]}}`))); err != nil {
 		t.Fatalf("expected upstream-close response.create send to succeed, got %v", err)
 	}
 
-	_, payload, usage, _, err := session.Recv(context.Background())
+	_, payload, usage, _, err := openAITestRecv(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected in-flight payload before upstream close, got %v", err)
 	}
@@ -1377,13 +1316,13 @@ func TestOpenAIRealtimeSessionUpstreamCloseFinalizesInflightTurn(t *testing.T) {
 func TestOpenAIRealtimeSessionCloseFinalizesInflightTurn(t *testing.T) {
 	serverReady := make(chan struct{})
 	releaseDone := make(chan struct{})
-	server := newOpenAIRealtimeTestServer(t, func(conn *websocket.Conn) {
+	server := newOpenAIRealtimeTestServer(t, func(conn *openAIRealtimeTestConn) {
 		_, _, err := conn.ReadMessage()
 		if err != nil {
 			t.Errorf("failed to read close response.create request: %v", err)
 			return
 		}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_local_close","status":"in_progress","usage":{"input_tokens":6,"output_tokens":0,"total_tokens":6}}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_local_close","status":"in_progress","usage":{"input_tokens":6,"output_tokens":0,"total_tokens":6}}}`)); err != nil {
 			t.Errorf("failed to write close response.created event: %v", err)
 			return
 		}
@@ -1410,7 +1349,7 @@ func TestOpenAIRealtimeSessionCloseFinalizesInflightTurn(t *testing.T) {
 	recorder := &recordingOpenAIRealtimeObserver{}
 	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return recorder })
 
-	if err := session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","response":{"input":[]}}`)); err != nil {
+	if err := session.SendClient(context.Background(), openAITestTextFrame([]byte(`{"type":"response.create","response":{"input":[]}}`))); err != nil {
 		t.Fatalf("expected close response.create send to succeed, got %v", err)
 	}
 
@@ -1420,7 +1359,7 @@ func TestOpenAIRealtimeSessionCloseFinalizesInflightTurn(t *testing.T) {
 		t.Fatal("timed out waiting for local close response")
 	}
 
-	_, payload, usage, _, err := session.Recv(context.Background())
+	_, payload, usage, _, err := openAITestRecv(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected in-flight payload before local close, got %v", err)
 	}
@@ -1446,13 +1385,13 @@ func TestOpenAIRealtimeSessionCloseFinalizesInflightTurn(t *testing.T) {
 }
 
 func TestOpenAIRealtimeSessionAbortWaitsForObserverUsageBeforeFinalizing(t *testing.T) {
-	server := newOpenAIRealtimeTestServer(t, func(conn *websocket.Conn) {
+	server := newOpenAIRealtimeTestServer(t, func(conn *openAIRealtimeTestConn) {
 		_, _, err := conn.ReadMessage()
 		if err != nil {
 			t.Errorf("failed to read observer-guard response.create request: %v", err)
 			return
 		}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_guarded","status":"in_progress","usage":{"input_tokens":2,"output_tokens":0,"total_tokens":2}}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_guarded","status":"in_progress","usage":{"input_tokens":2,"output_tokens":0,"total_tokens":2}}}`)); err != nil {
 			t.Errorf("failed to write observer-guard response.created event: %v", err)
 			return
 		}
@@ -1475,7 +1414,7 @@ func TestOpenAIRealtimeSessionAbortWaitsForObserverUsageBeforeFinalizing(t *test
 	defer observer.releaseObserve()
 	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return observer })
 
-	if err := session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","response":{"input":[]}}`)); err != nil {
+	if err := session.SendClient(context.Background(), openAITestTextFrame([]byte(`{"type":"response.create","response":{"input":[]}}`))); err != nil {
 		t.Fatalf("expected observer-guard response.create send to succeed, got %v", err)
 	}
 
@@ -1536,17 +1475,114 @@ func newOpenAIRealtimeTestProvider(serverURL string) *OpenAIProvider {
 	return CreateOpenAIProvider(channel, serverURL)
 }
 
-func newOpenAIRealtimeTestServer(t *testing.T, handler func(conn *websocket.Conn)) *httptest.Server {
+type openAIRealtimeTestFrame struct {
+	messageType wsconn.MessageType
+	payload     []byte
+}
+
+type openAIRealtimeTestConn struct {
+	conn *wsconn.ManagedConn
+
+	frames          chan openAIRealtimeTestFrame
+	closeFramesOnce sync.Once
+
+	readDeadlineMu sync.Mutex
+	readDeadline   time.Time
+}
+
+type openAIRealtimeTestTimeoutError struct{}
+
+func (openAIRealtimeTestTimeoutError) Error() string   { return "read timeout" }
+func (openAIRealtimeTestTimeoutError) Timeout() bool   { return true }
+func (openAIRealtimeTestTimeoutError) Temporary() bool { return true }
+
+func newOpenAIRealtimeTestConn(conn *wsconn.ManagedConn) *openAIRealtimeTestConn {
+	testConn := &openAIRealtimeTestConn{
+		conn:   conn,
+		frames: make(chan openAIRealtimeTestFrame, 32),
+	}
+	go func() {
+		defer func() {
+			if recover() != nil {
+				testConn.closeFramesOnce.Do(func() { close(testConn.frames) })
+			}
+		}()
+		wsconn.Pump{
+			Conn: conn,
+			Handle: func(_ context.Context, mt wsconn.MessageType, payload []byte) {
+				testConn.frames <- openAIRealtimeTestFrame{
+					messageType: mt,
+					payload:     append([]byte(nil), payload...),
+				}
+			},
+			OnClose: func(wsconn.CloseInfo) {
+				testConn.closeFramesOnce.Do(func() { close(testConn.frames) })
+			},
+		}.Run(context.Background())
+	}()
+	return testConn
+}
+
+func (c *openAIRealtimeTestConn) ReadMessage() (wsconn.MessageType, []byte, error) {
+	deadline := c.currentReadDeadline()
+	if !deadline.IsZero() {
+		if wait := time.Until(deadline); wait <= 0 {
+			return 0, nil, openAIRealtimeTestTimeoutError{}
+		} else {
+			timer := time.NewTimer(wait)
+			defer timer.Stop()
+			select {
+			case frame, ok := <-c.frames:
+				if !ok {
+					return 0, nil, net.ErrClosed
+				}
+				return frame.messageType, frame.payload, nil
+			case <-timer.C:
+				return 0, nil, openAIRealtimeTestTimeoutError{}
+			}
+		}
+	}
+	frame, ok := <-c.frames
+	if !ok {
+		return 0, nil, net.ErrClosed
+	}
+	return frame.messageType, frame.payload, nil
+}
+
+func (c *openAIRealtimeTestConn) WriteMessage(mt wsconn.MessageType, payload []byte) error {
+	return c.conn.WriteMessage(mt, payload)
+}
+
+func (c *openAIRealtimeTestConn) SetReadDeadline(deadline time.Time) error {
+	c.readDeadlineMu.Lock()
+	c.readDeadline = deadline
+	c.readDeadlineMu.Unlock()
+	return nil
+}
+
+func (c *openAIRealtimeTestConn) currentReadDeadline() time.Time {
+	c.readDeadlineMu.Lock()
+	defer c.readDeadlineMu.Unlock()
+	return c.readDeadline
+}
+
+func (c *openAIRealtimeTestConn) Close() {
+	c.conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_cleanup"})
+}
+
+func newOpenAIRealtimeTestServer(t *testing.T, handler func(conn *openAIRealtimeTestConn)) *httptest.Server {
 	t.Helper()
-	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
+		conn, err := wsconn.AcceptManaged(w, r, wsconn.Config{Label: "openai realtime test accept"}, wsconn.AcceptOptions{
+			CheckOrigin: func(*http.Request) bool { return true },
+		})
 		if err != nil {
 			t.Errorf("upgrade failed: %v", err)
 			return
 		}
-		defer conn.Close()
-		handler(conn)
+		testConn := newOpenAIRealtimeTestConn(conn)
+		defer testConn.Close()
+		handler(testConn)
 	}))
 	return server
 }

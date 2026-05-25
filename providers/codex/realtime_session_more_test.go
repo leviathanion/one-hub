@@ -2,50 +2,219 @@ package codex
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
-	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"one-api/common/authutil"
+	"one-api/common/config"
 	"one-api/common/logger"
+	"one-api/common/wsconn"
+	"one-api/common/wsconn/wstest"
 	runtimesession "one-api/runtime/session"
 	"one-api/types"
 
-	"github.com/gorilla/websocket"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 )
 
-func newCodexRealtimeConnPair(t *testing.T) (*websocket.Conn, func()) {
+func newCodexRealtimeConnPair(t *testing.T) (*wsconn.ManagedConn, func()) {
 	t.Helper()
 
-	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			t.Errorf("upgrade failed: %v", err)
-			return
-		}
-		defer conn.Close()
-		<-r.Context().Done()
+	wsURL, cleanupServer := wstest.Server(t, func(conn *wsconn.ManagedConn) {
+		<-conn.Done()
+	})
+	conn, err := wsconn.DialManaged(context.Background(), wsURL, nil, wsconn.Config{
+		Label:        "codex realtime test upstream",
+		ReadLimit:    config.RealtimeWebsocketReadLimit(),
+		WriteTimeout: config.RealtimeWebsocketWriteTimeout,
+	}, wsconn.WithDialSecurityPolicy(wsconn.DialSecurityPolicy{
+		AllowInsecureWS: true,
+		AllowPrivateIP:  true,
+		HostFilter: func(string, []net.IP) bool {
+			return true
+		},
 	}))
-
-	wsURL := "ws" + server.URL[len("http"):]
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
-		server.Close()
+		cleanupServer()
 		t.Fatalf("failed to dial helper websocket: %v", err)
 	}
 
 	return conn, func() {
-		_ = conn.Close()
-		server.Close()
+		conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_cleanup"})
+		cleanupServer()
+	}
+}
+
+func newCodexRealtimeConnPairFromURL(t *testing.T, wsURL string) (*wsconn.ManagedConn, func()) {
+	t.Helper()
+	conn, err := wsconn.DialManaged(context.Background(), wsURL, nil, wsconn.Config{
+		Label:        "codex realtime test upstream",
+		ReadLimit:    config.RealtimeWebsocketReadLimit(),
+		WriteTimeout: config.RealtimeWebsocketWriteTimeout,
+	}, wsconn.WithDialSecurityPolicy(wsconn.DialSecurityPolicy{
+		AllowInsecureWS: true,
+		AllowPrivateIP:  true,
+		HostFilter: func(string, []net.IP) bool {
+			return true
+		},
+	}))
+	if err != nil {
+		t.Fatalf("failed to dial helper websocket: %v", err)
+	}
+	return conn, func() {
+		conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_cleanup"})
+	}
+}
+
+func TestCodexRealtimeSessionSendClientRejectsZeroFrame(t *testing.T) {
+	session := &codexManagedRealtimeSession{
+		provider: &CodexProvider{},
+		exec:     runtimesession.NewExecutionSession(runtimesession.Metadata{SessionID: "codex-zero-frame"}),
+	}
+
+	if err := session.SendClient(context.Background(), runtimesession.Frame{}); !errors.Is(err, runtimesession.ErrInvalidFrame) {
+		t.Fatalf("expected zero frame to return ErrInvalidFrame, got %v", err)
+	}
+}
+
+func TestCodexRealtimeSessionSendClientRejectsUnknownFrameKind(t *testing.T) {
+	session := &codexManagedRealtimeSession{
+		provider: &CodexProvider{},
+		exec:     runtimesession.NewExecutionSession(runtimesession.Metadata{SessionID: "codex-unknown-frame-kind"}),
+	}
+
+	if err := session.SendClient(context.Background(), codexTestUnknownKindFrame([]byte("{}"))); !errors.Is(err, runtimesession.ErrInvalidFrame) {
+		t.Fatalf("expected unknown frame kind to return ErrInvalidFrame, got %v", err)
+	}
+}
+
+func codexTestUnknownKindFrame(payload []byte) runtimesession.Frame {
+	frame := runtimesession.NewTextFrame(payload)
+	field := reflect.ValueOf(&frame).Elem().FieldByName("kind")
+	reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem().SetInt(99)
+	return frame
+}
+
+func TestCodexRealtimeOutboundFromCloseInfoClassifiesPeerAndNonPeer(t *testing.T) {
+	peer := codexRealtimeOutboundFromCloseInfo(wsconn.CloseInfo{
+		Kind:   wsconn.CloseKindPeerClose,
+		Code:   wsconn.ClosePolicyViolation,
+		Reason: "quota exhausted",
+	})
+	if peer.providerClose == nil || peer.providerClose.Code != int(wsconn.ClosePolicyViolation) || peer.providerClose.Reason != "quota exhausted" {
+		t.Fatalf("expected peer close to become ProviderClose, got %+v", peer)
+	}
+	if peer.payload != nil || peer.err != nil || peer.origin != runtimesession.RealtimePayloadOriginProvider {
+		t.Fatalf("expected peer close to avoid payload/err, got %+v", peer)
+	}
+
+	for _, kind := range []wsconn.CloseKind{
+		wsconn.CloseKindReadError,
+		wsconn.CloseKindBackpressure,
+		wsconn.CloseKindPongMiss,
+		wsconn.CloseKindHandlerPanic,
+	} {
+		t.Run(string(kind), func(t *testing.T) {
+			outbound := codexRealtimeOutboundFromCloseInfo(wsconn.CloseInfo{Kind: kind, Reason: string(kind)})
+			if outbound.providerClose != nil {
+				t.Fatalf("expected non-peer close not to become ProviderClose, got %+v", outbound.providerClose)
+			}
+			if !strings.Contains(string(outbound.payload), "provider_connection_closed") {
+				t.Fatalf("expected provider_connection_closed payload, got %+v", outbound)
+			}
+			if !errors.Is(outbound.err, runtimesession.ErrSessionClosed) {
+				t.Fatalf("expected non-peer close to carry RecvEvent.Err source, got %v", outbound.err)
+			}
+			if outbound.origin != runtimesession.RealtimePayloadOriginProxyLocal {
+				t.Fatalf("expected proxy-local origin for non-peer close, got %v", outbound.origin)
+			}
+		})
+	}
+}
+
+func TestCodexTurnReadTimeoutClosesCurrentWebsocketWithAbort(t *testing.T) {
+	originalTimeout := codexRealtimeTurnReadTimeout
+	codexRealtimeTurnReadTimeout = 10 * time.Millisecond
+	t.Cleanup(func() {
+		codexRealtimeTurnReadTimeout = originalTimeout
+	})
+
+	conn, cleanup := newCodexRealtimeConnPair(t)
+	defer cleanup()
+
+	exec := runtimesession.NewExecutionSession(runtimesession.Metadata{
+		Key:       "turn-read-timeout",
+		SessionID: "turn-read-timeout",
+		Model:     "gpt-5",
+		Protocol:  codexRealtimeProtocolName,
+	})
+	exec.Lock()
+	state := getCodexManagedRuntimeStateLocked(exec)
+	state.wsConn = conn
+	state.wsConnGeneration = 1
+	state.turnSeq = 1
+	exec.Inflight = true
+	armCodexTurnReadTimeoutLocked(exec, state)
+	exec.Unlock()
+
+	select {
+	case <-conn.Done():
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for turn read timeout to close websocket")
+	}
+	if info := conn.CloseInfo(); info.Kind != wsconn.CloseKindAbort || info.Reason != "turn_read_timeout" {
+		t.Fatalf("expected turn read timeout to close with abort reason, got %+v", info)
+	}
+}
+
+func TestCodexTurnReadTimeoutIgnoresStaleConnectionGeneration(t *testing.T) {
+	originalTimeout := codexRealtimeTurnReadTimeout
+	codexRealtimeTurnReadTimeout = 10 * time.Millisecond
+	t.Cleanup(func() {
+		codexRealtimeTurnReadTimeout = originalTimeout
+	})
+
+	oldConn, oldCleanup := newCodexRealtimeConnPair(t)
+	defer oldCleanup()
+	newConn, newCleanup := newCodexRealtimeConnPair(t)
+	defer newCleanup()
+
+	exec := runtimesession.NewExecutionSession(runtimesession.Metadata{
+		Key:       "turn-read-timeout-stale",
+		SessionID: "turn-read-timeout-stale",
+		Model:     "gpt-5",
+		Protocol:  codexRealtimeProtocolName,
+	})
+	exec.Lock()
+	state := getCodexManagedRuntimeStateLocked(exec)
+	state.wsConn = oldConn
+	state.wsConnGeneration = 1
+	state.turnSeq = 1
+	exec.Inflight = true
+	armCodexTurnReadTimeoutLocked(exec, state)
+	state.wsConn = newConn
+	state.wsConnGeneration = 2
+	state.turnSeq = 2
+	exec.Unlock()
+
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-oldConn.Done():
+		t.Fatalf("stale turn timer closed old websocket: %+v", oldConn.CloseInfo())
+	default:
+	}
+	select {
+	case <-newConn.Done():
+		t.Fatalf("stale turn timer closed replacement websocket: %+v", newConn.CloseInfo())
+	default:
 	}
 }
 
@@ -125,32 +294,23 @@ func TestCodexRealtimeAttachmentTurnAndErrorHelpers(t *testing.T) {
 	state.wsReaderConn = conn
 	state.skipBootstrapConn = conn
 	configureCodexRealtimeConn(nil, state, conn)
-	writer := state.wsControlWriter
-	if writer == nil {
-		t.Fatal("expected configureCodexRealtimeConn to attach control frame writer")
-	}
-	if cleared := clearCodexManagedWebsocketLocked(state); cleared.conn != conn || cleared.controlWriter != writer || state.wsConn != nil || state.wsReaderConn != nil || state.skipBootstrapConn != nil || state.wsControlWriter != nil {
+	if cleared := clearCodexManagedWebsocketLocked(state); cleared.conn != conn || state.wsConn != nil || state.wsReaderConn != nil || state.skipBootstrapConn != nil {
 		t.Fatalf("expected clearCodexManagedWebsocketLocked to clear shared websocket references, cleared=%v state=%+v", cleared, state)
 	}
-	select {
-	case <-writer.Done():
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for cleared control frame writer to stop")
-	}
-	if cleared := clearCodexManagedWebsocketLocked(nil); cleared.conn != nil || cleared.controlWriter != nil {
+	if cleared := clearCodexManagedWebsocketLocked(nil); cleared.conn != nil {
 		t.Fatalf("expected nil managed websocket clear to return nil, got %v", cleared)
 	}
 
 	configureCodexRealtimeConn(nil, nil, nil)
-	if err := writeCodexRealtimeWSMessageLocked(nil, nil, websocket.TextMessage, []byte("hello")); !errors.Is(err, websocket.ErrCloseSent) {
-		t.Fatalf("expected nil websocket write to return close sent, got %v", err)
+	if err := writeCodexRealtimeWSMessageLocked(nil, nil, wsconn.TextMessage, []byte("hello")); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("expected nil websocket write to return net.ErrClosed, got %v", err)
 	}
 
 	conn, cleanupWrite := newCodexRealtimeConnPair(t)
 	defer cleanupWrite()
 	state = &codexManagedRuntimeState{}
 	configureCodexRealtimeConn(nil, state, conn)
-	if err := writeCodexRealtimeWSMessageLocked(state, conn, websocket.TextMessage, []byte(`{"type":"ping"}`)); err != nil {
+	if err := writeCodexRealtimeWSMessageLocked(state, conn, wsconn.TextMessage, []byte(`{"type":"ping"}`)); err != nil {
 		t.Fatalf("expected websocket helper write to succeed, got %v", err)
 	}
 
@@ -161,10 +321,10 @@ func TestCodexRealtimeAttachmentTurnAndErrorHelpers(t *testing.T) {
 	if attachment == nil || len(attachment.queue) != 1 {
 		t.Fatalf("expected explicit attachment capacity, got %+v", attachment)
 	}
-	if ok := enqueueCodexOutbound(attachment, codexRealtimeOutbound{messageType: websocket.TextMessage, payload: []byte("first")}); !ok {
+	if ok := enqueueCodexOutbound(attachment, codexRealtimeOutbound{messageType: wsconn.TextMessage, payload: []byte("first")}); !ok {
 		t.Fatal("expected first attachment enqueue to succeed")
 	}
-	if outbound := recvCodexAttachmentOutbound(t, attachment); outbound.messageType != websocket.TextMessage || string(outbound.payload) != "first" {
+	if outbound := recvCodexAttachmentOutbound(t, attachment); outbound.messageType != wsconn.TextMessage || string(outbound.payload) != "first" {
 		t.Fatalf("expected attachment recv to return queued payload, got %+v", outbound)
 	}
 	attachment.close()
@@ -177,10 +337,87 @@ func TestCodexRealtimeAttachmentTurnAndErrorHelpers(t *testing.T) {
 	if outbound, err := (*codexAttachment)(nil).recv(context.Background()); !errors.Is(err, runtimesession.ErrSessionClosed) || outbound.messageType != 0 {
 		t.Fatalf("expected nil attachment recv to fail with session closed, outbound=%+v err=%v", outbound, err)
 	}
+	if event, err := (&codexManagedRealtimeSession{attachment: attachment}).Recv(context.Background()); !errors.Is(err, runtimesession.ErrSessionClosed) || event != (runtimesession.RecvEvent{}) {
+		t.Fatalf("expected top-level recv error to return zero RecvEvent, event=%+v err=%v", event, err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if outbound, err := newCodexAttachmentWithCapacity(1).recv(ctx); !errors.Is(err, context.Canceled) || outbound.messageType != 0 {
 		t.Fatalf("expected canceled attachment recv, outbound=%+v err=%v", outbound, err)
+	}
+	providerClose := &runtimesession.ProviderClose{Code: int(wsconn.ClosePolicyViolation), Reason: "quota exhausted", Err: runtimesession.ErrSessionClosed}
+	providerCloseAttachment := newCodexAttachmentWithCapacity(1)
+	if ok := enqueueCodexOutbound(providerCloseAttachment, codexRealtimeOutbound{
+		providerClose: providerClose,
+		origin:        runtimesession.RealtimePayloadOriginProvider,
+	}); !ok {
+		t.Fatal("expected provider close attachment enqueue to succeed")
+	}
+	providerCloseSession := &codexManagedRealtimeSession{attachment: providerCloseAttachment}
+	if event, err := providerCloseSession.Recv(context.Background()); err != nil || event.ProviderClose != providerClose || event.Frame != nil || event.Usage != nil || event.Err != nil || event.Origin != runtimesession.RealtimePayloadOriginProvider {
+		t.Fatalf("expected provider close only event, event=%+v err=%v", event, err)
+	}
+
+	providerErr := errors.New("provider business error")
+	providerErrAttachment := newCodexAttachmentWithCapacity(1)
+	if ok := enqueueCodexOutbound(providerErrAttachment, codexRealtimeOutbound{
+		err:    providerErr,
+		origin: runtimesession.RealtimePayloadOriginProvider,
+	}); !ok {
+		t.Fatal("expected provider error attachment enqueue to succeed")
+	}
+	providerErrSession := &codexManagedRealtimeSession{attachment: providerErrAttachment}
+	if event, err := providerErrSession.Recv(context.Background()); err != nil || !errors.Is(event.Err, providerErr) || event.Frame != nil || event.Usage != nil || event.ProviderClose != nil || event.Origin != runtimesession.RealtimePayloadOriginProvider {
+		t.Fatalf("expected provider error event without top-level error, event=%+v err=%v", event, err)
+	}
+
+	frameUsageAttachment := newCodexAttachmentWithCapacity(1)
+	if ok := enqueueCodexOutbound(frameUsageAttachment, codexRealtimeOutbound{
+		messageType: wsconn.TextMessage,
+		payload:     []byte("queued"),
+		usage:       &types.UsageEvent{TotalTokens: 1},
+		origin:      runtimesession.RealtimePayloadOriginProvider,
+	}); !ok {
+		t.Fatal("expected frame+usage attachment enqueue to succeed")
+	}
+	frameUsageSession := &codexManagedRealtimeSession{attachment: frameUsageAttachment}
+	if event, err := frameUsageSession.Recv(context.Background()); err != nil || event.Frame == nil || event.Frame.Kind() != runtimesession.FrameKindText || event.Usage == nil || event.Usage.TotalTokens != 1 || event.ProviderClose != nil || event.Err != nil || event.Origin != runtimesession.RealtimePayloadOriginProvider {
+		t.Fatalf("expected frame+usage event without top-level error, event=%+v err=%v", event, err)
+	}
+	observerErr := runtimesession.NewClientPayloadError(errors.New("quota"), []byte(`{"type":"error","error":{"message":"quota"}}`))
+	frameUsageErrAttachment := newCodexAttachmentWithCapacity(2)
+	if ok := enqueueCodexOutbound(frameUsageErrAttachment, codexRealtimeOutbound{
+		messageType: wsconn.TextMessage,
+		payload:     []byte(`{"type":"response.done","response":{"usage":{"total_tokens":1}}}`),
+		usage:       &types.UsageEvent{TotalTokens: 1},
+		origin:      runtimesession.RealtimePayloadOriginProvider,
+		err:         observerErr,
+	}); !ok {
+		t.Fatal("expected frame+usage+err attachment enqueue to split events")
+	}
+	frameUsageErrSession := &codexManagedRealtimeSession{attachment: frameUsageErrAttachment}
+	if event, err := frameUsageErrSession.Recv(context.Background()); err != nil || event.Frame == nil || event.Usage == nil || event.Err != nil || event.ProviderClose != nil || event.Origin != runtimesession.RealtimePayloadOriginProvider {
+		t.Fatalf("expected first split event to preserve frame+usage without err, event=%+v err=%v", event, err)
+	}
+	if event, err := frameUsageErrSession.Recv(context.Background()); err != nil || event.Frame == nil || event.Usage != nil || !errors.Is(event.Err, observerErr) || event.ProviderClose != nil || event.Origin != runtimesession.RealtimePayloadOriginProxyLocal {
+		t.Fatalf("expected second split event to carry client payload error without usage, event=%+v err=%v", event, err)
+	}
+	if normalized := normalizeCodexRealtimeOutbound(codexRealtimeOutbound{
+		messageType:   wsconn.TextMessage,
+		payload:       []byte("ignored"),
+		providerClose: providerClose,
+		usage:         &types.UsageEvent{TotalTokens: 1},
+		origin:        runtimesession.RealtimePayloadOriginProvider,
+		err:           errors.New("ignored"),
+	}); len(normalized) != 1 || normalized[0].providerClose != providerClose || len(normalized[0].payload) != 0 || normalized[0].usage != nil || normalized[0].err != nil {
+		t.Fatalf("expected provider close normalization to keep only ProviderClose, got %+v", normalized)
+	}
+	if normalized := normalizeCodexRealtimeOutbound(codexRealtimeOutbound{
+		usage:  &types.UsageEvent{TotalTokens: 2},
+		origin: runtimesession.RealtimePayloadOriginProvider,
+		err:    observerErr,
+	}); len(normalized) != 2 || normalized[0].usage == nil || normalized[0].err != nil || normalized[1].usage != nil || !errors.Is(normalized[1].err, observerErr) {
+		t.Fatalf("unexpected normalized codex usage+err shape: %+v", normalized)
 	}
 
 	originalBackpressure := codexRealtimeOutboundBackpressureTimeout
@@ -189,10 +426,10 @@ func TestCodexRealtimeAttachmentTurnAndErrorHelpers(t *testing.T) {
 		codexRealtimeOutboundBackpressureTimeout = originalBackpressure
 	})
 	backpressured := newCodexAttachmentWithCapacity(1)
-	if ok := enqueueCodexOutbound(backpressured, codexRealtimeOutbound{messageType: websocket.TextMessage}); !ok {
+	if ok := enqueueCodexOutbound(backpressured, codexRealtimeOutbound{messageType: wsconn.TextMessage}); !ok {
 		t.Fatal("expected initial backpressure queue fill to succeed")
 	}
-	if ok := enqueueCodexOutbound(backpressured, codexRealtimeOutbound{messageType: websocket.TextMessage}); ok {
+	if ok := enqueueCodexOutbound(backpressured, codexRealtimeOutbound{messageType: wsconn.TextMessage}); ok {
 		t.Fatal("expected timed-out backpressure enqueue to fail")
 	}
 	if !backpressured.isClosed() {
@@ -210,13 +447,13 @@ func TestCodexRealtimeAttachmentTurnAndErrorHelpers(t *testing.T) {
 	if withoutID == "" || !json.Valid([]byte(withoutID)) {
 		t.Fatalf("expected cancelled payload without response id to be valid json, got %q", withoutID)
 	}
-	if !isCodexRealtimeBootstrapMessage(websocket.TextMessage, []byte(`{"type":"session.created"}`)) {
+	if !isCodexRealtimeBootstrapMessage(wsconn.TextMessage, []byte(`{"type":"session.created"}`)) {
 		t.Fatal("expected session.created to be treated as bootstrap message")
 	}
-	if isCodexRealtimeBootstrapMessage(websocket.BinaryMessage, []byte(`{"type":"session.created"}`)) {
+	if isCodexRealtimeBootstrapMessage(wsconn.BinaryMessage, []byte(`{"type":"session.created"}`)) {
 		t.Fatal("expected non-text realtime bootstrap message to be ignored")
 	}
-	if isCodexRealtimeBootstrapMessage(websocket.TextMessage, []byte("not-json")) {
+	if isCodexRealtimeBootstrapMessage(wsconn.TextMessage, []byte("not-json")) {
 		t.Fatal("expected invalid bootstrap json to be ignored")
 	}
 
@@ -302,10 +539,10 @@ func TestCodexRealtimeAttachmentTurnAndErrorHelpers(t *testing.T) {
 		t.Fatalf("expected truncated bridge reason, got %q", got)
 	}
 
-	if terminal, responseID, reason := inspectCodexRealtimeSupplierEvent(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_supplier","status":"completed"}}`)); !terminal || responseID != "resp_supplier" || reason != "response.completed" {
+	if terminal, responseID, reason := inspectCodexRealtimeSupplierEvent(wsconn.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_supplier","status":"completed"}}`)); !terminal || responseID != "resp_supplier" || reason != "response.completed" {
 		t.Fatalf("expected supplier terminal event inspection, terminal=%v response_id=%q reason=%q", terminal, responseID, reason)
 	}
-	if terminal, responseID, reason := inspectCodexRealtimeSupplierEvent(websocket.TextMessage, []byte("bad-json")); terminal || responseID != "" || reason != "" {
+	if terminal, responseID, reason := inspectCodexRealtimeSupplierEvent(wsconn.TextMessage, []byte("bad-json")); terminal || responseID != "" || reason != "" {
 		t.Fatalf("expected invalid supplier payload inspection fallback, terminal=%v response_id=%q reason=%q", terminal, responseID, reason)
 	}
 	if terminal, responseID, reason := inspectCodexRealtimeEvent(nil); terminal || responseID != "" || reason != "" {
@@ -384,27 +621,15 @@ func TestCodexRealtimeAttachmentTurnAndErrorHelpers(t *testing.T) {
 
 func TestCodexRealtimeWSReaderForwardsProviderCloseCode(t *testing.T) {
 	closeSent := make(chan struct{})
-	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			t.Errorf("upgrade failed: %v", err)
-			return
-		}
-		defer conn.Close()
-		payload := websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "quota exhausted")
-		_ = conn.WriteControl(websocket.CloseMessage, payload, time.Now().Add(time.Second))
+	wsURL, cleanupServer := wstest.Server(t, func(conn *wsconn.ManagedConn) {
+		conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindGracefulShutdown, Code: wsconn.CloseCode(4408), Reason: "quota exhausted"})
 		close(closeSent)
-		<-r.Context().Done()
-	}))
-	defer server.Close()
+		<-conn.Done()
+	})
+	defer cleanupServer()
 
-	wsURL := "ws" + server.URL[len("http"):]
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		t.Fatalf("failed to dial helper websocket: %v", err)
-	}
-	defer conn.Close()
+	conn, cleanup := newCodexRealtimeConnPairFromURL(t, wsURL)
+	defer cleanup()
 
 	provider := &CodexProvider{}
 	exec := runtimesession.NewExecutionSession(runtimesession.Metadata{
@@ -432,23 +657,30 @@ func TestCodexRealtimeWSReaderForwardsProviderCloseCode(t *testing.T) {
 	}
 
 	outbound := recvCodexAttachmentOutbound(t, attachment)
-	if outbound.messageType != websocket.CloseMessage {
-		t.Fatalf("expected provider close frame to be forwarded, got message_type=%d payload=%q", outbound.messageType, outbound.payload)
+	if outbound.messageType != 0 || len(outbound.payload) != 0 {
+		t.Fatalf("expected provider close not to be forwarded as data frame, got message_type=%d payload=%q", outbound.messageType, outbound.payload)
 	}
 	if outbound.origin != runtimesession.RealtimePayloadOriginProvider {
 		t.Fatalf("expected provider close origin, got %q", outbound.origin)
 	}
-	if !errors.Is(outbound.err, runtimesession.ErrSessionClosed) {
-		t.Fatalf("expected forwarded close to carry session closed error, got %v", outbound.err)
+	if outbound.providerClose == nil {
+		t.Fatalf("expected provider close event, got outbound=%+v", outbound)
 	}
-	if len(outbound.payload) < 2 {
-		t.Fatalf("expected close payload to include status code, got %q", outbound.payload)
+	if outbound.providerClose.Code != 4408 {
+		t.Fatalf("expected provider close code 4408, got %d", outbound.providerClose.Code)
 	}
-	if code := int(binary.BigEndian.Uint16(outbound.payload[:2])); code != websocket.ClosePolicyViolation {
-		t.Fatalf("expected provider close code %d, got %d", websocket.ClosePolicyViolation, code)
+	if outbound.providerClose.Reason != "quota exhausted" {
+		t.Fatalf("expected provider close reason to be preserved, got %q", outbound.providerClose.Reason)
 	}
-	if reason := string(outbound.payload[2:]); reason != "quota exhausted" {
-		t.Fatalf("expected provider close reason to be preserved, got %q", reason)
+	if !errors.Is(outbound.providerClose.Err, runtimesession.ErrSessionClosed) {
+		t.Fatalf("expected provider close to carry session closed error, got %v", outbound.providerClose.Err)
+	}
+
+	exec.Lock()
+	defer exec.Unlock()
+	state = getCodexManagedRuntimeStateLocked(exec)
+	if state.wsConn != nil || state.wsPump != nil || exec.Inflight || exec.State != runtimesession.SessionStateIdle {
+		t.Fatalf("expected Pump.OnClose path to clear websocket state and mark idle, exec=%+v state=%+v", exec, state)
 	}
 }
 
@@ -500,39 +732,48 @@ func TestConfigureCodexRealtimeConnAppliesReadLimit(t *testing.T) {
 	})
 
 	releaseWrite := make(chan struct{})
-	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			t.Errorf("upgrade failed: %v", err)
-			return
-		}
-		defer conn.Close()
+	wsURL, cleanupServer := wstest.Server(t, func(conn *wsconn.ManagedConn) {
 		<-releaseWrite
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(strings.Repeat("x", oversizedPayloadBytes))); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(strings.Repeat("x", oversizedPayloadBytes))); err != nil {
 			t.Errorf("failed to write oversized websocket frame: %v", err)
 		}
-	}))
-	defer server.Close()
+		<-conn.Done()
+	})
+	defer cleanupServer()
 
-	wsURL := "ws" + server.URL[len("http"):]
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		t.Fatalf("failed to dial helper websocket: %v", err)
-	}
-	defer conn.Close()
+	conn, cleanup := newCodexRealtimeConnPairFromURL(t, wsURL)
+	defer cleanup()
 
-	configureCodexRealtimeConn(nil, &codexManagedRuntimeState{}, conn)
+	provider := &CodexProvider{}
+	exec := runtimesession.NewExecutionSession(runtimesession.Metadata{
+		Key:       "read-limit",
+		SessionID: "read-limit",
+		Model:     "gpt-5",
+		Protocol:  codexRealtimeProtocolName,
+	})
+	attachment := newCodexAttachment()
+	exec.Lock()
+	state := getCodexManagedRuntimeStateLocked(exec)
+	assignCodexAttachmentOwnerLocked(state, attachment)
+	state.wsConn = conn
+	exec.Attached = true
+	exec.Inflight = true
+	exec.Transport = runtimesession.TransportModeResponsesWS
+	provider.startRealtimeWSReaderLocked(exec, state)
+	exec.Unlock()
 	close(releaseWrite)
 
-	_, payload, err := conn.ReadMessage()
-	if err == nil {
-		t.Fatalf("expected oversized upstream websocket frame to hit read limit, got payload length %d", len(payload))
+	outbound := recvCodexAttachmentOutbound(t, attachment)
+	if !strings.Contains(string(outbound.payload), "provider_connection_closed") {
+		t.Fatalf("expected read limit to produce provider_connection_closed payload, got %+v", outbound)
+	}
+	if !errors.Is(outbound.err, runtimesession.ErrSessionClosed) {
+		t.Fatalf("expected read limit to carry RecvEvent.Err source, got %v", outbound.err)
 	}
 }
 
 func TestCodexManagedRealtimeSessionGuardBranches(t *testing.T) {
-	if err := (*codexManagedRealtimeSession)(nil).SendClient(context.Background(), websocket.TextMessage, []byte(`{}`)); !errors.Is(err, runtimesession.ErrSessionClosed) {
+	if err := (*codexManagedRealtimeSession)(nil).SendClient(context.Background(), codexTestTextFrame([]byte(`{}`))); !errors.Is(err, runtimesession.ErrSessionClosed) {
 		t.Fatalf("expected nil managed realtime session SendClient to report session closed, got %v", err)
 	}
 
@@ -556,10 +797,10 @@ func TestCodexManagedRealtimeSessionGuardBranches(t *testing.T) {
 		ownerSeq:   1,
 	}
 
-	if err := session.SendClient(context.Background(), websocket.BinaryMessage, []byte("binary")); err == nil {
+	if err := session.SendClient(context.Background(), codexTestBinaryFrame([]byte("binary"))); err == nil {
 		t.Fatal("expected binary realtime client payload to be rejected")
 	}
-	if err := session.SendClient(context.Background(), websocket.TextMessage, []byte("not-json")); err == nil {
+	if err := session.SendClient(context.Background(), codexTestTextFrame([]byte("not-json"))); err == nil {
 		t.Fatal("expected invalid realtime client json to be rejected")
 	}
 
@@ -569,37 +810,37 @@ func TestCodexManagedRealtimeSessionGuardBranches(t *testing.T) {
 		attachment: attachment,
 		ownerSeq:   2,
 	}
-	if err := foreignSession.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.cancel"}`)); !errors.Is(err, runtimesession.ErrSessionClosed) {
+	if err := foreignSession.SendClient(context.Background(), codexTestTextFrame([]byte(`{"type":"response.cancel"}`))); !errors.Is(err, runtimesession.ErrSessionClosed) {
 		t.Fatalf("expected foreign attachment owner SendClient to be rejected, got %v", err)
 	}
 
-	if err := session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","event_id":"evt_missing"}`)); err == nil {
+	if err := session.SendClient(context.Background(), codexTestTextFrame([]byte(`{"type":"response.create","event_id":"evt_missing"}`))); err == nil {
 		t.Fatal("expected missing response.create model to be rejected")
 	}
 
 	exec.Inflight = true
-	if err := session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","event_id":"evt_busy","input":[]}`)); err == nil {
+	if err := session.SendClient(context.Background(), codexTestTextFrame([]byte(`{"type":"response.create","event_id":"evt_busy","input":[]}`))); err == nil {
 		t.Fatal("expected inflight response.create to be rejected as busy")
 	}
 	exec.Inflight = false
 
-	if err := session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","event_id":"evt_mismatch","model":"o4-mini","input":[]}`)); err == nil {
+	if err := session.SendClient(context.Background(), codexTestTextFrame([]byte(`{"type":"response.create","event_id":"evt_mismatch","model":"o4-mini","input":[]}`))); err == nil {
 		t.Fatal("expected mismatched response.create model to be rejected")
 	}
 
 	beginCodexTurnLocked(state, time.Now())
 	exec.Transport = runtimesession.TransportModeResponsesWS
-	if err := session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.cancel","event_id":"evt_cancel"}`)); err != nil {
+	if err := session.SendClient(context.Background(), codexTestTextFrame([]byte(`{"type":"response.cancel","event_id":"evt_cancel"}`))); err != nil {
 		t.Fatalf("expected response.cancel without wsConn to finalize locally, got %v", err)
 	}
 	if exec.Inflight || exec.State != runtimesession.SessionStateIdle {
 		t.Fatalf("expected local response.cancel to reset inflight state, exec=%+v", exec)
 	}
 
-	if err := session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"unsupported","event_id":"evt_unsupported"}`)); err == nil {
+	if err := session.SendClient(context.Background(), codexTestTextFrame([]byte(`{"type":"unsupported","event_id":"evt_unsupported"}`))); err == nil {
 		t.Fatal("expected unsupported realtime client event to be rejected")
 	}
-	if _, _, _, _, err := (*codexManagedRealtimeSession)(nil).Recv(context.Background()); !errors.Is(err, runtimesession.ErrSessionClosed) {
+	if _, _, _, _, err := codexTestRecv(context.Background(), (*codexManagedRealtimeSession)(nil)); !errors.Is(err, runtimesession.ErrSessionClosed) {
 		t.Fatalf("expected nil managed realtime session Recv to report session closed, got %v", err)
 	}
 
@@ -647,7 +888,10 @@ func TestCodexManagedRealtimeSessionGuardBranches(t *testing.T) {
 	releaseLease()
 	abortState := getCodexManagedRuntimeStateLocked(abortExec)
 	abortAttachment := newCodexAttachmentWithCapacity(1)
+	abortConn, abortConnCleanup := newCodexRealtimeConnPair(t)
+	defer abortConnCleanup()
 	abortState.attachment = abortAttachment
+	abortState.wsConn = abortConn
 	abortState.ownerSeq = 9
 	abortExec.Attached = true
 	abortSession := &codexManagedRealtimeSession{
@@ -659,6 +903,10 @@ func TestCodexManagedRealtimeSessionGuardBranches(t *testing.T) {
 	abortSession.Abort("manual_abort")
 	if !abortExec.IsClosed() || !abortAttachment.isClosed() {
 		t.Fatalf("expected Abort to close owned execution session and attachment, exec_closed=%v attachment_closed=%v", abortExec.IsClosed(), abortAttachment.isClosed())
+	}
+	<-abortConn.Done()
+	if info := abortConn.CloseInfo(); info.Kind != wsconn.CloseKindAbort {
+		t.Fatalf("expected Abort to close owned websocket with CloseKindAbort, got %+v", info)
 	}
 	if removed := manager.DeleteIf(abortExec.Key, abortExec); removed != nil {
 		t.Fatalf("expected aborted execution session to be removed from manager, removed=%+v", removed)
@@ -747,7 +995,7 @@ func TestCodexResponsesWSSendClientStaleContinuationPreservesLastResponseID(t *t
 		ownerSeq:   1,
 	}
 
-	err := session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","event_id":"evt_stale_send","model":"gpt-5","previous_response_id":"resp_old","input":"hi"}`))
+	err := session.SendClient(context.Background(), codexTestTextFrame([]byte(`{"type":"response.create","event_id":"evt_stale_send","model":"gpt-5","previous_response_id":"resp_old","input":"hi"}`)))
 	if !errors.Is(err, runtimesession.ErrStaleResponsesWSContinuation) {
 		t.Fatalf("expected stale continuation sentinel, got %v", err)
 	}
@@ -756,36 +1004,6 @@ func TestCodexResponsesWSSendClientStaleContinuationPreservesLastResponseID(t *t
 	}
 	if exec.Inflight || exec.State != runtimesession.SessionStateIdle {
 		t.Fatalf("expected stale guard to reject before inflight mutation, inflight=%v state=%s", exec.Inflight, exec.State)
-	}
-}
-
-func TestCodexRealtimePingControlWriteDoesNotWaitForBusinessWriteLock(t *testing.T) {
-	conn, cleanup := newCodexRealtimeConnPair(t)
-	defer cleanup()
-
-	state := &codexManagedRuntimeState{}
-	configureCodexRealtimeConn(nil, state, conn)
-	if state.wsControlWriter == nil {
-		t.Fatal("expected codex realtime state to configure control frame writer")
-	}
-	defer func() {
-		_ = conn.Close()
-		state.wsControlWriter.Stop()
-		state.wsControlWriter.Wait()
-	}()
-
-	state.wsWriteMu.Lock()
-	defer state.wsWriteMu.Unlock()
-
-	done := make(chan error, 1)
-	go func() {
-		done <- conn.PingHandler()("ping")
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(200 * time.Millisecond):
-		t.Fatal("ping control write waited for business write lock")
 	}
 }
 
@@ -1000,7 +1218,7 @@ func TestCodexRealtimeTransportAndDetachedSessionHelpers(t *testing.T) {
 	if got := bridgeTerminationReason(io.EOF, false); got != "bridge_stream_closed" {
 		t.Fatalf("expected EOF bridge termination to be treated as clean close, got %q", got)
 	}
-	if terminal, responseID, reason := inspectCodexRealtimeSupplierEvent(websocket.BinaryMessage, []byte(`{"type":"response.completed"}`)); terminal || responseID != "" || reason != "" {
+	if terminal, responseID, reason := inspectCodexRealtimeSupplierEvent(wsconn.BinaryMessage, []byte(`{"type":"response.completed"}`)); terminal || responseID != "" || reason != "" {
 		t.Fatalf("expected non-text supplier payload to be ignored, terminal=%v response_id=%q reason=%q", terminal, responseID, reason)
 	}
 
@@ -1153,14 +1371,13 @@ func TestCodexResponsesWSCreateWriteDoesNotHoldExecLock(t *testing.T) {
 	state.requireWS = true
 	state.deferWSReader = true
 	state.wsConn = conn
-	state.wsWriteMu.Lock()
 	exec.Transport = runtimesession.TransportModeResponsesWS
 	exec.Attached = true
 	exec.Unlock()
 
 	done := make(chan error, 1)
 	go func() {
-		done <- session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","event_id":"evt_write_lock","model":"gpt-5","input":"hi"}`))
+		done <- session.SendClient(context.Background(), codexTestTextFrame([]byte(`{"type":"response.create","event_id":"evt_write_lock","model":"gpt-5","input":"hi"}`)))
 	}()
 
 	deadline := time.After(time.Second)
@@ -1174,24 +1391,15 @@ func TestCodexResponsesWSCreateWriteDoesNotHoldExecLock(t *testing.T) {
 		}
 		select {
 		case err := <-done:
-			state.wsWriteMu.Unlock()
-			t.Fatalf("SendClient returned before blocking on websocket write: %v", err)
+			if err != nil {
+				t.Fatalf("SendClient returned error while checking exec lock release: %v", err)
+			}
+			return
 		case <-deadline:
-			state.wsWriteMu.Unlock()
 			t.Fatal("expected SendClient to release exec lock while waiting for websocket write serialization")
 		default:
 			time.Sleep(10 * time.Millisecond)
 		}
-	}
-
-	state.wsWriteMu.Unlock()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("expected websocket send to complete after releasing write lock, got %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for SendClient to finish after releasing write lock")
 	}
 }
 
@@ -1223,24 +1431,21 @@ func TestCodexManagedRealtimeSessionAdmitsTurnBeforeUpstreamWrite(t *testing.T) 
 	state.deferWSReader = true
 	state.wsConn = conn
 	state.turnObserverFactory = func() runtimesession.TurnObserver { return observer }
-	state.wsWriteMu.Lock()
 	exec.Transport = runtimesession.TransportModeResponsesWS
 	exec.Attached = true
 	exec.Unlock()
 
 	done := make(chan error, 1)
 	go func() {
-		done <- session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","event_id":"evt_admit_first","model":"gpt-5","input":"hi"}`))
+		done <- session.SendClient(context.Background(), codexTestTextFrame([]byte(`{"type":"response.create","event_id":"evt_admit_first","model":"gpt-5","input":"hi"}`)))
 	}()
 
 	var err error
 	select {
 	case err = <-done:
 	case <-time.After(200 * time.Millisecond):
-		state.wsWriteMu.Unlock()
 		t.Fatal("expected admission failure to return before attempting upstream websocket write")
 	}
-	state.wsWriteMu.Unlock()
 
 	if observer.admitCount != 1 {
 		t.Fatalf("expected admission observer to be called once, got %d", observer.admitCount)

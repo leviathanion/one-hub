@@ -44,6 +44,9 @@ func TestOpenAIRealtimeTurnStateLifecycleAndFinalize(t *testing.T) {
 		InputTokens:  3,
 		OutputTokens: 5,
 		TotalTokens:  8,
+		Source:       types.UsageSourceRealtimeResponse,
+		BillingBasis: types.UsageBillingBasisTokens,
+		ResponseID:   "resp_usage",
 		ExtraTokens: map[string]int{
 			"cached": 2,
 		},
@@ -51,7 +54,10 @@ func TestOpenAIRealtimeTurnStateLifecycleAndFinalize(t *testing.T) {
 			types.APIToolTypeWebSearchPreview: {Type: "high", CallCount: 1},
 		},
 	})
-	if firstDelta == nil || firstDelta.TotalTokens != 8 {
+	if firstDelta == nil || firstDelta.TotalTokens != 8 ||
+		firstDelta.Source != types.UsageSourceRealtimeResponse ||
+		firstDelta.BillingBasis != types.UsageBillingBasisTokens ||
+		firstDelta.ResponseID != "resp_usage" {
 		t.Fatalf("expected first usage delta to be reported, got %+v", firstDelta)
 	}
 
@@ -59,6 +65,9 @@ func TestOpenAIRealtimeTurnStateLifecycleAndFinalize(t *testing.T) {
 		InputTokens:  4,
 		OutputTokens: 8,
 		TotalTokens:  12,
+		Source:       types.UsageSourceRealtimeResponse,
+		BillingBasis: types.UsageBillingBasisTokens,
+		ResponseID:   "resp_usage",
 		ExtraTokens: map[string]int{
 			"cached": 5,
 		},
@@ -66,7 +75,10 @@ func TestOpenAIRealtimeTurnStateLifecycleAndFinalize(t *testing.T) {
 			types.APIToolTypeWebSearchPreview: {Type: "high", CallCount: 3},
 		},
 	})
-	if secondDelta == nil || secondDelta.InputTokens != 1 || secondDelta.OutputTokens != 3 || secondDelta.TotalTokens != 4 {
+	if secondDelta == nil || secondDelta.InputTokens != 1 || secondDelta.OutputTokens != 3 || secondDelta.TotalTokens != 4 ||
+		secondDelta.Source != types.UsageSourceRealtimeResponse ||
+		secondDelta.BillingBasis != types.UsageBillingBasisTokens ||
+		secondDelta.ResponseID != "resp_usage" {
 		t.Fatalf("expected second usage delta to reflect incremental usage, got %+v", secondDelta)
 	}
 	if got := secondDelta.ExtraTokens["cached"]; got != 3 {

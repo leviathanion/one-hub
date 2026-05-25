@@ -71,6 +71,53 @@ const (
 
 var ErrSessionClosed = errors.New("realtime session closed")
 var ErrStaleResponsesWSContinuation = errors.New("stale responses websocket continuation")
+var ErrInvalidFrame = errors.New("invalid realtime frame")
+
+type FrameKind int
+
+const (
+	FrameKindText FrameKind = iota + 1
+	FrameKindBinary
+)
+
+// Frame carries a downstream/upstream data frame without exposing transport
+// message-type integers outside the session boundary. Callers transfer payload
+// ownership to NewTextFrame/NewBinaryFrame; after construction the payload is
+// treated as immutable. Payload returns read-only bytes and intentionally does
+// not clone to avoid copying large audio chunks. Code that sends a Frame across
+// goroutines or channels must copy before publishing when ownership is shared.
+type Frame struct {
+	kind    FrameKind
+	payload []byte
+}
+
+func NewTextFrame(payload []byte) Frame {
+	return Frame{kind: FrameKindText, payload: payload}
+}
+
+func NewBinaryFrame(payload []byte) Frame {
+	return Frame{kind: FrameKindBinary, payload: payload}
+}
+
+func (f Frame) Kind() FrameKind {
+	return f.kind
+}
+
+func (f Frame) Payload() []byte {
+	return f.payload
+}
+
+func (f Frame) ClonePayload() []byte {
+	return append([]byte(nil), f.payload...)
+}
+
+func (f Frame) IsZero() bool {
+	return f.kind == 0 && f.payload == nil
+}
+
+func (f Frame) valid() bool {
+	return f.kind == FrameKindText || f.kind == FrameKindBinary
+}
 
 // ClientPayloadError marks an error that carries an explicit client-facing
 // websocket payload. Callers should forward Payload as-is after delivering any
@@ -123,6 +170,20 @@ const (
 	RealtimePayloadOriginProvider
 )
 
+type ProviderClose struct {
+	Code   int
+	Reason string
+	Err    error
+}
+
+type RecvEvent struct {
+	Frame         *Frame
+	ProviderClose *ProviderClose
+	Usage         *types.UsageEvent
+	Origin        RealtimePayloadOrigin
+	Err           error
+}
+
 type Metadata struct {
 	Key               string
 	BindingKey        string
@@ -139,13 +200,11 @@ type Metadata struct {
 }
 
 type RealtimeSession interface {
-	SendClient(ctx context.Context, mt int, payload []byte) error
-	// Recv returns the next supplier payload for the downstream websocket.
-	// When both payload and err are non-empty/non-nil, payload is already the
-	// authoritative wire frame to deliver first. Callers must not blindly turn
-	// err into another websocket error frame; only ClientPayloadError carries an
-	// additional client-visible payload that should be emitted after payload.
-	Recv(ctx context.Context) (mt int, payload []byte, usage *types.UsageEvent, origin RealtimePayloadOrigin, err error)
+	SendClient(ctx context.Context, frame Frame) error
+	// Recv returns the next supplier event for the downstream WS client.
+	// Provider business errors are reported through RecvEvent.Err; the top-level
+	// error means there is no event to consume.
+	Recv(ctx context.Context) (RecvEvent, error)
 	// Detach releases the current downstream attachment without force-closing the
 	// upstream provider transport. Implementations may continue draining and
 	// finalizing turn state after Detach, and may explicitly stop queueing new

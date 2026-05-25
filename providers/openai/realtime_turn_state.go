@@ -150,6 +150,7 @@ func mergeOpenAIRealtimeUsageSnapshot(base, update *types.UsageEvent) *types.Usa
 	merged.OutputTokenDetails = maxOpenAIRealtimeCompletionTokenDetails(merged.OutputTokenDetails, update.OutputTokenDetails)
 	merged.ExtraTokens = maxOpenAIRealtimeExtraTokens(merged.ExtraTokens, update.ExtraTokens)
 	merged.ExtraBilling = maxOpenAIRealtimeExtraBilling(merged.ExtraBilling, update.ExtraBilling)
+	copyOpenAIRealtimeUsageAttribution(merged, update)
 	return merged
 }
 
@@ -170,7 +171,20 @@ func deltaOpenAIRealtimeUsageSnapshot(snapshot, accounted *types.UsageEvent) *ty
 	if !openAIRealtimeUsageHasValue(delta) {
 		return nil
 	}
+	copyOpenAIRealtimeUsageAttribution(delta, snapshot)
 	return delta
+}
+
+func copyOpenAIRealtimeUsageAttribution(dst, src *types.UsageEvent) {
+	if dst == nil || src == nil {
+		return
+	}
+	dst.Source = src.Source
+	dst.BillingBasis = src.BillingBasis
+	dst.ProviderEventID = src.ProviderEventID
+	dst.ResponseID = src.ResponseID
+	dst.ItemID = src.ItemID
+	dst.DurationSeconds = src.DurationSeconds
 }
 
 func openAIRealtimeUsageHasValue(usage *types.UsageEvent) bool {

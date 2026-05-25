@@ -53,6 +53,24 @@ func TestInitConfLoadsRealtimeSessionCompatFlagAndDefaults(t *testing.T) {
 	if got := viper.GetInt("realtime.websocket_ping_interval_ms"); got != 25000 {
 		t.Fatalf("expected realtime websocket ping interval default 25000ms, got %d", got)
 	}
+	if got := viper.GetInt("realtime_websocket_client_ping_interval_ms"); got != 25000 {
+		t.Fatalf("expected realtime websocket client ping interval default 25000ms, got %d", got)
+	}
+	if got := viper.GetInt("realtime_websocket_client_pong_miss_timeout_ms"); got != 0 {
+		t.Fatalf("expected realtime websocket client pong miss timeout default 0ms, got %d", got)
+	}
+	if got := viper.GetInt("realtime_websocket_client_inbound_activity_timeout_ms"); got != 0 {
+		t.Fatalf("expected realtime websocket client inbound activity timeout default 0ms, got %d", got)
+	}
+	if got := viper.GetInt("responses_websocket_client_ping_interval_ms"); got != 25000 {
+		t.Fatalf("expected responses websocket client ping interval default 25000ms, got %d", got)
+	}
+	if got := viper.GetInt("responses_websocket_client_pong_miss_timeout_ms"); got != 0 {
+		t.Fatalf("expected responses websocket client pong miss timeout default 0ms, got %d", got)
+	}
+	if got := viper.GetInt("responses_websocket_client_inbound_activity_timeout_ms"); got != 300000 {
+		t.Fatalf("expected responses websocket client inbound activity timeout default 300000ms, got %d", got)
+	}
 	if !viper.GetBool("responses_ws.active_lease_redis_fail_open") {
 		t.Fatal("expected ResponsesWS active lease Redis fail-open compatibility to be enabled by default")
 	}
@@ -145,33 +163,56 @@ func TestRealtimeWebsocketPingIntervalExplicitNonPositiveDisables(t *testing.T) 
 	}
 }
 
-func TestResponsesWSClientPongTimeoutDefaultsAndExplicitDisable(t *testing.T) {
+func TestSplitWebsocketClientLivenessConfig(t *testing.T) {
 	viper.Reset()
 	t.Cleanup(func() {
 		viper.Reset()
 	})
 
-	if got := ResponsesWSClientPongTimeout(); got != 5*time.Minute {
-		t.Fatalf("expected unset client pong timeout to use default 5m, got %s", got)
+	if got := RealtimeWebsocketClientPingInterval(); got != 25*time.Second {
+		t.Fatalf("expected unset realtime client ping interval to use default 25s, got %s", got)
+	}
+	if got := RealtimeWebsocketClientPongMissTimeout(); got != 0 {
+		t.Fatalf("expected unset realtime client pong miss timeout to default disabled, got %s", got)
+	}
+	if got := RealtimeWebsocketClientInboundActivityTimeout(); got != 0 {
+		t.Fatalf("expected unset realtime client inbound activity timeout to default disabled, got %s", got)
+	}
+	if got := ResponsesWebsocketClientPingInterval(); got != 25*time.Second {
+		t.Fatalf("expected unset responses client ping interval to use default 25s, got %s", got)
+	}
+	if got := ResponsesWebsocketClientPongMissTimeout(); got != 0 {
+		t.Fatalf("expected unset responses client pong miss timeout to default disabled, got %s", got)
+	}
+	if got := ResponsesWebsocketClientInboundActivityTimeout(); got != 5*time.Minute {
+		t.Fatalf("expected unset responses client inbound activity timeout to use default 5m, got %s", got)
 	}
 
 	defaultConfig()
-	if got := ResponsesWSClientPongTimeout(); got != 5*time.Minute {
-		t.Fatalf("expected configured default client pong timeout to be 5m, got %s", got)
+	if got := ResponsesWebsocketClientInboundActivityTimeout(); got != 5*time.Minute {
+		t.Fatalf("expected configured responses client inbound activity timeout default 5m, got %s", got)
 	}
 
-	viper.Set("responses_ws.client_pong_timeout_ms", 0)
-	if got := ResponsesWSClientPongTimeout(); got != 0 {
-		t.Fatalf("expected explicit zero client pong timeout to disable watchdog, got %s", got)
+	viper.Set("responses_websocket_client_inbound_activity_timeout_ms", 0)
+	if got := ResponsesWebsocketClientInboundActivityTimeout(); got != 0 {
+		t.Fatalf("expected explicit zero responses client inbound activity timeout to disable watchdog, got %s", got)
 	}
 
-	viper.Set("responses_ws.client_pong_timeout_ms", -1)
-	if got := ResponsesWSClientPongTimeout(); got != 0 {
-		t.Fatalf("expected explicit negative client pong timeout to disable watchdog, got %s", got)
+	viper.Set("responses_websocket_client_inbound_activity_timeout_ms", 1500)
+	if got := ResponsesWebsocketClientInboundActivityTimeout(); got != 1500*time.Millisecond {
+		t.Fatalf("expected explicit responses client inbound activity timeout to apply, got %s", got)
 	}
 
-	viper.Set("responses_ws.client_pong_timeout_ms", 1500)
-	if got := ResponsesWSClientPongTimeout(); got != 1500*time.Millisecond {
-		t.Fatalf("expected explicit client pong timeout to be applied, got %s", got)
+	viper.Set("realtime_websocket_client_ping_interval_ms", 1250)
+	viper.Set("realtime_websocket_client_pong_miss_timeout_ms", 2500)
+	viper.Set("realtime_websocket_client_inbound_activity_timeout_ms", 5000)
+	if got := RealtimeWebsocketClientPingInterval(); got != 1250*time.Millisecond {
+		t.Fatalf("expected realtime client ping interval override, got %s", got)
+	}
+	if got := RealtimeWebsocketClientPongMissTimeout(); got != 2500*time.Millisecond {
+		t.Fatalf("expected realtime client pong miss timeout override, got %s", got)
+	}
+	if got := RealtimeWebsocketClientInboundActivityTimeout(); got != 5*time.Second {
+		t.Fatalf("expected realtime client inbound activity timeout override, got %s", got)
 	}
 }

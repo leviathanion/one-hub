@@ -10,10 +10,9 @@ import (
 	"time"
 
 	"one-api/common/logger"
-	"one-api/common/requester"
+	"one-api/common/wsconn"
 	"one-api/types"
 
-	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 )
 
@@ -139,18 +138,18 @@ func TestCodexRealtimeHelperFunctionsAndCompatibilityHeaders(t *testing.T) {
 		t.Fatalf("expected cancelled realtime responses without usage not to emit usage events, got %+v", usage)
 	}
 
-	if shouldContinue, usage, rewritten, err := provider.handleRealtimeSupplierMessage(websocket.BinaryMessage, []byte("ignored"), nil, "gpt-5"); !shouldContinue || usage != nil || rewritten != nil || err != nil {
+	if shouldContinue, usage, rewritten, err := provider.handleRealtimeSupplierMessage(wsconn.BinaryMessage, []byte("ignored"), nil, "gpt-5"); !shouldContinue || usage != nil || rewritten != nil || err != nil {
 		t.Fatalf("expected non-text realtime supplier messages to be ignored, continue=%v usage=%+v rewritten=%v err=%v", shouldContinue, usage, rewritten, err)
 	}
-	if shouldContinue, usage, rewritten, err := provider.handleRealtimeSupplierMessage(websocket.TextMessage, []byte("bad-json"), nil, "gpt-5"); !shouldContinue || usage != nil || rewritten != nil || err != nil {
+	if shouldContinue, usage, rewritten, err := provider.handleRealtimeSupplierMessage(wsconn.TextMessage, []byte("bad-json"), nil, "gpt-5"); !shouldContinue || usage != nil || rewritten != nil || err != nil {
 		t.Fatalf("expected invalid realtime supplier json to be ignored, continue=%v usage=%+v rewritten=%v err=%v", shouldContinue, usage, rewritten, err)
 	}
-	if shouldContinue, usage, rewritten, err := provider.handleRealtimeSupplierMessage(websocket.TextMessage, []byte(`{"type":"error"}`), nil, "gpt-5"); !shouldContinue || usage != nil || rewritten != nil || err != nil {
+	if shouldContinue, usage, rewritten, err := provider.handleRealtimeSupplierMessage(wsconn.TextMessage, []byte(`{"type":"error"}`), nil, "gpt-5"); !shouldContinue || usage != nil || rewritten != nil || err != nil {
 		t.Fatalf("expected provider error events to pass through unchanged, continue=%v usage=%+v rewritten=%v err=%v", shouldContinue, usage, rewritten, err)
 	}
 
 	nestedErrorPayload := []byte(`{"type":"error","status":429,"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"slow down","param":"model"},"response":{"id":"resp_error_1"}}`)
-	shouldContinue, usage, rewritten, err := provider.handleRealtimeSupplierMessage(websocket.TextMessage, nestedErrorPayload, nil, "gpt-5")
+	shouldContinue, usage, rewritten, err := provider.handleRealtimeSupplierMessage(wsconn.TextMessage, nestedErrorPayload, nil, "gpt-5")
 	if !shouldContinue || usage != nil || rewritten != nil || err != nil {
 		t.Fatalf("expected nested provider error event to pass through unchanged, continue=%v usage=%+v rewritten=%v err=%v", shouldContinue, usage, rewritten, err)
 	}
@@ -225,7 +224,7 @@ func TestCodexRealtimeConnectionPlanningAndDialPaths(t *testing.T) {
 				wsURL: "ws" + server.URL[len("http"):],
 			})
 			if conn != nil {
-				_ = conn.Close()
+				conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_cleanup"})
 			}
 			done <- errWithCode
 		}()
@@ -254,7 +253,7 @@ func TestCodexRealtimeConnectionPlanningAndDialPaths(t *testing.T) {
 			{"server error", http.StatusBadGateway, "provider_ws_request_failed", http.StatusBadGateway},
 		}
 		for _, tc := range cases {
-			errWithCode := mapCodexRealtimeWSDialError(&requester.WSDialHandshakeError{
+			errWithCode := mapCodexRealtimeWSDialError(&wsconn.DialError{
 				URL:        "wss://provider.example/realtime",
 				StatusCode: tc.statusCode,
 				Err:        errors.New("handshake failed"),
@@ -273,7 +272,7 @@ func TestCodexRealtimeConnectionPlanningAndDialPaths(t *testing.T) {
 	})
 
 	t.Run("handshake diagnostic log sanitizes url and includes response context", func(t *testing.T) {
-		message := codexRealtimeWSDialFailureLogMessage(&requester.WSDialHandshakeError{
+		message := codexRealtimeWSDialFailureLogMessage(&wsconn.DialError{
 			URL:           "wss://provider.example/backend-api/codex/responses?api_key=secret#fragment",
 			StatusCode:    http.StatusBadGateway,
 			Header:        http.Header{"X-Request-Id": []string{"req_123"}, "Cf-Ray": []string{"ray_456"}, "Retry-After": []string{"3"}},
@@ -303,16 +302,16 @@ func TestCodexRealtimeConnectionPlanningAndDialPaths(t *testing.T) {
 
 	t.Run("createChatRealtimeConn dials websocket plan", func(t *testing.T) {
 		headerCh := make(chan http.Header, 1)
-		upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			headerCh <- r.Header.Clone()
-			conn, err := upgrader.Upgrade(w, r, nil)
+			conn, err := wsconn.AcceptManaged(w, r, wsconn.Config{Label: "codex realtime test accept"}, wsconn.AcceptOptions{
+				CheckOrigin: func(*http.Request) bool { return true },
+			})
 			if err != nil {
 				t.Errorf("upgrade failed: %v", err)
 				return
 			}
-			defer conn.Close()
-			<-r.Context().Done()
+			<-conn.Done()
 		}))
 		defer server.Close()
 
@@ -323,9 +322,7 @@ func TestCodexRealtimeConnectionPlanningAndDialPaths(t *testing.T) {
 		if errWithCode != nil {
 			t.Fatalf("expected realtime websocket connect to succeed, got %v", errWithCode)
 		}
-		if err := conn.Close(); err != nil {
-			t.Fatalf("expected realtime websocket close to succeed, got %v", err)
-		}
+		conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_cleanup"})
 
 		headers := <-headerCh
 		if got := headers.Get("Authorization"); got != "Bearer access-token" {

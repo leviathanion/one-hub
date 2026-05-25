@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"one-api/common"
@@ -14,6 +15,7 @@ import (
 	"one-api/common/logger"
 	"one-api/common/requester"
 	"one-api/common/responsesws"
+	"one-api/common/wsconn"
 	runtimesession "one-api/runtime/session"
 	"one-api/types"
 	"runtime/debug"
@@ -22,7 +24,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/gorilla/websocket"
 )
 
 const openAIRealtimeReadTimeout = 2 * time.Minute
@@ -32,11 +33,17 @@ const openAIRealtimeFinalizedResponseIDLimit = 16
 var openAIRealtimeOutboundBackpressureTimeout = 5 * time.Second
 
 type openAIRealtimeOutbound struct {
-	messageType int
+	messageType   wsconn.MessageType
+	payload       []byte
+	providerClose *runtimesession.ProviderClose
+	usage         *types.UsageEvent
+	origin        runtimesession.RealtimePayloadOrigin
+	err           error
+}
+
+type openAIRealtimeProviderFrame struct {
+	messageType wsconn.MessageType
 	payload     []byte
-	usage       *types.UsageEvent
-	origin      runtimesession.RealtimePayloadOrigin
-	err         error
 }
 
 type openAIRealtimePendingTurn struct {
@@ -58,7 +65,8 @@ type openAIRealtimeSession struct {
 	provider   *OpenAIProvider
 	model      string
 	sessionID  string
-	conn       *websocket.Conn
+	conn       *wsconn.ManagedConn
+	pump       *wsconn.Pump
 	compatMode bool
 
 	recvCh        chan openAIRealtimeOutbound
@@ -76,7 +84,6 @@ type openAIRealtimeSession struct {
 	turnReadMu    sync.Mutex
 	turnReadTimer *time.Timer
 	turnReadGen   int64
-	controlWriter *requester.WSControlFrameWriter
 
 	responsesWS         bool
 	turnSeq             int64
@@ -99,7 +106,7 @@ func (p *OpenAIProvider) OpenRealtimeSessionWithOptions(modelName string, option
 	responsesWS := options.PreferredTransport == runtimesession.TransportModeResponsesWS || options.RequireWS
 	sessionID, sessionIDErr := readOpenAIRealtimeSessionID(p)
 	if sessionIDErr != nil {
-		_ = conn.Close()
+		conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "invalid_session_id"})
 		return nil, sessionIDErr
 	}
 	session := &openAIRealtimeSession{
@@ -120,14 +127,14 @@ func (p *OpenAIProvider) OpenRealtimeSessionWithOptions(modelName string, option
 	return session, nil
 }
 
-func (p *OpenAIProvider) openRealtimeConnWithOptions(modelName string, options runtimesession.RealtimeOpenOptions) (*websocket.Conn, *types.OpenAIErrorWithStatusCode) {
+func (p *OpenAIProvider) openRealtimeConnWithOptions(modelName string, options runtimesession.RealtimeOpenOptions) (*wsconn.ManagedConn, *types.OpenAIErrorWithStatusCode) {
 	if options.PreferredTransport == runtimesession.TransportModeResponsesWS || options.RequireWS {
 		return p.openResponsesWSConnWithContext(options.Context, modelName)
 	}
 	return p.openRealtimeConn(modelName)
 }
 
-func (p *OpenAIProvider) openRealtimeConn(modelName string) (*websocket.Conn, *types.OpenAIErrorWithStatusCode) {
+func (p *OpenAIProvider) openRealtimeConn(modelName string) (*wsconn.ManagedConn, *types.OpenAIErrorWithStatusCode) {
 	fullRequestURL, errWithCode := p.realtimeWSURL(modelName)
 	if errWithCode != nil {
 		return nil, errWithCode
@@ -145,8 +152,7 @@ func (p *OpenAIProvider) openRealtimeConn(modelName string) (*websocket.Conn, *t
 		httpHeaders.Set("Authorization", fmt.Sprintf("Bearer %s", p.Channel.Key))
 	}
 
-	wsRequester := requester.NewWSRequester(proxyAddr)
-	wsConn, err := wsRequester.NewRequestContextWithSubprotocols(context.Background(), fullRequestURL, httpHeaders, openAIUpstreamWebsocketSubprotocols(p))
+	wsConn, err := wsconn.DialManaged(context.Background(), fullRequestURL, httpHeaders, openAIRealtimeWSConfig("openai realtime upstream"), openAIRealtimeDialOptions(proxyAddr, openAIResponsesWSSelfHosted(p), openAIUpstreamWebsocketSubprotocols(p))...)
 	if err != nil {
 		return nil, mapOpenAIRealtimeWSDialError(err)
 	}
@@ -245,11 +251,11 @@ func appendOpenAIRealtimeModelQuery(rawURL string, modelName string) (string, er
 	return parsed.String(), nil
 }
 
-func (p *OpenAIProvider) openResponsesWSConn(modelName string) (*websocket.Conn, *types.OpenAIErrorWithStatusCode) {
+func (p *OpenAIProvider) openResponsesWSConn(modelName string) (*wsconn.ManagedConn, *types.OpenAIErrorWithStatusCode) {
 	return p.openResponsesWSConnWithContext(context.Background(), modelName)
 }
 
-func (p *OpenAIProvider) openResponsesWSConnWithContext(ctx context.Context, modelName string) (*websocket.Conn, *types.OpenAIErrorWithStatusCode) {
+func (p *OpenAIProvider) openResponsesWSConnWithContext(ctx context.Context, modelName string) (*wsconn.ManagedConn, *types.OpenAIErrorWithStatusCode) {
 	fullRequestURL, errWithCode := p.responsesWSURL(modelName)
 	if errWithCode != nil {
 		return nil, errWithCode
@@ -267,12 +273,44 @@ func (p *OpenAIProvider) openResponsesWSConnWithContext(ctx context.Context, mod
 	if p.Channel != nil && p.Channel.Proxy != nil {
 		proxyAddr = *p.Channel.Proxy
 	}
-	wsRequester := requester.NewWSRequester(proxyAddr)
-	wsConn, err := wsRequester.NewRequestContextWithSubprotocols(ctx, fullRequestURL, httpHeaders, openAIUpstreamWebsocketSubprotocols(p))
+	wsConn, err := wsconn.DialManaged(ctx, fullRequestURL, httpHeaders, openAIRealtimeWSConfig("openai responses websocket upstream"), openAIRealtimeDialOptions(proxyAddr, openAIResponsesWSSelfHosted(p), openAIUpstreamWebsocketSubprotocols(p))...)
 	if err != nil {
 		return nil, mapOpenAIResponsesWSDialError(err)
 	}
 	return wsConn, nil
+}
+
+func openAIRealtimeWSConfig(label string) wsconn.Config {
+	return wsconn.Config{
+		Label:           label,
+		PingInterval:    config.RealtimeWebsocketPingInterval(),
+		PongMissTimeout: config.RealtimeWebsocketClientPongMissTimeout(),
+		InboundActivityTimeout: func() time.Duration {
+			return config.RealtimeWebsocketClientInboundActivityTimeout()
+		},
+		ReadLimit:    config.RealtimeWebsocketReadLimit(),
+		WriteTimeout: config.RealtimeWebsocketWriteTimeout,
+	}
+}
+
+func openAIRealtimeDialOptions(proxyAddr string, allowSelfHosted bool, subprotocols []string) []wsconn.DialOption {
+	policy := wsconn.DialSecurityPolicy{
+		AllowInsecureWS: allowSelfHosted,
+		AllowPrivateIP:  allowSelfHosted,
+	}
+	if allowSelfHosted {
+		policy.HostFilter = func(host string, ips []net.IP) bool {
+			return true
+		}
+	}
+	options := []wsconn.DialOption{
+		wsconn.WithSubprotocols(subprotocols...),
+		wsconn.WithDialSecurityPolicy(policy),
+	}
+	if strings.TrimSpace(proxyAddr) != "" {
+		options = append(options, wsconn.WithProxyURL(proxyAddr))
+	}
+	return options
 }
 
 func httpHeaderFromOpenAIHeaders(headers map[string]string) http.Header {
@@ -316,20 +354,12 @@ func (p *OpenAIProvider) azureV1ResponsesWSURL() (string, *types.OpenAIErrorWith
 	return p.responsesWSURLFromHTTP(parsed.String())
 }
 
-func responsesWSURLFromHTTP(rawURL string) (string, *types.OpenAIErrorWithStatusCode) {
-	return responsesWSURLFromHTTPWithPolicy(rawURL, false)
-}
-
 func (p *OpenAIProvider) responsesWSURLFromHTTP(rawURL string) (string, *types.OpenAIErrorWithStatusCode) {
 	proxyAddr := ""
 	if p != nil && p.Channel != nil && p.Channel.Proxy != nil {
 		proxyAddr = *p.Channel.Proxy
 	}
 	return responsesWSURLFromHTTPWithPolicyAndResolve(rawURL, openAIResponsesWSSelfHosted(p), proxyAddr == "")
-}
-
-func responsesWSURLFromHTTPWithPolicy(rawURL string, allowSelfHosted bool) (string, *types.OpenAIErrorWithStatusCode) {
-	return responsesWSURLFromHTTPWithPolicyAndResolve(rawURL, allowSelfHosted, true)
 }
 
 func responsesWSURLFromHTTPWithPolicyAndResolve(rawURL string, allowSelfHosted bool, resolveHost bool) (string, *types.OpenAIErrorWithStatusCode) {
@@ -373,40 +403,50 @@ func openAIUpstreamWebsocketSubprotocols(p *OpenAIProvider) []string {
 }
 
 func mapOpenAIResponsesWSDialError(err error) *types.OpenAIErrorWithStatusCode {
-	var handshake *requester.WSDialHandshakeError
-	if errors.As(err, &handshake) && handshake != nil {
-		switch handshake.StatusCode {
-		case http.StatusNotFound, http.StatusUpgradeRequired:
-			return common.StringErrorWrapperLocal("channel does not support Responses websocket transport", "responses_ws_unsupported_for_channel", http.StatusUpgradeRequired)
-		case http.StatusUnauthorized, http.StatusForbidden:
-			return common.StringErrorWrapperLocal("provider authentication failed", "provider_authentication_failed", handshake.StatusCode)
-		case http.StatusTooManyRequests:
-			return common.StringErrorWrapperLocal("provider rate limit exceeded", "provider_rate_limit_exceeded", http.StatusTooManyRequests)
-		default:
-			if handshake.StatusCode >= 500 {
-				return common.StringErrorWrapperLocal("provider websocket request failed", "provider_ws_request_failed", handshake.StatusCode)
-			}
-		}
+	var dialErr *wsconn.DialError
+	if errors.As(err, &dialErr) && dialErr != nil {
+		return mapOpenAIResponsesWSDialStatus(dialErr.StatusCode)
 	}
 	logOpenAIRealtimeInternalError("openai responses websocket dial failed: " + err.Error())
 	return common.StringErrorWrapperLocal("websocket request failed", "ws_request_failed", http.StatusInternalServerError)
 }
 
-func mapOpenAIRealtimeWSDialError(err error) *types.OpenAIErrorWithStatusCode {
-	var handshake *requester.WSDialHandshakeError
-	if errors.As(err, &handshake) && handshake != nil {
-		switch handshake.StatusCode {
-		case http.StatusUnauthorized, http.StatusForbidden:
-			return common.StringErrorWrapperLocal("provider authentication failed", "provider_authentication_failed", handshake.StatusCode)
-		case http.StatusTooManyRequests:
-			return common.StringErrorWrapperLocal("provider rate limit exceeded", "provider_rate_limit_exceeded", http.StatusTooManyRequests)
-		default:
-			if handshake.StatusCode >= 500 {
-				return common.StringErrorWrapperLocal("provider websocket request failed", "provider_ws_request_failed", handshake.StatusCode)
-			}
+func mapOpenAIResponsesWSDialStatus(statusCode int) *types.OpenAIErrorWithStatusCode {
+	switch statusCode {
+	case http.StatusNotFound, http.StatusUpgradeRequired:
+		return common.StringErrorWrapperLocal("channel does not support Responses websocket transport", "responses_ws_unsupported_for_channel", http.StatusUpgradeRequired)
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return common.StringErrorWrapperLocal("provider authentication failed", "provider_authentication_failed", statusCode)
+	case http.StatusTooManyRequests:
+		return common.StringErrorWrapperLocal("provider rate limit exceeded", "provider_rate_limit_exceeded", http.StatusTooManyRequests)
+	default:
+		if statusCode >= 500 {
+			return common.StringErrorWrapperLocal("provider websocket request failed", "provider_ws_request_failed", statusCode)
 		}
 	}
+	return common.StringErrorWrapperLocal("websocket request failed", "ws_request_failed", http.StatusInternalServerError)
+}
+
+func mapOpenAIRealtimeWSDialError(err error) *types.OpenAIErrorWithStatusCode {
+	var dialErr *wsconn.DialError
+	if errors.As(err, &dialErr) && dialErr != nil {
+		return mapOpenAIRealtimeWSDialStatus(dialErr.StatusCode)
+	}
 	logOpenAIRealtimeInternalError("openai realtime websocket dial failed: " + err.Error())
+	return common.StringErrorWrapperLocal("websocket request failed", "ws_request_failed", http.StatusInternalServerError)
+}
+
+func mapOpenAIRealtimeWSDialStatus(statusCode int) *types.OpenAIErrorWithStatusCode {
+	switch statusCode {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return common.StringErrorWrapperLocal("provider authentication failed", "provider_authentication_failed", statusCode)
+	case http.StatusTooManyRequests:
+		return common.StringErrorWrapperLocal("provider rate limit exceeded", "provider_rate_limit_exceeded", http.StatusTooManyRequests)
+	default:
+		if statusCode >= 500 {
+			return common.StringErrorWrapperLocal("provider websocket request failed", "provider_ws_request_failed", statusCode)
+		}
+	}
 	return common.StringErrorWrapperLocal("websocket request failed", "ws_request_failed", http.StatusInternalServerError)
 }
 
@@ -423,9 +463,13 @@ func readOpenAIRealtimeSessionID(p *OpenAIProvider) (string, *types.OpenAIErrorW
 	return uuid.NewString(), nil
 }
 
-func (s *openAIRealtimeSession) SendClient(ctx context.Context, mt int, payload []byte) error {
+func (s *openAIRealtimeSession) SendClient(ctx context.Context, frame runtimesession.Frame) error {
 	if s == nil || s.conn == nil || s.isDetached() {
 		return runtimesession.ErrSessionClosed
+	}
+	mt, payload, err := openAIRealtimeMessageFromFrame(frame)
+	if err != nil {
+		return err
 	}
 	select {
 	case <-ctx.Done():
@@ -465,9 +509,7 @@ func (s *openAIRealtimeSession) SendClient(ctx context.Context, mt int, payload 
 		return runtimesession.ErrSessionClosed
 	default:
 	}
-	if err := requester.WithWSWriteDeadline(s.conn, config.RealtimeWebsocketWriteTimeout, func() error {
-		return s.conn.WriteMessage(mt, normalizedPayload)
-	}); err != nil {
+	if err := s.conn.WriteMessage(wsconn.MessageType(mt), normalizedPayload); err != nil {
 		if startedTurn != nil && !s.responsesWS {
 			s.rollbackOpenAIRealtimeTurnAdmission(startedTurn, "write_failed")
 			s.rollbackTurn(startedTurn)
@@ -478,22 +520,22 @@ func (s *openAIRealtimeSession) SendClient(ctx context.Context, mt int, payload 
 	return nil
 }
 
-func (s *openAIRealtimeSession) Recv(ctx context.Context) (int, []byte, *types.UsageEvent, runtimesession.RealtimePayloadOrigin, error) {
+func (s *openAIRealtimeSession) Recv(ctx context.Context) (runtimesession.RecvEvent, error) {
 	s.startReadLoop()
-	if messageType, payload, usage, origin, err, handled := s.recvQueuedOutbound(); handled {
-		return messageType, payload, usage, origin, err
+	if event, err, handled := s.recvQueuedOutbound(); handled {
+		return event, err
 	}
 
 	select {
 	case <-ctx.Done():
-		return 0, nil, nil, runtimesession.RealtimePayloadOriginProxyLocal, ctx.Err()
+		return runtimesession.RecvEvent{}, ctx.Err()
 	case <-s.detached:
-		return 0, nil, nil, runtimesession.RealtimePayloadOriginProxyLocal, runtimesession.ErrSessionClosed
+		return runtimesession.RecvEvent{}, runtimesession.ErrSessionClosed
 	case <-s.closed:
-		if messageType, payload, usage, origin, err, handled := s.recvQueuedOutbound(); handled {
-			return messageType, payload, usage, origin, err
+		if event, err, handled := s.recvQueuedOutbound(); handled {
+			return event, err
 		}
-		return 0, nil, nil, runtimesession.RealtimePayloadOriginProxyLocal, runtimesession.ErrSessionClosed
+		return runtimesession.RecvEvent{}, runtimesession.ErrSessionClosed
 	case outbound, ok := <-s.recvCh:
 		return decodeOpenAIRealtimeOutbound(outbound, ok)
 	}
@@ -515,6 +557,13 @@ func (s *openAIRealtimeSession) Detach(reason string) {
 	s.detachOnce.Do(func() {
 		s.detachReason = strings.TrimSpace(reason)
 		close(s.detached)
+		if s.conn != nil {
+			s.conn.Close(wsconn.CloseInfo{
+				Kind:   wsconn.CloseKindGracefulShutdown,
+				Code:   wsconn.CloseNormalClosure,
+				Reason: s.detachReason,
+			})
+		}
 		s.startDetachTimer()
 	})
 }
@@ -540,32 +589,6 @@ func (s *openAIRealtimeSession) SetTurnObserverFactory(factory runtimesession.Tu
 }
 
 func (s *openAIRealtimeSession) configureConn() {
-	if s == nil || s.conn == nil {
-		return
-	}
-	requester.ApplyWSReadLimit(s.conn, config.RealtimeWebsocketReadLimit)
-	logCtx := context.Background()
-	if s.provider != nil && s.provider.Context != nil && s.provider.Context.Request != nil {
-		logCtx = s.provider.Context.Request.Context()
-	}
-	if s.controlWriter != nil {
-		s.controlWriter.Stop()
-		s.controlWriter.Wait()
-	}
-	writer := requester.NewWSControlFrameWriter(s.conn, requester.WSControlFrameWriterOptions{
-		Label:      "openai realtime upstream",
-		LogContext: logCtx,
-	})
-	s.controlWriter = writer
-	s.conn.SetPingHandler(func(appData string) error {
-		if err := s.setReadDeadlineForCurrentState(); err != nil {
-			return err
-		}
-		return writer.EnqueuePong(appData)
-	})
-	s.conn.SetPongHandler(func(string) error {
-		return s.setReadDeadlineForCurrentState()
-	})
 }
 
 func (s *openAIRealtimeSession) readLoop() {
@@ -577,7 +600,7 @@ func (s *openAIRealtimeSession) readLoop() {
 			providerErr := types.NewErrorEvent("", "provider_error", "provider_panic", "upstream realtime reader failed")
 			payload := []byte(providerErr.Error())
 			s.enqueueOutbound(openAIRealtimeOutbound{
-				messageType: websocket.TextMessage,
+				messageType: wsconn.TextMessage,
 				payload:     payload,
 				origin:      runtimesession.RealtimePayloadOriginProxyLocal,
 				err:         runtimesession.ErrSessionClosed,
@@ -586,42 +609,54 @@ func (s *openAIRealtimeSession) readLoop() {
 		s.close("upstream_closed")
 	}()
 
-	for {
-		_ = s.setReadDeadlineForCurrentState()
-		messageType, payload, err := s.conn.ReadMessage()
-		if err != nil {
-			var closeErr *websocket.CloseError
-			if errors.As(err, &closeErr) {
-				s.enqueueOutbound(openAIRealtimeOutbound{
-					messageType: websocket.CloseMessage,
-					payload:     requester.SafeWSCloseMessage(closeErr.Code, closeErr.Text),
-					origin:      runtimesession.RealtimePayloadOriginProvider,
-					err:         runtimesession.ErrSessionClosed,
-				})
-				return
-			}
-			logOpenAIRealtimeInternalError("openai realtime websocket read failed: " + err.Error())
-			providerErr := types.NewErrorEvent("", "provider_error", "provider_connection_closed", "upstream websocket connection closed")
-			payload := []byte(providerErr.Error())
-			s.enqueueOutbound(openAIRealtimeOutbound{
-				messageType: websocket.TextMessage,
-				payload:     payload,
-				origin:      runtimesession.RealtimePayloadOriginProxyLocal,
-				err:         runtimesession.ErrSessionClosed,
-			})
-			return
-		}
-		s.refreshActiveTurnReadTimeout()
+	if s == nil || s.conn == nil {
+		return
+	}
 
-		outbound, shouldClose := s.observeSupplierMessage(messageType, payload)
-		if len(outbound.payload) > 0 || outbound.usage != nil || outbound.err != nil {
-			if !s.enqueueOutbound(outbound) {
-				return
+	frameCh := make(chan openAIRealtimeProviderFrame, 64)
+	closeCh := make(chan wsconn.CloseInfo, 1)
+	var finishPumpOnce sync.Once
+	finishPump := func(info wsconn.CloseInfo) {
+		finishPumpOnce.Do(func() {
+			closeCh <- info
+			close(frameCh)
+		})
+	}
+	pump := &wsconn.Pump{
+		Conn: s.conn,
+		Handle: func(_ context.Context, messageType wsconn.MessageType, payload []byte) {
+			frame := openAIRealtimeProviderFrame{messageType: messageType, payload: append([]byte(nil), payload...)}
+			select {
+			case frameCh <- frame:
+			default:
+				s.conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindBackpressure, Code: wsconn.CloseTryAgainLater, Reason: "openai_provider_frame_backpressure"})
 			}
-		}
-		if shouldClose {
+		},
+		OnClose: finishPump,
+	}
+	s.pump = pump
+	go pump.Run(context.Background())
+
+	for frame := range frameCh {
+		s.handleProviderFrame(frame)
+	}
+	info := <-closeCh
+	s.handlePumpClose(info)
+}
+
+func (s *openAIRealtimeSession) handleProviderFrame(frame openAIRealtimeProviderFrame) {
+	if s == nil {
+		return
+	}
+	s.refreshActiveTurnReadTimeout()
+	outbound, shouldClose := s.observeSupplierMessage(frame.messageType, frame.payload)
+	if len(outbound.payload) > 0 || outbound.usage != nil || outbound.err != nil {
+		if !s.enqueueOutbound(outbound) {
 			return
 		}
+	}
+	if shouldClose && s.conn != nil {
+		s.conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "provider_message_terminal"})
 	}
 }
 
@@ -709,35 +744,24 @@ func (s *openAIRealtimeSession) handleActiveTurnReadTimeout(seq int64, generatio
 	if generation != currentGeneration || !s.hasActiveTurnSeq(seq) {
 		return
 	}
-	providerErr := types.NewErrorEvent("", "provider_error", "provider_read_timeout", "upstream realtime turn timed out")
+	providerErr := types.NewErrorEvent("", "provider_error", "turn_read_timeout", "upstream realtime turn timed out")
 	payload := []byte(providerErr.Error())
 	s.enqueueOutbound(openAIRealtimeOutbound{
-		messageType: websocket.TextMessage,
+		messageType: wsconn.TextMessage,
 		payload:     payload,
 		origin:      runtimesession.RealtimePayloadOriginProxyLocal,
 		err:         runtimesession.ErrSessionClosed,
 	})
-	s.close("provider_read_timeout")
+	s.close("turn_read_timeout")
 }
 
-func (s *openAIRealtimeSession) setReadDeadlineForCurrentState() error {
-	if s == nil || s.conn == nil {
-		return nil
-	}
-	timeout := s.currentReadTimeout()
-	if timeout <= 0 {
-		return s.conn.SetReadDeadline(time.Time{})
-	}
-	return s.conn.SetReadDeadline(time.Now().Add(timeout))
-}
-
-func (s *openAIRealtimeSession) observeSupplierMessage(messageType int, payload []byte) (openAIRealtimeOutbound, bool) {
+func (s *openAIRealtimeSession) observeSupplierMessage(messageType wsconn.MessageType, payload []byte) (openAIRealtimeOutbound, bool) {
 	outbound := openAIRealtimeOutbound{
 		messageType: messageType,
 		payload:     payload,
 		origin:      runtimesession.RealtimePayloadOriginProvider,
 	}
-	if messageType != websocket.TextMessage {
+	if messageType != wsconn.TextMessage {
 		return outbound, false
 	}
 
@@ -752,7 +776,7 @@ func (s *openAIRealtimeSession) observeSupplierMessage(messageType int, payload 
 
 	receivedAt := time.Now()
 	terminal, terminationReason := openAIRealtimeTurnTerminal(eventType, &event)
-	usage := openAIRealtimeResponseUsage(event.Response).Clone()
+	usage := openAIRealtimeEventUsage(eventType, event.EventId, event.Response, payload).Clone()
 	responseID := ""
 	if event.Response != nil {
 		responseID = strings.TrimSpace(event.Response.ID)
@@ -798,6 +822,42 @@ func (s *openAIRealtimeSession) observeSupplierMessage(messageType int, payload 
 	}
 
 	return outbound, false
+}
+
+func (s *openAIRealtimeSession) handlePumpClose(info wsconn.CloseInfo) {
+	if s == nil {
+		return
+	}
+	var closeErr *wsconn.CloseError
+	if errors.As(info.Err, &closeErr) || info.Kind == wsconn.CloseKindPeerClose {
+		code := int(info.Code)
+		if closeErr != nil {
+			code = int(closeErr.Code)
+		}
+		s.enqueueOutbound(openAIRealtimeOutbound{
+			providerClose: &runtimesession.ProviderClose{
+				Code:   code,
+				Reason: info.Reason,
+				Err:    runtimesession.ErrSessionClosed,
+			},
+			origin: runtimesession.RealtimePayloadOriginProvider,
+		})
+		return
+	}
+	if info.Kind == wsconn.CloseKindAbort && info.Reason == "provider_message_terminal" {
+		return
+	}
+	if info.Err != nil {
+		logOpenAIRealtimeInternalError("openai realtime websocket read failed: " + info.Err.Error())
+	}
+	providerErr := types.NewErrorEvent("", "provider_error", "provider_connection_closed", "upstream websocket connection closed")
+	payload := []byte(providerErr.Error())
+	s.enqueueOutbound(openAIRealtimeOutbound{
+		messageType: wsconn.TextMessage,
+		payload:     payload,
+		origin:      runtimesession.RealtimePayloadOriginProxyLocal,
+		err:         runtimesession.ErrSessionClosed,
+	})
 }
 
 func logOpenAIRealtimeInternalError(message string) {
@@ -932,12 +992,8 @@ func (s *openAIRealtimeSession) close(reason string) {
 		finalized = append(finalized, s.finalizePendingTurns(strings.TrimSpace(reason), now)...)
 		s.stopActiveTurnReadTimeout()
 		s.stopDetachTimer()
-		if s.controlWriter != nil {
-			s.controlWriter.Stop()
-			s.controlWriter.Wait()
-		}
 		if s.conn != nil {
-			_ = s.conn.Close()
+			s.conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: strings.TrimSpace(reason)})
 		}
 		close(s.closed)
 	})
@@ -956,24 +1012,55 @@ func (s *openAIRealtimeSession) isDetached() bool {
 	}
 }
 
-func (s *openAIRealtimeSession) recvQueuedOutbound() (int, []byte, *types.UsageEvent, runtimesession.RealtimePayloadOrigin, error, bool) {
+func (s *openAIRealtimeSession) recvQueuedOutbound() (runtimesession.RecvEvent, error, bool) {
 	if s == nil {
-		return 0, nil, nil, runtimesession.RealtimePayloadOriginProxyLocal, runtimesession.ErrSessionClosed, true
+		return runtimesession.RecvEvent{}, runtimesession.ErrSessionClosed, true
 	}
 	select {
 	case outbound, ok := <-s.recvCh:
-		messageType, payload, usage, origin, err := decodeOpenAIRealtimeOutbound(outbound, ok)
-		return messageType, payload, usage, origin, err, true
+		event, err := decodeOpenAIRealtimeOutbound(outbound, ok)
+		return event, err, true
 	default:
-		return 0, nil, nil, runtimesession.RealtimePayloadOriginProxyLocal, nil, false
+		return runtimesession.RecvEvent{}, nil, false
 	}
 }
 
-func decodeOpenAIRealtimeOutbound(outbound openAIRealtimeOutbound, ok bool) (int, []byte, *types.UsageEvent, runtimesession.RealtimePayloadOrigin, error) {
+func decodeOpenAIRealtimeOutbound(outbound openAIRealtimeOutbound, ok bool) (runtimesession.RecvEvent, error) {
 	if !ok {
-		return 0, nil, nil, runtimesession.RealtimePayloadOriginProxyLocal, runtimesession.ErrSessionClosed
+		return runtimesession.RecvEvent{}, runtimesession.ErrSessionClosed
 	}
-	return outbound.messageType, outbound.payload, outbound.usage, outbound.origin, outbound.err
+	event := runtimesession.RecvEvent{
+		ProviderClose: outbound.providerClose,
+		Usage:         outbound.usage,
+		Origin:        outbound.origin,
+		Err:           outbound.err,
+	}
+	if len(outbound.payload) > 0 {
+		frame := openAIRealtimeFrameFromMessage(outbound.messageType, outbound.payload)
+		event.Frame = &frame
+	}
+	return event, nil
+}
+
+func openAIRealtimeMessageFromFrame(frame runtimesession.Frame) (wsconn.MessageType, []byte, error) {
+	if frame.IsZero() {
+		return 0, nil, runtimesession.ErrInvalidFrame
+	}
+	switch frame.Kind() {
+	case runtimesession.FrameKindText:
+		return wsconn.TextMessage, frame.Payload(), nil
+	case runtimesession.FrameKindBinary:
+		return wsconn.BinaryMessage, frame.Payload(), nil
+	default:
+		return 0, nil, runtimesession.ErrInvalidFrame
+	}
+}
+
+func openAIRealtimeFrameFromMessage(messageType wsconn.MessageType, payload []byte) runtimesession.Frame {
+	if messageType == wsconn.BinaryMessage {
+		return runtimesession.NewBinaryFrame(payload)
+	}
+	return runtimesession.NewTextFrame(payload)
 }
 
 func runOpenAIRealtimeFinalizers(finalized []openAIRealtimeFinalizedTurn) {
@@ -1141,6 +1228,41 @@ func (s *openAIRealtimeSession) finalizePendingTurn(pending openAIRealtimePendin
 }
 
 func (s *openAIRealtimeSession) enqueueOutbound(outbound openAIRealtimeOutbound) bool {
+	for _, current := range normalizeOpenAIRealtimeOutbound(outbound) {
+		if !s.enqueueSingleOutbound(current) {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeOpenAIRealtimeOutbound(outbound openAIRealtimeOutbound) []openAIRealtimeOutbound {
+	hasPayload := len(outbound.payload) > 0
+	hasUsage := outbound.usage != nil
+	hasErr := outbound.err != nil
+	if outbound.providerClose != nil && (hasPayload || hasUsage || hasErr) {
+		return []openAIRealtimeOutbound{{
+			providerClose: outbound.providerClose,
+			origin:        outbound.origin,
+		}}
+	}
+	if !hasErr || !hasUsage {
+		return []openAIRealtimeOutbound{outbound}
+	}
+	errEvent := openAIRealtimeOutbound{
+		origin: outbound.origin,
+		err:    outbound.err,
+	}
+	if payload := runtimesession.ClientPayloadFromError(outbound.err); len(payload) > 0 {
+		errEvent.messageType = wsconn.TextMessage
+		errEvent.payload = payload
+		errEvent.origin = runtimesession.RealtimePayloadOriginProxyLocal
+	}
+	outbound.err = nil
+	return []openAIRealtimeOutbound{outbound, errEvent}
+}
+
+func (s *openAIRealtimeSession) enqueueSingleOutbound(outbound openAIRealtimeOutbound) bool {
 	if s == nil {
 		return false
 	}
@@ -1223,8 +1345,8 @@ func (s *openAIRealtimeSession) stopDetachTimer() {
 	s.detachTimer = nil
 }
 
-func normalizeOpenAIRealtimeClientPayload(payload []byte, messageType int, modelName string, compatMode bool) ([]byte, string, error) {
-	if messageType != websocket.TextMessage {
+func normalizeOpenAIRealtimeClientPayload(payload []byte, messageType wsconn.MessageType, modelName string, compatMode bool) ([]byte, string, error) {
+	if messageType != wsconn.TextMessage {
 		return payload, "", nil
 	}
 
@@ -1348,9 +1470,70 @@ func anyToString(value any) string {
 	}
 }
 
-func openAIRealtimeResponseUsage(response *types.ResponseEvent) *types.UsageEvent {
+func openAIRealtimeResponseUsage(providerEventID string, response *types.ResponseEvent) *types.UsageEvent {
 	if response == nil || response.Usage == nil {
 		return nil
 	}
-	return response.Usage
+	usage := response.Usage.Clone()
+	usage.Source = types.UsageSourceRealtimeResponse
+	usage.BillingBasis = types.UsageBillingBasisTokens
+	usage.ProviderEventID = strings.TrimSpace(providerEventID)
+	usage.ResponseID = strings.TrimSpace(response.ID)
+	return usage
+}
+
+func openAIRealtimeEventUsage(eventType string, providerEventID string, response *types.ResponseEvent, payload []byte) *types.UsageEvent {
+	if usage := openAIRealtimeResponseUsage(providerEventID, response); usage != nil {
+		return usage
+	}
+	return openAIRealtimeInputAudioTranscriptionUsage(eventType, providerEventID, payload)
+}
+
+type openAIRealtimeInputAudioTranscriptionUsageEvent struct {
+	EventID string                    `json:"event_id"`
+	Type    string                    `json:"type"`
+	ItemID  string                    `json:"item_id"`
+	Usage   *types.UsageEvent         `json:"usage,omitempty"`
+	Audio   *openAIRealtimeAudioUsage `json:"audio,omitempty"`
+}
+
+type openAIRealtimeAudioUsage struct {
+	DurationSeconds float64 `json:"duration_seconds,omitempty"`
+	Duration        float64 `json:"duration,omitempty"`
+	Seconds         float64 `json:"seconds,omitempty"`
+}
+
+func openAIRealtimeInputAudioTranscriptionUsage(eventType string, providerEventID string, payload []byte) *types.UsageEvent {
+	if strings.TrimSpace(eventType) != "conversation.item.input_audio_transcription.completed" {
+		return nil
+	}
+	var event openAIRealtimeInputAudioTranscriptionUsageEvent
+	if err := json.Unmarshal(payload, &event); err != nil || event.Usage == nil {
+		return nil
+	}
+	usage := event.Usage.Clone()
+	usage.Source = types.UsageSourceInputAudioTranscription
+	usage.ProviderEventID = strings.TrimSpace(providerEventID)
+	if usage.ProviderEventID == "" {
+		usage.ProviderEventID = strings.TrimSpace(event.EventID)
+	}
+	usage.ItemID = strings.TrimSpace(event.ItemID)
+	duration := usage.DurationSeconds
+	if duration <= 0 && event.Audio != nil {
+		duration = event.Audio.DurationSeconds
+		if duration <= 0 {
+			duration = event.Audio.Duration
+		}
+		if duration <= 0 {
+			duration = event.Audio.Seconds
+		}
+	}
+	if duration > 0 && usage.TotalTokens == 0 && usage.InputTokens == 0 && usage.OutputTokens == 0 {
+		usage.BillingBasis = types.UsageBillingBasisDuration
+		usage.DurationSeconds = duration
+		return usage
+	}
+	usage.BillingBasis = types.UsageBillingBasisTokens
+	usage.DurationSeconds = 0
+	return usage
 }

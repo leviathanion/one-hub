@@ -25,16 +25,14 @@ func (f XunfeiProviderFactory) Create(channel *model.Channel) base.ProviderInter
 			Channel:   channel,
 			Requester: requester.NewHTTPRequester(*channel.Proxy, nil),
 		},
-		wsRequester: requester.NewWSRequester(*channel.Proxy),
 	}
 }
 
 // https://www.xfyun.cn/doc/spark/Web.html
 type XunfeiProvider struct {
 	base.BaseProvider
-	domain      string
-	apiId       string
-	wsRequester *requester.WSRequester
+	domain string
+	apiId  string
 }
 
 func getConfig() base.ProviderConfig {

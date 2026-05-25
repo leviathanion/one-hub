@@ -1,6 +1,8 @@
 package xunfei
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,15 +12,25 @@ import (
 	"one-api/common/config"
 	"one-api/common/requester"
 	"one-api/common/utils"
+	"one-api/common/wsconn"
 	"one-api/types"
 	"strings"
-
-	"github.com/gorilla/websocket"
+	"sync"
 )
 
 type xunfeiHandler struct {
 	Usage   *types.Usage
 	Request *types.ChatCompletionRequest
+}
+
+type xunfeiWSReader[T any] struct {
+	conn           *wsconn.ManagedConn
+	handlerPrefix  requester.HandlerPrefix[T]
+	DataChan       chan T
+	ErrChan        chan error
+	frameChan      chan []byte
+	startOnce      sync.Once
+	closeFrameOnce sync.Once
 }
 
 func (p *XunfeiProvider) CreateChatCompletion(request *types.ChatCompletionRequest) (*types.ChatCompletionResponse, *types.OpenAIErrorWithStatusCode) {
@@ -34,13 +46,12 @@ func (p *XunfeiProvider) CreateChatCompletion(request *types.ChatCompletionReque
 		Request: request,
 	}
 
-	stream, errWithCode := requester.SendWSJsonRequest[XunfeiChatResponse](wsConn, xunfeiRequest, chatHandler.handlerNotStream)
+	stream, errWithCode := sendXunfeiWSJSONRequest[XunfeiChatResponse](wsConn, xunfeiRequest, chatHandler.handlerNotStream)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
 
 	return chatHandler.convertToChatOpenai(stream)
-
 }
 
 func (p *XunfeiProvider) CreateChatCompletionStream(request *types.ChatCompletionRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
@@ -56,10 +67,10 @@ func (p *XunfeiProvider) CreateChatCompletionStream(request *types.ChatCompletio
 		Request: request,
 	}
 
-	return requester.SendWSJsonRequest[string](wsConn, xunfeiRequest, chatHandler.handlerStream)
+	return sendXunfeiWSJSONRequest[string](wsConn, xunfeiRequest, chatHandler.handlerStream)
 }
 
-func (p *XunfeiProvider) getChatRequest(request *types.ChatCompletionRequest) (*websocket.Conn, *types.OpenAIErrorWithStatusCode) {
+func (p *XunfeiProvider) getChatRequest(request *types.ChatCompletionRequest) (*wsconn.ManagedConn, *types.OpenAIErrorWithStatusCode) {
 	_, errWithCode := p.GetSupportedAPIUri(config.RelayModeChatCompletions)
 	if errWithCode != nil {
 		return nil, errWithCode
@@ -67,12 +78,110 @@ func (p *XunfeiProvider) getChatRequest(request *types.ChatCompletionRequest) (*
 
 	authUrl := p.GetFullRequestURL(request.Model)
 
-	wsConn, err := p.wsRequester.NewRequest(authUrl, nil)
+	proxyAddr := ""
+	if p != nil && p.Channel != nil && p.Channel.Proxy != nil {
+		proxyAddr = *p.Channel.Proxy
+	}
+	wsConn, err := wsconn.DialManaged(context.Background(), authUrl, nil, xunfeiWSConfig(), wsconn.WithProxyURL(proxyAddr))
 	if err != nil {
 		return nil, common.ErrorWrapper(err, "ws_request_failed", http.StatusInternalServerError)
 	}
 
 	return wsConn, nil
+}
+
+func xunfeiWSConfig() wsconn.Config {
+	return wsconn.Config{
+		Label:     "xunfei-chat-upstream",
+		ReadLimit: config.RealtimeWebsocketReadLimit(),
+	}
+}
+
+func sendXunfeiWSJSONRequest[T any](conn *wsconn.ManagedConn, data any, handlerPrefix requester.HandlerPrefix[T]) (*xunfeiWSReader[T], *types.OpenAIErrorWithStatusCode) {
+	payload, err := json.Marshal(data)
+	if err != nil {
+		return nil, common.ErrorWrapper(err, "ws_request_failed", http.StatusInternalServerError)
+	}
+	if err := conn.WriteMessage(wsconn.TextMessage, payload); err != nil {
+		return nil, common.ErrorWrapper(err, "ws_request_failed", http.StatusInternalServerError)
+	}
+	return &xunfeiWSReader[T]{
+		conn:          conn,
+		handlerPrefix: handlerPrefix,
+		DataChan:      make(chan T, 1),
+		ErrChan:       make(chan error, 1),
+		frameChan:     make(chan []byte, 128),
+	}, nil
+}
+
+func (stream *xunfeiWSReader[T]) Recv() (<-chan T, <-chan error) {
+	stream.startOnce.Do(func() {
+		go stream.runPump()
+		go stream.processFrames()
+	})
+	return stream.DataChan, stream.ErrChan
+}
+
+func (stream *xunfeiWSReader[T]) Close() {
+	if stream == nil || stream.conn == nil {
+		return
+	}
+	stream.conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "xunfei_reader_close"})
+}
+
+func (stream *xunfeiWSReader[T]) runPump() {
+	if stream == nil || stream.conn == nil {
+		return
+	}
+	wsconn.Pump{
+		Conn: stream.conn,
+		Handle: func(_ context.Context, _ wsconn.MessageType, payload []byte) {
+			frame := append([]byte(nil), payload...)
+			select {
+			case stream.frameChan <- frame:
+			default:
+				stream.conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindBackpressure, Code: wsconn.CloseTryAgainLater, Reason: "xunfei_frame_backpressure"})
+			}
+		},
+		OnClose: func(info wsconn.CloseInfo) {
+			stream.closeFrameChan()
+			if info.Kind == wsconn.CloseKindNormal {
+				return
+			}
+			var err error
+			if info.Err != nil {
+				err = info.Err
+			} else {
+				err = io.EOF
+			}
+			select {
+			case stream.ErrChan <- err:
+			default:
+			}
+		},
+	}.Run(context.Background())
+}
+
+func (stream *xunfeiWSReader[T]) processFrames() {
+	if stream == nil {
+		return
+	}
+	for msg := range stream.frameChan {
+		stream.handlerPrefix(&msg, stream.DataChan, stream.ErrChan)
+		if bytes.Equal(msg, requester.StreamClosed) {
+			stream.conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindNormal, Code: wsconn.CloseNormalClosure, Reason: "stream completed"})
+			return
+		}
+	}
+}
+
+func (stream *xunfeiWSReader[T]) closeFrameChan() {
+	if stream == nil {
+		return
+	}
+	stream.closeFrameOnce.Do(func() {
+		close(stream.frameChan)
+	})
 }
 
 func (p *XunfeiProvider) convertFromChatOpenai(request *types.ChatCompletionRequest) *XunfeiChatRequest {
@@ -183,7 +292,6 @@ func (h *xunfeiHandler) convertToChatOpenai(stream requester.StreamReaderInterfa
 			choice.Message.FunctionCall = xunfeiText.FunctionCall
 			choice.FinishReason = types.FinishReasonFunctionCall
 		}
-
 	} else {
 		choice.Message = types.ChatCompletionMessage{
 			Role:    "assistant",
@@ -300,7 +408,6 @@ func (h *xunfeiHandler) convertToOpenaiStream(xunfeiChatResponse *XunfeiChatResp
 			choice.Delta.FunctionCall = xunfeiText.FunctionCall
 			choice.FinishReason = types.FinishReasonFunctionCall
 		}
-
 	} else {
 		choice.Delta.Content = xunfeiChatResponse.Payload.Choices.Text[0].Content
 		if xunfeiChatResponse.Payload.Choices.Status == 2 {

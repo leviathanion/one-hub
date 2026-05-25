@@ -155,9 +155,15 @@ func TestUsageEventMergeSeparatesImageGenerationVariants(t *testing.T) {
 
 func TestUsageEventCloneDeepCopiesExtraMaps(t *testing.T) {
 	usage := &UsageEvent{
-		InputTokens:  3,
-		OutputTokens: 5,
-		TotalTokens:  8,
+		InputTokens:     3,
+		OutputTokens:    5,
+		TotalTokens:     8,
+		Source:          UsageSourceInputAudioTranscription,
+		BillingBasis:    UsageBillingBasisDuration,
+		ProviderEventID: "evt_1",
+		ResponseID:      "resp_1",
+		ItemID:          "item_1",
+		DurationSeconds: 2.5,
 		ExtraTokens: map[string]int{
 			"cached": 2,
 		},
@@ -185,6 +191,14 @@ func TestUsageEventCloneDeepCopiesExtraMaps(t *testing.T) {
 	}
 	if got := usage.ExtraBilling[APIToolTypeWebSearchPreview].CallCount; got != 1 {
 		t.Fatalf("expected source extra billing to stay unchanged, got %d", got)
+	}
+	if cloned.Source != UsageSourceInputAudioTranscription ||
+		cloned.BillingBasis != UsageBillingBasisDuration ||
+		cloned.ProviderEventID != "evt_1" ||
+		cloned.ResponseID != "resp_1" ||
+		cloned.ItemID != "item_1" ||
+		cloned.DurationSeconds != 2.5 {
+		t.Fatalf("expected clone to preserve usage metadata, got %+v", cloned)
 	}
 }
 

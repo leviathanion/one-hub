@@ -4,21 +4,24 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"one-api/common/config"
 	"one-api/common/logger"
-	"one-api/common/requester"
+	"one-api/common/wsconn"
+	"one-api/common/wsconn/wstest"
 	"one-api/model"
 	runtimesession "one-api/runtime/session"
 	"one-api/types"
 
 	"github.com/gin-gonic/gin"
-	"github.com/gorilla/websocket"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 )
@@ -33,30 +36,134 @@ func newOpenAIRealtimeHelperSession() *openAIRealtimeSession {
 	}
 }
 
-func newOpenAIRealtimeConnPair(t *testing.T) (*websocket.Conn, func()) {
+func newOpenAIRealtimeConnPair(t *testing.T) (*wsconn.ManagedConn, func()) {
 	t.Helper()
 
-	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
+	wsURL, cleanupServer := wstest.Server(t, func(conn *wsconn.ManagedConn) {
+		<-conn.Done()
+	})
+	conn := dialOpenAIRealtimeManagedTestConn(t, wsURL, wsconn.Config{
+		Label:        "openai realtime test upstream",
+		ReadLimit:    config.RealtimeWebsocketReadLimit(),
+		WriteTimeout: config.RealtimeWebsocketWriteTimeout,
+	})
+
+	return conn, func() {
+		conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_cleanup"})
+		cleanupServer()
+	}
+}
+
+func dialOpenAIRealtimeManagedTestConn(t *testing.T, wsURL string, cfg wsconn.Config) *wsconn.ManagedConn {
+	t.Helper()
+	conn, err := wsconn.DialManaged(context.Background(), wsURL, nil, cfg, wsconn.WithDialSecurityPolicy(wsconn.DialSecurityPolicy{
+		AllowInsecureWS: true,
+		AllowPrivateIP:  true,
+		HostFilter: func(host string, ips []net.IP) bool {
+			return true
+		},
+	}))
+	if err != nil {
+		t.Fatalf("failed to dial helper websocket: %v", err)
+	}
+	return conn
+}
+
+func newOpenAIRealtimeHeaderCaptureServer(t *testing.T, headerCh chan<- http.Header, urlCh chan<- string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if headerCh != nil {
+			headerCh <- r.Header.Clone()
+		}
+		if urlCh != nil {
+			urlCh <- r.URL.String()
+		}
+		conn, err := wsconn.AcceptManaged(w, r, wsconn.Config{Label: "openai realtime test accept"}, wsconn.AcceptOptions{
+			CheckOrigin: func(*http.Request) bool { return true },
+		})
 		if err != nil {
 			t.Errorf("upgrade failed: %v", err)
 			return
 		}
-		defer conn.Close()
-		<-r.Context().Done()
+		<-conn.Done()
 	}))
+}
 
-	wsURL := "ws" + server.URL[len("http"):]
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		server.Close()
-		t.Fatalf("failed to dial helper websocket: %v", err)
+func TestOpenAIRealtimeSessionSendClientRejectsZeroFrame(t *testing.T) {
+	conn, cleanup := newOpenAIRealtimeConnPair(t)
+	defer cleanup()
+
+	session := newOpenAIRealtimeHelperSession()
+	session.conn = conn
+
+	if err := session.SendClient(context.Background(), runtimesession.Frame{}); !errors.Is(err, runtimesession.ErrInvalidFrame) {
+		t.Fatalf("expected zero frame to return ErrInvalidFrame, got %v", err)
+	}
+}
+
+func TestOpenAIRealtimeSessionSendClientRejectsUnknownFrameKind(t *testing.T) {
+	conn, cleanup := newOpenAIRealtimeConnPair(t)
+	defer cleanup()
+
+	session := newOpenAIRealtimeHelperSession()
+	session.conn = conn
+
+	if err := session.SendClient(context.Background(), openAITestUnknownKindFrame([]byte("{}"))); !errors.Is(err, runtimesession.ErrInvalidFrame) {
+		t.Fatalf("expected unknown frame kind to return ErrInvalidFrame, got %v", err)
+	}
+}
+
+func openAITestUnknownKindFrame(payload []byte) runtimesession.Frame {
+	frame := runtimesession.NewTextFrame(payload)
+	field := reflect.ValueOf(&frame).Elem().FieldByName("kind")
+	reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem().SetInt(99)
+	return frame
+}
+
+func TestOpenAIRealtimeReadLoopForwardsProviderCloseCode(t *testing.T) {
+	closeSent := make(chan struct{})
+	wsURL, cleanupServer := wstest.Server(t, func(conn *wsconn.ManagedConn) {
+		conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindGracefulShutdown, Code: wsconn.CloseCode(4408), Reason: "quota exhausted"})
+		close(closeSent)
+		<-conn.Done()
+	})
+	defer cleanupServer()
+
+	conn := dialOpenAIRealtimeManagedTestConn(t, wsURL, wsconn.Config{
+		Label:        "openai realtime close test upstream",
+		ReadLimit:    config.RealtimeWebsocketReadLimit(),
+		WriteTimeout: config.RealtimeWebsocketWriteTimeout,
+	})
+	defer conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_cleanup"})
+
+	session := newOpenAIRealtimeHelperSession()
+	session.conn = conn
+	session.startReadLoop()
+
+	select {
+	case <-closeSent:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for test server to send close frame")
 	}
 
-	return conn, func() {
-		_ = conn.Close()
-		server.Close()
+	event, err := session.Recv(context.Background())
+	if err != nil {
+		t.Fatalf("Recv err=%v, want provider close event", err)
+	}
+	if event.ProviderClose == nil {
+		t.Fatalf("expected provider close event, got %+v", event)
+	}
+	if event.ProviderClose.Code != 4408 {
+		t.Fatalf("expected provider close code 4408, got %d", event.ProviderClose.Code)
+	}
+	if event.ProviderClose.Reason != "quota exhausted" {
+		t.Fatalf("expected provider close reason to be preserved, got %q", event.ProviderClose.Reason)
+	}
+	if !errors.Is(event.ProviderClose.Err, runtimesession.ErrSessionClosed) {
+		t.Fatalf("expected provider close to carry session closed error, got %v", event.ProviderClose.Err)
+	}
+	if event.Frame != nil || event.Usage != nil || event.Err != nil || event.Origin != runtimesession.RealtimePayloadOriginProvider {
+		t.Fatalf("expected only provider close with provider origin, got %+v", event)
 	}
 }
 
@@ -82,20 +189,20 @@ func TestOpenAIRealtimeSessionHelperNormalizationAndIDs(t *testing.T) {
 	}
 
 	binaryPayload := []byte{1, 2, 3}
-	if normalized, eventType, err := normalizeOpenAIRealtimeClientPayload(binaryPayload, websocket.BinaryMessage, "gpt-4o", false); err != nil || eventType != "" || string(normalized) != string(binaryPayload) {
+	if normalized, eventType, err := normalizeOpenAIRealtimeClientPayload(binaryPayload, wsconn.BinaryMessage, "gpt-4o", false); err != nil || eventType != "" || string(normalized) != string(binaryPayload) {
 		t.Fatalf("expected non-text payload passthrough, normalized=%v event=%q err=%v", normalized, eventType, err)
 	}
 
-	if normalized, eventType, err := normalizeOpenAIRealtimeClientPayload([]byte("not-json"), websocket.TextMessage, "gpt-4o", false); err != nil || eventType != "" || string(normalized) != "not-json" {
+	if normalized, eventType, err := normalizeOpenAIRealtimeClientPayload([]byte("not-json"), wsconn.TextMessage, "gpt-4o", false); err != nil || eventType != "" || string(normalized) != "not-json" {
 		t.Fatalf("expected invalid json passthrough, normalized=%q event=%q err=%v", string(normalized), eventType, err)
 	}
 
 	compatPayload := []byte(`{"type":"response.create","response":{"input":[]}}`)
-	if normalized, eventType, err := normalizeOpenAIRealtimeClientPayload(compatPayload, websocket.TextMessage, "gpt-4o", true); err != nil || eventType != "response.create" || string(normalized) != string(compatPayload) {
+	if normalized, eventType, err := normalizeOpenAIRealtimeClientPayload(compatPayload, wsconn.TextMessage, "gpt-4o", true); err != nil || eventType != "response.create" || string(normalized) != string(compatPayload) {
 		t.Fatalf("expected compat mode passthrough, normalized=%q event=%q err=%v", string(normalized), eventType, err)
 	}
 
-	withResponse, eventType, err := normalizeOpenAIRealtimeClientPayload([]byte(`{"type":"response.create","response":{"input":[]}}`), websocket.TextMessage, "gpt-4o", false)
+	withResponse, eventType, err := normalizeOpenAIRealtimeClientPayload([]byte(`{"type":"response.create","response":{"input":[]}}`), wsconn.TextMessage, "gpt-4o", false)
 	if err != nil || eventType != "response.create" {
 		t.Fatalf("expected response.create normalization, event=%q err=%v", eventType, err)
 	}
@@ -108,7 +215,7 @@ func TestOpenAIRealtimeSessionHelperNormalizationAndIDs(t *testing.T) {
 		t.Fatalf("expected response model backfill, got %q", got)
 	}
 
-	topLevel, eventType, err := normalizeOpenAIRealtimeClientPayload([]byte(`{"type":"response.create"}`), websocket.TextMessage, "gpt-4o-mini", false)
+	topLevel, eventType, err := normalizeOpenAIRealtimeClientPayload([]byte(`{"type":"response.create"}`), wsconn.TextMessage, "gpt-4o-mini", false)
 	if err != nil || eventType != "response.create" {
 		t.Fatalf("expected top-level normalization, event=%q err=%v", eventType, err)
 	}
@@ -120,7 +227,7 @@ func TestOpenAIRealtimeSessionHelperNormalizationAndIDs(t *testing.T) {
 		t.Fatalf("expected top-level model backfill, got %q", got)
 	}
 
-	preseeded, _, err := normalizeOpenAIRealtimeClientPayload([]byte(`{"type":"response.create","response":{"model":"o1","input":[]}}`), websocket.TextMessage, "gpt-4o", false)
+	preseeded, _, err := normalizeOpenAIRealtimeClientPayload([]byte(`{"type":"response.create","response":{"model":"o1","input":[]}}`), wsconn.TextMessage, "gpt-4o", false)
 	if err != nil {
 		t.Fatalf("expected preseeded payload to normalize without error, got %v", err)
 	}
@@ -134,11 +241,11 @@ func TestOpenAIRealtimeSessionHelperNormalizationAndIDs(t *testing.T) {
 	}
 
 	rawPreseeded := []byte(`{"type":"response.create","response":{"model":"o1","input":[],"unknown_number":12345678901234567890}}`)
-	if normalized, _, err := normalizeOpenAIRealtimeClientPayload(rawPreseeded, websocket.TextMessage, "gpt-4o", false); err != nil || string(normalized) != string(rawPreseeded) {
+	if normalized, _, err := normalizeOpenAIRealtimeClientPayload(rawPreseeded, wsconn.TextMessage, "gpt-4o", false); err != nil || string(normalized) != string(rawPreseeded) {
 		t.Fatalf("expected preseeded response.create to remain byte-identical, normalized=%q err=%v", string(normalized), err)
 	}
 
-	withUnknownNumber, _, err := normalizeOpenAIRealtimeClientPayload([]byte(`{"type":"response.create","response":{"input":[],"unknown_number":12345678901234567890}}`), websocket.TextMessage, "gpt-4o", false)
+	withUnknownNumber, _, err := normalizeOpenAIRealtimeClientPayload([]byte(`{"type":"response.create","response":{"input":[],"unknown_number":12345678901234567890}}`), wsconn.TextMessage, "gpt-4o", false)
 	if err != nil {
 		t.Fatalf("expected raw-message normalization to succeed, got %v", err)
 	}
@@ -154,11 +261,11 @@ func TestOpenAIRealtimeSessionHelperNormalizationAndIDs(t *testing.T) {
 		t.Fatalf("expected unknown numeric field to preserve raw precision, got %s", responseRaw["unknown_number"])
 	}
 
-	cancelPayload, eventType, err := normalizeOpenAIRealtimeClientPayload([]byte(`{"type":"response.cancel"}`), websocket.TextMessage, "gpt-4o", false)
+	cancelPayload, eventType, err := normalizeOpenAIRealtimeClientPayload([]byte(`{"type":"response.cancel"}`), wsconn.TextMessage, "gpt-4o", false)
 	if err != nil || eventType != "response.cancel" || string(cancelPayload) != `{"type":"response.cancel"}` {
 		t.Fatalf("expected non-response.create realtime payload to pass through, payload=%q event=%q err=%v", string(cancelPayload), eventType, err)
 	}
-	blankModelPayload, eventType, err := normalizeOpenAIRealtimeClientPayload([]byte(`{"type":"response.create","response":{"input":[]}}`), websocket.TextMessage, "   ", false)
+	blankModelPayload, eventType, err := normalizeOpenAIRealtimeClientPayload([]byte(`{"type":"response.create","response":{"input":[]}}`), wsconn.TextMessage, "   ", false)
 	if err != nil || eventType != "response.create" || string(blankModelPayload) != `{"type":"response.create","response":{"input":[]}}` {
 		t.Fatalf("expected blank model normalization to preserve payload, payload=%q event=%q err=%v", string(blankModelPayload), eventType, err)
 	}
@@ -166,16 +273,44 @@ func TestOpenAIRealtimeSessionHelperNormalizationAndIDs(t *testing.T) {
 	if got := anyToString(123); got != "" {
 		t.Fatalf("expected non-string conversion to return empty string, got %q", got)
 	}
-	if usage := openAIRealtimeResponseUsage(nil); usage != nil {
+	if usage := openAIRealtimeResponseUsage("evt_ignored", nil); usage != nil {
 		t.Fatalf("expected nil response usage to stay nil, got %+v", usage)
 	}
-	responseEvent := &types.ResponseEvent{Usage: &types.UsageEvent{TotalTokens: 9}}
-	if usage := openAIRealtimeResponseUsage(responseEvent); usage == nil || usage.TotalTokens != 9 {
+	responseEvent := &types.ResponseEvent{ID: " resp_usage ", Usage: &types.UsageEvent{TotalTokens: 9}}
+	if usage := openAIRealtimeResponseUsage(" evt_usage ", responseEvent); usage == nil || usage.TotalTokens != 9 ||
+		usage.Source != types.UsageSourceRealtimeResponse ||
+		usage.BillingBasis != types.UsageBillingBasisTokens ||
+		usage.ProviderEventID != "evt_usage" ||
+		usage.ResponseID != "resp_usage" {
 		t.Fatalf("expected response usage passthrough, got %+v", usage)
+	}
+
+	tokenUsagePayload := []byte(`{"event_id":" evt_transcript_tokens ","type":"conversation.item.input_audio_transcription.completed","item_id":" item_1 ","usage":{"input_tokens":7,"total_tokens":7}}`)
+	tokenUsage := openAIRealtimeInputAudioTranscriptionUsage("conversation.item.input_audio_transcription.completed", " evt_override ", tokenUsagePayload)
+	if tokenUsage == nil ||
+		tokenUsage.Source != types.UsageSourceInputAudioTranscription ||
+		tokenUsage.BillingBasis != types.UsageBillingBasisTokens ||
+		tokenUsage.ProviderEventID != "evt_override" ||
+		tokenUsage.ItemID != "item_1" ||
+		tokenUsage.InputTokens != 7 ||
+		tokenUsage.TotalTokens != 7 ||
+		tokenUsage.DurationSeconds != 0 {
+		t.Fatalf("expected token transcription usage attribution, got %+v", tokenUsage)
+	}
+
+	durationUsagePayload := []byte(`{"event_id":" evt_transcript_duration ","type":"conversation.item.input_audio_transcription.completed","item_id":" item_2 ","usage":{"duration_seconds":2.5}}`)
+	durationUsage := openAIRealtimeInputAudioTranscriptionUsage("conversation.item.input_audio_transcription.completed", "", durationUsagePayload)
+	if durationUsage == nil ||
+		durationUsage.Source != types.UsageSourceInputAudioTranscription ||
+		durationUsage.BillingBasis != types.UsageBillingBasisDuration ||
+		durationUsage.ProviderEventID != "evt_transcript_duration" ||
+		durationUsage.ItemID != "item_2" ||
+		durationUsage.DurationSeconds != 2.5 {
+		t.Fatalf("expected duration transcription usage attribution, got %+v", durationUsage)
 	}
 }
 
-func TestOpenAIRealtimeReadLoopRecoversPanicAndClosesSession(t *testing.T) {
+func TestOpenAIRealtimeReadLoopWithNilConnClosesSession(t *testing.T) {
 	originalLogger := logger.Logger
 	logger.Logger = zap.NewNop()
 	t.Cleanup(func() {
@@ -184,7 +319,7 @@ func TestOpenAIRealtimeReadLoopRecoversPanicAndClosesSession(t *testing.T) {
 
 	session := &openAIRealtimeSession{
 		model:     "gpt-5",
-		sessionID: "panic-session",
+		sessionID: "nil-conn-session",
 		recvCh:    make(chan openAIRealtimeOutbound, 1),
 		closed:    make(chan struct{}),
 		detached:  make(chan struct{}),
@@ -195,55 +330,22 @@ func TestOpenAIRealtimeReadLoopRecoversPanicAndClosesSession(t *testing.T) {
 	select {
 	case <-session.closed:
 	default:
-		t.Fatal("expected read loop panic recovery to close the session")
+		t.Fatal("expected read loop with nil conn to close the session")
 	}
 
-	var gotPanicPayload bool
-	for outbound := range session.recvCh {
-		if strings.Contains(string(outbound.payload), "provider_panic") {
-			gotPanicPayload = true
-		}
-	}
-	if !gotPanicPayload {
-		t.Fatal("expected read loop panic recovery to enqueue a provider_panic payload")
-	}
-}
-
-func TestOpenAIRealtimePingControlWriteDoesNotWaitForBusinessWriteLock(t *testing.T) {
-	conn, cleanup := newOpenAIRealtimeConnPair(t)
-	defer cleanup()
-
-	session := newOpenAIRealtimeHelperSession()
-	session.conn = conn
-	session.configureConn()
-	if session.controlWriter == nil {
-		t.Fatal("expected openai realtime session to configure control frame writer")
-	}
-	defer session.close("test_done")
-
-	session.writeMu.Lock()
-	defer session.writeMu.Unlock()
-
-	done := make(chan error, 1)
-	go func() {
-		done <- conn.PingHandler()("ping")
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(200 * time.Millisecond):
-		t.Fatal("ping control write waited for business write lock")
+	if outbound, ok := <-session.recvCh; ok {
+		t.Fatalf("expected nil conn read loop to close without outbound payload, got %+v", outbound)
 	}
 }
 
 func TestOpenAIResponsesWSDefersReadUntilRecvAndFiltersSessionCreated(t *testing.T) {
 	releaseDone := make(chan struct{})
-	server := newOpenAIRealtimeTestServer(t, func(conn *websocket.Conn) {
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"id":"sess_private"}}`)); err != nil {
+	server := newOpenAIRealtimeTestServer(t, func(conn *openAIRealtimeTestConn) {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"session.created","session":{"id":"sess_private"}}`)); err != nil {
 			t.Errorf("failed to write private bootstrap event: %v", err)
 			return
 		}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_visible","status":"in_progress"}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_visible","status":"in_progress"}}`)); err != nil {
 			t.Errorf("failed to write visible responses event: %v", err)
 			return
 		}
@@ -274,7 +376,7 @@ func TestOpenAIResponsesWSDefersReadUntilRecvAndFiltersSessionCreated(t *testing
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	_, payload, _, _, err := session.Recv(ctx)
+	_, payload, _, _, err := openAITestRecv(ctx, session)
 	if err != nil {
 		t.Fatalf("expected first Recv to return provider event, got %v", err)
 	}
@@ -294,12 +396,12 @@ func TestOpenAIRequireWSOnlyUsesResponsesWSWithoutCompatMode(t *testing.T) {
 	}()
 
 	releaseDone := make(chan struct{})
-	server := newOpenAIRealtimeTestServer(t, func(conn *websocket.Conn) {
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","session":{"id":"sess_private"}}`)); err != nil {
+	server := newOpenAIRealtimeTestServer(t, func(conn *openAIRealtimeTestConn) {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"session.created","session":{"id":"sess_private"}}`)); err != nil {
 			t.Errorf("failed to write private bootstrap event: %v", err)
 			return
 		}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_visible","status":"in_progress"}}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_visible","status":"in_progress"}}`)); err != nil {
 			t.Errorf("failed to write visible responses event: %v", err)
 			return
 		}
@@ -335,7 +437,7 @@ func TestOpenAIRequireWSOnlyUsesResponsesWSWithoutCompatMode(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	_, payload, _, _, err := session.Recv(ctx)
+	_, payload, _, _, err := openAITestRecv(ctx, session)
 	if err != nil {
 		t.Fatalf("expected first Recv to return provider event, got %v", err)
 	}
@@ -359,7 +461,7 @@ func TestOpenAIResponsesWSReadTimeoutFollowsTurnState(t *testing.T) {
 		t.Fatalf("expected active ResponsesWS turn to use realtime read timeout, got %s", got)
 	}
 
-	outbound, shouldClose := session.observeSupplierMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_done","status":"completed"}}`))
+	outbound, shouldClose := session.observeSupplierMessage(wsconn.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_done","status":"completed"}}`))
 	if shouldClose {
 		t.Fatalf("expected terminal ResponsesWS event to keep session open, outbound=%+v", outbound)
 	}
@@ -382,35 +484,74 @@ func TestOpenAIRealtimeConfigureConnAppliesUpstreamReadLimit(t *testing.T) {
 	})
 
 	releaseWrite := make(chan struct{})
-	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			t.Errorf("upgrade failed: %v", err)
-			return
-		}
-		defer conn.Close()
+	wsURL, cleanupServer := wstest.Server(t, func(conn *wsconn.ManagedConn) {
 		<-releaseWrite
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(strings.Repeat("x", oversizedPayloadBytes))); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(strings.Repeat("x", oversizedPayloadBytes))); err != nil {
 			t.Errorf("failed to write oversized websocket frame: %v", err)
 		}
-	}))
-	defer server.Close()
+		<-conn.Done()
+	})
+	defer cleanupServer()
 
-	wsURL := "ws" + server.URL[len("http"):]
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		t.Fatalf("failed to dial helper websocket: %v", err)
+	conn := dialOpenAIRealtimeManagedTestConn(t, wsURL, wsconn.Config{
+		Label:        "openai realtime read limit test upstream",
+		ReadLimit:    config.RealtimeWebsocketReadLimit(),
+		WriteTimeout: config.RealtimeWebsocketWriteTimeout,
+	})
+	defer conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_cleanup"})
+
+	session := &openAIRealtimeSession{
+		conn:     conn,
+		recvCh:   make(chan openAIRealtimeOutbound, 8),
+		closed:   make(chan struct{}),
+		detached: make(chan struct{}),
 	}
-	defer conn.Close()
-
-	session := &openAIRealtimeSession{conn: conn}
-	session.configureConn()
+	session.startReadLoop()
 	close(releaseWrite)
 
-	_, payload, err := conn.ReadMessage()
-	if err == nil {
-		t.Fatalf("expected oversized upstream websocket frame to hit read limit, got payload length %d", len(payload))
+	event, err := session.Recv(context.Background())
+	if err != nil {
+		t.Fatalf("expected read-limit error event, got err=%v", err)
+	}
+	if event.Frame == nil || !strings.Contains(string(event.Frame.Payload()), "provider_connection_closed") {
+		t.Fatalf("expected provider_connection_closed payload after read limit, got %+v", event)
+	}
+	if !errors.Is(event.Err, runtimesession.ErrSessionClosed) {
+		t.Fatalf("expected read-limit event to carry RecvEvent.Err source, got %v", event.Err)
+	}
+}
+
+func TestOpenAIRealtimePumpNonPeerCloseEmitsRecvEventErr(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		kind wsconn.CloseKind
+	}{
+		{name: "read error", kind: wsconn.CloseKindReadError},
+		{name: "backpressure", kind: wsconn.CloseKindBackpressure},
+		{name: "pong miss", kind: wsconn.CloseKindPongMiss},
+		{name: "handler panic", kind: wsconn.CloseKindHandlerPanic},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			session := &openAIRealtimeSession{
+				recvCh:   make(chan openAIRealtimeOutbound, 1),
+				closed:   make(chan struct{}),
+				detached: make(chan struct{}),
+			}
+			session.handlePumpClose(wsconn.CloseInfo{Kind: tc.kind, Reason: string(tc.kind)})
+			event, err := session.Recv(context.Background())
+			if err != nil {
+				t.Fatalf("expected RecvEvent for %s, got err=%v", tc.kind, err)
+			}
+			if event.ProviderClose != nil {
+				t.Fatalf("expected non-peer close not to produce ProviderClose, got %+v", event.ProviderClose)
+			}
+			if event.Frame == nil || !strings.Contains(string(event.Frame.Payload()), "provider_connection_closed") {
+				t.Fatalf("expected provider_connection_closed payload, got %+v", event)
+			}
+			if !errors.Is(event.Err, runtimesession.ErrSessionClosed) {
+				t.Fatalf("expected RecvEvent.Err for %s, got %v", tc.kind, event.Err)
+			}
+		})
 	}
 }
 
@@ -507,39 +648,94 @@ func TestOpenAIRealtimeSessionSelectionAndFinalizationHelpers(t *testing.T) {
 }
 
 func TestOpenAIRealtimeSessionQueueLifecycleAndSendClientGuards(t *testing.T) {
-	if messageType, payload, usage, _, err, handled := (*openAIRealtimeSession)(nil).recvQueuedOutbound(); !handled || !errors.Is(err, runtimesession.ErrSessionClosed) || messageType != 0 || payload != nil || usage != nil {
-		t.Fatalf("expected nil session queue read to report session closed, type=%d payload=%v usage=%v err=%v handled=%v", messageType, payload, usage, err, handled)
+	if event, err, handled := (*openAIRealtimeSession)(nil).recvQueuedOutbound(); !handled || !errors.Is(err, runtimesession.ErrSessionClosed) || event != (runtimesession.RecvEvent{}) {
+		t.Fatalf("expected nil session queue read to report session closed, event=%+v err=%v handled=%v", event, err, handled)
 	}
-	if messageType, payload, usage, _, err := decodeOpenAIRealtimeOutbound(openAIRealtimeOutbound{}, false); !errors.Is(err, runtimesession.ErrSessionClosed) || messageType != 0 || payload != nil || usage != nil {
-		t.Fatalf("expected closed outbound decode to report session closed, type=%d payload=%v usage=%v err=%v", messageType, payload, usage, err)
+	if event, err := decodeOpenAIRealtimeOutbound(openAIRealtimeOutbound{}, false); !errors.Is(err, runtimesession.ErrSessionClosed) || event != (runtimesession.RecvEvent{}) {
+		t.Fatalf("expected closed outbound decode to report session closed, event=%+v err=%v", event, err)
+	}
+	providerClose := &runtimesession.ProviderClose{Code: int(wsconn.ClosePolicyViolation), Reason: "quota exhausted", Err: runtimesession.ErrSessionClosed}
+	if event, err := decodeOpenAIRealtimeOutbound(openAIRealtimeOutbound{
+		providerClose: providerClose,
+		origin:        runtimesession.RealtimePayloadOriginProvider,
+	}, true); err != nil || event.ProviderClose != providerClose || event.Frame != nil || event.Usage != nil || event.Err != nil || event.Origin != runtimesession.RealtimePayloadOriginProvider {
+		t.Fatalf("expected provider close only event, event=%+v err=%v", event, err)
+	}
+	providerErr := errors.New("provider business error")
+	if event, err := decodeOpenAIRealtimeOutbound(openAIRealtimeOutbound{
+		err:    providerErr,
+		origin: runtimesession.RealtimePayloadOriginProvider,
+	}, true); err != nil || !errors.Is(event.Err, providerErr) || event.Frame != nil || event.Usage != nil || event.ProviderClose != nil || event.Origin != runtimesession.RealtimePayloadOriginProvider {
+		t.Fatalf("expected provider error event without top-level error, event=%+v err=%v", event, err)
+	}
+	if event, err := decodeOpenAIRealtimeOutbound(openAIRealtimeOutbound{
+		messageType: wsconn.TextMessage,
+		payload:     []byte("queued"),
+		usage:       &types.UsageEvent{TotalTokens: 1},
+		origin:      runtimesession.RealtimePayloadOriginProvider,
+	}, true); err != nil || event.Frame == nil || event.Frame.Kind() != runtimesession.FrameKindText || event.Usage == nil || event.Usage.TotalTokens != 1 || event.ProviderClose != nil || event.Err != nil || event.Origin != runtimesession.RealtimePayloadOriginProvider {
+		t.Fatalf("expected frame+usage event without top-level error, event=%+v err=%v", event, err)
 	}
 	if terminal, reason := openAIRealtimeTurnTerminal(types.EventTypeResponseDone, nil); !terminal || reason != types.EventTypeResponseDone {
 		t.Fatalf("expected response.done helper classification, terminal=%v reason=%q", terminal, reason)
 	}
 
 	session := newOpenAIRealtimeHelperSession()
-	if handled := session.enqueueOutbound(openAIRealtimeOutbound{messageType: websocket.TextMessage, payload: []byte("queued")}); !handled {
+	if handled := session.enqueueOutbound(openAIRealtimeOutbound{messageType: wsconn.TextMessage, payload: []byte("queued")}); !handled {
 		t.Fatal("expected enqueueOutbound to queue active outbound")
 	}
-	if messageType, payload, _, _, err, handled := session.recvQueuedOutbound(); !handled || err != nil || messageType != websocket.TextMessage || string(payload) != "queued" {
-		t.Fatalf("expected queued outbound recv, type=%d payload=%q err=%v handled=%v", messageType, string(payload), err, handled)
+	if event, err, handled := session.recvQueuedOutbound(); !handled || err != nil || event.Frame == nil || event.Frame.Kind() != runtimesession.FrameKindText || string(event.Frame.Payload()) != "queued" {
+		t.Fatalf("expected queued outbound recv, event=%+v err=%v handled=%v", event, err, handled)
+	}
+	observerErr := runtimesession.NewClientPayloadError(errors.New("quota"), []byte(`{"type":"error","error":{"message":"quota"}}`))
+	if handled := session.enqueueOutbound(openAIRealtimeOutbound{
+		messageType: wsconn.TextMessage,
+		payload:     []byte(`{"type":"response.done","response":{"usage":{"total_tokens":1}}}`),
+		usage:       &types.UsageEvent{TotalTokens: 1},
+		origin:      runtimesession.RealtimePayloadOriginProvider,
+		err:         observerErr,
+	}); !handled {
+		t.Fatal("expected frame+usage+err outbound to enqueue as split events")
+	}
+	if event, err, handled := session.recvQueuedOutbound(); !handled || err != nil || event.Frame == nil || event.Usage == nil || event.Err != nil || event.ProviderClose != nil || event.Origin != runtimesession.RealtimePayloadOriginProvider {
+		t.Fatalf("expected first split event to preserve frame+usage without err, event=%+v err=%v handled=%v", event, err, handled)
+	}
+	if event, err, handled := session.recvQueuedOutbound(); !handled || err != nil || event.Frame == nil || event.Usage != nil || !errors.Is(event.Err, observerErr) || event.ProviderClose != nil || event.Origin != runtimesession.RealtimePayloadOriginProxyLocal {
+		t.Fatalf("expected second split event to carry client payload error without usage, event=%+v err=%v handled=%v", event, err, handled)
+	}
+	if normalized := normalizeOpenAIRealtimeOutbound(openAIRealtimeOutbound{
+		messageType:   wsconn.TextMessage,
+		payload:       []byte("ignored"),
+		providerClose: providerClose,
+		usage:         &types.UsageEvent{TotalTokens: 1},
+		origin:        runtimesession.RealtimePayloadOriginProvider,
+		err:           errors.New("ignored"),
+	}); len(normalized) != 1 || normalized[0].providerClose != providerClose || len(normalized[0].payload) != 0 || normalized[0].usage != nil || normalized[0].err != nil {
+		t.Fatalf("expected provider close normalization to keep only ProviderClose, got %+v", normalized)
+	}
+	if normalized := normalizeOpenAIRealtimeOutbound(openAIRealtimeOutbound{
+		usage:  &types.UsageEvent{TotalTokens: 2},
+		origin: runtimesession.RealtimePayloadOriginProvider,
+		err:    observerErr,
+	}); len(normalized) != 2 || normalized[0].usage == nil || normalized[0].err != nil || normalized[1].usage != nil || !errors.Is(normalized[1].err, observerErr) {
+		t.Fatalf("unexpected normalized openai usage+err shape: %+v", normalized)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, _, _, _, err := session.Recv(ctx); !errors.Is(err, context.Canceled) {
+	if _, _, _, _, err := openAITestRecv(ctx, session); !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected canceled Recv to return context cancellation, got %v", err)
 	}
 
 	detachedSession := newOpenAIRealtimeHelperSession()
 	close(detachedSession.detached)
-	if _, _, _, _, err := detachedSession.Recv(context.Background()); !errors.Is(err, runtimesession.ErrSessionClosed) {
+	if _, _, _, _, err := openAITestRecv(context.Background(), detachedSession); !errors.Is(err, runtimesession.ErrSessionClosed) {
 		t.Fatalf("expected detached Recv to return session closed, got %v", err)
 	}
 
 	closedSession := newOpenAIRealtimeHelperSession()
 	close(closedSession.closed)
-	if _, _, _, _, err := closedSession.Recv(context.Background()); !errors.Is(err, runtimesession.ErrSessionClosed) {
+	if _, _, _, _, err := openAITestRecv(context.Background(), closedSession); !errors.Is(err, runtimesession.ErrSessionClosed) {
 		t.Fatalf("expected closed Recv to return session closed, got %v", err)
 	}
 
@@ -588,14 +784,14 @@ func TestOpenAIRealtimeSessionQueueLifecycleAndSendClientGuards(t *testing.T) {
 		closed:   make(chan struct{}),
 		detached: make(chan struct{}),
 	}
-	backpressuredSession.recvCh <- openAIRealtimeOutbound{messageType: websocket.TextMessage}
+	backpressuredSession.recvCh <- openAIRealtimeOutbound{messageType: wsconn.TextMessage}
 	originalOutboundTimeout := openAIRealtimeOutboundBackpressureTimeout
 	openAIRealtimeOutboundBackpressureTimeout = 10 * time.Millisecond
 	t.Cleanup(func() {
 		openAIRealtimeOutboundBackpressureTimeout = originalOutboundTimeout
 	})
 	start := time.Now()
-	if handled := backpressuredSession.enqueueOutbound(openAIRealtimeOutbound{messageType: websocket.TextMessage}); handled {
+	if handled := backpressuredSession.enqueueOutbound(openAIRealtimeOutbound{messageType: wsconn.TextMessage}); handled {
 		t.Fatal("expected backpressured realtime session enqueue to fail")
 	}
 	if elapsed := time.Since(start); elapsed < openAIRealtimeOutboundBackpressureTimeout {
@@ -606,13 +802,11 @@ func TestOpenAIRealtimeSessionQueueLifecycleAndSendClientGuards(t *testing.T) {
 
 	conn, cleanupConn := newOpenAIRealtimeConnPair(t)
 	defer cleanupConn()
-	if err := conn.Close(); err != nil {
-		t.Fatalf("failed to close helper websocket client: %v", err)
-	}
+	conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_closed_conn"})
 
 	writeFailSession := newOpenAIRealtimeHelperSession()
 	writeFailSession.conn = conn
-	if err := writeFailSession.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","response":{"input":[]}}`)); err == nil {
+	if err := writeFailSession.SendClient(context.Background(), openAITestTextFrame([]byte(`{"type":"response.create","response":{"input":[]}}`))); err == nil {
 		t.Fatal("expected closed websocket write to fail")
 	} else {
 		var event *types.Event
@@ -628,15 +822,15 @@ func TestOpenAIRealtimeSessionQueueLifecycleAndSendClientGuards(t *testing.T) {
 	busySession.conn, cleanupConn = newOpenAIRealtimeConnPair(t)
 	defer cleanupConn()
 	busySession.turn = newOpenAIRealtimeTurnState(1, time.Now(), nil)
-	if err := busySession.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.create","response":{"input":[]}}`)); err == nil {
+	if err := busySession.SendClient(context.Background(), openAITestTextFrame([]byte(`{"type":"response.create","response":{"input":[]}}`))); err == nil {
 		t.Fatal("expected busy realtime session to reject a second response.create")
 	}
 
 	guardSession := newOpenAIRealtimeHelperSession()
-	if err := guardSession.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"bad"`)); err == nil {
+	if err := guardSession.SendClient(context.Background(), openAITestTextFrame([]byte(`{"type":"bad"`))); err == nil {
 		t.Fatal("expected invalid client payload to fail")
 	}
-	if err := (*openAIRealtimeSession)(nil).SendClient(context.Background(), websocket.TextMessage, []byte(`{}`)); !errors.Is(err, runtimesession.ErrSessionClosed) {
+	if err := (*openAIRealtimeSession)(nil).SendClient(context.Background(), openAITestTextFrame([]byte(`{}`))); !errors.Is(err, runtimesession.ErrSessionClosed) {
 		t.Fatalf("expected nil session SendClient to report session closed, got %v", err)
 	}
 
@@ -667,11 +861,11 @@ func TestOpenAIRealtimeActiveTurnTimeoutQueuesClientVisibleError(t *testing.T) {
 
 	select {
 	case outbound := <-session.recvCh:
-		if outbound.messageType != websocket.TextMessage {
+		if outbound.messageType != wsconn.TextMessage {
 			t.Fatalf("expected websocket text error frame, got type=%d", outbound.messageType)
 		}
-		if !strings.Contains(string(outbound.payload), "provider_read_timeout") {
-			t.Fatalf("expected provider_read_timeout payload, got %s", string(outbound.payload))
+		if !strings.Contains(string(outbound.payload), "turn_read_timeout") {
+			t.Fatalf("expected turn_read_timeout payload, got %s", string(outbound.payload))
 		}
 		if outbound.origin != runtimesession.RealtimePayloadOriginProxyLocal {
 			t.Fatalf("expected proxy-local timeout payload, got origin=%v", outbound.origin)
@@ -745,18 +939,7 @@ func TestOpenAIRealtimeSessionConnectionErrorsAndAzureHeaders(t *testing.T) {
 	t.Run("azure websocket auth uses api key header", func(t *testing.T) {
 		headerCh := make(chan http.Header, 1)
 		urlCh := make(chan string, 1)
-		upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			headerCh <- r.Header.Clone()
-			urlCh <- r.URL.String()
-			conn, err := upgrader.Upgrade(w, r, nil)
-			if err != nil {
-				t.Errorf("upgrade failed: %v", err)
-				return
-			}
-			defer conn.Close()
-			<-r.Context().Done()
-		}))
+		server := newOpenAIRealtimeHeaderCaptureServer(t, headerCh, urlCh)
 		defer server.Close()
 
 		proxy := ""
@@ -775,9 +958,7 @@ func TestOpenAIRealtimeSessionConnectionErrorsAndAzureHeaders(t *testing.T) {
 		if errWithCode != nil {
 			t.Fatalf("expected azure realtime websocket to connect, got %v", errWithCode)
 		}
-		if err := conn.Close(); err != nil {
-			t.Fatalf("expected azure realtime websocket close to succeed, got %v", err)
-		}
+		conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_done"})
 
 		headers := <-headerCh
 		if got := headers.Get("Api-Key"); got != "azure-key" {
@@ -796,17 +977,7 @@ func TestOpenAIRealtimeSessionConnectionErrorsAndAzureHeaders(t *testing.T) {
 
 	t.Run("realtime beta header is preserved only when channel config opts in", func(t *testing.T) {
 		headerCh := make(chan http.Header, 1)
-		upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			headerCh <- r.Header.Clone()
-			conn, err := upgrader.Upgrade(w, r, nil)
-			if err != nil {
-				t.Errorf("upgrade failed: %v", err)
-				return
-			}
-			defer conn.Close()
-			<-r.Context().Done()
-		}))
+		server := newOpenAIRealtimeHeaderCaptureServer(t, headerCh, nil)
 		defer server.Close()
 
 		proxy := ""
@@ -822,9 +993,7 @@ func TestOpenAIRealtimeSessionConnectionErrorsAndAzureHeaders(t *testing.T) {
 		if errWithCode != nil {
 			t.Fatalf("expected realtime websocket to connect, got %v", errWithCode)
 		}
-		if err := conn.Close(); err != nil {
-			t.Fatalf("expected realtime websocket close to succeed, got %v", err)
-		}
+		conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_done"})
 
 		headers := <-headerCh
 		if got := headers.Get("Openai-Beta"); got != "realtime=v1" {
@@ -834,17 +1003,7 @@ func TestOpenAIRealtimeSessionConnectionErrorsAndAzureHeaders(t *testing.T) {
 
 	t.Run("responses websocket merges custom headers", func(t *testing.T) {
 		headerCh := make(chan http.Header, 1)
-		upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			headerCh <- r.Header.Clone()
-			conn, err := upgrader.Upgrade(w, r, nil)
-			if err != nil {
-				t.Errorf("upgrade failed: %v", err)
-				return
-			}
-			defer conn.Close()
-			<-r.Context().Done()
-		}))
+		server := newOpenAIRealtimeHeaderCaptureServer(t, headerCh, nil)
 		defer server.Close()
 
 		proxy := ""
@@ -860,9 +1019,7 @@ func TestOpenAIRealtimeSessionConnectionErrorsAndAzureHeaders(t *testing.T) {
 		if errWithCode != nil {
 			t.Fatalf("expected responses websocket to connect, got %v", errWithCode)
 		}
-		if err := conn.Close(); err != nil {
-			t.Fatalf("expected responses websocket close to succeed, got %v", err)
-		}
+		conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_done"})
 
 		headers := <-headerCh
 		if got := headers.Get("Authorization"); got != "Bearer sk-test" {
@@ -878,17 +1035,7 @@ func TestOpenAIRealtimeSessionConnectionErrorsAndAzureHeaders(t *testing.T) {
 
 	t.Run("azure responses websocket auth uses api key header", func(t *testing.T) {
 		headerCh := make(chan http.Header, 1)
-		upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			headerCh <- r.Header.Clone()
-			conn, err := upgrader.Upgrade(w, r, nil)
-			if err != nil {
-				t.Errorf("upgrade failed: %v", err)
-				return
-			}
-			defer conn.Close()
-			<-r.Context().Done()
-		}))
+		server := newOpenAIRealtimeHeaderCaptureServer(t, headerCh, nil)
 		defer server.Close()
 
 		proxy := ""
@@ -909,9 +1056,7 @@ func TestOpenAIRealtimeSessionConnectionErrorsAndAzureHeaders(t *testing.T) {
 		if errWithCode != nil {
 			t.Fatalf("expected azure responses websocket to connect, got %v", errWithCode)
 		}
-		if err := conn.Close(); err != nil {
-			t.Fatalf("expected azure responses websocket close to succeed, got %v", err)
-		}
+		conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_done"})
 
 		headers := <-headerCh
 		if got := headers.Get("Api-Key"); got != "azure-key" {
@@ -1061,7 +1206,7 @@ func TestMapOpenAIResponsesWSDialErrorPreservesHandshakeStatus(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			errWithCode := mapOpenAIResponsesWSDialError(&requester.WSDialHandshakeError{
+			errWithCode := mapOpenAIResponsesWSDialError(&wsconn.DialError{
 				URL:        "wss://provider.example/v1/responses?api_key=secret",
 				StatusCode: tc.statusCode,
 				Header:     http.Header{"Retry-After": []string{"2"}},
@@ -1101,18 +1246,18 @@ func TestOpenAIRealtimeSessionAdditionalHelperBranches(t *testing.T) {
 		t.Fatal("expected SetTurnObserverFactory to attach an observer to the active turn")
 	}
 
-	if outbound, shouldClose := session.observeSupplierMessage(websocket.BinaryMessage, []byte{1, 2, 3}); shouldClose || outbound.err != nil || string(outbound.payload) != string([]byte{1, 2, 3}) {
+	if outbound, shouldClose := session.observeSupplierMessage(wsconn.BinaryMessage, []byte{1, 2, 3}); shouldClose || outbound.err != nil || string(outbound.payload) != string([]byte{1, 2, 3}) {
 		t.Fatalf("expected binary realtime supplier payload passthrough, outbound=%+v should_close=%v", outbound, shouldClose)
 	}
-	if outbound, shouldClose := session.observeSupplierMessage(websocket.TextMessage, []byte("not-json")); shouldClose || outbound.err != nil || string(outbound.payload) != "not-json" {
+	if outbound, shouldClose := session.observeSupplierMessage(wsconn.TextMessage, []byte("not-json")); shouldClose || outbound.err != nil || string(outbound.payload) != "not-json" {
 		t.Fatalf("expected invalid json supplier payload passthrough, outbound=%+v should_close=%v", outbound, shouldClose)
 	}
 
 	session.compatMode = true
-	if outbound, shouldClose := session.observeSupplierMessage(websocket.TextMessage, []byte(`{"type":"error","error":{"type":"invalid_request_error","code":"bad_request","message":"boom"}}`)); shouldClose || outbound.err != nil {
+	if outbound, shouldClose := session.observeSupplierMessage(wsconn.TextMessage, []byte(`{"type":"error","error":{"type":"invalid_request_error","code":"bad_request","message":"boom"}}`)); shouldClose || outbound.err != nil {
 		t.Fatalf("expected non-fatal compat mode upstream errors to pass through, outbound=%+v should_close=%v", outbound, shouldClose)
 	}
-	if outbound, shouldClose := session.observeSupplierMessage(websocket.TextMessage, []byte(`{"type":"error","error":{"type":"server_error","code":"session_expired","message":"boom"}}`)); shouldClose || outbound.err != nil {
+	if outbound, shouldClose := session.observeSupplierMessage(wsconn.TextMessage, []byte(`{"type":"error","error":{"type":"server_error","code":"session_expired","message":"boom"}}`)); shouldClose || outbound.err != nil {
 		t.Fatalf("expected compat mode upstream errors to pass through without closing the session, outbound=%+v should_close=%v", outbound, shouldClose)
 	}
 
@@ -1120,13 +1265,13 @@ func TestOpenAIRealtimeSessionAdditionalHelperBranches(t *testing.T) {
 	session.turn = nil
 	session.pendingTurns = nil
 	session.recentFinalizedIDs = nil
-	outbound, shouldClose := session.observeSupplierMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_orphan","status":"completed","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`))
+	outbound, shouldClose := session.observeSupplierMessage(wsconn.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_orphan","status":"completed","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`))
 	if shouldClose || outbound.usage == nil || outbound.usage.TotalTokens != 3 {
 		t.Fatalf("expected orphan terminal usage to be forwarded without closing, outbound=%+v should_close=%v", outbound, shouldClose)
 	}
 
 	session.recentFinalizedIDs = []string{"resp_orphan"}
-	outbound, shouldClose = session.observeSupplierMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_orphan","status":"completed","usage":{"input_tokens":5,"output_tokens":5,"total_tokens":10}}}`))
+	outbound, shouldClose = session.observeSupplierMessage(wsconn.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_orphan","status":"completed","usage":{"input_tokens":5,"output_tokens":5,"total_tokens":10}}}`))
 	if shouldClose || outbound.usage != nil {
 		t.Fatalf("expected late finalized response usage to be dropped, outbound=%+v should_close=%v", outbound, shouldClose)
 	}

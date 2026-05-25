@@ -86,12 +86,32 @@ type ResponseEvent struct {
 	Usage  *UsageEvent `json:"usage,omitempty"`
 }
 
+type UsageSource string
+
+const (
+	UsageSourceRealtimeResponse        UsageSource = "realtime_response"
+	UsageSourceInputAudioTranscription UsageSource = "input_audio_transcription"
+)
+
+type UsageBillingBasis string
+
+const (
+	UsageBillingBasisTokens   UsageBillingBasis = "tokens"
+	UsageBillingBasisDuration UsageBillingBasis = "duration"
+)
+
 type UsageEvent struct {
 	InputTokens        int                     `json:"input_tokens"`
 	OutputTokens       int                     `json:"output_tokens"`
 	TotalTokens        int                     `json:"total_tokens"`
 	InputTokenDetails  PromptTokensDetails     `json:"input_token_details,omitempty"`
 	OutputTokenDetails CompletionTokensDetails `json:"output_token_details,omitempty"`
+	Source             UsageSource             `json:"source,omitempty"`
+	BillingBasis       UsageBillingBasis       `json:"billing_basis,omitempty"`
+	ProviderEventID    string                  `json:"provider_event_id,omitempty"`
+	ResponseID         string                  `json:"response_id,omitempty"`
+	ItemID             string                  `json:"item_id,omitempty"`
+	DurationSeconds    float64                 `json:"duration_seconds,omitempty"`
 
 	ExtraTokens  map[string]int          `json:"-"`
 	ExtraBilling map[string]ExtraBilling `json:"-"`

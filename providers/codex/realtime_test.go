@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,11 +17,11 @@ import (
 
 	"one-api/common/config"
 	"one-api/common/requester"
+	"one-api/common/wsconn"
 	runtimesession "one-api/runtime/session"
 	"one-api/types"
 
 	"github.com/gin-gonic/gin"
-	"github.com/gorilla/websocket"
 )
 
 func recvCodexAttachmentOutbound(t *testing.T, attachment *codexAttachment) codexRealtimeOutbound {
@@ -52,6 +53,137 @@ func waitForCodexAttachmentClosed(t *testing.T, attachment *codexAttachment, tim
 	}
 }
 
+func dialCodexManagedTestConn(t *testing.T, wsURL string) *wsconn.ManagedConn {
+	t.Helper()
+	conn, err := wsconn.DialManaged(context.Background(), wsURL, nil, wsconn.Config{
+		Label:        "codex realtime test upstream",
+		ReadLimit:    config.RealtimeWebsocketReadLimit(),
+		WriteTimeout: config.RealtimeWebsocketWriteTimeout,
+	}, wsconn.WithDialSecurityPolicy(wsconn.DialSecurityPolicy{
+		AllowInsecureWS: true,
+		AllowPrivateIP:  true,
+		HostFilter: func(string, []net.IP) bool {
+			return true
+		},
+	}))
+	if err != nil {
+		t.Fatalf("failed to dial managed test websocket: %v", err)
+	}
+	return conn
+}
+
+type codexRealtimeTestFrame struct {
+	messageType wsconn.MessageType
+	payload     []byte
+}
+
+type codexRealtimeTestConn struct {
+	conn *wsconn.ManagedConn
+
+	frames          chan codexRealtimeTestFrame
+	closeFramesOnce sync.Once
+}
+
+func newCodexRealtimeTestConn(conn *wsconn.ManagedConn) *codexRealtimeTestConn {
+	testConn := &codexRealtimeTestConn{
+		conn:   conn,
+		frames: make(chan codexRealtimeTestFrame, 32),
+	}
+	go func() {
+		defer func() {
+			if recover() != nil {
+				testConn.closeFramesOnce.Do(func() { close(testConn.frames) })
+			}
+		}()
+		wsconn.Pump{
+			Conn: conn,
+			Handle: func(_ context.Context, mt wsconn.MessageType, payload []byte) {
+				testConn.frames <- codexRealtimeTestFrame{
+					messageType: mt,
+					payload:     append([]byte(nil), payload...),
+				}
+			},
+			OnClose: func(wsconn.CloseInfo) {
+				testConn.closeFramesOnce.Do(func() { close(testConn.frames) })
+			},
+		}.Run(context.Background())
+	}()
+	return testConn
+}
+
+func (c *codexRealtimeTestConn) ReadMessage() (wsconn.MessageType, []byte, error) {
+	frame, ok := <-c.frames
+	if !ok {
+		return 0, nil, net.ErrClosed
+	}
+	return frame.messageType, frame.payload, nil
+}
+
+func (c *codexRealtimeTestConn) WriteMessage(mt wsconn.MessageType, payload []byte) error {
+	return c.conn.WriteMessage(mt, payload)
+}
+
+func (c *codexRealtimeTestConn) Close() {
+	c.conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_cleanup"})
+}
+
+func acceptCodexRealtimeTestConn(t *testing.T, w http.ResponseWriter, r *http.Request) (*codexRealtimeTestConn, bool) {
+	t.Helper()
+	conn, err := wsconn.AcceptManaged(w, r, wsconn.Config{Label: "codex realtime test accept"}, wsconn.AcceptOptions{
+		CheckOrigin: func(*http.Request) bool { return true },
+	})
+	if err != nil {
+		t.Errorf("accept managed: %v", err)
+		return nil, false
+	}
+	return newCodexRealtimeTestConn(conn), true
+}
+
+func newCodexRealtimeCountingServer(t *testing.T, counter *atomic.Int32) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, ok := acceptCodexRealtimeTestConn(t, w, r)
+		if !ok {
+			return
+		}
+		if counter != nil {
+			counter.Add(1)
+		}
+		go func() {
+			defer conn.Close()
+			for {
+				if _, _, err := conn.ReadMessage(); err != nil {
+					return
+				}
+			}
+		}()
+	}))
+}
+
+func codexTestTextFrame(payload []byte) runtimesession.Frame {
+	return runtimesession.NewTextFrame(payload)
+}
+
+func codexTestBinaryFrame(payload []byte) runtimesession.Frame {
+	return runtimesession.NewBinaryFrame(payload)
+}
+
+func codexTestRecv(ctx context.Context, session runtimesession.RealtimeSession) (wsconn.MessageType, []byte, *types.UsageEvent, runtimesession.RealtimePayloadOrigin, error) {
+	event, err := session.Recv(ctx)
+	if err != nil {
+		return 0, nil, nil, runtimesession.RealtimePayloadOriginProxyLocal, err
+	}
+	messageType := wsconn.TextMessage
+	var payload []byte
+	if event.Frame != nil {
+		if event.Frame.Kind() == runtimesession.FrameKindBinary {
+			messageType = wsconn.BinaryMessage
+		}
+		payload = event.Frame.Payload()
+	}
+	return messageType, payload, event.Usage, event.Origin, event.Err
+}
+
 func assignCodexAttachmentOwnerLocked(state *codexManagedRuntimeState, attachment *codexAttachment) uint64 {
 	if state == nil {
 		return 0
@@ -78,14 +210,14 @@ func resolveTestRealtimeBinding(c *gin.Context) (*runtimesession.Binding, bool) 
 
 func TestCodexRealtimeBootstrapMessageDetection(t *testing.T) {
 	payload := []byte(`{"type":"session.created","session":{"id":"execution-session-456"}}`)
-	if !isCodexRealtimeBootstrapMessage(websocket.TextMessage, payload) {
+	if !isCodexRealtimeBootstrapMessage(wsconn.TextMessage, payload) {
 		t.Fatal("expected Codex realtime bootstrap detector to match session.created events")
 	}
 }
 
 func TestCodexRealtimeHandlerLogsMalformedJSONAndContinues(t *testing.T) {
 	provider := &CodexProvider{}
-	shouldContinue, usage, newMessage, err := provider.handleRealtimeSupplierMessage(websocket.TextMessage, []byte(`{"type":`), nil, "gpt-5")
+	shouldContinue, usage, newMessage, err := provider.handleRealtimeSupplierMessage(wsconn.TextMessage, []byte(`{"type":`), nil, "gpt-5")
 	if err != nil {
 		t.Fatalf("expected malformed provider JSON to be ignored without handler error, got %v", err)
 	}
@@ -130,7 +262,7 @@ func TestCodexRealtimeHandlerExtractsUsageOnTerminalResponseEvents(t *testing.T)
 
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			shouldContinue, usage, newMessage, err := provider.handleRealtimeSupplierMessage(websocket.TextMessage, testCase.payload, newCodexTurnUsageAccumulator(), "gpt-5")
+			shouldContinue, usage, newMessage, err := provider.handleRealtimeSupplierMessage(wsconn.TextMessage, testCase.payload, newCodexTurnUsageAccumulator(), "gpt-5")
 			if err != nil {
 				t.Fatalf("expected no handler error, got %v", err)
 			}
@@ -162,7 +294,7 @@ func TestCodexRealtimeHandlerPreservesToolCallExtraBillingOnTerminalResponses(t 
 		}
 	}`)
 
-	shouldContinue, usage, _, err := provider.handleRealtimeSupplierMessage(websocket.TextMessage, payload, newCodexTurnUsageAccumulator(), "gpt-5")
+	shouldContinue, usage, _, err := provider.handleRealtimeSupplierMessage(wsconn.TextMessage, payload, newCodexTurnUsageAccumulator(), "gpt-5")
 	if err != nil {
 		t.Fatalf("expected no handler error, got %v", err)
 	}
@@ -205,7 +337,7 @@ func TestCodexRealtimeHandlerBackfillsMissingTerminalUsageFromSeededRequest(t *t
 		}
 	}`)
 
-	shouldContinue, usage, _, err := provider.handleRealtimeSupplierMessage(websocket.TextMessage, payload, accumulator, "gpt-5")
+	shouldContinue, usage, _, err := provider.handleRealtimeSupplierMessage(wsconn.TextMessage, payload, accumulator, "gpt-5")
 	if err != nil {
 		t.Fatalf("expected no handler error, got %v", err)
 	}
@@ -228,7 +360,7 @@ func TestCodexRealtimeHandlerIgnoresUsageOnNonTerminalResponseEvents(t *testing.
 	provider := &CodexProvider{}
 	payload := []byte(`{"type":"response.created","response":{"status":"in_progress","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`)
 
-	shouldContinue, usage, newMessage, err := provider.handleRealtimeSupplierMessage(websocket.TextMessage, payload, newCodexTurnUsageAccumulator(), "gpt-5")
+	shouldContinue, usage, newMessage, err := provider.handleRealtimeSupplierMessage(wsconn.TextMessage, payload, newCodexTurnUsageAccumulator(), "gpt-5")
 	if err != nil {
 		t.Fatalf("expected no handler error, got %v", err)
 	}
@@ -344,15 +476,14 @@ func TestCodexRealtimeHeadersReplaceOverridesCaseInsensitively(t *testing.T) {
 }
 
 func TestCodexManagedRealtimeSkipsBootstrapFrameOnNewWebsocket(t *testing.T) {
-	upgrader := websocket.Upgrader{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
+		conn, ok := acceptCodexRealtimeTestConn(t, w, r)
+		if !ok {
 			return
 		}
 		defer conn.Close()
 
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","event_id":"evt_bootstrap"}`)); err != nil {
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"session.created","event_id":"evt_bootstrap"}`)); err != nil {
 			return
 		}
 
@@ -360,7 +491,7 @@ func TestCodexManagedRealtimeSkipsBootstrapFrameOnNewWebsocket(t *testing.T) {
 			return
 		}
 
-		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_after_bootstrap","status":"completed"}}`))
+		_ = conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_after_bootstrap","status":"completed"}}`))
 	}))
 	defer server.Close()
 
@@ -378,14 +509,14 @@ func TestCodexManagedRealtimeSkipsBootstrapFrameOnNewWebsocket(t *testing.T) {
 	defer cleanupCodexManagedSession(t, provider, "gpt-5")
 
 	createEvent := []byte(`{"type":"response.create","event_id":"evt_create","model":"gpt-5","input":"hello"}`)
-	if err := session.SendClient(context.Background(), websocket.TextMessage, createEvent); err != nil {
+	if err := session.SendClient(context.Background(), codexTestTextFrame(createEvent)); err != nil {
 		t.Fatalf("expected websocket dispatch to succeed, got %v", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	_, payload, _, _, err := session.Recv(ctx)
+	_, payload, _, _, err := codexTestRecv(ctx, session)
 	if err != nil {
 		t.Fatalf("expected post-bootstrap response, got %v", err)
 	}
@@ -398,11 +529,10 @@ func TestCodexManagedRealtimeSkipsBootstrapFrameOnNewWebsocket(t *testing.T) {
 }
 
 func TestCodexManagedRealtimeReplacementReaderPreservesBootstrapOwnership(t *testing.T) {
-	upgrader := websocket.Upgrader{}
-	accepted := make(chan *websocket.Conn, 2)
+	accepted := make(chan *codexRealtimeTestConn, 2)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
+		conn, ok := acceptCodexRealtimeTestConn(t, w, r)
+		if !ok {
 			return
 		}
 		accepted <- conn
@@ -410,20 +540,14 @@ func TestCodexManagedRealtimeReplacementReaderPreservesBootstrapOwnership(t *tes
 	defer server.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-	conn1, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		t.Fatalf("expected first websocket dial to succeed, got %v", err)
-	}
-	defer conn1.Close()
+	conn1 := dialCodexManagedTestConn(t, wsURL)
+	defer conn1.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_cleanup"})
 
 	serverConn1 := <-accepted
 	defer serverConn1.Close()
 
-	conn2, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		t.Fatalf("expected replacement websocket dial to succeed, got %v", err)
-	}
-	defer conn2.Close()
+	conn2 := dialCodexManagedTestConn(t, wsURL)
+	defer conn2.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_cleanup"})
 
 	serverConn2 := <-accepted
 	defer serverConn2.Close()
@@ -453,7 +577,7 @@ func TestCodexManagedRealtimeReplacementReaderPreservesBootstrapOwnership(t *tes
 	provider.startRealtimeWSReaderLocked(exec, state)
 	exec.Unlock()
 
-	_ = serverConn1.Close()
+	serverConn1.Close()
 	time.Sleep(100 * time.Millisecond)
 
 	exec.Lock()
@@ -472,10 +596,10 @@ func TestCodexManagedRealtimeReplacementReaderPreservesBootstrapOwnership(t *tes
 	}
 	exec.Unlock()
 
-	if err := serverConn2.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.created","event_id":"evt_replacement_bootstrap"}`)); err != nil {
+	if err := serverConn2.WriteMessage(wsconn.TextMessage, []byte(`{"type":"session.created","event_id":"evt_replacement_bootstrap"}`)); err != nil {
 		t.Fatalf("expected replacement bootstrap frame to be delivered, got %v", err)
 	}
-	if err := serverConn2.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_after_replacement","status":"completed"}}`)); err != nil {
+	if err := serverConn2.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_after_replacement","status":"completed"}}`)); err != nil {
 		t.Fatalf("expected replacement response frame to be delivered, got %v", err)
 	}
 
@@ -494,22 +618,7 @@ func TestCodexManagedRealtimeReplacementReaderPreservesBootstrapOwnership(t *tes
 
 func TestCodexManagedRealtimeReusesExecutionSessionWebsocket(t *testing.T) {
 	var connections atomic.Int32
-	upgrader := websocket.Upgrader{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		connections.Add(1)
-		go func() {
-			defer conn.Close()
-			for {
-				if _, _, err := conn.ReadMessage(); err != nil {
-					return
-				}
-			}
-		}()
-	}))
+	server := newCodexRealtimeCountingServer(t, &connections)
 	defer server.Close()
 
 	providerA := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", map[string]string{
@@ -536,9 +645,9 @@ func TestCodexManagedRealtimeReusesExecutionSessionWebsocket(t *testing.T) {
 	}
 	defer sessionB.Detach("test_detach")
 
-	waitForAtomicCount(t, &connections, 1, 2*time.Second, "expected websocket dial to be reused")
-	if got := connections.Load(); got != 1 {
-		t.Fatalf("expected websocket dial to be reused, got %d upstream connections", got)
+	waitForAtomicCount(t, &connections, 2, 2*time.Second, "expected detach to close upstream before reopen")
+	if got := connections.Load(); got != 2 {
+		t.Fatalf("expected detach to force a fresh upstream connection, got %d", got)
 	}
 
 	cleanupCodexManagedSession(t, providerB, "gpt-5")
@@ -546,22 +655,7 @@ func TestCodexManagedRealtimeReusesExecutionSessionWebsocket(t *testing.T) {
 
 func TestCodexManagedRealtimeStaleAbortDoesNotCloseReattachedExecutionSession(t *testing.T) {
 	var connections atomic.Int32
-	upgrader := websocket.Upgrader{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		connections.Add(1)
-		go func() {
-			defer conn.Close()
-			for {
-				if _, _, err := conn.ReadMessage(); err != nil {
-					return
-				}
-			}
-		}()
-	}))
+	server := newCodexRealtimeCountingServer(t, &connections)
 	defer server.Close()
 
 	providerA := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", map[string]string{
@@ -597,7 +691,7 @@ func TestCodexManagedRealtimeStaleAbortDoesNotCloseReattachedExecutionSession(t 
 	defer managedB.Detach("test_close")
 	defer cleanupCodexManagedSession(t, providerB, "gpt-5")
 
-	waitForAtomicCount(t, &connections, 1, 2*time.Second, "expected websocket dial to be reused after reattach")
+	waitForAtomicCount(t, &connections, 2, 2*time.Second, "expected detach to close upstream before reattach")
 
 	managedA.Abort("stale_abort")
 
@@ -617,22 +711,7 @@ func TestCodexManagedRealtimeStaleAbortDoesNotCloseReattachedExecutionSession(t 
 
 func TestCodexManagedRealtimeStaleObserverFactoryCannotMutateReattachedSession(t *testing.T) {
 	var connections atomic.Int32
-	upgrader := websocket.Upgrader{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		connections.Add(1)
-		go func() {
-			defer conn.Close()
-			for {
-				if _, _, err := conn.ReadMessage(); err != nil {
-					return
-				}
-			}
-		}()
-	}))
+	server := newCodexRealtimeCountingServer(t, &connections)
 	defer server.Close()
 
 	providerA := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", map[string]string{
@@ -668,7 +747,7 @@ func TestCodexManagedRealtimeStaleObserverFactoryCannotMutateReattachedSession(t
 	defer managedB.Detach("test_close")
 	defer cleanupCodexManagedSession(t, providerB, "gpt-5")
 
-	waitForAtomicCount(t, &connections, 1, 2*time.Second, "expected websocket dial to be reused after reattach")
+	waitForAtomicCount(t, &connections, 2, 2*time.Second, "expected detach to close upstream before reattach")
 
 	staleRecorder := &recordingTurnObserver{}
 	managedA.SetTurnObserverFactory(func() runtimesession.TurnObserver { return staleRecorder })
@@ -755,22 +834,7 @@ func TestCodexManagedRealtimeReattachDoesNotInheritPriorObserverFactory(t *testi
 
 func TestCodexManagedRealtimeRejectsExecutionSessionReuseAcrossChannelsWithoutSharedPool(t *testing.T) {
 	var connections atomic.Int32
-	upgrader := websocket.Upgrader{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		connections.Add(1)
-		go func() {
-			defer conn.Close()
-			for {
-				if _, _, err := conn.ReadMessage(); err != nil {
-					return
-				}
-			}
-		}()
-	}))
+	server := newCodexRealtimeCountingServer(t, &connections)
 	defer server.Close()
 
 	providerA := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", map[string]string{
@@ -821,22 +885,7 @@ func TestCodexManagedRealtimeRejectsExecutionSessionReuseAcrossChannelsWithoutSh
 
 func TestCodexManagedRealtimeRejectsExecutionSessionReuseAcrossDifferentModelHeadersWithinSameChannel(t *testing.T) {
 	var connections atomic.Int32
-	upgrader := websocket.Upgrader{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		connections.Add(1)
-		go func() {
-			defer conn.Close()
-			for {
-				if _, _, err := conn.ReadMessage(); err != nil {
-					return
-				}
-			}
-		}()
-	}))
+	server := newCodexRealtimeCountingServer(t, &connections)
 	defer server.Close()
 
 	providerA := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", map[string]string{
@@ -925,22 +974,7 @@ func TestCodexManagedRealtimeRejectsExecutionSessionReuseAcrossDifferentRequestH
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
 			var connections atomic.Int32
-			upgrader := websocket.Upgrader{}
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				conn, err := upgrader.Upgrade(w, r, nil)
-				if err != nil {
-					return
-				}
-				connections.Add(1)
-				go func() {
-					defer conn.Close()
-					for {
-						if _, _, err := conn.ReadMessage(); err != nil {
-							return
-						}
-					}
-				}()
-			}))
+			server := newCodexRealtimeCountingServer(t, &connections)
 			defer server.Close()
 
 			sessionID := fmt.Sprintf("managed-request-header-session-%s", testCase.name)
@@ -992,22 +1026,7 @@ func TestCodexManagedRealtimeRejectsExecutionSessionReuseAcrossDifferentRequestH
 
 func TestCodexManagedRealtimeRejectsExecutionSessionReuseAcrossDifferentLegacyUserAgentsWithinSameChannel(t *testing.T) {
 	var connections atomic.Int32
-	upgrader := websocket.Upgrader{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		connections.Add(1)
-		go func() {
-			defer conn.Close()
-			for {
-				if _, _, err := conn.ReadMessage(); err != nil {
-					return
-				}
-			}
-		}()
-	}))
+	server := newCodexRealtimeCountingServer(t, &connections)
 	defer server.Close()
 
 	optionsA := `{"user_agent":"legacy-codex-ua-a"}`
@@ -1058,24 +1077,9 @@ func TestCodexManagedRealtimeRejectsExecutionSessionReuseAcrossDifferentLegacyUs
 func TestCodexManagedRealtimeRejectsExecutionSessionReuseAcrossDifferentBaseURLs(t *testing.T) {
 	var connectionsA atomic.Int32
 	var connectionsB atomic.Int32
-	upgrader := websocket.Upgrader{}
 
 	newServer := func(counter *atomic.Int32) *httptest.Server {
-		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			conn, err := upgrader.Upgrade(w, r, nil)
-			if err != nil {
-				return
-			}
-			counter.Add(1)
-			go func() {
-				defer conn.Close()
-				for {
-					if _, _, err := conn.ReadMessage(); err != nil {
-						return
-					}
-				}
-			}()
-		}))
+		return newCodexRealtimeCountingServer(t, counter)
 	}
 
 	serverA := newServer(&connectionsA)
@@ -1132,22 +1136,7 @@ func TestCodexManagedRealtimeRejectsExecutionSessionReuseAcrossDifferentBaseURLs
 
 func TestCodexManagedRealtimeRejectsExecutionSessionReuseAcrossDifferentUpstreamCredentials(t *testing.T) {
 	var connections atomic.Int32
-	upgrader := websocket.Upgrader{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		connections.Add(1)
-		go func() {
-			defer conn.Close()
-			for {
-				if _, _, err := conn.ReadMessage(); err != nil {
-					return
-				}
-			}
-		}()
-	}))
+	server := newCodexRealtimeCountingServer(t, &connections)
 	defer server.Close()
 
 	providerA := newTestCodexProviderWithContext(t, `{"access_token":"access-token-a","account_id":"acct-123"}`, "", map[string]string{
@@ -1194,22 +1183,7 @@ func TestCodexManagedRealtimeRejectsExecutionSessionReuseAcrossDifferentUpstream
 
 func TestCodexManagedRealtimeReclaimsAttachedExecutionSession(t *testing.T) {
 	var connections atomic.Int32
-	upgrader := websocket.Upgrader{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		connections.Add(1)
-		go func() {
-			defer conn.Close()
-			for {
-				if _, _, err := conn.ReadMessage(); err != nil {
-					return
-				}
-			}
-		}()
-	}))
+	server := newCodexRealtimeCountingServer(t, &connections)
 	defer server.Close()
 
 	providerA := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", map[string]string{
@@ -1244,30 +1218,15 @@ func TestCodexManagedRealtimeReclaimsAttachedExecutionSession(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	_, _, _, _, err := sessionA.Recv(ctx)
+	_, _, _, _, err := codexTestRecv(ctx, sessionA)
 	if !errors.Is(err, runtimesession.ErrSessionClosed) {
 		t.Fatalf("expected reclaimed attachment to close the stale session, got %v", err)
 	}
 }
 
-func TestCodexManagedRealtimeReusesExecutionSessionAcrossNormalizedModelAliases(t *testing.T) {
+func TestCodexManagedRealtimeDetachClosesAliasedSessionBeforeReopen(t *testing.T) {
 	var connections atomic.Int32
-	upgrader := websocket.Upgrader{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		connections.Add(1)
-		go func() {
-			defer conn.Close()
-			for {
-				if _, _, err := conn.ReadMessage(); err != nil {
-					return
-				}
-			}
-		}()
-	}))
+	server := newCodexRealtimeCountingServer(t, &connections)
 	defer server.Close()
 
 	providerA := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", map[string]string{
@@ -1294,26 +1253,21 @@ func TestCodexManagedRealtimeReusesExecutionSessionAcrossNormalizedModelAliases(
 	}
 	defer sessionB.Detach("test_detach")
 
-	waitForAtomicCount(t, &connections, 1, 2*time.Second, "expected websocket dial to be reused across normalized model aliases")
-	if got := connections.Load(); got != 1 {
-		t.Fatalf("expected websocket dial to be reused across normalized model aliases, got %d upstream connections", got)
+	waitForAtomicCount(t, &connections, 2, 2*time.Second, "expected detach to close upstream before normalized alias reopen")
+	if got := connections.Load(); got != 2 {
+		t.Fatalf("expected detach to force a fresh upstream connection across normalized aliases, got %d", got)
 	}
 
 	cleanupCodexManagedSession(t, providerB, "gpt-5")
 }
 
 func TestCodexManagedRealtimeWebsocketNormalizesCodexRequestBeforeDispatch(t *testing.T) {
-	upgrader := websocket.Upgrader{}
 	eventCh := make(chan map[string]any, 1)
 	errCh := make(chan error, 1)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			select {
-			case errCh <- err:
-			default:
-			}
+		conn, ok := acceptCodexRealtimeTestConn(t, w, r)
+		if !ok {
 			return
 		}
 		defer conn.Close()
@@ -1363,7 +1317,7 @@ func TestCodexManagedRealtimeWebsocketNormalizesCodexRequestBeforeDispatch(t *te
 	defer cleanupCodexManagedSession(t, provider, "gpt-5-mini")
 
 	createEvent := []byte(`{"type":"response.create","event_id":"evt_normalize","model":"gpt-5-mini","input":"hello","include":"output_text.annotations","temperature":0.2,"top_p":0.9,"truncation":"auto","context_management":{"mode":"manual"},"tools":[{"type":"web_search_preview"}],"tool_choice":{"type":"web_search_preview_2025_03_11"}}`)
-	if err := session.SendClient(context.Background(), websocket.TextMessage, createEvent); err != nil {
+	if err := session.SendClient(context.Background(), codexTestTextFrame(createEvent)); err != nil {
 		t.Fatalf("expected websocket dispatch to succeed, got %v", err)
 	}
 
@@ -1428,7 +1382,7 @@ func TestCodexManagedRealtimeFallsBackToHTTPBridgeInAutoMode(t *testing.T) {
 	requester.InitHttpClient()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if websocket.IsWebSocketUpgrade(r) {
+		if wsconn.IsUpgrade(r) {
 			http.Error(w, "websocket disabled", http.StatusBadRequest)
 			return
 		}
@@ -1459,14 +1413,14 @@ func TestCodexManagedRealtimeFallsBackToHTTPBridgeInAutoMode(t *testing.T) {
 	defer cleanupCodexManagedSession(t, provider, "gpt-5")
 
 	createEvent := []byte(`{"type":"response.create","event_id":"evt_bridge","model":"gpt-5","input":"hello"}`)
-	if err := session.SendClient(context.Background(), websocket.TextMessage, createEvent); err != nil {
+	if err := session.SendClient(context.Background(), codexTestTextFrame(createEvent)); err != nil {
 		t.Fatalf("expected bridge dispatch to succeed, got %v", err)
 	}
 
 	var usage *types.UsageEvent
 	var completed bool
 	for i := 0; i < 2; i++ {
-		_, payload, eventUsage, _, err := session.Recv(context.Background())
+		_, payload, eventUsage, _, err := codexTestRecv(context.Background(), session)
 		if err != nil {
 			t.Fatalf("expected bridge event, got %v", err)
 		}
@@ -1512,22 +1466,7 @@ func TestCodexManagedRealtimeFailedInitialOpenDoesNotLeaveStaleBinding(t *testin
 	defer failedServer.Close()
 
 	var successfulConnections atomic.Int32
-	upgrader := websocket.Upgrader{}
-	successServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		successfulConnections.Add(1)
-		go func() {
-			defer conn.Close()
-			for {
-				if _, _, err := conn.ReadMessage(); err != nil {
-					return
-				}
-			}
-		}()
-	}))
+	successServer := newCodexRealtimeCountingServer(t, &successfulConnections)
 	defer successServer.Close()
 
 	providerA := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"force"}`, map[string]string{
@@ -1737,22 +1676,7 @@ func TestCodexRealtimeForceFreshReleasesPerCallerCapacity(t *testing.T) {
 
 func TestCodexManagedRealtimeAutoModePropagatesRealtimeHeaderErrors(t *testing.T) {
 	var connections atomic.Int32
-	upgrader := websocket.Upgrader{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		connections.Add(1)
-		go func() {
-			defer conn.Close()
-			for {
-				if _, _, err := conn.ReadMessage(); err != nil {
-					return
-				}
-			}
-		}()
-	}))
+	server := newCodexRealtimeCountingServer(t, &connections)
 	defer server.Close()
 
 	provider := newTestCodexProviderWithContext(t, `{"account_id":"acct-123"}`, `{"websocket_mode":"auto"}`, map[string]string{
@@ -1780,22 +1704,7 @@ func TestCodexManagedRealtimeAutoModePropagatesRealtimeHeaderErrors(t *testing.T
 
 func TestCodexManagedRealtimeForceModeBypassesBridgeCooldown(t *testing.T) {
 	var connections atomic.Int32
-	upgrader := websocket.Upgrader{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		connections.Add(1)
-		go func() {
-			defer conn.Close()
-			for {
-				if _, _, err := conn.ReadMessage(); err != nil {
-					return
-				}
-			}
-		}()
-	}))
+	server := newCodexRealtimeCountingServer(t, &connections)
 	defer server.Close()
 
 	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"force"}`, map[string]string{
@@ -1813,7 +1722,7 @@ func TestCodexManagedRealtimeForceModeBypassesBridgeCooldown(t *testing.T) {
 		Protocol:  codexRealtimeProtocolName,
 	})
 
-	var wsConn *websocket.Conn
+	var wsConn *wsconn.ManagedConn
 	exec.Lock()
 	state := getCodexManagedRuntimeStateLocked(exec)
 	exec.Transport = runtimesession.TransportModeResponsesHTTPBridge
@@ -1839,7 +1748,7 @@ func TestCodexManagedRealtimeForceModeBypassesBridgeCooldown(t *testing.T) {
 	exec.Unlock()
 
 	if wsConn != nil {
-		_ = wsConn.Close()
+		wsConn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_cleanup"})
 	}
 	waitForAtomicCount(t, &connections, 1, 2*time.Second, "expected force mode to redial websocket during cooldown")
 }
@@ -1875,11 +1784,11 @@ func TestCodexManagedRealtimeRejectsConcurrentResponseCreate(t *testing.T) {
 	defer cleanupCodexManagedSession(t, provider, "gpt-5")
 
 	createEvent := []byte(`{"type":"response.create","event_id":"evt_busy","model":"gpt-5","input":"hello"}`)
-	if err := session.SendClient(context.Background(), websocket.TextMessage, createEvent); err != nil {
+	if err := session.SendClient(context.Background(), codexTestTextFrame(createEvent)); err != nil {
 		t.Fatalf("expected first response.create to succeed, got %v", err)
 	}
 
-	err := session.SendClient(context.Background(), websocket.TextMessage, createEvent)
+	err := session.SendClient(context.Background(), codexTestTextFrame(createEvent))
 	if err == nil {
 		t.Fatalf("expected second inflight response.create to fail")
 	}
@@ -1889,19 +1798,18 @@ func TestCodexManagedRealtimeRejectsConcurrentResponseCreate(t *testing.T) {
 }
 
 func TestCodexManagedRealtimeReconnectRejectsWebsocketModeMismatch(t *testing.T) {
-	upgrader := websocket.Upgrader{}
-	connReady := make(chan *websocket.Conn, 1)
+	connReady := make(chan *codexRealtimeTestConn, 1)
 	connClosed := make(chan struct{}, 1)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
+		conn, ok := acceptCodexRealtimeTestConn(t, w, r)
+		if !ok {
 			return
 		}
 		select {
 		case connReady <- conn:
 		default:
-			_ = conn.Close()
+			conn.Close()
 			return
 		}
 
@@ -1936,13 +1844,14 @@ func TestCodexManagedRealtimeReconnectRejectsWebsocketModeMismatch(t *testing.T)
 	}
 	defer managedA.Abort("test_cleanup_a")
 	defer cleanupCodexManagedSession(t, providerA, "gpt-5")
-	sessionA.Detach("test_detach")
 
+	var firstConn *codexRealtimeTestConn
 	select {
-	case <-connReady:
+	case firstConn = <-connReady:
 	case <-time.After(2 * time.Second):
 		t.Fatalf("timed out waiting for upstream websocket connection")
 	}
+	sessionA.Detach("test_detach")
 
 	providerB := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, map[string]string{
 		"X-Session-Id": "managed-ws-off-session",
@@ -1968,8 +1877,11 @@ func TestCodexManagedRealtimeReconnectRejectsWebsocketModeMismatch(t *testing.T)
 
 	select {
 	case <-connClosed:
-		t.Fatalf("expected incompatible reconnect to preserve the original upstream websocket")
-	case <-time.After(300 * time.Millisecond):
+	case <-time.After(2 * time.Second):
+		t.Fatalf("expected Detach to close the original upstream websocket")
+	}
+	if info := firstConn.conn.CloseInfo(); info.Kind != wsconn.CloseKindPeerClose || info.Code != wsconn.CloseNormalClosure || info.Reason != "test_detach" {
+		t.Fatalf("expected upstream peer close 1000 from Detach, got %+v", info)
 	}
 }
 
@@ -2010,7 +1922,7 @@ func TestCodexManagedRealtimeBridgeCancelEnqueuesCancelledEvent(t *testing.T) {
 		ownerSeq:   ownerSeq,
 	}
 
-	if err := session.SendClient(context.Background(), websocket.TextMessage, []byte(`{"type":"response.cancel","event_id":"evt_cancel"}`)); err != nil {
+	if err := session.SendClient(context.Background(), codexTestTextFrame([]byte(`{"type":"response.cancel","event_id":"evt_cancel"}`))); err != nil {
 		t.Fatalf("expected bridge cancel to succeed, got %v", err)
 	}
 
@@ -2020,7 +1932,7 @@ func TestCodexManagedRealtimeBridgeCancelEnqueuesCancelledEvent(t *testing.T) {
 		t.Fatalf("timed out waiting for bridge stream close")
 	}
 
-	_, payload, usage, _, err := session.Recv(context.Background())
+	_, payload, usage, _, err := codexTestRecv(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected cancelled event after bridge cancel, got %v", err)
 	}
@@ -2048,11 +1960,10 @@ func TestCodexManagedRealtimeBridgeCancelEnqueuesCancelledEvent(t *testing.T) {
 func TestCodexManagedRealtimeKeepsWebsocketAfterProviderErrorFrame(t *testing.T) {
 	var connections atomic.Int32
 	secondRequestOnFirstConn := make(chan struct{}, 1)
-	upgrader := websocket.Upgrader{}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
+		conn, ok := acceptCodexRealtimeTestConn(t, w, r)
+		if !ok {
 			return
 		}
 		defer conn.Close()
@@ -2064,7 +1975,7 @@ func TestCodexManagedRealtimeKeepsWebsocketAfterProviderErrorFrame(t *testing.T)
 		}
 
 		if connectionID == 1 {
-			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","code":"upstream_failed","message":"upstream failed"}`)); err != nil {
+			if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"error","code":"upstream_failed","message":"upstream failed"}`)); err != nil {
 				return
 			}
 			if _, _, err := conn.ReadMessage(); err != nil {
@@ -2074,11 +1985,11 @@ func TestCodexManagedRealtimeKeepsWebsocketAfterProviderErrorFrame(t *testing.T)
 			case secondRequestOnFirstConn <- struct{}{}:
 			default:
 			}
-			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_recovered","status":"completed"}}`)); err != nil {
+			if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_recovered","status":"completed"}}`)); err != nil {
 				return
 			}
 		} else {
-			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_recovered","status":"completed"}}`)); err != nil {
+			if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_recovered","status":"completed"}}`)); err != nil {
 				return
 			}
 		}
@@ -2101,11 +2012,11 @@ func TestCodexManagedRealtimeKeepsWebsocketAfterProviderErrorFrame(t *testing.T)
 	defer cleanupCodexManagedSession(t, provider, "gpt-5")
 
 	createEvent := []byte(`{"type":"response.create","event_id":"evt_error","model":"gpt-5","input":"hello"}`)
-	if err := session.SendClient(context.Background(), websocket.TextMessage, createEvent); err != nil {
+	if err := session.SendClient(context.Background(), codexTestTextFrame(createEvent)); err != nil {
 		t.Fatalf("expected first websocket dispatch to succeed, got %v", err)
 	}
 
-	_, payload, _, _, err := session.Recv(context.Background())
+	_, payload, _, _, err := codexTestRecv(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected provider error event after first dispatch, got %v", err)
 	}
@@ -2113,7 +2024,7 @@ func TestCodexManagedRealtimeKeepsWebsocketAfterProviderErrorFrame(t *testing.T)
 		t.Fatalf("expected provider error event payload, got %q", got)
 	}
 
-	if err := session.SendClient(context.Background(), websocket.TextMessage, createEvent); err != nil {
+	if err := session.SendClient(context.Background(), codexTestTextFrame(createEvent)); err != nil {
 		t.Fatalf("expected second websocket dispatch to reuse the open provider websocket, got %v", err)
 	}
 
@@ -2123,7 +2034,7 @@ func TestCodexManagedRealtimeKeepsWebsocketAfterProviderErrorFrame(t *testing.T)
 		t.Fatalf("expected provider error frame not to close the upstream websocket")
 	}
 
-	_, payload, _, _, err = session.Recv(context.Background())
+	_, payload, _, _, err = codexTestRecv(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected response from reused websocket, got %v", err)
 	}
@@ -2135,11 +2046,10 @@ func TestCodexManagedRealtimeKeepsWebsocketAfterProviderErrorFrame(t *testing.T)
 	}
 }
 
-func TestCodexManagedRealtimeReconnectReceivesInflightWebsocketResponse(t *testing.T) {
+func TestCodexManagedRealtimeDetachClosesInflightWebsocket(t *testing.T) {
 	var connections atomic.Int32
 	createSeen := make(chan struct{}, 1)
 	allowComplete := make(chan struct{}, 1)
-	upgrader := websocket.Upgrader{}
 
 	defer func() {
 		select {
@@ -2149,8 +2059,8 @@ func TestCodexManagedRealtimeReconnectReceivesInflightWebsocketResponse(t *testi
 	}()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
+		conn, ok := acceptCodexRealtimeTestConn(t, w, r)
+		if !ok {
 			return
 		}
 		connections.Add(1)
@@ -2172,7 +2082,7 @@ func TestCodexManagedRealtimeReconnectReceivesInflightWebsocketResponse(t *testi
 			}
 
 			<-allowComplete
-			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_after_reattach","status":"completed"}}`))
+			_ = conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_after_reattach","status":"completed"}}`))
 
 			for {
 				if _, _, err := conn.ReadMessage(); err != nil {
@@ -2195,7 +2105,7 @@ func TestCodexManagedRealtimeReconnectReceivesInflightWebsocketResponse(t *testi
 	}
 
 	createEvent := []byte(`{"type":"response.create","event_id":"evt_inflight","model":"gpt-5","input":"hello"}`)
-	if err := sessionA.SendClient(context.Background(), websocket.TextMessage, createEvent); err != nil {
+	if err := sessionA.SendClient(context.Background(), codexTestTextFrame(createEvent)); err != nil {
 		t.Fatalf("expected websocket dispatch to succeed, got %v", err)
 	}
 
@@ -2209,39 +2119,14 @@ func TestCodexManagedRealtimeReconnectReceivesInflightWebsocketResponse(t *testi
 
 	ctxClosed, cancelClosed := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancelClosed()
-	_, _, _, _, err := sessionA.Recv(ctxClosed)
+	_, _, _, _, err := codexTestRecv(ctxClosed, sessionA)
 	if !errors.Is(err, runtimesession.ErrSessionClosed) {
 		t.Fatalf("expected detached websocket session to close locally, got %v", err)
 	}
 
-	providerB := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"force"}`, map[string]string{
-		"X-Session-Id": "managed-ws-reattach-session",
-	})
-	providerB.Context.Set("token_id", 110)
-	providerB.Channel.BaseURL = stringPtr(server.URL)
-
-	sessionB, errWithCode := providerB.OpenRealtimeSession("gpt-5")
-	if errWithCode != nil {
-		t.Fatalf("expected reconnect during inflight websocket turn to succeed, got %v", errWithCode)
-	}
-	defer sessionB.Detach("test_close")
-	defer cleanupCodexManagedSession(t, providerB, "gpt-5")
-
 	allowComplete <- struct{}{}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	_, payload, _, _, err := sessionB.Recv(ctx)
-	if err != nil {
-		t.Fatalf("expected reattached session to receive inflight websocket response, got %v", err)
-	}
-	if got := string(payload); !containsAll(got, "response.completed", "resp_after_reattach") {
-		t.Fatalf("expected completed event after websocket reattach, got %q", got)
-	}
-	waitForAtomicCount(t, &connections, 1, 2*time.Second, "expected inflight websocket reconnect to reuse upstream connection")
 	if got := connections.Load(); got != 1 {
-		t.Fatalf("expected inflight websocket reconnect to reuse upstream connection, got %d connections", got)
+		t.Fatalf("expected Detach to close the original inflight websocket without opening a replacement, got %d connections", got)
 	}
 }
 
@@ -2273,7 +2158,7 @@ func TestCodexRealtimeErrorFromOpenAIErrorFallsBackWhenCodeIsNil(t *testing.T) {
 func TestCodexManagedRealtimeRecvPrefersBufferedFramesAfterAttachmentClose(t *testing.T) {
 	attachment := newCodexAttachment()
 	if ok := enqueueCodexOutbound(attachment, codexRealtimeOutbound{
-		messageType: websocket.TextMessage,
+		messageType: wsconn.TextMessage,
 		payload:     []byte(`{"type":"response.completed"}`),
 	}); !ok {
 		t.Fatal("expected outbound frame to enqueue before attachment close")
@@ -2281,11 +2166,11 @@ func TestCodexManagedRealtimeRecvPrefersBufferedFramesAfterAttachmentClose(t *te
 	attachment.close()
 
 	session := &codexManagedRealtimeSession{attachment: attachment}
-	messageType, payload, usage, _, err := session.Recv(context.Background())
+	messageType, payload, usage, _, err := codexTestRecv(context.Background(), session)
 	if err != nil {
 		t.Fatalf("expected buffered outbound to survive attachment close, got %v", err)
 	}
-	if messageType != websocket.TextMessage {
+	if messageType != wsconn.TextMessage {
 		t.Fatalf("expected buffered websocket text payload, got %d", messageType)
 	}
 	if got := string(payload); got != `{"type":"response.completed"}` {
@@ -2295,7 +2180,7 @@ func TestCodexManagedRealtimeRecvPrefersBufferedFramesAfterAttachmentClose(t *te
 		t.Fatalf("expected buffered payload not to invent usage, got %+v", usage)
 	}
 
-	_, payload, usage, _, err = session.Recv(context.Background())
+	_, payload, usage, _, err = codexTestRecv(context.Background(), session)
 	if !errors.Is(err, runtimesession.ErrSessionClosed) {
 		t.Fatalf("expected closed attachment to stop Recv after buffered outbound is drained, got %v", err)
 	}
@@ -2313,7 +2198,7 @@ func TestEnqueueCodexOutboundRejectsClosedAttachment(t *testing.T) {
 
 	for attempt := 0; attempt < 64; attempt++ {
 		if ok := enqueueCodexOutbound(attachment, codexRealtimeOutbound{
-			messageType: websocket.TextMessage,
+			messageType: wsconn.TextMessage,
 			payload:     []byte(`{"type":"response.completed"}`),
 		}); ok {
 			t.Fatalf("expected closed attachment to reject outbound enqueue on attempt %d", attempt+1)
@@ -2335,7 +2220,7 @@ func TestEnqueueCodexOutboundClosesAttachmentWhenBackpressured(t *testing.T) {
 
 	attachment := newCodexAttachmentWithCapacity(1)
 	if ok := enqueueCodexOutbound(attachment, codexRealtimeOutbound{
-		messageType: websocket.TextMessage,
+		messageType: wsconn.TextMessage,
 		payload:     []byte(`{"type":"response.created"}`),
 	}); !ok {
 		t.Fatal("expected first outbound enqueue to succeed")
@@ -2343,7 +2228,7 @@ func TestEnqueueCodexOutboundClosesAttachmentWhenBackpressured(t *testing.T) {
 
 	startedAt := time.Now()
 	if ok := enqueueCodexOutbound(attachment, codexRealtimeOutbound{
-		messageType: websocket.TextMessage,
+		messageType: wsconn.TextMessage,
 		payload:     []byte(`{"type":"response.completed"}`),
 	}); ok {
 		t.Fatal("expected backpressured outbound enqueue to fail")
@@ -2355,7 +2240,7 @@ func TestEnqueueCodexOutboundClosesAttachmentWhenBackpressured(t *testing.T) {
 	waitForCodexAttachmentClosed(t, attachment, time.Second)
 
 	if ok := enqueueCodexOutbound(attachment, codexRealtimeOutbound{
-		messageType: websocket.TextMessage,
+		messageType: wsconn.TextMessage,
 		payload:     []byte(`{"type":"response.failed"}`),
 	}); ok {
 		t.Fatal("expected closed attachment to reject subsequent outbound frames")
@@ -2683,7 +2568,7 @@ func TestPumpRealtimeHTTPBridgeIgnoresNonTerminalUsageSnapshots(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	_, payload, usage, _, err := session.Recv(ctx)
+	_, payload, usage, _, err := codexTestRecv(ctx, session)
 	if err != nil {
 		t.Fatalf("expected first bridge payload, got %v", err)
 	}
@@ -2694,7 +2579,7 @@ func TestPumpRealtimeHTTPBridgeIgnoresNonTerminalUsageSnapshots(t *testing.T) {
 		t.Fatalf("expected non-terminal bridge usage snapshot to be ignored, got %+v", usage)
 	}
 
-	_, payload, usage, _, err = session.Recv(ctx)
+	_, payload, usage, _, err = codexTestRecv(ctx, session)
 	if err != nil {
 		t.Fatalf("expected terminal bridge payload, got %v", err)
 	}
@@ -2747,7 +2632,7 @@ func TestPumpRealtimeHTTPBridgeBackpressureCleansBusySession(t *testing.T) {
 		Protocol:  codexRealtimeProtocolName,
 	})
 	attachment := newCodexAttachmentWithCapacity(1)
-	if !enqueueCodexOutbound(attachment, codexRealtimeOutbound{messageType: websocket.TextMessage, payload: []byte(`{"type":"response.created"}`)}) {
+	if !enqueueCodexOutbound(attachment, codexRealtimeOutbound{messageType: wsconn.TextMessage, payload: []byte(`{"type":"response.created"}`)}) {
 		t.Fatal("expected initial outbound fill to succeed")
 	}
 	recorder := &recordingTurnObserver{}
@@ -2842,11 +2727,11 @@ func TestPumpRealtimeHTTPBridgePropagatesTurnUsageObserverErrors(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	messageType, payload, usage, _, err := session.Recv(ctx)
-	if err == nil {
-		t.Fatal("expected turn usage observer error to reach the managed session")
+	messageType, payload, usage, _, err := codexTestRecv(ctx, session)
+	if err != nil {
+		t.Fatalf("expected original bridge payload before turn usage observer error, got %v", err)
 	}
-	if messageType != websocket.TextMessage {
+	if messageType != wsconn.TextMessage {
 		t.Fatalf("expected websocket text payload, got %d", messageType)
 	}
 	if got := string(payload); !containsAll(got, "response.completed", "resp_quota") {
@@ -2854,6 +2739,13 @@ func TestPumpRealtimeHTTPBridgePropagatesTurnUsageObserverErrors(t *testing.T) {
 	}
 	if usage == nil || usage.TotalTokens != 8 {
 		t.Fatalf("expected bridge usage to remain attached to the forwarded payload, got %+v", usage)
+	}
+	_, _, usage, _, err = codexTestRecv(ctx, session)
+	if err == nil {
+		t.Fatal("expected turn usage observer error to reach the managed session after terminal payload")
+	}
+	if usage != nil {
+		t.Fatalf("expected observer error event not to carry usage, got %+v", usage)
 	}
 	if got := err.Error(); !containsAll(got, "system_error", "user quota is not enough") {
 		t.Fatalf("expected quota exhaustion error payload, got %q", got)
@@ -2965,7 +2857,7 @@ func TestPumpRealtimeHTTPBridgeBackfillsMissingTerminalUsage(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	_, payload, usage, _, err := session.Recv(ctx)
+	_, payload, usage, _, err := codexTestRecv(ctx, session)
 	if err != nil {
 		t.Fatalf("expected terminal bridge payload, got %v", err)
 	}
@@ -2995,10 +2887,9 @@ func TestPumpRealtimeHTTPBridgeBackfillsMissingTerminalUsage(t *testing.T) {
 }
 
 func TestCodexManagedRealtimeWebsocketCarriesUsageOnFailedTerminalEvent(t *testing.T) {
-	upgrader := websocket.Upgrader{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
+		conn, ok := acceptCodexRealtimeTestConn(t, w, r)
+		if !ok {
 			return
 		}
 		defer conn.Close()
@@ -3007,7 +2898,7 @@ func TestCodexManagedRealtimeWebsocketCarriesUsageOnFailedTerminalEvent(t *testi
 			return
 		}
 
-		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.failed","response":{"id":"resp_failed","status":"failed","usage":{"input_tokens":3,"output_tokens":0,"total_tokens":3}}}`))
+		_ = conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.failed","response":{"id":"resp_failed","status":"failed","usage":{"input_tokens":3,"output_tokens":0,"total_tokens":3}}}`))
 	}))
 	defer server.Close()
 
@@ -3028,14 +2919,14 @@ func TestCodexManagedRealtimeWebsocketCarriesUsageOnFailedTerminalEvent(t *testi
 	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return recorder })
 
 	createEvent := []byte(`{"type":"response.create","event_id":"evt_failed","model":"gpt-5","input":"hello"}`)
-	if err := session.SendClient(context.Background(), websocket.TextMessage, createEvent); err != nil {
+	if err := session.SendClient(context.Background(), codexTestTextFrame(createEvent)); err != nil {
 		t.Fatalf("expected websocket dispatch to succeed, got %v", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	_, payload, usage, _, err := session.Recv(ctx)
+	_, payload, usage, _, err := codexTestRecv(ctx, session)
 	if err != nil {
 		t.Fatalf("expected failed terminal payload, got %v", err)
 	}
@@ -3076,10 +2967,9 @@ func TestCodexManagedRealtimeWebsocketBackfillsMissingTerminalUsage(t *testing.T
 		config.DisableTokenEncoders = originalDisable
 	})
 
-	upgrader := websocket.Upgrader{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
+		conn, ok := acceptCodexRealtimeTestConn(t, w, r)
+		if !ok {
 			return
 		}
 		defer conn.Close()
@@ -3088,7 +2978,7 @@ func TestCodexManagedRealtimeWebsocketBackfillsMissingTerminalUsage(t *testing.T
 			return
 		}
 
-		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_backfilled","status":"completed","tools":[{"type":"web_search_preview","search_context_size":"high"}],"output":[{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"hello from websocket"}]},{"id":"ws_1","type":"web_search_call","status":"completed"}]}}`))
+		_ = conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_backfilled","status":"completed","tools":[{"type":"web_search_preview","search_context_size":"high"}],"output":[{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"hello from websocket"}]},{"id":"ws_1","type":"web_search_call","status":"completed"}]}}`))
 	}))
 	defer server.Close()
 
@@ -3109,14 +2999,14 @@ func TestCodexManagedRealtimeWebsocketBackfillsMissingTerminalUsage(t *testing.T
 	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return recorder })
 
 	createEvent := []byte(`{"type":"response.create","event_id":"evt_backfilled","model":"gpt-5","input":"hello"}`)
-	if err := session.SendClient(context.Background(), websocket.TextMessage, createEvent); err != nil {
+	if err := session.SendClient(context.Background(), codexTestTextFrame(createEvent)); err != nil {
 		t.Fatalf("expected websocket dispatch to succeed, got %v", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	_, payload, usage, _, err := session.Recv(ctx)
+	_, payload, usage, _, err := codexTestRecv(ctx, session)
 	if err != nil {
 		t.Fatalf("expected completed terminal payload, got %v", err)
 	}
@@ -3272,10 +3162,9 @@ func TestPumpRealtimeHTTPBridgeReportsEOFBeforeTerminalEvent(t *testing.T) {
 }
 
 func TestCodexManagedRealtimeWebsocketDuplicateTerminalEventsDoNotDoubleBill(t *testing.T) {
-	upgrader := websocket.Upgrader{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
+		conn, ok := acceptCodexRealtimeTestConn(t, w, r)
+		if !ok {
 			return
 		}
 		defer conn.Close()
@@ -3284,8 +3173,8 @@ func TestCodexManagedRealtimeWebsocketDuplicateTerminalEventsDoNotDoubleBill(t *
 			return
 		}
 
-		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_duplicate","status":"completed","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`))
-		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_duplicate","status":"completed","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`))
+		_ = conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_duplicate","status":"completed","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`))
+		_ = conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_duplicate","status":"completed","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`))
 	}))
 	defer server.Close()
 
@@ -3306,7 +3195,7 @@ func TestCodexManagedRealtimeWebsocketDuplicateTerminalEventsDoNotDoubleBill(t *
 	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return recorder })
 
 	createEvent := []byte(`{"type":"response.create","event_id":"evt_duplicate","model":"gpt-5","input":"hello"}`)
-	if err := session.SendClient(context.Background(), websocket.TextMessage, createEvent); err != nil {
+	if err := session.SendClient(context.Background(), codexTestTextFrame(createEvent)); err != nil {
 		t.Fatalf("expected websocket dispatch to succeed, got %v", err)
 	}
 
@@ -3314,7 +3203,7 @@ func TestCodexManagedRealtimeWebsocketDuplicateTerminalEventsDoNotDoubleBill(t *
 	defer cancel()
 
 	for _, want := range []string{"response.completed", "response.done"} {
-		_, payload, _, _, err := session.Recv(ctx)
+		_, payload, _, _, err := codexTestRecv(ctx, session)
 		if err != nil {
 			t.Fatalf("expected duplicate terminal payload %q, got %v", want, err)
 		}
@@ -3443,10 +3332,9 @@ func TestCodexDetachDeletesGeneratedExecutionSessionAfterInflightTurnCompletes(t
 	replaceCodexExecutionSessionsForTest(t, testManager)
 
 	allowTerminalEvent := make(chan struct{})
-	upgrader := websocket.Upgrader{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
+		conn, ok := acceptCodexRealtimeTestConn(t, w, r)
+		if !ok {
 			return
 		}
 		defer conn.Close()
@@ -3455,7 +3343,7 @@ func TestCodexDetachDeletesGeneratedExecutionSessionAfterInflightTurnCompletes(t
 			return
 		}
 		<-allowTerminalEvent
-		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_detached_terminal","status":"completed","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`))
+		_ = conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_detached_terminal","status":"completed","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`))
 	}))
 	defer server.Close()
 
@@ -3481,7 +3369,7 @@ func TestCodexDetachDeletesGeneratedExecutionSessionAfterInflightTurnCompletes(t
 	}
 
 	createEvent := []byte(`{"type":"response.create","event_id":"evt_detached_terminal","model":"gpt-5","input":"hello"}`)
-	if err := session.SendClient(context.Background(), websocket.TextMessage, createEvent); err != nil {
+	if err := session.SendClient(context.Background(), codexTestTextFrame(createEvent)); err != nil {
 		t.Fatalf("expected websocket dispatch to succeed, got %v", err)
 	}
 

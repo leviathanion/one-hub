@@ -6,18 +6,19 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/logger"
 	"one-api/common/requester"
 	"one-api/common/responsesws"
+	"one-api/common/wsconn"
 	"one-api/types"
-
-	"github.com/gorilla/websocket"
 )
 
 const codexResponsesWebsocketBetaHeaderValue = "responses_websockets=2026-02-06"
@@ -29,11 +30,11 @@ type codexRealtimeConnPlan struct {
 	headers map[string]string
 }
 
-func (p *CodexProvider) createChatRealtimeConn(modelName, sessionID string) (*websocket.Conn, *types.OpenAIErrorWithStatusCode) {
+func (p *CodexProvider) createChatRealtimeConn(modelName, sessionID string) (*wsconn.ManagedConn, *types.OpenAIErrorWithStatusCode) {
 	return p.createChatRealtimeConnWithContext(context.Background(), modelName, sessionID)
 }
 
-func (p *CodexProvider) createChatRealtimeConnWithContext(ctx context.Context, modelName, sessionID string) (*websocket.Conn, *types.OpenAIErrorWithStatusCode) {
+func (p *CodexProvider) createChatRealtimeConnWithContext(ctx context.Context, modelName, sessionID string) (*wsconn.ManagedConn, *types.OpenAIErrorWithStatusCode) {
 	plan, errWithCode := p.prepareChatRealtimeConn(modelName, sessionID)
 	if errWithCode != nil {
 		return nil, errWithCode
@@ -65,17 +66,16 @@ func (p *CodexProvider) prepareChatRealtimeConn(modelName, sessionID string) (*c
 	}, nil
 }
 
-func (p *CodexProvider) dialChatRealtimeConn(plan *codexRealtimeConnPlan) (*websocket.Conn, *types.OpenAIErrorWithStatusCode) {
+func (p *CodexProvider) dialChatRealtimeConn(plan *codexRealtimeConnPlan) (*wsconn.ManagedConn, *types.OpenAIErrorWithStatusCode) {
 	return p.dialChatRealtimeConnWithContext(context.Background(), plan)
 }
 
-func (p *CodexProvider) dialChatRealtimeConnWithContext(ctx context.Context, plan *codexRealtimeConnPlan) (*websocket.Conn, *types.OpenAIErrorWithStatusCode) {
+func (p *CodexProvider) dialChatRealtimeConnWithContext(ctx context.Context, plan *codexRealtimeConnPlan) (*wsconn.ManagedConn, *types.OpenAIErrorWithStatusCode) {
 	if plan == nil {
 		return nil, common.StringErrorWrapperLocal("realtime websocket plan is required", "ws_request_failed", http.StatusInternalServerError)
 	}
 
-	wsRequester := requester.NewWSRequester(channelProxyValue(p.Channel))
-	wsConn, err := wsRequester.NewRequestContext(ctx, plan.wsURL, wsRequester.WithHeader(plan.headers))
+	wsConn, err := wsconn.DialManaged(ctx, plan.wsURL, codexRealtimeHTTPHeader(plan.headers), codexRealtimeWSConfig(), codexRealtimeDialOptions(channelProxyValue(p.Channel), p.codexRealtimeSelfHosted())...)
 	if err != nil {
 		return nil, mapCodexRealtimeWSDialError(err)
 	}
@@ -83,22 +83,69 @@ func (p *CodexProvider) dialChatRealtimeConnWithContext(ctx context.Context, pla
 	return wsConn, nil
 }
 
+func codexRealtimeHTTPHeader(headers map[string]string) http.Header {
+	httpHeaders := make(http.Header, len(headers))
+	for key, value := range headers {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		httpHeaders.Set(key, value)
+	}
+	return httpHeaders
+}
+
+func codexRealtimeWSConfig() wsconn.Config {
+	return wsconn.Config{
+		Label:           "codex realtime upstream",
+		PingInterval:    config.RealtimeWebsocketPingInterval(),
+		PongMissTimeout: config.RealtimeWebsocketClientPongMissTimeout(),
+		InboundActivityTimeout: func() time.Duration {
+			return config.RealtimeWebsocketClientInboundActivityTimeout()
+		},
+		ReadLimit:    config.RealtimeWebsocketReadLimit(),
+		WriteTimeout: config.RealtimeWebsocketWriteTimeout,
+	}
+}
+
+func codexRealtimeDialOptions(proxyAddr string, allowSelfHosted bool) []wsconn.DialOption {
+	policy := wsconn.DialSecurityPolicy{
+		AllowInsecureWS: allowSelfHosted,
+		AllowPrivateIP:  allowSelfHosted,
+	}
+	if allowSelfHosted {
+		policy.HostFilter = func(host string, ips []net.IP) bool {
+			return true
+		}
+	}
+	options := []wsconn.DialOption{wsconn.WithDialSecurityPolicy(policy)}
+	if strings.TrimSpace(proxyAddr) != "" {
+		options = append(options, wsconn.WithProxyURL(proxyAddr))
+	}
+	return options
+}
+
 func mapCodexRealtimeWSDialError(err error) *types.OpenAIErrorWithStatusCode {
 	logCodexRealtimeWSDialFailure(err)
 
-	var handshake *requester.WSDialHandshakeError
-	if errors.As(err, &handshake) && handshake != nil {
-		switch handshake.StatusCode {
-		case http.StatusNotFound, http.StatusUpgradeRequired:
-			return common.StringErrorWrapperLocal("channel does not support Responses websocket transport", "responses_ws_unsupported_for_channel", http.StatusUpgradeRequired)
-		case http.StatusUnauthorized, http.StatusForbidden:
-			return common.StringErrorWrapperLocal("provider authentication failed", "provider_authentication_failed", handshake.StatusCode)
-		case http.StatusTooManyRequests:
-			return common.StringErrorWrapperLocal("provider rate limit exceeded", "provider_rate_limit_exceeded", http.StatusTooManyRequests)
-		default:
-			if handshake.StatusCode >= 500 {
-				return common.StringErrorWrapperLocal("provider websocket request failed", "provider_ws_request_failed", handshake.StatusCode)
-			}
+	var dialErr *wsconn.DialError
+	if errors.As(err, &dialErr) && dialErr != nil {
+		return mapCodexRealtimeWSDialStatus(dialErr.StatusCode)
+	}
+	return common.StringErrorWrapperLocal("websocket request failed", "ws_request_failed", http.StatusInternalServerError)
+}
+
+func mapCodexRealtimeWSDialStatus(statusCode int) *types.OpenAIErrorWithStatusCode {
+	switch statusCode {
+	case http.StatusNotFound, http.StatusUpgradeRequired:
+		return common.StringErrorWrapperLocal("channel does not support Responses websocket transport", "responses_ws_unsupported_for_channel", http.StatusUpgradeRequired)
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return common.StringErrorWrapperLocal("provider authentication failed", "provider_authentication_failed", statusCode)
+	case http.StatusTooManyRequests:
+		return common.StringErrorWrapperLocal("provider rate limit exceeded", "provider_rate_limit_exceeded", http.StatusTooManyRequests)
+	default:
+		if statusCode >= 500 {
+			return common.StringErrorWrapperLocal("provider websocket request failed", "provider_ws_request_failed", statusCode)
 		}
 	}
 	return common.StringErrorWrapperLocal("websocket request failed", "ws_request_failed", http.StatusInternalServerError)
@@ -117,28 +164,28 @@ func logCodexRealtimeWSDialFailure(err error) {
 }
 
 func codexRealtimeWSDialFailureLogMessage(err error) string {
-	var handshake *requester.WSDialHandshakeError
-	if !errors.As(err, &handshake) || handshake == nil {
+	var dialErr *wsconn.DialError
+	if !errors.As(err, &dialErr) || dialErr == nil {
 		return "codex realtime websocket dial failed: cause=" + codexRealtimeLogValue(err.Error())
 	}
 
-	body := codexRealtimeLogValue(string(handshake.BodySnippet))
-	if body == "" && handshake.BodyReadErr != nil {
-		body = "body_read_failed:" + codexRealtimeLogValue(handshake.BodyReadErr.Error())
+	body := codexRealtimeLogValue(string(dialErr.BodySnippet))
+	if body == "" && dialErr.BodyReadErr != nil {
+		body = "body_read_failed:" + codexRealtimeLogValue(dialErr.BodyReadErr.Error())
 	}
 	return fmt.Sprintf(
 		"codex realtime websocket dial failed: status=%d url=%s server=%s via=%s cf_ray=%s x_request_id=%s openai_request_id=%s retry_after=%s body_truncated=%v body=%s cause=%s",
-		handshake.StatusCode,
-		codexRealtimeWSURLForLog(handshake.URL),
-		codexRealtimeHeaderForLog(handshake.Header, "server"),
-		codexRealtimeHeaderForLog(handshake.Header, "via"),
-		codexRealtimeHeaderForLog(handshake.Header, "cf-ray"),
-		codexRealtimeHeaderForLog(handshake.Header, "x-request-id"),
-		codexRealtimeHeaderForLog(handshake.Header, "x-openai-request-id"),
-		codexRealtimeHeaderForLog(handshake.Header, "retry-after"),
-		handshake.BodyTruncated,
+		dialErr.StatusCode,
+		codexRealtimeWSURLForLog(dialErr.URL),
+		codexRealtimeHeaderForLog(dialErr.Header, "server"),
+		codexRealtimeHeaderForLog(dialErr.Header, "via"),
+		codexRealtimeHeaderForLog(dialErr.Header, "cf-ray"),
+		codexRealtimeHeaderForLog(dialErr.Header, "x-request-id"),
+		codexRealtimeHeaderForLog(dialErr.Header, "x-openai-request-id"),
+		codexRealtimeHeaderForLog(dialErr.Header, "retry-after"),
+		dialErr.BodyTruncated,
 		body,
-		codexRealtimeLogValue(handshake.Error()),
+		codexRealtimeLogValue(fmt.Sprint(dialErr.Err)),
 	)
 }
 
@@ -317,8 +364,8 @@ func codexRealtimeUsageEvent(response *types.OpenAIResponsesResponses, accumulat
 	return accumulator.ResolveUsageEvent(response, modelName, true)
 }
 
-func (p *CodexProvider) handleRealtimeSupplierMessage(messageType int, message []byte, accumulator *codexTurnUsageAccumulator, modelName string) (bool, *types.UsageEvent, []byte, error) {
-	if messageType != websocket.TextMessage {
+func (p *CodexProvider) handleRealtimeSupplierMessage(messageType wsconn.MessageType, message []byte, accumulator *codexTurnUsageAccumulator, modelName string) (bool, *types.UsageEvent, []byte, error) {
+	if messageType != wsconn.TextMessage {
 		return true, nil, nil, nil
 	}
 
