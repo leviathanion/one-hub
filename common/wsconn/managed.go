@@ -167,6 +167,14 @@ func (c *ManagedConn) Done() <-chan struct{} {
 	return c.done
 }
 
+// Subprotocol returns the WebSocket subprotocol negotiated during handshake.
+func (c *ManagedConn) Subprotocol() string {
+	if c == nil || c.raw == nil {
+		return ""
+	}
+	return c.raw.Subprotocol()
+}
+
 func (c *ManagedConn) CloseInfo() CloseInfo {
 	if c == nil {
 		return CloseInfo{}

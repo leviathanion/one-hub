@@ -140,6 +140,9 @@ func TestAcceptManagedResponseHeaderSubprotocolAndCompression(t *testing.T) {
 
 	select {
 	case conn := <-accepted:
+		if got := conn.Subprotocol(); got != "chosen-proto" {
+			t.Fatalf("managed subprotocol=%q, want chosen-proto", got)
+		}
 		conn.Close(CloseInfo{Kind: CloseKindAbort})
 	case <-time.After(time.Second):
 		t.Fatalf("timed out waiting for accepted conn")

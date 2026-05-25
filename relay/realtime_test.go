@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -22,7 +23,6 @@ import (
 	"one-api/types"
 
 	"github.com/gin-gonic/gin"
-	gorillawebsocket "github.com/gorilla/websocket"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 	"gorm.io/driver/sqlite"
@@ -365,22 +365,25 @@ func TestWebSocketUpgradeDoesNotEchoCredentialSubprotocol(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dialer := gorillawebsocket.Dialer{Subprotocols: tt.protocols}
-			conn, resp, err := dialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+			conn, err := wsconn.DialManaged(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http"), nil, wsconn.Config{Label: "subprotocol-client-test"},
+				wsconn.WithSubprotocols(tt.protocols...),
+				wsconn.WithDialSecurityPolicy(wsconn.DialSecurityPolicy{
+					AllowInsecureWS: true,
+					AllowPrivateIP:  true,
+					HostFilter:      func(string, []net.IP) bool { return true },
+				}),
+			)
 			if err != nil {
 				t.Fatalf("websocket dial failed: %v", err)
 			}
-			defer conn.Close()
-			if got := conn.Subprotocol(); got != tt.want {
+			defer conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort})
+
+			got := conn.Subprotocol()
+			if got != tt.want {
 				t.Fatalf("negotiated subprotocol=%q, want %q", got, tt.want)
 			}
-			if resp != nil {
-				if got := resp.Header.Get("Sec-WebSocket-Protocol"); got != tt.want {
-					t.Fatalf("response subprotocol=%q, want %q", got, tt.want)
-				}
-				if strings.Contains(resp.Header.Get("Sec-WebSocket-Protocol"), "openai-insecure-api-key.") {
-					t.Fatalf("response leaked credential subprotocol: %q", resp.Header.Get("Sec-WebSocket-Protocol"))
-				}
+			if strings.Contains(got, "openai-insecure-api-key.") {
+				t.Fatalf("negotiated credential subprotocol: %q", got)
 			}
 		})
 	}
