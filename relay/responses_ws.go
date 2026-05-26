@@ -120,7 +120,6 @@ func NewResponsesWSManagedBridge(conn *wsconn.ManagedConn, actor *ResponsesWSSes
 		writer: newResponsesWSManagedClientWriter(conn),
 		actor:  actor,
 	}
-	bridge.markClientInboundActivity(time.Now())
 	return bridge
 }
 
@@ -147,11 +146,6 @@ func responsesWSClientWSConfig() wsconn.Config {
 		ReadLimit:    config.RealtimeWebsocketReadLimit(),
 		WriteTimeout: func() time.Duration { return writeTimeout },
 	}
-}
-
-func (b *ResponsesWSIOBridge) markClientInboundActivity(now time.Time) {
-	_ = b
-	_ = now
 }
 
 func (b *ResponsesWSIOBridge) ArmProviderRecvPump(upstreamSessionGeneration string, selectedChannelID int, session runtimesession.RealtimeSession) {
@@ -1451,7 +1445,7 @@ func (a *ResponsesWSSessionActor) handleSendResult(event ResponsesWSEventSendRes
 			a.failProofConflict("responses_ws_not_sent_with_provider_evidence")
 			return
 		}
-		if isResponsesContinuationMissError(event.Err) {
+		if isProviderReportedContinuationMiss(event.Err) {
 			ClearResponsesTurnStaleBindings(attempt.Candidate, attempt.SelectedChannelID)
 		}
 		if err := attempt.RollbackBeforeLocalWriteOK("send_not_sent"); err != nil {

@@ -30,7 +30,9 @@ type codexRealtimeConnPlan struct {
 }
 
 func (p *CodexProvider) createChatRealtimeConn(modelName, sessionID string) (*wsconn.ManagedConn, *types.OpenAIErrorWithStatusCode) {
-	return p.createChatRealtimeConnWithContext(context.Background(), modelName, sessionID)
+	ctx, cancel := context.WithTimeout(context.Background(), config.ConnectTimeout())
+	defer cancel()
+	return p.createChatRealtimeConnWithContext(ctx, modelName, sessionID)
 }
 
 func (p *CodexProvider) createChatRealtimeConnWithContext(ctx context.Context, modelName, sessionID string) (*wsconn.ManagedConn, *types.OpenAIErrorWithStatusCode) {
@@ -66,7 +68,9 @@ func (p *CodexProvider) prepareChatRealtimeConn(modelName, sessionID string) (*c
 }
 
 func (p *CodexProvider) dialChatRealtimeConn(plan *codexRealtimeConnPlan) (*wsconn.ManagedConn, *types.OpenAIErrorWithStatusCode) {
-	return p.dialChatRealtimeConnWithContext(context.Background(), plan)
+	ctx, cancel := context.WithTimeout(context.Background(), config.ConnectTimeout())
+	defer cancel()
+	return p.dialChatRealtimeConnWithContext(ctx, plan)
 }
 
 func (p *CodexProvider) dialChatRealtimeConnWithContext(ctx context.Context, plan *codexRealtimeConnPlan) (*wsconn.ManagedConn, *types.OpenAIErrorWithStatusCode) {
@@ -74,12 +78,24 @@ func (p *CodexProvider) dialChatRealtimeConnWithContext(ctx context.Context, pla
 		return nil, common.StringErrorWrapperLocal("realtime websocket plan is required", "ws_request_failed", http.StatusInternalServerError)
 	}
 
-	wsConn, err := wsconn.DialManaged(ctx, plan.wsURL, codexRealtimeHTTPHeader(plan.headers), codexRealtimeWSConfig(), codexRealtimeDialOptions(channelProxyValue(p.Channel), p.codexRealtimeSelfHosted())...)
+	dialCtx, cancel := codexRealtimeDialContext(ctx)
+	defer cancel()
+	wsConn, err := wsconn.DialManaged(dialCtx, plan.wsURL, codexRealtimeHTTPHeader(plan.headers), codexRealtimeWSConfig(), codexRealtimeDialOptions(channelProxyValue(p.Channel), p.codexRealtimeSelfHosted())...)
 	if err != nil {
 		return nil, mapCodexRealtimeWSDialError(err)
 	}
 
 	return wsConn, nil
+}
+
+func codexRealtimeDialContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, config.ConnectTimeout())
 }
 
 func codexRealtimeHTTPHeader(headers map[string]string) http.Header {

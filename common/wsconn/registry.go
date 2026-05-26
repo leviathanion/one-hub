@@ -10,15 +10,23 @@ type activeRegistry struct {
 	conns map[*ManagedConn]struct{}
 }
 
+type connRegistration struct {
+	conn      *ManagedConn
+	watchDone bool
+}
+
 var defaultActiveRegistry = &activeRegistry{conns: make(map[*ManagedConn]struct{})}
 
 // RegisterActive tracks conn for process-level graceful shutdown. The returned
-// function is idempotent; callers should defer it after a successful accept.
+// function is idempotent. ManagedConn registers itself internally without a
+// per-connection goroutine; this compatibility helper still watches Done for
+// external/manual registrations.
 func RegisterActive(conn *ManagedConn) func() {
-	return defaultActiveRegistry.register(conn)
+	return defaultActiveRegistry.register(connRegistration{conn: conn, watchDone: true})
 }
 
-func (r *activeRegistry) register(conn *ManagedConn) func() {
+func (r *activeRegistry) register(reg connRegistration) func() {
+	conn := reg.conn
 	if r == nil || conn == nil {
 		return func() {}
 	}
@@ -37,10 +45,12 @@ func (r *activeRegistry) register(conn *ManagedConn) func() {
 			r.mu.Unlock()
 		})
 	}
-	go func() {
-		<-conn.Done()
-		unregister()
-	}()
+	if reg.watchDone {
+		go func() {
+			<-conn.Done()
+			unregister()
+		}()
+	}
 	return unregister
 }
 

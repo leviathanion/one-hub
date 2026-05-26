@@ -557,6 +557,25 @@ func TestOpenAIRealtimePumpNonPeerCloseEmitsRecvEventErr(t *testing.T) {
 	}
 }
 
+func TestOpenAIRealtimePumpNormalCloseEmitsProviderClose(t *testing.T) {
+	session := &openAIRealtimeSession{
+		recvCh:   make(chan openAIRealtimeOutbound, 1),
+		closed:   make(chan struct{}),
+		detached: make(chan struct{}),
+	}
+	session.handlePumpClose(wsconn.CloseInfo{Kind: wsconn.CloseKindNormal, Code: wsconn.CloseNormalClosure, Reason: "normal"})
+	event, err := session.Recv(context.Background())
+	if err != nil {
+		t.Fatalf("expected ProviderClose event, got err=%v", err)
+	}
+	if event.ProviderClose == nil || event.ProviderClose.Code != int(wsconn.CloseNormalClosure) || event.ProviderClose.Reason != "normal" {
+		t.Fatalf("expected normal close to become ProviderClose, got %+v", event.ProviderClose)
+	}
+	if event.Frame != nil {
+		t.Fatalf("expected normal close not to produce error payload, got %+v", event.Frame)
+	}
+}
+
 func TestOpenAIRealtimeSessionSelectionAndFinalizationHelpers(t *testing.T) {
 	recorder := &recordingOpenAIRealtimeObserver{}
 	now := time.Now()
@@ -799,8 +818,6 @@ func TestOpenAIRealtimeSessionQueueLifecycleAndSendClientGuards(t *testing.T) {
 	if elapsed := time.Since(start); elapsed < openAIRealtimeOutboundBackpressureTimeout {
 		t.Fatalf("expected enqueue to wait for bounded backpressure timeout, elapsed=%s", elapsed)
 	}
-
-	(&openAIRealtimeSession{}).configureConn()
 
 	conn, cleanupConn := newOpenAIRealtimeConnPair(t)
 	defer cleanupConn()

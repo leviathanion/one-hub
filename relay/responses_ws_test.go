@@ -3733,7 +3733,7 @@ func TestResponsesWSSendOutcomeFromErrorClassifiesWriteFailureAmbiguous(t *testi
 	if got := responsesWSSendOutcomeFromError(runtimesession.ErrStaleResponsesWSContinuation); got != SendOutcomeNotSent {
 		t.Fatalf("expected stale local continuation guard to be not-sent, got %v", got)
 	}
-	if isResponsesContinuationMissError(runtimesession.ErrStaleResponsesWSContinuation) {
+	if isProviderReportedContinuationMiss(runtimesession.ErrStaleResponsesWSContinuation) {
 		t.Fatal("expected local stale continuation guard not to clear provider affinity")
 	}
 	payload := string(responsesWSErrorFromErr(runtimesession.ErrStaleResponsesWSContinuation))

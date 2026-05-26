@@ -20,6 +20,12 @@ import (
 
 const realtimeRelayClientFrameQueueSize = 128
 
+const (
+	realtimeRelayStateOpen int32 = iota
+	realtimeRelayStateExitEmitted
+	realtimeRelayStateClosing
+)
+
 type realtimeRelayClientFrame struct {
 	mt      wsconn.MessageType
 	payload []byte
@@ -48,13 +54,12 @@ type realtimeRelayActor struct {
 	supplierClosed chan struct{}
 	exitCh         chan realtimeRelayExit
 
-	workers           sync.WaitGroup
-	doneOnce          sync.Once
-	userCloseOnce     sync.Once
-	closeOnce         sync.Once
-	externalCloseOnce sync.Once
+	workers       sync.WaitGroup
+	doneOnce      sync.Once
+	userCloseOnce sync.Once
 
 	started              atomic.Bool
+	closeState           atomic.Int32
 	dropDownstreamWrites atomic.Bool
 	exitDropLogged       atomic.Bool
 	lastActivityUnixNano atomic.Int64
@@ -77,14 +82,20 @@ func newRealtimeRelayActor(client *wsconn.ManagedConn, session runtimesession.Re
 		done:           make(chan struct{}),
 		userClosed:     make(chan struct{}),
 		supplierClosed: make(chan struct{}),
-		exitCh:         make(chan realtimeRelayExit, 6),
+		exitCh:         make(chan realtimeRelayExit, 16),
 	}
 	b.markActivity(time.Now())
 	return b
 }
 
 func (b *realtimeRelayActor) Start() {
-	b.started.Store(true)
+	if b == nil || !b.started.CompareAndSwap(false, true) {
+		return
+	}
+	if b.closeState.Load() != realtimeRelayStateOpen {
+		b.signalDone()
+		return
+	}
 	b.workers.Add(4)
 	go b.runWorker(b.clientPump)
 	go b.runWorker(b.clientToSession)
@@ -99,12 +110,12 @@ func (b *realtimeRelayActor) Wait() {
 
 func (b *realtimeRelayActor) Close() {
 	if b.started.Load() {
-		b.externalCloseOnce.Do(func() {
+		if b.beginExternalClose() {
 			b.emitExit(realtimeRelayExit{source: "external", err: context.Canceled, graceful: true})
-		})
+		}
 		return
 	}
-	b.closeOnce.Do(func() {
+	if b.beginClose() {
 		b.cancel()
 		if b.client != nil {
 			b.client.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "proxy_closed"})
@@ -114,7 +125,33 @@ func (b *realtimeRelayActor) Close() {
 				b.session.Detach("proxy_closed")
 			})
 		}
-	})
+		b.signalDone()
+	}
+}
+
+func (b *realtimeRelayActor) beginClose() bool {
+	return b != nil && b.closeState.CompareAndSwap(realtimeRelayStateOpen, realtimeRelayStateClosing)
+}
+
+func (b *realtimeRelayActor) beginExternalClose() bool {
+	return b != nil && b.closeState.CompareAndSwap(realtimeRelayStateOpen, realtimeRelayStateExitEmitted)
+}
+
+func (b *realtimeRelayActor) coordinateClose() bool {
+	if b == nil {
+		return false
+	}
+	for {
+		state := b.closeState.Load()
+		switch state {
+		case realtimeRelayStateOpen, realtimeRelayStateExitEmitted:
+			if b.closeState.CompareAndSwap(state, realtimeRelayStateClosing) {
+				return true
+			}
+		default:
+			return false
+		}
+	}
 }
 
 func (b *realtimeRelayActor) UserClosed() <-chan struct{} {
@@ -304,14 +341,19 @@ func (b *realtimeRelayActor) idleWatchdog() {
 func (b *realtimeRelayActor) coordinate() {
 	defer b.finishCoordinate()
 
-	first := <-b.exitCh
+	var first realtimeRelayExit
+	select {
+	case first = <-b.exitCh:
+	case <-b.ctx.Done():
+		first = realtimeRelayExit{source: "ctx", err: b.ctx.Err(), graceful: true}
+	}
 	reason := realtimeActorDetachReason(first.source)
 
 	if first.source == "user" && first.graceful {
 		b.dropDownstreamWrites.Store(true)
 	}
 
-	b.closeOnce.Do(func() {
+	if b.coordinateClose() {
 		switch {
 		case b.session == nil:
 		case first.source == "idle":
@@ -328,7 +370,7 @@ func (b *realtimeRelayActor) coordinate() {
 		} else {
 			b.closeDownstream(wsconn.CloseNormalClosure, reason)
 		}
-	})
+	}
 }
 
 func (b *realtimeRelayActor) runWorker(fn func()) {

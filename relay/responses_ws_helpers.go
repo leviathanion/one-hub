@@ -159,7 +159,7 @@ func responsesWSStaticErrorMessage(code string) string {
 	}
 }
 
-func isResponsesContinuationMissError(err error) bool {
+func isProviderReportedContinuationMiss(err error) bool {
 	if err == nil {
 		return false
 	}

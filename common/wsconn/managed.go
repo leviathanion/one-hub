@@ -100,7 +100,9 @@ type ManagedConn struct {
 	readState atomic.Int32
 	control   *controlWriter
 	pong      pongState
-	watchdog  *inboundWatchdog
+	watchdog  atomic.Pointer[inboundWatchdog]
+
+	unregisterActive func()
 }
 
 func newManagedConn(raw *websocket.Conn, cfg Config) *ManagedConn {
@@ -118,7 +120,7 @@ func newManagedConn(raw *websocket.Conn, cfg Config) *ManagedConn {
 	}
 	c.control = newControlWriter(c)
 	c.installHandlers()
-	RegisterActive(c)
+	c.unregisterActive = defaultActiveRegistry.register(connRegistration{conn: c, watchDone: false})
 	return c
 }
 
@@ -159,7 +161,7 @@ func (c *ManagedConn) Close(info CloseInfo) {
 	c.closeInfoMu.Lock()
 	c.closeInfo = info
 	c.closeInfoMu.Unlock()
-	go c.cleanup(info)
+	go c.cleanupSafely(info)
 }
 
 func (c *ManagedConn) Done() <-chan struct{} {
@@ -188,6 +190,16 @@ func (c *ManagedConn) CloseInfo() CloseInfo {
 	return c.closeInfo
 }
 
+func (c *ManagedConn) cleanupSafely(info CloseInfo) {
+	defer func() {
+		if r := recover(); r != nil {
+			logWarnf("wsconn[%s]: cleanup panic: %v", c.label(), r)
+		}
+		c.finishCleanup()
+	}()
+	c.cleanup(info)
+}
+
 func (c *ManagedConn) cleanup(info CloseInfo) {
 	if shouldSendCloseFrame(info) {
 		_ = c.writeCloseFrame(wireCloseCodeFor(info), info.Reason)
@@ -196,14 +208,34 @@ func (c *ManagedConn) cleanup(info CloseInfo) {
 		c.control.Stop()
 		c.waitControlWriterDone()
 	}
-	if c.watchdog != nil {
-		c.watchdog.stop()
+	if watchdog := c.watchdog.Load(); watchdog != nil {
+		watchdog.stop()
 	}
 	c.pong.stop()
 	if c.raw != nil {
 		_ = c.raw.Close()
 	}
-	close(c.done)
+}
+
+func (c *ManagedConn) finishCleanup() {
+	if c == nil {
+		return
+	}
+	if c.unregisterActive != nil {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logWarnf("wsconn[%s]: active unregister panic: %v", c.label(), r)
+				}
+			}()
+			c.unregisterActive()
+		}()
+	}
+	select {
+	case <-c.done:
+	default:
+		close(c.done)
+	}
 }
 
 func (c *ManagedConn) waitControlWriterDone() {

@@ -324,11 +324,42 @@ func TestProxyURLFailClosed(t *testing.T) {
 
 func TestProxyURLAcceptsSocks5H(t *testing.T) {
 	var dialer websocket.Dialer
-	if err := applyProxy(&dialer, "socks5h://127.0.0.1:1080", nil); err != nil {
+	if err := applyProxy(&dialer, "socks5h://127.0.0.1:1080"); err != nil {
 		t.Fatalf("applyProxy socks5h err=%v, want nil", err)
 	}
 	if dialer.NetDialContext == nil {
 		t.Fatal("expected socks5h proxy to install NetDialContext")
+	}
+}
+
+func TestDialManagedPinsValidatedResolvedIP(t *testing.T) {
+	var dialAddr string
+	_, err := DialManaged(context.Background(), "wss://localhost/realtime", nil, Config{},
+		WithDialSecurityPolicy(DialSecurityPolicy{HostFilter: func(string, []net.IP) bool { return true }}),
+		WithNetDialContext(func(_ context.Context, _, addr string) (net.Conn, error) {
+			dialAddr = addr
+			return nil, errors.New("dial attempted")
+		}),
+	)
+	if err == nil {
+		t.Fatal("DialManaged err=nil, want dial failure")
+	}
+	host, _, splitErr := net.SplitHostPort(dialAddr)
+	if splitErr != nil {
+		t.Fatalf("dial addr %q is not host:port: %v", dialAddr, splitErr)
+	}
+	if net.ParseIP(host) == nil {
+		t.Fatalf("dial addr host=%q, want pinned IP instead of original hostname", host)
+	}
+}
+
+func TestMetadataIPv4MappedIPv6Blocked(t *testing.T) {
+	ip := net.ParseIP("::ffff:169.254.169.254")
+	if ip == nil {
+		t.Fatal("failed to parse IPv4-mapped metadata IP")
+	}
+	if !isMetadataIP(ip) || !isBlockedIP(ip, true) {
+		t.Fatal("expected IPv4-mapped metadata IP to be blocked")
 	}
 }
 

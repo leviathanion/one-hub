@@ -115,6 +115,18 @@ func TestCodexRealtimeOutboundFromCloseInfoClassifiesPeerAndNonPeer(t *testing.T
 		t.Fatalf("expected peer close to avoid payload/err, got %+v", peer)
 	}
 
+	normal := codexRealtimeOutboundFromCloseInfo(wsconn.CloseInfo{
+		Kind:   wsconn.CloseKindNormal,
+		Code:   wsconn.CloseNormalClosure,
+		Reason: "normal",
+	})
+	if normal.providerClose == nil || normal.providerClose.Code != int(wsconn.CloseNormalClosure) || normal.providerClose.Reason != "normal" {
+		t.Fatalf("expected normal close to become ProviderClose, got %+v", normal)
+	}
+	if normal.payload != nil || normal.err != nil || normal.origin != runtimesession.RealtimePayloadOriginProvider {
+		t.Fatalf("expected normal close to avoid payload/err, got %+v", normal)
+	}
+
 	for _, kind := range []wsconn.CloseKind{
 		wsconn.CloseKindReadError,
 		wsconn.CloseKindBackpressure,
@@ -293,7 +305,6 @@ func TestCodexRealtimeAttachmentTurnAndErrorHelpers(t *testing.T) {
 	state.wsConn = conn
 	state.wsReaderConn = conn
 	state.skipBootstrapConn = conn
-	configureCodexRealtimeConn(nil, state, conn)
 	if cleared := clearCodexManagedWebsocketLocked(state); cleared.conn != conn || state.wsConn != nil || state.wsReaderConn != nil || state.skipBootstrapConn != nil {
 		t.Fatalf("expected clearCodexManagedWebsocketLocked to clear shared websocket references, cleared=%v state=%+v", cleared, state)
 	}
@@ -301,16 +312,14 @@ func TestCodexRealtimeAttachmentTurnAndErrorHelpers(t *testing.T) {
 		t.Fatalf("expected nil managed websocket clear to return nil, got %v", cleared)
 	}
 
-	configureCodexRealtimeConn(nil, nil, nil)
-	if err := writeCodexRealtimeWSMessageLocked(nil, nil, wsconn.TextMessage, []byte("hello")); !errors.Is(err, net.ErrClosed) {
+	if err := writeCodexRealtimeWSMessage(nil, wsconn.TextMessage, []byte("hello")); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("expected nil websocket write to return net.ErrClosed, got %v", err)
 	}
 
 	conn, cleanupWrite := newCodexRealtimeConnPair(t)
 	defer cleanupWrite()
 	state = &codexManagedRuntimeState{}
-	configureCodexRealtimeConn(nil, state, conn)
-	if err := writeCodexRealtimeWSMessageLocked(state, conn, wsconn.TextMessage, []byte(`{"type":"ping"}`)); err != nil {
+	if err := writeCodexRealtimeWSMessage(conn, wsconn.TextMessage, []byte(`{"type":"ping"}`)); err != nil {
 		t.Fatalf("expected websocket helper write to succeed, got %v", err)
 	}
 

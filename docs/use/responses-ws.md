@@ -324,6 +324,8 @@ responses_ws:
 | `responses_websocket_client_pong_miss_timeout_ms` | `0` | 对应 pong 缺失判死；当前 relay 迁移完成前保持禁用 |
 | `responses_websocket_client_inbound_activity_timeout_ms` | `300000` | 客户端入站活性超时；`0` 禁用 watchdog |
 
+这些 liveness 配置在 WebSocket 连接创建时取快照；修改 `config.yaml` 后只影响新连接，已建立连接不会热重载。`pong_miss_timeout_ms=0` 是有意的宽松默认，需要更快发现半开连接时可显式启用。
+
 **示例**：
 
 ```yaml

@@ -119,7 +119,6 @@ func (p *OpenAIProvider) OpenRealtimeSessionWithOptions(modelName string, option
 		closed:      make(chan struct{}),
 		detached:    make(chan struct{}),
 	}
-	session.configureConn()
 	if !session.responsesWS {
 		session.startReadLoop()
 	}
@@ -130,10 +129,14 @@ func (p *OpenAIProvider) openRealtimeConnWithOptions(modelName string, options r
 	if options.PreferredTransport == runtimesession.TransportModeResponsesWS || options.RequireWS {
 		return p.openResponsesWSConnWithContext(options.Context, modelName)
 	}
-	return p.openRealtimeConn(modelName)
+	return p.openRealtimeConnWithContext(options.Context, modelName)
 }
 
 func (p *OpenAIProvider) openRealtimeConn(modelName string) (*wsconn.ManagedConn, *types.OpenAIErrorWithStatusCode) {
+	return p.openRealtimeConnWithContext(context.Background(), modelName)
+}
+
+func (p *OpenAIProvider) openRealtimeConnWithContext(ctx context.Context, modelName string) (*wsconn.ManagedConn, *types.OpenAIErrorWithStatusCode) {
 	fullRequestURL, errWithCode := p.realtimeWSURL(modelName)
 	if errWithCode != nil {
 		return nil, errWithCode
@@ -151,7 +154,9 @@ func (p *OpenAIProvider) openRealtimeConn(modelName string) (*wsconn.ManagedConn
 		httpHeaders.Set("Authorization", fmt.Sprintf("Bearer %s", p.Channel.Key))
 	}
 
-	wsConn, err := wsconn.DialManaged(context.Background(), fullRequestURL, httpHeaders, openAIRealtimeWSConfig("openai realtime upstream"), openAIRealtimeDialOptions(proxyAddr, openAIResponsesWSSelfHosted(p), openAIUpstreamWebsocketSubprotocols(p))...)
+	dialCtx, cancel := openAIRealtimeDialContext(ctx)
+	defer cancel()
+	wsConn, err := wsconn.DialManaged(dialCtx, fullRequestURL, httpHeaders, openAIRealtimeWSConfig("openai realtime upstream"), openAIRealtimeDialOptions(proxyAddr, openAIResponsesWSSelfHosted(p), openAIUpstreamWebsocketSubprotocols(p))...)
 	if err != nil {
 		return nil, mapOpenAIRealtimeWSDialError(err)
 	}
@@ -272,11 +277,23 @@ func (p *OpenAIProvider) openResponsesWSConnWithContext(ctx context.Context, mod
 	if p.Channel != nil && p.Channel.Proxy != nil {
 		proxyAddr = *p.Channel.Proxy
 	}
-	wsConn, err := wsconn.DialManaged(ctx, fullRequestURL, httpHeaders, openAIRealtimeWSConfig("openai responses websocket upstream"), openAIRealtimeDialOptions(proxyAddr, openAIResponsesWSSelfHosted(p), openAIUpstreamWebsocketSubprotocols(p))...)
+	dialCtx, cancel := openAIRealtimeDialContext(ctx)
+	defer cancel()
+	wsConn, err := wsconn.DialManaged(dialCtx, fullRequestURL, httpHeaders, openAIRealtimeWSConfig("openai responses websocket upstream"), openAIRealtimeDialOptions(proxyAddr, openAIResponsesWSSelfHosted(p), openAIUpstreamWebsocketSubprotocols(p))...)
 	if err != nil {
 		return nil, mapOpenAIResponsesWSDialError(err)
 	}
 	return wsConn, nil
+}
+
+func openAIRealtimeDialContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, config.ConnectTimeout())
 }
 
 func openAIRealtimeWSConfig(label string) wsconn.Config {
@@ -585,9 +602,6 @@ func (s *openAIRealtimeSession) SetTurnObserverFactory(factory runtimesession.Tu
 	}
 }
 
-func (s *openAIRealtimeSession) configureConn() {
-}
-
 func (s *openAIRealtimeSession) readLoop() {
 	defer close(s.recvCh)
 	defer func() {
@@ -826,7 +840,7 @@ func (s *openAIRealtimeSession) handlePumpClose(info wsconn.CloseInfo) {
 		return
 	}
 	var closeErr *wsconn.CloseError
-	if errors.As(info.Err, &closeErr) || info.Kind == wsconn.CloseKindPeerClose {
+	if errors.As(info.Err, &closeErr) || openAIRealtimeCloseAsProviderClose(info.Kind) {
 		code := int(info.Code)
 		if closeErr != nil {
 			code = int(closeErr.Code)
@@ -855,6 +869,15 @@ func (s *openAIRealtimeSession) handlePumpClose(info wsconn.CloseInfo) {
 		origin:      runtimesession.RealtimePayloadOriginProxyLocal,
 		err:         runtimesession.ErrSessionClosed,
 	})
+}
+
+func openAIRealtimeCloseAsProviderClose(kind wsconn.CloseKind) bool {
+	switch kind {
+	case wsconn.CloseKindPeerClose, wsconn.CloseKindNormal, wsconn.CloseKindGracefulShutdown:
+		return true
+	default:
+		return false
+	}
 }
 
 func logOpenAIRealtimeInternalError(message string) {

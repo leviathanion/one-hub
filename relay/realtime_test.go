@@ -1163,6 +1163,17 @@ func TestRealtimeRelayActorProviderFrameWritesDownstream(t *testing.T) {
 	}
 }
 
+func TestRealtimeRelayActorCoordinateExitsOnContextCancel(t *testing.T) {
+	actor := newRealtimeRelayActor(nil, nil, time.Second)
+	actor.cancel()
+	go actor.coordinate()
+	select {
+	case <-actor.done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for coordinator to exit on context cancel")
+	}
+}
+
 func TestRealtimeRelayActorProviderClosePreservesPrivateWireCode(t *testing.T) {
 	serverConn, client := newRelayWebsocketPair(t)
 	actor := newRealtimeRelayActor(serverConn, newRelayActorTestSession(), time.Second)

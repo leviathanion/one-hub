@@ -24,10 +24,12 @@ type controlFrame struct {
 type controlWriter struct {
 	conn *ManagedConn
 
-	queue chan controlFrame
-	stop  chan struct{}
-	done  chan struct{}
-	once  sync.Once
+	queue   chan controlFrame
+	stop    chan struct{}
+	done    chan struct{}
+	once    sync.Once
+	mu      sync.Mutex
+	stopped bool
 }
 
 func newControlWriter(conn *ManagedConn) *controlWriter {
@@ -54,17 +56,18 @@ func (w *controlWriter) enqueue(mt int, payload []byte) error {
 		return errControlWriterClosed
 	}
 	frame := controlFrame{messageType: mt, payload: append([]byte(nil), payload...)}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.stopped {
+		return errControlWriterClosed
+	}
 	select {
 	case <-w.done:
-		return errControlWriterClosed
-	case <-w.stop:
 		return errControlWriterClosed
 	default:
 	}
 	select {
 	case <-w.done:
-		return errControlWriterClosed
-	case <-w.stop:
 		return errControlWriterClosed
 	case w.queue <- frame:
 		return nil
@@ -77,7 +80,12 @@ func (w *controlWriter) Stop() {
 	if w == nil {
 		return
 	}
-	w.once.Do(func() { close(w.stop) })
+	w.once.Do(func() {
+		w.mu.Lock()
+		w.stopped = true
+		close(w.stop)
+		w.mu.Unlock()
+	})
 }
 
 func (w *controlWriter) Wait() {

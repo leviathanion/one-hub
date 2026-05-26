@@ -679,7 +679,7 @@ func (s *codexManagedRealtimeSession) SendClient(ctx context.Context, frame runt
 				return nil
 			}
 			conn := state.wsConn
-			if err := writeCodexRealtimeWSMessageWithExecUnlocked(s.exec, state, conn, wsconn.TextMessage, payload); err != nil {
+			if err := writeCodexRealtimeWSMessageWithExecUnlocked(s.exec, conn, wsconn.TextMessage, payload); err != nil {
 				logCodexRealtimeInternalError("codex realtime websocket request write failed: " + err.Error())
 				if !codexManagedSessionOwnsAttachmentLocked(state, s.ownerSeq, s.attachment) {
 					unlockExec()
@@ -1368,7 +1368,6 @@ func (p *CodexProvider) ensureRealtimeTransportWithContextLocked(ctx context.Con
 		state.skipBootstrapConn = conn
 		exec.Transport = runtimesession.TransportModeResponsesWS
 		exec.FallbackUntil = time.Time{}
-		configureCodexRealtimeConn(exec, state, conn)
 		if state == nil || !state.deferWSReader {
 			p.startRealtimeWSReaderLocked(exec, state)
 		}
@@ -1675,7 +1674,7 @@ func (p *CodexProvider) startRealtimeWSReaderLocked(exec *runtimesession.Executi
 }
 
 func codexRealtimeOutboundFromCloseInfo(info wsconn.CloseInfo) codexRealtimeOutbound {
-	if info.Kind == wsconn.CloseKindPeerClose {
+	if codexRealtimeCloseAsProviderClose(info.Kind) {
 		return codexRealtimeOutbound{
 			providerClose: &runtimesession.ProviderClose{
 				Code:   int(info.Code),
@@ -1690,6 +1689,15 @@ func codexRealtimeOutboundFromCloseInfo(info wsconn.CloseInfo) codexRealtimeOutb
 		payload:     codexRealtimeProviderErrorEventPayload("", "provider_connection_closed", codexRealtimeStaticErrorMessage("provider_connection_closed")),
 		origin:      runtimesession.RealtimePayloadOriginProxyLocal,
 		err:         runtimesession.ErrSessionClosed,
+	}
+}
+
+func codexRealtimeCloseAsProviderClose(kind wsconn.CloseKind) bool {
+	switch kind {
+	case wsconn.CloseKindPeerClose, wsconn.CloseKindNormal, wsconn.CloseKindGracefulShutdown:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1719,7 +1727,7 @@ func (p *CodexProvider) sendRealtimeWSEventLocked(ctx context.Context, exec *run
 	}
 
 	conn := state.wsConn
-	writeErr := writeCodexRealtimeWSMessageWithExecUnlocked(exec, state, conn, wsconn.TextMessage, payload)
+	writeErr := writeCodexRealtimeWSMessageWithExecUnlocked(exec, conn, wsconn.TextMessage, payload)
 	if writeErr == nil {
 		return nil
 	}
@@ -1747,7 +1755,7 @@ func (p *CodexProvider) sendRealtimeWSEventLocked(ctx context.Context, exec *run
 
 	if errWithCode := p.ensureRealtimeTransportWithContextLocked(ctx, exec, state, time.Now(), ""); errWithCode == nil && exec.Transport == runtimesession.TransportModeResponsesWS && state.wsConn != nil {
 		retryConn := state.wsConn
-		if err := writeCodexRealtimeWSMessageWithExecUnlocked(exec, state, retryConn, wsconn.TextMessage, payload); err == nil {
+		if err := writeCodexRealtimeWSMessageWithExecUnlocked(exec, retryConn, wsconn.TextMessage, payload); err == nil {
 			return nil
 		}
 		if ownerSeq != 0 && !codexManagedSessionOwnsAttachmentLocked(state, ownerSeq, attachment) {
@@ -2048,22 +2056,19 @@ func closeCodexClearedWebsocket(cleared codexClearedWebsocket) {
 	}
 }
 
-func configureCodexRealtimeConn(exec *runtimesession.ExecutionSession, state *codexManagedRuntimeState, conn *wsconn.ManagedConn) {
-}
-
-func writeCodexRealtimeWSMessageLocked(state *codexManagedRuntimeState, conn *wsconn.ManagedConn, messageType wsconn.MessageType, payload []byte) error {
+func writeCodexRealtimeWSMessage(conn *wsconn.ManagedConn, messageType wsconn.MessageType, payload []byte) error {
 	if conn == nil {
 		return net.ErrClosed
 	}
 	return conn.WriteMessage(messageType, payload)
 }
 
-func writeCodexRealtimeWSMessageWithExecUnlocked(exec *runtimesession.ExecutionSession, state *codexManagedRuntimeState, conn *wsconn.ManagedConn, messageType wsconn.MessageType, payload []byte) error {
+func writeCodexRealtimeWSMessageWithExecUnlocked(exec *runtimesession.ExecutionSession, conn *wsconn.ManagedConn, messageType wsconn.MessageType, payload []byte) error {
 	if exec == nil {
-		return writeCodexRealtimeWSMessageLocked(state, conn, messageType, payload)
+		return writeCodexRealtimeWSMessage(conn, messageType, payload)
 	}
 	exec.Unlock()
-	err := writeCodexRealtimeWSMessageLocked(state, conn, messageType, payload)
+	err := writeCodexRealtimeWSMessage(conn, messageType, payload)
 	exec.Lock()
 	return err
 }

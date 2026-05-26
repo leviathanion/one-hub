@@ -10,7 +10,7 @@ import (
 func TestActiveRegistryShutdownClosesAndWaits(t *testing.T) {
 	client, server := managedPairForTest(t)
 	registry := &activeRegistry{}
-	unregister := registry.register(server)
+	unregister := registry.register(connRegistration{conn: server, watchDone: false})
 	t.Cleanup(unregister)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -36,12 +36,37 @@ func TestActiveRegistryShutdownClosesAndWaits(t *testing.T) {
 func TestActiveRegistryShutdownHonorsContext(t *testing.T) {
 	server := &ManagedConn{done: make(chan struct{}), clock: realClock{}}
 	registry := &activeRegistry{}
-	unregister := registry.register(server)
+	unregister := registry.register(connRegistration{conn: server, watchDone: false})
 	defer unregister()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := registry.shutdown(ctx, CloseInfo{Kind: CloseKindGracefulShutdown, Code: CloseGoingAway, Reason: "server_shutdown"}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("shutdown err=%v, want context.Canceled", err)
+	}
+}
+
+func TestCleanupSafelyClosesDoneWhenUnregisterPanics(t *testing.T) {
+	conn := &ManagedConn{
+		done:  make(chan struct{}),
+		clock: realClock{},
+		unregisterActive: func() {
+			panic("unregister failed")
+		},
+	}
+	conn.cleanupSafely(CloseInfo{Kind: CloseKindAbort, Reason: "test_cleanup"})
+	select {
+	case <-conn.Done():
+	default:
+		t.Fatal("expected cleanupSafely to close Done after unregister panic")
+	}
+}
+
+func TestCleanupWaitTimeoutFallsBackWhenWriteTimeoutDisabled(t *testing.T) {
+	conn := &ManagedConn{
+		cfg: Config{WriteTimeout: func() time.Duration { return 0 }},
+	}
+	if got := conn.cleanupWaitTimeout(); got != defaultWriteTimeout {
+		t.Fatalf("cleanupWaitTimeout=%s, want default %s", got, defaultWriteTimeout)
 	}
 }

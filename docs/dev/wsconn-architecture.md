@@ -112,6 +112,10 @@ type Config struct {
     OnActivity             func(time.Time)       // 任意 inbound control frame 或完整 data message 到达；仅 transport hook，不允许写连接
 }
 
+// Provider/relay 调用方可以在创建 Config 时捕获配置值；已建立连接使用创建时
+// 的 timeout/liveness 快照，不承诺热重载。这样避免每次 timer reset / write 都
+// 重新读取全局配置带来的锁、漂移和测试复杂度。
+
 // Clock 抽象 wsconn 内部的 Go runtime timer 操作。
 //
 // 走 Clock：
@@ -209,7 +213,7 @@ if d < 0 {
 // 单独配置（gorilla websocket.Upgrader 本身没有 HandshakeTimeout 字段，
 // 这跟 Dialer 不同）。
 type AcceptOptions struct {
-    CheckOrigin       func(*http.Request) bool
+    CheckOrigin       func(*http.Request) bool // nil = gorilla 默认 same-host Origin 策略，不是允许所有来源
     ResponseHeader    http.Header
     ReadBufferSize    int
     WriteBufferSize   int
@@ -245,6 +249,10 @@ func WithHandshakeTimeout(d time.Duration) DialOption // d <= 0 使用 wsconn �
 func WithTLSConfig(cfg *tls.Config) DialOption
 func WithNetDialContext(f func(ctx context.Context,
                                network, addr string) (net.Conn, error)) DialOption
+
+// DialManaged 默认拒绝 insecure ws、私网/metadata IP，并在直连路径把已校验 DNS
+// 结果固定到 NetDialContext，避免校验与连接之间再次解析。配置 HTTP/SOCKS
+// proxy 时不做目标 IP pin；proxy 部署由 proxy 本身承担目标解析和出网策略。
 
 // 出站握手失败时返回的诊断信息。完整保留现有 WSDialHandshakeError 字段，
 // 并把 CloseInfo 内联进来（DialFailed 时没有 ManagedConn 承载 CloseInfo）。

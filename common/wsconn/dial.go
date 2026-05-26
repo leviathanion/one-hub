@@ -20,6 +20,7 @@ var (
 	ErrInsecureScheme     = errors.New("wsconn: insecure ws scheme blocked")
 	ErrPrivateAddrBlocked = errors.New("wsconn: private address blocked")
 	ErrInvalidProxyURL    = errors.New("wsconn: invalid proxy url")
+	ErrInvalidDialURL     = errors.New("wsconn: invalid dial url")
 )
 
 const defaultDialHandshakeTimeout = 5 * time.Second
@@ -117,14 +118,20 @@ func DialManaged(ctx context.Context, rawURL string, header http.Header, cfg Con
 			opt(&dc)
 		}
 	}
-	if err := validateDialTarget(ctx, rawURL, dc.security); err != nil {
+	handshakeTimeout := normalizeDialHandshakeTimeout(dc.handshakeTimeout)
+	validationCtx, cancelValidation := dialValidationContext(ctx, handshakeTimeout)
+	defer cancelValidation()
+	resolved, err := validateDialTarget(validationCtx, rawURL, dc.security)
+	if err != nil {
 		return nil, err
 	}
-	handshakeTimeout := normalizeDialHandshakeTimeout(dc.handshakeTimeout)
 	netDial := dc.netDialContext
 	if netDial == nil {
 		d := &net.Dialer{Timeout: handshakeTimeout, KeepAlive: 30 * time.Second}
 		netDial = d.DialContext
+	}
+	if dc.proxyURL == "" {
+		netDial = pinnedNetDialContext(netDial, resolved)
 	}
 	dialer := websocket.Dialer{
 		HandshakeTimeout: handshakeTimeout,
@@ -133,7 +140,7 @@ func DialManaged(ctx context.Context, rawURL string, header http.Header, cfg Con
 		NetDialContext:   netDial,
 	}
 	if dc.proxyURL != "" {
-		if err := applyProxy(&dialer, dc.proxyURL, netDial); err != nil {
+		if err := applyProxy(&dialer, dc.proxyURL); err != nil {
 			return nil, err
 		}
 	}
@@ -148,46 +155,114 @@ func DialManaged(ctx context.Context, rawURL string, header http.Header, cfg Con
 	return newManagedConn(conn, cfg), nil
 }
 
-func validateDialTarget(ctx context.Context, rawURL string, policy DialSecurityPolicy) error {
+type resolvedDialTarget struct {
+	host string
+	ips  []net.IP
+}
+
+func validateDialTarget(ctx context.Context, rawURL string, policy DialSecurityPolicy) (resolvedDialTarget, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return err
+		return resolvedDialTarget{}, fmt.Errorf("%w: %s", ErrInvalidDialURL, redactedURLForError(rawURL))
 	}
 	switch strings.ToLower(u.Scheme) {
 	case "wss":
 	case "ws":
 		if !policy.AllowInsecureWS {
-			return fmt.Errorf("%w: %s", ErrInsecureScheme, redactedURLForError(rawURL))
+			return resolvedDialTarget{}, fmt.Errorf("%w: %s", ErrInsecureScheme, redactedURLForError(rawURL))
 		}
 	default:
-		return fmt.Errorf("%w: %s", ErrInsecureScheme, redactedURLForError(rawURL))
+		return resolvedDialTarget{}, fmt.Errorf("%w: %s", ErrInsecureScheme, redactedURLForError(rawURL))
 	}
 	host := u.Hostname()
 	if host == "" {
-		return nil
+		return resolvedDialTarget{}, fmt.Errorf("%w: missing host", ErrInvalidDialURL)
 	}
-	ips, _ := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	ips, err := resolveDialHost(ctx, host)
+	if err != nil {
+		return resolvedDialTarget{}, fmt.Errorf("%w: %v", ErrPrivateAddrBlocked, err)
+	}
 	if containsMetadataIP(host, ips) {
-		return fmt.Errorf("%w: %s", ErrPrivateAddrBlocked, host)
+		return resolvedDialTarget{}, fmt.Errorf("%w: %s", ErrPrivateAddrBlocked, host)
 	}
 	if policy.HostFilter != nil {
 		if !policy.HostFilter(host, ips) {
-			return fmt.Errorf("%w: %s", ErrPrivateAddrBlocked, host)
+			return resolvedDialTarget{}, fmt.Errorf("%w: %s", ErrPrivateAddrBlocked, host)
 		}
-		return nil
+		return resolvedDialTarget{host: host, ips: ips}, nil
 	}
 	for _, ip := range ips {
 		if isBlockedIP(ip, policy.AllowPrivateIP) {
-			return fmt.Errorf("%w: %s", ErrPrivateAddrBlocked, ip.String())
+			return resolvedDialTarget{}, fmt.Errorf("%w: %s", ErrPrivateAddrBlocked, ip.String())
 		}
 	}
-	return nil
+	return resolvedDialTarget{host: host, ips: ips}, nil
+}
+
+func dialValidationContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if timeout <= 0 {
+		timeout = defaultDialHandshakeTimeout
+	}
+	deadline := time.Now().Add(timeout)
+	if parentDeadline, ok := parent.Deadline(); ok && parentDeadline.Before(deadline) {
+		return parent, func() {}
+	}
+	return context.WithDeadline(parent, deadline)
+}
+
+func resolveDialHost(ctx context.Context, host string) ([]net.IP, error) {
+	if ip := net.ParseIP(host); ip != nil {
+		return []net.IP{normalizeIP(ip)}, nil
+	}
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	if err != nil {
+		return nil, err
+	}
+	if len(ips) == 0 {
+		return nil, net.ErrClosed
+	}
+	for i := range ips {
+		ips[i] = normalizeIP(ips[i])
+	}
+	return ips, nil
+}
+
+func pinnedNetDialContext(base func(context.Context, string, string) (net.Conn, error), resolved resolvedDialTarget) func(context.Context, string, string) (net.Conn, error) {
+	if base == nil || resolved.host == "" || len(resolved.ips) == 0 {
+		return base
+	}
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil || !sameDialHost(host, resolved.host) {
+			return base(ctx, network, addr)
+		}
+		var lastErr error
+		for _, ip := range resolved.ips {
+			conn, err := base(ctx, network, net.JoinHostPort(ip.String(), port))
+			if err == nil {
+				return conn, nil
+			}
+			lastErr = err
+			if ctx != nil && ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+		}
+		return nil, lastErr
+	}
+}
+
+func sameDialHost(a, b string) bool {
+	return strings.TrimSuffix(strings.ToLower(a), ".") == strings.TrimSuffix(strings.ToLower(b), ".")
 }
 
 func isBlockedIP(ip net.IP, allowPrivate bool) bool {
 	if ip == nil {
 		return false
 	}
+	ip = normalizeIP(ip)
 	if isMetadataIP(ip) {
 		return true
 	}
@@ -219,9 +294,20 @@ func isMetadataIP(ip net.IP) bool {
 	if ip == nil {
 		return false
 	}
+	ip = normalizeIP(ip)
 	return ip.Equal(net.ParseIP("169.254.169.254")) ||
 		ip.Equal(net.ParseIP("100.100.100.200")) ||
 		ip.Equal(net.ParseIP("fd00:ec2::254"))
+}
+
+func normalizeIP(ip net.IP) net.IP {
+	if ip == nil {
+		return nil
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return v4
+	}
+	return ip
 }
 
 func normalizeDialHandshakeTimeout(d time.Duration) time.Duration {
@@ -247,7 +333,7 @@ func redactedURLForError(rawURL string) string {
 	return u.String()
 }
 
-func applyProxy(dialer *websocket.Dialer, rawURL string, base func(context.Context, string, string) (net.Conn, error)) error {
+func applyProxy(dialer *websocket.Dialer, rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Scheme == "" {
 		return fmt.Errorf("%w: %v", ErrInvalidProxyURL, err)
@@ -269,7 +355,6 @@ func applyProxy(dialer *websocket.Dialer, rawURL string, base func(context.Conte
 	default:
 		return fmt.Errorf("%w: unsupported scheme %s", ErrInvalidProxyURL, u.Scheme)
 	}
-	_ = base
 	return nil
 }
 

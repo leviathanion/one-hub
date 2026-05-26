@@ -19,15 +19,22 @@ func (c *ManagedConn) startInboundWatchdog() {
 	if d <= 0 {
 		return
 	}
-	c.watchdog = &inboundWatchdog{conn: c}
-	c.watchdog.t = c.clock.AfterFunc(d, func() {
+	watchdog := &inboundWatchdog{conn: c}
+	watchdog.t = c.clock.AfterFunc(d, func() {
 		c.Close(CloseInfo{Kind: CloseKindInboundIdle, Reason: "inbound_idle"})
 	})
+	if !c.watchdog.CompareAndSwap(nil, watchdog) {
+		watchdog.stop()
+		return
+	}
+	if c.closeStarted.Load() {
+		watchdog.stop()
+	}
 }
 
 func (c *ManagedConn) markInboundActivity(now time.Time, invokeCallback bool) {
-	if c.watchdog != nil {
-		c.watchdog.reset()
+	if watchdog := c.watchdog.Load(); watchdog != nil {
+		watchdog.reset()
 	}
 	if invokeCallback && c.cfg.OnActivity != nil {
 		c.cfg.OnActivity(now)

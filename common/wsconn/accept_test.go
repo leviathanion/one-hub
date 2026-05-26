@@ -43,6 +43,26 @@ func TestAcceptManagedRejectsOriginAndUsesErrorCallback(t *testing.T) {
 	}
 }
 
+func TestAcceptManagedNilCheckOriginUsesGorillaDefaultPolicy(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := AcceptManaged(w, r, Config{}, AcceptOptions{})
+		if err == nil {
+			conn.Close(CloseInfo{Kind: CloseKindAbort, Reason: "test_cleanup"})
+		}
+	}))
+	defer server.Close()
+
+	_, resp, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), http.Header{
+		"Origin": []string{"https://blocked.example"},
+	})
+	if err == nil {
+		t.Fatal("Dial err=nil, want default origin rejection")
+	}
+	if resp == nil || resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("response=%v, want 403", resp)
+	}
+}
+
 func TestAcceptManagedUpgradeFailureDoesNotLeakAcceptedResource(t *testing.T) {
 	var managedAccepted atomic.Bool
 	handlerReturned := make(chan struct{}, 1)
