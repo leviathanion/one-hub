@@ -1203,7 +1203,7 @@ func (a *ResponsesWSSessionActor) handleClientFrame(event ResponsesWSEventClient
 	}
 	if err := json.Unmarshal(event.Payload, &envelope); err != nil {
 		logger.LogError(context.Background(), "responses websocket client frame parse failed: "+err.Error())
-		a.writeProxyLocal(responsesWSErrorPayload(http.StatusBadRequest, "invalid_event", err.Error()))
+		a.writeProxyLocal(responsesWSErrorPayload(http.StatusBadRequest, "invalid_event", responsesWSMessageInvalidWebsocketEvent))
 		return
 	}
 	switch strings.TrimSpace(envelope.Type) {
@@ -1291,7 +1291,7 @@ func (a *ResponsesWSSessionActor) startSubsequentTurn(raw []byte, receivedAt tim
 	frame, err := responsesws.ParseRawResponsesCreateFrame(raw)
 	if err != nil {
 		logger.LogError(context.Background(), "responses websocket subsequent frame parse failed: "+err.Error())
-		a.writeProxyLocal(responsesWSErrorPayload(http.StatusBadRequest, "invalid_event", err.Error()))
+		a.writeProxyLocal(responsesWSErrorPayload(http.StatusBadRequest, responsesWSErrorCodeInvalidResponseCreate, responsesWSMessageInvalidResponseCreate))
 		return
 	}
 	ctx := a.Context()
@@ -2184,8 +2184,8 @@ func ResponsesWebSocket(c *gin.Context) {
 	}
 	frame, err := responsesws.ParseRawResponsesCreateFrame(raw)
 	if err != nil {
-		_ = clientConn.WriteMessage(wsconn.TextMessage, responsesWSErrorPayload(http.StatusBadRequest, "invalid_response_create", "invalid response.create"))
-		clientConn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindNormal, Code: wsconn.ClosePolicyViolation, Reason: "invalid_response_create", Err: err})
+		_ = clientConn.WriteMessage(wsconn.TextMessage, responsesWSErrorPayload(http.StatusBadRequest, responsesWSErrorCodeInvalidResponseCreate, responsesWSMessageInvalidResponseCreate))
+		clientConn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindNormal, Code: wsconn.ClosePolicyViolation, Reason: responsesWSErrorCodeInvalidResponseCreate, Err: err})
 		return
 	}
 

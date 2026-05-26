@@ -6,8 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
+	"one-api/common/logger"
 	"one-api/common/wsconn"
 	runtimesession "one-api/runtime/session"
 	"one-api/types"
@@ -376,7 +376,7 @@ func (b *realtimeRelayActor) coordinate() {
 func (b *realtimeRelayActor) runWorker(fn func()) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			log.Printf("realtime relay actor worker panic: %v", recovered)
+			logger.SysError(fmt.Sprintf("realtime relay actor worker panic: %v", recovered))
 			b.emitExit(realtimeRelayExit{source: "proxy_panic", err: fmt.Errorf("proxy_panic: %v", recovered)})
 			b.emergencyShutdown("proxy_panic")
 		}
@@ -387,7 +387,7 @@ func (b *realtimeRelayActor) runWorker(fn func()) {
 
 func (b *realtimeRelayActor) finishCoordinate() {
 	if recovered := recover(); recovered != nil {
-		log.Printf("realtime relay actor coordinator panic: %v", recovered)
+		logger.SysError(fmt.Sprintf("realtime relay actor coordinator panic: %v", recovered))
 		b.emergencyShutdown("proxy_panic")
 	}
 	b.workers.Wait()
@@ -399,7 +399,7 @@ func (b *realtimeRelayActor) emitExit(exit realtimeRelayExit) {
 	case b.exitCh <- exit:
 	default:
 		if b != nil && b.exitDropLogged.CompareAndSwap(false, true) {
-			log.Printf("realtime relay actor exit signal dropped: source=%s err=%v", exit.source, exit.err)
+			logger.SysError(fmt.Sprintf("realtime relay actor exit signal dropped: source=%s err=%v", exit.source, exit.err))
 		}
 	}
 }
@@ -445,7 +445,7 @@ func (b *realtimeRelayActor) safeSessionAction(label string, fn func()) {
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			log.Printf("realtime relay actor session %s panic: %v", strings.TrimSpace(label), recovered)
+			logger.SysError(fmt.Sprintf("realtime relay actor session %s panic: %v", strings.TrimSpace(label), recovered))
 			if b.cancel != nil {
 				b.cancel()
 			}
@@ -473,7 +473,7 @@ func (b *realtimeRelayActor) observeProviderPayload(mt wsconn.MessageType, paylo
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			log.Printf("realtime relay actor provider payload observer panic: %v", recovered)
+			logger.SysError(fmt.Sprintf("realtime relay actor provider payload observer panic: %v", recovered))
 		}
 	}()
 	b.providerPayloadObserver(mt, append([]byte(nil), payload...))
@@ -517,7 +517,7 @@ func realtimeRelayErrorPayload(err error) []byte {
 		return []byte(types.NewErrorEvent("", "system_error", code, realtimeRelayStaticErrorMessage(code)).Error())
 	}
 
-	log.Printf("realtime relay actor internal error: %v", err)
+	logger.SysError(fmt.Sprintf("realtime relay actor internal error: %v", err))
 	return []byte(types.NewErrorEvent("", "system_error", "system_error", realtimeRelayStaticErrorMessage("system_error")).Error())
 }
 

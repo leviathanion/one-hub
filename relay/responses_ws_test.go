@@ -728,9 +728,9 @@ func TestResponsesWebSocketInvalidJSONFirstFrameWritesErrorThenPolicyClose(t *te
 	if err != nil {
 		t.Fatalf("expected invalid_response_create payload before close, got err=%v", err)
 	}
-	assertResponsesWSErrorPayload(t, string(payload), http.StatusBadRequest, "invalid_response_create", "invalid response.create")
+	assertResponsesWSErrorPayload(t, string(payload), http.StatusBadRequest, responsesWSErrorCodeInvalidResponseCreate, responsesWSMessageInvalidResponseCreate)
 	closeInfo := waitResponsesWSTestManagedClose(t, conn)
-	if closeInfo.Code != wsconn.ClosePolicyViolation || closeInfo.Reason != "invalid_response_create" {
+	if closeInfo.Code != wsconn.ClosePolicyViolation || closeInfo.Reason != responsesWSErrorCodeInvalidResponseCreate {
 		t.Fatalf("expected policy-violation close with invalid_response_create reason, got %+v", closeInfo)
 	}
 	select {
@@ -2279,7 +2279,7 @@ func TestResponsesWSSubsequentModelMismatchRejectsBeforeAdmission(t *testing.T) 
 	}
 }
 
-func TestResponsesWSClientFrameParseErrorUsesJSONErrorMessage(t *testing.T) {
+func TestResponsesWSClientFrameParseErrorUsesStaticMessage(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	recorder := httptest.NewRecorder()
@@ -2296,10 +2296,13 @@ func TestResponsesWSClientFrameParseErrorUsesJSONErrorMessage(t *testing.T) {
 	})
 
 	got, _ := conn.lastWrite.Load().(string)
-	assertResponsesWSErrorPayload(t, got, http.StatusBadRequest, "invalid_event", "unexpected end of JSON input")
+	assertResponsesWSErrorPayload(t, got, http.StatusBadRequest, "invalid_event", responsesWSMessageInvalidWebsocketEvent)
+	if strings.Contains(got, "unexpected end of JSON input") {
+		t.Fatalf("expected client payload to hide parser detail, got %q", got)
+	}
 }
 
-func TestResponsesWSSubsequentFrameParseErrorUsesParserMessage(t *testing.T) {
+func TestResponsesWSSubsequentFrameParseErrorUsesInvalidResponseCreate(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	recorder := httptest.NewRecorder()
@@ -2313,7 +2316,10 @@ func TestResponsesWSSubsequentFrameParseErrorUsesParserMessage(t *testing.T) {
 	actor.startSubsequentTurn([]byte(`{"type":"response.cancel","model":"gpt-5"}`), time.Now())
 
 	got, _ := conn.lastWrite.Load().(string)
-	assertResponsesWSErrorPayload(t, got, http.StatusBadRequest, "invalid_event", `unsupported responses websocket event type "response.cancel"`)
+	assertResponsesWSErrorPayload(t, got, http.StatusBadRequest, responsesWSErrorCodeInvalidResponseCreate, responsesWSMessageInvalidResponseCreate)
+	if strings.Contains(got, "unsupported responses websocket event type") {
+		t.Fatalf("expected client payload to hide parser detail, got %q", got)
+	}
 }
 
 func TestResponsesWSSubsequentRewriteFailureUsesInternalErrorCode(t *testing.T) {

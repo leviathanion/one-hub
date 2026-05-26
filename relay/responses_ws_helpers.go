@@ -12,6 +12,14 @@ import (
 	"strings"
 )
 
+// Client-facing error messages must not expose parser/validation internals.
+// Detailed errors are logged server-side; clients receive static messages only.
+const (
+	responsesWSErrorCodeInvalidResponseCreate = "invalid_response_create"
+	responsesWSMessageInvalidWebsocketEvent   = "invalid websocket event"
+	responsesWSMessageInvalidResponseCreate   = "invalid response.create"
+)
+
 func responsesWSSendOutcomeFromError(err error) ResponsesWSSendOutcome {
 	if err == nil {
 		return SendOutcomeLocalWriteOK
@@ -136,6 +144,8 @@ func responsesWSStaticErrorMessage(code string) string {
 	switch strings.TrimSpace(code) {
 	case "invalid_event":
 		return "invalid response.create event"
+	case responsesWSErrorCodeInvalidResponseCreate:
+		return responsesWSMessageInvalidResponseCreate
 	case "responses_affinity_conflict":
 		return "responses affinity conflict"
 	case "quota_rollback_failed":
