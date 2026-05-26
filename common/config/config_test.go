@@ -169,13 +169,13 @@ func TestConnectTimeoutUsesConfiguredSecondsWithFallback(t *testing.T) {
 		viper.Reset()
 	})
 
-	if got := ConnectTimeout(); got != 5*time.Second {
-		t.Fatalf("expected unset connect timeout to use default 5s, got %s", got)
+	if got := ConnectTimeout(); got != 30*time.Second {
+		t.Fatalf("expected unset connect timeout to use default 30s, got %s", got)
 	}
 
 	defaultConfig()
-	if got := ConnectTimeout(); got != 5*time.Second {
-		t.Fatalf("expected configured default connect timeout to be 5s, got %s", got)
+	if got := ConnectTimeout(); got != 30*time.Second {
+		t.Fatalf("expected configured default connect timeout to be 30s, got %s", got)
 	}
 
 	viper.Set("connect_timeout", 12)
@@ -184,8 +184,8 @@ func TestConnectTimeoutUsesConfiguredSecondsWithFallback(t *testing.T) {
 	}
 
 	viper.Set("connect_timeout", 0)
-	if got := ConnectTimeout(); got != 5*time.Second {
-		t.Fatalf("expected non-positive connect timeout to fall back to 5s, got %s", got)
+	if got := ConnectTimeout(); got != 30*time.Second {
+		t.Fatalf("expected non-positive connect timeout to fall back to 30s, got %s", got)
 	}
 }
 

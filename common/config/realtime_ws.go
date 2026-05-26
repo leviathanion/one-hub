@@ -17,7 +17,7 @@ func RealtimeWebsocketReadLimit() int64 {
 func RealtimeWebsocketWriteTimeout() time.Duration {
 	timeoutMS := viper.GetInt("realtime.websocket_write_timeout_ms")
 	if timeoutMS <= 0 {
-		return 10 * time.Second
+		return 40 * time.Second
 	}
 	return time.Duration(timeoutMS) * time.Millisecond
 }
@@ -25,7 +25,7 @@ func RealtimeWebsocketWriteTimeout() time.Duration {
 func ConnectTimeout() time.Duration {
 	timeoutSec := viper.GetInt("connect_timeout")
 	if timeoutSec <= 0 {
-		return 5 * time.Second
+		return 30 * time.Second
 	}
 	return time.Duration(timeoutSec) * time.Second
 }

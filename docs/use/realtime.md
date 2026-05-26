@@ -18,6 +18,9 @@ lastUpdated: true
 | `realtime.websocket_read_limit` | `config.yaml` | 重启服务 |
 | `realtime.websocket_ping_interval_ms` | `config.yaml` | 重启服务 |
 | `realtime.websocket_write_timeout_ms` | `config.yaml` | 重启服务 |
+| `realtime_websocket_client_ping_interval_ms` | `config.yaml` | 重启服务（新连接生效） |
+| `realtime_websocket_client_pong_miss_timeout_ms` | `config.yaml` | 重启服务（新连接生效） |
+| `realtime_websocket_client_inbound_activity_timeout_ms` | `config.yaml` | 重启服务（新连接生效） |
 | `openai.realtime_session_compat` | `config.yaml` | 重启服务 |
 | `cors.allow_origins` | `config.yaml` | 重启服务（realtime 回退时读取） |
 | 上游地址（Base URL） | Web 后台 → `渠道` → `渠道 API 地址` | 即刻生效（下次选渠道路由时） |
@@ -43,7 +46,12 @@ realtime:
   unsafe_allow_credential_subprotocol_any_origin: false
   websocket_read_limit: 16777216    # 单帧读取上限（字节）
   websocket_ping_interval_ms: 25000 # 服务端主动 Ping 周期（毫秒）
-  websocket_write_timeout_ms: 10000 # WebSocket 写超时（毫秒）
+  websocket_write_timeout_ms: 40000 # WebSocket 写超时（毫秒）
+
+# Realtime 客户端连接 liveness（顶层键，非 realtime 子键）
+realtime_websocket_client_ping_interval_ms: 25000              # 客户端连接主动 Ping 周期（毫秒）
+realtime_websocket_client_pong_miss_timeout_ms: 0              # 发出 ping 后未收到对应 pong 的超时；0 禁用
+realtime_websocket_client_inbound_activity_timeout_ms: 0       # 任意客户端入站活动超时；0 禁用
 ```
 
 ---
@@ -222,7 +230,7 @@ realtime:
 | 属性 | 值 |
 |------|-----|
 | 类型 | `int`（毫秒） |
-| 默认值 | `10000`（10 秒） |
+| 默认值 | `40000`（40 秒） |
 | 必填 | 否 |
 
 **作用**：向客户端或上游写 WebSocket 帧的超时时间。写操作超时后连接可能被关闭。
@@ -232,6 +240,7 @@ realtime:
 | 值 | 行为 | 影响 |
 |----|------|------|
 | `10000`（默认） | 写超时 10 秒 | 覆盖正常网络抖动 |
+| `40000`（默认） | 写超时 40 秒 | 覆盖高延迟跨区域链路 |
 | `5000` | 5 秒 | 更快释放慢连接资源 |
 | `30000` | 30 秒 | 容忍高延迟网络（如跨国链路） |
 
@@ -239,15 +248,15 @@ realtime:
 
 ```yaml
 realtime:
-  websocket_write_timeout_ms: 10000
+  websocket_write_timeout_ms: 40000
 
 # 高延迟跨国场景
 realtime:
-  websocket_write_timeout_ms: 30000
+  websocket_write_timeout_ms: 60000
 
 # 内网低延迟
 realtime:
-  websocket_write_timeout_ms: 3000
+  websocket_write_timeout_ms: 10000
 ```
 
 **对系统的影响**：
@@ -284,6 +293,68 @@ openai:
 **对系统的影响**：
 - `false`：正常转发，无额外影响。
 - `true`：每次上游 error 都会触发额外 `session.Abort`，略微增加 goroutine 调度开销。若上游在 error 后仍有 data frame，会被截断。
+
+---
+
+### Realtime 客户端 liveness 🏷️ config.yaml
+
+| 属性 | 值 |
+|------|-----|
+| 类型 | `int`（毫秒） |
+| 默认值 | ping interval `25000`；pong miss `0`；inbound activity `0` |
+| 必填 | 否 |
+
+**作用**：已建立 Realtime 连接的传输层 liveness 拆为两个独立语义。`realtime_websocket_client_pong_miss_timeout_ms` 只表示发出 ping 后未收到对应 pong；`realtime_websocket_client_inbound_activity_timeout_ms` 表示多久没有任何客户端入站 control frame 或完整 data frame。
+
+> **注意**：以下三个配置是**顶层键**（非 `realtime.*` 子键），与 `realtime.websocket_ping_interval_ms`（服务端→客户端方向）是不同的配置。客户端 liveness 配置作用于 one-hub 作为**客户端连接上游**时对自身连接的健康检查。
+
+**可配置值**：
+
+| 配置项 | 默认值 | 行为 |
+|--------|--------|------|
+| `realtime_websocket_client_ping_interval_ms` | `25000` | one-hub 向上游发送 Ping 的周期；`<=0` 禁用主动 Ping |
+| `realtime_websocket_client_pong_miss_timeout_ms` | `0` | 对应 pong 缺失判死超时；`0` 禁用 pong-miss 检测 |
+| `realtime_websocket_client_inbound_activity_timeout_ms` | `0` | 上游入站活性看门狗超时；`0` 禁用 watchdog |
+
+这些 liveness 配置在 WebSocket 连接创建时取快照；修改 `config.yaml` 后只影响新连接，已建立连接不会热重载。
+
+默认值 `pong_miss_timeout_ms=0` 和 `inbound_activity_timeout_ms=0` 表示两项检测均默认关闭，仅依赖 TCP/socket read deadline 来感知断连。需要更快发现半开连接时可显式启用其中一项或两项。
+
+**示例**：
+
+```yaml
+# 默认（全部关闭，依赖 socket read deadline）
+realtime_websocket_client_ping_interval_ms: 25000
+realtime_websocket_client_pong_miss_timeout_ms: 0
+realtime_websocket_client_inbound_activity_timeout_ms: 0
+
+# 启用 pong-miss 检测（推荐：发现半开连接）
+realtime_websocket_client_ping_interval_ms: 25000
+realtime_websocket_client_pong_miss_timeout_ms: 10000
+realtime_websocket_client_inbound_activity_timeout_ms: 0
+
+# 同时启用两项检测
+realtime_websocket_client_ping_interval_ms: 25000
+realtime_websocket_client_pong_miss_timeout_ms: 10000
+realtime_websocket_client_inbound_activity_timeout_ms: 60000
+```
+
+**对系统的影响**：
+- 过小：跨境链路或中间代理短暂抖动时，连接可能被误关。
+- 过大：真实断开的上游连接会更久占用资源。
+- `ping_interval_ms` 和 `pong_miss_timeout_ms` 配合使用：ping 间隔应小于 pong 超时的 1/2，避免正常延迟被误判为超时。
+- `inbound_activity_timeout_ms` 独立于 ping/pong：即使 ping/pong 正常，若上游长时间无业务数据也会触发。
+
+**与 `realtime.websocket_ping_interval_ms` 的区别**：
+
+| 配置项 | 方向 | 作用对象 |
+|--------|------|----------|
+| `realtime.websocket_ping_interval_ms` | 服务端 → 客户端 | one-hub 向**下游客户端**发送 Ping |
+| `realtime_websocket_client_ping_interval_ms` | 客户端 → 服务端 | one-hub 向**上游 provider** 发送 Ping |
+
+**排障信号**：
+- 超时关闭码：`1000`（正常关闭），关闭原因字符串：`"client_pong_timeout"`
+- 日志：搜索 `"client_pong_timeout"` 可定位所有因客户端活性超时关闭的连接
 
 ---
 

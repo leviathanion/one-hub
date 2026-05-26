@@ -39,7 +39,7 @@ func ProxyFunc(req *http.Request) (*url.URL, error) {
 
 func Socks5ProxyFunc(ctx context.Context, network, addr string) (net.Conn, error) {
 	dialer := &net.Dialer{
-		Timeout:   time.Duration(GetOrDefault("connect_timeout", 5)) * time.Second,
+		Timeout:   time.Duration(GetOrDefault("connect_timeout", 30)) * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
 

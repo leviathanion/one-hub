@@ -190,7 +190,7 @@ active lease 不随首帧发送成功释放，因为 established websocket 可�
 | --- | --- |
 | `realtime.websocket_read_limit` | `32 MiB` |
 | `realtime.websocket_ping_interval_ms` | `25000`（`<=0` 显式禁用，仅建议测试使用） |
-| `realtime.websocket_write_timeout_ms` | `10000` |
+| `realtime.websocket_write_timeout_ms` | `40000` |
 | `responses_ws.first_frame_timeout_ms` | `30000` |
 | `responses_ws.client_pong_timeout_ms` | `300000` |
 | `responses_ws.idle_timeout_ms` | `1800000` |

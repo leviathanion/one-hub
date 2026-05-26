@@ -321,7 +321,7 @@ responses_ws:
 | 配置项 | 默认值 | 行为 |
 |--------|--------|------|
 | `responses_websocket_client_ping_interval_ms` | `25000` | 服务端主动 ping 周期；`<=0` 禁用主动 ping |
-| `responses_websocket_client_pong_miss_timeout_ms` | `0` | 对应 pong 缺失判死；当前 relay 迁移完成前保持禁用 |
+| `responses_websocket_client_pong_miss_timeout_ms` | `0` | 对应 pong 缺失判死；`0` 禁用 |
 | `responses_websocket_client_inbound_activity_timeout_ms` | `300000` | 客户端入站活性超时；`0` 禁用 watchdog |
 
 这些 liveness 配置在 WebSocket 连接创建时取快照；修改 `config.yaml` 后只影响新连接，已建立连接不会热重载。`pong_miss_timeout_ms=0` 是有意的宽松默认，需要更快发现半开连接时可显式启用。
@@ -333,8 +333,6 @@ responses_websocket_client_ping_interval_ms: 25000
 responses_websocket_client_pong_miss_timeout_ms: 0
 responses_websocket_client_inbound_activity_timeout_ms: 300000
 ```
-
-旧配置名 `responses_ws.client_pong_timeout_ms` 不再读取；升级时需要改为 `responses_websocket_client_inbound_activity_timeout_ms`。
 
 **对系统的影响**：
 - 过小：跨境链路或中间代理短暂抖动时，长 turn 可能被误关。
@@ -629,8 +627,9 @@ Codex 渠道作为 ResponsesWS 上游时的 `channel.Other` 配置，详见 [Cod
 | 容量控制 | 无专用容量限制 | 三级 active lease + pending slot |
 | 写超时 | `realtime.websocket_write_timeout_ms` | 同（复用同一 writer primitive） |
 | 读上限 | `realtime.websocket_read_limit` | 同（复用同一 read limit primitive） |
-| Ping 间隔 | `realtime.websocket_ping_interval_ms` | `responses_websocket_client_ping_interval_ms` |
-| Pong 超时 | 无（依赖 socket read deadline） | `responses_websocket_client_pong_miss_timeout_ms` |
+| 客户端 Ping 间隔 | `realtime_websocket_client_ping_interval_ms` | `responses_websocket_client_ping_interval_ms` |
+| 客户端 Pong 超时 | `realtime_websocket_client_pong_miss_timeout_ms` | `responses_websocket_client_pong_miss_timeout_ms` |
+| 客户端入站活性超时 | `realtime_websocket_client_inbound_activity_timeout_ms` | `responses_websocket_client_inbound_activity_timeout_ms` |
 
 ## 相关文档
 

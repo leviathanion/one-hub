@@ -46,7 +46,7 @@ realtime:
   unsafe_allow_credential_subprotocol_any_origin: false # 仅兼容旧浏览器直连；true 时 openai-insecure-api-key.* 子协议可在空/通配 Origin 白名单下使用
   websocket_read_limit: 33554432 # WebSocket 单帧读取上限，默认 32MiB；超限连接会返回静态 invalid_event 后关闭
   websocket_ping_interval_ms: 25000 # 服务端主动 Ping 周期，默认 25 秒；<=0 仅建议测试禁用
-  websocket_write_timeout_ms: 10000 # WebSocket 写超时，默认 10 秒
+  websocket_write_timeout_ms: 40000 # WebSocket 写超时，默认 40 秒
 realtime_websocket_client_ping_interval_ms: 25000 # Realtime 客户端连接主动 Ping 周期，默认 25 秒；<=0 禁用；已建立连接使用创建时配置快照
 realtime_websocket_client_pong_miss_timeout_ms: 0 # Realtime 发出 ping 后未收到对应 pong 的超时；0 禁用；默认依赖业务 idle 回收
 realtime_websocket_client_inbound_activity_timeout_ms: 0 # Realtime 任意客户端入站活动超时；0 禁用；已建立连接使用创建时配置快照
@@ -92,7 +92,7 @@ channel:
 
 # 连接设置
 relay_timeout: 0 # 中继请求超时时间，单位为秒，默认为 0。
-connect_timeout: 5 # 连接超时时间，单位为秒，默认为 5。
+connect_timeout: 30 # 连接超时时间，单位为秒，默认为 30。
 
 # 默认程序启动时会联网下载一些通用的Token的编码，如：gpt-3.5-turbo，在一些网络环境不稳定，或者离线情况，可能会导致启动有问题，可以配置此目录缓存数据，可迁移到离线环境。
 tiktoken_cache_dir: ""
