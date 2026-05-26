@@ -228,6 +228,11 @@ func (b *realtimeRelayActor) clientToSession() {
 func (b *realtimeRelayActor) sessionToClient() {
 	defer close(b.supplierClosed)
 
+	if b.session == nil {
+		b.emitExit(realtimeRelayExit{source: "supplier", err: net.ErrClosed})
+		return
+	}
+
 	for {
 		event, err := b.session.Recv(b.ctx)
 		if err != nil {

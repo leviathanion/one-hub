@@ -2,6 +2,8 @@ package relay
 
 import (
 	"context"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1171,6 +1173,25 @@ func TestRealtimeRelayActorCoordinateExitsOnContextCancel(t *testing.T) {
 	case <-actor.done:
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for coordinator to exit on context cancel")
+	}
+}
+
+func TestRealtimeRelayActorSessionToClientHandlesNilSession(t *testing.T) {
+	actor := newRealtimeRelayActor(nil, nil, time.Second)
+	actor.sessionToClient()
+
+	select {
+	case <-actor.supplierClosed:
+	default:
+		t.Fatal("expected supplierClosed to close when session is nil")
+	}
+	select {
+	case exit := <-actor.exitCh:
+		if exit.source != "supplier" || !errors.Is(exit.err, net.ErrClosed) {
+			t.Fatalf("unexpected nil session exit: %+v", exit)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for nil session exit")
 	}
 }
 
