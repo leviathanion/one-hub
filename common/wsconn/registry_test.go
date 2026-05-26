@@ -3,6 +3,7 @@ package wsconn
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 )
@@ -44,6 +45,39 @@ func TestActiveRegistryShutdownHonorsContext(t *testing.T) {
 	if err := registry.shutdown(ctx, CloseInfo{Kind: CloseKindGracefulShutdown, Code: CloseGoingAway, Reason: "server_shutdown"}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("shutdown err=%v, want context.Canceled", err)
 	}
+}
+
+func TestRegisterActiveShutdownActivePublicAPI(t *testing.T) {
+	conn := &ManagedConn{done: make(chan struct{}), clock: realClock{}}
+	unregister := RegisterActive(conn)
+	t.Cleanup(func() {
+		unregister()
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := ShutdownActive(ctx); err != nil {
+		t.Fatalf("ShutdownActive err=%v", err)
+	}
+	if info := conn.CloseInfo(); info.Kind != CloseKindGracefulShutdown || info.Code != CloseGoingAway || info.Reason != "server_shutdown" {
+		t.Fatalf("conn CloseInfo=%+v, want graceful going-away server_shutdown", info)
+	}
+
+	unregister()
+	unregister()
+}
+
+func TestRegisterActiveNilReturnsIdempotentNoop(t *testing.T) {
+	unregister := RegisterActive(nil)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			unregister()
+		}()
+	}
+	wg.Wait()
 }
 
 func TestCleanupSafelyClosesDoneWhenUnregisterPanics(t *testing.T) {

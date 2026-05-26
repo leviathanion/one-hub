@@ -114,6 +114,7 @@ func TestDialErrorHasDiagnosticsAndRedactsHeaders(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Authorization", "secret-token")
 		w.Header().Set("Cookie", "sid=secret")
+		w.Header().Set("Set-Cookie", "sid=secret")
 		w.Header().Set("Sec-WebSocket-Protocol", "secret-proto")
 		w.WriteHeader(http.StatusUnauthorized)
 		_, _ = w.Write([]byte(strings.Repeat("x", 16)))
@@ -144,6 +145,9 @@ func TestDialErrorHasDiagnosticsAndRedactsHeaders(t *testing.T) {
 	if got := dialErr.Header.Get("Cookie"); got != "[REDACTED]" {
 		t.Fatalf("Cookie header=%q, want [REDACTED]", got)
 	}
+	if got := dialErr.Header.Get("Set-Cookie"); got != "[REDACTED]" {
+		t.Fatalf("Set-Cookie header=%q, want [REDACTED]", got)
+	}
 	if got := dialErr.Header.Get("Sec-WebSocket-Protocol"); got != "[REDACTED]" {
 		t.Fatalf("Sec-WebSocket-Protocol header=%q, want [REDACTED]", got)
 	}
@@ -172,6 +176,36 @@ func TestDialErrorRedactsURLUserInfoAndQuery(t *testing.T) {
 	}
 	if safeURL := dialErr.SafeURL(); safeURL == "" || strings.Contains(safeURL, "secret-key") {
 		t.Fatalf("DialError.SafeURL() = %q, want redacted diagnostic URL", safeURL)
+	}
+}
+
+func TestDialErrorWrapsNilResponseFailures(t *testing.T) {
+	dialFailure := errors.New("dial attempted")
+	rawURL := "wss://127.0.0.1/realtime?api_key=secret-key"
+	_, err := DialManaged(context.Background(), rawURL, nil, Config{},
+		WithDialSecurityPolicy(DialSecurityPolicy{
+			AllowPrivateIP: true,
+			HostFilter:     func(string, []net.IP) bool { return true },
+		}),
+		WithNetDialContext(func(context.Context, string, string) (net.Conn, error) {
+			return nil, dialFailure
+		}),
+	)
+
+	var dialErr *DialError
+	if !errors.As(err, &dialErr) {
+		t.Fatalf("err=%T %v, want *DialError", err, err)
+	}
+	if !errors.Is(err, dialFailure) {
+		t.Fatalf("err=%v, want errors.Is dial failure", err)
+	}
+	if dialErr.StatusCode != 0 || dialErr.CloseInfo.Kind != CloseKindDialFailed || dialErr.CloseInfo.Err != dialFailure {
+		t.Fatalf("unexpected nil-response DialError diagnostics: %+v", dialErr)
+	}
+	for _, leaked := range []string{"secret", "api_key", "?"} {
+		if strings.Contains(dialErr.Error(), leaked) {
+			t.Fatalf("DialError.Error leaked %q in %q", leaked, dialErr.Error())
+		}
 	}
 }
 

@@ -359,20 +359,20 @@ func applyProxy(dialer *websocket.Dialer, rawURL string) error {
 }
 
 func newDialError(rawURL string, resp *http.Response, err error, policy DialSecurityPolicy) error {
+	e := &DialError{
+		URL:       redactedURLForError(rawURL),
+		Err:       err,
+		CloseInfo: CloseInfo{Kind: CloseKindDialFailed, Reason: "dial_failed", Err: err, At: time.Now()},
+	}
 	if resp == nil {
-		return err
+		return e
 	}
 	limit := policy.MaxBodySnippet
 	if limit <= 0 {
 		limit = 4 << 10
 	}
-	e := &DialError{
-		URL:        redactedURLForError(rawURL),
-		StatusCode: resp.StatusCode,
-		Header:     redactHeaders(resp.Header.Clone(), policy),
-		Err:        err,
-		CloseInfo:  CloseInfo{Kind: CloseKindDialFailed, Reason: "dial_failed", Err: err, At: time.Now()},
-	}
+	e.StatusCode = resp.StatusCode
+	e.Header = redactHeaders(resp.Header.Clone(), policy)
 	if resp.Body != nil {
 		body, readErr := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 		_ = resp.Body.Close()
@@ -398,7 +398,7 @@ func headerClone(header http.Header) http.Header {
 func redactHeaders(header http.Header, policy DialSecurityPolicy) http.Header {
 	names := policy.RedactHeaders
 	if len(names) == 0 {
-		names = []string{"Authorization", "Cookie", "Sec-WebSocket-Protocol"}
+		names = []string{"Authorization", "Cookie", "Set-Cookie", "Sec-WebSocket-Protocol"}
 	}
 	for _, name := range names {
 		if _, ok := header[http.CanonicalHeaderKey(name)]; ok {
