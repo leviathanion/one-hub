@@ -191,10 +191,12 @@ func getLogDir() string {
 func SysLog(s string) {
 	message := "[SYS] | " + s
 
-	// Add to in-memory log history
 	logHistory.AddEntry(loggerINFO, message)
+	if Logger == nil {
+		log.Print(message)
+		return
+	}
 
-	// Write to log file
 	entry := zapcore.Entry{
 		Level:   zapcore.InfoLevel,
 		Time:    time.Now(),
@@ -210,20 +212,22 @@ func SysLog(s string) {
 func SysError(s string) {
 	message := "[SYS] | " + s
 
-	// Add to in-memory log history
 	logHistory.AddEntry(loggerError, message)
-
-	// Write to log file
+	if Logger == nil {
+		log.Print(message)
+		return
+	}
 	Logger.Error(message)
 }
 
 func SysDebug(s string) {
 	message := "[SYS] | " + s
 
-	// Add to in-memory log history
 	logHistory.AddEntry(loggerDEBUG, message)
-
-	// Write to log file
+	if Logger == nil {
+		log.Print(message)
+		return
+	}
 	Logger.Debug(message)
 }
 
@@ -244,17 +248,24 @@ func LogDebug(ctx context.Context, msg string) {
 }
 
 func logHelper(ctx context.Context, level string, msg string) {
-	id, ok := ctx.Value(RequestIdKey).(string)
-	if !ok {
+	id := "unknown"
+	if ctx != nil {
+		if value, ok := ctx.Value(RequestIdKey).(string); ok {
+			id = value
+		}
+	}
+	if id == "" {
 		id = "unknown"
 	}
 
 	logMsg := fmt.Sprintf("%s | %s \n", id, msg)
 
-	// Add to in-memory log history
 	logHistory.AddEntry(level, logMsg)
+	if Logger == nil {
+		log.Print(logMsg)
+		return
+	}
 
-	// Write to log file
 	switch level {
 	case loggerINFO:
 		Logger.Info(logMsg)
@@ -272,10 +283,12 @@ func logHelper(ctx context.Context, level string, msg string) {
 func FatalLog(v ...any) {
 	message := fmt.Sprintf("[FATAL] %v | %v \n", time.Now().Format("2006/01/02 - 15:04:05"), v)
 
-	// Add to in-memory log history
 	logHistory.AddEntry("FATAL", message)
 
-	// Write to log file
+	if Logger == nil {
+		log.Print(message)
+		os.Exit(1)
+	}
 	Logger.Fatal(message)
 	// t := time.Now()
 	// _, _ = fmt.Fprintf(gin.DefaultErrorWriter, "[FATAL] %v | %v \n", t.Format("2006/01/02 - 15:04:05"), v)
