@@ -37,6 +37,15 @@ tasks:
     cmds:
       - go mod tidy
 
+  test:
+    cmds:
+      - go test ./...
+
+  test-race:
+    cmds:
+      - go test -race ./common/wsconn ./providers/openai ./providers/codex
+      - go test -race ./relay -run '^TestRealtimeRelay'
+
   gofmt:
     cmds:
       - go install golang.org/x/tools/cmd/goimports@latest
