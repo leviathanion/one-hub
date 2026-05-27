@@ -307,9 +307,7 @@ func (a *ResponsesWSSessionActor) startSendWorker() {
 		return
 	}
 	a.sendOnce.Do(func() {
-		a.sendWG.Add(1)
 		go func() {
-			defer a.sendWG.Done()
 			defer recoverResponsesWSGoroutine("send_worker", func(reason string) {
 				if a != nil {
 					a.PostReliable(ResponsesWSEventTimeout{Reason: reason})
@@ -505,17 +503,20 @@ type ResponsesWSSessionActor struct {
 	state                       responsesWSSessionState
 	closed                      atomic.Bool
 	clientClosed                atomic.Bool
-	backpressurePosted          atomic.Bool
-	downstreamCloseSent         atomic.Bool
-	runWG                       sync.WaitGroup
-	sendCommands                chan responsesWSSendCommand
-	sendOnce                    sync.Once
-	sendWG                      sync.WaitGroup
-	lastActivityUnixNano        atomic.Int64
-	busyRejectWindowStart       time.Time
-	busyRejects                 int
-	setupCancelMu               sync.Mutex
-	setupCancel                 context.CancelFunc
+	// One-shot guard: after the event queue is saturated, keep at most one
+	// delayed timeout poster alive. Resetting this during recovery would let
+	// repeated saturation cycles enqueue more timeout goroutines into an already
+	// congested actor.
+	backpressurePosted    atomic.Bool
+	downstreamCloseSent   atomic.Bool
+	runWG                 sync.WaitGroup
+	sendCommands          chan responsesWSSendCommand
+	sendOnce              sync.Once
+	lastActivityUnixNano  atomic.Int64
+	busyRejectWindowStart time.Time
+	busyRejects           int
+	setupCancelMu         sync.Mutex
+	setupCancel           context.CancelFunc
 }
 
 func NewResponsesWSSessionActor(c *gin.Context) *ResponsesWSSessionActor {

@@ -157,6 +157,41 @@ func TestPongGenerationMismatchedPongStillTimesOut(t *testing.T) {
 	}
 }
 
+func TestPongMissDecisionClearsOutstandingBeforeLatePong(t *testing.T) {
+	clock := newManualClock(time.Unix(360, 0))
+	conn := &ManagedConn{
+		cfg:   Config{Clock: clock},
+		clock: clock,
+		done:  make(chan struct{}),
+	}
+	conn.pong.awaiting = true
+	conn.pong.outstandingGen = 7
+	conn.pong.outstandingTimer = clock.AfterFunc(time.Hour, func() {})
+
+	conn.onPongMiss(7)
+	var payload [8]byte
+	binary.BigEndian.PutUint64(payload[:], 7)
+	conn.observePongGeneration(string(payload[:]))
+
+	select {
+	case <-conn.Done():
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for pong miss close")
+	}
+	conn.pong.mu.Lock()
+	awaiting := conn.pong.awaiting
+	outstandingGen := conn.pong.outstandingGen
+	outstandingTimer := conn.pong.outstandingTimer
+	lastMatchedPongAt := conn.pong.lastMatchedPongAt
+	conn.pong.mu.Unlock()
+	if awaiting || outstandingGen != 0 || outstandingTimer != nil || !lastMatchedPongAt.IsZero() {
+		t.Fatalf("late pong changed timeout state: awaiting=%v outstanding=%d timer=%v matched=%s", awaiting, outstandingGen, outstandingTimer, lastMatchedPongAt)
+	}
+	if info := conn.CloseInfo(); info.Kind != CloseKindPongMiss {
+		t.Fatalf("CloseInfo=%+v, want pong_miss", info)
+	}
+}
+
 func TestEnqueuePingFailureStopsOutstandingPongMiss(t *testing.T) {
 	clock := newManualClock(time.Unix(375, 0))
 	client, server := managedPairForTestWithConfigs(t, Config{

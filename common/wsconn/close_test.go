@@ -338,6 +338,39 @@ func TestCleanupControlWriterWaitUsesFakeClock(t *testing.T) {
 	}
 }
 
+func TestCleanupSkipsCloseFrameWhenWriterBusyAndWriteTimeoutDisabled(t *testing.T) {
+	clock := newManualClock(time.Unix(901, 0))
+	conn := &ManagedConn{
+		cfg:   Config{Clock: clock, WriteTimeout: func() time.Duration { return 0 }},
+		clock: clock,
+		done:  make(chan struct{}),
+		control: &controlWriter{
+			stop: make(chan struct{}),
+			done: make(chan struct{}),
+		},
+	}
+	conn.writeMu.Lock()
+	defer conn.writeMu.Unlock()
+
+	conn.Close(CloseInfo{Kind: CloseKindNormal, Reason: "normal"})
+	clock.waitTimers(t, 1)
+	select {
+	case <-conn.Done():
+		t.Fatalf("cleanup completed before fallback cleanup wait elapsed")
+	default:
+	}
+
+	clock.Advance(defaultWriteTimeout)
+	select {
+	case <-conn.Done():
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for cleanup with busy writer and WriteTimeout=0")
+	}
+	if info := conn.CloseInfo(); info.Kind != CloseKindNormal {
+		t.Fatalf("CloseInfo=%+v, want normal close preserved", info)
+	}
+}
+
 func TestAbortLikeCloseKindsDoNotSendCloseFrame(t *testing.T) {
 	tests := []CloseKind{
 		CloseKindAbort,

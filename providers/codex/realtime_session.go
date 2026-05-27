@@ -89,7 +89,6 @@ type codexManagedRuntimeState struct {
 	attachment            *codexAttachment
 	ownerSeq              uint64
 	wsConn                *wsconn.ManagedConn
-	wsPump                *wsconn.Pump
 	wsConnGeneration      uint64
 	wsReaderConn          *wsconn.ManagedConn
 	bridgeStream          requester.StreamReaderInterface[string]
@@ -1462,14 +1461,6 @@ func (p *CodexProvider) startRealtimeWSReaderLocked(exec *runtimesession.Executi
 				},
 				OnClose: finishPump,
 			}
-			func() {
-				exec.Lock()
-				currentState := getCodexManagedRuntimeStateLocked(exec)
-				if currentState.wsConn == conn {
-					currentState.wsPump = pump
-				}
-				exec.Unlock()
-			}()
 			pump.Run(context.Background())
 		}()
 
@@ -2040,7 +2031,6 @@ func clearCodexManagedWebsocketLocked(state *codexManagedRuntimeState) codexClea
 		conn: state.wsConn,
 	}
 	state.wsConn = nil
-	state.wsPump = nil
 	if state.wsReaderConn == cleared.conn {
 		state.wsReaderConn = nil
 	}

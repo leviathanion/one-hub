@@ -201,11 +201,13 @@ func (c *ManagedConn) cleanupSafely(info CloseInfo) {
 }
 
 func (c *ManagedConn) cleanup(info CloseInfo) {
-	if shouldSendCloseFrame(info) {
-		_ = c.writeCloseFrame(wireCloseCodeFor(info), info.Reason)
-	}
 	if c.control != nil {
 		c.control.Stop()
+	}
+	if shouldSendCloseFrame(info) {
+		_ = c.writeCloseFrameBestEffort(wireCloseCodeFor(info), info.Reason)
+	}
+	if c.control != nil {
 		c.waitControlWriterDone()
 	}
 	if watchdog := c.watchdog.Load(); watchdog != nil {
@@ -272,10 +274,25 @@ func (c *ManagedConn) cleanupWaitTimeout() time.Duration {
 func (c *ManagedConn) writeCloseFrame(code CloseCode, reason string) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	return c.writeCloseFrameLocked(code, reason, c.runtimeWriteTimeout())
+}
+
+func (c *ManagedConn) writeCloseFrameBestEffort(code CloseCode, reason string) error {
+	if !c.writeMu.TryLock() {
+		// Trade-off: close frames are useful diagnostics, but cleanup completion is
+		// more important. A stuck data/control writer can hold writeMu forever when
+		// WriteTimeout=0, so cleanup must not block behind it.
+		logWarnf("wsconn[%s]: skipping close frame because writer is busy during cleanup", c.label())
+		return errControlQueueFull
+	}
+	defer c.writeMu.Unlock()
+	return c.writeCloseFrameLocked(code, reason, c.cleanupWaitTimeout())
+}
+
+func (c *ManagedConn) writeCloseFrameLocked(code CloseCode, reason string, timeout time.Duration) error {
 	if c.raw == nil {
 		return net.ErrClosed
 	}
-	timeout := c.runtimeWriteTimeout()
 	deadline := time.Time{}
 	if timeout > 0 {
 		deadline = time.Now().Add(timeout)

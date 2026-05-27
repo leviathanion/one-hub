@@ -65,7 +65,6 @@ type openAIRealtimeSession struct {
 	model      string
 	sessionID  string
 	conn       *wsconn.ManagedConn
-	pump       *wsconn.Pump
 	compatMode bool
 
 	recvCh        chan openAIRealtimeOutbound
@@ -645,7 +644,6 @@ func (s *openAIRealtimeSession) readLoop() {
 		},
 		OnClose: finishPump,
 	}
-	s.pump = pump
 	go pump.Run(context.Background())
 
 	for frame := range frameCh {

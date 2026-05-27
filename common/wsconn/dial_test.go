@@ -249,6 +249,47 @@ func TestDialManagedAppliesDefaultAndOverrideHandshakeTimeout(t *testing.T) {
 	}
 }
 
+func TestSocks5ProxyUsesCustomNetDialContextForProxyConnection(t *testing.T) {
+	proxyListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen proxy: %v", err)
+	}
+	defer proxyListener.Close()
+	accepted := make(chan struct{})
+	go func() {
+		conn, err := proxyListener.Accept()
+		if err == nil {
+			close(accepted)
+			_ = conn.Close()
+		}
+	}()
+
+	var dialedNetwork, dialedAddr string
+	dialer := websocket.Dialer{
+		NetDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialedNetwork = network
+			dialedAddr = addr
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		},
+	}
+	if err := applyProxy(&dialer, "socks5://"+proxyListener.Addr().String()); err != nil {
+		t.Fatalf("applyProxy: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, _ = dialer.NetDialContext(ctx, "tcp", "upstream.example.test:443")
+
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatalf("proxy listener did not receive dial")
+	}
+	if dialedNetwork != "tcp" || dialedAddr != proxyListener.Addr().String() {
+		t.Fatalf("custom dialer saw network=%q addr=%q, want tcp %q", dialedNetwork, dialedAddr, proxyListener.Addr().String())
+	}
+}
+
 func TestDialErrorPreservesBodyReadError(t *testing.T) {
 	readErr := errors.New("body read failed")
 	err := newDialError("wss://upstream.example.test/realtime", &http.Response{

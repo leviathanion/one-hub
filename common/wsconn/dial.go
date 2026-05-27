@@ -370,7 +370,7 @@ func applyProxy(dialer *websocket.Dialer, rawURL string) error {
 	case "http", "https":
 		dialer.Proxy = func(*http.Request) (*url.URL, error) { return u, nil }
 	case "socks5", "socks5h":
-		proxyDialer, err := proxy.FromURL(u, proxy.Direct)
+		proxyDialer, err := proxy.FromURL(u, netDialContextProxyAdapter{dial: dialer.NetDialContext})
 		if err != nil {
 			return fmt.Errorf("%w: %v", ErrInvalidProxyURL, err)
 		}
@@ -384,6 +384,21 @@ func applyProxy(dialer *websocket.Dialer, rawURL string) error {
 		return fmt.Errorf("%w: unsupported scheme %s", ErrInvalidProxyURL, u.Scheme)
 	}
 	return nil
+}
+
+type netDialContextProxyAdapter struct {
+	dial func(context.Context, string, string) (net.Conn, error)
+}
+
+func (a netDialContextProxyAdapter) Dial(network, addr string) (net.Conn, error) {
+	return a.DialContext(context.Background(), network, addr)
+}
+
+func (a netDialContextProxyAdapter) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if a.dial == nil {
+		return proxy.Direct.Dial(network, addr)
+	}
+	return a.dial(ctx, network, addr)
 }
 
 func newDialError(rawURL string, resp *http.Response, err error, policy DialSecurityPolicy) error {

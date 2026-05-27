@@ -688,7 +688,7 @@ func TestCodexRealtimeWSReaderForwardsProviderCloseCode(t *testing.T) {
 	exec.Lock()
 	defer exec.Unlock()
 	state = getCodexManagedRuntimeStateLocked(exec)
-	if state.wsConn != nil || state.wsPump != nil || exec.Inflight || exec.State != runtimesession.SessionStateIdle {
+	if state.wsConn != nil || exec.Inflight || exec.State != runtimesession.SessionStateIdle {
 		t.Fatalf("expected Pump.OnClose path to clear websocket state and mark idle, exec=%+v state=%+v", exec, state)
 	}
 }

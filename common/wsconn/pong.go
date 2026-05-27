@@ -69,7 +69,7 @@ func (c *ManagedConn) onPingTick() {
 	}
 
 	c.pong.mu.Lock()
-	if c.pong.pingTimer != nil {
+	if !c.closeStarted.Load() && c.pong.pingTimer != nil {
 		c.pong.pingTimer.Reset(c.cfg.PingInterval)
 	}
 	c.pong.mu.Unlock()
@@ -78,6 +78,11 @@ func (c *ManagedConn) onPingTick() {
 func (c *ManagedConn) onPongMiss(gen uint64) {
 	c.pong.mu.Lock()
 	missed := c.pong.awaiting && c.pong.outstandingGen == gen
+	if missed {
+		c.pong.awaiting = false
+		c.pong.outstandingGen = 0
+		c.pong.outstandingTimer = nil
+	}
 	c.pong.mu.Unlock()
 	if missed {
 		c.Close(CloseInfo{Kind: CloseKindPongMiss, Reason: "pong_miss"})
