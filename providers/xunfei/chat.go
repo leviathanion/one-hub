@@ -10,10 +10,12 @@ import (
 	"net/http"
 	"one-api/common"
 	"one-api/common/config"
+	"one-api/common/logger"
 	"one-api/common/requester"
 	"one-api/common/utils"
 	"one-api/common/wsconn"
 	"one-api/types"
+	"runtime/debug"
 	"strings"
 	"sync"
 )
@@ -171,6 +173,19 @@ func (stream *xunfeiWSReader[T]) processFrames() {
 	if stream == nil {
 		return
 	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			logger.SysError(fmt.Sprintf("xunfei websocket handler panic: %v", recovered))
+			logger.SysError(fmt.Sprintf("stacktrace from panic: %s", string(debug.Stack())))
+			select {
+			case stream.ErrChan <- errors.New("xunfei websocket handler failed"):
+			default:
+			}
+			if stream.conn != nil {
+				stream.conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindHandlerPanic, Reason: "xunfei_handler_panic", Err: fmt.Errorf("%v", recovered)})
+			}
+		}
+	}()
 	for msg := range stream.frameChan {
 		stream.handlerPrefix(&msg, stream.DataChan, stream.ErrChan)
 		if bytes.Equal(msg, requester.StreamClosed) {
@@ -246,6 +261,7 @@ func (h *xunfeiHandler) convertToChatOpenai(stream requester.StreamReaderInterfa
 	var content string
 	var xunfeiResponse XunfeiChatResponse
 	dataChan, errChan := stream.Recv()
+	defer stream.Close()
 
 	stop := false
 	for !stop {

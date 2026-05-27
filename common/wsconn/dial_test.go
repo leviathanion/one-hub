@@ -407,7 +407,7 @@ func TestProxyURLAcceptsSocks5H(t *testing.T) {
 	}
 }
 
-func TestDialManagedWithProxySkipsTargetDNSAndIPPinning(t *testing.T) {
+func TestDialManagedWithProxyValidatesTargetBeforeProxyDial(t *testing.T) {
 	dialFailure := errors.New("proxy dial attempted")
 	var dialAddr string
 	_, err := DialManaged(context.Background(), "wss://target-name-that-must-not-resolve.invalid/realtime", nil, Config{},
@@ -417,29 +417,60 @@ func TestDialManagedWithProxySkipsTargetDNSAndIPPinning(t *testing.T) {
 			return nil, dialFailure
 		}),
 	)
-	if !errors.Is(err, dialFailure) {
-		t.Fatalf("err=%v, want proxy dial failure; target DNS may have been resolved locally", err)
+	if !errors.Is(err, ErrPrivateAddrBlocked) {
+		t.Fatalf("err=%v, want fail-closed target validation before proxy dial", err)
 	}
-	if dialAddr != "127.0.0.1:8080" {
-		t.Fatalf("dial addr=%q, want proxy address", dialAddr)
+	if dialAddr != "" {
+		t.Fatalf("proxy dial addr=%q, want no dial before target validation succeeds", dialAddr)
+	}
+}
+
+func TestDialManagedWithProxyBlocksPrivateTargetsBeforeDial(t *testing.T) {
+	for _, rawURL := range []string{
+		"wss://127.0.0.1/realtime",
+		"wss://[::1]/realtime",
+	} {
+		t.Run(rawURL, func(t *testing.T) {
+			var dialed bool
+			_, err := DialManaged(context.Background(), rawURL, nil, Config{},
+				WithProxyURL("http://127.0.0.1:8080"),
+				WithNetDialContext(func(context.Context, string, string) (net.Conn, error) {
+					dialed = true
+					return nil, errors.New("unexpected proxy dial")
+				}),
+			)
+			if !errors.Is(err, ErrPrivateAddrBlocked) {
+				t.Fatalf("err=%v, want ErrPrivateAddrBlocked", err)
+			}
+			if dialed {
+				t.Fatal("private target attempted proxy dial")
+			}
+		})
 	}
 }
 
 func TestDialManagedWithProxyStillBlocksMetadataIPLiteral(t *testing.T) {
-	var dialed bool
-	_, err := DialManaged(context.Background(), "wss://169.254.169.254/realtime", nil, Config{},
-		WithProxyURL("http://127.0.0.1:8080"),
-		WithDialSecurityPolicy(DialSecurityPolicy{AllowPrivateIP: true}),
-		WithNetDialContext(func(context.Context, string, string) (net.Conn, error) {
-			dialed = true
-			return nil, errors.New("unexpected proxy dial")
-		}),
-	)
-	if !errors.Is(err, ErrPrivateAddrBlocked) {
-		t.Fatalf("err=%v, want ErrPrivateAddrBlocked", err)
-	}
-	if dialed {
-		t.Fatal("metadata IP literal attempted proxy dial")
+	for _, rawURL := range []string{
+		"wss://169.254.169.254/realtime",
+		"wss://[fd00:ec2::254]/realtime",
+	} {
+		t.Run(rawURL, func(t *testing.T) {
+			var dialed bool
+			_, err := DialManaged(context.Background(), rawURL, nil, Config{},
+				WithProxyURL("http://127.0.0.1:8080"),
+				WithDialSecurityPolicy(DialSecurityPolicy{AllowPrivateIP: true}),
+				WithNetDialContext(func(context.Context, string, string) (net.Conn, error) {
+					dialed = true
+					return nil, errors.New("unexpected proxy dial")
+				}),
+			)
+			if !errors.Is(err, ErrPrivateAddrBlocked) {
+				t.Fatalf("err=%v, want ErrPrivateAddrBlocked", err)
+			}
+			if dialed {
+				t.Fatal("metadata IP literal attempted proxy dial")
+			}
+		})
 	}
 }
 

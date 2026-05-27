@@ -1611,6 +1611,11 @@ func (a *ResponsesWSSessionActor) handleProviderDownstream(event ResponsesWSEven
 		if event.Usage != nil {
 			a.pendingAttempt.MarkProviderUsageSeen()
 			mergeResponsesWSUsageEvent(a.pendingAttempt.Usage, event.Usage)
+			// Pending downstream frames are replayed after the send result. Usage
+			// attached to the frame has already entered the pending attempt, so the
+			// replayed copy must keep the provider payload but not bill the same
+			// delta a second time.
+			event.Usage = nil
 		}
 		if event.Kind == ProviderDownstreamFrame && event.MessageType != responsesWSCloseMessageType && len(event.Payload) > 0 {
 			a.pendingAttempt.MarkFirstProviderResponse(receivedAt)

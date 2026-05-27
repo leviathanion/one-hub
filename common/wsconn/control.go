@@ -2,9 +2,13 @@ package wsconn
 
 import (
 	"errors"
+	"fmt"
 	"net"
+	"runtime/debug"
 	"sync"
 	"time"
+
+	"one-api/common/logger"
 
 	"github.com/gorilla/websocket"
 )
@@ -27,6 +31,7 @@ type controlWriter struct {
 	queue   chan controlFrame
 	stop    chan struct{}
 	done    chan struct{}
+	writeFn func(controlFrame) error
 	once    sync.Once
 	mu      sync.Mutex
 	stopped bool
@@ -39,6 +44,7 @@ func newControlWriter(conn *ManagedConn) *controlWriter {
 		stop:  make(chan struct{}),
 		done:  make(chan struct{}),
 	}
+	w.writeFn = w.write
 	go w.run()
 	return w
 }
@@ -96,13 +102,26 @@ func (w *controlWriter) Wait() {
 }
 
 func (w *controlWriter) run() {
-	defer close(w.done)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			logger.SysError(fmt.Sprintf("wsconn control writer panic: %v", recovered))
+			logger.SysError(fmt.Sprintf("stacktrace from panic: %s", string(debug.Stack())))
+			if w != nil && w.conn != nil {
+				w.conn.Close(CloseInfo{Kind: CloseKindWriteError, Reason: "control_writer_panic", Err: fmt.Errorf("%v", recovered)})
+			}
+		}
+		close(w.done)
+	}()
 	for {
 		select {
 		case <-w.stop:
 			return
 		case frame := <-w.queue:
-			if err := w.write(frame); err != nil {
+			write := w.write
+			if w.writeFn != nil {
+				write = w.writeFn
+			}
+			if err := write(frame); err != nil {
 				w.conn.Close(CloseInfo{Kind: CloseKindWriteError, Reason: "control_write_failed", Err: err})
 				return
 			}

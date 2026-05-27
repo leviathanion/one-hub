@@ -338,6 +338,42 @@ func TestCleanupControlWriterWaitUsesFakeClock(t *testing.T) {
 	}
 }
 
+func TestControlWriterPanicClosesDoneAndConnection(t *testing.T) {
+	client := &ManagedConn{
+		clock: realClock{},
+		done:  make(chan struct{}),
+	}
+	writer := &controlWriter{
+		conn:  client,
+		queue: make(chan controlFrame, controlQueueSize),
+		stop:  make(chan struct{}),
+		done:  make(chan struct{}),
+		writeFn: func(controlFrame) error {
+			panic("injected control writer panic")
+		},
+	}
+	client.control = writer
+	go writer.run()
+
+	if err := writer.EnqueuePing([]byte("panic")); err != nil {
+		t.Fatalf("EnqueuePing err=%v", err)
+	}
+	select {
+	case <-writer.done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for control writer done after panic")
+	}
+	select {
+	case <-client.Done():
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for connection close after control writer panic")
+	}
+	info := client.CloseInfo()
+	if info.Kind != CloseKindWriteError || info.Reason != "control_writer_panic" {
+		t.Fatalf("CloseInfo=%+v, want write_error/control_writer_panic", info)
+	}
+}
+
 func TestCleanupSkipsCloseFrameWhenWriterBusyAndWriteTimeoutDisabled(t *testing.T) {
 	clock := newManualClock(time.Unix(901, 0))
 	conn := &ManagedConn{

@@ -3276,6 +3276,117 @@ func TestResponsesWSProviderDownstreamFrameWithUsageMergesBeforeWrite(t *testing
 	}
 }
 
+func TestResponsesWSPendingProviderFrameWithUsageReplaysWithoutDoubleBilling(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-pending-frame-usage",
+		SelectedChannelID: 17,
+		Usage:             &types.Usage{},
+	}
+	actor.pendingAttempt = attempt
+	actor.state = responsesWSStatePendingSend
+
+	payload := []byte(`{"type":"response.output_text.delta","delta":"hi"}`)
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		MessageType:               responsesWSTextMessageType,
+		Payload:                   payload,
+		Usage:                     &types.UsageEvent{InputTokens: 4, OutputTokens: 2, TotalTokens: 6},
+		Origin:                    runtimesession.RealtimePayloadOriginProvider,
+	})
+
+	if attempt.Usage.PromptTokens != 4 || attempt.Usage.CompletionTokens != 2 || attempt.Usage.TotalTokens != 6 {
+		t.Fatalf("expected pending usage to merge once before replay, got %+v", attempt.Usage)
+	}
+	if len(actor.pendingProviderEvents) != 1 || actor.pendingProviderEvents[0].Usage != nil {
+		t.Fatalf("expected buffered replay event to clear usage after merge, got %+v", actor.pendingProviderEvents)
+	}
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:         "attempt-pending-frame-usage",
+		SelectedChannelID: 17,
+		Outcome:           SendOutcomeLocalWriteOK,
+	})
+
+	if got := atomic.LoadInt32(&conn.writeCount); got != 1 {
+		t.Fatalf("expected buffered provider frame to be written once, got %d writes", got)
+	}
+	if got, _ := conn.lastWrite.Load().(string); got != string(payload) {
+		t.Fatalf("expected provider payload to be replayed, got %q", got)
+	}
+	if attempt.Usage.PromptTokens != 4 || attempt.Usage.CompletionTokens != 2 || attempt.Usage.TotalTokens != 6 {
+		t.Fatalf("expected usage not to double count after replay, got %+v", attempt.Usage)
+	}
+}
+
+func TestResponsesWSPendingTerminalWithUsageReplaysSideEffectsWithoutDoubleBilling(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-pending-terminal-usage",
+		SelectedChannelID: 17,
+		Usage:             &types.Usage{},
+	}
+	actor.pendingAttempt = attempt
+	actor.state = responsesWSStatePendingSend
+
+	payload := []byte(`{"type":"response.completed","response":{"id":"resp_pending_usage","status":"completed"}}`)
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		MessageType:               responsesWSTextMessageType,
+		Payload:                   payload,
+		Usage: &types.UsageEvent{
+			InputTokens:  3,
+			OutputTokens: 4,
+			TotalTokens:  7,
+			ExtraBilling: map[string]types.ExtraBilling{
+				types.APIToolTypeWebSearchPreview: {ServiceType: types.APIToolTypeWebSearchPreview, CallCount: 1},
+			},
+		},
+		Origin: runtimesession.RealtimePayloadOriginProvider,
+	})
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:         "attempt-pending-terminal-usage",
+		SelectedChannelID: 17,
+		Outcome:           SendOutcomeLocalWriteOK,
+	})
+
+	if attempt.Usage.PromptTokens != 3 || attempt.Usage.CompletionTokens != 4 || attempt.Usage.TotalTokens != 7 {
+		t.Fatalf("expected terminal attached usage to remain single-counted after replay, got %+v", attempt.Usage)
+	}
+	if got := attempt.Usage.ExtraBilling[types.APIToolTypeWebSearchPreview].CallCount; got != 1 {
+		t.Fatalf("expected extra billing not to double count after replay, got %d in %+v", got, attempt.Usage.ExtraBilling)
+	}
+	if actor.lastFinal == nil || actor.lastFinal.ID != "resp_pending_usage" {
+		t.Fatalf("expected terminal side effects to run during replay, got %+v", actor.lastFinal)
+	}
+	if got, _ := conn.lastWrite.Load().(string); got != string(payload) {
+		t.Fatalf("expected terminal provider payload to be replayed, got %q", got)
+	}
+}
+
 func TestResponsesWSProviderUsageObservedOnlyUpdatesSettlementState(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

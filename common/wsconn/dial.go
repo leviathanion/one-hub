@@ -134,8 +134,16 @@ func DialManaged(ctx context.Context, rawURL string, header http.Header, cfg Con
 			return nil, err
 		}
 		netDial = pinnedNetDialContext(netDial, resolved)
-	} else if err := validateProxiedDialTarget(rawURL, dc.security); err != nil {
-		return nil, err
+	} else {
+		validationCtx, cancelValidation := dialValidationContext(ctx, handshakeTimeout)
+		defer cancelValidation()
+		// Trade-off: a proxy may resolve hostnames differently than this process,
+		// so proxy mode cannot pin the proxy-side IP. We still fail closed using
+		// local DNS validation because allowing private or metadata targets through
+		// CONNECT/SOCKS would be a higher-impact SSRF bypass.
+		if _, err := validateDialTarget(validationCtx, rawURL, dc.security); err != nil {
+			return nil, err
+		}
 	}
 	dialer := websocket.Dialer{
 		HandshakeTimeout: handshakeTimeout,
@@ -201,30 +209,6 @@ func validateDialTarget(ctx context.Context, rawURL string, policy DialSecurityP
 		}
 	}
 	return resolvedDialTarget{host: host, ips: ips}, nil
-}
-
-func validateProxiedDialTarget(rawURL string, policy DialSecurityPolicy) error {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return fmt.Errorf("%w: %s", ErrInvalidDialURL, redactedURLForError(rawURL))
-	}
-	switch strings.ToLower(u.Scheme) {
-	case "wss":
-	case "ws":
-		if !policy.AllowInsecureWS {
-			return fmt.Errorf("%w: %s", ErrInsecureScheme, redactedURLForError(rawURL))
-		}
-	default:
-		return fmt.Errorf("%w: %s", ErrInsecureScheme, redactedURLForError(rawURL))
-	}
-	host := u.Hostname()
-	if host == "" {
-		return fmt.Errorf("%w: missing host", ErrInvalidDialURL)
-	}
-	if isMetadataIP(net.ParseIP(host)) {
-		return fmt.Errorf("%w: %s", ErrPrivateAddrBlocked, host)
-	}
-	return nil
 }
 
 func dialValidationContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
