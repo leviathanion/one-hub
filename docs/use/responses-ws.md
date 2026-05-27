@@ -314,7 +314,7 @@ responses_ws:
 | 默认值 | ping interval `25000`；pong miss `0`；inbound activity `300000` |
 | 必填 | 否 |
 
-**作用**：已建立 ResponsesWS 连接的传输层 liveness 拆为两个独立语义。`responses_websocket_client_pong_miss_timeout_ms` 只表示发出 ping 后未收到对应 pong；`responses_websocket_client_inbound_activity_timeout_ms` 表示多久没有任何客户端入站 control frame 或完整 data frame。当前 ResponsesWS established 阶段使用 inbound activity watchdog；超过该时间没有任何客户端入站活动时，连接以 `client_pong_timeout` 关闭。
+**作用**：已建立 ResponsesWS 连接的传输层 liveness 拆为两个独立语义。`responses_websocket_client_pong_miss_timeout_ms` 只表示发出 ping 后未收到对应 pong；`responses_websocket_client_inbound_activity_timeout_ms` 表示多久没有任何客户端入站 control frame 或完整 data frame。当前 ResponsesWS established 阶段使用 inbound activity watchdog；超过该时间没有任何客户端入站活动时，连接以 `inbound_idle` 关闭。旧配置 `responses_ws.client_pong_timeout_ms` 已移除，不再读取或 fallback，请迁移到 `responses_websocket_client_inbound_activity_timeout_ms`。
 
 **可配置值**：
 
@@ -344,9 +344,9 @@ responses_websocket_client_inbound_activity_timeout_ms: 300000
 - 若调小至与 ping 间隔相近（如 30s），单个丢包或网络抖动就可能触发误关。
 
 **排障信号**：
-- 超时关闭码：`1000`（正常关闭），关闭原因字符串：`"client_pong_timeout"`
-- 日志：搜索 `"client_pong_timeout"` 可定位所有因客户端活性超时关闭的连接
-- 若用户频繁报告断连：先排查客户端是否正确回复 pong；若非客户端问题，适当调大 `responses_websocket_client_inbound_activity_timeout_ms`
+- 超时关闭码：`1000`（正常关闭），关闭原因字符串：`"inbound_idle"`
+- 日志：搜索 `"inbound_idle"` 可定位所有因客户端入站活性超时关闭的连接
+- 若用户频繁报告断连：先排查客户端是否持续处理服务端 ping 并产生入站 pong；若非客户端问题，适当调大 `responses_websocket_client_inbound_activity_timeout_ms`
 
 ---
 

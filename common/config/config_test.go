@@ -229,6 +229,12 @@ func TestSplitWebsocketClientLivenessConfig(t *testing.T) {
 		t.Fatalf("expected explicit responses client inbound activity timeout to apply, got %s", got)
 	}
 
+	viper.Reset()
+	viper.Set("responses_ws.client_pong_timeout_ms", 1500)
+	if got := ResponsesWebsocketClientInboundActivityTimeout(); got != 5*time.Minute {
+		t.Fatalf("expected legacy responses_ws.client_pong_timeout_ms to be ignored, got %s", got)
+	}
+
 	viper.Set("realtime_websocket_client_ping_interval_ms", 1250)
 	viper.Set("realtime_websocket_client_pong_miss_timeout_ms", 2500)
 	viper.Set("realtime_websocket_client_inbound_activity_timeout_ms", 5000)

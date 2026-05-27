@@ -192,12 +192,12 @@ active lease 不随首帧发送成功释放，因为 established websocket 可�
 | `realtime.websocket_ping_interval_ms` | `25000`（`<=0` 显式禁用，仅建议测试使用） |
 | `realtime.websocket_write_timeout_ms` | `40000` |
 | `responses_ws.first_frame_timeout_ms` | `30000` |
-| `responses_ws.client_pong_timeout_ms` | `300000` |
+| `responses_websocket_client_inbound_activity_timeout_ms` | `300000` |
 | `responses_ws.idle_timeout_ms` | `1800000` |
 | `responses_ws.max_lifetime_ms` | `3600000` |
 | `responses_ws.pending_provider_events_max_bytes` | `2097152` |
 
-首帧读取成功后会清除 first-frame read deadline，established 阶段的客户端连接活性由服务端 ping 和 `responses_ws.client_pong_timeout_ms` watchdog 维护，所有客户端入站 data/control frame 都刷新该 liveness；业务 idle 由 actor watchdog 维护，只由客户端 data frame 与 provider frame/usage/error 刷新。总连接寿命墙用于回收长期挂起连接，pending provider buffer 上限用于限制 send 结果确认前的内存占用。Trade-off：32 MiB 默认 read limit 降低 Codex 大上下文/文件负载误伤，但会提高单连接峰值内存预算；超限后 gorilla 连接不可复用，因此实现返回静态 `invalid_event` 后关闭连接。
+首帧读取成功后会清除 first-frame read deadline，established 阶段的客户端连接活性由服务端 ping 和 `responses_websocket_client_inbound_activity_timeout_ms` inbound activity watchdog 维护，所有客户端入站 data/control frame 都刷新该 liveness；旧配置 `responses_ws.client_pong_timeout_ms` 已移除，不再读取或 fallback。业务 idle 由 actor watchdog 维护，只由客户端 data frame 与 provider frame/usage/error 刷新。总连接寿命墙用于回收长期挂起连接，pending provider buffer 上限用于限制 send 结果确认前的内存占用。Trade-off：32 MiB 默认 read limit 降低 Codex 大上下文/文件负载误伤，但会提高单连接峰值内存预算；超限后 gorilla 连接不可复用，因此实现返回静态 `invalid_event` 后关闭连接。
 
 ## Turn 事务
 
@@ -354,7 +354,7 @@ Provider 边界以 [OpenAI Responses WebSocket mode](https://developers.openai.c
 
 ### Read timeout 分层
 
-OpenAI ResponsesWS 的 timeout 分层：首帧用 gorilla read deadline 限制握手悬挂；首帧成功后立即清除 gorilla read deadline；客户端连接活性由 ping/pong liveness watchdog 判断，超时原因固定为 `client_pong_timeout`；业务 idle 由 actor watchdog 判断，provider frame、usage、provider-originated error 和客户端 data frame 刷新 actor activity。Trade-off：不再用 `2 * realtime.websocket_ping_interval_ms` 隐式杀 established 连接，代价是断开的客户端最多保留到 `responses_ws.client_pong_timeout_ms` 才回收；收益是长 Codex/ResponsesWS turn 不会因为下游 pong 抖动被 50 秒 socket deadline 误杀。
+OpenAI ResponsesWS 的 timeout 分层：首帧用 gorilla read deadline 限制握手悬挂；首帧成功后立即清除 gorilla read deadline；客户端连接活性由 inbound activity watchdog 判断，超时原因固定为 `inbound_idle`；业务 idle 由 actor watchdog 判断，provider frame、usage、provider-originated error 和客户端 data frame 刷新 actor activity。Trade-off：不再用 `2 * realtime.websocket_ping_interval_ms` 隐式杀 established 连接，代价是断开的客户端最多保留到 `responses_websocket_client_inbound_activity_timeout_ms` 才回收；收益是长 Codex/ResponsesWS turn 不会因为下游 pong 抖动被 50 秒 socket deadline 误杀。
 
 ## 失败矩阵
 

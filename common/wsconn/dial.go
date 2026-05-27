@@ -119,19 +119,23 @@ func DialManaged(ctx context.Context, rawURL string, header http.Header, cfg Con
 		}
 	}
 	handshakeTimeout := normalizeDialHandshakeTimeout(dc.handshakeTimeout)
-	validationCtx, cancelValidation := dialValidationContext(ctx, handshakeTimeout)
-	defer cancelValidation()
-	resolved, err := validateDialTarget(validationCtx, rawURL, dc.security)
-	if err != nil {
-		return nil, err
-	}
 	netDial := dc.netDialContext
 	if netDial == nil {
 		d := &net.Dialer{Timeout: handshakeTimeout, KeepAlive: 30 * time.Second}
 		netDial = d.DialContext
 	}
+	var resolved resolvedDialTarget
 	if dc.proxyURL == "" {
+		validationCtx, cancelValidation := dialValidationContext(ctx, handshakeTimeout)
+		defer cancelValidation()
+		var err error
+		resolved, err = validateDialTarget(validationCtx, rawURL, dc.security)
+		if err != nil {
+			return nil, err
+		}
 		netDial = pinnedNetDialContext(netDial, resolved)
+	} else if err := validateProxiedDialTarget(rawURL, dc.security); err != nil {
+		return nil, err
 	}
 	dialer := websocket.Dialer{
 		HandshakeTimeout: handshakeTimeout,
@@ -197,6 +201,30 @@ func validateDialTarget(ctx context.Context, rawURL string, policy DialSecurityP
 		}
 	}
 	return resolvedDialTarget{host: host, ips: ips}, nil
+}
+
+func validateProxiedDialTarget(rawURL string, policy DialSecurityPolicy) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("%w: %s", ErrInvalidDialURL, redactedURLForError(rawURL))
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "wss":
+	case "ws":
+		if !policy.AllowInsecureWS {
+			return fmt.Errorf("%w: %s", ErrInsecureScheme, redactedURLForError(rawURL))
+		}
+	default:
+		return fmt.Errorf("%w: %s", ErrInsecureScheme, redactedURLForError(rawURL))
+	}
+	host := u.Hostname()
+	if host == "" {
+		return fmt.Errorf("%w: missing host", ErrInvalidDialURL)
+	}
+	if isMetadataIP(net.ParseIP(host)) {
+		return fmt.Errorf("%w: %s", ErrPrivateAddrBlocked, host)
+	}
+	return nil
 }
 
 func dialValidationContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {

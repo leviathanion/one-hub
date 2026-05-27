@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"net/http"
 	"one-api/cli"
@@ -172,12 +173,34 @@ func initHttpServer() {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := wsconn.ShutdownActive(shutdownCtx); err != nil {
-		logger.SysError("failed to drain active websocket connections: " + err.Error())
+	if err := gracefulShutdown(shutdownCtx, httpServer, wsconn.ShutdownActive); err != nil {
+		logger.FatalLog("failed to shutdown server: " + err.Error())
 	}
-	if err := httpServer.Shutdown(shutdownCtx); err != nil {
-		logger.FatalLog("failed to shutdown HTTP server: " + err.Error())
+}
+
+func gracefulShutdown(ctx context.Context, httpServer *http.Server, drainWebSockets func(context.Context) error) error {
+	var shutdownHTTP func(context.Context) error
+	if httpServer != nil {
+		shutdownHTTP = httpServer.Shutdown
 	}
+	return gracefulShutdownSteps(ctx, shutdownHTTP, drainWebSockets)
+}
+
+func gracefulShutdownSteps(ctx context.Context, shutdownHTTP func(context.Context) error, drainWebSockets func(context.Context) error) error {
+	var shutdownErrs []error
+	if shutdownHTTP != nil {
+		if err := shutdownHTTP(ctx); err != nil {
+			logger.SysError("failed to shutdown HTTP server: " + err.Error())
+			shutdownErrs = append(shutdownErrs, fmt.Errorf("http shutdown: %w", err))
+		}
+	}
+	if drainWebSockets != nil {
+		if err := drainWebSockets(ctx); err != nil {
+			logger.SysError("failed to drain active websocket connections: " + err.Error())
+			shutdownErrs = append(shutdownErrs, fmt.Errorf("websocket drain: %w", err))
+		}
+	}
+	return errors.Join(shutdownErrs...)
 }
 
 func SyncChannelCache(frequency int) {

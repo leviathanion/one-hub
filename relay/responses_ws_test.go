@@ -281,7 +281,10 @@ func (l *responsesWSTestLease) Lost() <-chan struct{} {
 	return l.lost
 }
 
-var responsesWSConnectionAttemptTokenSeq int64 = 91000
+var (
+	responsesWSConnectionAttemptTokenSeq int64 = 91000
+	responsesWSTestViperMu               sync.Mutex
+)
 
 func nextResponsesWSConnectionAttemptTokenID() int {
 	return int(atomic.AddInt64(&responsesWSConnectionAttemptTokenSeq, 1))
@@ -289,10 +292,28 @@ func nextResponsesWSConnectionAttemptTokenID() int {
 
 func setResponsesWSTestViperInt(t *testing.T, key string, value int) {
 	t.Helper()
+	responsesWSTestViperMu.Lock()
 	previous := viper.Get(key)
 	viper.Set(key, value)
+	responsesWSTestViperMu.Unlock()
 	t.Cleanup(func() {
+		responsesWSTestViperMu.Lock()
+		defer responsesWSTestViperMu.Unlock()
 		viper.Set(key, previous)
+	})
+}
+
+func startResponsesWSTestActor(t *testing.T, actor *ResponsesWSSessionActor) {
+	t.Helper()
+	actor.Start()
+	t.Cleanup(func() {
+		actor.close("test_cleanup")
+		select {
+		case <-actor.Done():
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for responses websocket actor cleanup")
+		}
+		actor.waitStartedGoroutines()
 	})
 }
 
@@ -896,7 +917,7 @@ func TestResponsesWSFirstTurnOpenResultAfterClientCloseIsAbortedNotAdopted(t *te
 
 	actor := NewResponsesWSSessionActor(ctx)
 	actor.ReserveFirstTurnOpening(frame)
-	actor.Start()
+	startResponsesWSTestActor(t, actor)
 	actor.startFirstTurnOpenWorker(actor.openingID, frame)
 
 	select {
@@ -1233,7 +1254,7 @@ func TestResponsesWSFirstTurnRetryOpenDoesNotBlockActorLoop(t *testing.T) {
 		snapshot:          NewResponsesWSRequestSnapshot(ctx),
 	}
 	actor.state = responsesWSStatePendingSend
-	actor.Start()
+	startResponsesWSTestActor(t, actor)
 
 	if !actor.Post(ResponsesWSEventSendResult{
 		AttemptID:         "attempt-old",

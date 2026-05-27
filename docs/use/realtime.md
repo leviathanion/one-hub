@@ -353,8 +353,8 @@ realtime_websocket_client_inbound_activity_timeout_ms: 60000
 | `realtime_websocket_client_ping_interval_ms` | 客户端 → 服务端 | one-hub 向**上游 provider** 发送 Ping |
 
 **排障信号**：
-- 超时关闭码：`1000`（正常关闭），关闭原因字符串：`"client_pong_timeout"`
-- 日志：搜索 `"client_pong_timeout"` 可定位所有因客户端活性超时关闭的连接
+- 超时关闭码：`1000`（正常关闭），关闭原因字符串：`"inbound_idle"`
+- 日志：搜索 `"inbound_idle"` 可定位所有因客户端入站活性超时关闭的连接
 
 ---
 

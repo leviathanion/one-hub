@@ -507,6 +507,7 @@ type ResponsesWSSessionActor struct {
 	clientClosed                atomic.Bool
 	backpressurePosted          atomic.Bool
 	downstreamCloseSent         atomic.Bool
+	runWG                       sync.WaitGroup
 	sendCommands                chan responsesWSSendCommand
 	sendOnce                    sync.Once
 	sendWG                      sync.WaitGroup
@@ -559,12 +560,26 @@ func (a *ResponsesWSSessionActor) SetClientConn(conn *wsconn.ManagedConn) {
 }
 
 func (a *ResponsesWSSessionActor) Start() {
-	go a.loop()
-	go a.idleWatchdog()
+	a.runWG.Add(2)
+	go func() {
+		defer a.runWG.Done()
+		a.loop()
+	}()
+	go func() {
+		defer a.runWG.Done()
+		a.idleWatchdog()
+	}()
 }
 
 func (a *ResponsesWSSessionActor) Done() <-chan struct{} {
 	return a.done
+}
+
+func (a *ResponsesWSSessionActor) waitStartedGoroutines() {
+	if a == nil {
+		return
+	}
+	a.runWG.Wait()
 }
 
 func (a *ResponsesWSSessionActor) Post(event ResponsesWSEvent) bool {

@@ -366,6 +366,42 @@ func TestProxyURLAcceptsSocks5H(t *testing.T) {
 	}
 }
 
+func TestDialManagedWithProxySkipsTargetDNSAndIPPinning(t *testing.T) {
+	dialFailure := errors.New("proxy dial attempted")
+	var dialAddr string
+	_, err := DialManaged(context.Background(), "wss://target-name-that-must-not-resolve.invalid/realtime", nil, Config{},
+		WithProxyURL("http://127.0.0.1:8080"),
+		WithNetDialContext(func(_ context.Context, _ string, addr string) (net.Conn, error) {
+			dialAddr = addr
+			return nil, dialFailure
+		}),
+	)
+	if !errors.Is(err, dialFailure) {
+		t.Fatalf("err=%v, want proxy dial failure; target DNS may have been resolved locally", err)
+	}
+	if dialAddr != "127.0.0.1:8080" {
+		t.Fatalf("dial addr=%q, want proxy address", dialAddr)
+	}
+}
+
+func TestDialManagedWithProxyStillBlocksMetadataIPLiteral(t *testing.T) {
+	var dialed bool
+	_, err := DialManaged(context.Background(), "wss://169.254.169.254/realtime", nil, Config{},
+		WithProxyURL("http://127.0.0.1:8080"),
+		WithDialSecurityPolicy(DialSecurityPolicy{AllowPrivateIP: true}),
+		WithNetDialContext(func(context.Context, string, string) (net.Conn, error) {
+			dialed = true
+			return nil, errors.New("unexpected proxy dial")
+		}),
+	)
+	if !errors.Is(err, ErrPrivateAddrBlocked) {
+		t.Fatalf("err=%v, want ErrPrivateAddrBlocked", err)
+	}
+	if dialed {
+		t.Fatal("metadata IP literal attempted proxy dial")
+	}
+}
+
 func TestDialManagedPinsValidatedResolvedIP(t *testing.T) {
 	var dialAddr string
 	_, err := DialManaged(context.Background(), "wss://localhost/realtime", nil, Config{},
