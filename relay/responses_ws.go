@@ -450,6 +450,102 @@ func parseResponsesWSClosePayload(payload []byte) (int, string) {
 	return code, string(payload[2:])
 }
 
+type responsesWSFrameDiagnostics struct {
+	EventType         string
+	Generate          string
+	PreviousResponse  string
+	Model             string
+	Subagent          string
+	ParentThreadID    string
+	TurnRequestKind   string
+	TurnMetadataBytes int
+	PayloadBytes      int
+}
+
+func responsesWSFrameDiagnosticsFromRaw(raw []byte) responsesWSFrameDiagnostics {
+	diag := responsesWSFrameDiagnostics{PayloadBytes: len(raw)}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return diag
+	}
+	diag.EventType = jsonStringField(object, "type")
+	diag.Model = jsonStringField(object, "model")
+	diag.PreviousResponse = jsonStringField(object, "previous_response_id")
+	diag.Generate = jsonBoolPresence(object, "generate")
+
+	var metadata map[string]json.RawMessage
+	if rawMetadata, ok := object["client_metadata"]; ok {
+		if err := json.Unmarshal(rawMetadata, &metadata); err == nil {
+			diag.Subagent = jsonStringField(metadata, "x-openai-subagent")
+			diag.ParentThreadID = jsonStringField(metadata, "x-codex-parent-thread-id")
+			turnMetadata := jsonStringField(metadata, "x-codex-turn-metadata")
+			diag.TurnMetadataBytes = len(turnMetadata)
+			diag.TurnRequestKind = responsesWSTurnRequestKind(turnMetadata)
+		}
+	}
+	return diag
+}
+
+func jsonStringField(object map[string]json.RawMessage, key string) string {
+	if object == nil {
+		return ""
+	}
+	raw, ok := object[key]
+	if !ok {
+		return ""
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(value)
+}
+
+func jsonBoolPresence(object map[string]json.RawMessage, key string) string {
+	if object == nil {
+		return "absent"
+	}
+	raw, ok := object[key]
+	if !ok {
+		return "absent"
+	}
+	var value bool
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "non_bool"
+	}
+	if value {
+		return "true"
+	}
+	return "false"
+}
+
+func responsesWSTurnRequestKind(turnMetadata string) string {
+	turnMetadata = strings.TrimSpace(turnMetadata)
+	if turnMetadata == "" {
+		return ""
+	}
+	var metadata map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(turnMetadata), &metadata); err != nil {
+		return ""
+	}
+	return jsonStringField(metadata, "request_kind")
+}
+
+func logResponsesWSFirstFrame(ctx context.Context, diag responsesWSFrameDiagnostics) {
+	logger.LogInfo(ctx, fmt.Sprintf(
+		"responses websocket first frame: type=%s model=%s generate=%s has_previous_response_id=%t subagent=%s parent_thread_id=%s request_kind=%s turn_metadata_bytes=%d payload_bytes=%d",
+		diag.EventType,
+		diag.Model,
+		diag.Generate,
+		diag.PreviousResponse != "",
+		diag.Subagent,
+		diag.ParentThreadID,
+		diag.TurnRequestKind,
+		diag.TurnMetadataBytes,
+		diag.PayloadBytes,
+	))
+}
+
 type responsesWSSessionState int
 
 const (
@@ -1670,6 +1766,7 @@ func (a *ResponsesWSSessionActor) handleProviderDownstream(event ResponsesWSEven
 		classified.Kind == responsesws.ResponsesFailedTerminal ||
 		classified.Kind == responsesws.ResponsesCancelledTerminal
 	if isTerminal {
+		a.logProviderTerminal(classified, receivedAt)
 		a.activeAttempt.MarkCompleted(receivedAt)
 		a.finalizeActiveAttempt()
 		a.processProviderPayloadAPIError(payload, event.ChannelID, "responses_ws_provider_frame")
@@ -1995,6 +2092,76 @@ func (a *ResponsesWSSessionActor) handleClientClosed(err error) {
 	a.close("client_closed")
 }
 
+func (a *ResponsesWSSessionActor) logProviderTerminal(classified responsesws.ResponsesTerminalResult, receivedAt time.Time) {
+	if a == nil {
+		return
+	}
+	elapsedMs := int64(-1)
+	if !a.firstTurnStartedAt.IsZero() {
+		elapsedMs = receivedAt.Sub(a.firstTurnStartedAt).Milliseconds()
+	}
+	promptTokens := 0
+	completionTokens := 0
+	totalTokens := 0
+	status := ""
+	if classified.Response != nil && classified.Response.Usage != nil {
+		promptTokens = classified.Response.Usage.InputTokens
+		completionTokens = classified.Response.Usage.OutputTokens
+		totalTokens = classified.Response.Usage.TotalTokens
+	}
+	if classified.Response != nil {
+		status = classified.Response.Status
+	}
+	logger.LogInfo(a.logContext(), fmt.Sprintf(
+		"responses websocket provider terminal: event_type=%s kind=%d status=%s continuation_miss=%t elapsed_ms=%d channel_id=%d prompt_tokens=%d completion_tokens=%d total_tokens=%d",
+		classified.EventType,
+		classified.Kind,
+		status,
+		classified.ContinuationMiss,
+		elapsedMs,
+		a.activeChannelID,
+		promptTokens,
+		completionTokens,
+		totalTokens,
+	))
+}
+
+func (a *ResponsesWSSessionActor) logClose(reason string) {
+	if a == nil {
+		return
+	}
+	elapsedMs := int64(-1)
+	if !a.firstTurnStartedAt.IsZero() {
+		elapsedMs = time.Since(a.firstTurnStartedAt).Milliseconds()
+	}
+	logger.LogInfo(a.logContext(), fmt.Sprintf(
+		"responses websocket session closing: reason=%s state=%d pending_phase=%d pending_attempt=%t active_attempt=%t pending_provider_events=%d pending_provider_evidence=%t active_channel_id=%d session_channel_id=%d downstream_close_sent=%t client_closed=%t elapsed_ms=%d",
+		strings.TrimSpace(reason),
+		a.state,
+		a.pendingTurnPhase,
+		a.pendingAttempt != nil,
+		a.activeAttempt != nil,
+		len(a.pendingProviderEvents),
+		a.pendingProviderEvidenceSeen,
+		a.activeChannelID,
+		a.sessionChannelID,
+		a.downstreamCloseSent.Load(),
+		a.clientClosed.Load(),
+		elapsedMs,
+	))
+}
+
+func (a *ResponsesWSSessionActor) logContext() context.Context {
+	if a == nil {
+		return context.Background()
+	}
+	ctx := a.Context()
+	if ctx != nil && ctx.Request != nil {
+		return ctx.Request.Context()
+	}
+	return context.Background()
+}
+
 func (a *ResponsesWSSessionActor) isBusy() bool {
 	return a.pendingTurnPhase != responsesWSPendingTurnNone || a.pendingAttempt != nil || a.activeAttempt != nil || a.state == responsesWSStateOpening || a.state == responsesWSStatePendingPrepare || a.state == responsesWSStatePendingSend || a.state == responsesWSStateInFlight
 }
@@ -2113,6 +2280,7 @@ func (a *ResponsesWSSessionActor) close(reason string) {
 	if a == nil || a.closed.Swap(true) {
 		return
 	}
+	a.logClose(reason)
 	a.cancelSetup()
 	a.releasePendingLease()
 	defer a.releaseActiveLease()
@@ -2196,19 +2364,23 @@ func ResponsesWebSocket(c *gin.Context) {
 	firstFrameReceivedAt := time.Now()
 	if err != nil {
 		_ = clientConn.WriteMessage(wsconn.TextMessage, responsesWSErrorPayload(http.StatusBadRequest, "invalid_event", responsesWSFirstFrameReadErrorMessage(err)))
+		logger.LogWarn(c.Request.Context(), fmt.Sprintf("responses websocket first frame read failed: err=%v timeout=%s", err, config.ResponsesWSFirstFrameTimeout()))
 		clientConn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "first_frame_read_failed", Err: err})
 		return
 	}
 	if mt != wsconn.TextMessage {
+		logger.LogWarn(c.Request.Context(), fmt.Sprintf("responses websocket first frame rejected: message_type=%d reason=text_only", mt))
 		clientConn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindNormal, Code: wsconn.CloseUnsupportedData, Reason: "text_only"})
 		return
 	}
 	frame, err := responsesws.ParseRawResponsesCreateFrame(raw)
 	if err != nil {
 		_ = clientConn.WriteMessage(wsconn.TextMessage, responsesWSErrorPayload(http.StatusBadRequest, responsesWSErrorCodeInvalidResponseCreate, responsesWSMessageInvalidResponseCreate))
+		logger.LogWarn(c.Request.Context(), fmt.Sprintf("responses websocket first frame parse failed: err=%v payload_bytes=%d", err, len(raw)))
 		clientConn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindNormal, Code: wsconn.ClosePolicyViolation, Reason: responsesWSErrorCodeInvalidResponseCreate, Err: err})
 		return
 	}
+	logResponsesWSFirstFrame(c.Request.Context(), responsesWSFrameDiagnosticsFromRaw(raw))
 
 	actor := NewResponsesWSSessionActor(c)
 	defer func() {
