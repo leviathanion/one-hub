@@ -99,9 +99,9 @@ func (r *relayResponses) sendCurrentProvider() (err *types.OpenAIErrorWithStatus
 		}
 
 		r.responsesRequest.Model = r.modelName
-		channel := r.provider.GetChannel()
 		responsesProvider, ok := r.provider.(providersBase.ResponsesInterface)
-		if !ok || channel.CompatibleResponse || !r.provider.GetSupportedResponse() {
+		canNative := ok && r.provider.GetSupportedResponse()
+		if !canNative {
 			err = common.StringErrorWrapperLocal("channel not implemented", "channel_error", http.StatusServiceUnavailable)
 			done = true
 			return
@@ -122,7 +122,15 @@ func (r *relayResponses) sendCurrentProvider() (err *types.OpenAIErrorWithStatus
 		r.responsesRequest.Model = r.modelName
 		channel := r.provider.GetChannel()
 		responsesProvider, ok := r.provider.(providersBase.ResponsesInterface)
-		if !ok || channel.CompatibleResponse || !r.provider.GetSupportedResponse() {
+		canNative := ok && r.provider.GetSupportedResponse()
+
+		if !canNative {
+			if !channel.CompatibleResponse {
+				err = common.StringErrorWrapperLocal("channel not implemented", "channel_error", http.StatusServiceUnavailable)
+				done = true
+				return
+			}
+
 			// 做一层Chat的兼容
 			chatProvider, ok := r.provider.(providersBase.ChatInterface)
 			if !ok {

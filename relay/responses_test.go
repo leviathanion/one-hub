@@ -625,7 +625,7 @@ func TestRelayResponsesCompatibleStreamRecordsPreviousResponseIDAffinity(t *test
 
 	provider := &compatibleStreamChatProvider{
 		BaseProvider: providersBase.BaseProvider{
-			Channel:         &model.Channel{Id: 67},
+			Channel:         &model.Channel{Id: 67, CompatibleResponse: true},
 			SupportResponse: false,
 		},
 		stream: stream,
@@ -947,7 +947,7 @@ func TestRelayResponsesCompatibleFallbackRejectsStatefulResponses(t *testing.T) 
 
 			provider := &compatibleResponsesChatProvider{
 				BaseProvider: providersBase.BaseProvider{
-					Channel: &model.Channel{Id: 88},
+					Channel: &model.Channel{Id: 88, CompatibleResponse: true},
 				},
 				response: &types.ChatCompletionResponse{
 					ID:     "chatcmpl_unused",
