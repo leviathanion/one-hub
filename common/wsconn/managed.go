@@ -1,6 +1,7 @@
 package wsconn
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -154,7 +155,7 @@ func (c *ManagedConn) Close(info CloseInfo) {
 		return
 	}
 	if info.Kind == CloseKindUnknown {
-		logWarnf("wsconn[%s]: Close called with unknown kind; falling back to abort", c.label())
+		logWarnf(context.Background(), "wsconn[%s]: Close called with unknown kind; falling back to abort", c.label())
 		info.Kind = CloseKindAbort
 	}
 	info.At = c.clock.Now()
@@ -193,7 +194,7 @@ func (c *ManagedConn) CloseInfo() CloseInfo {
 func (c *ManagedConn) cleanupSafely(info CloseInfo) {
 	defer func() {
 		if r := recover(); r != nil {
-			logWarnf("wsconn[%s]: cleanup panic: %v", c.label(), r)
+			logWarnf(context.Background(), "wsconn[%s]: cleanup panic: %v", c.label(), r)
 		}
 		c.finishCleanup()
 	}()
@@ -227,7 +228,7 @@ func (c *ManagedConn) finishCleanup() {
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
-					logWarnf("wsconn[%s]: active unregister panic: %v", c.label(), r)
+					logWarnf(context.Background(), "wsconn[%s]: active unregister panic: %v", c.label(), r)
 				}
 			}()
 			c.unregisterActive()
@@ -255,7 +256,7 @@ func (c *ManagedConn) waitControlWriterDone() {
 	select {
 	case <-c.control.done:
 	case <-timer.Chan():
-		logWarnf("wsconn[%s]: control writer cleanup wait timed out", c.label())
+		logWarnf(context.Background(), "wsconn[%s]: control writer cleanup wait timed out", c.label())
 	}
 }
 
@@ -282,7 +283,7 @@ func (c *ManagedConn) writeCloseFrameBestEffort(code CloseCode, reason string) e
 		// Trade-off: close frames are useful diagnostics, but cleanup completion is
 		// more important. A stuck data/control writer can hold writeMu forever when
 		// WriteTimeout=0, so cleanup must not block behind it.
-		logWarnf("wsconn[%s]: skipping close frame because writer is busy during cleanup", c.label())
+		logWarnf(context.Background(), "wsconn[%s]: skipping close frame because writer is busy during cleanup", c.label())
 		return errControlQueueFull
 	}
 	defer c.writeMu.Unlock()
@@ -320,7 +321,7 @@ func (c *ManagedConn) runtimeWriteTimeout() time.Duration {
 	}
 	d := c.cfg.WriteTimeout()
 	if d < 0 {
-		logWarnf("wsconn[%s]: WriteTimeout returned negative; falling back to default", c.label())
+		logWarnf(context.Background(), "wsconn[%s]: WriteTimeout returned negative; falling back to default", c.label())
 		return defaultWriteTimeout
 	}
 	return d

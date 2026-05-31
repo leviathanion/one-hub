@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"one-api/common/logger"
+
 	"github.com/gorilla/websocket"
 )
 
@@ -528,7 +530,10 @@ func TestPumpSlowHandleObservationUsesFakeClock(t *testing.T) {
 	defer client.Close(CloseInfo{Kind: CloseKindAbort})
 	defer server.Close(CloseInfo{Kind: CloseKindAbort})
 
-	recorder := &recordingSlowHandleObserver{observed: make(chan time.Duration, 1)}
+	recorder := &recordingSlowHandleObserver{
+		observed:    make(chan time.Duration, 1),
+		ctxObserved: make(chan context.Context, 1),
+	}
 	slowHandleObserverMu.Lock()
 	previousRecorder := slowHandleRecorder
 	slowHandleRecorder = recorder
@@ -540,13 +545,14 @@ func TestPumpSlowHandleObservationUsesFakeClock(t *testing.T) {
 	})
 
 	handled := make(chan struct{}, 1)
+	pumpCtx := context.WithValue(context.Background(), logger.RequestIdKey, "req-slow-handle")
 	go Pump{
 		Conn: client,
 		Handle: func(context.Context, MessageType, []byte) {
 			clock.Advance(5 * time.Millisecond)
 			handled <- struct{}{}
 		},
-	}.Run(context.Background())
+	}.Run(pumpCtx)
 
 	if err := server.WriteMessage(TextMessage, []byte("slow")); err != nil {
 		t.Fatalf("server write slow frame: %v", err)
@@ -563,6 +569,14 @@ func TestPumpSlowHandleObservationUsesFakeClock(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatalf("timed out waiting for slow handle observation")
+	}
+	select {
+	case ctx := <-recorder.ctxObserved:
+		if got := ctx.Value(logger.RequestIdKey); got != "req-slow-handle" {
+			t.Fatalf("observed request id=%v, want req-slow-handle", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for slow handle context")
 	}
 }
 
@@ -945,9 +959,11 @@ func goroutineStackContains(needle string) bool {
 }
 
 type recordingSlowHandleObserver struct {
-	observed chan time.Duration
+	observed    chan time.Duration
+	ctxObserved chan context.Context
 }
 
-func (r *recordingSlowHandleObserver) Observe(elapsed time.Duration) {
+func (r *recordingSlowHandleObserver) Observe(ctx context.Context, elapsed time.Duration) {
 	r.observed <- elapsed
+	r.ctxObserved <- ctx
 }

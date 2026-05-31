@@ -151,7 +151,7 @@ func (p Pump) Run(ctx context.Context) {
 					c.Close(CloseInfo{Kind: CloseKindHandlerPanic, Reason: "handler_panic", Err: fmt.Errorf("%v", r)})
 				}
 				if elapsed := c.clock.Now().Sub(start); elapsed > time.Millisecond {
-					observeSlowHandle(elapsed)
+					observeSlowHandle(ctx, elapsed)
 				}
 			}()
 			if p.Handle != nil {

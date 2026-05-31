@@ -1,6 +1,7 @@
 package wsconn
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -111,7 +112,7 @@ func SanitizeWireCloseCode(code int) CloseCode {
 	case code >= 3000 && code <= 4999:
 		return CloseCode(code)
 	default:
-		logWarnf("wsconn: invalid close code %d; using 1011", code)
+		logWarnf(context.Background(), "wsconn: invalid close code %d; using 1011", code)
 		return CloseInternalServerErr
 	}
 }

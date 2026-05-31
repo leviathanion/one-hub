@@ -11,13 +11,13 @@ import (
 )
 
 type slowHandleObserver interface {
-	Observe(time.Duration)
+	Observe(context.Context, time.Duration)
 }
 
 type slowHandleLogObserver struct{}
 
-func (slowHandleLogObserver) Observe(elapsed time.Duration) {
-	logWarnf("wsconn: slow Pump.Handle observed: %s", elapsed)
+func (slowHandleLogObserver) Observe(ctx context.Context, elapsed time.Duration) {
+	logWarnf(ctx, "wsconn: slow Pump.Handle observed: %s", elapsed)
 }
 
 var (
@@ -25,19 +25,19 @@ var (
 	slowHandleRecorder   slowHandleObserver = slowHandleLogObserver{}
 )
 
-func observeSlowHandle(elapsed time.Duration) {
+func observeSlowHandle(ctx context.Context, elapsed time.Duration) {
 	slowHandleObserverMu.RLock()
 	recorder := slowHandleRecorder
 	slowHandleObserverMu.RUnlock()
 	if recorder != nil {
-		recorder.Observe(elapsed)
+		recorder.Observe(ctx, elapsed)
 	}
 }
 
-func logWarnf(format string, args ...any) {
+func logWarnf(ctx context.Context, format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
 	if logger.Logger != nil {
-		logger.LogWarn(context.Background(), msg)
+		logger.LogWarn(ctx, msg)
 		return
 	}
 	log.Print(msg)
