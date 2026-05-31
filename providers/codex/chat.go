@@ -68,9 +68,12 @@ func (p *CodexProvider) applyDefaultHeaders(headers *codexHeaderBag) {
 		headers.Set("session_id", uuid.NewString())
 	}
 
-	// Set Originator when missing to mimic Codex CLI requests.
-	if !headers.Has("Originator") {
-		headers.Set("Originator", defaultOriginator)
+	// Smart originator: pass through client value, otherwise auto-select
+	// codex-tui for official clients or pi for non-official. Resolve from the
+	// effective upstream UA after channel/default overrides; using the incoming
+	// UA can produce inconsistent upstream identity when ModelHeaders replace it.
+	if !headers.Has("originator") {
+		headers.Set("originator", resolveSmartOriginatorForEffectiveUserAgent(headers.Get("User-Agent")))
 	}
 
 	// Keep the connection alive for SSE/non-SSE Codex responses.

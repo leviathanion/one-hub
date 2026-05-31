@@ -2,8 +2,14 @@ package codex
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -101,5 +107,65 @@ func TestWaitForRetryHonorsContextCancellation(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
 		t.Fatalf("expected cancellation to return promptly, took %v", elapsed)
+	}
+}
+
+func TestOAuth2CredentialsRefreshDoesNotSetUserAgentOrOriginator(t *testing.T) {
+	withTokenEndpointTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if values, exists := req.Header["User-Agent"]; exists {
+			t.Fatalf("expected refresh token request not to send user agent, got %q", values)
+		}
+		if got := req.Header.Get("Originator"); got != "" {
+			t.Fatalf("expected refresh token request not to set originator, got %q", got)
+		}
+		if got := req.Header.Get("Content-Type"); got != "application/x-www-form-urlencoded" {
+			t.Fatalf("expected form content type, got %q", got)
+		}
+
+		bodyBytes, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Fatalf("failed to read refresh request body: %v", err)
+		}
+		body := string(bodyBytes)
+		if !strings.Contains(body, "grant_type=refresh_token") || !strings.Contains(body, "refresh_token=refresh-token") {
+			t.Fatalf("expected form-encoded refresh body, got %q", body)
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{
+				"access_token":"new-access-token",
+				"refresh_token":"new-refresh-token",
+				"token_type":"Bearer",
+				"expires_in":3600
+			}`))
+	}))
+
+	creds := &OAuth2Credentials{RefreshToken: "refresh-token"}
+	if err := creds.Refresh(context.Background(), "", 0); err != nil {
+		t.Fatalf("expected refresh to succeed, got %v", err)
+	}
+	if creds.AccessToken != "new-access-token" || creds.RefreshToken != "new-refresh-token" {
+		t.Fatalf("expected credentials to be updated, got %+v", creds)
+	}
+}
+
+func withTokenEndpointTLSServer(t *testing.T, handler http.Handler) {
+	t.Helper()
+
+	server := httptest.NewTLSServer(handler)
+	t.Cleanup(server.Close)
+
+	originalTransport := http.DefaultTransport
+	t.Cleanup(func() {
+		http.DefaultTransport = originalTransport
+	})
+
+	serverAddr := server.Listener.Addr().String()
+	http.DefaultTransport = &http.Transport{
+		Proxy: nil,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, serverAddr)
+		},
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
 }

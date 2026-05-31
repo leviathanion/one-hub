@@ -149,8 +149,12 @@ func (c *OAuth2Credentials) Refresh(ctx context.Context, proxyURL string, maxRet
 		}
 
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		req.Header.Set("User-Agent", defaultUserAgent)
 		req.Header.Set("Accept", "application/json, text/plain, */*")
+		// Empty key presence suppresses net/http's default "Go-http-client/1.1"
+		// User-Agent on the wire. Trade-off: this relies on Go's documented
+		// request serialization behavior, but keeps OAuth identity separate from
+		// Codex API request identity.
+		req.Header.Set("User-Agent", "")
 
 		resp, err := client.Do(req)
 		if err != nil {

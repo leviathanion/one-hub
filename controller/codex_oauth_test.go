@@ -1,29 +1,23 @@
 package controller
 
 import (
+	"context"
+	"crypto/tls"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"one-api/providers/codex"
 )
 
-type roundTripperFunc func(*http.Request) (*http.Response, error)
-
-func (fn roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
-	return fn(req)
-}
-
-func TestExchangeCodexCodeForTokenUsesDefaultUserAgent(t *testing.T) {
-	originalTransport := http.DefaultTransport
-	t.Cleanup(func() {
-		http.DefaultTransport = originalTransport
-	})
-
-	http.DefaultTransport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-		if got := req.Header.Get("User-Agent"); got != codex.DefaultUserAgent() {
-			t.Fatalf("expected default codex user agent %q, got %q", codex.DefaultUserAgent(), got)
+func TestExchangeCodexCodeForTokenDoesNotSetUserAgentOrOriginator(t *testing.T) {
+	withTokenEndpointTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if values, exists := req.Header["User-Agent"]; exists {
+			t.Fatalf("expected token exchange not to send user agent, got %q", values)
+		}
+		if got := req.Header.Get("Originator"); got != "" {
+			t.Fatalf("expected token exchange not to set originator, got %q", got)
 		}
 		if got := req.Header.Get("Accept"); got != "application/json" {
 			t.Fatalf("expected json accept header, got %q", got)
@@ -41,17 +35,14 @@ func TestExchangeCodexCodeForTokenUsesDefaultUserAgent(t *testing.T) {
 			t.Fatalf("expected form-encoded auth code body, got %q", body)
 		}
 
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Body: io.NopCloser(strings.NewReader(`{
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{
 				"access_token":"access-token",
 				"refresh_token":"refresh-token",
 				"token_type":"Bearer",
 				"expires_in":3600
-			}`)),
-			Header: make(http.Header),
-		}, nil
-	})
+			}`))
+	}))
 
 	tokenResp, err := exchangeCodexCodeForToken("auth-code", "verifier-123", "state-123", "")
 	if err != nil {
@@ -59,5 +50,26 @@ func TestExchangeCodexCodeForTokenUsesDefaultUserAgent(t *testing.T) {
 	}
 	if tokenResp == nil || tokenResp.AccessToken != "access-token" || tokenResp.RefreshToken != "refresh-token" {
 		t.Fatalf("expected parsed token response, got %+v", tokenResp)
+	}
+}
+
+func withTokenEndpointTLSServer(t *testing.T, handler http.Handler) {
+	t.Helper()
+
+	server := httptest.NewTLSServer(handler)
+	t.Cleanup(server.Close)
+
+	originalTransport := http.DefaultTransport
+	t.Cleanup(func() {
+		http.DefaultTransport = originalTransport
+	})
+
+	serverAddr := server.Listener.Addr().String()
+	http.DefaultTransport = &http.Transport{
+		Proxy: nil,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, serverAddr)
+		},
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
 }

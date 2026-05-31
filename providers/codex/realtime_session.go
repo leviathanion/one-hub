@@ -1092,12 +1092,6 @@ func (p *CodexProvider) buildRealtimeHandshakePolicySignature() string {
 		userAgent = value
 		delete(headers, "user-agent")
 	}
-	if userAgent == defaultUserAgent {
-		userAgent = ""
-	}
-	if value := strings.TrimSpace(headers["originator"]); value == defaultOriginator {
-		delete(headers, "originator")
-	}
 
 	policy := codexRealtimeHandshakePolicy{
 		EffectiveUserAgent: userAgent,
@@ -1120,7 +1114,12 @@ func (p *CodexProvider) buildRealtimeCompatibilityHeaders() map[string]string {
 		headers.Set(key, value)
 	}
 	p.applyRealtimeRequestHeaderOverrides(headers)
-	headers.SetIfAbsent("originator", defaultOriginator)
+	if !headers.Has("User-Agent") {
+		headers.Set("User-Agent", defaultUserAgent)
+	}
+	if !headers.Has("originator") {
+		headers.Set("originator", resolveSmartOriginatorForEffectiveUserAgent(headers.Get("User-Agent")))
+	}
 	return headers.Map()
 }
 

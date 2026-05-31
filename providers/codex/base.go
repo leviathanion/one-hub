@@ -25,10 +25,11 @@ import (
 )
 
 const (
-	TokenCacheKey        = "api_token:codex"
-	refreshLockKeyPrefix = "codex:refresh-lock"
-	defaultUserAgent     = "codex-tui/0.135.0 (Arch Linux Rolling Release; x86_64) foot (codex-tui; 0.135.0)"
-	defaultOriginator    = "codex_cli_rs"
+	TokenCacheKey                     = "api_token:codex"
+	refreshLockKeyPrefix              = "codex:refresh-lock"
+	defaultUserAgent                  = "codex-tui/0.135.0 (Arch Linux Rolling Release; x86_64) foot (codex-tui; 0.135.0)"
+	defaultOfficialCodexOriginator    = "codex-tui"
+	defaultNonOfficialCodexOriginator = "pi"
 )
 
 const (

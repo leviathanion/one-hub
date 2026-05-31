@@ -1086,25 +1086,128 @@ func TestCodexRealtimeMetadataCompatibilityAndNamespaceBranches(t *testing.T) {
 		t.Fatalf("expected invalid model headers to produce empty compatibility headers, got %+v", headers)
 	}
 
-	modelHeaders := `{"Authorization":"ignored","Connection":"ignored","X-Session-Id":"ignored","Originator":"codex_cli_rs","User-Agent":"channel-ua","X-Trace":"trace"}`
+	modelHeaders := `{"Authorization":"ignored","Connection":"ignored","X-Session-Id":"ignored","Originator":"codex-tui","User-Agent":"channel-ua","X-Trace":"trace"}`
 	provider.Channel.ModelHeaders = &modelHeaders
 	channelHeaders := provider.buildRealtimeChannelCompatibilityHeaders()
 	if _, exists := channelHeaders["authorization"]; exists {
 		t.Fatalf("expected authorization header to be filtered, got %+v", channelHeaders)
 	}
-	if channelHeaders["x-trace"] != "trace" || channelHeaders["originator"] != defaultOriginator {
+	if channelHeaders["x-trace"] != "trace" || channelHeaders["originator"] != defaultOfficialCodexOriginator {
 		t.Fatalf("expected filtered compatibility headers to preserve x-trace/originator, got %+v", channelHeaders)
 	}
 
 	signature := provider.buildRealtimeHandshakePolicySignature()
-	if !strings.Contains(signature, "channel-ua") || strings.Contains(signature, defaultOriginator) {
-		t.Fatalf("expected handshake signature to use channel user agent and strip default originator, got %q", signature)
+	if !strings.Contains(signature, "channel-ua") || !strings.Contains(signature, defaultOfficialCodexOriginator) {
+		t.Fatalf("expected handshake signature to use channel user agent and preserve explicit channel originator, got %q", signature)
 	}
 	if got := provider.buildRealtimeCompatibilityHash("gpt-5", provider.readRealtimeUpstreamIdentity()); got == "" {
 		t.Fatal("expected compatibility hash to be populated")
 	}
 	if got := provider.readRealtimeUpstreamIdentity(); !strings.Contains(got, "credential:account:acct-123") {
 		t.Fatalf("expected upstream identity to include credential identity, got %q", got)
+	}
+}
+
+func TestCodexRealtimeCompatibilityHashSeparatesSmartOriginatorFallbacks(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	officialProvider := newTestCodexProviderWithContext(t, key, "", map[string]string{
+		"User-Agent": "codex_cli_rs/0.116.0",
+	})
+	nonOfficialProvider := newTestCodexProviderWithContext(t, key, "", map[string]string{
+		"User-Agent": "curl/8.0",
+	})
+
+	officialSignature := officialProvider.buildRealtimeHandshakePolicySignature()
+	if !strings.Contains(officialSignature, "codex_cli_rs/0.116.0") || !strings.Contains(officialSignature, `"originator":"codex-tui"`) {
+		t.Fatalf("expected official user agent and synthesized codex-tui originator to remain in signature, got %q", officialSignature)
+	}
+
+	nonOfficialSignature := nonOfficialProvider.buildRealtimeHandshakePolicySignature()
+	if !strings.Contains(nonOfficialSignature, `"originator":"pi"`) {
+		t.Fatalf("expected non-official pi originator to remain in handshake signature, got %q", nonOfficialSignature)
+	}
+
+	upstreamIdentity := officialProvider.readRealtimeUpstreamIdentity()
+	if upstreamIdentity != nonOfficialProvider.readRealtimeUpstreamIdentity() {
+		t.Fatalf("test setup expected matching upstream identity")
+	}
+	officialHash := officialProvider.buildRealtimeCompatibilityHash("gpt-5", upstreamIdentity)
+	nonOfficialHash := nonOfficialProvider.buildRealtimeCompatibilityHash("gpt-5", upstreamIdentity)
+	if officialHash == "" || nonOfficialHash == "" || officialHash == nonOfficialHash {
+		t.Fatalf("expected official and non-official smart originators to produce different hashes, official=%q non_official=%q", officialHash, nonOfficialHash)
+	}
+}
+
+func TestCodexRealtimeCompatibilityHashSmartOriginatorUsesEffectiveChannelUserAgent(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, "", map[string]string{
+		"User-Agent": "Mozilla/5.0",
+	})
+	provider.Channel.ModelHeaders = stringPtr(`{"User-Agent":"codex-tui/1.0"}`)
+
+	signature := provider.buildRealtimeHandshakePolicySignature()
+	if !strings.Contains(signature, "codex-tui/1.0") || !strings.Contains(signature, `"originator":"codex-tui"`) {
+		t.Fatalf("expected smart originator to follow effective channel user agent in signature, got %q", signature)
+	}
+}
+
+func TestCodexRealtimeCompatibilityHashIncludesDefaultOriginator(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	implicitProvider := newTestCodexProviderWithContext(t, key, "", map[string]string{
+		"User-Agent": defaultUserAgent,
+	})
+	explicitProvider := newTestCodexProviderWithContext(t, key, "", map[string]string{
+		"User-Agent": defaultUserAgent,
+		"Originator": defaultOfficialCodexOriginator,
+	})
+
+	implicitSignature := implicitProvider.buildRealtimeHandshakePolicySignature()
+	if !strings.Contains(implicitSignature, `"originator":"codex-tui"`) {
+		t.Fatalf("expected synthesized default originator to remain in signature, got %q", implicitSignature)
+	}
+
+	explicitSignature := explicitProvider.buildRealtimeHandshakePolicySignature()
+	if !strings.Contains(explicitSignature, `"originator":"codex-tui"`) {
+		t.Fatalf("expected explicit default originator to remain in signature, got %q", explicitSignature)
+	}
+
+	upstreamIdentity := implicitProvider.readRealtimeUpstreamIdentity()
+	if upstreamIdentity != explicitProvider.readRealtimeUpstreamIdentity() {
+		t.Fatalf("test setup expected matching upstream identity")
+	}
+	implicitHash := implicitProvider.buildRealtimeCompatibilityHash("gpt-5", upstreamIdentity)
+	explicitHash := explicitProvider.buildRealtimeCompatibilityHash("gpt-5", upstreamIdentity)
+	if implicitHash == "" || explicitHash == "" || implicitHash != explicitHash {
+		t.Fatalf("expected identical default originators to produce same compatibility hash, implicit=%q explicit=%q", implicitHash, explicitHash)
+	}
+}
+
+func TestCodexRealtimeCompatibilityHashSeparatesDifferentOfficialUserAgents(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	providerA := newTestCodexProviderWithContext(t, key, "", map[string]string{
+		"User-Agent": "codex-tui/1.0",
+	})
+	providerB := newTestCodexProviderWithContext(t, key, "", map[string]string{
+		"User-Agent": "CodexCanary/1.0",
+	})
+
+	signatureA := providerA.buildRealtimeHandshakePolicySignature()
+	if !strings.Contains(signatureA, "codex-tui/1.0") || !strings.Contains(signatureA, `"originator":"codex-tui"`) {
+		t.Fatalf("expected official user agent and synthesized codex-tui originator to remain in signature, got %q", signatureA)
+	}
+	signatureB := providerB.buildRealtimeHandshakePolicySignature()
+	if !strings.Contains(signatureB, "CodexCanary/1.0") || !strings.Contains(signatureB, `"originator":"codex-tui"`) {
+		t.Fatalf("expected official user agent and synthesized codex-tui originator to remain in signature, got %q", signatureB)
+	}
+
+	upstreamIdentity := providerA.readRealtimeUpstreamIdentity()
+	if upstreamIdentity != providerB.readRealtimeUpstreamIdentity() {
+		t.Fatalf("test setup expected matching upstream identity")
+	}
+	hashA := providerA.buildRealtimeCompatibilityHash("gpt-5", upstreamIdentity)
+	hashB := providerB.buildRealtimeCompatibilityHash("gpt-5", upstreamIdentity)
+	if hashA == "" || hashB == "" || hashA == hashB {
+		t.Fatalf("expected different official user agents to produce different hashes, a=%q b=%q", hashA, hashB)
 	}
 }
 

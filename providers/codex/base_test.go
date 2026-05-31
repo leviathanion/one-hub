@@ -149,8 +149,10 @@ func TestGetResponsesRequestAddsCLICompatibleDefaultHeaders(t *testing.T) {
 	if got := req.Header.Get("User-Agent"); got != defaultUserAgent {
 		t.Fatalf("expected default user agent %q, got %q", defaultUserAgent, got)
 	}
-	if got := req.Header.Get("Originator"); got != defaultOriginator {
-		t.Fatalf("expected default originator %q, got %q", defaultOriginator, got)
+	// No client User-Agent or originator means the upstream request uses the
+	// proxy's default Codex UA, so smart originator follows that effective UA.
+	if got := req.Header.Get("Originator"); got != defaultOfficialCodexOriginator {
+		t.Fatalf("expected smart originator %q for default upstream user agent, got %q", defaultOfficialCodexOriginator, got)
 	}
 	if got := req.Header.Get("Session_id"); got == "" {
 		t.Fatalf("expected generated session header")
@@ -201,12 +203,11 @@ func TestGetResponsesRequestPrefersIncomingCodexHeaders(t *testing.T) {
 	}
 }
 
-func TestGetResponsesRequestPrefersChannelUserAgentOverIncomingClientUserAgent(t *testing.T) {
+func TestGetResponsesRequestUsesCodexTUIOriginatorForOfficialClientFallback(t *testing.T) {
 	key := `{"access_token":"access-token","account_id":"acct-123"}`
 	provider := newTestCodexProviderWithContext(t, key, "", map[string]string{
-		"User-Agent": "Mozilla/5.0",
+		"User-Agent": "codex_cli_rs/0.116.0",
 	})
-	provider.Channel.ModelHeaders = stringPtr(`{"User-Agent":"custom-codex-ua"}`)
 
 	req, errWithCode := provider.getResponsesRequest(&types.OpenAIResponsesRequest{
 		Model: "gpt-5",
@@ -215,8 +216,30 @@ func TestGetResponsesRequestPrefersChannelUserAgentOverIncomingClientUserAgent(t
 		t.Fatalf("expected request build to succeed, got %v", errWithCode)
 	}
 
-	if got := req.Header.Get("User-Agent"); got != "custom-codex-ua" {
+	if got := req.Header.Get("Originator"); got != defaultOfficialCodexOriginator {
+		t.Fatalf("expected official client fallback originator %q, got %q", defaultOfficialCodexOriginator, got)
+	}
+}
+
+func TestGetResponsesRequestPrefersChannelUserAgentOverIncomingClientUserAgent(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, "", map[string]string{
+		"User-Agent": "Mozilla/5.0",
+	})
+	provider.Channel.ModelHeaders = stringPtr(`{"User-Agent":"codex-tui/1.0"}`)
+
+	req, errWithCode := provider.getResponsesRequest(&types.OpenAIResponsesRequest{
+		Model: "gpt-5",
+	})
+	if errWithCode != nil {
+		t.Fatalf("expected request build to succeed, got %v", errWithCode)
+	}
+
+	if got := req.Header.Get("User-Agent"); got != "codex-tui/1.0" {
 		t.Fatalf("expected channel user agent to win over incoming user agent, got %q", got)
+	}
+	if got := req.Header.Get("Originator"); got != defaultOfficialCodexOriginator {
+		t.Fatalf("expected smart originator to follow effective channel user agent, got %q", got)
 	}
 }
 
@@ -234,6 +257,28 @@ func TestGetResponsesRequestUsesChannelUserAgentWhenIncomingClientUserAgentMissi
 
 	if got := req.Header.Get("User-Agent"); got != "custom-codex-ua" {
 		t.Fatalf("expected channel user agent when incoming user agent is missing, got %q", got)
+	}
+}
+
+func TestGetResponsesRequestSmartOriginatorUsesEffectiveNonOfficialChannelUserAgent(t *testing.T) {
+	key := `{"access_token":"access-token","account_id":"acct-123"}`
+	provider := newTestCodexProviderWithContext(t, key, "", map[string]string{
+		"User-Agent": "codex_cli_rs/0.116.0",
+	})
+	provider.Channel.ModelHeaders = stringPtr(`{"User-Agent":"Mozilla/5.0"}`)
+
+	req, errWithCode := provider.getResponsesRequest(&types.OpenAIResponsesRequest{
+		Model: "gpt-5",
+	})
+	if errWithCode != nil {
+		t.Fatalf("expected request build to succeed, got %v", errWithCode)
+	}
+
+	if got := req.Header.Get("User-Agent"); got != "Mozilla/5.0" {
+		t.Fatalf("expected channel user agent to win over incoming user agent, got %q", got)
+	}
+	if got := req.Header.Get("Originator"); got != defaultNonOfficialCodexOriginator {
+		t.Fatalf("expected smart originator to follow effective non-official channel user agent, got %q", got)
 	}
 }
 
@@ -1799,5 +1844,110 @@ func TestAcquireChannelRefreshLockCleansUpUnusedEntry(t *testing.T) {
 	channelRefreshLocks.mu.Unlock()
 	if ok {
 		t.Fatalf("expected lock entry to be cleaned up after release")
+	}
+}
+
+func TestIsCodexOfficialClientRequest(t *testing.T) {
+	tests := []struct {
+		name      string
+		userAgent string
+		want      bool
+	}{
+		{"empty", "", false},
+		{"codex_cli_rs", "codex_cli_rs/0.116.0", true},
+		{"codex_vscode", "codex_vscode/1.0.0", true},
+		{"codex_app", "codex_app/2.1.0", true},
+		{"codex_chatgpt_desktop", "codex_chatgpt_desktop/1.0", true},
+		{"codex_atlas", "codex_atlas/0.5", true},
+		{"codex_exec", "codex_exec/3.0", true},
+		{"codex_sdk_ts", "codex_sdk_ts/0.9", true},
+		{"codex desktop with version", "Codex Desktop/1.0", true},
+		{"codex desktop case insensitive", "CODEX DESKTOP/2.0", true},
+		{"codex slash prefix", "codex/1.0", true},
+		{"codex hyphen prefix", "codex-tui/1.0", true},
+		{"codex bare prefix", "CodexCanary/1.0", true},
+		{"non-codex curl", "curl/8.0", false},
+		{"non-codex browser", "Mozilla/5.0", false},
+		{"codex substring only", "my-codex-tool/1.0", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isCodexOfficialClientRequest(tt.userAgent); got != tt.want {
+				t.Fatalf("isCodexOfficialClientRequest(%q) = %v, want %v", tt.userAgent, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsCodexOfficialClientOriginator(t *testing.T) {
+	tests := []struct {
+		name       string
+		originator string
+		want       bool
+	}{
+		{"empty", "", false},
+		{"codex_cli_rs", "codex_cli_rs", true},
+		{"codex_vscode", "codex_vscode", true},
+		{"codex_app", "codex_app", true},
+		{"codex_chatgpt_desktop", "codex_chatgpt_desktop", true},
+		{"codex_atlas", "codex_atlas", true},
+		{"codex_exec", "codex_exec", true},
+		{"codex_sdk_ts", "codex_sdk_ts", true},
+		{"codex desktop", "Codex Desktop", true},
+		{"codex desktop case insensitive", "CODEX DESKTOP", true},
+		{"codex slash prefix", "codex/cli", true},
+		{"codex hyphen prefix", "codex-tui", true},
+		{"codex bare prefix", "CodexCanary", true},
+		{"non-codex", "my_client", false},
+		{"codex substring only", "my-codex-client", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isCodexOfficialClientOriginator(tt.originator); got != tt.want {
+				t.Fatalf("isCodexOfficialClientOriginator(%q) = %v, want %v", tt.originator, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsCodexOfficialClientByHeaders(t *testing.T) {
+	tests := []struct {
+		name       string
+		userAgent  string
+		originator string
+		want       bool
+	}{
+		{"both empty", "", "", false},
+		{"UA official only", "codex_cli_rs/1.0", "", true},
+		{"originator official only", "curl/8.0", "codex_vscode", true},
+		{"both official", "codex_app/3.0", "codex_chatgpt_desktop", true},
+		{"neither official", "curl/8.0", "my_client", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isCodexOfficialClientByHeaders(tt.userAgent, tt.originator); got != tt.want {
+				t.Fatalf("isCodexOfficialClientByHeaders(%q, %q) = %v, want %v", tt.userAgent, tt.originator, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveSmartOriginatorForEffectiveUserAgent(t *testing.T) {
+	tests := []struct {
+		name      string
+		userAgent string
+		want      string
+	}{
+		{"empty effective UA", "", defaultNonOfficialCodexOriginator},
+		{"official client UA", "codex_cli_rs/0.116.0", defaultOfficialCodexOriginator},
+		{"codex-tui client UA", "codex-tui/1.0", defaultOfficialCodexOriginator},
+		{"non-official client UA", "curl/8.0", defaultNonOfficialCodexOriginator},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := resolveSmartOriginatorForEffectiveUserAgent(tt.userAgent); got != tt.want {
+				t.Fatalf("resolveSmartOriginatorForEffectiveUserAgent(%q) = %q, want %q", tt.userAgent, got, tt.want)
+			}
+		})
 	}
 }

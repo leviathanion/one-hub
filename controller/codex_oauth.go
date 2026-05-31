@@ -301,8 +301,12 @@ func exchangeCodexCodeForToken(code, codeVerifier, state, proxyURL string) (*cod
 	}
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", codex.DefaultUserAgent())
 	req.Header.Set("Accept", "application/json")
+	// Empty key presence suppresses net/http's default "Go-http-client/1.1"
+	// User-Agent on the wire. Trade-off: this relies on Go's documented
+	// request serialization behavior, but keeps OAuth identity separate from
+	// Codex API request identity.
+	req.Header.Set("User-Agent", "")
 
 	// Create HTTP client.
 	client := &http.Client{Timeout: 30 * time.Second}
