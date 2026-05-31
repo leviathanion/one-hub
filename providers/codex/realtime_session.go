@@ -853,6 +853,14 @@ func (s *codexManagedRealtimeSession) Abort(reason string) {
 		}
 		s.exec.Unlock()
 		if !owned {
+			// When ownership is stale (new handler already re-attached),
+			// we cannot safely mutate exec state, but we must release our
+			// attachment to prevent mailbox goroutine leaks.
+			// close() is idempotent and safe to call after the new owner
+			// has already closed it.
+			if s.attachment != nil {
+				s.attachment.close()
+			}
 			return
 		}
 		closeCodexClearedWebsocket(cleared)

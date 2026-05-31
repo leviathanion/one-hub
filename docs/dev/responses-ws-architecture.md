@@ -112,21 +112,22 @@ actor 后续 turn 使用当前 upstream session 和该 snapshot 做日志、诊�
 33. raw rewrite 只承诺语义级保留（unknown field value 不被 `float64` 改写），不承诺保留顶层对象 key 顺序、空白或重复 key 结构；parser 拒绝顶层重复 key。
 34. Codex provider 内部要求嵌套 `{"type":"response.create","response":{...}}` 的 wrapping 只能在发送给 codex provider 的边界做，wrapper 内容来自 raw map，不能来自 typed struct 重组。
 35. provider adapter 对 actor 暴露的必须是官方 ResponsesWS event surface；私有 bootstrap/control frame（`session.created`、内部 ack、transport greeting）必须在 adapter 内消费或转为本地协议错误。
+36. ResponsesWS 的 live provider execution session 只在同一条 downstream WebSocket 内复用；不同 downstream WS 连接必须使用不同 provider execution session，即使请求带相同 `x-session-id`。`x-session-id` 仍可参与 routing/prompt-cache identity，但不能成为跨连接共享上游 WS 的 binding。
 
 ### 并发与资源
 
-36. actor event loop 是 turn/quota/affinity state 的唯一写入者。I/O goroutine、provider、wrapper、observer callback 只能投递事件。
-37. proxy 对客户端 websocket 保持 single writer；provider frame 和 proxy-local error frame 都由 actor 下发 write command，再经同一个 write pump/write lock/write deadline 写出。
-38. 上游 provider websocket 写也必须有 deadline。实际写上游 frame 的 adapter 在写锁内设置 `SetWriteDeadline(now+RealtimeWebsocketWriteTimeout())`，写后清零；deadline/partial write 失败默认映射为 `SendOutcomeAmbiguous`。
-39. proxy-local error frame 不能触发 terminal sniff、active turn cleanup 或 affinity clear。
-40. `session.Recv` 返回的 payload 来源必须通过类型表达：没有 provider-origin proof 的 `Recv` error payload 一律按 proxy-local 写；provider-origin `payload + err` 必须端到端保真，先 primary payload，再把 `ClientPayloadError` 携带的 client payload 作为 proxy-local error 补发；若 err 不携带 `ClientPayloadError`，则在 primary payload 之后投递 provider close/timeout。
-41. gorilla read deadline 一旦设置会持续作用于后续 reads；first-frame deadline 只覆盖首帧读取，首帧成功后必须 `SetReadDeadline(time.Time{})`，established 阶段不得重新套用 `2 * realtime.websocket_ping_interval_ms` 这类隐式 read deadline。
-42. gorilla ping/pong control frames 必须刷新 connection liveness，但不能刷新 actor business idle；普通客户端 data frame 才同时刷新 connection liveness 和 actor activity。
-43. ResponsesWS established session 的 idle 语义以 `ResponsesWSIdleTimeout` 和业务 activity 为准。provider data frame、usage event、provider-originated error、客户端 data frame 都必须刷新 actor activity。OpenAI ResponsesWS 的 gorilla read-side API 只属于 read loop / read handler，writer 路径的 turn 状态变化不调用 `SetReadDeadline`，active-turn 无 provider/client data activity 时由业务 idle/后续独立 turn timer 关闭，不能复用客户端 socket read deadline。
-44. handler 的 live `gin.Context` 不跨 goroutine 读写。turn prepare/record/clear 使用稳定 input 或 `c.Copy()`。
-45. actor mailbox 事件必须分级：`SendResult`、actor 自身 panic/timeout 这类账本 proof / fail-closed 事件必须可靠投递；普通 provider data frame 可以受 mailbox backpressure 影响，但丢弃时必须最终投递 backpressure timeout 或关闭连接。
-46. `pendingProviderEvents` 必须同时有事件数和字节数上限；上限触发时 fail closed，不能靠 mailbox 长度推导内存边界。
-47. 所有 ResponsesWS goroutine 入口（actor loop、client read pump、provider recv pump、send worker、open worker、idle watchdog）都必须有 panic recovery，recovery 策略为 fail closed。
+37. actor event loop 是 turn/quota/affinity state 的唯一写入者。I/O goroutine、provider、wrapper、observer callback 只能投递事件。
+38. proxy 对客户端 websocket 保持 single writer；provider frame 和 proxy-local error frame 都由 actor 下发 write command，再经同一个 write pump/write lock/write deadline 写出。
+39. 上游 provider websocket 写也必须有 deadline。实际写上游 frame 的 adapter 在写锁内设置 `SetWriteDeadline(now+RealtimeWebsocketWriteTimeout())`，写后清零；deadline/partial write 失败默认映射为 `SendOutcomeAmbiguous`。
+40. proxy-local error frame 不能触发 terminal sniff、active turn cleanup 或 affinity clear。
+41. `session.Recv` 返回的 payload 来源必须通过类型表达：没有 provider-origin proof 的 `Recv` error payload 一律按 proxy-local 写；provider-origin `payload + err` 必须端到端保真，先 primary payload，再把 `ClientPayloadError` 携带的 client payload 作为 proxy-local error 补发；若 err 不携带 `ClientPayloadError`，则在 primary payload 之后投递 provider close/timeout。
+42. gorilla read deadline 一旦设置会持续作用于后续 reads；first-frame deadline 只覆盖首帧读取，首帧成功后必须 `SetReadDeadline(time.Time{})`，established 阶段不得重新套用 `2 * realtime.websocket_ping_interval_ms` 这类隐式 read deadline。
+43. gorilla ping/pong control frames 必须刷新 connection liveness，但不能刷新 actor business idle；普通客户端 data frame 才同时刷新 connection liveness 和 actor activity。
+44. ResponsesWS established session 的 idle 语义以 `ResponsesWSIdleTimeout` 和业务 activity 为准。provider data frame、usage event、provider-originated error、客户端 data frame 都必须刷新 actor activity。OpenAI ResponsesWS 的 gorilla read-side API 只属于 read loop / read handler，writer 路径的 turn 状态变化不调用 `SetReadDeadline`，active-turn 无 provider/client data activity 时由业务 idle/后续独立 turn timer 关闭，不能复用客户端 socket read deadline。
+45. handler 的 live `gin.Context` 不跨 goroutine 读写。turn prepare/record/clear 使用稳定 input 或 `c.Copy()`。
+46. actor mailbox 事件必须分级：`SendResult`、actor 自身 panic/timeout 这类账本 proof / fail-closed 事件必须可靠投递；普通 provider data frame 可以受 mailbox backpressure 影响，但丢弃时必须最终投递 backpressure timeout 或关闭连接。
+47. `pendingProviderEvents` 必须同时有事件数和字节数上限；上限触发时 fail closed，不能靠 mailbox 长度推导内存边界。
+48. 所有 ResponsesWS goroutine 入口（actor loop、client read pump、provider recv pump、send worker、open worker、idle watchdog）都必须有 panic recovery，recovery 策略为 fail closed。
 
 ## 核心组件
 
@@ -261,7 +262,7 @@ Terminal side effects 顺序是 actor contract：先 merge terminal usage 并 fi
 
 1. 按 pinned / owner affinity / fresh 规则选 channel。显式 pinned channel 可以 raw `fetchChannelById`；owner/preferred affinity 走 normal selector 的 strict preferred path，不能绕过 group/model/filter/cooldown/skip eligibility。
 2. 若 channel 明确不支持 ResponsesWS：fresh 或非 strict preferred affinity skip 当前 channel；pinned 或 strict owner affinity 写 wrapped fallback frame。
-3. 用 `RealtimeOpenOptions{PreferredTransport: TransportModeResponsesWS, RequireWS: true}` 打开 upstream session，禁止 HTTP bridge fallback。
+3. 为本 downstream WS 连接生成内部 `ClientSessionID`，用 `RealtimeOpenOptions{ClientSessionID: "responses-ws:<uuid>", PreferredTransport: TransportModeResponsesWS, RequireWS: true}` 打开 upstream session，禁止 HTTP bridge fallback。该内部 id 不来自客户端 `x-session-id`，首帧 retry 其它候选 channel 时复用同一个内部 id。
 4. actor 记录 `sessionChannelID`，只表示物理 session owner，不写共享 affinity。
 5. actor 冻结本连接的 upstream snapshot：channel、resolved base URL、原始/上游/billing model、billing flag 与 pre-cost；不存储 `key_fingerprint`。后续结算、日志和 continuation miss 诊断使用 snapshot，不重新读取 live channel 配置推导本连接事实。
 6. `PrepareResponsesWSTurnAttempt(...)` 完成 prompt-token 估算、quota 对象创建和 passive sink 准备，不执行 quota/RPM 副作用。

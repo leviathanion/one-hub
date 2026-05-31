@@ -31,7 +31,7 @@ func responsesWSSendOutcomeFromError(err error) ResponsesWSSendOutcome {
 	if errors.As(err, &event) && event != nil && event.IsError() {
 		code := openAIErrorCodeString(event.ErrorDetail.Code, "")
 		switch code {
-		case "previous_response_not_found", "invalid_event", "responses_ws_unsupported_for_channel":
+		case "previous_response_not_found", "invalid_event", "responses_ws_unsupported_for_channel", "session_busy":
 			return SendOutcomeNotSent
 		default:
 			return SendOutcomeAmbiguous

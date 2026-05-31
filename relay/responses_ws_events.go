@@ -35,6 +35,7 @@ const (
 	responsesWSBusyRejectLimit              = 16
 	responsesWSBusyRejectWindow             = 10 * time.Second
 	responsesWSPreviousResponseIDContextKey = "responses_ws_previous_response_id"
+	responsesWSConnectionSessionIDKey       = "responses_ws_connection_session_id"
 )
 
 const (

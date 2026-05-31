@@ -546,6 +546,23 @@ func logResponsesWSFirstFrame(ctx context.Context, diag responsesWSFrameDiagnost
 	))
 }
 
+// ensureResponsesWSConnectionSessionID assigns a per-downstream-connection
+// session id for provider execution-session isolation. Client x-session-id
+// remains available to routing/prompt-cache code through the request snapshot,
+// but ResponsesWS live provider WebSockets must not be shared across separate
+// downstream WebSocket connections.
+func ensureResponsesWSConnectionSessionID(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	if existing := strings.TrimSpace(c.GetString(responsesWSConnectionSessionIDKey)); existing != "" {
+		return existing
+	}
+	sessionID := "responses-ws:" + uuid.NewString()
+	c.Set(responsesWSConnectionSessionIDKey, sessionID)
+	return sessionID
+}
+
 type responsesWSSessionState int
 
 const (
@@ -1057,6 +1074,7 @@ func (a *ResponsesWSSessionActor) handleFirstTurnSetup(event ResponsesWSEventFir
 	actorCtx := a.Context()
 	request := event.Frame.Projection
 	prepareResponsesChannelAffinity(actorCtx, &request)
+	ensureResponsesWSConnectionSessionID(actorCtx)
 	a.RefreshContext(actorCtx)
 	admission := a.firstTurnAdmission
 	if admission == nil {

@@ -950,6 +950,8 @@ trade-off：
 - 同一个调用方带着同一个 `x-session-id` / `session-id` / `session_id` 回到同一个渠道时，可以复用之前的 execution session
 - 超过 TTL 后，runtime 会清理空闲 session，释放上游连接
 
+注意：这里的跨请求 execution session 复用只适用于 Codex Realtime 路径。Responses WebSocket (`GET /v1/responses`) 会为每条下游 WebSocket 连接使用独立的上游 execution session，避免 multi-agent 或多连接并发共享同一个 single-inflight 上游 WS。`x-session-id` 仍可用于 routing affinity 和 prompt cache identity，但不会让多条 ResponsesWS 连接复用同一个 live 上游 WS。
+
 ### 全局 `codex.execution_session_revocation_timeout_ms`
 
 配置位置：
@@ -984,6 +986,8 @@ trade-off：
 - 同一个 execution session 继续走 HTTP bridge
 - 不会每次请求都重新尝试 websocket 握手
 
+Responses WebSocket 入口要求真实 WS 传输，不能静默切到 HTTP bridge；如果 Codex 渠道不支持或暂时无法建立 ResponsesWS，会返回 websocket 入口的错误/回退信号，而不是在已升级的 ResponsesWS 连接内复用 HTTP bridge。
+
 ## Realtime 渠道亲和
 
 Codex realtime 现在采用 channel affinity + same-channel resume 语义：
@@ -994,6 +998,8 @@ Codex realtime 现在采用 channel affinity + same-channel resume 语义：
 - 只有在同一个 channel 内，provider 才会尝试复用本地 execution session / 上游 websocket
 - 如果该 channel 不可用，或 same-channel resume 因模型、headers、UA、base URL、credential 等兼容性变化失败，请求会走 fresh route，并在成功后把 affinity 改写到新 channel
 - 不支持跨 channel 延续旧的上游 realtime 会话
+
+Responses WebSocket 也可以使用相同的请求 identity 做渠道亲和和缓存身份，但它不做跨下游 WS 连接的 live execution session resume。同一个 `x-session-id` 同时开两条 ResponsesWS 连接时，会打开两条独立的上游 WS，避免互相抢占同一个 inflight turn。
 
 ## Realtime `session_id` 规则
 

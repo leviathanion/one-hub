@@ -122,6 +122,58 @@ func assertResponsesWSErrorPayload(t *testing.T, payload string, status int, cod
 	}
 }
 
+func TestResponsesWSOpenOptionsUseConnectionScopedSessionWithoutForceFresh(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+
+	options := responsesWSOpenOptions(c, context.Background())
+
+	if options.ForceFresh {
+		t.Fatal("expected responses websocket open not to use ForceFresh because it would replace other connection bindings")
+	}
+	if got := options.ClientSessionID; !strings.HasPrefix(got, "responses-ws:") {
+		t.Fatalf("expected synthetic responses websocket client session id, got %q", got)
+	}
+	if err := runtimesession.ValidateClientSessionID(options.ClientSessionID); err != nil {
+		t.Fatalf("expected synthetic responses websocket client session id to be valid, got %v", err)
+	}
+	if options.ClientSessionID != c.GetString(responsesWSConnectionSessionIDKey) {
+		t.Fatal("expected open options to reuse the context connection session id")
+	}
+}
+
+func TestResponsesWSOpenOptionsIgnoreRequestSessionIDForProviderSessionReuse(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	reqA := httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	reqA.Header.Set("x-session-id", "shared-client-session")
+	wA := httptest.NewRecorder()
+	cA, _ := gin.CreateTestContext(wA)
+	cA.Request = reqA
+
+	reqB := httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	reqB.Header.Set("x-session-id", "shared-client-session")
+	wB := httptest.NewRecorder()
+	cB, _ := gin.CreateTestContext(wB)
+	cB.Request = reqB
+
+	optionsA := responsesWSOpenOptions(cA, context.Background())
+	optionsB := responsesWSOpenOptions(cB, context.Background())
+
+	if optionsA.ClientSessionID == "" || optionsB.ClientSessionID == "" {
+		t.Fatalf("expected both responses websocket opens to use synthetic session ids, got %q and %q", optionsA.ClientSessionID, optionsB.ClientSessionID)
+	}
+	if optionsA.ClientSessionID == "shared-client-session" || optionsB.ClientSessionID == "shared-client-session" {
+		t.Fatalf("expected request x-session-id not to be used for provider session reuse, got %q and %q", optionsA.ClientSessionID, optionsB.ClientSessionID)
+	}
+	if optionsA.ClientSessionID == optionsB.ClientSessionID {
+		t.Fatalf("expected separate downstream websocket connections to get different provider session ids, got %q", optionsA.ClientSessionID)
+	}
+	if optionsA.ForceFresh || optionsB.ForceFresh {
+		t.Fatal("expected responses websocket open not to force a fresh provider session")
+	}
+}
+
 func intSliceContains(values []int, target int) bool {
 	for _, value := range values {
 		if value == target {

@@ -73,12 +73,7 @@ func openAndPrimeResponsesWSSessionWithContext(openCtx context.Context, c *gin.C
 		providerAttempted = true
 		provider := relay.getProvider()
 		channel := provider.GetChannel()
-		session, apiErr := openRealtimeSessionWithOptions(provider, relay.modelName, runtimesession.RealtimeOpenOptions{
-			Context:                       openCtx,
-			PreferredTransport:            runtimesession.TransportModeResponsesWS,
-			RequireWS:                     true,
-			ResponsesWSPreviousResponseID: responsesWSOpenPreviousResponseID(c),
-		})
+		session, apiErr := openRealtimeSessionWithOptions(provider, relay.modelName, responsesWSOpenOptions(c, openCtx))
 		if apiErr == nil {
 			metrics.RecordProvider(c, 200)
 			return &responsesWSOpenResult{
@@ -173,12 +168,7 @@ func openResponsesWSSelectedChannelWithContext(openCtx context.Context, c *gin.C
 	if candidate != nil {
 		candidate.SelectedChannelID = channel.Id
 	}
-	session, apiErr := openRealtimeSessionWithOptions(provider, mappedModel, runtimesession.RealtimeOpenOptions{
-		Context:                       openCtx,
-		PreferredTransport:            runtimesession.TransportModeResponsesWS,
-		RequireWS:                     true,
-		ResponsesWSPreviousResponseID: responsesWSOpenPreviousResponseID(c),
-	})
+	session, apiErr := openRealtimeSessionWithOptions(provider, mappedModel, responsesWSOpenOptions(c, openCtx))
 	if apiErr != nil {
 		return nil, apiErr
 	}
@@ -328,4 +318,20 @@ func responsesWSSubsequentModelMismatch(requestModel string, lockedSessionModel 
 		return ""
 	}
 	return fmt.Sprintf("responses websocket session is locked to model %q", lockedSessionModel)
+}
+
+// responsesWSOpenOptions builds RealtimeOpenOptions for the provider session.
+// Every downstream ResponsesWS connection gets an internal client session id,
+// independent from request x-session-id. This keeps a single provider WS scoped
+// to one downstream WS connection while preserving x-session-id for routing and
+// prompt-cache identity. Using ForceFresh here would replace any existing
+// binding and can close another in-flight client connection.
+func responsesWSOpenOptions(c *gin.Context, openCtx context.Context) runtimesession.RealtimeOpenOptions {
+	return runtimesession.RealtimeOpenOptions{
+		Context:                       openCtx,
+		ClientSessionID:               ensureResponsesWSConnectionSessionID(c),
+		PreferredTransport:            runtimesession.TransportModeResponsesWS,
+		RequireWS:                     true,
+		ResponsesWSPreviousResponseID: responsesWSOpenPreviousResponseID(c),
+	}
 }
