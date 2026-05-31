@@ -99,10 +99,11 @@ func RecordConsumeLog(
 	isStream bool,
 	metadata map[string]any,
 	sourceIp string) {
-	logger.LogInfo(ctx, fmt.Sprintf("record consume log: userId=%d, channelId=%d, promptTokens=%d, completionTokens=%d, modelName=%s, tokenName=%s, quota=%d, content=%s ,sourceIp=%s", userId, channelId, promptTokens, completionTokens, modelName, tokenName, quota, content, sourceIp))
 	if !config.LogConsumeEnabled {
 		return
 	}
+
+	logger.LogDebug(ctx, fmt.Sprintf("record consume log: userId=%d, channelId=%d, promptTokens=%d, completionTokens=%d, modelName=%s, tokenName=%s, quota=%d, content=%s ,sourceIp=%s", userId, channelId, promptTokens, completionTokens, modelName, tokenName, quota, content, sourceIp))
 
 	username, _ := CacheGetUsername(userId)
 

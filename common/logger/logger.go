@@ -221,6 +221,10 @@ func SysError(s string) {
 }
 
 func SysDebug(s string) {
+	if !isDebugEnabled() {
+		return
+	}
+
 	message := "[SYS] | " + s
 
 	logHistory.AddEntry(loggerDEBUG, message)
@@ -244,7 +248,18 @@ func LogError(ctx context.Context, msg string) {
 }
 
 func LogDebug(ctx context.Context, msg string) {
+	if !isDebugEnabled() {
+		return
+	}
+
 	logHelper(ctx, loggerDEBUG, msg)
+}
+
+func isDebugEnabled() bool {
+	if Logger == nil {
+		return getLogLevel().Enabled(zapcore.DebugLevel)
+	}
+	return Logger.Core().Enabled(zapcore.DebugLevel)
 }
 
 func logHelper(ctx context.Context, level string, msg string) {
