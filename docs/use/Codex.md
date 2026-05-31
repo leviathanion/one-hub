@@ -80,7 +80,36 @@ Codex 渠道当前通过 OpenAI 兼容接口使用，支持以下路径：
 | `websocket_mode` | 否 | `auto` | 控制 Codex realtime 优先 websocket、强制 websocket，还是直接关闭 websocket |
 | `execution_session_ttl_seconds` | 否 | `600` | execution session 空闲保留时长 |
 | `websocket_retry_cooldown_seconds` | 否 | `120` | websocket 失败后切回 HTTP bridge 的冷却时间 |
-| `user_agent` | 否 | 内置 Codex CLI UA | 覆盖向 Codex 上游发送的 `User-Agent` |
+
+### `User-Agent` 透传与兜底优先级
+
+Breaking change：Codex 渠道不再读取 `Codex 配置(JSON)` / `channel.Other` 里的 `user_agent` 字段。旧配置如果仍然写成：
+
+```json
+{
+  "user_agent": "codex-tui/..."
+}
+```
+
+新版本会把它视为不支持字段；运行请求时不会再用它覆盖上游 `User-Agent`，编辑或导入渠道时也会被配置校验拦截。请迁移到渠道自定义模型请求头：
+
+```json
+{
+  "User-Agent": "codex-tui/..."
+}
+```
+
+Codex 渠道会优先使用渠道自定义模型请求头中的 `User-Agent`。如果渠道没有配置 `User-Agent`，则透传客户端请求中的 `User-Agent`；两者都不存在时，使用内置默认值。
+
+最终向 Codex 上游发送的 `User-Agent` 优先级如下：
+
+1. 渠道自定义模型请求头 `User-Agent`
+2. 客户端请求头 `User-Agent`
+3. 内置 Codex CLI `User-Agent`
+
+如果需要固定某个 Codex 渠道对上游展示的 `User-Agent`，请在渠道的自定义模型请求头中配置 `User-Agent`，不要写在 `Codex 配置(JSON)` 中。
+
+这个选择的 trade-off 是：渠道配置可以稳定覆盖上游识别行为，便于按渠道做兼容性治理；未配置渠道 `User-Agent` 时仍保留客户端真实身份以兼容不同 Codex 客户端行为。同时把渠道级配置统一收敛到通用 Header 配置，避免同一个 Header 出现两个配置入口。为降低敏感 Header 泄漏风险，Codex 渠道只透传受控白名单中的客户端 Header，并不会无差别透传所有请求头。
 
 ## 从 Web 页面看，哪些配置改哪里
 
