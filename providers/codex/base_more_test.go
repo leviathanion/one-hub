@@ -59,7 +59,7 @@ func TestCodexBaseHelperFunctionsAndHeaderFallbacks(t *testing.T) {
 	}
 
 	key := `{"access_token":"access-token","account_id":"acct-123"}`
-	provider := newTestCodexProviderWithContext(t, key, `{"user_agent":"legacy-codex-ua"}`, map[string]string{
+	provider := newTestCodexProviderWithContext(t, key, `{"websocket_mode":"auto"}`, map[string]string{
 		"Version":             "2026-03-28",
 		"OpenAI-Beta":         "responses=v1",
 		"X-Session-Id":        "session-123",
@@ -84,17 +84,14 @@ func TestCodexBaseHelperFunctionsAndHeaderFallbacks(t *testing.T) {
 	}
 
 	options := provider.getChannelOptions()
-	if options == nil || options.UserAgent != "legacy-codex-ua" {
+	if options == nil || options.WebsocketMode != "auto" {
 		t.Fatalf("expected codex channel options to decode once, got %+v", options)
 	}
 	if provider.getChannelOptions() != options {
 		t.Fatal("expected codex channel options to be cached")
 	}
-	if got := provider.getLegacyUserAgentOverride(); got != "legacy-codex-ua" {
-		t.Fatalf("expected legacy user agent override, got %q", got)
-	}
 
-	provider.channelOptions = &codexChannelOptions{UserAgent: "cached"}
+	provider.channelOptions = &codexChannelOptions{WebsocketMode: "cached"}
 	provider.channelOptionsLoaded = true
 	provider.syncRuntimeChannel(&model.Channel{Id: 43, Key: key})
 	if provider.Channel == nil || provider.Channel.Id != 43 || provider.channelOptions != nil || provider.channelOptionsLoaded {
@@ -191,12 +188,9 @@ func TestCodexBaseAdditionalOptionAndHeaderBranches(t *testing.T) {
 		t.Fatalf("expected empty other config not to produce channel options, got %+v", got)
 	}
 
-	invalidOtherProvider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"user_agent":123}`, nil)
+	invalidOtherProvider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"execution_session_ttl_seconds":"bad"}`, nil)
 	if got := invalidOtherProvider.getChannelOptions(); got != nil {
 		t.Fatalf("expected invalid channel options payload not to decode, got %+v", got)
-	}
-	if got := invalidOtherProvider.getLegacyUserAgentOverride(); got != "" {
-		t.Fatalf("expected invalid decoded options not to expose a user agent override, got %q", got)
 	}
 
 	applyCommonRequestHeadersProvider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", map[string]string{"Accept": "application/json"})

@@ -196,8 +196,8 @@ func TestGetResponsesRequestPrefersIncomingCodexHeaders(t *testing.T) {
 	if got := req.Header.Get("X-Session-Id"); got != "session-123" {
 		t.Fatalf("expected session passthrough, got %q", got)
 	}
-	if got := req.Header.Get("User-Agent"); got != defaultUserAgent {
-		t.Fatalf("expected codex default user agent %q, got %q", defaultUserAgent, got)
+	if got := req.Header.Get("User-Agent"); got != "incoming-codex-ua" {
+		t.Fatalf("expected incoming user agent passthrough, got %q", got)
 	}
 }
 
@@ -216,13 +216,14 @@ func TestGetResponsesRequestPrefersChannelUserAgentOverIncomingClientUserAgent(t
 	}
 
 	if got := req.Header.Get("User-Agent"); got != "custom-codex-ua" {
-		t.Fatalf("expected channel user agent override, got %q", got)
+		t.Fatalf("expected channel user agent to win over incoming user agent, got %q", got)
 	}
 }
 
-func TestGetResponsesRequestPreservesLegacyOtherUserAgentOverride(t *testing.T) {
+func TestGetResponsesRequestUsesChannelUserAgentWhenIncomingClientUserAgentMissing(t *testing.T) {
 	key := `{"access_token":"access-token","account_id":"acct-123"}`
-	provider := newTestCodexProviderWithContext(t, key, `{"user_agent":"legacy-codex-ua"}`, nil)
+	provider := newTestCodexProviderWithContext(t, key, "", nil)
+	provider.Channel.ModelHeaders = stringPtr(`{"User-Agent":"custom-codex-ua"}`)
 
 	req, errWithCode := provider.getResponsesRequest(&types.OpenAIResponsesRequest{
 		Model: "gpt-5",
@@ -231,8 +232,8 @@ func TestGetResponsesRequestPreservesLegacyOtherUserAgentOverride(t *testing.T) 
 		t.Fatalf("expected request build to succeed, got %v", errWithCode)
 	}
 
-	if got := req.Header.Get("User-Agent"); got != "legacy-codex-ua" {
-		t.Fatalf("expected legacy other.user_agent override, got %q", got)
+	if got := req.Header.Get("User-Agent"); got != "custom-codex-ua" {
+		t.Fatalf("expected channel user agent when incoming user agent is missing, got %q", got)
 	}
 }
 
@@ -1141,7 +1142,7 @@ func TestLoadLatestCredentialsFromDatabaseReloadsChannelOptions(t *testing.T) {
 	sharedChannel := &model.Channel{
 		Id:    424253,
 		Key:   initialKey,
-		Other: `{"websocket_mode":"off","prompt_cache_key_strategy":"off","execution_session_ttl_seconds":60,"user_agent":"legacy-codex-ua-old"}`,
+		Other: `{"websocket_mode":"off","prompt_cache_key_strategy":"off","execution_session_ttl_seconds":60}`,
 	}
 
 	provider, ok := CodexProviderFactory{}.Create(sharedChannel).(*CodexProvider)
@@ -1158,10 +1159,6 @@ func TestLoadLatestCredentialsFromDatabaseReloadsChannelOptions(t *testing.T) {
 	if got := provider.getPromptCacheKeyStrategy(); got != codexPromptCacheStrategyOff {
 		t.Fatalf("expected initial prompt cache strategy off, got %q", got)
 	}
-	if got := provider.getLegacyUserAgentOverride(); got != "legacy-codex-ua-old" {
-		t.Fatalf("expected initial legacy user agent override, got %q", got)
-	}
-
 	latestCreds := &OAuth2Credentials{
 		AccessToken:  "latest-access-token",
 		RefreshToken: "latest-refresh-token",
@@ -1180,7 +1177,7 @@ func TestLoadLatestCredentialsFromDatabaseReloadsChannelOptions(t *testing.T) {
 		return &model.Channel{
 			Id:    channelID,
 			Key:   latestKey,
-			Other: `{"websocket_mode":"force","prompt_cache_key_strategy":"auth_header","execution_session_ttl_seconds":180,"user_agent":"legacy-codex-ua-new"}`,
+			Other: `{"websocket_mode":"force","prompt_cache_key_strategy":"auth_header","execution_session_ttl_seconds":180}`,
 		}, nil
 	}
 	t.Cleanup(func() {
@@ -1199,9 +1196,6 @@ func TestLoadLatestCredentialsFromDatabaseReloadsChannelOptions(t *testing.T) {
 	}
 	if got := provider.getPromptCacheKeyStrategy(); got != codexPromptCacheStrategyAuthHeader {
 		t.Fatalf("expected reloaded prompt cache strategy auth_header, got %q", got)
-	}
-	if got := provider.getLegacyUserAgentOverride(); got != "legacy-codex-ua-new" {
-		t.Fatalf("expected reloaded legacy user agent override, got %q", got)
 	}
 }
 
@@ -1257,7 +1251,7 @@ func TestLoadLatestCredentialsFromDatabaseReloadsChannelOptionsAfterInvalidOther
 		return &model.Channel{
 			Id:    channelID,
 			Key:   latestKey,
-			Other: `{"websocket_mode":"force","prompt_cache_key_strategy":"user_id","execution_session_ttl_seconds":240,"user_agent":"legacy-codex-ua-recovered"}`,
+			Other: `{"websocket_mode":"force","prompt_cache_key_strategy":"user_id","execution_session_ttl_seconds":240}`,
 		}, nil
 	}
 	t.Cleanup(func() {
@@ -1276,9 +1270,6 @@ func TestLoadLatestCredentialsFromDatabaseReloadsChannelOptionsAfterInvalidOther
 	}
 	if got := provider.getPromptCacheKeyStrategy(); got != codexPromptCacheStrategyUserID {
 		t.Fatalf("expected reloaded prompt cache strategy user_id, got %q", got)
-	}
-	if got := provider.getLegacyUserAgentOverride(); got != "legacy-codex-ua-recovered" {
-		t.Fatalf("expected reloaded legacy user agent override, got %q", got)
 	}
 }
 

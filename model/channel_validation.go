@@ -108,10 +108,6 @@ func validateCodexChannelOther(raw string) error {
 			if err := validateCodexPositiveIntField(fieldName, value); err != nil {
 				return err
 			}
-		case "user_agent":
-			if err := validateCodexStringField(fieldName, value); err != nil {
-				return err
-			}
 		default:
 			return fmt.Errorf("%s is not supported for Codex channels", fieldName)
 		}
@@ -124,14 +120,6 @@ func validateCodexBoolField(fieldName string, raw json.RawMessage) error {
 	var value bool
 	if err := json.Unmarshal(raw, &value); err != nil {
 		return fmt.Errorf("%s must be a boolean: %w", fieldName, err)
-	}
-	return nil
-}
-
-func validateCodexStringField(fieldName string, raw json.RawMessage) error {
-	var value string
-	if err := json.Unmarshal(raw, &value); err != nil {
-		return fmt.Errorf("%s must be a string: %w", fieldName, err)
 	}
 	return nil
 }

@@ -1018,19 +1018,17 @@ func TestCodexManagedRealtimeRejectsExecutionSessionReuseAcrossDifferentRequestH
 	}
 }
 
-func TestCodexManagedRealtimeRejectsExecutionSessionReuseAcrossDifferentLegacyUserAgentsWithinSameChannel(t *testing.T) {
+func TestCodexManagedRealtimeRejectsExecutionSessionReuseAcrossDifferentChannelUserAgentsWithinSameChannel(t *testing.T) {
 	var connections atomic.Int32
 	server := newCodexRealtimeCountingServer(t, &connections)
 	defer server.Close()
 
-	optionsA := `{"user_agent":"legacy-codex-ua-a"}`
-	optionsB := `{"user_agent":"legacy-codex-ua-b"}`
-
-	providerA := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, optionsA, map[string]string{
-		"X-Session-Id": "managed-cross-legacy-ua-session",
+	providerA := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", map[string]string{
+		"X-Session-Id": "managed-cross-channel-ua-session",
 	})
 	providerA.Context.Set("token_id", 214)
 	providerA.Channel.BaseURL = stringPtr(server.URL)
+	providerA.Channel.ModelHeaders = stringPtr(`{"User-Agent":"channel-codex-ua-a"}`)
 
 	sessionA, errWithCode := providerA.OpenRealtimeSession("gpt-5")
 	if errWithCode != nil {
@@ -1043,15 +1041,16 @@ func TestCodexManagedRealtimeRejectsExecutionSessionReuseAcrossDifferentLegacyUs
 	defer managedA.Abort("test_cleanup_a")
 	sessionA.Detach("test_detach")
 
-	providerB := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, optionsB, map[string]string{
-		"X-Session-Id": "managed-cross-legacy-ua-session",
+	providerB := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", map[string]string{
+		"X-Session-Id": "managed-cross-channel-ua-session",
 	})
 	providerB.Context.Set("token_id", 214)
 	providerB.Channel.BaseURL = stringPtr(server.URL)
+	providerB.Channel.ModelHeaders = stringPtr(`{"User-Agent":"channel-codex-ua-b"}`)
 
 	sessionB, errWithCode := providerB.OpenRealtimeSession("gpt-5")
 	if errWithCode != nil {
-		t.Fatalf("expected reconnect with different legacy user agent policy to open a fresh execution session, got %v", errWithCode)
+		t.Fatalf("expected reconnect with different channel user agent policy to open a fresh execution session, got %v", errWithCode)
 	}
 	managedB, ok := sessionB.(*codexManagedRealtimeSession)
 	if !ok {
@@ -1060,7 +1059,7 @@ func TestCodexManagedRealtimeRejectsExecutionSessionReuseAcrossDifferentLegacyUs
 	defer managedB.Abort("test_cleanup_b")
 
 	if managedB.exec.Key == managedA.exec.Key {
-		t.Fatal("expected different legacy user agent policy to force a fresh execution session key")
+		t.Fatal("expected different channel user agent policy to force a fresh execution session key")
 	}
 	if binding, ok := resolveTestRealtimeBinding(providerB.Context); !ok || binding == nil || binding.SessionKey != managedB.exec.Key {
 		t.Fatalf("expected binding to move onto the fresh execution session, got %+v", binding)

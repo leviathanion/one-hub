@@ -253,7 +253,6 @@ func (p *CodexProvider) getUsageRequestHeaders() (map[string]string, error) {
 
 	headers.Set("Accept", "application/json")
 	headers.SetIfAbsent("Originator", defaultOriginator)
-	headers.SetIfAbsent("User-Agent", p.getLegacyUserAgentOverride())
 	if strings.TrimSpace(headers.Get("User-Agent")) == "" {
 		headers.Set("User-Agent", defaultUserAgent)
 	}

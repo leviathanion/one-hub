@@ -1091,8 +1091,6 @@ func (p *CodexProvider) buildRealtimeHandshakePolicySignature() string {
 	if value := strings.TrimSpace(headers["user-agent"]); value != "" {
 		userAgent = value
 		delete(headers, "user-agent")
-	} else if value := p.getLegacyUserAgentOverride(); value != "" {
-		userAgent = value
 	}
 	if userAgent == defaultUserAgent {
 		userAgent = ""

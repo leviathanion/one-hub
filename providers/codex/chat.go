@@ -60,11 +60,7 @@ func (p *CodexProvider) applyDefaultHeaders(headers *codexHeaderBag) {
 
 	// Set User-Agent if missing.
 	if !headers.Has("User-Agent") {
-		if userAgent := p.getLegacyUserAgentOverride(); userAgent != "" {
-			headers.Set("User-Agent", userAgent)
-		} else {
-			headers.Set("User-Agent", defaultUserAgent)
-		}
+		headers.Set("User-Agent", defaultUserAgent)
 	}
 
 	// Match Codex CLI behavior when the caller does not pin a session.

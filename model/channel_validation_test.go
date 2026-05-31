@@ -26,7 +26,7 @@ func TestChannelRuntimeConfigValidationBranches(t *testing.T) {
 		ModelMapping:    testStringPtr(`{"gpt-5":"gpt-5-codex"}`),
 		ModelHeaders:    testStringPtr(`{"X-Test":"1"}`),
 		CustomParameter: testStringPtr(`{"temperature":0.2}`),
-		Other:           `{"user_agent":"codex-cli"}`,
+		Other:           `{"websocket_mode":"auto"}`,
 	}
 	if err := channel.ValidateRuntimeConfigJSON(); err != nil {
 		t.Fatalf("expected valid codex runtime config json, got %v", err)
@@ -81,8 +81,7 @@ func TestValidateCodexChannelOtherAcceptsDocumentedFields(t *testing.T) {
 			"prompt_cache_key_strategy":" AUTO ",
 			"websocket_mode":" force ",
 			"execution_session_ttl_seconds":600,
-			"websocket_retry_cooldown_seconds":120,
-			"user_agent":"Codex/1.0"
+			"websocket_retry_cooldown_seconds":120
 		}`,
 	}
 	if err := channel.ValidateRuntimeConfigJSON(); err != nil {
@@ -154,8 +153,8 @@ func TestValidateCodexChannelOtherRejectsUnsupportedOrInvalidFields(t *testing.T
 			contains: "other.execution_session_ttl_seconds",
 		},
 		{
-			name:     "invalid user agent type",
-			other:    `{"user_agent":123}`,
+			name:     "legacy user agent field",
+			other:    `{"user_agent":"Codex/1.0"}`,
 			contains: "other.user_agent",
 		},
 	}

@@ -104,8 +104,7 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
     ['execution_session_ttl_seconds', '600', '正整数秒', 'execution session 空闲保留时长'],
     ['websocket_retry_cooldown_seconds', '120', '正整数秒', 'websocket 失败后切回 HTTP bridge 的冷却时间'],
     ['self_hosted', 'false', 'true / false', '允许 Codex Realtime 使用私有或本地自建上游'],
-    ['responses_ws_self_hosted', 'false', 'true / false', '允许 Responses websocket 使用私有或本地自建上游'],
-    ['user_agent', '内置 Codex CLI UA', '字符串', '覆盖向 Codex 上游发送的 User-Agent']
+    ['responses_ws_self_hosted', 'false', 'true / false', '允许 Responses websocket 使用私有或本地自建上游']
   ];
   const codexConfigExamples = [
     {

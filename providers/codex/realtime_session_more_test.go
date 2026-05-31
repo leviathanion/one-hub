@@ -1017,7 +1017,7 @@ func TestCodexResponsesWSSendClientStaleContinuationPreservesLastResponseID(t *t
 }
 
 func TestCodexRealtimeMetadataCompatibilityAndNamespaceBranches(t *testing.T) {
-	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"user_agent":"legacy-ua","websocket_mode":"off"}`, nil)
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, nil)
 	provider.Context.Set("id", 7001)
 	provider.Context.Request.Header.Set("Authorization", "Bearer sk-session-auth")
 
@@ -1086,7 +1086,7 @@ func TestCodexRealtimeMetadataCompatibilityAndNamespaceBranches(t *testing.T) {
 		t.Fatalf("expected invalid model headers to produce empty compatibility headers, got %+v", headers)
 	}
 
-	modelHeaders := `{"Authorization":"ignored","Connection":"ignored","X-Session-Id":"ignored","Originator":"codex_cli_rs","X-Trace":"trace"}`
+	modelHeaders := `{"Authorization":"ignored","Connection":"ignored","X-Session-Id":"ignored","Originator":"codex_cli_rs","User-Agent":"channel-ua","X-Trace":"trace"}`
 	provider.Channel.ModelHeaders = &modelHeaders
 	channelHeaders := provider.buildRealtimeChannelCompatibilityHeaders()
 	if _, exists := channelHeaders["authorization"]; exists {
@@ -1097,8 +1097,8 @@ func TestCodexRealtimeMetadataCompatibilityAndNamespaceBranches(t *testing.T) {
 	}
 
 	signature := provider.buildRealtimeHandshakePolicySignature()
-	if !strings.Contains(signature, "legacy-ua") || strings.Contains(signature, defaultOriginator) {
-		t.Fatalf("expected handshake signature to use legacy user agent and strip default originator, got %q", signature)
+	if !strings.Contains(signature, "channel-ua") || strings.Contains(signature, defaultOriginator) {
+		t.Fatalf("expected handshake signature to use channel user agent and strip default originator, got %q", signature)
 	}
 	if got := provider.buildRealtimeCompatibilityHash("gpt-5", provider.readRealtimeUpstreamIdentity()); got == "" {
 		t.Fatal("expected compatibility hash to be populated")

@@ -274,6 +274,7 @@ func (p *CodexProvider) codexRealtimeSelfHosted() bool {
 var codexRealtimeCompatibilityHeaderKeys = []string{
 	"version",
 	"originator",
+	"user-agent",
 	"x-codex-turn-state",
 	"x-responsesapi-include-timing-metrics",
 	"x-codex-beta-features",

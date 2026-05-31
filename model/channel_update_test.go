@@ -1735,7 +1735,7 @@ func TestBatchUpdateChannelsAzureApiClearsCodexDerivedCaches(t *testing.T) {
 		Key:    "sk-batch",
 		Group:  "default",
 		Models: "gpt-5",
-		Other:  `{"user_agent":"old-agent"}`,
+		Other:  `{"websocket_mode":"auto"}`,
 	})
 	insertTestChannel(t, &Channel{
 		Id:     2,
@@ -1751,7 +1751,7 @@ func TestBatchUpdateChannelsAzureApiClearsCodexDerivedCaches(t *testing.T) {
 
 	count, err := BatchUpdateChannelsAzureApi(&BatchChannelsParams{
 		Ids:   []int{1, 2},
-		Value: `{"user_agent":"new-agent"}`,
+		Value: `{"websocket_mode":"force"}`,
 	})
 	if err != nil {
 		t.Fatalf("expected batch update to succeed, got %v", err)

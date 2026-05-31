@@ -27,7 +27,7 @@ import (
 const (
 	TokenCacheKey        = "api_token:codex"
 	refreshLockKeyPrefix = "codex:refresh-lock"
-	defaultUserAgent     = "codex_cli_rs/0.116.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
+	defaultUserAgent     = "codex-tui/0.135.0 (Arch Linux Rolling Release; x86_64) foot (codex-tui; 0.135.0)"
 	defaultOriginator    = "codex_cli_rs"
 )
 
@@ -51,7 +51,6 @@ type codexChannelOptions struct {
 	ResponsesWSSelfHosted         bool   `json:"responses_ws_self_hosted"`
 	ExecutionSessionTTLSeconds    int    `json:"execution_session_ttl_seconds"`
 	WebsocketRetryCooldownSeconds int    `json:"websocket_retry_cooldown_seconds"`
-	UserAgent                     string `json:"user_agent"`
 }
 
 func DefaultUserAgent() string {
@@ -260,14 +259,6 @@ func (p *CodexProvider) channelLogContext() context.Context {
 	return context.Background()
 }
 
-func (p *CodexProvider) getLegacyUserAgentOverride() string {
-	options := p.getChannelOptions()
-	if options == nil {
-		return ""
-	}
-	return strings.TrimSpace(options.UserAgent)
-}
-
 func getConfig() base.ProviderConfig {
 	return base.ProviderConfig{
 		BaseURL:         "https://chatgpt.com",
@@ -413,6 +404,7 @@ func (p *CodexProvider) filterAndPassthroughClientHeaders(headers *codexHeaderBa
 		"x-responsesapi-include-timing-metrics",
 		"x-codex-beta-features",
 		"originator",
+		"user-agent",
 	}
 
 	// Pass through allow-listed headers.
