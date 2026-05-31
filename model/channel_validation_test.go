@@ -43,6 +43,11 @@ func TestChannelRuntimeConfigValidationBranches(t *testing.T) {
 		t.Fatalf("expected invalid model_headers json to fail validation, got %v", err)
 	}
 
+	channel.ModelHeaders = testStringPtr(`{"User-Agent":123}`)
+	if err := channel.ValidateRuntimeConfigJSONWithType(config.ChannelTypeCodex); err == nil || !strings.Contains(err.Error(), "model_headers") {
+		t.Fatalf("expected non-string model_headers value to fail validation, got %v", err)
+	}
+
 	channel.ModelHeaders = nil
 	channel.CustomParameter = testStringPtr(`{"broken":`)
 	if err := channel.ValidateRuntimeConfigJSONWithType(config.ChannelTypeCodex); err == nil || !strings.Contains(err.Error(), "custom_parameter") {

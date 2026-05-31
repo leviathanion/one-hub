@@ -27,7 +27,7 @@ func (channel *Channel) ValidateRuntimeConfigJSONWithType(channelType int) error
 	if channel.ModelHeaders != nil {
 		modelHeaders = *channel.ModelHeaders
 	}
-	if err := validateOptionalJSONObject("model_headers", modelHeaders); err != nil {
+	if err := validateOptionalJSONStringMap("model_headers", modelHeaders); err != nil {
 		return err
 	}
 	if err := validateOptionalJSONObject("custom_parameter", channel.GetCustomParameter()); err != nil {
@@ -50,6 +50,19 @@ func (channel *Channel) ValidateRuntimeConfigJSONWithType(channelType int) error
 func validateOptionalJSONObject(fieldName, raw string) error {
 	_, err := parseOptionalJSONObject(fieldName, raw)
 	return err
+}
+
+func validateOptionalJSONStringMap(fieldName, raw string) error {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || trimmed == "{}" {
+		return nil
+	}
+
+	var parsed map[string]string
+	if err := json.Unmarshal([]byte(trimmed), &parsed); err != nil {
+		return fmt.Errorf("%s must be a JSON object with string values: %w", fieldName, err)
+	}
+	return nil
 }
 
 func parseOptionalJSONObject(fieldName, raw string) (map[string]json.RawMessage, error) {
