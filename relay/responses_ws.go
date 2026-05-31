@@ -532,7 +532,7 @@ func responsesWSTurnRequestKind(turnMetadata string) string {
 }
 
 func logResponsesWSFirstFrame(ctx context.Context, diag responsesWSFrameDiagnostics) {
-	logger.LogInfo(ctx, fmt.Sprintf(
+	logger.LogDebug(ctx, fmt.Sprintf(
 		"responses websocket first frame: type=%s model=%s generate=%s has_previous_response_id=%t subagent=%s parent_thread_id=%s request_kind=%s turn_metadata_bytes=%d payload_bytes=%d",
 		diag.EventType,
 		diag.Model,
@@ -805,7 +805,7 @@ func (a *ResponsesWSSessionActor) markClientClosed(err error) {
 		return
 	}
 	if err != nil && !isResponsesWSExpectedClientDisconnectError(err) {
-		logger.LogInfo(context.Background(), fmt.Sprintf("responses websocket client closed: %T: %v", err, err))
+		logger.LogDebug(context.Background(), fmt.Sprintf("responses websocket client closed: %T: %v", err, err))
 	}
 	a.clientClosed.Store(true)
 	a.cancelSetup()
@@ -2105,7 +2105,7 @@ func (a *ResponsesWSSessionActor) clearActiveTurn() {
 
 func (a *ResponsesWSSessionActor) handleClientClosed(err error) {
 	if err != nil && !isResponsesWSExpectedClientDisconnectError(err) {
-		logger.LogInfo(context.Background(), fmt.Sprintf("responses websocket client close event: %T: %v", err, err))
+		logger.LogDebug(context.Background(), fmt.Sprintf("responses websocket client close event: %T: %v", err, err))
 	}
 	a.close("client_closed")
 }
@@ -2130,7 +2130,7 @@ func (a *ResponsesWSSessionActor) logProviderTerminal(classified responsesws.Res
 	if classified.Response != nil {
 		status = classified.Response.Status
 	}
-	logger.LogInfo(a.logContext(), fmt.Sprintf(
+	logger.LogDebug(a.logContext(), fmt.Sprintf(
 		"responses websocket provider terminal: event_type=%s kind=%d status=%s continuation_miss=%t elapsed_ms=%d channel_id=%d prompt_tokens=%d completion_tokens=%d total_tokens=%d",
 		classified.EventType,
 		classified.Kind,
@@ -2152,7 +2152,7 @@ func (a *ResponsesWSSessionActor) logClose(reason string) {
 	if !a.firstTurnStartedAt.IsZero() {
 		elapsedMs = time.Since(a.firstTurnStartedAt).Milliseconds()
 	}
-	logger.LogInfo(a.logContext(), fmt.Sprintf(
+	logger.LogDebug(a.logContext(), fmt.Sprintf(
 		"responses websocket session closing: reason=%s state=%d pending_phase=%d pending_attempt=%t active_attempt=%t pending_provider_events=%d pending_provider_evidence=%t active_channel_id=%d session_channel_id=%d downstream_close_sent=%t client_closed=%t elapsed_ms=%d",
 		strings.TrimSpace(reason),
 		a.state,
