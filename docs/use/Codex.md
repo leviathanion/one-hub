@@ -76,8 +76,8 @@ Codex 渠道当前通过 OpenAI 兼容接口使用，支持以下路径：
 
 | 字段 | 是否必填 | 默认值 | 作用 |
 | --- | --- | --- | --- |
-| `prompt_cache_key_strategy` | 否 | `off` | 控制未显式传 `prompt_cache_key` 时，系统如何自动生成稳定值 |
-| `websocket_mode` | 否 | `auto` | 控制 Codex realtime 优先 websocket、强制 websocket，还是直接关闭 websocket |
+| `prompt_cache_key_strategy` | 否 | `off` | 未显式传 `prompt_cache_key` 时在 provider 侧生成稳定值；预路由亲和需配置 `CodexRoutingHintSetting` |
+| `websocket_mode` | 否 | `auto` | 控制 Codex Realtime/Responses native websocket；`off` 会关闭 native WS，但不影响普通 `/v1/responses` 或显式 `http_bridge` |
 | `responses_ws_transport` | 否 | `native` | 控制 ResponsesWS 使用 native WS 还是显式 HTTP bridge 兼容模式 |
 | `execution_session_ttl_seconds` | 否 | `600` | Codex Realtime execution session 空闲保留时长 |
 | `websocket_retry_cooldown_seconds` | 否 | `120` | Codex Realtime websocket 失败后的 bridge 冷却 |
@@ -749,7 +749,7 @@ trade-off：
 
 - `渠道 -> 新建/编辑 -> Codex -> Codex 配置(JSON)`
 
-这个字段只影响 Codex 的 `/v1/realtime`，不影响普通的 `/v1/responses` 和 `/v1/chat/completions`。
+这个字段控制 Codex Realtime/Responses native websocket。它不影响普通的 `/v1/responses` 和 `/v1/chat/completions`；但 `off` 会让 ResponsesWS native 返回 `unsupported`，除非你显式配置 `responses_ws_transport=http_bridge`。
 
 推荐默认配置：
 
@@ -775,9 +775,9 @@ trade-off：
 }
 ```
 
-如果你同时希望 Codex Realtime/native websocket 也关闭，可以再加上 `"websocket_mode": "off"`。
+如果你同时希望 Codex Realtime/Responses native websocket 也关闭，可以再加上 `"websocket_mode": "off"`。
 
-注意：`responses_ws_transport=http_bridge` 是你主动选择 ResponsesWS HTTP bridge 兼容模式，不是 native ResponsesWS 建连失败后的自动回退。`websocket_mode` 主要约束 Codex Realtime/native websocket；未显式配置 `responses_ws_transport=http_bridge` 时，ResponsesWS 不会静默从 native WS 切到 HTTP bridge。
+注意：`responses_ws_transport=http_bridge` 是你主动选择 ResponsesWS HTTP bridge 兼容模式，不是 native ResponsesWS 建连失败后的自动回退。`websocket_mode` 约束 Codex Realtime/Responses native websocket；未显式配置 `responses_ws_transport=http_bridge` 时，ResponsesWS 不会静默从 native WS 切到 HTTP bridge。
 
 ### 自动生成稳定缓存身份
 
@@ -915,9 +915,9 @@ trade-off：
 
 此时 one-hub 不会自动帮客户端改写请求并重试，客户端需要携带完整上下文重新发送请求。
 
-## Realtime 相关配置
+## Realtime/Responses native websocket 相关配置
 
-这些配置只影响 Codex 的 `/v1/realtime` 路径，不影响普通的 `/v1/responses` 和 `/v1/chat/completions`。
+这些配置主要影响 Codex 的 `/v1/realtime` 路径，不影响普通的 `/v1/responses` 和 `/v1/chat/completions`。其中 `websocket_mode` 也会影响 ResponsesWS native 是否可用；ResponsesWS HTTP bridge 仍由 `responses_ws_transport=http_bridge` 显式选择。
 
 ### `websocket_mode`
 

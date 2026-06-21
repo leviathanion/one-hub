@@ -138,8 +138,9 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
   const [tempSetFieldValue, setTempSetFieldValue] = useState(null);
   const batchFileInputRef = useRef(null);
   const codexBatchAuthFileInputRef = useRef(null);
-  const [codexConfigHelpOpen, setCodexConfigHelpOpen] = useState(false);
+  const [otherConfigHelpOpen, setOtherConfigHelpOpen] = useState(false);
   const codexConfigHelpKey = 'channel_edit.codexConfigHelp';
+  const otherConfigHelpKey = 'channel_edit.otherConfigHelp';
   const codexConfigFields = [
     [
       'prompt_cache_key_strategy',
@@ -236,6 +237,214 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
 }`
     }
   ];
+  const commonOtherConfigFields = {
+    responses_ws_transport: [
+      'responses_ws_transport',
+      'native',
+      'native / http_bridge',
+      t(`${otherConfigHelpKey}.fields.responsesWSTransport`)
+    ],
+    responses_ws_native: ['responses_ws_native', 'false', 'true / false', t(`${otherConfigHelpKey}.fields.responsesWSNative`)],
+    self_hosted: ['self_hosted', 'false', 'true / false', t(`${otherConfigHelpKey}.fields.selfHosted`)],
+    responses_ws_self_hosted: [
+      'responses_ws_self_hosted',
+      'false',
+      'true / false',
+      t(`${otherConfigHelpKey}.fields.responsesWSSelfHosted`)
+    ],
+    extra: ['extra', '{}', 'JSON object', t(`${otherConfigHelpKey}.fields.extra`)],
+    vendor_extra: ['vendor_extra', '{}', 'JSON object', t(`${otherConfigHelpKey}.fields.vendorExtra`)]
+  };
+  const commonResponsesWSFieldKeys = ['responses_ws_transport', 'responses_ws_native', 'self_hosted', 'responses_ws_self_hosted'];
+  const commonOpaqueFieldKeys = ['extra', 'vendor_extra'];
+  const providerOtherConfigHelp = {
+    1: {
+      commonFieldKeys: commonResponsesWSFieldKeys,
+      examples: [
+        {
+          title: t(`${otherConfigHelpKey}.examples.responsesBridge`),
+          value: `{
+  "responses_ws_transport": "http_bridge"
+}`
+        }
+      ]
+    },
+    8: {
+      commonFieldKeys: commonResponsesWSFieldKeys,
+      examples: [
+        {
+          title: t(`${otherConfigHelpKey}.examples.customNative`),
+          value: `{
+  "responses_ws_native": true,
+  "responses_ws_transport": "native"
+}`
+        }
+      ]
+    },
+    3: {
+      providerFields: [
+        ['api_version', t(`${otherConfigHelpKey}.required`), 'non-empty string', t(`${otherConfigHelpKey}.fields.azureAPIVersion`)]
+      ],
+      commonFieldKeys: ['responses_ws_transport', 'self_hosted', 'responses_ws_self_hosted'],
+      examples: [
+        {
+          title: t(`${otherConfigHelpKey}.examples.azureClassic`),
+          value: `{
+  "api_version": "2024-05-01-preview",
+  "responses_ws_transport": "native"
+}`
+        }
+      ]
+    },
+    55: {
+      commonFieldKeys: commonResponsesWSFieldKeys,
+      examples: [
+        {
+          title: t(`${otherConfigHelpKey}.examples.azureV1`),
+          value: `{
+  "responses_ws_transport": "native"
+}`
+        }
+      ]
+    },
+    17: {
+      providerFields: [
+        ['dashscope_plugin', t(`${otherConfigHelpKey}.empty`), 'string', t(`${otherConfigHelpKey}.fields.dashscopePlugin`)]
+      ],
+      commonFieldKeys: commonResponsesWSFieldKeys,
+      examples: [
+        {
+          title: t(`${otherConfigHelpKey}.examples.ali`),
+          value: `{
+  "dashscope_plugin": "plugin-name"
+}`
+        }
+      ]
+    },
+    18: {
+      providerFields: [['api_version', t(`${otherConfigHelpKey}.empty`), 'string', t(`${otherConfigHelpKey}.fields.xunfeiAPIVersion`)]],
+      commonFieldKeys: commonResponsesWSFieldKeys,
+      examples: [
+        {
+          title: t(`${otherConfigHelpKey}.examples.xunfei`),
+          value: `{
+  "api_version": "v3.1"
+}`
+        }
+      ]
+    },
+    25: {
+      providerFields: [['api_version', t(`${otherConfigHelpKey}.empty`), 'string', t(`${otherConfigHelpKey}.fields.geminiAPIVersion`)]],
+      commonFieldKeys: commonResponsesWSFieldKeys,
+      examples: [
+        {
+          title: t(`${otherConfigHelpKey}.examples.gemini`),
+          value: `{
+  "api_version": "v1"
+}`
+        }
+      ]
+    },
+    24: {
+      providerFields: [['region', t(`${otherConfigHelpKey}.empty`), 'string', t(`${otherConfigHelpKey}.fields.azureSpeechRegion`)]],
+      commonFieldKeys: commonResponsesWSFieldKeys,
+      examples: [
+        {
+          title: t(`${otherConfigHelpKey}.examples.azureSpeech`),
+          value: `{
+  "region": "eastasia"
+}`
+        }
+      ]
+    },
+    42: {
+      providerFields: [
+        ['region', t(`${otherConfigHelpKey}.required`), 'string', t(`${otherConfigHelpKey}.fields.vertexRegion`)],
+        ['project_id', t(`${otherConfigHelpKey}.required`), 'string', t(`${otherConfigHelpKey}.fields.vertexProjectID`)]
+      ],
+      commonFieldKeys: commonResponsesWSFieldKeys,
+      examples: [
+        {
+          title: t(`${otherConfigHelpKey}.examples.vertex`),
+          value: `{
+  "region": "us-central1",
+  "project_id": "my-project"
+}`
+        }
+      ]
+    }
+  };
+  const buildOtherConfigHelp = (channelType) => {
+    if (channelType === 101) {
+      return {
+        title: t(`${codexConfigHelpKey}.title`),
+        intro: t(`${codexConfigHelpKey}.intro`),
+        sections: [{ title: t(`${codexConfigHelpKey}.fieldsTitle`), fields: codexConfigFields }],
+        examplesTitle: t(`${codexConfigHelpKey}.examplesTitle`),
+        examples: codexConfigExamples,
+        close: t(`${codexConfigHelpKey}.close`),
+        emptyText: ''
+      };
+    }
+
+    const config = providerOtherConfigHelp[channelType] || {
+      commonFieldKeys: commonResponsesWSFieldKeys,
+      examples: [
+        {
+          title: t(`${otherConfigHelpKey}.examples.opaque`),
+          value: `{
+  "vendor_extra": {
+    "owner": "ops"
+  }
+}`
+        }
+      ]
+    };
+    const providerFields = config.providerFields || [];
+    const commonFields = (config.commonFieldKeys || []).map((field) => commonOtherConfigFields[field]).filter(Boolean);
+    const opaqueFields = commonOpaqueFieldKeys.map((field) => commonOtherConfigFields[field]);
+    const channelName = CHANNEL_OPTIONS[channelType]?.text || customizeT(inputLabel.other);
+    return {
+      title: t(`${otherConfigHelpKey}.title`, { channel: channelName }),
+      intro: t(`${otherConfigHelpKey}.intro`),
+      sections: [
+        { title: t(`${otherConfigHelpKey}.providerFieldsTitle`), fields: providerFields, emptyText: t(`${otherConfigHelpKey}.noProviderFields`) },
+        { title: t(`${otherConfigHelpKey}.commonFieldsTitle`), fields: commonFields },
+        { title: t(`${otherConfigHelpKey}.opaqueFieldsTitle`), fields: opaqueFields }
+      ],
+      examplesTitle: t(`${otherConfigHelpKey}.examplesTitle`),
+      examples: config.examples || [],
+      close: t(`${otherConfigHelpKey}.close`)
+    };
+  };
+  const renderOtherConfigFields = (fields, emptyText) =>
+    fields.length > 0 ? (
+      <Box sx={{ display: 'grid', gap: 1, mb: 2 }}>
+        {fields.map(([field, defaultValue, accepted, description]) => (
+          <Box
+            key={field}
+            sx={{
+              display: 'grid',
+              gridTemplateColumns: { xs: '1fr', sm: '210px 120px 1fr' },
+              gap: 1,
+              p: 1,
+              borderRadius: 1,
+              backgroundColor: theme.palette.mode === 'dark' ? 'grey.900' : 'grey.50'
+            }}
+          >
+            <Typography component="code" variant="caption" sx={{ fontWeight: 700 }}>
+              {field}
+            </Typography>
+            <Typography variant="caption">{t(`${codexConfigHelpKey}.defaultValue`, { value: defaultValue })}</Typography>
+            <Typography variant="caption">{t(`${codexConfigHelpKey}.acceptedValue`, { accepted, description })}</Typography>
+          </Box>
+        ))}
+      </Box>
+    ) : (
+      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 2 }}>
+        {emptyText}
+      </Typography>
+    );
 
   const initChannel = (typeValue) => {
     if (typeConfig[typeValue]?.inputLabel) {
@@ -706,6 +915,7 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
               setTempSetFieldValue(() => setFieldValue); // 保存函数引用
               setModelSelectorOpen(true);
             };
+            const activeOtherConfigHelp = buildOtherConfigHelp(values.type);
 
             return (
               <form noValidate onSubmit={handleSubmit}>
@@ -835,15 +1045,15 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                         onBlur={handleBlur}
                         onChange={handleChange}
                         endAdornment={
-                          values.type === 101 ? (
+                          activeOtherConfigHelp ? (
                             <InputAdornment position="end" sx={{ alignSelf: values.type === 101 ? 'flex-start' : 'center', mt: 0.5 }}>
-                              <Tooltip title={t(`${codexConfigHelpKey}.tooltip`)}>
+                              <Tooltip title={values.type === 101 ? t(`${codexConfigHelpKey}.tooltip`) : t(`${otherConfigHelpKey}.tooltip`)}>
                                 <IconButton
-                                  aria-label={t(`${codexConfigHelpKey}.tooltip`)}
+                                  aria-label={values.type === 101 ? t(`${codexConfigHelpKey}.tooltip`) : t(`${otherConfigHelpKey}.tooltip`)}
                                   edge="end"
                                   size="small"
                                   type="button"
-                                  onClick={() => setCodexConfigHelpOpen(true)}
+                                  onClick={() => setOtherConfigHelpOpen(true)}
                                 >
                                   <Icon icon="solar:question-circle-bold-duotone" width={20} />
                                 </IconButton>
@@ -863,46 +1073,26 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                       )}
                     </FormControl>
 
-                    {values.type === 101 && (
-                      <Dialog open={codexConfigHelpOpen} onClose={() => setCodexConfigHelpOpen(false)} fullWidth maxWidth="md">
-                        <DialogTitle>{t(`${codexConfigHelpKey}.title`)}</DialogTitle>
+                    {activeOtherConfigHelp && (
+                      <Dialog open={otherConfigHelpOpen} onClose={() => setOtherConfigHelpOpen(false)} fullWidth maxWidth="md">
+                        <DialogTitle>{activeOtherConfigHelp.title}</DialogTitle>
                         <DialogContent dividers>
                           <Typography variant="body2" sx={{ mb: 2 }}>
-                            {t(`${codexConfigHelpKey}.intro`)}
+                            {activeOtherConfigHelp.intro}
                           </Typography>
+                          {activeOtherConfigHelp.sections.map((section) => (
+                            <Box key={section.title}>
+                              <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                                {section.title}
+                              </Typography>
+                              {renderOtherConfigFields(section.fields || [], section.emptyText || activeOtherConfigHelp.emptyText)}
+                            </Box>
+                          ))}
                           <Typography variant="subtitle2" sx={{ mb: 1 }}>
-                            {t(`${codexConfigHelpKey}.fieldsTitle`)}
-                          </Typography>
-                          <Box sx={{ display: 'grid', gap: 1, mb: 2 }}>
-                            {codexConfigFields.map(([field, defaultValue, accepted, description]) => (
-                              <Box
-                                key={field}
-                                sx={{
-                                  display: 'grid',
-                                  gridTemplateColumns: { xs: '1fr', sm: '210px 120px 1fr' },
-                                  gap: 1,
-                                  p: 1,
-                                  borderRadius: 1,
-                                  backgroundColor: theme.palette.mode === 'dark' ? 'grey.900' : 'grey.50'
-                                }}
-                              >
-                                <Typography component="code" variant="caption" sx={{ fontWeight: 700 }}>
-                                  {field}
-                                </Typography>
-                                <Typography variant="caption">
-                                  {t(`${codexConfigHelpKey}.defaultValue`, { value: defaultValue })}
-                                </Typography>
-                                <Typography variant="caption">
-                                  {t(`${codexConfigHelpKey}.acceptedValue`, { accepted, description })}
-                                </Typography>
-                              </Box>
-                            ))}
-                          </Box>
-                          <Typography variant="subtitle2" sx={{ mb: 1 }}>
-                            {t(`${codexConfigHelpKey}.examplesTitle`)}
+                            {activeOtherConfigHelp.examplesTitle}
                           </Typography>
                           <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' }, gap: 1.5 }}>
-                            {codexConfigExamples.map((example) => (
+                            {activeOtherConfigHelp.examples.map((example) => (
                               <Box key={example.title}>
                                 <Typography variant="caption" sx={{ display: 'block', mb: 0.5, fontWeight: 700 }}>
                                   {example.title}
@@ -926,7 +1116,7 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                           </Box>
                         </DialogContent>
                         <DialogActions>
-                          <Button onClick={() => setCodexConfigHelpOpen(false)}>{t(`${codexConfigHelpKey}.close`)}</Button>
+                          <Button onClick={() => setOtherConfigHelpOpen(false)}>{activeOtherConfigHelp.close}</Button>
                         </DialogActions>
                       </Dialog>
                     )}
