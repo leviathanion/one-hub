@@ -18,6 +18,7 @@ func TestSetApiRouterRegistersNewOptionAdminEndpoints(t *testing.T) {
 		"DELETE /api/option/channel_affinity_cache": false,
 		"PUT /api/option/batch":                     false,
 		"POST /api/user/dashboard/modules/query":    false,
+		"GET /api/readyz":                           false,
 	}
 
 	for _, route := range engine.Routes() {

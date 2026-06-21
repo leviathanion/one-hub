@@ -14,6 +14,7 @@ func SetApiRouter(router *gin.Engine) {
 	apiRouter := router.Group("/api")
 	apiRouter.GET("/metrics", middleware.MetricsWithBasicAuth(), gin.WrapH(promhttp.Handler()))
 	apiRouter.Use(gzip.Gzip(gzip.DefaultCompression))
+	apiRouter.GET("/readyz", controller.Readyz)
 
 	systemInfo := apiRouter.Group("/system_info")
 	systemInfo.Use(middleware.RootAuth())
