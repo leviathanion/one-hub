@@ -234,7 +234,7 @@ func TestGroupManagerFallbackAndFetchChannelByID(t *testing.T) {
 	}
 
 	originalDB := model.DB
-	testDB, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	testDB, err := gorm.Open(sqlite.Open("file:"+strings.ReplaceAll(t.Name(), "/", "_")+"?mode=memory&cache=shared"), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("expected in-memory sqlite database, got %v", err)
 	}
@@ -244,16 +244,24 @@ func TestGroupManagerFallbackAndFetchChannelByID(t *testing.T) {
 	model.DB = testDB
 	t.Cleanup(func() {
 		model.DB = originalDB
+		if sqlDB, dbErr := testDB.DB(); dbErr == nil {
+			_ = sqlDB.Close()
+		}
 	})
 
 	enabled := newRelayTestCodexChannel(101)
 	disabled := newRelayTestCodexChannel(102)
 	disabled.Status = config.ChannelStatusManuallyDisabled
+	invalidRuntimeConfig := newRelayTestCodexChannel(103)
+	invalidRuntimeConfig.Other = "2024-05-01-preview"
 	if err := testDB.Create(enabled).Error; err != nil {
 		t.Fatalf("expected enabled channel insert, got %v", err)
 	}
 	if err := testDB.Create(disabled).Error; err != nil {
 		t.Fatalf("expected disabled channel insert, got %v", err)
+	}
+	if err := testDB.Create(invalidRuntimeConfig).Error; err != nil {
+		t.Fatalf("expected invalid runtime config fixture insert, got %v", err)
 	}
 
 	if channel, err := fetchChannelById(enabled.Id); err != nil || channel == nil || channel.Id != enabled.Id {
@@ -264,6 +272,10 @@ func TestGroupManagerFallbackAndFetchChannelByID(t *testing.T) {
 	}
 	if _, err := fetchChannelById(disabled.Id); err == nil || !strings.Contains(err.Error(), "已被禁用") {
 		t.Fatalf("expected disabled channel lookup to fail, got %v", err)
+	}
+	var invalidConfigErr *model.InvalidChannelRuntimeConfigError
+	if _, err := fetchChannelById(invalidRuntimeConfig.Id); err == nil || !errors.As(err, &invalidConfigErr) {
+		t.Fatalf("expected invalid runtime config channel lookup to fail closed, got %v", err)
 	}
 }
 
@@ -306,7 +318,7 @@ func TestRelayCommonStreamingAndRetryHelpers(t *testing.T) {
 	}
 	go func() {
 		observerStream.dataChan <- "event: response.created\ndata: {\"id\":\"resp_observed\"}\n\n"
-		observerStream.errChan <- errors.New("stream broken")
+		observerStream.errChan <- errors.New("stream broken Authorization: Bearer secret-token api_key=query-secret https://provider.example/v1?token=url-secret session session-secret")
 	}()
 	firstResponseTime = responseGeneralStreamClientWithObserver(observerCtx, observerStream, func() string {
 		return "ignored-end"
@@ -319,8 +331,14 @@ func TestRelayCommonStreamingAndRetryHelpers(t *testing.T) {
 	if len(observed) != 1 || !strings.Contains(observed[0], "resp_observed") {
 		t.Fatalf("expected observer to receive upstream stream data, got %#v", observed)
 	}
-	if body := observerRecorder.Body.String(); !strings.Contains(body, `"type":"error"`) || !strings.Contains(body, "stream broken") {
-		t.Fatalf("expected general stream client error payload, got %q", body)
+	if body := observerRecorder.Body.String(); !strings.Contains(body, `"type":"error"`) || !strings.Contains(body, `"message":"stream interrupted"`) {
+		t.Fatalf("expected general stream client stable error payload, got %q", body)
+	} else {
+		for _, forbidden := range []string{"stream broken", "Authorization", "secret-token", "query-secret", "provider.example", "url-secret", "session-secret"} {
+			if strings.Contains(body, forbidden) {
+				t.Fatalf("expected general stream error body not to leak %q, got %q", forbidden, body)
+			}
+		}
 	}
 
 	jsonRecorder := httptest.NewRecorder()
@@ -579,18 +597,7 @@ func TestRelayCommonAdditionalProviderAndSelectionBranches(t *testing.T) {
 		t.Fatalf("expected nil channel provider preparation to fail, provider=%#v model=%q err=%v", provider, modelName, err)
 	}
 
-	originalDB := model.DB
-	testDB, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
-	if err != nil {
-		t.Fatalf("expected in-memory sqlite database, got %v", err)
-	}
-	if err := testDB.AutoMigrate(&model.Channel{}); err != nil {
-		t.Fatalf("expected channel schema migration, got %v", err)
-	}
-	model.DB = testDB
-	t.Cleanup(func() {
-		model.DB = originalDB
-	})
+	testDB := setupRelayTestDB(t, &model.Channel{})
 
 	pinnedChannel := newRelayTestCodexChannel(301)
 	if err := testDB.Create(pinnedChannel).Error; err != nil {
@@ -657,6 +664,7 @@ func TestRelayCommonAdditionalProviderAndSelectionBranches(t *testing.T) {
 		errChan:  make(chan error, 1),
 	}
 	close(closedStream.dataChan)
+	close(closedStream.errChan)
 	if firstResponseTime := responseGeneralStreamClientWithObserver(closedCtx, closedStream, nil, nil); !firstResponseTime.IsZero() {
 		t.Fatalf("expected closed stream without data to return zero first response time, got %v", firstResponseTime)
 	}
@@ -671,6 +679,7 @@ func TestRelayCommonAdditionalProviderAndSelectionBranches(t *testing.T) {
 	go func() {
 		closedAfterDataStream.dataChan <- "event: response.created\ndata: {\"id\":\"resp_close\"}\n\n"
 		close(closedAfterDataStream.dataChan)
+		close(closedAfterDataStream.errChan)
 	}()
 	firstResponseTime := responseGeneralStreamClientWithObserver(closedAfterDataCtx, closedAfterDataStream, nil, nil)
 	if firstResponseTime.IsZero() {

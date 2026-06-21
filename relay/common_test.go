@@ -47,7 +47,7 @@ func TestResponseStreamClientDoesNotReturnMidStreamError(t *testing.T) {
 
 	go func() {
 		stream.dataChan <- `{"id":"chunk-1"}`
-		stream.errChan <- errors.New("upstream stream broken")
+		stream.errChan <- errors.New("upstream stream broken Authorization: Bearer secret-token api_key=query-secret https://provider.example/v1?token=url-secret session session-secret sk-testSECRET123")
 	}()
 
 	firstResponseTime, errWithCode := responseStreamClient(ctx, stream, nil)
@@ -66,6 +66,61 @@ func TestResponseStreamClientDoesNotReturnMidStreamError(t *testing.T) {
 
 	if !strings.Contains(body, `"stream_error"`) {
 		t.Fatalf("expected stream body to include SSE error payload, got: %q", body)
+	}
+	if !strings.Contains(body, `"message":"stream interrupted"`) {
+		t.Fatalf("expected stream body to include stable stream error message, got: %q", body)
+	}
+	for _, forbidden := range []string{
+		"upstream stream broken",
+		"Authorization",
+		"secret-token",
+		"query-secret",
+		"provider.example",
+		"url-secret",
+		"session-secret",
+		"sk-testSECRET123",
+	} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("expected stream error body not to leak %q, got %q", forbidden, body)
+		}
+	}
+}
+
+func TestResponseStreamClientClosedChannelsFinishAsEOF(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logger.Logger = zap.NewNop()
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+
+	stream := &fakeRelayStream{
+		dataChan: make(chan string),
+		errChan:  make(chan error, 1),
+	}
+
+	go func() {
+		stream.dataChan <- `{"id":"chunk-closed"}`
+		close(stream.dataChan)
+		close(stream.errChan)
+	}()
+
+	firstResponseTime, errWithCode := responseStreamClient(ctx, stream, func() string {
+		return `{"id":"end"}`
+	})
+	if errWithCode != nil {
+		t.Fatalf("expected nil error, got: %v", errWithCode.Message)
+	}
+	if firstResponseTime.IsZero() {
+		t.Fatal("expected first response time to be set")
+	}
+
+	body := recorder.Body.String()
+	if !strings.Contains(body, `data: {"id":"chunk-closed"}`) {
+		t.Fatalf("expected stream body to include upstream chunk, got: %q", body)
+	}
+	if !strings.Contains(body, `data: {"id":"end"}`) || !strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("expected closed channels to finish with end payload and [DONE], got: %q", body)
 	}
 }
 

@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"one-api/common"
@@ -11,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
 )
 
 func GetChannelsList(c *gin.Context) {
@@ -189,7 +191,9 @@ func DeleteDisabledChannel(c *gin.Context) {
 
 func UpdateChannel(c *gin.Context) {
 	channel := model.Channel{}
-	err := c.ShouldBindJSON(&channel)
+	// ShouldBindBodyWith caches the raw body in Gin's context, so the second
+	// bind below can distinguish omitted fields from submitted zero values.
+	err := c.ShouldBindBodyWith(&channel, binding.JSON)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
@@ -197,10 +201,22 @@ func UpdateChannel(c *gin.Context) {
 		})
 		return
 	}
+	var submitted map[string]json.RawMessage
+	if err := c.ShouldBindBodyWith(&submitted, binding.JSON); err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	updateOptions := model.ChannelUpdateOptions{
+		OtherSubmitted:   submitted != nil && mapHasJSONField(submitted, "other"),
+		BaseURLSubmitted: submitted != nil && mapHasJSONField(submitted, "base_url"),
+	}
 	if channel.Models == "" {
-		err = channel.Update(false)
+		err = channel.UpdateWithOptions(false, updateOptions)
 	} else {
-		err = channel.Update(true)
+		err = channel.UpdateWithOptions(true, updateOptions)
 	}
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
@@ -214,6 +230,11 @@ func UpdateChannel(c *gin.Context) {
 		"message": "",
 		"data":    channel,
 	})
+}
+
+func mapHasJSONField(fields map[string]json.RawMessage, field string) bool {
+	_, ok := fields[field]
+	return ok
 }
 
 func BatchUpdateChannelsAzureApi(c *gin.Context) {
@@ -242,7 +263,7 @@ func BatchUpdateChannelsAzureApi(c *gin.Context) {
 }
 
 func BatchDelModelChannels(c *gin.Context) {
-	var params model.BatchChannelsParams
+	var params model.BatchDelModelChannelsParams
 	err := c.ShouldBindJSON(&params)
 	if err != nil {
 		common.APIRespondWithError(c, http.StatusOK, err)

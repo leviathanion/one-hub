@@ -1,6 +1,7 @@
 package model
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 
@@ -157,6 +158,48 @@ func TestChannelsChooserRefreshChannelUpdatesTrackedKeyAndProxy(t *testing.T) {
 	}
 }
 
+func TestChannelsChooserRefreshChannelInvalidRuntimeConfigFailsClosed(t *testing.T) {
+	originalLoader := loadChannelByIDForChannelGroupRefresh
+	t.Cleanup(func() {
+		loadChannelByIDForChannelGroupRefresh = originalLoader
+	})
+
+	weight := uint(1)
+	chooser := ChannelsChooser{
+		Channels: map[int]*ChannelChoice{
+			7: {
+				Channel: &Channel{
+					Id:     7,
+					Type:   config.ChannelTypeOpenAI,
+					Weight: &weight,
+				},
+			},
+		},
+	}
+	loadChannelByIDForChannelGroupRefresh = func(id int) (*Channel, error) {
+		if id != 7 {
+			t.Fatalf("unexpected channel refresh id: got %d want 7", id)
+		}
+		return &Channel{
+			Id:    7,
+			Type:  config.ChannelTypeOpenAI,
+			Other: "2024-05-01-preview",
+		}, nil
+	}
+
+	err := chooser.RefreshChannel(7)
+	var invalid *InvalidChannelRuntimeConfigError
+	if !errors.As(err, &invalid) {
+		t.Fatalf("expected invalid runtime config error, got %v", err)
+	}
+	if choice := chooser.Channels[7]; choice == nil || !choice.Disable {
+		t.Fatalf("expected invalid refresh to fail-close existing channel, got %+v", choice)
+	}
+	if !chooser.isDirty() {
+		t.Fatal("expected fail-closed refresh to mark chooser dirty")
+	}
+}
+
 func TestChannelValidateRuntimeConfigJSONRejectsInvalidCodexOther(t *testing.T) {
 	channel := &Channel{
 		Type:  config.ChannelTypeCodex,
@@ -167,13 +210,18 @@ func TestChannelValidateRuntimeConfigJSONRejectsInvalidCodexOther(t *testing.T) 
 	}
 }
 
-func TestChannelValidateRuntimeConfigJSONAllowsPlainOtherForNonCodexChannels(t *testing.T) {
+func TestChannelValidateRuntimeConfigJSONRejectsPlainOtherForAllChannels(t *testing.T) {
 	channel := &Channel{
-		Type:  3,
+		Type:  config.ChannelTypeOpenAI,
 		Other: "2024-05-01-preview",
 	}
+	if err := channel.ValidateRuntimeConfigJSON(); err == nil {
+		t.Fatal("expected plain other field to be rejected")
+	}
+
+	channel.Other = `{"vendor_extra":{"api_version":"2024-05-01-preview"}}`
 	if err := channel.ValidateRuntimeConfigJSON(); err != nil {
-		t.Fatalf("expected non-Codex plain other field to remain valid, got %v", err)
+		t.Fatalf("expected JSON object other field to remain valid, got %v", err)
 	}
 }
 
@@ -284,6 +332,63 @@ func TestChannelInsertAndHydrateValidationBranches(t *testing.T) {
 	}).UpdateRaw(false); err == nil {
 		t.Fatal("expected updates for missing channels to fail while hydrating the persisted type")
 	}
+}
+
+func TestChannelPersistenceCanonicalizesLegacyOther(t *testing.T) {
+	useTestChannelDB(t)
+
+	inserted := &Channel{
+		Type:   config.ChannelTypeOpenAI,
+		Name:   "openai-insert",
+		Key:    "sk-insert",
+		Group:  "default",
+		Models: "gpt-5",
+		Other:  "legacy-openai",
+	}
+	if err := inserted.Insert(); err != nil {
+		t.Fatalf("expected insert to canonicalize OpenAI legacy other, got %v", err)
+	}
+	persisted, err := GetChannelById(inserted.Id)
+	if err != nil {
+		t.Fatalf("expected inserted OpenAI channel lookup to succeed, got %v", err)
+	}
+	assertJSONObjectsEqual(t, persisted.Other, `{"vendor_extra":{"legacy_other":"legacy-openai"}}`)
+
+	if err := BatchInsertChannels([]Channel{
+		{
+			Type:   config.ChannelTypeCodex,
+			Name:   "codex-batch",
+			Key:    "sk-batch",
+			Group:  "default",
+			Models: "gpt-5",
+			Other:  `{"websocket_mode":"required"}`,
+		},
+	}); err != nil {
+		t.Fatalf("expected batch insert to canonicalize Codex legacy websocket_mode, got %v", err)
+	}
+	var batch Channel
+	if err := DB.Where("name = ?", "codex-batch").First(&batch).Error; err != nil {
+		t.Fatalf("expected batch-inserted Codex channel lookup to succeed, got %v", err)
+	}
+	assertJSONObjectsEqual(t, batch.Other, `{"websocket_mode":"force"}`)
+
+	update := &Channel{
+		Id:     inserted.Id,
+		Type:   config.ChannelTypeOpenAI,
+		Name:   "openai-update",
+		Key:    "sk-update",
+		Group:  "default",
+		Models: "gpt-5",
+		Other:  "legacy-update",
+	}
+	if err := update.UpdateRawWithOptions(false, ChannelUpdateOptions{OtherSubmitted: true}); err != nil {
+		t.Fatalf("expected update to canonicalize OpenAI legacy other, got %v", err)
+	}
+	persisted, err = GetChannelById(inserted.Id)
+	if err != nil {
+		t.Fatalf("expected updated OpenAI channel lookup to succeed, got %v", err)
+	}
+	assertJSONObjectsEqual(t, persisted.Other, `{"vendor_extra":{"legacy_other":"legacy-update"}}`)
 }
 
 func TestChannelGetOtherMapParsesAndReparsesOtherJSON(t *testing.T) {

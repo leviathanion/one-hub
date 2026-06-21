@@ -134,6 +134,20 @@ func BatchInsert[T any](db *gorm.DB, data []T) error {
 	return nil
 }
 
+func BatchInsertStrict[T any](db *gorm.DB, data []T) error {
+	batchSize := 200
+	for i := 0; i < len(data); i += batchSize {
+		end := i + batchSize
+		if end > len(data) {
+			end = len(data)
+		}
+		if err := batchInsertWithRetry(db, data[i:end]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // batchInsertWithRetry 使用二分法进行容错插入
 // 当批量插入失败时，将数据二分后分别尝试插入，递归直到单条记录
 func batchInsertWithRetry[T any](db *gorm.DB, data []T) error {

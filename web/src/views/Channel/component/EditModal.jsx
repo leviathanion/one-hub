@@ -41,7 +41,7 @@ import CheckBoxOutlineBlankIcon from '@mui/icons-material/CheckBoxOutlineBlank';
 import CheckBoxIcon from '@mui/icons-material/CheckBox';
 import { useTranslation } from 'react-i18next';
 import useCustomizeT from 'hooks/useCustomizeT';
-import { PreCostType } from '../type/other';
+import { PreCostType, normalizeChannelOtherForRequest } from '../type/other';
 import MapInput from './MapInput';
 import ListInput from './ListInput';
 import ModelSelectorModal from './ModelSelectorModal';
@@ -54,6 +54,26 @@ const icon = <CheckBoxOutlineBlankIcon fontSize="small" />;
 const checkedIcon = <CheckBoxIcon fontSize="small" />;
 
 const filter = createFilterOptions();
+const isAzureV1ResourceLevelBaseUrl = (value) => {
+  const raw = String(value ?? '').trim();
+  if (raw === '') {
+    return false;
+  }
+  try {
+    const parsed = new URL(raw);
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+      return false;
+    }
+    const segments = parsed.pathname
+      .toLowerCase()
+      .split('/')
+      .filter((segment) => segment !== '');
+    return !segments.some((segment, index) => segment === 'openai' && segments[index + 1] === 'deployments');
+  } catch {
+    return false;
+  }
+};
+
 const getValidationSchema = (t) =>
   Yup.object().shape({
     is_edit: Yup.boolean(),
@@ -61,14 +81,35 @@ const getValidationSchema = (t) =>
     name: Yup.string().required(t('channel_edit.requiredName')),
     type: Yup.number().required(t('channel_edit.requiredChannel')),
     key: Yup.string().when('is_edit', { is: false, then: Yup.string().required(t('channel_edit.requiredKey')) }),
-    other: Yup.string(),
+    other: Yup.string().test('azure-speech-region-or-base-url', t('channel_edit.requiredAzureSpeechRegionOrBaseUrl'), function (value) {
+      if (Number(this.parent.type) !== 24 || String(this.parent.base_url ?? '').trim() !== '') {
+        return true;
+      }
+      const raw = String(value ?? '').trim();
+      if (raw === '') {
+        return false;
+      }
+      try {
+        const parsed = JSON.parse(raw);
+        return Boolean(parsed && typeof parsed === 'object' && !Array.isArray(parsed) && String(parsed.region ?? '').trim() !== '');
+      } catch {
+        return false;
+      }
+    }),
     proxy: Yup.string(),
     test_model: Yup.string(),
     models: Yup.array().min(1, t('channel_edit.requiredModels')),
     groups: Yup.array().min(1, t('channel_edit.requiredGroup')),
     base_url: Yup.string().when('type', {
-      is: (value) => [3, 8].includes(value),
-      then: Yup.string().required(t('channel_edit.requiredBaseUrl')), // base_url 是必需的
+      is: (value) => [3, 8, 55].includes(value),
+      then: Yup.string()
+        .required(t('channel_edit.requiredBaseUrl'))
+        .test('azure-v1-resource-level-base-url', t('channel_edit.invalidAzureV1ResourceBaseUrl'), function (value) {
+          if (Number(this.parent.type) !== 55) {
+            return true;
+          }
+          return isAzureV1ResourceLevelBaseUrl(value);
+        }),
       otherwise: Yup.string() // 在其他情况下，base_url 可以是任意字符串
     }),
     model_mapping: Yup.array(),
@@ -98,79 +139,92 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
   const batchFileInputRef = useRef(null);
   const codexBatchAuthFileInputRef = useRef(null);
   const [codexConfigHelpOpen, setCodexConfigHelpOpen] = useState(false);
+  const codexConfigHelpKey = 'channel_edit.codexConfigHelp';
   const codexConfigFields = [
-    ['prompt_cache_key_strategy', 'off', 'auto / off / session_id / auth_header / token_id / user_id', '未显式传 prompt_cache_key 时如何自动生成稳定值'],
-    ['websocket_mode', 'auto', 'auto / force / off', '控制 Realtime 优先 websocket、强制 websocket，或禁用 websocket'],
-    ['execution_session_ttl_seconds', '600', '正整数秒', 'execution session 空闲保留时长'],
-    ['websocket_retry_cooldown_seconds', '120', '正整数秒', 'websocket 失败后切回 HTTP bridge 的冷却时间'],
-    ['self_hosted', 'false', 'true / false', '允许 Codex Realtime 使用私有或本地自建上游'],
-    ['responses_ws_self_hosted', 'false', 'true / false', '允许 Responses websocket 使用私有或本地自建上游']
+    [
+      'prompt_cache_key_strategy',
+      'off',
+      'auto / off / session_id / auth_header / token_id / user_id',
+      t(`${codexConfigHelpKey}.fields.promptCacheKeyStrategy`)
+    ],
+    ['websocket_mode', 'auto', 'auto / force / off', t(`${codexConfigHelpKey}.fields.websocketMode`)],
+    ['responses_ws_transport', 'native', 'native / http_bridge', t(`${codexConfigHelpKey}.fields.responsesWSTransport`)],
+    ['execution_session_ttl_seconds', '600', t(`${codexConfigHelpKey}.positiveIntegerSeconds`), t(`${codexConfigHelpKey}.fields.executionSessionTTL`)],
+    [
+      'websocket_retry_cooldown_seconds',
+      '120',
+      t(`${codexConfigHelpKey}.positiveIntegerSeconds`),
+      t(`${codexConfigHelpKey}.fields.websocketRetryCooldown`)
+    ],
+    ['self_hosted', 'false', 'true / false', t(`${codexConfigHelpKey}.fields.selfHosted`)],
+    ['responses_ws_self_hosted', 'false', 'true / false', t(`${codexConfigHelpKey}.fields.responsesWSSelfHosted`)]
   ];
   const codexConfigExamples = [
     {
-      title: '默认行为：不自动生成 prompt_cache_key',
+      title: t(`${codexConfigHelpKey}.examples.defaultPromptCache`),
       value: `{
   "prompt_cache_key_strategy": "off"
 }`
     },
     {
-      title: '常用：自动生成稳定 prompt_cache_key',
+      title: t(`${codexConfigHelpKey}.examples.autoPromptCache`),
       value: `{
   "prompt_cache_key_strategy": "auto"
 }`
     },
     {
-      title: 'Realtime：优先 websocket，失败回退 HTTP bridge',
+      title: t(`${codexConfigHelpKey}.examples.realtimeAuto`),
       value: `{
   "websocket_mode": "auto"
 }`
     },
     {
-      title: 'Realtime：必须走 websocket',
+      title: t(`${codexConfigHelpKey}.examples.realtimeForce`),
       value: `{
   "websocket_mode": "force"
 }`
     },
     {
-      title: 'Realtime：禁用 websocket',
+      title: t(`${codexConfigHelpKey}.examples.realtimeOff`),
       value: `{
   "websocket_mode": "off"
 }`
     },
     {
-      title: '按 session_id 绑定缓存',
+      title: t(`${codexConfigHelpKey}.examples.sessionIDCache`),
       value: `{
   "prompt_cache_key_strategy": "session_id"
 }`
     },
     {
-      title: '同一用户多个令牌共享缓存',
+      title: t(`${codexConfigHelpKey}.examples.userIDCache`),
       value: `{
   "prompt_cache_key_strategy": "user_id"
 }`
     },
     {
-      title: '每个令牌独立缓存',
+      title: t(`${codexConfigHelpKey}.examples.tokenIDCache`),
       value: `{
   "prompt_cache_key_strategy": "token_id"
 }`
     },
     {
-      title: '按外部认证头共享缓存',
+      title: t(`${codexConfigHelpKey}.examples.authHeaderCache`),
       value: `{
   "prompt_cache_key_strategy": "auth_header"
 }`
     },
     {
-      title: '自建或内网上游：显式放开私有地址',
+      title: t(`${codexConfigHelpKey}.examples.selfHosted`),
       value: `{
   "websocket_mode": "auto",
+  "responses_ws_transport": "native",
   "self_hosted": true,
   "responses_ws_self_hosted": true
 }`
     },
     {
-      title: '进阶：调整 session TTL 与 websocket 冷却',
+      title: t(`${codexConfigHelpKey}.examples.ttlCooldown`),
       value: `{
   "execution_session_ttl_seconds": 600,
   "websocket_retry_cooldown_seconds": 120
@@ -324,7 +378,7 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
   };
 
   const prepareChannelPayload = (sourceValues) => {
-    const values = trims(JSON.parse(JSON.stringify(sourceValues)));
+    let values = trims(JSON.parse(JSON.stringify(sourceValues)));
     const modelMappingModel = [];
 
     if (!Array.isArray(values.models) || values.models.length === 0) {
@@ -334,12 +388,10 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
     if (values.base_url && values.base_url.endsWith('/')) {
       values.base_url = values.base_url.slice(0, values.base_url.length - 1);
     }
-    if (values.type === 3 && values.other === '') {
-      values.other = '2024-05-01-preview';
-    }
-    if (values.type === 18 && values.other === '') {
-      values.other = 'v2.1';
-    }
+	values = normalizeChannelOtherForRequest(values);
+	if (values.type === 18 && values.other === '') {
+	  values.other = '{"api_version":"v3.1"}';
+	}
 
     if (values.model_mapping) {
       try {
@@ -390,7 +442,7 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
       values.custom_parameter = normalizeJSONObjectString('custom_parameter', values.custom_parameter);
     }
 
-    if (values.type === 101 && values.other) {
+    if (values.other) {
       values.other = normalizeJSONObjectString('other', values.other);
     }
 
@@ -780,9 +832,9 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                         endAdornment={
                           values.type === 101 ? (
                             <InputAdornment position="end" sx={{ alignSelf: values.type === 101 ? 'flex-start' : 'center', mt: 0.5 }}>
-                              <Tooltip title="查看 Codex 配置帮助">
+                              <Tooltip title={t(`${codexConfigHelpKey}.tooltip`)}>
                                 <IconButton
-                                  aria-label="查看 Codex 配置帮助"
+                                  aria-label={t(`${codexConfigHelpKey}.tooltip`)}
                                   edge="end"
                                   size="small"
                                   type="button"
@@ -808,14 +860,13 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
 
                     {values.type === 101 && (
                       <Dialog open={codexConfigHelpOpen} onClose={() => setCodexConfigHelpOpen(false)} fullWidth maxWidth="md">
-                        <DialogTitle>Codex 配置帮助</DialogTitle>
+                        <DialogTitle>{t(`${codexConfigHelpKey}.title`)}</DialogTitle>
                         <DialogContent dividers>
                           <Typography variant="body2" sx={{ mb: 2 }}>
-                            这里填写的是渠道级 JSON，对应后端 channel.Other。留空可用默认值；如果你已经在请求里显式传
-                            prompt_cache_key，通常不需要配置 prompt_cache_key_strategy。
+                            {t(`${codexConfigHelpKey}.intro`)}
                           </Typography>
                           <Typography variant="subtitle2" sx={{ mb: 1 }}>
-                            支持字段
+                            {t(`${codexConfigHelpKey}.fieldsTitle`)}
                           </Typography>
                           <Box sx={{ display: 'grid', gap: 1, mb: 2 }}>
                             {codexConfigFields.map(([field, defaultValue, accepted, description]) => (
@@ -833,15 +884,15 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                                 <Typography component="code" variant="caption" sx={{ fontWeight: 700 }}>
                                   {field}
                                 </Typography>
-                                <Typography variant="caption">默认：{defaultValue}</Typography>
+                                <Typography variant="caption">{t(`${codexConfigHelpKey}.defaultValue`, { value: defaultValue })}</Typography>
                                 <Typography variant="caption">
-                                  {accepted}；{description}
+                                  {t(`${codexConfigHelpKey}.acceptedValue`, { accepted, description })}
                                 </Typography>
                               </Box>
                             ))}
                           </Box>
                           <Typography variant="subtitle2" sx={{ mb: 1 }}>
-                            可复制模板
+                            {t(`${codexConfigHelpKey}.examplesTitle`)}
                           </Typography>
                           <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' }, gap: 1.5 }}>
                             {codexConfigExamples.map((example) => (
@@ -868,7 +919,7 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                           </Box>
                         </DialogContent>
                         <DialogActions>
-                          <Button onClick={() => setCodexConfigHelpOpen(false)}>关闭</Button>
+                          <Button onClick={() => setCodexConfigHelpOpen(false)}>{t(`${codexConfigHelpKey}.close`)}</Button>
                         </DialogActions>
                       </Dialog>
                     )}

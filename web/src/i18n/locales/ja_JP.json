@@ -123,6 +123,8 @@
     "modelMappingKey": "ユーザーリクエストモデル",
     "modelMappingValue": "実際の転送モデル",
     "requiredBaseUrl": "チャネル API アドレスを空にすることはできません",
+    "invalidAzureV1ResourceBaseUrl": "Azure V1 endpoint は resource-level URL で、/openai/deployments を含めることはできません",
+    "requiredAzureSpeechRegionOrBaseUrl": "Azure Speech には other.region またはチャネル API アドレスが必要です",
     "requiredChannel": "チャンネルを空にすることはできません",
     "requiredGroup": "ユーザーグループを空にすることはできません",
     "requiredKey": "キーを空にすることはできません",
@@ -149,7 +151,40 @@
     "removePrefix": "前缀を削除",
     "removeSuffix": "後缀を削除",
     "collapseList": "リストを折りたたむ",
-    "expandList": "リストを展開"
+    "expandList": "リストを展開",
+    "codexConfigHelp": {
+      "title": "Codex 設定ヘルプ",
+      "tooltip": "Codex 設定ヘルプを表示",
+      "intro": "ここに入力するのはチャネル単位の JSON で、バックエンドの channel.Other に対応します。空欄の場合はデフォルトを使用します。リクエストで prompt_cache_key を明示している場合、通常 prompt_cache_key_strategy の設定は不要です。",
+      "fieldsTitle": "対応フィールド",
+      "examplesTitle": "コピー可能なテンプレート",
+      "positiveIntegerSeconds": "正の整数秒",
+      "defaultValue": "デフォルト: {{value}}",
+      "acceptedValue": "{{accepted}}; {{description}}",
+      "close": "閉じる",
+      "fields": {
+        "promptCacheKeyStrategy": "prompt_cache_key が明示されない場合に安定した値を自動生成する方法",
+        "websocketMode": "Codex Realtime で websocket を優先、必須、または無効にするかを制御します",
+        "responsesWSTransport": "Responses websocket の upstream transport。http_bridge は明示的に有効化する必要があり、native 失敗後の自動 fallback ではありません",
+        "executionSessionTTL": "Codex Realtime execution session のアイドル保持時間",
+        "websocketRetryCooldown": "Codex Realtime websocket 失敗後の bridge クールダウン",
+        "selfHosted": "Codex Realtime のみ、プライベートまたはローカルの self-hosted upstream を許可します",
+        "responsesWSSelfHosted": "Responses websocket のみ、プライベートまたはローカルの self-hosted upstream を許可します"
+      },
+      "examples": {
+        "defaultPromptCache": "デフォルト: prompt_cache_key を自動生成しない",
+        "autoPromptCache": "一般的: 安定した prompt_cache_key を生成",
+        "realtimeAuto": "Realtime: websocket を優先し、失敗後は HTTP bridge クールダウンを使用",
+        "realtimeForce": "Realtime: websocket を必須にする",
+        "realtimeOff": "Realtime: websocket を無効にする",
+        "sessionIDCache": "session_id でキャッシュを紐付ける",
+        "userIDCache": "同一ユーザーの複数トークンでキャッシュを共有",
+        "tokenIDCache": "トークンごとにキャッシュを分離",
+        "authHeaderCache": "外部認証ヘッダーでキャッシュを共有",
+        "selfHosted": "Self-hosted またはイントラネット upstream: プライベートアドレスを明示的に許可",
+        "ttlCooldown": "高度: session TTL と Realtime bridge クールダウンを調整"
+      }
+    }
   },
   "channel_index": {
     "AzureApiVersion": "Azureのバージョン番号",
@@ -1719,6 +1754,24 @@
   "使用代码执行功能，开启后，计算tokens不准确，建议个人使用开启": "コード実行機能を使用する場合、オンにするとトークンの計算が不正確になるため、個人で使用することを推奨します。",
   "使用网页搜索功能，对用户输入的内容进行搜索": "Web検索機能を使用して、ユーザーが入力したコンテンツを検索します。",
   "其他参数": "その他のパラメータ",
+  "Azure 配置(JSON)": "Azure 構成 (JSON)",
+  "Other(JSON)": "Other (JSON)",
+  "Ali 配置(JSON)": "Ali 構成 (JSON)",
+  "Xunfei 配置(JSON)": "Xunfei 構成 (JSON)",
+  "Gemini 配置(JSON)": "Gemini 構成 (JSON)",
+  "Azure Speech 配置(JSON)": "Azure Speech 構成 (JSON)",
+  "请输入 JSON，例如：{\"api_version\":\"2024-05-01-preview\"}": "JSON を入力してください。例: {\"api_version\":\"2024-05-01-preview\"}",
+  "请输入 JSON，例如：{\"api_version\":\"2024-05-01-preview\",\"responses_ws_transport\":\"native\"}": "JSON を入力してください。例: {\"api_version\":\"2024-05-01-preview\",\"responses_ws_transport\":\"native\"}",
+  "可选 JSON 配置，例如：{}": "任意の JSON 構成です。例: {}",
+  "可选 JSON 配置，例如：{\"responses_ws_transport\":\"native\"}": "任意の JSON 構成です。例: {\"responses_ws_transport\":\"native\"}",
+  "可选 JSON 配置，例如：{\"responses_ws_native\":true}；仅当自定义兼容上游明确支持原生 Responses WebSocket 时填写。": "任意の JSON 構成です。例: {\"responses_ws_native\":true}。カスタム互換 upstream が native Responses WebSocket を明示的にサポートする場合のみ入力してください。",
+  "可选 JSON 配置，例如：{\"responses_ws_transport\":\"http_bridge\"}；如需原生 Responses WebSocket，可使用 {\"responses_ws_transport\":\"native\"}。": "任意の JSON 構成です。例: {\"responses_ws_transport\":\"http_bridge\"}。native Responses WebSocket を使う場合は {\"responses_ws_transport\":\"native\"} を使用してください。",
+  "可选 JSON 配置，例如：{\"responses_ws_transport\":\"http_bridge\"}；如自定义兼容上游支持原生 Responses WebSocket，可使用 {\"responses_ws_native\":true,\"responses_ws_transport\":\"native\"}。": "任意の JSON 構成です。例: {\"responses_ws_transport\":\"http_bridge\"}。カスタム互換 upstream が native Responses WebSocket をサポートする場合は {\"responses_ws_native\":true,\"responses_ws_transport\":\"native\"} を使用してください。",
+  "请输入 JSON，例如：{\"dashscope_plugin\":\"plugin-name\"}": "JSON を入力してください。例: {\"dashscope_plugin\":\"plugin-name\"}",
+  "请输入 JSON，例如：{\"api_version\":\"v3.1\"}": "JSON を入力してください。例: {\"api_version\":\"v3.1\"}",
+  "请输入 JSON，例如：{\"api_version\":\"v1\"}": "JSON を入力してください。例: {\"api_version\":\"v1\"}",
+  "请输入 JSON，例如：{\"region\":\"eastasia\"}": "JSON を入力してください。例: {\"region\":\"eastasia\"}",
+  "请输入 JSON，例如：{\"region\":\"us-central1\",\"project_id\":\"my-project\"}": "JSON を入力してください。例: {\"region\":\"us-central1\",\"project_id\":\"my-project\"}",
   "可空，请输入中转API地址，例如通过cloudflare中转": "空のままにすることもできます。たとえば、cloudflare 転送を通じて転送 API アドレスを入力してください。",
   "启用": "有効にする",
   "地址填写Suno-API部署的地址": "アドレス: Suno-API デプロイメントのアドレスを入力します。",
@@ -1858,5 +1911,6 @@
       }
     }
   },
-  "这里填写禁用流式的模型，注意：如果填写了禁用流式的模型，那么这些模型在流式请求时会跳过该渠道": "ここには、ストリーミングを無効にするモデルを記入してください。注意：ストリーミングを無効にするモデルを記入した場合、これらのモデルはストリームリクエスト時にそのチャンネルをスキップします。"
+  "这里填写禁用流式的模型，注意：如果填写了禁用流式的模型，那么这些模型在流式请求时会跳过该渠道": "ここには、ストリーミングを無効にするモデルを記入してください。注意：ストリーミングを無効にするモデルを記入した場合、これらのモデルはストリームリクエスト時にそのチャンネルをスキップします。",
+  "开启后，将会透传普通 HTTP 请求中的额外字段（如 OpenAI SDK 的 extra_body 参数）；ResponsesWS HTTP bridge 按 WebSocket raw frame 契约保留未知字段，不受此开关控制": "有効にすると、通常の HTTP リクエスト内の追加フィールド（OpenAI SDK の extra_body パラメータなど）を透過的に転送します。ResponsesWS HTTP bridge は WebSocket raw frame 契約に従って未知フィールドを保持するため、このスイッチの制御対象外です。"
 }

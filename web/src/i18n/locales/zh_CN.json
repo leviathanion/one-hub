@@ -227,6 +227,8 @@
     "requiredModels": "模型 不能为空",
     "requiredGroup": "用户组 不能为空",
     "requiredBaseUrl": "渠道API地址 不能为空",
+    "invalidAzureV1ResourceBaseUrl": "Azure V1 Endpoint 必须是 resource-level 地址，不能包含 /openai/deployments 路径",
+    "requiredAzureSpeechRegionOrBaseUrl": "Azure Speech 需要填写 other.region 或渠道API地址",
     "validJson": "必须是有效的JSON字符串",
     "modelMappingKey": "用户请求模型",
     "modelMappingValue": "实际转发模型",
@@ -280,7 +282,40 @@
     "overwriteMappings": "覆盖原有映射关系",
     "overwriteMappingsTip": "启用后将清空原有的映射关系，仅保留此次创建的映射",
     "clearModels": "重置",
-    "clearModelsTip": "重置所有已选择的模型"
+    "clearModelsTip": "重置所有已选择的模型",
+    "codexConfigHelp": {
+      "title": "Codex 配置帮助",
+      "tooltip": "查看 Codex 配置帮助",
+      "intro": "这里填写的是渠道级 JSON，对应后端 channel.Other。留空可用默认值；如果你已经在请求里显式传 prompt_cache_key，通常不需要配置 prompt_cache_key_strategy。",
+      "fieldsTitle": "支持字段",
+      "examplesTitle": "可复制模板",
+      "positiveIntegerSeconds": "正整数秒",
+      "defaultValue": "默认：{{value}}",
+      "acceptedValue": "{{accepted}}；{{description}}",
+      "close": "关闭",
+      "fields": {
+        "promptCacheKeyStrategy": "未显式传 prompt_cache_key 时如何自动生成稳定值",
+        "websocketMode": "控制 Codex Realtime 优先 websocket、强制 websocket，或禁用 websocket",
+        "responsesWSTransport": "Responses websocket 上游传输；http_bridge 需显式启用，且不是 native 失败后的自动 fallback",
+        "executionSessionTTL": "Codex Realtime execution session 空闲保留时长",
+        "websocketRetryCooldown": "Codex Realtime websocket 失败后的 bridge 冷却",
+        "selfHosted": "仅允许 Codex Realtime 使用私有或本地自建上游",
+        "responsesWSSelfHosted": "仅允许 Responses websocket 使用私有或本地自建上游"
+      },
+      "examples": {
+        "defaultPromptCache": "默认行为：不自动生成 prompt_cache_key",
+        "autoPromptCache": "常用：自动生成稳定 prompt_cache_key",
+        "realtimeAuto": "Realtime：优先 websocket，失败后使用 HTTP bridge 冷却",
+        "realtimeForce": "Realtime：必须走 websocket",
+        "realtimeOff": "Realtime：禁用 websocket",
+        "sessionIDCache": "按 session_id 绑定缓存",
+        "userIDCache": "同一用户多个令牌共享缓存",
+        "tokenIDCache": "每个令牌独立缓存",
+        "authHeaderCache": "按外部认证头共享缓存",
+        "selfHosted": "自建或内网上游：显式放开私有地址",
+        "ttlCooldown": "进阶：调整 session TTL 与 Realtime bridge 冷却"
+      }
+    }
   },
   "token_index": {
     "token": "令牌",
@@ -1839,5 +1874,24 @@
     "nameTip": "渠道名称"
   },
   "禁用流式的模型": "禁用流式的模型",
-  "这里填写禁用流式的模型，注意：如果填写了禁用流式的模型，那么这些模型在流式请求时会跳过该渠道": "这里填写禁用流式的模型，注意：如果填写了禁用流式的模型，那么这些模型在流式请求时会跳过该渠道"
+  "这里填写禁用流式的模型，注意：如果填写了禁用流式的模型，那么这些模型在流式请求时会跳过该渠道": "这里填写禁用流式的模型，注意：如果填写了禁用流式的模型，那么这些模型在流式请求时会跳过该渠道",
+  "Azure 配置(JSON)": "Azure 配置(JSON)",
+  "Other(JSON)": "Other(JSON)",
+  "Ali 配置(JSON)": "Ali 配置(JSON)",
+  "Xunfei 配置(JSON)": "Xunfei 配置(JSON)",
+  "Gemini 配置(JSON)": "Gemini 配置(JSON)",
+  "Azure Speech 配置(JSON)": "Azure Speech 配置(JSON)",
+  "请输入 JSON，例如：{\"api_version\":\"2024-05-01-preview\"}": "请输入 JSON，例如：{\"api_version\":\"2024-05-01-preview\"}",
+  "请输入 JSON，例如：{\"api_version\":\"2024-05-01-preview\",\"responses_ws_transport\":\"native\"}": "请输入 JSON，例如：{\"api_version\":\"2024-05-01-preview\",\"responses_ws_transport\":\"native\"}",
+  "可选 JSON 配置，例如：{}": "可选 JSON 配置，例如：{}",
+  "可选 JSON 配置，例如：{\"responses_ws_transport\":\"native\"}": "可选 JSON 配置，例如：{\"responses_ws_transport\":\"native\"}",
+  "可选 JSON 配置，例如：{\"responses_ws_native\":true}；仅当自定义兼容上游明确支持原生 Responses WebSocket 时填写。": "可选 JSON 配置，例如：{\"responses_ws_native\":true}；仅当自定义兼容上游明确支持原生 Responses WebSocket 时填写。",
+  "可选 JSON 配置，例如：{\"responses_ws_transport\":\"http_bridge\"}；如需原生 Responses WebSocket，可使用 {\"responses_ws_transport\":\"native\"}。": "可选 JSON 配置，例如：{\"responses_ws_transport\":\"http_bridge\"}；如需原生 Responses WebSocket，可使用 {\"responses_ws_transport\":\"native\"}。",
+  "可选 JSON 配置，例如：{\"responses_ws_transport\":\"http_bridge\"}；如自定义兼容上游支持原生 Responses WebSocket，可使用 {\"responses_ws_native\":true,\"responses_ws_transport\":\"native\"}。": "可选 JSON 配置，例如：{\"responses_ws_transport\":\"http_bridge\"}；如自定义兼容上游支持原生 Responses WebSocket，可使用 {\"responses_ws_native\":true,\"responses_ws_transport\":\"native\"}。",
+  "请输入 JSON，例如：{\"dashscope_plugin\":\"plugin-name\"}": "请输入 JSON，例如：{\"dashscope_plugin\":\"plugin-name\"}",
+  "请输入 JSON，例如：{\"api_version\":\"v3.1\"}": "请输入 JSON，例如：{\"api_version\":\"v3.1\"}",
+  "请输入 JSON，例如：{\"api_version\":\"v1\"}": "请输入 JSON，例如：{\"api_version\":\"v1\"}",
+  "请输入 JSON，例如：{\"region\":\"eastasia\"}": "请输入 JSON，例如：{\"region\":\"eastasia\"}",
+  "请输入 JSON，例如：{\"region\":\"us-central1\",\"project_id\":\"my-project\"}": "请输入 JSON，例如：{\"region\":\"us-central1\",\"project_id\":\"my-project\"}",
+  "开启后，将会透传普通 HTTP 请求中的额外字段（如 OpenAI SDK 的 extra_body 参数）；ResponsesWS HTTP bridge 按 WebSocket raw frame 契约保留未知字段，不受此开关控制": "开启后，将会透传普通 HTTP 请求中的额外字段（如 OpenAI SDK 的 extra_body 参数）；ResponsesWS HTTP bridge 按 WebSocket raw frame 契约保留未知字段，不受此开关控制"
 }

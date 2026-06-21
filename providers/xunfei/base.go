@@ -86,13 +86,19 @@ func (p *XunfeiProvider) getAPIVersion(modelName string) string {
 		return apiVersion
 	}
 
-	apiVersion = p.Channel.Other
+	if p.Channel != nil {
+		configured, err := p.Channel.GetOtherStringField("api_version")
+		if err != nil {
+			base.LogChannelConfigParseError(p.LogContext(), "xunfei", p.Channel, "api_version", err)
+		}
+		apiVersion = configured
+	}
 	if apiVersion != "" {
 		return apiVersion
 	}
 	apiVersion = "v1.1"
 
-	logger.SysLog("api_version not found, use default: " + apiVersion)
+	base.LogChannelConfigWarning(p.LogContext(), "xunfei", p.Channel, "api_version", "api_version not found, using default: "+apiVersion)
 	return apiVersion
 }
 

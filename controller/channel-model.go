@@ -42,6 +42,14 @@ func GetModelList(c *gin.Context) {
 		}
 	}
 
+	if err := channel.ValidateRuntimeConfigJSON(); err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+
 	provider := providers.GetProvider(channel, c)
 	if provider == nil {
 		c.JSON(http.StatusOK, gin.H{

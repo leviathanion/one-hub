@@ -125,8 +125,8 @@ func (converter *OpenAIResponsesStreamConverter) ProcessStreamData(jsonStr strin
 	converter.processChoices(response.Choices)
 }
 
-func (converter *OpenAIResponsesStreamConverter) ProcessError(jsonStr string) {
-	converter.sendError(jsonStr)
+func (converter *OpenAIResponsesStreamConverter) ProcessStreamError() {
+	converter.sendError("stream interrupted")
 }
 
 func (observer *OpenAIResponsesStreamObserver) ObserveRawLine(rawLine string) {

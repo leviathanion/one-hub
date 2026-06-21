@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"one-api/common/config"
 	"one-api/common/requester"
 	"one-api/model"
@@ -17,6 +18,14 @@ type OpenAIProviderFactory struct{}
 
 type UsageHandler func(usage *types.Usage) (ForcedFormatting bool)
 type RequestHandleBefore func(request *types.ChatCompletionRequest) (errWithCode *types.OpenAIErrorWithStatusCode)
+
+type openAIRequestAuthMode int
+
+const (
+	openAIRequestAuthDefault openAIRequestAuthMode = iota
+	openAIRequestAuthBearer
+	openAIRequestAuthAzureAPIKey
+)
 
 type OpenAIProvider struct {
 	base.BaseProvider
@@ -114,6 +123,7 @@ func ErrorHandle(openaiError *types.OpenAIErrorResponse) *types.OpenAIError {
 // 获取完整请求 URL
 func (p *OpenAIProvider) GetFullRequestURL(requestURL string, modelName string) string {
 	baseURL := strings.TrimSuffix(p.GetBaseURL(), "/")
+	azureAPIVersion := p.azureClassicAPIVersionOrEmpty()
 
 	if strings.Contains(modelName, "-realtime") {
 		if strings.HasPrefix(baseURL, "https://") {
@@ -124,7 +134,7 @@ func (p *OpenAIProvider) GetFullRequestURL(requestURL string, modelName string) 
 
 		if p.IsAzure {
 			// wss://my-eastus2-openai-resource.openai.azure.com/openai/realtime?api-version=2024-10-01-preview&deployment=gpt-4o-realtime-preview-1001
-			requestURL = fmt.Sprintf("/openai/%s?api-version=%s&deployment=%s", requestURL, p.Channel.Other, modelName)
+			requestURL = fmt.Sprintf("/openai/%s?api-version=%s&deployment=%s", requestURL, azureAPIVersion, modelName)
 		} else {
 			requestURL += fmt.Sprintf("?model=%s", modelName)
 		}
@@ -132,9 +142,15 @@ func (p *OpenAIProvider) GetFullRequestURL(requestURL string, modelName string) 
 		return fmt.Sprintf("%s%s", baseURL, requestURL)
 	}
 
+	if p.IsAzure && p.Channel != nil && p.Channel.Type == config.ChannelTypeAzureV1 {
+		return azureV1FullRequestURL(baseURL, requestURL)
+	}
+
 	if p.IsAzure {
-		apiVersion := p.Channel.Other
-		if modelName != "" {
+		apiVersion := azureAPIVersion
+		if isAzureClassicResponsesHTTPPath(requestURL) {
+			requestURL = azureClassicResponsesHTTPRequestURL(requestURL, apiVersion)
+		} else if modelName != "" {
 			// 检测模型是是否包含 . 如果有则直接去掉
 			// modelName = strings.Replace(modelName, ".", "", -1)
 
@@ -172,13 +188,128 @@ func (p *OpenAIProvider) GetFullRequestURL(requestURL string, modelName string) 
 	return fmt.Sprintf("%s%s", baseURL, requestURL)
 }
 
+func isAzureClassicResponsesHTTPPath(requestURL string) bool {
+	path := azureClassicResponsesHTTPPathCandidate(requestURL)
+	return path == "/responses" || strings.HasPrefix(path, "/responses/")
+}
+
+func azureClassicResponsesHTTPRequestURL(requestURL string, apiVersion string) string {
+	parsed, err := url.Parse(strings.TrimSpace(requestURL))
+	if err != nil {
+		return fmt.Sprintf("/openai%s?api-version=%s", azureClassicResponsesHTTPPathCandidate(requestURL), apiVersion)
+	}
+	parsed.Path = "/openai" + azureClassicResponsesHTTPPath(parsed.Path)
+	parsed.RawPath = ""
+	parsed.Fragment = ""
+	query := parsed.Query()
+	query.Set("api-version", apiVersion)
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
+}
+
+func azureClassicResponsesHTTPPathCandidate(requestURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(requestURL))
+	if err == nil {
+		return azureClassicResponsesHTTPPath(parsed.Path)
+	}
+	path := strings.TrimSpace(requestURL)
+	if index := strings.IndexAny(path, "?#"); index >= 0 {
+		path = path[:index]
+	}
+	return azureClassicResponsesHTTPPath(path)
+}
+
+func azureClassicResponsesHTTPPath(path string) string {
+	path = "/" + strings.TrimLeft(strings.TrimSpace(path), "/")
+	if path == "/v1" {
+		return ""
+	}
+	if strings.HasPrefix(path, "/v1/") {
+		return strings.TrimPrefix(path, "/v1")
+	}
+	return path
+}
+
+func azureV1FullRequestURL(baseURL string, requestURL string) string {
+	normalizedPath := "/" + strings.TrimLeft(strings.TrimSpace(requestURL), "/")
+	if normalizedPath == "/1" {
+		normalizedPath = "/v1/models"
+	}
+	normalizedPath = strings.TrimPrefix(normalizedPath, "/openai")
+	if !strings.HasPrefix(normalizedPath, "/v1") {
+		normalizedPath = "/v1" + normalizedPath
+	}
+	trimmedBaseURL := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	parsed, err := url.Parse(trimmedBaseURL)
+	if err == nil && parsed.Scheme != "" && parsed.Host != "" {
+		parsed.Path = azureV1ResourceEndpointPath(parsed.Path, normalizedPath)
+		parsed.RawPath = ""
+		parsed.RawQuery = ""
+		parsed.Fragment = ""
+		return parsed.String()
+	}
+	return trimmedBaseURL + azureV1ResourceEndpointPath("", normalizedPath)
+}
+
+func azureV1ResourceEndpointPath(basePath string, endpointPath string) string {
+	endpointPath = "/" + strings.TrimLeft(strings.TrimSpace(endpointPath), "/")
+	if !strings.HasPrefix(endpointPath, "/v1") {
+		endpointPath = "/v1" + endpointPath
+	}
+	prefix := azureV1ResourcePathPrefix(basePath)
+	return prefix + "/openai" + endpointPath
+}
+
+func azureV1ResourcePathPrefix(basePath string) string {
+	path := "/" + strings.Trim(strings.TrimSpace(basePath), "/")
+	if path == "/" || path == "/openai" || path == "/openai/v1" {
+		return ""
+	}
+	switch {
+	case strings.HasSuffix(path, "/openai/v1"):
+		path = strings.TrimSuffix(path, "/openai/v1")
+	case strings.HasSuffix(path, "/openai"):
+		path = strings.TrimSuffix(path, "/openai")
+	}
+	if path == "/" {
+		return ""
+	}
+	return strings.TrimRight(path, "/")
+}
+
+func (p *OpenAIProvider) azureClassicAPIVersionOrEmpty() string {
+	if p == nil || p.Channel == nil {
+		return ""
+	}
+	apiVersion, err := p.Channel.GetAzureAPIVersion()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(apiVersion)
+}
+
+func (p *OpenAIProvider) validateAzureClassicAPIVersionForRequest() *types.OpenAIErrorWithStatusCode {
+	if p == nil || !p.IsAzure {
+		return nil
+	}
+	if p.Channel != nil && p.Channel.Type == config.ChannelTypeAzureV1 {
+		return nil
+	}
+	_, errWithCode := p.azureClassicAPIVersion()
+	return errWithCode
+}
+
 // 获取请求头
 func (p *OpenAIProvider) GetRequestHeaders() (headers map[string]string) {
+	return p.requestHeaders(openAIRequestAuthDefault)
+}
+
+func (p *OpenAIProvider) requestHeaders(mode openAIRequestAuthMode) (headers map[string]string) {
 	headers = make(map[string]string)
 	p.CommonRequestHeaders(headers)
-	if p.IsAzure {
+
+	if p.openAIRequestUsesAzureAPIKey(mode) {
 		headers["api-key"] = p.Channel.Key
-		headers["Authorization"] = fmt.Sprintf("Bearer %s", p.Channel.Key)
 	} else {
 		headers["Authorization"] = fmt.Sprintf("Bearer %s", p.Channel.Key)
 	}
@@ -186,10 +317,24 @@ func (p *OpenAIProvider) GetRequestHeaders() (headers map[string]string) {
 	return headers
 }
 
+func (p *OpenAIProvider) openAIRequestUsesAzureAPIKey(mode openAIRequestAuthMode) bool {
+	switch mode {
+	case openAIRequestAuthAzureAPIKey:
+		return true
+	case openAIRequestAuthBearer:
+		return false
+	default:
+		return p != nil && p.IsAzure && p.Channel != nil && p.Channel.Type != config.ChannelTypeAzureV1
+	}
+}
+
 // 修改 GetRequestTextBody 函数中的对应部分
 func (p *OpenAIProvider) GetRequestTextBody(relayMode int, ModelName string, request any) (*http.Request, *types.OpenAIErrorWithStatusCode) {
 	url, errWithCode := p.GetSupportedAPIUri(relayMode)
 	if errWithCode != nil {
+		return nil, errWithCode
+	}
+	if errWithCode := p.validateAzureClassicAPIVersionForRequest(); errWithCode != nil {
 		return nil, errWithCode
 	}
 	// 获取请求地址

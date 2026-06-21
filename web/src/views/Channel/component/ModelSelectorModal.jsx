@@ -36,6 +36,7 @@ import LoadingButton from '@mui/lab/LoadingButton';
 import { useTranslation } from 'react-i18next';
 import { Icon } from '@iconify/react';
 import { useSelector } from 'react-redux';
+import { normalizeChannelOtherForRequest, normalizeOpenAICompatibleOtherForRequest } from '../type/other';
 
 const ModelSelectorModal = ({ open, onClose, onConfirm, channelValues, prices }) => {
   const { t } = useTranslation();
@@ -161,7 +162,7 @@ const ModelSelectorModal = ({ open, onClose, onConfirm, channelValues, prices })
     setLoading(true);
     setError('');
     try {
-      const requestData = {
+      let requestData = {
         ...channelValues,
         models: '',
         model_mapping: '',
@@ -173,6 +174,9 @@ const ModelSelectorModal = ({ open, onClose, onConfirm, channelValues, prices })
         if (customBaseUrl) {
           requestData.base_url = customBaseUrl;
         }
+        requestData = normalizeOpenAICompatibleOtherForRequest(requestData, { dropUnsupportedFields: true });
+      } else {
+        requestData = normalizeChannelOtherForRequest(requestData);
       }
 
       const res = await API.post(`/api/channel/provider_models_list`, requestData);

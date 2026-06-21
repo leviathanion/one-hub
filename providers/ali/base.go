@@ -124,8 +124,11 @@ func (p *AliProvider) GetRequestHeaders() (headers map[string]string) {
 	headers = make(map[string]string)
 	p.CommonRequestHeaders(headers)
 	headers["Authorization"] = fmt.Sprintf("Bearer %s", p.Channel.Key)
-	if p.Channel.Other != "" {
-		headers["X-DashScope-Plugin"] = p.Channel.Other
+	plugin, err := p.Channel.GetOtherStringField("dashscope_plugin")
+	if err != nil {
+		base.LogChannelConfigParseError(p.LogContext(), "ali", p.Channel, "dashscope_plugin", err)
+	} else if plugin != "" {
+		headers["X-DashScope-Plugin"] = plugin
 	}
 
 	return headers

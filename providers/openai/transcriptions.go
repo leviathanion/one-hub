@@ -70,6 +70,9 @@ func (p *OpenAIProvider) getRequestAudioBody(relayMode int, ModelName string, re
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
+	if errWithCode := p.validateAzureClassicAPIVersionForRequest(); errWithCode != nil {
+		return nil, errWithCode
+	}
 	// 获取请求地址
 	fullRequestURL := p.GetFullRequestURL(url, ModelName)
 

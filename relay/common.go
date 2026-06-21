@@ -39,6 +39,14 @@ type realtimeChannelSelection struct {
 
 const defaultClaudeBaseURL = "https://api.anthropic.com"
 
+func invalidChannelRuntimeConfigAPIError(err error) *types.OpenAIErrorWithStatusCode {
+	var invalidConfig *model.InvalidChannelRuntimeConfigError
+	if !errors.As(err, &invalidConfig) {
+		return nil
+	}
+	return common.StringErrorWrapperLocal("invalid channel runtime config", model.InvalidChannelRuntimeConfigCode, http.StatusServiceUnavailable)
+}
+
 func Path2Relay(c *gin.Context, path string) RelayBaseInterface {
 	var relay RelayBaseInterface
 	if strings.HasPrefix(path, "/v1/chat/completions") {
@@ -136,6 +144,11 @@ func prepareProviderForChannel(c *gin.Context, modelName string, channel *model.
 		fail = errors.New("channel not found")
 		return
 	}
+	if err := channel.ValidateRuntimeConfigJSON(); err != nil {
+		fail = model.NewInvalidChannelRuntimeConfigError(channel.Id, err)
+		return
+	}
+	channel.ParseRuntimeConfig()
 
 	c.Set("channel_id", channel.Id)
 	c.Set("channel_type", channel.Type)
@@ -258,6 +271,9 @@ func fetchChannelById(channelId int) (*model.Channel, error) {
 	}
 	if channel.Status != config.ChannelStatusEnabled {
 		return nil, errors.New("该渠道已被禁用")
+	}
+	if err := channel.ValidateRuntimeConfigJSON(); err != nil {
+		return nil, model.NewInvalidChannelRuntimeConfigError(channel.Id, err)
 	}
 
 	return channel, nil
@@ -564,6 +580,12 @@ func responseJsonClient(c *gin.Context, data interface{}) *types.OpenAIErrorWith
 
 type StreamEndHandler func() string
 
+const streamErrorClientMessage = "stream interrupted"
+
+func isStreamTerminalEOF(err error) bool {
+	return err == nil || errors.Is(err, io.EOF)
+}
+
 func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface[string], endHandler StreamEndHandler) (firstResponseTime time.Time, errWithOP *types.OpenAIErrorWithStatusCode) {
 	requester.SetEventStreamHeaders(c)
 	dataChan, errChan := stream.Recv()
@@ -573,64 +595,101 @@ func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface
 	defer streamWriter.Close()
 
 	var isFirstResponse bool
+	dataOpen := dataChan != nil
+	errOpen := errChan != nil
 
-	for {
+	handleData := func(data string) {
+		streamData := "data: " + data + "\n\n"
+		if !isFirstResponse {
+			firstResponseTime = time.Now()
+			isFirstResponse = true
+		}
+
+		select {
+		case <-c.Request.Context().Done():
+		default:
+			_, _ = streamWriter.WriteString(streamData)
+		}
+	}
+
+	handleEOF := func() {
+		if endHandler != nil {
+			streamData := endHandler()
+			if streamData != "" {
+				select {
+				case <-c.Request.Context().Done():
+				default:
+					_, _ = streamWriter.WriteString("data: " + streamData + "\n\n")
+				}
+			}
+		}
+
+		select {
+		case <-c.Request.Context().Done():
+		default:
+			_, _ = streamWriter.WriteString("data: [DONE]\n\n")
+		}
+	}
+
+	handleError := func(err error) {
+		if isStreamTerminalEOF(err) {
+			handleEOF()
+			return
+		}
+		errPayload := map[string]any{
+			"error": map[string]any{
+				"message": streamErrorClientMessage,
+				"type":    "stream_error",
+				"code":    "stream_error",
+			},
+		}
+		errJSON, _ := json.Marshal(errPayload)
+		errMsg := "data: " + string(errJSON) + "\n\n"
+		select {
+		case <-c.Request.Context().Done():
+		default:
+			_, _ = streamWriter.WriteString(errMsg)
+		}
+
+		logger.LogError(c.Request.Context(), "Stream err:"+common.RedactSensitiveText(err.Error()))
+	}
+
+	for dataOpen || errOpen {
+		if dataOpen {
+			select {
+			case data, ok := <-dataChan:
+				if !ok {
+					dataOpen = false
+					dataChan = nil
+					continue
+				}
+				handleData(data)
+				continue
+			default:
+			}
+		}
+
 		select {
 		case data, ok := <-dataChan:
 			if !ok {
-				return firstResponseTime, nil
+				dataOpen = false
+				dataChan = nil
+				continue
 			}
-
-			streamData := "data: " + data + "\n\n"
-			if !isFirstResponse {
-				firstResponseTime = time.Now()
-				isFirstResponse = true
+			handleData(data)
+		case err, ok := <-errChan:
+			if !ok {
+				errOpen = false
+				errChan = nil
+				continue
 			}
-
-			select {
-			case <-c.Request.Context().Done():
-			default:
-				_, _ = streamWriter.WriteString(streamData)
-			}
-		case err := <-errChan:
-			if !errors.Is(err, io.EOF) {
-				errPayload := map[string]any{
-					"error": map[string]any{
-						"message": err.Error(),
-						"type":    "stream_error",
-						"code":    "stream_error",
-					},
-				}
-				errJSON, _ := json.Marshal(errPayload)
-				errMsg := "data: " + string(errJSON) + "\n\n"
-				select {
-				case <-c.Request.Context().Done():
-				default:
-					_, _ = streamWriter.WriteString(errMsg)
-				}
-
-				logger.LogError(c.Request.Context(), "Stream err:"+err.Error())
-			} else {
-				if endHandler != nil {
-					streamData := endHandler()
-					if streamData != "" {
-						select {
-						case <-c.Request.Context().Done():
-						default:
-							_, _ = streamWriter.WriteString("data: " + streamData + "\n\n")
-						}
-					}
-				}
-
-				select {
-				case <-c.Request.Context().Done():
-				default:
-					_, _ = streamWriter.WriteString("data: [DONE]\n\n")
-				}
-			}
+			handleError(err)
 			return firstResponseTime, nil
 		}
 	}
+
+	handleEOF()
+	return firstResponseTime, nil
 }
 
 func responseGeneralStreamClient(c *gin.Context, stream requester.StreamReaderInterface[string], endHandler StreamEndHandler) (firstResponseTime time.Time) {
@@ -645,78 +704,99 @@ func responseGeneralStreamClientWithObserver(c *gin.Context, stream requester.St
 	streamWriter := relay_util.NewBufferedStreamWriter(c.Writer, 0)
 	defer streamWriter.Close()
 	var isFirstResponse bool
+	dataOpen := dataChan != nil
+	errOpen := errChan != nil
 
-	for {
+	handleData := func(data string) {
+		if !isFirstResponse {
+			firstResponseTime = time.Now()
+			isFirstResponse = true
+		}
+		if observer != nil {
+			observer(data)
+		}
 		select {
-		case data, ok := <-dataChan:
-			if !ok {
-				return firstResponseTime
-			}
-			if !isFirstResponse {
-				firstResponseTime = time.Now()
-				isFirstResponse = true
-			}
-			if observer != nil {
-				observer(data)
-			}
-			select {
-			case <-c.Request.Context().Done():
-			default:
-				_, _ = streamWriter.WriteString(data)
-			}
-			continue
+		case <-c.Request.Context().Done():
 		default:
+			_, _ = streamWriter.WriteString(data)
+		}
+	}
+
+	handleEOF := func() {
+		if endHandler == nil {
+			return
+		}
+		streamData := endHandler()
+		if streamData == "" {
+			return
+		}
+		if observer != nil {
+			observer(streamData)
+		}
+		select {
+		case <-c.Request.Context().Done():
+		default:
+			_, _ = streamWriter.WriteString(streamData)
+		}
+	}
+
+	handleError := func(err error) {
+		if isStreamTerminalEOF(err) {
+			handleEOF()
+			return
+		}
+		errPayload := map[string]any{
+			"type":    "error",
+			"code":    "stream_error",
+			"message": streamErrorClientMessage,
+		}
+		errJSON, _ := json.Marshal(errPayload)
+		errEvent := "event: error\ndata: " + string(errJSON) + "\n\n"
+		select {
+		case <-c.Request.Context().Done():
+		default:
+			_, _ = streamWriter.WriteString(errEvent)
+		}
+
+		logger.LogError(c.Request.Context(), "Stream err:"+common.RedactSensitiveText(err.Error()))
+	}
+
+	for dataOpen || errOpen {
+		if dataOpen {
+			select {
+			case data, ok := <-dataChan:
+				if !ok {
+					dataOpen = false
+					dataChan = nil
+					continue
+				}
+				handleData(data)
+				continue
+			default:
+			}
 		}
 
 		select {
 		case data, ok := <-dataChan:
 			if !ok {
-				return firstResponseTime
+				dataOpen = false
+				dataChan = nil
+				continue
 			}
-			if !isFirstResponse {
-				firstResponseTime = time.Now()
-				isFirstResponse = true
+			handleData(data)
+		case err, ok := <-errChan:
+			if !ok {
+				errOpen = false
+				errChan = nil
+				continue
 			}
-			if observer != nil {
-				observer(data)
-			}
-			select {
-			case <-c.Request.Context().Done():
-			default:
-				_, _ = streamWriter.WriteString(data)
-			}
-		case err := <-errChan:
-			if !errors.Is(err, io.EOF) {
-				errPayload := map[string]any{
-					"type":    "error",
-					"code":    "stream_error",
-					"message": err.Error(),
-				}
-				errJSON, _ := json.Marshal(errPayload)
-				errEvent := "event: error\ndata: " + string(errJSON) + "\n\n"
-				select {
-				case <-c.Request.Context().Done():
-				default:
-					_, _ = streamWriter.WriteString(errEvent)
-				}
-
-				logger.LogError(c.Request.Context(), "Stream err:"+err.Error())
-			} else if endHandler != nil {
-				streamData := endHandler()
-				if streamData != "" {
-					if observer != nil {
-						observer(streamData)
-					}
-					select {
-					case <-c.Request.Context().Done():
-					default:
-						_, _ = streamWriter.WriteString(streamData)
-					}
-				}
-			}
+			handleError(err)
 			return firstResponseTime
 		}
 	}
+
+	handleEOF()
+	return firstResponseTime
 }
 
 func responseMultipart(c *gin.Context, resp *http.Response) *types.OpenAIErrorWithStatusCode {

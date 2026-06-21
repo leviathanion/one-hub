@@ -64,7 +64,8 @@ const defaultConfig = {
       '这里选择预计费选项，用于预估费用，如果你觉得计算图片占用太多资源，可以选择关闭图片计费。但是请注意：有些渠道在stream下是不会返回tokens的，这会导致输入tokens计算错误。',
     disabled_stream: '这里填写禁用流式的模型，注意：如果填写了禁用流式的模型，那么这些模型在流式请求时会跳过该渠道',
     compatible_response: '兼容Response API',
-    allow_extra_body: '开启后，将会透传用户请求中的额外字段（如OpenAI SDK的extra_body参数），适用于需要传递自定义参数到上游API的场景'
+    allow_extra_body:
+      '开启后，将会透传普通 HTTP 请求中的额外字段（如 OpenAI SDK 的 extra_body 参数）；ResponsesWS HTTP bridge 按 WebSocket raw frame 契约保留未知字段，不受此开关控制'
   },
   modelGroup: 'OpenAI'
 };
@@ -72,37 +73,45 @@ const defaultConfig = {
 const typeConfig = {
   1: {
     inputLabel: {
+      other: 'Other(JSON)',
       provider_models_list: '从OpenAI获取模型列表'
+    },
+    prompt: {
+      other:
+        '可选 JSON 配置，例如：{"responses_ws_transport":"http_bridge"}；官方 OpenAI 可使用 {"responses_ws_transport":"native"}，自定义兼容上游还需 {"responses_ws_native":true}。'
     }
   },
   8: {
     inputLabel: {
+      other: 'Other(JSON)',
       provider_models_list: '从渠道获取模型列表'
     },
     prompt: {
-      other: ''
+      other:
+        '可选 JSON 配置，例如：{"responses_ws_transport":"http_bridge"}；如自定义兼容上游支持原生 Responses WebSocket，可使用 {"responses_ws_native":true,"responses_ws_transport":"native"}。'
     }
   },
   3: {
     inputLabel: {
       base_url: 'AZURE_OPENAI_ENDPOINT',
-      other: '默认 API 版本',
+      other: 'Azure 配置(JSON)',
       provider_models_list: '从Azure获取已部署模型列表'
     },
     prompt: {
       base_url: '请填写AZURE_OPENAI_ENDPOINT',
-      other: '请输入默认API版本，例如：2024-05-01-preview'
+      other: '请输入 JSON，例如：{"api_version":"2024-05-01-preview","responses_ws_transport":"native"}'
     }
   },
   55: {
     inputLabel: {
       base_url: 'AZURE_OPENAI_ENDPOINT',
-      other: '默认 API 版本',
+      other: 'Other(JSON)',
       provider_models_list: '从Azure获取已部署模型列表'
     },
     prompt: {
-      base_url: '请填写AZURE_OPENAI_ENDPOINT',
-      other: '请输入默认API版本，例如：preview OR latest'
+      base_url: '请填写 resource-level AZURE_OPENAI_ENDPOINT，不要包含 /openai/deployments 路径',
+      other:
+        '可选 JSON 配置，例如：{"responses_ws_transport":"http_bridge"}；如需原生 Responses WebSocket，可使用 {"responses_ws_transport":"native"}。'
     }
   },
   // 11: {
@@ -181,7 +190,7 @@ const typeConfig = {
   },
   17: {
     inputLabel: {
-      other: '插件参数',
+      other: 'Ali 配置(JSON)',
       provider_models_list: '从Ali获取模型列表'
     },
     input: {
@@ -189,20 +198,20 @@ const typeConfig = {
       test_model: 'qwen-turbo'
     },
     prompt: {
-      other: '请输入插件参数，即 X-DashScope-Plugin 请求头的取值'
+      other: '请输入 JSON，例如：{"dashscope_plugin":"plugin-name"}'
     },
     modelGroup: 'Ali'
   },
   18: {
     inputLabel: {
-      other: '版本号'
+      other: 'Xunfei 配置(JSON)'
     },
     input: {
       models: ['SparkDesk', 'SparkDesk-v1.1', 'SparkDesk-v2.1', 'SparkDesk-v3.1', 'SparkDesk-v3.5']
     },
     prompt: {
       key: '按照如下格式输入：APPID|APISecret|APIKey',
-      other: '请输入版本号，例如：v3.1'
+      other: '请输入 JSON，例如：{"api_version":"v3.1"}'
     },
     modelGroup: 'Xunfei'
   },
@@ -230,7 +239,7 @@ const typeConfig = {
   },
   25: {
     inputLabel: {
-      other: '版本号',
+      other: 'Gemini 配置(JSON)',
       provider_models_list: '从Gemini获取模型列表'
     },
     input: {
@@ -238,7 +247,7 @@ const typeConfig = {
       test_model: 'gemini-pro'
     },
     prompt: {
-      other: '请输入版本号，例如：v1'
+      other: '请输入 JSON，例如：{"api_version":"v1"}'
     },
     modelGroup: 'Google Gemini'
   },
@@ -251,15 +260,15 @@ const typeConfig = {
   },
   24: {
     inputLabel: {
-      other: '位置/区域'
+      other: 'Azure Speech 配置(JSON)'
     },
     input: {
       models: ['tts-1', 'tts-1-hd']
     },
     prompt: {
       test_model: '',
-      base_url: '',
-      other: '请输入你 Speech Studio 的位置/区域，例如：eastasia'
+      base_url: '请输入 Azure Speech endpoint，例如：https://eastasia.api.cognitive.microsoft.com',
+      other: '请输入 JSON，例如：{"region":"eastasia"}'
     }
   },
   27: {
@@ -471,7 +480,7 @@ const typeConfig = {
     },
     prompt: {
       key: '请参考wiki中的文档获取key. https://github.com/MartialBE/one-hub/wiki/VertexAI',
-      other: 'Region|ProjectID',
+      other: '请输入 JSON，例如：{"region":"us-central1","project_id":"my-project"}',
       base_url: ''
     },
     modelGroup: 'VertexAI'

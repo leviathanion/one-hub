@@ -66,13 +66,26 @@ func getConfig() base.ProviderConfig {
 }
 
 func getKeyConfig(vertexAI *VertexAIProvider) {
-	keys := strings.Split(vertexAI.Channel.Other, "|")
-	if len(keys) != 2 {
+	if vertexAI == nil || vertexAI.Channel == nil {
 		return
 	}
 
-	vertexAI.Region = keys[0]
-	vertexAI.ProjectID = keys[1]
+	region, err := vertexAI.Channel.GetOtherStringField("region")
+	if err != nil {
+		base.LogChannelConfigParseError(vertexAI.LogContext(), "vertexai", vertexAI.Channel, "region", err)
+		return
+	}
+	projectID, err := vertexAI.Channel.GetOtherStringField("project_id")
+	if err != nil {
+		base.LogChannelConfigParseError(vertexAI.LogContext(), "vertexai", vertexAI.Channel, "project_id", err)
+		return
+	}
+	if region == "" || projectID == "" {
+		return
+	}
+
+	vertexAI.Region = region
+	vertexAI.ProjectID = projectID
 }
 
 func (p *VertexAIProvider) GetFullRequestURL(modelName string, other string) string {

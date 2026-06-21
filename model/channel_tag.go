@@ -276,10 +276,19 @@ func UpdateChannelsTagWithSubmittedFields(tag string, channel *Channel, submitte
 		existingMemberIDs = append(existingMemberIDs, id)
 	}
 	channel.Type = channelTag.Type
+	configFields := channelTagConfigFields(submittedFields)
+	if channelTypeRequiresOtherForPartialUpdate(channel.Type) && strings.TrimSpace(channel.Other) == "" && !channelTagConfigFieldSubmitted(configFields, "other") {
+		channel.Other = channelTag.Other
+	}
+	if channelTypeRequiresBaseURLForPartialUpdate(channel.Type) && channel.BaseURL == nil && !channelTagConfigFieldSubmitted(configFields, "base_url") {
+		channel.BaseURL = channelTag.BaseURL
+	}
+	if err := channel.CanonicalizeRuntimeConfigJSONWithType(channelTag.Type); err != nil {
+		return err
+	}
 	if err := channel.ValidateRuntimeConfigJSONWithType(channelTag.Type); err != nil {
 		return err
 	}
-	configFields := channelTagConfigFields(submittedFields)
 
 	if channel.Key == "" {
 		return errors.New("key不能为空")
@@ -317,6 +326,29 @@ func UpdateChannelsTagWithSubmittedFields(tag string, channel *Channel, submitte
 		}
 	}
 
+	addChannels := make([]Channel, 0, len(addKeys))
+	if len(addKeys) > 0 {
+		maxKey := len(channelTag.KeyMap)
+		baseName := channel.Name
+		if baseName == "" {
+			baseName = channelTag.Name
+		}
+		for _, key := range addKeys {
+			// Partial tag updates only carry changed config fields. New members
+			// start from the existing tag representative, then receive the
+			// submitted tag-level overlay; runtime counters are reset below.
+			addChannel := buildChannelTagMember(channelTag, channel, configFields, key, fmt.Sprintf("%s_%d", baseName, maxKey), maxKey)
+			if err := addChannel.CanonicalizeRuntimeConfigJSONWithType(channelTag.Type); err != nil {
+				return err
+			}
+			if err := addChannel.ValidateRuntimeConfigJSONWithType(channelTag.Type); err != nil {
+				return err
+			}
+			addChannels = append(addChannels, addChannel)
+			maxKey++
+		}
+	}
+
 	tx := DB.Begin()
 	// 先处理要删除的数据
 	if len(delIds) > 0 {
@@ -328,23 +360,8 @@ func UpdateChannelsTagWithSubmittedFields(tag string, channel *Channel, submitte
 	}
 
 	// 处理要添加的数据
-	if len(addKeys) > 0 {
-		maxKey := len(channelTag.KeyMap)
-		baseName := channel.Name
-		if baseName == "" {
-			baseName = channelTag.Name
-		}
-
-		addChannels := make([]Channel, 0, len(addKeys))
-		for _, key := range addKeys {
-			// Partial tag updates only carry changed config fields. New members
-			// start from the existing tag representative, then receive the
-			// submitted tag-level overlay; runtime counters are reset below.
-			addChannel := buildChannelTagMember(channelTag, channel, configFields, key, fmt.Sprintf("%s_%d", baseName, maxKey), maxKey)
-			addChannels = append(addChannels, addChannel)
-			maxKey++
-		}
-		err = BatchInsert(tx, addChannels)
+	if len(addChannels) > 0 {
+		err = BatchInsertStrict(tx, addChannels)
 		if err != nil {
 			tx.Rollback()
 			return err
@@ -370,6 +387,15 @@ func UpdateChannelsTagWithSubmittedFields(tag string, channel *Channel, submitte
 
 	refreshChannelGroupAfterMutation("update channel tag", delIds)
 	return nil
+}
+
+func channelTagConfigFieldSubmitted(fields []channelTagConfigField, jsonName string) bool {
+	for _, field := range fields {
+		if field.jsonName == jsonName {
+			return true
+		}
+	}
+	return false
 }
 
 func AddChannelToTag(tag string, channel *Channel) (*Channel, error) {
@@ -400,6 +426,9 @@ func AddChannelToTag(tag string, channel *Channel) (*Channel, error) {
 	}
 
 	newChannel := buildChannelTagMember(channelTag, nil, nil, key, strings.TrimSpace(channel.Name), len(channelTag.KeyMap))
+	if err := newChannel.CanonicalizeRuntimeConfigJSONWithType(channelTag.Type); err != nil {
+		return nil, err
+	}
 	if err := newChannel.ValidateRuntimeConfigJSONWithType(channelTag.Type); err != nil {
 		return nil, err
 	}

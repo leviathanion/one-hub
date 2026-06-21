@@ -2,6 +2,8 @@ package model
 
 import (
 	"encoding/json"
+	"fmt"
+	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/logger"
 	"strconv"
@@ -558,6 +560,129 @@ func addDashboardCacheTokenMigration() *gormigrate.Migration {
 	}
 }
 
+func migrateLegacyChannelOtherJSON() *gormigrate.Migration {
+	return &gormigrate.Migration{
+		ID: "202606080001",
+		Migrate: func(tx *gorm.DB) error {
+			if !tx.Migrator().HasTable("channels") {
+				return nil
+			}
+
+			var channels []Channel
+			if err := tx.Select("id", "type", "other").Where("other != ?", "").Find(&channels).Error; err != nil {
+				return err
+			}
+			stats := legacyChannelOtherMigrationStats{}
+			for _, channel := range channels {
+				stats.Scanned++
+				converted, shouldUpdate, err := legacyChannelOtherJSON(channel.Type, channel.Other)
+				if err != nil {
+					stats.Failed++
+					logLegacyChannelOtherMigrationFailure(channel, stats, err)
+					return fmt.Errorf("legacy channel Other JSON migration failed for channel %d type %d: %w", channel.Id, channel.Type, err)
+				}
+				if !shouldUpdate {
+					if legacyChannelOtherMigrationSkipped(channel.Type, channel.Other) {
+						stats.Skipped++
+					} else {
+						stats.Unchanged++
+					}
+					continue
+				}
+				if err := tx.Model(&Channel{}).Where("id = ?", channel.Id).Update("other", converted).Error; err != nil {
+					stats.Failed++
+					logLegacyChannelOtherMigrationFailure(channel, stats, err)
+					return fmt.Errorf("legacy channel Other JSON migration update failed for channel %d type %d: %w", channel.Id, channel.Type, err)
+				}
+				stats.Updated++
+			}
+			logger.SysLog("legacy channel Other JSON migration completed: " + stats.String())
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			// Trade-off: rollback is intentionally no-op. The forward migration
+			// maps plain strings into provider-specific JSON fields, but a JSON
+			// object cannot be losslessly proven to have come from a legacy string.
+			// Keeping rollback inert preserves idempotence and fail-closed runtime
+			// validation for ambiguous values.
+			return nil
+		},
+	}
+}
+
+type legacyChannelOtherMigrationStats struct {
+	Scanned   int
+	Updated   int
+	Unchanged int
+	Skipped   int
+	Failed    int
+}
+
+func (s legacyChannelOtherMigrationStats) String() string {
+	return fmt.Sprintf("scanned=%d updated=%d unchanged=%d skipped=%d failed=%d", s.Scanned, s.Updated, s.Unchanged, s.Skipped, s.Failed)
+}
+
+func logLegacyChannelOtherMigrationFailure(channel Channel, stats legacyChannelOtherMigrationStats, err error) {
+	errSummary := ""
+	if err != nil {
+		errSummary = common.RedactSensitiveText(err.Error())
+	}
+	logger.SysError(fmt.Sprintf("legacy channel Other JSON migration failed: channel_id=%d channel_type=%d err=%s %s", channel.Id, channel.Type, errSummary, stats.String()))
+}
+
+func legacyChannelOtherMigrationSkipped(channelType int, raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return false
+	}
+	if _, err := parseOptionalJSONObject("other", trimmed); err == nil {
+		return false
+	}
+	if legacyOtherLooksLikeJSON(trimmed) {
+		return true
+	}
+	switch channelType {
+	case config.ChannelTypeOpenAI, config.ChannelTypeCustom, config.ChannelTypeAzure, config.ChannelTypeGemini, config.ChannelTypeXunfei, config.ChannelTypeAzureSpeech, config.ChannelTypeAli:
+		return false
+	case config.ChannelTypeVertexAI:
+		parts := strings.Split(trimmed, "|")
+		if len(parts) != 2 {
+			return true
+		}
+		return strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == ""
+	default:
+		return true
+	}
+}
+
+func legacyChannelOtherJSON(channelType int, raw string) (string, bool, error) {
+	converted, shouldUpdate, err := canonicalizeChannelOtherJSON(channelType, raw)
+	if err != nil || !shouldUpdate {
+		return converted, shouldUpdate, err
+	}
+	channel := &Channel{Type: channelType, Other: converted}
+	if err := channel.ValidateRuntimeConfigJSON(); err != nil {
+		return "", false, err
+	}
+	return converted, true, nil
+}
+
+func legacyOtherLooksLikeJSON(trimmed string) bool {
+	trimmed = strings.TrimSpace(trimmed)
+	if trimmed == "" {
+		return false
+	}
+	switch trimmed[0] {
+	case '{', '[', '"':
+		return true
+	}
+	switch strings.ToLower(trimmed) {
+	case "null", "true", "false":
+		return true
+	}
+	return json.Valid([]byte(trimmed))
+}
+
 func beforeAutoMigrateMigrations() []*gormigrate.Migration {
 	return []*gormigrate.Migration{
 		removeKeyIndexMigration(),
@@ -574,6 +699,7 @@ func afterAutoMigrateMigrations() []*gormigrate.Migration {
 		addExtraRatios(),
 		migrateTokenLimitsStructure(),
 		addDashboardCacheTokenMigration(),
+		migrateLegacyChannelOtherJSON(),
 	}
 }
 

@@ -208,7 +208,10 @@ func InitDB() (err error) {
 			}
 		}
 
-		migrationAfter(DB)
+		if err = migrationAfter(DB); err != nil {
+			logger.SysError("database migration after AutoMigrate failed: " + err.Error())
+			return err
+		}
 
 		logger.SysLog("database migrated")
 		err = createRootAccountIfNeed()

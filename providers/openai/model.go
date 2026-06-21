@@ -6,6 +6,9 @@ import (
 )
 
 func (p *OpenAIProvider) GetModelList() ([]string, error) {
+	if errWithCode := p.validateAzureClassicAPIVersionForRequest(); errWithCode != nil {
+		return nil, errors.New(errWithCode.Message)
+	}
 	fullRequestURL := p.GetFullRequestURL(p.Config.ModelList, "")
 	headers := p.GetRequestHeaders()
 

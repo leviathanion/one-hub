@@ -65,6 +65,9 @@ func testChannel(channel *model.Channel, testModel string) (openaiErr *types.Ope
 
 	channelType := getModelType(testModel)
 	channel.SetProxy()
+	if err := channel.ValidateRuntimeConfigJSON(); err != nil {
+		return nil, err
+	}
 
 	var url string
 	switch channelType {

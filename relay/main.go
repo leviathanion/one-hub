@@ -72,6 +72,9 @@ func Relay(c *gin.Context) {
 }
 
 func wrapRelaySetupError(relay RelayBaseInterface, stage string, err error, defaultCode string, statusCode int) *types.OpenAIErrorWithStatusCode {
+	if wrapped := invalidChannelRuntimeConfigAPIError(err); wrapped != nil {
+		return wrapped
+	}
 	if wrapper, ok := relay.(relaySetupErrorWrapper); ok {
 		if wrapped := wrapper.WrapSetupError(stage, err); wrapped != nil {
 			return wrapped

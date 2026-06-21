@@ -30,8 +30,11 @@ type AzureSpeechProvider struct {
 
 func (p *AzureSpeechProvider) GetFullRequestURL(requestURL string) string {
 	baseURL := ""
-	if p.Channel.Other != "" {
-		baseURL = fmt.Sprintf("https://%s.tts.speech.microsoft.com", p.Channel.Other)
+	region, err := p.Channel.GetOtherStringField("region")
+	if err != nil {
+		base.LogChannelConfigParseError(p.LogContext(), "azureSpeech", p.Channel, "region", err)
+	} else if region != "" {
+		baseURL = fmt.Sprintf("https://%s.tts.speech.microsoft.com", region)
 	} else {
 		baseURL = strings.TrimSuffix(p.GetBaseURL(), "/")
 	}

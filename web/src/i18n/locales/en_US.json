@@ -135,6 +135,8 @@
     "modelMappingKey": "User request model",
     "modelMappingValue": "Actual forwarding model",
     "requiredBaseUrl": "Channel API address cannot be empty",
+    "invalidAzureV1ResourceBaseUrl": "Azure V1 endpoint must be resource-level and must not include /openai/deployments",
+    "requiredAzureSpeechRegionOrBaseUrl": "Azure Speech requires other.region or channel API address",
     "requiredChannel": "Channel cannot be empty",
     "requiredGroup": "User group cannot be empty",
     "requiredKey": "Key cannot be empty",
@@ -169,7 +171,40 @@
     "overwriteMappings": "Overwrite existing mappings",
     "overwriteMappingsTip": "When enabled, existing mappings will be cleared and only new mappings will be preserved",
     "clearModels": "Reset",
-    "clearModelsTip": "Reset all selected models"
+    "clearModelsTip": "Reset all selected models",
+    "codexConfigHelp": {
+      "title": "Codex Configuration Help",
+      "tooltip": "View Codex configuration help",
+      "intro": "This field is channel-level JSON and maps to backend channel.Other. Leave it blank to use defaults. If the request already sends prompt_cache_key explicitly, prompt_cache_key_strategy is usually unnecessary.",
+      "fieldsTitle": "Supported fields",
+      "examplesTitle": "Copyable templates",
+      "positiveIntegerSeconds": "positive integer seconds",
+      "defaultValue": "Default: {{value}}",
+      "acceptedValue": "{{accepted}}; {{description}}",
+      "close": "Close",
+      "fields": {
+        "promptCacheKeyStrategy": "How to generate a stable value when prompt_cache_key is not explicitly sent",
+        "websocketMode": "Controls whether Codex Realtime prefers websocket, requires websocket, or disables websocket",
+        "responsesWSTransport": "Responses websocket upstream transport; http_bridge must be explicit and is not automatic fallback after native failure",
+        "executionSessionTTL": "Codex Realtime execution session idle retention",
+        "websocketRetryCooldown": "Bridge cooldown after Codex Realtime websocket failure",
+        "selfHosted": "Allows private or local self-hosted upstreams for Codex Realtime only",
+        "responsesWSSelfHosted": "Allows private or local self-hosted upstreams for Responses websocket only"
+      },
+      "examples": {
+        "defaultPromptCache": "Default: do not generate prompt_cache_key",
+        "autoPromptCache": "Common: generate a stable prompt_cache_key",
+        "realtimeAuto": "Realtime: prefer websocket with HTTP bridge cooldown after failure",
+        "realtimeForce": "Realtime: require websocket",
+        "realtimeOff": "Realtime: disable websocket",
+        "sessionIDCache": "Bind cache by session_id",
+        "userIDCache": "Share cache across one user's tokens",
+        "tokenIDCache": "Keep cache separate per token",
+        "authHeaderCache": "Share cache by external auth header",
+        "selfHosted": "Self-hosted or intranet upstream: explicitly allow private addresses",
+        "ttlCooldown": "Advanced: adjust session TTL and Realtime bridge cooldown"
+      }
+    }
   },
   "channel_index": {
     "AzureApiVersion": "Azure version number",
@@ -1891,5 +1926,24 @@
       }
     }
   },
-  "这里填写禁用流式的模型，注意：如果填写了禁用流式的模型，那么这些模型在流式请求时会跳过该渠道": "Fill in here to disable the streaming model. Note: If you fill in to disable the streaming model, these models will be skipped for streaming requests on that channel."
+  "这里填写禁用流式的模型，注意：如果填写了禁用流式的模型，那么这些模型在流式请求时会跳过该渠道": "Fill in here to disable the streaming model. Note: If you fill in to disable the streaming model, these models will be skipped for streaming requests on that channel.",
+  "Azure 配置(JSON)": "Azure config (JSON)",
+  "Other(JSON)": "Other (JSON)",
+  "Ali 配置(JSON)": "Ali config (JSON)",
+  "Xunfei 配置(JSON)": "Xunfei config (JSON)",
+  "Gemini 配置(JSON)": "Gemini config (JSON)",
+  "Azure Speech 配置(JSON)": "Azure Speech config (JSON)",
+  "请输入 JSON，例如：{\"api_version\":\"2024-05-01-preview\"}": "Enter JSON, for example: {\"api_version\":\"2024-05-01-preview\"}",
+  "请输入 JSON，例如：{\"api_version\":\"2024-05-01-preview\",\"responses_ws_transport\":\"native\"}": "Enter JSON, for example: {\"api_version\":\"2024-05-01-preview\",\"responses_ws_transport\":\"native\"}",
+  "可选 JSON 配置，例如：{}": "Optional JSON config, for example: {}",
+  "可选 JSON 配置，例如：{\"responses_ws_transport\":\"native\"}": "Optional JSON config, for example: {\"responses_ws_transport\":\"native\"}",
+  "可选 JSON 配置，例如：{\"responses_ws_native\":true}；仅当自定义兼容上游明确支持原生 Responses WebSocket 时填写。": "Optional JSON config, for example: {\"responses_ws_native\":true}; fill this only when the custom compatible upstream explicitly supports native Responses WebSocket.",
+  "可选 JSON 配置，例如：{\"responses_ws_transport\":\"http_bridge\"}；如需原生 Responses WebSocket，可使用 {\"responses_ws_transport\":\"native\"}。": "Optional JSON config, for example: {\"responses_ws_transport\":\"http_bridge\"}; for native Responses WebSocket, use {\"responses_ws_transport\":\"native\"}.",
+  "可选 JSON 配置，例如：{\"responses_ws_transport\":\"http_bridge\"}；如自定义兼容上游支持原生 Responses WebSocket，可使用 {\"responses_ws_native\":true,\"responses_ws_transport\":\"native\"}。": "Optional JSON config, for example: {\"responses_ws_transport\":\"http_bridge\"}; if the custom compatible upstream supports native Responses WebSocket, use {\"responses_ws_native\":true,\"responses_ws_transport\":\"native\"}.",
+  "请输入 JSON，例如：{\"dashscope_plugin\":\"plugin-name\"}": "Enter JSON, for example: {\"dashscope_plugin\":\"plugin-name\"}",
+  "请输入 JSON，例如：{\"api_version\":\"v3.1\"}": "Enter JSON, for example: {\"api_version\":\"v3.1\"}",
+  "请输入 JSON，例如：{\"api_version\":\"v1\"}": "Enter JSON, for example: {\"api_version\":\"v1\"}",
+  "请输入 JSON，例如：{\"region\":\"eastasia\"}": "Enter JSON, for example: {\"region\":\"eastasia\"}",
+  "请输入 JSON，例如：{\"region\":\"us-central1\",\"project_id\":\"my-project\"}": "Enter JSON, for example: {\"region\":\"us-central1\",\"project_id\":\"my-project\"}",
+  "开启后，将会透传普通 HTTP 请求中的额外字段（如 OpenAI SDK 的 extra_body 参数）；ResponsesWS HTTP bridge 按 WebSocket raw frame 契约保留未知字段，不受此开关控制": "When enabled, extra fields in ordinary HTTP requests are passed through, such as the OpenAI SDK extra_body parameter. ResponsesWS HTTP bridge preserves unknown fields under the WebSocket raw frame contract and is not controlled by this switch."
 }

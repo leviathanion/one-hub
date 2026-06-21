@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
@@ -95,6 +96,8 @@ var allowedChannelOrderFields = map[string]bool{
 	"weight":        true,
 }
 
+var azureAPIVersionSearchCandidateWarnThreshold = 1000
+
 var loadChannelByIDForChannelGroupRefresh = GetChannelById
 
 const (
@@ -106,7 +109,8 @@ const (
 type SearchChannelsParams struct {
 	Channel
 	PaginationParams
-	FilterTag int `json:"filter_tag" form:"filter_tag"`
+	FilterTag       int    `json:"filter_tag" form:"filter_tag"`
+	AzureAPIVersion string `json:"azure_api_version" form:"azure_api_version"`
 }
 
 func GetChannelsList(params *SearchChannelsParams) (*DataResult[Channel], error) {
@@ -148,6 +152,11 @@ func GetChannelsList(params *SearchChannelsParams) (*DataResult[Channel], error)
 		tagDB = tagDB.Where("other LIKE ?", params.Other+"%")
 	}
 
+	if strings.TrimSpace(params.AzureAPIVersion) != "" {
+		db = db.Where("type = ?", config.ChannelTypeAzure)
+		tagDB = tagDB.Where("type = ?", config.ChannelTypeAzure)
+	}
+
 	if params.Key != "" {
 		db = db.Where(quotePostgresField("key")+" = ?", params.Key)
 		tagDB = tagDB.Where(quotePostgresField("key")+" = ?", params.Key)
@@ -172,7 +181,111 @@ func GetChannelsList(params *SearchChannelsParams) (*DataResult[Channel], error)
 		db = db.Where("tag = '' OR id IN (?)", tagDB)
 	}
 
+	if strings.TrimSpace(params.AzureAPIVersion) != "" {
+		return paginateAndOrderAzureAPIVersion(db, &params.PaginationParams, &channels, params.AzureAPIVersion)
+	}
 	return PaginateAndOrder(db, &params.PaginationParams, &channels, allowedChannelOrderFields)
+}
+
+func paginateAndOrderAzureAPIVersion(db *gorm.DB, params *PaginationParams, result *[]*Channel, apiVersion string) (*DataResult[Channel], error) {
+	needle := strings.TrimSpace(apiVersion)
+	if params.Page < 1 {
+		params.Page = 1
+	}
+	if params.Size < 1 {
+		params.Size = config.ItemsPerPage
+	}
+	if params.Size > config.MaxRecentItems {
+		return nil, fmt.Errorf("size 参数不能超过 %d", config.MaxRecentItems)
+	}
+	db, err := applyChannelListOrder(db, params.Order)
+	if err != nil {
+		return nil, err
+	}
+
+	type azureAPIVersionCandidate struct {
+		Id    int
+		Other string
+	}
+	var candidates []azureAPIVersionCandidate
+	if err := db.Model(&Channel{}).Select("id", "other").Find(&candidates).Error; err != nil {
+		return nil, err
+	}
+	if len(candidates) > azureAPIVersionSearchCandidateWarnThreshold {
+		logger.LogWarn(context.Background(), fmt.Sprintf("Azure api_version search scanning %d candidate row(s) for api_version=%q page=%d size=%d", len(candidates), needle, params.Page, params.Size))
+	}
+	filteredIDs := make([]int, 0, len(candidates))
+	invalidSkipped := 0
+	for _, channel := range candidates {
+		options, err := ParseAzureChannelOther(channel.Other)
+		if err != nil {
+			invalidSkipped++
+			continue
+		}
+		if strings.Contains(options.APIVersion, needle) {
+			filteredIDs = append(filteredIDs, channel.Id)
+		}
+	}
+	if invalidSkipped > 0 {
+		logger.LogWarn(context.Background(), fmt.Sprintf("Azure api_version search skipped %d invalid Azure channel Other config(s) while filtering %d candidate(s) for %q", invalidSkipped, len(candidates), needle))
+	}
+
+	totalCount := int64(len(filteredIDs))
+	offset := (params.Page - 1) * params.Size
+	if offset >= len(filteredIDs) {
+		*result = []*Channel{}
+	} else {
+		end := offset + params.Size
+		if end > len(filteredIDs) {
+			end = len(filteredIDs)
+		}
+		pageIDs := filteredIDs[offset:end]
+		pageChannels := make([]*Channel, 0, len(pageIDs))
+		if err := DB.Omit("key").Where("id IN ?", pageIDs).Find(&pageChannels).Error; err != nil {
+			return nil, err
+		}
+		byID := make(map[int]*Channel, len(pageChannels))
+		for _, channel := range pageChannels {
+			if channel != nil {
+				byID[channel.Id] = channel
+			}
+		}
+		ordered := make([]*Channel, 0, len(pageIDs))
+		for _, id := range pageIDs {
+			if channel := byID[id]; channel != nil {
+				ordered = append(ordered, channel)
+			}
+		}
+		*result = ordered
+	}
+	return &DataResult[Channel]{
+		Data:       result,
+		Page:       params.Page,
+		Size:       params.Size,
+		TotalCount: totalCount,
+	}, nil
+}
+
+func applyChannelListOrder(db *gorm.DB, order string) (*gorm.DB, error) {
+	if order == "" {
+		return db.Order("id DESC"), nil
+	}
+	orderFields := strings.Split(order, ",")
+	for _, field := range orderFields {
+		field = strings.TrimSpace(field)
+		desc := strings.HasPrefix(field, "-")
+		if desc {
+			field = field[1:]
+		}
+		if !allowedChannelOrderFields[field] {
+			return nil, fmt.Errorf("不允许对字段 '%s' 进行排序", field)
+		}
+		if desc {
+			field = field + " DESC"
+		}
+		db = db.Order(field)
+	}
+	return db, nil
 }
 
 func GetAllChannels() ([]*Channel, error) {
@@ -300,6 +413,9 @@ func BatchDeleteChannel(ids []int) (int64, error) {
 
 func BatchInsertChannels(channels []Channel) error {
 	for i := range channels {
+		if err := channels[i].CanonicalizeRuntimeConfigJSON(); err != nil {
+			return err
+		}
 		if err := channels[i].ValidateRuntimeConfigJSON(); err != nil {
 			return err
 		}
@@ -314,42 +430,74 @@ func BatchInsertChannels(channels []Channel) error {
 }
 
 type BatchChannelsParams struct {
+	APIVersion string `json:"api_version" form:"api_version"`
+	Ids        []int  `json:"ids" form:"ids" binding:"required"`
+}
+
+type BatchDelModelChannelsParams struct {
 	Value string `json:"value" form:"value" binding:"required"`
 	Ids   []int  `json:"ids" form:"ids" binding:"required"`
 }
 
 func BatchUpdateChannelsAzureApi(params *BatchChannelsParams) (int64, error) {
+	if params == nil {
+		return 0, fmt.Errorf("params is required")
+	}
+	apiVersion := strings.TrimSpace(params.APIVersion)
+	if apiVersion == "" {
+		return 0, fmt.Errorf("api_version is required")
+	}
 	var channels []Channel
-	if err := DB.Select("id, type").Find(&channels, "id IN ?", params.Ids).Error; err != nil {
+	if err := DB.Select("id, type, other").Find(&channels, "id IN ?", params.Ids).Error; err != nil {
 		return 0, err
 	}
-	codexChannelIDs := make([]int, 0, len(channels))
 	for i := range channels {
-		channel := Channel{
-			Type:  channels[i].Type,
-			Other: params.Value,
-		}
-		if err := channel.ValidateRuntimeConfigJSON(); err != nil {
-			return 0, err
-		}
-		if channels[i].Type == config.ChannelTypeCodex {
-			codexChannelIDs = append(codexChannelIDs, channels[i].Id)
+		if channels[i].Type != config.ChannelTypeAzure {
+			return 0, fmt.Errorf("batch Azure api_version update only supports Azure classic channels")
 		}
 	}
 
-	db := DB.Model(&Channel{}).Where("id IN ?", params.Ids).Update("other", params.Value)
-	if db.Error != nil {
-		return 0, db.Error
+	var rowsAffected int64
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		for i := range channels {
+			_, other, err := parseAzureChannelOtherObject(channels[i].Other)
+			if err != nil {
+				return err
+			}
+			encodedAPIVersion, err := json.Marshal(apiVersion)
+			if err != nil {
+				return err
+			}
+			other["api_version"] = encodedAPIVersion
+			updated, err := json.Marshal(other)
+			if err != nil {
+				return err
+			}
+			result := tx.Model(&Channel{}).Where("id = ?", channels[i].Id).Update("other", string(updated))
+			if result.Error != nil {
+				return result.Error
+			}
+			rowsAffected += result.RowsAffected
+		}
+		return nil
+	}); err != nil {
+		return 0, err
 	}
 
-	if db.RowsAffected > 0 {
-		ClearChannelCodexDerivedCaches(codexChannelIDs)
+	if rowsAffected > 0 {
 		refreshChannelGroupAfterMutation("batch update channel runtime config", nil)
 	}
-	return db.RowsAffected, nil
+	return rowsAffected, nil
 }
 
-func BatchDelModelChannels(params *BatchChannelsParams) (int64, error) {
+func BatchDelModelChannels(params *BatchDelModelChannelsParams) (int64, error) {
+	if params == nil {
+		return 0, fmt.Errorf("params is required")
+	}
+	targetModel := strings.TrimSpace(params.Value)
+	if targetModel == "" {
+		return 0, fmt.Errorf("value is required")
+	}
 	var count int64
 
 	var channels []*Channel
@@ -360,15 +508,23 @@ func BatchDelModelChannels(params *BatchChannelsParams) (int64, error) {
 
 	for _, channel := range channels {
 		modelsSlice := strings.Split(channel.Models, ",")
+		removed := false
 		for i, m := range modelsSlice {
-			if m == params.Value {
+			if strings.TrimSpace(m) == targetModel {
 				modelsSlice = append(modelsSlice[:i], modelsSlice[i+1:]...)
+				removed = true
 				break
 			}
 		}
+		if !removed {
+			continue
+		}
 
 		channel.Models = strings.Join(modelsSlice, ",")
-		channel.UpdateRaw(false)
+		if err := DB.Model(&Channel{}).Where("id = ?", channel.Id).Update("models", channel.Models).Error; err != nil {
+			return count, err
+		}
+		ClearChannelCodexDerivedCache(channel.Id)
 		count++
 	}
 
@@ -615,6 +771,9 @@ func (channel *Channel) ParseRuntimeConfig() {
 }
 
 func (channel *Channel) Insert() error {
+	if err := channel.CanonicalizeRuntimeConfigJSON(); err != nil {
+		return err
+	}
 	if err := channel.ValidateRuntimeConfigJSON(); err != nil {
 		return err
 	}
@@ -627,7 +786,19 @@ func (channel *Channel) Insert() error {
 }
 
 func (channel *Channel) Update(overwrite bool) error {
-	err := channel.UpdateRaw(overwrite)
+	return channel.UpdateWithOptions(overwrite, ChannelUpdateOptions{
+		OtherSubmitted:   overwrite,
+		BaseURLSubmitted: overwrite,
+	})
+}
+
+type ChannelUpdateOptions struct {
+	OtherSubmitted   bool
+	BaseURLSubmitted bool
+}
+
+func (channel *Channel) UpdateWithOptions(overwrite bool, options ChannelUpdateOptions) error {
+	err := channel.UpdateRawWithOptions(overwrite, options)
 
 	if err == nil {
 		var failClosedChannelIDs []int
@@ -641,8 +812,24 @@ func (channel *Channel) Update(overwrite bool) error {
 }
 
 func (channel *Channel) UpdateRaw(overwrite bool) error {
+	return channel.UpdateRawWithOptions(overwrite, ChannelUpdateOptions{
+		OtherSubmitted:   overwrite,
+		BaseURLSubmitted: overwrite,
+	})
+}
+
+func (channel *Channel) UpdateRawWithOptions(overwrite bool, options ChannelUpdateOptions) error {
 	var err error
 	if err = channel.hydratePersistedTypeForUpdate(); err != nil {
+		return err
+	}
+	if err = channel.hydratePersistedOtherForUpdate(options.OtherSubmitted); err != nil {
+		return err
+	}
+	if err = channel.hydratePersistedBaseURLForUpdate(options.BaseURLSubmitted); err != nil {
+		return err
+	}
+	if err = channel.CanonicalizeRuntimeConfigJSON(); err != nil {
 		return err
 	}
 	if err = channel.ValidateRuntimeConfigJSON(); err != nil {
@@ -653,6 +840,9 @@ func (channel *Channel) UpdateRaw(overwrite bool) error {
 		err = DB.Model(channel).Select("*").Omit("UsedQuota").Updates(channel).Error
 	} else {
 		err = DB.Model(channel).Omit("UsedQuota").Updates(channel).Error
+		if err == nil {
+			err = channel.updateSubmittedZeroValueRuntimeConfig(options)
+		}
 	}
 	if err != nil {
 		return err
@@ -660,6 +850,27 @@ func (channel *Channel) UpdateRaw(overwrite bool) error {
 	ClearChannelCodexDerivedCache(channel.Id)
 	DB.Model(channel).First(channel, "id = ?", channel.Id)
 	return err
+}
+
+func (channel *Channel) updateSubmittedZeroValueRuntimeConfig(options ChannelUpdateOptions) error {
+	if channel == nil || channel.Id <= 0 {
+		return nil
+	}
+	updates := make(map[string]any)
+	if options.OtherSubmitted {
+		updates["other"] = channel.Other
+	}
+	if options.BaseURLSubmitted {
+		if channel.BaseURL == nil {
+			updates["base_url"] = nil
+		} else {
+			updates["base_url"] = *channel.BaseURL
+		}
+	}
+	if len(updates) == 0 {
+		return nil
+	}
+	return DB.Model(&Channel{}).Where("id = ?", channel.Id).UpdateColumns(updates).Error
 }
 
 func (channel *Channel) hydratePersistedTypeForUpdate() error {
@@ -674,6 +885,60 @@ func (channel *Channel) hydratePersistedTypeForUpdate() error {
 
 	channel.Type = persisted.Type
 	return nil
+}
+
+func (channel *Channel) hydratePersistedRequiredOtherForPartialUpdate() error {
+	return channel.hydratePersistedOtherForUpdate(false)
+}
+
+func (channel *Channel) hydratePersistedOtherForUpdate(otherSubmitted bool) error {
+	if channel == nil || channel.Id <= 0 || otherSubmitted || strings.TrimSpace(channel.Other) != "" {
+		return nil
+	}
+
+	persisted, err := GetChannelById(channel.Id)
+	if err != nil {
+		return err
+	}
+	if channel.Type != config.ChannelTypeUnknown && channel.Type != persisted.Type {
+		return fmt.Errorf("other must be submitted when changing channel type")
+	}
+	channel.Other = persisted.Other
+	return nil
+}
+
+func (channel *Channel) hydratePersistedBaseURLForUpdate(baseURLSubmitted bool) error {
+	if channel == nil || channel.Id <= 0 || baseURLSubmitted || channel.BaseURL != nil {
+		return nil
+	}
+
+	persisted, err := GetChannelById(channel.Id)
+	if err != nil {
+		return err
+	}
+	if channel.Type != config.ChannelTypeUnknown && channel.Type != persisted.Type {
+		return fmt.Errorf("base_url must be submitted when changing channel type")
+	}
+	channel.BaseURL = persisted.BaseURL
+	return nil
+}
+
+func channelTypeRequiresOtherForPartialUpdate(channelType int) bool {
+	switch channelType {
+	case config.ChannelTypeAzure, config.ChannelTypeAzureSpeech, config.ChannelTypeVertexAI:
+		return true
+	default:
+		return false
+	}
+}
+
+func channelTypeRequiresBaseURLForPartialUpdate(channelType int) bool {
+	switch channelType {
+	case config.ChannelTypeAzureSpeech, config.ChannelTypeAzureV1:
+		return true
+	default:
+		return false
+	}
 }
 
 func (channel *Channel) UpdateResponseTime(responseTime int64) {

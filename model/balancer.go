@@ -432,16 +432,20 @@ func (cc *ChannelsChooser) GetChannel(channelId int) *Channel {
 
 var ChannelGroup = ChannelsChooser{}
 
-func normalizeChannelForChooser(channel *Channel) {
+func normalizeChannelForChooser(channel *Channel) error {
 	if channel == nil {
-		return
+		return nil
 	}
 
+	if err := channel.ValidateRuntimeConfigJSON(); err != nil {
+		return NewInvalidChannelRuntimeConfigError(channel.Id, err)
+	}
 	channel.SetProxy()
 	channel.ParseRuntimeConfig()
 	if channel.Weight == nil || *channel.Weight == 0 {
 		channel.Weight = &config.DefaultChannelWeight
 	}
+	return nil
 }
 
 func (cc *ChannelsChooser) RefreshChannel(channelID int) error {
@@ -453,7 +457,10 @@ func (cc *ChannelsChooser) RefreshChannel(channelID int) error {
 	if err != nil {
 		return err
 	}
-	normalizeChannelForChooser(channel)
+	if err := normalizeChannelForChooser(channel); err != nil {
+		cc.failClosedChannels([]int{channelID})
+		return err
+	}
 
 	cc.Lock()
 	defer cc.Unlock()
@@ -538,7 +545,10 @@ func (cc *ChannelsChooser) loadLocked() error {
 
 	// 处理每个channel
 	for _, channel := range channels {
-		normalizeChannelForChooser(channel)
+		if err := normalizeChannelForChooser(channel); err != nil {
+			logger.SysError(err.Error())
+			continue
+		}
 		newChannels[channel.Id] = &ChannelChoice{
 			Channel:       channel,
 			CooldownsTime: 0,

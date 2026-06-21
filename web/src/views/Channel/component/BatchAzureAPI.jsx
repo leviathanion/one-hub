@@ -7,6 +7,19 @@ import { API } from 'utils/api';
 import { showError, showSuccess } from 'utils/common';
 import { useTranslation } from 'react-i18next';
 
+export const azureBatchAPILabelOther = (other) => {
+  const raw = String(other ?? '');
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && typeof parsed.api_version === 'string') {
+      return parsed.api_version;
+    }
+  } catch (error) {
+    return raw;
+  }
+  return raw;
+};
+
 const BatchAzureAPI = () => {
   const [value, setValue] = useState('');
   const [data, setData] = useState([]);
@@ -15,7 +28,8 @@ const BatchAzureAPI = () => {
   const { t } = useTranslation();
 
   const handleSearch = async () => {
-    const data = await fetchChannelData(0, 100, { other: value, type: 3 }, 'desc', 'id');
+    const trimmed = value.trim();
+    const data = await fetchChannelData(0, 100, { azure_api_version: trimmed, type: 3 }, 'desc', 'id');
     if (data) {
       setData(data.data);
     }
@@ -43,7 +57,7 @@ const BatchAzureAPI = () => {
     try {
       const res = await API.put(`/api/channel/batch/azure_api`, {
         ids: selected,
-        value: replaceValue
+        api_version: replaceValue.trim()
       });
 
       const { success, message, data } = res.data;
@@ -91,15 +105,15 @@ const BatchAzureAPI = () => {
               {selected.length === data.length ? t('channel_index.unselectAll') : t('channel_index.selectAll')}
             </Button>
           </Grid>
-          <Grid item xs={12}>
-            {data.map((item) => (
-              <FormControlLabel
-                key={item.id}
-                control={<Checkbox checked={selected.includes(item.id)} onChange={() => handleSelect(item.id)} />}
-                label={item.name + '(' + item.other + ')'}
-              />
-            ))}
-          </Grid>
+	          <Grid item xs={12}>
+	            {data.map((item) => (
+	              <FormControlLabel
+	                key={item.id}
+	                control={<Checkbox checked={selected.includes(item.id)} onChange={() => handleSelect(item.id)} />}
+	                label={item.name + '(' + azureBatchAPILabelOther(item.other) + ')'}
+	              />
+	            ))}
+	          </Grid>
           <Grid item xs={12}>
             <TextField
               sx={{ ml: 1, flex: 1 }}

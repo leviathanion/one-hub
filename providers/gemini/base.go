@@ -2,6 +2,7 @@ package gemini
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -36,10 +37,7 @@ func (f GeminiProviderFactory) Create(channel *model.Channel) base.ProviderInter
 		}
 	}
 
-	version := "v1beta"
-	if channel.Other != "" {
-		version = channel.Other
-	}
+	version := geminiAPIVersionWithContext(nil, channel)
 
 	return &GeminiProvider{
 		OpenAIProvider: openai.OpenAIProvider{
@@ -113,17 +111,13 @@ func cleaningError(errorInfo *GeminiError, key string) {
 	if key == "" {
 		return
 	}
-	message := strings.Replace(errorInfo.Message, key, "xxxxx", 1)
+	message := strings.ReplaceAll(errorInfo.Message, key, "xxxxx")
 	errorInfo.Message = message
 }
 
 func (p *GeminiProvider) GetFullRequestURL(requestURL string, modelName string) string {
 	baseURL := strings.TrimSuffix(p.GetBaseURL(), "/")
-	version := "v1beta"
-
-	if p.Channel.Other != "" {
-		version = p.Channel.Other
-	}
+	version := geminiAPIVersionWithContext(p.LogContext(), p.Channel)
 
 	inputVersion := p.Context.Param("version")
 	if inputVersion != "" {
@@ -131,6 +125,26 @@ func (p *GeminiProvider) GetFullRequestURL(requestURL string, modelName string) 
 	}
 
 	return fmt.Sprintf("%s/%s/models/%s:%s", baseURL, version, modelName, requestURL)
+}
+
+func geminiAPIVersion(channel *model.Channel) string {
+	return geminiAPIVersionWithContext(nil, channel)
+}
+
+func geminiAPIVersionWithContext(ctx context.Context, channel *model.Channel) string {
+	version := "v1beta"
+	if channel == nil {
+		return version
+	}
+	configured, err := channel.GetOtherStringField("api_version")
+	if err != nil {
+		base.LogChannelConfigParseError(ctx, "gemini", channel, "api_version", err)
+		return version
+	}
+	if configured != "" {
+		return configured
+	}
+	return version
 }
 
 // 获取请求头

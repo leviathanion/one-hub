@@ -76,6 +76,16 @@ func TestParseCodexChannelTemplateRejectsInvalidRuntimeConfigJSON(t *testing.T) 
 	}
 }
 
+func TestParseCodexChannelTemplateCanonicalizesLegacyRequiredWebsocketMode(t *testing.T) {
+	channel, err := parseCodexChannelTemplate(`{"type":101,"name":"codex","models":"gpt-5","group":"default","other":"{\"websocket_mode\":\"required\"}"}`)
+	if err != nil {
+		t.Fatalf("expected legacy Codex websocket_mode template to be accepted, got %v", err)
+	}
+	if channel.Other != `{"websocket_mode":"force"}` {
+		t.Fatalf("expected legacy Codex websocket_mode to canonicalize to force, got %q", channel.Other)
+	}
+}
+
 func TestParseCodexChannelTemplateRejectsUnsupportedCodexOtherFields(t *testing.T) {
 	_, err := parseCodexChannelTemplate(`{"type":101,"name":"codex","models":"gpt-5","group":"default","other":"{\"user_agent_regex\":\"^Codex/\"}"}`)
 	if err == nil {

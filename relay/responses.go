@@ -1,9 +1,7 @@
 package relay
 
 import (
-	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"one-api/common"
 	"one-api/common/logger"
@@ -346,59 +344,76 @@ func (r *relayResponses) chatToResponseStreamClient(stream requester.StreamReade
 	var isFirstResponse bool
 
 	converter := relay_util.NewOpenAIResponsesStreamConverter(r.c, &r.responsesRequest, r.provider.GetUsage())
+	dataOpen := dataChan != nil
+	errOpen := errChan != nil
 
-	for {
+	handleData := func(data string) {
+		if !isFirstResponse {
+			firstResponseTime = time.Now()
+			isFirstResponse = true
+		}
+
 		select {
-		case data, ok := <-dataChan:
-			if !ok {
-				return firstResponseTime, converter.FinalResponse()
-			}
-
-			if !isFirstResponse {
-				firstResponseTime = time.Now()
-				isFirstResponse = true
-			}
-
-			select {
-			case <-r.c.Request.Context().Done():
-			default:
-				converter.ProcessStreamData(data)
-			}
-			continue
+		case <-r.c.Request.Context().Done():
 		default:
+			converter.ProcessStreamData(data)
+		}
+	}
+
+	handleEOF := func() {
+		converter.ProcessStreamData("[DONE]")
+	}
+
+	handleError := func(err error) {
+		if isStreamTerminalEOF(err) {
+			handleEOF()
+			return
+		}
+		select {
+		case <-r.c.Request.Context().Done():
+		default:
+			converter.ProcessStreamError()
+		}
+
+		logger.LogError(r.c.Request.Context(), "Stream err:"+common.RedactSensitiveText(err.Error()))
+	}
+
+	for dataOpen || errOpen {
+		if dataOpen {
+			select {
+			case data, ok := <-dataChan:
+				if !ok {
+					dataOpen = false
+					dataChan = nil
+					continue
+				}
+				handleData(data)
+				continue
+			default:
+			}
 		}
 
 		select {
 		case data, ok := <-dataChan:
 			if !ok {
-				return firstResponseTime, converter.FinalResponse()
+				dataOpen = false
+				dataChan = nil
+				continue
 			}
-
-			if !isFirstResponse {
-				firstResponseTime = time.Now()
-				isFirstResponse = true
+			handleData(data)
+		case err, ok := <-errChan:
+			if !ok {
+				errOpen = false
+				errChan = nil
+				continue
 			}
-
-			select {
-			case <-r.c.Request.Context().Done():
-			default:
-				converter.ProcessStreamData(data)
-			}
-		case err := <-errChan:
-			if !errors.Is(err, io.EOF) {
-				select {
-				case <-r.c.Request.Context().Done():
-				default:
-					converter.ProcessError(err.Error())
-				}
-
-				logger.LogError(r.c.Request.Context(), "Stream err:"+err.Error())
-			} else {
-				converter.ProcessStreamData("[DONE]")
-			}
+			handleError(err)
 			return firstResponseTime, converter.FinalResponse()
 		}
 	}
+
+	handleEOF()
+	return firstResponseTime, converter.FinalResponse()
 }
 
 type responsesOperation int

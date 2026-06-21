@@ -3,6 +3,7 @@ package controller
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"testing"
 
@@ -121,5 +122,262 @@ func TestAddChannelAllowsNewTag(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("expected new tag create to insert one channel, got count=%d", count)
+	}
+}
+
+func TestAddChannelCanonicalizesCodexLegacyRequiredWebsocketMode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	useControllerChannelTagTestDB(t)
+
+	payload, err := json.Marshal(map[string]any{
+		"type":   config.ChannelTypeCodex,
+		"name":   "codex-required",
+		"key":    "codex-token",
+		"models": "gpt-5",
+		"group":  "default",
+		"other":  `{"websocket_mode":"required"}`,
+	})
+	if err != nil {
+		t.Fatalf("expected request payload to marshal, got %v", err)
+	}
+	ctx, recorder := commonTest.GetContext(http.MethodPost, "/api/channel/", commonTest.RequestJSONConfig(), bytes.NewBuffer(payload))
+
+	AddChannel(ctx)
+
+	var resp struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("expected JSON response, got %v", err)
+	}
+	if !resp.Success {
+		t.Fatalf("expected Codex legacy websocket_mode create to succeed, got %s", recorder.Body.String())
+	}
+
+	var persisted model.Channel
+	if err := model.DB.Where("name = ?", "codex-required").First(&persisted).Error; err != nil {
+		t.Fatalf("expected created Codex channel lookup to succeed, got %v", err)
+	}
+	if persisted.Other != `{"websocket_mode":"force"}` {
+		t.Fatalf("expected Codex websocket_mode to persist as force, got %q", persisted.Other)
+	}
+}
+
+func TestUpdateChannelCanonicalizesCodexLegacyRequiredWebsocketMode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	useControllerChannelTagTestDB(t)
+
+	if err := model.DB.Create(&model.Channel{
+		Id:     1,
+		Type:   config.ChannelTypeCodex,
+		Name:   "codex-old",
+		Key:    "codex-token",
+		Group:  "default",
+		Models: "gpt-5",
+	}).Error; err != nil {
+		t.Fatalf("expected Codex channel fixture to persist, got %v", err)
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"id":     1,
+		"type":   config.ChannelTypeCodex,
+		"name":   "codex-new",
+		"key":    "codex-token",
+		"models": "gpt-5",
+		"group":  "default",
+		"other":  `{"websocket_mode":"required"}`,
+	})
+	if err != nil {
+		t.Fatalf("expected request payload to marshal, got %v", err)
+	}
+	ctx, recorder := commonTest.GetContext(http.MethodPut, "/api/channel/", commonTest.RequestJSONConfig(), bytes.NewBuffer(payload))
+
+	UpdateChannel(ctx)
+
+	var resp struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("expected JSON response, got %v", err)
+	}
+	if !resp.Success {
+		t.Fatalf("expected Codex legacy websocket_mode update to succeed, got %s", recorder.Body.String())
+	}
+
+	persisted, err := model.GetChannelById(1)
+	if err != nil {
+		t.Fatalf("expected persisted Codex channel lookup to succeed, got %v", err)
+	}
+	if persisted.Other != `{"websocket_mode":"force"}` {
+		t.Fatalf("expected Codex websocket_mode to persist as force, got %q", persisted.Other)
+	}
+}
+
+func TestUpdateChannelOmittedOtherPreservesAzureRequiredOther(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	useControllerChannelTagTestDB(t)
+
+	const originalOther = `{"api_version":"2024-05-01-preview","responses_ws_transport":"http_bridge"}`
+	if err := model.DB.Create(&model.Channel{
+		Id:     1,
+		Type:   config.ChannelTypeAzure,
+		Name:   "azure-old",
+		Key:    "sk-azure",
+		Group:  "default",
+		Models: "gpt-old",
+		Other:  originalOther,
+	}).Error; err != nil {
+		t.Fatalf("expected Azure channel fixture to persist, got %v", err)
+	}
+
+	body := bytes.NewBufferString(`{"id":1,"type":3,"name":"azure-new","key":"sk-azure","models":"gpt-new","group":"default"}`)
+	ctx, recorder := commonTest.GetContext(http.MethodPut, "/api/channel/", commonTest.RequestJSONConfig(), body)
+
+	UpdateChannel(ctx)
+
+	var resp struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("expected JSON response, got %v", err)
+	}
+	if !resp.Success {
+		t.Fatalf("expected omitted other update to succeed, got %s", recorder.Body.String())
+	}
+
+	persisted, err := model.GetChannelById(1)
+	if err != nil {
+		t.Fatalf("expected persisted Azure channel lookup to succeed, got %v", err)
+	}
+	if persisted.Models != "gpt-new" || persisted.Other != originalOther {
+		t.Fatalf("expected omitted other to be preserved while models update, models=%q other=%q", persisted.Models, persisted.Other)
+	}
+}
+
+func TestUpdateChannelOmittedOtherPreservesOpenAIOptionalOther(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	useControllerChannelTagTestDB(t)
+
+	const originalOther = `{"responses_ws_transport":"http_bridge","responses_ws_native":false}`
+	if err := model.DB.Create(&model.Channel{
+		Id:     1,
+		Type:   config.ChannelTypeOpenAI,
+		Name:   "openai-old",
+		Key:    "sk-openai",
+		Group:  "default",
+		Models: "gpt-old",
+		Other:  originalOther,
+	}).Error; err != nil {
+		t.Fatalf("expected OpenAI channel fixture to persist, got %v", err)
+	}
+
+	body := bytes.NewBufferString(fmt.Sprintf(`{"id":1,"type":%d,"name":"openai-new","key":"sk-openai","models":"gpt-new","group":"default"}`, config.ChannelTypeOpenAI))
+	ctx, recorder := commonTest.GetContext(http.MethodPut, "/api/channel/", commonTest.RequestJSONConfig(), body)
+
+	UpdateChannel(ctx)
+
+	var resp struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("expected JSON response, got %v", err)
+	}
+	if !resp.Success {
+		t.Fatalf("expected omitted optional other update to succeed, got %s", recorder.Body.String())
+	}
+
+	persisted, err := model.GetChannelById(1)
+	if err != nil {
+		t.Fatalf("expected persisted OpenAI channel lookup to succeed, got %v", err)
+	}
+	if persisted.Models != "gpt-new" || persisted.Other != originalOther {
+		t.Fatalf("expected omitted optional other to be preserved while models update, models=%q other=%q", persisted.Models, persisted.Other)
+	}
+}
+
+func TestUpdateChannelExplicitEmptyOtherRejectsAzureAndLeavesDBUnchanged(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	useControllerChannelTagTestDB(t)
+
+	const originalOther = `{"api_version":"2024-05-01-preview"}`
+	if err := model.DB.Create(&model.Channel{
+		Id:     1,
+		Type:   config.ChannelTypeAzure,
+		Name:   "azure-old",
+		Key:    "sk-azure",
+		Group:  "default",
+		Models: "gpt-old",
+		Other:  originalOther,
+	}).Error; err != nil {
+		t.Fatalf("expected Azure channel fixture to persist, got %v", err)
+	}
+
+	body := bytes.NewBufferString(`{"id":1,"type":3,"name":"azure-new","key":"sk-azure","models":"gpt-new","group":"default","other":""}`)
+	ctx, recorder := commonTest.GetContext(http.MethodPut, "/api/channel/", commonTest.RequestJSONConfig(), body)
+
+	UpdateChannel(ctx)
+
+	var resp struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("expected JSON response, got %v", err)
+	}
+	if resp.Success {
+		t.Fatalf("expected explicit empty other update to be rejected, got %s", recorder.Body.String())
+	}
+
+	persisted, err := model.GetChannelById(1)
+	if err != nil {
+		t.Fatalf("expected persisted Azure channel lookup to succeed, got %v", err)
+	}
+	if persisted.Models != "gpt-old" || persisted.Other != originalOther || persisted.Name != "azure-old" {
+		t.Fatalf("expected rejected update not to mutate DB, name=%q models=%q other=%q", persisted.Name, persisted.Models, persisted.Other)
+	}
+}
+
+func TestBatchUpdateChannelsAzureApiRejectsLegacyValuePayload(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	useControllerChannelTagTestDB(t)
+
+	if err := model.DB.Create(&model.Channel{
+		Id:     1,
+		Type:   config.ChannelTypeAzure,
+		Name:   "azure",
+		Key:    "sk-azure",
+		Group:  "default",
+		Models: "gpt-5",
+		Other:  `{"api_version":"2024-05-01-preview","responses_ws_transport":"http_bridge"}`,
+	}).Error; err != nil {
+		t.Fatalf("expected Azure channel fixture to persist, got %v", err)
+	}
+
+	body := bytes.NewBufferString(`{"ids":[1],"value":"2024-06-01"}`)
+	ctx, recorder := commonTest.GetContext(http.MethodPut, "/api/channel/batch/azure_api", commonTest.RequestJSONConfig(), body)
+
+	BatchUpdateChannelsAzureApi(ctx)
+
+	var resp struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("expected JSON response, got %v", err)
+	}
+	if resp.Success || resp.Message != "api_version is required" {
+		t.Fatalf("expected legacy value payload to be rejected, got %s", recorder.Body.String())
+	}
+
+	persisted, err := model.GetChannelById(1)
+	if err != nil {
+		t.Fatalf("expected persisted Azure channel lookup to succeed, got %v", err)
+	}
+	if persisted.Other != `{"api_version":"2024-05-01-preview","responses_ws_transport":"http_bridge"}` {
+		t.Fatalf("expected rejected legacy payload not to mutate other, got %q", persisted.Other)
 	}
 }

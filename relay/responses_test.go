@@ -1,18 +1,21 @@
 package relay
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"one-api/common/logger"
 	"one-api/common/requester"
 	"one-api/model"
 	providersBase "one-api/providers/base"
 	"one-api/types"
 
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 )
 
 type affinityResponsesProvider struct {
@@ -896,8 +899,69 @@ func TestRelayResponsesSetRequestAndCompactSuccessBranches(t *testing.T) {
 		errChan:  make(chan error, 1),
 	}
 	close(closedStream.dataChan)
-	if firstResponseTime, finalResponse := streamRelay.chatToResponseStreamClient(closedStream); !firstResponseTime.IsZero() || finalResponse != nil {
-		t.Fatalf("expected closed response stream to return zero time and no final response payload, time=%v final=%#v", firstResponseTime, finalResponse)
+	close(closedStream.errChan)
+	firstResponseTime, finalResponse := streamRelay.chatToResponseStreamClient(closedStream)
+	if !firstResponseTime.IsZero() {
+		t.Fatalf("expected closed response stream to return zero first response time, got %v", firstResponseTime)
+	}
+	if finalResponse == nil || finalResponse.Status != types.ResponseStatusCompleted {
+		t.Fatalf("expected closed response stream to process terminal response, got %#v", finalResponse)
+	}
+}
+
+func TestRelayResponsesChatToResponsesStreamErrorIsClientSafe(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	originalLogger := logger.Logger
+	logger.Logger = zap.NewNop()
+	t.Cleanup(func() {
+		logger.Logger = originalLogger
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	streamRelay := &relayResponses{
+		relayBase: relayBase{
+			c:        ctx,
+			provider: &compatibleResponsesChatProvider{BaseProvider: providersBase.BaseProvider{Channel: &model.Channel{}}},
+		},
+		responsesRequest: types.OpenAIResponsesRequest{Model: "gpt-5"},
+	}
+	stream := &fakeRelayStream{
+		dataChan: make(chan string),
+		errChan:  make(chan error, 1),
+	}
+	close(stream.dataChan)
+	stream.errChan <- errors.New("upstream stream broken Authorization: Bearer secret-token api_key=query-secret https://provider.example/v1?token=url-secret session session-secret sk-testSECRET123")
+	close(stream.errChan)
+
+	streamRelay.chatToResponseStreamClient(stream)
+
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"message":"stream interrupted"`) {
+		t.Fatalf("expected stable client stream error message, got %q", body)
+	}
+	for _, forbidden := range []string{"upstream stream broken", "Authorization", "secret-token", "query-secret", "provider.example", "url-secret", "session-secret", "sk-testSECRET123"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("expected client stream body not to leak %q, got %q", forbidden, body)
+		}
+	}
+
+	entries, _ := logger.GetLatestLogs(20)
+	var streamLog string
+	for i := len(entries) - 1; i >= 0; i-- {
+		if strings.Contains(entries[i].Message, "Stream err:") {
+			streamLog = entries[i].Message
+			break
+		}
+	}
+	if streamLog == "" {
+		t.Fatal("expected stream error to be logged")
+	}
+	for _, forbidden := range []string{"secret-token", "query-secret", "provider.example", "url-secret", "session-secret", "sk-testSECRET123"} {
+		if strings.Contains(streamLog, forbidden) {
+			t.Fatalf("expected stream error log to redact %q, got %q", forbidden, streamLog)
+		}
 	}
 }
 
