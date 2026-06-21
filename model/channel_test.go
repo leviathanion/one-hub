@@ -2,6 +2,7 @@ package model
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -389,6 +390,90 @@ func TestChannelPersistenceCanonicalizesLegacyOther(t *testing.T) {
 		t.Fatalf("expected updated OpenAI channel lookup to succeed, got %v", err)
 	}
 	assertJSONObjectsEqual(t, persisted.Other, `{"vendor_extra":{"legacy_other":"legacy-update"}}`)
+}
+
+func TestBatchInsertChannelsCreatesLargeBatches(t *testing.T) {
+	useTestChannelDB(t)
+
+	channels := make([]Channel, 0, 1200)
+	for i := 0; i < 1200; i++ {
+		channels = append(channels, Channel{
+			Type:   config.ChannelTypeCodex,
+			Name:   fmt.Sprintf("codex-batch-%04d", i),
+			Key:    fmt.Sprintf("sk-batch-%04d", i),
+			Group:  "default",
+			Models: "gpt-5",
+		})
+	}
+
+	if err := BatchInsertChannels(channels); err != nil {
+		t.Fatalf("expected 1200 channel batch insert to succeed, got %v", err)
+	}
+
+	var count int64
+	if err := DB.Model(&Channel{}).Count(&count).Error; err != nil {
+		t.Fatalf("expected channel count query to succeed, got %v", err)
+	}
+	if count != 1200 {
+		t.Fatalf("expected 1200 persisted channels, got %d", count)
+	}
+}
+
+func TestBatchInsertChannelsValidationFailureDoesNotWrite(t *testing.T) {
+	useTestChannelDB(t)
+
+	channels := make([]Channel, 0, 3)
+	for i := 0; i < 3; i++ {
+		channels = append(channels, Channel{
+			Type:   config.ChannelTypeCodex,
+			Name:   fmt.Sprintf("codex-validation-%d", i),
+			Key:    fmt.Sprintf("sk-validation-%d", i),
+			Group:  "default",
+			Models: "gpt-5",
+		})
+	}
+	channels[1].Other = `{"prompt_cache_key_strategy":`
+
+	if err := BatchInsertChannels(channels); err == nil {
+		t.Fatal("expected invalid runtime config to fail the whole batch")
+	}
+
+	var count int64
+	if err := DB.Model(&Channel{}).Count(&count).Error; err != nil {
+		t.Fatalf("expected channel count query to succeed, got %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected validation failure to write no channels, got %d", count)
+	}
+}
+
+func TestBatchInsertChannelsRollsBackWhenLaterBatchFails(t *testing.T) {
+	useTestChannelDB(t)
+
+	channels := make([]Channel, 0, 250)
+	for i := 0; i < 250; i++ {
+		channels = append(channels, Channel{
+			Type:   config.ChannelTypeCodex,
+			Name:   fmt.Sprintf("codex-rollback-%03d", i),
+			Key:    fmt.Sprintf("sk-rollback-%03d", i),
+			Group:  "default",
+			Models: "gpt-5",
+		})
+	}
+	channels[0].Id = 9001
+	channels[220].Id = 9001
+
+	if err := BatchInsertChannels(channels); err == nil {
+		t.Fatal("expected duplicate primary key in a later batch to fail")
+	}
+
+	var count int64
+	if err := DB.Model(&Channel{}).Count(&count).Error; err != nil {
+		t.Fatalf("expected channel count query to succeed, got %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected transaction rollback to write no channels, got %d", count)
+	}
 }
 
 func TestChannelGetOtherMapParsesAndReparsesOtherJSON(t *testing.T) {

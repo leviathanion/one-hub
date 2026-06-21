@@ -60,13 +60,13 @@ func ParseCodexAuthFile(c *gin.Context) {
 
 // ImportCodexAuthFiles creates Codex channels directly from uploaded auth files.
 func ImportCodexAuthFiles(c *gin.Context) {
-	template, err := parseCodexChannelTemplate(c.PostForm("channel"))
+	templateRaw, parsedFiles, err := readCodexAuthFilesImportParts(c)
 	if err != nil {
 		common.APIRespondWithError(c, http.StatusOK, err)
 		return
 	}
 
-	fileHeaders, err := collectCodexAuthFileHeaders(c)
+	template, err := parseCodexChannelTemplate(templateRaw)
 	if err != nil {
 		common.APIRespondWithError(c, http.StatusOK, err)
 		return
@@ -75,23 +75,17 @@ func ImportCodexAuthFiles(c *gin.Context) {
 	template.Type = config.ChannelTypeCodex
 	template.CreatedTime = utils.GetTimestamp()
 
-	channels := make([]model.Channel, 0, len(fileHeaders))
-	for index, fileHeader := range fileHeaders {
-		parsed, err := parseUploadedCodexAuthFile(fileHeader)
-		if err != nil {
-			common.APIRespondWithError(c, http.StatusOK, fmt.Errorf("%s: %w", fileHeader.Filename, err))
-			return
-		}
-
+	channels := make([]model.Channel, 0, len(parsedFiles))
+	for index, parsed := range parsedFiles {
 		credentialsJSON, err := parsed.CredentialsJSON()
 		if err != nil {
-			common.APIRespondWithError(c, http.StatusOK, fmt.Errorf("%s: %w", fileHeader.Filename, err))
+			common.APIRespondWithError(c, http.StatusOK, fmt.Errorf("%s: %w", parsed.FileName, err))
 			return
 		}
 
 		channel := template
 		channel.Key = credentialsJSON
-		channel.Name = buildImportedCodexChannelName(template.Name, parsed, index, len(fileHeaders))
+		channel.Name = buildImportedCodexChannelName(template.Name, parsed, index, len(parsedFiles))
 		channels = append(channels, channel)
 	}
 
@@ -150,20 +144,71 @@ func hasConfiguredModels(models string) bool {
 	return false
 }
 
-func collectCodexAuthFileHeaders(c *gin.Context) ([]*multipart.FileHeader, error) {
-	form, err := c.MultipartForm()
+func readCodexAuthFilesImportParts(c *gin.Context) (string, []*codex.ParsedAuthFile, error) {
+	reader, err := c.Request.MultipartReader()
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse upload form: %w", err)
+		return "", nil, fmt.Errorf("failed to parse upload form: %w", err)
 	}
 
-	fileHeaders := make([]*multipart.FileHeader, 0)
-	fileHeaders = append(fileHeaders, form.File["files"]...)
-	fileHeaders = append(fileHeaders, form.File["file"]...)
-	if len(fileHeaders) == 0 {
-		return nil, fmt.Errorf("at least one auth file is required")
+	templateRaw := ""
+	parsedFiles := make([]*codex.ParsedAuthFile, 0)
+
+	for {
+		part, err := reader.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", nil, fmt.Errorf("failed to read upload form: %w", err)
+		}
+
+		formName := part.FormName()
+		fileName := part.FileName()
+
+		switch {
+		case formName == "channel" && fileName == "":
+			if templateRaw != "" {
+				_ = part.Close()
+				continue
+			}
+			data, err := io.ReadAll(part)
+			closeErr := part.Close()
+			if err != nil {
+				return "", nil, fmt.Errorf("failed to read channel template: %w", err)
+			}
+			if closeErr != nil {
+				return "", nil, fmt.Errorf("failed to close channel template part: %w", closeErr)
+			}
+			templateRaw = string(data)
+
+		case (formName == "files" || formName == "file") && fileName != "":
+			data, err := io.ReadAll(part)
+			closeErr := part.Close()
+			if err != nil {
+				return "", nil, fmt.Errorf("%s: failed to read auth file: %w", fileName, err)
+			}
+			if closeErr != nil {
+				return "", nil, fmt.Errorf("%s: failed to close auth file part: %w", fileName, closeErr)
+			}
+			parsed, err := parseCodexAuthFileBytes(data, fileName)
+			if err != nil {
+				return "", nil, fmt.Errorf("%s: %w", fileName, err)
+			}
+			parsedFiles = append(parsedFiles, parsed)
+
+		default:
+			_ = part.Close()
+		}
 	}
 
-	return fileHeaders, nil
+	if strings.TrimSpace(templateRaw) == "" {
+		return "", nil, fmt.Errorf("channel template is required")
+	}
+	if len(parsedFiles) == 0 {
+		return "", nil, fmt.Errorf("at least one auth file is required")
+	}
+
+	return templateRaw, parsedFiles, nil
 }
 
 func parseUploadedCodexAuthFile(fileHeader *multipart.FileHeader) (*codex.ParsedAuthFile, error) {
@@ -182,7 +227,11 @@ func parseUploadedCodexAuthFile(fileHeader *multipart.FileHeader) (*codex.Parsed
 		return nil, fmt.Errorf("failed to read auth file: %w", err)
 	}
 
-	return codex.ParseAuthFile(data, fileHeader.Filename)
+	return parseCodexAuthFileBytes(data, fileHeader.Filename)
+}
+
+func parseCodexAuthFileBytes(data []byte, filename string) (*codex.ParsedAuthFile, error) {
+	return codex.ParseAuthFile(data, filename)
 }
 
 func buildImportedCodexChannelName(baseName string, parsed *codex.ParsedAuthFile, index int, total int) string {

@@ -420,7 +420,14 @@ func BatchInsertChannels(channels []Channel) error {
 			return err
 		}
 	}
-	err := DB.Omit("UsedQuota").Create(&channels).Error
+
+	if len(channels) == 0 {
+		return nil
+	}
+
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		return tx.Omit("UsedQuota").CreateInBatches(&channels, 200).Error
+	})
 	if err != nil {
 		return err
 	}
