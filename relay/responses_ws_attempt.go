@@ -7,11 +7,12 @@ import (
 	"net/http"
 	"one-api/common"
 	"one-api/common/logger"
+	"one-api/common/responsesws"
 	"one-api/internal/billing"
+	"one-api/metrics"
 	"one-api/model"
 	providersBase "one-api/providers/base"
 	"one-api/relay/relay_util"
-	runtimesession "one-api/runtime/session"
 	"one-api/types"
 	"strings"
 	"time"
@@ -52,7 +53,7 @@ type ResponsesWSTurnAttemptInput struct {
 	Admission         *ResponsesWSTurnAdmission
 	Candidate         *ResponsesTurnAffinity
 	SelectedChannelID int
-	Session           runtimesession.RealtimeSession
+	Session           responsesws.Upstream
 	BillingModel      string
 	PromptModel       string
 	Request           *types.OpenAIResponsesRequest
@@ -60,7 +61,7 @@ type ResponsesWSTurnAttemptInput struct {
 }
 
 type responsesWSOpenResult struct {
-	Session       runtimesession.RealtimeSession
+	Session       responsesws.Upstream
 	Provider      providersBase.ProviderInterface
 	ProviderModel string
 	BillingModel  string
@@ -82,30 +83,34 @@ type SelectedChannelSnapshot struct {
 var openAndPrimeResponsesWSSessionForActor = openAndPrimeResponsesWSSessionWithContext
 
 type ResponsesWSTurnAttempt struct {
-	OpeningID              string
-	AttemptID              string
-	Admission              *ResponsesWSTurnAdmission
-	Candidate              *ResponsesTurnAffinity
-	SelectedChannelID      int
-	Session                runtimesession.RealtimeSession
-	Quota                  *relay_util.Quota
-	QuotaPreconsumed       bool
-	PreconsumeAttempted    bool
-	PreconsumeTruthApplied bool
-	PreconsumeCacheApplied bool
-	QuotaFinalized         bool
-	RolledBack             bool
-	RollbackErr            error
-	QuotaEventSinkAttached bool
-	CandidateBegun         bool
-	SendOutcome            ResponsesWSSendOutcome
-	Usage                  *types.Usage
-	BillingEvidence        BillingEvidence
-	StartedAt              time.Time
-	FirstResponseAt        time.Time
-	CompletedAt            time.Time
-	snapshot               *ResponsesWSRequestSnapshot
-	providerAPIErrorKeys   map[string]struct{}
+	OpeningID                   string
+	AttemptID                   string
+	Admission                   *ResponsesWSTurnAdmission
+	Candidate                   *ResponsesTurnAffinity
+	SelectedChannelID           int
+	Session                     responsesws.Upstream
+	Quota                       *relay_util.Quota
+	QuotaPreconsumed            bool
+	PreconsumeAttempted         bool
+	PreconsumeTruthApplied      bool
+	PreconsumeCacheApplied      bool
+	QuotaFinalized              bool
+	RolledBack                  bool
+	RollbackErr                 error
+	QuotaEventSinkAttached      bool
+	CandidateBegun              bool
+	TransportResult             responsesws.ResponsesWSTransportSendResult
+	AttemptedPreviousResponseID string
+	SeenProviderResponseID      string
+	Usage                       *types.Usage
+	TerminalEvidence            *ResponsesWSTerminalEvidence
+	TerminalUsage               *types.Usage
+	AppliedSettlement           *ResponsesWSAppliedSettlement
+	StartedAt                   time.Time
+	FirstResponseAt             time.Time
+	CompletedAt                 time.Time
+	snapshot                    *ResponsesWSRequestSnapshot
+	providerAPIErrorKeys        map[string]struct{}
 }
 
 func PrepareResponsesWSTurnAttempt(input ResponsesWSTurnAttemptInput) (*ResponsesWSTurnAttempt, *types.OpenAIErrorWithStatusCode) {
@@ -137,15 +142,16 @@ func PrepareResponsesWSTurnAttempt(input ResponsesWSTurnAttemptInput) (*Response
 	quota := relay_util.NewQuota(input.Context, input.BillingModel, promptTokens)
 	quota.SetLogProtocol(relay_util.LogProtocolResponsesWS)
 	return &ResponsesWSTurnAttempt{
-		OpeningID:         input.OpeningID,
-		Admission:         input.Admission,
-		Candidate:         input.Candidate,
-		SelectedChannelID: input.SelectedChannelID,
-		Session:           input.Session,
-		Quota:             quota,
-		Usage:             usage,
-		StartedAt:         startedAt,
-		snapshot:          snapshot.Clone(),
+		OpeningID:                   input.OpeningID,
+		Admission:                   input.Admission,
+		Candidate:                   input.Candidate,
+		SelectedChannelID:           input.SelectedChannelID,
+		Session:                     input.Session,
+		Quota:                       quota,
+		AttemptedPreviousResponseID: strings.TrimSpace(input.Request.PreviousResponseID),
+		Usage:                       usage,
+		StartedAt:                   startedAt,
+		snapshot:                    snapshot.Clone(),
 	}, nil
 }
 
@@ -165,10 +171,13 @@ func (a *ResponsesWSTurnAttempt) BeginCandidate(actor *ResponsesWSSessionActor) 
 	}
 	a.AttemptID = uuid.NewString()
 	a.CandidateBegun = true
-	actor.pendingAttempt = a
-	actor.pendingProviderEvents = nil
-	actor.pendingProviderBytes = 0
-	actor.pendingProviderEvidenceSeen = false
+	actor.clearPendingProviderState("begin_candidate")
+	pending := actor.turns.pending
+	pending.attempt = a
+	pending.openingID = a.OpeningID
+	if err := actor.turns.AttachPending(pending); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -176,7 +185,14 @@ func (a *ResponsesWSTurnAttempt) PreConsumeQuota() *types.OpenAIErrorWithStatusC
 	if a == nil || a.Quota == nil {
 		return common.StringErrorWrapperLocal("quota transaction is required", "quota_transaction_missing", http.StatusInternalServerError)
 	}
+	a.Quota.ForcePreConsume()
+	startedAt := time.Now()
 	err := a.Quota.PreQuotaConsumptionRollbackable()
+	outcome := "success"
+	if err != nil {
+		outcome = "error"
+	}
+	metrics.RecordResponsesWSPreconsumeForced(outcome, time.Since(startedAt), a.Quota.PreConsumedQuota())
 	a.PreconsumeAttempted = true
 	if a.Quota.HasPreConsumedSideEffect() {
 		a.QuotaPreconsumed = true
@@ -190,29 +206,56 @@ func (a *ResponsesWSTurnAttempt) CommitLocalWriteOK() {
 	if a == nil {
 		return
 	}
-	a.SendOutcome = SendOutcomeLocalWriteOK
+	a.TransportResult = responsesws.ResponsesWSTransportSendResult{Status: responsesws.ResponsesWSTransportSendAttempted}
 }
 
 func (a *ResponsesWSTurnAttempt) CommitAmbiguousAdmission(reason string) {
 	if a == nil {
 		return
 	}
-	_ = reason
-	a.SendOutcome = SendOutcomeAmbiguous
+	err := errors.New("responses websocket transport send ambiguous")
+	if strings.TrimSpace(reason) != "" {
+		err = errors.New(reason)
+	}
+	a.TransportResult = responsesws.ResponsesWSTransportSendResult{Status: responsesws.ResponsesWSTransportSendAmbiguous, Err: err}
 }
 
-func (a *ResponsesWSTurnAttempt) MarkProviderUsageSeen() {
+func (a *ResponsesWSTurnAttempt) MarkProviderTerminalEvidence(classified responsesws.ResponsesTerminalResult) {
 	if a == nil {
 		return
 	}
-	a.BillingEvidence = BillingEvidenceProviderUsageSeen
+	terminalUsage := responsesWSTerminalUsageSnapshot(classified.Response)
+	hasTerminalUsage := classified.Response != nil && classified.Response.Usage != nil
+	billableQuota := int64(0)
+	if hasTerminalUsage && a.Quota != nil {
+		billableQuota = int64(a.Quota.GetTotalQuotaByUsage(terminalUsage))
+	}
+	responseID := ""
+	if classified.Response != nil {
+		responseID = classified.Response.ID
+	}
+	a.TerminalUsage = terminalUsage
+	a.TerminalEvidence = &ResponsesWSTerminalEvidence{
+		Kind:             classified.Kind,
+		ResponseID:       responseID,
+		HasTerminalUsage: hasTerminalUsage,
+		BillableQuota:    billableQuota,
+	}
 }
 
-func (a *ResponsesWSTurnAttempt) MarkProviderAcceptedTurnEvidence() {
-	if a == nil || a.BillingEvidence == BillingEvidenceProviderUsageSeen {
-		return
+func (a *ResponsesWSTurnAttempt) RememberProviderResponseID(responseID string) bool {
+	if a == nil {
+		return true
 	}
-	a.BillingEvidence = BillingEvidenceProviderAcceptedTurnEvidence
+	responseID = strings.TrimSpace(responseID)
+	if responseID == "" {
+		return true
+	}
+	if a.SeenProviderResponseID == "" {
+		a.SeenProviderResponseID = responseID
+		return true
+	}
+	return a.SeenProviderResponseID == responseID
 }
 
 func (a *ResponsesWSTurnAttempt) MarkFirstProviderResponse(now time.Time) {
@@ -273,49 +316,145 @@ func (a *ResponsesWSTurnAttempt) RollbackBeforeLocalWriteOK(reason string) error
 	return nil
 }
 
-func (a *ResponsesWSTurnAttempt) FinalizeQuota(c *gin.Context) {
+func (a *ResponsesWSTurnAttempt) ApplyResponsesWSSettlementDecision(c *gin.Context, decision ResponsesWSSettlementDecision) (ResponsesWSAppliedSettlement, error) {
+	applied := ResponsesWSAppliedSettlement{
+		Action:             decision.Action,
+		Basis:              decision.Basis,
+		ExpectedFinalQuota: decision.ExpectedFinalQuota,
+	}
+	if a == nil {
+		return applied, errors.New("responses websocket attempt is required")
+	}
+	attemptID := strings.TrimSpace(a.AttemptID)
+	if attemptID == "" {
+		return applied, errors.New("responses websocket attempt id is required for settlement")
+	}
+	applied.AttemptID = attemptID
 	if c == nil {
 		c = a.Context()
 	}
-	a.finalizeQuota(c, false)
+
+	switch decision.Action {
+	case ResponsesWSSettlementRollbackReserve:
+		if decision.ExpectedFinalQuota != 0 {
+			return applied, fmt.Errorf("responses websocket rollback settlement must expect zero final quota, got %d", decision.ExpectedFinalQuota)
+		}
+		if a.QuotaFinalized {
+			return applied, errors.New("cannot rollback a finalized responses websocket attempt")
+		}
+		if a.RolledBack {
+			if a.AppliedSettlement == nil {
+				return applied, errors.New("responses websocket rolled back attempt is missing applied settlement")
+			}
+			stored := *a.AppliedSettlement
+			if stored.Action != ResponsesWSSettlementRollbackReserve ||
+				stored.Basis != decision.Basis ||
+				stored.ExpectedFinalQuota != 0 ||
+				stored.AppliedFinalQuota != 0 {
+				return applied, errors.New("responses websocket duplicate rollback settlement mismatch")
+			}
+			return stored, nil
+		}
+		if err := a.RollbackBeforeLocalWriteOK("settlement_rollback"); err != nil {
+			return applied, err
+		}
+		applied.AppliedFinalQuota = 0
+		a.AppliedSettlement = cloneResponsesWSAppliedSettlement(applied)
+		metrics.RecordResponsesWSPreconsumeSettlement("rollback")
+		return applied, nil
+	case ResponsesWSSettlementFinalizeExactUsage,
+		ResponsesWSSettlementFinalizeFloor,
+		ResponsesWSSettlementFinalizeObservedOrFloor:
+		if a.QuotaFinalized {
+			if a.AppliedSettlement == nil {
+				return applied, errors.New("responses websocket finalized attempt is missing applied settlement")
+			}
+			stored := *a.AppliedSettlement
+			if stored.ExpectedFinalQuota != decision.ExpectedFinalQuota ||
+				stored.AppliedFinalQuota != decision.ExpectedFinalQuota ||
+				stored.Action != decision.Action ||
+				stored.Basis != decision.Basis {
+				return applied, fmt.Errorf("responses websocket duplicate settlement mismatch: expected_final_quota=%d stored_expected=%d stored_applied=%d", decision.ExpectedFinalQuota, stored.ExpectedFinalQuota, stored.AppliedFinalQuota)
+			}
+			return stored, nil
+		}
+		if a.RolledBack {
+			return applied, errors.New("cannot finalize a rolled back responses websocket attempt")
+		}
+		if a.Quota == nil {
+			return applied, errors.New("responses websocket quota is required for final settlement")
+		}
+		if a.Quota.ModelName() == "" {
+			return applied, errors.New("responses websocket quota model is required for final settlement")
+		}
+		if decision.ExpectedFinalQuota == 0 &&
+			decision.Basis != ResponsesWSSettlementBasisTerminalUsage &&
+			responsesWSSettlementHasFlag(decision, ResponsesWSSettlementFlagMissingSettlementFloor) {
+			err := errors.New("responses websocket settlement missing floor for billable uncertain path")
+			logger.LogError(responsesWSAttemptLogContext(c, a), err.Error())
+			return applied, err
+		}
+		identity := a.settlementIdentity()
+		a.SeedQuotaTiming(time.Now())
+		usage := a.settlementUsageForDecision(decision)
+		appliedQuota, settlementIdentity, err := a.Quota.ConsumeFixedFinalQuotaWithUsageIdentity(c, decision.ExpectedFinalQuota, usage, billing.SettlementRequestKindRealtimeTurn, identity, identity != "")
+		applied.AppliedFinalQuota = appliedQuota
+		applied.SettlementIdentity = settlementIdentity
+		if err != nil {
+			return applied, err
+		}
+		if appliedQuota != decision.ExpectedFinalQuota {
+			err := fmt.Errorf("responses websocket settlement mismatch: expected_final_quota=%d applied_final_quota=%d", decision.ExpectedFinalQuota, appliedQuota)
+			logger.LogError(responsesWSAttemptLogContext(c, a), err.Error())
+			return applied, err
+		}
+		a.QuotaFinalized = true
+		a.QuotaPreconsumed = false
+		a.PreconsumeTruthApplied = false
+		a.PreconsumeCacheApplied = false
+		a.AppliedSettlement = cloneResponsesWSAppliedSettlement(applied)
+		metrics.RecordResponsesWSPreconsumeSettlement("finalize")
+		return applied, nil
+	case ResponsesWSSettlementNoop:
+		return applied, errors.New("responses websocket settlement noop is not executable")
+	default:
+		return applied, fmt.Errorf("unsupported responses websocket settlement action: %d", decision.Action)
+	}
 }
 
-func (a *ResponsesWSTurnAttempt) FinalizeQuotaPreservingPreConsumed(c *gin.Context) {
-	if c == nil {
-		c = a.Context()
+func responsesWSAttemptLogContext(c *gin.Context, attempt *ResponsesWSTurnAttempt) context.Context {
+	if c == nil && attempt != nil {
+		c = attempt.Context()
 	}
-	a.finalizeQuota(c, true)
+	if c != nil && c.Request != nil {
+		return c.Request.Context()
+	}
+	return context.Background()
 }
 
-func (a *ResponsesWSTurnAttempt) finalizeQuota(c *gin.Context, preservePreConsumed bool) {
-	if a == nil || a.Quota == nil || a.QuotaFinalized || a.RolledBack {
-		return
+func (a *ResponsesWSTurnAttempt) settlementUsageForDecision(decision ResponsesWSSettlementDecision) *types.Usage {
+	if a == nil {
+		return nil
 	}
-	hasUsage := responsesWSUsageHasBillableEvidence(a.Usage)
-	identity := a.settlementIdentity()
-	a.SeedQuotaTiming(time.Now())
-	if preservePreConsumed && !hasUsage {
-		// Trade-off: once a turn has reached a send/active state, absence of a
-		// terminal usage frame is not proof that the provider did no work. Keep
-		// the pre-consumed floor to avoid making ambiguous completed work free;
-		// explicit NotSent/pre-send paths still rollback before finalization.
-		if err := a.Quota.ConsumeAtLeastPreConsumedWithIdentity(c, a.Usage, true, billing.SettlementRequestKindRealtimeTurn, identity, identity != ""); err != nil {
-			logger.LogError(context.Background(), "responses websocket quota floor settlement failed: "+err.Error())
-		}
-	} else {
-		if err := a.Quota.ConsumeWithIdentity(c, a.Usage, true, billing.SettlementRequestKindRealtimeTurn, identity, identity != ""); err != nil {
-			logger.LogError(context.Background(), "responses websocket quota settlement failed: "+err.Error())
+	switch decision.Action {
+	case ResponsesWSSettlementFinalizeExactUsage:
+		return cloneResponsesWSUsage(a.TerminalUsage)
+	case ResponsesWSSettlementFinalizeObservedOrFloor:
+		if responsesWSUsageHasBillableEvidence(a.Usage) {
+			return cloneResponsesWSUsage(a.Usage)
 		}
 	}
-	a.QuotaFinalized = true
+	return nil
+}
+
+func cloneResponsesWSAppliedSettlement(applied ResponsesWSAppliedSettlement) *ResponsesWSAppliedSettlement {
+	cloned := applied
+	return &cloned
 }
 
 func (a *ResponsesWSTurnAttempt) settlementIdentity() string {
 	if a == nil {
 		return ""
-	}
-	if a.AttemptID == "" {
-		a.AttemptID = uuid.NewString()
 	}
 	parts := make([]string, 0, 3)
 	if a.OpeningID != "" {

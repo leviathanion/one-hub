@@ -13,16 +13,22 @@ import (
 )
 
 var (
-	httpRequestsTotal        *prometheus.CounterVec
-	httpRequestDuration      *prometheus.HistogramVec
-	providerCounter          *prometheus.CounterVec
-	panicCounter             *prometheus.CounterVec
-	requestBodyDecodeCounter *prometheus.CounterVec
-	requestBodyDecodedBytes  *prometheus.HistogramVec
-	responsesWSConnectLimit  *prometheus.CounterVec
-	responsesWSRedisFallback *prometheus.CounterVec
-	usageObservedUnbilled    *prometheus.CounterVec
-	requestBodyDecodeOnce    sync.Once
+	httpRequestsTotal             *prometheus.CounterVec
+	httpRequestDuration           *prometheus.HistogramVec
+	providerCounter               *prometheus.CounterVec
+	panicCounter                  *prometheus.CounterVec
+	requestBodyDecodeCounter      *prometheus.CounterVec
+	requestBodyDecodedBytes       *prometheus.HistogramVec
+	responsesWSConnectLimit       *prometheus.CounterVec
+	responsesWSRedisFallback      *prometheus.CounterVec
+	responsesWSEventPostTimeout   *prometheus.CounterVec
+	responsesWSPreconsumeForced   *prometheus.CounterVec
+	responsesWSPreconsumeLatency  *prometheus.HistogramVec
+	responsesWSPreconsumeFloor    *prometheus.HistogramVec
+	responsesWSPreconsumeSettle   *prometheus.CounterVec
+	responsesWSSettlementConflict *prometheus.CounterVec
+	usageObservedUnbilled         *prometheus.CounterVec
+	requestBodyDecodeOnce         sync.Once
 )
 
 func requestBodyDecodedBytesBuckets() []float64 {
@@ -98,6 +104,50 @@ func init() {
 			Help: "Total number of Responses WebSocket connection limiter fail-open fallbacks from Redis to in-process storage.",
 		},
 		[]string{"reason"},
+	)
+	responsesWSEventPostTimeout = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "responses_ws_event_post_timeout_total",
+			Help: "Total number of bounded reliable Responses WebSocket actor event post timeouts.",
+		},
+		[]string{"event_type"},
+	)
+	responsesWSPreconsumeForced = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "responses_ws_preconsume_forced_total",
+			Help: "Total number of Responses WebSocket attempts that force quota pre-consumption.",
+		},
+		[]string{"outcome"},
+	)
+	responsesWSPreconsumeLatency = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "responses_ws_preconsume_latency_ms",
+			Help:    "Latency of Responses WebSocket forced quota pre-consumption in milliseconds.",
+			Buckets: []float64{1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000},
+		},
+		[]string{"outcome"},
+	)
+	responsesWSPreconsumeFloor = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "responses_ws_preconsume_floor_quota",
+			Help:    "Pre-consumed floor quota for Responses WebSocket attempts.",
+			Buckets: prometheus.ExponentialBuckets(1, 2, 18),
+		},
+		[]string{"outcome"},
+	)
+	responsesWSPreconsumeSettle = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "responses_ws_preconsume_settlement_total",
+			Help: "Total number of Responses WebSocket pre-consume reserve settlements.",
+		},
+		[]string{"action"},
+	)
+	responsesWSSettlementConflict = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "responses_ws_settlement_conflict_total",
+			Help: "Total number of Responses WebSocket settlement evidence conflicts.",
+		},
+		[]string{"kind"},
 	)
 	usageObservedUnbilled = promauto.NewCounterVec(
 		prometheus.CounterOpts{
@@ -188,6 +238,34 @@ func RecordResponsesWSConnectionRateLimited(group, credentialKind string) {
 func RecordResponsesWSConnectionLimiterRedisFallback(reason string) {
 	SafelyRecordMetric(func() {
 		responsesWSRedisFallback.WithLabelValues(reason).Inc()
+	})
+}
+
+func RecordResponsesWSEventPostTimeout(eventType string) {
+	SafelyRecordMetric(func() {
+		responsesWSEventPostTimeout.WithLabelValues(eventType).Inc()
+	})
+}
+
+func RecordResponsesWSPreconsumeForced(outcome string, latency time.Duration, floorQuota int) {
+	SafelyRecordMetric(func() {
+		responsesWSPreconsumeForced.WithLabelValues(outcome).Inc()
+		responsesWSPreconsumeLatency.WithLabelValues(outcome).Observe(float64(latency.Milliseconds()))
+		if floorQuota > 0 {
+			responsesWSPreconsumeFloor.WithLabelValues(outcome).Observe(float64(floorQuota))
+		}
+	})
+}
+
+func RecordResponsesWSPreconsumeSettlement(action string) {
+	SafelyRecordMetric(func() {
+		responsesWSPreconsumeSettle.WithLabelValues(action).Inc()
+	})
+}
+
+func RecordResponsesWSSettlementConflict(kind string) {
+	SafelyRecordMetric(func() {
+		responsesWSSettlementConflict.WithLabelValues(kind).Inc()
 	})
 }
 

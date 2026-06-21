@@ -2,11 +2,13 @@ package openai
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/requester"
+	"one-api/common/responsesws"
 	"one-api/common/utils"
 	providersBase "one-api/providers/base"
 	"one-api/types"
@@ -99,6 +101,107 @@ func (p *OpenAIProvider) CreateResponsesStream(request *types.OpenAIResponsesReq
 	}
 	defer req.Body.Close()
 
+	return p.createResponsesStreamFromRequest(req, request)
+}
+
+func (p *OpenAIProvider) CreateResponsesStreamRaw(ctx context.Context, model string, body map[string]json.RawMessage, request *types.OpenAIResponsesRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+	fullRequestURL, errWithCode := p.responsesHTTPBridgeRequestURL(model)
+	if errWithCode != nil {
+		return nil, errWithCode
+	}
+	if err := p.validateResponsesWSHTTPBridgeURL(ctx, fullRequestURL); err != nil {
+		return nil, common.StringErrorWrapperLocal(err.Error(), "ws_request_failed", requester.UpstreamResponsesHTTPURLStatusCode(err))
+	}
+	headers := p.requestHeaders(openAIRequestAuthBearer)
+	req, errWithCode := p.buildResponsesHTTPBridgeRequest(body, fullRequestURL, headers, model)
+	if errWithCode != nil {
+		return nil, markHTTPBridgePreSendLocalError(errWithCode)
+	}
+	if ctx != nil {
+		req = req.WithContext(ctx)
+	}
+	defer req.Body.Close()
+
+	stream, errWithCode := p.createResponsesHTTPBridgeStreamFromRequestWithOptions(req, request, responsesHTTPBridgeStreamReadOptions())
+	if errWithCode != nil {
+		return nil, responsesws.MarkHTTPBridgeTransportError(errWithCode)
+	}
+	return stream, nil
+}
+
+func markHTTPBridgePreSendLocalError(errWithStatus *types.OpenAIErrorWithStatusCode) *types.OpenAIErrorWithStatusCode {
+	if errWithStatus != nil {
+		errWithStatus.LocalError = true
+	}
+	return errWithStatus
+}
+
+func (p *OpenAIProvider) responsesHTTPBridgeRequestURL(model string) (string, *types.OpenAIErrorWithStatusCode) {
+	url, errWithCode := p.GetSupportedAPIUri(config.RelayModeResponses)
+	if errWithCode != nil {
+		return "", errWithCode
+	}
+	if errWithCode := p.validateAzureClassicAPIVersionForRequest(); errWithCode != nil {
+		return "", errWithCode
+	}
+	return p.GetFullRequestURL(url, model), nil
+}
+
+func responsesHTTPBridgeStreamReadOptions() requester.StreamReadOptions {
+	return requester.StreamReadOptions{MaxLineBytes: config.RealtimeWebsocketReadLimit()}
+}
+
+func (p *OpenAIProvider) buildResponsesHTTPBridgeRequest(body map[string]json.RawMessage, fullRequestURL string, headers map[string]string, model string) (*http.Request, *types.OpenAIErrorWithStatusCode) {
+	requestMap, err := rawMessageBodyToInterfaceMap(body)
+	if err != nil {
+		return nil, common.ErrorWrapper(err, "decode_request_failed", http.StatusInternalServerError)
+	}
+	if requestMap == nil {
+		requestMap = make(map[string]interface{})
+	}
+	customParams, err := p.CustomParameterHandler()
+	if err != nil {
+		return nil, common.ErrorWrapper(err, "custom_parameter_error", http.StatusInternalServerError)
+	}
+	if customParams != nil {
+		requestMap = p.MergeCustomParams(requestMap, customParams, model)
+	}
+	if err := responsesws.NormalizeResponsesHTTPBridgeRequestMap(requestMap); err != nil {
+		return nil, common.StringErrorWrapperLocal(err.Error(), "unsupported_responses_ws_bridge_field", http.StatusBadRequest)
+	}
+	requestBytes, err := json.Marshal(requestMap)
+	if err != nil {
+		return nil, common.ErrorWrapper(err, "marshal_request_failed", http.StatusInternalServerError)
+	}
+	req, err := p.Requester.NewRequest(http.MethodPost, fullRequestURL, p.Requester.WithBody(requestBytes), p.Requester.WithHeader(headers))
+	if err != nil {
+		return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
+	}
+	return req, nil
+}
+
+func rawMessageBodyToInterfaceMap(body map[string]json.RawMessage) (map[string]interface{}, error) {
+	if body == nil {
+		return nil, nil
+	}
+	converted := make(map[string]interface{}, len(body))
+	for key, value := range body {
+		var decoded interface{}
+		decoder := json.NewDecoder(bytes.NewReader(value))
+		decoder.UseNumber()
+		if err := decoder.Decode(&decoded); err != nil {
+			return nil, err
+		}
+		converted[key] = decoded
+	}
+	return converted, nil
+}
+
+func (p *OpenAIProvider) createResponsesStreamFromRequest(req *http.Request, request *types.OpenAIResponsesRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+	return p.createResponsesStreamFromRequestWithOptions(req, request, requester.StreamReadOptions{})
+}
+
+func (p *OpenAIProvider) createResponsesStreamFromRequestWithOptions(req *http.Request, request *types.OpenAIResponsesRequest, options requester.StreamReadOptions) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
 	// 发送请求
 	resp, errWithCode := p.Requester.SendRequestRaw(req)
 	if errWithCode != nil {
@@ -112,10 +215,29 @@ func (p *OpenAIProvider) CreateResponsesStream(request *types.OpenAIResponsesReq
 	}
 
 	if request.ConvertChat {
-		return requester.RequestStream(p.Requester, resp, chatHandler.HandlerChatStream)
+		return requester.RequestStreamWithOptions(p.Requester, resp, chatHandler.HandlerChatStream, options)
 	}
 
-	return requester.RequestNoTrimStream(p.Requester, resp, chatHandler.HandlerResponsesStream)
+	return requester.RequestNoTrimStreamWithEmitterOptions(p.Requester, resp, chatHandler.HandlerResponsesStreamWithEmitter, options)
+}
+
+func (p *OpenAIProvider) createResponsesHTTPBridgeStreamFromRequestWithOptions(req *http.Request, request *types.OpenAIResponsesRequest, options requester.StreamReadOptions) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+	resp, errWithCode := p.Requester.SendResponsesHTTPBridgeRaw(req, p.responsesHTTPBridgeSecurity())
+	if errWithCode != nil {
+		return nil, errWithCode
+	}
+
+	chatHandler := OpenAIResponsesStreamHandler{
+		Usage:  p.Usage,
+		Prefix: `data: `,
+		Model:  request.Model,
+	}
+
+	if request.ConvertChat {
+		return requester.RequestStreamWithOptions(p.Requester, resp, chatHandler.HandlerChatStream, options)
+	}
+
+	return requester.RequestNoTrimStreamWithEmitterOptions(p.Requester, resp, chatHandler.HandlerResponsesStreamWithEmitter, options)
 }
 
 func (p *OpenAIProvider) CompactResponses(request *types.OpenAIResponsesRequest) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
@@ -150,6 +272,9 @@ func (p *OpenAIProvider) CompactResponses(request *types.OpenAIResponsesRequest)
 func (p *OpenAIProvider) buildCompactResponsesRequest(request *types.OpenAIResponsesRequest) (*http.Request, *types.OpenAIErrorWithStatusCode) {
 	basePath, errWithCode := p.GetSupportedAPIUri(config.RelayModeResponses)
 	if errWithCode != nil {
+		return nil, errWithCode
+	}
+	if errWithCode := p.validateAzureClassicAPIVersionForRequest(); errWithCode != nil {
 		return nil, errWithCode
 	}
 
@@ -262,24 +387,35 @@ func collectJSONFieldNames(t reflect.Type) map[string]bool {
 }
 
 func (h *OpenAIResponsesStreamHandler) HandlerResponsesStream(rawLine *[]byte, dataChan chan string, errChan chan error) {
+	h.handleResponsesStream(rawLine, func(data string) bool {
+		dataChan <- data
+		return true
+	})
+}
+
+func (h *OpenAIResponsesStreamHandler) HandlerResponsesStreamWithEmitter(rawLine *[]byte, emitter requester.StreamEmitter[string]) {
+	h.handleResponsesStream(rawLine, emitter.SendData)
+}
+
+func (h *OpenAIResponsesStreamHandler) handleResponsesStream(rawLine *[]byte, sendData func(string) bool) {
 	rawStr := string(*rawLine)
 
 	// 如果rawLine 前缀不为data:，则直接返回
 	if !strings.HasPrefix(rawStr, h.Prefix) {
-		dataChan <- rawStr
+		sendData(rawStr)
 		return
 	}
 
 	noSpaceLine := bytes.TrimSpace(*rawLine)
 	if !bytes.HasPrefix(noSpaceLine, responsesDataPrefix) {
-		dataChan <- rawStr
+		sendData(rawStr)
 		return
 	}
 
 	payload := bytes.TrimSpace(noSpaceLine[len(responsesDataPrefix):])
 
 	if len(payload) == 0 || bytes.Equal(payload, responsesDonePayload) {
-		dataChan <- rawStr
+		sendData(rawStr)
 		return
 	}
 
@@ -287,19 +423,19 @@ func (h *OpenAIResponsesStreamHandler) HandlerResponsesStream(rawLine *[]byte, d
 		Type string `json:"type"`
 	}
 	if err := json.Unmarshal(payload, &eventMeta); err != nil || eventMeta.Type == "" {
-		dataChan <- rawStr
+		sendData(rawStr)
 		return
 	}
 
 	if !shouldTrackResponsesUsageByType(eventMeta.Type) {
-		dataChan <- rawStr
+		sendData(rawStr)
 		return
 	}
 
 	var openaiResponse responsesUsageEvent
 	if err := json.Unmarshal(payload, &openaiResponse); err != nil {
 		// Usage tracking should not break stream passthrough.
-		dataChan <- rawStr
+		sendData(rawStr)
 		return
 	}
 
@@ -342,7 +478,7 @@ func (h *OpenAIResponsesStreamHandler) HandlerResponsesStream(rawLine *[]byte, d
 		}
 	}
 
-	dataChan <- rawStr
+	sendData(rawStr)
 }
 
 func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataChan chan string, errChan chan error) {

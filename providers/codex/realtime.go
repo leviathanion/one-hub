@@ -25,8 +25,9 @@ const codexRealtimeMalformedPayloadLogLimit = 4096
 const codexRealtimeDiagnosticValueLogLimit = 4096
 
 type codexRealtimeConnPlan struct {
-	wsURL   string
-	headers map[string]string
+	wsURL           string
+	headers         map[string]string
+	allowSelfHosted bool
 }
 
 func (p *CodexProvider) createChatRealtimeConn(modelName, sessionID string) (*wsconn.ManagedConn, *types.OpenAIErrorWithStatusCode) {
@@ -44,6 +45,10 @@ func (p *CodexProvider) createChatRealtimeConnWithContext(ctx context.Context, m
 }
 
 func (p *CodexProvider) prepareChatRealtimeConn(modelName, sessionID string) (*codexRealtimeConnPlan, *types.OpenAIErrorWithStatusCode) {
+	return p.prepareChatRealtimeConnWithSelfHosted(modelName, sessionID, p.codexRealtimeSelfHosted())
+}
+
+func (p *CodexProvider) prepareChatRealtimeConnWithSelfHosted(modelName, sessionID string, allowSelfHosted bool) (*codexRealtimeConnPlan, *types.OpenAIErrorWithStatusCode) {
 	urlPath, errWithCode := p.GetSupportedAPIUri(config.RelayModeChatRealtime)
 	if errWithCode != nil {
 		return nil, errWithCode
@@ -51,7 +56,7 @@ func (p *CodexProvider) prepareChatRealtimeConn(modelName, sessionID string) (*c
 
 	httpURL := p.GetFullRequestURL(urlPath, modelName)
 	proxyAddr := channelProxyValue(p.Channel)
-	wsURL, err := buildCodexRealtimeURLWithPolicy(httpURL, p.codexRealtimeSelfHosted(), proxyAddr == "")
+	wsURL, err := buildCodexRealtimeURLWithPolicy(httpURL, allowSelfHosted, proxyAddr == "")
 	if err != nil {
 		return nil, common.StringErrorWrapperLocal(err.Error(), "ws_request_failed", requester.UpstreamRealtimeURLStatusCode(err))
 	}
@@ -62,8 +67,9 @@ func (p *CodexProvider) prepareChatRealtimeConn(modelName, sessionID string) (*c
 	}
 
 	return &codexRealtimeConnPlan{
-		wsURL:   wsURL,
-		headers: headers,
+		wsURL:           wsURL,
+		headers:         headers,
+		allowSelfHosted: allowSelfHosted,
 	}, nil
 }
 
@@ -80,7 +86,7 @@ func (p *CodexProvider) dialChatRealtimeConnWithContext(ctx context.Context, pla
 
 	dialCtx, cancel := codexRealtimeDialContext(ctx)
 	defer cancel()
-	wsConn, err := wsconn.DialManaged(dialCtx, plan.wsURL, codexRealtimeHTTPHeader(plan.headers), codexRealtimeWSConfig(), codexRealtimeDialOptions(channelProxyValue(p.Channel), p.codexRealtimeSelfHosted())...)
+	wsConn, err := wsconn.DialManaged(dialCtx, plan.wsURL, codexRealtimeHTTPHeader(plan.headers), codexRealtimeWSConfig(), codexRealtimeDialOptions(channelProxyValue(p.Channel), plan.allowSelfHosted)...)
 	if err != nil {
 		return nil, mapCodexRealtimeWSDialError(err)
 	}
@@ -253,6 +259,23 @@ func (p *CodexProvider) codexRealtimeSelfHosted() bool {
 	if p == nil {
 		return false
 	}
+	if p.Context != nil && p.Context.GetBool("self_hosted") {
+		return true
+	}
+	if p.Channel == nil {
+		return false
+	}
+	other, err := p.Channel.GetOtherMap()
+	if err != nil {
+		return false
+	}
+	return codexRawJSONBool(other["self_hosted"])
+}
+
+func (p *CodexProvider) codexResponsesWSSelfHosted() bool {
+	if p == nil {
+		return false
+	}
 	if p.Context != nil && p.Context.GetBool("responses_ws_self_hosted") {
 		return true
 	}
@@ -263,12 +286,15 @@ func (p *CodexProvider) codexRealtimeSelfHosted() bool {
 	if err != nil {
 		return false
 	}
-	for _, key := range []string{"responses_ws_self_hosted", "self_hosted"} {
-		if raw, ok := other[key]; ok && strings.EqualFold(strings.TrimSpace(string(raw)), "true") {
-			return true
-		}
+	return codexRawJSONBool(other["responses_ws_self_hosted"])
+}
+
+func codexRawJSONBool(raw json.RawMessage) bool {
+	var value bool
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return false
 	}
-	return false
+	return value
 }
 
 var codexRealtimeCompatibilityHeaderKeys = []string{
@@ -381,10 +407,15 @@ func codexRealtimeUsageEvent(response *types.OpenAIResponsesResponses, accumulat
 }
 
 func (p *CodexProvider) handleRealtimeSupplierMessage(messageType wsconn.MessageType, message []byte, accumulator *codexTurnUsageAccumulator, modelName string) (bool, *types.UsageEvent, []byte, error) {
+	// wsconn.MessageType belongs at the realtime wire boundary. ResponsesWS
+	// adapters should call handleRealtimeSupplierPayload directly.
 	if messageType != wsconn.TextMessage {
 		return true, nil, nil, nil
 	}
+	return p.handleRealtimeSupplierPayload(message, accumulator, modelName)
+}
 
+func (p *CodexProvider) handleRealtimeSupplierPayload(message []byte, accumulator *codexTurnUsageAccumulator, modelName string) (bool, *types.UsageEvent, []byte, error) {
 	var event types.OpenAIResponsesStreamResponses
 	if err := json.Unmarshal(message, &event); err != nil {
 		logger.LogError(context.Background(), "codex realtime supplier message unmarshal failed: "+err.Error()+" payload="+codexRealtimePayloadSnippet(message))

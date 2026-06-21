@@ -7,8 +7,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -16,8 +18,11 @@ import (
 	"one-api/common/authutil"
 	"one-api/common/config"
 	"one-api/common/logger"
+	"one-api/common/requester"
+	"one-api/common/responsesws"
 	"one-api/common/wsconn"
 	"one-api/common/wsconn/wstest"
+	runtimerealtime "one-api/runtime/realtime"
 	runtimesession "one-api/runtime/session"
 	"one-api/types"
 
@@ -28,6 +33,48 @@ import (
 func codexRealtimeTestWriteTimeout() func() time.Duration {
 	timeout := config.RealtimeWebsocketWriteTimeout()
 	return func() time.Duration { return timeout }
+}
+
+func TestCodexResponsesWSAdapterMapsProviderCloseOnlyForPeerClose(t *testing.T) {
+	adapter := &codexResponsesWSAdapter{}
+	cases := []struct {
+		name string
+		info responsesws.ProviderCloseInfo
+		want bool
+	}{
+		{
+			name: "peer close",
+			info: responsesws.ProviderCloseInfo{Kind: responsesws.ProviderCloseKindPeerClose, Code: int(wsconn.CloseNormalClosure), Reason: "done"},
+			want: true,
+		},
+		{
+			name: "unknown with code and reason",
+			info: responsesws.ProviderCloseInfo{Kind: responsesws.ProviderCloseKindUnknown, Code: int(wsconn.CloseNormalClosure), Reason: "done"},
+		},
+		{
+			name: "unknown close error",
+			info: responsesws.ProviderCloseInfo{Kind: responsesws.ProviderCloseKindUnknown, Err: &wsconn.CloseError{Code: wsconn.CloseNormalClosure, Reason: "done"}},
+		},
+		{
+			name: "write error",
+			info: responsesws.ProviderCloseInfo{Kind: responsesws.ProviderCloseKindWriteError, Code: int(wsconn.CloseNormalClosure), Reason: "local write failed"},
+		},
+		{
+			name: "normal local close",
+			info: responsesws.ProviderCloseInfo{Kind: responsesws.ProviderCloseKindNormal, Code: int(wsconn.CloseNormalClosure), Reason: "local normal"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := adapter.MapProviderClose(context.Background(), tc.info)
+			if got := result.ProviderClose != nil; got != tc.want {
+				t.Fatalf("provider close mapping mismatch: got %v want %v result=%+v", got, tc.want, result)
+			}
+			if tc.want && result.Origin != responsesws.RecvDetailOriginNativeProviderClose {
+				t.Fatalf("expected native provider close origin, got %+v", result)
+			}
+		})
+	}
 }
 
 func newCodexRealtimeConnPair(t *testing.T) (*wsconn.ManagedConn, func()) {
@@ -79,7 +126,7 @@ func TestCodexRealtimeSessionSendClientRejectsZeroFrame(t *testing.T) {
 		exec:     runtimesession.NewExecutionSession(runtimesession.Metadata{SessionID: "codex-zero-frame"}),
 	}
 
-	if err := session.SendClient(context.Background(), runtimesession.Frame{}); !errors.Is(err, runtimesession.ErrInvalidFrame) {
+	if err := session.SendClient(context.Background(), runtimerealtime.Frame{}); !errors.Is(err, runtimerealtime.ErrInvalidFrame) {
 		t.Fatalf("expected zero frame to return ErrInvalidFrame, got %v", err)
 	}
 }
@@ -90,13 +137,498 @@ func TestCodexRealtimeSessionSendClientRejectsUnknownFrameKind(t *testing.T) {
 		exec:     runtimesession.NewExecutionSession(runtimesession.Metadata{SessionID: "codex-unknown-frame-kind"}),
 	}
 
-	if err := session.SendClient(context.Background(), codexTestUnknownKindFrame([]byte("{}"))); !errors.Is(err, runtimesession.ErrInvalidFrame) {
+	if err := session.SendClient(context.Background(), codexTestUnknownKindFrame([]byte("{}"))); !errors.Is(err, runtimerealtime.ErrInvalidFrame) {
 		t.Fatalf("expected unknown frame kind to return ErrInvalidFrame, got %v", err)
 	}
 }
 
-func codexTestUnknownKindFrame(payload []byte) runtimesession.Frame {
-	frame := runtimesession.NewTextFrame(payload)
+func TestCodexResponsesWSOpenBypassesExecutionSessionManager(t *testing.T) {
+	var connections atomic.Int32
+	server := newCodexRealtimeCountingServer(t, &connections)
+	defer server.Close()
+
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"force"}`, map[string]string{
+		"X-Session-Id": "client-supplied-realtime-session",
+	})
+	provider.Context.Set("token_id", 9201)
+	provider.Channel.BaseURL = stringPtr(server.URL)
+
+	before := ExecutionSessionStats()
+	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{UpstreamSessionID: "responses-ws-local-test"})
+	if errWithCode != nil {
+		t.Fatalf("expected ResponsesWS session to open, got %v", errWithCode)
+	}
+	upstream, ok := session.(*responsesws.NativeSession)
+	if !ok {
+		t.Fatalf("expected common native ResponsesWS upstream, got %T", session)
+	}
+	defer upstream.Abort("test_cleanup")
+
+	after := ExecutionSessionStats()
+	if after.LocalSessions != before.LocalSessions || after.LocalBindings != before.LocalBindings {
+		t.Fatalf("expected ResponsesWS open to bypass global execution session manager, before=%+v after=%+v", before, after)
+	}
+	waitForCodexRealtimeConnectionCount(t, &connections, 1)
+}
+
+func TestCodexResponsesWSHTTPBridgeBypassesWebsocketModeOff(t *testing.T) {
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, nil)
+	before := ExecutionSessionStats()
+	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
+		Transport: runtimesession.TransportModeResponsesHTTPBridge,
+	})
+	if errWithCode != nil {
+		t.Fatalf("expected explicit http_bridge to bypass native websocket_mode=off, got %v", errWithCode)
+	}
+	if _, ok := session.(*responsesws.BridgeSession); !ok {
+		t.Fatalf("expected common bridge ResponsesWS upstream, got %T", session)
+	}
+	session.Abort("test_cleanup")
+	after := ExecutionSessionStats()
+	if after.LocalSessions != before.LocalSessions || after.LocalBindings != before.LocalBindings {
+		t.Fatalf("expected bridge open to bypass execution session manager, before=%+v after=%+v", before, after)
+	}
+}
+
+func TestCodexResponsesWSHTTPBridgeRequiresResponsesEndpoint(t *testing.T) {
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, nil)
+	provider.Config.Responses = ""
+
+	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
+		Transport: runtimesession.TransportModeResponsesHTTPBridge,
+	})
+	if session != nil {
+		session.Abort("test_cleanup")
+	}
+	if errWithCode == nil || errWithCode.StatusCode != http.StatusUpgradeRequired || errWithCode.Code != "responses_ws_unsupported_for_channel" {
+		t.Fatalf("expected missing Responses endpoint to return responses_ws_unsupported_for_channel, session=%T err=%+v", session, errWithCode)
+	}
+}
+
+func TestCodexResponsesWSHTTPBridgeURLPolicyRejectsUnsafeDefaults(t *testing.T) {
+	t.Run("local http requires explicit responses self hosted", func(t *testing.T) {
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, nil)
+		provider.Context.Set("responses_ws_self_hosted", false)
+		provider.Channel.BaseURL = stringPtr("http://127.0.0.1:1")
+		session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
+			Transport: runtimesession.TransportModeResponsesHTTPBridge,
+		})
+		if errWithCode != nil {
+			t.Fatalf("expected bridge session to open lazily, got %v", errWithCode)
+		}
+		defer session.Abort("test_cleanup")
+
+		result := session.(responsesws.TransportSendCapable).SendClientWithResult(context.Background(), responsesws.SendRequest{AttemptID: "attempt-test", Frame: responsesws.NewTextFrame([]byte(`{"type":"response.create","model":"gpt-5","input":"hello"}`))})
+		if result.Status != responsesws.ResponsesWSTransportSendNotAttempted || !errors.Is(result.Err, requester.ErrUpstreamResponsesHTTPURLRequiresHTTPS) {
+			t.Fatalf("expected local http bridge send to be rejected before request, got %+v", result)
+		}
+	})
+
+	t.Run("metadata stays blocked even when responses self hosted", func(t *testing.T) {
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off","responses_ws_self_hosted":true}`, nil)
+		provider.Channel.BaseURL = stringPtr("http://169.254.169.254")
+		session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
+			Transport: runtimesession.TransportModeResponsesHTTPBridge,
+		})
+		if errWithCode != nil {
+			t.Fatalf("expected bridge session to open lazily, got %v", errWithCode)
+		}
+		defer session.Abort("test_cleanup")
+
+		result := session.(responsesws.TransportSendCapable).SendClientWithResult(context.Background(), responsesws.SendRequest{AttemptID: "attempt-test", Frame: responsesws.NewTextFrame([]byte(`{"type":"response.create","model":"gpt-5","input":"hello"}`))})
+		if result.Status != responsesws.ResponsesWSTransportSendNotAttempted || !errors.Is(result.Err, requester.ErrUpstreamResponsesHTTPURLHostBlocked) {
+			t.Fatalf("expected metadata bridge send to be rejected before request, got %+v", result)
+		}
+	})
+}
+
+func TestCodexResponsesWSHTTPBridgeURLPolicyPrecedesBridgeBodyValidation(t *testing.T) {
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, nil)
+	provider.Context.Set("responses_ws_self_hosted", false)
+	provider.Channel.BaseURL = stringPtr("http://127.0.0.1:1")
+	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
+		Transport: runtimesession.TransportModeResponsesHTTPBridge,
+	})
+	if errWithCode != nil {
+		t.Fatalf("expected bridge session to open lazily, got %v", errWithCode)
+	}
+	defer session.Abort("test_cleanup")
+
+	result := session.(responsesws.TransportSendCapable).SendClientWithResult(context.Background(), responsesws.SendRequest{AttemptID: "attempt-test", Frame: responsesws.NewTextFrame([]byte(`{"type":"response.create","model":"gpt-5","input":"hello","background":true}`))})
+	if result.Status != responsesws.ResponsesWSTransportSendNotAttempted || !errors.Is(result.Err, requester.ErrUpstreamResponsesHTTPURLRequiresHTTPS) {
+		t.Fatalf("expected URL policy error before unsupported background validation, got %+v", result)
+	}
+	if strings.Contains(result.Err.Error(), "background") {
+		t.Fatalf("expected URL policy error to win over background validation, got %v", result.Err)
+	}
+}
+
+func TestCodexResponsesWSHTTPBridgeStreamsAndPreservesRawPayload(t *testing.T) {
+	originalHTTPClient := requester.HTTPClient
+	requester.HTTPClient = &http.Client{}
+	defer func() {
+		requester.HTTPClient = originalHTTPClient
+	}()
+
+	received := make(chan []byte, 1)
+	receivedHeaders := make(chan http.Header, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			return
+		}
+		receivedHeaders <- r.Header.Clone()
+		received <- body
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_codex_bridge\",\"status\":\"completed\",\"usage\":{\"input_tokens\":4,\"output_tokens\":5,\"total_tokens\":9}}}\n\n"))
+	}))
+	defer server.Close()
+
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, map[string]string{
+		"X-Session-Id":                          "client-session",
+		"Session_Id":                            "client-session-legacy",
+		"X-Codex-Turn-Metadata":                 "request-turn-metadata",
+		"X-Codex-Turn-State":                    "request-turn-state",
+		"X-Client-Request-Id":                   "request-id",
+		"X-Codex-Beta-Features":                 "beta-feature",
+		"X-Responsesapi-Include-Timing-Metrics": "true",
+	})
+	provider.Channel.ModelHeaders = stringPtr(`{"x-codex-turn-state":"channel-turn-state","x-codex-turn-metadata":"channel-turn-metadata"}`)
+	provider.Channel.BaseURL = stringPtr(server.URL)
+	provider.Usage = &types.Usage{}
+	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
+		Transport: runtimesession.TransportModeResponsesHTTPBridge,
+	})
+	if errWithCode != nil {
+		t.Fatalf("expected http bridge session to open, got %v", errWithCode)
+	}
+	defer session.Abort("test_cleanup")
+
+	result := session.(responsesws.TransportSendCapable).SendClientWithResult(context.Background(), responsesws.SendRequest{AttemptID: "attempt-test", Frame: responsesws.NewTextFrame([]byte(`{"type":"response.create","event_id":"evt_bridge","model":"gpt-5","input":"hi","stream":true,"background":false,"stream_options":{"include_usage":true},"temperature":0.7,"top_p":0.9,"unknown_number":12345678901234567890,"future_object":{"enabled":true}}`))})
+	if result.Status != responsesws.ResponsesWSTransportSendAttempted || result.Err != nil {
+		t.Fatalf("expected bridge create to be attempted, got %+v", result)
+	}
+
+	var body []byte
+	select {
+	case body = <-received:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for Codex bridge HTTP request")
+	}
+	select {
+	case headers := <-receivedHeaders:
+		if got := headers.Get("X-Session-Id"); got != "" {
+			t.Fatalf("expected Codex bridge not to forward x-session-id, got %q", got)
+		}
+		if got := headers.Get("Session_Id"); got != "" {
+			t.Fatalf("expected Codex bridge not to forward session_id, got %q", got)
+		}
+		if got := headers.Get("X-Codex-Turn-Metadata"); got != "" {
+			t.Fatalf("expected Codex bridge not to forward turn metadata, got %q", got)
+		}
+		if got := headers.Get("X-Codex-Turn-State"); got != "" {
+			t.Fatalf("expected Codex bridge not to forward turn state, got %q", got)
+		}
+		if got := headers.Get("X-Client-Request-Id"); got != "request-id" {
+			t.Fatalf("expected non-session request id passthrough, got %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for Codex bridge HTTP headers")
+	}
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("decode bridge request body: %v body=%s", err, body)
+	}
+	if _, ok := decoded["type"]; ok {
+		t.Fatalf("expected websocket event type to be stripped from HTTP bridge body, body=%s", body)
+	}
+	if _, ok := decoded["event_id"]; ok {
+		t.Fatalf("expected websocket event_id to be stripped from HTTP bridge body, body=%s", body)
+	}
+	if _, ok := decoded["background"]; ok {
+		t.Fatalf("expected websocket background to be stripped from HTTP bridge body, body=%s", body)
+	}
+	if string(decoded["stream_options"]) != `{"include_usage":true}` {
+		t.Fatalf("expected stream_options to be preserved in HTTP bridge body, body=%s", body)
+	}
+	if string(decoded["unknown_number"]) != `12345678901234567890` {
+		t.Fatalf("expected unknown numeric field to be preserved, got %s body=%s", decoded["unknown_number"], body)
+	}
+	if string(decoded["future_object"]) != `{"enabled":true}` {
+		t.Fatalf("expected unknown object field to be preserved, got %s body=%s", decoded["future_object"], body)
+	}
+	if _, ok := decoded["previous_response_id"]; ok {
+		t.Fatalf("expected absent previous_response_id to stay absent without open continuation, body=%s", body)
+	}
+	if _, ok := decoded["top_p"]; ok {
+		t.Fatalf("expected top_p to be removed when temperature is set, body=%s", body)
+	}
+	if string(decoded["store"]) != `false` || string(decoded["stream"]) != `true` {
+		t.Fatalf("expected Codex bridge to force store=false and stream=true, body=%s", body)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	opened, err := session.Recv(ctx)
+	if err != nil {
+		t.Fatalf("recv bridge opened: %v", err)
+	}
+	if opened.DetailOrigin != responsesws.RecvDetailOriginBridgeStreamOpened {
+		t.Fatalf("expected bridge_stream_opened, got %+v", opened)
+	}
+	event, err := session.Recv(ctx)
+	if err != nil {
+		t.Fatalf("recv provider stream event: %v", err)
+	}
+	if event.Frame == nil || !strings.Contains(string(event.Frame.Payload()), "resp_codex_bridge") || event.DetailOrigin != responsesws.RecvDetailOriginProviderStream {
+		t.Fatalf("expected Codex provider_stream frame, got %+v", event)
+	}
+	if event.Usage == nil || event.Usage.TotalTokens != 9 {
+		t.Fatalf("expected Codex bridge usage event, got %+v", event.Usage)
+	}
+}
+
+func TestCodexResponsesWSHTTPBridgeUsesOpenPreviousResponseID(t *testing.T) {
+	originalHTTPClient := requester.HTTPClient
+	requester.HTTPClient = &http.Client{}
+	defer func() {
+		requester.HTTPClient = originalHTTPClient
+	}()
+
+	received := make(chan []byte, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			return
+		}
+		received <- body
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_codex_bridge_prev\",\"status\":\"completed\"}}\n\n"))
+	}))
+	defer server.Close()
+
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, nil)
+	provider.Channel.BaseURL = stringPtr(server.URL)
+	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
+		Transport:          runtimesession.TransportModeResponsesHTTPBridge,
+		PreviousResponseID: "resp_open_default",
+	})
+	if errWithCode != nil {
+		t.Fatalf("expected http bridge session to open, got %v", errWithCode)
+	}
+	defer session.Abort("test_cleanup")
+
+	result := session.(responsesws.TransportSendCapable).SendClientWithResult(context.Background(), responsesws.SendRequest{AttemptID: "attempt-test", Frame: responsesws.NewTextFrame([]byte(`{"type":"response.create","event_id":"evt_bridge_prev","model":"gpt-5","input":"hi"}`))})
+	if result.Status != responsesws.ResponsesWSTransportSendAttempted || result.Err != nil {
+		t.Fatalf("expected bridge create to be attempted, got %+v", result)
+	}
+
+	var body []byte
+	select {
+	case body = <-received:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for Codex bridge HTTP request")
+	}
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("decode bridge request body: %v body=%s", err, body)
+	}
+	if string(decoded["previous_response_id"]) != `"resp_open_default"` {
+		t.Fatalf("expected bridge to use open previous_response_id, got %s body=%s", decoded["previous_response_id"], body)
+	}
+}
+
+func TestCodexResponsesWSHTTPBridgeDoesNotReuseOpenPreviousResponseID(t *testing.T) {
+	originalHTTPClient := requester.HTTPClient
+	requester.HTTPClient = &http.Client{}
+	defer func() {
+		requester.HTTPClient = originalHTTPClient
+	}()
+
+	received := make(chan []byte, 2)
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			return
+		}
+		received <- body
+		id := "resp_codex_bridge_first"
+		if requests.Add(1) == 2 {
+			id = "resp_codex_bridge_second"
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"` + id + `","status":"completed"}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, nil)
+	provider.Channel.BaseURL = stringPtr(server.URL)
+	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
+		Transport:          runtimesession.TransportModeResponsesHTTPBridge,
+		PreviousResponseID: "resp_open_default",
+	})
+	if errWithCode != nil {
+		t.Fatalf("expected http bridge session to open, got %v", errWithCode)
+	}
+	defer session.Abort("test_cleanup")
+
+	result := session.(responsesws.TransportSendCapable).SendClientWithResult(context.Background(), responsesws.SendRequest{AttemptID: "attempt-test", Frame: responsesws.NewTextFrame([]byte(`{"type":"response.create","event_id":"evt_bridge_prev_first","model":"gpt-5","input":"first"}`))})
+	if result.Status != responsesws.ResponsesWSTransportSendAttempted || result.Err != nil {
+		t.Fatalf("expected first bridge create to be attempted, got %+v", result)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := session.Recv(ctx); err != nil {
+		t.Fatalf("recv first bridge opened: %v", err)
+	}
+	if _, err := session.Recv(ctx); err != nil {
+		t.Fatalf("recv first bridge terminal: %v", err)
+	}
+	var first map[string]json.RawMessage
+	select {
+	case body := <-received:
+		if err := json.Unmarshal(body, &first); err != nil {
+			t.Fatalf("decode first bridge request body: %v body=%s", err, body)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first Codex bridge HTTP request")
+	}
+	if string(first["previous_response_id"]) != `"resp_open_default"` {
+		t.Fatalf("expected first bridge request to use open default, got %s", first["previous_response_id"])
+	}
+
+	result = session.(responsesws.TransportSendCapable).SendClientWithResult(context.Background(), responsesws.SendRequest{AttemptID: "attempt-test", Frame: responsesws.NewTextFrame([]byte(`{"type":"response.create","event_id":"evt_bridge_prev_second","model":"gpt-5","input":"second"}`))})
+	if result.Status != responsesws.ResponsesWSTransportSendAttempted || result.Err != nil {
+		t.Fatalf("expected second bridge create to be attempted, got %+v", result)
+	}
+	var second map[string]json.RawMessage
+	select {
+	case body := <-received:
+		if err := json.Unmarshal(body, &second); err != nil {
+			t.Fatalf("decode second bridge request body: %v body=%s", err, body)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for second Codex bridge HTTP request")
+	}
+	if _, ok := second["previous_response_id"]; ok {
+		t.Fatalf("expected second bridge request not to reuse open default, body=%s", second)
+	}
+}
+
+func TestCodexResponsesWSNativeUsesIndependentConnectionsForSameClientSession(t *testing.T) {
+	var connections atomic.Int32
+	server := newCodexRealtimeCountingServer(t, &connections)
+	defer server.Close()
+
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"force"}`, map[string]string{
+		"X-Session-Id": "same-client-session",
+	})
+	provider.Channel.BaseURL = stringPtr(server.URL)
+
+	sessionA, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{})
+	if errWithCode != nil {
+		t.Fatalf("open first ResponsesWS session: %v", errWithCode)
+	}
+	defer sessionA.Abort("test_cleanup")
+	sessionB, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{})
+	if errWithCode != nil {
+		t.Fatalf("open second ResponsesWS session: %v", errWithCode)
+	}
+	defer sessionB.Abort("test_cleanup")
+
+	if _, ok := sessionA.(*responsesws.NativeSession); !ok {
+		t.Fatalf("expected first session to use common native helper, got %T", sessionA)
+	}
+	if _, ok := sessionB.(*responsesws.NativeSession); !ok {
+		t.Fatalf("expected second session to use common native helper, got %T", sessionB)
+	}
+	waitForCodexRealtimeConnectionCount(t, &connections, 2)
+}
+
+func waitForCodexRealtimeConnectionCount(t *testing.T, connections *atomic.Int32, want int32) {
+	t.Helper()
+	deadline := time.After(time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for connections.Load() != want {
+		select {
+		case <-deadline:
+			t.Fatalf("expected %d upstream websocket connection(s), got %d", want, connections.Load())
+		case <-ticker.C:
+		}
+	}
+}
+
+func TestCodexResponsesWSNativeRewritesNestedPayloadAndPreservesUnknownFields(t *testing.T) {
+	received := make(chan []byte, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, ok := acceptCodexRealtimeTestConn(t, w, r)
+		if !ok {
+			return
+		}
+		defer conn.Close()
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			t.Errorf("read upstream response.create: %v", err)
+			return
+		}
+		received <- payload
+	}))
+	defer server.Close()
+
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"force"}`, nil)
+	provider.Channel.BaseURL = stringPtr(server.URL)
+
+	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{UpstreamSessionID: "responses-ws-rewrite-test"})
+	if errWithCode != nil {
+		t.Fatalf("open ResponsesWS session: %v", errWithCode)
+	}
+	defer session.Abort("test_cleanup")
+
+	payload := []byte(`{"type":"response.create","event_id":"evt_raw","model":"gpt-5","input":"hi","temperature":0.7,"top_p":0.9,"unknown_number":12345678901234567890,"future_object":{"enabled":true}}`)
+	result := session.SendClientWithResult(context.Background(), responsesws.SendRequest{
+		AttemptID: "attempt-raw-payload",
+		Frame:     responsesws.NewTextFrame(payload),
+	})
+	if result.Status != responsesws.ResponsesWSTransportSendAttempted || result.Err != nil {
+		t.Fatalf("send response.create: %+v", result)
+	}
+
+	select {
+	case got := <-received:
+		var decoded map[string]json.RawMessage
+		if err := json.Unmarshal(got, &decoded); err != nil {
+			t.Fatalf("decode upstream payload: %v payload=%s", err, got)
+		}
+		if string(decoded["type"]) != `"response.create"` {
+			t.Fatalf("expected native adapter to preserve websocket event type, got %s", decoded["type"])
+		}
+		if string(decoded["event_id"]) != `"evt_raw"` {
+			t.Fatalf("expected native adapter to preserve websocket event_id, got %s", decoded["event_id"])
+		}
+		if string(decoded["unknown_number"]) != `12345678901234567890` {
+			t.Fatalf("expected unknown numeric field to be preserved, got %s", decoded["unknown_number"])
+		}
+		if string(decoded["future_object"]) != `{"enabled":true}` {
+			t.Fatalf("expected unknown object field to be preserved, got %s", decoded["future_object"])
+		}
+		if _, ok := decoded["top_p"]; ok {
+			t.Fatalf("expected top_p to be removed when temperature is set, got %s", decoded["top_p"])
+		}
+		if string(decoded["store"]) != `false` {
+			t.Fatalf("expected Codex native adapter to force store=false, got %s", decoded["store"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for upstream response.create")
+	}
+}
+
+func codexTestUnknownKindFrame(payload []byte) runtimerealtime.Frame {
+	frame := runtimerealtime.NewTextFrame(payload)
 	field := reflect.ValueOf(&frame).Elem().FieldByName("kind")
 	reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem().SetInt(99)
 	return frame
@@ -111,7 +643,7 @@ func TestCodexRealtimeOutboundFromCloseInfoClassifiesPeerAndNonPeer(t *testing.T
 	if peer.providerClose == nil || peer.providerClose.Code != int(wsconn.ClosePolicyViolation) || peer.providerClose.Reason != "quota exhausted" {
 		t.Fatalf("expected peer close to become ProviderClose, got %+v", peer)
 	}
-	if peer.payload != nil || peer.err != nil || peer.origin != runtimesession.RealtimePayloadOriginProvider {
+	if peer.payload != nil || peer.err != nil || peer.origin != runtimerealtime.RealtimePayloadOriginProvider {
 		t.Fatalf("expected peer close to avoid payload/err, got %+v", peer)
 	}
 
@@ -123,7 +655,7 @@ func TestCodexRealtimeOutboundFromCloseInfoClassifiesPeerAndNonPeer(t *testing.T
 	if normal.providerClose == nil || normal.providerClose.Code != int(wsconn.CloseNormalClosure) || normal.providerClose.Reason != "normal" {
 		t.Fatalf("expected normal close to become ProviderClose, got %+v", normal)
 	}
-	if normal.payload != nil || normal.err != nil || normal.origin != runtimesession.RealtimePayloadOriginProvider {
+	if normal.payload != nil || normal.err != nil || normal.origin != runtimerealtime.RealtimePayloadOriginProvider {
 		t.Fatalf("expected normal close to avoid payload/err, got %+v", normal)
 	}
 
@@ -141,10 +673,10 @@ func TestCodexRealtimeOutboundFromCloseInfoClassifiesPeerAndNonPeer(t *testing.T
 			if !strings.Contains(string(outbound.payload), "provider_connection_closed") {
 				t.Fatalf("expected provider_connection_closed payload, got %+v", outbound)
 			}
-			if !errors.Is(outbound.err, runtimesession.ErrSessionClosed) {
+			if !errors.Is(outbound.err, runtimerealtime.ErrSessionClosed) {
 				t.Fatalf("expected non-peer close to carry RecvEvent.Err source, got %v", outbound.err)
 			}
-			if outbound.origin != runtimesession.RealtimePayloadOriginProxyLocal {
+			if outbound.origin != runtimerealtime.RealtimePayloadOriginProxyLocal {
 				t.Fatalf("expected proxy-local origin for non-peer close, got %v", outbound.origin)
 			}
 		})
@@ -340,13 +872,13 @@ func TestCodexRealtimeAttachmentTurnAndErrorHelpers(t *testing.T) {
 	if !attachment.isClosed() {
 		t.Fatal("expected attachment close to mark closed")
 	}
-	if outbound, err := attachment.recv(context.Background()); !errors.Is(err, runtimesession.ErrSessionClosed) || outbound.messageType != 0 {
+	if outbound, err := attachment.recv(context.Background()); !errors.Is(err, runtimerealtime.ErrSessionClosed) || outbound.messageType != 0 {
 		t.Fatalf("expected closed attachment recv to fail with session closed, outbound=%+v err=%v", outbound, err)
 	}
-	if outbound, err := (*codexAttachment)(nil).recv(context.Background()); !errors.Is(err, runtimesession.ErrSessionClosed) || outbound.messageType != 0 {
+	if outbound, err := (*codexAttachment)(nil).recv(context.Background()); !errors.Is(err, runtimerealtime.ErrSessionClosed) || outbound.messageType != 0 {
 		t.Fatalf("expected nil attachment recv to fail with session closed, outbound=%+v err=%v", outbound, err)
 	}
-	if event, err := (&codexManagedRealtimeSession{attachment: attachment}).Recv(context.Background()); !errors.Is(err, runtimesession.ErrSessionClosed) || event != (runtimesession.RecvEvent{}) {
+	if event, err := (&codexManagedRealtimeSession{attachment: attachment}).Recv(context.Background()); !errors.Is(err, runtimerealtime.ErrSessionClosed) || event != (runtimerealtime.RecvEvent{}) {
 		t.Fatalf("expected top-level recv error to return zero RecvEvent, event=%+v err=%v", event, err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -354,16 +886,16 @@ func TestCodexRealtimeAttachmentTurnAndErrorHelpers(t *testing.T) {
 	if outbound, err := newCodexAttachmentWithCapacity(1).recv(ctx); !errors.Is(err, context.Canceled) || outbound.messageType != 0 {
 		t.Fatalf("expected canceled attachment recv, outbound=%+v err=%v", outbound, err)
 	}
-	providerClose := &runtimesession.ProviderClose{Code: int(wsconn.ClosePolicyViolation), Reason: "quota exhausted", Err: runtimesession.ErrSessionClosed}
+	providerClose := &runtimerealtime.ProviderClose{Code: int(wsconn.ClosePolicyViolation), Reason: "quota exhausted", Err: runtimerealtime.ErrSessionClosed}
 	providerCloseAttachment := newCodexAttachmentWithCapacity(1)
 	if ok := enqueueCodexOutbound(providerCloseAttachment, codexRealtimeOutbound{
 		providerClose: providerClose,
-		origin:        runtimesession.RealtimePayloadOriginProvider,
+		origin:        runtimerealtime.RealtimePayloadOriginProvider,
 	}); !ok {
 		t.Fatal("expected provider close attachment enqueue to succeed")
 	}
 	providerCloseSession := &codexManagedRealtimeSession{attachment: providerCloseAttachment}
-	if event, err := providerCloseSession.Recv(context.Background()); err != nil || event.ProviderClose != providerClose || event.Frame != nil || event.Usage != nil || event.Err != nil || event.Origin != runtimesession.RealtimePayloadOriginProvider {
+	if event, err := providerCloseSession.Recv(context.Background()); err != nil || event.ProviderClose != providerClose || event.Frame != nil || event.Usage != nil || event.Err != nil || event.Origin != runtimerealtime.RealtimePayloadOriginProvider {
 		t.Fatalf("expected provider close only event, event=%+v err=%v", event, err)
 	}
 
@@ -371,12 +903,12 @@ func TestCodexRealtimeAttachmentTurnAndErrorHelpers(t *testing.T) {
 	providerErrAttachment := newCodexAttachmentWithCapacity(1)
 	if ok := enqueueCodexOutbound(providerErrAttachment, codexRealtimeOutbound{
 		err:    providerErr,
-		origin: runtimesession.RealtimePayloadOriginProvider,
+		origin: runtimerealtime.RealtimePayloadOriginProvider,
 	}); !ok {
 		t.Fatal("expected provider error attachment enqueue to succeed")
 	}
 	providerErrSession := &codexManagedRealtimeSession{attachment: providerErrAttachment}
-	if event, err := providerErrSession.Recv(context.Background()); err != nil || !errors.Is(event.Err, providerErr) || event.Frame != nil || event.Usage != nil || event.ProviderClose != nil || event.Origin != runtimesession.RealtimePayloadOriginProvider {
+	if event, err := providerErrSession.Recv(context.Background()); err != nil || !errors.Is(event.Err, providerErr) || event.Frame != nil || event.Usage != nil || event.ProviderClose != nil || event.Origin != runtimerealtime.RealtimePayloadOriginProvider {
 		t.Fatalf("expected provider error event without top-level error, event=%+v err=%v", event, err)
 	}
 
@@ -385,30 +917,30 @@ func TestCodexRealtimeAttachmentTurnAndErrorHelpers(t *testing.T) {
 		messageType: wsconn.TextMessage,
 		payload:     []byte("queued"),
 		usage:       &types.UsageEvent{TotalTokens: 1},
-		origin:      runtimesession.RealtimePayloadOriginProvider,
+		origin:      runtimerealtime.RealtimePayloadOriginProvider,
 	}); !ok {
 		t.Fatal("expected frame+usage attachment enqueue to succeed")
 	}
 	frameUsageSession := &codexManagedRealtimeSession{attachment: frameUsageAttachment}
-	if event, err := frameUsageSession.Recv(context.Background()); err != nil || event.Frame == nil || event.Frame.Kind() != runtimesession.FrameKindText || event.Usage == nil || event.Usage.TotalTokens != 1 || event.ProviderClose != nil || event.Err != nil || event.Origin != runtimesession.RealtimePayloadOriginProvider {
+	if event, err := frameUsageSession.Recv(context.Background()); err != nil || event.Frame == nil || event.Frame.Kind() != runtimerealtime.FrameKindText || event.Usage == nil || event.Usage.TotalTokens != 1 || event.ProviderClose != nil || event.Err != nil || event.Origin != runtimerealtime.RealtimePayloadOriginProvider {
 		t.Fatalf("expected frame+usage event without top-level error, event=%+v err=%v", event, err)
 	}
-	observerErr := runtimesession.NewClientPayloadError(errors.New("quota"), []byte(`{"type":"error","error":{"message":"quota"}}`))
+	observerErr := runtimerealtime.NewClientPayloadError(errors.New("quota"), []byte(`{"type":"error","error":{"message":"quota"}}`))
 	frameUsageErrAttachment := newCodexAttachmentWithCapacity(2)
 	if ok := enqueueCodexOutbound(frameUsageErrAttachment, codexRealtimeOutbound{
 		messageType: wsconn.TextMessage,
 		payload:     []byte(`{"type":"response.done","response":{"usage":{"total_tokens":1}}}`),
 		usage:       &types.UsageEvent{TotalTokens: 1},
-		origin:      runtimesession.RealtimePayloadOriginProvider,
+		origin:      runtimerealtime.RealtimePayloadOriginProvider,
 		err:         observerErr,
 	}); !ok {
 		t.Fatal("expected frame+usage+err attachment enqueue to split events")
 	}
 	frameUsageErrSession := &codexManagedRealtimeSession{attachment: frameUsageErrAttachment}
-	if event, err := frameUsageErrSession.Recv(context.Background()); err != nil || event.Frame == nil || event.Usage == nil || event.Err != nil || event.ProviderClose != nil || event.Origin != runtimesession.RealtimePayloadOriginProvider {
+	if event, err := frameUsageErrSession.Recv(context.Background()); err != nil || event.Frame == nil || event.Usage == nil || event.Err != nil || event.ProviderClose != nil || event.Origin != runtimerealtime.RealtimePayloadOriginProvider {
 		t.Fatalf("expected first split event to preserve frame+usage without err, event=%+v err=%v", event, err)
 	}
-	if event, err := frameUsageErrSession.Recv(context.Background()); err != nil || event.Frame == nil || event.Usage != nil || !errors.Is(event.Err, observerErr) || event.ProviderClose != nil || event.Origin != runtimesession.RealtimePayloadOriginProxyLocal {
+	if event, err := frameUsageErrSession.Recv(context.Background()); err != nil || event.Frame == nil || event.Usage != nil || !errors.Is(event.Err, observerErr) || event.ProviderClose != nil || event.Origin != runtimerealtime.RealtimePayloadOriginProxyLocal {
 		t.Fatalf("expected second split event to carry client payload error without usage, event=%+v err=%v", event, err)
 	}
 	if normalized := normalizeCodexRealtimeOutbound(codexRealtimeOutbound{
@@ -416,14 +948,14 @@ func TestCodexRealtimeAttachmentTurnAndErrorHelpers(t *testing.T) {
 		payload:       []byte("ignored"),
 		providerClose: providerClose,
 		usage:         &types.UsageEvent{TotalTokens: 1},
-		origin:        runtimesession.RealtimePayloadOriginProvider,
+		origin:        runtimerealtime.RealtimePayloadOriginProvider,
 		err:           errors.New("ignored"),
 	}); len(normalized) != 1 || normalized[0].providerClose != providerClose || len(normalized[0].payload) != 0 || normalized[0].usage != nil || normalized[0].err != nil {
 		t.Fatalf("expected provider close normalization to keep only ProviderClose, got %+v", normalized)
 	}
 	if normalized := normalizeCodexRealtimeOutbound(codexRealtimeOutbound{
 		usage:  &types.UsageEvent{TotalTokens: 2},
-		origin: runtimesession.RealtimePayloadOriginProvider,
+		origin: runtimerealtime.RealtimePayloadOriginProvider,
 		err:    observerErr,
 	}); len(normalized) != 2 || normalized[0].usage == nil || normalized[0].err != nil || normalized[1].usage != nil || !errors.Is(normalized[1].err, observerErr) {
 		t.Fatalf("unexpected normalized codex usage+err shape: %+v", normalized)
@@ -458,6 +990,9 @@ func TestCodexRealtimeAttachmentTurnAndErrorHelpers(t *testing.T) {
 	}
 	if !isCodexRealtimeBootstrapMessage(wsconn.TextMessage, []byte(`{"type":"session.created"}`)) {
 		t.Fatal("expected session.created to be treated as bootstrap message")
+	}
+	if !isCodexRealtimeBootstrapMessage(wsconn.TextMessage, []byte(`{"type":"session.created","session":"opaque"}`)) {
+		t.Fatal("expected opaque session.created to be treated as bootstrap message")
 	}
 	if isCodexRealtimeBootstrapMessage(wsconn.BinaryMessage, []byte(`{"type":"session.created"}`)) {
 		t.Fatal("expected non-text realtime bootstrap message to be ignored")
@@ -655,7 +1190,7 @@ func TestCodexRealtimeWSReaderForwardsProviderCloseCode(t *testing.T) {
 	state.wsConn = conn
 	exec.Attached = true
 	exec.Inflight = true
-	exec.Transport = runtimesession.TransportModeResponsesWS
+	exec.Transport = runtimesession.TransportModeRealtimeWS
 	provider.startRealtimeWSReaderLocked(exec, state)
 	exec.Unlock()
 
@@ -669,7 +1204,7 @@ func TestCodexRealtimeWSReaderForwardsProviderCloseCode(t *testing.T) {
 	if outbound.messageType != 0 || len(outbound.payload) != 0 {
 		t.Fatalf("expected provider close not to be forwarded as data frame, got message_type=%d payload=%q", outbound.messageType, outbound.payload)
 	}
-	if outbound.origin != runtimesession.RealtimePayloadOriginProvider {
+	if outbound.origin != runtimerealtime.RealtimePayloadOriginProvider {
 		t.Fatalf("expected provider close origin, got %q", outbound.origin)
 	}
 	if outbound.providerClose == nil {
@@ -681,7 +1216,7 @@ func TestCodexRealtimeWSReaderForwardsProviderCloseCode(t *testing.T) {
 	if outbound.providerClose.Reason != "quota exhausted" {
 		t.Fatalf("expected provider close reason to be preserved, got %q", outbound.providerClose.Reason)
 	}
-	if !errors.Is(outbound.providerClose.Err, runtimesession.ErrSessionClosed) {
+	if !errors.Is(outbound.providerClose.Err, runtimerealtime.ErrSessionClosed) {
 		t.Fatalf("expected provider close to carry session closed error, got %v", outbound.providerClose.Err)
 	}
 
@@ -767,7 +1302,7 @@ func TestConfigureCodexRealtimeConnAppliesReadLimit(t *testing.T) {
 	state.wsConn = conn
 	exec.Attached = true
 	exec.Inflight = true
-	exec.Transport = runtimesession.TransportModeResponsesWS
+	exec.Transport = runtimesession.TransportModeRealtimeWS
 	provider.startRealtimeWSReaderLocked(exec, state)
 	exec.Unlock()
 	close(releaseWrite)
@@ -776,13 +1311,13 @@ func TestConfigureCodexRealtimeConnAppliesReadLimit(t *testing.T) {
 	if !strings.Contains(string(outbound.payload), "provider_connection_closed") {
 		t.Fatalf("expected read limit to produce provider_connection_closed payload, got %+v", outbound)
 	}
-	if !errors.Is(outbound.err, runtimesession.ErrSessionClosed) {
+	if !errors.Is(outbound.err, runtimerealtime.ErrSessionClosed) {
 		t.Fatalf("expected read limit to carry RecvEvent.Err source, got %v", outbound.err)
 	}
 }
 
 func TestCodexManagedRealtimeSessionGuardBranches(t *testing.T) {
-	if err := (*codexManagedRealtimeSession)(nil).SendClient(context.Background(), codexTestTextFrame([]byte(`{}`))); !errors.Is(err, runtimesession.ErrSessionClosed) {
+	if err := (*codexManagedRealtimeSession)(nil).SendClient(context.Background(), codexTestTextFrame([]byte(`{}`))); !errors.Is(err, runtimerealtime.ErrSessionClosed) {
 		t.Fatalf("expected nil managed realtime session SendClient to report session closed, got %v", err)
 	}
 
@@ -819,7 +1354,7 @@ func TestCodexManagedRealtimeSessionGuardBranches(t *testing.T) {
 		attachment: attachment,
 		ownerSeq:   2,
 	}
-	if err := foreignSession.SendClient(context.Background(), codexTestTextFrame([]byte(`{"type":"response.cancel"}`))); !errors.Is(err, runtimesession.ErrSessionClosed) {
+	if err := foreignSession.SendClient(context.Background(), codexTestTextFrame([]byte(`{"type":"response.cancel"}`))); !errors.Is(err, runtimerealtime.ErrSessionClosed) {
 		t.Fatalf("expected foreign attachment owner SendClient to be rejected, got %v", err)
 	}
 
@@ -838,7 +1373,7 @@ func TestCodexManagedRealtimeSessionGuardBranches(t *testing.T) {
 	}
 
 	beginCodexTurnLocked(state, time.Now())
-	exec.Transport = runtimesession.TransportModeResponsesWS
+	exec.Transport = runtimesession.TransportModeRealtimeWS
 	if err := session.SendClient(context.Background(), codexTestTextFrame([]byte(`{"type":"response.cancel","event_id":"evt_cancel"}`))); err != nil {
 		t.Fatalf("expected response.cancel without wsConn to finalize locally, got %v", err)
 	}
@@ -849,7 +1384,7 @@ func TestCodexManagedRealtimeSessionGuardBranches(t *testing.T) {
 	if err := session.SendClient(context.Background(), codexTestTextFrame([]byte(`{"type":"unsupported","event_id":"evt_unsupported"}`))); err == nil {
 		t.Fatal("expected unsupported realtime client event to be rejected")
 	}
-	if _, _, _, _, err := codexTestRecv(context.Background(), (*codexManagedRealtimeSession)(nil)); !errors.Is(err, runtimesession.ErrSessionClosed) {
+	if _, _, _, _, err := codexTestRecv(context.Background(), (*codexManagedRealtimeSession)(nil)); !errors.Is(err, runtimerealtime.ErrSessionClosed) {
 		t.Fatalf("expected nil managed realtime session Recv to report session closed, got %v", err)
 	}
 
@@ -922,114 +1457,20 @@ func TestCodexManagedRealtimeSessionGuardBranches(t *testing.T) {
 	}
 }
 
-func TestCodexResponsesWSStaleContinuationPreflightFailClosed(t *testing.T) {
-	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"force"}`, nil)
-	exec := runtimesession.NewExecutionSession(runtimesession.Metadata{
-		Key:       "channel:1/hash-a/session-stale-preflight",
-		SessionID: "session-stale-preflight",
-		Model:     "gpt-5",
-		IdleTTL:   time.Minute,
-	})
-	exec.LastResponseID = "resp_last"
-	attachment := newCodexAttachment()
-	state := getCodexManagedRuntimeStateLocked(exec)
-	state.attachment = attachment
-	state.ownerSeq = 1
-	state.requireWS = true
-	state.wsConnGeneration = 1
-	exec.Attached = true
-
-	session := &codexManagedRealtimeSession{
-		provider:   provider,
-		exec:       exec,
-		attachment: attachment,
-		ownerSeq:   1,
-	}
-
-	err := session.PreflightResponsesWSSend(context.Background(), "evt_stale", &types.OpenAIResponsesRequest{
-		Model:              "gpt-5",
-		PreviousResponseID: "resp_old",
-	})
-	if !errors.Is(err, runtimesession.ErrStaleResponsesWSContinuation) {
-		t.Fatalf("expected stale continuation sentinel, got %v", err)
-	}
-	payload := runtimesession.ClientPayloadFromError(err)
-	if !strings.Contains(string(payload), `"status":409`) ||
-		!strings.Contains(string(payload), `"code":"previous_response_not_found"`) ||
-		!strings.Contains(string(payload), `"param":"previous_response_id"`) {
-		t.Fatalf("expected local previous_response_not_found payload, got %q", payload)
-	}
-	if exec.LastResponseID != "resp_last" {
-		t.Fatalf("expected stale guard not to clear LastResponseID, got %q", exec.LastResponseID)
-	}
-	if state.wsConnGeneration != 1 || state.wsConn != nil {
-		t.Fatalf("expected stale guard to leave websocket generation/binding state intact, state=%+v", state)
-	}
-	if err := session.PreflightResponsesWSSend(context.Background(), "evt_fresh", &types.OpenAIResponsesRequest{Model: "gpt-5"}); err != nil {
-		t.Fatalf("expected request without previous_response_id to allow reconnect path, got %v", err)
-	}
-
-	exec.Lock()
-	apiErr := provider.ensureRealtimeTransportWithContextLocked(context.Background(), exec, state, time.Now(), "resp_old")
-	exec.Unlock()
-	if apiErr == nil || codexRealtimeErrorCodeString(apiErr.Code, "") != "previous_response_not_found" || apiErr.Param != "previous_response_id" || apiErr.StatusCode != http.StatusConflict {
-		t.Fatalf("expected open-time stale guard before reconnect dial, got %+v", apiErr)
-	}
-	if !apiErr.LocalError {
-		t.Fatal("expected open-time stale guard to be marked local so relay retries fail closed")
-	}
-}
-
-func TestCodexResponsesWSSendClientStaleContinuationPreservesLastResponseID(t *testing.T) {
-	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"force"}`, nil)
-	exec := runtimesession.NewExecutionSession(runtimesession.Metadata{
-		Key:       "channel:1/hash-a/session-stale-send",
-		SessionID: "session-stale-send",
-		Model:     "gpt-5",
-		IdleTTL:   time.Minute,
-	})
-	exec.LastResponseID = "resp_last"
-	attachment := newCodexAttachment()
-	state := getCodexManagedRuntimeStateLocked(exec)
-	state.attachment = attachment
-	state.ownerSeq = 1
-	state.requireWS = true
-	state.wsConnGeneration = 1
-	exec.Attached = true
-
-	session := &codexManagedRealtimeSession{
-		provider:   provider,
-		exec:       exec,
-		attachment: attachment,
-		ownerSeq:   1,
-	}
-
-	err := session.SendClient(context.Background(), codexTestTextFrame([]byte(`{"type":"response.create","event_id":"evt_stale_send","model":"gpt-5","previous_response_id":"resp_old","input":"hi"}`)))
-	if !errors.Is(err, runtimesession.ErrStaleResponsesWSContinuation) {
-		t.Fatalf("expected stale continuation sentinel, got %v", err)
-	}
-	if exec.LastResponseID != "resp_last" {
-		t.Fatalf("expected SendClient stale guard not to clear LastResponseID, got %q", exec.LastResponseID)
-	}
-	if exec.Inflight || exec.State != runtimesession.SessionStateIdle {
-		t.Fatalf("expected stale guard to reject before inflight mutation, inflight=%v state=%s", exec.Inflight, exec.State)
-	}
-}
-
 func TestCodexRealtimeMetadataCompatibilityAndNamespaceBranches(t *testing.T) {
 	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, nil)
 	provider.Context.Set("id", 7001)
 	provider.Context.Request.Header.Set("Authorization", "Bearer sk-session-auth")
 
-	if _, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimesession.RealtimeOpenOptions{ClientSessionID: "bad/session"}); errWithCode == nil || errWithCode.Code != "invalid_session_id" {
+	if _, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimerealtime.RealtimeOpenOptions{ClientSessionID: "bad/session"}); errWithCode == nil || errWithCode.Code != "invalid_session_id" {
 		t.Fatalf("expected invalid client session id metadata error, got %+v", errWithCode)
 	}
 	provider.Context.Request.Header.Set("X-Session-Id", "bad/session")
-	if _, _, errWithCode := provider.readRealtimeClientSessionID(runtimesession.RealtimeOpenOptions{}); errWithCode == nil || errWithCode.Code != "invalid_session_id" {
+	if _, _, errWithCode := provider.readRealtimeClientSessionID(runtimerealtime.RealtimeOpenOptions{}); errWithCode == nil || errWithCode.Code != "invalid_session_id" {
 		t.Fatalf("expected invalid request session id to fail validation, got %+v", errWithCode)
 	}
 	provider.Context.Request.Header.Set("X-Session-Id", "client-session")
-	if sessionID, clientSupplied, errWithCode := provider.readRealtimeClientSessionID(runtimesession.RealtimeOpenOptions{}); errWithCode != nil || !clientSupplied || sessionID != "client-session" {
+	if sessionID, clientSupplied, errWithCode := provider.readRealtimeClientSessionID(runtimerealtime.RealtimeOpenOptions{}); errWithCode != nil || !clientSupplied || sessionID != "client-session" {
 		t.Fatalf("expected valid request session id to be returned, session=%q supplied=%v err=%v", sessionID, clientSupplied, errWithCode)
 	}
 	if _, _, _, ok := parseCodexExecutionSessionKey("wrong-prefix/hash/session"); ok {
@@ -1264,7 +1705,7 @@ func TestCodexRealtimeTransportAndDetachedSessionHelpers(t *testing.T) {
 	bridgeState.requireWS = true
 	if errWithCode := providerAuto.ensureRealtimeTransportLocked(bridgeExec, bridgeState, time.Now()); errWithCode == nil || codexRealtimeErrorCodeString(errWithCode.Code, "") != "responses_ws_unsupported_for_channel" {
 		bridgeExec.Unlock()
-		t.Fatalf("expected RequireWS to reject existing HTTP bridge transport, got %v", errWithCode)
+		t.Fatalf("expected websocket-only state to reject existing HTTP bridge transport, got %v", errWithCode)
 	}
 	bridgeExec.Unlock()
 
@@ -1284,7 +1725,7 @@ func TestCodexRealtimeTransportAndDetachedSessionHelpers(t *testing.T) {
 		wsExec.Unlock()
 		t.Fatalf("expected existing websocket transport path to succeed, got %v", errWithCode)
 	}
-	if wsExec.Transport != runtimesession.TransportModeResponsesWS || wsState.wsReaderConn != wsConn {
+	if wsExec.Transport != runtimesession.TransportModeRealtimeWS || wsState.wsReaderConn != wsConn {
 		wsExec.Unlock()
 		t.Fatalf("expected existing websocket transport to set reader conn, exec=%+v state=%+v", wsExec, wsState)
 	}
@@ -1362,7 +1803,7 @@ func TestCodexRealtimeTransportAndDetachedSessionHelpers(t *testing.T) {
 	}
 }
 
-func TestCodexRequireWSOpenFailureRestoresTransportFlags(t *testing.T) {
+func TestCodexResponsesWSUnsupportedOpenDoesNotMutateRealtimeSession(t *testing.T) {
 	manager := runtimesession.NewManagerWithOptions(runtimesession.ManagerOptions{
 		DefaultTTL: time.Minute,
 		Cleanup:    cleanupCodexExecutionSession,
@@ -1390,37 +1831,35 @@ func TestCodexRequireWSOpenFailureRestoresTransportFlags(t *testing.T) {
 	staleOwnerSeq := state.ownerSeq
 	if state.requireWS || state.deferWSReader {
 		managed.exec.Unlock()
-		t.Fatalf("expected baseline HTTP-bridge session to start without RequireWS flags, state=%+v", state)
+		t.Fatalf("expected baseline HTTP-bridge session to start without websocket-only flags, state=%+v", state)
 	}
 	managed.exec.Unlock()
 
-	failedSession, errWithCode := provider.OpenRealtimeSessionWithOptions("gpt-5", runtimesession.RealtimeOpenOptions{
-		ClientSessionID:    "require-ws-rollback-session",
-		PreferredTransport: runtimesession.TransportModeResponsesWS,
-		RequireWS:          true,
+	failedUpstream, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
+		UpstreamSessionID: "responses-ws-off-test",
 	})
-	if failedSession != nil {
-		failedSession.Abort("unexpected_open")
+	if failedUpstream != nil {
+		failedUpstream.Abort("unexpected_open")
 	}
 	if errWithCode == nil || codexRealtimeErrorCodeString(errWithCode.Code, "") != "responses_ws_unsupported_for_channel" {
-		t.Fatalf("expected RequireWS attach to fail as unsupported, got session=%#v err=%+v", failedSession, errWithCode)
+		t.Fatalf("expected ResponsesWS open to fail as unsupported, got upstream=%#v err=%+v", failedUpstream, errWithCode)
 	}
 
 	managed.exec.Lock()
 	defer managed.exec.Unlock()
 	state = getCodexManagedRuntimeStateLocked(managed.exec)
 	if state.attachment != staleAttachment || state.ownerSeq != staleOwnerSeq {
-		t.Fatalf("expected failed RequireWS attach to restore attachment ownership, state=%+v stale_owner=%d", state, staleOwnerSeq)
+		t.Fatalf("expected failed ResponsesWS open not to mutate realtime attachment ownership, state=%+v stale_owner=%d", state, staleOwnerSeq)
 	}
 	if state.requireWS || state.deferWSReader {
-		t.Fatalf("expected failed RequireWS attach to restore transport flags, require_ws=%v defer_reader=%v", state.requireWS, state.deferWSReader)
+		t.Fatalf("expected failed ResponsesWS open not to set realtime transport flags, require_ws=%v defer_reader=%v", state.requireWS, state.deferWSReader)
 	}
 	if !managed.exec.Attached {
-		t.Fatal("expected original session attachment to remain attached after failed RequireWS open")
+		t.Fatal("expected original realtime session attachment to remain attached after failed ResponsesWS open")
 	}
 }
 
-func TestCodexRequireWSWriteFailureUsesAmbiguousWriteCode(t *testing.T) {
+func TestCodexRealtimeWSWriteFailureUsesAmbiguousWriteCode(t *testing.T) {
 	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"force"}`, nil)
 	exec := runtimesession.NewExecutionSession(runtimesession.Metadata{
 		Key:       "channel:1/hash-a/session-write-fail",
@@ -1435,7 +1874,7 @@ func TestCodexRequireWSWriteFailureUsesAmbiguousWriteCode(t *testing.T) {
 	state := getCodexManagedRuntimeStateLocked(exec)
 	state.requireWS = true
 	state.wsConn = conn
-	exec.Transport = runtimesession.TransportModeResponsesWS
+	exec.Transport = runtimesession.TransportModeRealtimeWS
 	err := provider.sendRealtimeWSEventLocked(
 		context.Background(),
 		exec,
@@ -1453,7 +1892,7 @@ func TestCodexRequireWSWriteFailureUsesAmbiguousWriteCode(t *testing.T) {
 		t.Fatalf("expected codex provider error event, got %v", err)
 	}
 	if got := codexRealtimeErrorCodeString(event.ErrorDetail.Code, ""); got != "ws_write_failed" {
-		t.Fatalf("expected RequireWS websocket write failure to use ambiguous write code, got %q", got)
+		t.Fatalf("expected websocket write failure to use ambiguous write code, got %q", got)
 	}
 }
 
@@ -1483,7 +1922,7 @@ func TestCodexResponsesWSCreateWriteDoesNotHoldExecLock(t *testing.T) {
 	state.requireWS = true
 	state.deferWSReader = true
 	state.wsConn = conn
-	exec.Transport = runtimesession.TransportModeResponsesWS
+	exec.Transport = runtimesession.TransportModeRealtimeWS
 	exec.Attached = true
 	exec.Unlock()
 
@@ -1515,6 +1954,186 @@ func TestCodexResponsesWSCreateWriteDoesNotHoldExecLock(t *testing.T) {
 	}
 }
 
+func TestCodexManagedHTTPBridgeOpenUsesSendContextAndDoesNotHoldExecLock(t *testing.T) {
+	requestStarted := make(chan struct{}, 1)
+	releaseHandler := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case requestStarted <- struct{}{}:
+		default:
+		}
+		select {
+		case <-r.Context().Done():
+		case <-releaseHandler:
+		}
+	}))
+	defer server.Close()
+	defer close(releaseHandler)
+	originalHTTPClient := requester.HTTPClient
+	requester.HTTPClient = server.Client()
+	defer func() {
+		requester.HTTPClient = originalHTTPClient
+	}()
+
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, nil)
+	provider.Channel.BaseURL = stringPtr(server.URL)
+	session, errWithCode := provider.OpenRealtimeSession("gpt-5")
+	if errWithCode != nil {
+		t.Fatalf("open managed session: %v", errWithCode)
+	}
+	defer session.Detach("test_close")
+	defer cleanupCodexManagedSession(t, provider, "gpt-5")
+
+	managed := session.(*codexManagedRealtimeSession)
+	observer := &admissionFailingCodexTurnObserver{}
+	managed.exec.Lock()
+	state := getCodexManagedRuntimeStateLocked(managed.exec)
+	state.turnObserverFactory = func() runtimesession.TurnObserver { return observer }
+	managed.exec.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- session.SendClient(ctx, codexTestTextFrame([]byte(`{"type":"response.create","event_id":"evt_bridge_open_ctx","model":"gpt-5","input":"hi"}`)))
+	}()
+
+	waitCodexRealtimeTestSignal(t, requestStarted, "bridge request start")
+	deadline := time.After(time.Second)
+	for {
+		if managed.exec.TryLock() {
+			inflight := managed.exec.Inflight
+			managed.exec.Unlock()
+			if inflight {
+				break
+			}
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("SendClient returned before lock probe, err=%v", err)
+		case <-deadline:
+			t.Fatal("expected HTTP bridge open to release exec lock while upstream request is pending")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	cancel()
+	if err := waitCodexRealtimeSendDone(t, done); err == nil {
+		t.Fatal("expected cancelled bridge open to return an error")
+	}
+
+	managed.exec.Lock()
+	state = getCodexManagedRuntimeStateLocked(managed.exec)
+	if state.bridgeOpeningCancel != nil || state.bridgeStream != nil || managed.exec.Inflight || managed.exec.State != runtimesession.SessionStateIdle {
+		t.Fatalf("expected cancelled bridge open to leave idle clean state, inflight=%v state=%v opening=%v stream=%v", managed.exec.Inflight, managed.exec.State, state.bridgeOpeningCancel != nil, state.bridgeStream != nil)
+	}
+	managed.exec.Unlock()
+	if observer.admitCount != 1 || observer.rollbackCount != 1 || observer.rollbackReason != "bridge_local_failure" {
+		t.Fatalf("expected cancelled bridge open to rollback admitted turn, admit=%d rollback=%d reason=%q", observer.admitCount, observer.rollbackCount, observer.rollbackReason)
+	}
+}
+
+func TestCodexManagedHTTPBridgeUsesResponsesURLPolicy(t *testing.T) {
+	t.Run("local http requires explicit responses self hosted", func(t *testing.T) {
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, nil)
+		provider.Context.Set("responses_ws_self_hosted", false)
+		provider.Channel.BaseURL = stringPtr("http://127.0.0.1:1")
+
+		stream, errWithCode := provider.createResponsesStreamWithSession(context.Background(), &types.OpenAIResponsesRequest{Model: "gpt-5"}, "session-managed-policy")
+		if stream != nil {
+			stream.Close()
+		}
+		if errWithCode == nil || errWithCode.Code != "ws_request_failed" || errWithCode.StatusCode != http.StatusBadRequest || !strings.Contains(errWithCode.Message, requester.ErrUpstreamResponsesHTTPURLRequiresHTTPS.Error()) {
+			t.Fatalf("expected managed bridge local http URL policy rejection, stream=%T err=%+v", stream, errWithCode)
+		}
+	})
+
+	t.Run("metadata stays blocked even when responses self hosted", func(t *testing.T) {
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, nil)
+		provider.Channel.BaseURL = stringPtr("http://169.254.169.254")
+
+		stream, errWithCode := provider.createResponsesStreamWithSession(context.Background(), &types.OpenAIResponsesRequest{Model: "gpt-5"}, "session-managed-policy")
+		if stream != nil {
+			stream.Close()
+		}
+		if errWithCode == nil || errWithCode.Code != "ws_request_failed" || errWithCode.StatusCode != http.StatusBadRequest || !strings.Contains(errWithCode.Message, requester.ErrUpstreamResponsesHTTPURLHostBlocked.Error()) {
+			t.Fatalf("expected managed bridge metadata URL policy rejection, stream=%T err=%+v", stream, errWithCode)
+		}
+	})
+}
+
+func TestCodexManagedHTTPBridgeCancelDuringOpenCancelsRequestAndDoesNotAdoptStream(t *testing.T) {
+	requestStarted := make(chan struct{}, 1)
+	releaseHandler := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case requestStarted <- struct{}{}:
+		default:
+		}
+		select {
+		case <-r.Context().Done():
+		case <-releaseHandler:
+		}
+	}))
+	defer server.Close()
+	defer close(releaseHandler)
+	originalHTTPClient := requester.HTTPClient
+	requester.HTTPClient = server.Client()
+	defer func() {
+		requester.HTTPClient = originalHTTPClient
+	}()
+
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, nil)
+	provider.Channel.BaseURL = stringPtr(server.URL)
+	session, errWithCode := provider.OpenRealtimeSession("gpt-5")
+	if errWithCode != nil {
+		t.Fatalf("open managed session: %v", errWithCode)
+	}
+	defer session.Detach("test_close")
+	defer cleanupCodexManagedSession(t, provider, "gpt-5")
+
+	done := make(chan error, 1)
+	go func() {
+		done <- session.SendClient(context.Background(), codexTestTextFrame([]byte(`{"type":"response.create","event_id":"evt_bridge_open_cancel","model":"gpt-5","input":"hi"}`)))
+	}()
+
+	waitCodexRealtimeTestSignal(t, requestStarted, "bridge request start")
+	if err := session.SendClient(context.Background(), codexTestTextFrame([]byte(`{"type":"response.cancel","event_id":"evt_cancel_open"}`))); err != nil {
+		t.Fatalf("cancel opening bridge: %v", err)
+	}
+	if err := waitCodexRealtimeSendDone(t, done); err != nil {
+		t.Fatalf("expected cancelled opening create to return cleanly, got %v", err)
+	}
+
+	managed := session.(*codexManagedRealtimeSession)
+	managed.exec.Lock()
+	state := getCodexManagedRuntimeStateLocked(managed.exec)
+	if state.bridgeOpeningCancel != nil || state.bridgeStream != nil || managed.exec.Inflight || managed.exec.State != runtimesession.SessionStateIdle {
+		t.Fatalf("expected response.cancel during bridge open to leave idle clean state, inflight=%v state=%v opening=%v stream=%v", managed.exec.Inflight, managed.exec.State, state.bridgeOpeningCancel != nil, state.bridgeStream != nil)
+	}
+	managed.exec.Unlock()
+}
+
+func waitCodexRealtimeTestSignal(t *testing.T, ch <-chan struct{}, name string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s", name)
+	}
+}
+
+func waitCodexRealtimeSendDone(t *testing.T, ch <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-ch:
+		return err
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for SendClient")
+		return nil
+	}
+}
+
 func TestCodexManagedRealtimeSessionAdmitsTurnBeforeUpstreamWrite(t *testing.T) {
 	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"force"}`, nil)
 	exec := runtimesession.NewExecutionSession(runtimesession.Metadata{
@@ -1543,7 +2162,7 @@ func TestCodexManagedRealtimeSessionAdmitsTurnBeforeUpstreamWrite(t *testing.T) 
 	state.deferWSReader = true
 	state.wsConn = conn
 	state.turnObserverFactory = func() runtimesession.TurnObserver { return observer }
-	exec.Transport = runtimesession.TransportModeResponsesWS
+	exec.Transport = runtimesession.TransportModeRealtimeWS
 	exec.Attached = true
 	exec.Unlock()
 
@@ -1578,7 +2197,7 @@ func TestCodexManagedRealtimeSessionAdmitsTurnBeforeUpstreamWrite(t *testing.T) 
 	exec.Unlock()
 }
 
-func TestCodexRequireWSDeferredReaderStartsReconnectAfterRecvArmed(t *testing.T) {
+func TestCodexWebsocketOnlyDeferredReaderStartsReconnectAfterRecvArmed(t *testing.T) {
 	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"force"}`, nil)
 	exec := runtimesession.NewExecutionSession(runtimesession.Metadata{
 		Key:       "channel:1/hash-a/session-reconnect-reader",
@@ -1606,7 +2225,7 @@ func TestCodexRequireWSDeferredReaderStartsReconnectAfterRecvArmed(t *testing.T)
 	state.requireWS = true
 	state.deferWSReader = true
 	state.wsConn = firstConn
-	exec.Transport = runtimesession.TransportModeResponsesWS
+	exec.Transport = runtimesession.TransportModeRealtimeWS
 	exec.Unlock()
 
 	session.startDeferredRealtimeWSReader()
@@ -1626,11 +2245,11 @@ func TestCodexRequireWSDeferredReaderStartsReconnectAfterRecvArmed(t *testing.T)
 	state.wsConnGeneration++
 	if errWithCode := provider.ensureRealtimeTransportLocked(exec, state, time.Now()); errWithCode != nil {
 		exec.Unlock()
-		t.Fatalf("expected RequireWS reconnect transport to stay websocket, got %v", errWithCode)
+		t.Fatalf("expected websocket-only reconnect transport to stay websocket, got %v", errWithCode)
 	}
 	if state.wsReaderConn != secondConn {
 		exec.Unlock()
-		t.Fatalf("expected RequireWS reconnect to start a new reader after recv pump was armed, got %#v", state.wsReaderConn)
+		t.Fatalf("expected websocket-only reconnect to start a new reader after recv pump was armed, got %#v", state.wsReaderConn)
 	}
 	exec.Unlock()
 }

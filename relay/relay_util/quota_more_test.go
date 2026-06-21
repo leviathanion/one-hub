@@ -746,6 +746,126 @@ func TestConsumeUsageSettlementReconcilesRealtimeQuotaOnError(t *testing.T) {
 	}
 }
 
+func TestConsumeFixedFinalQuotaSettlementReturnsZeroAppliedOnError(t *testing.T) {
+	logger.Logger = zap.NewNop()
+
+	originalDB := model.DB
+	testDB, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("expected in-memory sqlite database, got %v", err)
+	}
+	model.DB = testDB
+	t.Cleanup(func() {
+		model.DB = originalDB
+	})
+
+	quota := &Quota{
+		modelName:      "gpt-5",
+		userId:         1,
+		tokenId:        1,
+		channelId:      1,
+		requestContext: context.Background(),
+	}
+	applied, err := quota.consumeFixedFinalQuotaSettlement(100, nil, true, billing.SettlementRequestKindRealtimeTurn, "fixed-error", false)
+	if err == nil {
+		t.Fatal("expected fixed final quota settlement to fail against an unmigrated database")
+	}
+	if applied != 0 {
+		t.Fatalf("expected failed fixed settlement to report zero applied quota, got %d", applied)
+	}
+}
+
+func TestConsumeFixedFinalQuotaSettlementRejectsFingerprintConflict(t *testing.T) {
+	logger.Logger = zap.NewNop()
+
+	server, err := fakeredis.Start()
+	if err != nil {
+		t.Fatalf("expected fake redis server to start, got %v", err)
+	}
+	defer server.Close()
+	server.RegisterLuaScript(`
+local key = KEYS[1]
+local fingerprint = ARGV[1]
+local ttl_ms = tonumber(ARGV[2])
+
+local current = redis.call('GET', key)
+if not current then
+	redis.call('SET', key, fingerprint, 'PX', ttl_ms)
+	return 1
+end
+if current == fingerprint then
+	return 0
+end
+return -1
+`, func(keys, args []string) int64 {
+		current, ok := server.GetRaw(keys[0])
+		if !ok {
+			server.SetRaw(keys[0], args[0])
+			return 1
+		}
+		if current == args[0] {
+			return 0
+		}
+		return -1
+	})
+
+	originalRedisEnabled := config.RedisEnabled
+	originalRedisClient := commonredis.RDB
+	originalDB := model.DB
+	originalBatchUpdate := config.BatchUpdateEnabled
+	originalLogConsume := config.LogConsumeEnabled
+	testDB, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("expected in-memory sqlite database, got %v", err)
+	}
+	if err := testDB.AutoMigrate(&model.User{}, &model.Token{}, &model.Log{}); err != nil {
+		t.Fatalf("expected schema migration to succeed, got %v", err)
+	}
+	model.DB = testDB
+	config.RedisEnabled = true
+	config.BatchUpdateEnabled = false
+	config.LogConsumeEnabled = false
+	commonredis.RDB = server.Client()
+	t.Cleanup(func() {
+		config.RedisEnabled = originalRedisEnabled
+		config.BatchUpdateEnabled = originalBatchUpdate
+		config.LogConsumeEnabled = originalLogConsume
+		commonredis.RDB = originalRedisClient
+		model.DB = originalDB
+	})
+	if err := model.DB.Create(&model.User{Id: 1, Username: "alice", Quota: 1000, Status: config.UserStatusEnabled, CreatedTime: 1}).Error; err != nil {
+		t.Fatalf("expected user fixture to persist, got %v", err)
+	}
+	if err := model.DB.Session(&gorm.Session{SkipHooks: true}).Create(&model.Token{Id: 1, UserId: 1, Name: "token", Key: "sk-test", Status: config.TokenStatusEnabled, RemainQuota: 1000, CreatedTime: 1, AccessedTime: 1}).Error; err != nil {
+		t.Fatalf("expected token fixture to persist, got %v", err)
+	}
+
+	quota := &Quota{
+		modelName:              "gpt-5",
+		userId:                 1,
+		tokenId:                1,
+		channelId:              1,
+		preConsumedQuota:       100,
+		requestContext:         context.Background(),
+		tokenName:              "token",
+		PreconsumeTruthApplied: true,
+	}
+	first, err := quota.consumeFixedFinalQuotaSettlement(250, &types.Usage{PromptTokens: 3, CompletionTokens: 5, TotalTokens: 8}, true, billing.SettlementRequestKindRealtimeTurn, "fixed-conflict", true)
+	if err != nil {
+		t.Fatalf("expected first fixed settlement to succeed, got %v", err)
+	}
+	if first != 250 {
+		t.Fatalf("expected first fixed settlement applied quota 250, got %d", first)
+	}
+	second, err := quota.consumeFixedFinalQuotaSettlement(0, nil, true, billing.SettlementRequestKindRealtimeTurn, "fixed-conflict", true)
+	if err == nil {
+		t.Fatal("expected conflicting fixed settlement to fail")
+	}
+	if second != 0 {
+		t.Fatalf("expected conflicting fixed settlement to report zero applied quota, got %d", second)
+	}
+}
+
 func TestConsumeUsageSettlementFailurePreservesPreConsumedTruth(t *testing.T) {
 	logger.Logger = zap.NewNop()
 	gin.SetMode(gin.TestMode)

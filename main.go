@@ -56,6 +56,7 @@ func main() {
 
 	logger.SetupLogger()
 	logger.SysLog("One Hub " + config.Version + " started")
+	config.LogRuntimeConfigWarnings()
 	middleware.WarnResponsesWSAnonymousCapacityBucketIfEnabled()
 
 	// Initialize user token

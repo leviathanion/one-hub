@@ -18,6 +18,7 @@ import (
 	"one-api/model"
 	"one-api/providers/base"
 	"one-api/providers/openai"
+	runtimerealtime "one-api/runtime/realtime"
 	runtimesession "one-api/runtime/session"
 	"one-api/types"
 
@@ -122,6 +123,7 @@ func newTestCodexProviderWithContext(t *testing.T, key string, other string, hea
 		req.Header.Set(k, v)
 	}
 	ctx.Request = req
+	ctx.Set("self_hosted", true)
 	ctx.Set("responses_ws_self_hosted", true)
 	provider.Context = ctx
 
@@ -409,7 +411,7 @@ func TestBuildExecutionSessionMetadataPrefersXSessionIDOverConversationSessionID
 	})
 	provider.Context.Set("token_id", 12345)
 
-	meta, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimesession.RealtimeOpenOptions{})
+	meta, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimerealtime.RealtimeOpenOptions{})
 	if errWithCode != nil {
 		t.Fatalf("expected execution session metadata to build, got %v", errWithCode)
 	}
@@ -447,7 +449,7 @@ func TestBuildExecutionSessionMetadataUsesNativeSessionID(t *testing.T) {
 	})
 	provider.Context.Set("token_id", 12345)
 
-	meta, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimesession.RealtimeOpenOptions{})
+	meta, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimerealtime.RealtimeOpenOptions{})
 	if errWithCode != nil {
 		t.Fatalf("expected execution session metadata to build, got %v", errWithCode)
 	}
@@ -466,13 +468,13 @@ func TestBuildExecutionSessionMetadataUsesResolvedUpstreamSessionIDWhenProvided(
 	provider := newTestCodexProviderWithContext(t, key, "", nil)
 	provider.Context.Set("token_id", 12346)
 
-	first, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimesession.RealtimeOpenOptions{
+	first, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimerealtime.RealtimeOpenOptions{
 		ResolvedUpstreamSessionID: "upstream-session-456",
 	})
 	if errWithCode != nil {
 		t.Fatalf("expected first execution session metadata to build, got %v", errWithCode)
 	}
-	second, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimesession.RealtimeOpenOptions{
+	second, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimerealtime.RealtimeOpenOptions{
 		ResolvedUpstreamSessionID: "upstream-session-456",
 	})
 	if errWithCode != nil {
@@ -498,7 +500,7 @@ func TestBuildExecutionSessionMetadataSeparatesCapacityNamespaceFromCallerNamesp
 	provider.Context.Set("id", 77)
 	provider.Context.Set("token_id", 12347)
 
-	meta, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimesession.RealtimeOpenOptions{})
+	meta, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimerealtime.RealtimeOpenOptions{})
 	if errWithCode != nil {
 		t.Fatalf("expected execution session metadata to build, got %v", errWithCode)
 	}
@@ -519,11 +521,11 @@ func TestBuildExecutionSessionMetadataNormalizesFallbackCallerNamespaceFromCanon
 		"x-api-key": "shared-auth-token",
 	})
 
-	metaA, errWithCode := providerA.buildExecutionSessionMetadata("gpt-5", runtimesession.RealtimeOpenOptions{})
+	metaA, errWithCode := providerA.buildExecutionSessionMetadata("gpt-5", runtimerealtime.RealtimeOpenOptions{})
 	if errWithCode != nil {
 		t.Fatalf("expected providerA metadata to build, got %v", errWithCode)
 	}
-	metaB, errWithCode := providerB.buildExecutionSessionMetadata("gpt-5", runtimesession.RealtimeOpenOptions{})
+	metaB, errWithCode := providerB.buildExecutionSessionMetadata("gpt-5", runtimerealtime.RealtimeOpenOptions{})
 	if errWithCode != nil {
 		t.Fatalf("expected providerB metadata to build, got %v", errWithCode)
 	}
@@ -542,7 +544,7 @@ func TestBuildExecutionSessionMetadataRejectsInvalidSessionID(t *testing.T) {
 		"X-Session-Id": "bad/session",
 	})
 
-	_, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimesession.RealtimeOpenOptions{})
+	_, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimerealtime.RealtimeOpenOptions{})
 	if errWithCode == nil {
 		t.Fatal("expected invalid execution session id to be rejected")
 	}
@@ -557,7 +559,7 @@ func TestBuildExecutionSessionMetadataRejectsOverlongSessionID(t *testing.T) {
 		"X-Session-Id": strings.Repeat("a", runtimesession.ClientSessionIDMaxLen+1),
 	})
 
-	_, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimesession.RealtimeOpenOptions{})
+	_, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimerealtime.RealtimeOpenOptions{})
 	if errWithCode == nil {
 		t.Fatal("expected overlong execution session id to be rejected")
 	}

@@ -1,7 +1,7 @@
 package session
 
 import (
-	stderrors "errors"
+	"encoding/json"
 	"net/http"
 	"testing"
 	"time"
@@ -9,41 +9,69 @@ import (
 	"one-api/types"
 )
 
-func TestClientPayloadErrorHelpersWithCauseAndNilReceiver(t *testing.T) {
-	if err := NewClientPayloadError(nil, nil); err != nil {
-		t.Fatalf("expected nil payload+cause to produce nil error, got %v", err)
-	}
-	payloadOnly := NewClientPayloadError(nil, []byte("payload-only"))
-	if payloadOnly == nil || payloadOnly.Error() != "payload-only" {
-		t.Fatalf("expected payload-only error string, got %v", payloadOnly)
-	}
-
-	baseErr := stderrors.New("base failure")
-	originalPayload := []byte(`{"type":"error","message":"payload"}`)
-	err := NewClientPayloadError(baseErr, originalPayload)
-	if err == nil {
-		t.Fatal("expected client payload error")
-	}
-	originalPayload[0] = '!'
-	if got := string(ClientPayloadFromError(err)); got != `{"type":"error","message":"payload"}` {
-		t.Fatalf("expected client payload helper to clone payload bytes, got %q", got)
-	}
-	if err.Error() != baseErr.Error() {
-		t.Fatalf("expected client payload error string to follow cause, got %q", err.Error())
-	}
-	if !stderrors.Is(err, baseErr) {
-		t.Fatal("expected client payload error to unwrap to original cause")
+func TestNormalizeResponsesWSTransport(t *testing.T) {
+	cases := []struct {
+		name   string
+		value  string
+		want   TransportMode
+		wantOK bool
+	}{
+		{name: "empty defaults native", value: "", want: TransportModeResponsesWS, wantOK: true},
+		{name: "native", value: "native", want: TransportModeResponsesWS, wantOK: true},
+		{name: "native trims case", value: " Native ", want: TransportModeResponsesWS, wantOK: true},
+		{name: "http bridge", value: "http_bridge", want: TransportModeResponsesHTTPBridge, wantOK: true},
+		{name: "http bridge trims case", value: " HTTP_BRIDGE ", want: TransportModeResponsesHTTPBridge, wantOK: true},
+		{name: "invalid auto", value: "auto"},
+		{name: "invalid websocket", value: "websocket"},
 	}
 
-	var nilErr *ClientPayloadError
-	if nilErr.Error() != "" {
-		t.Fatalf("expected nil ClientPayloadError string to be empty, got %q", nilErr.Error())
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := NormalizeResponsesWSTransport(tc.value)
+			if got != tc.want || ok != tc.wantOK {
+				t.Fatalf("expected mode=%q ok=%v, got mode=%q ok=%v", tc.want, tc.wantOK, got, ok)
+			}
+		})
 	}
-	if nilErr.Unwrap() != nil {
-		t.Fatal("expected nil ClientPayloadError unwrap to return nil")
+}
+
+func TestParseResponsesWSTransportField(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     json.RawMessage
+		want    TransportMode
+		wantErr bool
+	}{
+		{name: "missing defaults native", raw: nil, want: TransportModeResponsesWS},
+		{name: "null defaults native", raw: json.RawMessage(`null`), want: TransportModeResponsesWS},
+		{name: "native", raw: json.RawMessage(`"native"`), want: TransportModeResponsesWS},
+		{name: "http bridge", raw: json.RawMessage(`" HTTP_BRIDGE "`), want: TransportModeResponsesHTTPBridge},
+		{name: "non string", raw: json.RawMessage(`123`), wantErr: true},
+		{name: "invalid value", raw: json.RawMessage(`"auto"`), wantErr: true},
 	}
-	if payload := ClientPayloadFromError(baseErr); payload != nil {
-		t.Fatalf("expected non-payload errors to return nil payload, got %q", string(payload))
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ParseResponsesWSTransportField(tc.raw)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected parse error, got mode=%q", got)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("expected mode=%q without error, got mode=%q err=%v", tc.want, got, err)
+			}
+		})
+	}
+}
+
+func TestResponsesWSTransportConfigValue(t *testing.T) {
+	if got := ResponsesWSTransportConfigValue(TransportModeResponsesWS); got != "native" {
+		t.Fatalf("expected native config value, got %q", got)
+	}
+	if got := ResponsesWSTransportConfigValue(TransportModeResponsesHTTPBridge); got != "http_bridge" {
+		t.Fatalf("expected http_bridge config value, got %q", got)
 	}
 }
 

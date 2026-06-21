@@ -21,6 +21,12 @@ var (
 	ErrUpstreamRealtimeURLRequiresWSS   = errors.New("upstream realtime websocket requires wss")
 	ErrUpstreamRealtimeURLHostBlocked   = errors.New("upstream realtime websocket host is not allowed")
 	ErrUpstreamRealtimeURLResolveFailed = errors.New("upstream realtime websocket host could not be resolved")
+
+	ErrUpstreamResponsesHTTPURLInvalid       = errors.New("upstream responses http url is invalid")
+	ErrUpstreamResponsesHTTPURLUnsupported   = errors.New("unsupported upstream responses http url scheme")
+	ErrUpstreamResponsesHTTPURLRequiresHTTPS = errors.New("upstream responses http bridge requires https")
+	ErrUpstreamResponsesHTTPURLHostBlocked   = errors.New("upstream responses http bridge host is not allowed")
+	ErrUpstreamResponsesHTTPURLResolveFailed = errors.New("upstream responses http bridge host could not be resolved")
 )
 
 type UpstreamRealtimeURLPolicy struct {
@@ -59,6 +65,33 @@ func UpstreamRealtimeURLStatusCode(err error) int {
 		return validationErr.StatusCode
 	}
 	return http.StatusBadRequest
+}
+
+func UpstreamResponsesHTTPURLStatusCode(err error) int {
+	var validationErr *UpstreamResponsesHTTPURLValidationError
+	if errors.As(err, &validationErr) && validationErr != nil && validationErr.StatusCode > 0 {
+		return validationErr.StatusCode
+	}
+	return http.StatusBadRequest
+}
+
+type UpstreamResponsesHTTPURLValidationError struct {
+	Err        error
+	StatusCode int
+}
+
+func (e *UpstreamResponsesHTTPURLValidationError) Error() string {
+	if e == nil || e.Err == nil {
+		return ErrUpstreamResponsesHTTPURLInvalid.Error()
+	}
+	return e.Err.Error()
+}
+
+func (e *UpstreamResponsesHTTPURLValidationError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
 }
 
 func ValidateUpstreamRealtimeURL(rawURL string, policy UpstreamRealtimeURLPolicy) (string, error) {
@@ -133,6 +166,10 @@ func upstreamRealtimeURLValidationError(err error, status int) error {
 	return &UpstreamRealtimeURLValidationError{Err: err, StatusCode: status}
 }
 
+func upstreamResponsesHTTPURLValidationError(err error, status int) error {
+	return &UpstreamResponsesHTTPURLValidationError{Err: err, StatusCode: status}
+}
+
 func UpstreamRealtimeHostBlocked(host string) bool {
 	host = strings.TrimSuffix(strings.TrimSpace(strings.ToLower(host)), ".")
 	if host == "" || host == "localhost" || strings.HasSuffix(host, ".localhost") {
@@ -146,6 +183,9 @@ func UpstreamRealtimeHostBlocked(host string) bool {
 
 func UpstreamRealtimeMetadataHostBlocked(host string) bool {
 	host = strings.TrimSuffix(strings.TrimSpace(strings.ToLower(host)), ".")
+	if host == "metadata.google.internal" {
+		return true
+	}
 	if ip, err := netip.ParseAddr(host); err == nil {
 		return UpstreamRealtimeMetadataIPBlocked(ip)
 	}

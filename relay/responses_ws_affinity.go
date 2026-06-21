@@ -3,6 +3,7 @@ package relay
 import (
 	"errors"
 	"fmt"
+	"one-api/common/config"
 	runtimeaffinity "one-api/runtime/channelaffinity"
 	"one-api/types"
 	"strings"
@@ -76,6 +77,33 @@ func ClearResponsesTurnStaleBindings(activeOrCandidate *ResponsesTurnAffinity, o
 		if ok && record.ChannelID == ownerChannelID {
 			manager.Delete(binding.Key)
 			deleted[binding.Key] = struct{}{}
+		}
+	}
+}
+
+func ClearResponsesTurnContinuationMissBindings(activeOrCandidate *ResponsesTurnAffinity, ownerChannelID int, attemptedPreviousResponseID string) {
+	ClearResponsesTurnStaleBindings(activeOrCandidate, ownerChannelID)
+	if activeOrCandidate == nil || activeOrCandidate.State == nil || ownerChannelID <= 0 {
+		return
+	}
+	attemptedPreviousResponseID = strings.TrimSpace(attemptedPreviousResponseID)
+	if attemptedPreviousResponseID == "" {
+		return
+	}
+	manager := channelAffinityManager()
+	deleted := map[string]struct{}{}
+	for _, recorder := range activeOrCandidate.State.DerivedRecorders[config.ChannelAffinityAliasResponseID] {
+		key := recorder.BuildKey(attemptedPreviousResponseID)
+		if strings.TrimSpace(key) == "" {
+			continue
+		}
+		if _, ok := deleted[key]; ok {
+			continue
+		}
+		record, ok := manager.Get(key)
+		if ok && record.ChannelID == ownerChannelID {
+			manager.Delete(key)
+			deleted[key] = struct{}{}
 		}
 	}
 }

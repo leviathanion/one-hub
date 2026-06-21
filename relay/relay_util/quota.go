@@ -124,6 +124,13 @@ func (q *Quota) ModelName() string {
 	return q.modelName
 }
 
+func (q *Quota) PreConsumedQuota() int {
+	if q == nil {
+		return 0
+	}
+	return q.preConsumedQuota
+}
+
 func readQuotaCallerNamespace(c *gin.Context) string {
 	if c != nil {
 		if tokenID := c.GetInt("token_id"); tokenID > 0 {
@@ -361,6 +368,16 @@ func (q *Quota) ConsumeWithIdentity(c *gin.Context, usage *types.Usage, isStream
 	return q.ConsumeUsageWithIdentity(usage, isStream, requestKind, identity, deduplicate)
 }
 
+func (q *Quota) ConsumeFixedFinalQuotaWithIdentity(c *gin.Context, finalQuota int64, requestKind billing.SettlementRequestKind, identity string, deduplicate bool) (int64, string, error) {
+	return q.ConsumeFixedFinalQuotaWithUsageIdentity(c, finalQuota, nil, requestKind, identity, deduplicate)
+}
+
+func (q *Quota) ConsumeFixedFinalQuotaWithUsageIdentity(c *gin.Context, finalQuota int64, usage *types.Usage, requestKind billing.SettlementRequestKind, identity string, deduplicate bool) (int64, string, error) {
+	q.prepareConsumeContext(c)
+	appliedQuota, err := q.consumeFixedFinalQuotaSettlement(finalQuota, usage, true, requestKind, identity, deduplicate)
+	return appliedQuota, identity, err
+}
+
 func (q *Quota) prepareConsumeContext(c *gin.Context) {
 	if q == nil {
 		return
@@ -418,6 +435,15 @@ func (q *Quota) ConsumeUsageWithIdentity(usage *types.Usage, isStream bool, requ
 
 func (q *Quota) BuildSettlementEnvelope(usage *types.Usage, isStream bool, requestKind billing.SettlementRequestKind, identity string, deduplicate bool) *billing.SettlementEnvelope {
 	return q.buildSettlementEnvelopeWithFinalQuotaFloor(usage, isStream, requestKind, identity, deduplicate, 0)
+}
+
+func (q *Quota) buildSettlementEnvelopeWithFixedFinalQuota(finalQuota int, usage *types.Usage, isStream bool, requestKind billing.SettlementRequestKind, identity string, deduplicate bool) *billing.SettlementEnvelope {
+	envelope := q.buildSettlementEnvelopeWithFinalQuotaFloor(usage, isStream, requestKind, identity, deduplicate, 0)
+	if envelope == nil {
+		return nil
+	}
+	envelope.Command.FinalQuota = finalQuota
+	return envelope
 }
 
 func (q *Quota) buildSettlementEnvelopeWithFinalQuotaFloor(usage *types.Usage, isStream bool, requestKind billing.SettlementRequestKind, identity string, deduplicate bool, finalQuotaFloor int) *billing.SettlementEnvelope {
@@ -505,6 +531,51 @@ func (q *Quota) consumeUsageSettlementWithFinalQuotaFloor(usage *types.Usage, is
 	}
 	q.reconcileRealtimeQuotaCache()
 	return nil
+}
+
+func (q *Quota) consumeFixedFinalQuotaSettlement(finalQuota int64, usage *types.Usage, isStream bool, requestKind billing.SettlementRequestKind, identity string, deduplicate bool) (int64, error) {
+	if q == nil {
+		return 0, nil
+	}
+	if finalQuota < 0 {
+		return 0, errors.New("fixed final quota cannot be negative")
+	}
+	maxInt := int64(int(^uint(0) >> 1))
+	if finalQuota > maxInt {
+		return 0, errors.New("fixed final quota exceeds platform int range")
+	}
+
+	q.requestContext = detachQuotaContext(q.requestContext)
+	if q.startTime.IsZero() {
+		q.startTime = time.Now()
+	}
+
+	envelope := q.buildSettlementEnvelopeWithFixedFinalQuota(int(finalQuota), usage, isStream, requestKind, identity, deduplicate)
+	if envelope == nil {
+		return 0, nil
+	}
+
+	result, err := billing.ApplySettlement(q.requestContext, envelope.Command, &envelope.Options)
+	if err != nil {
+		q.reconcileRealtimeQuotaCache()
+		return 0, errors.New("error applying settlement: " + err.Error())
+	}
+	if result.Deduplicated {
+		if result.FingerprintConflict {
+			return 0, errors.New("settlement identity fingerprint conflict")
+		}
+		return int64(envelope.Command.FinalQuota), nil
+	}
+	if result.TruthApplied {
+		if q.cacheQuota > 0 && !result.CleanupFailed {
+			q.cacheQuota = 0
+		}
+		q.PreconsumeTruthApplied = false
+		q.PreconsumeCacheApplied = false
+		return int64(envelope.Command.FinalQuota), nil
+	}
+	q.reconcileRealtimeQuotaCache()
+	return int64(envelope.Command.FinalQuota), nil
 }
 
 func detachQuotaContext(ctx context.Context) context.Context {

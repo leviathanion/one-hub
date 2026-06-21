@@ -20,14 +20,13 @@ import (
 	providersBase "one-api/providers/base"
 	"one-api/providers/codex"
 	runtimeaffinity "one-api/runtime/channelaffinity"
+	runtimerealtime "one-api/runtime/realtime"
 	runtimesession "one-api/runtime/session"
 	"one-api/types"
 
 	"github.com/gin-gonic/gin"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
-	"gorm.io/driver/sqlite"
-	"gorm.io/gorm"
 )
 
 type relayTestRealtimeSession struct{}
@@ -36,9 +35,9 @@ func init() {
 	logger.Logger = zap.NewNop()
 }
 
-func (relayTestRealtimeSession) SendClient(context.Context, runtimesession.Frame) error { return nil }
-func (relayTestRealtimeSession) Recv(context.Context) (runtimesession.RecvEvent, error) {
-	return runtimesession.RecvEvent{}, nil
+func (relayTestRealtimeSession) SendClient(context.Context, runtimerealtime.Frame) error { return nil }
+func (relayTestRealtimeSession) Recv(context.Context) (runtimerealtime.RecvEvent, error) {
+	return runtimerealtime.RecvEvent{}, nil
 }
 func (relayTestRealtimeSession) Detach(string) {}
 func (relayTestRealtimeSession) Abort(string)  {}
@@ -46,8 +45,8 @@ func (relayTestRealtimeSession) SetTurnObserverFactory(runtimesession.TurnObserv
 }
 
 type relayActorTestSession struct {
-	sendCh chan runtimesession.Frame
-	recvCh chan runtimesession.RecvEvent
+	sendCh chan runtimerealtime.Frame
+	recvCh chan runtimerealtime.RecvEvent
 
 	mu            sync.Mutex
 	detachReasons []string
@@ -56,12 +55,12 @@ type relayActorTestSession struct {
 
 func newRelayActorTestSession() *relayActorTestSession {
 	return &relayActorTestSession{
-		sendCh: make(chan runtimesession.Frame, 8),
-		recvCh: make(chan runtimesession.RecvEvent, 8),
+		sendCh: make(chan runtimerealtime.Frame, 8),
+		recvCh: make(chan runtimerealtime.RecvEvent, 8),
 	}
 }
 
-func (s *relayActorTestSession) SendClient(ctx context.Context, frame runtimesession.Frame) error {
+func (s *relayActorTestSession) SendClient(ctx context.Context, frame runtimerealtime.Frame) error {
 	select {
 	case s.sendCh <- frame:
 		return nil
@@ -70,12 +69,12 @@ func (s *relayActorTestSession) SendClient(ctx context.Context, frame runtimeses
 	}
 }
 
-func (s *relayActorTestSession) Recv(ctx context.Context) (runtimesession.RecvEvent, error) {
+func (s *relayActorTestSession) Recv(ctx context.Context) (runtimerealtime.RecvEvent, error) {
 	select {
 	case event := <-s.recvCh:
 		return event, nil
 	case <-ctx.Done():
-		return runtimesession.RecvEvent{}, ctx.Err()
+		return runtimerealtime.RecvEvent{}, ctx.Err()
 	}
 }
 
@@ -115,17 +114,17 @@ func (p *relayTestBaseProvider) GetSupportedResponse() bool { return false }
 
 type relayTestRealtimeProvider struct {
 	relayTestBaseProvider
-	openFn func(modelName string, options runtimesession.RealtimeOpenOptions) (runtimesession.RealtimeSession, *types.OpenAIErrorWithStatusCode)
+	openFn func(modelName string, options runtimerealtime.RealtimeOpenOptions) (runtimerealtime.RealtimeSession, *types.OpenAIErrorWithStatusCode)
 }
 
-func (p *relayTestRealtimeProvider) OpenRealtimeSession(modelName string) (runtimesession.RealtimeSession, *types.OpenAIErrorWithStatusCode) {
+func (p *relayTestRealtimeProvider) OpenRealtimeSession(modelName string) (runtimerealtime.RealtimeSession, *types.OpenAIErrorWithStatusCode) {
 	if p.openFn != nil {
-		return p.openFn(modelName, runtimesession.RealtimeOpenOptions{})
+		return p.openFn(modelName, runtimerealtime.RealtimeOpenOptions{})
 	}
 	return relayTestRealtimeSession{}, nil
 }
 
-func (p *relayTestRealtimeProvider) OpenRealtimeSessionWithOptions(modelName string, options runtimesession.RealtimeOpenOptions) (runtimesession.RealtimeSession, *types.OpenAIErrorWithStatusCode) {
+func (p *relayTestRealtimeProvider) OpenRealtimeSessionWithOptions(modelName string, options runtimerealtime.RealtimeOpenOptions) (runtimerealtime.RealtimeSession, *types.OpenAIErrorWithStatusCode) {
 	if p.openFn != nil {
 		return p.openFn(modelName, options)
 	}
@@ -622,18 +621,7 @@ func TestRelayModeChatRealtimeGetProviderFreshRerouteReplacesStaleBindingAfterAf
 func TestRelayModeChatRealtimeGetProviderPinnedChannelOverridesAffinity(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	originalDB := model.DB
-	testDB, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
-	if err != nil {
-		t.Fatalf("expected in-memory sqlite database, got %v", err)
-	}
-	if err := testDB.AutoMigrate(&model.Channel{}); err != nil {
-		t.Fatalf("expected channel schema migration, got %v", err)
-	}
-	model.DB = testDB
-	t.Cleanup(func() {
-		model.DB = originalDB
-	})
+	setupRelayTestDB(t, &model.Channel{})
 
 	const (
 		sessionID         = "client-session-pinned-force-fresh"
@@ -977,10 +965,10 @@ func TestRealtimeHelperFunctionsAndFallbacks(t *testing.T) {
 		t.Fatal("expected unrelated local error not to force fresh")
 	}
 
-	calls := make([]runtimesession.RealtimeOpenOptions, 0, 2)
+	calls := make([]runtimerealtime.RealtimeOpenOptions, 0, 2)
 	provider := &relayTestRealtimeProvider{
 		relayTestBaseProvider: relayTestBaseProvider{channel: newRelayTestCodexChannel(99)},
-		openFn: func(modelName string, options runtimesession.RealtimeOpenOptions) (runtimesession.RealtimeSession, *types.OpenAIErrorWithStatusCode) {
+		openFn: func(modelName string, options runtimerealtime.RealtimeOpenOptions) (runtimerealtime.RealtimeSession, *types.OpenAIErrorWithStatusCode) {
 			calls = append(calls, options)
 			if len(calls) == 1 {
 				return nil, &types.OpenAIErrorWithStatusCode{
@@ -993,7 +981,7 @@ func TestRealtimeHelperFunctionsAndFallbacks(t *testing.T) {
 			return relayTestRealtimeSession{}, nil
 		},
 	}
-	session, apiErr := openRealtimeSessionWithFreshFallback(provider, "gpt-5", runtimesession.RealtimeOpenOptions{
+	session, apiErr := openRealtimeSessionWithFreshFallback(provider, "gpt-5", runtimerealtime.RealtimeOpenOptions{
 		ClientSessionID: "session-123",
 	})
 	if apiErr != nil || session == nil {
@@ -1003,7 +991,7 @@ func TestRealtimeHelperFunctionsAndFallbacks(t *testing.T) {
 		t.Fatalf("expected second realtime open attempt to force fresh, got %+v", calls)
 	}
 
-	if _, apiErr := openRealtimeSessionWithOptions(&relayTestBaseProvider{}, "gpt-5", runtimesession.RealtimeOpenOptions{}); apiErr == nil || apiErr.Message != "channel not implemented" {
+	if _, apiErr := openRealtimeSessionWithOptions(&relayTestBaseProvider{}, "gpt-5", runtimerealtime.RealtimeOpenOptions{}); apiErr == nil || apiErr.Message != "channel not implemented" {
 		t.Fatalf("expected unsupported provider to return channel-not-implemented, got %v", apiErr)
 	}
 }
@@ -1140,10 +1128,10 @@ func TestRealtimeRelayActorProviderFrameWritesDownstream(t *testing.T) {
 	serverConn, client := newRelayWebsocketPair(t)
 	actor := newRealtimeRelayActor(serverConn, newRelayActorTestSession(), time.Second)
 
-	textFrame := runtimesession.NewTextFrame([]byte(`{"type":"response.text.delta","delta":"hi"}`))
-	if !actor.deliverEventFrame(runtimesession.RecvEvent{
+	textFrame := runtimerealtime.NewTextFrame([]byte(`{"type":"response.text.delta","delta":"hi"}`))
+	if !actor.deliverEventFrame(runtimerealtime.RecvEvent{
 		Frame:  &textFrame,
-		Origin: runtimesession.RealtimePayloadOriginProvider,
+		Origin: runtimerealtime.RealtimePayloadOriginProvider,
 	}) {
 		t.Fatal("expected text provider frame to be delivered")
 	}
@@ -1152,10 +1140,10 @@ func TestRealtimeRelayActorProviderFrameWritesDownstream(t *testing.T) {
 		t.Fatalf("unexpected downstream text frame mt=%d payload=%s", frame.messageType, frame.payload)
 	}
 
-	binaryFrame := runtimesession.NewBinaryFrame([]byte{1, 2, 3})
-	if !actor.deliverEventFrame(runtimesession.RecvEvent{
+	binaryFrame := runtimerealtime.NewBinaryFrame([]byte{1, 2, 3})
+	if !actor.deliverEventFrame(runtimerealtime.RecvEvent{
 		Frame:  &binaryFrame,
-		Origin: runtimesession.RealtimePayloadOriginProvider,
+		Origin: runtimerealtime.RealtimePayloadOriginProvider,
 	}) {
 		t.Fatal("expected binary provider frame to be delivered")
 	}
@@ -1199,7 +1187,7 @@ func TestRealtimeRelayActorProviderClosePreservesPrivateWireCode(t *testing.T) {
 	serverConn, client := newRelayWebsocketPair(t)
 	actor := newRealtimeRelayActor(serverConn, newRelayActorTestSession(), time.Second)
 
-	exit := actor.providerCloseExit(&runtimesession.ProviderClose{
+	exit := actor.providerCloseExit(&runtimerealtime.ProviderClose{
 		Code:   4408,
 		Reason: "session_expired",
 	}, nil)
@@ -1220,11 +1208,11 @@ func TestRealtimeRelayActorProviderCloseClosesDownstreamAtRecvPoint(t *testing.T
 	actor.workers.Add(1)
 	go actor.runWorker(actor.sessionToClient)
 
-	session.recvCh <- runtimesession.RecvEvent{
-		ProviderClose: &runtimesession.ProviderClose{
+	session.recvCh <- runtimerealtime.RecvEvent{
+		ProviderClose: &runtimerealtime.ProviderClose{
 			Code:   4408,
 			Reason: "session_expired",
-			Err:    runtimesession.ErrSessionClosed,
+			Err:    runtimerealtime.ErrSessionClosed,
 		},
 	}
 

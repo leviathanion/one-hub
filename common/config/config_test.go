@@ -1,10 +1,14 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 
+	"one-api/common/logger"
+
 	"github.com/spf13/viper"
+	"go.uber.org/zap"
 )
 
 func TestInitConfLoadsRealtimeSessionCompatFlagAndDefaults(t *testing.T) {
@@ -70,6 +74,12 @@ func TestInitConfLoadsRealtimeSessionCompatFlagAndDefaults(t *testing.T) {
 	}
 	if got := viper.GetInt("responses_websocket_client_inbound_activity_timeout_ms"); got != 300000 {
 		t.Fatalf("expected responses websocket client inbound activity timeout default 300000ms, got %d", got)
+	}
+	if got := viper.GetInt("responses_ws.active_turn_timeout_ms"); got != 120000 {
+		t.Fatalf("expected ResponsesWS active turn timeout default 120000ms, got %d", got)
+	}
+	if got := viper.GetInt("responses_ws.bridge_open_timeout_ms"); got != 30000 {
+		t.Fatalf("expected ResponsesWS bridge open timeout default 30000ms, got %d", got)
 	}
 	if !viper.GetBool("responses_ws.active_lease_redis_fail_open") {
 		t.Fatal("expected ResponsesWS active lease Redis fail-open compatibility to be enabled by default")
@@ -163,6 +173,49 @@ func TestRealtimeWebsocketPingIntervalExplicitNonPositiveDisables(t *testing.T) 
 	}
 }
 
+func TestLogRuntimeConfigWarningsBridgeOpenTimeoutDisabled(t *testing.T) {
+	originalLogger := logger.Logger
+	logger.Logger = zap.NewNop()
+	originalWarnings := runtimeConfigWarningsLogged
+	runtimeConfigWarningsLogged = map[string]bool{}
+	viper.Reset()
+	t.Cleanup(func() {
+		logger.Logger = originalLogger
+		runtimeConfigWarningsLogged = originalWarnings
+		viper.Reset()
+	})
+
+	before := countRuntimeWarningLogs("bridge opening watchdog")
+	defaultConfig()
+	LogRuntimeConfigWarnings()
+	if got := countRuntimeWarningLogs("bridge opening watchdog"); got != before {
+		t.Fatalf("expected default bridge_open_timeout_ms not to warn, before=%d after=%d", before, got)
+	}
+
+	viper.Set("responses_ws.bridge_open_timeout_ms", 0)
+	LogRuntimeConfigWarnings()
+	afterFirst := countRuntimeWarningLogs("bridge opening watchdog")
+	if afterFirst != before+1 {
+		t.Fatalf("expected explicit disabled bridge open timeout to warn once, before=%d after=%d", before, afterFirst)
+	}
+
+	LogRuntimeConfigWarnings()
+	if got := countRuntimeWarningLogs("bridge opening watchdog"); got != afterFirst {
+		t.Fatalf("expected runtime config warning to be emitted once, afterFirst=%d afterSecond=%d", afterFirst, got)
+	}
+}
+
+func countRuntimeWarningLogs(needle string) int {
+	entries, _ := logger.GetLatestLogs(500)
+	count := 0
+	for _, entry := range entries {
+		if strings.Contains(entry.Message, needle) {
+			count++
+		}
+	}
+	return count
+}
+
 func TestConnectTimeoutUsesConfiguredSecondsWithFallback(t *testing.T) {
 	viper.Reset()
 	t.Cleanup(func() {
@@ -227,6 +280,29 @@ func TestSplitWebsocketClientLivenessConfig(t *testing.T) {
 	viper.Set("responses_websocket_client_inbound_activity_timeout_ms", 1500)
 	if got := ResponsesWebsocketClientInboundActivityTimeout(); got != 1500*time.Millisecond {
 		t.Fatalf("expected explicit responses client inbound activity timeout to apply, got %s", got)
+	}
+
+	if got := ResponsesWSActiveTurnTimeout(); got != 2*time.Minute {
+		t.Fatalf("expected unset responses active turn timeout to default 2m, got %s", got)
+	}
+	viper.Set("responses_ws.active_turn_timeout_ms", 1500)
+	if got := ResponsesWSActiveTurnTimeout(); got != 1500*time.Millisecond {
+		t.Fatalf("expected explicit responses active turn timeout to apply, got %s", got)
+	}
+	viper.Set("responses_ws.active_turn_timeout_ms", 0)
+	if got := ResponsesWSActiveTurnTimeout(); got != 2*time.Minute {
+		t.Fatalf("expected non-positive responses active turn timeout to fall back to 2m, got %s", got)
+	}
+	if got := ResponsesWSBridgeOpenTimeout(); got != 30*time.Second {
+		t.Fatalf("expected unset responses bridge open timeout to default 30s, got %s", got)
+	}
+	viper.Set("responses_ws.bridge_open_timeout_ms", 1500)
+	if got := ResponsesWSBridgeOpenTimeout(); got != 1500*time.Millisecond {
+		t.Fatalf("expected explicit responses bridge open timeout to apply, got %s", got)
+	}
+	viper.Set("responses_ws.bridge_open_timeout_ms", 0)
+	if got := ResponsesWSBridgeOpenTimeout(); got != 0 {
+		t.Fatalf("expected non-positive responses bridge open timeout to disable watchdog, got %s", got)
 	}
 
 	viper.Reset()

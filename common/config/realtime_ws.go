@@ -61,6 +61,17 @@ func ResponsesWSFirstFrameTimeout() time.Duration {
 	return time.Duration(timeoutMS) * time.Millisecond
 }
 
+func ResponsesWSBridgeOpenTimeout() time.Duration {
+	return durationFromViperMS("responses_ws.bridge_open_timeout_ms", 30*time.Second, true)
+}
+
+func ResponsesWSActiveLeaseRedisFailOpen() bool {
+	if !viper.IsSet("responses_ws.active_lease_redis_fail_open") {
+		return true
+	}
+	return viper.GetBool("responses_ws.active_lease_redis_fail_open")
+}
+
 func ResponsesWebsocketClientPingInterval() time.Duration {
 	return durationFromViperMS("responses_websocket_client_ping_interval_ms", 25*time.Second, true)
 }
@@ -77,6 +88,14 @@ func ResponsesWSIdleTimeout() time.Duration {
 	timeoutMS := viper.GetInt("responses_ws.idle_timeout_ms")
 	if timeoutMS <= 0 {
 		return 30 * time.Minute
+	}
+	return time.Duration(timeoutMS) * time.Millisecond
+}
+
+func ResponsesWSActiveTurnTimeout() time.Duration {
+	timeoutMS := viper.GetInt("responses_ws.active_turn_timeout_ms")
+	if timeoutMS <= 0 {
+		return 2 * time.Minute
 	}
 	return time.Duration(timeoutMS) * time.Millisecond
 }

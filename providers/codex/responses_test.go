@@ -1,9 +1,12 @@
 package codex
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,8 +16,36 @@ import (
 
 	"one-api/common/config"
 	"one-api/common/requester"
+	"one-api/common/responsesws"
 	"one-api/types"
 )
+
+func TestCodexResponsesHTTPBridgeURLPreflightUsesOpenContext(t *testing.T) {
+	originalResolver := net.DefaultResolver
+	net.DefaultResolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+	t.Cleanup(func() {
+		net.DefaultResolver = originalResolver
+	})
+
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := provider.validateResponsesWSHTTPBridgeURL(ctx, "https://slow-dns.test/backend-api/codex/responses")
+	if err == nil {
+		t.Fatal("expected canceled bridge URL preflight to fail")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("expected bridge URL preflight to honor open context, took %s", elapsed)
+	}
+}
 
 type fakeStringStream struct {
 	dataChan  chan string
@@ -34,6 +65,86 @@ func (s *fakeStringStream) Close() {
 	s.closeOnce.Do(func() {
 		close(s.closed)
 	})
+}
+
+func TestCodexResponsesWSAdapterTreatsBinaryProviderFrameAsMalformed(t *testing.T) {
+	adapter := &codexResponsesWSAdapter{}
+	if _, ok := any(adapter).(responsesws.BinaryProviderFrameCapable); ok {
+		t.Fatal("expected codex responses websocket adapter not to opt into binary provider frames")
+	}
+	result := adapter.HandleProviderFrame(context.Background(), responsesws.NewBinaryFrame([]byte("binary")))
+	if result.Origin != responsesws.RecvDetailOriginProviderMalformed || result.Err == nil || !result.CloseTransport || result.EmitFrame != nil {
+		t.Fatalf("expected binary provider frame to become provider_malformed, got %+v", result)
+	}
+}
+
+func TestCodexResponsesWSAdapterTreatsMalformedTextProviderFrameAsMalformed(t *testing.T) {
+	adapter := &codexResponsesWSAdapter{}
+	result := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame([]byte(`{"type":`)))
+	if result.Origin != responsesws.RecvDetailOriginProviderMalformed || result.Err == nil || !result.CloseTransport || result.EmitFrame != nil {
+		t.Fatalf("expected malformed text provider frame to become provider_malformed, got %+v", result)
+	}
+	if payload := responsesws.ClientPayloadFromError(result.Err); len(payload) != 0 {
+		t.Fatalf("expected provider malformed error not to carry client payload, got %q", payload)
+	}
+}
+
+func TestCodexResponsesWSAdapterFutureProviderEventShapePassesThrough(t *testing.T) {
+	adapter := &codexResponsesWSAdapter{provider: &CodexProvider{}, model: "gpt-5"}
+	payload := []byte(`{"type":"response.future","event_id":"evt_future","response":"opaque","future":{"enabled":true}}`)
+	result := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame(payload))
+	if result.Err != nil || result.CloseTransport || result.Filtered || result.EmitFrame == nil {
+		t.Fatalf("expected future provider event to pass through, got %+v", result)
+	}
+	if string(result.EmitFrame.Payload()) != string(payload) || result.Usage != nil || result.Origin != responsesws.RecvDetailOriginProviderFrame {
+		t.Fatalf("expected future provider event to pass through byte-identically without usage, got %+v payload=%s", result, result.EmitFrame.Payload())
+	}
+}
+
+func TestCodexResponsesWSAdapterKnownTerminalBadResponseShapeClosesAsProviderMalformed(t *testing.T) {
+	adapter := &codexResponsesWSAdapter{provider: &CodexProvider{}, model: "gpt-5"}
+	result := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame([]byte(`{"type":"response.completed","response":"opaque"}`)))
+	if result.Origin != responsesws.RecvDetailOriginProviderMalformed || !errors.Is(result.Err, responsesws.ErrInvalidProviderEventPayload) || !result.CloseTransport || result.EmitFrame != nil {
+		t.Fatalf("expected bad known terminal shape to become provider_malformed, got %+v", result)
+	}
+}
+
+func TestCodexResponsesWSAdapterRejectsDuplicateKeyClientCancel(t *testing.T) {
+	adapter := &codexResponsesWSAdapter{provider: &CodexProvider{}, model: "gpt-5"}
+	_, err := adapter.PrepareClientFrame(context.Background(), responsesws.NewTextFrame([]byte(`{"type":"response.create","model":"gpt-5","type":"response.cancel"}`)))
+	if err == nil || !strings.Contains(err.Error(), "invalid_event") {
+		t.Fatalf("expected duplicate-key client event to become invalid_event, got %v", err)
+	}
+}
+
+func TestCodexResponsesWSAdapterFiltersOpaqueSessionCreatedBootstrap(t *testing.T) {
+	adapter := &codexResponsesWSAdapter{provider: &CodexProvider{}, model: "gpt-5"}
+	result := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame([]byte(`{"type":"session.created","session":"opaque"}`)))
+	if !result.Filtered || result.Err != nil || result.CloseTransport || result.EmitFrame != nil || result.Usage != nil || result.Origin != responsesws.RecvDetailOriginProviderFrame {
+		t.Fatalf("expected opaque session.created bootstrap to be filtered, got %+v", result)
+	}
+}
+
+func TestCodexResponsesWSAdapterTerminalTextProviderFrameExtractsUsage(t *testing.T) {
+	adapter := &codexResponsesWSAdapter{
+		provider:    &CodexProvider{},
+		model:       "gpt-5",
+		accumulator: newCodexTurnUsageAccumulator(),
+	}
+	payload := []byte(`{"type":"response.completed","response":{"id":"resp_done","status":"completed","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`)
+	result := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame(payload))
+	if result.Err != nil || result.CloseTransport || result.Filtered || result.EmitFrame == nil {
+		t.Fatalf("expected terminal provider frame to pass through, got %+v", result)
+	}
+	if string(result.EmitFrame.Payload()) != string(payload) || result.Origin != responsesws.RecvDetailOriginProviderFrame {
+		t.Fatalf("expected terminal provider frame to pass through byte-identically, got %+v payload=%s", result, result.EmitFrame.Payload())
+	}
+	if result.Usage == nil || result.Usage.InputTokens != 3 || result.Usage.OutputTokens != 5 || result.Usage.TotalTokens != 8 {
+		t.Fatalf("expected terminal usage to be extracted, got %+v", result.Usage)
+	}
+	if adapter.lastResponse != "resp_done" || adapter.accumulator != nil {
+		t.Fatalf("expected terminal frame to update response state and clear accumulator, last=%q accumulator=%+v", adapter.lastResponse, adapter.accumulator)
+	}
 }
 
 func TestCollectResponsesStreamResponseAcceptsDataWithoutSpace(t *testing.T) {

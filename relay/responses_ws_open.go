@@ -13,13 +13,26 @@ import (
 	"one-api/common/wsconn"
 	"one-api/metrics"
 	"one-api/model"
+	providersBase "one-api/providers/base"
 	runtimesession "one-api/runtime/session"
 	"one-api/types"
 	"strings"
+	"sync"
 
 	"github.com/gin-gonic/gin"
 	"github.com/spf13/viper"
 )
+
+const responsesWSUnsupportedScanWarnChannelThreshold = 16
+
+var responsesWSUnsupportedScanWarnOnce sync.Once
+
+func responsesWSGinLogContext(c *gin.Context) context.Context {
+	if c != nil && c.Request != nil {
+		return c.Request.Context()
+	}
+	return context.Background()
+}
 
 func openAndPrimeResponsesWSSession(c *gin.Context, request *types.OpenAIResponsesRequest) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
 	return openAndPrimeResponsesWSSessionWithContext(context.Background(), c, request)
@@ -30,42 +43,44 @@ func openAndPrimeResponsesWSSessionWithContext(openCtx context.Context, c *gin.C
 		return nil, common.StringErrorWrapperLocal("request is required", "invalid_request_error", http.StatusBadRequest)
 	}
 	markResponsesWSStreamRequest(c)
-	setResponsesWSOpenPreviousResponseID(c, request.PreviousResponseID)
 	if openCtx == nil {
 		openCtx = context.Background()
 	}
 	candidate, err := PrepareResponsesTurnAffinity(ResponsesAffinityInput{Context: c, Request: request})
 	if err != nil {
-		logger.LogError(context.Background(), "responses websocket affinity preparation failed: "+err.Error())
+		logger.LogError(responsesWSGinLogContext(c), "responses websocket affinity preparation failed: "+err.Error())
 		return nil, common.StringErrorWrapperLocal(responsesWSStaticErrorMessage("responses_affinity_conflict"), "responses_affinity_conflict", http.StatusConflict)
 	}
 	relay := &relayBase{c: c}
 	relay.setOriginalModel(request.Model)
+	var lastErr *types.OpenAIErrorWithStatusCode
+	var lastNonUnsupportedErr *types.OpenAIErrorWithStatusCode
 
 	if candidate != nil && candidate.ExplicitPinID > 0 {
-		return openResponsesWSSpecificChannelWithContext(openCtx, c, request.Model, candidate, candidate.ExplicitPinID)
+		return openResponsesWSSpecificChannelWithContext(openCtx, c, request.Model, candidate, candidate.ExplicitPinID, request.PreviousResponseID)
 	}
 	if preferred := currentPreferredChannelID(c); preferred > 0 {
-		openResult, openErr := openResponsesWSPreferredChannelWithContext(openCtx, c, request.Model, candidate, preferred)
+		openResult, openErr := openResponsesWSPreferredChannelWithContext(openCtx, c, request.Model, candidate, preferred, request.PreviousResponseID)
 		if openErr == nil {
 			return openResult, nil
 		}
 		if currentChannelAffinityStrict(c) {
 			return nil, openErr
 		}
+		if !responsesWSUnsupportedError(openErr) {
+			lastNonUnsupportedErr = openErr
+		}
 		relay.skipChannelID(preferred)
 	}
 
-	retryTimes := realtimeOpenRetryBudget()
-	var lastErr *types.OpenAIErrorWithStatusCode
-	var lastNonUnsupportedErr *types.OpenAIErrorWithStatusCode
+	attemptsRemaining := realtimeOpenRetryBudget()
 	providerAttempted := false
 	unsupportedScans := 0
-	unsupportedScanLimit := responsesWSUnsupportedScanLimit()
-	for i := retryTimes; i > 0; i-- {
+	unsupportedScanLimit, unsupportedScanLimited := responsesWSUnsupportedScanPolicy()
+	for attemptsRemaining > 0 {
 		if err := relay.setProvider(request.Model); err != nil {
 			if !providerAttempted && lastErr == nil {
-				logger.LogError(context.Background(), "responses websocket channel selection failed: "+err.Error())
+				logger.LogError(responsesWSGinLogContext(c), "responses websocket channel selection failed: "+err.Error())
 				lastErr = common.StringErrorWrapperLocal("channel selection failed", "channel_error", http.StatusServiceUnavailable)
 			}
 			break
@@ -73,7 +88,11 @@ func openAndPrimeResponsesWSSessionWithContext(openCtx context.Context, c *gin.C
 		providerAttempted = true
 		provider := relay.getProvider()
 		channel := provider.GetChannel()
-		session, apiErr := openRealtimeSessionWithOptions(provider, relay.modelName, responsesWSOpenOptions(c, openCtx))
+		transport, apiErr := parseResponsesWSTransportMode(channel)
+		if apiErr != nil {
+			return nil, apiErr
+		}
+		session, apiErr := openResponsesWSUpstream(openCtx, provider, relay.modelName, responsesWSOpenOptionsWithPreviousResponseID(c, request.PreviousResponseID, transport))
 		if apiErr == nil {
 			metrics.RecordProvider(c, 200)
 			return &responsesWSOpenResult{
@@ -86,14 +105,16 @@ func openAndPrimeResponsesWSSessionWithContext(openCtx context.Context, c *gin.C
 			}, nil
 		}
 		lastErr = apiErr
-		if openAIErrorCodeString(apiErr.Code, "") == "responses_ws_unsupported_for_channel" {
+		if responsesWSUnsupportedError(apiErr) {
 			relay.skipChannelID(channel.Id)
 			unsupportedScans++
-			if unsupportedScans < unsupportedScanLimit {
-				i++
+			if unsupportedScanLimited && unsupportedScans >= unsupportedScanLimit {
+				lastNonUnsupportedErr = common.StringErrorWrapperLocal("responses websocket unsupported scan limit reached before exhausting candidates", "responses_ws_unsupported_scan_limited", http.StatusServiceUnavailable)
+				break
 			}
 			continue
 		}
+		attemptsRemaining--
 		lastNonUnsupportedErr = apiErr
 		if !shouldRetry(c, apiErr, channel.Type) {
 			break
@@ -109,50 +130,82 @@ func openAndPrimeResponsesWSSessionWithContext(openCtx context.Context, c *gin.C
 	return nil, lastErr
 }
 
-func responsesWSUnsupportedScanLimit() int {
-	configured := config.RetryTimes
-	if configured <= 0 {
-		configured = 1
+func responsesWSUnsupportedError(apiErr *types.OpenAIErrorWithStatusCode) bool {
+	if apiErr == nil {
+		return false
 	}
+	return openAIErrorCodeString(apiErr.Code, "") == "responses_ws_unsupported_for_channel"
+}
+
+func responsesWSUnsupportedScanLimit() int {
+	limit, _ := responsesWSUnsupportedScanPolicy()
+	return limit
+}
+
+func responsesWSUnsupportedScanPolicy() (int, bool) {
+	configured := config.RetryTimes
+	explicit := false
 	if viper.IsSet("responses_ws.unsupported_scan_limit") {
 		if value := viper.GetInt("responses_ws.unsupported_scan_limit"); value > 0 {
 			configured = value
+			explicit = true
 		}
+	}
+	if configured <= 0 {
+		configured = 1
 	}
 	model.ChannelGroup.RLock()
 	channelCount := len(model.ChannelGroup.Channels)
 	model.ChannelGroup.RUnlock()
-	if channelCount > 0 && channelCount < configured {
-		return channelCount
+	if channelCount <= 0 {
+		return configured, explicit
 	}
-	return configured
+	if !explicit && channelCount > responsesWSUnsupportedScanWarnChannelThreshold {
+		responsesWSUnsupportedScanWarnOnce.Do(func() {
+			logCtx := context.Background()
+			logger.LogWarn(logCtx, fmt.Sprintf(
+				"responses_ws.unsupported_scan_limit is not set; ResponsesWS unsupported fallback may scan up to %d loaded channels before proving exhaustion. Configure responses_ws.unsupported_scan_limit to cap tail latency.",
+				channelCount,
+			))
+		})
+	}
+	if explicit && configured < channelCount {
+		return configured, true
+	}
+	return channelCount, false
 }
 
-func openResponsesWSSpecificChannelWithContext(openCtx context.Context, c *gin.Context, modelName string, candidate *ResponsesTurnAffinity, channelID int) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
+func openResponsesWSSpecificChannelWithContext(openCtx context.Context, c *gin.Context, modelName string, candidate *ResponsesTurnAffinity, channelID int, previousResponseID string) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
 	markResponsesWSStreamRequest(c)
 	channel, err := fetchChannelById(channelID)
 	if err != nil {
-		logger.LogError(context.Background(), "responses websocket pinned channel fetch failed: "+err.Error())
+		logger.LogError(responsesWSGinLogContext(c), "responses websocket pinned channel fetch failed: "+err.Error())
+		if wrapped := invalidChannelRuntimeConfigAPIError(err); wrapped != nil {
+			return nil, wrapped
+		}
 		return nil, common.StringErrorWrapperLocal("channel selection failed", "channel_error", http.StatusServiceUnavailable)
 	}
-	return openResponsesWSSelectedChannelWithContext(openCtx, c, modelName, candidate, channel)
+	return openResponsesWSSelectedChannelWithContext(openCtx, c, modelName, candidate, channel, previousResponseID)
 }
 
 func openResponsesWSPreferredChannel(c *gin.Context, modelName string, candidate *ResponsesTurnAffinity, channelID int) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
-	return openResponsesWSPreferredChannelWithContext(context.Background(), c, modelName, candidate, channelID)
+	return openResponsesWSPreferredChannelWithContext(context.Background(), c, modelName, candidate, channelID, "")
 }
 
-func openResponsesWSPreferredChannelWithContext(openCtx context.Context, c *gin.Context, modelName string, candidate *ResponsesTurnAffinity, channelID int) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
+func openResponsesWSPreferredChannelWithContext(openCtx context.Context, c *gin.Context, modelName string, candidate *ResponsesTurnAffinity, channelID int, previousResponseID string) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
 	markResponsesWSStreamRequest(c)
 	channel, err := fetchPreferredRealtimeChannel(c, modelName, channelID)
 	if err != nil {
-		logger.LogError(context.Background(), "responses websocket preferred channel fetch failed: "+err.Error())
+		logger.LogError(responsesWSGinLogContext(c), "responses websocket preferred channel fetch failed: "+err.Error())
+		if wrapped := invalidChannelRuntimeConfigAPIError(err); wrapped != nil {
+			return nil, wrapped
+		}
 		return nil, common.StringErrorWrapperLocal("channel selection failed", "channel_error", http.StatusServiceUnavailable)
 	}
-	return openResponsesWSSelectedChannelWithContext(openCtx, c, modelName, candidate, channel)
+	return openResponsesWSSelectedChannelWithContext(openCtx, c, modelName, candidate, channel, previousResponseID)
 }
 
-func openResponsesWSSelectedChannelWithContext(openCtx context.Context, c *gin.Context, modelName string, candidate *ResponsesTurnAffinity, channel *model.Channel) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
+func openResponsesWSSelectedChannelWithContext(openCtx context.Context, c *gin.Context, modelName string, candidate *ResponsesTurnAffinity, channel *model.Channel, previousResponseID string) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
 	if channel == nil {
 		return nil, common.StringErrorWrapperLocal("channel not found", "channel_error", http.StatusServiceUnavailable)
 	}
@@ -162,13 +215,20 @@ func openResponsesWSSelectedChannelWithContext(openCtx context.Context, c *gin.C
 	}
 	provider, mappedModel, err := prepareProviderForChannel(c, modelName, channel)
 	if err != nil {
-		logger.LogError(context.Background(), "responses websocket provider preparation failed: "+err.Error())
+		logger.LogError(responsesWSGinLogContext(c), "responses websocket provider preparation failed: "+err.Error())
+		if wrapped := invalidChannelRuntimeConfigAPIError(err); wrapped != nil {
+			return nil, wrapped
+		}
 		return nil, common.StringErrorWrapperLocal("channel selection failed", "channel_error", http.StatusServiceUnavailable)
 	}
 	if candidate != nil {
 		candidate.SelectedChannelID = channel.Id
 	}
-	session, apiErr := openRealtimeSessionWithOptions(provider, mappedModel, responsesWSOpenOptions(c, openCtx))
+	transport, apiErr := parseResponsesWSTransportMode(channel)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+	session, apiErr := openResponsesWSUpstream(openCtx, provider, mappedModel, responsesWSOpenOptionsWithPreviousResponseID(c, previousResponseID, transport))
 	if apiErr != nil {
 		return nil, apiErr
 	}
@@ -187,19 +247,6 @@ func markResponsesWSStreamRequest(c *gin.Context) {
 	if c != nil {
 		c.Set("is_stream", true)
 	}
-}
-
-func setResponsesWSOpenPreviousResponseID(c *gin.Context, previousResponseID string) {
-	if c != nil {
-		c.Set(responsesWSPreviousResponseIDContextKey, strings.TrimSpace(previousResponseID))
-	}
-}
-
-func responsesWSOpenPreviousResponseID(c *gin.Context) string {
-	if c == nil {
-		return ""
-	}
-	return strings.TrimSpace(c.GetString(responsesWSPreviousResponseIDContextKey))
 }
 
 func attachResponsesWSSelectedChannelSnapshot(snapshot *ResponsesWSRequestSnapshot, channel *model.Channel, providerModel string, billingModel string) {
@@ -320,18 +367,78 @@ func responsesWSSubsequentModelMismatch(requestModel string, lockedSessionModel 
 	return fmt.Sprintf("responses websocket session is locked to model %q", lockedSessionModel)
 }
 
-// responsesWSOpenOptions builds RealtimeOpenOptions for the provider session.
-// Every downstream ResponsesWS connection gets an internal client session id,
-// independent from request x-session-id. This keeps a single provider WS scoped
-// to one downstream WS connection while preserving x-session-id for routing and
-// prompt-cache identity. Using ForceFresh here would replace any existing
-// binding and can close another in-flight client connection.
-func responsesWSOpenOptions(c *gin.Context, openCtx context.Context) runtimesession.RealtimeOpenOptions {
-	return runtimesession.RealtimeOpenOptions{
-		Context:                       openCtx,
-		ClientSessionID:               ensureResponsesWSConnectionSessionID(c),
-		PreferredTransport:            runtimesession.TransportModeResponsesWS,
-		RequireWS:                     true,
-		ResponsesWSPreviousResponseID: responsesWSOpenPreviousResponseID(c),
+func openResponsesWSUpstream(openCtx context.Context, provider providersBase.ProviderInterface, modelName string, options responsesws.OpenOptions) (responsesws.Upstream, *types.OpenAIErrorWithStatusCode) {
+	responsesProvider, ok := provider.(providersBase.ResponsesWSProvider)
+	if !ok {
+		return nil, common.StringErrorWrapperLocal("channel does not support Responses websocket transport", "responses_ws_unsupported_for_channel", http.StatusUpgradeRequired)
 	}
+	if openCtx == nil {
+		openCtx = context.Background()
+	}
+	return responsesProvider.OpenResponsesWS(openCtx, modelName, options)
+}
+
+// responsesWSOpenOptions builds connection-local upstream options. The internal
+// upstream session id is not derived from request x-session-id; client identity
+// remains available to routing and prompt-cache code without sharing live WS
+// connections across downstream clients.
+func responsesWSOpenOptions(c *gin.Context, transport ...runtimesession.TransportMode) responsesws.OpenOptions {
+	return responsesWSOpenOptionsWithPreviousResponseID(c, "", transport...)
+}
+
+func responsesWSOpenOptionsWithPreviousResponseID(c *gin.Context, previousResponseID string, transport ...runtimesession.TransportMode) responsesws.OpenOptions {
+	selectedTransport := runtimesession.TransportModeResponsesWS
+	if len(transport) > 0 && transport[0] != "" {
+		selectedTransport = transport[0]
+	}
+	channelID := 0
+	if c != nil {
+		channelID = c.GetInt("channel_id")
+	}
+	return responsesws.OpenOptions{
+		UpstreamSessionID:  ensureResponsesWSConnectionSessionID(c),
+		PreviousResponseID: strings.TrimSpace(previousResponseID),
+		Transport:          selectedTransport,
+		ChannelID:          channelID,
+		Diagnostics:        responsesWSDiagnosticHook(c),
+	}
+}
+
+func responsesWSDiagnosticHook(c *gin.Context) responsesws.DiagnosticHook {
+	logCtx := context.Background()
+	if c != nil && c.Request != nil {
+		logCtx = c.Request.Context()
+	}
+	return func(diag responsesws.Diagnostic) {
+		logger.LogError(logCtx, fmt.Sprintf(
+			"responses websocket diagnostic: code=%s provider=%s channel_id=%d transport=%s phase=%s panic_class=%s stack_hash=%s detail=%s",
+			responsesWSSafeDiagnosticValue(diag.Code),
+			responsesWSSafeDiagnosticValue(diag.Provider),
+			diag.ChannelID,
+			responsesWSSafeDiagnosticValue(diag.Transport),
+			responsesWSSafeDiagnosticValue(string(diag.Phase)),
+			responsesWSSafeDiagnosticValue(diag.PanicClass),
+			responsesWSSafeDiagnosticValue(diag.StackHash),
+			responsesWSSafeDiagnosticValue(diag.DetailError),
+		))
+	}
+}
+
+func parseResponsesWSTransportMode(channel *model.Channel) (runtimesession.TransportMode, *types.OpenAIErrorWithStatusCode) {
+	if channel == nil {
+		return runtimesession.TransportModeResponsesWS, nil
+	}
+	other, err := channel.GetOtherMap()
+	if err != nil {
+		return "", common.StringErrorWrapperLocal("invalid responses websocket transport configuration", "invalid_responses_ws_transport", http.StatusBadRequest)
+	}
+	raw, ok := other["responses_ws_transport"]
+	if !ok || len(raw) == 0 || string(raw) == "null" {
+		return runtimesession.TransportModeResponsesWS, nil
+	}
+	mode, err := runtimesession.ParseResponsesWSTransportField(raw)
+	if err != nil {
+		return "", common.StringErrorWrapperLocal("invalid responses websocket transport configuration", "invalid_responses_ws_transport", http.StatusBadRequest)
+	}
+	return mode, nil
 }

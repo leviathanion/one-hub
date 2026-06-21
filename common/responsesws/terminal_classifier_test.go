@@ -65,3 +65,15 @@ func TestClassifyResponsesWSEventTerminalCases(t *testing.T) {
 		})
 	}
 }
+
+func TestClassifyResponsesWSEventMalformedKnownTerminalResponseShape(t *testing.T) {
+	got := ClassifyResponsesWSEvent([]byte(`{"type":"response.completed","response":"opaque"}`))
+	if !got.Malformed || got.Kind != ResponsesFailedTerminal || got.MalformedError == "" {
+		t.Fatalf("expected known terminal with non-object response to be malformed, got %+v", got)
+	}
+
+	future := ClassifyResponsesWSEvent([]byte(`{"type":"response.future","response":"opaque"}`))
+	if future.Malformed || future.Kind != ResponsesNonTerminal {
+		t.Fatalf("expected future event with opaque response to remain passthrough non-terminal, got %+v", future)
+	}
+}

@@ -1,10 +1,12 @@
 package base
 
 import (
+	"context"
 	"net/http"
 	"one-api/common/requester"
+	"one-api/common/responsesws"
 	"one-api/model"
-	runtimesession "one-api/runtime/session"
+	runtimerealtime "one-api/runtime/realtime"
 	"one-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -135,12 +137,23 @@ type RerankInterface interface {
 
 type RealtimeSessionProvider interface {
 	ProviderInterface
-	OpenRealtimeSession(modelName string) (runtimesession.RealtimeSession, *types.OpenAIErrorWithStatusCode)
+	OpenRealtimeSession(modelName string) (runtimerealtime.RealtimeSession, *types.OpenAIErrorWithStatusCode)
 }
 
 type RealtimeSessionProviderWithOptions interface {
 	RealtimeSessionProvider
-	OpenRealtimeSessionWithOptions(modelName string, options runtimesession.RealtimeOpenOptions) (runtimesession.RealtimeSession, *types.OpenAIErrorWithStatusCode)
+	// OpenRealtimeSessionWithOptions is the /v1/realtime compatibility entry.
+	// New ResponsesWS providers must use ResponsesWSProvider.OpenResponsesWS
+	// instead of routing ResponsesWS through RealtimeOpenOptions.
+	OpenRealtimeSessionWithOptions(modelName string, options runtimerealtime.RealtimeOpenOptions) (runtimerealtime.RealtimeSession, *types.OpenAIErrorWithStatusCode)
+}
+
+type ResponsesWSProvider interface {
+	ProviderInterface
+	// OpenResponsesWS opens a ResponsesWS-specific provider upstream. The
+	// returned Upstream must not carry Codex realtime resume/binding/revocation
+	// semantics; relay owns ResponsesWS admission/accounting/finalization.
+	OpenResponsesWS(ctx context.Context, modelName string, options responsesws.OpenOptions) (responsesws.Upstream, *types.OpenAIErrorWithStatusCode)
 }
 
 type ResponsesInterface interface {

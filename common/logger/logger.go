@@ -209,6 +209,17 @@ func SysLog(s string) {
 	}
 }
 
+func SysWarn(s string) {
+	message := "[SYS] | " + s
+
+	logHistory.AddEntry(loggerWarn, message)
+	if Logger == nil {
+		log.Print(message)
+		return
+	}
+	Logger.Warn(message)
+}
+
 func SysError(s string) {
 	message := "[SYS] | " + s
 

@@ -15,6 +15,7 @@ import (
 	"one-api/common/config"
 	"one-api/common/wsconn"
 	"one-api/model"
+	runtimerealtime "one-api/runtime/realtime"
 	runtimesession "one-api/runtime/session"
 	"one-api/types"
 )
@@ -44,19 +45,19 @@ type failingOpenAIRealtimeObserver struct {
 	observeErr error
 }
 
-func openAITestTextFrame(payload []byte) runtimesession.Frame {
-	return runtimesession.NewTextFrame(payload)
+func openAITestTextFrame(payload []byte) runtimerealtime.Frame {
+	return runtimerealtime.NewTextFrame(payload)
 }
 
-func openAITestRecv(ctx context.Context, session runtimesession.RealtimeSession) (wsconn.MessageType, []byte, *types.UsageEvent, runtimesession.RealtimePayloadOrigin, error) {
+func openAITestRecv(ctx context.Context, session runtimerealtime.RealtimeSession) (wsconn.MessageType, []byte, *types.UsageEvent, runtimerealtime.RealtimePayloadOrigin, error) {
 	event, err := session.Recv(ctx)
 	if err != nil {
-		return 0, nil, nil, runtimesession.RealtimePayloadOriginProxyLocal, err
+		return 0, nil, nil, runtimerealtime.RealtimePayloadOriginProxyLocal, err
 	}
 	messageType := wsconn.TextMessage
 	var payload []byte
 	if event.Frame != nil {
-		if event.Frame.Kind() == runtimesession.FrameKindBinary {
+		if event.Frame.Kind() == runtimerealtime.FrameKindBinary {
 			messageType = wsconn.BinaryMessage
 		}
 		payload = event.Frame.Payload()
@@ -442,7 +443,7 @@ func TestOpenAIRealtimeSessionPropagatesObserverUsageErrors(t *testing.T) {
 	if usage != nil {
 		t.Fatalf("expected observer usage error event not to carry usage, got %+v", usage)
 	}
-	errorPayload := string(runtimesession.ClientPayloadFromError(err))
+	errorPayload := string(runtimerealtime.ClientPayloadFromError(err))
 	if !strings.Contains(errorPayload, `"code":"quota_exhausted"`) {
 		t.Fatalf("expected client-visible quota error payload, got err=%v payload=%q", err, errorPayload)
 	}
@@ -485,7 +486,7 @@ func TestOpenAIRealtimeSessionAdmissionFailureDoesNotWriteUpstream(t *testing.T)
 	if err == nil {
 		t.Fatal("expected admission failure to reject response.create")
 	}
-	errorPayload := string(runtimesession.ClientPayloadFromError(err))
+	errorPayload := string(runtimerealtime.ClientPayloadFromError(err))
 	if !strings.Contains(errorPayload, `"code":"quota_exhausted"`) {
 		t.Fatalf("expected client-visible quota error payload, got err=%v payload=%q", err, errorPayload)
 	}
@@ -1123,32 +1124,6 @@ func TestOpenAIRealtimeSessionRejectsConcurrentResponseCreate(t *testing.T) {
 	}
 }
 
-func TestOpenAIResponsesWSStartTurnUsesTimerWithoutMutatingReadDeadline(t *testing.T) {
-	session := newOpenAIRealtimeHelperSession()
-	session.responsesWS = true
-	startedTurn, _, err := session.startTurn()
-	if err != nil {
-		t.Fatalf("expected startTurn to succeed, got %v", err)
-	}
-	if startedTurn == nil {
-		t.Fatal("expected startTurn to return active turn")
-	}
-	session.turnReadMu.Lock()
-	timerArmed := session.turnReadTimer != nil
-	session.turnReadMu.Unlock()
-	if !timerArmed {
-		t.Fatal("expected active turn read timeout timer to be armed")
-	}
-
-	session.rollbackTurn(startedTurn)
-	session.turnReadMu.Lock()
-	timerStopped := session.turnReadTimer == nil
-	session.turnReadMu.Unlock()
-	if !timerStopped {
-		t.Fatal("expected rollback to stop active turn read timeout timer")
-	}
-}
-
 func TestOpenAIRealtimeSessionDetachClosesUpstreamWithNormalClosure(t *testing.T) {
 	closeInfoCh := make(chan wsconn.CloseInfo, 1)
 	server := newOpenAIRealtimeTestServer(t, func(conn *openAIRealtimeTestConn) {
@@ -1469,7 +1444,8 @@ func newOpenAIRealtimeTestProvider(serverURL string) *OpenAIProvider {
 	proxy := ""
 	channel := &model.Channel{
 		Key:   "sk-test",
-		Other: `{"responses_ws_self_hosted":true}`,
+		Type:  config.ChannelTypeOpenAI,
+		Other: `{"self_hosted":true,"responses_ws_native":true,"responses_ws_self_hosted":true}`,
 		Proxy: &proxy,
 	}
 	return CreateOpenAIProvider(channel, serverURL)

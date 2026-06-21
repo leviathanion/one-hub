@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"one-api/internal/testutil/fakeredis"
+	runtimerealtime "one-api/runtime/realtime"
 	runtimesession "one-api/runtime/session"
 
 	"github.com/spf13/viper"
@@ -41,7 +42,7 @@ func newCodexFakeRedisManager(t *testing.T) (*runtimesession.Manager, *fakeredis
 
 func codexTestMeta(t *testing.T, provider *CodexProvider) runtimesession.Metadata {
 	t.Helper()
-	meta, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimesession.RealtimeOpenOptions{})
+	meta, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimerealtime.RealtimeOpenOptions{})
 	if errWithCode != nil {
 		t.Fatalf("expected execution session metadata, got %v", errWithCode)
 	}
@@ -55,7 +56,7 @@ func TestCodexPlanRealtimeOpenBranches(t *testing.T) {
 		provider.Context.Set("token_id", 401)
 		meta := codexTestMeta(t, provider)
 
-		plan := provider.planRealtimeOpen(meta, runtimesession.RealtimeOpenOptions{})
+		plan := provider.planRealtimeOpen(meta, runtimerealtime.RealtimeOpenOptions{})
 		if plan.publishIntent != runtimesession.PublishIntentCreateIfAbsent || plan.candidateSessionKey != "" {
 			t.Fatalf("expected miss plan to publish create_if_absent, got %+v (manager=%p)", plan, manager)
 		}
@@ -77,7 +78,7 @@ func TestCodexPlanRealtimeOpenBranches(t *testing.T) {
 			t.Fatalf("expected shared binding fixture, got %q", status)
 		}
 
-		plan := provider.planRealtimeOpen(meta, runtimesession.RealtimeOpenOptions{})
+		plan := provider.planRealtimeOpen(meta, runtimerealtime.RealtimeOpenOptions{})
 		if plan.candidateSessionKey != binding.SessionKey || !plan.sharedHitCompatible || plan.publishIntent != runtimesession.PublishIntentNone {
 			t.Fatalf("expected compatible hit plan to reuse candidate, got %+v", plan)
 		}
@@ -99,7 +100,7 @@ func TestCodexPlanRealtimeOpenBranches(t *testing.T) {
 		}
 		server.FailNext("EXISTS", "ERR forced exists failure")
 
-		plan := provider.planRealtimeOpen(meta, runtimesession.RealtimeOpenOptions{})
+		plan := provider.planRealtimeOpen(meta, runtimerealtime.RealtimeOpenOptions{})
 		if plan.candidateSessionKey != "" || plan.publishIntent != runtimesession.PublishIntentNone {
 			t.Fatalf("expected revocation-unknown plan to avoid resume and publish, got %+v", plan)
 		}
@@ -121,7 +122,7 @@ func TestCodexPlanRealtimeOpenBranches(t *testing.T) {
 			t.Fatalf("expected incompatible shared binding fixture, got %q", status)
 		}
 
-		plan := provider.planRealtimeOpen(meta, runtimesession.RealtimeOpenOptions{})
+		plan := provider.planRealtimeOpen(meta, runtimerealtime.RealtimeOpenOptions{})
 		if plan.publishIntent != runtimesession.PublishIntentReplaceIfMatch || plan.expectedOldSessionKey != incompatible.SessionKey || plan.candidateSessionKey != "" {
 			t.Fatalf("expected incompatible hit plan to replace old binding, got %+v (prefix=%s)", plan, prefix)
 		}
@@ -134,7 +135,7 @@ func TestCodexPlanRealtimeOpenBranches(t *testing.T) {
 		meta := codexTestMeta(t, provider)
 		server.FailNext("GET", "ERR forced get failure")
 
-		plan := provider.planRealtimeOpen(meta, runtimesession.RealtimeOpenOptions{})
+		plan := provider.planRealtimeOpen(meta, runtimerealtime.RealtimeOpenOptions{})
 		if plan.candidateSessionKey != "" || plan.publishIntent != runtimesession.PublishIntentNone || plan.expectedOldSessionKey != "" {
 			t.Fatalf("expected backend error to return empty plan, got %+v", plan)
 		}
@@ -157,7 +158,7 @@ func TestCodexPlanRealtimeOpenBranches(t *testing.T) {
 		}
 		server.SetRaw(prefix+":revoked:"+meta.Key, "1")
 
-		plan := provider.planRealtimeOpen(meta, runtimesession.RealtimeOpenOptions{})
+		plan := provider.planRealtimeOpen(meta, runtimerealtime.RealtimeOpenOptions{})
 		if plan.publishIntent != runtimesession.PublishIntentReplaceIfMatch || plan.expectedOldSessionKey != meta.Key {
 			t.Fatalf("expected revoked plan to replace old binding, got %+v", plan)
 		}

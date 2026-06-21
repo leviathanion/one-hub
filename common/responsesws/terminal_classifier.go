@@ -7,6 +7,7 @@ import (
 	"strings"
 )
 
+// ResponsesTerminalKind classifies whether a ResponsesWS payload is terminal.
 type ResponsesTerminalKind int
 
 const (
@@ -16,6 +17,8 @@ const (
 	ResponsesCancelledTerminal
 )
 
+// ResponsesTerminalResult is the parsed terminal classification for a
+// ResponsesWS provider payload.
 type ResponsesTerminalResult struct {
 	Kind              ResponsesTerminalKind
 	EventType         string
@@ -48,6 +51,11 @@ func ClassifyResponsesWSEvent(payload []byte) ResponsesTerminalResult {
 		if err := decoder.Decode(&decoded); err == nil {
 			response = &decoded
 			result.Response = response
+		} else if isKnownResponsesTerminalEventType(eventType) {
+			result.Kind = ResponsesFailedTerminal
+			result.Malformed = true
+			result.MalformedError = "terminal response must be an object: " + err.Error()
+			return result
 		}
 	}
 
@@ -98,6 +106,21 @@ func ClassifyResponsesWSEvent(payload []byte) ResponsesTerminalResult {
 		result.NormalizedPayload = normalizeTerminalPayload(object, eventType, result.Kind)
 	}
 	return result
+}
+
+func isKnownResponsesTerminalEventType(eventType string) bool {
+	switch strings.TrimSpace(eventType) {
+	case "error",
+		"response.completed",
+		"response.done",
+		"response.cancelled",
+		"response.canceled",
+		"response.failed",
+		"response.incomplete":
+		return true
+	default:
+		return false
+	}
 }
 
 func ClassifyResponsesWSTerminal(eventType string, response *types.OpenAIResponsesResponses, hasEventError bool) ResponsesTerminalResult {

@@ -2,20 +2,55 @@ package openai
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/requester"
+	"one-api/common/responsesws"
 	"one-api/model"
 	"one-api/types"
 
 	"github.com/gin-gonic/gin"
 )
+
+func TestOpenAIResponsesHTTPBridgeURLPreflightUsesOpenContext(t *testing.T) {
+	originalResolver := net.DefaultResolver
+	net.DefaultResolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+	t.Cleanup(func() {
+		net.DefaultResolver = originalResolver
+	})
+
+	proxy := ""
+	channel := &model.Channel{Key: "sk-test", Type: config.ChannelTypeOpenAI, Proxy: &proxy}
+	channel.SetProxy()
+	provider := CreateOpenAIProvider(channel, "https://api.openai.com")
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := provider.validateResponsesWSHTTPBridgeURL(ctx, "https://slow-dns.test/v1/responses")
+	if err == nil {
+		t.Fatal("expected canceled bridge URL preflight to fail")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("expected bridge URL preflight to honor open context, took %s", elapsed)
+	}
+}
 
 func TestHandlerChatStreamToolCallsFinishReasonFromToolEvent(t *testing.T) {
 	handler := OpenAIResponsesStreamHandler{
@@ -330,6 +365,229 @@ func TestCompactResponsesPreservesUnknownAllowExtraBodyFieldsButNotKnownInclude(
 	}
 	if got := body["experimental_feature"]; got != "enabled" {
 		t.Fatalf("expected compact request body to preserve unknown extra field, got %#v", got)
+	}
+}
+
+func TestResponsesHTTPBridgeRequestDoesNotMergeCachedRawWSFields(t *testing.T) {
+	rawBody := []byte(`{"type":"response.create","event_id":"evt_raw","model":"gpt-5","input":"raw","stream":false,"background":true,"stream_options":{"include_usage":true},"raw_extra":"leak"}`)
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	common.SetReusableRequestBodyMap(ctx, rawBody, map[string]interface{}{
+		"type":           "response.create",
+		"event_id":       "evt_raw",
+		"model":          "gpt-5",
+		"input":          "raw",
+		"stream":         false,
+		"background":     true,
+		"stream_options": map[string]interface{}{"include_usage": true},
+		"raw_extra":      "leak",
+	})
+
+	proxy := ""
+	customParameter := `{"operator_extra":"custom"}`
+	provider := CreateOpenAIProvider(&model.Channel{
+		Type:            config.ChannelTypeOpenAI,
+		Key:             "sk-test",
+		Proxy:           &proxy,
+		AllowExtraBody:  true,
+		CustomParameter: &customParameter,
+	}, "https://example.test")
+	provider.SetContext(ctx)
+
+	req, errWithCode := provider.buildResponsesHTTPBridgeRequest(map[string]json.RawMessage{
+		"model":        json.RawMessage(`"gpt-5"`),
+		"input":        json.RawMessage(`"sanitized"`),
+		"future_field": json.RawMessage(`{"kept":true}`),
+	}, "https://example.test/v1/responses", map[string]string{"Authorization": "Bearer sk-test"}, "gpt-5")
+	if errWithCode != nil {
+		t.Fatalf("expected bridge request build to succeed, got %v", errWithCode.Message)
+	}
+	defer req.Body.Close()
+
+	bodyBytes, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("failed to read bridge request body: %v", err)
+	}
+	body := make(map[string]interface{})
+	if err := json.Unmarshal(bodyBytes, &body); err != nil {
+		t.Fatalf("failed to decode bridge request body: %v", err)
+	}
+
+	for _, forbidden := range []string{"type", "event_id", "background", "stream_options", "raw_extra"} {
+		if _, ok := body[forbidden]; ok {
+			t.Fatalf("expected bridge body not to merge raw field %q, got %#v", forbidden, body)
+		}
+	}
+	if body["stream"] != true {
+		t.Fatalf("expected bridge body to force stream=true, got %#v", body["stream"])
+	}
+	if body["input"] != "sanitized" || body["operator_extra"] != "custom" {
+		t.Fatalf("expected sanitized/custom fields to be preserved, got %#v", body)
+	}
+	if future, ok := body["future_field"].(map[string]interface{}); !ok || future["kept"] != true {
+		t.Fatalf("expected sanitized unknown create-body field to be preserved, got %#v", body["future_field"])
+	}
+}
+
+func TestResponsesHTTPBridgeAzureUsesBearerAuthAndFiltersModelAuthHeaders(t *testing.T) {
+	proxy := ""
+	modelHeaders := `{"Authorization":"Bearer should-not-send","api-key":"evil-api-key","X-Gateway-Auth":"azure-gateway"}`
+	provider := CreateOpenAIProvider(&model.Channel{
+		Type:         config.ChannelTypeAzure,
+		Key:          "azure-key",
+		Proxy:        &proxy,
+		ModelHeaders: &modelHeaders,
+		Other:        `{"api_version":"2024-10-01-preview"}`,
+	}, "https://example.openai.azure.com")
+	provider.IsAzure = true
+
+	req, errWithCode := provider.buildResponsesHTTPBridgeRequest(map[string]json.RawMessage{
+		"model": json.RawMessage(`"gpt-5"`),
+		"input": json.RawMessage(`[]`),
+	}, "https://example.test/v1/responses", provider.requestHeaders(openAIRequestAuthBearer), "gpt-5")
+	if errWithCode != nil {
+		t.Fatalf("expected bridge request build to succeed, got %v", errWithCode.Message)
+	}
+	defer req.Body.Close()
+
+	if got := req.Header.Get("Authorization"); got != "Bearer azure-key" {
+		t.Fatalf("expected bridge bearer auth header, got %q", got)
+	}
+	if got := req.Header.Get("Api-Key"); got != "" {
+		t.Fatalf("expected bridge not to send api-key header, got %q", got)
+	}
+	if got := req.Header.Get("X-Gateway-Auth"); got != "azure-gateway" {
+		t.Fatalf("expected non-auth custom header to remain, got %q", got)
+	}
+}
+
+func TestResponsesHTTPBridgeRequestDeepMergesCustomParameterObjects(t *testing.T) {
+	proxy := ""
+	customParameter := `{"metadata":{"operator":"custom","nested":{"operator":true}}}`
+	provider := CreateOpenAIProvider(&model.Channel{
+		Type:            config.ChannelTypeOpenAI,
+		Key:             "sk-test",
+		Proxy:           &proxy,
+		CustomParameter: &customParameter,
+	}, "https://api.openai.com")
+
+	req, errWithCode := provider.buildResponsesHTTPBridgeRequest(map[string]json.RawMessage{
+		"model":    json.RawMessage(`"gpt-5"`),
+		"input":    json.RawMessage(`"hello"`),
+		"metadata": json.RawMessage(`{"client":"kept","nested":{"client":true}}`),
+	}, "https://example.test/v1/responses", map[string]string{"Authorization": "Bearer sk-test"}, "gpt-5")
+	if errWithCode != nil {
+		t.Fatalf("expected bridge request build to succeed, got %v", errWithCode.Message)
+	}
+	defer req.Body.Close()
+
+	bodyBytes, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("failed to read bridge request body: %v", err)
+	}
+	body := make(map[string]interface{})
+	if err := json.Unmarshal(bodyBytes, &body); err != nil {
+		t.Fatalf("failed to decode bridge request body: %v", err)
+	}
+	metadata, ok := body["metadata"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected metadata object, got %#v", body["metadata"])
+	}
+	if metadata["client"] != "kept" || metadata["operator"] != "custom" {
+		t.Fatalf("expected metadata to preserve client and merge custom keys, got %#v", metadata)
+	}
+	nested, ok := metadata["nested"].(map[string]interface{})
+	if !ok || nested["client"] != true || nested["operator"] != true {
+		t.Fatalf("expected nested metadata to be deep-merged, got %#v", metadata["nested"])
+	}
+}
+
+func TestResponsesHTTPBridgeRequestCustomParameterCannotRemoveBridgeStream(t *testing.T) {
+	proxy := ""
+	customParameter := `{"remove_params":["stream"],"background":false}`
+	provider := CreateOpenAIProvider(&model.Channel{
+		Type:            config.ChannelTypeOpenAI,
+		Key:             "sk-test",
+		Proxy:           &proxy,
+		CustomParameter: &customParameter,
+	}, "https://example.test")
+
+	req, errWithCode := provider.buildResponsesHTTPBridgeRequest(map[string]json.RawMessage{
+		"model":  json.RawMessage(`"gpt-5"`),
+		"input":  json.RawMessage(`"hello"`),
+		"stream": json.RawMessage(`true`),
+	}, "https://example.test/v1/responses", map[string]string{"Authorization": "Bearer sk-test"}, "gpt-5")
+	if errWithCode != nil {
+		t.Fatalf("expected bridge request build to succeed, got %v", errWithCode.Message)
+	}
+	defer req.Body.Close()
+
+	bodyBytes, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("failed to read bridge request body: %v", err)
+	}
+	body := make(map[string]interface{})
+	if err := json.Unmarshal(bodyBytes, &body); err != nil {
+		t.Fatalf("failed to decode bridge request body: %v", err)
+	}
+	if body["stream"] != true {
+		t.Fatalf("expected bridge custom_parameter normalization to restore stream=true, got %#v", body)
+	}
+	if _, ok := body["background"]; ok {
+		t.Fatalf("expected bridge custom_parameter normalization to strip background=false, got %#v", body)
+	}
+}
+
+func TestResponsesHTTPBridgeRequestRejectsCustomBackgroundTrue(t *testing.T) {
+	proxy := ""
+	customParameter := `{"background":true}`
+	provider := CreateOpenAIProvider(&model.Channel{
+		Type:            config.ChannelTypeOpenAI,
+		Key:             "sk-test",
+		Proxy:           &proxy,
+		CustomParameter: &customParameter,
+	}, "https://example.test")
+
+	req, errWithCode := provider.buildResponsesHTTPBridgeRequest(map[string]json.RawMessage{
+		"model": json.RawMessage(`"gpt-5"`),
+		"input": json.RawMessage(`"hello"`),
+	}, "https://example.test/v1/responses", map[string]string{"Authorization": "Bearer sk-test"}, "gpt-5")
+	if req != nil {
+		t.Fatalf("expected rejected bridge request not to return req, got %+v", req)
+	}
+	if errWithCode == nil || errWithCode.StatusCode != http.StatusBadRequest || errWithCode.Code != "unsupported_responses_ws_bridge_field" {
+		t.Fatalf("expected custom background=true to be rejected as unsupported bridge field, got %+v", errWithCode)
+	}
+}
+
+func TestResponsesWSBridgeOpenerReportsPreSendBuildErrorAsPrepareError(t *testing.T) {
+	proxy := ""
+	customParameter := `{"background":true}`
+	provider := CreateOpenAIProvider(&model.Channel{
+		Type:            config.ChannelTypeOpenAI,
+		Key:             "sk-test",
+		Other:           `{"responses_ws_self_hosted":true}`,
+		Proxy:           &proxy,
+		CustomParameter: &customParameter,
+	}, "https://127.0.0.1:1")
+	opener := openAIResponsesWSBridgeOpener{provider: provider, model: "gpt-5"}
+
+	stream, providerErr, prepareErr := opener.OpenBridgeStream(context.Background(), responsesws.BridgeStreamRequest{
+		Frame: responsesws.NewTextFrame([]byte(`{"type":"response.create","model":"gpt-5","input":"hello"}`)),
+	})
+	if stream != nil {
+		t.Fatalf("expected no stream for pre-send build failure, got %+v", stream)
+	}
+	if providerErr != nil {
+		t.Fatalf("expected pre-send build failure not to be provider rejection evidence, got %+v", providerErr)
+	}
+	if prepareErr == nil {
+		t.Fatal("expected pre-send build failure to be returned as prepare error")
+	}
+	var apiErr *types.OpenAIErrorWithStatusCode
+	if !errors.As(prepareErr, &apiErr) || apiErr.Code != "unsupported_responses_ws_bridge_field" {
+		t.Fatalf("expected unsupported bridge field API error in prepare path, got %v", prepareErr)
 	}
 }
 

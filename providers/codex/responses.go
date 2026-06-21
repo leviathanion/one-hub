@@ -211,7 +211,7 @@ func (p *CodexProvider) CreateResponses(request *types.OpenAIResponsesRequest) (
 	handler := newCodexResponsesStreamHandler(p.Usage)
 
 	// Get stream response.
-	stream, errWithCode := requester.RequestNoTrimStream(p.Requester, resp, handler.HandlerResponsesStream)
+	stream, errWithCode := requester.RequestNoTrimStreamWithEmitterOptions(p.Requester, resp, handler.HandlerResponsesStreamWithEmitter, requester.StreamReadOptions{})
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -289,7 +289,7 @@ func (p *CodexProvider) CreateResponsesStream(request *types.OpenAIResponsesRequ
 	}
 
 	// Use RequestNoTrimStream to preserve event lines.
-	return requester.RequestNoTrimStream(p.Requester, resp, handler.HandlerResponsesStream)
+	return requester.RequestNoTrimStreamWithEmitterOptions(p.Requester, resp, handler.HandlerResponsesStreamWithEmitter, requester.StreamReadOptions{})
 }
 
 func (p *CodexProvider) CompactResponses(request *types.OpenAIResponsesRequest) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
@@ -819,26 +819,40 @@ func (p *CodexProvider) getResponsesOperationRequestWithSession(request *types.O
 
 // HandlerResponsesStream handles Responses streaming (passthrough).
 func (h *CodexResponsesStreamHandler) HandlerResponsesStream(rawLine *[]byte, dataChan chan string, errChan chan error) {
+	h.handleResponsesStream(rawLine, func(data string) bool {
+		dataChan <- data
+		return true
+	})
+}
+
+func (h *CodexResponsesStreamHandler) HandlerResponsesStreamWithEmitter(rawLine *[]byte, emitter requester.StreamEmitter[string]) {
+	h.handleResponsesStream(rawLine, emitter.SendData)
+}
+
+func (h *CodexResponsesStreamHandler) handleResponsesStream(rawLine *[]byte, sendData func(string) bool) {
 	rawStr := string(*rawLine)
 
 	// Handle SSE event lines.
 	if strings.HasPrefix(rawStr, "event: ") {
 		// Start new event and capture event type.
-		h.eventType = strings.TrimPrefix(rawStr, "event: ")
+		h.eventType = strings.TrimSpace(strings.TrimPrefix(rawStr, "event: "))
 		h.eventBuffer.Reset()
-		h.eventBuffer.WriteString(rawStr)
-		h.eventBuffer.WriteString("\n")
+		appendCodexSSELine(&h.eventBuffer, rawStr)
 		return
 	}
 
 	// Buffer non-data lines when inside an event.
 	if !strings.HasPrefix(rawStr, "data:") {
 		if h.eventBuffer.Len() > 0 {
-			h.eventBuffer.WriteString(rawStr)
-			h.eventBuffer.WriteString("\n")
+			appendCodexSSELine(&h.eventBuffer, rawStr)
+			if strings.TrimSpace(rawStr) == "" {
+				sendData(h.eventBuffer.String())
+				h.eventBuffer.Reset()
+				h.eventType = ""
+			}
 		} else {
 			// No event type: forward as-is.
-			dataChan <- rawStr
+			sendData(rawStr)
 		}
 		return
 	}
@@ -851,7 +865,7 @@ func (h *CodexResponsesStreamHandler) HandlerResponsesStream(rawLine *[]byte, da
 	if dataLine == "[DONE]" {
 		// Flush buffered event.
 		if h.eventBuffer.Len() > 0 {
-			dataChan <- h.eventBuffer.String()
+			sendData(h.eventBuffer.String())
 			h.eventBuffer.Reset()
 			h.eventType = ""
 		}
@@ -863,18 +877,19 @@ func (h *CodexResponsesStreamHandler) HandlerResponsesStream(rawLine *[]byte, da
 	// Passthrough: buffer or forward raw data.
 	if h.eventBuffer.Len() > 0 {
 		// Buffer data line within event.
-		h.eventBuffer.WriteString(rawStr)
-		h.eventBuffer.WriteString("\n")
-
-		// Send event when complete (blank line).
-		if strings.HasSuffix(h.eventBuffer.String(), "\n\n") {
-			// Send complete event.
-			dataChan <- h.eventBuffer.String()
-			h.eventBuffer.Reset()
-			h.eventType = ""
-		}
+		appendCodexSSELine(&h.eventBuffer, rawStr)
 	} else {
 		// No event type: forward data line.
-		dataChan <- rawStr
+		sendData(rawStr)
+	}
+}
+
+func appendCodexSSELine(buffer *strings.Builder, raw string) {
+	if buffer == nil {
+		return
+	}
+	buffer.WriteString(raw)
+	if !strings.HasSuffix(raw, "\n") {
+		buffer.WriteString("\n")
 	}
 }

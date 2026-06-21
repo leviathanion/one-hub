@@ -20,11 +20,13 @@ import (
 
 	"one-api/common"
 	"one-api/common/authutil"
+	"one-api/common/config"
 	"one-api/common/logger"
 	commonredis "one-api/common/redis"
 	"one-api/common/requester"
 	"one-api/common/responsesws"
 	"one-api/common/wsconn"
+	runtimerealtime "one-api/runtime/realtime"
 	runtimesession "one-api/runtime/session"
 	"one-api/types"
 	"runtime/debug"
@@ -66,9 +68,9 @@ var codexRealtimePreparedResponseOverrideFields = []string{
 type codexRealtimeOutbound struct {
 	messageType   wsconn.MessageType
 	payload       []byte
-	providerClose *runtimesession.ProviderClose
+	providerClose *runtimerealtime.ProviderClose
 	usage         *types.UsageEvent
-	origin        runtimesession.RealtimePayloadOrigin
+	origin        runtimerealtime.RealtimePayloadOrigin
 	err           error
 }
 
@@ -92,6 +94,11 @@ type codexManagedRuntimeState struct {
 	wsConnGeneration      uint64
 	wsReaderConn          *wsconn.ManagedConn
 	bridgeStream          requester.StreamReaderInterface[string]
+	bridgeOpeningCancel   context.CancelFunc
+	bridgeOpeningSeq      uint64
+	bridgeOpeningOwnerSeq uint64
+	bridgeOpeningTurnSeq  int64
+	bridgeOpeningAttach   *codexAttachment
 	skipBootstrapConn     *wsconn.ManagedConn
 	turnSeq               int64
 	turnStartedAt         time.Time
@@ -117,6 +124,33 @@ type codexClearedWebsocket struct {
 type codexWSFrame struct {
 	messageType wsconn.MessageType
 	payload     []byte
+}
+
+type codexRealtimeBridgeStream struct {
+	inner     requester.StreamReaderInterface[string]
+	cancel    context.CancelFunc
+	closeOnce sync.Once
+}
+
+func (s *codexRealtimeBridgeStream) Recv() (<-chan string, <-chan error) {
+	if s == nil || s.inner == nil {
+		return nil, nil
+	}
+	return s.inner.Recv()
+}
+
+func (s *codexRealtimeBridgeStream) Close() {
+	if s == nil {
+		return
+	}
+	s.closeOnce.Do(func() {
+		if s.cancel != nil {
+			s.cancel()
+		}
+		if s.inner != nil {
+			s.inner.Close()
+		}
+	})
 }
 
 type codexManagedRealtimeSession struct {
@@ -287,7 +321,7 @@ func codexAcquireLocalOnlyExecutionSession(bindingKey, excludedSessionKey string
 	return exec, releaseLease, true
 }
 
-func (p *CodexProvider) planRealtimeOpen(meta runtimesession.Metadata, options runtimesession.RealtimeOpenOptions) codexRealtimeOpenPlan {
+func (p *CodexProvider) planRealtimeOpen(meta runtimesession.Metadata, options runtimerealtime.RealtimeOpenOptions) codexRealtimeOpenPlan {
 	plan := codexRealtimeOpenPlan{publishIntent: runtimesession.PublishIntentNone}
 	if options.ForceFresh || strings.TrimSpace(meta.BindingKey) == "" {
 		return plan
@@ -354,8 +388,8 @@ func (p *CodexProvider) planForceFreshRealtimeOpen(meta runtimesession.Metadata)
 	return plan
 }
 
-func (p *CodexProvider) OpenRealtimeSession(modelName string) (runtimesession.RealtimeSession, *types.OpenAIErrorWithStatusCode) {
-	return p.OpenRealtimeSessionWithOptions(modelName, runtimesession.RealtimeOpenOptions{})
+func (p *CodexProvider) OpenRealtimeSession(modelName string) (runtimerealtime.RealtimeSession, *types.OpenAIErrorWithStatusCode) {
+	return p.OpenRealtimeSessionWithOptions(modelName, runtimerealtime.RealtimeOpenOptions{})
 }
 
 func codexExecutionSessionRevocationTimeout() time.Duration {
@@ -374,7 +408,7 @@ func ExecutionSessionStats() runtimesession.Stats {
 	return currentCodexExecutionSessions().Stats()
 }
 
-func (p *CodexProvider) OpenRealtimeSessionWithOptions(modelName string, options runtimesession.RealtimeOpenOptions) (runtimesession.RealtimeSession, *types.OpenAIErrorWithStatusCode) {
+func (p *CodexProvider) OpenRealtimeSessionWithOptions(modelName string, options runtimerealtime.RealtimeOpenOptions) (runtimerealtime.RealtimeSession, *types.OpenAIErrorWithStatusCode) {
 	normalizedModelName := normalizeCodexModelName(modelName)
 	meta, errWithCode := p.buildExecutionSessionMetadata(normalizedModelName, options)
 	if errWithCode != nil {
@@ -423,8 +457,6 @@ func (p *CodexProvider) OpenRealtimeSessionWithOptions(modelName string, options
 		attachment := newCodexAttachment()
 		var staleAttachment *codexAttachment
 		var staleOwnerSeq uint64
-		var staleRequireWS bool
-		var staleDeferWSReader bool
 		var staleTurnObserver runtimesession.TurnObserver
 		var staleTurnObserverFactory runtimesession.TurnObserverFactory
 		var wasAttached bool
@@ -460,25 +492,21 @@ func (p *CodexProvider) OpenRealtimeSessionWithOptions(modelName string, options
 		wasAttached = exec.Attached
 		staleAttachment = state.attachment
 		staleOwnerSeq = state.ownerSeq
-		staleRequireWS = state.requireWS
-		staleDeferWSReader = state.deferWSReader
 		staleTurnObserver = state.turnObserver
 		staleTurnObserverFactory = state.turnObserverFactory
 		state.ownerSeq++
 		state.attachment = attachment
-		state.requireWS = options.RequireWS || options.PreferredTransport == runtimesession.TransportModeResponsesWS
-		state.deferWSReader = state.requireWS
+		state.requireWS = false
+		state.deferWSReader = false
 		state.turnObserverFactory = nil
 		if !exec.Inflight {
 			state.turnObserver = nil
 		}
 		exec.Attached = true
 
-		if errWithCode := p.ensureRealtimeTransportWithContextLocked(options.Context, exec, state, time.Now(), options.ResponsesWSPreviousResponseID); errWithCode != nil {
+		if errWithCode := p.ensureRealtimeTransportWithContextLocked(options.Context, exec, state, time.Now(), ""); errWithCode != nil {
 			state.attachment = staleAttachment
 			state.ownerSeq = staleOwnerSeq
-			state.requireWS = staleRequireWS
-			state.deferWSReader = staleDeferWSReader
 			state.turnObserver = codexGuardTurnObserver(staleTurnObserver)
 			state.turnObserverFactory = staleTurnObserverFactory
 			exec.Attached = wasAttached && staleAttachment != nil
@@ -522,9 +550,9 @@ func (p *CodexProvider) OpenRealtimeSessionWithOptions(modelName string, options
 	return nil, common.StringErrorWrapperLocal("execution session is closed during open", "session_closed", http.StatusConflict)
 }
 
-func (s *codexManagedRealtimeSession) SendClient(ctx context.Context, frame runtimesession.Frame) error {
+func (s *codexManagedRealtimeSession) SendClient(ctx context.Context, frame runtimerealtime.Frame) error {
 	if s == nil || s.exec == nil || s.provider == nil {
-		return runtimesession.ErrSessionClosed
+		return runtimerealtime.ErrSessionClosed
 	}
 	mt, payload, err := codexRealtimeMessageFromFrame(frame)
 	if err != nil {
@@ -548,7 +576,7 @@ func (s *codexManagedRealtimeSession) SendClient(ctx context.Context, frame runt
 	state := getCodexManagedRuntimeStateLocked(s.exec)
 	if !codexManagedSessionOwnsAttachmentLocked(state, s.ownerSeq, s.attachment) {
 		unlockExec()
-		return runtimesession.ErrSessionClosed
+		return runtimerealtime.ErrSessionClosed
 	}
 
 	switch strings.TrimSpace(event.Type) {
@@ -597,12 +625,12 @@ func (s *codexManagedRealtimeSession) SendClient(ctx context.Context, frame runt
 			unlockExec()
 			return codexRealtimeClientPayloadErrorFromObserver(eventID, err)
 		}
-		if s.exec.Transport == runtimesession.TransportModeResponsesWS {
+		if s.exec.Transport == runtimesession.TransportModeRealtimeWS {
 			armCodexTurnReadTimeoutLocked(s.exec, state)
 		}
 
 		switch s.exec.Transport {
-		case runtimesession.TransportModeResponsesWS:
+		case runtimesession.TransportModeRealtimeWS:
 			if err := s.provider.sendRealtimeWSEventLocked(ctx, s.exec, state, encodedPayload, eventID, request, s.ownerSeq, s.attachment); err != nil {
 				if codexManagedSessionOwnsAttachmentLocked(state, s.ownerSeq, s.attachment) {
 					if codexRealtimeShouldRollbackAdmissionAfterLocalFailure(err) {
@@ -615,7 +643,7 @@ func (s *codexManagedRealtimeSession) SendClient(ctx context.Context, frame runt
 			}
 			unlockExec()
 		case runtimesession.TransportModeResponsesHTTPBridge:
-			if err := s.provider.startRealtimeHTTPBridgeLocked(s.exec, state, request, eventID); err != nil {
+			if err := s.provider.startRealtimeHTTPBridgeLocked(ctx, s.exec, state, request, eventID, s.ownerSeq, s.attachment); err != nil {
 				if codexRealtimeShouldRollbackAdmissionAfterLocalFailure(err) {
 					rollbackCodexTurnAdmissionLocked(state.turnObserver, "bridge_local_failure")
 				}
@@ -638,6 +666,7 @@ func (s *codexManagedRealtimeSession) SendClient(ctx context.Context, frame runt
 		s.exec.Touch(time.Now())
 		switch s.exec.Transport {
 		case runtimesession.TransportModeResponsesHTTPBridge:
+			cancelCodexManagedBridgeOpeningLocked(state)
 			stream := state.bridgeStream
 			attachment := state.attachment
 			responseID := event.ResponseID
@@ -657,7 +686,7 @@ func (s *codexManagedRealtimeSession) SendClient(ctx context.Context, frame runt
 				_ = enqueueCodexOutbound(attachment, codexRealtimeOutbound{
 					messageType: wsconn.TextMessage,
 					payload:     buildCodexRealtimeCancelledPayload(responseID),
-					origin:      runtimesession.RealtimePayloadOriginProxyLocal,
+					origin:      runtimerealtime.RealtimePayloadOriginProxyLocal,
 				})
 			}
 			if stream != nil {
@@ -665,7 +694,7 @@ func (s *codexManagedRealtimeSession) SendClient(ctx context.Context, frame runt
 			}
 			codexMaybeDeleteDetachedExecutionSession(s.exec, "detached_ephemeral_session")
 			return nil
-		case runtimesession.TransportModeResponsesWS:
+		case runtimesession.TransportModeRealtimeWS:
 			if state.wsConn == nil {
 				finalizer, finalizePayload := finalizeCodexTurnLocked(s.exec, state, "response.cancelled", time.Now())
 				s.exec.Inflight = false
@@ -682,7 +711,7 @@ func (s *codexManagedRealtimeSession) SendClient(ctx context.Context, frame runt
 				logCodexRealtimeInternalError("codex realtime websocket request write failed: " + err.Error())
 				if !codexManagedSessionOwnsAttachmentLocked(state, s.ownerSeq, s.attachment) {
 					unlockExec()
-					return runtimesession.ErrSessionClosed
+					return runtimerealtime.ErrSessionClosed
 				}
 				clearedToClose := codexClearedWebsocket{conn: conn}
 				if state.wsConn == conn {
@@ -712,32 +741,17 @@ func (s *codexManagedRealtimeSession) SendClient(ctx context.Context, frame runt
 	}
 }
 
-func (s *codexManagedRealtimeSession) PreflightResponsesWSSend(ctx context.Context, eventID string, request *types.OpenAIResponsesRequest) error {
-	_ = ctx
-	if s == nil || s.exec == nil {
-		return runtimesession.ErrSessionClosed
-	}
-
-	s.exec.Lock()
-	defer s.exec.Unlock()
-	state := getCodexManagedRuntimeStateLocked(s.exec)
-	if !codexManagedSessionOwnsAttachmentLocked(state, s.ownerSeq, s.attachment) {
-		return runtimesession.ErrSessionClosed
-	}
-	return codexCheckStaleResponsesWSContinuationLocked(state, eventID, request)
-}
-
-func (s *codexManagedRealtimeSession) Recv(ctx context.Context) (runtimesession.RecvEvent, error) {
+func (s *codexManagedRealtimeSession) Recv(ctx context.Context) (runtimerealtime.RecvEvent, error) {
 	if s == nil || s.attachment == nil {
-		return runtimesession.RecvEvent{}, runtimesession.ErrSessionClosed
+		return runtimerealtime.RecvEvent{}, runtimerealtime.ErrSessionClosed
 	}
 	s.startDeferredRealtimeWSReader()
 
 	outbound, err := s.attachment.recv(ctx)
 	if err != nil {
-		return runtimesession.RecvEvent{}, err
+		return runtimerealtime.RecvEvent{}, err
 	}
-	event := runtimesession.RecvEvent{
+	event := runtimerealtime.RecvEvent{
 		ProviderClose: outbound.providerClose,
 		Usage:         outbound.usage,
 		Origin:        outbound.origin,
@@ -750,25 +764,25 @@ func (s *codexManagedRealtimeSession) Recv(ctx context.Context) (runtimesession.
 	return event, nil
 }
 
-func codexRealtimeMessageFromFrame(frame runtimesession.Frame) (wsconn.MessageType, []byte, error) {
+func codexRealtimeMessageFromFrame(frame runtimerealtime.Frame) (wsconn.MessageType, []byte, error) {
 	if frame.IsZero() {
-		return 0, nil, runtimesession.ErrInvalidFrame
+		return 0, nil, runtimerealtime.ErrInvalidFrame
 	}
 	switch frame.Kind() {
-	case runtimesession.FrameKindText:
+	case runtimerealtime.FrameKindText:
 		return wsconn.TextMessage, frame.Payload(), nil
-	case runtimesession.FrameKindBinary:
+	case runtimerealtime.FrameKindBinary:
 		return wsconn.BinaryMessage, frame.Payload(), nil
 	default:
-		return 0, nil, runtimesession.ErrInvalidFrame
+		return 0, nil, runtimerealtime.ErrInvalidFrame
 	}
 }
 
-func codexRealtimeFrameFromMessage(messageType wsconn.MessageType, payload []byte) runtimesession.Frame {
+func codexRealtimeFrameFromMessage(messageType wsconn.MessageType, payload []byte) runtimerealtime.Frame {
 	if messageType == wsconn.BinaryMessage {
-		return runtimesession.NewBinaryFrame(payload)
+		return runtimerealtime.NewBinaryFrame(payload)
 	}
-	return runtimesession.NewTextFrame(payload)
+	return runtimerealtime.NewTextFrame(payload)
 }
 
 func (s *codexManagedRealtimeSession) startDeferredRealtimeWSReader() {
@@ -778,7 +792,7 @@ func (s *codexManagedRealtimeSession) startDeferredRealtimeWSReader() {
 	s.exec.Lock()
 	state := getCodexManagedRuntimeStateLocked(s.exec)
 	if codexManagedSessionOwnsAttachmentLocked(state, s.ownerSeq, s.attachment) &&
-		s.exec.Transport == runtimesession.TransportModeResponsesWS &&
+		s.exec.Transport == runtimesession.TransportModeRealtimeWS &&
 		state.wsConn != nil &&
 		state.deferWSReader {
 		s.provider.startRealtimeWSReaderLocked(s.exec, state)
@@ -793,24 +807,43 @@ func (s *codexManagedRealtimeSession) Detach(reason string) {
 
 	s.detachOnce.Do(func() {
 		var cleared codexClearedWebsocket
+		var bridgeStream requester.StreamReaderInterface[string]
 		var observer runtimesession.TurnObserver
 		var finalizePayload runtimesession.TurnFinalizePayload
 		s.exec.Lock()
 		state := getCodexManagedRuntimeStateLocked(s.exec)
 		if codexManagedSessionOwnsAttachmentLocked(state, s.ownerSeq, s.attachment) {
+			now := time.Now()
+			bridgeOpeningCancelled := cancelCodexManagedBridgeOpeningLocked(state)
 			state.attachment = nil
 			s.exec.Attached = false
-			if s.exec.Inflight && s.exec.Transport == runtimesession.TransportModeResponsesWS {
-				observer, finalizePayload = finalizeCodexTurnLocked(s.exec, state, "detached", time.Now())
+			if s.exec.Inflight && s.exec.Transport == runtimesession.TransportModeRealtimeWS {
+				observer, finalizePayload = finalizeCodexTurnLocked(s.exec, state, "detached", now)
 				s.exec.Inflight = false
 				s.exec.State = runtimesession.SessionStateIdle
 			}
-			s.exec.Touch(time.Now())
+			bridgeStream = clearCodexManagedBridgeStreamLocked(state)
+			if bridgeStream != nil || bridgeOpeningCancelled {
+				// HTTP bridge streams are normally finalized by the bridge pump.
+				// Detach closes/cancels the stream before the pump can own
+				// completion, so this teardown path must settle the inflight bridge
+				// turn itself.
+				bridgeObserver, bridgeFinalizePayload := finalizeCodexTurnLocked(s.exec, state, "detached", now)
+				if bridgeFinalizePayload.TurnSeq > 0 {
+					observer, finalizePayload = bridgeObserver, bridgeFinalizePayload
+				}
+				s.exec.Inflight = false
+				s.exec.State = runtimesession.SessionStateIdle
+			}
+			s.exec.Touch(now)
 			cleared = clearCodexManagedWebsocketLocked(state)
 		}
 		s.exec.Unlock()
 
 		s.attachment.close()
+		if bridgeStream != nil {
+			bridgeStream.Close()
+		}
 		if observer != nil && finalizePayload.TurnSeq > 0 {
 			observer.FinalizeTurn(finalizePayload)
 		}
@@ -833,11 +866,26 @@ func (s *codexManagedRealtimeSession) Abort(reason string) {
 	s.abortOnce.Do(func() {
 		var owned bool
 		var cleared codexClearedWebsocket
+		var bridgeStream requester.StreamReaderInterface[string]
+		var observer runtimesession.TurnObserver
+		var finalizePayload runtimesession.TurnFinalizePayload
 		s.exec.Lock()
 		state := getCodexManagedRuntimeStateLocked(s.exec)
 		if codexManagedSessionOwnsStateLocked(state, s.ownerSeq) {
 			owned = true
+			bridgeOpeningCancelled := cancelCodexManagedBridgeOpeningLocked(state)
 			cleared = clearCodexManagedWebsocketLocked(state)
+			bridgeStream = clearCodexManagedBridgeStreamLocked(state)
+			// An HTTP bridge turn is normally finalized by the bridge pump when the
+			// upstream ends. Closing/cancelling bridgeStream here makes the pump
+			// stop owning the stream, so it will no longer finalize; abort must
+			// settle the turn itself. finalizeCodexTurnLocked is idempotent
+			// (turnFinalized), so racing with the pump cannot double-settle. WS
+			// turns keep their existing behaviour (no finalize on abort) because
+			// bridgeStream is nil for them.
+			if bridgeStream != nil || bridgeOpeningCancelled {
+				observer, finalizePayload = finalizeCodexTurnLocked(s.exec, state, strings.TrimSpace(reason), time.Now())
+			}
 			attachment := state.attachment
 			state.attachment = nil
 			state.ownerSeq = 0
@@ -864,6 +912,12 @@ func (s *codexManagedRealtimeSession) Abort(reason string) {
 			return
 		}
 		closeCodexClearedWebsocket(cleared)
+		if bridgeStream != nil {
+			bridgeStream.Close()
+		}
+		if observer != nil {
+			observer.FinalizeTurn(finalizePayload)
+		}
 		currentCodexExecutionSessions().DeleteIf(s.exec.Key, s.exec)
 	})
 }
@@ -929,8 +983,8 @@ func cleanupCodexExecutionSessionWithLock(exec *runtimesession.ExecutionSession,
 		attachment = state.attachment
 		state.attachment = nil
 		state.ownerSeq = 0
-		bridgeStream = state.bridgeStream
-		state.bridgeStream = nil
+		cancelCodexManagedBridgeOpeningLocked(state)
+		bridgeStream = clearCodexManagedBridgeStreamLocked(state)
 		clearedWS = clearCodexManagedWebsocketLocked(state)
 		observer, finalizePayload = finalizeCodexTurnLocked(exec, state, "session_aborted", time.Now())
 		exec.Attached = false
@@ -994,7 +1048,7 @@ func recoverCodexRealtimeGoroutine(label string, exec *runtimesession.ExecutionS
 	}
 }
 
-func (p *CodexProvider) buildExecutionSessionMetadata(modelName string, options runtimesession.RealtimeOpenOptions) (runtimesession.Metadata, *types.OpenAIErrorWithStatusCode) {
+func (p *CodexProvider) buildExecutionSessionMetadata(modelName string, options runtimerealtime.RealtimeOpenOptions) (runtimesession.Metadata, *types.OpenAIErrorWithStatusCode) {
 	modelName = normalizeCodexModelName(modelName)
 	clientSessionID, clientSuppliedID, errWithCode := p.readRealtimeClientSessionID(options)
 	if errWithCode != nil {
@@ -1030,7 +1084,7 @@ func (p *CodexProvider) buildExecutionSessionMetadata(modelName string, options 
 	}, nil
 }
 
-func (p *CodexProvider) resolveExecutionSessionKey(bindingKey string, channelID int, compatibilityHash string, options runtimesession.RealtimeOpenOptions) (string, string) {
+func (p *CodexProvider) resolveExecutionSessionKey(bindingKey string, channelID int, compatibilityHash string, options runtimerealtime.RealtimeOpenOptions) (string, string) {
 	upstreamSessionID := strings.TrimSpace(options.ResolvedUpstreamSessionID)
 	if upstreamSessionID == "" {
 		upstreamSessionID = uuid.NewString()
@@ -1075,7 +1129,7 @@ func (p *CodexProvider) buildRealtimeCompatibilityHash(modelName, upstreamIdenti
 	}, "|"))
 }
 
-func (p *CodexProvider) readRealtimeClientSessionID(options runtimesession.RealtimeOpenOptions) (string, bool, *types.OpenAIErrorWithStatusCode) {
+func (p *CodexProvider) readRealtimeClientSessionID(options runtimerealtime.RealtimeOpenOptions) (string, bool, *types.OpenAIErrorWithStatusCode) {
 	if resolved := strings.TrimSpace(options.ClientSessionID); resolved != "" {
 		if err := validateCodexRealtimeExecutionSessionID(resolved); err != nil {
 			return "", false, codexRealtimeInvalidSessionIDError(err)
@@ -1333,7 +1387,7 @@ func (p *CodexProvider) ensureRealtimeTransportWithContextLocked(ctx context.Con
 	}
 
 	if state.wsConn != nil {
-		exec.Transport = runtimesession.TransportModeResponsesWS
+		exec.Transport = runtimesession.TransportModeRealtimeWS
 		if state == nil || !state.deferWSReader {
 			p.startRealtimeWSReaderLocked(exec, state)
 		}
@@ -1370,7 +1424,7 @@ func (p *CodexProvider) ensureRealtimeTransportWithContextLocked(ctx context.Con
 		state.wsConn = conn
 		state.wsConnGeneration++
 		state.skipBootstrapConn = conn
-		exec.Transport = runtimesession.TransportModeResponsesWS
+		exec.Transport = runtimesession.TransportModeRealtimeWS
 		exec.FallbackUntil = time.Time{}
 		if state == nil || !state.deferWSReader {
 			p.startRealtimeWSReaderLocked(exec, state)
@@ -1623,7 +1677,7 @@ func (p *CodexProvider) startRealtimeWSReaderLocked(exec *runtimesession.Executi
 						messageType: messageType,
 						payload:     payload,
 						usage:       usage,
-						origin:      runtimesession.RealtimePayloadOriginProvider,
+						origin:      runtimerealtime.RealtimePayloadOriginProvider,
 						err:         codexRealtimeTurnUsageError(usageErr),
 					})
 				}
@@ -1638,14 +1692,14 @@ func (p *CodexProvider) startRealtimeWSReaderLocked(exec *runtimesession.Executi
 
 			if handlerErr != nil {
 				if attachment != nil {
-					errorPayload := runtimesession.ClientPayloadFromError(handlerErr)
+					errorPayload := runtimerealtime.ClientPayloadFromError(handlerErr)
 					if len(errorPayload) == 0 {
 						errorPayload = []byte(handlerErr.Error())
 					}
 					_ = enqueueCodexOutbound(attachment, codexRealtimeOutbound{
 						messageType: wsconn.TextMessage,
 						payload:     errorPayload,
-						origin:      runtimesession.RealtimePayloadOriginProxyLocal,
+						origin:      runtimerealtime.RealtimePayloadOriginProxyLocal,
 					})
 				}
 				return
@@ -1659,7 +1713,7 @@ func (p *CodexProvider) startRealtimeWSReaderLocked(exec *runtimesession.Executi
 					messageType: messageType,
 					payload:     payload,
 					usage:       usage,
-					origin:      runtimesession.RealtimePayloadOriginProvider,
+					origin:      runtimerealtime.RealtimePayloadOriginProvider,
 				}) {
 					cleanupCodexExecutionSession(exec)
 					return
@@ -1672,19 +1726,19 @@ func (p *CodexProvider) startRealtimeWSReaderLocked(exec *runtimesession.Executi
 func codexRealtimeOutboundFromCloseInfo(info wsconn.CloseInfo) codexRealtimeOutbound {
 	if codexRealtimeCloseAsProviderClose(info.Kind) {
 		return codexRealtimeOutbound{
-			providerClose: &runtimesession.ProviderClose{
+			providerClose: &runtimerealtime.ProviderClose{
 				Code:   int(info.Code),
 				Reason: info.Reason,
-				Err:    runtimesession.ErrSessionClosed,
+				Err:    runtimerealtime.ErrSessionClosed,
 			},
-			origin: runtimesession.RealtimePayloadOriginProvider,
+			origin: runtimerealtime.RealtimePayloadOriginProvider,
 		}
 	}
 	return codexRealtimeOutbound{
 		messageType: wsconn.TextMessage,
 		payload:     codexRealtimeProviderErrorEventPayload("", "provider_connection_closed", codexRealtimeStaticErrorMessage("provider_connection_closed")),
-		origin:      runtimesession.RealtimePayloadOriginProxyLocal,
-		err:         runtimesession.ErrSessionClosed,
+		origin:      runtimerealtime.RealtimePayloadOriginProxyLocal,
+		err:         runtimerealtime.ErrSessionClosed,
 	}
 }
 
@@ -1710,13 +1764,13 @@ func (p *CodexProvider) sendRealtimeWSEventLocked(ctx context.Context, exec *run
 		return codexRealtimeErrorFromOpenAIError(eventID, errWithCode)
 	}
 
-	if exec.Transport != runtimesession.TransportModeResponsesWS || state.wsConn == nil {
+	if exec.Transport != runtimesession.TransportModeRealtimeWS || state.wsConn == nil {
 		if state != nil && state.requireWS {
 			exec.Inflight = false
 			exec.State = runtimesession.SessionStateIdle
 			return newCodexRealtimeProviderError(eventID, "responses_ws_unsupported_for_channel", "channel does not support Responses websocket transport")
 		}
-		if err := p.startRealtimeHTTPBridgeLocked(exec, state, request, eventID); err != nil {
+		if err := p.startRealtimeHTTPBridgeLocked(ctx, exec, state, request, eventID, ownerSeq, attachment); err != nil {
 			return err
 		}
 		return nil
@@ -1728,7 +1782,7 @@ func (p *CodexProvider) sendRealtimeWSEventLocked(ctx context.Context, exec *run
 		return nil
 	}
 	if ownerSeq != 0 && !codexManagedSessionOwnsAttachmentLocked(state, ownerSeq, attachment) {
-		return runtimesession.ErrSessionClosed
+		return runtimerealtime.ErrSessionClosed
 	}
 
 	if state != nil && state.requireWS {
@@ -1749,13 +1803,13 @@ func (p *CodexProvider) sendRealtimeWSEventLocked(ctx context.Context, exec *run
 	}
 	closeCodexClearedWebsocket(clearedToClose)
 
-	if errWithCode := p.ensureRealtimeTransportWithContextLocked(ctx, exec, state, time.Now(), ""); errWithCode == nil && exec.Transport == runtimesession.TransportModeResponsesWS && state.wsConn != nil {
+	if errWithCode := p.ensureRealtimeTransportWithContextLocked(ctx, exec, state, time.Now(), ""); errWithCode == nil && exec.Transport == runtimesession.TransportModeRealtimeWS && state.wsConn != nil {
 		retryConn := state.wsConn
 		if err := writeCodexRealtimeWSMessageWithExecUnlocked(exec, retryConn, wsconn.TextMessage, payload); err == nil {
 			return nil
 		}
 		if ownerSeq != 0 && !codexManagedSessionOwnsAttachmentLocked(state, ownerSeq, attachment) {
-			return runtimesession.ErrSessionClosed
+			return runtimerealtime.ErrSessionClosed
 		}
 		clearedRetryToClose := codexClearedWebsocket{conn: retryConn}
 		if state.wsConn == retryConn {
@@ -1772,7 +1826,7 @@ func (p *CodexProvider) sendRealtimeWSEventLocked(ctx context.Context, exec *run
 		}
 		exec.Transport = runtimesession.TransportModeResponsesHTTPBridge
 		exec.FallbackUntil = time.Now().Add(p.getWebsocketRetryCooldown())
-		return p.startRealtimeHTTPBridgeLocked(exec, state, request, eventID)
+		return p.startRealtimeHTTPBridgeLocked(ctx, exec, state, request, eventID, ownerSeq, attachment)
 	}
 
 	exec.Inflight = false
@@ -1816,19 +1870,79 @@ func codexShouldFailStaleResponsesWSContinuationLocked(state *codexManagedRuntim
 		state.wsConn == nil
 }
 
-func (p *CodexProvider) startRealtimeHTTPBridgeLocked(exec *runtimesession.ExecutionSession, state *codexManagedRuntimeState, request *types.OpenAIResponsesRequest, eventID string) error {
+func (p *CodexProvider) startRealtimeHTTPBridgeLocked(ctx context.Context, exec *runtimesession.ExecutionSession, state *codexManagedRuntimeState, request *types.OpenAIResponsesRequest, eventID string, ownerSeq uint64, attachment *codexAttachment) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if state == nil {
+		state = getCodexManagedRuntimeStateLocked(exec)
+	}
 	if state != nil && state.requireWS {
 		exec.Inflight = false
 		exec.State = runtimesession.SessionStateIdle
 		return newCodexRealtimeProviderError(eventID, "responses_ws_unsupported_for_channel", "Responses websocket transport is required")
 	}
-	stream, errWithCode := p.createResponsesStreamWithSession(request, exec.SessionID)
-	if errWithCode != nil {
+	if err := ctx.Err(); err != nil {
 		exec.Inflight = false
 		exec.State = runtimesession.SessionStateIdle
-		return codexRealtimeErrorFromOpenAIError(eventID, errWithCode)
+		return newCodexRealtimeProviderError(eventID, "bridge_open_cancelled", err.Error())
 	}
 
+	cancelCodexManagedBridgeOpeningLocked(state)
+	openCtx, cancelOpen := context.WithCancel(ctx)
+	state.bridgeOpeningSeq++
+	openingSeq := state.bridgeOpeningSeq
+	state.bridgeOpeningCancel = cancelOpen
+	state.bridgeOpeningOwnerSeq = ownerSeq
+	state.bridgeOpeningTurnSeq = state.turnSeq
+	state.bridgeOpeningAttach = attachment
+	sessionID := exec.SessionID
+	turnSeq := state.turnSeq
+	exec.Unlock()
+
+	stream, errWithCode := p.createResponsesStreamWithSession(openCtx, request, sessionID)
+
+	exec.Lock()
+	state = getCodexManagedRuntimeStateLocked(exec)
+	openingStillOwned := state.bridgeOpeningSeq == openingSeq &&
+		state.bridgeOpeningCancel != nil &&
+		state.bridgeOpeningOwnerSeq == ownerSeq &&
+		state.bridgeOpeningTurnSeq == turnSeq &&
+		state.bridgeOpeningAttach == attachment &&
+		(ownerSeq == 0 || codexManagedSessionOwnsAttachmentLocked(state, ownerSeq, attachment)) &&
+		!exec.IsClosed()
+	if !openingStillOwned {
+		cancelOpen()
+		if stream != nil {
+			stream.Close()
+		}
+		return nil
+	}
+	state.bridgeOpeningCancel = nil
+	state.bridgeOpeningOwnerSeq = 0
+	state.bridgeOpeningTurnSeq = 0
+	state.bridgeOpeningAttach = nil
+	if errWithCode != nil {
+		openErr := openCtx.Err()
+		cancelOpen()
+		exec.Inflight = false
+		exec.State = runtimesession.SessionStateIdle
+		if openErr != nil {
+			return newCodexRealtimeProviderError(eventID, "bridge_open_cancelled", openErr.Error())
+		}
+		return codexRealtimeErrorFromOpenAIError(eventID, errWithCode)
+	}
+	if stream == nil {
+		cancelOpen()
+		exec.Inflight = false
+		exec.State = runtimesession.SessionStateIdle
+		return newCodexRealtimeProviderError(eventID, "bridge_open_failed", codexRealtimeStaticErrorMessage("bridge_open_failed"))
+	}
+
+	stream = &codexRealtimeBridgeStream{
+		inner:  stream,
+		cancel: cancelOpen,
+	}
 	state.bridgeStream = stream
 	exec.Transport = runtimesession.TransportModeResponsesHTTPBridge
 	exec.Touch(time.Now())
@@ -1846,10 +1960,61 @@ func (p *CodexProvider) pumpRealtimeHTTPBridge(exec *runtimesession.ExecutionSes
 	dataChan, errChan := stream.Recv()
 	defer stream.Close()
 
+	handleBridgeStreamError := func(err error) {
+		var attachment *codexAttachment
+		shouldReportTruncatedBridge := false
+		var turnObserver runtimesession.TurnObserver
+		var finalizePayload runtimesession.TurnFinalizePayload
+
+		exec.Lock()
+		state := getCodexManagedRuntimeStateLocked(exec)
+		ownsBridge := state.bridgeStream == stream
+		if ownsBridge {
+			attachment = state.attachment
+			shouldReportTruncatedBridge = exec.Inflight && errors.Is(err, io.EOF)
+			state.bridgeStream = nil
+			turnObserver, finalizePayload = finalizeCodexTurnLocked(exec, state, bridgeTerminationReason(err, shouldReportTruncatedBridge), time.Now())
+			exec.Inflight = false
+			exec.State = runtimesession.SessionStateIdle
+			exec.Touch(time.Now())
+		}
+		exec.Unlock()
+		if turnObserver != nil {
+			turnObserver.FinalizeTurn(finalizePayload)
+		}
+		codexMaybeDeleteDetachedExecutionSession(exec, "detached_ephemeral_session")
+
+		if err != nil && ownsBridge && attachment != nil {
+			logCodexRealtimeInternalError("codex realtime bridge stream failed: " + err.Error())
+			payload := codexRealtimeProviderErrorEventPayload("", "bridge_stream_failed", codexRealtimeStaticErrorMessage("bridge_stream_failed"))
+			if shouldReportTruncatedBridge {
+				payload = codexRealtimeProviderErrorEventPayload("", "bridge_stream_failed", "provider bridge stream closed before a terminal response event")
+			}
+			if !errors.Is(err, io.EOF) || shouldReportTruncatedBridge {
+				_ = enqueueCodexOutbound(attachment, codexRealtimeOutbound{
+					messageType: wsconn.TextMessage,
+					payload:     payload,
+					origin:      runtimerealtime.RealtimePayloadOriginProxyLocal,
+				})
+			}
+		}
+	}
+
 	for {
 		select {
 		case data, ok := <-dataChan:
 			if !ok {
+				dataChan = nil
+				select {
+				case err, ok := <-errChan:
+					if ok {
+						handleBridgeStreamError(err)
+					} else {
+						handleBridgeStreamError(io.EOF)
+					}
+				default:
+					handleBridgeStreamError(io.EOF)
+				}
 				return
 			}
 
@@ -1921,7 +2086,7 @@ func (p *CodexProvider) pumpRealtimeHTTPBridge(exec *runtimesession.ExecutionSes
 						messageType: wsconn.TextMessage,
 						payload:     []byte(payload),
 						usage:       usage,
-						origin:      runtimesession.RealtimePayloadOriginProvider,
+						origin:      runtimerealtime.RealtimePayloadOriginProvider,
 						err:         codexRealtimeTurnUsageError(usageErr),
 					})
 				}
@@ -1939,7 +2104,7 @@ func (p *CodexProvider) pumpRealtimeHTTPBridge(exec *runtimesession.ExecutionSes
 					messageType: wsconn.TextMessage,
 					payload:     []byte(payload),
 					usage:       usage,
-					origin:      runtimesession.RealtimePayloadOriginProvider,
+					origin:      runtimerealtime.RealtimePayloadOriginProvider,
 				}) {
 					cleanupCodexExecutionSession(exec)
 					stream.Close()
@@ -1947,50 +2112,22 @@ func (p *CodexProvider) pumpRealtimeHTTPBridge(exec *runtimesession.ExecutionSes
 				}
 			}
 
-		case err := <-errChan:
-			var attachment *codexAttachment
-			shouldReportTruncatedBridge := false
-			var turnObserver runtimesession.TurnObserver
-			var finalizePayload runtimesession.TurnFinalizePayload
-
-			exec.Lock()
-			state := getCodexManagedRuntimeStateLocked(exec)
-			ownsBridge := state.bridgeStream == stream
-			if ownsBridge {
-				attachment = state.attachment
-				shouldReportTruncatedBridge = exec.Inflight && errors.Is(err, io.EOF)
-				state.bridgeStream = nil
-				turnObserver, finalizePayload = finalizeCodexTurnLocked(exec, state, bridgeTerminationReason(err, shouldReportTruncatedBridge), time.Now())
-				exec.Inflight = false
-				exec.State = runtimesession.SessionStateIdle
-				exec.Touch(time.Now())
-			}
-			exec.Unlock()
-			if turnObserver != nil {
-				turnObserver.FinalizeTurn(finalizePayload)
-			}
-			codexMaybeDeleteDetachedExecutionSession(exec, "detached_ephemeral_session")
-
-			if err != nil && ownsBridge && attachment != nil {
-				logCodexRealtimeInternalError("codex realtime bridge stream failed: " + err.Error())
-				payload := codexRealtimeProviderErrorEventPayload("", "bridge_stream_failed", codexRealtimeStaticErrorMessage("bridge_stream_failed"))
-				if shouldReportTruncatedBridge {
-					payload = codexRealtimeProviderErrorEventPayload("", "bridge_stream_failed", "provider bridge stream closed before a terminal response event")
+		case err, ok := <-errChan:
+			if !ok {
+				errChan = nil
+				if dataChan == nil {
+					handleBridgeStreamError(io.EOF)
+					return
 				}
-				if !errors.Is(err, io.EOF) || shouldReportTruncatedBridge {
-					_ = enqueueCodexOutbound(attachment, codexRealtimeOutbound{
-						messageType: wsconn.TextMessage,
-						payload:     payload,
-						origin:      runtimesession.RealtimePayloadOriginProxyLocal,
-					})
-				}
+				continue
 			}
+			handleBridgeStreamError(err)
 			return
 		}
 	}
 }
 
-func (p *CodexProvider) createResponsesStreamWithSession(request *types.OpenAIResponsesRequest, sessionID string) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+func (p *CodexProvider) createResponsesStreamWithSession(ctx context.Context, request *types.OpenAIResponsesRequest, sessionID string) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
 	request, err := cloneCodexResponsesRequest(request)
 	if err != nil {
 		return nil, common.ErrorWrapperLocal(err, "invalid_event", http.StatusBadRequest)
@@ -2004,8 +2141,11 @@ func (p *CodexProvider) createResponsesStreamWithSession(request *types.OpenAIRe
 		return nil, errWithCode
 	}
 	defer req.Body.Close()
+	if ctx != nil {
+		req = req.WithContext(ctx)
+	}
 
-	resp, errWithCode := p.Requester.SendRequestRaw(req)
+	resp, errWithCode := p.Requester.SendResponsesHTTPBridgeRaw(req, p.responsesHTTPBridgeSecurity())
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -2013,7 +2153,9 @@ func (p *CodexProvider) createResponsesStreamWithSession(request *types.OpenAIRe
 	handler := &CodexResponsesStreamHandler{
 		Usage: p.Usage,
 	}
-	return requester.RequestNoTrimStream(p.Requester, resp, handler.HandlerResponsesStream)
+	return requester.RequestNoTrimStreamWithEmitterOptions(p.Requester, resp, handler.HandlerResponsesStreamWithEmitter, requester.StreamReadOptions{
+		MaxLineBytes: config.RealtimeWebsocketReadLimit(),
+	})
 }
 
 func getCodexManagedRuntimeStateLocked(exec *runtimesession.ExecutionSession) *codexManagedRuntimeState {
@@ -2049,6 +2191,34 @@ func closeCodexClearedWebsocket(cleared codexClearedWebsocket) {
 	if cleared.conn != nil {
 		cleared.conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "codex_ws_closed"})
 	}
+}
+
+func cancelCodexManagedBridgeOpeningLocked(state *codexManagedRuntimeState) bool {
+	if state == nil || state.bridgeOpeningCancel == nil {
+		return false
+	}
+	cancel := state.bridgeOpeningCancel
+	state.bridgeOpeningCancel = nil
+	state.bridgeOpeningOwnerSeq = 0
+	state.bridgeOpeningTurnSeq = 0
+	state.bridgeOpeningAttach = nil
+	state.bridgeOpeningSeq++
+	cancel()
+	return true
+}
+
+// clearCodexManagedBridgeStreamLocked detaches the current HTTP bridge stream
+// handle from state, mirroring clearCodexManagedWebsocketLocked for the WS conn.
+// The bridge stream handle exists solely as a cancellation target; every teardown
+// path must release it so the bridge pump can exit instead of spinning until the
+// upstream closes. Caller must Close the returned stream after releasing exec.Lock.
+func clearCodexManagedBridgeStreamLocked(state *codexManagedRuntimeState) requester.StreamReaderInterface[string] {
+	if state == nil {
+		return nil
+	}
+	stream := state.bridgeStream
+	state.bridgeStream = nil
+	return stream
 }
 
 func writeCodexRealtimeWSMessage(conn *wsconn.ManagedConn, messageType wsconn.MessageType, payload []byte) error {
@@ -2141,7 +2311,7 @@ func (a *codexAttachment) isClosed() bool {
 
 func (a *codexAttachment) recv(ctx context.Context) (codexRealtimeOutbound, error) {
 	if a == nil {
-		return codexRealtimeOutbound{}, runtimesession.ErrSessionClosed
+		return codexRealtimeOutbound{}, runtimerealtime.ErrSessionClosed
 	}
 
 	for {
@@ -2157,7 +2327,7 @@ func (a *codexAttachment) recv(ctx context.Context) (codexRealtimeOutbound, erro
 		}
 		if a.closed {
 			a.mu.Unlock()
-			return codexRealtimeOutbound{}, runtimesession.ErrSessionClosed
+			return codexRealtimeOutbound{}, runtimerealtime.ErrSessionClosed
 		}
 		waitCh := a.waitCh
 		a.mu.Unlock()
@@ -2201,10 +2371,10 @@ func normalizeCodexRealtimeOutbound(outbound codexRealtimeOutbound) []codexRealt
 		origin: outbound.origin,
 		err:    outbound.err,
 	}
-	if payload := runtimesession.ClientPayloadFromError(outbound.err); len(payload) > 0 {
+	if payload := runtimerealtime.ClientPayloadFromError(outbound.err); len(payload) > 0 {
 		errEvent.messageType = wsconn.TextMessage
 		errEvent.payload = payload
-		errEvent.origin = runtimesession.RealtimePayloadOriginProxyLocal
+		errEvent.origin = runtimerealtime.RealtimePayloadOriginProxyLocal
 	}
 	outbound.err = nil
 	return []codexRealtimeOutbound{outbound, errEvent}
@@ -2273,16 +2443,21 @@ func buildCodexRealtimeCancelledPayload(responseID string) []byte {
 }
 
 func isCodexRealtimeBootstrapMessage(messageType wsconn.MessageType, payload []byte) bool {
+	// wsconn.MessageType belongs at the realtime wire boundary. ResponsesWS
+	// adapters should call isCodexRealtimeBootstrapPayload directly.
 	if messageType != wsconn.TextMessage {
 		return false
 	}
+	return isCodexRealtimeBootstrapPayload(payload)
+}
 
-	var event types.Event
-	if err := json.Unmarshal(payload, &event); err != nil {
+func isCodexRealtimeBootstrapPayload(payload []byte) bool {
+	envelope, err := responsesws.ParseProviderEventEnvelope(payload)
+	if err != nil {
 		return false
 	}
 
-	return strings.TrimSpace(event.Type) == types.EventTypeSessionCreated
+	return strings.TrimSpace(envelope.Type) == types.EventTypeSessionCreated
 }
 
 func beginCodexTurnLocked(state *codexManagedRuntimeState, now time.Time) {
@@ -2314,6 +2489,7 @@ func resetCodexTurnLocked(state *codexManagedRuntimeState) {
 		return
 	}
 
+	cancelCodexManagedBridgeOpeningLocked(state)
 	stopCodexTurnReadTimeoutLocked(state)
 	state.turnStartedAt = time.Time{}
 	state.turnFirstResponseAt = time.Time{}
@@ -2455,7 +2631,7 @@ func codexRealtimeTurnUsageError(err error) error {
 
 	var event *types.Event
 	if errors.As(err, &event) {
-		return runtimesession.NewClientPayloadError(event, []byte(event.Error()))
+		return runtimerealtime.NewClientPayloadError(event, []byte(event.Error()))
 	}
 
 	logCodexRealtimeInternalError("codex realtime turn usage error: " + err.Error())
@@ -2464,7 +2640,7 @@ func codexRealtimeTurnUsageError(err error) error {
 		message = "user quota is not enough"
 	}
 	event = types.NewErrorEvent("", "system_error", "system_error", message)
-	return runtimesession.NewClientPayloadError(event, []byte(event.Error()))
+	return runtimerealtime.NewClientPayloadError(event, []byte(event.Error()))
 }
 
 func codexTurnTerminationReason(eventType string, response *types.OpenAIResponsesResponses) string {
@@ -2490,10 +2666,15 @@ func bridgeTerminationReason(err error, truncated bool) string {
 }
 
 func inspectCodexRealtimeSupplierEvent(messageType wsconn.MessageType, payload []byte) (bool, string, string) {
+	// wsconn.MessageType belongs at the realtime wire boundary. ResponsesWS
+	// adapters should call inspectCodexRealtimeSupplierPayload directly.
 	if messageType != wsconn.TextMessage {
 		return false, "", ""
 	}
+	return inspectCodexRealtimeSupplierPayload(payload)
+}
 
+func inspectCodexRealtimeSupplierPayload(payload []byte) (bool, string, string) {
 	var event types.OpenAIResponsesStreamResponses
 	if err := json.Unmarshal(payload, &event); err != nil {
 		return false, "", ""
@@ -2677,7 +2858,7 @@ func newCodexRealtimeProviderError(eventID, code, message string) error {
 
 func codexStaleResponsesWSContinuationError(eventID string) error {
 	_ = eventID
-	return runtimesession.NewClientPayloadError(runtimesession.ErrStaleResponsesWSContinuation, codexResponsesWSPreviousResponseNotFoundPayload())
+	return responsesws.NewClientPayloadError(responsesws.ErrStaleContinuation, codexResponsesWSPreviousResponseNotFoundPayload())
 }
 
 func codexResponsesWSPreviousResponseNotFoundPayload() []byte {
@@ -2703,7 +2884,7 @@ func codexRealtimeClientPayloadErrorFromObserver(eventID string, err error) erro
 	if err == nil {
 		return nil
 	}
-	if payload := runtimesession.ClientPayloadFromError(err); len(payload) > 0 {
+	if payload := runtimerealtime.ClientPayloadFromError(err); len(payload) > 0 {
 		return err
 	}
 	var event *types.Event
@@ -2716,7 +2897,7 @@ func codexRealtimeClientPayloadErrorFromObserver(eventID string, err error) erro
 		code = codexRealtimeErrorCodeString(apiErr.Code, code)
 	}
 	event = types.NewErrorEvent(eventID, "system_error", code, codexRealtimeObserverErrorMessage(code))
-	return runtimesession.NewClientPayloadError(event, []byte(event.Error()))
+	return runtimerealtime.NewClientPayloadError(event, []byte(event.Error()))
 }
 
 func rollbackCodexTurnAdmissionLocked(observer runtimesession.TurnObserver, reason string) {
@@ -2737,7 +2918,7 @@ func codexRealtimeShouldRollbackAdmissionAfterLocalFailure(err error) bool {
 		return false
 	}
 	switch codexRealtimeErrorCodeString(event.ErrorDetail.Code, "") {
-	case "responses_ws_unsupported_for_channel", "transport_unavailable":
+	case "responses_ws_unsupported_for_channel", "transport_unavailable", "bridge_open_cancelled", "bridge_open_failed":
 		return true
 	default:
 		return false
@@ -2756,6 +2937,10 @@ func codexRealtimeStaticErrorMessage(code string) string {
 		return "upstream websocket write failed"
 	case "provider_connection_closed":
 		return "upstream websocket connection closed"
+	case "bridge_open_cancelled":
+		return "provider bridge open cancelled"
+	case "bridge_open_failed":
+		return "provider bridge open failed"
 	case "bridge_stream_failed":
 		return "provider bridge stream failed"
 	default:

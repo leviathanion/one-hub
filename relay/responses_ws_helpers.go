@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"one-api/common/logger"
 	"one-api/common/responsesws"
-	runtimesession "one-api/runtime/session"
 	"one-api/types"
 	"strings"
 )
@@ -20,28 +19,21 @@ const (
 	responsesWSMessageInvalidResponseCreate   = "invalid response.create"
 )
 
-func responsesWSSendOutcomeFromError(err error) ResponsesWSSendOutcome {
-	if err == nil {
-		return SendOutcomeLocalWriteOK
-	}
-	if errors.Is(err, runtimesession.ErrSessionClosed) || errors.Is(err, runtimesession.ErrStaleResponsesWSContinuation) {
-		return SendOutcomeNotSent
-	}
-	var event *types.Event
-	if errors.As(err, &event) && event != nil && event.IsError() {
-		code := openAIErrorCodeString(event.ErrorDetail.Code, "")
-		switch code {
-		case "previous_response_not_found", "invalid_event", "responses_ws_unsupported_for_channel", "session_busy":
-			return SendOutcomeNotSent
-		default:
-			return SendOutcomeAmbiguous
-		}
-	}
-	return SendOutcomeAmbiguous
-}
+var responsesWSSystemErrorPayloadLiteral = []byte(`{"type":"error","status":500,"error":{"type":"invalid_request_error","code":"system_error","message":"system error"}}`)
 
 func responsesWSErrorPayload(status int, code string, message string) []byte {
 	return responsesWSErrorPayloadWithParam(status, code, message, "")
+}
+
+func responsesWSSafeErrorDiagnostic(err error) string {
+	if err == nil {
+		return ""
+	}
+	return responsesWSRedactAndLimitDiagnostic(err.Error())
+}
+
+func responsesWSRedactAndLimitDiagnostic(message string) string {
+	return responsesWSSafeDiagnosticValue(responsesws.RedactSensitiveText(message))
 }
 
 func responsesWSErrorPayloadWithParam(status int, code string, message string, param string) []byte {
@@ -57,8 +49,20 @@ func responsesWSErrorPayloadWithParam(status int, code string, message string, p
 	if strings.TrimSpace(param) != "" {
 		payload["error"].(map[string]any)["param"] = strings.TrimSpace(param)
 	}
-	encoded, _ := json.Marshal(payload)
-	return encoded
+	return responsesWSMarshalErrorPayload(payload)
+}
+
+func responsesWSMarshalErrorPayload(payload any) []byte {
+	encoded, err := json.Marshal(payload)
+	if err == nil && len(encoded) > 0 {
+		return encoded
+	}
+	if err != nil {
+		logger.LogError(context.Background(), "responses websocket error payload marshal failed: "+err.Error())
+	} else {
+		logger.LogError(context.Background(), "responses websocket error payload marshal returned empty payload")
+	}
+	return append([]byte(nil), responsesWSSystemErrorPayloadLiteral...)
 }
 
 func responsesWSPreviousResponseNotFoundPayload() []byte {
@@ -90,8 +94,7 @@ func responsesWSErrorFromOpenAI(apiErr *types.OpenAIErrorWithStatusCode) []byte 
 			"param":   param,
 		},
 	}
-	encoded, _ := json.Marshal(payload)
-	return encoded
+	return responsesWSMarshalErrorPayload(payload)
 }
 
 func responsesWSClientMessageFromOpenAI(apiErr *types.OpenAIErrorWithStatusCode, code string) string {
@@ -124,11 +127,15 @@ func responsesWSErrorFromErr(err error) []byte {
 	if err == nil {
 		return nil
 	}
-	if payload := runtimesession.ClientPayloadFromError(err); len(payload) > 0 {
+	if payload := responsesws.ClientPayloadFromError(err); len(payload) > 0 {
 		return payload
 	}
-	if errors.Is(err, runtimesession.ErrStaleResponsesWSContinuation) {
+	if errors.Is(err, responsesws.ErrStaleContinuation) {
 		return responsesWSPreviousResponseNotFoundPayload()
+	}
+	var apiErr *types.OpenAIErrorWithStatusCode
+	if errors.As(err, &apiErr) && apiErr != nil {
+		return responsesWSErrorFromOpenAI(apiErr)
 	}
 	var event *types.Event
 	if errors.As(err, &event) && event != nil && event.IsError() {
@@ -136,8 +143,59 @@ func responsesWSErrorFromErr(err error) []byte {
 		message := responsesWSStaticErrorMessage(code)
 		return responsesWSErrorPayload(http.StatusBadGateway, code, message)
 	}
-	logger.LogError(context.Background(), "responses websocket upstream error: "+err.Error())
+	logCtx := context.Background()
+	logger.LogError(logCtx, "responses websocket upstream error: "+err.Error())
 	return responsesWSErrorPayload(http.StatusBadGateway, "upstream_error", responsesWSStaticErrorMessage("upstream_error"))
+}
+
+func isResponsesWSBridgeOpenProviderError(err error) bool {
+	var bridgeErr *responsesws.BridgeOpenProviderError
+	return errors.As(err, &bridgeErr)
+}
+
+func responsesWSBridgeOpenProviderAPIError(err error) *types.OpenAIErrorWithStatusCode {
+	var bridgeErr *responsesws.BridgeOpenProviderError
+	if !errors.As(err, &bridgeErr) || bridgeErr == nil {
+		return nil
+	}
+	status := bridgeErr.StatusCode
+	if status <= 0 {
+		status = http.StatusBadGateway
+	}
+	// Trade-off: carry the typed provider rejection through the actor instead of
+	// reparsing the safe client payload. This preserves HTTP status for metrics
+	// and auto-disable while keeping the websocket payload redacted.
+	return &types.OpenAIErrorWithStatusCode{
+		OpenAIError: types.OpenAIError{
+			Type:    bridgeErr.Type,
+			Code:    bridgeErr.Code,
+			Message: bridgeErr.Message,
+		},
+		StatusCode: status,
+		LocalError: false,
+	}
+}
+
+func responsesWSBridgeOpenProviderContinuationMiss(event ResponsesWSEventBridgeOpenProviderError) bool {
+	if event.ProviderAPIError != nil {
+		code := openAIErrorCodeString(event.ProviderAPIError.Code, "")
+		if code == "previous_response_not_found" {
+			return true
+		}
+		message := strings.ToLower(strings.TrimSpace(event.ProviderAPIError.Message))
+		if strings.Contains(message, "previous_response_not_found") ||
+			(strings.Contains(message, "previous response") && strings.Contains(message, "not found")) {
+			return true
+		}
+	}
+	if len(event.Payload) == 0 {
+		return false
+	}
+	classified := responsesws.ClassifyResponsesWSEvent(event.Payload)
+	if classified.ContinuationMiss {
+		return true
+	}
+	return strings.Contains(strings.ToLower(string(event.Payload)), "previous_response_not_found")
 }
 
 func responsesWSStaticErrorMessage(code string) string {
@@ -173,7 +231,7 @@ func isProviderReportedContinuationMiss(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, runtimesession.ErrStaleResponsesWSContinuation) {
+	if errors.Is(err, responsesws.ErrStaleContinuation) {
 		return false
 	}
 	payload := responsesWSErrorFromErr(err)
@@ -237,6 +295,59 @@ func mergeResponsesWSTerminalResponse(usage *types.Usage, response *types.OpenAI
 	// Provider UsageEvents can already contain the same charges, so merge by max
 	// count per normalized key rather than adding and risking double billing.
 	usage.ExtraBilling = mergeExtraBillingMapsMax(usage.ExtraBilling, types.GetResponsesExtraBilling(response))
+}
+
+func responsesWSTerminalUsageSnapshot(response *types.OpenAIResponsesResponses) *types.Usage {
+	if response == nil || response.Usage == nil {
+		return nil
+	}
+	// Terminal exact settlement uses the provider terminal usage snapshot as
+	// the authority. Accumulated observed usage remains useful for no-terminal
+	// settlement and diagnostics, but must not inflate or overwrite exact
+	// terminal billing.
+	usage := response.Usage.ToOpenAIUsage()
+	usage.ExtraBilling = mergeExtraBillingMapsMax(usage.ExtraBilling, types.GetResponsesExtraBilling(response))
+	return usage
+}
+
+func cloneResponsesWSUsage(usage *types.Usage) *types.Usage {
+	if usage == nil {
+		return nil
+	}
+	cloned := &types.Usage{
+		PromptTokens:            usage.PromptTokens,
+		CompletionTokens:        usage.CompletionTokens,
+		TotalTokens:             usage.TotalTokens,
+		PromptTokensDetails:     usage.PromptTokensDetails,
+		CompletionTokensDetails: usage.CompletionTokensDetails,
+	}
+	if len(usage.ExtraTokens) > 0 {
+		cloned.ExtraTokens = make(map[string]int, len(usage.ExtraTokens))
+		for key, value := range usage.ExtraTokens {
+			cloned.ExtraTokens[key] = value
+		}
+	}
+	if len(usage.ExtraBilling) > 0 {
+		cloned.ExtraBilling = make(map[string]types.ExtraBilling, len(usage.ExtraBilling))
+		for key, value := range usage.ExtraBilling {
+			cloned.ExtraBilling[key] = value
+		}
+	}
+	if usage.TextBuilder.Len() > 0 {
+		cloned.TextBuilder.WriteString(usage.TextBuilder.String())
+	}
+	return cloned
+}
+
+func responsesWSShouldMergeAttachedFrameUsage(classified responsesws.ResponsesTerminalResult, eventUsage *types.UsageEvent) bool {
+	if eventUsage == nil {
+		return false
+	}
+	// Native adapters and the HTTP bridge may attach Usage extracted from the
+	// same provider frame that still carries response.usage. response.usage is
+	// an absolute snapshot, not a delta, so adding the attached copy would bill
+	// the same terminal frame twice.
+	return classified.Response == nil || classified.Response.Usage == nil
 }
 
 func responsesWSUsageHasBillableEvidence(usage *types.Usage) bool {

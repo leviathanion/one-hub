@@ -232,6 +232,7 @@ func acquireResponsesWSActiveRedisLease(credential, group string, credentialLimi
 	client := redis.GetRedisClient()
 	ctx := context.Background()
 	acquired := make([]string, 0, len(counters))
+	leaseTTL := responsesWSActiveLeaseTTL
 	for _, counter := range counters {
 		if counter.limit < 0 {
 			continue
@@ -248,7 +249,7 @@ func acquireResponsesWSActiveRedisLease(credential, group string, credentialLimi
 			return nil, nil, true
 		}
 		acquired = append(acquired, counter.key)
-		if err := client.Expire(ctx, counter.key, responsesWSActiveLeaseTTL).Err(); err != nil {
+		if err := client.Expire(ctx, counter.key, leaseTTL).Err(); err != nil {
 			releaseResponsesWSRedisCounters(ctx, acquired)
 			metrics.RecordResponsesWSConnectionLimiterRedisFallback("active_lease_expire_error")
 			if !responsesWSActiveLeaseRedisFailOpen() {
@@ -265,7 +266,7 @@ func acquireResponsesWSActiveRedisLease(credential, group string, credentialLimi
 	}
 	done := make(chan struct{})
 	lost := make(chan struct{})
-	go heartbeatResponsesWSRedisCounters(acquired, done, lost)
+	go heartbeatResponsesWSRedisCounters(acquired, leaseTTL, done, lost)
 	return newResponsesWSLease(func() {
 		close(done)
 		releaseResponsesWSRedisCounters(context.Background(), acquired)
@@ -273,13 +274,10 @@ func acquireResponsesWSActiveRedisLease(credential, group string, credentialLimi
 }
 
 func responsesWSActiveLeaseRedisFailOpen() bool {
-	if !viper.IsSet("responses_ws.active_lease_redis_fail_open") {
-		return true
-	}
-	return viper.GetBool("responses_ws.active_lease_redis_fail_open")
+	return commonconfig.ResponsesWSActiveLeaseRedisFailOpen()
 }
 
-func heartbeatResponsesWSRedisCounters(keys []string, done <-chan struct{}, lost chan<- struct{}) {
+func heartbeatResponsesWSRedisCounters(keys []string, leaseTTL time.Duration, done <-chan struct{}, lost chan<- struct{}) {
 	if len(keys) == 0 {
 		return
 	}
@@ -297,7 +295,11 @@ func heartbeatResponsesWSRedisCounters(keys []string, done <-chan struct{}, lost
 			signalLost()
 		}
 	}()
-	ticker := time.NewTicker(responsesWSActiveLeaseTTL / 3)
+	tickerInterval := leaseTTL / 3
+	if tickerInterval <= 0 {
+		tickerInterval = time.Second
+	}
+	ticker := time.NewTicker(tickerInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -310,12 +312,12 @@ func heartbeatResponsesWSRedisCounters(keys []string, done <-chan struct{}, lost
 				return
 			}
 			for _, key := range keys {
-				timeout := responsesWSActiveLeaseTTL / 2
+				timeout := leaseTTL / 2
 				if timeout <= 0 {
 					timeout = time.Second
 				}
 				ctx, cancel := context.WithTimeout(context.Background(), timeout)
-				ok, err := client.Expire(ctx, key, responsesWSActiveLeaseTTL).Result()
+				ok, err := client.Expire(ctx, key, leaseTTL).Result()
 				cancel()
 				if err != nil || !ok {
 					signalLost()

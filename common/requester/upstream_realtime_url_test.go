@@ -37,6 +37,7 @@ func TestValidateUpstreamRealtimeURLPolicy(t *testing.T) {
 			"http://169.254.169.254/latest/meta-data",
 			"http://100.100.100.200/latest/meta-data",
 			"http://[fd00:ec2::254]/latest/meta-data",
+			"http://metadata.google.internal/computeMetadata/v1",
 		} {
 			if _, err := ValidateUpstreamRealtimeURL(rawURL, UpstreamRealtimeURLPolicy{AllowSelfHosted: true}); err == nil {
 				t.Fatalf("expected self-hosted metadata upstream %s to be rejected", rawURL)
@@ -54,6 +55,8 @@ func TestValidateUpstreamRealtimeURLPolicy(t *testing.T) {
 		"https://169.254.169.254/latest/meta-data",
 		"https://100.100.100.200/latest/meta-data",
 		"https://[fd00:ec2::254]/latest/meta-data",
+		"https://metadata.google.internal/computeMetadata/v1",
+		"https://metadata.google.internal./computeMetadata/v1",
 		"https://[fe80::1]/v1/realtime",
 	} {
 		t.Run("blocked "+rawURL, func(t *testing.T) {
@@ -61,5 +64,17 @@ func TestValidateUpstreamRealtimeURLPolicy(t *testing.T) {
 				t.Fatalf("expected %s to be rejected", rawURL)
 			}
 		})
+	}
+}
+
+func TestValidateUpstreamRealtimeURLBlocksMetadataHostnameWithoutDNS(t *testing.T) {
+	for _, policy := range []UpstreamRealtimeURLPolicy{
+		{},
+		{AllowSelfHosted: true},
+		{ResolveHost: false},
+	} {
+		if _, err := ValidateUpstreamRealtimeURL("https://metadata.google.internal/computeMetadata/v1", policy); err == nil {
+			t.Fatalf("expected metadata hostname to be rejected with policy %+v", policy)
+		}
 	}
 }

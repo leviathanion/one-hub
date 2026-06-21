@@ -9,7 +9,7 @@ import (
 	"net"
 	"one-api/common/logger"
 	"one-api/common/wsconn"
-	runtimesession "one-api/runtime/session"
+	runtimerealtime "one-api/runtime/realtime"
 	"one-api/types"
 	"strings"
 	"sync"
@@ -42,7 +42,7 @@ type realtimeRelayExit struct {
 
 type realtimeRelayActor struct {
 	client  *wsconn.ManagedConn
-	session runtimesession.RealtimeSession
+	session runtimerealtime.RealtimeSession
 	timeout time.Duration
 
 	ctx    context.Context
@@ -67,7 +67,7 @@ type realtimeRelayActor struct {
 	providerPayloadObserver func(wsconn.MessageType, []byte)
 }
 
-func newRealtimeRelayActor(client *wsconn.ManagedConn, session runtimesession.RealtimeSession, timeout time.Duration) *realtimeRelayActor {
+func newRealtimeRelayActor(client *wsconn.ManagedConn, session runtimerealtime.RealtimeSession, timeout time.Duration) *realtimeRelayActor {
 	if timeout <= 0 {
 		timeout = 2 * time.Minute
 	}
@@ -244,7 +244,7 @@ func (b *realtimeRelayActor) sessionToClient() {
 			}
 			deliveredPayload := b.deliverEventFrame(event)
 			if !b.dropDownstreamWrites.Load() {
-				if errorPayload := runtimesession.ClientPayloadFromError(err); errorPayload != nil {
+				if errorPayload := runtimerealtime.ClientPayloadFromError(err); errorPayload != nil {
 					deliveredFramePayload := []byte(nil)
 					if event.Frame != nil {
 						deliveredFramePayload = event.Frame.Payload()
@@ -254,7 +254,7 @@ func (b *realtimeRelayActor) sessionToClient() {
 					}
 				}
 			}
-			b.emitExit(realtimeRelayExit{source: "supplier", err: err, graceful: errors.Is(err, runtimesession.ErrSessionClosed) || errors.Is(err, context.Canceled)})
+			b.emitExit(realtimeRelayExit{source: "supplier", err: err, graceful: errors.Is(err, runtimerealtime.ErrSessionClosed) || errors.Is(err, context.Canceled)})
 			return
 		}
 
@@ -268,7 +268,7 @@ func (b *realtimeRelayActor) sessionToClient() {
 		if event.Err != nil {
 			deliveredPayload := b.deliverEventFrame(event)
 			if !b.dropDownstreamWrites.Load() {
-				if errorPayload := runtimesession.ClientPayloadFromError(event.Err); errorPayload != nil {
+				if errorPayload := runtimerealtime.ClientPayloadFromError(event.Err); errorPayload != nil {
 					deliveredFramePayload := []byte(nil)
 					if event.Frame != nil {
 						deliveredFramePayload = event.Frame.Payload()
@@ -285,7 +285,7 @@ func (b *realtimeRelayActor) sessionToClient() {
 	}
 }
 
-func (b *realtimeRelayActor) deliverEventFrame(event runtimesession.RecvEvent) bool {
+func (b *realtimeRelayActor) deliverEventFrame(event runtimerealtime.RecvEvent) bool {
 	if event.Frame == nil || len(event.Frame.Payload()) == 0 || b.dropDownstreamWrites.Load() {
 		return false
 	}
@@ -299,9 +299,9 @@ func (b *realtimeRelayActor) deliverEventFrame(event runtimesession.RecvEvent) b
 	return true
 }
 
-func (b *realtimeRelayActor) providerCloseExit(closeInfo *runtimesession.ProviderClose, fallbackErr error) realtimeRelayExit {
+func (b *realtimeRelayActor) providerCloseExit(closeInfo *runtimerealtime.ProviderClose, fallbackErr error) realtimeRelayExit {
 	if closeInfo == nil {
-		return realtimeRelayExit{source: "supplier", err: fallbackErr, graceful: errors.Is(fallbackErr, runtimesession.ErrSessionClosed) || errors.Is(fallbackErr, context.Canceled)}
+		return realtimeRelayExit{source: "supplier", err: fallbackErr, graceful: errors.Is(fallbackErr, runtimerealtime.ErrSessionClosed) || errors.Is(fallbackErr, context.Canceled)}
 	}
 	err := closeInfo.Err
 	if err == nil {
@@ -472,8 +472,8 @@ func (b *realtimeRelayActor) writeClientMessage(mt wsconn.MessageType, payload [
 	return b.client.WriteMessage(mt, payload)
 }
 
-func (b *realtimeRelayActor) observeProviderPayload(mt wsconn.MessageType, payload []byte, origin runtimesession.RealtimePayloadOrigin) {
-	if b == nil || origin != runtimesession.RealtimePayloadOriginProvider || len(payload) == 0 || b.providerPayloadObserver == nil {
+func (b *realtimeRelayActor) observeProviderPayload(mt wsconn.MessageType, payload []byte, origin runtimerealtime.RealtimePayloadOrigin) {
+	if b == nil || origin != runtimerealtime.RealtimePayloadOriginProvider || len(payload) == 0 || b.providerPayloadObserver == nil {
 		return
 	}
 	defer func() {
@@ -491,25 +491,25 @@ func (b *realtimeRelayActor) markActivity(now time.Time) {
 	b.lastActivityUnixNano.Store(now.UnixNano())
 }
 
-func realtimeRelayFrameFromMessage(mt wsconn.MessageType, payload []byte) runtimesession.Frame {
+func realtimeRelayFrameFromMessage(mt wsconn.MessageType, payload []byte) runtimerealtime.Frame {
 	if mt == wsconn.BinaryMessage {
-		return runtimesession.NewBinaryFrame(payload)
+		return runtimerealtime.NewBinaryFrame(payload)
 	}
-	return runtimesession.NewTextFrame(payload)
+	return runtimerealtime.NewTextFrame(payload)
 }
 
-func realtimeRelayMessageTypeFromFrame(frame runtimesession.Frame) wsconn.MessageType {
-	if frame.Kind() == runtimesession.FrameKindBinary {
+func realtimeRelayMessageTypeFromFrame(frame runtimerealtime.Frame) wsconn.MessageType {
+	if frame.Kind() == runtimerealtime.FrameKindBinary {
 		return wsconn.BinaryMessage
 	}
 	return wsconn.TextMessage
 }
 
 func realtimeRelayErrorPayload(err error) []byte {
-	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, runtimesession.ErrSessionClosed) {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, runtimerealtime.ErrSessionClosed) {
 		return nil
 	}
-	if payload := runtimesession.ClientPayloadFromError(err); len(payload) > 0 {
+	if payload := runtimerealtime.ClientPayloadFromError(err); len(payload) > 0 {
 		return payload
 	}
 
@@ -540,7 +540,7 @@ func realtimeRelayStaticErrorMessage(code string) string {
 }
 
 func realtimeRelayRecoverableError(err error) bool {
-	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, runtimesession.ErrSessionClosed) {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, runtimerealtime.ErrSessionClosed) {
 		return false
 	}
 
@@ -605,8 +605,8 @@ func realtimeActorDetachReason(source string) string {
 	}
 }
 
-func sessionSupportsGracefulDetach(session runtimesession.RealtimeSession) bool {
-	detachable, ok := session.(runtimesession.GracefulDetachCapable)
+func sessionSupportsGracefulDetach(session runtimerealtime.RealtimeSession) bool {
+	detachable, ok := session.(runtimerealtime.GracefulDetachCapable)
 	return ok && detachable.SupportsGracefulDetach()
 }
 

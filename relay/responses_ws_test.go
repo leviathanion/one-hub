@@ -13,12 +13,14 @@ import (
 	"one-api/common/config"
 	ratelimit "one-api/common/limit"
 	"one-api/common/logger"
+	"one-api/common/requester"
 	"one-api/common/responsesws"
 	"one-api/common/wsconn"
 	"one-api/common/wsconn/wstest"
 	"one-api/middleware"
 	"one-api/relay/relay_util"
 	runtimeaffinity "one-api/runtime/channelaffinity"
+	runtimerealtime "one-api/runtime/realtime"
 	runtimesession "one-api/runtime/session"
 	"one-api/types"
 	"strings"
@@ -44,13 +46,14 @@ type responsesWSReadResult struct {
 }
 
 type responsesWSFakeUserConn struct {
-	reads        chan responsesWSReadResult
-	writeErr     error
-	writeCount   int32
-	closeCount   int32
-	controlCount int32
-	lastWrite    atomic.Value
-	lastControl  atomic.Value
+	reads           chan responsesWSReadResult
+	writeErr        error
+	writeCount      int32
+	closeCount      int32
+	controlCount    int32
+	lastMessageType int32
+	lastWrite       atomic.Value
+	lastControl     atomic.Value
 }
 
 func NewResponsesWSIOBridge(conn *responsesWSFakeUserConn, actor *ResponsesWSSessionActor) *ResponsesWSIOBridge {
@@ -72,6 +75,7 @@ func (c *responsesWSFakeUserConn) WriteFrame(messageType int, payload []byte, _ 
 		return nil
 	}
 	atomic.AddInt32(&c.writeCount, 1)
+	atomic.StoreInt32(&c.lastMessageType, int32(messageType))
 	if c.writeErr != nil {
 		return c.writeErr
 	}
@@ -88,6 +92,84 @@ func (c *responsesWSFakeUserConn) Abort(string) {
 	atomic.AddInt32(&c.closeCount, 1)
 }
 
+func responsesWSTestClientTextFrame(payload []byte) ResponsesWSEventClientFrame {
+	return ResponsesWSEventClientFrame{Frame: responsesws.NewTextFrame(payload)}
+}
+
+func responsesWSTestProviderTextFrame(payload []byte) *responsesws.Frame {
+	frame := responsesws.NewTextFrame(payload)
+	return &frame
+}
+
+func responsesWSTestCurrentAttemptID(actor *ResponsesWSSessionActor) string {
+	if actor == nil {
+		return "attempt-test"
+	}
+	if actor.turns.pending.attempt != nil && actor.turns.pending.attempt.AttemptID != "" {
+		return actor.turns.pending.attempt.AttemptID
+	}
+	if actor.turns.active.attempt != nil && actor.turns.active.attempt.AttemptID != "" {
+		return actor.turns.active.attempt.AttemptID
+	}
+	return "attempt-test"
+}
+
+func responsesWSTestProviderBinaryFrame(payload []byte) *responsesws.Frame {
+	frame := responsesws.NewBinaryFrame(payload)
+	return &frame
+}
+
+func responsesWSTestProviderEventPayload(event ResponsesWSEventProviderDownstream) []byte {
+	if event.Frame == nil {
+		return nil
+	}
+	return event.Frame.Payload()
+}
+
+func responsesWSTestProviderProjection(events ...responsesws.UpstreamEvent) responsesws.ProviderSettlementLogProjection {
+	var projection responsesws.ProviderSettlementLogProjection
+	for _, event := range events {
+		projection.Observe(responsesws.NewProviderObservation(event))
+	}
+	return projection
+}
+
+func responsesWSTestProviderFrameProjection() responsesws.ProviderSettlementLogProjection {
+	return responsesWSTestProviderProjection(responsesws.UpstreamEvent{
+		DetailOrigin: responsesws.RecvDetailOriginProviderFrame,
+	})
+}
+
+func responsesWSTestProviderUsageProjection() responsesws.ProviderSettlementLogProjection {
+	return responsesWSTestProviderProjection(responsesws.UpstreamEvent{
+		DetailOrigin: responsesws.RecvDetailOriginProviderFrame,
+		Usage:        &types.UsageEvent{TotalTokens: 1},
+	})
+}
+
+func responsesWSTestProviderJournal(events ...responsesws.UpstreamEvent) responsesWSProviderJournal {
+	var journal responsesWSProviderJournal
+	for _, event := range events {
+		journal.AppendLifecycle(event)
+	}
+	return journal
+}
+
+func responsesWSTestProviderFrameJournal() responsesWSProviderJournal {
+	return responsesWSTestProviderJournal(responsesws.UpstreamEvent{
+		DetailOrigin: responsesws.RecvDetailOriginProviderFrame,
+	})
+}
+
+func responsesWSTraceHasDetailOrigin(trace ResponsesWSSettlementTrace, origin responsesws.RecvDetailOrigin) bool {
+	for _, got := range trace.Input.Diagnostics.DetailOrigins {
+		if got == string(origin) {
+			return true
+		}
+	}
+	return false
+}
+
 func readResponsesWSEvent(t *testing.T, actor *ResponsesWSSessionActor) ResponsesWSEvent {
 	t.Helper()
 	select {
@@ -96,6 +178,31 @@ func readResponsesWSEvent(t *testing.T, actor *ResponsesWSSessionActor) Response
 	case <-time.After(time.Second):
 		t.Fatalf("timed out waiting for responses websocket actor event")
 		return nil
+	}
+}
+
+func waitResponsesWSTestCondition(t *testing.T, timeout time.Duration, interval time.Duration, condition func() bool, failureMessage func() string) {
+	t.Helper()
+	if condition() {
+		return
+	}
+	if interval <= 0 {
+		interval = time.Millisecond
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-timer.C:
+			t.Fatal(failureMessage())
+			return
+		case <-ticker.C:
+			if condition() {
+				return
+			}
+		}
 	}
 }
 
@@ -122,24 +229,187 @@ func assertResponsesWSErrorPayload(t *testing.T, payload string, status int, cod
 	}
 }
 
-func TestResponsesWSOpenOptionsUseConnectionScopedSessionWithoutForceFresh(t *testing.T) {
+func TestResponsesWSErrorPayloadMarshalFallbackReturnsSystemErrorJSON(t *testing.T) {
+	payload := responsesWSMarshalErrorPayload(map[string]any{
+		"type": "error",
+		"bad":  func() {},
+	})
+	if len(payload) == 0 {
+		t.Fatal("expected fallback payload to be non-empty")
+	}
+	assertResponsesWSErrorPayload(t, string(payload), http.StatusInternalServerError, "system_error", "system error")
+}
+
+func TestResponsesWSOpenOptionsUseConnectionScopedUpstreamSession(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	options := responsesWSOpenOptions(c, context.Background())
+	options := responsesWSOpenOptions(c)
 
-	if options.ForceFresh {
-		t.Fatal("expected responses websocket open not to use ForceFresh because it would replace other connection bindings")
-	}
-	if got := options.ClientSessionID; !strings.HasPrefix(got, "responses-ws:") {
+	if got := options.UpstreamSessionID; !strings.HasPrefix(got, "responses-ws:") {
 		t.Fatalf("expected synthetic responses websocket client session id, got %q", got)
 	}
-	if err := runtimesession.ValidateClientSessionID(options.ClientSessionID); err != nil {
+	if err := runtimesession.ValidateClientSessionID(options.UpstreamSessionID); err != nil {
 		t.Fatalf("expected synthetic responses websocket client session id to be valid, got %v", err)
 	}
-	if options.ClientSessionID != c.GetString(responsesWSConnectionSessionIDKey) {
+	if options.UpstreamSessionID != c.GetString(responsesWSConnectionSessionIDKey) {
 		t.Fatal("expected open options to reuse the context connection session id")
+	}
+	if options.Transport != runtimesession.TransportModeResponsesWS {
+		t.Fatalf("expected default responses websocket transport to be native, got %q", options.Transport)
+	}
+}
+
+func TestResponsesWSOpenOptionsUseExplicitPreviousResponseID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+
+	options := responsesWSOpenOptionsWithPreviousResponseID(c, " resp_explicit ", runtimesession.TransportModeResponsesHTTPBridge)
+
+	if options.PreviousResponseID != "resp_explicit" {
+		t.Fatalf("expected explicit previous response id, got %q", options.PreviousResponseID)
+	}
+	if options.Transport != runtimesession.TransportModeResponsesHTTPBridge {
+		t.Fatalf("expected explicit bridge transport, got %q", options.Transport)
+	}
+}
+
+func TestParseResponsesWSTransportMode(t *testing.T) {
+	cases := []struct {
+		name       string
+		other      string
+		want       runtimesession.TransportMode
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name: "empty defaults native",
+			want: runtimesession.TransportModeResponsesWS,
+		},
+		{
+			name:  "native",
+			other: `{"responses_ws_transport":"native"}`,
+			want:  runtimesession.TransportModeResponsesWS,
+		},
+		{
+			name:  "native normalized",
+			other: `{"responses_ws_transport":" Native "}`,
+			want:  runtimesession.TransportModeResponsesWS,
+		},
+		{
+			name:  "http bridge",
+			other: `{"responses_ws_transport":"http_bridge"}`,
+			want:  runtimesession.TransportModeResponsesHTTPBridge,
+		},
+		{
+			name:  "azure http bridge with api version",
+			other: `{"api_version":"2024-10-01-preview","responses_ws_transport":"http_bridge"}`,
+			want:  runtimesession.TransportModeResponsesHTTPBridge,
+		},
+		{
+			name:  "http bridge normalized",
+			other: `{"responses_ws_transport":" HTTP_BRIDGE "}`,
+			want:  runtimesession.TransportModeResponsesHTTPBridge,
+		},
+		{
+			name:       "invalid value",
+			other:      `{"responses_ws_transport":"auto"}`,
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "invalid_responses_ws_transport",
+		},
+		{
+			name:       "invalid json",
+			other:      `{"responses_ws_transport":`,
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "invalid_responses_ws_transport",
+		},
+		{
+			name:       "non string",
+			other:      `{"responses_ws_transport":123}`,
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "invalid_responses_ws_transport",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, apiErr := parseResponsesWSTransportMode(&model.Channel{Other: tc.other})
+			if tc.wantCode != "" {
+				if apiErr == nil || apiErr.StatusCode != tc.wantStatus || openAIErrorCodeString(apiErr.Code, "") != tc.wantCode {
+					t.Fatalf("expected %d/%s, got mode=%q err=%+v", tc.wantStatus, tc.wantCode, got, apiErr)
+				}
+				return
+			}
+			if apiErr != nil {
+				t.Fatalf("expected transport mode parse to succeed, got %v", apiErr)
+			}
+			if got != tc.want {
+				t.Fatalf("expected transport %q, got %q", tc.want, got)
+			}
+		})
+	}
+}
+
+func TestOpenResponsesWSUpstreamHTTPBridgeRequiresProviderSupport(t *testing.T) {
+	_, apiErr := openResponsesWSUpstream(context.Background(), &relayTestBaseProvider{}, "gpt-5", responsesws.OpenOptions{
+		Transport: runtimesession.TransportModeResponsesHTTPBridge,
+	})
+	if apiErr == nil || apiErr.StatusCode != http.StatusUpgradeRequired || openAIErrorCodeString(apiErr.Code, "") != "responses_ws_unsupported_for_channel" {
+		t.Fatalf("expected http_bridge without ResponsesWS provider support to return 426 unsupported, got %+v", apiErr)
+	}
+}
+
+type relayTestResponsesWSProvider struct {
+	relayTestBaseProvider
+	gotTransport runtimesession.TransportMode
+}
+
+func (p *relayTestResponsesWSProvider) OpenResponsesWS(_ context.Context, _ string, options responsesws.OpenOptions) (responsesws.Upstream, *types.OpenAIErrorWithStatusCode) {
+	p.gotTransport = options.Transport
+	return &responsesWSTestSession{}, nil
+}
+
+func TestOpenResponsesWSUpstreamHTTPBridgePassesNormalizedTransportToProvider(t *testing.T) {
+	provider := &relayTestResponsesWSProvider{}
+	session, apiErr := openResponsesWSUpstream(context.Background(), provider, "gpt-5", responsesws.OpenOptions{
+		Transport: runtimesession.TransportModeResponsesHTTPBridge,
+	})
+	if apiErr != nil {
+		t.Fatalf("expected provider to receive http_bridge transport, got %v", apiErr)
+	}
+	if session == nil || provider.gotTransport != runtimesession.TransportModeResponsesHTTPBridge {
+		t.Fatalf("expected http_bridge transport to reach provider, session=%T transport=%q", session, provider.gotTransport)
+	}
+}
+
+func TestOpenResponsesWSUpstreamDoesNotUseLegacyRealtimeOptions(t *testing.T) {
+	var legacyCalls int
+	provider := &relayTestRealtimeProvider{
+		openFn: func(modelName string, options runtimerealtime.RealtimeOpenOptions) (runtimerealtime.RealtimeSession, *types.OpenAIErrorWithStatusCode) {
+			legacyCalls++
+			t.Fatalf("ResponsesWS open path must not call legacy realtime opener, model=%q options=%+v", modelName, options)
+			return nil, nil
+		},
+	}
+
+	for _, transport := range []runtimesession.TransportMode{
+		runtimesession.TransportModeResponsesWS,
+		runtimesession.TransportModeResponsesHTTPBridge,
+	} {
+		t.Run(string(transport), func(t *testing.T) {
+			session, apiErr := openResponsesWSUpstream(context.Background(), provider, "gpt-5", responsesws.OpenOptions{Transport: transport})
+			if session != nil {
+				t.Fatalf("expected no session from provider without OpenResponsesWS support, got %T", session)
+			}
+			if apiErr == nil || apiErr.StatusCode != http.StatusUpgradeRequired || openAIErrorCodeString(apiErr.Code, "") != "responses_ws_unsupported_for_channel" {
+				t.Fatalf("expected unsupported ResponsesWS provider error, got %+v", apiErr)
+			}
+		})
+	}
+	if legacyCalls != 0 {
+		t.Fatalf("expected legacy realtime opener not to be called, got %d calls", legacyCalls)
 	}
 }
 
@@ -157,20 +427,17 @@ func TestResponsesWSOpenOptionsIgnoreRequestSessionIDForProviderSessionReuse(t *
 	cB, _ := gin.CreateTestContext(wB)
 	cB.Request = reqB
 
-	optionsA := responsesWSOpenOptions(cA, context.Background())
-	optionsB := responsesWSOpenOptions(cB, context.Background())
+	optionsA := responsesWSOpenOptions(cA)
+	optionsB := responsesWSOpenOptions(cB)
 
-	if optionsA.ClientSessionID == "" || optionsB.ClientSessionID == "" {
-		t.Fatalf("expected both responses websocket opens to use synthetic session ids, got %q and %q", optionsA.ClientSessionID, optionsB.ClientSessionID)
+	if optionsA.UpstreamSessionID == "" || optionsB.UpstreamSessionID == "" {
+		t.Fatalf("expected both responses websocket opens to use synthetic session ids, got %q and %q", optionsA.UpstreamSessionID, optionsB.UpstreamSessionID)
 	}
-	if optionsA.ClientSessionID == "shared-client-session" || optionsB.ClientSessionID == "shared-client-session" {
-		t.Fatalf("expected request x-session-id not to be used for provider session reuse, got %q and %q", optionsA.ClientSessionID, optionsB.ClientSessionID)
+	if optionsA.UpstreamSessionID == "shared-client-session" || optionsB.UpstreamSessionID == "shared-client-session" {
+		t.Fatalf("expected request x-session-id not to be used for provider session reuse, got %q and %q", optionsA.UpstreamSessionID, optionsB.UpstreamSessionID)
 	}
-	if optionsA.ClientSessionID == optionsB.ClientSessionID {
-		t.Fatalf("expected separate downstream websocket connections to get different provider session ids, got %q", optionsA.ClientSessionID)
-	}
-	if optionsA.ForceFresh || optionsB.ForceFresh {
-		t.Fatal("expected responses websocket open not to force a fresh provider session")
+	if optionsA.UpstreamSessionID == optionsB.UpstreamSessionID {
+		t.Fatalf("expected separate downstream websocket connections to get different provider session ids, got %q", optionsA.UpstreamSessionID)
 	}
 }
 
@@ -235,7 +502,9 @@ type responsesWSTestSession struct {
 	preflightRequest *types.OpenAIResponsesRequest
 }
 
-func (s *responsesWSTestSession) SendClient(context.Context, runtimesession.Frame) error { return nil }
+func (s *responsesWSTestSession) SendClientWithResult(context.Context, responsesws.SendRequest) responsesws.ResponsesWSTransportSendResult {
+	return responsesws.ResponsesWSTransportSendResult{Status: responsesws.ResponsesWSTransportSendAttempted}
+}
 
 func (s *responsesWSTestSession) PreflightResponsesWSSend(_ context.Context, eventID string, request *types.OpenAIResponsesRequest) error {
 	atomic.AddInt32(&s.preflightCalls, 1)
@@ -249,8 +518,8 @@ func (s *responsesWSTestSession) PreflightResponsesWSSend(_ context.Context, eve
 	return s.preflightErr
 }
 
-func (s *responsesWSTestSession) Recv(context.Context) (runtimesession.RecvEvent, error) {
-	return runtimesession.RecvEvent{}, runtimesession.ErrSessionClosed
+func (s *responsesWSTestSession) Recv(context.Context) (responsesws.UpstreamEvent, error) {
+	return responsesws.UpstreamEvent{}, responsesws.ErrUpstreamClosed
 }
 
 func (s *responsesWSTestSession) Detach(string) {}
@@ -266,56 +535,149 @@ func (s *responsesWSTestSession) Abort(reason string) {
 	}
 }
 
-func (s *responsesWSTestSession) SetTurnObserverFactory(runtimesession.TurnObserverFactory) {}
+type responsesWSBridgeContinuationTestSession struct {
+	responsesWSTestSession
+	supports bool
+}
+
+func (s *responsesWSBridgeContinuationTestSession) SupportsBridgeContinuationDefault() bool {
+	return s != nil && s.supports
+}
+
+type responsesWSSendResultTestSession struct {
+	result      responsesws.ResponsesWSTransportSendResult
+	resultCalls int32
+}
+
+func (s *responsesWSSendResultTestSession) SendClientWithResult(context.Context, responsesws.SendRequest) responsesws.ResponsesWSTransportSendResult {
+	atomic.AddInt32(&s.resultCalls, 1)
+	return s.result
+}
+
+func (s *responsesWSSendResultTestSession) Recv(context.Context) (responsesws.UpstreamEvent, error) {
+	return responsesws.UpstreamEvent{}, responsesws.ErrUpstreamClosed
+}
+
+func (s *responsesWSSendResultTestSession) Abort(string) {}
+
+type responsesWSCaptureSendSession struct {
+	result   responsesws.ResponsesWSTransportSendResult
+	requests chan responsesws.SendRequest
+	calls    int32
+}
+
+func (s *responsesWSCaptureSendSession) SendClientWithResult(_ context.Context, req responsesws.SendRequest) responsesws.ResponsesWSTransportSendResult {
+	atomic.AddInt32(&s.calls, 1)
+	if s.requests != nil {
+		s.requests <- req
+	}
+	if s.result.Status != "" || s.result.Err != nil || s.result.Reason != "" {
+		return s.result
+	}
+	return responsesws.ResponsesWSTransportSendResult{Status: responsesws.ResponsesWSTransportSendAttempted}
+}
+
+func (s *responsesWSCaptureSendSession) Recv(context.Context) (responsesws.UpstreamEvent, error) {
+	return responsesws.UpstreamEvent{}, responsesws.ErrUpstreamClosed
+}
+
+func (s *responsesWSCaptureSendSession) Abort(string) {}
+
+type responsesWSControlLaneTestSession struct {
+	createStarted   chan struct{}
+	releaseCreate   chan struct{}
+	controlCalled   chan struct{}
+	createOnce      sync.Once
+	controlOnce     sync.Once
+	controlCalls    int32
+	controlContexts chan context.Context
+	controlRequests chan responsesws.SendRequest
+	controlFrames   chan responsesws.Frame
+	controlResult   responsesws.ResponsesWSTransportSendResult
+}
+
+func (s *responsesWSControlLaneTestSession) SendClientWithResult(context.Context, responsesws.SendRequest) responsesws.ResponsesWSTransportSendResult {
+	s.createOnce.Do(func() {
+		close(s.createStarted)
+	})
+	<-s.releaseCreate
+	return responsesws.ResponsesWSTransportSendResult{Status: responsesws.ResponsesWSTransportSendAmbiguous, Err: responsesws.ErrUpstreamClosed}
+}
+
+func (s *responsesWSControlLaneTestSession) SendControl(ctx context.Context, req responsesws.SendRequest) responsesws.ResponsesWSTransportSendResult {
+	atomic.AddInt32(&s.controlCalls, 1)
+	if s.controlContexts != nil {
+		s.controlContexts <- ctx
+	}
+	if s.controlRequests != nil {
+		s.controlRequests <- req
+	}
+	if s.controlFrames != nil {
+		s.controlFrames <- req.Frame
+	}
+	s.controlOnce.Do(func() {
+		close(s.controlCalled)
+	})
+	if s.controlResult.Status != "" || s.controlResult.Err != nil || s.controlResult.Reason != "" {
+		return s.controlResult
+	}
+	return responsesws.ResponsesWSTransportSendResult{Status: responsesws.ResponsesWSTransportSendAttempted}
+}
+
+func (s *responsesWSControlLaneTestSession) Recv(context.Context) (responsesws.UpstreamEvent, error) {
+	return responsesws.UpstreamEvent{}, responsesws.ErrUpstreamClosed
+}
+
+func (s *responsesWSControlLaneTestSession) Abort(string) {}
 
 type responsesWSRecvResult struct {
 	messageType   int
 	payload       []byte
-	providerClose *runtimesession.ProviderClose
+	providerClose *responsesws.ProviderClose
 	usage         *types.UsageEvent
-	origin        runtimesession.RealtimePayloadOrigin
+	attemptID     string
+	detailOrigin  responsesws.RecvDetailOrigin
+	detailPhase   responsesws.RecvDetailPhase
 	err           error
 	topErr        error
 }
 
 type responsesWSRecvSequenceSession struct {
 	responses chan responsesWSRecvResult
+	recvCalls int32
 }
 
-func (s *responsesWSRecvSequenceSession) SendClient(context.Context, runtimesession.Frame) error {
-	return nil
+func (s *responsesWSRecvSequenceSession) SendClientWithResult(context.Context, responsesws.SendRequest) responsesws.ResponsesWSTransportSendResult {
+	return responsesws.ResponsesWSTransportSendResult{Status: responsesws.ResponsesWSTransportSendAttempted}
 }
 
-func (s *responsesWSRecvSequenceSession) Recv(ctx context.Context) (runtimesession.RecvEvent, error) {
+func (s *responsesWSRecvSequenceSession) Recv(ctx context.Context) (responsesws.UpstreamEvent, error) {
+	atomic.AddInt32(&s.recvCalls, 1)
 	select {
 	case result := <-s.responses:
 		if result.topErr != nil {
-			return runtimesession.RecvEvent{}, result.topErr
+			return responsesws.UpstreamEvent{}, result.topErr
 		}
-		origin := result.origin
-		if origin == runtimesession.RealtimePayloadOriginProxyLocal && result.err == nil && len(result.payload) > 0 {
-			origin = runtimesession.RealtimePayloadOriginProvider
-		}
-		event := runtimesession.RecvEvent{
+		event := responsesws.UpstreamEvent{
 			ProviderClose: result.providerClose,
 			Usage:         result.usage,
-			Origin:        origin,
+			AttemptID:     result.attemptID,
+			DetailOrigin:  result.detailOrigin,
+			DetailPhase:   result.detailPhase,
 			Err:           result.err,
 		}
 		if len(result.payload) > 0 {
-			frame := responsesWSSessionFrameFromMessage(result.messageType, result.payload)
+			frame := responsesWSFrameFromWireMessage(result.messageType, result.payload)
 			event.Frame = &frame
 		}
 		return event, nil
 	case <-ctx.Done():
-		return runtimesession.RecvEvent{}, ctx.Err()
+		return responsesws.UpstreamEvent{}, ctx.Err()
 	}
 }
 
 func (s *responsesWSRecvSequenceSession) Detach(string) {}
 func (s *responsesWSRecvSequenceSession) Abort(string)  {}
-func (s *responsesWSRecvSequenceSession) SetTurnObserverFactory(runtimesession.TurnObserverFactory) {
-}
 
 type responsesWSTestLease struct {
 	releases int32
@@ -402,12 +764,15 @@ func setupResponsesWSQuotaFixture(t *testing.T, quota int) *gin.Context {
 	if err != nil {
 		t.Fatalf("expected in-memory sqlite database, got %v", err)
 	}
-	if err := testDB.AutoMigrate(&model.User{}, &model.Token{}, &model.Log{}); err != nil {
+	if err := testDB.AutoMigrate(&model.User{}, &model.Token{}, &model.Log{}, &model.Channel{}); err != nil {
 		t.Fatalf("expected quota settlement schema migration to succeed, got %v", err)
 	}
 	model.DB = testDB
 	t.Cleanup(func() {
 		model.DB = originalDB
+		if sqlDB, dbErr := testDB.DB(); dbErr == nil {
+			_ = sqlDB.Close()
+		}
 	})
 
 	originalPricing := model.PricingInstance
@@ -457,6 +822,18 @@ func setupResponsesWSQuotaFixture(t *testing.T, quota int) *gin.Context {
 	}).Error; err != nil {
 		t.Fatalf("expected token fixture to persist, got %v", err)
 	}
+	if err := model.DB.Session(&gorm.Session{SkipHooks: true}).Create(&model.Channel{
+		Id:          17,
+		Type:        config.ChannelTypeOpenAI,
+		Name:        "openai-quota",
+		Key:         "sk-test",
+		Status:      config.ChannelStatusEnabled,
+		Models:      "gpt-5",
+		Group:       "default",
+		CreatedTime: 1,
+	}).Error; err != nil {
+		t.Fatalf("expected channel fixture to persist, got %v", err)
+	}
 
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
@@ -487,7 +864,17 @@ func preparePreconsumedResponsesWSTestAttempt(t *testing.T, ctx *gin.Context) *R
 	if apiErr := attempt.PreConsumeQuota(); apiErr != nil {
 		t.Fatalf("expected quota preconsume to succeed, got %v", apiErr)
 	}
+	attempt.AttemptID = "attempt-" + strings.ReplaceAll(t.Name(), "/", "_")
 	return attempt
+}
+
+func setupPreconsumedResponsesWSActorAttempt(t *testing.T, quota int, attemptID string) (*gin.Context, *ResponsesWSTurnAttempt) {
+	t.Helper()
+	ctx := setupResponsesWSQuotaFixture(t, quota)
+	configureResponsesWSTokenPricingFloor(t, 100)
+	attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+	attempt.AttemptID = attemptID
+	return ctx, attempt
 }
 
 func readResponsesWSQuotaFixture(t *testing.T) (model.User, model.Token) {
@@ -501,6 +888,24 @@ func readResponsesWSQuotaFixture(t *testing.T) (model.User, model.Token) {
 		t.Fatalf("expected token lookup to succeed, got %v", err)
 	}
 	return user, token
+}
+
+func readResponsesWSConsumeLog(t *testing.T) model.Log {
+	t.Helper()
+	var log model.Log
+	if err := model.DB.Order("id desc").First(&log).Error; err != nil {
+		t.Fatalf("expected consume log lookup to succeed, got %v", err)
+	}
+	return log
+}
+
+func readResponsesWSChannelFixture(t *testing.T) model.Channel {
+	t.Helper()
+	var channel model.Channel
+	if err := model.DB.First(&channel, 17).Error; err != nil {
+		t.Fatalf("expected channel lookup to succeed, got %v", err)
+	}
+	return channel
 }
 
 func TestResponsesWSCurrentModelNamesSeparatesProviderAndBilling(t *testing.T) {
@@ -641,6 +1046,40 @@ func TestResponsesWebSocketRejectsNonUpgradeBeforeConnectionLimiter(t *testing.T
 	ctx.Set("token_id", tokenID)
 	if apiErr := middleware.AllowResponsesWSConnectionAttempt(ctx); apiErr != nil {
 		t.Fatalf("expected non-upgrade rejection not to consume connection limiter, got %v", apiErr)
+	}
+}
+
+func TestResponsesWSFrameDiagnosticsSanitizesClientMetadata(t *testing.T) {
+	parentThreadID := "thread-secret-sk-proj-abcdefghijklmnopqrstuvwxyz"
+	raw, err := json.Marshal(map[string]any{
+		"type":  "response.create",
+		"model": "gpt-5\nmini",
+		"client_metadata": map[string]string{
+			"x-openai-subagent":        "Bearer abcdefghij.klmnopqrst.uvwxyzabcd",
+			"x-codex-parent-thread-id": parentThreadID,
+			"x-codex-turn-metadata":    `{"request_kind":"kind\nsk-proj-abcdefghijklmnopqrstuvwxyz"}`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal diagnostic payload: %v", err)
+	}
+
+	diag := responsesWSFrameDiagnosticsFromRaw(raw)
+	if strings.ContainsAny(diag.Model+diag.TurnRequestKind, "\r\n\t") {
+		t.Fatalf("expected diagnostic values to escape control characters, got %+v", diag)
+	}
+	if !diag.SubagentPresent || diag.SubagentBytes == 0 || diag.SubagentHash == "" {
+		t.Fatalf("expected subagent presence, length, and hash only, got %+v", diag)
+	}
+	if !diag.ParentThreadPresent || diag.ParentThreadBytes != len(parentThreadID) || diag.ParentThreadHash == "" {
+		t.Fatalf("expected parent thread presence, length, and hash only, got %+v", diag)
+	}
+	rendered := fmt.Sprintf("%+v", diag)
+	if strings.Contains(rendered, "Bearer") || strings.Contains(rendered, parentThreadID) || strings.Contains(rendered, "sk-proj-abcdefghijklmnopqrstuvwxyz") {
+		t.Fatalf("expected client metadata secrets to be redacted from diagnostics, got %+v", diag)
+	}
+	if !strings.Contains(diag.TurnRequestKind, "[redacted]") {
+		t.Fatalf("expected request kind secret to be redacted, got %+v", diag)
 	}
 }
 
@@ -896,7 +1335,7 @@ func TestResponsesWSFirstTurnSetupSkipsOpenAfterClientClosed(t *testing.T) {
 	if got := atomic.LoadInt32(&lease.releases); got != 1 {
 		t.Fatalf("expected pending lease to be released once, got %d", got)
 	}
-	if !actor.closed.Load() {
+	if !actor.closing.closed.Load() {
 		t.Fatalf("expected actor to close after client close")
 	}
 }
@@ -937,6 +1376,31 @@ func TestResponsesWSProviderPayloadKeepsCodexCreateModelTopLevel(t *testing.T) {
 	}
 }
 
+func TestResponsesWSBridgeDefaultPreviousResponseIDRequiresCapability(t *testing.T) {
+	actor := NewResponsesWSSessionActor(nil)
+	actor.turns.history.lastFinal = &types.OpenAIResponsesResponses{ID: "resp_success"}
+
+	bridgeSession := responsesws.NewBridgeSession(nil, responsesws.BridgeSessionOptions{})
+	if got := actor.bridgeDefaultPreviousResponseID(bridgeSession); got != "resp_success" {
+		t.Fatalf("expected bridge session to use latest successful response id, got %q", got)
+	}
+	capableSession := &responsesWSBridgeContinuationTestSession{supports: true}
+	if got := actor.bridgeDefaultPreviousResponseID(capableSession); got != "resp_success" {
+		t.Fatalf("expected capable bridge session to use latest successful response id, got %q", got)
+	}
+	if got := actor.bridgeDefaultPreviousResponseID(&responsesWSTestSession{}); got != "" {
+		t.Fatalf("expected non-capable session not to use latest response id, got %q", got)
+	}
+	disabledSession := &responsesWSBridgeContinuationTestSession{supports: false}
+	if got := actor.bridgeDefaultPreviousResponseID(disabledSession); got != "" {
+		t.Fatalf("expected disabled capable session not to use latest response id, got %q", got)
+	}
+	actor.turns.history.lastFinal = nil
+	if got := actor.bridgeDefaultPreviousResponseID(bridgeSession); got != "" {
+		t.Fatalf("expected missing latest response to skip bridge default, got %q", got)
+	}
+}
+
 func TestResponsesWSFirstTurnOpenResultAfterClientCloseIsAbortedNotAdopted(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -970,7 +1434,7 @@ func TestResponsesWSFirstTurnOpenResultAfterClientCloseIsAbortedNotAdopted(t *te
 	actor := NewResponsesWSSessionActor(ctx)
 	actor.ReserveFirstTurnOpening(frame)
 	startResponsesWSTestActor(t, actor)
-	actor.startFirstTurnOpenWorker(actor.openingID, frame)
+	actor.startFirstTurnOpenWorker(actor.turns.opening.openingID, frame)
 
 	select {
 	case <-openStarted:
@@ -995,8 +1459,204 @@ func TestResponsesWSFirstTurnOpenResultAfterClientCloseIsAbortedNotAdopted(t *te
 	case <-time.After(time.Second):
 		t.Fatalf("expected actor to close after client close")
 	}
-	if actor.session != nil || actor.upstreamSessionGeneration != "" {
-		t.Fatalf("expected closed actor not to adopt opened session, upstreamSessionGeneration=%q session=%#v", actor.upstreamSessionGeneration, actor.session)
+	if actor.upstream.session != nil || actor.upstream.sessionGeneration != "" {
+		t.Fatalf("expected closed actor not to adopt opened session, upstreamSessionGeneration=%q session=%#v", actor.upstream.sessionGeneration, actor.upstream.session)
+	}
+}
+
+func TestResponsesWSFirstTurnOpenResultSuccessAdoptsSnapshotAndStartsSend(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	ctx := setupResponsesWSQuotaFixture(t, 10000)
+	frame, err := responsesws.ParseRawResponsesCreateFrame([]byte(`{"type":"response.create","model":"gpt-5","input":[]}`))
+	if err != nil {
+		t.Fatalf("parse first frame: %v", err)
+	}
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	session := &responsesWSSendResultTestSession{
+		result: responsesws.ResponsesWSTransportSendResult{Status: responsesws.ResponsesWSTransportSendAttempted},
+	}
+	actor := NewResponsesWSSessionActor(ctx)
+	bridge := NewResponsesWSIOBridge(conn, actor)
+	actor.SetBridge(bridge)
+	t.Cleanup(func() {
+		actor.finish()
+		bridge.Close()
+	})
+	actor.ReserveFirstTurnOpening(frame)
+
+	eventSnapshot := NewResponsesWSRequestSnapshot(ctx)
+	eventSnapshot.Set("snapshot_marker", []string{"event"})
+	adoptedCh := make(chan bool, 1)
+	actor.handleFirstTurnOpenResult(ResponsesWSEventFirstTurnOpenResult{
+		OpeningID: actor.turns.opening.openingID,
+		Snapshot:  eventSnapshot,
+		OpenResult: &responsesWSOpenResult{
+			Session:       session,
+			ProviderModel: "gpt-5",
+			BillingModel:  "gpt-5",
+			Channel:       &model.Channel{Id: 17, Type: config.ChannelTypeOpenAI, Name: "openai", Models: "gpt-5", Group: "default"},
+		},
+		Adopted: adoptedCh,
+	})
+
+	if adopted := <-adoptedCh; !adopted {
+		t.Fatal("expected first-turn open result to be adopted")
+	}
+	if actor.snapshot.snapshot == eventSnapshot {
+		t.Fatal("expected actor to clone event snapshot instead of retaining caller-owned pointer")
+	}
+	if actor.upstream.session != session || actor.upstream.channelID != 17 || actor.upstream.sessionGeneration == "" || !actor.upstream.recvArmed {
+		t.Fatalf("expected upstream session to be attached and recv pump armed, session=%T channel=%d generation=%q armed=%v", actor.upstream.session, actor.upstream.channelID, actor.upstream.sessionGeneration, actor.upstream.recvArmed)
+	}
+	if actor.turns.pending.attempt == nil || actor.turns.pending.attempt.Session != session || actor.turns.pending.attempt.SelectedChannelID != 17 {
+		t.Fatalf("expected first turn attempt to be prepared, pending=%+v", actor.turns.pending.attempt)
+	}
+	if actor.turns.pending.phase != responsesWSPendingTurnSend || actor.state != responsesWSStatePendingSend {
+		t.Fatalf("expected first turn to enter send phase, phase=%v state=%v", actor.turns.pending.phase, actor.state)
+	}
+	attached := actor.snapshotClone()
+	rawSelected, ok := attached.Get("responses_ws_selected_channel_snapshot")
+	selected, okSelected := rawSelected.(*SelectedChannelSnapshot)
+	if !ok || !okSelected || selected.ChannelID != 17 || selected.ProviderModel != "gpt-5" || selected.BillingModel != "gpt-5" {
+		t.Fatalf("expected selected channel snapshot to be attached, got %#v", rawSelected)
+	}
+	waitResponsesWSTestCondition(t, time.Second, time.Millisecond, func() bool {
+		return atomic.LoadInt32(&session.resultCalls) == 1
+	}, func() string {
+		return fmt.Sprintf("expected first-turn send worker to call provider once, got %d", atomic.LoadInt32(&session.resultCalls))
+	})
+}
+
+func TestResponsesWSFirstTurnOpenResultUnsupportedWritesFallbackAndCloseControl(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	frame, err := responsesws.ParseRawResponsesCreateFrame([]byte(`{"type":"response.create","model":"gpt-5","input":"hi"}`))
+	if err != nil {
+		t.Fatalf("parse first frame: %v", err)
+	}
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	actor.ReserveFirstTurnOpening(frame)
+	adoptedCh := make(chan bool, 1)
+
+	actor.handleFirstTurnOpenResult(ResponsesWSEventFirstTurnOpenResult{
+		OpeningID: actor.turns.opening.openingID,
+		Err:       common.StringErrorWrapperLocal("unsupported", "responses_ws_unsupported_for_channel", http.StatusUpgradeRequired),
+		Adopted:   adoptedCh,
+	})
+
+	if adopted := <-adoptedCh; !adopted {
+		t.Fatal("expected unsupported open error to be adopted by actor")
+	}
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected unsupported open error to close actor")
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "responses_ws_unsupported_for_channel") {
+		t.Fatalf("expected fallback payload, got %q", got)
+	}
+	if atomic.LoadInt32(&conn.controlCount) != 1 {
+		t.Fatalf("expected exactly one fallback close control, got %d", atomic.LoadInt32(&conn.controlCount))
+	}
+	if got, _ := conn.lastControl.Load().(string); !strings.Contains(got, "responses_ws_unsupported_for_channel") {
+		t.Fatalf("expected fallback close reason, got %q", got)
+	}
+}
+
+func TestResponsesWSFirstTurnOpenResultOpenAIErrorWritesErrorWithoutFallbackClose(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	frame, err := responsesws.ParseRawResponsesCreateFrame([]byte(`{"type":"response.create","model":"gpt-5","input":"hi"}`))
+	if err != nil {
+		t.Fatalf("parse first frame: %v", err)
+	}
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	actor.ReserveFirstTurnOpening(frame)
+	adoptedCh := make(chan bool, 1)
+
+	actor.handleFirstTurnOpenResult(ResponsesWSEventFirstTurnOpenResult{
+		OpeningID: actor.turns.opening.openingID,
+		Err: &types.OpenAIErrorWithStatusCode{
+			OpenAIError: types.OpenAIError{
+				Type:    "rate_limit_error",
+				Code:    "rate_limit_exceeded",
+				Message: "provider busy",
+			},
+			StatusCode: http.StatusTooManyRequests,
+		},
+		Adopted: adoptedCh,
+	})
+
+	if adopted := <-adoptedCh; !adopted {
+		t.Fatal("expected open error to be adopted by actor")
+	}
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected open error to close actor")
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "rate_limit_exceeded") || strings.Contains(got, "responses_ws_unsupported_for_channel") {
+		t.Fatalf("expected OpenAI error payload without fallback code, got %q", got)
+	}
+	if got, _ := conn.lastControl.Load().(string); strings.Contains(got, "responses_ws_unsupported_for_channel") {
+		t.Fatalf("expected ordinary close control not fallback close, got %q", got)
+	}
+}
+
+func TestResponsesWSFirstTurnOpenResultInvalidOpenResultClosesWithChannelError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cases := []struct {
+		name       string
+		openResult *responsesWSOpenResult
+	}{
+		{name: "nil open result"},
+		{name: "nil session", openResult: &responsesWSOpenResult{Channel: &model.Channel{Id: 17}}},
+		{name: "nil channel", openResult: &responsesWSOpenResult{Session: &responsesWSTestSession{}}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+			frame, err := responsesws.ParseRawResponsesCreateFrame([]byte(`{"type":"response.create","model":"gpt-5","input":"hi"}`))
+			if err != nil {
+				t.Fatalf("parse first frame: %v", err)
+			}
+
+			conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+			actor := NewResponsesWSSessionActor(ctx)
+			actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+			actor.ReserveFirstTurnOpening(frame)
+			adoptedCh := make(chan bool, 1)
+
+			actor.handleFirstTurnOpenResult(ResponsesWSEventFirstTurnOpenResult{
+				OpeningID:  actor.turns.opening.openingID,
+				OpenResult: tc.openResult,
+				Adopted:    adoptedCh,
+			})
+
+			if adopted := <-adoptedCh; !adopted {
+				t.Fatal("expected invalid open result to be adopted and cleaned up by actor")
+			}
+			if !actor.closing.closed.Load() {
+				t.Fatal("expected invalid open result to close actor")
+			}
+			if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "channel_error") {
+				t.Fatalf("expected safe channel_error payload, got %q", got)
+			}
+		})
 	}
 }
 
@@ -1072,7 +1732,7 @@ func TestResponsesWSFirstTurnAdmissionRejectsBeforeUpstreamOpen(t *testing.T) {
 		t.Fatal("expected RPM rejection before upstream open")
 	case <-time.After(100 * time.Millisecond):
 	}
-	if !actor.closed.Load() {
+	if !actor.closing.closed.Load() {
 		t.Fatal("expected actor to close on RPM rejection")
 	}
 }
@@ -1112,7 +1772,7 @@ func TestResponsesWSFirstTurnActiveLeaseRejectsBeforeRPM(t *testing.T) {
 		Frame:        frame,
 		PendingLease: &responsesWSTestLease{},
 	})
-	if !actor.closed.Load() {
+	if !actor.closing.closed.Load() {
 		t.Fatal("expected actor to close on active lease rejection")
 	}
 
@@ -1131,7 +1791,7 @@ func TestResponsesWSActorCloseReleasesActiveLeaseOnce(t *testing.T) {
 
 	lease := &responsesWSTestLease{}
 	actor := NewResponsesWSSessionActor(ctx)
-	actor.activeLease = lease
+	actor.lease.activeLease = lease
 	actor.close("first_close")
 	actor.close("second_close")
 
@@ -1149,7 +1809,7 @@ func TestResponsesWSClientCloseBeforeOpenReleasesActiveLease(t *testing.T) {
 
 	lease := &responsesWSTestLease{}
 	actor := NewResponsesWSSessionActor(ctx)
-	actor.activeLease = lease
+	actor.lease.activeLease = lease
 	actor.handleClientClosed(errors.New("client closed"))
 
 	if got := atomic.LoadInt32(&lease.releases); got != 1 {
@@ -1250,7 +1910,7 @@ func TestResponsesWSFirstTurnFailureAfterAttachAbortsSessionOnce(t *testing.T) {
 	if session.abortReason != "rewrite_failed" {
 		t.Fatalf("expected actor close to own abort reason, got %q", session.abortReason)
 	}
-	if !actor.closed.Load() {
+	if !actor.closing.closed.Load() {
 		t.Fatal("expected actor to close after first-turn rewrite failure")
 	}
 	got, _ := conn.lastWrite.Load().(string)
@@ -1291,18 +1951,18 @@ func TestResponsesWSFirstTurnRetryOpenDoesNotBlockActorLoop(t *testing.T) {
 
 	openingID := actor.ReserveFirstTurnOpening(frame)
 	admission := NewResponsesWSTurnAdmission()
-	actor.firstTurnAdmission = admission
-	actor.session = &responsesWSTestSession{}
-	actor.upstreamSessionGeneration = "old-session"
-	actor.sessionChannelID = 17
-	actor.providerRecvArmed = true
-	actor.pendingAttempt = &ResponsesWSTurnAttempt{
+	actor.turns.opening.admission = admission
+	actor.upstream.session = &responsesWSTestSession{}
+	actor.upstream.sessionGeneration = "old-session"
+	actor.upstream.channelID = 17
+	actor.upstream.recvArmed = true
+	actor.turns.pending.attempt = &ResponsesWSTurnAttempt{
 		OpeningID:         openingID,
 		AttemptID:         "attempt-old",
 		Admission:         admission,
 		Candidate:         &ResponsesTurnAffinity{},
 		SelectedChannelID: 17,
-		Session:           actor.session,
+		Session:           actor.upstream.session,
 		snapshot:          NewResponsesWSRequestSnapshot(ctx),
 	}
 	actor.state = responsesWSStatePendingSend
@@ -1311,8 +1971,10 @@ func TestResponsesWSFirstTurnRetryOpenDoesNotBlockActorLoop(t *testing.T) {
 	if !actor.Post(ResponsesWSEventSendResult{
 		AttemptID:         "attempt-old",
 		SelectedChannelID: 17,
-		Outcome:           SendOutcomeNotSent,
-		Err:               runtimesession.ErrSessionClosed,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendNotAttempted,
+			Err:    responsesws.ErrUpstreamClosed,
+		},
 	}) {
 		t.Fatal("expected send result to queue")
 	}
@@ -1462,7 +2124,7 @@ func TestOpenAndPrimeResponsesWSNonStrictUnsupportedPreferredFallsBack(t *testin
 	proxy := ""
 	preferredBaseURL := unsupportedServer.URL
 	fallbackBaseURL := fallbackServer.URL
-	selfHostedOther := `{"responses_ws_self_hosted":true}`
+	selfHostedOther := `{"responses_ws_native":true,"responses_ws_self_hosted":true}`
 	preferred := &model.Channel{
 		Id:      preferredChannelID,
 		Type:    config.ChannelTypeOpenAI,
@@ -1537,6 +2199,137 @@ func TestOpenAndPrimeResponsesWSNonStrictUnsupportedPreferredFallsBack(t *testin
 	}
 }
 
+func TestOpenAndPrimeResponsesWSUnsupportedCandidateDoesNotConsumeRetryBudget(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	channelGroupSnapshot := snapshotChannelGroup()
+	t.Cleanup(func() {
+		restoreChannelGroup(channelGroupSnapshot)
+	})
+	originalRetryTimes := config.RetryTimes
+	config.RetryTimes = 1
+	t.Cleanup(func() {
+		config.RetryTimes = originalRetryTimes
+	})
+
+	unsupportedServer := httptest.NewServer(http.NotFoundHandler())
+	defer unsupportedServer.Close()
+
+	upgraded := make(chan *wsconn.ManagedConn, 1)
+	fallbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := wsconn.AcceptManaged(w, r, wsconn.Config{Label: "responses ws retry budget fallback"}, wsconn.AcceptOptions{
+			CheckOrigin: func(*http.Request) bool { return true },
+		})
+		if err != nil {
+			t.Errorf("fallback upgrade failed: %v", err)
+			return
+		}
+		upgraded <- conn
+		<-r.Context().Done()
+	}))
+	defer fallbackServer.Close()
+
+	proxy := ""
+	unsupportedBaseURL := unsupportedServer.URL
+	fallbackBaseURL := fallbackServer.URL
+	selfHostedOther := `{"responses_ws_native":true,"responses_ws_self_hosted":true}`
+	model.ChannelGroup = buildRealtimeTestChannelGroupForChannels(
+		&model.Channel{Id: 81, Type: config.ChannelTypeOpenAI, Key: "sk-unsupported", BaseURL: &unsupportedBaseURL, Proxy: &proxy, Other: selfHostedOther},
+		&model.Channel{Id: 82, Type: config.ChannelTypeOpenAI, Key: "sk-fallback", BaseURL: &fallbackBaseURL, Proxy: &proxy, Other: selfHostedOther},
+	)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	ctx.Set("token_group", "default")
+
+	openResult, apiErr := openAndPrimeResponsesWSSession(ctx, &types.OpenAIResponsesRequest{Model: "gpt-5"})
+	if apiErr != nil {
+		t.Fatalf("expected unsupported candidate not to consume retry budget, got %v", apiErr)
+	}
+	if openResult == nil || openResult.Channel == nil || openResult.Channel.Id != 82 {
+		t.Fatalf("expected fallback channel #82, got %#v", openResult)
+	}
+	if openResult.Session != nil {
+		openResult.Session.Abort("test_done")
+	}
+	select {
+	case conn := <-upgraded:
+		conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_cleanup"})
+	case <-time.After(time.Second):
+		t.Fatalf("expected fallback websocket server to be used")
+	}
+}
+
+func TestOpenAndPrimeResponsesWSNonStrictPreferredProviderErrorSurvivesUnsupportedFallback(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	channelGroupSnapshot := snapshotChannelGroup()
+	t.Cleanup(func() {
+		restoreChannelGroup(channelGroupSnapshot)
+	})
+
+	badGatewayServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+	}))
+	defer badGatewayServer.Close()
+	unsupportedServer := httptest.NewServer(http.NotFoundHandler())
+	defer unsupportedServer.Close()
+
+	const (
+		preferredChannelID   = 83
+		unsupportedChannelID = 84
+	)
+	proxy := ""
+	preferredBaseURL := badGatewayServer.URL
+	unsupportedBaseURL := unsupportedServer.URL
+	selfHostedOther := `{"responses_ws_native":true,"responses_ws_self_hosted":true}`
+	preferred := &model.Channel{Id: preferredChannelID, Type: config.ChannelTypeOpenAI, Key: "sk-preferred", BaseURL: &preferredBaseURL, Proxy: &proxy, Other: selfHostedOther}
+	unsupported := &model.Channel{Id: unsupportedChannelID, Type: config.ChannelTypeOpenAI, Key: "sk-unsupported", BaseURL: &unsupportedBaseURL, Proxy: &proxy, Other: selfHostedOther}
+	model.ChannelGroup = buildRealtimeTestChannelGroupForChannels(unsupported, preferred)
+
+	settings := config.ChannelAffinitySettings{
+		Enabled:           true,
+		DefaultTTLSeconds: 60,
+		Rules: []config.ChannelAffinityRule{
+			{
+				Name:            "responses-prompt-nonstrict-error",
+				Enabled:         true,
+				Kind:            "responses",
+				IncludeModel:    true,
+				IncludeRuleName: true,
+				Strict:          false,
+				RecordOnSuccess: true,
+				KeySources: []config.ChannelAffinityKeySource{
+					{Source: "request_field", Key: "prompt_cache_key", Alias: config.ChannelAffinityAliasPromptCacheKey},
+				},
+			},
+		},
+	}
+	settings.Normalize()
+	manager := withChannelAffinitySettings(t, settings)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	ctx.Set("token_group", "default")
+
+	request := &types.OpenAIResponsesRequest{Model: "gpt-5", PromptCacheKey: "pc-provider-error"}
+	template := newChannelAffinityTemplate(ctx, channelAffinityKindResponses, "gpt-5", settings.Rules[0], "request_field", config.ChannelAffinityAliasPromptCacheKey, settings.DefaultTTLSeconds)
+	manager.SetRecord(template.BuildKey(request.PromptCacheKey), runtimeaffinity.Record{
+		ChannelID:         preferredChannelID,
+		ResumeFingerprint: "model:gpt-5",
+	}, time.Minute)
+
+	openResult, apiErr := openAndPrimeResponsesWSSession(ctx, request)
+	if openResult != nil && openResult.Session != nil {
+		openResult.Session.Abort("test_done")
+	}
+	if apiErr == nil || apiErr.StatusCode != http.StatusBadGateway || openAIErrorCodeString(apiErr.Code, "") != "provider_ws_request_failed" {
+		t.Fatalf("expected preferred provider 5xx to survive unsupported fallback, result=%#v err=%+v", openResult, apiErr)
+	}
+}
+
 func TestOpenAndPrimeResponsesWSAllUnsupportedReturnsFallbackError(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -1550,7 +2343,7 @@ func TestOpenAndPrimeResponsesWSAllUnsupportedReturnsFallbackError(t *testing.T)
 
 	proxy := ""
 	baseURL := unsupportedServer.URL
-	selfHostedOther := `{"responses_ws_self_hosted":true}`
+	selfHostedOther := `{"responses_ws_native":true,"responses_ws_self_hosted":true}`
 	model.ChannelGroup = buildRealtimeTestChannelGroupForChannels(&model.Channel{
 		Id:      91,
 		Type:    config.ChannelTypeOpenAI,
@@ -1597,7 +2390,7 @@ func TestOpenAndPrimeResponsesWSMixedUnsupportedPreservesProviderError(t *testin
 	proxy := ""
 	unsupportedBaseURL := unsupportedServer.URL
 	badGatewayBaseURL := badGatewayServer.URL
-	selfHostedOther := `{"responses_ws_self_hosted":true}`
+	selfHostedOther := `{"responses_ws_native":true,"responses_ws_self_hosted":true}`
 	model.ChannelGroup = buildRealtimeTestChannelGroupForChannels(
 		&model.Channel{
 			Id:      92,
@@ -1651,6 +2444,13 @@ func TestResponsesWSUnsupportedScanLimitCapsByConfigAndChannelCount(t *testing.T
 	if got := responsesWSUnsupportedScanLimit(); got != 2 {
 		t.Fatalf("expected unsupported scan limit to cap at channel count 2, got %d", got)
 	}
+	if limit, limited := responsesWSUnsupportedScanPolicy(); limit != 2 || limited {
+		t.Fatalf("expected high scan limit not to be marked as limited, limit=%d limited=%v", limit, limited)
+	}
+	setResponsesWSTestViperInt(t, "responses_ws.unsupported_scan_limit", 1)
+	if limit, limited := responsesWSUnsupportedScanPolicy(); limit != 1 || !limited {
+		t.Fatalf("expected low explicit scan limit to be marked limited, limit=%d limited=%v", limit, limited)
+	}
 }
 
 func TestResponsesWSActorBackpressurePostsEventInsteadOfClosingDirectly(t *testing.T) {
@@ -1668,7 +2468,7 @@ func TestResponsesWSActorBackpressurePostsEventInsteadOfClosingDirectly(t *testi
 	}
 
 	actor.Post(ResponsesWSEventClientClosed{})
-	if actor.closed.Load() {
+	if actor.closing.closed.Load() {
 		t.Fatalf("expected event queue backpressure to be handled by actor event, got direct close")
 	}
 	select {
@@ -1692,6 +2492,128 @@ func TestResponsesWSActorBackpressurePostsEventInsteadOfClosingDirectly(t *testi
 	t.Fatalf("expected queued backpressure timeout event")
 }
 
+func TestResponsesWSPostReliableTimesOutAndRequestsCloseIntent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	t.Cleanup(actor.finish)
+
+	actor.reliablePostTimeout = 100 * time.Millisecond
+
+	originalRecorder := recordResponsesWSEventPostTimeout
+	recordedEventTypes := make(chan string, 4)
+	recordResponsesWSEventPostTimeout = func(eventType string) {
+		recordedEventTypes <- eventType
+	}
+	t.Cleanup(func() {
+		recordResponsesWSEventPostTimeout = originalRecorder
+	})
+
+	for i := 0; i < cap(actor.events); i++ {
+		actor.events <- ResponsesWSEventTimeout{Reason: "preloaded"}
+	}
+
+	start := time.Now()
+	if actor.PostReliable(ResponsesWSEventClientClosed{}) {
+		t.Fatal("expected reliable post to time out on a full actor queue")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("expected bounded reliable post to return promptly, took %s", elapsed)
+	}
+	select {
+	case got := <-recordedEventTypes:
+		if got != "client_closed" {
+			t.Fatalf("expected client_closed metric label, got %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected reliable post timeout metric")
+	}
+	if !actor.closing.closeIntentPosted.Load() {
+		t.Fatal("expected reliable post timeout to request close intent")
+	}
+
+	for i := 0; i < cap(actor.events); i++ {
+		<-actor.events
+	}
+	event := readResponsesWSEvent(t, actor)
+	closeIntent, ok := event.(ResponsesWSEventCloseIntent)
+	if !ok {
+		t.Fatalf("expected close intent after queue drains, got %T", event)
+	}
+	if closeIntent.Reason != "reliable_post_timeout" {
+		t.Fatalf("unexpected close intent reason %q", closeIntent.Reason)
+	}
+}
+
+func TestResponsesWSOnClientConnClosedPostsAsyncWhenQueueFull(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	t.Cleanup(actor.finish)
+
+	actor.reliablePostTimeout = 20 * time.Millisecond
+
+	for i := 0; i < cap(actor.events); i++ {
+		actor.events <- ResponsesWSEventTimeout{Reason: "preloaded"}
+	}
+
+	start := time.Now()
+	actor.onClientConnClosed(wsconn.CloseInfo{Err: io.EOF})
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Fatalf("expected OnClose callback path not to block on full actor queue, took %s", elapsed)
+	}
+
+	waitResponsesWSTestCondition(t, time.Second, time.Millisecond, func() bool {
+		return actor.closing.closeIntentPosted.Load()
+	}, func() string {
+		return "expected async client close post timeout to request close intent"
+	})
+}
+
+func TestResponsesWSProviderRecvPumpStopsAfterReliablePostFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	t.Cleanup(actor.finish)
+
+	actor.reliablePostTimeout = 20 * time.Millisecond
+
+	for i := 0; i < cap(actor.events); i++ {
+		actor.events <- ResponsesWSEventTimeout{Reason: "preloaded"}
+	}
+
+	session := &responsesWSRecvSequenceSession{responses: make(chan responsesWSRecvResult, 2)}
+	session.responses <- responsesWSRecvResult{messageType: int(wsconn.TextMessage), payload: []byte(`{"type":"response.created","response":{"id":"resp_1"}}`)}
+	session.responses <- responsesWSRecvResult{providerClose: &responsesws.ProviderClose{Code: int(wsconn.CloseNormalClosure), Reason: "second"}}
+
+	bridge := NewResponsesWSIOBridge(nil, actor)
+	t.Cleanup(bridge.Close)
+	bridge.ArmProviderRecvPump("generation-1", 11, session)
+
+	waitResponsesWSTestCondition(t, time.Second, time.Millisecond, func() bool {
+		return actor.closing.closeIntentPosted.Load()
+	}, func() string {
+		return "expected failed provider event post to request close intent"
+	})
+	time.Sleep(3 * actor.reliablePostTimeout)
+
+	if got := atomic.LoadInt32(&session.recvCalls); got != 1 {
+		t.Fatalf("expected provider recv pump to stop after first failed post, recv calls=%d", got)
+	}
+}
+
 func TestResponsesWSOnClientFrameCopiesPayloadAndPostsNonBlocking(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -1710,8 +2632,8 @@ func TestResponsesWSOnClientFrameCopiesPayloadAndPostsNonBlocking(t *testing.T) 
 	if !ok {
 		t.Fatalf("expected client frame event, got %T", event)
 	}
-	if clientFrame.MessageType != int(wsconn.TextMessage) || string(clientFrame.Payload) != `{"type":"response.cancel"}` {
-		t.Fatalf("unexpected client frame event: %+v payload=%q", clientFrame, clientFrame.Payload)
+	if clientFrame.Frame.Kind() != responsesws.FrameKindText || string(clientFrame.Frame.Payload()) != `{"type":"response.cancel"}` {
+		t.Fatalf("unexpected client frame event: %+v payload=%q", clientFrame, clientFrame.Frame.Payload())
 	}
 	if clientFrame.ReceivedAt.IsZero() {
 		t.Fatal("expected client frame received time")
@@ -1777,7 +2699,7 @@ func TestResponsesWSOnClientFrameBackpressureRequestsCloseAndClosesManagedConn(t
 	}
 }
 
-func TestResponsesWSSendResultReliableWhenMailboxFull(t *testing.T) {
+func TestResponsesWSTransportSendResultReliableWhenMailboxFull(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	recorder := httptest.NewRecorder()
@@ -1796,8 +2718,7 @@ func TestResponsesWSSendResultReliableWhenMailboxFull(t *testing.T) {
 			AttemptID:         "attempt-reliable",
 			SelectedChannelID: 17,
 			Session:           session,
-			MessageType:       responsesWSTextMessageType,
-			Payload:           []byte(`{"type":"response.cancel"}`),
+			Frame:             responsesWSFrameFromWireMessage(responsesWSTextMessageType, []byte(`{"type":"response.cancel"}`)),
 		})
 		close(done)
 	}()
@@ -1816,12 +2737,143 @@ func TestResponsesWSSendResultReliableWhenMailboxFull(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected send result after draining preloaded events, got %T", event)
 	}
-	if sendResult.AttemptID != "attempt-reliable" || sendResult.Outcome != SendOutcomeLocalWriteOK {
+	if sendResult.AttemptID != "attempt-reliable" ||
+		sendResult.TransportResult.Status != responsesws.ResponsesWSTransportSendAttempted {
 		t.Fatalf("unexpected send result: %+v", sendResult)
 	}
 }
 
-func TestResponsesWSSendQueueFullPostsNotSentEvent(t *testing.T) {
+func TestResponsesWSControlLaneBypassesBlockedCreateSend(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	session := &responsesWSControlLaneTestSession{
+		createStarted: make(chan struct{}),
+		releaseCreate: make(chan struct{}),
+		controlCalled: make(chan struct{}),
+	}
+	actor := NewResponsesWSSessionActor(ctx)
+	defer actor.finish()
+	defer close(session.releaseCreate)
+	actor.AttachUpstreamSession(session, 17)
+
+	if !actor.SendProviderFrame("attempt-blocked-create", 17, session, responsesws.NewTextFrame([]byte(`{"type":"response.create"}`))) {
+		t.Fatal("expected create send to enqueue")
+	}
+	select {
+	case <-session.createStarted:
+	case <-time.After(time.Second):
+		t.Fatal("expected create send to start and block")
+	}
+
+	if !actor.SendProviderControlFrame("attempt-blocked-create", 17, session, responsesws.NewTextFrame([]byte(`{"type":"response.cancel"}`))) {
+		t.Fatal("expected cancel control send to enqueue")
+	}
+	select {
+	case <-session.controlCalled:
+	case <-time.After(time.Second):
+		t.Fatal("expected cancel control lane to bypass blocked create send")
+	}
+}
+
+func TestResponsesWSControlFrameUsesQueuedContext(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	type contextKey string
+	const key contextKey = "responses_ws_control_context"
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	reqCtx := context.WithValue(context.Background(), key, "queued")
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil).WithContext(reqCtx)
+
+	session := &responsesWSControlLaneTestSession{
+		createStarted:   make(chan struct{}),
+		releaseCreate:   make(chan struct{}),
+		controlCalled:   make(chan struct{}),
+		controlContexts: make(chan context.Context, 1),
+		controlRequests: make(chan responsesws.SendRequest, 1),
+	}
+	actor := NewResponsesWSSessionActor(ctx)
+	defer actor.finish()
+	defer close(session.releaseCreate)
+	actor.AttachUpstreamSession(session, 17)
+
+	if !actor.SendProviderControlFrame("attempt-control-context", 17, session, responsesws.NewTextFrame([]byte(`{"type":"response.cancel"}`))) {
+		t.Fatal("expected cancel control send to enqueue")
+	}
+
+	select {
+	case controlCtx := <-session.controlContexts:
+		if got := controlCtx.Value(key); got != "queued" {
+			t.Fatalf("expected queued request context value, got %#v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for control context")
+	}
+	select {
+	case req := <-session.controlRequests:
+		if req.AttemptID != "attempt-control-context" {
+			t.Fatalf("expected control request attempt id, got %q", req.AttemptID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for control request")
+	}
+}
+
+func TestResponsesWSHandleControlCommandPropagatesSendResult(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	controlErr := errors.New("no active bridge cancel")
+	session := &responsesWSControlLaneTestSession{
+		controlCalled: make(chan struct{}),
+		controlResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendNotAttempted,
+			Err:    controlErr,
+			Reason: responsesws.ResponsesWSTransportSendReasonNoActiveBridgeCancel,
+		},
+	}
+	actor := NewResponsesWSSessionActor(ctx)
+	defer actor.finish()
+
+	actor.handleControlCommand(responsesWSSendCommand{
+		AttemptID:                 "attempt-control-propagation",
+		ResponseID:                "resp-control",
+		UpstreamSessionGeneration: "generation-control",
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeControl,
+		Session:                   session,
+		Frame:                     responsesWSFrameFromWireMessage(responsesWSTextMessageType, []byte(`{"type":"response.cancel"}`)),
+	})
+
+	event := readResponsesWSEvent(t, actor)
+	sendResult, ok := event.(ResponsesWSEventSendResult)
+	if !ok {
+		t.Fatalf("expected control send result event, got %T", event)
+	}
+	if sendResult.AttemptID != "attempt-control-propagation" ||
+		sendResult.ResponseID != "resp-control" ||
+		sendResult.UpstreamSessionGeneration != "generation-control" ||
+		sendResult.SelectedChannelID != 17 ||
+		sendResult.Purpose != ResponsesWSSendPurposeControl {
+		t.Fatalf("expected control routing fields to be preserved, got %+v", sendResult)
+	}
+	if sendResult.TransportResult.Status != responsesws.ResponsesWSTransportSendNotAttempted ||
+		sendResult.TransportResult.Reason != responsesws.ResponsesWSTransportSendReasonNoActiveBridgeCancel ||
+		!errors.Is(sendResult.TransportResult.Err, controlErr) ||
+		!errors.Is(sendResult.TransportResult.Err, controlErr) {
+		t.Fatalf("expected control result details to propagate, got %+v", sendResult)
+	}
+}
+
+func TestResponsesWSHandleControlCommandRejectsNonControlCapableSession(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	recorder := httptest.NewRecorder()
@@ -1829,32 +2881,535 @@ func TestResponsesWSSendQueueFullPostsNotSentEvent(t *testing.T) {
 	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
 
 	actor := NewResponsesWSSessionActor(ctx)
-	attempt := &ResponsesWSTurnAttempt{
-		AttemptID:         "attempt-queue-full",
+	defer actor.finish()
+	actor.handleControlCommand(responsesWSSendCommand{
+		AttemptID:         "attempt-control-non-capable",
 		SelectedChannelID: 17,
-		QuotaPreconsumed:  true,
+		Purpose:           ResponsesWSSendPurposeControl,
+		Session:           &responsesWSTestSession{},
+		Frame:             responsesWSFrameFromWireMessage(responsesWSTextMessageType, []byte(`{"type":"response.cancel"}`)),
+	})
+
+	event := readResponsesWSEvent(t, actor)
+	sendResult, ok := event.(ResponsesWSEventSendResult)
+	if !ok {
+		t.Fatalf("expected control send result event, got %T", event)
+	}
+	if sendResult.TransportResult.Status != responsesws.ResponsesWSTransportSendNotAttempted ||
+		!errors.Is(sendResult.TransportResult.Err, responsesws.ErrInvalidFrame) ||
+		!errors.Is(sendResult.TransportResult.Err, responsesws.ErrInvalidFrame) ||
+		sendResult.AttemptID != "attempt-control-non-capable" ||
+		sendResult.Purpose != ResponsesWSSendPurposeControl {
+		t.Fatalf("expected non-control capable session to return NotSent invalid-frame result, got %+v", sendResult)
+	}
+}
+
+func TestResponsesWSControlFallbackPreservesAttemptID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	session := &responsesWSCaptureSendSession{requests: make(chan responsesws.SendRequest, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	defer actor.finish()
+	actor.AttachUpstreamSession(session, 17)
+
+	if !actor.SendProviderControlFrame("attempt-fallback-cancel", 17, session, responsesws.NewTextFrame([]byte(`{"type":"response.cancel"}`))) {
+		t.Fatal("expected non-control cancel fallback to enqueue on send lane")
+	}
+
+	select {
+	case req := <-session.requests:
+		if req.AttemptID != "attempt-fallback-cancel" {
+			t.Fatalf("expected cancel fallback request to preserve attempt id, got %q", req.AttemptID)
+		}
+		if string(req.Frame.Payload()) != `{"type":"response.cancel"}` {
+			t.Fatalf("expected cancel payload to be preserved, got %s", req.Frame.Payload())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for fallback send request")
+	}
+
+	event := readResponsesWSEvent(t, actor)
+	sendResult, ok := event.(ResponsesWSEventSendResult)
+	if !ok {
+		t.Fatalf("expected fallback send result event, got %T", event)
+	}
+	if sendResult.Purpose != ResponsesWSSendPurposeResponseCancel ||
+		sendResult.AttemptID != "attempt-fallback-cancel" ||
+		sendResult.TransportResult.Status != responsesws.ResponsesWSTransportSendAttempted {
+		t.Fatalf("expected fallback cancel send result to remain cancel-scoped, got %+v", sendResult)
+	}
+}
+
+func TestResponsesWSClientCancelDuringInFlightUsesActiveAttemptControlLane(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	session := &responsesWSControlLaneTestSession{
+		controlCalled:   make(chan struct{}),
+		controlContexts: make(chan context.Context, 1),
+		controlRequests: make(chan responsesws.SendRequest, 1),
+		controlFrames:   make(chan responsesws.Frame, 1),
+	}
+	actor := NewResponsesWSSessionActor(ctx)
+	defer actor.finish()
+	actor.AttachUpstreamSession(session, 17)
+	actor.turns.active.attempt = &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-active-cancel",
+		SelectedChannelID: 17,
 		Usage:             &types.Usage{},
 	}
-	actor.pendingAttempt = attempt
-	actor.state = responsesWSStatePendingSend
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
 
-	actor.postSendQueueFull(attempt.AttemptID, attempt.SelectedChannelID)
-	if attempt.RolledBack || actor.pendingAttempt == nil {
-		t.Fatal("expected send queue full to wait for actor event handling before mutating attempt state")
+	payload := []byte(`{"type":"response.cancel"}`)
+	actor.handleClientCancel(responsesWSTestClientTextFrame(payload))
+
+	select {
+	case <-session.controlCalled:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for in-flight client cancel control send")
 	}
+	select {
+	case req := <-session.controlRequests:
+		if req.AttemptID != "attempt-active-cancel" {
+			t.Fatalf("expected active attempt id on cancel control request, got %q", req.AttemptID)
+		}
+	default:
+		t.Fatal("expected cancel control request")
+	}
+	select {
+	case frame := <-session.controlFrames:
+		if frame.Kind() != responsesws.FrameKindText || string(frame.Payload()) != string(payload) {
+			t.Fatalf("expected cancel control frame to preserve payload, got kind=%v payload=%s", frame.Kind(), frame.Payload())
+		}
+	default:
+		t.Fatal("expected cancel control frame")
+	}
+	if calls := atomic.LoadInt32(&session.controlCalls); calls != 1 {
+		t.Fatalf("expected exactly one provider control call, got %d", calls)
+	}
+}
+
+func TestResponsesWSClientCancelWithoutProviderTurnDoesNotReachProvider(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	session := &responsesWSControlLaneTestSession{
+		controlCalled: make(chan struct{}),
+	}
+	actor := NewResponsesWSSessionActor(ctx)
+	defer actor.finish()
+	actor.AttachUpstreamSession(session, 17)
+	actor.state = responsesWSStateIdle
+
+	actor.handleClientCancel(responsesWSTestClientTextFrame([]byte(`{"type":"response.cancel"}`)))
+
+	if calls := atomic.LoadInt32(&session.controlCalls); calls != 0 {
+		t.Fatalf("expected idle client cancel not to call provider control, got %d", calls)
+	}
+	select {
+	case <-session.controlCalled:
+		t.Fatal("idle client cancel must not enqueue provider control")
+	default:
+	}
+}
+
+func TestResponsesWSPendingSendCancelReplaysAfterCreateAttempted(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	session := &responsesWSControlLaneTestSession{
+		createStarted: make(chan struct{}),
+		releaseCreate: make(chan struct{}),
+		controlCalled: make(chan struct{}),
+	}
+	actor := NewResponsesWSSessionActor(ctx)
+	defer actor.finish()
+	generation := actor.AttachUpstreamSession(session, 17)
+	cancelled := make(chan struct{})
+	var cancelOnce sync.Once
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-pending-send-cancel",
+		SelectedChannelID: 17,
+		Candidate:         &ResponsesTurnAffinity{},
+		Quota:             &relay_util.Quota{},
+		Usage:             &types.Usage{},
+	}
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+	actor.setPendingSendCancel(attempt.AttemptID, func() {
+		cancelOnce.Do(func() {
+			close(cancelled)
+		})
+	})
+
+	actor.handleClientFrame(responsesWSTestClientTextFrame([]byte(`{"type":"response.cancel"}`)))
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("expected pending create send context to be canceled")
+	}
+	select {
+	case <-session.controlCalled:
+	case <-time.After(time.Second):
+		t.Fatal("expected early control cancel attempt")
+	}
+	if !actor.hasPendingCreateCancel(attempt.AttemptID) {
+		t.Fatal("expected pending cancel marker to survive early control send")
+	}
+	if got := atomic.LoadInt32(&session.controlCalls); got != 1 {
+		t.Fatalf("expected early control cancel attempt, got %d", got)
+	}
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendAttempted,
+		},
+	})
+	if actor.turns.pending.attempt != nil || actor.turns.active.attempt != attempt || actor.state != responsesWSStateInFlight {
+		t.Fatalf("expected pending attempt to commit before replayed cancel, pending=%+v active=%+v state=%v", actor.turns.pending.attempt, actor.turns.active.attempt, actor.state)
+	}
+	if actor.hasPendingCreateCancel(attempt.AttemptID) {
+		t.Fatal("expected pending cancel marker to be consumed after replay")
+	}
+	waitResponsesWSTestCondition(t, time.Second, time.Millisecond, func() bool {
+		return atomic.LoadInt32(&session.controlCalls) >= 2
+	}, func() string {
+		return fmt.Sprintf("expected replayed control cancel after create attempted, got %d calls", atomic.LoadInt32(&session.controlCalls))
+	})
+}
+
+func TestResponsesWSOpeningCancelCancelsSetup(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	cancelled := make(chan struct{})
+	var cancelOnce sync.Once
+	actor.setSetupCancel(func() {
+		cancelOnce.Do(func() {
+			close(cancelled)
+		})
+	})
+	actor.ReserveFirstTurnOpening(&responsesws.RawResponsesCreateFrame{})
+
+	actor.handleClientFrame(responsesWSTestClientTextFrame([]byte(`{"type":"response.cancel"}`)))
+
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("expected opening cancel to cancel setup")
+	}
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected opening cancel to close actor without adopting open result")
+	}
+}
+
+func TestResponsesWSIdleCancelDoesNotReachProvider(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	session := &responsesWSSendResultTestSession{
+		result: responsesws.ResponsesWSTransportSendResult{Status: responsesws.ResponsesWSTransportSendAttempted},
+	}
+	actor := NewResponsesWSSessionActor(ctx)
+	defer actor.finish()
+	actor.AttachUpstreamSession(session, 17)
+	actor.turns.pending.phase = responsesWSPendingTurnNone
+	actor.state = responsesWSStateIdle
+
+	actor.handleClientFrame(responsesWSTestClientTextFrame([]byte(`{"type":"response.cancel"}`)))
+
+	if atomic.LoadInt32(&session.resultCalls) != 0 {
+		t.Fatalf("expected idle cancel not to reach provider, result_calls=%d", session.resultCalls)
+	}
+}
+
+func TestResponsesWSSendWorkerPrefersTypedSendResult(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.upstream.sessionGeneration = "generation-typed"
+	session := &responsesWSSendResultTestSession{
+		result: responsesws.ResponsesWSTransportSendResult{Status: responsesws.ResponsesWSTransportSendAttempted},
+	}
+
+	actor.handleSendCommand(responsesWSSendCommand{
+		AttemptID:                 "attempt-typed",
+		UpstreamSessionGeneration: "generation-typed",
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeResponseCreate,
+		Session:                   session,
+		Frame:                     responsesWSFrameFromWireMessage(responsesWSTextMessageType, []byte(`{"type":"response.create"}`)),
+	})
 
 	event := readResponsesWSEvent(t, actor)
 	sendResult, ok := event.(ResponsesWSEventSendResult)
 	if !ok {
 		t.Fatalf("expected send result event, got %T", event)
 	}
-	if sendResult.Outcome != SendOutcomeNotSent || !errors.Is(sendResult.Err, errResponsesWSSendQueueFull) {
-		t.Fatalf("unexpected send queue full result: %+v", sendResult)
+	if sendResult.TransportResult.Status != responsesws.ResponsesWSTransportSendAttempted || sendResult.TransportResult.Err != nil {
+		t.Fatalf("expected attempted transport send result, got %+v", sendResult)
+	}
+	if sendResult.UpstreamSessionGeneration != "generation-typed" || sendResult.Purpose != ResponsesWSSendPurposeResponseCreate {
+		t.Fatalf("expected generation and purpose to be preserved, got %+v", sendResult)
+	}
+	if atomic.LoadInt32(&session.resultCalls) != 1 {
+		t.Fatalf("expected typed send path only, result_calls=%d", session.resultCalls)
+	}
+}
+
+func TestResponsesWSSendWorkerUsesRequiredTypedSendResult(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	session := &responsesWSTestSession{}
+
+	actor.handleSendCommand(responsesWSSendCommand{
+		AttemptID:         "attempt-legacy",
+		SelectedChannelID: 17,
+		Purpose:           ResponsesWSSendPurposeResponseCreate,
+		Session:           session,
+		Frame:             responsesWSFrameFromWireMessage(responsesWSTextMessageType, []byte(`{"type":"response.create"}`)),
+	})
+
+	event := readResponsesWSEvent(t, actor)
+	sendResult, ok := event.(ResponsesWSEventSendResult)
+	if !ok {
+		t.Fatalf("expected send result event, got %T", event)
+	}
+	if sendResult.TransportResult.Status != responsesws.ResponsesWSTransportSendAttempted || sendResult.TransportResult.Err != nil {
+		t.Fatalf("expected attempted transport result, got %+v", sendResult)
+	}
+}
+
+func TestResponsesWSSendWorkerReportsUnknownTypedStatusAsContractViolation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	session := &responsesWSSendResultTestSession{
+		result: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendStatus("future_status"),
+			Err:    errors.New("future status"),
+		},
 	}
 
-	actor.handleEvent(sendResult)
-	if !attempt.RolledBack || actor.pendingAttempt != nil {
-		t.Fatalf("expected actor event handling to rollback queue-full attempt, rolled=%v pending=%+v", attempt.RolledBack, actor.pendingAttempt)
+	actor.handleSendCommand(responsesWSSendCommand{
+		AttemptID:         "attempt-unknown",
+		SelectedChannelID: 17,
+		Purpose:           ResponsesWSSendPurposeResponseCreate,
+		Session:           session,
+		Frame:             responsesWSFrameFromWireMessage(responsesWSTextMessageType, []byte(`{"type":"response.create"}`)),
+	})
+
+	event := readResponsesWSEvent(t, actor)
+	violation, ok := event.(ResponsesWSEventTransportContractViolation)
+	if !ok {
+		t.Fatalf("expected transport contract violation event, got %T", event)
+	}
+	if violation.TransportResult.Status != responsesws.ResponsesWSTransportSendStatus("future_status") ||
+		!errors.Is(violation.Err, responsesws.ErrInvalidResponsesWSTransportSendResult) {
+		t.Fatalf("expected invalid transport result to fail loud, got %+v", violation)
+	}
+}
+
+func TestResponsesWSSendWorkerTreatsNotAttemptedReasonAsNotSent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	session := &responsesWSSendResultTestSession{
+		result: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendNotAttempted,
+			Reason: responsesws.ResponsesWSTransportSendReasonNoActiveBridgeCancel,
+		},
+	}
+
+	actor.handleSendCommand(responsesWSSendCommand{
+		AttemptID:         "attempt-cancel-noop",
+		SelectedChannelID: 17,
+		Purpose:           ResponsesWSSendPurposeResponseCancel,
+		Session:           session,
+		Frame:             responsesWSFrameFromWireMessage(responsesWSTextMessageType, []byte(`{"type":"response.cancel"}`)),
+	})
+
+	event := readResponsesWSEvent(t, actor)
+	sendResult, ok := event.(ResponsesWSEventSendResult)
+	if !ok {
+		t.Fatalf("expected send result event, got %T", event)
+	}
+	if sendResult.TransportResult.Status != responsesws.ResponsesWSTransportSendNotAttempted {
+		t.Fatalf("expected no-op not_attempted reason to stay not_attempted, got %+v", sendResult)
+	}
+}
+
+func TestResponsesWSActorProviderJournalUsesTypedOrigin(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.upstream.sessionGeneration = "generation-a"
+	actor.upstream.channelID = 17
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-a",
+		SelectedChannelID: 17,
+		Usage:             &types.Usage{},
+	}
+	if err := actor.BeginCandidate(attempt); err != nil {
+		t.Fatalf("begin candidate: %v", err)
+	}
+	if !actor.turns.pending.provider.journal.Project().IsZero() {
+		t.Fatalf("expected fresh pending evidence state, got %+v", actor.turns.pending.provider.journal.Project())
+	}
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: "stale-generation",
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.created","response":{"id":"resp_stale"}}`)),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
+	})
+	if actor.turns.pending.provider.journal.Project().HasActivity() {
+		t.Fatal("expected stale generation provider event not to update pending evidence")
+	}
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: "generation-a",
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.created","response":{"id":"resp_1"}}`)),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
+	})
+	if !actor.turns.pending.provider.journal.Project().HasActivity() ||
+		actor.turns.pending.provider.journal.Project().LastActivityOrigin() != responsesws.RecvDetailOriginProviderFrame {
+		t.Fatalf("expected typed provider frame evidence, got %+v", actor.turns.pending.provider.journal.Project())
+	}
+
+	actor.commitPendingAttempt(attempt)
+	if !actor.turns.pending.provider.journal.Project().IsZero() || !actor.turns.active.evidence.HasActivity() {
+		t.Fatalf("expected evidence projection to move from pending to active, pending=%+v active=%+v", actor.turns.pending.provider.journal.Project(), actor.turns.active.evidence)
+	}
+	actor.clearActiveTurn()
+	if !actor.turns.active.evidence.IsZero() {
+		t.Fatalf("expected active evidence to clear after turn teardown, got %+v", actor.turns.active.evidence)
+	}
+
+	next := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-b",
+		SelectedChannelID: 17,
+		Usage:             &types.Usage{},
+	}
+	if err := actor.BeginCandidate(next); err != nil {
+		t.Fatalf("begin next candidate: %v", err)
+	}
+	if !actor.turns.pending.provider.journal.Project().IsZero() {
+		t.Fatalf("expected sequential turn to get fresh evidence state, got %+v", actor.turns.pending.provider.journal.Project())
+	}
+}
+
+func TestResponsesWSActorProviderJournalRejectsUnknownDetailOrigin(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.upstream.sessionGeneration = "generation-a"
+	actor.upstream.channelID = 17
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-a",
+		SelectedChannelID: 17,
+		Usage:             &types.Usage{},
+	}
+	if err := actor.BeginCandidate(attempt); err != nil {
+		t.Fatalf("begin candidate: %v", err)
+	}
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: "generation-a",
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.completed","response":{"id":"resp_1","status":"completed"}}`)),
+		DetailOrigin:              responsesws.RecvDetailOrigin("future_origin"),
+	})
+	if actor.turns.pending.provider.journal.Project().HasActivity() {
+		t.Fatalf("expected unknown detail origin not to update provider evidence, got %+v", actor.turns.pending.provider.journal.Project())
+	}
+}
+
+func TestResponsesWSActorProviderEvidenceRequiresGenerationWhenBound(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.upstream.sessionGeneration = "generation-a"
+	actor.upstream.channelID = 17
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-a",
+		SelectedChannelID: 17,
+		Usage:             &types.Usage{},
+	}
+	if err := actor.BeginCandidate(attempt); err != nil {
+		t.Fatalf("begin candidate: %v", err)
+	}
+
+	actor.handleProviderUsageObserved(ResponsesWSEventProviderUsageObserved{
+		AttemptID:    responsesWSTestCurrentAttemptID(actor),
+		ChannelID:    17,
+		Usage:        &types.UsageEvent{InputTokens: 4, TotalTokens: 4},
+		DetailOrigin: responsesws.RecvDetailOriginProviderFrame,
+	})
+	if actor.turns.pending.provider.journal.Project().HasActivity() || attempt.Usage.TotalTokens != 0 {
+		t.Fatalf("expected missing generation evidence not to update state/accounting, evidence=%+v usage=%+v", actor.turns.pending.provider.journal.Project(), attempt.Usage)
 	}
 }
 
@@ -1873,7 +3428,7 @@ func TestResponsesWSWriteProxyLocalFailurePostsCloseIntent(t *testing.T) {
 	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
 
 	actor.writeProxyLocal([]byte(`{"type":"error"}`))
-	if actor.closed.Load() {
+	if actor.closing.closed.Load() {
 		t.Fatal("expected proxy-local write failure to post a close intent instead of closing directly")
 	}
 
@@ -1887,8 +3442,37 @@ func TestResponsesWSWriteProxyLocalFailurePostsCloseIntent(t *testing.T) {
 	}
 
 	actor.handleEvent(closeIntent)
-	if !actor.closed.Load() {
+	if !actor.closing.closed.Load() {
 		t.Fatal("expected actor loop close intent handling to close session")
+	}
+}
+
+func TestResponsesWSRequestCloseIntentIsOneShotPerActor(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	defer actor.finish()
+
+	actor.requestCloseIntent("first_close")
+	actor.requestCloseIntent("second_close")
+	actor.requestCloseIntent("third_close")
+
+	event := readResponsesWSEvent(t, actor)
+	closeIntent, ok := event.(ResponsesWSEventCloseIntent)
+	if !ok {
+		t.Fatalf("expected close intent event, got %T", event)
+	}
+	if closeIntent.Reason != "first_close" {
+		t.Fatalf("expected first close reason to win, got %q", closeIntent.Reason)
+	}
+	select {
+	case extra := <-actor.events:
+		t.Fatalf("expected repeated close intents to be suppressed, got %T", extra)
+	default:
 	}
 }
 
@@ -1956,21 +3540,21 @@ func TestResponsesWSNoTurnProviderEventFailsClosedAndAbortsSession(t *testing.T)
 	upstreamSessionGeneration := actor.AttachUpstreamSession(session, 17)
 
 	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
 		UpstreamSessionGeneration: upstreamSessionGeneration,
 		ChannelID:                 17,
 		Kind:                      ProviderDownstreamFrame,
-		MessageType:               responsesWSTextMessageType,
-		Payload:                   []byte(`{"type":"response.completed","response":{"id":"resp_no_turn"}}`),
-		Origin:                    runtimesession.RealtimePayloadOriginProvider,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.completed","response":{"id":"resp_no_turn"}}`)),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
 	})
 
-	if !actor.closed.Load() {
+	if !actor.closing.closed.Load() {
 		t.Fatalf("expected provider event without turn to fail closed")
 	}
 	if session.abortReason != "responses_ws_provider_event_without_turn" {
 		t.Fatalf("expected session abort on no-turn provider event, got %q", session.abortReason)
 	}
-	if actor.lastFinal != nil || actor.activeAttempt != nil {
+	if actor.turns.history.lastFinal != nil || actor.turns.active.attempt != nil {
 		t.Fatalf("expected no terminal classification or active turn commit, actor=%+v", actor)
 	}
 }
@@ -1988,18 +3572,19 @@ func TestResponsesWSProviderCloseAfterTerminalIsForwarded(t *testing.T) {
 	actor.SetBridge(bridge)
 	session := &responsesWSTestSession{}
 	upstreamSessionGeneration := actor.AttachUpstreamSession(session, 17)
-	actor.lastFinal = &types.OpenAIResponsesResponses{ID: "resp_done"}
+	actor.turns.history.lastFinal = &types.OpenAIResponsesResponses{ID: "resp_done"}
 
 	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
 		UpstreamSessionGeneration: upstreamSessionGeneration,
 		ChannelID:                 17,
-		Kind:                      ProviderDownstreamFrame,
-		MessageType:               responsesWSCloseMessageType,
-		Payload:                   []byte("bye"),
-		Origin:                    runtimesession.RealtimePayloadOriginProvider,
+		Kind:                      ProviderDownstreamClose,
+		CloseCode:                 int(wsconn.CloseNormalClosure),
+		CloseReason:               "bye",
+		DetailOrigin:              responsesws.RecvDetailOriginNativeProviderClose,
 	})
 
-	if !actor.closed.Load() {
+	if !actor.closing.closed.Load() {
 		t.Fatal("expected provider close to end the actor")
 	}
 	if session.abortReason == "responses_ws_provider_event_without_turn" {
@@ -2007,6 +3592,183 @@ func TestResponsesWSProviderCloseAfterTerminalIsForwarded(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&conn.controlCount); got != 1 {
 		t.Fatalf("expected provider close frame to be forwarded once, got %d", got)
+	}
+}
+
+func TestResponsesWSNativeProviderClosedAfterTurnClearedClosesSession(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	session := &responsesWSTestSession{}
+	generation := actor.AttachUpstreamSession(session, 17)
+	actor.turns.history.lastFinal = &types.OpenAIResponsesResponses{ID: "resp_done"}
+	actor.state = responsesWSStateIdle
+
+	actor.handleProviderClosed(ResponsesWSEventProviderClosed{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		AttemptID:                 "attempt-completed",
+		Code:                      int(wsconn.CloseNormalClosure),
+		Reason:                    "provider idle close",
+		DetailOrigin:              responsesws.RecvDetailOriginNativeProviderClose,
+		DetailPhase:               responsesws.RecvDetailPhaseMapProviderClose,
+	})
+
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected idle native provider close to close the actor")
+	}
+	if session.abortReason != "provider_closed" {
+		t.Fatalf("expected upstream abort reason provider_closed, got %q", session.abortReason)
+	}
+}
+
+func TestResponsesWSNativeRecvFailureAfterTurnClearedClosesSession(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	session := &responsesWSTestSession{}
+	generation := actor.AttachUpstreamSession(session, 17)
+	actor.turns.history.lastFinal = &types.OpenAIResponsesResponses{ID: "resp_done"}
+	actor.state = responsesWSStateIdle
+
+	actor.handleProviderRecvFailed(ResponsesWSEventProviderRecvFailed{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Err:                       io.EOF,
+		DetailOrigin:              responsesws.RecvDetailOriginNativeProviderEOF,
+		DetailPhase:               responsesws.RecvDetailPhaseMapProviderClose,
+	})
+
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected idle native provider EOF to close the actor")
+	}
+	if session.abortReason != "provider_recv_failed" {
+		t.Fatalf("expected upstream abort reason provider_recv_failed, got %q", session.abortReason)
+	}
+}
+
+func TestResponsesWSProviderRecvFailedDerivesCoarseOrigin(t *testing.T) {
+	event := ResponsesWSEventProviderRecvFailed{
+		AttemptID:    "attempt-origin",
+		DetailOrigin: responsesws.RecvDetailOriginNativeProviderEOF,
+		DetailPhase:  responsesws.RecvDetailPhaseMapProviderClose,
+		Err:          io.EOF,
+	}
+
+	upstreamEvent := upstreamEventFromProviderRecvFailed(event)
+	if responsesws.PayloadOriginForDetailOrigin(upstreamEvent.DetailOrigin) != responsesws.PayloadOriginProvider {
+		t.Fatalf("expected provider coarse origin to be derived, got %d", responsesws.PayloadOriginForDetailOrigin(upstreamEvent.DetailOrigin))
+	}
+	expected, ok := responsesws.ExpectedPayloadOriginForRecvDetailOrigin(upstreamEvent.DetailOrigin)
+	if !ok || expected != responsesws.PayloadOriginProvider || responsesws.PayloadOriginForDetailOrigin(upstreamEvent.DetailOrigin) != responsesws.PayloadOriginProvider {
+		t.Fatalf("expected coarse/detail origin combination to be valid, got %+v", upstreamEvent)
+	}
+	if responsesws.UpstreamEventHasProviderEvidence(upstreamEvent) {
+		t.Fatal("native provider EOF must not become provider request evidence")
+	}
+}
+
+func TestResponsesWSBridgeStreamEOFAfterTurnClearedDoesNotCloseSession(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	session := &responsesWSTestSession{}
+	generation := actor.AttachUpstreamSession(session, 17)
+	actor.turns.history.lastFinal = &types.OpenAIResponsesResponses{ID: "resp_done"}
+	actor.state = responsesWSStateIdle
+
+	actor.handleProviderRecvFailed(ResponsesWSEventProviderRecvFailed{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		DetailOrigin:              responsesws.RecvDetailOriginBridgeStreamEOF,
+	})
+
+	if actor.closing.closed.Load() {
+		t.Fatal("expected idle bridge stream EOF from an old turn not to close the session")
+	}
+	if session.abortReason != "" {
+		t.Fatalf("expected upstream session to remain open, got abort reason %q", session.abortReason)
+	}
+}
+
+func TestResponsesWSBridgeStreamLineLimitFailureSendsSafeProtocolError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-line-limit")
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	session := &responsesWSTestSession{}
+	generation := actor.AttachUpstreamSession(session, 17)
+	actor.turns.active.attempt = attempt
+	actor.turns.active.affinity = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.handleProviderRecvFailed(ResponsesWSEventProviderRecvFailed{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Err:                       requester.ErrStreamLineTooLarge,
+		DetailOrigin:              responsesws.RecvDetailOriginBridgeStreamError,
+	})
+
+	got, _ := conn.lastWrite.Load().(string)
+	assertResponsesWSErrorPayload(t, got, http.StatusBadGateway, "responses_ws_provider_protocol_error", "stream line exceeds configured read limit")
+	if !actor.closing.closed.Load() || session.abortReason != "provider_recv_failed" {
+		t.Fatalf("expected line-limit bridge failure to close session safely, closed=%v abort=%q", actor.closing.closed.Load(), session.abortReason)
+	}
+}
+
+func TestResponsesWSBridgeMalformedStreamPayloadSendsSafeProtocolError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-malformed-bridge-stream")
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	session := &responsesWSTestSession{}
+	generation := actor.AttachUpstreamSession(session, 17)
+	actor.turns.active.attempt = attempt
+	actor.turns.active.affinity = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.handleProviderRecvFailed(ResponsesWSEventProviderRecvFailed{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Err:                       responsesws.ErrInvalidBridgeStreamPayload,
+		DetailOrigin:              responsesws.RecvDetailOriginBridgeStreamError,
+	})
+
+	got, _ := conn.lastWrite.Load().(string)
+	assertResponsesWSErrorPayload(t, got, http.StatusBadGateway, "responses_ws_provider_protocol_error", "malformed responses websocket bridge stream payload")
+	if strings.Contains(got, "data:") {
+		t.Fatalf("expected malformed bridge payload error not to include raw upstream data, got %q", got)
+	}
+	if !actor.closing.closed.Load() || session.abortReason != "provider_recv_failed" {
+		t.Fatalf("expected malformed bridge stream failure to close session safely, closed=%v abort=%q", actor.closing.closed.Load(), session.abortReason)
 	}
 }
 
@@ -2022,9 +3784,9 @@ func TestResponsesWSProviderClosedFinalizesActiveAttemptAndForwardsSanitizedCode
 	session := &responsesWSTestSession{}
 	generation := actor.AttachUpstreamSession(session, 17)
 	lease := &responsesWSTestLease{}
-	actor.activeLease = lease
-	actor.activeAttempt = attempt
-	actor.activeChannelID = 17
+	actor.lease.activeLease = lease
+	actor.turns.active.attempt = attempt
+	actor.turns.active.channelID = 17
 	actor.state = responsesWSStateInFlight
 
 	actor.handleProviderClosed(ResponsesWSEventProviderClosed{
@@ -2036,14 +3798,17 @@ func TestResponsesWSProviderClosedFinalizesActiveAttemptAndForwardsSanitizedCode
 		ReceivedAt:                time.Now(),
 	})
 
-	if !actor.closed.Load() {
+	if !actor.closing.closed.Load() {
 		t.Fatal("expected provider close to close actor")
 	}
-	if actor.activeAttempt != nil || actor.activeChannelID != 0 || actor.state != responsesWSStateClosed {
-		t.Fatalf("expected provider close to clear active turn, active=%v channel=%d state=%v", actor.activeAttempt != nil, actor.activeChannelID, actor.state)
+	if actor.turns.active.attempt != nil || actor.turns.active.channelID != 0 || actor.state != responsesWSStateClosed {
+		t.Fatalf("expected provider close to clear active turn, active=%v channel=%d state=%v", actor.turns.active.attempt != nil, actor.turns.active.channelID, actor.state)
 	}
 	if !attempt.QuotaFinalized || attempt.RolledBack {
 		t.Fatalf("expected provider close to finalize quota without rollback, finalized=%v rolled=%v", attempt.QuotaFinalized, attempt.RolledBack)
+	}
+	if channel := readResponsesWSChannelFixture(t); channel.UsedQuota != 100 {
+		t.Fatalf("expected provider close to update channel used quota, got %d", channel.UsedQuota)
 	}
 	if got := atomic.LoadInt32(&lease.releases); got != 1 {
 		t.Fatalf("expected provider close to release active lease once, got %d", got)
@@ -2083,9 +3848,9 @@ func TestResponsesWSProviderClosedUsesManagedClientCloseWhenAvailable(t *testing
 	session := &responsesWSTestSession{}
 	generation := actor.AttachUpstreamSession(session, 17)
 	lease := &responsesWSTestLease{}
-	actor.activeLease = lease
-	actor.activeAttempt = attempt
-	actor.activeChannelID = 17
+	actor.lease.activeLease = lease
+	actor.turns.active.attempt = attempt
+	actor.turns.active.channelID = 17
 	actor.state = responsesWSStateInFlight
 
 	actor.handleProviderClosed(ResponsesWSEventProviderClosed{
@@ -2131,7 +3896,7 @@ func TestResponsesWSProviderClosedDuringPendingAttemptIsBuffered(t *testing.T) {
 	bridge := NewResponsesWSIOBridge(conn, actor)
 	actor.SetBridge(bridge)
 	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
-	actor.pendingAttempt = &ResponsesWSTurnAttempt{
+	actor.turns.pending.attempt = &ResponsesWSTurnAttempt{
 		AttemptID:         "attempt-provider-close-pending",
 		SelectedChannelID: 17,
 		Usage:             &types.Usage{},
@@ -2143,27 +3908,22 @@ func TestResponsesWSProviderClosedDuringPendingAttemptIsBuffered(t *testing.T) {
 		ChannelID:                 17,
 		Code:                      4408,
 		Reason:                    "quota exhausted",
+		DetailOrigin:              responsesws.RecvDetailOriginNativeProviderClose,
 		ReceivedAt:                time.Now(),
 	})
 
-	if actor.closed.Load() {
+	if actor.closing.closed.Load() {
 		t.Fatal("expected pending provider close to be buffered without closing actor")
 	}
 	if got := atomic.LoadInt32(&conn.controlCount); got != 0 {
 		t.Fatalf("expected no downstream close while provider close is pending, got %d", got)
 	}
-	if !actor.hasPendingProviderEvidence() || len(actor.pendingProviderEvents) != 1 {
-		t.Fatalf("expected provider close to be buffered as pending evidence, evidence=%v events=%d", actor.hasPendingProviderEvidence(), len(actor.pendingProviderEvents))
+	if !actor.hasPendingProviderEvidence() || len(actor.turns.pending.provider.journal.DownstreamEvents()) != 1 {
+		t.Fatalf("expected provider close to be buffered as pending evidence, evidence=%v events=%d", actor.hasPendingProviderEvidence(), len(actor.turns.pending.provider.journal.DownstreamEvents()))
 	}
-	buffered := actor.pendingProviderEvents[0]
-	if buffered.MessageType != responsesWSCloseMessageType || buffered.Origin != runtimesession.RealtimePayloadOriginProvider {
-		t.Fatalf("expected buffered provider close frame, got %+v", buffered)
-	}
-	if len(buffered.Payload) < 2 {
-		t.Fatalf("expected buffered close payload, got %q", buffered.Payload)
-	}
-	if code := int(binary.BigEndian.Uint16(buffered.Payload[:2])); code != 4408 {
-		t.Fatalf("expected buffered provider close code 4408, got %d", code)
+	buffered := actor.turns.pending.provider.journal.DownstreamEvents()[0]
+	if buffered.Kind != ProviderDownstreamClose || buffered.CloseCode != 4408 || buffered.CloseReason != "quota exhausted" || responsesws.PayloadOriginForDetailOrigin(buffered.DetailOrigin) != responsesws.PayloadOriginProvider {
+		t.Fatalf("expected buffered provider close event, got %+v", buffered)
 	}
 }
 
@@ -2180,9 +3940,7 @@ func TestResponsesWSProviderClosedInvalidCodeIsSanitized(t *testing.T) {
 func TestResponsesWSAmbiguousSendWithBufferedProviderEventWaitsForTerminal(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-ambiguous")
 
 	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
 	actor := NewResponsesWSSessionActor(ctx)
@@ -2190,48 +3948,664 @@ func TestResponsesWSAmbiguousSendWithBufferedProviderEventWaitsForTerminal(t *te
 	actor.SetBridge(bridge)
 	session := &responsesWSTestSession{}
 	upstreamSessionGeneration := actor.AttachUpstreamSession(session, 17)
-	attempt := &ResponsesWSTurnAttempt{
-		AttemptID:         "attempt-ambiguous",
-		SelectedChannelID: 17,
-		Usage:             &types.Usage{},
-	}
-	actor.pendingAttempt = attempt
+	actor.turns.pending.attempt = attempt
 	actor.state = responsesWSStatePendingSend
 
 	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
 		UpstreamSessionGeneration: upstreamSessionGeneration,
 		ChannelID:                 17,
 		Kind:                      ProviderDownstreamFrame,
-		MessageType:               responsesWSTextMessageType,
-		Payload:                   []byte(`{"type":"response.completed","response":{"id":"resp_buffered"}}`),
-		Origin:                    runtimesession.RealtimePayloadOriginProvider,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.completed","response":{"id":"resp_buffered"}}`)),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
 	})
-	if !actor.hasPendingProviderEvidence() || len(actor.pendingProviderEvents) != 1 {
+	if !actor.hasPendingProviderEvidence() || len(actor.turns.pending.provider.journal.DownstreamEvents()) != 1 {
 		t.Fatalf("expected buffered provider evidence before send result")
 	}
 
 	actor.handleSendResult(ResponsesWSEventSendResult{
 		AttemptID:         "attempt-ambiguous",
 		SelectedChannelID: 17,
-		Outcome:           SendOutcomeAmbiguous,
-		Err:               errors.New("write timeout"),
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendAmbiguous,
+			Err:    errors.New("write timeout"),
+		},
 	})
 
-	if actor.closed.Load() {
+	if actor.closing.closed.Load() {
 		t.Fatalf("expected ambiguous send with provider evidence to stay open")
 	}
-	if actor.lastFinal == nil || actor.lastFinal.ID != "resp_buffered" {
-		t.Fatalf("expected buffered terminal to be consumed, got %+v", actor.lastFinal)
+	if actor.turns.history.lastFinal == nil || actor.turns.history.lastFinal.ID != "resp_buffered" {
+		t.Fatalf("expected buffered terminal to be consumed, got %+v", actor.turns.history.lastFinal)
 	}
 	if got, _ := conn.lastWrite.Load().(string); strings.Contains(got, "responses_ws_send_ambiguous") {
 		t.Fatalf("expected no proxy-local ambiguous error after provider evidence, got %q", got)
 	}
-	if actor.activeAttempt != nil || actor.state != responsesWSStateIdle {
-		t.Fatalf("expected terminal to clear active attempt, state=%v active=%+v", actor.state, actor.activeAttempt)
+	if actor.turns.active.attempt != nil || actor.state != responsesWSStateIdle {
+		t.Fatalf("expected terminal to clear active attempt, state=%v active=%+v", actor.state, actor.turns.active.attempt)
 	}
 }
 
-func TestResponsesWSNotSentWithUsageOnlyProviderEvidenceFailsClosed(t *testing.T) {
+func TestResponsesWSAmbiguousSendWithProviderClosePreservesQuotaFloorWithoutTerminal(t *testing.T) {
+	ctx := setupResponsesWSQuotaFixture(t, 1000)
+	configureResponsesWSTokenPricingFloor(t, 100)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+	attempt.AttemptID = "attempt-ambiguous-close"
+	actor.turns.pending.attempt = attempt
+	actor.state = responsesWSStatePendingSend
+
+	actor.handleProviderClosed(ResponsesWSEventProviderClosed{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Code:                      int(wsconn.CloseGoingAway),
+		Reason:                    "provider closed",
+		DetailOrigin:              responsesws.RecvDetailOriginNativeProviderClose,
+		ReceivedAt:                time.Now(),
+	})
+	if !actor.hasPendingProviderEvidence() {
+		t.Fatal("expected native provider close to count as pending provider evidence")
+	}
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:         "attempt-ambiguous-close",
+		SelectedChannelID: 17,
+		Purpose:           ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendAmbiguous,
+			Err:    errors.New("write timeout"),
+		},
+	})
+
+	if attempt.RolledBack || !attempt.QuotaFinalized {
+		t.Fatalf("expected provider evidence without terminal to preserve quota floor, rolled=%v finalized=%v", attempt.RolledBack, attempt.QuotaFinalized)
+	}
+	if actor.turns.history.lastFinal != nil {
+		t.Fatalf("expected provider close without terminal payload not to record provider terminal, got %+v", actor.turns.history.lastFinal)
+	}
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected provider close replay to close actor")
+	}
+	if got, _ := conn.lastWrite.Load().(string); strings.Contains(got, "ambiguous_close_no_provider_evidence") {
+		t.Fatalf("expected no no-evidence ambiguous error after provider close evidence, got %q", got)
+	}
+}
+
+func TestResponsesWSBridgeStreamOpenedThenEOFUsesProviderEvidencePolicy(t *testing.T) {
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-bridge-opened")
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	actor.turns.pending.attempt = attempt
+	actor.state = responsesWSStatePendingSend
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		DetailOrigin:              responsesws.RecvDetailOriginBridgeStreamOpened,
+		ReceivedAt:                time.Now(),
+	})
+	if !actor.hasPendingProviderEvidence() {
+		t.Fatal("expected bridge_stream_opened to count as pending provider evidence")
+	}
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:         "attempt-bridge-opened",
+		SelectedChannelID: 17,
+		Purpose:           ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendAmbiguous,
+			Err:    errors.New("write timeout"),
+		},
+	})
+	if actor.closing.closed.Load() || actor.turns.active.attempt != attempt {
+		t.Fatalf("expected bridge open evidence to keep turn active after ambiguous send, closed=%v active=%+v", actor.closing.closed.Load(), actor.turns.active.attempt)
+	}
+
+	actor.handleProviderRecvFailed(ResponsesWSEventProviderRecvFailed{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		DetailOrigin:              responsesws.RecvDetailOriginBridgeStreamEOF,
+	})
+	if attempt.RolledBack || !attempt.QuotaFinalized {
+		t.Fatalf("expected bridge EOF after open evidence to preserve quota floor, rolled=%v finalized=%v", attempt.RolledBack, attempt.QuotaFinalized)
+	}
+	if got, _ := conn.lastWrite.Load().(string); strings.Contains(got, "ambiguous_close_no_provider_evidence") {
+		t.Fatalf("expected no no-evidence ambiguous error after bridge open evidence, got %q", got)
+	}
+}
+
+func TestResponsesWSRecvFailureUsesAccumulatedProviderEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		firstOrigin  responsesws.RecvDetailOrigin
+		failOrigin   responsesws.RecvDetailOrigin
+		firstPayload string
+	}{
+		{
+			name:         "provider stream then bridge stream error",
+			firstOrigin:  responsesws.RecvDetailOriginProviderStream,
+			failOrigin:   responsesws.RecvDetailOriginBridgeStreamError,
+			firstPayload: `{"type":"response.created","response":{"id":"resp_stream","status":"in_progress"}}`,
+		},
+		{
+			name:         "provider frame then native eof",
+			firstOrigin:  responsesws.RecvDetailOriginProviderFrame,
+			failOrigin:   responsesws.RecvDetailOriginNativeProviderEOF,
+			firstPayload: `{"type":"response.created","response":{"id":"resp_native","status":"in_progress"}}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-accumulated-evidence")
+
+			conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+			actor := NewResponsesWSSessionActor(ctx)
+			actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+			generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+			actor.turns.active.attempt = attempt
+			actor.turns.active.affinity = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
+			actor.turns.active.channelID = 17
+			actor.state = responsesWSStateInFlight
+
+			actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+				AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+				UpstreamSessionGeneration: generation,
+				ChannelID:                 17,
+				Kind:                      ProviderDownstreamFrame,
+				Frame:                     responsesWSTestProviderTextFrame([]byte(tc.firstPayload)),
+				DetailOrigin:              tc.firstOrigin,
+				ReceivedAt:                time.Now(),
+			})
+			if !actor.turns.active.evidence.HasActivity() {
+				t.Fatalf("expected first provider event to update accumulated evidence, got %+v", actor.turns.active.evidence)
+			}
+
+			actor.handleProviderRecvFailed(ResponsesWSEventProviderRecvFailed{
+				AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+				UpstreamSessionGeneration: generation,
+				ChannelID:                 17,
+				Err:                       errors.New("stream ended"),
+				DetailOrigin:              tc.failOrigin,
+			})
+			if attempt.RolledBack || !attempt.QuotaFinalized {
+				t.Fatalf("expected accumulated provider evidence to preserve quota floor on recv failure, rolled=%v finalized=%v", attempt.RolledBack, attempt.QuotaFinalized)
+			}
+			if got, _ := conn.lastWrite.Load().(string); strings.Contains(got, "ambiguous_close_no_provider_evidence") {
+				t.Fatalf("expected recv failure not to use no-evidence ambiguous policy, got %q", got)
+			}
+		})
+	}
+}
+
+func TestResponsesWSAdapterPanicDuringProviderFrameRecordsActivityWithoutTerminal(t *testing.T) {
+	ctx := setupResponsesWSQuotaFixture(t, 1000)
+	configureResponsesWSTokenPricingFloor(t, 100)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+	attempt.AttemptID = "attempt-adapter-panic"
+	actor.turns.active.attempt = attempt
+	actor.turns.active.affinity = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.handleProviderBusinessError(ResponsesWSEventProviderBusinessError{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Err:                       errors.New("adapter panic recovered"),
+		DetailOrigin:              responsesws.RecvDetailOriginAdapterPanic,
+		DetailPhase:               responsesws.RecvDetailPhaseHandleProviderFrame,
+	})
+
+	if !actor.turns.active.evidence.HasActivity() {
+		t.Fatalf("expected adapter panic in provider-frame phase to record provider activity, got %+v", actor.turns.active.evidence)
+	}
+	if actor.turns.active.evidence.LastActivityOrigin() != responsesws.RecvDetailOriginAdapterPanic {
+		t.Fatalf("expected adapter panic origin, got %q", actor.turns.active.evidence.LastActivityOrigin())
+	}
+	if actor.turns.history.lastFinal != nil {
+		t.Fatalf("expected no provider terminal side effect, got %+v", actor.turns.history.lastFinal)
+	}
+	if attempt.RolledBack || !attempt.QuotaFinalized {
+		t.Fatalf("expected adapter panic with provider activity to preserve quota floor, rolled=%v finalized=%v", attempt.RolledBack, attempt.QuotaFinalized)
+	}
+}
+
+func TestResponsesWSAdapterPanicDuringPrepareDoesNotProjectProviderActivity(t *testing.T) {
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID: "attempt-adapter-panic-prepare",
+		Quota:     &relay_util.Quota{},
+		Usage:     &types.Usage{},
+	}
+	projection := responsesWSTestProviderProjection(responsesws.UpstreamEvent{
+		DetailOrigin: responsesws.RecvDetailOriginAdapterPanic,
+		DetailPhase:  responsesws.RecvDetailPhasePrepareClientFrame,
+	})
+	actor := &ResponsesWSSessionActor{}
+	input := actor.buildSettlementInputFromAttempt(attempt, projection, "adapter_panic_prepare_client_frame", ResponsesWSZeroChargeProof{})
+	if input.Evidence.AnyProviderActivityEvidence {
+		t.Fatalf("expected prepare adapter panic not to project provider activity, input=%+v projection=%+v", input, projection)
+	}
+	decision := decideResponsesWSSettlement(input)
+	if decision.Action != ResponsesWSSettlementFinalizeFloor || !responsesWSSettlementHasFlag(decision, ResponsesWSSettlementFlagMissingSettlementFloor) {
+		t.Fatalf("expected prepare adapter panic to remain no-proof local floor path, got %+v", decision)
+	}
+}
+
+func TestResponsesWSBridgeOpenProviderErrorRollsBackPendingQuota(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	originalProcess := processChannelRelayErrorFunc
+	errCh := make(chan *types.OpenAIErrorWithStatusCode, 1)
+	processChannelRelayErrorFunc = func(_ context.Context, _ int, _ string, apiErr *types.OpenAIErrorWithStatusCode, _ int) {
+		errCh <- apiErr
+	}
+	defer func() {
+		processChannelRelayErrorFunc = originalProcess
+	}()
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	ctx.Set("responses_ws_selected_channel", &model.Channel{Id: 17, Name: "bridge-provider-error", Type: config.ChannelTypeOpenAI})
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-bridge-open-error",
+		SelectedChannelID: 17,
+		QuotaPreconsumed:  true,
+		Usage:             &types.Usage{},
+	}
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	actor.handleEvent(ResponsesWSEventBridgeOpenProviderError{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		Payload:                   responsesWSErrorPayload(http.StatusTooManyRequests, "provider_rate_limit", "provider rejected stream open"),
+		ProviderAPIError: &types.OpenAIErrorWithStatusCode{
+			OpenAIError: types.OpenAIError{
+				Type:    "rate_limit_error",
+				Code:    "rate_limit_exceeded",
+				Message: "provider rejected stream open",
+			},
+			StatusCode: http.StatusTooManyRequests,
+		},
+		Recoverable: false,
+	})
+
+	if !attempt.RolledBack || attempt.QuotaPreconsumed || attempt.QuotaFinalized {
+		t.Fatalf("expected bridge open provider error to rollback pending quota without finalize, attempt=%+v", attempt)
+	}
+	if actor.turns.pending.attempt != nil || actor.turns.active.attempt != nil {
+		t.Fatalf("expected bridge open provider error to release attempt state, pending=%+v active=%+v", actor.turns.pending.attempt, actor.turns.active.attempt)
+	}
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected bridge open provider error to close session")
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "provider_rate_limit") {
+		t.Fatalf("expected provider rejection payload, got %q", got)
+	}
+	if actor.turns.history.lastFinal != nil {
+		t.Fatalf("expected bridge open provider error not to submit terminal side effect, got %+v", actor.turns.history.lastFinal)
+	}
+	select {
+	case apiErr := <-errCh:
+		if apiErr == nil || apiErr.StatusCode != http.StatusTooManyRequests || apiErr.Type != "rate_limit_error" || apiErr.Code != "rate_limit_exceeded" {
+			t.Fatalf("expected bridge open provider rejection to be processed with provider status/code, got %#v", apiErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for bridge open provider error control-plane handling")
+	}
+}
+
+func TestResponsesWSBridgeOpenProviderErrorStopsActiveTurnWatchdog(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setResponsesWSTestViperInt(t, "responses_ws.active_turn_timeout_ms", 30000)
+
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-active-bridge-open-error")
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	actor.turns.active.attempt = attempt
+	actor.turns.active.evidence = responsesws.ProviderSettlementLogProjection{}
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+	actor.armActiveTurnWatchdog()
+	if actor.watchdog.activeTurnTimer == nil {
+		t.Fatal("expected active turn watchdog to be armed before bridge provider error")
+	}
+
+	var traces []ResponsesWSSettlementTrace
+	originalHook := responsesWSSettlementTraceHook
+	responsesWSSettlementTraceHook = func(trace ResponsesWSSettlementTrace) {
+		traces = append(traces, trace)
+	}
+	t.Cleanup(func() {
+		responsesWSSettlementTraceHook = originalHook
+	})
+
+	actor.handleEvent(ResponsesWSEventBridgeOpenProviderError{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		AttemptID:                 attempt.AttemptID,
+		Payload:                   responsesWSErrorPayload(http.StatusTooManyRequests, "provider_rate_limit", "provider rejected stream open"),
+		Recoverable:               true,
+	})
+
+	if actor.watchdog.activeTurnTimer != nil {
+		t.Fatal("expected bridge open provider error to stop active turn watchdog before clearing active attempt")
+	}
+	if actor.turns.active.attempt != nil || actor.state != responsesWSStateClosed || !actor.closing.closed.Load() {
+		t.Fatalf("expected active bridge provider error to clear active turn and close session, active=%+v state=%v closed=%v", actor.turns.active.attempt, actor.state, actor.closing.closed.Load())
+	}
+	if attempt.RolledBack || !attempt.QuotaFinalized {
+		t.Fatalf("expected active bridge provider error to finalize conservatively, attempt=%+v", attempt)
+	}
+	if len(traces) != 1 {
+		t.Fatalf("expected one active settlement trace, got %d", len(traces))
+	}
+	if traces[0].Input.ZeroChargeProof.Present() ||
+		traces[0].Input.ZeroChargeProof.Kind == ResponsesWSZeroChargeProofProviderRejectedBeforeStream ||
+		responsesWSTraceHasDetailOrigin(traces[0], responsesws.RecvDetailOriginBridgeOpenProviderError) {
+		t.Fatalf("active bridge provider error must not become rejected-before-stream proof, trace=%+v", traces[0])
+	}
+}
+
+func TestResponsesWSActiveBridgeOpenProviderErrorWithObservedUsageFinalizesObservedOrFloor(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-active-bridge-open-error-observed")
+	mergeResponsesWSUsageEvent(attempt.Usage, &types.UsageEvent{InputTokens: 150, TotalTokens: 150})
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	actor.turns.active.attempt = attempt
+	actor.turns.active.evidence = responsesWSTestProviderUsageProjection()
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+
+	var traces []ResponsesWSSettlementTrace
+	originalHook := responsesWSSettlementTraceHook
+	responsesWSSettlementTraceHook = func(trace ResponsesWSSettlementTrace) {
+		traces = append(traces, trace)
+	}
+	t.Cleanup(func() {
+		responsesWSSettlementTraceHook = originalHook
+	})
+
+	actor.handleEvent(ResponsesWSEventBridgeOpenProviderError{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		AttemptID:                 attempt.AttemptID,
+		Payload:                   responsesWSErrorPayload(http.StatusTooManyRequests, "provider_rate_limit", "provider rejected stream open"),
+		Recoverable:               true,
+	})
+
+	if attempt.RolledBack || !attempt.QuotaFinalized {
+		t.Fatalf("expected active observed bridge provider error to finalize, attempt=%+v", attempt)
+	}
+	if len(traces) != 1 {
+		t.Fatalf("expected one active settlement trace, got %d", len(traces))
+	}
+	trace := traces[0]
+	if trace.Decision.Action != ResponsesWSSettlementFinalizeObservedOrFloor ||
+		trace.Decision.ExpectedFinalQuota != 150 ||
+		trace.Applied.AppliedFinalQuota != 150 ||
+		trace.Input.ZeroChargeProof.Present() {
+		t.Fatalf("expected observed-or-floor settlement without zero proof, trace=%+v", trace)
+	}
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected active bridge provider error with observed usage to close session")
+	}
+}
+
+func TestResponsesWSBridgeLocalOpenErrorBeforeSendResultSettlesFloor(t *testing.T) {
+	ctx := setupResponsesWSQuotaFixture(t, 1000)
+	configureResponsesWSTokenPricingFloor(t, 100)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+	attempt.AttemptID = "attempt-bridge-local-open-error"
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	actor.handleEvent(ResponsesWSEventBridgeOpenLocalError{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		AttemptID:                 attempt.AttemptID,
+		Payload:                   responsesWSErrorPayload(http.StatusBadGateway, "ws_request_failed", "dial failed before provider status"),
+		Recoverable:               false,
+	})
+
+	if attempt.RolledBack || !attempt.QuotaFinalized {
+		t.Fatalf("expected bridge local open error before send result to settle floor, attempt=%+v", attempt)
+	}
+	if actor.turns.pending.attempt != nil || actor.turns.active.attempt != nil {
+		t.Fatalf("expected bridge local open error to release attempt state, pending=%+v active=%+v", actor.turns.pending.attempt, actor.turns.active.attempt)
+	}
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected non-recoverable bridge local open error to close session")
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "ws_request_failed") {
+		t.Fatalf("expected local open error payload, got %q", got)
+	}
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendAmbiguous,
+			Err:    errors.New("late local open failure"),
+		},
+	})
+	if attempt.RolledBack || !attempt.QuotaFinalized {
+		t.Fatalf("expected late send result not to double-settle finalized attempt, attempt=%+v", attempt)
+	}
+}
+
+func TestResponsesWSBridgeLocalOpenErrorAfterSendResultKeepsPrecisePayload(t *testing.T) {
+	ctx := setupResponsesWSQuotaFixture(t, 1000)
+	configureResponsesWSTokenPricingFloor(t, 100)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+	attempt.AttemptID = "attempt-bridge-local-open-error-late-event"
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	localOpenErr := common.StringErrorWrapperLocal("dial failed before provider status", "ws_request_failed", http.StatusBadGateway)
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendAmbiguous,
+			Err:    localOpenErr,
+		},
+	})
+
+	if attempt.RolledBack || attempt.QuotaFinalized {
+		t.Fatalf("expected send result to wait for local-open payload before settling quota, attempt=%+v", attempt)
+	}
+	if actor.turns.pending.attempt == nil || actor.turns.pending.provider.bridgeOpenLocalErrorAttemptID != attempt.AttemptID {
+		t.Fatalf("expected pending attempt to await bridge local open error, pending=%+v marker=%q", actor.turns.pending.attempt, actor.turns.pending.provider.bridgeOpenLocalErrorAttemptID)
+	}
+	if got, _ := conn.lastWrite.Load().(string); strings.Contains(got, "ambiguous_close_no_provider_evidence") {
+		t.Fatalf("expected no generic ambiguous payload before local-open event, got %q", got)
+	}
+
+	actor.handleEvent(ResponsesWSEventBridgeOpenLocalError{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		AttemptID:                 attempt.AttemptID,
+		Payload:                   responsesWSErrorPayload(http.StatusBadGateway, "ws_request_failed", "dial failed before provider status"),
+		Recoverable:               false,
+	})
+
+	if attempt.RolledBack || !attempt.QuotaFinalized {
+		t.Fatalf("expected late local-open event to settle floor once, attempt=%+v", attempt)
+	}
+	if actor.turns.pending.attempt != nil || actor.turns.pending.provider.bridgeOpenLocalErrorAttemptID != "" {
+		t.Fatalf("expected local-open event to release pending state, pending=%+v marker=%q", actor.turns.pending.attempt, actor.turns.pending.provider.bridgeOpenLocalErrorAttemptID)
+	}
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected non-recoverable bridge local open error to close session")
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "ws_request_failed") || strings.Contains(got, "ambiguous_close_no_provider_evidence") {
+		t.Fatalf("expected precise local open error payload, got %q", got)
+	}
+}
+
+func TestResponsesWSBridgeLocalOpenErrorWaitTimeoutReleasesPendingState(t *testing.T) {
+	originalTimeout := responsesWSBridgeLocalOpenErrorWaitTimeout
+	responsesWSBridgeLocalOpenErrorWaitTimeout = -1
+	t.Cleanup(func() {
+		responsesWSBridgeLocalOpenErrorWaitTimeout = originalTimeout
+	})
+
+	ctx := setupResponsesWSQuotaFixture(t, 1000)
+	configureResponsesWSTokenPricingFloor(t, 100)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+	attempt.AttemptID = "attempt-bridge-local-open-timeout"
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	localOpenErr := common.StringErrorWrapperLocal("dial failed before provider status", "ws_request_failed", http.StatusBadGateway)
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendAmbiguous,
+			Err:    localOpenErr,
+		},
+	})
+	if attempt.QuotaFinalized || actor.turns.pending.attempt != attempt || actor.turns.pending.provider.bridgeOpenLocalErrorAttemptID != attempt.AttemptID {
+		t.Fatalf("expected ambiguous local-open send result to await precise bridge event, attempt=%+v pending=%+v marker=%q", attempt, actor.turns.pending.attempt, actor.turns.pending.provider.bridgeOpenLocalErrorAttemptID)
+	}
+
+	actor.handleTimeout(ResponsesWSEventTimeout{
+		Reason:                    responsesWSBridgeLocalOpenErrorWaitTimeoutReason,
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		AttemptID:                 attempt.AttemptID,
+	})
+
+	if attempt.RolledBack || !attempt.QuotaFinalized {
+		t.Fatalf("expected local-open timeout to settle floor, attempt=%+v", attempt)
+	}
+	if actor.turns.pending.attempt != nil || actor.turns.active.attempt != nil || actor.turns.pending.phase != responsesWSPendingTurnNone || actor.state != responsesWSStateClosed {
+		t.Fatalf("expected local-open timeout to release pending state, pending=%+v active=%+v phase=%v state=%v", actor.turns.pending.attempt, actor.turns.active.attempt, actor.turns.pending.phase, actor.state)
+	}
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected local-open timeout to close uncertain bridge session")
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "ws_request_failed") || strings.Contains(got, "ambiguous_close_no_provider_evidence") {
+		t.Fatalf("expected generic ws_request_failed fallback payload, got %q", got)
+	}
+}
+
+func TestResponsesWSBridgeLocalOpenErrorWaitTimeoutIgnoredAfterBridgeEvent(t *testing.T) {
+	ctx := setupResponsesWSQuotaFixture(t, 1000)
+	configureResponsesWSTokenPricingFloor(t, 100)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+	attempt.AttemptID = "attempt-bridge-local-open-timeout-stale"
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	localOpenErr := common.StringErrorWrapperLocal("dial failed before provider status", "ws_request_failed", http.StatusBadGateway)
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendAmbiguous,
+			Err:    localOpenErr,
+		},
+	})
+	actor.handleEvent(ResponsesWSEventBridgeOpenLocalError{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		AttemptID:                 attempt.AttemptID,
+		Payload:                   responsesWSErrorPayload(http.StatusBadGateway, "ws_request_failed", "dial failed before provider status"),
+		Recoverable:               false,
+	})
+	precisePayload, _ := conn.lastWrite.Load().(string)
+
+	actor.handleTimeout(ResponsesWSEventTimeout{
+		Reason:                    responsesWSBridgeLocalOpenErrorWaitTimeoutReason,
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		AttemptID:                 attempt.AttemptID,
+	})
+
+	if attempt.RolledBack || !attempt.QuotaFinalized {
+		t.Fatalf("expected precise bridge event settlement to survive stale timeout, attempt=%+v", attempt)
+	}
+	if got, _ := conn.lastWrite.Load().(string); got != precisePayload || !strings.Contains(got, "ws_request_failed") || strings.Contains(got, "ambiguous_close_no_provider_evidence") {
+		t.Fatalf("expected stale timeout not to overwrite precise payload, before=%q after=%q", precisePayload, got)
+	}
+}
+
+func TestResponsesWSBridgeOpenProviderAPIErrorPreservesProviderStatus(t *testing.T) {
+	err := responsesws.NewBridgeOpenProviderError(http.StatusUnauthorized, "invalid_api_key", "authentication_error", "bad key")
+
+	apiErr := responsesWSBridgeOpenProviderAPIError(err)
+	if apiErr == nil {
+		t.Fatal("expected bridge open provider error to convert to provider api error")
+	}
+	if apiErr.StatusCode != http.StatusUnauthorized || apiErr.Code != "invalid_api_key" || apiErr.Type != "authentication_error" || apiErr.Message != "bad key" || apiErr.LocalError {
+		t.Fatalf("unexpected converted provider api error: %#v", apiErr)
+	}
+}
+
+func TestResponsesWSRejectedBeforeStreamSendResultRollsBackThenBridgeEventCloses(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	recorder := httptest.NewRecorder()
@@ -2240,27 +4614,927 @@ func TestResponsesWSNotSentWithUsageOnlyProviderEvidenceFailsClosed(t *testing.T
 
 	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
 	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-bridge-open-send-result",
+		SelectedChannelID: 17,
+		QuotaPreconsumed:  true,
+		Usage:             &types.Usage{},
+	}
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:                 "attempt-bridge-open-send-result",
+		UpstreamSessionGeneration: generation,
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendRejectedBeforeStream,
+		},
+	})
+
+	if attempt.RolledBack || !attempt.QuotaPreconsumed || attempt.QuotaFinalized {
+		t.Fatalf("expected rejected_before_stream send result to await bridge provider observation before rollback, attempt=%+v", attempt)
+	}
+	if actor.turns.pending.attempt != attempt || actor.turns.active.attempt != nil || actor.state != responsesWSStatePendingSend {
+		t.Fatalf("expected rejected_before_stream send result to retain pending attempt until bridge event, pending=%+v active=%+v state=%v", actor.turns.pending.attempt, actor.turns.active.attempt, actor.state)
+	}
+
+	actor.handleEvent(ResponsesWSEventBridgeOpenProviderError{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		AttemptID:                 attempt.AttemptID,
+		Payload:                   responsesWSErrorPayload(http.StatusTooManyRequests, "provider_rate_limit", "provider rejected stream open"),
+		Recoverable:               false,
+	})
+
+	if actor.turns.pending.attempt != nil || actor.turns.active.attempt != nil {
+		t.Fatalf("expected bridge open provider error to release attempt state, pending=%+v active=%+v state=%v", actor.turns.pending.attempt, actor.turns.active.attempt, actor.state)
+	}
+	if !attempt.RolledBack || attempt.QuotaPreconsumed || attempt.QuotaFinalized {
+		t.Fatalf("expected bridge open provider observation to rollback quota without finalize, attempt=%+v", attempt)
+	}
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected bridge open provider error after rejected_before_stream send to close session")
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "provider_rate_limit") {
+		t.Fatalf("expected provider rejection payload, got %q", got)
+	}
+	if actor.turns.history.lastFinal != nil {
+		t.Fatalf("expected bridge open provider error not to submit terminal side effect, got %+v", actor.turns.history.lastFinal)
+	}
+}
+
+func TestResponsesWSRejectedBeforeStreamSendResultFallbackReleasesPendingState(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	originalTimeout := responsesWSBridgeProviderRejectionWaitTimeout
+	responsesWSBridgeProviderRejectionWaitTimeout = -1
+	t.Cleanup(func() {
+		responsesWSBridgeProviderRejectionWaitTimeout = originalTimeout
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-bridge-open-send-result-fallback",
+		SelectedChannelID: 17,
+		QuotaPreconsumed:  true,
+		Usage:             &types.Usage{},
+	}
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendRejectedBeforeStream,
+		},
+	})
+
+	if attempt.RolledBack || actor.turns.pending.attempt != attempt || actor.state != responsesWSStatePendingSend {
+		t.Fatalf("expected rejected_before_stream send result to await bridge event before rollback, attempt=%+v pending=%+v state=%v", attempt, actor.turns.pending.attempt, actor.state)
+	}
+
+	actor.handleTimeout(ResponsesWSEventTimeout{
+		Reason:                    responsesWSBridgeProviderRejectionWaitTimeoutReason,
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		AttemptID:                 attempt.AttemptID,
+	})
+
+	if actor.turns.pending.attempt != nil || actor.turns.active.attempt != nil || actor.turns.pending.phase != responsesWSPendingTurnNone || actor.state != responsesWSStateIdle {
+		t.Fatalf("expected fallback to release settled pending attempt, pending=%+v active=%+v phase=%v state=%v", actor.turns.pending.attempt, actor.turns.active.attempt, actor.turns.pending.phase, actor.state)
+	}
+	if !attempt.RolledBack || attempt.QuotaPreconsumed || attempt.QuotaFinalized {
+		t.Fatalf("expected fallback to rollback unsettled attempt, attempt=%+v", attempt)
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, responsesWSBridgeProviderRejectionFallbackErrorCode) {
+		t.Fatalf("expected generic provider rejection fallback payload, got %q", got)
+	}
+}
+
+func TestResponsesWSRejectedBeforeStreamFallbackIgnoredAfterBridgeEvent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-bridge-open-send-result-fallback-ignored",
+		SelectedChannelID: 17,
+		QuotaPreconsumed:  true,
+		Usage:             &types.Usage{},
+	}
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendRejectedBeforeStream,
+		},
+	})
+	actor.handleEvent(ResponsesWSEventBridgeOpenProviderError{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		AttemptID:                 attempt.AttemptID,
+		Payload:                   responsesWSErrorPayload(http.StatusTooManyRequests, "provider_rate_limit", "provider rejected stream open"),
+		Recoverable:               true,
+	})
+
+	actor.handleTimeout(ResponsesWSEventTimeout{
+		Reason:                    responsesWSBridgeProviderRejectionWaitTimeoutReason,
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		AttemptID:                 attempt.AttemptID,
+	})
+
+	if actor.turns.pending.attempt != nil || actor.turns.active.attempt != nil || actor.state != responsesWSStateIdle || actor.closing.closed.Load() {
+		t.Fatalf("expected bridge event to release attempt and stale fallback to be ignored, pending=%+v active=%+v state=%v closed=%v", actor.turns.pending.attempt, actor.turns.active.attempt, actor.state, actor.closing.closed.Load())
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "provider_rate_limit") || strings.Contains(got, responsesWSBridgeProviderRejectionFallbackErrorCode) {
+		t.Fatalf("expected precise provider rejection payload to survive fallback, got %q", got)
+	}
+}
+
+func TestResponsesWSRecoverableRejectedBeforeStreamSendResultWaitsForBridgeEvent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-recoverable-send-result-first",
+		SelectedChannelID: 17,
+		QuotaPreconsumed:  true,
+		Usage:             &types.Usage{},
+	}
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendRejectedBeforeStream,
+		},
+	})
+
+	if attempt.RolledBack || actor.turns.pending.attempt != attempt || actor.closing.closed.Load() {
+		t.Fatalf("expected rejected_before_stream send result to await bridge event before rollback, attempt=%+v pending=%+v closed=%v", attempt, actor.turns.pending.attempt, actor.closing.closed.Load())
+	}
+
+	actor.handleEvent(ResponsesWSEventBridgeOpenProviderError{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		AttemptID:                 attempt.AttemptID,
+		Payload:                   responsesWSErrorPayload(http.StatusTooManyRequests, "provider_rate_limit", "provider rejected stream open"),
+		Recoverable:               true,
+	})
+
+	if actor.turns.pending.attempt != nil || actor.turns.active.attempt != nil || actor.state != responsesWSStateIdle || actor.closing.closed.Load() {
+		t.Fatalf("expected recoverable bridge event after send result to clear attempt and keep session open, pending=%+v active=%+v state=%v closed=%v", actor.turns.pending.attempt, actor.turns.active.attempt, actor.state, actor.closing.closed.Load())
+	}
+	if !attempt.RolledBack || attempt.QuotaPreconsumed || attempt.QuotaFinalized {
+		t.Fatalf("expected recoverable bridge event to rollback quota without finalize, attempt=%+v", attempt)
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "provider_rate_limit") {
+		t.Fatalf("expected provider rejection payload, got %q", got)
+	}
+	if actor.turns.history.lastFinal != nil {
+		t.Fatalf("expected bridge open provider error not to submit terminal side effect, got %+v", actor.turns.history.lastFinal)
+	}
+}
+
+func TestResponsesWSRecoverableBridgeOpenProviderErrorKeepsSessionOpenAfterSendResult(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-recoverable-bridge-open-error",
+		SelectedChannelID: 17,
+		QuotaPreconsumed:  true,
+		Usage:             &types.Usage{},
+	}
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	actor.handleEvent(ResponsesWSEventBridgeOpenProviderError{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		AttemptID:                 attempt.AttemptID,
+		Payload:                   responsesWSErrorPayload(http.StatusTooManyRequests, "provider_rate_limit", "provider rejected stream open"),
+		Recoverable:               true,
+	})
+
+	if actor.closing.closed.Load() || actor.turns.pending.attempt != attempt {
+		t.Fatalf("expected recoverable bridge provider error to wait for send result, closed=%v pending=%+v", actor.closing.closed.Load(), actor.turns.pending.attempt)
+	}
+	if got, _ := conn.lastWrite.Load().(string); got != "" {
+		t.Fatalf("expected provider rejection payload to wait for settlement, got %q", got)
+	}
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendRejectedBeforeStream,
+		},
+	})
+
+	if !attempt.RolledBack || actor.turns.pending.attempt != nil || actor.turns.active.attempt != nil || actor.state != responsesWSStateIdle || actor.closing.closed.Load() {
+		t.Fatalf("expected recoverable bridge rejection to rollback and keep session idle/open, attempt=%+v pending=%+v active=%+v state=%v closed=%v", attempt, actor.turns.pending.attempt, actor.turns.active.attempt, actor.state, actor.closing.closed.Load())
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "provider_rate_limit") {
+		t.Fatalf("expected provider rejection payload after settlement, got %q", got)
+	}
+}
+
+func TestResponsesWSBridgeOpenContinuationMissClearsDefaultPreviousResponseState(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	settings := config.ChannelAffinitySettings{
+		Enabled:           true,
+		DefaultTTLSeconds: 60,
+		Rules: []config.ChannelAffinityRule{
+			{
+				Name:            "responses-response-id",
+				Enabled:         true,
+				Kind:            "responses",
+				IncludeModel:    true,
+				IncludeRuleName: true,
+				RecordOnSuccess: true,
+				KeySources: []config.ChannelAffinityKeySource{
+					{Source: "request_field", Key: "previous_response_id", Alias: config.ChannelAffinityAliasResponseID},
+				},
+			},
+		},
+	}
+	settings.Normalize()
+
+	for _, eventFirst := range []bool{true, false} {
+		t.Run(fmt.Sprintf("event_first_%t", eventFirst), func(t *testing.T) {
+			manager := withChannelAffinitySettings(t, settings)
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+			request := &types.OpenAIResponsesRequest{Model: "gpt-5"}
+			candidate, err := PrepareResponsesTurnAffinity(ResponsesAffinityInput{Context: ctx, Request: request})
+			if err != nil {
+				t.Fatalf("prepare affinity: %v", err)
+			}
+			template := newChannelAffinityTemplate(ctx, channelAffinityKindResponses, "gpt-5", settings.Rules[0], "request_field", config.ChannelAffinityAliasResponseID, settings.DefaultTTLSeconds)
+			key := template.BuildKey("resp_stale_default")
+			manager.SetRecord(key, runtimeaffinity.Record{
+				ChannelID:         17,
+				ResumeFingerprint: "model:gpt-5",
+			}, time.Minute)
+
+			conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+			actor := NewResponsesWSSessionActor(ctx)
+			actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+			generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+			attempt := &ResponsesWSTurnAttempt{
+				AttemptID:                   "attempt-bridge-continuation-miss",
+				Candidate:                   candidate,
+				SelectedChannelID:           17,
+				AttemptedPreviousResponseID: "resp_stale_default",
+				QuotaPreconsumed:            true,
+				Usage:                       &types.Usage{},
+			}
+			actor.turns.pending.attempt = attempt
+			actor.turns.pending.provider.journal = responsesWSProviderJournal{}
+			actor.turns.pending.phase = responsesWSPendingTurnSend
+			actor.state = responsesWSStatePendingSend
+			actor.turns.history.lastFinal = &types.OpenAIResponsesResponses{ID: "resp_stale_default"}
+
+			sendResult := ResponsesWSEventSendResult{
+				AttemptID:                 attempt.AttemptID,
+				UpstreamSessionGeneration: generation,
+				SelectedChannelID:         17,
+				Purpose:                   ResponsesWSSendPurposeResponseCreate,
+				TransportResult: responsesws.ResponsesWSTransportSendResult{
+					Status: responsesws.ResponsesWSTransportSendRejectedBeforeStream,
+				},
+			}
+			providerEvent := ResponsesWSEventBridgeOpenProviderError{
+				UpstreamSessionGeneration: generation,
+				ChannelID:                 17,
+				AttemptID:                 attempt.AttemptID,
+				Payload:                   responsesWSPreviousResponseNotFoundPayload(),
+				Recoverable:               true,
+			}
+
+			if eventFirst {
+				actor.handleEvent(providerEvent)
+				actor.handleSendResult(sendResult)
+			} else {
+				actor.handleSendResult(sendResult)
+				actor.handleEvent(providerEvent)
+			}
+
+			if _, ok := manager.Get(key); ok {
+				t.Fatal("expected stale default previous_response_id affinity binding to be cleared")
+			}
+			if actor.turns.history.lastFinal != nil {
+				t.Fatalf("expected stale bridge default previous response to be cleared, got %+v", actor.turns.history.lastFinal)
+			}
+			if !attempt.RolledBack || actor.turns.pending.attempt != nil || actor.turns.active.attempt != nil || actor.state != responsesWSStateIdle || actor.closing.closed.Load() {
+				t.Fatalf("expected recoverable continuation miss to rollback and keep session idle/open, attempt=%+v pending=%+v active=%+v state=%v closed=%v", attempt, actor.turns.pending.attempt, actor.turns.active.attempt, actor.state, actor.closing.closed.Load())
+			}
+			if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "previous_response_not_found") {
+				t.Fatalf("expected continuation miss payload, got %q", got)
+			}
+		})
+	}
+}
+
+func TestResponsesWSUnknownProviderDetailOriginDoesNotFinalizeTerminal(t *testing.T) {
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-unknown-origin")
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	actor.turns.active.attempt = attempt
+	actor.turns.active.affinity = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.completed","response":{"id":"resp_unknown","status":"completed"}}`)),
+		DetailOrigin:              responsesws.RecvDetailOrigin("future_provider_origin"),
+	})
+
+	if actor.turns.history.lastFinal != nil {
+		t.Fatalf("expected unknown detail origin not to drive terminal side effect, final=%+v", actor.turns.history.lastFinal)
+	}
+	if attempt.RolledBack || !attempt.QuotaFinalized {
+		t.Fatalf("expected unknown detail origin close to preserve quota floor, finalized=%v rolled=%v", attempt.QuotaFinalized, attempt.RolledBack)
+	}
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected unknown provider detail origin to fail closed")
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "responses_ws_unknown_provider_event_origin") {
+		t.Fatalf("expected proxy-local protocol error for unknown origin, got %q", got)
+	}
+}
+
+func TestResponsesWSSyntheticCancelDefersAccountingUntilBridgeEOF(t *testing.T) {
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-synthetic-cancel-active")
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	actor.turns.active.attempt = attempt
+	actor.turns.active.affinity = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.cancelled","response":{"id":"resp_cancel","status":"cancelled"}}`)),
+		DetailOrigin:              responsesws.RecvDetailOriginSyntheticBridge,
+		ReceivedAt:                time.Now(),
+	})
+
+	if actor.turns.active.attempt != attempt || actor.turns.active.channelID != 17 || actor.state != responsesWSStateInFlight {
+		t.Fatalf("expected synthetic cancel to keep active turn pending, active=%+v channel=%d state=%v", actor.turns.active.attempt, actor.turns.active.channelID, actor.state)
+	}
+	if attempt.QuotaFinalized || attempt.RolledBack || !attempt.CompletedAt.IsZero() {
+		t.Fatalf("expected synthetic cancel not to finalize active quota, attempt=%+v", attempt)
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "resp_cancel") {
+		t.Fatalf("expected synthetic cancel payload to be forwarded, got %q", got)
+	}
+
+	actor.handleProviderRecvFailed(ResponsesWSEventProviderRecvFailed{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		DetailOrigin:              responsesws.RecvDetailOriginBridgeStreamEOF,
+	})
+	if actor.turns.active.attempt != nil || actor.turns.active.channelID != 0 || actor.state != responsesWSStateIdle || actor.closing.closed.Load() {
+		t.Fatalf("expected matching bridge EOF to clear active turn and keep session open, active=%+v channel=%d state=%v closed=%v", actor.turns.active.attempt, actor.turns.active.channelID, actor.state, actor.closing.closed.Load())
+	}
+	if !attempt.QuotaFinalized || attempt.RolledBack || attempt.CompletedAt.IsZero() {
+		t.Fatalf("expected bridge EOF after cancel to finalize active quota once, attempt=%+v", attempt)
+	}
+}
+
+func TestResponsesWSSyntheticCancelBuffersUntilPendingSendResult(t *testing.T) {
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-synthetic-cancel-pending")
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.cancelled","response":{"id":"resp_cancel_pending","status":"cancelled"}}`)),
+		DetailOrigin:              responsesws.RecvDetailOriginSyntheticBridge,
+		ReceivedAt:                time.Now(),
+	})
+	if actor.turns.pending.attempt != attempt || actor.turns.active.attempt != nil || len(actor.turns.pending.provider.journal.DownstreamEvents()) != 1 {
+		t.Fatalf("expected pending synthetic cancel to buffer, pending=%+v active=%+v events=%d", actor.turns.pending.attempt, actor.turns.active.attempt, len(actor.turns.pending.provider.journal.DownstreamEvents()))
+	}
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:                 "attempt-synthetic-cancel-pending",
+		UpstreamSessionGeneration: generation,
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendAttempted,
+		},
+	})
+
+	if actor.turns.pending.attempt != nil || actor.turns.active.attempt != attempt || actor.state != responsesWSStateInFlight {
+		t.Fatalf("expected buffered synthetic cancel to replay and keep active turn pending, pending=%+v active=%+v state=%v", actor.turns.pending.attempt, actor.turns.active.attempt, actor.state)
+	}
+	if attempt.QuotaFinalized || attempt.RolledBack || !attempt.CompletedAt.IsZero() {
+		t.Fatalf("expected replayed synthetic cancel not to finalize committed attempt, attempt=%+v", attempt)
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "resp_cancel_pending") {
+		t.Fatalf("expected buffered synthetic cancel payload to be forwarded after send result, got %q", got)
+	}
+
+	actor.handleProviderRecvFailed(ResponsesWSEventProviderRecvFailed{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		DetailOrigin:              responsesws.RecvDetailOriginBridgeStreamEOF,
+	})
+	if actor.turns.pending.attempt != nil || actor.turns.active.attempt != nil || actor.state != responsesWSStateIdle || actor.closing.closed.Load() {
+		t.Fatalf("expected bridge EOF after buffered synthetic cancel to clear turn, pending=%+v active=%+v state=%v closed=%v", actor.turns.pending.attempt, actor.turns.active.attempt, actor.state, actor.closing.closed.Load())
+	}
+	if !attempt.QuotaFinalized || attempt.RolledBack || attempt.CompletedAt.IsZero() {
+		t.Fatalf("expected bridge EOF after buffered cancel to finalize committed attempt, attempt=%+v", attempt)
+	}
+}
+
+func TestResponsesWSSyntheticCancelThenProviderTerminalProviderWins(t *testing.T) {
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-cancel-then-provider-terminal")
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	actor.turns.active.attempt = attempt
+	actor.turns.active.affinity = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.cancelled","response":{"id":"resp_synthetic","status":"cancelled"}}`)),
+		DetailOrigin:              responsesws.RecvDetailOriginSyntheticBridge,
+		ReceivedAt:                time.Now(),
+	})
+	if attempt.QuotaFinalized || actor.turns.active.attempt != attempt {
+		t.Fatalf("expected synthetic cancel to defer provider decision, attempt=%+v active=%+v", attempt, actor.turns.active.attempt)
+	}
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.completed","response":{"id":"resp_provider_wins_after_cancel","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`)),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderStream,
+		ReceivedAt:                time.Now(),
+	})
+	if actor.turns.history.lastFinal == nil || actor.turns.history.lastFinal.ID != "resp_provider_wins_after_cancel" || actor.turns.active.attempt != nil || actor.state != responsesWSStateIdle {
+		t.Fatalf("expected provider terminal to win and clear turn, final=%+v active=%+v state=%v", actor.turns.history.lastFinal, actor.turns.active.attempt, actor.state)
+	}
+	if !attempt.QuotaFinalized || attempt.RolledBack {
+		t.Fatalf("expected provider terminal to finalize once, attempt=%+v", attempt)
+	}
+
+	actor.handleProviderRecvFailed(ResponsesWSEventProviderRecvFailed{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		DetailOrigin:              responsesws.RecvDetailOriginBridgeStreamEOF,
+	})
+	if actor.closing.closed.Load() || !attempt.QuotaFinalized || attempt.RolledBack {
+		t.Fatalf("expected late bridge EOF after provider terminal to be ignored, closed=%v attempt=%+v", actor.closing.closed.Load(), attempt)
+	}
+}
+
+func TestResponsesWSSyntheticCancelDoesNotOverrideProviderTerminal(t *testing.T) {
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-terminal-before-cancel")
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	actor.turns.active.attempt = attempt
+	actor.turns.active.affinity = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.completed","response":{"id":"resp_provider_wins","status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderStream,
+		ReceivedAt:                time.Now(),
+	})
+	if actor.turns.history.lastFinal == nil || actor.turns.history.lastFinal.ID != "resp_provider_wins" || !attempt.QuotaFinalized {
+		t.Fatalf("expected provider terminal to finalize once, final=%+v finalized=%v", actor.turns.history.lastFinal, attempt.QuotaFinalized)
+	}
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.cancelled","response":{"id":"resp_synthetic","status":"cancelled"}}`)),
+		DetailOrigin:              responsesws.RecvDetailOriginSyntheticBridge,
+		ReceivedAt:                time.Now(),
+	})
+	if actor.turns.history.lastFinal == nil || actor.turns.history.lastFinal.ID != "resp_provider_wins" {
+		t.Fatalf("expected synthetic cancel not to override provider terminal, final=%+v", actor.turns.history.lastFinal)
+	}
+	if !attempt.QuotaFinalized || attempt.RolledBack {
+		t.Fatalf("expected synthetic cancel not to mutate finalized quota, finalized=%v rolled=%v", attempt.QuotaFinalized, attempt.RolledBack)
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "resp_synthetic") {
+		t.Fatalf("expected synthetic cancel payload to remain proxy-local downstream diagnostic, got %q", got)
+	}
+}
+
+func TestResponsesWSDuplicateProviderTerminalDoesNotDoubleFinalize(t *testing.T) {
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-duplicate-terminal")
+
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(&responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	actor.turns.active.attempt = attempt
+	actor.turns.active.affinity = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+
+	event := ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.completed","response":{"id":"resp_once","status":"completed","usage":{"input_tokens":2,"output_tokens":2,"total_tokens":4}}}`)),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
+		ReceivedAt:                time.Now(),
+	}
+	actor.handleProviderDownstream(event)
+	if actor.turns.history.lastFinal == nil || actor.turns.history.lastFinal.ID != "resp_once" || !attempt.QuotaFinalized {
+		t.Fatalf("expected first terminal to finalize once, final=%+v finalized=%v", actor.turns.history.lastFinal, attempt.QuotaFinalized)
+	}
+	firstUsage := *attempt.Usage
+
+	actor.handleProviderDownstream(event)
+	if actor.turns.history.lastFinal == nil || actor.turns.history.lastFinal.ID != "resp_once" {
+		t.Fatalf("expected duplicate terminal not to overwrite final, got %+v", actor.turns.history.lastFinal)
+	}
+	if !attempt.QuotaFinalized || attempt.Usage.TotalTokens != firstUsage.TotalTokens {
+		t.Fatalf("expected duplicate terminal not to mutate quota/usage, finalized=%v usage=%+v first=%+v", attempt.QuotaFinalized, attempt.Usage, firstUsage)
+	}
+}
+
+func TestResponsesWSAmbiguousSendWithoutProviderEvidencePreservesPreConsumedFloor(t *testing.T) {
+	ctx := setupResponsesWSQuotaFixture(t, 1000)
+	configureResponsesWSTokenPricingFloor(t, 100)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+	attempt.AttemptID = "attempt-ambiguous-no-evidence"
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.provider.journal.AppendDownstreamReplay(ResponsesWSEventProviderDownstream{
+		ChannelID: 17,
+	})
+	actor.turns.pending.provider.journal.bytes = 456
+	actor.turns.pending.provider.journal.AppendFailureReplay(ResponsesWSEventProviderRecvFailed{
+		ChannelID: 17,
+		Err:       errors.New("stale pending failure"),
+	})
+	actor.turns.pending.provider.bridgeOpenLocalErrorAttemptID = "stale-marker"
+	actor.state = responsesWSStatePendingSend
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:         "attempt-ambiguous-no-evidence",
+		SelectedChannelID: 17,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendAmbiguous,
+			Err:    errors.New("write timeout"),
+		},
+	})
+
+	if attempt.RolledBack || !attempt.QuotaFinalized {
+		t.Fatalf("expected ambiguous no-evidence send to settle floor, attempt=%+v", attempt)
+	}
+	if actor.turns.pending.attempt != nil || actor.turns.active.attempt != nil {
+		t.Fatalf("expected ambiguous no-evidence send to release attempt state, pending=%+v active=%+v", actor.turns.pending.attempt, actor.turns.active.attempt)
+	}
+	if len(actor.turns.pending.provider.journal.DownstreamEvents()) != 0 || actor.turns.pending.provider.journal.bytes != 0 || len(actor.turns.pending.provider.journal.Failures()) != 0 || !actor.turns.pending.provider.journal.Project().IsZero() || actor.turns.pending.provider.bridgeOpenLocalErrorAttemptID != "" {
+		t.Fatalf("expected ambiguous cleanup to clear pending provider state, events=%d bytes=%d failures=%d evidence=%+v marker=%q",
+			len(actor.turns.pending.provider.journal.DownstreamEvents()), actor.turns.pending.provider.journal.bytes, len(actor.turns.pending.provider.journal.Failures()), actor.turns.pending.provider.journal.Project(), actor.turns.pending.provider.bridgeOpenLocalErrorAttemptID)
+	}
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected ambiguous no-evidence send to close actor")
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "ambiguous_close_no_provider_evidence") {
+		t.Fatalf("expected proxy-local ambiguous error, got %q", got)
+	}
+}
+
+func TestResponsesWSPrepareFailureNotAttemptedRollsBackWithoutTerminalFinalize(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-prepare-failed",
+		SelectedChannelID: 17,
+		QuotaPreconsumed:  true,
+		Usage:             &types.Usage{},
+	}
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	prepareErr := errors.New("prepare failed before local write")
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:                 "attempt-prepare-failed",
+		UpstreamSessionGeneration: generation,
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendNotAttempted,
+			Err:    prepareErr,
+		},
+	})
+
+	if !attempt.RolledBack || attempt.QuotaPreconsumed || attempt.QuotaFinalized {
+		t.Fatalf("expected prepare failure to rollback without finalizing terminal quota, attempt=%+v", attempt)
+	}
+	if actor.turns.pending.attempt != nil || actor.turns.active.attempt != nil || actor.state != responsesWSStateIdle {
+		t.Fatalf("expected prepare failure to clear attempt state, pending=%+v active=%+v state=%v", actor.turns.pending.attempt, actor.turns.active.attempt, actor.state)
+	}
+	if actor.turns.history.lastFinal != nil {
+		t.Fatalf("expected prepare failure not to create terminal side effect, got %+v", actor.turns.history.lastFinal)
+	}
+}
+
+func TestResponsesWSNotSentUpstreamClosedAfterIgnoredNativeCloseClosesSession(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	session := &responsesWSTestSession{}
+	generation := actor.AttachUpstreamSession(session, 17)
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-new",
+		SelectedChannelID: 17,
+		QuotaPreconsumed:  true,
+		Usage:             &types.Usage{},
+	}
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	actor.handleProviderClosed(ResponsesWSEventProviderClosed{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		AttemptID:                 "attempt-old",
+		Code:                      int(wsconn.CloseNormalClosure),
+		Reason:                    "idle provider close",
+		Err:                       responsesws.ErrUpstreamClosed,
+		DetailOrigin:              responsesws.RecvDetailOriginNativeProviderClose,
+	})
+	if actor.closing.closed.Load() || actor.turns.pending.attempt != attempt || actor.state != responsesWSStatePendingSend {
+		t.Fatalf("expected stale-attempt native close to be ignored while current send is pending, closed=%v pending=%+v state=%v", actor.closing.closed.Load(), actor.turns.pending.attempt, actor.state)
+	}
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:                 "attempt-new",
+		UpstreamSessionGeneration: generation,
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendNotAttempted,
+			Err:    responsesws.ErrUpstreamClosed,
+		},
+	})
+
+	if !attempt.RolledBack || attempt.QuotaPreconsumed || attempt.QuotaFinalized {
+		t.Fatalf("expected upstream-closed NotSent to rollback without terminal finalization, attempt=%+v", attempt)
+	}
+	if !actor.closing.closed.Load() || actor.state != responsesWSStateClosed {
+		t.Fatalf("expected upstream-closed NotSent to close actor, closed=%v state=%v", actor.closing.closed.Load(), actor.state)
+	}
+	if session.abortReason != "upstream_closed_before_send" {
+		t.Fatalf("expected upstream session abort for upstream_closed_before_send, got %q", session.abortReason)
+	}
+	if got, _ := conn.lastControl.Load().(string); !strings.Contains(got, "upstream_closed_before_send") {
+		t.Fatalf("expected downstream close control for upstream_closed_before_send, got %q", got)
+	}
+}
+
+func TestResponsesWSAmbiguousSendWithImmediateNativeEOFWithoutEvidenceSettlesFloor(t *testing.T) {
+	ctx := setupResponsesWSQuotaFixture(t, 1000)
+	configureResponsesWSTokenPricingFloor(t, 100)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+	attempt.AttemptID = "attempt-eof-no-evidence"
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	actor.handleProviderRecvFailed(ResponsesWSEventProviderRecvFailed{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Err:                       io.EOF,
+		DetailOrigin:              responsesws.RecvDetailOriginNativeProviderEOF,
+	})
+	if actor.closing.closed.Load() || actor.turns.pending.attempt != attempt {
+		t.Fatalf("expected immediate native EOF without evidence to wait for send result, closed=%v pending=%+v", actor.closing.closed.Load(), actor.turns.pending.attempt)
+	}
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:                 "attempt-eof-no-evidence",
+		UpstreamSessionGeneration: generation,
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendAmbiguous,
+			Err:    errors.New("write failed"),
+		},
+	})
+	if attempt.RolledBack || !attempt.QuotaFinalized {
+		t.Fatalf("expected ambiguous send plus EOF without evidence to settle floor, attempt=%+v", attempt)
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "ambiguous_close_no_provider_evidence") {
+		t.Fatalf("expected ambiguous no-evidence error, got %q", got)
+	}
+}
+
+func TestResponsesWSAmbiguousSendWithImmediateBridgeStreamErrorWithoutEvidenceSettlesFloor(t *testing.T) {
+	ctx := setupResponsesWSQuotaFixture(t, 1000)
+	configureResponsesWSTokenPricingFloor(t, 100)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+	attempt.AttemptID = "attempt-bridge-stream-error-no-evidence"
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	streamErr := errors.New("bridge stream failed before send result")
+	actor.handleProviderRecvFailed(ResponsesWSEventProviderRecvFailed{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Err:                       streamErr,
+		DetailOrigin:              responsesws.RecvDetailOriginBridgeStreamError,
+	})
+	if actor.closing.closed.Load() || actor.turns.pending.attempt != attempt {
+		t.Fatalf("expected immediate bridge stream error without evidence to wait for send result, closed=%v pending=%+v", actor.closing.closed.Load(), actor.turns.pending.attempt)
+	}
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:                 "attempt-bridge-stream-error-no-evidence",
+		UpstreamSessionGeneration: generation,
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendAmbiguous,
+			Err:    errors.New("write failed"),
+		},
+	})
+	if attempt.RolledBack || !attempt.QuotaFinalized {
+		t.Fatalf("expected ambiguous send plus bridge stream error without evidence to settle floor, attempt=%+v", attempt)
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "ambiguous_close_no_provider_evidence") {
+		t.Fatalf("expected ambiguous no-evidence error, got %q", got)
+	}
+}
+
+func TestResponsesWSNotSentWithUsageOnlyProviderEvidenceSettlesWithoutFailClosed(t *testing.T) {
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-usage")
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
 	bridge := NewResponsesWSIOBridge(conn, actor)
 	actor.SetBridge(bridge)
 	session := &responsesWSTestSession{}
 	upstreamSessionGeneration := actor.AttachUpstreamSession(session, 17)
-	attempt := &ResponsesWSTurnAttempt{
-		AttemptID:              "attempt-usage",
-		SelectedChannelID:      17,
-		SendOutcome:            SendOutcomeNotSent,
-		Usage:                  &types.Usage{},
-		QuotaPreconsumed:       true,
-		QuotaFinalized:         true,
-		QuotaEventSinkAttached: false,
+	attempt.TransportResult = responsesws.ResponsesWSTransportSendResult{
+		Status: responsesws.ResponsesWSTransportSendNotAttempted,
+		Reason: responsesws.ResponsesWSTransportSendReasonNoActiveBridgeCancel,
 	}
-	actor.pendingAttempt = attempt
+	actor.turns.pending.attempt = attempt
 	actor.state = responsesWSStatePendingSend
 
+	conflictCalls := 0
+	originalRecorder := recordResponsesWSSettlementConflict
+	recordResponsesWSSettlementConflict = func(kind string) {
+		if kind != "not_sent_with_provider_evidence" {
+			t.Fatalf("unexpected conflict kind %q", kind)
+		}
+		conflictCalls++
+	}
+	t.Cleanup(func() {
+		recordResponsesWSSettlementConflict = originalRecorder
+	})
+
 	actor.handleProviderUsageObserved(ResponsesWSEventProviderUsageObserved{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
 		UpstreamSessionGeneration: upstreamSessionGeneration,
 		ChannelID:                 17,
 		Usage:                     &types.UsageEvent{InputTokens: 4, OutputTokens: 2, TotalTokens: 6},
-		Origin:                    runtimesession.RealtimePayloadOriginProvider,
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
 	})
 	if !actor.hasPendingProviderEvidence() {
 		t.Fatalf("expected usage-only provider event to count as pending evidence")
@@ -2272,21 +5546,83 @@ func TestResponsesWSNotSentWithUsageOnlyProviderEvidenceFailsClosed(t *testing.T
 	actor.handleSendResult(ResponsesWSEventSendResult{
 		AttemptID:         "attempt-usage",
 		SelectedChannelID: 17,
-		Outcome:           SendOutcomeNotSent,
-		Err:               runtimesession.ErrSessionClosed,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendNotAttempted,
+			Reason: responsesws.ResponsesWSTransportSendReasonNoActiveBridgeCancel,
+		},
 	})
 
-	if !actor.closed.Load() {
-		t.Fatalf("expected not-sent proof conflict with usage evidence to fail closed")
+	if actor.closing.closed.Load() {
+		t.Fatalf("expected not-sent proof conflict with usage evidence not to fail closed")
 	}
-	if attempt.RolledBack {
-		t.Fatalf("expected proof conflict not to rollback quota")
+	if attempt.RolledBack || !attempt.QuotaFinalized {
+		t.Fatalf("expected proof conflict to settle conservatively, attempt=%+v", attempt)
 	}
-	if session.abortReason != "responses_ws_not_sent_with_provider_evidence" {
-		t.Fatalf("expected session abort for proof conflict, got %q", session.abortReason)
+	if actor.turns.pending.attempt != nil || actor.turns.pending.phase != responsesWSPendingTurnNone {
+		t.Fatalf("expected proof conflict to clear pending turn, pending=%+v phase=%v", actor.turns.pending.attempt, actor.turns.pending.phase)
 	}
-	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "responses_ws_not_sent_with_provider_evidence") {
-		t.Fatalf("expected protocol violation payload for proof conflict, got %q", got)
+	if session.abortReason != "" {
+		t.Fatalf("expected no protocol violation abort, got %q", session.abortReason)
+	}
+	if conflictCalls != 1 {
+		t.Fatalf("expected one settlement conflict metric, got %d", conflictCalls)
+	}
+}
+
+func TestResponsesWSProofConflictSettlementFailurePreservesPendingAttempt(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-proof-conflict-settlement-fails",
+		SelectedChannelID: 17,
+		Quota:             &relay_util.Quota{},
+		Usage:             &types.Usage{},
+	}
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.provider.journal = responsesWSTestProviderFrameJournal()
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	var traces []ResponsesWSSettlementTrace
+	originalHook := responsesWSSettlementTraceHook
+	responsesWSSettlementTraceHook = func(trace ResponsesWSSettlementTrace) {
+		traces = append(traces, trace)
+	}
+	t.Cleanup(func() {
+		responsesWSSettlementTraceHook = originalHook
+	})
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:         attempt.AttemptID,
+		SelectedChannelID: 17,
+		Purpose:           ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendNotAttempted,
+			Err:    responsesws.ErrUpstreamClosed,
+		},
+	})
+
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected proof-conflict settlement failure to close session")
+	}
+	if actor.turns.pending.attempt != attempt {
+		t.Fatalf("expected failed proof-conflict settlement to preserve pending attempt, pending=%+v", actor.turns.pending.attempt)
+	}
+	if attempt.RolledBack || attempt.QuotaFinalized {
+		t.Fatalf("expected failed proof-conflict settlement not to mutate accounting state, attempt=%+v", attempt)
+	}
+	if len(traces) != 0 {
+		t.Fatalf("expected failed settlement not to emit successful trace, got %+v", traces)
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "quota_settlement_failed") {
+		t.Fatalf("expected quota settlement failure payload, got %q", got)
 	}
 }
 
@@ -2300,7 +5636,7 @@ func TestResponsesWSPendingLocalRollbackClearsBusyState(t *testing.T) {
 	actor := NewResponsesWSSessionActor(ctx)
 	actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
 	actor.state = responsesWSStateIdle
-	actor.pendingTurnPhase = responsesWSPendingTurnNone
+	actor.turns.pending.phase = responsesWSPendingTurnNone
 	attempt := &ResponsesWSTurnAttempt{
 		SelectedChannelID: 17,
 		Usage:             &types.Usage{},
@@ -2309,18 +5645,18 @@ func TestResponsesWSPendingLocalRollbackClearsBusyState(t *testing.T) {
 	if err := actor.BeginCandidate(attempt); err != nil {
 		t.Fatalf("expected pending attempt to begin, got %v", err)
 	}
-	if !actor.isBusy() || actor.pendingTurnPhase != responsesWSPendingTurnPrepare || actor.state != responsesWSStatePendingPrepare {
-		t.Fatalf("expected BeginCandidate to make actor busy, state=%v phase=%v", actor.state, actor.pendingTurnPhase)
+	if !actor.isBusy() || actor.turns.pending.phase != responsesWSPendingTurnPrepare || actor.state != responsesWSStatePendingPrepare {
+		t.Fatalf("expected BeginCandidate to make actor busy, state=%v phase=%v", actor.state, actor.turns.pending.phase)
 	}
-	if err := actor.rollbackPendingAttemptBeforeLocalWrite("rewrite_failed"); err != nil {
+	if err := actor.settlePendingAttemptBeforeLocalWrite("rewrite_failed", responsesWSZeroChargeProof(ResponsesWSZeroChargeProofRewriteFailed, "rewrite_failed")); err != nil {
 		t.Fatalf("expected rollback cleanup to succeed, got %v", err)
 	}
 
 	if actor.isBusy() {
-		t.Fatalf("expected local rollback to leave actor idle, state=%v phase=%v pending=%+v", actor.state, actor.pendingTurnPhase, actor.pendingAttempt)
+		t.Fatalf("expected local rollback to leave actor idle, state=%v phase=%v pending=%+v", actor.state, actor.turns.pending.phase, actor.turns.pending.attempt)
 	}
-	if actor.pendingAttempt != nil || actor.pendingTurnPhase != responsesWSPendingTurnNone || actor.state != responsesWSStateIdle {
-		t.Fatalf("expected pending turn transaction to be cleared, state=%v phase=%v pending=%+v", actor.state, actor.pendingTurnPhase, actor.pendingAttempt)
+	if actor.turns.pending.attempt != nil || actor.turns.pending.phase != responsesWSPendingTurnNone || actor.state != responsesWSStateIdle {
+		t.Fatalf("expected pending turn transaction to be cleared, state=%v phase=%v pending=%+v", actor.state, actor.turns.pending.phase, actor.turns.pending.attempt)
 	}
 }
 
@@ -2340,12 +5676,12 @@ func TestResponsesWSSubsequentModelMismatchRejectsBeforeAdmission(t *testing.T) 
 	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
 	actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
 	actor.state = responsesWSStateIdle
-	actor.pendingTurnPhase = responsesWSPendingTurnNone
+	actor.turns.pending.phase = responsesWSPendingTurnNone
 
 	actor.startSubsequentTurn([]byte(`{"type":"response.create","model":"gpt-4","input":[]}`), time.Now())
 
-	if actor.pendingAttempt != nil || actor.pendingTurnPhase != responsesWSPendingTurnNone || actor.state != responsesWSStateIdle {
-		t.Fatalf("expected model mismatch before attempt creation, state=%v phase=%v pending=%+v", actor.state, actor.pendingTurnPhase, actor.pendingAttempt)
+	if actor.turns.pending.attempt != nil || actor.turns.pending.phase != responsesWSPendingTurnNone || actor.state != responsesWSStateIdle {
+		t.Fatalf("expected model mismatch before attempt creation, state=%v phase=%v pending=%+v", actor.state, actor.turns.pending.phase, actor.turns.pending.attempt)
 	}
 	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, `"code":"responses_ws_model_mismatch"`) {
 		t.Fatalf("expected model mismatch error, got %q", got)
@@ -2363,16 +5699,30 @@ func TestResponsesWSClientFrameParseErrorUsesStaticMessage(t *testing.T) {
 	actor := NewResponsesWSSessionActor(ctx)
 	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
 
-	actor.handleClientFrame(ResponsesWSEventClientFrame{
-		MessageType: responsesWSTextMessageType,
-		Payload:     []byte(`{"type":`),
-	})
+	actor.handleClientFrame(responsesWSTestClientTextFrame([]byte(`{"type":`)))
 
 	got, _ := conn.lastWrite.Load().(string)
 	assertResponsesWSErrorPayload(t, got, http.StatusBadRequest, "invalid_event", responsesWSMessageInvalidWebsocketEvent)
 	if strings.Contains(got, "unexpected end of JSON input") {
 		t.Fatalf("expected client payload to hide parser detail, got %q", got)
 	}
+}
+
+func TestResponsesWSClientFrameRejectsDuplicateKeyCancelEnvelope(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+
+	actor.handleClientFrame(responsesWSTestClientTextFrame([]byte(`{"type":"response.create","model":"gpt-5","type":"response.cancel"}`)))
+
+	got, _ := conn.lastWrite.Load().(string)
+	assertResponsesWSErrorPayload(t, got, http.StatusBadRequest, "invalid_event", responsesWSMessageInvalidWebsocketEvent)
 }
 
 func TestResponsesWSSubsequentFrameParseErrorUsesInvalidResponseCreate(t *testing.T) {
@@ -2426,12 +5776,12 @@ func TestResponsesWSSubsequentRewriteFailureUsesInternalErrorCode(t *testing.T) 
 	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
 	actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
 	actor.state = responsesWSStateIdle
-	actor.pendingTurnPhase = responsesWSPendingTurnNone
+	actor.turns.pending.phase = responsesWSPendingTurnNone
 
 	actor.startSubsequentTurn([]byte(`{"type":"response.create","model":"gpt-5","input":[]}`), time.Now())
 
-	if actor.pendingAttempt != nil || actor.pendingTurnPhase != responsesWSPendingTurnNone || actor.state != responsesWSStateIdle {
-		t.Fatalf("expected rewrite rollback to clear pending turn, state=%v phase=%v pending=%+v", actor.state, actor.pendingTurnPhase, actor.pendingAttempt)
+	if actor.turns.pending.attempt != nil || actor.turns.pending.phase != responsesWSPendingTurnNone || actor.state != responsesWSStateIdle {
+		t.Fatalf("expected rewrite rollback to clear pending turn, state=%v phase=%v pending=%+v", actor.state, actor.turns.pending.phase, actor.turns.pending.attempt)
 	}
 	got, _ := conn.lastWrite.Load().(string)
 	assertResponsesWSErrorPayload(t, got, http.StatusInternalServerError, "responses_ws_payload_rewrite_failed", "internal payload rewrite failed")
@@ -2463,12 +5813,12 @@ func TestResponsesWSSubsequentRPMFailureDoesNotCreateAttempt(t *testing.T) {
 	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
 	actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
 	actor.state = responsesWSStateIdle
-	actor.pendingTurnPhase = responsesWSPendingTurnNone
+	actor.turns.pending.phase = responsesWSPendingTurnNone
 
 	actor.startSubsequentTurn([]byte(`{"type":"response.create","model":"gpt-5","input":[]}`), time.Now())
 
-	if actor.pendingAttempt != nil || actor.pendingTurnPhase != responsesWSPendingTurnNone || actor.state != responsesWSStateIdle {
-		t.Fatalf("expected RPM failure before attempt creation, state=%v phase=%v pending=%+v", actor.state, actor.pendingTurnPhase, actor.pendingAttempt)
+	if actor.turns.pending.attempt != nil || actor.turns.pending.phase != responsesWSPendingTurnNone || actor.state != responsesWSStateIdle {
+		t.Fatalf("expected RPM failure before attempt creation, state=%v phase=%v pending=%+v", actor.state, actor.turns.pending.phase, actor.turns.pending.attempt)
 	}
 	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, `"code":"api_requests_not_allowed"`) || strings.Contains(got, "API requests are not allowed") {
 		t.Fatalf("expected local RPM error, got %q", got)
@@ -2499,10 +5849,10 @@ func TestResponsesWSSubsequentStalePreflightRejectsBeforeRPMAndCloses(t *testing
 	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
 	actor := NewResponsesWSSessionActor(ctx)
 	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
-	session := &responsesWSTestSession{preflightErr: runtimesession.NewClientPayloadError(runtimesession.ErrStaleResponsesWSContinuation, responsesWSPreviousResponseNotFoundPayload())}
+	session := &responsesWSTestSession{preflightErr: responsesws.NewClientPayloadError(responsesws.ErrStaleContinuation, responsesWSPreviousResponseNotFoundPayload())}
 	actor.AttachUpstreamSession(session, 17)
 	actor.state = responsesWSStateIdle
-	actor.pendingTurnPhase = responsesWSPendingTurnNone
+	actor.turns.pending.phase = responsesWSPendingTurnNone
 
 	actor.startSubsequentTurn([]byte(`{"type":"response.create","event_id":"evt_stale","model":"gpt-5","previous_response_id":"resp_old","input":[]}`), time.Now())
 
@@ -2512,10 +5862,10 @@ func TestResponsesWSSubsequentStalePreflightRejectsBeforeRPMAndCloses(t *testing
 	if session.preflightEventID != "evt_stale" || session.preflightRequest == nil || session.preflightRequest.PreviousResponseID != "resp_old" {
 		t.Fatalf("expected preflight request to carry event and previous response, event=%q request=%+v", session.preflightEventID, session.preflightRequest)
 	}
-	if actor.pendingAttempt != nil || actor.pendingTurnPhase != responsesWSPendingTurnNone {
-		t.Fatalf("expected stale preflight before attempt creation, phase=%v pending=%+v", actor.pendingTurnPhase, actor.pendingAttempt)
+	if actor.turns.pending.attempt != nil || actor.turns.pending.phase != responsesWSPendingTurnNone {
+		t.Fatalf("expected stale preflight before attempt creation, phase=%v pending=%+v", actor.turns.pending.phase, actor.turns.pending.attempt)
 	}
-	if !actor.closed.Load() {
+	if !actor.closing.closed.Load() {
 		t.Fatal("expected stale preflight to close downstream session")
 	}
 	got, _ := conn.lastWrite.Load().(string)
@@ -2531,24 +5881,19 @@ func TestResponsesWSSubsequentStalePreflightRejectsBeforeRPMAndCloses(t *testing
 func TestResponsesWSBusyCreateBudgetClosesAbusiveClient(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-busy-rate-limit")
 
 	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
 	actor := NewResponsesWSSessionActor(ctx)
 	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
-	actor.activeAttempt = &ResponsesWSTurnAttempt{Usage: &types.Usage{}}
+	actor.turns.active.attempt = attempt
 	actor.state = responsesWSStateInFlight
 
 	for i := 0; i < responsesWSBusyRejectLimit+1; i++ {
-		actor.handleClientFrame(ResponsesWSEventClientFrame{
-			MessageType: responsesWSTextMessageType,
-			Payload:     []byte(`{"type":"response.create","model":"gpt-5","input":"hi"}`),
-		})
+		actor.handleClientFrame(responsesWSTestClientTextFrame([]byte(`{"type":"response.create","model":"gpt-5","input":"hi"}`)))
 	}
 
-	if !actor.closed.Load() {
+	if !actor.closing.closed.Load() {
 		t.Fatal("expected excessive busy response.create frames to close the session")
 	}
 	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "responses_ws_busy_rate_limited") {
@@ -2559,32 +5904,122 @@ func TestResponsesWSBusyCreateBudgetClosesAbusiveClient(t *testing.T) {
 func TestResponsesWSPendingProviderBufferHasByteCap(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-buffer")
 
 	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
 	actor := NewResponsesWSSessionActor(ctx)
 	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
 	session := &responsesWSTestSession{}
 	generation := actor.AttachUpstreamSession(session, 17)
-	actor.pendingAttempt = &ResponsesWSTurnAttempt{AttemptID: "attempt-buffer", SelectedChannelID: 17, Usage: &types.Usage{}}
+	actor.turns.pending.attempt = attempt
 	actor.state = responsesWSStatePendingSend
 
 	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
 		UpstreamSessionGeneration: generation,
 		ChannelID:                 17,
 		Kind:                      ProviderDownstreamFrame,
-		MessageType:               responsesWSTextMessageType,
-		Payload:                   []byte(strings.Repeat("x", config.ResponsesWSPendingProviderEventsMaxBytes()+1)),
-		Origin:                    runtimesession.RealtimePayloadOriginProvider,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(strings.Repeat("x", config.ResponsesWSPendingProviderEventsMaxBytes()+1))),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
 	})
 
-	if !actor.closed.Load() {
+	if !actor.closing.closed.Load() {
 		t.Fatal("expected oversized pending provider buffer to fail closed")
 	}
 	if session.abortReason != "responses_ws_pending_provider_buffer_full" {
 		t.Fatalf("expected buffer cap abort reason, got %q", session.abortReason)
+	}
+}
+
+func TestResponsesWSPendingProviderLifecycleHasEntryCap(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-lifecycle-cap")
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	session := &responsesWSTestSession{}
+	generation := actor.AttachUpstreamSession(session, 17)
+	actor.turns.pending.attempt = attempt
+	actor.state = responsesWSStatePendingSend
+
+	var traces []ResponsesWSSettlementTrace
+	originalHook := responsesWSSettlementTraceHook
+	responsesWSSettlementTraceHook = func(trace ResponsesWSSettlementTrace) {
+		traces = append(traces, trace)
+	}
+	t.Cleanup(func() {
+		responsesWSSettlementTraceHook = originalHook
+	})
+
+	for i := 0; i <= responsesWSPendingProviderEventsMax; i++ {
+		actor.handleProviderUsageObserved(ResponsesWSEventProviderUsageObserved{
+			AttemptID:                 attempt.AttemptID,
+			UpstreamSessionGeneration: generation,
+			ChannelID:                 17,
+			Usage:                     &types.UsageEvent{TotalTokens: 1},
+			DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
+		})
+	}
+
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected excessive pending provider lifecycle observations to fail closed")
+	}
+	if session.abortReason != "responses_ws_pending_provider_buffer_full" {
+		t.Fatalf("expected buffer cap abort reason, got %q", session.abortReason)
+	}
+	if len(traces) != 1 || !traces[0].Input.Diagnostics.ProviderUsageSeen {
+		t.Fatalf("expected overflow lifecycle observation to reach settlement projection, traces=%+v", traces)
+	}
+	if got := traces[0].Input.Diagnostics.DetailOrigins; len(got) != responsesWSPendingProviderEventsMax+1 || got[len(got)-1] != string(responsesws.RecvDetailOriginProviderFrame) {
+		t.Fatalf("expected overflow lifecycle origin in settlement trace, origins=%+v", got)
+	}
+}
+
+func TestResponsesWSPendingProviderFailureHasEntryCap(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-failure-cap")
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	session := &responsesWSTestSession{}
+	generation := actor.AttachUpstreamSession(session, 17)
+	actor.turns.pending.attempt = attempt
+	actor.state = responsesWSStatePendingSend
+
+	var traces []ResponsesWSSettlementTrace
+	originalHook := responsesWSSettlementTraceHook
+	responsesWSSettlementTraceHook = func(trace ResponsesWSSettlementTrace) {
+		traces = append(traces, trace)
+	}
+	t.Cleanup(func() {
+		responsesWSSettlementTraceHook = originalHook
+	})
+
+	for i := 0; i <= responsesWSPendingProviderEventsMax; i++ {
+		actor.handleProviderRecvFailed(ResponsesWSEventProviderRecvFailed{
+			AttemptID:                 attempt.AttemptID,
+			UpstreamSessionGeneration: generation,
+			ChannelID:                 17,
+			Err:                       responsesws.ErrInvalidProviderEventPayload,
+			DetailOrigin:              responsesws.RecvDetailOriginProviderMalformed,
+		})
+	}
+
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected excessive pending provider failures to fail closed")
+	}
+	if session.abortReason != "responses_ws_pending_provider_buffer_full" {
+		t.Fatalf("expected buffer cap abort reason, got %q", session.abortReason)
+	}
+	if len(traces) != 1 || !traces[0].Input.Diagnostics.ProviderFrameSeen {
+		t.Fatalf("expected overflow failure observation to reach settlement projection, traces=%+v", traces)
+	}
+	if got := traces[0].Input.Diagnostics.DetailOrigins; len(got) != responsesWSPendingProviderEventsMax+1 || got[len(got)-1] != string(responsesws.RecvDetailOriginProviderMalformed) {
+		t.Fatalf("expected overflow failure origin in settlement trace, origins=%+v", got)
 	}
 }
 
@@ -2606,76 +6041,199 @@ func TestResponsesWSMaxLifetimeClosesActor(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("expected max lifetime timer to close actor")
 	}
-	if !actor.closed.Load() {
+	if !actor.closing.closed.Load() {
 		t.Fatal("expected actor to be marked closed after max lifetime")
 	}
 }
 
-func TestResponsesWSTerminalSideEffectsSurviveClientWriteFailure(t *testing.T) {
+func TestResponsesWSActiveTurnTimeoutFinalizesAndCloses(t *testing.T) {
+	setResponsesWSTestViperInt(t, "responses_ws.active_turn_timeout_ms", 30000)
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-active-timeout")
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	session := &responsesWSTestSession{}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(session, 17)
+	actor.turns.active.attempt = attempt
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+	actor.armActiveTurnWatchdog()
+	timerGen := actor.watchdog.activeTurnTimerGen
+
+	actor.handleTimeout(ResponsesWSEventTimeout{
+		Reason:                    responsesWSActiveTurnTimeoutReason,
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		AttemptID:                 "attempt-active-timeout",
+		TimeoutGeneration:         timerGen,
+	})
+
+	if actor.turns.active.attempt != nil || !actor.closing.closed.Load() || actor.state != responsesWSStateClosed {
+		t.Fatalf("expected active timeout to clear and close, active=%+v closed=%v state=%v", actor.turns.active.attempt, actor.closing.closed.Load(), actor.state)
+	}
+	if !attempt.QuotaFinalized || attempt.RolledBack || attempt.CompletedAt.IsZero() {
+		t.Fatalf("expected active timeout to finalize quota preserving floor, attempt=%+v", attempt)
+	}
+	if session.abortReason != responsesWSActiveTurnTimeoutReason {
+		t.Fatalf("expected active timeout to abort upstream, got %q", session.abortReason)
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, responsesWSActiveTurnTimeoutReason) {
+		t.Fatalf("expected client timeout payload, got %q", got)
+	}
+}
+
+func TestResponsesWSActiveTurnWatchdogTimerPostsTimeout(t *testing.T) {
+	setResponsesWSTestViperInt(t, "responses_ws.active_turn_timeout_ms", 10)
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-active-timeout-timer")
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	session := &responsesWSTestSession{}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	actor.AttachUpstreamSession(session, 17)
+	actor.turns.active.attempt = attempt
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+
+	go actor.loop()
+	actor.armActiveTurnWatchdog()
+
+	select {
+	case <-actor.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected active turn watchdog timer to close actor")
+	}
+	if actor.turns.active.attempt != nil || !actor.closing.closed.Load() || actor.state != responsesWSStateClosed {
+		t.Fatalf("expected timer timeout to clear and close, active=%+v closed=%v state=%v", actor.turns.active.attempt, actor.closing.closed.Load(), actor.state)
+	}
+	if !attempt.QuotaFinalized || attempt.RolledBack || attempt.CompletedAt.IsZero() {
+		t.Fatalf("expected timer timeout to finalize quota preserving floor, attempt=%+v", attempt)
+	}
+	if session.abortReason != responsesWSActiveTurnTimeoutReason {
+		t.Fatalf("expected timer timeout to abort upstream, got %q", session.abortReason)
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, responsesWSActiveTurnTimeoutReason) {
+		t.Fatalf("expected client timeout payload, got %q", got)
+	}
+}
+
+func TestResponsesWSActiveTurnWatchdogRefreshAndStaleTimeoutIgnored(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	setResponsesWSTestViperInt(t, "responses_ws.active_turn_timeout_ms", 30000)
 
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
 
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-watchdog-refresh",
+		SelectedChannelID: 17,
+		Quota:             &relay_util.Quota{},
+		QuotaPreconsumed:  true,
+		Usage:             &types.Usage{},
+	}
+	actor.turns.active.attempt = attempt
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+	actor.armActiveTurnWatchdog()
+	firstGen := actor.watchdog.activeTurnTimerGen
+
+	frame := responsesws.NewTextFrame([]byte(`{"type":"response.created","response":{"id":"resp_refresh","status":"in_progress"}}`))
+	actor.updateActiveProviderEvidence(responsesws.UpstreamEvent{
+		Frame:        &frame,
+		AttemptID:    "attempt-watchdog-refresh",
+		DetailOrigin: responsesws.RecvDetailOriginProviderStream,
+	})
+	refreshedGen := actor.watchdog.activeTurnTimerGen
+	if refreshedGen == firstGen {
+		t.Fatalf("expected provider evidence to refresh active turn watchdog, gen=%d", refreshedGen)
+	}
+	actor.updateActiveProviderEvidence(responsesws.UpstreamEvent{
+		AttemptID:    "attempt-watchdog-refresh",
+		DetailOrigin: responsesws.RecvDetailOriginSyntheticBridge,
+	})
+	if actor.watchdog.activeTurnTimerGen != refreshedGen {
+		t.Fatalf("expected synthetic bridge event not to refresh watchdog, before=%d after=%d", refreshedGen, actor.watchdog.activeTurnTimerGen)
+	}
+
+	actor.handleTimeout(ResponsesWSEventTimeout{
+		Reason:                    responsesWSActiveTurnTimeoutReason,
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		AttemptID:                 "attempt-watchdog-refresh",
+		TimeoutGeneration:         firstGen,
+	})
+	if actor.closing.closed.Load() || actor.turns.active.attempt != attempt {
+		t.Fatalf("expected stale active timeout to be ignored, closed=%v active=%+v", actor.closing.closed.Load(), actor.turns.active.attempt)
+	}
+	actor.stopActiveTurnWatchdog()
+}
+
+func TestResponsesWSTerminalSideEffectsSurviveClientWriteFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-terminal")
+
 	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1), writeErr: errors.New("client write failed")}
 	actor := NewResponsesWSSessionActor(ctx)
 	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
 	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
-	actor.activeAttempt = &ResponsesWSTurnAttempt{AttemptID: "attempt-terminal", SelectedChannelID: 17, Usage: &types.Usage{}}
-	actor.activeTurn = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
-	actor.activeChannelID = 17
+	actor.turns.active.attempt = attempt
+	actor.turns.active.affinity = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
+	actor.turns.active.channelID = 17
 	actor.state = responsesWSStateInFlight
 
 	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
 		UpstreamSessionGeneration: generation,
 		ChannelID:                 17,
 		Kind:                      ProviderDownstreamFrame,
-		MessageType:               responsesWSTextMessageType,
-		Payload:                   []byte(`{"type":"response.completed","response":{"id":"resp_write_failed","status":"completed","usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}}`),
-		Origin:                    runtimesession.RealtimePayloadOriginProvider,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.completed","response":{"id":"resp_write_failed","status":"completed","usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}}`)),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
 	})
 
-	if actor.lastFinal == nil || actor.lastFinal.ID != "resp_write_failed" {
-		t.Fatalf("expected terminal side effects before client write failure, got %+v", actor.lastFinal)
+	if actor.turns.history.lastFinal == nil || actor.turns.history.lastFinal.ID != "resp_write_failed" {
+		t.Fatalf("expected terminal side effects before client write failure, got %+v", actor.turns.history.lastFinal)
 	}
-	if actor.activeAttempt != nil || !actor.closed.Load() {
-		t.Fatalf("expected active turn cleared and session closed, active=%+v closed=%v", actor.activeAttempt, actor.closed.Load())
+	if actor.turns.active.attempt != nil || !actor.closing.closed.Load() {
+		t.Fatalf("expected active turn cleared and session closed, active=%+v closed=%v", actor.turns.active.attempt, actor.closing.closed.Load())
 	}
 }
 
 func TestResponsesWSFailedTerminalDoesNotCloseSessionForTurnScopedError(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-failed")
 	ctx.Set("responses_ws_selected_channel", &model.Channel{Id: 17, Type: config.ChannelTypeOpenAI})
 
 	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
 	actor := NewResponsesWSSessionActor(ctx)
 	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
 	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
-	attempt := &ResponsesWSTurnAttempt{AttemptID: "attempt-failed", SelectedChannelID: 17, Usage: &types.Usage{}}
-	actor.activeAttempt = attempt
-	actor.activeTurn = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
-	actor.activeChannelID = 17
+	actor.turns.active.attempt = attempt
+	actor.turns.active.affinity = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
+	actor.turns.active.channelID = 17
 	actor.state = responsesWSStateInFlight
 
 	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
 		UpstreamSessionGeneration: generation,
 		ChannelID:                 17,
 		Kind:                      ProviderDownstreamFrame,
-		MessageType:               responsesWSTextMessageType,
-		Payload:                   []byte(`{"type":"response.failed","response":{"id":"resp_failed","status":"failed","error":{"type":"invalid_request_error","code":"bad_input","message":"bad input"}}}`),
-		Origin:                    runtimesession.RealtimePayloadOriginProvider,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.failed","response":{"id":"resp_failed","status":"failed","error":{"type":"invalid_request_error","code":"bad_input","message":"bad input"}}}`)),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
 	})
 
-	if actor.closed.Load() {
+	if actor.closing.closed.Load() {
 		t.Fatal("expected turn-scoped provider failed terminal to keep websocket session open")
 	}
-	if actor.activeAttempt != nil || actor.state != responsesWSStateIdle {
-		t.Fatalf("expected failed terminal to clear only the active turn, state=%v active=%+v", actor.state, actor.activeAttempt)
+	if actor.turns.active.attempt != nil || actor.state != responsesWSStateIdle {
+		t.Fatalf("expected failed terminal to clear only the active turn, state=%v active=%+v", actor.state, actor.turns.active.attempt)
 	}
 	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "response.failed") || !strings.Contains(got, "bad_input") {
 		t.Fatalf("expected failed terminal payload to be forwarded, got %q", got)
@@ -2685,34 +6243,32 @@ func TestResponsesWSFailedTerminalDoesNotCloseSessionForTurnScopedError(t *testi
 func TestResponsesWSIncompleteTerminalWithoutErrorDoesNotCloseSession(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-incomplete")
 	ctx.Set("responses_ws_selected_channel", &model.Channel{Id: 17, Type: config.ChannelTypeOpenAI})
 
 	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
 	actor := NewResponsesWSSessionActor(ctx)
 	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
 	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
-	actor.activeAttempt = &ResponsesWSTurnAttempt{AttemptID: "attempt-incomplete", SelectedChannelID: 17, Usage: &types.Usage{}}
-	actor.activeTurn = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
-	actor.activeChannelID = 17
+	actor.turns.active.attempt = attempt
+	actor.turns.active.affinity = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
+	actor.turns.active.channelID = 17
 	actor.state = responsesWSStateInFlight
 
 	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
 		UpstreamSessionGeneration: generation,
 		ChannelID:                 17,
 		Kind:                      ProviderDownstreamFrame,
-		MessageType:               responsesWSTextMessageType,
-		Payload:                   []byte(`{"type":"response.completed","response":{"id":"resp_incomplete","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}`),
-		Origin:                    runtimesession.RealtimePayloadOriginProvider,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.completed","response":{"id":"resp_incomplete","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}`)),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
 	})
 
-	if actor.closed.Load() {
+	if actor.closing.closed.Load() {
 		t.Fatal("expected incomplete terminal without explicit error detail to keep websocket session open")
 	}
-	if actor.activeAttempt != nil || actor.state != responsesWSStateIdle {
-		t.Fatalf("expected incomplete terminal to clear only the active turn, state=%v active=%+v", actor.state, actor.activeAttempt)
+	if actor.turns.active.attempt != nil || actor.state != responsesWSStateIdle {
+		t.Fatalf("expected incomplete terminal to clear only the active turn, state=%v active=%+v", actor.state, actor.turns.active.attempt)
 	}
 	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "response.failed") || !strings.Contains(got, "max_output_tokens") {
 		t.Fatalf("expected incomplete terminal payload to be forwarded, got %q", got)
@@ -2731,9 +6287,7 @@ func TestResponsesWSFailedTerminalProcessesProviderErrorWithoutClosingSession(t 
 		processChannelRelayErrorFunc = originalProcess
 	}()
 
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-limit")
 	ctx.Set("original_model", "gpt-test")
 	ctx.Set("channel_type", config.ChannelTypeOpenAI)
 	ctx.Set("channel_id", 17)
@@ -2743,21 +6297,21 @@ func TestResponsesWSFailedTerminalProcessesProviderErrorWithoutClosingSession(t 
 	actor := NewResponsesWSSessionActor(ctx)
 	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
 	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
-	actor.activeAttempt = &ResponsesWSTurnAttempt{AttemptID: "attempt-limit", SelectedChannelID: 17, Usage: &types.Usage{}}
-	actor.activeTurn = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
-	actor.activeChannelID = 17
+	actor.turns.active.attempt = attempt
+	actor.turns.active.affinity = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
+	actor.turns.active.channelID = 17
 	actor.state = responsesWSStateInFlight
 
 	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
 		UpstreamSessionGeneration: generation,
 		ChannelID:                 17,
 		Kind:                      ProviderDownstreamFrame,
-		MessageType:               responsesWSTextMessageType,
-		Payload:                   []byte(`{"type":"response.failed","response":{"id":"resp_limit","status":"failed","error":{"type":"usage_limit_reached","message":"monthly usage limit reached"}}}`),
-		Origin:                    runtimesession.RealtimePayloadOriginProvider,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.failed","response":{"id":"resp_limit","status":"failed","error":{"type":"usage_limit_reached","message":"monthly usage limit reached"}}}`)),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
 	})
 
-	if actor.closed.Load() {
+	if actor.closing.closed.Load() {
 		t.Fatal("expected provider api error not to close websocket session")
 	}
 	select {
@@ -2794,7 +6348,7 @@ func TestResponsesWSProviderAPIErrorDedupesWithinTurn(t *testing.T) {
 	ctx.Set("responses_ws_selected_channel", &model.Channel{Id: 17, Name: "provider-error", Type: config.ChannelTypeOpenAI})
 
 	actor := NewResponsesWSSessionActor(ctx)
-	actor.activeAttempt = &ResponsesWSTurnAttempt{AttemptID: "attempt-limit", SelectedChannelID: 17}
+	actor.turns.active.attempt = &ResponsesWSTurnAttempt{AttemptID: "attempt-limit", SelectedChannelID: 17}
 
 	payload := []byte(`{"type":"error","error":{"type":"usage_limit_reached","message":"usage limit reached"}}`)
 	actor.processProviderPayloadAPIError(payload, 17, "responses_ws_provider_frame")
@@ -2815,7 +6369,7 @@ func TestResponsesWSProviderAPIErrorDedupesWithinTurn(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 
-	actor.activeAttempt = &ResponsesWSTurnAttempt{AttemptID: "attempt-limit-next", SelectedChannelID: 17}
+	actor.turns.active.attempt = &ResponsesWSTurnAttempt{AttemptID: "attempt-limit-next", SelectedChannelID: 17}
 	actor.processProviderPayloadAPIError(payload, 17, "responses_ws_provider_frame")
 
 	select {
@@ -2831,28 +6385,34 @@ func TestResponsesWSProviderAPIErrorDedupesWithinTurn(t *testing.T) {
 func TestResponsesWSCloseReplaysBufferedTerminalForUsage(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-buffered-close")
 
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	session := &responsesWSTestSession{}
 	actor := NewResponsesWSSessionActor(ctx)
-	actor.SetBridge(NewResponsesWSIOBridge(&responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}, actor))
-	actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
-	attempt := &ResponsesWSTurnAttempt{
-		AttemptID:         "attempt-buffered-close",
-		SelectedChannelID: 17,
-		SendOutcome:       SendOutcomeAmbiguous,
-		Usage:             &types.Usage{},
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	actor.AttachUpstreamSession(session, 17)
+	terminalReceivedAt := time.Now().Add(-250 * time.Millisecond)
+	attempt.TransportResult = responsesws.ResponsesWSTransportSendResult{
+		Status: responsesws.ResponsesWSTransportSendAmbiguous,
+		Err:    errors.New("ambiguous send"),
 	}
-	actor.pendingAttempt = attempt
-	actor.pendingProviderEvidenceSeen = true
-	actor.pendingProviderEvents = []ResponsesWSEventProviderDownstream{{
-		ChannelID:   17,
-		Kind:        ProviderDownstreamFrame,
-		MessageType: responsesWSTextMessageType,
-		Payload:     []byte(`{"type":"response.completed","response":{"id":"resp_close_buffered","status":"completed","usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}}}`),
-		Origin:      runtimesession.RealtimePayloadOriginProvider,
-	}}
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.provider.journal = responsesWSTestProviderFrameJournal()
+	actor.turns.pending.provider.journal.AppendDownstreamReplay(ResponsesWSEventProviderDownstream{
+		ChannelID:    17,
+		Kind:         ProviderDownstreamFrame,
+		Frame:        responsesWSTestProviderTextFrame([]byte(`{"type":"response.completed","response":{"id":"resp_close_buffered","status":"completed","usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}}}`)),
+		DetailOrigin: responsesws.RecvDetailOriginProviderFrame,
+		ReceivedAt:   terminalReceivedAt,
+	})
+	actor.turns.pending.provider.journal.AppendDownstreamReplay(ResponsesWSEventProviderDownstream{
+		ChannelID:    17,
+		Kind:         ProviderDownstreamFrame,
+		Frame:        responsesWSTestProviderTextFrame([]byte(`{"type":"response.completed","response":{"id":"resp_close_buffered_duplicate","status":"completed","usage":{"input_tokens":30,"output_tokens":40,"total_tokens":70}}}`)),
+		DetailOrigin: responsesws.RecvDetailOriginProviderFrame,
+		ReceivedAt:   terminalReceivedAt.Add(100 * time.Millisecond),
+	})
 	actor.state = responsesWSStatePendingSend
 
 	actor.close("test_close_buffered")
@@ -2860,9 +6420,402 @@ func TestResponsesWSCloseReplaysBufferedTerminalForUsage(t *testing.T) {
 	if attempt.Usage.PromptTokens != 3 || attempt.Usage.CompletionTokens != 4 || attempt.Usage.TotalTokens != 7 {
 		t.Fatalf("expected buffered terminal usage to be merged before close settlement, got %+v", attempt.Usage)
 	}
-	if actor.lastFinal == nil || actor.lastFinal.ID != "resp_close_buffered" {
-		t.Fatalf("expected buffered terminal final response to be recorded, got %+v", actor.lastFinal)
+	if actor.turns.history.lastFinal == nil || actor.turns.history.lastFinal.ID != "resp_close_buffered" {
+		t.Fatalf("expected buffered terminal final response to be recorded, got %+v", actor.turns.history.lastFinal)
 	}
+	if !attempt.CompletedAt.Equal(terminalReceivedAt) {
+		t.Fatalf("expected close replay to preserve provider terminal timestamp, got %s want %s", attempt.CompletedAt, terminalReceivedAt)
+	}
+}
+
+func TestResponsesWSCloseBufferedTerminalExactZeroIgnoresObservedUsage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-buffered-close-zero")
+	mergeResponsesWSUsageEvent(attempt.Usage, &types.UsageEvent{InputTokens: 10, OutputTokens: 90, TotalTokens: 100})
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	session := &responsesWSTestSession{}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	actor.AttachUpstreamSession(session, 17)
+	terminalReceivedAt := time.Now().Add(-250 * time.Millisecond)
+	attempt.TransportResult = responsesws.ResponsesWSTransportSendResult{
+		Status: responsesws.ResponsesWSTransportSendAmbiguous,
+		Err:    errors.New("ambiguous send"),
+	}
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.provider.journal = responsesWSTestProviderFrameJournal()
+	actor.turns.pending.provider.journal.AppendDownstreamReplay(ResponsesWSEventProviderDownstream{
+		ChannelID:    17,
+		Kind:         ProviderDownstreamFrame,
+		Frame:        responsesWSTestProviderTextFrame([]byte(`{"type":"response.completed","response":{"id":"resp_close_buffered_zero","status":"completed","usage":{}}}`)),
+		DetailOrigin: responsesws.RecvDetailOriginProviderFrame,
+		ReceivedAt:   terminalReceivedAt,
+	})
+	actor.state = responsesWSStatePendingSend
+
+	actor.close("test_close_buffered_zero")
+
+	if attempt.AppliedSettlement == nil || attempt.AppliedSettlement.AppliedFinalQuota != 0 {
+		t.Fatalf("expected buffered terminal exact zero settlement, applied=%+v", attempt.AppliedSettlement)
+	}
+	user, token := readResponsesWSQuotaFixture(t)
+	if user.Quota != 1000 || user.UsedQuota != 0 || token.RemainQuota != 1000 || token.UsedQuota != 0 {
+		t.Fatalf("expected buffered terminal exact zero to refund observed/floor reserve, user=%+v token=%+v", user, token)
+	}
+	if actor.turns.history.lastFinal == nil || actor.turns.history.lastFinal.ID != "resp_close_buffered_zero" {
+		t.Fatalf("expected buffered terminal side effects after exact zero settlement, last=%+v", actor.turns.history.lastFinal)
+	}
+}
+
+func TestResponsesWSCloseBufferedTerminalSettlementFailureSkipsSuccessSideEffects(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	session := &responsesWSTestSession{}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	actor.AttachUpstreamSession(session, 17)
+	terminalReceivedAt := time.Now().Add(-250 * time.Millisecond)
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-buffered-close-settlement-fails",
+		SelectedChannelID: 17,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendAmbiguous,
+			Err:    errors.New("ambiguous send"),
+		},
+		Usage: &types.Usage{},
+	}
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.provider.journal.AppendDownstreamReplay(ResponsesWSEventProviderDownstream{
+		ChannelID:    17,
+		Kind:         ProviderDownstreamFrame,
+		Frame:        responsesWSTestProviderTextFrame([]byte(`{"type":"response.completed","response":{"id":"resp_close_settlement_fails","status":"completed","usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}}}`)),
+		DetailOrigin: responsesws.RecvDetailOriginProviderFrame,
+		ReceivedAt:   terminalReceivedAt,
+	})
+	actor.state = responsesWSStatePendingSend
+
+	actor.close("test_close_buffered_settlement_fails")
+
+	if attempt.Usage.PromptTokens != 3 || attempt.Usage.CompletionTokens != 4 || attempt.Usage.TotalTokens != 7 {
+		t.Fatalf("expected terminal usage evidence to be projected before failed settlement, got %+v", attempt.Usage)
+	}
+	if attempt.TerminalEvidence == nil || !attempt.CompletedAt.Equal(terminalReceivedAt) {
+		t.Fatalf("expected terminal evidence/timestamp before settlement, evidence=%+v completed=%s", attempt.TerminalEvidence, attempt.CompletedAt)
+	}
+	if attempt.QuotaFinalized || attempt.RolledBack {
+		t.Fatalf("expected nil quota settlement failure not to mark attempt settled, attempt=%+v", attempt)
+	}
+	if actor.turns.history.lastFinal != nil || len(actor.turns.history.recentFinalizedResponseIDs) != 0 {
+		t.Fatalf("expected terminal success side effects to wait for settlement success, last=%+v recent=%+v", actor.turns.history.lastFinal, actor.turns.history.recentFinalizedResponseIDs)
+	}
+	if session.abortReason != "quota_settlement_failed" {
+		t.Fatalf("expected pending close settlement failure to abort with quota_settlement_failed, got %q", session.abortReason)
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "quota_settlement_failed") {
+		t.Fatalf("expected quota settlement failure payload, got %q", got)
+	}
+	if got, _ := conn.lastControl.Load().(string); !strings.Contains(got, "quota_settlement_failed") {
+		t.Fatalf("expected downstream close control to use quota_settlement_failed, got %q", got)
+	}
+}
+
+func TestResponsesWSCloseBufferedTerminalSettlementFailureSkipsProviderAPIErrorSideEffect(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	originalProcess := processChannelRelayErrorFunc
+	errCh := make(chan *types.OpenAIErrorWithStatusCode, 1)
+	processChannelRelayErrorFunc = func(_ context.Context, _ int, _ string, apiErr *types.OpenAIErrorWithStatusCode, _ int) {
+		errCh <- apiErr
+	}
+	defer func() {
+		processChannelRelayErrorFunc = originalProcess
+	}()
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	ctx.Set("responses_ws_selected_channel", &model.Channel{Id: 17, Name: "provider-error", Type: config.ChannelTypeOpenAI})
+
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(&responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}, actor))
+	actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-buffered-error-settlement-fails",
+		SelectedChannelID: 17,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendAmbiguous,
+			Err:    errors.New("ambiguous send"),
+		},
+		Usage: &types.Usage{},
+	}
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.provider.journal.AppendDownstreamReplay(ResponsesWSEventProviderDownstream{
+		ChannelID:    17,
+		Kind:         ProviderDownstreamFrame,
+		Frame:        responsesWSTestProviderTextFrame([]byte(`{"type":"response.failed","response":{"id":"resp_error_settlement_fails","status":"failed","error":{"type":"usage_limit_reached","message":"monthly usage limit reached"}}}`)),
+		DetailOrigin: responsesws.RecvDetailOriginProviderFrame,
+		ReceivedAt:   time.Now(),
+	})
+	actor.state = responsesWSStatePendingSend
+
+	actor.close("test_close_buffered_error_settlement_fails")
+
+	if attempt.QuotaFinalized || attempt.RolledBack {
+		t.Fatalf("expected nil quota settlement failure not to mark attempt settled, attempt=%+v", attempt)
+	}
+	if len(actor.turns.history.recentFinalizedResponseIDs) != 0 {
+		t.Fatalf("expected finalized response id side effect to wait for settlement success, recent=%+v", actor.turns.history.recentFinalizedResponseIDs)
+	}
+	select {
+	case apiErr := <-errCh:
+		t.Fatalf("expected provider api error side effect to wait for settlement success, got %#v", apiErr)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestResponsesWSCloseRejectedBeforeStreamWithBufferedTerminalFailsClosedWithoutTerminalSideEffects(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	settings := config.ChannelAffinitySettings{
+		Enabled:           true,
+		DefaultTTLSeconds: 60,
+		Rules: []config.ChannelAffinityRule{{
+			Name:            "responses-response-id",
+			Enabled:         true,
+			Kind:            "responses",
+			IncludeModel:    true,
+			IncludeRuleName: true,
+			RecordOnSuccess: true,
+			KeySources: []config.ChannelAffinityKeySource{
+				{Source: "request_field", Key: "previous_response_id", Alias: config.ChannelAffinityAliasResponseID},
+			},
+		}},
+	}
+	settings.Normalize()
+	manager := withChannelAffinitySettings(t, settings)
+
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-close-rejected-terminal-conflict")
+	candidate, err := PrepareResponsesTurnAffinity(ResponsesAffinityInput{
+		Context: ctx,
+		Request: &types.OpenAIResponsesRequest{Model: "gpt-5"},
+	})
+	if err != nil {
+		t.Fatalf("prepare affinity: %v", err)
+	}
+	attempt.Candidate = candidate
+
+	template := newChannelAffinityTemplate(ctx, channelAffinityKindResponses, "gpt-5", settings.Rules[0], "request_field", config.ChannelAffinityAliasResponseID, settings.DefaultTTLSeconds)
+	affinityKey := template.BuildKey("resp_close_conflict")
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	session := &responsesWSTestSession{}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(session, 17)
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	var traces []ResponsesWSSettlementTrace
+	originalHook := responsesWSSettlementTraceHook
+	responsesWSSettlementTraceHook = func(trace ResponsesWSSettlementTrace) {
+		traces = append(traces, trace)
+	}
+	t.Cleanup(func() {
+		responsesWSSettlementTraceHook = originalHook
+	})
+
+	actor.handleEvent(ResponsesWSEventBridgeOpenProviderError{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		AttemptID:                 attempt.AttemptID,
+		Payload:                   responsesWSErrorPayload(http.StatusTooManyRequests, "provider_rate_limit", "provider rejected stream open"),
+		Recoverable:               true,
+	})
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.completed","response":{"id":"resp_close_conflict","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`)),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
+		ReceivedAt:                time.Now(),
+	})
+
+	actor.close("client_closed_after_rejected_before_stream")
+
+	if attempt.RolledBack || !attempt.QuotaFinalized {
+		t.Fatalf("expected proof conflict close to finalize conservatively, attempt=%+v", attempt)
+	}
+	if len(traces) != 1 || !responsesWSSettlementHasFlag(traces[0].Decision, ResponsesWSSettlementFlagContradictoryInput) {
+		t.Fatalf("expected contradictory settlement trace, traces=%+v", traces)
+	}
+	if actor.turns.history.lastFinal == nil || actor.turns.history.lastFinal.ID != "resp_close_conflict" || len(actor.turns.history.recentFinalizedResponseIDs) == 0 {
+		t.Fatalf("expected terminal side effects to be applied, last=%+v recent=%+v", actor.turns.history.lastFinal, actor.turns.history.recentFinalizedResponseIDs)
+	}
+	if _, ok := manager.Get(affinityKey); !ok {
+		t.Fatal("expected success affinity to be recorded for close proof conflict")
+	}
+	if actor.turns.pending.attempt != nil || actor.turns.pending.phase != responsesWSPendingTurnNone {
+		t.Fatalf("expected close proof conflict to clear pending turn, pending=%+v phase=%v", actor.turns.pending.attempt, actor.turns.pending.phase)
+	}
+	if session.abortReason != "client_closed_after_rejected_before_stream" {
+		t.Fatalf("expected ordinary close abort reason, got %q", session.abortReason)
+	}
+}
+
+func TestResponsesWSCloseRejectedBeforeStreamWithBufferedProviderAPIErrorSkipsSideEffect(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	originalProcess := processChannelRelayErrorFunc
+	errCh := make(chan *types.OpenAIErrorWithStatusCode, 1)
+	processChannelRelayErrorFunc = func(_ context.Context, _ int, _ string, apiErr *types.OpenAIErrorWithStatusCode, _ int) {
+		errCh <- apiErr
+	}
+	t.Cleanup(func() {
+		processChannelRelayErrorFunc = originalProcess
+	})
+
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-close-rejected-api-error-conflict")
+	ctx.Set("responses_ws_selected_channel", &model.Channel{Id: 17, Name: "provider-error", Type: config.ChannelTypeOpenAI})
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	session := &responsesWSTestSession{}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(session, 17)
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	actor.handleEvent(ResponsesWSEventBridgeOpenProviderError{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		AttemptID:                 attempt.AttemptID,
+		Payload:                   responsesWSErrorPayload(http.StatusTooManyRequests, "provider_rate_limit", "provider rejected stream open"),
+		Recoverable:               true,
+	})
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.failed","response":{"id":"resp_close_conflict_error","status":"failed","error":{"type":"invalid_request_error","code":"bad_input","message":"bad input"}}}`)),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
+		ReceivedAt:                time.Now(),
+	})
+
+	actor.close("client_closed_after_rejected_before_stream")
+
+	if attempt.RolledBack || !attempt.QuotaFinalized {
+		t.Fatalf("expected proof conflict close to finalize conservatively, attempt=%+v", attempt)
+	}
+	if len(actor.turns.history.recentFinalizedResponseIDs) == 0 {
+		t.Fatalf("expected failed terminal response id side effect to be applied, recent=%+v", actor.turns.history.recentFinalizedResponseIDs)
+	}
+	select {
+	case apiErr := <-errCh:
+		if apiErr == nil || apiErr.Code != "bad_input" {
+			t.Fatalf("expected provider API error side effect, got %#v", apiErr)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("expected provider API error side effect")
+	}
+	if session.abortReason != "client_closed_after_rejected_before_stream" {
+		t.Fatalf("expected ordinary close abort reason, got %q", session.abortReason)
+	}
+}
+
+func TestResponsesWSCloseReplayProcessesBufferedProviderAPIError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	originalProcess := processChannelRelayErrorFunc
+	errCh := make(chan *types.OpenAIErrorWithStatusCode, 1)
+	processChannelRelayErrorFunc = func(_ context.Context, _ int, _ string, apiErr *types.OpenAIErrorWithStatusCode, _ int) {
+		errCh <- apiErr
+	}
+	defer func() {
+		processChannelRelayErrorFunc = originalProcess
+	}()
+
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-buffered-error-close")
+	ctx.Set("responses_ws_selected_channel", &model.Channel{Id: 17, Name: "provider-error", Type: config.ChannelTypeOpenAI})
+
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(&responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}, actor))
+	actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt.TransportResult = responsesws.ResponsesWSTransportSendResult{
+		Status: responsesws.ResponsesWSTransportSendAmbiguous,
+		Err:    errors.New("ambiguous send"),
+	}
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.provider.journal = responsesWSTestProviderFrameJournal()
+	actor.turns.pending.provider.journal.AppendDownstreamReplay(ResponsesWSEventProviderDownstream{
+		ChannelID:    17,
+		Kind:         ProviderDownstreamFrame,
+		Frame:        responsesWSTestProviderTextFrame([]byte(`{"type":"response.failed","response":{"id":"resp_limit","status":"failed","error":{"type":"usage_limit_reached","message":"monthly usage limit reached"}}}`)),
+		DetailOrigin: responsesws.RecvDetailOriginProviderFrame,
+	})
+	actor.state = responsesWSStatePendingSend
+
+	actor.close("test_close_buffered_error")
+
+	select {
+	case apiErr := <-errCh:
+		if apiErr == nil || apiErr.StatusCode != http.StatusTooManyRequests || apiErr.Type != "usage_limit_reached" {
+			t.Fatalf("expected parsed usage-limit provider error, got %#v", apiErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for replayed provider error control-plane handling")
+	}
+}
+
+func TestResponsesWSCloseReplayProcessesBufferedProviderRecvFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-buffered-failure-close")
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	failedAt := time.Now().Add(-300 * time.Millisecond)
+	attempt.TransportResult = responsesws.ResponsesWSTransportSendResult{
+		Status: responsesws.ResponsesWSTransportSendAmbiguous,
+		Err:    errors.New("ambiguous send"),
+	}
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	actor.handleProviderRecvFailed(ResponsesWSEventProviderRecvFailed{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Err:                       errors.New("buffered read failure"),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderMalformed,
+		DetailPhase:               responsesws.RecvDetailPhaseHandleProviderFrame,
+		ReceivedAt:                failedAt,
+	})
+	if actor.closing.closed.Load() || len(actor.turns.pending.provider.journal.Failures()) != 1 {
+		t.Fatalf("expected pending provider failure to be buffered, closed=%v failures=%d", actor.closing.closed.Load(), len(actor.turns.pending.provider.journal.Failures()))
+	}
+
+	actor.close("test_close_buffered_failure")
+
+	if !attempt.CompletedAt.Equal(failedAt) {
+		t.Fatalf("expected close replay to preserve provider failure timestamp, got %s want %s", attempt.CompletedAt, failedAt)
+	}
+	if attempt.RolledBack {
+		t.Fatal("expected buffered provider failure evidence to preserve quota floor, not rollback")
+	}
+	payload, _ := conn.lastWrite.Load().(string)
+	assertResponsesWSErrorPayload(t, payload, http.StatusBadGateway, "responses_ws_provider_protocol_error", "malformed responses websocket frame")
 }
 
 func TestResponsesWSProviderRecvPumpEmitsClientPayloadErrorAfterProviderPayload(t *testing.T) {
@@ -2880,19 +6833,19 @@ func TestResponsesWSProviderRecvPumpEmitsClientPayloadErrorAfterProviderPayload(
 	quotaErr := types.NewErrorEvent("evt_quota", "system_error", "system_error", "user quota is not enough")
 	bridge.ArmProviderRecvPump("session-payload-error", 17, session)
 	session.responses <- responsesWSRecvResult{
-		messageType: responsesWSTextMessageType,
-		payload:     []byte(`{"type":"response.output_text.delta","delta":"hi"}`),
-		origin:      runtimesession.RealtimePayloadOriginProvider,
-		err:         runtimesession.NewClientPayloadError(quotaErr, []byte(quotaErr.Error())),
+		messageType:  responsesWSTextMessageType,
+		payload:      []byte(`{"type":"response.output_text.delta","delta":"hi"}`),
+		detailOrigin: responsesws.RecvDetailOriginProviderFrame,
+		err:          responsesws.NewClientPayloadError(quotaErr, []byte(quotaErr.Error())),
 	}
 
 	first := readResponsesWSEvent(t, actor)
 	downstream, ok := first.(ResponsesWSEventProviderDownstream)
-	if !ok || downstream.Kind != ProviderDownstreamFrame || downstream.Origin != runtimesession.RealtimePayloadOriginProvider {
+	if !ok || downstream.Kind != ProviderDownstreamFrame || responsesws.PayloadOriginForDetailOrigin(downstream.DetailOrigin) != responsesws.PayloadOriginProvider {
 		t.Fatalf("expected provider payload to be emitted first, got %#v", first)
 	}
-	if string(downstream.Payload) == "" || !strings.Contains(string(downstream.Payload), "response.output_text.delta") {
-		t.Fatalf("expected provider payload to be preserved, got %q", downstream.Payload)
+	if payload := responsesWSTestProviderEventPayload(downstream); len(payload) == 0 || !strings.Contains(string(payload), "response.output_text.delta") {
+		t.Fatalf("expected provider payload to be preserved, got %q", payload)
 	}
 
 	second := readResponsesWSEvent(t, actor)
@@ -2905,6 +6858,33 @@ func TestResponsesWSProviderRecvPumpEmitsClientPayloadErrorAfterProviderPayload(
 	}
 	if localErr.Recoverable {
 		t.Fatalf("expected provider recv client payload error to be non-recoverable")
+	}
+}
+
+func TestResponsesWSProviderRecvPumpPreservesNoPayloadBridgeStreamOpened(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	bridge := NewResponsesWSIOBridge(nil, actor)
+	defer bridge.Close()
+
+	session := &responsesWSRecvSequenceSession{responses: make(chan responsesWSRecvResult, 1)}
+	bridge.ArmProviderRecvPump("session-bridge-opened", 17, session)
+	session.responses <- responsesWSRecvResult{
+		detailOrigin: responsesws.RecvDetailOriginBridgeStreamOpened,
+	}
+
+	event := readResponsesWSEvent(t, actor)
+	downstream, ok := event.(ResponsesWSEventProviderDownstream)
+	if !ok {
+		t.Fatalf("expected no-payload bridge_stream_opened to reach actor event path, got %#v", event)
+	}
+	if downstream.DetailOrigin != responsesws.RecvDetailOriginBridgeStreamOpened || downstream.Frame != nil || responsesws.PayloadOriginForDetailOrigin(downstream.DetailOrigin) != responsesws.PayloadOriginProvider {
+		t.Fatalf("expected bridge_stream_opened evidence-only downstream event, got %+v", downstream)
 	}
 }
 
@@ -2923,18 +6903,18 @@ func TestResponsesWSProviderRecvPumpDoesNotEmitTimeoutAfterProviderErrorPayload(
 	payload := []byte(`{"type":"error","error":{"type":"usage_limit_reached","message":"usage limit reached"}}`)
 	bridge.ArmProviderRecvPump("session-provider-error-payload", 17, session)
 	session.responses <- responsesWSRecvResult{
-		messageType: responsesWSTextMessageType,
-		payload:     payload,
-		origin:      runtimesession.RealtimePayloadOriginProvider,
-		err:         errors.New("provider closed after error payload"),
+		messageType:  responsesWSTextMessageType,
+		payload:      payload,
+		detailOrigin: responsesws.RecvDetailOriginProviderFrame,
+		err:          errors.New("provider closed after error payload"),
 	}
 
 	first := readResponsesWSEvent(t, actor)
 	downstream, ok := first.(ResponsesWSEventProviderDownstream)
-	if !ok || downstream.Kind != ProviderDownstreamFrame || downstream.Origin != runtimesession.RealtimePayloadOriginProvider {
+	if !ok || downstream.Kind != ProviderDownstreamFrame || responsesws.PayloadOriginForDetailOrigin(downstream.DetailOrigin) != responsesws.PayloadOriginProvider {
 		t.Fatalf("expected provider payload event, got %#v", first)
 	}
-	if got := string(downstream.Payload); got != string(payload) {
+	if got := string(responsesWSTestProviderEventPayload(downstream)); got != string(payload) {
 		t.Fatalf("expected provider payload to be preserved, got %q", got)
 	}
 
@@ -3003,6 +6983,73 @@ func TestResponsesWSProviderRecvPumpEmitsProviderRecvFailedForTopLevelRecvError(
 	}
 }
 
+func TestResponsesWSProviderRecvPumpEmitsProviderRecvFailedForLifecycleEventErr(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	bridge := NewResponsesWSIOBridge(nil, actor)
+	defer bridge.Close()
+
+	recvErr := errors.New("bridge stream failed")
+	session := &responsesWSRecvSequenceSession{responses: make(chan responsesWSRecvResult, 1)}
+	bridge.ArmProviderRecvPump("session-lifecycle-failed", 17, session)
+	session.responses <- responsesWSRecvResult{
+		err:          recvErr,
+		detailOrigin: responsesws.RecvDetailOriginBridgeStreamError,
+	}
+
+	event := readResponsesWSEvent(t, actor)
+	recvFailed, ok := event.(ResponsesWSEventProviderRecvFailed)
+	if !ok {
+		t.Fatalf("expected provider recv failed event, got %#v", event)
+	}
+	if recvFailed.UpstreamSessionGeneration != "session-lifecycle-failed" || recvFailed.ChannelID != 17 || !errors.Is(recvFailed.Err, recvErr) ||
+		responsesws.PayloadOriginForDetailOrigin(recvFailed.DetailOrigin) != responsesws.PayloadOriginProxyLocal || recvFailed.DetailOrigin != responsesws.RecvDetailOriginBridgeStreamError {
+		t.Fatalf("expected lifecycle recv failure metadata to be preserved, got %+v", recvFailed)
+	}
+
+	select {
+	case event := <-actor.events:
+		t.Fatalf("expected recv loop to exit after lifecycle recv failure, got extra event %#v", event)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestResponsesWSProviderRecvPumpEmitsProviderRecvFailedForProviderMalformed(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	bridge := NewResponsesWSIOBridge(nil, actor)
+	defer bridge.Close()
+
+	recvErr := errors.New("provider frame parse failed")
+	session := &responsesWSRecvSequenceSession{responses: make(chan responsesWSRecvResult, 1)}
+	bridge.ArmProviderRecvPump("session-provider-malformed", 17, session)
+	session.responses <- responsesWSRecvResult{
+		err:          recvErr,
+		detailOrigin: responsesws.RecvDetailOriginProviderMalformed,
+		detailPhase:  responsesws.RecvDetailPhaseHandleProviderFrame,
+	}
+
+	event := readResponsesWSEvent(t, actor)
+	recvFailed, ok := event.(ResponsesWSEventProviderRecvFailed)
+	if !ok {
+		t.Fatalf("expected provider malformed to stay on ProviderRecvFailed path, got %#v", event)
+	}
+	if recvFailed.DetailOrigin != responsesws.RecvDetailOriginProviderMalformed || recvFailed.DetailPhase != responsesws.RecvDetailPhaseHandleProviderFrame ||
+		recvFailed.UpstreamSessionGeneration != "session-provider-malformed" || recvFailed.ChannelID != 17 || !errors.Is(recvFailed.Err, recvErr) {
+		t.Fatalf("expected provider malformed recv failure metadata to be preserved, got %+v", recvFailed)
+	}
+}
+
 func TestResponsesWSProviderRecvPumpEmitsFrameBeforeProviderBusinessErrorPayload(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -3018,10 +7065,10 @@ func TestResponsesWSProviderRecvPumpEmitsFrameBeforeProviderBusinessErrorPayload
 	session := &responsesWSRecvSequenceSession{responses: make(chan responsesWSRecvResult, 1)}
 	bridge.ArmProviderRecvPump("session-frame-business-error", 17, session)
 	session.responses <- responsesWSRecvResult{
-		messageType: responsesWSTextMessageType,
-		payload:     []byte(`{"type":"response.output_text.delta","delta":"hi"}`),
-		origin:      runtimesession.RealtimePayloadOriginProvider,
-		err:         runtimesession.NewClientPayloadError(providerErr, []byte(providerErr.Error())),
+		messageType:  responsesWSTextMessageType,
+		payload:      []byte(`{"type":"response.output_text.delta","delta":"hi"}`),
+		detailOrigin: responsesws.RecvDetailOriginProviderFrame,
+		err:          responsesws.NewClientPayloadError(providerErr, []byte(providerErr.Error())),
 	}
 
 	first := readResponsesWSEvent(t, actor)
@@ -3029,7 +7076,7 @@ func TestResponsesWSProviderRecvPumpEmitsFrameBeforeProviderBusinessErrorPayload
 	if !ok || downstream.Kind != ProviderDownstreamFrame || downstream.Err != nil {
 		t.Fatalf("expected clean provider frame first, got %#v", first)
 	}
-	if got := string(downstream.Payload); !strings.Contains(got, "response.output_text.delta") {
+	if got := string(responsesWSTestProviderEventPayload(downstream)); !strings.Contains(got, "response.output_text.delta") {
 		t.Fatalf("expected provider frame payload to be preserved, got %q", got)
 	}
 
@@ -3057,12 +7104,12 @@ func TestResponsesWSProviderRecvPumpEmitsProviderClosedEvent(t *testing.T) {
 	session := &responsesWSRecvSequenceSession{responses: make(chan responsesWSRecvResult, 1)}
 	bridge.ArmProviderRecvPump("session-provider-close", 17, session)
 	session.responses <- responsesWSRecvResult{
-		providerClose: &runtimesession.ProviderClose{
+		providerClose: &responsesws.ProviderClose{
 			Code:   4408,
 			Reason: "quota exhausted",
-			Err:    runtimesession.ErrSessionClosed,
+			Err:    responsesws.ErrUpstreamClosed,
 		},
-		origin: runtimesession.RealtimePayloadOriginProvider,
+		detailOrigin: responsesws.RecvDetailOriginNativeProviderClose,
 	}
 
 	event := readResponsesWSEvent(t, actor)
@@ -3073,7 +7120,7 @@ func TestResponsesWSProviderRecvPumpEmitsProviderClosedEvent(t *testing.T) {
 	if closed.UpstreamSessionGeneration != "session-provider-close" || closed.ChannelID != 17 {
 		t.Fatalf("expected provider close routing metadata, got %+v", closed)
 	}
-	if closed.Code != 4408 || closed.Reason != "quota exhausted" || !errors.Is(closed.Err, runtimesession.ErrSessionClosed) {
+	if closed.Code != 4408 || closed.Reason != "quota exhausted" || !errors.Is(closed.Err, responsesws.ErrUpstreamClosed) {
 		t.Fatalf("expected provider close fields to be preserved, got %+v", closed)
 	}
 
@@ -3097,29 +7144,33 @@ func TestResponsesWSProviderRecvPumpMarksActivityForProviderEvents(t *testing.T)
 	session := &responsesWSRecvSequenceSession{responses: make(chan responsesWSRecvResult, 2)}
 
 	old := time.Now().Add(-time.Hour)
-	actor.lastActivityUnixNano.Store(old.UnixNano())
+	actor.setLastActivity(old)
 	bridge.ArmProviderRecvPump("session-activity", 17, session)
 
-	session.responses <- responsesWSRecvResult{usage: &types.UsageEvent{TotalTokens: 1}}
+	session.responses <- responsesWSRecvResult{
+		usage:        &types.UsageEvent{TotalTokens: 1},
+		detailOrigin: responsesws.RecvDetailOriginProviderFrame,
+	}
 	event := readResponsesWSEvent(t, actor)
 	if usage, ok := event.(ResponsesWSEventProviderUsageObserved); !ok || usage.Usage == nil || usage.Usage.TotalTokens != 1 {
 		t.Fatalf("expected provider usage event, got %#v", event)
 	}
-	if got := time.Unix(0, actor.lastActivityUnixNano.Load()); !got.After(old) {
+	if got := actor.lastActivity(); !got.After(old) {
 		t.Fatalf("expected provider usage to refresh activity, got %s old %s", got, old)
 	}
 
 	old = time.Now().Add(-time.Hour)
-	actor.lastActivityUnixNano.Store(old.UnixNano())
+	actor.setLastActivity(old)
 	session.responses <- responsesWSRecvResult{
-		messageType: responsesWSTextMessageType,
-		payload:     []byte(`{"type":"response.output_text.delta","delta":"hi"}`),
+		messageType:  responsesWSTextMessageType,
+		payload:      []byte(`{"type":"response.output_text.delta","delta":"hi"}`),
+		detailOrigin: responsesws.RecvDetailOriginProviderFrame,
 	}
 	event = readResponsesWSEvent(t, actor)
 	if downstream, ok := event.(ResponsesWSEventProviderDownstream); !ok || downstream.Kind != ProviderDownstreamFrame {
 		t.Fatalf("expected provider frame event, got %#v", event)
 	}
-	if got := time.Unix(0, actor.lastActivityUnixNano.Load()); !got.After(old) {
+	if got := actor.lastActivity(); !got.After(old) {
 		t.Fatalf("expected provider frame to refresh activity, got %s old %s", got, old)
 	}
 }
@@ -3146,7 +7197,7 @@ func TestResponsesWSProviderRecvPumpPostsInputAudioTranscriptionUsageOnly(t *tes
 			ItemID:          "item_1",
 			ProviderEventID: "evt_transcription",
 		},
-		origin: runtimesession.RealtimePayloadOriginProvider,
+		detailOrigin: responsesws.RecvDetailOriginProviderFrame,
 	}
 
 	event := readResponsesWSEvent(t, actor)
@@ -3181,10 +7232,10 @@ func TestResponsesWSProviderRecvPumpKeepsFrameAndUsageTogether(t *testing.T) {
 
 	bridge.ArmProviderRecvPump("session-frame-usage", 17, session)
 	session.responses <- responsesWSRecvResult{
-		messageType: responsesWSTextMessageType,
-		payload:     []byte(`{"type":"response.output_text.delta","delta":"hi"}`),
-		usage:       &types.UsageEvent{InputTokens: 4, OutputTokens: 2, TotalTokens: 6},
-		origin:      runtimesession.RealtimePayloadOriginProvider,
+		messageType:  responsesWSTextMessageType,
+		payload:      []byte(`{"type":"response.output_text.delta","delta":"hi"}`),
+		usage:        &types.UsageEvent{InputTokens: 4, OutputTokens: 2, TotalTokens: 6},
+		detailOrigin: responsesws.RecvDetailOriginProviderFrame,
 	}
 
 	event := readResponsesWSEvent(t, actor)
@@ -3203,22 +7254,86 @@ func TestResponsesWSProviderRecvPumpKeepsFrameAndUsageTogether(t *testing.T) {
 }
 
 func TestResponsesWSSessionFrameMessageMappingIsTextBinaryOnly(t *testing.T) {
-	textFrame := responsesWSSessionFrameFromMessage(responsesWSTextMessageType, []byte("text"))
-	if textFrame.Kind() != runtimesession.FrameKindText || string(textFrame.Payload()) != "text" {
+	textFrame := responsesWSFrameFromWireMessage(responsesWSTextMessageType, []byte("text"))
+	if textFrame.Kind() != responsesws.FrameKindText || string(textFrame.Payload()) != "text" {
 		t.Fatalf("expected websocket text to map to session text frame, got kind=%v payload=%q", textFrame.Kind(), textFrame.Payload())
 	}
-	mt, payload := responsesWSMessageFromSessionFrame(textFrame)
-	if mt != responsesWSTextMessageType || string(payload) != "text" {
-		t.Fatalf("expected session text frame to map to websocket text, mt=%d payload=%q", mt, payload)
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	bridge := NewResponsesWSIOBridge(conn, nil)
+	if err := bridge.WriteClientTypedFrame(textFrame, ResponsesWSWriteProvider); err != nil {
+		t.Fatalf("write text typed frame: %v", err)
+	}
+	if mt := atomic.LoadInt32(&conn.lastMessageType); int(mt) != responsesWSTextMessageType {
+		t.Fatalf("expected session text frame to map to websocket text, mt=%d", mt)
+	}
+	if got, _ := conn.lastWrite.Load().(string); got != "text" {
+		t.Fatalf("expected text payload to write unchanged, got %q", got)
 	}
 
-	binaryFrame := responsesWSSessionFrameFromMessage(responsesWSBinaryMessageType, []byte{1, 2, 3})
-	if binaryFrame.Kind() != runtimesession.FrameKindBinary || string(binaryFrame.Payload()) != string([]byte{1, 2, 3}) {
+	binaryFrame := responsesWSFrameFromWireMessage(responsesWSBinaryMessageType, []byte{1, 2, 3})
+	if binaryFrame.Kind() != responsesws.FrameKindBinary || string(binaryFrame.Payload()) != string([]byte{1, 2, 3}) {
 		t.Fatalf("expected websocket binary to map to session binary frame, got kind=%v payload=%v", binaryFrame.Kind(), binaryFrame.Payload())
 	}
-	mt, payload = responsesWSMessageFromSessionFrame(binaryFrame)
-	if mt != responsesWSBinaryMessageType || string(payload) != string([]byte{1, 2, 3}) {
-		t.Fatalf("expected session binary frame to map to websocket binary, mt=%d payload=%v", mt, payload)
+	if err := bridge.WriteClientTypedFrame(binaryFrame, ResponsesWSWriteProvider); err != nil {
+		t.Fatalf("write binary typed frame: %v", err)
+	}
+	if mt := atomic.LoadInt32(&conn.lastMessageType); int(mt) != responsesWSBinaryMessageType {
+		t.Fatalf("expected session binary frame to map to websocket binary, mt=%d", mt)
+	}
+	if got, _ := conn.lastWrite.Load().(string); got != string([]byte{1, 2, 3}) {
+		t.Fatalf("expected binary payload to write unchanged, got %q", got)
+	}
+}
+
+func TestResponsesWSProviderBinaryFrameForwardsWithoutTerminalClassification(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-binary-active",
+		SelectedChannelID: 17,
+		Usage:             &types.Usage{},
+	}
+	actor.turns.active.attempt = attempt
+	actor.turns.active.affinity = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+
+	payload := []byte(`{"type":"response.completed","response":{"id":"resp_binary","status":"completed"}}`)
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame:                     responsesWSTestProviderBinaryFrame(payload),
+		Usage:                     &types.UsageEvent{InputTokens: 1, OutputTokens: 2, TotalTokens: 3},
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
+	})
+
+	if actor.closing.closed.Load() {
+		t.Fatal("expected provider binary frame not to close as malformed JSON")
+	}
+	if actor.turns.active.attempt != attempt || attempt.QuotaFinalized {
+		t.Fatalf("expected binary frame to remain non-terminal, active=%+v finalized=%v", actor.turns.active.attempt, attempt.QuotaFinalized)
+	}
+	if got := atomic.LoadInt32(&conn.writeCount); got != 1 {
+		t.Fatalf("expected one binary downstream write, got %d", got)
+	}
+	if got := atomic.LoadInt32(&conn.lastMessageType); int(got) != responsesWSBinaryMessageType {
+		t.Fatalf("expected downstream binary message type, got %d", got)
+	}
+	if got, _ := conn.lastWrite.Load().(string); got != string(payload) {
+		t.Fatalf("expected binary payload to forward unchanged, got %q", got)
+	}
+	if attempt.Usage.PromptTokens != 1 || attempt.Usage.CompletionTokens != 2 || attempt.Usage.TotalTokens != 3 {
+		t.Fatalf("expected binary-attached usage to merge once, got %+v", attempt.Usage)
 	}
 }
 
@@ -3256,10 +7371,10 @@ func TestResponsesWSProviderRecvPumpKeepsTerminalStatusFramesWithUsage(t *testin
 
 			bridge.ArmProviderRecvPump("session-terminal-"+tc.name, 17, session)
 			session.responses <- responsesWSRecvResult{
-				messageType: responsesWSTextMessageType,
-				payload:     tc.payload,
-				usage:       &types.UsageEvent{InputTokens: 4, OutputTokens: 2, TotalTokens: 6},
-				origin:      runtimesession.RealtimePayloadOriginProvider,
+				messageType:  responsesWSTextMessageType,
+				payload:      tc.payload,
+				usage:        &types.UsageEvent{InputTokens: 4, OutputTokens: 2, TotalTokens: 6},
+				detailOrigin: responsesws.RecvDetailOriginProviderFrame,
 			}
 
 			event := readResponsesWSEvent(t, actor)
@@ -3270,7 +7385,7 @@ func TestResponsesWSProviderRecvPumpKeepsTerminalStatusFramesWithUsage(t *testin
 			if downstream.Kind != ProviderDownstreamFrame || downstream.Usage == nil || downstream.Usage.TotalTokens != 6 {
 				t.Fatalf("expected terminal status frame with usage, got %+v", downstream)
 			}
-			if got := string(downstream.Payload); !strings.Contains(got, `"status":"`+tc.name+`"`) {
+			if got := string(responsesWSTestProviderEventPayload(downstream)); !strings.Contains(got, `"status":"`+tc.name+`"`) {
 				t.Fatalf("expected terminal status payload to be preserved, got %q", got)
 			}
 
@@ -3280,6 +7395,49 @@ func TestResponsesWSProviderRecvPumpKeepsTerminalStatusFramesWithUsage(t *testin
 			case <-time.After(100 * time.Millisecond):
 			}
 		})
+	}
+}
+
+func TestResponsesWSProviderRecvPumpContinuesAfterRecoverableBridgeOpenError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	bridge := NewResponsesWSIOBridge(nil, actor)
+	defer bridge.Close()
+	session := &responsesWSRecvSequenceSession{responses: make(chan responsesWSRecvResult, 2)}
+
+	bridge.ArmProviderRecvPump("session-recoverable-bridge-open", 17, session)
+	session.responses <- responsesWSRecvResult{
+		attemptID:    "attempt-recoverable",
+		detailOrigin: responsesws.RecvDetailOriginBridgeOpenProviderError,
+		err:          responsesws.NewBridgeOpenProviderError(http.StatusTooManyRequests, "rate_limit", "provider_error", "provider busy"),
+	}
+
+	first := readResponsesWSEvent(t, actor)
+	providerErr, ok := first.(ResponsesWSEventBridgeOpenProviderError)
+	if !ok || !providerErr.Recoverable {
+		t.Fatalf("expected recoverable bridge open provider error, got %#v", first)
+	}
+
+	payload := []byte(`{"type":"response.created","response":{"id":"resp_after_recoverable","status":"in_progress"}}`)
+	session.responses <- responsesWSRecvResult{
+		messageType:  responsesWSTextMessageType,
+		payload:      payload,
+		attemptID:    "attempt-next",
+		detailOrigin: responsesws.RecvDetailOriginProviderStream,
+	}
+
+	second := readResponsesWSEvent(t, actor)
+	downstream, ok := second.(ResponsesWSEventProviderDownstream)
+	if !ok {
+		t.Fatalf("expected recv pump to keep forwarding after recoverable error, got %#v", second)
+	}
+	if downstream.AttemptID != "attempt-next" || string(responsesWSTestProviderEventPayload(downstream)) != string(payload) {
+		t.Fatalf("expected next provider frame after recoverable bridge error, got %+v", downstream)
 	}
 }
 
@@ -3299,19 +7457,19 @@ func TestResponsesWSProviderDownstreamFrameWithUsageMergesBeforeWrite(t *testing
 		SelectedChannelID: 17,
 		Usage:             &types.Usage{},
 	}
-	actor.activeAttempt = attempt
-	actor.activeChannelID = 17
+	actor.turns.active.attempt = attempt
+	actor.turns.active.channelID = 17
 	actor.state = responsesWSStateInFlight
 
 	payload := []byte(`{"type":"response.output_text.delta","delta":"hi"}`)
 	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
 		UpstreamSessionGeneration: generation,
 		ChannelID:                 17,
 		Kind:                      ProviderDownstreamFrame,
-		MessageType:               responsesWSTextMessageType,
-		Payload:                   payload,
+		Frame:                     responsesWSTestProviderTextFrame(payload),
 		Usage:                     &types.UsageEvent{InputTokens: 4, OutputTokens: 2, TotalTokens: 6},
-		Origin:                    runtimesession.RealtimePayloadOriginProvider,
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
 	})
 
 	if got := atomic.LoadInt32(&conn.writeCount); got != 1 {
@@ -3323,8 +7481,38 @@ func TestResponsesWSProviderDownstreamFrameWithUsageMergesBeforeWrite(t *testing
 	if attempt.Usage.PromptTokens != 4 || attempt.Usage.CompletionTokens != 2 || attempt.Usage.TotalTokens != 6 {
 		t.Fatalf("expected attached usage to merge into active attempt, got %+v", attempt.Usage)
 	}
-	if attempt.CompletedAt.IsZero() == false || attempt.QuotaFinalized || actor.activeAttempt != attempt {
-		t.Fatalf("expected non-terminal frame+usage not to complete/finalize/clear turn, completed=%s finalized=%v active=%v", attempt.CompletedAt, attempt.QuotaFinalized, actor.activeAttempt == attempt)
+	if attempt.CompletedAt.IsZero() == false || attempt.QuotaFinalized || actor.turns.active.attempt != attempt {
+		t.Fatalf("expected non-terminal frame+usage not to complete/finalize/clear turn, completed=%s finalized=%v active=%v", attempt.CompletedAt, attempt.QuotaFinalized, actor.turns.active.attempt == attempt)
+	}
+}
+
+func TestResponsesWSTerminalFrameWithResponseUsageAndAttachedUsageBillsOnce(t *testing.T) {
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-terminal-usage-once")
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	actor.turns.active.attempt = attempt
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+
+	payload := []byte(`{"type":"response.completed","response":{"id":"resp_usage_once","status":"completed","usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}`)
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame:                     responsesWSTestProviderTextFrame(payload),
+		Usage:                     &types.UsageEvent{InputTokens: 4, OutputTokens: 2, TotalTokens: 6},
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
+	})
+
+	if attempt.Usage.PromptTokens != 4 || attempt.Usage.CompletionTokens != 2 || attempt.Usage.TotalTokens != 6 {
+		t.Fatalf("expected terminal response usage and attached usage to bill once, got %+v", attempt.Usage)
+	}
+	if actor.turns.active.attempt != nil || actor.state != responsesWSStateIdle {
+		t.Fatalf("expected terminal to clear active turn, active=%+v state=%v", actor.turns.active.attempt, actor.state)
 	}
 }
 
@@ -3344,31 +7532,33 @@ func TestResponsesWSPendingProviderFrameWithUsageReplaysWithoutDoubleBilling(t *
 		SelectedChannelID: 17,
 		Usage:             &types.Usage{},
 	}
-	actor.pendingAttempt = attempt
+	actor.turns.pending.attempt = attempt
 	actor.state = responsesWSStatePendingSend
 
 	payload := []byte(`{"type":"response.output_text.delta","delta":"hi"}`)
 	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
 		UpstreamSessionGeneration: generation,
 		ChannelID:                 17,
 		Kind:                      ProviderDownstreamFrame,
-		MessageType:               responsesWSTextMessageType,
-		Payload:                   payload,
+		Frame:                     responsesWSTestProviderTextFrame(payload),
 		Usage:                     &types.UsageEvent{InputTokens: 4, OutputTokens: 2, TotalTokens: 6},
-		Origin:                    runtimesession.RealtimePayloadOriginProvider,
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
 	})
 
 	if attempt.Usage.PromptTokens != 4 || attempt.Usage.CompletionTokens != 2 || attempt.Usage.TotalTokens != 6 {
 		t.Fatalf("expected pending usage to merge once before replay, got %+v", attempt.Usage)
 	}
-	if len(actor.pendingProviderEvents) != 1 || actor.pendingProviderEvents[0].Usage != nil {
-		t.Fatalf("expected buffered replay event to clear usage after merge, got %+v", actor.pendingProviderEvents)
+	if len(actor.turns.pending.provider.journal.DownstreamEvents()) != 1 || actor.turns.pending.provider.journal.DownstreamEvents()[0].Usage != nil {
+		t.Fatalf("expected buffered replay event to clear usage after merge, got %+v", actor.turns.pending.provider.journal.DownstreamEvents())
 	}
 
 	actor.handleSendResult(ResponsesWSEventSendResult{
 		AttemptID:         "attempt-pending-frame-usage",
 		SelectedChannelID: 17,
-		Outcome:           SendOutcomeLocalWriteOK,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendAttempted,
+		},
 	})
 
 	if got := atomic.LoadInt32(&conn.writeCount); got != 1 {
@@ -3382,7 +7572,7 @@ func TestResponsesWSPendingProviderFrameWithUsageReplaysWithoutDoubleBilling(t *
 	}
 }
 
-func TestResponsesWSPendingTerminalWithUsageReplaysSideEffectsWithoutDoubleBilling(t *testing.T) {
+func TestResponsesWSPendingProviderBinaryFrameReplaysWithoutTerminalSideEffects(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	recorder := httptest.NewRecorder()
@@ -3394,35 +7584,83 @@ func TestResponsesWSPendingTerminalWithUsageReplaysSideEffectsWithoutDoubleBilli
 	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
 	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
 	attempt := &ResponsesWSTurnAttempt{
-		AttemptID:         "attempt-pending-terminal-usage",
+		AttemptID:         "attempt-pending-binary",
 		SelectedChannelID: 17,
 		Usage:             &types.Usage{},
 	}
-	actor.pendingAttempt = attempt
+	actor.turns.pending.attempt = attempt
+	actor.state = responsesWSStatePendingSend
+
+	payload := []byte(`{"type":"response.completed","response":{"id":"resp_binary_pending","status":"completed"}}`)
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame:                     responsesWSTestProviderBinaryFrame(payload),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
+	})
+
+	if !actor.hasPendingProviderEvidence() || len(actor.turns.pending.provider.journal.DownstreamEvents()) != 1 {
+		t.Fatalf("expected pending binary frame to be buffered as provider evidence, evidence=%v events=%d", actor.hasPendingProviderEvidence(), len(actor.turns.pending.provider.journal.DownstreamEvents()))
+	}
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:         "attempt-pending-binary",
+		SelectedChannelID: 17,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendAttempted,
+		},
+	})
+
+	if actor.closing.closed.Load() {
+		t.Fatal("expected pending binary replay not to close as malformed JSON")
+	}
+	if actor.turns.active.attempt != attempt || attempt.QuotaFinalized || actor.turns.history.lastFinal != nil {
+		t.Fatalf("expected binary replay to stay non-terminal, active=%+v finalized=%v last_final=%+v", actor.turns.active.attempt, attempt.QuotaFinalized, actor.turns.history.lastFinal)
+	}
+	if got := atomic.LoadInt32(&conn.lastMessageType); int(got) != responsesWSBinaryMessageType {
+		t.Fatalf("expected pending binary replay as binary message type, got %d", got)
+	}
+	if got, _ := conn.lastWrite.Load().(string); got != string(payload) {
+		t.Fatalf("expected pending binary payload to replay unchanged, got %q", got)
+	}
+}
+
+func TestResponsesWSPendingTerminalWithUsageReplaysSideEffectsWithoutDoubleBilling(t *testing.T) {
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000000, "attempt-pending-terminal-usage")
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	actor.turns.pending.attempt = attempt
 	actor.state = responsesWSStatePendingSend
 
 	payload := []byte(`{"type":"response.completed","response":{"id":"resp_pending_usage","status":"completed"}}`)
 	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
 		UpstreamSessionGeneration: generation,
 		ChannelID:                 17,
 		Kind:                      ProviderDownstreamFrame,
-		MessageType:               responsesWSTextMessageType,
-		Payload:                   payload,
+		Frame:                     responsesWSTestProviderTextFrame(payload),
 		Usage: &types.UsageEvent{
 			InputTokens:  3,
 			OutputTokens: 4,
 			TotalTokens:  7,
 			ExtraBilling: map[string]types.ExtraBilling{
-				types.APIToolTypeWebSearchPreview: {ServiceType: types.APIToolTypeWebSearchPreview, CallCount: 1},
+				types.APIToolTypeWebSearchPreview: {CallCount: 1},
 			},
 		},
-		Origin: runtimesession.RealtimePayloadOriginProvider,
+		DetailOrigin: responsesws.RecvDetailOriginProviderFrame,
 	})
 
 	actor.handleSendResult(ResponsesWSEventSendResult{
 		AttemptID:         "attempt-pending-terminal-usage",
 		SelectedChannelID: 17,
-		Outcome:           SendOutcomeLocalWriteOK,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendAttempted,
+		},
 	})
 
 	if attempt.Usage.PromptTokens != 3 || attempt.Usage.CompletionTokens != 4 || attempt.Usage.TotalTokens != 7 {
@@ -3431,8 +7669,9 @@ func TestResponsesWSPendingTerminalWithUsageReplaysSideEffectsWithoutDoubleBilli
 	if got := attempt.Usage.ExtraBilling[types.APIToolTypeWebSearchPreview].CallCount; got != 1 {
 		t.Fatalf("expected extra billing not to double count after replay, got %d in %+v", got, attempt.Usage.ExtraBilling)
 	}
-	if actor.lastFinal == nil || actor.lastFinal.ID != "resp_pending_usage" {
-		t.Fatalf("expected terminal side effects to run during replay, got %+v", actor.lastFinal)
+	if actor.turns.history.lastFinal == nil || actor.turns.history.lastFinal.ID != "resp_pending_usage" {
+		t.Fatalf("expected terminal side effects to run during replay, final=%+v closed=%v state=%v active=%+v finalized=%v rolled_back=%v settlement=%+v recent=%+v",
+			actor.turns.history.lastFinal, actor.closing.closed.Load(), actor.state, actor.turns.active.attempt, attempt.QuotaFinalized, attempt.RolledBack, attempt.AppliedSettlement, actor.turns.history.recentFinalizedResponseIDs)
 	}
 	if got, _ := conn.lastWrite.Load().(string); got != string(payload) {
 		t.Fatalf("expected terminal provider payload to be replayed, got %q", got)
@@ -3455,15 +7694,15 @@ func TestResponsesWSProviderUsageObservedOnlyUpdatesSettlementState(t *testing.T
 		SelectedChannelID: 17,
 		Usage:             &types.Usage{},
 	}
-	actor.activeAttempt = attempt
-	actor.activeChannelID = 17
+	actor.turns.active.attempt = attempt
+	actor.turns.active.channelID = 17
 	actor.state = responsesWSStateInFlight
 
 	actor.handleProviderUsageObserved(ResponsesWSEventProviderUsageObserved{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
 		UpstreamSessionGeneration: generation,
 		ChannelID:                 17,
 		Usage:                     &types.UsageEvent{InputTokens: 4, OutputTokens: 2, TotalTokens: 6},
-		Origin:                    runtimesession.RealtimePayloadOriginProvider,
 		ReceivedAt:                time.Now(),
 	})
 
@@ -3479,12 +7718,45 @@ func TestResponsesWSProviderUsageObservedOnlyUpdatesSettlementState(t *testing.T
 	if attempt.QuotaFinalized {
 		t.Fatal("expected usage-only event not to finalize quota")
 	}
-	if actor.activeAttempt != attempt || actor.activeChannelID != 17 || actor.state != responsesWSStateInFlight {
-		t.Fatalf("expected usage-only event not to clear active turn, active=%v channel=%d state=%v", actor.activeAttempt == attempt, actor.activeChannelID, actor.state)
+	if actor.turns.active.attempt != attempt || actor.turns.active.channelID != 17 || actor.state != responsesWSStateInFlight {
+		t.Fatalf("expected usage-only event not to clear active turn, active=%v channel=%d state=%v", actor.turns.active.attempt == attempt, actor.turns.active.channelID, actor.state)
 	}
 	if attempt.Usage.PromptTokens != 4 || attempt.Usage.CompletionTokens != 2 || attempt.Usage.TotalTokens != 6 {
 		t.Fatalf("expected usage-only event to merge settlement usage, got %+v", attempt.Usage)
 	}
+}
+
+func TestResponsesWSProviderUsageObservedRejectsProxyLocalUsage(t *testing.T) {
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-proxy-local-usage")
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	actor.turns.active.attempt = attempt
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.handleProviderUsageObserved(ResponsesWSEventProviderUsageObserved{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Usage:                     &types.UsageEvent{InputTokens: 4, OutputTokens: 2, TotalTokens: 6},
+		DetailOrigin:              responsesws.RecvDetailOriginBridgeStreamEOF,
+		ReceivedAt:                time.Now(),
+	})
+
+	if attempt.Usage.PromptTokens != 0 || attempt.Usage.CompletionTokens != 0 || attempt.Usage.TotalTokens != 0 {
+		t.Fatalf("expected invalid-origin usage not to enter settlement state, got %+v", attempt.Usage)
+	}
+	if actor.turns.active.evidence.HasActivity() {
+		t.Fatalf("expected invalid-origin usage not to enter provider observation log, got %+v", actor.turns.active.evidence)
+	}
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected proxy-local usage evidence violation to fail closed")
+	}
+	written, _ := conn.lastWrite.Load().(string)
+	assertResponsesWSErrorPayload(t, written, http.StatusBadGateway, "responses_ws_protocol_violation", "responses_ws_provider_usage_without_provider_evidence")
 }
 
 func TestResponsesWSProviderUsageObservedDropsUnpricedInputAudioTranscription(t *testing.T) {
@@ -3534,11 +7806,12 @@ func TestResponsesWSProviderUsageObservedDropsUnpricedInputAudioTranscription(t 
 		Quota:             relay_util.NewQuota(ctx, "gpt-5", 0),
 		Usage:             &types.Usage{},
 	}
-	actor.activeAttempt = attempt
-	actor.activeChannelID = 17
+	actor.turns.active.attempt = attempt
+	actor.turns.active.channelID = 17
 	actor.state = responsesWSStateInFlight
 
 	actor.handleProviderUsageObserved(ResponsesWSEventProviderUsageObserved{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
 		UpstreamSessionGeneration: generation,
 		ChannelID:                 17,
 		Usage: &types.UsageEvent{
@@ -3547,7 +7820,6 @@ func TestResponsesWSProviderUsageObservedDropsUnpricedInputAudioTranscription(t 
 			Source:       types.UsageSourceInputAudioTranscription,
 			BillingBasis: types.UsageBillingBasisTokens,
 		},
-		Origin:     runtimesession.RealtimePayloadOriginProvider,
 		ReceivedAt: time.Now(),
 	})
 
@@ -3560,8 +7832,97 @@ func TestResponsesWSProviderUsageObservedDropsUnpricedInputAudioTranscription(t 
 	if attempt.Usage.PromptTokens != 0 || attempt.Usage.CompletionTokens != 0 || attempt.Usage.TotalTokens != 0 {
 		t.Fatalf("expected unpriced transcription usage not to enter settlement, got %+v", attempt.Usage)
 	}
-	if !attempt.CompletedAt.IsZero() || attempt.QuotaFinalized || actor.activeAttempt != attempt || actor.state != responsesWSStateInFlight {
-		t.Fatalf("expected unpriced transcription usage not to mutate lifecycle, completed=%s finalized=%v active=%v state=%v", attempt.CompletedAt, attempt.QuotaFinalized, actor.activeAttempt == attempt, actor.state)
+	if !attempt.CompletedAt.IsZero() || attempt.QuotaFinalized || actor.turns.active.attempt != attempt || actor.state != responsesWSStateInFlight {
+		t.Fatalf("expected unpriced transcription usage not to mutate lifecycle, completed=%s finalized=%v active=%v state=%v", attempt.CompletedAt, attempt.QuotaFinalized, actor.turns.active.attempt == attempt, actor.state)
+	}
+}
+
+func TestResponsesWSPendingUnpricedInputAudioUsagePreservesProviderEvidence(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	originalPricing := model.PricingInstance
+	model.PricingInstance = &model.Pricing{Prices: map[string]*model.Price{
+		"gpt-5": {
+			Model: "gpt-5",
+			Type:  model.TokensPriceType,
+			Input: 1,
+		},
+	}}
+	t.Cleanup(func() {
+		model.PricingInstance = originalPricing
+	})
+
+	originalRecorder := recordUsageObservedUnbilled
+	recordUsageObservedUnbilled = func(source, model string) {}
+	t.Cleanup(func() {
+		recordUsageObservedUnbilled = originalRecorder
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	ctx.Set("group_ratio", 1.0)
+	ctx.Set("channel_id", 17)
+	ctx.Set("channel_type", config.ChannelTypeOpenAI)
+	ctx.Set("original_model", "gpt-5")
+	ctx.Set("new_model", "gpt-5")
+	ctx.Set("billing_original_model", true)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-pending-unpriced-transcription",
+		SelectedChannelID: 17,
+		Quota:             relay_util.NewQuota(ctx, "gpt-5", 0),
+		Usage:             &types.Usage{},
+	}
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.provider.journal = responsesWSProviderJournal{}
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+	t.Cleanup(func() {
+		actor.finish()
+	})
+
+	actor.handleProviderUsageObserved(ResponsesWSEventProviderUsageObserved{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Usage: &types.UsageEvent{
+			InputTokens:  4,
+			TotalTokens:  4,
+			Source:       types.UsageSourceInputAudioTranscription,
+			BillingBasis: types.UsageBillingBasisTokens,
+		},
+		ReceivedAt: time.Now(),
+	})
+
+	if !actor.hasPendingProviderEvidence() {
+		t.Fatal("expected unpriced usage-only provider event to preserve pending provider evidence")
+	}
+	if attempt.Usage.TotalTokens != 0 {
+		t.Fatalf("expected unpriced usage not to become billable usage, usage=%+v", attempt.Usage)
+	}
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendAmbiguous,
+			Err:    errors.New("write result unknown"),
+		},
+	})
+
+	if attempt.RolledBack || actor.turns.active.attempt != attempt || actor.state != responsesWSStateInFlight {
+		t.Fatalf("expected ambiguous send with provider evidence to commit attempt, rolledBack=%v active=%v state=%v", attempt.RolledBack, actor.turns.active.attempt == attempt, actor.state)
+	}
+	if !actor.turns.active.evidence.HasActivity() {
+		t.Fatalf("expected committed active attempt to retain provider evidence, got %+v", actor.turns.active.evidence)
+	}
+	if attempt.Usage.TotalTokens != 0 {
+		t.Fatalf("expected unpriced usage to remain excluded from settlement, got %+v", attempt.Usage)
 	}
 }
 
@@ -3611,11 +7972,12 @@ func TestResponsesWSProviderUsageObservedMergesPricedInputAudioTranscription(t *
 		Quota:             relay_util.NewQuota(ctx, "gpt-5", 0),
 		Usage:             &types.Usage{},
 	}
-	actor.activeAttempt = attempt
-	actor.activeChannelID = 17
+	actor.turns.active.attempt = attempt
+	actor.turns.active.channelID = 17
 	actor.state = responsesWSStateInFlight
 
 	actor.handleProviderUsageObserved(ResponsesWSEventProviderUsageObserved{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
 		UpstreamSessionGeneration: generation,
 		ChannelID:                 17,
 		Usage: &types.UsageEvent{
@@ -3624,7 +7986,6 @@ func TestResponsesWSProviderUsageObservedMergesPricedInputAudioTranscription(t *
 			Source:       types.UsageSourceInputAudioTranscription,
 			BillingBasis: types.UsageBillingBasisTokens,
 		},
-		Origin:     runtimesession.RealtimePayloadOriginProvider,
 		ReceivedAt: time.Now(),
 	})
 
@@ -3650,21 +8011,21 @@ func TestResponsesWSProviderUsageObservedWithoutTurnHasNoQuotaSemantics(t *testi
 	actor.state = responsesWSStateIdle
 
 	actor.handleProviderUsageObserved(ResponsesWSEventProviderUsageObserved{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
 		UpstreamSessionGeneration: generation,
 		ChannelID:                 17,
 		Usage:                     &types.UsageEvent{InputTokens: 4, OutputTokens: 2, TotalTokens: 6},
-		Origin:                    runtimesession.RealtimePayloadOriginProvider,
 		ReceivedAt:                time.Now(),
 	})
 
-	if actor.pendingAttempt != nil || actor.activeAttempt != nil || actor.pendingProviderEvidenceSeen || len(actor.pendingProviderEvents) != 0 {
-		t.Fatalf("expected orphan usage not to create turn quota state, pending=%v active=%v evidence=%v events=%d", actor.pendingAttempt != nil, actor.activeAttempt != nil, actor.pendingProviderEvidenceSeen, len(actor.pendingProviderEvents))
+	if actor.turns.pending.attempt != nil || actor.turns.active.attempt != nil || actor.hasPendingProviderEvidence() || len(actor.turns.pending.provider.journal.DownstreamEvents()) != 0 {
+		t.Fatalf("expected orphan usage not to create turn quota state, pending=%v active=%v evidence=%v events=%d", actor.turns.pending.attempt != nil, actor.turns.active.attempt != nil, actor.hasPendingProviderEvidence(), len(actor.turns.pending.provider.journal.DownstreamEvents()))
 	}
 	if got := atomic.LoadInt32(&conn.writeCount); got != 0 {
 		t.Fatalf("expected orphan usage not to write downstream, got %d writes", got)
 	}
-	if actor.closed.Load() || actor.state != responsesWSStateIdle {
-		t.Fatalf("expected orphan usage not to close or mutate actor lifecycle, closed=%v state=%v", actor.closed.Load(), actor.state)
+	if actor.closing.closed.Load() || actor.state != responsesWSStateIdle {
+		t.Fatalf("expected orphan usage not to close or mutate actor lifecycle, closed=%v state=%v", actor.closing.closed.Load(), actor.state)
 	}
 }
 
@@ -3686,24 +8047,20 @@ func TestResponsesWSProviderRecvPumpDeletesArmedGenerationOnExit(t *testing.T) {
 		t.Fatal("expected provider generation to be armed")
 	}
 
-	session.responses <- responsesWSRecvResult{err: runtimesession.ErrSessionClosed}
+	session.responses <- responsesWSRecvResult{err: responsesws.ErrUpstreamClosed}
 	event := readResponsesWSEvent(t, actor)
 	if providerErr, ok := event.(ResponsesWSEventProviderBusinessError); !ok || providerErr.UpstreamSessionGeneration != generation {
 		t.Fatalf("expected provider business error event, got %#v", event)
 	}
 
-	deadline := time.After(time.Second)
-	for {
+	waitResponsesWSTestCondition(t, time.Second, 10*time.Millisecond, func() bool {
 		if _, ok := bridge.armed.Load(generation); !ok {
-			return
+			return true
 		}
-		select {
-		case <-deadline:
-			t.Fatal("expected provider recv pump to delete armed generation on exit")
-		default:
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
+		return false
+	}, func() string {
+		return "expected provider recv pump to delete armed generation on exit"
+	})
 }
 
 func TestResponsesWSTurnAttemptFinalUsageStartsWithoutPromptEstimate(t *testing.T) {
@@ -3907,26 +8264,11 @@ func TestResponsesWSUsageEventAccumulatesExtraBilling(t *testing.T) {
 	}
 }
 
-func TestResponsesWSSendOutcomeFromErrorClassifiesWriteFailureAmbiguous(t *testing.T) {
-	if got := responsesWSSendOutcomeFromError(types.NewErrorEvent("", "provider_error", "ws_write_failed", "timeout")); got != SendOutcomeAmbiguous {
-		t.Fatalf("expected websocket write failure to be ambiguous, got %v", got)
-	}
-	if got := responsesWSSendOutcomeFromError(types.NewErrorEvent("", "provider_error", "previous_response_not_found", "missing")); got != SendOutcomeNotSent {
-		t.Fatalf("expected local provider rejection before write proof to be not-sent, got %v", got)
-	}
-	if got := responsesWSSendOutcomeFromError(types.NewErrorEvent("", "provider_error", "upstream_timeout", "timeout")); got != SendOutcomeAmbiguous {
-		t.Fatalf("expected unknown provider error to be ambiguous, got %v", got)
-	}
-	if got := responsesWSSendOutcomeFromError(runtimesession.ErrSessionClosed); got != SendOutcomeNotSent {
-		t.Fatalf("expected closed session before write to be not-sent, got %v", got)
-	}
-	if got := responsesWSSendOutcomeFromError(runtimesession.ErrStaleResponsesWSContinuation); got != SendOutcomeNotSent {
-		t.Fatalf("expected stale local continuation guard to be not-sent, got %v", got)
-	}
-	if isProviderReportedContinuationMiss(runtimesession.ErrStaleResponsesWSContinuation) {
+func TestResponsesWSLocalStaleContinuationDoesNotClearProviderAffinity(t *testing.T) {
+	if isProviderReportedContinuationMiss(responsesws.ErrStaleContinuation) {
 		t.Fatal("expected local stale continuation guard not to clear provider affinity")
 	}
-	payload := string(responsesWSErrorFromErr(runtimesession.ErrStaleResponsesWSContinuation))
+	payload := string(responsesWSErrorFromErr(responsesws.ErrStaleContinuation))
 	assertResponsesWSErrorPayload(t, payload, http.StatusConflict, "previous_response_not_found", "previous response was not found")
 	if !strings.Contains(payload, `"param":"previous_response_id"`) {
 		t.Fatalf("expected previous_response_id param in stale payload, got %q", payload)
@@ -3941,8 +8283,8 @@ func TestResponsesWSActorCloseRollsBackPendingAttemptWithoutProviderEvidence(t *
 	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
 
 	prepareActor := NewResponsesWSSessionActor(ctx)
-	prepareAttempt := &ResponsesWSTurnAttempt{}
-	prepareActor.pendingAttempt = prepareAttempt
+	prepareAttempt := &ResponsesWSTurnAttempt{AttemptID: "attempt-pending-prepare-close"}
+	prepareActor.turns.pending.attempt = prepareAttempt
 	prepareActor.state = responsesWSStatePendingPrepare
 	prepareActor.close("test_pending_prepare")
 	if !prepareAttempt.RolledBack {
@@ -3951,7 +8293,7 @@ func TestResponsesWSActorCloseRollsBackPendingAttemptWithoutProviderEvidence(t *
 
 	sendActor := NewResponsesWSSessionActor(ctx)
 	sendAttempt := &ResponsesWSTurnAttempt{}
-	sendActor.pendingAttempt = sendAttempt
+	sendActor.turns.pending.attempt = sendAttempt
 	sendActor.state = responsesWSStatePendingSend
 	sendActor.close("test_pending_send")
 	if sendAttempt.RolledBack {
@@ -3959,8 +8301,14 @@ func TestResponsesWSActorCloseRollsBackPendingAttemptWithoutProviderEvidence(t *
 	}
 
 	notSentActor := NewResponsesWSSessionActor(ctx)
-	notSentAttempt := &ResponsesWSTurnAttempt{SendOutcome: SendOutcomeNotSent}
-	notSentActor.pendingAttempt = notSentAttempt
+	notSentAttempt := &ResponsesWSTurnAttempt{
+		AttemptID: "attempt-not-sent-close",
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendNotAttempted,
+			Err:    responsesws.ErrUpstreamClosed,
+		},
+	}
+	notSentActor.turns.pending.attempt = notSentAttempt
 	notSentActor.state = responsesWSStatePendingSend
 	notSentActor.close("test_not_sent")
 	if !notSentAttempt.RolledBack {
@@ -3968,21 +8316,204 @@ func TestResponsesWSActorCloseRollsBackPendingAttemptWithoutProviderEvidence(t *
 	}
 }
 
+func TestResponsesWSSendQueueFullNotSentBeatsQueuedClientClose(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-send-queue-full-close-race",
+		SelectedChannelID: 17,
+		QuotaPreconsumed:  true,
+		Usage:             &types.Usage{},
+	}
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.provider.journal = responsesWSProviderJournal{}
+	actor.turns.pending.provider.journal.AppendDownstreamReplay(ResponsesWSEventProviderDownstream{
+		ChannelID: 17,
+	})
+	actor.turns.pending.provider.journal.bytes = 123
+	actor.turns.pending.provider.journal.AppendFailureReplay(ResponsesWSEventProviderRecvFailed{
+		ChannelID: 17,
+		Err:       errors.New("stale pending failure"),
+	})
+	actor.turns.pending.provider.bridgeOpenLocalErrorAttemptID = "stale-marker"
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+	if !actor.Post(ResponsesWSEventClientClosed{}) {
+		t.Fatal("expected queued client close")
+	}
+
+	actor.handleSendQueueFull(attempt.AttemptID, 17)
+
+	if !attempt.RolledBack || attempt.QuotaPreconsumed {
+		t.Fatalf("expected synchronous NotSent to rollback before queued close can settle, attempt=%+v", attempt)
+	}
+	if actor.turns.pending.attempt != nil || actor.turns.pending.phase != responsesWSPendingTurnNone || actor.state != responsesWSStateIdle {
+		t.Fatalf("expected actor to return idle after send queue full, state=%v phase=%v pending=%+v", actor.state, actor.turns.pending.phase, actor.turns.pending.attempt)
+	}
+	if len(actor.turns.pending.provider.journal.DownstreamEvents()) != 0 || actor.turns.pending.provider.journal.bytes != 0 || len(actor.turns.pending.provider.journal.Failures()) != 0 || !actor.turns.pending.provider.journal.Project().IsZero() || actor.turns.pending.provider.bridgeOpenLocalErrorAttemptID != "" {
+		t.Fatalf("expected NotSent cleanup to clear pending provider state, events=%d bytes=%d failures=%d evidence=%+v marker=%q",
+			len(actor.turns.pending.provider.journal.DownstreamEvents()), actor.turns.pending.provider.journal.bytes, len(actor.turns.pending.provider.journal.Failures()), actor.turns.pending.provider.journal.Project(), actor.turns.pending.provider.bridgeOpenLocalErrorAttemptID)
+	}
+	if got, _ := conn.lastWrite.Load().(string); got == "" {
+		t.Fatal("expected client-facing send failure payload")
+	}
+	if generation == "" {
+		t.Fatal("expected attached generation")
+	}
+}
+
+func TestResponsesWSActorCloseAfterRecoverableBridgeOpenProviderErrorRollsBackPendingQuota(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-bridge-open-provider-error-close",
+		SelectedChannelID: 17,
+		QuotaPreconsumed:  true,
+		Usage:             &types.Usage{},
+	}
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	actor.handleEvent(ResponsesWSEventBridgeOpenProviderError{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		AttemptID:                 attempt.AttemptID,
+		Payload:                   responsesWSErrorPayload(http.StatusTooManyRequests, "provider_rate_limit", "provider rejected stream open"),
+		Recoverable:               true,
+	})
+
+	if actor.hasPendingProviderEvidence() || !actor.pendingBridgeOpenProviderErrorRecorded() {
+		t.Fatalf("expected bridge open provider error proof without provider activity, evidence=%+v", actor.turns.pending.provider.journal.Project())
+	}
+	actor.markPendingCreateCancel(attempt.AttemptID, responsesWSTestClientTextFrame([]byte(`{"type":"response.cancel"}`)))
+
+	actor.close("client_closed_before_rejected_send_result")
+
+	if !attempt.RolledBack || attempt.QuotaPreconsumed || attempt.QuotaFinalized {
+		t.Fatalf("expected close after bridge open provider error to rollback without finalize, attempt=%+v", attempt)
+	}
+	if actor.turns.history.lastFinal != nil {
+		t.Fatalf("expected bridge open provider error close not to submit terminal side effect, got %+v", actor.turns.history.lastFinal)
+	}
+	if actor.turns.pending.cancel.createAttemptID != "" || !actor.turns.pending.cancel.createFrame.IsZero() {
+		t.Fatalf("expected close to clear pending create cancel marker, attempt_id=%q frame=%+v",
+			actor.turns.pending.cancel.createAttemptID, actor.turns.pending.cancel.createFrame)
+	}
+}
+
+func TestResponsesWSRecoverableBridgeOpenProviderErrorWithActivitySettlesWithoutFailClosed(t *testing.T) {
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-bridge-open-provider-conflict")
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.provider.journal = responsesWSTestProviderFrameJournal()
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	actor.handleEvent(ResponsesWSEventBridgeOpenProviderError{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		AttemptID:                 attempt.AttemptID,
+		Payload:                   responsesWSErrorPayload(http.StatusTooManyRequests, "provider_rate_limit", "provider rejected stream open"),
+		Recoverable:               true,
+	})
+
+	if attempt.RolledBack {
+		t.Fatalf("expected provider activity to suppress bridge rejection rollback, attempt=%+v", attempt)
+	}
+	if !attempt.QuotaFinalized {
+		t.Fatalf("expected provider rejection/activity conflict to finalize conservatively, attempt=%+v", attempt)
+	}
+	if actor.closing.closed.Load() {
+		t.Fatal("expected provider rejection/activity conflict not to fail closed")
+	}
+	if actor.turns.pending.attempt != nil || actor.turns.active.attempt != nil {
+		t.Fatalf("expected conflict cleanup to clear turn state, pending=%+v active=%+v", actor.turns.pending.attempt, actor.turns.active.attempt)
+	}
+}
+
+func TestResponsesWSRejectedBeforeStreamAfterRecoveredProviderActivitySettlesWithoutFailClosed(t *testing.T) {
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-bridge-open-provider-late-conflict")
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	actor.handleEvent(ResponsesWSEventBridgeOpenProviderError{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		AttemptID:                 attempt.AttemptID,
+		Payload:                   responsesWSErrorPayload(http.StatusTooManyRequests, "provider_rate_limit", "provider rejected stream open"),
+		Recoverable:               true,
+	})
+	if actor.closing.closed.Load() || attempt.RolledBack || !actor.pendingBridgeOpenProviderErrorRecorded() {
+		t.Fatalf("expected recoverable provider rejection proof to wait for send result, closed=%v attempt=%+v evidence=%+v", actor.closing.closed.Load(), attempt, actor.turns.pending.provider.journal.Project())
+	}
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.created","response":{"id":"resp_conflict","status":"in_progress"}}`)),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
+	})
+	if !actor.hasPendingProviderEvidence() {
+		t.Fatalf("expected provider activity to be retained before rejected send result, evidence=%+v", actor.turns.pending.provider.journal.Project())
+	}
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendRejectedBeforeStream,
+		},
+	})
+
+	if attempt.RolledBack {
+		t.Fatalf("expected provider activity to suppress rejected_before_stream rollback, attempt=%+v", attempt)
+	}
+	if !attempt.QuotaFinalized {
+		t.Fatalf("expected rejected_before_stream/activity conflict to finalize conservatively, attempt=%+v", attempt)
+	}
+	if actor.closing.closed.Load() {
+		t.Fatal("expected rejected_before_stream/activity conflict not to fail closed")
+	}
+	if actor.turns.pending.attempt != nil || actor.turns.pending.phase != responsesWSPendingTurnNone {
+		t.Fatalf("expected rejected_before_stream/activity conflict to clear pending turn, pending=%+v phase=%v", actor.turns.pending.attempt, actor.turns.pending.phase)
+	}
+}
+
 func TestResponsesWSActorClosePendingSendUnknownPreservesPreConsumedQuota(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	originalDB := model.DB
-	testDB, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))), &gorm.Config{})
-	if err != nil {
-		t.Fatalf("expected in-memory sqlite database, got %v", err)
-	}
-	if err := testDB.AutoMigrate(&model.User{}, &model.Token{}, &model.Log{}); err != nil {
-		t.Fatalf("expected quota settlement schema migration to succeed, got %v", err)
-	}
-	model.DB = testDB
-	t.Cleanup(func() {
-		model.DB = originalDB
-	})
+	setupRelayTestDB(t, &model.User{}, &model.Token{}, &model.Log{})
 
 	originalPricing := model.PricingInstance
 	model.PricingInstance = &model.Pricing{
@@ -4052,9 +8583,10 @@ func TestResponsesWSActorClosePendingSendUnknownPreservesPreConsumedQuota(t *tes
 	if apiErr := attempt.PreConsumeQuota(); apiErr != nil {
 		t.Fatalf("expected quota preconsume to succeed, got %v", apiErr)
 	}
+	attempt.AttemptID = "attempt-pending-send-unknown-close"
 
 	actor := NewResponsesWSSessionActor(ctx)
-	actor.pendingAttempt = attempt
+	actor.turns.pending.attempt = attempt
 	actor.state = responsesWSStatePendingSend
 	actor.close("test_no_terminal_settle")
 
@@ -4084,10 +8616,10 @@ func TestResponsesWSActorClosePendingSendUnknownPreservesPreConsumedQuota(t *tes
 func TestResponsesWSActorCloseProviderAcceptedWithoutUsagePreservesPreConsumedFloor(t *testing.T) {
 	ctx := setupResponsesWSQuotaFixture(t, 1000)
 	attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
-	attempt.MarkProviderAcceptedTurnEvidence()
 
 	actor := NewResponsesWSSessionActor(ctx)
-	actor.activeAttempt = attempt
+	actor.turns.active.attempt = attempt
+	actor.turns.active.evidence = responsesWSTestProviderFrameProjection()
 	actor.state = responsesWSStateInFlight
 	actor.close("test_provider_accepted_no_usage")
 
@@ -4110,10 +8642,10 @@ func TestResponsesWSActorCloseProviderAcceptedWithoutUsagePreservesPreConsumedFl
 func TestResponsesWSActorCloseUsageSeenWithoutTokenCountsPreservesPreConsumedFloor(t *testing.T) {
 	ctx := setupResponsesWSQuotaFixture(t, 1000)
 	attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
-	attempt.MarkProviderUsageSeen()
 
 	actor := NewResponsesWSSessionActor(ctx)
-	actor.activeAttempt = attempt
+	actor.turns.active.attempt = attempt
+	actor.turns.active.evidence = responsesWSTestProviderUsageProjection()
 	actor.state = responsesWSStateInFlight
 	actor.close("test_provider_usage_seen_no_tokens")
 
@@ -4141,19 +8673,19 @@ func TestResponsesWSActorCancelledTerminalFinalizesAndClearsActiveTurn(t *testin
 	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
 	bridge := NewResponsesWSIOBridge(conn, actor)
 	actor.SetBridge(bridge)
-	actor.activeAttempt = attempt
-	actor.activeChannelID = 17
+	actor.turns.active.attempt = attempt
+	actor.turns.active.channelID = 17
 	actor.state = responsesWSStateInFlight
 
 	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
-		Kind:        ProviderDownstreamFrame,
-		MessageType: responsesWSTextMessageType,
-		Payload:     []byte(`{"type":"response.cancelled","response":{"id":"resp_cancel","status":"cancelled","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}`),
-		Origin:      runtimesession.RealtimePayloadOriginProvider,
+		AttemptID:    responsesWSTestCurrentAttemptID(actor),
+		Kind:         ProviderDownstreamFrame,
+		Frame:        responsesWSTestProviderTextFrame([]byte(`{"type":"response.cancelled","response":{"id":"resp_cancel","status":"cancelled","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}`)),
+		DetailOrigin: responsesws.RecvDetailOriginProviderFrame,
 	})
 
-	if actor.activeAttempt != nil || actor.activeChannelID != 0 || actor.state != responsesWSStateIdle {
-		t.Fatalf("expected cancelled terminal to clear active turn, active=%v channel=%d state=%v", actor.activeAttempt != nil, actor.activeChannelID, actor.state)
+	if actor.turns.active.attempt != nil || actor.turns.active.channelID != 0 || actor.state != responsesWSStateIdle {
+		t.Fatalf("expected cancelled terminal to clear active turn, active=%v channel=%d state=%v", actor.turns.active.attempt != nil, actor.turns.active.channelID, actor.state)
 	}
 	if !attempt.QuotaFinalized || attempt.RolledBack {
 		t.Fatalf("expected cancelled terminal with usage to finalize quota, finalized=%v rolled=%v", attempt.QuotaFinalized, attempt.RolledBack)
@@ -4182,22 +8714,23 @@ func TestResponsesWSSettlementLogMarksStreamProtocolAndTiming(t *testing.T) {
 	if apiErr := attempt.PreConsumeQuota(); apiErr != nil {
 		t.Fatalf("expected quota preconsume to succeed, got %v", apiErr)
 	}
+	attempt.AttemptID = "attempt-settlement-log"
 	attempt.MarkFirstProviderResponse(firstResponseAt)
 
 	actor := NewResponsesWSSessionActor(ctx)
 	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
 	bridge := NewResponsesWSIOBridge(conn, actor)
 	actor.SetBridge(bridge)
-	actor.activeAttempt = attempt
-	actor.activeChannelID = 17
+	actor.turns.active.attempt = attempt
+	actor.turns.active.channelID = 17
 	actor.state = responsesWSStateInFlight
 
 	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
-		Kind:        ProviderDownstreamFrame,
-		MessageType: responsesWSTextMessageType,
-		Payload:     []byte(`{"type":"response.completed","response":{"id":"resp_done","status":"completed","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}`),
-		Origin:      runtimesession.RealtimePayloadOriginProvider,
-		ReceivedAt:  completedAt,
+		AttemptID:    responsesWSTestCurrentAttemptID(actor),
+		Kind:         ProviderDownstreamFrame,
+		Frame:        responsesWSTestProviderTextFrame([]byte(`{"type":"response.completed","response":{"id":"resp_done","status":"completed","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}`)),
+		DetailOrigin: responsesws.RecvDetailOriginProviderFrame,
+		ReceivedAt:   completedAt,
 	})
 
 	var log model.Log
@@ -4224,7 +8757,7 @@ func TestResponsesWSActorCloseActiveNoProviderEvidencePreservesPreConsumedFloor(
 	attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
 
 	actor := NewResponsesWSSessionActor(ctx)
-	actor.activeAttempt = attempt
+	actor.turns.active.attempt = attempt
 	actor.state = responsesWSStateInFlight
 	actor.close("client_closed")
 
@@ -4237,6 +8770,1117 @@ func TestResponsesWSActorCloseActiveNoProviderEvidencePreservesPreConsumedFloor(
 	}
 	if token.RemainQuota != 900 || token.UsedQuota != 100 {
 		t.Fatalf("expected active no-evidence close to keep token preconsume, remain=%d used=%d", token.RemainQuota, token.UsedQuota)
+	}
+}
+
+func configureResponsesWSTokenPricingFloor(t *testing.T, floor int) {
+	t.Helper()
+	originalPricing := model.PricingInstance
+	originalPreConsumedQuota := config.PreConsumedQuota
+	model.PricingInstance = &model.Pricing{
+		Prices: map[string]*model.Price{
+			"gpt-5": {
+				Model:  "gpt-5",
+				Type:   model.TokensPriceType,
+				Input:  1,
+				Output: 1,
+			},
+		},
+	}
+	config.PreConsumedQuota = floor
+	t.Cleanup(func() {
+		model.PricingInstance = originalPricing
+		config.PreConsumedQuota = originalPreConsumedQuota
+	})
+}
+
+func TestResponsesWSApplySettlementDecisionUsesFixedFinalQuota(t *testing.T) {
+	t.Run("terminal exact below floor refunds to exact", func(t *testing.T) {
+		ctx := setupResponsesWSQuotaFixture(t, 1000)
+		configureResponsesWSTokenPricingFloor(t, 100)
+		attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+		response := &types.OpenAIResponsesResponses{
+			ID:     "resp_exact",
+			Status: types.ResponseStatusCompleted,
+			Usage:  &types.ResponsesUsage{InputTokens: 10, TotalTokens: 10},
+		}
+		mergeResponsesWSTerminalResponse(attempt.Usage, response)
+		attempt.MarkProviderTerminalEvidence(responsesws.ClassifyResponsesWSTerminal("response.completed", response, false))
+
+		actor := NewResponsesWSSessionActor(ctx)
+		actor.turns.active.attempt = attempt
+		_, applied, err := actor.applyActiveSettlement(actor.buildActiveSettlementInput("terminal", ResponsesWSZeroChargeProof{}))
+		if err != nil {
+			t.Fatalf("expected exact settlement to succeed, got %v", err)
+		}
+		if applied.AppliedFinalQuota != 10 {
+			t.Fatalf("expected terminal exact applied quota 10 below floor, got %d", applied.AppliedFinalQuota)
+		}
+		user, token := readResponsesWSQuotaFixture(t)
+		if user.Quota != 990 || user.UsedQuota != 10 || token.RemainQuota != 990 || token.UsedQuota != 10 {
+			t.Fatalf("expected exact final quota 10, user=%+v token=%+v", user, token)
+		}
+		log := readResponsesWSConsumeLog(t)
+		if log.Quota != 10 || log.PromptTokens != 10 || log.CompletionTokens != 0 {
+			t.Fatalf("expected exact consume log to preserve terminal usage, got %+v", log)
+		}
+	})
+
+	t.Run("terminal explicit zero usage refunds to zero", func(t *testing.T) {
+		ctx := setupResponsesWSQuotaFixture(t, 1000)
+		configureResponsesWSTokenPricingFloor(t, 100)
+		attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+		response := &types.OpenAIResponsesResponses{
+			ID:     "resp_exact_zero",
+			Status: types.ResponseStatusCompleted,
+			Usage:  &types.ResponsesUsage{},
+		}
+		mergeResponsesWSTerminalResponse(attempt.Usage, response)
+		attempt.MarkProviderTerminalEvidence(responsesws.ClassifyResponsesWSTerminal("response.completed", response, false))
+
+		actor := NewResponsesWSSessionActor(ctx)
+		actor.turns.active.attempt = attempt
+		decision, applied, err := actor.applyActiveSettlement(actor.buildActiveSettlementInput("terminal_zero", ResponsesWSZeroChargeProof{}))
+		if err != nil {
+			t.Fatalf("expected exact zero settlement to succeed, got %v decision=%+v", err, decision)
+		}
+		if decision.Action != ResponsesWSSettlementFinalizeExactUsage || decision.Basis != ResponsesWSSettlementBasisTerminalUsage {
+			t.Fatalf("expected explicit terminal usage to use exact settlement, decision=%+v", decision)
+		}
+		if applied.AppliedFinalQuota != 0 {
+			t.Fatalf("expected terminal exact zero applied quota, got %d", applied.AppliedFinalQuota)
+		}
+		user, token := readResponsesWSQuotaFixture(t)
+		if user.Quota != 1000 || user.UsedQuota != 0 || token.RemainQuota != 1000 || token.UsedQuota != 0 {
+			t.Fatalf("expected exact final quota 0 to refund preconsume, user=%+v token=%+v", user, token)
+		}
+	})
+
+	t.Run("terminal explicit zero ignores previously observed usage", func(t *testing.T) {
+		ctx := setupResponsesWSQuotaFixture(t, 1000)
+		configureResponsesWSTokenPricingFloor(t, 100)
+		attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+		mergeResponsesWSUsageEvent(attempt.Usage, &types.UsageEvent{InputTokens: 10, TotalTokens: 10})
+		response := &types.OpenAIResponsesResponses{
+			ID:     "resp_exact_zero_after_observed",
+			Status: types.ResponseStatusCompleted,
+			Usage:  &types.ResponsesUsage{},
+		}
+		mergeResponsesWSTerminalResponse(attempt.Usage, response)
+		attempt.MarkProviderTerminalEvidence(responsesws.ClassifyResponsesWSTerminal("response.completed", response, false))
+
+		actor := NewResponsesWSSessionActor(ctx)
+		actor.turns.active.attempt = attempt
+		decision, applied, err := actor.applyActiveSettlement(actor.buildActiveSettlementInput("terminal_zero_after_observed", ResponsesWSZeroChargeProof{}))
+		if err != nil {
+			t.Fatalf("expected exact zero settlement to succeed, got %v decision=%+v", err, decision)
+		}
+		if decision.ExpectedFinalQuota != 0 || applied.AppliedFinalQuota != 0 {
+			t.Fatalf("expected terminal snapshot zero to win over observed usage, decision=%+v applied=%+v", decision, applied)
+		}
+		user, token := readResponsesWSQuotaFixture(t)
+		if user.Quota != 1000 || user.UsedQuota != 0 || token.RemainQuota != 1000 || token.UsedQuota != 0 {
+			t.Fatalf("expected exact final quota 0 after observed usage, user=%+v token=%+v", user, token)
+		}
+	})
+
+	t.Run("terminal smaller snapshot ignores stale observed output tokens", func(t *testing.T) {
+		ctx := setupResponsesWSQuotaFixture(t, 1000)
+		configureResponsesWSTokenPricingFloor(t, 100)
+		attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+		mergeResponsesWSUsageEvent(attempt.Usage, &types.UsageEvent{InputTokens: 10, OutputTokens: 90, TotalTokens: 100})
+		response := &types.OpenAIResponsesResponses{
+			ID:     "resp_exact_ten_after_observed",
+			Status: types.ResponseStatusCompleted,
+			Usage:  &types.ResponsesUsage{InputTokens: 10, TotalTokens: 10},
+		}
+		mergeResponsesWSTerminalResponse(attempt.Usage, response)
+		attempt.MarkProviderTerminalEvidence(responsesws.ClassifyResponsesWSTerminal("response.completed", response, false))
+
+		actor := NewResponsesWSSessionActor(ctx)
+		actor.turns.active.attempt = attempt
+		decision, applied, err := actor.applyActiveSettlement(actor.buildActiveSettlementInput("terminal_ten_after_observed", ResponsesWSZeroChargeProof{}))
+		if err != nil {
+			t.Fatalf("expected exact smaller settlement to succeed, got %v decision=%+v", err, decision)
+		}
+		if decision.ExpectedFinalQuota != 10 || applied.AppliedFinalQuota != 10 {
+			t.Fatalf("expected terminal snapshot quota 10 to win over observed usage, decision=%+v applied=%+v", decision, applied)
+		}
+		log := readResponsesWSConsumeLog(t)
+		if log.Quota != 10 || log.PromptTokens != 10 || log.CompletionTokens != 0 {
+			t.Fatalf("expected exact consume log to use terminal snapshot, got %+v", log)
+		}
+	})
+
+	t.Run("terminal positive tokens on zero price model refunds to zero", func(t *testing.T) {
+		ctx := setupResponsesWSQuotaFixture(t, 1000)
+		originalPricing := model.PricingInstance
+		originalPreConsumedQuota := config.PreConsumedQuota
+		model.PricingInstance = &model.Pricing{
+			Prices: map[string]*model.Price{
+				"gpt-5": {
+					Model:  "gpt-5",
+					Type:   model.TokensPriceType,
+					Input:  0,
+					Output: 0,
+				},
+			},
+		}
+		config.PreConsumedQuota = 100
+		t.Cleanup(func() {
+			model.PricingInstance = originalPricing
+			config.PreConsumedQuota = originalPreConsumedQuota
+		})
+		attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+		response := &types.OpenAIResponsesResponses{
+			ID:     "resp_exact_zero_price",
+			Status: types.ResponseStatusCompleted,
+			Usage:  &types.ResponsesUsage{InputTokens: 10, TotalTokens: 10},
+		}
+		mergeResponsesWSTerminalResponse(attempt.Usage, response)
+		attempt.MarkProviderTerminalEvidence(responsesws.ClassifyResponsesWSTerminal("response.completed", response, false))
+
+		actor := NewResponsesWSSessionActor(ctx)
+		actor.turns.active.attempt = attempt
+		decision, applied, err := actor.applyActiveSettlement(actor.buildActiveSettlementInput("terminal_zero_price", ResponsesWSZeroChargeProof{}))
+		if err != nil {
+			t.Fatalf("expected zero-price terminal settlement to succeed, got %v decision=%+v", err, decision)
+		}
+		if decision.Action != ResponsesWSSettlementFinalizeExactUsage || decision.Basis != ResponsesWSSettlementBasisTerminalUsage {
+			t.Fatalf("expected zero-price terminal usage to use exact settlement, decision=%+v", decision)
+		}
+		if applied.AppliedFinalQuota != 0 {
+			t.Fatalf("expected zero-price terminal exact applied quota 0, got %d", applied.AppliedFinalQuota)
+		}
+		user, token := readResponsesWSQuotaFixture(t)
+		if user.Quota != 1000 || user.UsedQuota != 0 || token.RemainQuota != 1000 || token.UsedQuota != 0 {
+			t.Fatalf("expected zero-price exact final quota 0 to refund preconsume, user=%+v token=%+v", user, token)
+		}
+	})
+
+	t.Run("observed below floor preserves floor", func(t *testing.T) {
+		ctx := setupResponsesWSQuotaFixture(t, 1000)
+		configureResponsesWSTokenPricingFloor(t, 100)
+		attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+		mergeResponsesWSUsageEvent(attempt.Usage, &types.UsageEvent{InputTokens: 10, TotalTokens: 10})
+		floor := int64(attempt.Quota.PreConsumedQuota())
+
+		actor := NewResponsesWSSessionActor(ctx)
+		actor.turns.active.attempt = attempt
+		actor.turns.active.evidence = responsesWSTestProviderUsageProjection()
+		_, applied, err := actor.applyActiveSettlement(actor.buildActiveSettlementInput("usage_only", ResponsesWSZeroChargeProof{}))
+		if err != nil {
+			t.Fatalf("expected observed settlement to succeed, got %v", err)
+		}
+		if applied.AppliedFinalQuota != floor {
+			t.Fatalf("expected observed below floor to apply floor %d, got %d", floor, applied.AppliedFinalQuota)
+		}
+		user, token := readResponsesWSQuotaFixture(t)
+		if user.Quota != 1000-int(floor) || user.UsedQuota != int(floor) || token.RemainQuota != 1000-int(floor) || token.UsedQuota != int(floor) {
+			t.Fatalf("expected floor final quota 100, user=%+v token=%+v", user, token)
+		}
+		log := readResponsesWSConsumeLog(t)
+		if log.Quota != int(floor) || log.PromptTokens != 10 || log.CompletionTokens != 0 {
+			t.Fatalf("expected observed floor consume log to preserve observed usage, got %+v", log)
+		}
+	})
+
+	t.Run("pure floor has empty usage summary", func(t *testing.T) {
+		ctx := setupResponsesWSQuotaFixture(t, 1000)
+		configureResponsesWSTokenPricingFloor(t, 100)
+		attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+		floor := int64(attempt.Quota.PreConsumedQuota())
+
+		actor := NewResponsesWSSessionActor(ctx)
+		actor.turns.active.attempt = attempt
+		_, applied, err := actor.applyActiveSettlement(actor.buildActiveSettlementInput("uncertain_floor", ResponsesWSZeroChargeProof{}))
+		if err != nil {
+			t.Fatalf("expected floor settlement to succeed, got %v", err)
+		}
+		if applied.AppliedFinalQuota != floor {
+			t.Fatalf("expected pure floor applied quota %d, got %d", floor, applied.AppliedFinalQuota)
+		}
+		log := readResponsesWSConsumeLog(t)
+		if log.Quota != int(floor) || log.PromptTokens != 0 || log.CompletionTokens != 0 {
+			t.Fatalf("expected pure floor consume log to omit usage details, got %+v", log)
+		}
+	})
+
+	t.Run("zero proof rolls back reserve", func(t *testing.T) {
+		ctx := setupResponsesWSQuotaFixture(t, 1000)
+		configureResponsesWSTokenPricingFloor(t, 100)
+		attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+
+		actor := NewResponsesWSSessionActor(ctx)
+		actor.turns.pending.attempt = attempt
+		_, applied, err := actor.applyPendingSettlement(actor.buildPendingSettlementInput("send_not_sent", responsesWSZeroChargeProof(ResponsesWSZeroChargeProofTransportNotAttempted, "send_not_sent")))
+		if err != nil {
+			t.Fatalf("expected rollback settlement to succeed, got %v", err)
+		}
+		if applied.AppliedFinalQuota != 0 || !attempt.RolledBack {
+			t.Fatalf("expected rollback applied quota 0, applied=%+v attempt=%+v", applied, attempt)
+		}
+		user, token := readResponsesWSQuotaFixture(t)
+		if user.Quota != 1000 || user.UsedQuota != 0 || token.RemainQuota != 1000 || token.UsedQuota != 0 {
+			t.Fatalf("expected rollback to restore reserve, user=%+v token=%+v", user, token)
+		}
+	})
+}
+
+func TestResponsesWSApplySettlementDecisionFailsLoudForInvalidFinalSettlement(t *testing.T) {
+	ctx := setupResponsesWSQuotaFixture(t, 1000)
+	configureResponsesWSTokenPricingFloor(t, 100)
+
+	t.Run("nil quota", func(t *testing.T) {
+		attempt := &ResponsesWSTurnAttempt{AttemptID: "attempt-nil-quota"}
+		_, err := attempt.ApplyResponsesWSSettlementDecision(ctx, ResponsesWSSettlementDecision{
+			Action:             ResponsesWSSettlementFinalizeFloor,
+			Basis:              ResponsesWSSettlementBasisFloor,
+			ExpectedFinalQuota: 100,
+		})
+		if err == nil || attempt.QuotaFinalized {
+			t.Fatalf("expected nil quota finalize to fail without finalizing, err=%v attempt=%+v", err, attempt)
+		}
+	})
+
+	t.Run("empty model", func(t *testing.T) {
+		attempt := &ResponsesWSTurnAttempt{AttemptID: "attempt-empty-model", Quota: &relay_util.Quota{}}
+		_, err := attempt.ApplyResponsesWSSettlementDecision(ctx, ResponsesWSSettlementDecision{
+			Action:             ResponsesWSSettlementFinalizeFloor,
+			Basis:              ResponsesWSSettlementBasisFloor,
+			ExpectedFinalQuota: 100,
+		})
+		if err == nil || attempt.QuotaFinalized {
+			t.Fatalf("expected empty model finalize to fail without finalizing, err=%v attempt=%+v", err, attempt)
+		}
+	})
+
+	t.Run("missing attempt id finalize", func(t *testing.T) {
+		attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+		attempt.AttemptID = ""
+		_, err := attempt.ApplyResponsesWSSettlementDecision(ctx, ResponsesWSSettlementDecision{
+			Action:             ResponsesWSSettlementFinalizeFloor,
+			Basis:              ResponsesWSSettlementBasisFloor,
+			ExpectedFinalQuota: int64(attempt.Quota.PreConsumedQuota()),
+		})
+		if err == nil || attempt.QuotaFinalized {
+			t.Fatalf("expected missing attempt id finalize to fail without finalizing, err=%v attempt=%+v", err, attempt)
+		}
+	})
+
+	t.Run("missing attempt id rollback", func(t *testing.T) {
+		attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+		attempt.AttemptID = ""
+		_, err := attempt.ApplyResponsesWSSettlementDecision(ctx, ResponsesWSSettlementDecision{
+			Action:             ResponsesWSSettlementRollbackReserve,
+			Basis:              ResponsesWSSettlementBasisZeroChargeProof,
+			ExpectedFinalQuota: 0,
+		})
+		if err == nil || attempt.RolledBack {
+			t.Fatalf("expected missing attempt id rollback to fail without rollback, err=%v attempt=%+v", err, attempt)
+		}
+	})
+
+	t.Run("rollback non zero expected quota", func(t *testing.T) {
+		ctx := setupResponsesWSQuotaFixture(t, 1000)
+		configureResponsesWSTokenPricingFloor(t, 100)
+		attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+		floor := attempt.Quota.PreConsumedQuota()
+		_, err := attempt.ApplyResponsesWSSettlementDecision(ctx, ResponsesWSSettlementDecision{
+			Action:             ResponsesWSSettlementRollbackReserve,
+			Basis:              ResponsesWSSettlementBasisZeroChargeProof,
+			ExpectedFinalQuota: 1,
+		})
+		if err == nil || attempt.RolledBack || attempt.AppliedSettlement != nil {
+			t.Fatalf("expected malformed rollback decision to fail without applying, err=%v attempt=%+v", err, attempt)
+		}
+		user, token := readResponsesWSQuotaFixture(t)
+		if user.Quota != 1000-floor || user.UsedQuota != 0 || token.RemainQuota != 1000-floor || token.UsedQuota != floor {
+			t.Fatalf("expected failed rollback to leave preconsume untouched, user=%+v token=%+v", user, token)
+		}
+	})
+
+	t.Run("missing floor zero", func(t *testing.T) {
+		attempt, apiErr := PrepareResponsesWSTurnAttempt(ResponsesWSTurnAttemptInput{
+			Context:           ctx,
+			SelectedChannelID: 17,
+			BillingModel:      "gpt-5",
+			PromptModel:       "gpt-5",
+			Request:           &types.OpenAIResponsesRequest{Model: "gpt-5", Input: []types.ChatCompletionMessage{}},
+		})
+		if apiErr != nil {
+			t.Fatalf("prepare attempt: %v", apiErr)
+		}
+		attempt.AttemptID = "attempt-missing-floor-zero"
+		_, err := attempt.ApplyResponsesWSSettlementDecision(ctx, ResponsesWSSettlementDecision{
+			Action:             ResponsesWSSettlementFinalizeFloor,
+			Basis:              ResponsesWSSettlementBasisFloor,
+			ExpectedFinalQuota: 0,
+			Flags:              []ResponsesWSSettlementFlag{ResponsesWSSettlementFlagMissingSettlementFloor},
+		})
+		if err == nil || attempt.QuotaFinalized {
+			t.Fatalf("expected missing floor zero to fail without finalizing, err=%v attempt=%+v", err, attempt)
+		}
+	})
+}
+
+func TestResponsesWSApplySettlementDecisionDuplicateFinalizeUsesStoredApplied(t *testing.T) {
+	ctx := setupResponsesWSQuotaFixture(t, 1000)
+	configureResponsesWSTokenPricingFloor(t, 100)
+	attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+	decision := ResponsesWSSettlementDecision{
+		Action:             ResponsesWSSettlementFinalizeExactUsage,
+		Basis:              ResponsesWSSettlementBasisTerminalUsage,
+		ExpectedFinalQuota: 10,
+	}
+	first, err := attempt.ApplyResponsesWSSettlementDecision(ctx, decision)
+	if err != nil {
+		t.Fatalf("expected first finalize to succeed, got %v", err)
+	}
+	second, err := attempt.ApplyResponsesWSSettlementDecision(ctx, decision)
+	if err != nil {
+		t.Fatalf("expected duplicate same finalize to be idempotent, got %v", err)
+	}
+	if second != first {
+		t.Fatalf("expected duplicate finalize to return stored applied, first=%+v second=%+v", first, second)
+	}
+	decision.ExpectedFinalQuota = 11
+	if _, err := attempt.ApplyResponsesWSSettlementDecision(ctx, decision); err == nil {
+		t.Fatal("expected duplicate finalize with different amount to fail")
+	}
+}
+
+func TestResponsesWSApplySettlementDecisionRejectsRollbackAfterFinalize(t *testing.T) {
+	ctx := setupResponsesWSQuotaFixture(t, 1000)
+	configureResponsesWSTokenPricingFloor(t, 100)
+	attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+	finalize := ResponsesWSSettlementDecision{
+		Action:             ResponsesWSSettlementFinalizeFloor,
+		Basis:              ResponsesWSSettlementBasisFloor,
+		ExpectedFinalQuota: int64(attempt.Quota.PreConsumedQuota()),
+	}
+	if _, err := attempt.ApplyResponsesWSSettlementDecision(ctx, finalize); err != nil {
+		t.Fatalf("expected finalize to succeed, got %v", err)
+	}
+	rollback := ResponsesWSSettlementDecision{
+		Action:             ResponsesWSSettlementRollbackReserve,
+		Basis:              ResponsesWSSettlementBasisZeroChargeProof,
+		ExpectedFinalQuota: 0,
+	}
+	if _, err := attempt.ApplyResponsesWSSettlementDecision(ctx, rollback); err == nil {
+		t.Fatal("expected rollback after finalize to fail")
+	}
+	if attempt.RolledBack {
+		t.Fatal("expected failed rollback after finalize not to mark attempt rolled back")
+	}
+}
+
+func TestResponsesWSApplySettlementDecisionDuplicateRollbackUsesStoredApplied(t *testing.T) {
+	ctx := setupResponsesWSQuotaFixture(t, 1000)
+	configureResponsesWSTokenPricingFloor(t, 100)
+	attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+	decision := ResponsesWSSettlementDecision{
+		Action:             ResponsesWSSettlementRollbackReserve,
+		Basis:              ResponsesWSSettlementBasisZeroChargeProof,
+		ExpectedFinalQuota: 0,
+	}
+	first, err := attempt.ApplyResponsesWSSettlementDecision(ctx, decision)
+	if err != nil {
+		t.Fatalf("expected first rollback to succeed, got %v", err)
+	}
+	second, err := attempt.ApplyResponsesWSSettlementDecision(ctx, decision)
+	if err != nil {
+		t.Fatalf("expected duplicate rollback to be idempotent, got %v", err)
+	}
+	if second != first {
+		t.Fatalf("expected duplicate rollback to return stored applied, first=%+v second=%+v", first, second)
+	}
+}
+
+func TestResponsesWSSettlementFailureDoesNotEmitSuccessfulTrace(t *testing.T) {
+	ctx := setupResponsesWSQuotaFixture(t, 1000)
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.turns.active.attempt = &ResponsesWSTurnAttempt{
+		AttemptID: "attempt-invalid-settlement",
+		Quota:     &relay_util.Quota{},
+		Usage:     &types.Usage{},
+	}
+
+	var traces []ResponsesWSSettlementTrace
+	originalHook := responsesWSSettlementTraceHook
+	responsesWSSettlementTraceHook = func(trace ResponsesWSSettlementTrace) {
+		traces = append(traces, trace)
+	}
+	t.Cleanup(func() {
+		responsesWSSettlementTraceHook = originalHook
+	})
+
+	_, _, err := actor.applyActiveSettlement(actor.buildActiveSettlementInput("invalid_settlement", ResponsesWSZeroChargeProof{}))
+	if err == nil {
+		t.Fatal("expected invalid settlement to fail")
+	}
+	if len(traces) != 0 {
+		t.Fatalf("expected failed settlement not to emit successful trace, got %+v", traces)
+	}
+}
+
+func TestResponsesWSProviderActivityWithMissingFloorFailsLoud(t *testing.T) {
+	providerOpened := responsesws.UpstreamEvent{
+		DetailOrigin: responsesws.RecvDetailOriginBridgeStreamOpened,
+	}
+	cases := []struct {
+		name  string
+		apply func(*ResponsesWSSessionActor, *ResponsesWSTurnAttempt) (ResponsesWSSettlementInput, ResponsesWSSettlementDecision, error)
+	}{
+		{
+			name: "pending journal",
+			apply: func(actor *ResponsesWSSessionActor, attempt *ResponsesWSTurnAttempt) (ResponsesWSSettlementInput, ResponsesWSSettlementDecision, error) {
+				actor.turns.pending.attempt = attempt
+				actor.turns.pending.provider.journal.AppendLifecycle(providerOpened)
+				input := actor.buildPendingSettlementInput("missing_floor_pending", ResponsesWSZeroChargeProof{})
+				decision, _, err := actor.applyPendingSettlement(input)
+				return input, decision, err
+			},
+		},
+		{
+			name: "active projection",
+			apply: func(actor *ResponsesWSSessionActor, attempt *ResponsesWSTurnAttempt) (ResponsesWSSettlementInput, ResponsesWSSettlementDecision, error) {
+				actor.turns.active.attempt = attempt
+				actor.turns.active.evidence = responsesWSTestProviderProjection(providerOpened)
+				input := actor.buildActiveSettlementInput("missing_floor_active", ResponsesWSZeroChargeProof{})
+				decision, _, err := actor.applyActiveSettlement(input)
+				return input, decision, err
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := setupResponsesWSQuotaFixture(t, 1000)
+			attempt, apiErr := PrepareResponsesWSTurnAttempt(ResponsesWSTurnAttemptInput{
+				Context:           ctx,
+				SelectedChannelID: 17,
+				BillingModel:      "gpt-5",
+				PromptModel:       "gpt-5",
+				Request:           &types.OpenAIResponsesRequest{Model: "gpt-5", Input: []types.ChatCompletionMessage{}},
+			})
+			if apiErr != nil {
+				t.Fatalf("prepare attempt: %v", apiErr)
+			}
+			attempt.AttemptID = "attempt-missing-floor-" + strings.ReplaceAll(tc.name, " ", "-")
+
+			actor := NewResponsesWSSessionActor(ctx)
+			var traces []ResponsesWSSettlementTrace
+			originalHook := responsesWSSettlementTraceHook
+			responsesWSSettlementTraceHook = func(trace ResponsesWSSettlementTrace) {
+				traces = append(traces, trace)
+			}
+			t.Cleanup(func() {
+				responsesWSSettlementTraceHook = originalHook
+			})
+
+			input, decision, err := tc.apply(actor, attempt)
+			if !input.Evidence.AnyProviderActivityEvidence {
+				t.Fatalf("expected provider activity evidence in settlement input, input=%+v", input)
+			}
+			if decision.Action != ResponsesWSSettlementFinalizeFloor && decision.Action != ResponsesWSSettlementFinalizeObservedOrFloor {
+				t.Fatalf("expected floor settlement path, got decision=%+v", decision)
+			}
+			if decision.ExpectedFinalQuota != 0 || !responsesWSSettlementHasFlag(decision, ResponsesWSSettlementFlagMissingSettlementFloor) {
+				t.Fatalf("expected missing-floor zero decision, got %+v", decision)
+			}
+			if err == nil {
+				t.Fatal("expected missing floor settlement to fail loud")
+			}
+			if attempt.QuotaFinalized || attempt.RolledBack || attempt.AppliedSettlement != nil {
+				t.Fatalf("expected failed settlement not to mutate settlement state, attempt=%+v", attempt)
+			}
+			if len(traces) != 0 {
+				t.Fatalf("expected failed settlement not to emit successful trace, got %+v", traces)
+			}
+		})
+	}
+}
+
+func TestResponsesWSActiveSettlementFailureStopsTerminalSideEffects(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-terminal-settlement-fails",
+		SelectedChannelID: 17,
+		Quota:             &relay_util.Quota{},
+		Usage:             &types.Usage{},
+	}
+	actor.turns.active.attempt = attempt
+	actor.turns.active.affinity = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.completed","response":{"id":"resp_no_settle","status":"completed","usage":{"input_tokens":1,"total_tokens":1}}}`)),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
+	})
+
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected settlement failure to close session")
+	}
+	if actor.turns.history.lastFinal != nil {
+		t.Fatalf("expected terminal success side effects not to run, lastFinal=%+v", actor.turns.history.lastFinal)
+	}
+	if actor.turns.active.attempt != attempt || attempt.QuotaFinalized || attempt.RolledBack {
+		t.Fatalf("expected failed settlement to preserve active attempt state, active=%v finalized=%v rolled=%v", actor.turns.active.attempt == attempt, attempt.QuotaFinalized, attempt.RolledBack)
+	}
+}
+
+func TestResponsesWSActiveTerminalNilQuotaFailsBeforeSideEffects(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-terminal-nil-quota",
+		SelectedChannelID: 17,
+		Usage:             &types.Usage{},
+	}
+	actor.turns.active.attempt = attempt
+	actor.turns.active.affinity = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.completed","response":{"id":"resp_nil_quota","status":"completed","usage":{"input_tokens":1,"total_tokens":1}}}`)),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
+	})
+
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected nil quota settlement failure to close session")
+	}
+	if actor.turns.history.lastFinal != nil {
+		t.Fatalf("expected nil quota terminal side effects not to run, lastFinal=%+v", actor.turns.history.lastFinal)
+	}
+	if actor.turns.active.attempt != attempt || attempt.QuotaFinalized || attempt.RolledBack {
+		t.Fatalf("expected nil quota settlement failure to preserve active attempt, active=%v finalized=%v rolled=%v", actor.turns.active.attempt == attempt, attempt.QuotaFinalized, attempt.RolledBack)
+	}
+}
+
+func TestResponsesWSActiveCloseSettlementFailureUsesQuotaSettlementFailedReason(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	session := &responsesWSTestSession{}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	actor.AttachUpstreamSession(session, 17)
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-active-close-settlement-fails",
+		SelectedChannelID: 17,
+		Quota:             &relay_util.Quota{},
+		Usage:             &types.Usage{},
+	}
+	actor.turns.active.attempt = attempt
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.close("provider_closed")
+
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected active settlement failure during close to close session")
+	}
+	if attempt.QuotaFinalized || attempt.RolledBack {
+		t.Fatalf("expected failed active close settlement not to mutate attempt, attempt=%+v", attempt)
+	}
+	if session.abortReason != "quota_settlement_failed" {
+		t.Fatalf("expected active close settlement failure to abort with quota_settlement_failed, got %q", session.abortReason)
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "quota_settlement_failed") {
+		t.Fatalf("expected quota settlement failure payload, got %q", got)
+	}
+	if got, _ := conn.lastControl.Load().(string); !strings.Contains(got, "quota_settlement_failed") {
+		t.Fatalf("expected downstream close control to use quota_settlement_failed, got %q", got)
+	}
+}
+
+func TestResponsesWSActiveProviderCloseMissingAttemptIDFailsLoud(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	session := &responsesWSTestSession{}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(session, 17)
+	attempt := &ResponsesWSTurnAttempt{
+		SelectedChannelID: 17,
+		Quota:             &relay_util.Quota{},
+		Usage:             &types.Usage{},
+	}
+	actor.turns.active.attempt = attempt
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.handleProviderClosed(ResponsesWSEventProviderClosed{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Code:                      1000,
+		Reason:                    "provider closed",
+		DetailOrigin:              responsesws.RecvDetailOriginNativeProviderClose,
+	})
+
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected missing attempt id provider close to close session")
+	}
+	if actor.turns.active.attempt != attempt || attempt.QuotaFinalized || attempt.RolledBack {
+		t.Fatalf("expected missing attempt id failure to preserve active attempt, active=%v finalized=%v rolled=%v", actor.turns.active.attempt == attempt, attempt.QuotaFinalized, attempt.RolledBack)
+	}
+	if session.abortReason != "quota_settlement_failed" {
+		t.Fatalf("expected provider close settlement failure to abort with quota_settlement_failed, got %q", session.abortReason)
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "quota_settlement_failed") {
+		t.Fatalf("expected quota settlement failure payload, got %q", got)
+	}
+}
+
+func TestResponsesWSActiveSessionCloseMissingAttemptIDFailsLoud(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	session := &responsesWSTestSession{}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	actor.AttachUpstreamSession(session, 17)
+	attempt := &ResponsesWSTurnAttempt{
+		SelectedChannelID: 17,
+		Quota:             &relay_util.Quota{},
+		Usage:             &types.Usage{},
+	}
+	actor.turns.active.attempt = attempt
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.close("provider_closed")
+
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected missing attempt id session close to close session")
+	}
+	if actor.turns.active.attempt != attempt || attempt.QuotaFinalized || attempt.RolledBack {
+		t.Fatalf("expected missing attempt id close failure to preserve active attempt, active=%v finalized=%v rolled=%v", actor.turns.active.attempt == attempt, attempt.QuotaFinalized, attempt.RolledBack)
+	}
+	if session.abortReason != "quota_settlement_failed" {
+		t.Fatalf("expected session close settlement failure to abort with quota_settlement_failed, got %q", session.abortReason)
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "quota_settlement_failed") {
+		t.Fatalf("expected quota settlement failure payload, got %q", got)
+	}
+	if got, _ := conn.lastControl.Load().(string); !strings.Contains(got, "quota_settlement_failed") {
+		t.Fatalf("expected downstream close control to use quota_settlement_failed, got %q", got)
+	}
+}
+
+func TestResponsesWSSettlementTraceUsesAttemptOpeningID(t *testing.T) {
+	t.Run("subsequent turn does not inherit actor opening id", func(t *testing.T) {
+		ctx := setupResponsesWSQuotaFixture(t, 1000)
+		configureResponsesWSTokenPricingFloor(t, 100)
+		attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+		attempt.OpeningID = ""
+
+		var traces []ResponsesWSSettlementTrace
+		originalHook := responsesWSSettlementTraceHook
+		responsesWSSettlementTraceHook = func(trace ResponsesWSSettlementTrace) {
+			traces = append(traces, trace)
+		}
+		t.Cleanup(func() {
+			responsesWSSettlementTraceHook = originalHook
+		})
+
+		actor := NewResponsesWSSessionActor(ctx)
+		actor.turns.opening.openingID = "first-turn-opening-id"
+		actor.turns.active.attempt = attempt
+		_, _, err := actor.applyActiveSettlement(actor.buildActiveSettlementInput("subsequent_turn", ResponsesWSZeroChargeProof{}))
+		if err != nil {
+			t.Fatalf("expected subsequent turn settlement to succeed, got %v", err)
+		}
+		if len(traces) != 1 {
+			t.Fatalf("expected one settlement trace, got %d", len(traces))
+		}
+		if traces[0].OpeningID != "" || traces[0].Input.OpeningID != "" {
+			t.Fatalf("expected subsequent turn trace not to inherit actor opening id, trace=%+v", traces[0])
+		}
+	})
+
+	t.Run("first turn uses attempt opening id", func(t *testing.T) {
+		ctx := setupResponsesWSQuotaFixture(t, 1000)
+		configureResponsesWSTokenPricingFloor(t, 100)
+		attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+		attempt.OpeningID = "current-attempt-opening-id"
+
+		var traces []ResponsesWSSettlementTrace
+		originalHook := responsesWSSettlementTraceHook
+		responsesWSSettlementTraceHook = func(trace ResponsesWSSettlementTrace) {
+			traces = append(traces, trace)
+		}
+		t.Cleanup(func() {
+			responsesWSSettlementTraceHook = originalHook
+		})
+
+		actor := NewResponsesWSSessionActor(ctx)
+		actor.turns.opening.openingID = "stale-actor-opening-id"
+		actor.turns.active.attempt = attempt
+		_, _, err := actor.applyActiveSettlement(actor.buildActiveSettlementInput("first_turn", ResponsesWSZeroChargeProof{}))
+		if err != nil {
+			t.Fatalf("expected first turn settlement to succeed, got %v", err)
+		}
+		if len(traces) != 1 {
+			t.Fatalf("expected one settlement trace, got %d", len(traces))
+		}
+		if traces[0].OpeningID != "current-attempt-opening-id" || traces[0].Input.OpeningID != "current-attempt-opening-id" {
+			t.Fatalf("expected trace opening id to come from attempt/input, trace=%+v", traces[0])
+		}
+	})
+}
+
+func TestResponsesWSSettlementTraceReplayAndAppliedEquality(t *testing.T) {
+	tests := []struct {
+		name     string
+		setup    func(t *testing.T, attempt *ResponsesWSTurnAttempt)
+		evidence responsesws.ProviderSettlementLogProjection
+		want     int64
+	}{
+		{
+			name: "ambiguous no evidence floor",
+			want: -1,
+		},
+		{
+			name: "terminal exact below floor",
+			setup: func(t *testing.T, attempt *ResponsesWSTurnAttempt) {
+				response := &types.OpenAIResponsesResponses{
+					ID:     "resp_trace_exact",
+					Status: types.ResponseStatusCompleted,
+					Usage:  &types.ResponsesUsage{InputTokens: 10, TotalTokens: 10},
+				}
+				mergeResponsesWSTerminalResponse(attempt.Usage, response)
+				attempt.MarkProviderTerminalEvidence(responsesws.ClassifyResponsesWSTerminal("response.completed", response, false))
+			},
+			want: 10,
+		},
+		{
+			name: "observed below floor",
+			setup: func(t *testing.T, attempt *ResponsesWSTurnAttempt) {
+				mergeResponsesWSUsageEvent(attempt.Usage, &types.UsageEvent{InputTokens: 10, TotalTokens: 10})
+			},
+			evidence: responsesWSTestProviderUsageProjection(),
+			want:     -1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := setupResponsesWSQuotaFixture(t, 1000)
+			configureResponsesWSTokenPricingFloor(t, 100)
+			attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+			if tc.setup != nil {
+				tc.setup(t, attempt)
+			}
+			want := tc.want
+			if want < 0 {
+				want = int64(attempt.Quota.PreConsumedQuota())
+			}
+
+			var traces []ResponsesWSSettlementTrace
+			originalHook := responsesWSSettlementTraceHook
+			responsesWSSettlementTraceHook = func(trace ResponsesWSSettlementTrace) {
+				traces = append(traces, trace)
+			}
+			t.Cleanup(func() {
+				responsesWSSettlementTraceHook = originalHook
+			})
+
+			actor := NewResponsesWSSessionActor(ctx)
+			actor.turns.active.attempt = attempt
+			actor.turns.active.evidence = tc.evidence
+			_, applied, err := actor.applyActiveSettlement(actor.buildActiveSettlementInput(tc.name, ResponsesWSZeroChargeProof{}))
+			if err != nil {
+				t.Fatalf("expected traced settlement to succeed, got %v", err)
+			}
+			if applied.AppliedFinalQuota != want {
+				t.Fatalf("expected applied quota %d, got %d", want, applied.AppliedFinalQuota)
+			}
+			if len(traces) != 1 {
+				t.Fatalf("expected one settlement trace, got %d", len(traces))
+			}
+			trace := traces[0]
+			if replayed := decideResponsesWSSettlement(trace.Input); replayed.DecisionKey != trace.Decision.DecisionKey {
+				t.Fatalf("expected replay decision key %q, got %q", trace.Decision.DecisionKey, replayed.DecisionKey)
+			}
+			if trace.Decision.ExpectedFinalQuota != trace.Applied.AppliedFinalQuota {
+				t.Fatalf("expected trace applied equality, decision=%+v applied=%+v", trace.Decision, trace.Applied)
+			}
+		})
+	}
+}
+
+func TestResponsesWSTransportSendResultSettlementTraceTransportStatus(t *testing.T) {
+	tests := []struct {
+		name   string
+		result responsesws.ResponsesWSTransportSendResult
+		want   string
+	}{
+		{name: "not_attempted", result: responsesws.ResponsesWSTransportSendResult{Status: responsesws.ResponsesWSTransportSendNotAttempted, Err: errors.New("not attempted")}, want: "not_attempted"},
+		{name: "rejected_before_stream", result: responsesws.ResponsesWSTransportSendResult{Status: responsesws.ResponsesWSTransportSendRejectedBeforeStream}, want: "rejected_before_stream"},
+		{name: "ambiguous", result: responsesws.ResponsesWSTransportSendResult{Status: responsesws.ResponsesWSTransportSendAmbiguous, Err: errors.New("ambiguous write")}, want: "ambiguous"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-trace-"+tc.name)
+			actor := NewResponsesWSSessionActor(ctx)
+			actor.turns.pending.attempt = attempt
+			actor.turns.pending.phase = responsesWSPendingTurnSend
+			actor.state = responsesWSStatePendingSend
+
+			var traces []ResponsesWSSettlementTrace
+			originalHook := responsesWSSettlementTraceHook
+			responsesWSSettlementTraceHook = func(trace ResponsesWSSettlementTrace) {
+				traces = append(traces, trace)
+			}
+			t.Cleanup(func() {
+				responsesWSSettlementTraceHook = originalHook
+			})
+
+			actor.handleSendResult(ResponsesWSEventSendResult{
+				AttemptID:         attempt.AttemptID,
+				SelectedChannelID: 17,
+				Purpose:           ResponsesWSSendPurposeResponseCreate,
+				TransportResult:   tc.result,
+			})
+			if responsesWSTransportSendStatus(tc.result) == responsesws.ResponsesWSTransportSendRejectedBeforeStream {
+				actor.handleEvent(ResponsesWSEventBridgeOpenProviderError{
+					AttemptID:   attempt.AttemptID,
+					Payload:     responsesWSErrorPayload(http.StatusBadGateway, "provider_rejected_before_stream", "provider rejected stream open"),
+					Recoverable: true,
+				})
+			}
+
+			if len(traces) != 1 {
+				t.Fatalf("expected one settlement trace, got %d", len(traces))
+			}
+			if got := traces[0].Input.Diagnostics.TransportStatus; got != tc.want {
+				t.Fatalf("expected transport status %q, got %q trace=%+v", tc.want, got, traces[0])
+			}
+			if responsesWSTransportSendStatus(tc.result) == responsesws.ResponsesWSTransportSendRejectedBeforeStream &&
+				!responsesWSTraceHasDetailOrigin(traces[0], responsesws.RecvDetailOriginBridgeOpenProviderError) {
+				t.Fatalf("expected rejected_before_stream trace to include bridge_open_provider_error, trace=%+v", traces[0])
+			}
+		})
+	}
+}
+
+func TestResponsesWSAmbiguousSendDoesNotRetryAndSettlesFloor(t *testing.T) {
+	ctx := setupResponsesWSQuotaFixture(t, 1000)
+	configureResponsesWSTokenPricingFloor(t, 100)
+	frame, err := responsesws.ParseRawResponsesCreateFrame([]byte(`{"type":"response.create","model":"gpt-5","input":[]}`))
+	if err != nil {
+		t.Fatalf("parse frame: %v", err)
+	}
+	actor := NewResponsesWSSessionActor(ctx)
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	openingID := actor.ReserveFirstTurnOpening(frame)
+	attempt, apiErr := PrepareResponsesWSTurnAttempt(ResponsesWSTurnAttemptInput{
+		Context:           ctx,
+		OpeningID:         openingID,
+		Admission:         NewResponsesWSTurnAdmission(),
+		SelectedChannelID: 17,
+		BillingModel:      "gpt-5",
+		PromptModel:       "gpt-5",
+		Request:           &frame.Projection,
+	})
+	if apiErr != nil {
+		t.Fatalf("prepare attempt: %v", apiErr)
+	}
+	if apiErr := attempt.PreConsumeQuota(); apiErr != nil {
+		t.Fatalf("preconsume attempt: %v", apiErr)
+	}
+	attempt.AttemptID = "attempt-ambiguous-no-retry"
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	originalOpen := openAndPrimeResponsesWSSessionForActor
+	var openCalls int32
+	openAndPrimeResponsesWSSessionForActor = func(context.Context, *gin.Context, *types.OpenAIResponsesRequest) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
+		atomic.AddInt32(&openCalls, 1)
+		return &responsesWSOpenResult{Session: &responsesWSTestSession{}, BillingModel: "gpt-5"}, nil
+	}
+	t.Cleanup(func() {
+		openAndPrimeResponsesWSSessionForActor = originalOpen
+	})
+
+	var trace ResponsesWSSettlementTrace
+	originalHook := responsesWSSettlementTraceHook
+	responsesWSSettlementTraceHook = func(got ResponsesWSSettlementTrace) {
+		trace = got
+	}
+	t.Cleanup(func() {
+		responsesWSSettlementTraceHook = originalHook
+	})
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:         attempt.AttemptID,
+		SelectedChannelID: 17,
+		Purpose:           ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendAmbiguous,
+			Err:    errors.New("ambiguous write"),
+		},
+	})
+
+	if got := atomic.LoadInt32(&openCalls); got != 0 {
+		t.Fatalf("expected ambiguous send not to retry/open another channel, got %d opens", got)
+	}
+	if !attempt.QuotaFinalized || attempt.RolledBack {
+		t.Fatalf("expected ambiguous no-retry path to settle floor, attempt=%+v", attempt)
+	}
+	if trace.Decision.Action != ResponsesWSSettlementFinalizeFloor || trace.Applied.AppliedFinalQuota != int64(attempt.Quota.PreConsumedQuota()) {
+		t.Fatalf("expected trace floor settlement, trace=%+v", trace)
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "ambiguous_close_no_provider_evidence") {
+		t.Fatalf("expected proxy-local ambiguous error, got %q", got)
+	}
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected ambiguous no-retry path to close session")
+	}
+}
+
+func TestResponsesWSInvalidTransportResultSettlesFloorThenFailsClosed(t *testing.T) {
+	ctx := setupResponsesWSQuotaFixture(t, 1000)
+	configureResponsesWSTokenPricingFloor(t, 100)
+	frame, err := responsesws.ParseRawResponsesCreateFrame([]byte(`{"type":"response.create","model":"gpt-5","input":[]}`))
+	if err != nil {
+		t.Fatalf("parse frame: %v", err)
+	}
+	actor := NewResponsesWSSessionActor(ctx)
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	openingID := actor.ReserveFirstTurnOpening(frame)
+	attempt, apiErr := PrepareResponsesWSTurnAttempt(ResponsesWSTurnAttemptInput{
+		Context:           ctx,
+		OpeningID:         openingID,
+		Admission:         NewResponsesWSTurnAdmission(),
+		SelectedChannelID: 17,
+		BillingModel:      "gpt-5",
+		PromptModel:       "gpt-5",
+		Request:           &frame.Projection,
+	})
+	if apiErr != nil {
+		t.Fatalf("prepare attempt: %v", apiErr)
+	}
+	if apiErr := attempt.PreConsumeQuota(); apiErr != nil {
+		t.Fatalf("preconsume attempt: %v", apiErr)
+	}
+	attempt.AttemptID = "attempt-invalid-transport-result"
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	var trace ResponsesWSSettlementTrace
+	originalHook := responsesWSSettlementTraceHook
+	responsesWSSettlementTraceHook = func(got ResponsesWSSettlementTrace) {
+		trace = got
+	}
+	t.Cleanup(func() {
+		responsesWSSettlementTraceHook = originalHook
+	})
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:         attempt.AttemptID,
+		SelectedChannelID: 17,
+		Purpose:           ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendAttempted,
+			Err:    errors.New("attempted cannot carry err"),
+		},
+	})
+
+	if !attempt.QuotaFinalized || attempt.RolledBack {
+		t.Fatalf("expected invalid transport result to settle floor, attempt=%+v", attempt)
+	}
+	if trace.Decision.Action != ResponsesWSSettlementFinalizeFloor ||
+		trace.Input.ZeroChargeProof.Present() ||
+		trace.Input.Diagnostics.TransportStatus != "invalid" {
+		t.Fatalf("expected invalid transport settlement without zero proof, trace=%+v", trace)
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "responses_ws_transport_contract_violation") ||
+		strings.Contains(got, "ambiguous_close_no_provider_evidence") {
+		t.Fatalf("expected contract violation payload, got %q", got)
+	}
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected invalid transport result to fail closed")
+	}
+}
+
+func TestResponsesWSPreConsumeForcesFloorForHighBalanceUser(t *testing.T) {
+	ctx := setupResponsesWSQuotaFixture(t, 200000)
+
+	trustedQuota := relay_util.NewQuota(ctx, "gpt-5", 0)
+	if apiErr := trustedQuota.PreQuotaConsumptionRollbackable(); apiErr != nil {
+		t.Fatalf("expected ordinary trusted preconsume to succeed, got %v", apiErr)
+	}
+	user, token := readResponsesWSQuotaFixture(t)
+	if user.Quota != 200000 || token.RemainQuota != 200000 || token.UsedQuota != 0 {
+		t.Fatalf("expected ordinary quota path to skip high-balance reserve, user=%+v token=%+v", user, token)
+	}
+
+	attempt, apiErr := PrepareResponsesWSTurnAttempt(ResponsesWSTurnAttemptInput{
+		Context:           ctx,
+		SelectedChannelID: 17,
+		BillingModel:      "gpt-5",
+		PromptModel:       "gpt-5",
+		Request:           &types.OpenAIResponsesRequest{Model: "gpt-5", Input: []types.ChatCompletionMessage{}},
+	})
+	if apiErr != nil {
+		t.Fatalf("expected attempt preparation to succeed, got %v", apiErr)
+	}
+	if apiErr := attempt.PreConsumeQuota(); apiErr != nil {
+		t.Fatalf("expected responses websocket forced preconsume to succeed, got %v", apiErr)
+	}
+	if !attempt.QuotaPreconsumed || !attempt.Quota.HasPreConsumedSideEffect() || attempt.Quota.PreConsumedQuota() <= 0 {
+		t.Fatalf("expected responses websocket preconsume to force a floor, attempt=%+v floor=%d", attempt, attempt.Quota.PreConsumedQuota())
+	}
+	user, token = readResponsesWSQuotaFixture(t)
+	floor := attempt.Quota.PreConsumedQuota()
+	if user.Quota != 200000-floor || token.RemainQuota != 200000-floor || token.UsedQuota != floor {
+		t.Fatalf("expected forced responses websocket reserve floor %d, user=%+v token=%+v", floor, user, token)
 	}
 }
 
@@ -4280,11 +9924,11 @@ func TestMergeResponsesWSResponsesUsagePreservesAccumulatedDetailsWhenTerminalOm
 func TestResponsesWSActorCloseActiveUsageEvidenceSettlesQuota(t *testing.T) {
 	ctx := setupResponsesWSQuotaFixture(t, 1000)
 	attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
-	attempt.MarkProviderUsageSeen()
 	mergeResponsesWSUsageEvent(attempt.Usage, &types.UsageEvent{InputTokens: 4, OutputTokens: 2, TotalTokens: 6})
 
 	actor := NewResponsesWSSessionActor(ctx)
-	actor.activeAttempt = attempt
+	actor.turns.active.attempt = attempt
+	actor.turns.active.evidence = responsesWSTestProviderUsageProjection()
 	actor.state = responsesWSStateInFlight
 	actor.close("client_closed")
 
@@ -4305,29 +9949,29 @@ func TestResponsesWSSameSessionTwoMessagesAccumulateQuota(t *testing.T) {
 	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
 	actor := NewResponsesWSSessionActor(ctx)
 	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
-	actor.sessionChannelID = 17
+	actor.upstream.channelID = 17
 
 	for i, responseID := range []string{"resp_one", "resp_two"} {
 		attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
-		actor.activeAttempt = attempt
-		actor.activeTurn = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
-		actor.activeChannelID = 17
+		actor.turns.active.attempt = attempt
+		actor.turns.active.affinity = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
+		actor.turns.active.channelID = 17
 		actor.state = responsesWSStateInFlight
 		actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
-			ChannelID:   17,
-			Kind:        ProviderDownstreamFrame,
-			MessageType: responsesWSTextMessageType,
-			Payload: []byte(fmt.Sprintf(
+			AttemptID: responsesWSTestCurrentAttemptID(actor),
+			ChannelID: 17,
+			Kind:      ProviderDownstreamFrame,
+			Frame: responsesWSTestProviderTextFrame([]byte(fmt.Sprintf(
 				`{"type":"response.completed","response":{"id":%q,"status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`,
 				responseID,
-			)),
-			Origin: runtimesession.RealtimePayloadOriginProvider,
+			))),
+			DetailOrigin: responsesws.RecvDetailOriginProviderFrame,
 		})
 		if attempt.RolledBack || !attempt.QuotaFinalized {
 			t.Fatalf("expected turn %d to finalize without rollback, rolled=%v finalized=%v", i+1, attempt.RolledBack, attempt.QuotaFinalized)
 		}
-		if actor.state != responsesWSStateIdle || actor.activeAttempt != nil {
-			t.Fatalf("expected turn %d to leave actor idle, state=%v active=%+v", i+1, actor.state, actor.activeAttempt)
+		if actor.state != responsesWSStateIdle || actor.turns.active.attempt != nil {
+			t.Fatalf("expected turn %d to leave actor idle, state=%v active=%+v", i+1, actor.state, actor.turns.active.attempt)
 		}
 	}
 
@@ -4340,7 +9984,7 @@ func TestResponsesWSSameSessionTwoMessagesAccumulateQuota(t *testing.T) {
 	}
 }
 
-func TestResponsesWSSendResultMismatchWithoutEvidenceRollsBack(t *testing.T) {
+func TestResponsesWSTransportSendResultMismatchWithoutEvidenceIsDiagnosticOnly(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	recorder := httptest.NewRecorder()
@@ -4356,24 +10000,26 @@ func TestResponsesWSSendResultMismatchWithoutEvidenceRollsBack(t *testing.T) {
 		QuotaPreconsumed:  true,
 		Usage:             &types.Usage{},
 	}
-	actor.pendingAttempt = attempt
+	actor.turns.pending.attempt = attempt
 	actor.state = responsesWSStatePendingSend
 
 	actor.handleSendResult(ResponsesWSEventSendResult{
 		AttemptID:         "attempt-stale",
 		SelectedChannelID: 17,
-		Outcome:           SendOutcomeLocalWriteOK,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendAttempted,
+		},
 	})
 
-	if !attempt.RolledBack || actor.pendingAttempt != nil {
-		t.Fatalf("expected mismatch without evidence to rollback and clear pending attempt, rolled=%v pending=%+v", attempt.RolledBack, actor.pendingAttempt)
+	if attempt.RolledBack || actor.turns.pending.attempt != attempt {
+		t.Fatalf("expected mismatch to leave pending attempt untouched, rolled=%v pending=%+v", attempt.RolledBack, actor.turns.pending.attempt)
 	}
-	if !actor.closed.Load() {
-		t.Fatalf("expected mismatch to fail closed after rollback")
+	if actor.closing.closed.Load() {
+		t.Fatal("expected mismatch to stay diagnostic-only")
 	}
 }
 
-func TestResponsesWSMalformedProviderFramePreservesPreConsumedFloor(t *testing.T) {
+func TestResponsesWSProviderEventAttemptMismatchDoesNotUpdateEvidence(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	recorder := httptest.NewRecorder()
@@ -4385,24 +10031,268 @@ func TestResponsesWSMalformedProviderFramePreservesPreConsumedFloor(t *testing.T
 	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
 	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
 	attempt := &ResponsesWSTurnAttempt{
-		AttemptID:         "attempt-malformed",
+		AttemptID:         "attempt-current",
 		SelectedChannelID: 17,
-		Quota:             &relay_util.Quota{},
 		QuotaPreconsumed:  true,
 		Usage:             &types.Usage{},
 	}
-	actor.activeAttempt = attempt
-	actor.activeTurn = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
-	actor.activeChannelID = 17
-	actor.state = responsesWSStateInFlight
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.provider.journal = responsesWSProviderJournal{}
 
 	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 "attempt-stale",
 		UpstreamSessionGeneration: generation,
 		ChannelID:                 17,
 		Kind:                      ProviderDownstreamFrame,
-		MessageType:               responsesWSTextMessageType,
-		Payload:                   []byte(`{"type":`),
-		Origin:                    runtimesession.RealtimePayloadOriginProvider,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.created","response":{"id":"resp_stale","status":"in_progress"}}`)),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
+	})
+
+	if actor.turns.pending.provider.journal.Project().HasActivity() || len(actor.turns.pending.provider.journal.DownstreamEvents()) != 0 {
+		t.Fatalf("expected stale attempt provider event not to update evidence/buffer, evidence=%+v buffered=%d", actor.turns.pending.provider.journal.Project(), len(actor.turns.pending.provider.journal.DownstreamEvents()))
+	}
+	if actor.closing.closed.Load() || actor.turns.pending.attempt != attempt {
+		t.Fatalf("expected stale attempt provider event to be diagnostic-only, closed=%v pending=%+v", actor.closing.closed.Load(), actor.turns.pending.attempt)
+	}
+}
+
+func TestResponsesWSProviderDownstreamFinalizedResponseIDIgnoredForNewAttempt(t *testing.T) {
+	ctx, firstAttempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-old")
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	actor.turns.active.attempt = firstAttempt
+	actor.turns.active.affinity = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.completed","response":{"id":"resp_old","status":"completed"}}`)),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
+	})
+	if actor.turns.history.lastFinal == nil || actor.turns.history.lastFinal.ID != "resp_old" {
+		t.Fatalf("expected first terminal response to be finalized, got %+v", actor.turns.history.lastFinal)
+	}
+
+	nextAttempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-new",
+		SelectedChannelID: 17,
+		Usage:             &types.Usage{},
+	}
+	actor.turns.pending.attempt = nextAttempt
+	actor.turns.pending.provider.journal = responsesWSProviderJournal{}
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.completed","response":{"id":"resp_old","status":"completed"}}`)),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
+	})
+
+	if nextAttempt.SeenProviderResponseID != "" || actor.turns.pending.provider.journal.Project().HasActivity() || len(actor.turns.pending.provider.journal.DownstreamEvents()) != 0 {
+		t.Fatalf("expected finalized response id event to be ignored, attempt=%+v evidence=%+v buffered=%d", nextAttempt, actor.turns.pending.provider.journal.Project(), len(actor.turns.pending.provider.journal.DownstreamEvents()))
+	}
+	if actor.turns.pending.attempt != nextAttempt || actor.closing.closed.Load() {
+		t.Fatalf("expected new pending attempt to remain open, pending=%+v closed=%v", actor.turns.pending.attempt, actor.closing.closed.Load())
+	}
+}
+
+func TestResponsesWSProviderDownstreamResponseIDMismatchFailsClosed(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-current",
+		SelectedChannelID: 17,
+		Usage:             &types.Usage{},
+	}
+	actor.turns.active.attempt = attempt
+	actor.turns.active.affinity = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.created","response":{"id":"resp_current","status":"in_progress"}}`)),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
+	})
+	if attempt.SeenProviderResponseID != "resp_current" || actor.closing.closed.Load() {
+		t.Fatalf("expected first response id to be accepted, attempt=%+v closed=%v", attempt, actor.closing.closed.Load())
+	}
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.output_text.delta","response_id":"resp_other","delta":"mismatch"}`)),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
+	})
+
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected response id mismatch to fail closed")
+	}
+	if actor.turns.history.lastFinal != nil {
+		t.Fatalf("expected response id mismatch not to submit terminal side effect, got %+v", actor.turns.history.lastFinal)
+	}
+}
+
+func TestResponsesWSTransportSendResultGenerationMismatchIsDiagnosticOnly(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.upstream.sessionGeneration = "generation-current"
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-current",
+		SelectedChannelID: 17,
+		QuotaPreconsumed:  true,
+		Usage:             &types.Usage{},
+	}
+	actor.turns.pending.attempt = attempt
+	actor.state = responsesWSStatePendingSend
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:                 "attempt-current",
+		UpstreamSessionGeneration: "generation-stale",
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendNotAttempted,
+			Err:    responsesws.ErrUpstreamClosed,
+		},
+	})
+
+	if attempt.RolledBack || actor.turns.pending.attempt != attempt {
+		t.Fatalf("expected stale generation send result to leave pending attempt untouched, rolled=%v pending=%+v", attempt.RolledBack, actor.turns.pending.attempt)
+	}
+	if actor.closing.closed.Load() {
+		t.Fatal("expected stale generation send result not to close actor")
+	}
+}
+
+func TestResponsesWSNonCreateSendResultIsDiagnosticOnly(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	actor := NewResponsesWSSessionActor(ctx)
+	attempt := &ResponsesWSTurnAttempt{
+		AttemptID:         "attempt-current",
+		SelectedChannelID: 17,
+		QuotaPreconsumed:  true,
+		Usage:             &types.Usage{},
+	}
+	actor.turns.pending.attempt = attempt
+	actor.state = responsesWSStatePendingSend
+
+	for _, purpose := range []ResponsesWSSendPurpose{
+		ResponsesWSSendPurposeResponseCancel,
+		ResponsesWSSendPurposeControl,
+		ResponsesWSSendPurposePingPong,
+	} {
+		actor.handleSendResult(ResponsesWSEventSendResult{
+			AttemptID:         "attempt-current",
+			SelectedChannelID: 17,
+			Purpose:           purpose,
+			TransportResult: responsesws.ResponsesWSTransportSendResult{
+				Status: responsesws.ResponsesWSTransportSendNotAttempted,
+				Err:    responsesws.ErrUpstreamClosed,
+			},
+		})
+	}
+
+	if attempt.RolledBack || actor.turns.pending.attempt != attempt {
+		t.Fatalf("expected non-create send result to leave pending attempt untouched, rolled=%v pending=%+v", attempt.RolledBack, actor.turns.pending.attempt)
+	}
+	if actor.closing.closed.Load() {
+		t.Fatal("expected non-create send result not to close actor")
+	}
+}
+
+func TestResponsesWSUpstreamEventConversionPreservesTypedRouting(t *testing.T) {
+	frameEvent := upstreamEventFromProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 "attempt-conversion",
+		UpstreamSessionGeneration: "generation-a",
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.created"}`)),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderStream,
+		DetailPhase:               responsesws.RecvDetailPhaseHandleProviderFrame,
+	})
+	if frameEvent.Frame == nil || frameEvent.DetailOrigin != responsesws.RecvDetailOriginProviderStream || frameEvent.DetailPhase != responsesws.RecvDetailPhaseHandleProviderFrame || responsesws.PayloadOriginForDetailOrigin(frameEvent.DetailOrigin) != responsesws.PayloadOriginProvider {
+		t.Fatalf("expected downstream conversion to preserve typed provider routing, got %+v", frameEvent)
+	}
+
+	usageEvent := upstreamEventFromProviderUsage(ResponsesWSEventProviderUsageObserved{
+		AttemptID:                 "attempt-conversion",
+		UpstreamSessionGeneration: "generation-a",
+		ChannelID:                 17,
+		Usage:                     &types.UsageEvent{TotalTokens: 3},
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
+		DetailPhase:               responsesws.RecvDetailPhaseHandleProviderFrame,
+	})
+	if usageEvent.Usage == nil || usageEvent.DetailOrigin != responsesws.RecvDetailOriginProviderFrame || usageEvent.DetailPhase != responsesws.RecvDetailPhaseHandleProviderFrame || responsesws.PayloadOriginForDetailOrigin(usageEvent.DetailOrigin) != responsesws.PayloadOriginProvider {
+		t.Fatalf("expected usage conversion to preserve typed provider routing, got %+v", usageEvent)
+	}
+
+	closeEvent := upstreamEventFromProviderClosed(ResponsesWSEventProviderClosed{
+		UpstreamSessionGeneration: "generation-a",
+		ChannelID:                 17,
+		Code:                      int(wsconn.CloseNormalClosure),
+		Reason:                    "done",
+		DetailOrigin:              responsesws.RecvDetailOriginNativeProviderClose,
+		DetailPhase:               responsesws.RecvDetailPhaseMapProviderClose,
+	})
+	if closeEvent.ProviderClose == nil || closeEvent.DetailOrigin != responsesws.RecvDetailOriginNativeProviderClose || closeEvent.DetailPhase != responsesws.RecvDetailPhaseMapProviderClose || responsesws.PayloadOriginForDetailOrigin(closeEvent.DetailOrigin) != responsesws.PayloadOriginProvider {
+		t.Fatalf("expected close conversion to preserve typed provider routing, got %+v", closeEvent)
+	}
+}
+
+func TestResponsesWSMalformedProviderFramePreservesPreConsumedFloor(t *testing.T) {
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-malformed")
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	actor.turns.active.attempt = attempt
+	actor.turns.active.affinity = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":`)),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
 	})
 
 	if attempt.RolledBack {
@@ -4411,7 +10301,7 @@ func TestResponsesWSMalformedProviderFramePreservesPreConsumedFloor(t *testing.T
 	if !attempt.QuotaFinalized {
 		t.Fatalf("expected malformed provider frame on active turn to finalize quota floor")
 	}
-	if !actor.closed.Load() {
+	if !actor.closing.closed.Load() {
 		t.Fatalf("expected malformed provider frame to close session")
 	}
 	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "responses_ws_provider_protocol_error") {
@@ -4419,21 +10309,73 @@ func TestResponsesWSMalformedProviderFramePreservesPreConsumedFloor(t *testing.T
 	}
 }
 
+func TestResponsesWSProviderMalformedRecvFailureEmitsProtocolErrorPayload(t *testing.T) {
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-provider-malformed")
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	actor.turns.active.attempt = attempt
+	actor.turns.active.affinity = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.handleProviderRecvFailed(ResponsesWSEventProviderRecvFailed{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Err:                       errors.New("provider frame parse failed"),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderMalformed,
+		DetailPhase:               responsesws.RecvDetailPhaseHandleProviderFrame,
+	})
+
+	if attempt.RolledBack {
+		t.Fatalf("expected provider malformed recv failure to preserve quota floor")
+	}
+	if !attempt.QuotaFinalized {
+		t.Fatalf("expected provider malformed recv failure to finalize active quota floor")
+	}
+	if actor.turns.active.attempt != nil || !actor.turns.active.evidence.IsZero() || actor.state != responsesWSStateClosed {
+		t.Fatalf("expected malformed recv failure to clear active turn and close, active=%+v evidence=%+v state=%v", actor.turns.active.attempt, actor.turns.active.evidence, actor.state)
+	}
+	payload, _ := conn.lastWrite.Load().(string)
+	assertResponsesWSErrorPayload(t, payload, http.StatusBadGateway, "responses_ws_provider_protocol_error", "malformed responses websocket frame")
+}
+
+func TestResponsesWSProviderMalformedRecvFailureClosesIdleSessionWithPayload(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	actor.state = responsesWSStateIdle
+
+	actor.handleProviderRecvFailed(ResponsesWSEventProviderRecvFailed{
+		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Err:                       errors.New("provider frame parse failed"),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderMalformed,
+		DetailPhase:               responsesws.RecvDetailPhaseHandleProviderFrame,
+	})
+
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected idle provider malformed recv failure to close session")
+	}
+	payload, _ := conn.lastWrite.Load().(string)
+	assertResponsesWSErrorPayload(t, payload, http.StatusBadGateway, "responses_ws_provider_protocol_error", "malformed responses websocket frame")
+}
+
 func TestResponsesWSTurnAttemptRollbackRestoresQuotaSynchronously(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	originalDB := model.DB
-	testDB, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))), &gorm.Config{})
-	if err != nil {
-		t.Fatalf("expected in-memory sqlite database, got %v", err)
-	}
-	if err := testDB.AutoMigrate(&model.User{}, &model.Token{}); err != nil {
-		t.Fatalf("expected quota rollback schema migration to succeed, got %v", err)
-	}
-	model.DB = testDB
-	t.Cleanup(func() {
-		model.DB = originalDB
-	})
+	setupRelayTestDB(t, &model.User{}, &model.Token{})
 
 	originalPricing := model.PricingInstance
 	model.PricingInstance = &model.Pricing{

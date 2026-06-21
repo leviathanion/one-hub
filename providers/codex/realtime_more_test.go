@@ -11,6 +11,7 @@ import (
 
 	"one-api/common/logger"
 	"one-api/common/wsconn"
+	"one-api/model"
 	"one-api/types"
 
 	"go.uber.org/zap"
@@ -157,6 +158,38 @@ func TestCodexRealtimeHelperFunctionsAndCompatibilityHeaders(t *testing.T) {
 	if detail.Type != "rate_limit_error" || detail.Code != "rate_limit_exceeded" || detail.Message != "slow down" {
 		t.Fatalf("expected nested provider error detail to be preserved for logging, got %+v", detail)
 	}
+}
+
+func TestCodexSelfHostedFlagsAreTransportScoped(t *testing.T) {
+	realtimeOnly := newCodexSelfHostedFlagTestProvider(t, `{"self_hosted":true}`)
+	if !realtimeOnly.codexRealtimeSelfHosted() {
+		t.Fatal("expected self_hosted to allow Codex realtime self-hosted upstream")
+	}
+	if realtimeOnly.codexResponsesWSSelfHosted() {
+		t.Fatal("expected self_hosted not to allow Codex ResponsesWS self-hosted upstream")
+	}
+
+	responsesOnly := newCodexSelfHostedFlagTestProvider(t, `{"responses_ws_self_hosted":true}`)
+	if responsesOnly.codexRealtimeSelfHosted() {
+		t.Fatal("expected responses_ws_self_hosted not to allow Codex realtime self-hosted upstream")
+	}
+	if !responsesOnly.codexResponsesWSSelfHosted() {
+		t.Fatal("expected responses_ws_self_hosted to allow Codex ResponsesWS self-hosted upstream")
+	}
+}
+
+func newCodexSelfHostedFlagTestProvider(t *testing.T, other string) *CodexProvider {
+	t.Helper()
+	channel := &model.Channel{
+		Key:   `{"access_token":"access-token","account_id":"acct-123"}`,
+		Other: other,
+	}
+	channel.SetProxy()
+	provider, ok := CodexProviderFactory{}.Create(channel).(*CodexProvider)
+	if !ok || provider == nil {
+		t.Fatal("expected Codex provider")
+	}
+	return provider
 }
 
 func TestCodexRealtimeSelfHostedDialOptionsStillBlockMetadataIP(t *testing.T) {

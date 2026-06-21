@@ -18,6 +18,7 @@ import (
 	"one-api/common/config"
 	"one-api/common/requester"
 	"one-api/common/wsconn"
+	runtimerealtime "one-api/runtime/realtime"
 	runtimesession "one-api/runtime/session"
 	"one-api/types"
 
@@ -157,23 +158,23 @@ func newCodexRealtimeCountingServer(t *testing.T, counter *atomic.Int32) *httpte
 	}))
 }
 
-func codexTestTextFrame(payload []byte) runtimesession.Frame {
-	return runtimesession.NewTextFrame(payload)
+func codexTestTextFrame(payload []byte) runtimerealtime.Frame {
+	return runtimerealtime.NewTextFrame(payload)
 }
 
-func codexTestBinaryFrame(payload []byte) runtimesession.Frame {
-	return runtimesession.NewBinaryFrame(payload)
+func codexTestBinaryFrame(payload []byte) runtimerealtime.Frame {
+	return runtimerealtime.NewBinaryFrame(payload)
 }
 
-func codexTestRecv(ctx context.Context, session runtimesession.RealtimeSession) (wsconn.MessageType, []byte, *types.UsageEvent, runtimesession.RealtimePayloadOrigin, error) {
+func codexTestRecv(ctx context.Context, session runtimerealtime.RealtimeSession) (wsconn.MessageType, []byte, *types.UsageEvent, runtimerealtime.RealtimePayloadOrigin, error) {
 	event, err := session.Recv(ctx)
 	if err != nil {
-		return 0, nil, nil, runtimesession.RealtimePayloadOriginProxyLocal, err
+		return 0, nil, nil, runtimerealtime.RealtimePayloadOriginProxyLocal, err
 	}
 	messageType := wsconn.TextMessage
 	var payload []byte
 	if event.Frame != nil {
-		if event.Frame.Kind() == runtimesession.FrameKindBinary {
+		if event.Frame.Kind() == runtimerealtime.FrameKindBinary {
 			messageType = wsconn.BinaryMessage
 		}
 		payload = event.Frame.Payload()
@@ -562,7 +563,7 @@ func TestCodexManagedRealtimeReplacementReaderPreservesBootstrapOwnership(t *tes
 	state := getCodexManagedRuntimeStateLocked(exec)
 	assignCodexAttachmentOwnerLocked(state, attachment)
 	state.wsConn = conn1
-	exec.Transport = runtimesession.TransportModeResponsesWS
+	exec.Transport = runtimesession.TransportModeRealtimeWS
 	provider.startRealtimeWSReaderLocked(exec, state)
 	replaced := clearCodexManagedWebsocketLocked(state)
 	if replaced.conn != conn1 {
@@ -1212,7 +1213,7 @@ func TestCodexManagedRealtimeReclaimsAttachedExecutionSession(t *testing.T) {
 	defer cancel()
 
 	_, _, _, _, err := codexTestRecv(ctx, sessionA)
-	if !errors.Is(err, runtimesession.ErrSessionClosed) {
+	if !errors.Is(err, runtimerealtime.ErrSessionClosed) {
 		t.Fatalf("expected reclaimed attachment to close the stale session, got %v", err)
 	}
 }
@@ -1556,7 +1557,7 @@ func TestCodexRealtimeForceFreshReplacesBindingWithoutStaleConflict(t *testing.T
 	oldKey := managedA.exec.Key
 	oldUpstreamSessionID := managedA.exec.SessionID
 
-	sessionB, errWithCode := provider.OpenRealtimeSessionWithOptions("gpt-5", runtimesession.RealtimeOpenOptions{
+	sessionB, errWithCode := provider.OpenRealtimeSessionWithOptions("gpt-5", runtimerealtime.RealtimeOpenOptions{
 		ClientSessionID: "force-fresh-rebind-session",
 		ForceFresh:      true,
 	})
@@ -1632,7 +1633,7 @@ func TestCodexRealtimeForceFreshReleasesPerCallerCapacity(t *testing.T) {
 	}
 	sessionA.Detach("test_detach")
 
-	sessionB, errWithCode := provider.OpenRealtimeSessionWithOptions("gpt-5", runtimesession.RealtimeOpenOptions{
+	sessionB, errWithCode := provider.OpenRealtimeSessionWithOptions("gpt-5", runtimerealtime.RealtimeOpenOptions{
 		ClientSessionID: "force-fresh-capacity-session",
 		ForceFresh:      true,
 	})
@@ -1725,7 +1726,7 @@ func TestCodexManagedRealtimeForceModeBypassesBridgeCooldown(t *testing.T) {
 		exec.Unlock()
 		t.Fatalf("expected force mode to bypass bridge cooldown and redial websocket, got %v", errWithCode)
 	}
-	if exec.Transport != runtimesession.TransportModeResponsesWS {
+	if exec.Transport != runtimesession.TransportModeRealtimeWS {
 		exec.Unlock()
 		t.Fatalf("expected force mode to switch transport back to websocket, got %q", exec.Transport)
 	}
@@ -2113,7 +2114,7 @@ func TestCodexManagedRealtimeDetachClosesInflightWebsocket(t *testing.T) {
 	ctxClosed, cancelClosed := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancelClosed()
 	_, _, _, _, err := codexTestRecv(ctxClosed, sessionA)
-	if !errors.Is(err, runtimesession.ErrSessionClosed) {
+	if !errors.Is(err, runtimerealtime.ErrSessionClosed) {
 		t.Fatalf("expected detached websocket session to close locally, got %v", err)
 	}
 
@@ -2174,7 +2175,7 @@ func TestCodexManagedRealtimeRecvPrefersBufferedFramesAfterAttachmentClose(t *te
 	}
 
 	_, payload, usage, _, err = codexTestRecv(context.Background(), session)
-	if !errors.Is(err, runtimesession.ErrSessionClosed) {
+	if !errors.Is(err, runtimerealtime.ErrSessionClosed) {
 		t.Fatalf("expected closed attachment to stop Recv after buffered outbound is drained, got %v", err)
 	}
 	if payload != nil {
@@ -2199,7 +2200,7 @@ func TestEnqueueCodexOutboundRejectsClosedAttachment(t *testing.T) {
 	}
 
 	_, err := recvCodexAttachmentOutboundWithTimeout(attachment, 50*time.Millisecond)
-	if !errors.Is(err, runtimesession.ErrSessionClosed) {
+	if !errors.Is(err, runtimerealtime.ErrSessionClosed) {
 		t.Fatalf("expected closed attachment to stay drained, got %v", err)
 	}
 }
@@ -2329,11 +2330,12 @@ func TestCodexManagedRealtimePreservesInflightBridgeTransportOnReattach(t *testi
 	exec.Unlock()
 }
 
-func TestPumpRealtimeHTTPBridgeReattachesInflightDelivery(t *testing.T) {
+func TestPumpRealtimeHTTPBridgeDetachDropsInflightDelivery(t *testing.T) {
 	provider := &CodexProvider{}
 	stream := &fakeStringStream{
 		dataChan: make(chan string),
 		errChan:  make(chan error, 1),
+		closed:   make(chan struct{}),
 	}
 	exec := runtimesession.NewExecutionSession(runtimesession.Metadata{
 		Key:       "token:1/424299/managed-bridge-reattach-session",
@@ -2369,37 +2371,34 @@ func TestPumpRealtimeHTTPBridgeReattachesInflightDelivery(t *testing.T) {
 
 	session.Detach("test_detach")
 
+	select {
+	case <-stream.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected detach to close the HTTP bridge stream")
+	}
+
 	exec.Lock()
 	state = getCodexManagedRuntimeStateLocked(exec)
-	if state.bridgeStream != stream {
+	if state.bridgeStream != nil {
 		exec.Unlock()
-		t.Fatal("expected detach to preserve inflight bridge stream")
+		t.Fatal("expected detach to clear inflight bridge stream")
 	}
-	if !exec.Inflight {
+	if exec.Inflight {
 		exec.Unlock()
-		t.Fatal("expected detach to preserve inflight bridge state")
+		t.Fatal("expected detach to clear inflight bridge state")
 	}
 	if exec.Attached {
 		exec.Unlock()
 		t.Fatal("expected detach to clear attachment ownership")
 	}
-	exec.Unlock()
-
-	replacementAttachment := newCodexAttachment()
-
-	exec.Lock()
-	state = getCodexManagedRuntimeStateLocked(exec)
-	assignCodexAttachmentOwnerLocked(state, replacementAttachment)
-	exec.Attached = true
+	if exec.State != runtimesession.SessionStateClosed {
+		exec.Unlock()
+		t.Fatalf("expected detached ephemeral bridge session to close, got %q", exec.State)
+	}
 	exec.Unlock()
 
 	stream.dataChan <- "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_reattached\",\"status\":\"completed\"}}\n\n"
 	stream.errChan <- io.EOF
-
-	outbound := recvCodexAttachmentOutbound(t, replacementAttachment)
-	if got := string(outbound.payload); !containsAll(got, "response.completed", "resp_reattached") {
-		t.Fatalf("expected reattached bridge payload, got %q", got)
-	}
 
 	select {
 	case <-done:
@@ -2416,19 +2415,17 @@ func TestPumpRealtimeHTTPBridgeReattachesInflightDelivery(t *testing.T) {
 	if exec.Inflight {
 		t.Fatalf("expected inflight bridge state to clear after completion")
 	}
-	if exec.State != runtimesession.SessionStateIdle {
-		t.Fatalf("expected bridge session state to return idle, got %q", exec.State)
-	}
-	if got := exec.LastResponseID; got != "resp_reattached" {
-		t.Fatalf("expected last response id to follow reattached bridge, got %q", got)
+	if got := exec.LastResponseID; got != "" {
+		t.Fatalf("expected stale bridge payload after detach not to update last response id, got %q", got)
 	}
 }
 
-func TestPumpRealtimeHTTPBridgeFinalizesTurnOnlyAfterTerminalEvent(t *testing.T) {
+func TestPumpRealtimeHTTPBridgeDetachFinalizesTurnAndIgnoresLateTerminal(t *testing.T) {
 	provider := &CodexProvider{}
 	stream := &fakeStringStream{
 		dataChan: make(chan string),
 		errChan:  make(chan error, 1),
+		closed:   make(chan struct{}),
 	}
 	exec := runtimesession.NewExecutionSession(runtimesession.Metadata{
 		Key:       "token:1/managed-bridge-finalizer-session",
@@ -2466,28 +2463,21 @@ func TestPumpRealtimeHTTPBridgeFinalizesTurnOnlyAfterTerminalEvent(t *testing.T)
 	}()
 
 	session.Detach("test_detach")
-	detachObservationDeadline := time.Now().Add(50 * time.Millisecond)
-	for time.Now().Before(detachObservationDeadline) {
-		if got := recorder.finalizeCount(); got != 0 {
-			t.Fatalf("expected detach to avoid finalizing the inflight turn, got %d finalizations", got)
-		}
-		time.Sleep(5 * time.Millisecond)
+	select {
+	case <-stream.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected detach to close the HTTP bridge stream")
 	}
-
-	replacementAttachment := newCodexAttachment()
-	exec.Lock()
-	state = getCodexManagedRuntimeStateLocked(exec)
-	assignCodexAttachmentOwnerLocked(state, replacementAttachment)
-	exec.Attached = true
-	exec.Unlock()
+	if got := recorder.finalizeCount(); got != 1 {
+		t.Fatalf("expected detach to finalize the inflight bridge turn exactly once, got %d", got)
+	}
+	detachPayload := recorder.lastPayload()
+	if detachPayload.TerminationReason != "detached" {
+		t.Fatalf("expected detach finalization reason, got %q", detachPayload.TerminationReason)
+	}
 
 	stream.dataChan <- "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_finalized\",\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":5,\"total_tokens\":8}}}\n\n"
 	stream.errChan <- io.EOF
-
-	outbound := recvCodexAttachmentOutbound(t, replacementAttachment)
-	if got := string(outbound.payload); !containsAll(got, "response.completed", "resp_finalized") {
-		t.Fatalf("expected reattached bridge payload, got %q", got)
-	}
 
 	select {
 	case <-done:
@@ -2496,23 +2486,17 @@ func TestPumpRealtimeHTTPBridgeFinalizesTurnOnlyAfterTerminalEvent(t *testing.T)
 	}
 
 	if got := recorder.finalizeCount(); got != 1 {
-		t.Fatalf("expected exactly one turn finalization after terminal event, got %d", got)
+		t.Fatalf("expected late terminal event after detach not to double-finalize, got %d", got)
 	}
 	payload := recorder.lastPayload()
-	if payload.TerminationReason != "response.completed" {
-		t.Fatalf("expected terminal finalization reason to follow the terminal event, got %q", payload.TerminationReason)
+	if payload.TerminationReason != "detached" {
+		t.Fatalf("expected detach finalization reason to remain stable, got %q", payload.TerminationReason)
 	}
-	if payload.FirstResponseAt.IsZero() {
-		t.Fatal("expected terminal finalization payload to freeze the first supplier response time")
+	if payload.Usage == nil || payload.Usage.TotalTokens != 0 {
+		t.Fatalf("expected late terminal usage after detach not to mutate finalized payload, got %+v", payload.Usage)
 	}
-	if payload.FirstResponseAt.Before(payload.StartedAt) {
-		t.Fatalf("expected first response time to be on or after the turn start, got start=%v first=%v", payload.StartedAt, payload.FirstResponseAt)
-	}
-	if payload.Usage == nil || payload.Usage.TotalTokens != 8 {
-		t.Fatalf("expected terminal usage to be finalized once, got %+v", payload.Usage)
-	}
-	if got := recorder.observeCount(); got != 1 {
-		t.Fatalf("expected turn usage observer to see the terminal usage once, got %d", got)
+	if got := recorder.observeCount(); got != 0 {
+		t.Fatalf("expected late terminal usage after detach not to reach the turn observer, got %d", got)
 	}
 }
 
@@ -3157,6 +3141,66 @@ func TestPumpRealtimeHTTPBridgeReportsEOFBeforeTerminalEvent(t *testing.T) {
 	}
 }
 
+func TestPumpRealtimeHTTPBridgeTreatsDataChannelCloseAsEOF(t *testing.T) {
+	provider := &CodexProvider{}
+	stream := &fakeStringStream{
+		dataChan: make(chan string),
+		errChan:  make(chan error),
+	}
+	exec := runtimesession.NewExecutionSession(runtimesession.Metadata{
+		Key:       "token:1/managed-bridge-data-close-session",
+		SessionID: "managed-bridge-data-close-session",
+		CallerNS:  "token:1",
+		ChannelID: 424299,
+		Model:     "gpt-5",
+		Protocol:  codexRealtimeProtocolName,
+	})
+
+	attachment := newCodexAttachment()
+
+	exec.Lock()
+	state := getCodexManagedRuntimeStateLocked(exec)
+	assignCodexAttachmentOwnerLocked(state, attachment)
+	state.bridgeStream = stream
+	exec.Attached = true
+	exec.Inflight = true
+	exec.Transport = runtimesession.TransportModeResponsesHTTPBridge
+	exec.State = runtimesession.SessionStateActive
+	exec.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		provider.pumpRealtimeHTTPBridge(exec, stream)
+		close(done)
+	}()
+
+	close(stream.dataChan)
+
+	outbound := recvCodexAttachmentOutbound(t, attachment)
+	if got := string(outbound.payload); !containsAll(got, "bridge_stream_failed", "closed before a terminal response event") {
+		t.Fatalf("expected data channel close before terminal event to surface a bridge failure, got %q", got)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for bridge reader to exit after data channel close")
+	}
+
+	exec.Lock()
+	defer exec.Unlock()
+	state = getCodexManagedRuntimeStateLocked(exec)
+	if state.bridgeStream != nil {
+		t.Fatalf("expected bridge stream to clear after data channel close")
+	}
+	if exec.Inflight {
+		t.Fatalf("expected inflight bridge state to clear after data channel close")
+	}
+	if exec.State != runtimesession.SessionStateIdle {
+		t.Fatalf("expected bridge session state to return idle after data channel close, got %q", exec.State)
+	}
+}
+
 func TestCodexManagedRealtimeWebsocketDuplicateTerminalEventsDoNotDoubleBill(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, ok := acceptCodexRealtimeTestConn(t, w, r)
@@ -3245,7 +3289,7 @@ func TestCodexOpenRealtimeSessionReleasesLeaseOnModelMismatch(t *testing.T) {
 	})
 	provider.Context.Set("token_id", 118)
 
-	meta, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimesession.RealtimeOpenOptions{})
+	meta, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimerealtime.RealtimeOpenOptions{})
 	if errWithCode != nil {
 		t.Fatalf("expected execution session metadata, got %v", errWithCode)
 	}
@@ -3527,7 +3571,7 @@ func TestCodexRealtimeReopenLocalOnlySessionPromotesToShared(t *testing.T) {
 	})
 	provider.Context.Set("token_id", 118)
 
-	meta, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimesession.RealtimeOpenOptions{})
+	meta, errWithCode := provider.buildExecutionSessionMetadata("gpt-5", runtimerealtime.RealtimeOpenOptions{})
 	if errWithCode != nil {
 		t.Fatalf("expected execution session metadata, got %v", errWithCode)
 	}
@@ -3574,7 +3618,7 @@ func cleanupCodexManagedSession(t *testing.T, provider *CodexProvider, model str
 		currentCodexExecutionSessions().Delete(binding.SessionKey)
 		return
 	}
-	meta, errWithCode := provider.buildExecutionSessionMetadata(model, runtimesession.RealtimeOpenOptions{})
+	meta, errWithCode := provider.buildExecutionSessionMetadata(model, runtimerealtime.RealtimeOpenOptions{})
 	if errWithCode != nil {
 		return
 	}

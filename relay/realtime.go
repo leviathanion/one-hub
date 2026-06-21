@@ -16,7 +16,7 @@ import (
 	"one-api/model"
 	providersBase "one-api/providers/base"
 	"one-api/relay/relay_util"
-	runtimesession "one-api/runtime/session"
+	runtimerealtime "one-api/runtime/realtime"
 	"one-api/types"
 	"strings"
 	"time"
@@ -28,7 +28,7 @@ import (
 type RelayModeChatRealtime struct {
 	relayBase
 	userConn *wsconn.ManagedConn
-	session  runtimesession.RealtimeSession
+	session  runtimerealtime.RealtimeSession
 	quota    *relay_util.Quota
 }
 
@@ -393,7 +393,7 @@ func (r *RelayModeChatRealtime) tryPinnedRealtimeSession(clientSessionID string,
 		return false
 	}
 
-	realtimeSession, apiErr := openRealtimeSessionWithFreshFallback(provider, modelName, runtimesession.RealtimeOpenOptions{
+	realtimeSession, apiErr := openRealtimeSessionWithFreshFallback(provider, modelName, runtimerealtime.RealtimeOpenOptions{
 		ClientSessionID: clientSessionID,
 	})
 	if apiErr == nil {
@@ -423,7 +423,7 @@ func (r *RelayModeChatRealtime) tryAffinityRealtimeSession(clientSessionID strin
 		return false, nil
 	}
 
-	realtimeSession, apiErr := openRealtimeSessionWithFreshFallback(provider, modelName, runtimesession.RealtimeOpenOptions{
+	realtimeSession, apiErr := openRealtimeSessionWithFreshFallback(provider, modelName, runtimerealtime.RealtimeOpenOptions{
 		ClientSessionID: clientSessionID,
 	})
 	if apiErr == nil {
@@ -463,12 +463,9 @@ func providerSupportsRealtime(provider providersBase.ProviderInterface) bool {
 	return ok
 }
 
-func openRealtimeSessionWithOptions(provider providersBase.ProviderInterface, modelName string, options runtimesession.RealtimeOpenOptions) (runtimesession.RealtimeSession, *types.OpenAIErrorWithStatusCode) {
+func openRealtimeSessionWithOptions(provider providersBase.ProviderInterface, modelName string, options runtimerealtime.RealtimeOpenOptions) (runtimerealtime.RealtimeSession, *types.OpenAIErrorWithStatusCode) {
 	if providerWithOptions, ok := provider.(providersBase.RealtimeSessionProviderWithOptions); ok {
 		return providerWithOptions.OpenRealtimeSessionWithOptions(modelName, options)
-	}
-	if options.RequireWS {
-		return nil, common.StringErrorWrapperLocal("channel does not support Responses websocket transport", "responses_ws_unsupported_for_channel", http.StatusUpgradeRequired)
 	}
 	realtimeProvider, ok := provider.(providersBase.RealtimeSessionProvider)
 	if !ok {
@@ -477,9 +474,9 @@ func openRealtimeSessionWithOptions(provider providersBase.ProviderInterface, mo
 	return realtimeProvider.OpenRealtimeSession(modelName)
 }
 
-func openRealtimeSessionWithFreshFallback(provider providersBase.ProviderInterface, modelName string, options runtimesession.RealtimeOpenOptions) (runtimesession.RealtimeSession, *types.OpenAIErrorWithStatusCode) {
+func openRealtimeSessionWithFreshFallback(provider providersBase.ProviderInterface, modelName string, options runtimerealtime.RealtimeOpenOptions) (runtimerealtime.RealtimeSession, *types.OpenAIErrorWithStatusCode) {
 	realtimeSession, apiErr := openRealtimeSessionWithOptions(provider, modelName, options)
-	if apiErr == nil || options.RequireWS || options.ForceFresh || !shouldForceFreshRealtimeSession(apiErr) {
+	if apiErr == nil || options.ForceFresh || !shouldForceFreshRealtimeSession(apiErr) {
 		return realtimeSession, apiErr
 	}
 
@@ -499,7 +496,7 @@ func shouldForceFreshRealtimeSession(apiErr *types.OpenAIErrorWithStatusCode) bo
 	}
 }
 
-func (r *RelayModeChatRealtime) activateRealtimeSession(provider providersBase.ProviderInterface, modelName string, realtimeSession runtimesession.RealtimeSession, channelID int) {
+func (r *RelayModeChatRealtime) activateRealtimeSession(provider providersBase.ProviderInterface, modelName string, realtimeSession runtimerealtime.RealtimeSession, channelID int) {
 	if r == nil {
 		return
 	}
@@ -530,7 +527,7 @@ func (r *RelayModeChatRealtime) openFreshRealtimeSession(clientSessionID string,
 			continue
 		}
 
-		realtimeSession, apiErr := openRealtimeSessionWithFreshFallback(r.provider, r.modelName, runtimesession.RealtimeOpenOptions{
+		realtimeSession, apiErr := openRealtimeSessionWithFreshFallback(r.provider, r.modelName, runtimerealtime.RealtimeOpenOptions{
 			ClientSessionID: clientSessionID,
 			ForceFresh:      forceFresh,
 		})
