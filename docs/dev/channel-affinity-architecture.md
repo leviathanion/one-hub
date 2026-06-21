@@ -305,7 +305,7 @@ Codex realtime 的共享亲和逻辑由 `providers/codex/realtime_session.go` �
 - 静默回放。
 - 把 continuation miss 视为普通渠道错误并走通用 retry/cooldown。
 
-ResponsesWS 也遵守同一 correctness 边界，但错误交互形态不同：actor 在当前 upstream session 内透传或规范化为 WS error frame，并记录连接建立时的 upstream snapshot；不得因为 `previous_response_not_found` 重新选 channel/key、重放业务事件或清空 `previous_response_id` 后继续发送。
+ResponsesWS 也遵守同一 correctness 边界，但错误交互形态不同：actor 在当前 upstream session 内透传或规范化为 WS error frame，并记录连接建立时的 upstream snapshot；不得因为 `previous_response_not_found` 重新选 channel/key、重放业务事件或清空 `previous_response_id` 后继续发送。HTTP bridge omitted turn 使用 actor 的 `lastFinal.ID` 作为 default `previous_response_id` 时，该 default 也是本次实际 attempted continuation key；若 provider 返回 miss，actor 必须按 owner 条件清理对应 response-id binding，并在匹配时清除 `lastFinal`，防止后续 omitted turn 重复注入 stale id。
 
 ## 一致性模型
 

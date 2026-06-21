@@ -44,7 +44,7 @@ realtime:
   allowed_origins:                  # Realtime WebSocket Origin 白名单
     - "https://app.example.com"
   unsafe_allow_credential_subprotocol_any_origin: false
-  websocket_read_limit: 16777216    # 单帧读取上限（字节）
+  websocket_read_limit: 33554432    # 单帧读取上限（字节，默认 32 MiB）
   websocket_ping_interval_ms: 25000 # 服务端主动 Ping 周期（毫秒）
   websocket_write_timeout_ms: 40000 # WebSocket 写超时（毫秒）
 
@@ -239,7 +239,7 @@ realtime:
 
 | 值 | 行为 | 影响 |
 |----|------|------|
-| `10000`（默认） | 写超时 10 秒 | 覆盖正常网络抖动 |
+| `10000` | 写超时 10 秒 | 更快释放慢连接，但更容易误伤跨区域网络抖动 |
 | `40000`（默认） | 写超时 40 秒 | 覆盖高延迟跨区域链路 |
 | `5000` | 5 秒 | 更快释放慢连接资源 |
 | `30000` | 30 秒 | 容忍高延迟网络（如跨国链路） |
@@ -405,19 +405,19 @@ realtime_websocket_client_inbound_activity_timeout_ms: 60000
 | 值 | 行为 | 影响 |
 |----|------|------|
 | `"auto"`（默认） | 优先 WebSocket，失败后回退 HTTP bridge | 推荐；兼顾性能与可用性 |
-| `"required"` | 强制 WebSocket，不支持则拒绝 | WebSocket 不可用时请求失败 |
+| `"force"` | 强制 WebSocket，不支持则拒绝 | WebSocket 不可用时请求失败 |
 | `"off"` | 禁用 WebSocket，始终走 HTTP bridge | 不使用 Codex Realtime |
 
 **示例（渠道 Codex 配置(JSON)）**：
 
 ```json
 {
-  "websocket_mode": "required"
+  "websocket_mode": "force"
 }
 ```
 
 **对系统的影响**：
-- `"required"`：若 Codex upstream 不支持 WebSocket，客户端收到错误。
+- `"force"`：若 Codex upstream 不支持 WebSocket，客户端收到错误。
 - `"off"`：关闭 WebSocket 连接能力，节省连接资源但失去 Realtime 低延迟优势。
 
 Codex 渠道的完整 `channel.Other` 配置见 [Codex 渠道文档](/use/Codex)。
@@ -426,12 +426,12 @@ Codex 渠道的完整 `channel.Other` 配置见 [Codex 渠道文档](/use/Codex)
 
 ### Codex 渠道专用：`websocket_retry_cooldown_seconds` 🏷️ Web 后台 → 渠道 → Codex 配置(JSON)
 
-**位置**：`渠道 → Codex → Codex 配置(JSON)` 中的 `websocket_retry_cooldown_seconds` 字段。WebSocket 连接失败后的冷却时间，在此期间不重试 WebSocket 而是走 HTTP bridge。
+**位置**：`渠道 → Codex → Codex 配置(JSON)` 中的 `websocket_retry_cooldown_seconds` 字段。表示 Codex Realtime websocket 失败后的 bridge 冷却；在冷却期内，同一 Realtime execution session 不重试 websocket，而是继续使用 HTTP bridge。
 
 | 值 | 行为 |
 |----|------|
 | `120`（默认） | 2 分钟冷却 |
-| `0` | 无冷却，立即重试 |
+| 正整数 | 指定冷却秒数；保存校验要求大于 0 |
 
 ---
 

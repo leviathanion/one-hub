@@ -2,15 +2,18 @@
 
 ## 文档收敛说明
 
-`docs/dev` 里原先有多份渠道亲和、usage 与 async task 设计文档，主题重复，而且不少内容混杂了“当前实现”和“未来草案”两种口径。
+`docs/dev` 里原先有多份渠道亲和、usage 与 async task 设计文档，主题重复，而且不少内容混杂了“当前实现”和“未来方案”两种口径。
 
 现在收敛成若干份“当前架构说明”和一份独立工具文档：
 
 | 文档 | 主题 | 说明 |
 | --- | --- | --- |
 | [Channel Affinity 架构设计方案](./channel-affinity-architecture.md) | 渠道路由、responses affinity、Codex realtime affinity | 当前 routing / affinity 架构说明 |
-| [Billing / Usage 结算架构](./billing-settlement-architecture.md) | usage / settlement / finalize | 当前统一结算架构说明 |
-| [ResponsesWS 架构说明](./responses-ws-architecture.md) | `/v1/responses` WebSocket、actor、quota、upstream snapshot、fallback | 当前 ResponsesWS ingress 架构说明 |
+| [Billing / Usage 结算架构](./billing-settlement-architecture.md) | usage / settlement / finalize / ResponsesWS conservative billing | 当前统一结算架构说明；ResponsesWS 采用保守有界计费 |
+| [ResponsesWS Settlement Core / Actor v2](./responses-ws-settlement-core-actor-v2.md) | ResponsesWS defensive settlement core、trace、actor 账务边界 | ResponsesWS 账务主规格；`ExpectedFinalQuota` 是真实扣费唯一金额来源 |
+| [ResponsesWS 架构说明](./responses-ws-architecture.md) | `/v1/responses` WebSocket、actor、quota、upstream snapshot、conservative billing | 当前 ResponsesWS ingress 架构说明；计费口径是不少计费、允许有界小幅多计费、不追求事务级精确 |
+| [ResponsesWS Transport 边界重构方案](./responses-ws-transport-boundary.md) | ResponsesWS native WS / HTTP bridge transport、provider adapter 边界 | 针对当前 provider 内部分叉的 v1 重构方案 |
+| [ResponsesWS Provider Contract ADR](./responses-ws-provider-contract.md) | ResponsesWS provider-facing contract 决策 | 选择 `OpenResponsesWS` / `responsesws.Upstream` 作为长期 ResponsesWS provider contract |
 | [WebSocket Transport 复用方案](./websocket-transport-architecture.md) | `/v1/realtime` 与 ResponsesWS 的旧底层 I/O 复用 | 旧方案说明；已被 wsconn 唯一传输边界取代 |
 | [wsconn 唯一传输边界架构方案](./wsconn-architecture.md) | `common/wsconn` 作为唯一 WebSocket 传输边界 | 当前实现；业务层不再持有 `*websocket.Conn` |
 | [one-hub Async Task 架构设计](./task-coordination-architecture.md) | async task、identity、fetch、sweeper、finalize | 当前异步任务架构说明 |
@@ -22,8 +25,11 @@
 | 文档 | 当前状态 | 说明 |
 | --- | --- | --- |
 | [Channel Affinity 架构设计方案](./channel-affinity-architecture.md) | 当前实现 | 当前代码已按该方案收敛，用于解释现有 routing / affinity 行为 |
-| [Billing / Usage 结算架构](./billing-settlement-architecture.md) | 当前实现 | `Quota -> SettlementEnvelope -> ApplySettlement` 已成为统一结算主链路 |
-| [ResponsesWS 架构说明](./responses-ws-architecture.md) | 当前实现 | `GET /v1/responses` WebSocket ingress、actor/attempt、upstream snapshot、RequireWS、capability、fallback 和容量配置 |
+| [Billing / Usage 结算架构](./billing-settlement-architecture.md) | 当前实现 + ResponsesWS v2 口径 | `Quota -> SettlementEnvelope -> ApplySettlement` 是统一结算主链路；ResponsesWS uncertain/no-terminal 使用 preconsume floor |
+| [ResponsesWS Settlement Core / Actor v2](./responses-ws-settlement-core-actor-v2.md) | 当前实现 + 目标约束 | settlement input/decision/applied trace 是 ResponsesWS 账务审计主规格；actor 不根据 diagnostic reason 改钱 |
+| [ResponsesWS 架构说明](./responses-ws-architecture.md) | 当前实现 + 待收敛设计 | `GET /v1/responses` WebSocket ingress、actor/attempt、upstream snapshot、专用 upstream capability、conservative billing 和 actor v2 数据结构 |
+| [ResponsesWS Transport 边界重构方案](./responses-ws-transport-boundary.md) | 目标方案 | 把 native WS / HTTP bridge transport 从 Codex realtime 语义中拆出，供 OpenAI/Codex provider adapter 显式复用 |
+| [ResponsesWS Provider Contract ADR](./responses-ws-provider-contract.md) | ADR | ResponsesWS 长期 provider contract 选择 `OpenResponsesWS(ctx, model, options)` 返回 `responsesws.Upstream` |
 | [WebSocket Transport 复用方案](./websocket-transport-architecture.md) | 旧方案说明 | 原 primitives-only safety primitives 路线，已被 `common/wsconn` 唯一传输边界取代 |
 | [wsconn 唯一传输边界架构方案](./wsconn-architecture.md) | 当前实现 | `common/wsconn` 是唯一 WebSocket 传输边界；业务层不再 import gorilla，CloseInfo first-write-wins，PongMiss/Idle 语义拆分 |
 | [one-hub Async Task 架构设计](./task-coordination-architecture.md) | 当前实现 | `tasks` 行、settlement snapshot、local fetch、sweeper、finalize 已形成稳定边界 |

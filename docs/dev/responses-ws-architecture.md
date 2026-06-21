@@ -22,7 +22,63 @@ ResponsesWS 入口要同时满足五个事实：
 4. **代理事实**：one-hub 是协议透明代理，转发真相是 raw frame；typed struct 只能服务本地决策。
 5. **归属事实**：provider-originated payload 只有在存在 pending 或 active turn 时才有 quota/affinity 语义；session open 只能证明 transport 可用，不能单独成为 provider frame 的业务归属。
 
-由此得到架构原则：**每条 ResponsesWS 连接只有一个状态写入者（actor），所有外部并发都先转换为事件；每个 turn attempt 是一个可提交或可回滚的事务；所有跨层语义必须通过类型表达，不能靠 sniff 或调用顺序约定。**
+由此得到架构原则：**每条 ResponsesWS 连接只有一个状态写入者（actor），所有外部并发都先转换为事件；每个 turn attempt 是一个可 rollback、usage settle 或 floor settle 的账务单元；所有跨层语义必须通过类型表达，不能靠 sniff 或调用顺序约定。**
+
+## Actor 状态机速查
+
+`ResponsesWSSessionActor` 的连接状态只表达 turn accounting 的主生命周期，固定链路为：
+
+```text
+opening -> pending_prepare -> pending_send -> in_flight -> idle -> ... -> closed
+```
+
+- `opening`：首帧已被保留，actor 正在获取 active lease、RPM admission、channel 和 upstream session。
+- `pending_prepare`：候选 turn attempt 已创建，尚未进入 provider local-write 边界。
+- `pending_send`：本地准备完成，正在等待 `SendClient` / `SendControl` 的 send proof。
+- `in_flight`：provider 已看到或可能已看到当前 turn，等待 provider terminal 或 proxy-local close。
+- `idle`：当前没有 pending/active turn，同一 upstream session 可接收下一次 `response.create`。
+- `closed`：连接级资源、lease、session 和 quota settlement 已终止。
+
+`pendingTurnPhase` 不是第二套 accounting truth。它只用于 first-turn/open/send 取消和乱序事件相关性：例如首帧 open worker、pending send cancel、bridge open error recv-pump 事件需要知道自己是否还属于当前 attempt。账本真相仍然是 actor `state` 与 `turns` slot：pending slot 持有 attempt、cancel state 和 `responsesWSProviderJournal`；active slot 持有 attempt、affinity、channel 与 `common/responsesws.ProviderSettlementLogProjection`。这些状态只能由 actor 事件循环写入。
+
+设计取舍：当前代码没有引入独立状态机框架。框架能减少非法迁移的表达空间，但会把 quota、affinity、send proof、provider evidence 的跨事件处理一次性搬进新抽象，增加迁移风险。本阶段用文档和 enum 注释固定状态含义，保留 actor 单写者结构。
+
+## 保守有界计费口径
+
+ResponsesWS 不追求事务级精确计费。WebSocket send result、provider terminal、客户端断开、provider close 可能乱序到达，proxy 无法在所有情况下证明 provider 是否已经看到 `response.create`。当前业务口径是：允许小幅多计费，不接受少计费；多计费必须受 preconsume floor 约束，不能按最大输出 token、未知 completion 上限或连接时长放大。
+
+结算规则固定为：
+
+- 可证明未发送、发送前 prepare/preflight 失败、本地 rewrite/quota preconsume 前失败：rollback reserve。
+- HTTP bridge 在 stream start 前收到 provider HTTP rejection：rollback reserve；RPM admission 不回滚。
+- provider terminal 带 billable usage：按 provider usage 结算，可低于 preconsume 并退款。
+- provider terminal 不带 billable usage：按 preconsume floor 结算。
+- no-terminal 但有 provider evidence：`final_quota = max(observed_billable_usage_quota, preconsume_floor)`。
+- no-terminal 且无 provider evidence，但没有 no-send proof：按 preconsume floor 结算。
+
+provider adapter 和 transport helper 只产出 evidence：send result、provider-originated frame、usage event、provider close、bridge stream opened/rejected 或 proxy-local transport error。quota、RPM、affinity、terminal finalization 和 conservative floor settlement 只能由 actor 串行决定。
+
+## Actor v2 数据结构收敛目标
+
+当前 actor 继续作为单写者，但顶层字段不能继续平铺 pending/active turn 状态。下一阶段的重构目标是先做零行为分组，再考虑抽轻量 accounting reducer，避免把 56 字段 actor 直接搬进另一层抽象。
+
+目标分组：
+
+- `io`：downstream/upstream writer、bridge、ping/pong 和 write command 状态。
+- `request`：首帧、credential、snapshot、model 与 raw frame projection。
+- `leases`：pending slot、active lease、connection rate limit 相关状态。
+- `upstream`：当前 provider session、channel、generation、open/cancel worker。
+- `turns`：`opening`、`pending`、`active`、last final response 和 recent finalized response ids。
+- `workers`：open/send/cancel/watchdog worker 的 attempt correlation。
+- `closing`：close reason、detach/abort、downstream close control。
+- `watchdog`：connection liveness、business idle、active turn timeout。
+
+不变量：
+
+- pending slot 的 identity 是 `attempt` / `openingID` / `phase`；清理 pending slot 必须通过 turn slot helper，确保 attempt、journal replay entries 与 cancel marker 同步归零。
+- active slot 的 identity 是 active attempt；清理 active slot 必须通过 turn slot helper，确保 projection、affinity、channel 和 bridge cancel marker 同步归零。
+- `opening`、`pending`、`active` 最多同时存在一个 current create；过渡必须通过显式 transition 函数完成。
+- 所有 state mutation 仍只发生在 actor event loop。
 
 ## 强不变量
 
@@ -50,9 +106,9 @@ ResponsesWS 入口要同时满足五个事实：
 14. 首帧 retry 边界不是 `SendClient` 返回 error，而是 actor 能证明该 candidate 没有被上游看到：未写入 upstream、没有 provider-originated event、没有 ambiguous outcome。
 15. 后续 turn 已绑定当前 upstream session，不能重新选号。本地 binding 指向其它 channel 时直接返回 owner conflict，不发送上游。
 16. `pending_prepare` / `pending_send` 是显式状态。RPM admission 在 turn entry 完成（首帧：pending-turn `opening` phase 内、channel selection 之前；后续 turn：busy check 通过、`PrepareResponsesWSTurnAttempt` 之前），独立于 candidate attempt。
-17. `BeginCandidate` 之后、`SendProviderFrame` 之前的任何本地失败都必须走同一个 rollback cleanup：先调用 `RollbackBeforeLocalWriteOK(reason)`，成功后同时清空 `pendingAttempt`、`pendingProviderEvents`、provider evidence、`pendingTurnPhase`，并把 actor state 恢复为 `idle`。rollback 失败不能继续返回原始业务错误，必须写 `quota_rollback_failed` 并 fail closed。
+17. `BeginCandidate` 之后、`SendProviderFrame` 之前的任何本地失败都必须走同一个 settlement cleanup：actor 构造 `ZeroChargeProof` 和当前 evidence，先经过 `decideResponsesWSSettlement(...)`，再由 executor 执行 rollback reserve 或保守结算；成功后通过 turn slot helper 同时清空 pending attempt、journal replay entries、cancel marker 与 `pendingTurnPhase`，并把 actor state 恢复为 `idle`。settlement 失败不能继续返回原始业务错误，必须写 `quota_settlement_failed` / `quota_rollback_failed` 并 fail closed。
 18. `providerRecvPump` 只能在 actor `BeginCandidate` 成功、RPM admission 通过、pending attempt 和 `AttemptID` 存在后启动；provider-originated event 在 `SendResult` 之前到达时必须先缓存在 pending turn 上。buffered provider-originated event 本身是上游可能已处理该 turn 的证据，之后即使 `SendResult` 带 error，也不能按未发送 retry。
-19. `SendOutcomeNotSent` 且无 buffered provider-originated event 时才允许 rollback/retry；`SendOutcomeAmbiguous` 不 retry、不 quota undo；`SendOutcomeNotSent` 与 buffered provider-originated event 同时出现是 proof 冲突，按 protocol violation fail closed（abort/detach session、关闭 turn/连接、不 retry、不重放 buffered event、不 classifier、不 record/clear affinity、不 quota undo）。
+19. `SendOutcomeNotSent` 且无 buffered provider-originated event 时才允许 rollback/retry；`SendOutcomeAmbiguous` 不 retry、不 cross-channel replay，也不 quota undo。`SendOutcomeAmbiguous` 即使没有 provider evidence，也只能说明 proxy 没观察到 evidence，不能证明 provider 没看到请求；actor 必须按 preconsume floor 做 conservative settlement 后关闭。`SendOutcomeNotSent` 与 buffered provider-originated event 同时出现是 proof conflict，provider evidence 压制 rollback；actor 记录 warning/metric，不 retry，quota 按 `max(observed_billable_usage, preconsume_floor)` 保守结算，不 record affinity。只有 attempt/channel/generation/response id 这类身份归属冲突才 fail closed。
 20. MVP 默认不做本地 `response.create` 队列；active turn 未 terminal 时返回 recoverable `session_busy`。后续如引入 `responses_ws.pending_create_queue_size=1`，入队前必须先完成 JSON、model 一致性、RPM、quota 和 frame size 校验。
 21. 后续 `response.create.model` 必须映射到首 turn 锁定的 upstream model；连接内 model 切换 MVP 返回 recoverable local error，不重新选 channel/key。
 
@@ -101,8 +157,8 @@ actor 后续 turn 使用当前 upstream session 和该 snapshot 做日志、诊�
 25. terminal 分类只允许通过 `ResponsesTerminalClassifier`。
 26. `response.completed` / `response.done` 只有在没有 top-level `error`、没有 non-null `response.error`，且 status 缺失或等于 `completed` 时才算 success terminal。
 27. `response.completed` / `response.done` 带 top-level error 或 `response.error` 时归类为 failed terminal，即使 status 缺失。
-28. status 为 `failed` / `incomplete` / `cancelled` / `canceled` 的 completed/done alias 必须归类为 failed terminal。
-29. normalize 只发生在下行边界：`response.done` + success 可转为 `response.completed`；cancelled/canceled/error-bearing done/completed 可转为 failed 形态。
+28. status 为 `failed` / `incomplete` 的 completed/done alias 必须归类为 failed terminal；status 为 `cancelled` / `canceled` 必须归类为独立 cancelled terminal，不得混入 failed terminal。
+29. normalize 只发生在下行边界：`response.done` + success 可转为 `response.completed`；error-bearing done/completed 可转为 failed 形态；cancelled/canceled 保持 cancelled terminal 语义。
 
 ### Raw protocol
 
@@ -112,7 +168,7 @@ actor 后续 turn 使用当前 upstream session 和该 snapshot 做日志、诊�
 33. raw rewrite 只承诺语义级保留（unknown field value 不被 `float64` 改写），不承诺保留顶层对象 key 顺序、空白或重复 key 结构；parser 拒绝顶层重复 key。
 34. Codex provider 内部要求嵌套 `{"type":"response.create","response":{...}}` 的 wrapping 只能在发送给 codex provider 的边界做，wrapper 内容来自 raw map，不能来自 typed struct 重组。
 35. provider adapter 对 actor 暴露的必须是官方 ResponsesWS event surface；私有 bootstrap/control frame（`session.created`、内部 ack、transport greeting）必须在 adapter 内消费或转为本地协议错误。
-36. ResponsesWS 的 live provider execution session 只在同一条 downstream WebSocket 内复用；不同 downstream WS 连接必须使用不同 provider execution session，即使请求带相同 `x-session-id`。`x-session-id` 仍可参与 routing/prompt-cache identity，但不能成为跨连接共享上游 WS 的 binding。
+36. ResponsesWS 的 live upstream 只在同一条 downstream WebSocket 内复用；不同 downstream WS 连接必须使用不同 upstream WS，即使请求带相同 `x-session-id`。`x-session-id` 仍可参与 routing/prompt-cache identity，但不能成为跨连接共享上游 WS 的 binding。
 
 ### 并发与资源
 
@@ -126,7 +182,7 @@ actor 后续 turn 使用当前 upstream session 和该 snapshot 做日志、诊�
 44. ResponsesWS established session 的 idle 语义以 `ResponsesWSIdleTimeout` 和业务 activity 为准。provider data frame、usage event、provider-originated error、客户端 data frame 都必须刷新 actor activity。OpenAI ResponsesWS 的 gorilla read-side API 只属于 read loop / read handler，writer 路径的 turn 状态变化不调用 `SetReadDeadline`，active-turn 无 provider/client data activity 时由业务 idle/后续独立 turn timer 关闭，不能复用客户端 socket read deadline。
 45. handler 的 live `gin.Context` 不跨 goroutine 读写。turn prepare/record/clear 使用稳定 input 或 `c.Copy()`。
 46. actor mailbox 事件必须分级：`SendResult`、actor 自身 panic/timeout 这类账本 proof / fail-closed 事件必须可靠投递；普通 provider data frame 可以受 mailbox backpressure 影响，但丢弃时必须最终投递 backpressure timeout 或关闭连接。
-47. `pendingProviderEvents` 必须同时有事件数和字节数上限；上限触发时 fail closed，不能靠 mailbox 长度推导内存边界。
+47. pending provider journal replay entries 必须同时有事件数和字节数上限；上限触发时 fail closed，不能靠 mailbox 长度推导内存边界。
 48. 所有 ResponsesWS goroutine 入口（actor loop、client read pump、provider recv pump、send worker、open worker、idle watchdog）都必须有 panic recovery，recovery 策略为 fail closed。
 
 ## 核心组件
@@ -135,7 +191,7 @@ actor 后续 turn 使用当前 upstream session 和该 snapshot 做日志、诊�
 | --- | --- |
 | `ResponsesWSSessionActor` | 连接级单写者，唯一拥有 `sessionChannelID`、upstream snapshot、pending turn、active turn、active quota transaction、RPM charge state、last final response 和 close state。串行消费 `ClientFrame`、`SendResult`、`ProviderDownstream`、`ProxyLocalError`、`ClientClosed`、`Timeout` 事件。 |
 | `ResponsesWSTurnAdmission` | 客户端 turn 级 RPM 账本；最多 `AllowRPMOnce` 一次，首帧 not-sent retry 复用同一个 admission。 |
-| `ResponsesWSTurnAttempt` | 单 selected channel 的事务，承载 quota、candidate、session、send outcome。提供 `BeginCandidate`、`PreConsumeQuota`、`CommitLocalWriteOK`、`CommitAmbiguousAdmission`、`RollbackBeforeLocalWriteOK`。 |
+| `ResponsesWSTurnAttempt` | 单 selected channel 的事务，承载 quota、candidate、session、send outcome 和 terminal evidence。提供 `BeginCandidate`、`PreConsumeQuota`、send outcome commit，以及 `ApplyResponsesWSSettlementDecision` 执行 rollback/fixed-final settlement。 |
 | `ResponsesWSIOBridge` | protocol-aware bridge：拥有 goroutine、websocket read/write deadline、single writer、ping/pong activity、frame size limit 和 provider `Recv` loop；只做首帧/后续帧校验、model rewrite、provider event delivery 与 unknown event passthrough，不直接 sniff terminal/affinity/quota，把所有 I/O 结果投递给 actor 并执行 actor 返回的 write/open/abort 指令。 |
 | `ResponsesAffinityManager` | responses-kind affinity 的 candidate、commit、record、clear 门面；所有调用来自 actor，所有 stale binding 清理必须带 owner 条件。 |
 | `ResponsesTerminalClassifier` | 把 provider-originated 下行事件分类成 `non_terminal / success_terminal / failed_terminal`，并给出有限 normalize 结果；放在 `common/responsesws` 供 relay 和 provider 共用。 |
@@ -146,11 +202,11 @@ actor 后续 turn 使用当前 upstream session 和该 snapshot 做日志、诊�
 
 ResponsesWS 需要专用 actor，不是因为底层 WebSocket I/O 特殊，而是因为每个 `response.create` 都是带 RPM、quota、affinity 和 terminal side effect 的 turn transaction。`RealtimeSessionProxy` 当前包含 pass-through policy，不能直接作为 ResponsesWS 的业务状态机复用。
 
-目标重构是复用 `common/requester` 内稳定的 WebSocket safety primitive，而不是复用 `RealtimeSessionProxy` 的 policy，也不是新建一套完整 `wsrelay` 框架。第一阶段只复用 client writer、write deadline、read limit、close control、UTF-8 安全 close reason、ping/pong activity handler、bounded control/error writer、active counter guard 和已有 `WSControlFrameWriter`。client read pump、session recv pump 和 send worker 仍由 ResponsesWS actor/IOBridge 持有，除非后续观察证明机械重复足够大且不会引入业务 flag。
+当前实现通过 `common/wsconn` 作为唯一 WebSocket 传输边界复用底层 I/O 能力，而不是复用 `RealtimeSessionProxy` 的 policy，也不是新建一套完整 `wsrelay` 框架。client read pump、session recv pump 和 send worker 仍由 ResponsesWS actor / transport helper 持有，避免把 turn accounting、quota 和 terminal side effect 下沉到通用 WebSocket 层。
 
-`LocalWriteOK / NotSent / Ambiguous` 不属于底层 helper。底层写 helper 只返回原始 error；ResponsesWS actor 结合 attempt phase、provider-originated evidence 和 session 状态合成 send outcome。这样可以让 `/v1/realtime` 继续保持 pass-through 语义，同时避免把 ResponsesWS 的账本概念泄漏到底层。
+`Attempted / NotAttempted / RejectedBeforeStream / Ambiguous` 的最终解释不属于底层 helper。ResponsesWS transport helper 产出 `responsesws.ResponsesWSTransportSendResult`，用于表达本地发送边界是否已进入 provider transport；ResponsesWS actor 结合 attempt phase、provider-originated evidence 和 session 状态把它解释成最终 send outcome 与账本动作。这样可以让 `/v1/realtime` 继续保持 pass-through 语义，同时避免让 provider adapter 拥有 ResponsesWS accounting。
 
-详细目标方案见 [WebSocket Transport 复用方案](./websocket-transport-architecture.md)。
+当前 WebSocket 传输边界见 [wsconn 唯一传输边界架构方案](./wsconn-architecture.md)；ResponsesWS provider transport 边界见 [ResponsesWS Transport 边界重构方案](./responses-ws-transport-boundary.md)。
 
 ## 连接账本
 
@@ -193,19 +249,23 @@ active lease 不随首帧发送成功释放，因为 established websocket 可�
 | `realtime.websocket_ping_interval_ms` | `25000`（`<=0` 显式禁用，仅建议测试使用） |
 | `realtime.websocket_write_timeout_ms` | `40000` |
 | `responses_ws.first_frame_timeout_ms` | `30000` |
+| `responses_ws.bridge_open_timeout_ms` | `30000` |
+| `responses_websocket_client_ping_interval_ms` | `25000`（`<=0` 显式禁用） |
+| `responses_websocket_client_pong_miss_timeout_ms` | `0`（默认禁用 pong-miss 判死） |
 | `responses_websocket_client_inbound_activity_timeout_ms` | `300000` |
 | `responses_ws.idle_timeout_ms` | `1800000` |
+| `responses_ws.active_turn_timeout_ms` | `120000` |
 | `responses_ws.max_lifetime_ms` | `3600000` |
 | `responses_ws.pending_provider_events_max_bytes` | `2097152` |
 
-首帧读取成功后会清除 first-frame read deadline，established 阶段的客户端连接活性由服务端 ping 和 `responses_websocket_client_inbound_activity_timeout_ms` inbound activity watchdog 维护，所有客户端入站 data/control frame 都刷新该 liveness；旧配置 `responses_ws.client_pong_timeout_ms` 已移除，不再读取或 fallback。业务 idle 由 actor watchdog 维护，只由客户端 data frame 与 provider frame/usage/error 刷新。总连接寿命墙用于回收长期挂起连接，pending provider buffer 上限用于限制 send 结果确认前的内存占用。Trade-off：32 MiB 默认 read limit 降低 Codex 大上下文/文件负载误伤，但会提高单连接峰值内存预算；超限后 gorilla 连接不可复用，因此实现返回静态 `invalid_event` 后关闭连接。
+首帧读取成功后会清除 first-frame read deadline，established 阶段的客户端连接活性由服务端 ping、可选 pong-miss watchdog 和 `responses_websocket_client_inbound_activity_timeout_ms` inbound activity watchdog 共同维护，所有客户端入站 data/control frame 都刷新该 liveness；旧配置 `responses_ws.client_pong_timeout_ms` 已移除，不再读取或 fallback。业务 idle 由 actor watchdog 维护，只由客户端 data frame 与 provider frame/usage/error 刷新。HTTP bridge opening 由 `responses_ws.bridge_open_timeout_ms` 单独保护，只覆盖等待上游 HTTP stream 打开的阶段，stream opened 后不再由该 timeout 取消，继续交给 active turn watchdog；`responses_ws.bridge_open_timeout_ms <=0` 表示禁用 opening watchdog，仍依赖 cancel/request context/client close/max lifetime 回收；`responses_ws.active_turn_timeout_ms` 只限制单个 active turn 的 provider inactivity，provider activity 会刷新，`<=0` 使用默认 2 分钟。总连接寿命墙用于回收长期挂起连接，pending provider buffer 上限用于限制 send 结果确认前的内存占用。Trade-off：32 MiB 默认 read limit 降低 Codex 大上下文/文件负载误伤，但会提高单连接峰值内存预算；bridge open 多一个 30 秒默认 watchdog，换取上游/代理卡在响应头前时的资源保护，显式禁用则提升慢 upstream 兼容性但扩大 opening 资源占用窗口；active turn watchdog 多一个超时维度，换取 provider stream 打开后长期无 activity 时能主动回收；超限后 gorilla 连接不可复用，因此实现返回静态 `invalid_event` 后关闭连接。
 
 ## Turn 事务
 
 每个 `response.create` 使用 `ResponsesWSTurnAdmission` 和 `ResponsesWSTurnAttempt` 表达两个账本：
 
 - **admission**：本客户端 turn 的 RPM 最多 `AllowRPMOnce` 一次。`AllowRPMOnce` 在 turn entry 调用（首帧：`FirstTurnSetup` 处理后、active lease 成功之后、channel selection 之前；后续 turn：busy 和 model 一致性检查通过、`PrepareResponsesWSTurnAttempt` 之前）。Allow 成功后无论后续是否 unsupported、open 失败、`SendOutcomeNotSent`、ambiguous 或 candidate retry，都不退 RPM；首帧 retry 其它候选时复用同一个 admission，不重复扣 RPM。
-- **attempt**：单 selected channel 上的 quota、candidate、session 和 send outcome。`BeginCandidate` 后的本地失败统一走 `RollbackBeforeLocalWriteOK`，只负责 quota/candidate/session 回滚，不退 RPM。
+- **attempt**：单 selected channel 上的 quota、candidate、session 和 send outcome。`BeginCandidate` 后的本地失败统一构造 zero-charge proof，经 settlement core 决策后执行 rollback/noop；该路径只处理 quota/candidate/session 清理，不退 RPM。
 
 ### 权威副作用顺序
 
@@ -216,20 +276,20 @@ active lease 不随首帧发送成功释放，因为 established websocket 可�
 | `AllowRPMOnce`（turn entry） | 是 | 无 | 成功消费一次；失败不消费 | 未启动 | 不创建 attempt、不打开/不复用上游，写 wrapped 429 |
 | open upstream session（首帧）/ 复用 session（后续 turn） | 是 | 无 | 已消费；retry 不重复扣 | 未启动 | abort/close session 或换候选 |
 | `BeginCandidate` | 是 | 无 | 已消费 | 未启动 | 丢弃 candidate/session，不退 RPM |
-| raw rewrite | 是 | 无 | 已消费 | 未启动 | `RollbackBeforeLocalWriteOK("rewrite_failed")` |
-| `PreConsumeQuota` | 是 | atomic 或带 rollback handle | 已消费 | 未启动 | `RollbackBeforeLocalWriteOK("quota_preconsume_failed")` |
+| raw rewrite | 是 | 无 | 已消费 | 未启动 | zero-charge proof，经 settlement core rollback |
+| `PreConsumeQuota` | 是 | atomic 或带 rollback handle | 已消费 | 未启动 | quota rejected proof，经 settlement core rollback/noop |
 | `ArmProviderRecvPump` | 否 | 已 preconsume | 已消费 | 启动 | 只允许 actor 内构造非失败 command |
-| `SendProviderFrame` / `SendResult` | 是 | local-write-ok/ambiguous 后不 undo；not-sent rollback | 不退 | 已启动，provider-originated event 先 buffer | 按 outcome commit / rollback / ambiguous admit |
+| `SendProviderFrame` / `SendResult` | 是 | not-sent rollback；local-write-ok/ambiguous/pending-send-unknown 进入 conservative settlement，不 undo | 不退 | 已启动，provider-originated event 先 buffer | 按 send outcome + provider evidence 决定 rollback、floor settle、usage settle 或 fail closed |
 
-`pending_prepare` 关闭可 rollback；`pending_send` 未收到 send result 时不能证明 not-sent，按 no-terminal settle 处理。no-terminal settle 必须保留至少 `PreConsumedQuota`，避免状态机不 rollback 但结算层退款，低估可能已经开始的 upstream write。
+`pending_prepare` 关闭可 rollback；`pending_send` 未收到 send result 时，除非 actor 有 no-send proof，否则按 conservative no-terminal settlement。no-terminal settlement 不要求精确，但必须避免少计费：没有 terminal usage 时至少保留 preconsume floor，有 billable usage evidence 时使用 `max(observed_billable_usage_quota, preconsume_floor)`。
 
-`BeginCandidate` 后的 rewrite、quota preconsume 等本地失败共享一个 cleanup path。这个路径的职责不只是 quota undo，还必须清 pending attempt、buffered provider events/evidence、pending phase 和 actor state；recoverable 的第二轮本地失败不会把连接永久留在 busy 状态。
+`BeginCandidate` 后的 rewrite、quota preconsume 等本地失败共享一个 settlement cleanup path。这个路径的职责不只是 quota undo，还必须清 pending attempt、buffered provider events/evidence、pending phase 和 actor state；recoverable 的第二轮本地失败不会把连接永久留在 busy 状态。所有真实扣费金额来自 settlement decision 的 `ExpectedFinalQuota`，executor 不得再用 attempt usage 重新推导另一套 final quota。
 
 Provider `Recv` 若返回 `payload + err`，payload 仍是第一权威帧。bridge 先投递该 frame，再把 `ClientPayloadError` 的 payload 作为 proxy-local error 投递；如果 err 没有 client payload，则投递 provider close/timeout。actor 不依赖 provider frame 上的 `Err` 字段来补发 client error，避免 provider-origin 错误因 frame 已转发而被吞掉。
 
 Terminal side effects 顺序是 actor contract：先 merge terminal usage 并 finalize quota，再 record/clear affinity 和清 active，最后写 client frame。client write 失败不能回滚已经由 provider terminal 证明的 quota/affinity side effects；close path 若已有非 proof-conflict 的 buffered terminal evidence，必须先做内部 replay 以提取 usage/terminal side effects 再进入 no-terminal settlement（`NotSent + provider evidence` proof 冲突除外，不能 replay buffered events）。
 
-财务验收标准：`pending_send` 无 send result、`SendOutcomeAmbiguous`、local-write-ok 后客户端断开等 no-terminal/uncertain 状态，不能 rollback，也不能把预扣额度退回。actor 必须使用 explicit no-terminal settlement，`FinalQuota >= PreConsumedQuota`；只有 terminal usage 明确给出更高费用时才超过预扣，只有可证明 not-sent 或 provider failed terminal 的普通 finalize 才允许低于预扣并退款。
+财务验收标准：ResponsesWS 可以小幅多计费，但不能把可能进入 provider 的 turn 退成免费。`SendOutcomeAmbiguous`、pending_send unknown、local-write-ok 后客户端断开、provider evidence without terminal 等 uncertain 状态不能 rollback reserve；只有可证明 not-sent、发送前 prepare/preflight 失败、或 provider rejected before stream 才允许 rollback。provider terminal 带 billable usage 时，以 provider usage 为准，允许低于 preconsume 并退款。
 
 ## 主流程概览
 
@@ -262,22 +322,22 @@ Terminal side effects 顺序是 actor contract：先 merge terminal usage 并 fi
 
 1. 按 pinned / owner affinity / fresh 规则选 channel。显式 pinned channel 可以 raw `fetchChannelById`；owner/preferred affinity 走 normal selector 的 strict preferred path，不能绕过 group/model/filter/cooldown/skip eligibility。
 2. 若 channel 明确不支持 ResponsesWS：fresh 或非 strict preferred affinity skip 当前 channel；pinned 或 strict owner affinity 写 wrapped fallback frame。
-3. 为本 downstream WS 连接生成内部 `ClientSessionID`，用 `RealtimeOpenOptions{ClientSessionID: "responses-ws:<uuid>", PreferredTransport: TransportModeResponsesWS, RequireWS: true}` 打开 upstream session，禁止 HTTP bridge fallback。该内部 id 不来自客户端 `x-session-id`，首帧 retry 其它候选 channel 时复用同一个内部 id。
+3. 为本 downstream WS 连接生成内部 upstream session id，并通过 provider 的 `OpenResponsesWS(ctx, model, responsesws.OpenOptions{UpstreamSessionID: ...})` 打开专用 upstream。该内部 id 不来自客户端 `x-session-id`，首帧 retry 其它候选 channel 时复用同一个内部 id。
 4. actor 记录 `sessionChannelID`，只表示物理 session owner，不写共享 affinity。
 5. actor 冻结本连接的 upstream snapshot：channel、resolved base URL、原始/上游/billing model、billing flag 与 pre-cost；不存储 `key_fingerprint`。后续结算、日志和 continuation miss 诊断使用 snapshot，不重新读取 live channel 配置推导本连接事实。
 6. `PrepareResponsesWSTurnAttempt(...)` 完成 prompt-token 估算、quota 对象创建和 passive sink 准备，不执行 quota/RPM 副作用。
 7. attempt 带 `openingID`，actor 调 `attempt.BeginCandidate(...)`，进入 `pending_prepare` 并分配 `AttemptID`。
-8. 用 `RawResponsesCreateFrame` rewrite mapped protocol model；失败走 `RollbackBeforeLocalWriteOK("rewrite_failed")`。
+8. 用 `RawResponsesCreateFrame` rewrite mapped protocol model；失败构造 `RewriteFailed` zero-charge proof，经 settlement core rollback/noop。
 9. 执行 `attempt.PreConsumeQuota()` 并安装 passive quota event sink；passive sink 只投递 actor event，不能 finalize quota。
 10. actor 把 attempt 从 `pending_prepare` 推进到 `pending_send`，发出 `ArmProviderRecvPump(upstreamSessionGeneration, selectedChannelID, session)`。
-11. actor 发出 `SendProviderFrame(attemptID, selectedChannelID, session, ...)`，IO bridge 调 `session.SendClient(...)`。
-12. IO bridge 把 `SendResult(attemptID, selectedChannelID, outcome, err)` 投递回 actor。
-13. `SendOutcomeLocalWriteOK` → `CommitLocalWriteOK`，pending commit 为 active，按到达顺序重放 `pendingProviderEvents`。
-14. `SendOutcomeNotSent` 且无 buffered event → `RollbackBeforeLocalWriteOK("send_not_sent")`，abort session，再按规则尝试下一候选。
-15. `SendOutcomeNotSent` 但已有 buffered event → protocol violation fail closed。
-16. `SendOutcomeAmbiguous` → `CommitAmbiguousAdmission`，不 retry、不 quota undo；有 buffered event 就重放并等待 terminal，没有 event 就写 ambiguous-send proxy-local error 并关闭/detach。
+11. actor 发出 `SendProviderFrame(attemptID, selectedChannelID, session, ...)`，IO bridge 调 `session.SendClientWithResult(ctx, responsesws.SendRequest{...})`。
+12. IO bridge 把 `ResponsesWSTransportSendResult` 投递回 actor。
+13. `ResponsesWSTransportSendAttempted` -> `CommitLocalWriteOK`，pending commit 为 active，按到达顺序重放 pending provider journal replay entries。
+14. `ResponsesWSTransportSendNotAttempted` 且无 buffered event → 构造 `TransportNotAttempted` proof，经 settlement core rollback，abort session，再按规则尝试下一候选。
+15. `ResponsesWSTransportSendNotAttempted` 但已有 buffered event → proof conflict；provider evidence 压制 rollback，记录 warning/metric，不 retry，按 provider evidence 做 conservative settlement。只有身份归属冲突才 fail closed。
+16. `ResponsesWSTransportSendAmbiguous` → 不 retry、不 quota undo；有 buffered event 就 commit 为 active 并按顺序重放；无 buffered provider evidence 时也不能 rollback，actor 按 preconsume floor 做 conservative settlement，写 `ambiguous_close_no_provider_evidence`，关闭/detach upstream 和 downstream。
 17. sync continuation miss 仅在满足 sync-miss-clear guard 时按 candidate + selected channel 清 stale binding；ambiguous miss、有 provider-originated event 的 miss、attempt/channel 不匹配的 miss 都不自动清 binding。
-18. all unsupported → 写 wrapped fallback frame `status:426`。
+18. all eligible candidate 都明确 unsupported → 写 wrapped fallback frame `status:426`；显式 scan limit 提前耗尽只能返回非 426 的 scan-limited 错误，不能伪装成 all unsupported。
 
 ### Proxy 阶段
 
@@ -290,7 +350,7 @@ Terminal side effects 顺序是 actor contract：先 merge terminal usage 并 fi
 ### 关闭
 
 1. 任一 pump 结束时投递 `ClientClosed` / `ProviderClosed` / `Timeout` 给 actor。
-2. actor 决定 detach/abort provider session、close client websocket、rollback 可证明 not-sent 的 pending attempt，或对 local-write-ok / ambiguous admitted / proof-conflict turn 做 no-terminal settle。close 前若 pending buffer 中已有非 proof-conflict terminal evidence，actor 必须内部 replay terminal usage/affinity side effects。
+2. actor 决定 detach/abort provider session、close client websocket，并对 pending/active attempt 构造 settlement input。可证明 not-sent 的 pending attempt 只有在没有 terminal、provider activity、observed usage 时 rollback；local-write-ok / ambiguous admitted / proof-conflict turn 做 floor、observed-or-floor 或 terminal exact settlement。close 前若 pending buffer 中已有非 proof-conflict terminal evidence，actor 必须内部 replay terminal usage/affinity side effects。
 3. release active lease。
 4. 发送 close control：wrapped error frame 之后使用 close code 1000 + bounded reason；首帧非法/非 JSON 这类还没有 actor 状态的 upgrade 入口可以使用 1008/1003 等协议 close code。
 5. best-effort record last final response 可保留，但正常路径应已逐 turn record；兜底必须幂等。
@@ -311,10 +371,9 @@ Terminal side effects 顺序是 actor contract：先 merge terminal usage 并 fi
 
 Provider 边界以 [OpenAI Responses WebSocket mode](https://developers.openai.com/api/docs/guides/websocket-mode) 和 [Azure Responses WebSocket mode](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/websockets) 的官方语义为准：真实 WS passthrough 是默认目标，HTTP/SSE bridge fallback 不是默认兼容策略。
 
-- `RealtimeOpenOptions` 必须显式承载 `PreferredTransport: TransportModeResponsesWS` 和 `RequireWS: true`。`PreferredTransport` 是 caller preference，`RequireWS` 是 hard invariant：管理员 `websocket_mode=off` 优先级高于 `RequireWS`，结果是 `responses_ws_unsupported_for_channel` + wrapped 426，而不是强行打开 WS。
-- `openRealtimeSessionWithFreshFallback` 不能在 `RequireWS` 为 true 时用 fresh retry 掩盖同一 channel 的 HTTP bridge fallback；fresh 只用于 retryable open/write failure。
-- provider 必须把 `RequireWS` 复制到 session/runtime state，供 open-time、send-time reconnect、write-failure fallback 和 cancel path 共同读取，不能只在 open 入参里检查一次。
-- provider attach/open 失败回滚必须把旧 session 的 transport flags 一并恢复（尤其 `requireWS` / `deferWSReader`），否则一次失败的 ResponsesWS attach 会污染原本可用的 HTTP-bridge session。
+- ResponsesWS 只断言 provider 的专用 `OpenResponsesWS` 能力；不调用 realtime session manager，不创建 binding，也不通过 realtime open options 表达 transport preference。
+- provider 不支持专用 ResponsesWS upstream 时返回 `responses_ws_unsupported_for_channel` + wrapped 426，而不是降级到 `/v1/realtime` 或 HTTP/SSE bridge。
+- provider attach/open 失败不得污染已有 realtime execution session；ResponsesWS upstream 生命周期完全由当前 actor 持有。
 - provider 在 ResponsesWS 场景只做 transport、必要模型/字段改写和 provider-local session 管理，不能拥有独立账本语义。adapter 改写 request 时以 raw envelope / raw response object 为输入输出，只覆盖明确支持的字段，保留未知字段。
 
 ### OpenAI official
@@ -326,22 +385,25 @@ Provider 边界以 [OpenAI Responses WebSocket mode](https://developers.openai.c
 
 ### Third-party OpenAI-compatible
 
-- 第三方 OpenAI-compatible channel 默认不启用 ResponsesWS，不能仅凭 HTTP Responses 兼容就推断支持 WebSocket mode。
-- 只有 channel 显式声明 `passthrough_supported` 时才允许按官方 inline `response.create` passthrough 打开上游 WS。
-- 未声明或声明不支持时，返回 `responses_ws_unsupported_for_channel`，不得静默切到 HTTP/SSE bridge。
-- HTTP/SSE bridge fallback 只能作为后续显式实验能力；启用时必须在日志和响应元数据中标注不保证 OpenAI connection-local previous-response cache。
+- 第三方 OpenAI-compatible channel 不能仅凭 provider config 中 `Responses` endpoint 非空推断 native WS 可用；`Responses` 只说明存在 HTTP Responses 路径，可用于 URL 派生或显式 HTTP bridge。
+- native WS 必须由已知官方 provider 类型承诺，或由 channel `Other` 显式配置 `{"responses_ws_native":true}` 承诺。这样会比“有 HTTP Responses 就尝试 WS”多一个配置字段，但能避免把不支持 native WebSocket 的兼容服务误判成可用。
+- 若 native 未被明确支持，或所选 transport 所需的 `Responses` endpoint 为空，返回 `responses_ws_unsupported_for_channel`。
+- provider 未实现 `ResponsesWSProvider` 或所选 transport 不支持时，返回 `responses_ws_unsupported_for_channel`，不得静默切到 HTTP/SSE bridge。
+- HTTP/SSE bridge 只能由显式 `responses_ws_transport=http_bridge` 启用；它不是 native WS 的自动 fallback。
+- 所有 channel 的 `Other` 非空时都必须是 JSON object；旧 plain string 不再作为 provider-specific 配置读取。持久化入口只做一次兼容 canonicalization：OpenAI/Custom plain string 包装到 `vendor_extra.legacy_other` 保留审计信息，Codex `websocket_mode=required` 别名落库为 `force`，malformed JSON-like 值仍 fail-closed。
 
 ### Azure OpenAI
 
-- `ChannelTypeAzureV1` 的 ResponsesWS URL 是 resource-level `/openai/v1/responses`，model/deployment 在 `response.create.model` 中表达。
-- classic `ChannelTypeAzure` 的 ResponsesWS URL 复用现有 Azure deployment/api-version builder，例如 `/openai/deployments/{deployment}/responses?api-version={Other}`，然后只转换 websocket scheme。
-- 默认按 Azure ResponsesWS 文档使用 `Authorization: Bearer <channel key or Entra token>`。如后续实测 `api-key` header 也可用，只能作为显式兼容 fallback；默认不得同时发送 Bearer 和 `api-key` 两套凭据。
-- 合并 channel custom headers 时必须过滤 hop-by-hop header 和下游敏感 header；如果 custom header 覆盖 `Authorization`，必须按 channel/provider 鉴权策略重新校验，避免用户配置造成双发或泄漏。
-- Azure base URL 若已经包含 `/openai/deployments/...`，本地返回配置错误（classic Azure 不套用 resource-level guard）。
+- `ChannelTypeAzureV1` 与 classic `ChannelTypeAzure` 的 ResponsesWS URL 都是 resource-level `/openai/v1/responses`，model/deployment 在 `response.create.model` 中表达；不得拼 `/openai/deployments/{deployment}/responses?api-version=...`。
+- classic `ChannelTypeAzure` 的 `channel.Other` 必须是 JSON object：`{"api_version":"2024-10-01-preview","responses_ws_transport":"native"}`，并允许 `extra` / `vendor_extra` 作为不解释的 opaque namespace。旧的 plain `Other="2024-10-01-preview"` 不再作为运行时 fallback 读取；升级迁移只把可无损识别的历史 provider `Other` 字符串一次性转换为 JSON object，无法判断的旧值保持原样并由运行时校验 fail-closed。Trade-off：迁移/批量更新代码必须保留 raw JSON object，复杂度略高于 struct round-trip，但运行时长期仍只有一个 JSON contract，且 opaque vendor data 不会被管理操作丢失。
+- classic `ChannelTypeAzure` 仍要求 `api_version`，因为该渠道的非 WS Azure HTTP 路径仍依赖该字段；ResponsesWS native URL 本身不把 `api_version` 写入 query。Trade-off：配置严格性略高，但避免同一 Azure channel 在不同 relay mode 下存在两套 `Other` 合法格式。
+- 当前实现对 Azure ResponsesWS 上游使用 `Authorization: Bearer <key>`，并移除 `api-key` header，匹配官方 Responses WebSocket mode 示例并避免双发凭据。
+- 合并 channel custom headers 时必须过滤 hop-by-hop header、WebSocket handshake header 和 credential/routing header（`Authorization`、`api-key`、`x-api-key`、`x-goog-api-key` 等）。如果自定义网关需要额外认证，应使用非 credential 名称如 `X-Gateway-Auth`。Trade-off：少数旧配置需要改名，但 channel header 不能覆盖 provider credential，避免双发或泄漏。
+- Azure base URL 若已经包含 `/openai/deployments/...`，本地返回 `invalid_azure_responses_ws_base_url`；ResponsesWS 只接受 resource-level base URL，可保留 gateway 前缀。
 
 ### Codex provider
 
-- `PreferredTransport=ResponsesWS` + `RequireWS=true` 时，任何 open-time、send-time、write-failure fallback 都不能切到 HTTP bridge。
+- Codex ResponsesWS 通过专用 upstream adapter 直连上游 WS；任何 open-time、send-time、write-failure fallback 都不能切到 HTTP bridge。
 - Codex 现有内部 `response` nested shape 只能作为 adapter shape。adapter 从 `map[string]json.RawMessage` 构造 nested payload，保留 unknown fields。
 - typed `OpenAIResponsesRequest` 不能成为 codex WS 转发的唯一来源。
 
@@ -371,10 +433,11 @@ OpenAI ResponsesWS 的 timeout 分层：首帧用 gorilla read deadline 限制�
 | all candidate unsupported | 是（admission 已前置） | 尝试前或握手处停止 | 不动 | wrapped fallback frame `status:426` + close 1000 |
 | 首帧 quota precheck 失败 | 已消耗（RPM 已前置） | 是，随后 abort | 不动；partial preconsume 走 attempt rollback | wrapped quota error |
 | session open 后、`ArmProviderRecvPump` 之前出现 provider event | 已消耗 | abort 当前 session | 不动；不 classifier、不 record、不 clear | fail closed，retry candidate 或 wrapped provider protocol error |
-| 首帧 `BeginCandidate` / rewrite / `PreConsumeQuota` 失败 | 已消耗；不退 | 是，随后 abort | 不动或丢弃 candidate | begin/rewrite 无账本 rollback；preconsume 走 `RollbackBeforeLocalWriteOK` 后 wrapped error |
+| 首帧 `BeginCandidate` / rewrite / `PreConsumeQuota` 失败 | 已消耗；不退 | 是，随后 abort | 不动或丢弃 candidate | begin/rewrite 无 reserve 或 zero-charge proof；preconsume 失败走 settlement core rollback/noop 后 wrapped error |
 | 首帧 `SendOutcomeNotSent` 且无 buffered event | 已消耗；不退 | abort 当前 session | candidate 丢弃；满足 sync-miss-clear guard 时 owner 条件清理 | retry 或错误 |
-| 首帧 `SendOutcomeNotSent` 但已有 buffered event | 已消耗；不退 | abort/detach | 不 record、不 clear、不 classifier | protocol violation fail closed |
-| 首帧 `SendOutcomeAmbiguous` | 已消耗；不退 | abort/detach 由 actor 决定 | 不 record；admitted 后的 provider failed terminal miss 才可按 active owner clear | 不 retry；重放 buffered event 或 ambiguous-send error 后关闭 |
+| 首帧 `SendOutcomeNotSent` 但已有 buffered event | 已消耗；不退 | abort/detach | 不 record、不 clear、不 classifier | proof conflict；provider evidence 压制 rollback，记录 warning/metric；quota 按 `max(observed_billable_usage, preconsume_floor)` 保守结算；仅身份归属冲突 fail closed |
+| 首帧 `SendOutcomeAmbiguous` 且无 provider evidence | 已消耗；不退 | abort/detach | 不 record | floor settlement；写 `ambiguous_close_no_provider_evidence` 后关闭，不 retry |
+| 首帧 `SendOutcomeAmbiguous` 且已有 provider evidence | 已消耗；不退 | abort/detach 或等待 terminal | terminal success 才 record | `max(observed_billable_usage, preconsume_floor)`，若 terminal usage 到达则按 terminal usage |
 | 首帧 sync `previous_response_not_found` + not-sent + 无 buffered event | 已消耗；不退 | abort | 满足 sync-miss-clear guard 时清 candidate 且只清当前 channel owner | 透传或规范化为 WS error frame，记录 upstream snapshot；不 reroute、不 replay、不清空 `previous_response_id` 重试 |
 | 后续 create 时 active turn 未结束 | 否 | 已有 | 不动 | recoverable `session_busy` |
 | 后续 create model 映射后不同于首 turn upstream model | 否 | 已有，但不发送该 turn | 不动 | recoverable model switch error |
@@ -384,12 +447,14 @@ OpenAI ResponsesWS 的 timeout 分层：首帧用 gorilla read deadline 限制�
 | 后续 `BeginCandidate` / rewrite / `PreConsumeQuota` 失败 | 已消耗；不退 | 已有 | candidate 丢弃；quota 走 rollback | recoverable local error |
 | 后续 `SendClient` sync miss + not-sent + 无 buffered event | 已消耗；不退 | 已有 | 满足 sync-miss-clear guard 时清 candidate 且只清 current channel owner | recoverable/terminal error |
 | provider terminal 早于 `SendResult` | 已按 attempt 决定 | 已有 | 先 buffer；commit 后才 record/clear；not-sent 与 buffered event 冲突 fail closed | 顺序化后写给客户端，或 proof 冲突时 fail closed |
-| provider 下行 `response.completed` 无 error | 已消耗 | 已有 | record active | success terminal |
-| provider 下行 completed/done 带 error | 已消耗 | 已有 | 不 record；miss 则 clear active | failed terminal |
-| provider 下行 `type:"error"` miss | 已消耗 | 已有 | clear active owner | failed terminal |
+| pending_send 期间客户端断开 / 无 send result | 已消耗；不退 | abort/detach | 不 record | 无 no-send proof 时 floor settlement |
+| provider evidence without terminal | 已消耗；不退 | abort/detach | 不 record | `max(observed_billable_usage, preconsume_floor)` |
+| provider terminal 带 billable usage | 已消耗 | 已有 | success record；failed clear | 按 provider usage 结算，可低于 preconsume |
+| provider terminal 无 billable usage | 已消耗 | 已有 | success record；failed clear | floor settlement |
+| provider 下行 `type:"error"` miss | 已消耗 | 已有 | clear active owner | failed terminal；无 billable usage 时 floor settlement |
 | proxy-local invalid event / 429 / session_busy | 否 | 不发送 | 不动 | recoverable local error，连接继续 |
-| 客户端 first open-and-prime 期间断开 | not-sent 可 rollback；ambiguous/admitted 不 undo；已 Allow 的 RPM 不 refund | 可能已有 | 不新增 record；不在 actor 外 finalize quota | actor 收到 `ClientClosed` 后 abort/detach，禁止 fresh retry |
-| 客户端断开 | 已接纳 turn 可能已消耗 | 已有 | 不新增 record；actor 做 no-terminal settle | detach/abort |
+| 客户端 first open-and-prime 期间断开 | not-sent 可 rollback；ambiguous/admitted 不 undo；已 Allow 的 RPM 不 refund | 可能已有 | 不新增 record；不在 actor 外 finalize quota | actor 收到 `ClientClosed` 后 abort/detach，禁止 fresh retry；无 no-send proof 时 floor settlement |
+| 客户端断开 | 已接纳 turn 可能已消耗 | 已有 | 不新增 record；actor 做 no-terminal floor settlement | detach/abort |
 | idle timeout | 不额外消耗 | 已有 | 不新增 record | abort session, release active lease |
 
 ## 关键 Trade-off
@@ -397,7 +462,7 @@ OpenAI ResponsesWS 的 timeout 分层：首帧用 gorilla read deadline 限制�
 1. **raw passthrough 优先于 typed safety**：rewrite 用 `map[string]json.RawMessage` 牺牲编译期字段约束，不能 byte-for-byte transcript；收益是不会因 typed struct 滞后丢失官方字段。
 2. **active connection limiter 独立于 RPM**：多一个 lease 生命周期；收益是能真正限制 30 分钟 idle established WS。
 3. **首 turn pending opening phase 优先于 pipeline queue**：第二个 `response.create` 在首 turn 打开阶段只能拿到 recoverable `session_busy`，极端客户端 pipeline 少一次自动排队；收益是 client close、quota preconsume、session abort 都能归属到 actor-owned phase，消除首帧 parse 到 `BeginCandidate` 之间的无主窗口。后续如引入 `responses_ws.pending_create_queue_size=1`，必须先验证 model/RPM/quota/frame size，并保持默认值为 `0`。
-4. **`SendClient` nil 不等于 upstream accepted**：`pending_send` 期间需要 buffer provider-originated event，ambiguous/proof-conflict 不自动 retry，proof 冲突 fail closed 会对单次异常 overcount；收益是不把本地写成功误判为 provider 语义接受，避免重复上游副作用和 underbilling。
+4. **`SendClient` nil 不等于 upstream accepted**：`pending_send` 期间需要 buffer provider-originated event，ambiguous/proof-conflict 不自动 retry；没有 no-send proof 时按 preconsume floor 做保守有界结算。代价是单次异常可能小幅多计费，收益是不把可能进入 provider 的 turn 免费化，也避免重复上游副作用。
 5. **upstream write deadline 放在 provider adapter 实际写点**：每个 ResponsesWS provider adapter 都必须接入同一个 write-deadline helper；deadline/partial write 只能按 ambiguous 处理；收益是 `SendClient` 一定能在有界时间内产出 `SendResult`，actor 不会长期停在 `pending_send` 并持有 quota/lease。
 6. **quota finalization 回到 actor，而不是沿用 realtime observer**：需要把现有 observer 改成 passive event sink；收益是 quota、terminal、affinity 的提交顺序和 rollback 边界一致，避免 provider recv goroutine 在 actor 之前 finalize。
 7. **binding 命中 fail-closed，binding 缺失 best-effort**：TTL/restart 后缺 binding 仍可能发到非 owner 并由上游返回 miss；收益是不会把已知 owner 的 continuation 错发到其它 channel。

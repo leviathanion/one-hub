@@ -22,10 +22,12 @@ ResponsesWS 是一个 **turn-based** WebSocket 入口：一条连接上可以发
 | `responses_ws.active_global` | `config.yaml` | 重启服务 |
 | `responses_ws.active_lease_redis_fail_open` | `config.yaml` | 重启服务 |
 | `responses_ws.first_frame_timeout_ms` | `config.yaml` | 重启服务 |
+| `responses_ws.bridge_open_timeout_ms` | `config.yaml` | 重启服务 |
 | `responses_websocket_client_ping_interval_ms` | `config.yaml` | 重启服务 |
 | `responses_websocket_client_pong_miss_timeout_ms` | `config.yaml` | 重启服务 |
 | `responses_websocket_client_inbound_activity_timeout_ms` | `config.yaml` | 重启服务 |
 | `responses_ws.idle_timeout_ms` | `config.yaml` | 重启服务 |
+| `responses_ws.active_turn_timeout_ms` | `config.yaml` | 重启服务 |
 | `responses_ws.max_lifetime_ms` | `config.yaml` | 重启服务 |
 | `responses_ws.pending_provider_events_max_bytes` | `config.yaml` | 重启服务 |
 | `responses_ws.allow_anonymous_capacity_bucket` | `config.yaml` | 重启服务 |
@@ -36,6 +38,9 @@ ResponsesWS 是一个 **turn-based** WebSocket 入口：一条连接上可以发
 | 用户组 | Web 后台 → `渠道` → `用户组` | 即刻生效 |
 | 计费倍率 | Web 后台 → `渠道` → `倍率` | 即刻生效 |
 | Codex `websocket_mode` | Web 后台 → `渠道` → `Codex 配置(JSON)` | 即刻生效 |
+| `responses_ws_transport` | Web 后台 → `渠道` → `Other(JSON)` / `Codex 配置(JSON)` | 即刻生效 |
+| `responses_ws_native` | Web 后台 → `渠道` → `Other(JSON)` | 即刻生效 |
+| `responses_ws_self_hosted` | Web 后台 → `渠道` → `Other(JSON)` / `Codex 配置(JSON)` | 即刻生效 |
 
 ---
 
@@ -54,12 +59,10 @@ responses_ws:
 
   # ---- 超时管理 ----
   first_frame_timeout_ms: 30000             # 首帧超时
+  bridge_open_timeout_ms: 30000             # HTTP bridge 打开上游 stream 超时
   idle_timeout_ms: 1800000                  # 空闲超时（30 分钟）
+  active_turn_timeout_ms: 120000            # 单 turn active 超时（2 分钟）
   max_lifetime_ms: 3600000                  # 最大存活时间（1 小时）
-
-responses_websocket_client_ping_interval_ms: 25000              # 客户端连接主动 Ping 周期
-responses_websocket_client_pong_miss_timeout_ms: 0              # 发出 ping 后未收到对应 pong 的超时；0 禁用
-responses_websocket_client_inbound_activity_timeout_ms: 300000  # 任意客户端入站活动超时（5 分钟）
 
   # ---- 缓冲区 ----
   pending_provider_events_max_bytes: 2097152 # 待确认上游事件缓冲区上限（2 MiB）
@@ -68,7 +71,11 @@ responses_websocket_client_inbound_activity_timeout_ms: 300000  # 任意客户�
   allow_anonymous_capacity_bucket: false    # 匿名容量桶
 
   # ---- 高级 ----
-  unsupported_scan_limit: 5                 # 不支持时扫描的候选渠道数（默认跟随 RetryTimes）
+  unsupported_scan_limit: 0                 # 显式 unsupported 扫描上限；0/未配置按当前加载渠道数扫描
+
+responses_websocket_client_ping_interval_ms: 25000              # 客户端连接主动 Ping 周期
+responses_websocket_client_pong_miss_timeout_ms: 0              # 发出 ping 后未收到对应 pong 的超时；0 禁用
+responses_websocket_client_inbound_activity_timeout_ms: 300000  # 任意客户端入站活动超时（5 分钟）
 ```
 
 ---
@@ -123,7 +130,7 @@ responses_ws:
 | 默认值 | `96` |
 | 必填 | 否 |
 
-**作用**：WebSocket Upgrade 成功后、首个 `response.create` 到达前的 pending 槽位上限。每个凭据同时只能有一个连接处于"已升级但未发首帧"状态。这是针对"升级后不发首帧就挂起"的防守。
+**作用**：WebSocket Upgrade 成功后、首个 `response.create` 到达前的 pending 槽位上限。每个凭据最多允许配置值数量的连接同时处于"已升级但未发首帧"状态。这是针对"升级后不发首帧就挂起"的防守。
 
 **可配置值**：
 
@@ -174,7 +181,7 @@ responses_ws:
 **对系统的影响**：
 - Redis 可用时：租约通过 Redis `INCR` + `EXPIRE` 跨实例协调；连接关闭时 `DECR`。后台 heartbeat goroutine 每 40s 刷新一次 TTL。
 - Redis 不可用时：回退进程内计数（容量 = 实例数 × 每实例进程内值，失真）。
-- 超限返回 `503 Service Unavailable`。
+- 单凭据 active 连接超限返回 `429 Too Many Requests`；group/global active 连接超限返回 `503 Service Unavailable`。
 
 ---
 
@@ -306,6 +313,25 @@ responses_ws:
 
 ---
 
+#### `responses_ws.bridge_open_timeout_ms` 🏷️ config.yaml
+
+| 属性 | 值 |
+|------|-----|
+| 类型 | `int`（毫秒） |
+| 默认值 | `30000`（30 秒） |
+| 必填 | 否 |
+
+**作用**：仅限制 ResponsesWS HTTP bridge 等待上游 HTTP `/responses` stream 打开的时间，也就是等待请求发出、上游返回响应头并创建 stream reader 的阶段。stream 已打开后，该 timeout 不再作用于后续 SSE 读取；后续活性仍由 `responses_ws.active_turn_timeout_ms` 和连接 idle/lifetime watchdog 管理。
+
+```yaml
+responses_ws:
+  bridge_open_timeout_ms: 30000
+```
+
+`<=0` 表示禁用这个 opening watchdog。Trade-off：多一个配置项和一个 opening 阶段 watchdog，换取代理/上游卡在响应头前时的资源保护；代价是极慢上游可能在 30 秒边界被本地取消，需要按部署网络调整。
+
+---
+
 #### ResponsesWS 客户端 liveness 🏷️ config.yaml
 
 | 属性 | 值 |
@@ -381,6 +407,27 @@ responses_ws:
 
 ---
 
+#### `responses_ws.active_turn_timeout_ms` 🏷️ config.yaml
+
+| 属性 | 值 |
+|------|-----|
+| 类型 | `int`（毫秒） |
+| 默认值 | `120000`（2 分钟） |
+| 必填 | 否 |
+
+**作用**：单个 `response.create` active turn 的 provider inactivity watchdog。成功发送到上游后，provider-originated activity 会刷新该计时器；超过该时间没有新的 provider activity / terminal 时，actor 关闭当前 downstream session 并 abort upstream，避免迟到的 provider terminal 污染下一次 turn。它不是单个 turn 的绝对最长运行时间。
+
+**示例**：
+
+```yaml
+responses_ws:
+  active_turn_timeout_ms: 120000
+```
+
+`<=0` 使用默认值，不表示禁用。
+
+---
+
 #### `responses_ws.max_lifetime_ms` 🏷️ config.yaml
 
 | 属性 | 值 |
@@ -407,7 +454,7 @@ responses_ws:
 ```
 
 **对系统的影响**：
-- 到期强制关闭：不影响正在进行中的 turn（turn 完成后正常关闭），但会阻止新 turn 创建。
+- 到期强制关闭：立即关闭当前连接；如果正在进行 turn，会中断该 turn 并 abort upstream。
 - 建议 ≤ 上游 session TTL，避免连接到已过期的上游 session。
 
 ---
@@ -491,24 +538,24 @@ responses_ws:
 | 属性 | 值 |
 |------|-----|
 | 类型 | `int` |
-| 默认值 | 跟随 `RetryTimes`（未显式设置时默认 1） |
+| 默认值 | 未显式设置时按当前已加载渠道数扫描；渠道缓存为空时回退 `RetryTimes` |
 | 必填 | 否 |
 
-**作用**：当首选渠道不支持 ResponsesWS 时，最多扫描多少个候选渠道寻找 WS-capable 渠道。超出后返回 `426 Upgrade Required` + wrapped error frame，客户端可 fallback 到 HTTP bridge。
+**作用**：当首选渠道不支持 ResponsesWS 时，限制一次打开流程最多扫描多少个 unsupported 候选。默认按当前已加载渠道数扫描，确保 `426 Upgrade Required` + wrapped fallback 只表示候选已明确耗尽且都不支持 ResponsesWS。若管理员显式配置的值低于当前渠道数，命中上限时返回 `503 responses_ws_unsupported_scan_limited`，不会伪装成 `426`；系统也不会把 native 自动切到 HTTP bridge，客户端可以改用普通 HTTP Responses，或管理员显式配置 `responses_ws_transport=http_bridge` 后重试。
 
 **可配置值**：
 
 | 值 | 行为 | 影响 |
 |----|------|------|
-| 未配置 | 使用 `RetryTimes` 值（默认 1） | 平衡性能与可用性 |
-| `5` | 扫描 5 个候选 | 提高命中 WS-capable 渠道概率，但增量开销 |
-| `1` | 只试首选 | 最快；首选不支持时直接 fallback |
+| 未配置 / `0` | 按当前已加载渠道数扫描 | `426` 只表示候选明确耗尽 |
+| `5` | 最多扫描 5 个 unsupported 候选 | 提高命中 WS-capable 渠道概率，但若渠道数更多且命中上限，会返回 `503 responses_ws_unsupported_scan_limited` |
+| `1` | 最多扫描 1 个 unsupported 候选 | 最快；如果后面仍可能有可用候选，返回 `503 responses_ws_unsupported_scan_limited`，不返回 `426` |
 
 **示例**：
 
 ```yaml
 responses_ws:
-  unsupported_scan_limit: 5
+  unsupported_scan_limit: 0
 ```
 
 **对系统的影响**：
@@ -530,7 +577,7 @@ responses_ws:
 - **Codex**：填写 `https://chatgpt.com`
 - **自托管/代理**：填写你自己的中转地址
 
-**安全说明**：上游 URL 在建立 WebSocket 连接前会经过严格 SSRF 校验。
+**安全说明**：上游 URL 在建立 WebSocket 连接前会经过严格 SSRF 校验；默认拒绝 loopback、内网、link-local、云 metadata IP，并硬拦截 `metadata.google.internal` 等 metadata hostname。显式 self-hosted 只放开本地/内网/明文自建地址，不放开 metadata host。
 
 ---
 
@@ -539,6 +586,103 @@ responses_ws:
 上游服务的 API Key。对于 OpenAI，填写 `sk-...` 格式的 key；对于 Codex，填写 OAuth 凭据 JSON。
 
 **注意**：key 本身**不会**存入 ResponsesWS 的 upstream snapshot。snapshot 中仅存储 channel 引用（可间接获取 Base URL 等），不存储原始凭据。
+
+---
+
+### `Other` JSON 🏷️ Web 后台 → 渠道
+
+所有渠道的 `Other` 非空时都必须是 JSON object。旧的纯字符串格式不再作为合法配置保存或运行时读取；需要把原先的字符串语义转换成对应字段，例如：
+
+```json
+{
+  "api_version": "2024-10-01-preview"
+}
+```
+
+对没有必填 `Other` 字段的渠道，空值表示使用该渠道的默认配置；Azure classic 仍必须提供 `api_version`，VertexAI 仍必须提供 `region` / `project_id`。`responses_ws_transport` 是跨 provider 的公共字段，非法值会返回 `invalid_responses_ws_transport`。
+
+常见渠道的 `Other` JSON 形态如下。这里的字段都是渠道级数据库配置，不是 `config.yaml` 项：
+
+| 渠道 | `Other` JSON 示例 | 说明 |
+| --- | --- | --- |
+| OpenAI / 自定义 OpenAI-compatible | `{"responses_ws_transport":"http_bridge"}` | 空值可用默认配置；自定义兼容上游若支持原生 ResponsesWS，需要额外声明 `responses_ws_native=true` |
+| Azure classic | `{"api_version":"2024-10-01-preview","responses_ws_transport":"native"}` | `api_version` 必填；不再接受旧的纯字符串 API version |
+| Azure V1 | `{"responses_ws_transport":"native"}` | `base_url` 必须是 resource-level endpoint，不要包含 `/openai/deployments`；不读取 `api_version` |
+| Ali | `{"dashscope_plugin":"plugin-name"}` | `dashscope_plugin` 可选；旧纯字符串插件参数会在迁移/保存时转换为该字段 |
+| Xunfei | `{"api_version":"v3.1"}` | `api_version` 可选；旧纯字符串版本号会转换为该字段 |
+| Gemini | `{"api_version":"v1"}` | `api_version` 可选；旧纯字符串版本号会转换为该字段 |
+| Azure Speech | `{"region":"eastasia"}` | `region` 和 `base_url` 至少配置一个；旧纯字符串区域会转换为 `region` |
+| VertexAI | `{"region":"us-central1","project_id":"my-project"}` | `region` / `project_id` 都必填；旧 `Region|ProjectID` 格式会转换为 JSON |
+| Codex | `{"websocket_mode":"auto","responses_ws_transport":"native"}` | 只允许 Codex 文档列出的有限字段；不接受 `extra` / `vendor_extra` |
+
+有限字段合同的 trade-off：显式 JSON 增加了一点填写成本，但可以在保存时发现拼写错误和类型错误，避免旧字符串或错字段被静默忽略。对确实需要保留 provider 私有数据的非 Codex 渠道，请放到 `extra` 或 `vendor_extra` 命名空间；运行时不会解释这两个命名空间。
+
+对第三方 OpenAI-compatible / 自定义渠道，HTTP `Responses` endpoint 非空不等于 native ResponsesWS 可用。若上游确实支持原生 Responses WebSocket，需要在 `Other` 中显式声明：
+
+```json
+{
+  "responses_ws_native": true
+}
+```
+
+该字段只允许 boolean。未声明时，请显式使用 `responses_ws_transport=http_bridge`，或保持不启用 ResponsesWS。
+
+私有或本地自建上游需要额外声明：
+
+```json
+{
+  "responses_ws_self_hosted": true
+}
+```
+
+`responses_ws_self_hosted` 只影响 ResponsesWS，`self_hosted` 只影响 Realtime；二者不是别名，且都只允许 boolean。
+
+---
+
+### Azure classic `Other` JSON 🏷️ Web 后台 → 渠道
+
+classic Azure OpenAI (`ChannelTypeAzure`) 的 `Other` 必须是 JSON object，不再兼容旧的纯 `api-version` 字符串：
+
+```json
+{
+  "api_version": "2024-10-01-preview",
+  "responses_ws_transport": "native",
+  "self_hosted": false,
+  "responses_ws_self_hosted": true
+}
+```
+
+- `api_version` 必填，必须是非空字符串。
+- `responses_ws_transport` 可选，只允许 `native` 或 `http_bridge`。
+- `self_hosted` 可选，只影响 Azure `/v1/realtime` 私有/本地上游。
+- `responses_ws_self_hosted` 可选，只影响 ResponsesWS native/HTTP bridge 私有/本地上游；它不是 `self_hosted` 的别名。
+- 旧格式 `"2024-10-01-preview"` 会在保存或批量更新时被拒绝；升级迁移只会把可无损识别的历史 provider `Other` 字符串一次性转换为 JSON object，无法判断的旧值保持原样并由运行时校验 fail-closed；运行时不会 fallback 读取旧格式。
+- classic Azure 与 Azure V1 的 ResponsesWS native endpoint 都使用 resource-level `/openai/v1/responses`；deployment name 放在 `response.create.model` 中。classic `api_version` 仍用于该 Azure 渠道的非 WS HTTP relay mode，不写入 ResponsesWS native URL。Azure V1 不读取顶层 `api_version`，保存时也会拒绝该字段；只配置 `responses_ws_transport`、`self_hosted`、`responses_ws_self_hosted` 等公共 runtime 字段。
+
+---
+
+### ResponsesWS transport 🏷️ Web 后台 → 渠道
+
+OpenAI、Codex、classic Azure 等支持 ResponsesWS provider contract 的渠道可以在 `Other` JSON 中显式选择 transport：
+
+```json
+{
+  "responses_ws_transport": "http_bridge"
+}
+```
+
+| 值 | 行为 |
+| --- | --- |
+| 空 / `native` | 官方 OpenAI、Azure、Codex 默认使用真实上游 ResponsesWS / provider native WS；自定义兼容渠道需要 `responses_ws_native=true` |
+| `http_bridge` | 主动使用 HTTP Responses stream bridge 模拟 ResponsesWS，需要上游 HTTP Responses endpoint 可用 |
+
+`http_bridge` 是主动兼容模式，不是 native WS 建连失败后的自动 fallback。非法值会返回 `invalid_responses_ws_transport`。
+
+自定义兼容渠道未声明 `responses_ws_native=true` 却请求 native，或显式 bridge 缺少 HTTP Responses endpoint，会返回 `responses_ws_unsupported_for_channel`。
+
+classic Azure 渠道配置该字段时，仍必须同时保留上一节的 `api_version`。
+
+HTTP bridge 会保留 ResponsesWS `response.create` raw JSON 中未知字段，以便兼容未来官方字段；只拒绝当前 bridge 明确无法支持的 transport 字段，例如显式 `stream=false` 或 `background=true`。这条 raw preservation contract 不受普通 HTTP relay 的 `AllowExtraBody` 开关控制：`AllowExtraBody` 只约束普通 HTTP 请求体额外字段透传，ResponsesWS bridge 以 WebSocket raw frame 作为转发真相。Trade-off：bridge 对未来字段更兼容，但需要在 transport 边界保留少量显式拒绝列表。
 
 ---
 
@@ -568,8 +712,12 @@ Codex 渠道作为 ResponsesWS 上游时的 `channel.Other` 配置，详见 [Cod
 
 | 字段 | 作用 |
 |------|------|
-| `websocket_mode` | `"auto"`（默认）/ `"required"` / `"off"`。`"off"` 时该渠道不被 ResponsesWS 选中（返回 `unsupported`） |
+| `websocket_mode` | `"auto"`（默认）/ `"force"` / `"off"`。`"off"` 只关闭 native websocket；未显式 `responses_ws_transport=http_bridge` 时 ResponsesWS 返回 `unsupported` |
+| `responses_ws_transport` | `"native"`（默认）/ `"http_bridge"`。显式选择 HTTP bridge 兼容模式；显式 `http_bridge` 不受 native `websocket_mode=off` 影响，也不是 native WS 建连失败后的自动 fallback |
+| `responses_ws_self_hosted` | `true` / `false`。只允许 ResponsesWS 使用私有或本地自建上游；不影响 Codex Realtime |
 | `prompt_cache_key_strategy` | 控制 prompt cache key 的生成策略，影响 channel affinity 命中率 |
+
+HTTP bridge 是有限兼容模式：`stream` 会被 bridge 强制为 `true`，显式 `stream=false` 会被拒绝；`background=true` 暂不支持并会在请求上游前失败；`stream_options` 会按原始 JSON 透传给 HTTP `/responses`。
 
 ---
 
@@ -588,7 +736,7 @@ Codex 渠道作为 ResponsesWS 上游时的 `channel.Other` 配置，详见 [Cod
 [3] first_frame_timeout_ms 内等待首帧  ← gorilla ReadDeadline (config.yaml)
     │
     ▼
-[4] 首帧解析 + channel selection       ← 可能扫描 unsupported_scan_limit 个候选 (config.yaml)
+[4] 首帧解析 + channel selection       ← 默认扫描当前加载候选；显式 unsupported_scan_limit 可提前返回 503
     │                                       ← 渠道 API 地址/密钥/模型/用户组 (Web 后台)
     ▼
 [5] active lease 获取                   ← 三级检查：credential → group → global (config.yaml)
@@ -599,6 +747,7 @@ Codex 渠道作为 ResponsesWS 上游时的 `channel.Other` 配置，详见 [Cod
     ▼
 [7] turn 循环（response.create → send → 转发 → terminal → finalize）
     │                                   ← pending_provider_events_max_bytes 缓冲 (config.yaml)
+    │                                   ← active_turn_timeout_ms 单 turn 超时 (config.yaml)
     │                                   ← idle_timeout_ms 空闲计时 (config.yaml)
     │                                   ← max_lifetime_ms 上限计时 (config.yaml)
     ▼
@@ -623,7 +772,7 @@ Codex 渠道作为 ResponsesWS 上游时的 `channel.Other` 配置，详见 [Cod
 | 协议模型 | pass-through（帧透传） | turn-based（事务） |
 | 系统级配置位置 | `config.yaml` → `realtime.*` | `config.yaml` → `responses_ws.*` |
 | 渠道配置位置 | Web 后台 `渠道` 页面 | Web 后台 `渠道` 页面（同） |
-| Origin 检查 | `realtime.allowed_origins` | 通过 `cors.allow_origins` |
+| Origin 检查 | `realtime.allowed_origins`，为空时 fallback 到 `cors.allow_origins` | 同 Realtime：优先 `realtime.allowed_origins`，为空时 fallback 到 `cors.allow_origins` |
 | 容量控制 | 无专用容量限制 | 三级 active lease + pending slot |
 | 写超时 | `realtime.websocket_write_timeout_ms` | 同（复用同一 writer primitive） |
 | 读上限 | `realtime.websocket_read_limit` | 同（复用同一 read limit primitive） |

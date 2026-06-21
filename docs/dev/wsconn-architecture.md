@@ -10,10 +10,10 @@
 
 ## 真实问题
 
-当前实现下，`common/requester/ws_*.go` 已经抽出若干 safety primitives（`WSClientWriter`、`WSControlFrameWriter`、`SafeWSCloseMessage`、`ApplyWSReadLimit`、`InstallWSActivityHandlers`、`WSActiveCounterGuard` 等），但它们是**散落的工具集**，不是一个连贯的连接抽象：
+落地前，`common/requester/ws_*.go` 曾经抽出若干 safety primitives（`WSClientWriter`、`WSControlFrameWriter`、`SafeWSCloseMessage`、`ApplyWSReadLimit`、`InstallWSActivityHandlers`、`WSActiveCounterGuard` 等），但它们是**散落的工具集**，不是一个连贯的连接抽象：
 
-1. 业务层（`relay/responses_ws.go` 3000+ 行、`relay/realtime.go` 580+ 行、`providers/openai/realtime_session.go`、`providers/codex/realtime.go`、`providers/xunfei/chat.go`）仍**直接持有** `*websocket.Conn`、直接调用 `ReadMessage`/`WriteMessage`/`SetReadDeadline`/`SetPongHandler`。
-2. 每个业务点重复实现 read pump、ping loop、liveness watchdog、send worker，且实现细节互有差异（例如 `client_pong_timeout_ms` 在 `relay/responses_ws.go:638` 实际是 inbound activity-based，名字却像 pong miss）。
+1. 业务层（`relay/responses_ws.go` 3000+ 行、`relay/realtime.go` 580+ 行、`providers/openai/realtime_session.go`、`providers/codex/realtime.go`、`providers/xunfei/chat.go`）曾**直接持有** `*websocket.Conn`、直接调用 `ReadMessage`/`WriteMessage`/`SetReadDeadline`/`SetPongHandler`。
+2. 每个业务点重复实现 read pump、ping loop、liveness watchdog、send worker，且实现细节互有差异；当时 ResponsesWS 的 `client_pong_timeout_ms` 实际是 inbound activity-based，名字却像 pong miss。
 3. close reason 在不同 goroutine 各自归类，缺少统一来源；metrics 维度容易漂移。
 4. 14 个生产文件、13 个测试文件直接 import `github.com/gorilla/websocket`。任何一处接触 transport 细节都可能引入并发写、漏 deadline、UTF-8 close reason 溢出、close 路径分叉等已知反复出错的 bug 类。
 
@@ -1439,7 +1439,7 @@ const (
 - **`FrameKind` 只有 Text/Binary**，没有 Close/Ping/Pong。Close 走 ProviderClose 事件，Ping/Pong 由 wsconn 内部处理业务感知不到
 - **`runtime/session` 包不 import `wsconn`**，避免 session 层绑定具体传输实现。relay 层负责把 `session.FrameKind` 映射到 `wsconn.MessageType`（两个值对一）
 - **`runtime/session` 包不 import gorilla**。`mt int` 时代里 mt 值是 gorilla 常量这件事直接消失
-- `ResponsesWSSendPreflightCapable`、`GracefulDetachCapable` 这类 optional capability 扩展模式继续保留
+- `responsesws.SendPreflightCapable`、`GracefulDetachCapable` 这类 optional capability 扩展模式继续保留
 
 迁移工作量：3 个 provider（openai/codex/xunfei）+ 2 个 relay handler + 所有 RealtimeSession 相关测试都要同步改 `SendClient`/`Recv` 调用形态。粗估 SendClient 调用点 ~40 处、Recv 调用点 ~30 处、Frame/RecvEvent 字段访问 ~50 处、测试 mock 重写 ~80 处，合计 **~200+ 行调用点更新**；折合 **3-5 人日**（一次性切换无双轨期）。
 
@@ -1833,14 +1833,16 @@ Actor 持有 client-side `*wsconn.ManagedConn` + provider-side `RealtimeSession`
 
 ### relay/responses_ws
 
-同 realtime 形态，但 Actor 状态机更复杂（turn admission、quota 预扣、ambiguous admission、fallback、settlement、ResponsesWSSendPreflightCapable 调用）。**入口分两段：先用 `ReadInitial` 同步读首帧 + 轻量 parse，然后立刻启动 actor + Pump，首帧作为 `FirstTurnSetup` 事件交给 actor**；所有 heavy admission（quota / RPM / model / lease 升级）走 actor 单线程处理（见 [ReadInitial 的特殊性](#readinitial-的特殊性)、[ResponsesWS 入口形态](#responsesws-入口形态)）。
+同 realtime 形态，但 Actor 状态机更复杂（turn admission、quota 预扣、ambiguous admission、fallback、settlement、`responsesws.SendPreflightCapable` 调用）。**入口分两段：先用 `ReadInitial` 同步读首帧 + 轻量 parse，然后立刻启动 actor + Pump，首帧作为 `FirstTurnSetup` 事件交给 actor**；所有 heavy admission（quota / RPM / model / lease 升级）走 actor 单线程处理（见 [ReadInitial 的特殊性](#readinitial-的特殊性)、[ResponsesWS 入口形态](#responsesws-入口形态)）。
 
 ```go
 mc, err := wsconn.AcceptManaged(w, r, wsconn.Config{
-    Label:                  "client-responses-ws",
-    PingInterval:           config.ResponsesWSClientPingInterval(),
-    PongMissTimeout:        config.ResponsesWSClientPongMiss(),
-    InboundActivityTimeout: config.ResponsesWSClientInboundActivity, // 取代旧 client_pong_timeout_ms
+	    Label:                  "client-responses-ws",
+	    PingInterval:           config.ResponsesWebsocketClientPingInterval(),
+	    PongMissTimeout:        config.ResponsesWebsocketClientPongMissTimeout(),
+	    InboundActivityTimeout: func() time.Duration {
+	        return config.ResponsesWebsocketClientInboundActivityTimeout()
+	    },
 }, wsconn.AcceptOptions{
     CheckOrigin:       responsesWSOriginAllowed,
     Subprotocols:      responsesWSAllowedSubprotocols(r),
@@ -1942,7 +1944,7 @@ CloseKind 不为 SIGTERM 引入新枚举值（`CloseKindServerShutdown` 不重�
 
 ## Liveness 语义拆分
 
-旧配置 `client_pong_timeout_ms`（`relay/responses_ws.go:638`）实际行为是 inbound activity-based —— 任何来自客户端的消息都会刷新 `lastClientInboundActivity`，触发条件是 `time.Since(lastActivity) >= pongTimeout`。这是 inbound activity timeout 的语义，但名字像 pong miss。
+落地前的旧配置 `client_pong_timeout_ms` 实际行为是 inbound activity-based —— 任何来自客户端的消息都会刷新 `lastClientInboundActivity`，触发条件是 `time.Since(lastActivity) >= pongTimeout`。这是 inbound activity timeout 的语义，但名字像 pong miss。当前实现已拆分为 ResponsesWS 专用的 `responses_websocket_client_ping_interval_ms`、`responses_websocket_client_pong_miss_timeout_ms` 和 `responses_websocket_client_inbound_activity_timeout_ms`，代码入口分别是 `config.ResponsesWebsocketClientPingInterval()`、`config.ResponsesWebsocketClientPongMissTimeout()` 和 `config.ResponsesWebsocketClientInboundActivityTimeout()`。
 
 新架构里**强制拆分为两个独立配置**：
 
@@ -2357,11 +2359,11 @@ func WithClock(clock wsconn.Clock) Option
 
 ## 与现有 websocket-transport-architecture.md 的关系
 
-[WebSocket Transport 复用方案](./websocket-transport-architecture.md) 描述的是**当前实现**：共享 safety primitives，但业务层各自组装、各自持有 `*websocket.Conn`。该路线已经达到 primitives-only 路径的能力上限。
+[WebSocket Transport 复用方案](./websocket-transport-architecture.md) 描述的是**旧实现路径**：共享 safety primitives，但业务层各自组装、各自持有 `*websocket.Conn`。该路线已经达到 primitives-only 路径的能力上限，并已被本方案取代。
 
-本方案是**目标方案**，替代而非叠加：
+本方案是**当前方案**，替代而非叠加：
 
-| 维度 | 当前实现（primitives-only） | 本方案（wsconn 硬边界） |
+| 维度 | 旧实现（primitives-only） | 当前方案（wsconn 硬边界） |
 |---|---|---|
 | 业务持有 `*websocket.Conn` | 是 | 否 |
 | 业务 import gorilla | 是（14 个生产文件） | 否（除 wsconn 外被 depguard 禁止） |

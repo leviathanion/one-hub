@@ -78,8 +78,11 @@ Codex 渠道当前通过 OpenAI 兼容接口使用，支持以下路径：
 | --- | --- | --- | --- |
 | `prompt_cache_key_strategy` | 否 | `off` | 控制未显式传 `prompt_cache_key` 时，系统如何自动生成稳定值 |
 | `websocket_mode` | 否 | `auto` | 控制 Codex realtime 优先 websocket、强制 websocket，还是直接关闭 websocket |
-| `execution_session_ttl_seconds` | 否 | `600` | execution session 空闲保留时长 |
-| `websocket_retry_cooldown_seconds` | 否 | `120` | websocket 失败后切回 HTTP bridge 的冷却时间 |
+| `responses_ws_transport` | 否 | `native` | 控制 ResponsesWS 使用 native WS 还是显式 HTTP bridge 兼容模式 |
+| `execution_session_ttl_seconds` | 否 | `600` | Codex Realtime execution session 空闲保留时长 |
+| `websocket_retry_cooldown_seconds` | 否 | `120` | Codex Realtime websocket 失败后的 bridge 冷却 |
+| `self_hosted` | 否 | `false` | 仅允许 Codex Realtime 使用私有或本地自建上游 |
+| `responses_ws_self_hosted` | 否 | `false` | 仅允许 ResponsesWS 使用私有或本地自建上游 |
 
 ### `User-Agent` 透传与兜底优先级
 
@@ -764,13 +767,17 @@ trade-off：
 }
 ```
 
-如果你希望“完全禁用 websocket，固定走 HTTP bridge”，可以改成：
+如果你希望 ResponsesWS 固定走 HTTP bridge，可以改成：
 
 ```json
 {
-  "websocket_mode": "off"
+  "responses_ws_transport": "http_bridge"
 }
 ```
+
+如果你同时希望 Codex Realtime/native websocket 也关闭，可以再加上 `"websocket_mode": "off"`。
+
+注意：`responses_ws_transport=http_bridge` 是你主动选择 ResponsesWS HTTP bridge 兼容模式，不是 native ResponsesWS 建连失败后的自动回退。`websocket_mode` 主要约束 Codex Realtime/native websocket；未显式配置 `responses_ws_transport=http_bridge` 时，ResponsesWS 不会静默从 native WS 切到 HTTP bridge。
 
 ### 自动生成稳定缓存身份
 
@@ -820,7 +827,7 @@ trade-off：
 }
 ```
 
-### Realtime 优先 websocket，失败自动回退
+### Realtime 优先 websocket，失败后进入 bridge 冷却
 
 ```json
 {
@@ -928,18 +935,18 @@ trade-off：
 
 | 值 | 行为 |
 | --- | --- |
-| `auto` | 优先 `responses-ws`，握手失败或后续发送失败时自动回退到 `responses-http-bridge` |
+| `auto` | Realtime 优先 websocket；ResponsesWS 仍要求 native WS，除非显式配置 `responses_ws_transport=http_bridge` |
 | `force` | 必须使用 websocket，握手失败直接报错，不做回退 |
-| `off` | 不尝试 websocket，直接走 HTTP bridge |
+| `off` | Realtime 不尝试 websocket；ResponsesWS 未显式 `http_bridge` 时返回 unsupported |
 
 推荐默认使用 `auto`。
 
 补充说明：
 
-- `auto` 适合大多数场景，优先吃到 websocket 的低延迟；如果上游暂时不支持或握手失败，会自动回退
+- `auto` 适合大多数 Realtime 场景，优先吃到 websocket 的低延迟；ResponsesWS 不做 native-to-HTTP bridge 自动回退
 - `force` 适合你明确要求上游必须支持 realtime websocket 的场景；任何 websocket 建连失败都会直接返回错误
-- 默认只允许 `wss` 公网 Realtime 上游，并拒绝 loopback、内网、link-local 和云 metadata IP。私有/本地自建上游必须在 Codex 配置中显式设置 `"self_hosted": true` 或 `"responses_ws_self_hosted": true`；开启后会允许本机/内网自建地址和明文 `ws`，但云 metadata IP 仍会被硬拦截。代价是你需要自行保证链路可信，尤其是明文 `ws` 会暴露 bearer 凭据。
-- `off` 适合网络环境对 websocket 不友好，或者你希望行为更稳定、更容易排查时使用
+- 默认只允许 `wss` 公网上游，并拒绝 loopback、内网、link-local、云 metadata IP 和 metadata hostname（例如 `metadata.google.internal`）。Codex Realtime 私有/本地自建上游必须显式设置 `"self_hosted": true`；ResponsesWS 私有/本地自建上游必须显式设置 `"responses_ws_self_hosted": true`。两个 key 不互相放开对方协议。开启后会允许本机/内网自建地址和明文 `ws`，但云 metadata IP/hostname 仍会被硬拦截。代价是你需要自行保证链路可信，尤其是明文 `ws` 会暴露 bearer 凭据。
+- `off` 适合 Realtime 网络环境对 websocket 不友好，或者你希望行为更稳定、更容易排查时使用。ResponsesWS 如需 HTTP bridge，请单独设置 `responses_ws_transport=http_bridge`
 
 ### `execution_session_ttl_seconds`
 
@@ -950,7 +957,7 @@ trade-off：
 - 同一个调用方带着同一个 `x-session-id` / `session-id` / `session_id` 回到同一个渠道时，可以复用之前的 execution session
 - 超过 TTL 后，runtime 会清理空闲 session，释放上游连接
 
-注意：这里的跨请求 execution session 复用只适用于 Codex Realtime 路径。Responses WebSocket (`GET /v1/responses`) 会为每条下游 WebSocket 连接使用独立的上游 execution session，避免 multi-agent 或多连接并发共享同一个 single-inflight 上游 WS。`x-session-id` 仍可用于 routing affinity 和 prompt cache identity，但不会让多条 ResponsesWS 连接复用同一个 live 上游 WS。
+注意：这里的跨请求 execution session 复用只适用于 Codex Realtime 路径。Responses WebSocket (`GET /v1/responses`) 会为每条下游 WebSocket 连接打开独立上游 WS，并使用连接本地的 upstream session id，避免 multi-agent 或多连接并发共享同一个 single-inflight 上游 WS。`x-session-id` 仍可用于 routing affinity 和 prompt cache identity，但不会让多条 ResponsesWS 连接复用同一个 live 上游 WS。
 
 ### 全局 `codex.execution_session_revocation_timeout_ms`
 
@@ -986,7 +993,7 @@ trade-off：
 - 同一个 execution session 继续走 HTTP bridge
 - 不会每次请求都重新尝试 websocket 握手
 
-Responses WebSocket 入口要求真实 WS 传输，不能静默切到 HTTP bridge；如果 Codex 渠道不支持或暂时无法建立 ResponsesWS，会返回 websocket 入口的错误/回退信号，而不是在已升级的 ResponsesWS 连接内复用 HTTP bridge。
+Responses WebSocket 入口不会静默切到 HTTP bridge；只有显式配置 `responses_ws_transport=http_bridge` 时才会使用 ResponsesWS HTTP bridge 兼容模式。如果 Codex 渠道未显式启用 bridge 且不支持或暂时无法建立 ResponsesWS，会返回 `unsupported` 或上游 websocket 错误，不会自动改走 HTTP bridge。
 
 ## Realtime 渠道亲和
 
@@ -999,7 +1006,7 @@ Codex realtime 现在采用 channel affinity + same-channel resume 语义：
 - 如果该 channel 不可用，或 same-channel resume 因模型、headers、UA、base URL、credential 等兼容性变化失败，请求会走 fresh route，并在成功后把 affinity 改写到新 channel
 - 不支持跨 channel 延续旧的上游 realtime 会话
 
-Responses WebSocket 也可以使用相同的请求 identity 做渠道亲和和缓存身份，但它不做跨下游 WS 连接的 live execution session resume。同一个 `x-session-id` 同时开两条 ResponsesWS 连接时，会打开两条独立的上游 WS，避免互相抢占同一个 inflight turn。
+Responses WebSocket 也可以使用相同的请求 identity 做渠道亲和和缓存身份，但它不做跨下游 WS 连接的 live execution session resume，也不写 one-hub realtime binding。同一个 `x-session-id` 同时开两条 ResponsesWS 连接时，会打开两条独立的上游 WS，避免互相抢占同一个 inflight turn。
 
 ## Realtime `session_id` 规则
 

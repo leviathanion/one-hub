@@ -29,4 +29,15 @@ lastUpdated: true
 
 6. 创建成功后，下载 JSON 文件，在本地打开 JSON 文件，将里面所有的内容复制到渠道的`Key`中。
 
-7. 最后在[这里](https://console.cloud.google.com/apis/library/iamcredentials.googleapis.com)，启用`IAM Service Account Credentials API`。
+7. 在渠道的 `Other(JSON)` 中填写 VertexAI 的区域和项目 ID：
+
+```json
+{
+  "region": "us-central1",
+  "project_id": "你的 Google Cloud Project ID"
+}
+```
+
+旧的 `Region|ProjectID` 字符串格式不再作为合法配置保存或运行时读取；升级迁移只会把可无损识别的历史值转换成上面的 JSON object。这个选择牺牲了旧格式的宽松兼容性，换来保存时能检查缺字段、错字段和非字符串值，避免请求运行到上游时才失败。
+
+8. 最后在[这里](https://console.cloud.google.com/apis/library/iamcredentials.googleapis.com)，启用`IAM Service Account Credentials API`。

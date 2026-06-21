@@ -9,9 +9,9 @@ lastUpdated: true
 
 ## 文档状态
 
-- 状态：当前实现
-- 适用范围：unary request、Codex realtime turn、async task
-- 目的：说明当前代码已经采用的结算架构、边界和 trade-off，而不是下一阶段的实现草案
+- 状态：当前实现 + ResponsesWS v2 目标口径
+- 适用范围：unary request、Codex realtime turn、ResponsesWS turn、async task
+- 目的：说明 one-hub 统一 settlement truth 入口，以及 ResponsesWS 在不可完全观测 provider 事务边界时采用的保守有界计费政策
 
 ## 这套架构真正解决什么
 
@@ -20,7 +20,7 @@ lastUpdated: true
 当前代码解决的是三件事：
 
 1. 预扣和最终结算分离，但最终 truth 只走一条入口
-2. unary、realtime、async task 三类请求共用同一套 settlement contract
+2. unary、realtime、ResponsesWS、async task 四类请求共用同一套 settlement contract
 3. detached finalize 场景在可接受复杂度内做幂等防重，而不是为此引入独立 ledger service
 
 当前代码明确不解决：
@@ -45,6 +45,7 @@ lastUpdated: true
 | `relay/relay_util/quota.go` | 计算价格、预扣额度、冻结结算快照 |
 | `internal/billing/settlement.go` | 统一结算入口、Redis gate、防重、truth / cleanup / projection 分层 |
 | `relay/relay_util/realtime_turn_observer.go` | realtime turn finalize 归一到 settlement |
+| `relay/responses_ws_settlement.go` | ResponsesWS defensive settlement core，输出唯一 `ExpectedFinalQuota` |
 | `relay/task/base/settlement.go` | async task snapshot 冻结与 finalize |
 | `model/token.go` | `ApplyTokenUserQuotaDeltaDirect`，同步落 user/token truth |
 
@@ -66,6 +67,8 @@ lastUpdated: true
 3. 全量重写 reserve 生命周期，牵动的范围远大于收益
 
 async task 额外调用 `ForcePreConsume()`，强制在 submit 时持有预扣额度，因为 finalize 发生在脱离原请求的异步路径上。
+
+ResponsesWS turn attempt 同样调用 `ForcePreConsume()`。原因不是异步任务生命周期，而是 ambiguous/no-terminal 路径需要一个有界 floor；高余额用户不能因为 trusted skip 而让 floor 变成 0。
 
 ### 2. `SettlementEnvelope` 是冻结后的最小结算快照
 
@@ -167,7 +170,24 @@ projection 只处理统计和审计：
 
 这一点非常关键：`delta` 用来修正 reserve，`final_quota` 才代表这次请求最终消费了多少。
 
-## 三类请求如何接入当前架构
+### 5. ResponsesWS fixed-final executor
+
+ResponsesWS 不直接把 actor 里的 `Usage` 交给 quota helper 重新计算 final quota。actor 先把 transport result、zero-charge proof、terminal evidence、observed usage 和 preconsume floor 投影为 `ResponsesWSSettlementInput`，由 `decideResponsesWSSettlement(...)` 得到 `ResponsesWSSettlementDecision`。
+
+`SettlementDecision.ExpectedFinalQuota` 是 ResponsesWS 真实扣费的唯一金额来源：
+
+- `RollbackReserve`：撤销 reserve，applied final quota 为 0。
+- `FinalizeExactUsage`：provider terminal 带 usage 时按 terminal usage exact，可低于 preconsume floor 并退款。
+- `FinalizeFloor`：ambiguous/no-terminal/no-proof 等不确定状态保留 preconsume floor。
+- `FinalizeObservedOrFloor`：有 provider activity 或 observed usage 但没有 terminal usage 时，按 `max(observed_billable_usage_quota, preconsume_floor)`。
+
+executor 通过 fixed-final quota API 构造 `SettlementEnvelope`，仍然走 `Quota -> SettlementEnvelope -> ApplySettlement` 主链路。它必须校验 applied final quota 等于 `ExpectedFinalQuota`，并在 settlement trace 中记录 input、decision 和 applied result。`Reason` 只用于诊断，actor 不得根据它选择账务动作。
+
+fixed-final API 的 trade-off：金额只信 `ExpectedFinalQuota`，但 envelope 仍可携带 usage summary 作为日志和审计明细。这样避免 no-terminal/floor 场景被 usage 重新计算拉低金额，同时保留 terminal/observed token 明细。纯 floor 兜底不携带 usage summary，明确表示没有可审计的 provider usage。
+
+executor 对不可信状态必须 fail loud：nil quota、空 model、uncertain/floor path 缺失 preconsume floor 且 expected final quota 为 0 时返回错误，不标记 finalized，不伪造 `AppliedFinalQuota == ExpectedFinalQuota`。收益是账务错误不会静默免费；代价是测试和调用方必须提供真实 quota/floor，不能再依赖 dummy quota 的假成功。
+
+## 四类请求如何接入当前架构
 
 ### Unary Request
 
@@ -208,6 +228,23 @@ async task 不是在 finalize 时重算 live config，而是在 submit 时冻结
 6. failure 把 `final_quota` 改成 `0`，完成 reserve 回补
 
 这意味着 async task 的价格、预扣和最终结算上下文，已经与 submit 时刻绑定，而不是依赖 finalize 时的 live pricing。
+
+### ResponsesWS Turn
+
+ResponsesWS 不追求事务级精确计费。WebSocket send result、provider terminal、客户端断开、provider close 可能乱序到达，proxy 无法在所有情况下证明 provider 是否已经看到 `response.create`。
+
+因此 ResponsesWS 使用保守有界计费：
+
+- 可证明未发送：rollback reserve，`final_quota = 0`。
+- provider stream-start 前 HTTP rejection：rollback reserve，RPM admission 不回滚。
+- provider terminal 带 usage：按 provider usage 结算，可低于 preconsume 并退款。
+- provider terminal 不带 usage：按 preconsume floor 结算。
+- no-terminal 但有 provider evidence：`final_quota = max(observed_billable_usage_quota, preconsume_floor)`。
+- no-terminal 且无 provider evidence，但没有 no-send proof：按 preconsume floor 结算。
+
+ResponsesWS 的 preconsume floor 必须有界：本地 prompt token 估算 + 小额固定 buffer / times-price 单次费用；不得包含 `max_output_tokens`、未知 completion 上限或连接时长乘数。
+
+ResponsesWS 应强制建立 preconsume floor。不能因为用户余额很高而跳过预扣，否则 ambiguous/no-terminal 路径会退化成 0 floor，违反“不少计费”的业务口径。
 
 ## Redis gate 的实际职责
 
@@ -255,13 +292,16 @@ gate 行为：
 
 ## 当前架构的关键不变量
 
-1. 所有最终扣费都必须经过 `ApplySettlement(...)`
-2. truth 必须先于 cleanup / projection
-3. projection 统计口径必须使用 `final_quota`
-4. detached finalize 的 identity 不能为空串
-5. async task finalize 必须优先使用本地 `tasks.id` 构造 identity
-6. gate backend 故障时允许 fail-open，但不能生成第二套 truth 路径
-7. task snapshot 一旦从 `reserved` 进入终态，就不能再按另一份 finalize 结果覆盖 truth
+1. 所有最终扣费都必须经过 `ApplySettlement(...)`。
+2. truth 必须先于 cleanup / projection。
+3. projection 统计口径必须使用 `final_quota`。
+4. detached finalize 的 identity 不能为空串。
+5. async task finalize 必须优先使用本地 `tasks.id` 构造 identity。
+6. gate backend 故障时允许 fail-open，但不能生成第二套 truth 路径。
+7. task snapshot 一旦从 `reserved` 进入终态，就不能再按另一份 finalize 结果覆盖 truth。
+8. ResponsesWS 只有 no-send proof 或 provider rejected before stream 才允许 rollback reserve。
+9. ResponsesWS uncertain/no-terminal 路径必须使用 explicit floor settlement，不能隐式 `Undo()`。
+10. ResponsesWS floor settlement 的 floor 必须有界，不能用最大输出 token 或连接时长放大。
 
 ## 兼容与回退路径
 

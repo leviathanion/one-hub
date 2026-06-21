@@ -2,9 +2,11 @@
 
 ## 文档状态
 
-本文描述 one-hub 如何把 `/v1/realtime` 与 `GET /v1/responses` 中重复的 WebSocket I/O 能力收敛为共享 safety primitive。Phase 0（正确性修复）和 Phase 1–4（抽 primitives、ResponsesWS 复用、文档拆分、回看）均已完成，当前代码已按本文方案落地。
+**历史方案，已被 [wsconn 唯一传输边界架构方案](./wsconn-architecture.md) 取代。**
 
-当前实现总览：
+本文记录 one-hub 曾经如何把 `/v1/realtime` 与 `GET /v1/responses` 中重复的 WebSocket I/O 能力收敛为共享 safety primitive。该 primitives-only 路线已完成其阶段性目标，但当前代码已经迁移到 `common/wsconn` 唯一传输边界；下方实现总览仅作为历史上下文保留，不代表当前文件结构。
+
+历史实现总览：
 - `common/requester/ws_writer.go` — `WSClientWriter`、`WithWSWriteDeadline`
 - `common/requester/ws_close.go` — `SafeWSCloseReason`、`SafeWSCloseMessage`
 - `common/requester/ws_activity.go` — `InstallWSActivityHandlers`
@@ -141,7 +143,7 @@ I/O helper 负责：
 ResponsesWS actor 负责：
 
 - 首帧和后续 `response.create` 状态机。
-- channel selection、RequireWS、affinity owner 检查。
+- channel selection、ResponsesWS upstream capability、affinity owner 检查。
 - RPM admission、quota preconsume、rollback、finalize。
 - provider event buffering。
 - terminal classifier、record/clear affinity。
