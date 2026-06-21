@@ -26,15 +26,12 @@ func GetSubscription(c *gin.Context) {
 
 	if token.UnlimitedQuota {
 		userId := c.GetInt("id")
-		userData, err := model.GetUserFields(userId, []string{"quota", "used_quota"})
+		remainQuota, usedQuota, err = model.GetUserQuotaFields(userId)
 		if err != nil {
 			common.APIRespondWithError(c, http.StatusOK, fmt.Errorf("获取用户信息失败: %v", err))
 
 			return
 		}
-
-		remainQuota = userData["quota"].(int)
-		usedQuota = userData["used_quota"].(int)
 	} else {
 		expiredTime = token.ExpiredTime
 		remainQuota = token.RemainQuota
@@ -76,14 +73,13 @@ func GetUsage(c *gin.Context) {
 
 	if token.UnlimitedQuota {
 		userId := c.GetInt("id")
-		userData, err := model.GetUserFields(userId, []string{"used_quota"})
+		_, usedQuota, err := model.GetUserQuotaFields(userId)
 		if err != nil {
 			common.APIRespondWithError(c, http.StatusOK, fmt.Errorf("获取用户信息失败: %v", err))
 
 			return
 		}
-
-		quota = userData["used_quota"].(int)
+		quota = usedQuota
 	} else {
 		quota = token.UsedQuota
 	}

@@ -427,6 +427,15 @@ func GetUserFields(id int, fields []string) (map[string]interface{}, error) {
 	return result, err
 }
 
+func GetUserQuotaFields(id int) (quota int, usedQuota int, err error) {
+	var result struct {
+		Quota     int
+		UsedQuota int
+	}
+	err = DB.Model(&User{}).Where("id = ?", id).Select("quota", "used_quota").Take(&result).Error
+	return result.Quota, result.UsedQuota, err
+}
+
 func GetUserQuota(id int) (quota int, err error) {
 	err = DB.Model(&User{}).Where("id = ?", id).Select("quota").Find(&quota).Error
 	return quota, err
