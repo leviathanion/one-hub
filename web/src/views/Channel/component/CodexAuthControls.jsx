@@ -6,7 +6,7 @@ import { copy, showError, showSuccess } from 'utils/common';
 import { Alert, Box, Button, Dialog, DialogActions, DialogContent, DialogTitle, TextField, Typography } from '@mui/material';
 import { Icon } from '@iconify/react';
 
-export default function CodexAuthControls({ channelId, proxy, currentName, onCredentials, onSuggestedName }) {
+export default function CodexAuthControls({ channelId, proxy, currentName, onCredentials, onSuggestedName, authFileActions }) {
   const authFileInputRef = useRef(null);
   const [authFileImporting, setAuthFileImporting] = useState(false);
   const [oauthVisible, setOauthVisible] = useState(false);
@@ -139,6 +139,7 @@ export default function CodexAuthControls({ channelId, proxy, currentName, onCre
         >
           {authFileImporting ? 'Importing auth file...' : 'Import Auth File'}
         </Button>
+        {authFileActions}
       </Box>
       <Button
         variant="outlined"
@@ -223,5 +224,6 @@ CodexAuthControls.propTypes = {
   proxy: PropTypes.string,
   currentName: PropTypes.string,
   onCredentials: PropTypes.func.isRequired,
-  onSuggestedName: PropTypes.func
+  onSuggestedName: PropTypes.func,
+  authFileActions: PropTypes.node
 };

@@ -1264,28 +1264,30 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                           setFieldValue('name', suggestedName);
                         }
                       }}
+                      authFileActions={
+                        channelId === 0 ? (
+                          <>
+                            <input
+                              ref={codexBatchAuthFileInputRef}
+                              hidden
+                              multiple
+                              type="file"
+                              accept=".json,application/json"
+                              onChange={(event) => handleCodexBatchAuthFilesImport(event, values)}
+                            />
+                            <Button
+                              variant="outlined"
+                              color="secondary"
+                              disabled={codexBatchAuthFileImporting}
+                              onClick={() => codexBatchAuthFileInputRef.current?.click()}
+                              startIcon={codexBatchAuthFileImporting ? null : <Icon icon="solar:folder-with-files-bold-duotone" />}
+                            >
+                              {codexBatchAuthFileImporting ? 'Importing auth files...' : 'Batch Import Auth Files'}
+                            </Button>
+                          </>
+                        ) : null
+                      }
                     />
-                    {channelId === 0 && (
-                      <>
-                        <input
-                          ref={codexBatchAuthFileInputRef}
-                          hidden
-                          multiple
-                          type="file"
-                          accept=".json,application/json"
-                          onChange={(event) => handleCodexBatchAuthFilesImport(event, values)}
-                        />
-                        <Button
-                          variant="outlined"
-                          color="secondary"
-                          disabled={codexBatchAuthFileImporting}
-                          onClick={() => codexBatchAuthFileInputRef.current?.click()}
-                          startIcon={codexBatchAuthFileImporting ? null : <Icon icon="solar:folder-with-files-bold-duotone" />}
-                        >
-                          {codexBatchAuthFileImporting ? 'Importing auth files...' : 'Batch Import Auth Files'}
-                        </Button>
-                      </>
-                    )}
                   </Box>
                 )}
 
