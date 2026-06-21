@@ -243,6 +243,9 @@ func HandleErrorResp(resp *http.Response, toOpenAIError HttpErrorHandler, isPref
 				}
 
 				openAIErrorWithStatusCode.OpenAIError = *errorResponse
+				if providerErrorIsUsageExhausted(openAIErrorWithStatusCode.OpenAIError) {
+					openAIErrorWithStatusCode.StatusCode = http.StatusTooManyRequests
+				}
 				if isPrefix {
 					openAIErrorWithStatusCode.OpenAIError.Message = fmt.Sprintf("Provider API error: %s", openAIErrorWithStatusCode.OpenAIError.Message)
 				}
@@ -264,6 +267,18 @@ func HandleErrorResp(resp *http.Response, toOpenAIError HttpErrorHandler, isPref
 	}
 
 	return openAIErrorWithStatusCode
+}
+
+func providerErrorIsUsageExhausted(openAIError types.OpenAIError) bool {
+	for _, value := range []any{openAIError.Type, openAIError.Code} {
+		if text, ok := value.(string); ok {
+			switch strings.ToLower(strings.TrimSpace(text)) {
+			case "usage_limit_reached", "insufficient_quota":
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func SetEventStreamHeaders(c *gin.Context) {

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"one-api/common/logger"
 	"one-api/model"
@@ -24,6 +25,52 @@ func (codexErrReadCloser) Read([]byte) (int, error) {
 
 func (codexErrReadCloser) Close() error {
 	return nil
+}
+
+func TestCodexUsageLimitRetryAfter(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+
+	t.Run("prefers resets_at", func(t *testing.T) {
+		retryAfter := codexUsageLimitRetryAfter(http.StatusTooManyRequests, CodexErrorDetail{
+			Type:            "usage_limit_reached",
+			ResetsAt:        now.Add(5 * time.Minute).Unix(),
+			ResetsInSeconds: 1,
+		}, now)
+		if retryAfter == nil || *retryAfter != 5*time.Minute {
+			t.Fatalf("retryAfter = %v, want %v", retryAfter, 5*time.Minute)
+		}
+	})
+
+	t.Run("falls back to resets_in_seconds", func(t *testing.T) {
+		retryAfter := codexUsageLimitRetryAfter(http.StatusTooManyRequests, CodexErrorDetail{
+			Type:            "usage_limit_reached",
+			ResetsAt:        now.Add(-time.Minute).Unix(),
+			ResetsInSeconds: 77,
+		}, now)
+		if retryAfter == nil || *retryAfter != 77*time.Second {
+			t.Fatalf("retryAfter = %v, want %v", retryAfter, 77*time.Second)
+		}
+	})
+
+	t.Run("accepts usage limit before status normalization", func(t *testing.T) {
+		retryAfter := codexUsageLimitRetryAfter(http.StatusBadRequest, CodexErrorDetail{
+			Type:            "usage_limit_reached",
+			ResetsInSeconds: 120,
+		}, now)
+		if retryAfter == nil || *retryAfter != 120*time.Second {
+			t.Fatalf("retryAfter = %v, want %v", retryAfter, 120*time.Second)
+		}
+	})
+
+	t.Run("ignores transient rate limit", func(t *testing.T) {
+		retryAfter := codexUsageLimitRetryAfter(http.StatusTooManyRequests, CodexErrorDetail{
+			Type:            "rate_limit_error",
+			ResetsInSeconds: 77,
+		}, now)
+		if retryAfter != nil {
+			t.Fatalf("expected transient rate limit reset to be ignored, got %v", *retryAfter)
+		}
+	})
 }
 
 func TestCodexBaseHelperFunctionsAndHeaderFallbacks(t *testing.T) {

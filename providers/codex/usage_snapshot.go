@@ -288,10 +288,9 @@ func normalizeUsageSnapshot(channelID int, credentials *OAuth2Credentials, statu
 	}
 
 	snapshot.PlanType = firstNonEmptyString(payload.PlanType, payload.RateLimit.PlanType)
-	snapshot.Allowed = payload.RateLimit.Allowed
-	snapshot.LimitReached = payload.RateLimit.LimitReached
 	snapshot.Account = normalizeUsageAccount(&payload, credentials)
 	snapshot.Windows = normalizeUsageWindows(&payload)
+	snapshot.Allowed, snapshot.LimitReached = normalizeUsageLimitState(payload.RateLimit.Allowed, payload.RateLimit.LimitReached, snapshot.Windows)
 
 	return snapshot, nil
 }
@@ -332,7 +331,7 @@ func normalizeUsageWindows(payload *codexWhamUsageResponse) []CodexUsageWindow {
 	seenWindowKeys := make(map[string]bool, 2)
 	for _, candidate := range candidates {
 		window := candidate.window
-		switch classifyUsageWindow(window.WindowSeconds) {
+		switch classifyUsageWindow(candidate.source, window.WindowSeconds) {
 		case "five_hour":
 			if !seenWindowKeys["five_hour"] {
 				window.WindowKey = "five_hour"
@@ -422,18 +421,89 @@ func normalizeUsageMetrics(explicitUsedPercent, used, limit *float64) (*float64,
 	return nil, nil
 }
 
-func classifyUsageWindow(windowSeconds int64) string {
-	// We only label windows when upstream exposes the canonical duration.
-	// Trade-off: unknown durations render as custom/blank in the list instead of
-	// guessing and showing a wrong 5h/7d badge.
+func normalizeUsageLimitState(upstreamAllowed *bool, upstreamLimitReached *bool, windows []CodexUsageWindow) (*bool, *bool) {
+	limitReached := upstreamLimitReached
+	if limitReached == nil {
+		if inferredLimitReached, ok := inferLimitReachedFromUsageWindows(windows); ok {
+			limitReached = boolPtr(inferredLimitReached)
+		}
+	}
+
+	allowed := upstreamAllowed
+	if allowed == nil && limitReached != nil {
+		allowed = boolPtr(!*limitReached)
+	}
+	if limitReached == nil && allowed != nil {
+		limitReached = boolPtr(!*allowed)
+	}
+
+	return allowed, limitReached
+}
+
+func inferLimitReachedFromUsageWindows(windows []CodexUsageWindow) (bool, bool) {
+	if len(windows) == 0 {
+		return false, false
+	}
+
+	known := false
+	for _, window := range windows {
+		reached, ok := usageWindowLimitReached(window)
+		if !ok {
+			continue
+		}
+		known = true
+		if reached {
+			return true, true
+		}
+	}
+	if known {
+		return false, true
+	}
+	return false, false
+}
+
+func usageWindowLimitReached(window CodexUsageWindow) (bool, bool) {
+	if window.Limit != nil && *window.Limit > 0 {
+		if window.Used != nil {
+			return *window.Used >= *window.Limit, true
+		}
+		if window.Remaining != nil {
+			return *window.Remaining <= 0, true
+		}
+	}
+	if window.UsageRatio != nil {
+		return *window.UsageRatio >= 1, true
+	}
+	if window.UsedPercent != nil {
+		return *window.UsedPercent >= 100, true
+	}
+	return false, false
+}
+
+func boolPtr(value bool) *bool {
+	return &value
+}
+
+func classifyUsageWindow(source string, windowSeconds int64) string {
+	// Prefer explicit upstream duration. Some Codex payloads omit one duration
+	// when only the 5h or weekly limiter is active, so we fall back to the stable
+	// field role only when duration is absent. This avoids requiring a complete
+	// primary+secondary JSON shape while still not overriding explicit custom
+	// durations.
 	switch windowSeconds {
 	case fiveHourWindowSeconds:
 		return "five_hour"
 	case weeklyWindowSeconds:
 		return "weekly"
-	default:
-		return ""
+	case 0:
+		switch strings.ToLower(strings.TrimSpace(source)) {
+		case "primary":
+			return "five_hour"
+		case "secondary":
+			return "weekly"
+		}
 	}
+	return ""
 }
 
 func extractUsageErrorMessage(raw any, statusCode int) string {

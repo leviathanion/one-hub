@@ -26,6 +26,7 @@ type CodexErrorDetail struct {
 	Message         string `json:"message"`
 	Type            string `json:"type"`
 	Code            any    `json:"code,omitempty"`
+	ResetsAt        int64  `json:"resets_at,omitempty"`         // Absolute reset timestamp.
 	ResetsInSeconds int    `json:"resets_in_seconds,omitempty"` // 429 reset time (seconds).
 	ResetsIn        int    `json:"resets_in,omitempty"`         // Fallback field.
 }

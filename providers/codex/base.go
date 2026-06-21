@@ -279,7 +279,7 @@ func RequestErrorHandle(accessToken string) requester.HttpErrorHandler {
 			return nil
 		}
 
-		// Try Codex error payload (resets_in_seconds).
+		// Try Codex error payload (resets_at/resets_in_seconds).
 		var codexErrorResp CodexErrorResponse
 		if err := json.Unmarshal(bodyBytes, &codexErrorResp); err == nil && codexErrorResp.Error.Message != "" {
 			openAIError := &types.OpenAIError{
@@ -293,12 +293,11 @@ func RequestErrorHandle(accessToken string) requester.HttpErrorHandler {
 				openAIError.Message = strings.Replace(openAIError.Message, accessToken, "xxxxx", -1)
 			}
 
-			// Parse rate-limit reset time for 429.
-			if resp.StatusCode == http.StatusTooManyRequests && codexErrorResp.Error.ResetsInSeconds > 0 {
-				// Compute reset timestamp.
-				resetTimestamp := time.Now().Unix() + int64(codexErrorResp.Error.ResetsInSeconds)
-				logger.SysLog(fmt.Sprintf("[Codex] Rate limit detected, resets in %d seconds, reset at: %s",
-					codexErrorResp.Error.ResetsInSeconds, time.Unix(resetTimestamp, 0).Format(time.RFC3339)))
+			now := time.Now()
+			if retryAfter := codexUsageLimitRetryAfter(resp.StatusCode, codexErrorResp.Error, now); retryAfter != nil {
+				resetAt := now.Add(*retryAfter)
+				logger.SysLog(fmt.Sprintf("[Codex] Usage limit detected, resets in %d seconds, reset at: %s",
+					int(retryAfter.Seconds()), resetAt.Format(time.RFC3339)))
 			}
 
 			return openAIError
@@ -321,6 +320,28 @@ func RequestErrorHandle(accessToken string) requester.HttpErrorHandler {
 
 		return openAIError
 	}
+}
+
+func codexUsageLimitRetryAfter(statusCode int, detail CodexErrorDetail, now time.Time) *time.Duration {
+	if statusCode < http.StatusBadRequest || !strings.EqualFold(strings.TrimSpace(detail.Type), "usage_limit_reached") {
+		return nil
+	}
+	if detail.ResetsAt > 0 {
+		resetAt := time.Unix(detail.ResetsAt, 0)
+		if resetAt.After(now) {
+			retryAfter := resetAt.Sub(now)
+			return &retryAfter
+		}
+	}
+	if detail.ResetsInSeconds > 0 {
+		retryAfter := time.Duration(detail.ResetsInSeconds) * time.Second
+		return &retryAfter
+	}
+	if detail.ResetsIn > 0 {
+		retryAfter := time.Duration(detail.ResetsIn) * time.Second
+		return &retryAfter
+	}
+	return nil
 }
 
 func (p *CodexProvider) applyCommonRequestHeaders(headers *codexHeaderBag) {
