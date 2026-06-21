@@ -30,14 +30,14 @@ export const normalizeOpenAICompatibleOtherForRequest = (sourceValues, options =
       throw new Error('other must be a JSON object');
     }
 
-	    const compatible = {};
-	    for (const key of Object.keys(parsed)) {
-	      if (!OPENAI_COMPATIBLE_OTHER_FIELDS.has(key)) {
-	        // Used only by the model selector's temporary OpenAI-compatible fetch request.
-	        // It must not persist the stripped provider-specific fields back to the channel.
-	        if (options.dropUnsupportedFields) {
-	          continue;
-	        }
+    const compatible = {};
+    for (const key of Object.keys(parsed)) {
+      if (!OPENAI_COMPATIBLE_OTHER_FIELDS.has(key)) {
+        // Used only by the model selector's temporary OpenAI-compatible fetch request.
+        // It must not persist the stripped provider-specific fields back to the channel.
+        if (options.dropUnsupportedFields) {
+          continue;
+        }
         throw new Error(`other.${key} is not supported for OpenAI-compatible model fetch`);
       }
       compatible[key] = parsed[key];

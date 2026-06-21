@@ -105,15 +105,15 @@ const BatchAzureAPI = () => {
               {selected.length === data.length ? t('channel_index.unselectAll') : t('channel_index.selectAll')}
             </Button>
           </Grid>
-	          <Grid item xs={12}>
-	            {data.map((item) => (
-	              <FormControlLabel
-	                key={item.id}
-	                control={<Checkbox checked={selected.includes(item.id)} onChange={() => handleSelect(item.id)} />}
-	                label={item.name + '(' + azureBatchAPILabelOther(item.other) + ')'}
-	              />
-	            ))}
-	          </Grid>
+          <Grid item xs={12}>
+            {data.map((item) => (
+              <FormControlLabel
+                key={item.id}
+                control={<Checkbox checked={selected.includes(item.id)} onChange={() => handleSelect(item.id)} />}
+                label={item.name + '(' + azureBatchAPILabelOther(item.other) + ')'}
+              />
+            ))}
+          </Grid>
           <Grid item xs={12}>
             <TextField
               sx={{ ml: 1, flex: 1 }}

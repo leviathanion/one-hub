@@ -149,7 +149,12 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
     ],
     ['websocket_mode', 'auto', 'auto / force / off', t(`${codexConfigHelpKey}.fields.websocketMode`)],
     ['responses_ws_transport', 'native', 'native / http_bridge', t(`${codexConfigHelpKey}.fields.responsesWSTransport`)],
-    ['execution_session_ttl_seconds', '600', t(`${codexConfigHelpKey}.positiveIntegerSeconds`), t(`${codexConfigHelpKey}.fields.executionSessionTTL`)],
+    [
+      'execution_session_ttl_seconds',
+      '600',
+      t(`${codexConfigHelpKey}.positiveIntegerSeconds`),
+      t(`${codexConfigHelpKey}.fields.executionSessionTTL`)
+    ],
     [
       'websocket_retry_cooldown_seconds',
       '120',
@@ -388,10 +393,10 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
     if (values.base_url && values.base_url.endsWith('/')) {
       values.base_url = values.base_url.slice(0, values.base_url.length - 1);
     }
-	values = normalizeChannelOtherForRequest(values);
-	if (values.type === 18 && values.other === '') {
-	  values.other = '{"api_version":"v3.1"}';
-	}
+    values = normalizeChannelOtherForRequest(values);
+    if (values.type === 18 && values.other === '') {
+      values.other = '{"api_version":"v3.1"}';
+    }
 
     if (values.model_mapping) {
       try {
@@ -884,7 +889,9 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                                 <Typography component="code" variant="caption" sx={{ fontWeight: 700 }}>
                                   {field}
                                 </Typography>
-                                <Typography variant="caption">{t(`${codexConfigHelpKey}.defaultValue`, { value: defaultValue })}</Typography>
+                                <Typography variant="caption">
+                                  {t(`${codexConfigHelpKey}.defaultValue`, { value: defaultValue })}
+                                </Typography>
                                 <Typography variant="caption">
                                   {t(`${codexConfigHelpKey}.acceptedValue`, { accepted, description })}
                                 </Typography>
