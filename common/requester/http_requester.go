@@ -129,6 +129,10 @@ func (r *HTTPRequester) SendRequestRaw(req *http.Request) (*http.Response, *type
 
 // 获取流式响应
 func RequestStream[T streamable](requester *HTTPRequester, resp *http.Response, handlerPrefix HandlerPrefix[T]) (*streamReader[T], *types.OpenAIErrorWithStatusCode) {
+	return RequestStreamWithOptions(requester, resp, handlerPrefix, StreamReadOptions{})
+}
+
+func RequestStreamWithOptions[T streamable](requester *HTTPRequester, resp *http.Response, handlerPrefix HandlerPrefix[T], options StreamReadOptions) (*streamReader[T], *types.OpenAIErrorWithStatusCode) {
 	// 如果返回的头是json格式 说明有错误
 	// if strings.Contains(resp.Header.Get("Content-Type"), "application/json") {
 	// 	return nil, HandleErrorResp(resp, requester.ErrorHandler, requester.IsOpenAI)
@@ -139,17 +143,43 @@ func RequestStream[T streamable](requester *HTTPRequester, resp *http.Response, 
 		response:      resp,
 		handlerPrefix: handlerPrefix,
 		NoTrim:        false,
+		options:       options,
 
 		// Keep data unbuffered so terminal errors cannot overtake emitted chunks.
 		DataChan: make(chan T),
 		ErrChan:  make(chan error, 1),
+		done:     make(chan struct{}),
 	}
 
 	return stream, nil
 }
 
+func RequestStreamWithEmitterOptions[T streamable](requester *HTTPRequester, resp *http.Response, handlerPrefix HandlerPrefixWithEmitter[T], options StreamReadOptions) (*streamReader[T], *types.OpenAIErrorWithStatusCode) {
+	stream, errWithCode := RequestStreamWithOptions[T](requester, resp, nil, options)
+	if errWithCode != nil {
+		return nil, errWithCode
+	}
+	stream.handlerPrefixEmitter = handlerPrefix
+	return stream, nil
+}
+
 func RequestNoTrimStream[T streamable](requester *HTTPRequester, resp *http.Response, handlerPrefix HandlerPrefix[T]) (*streamReader[T], *types.OpenAIErrorWithStatusCode) {
-	stream, err := RequestStream(requester, resp, handlerPrefix)
+	return RequestNoTrimStreamWithOptions(requester, resp, handlerPrefix, StreamReadOptions{})
+}
+
+func RequestNoTrimStreamWithOptions[T streamable](requester *HTTPRequester, resp *http.Response, handlerPrefix HandlerPrefix[T], options StreamReadOptions) (*streamReader[T], *types.OpenAIErrorWithStatusCode) {
+	stream, err := RequestStreamWithOptions(requester, resp, handlerPrefix, options)
+	if err != nil {
+		return nil, err
+	}
+
+	stream.NoTrim = true
+
+	return stream, nil
+}
+
+func RequestNoTrimStreamWithEmitterOptions[T streamable](requester *HTTPRequester, resp *http.Response, handlerPrefix HandlerPrefixWithEmitter[T], options StreamReadOptions) (*streamReader[T], *types.OpenAIErrorWithStatusCode) {
+	stream, err := RequestStreamWithEmitterOptions(requester, resp, handlerPrefix, options)
 	if err != nil {
 		return nil, err
 	}

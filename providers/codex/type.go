@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -54,6 +55,14 @@ type TokenRefreshResponse struct {
 type TokenRefreshError struct {
 	Error            string `json:"error"`
 	ErrorDescription string `json:"error_description"`
+}
+
+const tokenRefreshErrorBodyLogLimit = 1024
+
+var tokenRefreshSecretFieldPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)("(?:access_token|refresh_token|client_id)"\s*:\s*")[^"]*(")`),
+	regexp.MustCompile(`(?i)('(?:access_token|refresh_token|client_id)'\s*:\s*')[^']*(')`),
+	regexp.MustCompile(`(?i)((?:access_token|refresh_token|client_id)=)[^&\s<>"']+`),
 }
 
 type oauth2CredentialsPayload struct {
@@ -171,16 +180,17 @@ func (c *OAuth2Credentials) Refresh(ctx context.Context, proxyURL string, maxRet
 
 		// Check response status.
 		if resp.StatusCode != http.StatusOK {
-			// Parse error response.
+			logTokenRefreshErrorBody(ctx, hasContext, resp.StatusCode, bodyBytes, c, clientID)
+
 			var errResp TokenRefreshError
-			if err := json.Unmarshal(bodyBytes, &errResp); err == nil {
+			if isTokenRefreshErrorJSON(bodyBytes, &errResp) {
 				// Abort on non-retryable errors.
 				if isNonRetryableError(errResp.Error) {
 					return fmt.Errorf("token refresh failed (non-retryable): %s - %s", errResp.Error, errResp.ErrorDescription)
 				}
 				lastErr = fmt.Errorf("token refresh failed: %s - %s", errResp.Error, errResp.ErrorDescription)
 			} else {
-				lastErr = fmt.Errorf("token refresh failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+				lastErr = fmt.Errorf("token refresh failed with status %d: non-json response", resp.StatusCode)
 			}
 			continue
 		}
@@ -225,6 +235,75 @@ func (c *OAuth2Credentials) Refresh(ctx context.Context, proxyURL string, maxRet
 	}
 
 	return fmt.Errorf("token refresh failed after %d retries: %w", maxRetries, lastErr)
+}
+
+func isTokenRefreshErrorJSON(bodyBytes []byte, errResp *TokenRefreshError) bool {
+	if errResp == nil {
+		return false
+	}
+	if err := json.Unmarshal(bodyBytes, errResp); err != nil {
+		return false
+	}
+	return strings.TrimSpace(errResp.Error) != "" || strings.TrimSpace(errResp.ErrorDescription) != ""
+}
+
+func logTokenRefreshErrorBody(ctx context.Context, hasContext bool, statusCode int, bodyBytes []byte, creds *OAuth2Credentials, clientID string) {
+	snippet := tokenRefreshErrorBodyLogSnippet(bodyBytes, creds, clientID)
+	message := fmt.Sprintf("[Codex] Token refresh endpoint returned status %d body=%q", statusCode, snippet)
+	if len(bodyBytes) > tokenRefreshErrorBodyLogLimit {
+		message += " truncated=true"
+	}
+	if hasContext {
+		logger.LogError(ctx, message)
+		return
+	}
+	logger.SysError(message)
+}
+
+func tokenRefreshErrorBodyLogSnippet(bodyBytes []byte, creds *OAuth2Credentials, clientID string) string {
+	if len(bodyBytes) > tokenRefreshErrorBodyLogLimit {
+		bodyBytes = bodyBytes[:tokenRefreshErrorBodyLogLimit]
+	}
+	text := strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, string(bodyBytes))
+	for _, secret := range tokenRefreshKnownSecrets(creds, clientID) {
+		text = strings.ReplaceAll(text, secret, "[redacted]")
+	}
+	for _, pattern := range tokenRefreshSecretFieldPatterns {
+		text = pattern.ReplaceAllString(text, "${1}[redacted]${2}")
+	}
+	if len(text) > tokenRefreshErrorBodyLogLimit {
+		text = text[:tokenRefreshErrorBodyLogLimit]
+	}
+	return text
+}
+
+func tokenRefreshKnownSecrets(creds *OAuth2Credentials, clientID string) []string {
+	accessToken := ""
+	refreshToken := ""
+	if creds != nil {
+		accessToken = creds.AccessToken
+		refreshToken = creds.RefreshToken
+	}
+
+	values := make([]string, 0, 3)
+	seen := map[string]struct{}{}
+	for _, value := range []string{clientID, accessToken, refreshToken} {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		values = append(values, value)
+	}
+	return values
 }
 
 func ensureContext(ctx context.Context) context.Context {

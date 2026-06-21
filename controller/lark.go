@@ -253,9 +253,15 @@ func LarkBind(c *gin.Context) {
 		})
 		return
 	}
-	session := sessions.Default(c)
-	id := session.Get("id")
-	user.Id = id.(int)
+	id, ok := currentSessionUserID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"success": false,
+			"message": "无权进行此操作，登录状态无效",
+		})
+		return
+	}
+	user.Id = id
 	err = user.FillUserById()
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{

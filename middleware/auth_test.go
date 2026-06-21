@@ -12,6 +12,8 @@ import (
 	"one-api/common/logger"
 	"one-api/model"
 
+	"github.com/gin-contrib/sessions"
+	"github.com/gin-contrib/sessions/cookie"
 	"github.com/gin-gonic/gin"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
@@ -129,6 +131,48 @@ func TestAuthWrappersRejectShortCredentials(t *testing.T) {
 	}
 	if got := mjCtx.GetString("mj_model"); got != "fast" {
 		t.Fatalf("expected Midjourney mode normalization before token auth, got %q", got)
+	}
+}
+
+func TestAuthHelperRejectsMalformedSessionValues(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name   string
+		id     any
+		status any
+		role   any
+	}{
+		{name: "invalid id", id: "bad-id", status: config.UserStatusEnabled, role: config.RoleCommonUser},
+		{name: "invalid status", id: 1, status: "enabled", role: config.RoleCommonUser},
+		{name: "invalid role", id: 1, status: config.UserStatusEnabled, role: "common"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			router := gin.New()
+			router.Use(sessions.Sessions("session", cookie.NewStore([]byte("auth-test-secret"))))
+			router.GET("/auth", func(c *gin.Context) {
+				session := sessions.Default(c)
+				session.Set("username", "session-user")
+				session.Set("id", tt.id)
+				session.Set("status", tt.status)
+				session.Set("role", tt.role)
+
+				authHelper(c, config.RoleCommonUser)
+			}, func(c *gin.Context) {
+				c.JSON(http.StatusOK, gin.H{"success": true})
+			})
+
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, "/auth", nil)
+
+			router.ServeHTTP(recorder, request)
+
+			if recorder.Code != http.StatusUnauthorized {
+				t.Fatalf("expected malformed session to be rejected with 401, got %d body=%s", recorder.Code, recorder.Body.String())
+			}
+		})
 	}
 }
 

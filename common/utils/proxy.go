@@ -44,7 +44,8 @@ func Socks5ProxyFunc(ctx context.Context, network, addr string) (net.Conn, error
 	}
 
 	proxyAddr, ok := ctx.Value(ProxySock5AddrKey).(string)
-	if !ok {
+	proxyAddr = strings.TrimSpace(proxyAddr)
+	if !ok || proxyAddr == "" {
 		return dialer.DialContext(ctx, network, addr)
 	}
 
@@ -58,7 +59,34 @@ func Socks5ProxyFunc(ctx context.Context, network, addr string) (net.Conn, error
 		return nil, fmt.Errorf("error creating proxy dialer: %w", err)
 	}
 
-	return proxyDialer.Dial(network, addr)
+	if contextDialer, ok := proxyDialer.(proxy.ContextDialer); ok {
+		return contextDialer.DialContext(ctx, network, addr)
+	}
+	return dialProxyWithContext(ctx, proxyDialer, network, addr)
+}
+
+func dialProxyWithContext(ctx context.Context, dialer proxy.Dialer, network, addr string) (net.Conn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	resultCh := make(chan dialResult, 1)
+	go func() {
+		conn, err := dialer.Dial(network, addr)
+		if conn != nil && ctx.Err() != nil {
+			_ = conn.Close()
+		}
+		resultCh <- dialResult{conn: conn, err: err}
+	}()
+	select {
+	case result := <-resultCh:
+		return result.conn, result.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func SetProxy(proxyAddr string, ctx context.Context) context.Context {
@@ -66,14 +94,22 @@ func SetProxy(proxyAddr string, ctx context.Context) context.Context {
 		ctx = context.Background()
 	}
 
+	proxyAddr = strings.TrimSpace(proxyAddr)
 	if proxyAddr == "" {
 		return ctx
+	}
+	proxyURL, err := url.Parse(proxyAddr)
+	if err == nil && proxyURL != nil {
+		proxyURL.Scheme = strings.ToLower(strings.TrimSpace(proxyURL.Scheme))
+		if proxyURL.Scheme != "" {
+			proxyAddr = proxyURL.String()
+		}
 	}
 
 	key := ProxyHTTPAddrKey
 
 	// 如果是以 socks5:// 开头的地址，那么使用 socks5 代理
-	if strings.HasPrefix(proxyAddr, "socks5") {
+	if proxyURL != nil && strings.HasPrefix(proxyURL.Scheme, "socks5") {
 		key = ProxySock5AddrKey
 	}
 

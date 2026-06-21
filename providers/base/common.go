@@ -1,16 +1,20 @@
 package base
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"one-api/common"
 	"one-api/common/config"
+	"one-api/common/logger"
 	"one-api/common/requester"
 	"one-api/common/utils"
 	"one-api/model"
 	"one-api/types"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -78,6 +82,63 @@ type BaseProvider struct {
 	SupportResponse bool
 }
 
+var (
+	channelConfigLogMu       sync.Mutex
+	channelConfigLogNext     = map[string]time.Time{}
+	channelConfigLogNow      = time.Now
+	channelConfigLogInterval = 5 * time.Minute
+)
+
+func LogChannelConfigParseError(ctx context.Context, provider string, channel *model.Channel, field string, err error) {
+	if err == nil {
+		return
+	}
+	logChannelConfigWarning(ctx, provider, channel, field, "parse_failed", common.RedactSensitiveText(err.Error()))
+}
+
+func LogChannelConfigWarning(ctx context.Context, provider string, channel *model.Channel, field string, message string) {
+	logChannelConfigWarning(ctx, provider, channel, field, "warning", common.RedactSensitiveText(message))
+}
+
+func logChannelConfigWarning(ctx context.Context, provider string, channel *model.Channel, field string, reason string, message string) {
+	provider = strings.TrimSpace(provider)
+	field = strings.TrimSpace(field)
+	if provider == "" {
+		provider = "unknown"
+	}
+	if field == "" {
+		field = "other"
+	}
+	channelID := 0
+	channelType := 0
+	if channel != nil {
+		channelID = channel.Id
+		channelType = channel.Type
+	}
+	key := fmt.Sprintf("%s|%d|%s", provider, channelID, field)
+	now := channelConfigLogNow()
+
+	channelConfigLogMu.Lock()
+	if next, ok := channelConfigLogNext[key]; ok && now.Before(next) {
+		channelConfigLogMu.Unlock()
+		return
+	}
+	channelConfigLogNext[key] = now.Add(channelConfigLogInterval)
+	channelConfigLogMu.Unlock()
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	logger.LogWarn(ctx, fmt.Sprintf("channel config %s: provider=%s channel_id=%d channel_type=%d field=%s err=%s", reason, provider, channelID, channelType, field, message))
+}
+
+func (p *BaseProvider) LogContext() context.Context {
+	if p != nil && p.Context != nil && p.Context.Request != nil {
+		return p.Context.Request.Context()
+	}
+	return context.Background()
+}
+
 // 获取基础URL
 func (p *BaseProvider) GetBaseURL() string {
 	if p.Channel.GetBaseURL() != "" {
@@ -108,9 +169,55 @@ func (p *BaseProvider) CommonRequestHeaders(headers map[string]string) {
 	customHeaders, err := p.Channel.GetModelHeadersMap()
 	if err == nil {
 		for key, value := range customHeaders {
+			// model_headers 不允许覆盖凭证/路由头、hop-by-hop 头和 WebSocket
+			// handshake 协议头。业务头(Content-Type/Accept)不在保护范围，渠道
+			// 可以合法覆盖。
+			if reason, blocked := ProtectedModelHeaderReason(key); blocked {
+				LogChannelConfigWarning(p.LogContext(), "base", p.Channel, "model_headers", fmt.Sprintf("ignored_protected_key reason=%s", reason))
+				continue
+			}
 			headers[key] = value
 		}
 	}
+}
+
+type ModelHeaderProtectionReason string
+
+const (
+	ModelHeaderProtectionCredentialRouting ModelHeaderProtectionReason = "credential_or_routing"
+	ModelHeaderProtectionHopByHop          ModelHeaderProtectionReason = "hop_by_hop"
+	ModelHeaderProtectionWebSocket         ModelHeaderProtectionReason = "websocket_handshake"
+)
+
+// protectedModelHeaders 是渠道 model_headers 不允许覆盖的请求头集合(小写比较)。
+// 这些头属于凭证/路由、RFC 7230 hop-by-hop 或 WebSocket handshake 协议面；
+// Content-Type/Accept 等业务头不在保护范围，渠道可以合法覆盖。
+var protectedModelHeaders = map[string]ModelHeaderProtectionReason{
+	"authorization":       ModelHeaderProtectionCredentialRouting,
+	"api-key":             ModelHeaderProtectionCredentialRouting,
+	"host":                ModelHeaderProtectionCredentialRouting,
+	"x-api-key":           ModelHeaderProtectionCredentialRouting,
+	"x-goog-api-key":      ModelHeaderProtectionCredentialRouting,
+	"connection":          ModelHeaderProtectionHopByHop,
+	"keep-alive":          ModelHeaderProtectionHopByHop,
+	"proxy-authenticate":  ModelHeaderProtectionHopByHop,
+	"proxy-authorization": ModelHeaderProtectionHopByHop,
+	"te":                  ModelHeaderProtectionHopByHop,
+	"trailer":             ModelHeaderProtectionHopByHop,
+	"transfer-encoding":   ModelHeaderProtectionHopByHop,
+	"upgrade":             ModelHeaderProtectionHopByHop,
+}
+
+// ProtectedModelHeaderReason 报告某个 header 是否禁止被渠道 model_headers 覆盖。
+func ProtectedModelHeaderReason(key string) (ModelHeaderProtectionReason, bool) {
+	normalized := strings.ToLower(strings.TrimSpace(key))
+	if reason, blocked := protectedModelHeaders[normalized]; blocked {
+		return reason, true
+	}
+	if strings.HasPrefix(normalized, "sec-websocket-") {
+		return ModelHeaderProtectionWebSocket, true
+	}
+	return "", false
 }
 
 func (p *BaseProvider) GetUsage() *types.Usage {

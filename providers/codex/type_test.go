@@ -149,6 +149,74 @@ func TestOAuth2CredentialsRefreshDoesNotSetUserAgentOrOriginator(t *testing.T) {
 	}
 }
 
+func TestOAuth2CredentialsRefreshRedactsNonJSONErrorResponse(t *testing.T) {
+	withTokenEndpointTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`<html>upstream refresh failed access-secret refresh-secret client-secret</html>`))
+	}))
+
+	creds := &OAuth2Credentials{
+		AccessToken:  "access-secret",
+		RefreshToken: "refresh-secret",
+		ClientID:     "client-secret",
+	}
+	err := creds.Refresh(context.Background(), "", 0)
+	if err == nil {
+		t.Fatal("expected refresh failure")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "token refresh failed with status 502: non-json response") {
+		t.Fatalf("expected safe non-json response error, got %q", msg)
+	}
+	for _, forbidden := range []string{"<html>", "upstream refresh failed", "access-secret", "refresh-secret", "client-secret"} {
+		if strings.Contains(msg, forbidden) {
+			t.Fatalf("expected refresh error to omit %q, got %q", forbidden, msg)
+		}
+	}
+}
+
+func TestOAuth2CredentialsRefreshPreservesJSONOAuthErrorDetail(t *testing.T) {
+	withTokenEndpointTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"invalid_grant","error_description":"refresh token expired"}`))
+	}))
+
+	creds := &OAuth2Credentials{RefreshToken: "refresh-token"}
+	err := creds.Refresh(context.Background(), "", 0)
+	if err == nil {
+		t.Fatal("expected refresh failure")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "invalid_grant") || !strings.Contains(msg, "refresh token expired") {
+		t.Fatalf("expected OAuth error detail to remain in internal error, got %q", msg)
+	}
+}
+
+func TestTokenRefreshErrorBodyLogSnippetSanitizesBody(t *testing.T) {
+	body := []byte("line\x00\naccess_token=access-secret&refresh_token=refresh-secret&client_id=client-secret " + strings.Repeat("x", tokenRefreshErrorBodyLogLimit+32))
+	snippet := tokenRefreshErrorBodyLogSnippet(body, &OAuth2Credentials{
+		AccessToken:  "access-secret",
+		RefreshToken: "refresh-secret",
+		ClientID:     "client-secret",
+	}, "client-secret")
+	if len(snippet) > tokenRefreshErrorBodyLogLimit {
+		t.Fatalf("expected log snippet to be capped at %d bytes, got %d", tokenRefreshErrorBodyLogLimit, len(snippet))
+	}
+	for _, forbidden := range []string{"\x00", "\n", "access-secret", "refresh-secret", "client-secret"} {
+		if strings.Contains(snippet, forbidden) {
+			t.Fatalf("expected log snippet to omit %q, got %q", forbidden, snippet)
+		}
+	}
+	for _, r := range snippet {
+		if r < 0x20 || r == 0x7f {
+			t.Fatalf("expected log snippet to omit control character %q in %q", r, snippet)
+		}
+	}
+	if strings.Count(snippet, "[redacted]") < 3 {
+		t.Fatalf("expected known token fields to be redacted, got %q", snippet)
+	}
+}
+
 func withTokenEndpointTLSServer(t *testing.T, handler http.Handler) {
 	t.Helper()
 

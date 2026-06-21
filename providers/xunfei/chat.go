@@ -263,21 +263,54 @@ func (h *xunfeiHandler) convertToChatOpenai(stream requester.StreamReaderInterfa
 	dataChan, errChan := stream.Recv()
 	defer stream.Close()
 
+	appendResponse := func(response XunfeiChatResponse) {
+		if len(response.Payload.Choices.Text) == 0 {
+			return
+		}
+		xunfeiResponse = response
+		content += xunfeiResponse.Payload.Choices.Text[0].Content
+	}
+	drainBufferedData := func() {
+		for dataChan != nil {
+			select {
+			case response, ok := <-dataChan:
+				if !ok {
+					dataChan = nil
+					return
+				}
+				appendResponse(response)
+			default:
+				return
+			}
+		}
+	}
+
 	stop := false
 	for !stop {
 		select {
-		case response := <-dataChan:
-			if len(response.Payload.Choices.Text) == 0 {
+		case response, ok := <-dataChan:
+			if !ok {
+				dataChan = nil
+				if errChan == nil {
+					stop = true
+				}
 				continue
 			}
-			xunfeiResponse = response
-			content += xunfeiResponse.Payload.Choices.Text[0].Content
-		case err := <-errChan:
+			appendResponse(response)
+		case err, ok := <-errChan:
+			if !ok {
+				errChan = nil
+				if dataChan == nil {
+					stop = true
+				}
+				continue
+			}
 			if err != nil && !errors.Is(err, io.EOF) {
 				return nil, common.ErrorWrapper(err, "xunfei_failed", http.StatusInternalServerError)
 			}
 
 			if errors.Is(err, io.EOF) {
+				drainBufferedData()
 				stop = true
 			}
 		}

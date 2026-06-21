@@ -337,6 +337,11 @@ func (p *CodexProvider) applyCommonRequestHeaders(headers *codexHeaderBag) {
 		customHeaders, err := p.Channel.GetModelHeadersMap()
 		if err == nil {
 			for key, value := range customHeaders {
+				// 与 base.CommonRequestHeaders 一致：model_headers 不允许覆盖凭证/
+				// 路由头、hop-by-hop 头和 WebSocket handshake 协议头。
+				if _, blocked := base.ProtectedModelHeaderReason(key); blocked {
+					continue
+				}
 				headers.Set(key, value)
 			}
 		}
@@ -429,12 +434,13 @@ func (p *CodexProvider) GetRequestHeaders() map[string]string {
 	return fallback.Map()
 }
 
-func (p *CodexProvider) handleTokenError(err error) *types.OpenAIErrorWithStatusCode {
-	errMsg := err.Error()
-
+func (p *CodexProvider) handleTokenError(_ error) *types.OpenAIErrorWithStatusCode {
+	// Keep the client-facing token error static. Refresh failures may contain
+	// provider response bodies or credential fragments; detailed diagnostics stay
+	// on the server-side logging path.
 	return &types.OpenAIErrorWithStatusCode{
 		OpenAIError: types.OpenAIError{
-			Message: errMsg,
+			Message: "Codex token refresh failed; please check channel OAuth credentials",
 			Type:    "codex_token_error",
 			Code:    "codex_token_error",
 		},

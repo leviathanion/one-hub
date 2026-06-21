@@ -50,7 +50,34 @@ func authHelper(c *gin.Context, minRole int) {
 			return
 		}
 	}
-	if status.(int) == config.UserStatusDisabled {
+	idInt, ok := id.(int)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"success": false,
+			"message": "无权进行此操作，登录状态无效",
+		})
+		c.Abort()
+		return
+	}
+	statusInt, ok := status.(int)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"success": false,
+			"message": "无权进行此操作，登录状态无效",
+		})
+		c.Abort()
+		return
+	}
+	roleInt, ok := role.(int)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"success": false,
+			"message": "无权进行此操作，登录状态无效",
+		})
+		c.Abort()
+		return
+	}
+	if statusInt == config.UserStatusDisabled {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": "用户已被封禁",
@@ -58,7 +85,7 @@ func authHelper(c *gin.Context, minRole int) {
 		c.Abort()
 		return
 	}
-	if role.(int) < minRole {
+	if roleInt < minRole {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": "无权进行此操作，权限不足",
@@ -67,8 +94,8 @@ func authHelper(c *gin.Context, minRole int) {
 		return
 	}
 	c.Set("username", username)
-	c.Set("role", role)
-	c.Set("id", id)
+	c.Set("role", roleInt)
+	c.Set("id", idInt)
 	c.Next()
 }
 

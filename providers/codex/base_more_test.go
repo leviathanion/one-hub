@@ -11,6 +11,7 @@ import (
 	"one-api/model"
 	"one-api/providers/base"
 	"one-api/providers/openai"
+	"one-api/types"
 
 	"go.uber.org/zap"
 )
@@ -116,9 +117,64 @@ func TestCodexBaseHelperFunctionsAndHeaderFallbacks(t *testing.T) {
 		t.Fatalf("expected replaceHeader to normalize header map entries, got %+v", fallbackHeaders)
 	}
 
-	if errWithCode := provider.handleTokenError(errors.New("token expired")); errWithCode == nil || errWithCode.StatusCode != http.StatusUnauthorized || errWithCode.Code != "codex_token_error" {
+	if errWithCode := provider.handleTokenError(errors.New("token expired")); errWithCode == nil || errWithCode.StatusCode != http.StatusUnauthorized || errWithCode.Code != "codex_token_error" || errWithCode.Message != safeCodexTokenClientMessage {
 		t.Fatalf("expected handleTokenError to wrap unauthorized token failures, got %+v", errWithCode)
 	}
+}
+
+const safeCodexTokenClientMessage = "Codex token refresh failed; please check channel OAuth credentials"
+
+func assertSafeCodexTokenClientError(t *testing.T, errWithCode *types.OpenAIErrorWithStatusCode) {
+	t.Helper()
+	if errWithCode == nil {
+		t.Fatal("expected codex token error")
+	}
+	if errWithCode.StatusCode != http.StatusUnauthorized || errWithCode.Code != "codex_token_error" || errWithCode.Type != "codex_token_error" {
+		t.Fatalf("expected codex token error envelope, got %+v", errWithCode)
+	}
+	if errWithCode.Message != safeCodexTokenClientMessage {
+		t.Fatalf("expected safe codex token message %q, got %q", safeCodexTokenClientMessage, errWithCode.Message)
+	}
+	for _, leaked := range []string{"token expired", "refresh-secret", "access-secret"} {
+		if strings.Contains(errWithCode.Message, leaked) {
+			t.Fatalf("expected codex token client message not to leak %q, got %q", leaked, errWithCode.Message)
+		}
+	}
+}
+
+func TestCodexTokenErrorSurfaceUsesSafeClientMessageAcrossEntrypoints(t *testing.T) {
+	t.Run("responses", func(t *testing.T) {
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-secret","account_id":"acct-123"}`, "", nil)
+		provider.Credentials = nil
+
+		req, errWithCode := provider.getResponsesRequest(&types.OpenAIResponsesRequest{Model: "gpt-5"})
+		if req != nil {
+			t.Fatalf("expected responses request build to fail on token error, got %#v", req)
+		}
+		assertSafeCodexTokenClientError(t, errWithCode)
+	})
+
+	t.Run("responses websocket bridge", func(t *testing.T) {
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-secret","account_id":"acct-123"}`, "", nil)
+		provider.Credentials = nil
+
+		req, errWithCode := provider.getResponsesWSBridgeRequest(&types.OpenAIResponsesRequest{Model: "gpt-5", Stream: true})
+		if req != nil {
+			t.Fatalf("expected bridge request build to fail on token error, got %#v", req)
+		}
+		assertSafeCodexTokenClientError(t, errWithCode)
+	})
+
+	t.Run("realtime", func(t *testing.T) {
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-secret","account_id":"acct-123"}`, "", nil)
+		provider.Credentials = nil
+
+		plan, errWithCode := provider.prepareChatRealtimeConn("gpt-5", "session-123")
+		if plan != nil {
+			t.Fatalf("expected realtime plan preparation to fail on token error, got %#v", plan)
+		}
+		assertSafeCodexTokenClientError(t, errWithCode)
+	})
 }
 
 func TestCodexRequestErrorHandleParsesAndScrubsResponses(t *testing.T) {
@@ -209,5 +265,31 @@ func TestCodexBaseAdditionalOptionAndHeaderBranches(t *testing.T) {
 	errorProvider.Credentials = nil
 	if headers, err := errorProvider.getRequestHeadersInternal(); err == nil || headers != nil {
 		t.Fatalf("expected internal request header builder to surface token failures, headers=%+v err=%v", headers, err)
+	}
+}
+
+func TestCodexApplyCommonRequestHeadersFiltersProtectedModelHeaders(t *testing.T) {
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", nil)
+	provider.Channel.ModelHeaders = stringPtr(`{"Authorization":"Bearer channel-evil","api-key":"evil-api-key","X-API-Key":"evil-x-api-key","x-goog-api-key":"evil-google","Connection":"keep-alive","Sec-WebSocket-Protocol":"evil","X-From-Channel":"1"}`)
+
+	headers := newCodexHeaderBag()
+	provider.applyCommonRequestHeaders(headers)
+
+	if got := headers.Get("Authorization"); got != "" {
+		t.Fatalf("expected model_headers Authorization to be filtered, got %q", got)
+	}
+	for _, header := range []string{"api-key", "X-API-Key", "x-goog-api-key"} {
+		if got := headers.Get(header); got != "" {
+			t.Fatalf("expected model_headers %s to be filtered, got %q", header, got)
+		}
+	}
+	if got := headers.Get("Connection"); got != "" {
+		t.Fatalf("expected hop-by-hop Connection to be filtered, got %q", got)
+	}
+	if got := headers.Get("Sec-WebSocket-Protocol"); got != "" {
+		t.Fatalf("expected websocket handshake header to be filtered, got %q", got)
+	}
+	if got := headers.Get("X-From-Channel"); got != "1" {
+		t.Fatalf("expected normal model header to merge, got %q", got)
 	}
 }
