@@ -108,6 +108,15 @@ func responsesWSSettlementZeroChargeProof(in ResponsesWSSettlementProjectionInpu
 			responsesWSTransportSendStatus(in.TransportResult) != responsesws.ResponsesWSTransportSendRejectedBeforeStream {
 			return ResponsesWSZeroChargeProof{}
 		}
+	case ResponsesWSZeroChargeProofProviderRejectedBeforeAccept:
+		// Provider request-level rejection is a typed attempt event, not generic
+		// provider activity. It may have arrived as a native WS frame that is
+		// intentionally kept out of the settlement projection. Accept this proof
+		// only when it was constructed by the request-level rejection normalizer;
+		// independent acceptance/usage evidence still suppresses it later.
+		if !request.providerRejectedBeforeAcceptEvidence {
+			return ResponsesWSZeroChargeProof{}
+		}
 	case ResponsesWSZeroChargeProofTransportNotAttempted:
 		status := responsesWSTransportSendStatus(in.TransportResult)
 		if status != "" && status != responsesws.ResponsesWSTransportSendNotAttempted {

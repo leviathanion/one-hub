@@ -123,6 +123,14 @@ func responsesWSZeroChargeProof(kind ResponsesWSZeroChargeProofKind, reason stri
 	return ResponsesWSZeroChargeProof{Kind: kind, Reason: reason}
 }
 
+func responsesWSProviderRejectedBeforeAcceptProof(reason string) ResponsesWSZeroChargeProof {
+	return ResponsesWSZeroChargeProof{
+		Kind:                                 ResponsesWSZeroChargeProofProviderRejectedBeforeAccept,
+		Reason:                               reason,
+		providerRejectedBeforeAcceptEvidence: true,
+	}
+}
+
 func responsesWSTransportSendStatusLabel(result responsesws.ResponsesWSTransportSendResult) string {
 	if result.Status != "" {
 		if err := responsesws.ValidateResponsesWSTransportSendResult(result); err != nil {

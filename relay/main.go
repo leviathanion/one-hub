@@ -100,7 +100,7 @@ func executeRelayAttempts(relay RelayBaseInterface) *types.OpenAIErrorWithStatus
 	go processChannelRelayErrorFunc(c.Request.Context(), channel.Id, channel.Name, apiErr, channel.Type)
 
 	retryTimes := config.RetryTimes
-	if done || !shouldRetryFunc(c, apiErr, channel.Type) || shouldSkipRetryAfterAffinityFailure(c) {
+	if done || !relayAttemptShouldRetry(relay, apiErr, channel.Type) || relayShouldSkipRetryAfterAffinityFailure(relay) {
 		logger.LogError(c.Request.Context(), fmt.Sprintf("relay error happen, status code is %d, won't retry in this case", apiErr.StatusCode))
 		retryTimes = 0
 	}
@@ -136,12 +136,28 @@ func executeRelayAttempts(relay RelayBaseInterface) *types.OpenAIErrorWithStatus
 			return handledErr
 		}
 		go processChannelRelayErrorFunc(c.Request.Context(), channel.Id, channel.Name, apiErr, channel.Type)
-		if done || !shouldRetryFunc(c, apiErr, channel.Type) || shouldSkipRetryAfterAffinityFailure(c) {
+		if done || !relayAttemptShouldRetry(relay, apiErr, channel.Type) || relayShouldSkipRetryAfterAffinityFailure(relay) {
 			break
 		}
 	}
 
 	return apiErr
+}
+
+func relayAttemptShouldRetry(relay RelayBaseInterface, apiErr *types.OpenAIErrorWithStatusCode, channelType int) bool {
+	responsesRelay, ok := relay.(*relayResponses)
+	if ok && responsesRelay.operation == responsesOperationCreate {
+		metrics.RecordProvider(responsesRelay.getContext(), apiErr.StatusCode)
+		return responsesHTTPAttemptShouldRetry(responsesRelay, apiErr, channelType)
+	}
+	return shouldRetryFunc(relay.getContext(), apiErr, channelType)
+}
+
+func relayShouldSkipRetryAfterAffinityFailure(relay RelayBaseInterface) bool {
+	if responsesRelay, ok := relay.(*relayResponses); ok && responsesRelay.operation == responsesOperationCreate {
+		return false
+	}
+	return shouldSkipRetryAfterAffinityFailure(relay.getContext())
 }
 
 func handleResponsesContinuationMiss(relay RelayBaseInterface, apiErr *types.OpenAIErrorWithStatusCode) (*types.OpenAIErrorWithStatusCode, bool) {

@@ -1060,10 +1060,11 @@ type ResponsesWSSessionActor struct {
 	lease    responsesWSLeaseState
 	upstream responsesWSUpstreamState
 
-	turns    responsesWSTurnSlots
-	workers  responsesWSWorkerState
-	closing  responsesWSCloseState
-	watchdog responsesWSWatchdogState
+	turns         responsesWSTurnSlots
+	workers       responsesWSWorkerState
+	closing       responsesWSCloseState
+	watchdog      responsesWSWatchdogState
+	downstreamSeq uint64
 
 	state               responsesWSSessionState
 	reliablePostTimeout time.Duration
@@ -1946,6 +1947,9 @@ func (a *ResponsesWSSessionActor) handleBridgeOpenProviderError(event ResponsesW
 			attempt = a.turns.active.attempt
 			activeProviderRejection = attempt != nil
 		}
+		if a.tryExecuteBridgeOpenProviderReplay(event, attempt, continuationMiss, activeProviderRejection || !event.Recoverable) {
+			return
+		}
 		if !attempt.RolledBack && !attempt.QuotaFinalized {
 			if a.turns.pending.attempt != nil {
 				input := a.buildPendingSettlementInput("bridge_open_provider_error", responsesWSZeroChargeProof(ResponsesWSZeroChargeProofProviderRejectedBeforeStream, "bridge_open_provider_error"))
@@ -2746,29 +2750,53 @@ func (a *ResponsesWSSessionActor) handleSendResult(event ResponsesWSEventSendRes
 	case responsesws.ResponsesWSTransportSendNotAttempted:
 		hadProviderEvidence := a.hasPendingProviderEvidence()
 		continuationMiss := isProviderReportedContinuationMiss(sendErr)
-		input := a.buildPendingSettlementInput("send_not_sent", responsesWSZeroChargeProof(ResponsesWSZeroChargeProofTransportNotAttempted, "send_not_sent"))
-		decision, _, err := a.applyPendingSettlement(input)
-		if err != nil {
-			code := "quota_rollback_failed"
-			if hadProviderEvidence {
-				code = "quota_settlement_failed"
-			}
-			a.writeProxyLocal(responsesWSErrorPayload(http.StatusInternalServerError, code, responsesWSStaticErrorMessage(code)))
-			a.close(code)
-			return
+		payload := responsesWSErrorFromErr(sendErr)
+		if len(payload) == 0 {
+			payload = responsesWSErrorPayload(http.StatusBadGateway, "ws_request_failed", responsesWSStaticErrorMessage("ws_request_failed"))
 		}
-		if hadProviderEvidence || responsesWSSettlementHasFlag(decision, ResponsesWSSettlementFlagContradictoryInput) {
-			a.observeSettlementConflict("not_sent_with_provider_evidence", decision)
+		apiErr := responsesReplayLocalError("request was not sent to upstream", "ws_request_failed", http.StatusBadGateway)
+		if sendErr != nil {
+			apiErr = common.StringErrorWrapperLocal(sendErr.Error(), "ws_request_failed", http.StatusBadGateway)
 		}
-		if !hadProviderEvidence && continuationMiss {
-			a.applyContinuationMissSideEffects(attempt.Candidate, attempt.SelectedChannelID, attempt.AttemptedPreviousResponseID)
-		}
+		replayCommand := DecideResponsesAttemptReplay(a.responsesAttemptSnapshot(
+			attempt,
+			ResponsesAttemptUpstreamNotAttempted,
+			apiErr,
+			ResponsesAttemptFailureOriginTransportNotAttempted,
+			true,
+		))
 		if pendingCreateCancel {
+			input := a.buildPendingSettlementInput("send_not_sent", responsesWSZeroChargeProof(ResponsesWSZeroChargeProofTransportNotAttempted, "send_not_sent"))
+			decision, _, err := a.applyPendingSettlement(input)
+			if err != nil {
+				code := "quota_rollback_failed"
+				if hadProviderEvidence {
+					code = "quota_settlement_failed"
+				}
+				a.writeProxyLocal(responsesWSErrorPayload(http.StatusInternalServerError, code, responsesWSStaticErrorMessage(code)))
+				a.close(code)
+				return
+			}
+			if hadProviderEvidence || responsesWSSettlementHasFlag(decision, ResponsesWSSettlementFlagContradictoryInput) {
+				a.observeSettlementConflict("not_sent_with_provider_evidence", decision)
+			}
+			missTarget := a.continuationMissTargetForAttempt(attempt, continuationMiss && !hadProviderEvidence)
+			a.applyContinuationMissTargetAfterSettlement(attempt, missTarget)
 			a.clearPendingTurn("send_not_sent")
 			a.state = responsesWSStateIdle
 			return
 		}
 		if hadProviderEvidence {
+			input := a.buildPendingSettlementInput("send_not_sent", responsesWSZeroChargeProof(ResponsesWSZeroChargeProofTransportNotAttempted, "send_not_sent"))
+			decision, _, err := a.applyPendingSettlement(input)
+			if err != nil {
+				a.writeProxyLocal(responsesWSErrorPayload(http.StatusInternalServerError, "quota_settlement_failed", responsesWSStaticErrorMessage("quota_settlement_failed")))
+				a.close("quota_settlement_failed")
+				return
+			}
+			if hadProviderEvidence || responsesWSSettlementHasFlag(decision, ResponsesWSSettlementFlagContradictoryInput) {
+				a.observeSettlementConflict("not_sent_with_provider_evidence", decision)
+			}
 			a.clearPendingTurn("send_not_sent")
 			a.state = responsesWSStateIdle
 			if sendErr != nil {
@@ -2787,7 +2815,16 @@ func (a *ResponsesWSSessionActor) handleSendResult(event ResponsesWSEventSendRes
 			}
 			return
 		}
-		if a.retryFirstTurnAfterNotSent(attempt) {
+		missTarget := a.continuationMissTargetForAttempt(attempt, continuationMiss)
+		if a.executeResponsesAttemptReplayCommandWithContinuationMiss(
+			attempt,
+			replayCommand,
+			payload,
+			apiErr,
+			ResponsesAttemptFailureOriginTransportNotAttempted,
+			false,
+			missTarget,
+		) {
 			return
 		}
 		a.clearPendingTurn("send_not_sent")
@@ -2821,18 +2858,22 @@ func (a *ResponsesWSSessionActor) handleSendResult(event ResponsesWSEventSendRes
 			a.scheduleBridgeProviderRejectionWaitTimeout(event.AttemptID)
 			return
 		}
-		input := a.buildPendingSettlementInput("provider_rejected_before_stream_cleanup", responsesWSZeroChargeProof(ResponsesWSZeroChargeProofProviderRejectedBeforeStream, "provider_rejected_before_stream_cleanup"))
+		bridgeEvent := *a.turns.pending.provider.bridgeOpenProviderErr
+		if a.tryExecuteBridgeOpenProviderReplay(bridgeEvent, attempt, responsesWSBridgeOpenProviderContinuationMiss(bridgeEvent), !bridgeEvent.Recoverable) {
+			return
+		}
+		input := a.buildPendingSettlementInput("provider_rejected_before_stream_conflict", ResponsesWSZeroChargeProof{})
 		decision, _, err := a.applyPendingSettlement(input)
 		if err != nil {
-			a.writeProxyLocal(responsesWSErrorPayload(http.StatusInternalServerError, "quota_rollback_failed", responsesWSStaticErrorMessage("quota_rollback_failed")))
-			a.close("quota_rollback_failed")
+			a.writeProxyLocal(responsesWSErrorPayload(http.StatusInternalServerError, "quota_settlement_failed", responsesWSStaticErrorMessage("quota_settlement_failed")))
+			a.close("quota_settlement_failed")
 			return
 		}
 		if responsesWSSettlementHasFlag(decision, ResponsesWSSettlementFlagContradictoryInput) {
 			a.observeSettlementConflict(string(ResponsesWSSettlementFlagContradictoryInput), decision)
 		}
 		a.applyPendingBridgeOpenProviderErrorSideEffects(attempt)
-		a.clearPendingTurn("provider_rejected_before_stream_cleanup")
+		a.clearPendingTurn("provider_rejected_before_stream_conflict")
 		a.state = responsesWSStateIdle
 	case responsesws.ResponsesWSTransportSendAmbiguous:
 		hadProviderEvidence := a.hasPendingProviderEvidence()
@@ -3071,46 +3112,11 @@ func responsesWSPayloadResponseID(payload []byte) string {
 	return ""
 }
 
-func (a *ResponsesWSSessionActor) retryFirstTurnAfterNotSent(previous *ResponsesWSTurnAttempt) bool {
-	if a == nil || previous == nil || previous.OpeningID == "" || a.turns.pending.phase == responsesWSPendingTurnNone || a.turns.opening.firstFrame == nil || previous.Admission == nil {
-		return false
-	}
-	if previous.Candidate != nil && previous.Candidate.ExplicitPinID > 0 {
-		return false
-	}
-	ctx := a.Context()
-	if currentChannelAffinityStrict(ctx) {
-		return false
-	}
-
-	failedChannelID := previous.SelectedChannelID
-	if failedChannelID > 0 {
-		(&relayBase{c: ctx}).skipChannelID(failedChannelID)
-		a.RefreshContext(ctx)
-	}
-	if a.upstream.session != nil && a.io.bridge != nil {
-		a.io.bridge.AbortSession(a.upstream.session, "send_not_sent_retry")
-	}
-	a.upstream.session = nil
-	a.upstream.sessionGeneration = ""
-	a.upstream.channelID = 0
-	a.upstream.recvArmed = false
-	a.clearPendingProviderState("send_not_sent_retry")
-	a.turns.opening.admission = previous.Admission
-	a.mutateSnapshot(clearResponsesWSSelectedChannelSnapshot)
-
-	if a.isClientGone() {
-		a.close("client_closed_before_first_turn_retry")
-		return true
-	}
-	a.turns.pending.phase = responsesWSPendingTurnOpening
-	a.state = responsesWSStateOpening
-	a.startFirstTurnOpenWorker(a.turns.opening.openingID, a.turns.opening.firstFrame)
-	return true
-}
-
 func (a *ResponsesWSSessionActor) commitPendingAttempt(attempt *ResponsesWSTurnAttempt) {
 	a.clearPendingSendCancel(attempt.AttemptID)
+	if a.tryReplayPendingProviderRejectionBeforeCommit(attempt) {
+		return
+	}
 	_, replay, err := a.turns.CommitPendingToActive(attempt.SelectedChannelID)
 	if err != nil {
 		a.logErrorf("responses websocket pending commit transition failed: %v", err)
@@ -3182,6 +3188,9 @@ func (a *ResponsesWSSessionActor) handleProviderDownstreamWithObservation(event 
 			event.Kind, payloadPolicy.PayloadOrigin, frameKind, event.Err.Error()))
 	}
 	payload := responsesWSProviderDownstreamPayload(event)
+	if a.tryHandleProviderRejectedBeforeAccept(event, payloadPolicy) {
+		return
+	}
 	if payloadPolicy.PayloadOrigin == responsesws.PayloadOriginProvider {
 		responseID := responsesWSProviderDownstreamResponseID(event)
 		attempt := a.turns.pending.attempt
@@ -3250,23 +3259,28 @@ func (a *ResponsesWSSessionActor) handleProviderDownstreamWithObservation(event 
 		if event.Kind == ProviderDownstreamFrame && len(payload) > 0 {
 			a.turns.pending.attempt.MarkFirstProviderResponse(receivedAt)
 		}
+		if accounting.Diagnostic.DetailOrigin == responsesws.RecvDetailOriginBridgeStreamOpened {
+			a.turns.pending.attempt.MarkProviderAccepted("bridge_stream_opened", "")
+		}
 		a.observeAndBufferPendingProviderEvent(event, accounting.UpstreamEvent)
 		return
 	}
 	if event.Kind == ProviderDownstreamClose {
-		if a.turns.active.attempt != nil {
-			a.turns.active.attempt.MarkCompleted(receivedAt)
+		attempt := a.turns.active.attempt
+		if attempt != nil {
+			attempt.MarkCompleted(receivedAt)
 		}
 		if err := a.finalizeActiveAttempt(); err != nil {
 			a.handleActiveSettlementFailure(err)
 			return
 		}
 		a.clearActiveTurn()
-		a.markDownstreamCloseSent()
+		a.markDownstreamCloseCommitted(attempt, "provider_downstream_close")
 		if err := a.io.bridge.WriteClientFrame(responsesWSCloseMessageType, responsesWSProviderClosePayload(event.CloseCode, event.CloseReason), ResponsesWSWriteProvider); err != nil {
 			a.close("client_write_failed")
 			return
 		}
+		a.markDownstreamCloseSent()
 		a.close("provider_closed")
 		return
 	}
@@ -3280,11 +3294,14 @@ func (a *ResponsesWSSessionActor) handleProviderDownstreamWithObservation(event 
 	if event.Kind == ProviderDownstreamFrame && len(payload) > 0 {
 		a.turns.active.attempt.MarkFirstProviderResponse(receivedAt)
 	}
+	if accounting.Diagnostic.DetailOrigin == responsesws.RecvDetailOriginBridgeStreamOpened {
+		a.turns.active.attempt.MarkProviderAccepted("bridge_stream_opened", "")
+	}
 	if event.Frame != nil && event.Frame.Kind() == responsesws.FrameKindBinary {
 		if event.Usage != nil {
 			mergeResponsesWSUsageEvent(a.turns.active.attempt.Usage, event.Usage)
 		}
-		if err := a.io.bridge.WriteClientTypedFrame(responsesws.NewBinaryFrame(payload), ResponsesWSWriteProvider); err != nil {
+		if err := a.emitProviderFrameForAttempt(a.turns.active.attempt, responsesws.NewBinaryFrame(payload), "provider_binary_frame"); err != nil {
 			a.close("client_write_failed")
 		}
 		return
@@ -3308,10 +3325,11 @@ func (a *ResponsesWSSessionActor) handleProviderDownstreamWithObservation(event 
 	isTerminal := payloadPolicy.CanCarryTerminal && (classified.Kind == responsesws.ResponsesSuccessTerminal ||
 		classified.Kind == responsesws.ResponsesFailedTerminal ||
 		classified.Kind == responsesws.ResponsesCancelledTerminal)
+	writeAttempt := a.turns.active.attempt
 	if isTerminal {
 		a.logProviderTerminal(classified, receivedAt)
-		a.turns.active.attempt.MarkCompleted(receivedAt)
-		a.turns.active.attempt.MarkProviderTerminalEvidence(classified)
+		writeAttempt.MarkCompleted(receivedAt)
+		writeAttempt.MarkProviderTerminalEvidence(classified)
 		if err := a.finalizeActiveAttempt(); err != nil {
 			a.handleActiveSettlementFailure(err)
 			return
@@ -3319,7 +3337,7 @@ func (a *ResponsesWSSessionActor) handleProviderDownstreamWithObservation(event 
 		a.processProviderPayloadAPIError(payload, event.ChannelID, "responses_ws_provider_frame")
 		a.applyActiveTerminalSideEffects(classified)
 	}
-	if err := a.io.bridge.WriteClientTypedFrame(responsesws.NewTextFrame(payload), ResponsesWSWriteProvider); err != nil {
+	if err := a.emitProviderFrameForAttempt(writeAttempt, responsesws.NewTextFrame(payload), "provider_text_frame"); err != nil {
 		a.close("client_write_failed")
 		return
 	}
@@ -3370,6 +3388,7 @@ func (a *ResponsesWSSessionActor) handleProviderUsageObserved(event ResponsesWSE
 		if !a.appendPendingProviderLifecycle(accounting.UpstreamEvent) {
 			return
 		}
+		a.turns.pending.attempt.MarkProviderAccepted("provider_usage", responseID)
 		if !dropUnpricedUsage {
 			mergeResponsesWSUsageEvent(a.turns.pending.attempt.Usage, event.Usage)
 		}
@@ -3377,6 +3396,7 @@ func (a *ResponsesWSSessionActor) handleProviderUsageObserved(event ResponsesWSE
 	}
 	if a.turns.active.attempt != nil {
 		a.updateActiveProviderEvidence(accounting.UpstreamEvent)
+		a.turns.active.attempt.MarkProviderAccepted("provider_usage", responseID)
 		if !dropUnpricedUsage {
 			mergeResponsesWSUsageEvent(a.turns.active.attempt.Usage, event.Usage)
 		}
@@ -3591,17 +3611,19 @@ func (a *ResponsesWSSessionActor) handleProviderClosed(event ResponsesWSEventPro
 		}, upstreamEvent)
 		return
 	}
-	if a.turns.active.attempt != nil {
+	attempt := a.turns.active.attempt
+	if attempt != nil {
 		a.updateActiveProviderEvidence(upstreamEvent)
-		a.turns.active.attempt.MarkCompleted(receivedAt)
+		attempt.MarkCompleted(receivedAt)
 	}
 	if err := a.finalizeActiveAttempt(); err != nil {
 		a.handleActiveSettlementFailure(err)
 		return
 	}
 	a.clearActiveTurn()
-	a.markDownstreamCloseSent()
+	a.markDownstreamCloseCommitted(attempt, "provider_closed")
 	if a.closeProviderDownstream(event) {
+		a.markDownstreamCloseSent()
 		a.close("provider_closed")
 		return
 	}
@@ -3610,6 +3632,7 @@ func (a *ResponsesWSSessionActor) handleProviderClosed(event ResponsesWSEventPro
 			a.close("client_write_failed")
 			return
 		}
+		a.markDownstreamCloseSent()
 	}
 	a.close("provider_closed")
 }
@@ -3705,6 +3728,9 @@ func (a *ResponsesWSSessionActor) providerPayloadChannel(channelID int) *model.C
 	if channelID <= 0 {
 		return nil
 	}
+	if model.DB == nil {
+		return nil
+	}
 	channel, err := fetchChannelById(channelID)
 	if err != nil {
 		return nil
@@ -3717,12 +3743,13 @@ func (a *ResponsesWSSessionActor) handleMalformedProviderFrame(classified respon
 		return
 	}
 	payload := responsesWSProviderProtocolErrorPayload(classified.MalformedError)
+	attempt := a.turns.active.attempt
 	if err := a.finalizeActiveAttempt(); err != nil {
 		a.handleActiveSettlementFailure(err)
 		return
 	}
 	a.clearActiveTurn()
-	if err := a.io.bridge.WriteClientFrame(responsesWSTextMessageType, payload, ResponsesWSWriteProvider); err != nil {
+	if err := a.emitProviderFrameForAttempt(attempt, responsesws.NewTextFrame(payload), "malformed_provider_frame"); err != nil {
 		a.close("client_write_failed")
 		return
 	}
@@ -4028,9 +4055,67 @@ func (a *ResponsesWSSessionActor) writeProxyLocal(payload []byte) {
 	if a == nil || a.io.bridge == nil || len(payload) == 0 {
 		return
 	}
-	if err := a.io.bridge.WriteClientFrame(responsesWSTextMessageType, payload, ResponsesWSWriteProxyLocal); err != nil {
+	if err := a.io.bridge.WriteClientTypedFrame(responsesws.NewTextFrame(payload), ResponsesWSWriteProxyLocal); err != nil {
 		a.markClientClosed(err)
 		a.requestCloseIntent("client_write_failed")
+	}
+}
+
+func (a *ResponsesWSSessionActor) writeProxyLocalForAttempt(attempt *ResponsesWSTurnAttempt, payload []byte, reason string) {
+	if a == nil || len(payload) == 0 {
+		return
+	}
+	if err := a.emitProxyLocalForAttempt(attempt, payload, reason); err != nil {
+		a.markClientClosed(err)
+		a.requestCloseIntent("client_write_failed")
+	}
+}
+
+func (a *ResponsesWSSessionActor) currentTurnAttempt() *ResponsesWSTurnAttempt {
+	if a == nil {
+		return nil
+	}
+	if a.turns.active.attempt != nil {
+		return a.turns.active.attempt
+	}
+	return a.turns.pending.attempt
+}
+
+func (a *ResponsesWSSessionActor) nextDownstreamSeq() uint64 {
+	if a == nil {
+		return 0
+	}
+	a.downstreamSeq++
+	return a.downstreamSeq
+}
+
+func (a *ResponsesWSSessionActor) emitDownstream(attempt *ResponsesWSTurnAttempt, kind ResponsesDownstreamCommitKind, frame responsesws.Frame, mode ResponsesWSWriteMode, reason string) error {
+	if a == nil || a.io.bridge == nil {
+		return nil
+	}
+	if attempt != nil && !attempt.DownstreamCommitted {
+		attempt.MarkDownstreamCommitted(kind, reason, a.nextDownstreamSeq())
+	}
+	return a.io.bridge.WriteClientTypedFrame(frame, mode)
+}
+
+func (a *ResponsesWSSessionActor) emitProxyLocalForAttempt(attempt *ResponsesWSTurnAttempt, payload []byte, reason string) error {
+	if a == nil || a.io.bridge == nil || len(payload) == 0 {
+		return nil
+	}
+	return a.emitDownstream(attempt, DownstreamCommitProxyError, responsesws.NewTextFrame(payload), ResponsesWSWriteProxyLocal, reason)
+}
+
+func (a *ResponsesWSSessionActor) emitProviderFrameForAttempt(attempt *ResponsesWSTurnAttempt, frame responsesws.Frame, reason string) error {
+	if a == nil || a.io.bridge == nil || frame.IsZero() {
+		return nil
+	}
+	return a.emitDownstream(attempt, DownstreamCommitProviderFrame, frame, ResponsesWSWriteProvider, reason)
+}
+
+func (a *ResponsesWSSessionActor) markDownstreamCloseCommitted(attempt *ResponsesWSTurnAttempt, reason string) {
+	if attempt != nil && !attempt.DownstreamCommitted {
+		attempt.MarkDownstreamCommitted(DownstreamCommitClosePayload, reason, a.nextDownstreamSeq())
 	}
 }
 
@@ -4276,6 +4361,9 @@ func (a *ResponsesWSSessionActor) applyBufferedPendingTerminalEvidence() (*respo
 		if payloadPolicy.PayloadOrigin != responsesws.PayloadOriginProvider || !payloadPolicy.CanCarryTerminal || len(payload) == 0 {
 			continue
 		}
+		if _, ok := responsesWSProviderRequestRejectionFromPayload(payload); ok {
+			continue
+		}
 		if event.Frame != nil && event.Frame.Kind() == responsesws.FrameKindBinary {
 			continue
 		}
@@ -4498,6 +4586,9 @@ func (a *ResponsesWSSessionActor) pendingAttemptRollbackProofOnClose(reason stri
 	}
 	if a.pendingBridgeOpenProviderErrorRecorded() {
 		return responsesWSZeroChargeProof(ResponsesWSZeroChargeProofProviderRejectedBeforeStream, reason), true
+	}
+	if _, _, ok := a.pendingReplayableProviderRejection(); ok {
+		return responsesWSProviderRejectedBeforeAcceptProof(reason), true
 	}
 	switch responsesWSTransportSendStatus(a.turns.pending.attempt.TransportResult) {
 	case responsesws.ResponsesWSTransportSendRejectedBeforeStream:

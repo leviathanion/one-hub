@@ -124,8 +124,8 @@ type responsesWSProviderJournalAppendResult struct {
 	OverLimit bool
 }
 
-func (j *responsesWSProviderJournal) appendEntry(entry responsesWSProviderJournalEntry, replayBytes int, maxBytes int, enforceBytes bool) responsesWSProviderJournalAppendResult {
-	if j == nil || entry.Observation.IsZero() {
+func (j *responsesWSProviderJournal) appendEntry(entry responsesWSProviderJournalEntry, replayBytes int, maxBytes int, enforceBytes bool, allowReplayOnly bool) responsesWSProviderJournalAppendResult {
+	if j == nil || (entry.Observation.IsZero() && (!allowReplayOnly || (entry.Downstream == nil && entry.Failure == nil))) {
 		return responsesWSProviderJournalAppendResult{}
 	}
 	overLimit := len(j.entries) >= responsesWSPendingProviderEventsMax
@@ -133,9 +133,9 @@ func (j *responsesWSProviderJournal) appendEntry(entry responsesWSProviderJourna
 		overLimit = true
 	}
 	if overLimit {
-		// Keep the triggering observation in the journal before failing closed so
-		// settlement projection cannot accidentally turn a provider activity into
-		// a rollback. The replay payload is intentionally dropped on overflow.
+		// Keep the triggering observation, when one exists, before failing closed
+		// so settlement projection cannot accidentally turn provider activity into
+		// a rollback. Replay payload is intentionally dropped on overflow.
 		entry.Downstream = nil
 		entry.Failure = nil
 	} else if entry.Downstream != nil {
@@ -153,7 +153,7 @@ func (j *responsesWSProviderJournal) AppendDownstream(event ResponsesWSEventProv
 	eventBytes := len(responsesWSProviderDownstreamPayload(event))
 	copied := event
 	entry.Downstream = &copied
-	result := j.appendEntry(entry, eventBytes, maxBytes, true)
+	result := j.appendEntry(entry, eventBytes, maxBytes, true, false)
 	return result.Buffered, result.OverLimit
 }
 
@@ -165,7 +165,7 @@ func (j *responsesWSProviderJournal) AppendFailure(event ResponsesWSEventProvide
 	result := j.appendEntry(responsesWSProviderJournalEntry{
 		Observation: responsesws.NewProviderObservation(upstream),
 		Failure:     &copied,
-	}, 0, 0, false)
+	}, 0, 0, false, false)
 	return result.OverLimit
 }
 
@@ -179,6 +179,17 @@ func (j *responsesWSProviderJournal) AppendDownstreamReplay(event ResponsesWSEve
 		Downstream:  &copied,
 	})
 	j.bytes += len(responsesWSProviderDownstreamPayload(event))
+}
+
+func (j *responsesWSProviderJournal) AppendReplayableRequestRejection(event ResponsesWSEventProviderDownstream, maxBytes int) (bool, bool) {
+	if j == nil {
+		return false, false
+	}
+	copied := event
+	result := j.appendEntry(responsesWSProviderJournalEntry{
+		Downstream: &copied,
+	}, len(responsesWSProviderDownstreamPayload(event)), maxBytes, true, true)
+	return result.Buffered, result.OverLimit
 }
 
 func (j *responsesWSProviderJournal) AppendFailureReplay(event ResponsesWSEventProviderRecvFailed) {
@@ -207,7 +218,7 @@ func (j *responsesWSProviderJournal) AppendObservation(obs responsesws.ProviderO
 	if j == nil || obs.IsZero() {
 		return false
 	}
-	result := j.appendEntry(responsesWSProviderJournalEntry{Observation: obs}, 0, 0, false)
+	result := j.appendEntry(responsesWSProviderJournalEntry{Observation: obs}, 0, 0, false, false)
 	return result.OverLimit
 }
 

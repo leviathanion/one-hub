@@ -38,7 +38,7 @@ type codexUsagePreviewItem struct {
 
 type codexUsageProvider interface {
 	GetUsagePreview(ctx context.Context, forceRefresh bool) (*codex.CodexUsagePreview, error)
-	GetUsageSnapshot(ctx context.Context, forceRefresh bool) (*codex.CodexUsageSnapshot, error)
+	GetUsageSnapshot(ctx context.Context, forceRefresh bool, includeRaw ...bool) (*codex.CodexUsageSnapshot, error)
 }
 
 type codexUsagePreviewTarget struct {
@@ -73,10 +73,11 @@ func GetCodexChannelUsage(c *gin.Context) {
 	}
 
 	refreshRequested := parseRefreshQuery(c.Query("refresh"))
+	includeRaw := parseRefreshQuery(c.Query("debug_raw"))
 	ctx, cancel := context.WithTimeout(c.Request.Context(), codexUsageDetailFetchTimeout)
 	defer cancel()
 
-	snapshot, err := provider.GetUsageSnapshot(ctx, refreshRequested)
+	snapshot, err := provider.GetUsageSnapshot(ctx, refreshRequested, includeRaw)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,

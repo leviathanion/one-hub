@@ -21,11 +21,14 @@ const (
 	ResponsesWSZeroChargeProofClientClosedBeforeSend
 	ResponsesWSZeroChargeProofTransportNotAttempted
 	ResponsesWSZeroChargeProofProviderRejectedBeforeStream
+	ResponsesWSZeroChargeProofProviderRejectedBeforeAccept
 )
 
 type ResponsesWSZeroChargeProof struct {
 	Kind   ResponsesWSZeroChargeProofKind
 	Reason string
+
+	providerRejectedBeforeAcceptEvidence bool
 }
 
 func (p ResponsesWSZeroChargeProof) Present() bool {

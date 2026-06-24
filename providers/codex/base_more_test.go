@@ -52,6 +52,16 @@ func TestCodexUsageLimitRetryAfter(t *testing.T) {
 		}
 	})
 
+	t.Run("falls back to resets_in", func(t *testing.T) {
+		retryAfter := codexUsageLimitRetryAfter(http.StatusTooManyRequests, CodexErrorDetail{
+			Type:     "usage_limit_reached",
+			ResetsIn: 91,
+		}, now)
+		if retryAfter == nil || *retryAfter != 91*time.Second {
+			t.Fatalf("retryAfter = %v, want %v", retryAfter, 91*time.Second)
+		}
+	})
+
 	t.Run("accepts usage limit before status normalization", func(t *testing.T) {
 		retryAfter := codexUsageLimitRetryAfter(http.StatusBadRequest, CodexErrorDetail{
 			Type:            "usage_limit_reached",

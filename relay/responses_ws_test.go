@@ -48,6 +48,7 @@ type responsesWSReadResult struct {
 type responsesWSFakeUserConn struct {
 	reads           chan responsesWSReadResult
 	writeErr        error
+	closeWriteErr   error
 	writeCount      int32
 	closeCount      int32
 	controlCount    int32
@@ -70,6 +71,9 @@ func (c *responsesWSFakeUserConn) ReadMessage() (int, []byte, error) {
 
 func (c *responsesWSFakeUserConn) WriteFrame(messageType int, payload []byte, _ ResponsesWSWriteMode) error {
 	if messageType == responsesWSCloseMessageType {
+		if c.closeWriteErr != nil {
+			return c.closeWriteErr
+		}
 		code, reason := parseResponsesWSClosePayload(payload)
 		c.CloseWithCode(code, reason)
 		return nil
@@ -1965,6 +1969,7 @@ func TestResponsesWSFirstTurnRetryOpenDoesNotBlockActorLoop(t *testing.T) {
 		Session:           actor.upstream.session,
 		snapshot:          NewResponsesWSRequestSnapshot(ctx),
 	}
+	actor.turns.pending.phase = responsesWSPendingTurnSend
 	actor.state = responsesWSStatePendingSend
 	startResponsesWSTestActor(t, actor)
 
@@ -1991,6 +1996,864 @@ func TestResponsesWSFirstTurnRetryOpenDoesNotBlockActorLoop(t *testing.T) {
 	case <-actor.Done():
 	case <-time.After(time.Second):
 		t.Fatal("expected actor to process client close while retry open worker is blocked")
+	}
+}
+
+func setupResponsesWSReplayableFirstTurnAttempt(t *testing.T) (*ResponsesWSSessionActor, *ResponsesWSTurnAttempt, *responsesWSFakeUserConn, string) {
+	t.Helper()
+	ctx := setupResponsesWSQuotaFixture(t, 1000)
+	configureResponsesWSTokenPricingFloor(t, 100)
+	ctx.Set("responses_ws_selected_channel", &model.Channel{Id: 17, Type: config.ChannelTypeOpenAI, PreCost: config.PreContNotAll})
+	frame, err := responsesws.ParseRawResponsesCreateFrame([]byte(`{"type":"response.create","model":"gpt-5","input":[]}`))
+	if err != nil {
+		t.Fatalf("parse first frame: %v", err)
+	}
+	actor := NewResponsesWSSessionActor(ctx)
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	openingID := actor.ReserveFirstTurnOpening(frame)
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	attempt, apiErr := PrepareResponsesWSTurnAttempt(ResponsesWSTurnAttemptInput{
+		Context:           ctx,
+		Snapshot:          actor.snapshotClone(),
+		OpeningID:         openingID,
+		Admission:         actor.turns.opening.admission,
+		Candidate:         &ResponsesTurnAffinity{},
+		SelectedChannelID: 17,
+		Session:           actor.upstream.session,
+		BillingModel:      "gpt-5",
+		PromptModel:       "gpt-5",
+		Request:           &frame.Projection,
+	})
+	if apiErr != nil {
+		t.Fatalf("prepare attempt: %v", apiErr)
+	}
+	if apiErr := attempt.PreConsumeQuota(); apiErr != nil {
+		t.Fatalf("preconsume attempt: %v", apiErr)
+	}
+	attempt.AttemptID = "attempt-replay-" + strings.ReplaceAll(t.Name(), "/", "_")
+	t.Cleanup(func() {
+		actor.close("test_cleanup")
+	})
+	return actor, attempt, conn, generation
+}
+
+func setupResponsesWSTestResponseIDAffinity(t *testing.T, ctx *gin.Context, responseID string, ownerChannelID int) (*ResponsesTurnAffinity, string) {
+	t.Helper()
+	settings := config.ChannelAffinitySettings{
+		Enabled:           true,
+		DefaultTTLSeconds: 60,
+		Rules: []config.ChannelAffinityRule{
+			{
+				Name:            "responses-response-id",
+				Enabled:         true,
+				Kind:            "responses",
+				IncludeModel:    true,
+				IncludeRuleName: true,
+				RecordOnSuccess: true,
+				KeySources: []config.ChannelAffinityKeySource{
+					{Source: "request_field", Key: "previous_response_id", Alias: config.ChannelAffinityAliasResponseID},
+				},
+			},
+		},
+	}
+	settings.Normalize()
+	manager := withChannelAffinitySettings(t, settings)
+	request := &types.OpenAIResponsesRequest{Model: "gpt-5", PreviousResponseID: responseID}
+	candidate, err := PrepareResponsesTurnAffinity(ResponsesAffinityInput{Context: ctx, Request: request})
+	if err != nil {
+		t.Fatalf("prepare affinity: %v", err)
+	}
+	template := newChannelAffinityTemplate(ctx, channelAffinityKindResponses, "gpt-5", settings.Rules[0], "request_field", config.ChannelAffinityAliasResponseID, settings.DefaultTTLSeconds)
+	key := template.BuildKey(responseID)
+	manager.SetRecord(key, runtimeaffinity.Record{
+		ChannelID:         ownerChannelID,
+		ResumeFingerprint: "model:gpt-5",
+	}, time.Minute)
+	return candidate, key
+}
+
+func installResponsesWSReplayOpenProbe(t *testing.T) (chan struct{}, *int32) {
+	t.Helper()
+	started := make(chan struct{})
+	var calls int32
+	originalOpen := openAndPrimeResponsesWSSessionForActor
+	openAndPrimeResponsesWSSessionForActor = func(ctx context.Context, _ *gin.Context, _ *types.OpenAIResponsesRequest) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
+		atomic.AddInt32(&calls, 1)
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		<-ctx.Done()
+		return nil, common.StringErrorWrapperLocal("retry probe stops before adoption", "ws_request_failed", http.StatusBadGateway)
+	}
+	t.Cleanup(func() {
+		openAndPrimeResponsesWSSessionForActor = originalOpen
+	})
+	return started, &calls
+}
+
+func TestResponsesWSProviderRequestRejectionFromPayloadBoundaries(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload []byte
+		want    bool
+	}{
+		{name: "empty payload", payload: nil},
+		{name: "invalid json", payload: []byte(`{"type":"error"`)},
+		{name: "non error type", payload: []byte(`{"type":"response.failed","error":{"message":"nope"}}`)},
+		{name: "response id blocks request rejection", payload: []byte(`{"type":"error","response_id":"resp_1","error":{"message":"nope"}}`)},
+		{name: "response object blocks request rejection", payload: []byte(`{"type":"error","response":{"id":"resp_1"},"error":{"message":"nope"}}`)},
+		{name: "null response request rejection", payload: []byte(`{"type":"error","response":null,"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"slow down"}}`), want: true},
+		{name: "top level request rejection", payload: []byte(`{"type":"error","status":429,"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"slow down"}}`), want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			apiErr, got := responsesWSProviderRequestRejectionFromPayload(tt.payload)
+			if got != tt.want {
+				t.Fatalf("ok=%v, want %v apiErr=%+v", got, tt.want, apiErr)
+			}
+			if got && apiErr == nil {
+				t.Fatal("expected api error for accepted request-level rejection")
+			}
+		})
+	}
+}
+
+func TestResponsesWSNativeRequestErrorBeforeAcceptRollsBackAndRetriesFirstTurn(t *testing.T) {
+	actor, attempt, conn, generation := setupResponsesWSReplayableFirstTurnAttempt(t)
+	actor.turns.active.attempt = attempt
+	actor.turns.pending = responsesWSPendingTurn{}
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+	started, calls := installResponsesWSReplayOpenProbe(t)
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame: responsesWSTestProviderTextFrame([]byte(
+			`{"type":"error","status":429,"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"slow down"}}`,
+		)),
+		DetailOrigin: responsesws.RecvDetailOriginProviderFrame,
+		ReceivedAt:   time.Now(),
+	})
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("expected first-turn replay to start a new open worker")
+	}
+	if got := atomic.LoadInt32(calls); got != 1 {
+		t.Fatalf("expected one retry open call, got %d", got)
+	}
+	if !attempt.RolledBack || attempt.QuotaPreconsumed || attempt.QuotaFinalized {
+		t.Fatalf("expected request-level provider error to rollback before retry, attempt=%+v", attempt)
+	}
+	if attempt.DownstreamCommitted {
+		t.Fatalf("expected retry path not to surface downstream payload, attempt=%+v", attempt)
+	}
+	if got, _ := conn.lastWrite.Load().(string); got != "" {
+		t.Fatalf("expected no downstream write before retry, got %q", got)
+	}
+	if actor.turns.active.attempt != nil || actor.turns.pending.phase != responsesWSPendingTurnOpening || actor.state != responsesWSStateOpening {
+		t.Fatalf("expected actor to return to opening for replay, active=%+v phase=%v state=%v", actor.turns.active.attempt, actor.turns.pending.phase, actor.state)
+	}
+	skipIDs, _ := actor.Context().Get("skip_channel_ids")
+	if !intSliceContains(skipIDs.([]int), 17) {
+		t.Fatalf("expected failed channel to be skipped, got %#v", skipIDs)
+	}
+}
+
+func TestResponsesWSAttemptScopedProxyLocalCommitsExplicitAttempt(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	attempt := &ResponsesWSTurnAttempt{AttemptID: "attempt-explicit-proxy-local"}
+	payload := responsesWSErrorPayload(http.StatusBadGateway, "attempt_local_error", "attempt local error")
+
+	actor.writeProxyLocalForAttempt(attempt, payload, "attempt_local_error")
+
+	if !attempt.DownstreamCommitted {
+		t.Fatalf("expected explicit attempt proxy-local write to commit downstream, attempt=%+v", attempt)
+	}
+	if attempt.DownstreamCommitKind != DownstreamCommitProxyError ||
+		attempt.DownstreamCommitReason != "attempt_local_error" ||
+		attempt.DownstreamCommitSeq == 0 {
+		t.Fatalf("unexpected downstream commit metadata: attempt=%+v", attempt)
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "attempt_local_error") {
+		t.Fatalf("expected attempt proxy-local payload to be written, got %q", got)
+	}
+}
+
+func TestResponsesWSSessionBusyDoesNotCommitActiveAttemptBeforeProviderReplay(t *testing.T) {
+	actor, attempt, conn, generation := setupResponsesWSReplayableFirstTurnAttempt(t)
+	actor.turns.active.attempt = attempt
+	actor.turns.pending = responsesWSPendingTurn{}
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.handleClientFrame(responsesWSTestClientTextFrame([]byte(`{"type":"response.create"}`)))
+
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "session_busy") {
+		t.Fatalf("expected session_busy payload, got %q", got)
+	}
+	if attempt.DownstreamCommitted {
+		t.Fatalf("session-level busy error must not commit current attempt, attempt=%+v", attempt)
+	}
+	busyWrites := atomic.LoadInt32(&conn.writeCount)
+	started, calls := installResponsesWSReplayOpenProbe(t)
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame: responsesWSTestProviderTextFrame([]byte(
+			`{"type":"error","status":429,"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"slow down"}}`,
+		)),
+		DetailOrigin: responsesws.RecvDetailOriginProviderFrame,
+		ReceivedAt:   time.Now(),
+	})
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("expected session-local busy error not to block provider rejection replay")
+	}
+	if got := atomic.LoadInt32(calls); got != 1 {
+		t.Fatalf("expected one retry open call, got %d", got)
+	}
+	if !attempt.RolledBack || attempt.QuotaPreconsumed || attempt.QuotaFinalized || attempt.DownstreamCommitted {
+		t.Fatalf("expected provider request rejection to rollback and retry after session_busy, attempt=%+v", attempt)
+	}
+	if got := atomic.LoadInt32(&conn.writeCount); got != busyWrites {
+		t.Fatalf("expected replay to avoid surfacing provider rejection, writes=%d busy_writes=%d", got, busyWrites)
+	}
+}
+
+func TestResponsesWSInvalidEventDoesNotCommitActiveAttempt(t *testing.T) {
+	actor, attempt, conn, _ := setupResponsesWSReplayableFirstTurnAttempt(t)
+	actor.turns.active.attempt = attempt
+	actor.turns.pending = responsesWSPendingTurn{}
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.handleClientFrame(ResponsesWSEventClientFrame{Frame: responsesws.NewBinaryFrame([]byte{1, 2, 3})})
+
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "invalid_event") {
+		t.Fatalf("expected invalid_event payload, got %q", got)
+	}
+	if attempt.DownstreamCommitted {
+		t.Fatalf("session-level invalid_event must not commit current attempt, attempt=%+v", attempt)
+	}
+}
+
+func TestResponsesWSPendingRequestErrorBeforeAcceptReplaysAfterSendResult(t *testing.T) {
+	actor, attempt, conn, generation := setupResponsesWSReplayableFirstTurnAttempt(t)
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+	started, calls := installResponsesWSReplayOpenProbe(t)
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame: responsesWSTestProviderTextFrame([]byte(
+			`{"type":"error","status":429,"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"slow down"}}`,
+		)),
+		DetailOrigin: responsesws.RecvDetailOriginProviderFrame,
+		ReceivedAt:   time.Now(),
+	})
+	if actor.hasPendingProviderEvidence() {
+		t.Fatalf("request-level rejection must not contaminate provider activity evidence: %+v", actor.turns.pending.provider.journal.Project())
+	}
+	if got, _ := conn.lastWrite.Load().(string); got != "" {
+		t.Fatalf("expected pending provider rejection not to be written before send result, got %q", got)
+	}
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendAttempted,
+		},
+	})
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("expected pending request-level rejection to start replay after send result")
+	}
+	if got := atomic.LoadInt32(calls); got != 1 {
+		t.Fatalf("expected one retry open call, got %d", got)
+	}
+	if !attempt.RolledBack || attempt.QuotaFinalized || attempt.DownstreamCommitted {
+		t.Fatalf("expected pending request-level rejection to rollback without downstream commit, attempt=%+v", attempt)
+	}
+}
+
+func TestResponsesWSPendingCreateCancelBlocksRequestErrorReplay(t *testing.T) {
+	actor, attempt, conn, generation := setupResponsesWSReplayableFirstTurnAttempt(t)
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+	started, calls := installResponsesWSReplayOpenProbe(t)
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame: responsesWSTestProviderTextFrame([]byte(
+			`{"type":"error","status":429,"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"slow down"}}`,
+		)),
+		DetailOrigin: responsesws.RecvDetailOriginProviderFrame,
+		ReceivedAt:   time.Now(),
+	})
+	actor.markPendingCreateCancel(attempt.AttemptID, responsesWSTestClientTextFrame([]byte(`{"type":"response.cancel"}`)))
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendAttempted,
+		},
+	})
+
+	select {
+	case <-started:
+		t.Fatal("expected pending cancel to block replay open worker")
+	default:
+	}
+	if got := atomic.LoadInt32(calls); got != 0 {
+		t.Fatalf("expected no retry open calls after pending cancel, got %d", got)
+	}
+	if !attempt.RolledBack || attempt.QuotaFinalized || !attempt.DownstreamCommitted {
+		t.Fatalf("expected pending cancel barrier to rollback and surface, attempt=%+v", attempt)
+	}
+	if actor.turns.pending.attempt != nil || actor.turns.active.attempt != nil || actor.state != responsesWSStateIdle {
+		t.Fatalf("expected pending cancel barrier to clear turn state, pending=%+v active=%+v state=%v", actor.turns.pending.attempt, actor.turns.active.attempt, actor.state)
+	}
+	if actor.hasPendingCreateCancel(attempt.AttemptID) {
+		t.Fatal("expected surfaced pending cancel barrier to clear pending cancel marker")
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "rate_limit_exceeded") {
+		t.Fatalf("expected provider rejection payload to be surfaced, got %q", got)
+	}
+	if _, ok := actor.Context().Get("skip_channel_ids"); ok {
+		t.Fatalf("expected pending cancel barrier not to skip channel")
+	}
+}
+
+func TestResponsesWSNativeContinuationMissRequestErrorClearsAffinityState(t *testing.T) {
+	actor, attempt, conn, generation := setupResponsesWSReplayableFirstTurnAttempt(t)
+	const previousResponseID = "resp_native_continuation_miss"
+	candidate, affinityKey := setupResponsesWSTestResponseIDAffinity(t, actor.Context(), previousResponseID, 17)
+	attempt.Candidate = candidate
+	attempt.AttemptedPreviousResponseID = previousResponseID
+	actor.turns.active.attempt = attempt
+	actor.turns.pending = responsesWSPendingTurn{}
+	actor.turns.active.affinity = CommitResponsesTurnAffinity(candidate, 17)
+	actor.turns.active.channelID = 17
+	actor.turns.history.lastFinal = &types.OpenAIResponsesResponses{ID: previousResponseID}
+	actor.state = responsesWSStateInFlight
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame: responsesWSTestProviderTextFrame([]byte(
+			`{"type":"error","status":409,"error":{"type":"invalid_request_error","code":"previous_response_not_found","message":"previous response was not found"}}`,
+		)),
+		DetailOrigin: responsesws.RecvDetailOriginProviderFrame,
+		ReceivedAt:   time.Now(),
+	})
+
+	if _, ok := channelAffinityManager().Get(affinityKey); ok {
+		t.Fatal("expected native continuation miss to clear stale affinity binding")
+	}
+	if actor.turns.history.lastFinal != nil {
+		t.Fatalf("expected native continuation miss to clear stale default previous response, got %+v", actor.turns.history.lastFinal)
+	}
+	if !attempt.RolledBack || attempt.QuotaFinalized || !attempt.DownstreamCommitted {
+		t.Fatalf("expected continuation miss to rollback and surface, attempt=%+v", attempt)
+	}
+	if actor.turns.pending.attempt != nil || actor.turns.active.attempt != nil || actor.state != responsesWSStateIdle {
+		t.Fatalf("expected continuation miss to clear turn state, pending=%+v active=%+v state=%v", actor.turns.pending.attempt, actor.turns.active.attempt, actor.state)
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "previous_response_not_found") {
+		t.Fatalf("expected continuation miss payload to be surfaced, got %q", got)
+	}
+}
+
+func TestResponsesWSPendingCreateCancelNotAttemptedContinuationMissClearsAffinityState(t *testing.T) {
+	actor, attempt, _, generation := setupResponsesWSReplayableFirstTurnAttempt(t)
+	const previousResponseID = "resp_cancel_continuation_miss"
+	candidate, affinityKey := setupResponsesWSTestResponseIDAffinity(t, actor.Context(), previousResponseID, 17)
+	attempt.Candidate = candidate
+	attempt.AttemptedPreviousResponseID = previousResponseID
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.turns.history.lastFinal = &types.OpenAIResponsesResponses{ID: previousResponseID}
+	actor.state = responsesWSStatePendingSend
+	actor.markPendingCreateCancel(attempt.AttemptID, responsesWSTestClientTextFrame([]byte(`{"type":"response.cancel"}`)))
+
+	sendErr := responsesws.NewClientPayloadError(errors.New("provider previous_response_not_found"), responsesWSPreviousResponseNotFoundPayload())
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendNotAttempted,
+			Err:    sendErr,
+		},
+	})
+
+	if _, ok := channelAffinityManager().Get(affinityKey); ok {
+		t.Fatal("expected canceled continuation miss to clear stale affinity binding")
+	}
+	if actor.turns.history.lastFinal != nil {
+		t.Fatalf("expected canceled continuation miss to clear stale default previous response, got %+v", actor.turns.history.lastFinal)
+	}
+	if !attempt.RolledBack || attempt.QuotaFinalized {
+		t.Fatalf("expected canceled not-sent continuation miss to rollback reserve, attempt=%+v", attempt)
+	}
+	if actor.turns.pending.attempt != nil || actor.turns.active.attempt != nil || actor.state != responsesWSStateIdle {
+		t.Fatalf("expected canceled not-sent continuation miss to clear turn state, pending=%+v active=%+v state=%v", actor.turns.pending.attempt, actor.turns.active.attempt, actor.state)
+	}
+	if actor.hasPendingCreateCancel(attempt.AttemptID) {
+		t.Fatal("expected canceled not-sent continuation miss to clear pending cancel marker")
+	}
+}
+
+func TestResponsesWSPendingRequestErrorWithProviderCloseSettlesBeforeSurface(t *testing.T) {
+	actor, attempt, conn, generation := setupResponsesWSReplayableFirstTurnAttempt(t)
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame: responsesWSTestProviderTextFrame([]byte(
+			`{"type":"error","status":429,"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"slow down"}}`,
+		)),
+		DetailOrigin: responsesws.RecvDetailOriginProviderFrame,
+		ReceivedAt:   time.Now(),
+	})
+	actor.handleProviderClosed(ResponsesWSEventProviderClosed{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Code:                      int(wsconn.CloseGoingAway),
+		Reason:                    "provider closed",
+		DetailOrigin:              responsesws.RecvDetailOriginNativeProviderClose,
+		DetailPhase:               responsesws.RecvDetailPhaseMapProviderClose,
+		ReceivedAt:                time.Now(),
+	})
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendAttempted,
+		},
+	})
+
+	if attempt.RolledBack || !attempt.QuotaFinalized || attempt.AppliedSettlement == nil {
+		t.Fatalf("expected provider activity barrier to settle floor before surface, attempt=%+v", attempt)
+	}
+	if attempt.AppliedSettlement.Action != ResponsesWSSettlementFinalizeFloor {
+		t.Fatalf("expected floor settlement for provider activity barrier, settlement=%+v", attempt.AppliedSettlement)
+	}
+	if !attempt.DownstreamCommitted {
+		t.Fatalf("expected request rejection payload to be surfaced after settlement, attempt=%+v", attempt)
+	}
+	if actor.turns.pending.attempt != nil || actor.turns.active.attempt != nil {
+		t.Fatalf("expected replay surface to release turn state, pending=%+v active=%+v", actor.turns.pending.attempt, actor.turns.active.attempt)
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "rate_limit_exceeded") {
+		t.Fatalf("expected provider rejection payload after settlement, got %q", got)
+	}
+}
+
+func TestResponsesWSReplaySurfaceAccountingSettlementFailureDoesNotClearOrSurface(t *testing.T) {
+	actor, attempt, conn, _ := setupResponsesWSReplayableFirstTurnAttempt(t)
+	actor.turns.active.attempt = attempt
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+	attempt.Quota = nil
+
+	payload := []byte(`{"type":"error","status":429,"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"slow down"}}`)
+	command := ResponsesReplayCommand{
+		Decision: ResponsesAttemptDecisionSurface,
+		Failure:  ChannelFailureRateLimited,
+		APIError: &types.OpenAIErrorWithStatusCode{
+			OpenAIError: types.OpenAIError{Type: "rate_limit_error", Code: "rate_limit_exceeded", Message: "slow down"},
+			StatusCode:  http.StatusTooManyRequests,
+		},
+		Barrier: ReplayBarrierAccounting,
+	}
+
+	if !actor.executeResponsesAttemptReplayCommand(attempt, command, payload, command.APIError, ResponsesAttemptFailureOriginWSProviderRequestError, false) {
+		t.Fatal("expected surface accounting command to be handled")
+	}
+	if actor.turns.active.attempt != attempt || attempt.RolledBack || attempt.QuotaFinalized {
+		t.Fatalf("expected failed surface settlement to preserve attempt state, active=%+v attempt=%+v", actor.turns.active.attempt, attempt)
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "quota_settlement_failed") || strings.Contains(got, "rate_limit_exceeded") {
+		t.Fatalf("expected settlement failure payload without provider surface, got %q", got)
+	}
+}
+
+func TestResponsesWSPendingRequestErrorBeforeAcceptRollsBackOnClose(t *testing.T) {
+	actor, attempt, _, generation := setupResponsesWSReplayableFirstTurnAttempt(t)
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame: responsesWSTestProviderTextFrame([]byte(
+			`{"type":"error","status":429,"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"slow down"}}`,
+		)),
+		DetailOrigin: responsesws.RecvDetailOriginProviderFrame,
+		ReceivedAt:   time.Now(),
+	})
+
+	actor.close("client_closed_before_send_result")
+
+	if !attempt.RolledBack || attempt.QuotaFinalized || attempt.QuotaPreconsumed {
+		t.Fatalf("expected pending native request-level rejection to rollback on close, attempt=%+v", attempt)
+	}
+}
+
+func TestResponsesWSPendingRequestErrorBeforeAcceptHasByteCap(t *testing.T) {
+	actor, attempt, conn, generation := setupResponsesWSReplayableFirstTurnAttempt(t)
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	payload := []byte(`{"type":"error","status":429,"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"` +
+		strings.Repeat("x", config.ResponsesWSPendingProviderEventsMaxBytes()+1) + `"}}`)
+	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Kind:                      ProviderDownstreamFrame,
+		Frame:                     responsesWSTestProviderTextFrame(payload),
+		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
+		ReceivedAt:                time.Now(),
+	})
+
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected oversized pending request rejection to fail closed")
+	}
+	if attempt.RolledBack || !attempt.QuotaFinalized {
+		t.Fatalf("expected oversized request rejection fail-close to preserve quota floor, attempt=%+v", attempt)
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "responses_ws_pending_provider_buffer_full") {
+		t.Fatalf("expected buffer full protocol violation, got %q", got)
+	}
+}
+
+func TestResponsesWSPendingRequestErrorBeforeAcceptHasEntryCap(t *testing.T) {
+	actor, attempt, conn, generation := setupResponsesWSReplayableFirstTurnAttempt(t)
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	for i := 0; i <= responsesWSPendingProviderEventsMax; i++ {
+		actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
+			AttemptID:                 attempt.AttemptID,
+			UpstreamSessionGeneration: generation,
+			ChannelID:                 17,
+			Kind:                      ProviderDownstreamFrame,
+			Frame: responsesWSTestProviderTextFrame([]byte(
+				`{"type":"error","status":429,"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"slow down"}}`,
+			)),
+			DetailOrigin: responsesws.RecvDetailOriginProviderFrame,
+			ReceivedAt:   time.Now(),
+		})
+		if actor.closing.closed.Load() {
+			break
+		}
+	}
+
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected excessive pending request rejections to fail closed")
+	}
+	if attempt.RolledBack || !attempt.QuotaFinalized {
+		t.Fatalf("expected request rejection entry overflow to preserve quota floor, attempt=%+v", attempt)
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "responses_ws_pending_provider_buffer_full") {
+		t.Fatalf("expected buffer full protocol violation, got %q", got)
+	}
+}
+
+func TestResponsesWSBridgeOpenProviderErrorRetriesReplayableFirstTurn(t *testing.T) {
+	actor, attempt, conn, generation := setupResponsesWSReplayableFirstTurnAttempt(t)
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+	started, calls := installResponsesWSReplayOpenProbe(t)
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendRejectedBeforeStream,
+		},
+	})
+	actor.handleEvent(ResponsesWSEventBridgeOpenProviderError{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		AttemptID:                 attempt.AttemptID,
+		Payload: []byte(
+			`{"type":"error","status":429,"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"slow down"}}`,
+		),
+		ProviderAPIError: &types.OpenAIErrorWithStatusCode{
+			OpenAIError: types.OpenAIError{Type: "rate_limit_error", Code: "rate_limit_exceeded", Message: "slow down"},
+			StatusCode:  http.StatusTooManyRequests,
+		},
+		Recoverable: true,
+	})
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("expected bridge provider rejection to start replay")
+	}
+	if got := atomic.LoadInt32(calls); got != 1 {
+		t.Fatalf("expected one retry open call, got %d", got)
+	}
+	if !attempt.RolledBack || attempt.QuotaFinalized || attempt.DownstreamCommitted {
+		t.Fatalf("expected bridge provider rejection to rollback and retry silently, attempt=%+v", attempt)
+	}
+	if got, _ := conn.lastWrite.Load().(string); got != "" {
+		t.Fatalf("expected no downstream write before bridge replay, got %q", got)
+	}
+}
+
+func TestResponsesWSTransportNotAttemptedRetriesViaReplayExecutor(t *testing.T) {
+	actor, attempt, conn, generation := setupResponsesWSReplayableFirstTurnAttempt(t)
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+	started, calls := installResponsesWSReplayOpenProbe(t)
+
+	var decisionOrigins []string
+	var executedOrigins []string
+	originalDecision := recordResponsesWSAttemptReplayDecision
+	originalExecuted := recordResponsesWSAttemptReplayExecuted
+	recordResponsesWSAttemptReplayDecision = func(_ string, origin string, _ int, _ string, _ string) {
+		decisionOrigins = append(decisionOrigins, origin)
+	}
+	recordResponsesWSAttemptReplayExecuted = func(origin string, _ int, _ string) {
+		executedOrigins = append(executedOrigins, origin)
+	}
+	t.Cleanup(func() {
+		recordResponsesWSAttemptReplayDecision = originalDecision
+		recordResponsesWSAttemptReplayExecuted = originalExecuted
+	})
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendNotAttempted,
+			Err:    responsesws.ErrUpstreamClosed,
+		},
+	})
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("expected transport-not-attempted replay to start opening next channel")
+	}
+	if got := atomic.LoadInt32(calls); got != 1 {
+		t.Fatalf("expected one retry open call, got %d", got)
+	}
+	if !attempt.RolledBack || attempt.QuotaFinalized || attempt.DownstreamCommitted {
+		t.Fatalf("expected transport-not-attempted replay to rollback before retry, attempt=%+v", attempt)
+	}
+	if got, _ := conn.lastWrite.Load().(string); got != "" {
+		t.Fatalf("expected no downstream surface before retry, got %q", got)
+	}
+	if actor.turns.pending.phase != responsesWSPendingTurnOpening || actor.state != responsesWSStateOpening {
+		t.Fatalf("expected actor to reopen first turn, phase=%v state=%v", actor.turns.pending.phase, actor.state)
+	}
+	skipIDs, _ := actor.Context().Get("skip_channel_ids")
+	if !intSliceContains(skipIDs.([]int), 17) {
+		t.Fatalf("expected failed channel to be skipped, got %#v", skipIDs)
+	}
+	if len(decisionOrigins) != 1 || decisionOrigins[0] != "transport_not_attempted" {
+		t.Fatalf("expected replay decision origin transport_not_attempted, got %#v", decisionOrigins)
+	}
+	if len(executedOrigins) != 1 || executedOrigins[0] != "transport_not_attempted" {
+		t.Fatalf("expected replay executed origin transport_not_attempted, got %#v", executedOrigins)
+	}
+}
+
+func TestResponsesWSTransportNotAttemptedExplicitPinRollsBackAndSurfaces(t *testing.T) {
+	actor, attempt, conn, generation := setupResponsesWSReplayableFirstTurnAttempt(t)
+	attempt.Candidate = &ResponsesTurnAffinity{ExplicitPinID: 17}
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	var blocked []string
+	originalBlocked := recordResponsesWSAttemptReplayBlocked
+	recordResponsesWSAttemptReplayBlocked = func(barrier, origin string, _ int) {
+		blocked = append(blocked, barrier+":"+origin)
+	}
+	t.Cleanup(func() {
+		recordResponsesWSAttemptReplayBlocked = originalBlocked
+	})
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendNotAttempted,
+			Err:    errors.New("prepare failed"),
+		},
+	})
+
+	if !attempt.RolledBack || attempt.QuotaFinalized || !attempt.DownstreamCommitted {
+		t.Fatalf("expected explicit-pin not-attempted to rollback and surface downstream, attempt=%+v", attempt)
+	}
+	if actor.turns.pending.attempt != nil || actor.state != responsesWSStateIdle {
+		t.Fatalf("expected blocked replay to release pending attempt, pending=%+v state=%v", actor.turns.pending.attempt, actor.state)
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "upstream_error") {
+		t.Fatalf("expected downstream error surface, got %q", got)
+	}
+	if len(blocked) != 1 || blocked[0] != "affinity:transport_not_attempted" {
+		t.Fatalf("expected affinity blocked metric for transport_not_attempted, got %#v", blocked)
+	}
+	if _, ok := actor.Context().Get("skip_channel_ids"); ok {
+		t.Fatalf("expected blocked replay not to skip channel")
+	}
+}
+
+func TestResponsesWSTransportNotAttemptedWithProviderEvidenceDoesNotEnterReplayExecutor(t *testing.T) {
+	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-not-attempted-evidence")
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+	actor.turns.pending.provider.journal = responsesWSTestProviderFrameJournal()
+
+	replayDecisions := 0
+	originalDecision := recordResponsesWSAttemptReplayDecision
+	recordResponsesWSAttemptReplayDecision = func(_ string, _ string, _ int, _ string, _ string) {
+		replayDecisions++
+	}
+	t.Cleanup(func() {
+		recordResponsesWSAttemptReplayDecision = originalDecision
+		actor.close("test_cleanup")
+	})
+
+	actor.handleSendResult(ResponsesWSEventSendResult{
+		AttemptID:                 attempt.AttemptID,
+		UpstreamSessionGeneration: generation,
+		SelectedChannelID:         17,
+		Purpose:                   ResponsesWSSendPurposeResponseCreate,
+		TransportResult: responsesws.ResponsesWSTransportSendResult{
+			Status: responsesws.ResponsesWSTransportSendNotAttempted,
+			Err:    responsesws.ErrUpstreamClosed,
+		},
+	})
+
+	if replayDecisions != 0 {
+		t.Fatalf("expected provider evidence conflict not to enter replay executor, decisions=%d", replayDecisions)
+	}
+	if attempt.RolledBack || !attempt.QuotaFinalized {
+		t.Fatalf("expected provider evidence conflict to settle conservatively, attempt=%+v", attempt)
+	}
+}
+
+func TestResponsesWSReplayRollbackUnknownOriginFailsClosed(t *testing.T) {
+	actor, attempt, conn, _ := setupResponsesWSReplayableFirstTurnAttempt(t)
+	actor.turns.pending.attempt = attempt
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.state = responsesWSStatePendingSend
+
+	command := ResponsesReplayCommand{Decision: ResponsesAttemptDecisionRollbackAndRetryNextChannel}
+	if !actor.executeResponsesAttemptReplayCommand(attempt, command, nil, nil, ResponsesAttemptFailureOriginUnknown, false) {
+		t.Fatal("expected unknown-origin rollback command to be handled by fail-closed path")
+	}
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected unknown-origin replay rollback to close session")
+	}
+	if attempt.RolledBack {
+		t.Fatalf("expected unknown-origin replay not to accept rollback proof, attempt=%+v", attempt)
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "quota_settlement_failed") {
+		t.Fatalf("expected quota settlement failure surface, got %q", got)
+	}
+}
+
+func TestResponsesWSReplayRetryStateConflictDoesNotSkipOrReopen(t *testing.T) {
+	actor, attempt, _, _ := setupResponsesWSReplayableFirstTurnAttempt(t)
+	actor.turns.pending.attempt = &ResponsesWSTurnAttempt{AttemptID: "unrelated-pending"}
+	actor.turns.pending.phase = responsesWSPendingTurnSend
+	actor.turns.active.attempt = attempt
+	actor.state = responsesWSStateInFlight
+	started, calls := installResponsesWSReplayOpenProbe(t)
+
+	command := ResponsesReplayCommand{Decision: ResponsesAttemptDecisionRollbackAndRetryNextChannel}
+	if actor.retryFirstTurnAfterReplayableFailure(attempt, command) {
+		t.Fatal("expected replay retry state conflict not to report replayed")
+	}
+	select {
+	case <-started:
+		t.Fatal("expected no retry open worker on state conflict")
+	default:
+	}
+	if got := atomic.LoadInt32(calls); got != 0 {
+		t.Fatalf("expected no retry open calls, got %d", got)
+	}
+	if _, ok := actor.Context().Get("skip_channel_ids"); ok {
+		t.Fatalf("expected state conflict not to skip channel")
+	}
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected state conflict to fail closed")
 	}
 }
 
@@ -3831,6 +4694,44 @@ func TestResponsesWSProviderClosedFinalizesActiveAttemptAndForwardsSanitizedCode
 	}
 }
 
+func TestResponsesWSProviderClosedWriteFailureStillSendsCloseControl(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := setupResponsesWSQuotaFixture(t, 1000)
+	attempt := preparePreconsumedResponsesWSTestAttempt(t, ctx)
+
+	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1), closeWriteErr: errors.New("close sentinel write failed")}
+	actor := NewResponsesWSSessionActor(ctx)
+	actor.SetBridge(NewResponsesWSIOBridge(conn, actor))
+	session := &responsesWSTestSession{}
+	generation := actor.AttachUpstreamSession(session, 17)
+	actor.turns.active.attempt = attempt
+	actor.turns.active.channelID = 17
+	actor.state = responsesWSStateInFlight
+
+	actor.handleProviderClosed(ResponsesWSEventProviderClosed{
+		UpstreamSessionGeneration: generation,
+		ChannelID:                 17,
+		Code:                      4408,
+		Reason:                    "quota exhausted",
+		Err:                       errors.New("provider close"),
+		ReceivedAt:                time.Now(),
+	})
+
+	if !actor.closing.closed.Load() {
+		t.Fatal("expected provider close write failure to close actor")
+	}
+	if got := atomic.LoadInt32(&conn.controlCount); got != 1 {
+		t.Fatalf("expected fallback downstream close control after write failure, got %d", got)
+	}
+	payload, _ := conn.lastControl.Load().(string)
+	if !strings.Contains(payload, "client_write_failed") {
+		t.Fatalf("expected fallback close control to carry client_write_failed, got %q", payload)
+	}
+	if !attempt.QuotaFinalized || attempt.RolledBack {
+		t.Fatalf("expected provider close write failure to preserve finalized quota, finalized=%v rolled=%v", attempt.QuotaFinalized, attempt.RolledBack)
+	}
+}
+
 func TestResponsesWSProviderClosedUsesManagedClientCloseWhenAvailable(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx := setupResponsesWSQuotaFixture(t, 1000)
@@ -5354,7 +6255,7 @@ func TestResponsesWSPrepareFailureNotAttemptedRollsBackWithoutTerminalFinalize(t
 	}
 }
 
-func TestResponsesWSNotSentUpstreamClosedAfterIgnoredNativeCloseClosesSession(t *testing.T) {
+func TestResponsesWSNotSentUpstreamClosedAfterIgnoredNativeCloseSurfacesViaReplayExecutor(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	recorder := httptest.NewRecorder()
@@ -5403,14 +6304,17 @@ func TestResponsesWSNotSentUpstreamClosedAfterIgnoredNativeCloseClosesSession(t 
 	if !attempt.RolledBack || attempt.QuotaPreconsumed || attempt.QuotaFinalized {
 		t.Fatalf("expected upstream-closed NotSent to rollback without terminal finalization, attempt=%+v", attempt)
 	}
-	if !actor.closing.closed.Load() || actor.state != responsesWSStateClosed {
-		t.Fatalf("expected upstream-closed NotSent to close actor, closed=%v state=%v", actor.closing.closed.Load(), actor.state)
+	if actor.closing.closed.Load() || actor.state != responsesWSStateIdle {
+		t.Fatalf("expected non-replayable upstream-closed NotSent to surface and release actor, closed=%v state=%v", actor.closing.closed.Load(), actor.state)
 	}
-	if session.abortReason != "upstream_closed_before_send" {
-		t.Fatalf("expected upstream session abort for upstream_closed_before_send, got %q", session.abortReason)
+	if actor.turns.pending.attempt != nil || actor.turns.pending.phase != responsesWSPendingTurnNone {
+		t.Fatalf("expected non-replayable upstream-closed NotSent to clear pending turn, pending=%+v phase=%v", actor.turns.pending.attempt, actor.turns.pending.phase)
 	}
-	if got, _ := conn.lastControl.Load().(string); !strings.Contains(got, "upstream_closed_before_send") {
-		t.Fatalf("expected downstream close control for upstream_closed_before_send, got %q", got)
+	if session.abortReason != "" {
+		t.Fatalf("expected no bypass session abort outside replay executor, got %q", session.abortReason)
+	}
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "upstream_error") {
+		t.Fatalf("expected downstream error surface, got %q", got)
 	}
 }
 

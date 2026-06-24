@@ -243,7 +243,7 @@ func HandleErrorResp(resp *http.Response, toOpenAIError HttpErrorHandler, isPref
 				}
 
 				openAIErrorWithStatusCode.OpenAIError = *errorResponse
-				if providerErrorIsUsageExhausted(openAIErrorWithStatusCode.OpenAIError) {
+				if common.ProviderErrorIsQuotaExhausted(openAIErrorWithStatusCode.OpenAIError) {
 					openAIErrorWithStatusCode.StatusCode = http.StatusTooManyRequests
 				}
 				if isPrefix {
@@ -251,10 +251,9 @@ func HandleErrorResp(resp *http.Response, toOpenAIError HttpErrorHandler, isPref
 				}
 			}
 
-			// 如果 errorResponse 为 nil，并且响应体为JSON，则将响应体转换为字符串
-			if errorResponse == nil && strings.Contains(resp.Header.Get("Content-Type"), "application/json") {
-				openAIErrorWithStatusCode.OpenAIError.Message = string(bodyBytes)
-			}
+			// If the provider-specific mapper cannot produce a normalized error,
+			// keep the generic status summary below. Raw JSON bodies can contain
+			// account or credential details and must not be surfaced to clients.
 		}
 	}
 
@@ -267,18 +266,6 @@ func HandleErrorResp(resp *http.Response, toOpenAIError HttpErrorHandler, isPref
 	}
 
 	return openAIErrorWithStatusCode
-}
-
-func providerErrorIsUsageExhausted(openAIError types.OpenAIError) bool {
-	for _, value := range []any{openAIError.Type, openAIError.Code} {
-		if text, ok := value.(string); ok {
-			switch strings.ToLower(strings.TrimSpace(text)) {
-			case "usage_limit_reached", "insufficient_quota":
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func SetEventStreamHeaders(c *gin.Context) {

@@ -368,12 +368,78 @@ func TestGetUsageSnapshotReturnsSnapshotOnUpstreamFailure(t *testing.T) {
 		t.Fatalf("expected upstream status to be preserved, got %+v", snapshot)
 	}
 
-	rawMap, ok := snapshot.Raw.(map[string]any)
+	if snapshot.Raw != nil {
+		t.Fatalf("expected default usage snapshot to omit raw payload, got %#v", snapshot.Raw)
+	}
+
+	rawSnapshot, rawErr := provider.GetUsageSnapshot(context.Background(), true, true)
+	if rawErr == nil {
+		t.Fatal("expected debug raw snapshot fetch to keep returning upstream failure")
+	}
+	rawMap, ok := rawSnapshot.Raw.(map[string]any)
 	if !ok {
-		t.Fatalf("expected raw payload map, got %#v", snapshot.Raw)
+		t.Fatalf("expected raw payload map when raw is requested, got %#v", rawSnapshot.Raw)
 	}
 	if rawMap["message"] != "rate limit reached" {
 		t.Fatalf("expected raw payload message, got %+v", rawMap)
+	}
+}
+
+func TestGetUsageSnapshotDoesNotCacheDebugRawPayload(t *testing.T) {
+	cache.InitCacheManager()
+
+	requestCount := atomic.Int32{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"plan_type": "pro",
+			"email": "user@example.com",
+			"rate_limit": {
+				"allowed": true,
+				"limit_reached": false,
+				"primary_window": {
+					"used_percent": 25,
+					"limit_window_seconds": 18000
+				}
+			}
+		}`))
+	}))
+	defer server.Close()
+
+	originalHTTPClient := requester.HTTPClient
+	requester.HTTPClient = server.Client()
+	t.Cleanup(func() {
+		requester.HTTPClient = originalHTTPClient
+	})
+
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", nil)
+	provider.Channel.BaseURL = stringPtr(server.URL)
+
+	rawSnapshot, err := provider.GetUsageSnapshot(context.Background(), true, true)
+	if err != nil {
+		t.Fatalf("expected debug raw snapshot to succeed, got %v", err)
+	}
+	if rawSnapshot.Raw == nil {
+		t.Fatal("expected debug raw snapshot to include raw payload")
+	}
+
+	defaultSnapshot, err := provider.GetUsageSnapshot(context.Background(), false)
+	if err != nil {
+		t.Fatalf("expected default cached snapshot to succeed, got %v", err)
+	}
+	if defaultSnapshot.Raw != nil {
+		t.Fatalf("expected default cached snapshot to omit raw payload, got %#v", defaultSnapshot.Raw)
+	}
+	cached, cacheErr := getCachedUsageSnapshot(provider.Channel.Id)
+	if cacheErr != nil {
+		t.Fatalf("expected sanitized snapshot cache to be populated, got %v", cacheErr)
+	}
+	if cached.Raw != nil {
+		t.Fatalf("expected cached snapshot to omit raw payload, got %#v", cached.Raw)
+	}
+	if requestCount.Load() != 1 {
+		t.Fatalf("expected default fetch to reuse sanitized cache, got %d upstream calls", requestCount.Load())
 	}
 }
 
@@ -506,6 +572,66 @@ func TestNormalizeUsageSnapshotPreservesRawJSONPayload(t *testing.T) {
 	}
 	if string(encodedRaw) != string(body) {
 		t.Fatalf("expected raw payload to stay intact, got %s", string(encodedRaw))
+	}
+}
+
+func TestCloneCodexUsageSnapshotBoundaries(t *testing.T) {
+	if cloneCodexUsageSnapshot(nil, false) != nil {
+		t.Fatal("expected nil snapshot clone to stay nil")
+	}
+
+	empty := cloneCodexUsageSnapshot(&CodexUsageSnapshot{ChannelID: 1}, false)
+	if empty == nil || empty.Account != nil || len(empty.Windows) != 0 || empty.Raw != nil {
+		t.Fatalf("expected empty snapshot to clone without optional fields, got %+v", empty)
+	}
+
+	used := 3.0
+	source := &CodexUsageSnapshot{
+		ChannelID: 2,
+		Account:   &CodexUsageAccount{UserID: "user-1", AccountID: "acct-1"},
+		Windows: []CodexUsageWindow{{
+			WindowKey: "five_hour",
+			Label:     "5h",
+			Used:      &used,
+		}},
+		Raw: map[string]any{"hello": "world"},
+	}
+
+	withoutRaw := cloneCodexUsageSnapshot(source, false)
+	if withoutRaw == nil || withoutRaw.Raw != nil {
+		t.Fatalf("expected raw payload to be omitted, got %+v", withoutRaw)
+	}
+	withRaw := cloneCodexUsageSnapshot(source, true)
+	if withRaw == nil || withRaw.Raw == nil {
+		t.Fatalf("expected raw payload to be retained, got %+v", withRaw)
+	}
+
+	withoutRaw.Account.UserID = "mutated"
+	withoutRaw.Windows[0].WindowKey = "mutated"
+	if source.Account.UserID != "user-1" || source.Windows[0].WindowKey != "five_hour" {
+		t.Fatalf("expected account and windows slices to be isolated, source=%+v clone=%+v", source, withoutRaw)
+	}
+}
+
+func TestClassifyUsageWindowBoundaries(t *testing.T) {
+	tests := []struct {
+		name          string
+		source        string
+		windowSeconds int64
+		want          string
+	}{
+		{name: "empty source", want: ""},
+		{name: "unknown source", source: "custom", want: ""},
+		{name: "mixed case primary fallback", source: " PrImArY ", want: "five_hour"},
+		{name: "mixed case secondary fallback", source: " SeCoNdArY ", want: "weekly"},
+		{name: "duration beats source", source: "custom", windowSeconds: fiveHourWindowSeconds, want: "five_hour"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyUsageWindow(tt.source, tt.windowSeconds); got != tt.want {
+				t.Fatalf("classifyUsageWindow(%q, %d)=%q, want %q", tt.source, tt.windowSeconds, got, tt.want)
+			}
+		})
 	}
 }
 

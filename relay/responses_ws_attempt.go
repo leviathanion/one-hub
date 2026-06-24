@@ -109,6 +109,17 @@ type ResponsesWSTurnAttempt struct {
 	StartedAt                   time.Time
 	FirstResponseAt             time.Time
 	CompletedAt                 time.Time
+	DownstreamCommitted         bool
+	DownstreamCommittedAt       time.Time
+	DownstreamCommitReason      string
+	DownstreamCommitKind        ResponsesDownstreamCommitKind
+	DownstreamCommitSeq         uint64
+	ProviderAccepted            bool
+	ProviderAcceptedAt          time.Time
+	ProviderAcceptedReason      string
+	ProviderAcceptedID          string
+	ReplayFailure               *types.OpenAIErrorWithStatusCode
+	ReplayFailureOrigin         ResponsesAttemptFailureOrigin
 	snapshot                    *ResponsesWSRequestSnapshot
 	providerAPIErrorKeys        map[string]struct{}
 }
@@ -234,6 +245,7 @@ func (a *ResponsesWSTurnAttempt) MarkProviderTerminalEvidence(classified respons
 	if classified.Response != nil {
 		responseID = classified.Response.ID
 	}
+	a.MarkProviderAccepted("terminal:"+classified.EventType, responseID)
 	a.TerminalUsage = terminalUsage
 	a.TerminalEvidence = &ResponsesWSTerminalEvidence{
 		Kind:             classified.Kind,
@@ -251,6 +263,7 @@ func (a *ResponsesWSTurnAttempt) RememberProviderResponseID(responseID string) b
 	if responseID == "" {
 		return true
 	}
+	a.MarkProviderAccepted("response_id", responseID)
 	if a.SeenProviderResponseID == "" {
 		a.SeenProviderResponseID = responseID
 		return true
@@ -266,6 +279,28 @@ func (a *ResponsesWSTurnAttempt) MarkFirstProviderResponse(now time.Time) {
 		now = time.Now()
 	}
 	a.FirstResponseAt = now
+	a.MarkProviderAccepted("first_provider_response", "")
+}
+
+func (a *ResponsesWSTurnAttempt) MarkProviderAccepted(reason string, responseID string) {
+	if a == nil || a.ProviderAccepted {
+		return
+	}
+	a.ProviderAccepted = true
+	a.ProviderAcceptedAt = time.Now()
+	a.ProviderAcceptedReason = strings.TrimSpace(reason)
+	a.ProviderAcceptedID = strings.TrimSpace(responseID)
+}
+
+func (a *ResponsesWSTurnAttempt) MarkDownstreamCommitted(kind ResponsesDownstreamCommitKind, reason string, seq uint64) {
+	if a == nil || a.DownstreamCommitted {
+		return
+	}
+	a.DownstreamCommitted = true
+	a.DownstreamCommittedAt = time.Now()
+	a.DownstreamCommitKind = kind
+	a.DownstreamCommitReason = strings.TrimSpace(reason)
+	a.DownstreamCommitSeq = seq
 }
 
 func (a *ResponsesWSTurnAttempt) MarkCompleted(now time.Time) {

@@ -60,6 +60,9 @@ var (
 	recordUsageObservedUnbilled                   = metrics.RecordUsageObservedUnbilled
 	recordResponsesWSEventPostTimeout             = metrics.RecordResponsesWSEventPostTimeout
 	recordResponsesWSSettlementConflict           = metrics.RecordResponsesWSSettlementConflict
+	recordResponsesWSAttemptReplayDecision        = metrics.RecordResponsesWSAttemptReplayDecision
+	recordResponsesWSAttemptReplayExecuted        = metrics.RecordResponsesWSAttemptReplayExecuted
+	recordResponsesWSAttemptReplayBlocked         = metrics.RecordResponsesWSAttemptReplayBlocked
 )
 
 type ResponsesWSEvent interface{ responsesWSEvent() }

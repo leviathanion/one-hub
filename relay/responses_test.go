@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"one-api/common/config"
 	"one-api/common/logger"
 	"one-api/common/requester"
 	"one-api/model"
@@ -222,6 +223,64 @@ func TestRelayResponsesCompactRejectsStream(t *testing.T) {
 	}
 	if provider.compactCalled {
 		t.Fatal("expected provider compact call to be skipped")
+	}
+}
+
+func TestResponsesHTTPAttemptReplayPolicy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	apiErr := &types.OpenAIErrorWithStatusCode{
+		OpenAIError: types.OpenAIError{Type: "rate_limit_error", Code: "rate_limit_exceeded"},
+		StatusCode:  http.StatusTooManyRequests,
+	}
+
+	newRelay := func() (*relayResponses, *httptest.ResponseRecorder) {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		return &relayResponses{
+			relayBase:        relayBase{c: ctx},
+			responsesRequest: types.OpenAIResponsesRequest{Model: "gpt-5"},
+			operation:        responsesOperationCreate,
+		}, recorder
+	}
+
+	responsesRelay, _ := newRelay()
+	if !responsesHTTPAttemptShouldRetry(responsesRelay, apiErr, config.ChannelTypeOpenAI) {
+		t.Fatal("expected first-turn pre-commit 429 to retry")
+	}
+
+	responsesRelay, _ = newRelay()
+	responsesRelay.responsesRequest.PreviousResponseID = "resp_previous"
+	if responsesHTTPAttemptShouldRetry(responsesRelay, apiErr, config.ChannelTypeOpenAI) {
+		t.Fatal("expected previous_response_id continuation to block HTTP attempt replay")
+	}
+
+	responsesRelay, _ = newRelay()
+	responsesRelay.c.Set(channelAffinityPreferredChannelContextKey, 17)
+	responsesRelay.c.Set(channelAffinitySelectedPreferredContextKey, true)
+	responsesRelay.c.Set(channelAffinitySkipRetryContextKey, true)
+	if responsesHTTPAttemptShouldRetry(responsesRelay, apiErr, config.ChannelTypeOpenAI) {
+		t.Fatal("expected preferred skip-retry affinity to block HTTP attempt replay")
+	}
+
+	responsesRelay, _ = newRelay()
+	responsesRelay.c.Set("specific_channel_id", 17)
+	if responsesHTTPAttemptShouldRetry(responsesRelay, apiErr, config.ChannelTypeOpenAI) {
+		t.Fatal("expected explicit channel pin to block HTTP attempt replay")
+	}
+	if responsesHTTPAttemptShouldRetry(responsesRelay, &types.OpenAIErrorWithStatusCode{
+		OpenAIError: types.OpenAIError{Message: "Your credit balance is too low"},
+		StatusCode:  http.StatusBadRequest,
+	}, config.ChannelTypeAnthropic) {
+		t.Fatal("expected explicit channel pin to block channel-specific HTTP 400 retry")
+	}
+
+	responsesRelay, _ = newRelay()
+	responsesRelay.c.Writer.WriteHeader(http.StatusOK)
+	responsesRelay.c.Writer.WriteHeaderNow()
+	if responsesHTTPAttemptShouldRetry(responsesRelay, apiErr, config.ChannelTypeOpenAI) {
+		t.Fatal("expected committed downstream response to block HTTP attempt replay")
 	}
 }
 

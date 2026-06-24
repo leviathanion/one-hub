@@ -77,11 +77,23 @@ func TestShouldDisableChannelProviderPayloadCodes(t *testing.T) {
 			},
 			wantDisable: false,
 		},
+		{
+			name: "gemini forbidden disables",
+			err: &types.OpenAIErrorWithStatusCode{
+				OpenAIError: types.OpenAIError{Message: "permission denied"},
+				StatusCode:  http.StatusForbidden,
+			},
+			wantDisable: true,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := ShouldDisableChannel(config.ChannelTypeOpenAI, tt.err); got != tt.wantDisable {
+			channelType := config.ChannelTypeOpenAI
+			if tt.name == "gemini forbidden disables" {
+				channelType = config.ChannelTypeGemini
+			}
+			if got := ShouldDisableChannel(channelType, tt.err); got != tt.wantDisable {
 				t.Fatalf("expected disable=%v, got %v", tt.wantDisable, got)
 			}
 		})

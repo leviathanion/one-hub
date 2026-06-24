@@ -382,6 +382,35 @@ func TestBuildResponsesWSSettlementInputProjectsExplicitBeforeStreamProof(t *tes
 	}
 }
 
+func TestBuildResponsesWSSettlementInputRequiresTypedBeforeAcceptProof(t *testing.T) {
+	base := ResponsesWSSettlementProjectionInput{
+		AttemptID:  "attempt-before-accept",
+		FloorQuota: 100,
+		ZeroChargeProofRequest: ResponsesWSZeroChargeProof{
+			Kind:   ResponsesWSZeroChargeProofProviderRejectedBeforeAccept,
+			Reason: "misused_before_accept",
+		},
+	}
+
+	misusedInput := BuildResponsesWSSettlementInput(base)
+	if misusedInput.ZeroChargeProof.Present() {
+		t.Fatalf("expected untyped before-accept proof to be rejected, input=%+v", misusedInput)
+	}
+	if decision := decideResponsesWSSettlement(misusedInput); decision.Action == ResponsesWSSettlementRollbackReserve {
+		t.Fatalf("expected untyped before-accept proof not to rollback, decision=%+v", decision)
+	}
+
+	typed := base
+	typed.ZeroChargeProofRequest = responsesWSProviderRejectedBeforeAcceptProof("typed_before_accept")
+	typedInput := BuildResponsesWSSettlementInput(typed)
+	if !typedInput.ZeroChargeProof.Present() {
+		t.Fatalf("expected typed before-accept proof to be accepted, input=%+v", typedInput)
+	}
+	if decision := decideResponsesWSSettlement(typedInput); decision.Action != ResponsesWSSettlementRollbackReserve {
+		t.Fatalf("expected typed before-accept proof to rollback, decision=%+v", decision)
+	}
+}
+
 func TestResponsesWSPendingProviderReplayBuffersAppendEvidence(t *testing.T) {
 	actor := &ResponsesWSSessionActor{
 		turns: responsesWSTurnSlots{

@@ -22,6 +22,7 @@ type fakeCodexUsageProvider struct {
 	snapshotErr          error
 	previewForceRefresh  bool
 	snapshotForceRefresh bool
+	snapshotIncludeRaw   bool
 }
 
 func (f *fakeCodexUsageProvider) GetUsagePreview(_ context.Context, forceRefresh bool) (*codex.CodexUsagePreview, error) {
@@ -29,8 +30,9 @@ func (f *fakeCodexUsageProvider) GetUsagePreview(_ context.Context, forceRefresh
 	return f.preview, f.previewErr
 }
 
-func (f *fakeCodexUsageProvider) GetUsageSnapshot(_ context.Context, forceRefresh bool) (*codex.CodexUsageSnapshot, error) {
+func (f *fakeCodexUsageProvider) GetUsageSnapshot(_ context.Context, forceRefresh bool, includeRaw ...bool) (*codex.CodexUsageSnapshot, error) {
 	f.snapshotForceRefresh = forceRefresh
+	f.snapshotIncludeRaw = len(includeRaw) > 0 && includeRaw[0]
 	return f.snapshot, f.snapshotErr
 }
 
@@ -104,6 +106,50 @@ func TestGetCodexChannelUsageAllowsTaggedChannels(t *testing.T) {
 	}
 	if !provider.snapshotForceRefresh {
 		t.Fatalf("expected detail endpoint to force refresh the usage snapshot")
+	}
+	if provider.snapshotIncludeRaw {
+		t.Fatalf("expected detail endpoint not to request raw payload by default")
+	}
+}
+
+func TestGetCodexChannelUsageDebugRawRequestsRawSnapshot(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	originalLoadByID := loadCodexUsageChannelByID
+	originalCreateProvider := createCodexUsageProvider
+	t.Cleanup(func() {
+		loadCodexUsageChannelByID = originalLoadByID
+		createCodexUsageProvider = originalCreateProvider
+	})
+
+	provider := &fakeCodexUsageProvider{
+		snapshot: &codex.CodexUsageSnapshot{
+			ChannelID: 7,
+			PlanType:  "pro",
+			Raw:       map[string]any{"email": "user@example.com"},
+		},
+	}
+
+	loadCodexUsageChannelByID = func(channelID int) (*model.Channel, error) {
+		return &model.Channel{Id: channelID, Type: config.ChannelTypeCodex, Key: "credentials"}, nil
+	}
+	createCodexUsageProvider = func(channel *model.Channel) (codexUsageProvider, error) {
+		return provider, nil
+	}
+
+	ctx, recorder := commonTest.GetContext(http.MethodGet, "/api/channel/7/codex/usage?debug_raw=1", commonTest.RequestJSONConfig(), nil)
+	ctx.Params = gin.Params{{Key: "id", Value: "7"}}
+
+	GetCodexChannelUsage(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	if !provider.snapshotIncludeRaw {
+		t.Fatal("expected debug_raw=1 to request raw payload")
+	}
+	if !strings.Contains(recorder.Body.String(), "user@example.com") {
+		t.Fatalf("expected debug response to include raw payload, got %s", recorder.Body.String())
 	}
 }
 

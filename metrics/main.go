@@ -13,22 +13,25 @@ import (
 )
 
 var (
-	httpRequestsTotal             *prometheus.CounterVec
-	httpRequestDuration           *prometheus.HistogramVec
-	providerCounter               *prometheus.CounterVec
-	panicCounter                  *prometheus.CounterVec
-	requestBodyDecodeCounter      *prometheus.CounterVec
-	requestBodyDecodedBytes       *prometheus.HistogramVec
-	responsesWSConnectLimit       *prometheus.CounterVec
-	responsesWSRedisFallback      *prometheus.CounterVec
-	responsesWSEventPostTimeout   *prometheus.CounterVec
-	responsesWSPreconsumeForced   *prometheus.CounterVec
-	responsesWSPreconsumeLatency  *prometheus.HistogramVec
-	responsesWSPreconsumeFloor    *prometheus.HistogramVec
-	responsesWSPreconsumeSettle   *prometheus.CounterVec
-	responsesWSSettlementConflict *prometheus.CounterVec
-	usageObservedUnbilled         *prometheus.CounterVec
-	requestBodyDecodeOnce         sync.Once
+	httpRequestsTotal                *prometheus.CounterVec
+	httpRequestDuration              *prometheus.HistogramVec
+	providerCounter                  *prometheus.CounterVec
+	panicCounter                     *prometheus.CounterVec
+	requestBodyDecodeCounter         *prometheus.CounterVec
+	requestBodyDecodedBytes          *prometheus.HistogramVec
+	responsesWSConnectLimit          *prometheus.CounterVec
+	responsesWSRedisFallback         *prometheus.CounterVec
+	responsesWSEventPostTimeout      *prometheus.CounterVec
+	responsesWSPreconsumeForced      *prometheus.CounterVec
+	responsesWSPreconsumeLatency     *prometheus.HistogramVec
+	responsesWSPreconsumeFloor       *prometheus.HistogramVec
+	responsesWSPreconsumeSettle      *prometheus.CounterVec
+	responsesWSSettlementConflict    *prometheus.CounterVec
+	responsesWSAttemptReplayDecision *prometheus.CounterVec
+	responsesWSAttemptReplayExecuted *prometheus.CounterVec
+	responsesWSAttemptReplayBlocked  *prometheus.CounterVec
+	usageObservedUnbilled            *prometheus.CounterVec
+	requestBodyDecodeOnce            sync.Once
 )
 
 func requestBodyDecodedBytesBuckets() []float64 {
@@ -149,6 +152,27 @@ func init() {
 		},
 		[]string{"kind"},
 	)
+	responsesWSAttemptReplayDecision = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "responses_ws_attempt_replay_decision_total",
+			Help: "Total number of Responses WebSocket attempt replay decisions.",
+		},
+		[]string{"decision", "origin", "status", "barrier", "failure"},
+	)
+	responsesWSAttemptReplayExecuted = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "responses_ws_attempt_replay_executed_total",
+			Help: "Total number of Responses WebSocket attempt replays executed after rollback.",
+		},
+		[]string{"origin", "status", "failure"},
+	)
+	responsesWSAttemptReplayBlocked = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "responses_ws_attempt_replay_blocked_total",
+			Help: "Total number of Responses WebSocket attempt replay decisions blocked by a barrier.",
+		},
+		[]string{"barrier", "origin", "status"},
+	)
 	usageObservedUnbilled = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "usage_observed_unbilled",
@@ -266,6 +290,24 @@ func RecordResponsesWSPreconsumeSettlement(action string) {
 func RecordResponsesWSSettlementConflict(kind string) {
 	SafelyRecordMetric(func() {
 		responsesWSSettlementConflict.WithLabelValues(kind).Inc()
+	})
+}
+
+func RecordResponsesWSAttemptReplayDecision(decision, origin string, status int, barrier, failure string) {
+	SafelyRecordMetric(func() {
+		responsesWSAttemptReplayDecision.WithLabelValues(decision, origin, strconv.Itoa(status), barrier, failure).Inc()
+	})
+}
+
+func RecordResponsesWSAttemptReplayExecuted(origin string, status int, failure string) {
+	SafelyRecordMetric(func() {
+		responsesWSAttemptReplayExecuted.WithLabelValues(origin, strconv.Itoa(status), failure).Inc()
+	})
+}
+
+func RecordResponsesWSAttemptReplayBlocked(barrier, origin string, status int) {
+	SafelyRecordMetric(func() {
+		responsesWSAttemptReplayBlocked.WithLabelValues(barrier, origin, strconv.Itoa(status)).Inc()
 	})
 }
 

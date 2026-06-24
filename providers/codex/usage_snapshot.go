@@ -111,7 +111,7 @@ func (p *CodexProvider) GetUsagePreview(ctx context.Context, forceRefresh bool) 
 		}
 	}
 
-	snapshot, err := p.GetUsageSnapshot(ctx, forceRefresh)
+	snapshot, err := p.GetUsageSnapshot(ctx, forceRefresh, false)
 	if snapshot == nil {
 		return nil, err
 	}
@@ -123,20 +123,24 @@ func (p *CodexProvider) GetUsagePreview(ctx context.Context, forceRefresh bool) 
 	return preview, err
 }
 
-func (p *CodexProvider) GetUsageSnapshot(ctx context.Context, forceRefresh bool) (*CodexUsageSnapshot, error) {
+func (p *CodexProvider) GetUsageSnapshot(ctx context.Context, forceRefresh bool, includeRaw ...bool) (*CodexUsageSnapshot, error) {
 	if p == nil || p.Channel == nil {
 		return nil, fmt.Errorf("provider not configured")
 	}
 
-	if !forceRefresh {
+	rawRequested := len(includeRaw) > 0 && includeRaw[0]
+	if !forceRefresh && !rawRequested {
 		if cachedSnapshot, err := getCachedUsageSnapshot(p.Channel.Id); err == nil {
-			return &cachedSnapshot, nil
+			return cloneCodexUsageSnapshot(&cachedSnapshot, false), nil
 		}
 	}
 
 	snapshot, err := p.fetchUsageSnapshot(ctx)
 	if snapshot != nil && err == nil {
-		cacheSuccessfulUsageSnapshot(snapshot)
+		cacheSuccessfulUsageSnapshot(cloneCodexUsageSnapshot(snapshot, false))
+	}
+	if snapshot != nil && !rawRequested {
+		snapshot = cloneCodexUsageSnapshot(snapshot, false)
 	}
 	return snapshot, err
 }
@@ -157,6 +161,22 @@ func BuildUsagePreview(snapshot *CodexUsageSnapshot) *CodexUsagePreview {
 		FetchedAt:    snapshot.FetchedAt,
 		Windows:      windows,
 	}
+}
+
+func cloneCodexUsageSnapshot(snapshot *CodexUsageSnapshot, includeRaw bool) *CodexUsageSnapshot {
+	if snapshot == nil {
+		return nil
+	}
+	cloned := *snapshot
+	if snapshot.Account != nil {
+		account := *snapshot.Account
+		cloned.Account = &account
+	}
+	cloned.Windows = append([]CodexUsageWindow(nil), snapshot.Windows...)
+	if !includeRaw {
+		cloned.Raw = nil
+	}
+	return &cloned
 }
 
 func cacheSuccessfulUsageSnapshot(snapshot *CodexUsageSnapshot) {
@@ -660,7 +680,7 @@ func cacheUsageSnapshot(snapshot *CodexUsageSnapshot) {
 	if snapshot == nil || snapshot.ChannelID <= 0 {
 		return
 	}
-	if err := cache.SetCache(usageDetailCacheKey(snapshot.ChannelID), snapshot, usageCacheTTL); err != nil {
+	if err := cache.SetCache(usageDetailCacheKey(snapshot.ChannelID), cloneCodexUsageSnapshot(snapshot, false), usageCacheTTL); err != nil {
 		logger.SysError(fmt.Sprintf("[Codex] failed to cache usage snapshot for channel %d: %v", snapshot.ChannelID, err))
 	}
 }

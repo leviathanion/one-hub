@@ -76,6 +76,7 @@ provider adapter 和 transport helper 只产出 evidence：send result、provide
 不变量：
 
 - pending slot 的 identity 是 `attempt` / `openingID` / `phase`；清理 pending slot 必须通过 turn slot helper，确保 attempt、journal replay entries 与 cancel marker 同步归零。
+- pending create cancel marker 是 retry/replay barrier；send result 到达前已经收到 `response.cancel` 时，actor 不能清掉 marker 后重新发送 create。
 - active slot 的 identity 是 active attempt；清理 active slot 必须通过 turn slot helper，确保 projection、affinity、channel 和 bridge cancel marker 同步归零。
 - `opening`、`pending`、`active` 最多同时存在一个 current create；过渡必须通过显式 transition 函数完成。
 - 所有 state mutation 仍只发生在 actor event loop。
@@ -183,7 +184,8 @@ actor 后续 turn 使用当前 upstream session 和该 snapshot 做日志、诊�
 45. handler 的 live `gin.Context` 不跨 goroutine 读写。turn prepare/record/clear 使用稳定 input 或 `c.Copy()`。
 46. actor mailbox 事件必须分级：`SendResult`、actor 自身 panic/timeout 这类账本 proof / fail-closed 事件必须可靠投递；普通 provider data frame 可以受 mailbox backpressure 影响，但丢弃时必须最终投递 backpressure timeout 或关闭连接。
 47. pending provider journal replay entries 必须同时有事件数和字节数上限；上限触发时 fail closed，不能靠 mailbox 长度推导内存边界。
-48. 所有 ResponsesWS goroutine 入口（actor loop、client read pump、provider recv pump、send worker、open worker、idle watchdog）都必须有 panic recovery，recovery 策略为 fail closed。
+48. pending request-level rejection 虽然是 replay-only zero-charge proof，不进入 provider activity projection，但 append 仍必须经过 pending provider journal 的事件数和字节数上限。
+49. 所有 ResponsesWS goroutine 入口（actor loop、client read pump、provider recv pump、send worker、open worker、idle watchdog）都必须有 panic recovery，recovery 策略为 fail closed。
 
 ## 核心组件
 
@@ -452,7 +454,7 @@ OpenAI ResponsesWS 的 timeout 分层：首帧用 gorilla read deadline 限制�
 | provider terminal 带 billable usage | 已消耗 | 已有 | success record；failed clear | 按 provider usage 结算，可低于 preconsume |
 | provider terminal 无 billable usage | 已消耗 | 已有 | success record；failed clear | floor settlement |
 | provider 下行 `type:"error"` miss | 已消耗 | 已有 | clear active owner | failed terminal；无 billable usage 时 floor settlement |
-| proxy-local invalid event / 429 / session_busy | 否 | 不发送 | 不动 | recoverable local error，连接继续 |
+| proxy-local invalid event / 429 / session_busy | 否 | 不发送 | 不动；不 watermark 当前 attempt | recoverable local error，连接继续 |
 | 客户端 first open-and-prime 期间断开 | not-sent 可 rollback；ambiguous/admitted 不 undo；已 Allow 的 RPM 不 refund | 可能已有 | 不新增 record；不在 actor 外 finalize quota | actor 收到 `ClientClosed` 后 abort/detach，禁止 fresh retry；无 no-send proof 时 floor settlement |
 | 客户端断开 | 已接纳 turn 可能已消耗 | 已有 | 不新增 record；actor 做 no-terminal floor settlement | detach/abort |
 | idle timeout | 不额外消耗 | 已有 | 不新增 record | abort session, release active lease |

@@ -840,6 +840,8 @@ pending entries 有上限，`Project()` 默认直接从 entries 重算，避免�
 
 容量超限时必须保持当前顺序语义：先把 observation 计入 journal，再判定 downstream replay payload 是否超过容量并返回 `overLimit` 让 actor `failClosed`。否则 buffer 满触发 settlement 时，最后一条 provider activity 可能没有进入 projection。`bytes` 应归 journal 私有管理，避免容量状态与 entries 分离。
 
+request-level rejection 是特殊 replay-only entry：它可以没有 settlement observation，因为 typed `ProviderRejectedBeforeAccept` proof 不等价于 provider activity；但 append 仍必须使用 journal 的事件数/字节数容量检查。超限时丢弃 replay payload 并 fail closed，不能绕过 cap，也不能为了保留 projection 把 request rejection 伪造成 provider frame evidence。
+
 ### Active evidence：保存既有 projection，不保存 observation log
 
 active turn 不需要保存完整 observation log。pending commit 时将 journal 投影成 `ProviderSettlementLogProjection`，active 后续 provider event 直接 merge 到这个 projection。不要新增 `ProviderEvidenceState`；阶段二已经提供了等价且更准确的类型名。
@@ -1111,6 +1113,9 @@ Phase 4 不是承诺项，只有在满足以下条件时才做：
 21. pending -> active commit 后 replay 不再次 observe，不再次 merge usage。
 22. opening / pending / active 转换通过 turn slot helper 完成。
 23. contradictory input 默认 warning/metric/trace，不直接绕过 settlement core；身份/归属冲突才关闭当前 turn/session。
+24. replay `Surface` 遇到 accounting / provider accepted / downstream committed barrier 时，executor 必须先经过 settlement core，再 surface payload 和清 turn。
+25. pending create cancel marker 是 attempt replay barrier，不能被 retry 分支清掉后重新发送 create。
+26. pending request-level rejection append 必须执行 journal event/byte limits，即使该 entry 不进入 settlement observation projection。
 
 ## 需要同步修改的 docs/dev 文档
 
