@@ -49,7 +49,7 @@
 | [ResponsesWS Attempt Replay 架构设计方案](./responses-ws-attempt-replay-architecture.md) | HTTP / ResponsesWS request-level rejection replay、attempt barrier、rollback-before-retry | 当前 attempt replay 协议说明；只在 pre-accept、pre-visibility、可 rollback 的边界内重放 |
 | [ResponsesWS Transport 边界重构方案](./responses-ws-transport-boundary.md) | ResponsesWS native WS / HTTP bridge transport、provider adapter 边界 | 主体边界已进入当前实现；保留 v1 迁移顺序和复审修复记录 |
 | [Codex / PI OAuth 请求 Header 画像对照](./codex-pi-header-parity.md) | Codex / PI 自身 OAuth header 画像、one-hub 中转差异 | 用于后续 Codex provider header parity 修复和回归测试设计 |
-| [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md) | Codex provider `/responses` / `/responses/compact` / ResponsesWS upstream 协议边界 | 目标方案；一步到位重构为 raw envelope + official header plan，不保留 legacy one-hub header 兼容层 |
+| [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md) | Codex provider raw envelope、official header/body planner、ResponsesWS native upstream | 目标架构；一次性干净重构，不设 legacy/typed/bridge 运行时兼容态 |
 | [WebSocket Transport 复用方案](./websocket-transport-architecture.md) | `/v1/realtime` 与 ResponsesWS 的旧底层 I/O 复用 | 历史方案；已被 wsconn 唯一传输边界取代 |
 | [wsconn 唯一传输边界架构方案](./wsconn-architecture.md) | `common/wsconn` 作为唯一 WebSocket 传输边界 | 当前实现；业务层不再持有 `*websocket.Conn` |
 | [one-hub Async Task 架构设计](./task-coordination-architecture.md) | async task、identity、fetch、sweeper、finalize | 当前异步任务架构说明 |
@@ -67,7 +67,7 @@
 | [ResponsesWS Attempt Replay 架构设计方案](./responses-ws-attempt-replay-architecture.md) | 当前实现 | request-level rejection replay 已按 attempt barrier、rollback-before-retry 和 downstream visibility barrier 落地 |
 | [ResponsesWS Transport 边界重构方案](./responses-ws-transport-boundary.md) | 当前实现 + 目标约束 | 把 native WS / HTTP bridge transport 从 Codex realtime 语义中拆出；主体边界已进入当前实现，文档保留复审修复记录 |
 | [Codex / PI OAuth 请求 Header 画像对照](./codex-pi-header-parity.md) | 当前诊断 | 记录 Codex / PI 本体 HTTP/WS header 画像，以及 one-hub 当前中转后的缺失、额外和逻辑不一致字段 |
-| [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md) | 目标方案 | Codex provider 的 official upstream dialect：raw envelope、typed lens、CodexIdentity、HeaderPlan、native ResponsesWS，不做 legacy header 兼容 |
+| [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md) | 目标方案 | Codex provider 以 raw envelope contract 和 official planner 作为唯一协议边界；删除 legacy header、typed upstream contract、WS bridge fallback 和 model_headers override |
 | [WebSocket Transport 复用方案](./websocket-transport-architecture.md) | 历史方案 | 原 primitives-only safety primitives 路线，已被 `common/wsconn` 唯一传输边界取代 |
 | [wsconn 唯一传输边界架构方案](./wsconn-architecture.md) | 当前实现 | `common/wsconn` 是唯一 WebSocket 传输边界；业务层不再 import gorilla，CloseInfo first-write-wins，PongMiss/Idle 语义拆分 |
 | [one-hub Async Task 架构设计](./task-coordination-architecture.md) | 当前实现 | `tasks` 行、settlement snapshot、local fetch、sweeper、finalize 已形成稳定边界 |
