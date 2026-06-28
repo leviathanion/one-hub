@@ -217,6 +217,242 @@ func TestNormalizeUsageSnapshotPreservesUnknownLimitState(t *testing.T) {
 	}
 }
 
+func TestNormalizeUsageSnapshotIncludesResetCreditCount(t *testing.T) {
+	body := []byte(`{
+		"plan_type": "pro",
+		"rate_limit_reset_credits": {
+			"available_count": 2
+		},
+		"rate_limit": {
+			"primary_window": {
+				"used_percent": 25,
+				"limit_window_seconds": 18000
+			}
+		}
+	}`)
+
+	snapshot, err := normalizeUsageSnapshot(42, nil, http.StatusOK, body)
+	if err != nil {
+		t.Fatalf("expected normalization to succeed, got %v", err)
+	}
+	if snapshot.RateLimitResetCredits == nil || snapshot.RateLimitResetCredits.AvailableCount != 2 {
+		t.Fatalf("expected reset credit count to be preserved, got %+v", snapshot.RateLimitResetCredits)
+	}
+}
+
+func TestConsumeResetCreditSendsOfficialRequest(t *testing.T) {
+	requestCount := atomic.Int32{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		if r.Method != http.MethodPost {
+			t.Fatalf("expected POST, got %s", r.Method)
+		}
+		if r.URL.Path != "/backend-api/wham/rate-limit-reset-credits/consume" {
+			t.Fatalf("unexpected reset credit path %q", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer access-token" {
+			t.Fatalf("expected authorization header, got %q", got)
+		}
+		if got := r.Header.Get("chatgpt-account-id"); got != "acct-123" {
+			t.Fatalf("expected account id header, got %q", got)
+		}
+		if got := r.Header.Get("User-Agent"); got != defaultUserAgent {
+			t.Fatalf("expected default user agent %q, got %q", defaultUserAgent, got)
+		}
+		if got := r.Header.Get("originator"); got != defaultOfficialCodexOriginator {
+			t.Fatalf("expected official originator, got %q", got)
+		}
+
+		var payload codexResetCreditConsumeRequest
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("failed to decode reset request body: %v", err)
+		}
+		if payload.RedeemRequestID == "" {
+			t.Fatal("expected redeem_request_id to be set")
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"code": "ok",
+			"windows_reset": 1,
+			"rate_limit_reset_credit": {
+				"id": "credit-1",
+				"status": "redeemed",
+				"redeemed_at": "2026-06-26T00:00:00Z"
+			}
+		}`))
+	}))
+	defer server.Close()
+
+	originalHTTPClient := requester.HTTPClient
+	requester.HTTPClient = server.Client()
+	t.Cleanup(func() {
+		requester.HTTPClient = originalHTTPClient
+	})
+
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", nil)
+	provider.Channel.BaseURL = stringPtr(server.URL)
+
+	result, err := provider.ConsumeResetCredit(context.Background())
+	if err != nil {
+		t.Fatalf("expected reset credit consume to succeed, got %v", err)
+	}
+	if requestCount.Load() != 1 {
+		t.Fatalf("expected one upstream request, got %d", requestCount.Load())
+	}
+	if result == nil || result.ChannelID != provider.Channel.Id || result.Code != "ok" || result.WindowsReset != 1 {
+		t.Fatalf("unexpected reset result: %+v", result)
+	}
+	if result.Credit == nil || result.Credit.ID != "credit-1" || result.Credit.Status != "redeemed" {
+		t.Fatalf("expected redeemed credit payload, got %+v", result.Credit)
+	}
+}
+
+func TestNormalizeResetCreditResultAcceptsDirectCreditPayload(t *testing.T) {
+	result, err := normalizeResetCreditResult(42, http.StatusOK, []byte(`{
+		"id": "credit-direct",
+		"status": "redeemed",
+		"redeemed_at": "2026-06-26T00:00:00Z"
+	}`))
+	if err != nil {
+		t.Fatalf("expected direct credit payload to normalize, got %v", err)
+	}
+	if result.WindowsReset != 1 {
+		t.Fatalf("expected successful reset to default windows_reset=1, got %+v", result)
+	}
+	if result.Credit == nil || result.Credit.ID != "credit-direct" || result.Credit.Status != "redeemed" {
+		t.Fatalf("expected direct credit fields to be preserved, got %+v", result.Credit)
+	}
+}
+
+func TestConsumeResetCreditRetriesAfterUnauthorizedByForceRefreshing(t *testing.T) {
+	cache.InitCacheManager()
+	logger.SetupLogger()
+
+	serverToken := atomic.Value{}
+	serverToken.Store("refreshed-token")
+	requestCount := atomic.Int32{}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		if r.URL.Path != "/backend-api/wham/rate-limit-reset-credits/consume" {
+			t.Fatalf("unexpected reset path %q", r.URL.Path)
+		}
+
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if token != serverToken.Load().(string) {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"message":"expired"}}`))
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":"ok","windows_reset":1,"credit":{"id":"credit-2","status":"redeemed"}}`))
+	}))
+	defer server.Close()
+
+	originalHTTPClient := requester.HTTPClient
+	requester.HTTPClient = server.Client()
+	t.Cleanup(func() {
+		requester.HTTPClient = originalHTTPClient
+	})
+
+	originalRefreshCredentials := refreshOAuthCredentials
+	refreshOAuthCredentials = func(creds *OAuth2Credentials, _ context.Context, _ string, _ int) error {
+		creds.AccessToken = serverToken.Load().(string)
+		creds.ExpiresAt = time.Now().Add(time.Hour)
+		return nil
+	}
+	t.Cleanup(func() {
+		refreshOAuthCredentials = originalRefreshCredentials
+	})
+
+	updatedKey := atomic.Value{}
+	initialCreds := &OAuth2Credentials{
+		AccessToken:  "expired-token",
+		RefreshToken: "refresh-token",
+		AccountID:    "acct-123",
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}
+	initialKey, err := initialCreds.ToJSON()
+	if err != nil {
+		t.Fatalf("failed to serialize initial credentials: %v", err)
+	}
+	updatedKey.Store(initialKey)
+
+	originalUpdateChannelKey := updateChannelKey
+	updateChannelKey = func(channelID int, key string) error {
+		if channelID != 424299 {
+			t.Fatalf("unexpected channel id update %d", channelID)
+		}
+		updatedKey.Store(key)
+		return nil
+	}
+	t.Cleanup(func() {
+		updateChannelKey = originalUpdateChannelKey
+	})
+
+	originalLoadLatestChannelByID := loadLatestChannelByID
+	loadLatestChannelByID = func(channelID int) (*model.Channel, error) {
+		if channelID != 424299 {
+			t.Fatalf("unexpected channel id reload %d", channelID)
+		}
+		return &model.Channel{
+			Id:      channelID,
+			Key:     updatedKey.Load().(string),
+			BaseURL: stringPtr(server.URL),
+		}, nil
+	}
+	t.Cleanup(func() {
+		loadLatestChannelByID = originalLoadLatestChannelByID
+	})
+
+	provider := newTestCodexProviderWithContext(t, initialKey, "", nil)
+	provider.Channel.BaseURL = stringPtr(server.URL)
+
+	result, err := provider.ConsumeResetCredit(context.Background())
+	if err != nil {
+		t.Fatalf("expected retry after forced refresh to succeed, got %v", err)
+	}
+	if requestCount.Load() != 2 {
+		t.Fatalf("expected unauthorized request to be retried once, got %d attempts", requestCount.Load())
+	}
+	if result == nil || result.Credit == nil || result.Credit.ID != "credit-2" {
+		t.Fatalf("expected successful reset result after retry, got %+v", result)
+	}
+	if !strings.Contains(updatedKey.Load().(string), "refreshed-token") {
+		t.Fatalf("expected refreshed token to be persisted, got %s", updatedKey.Load().(string))
+	}
+}
+
+func TestConsumeResetCreditReturnsUpstreamMessage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"no reset credits available"}}`))
+	}))
+	defer server.Close()
+
+	originalHTTPClient := requester.HTTPClient
+	requester.HTTPClient = server.Client()
+	t.Cleanup(func() {
+		requester.HTTPClient = originalHTTPClient
+	})
+
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", nil)
+	provider.Channel.BaseURL = stringPtr(server.URL)
+
+	result, err := provider.ConsumeResetCredit(context.Background())
+	if err == nil {
+		t.Fatal("expected upstream failure to return an error")
+	}
+	if !strings.Contains(err.Error(), "no reset credits available") {
+		t.Fatalf("expected upstream message to surface, got %v", err)
+	}
+	if result == nil || result.ChannelID != provider.Channel.Id {
+		t.Fatalf("expected partial result on upstream failure, got %+v", result)
+	}
+}
+
 func TestGetUsageSnapshotRetriesAfterUnauthorizedByForceRefreshing(t *testing.T) {
 	cache.InitCacheManager()
 	logger.SetupLogger()

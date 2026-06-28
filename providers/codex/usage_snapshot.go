@@ -13,6 +13,8 @@ import (
 	"one-api/common/cache"
 	"one-api/common/logger"
 	"one-api/common/requester"
+
+	"github.com/google/uuid"
 )
 
 const (
@@ -54,24 +56,44 @@ type CodexUsagePreview struct {
 	Windows      []CodexUsageWindow `json:"windows"`
 }
 
+type CodexRateLimitResetCredits struct {
+	AvailableCount int `json:"available_count"`
+}
+
 type CodexUsageSnapshot struct {
-	ChannelID      int                `json:"channel_id"`
-	Account        *CodexUsageAccount `json:"account,omitempty"`
-	PlanType       string             `json:"plan_type,omitempty"`
-	Allowed        *bool              `json:"allowed,omitempty"`
-	LimitReached   *bool              `json:"limit_reached,omitempty"`
-	UpstreamStatus int                `json:"upstream_status"`
-	FetchedAt      int64              `json:"fetched_at"`
-	Windows        []CodexUsageWindow `json:"windows"`
-	Raw            any                `json:"raw,omitempty"`
+	ChannelID             int                         `json:"channel_id"`
+	Account               *CodexUsageAccount          `json:"account,omitempty"`
+	PlanType              string                      `json:"plan_type,omitempty"`
+	Allowed               *bool                       `json:"allowed,omitempty"`
+	LimitReached          *bool                       `json:"limit_reached,omitempty"`
+	UpstreamStatus        int                         `json:"upstream_status"`
+	FetchedAt             int64                       `json:"fetched_at"`
+	Windows               []CodexUsageWindow          `json:"windows"`
+	RateLimitResetCredits *CodexRateLimitResetCredits `json:"rate_limit_reset_credits,omitempty"`
+	Raw                   any                         `json:"raw,omitempty"`
+}
+
+type CodexResetCredit struct {
+	ID         string `json:"id,omitempty"`
+	Status     string `json:"status,omitempty"`
+	RedeemedAt string `json:"redeemed_at,omitempty"`
+}
+
+type CodexResetResult struct {
+	ChannelID      int               `json:"channel_id"`
+	Code           string            `json:"code,omitempty"`
+	WindowsReset   int               `json:"windows_reset"`
+	Credit         *CodexResetCredit `json:"credit,omitempty"`
+	upstreamStatus int
 }
 
 type codexWhamUsageResponse struct {
-	PlanType  any                `json:"plan_type,omitempty"`
-	UserID    any                `json:"user_id,omitempty"`
-	Email     any                `json:"email,omitempty"`
-	AccountID any                `json:"account_id,omitempty"`
-	RateLimit codexWhamRateLimit `json:"rate_limit,omitempty"`
+	PlanType              any                         `json:"plan_type,omitempty"`
+	UserID                any                         `json:"user_id,omitempty"`
+	Email                 any                         `json:"email,omitempty"`
+	AccountID             any                         `json:"account_id,omitempty"`
+	RateLimit             codexWhamRateLimit          `json:"rate_limit,omitempty"`
+	RateLimitResetCredits *CodexRateLimitResetCredits `json:"rate_limit_reset_credits,omitempty"`
 }
 
 type codexWhamRateLimit struct {
@@ -98,6 +120,20 @@ type codexWhamWindow struct {
 type usageWindowCandidate struct {
 	source string
 	window CodexUsageWindow
+}
+
+type codexResetCreditConsumeRequest struct {
+	RedeemRequestID string `json:"redeem_request_id"`
+}
+
+type codexResetCreditConsumeResponse struct {
+	Code         string            `json:"code,omitempty"`
+	WindowsReset int               `json:"windows_reset,omitempty"`
+	Credit       *CodexResetCredit `json:"credit,omitempty"`
+	ResetCredit  *CodexResetCredit `json:"rate_limit_reset_credit,omitempty"`
+	ID           string            `json:"id,omitempty"`
+	Status       string            `json:"status,omitempty"`
+	RedeemedAt   string            `json:"redeemed_at,omitempty"`
 }
 
 func (p *CodexProvider) GetUsagePreview(ctx context.Context, forceRefresh bool) (*CodexUsagePreview, error) {
@@ -173,10 +209,85 @@ func cloneCodexUsageSnapshot(snapshot *CodexUsageSnapshot, includeRaw bool) *Cod
 		cloned.Account = &account
 	}
 	cloned.Windows = append([]CodexUsageWindow(nil), snapshot.Windows...)
+	if snapshot.RateLimitResetCredits != nil {
+		credits := *snapshot.RateLimitResetCredits
+		cloned.RateLimitResetCredits = &credits
+	}
 	if !includeRaw {
 		cloned.Raw = nil
 	}
 	return &cloned
+}
+
+func (p *CodexProvider) ConsumeResetCredit(ctx context.Context) (*CodexResetResult, error) {
+	if p == nil || p.Channel == nil {
+		return nil, fmt.Errorf("provider not configured")
+	}
+
+	result, err := p.consumeResetCreditOnce(ctx)
+	if err == nil {
+		return result, nil
+	}
+	if result == nil || result.upstreamStatus != http.StatusUnauthorized && result.upstreamStatus != http.StatusForbidden {
+		return result, err
+	}
+	if p.Credentials == nil || strings.TrimSpace(p.Credentials.RefreshToken) == "" {
+		return result, err
+	}
+
+	if _, refreshErr := p.forceRefreshToken(ctx); refreshErr != nil {
+		if ctx != nil {
+			logger.LogWarn(ctx, fmt.Sprintf("[Codex] forced refresh after reset credit failure failed: %s", refreshErr.Error()))
+		} else {
+			logger.SysError("[Codex] forced refresh after reset credit failure failed: " + refreshErr.Error())
+		}
+		return result, err
+	}
+
+	return p.consumeResetCreditOnce(ctx)
+}
+
+func (p *CodexProvider) consumeResetCreditOnce(ctx context.Context) (*CodexResetResult, error) {
+	headers, err := p.getUsageRequestHeaders()
+	if err != nil {
+		return nil, err
+	}
+
+	if p.Requester != nil {
+		p.Requester.Context = ensureContext(ctx)
+	}
+
+	requestURL := p.GetFullRequestURL("/backend-api/wham/rate-limit-reset-credits/consume", "")
+	req, err := p.Requester.NewRequest(
+		http.MethodPost,
+		requestURL,
+		p.Requester.WithHeader(headers),
+		p.Requester.WithBody(codexResetCreditConsumeRequest{RedeemRequestID: uuid.NewString()}),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := requester.HTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	result, normalizeErr := normalizeResetCreditResult(p.Channel.Id, resp.StatusCode, bodyBytes)
+	if normalizeErr != nil {
+		return result, normalizeErr
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return result, errors.New(extractUsageErrorMessage(decodeRawJSON(bodyBytes), resp.StatusCode))
+	}
+
+	return result, nil
 }
 
 func cacheSuccessfulUsageSnapshot(snapshot *CodexUsageSnapshot) {
@@ -311,8 +422,53 @@ func normalizeUsageSnapshot(channelID int, credentials *OAuth2Credentials, statu
 	snapshot.Account = normalizeUsageAccount(&payload, credentials)
 	snapshot.Windows = normalizeUsageWindows(&payload)
 	snapshot.Allowed, snapshot.LimitReached = normalizeUsageLimitState(payload.RateLimit.Allowed, payload.RateLimit.LimitReached, snapshot.Windows)
+	snapshot.RateLimitResetCredits = payload.RateLimitResetCredits
 
 	return snapshot, nil
+}
+
+func normalizeResetCreditResult(channelID int, statusCode int, bodyBytes []byte) (*CodexResetResult, error) {
+	result := &CodexResetResult{
+		ChannelID:      channelID,
+		Code:           fmt.Sprintf("%d", statusCode),
+		upstreamStatus: statusCode,
+	}
+
+	if len(strings.TrimSpace(string(bodyBytes))) == 0 {
+		return result, fmt.Errorf("empty Codex reset credit payload")
+	}
+
+	var payload codexResetCreditConsumeResponse
+	if err := json.Unmarshal(bodyBytes, &payload); err != nil {
+		return result, fmt.Errorf("failed to decode Codex reset credit payload: %w", err)
+	}
+
+	result.Code = firstNonEmptyString(payload.Code, result.Code)
+	result.WindowsReset = payload.WindowsReset
+	if statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices && result.WindowsReset == 0 {
+		result.WindowsReset = 1
+	}
+	if payload.Credit != nil {
+		result.Credit = payload.Credit
+	} else if payload.ResetCredit != nil {
+		result.Credit = payload.ResetCredit
+	} else if payload.ID != "" || payload.Status != "" || payload.RedeemedAt != "" {
+		result.Credit = &CodexResetCredit{
+			ID:         payload.ID,
+			Status:     payload.Status,
+			RedeemedAt: payload.RedeemedAt,
+		}
+	}
+
+	return result, nil
+}
+
+func decodeRawJSON(bodyBytes []byte) any {
+	var raw any
+	if err := json.Unmarshal(bodyBytes, &raw); err != nil {
+		return string(bodyBytes)
+	}
+	return raw
 }
 
 func normalizeUsageAccount(payload *codexWhamUsageResponse, credentials *OAuth2Credentials) *CodexUsageAccount {

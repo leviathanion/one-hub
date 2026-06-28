@@ -39,6 +39,7 @@ type codexUsagePreviewItem struct {
 type codexUsageProvider interface {
 	GetUsagePreview(ctx context.Context, forceRefresh bool) (*codex.CodexUsagePreview, error)
 	GetUsageSnapshot(ctx context.Context, forceRefresh bool, includeRaw ...bool) (*codex.CodexUsageSnapshot, error)
+	ConsumeResetCredit(ctx context.Context) (*codex.CodexResetResult, error)
 }
 
 type codexUsagePreviewTarget struct {
@@ -153,6 +154,41 @@ func GetCodexUsagePreviews(c *gin.Context) {
 		"data": gin.H{
 			"items": results,
 		},
+	})
+}
+
+func ConsumeCodexResetCredit(c *gin.Context) {
+	channelID, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		common.APIRespondWithError(c, http.StatusOK, err)
+		return
+	}
+
+	provider, err := buildCodexUsageProviderByChannelID(channelID)
+	if err != nil {
+		common.APIRespondWithError(c, http.StatusOK, err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), codexUsageDetailFetchTimeout)
+	defer cancel()
+
+	result, err := provider.ConsumeResetCredit(ctx)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": err.Error(),
+			"data":    result,
+		})
+		return
+	}
+
+	model.ClearChannelCodexUsageCache(channelID)
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data":    result,
 	})
 }
 

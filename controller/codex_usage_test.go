@@ -3,10 +3,13 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
+	"one-api/common/cache"
 	"one-api/common/config"
 	commonTest "one-api/common/test"
 	"one-api/model"
@@ -20,9 +23,12 @@ type fakeCodexUsageProvider struct {
 	previewErr           error
 	snapshot             *codex.CodexUsageSnapshot
 	snapshotErr          error
+	resetResult          *codex.CodexResetResult
+	resetErr             error
 	previewForceRefresh  bool
 	snapshotForceRefresh bool
 	snapshotIncludeRaw   bool
+	resetCalled          bool
 }
 
 func (f *fakeCodexUsageProvider) GetUsagePreview(_ context.Context, forceRefresh bool) (*codex.CodexUsagePreview, error) {
@@ -34,6 +40,11 @@ func (f *fakeCodexUsageProvider) GetUsageSnapshot(_ context.Context, forceRefres
 	f.snapshotForceRefresh = forceRefresh
 	f.snapshotIncludeRaw = len(includeRaw) > 0 && includeRaw[0]
 	return f.snapshot, f.snapshotErr
+}
+
+func (f *fakeCodexUsageProvider) ConsumeResetCredit(_ context.Context) (*codex.CodexResetResult, error) {
+	f.resetCalled = true
+	return f.resetResult, f.resetErr
 }
 
 func TestValidateCodexUsageChannelAllowsTaggedCodexChannels(t *testing.T) {
@@ -150,6 +161,161 @@ func TestGetCodexChannelUsageDebugRawRequestsRawSnapshot(t *testing.T) {
 	}
 	if !strings.Contains(recorder.Body.String(), "user@example.com") {
 		t.Fatalf("expected debug response to include raw payload, got %s", recorder.Body.String())
+	}
+}
+
+func TestConsumeCodexResetCreditAllowsTaggedChannelsAndClearsCache(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cache.InitCacheManager()
+
+	originalLoadByID := loadCodexUsageChannelByID
+	originalCreateProvider := createCodexUsageProvider
+	t.Cleanup(func() {
+		loadCodexUsageChannelByID = originalLoadByID
+		createCodexUsageProvider = originalCreateProvider
+	})
+
+	channelID := 7
+	if err := cache.SetCache("codex:usage:preview:7", "cached-preview", time.Minute); err != nil {
+		t.Fatalf("failed to seed preview cache: %v", err)
+	}
+	if err := cache.SetCache("codex:usage:detail:7", "cached-detail", time.Minute); err != nil {
+		t.Fatalf("failed to seed detail cache: %v", err)
+	}
+
+	provider := &fakeCodexUsageProvider{
+		resetResult: &codex.CodexResetResult{
+			ChannelID:    channelID,
+			Code:         "ok",
+			WindowsReset: 1,
+			Credit:       &codex.CodexResetCredit{ID: "credit-1", Status: "redeemed"},
+		},
+	}
+
+	loadCodexUsageChannelByID = func(channelID int) (*model.Channel, error) {
+		return &model.Channel{
+			Id:   channelID,
+			Type: config.ChannelTypeCodex,
+			Tag:  "codex-team",
+			Key:  "credentials",
+		}, nil
+	}
+	createCodexUsageProvider = func(channel *model.Channel) (codexUsageProvider, error) {
+		if channel.Tag != "codex-team" {
+			t.Fatalf("expected tagged channel to reach provider creation, got tag %q", channel.Tag)
+		}
+		return provider, nil
+	}
+
+	ctx, recorder := commonTest.GetContext(http.MethodPost, "/api/channel/7/codex/reset-credit", commonTest.RequestJSONConfig(), nil)
+	ctx.Params = gin.Params{{Key: "id", Value: "7"}}
+
+	ConsumeCodexResetCredit(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", recorder.Code)
+	}
+	if !provider.resetCalled {
+		t.Fatal("expected reset provider method to be called")
+	}
+
+	var resp struct {
+		Success bool                    `json:"success"`
+		Message string                  `json:"message"`
+		Data    *codex.CodexResetResult `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if !resp.Success {
+		t.Fatalf("expected success response, got body %s", recorder.Body.String())
+	}
+	if resp.Data == nil || resp.Data.ChannelID != channelID || resp.Data.WindowsReset != 1 {
+		t.Fatalf("expected reset result payload, got %+v", resp.Data)
+	}
+	if _, err := cache.GetCache[string]("codex:usage:preview:7"); !errors.Is(err, cache.CacheNotFound) {
+		t.Fatalf("expected preview cache to be cleared, got err=%v", err)
+	}
+	if _, err := cache.GetCache[string]("codex:usage:detail:7"); !errors.Is(err, cache.CacheNotFound) {
+		t.Fatalf("expected detail cache to be cleared, got err=%v", err)
+	}
+}
+
+func TestConsumeCodexResetCreditRejectsInvalidChannels(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name    string
+		idParam string
+		channel *model.Channel
+		want    string
+	}{
+		{
+			name:    "invalid id",
+			idParam: "bad",
+			want:    "invalid syntax",
+		},
+		{
+			name:    "non codex",
+			idParam: "8",
+			channel: &model.Channel{Id: 8, Type: config.ChannelTypeOpenAI, Key: "credentials"},
+			want:    "channel type is not Codex",
+		},
+		{
+			name:    "empty key",
+			idParam: "9",
+			channel: &model.Channel{Id: 9, Type: config.ChannelTypeCodex, Key: "  "},
+			want:    "Codex channel credentials are empty",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			originalLoadByID := loadCodexUsageChannelByID
+			originalCreateProvider := createCodexUsageProvider
+			t.Cleanup(func() {
+				loadCodexUsageChannelByID = originalLoadByID
+				createCodexUsageProvider = originalCreateProvider
+			})
+
+			provider := &fakeCodexUsageProvider{}
+
+			loadCodexUsageChannelByID = func(channelID int) (*model.Channel, error) {
+				if tt.channel == nil {
+					return nil, errors.New("channel not found")
+				}
+				return tt.channel, nil
+			}
+			createCodexUsageProvider = func(channel *model.Channel) (codexUsageProvider, error) {
+				return provider, nil
+			}
+
+			ctx, recorder := commonTest.GetContext(http.MethodPost, "/api/channel/"+tt.idParam+"/codex/reset-credit", commonTest.RequestJSONConfig(), nil)
+			ctx.Params = gin.Params{{Key: "id", Value: tt.idParam}}
+
+			ConsumeCodexResetCredit(ctx)
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("expected status 200, got %d", recorder.Code)
+			}
+
+			var resp struct {
+				Success bool   `json:"success"`
+				Message string `json:"message"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("failed to decode response: %v", err)
+			}
+			if resp.Success {
+				t.Fatalf("expected failure response, got body %s", recorder.Body.String())
+			}
+			if !strings.Contains(resp.Message, tt.want) {
+				t.Fatalf("expected message to contain %q, got %q", tt.want, resp.Message)
+			}
+			if provider.resetCalled {
+				t.Fatal("expected invalid channel not to call reset provider method")
+			}
+		})
 	}
 }
 
