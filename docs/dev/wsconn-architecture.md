@@ -2,7 +2,9 @@
 
 ## 文档状态
 
-**已落地。**
+- 状态：当前实现。
+- 适用范围：`common/wsconn`、下游/上游 WebSocket accept/dial、read/write pump、liveness、close reason、gorilla import 隔离。
+- 文档口径：本文描述已经落地的唯一 WebSocket 传输边界；旧 primitives 路线只作为被替代背景，不再是可新增能力的落点。
 
 本文描述 one-hub 的 WebSocket 传输层已从"共享 safety primitives + 业务各自组装"的形态，演进为"`common/wsconn` 作为唯一传输边界、业务层不直接接触 `github.com/gorilla/websocket`"的硬边界形态。
 

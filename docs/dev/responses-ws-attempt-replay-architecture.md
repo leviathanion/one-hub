@@ -7,6 +7,12 @@ lastUpdated: true
 
 # ResponsesWS Attempt Replay 架构设计方案
 
+## 文档状态
+
+- 状态：当前实现。
+- 适用范围：HTTP `/v1/responses` pre-commit retry、ResponsesWS native / HTTP bridge request-level rejection replay、attempt snapshot、replay barrier、rollback-before-retry。
+- 文档口径：本文记录已经落地的 attempt replay 协议及其安全边界；不支持的场景应继续按 barrier fail closed，而不是在 provider/transport 分支里临时补 retry。
+
 ## 目标边界
 
 `GET /v1/responses` 的 WebSocket 入站需要支持 provider request-level rejection 场景下的安全重放。该能力不是在 WS provider error 分支里补一个 retry loop，而是把 HTTP `/v1/responses`、ResponsesWS native upstream、ResponsesWS HTTP bridge upstream 的失败结果统一建模为 **attempt replay protocol**。

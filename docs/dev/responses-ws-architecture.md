@@ -1,5 +1,11 @@
 # ResponsesWS 架构说明
 
+## 文档状态
+
+- 状态：当前实现 + 目标约束。
+- 适用范围：`GET /v1/responses` WebSocket ingress、ResponsesWS actor、turn attempt、quota settlement、upstream snapshot、provider evidence、conservative billing。
+- 文档口径：当前行为以 actor / settlement / transport 已落地 contract 为准；标为“目标”“下一阶段”的段落是后续收敛方向，不应反向解释为现有代码已经完成的结构重组。
+
 ## 目标边界
 
 `GET /v1/responses` 是通用 Responses WebSocket 入站。客户端升级后首帧必须是官方 inline `response.create`，例如：

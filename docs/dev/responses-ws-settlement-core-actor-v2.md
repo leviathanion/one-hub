@@ -2,10 +2,11 @@
 
 ## 文档状态
 
-- 状态：目标方案。建议作为 `docs/dev/responses-ws-architecture.md` 中计费、attempt、provider evidence、actor 状态章节的替换内容，也可以独立落盘为 `docs/dev/responses-ws-settlement-core-actor-v2.md` 并在 `docs/dev/index.md` 中引用。
+- 状态：当前实现 + 目标约束。
 - 适用范围：`GET /v1/responses` WebSocket ingress、ResponsesWS native upstream、ResponsesWS HTTP bridge upstream、turn attempt accounting、quota settlement、provider evidence、affinity side effect、actor 状态重构。
 - 业务口径：ResponsesWS 不要求完全精准；允许有界小幅多计费；不能把可能进入 provider 的 turn 退成免费；不能用无界 worst-case 方式造成大偏差。
-- 关键取舍：proxy 无法在所有 WebSocket / HTTP bridge / SSE 竞态中观测 provider 的真实事务边界。本方案不追求事务级精确，也不把 actor 扩展成完整工作流引擎；目标是把账务判断压缩到一个可测试、可审计、可回放的 bounded pure core：`decideResponsesWSSettlement(...)`，同时把 actor 状态整理成边界清晰的 turn domain model。
+- 文档口径：settlement core、trace replay、provider evidence projection 与 conservative floor 口径已经是当前主规格；actor v2 字段分组仍是后续收敛方向。
+- 关键取舍：proxy 无法在所有 WebSocket / HTTP bridge / SSE 竞态中观测 provider 的真实事务边界。当前实现不追求事务级精确，也不把 actor 扩展成完整工作流引擎；目标是把账务判断压缩到一个可测试、可审计、可回放的 bounded pure core：`decideResponsesWSSettlement(...)`，同时把 actor 状态逐步整理成边界清晰的 turn domain model。
 
 ## 背景
 
@@ -1122,5 +1123,4 @@ Phase 4 不是承诺项，只有在满足以下条件时才做：
 - `docs/dev/responses-ws-architecture.md`：把计费章节替换为本方案的 conservative bounded billing + settlement core 口径。
 - `docs/dev/billing-settlement-architecture.md`：新增 ResponsesWS settlement 类型，说明 exact/floor/observed-or-floor/fixed final quota。
 - `docs/dev/responses-ws-transport-boundary.md`：删除 ambiguous/no-evidence rollback 叙述，改为 floor settlement；明确 bridge local error 与 bridge provider rejection 的区别。
-- `docs/dev/responses-ws-provider-contract.md`：把 “precise send result” 改为 “explicit transport send result”；说明 send result 不是 provider accepted proof。
 - `docs/dev/index.md`：索引更新为 ResponsesWS conservative bounded billing / settlement core。

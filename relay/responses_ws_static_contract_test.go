@@ -194,7 +194,6 @@ func TestResponsesWSDocsUseCurrentProviderContract(t *testing.T) {
 	root := responsesWSTestRepoRoot(t)
 	files := []string{
 		filepath.Join(root, "docs/dev/responses-ws-architecture.md"),
-		filepath.Join(root, "docs/dev/responses-ws-provider-contract.md"),
 		filepath.Join(root, "docs/dev/responses-ws-settlement-core-actor-v2.md"),
 		filepath.Join(root, "docs/dev/responses-ws-transport-boundary.md"),
 	}

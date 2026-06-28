@@ -9,7 +9,7 @@ lastUpdated: true
 
 ## 文档状态
 
-- 状态：正式方案，已选型并已按当前代码落地
+- 状态：当前实现。
 - 目标：描述 `runtime/session` 在 revocation、binding、Sweep、容量回收和 Codex realtime 复用上的并发与一致性架构
 - 文档口径：保留选型说明，但所有描述都以当前终态 contract 为准，不再记录实现前待确认事项
 - 范围：`runtime/session/manager.go`、`runtime/session/redis.go`、Codex execution session manager 接线与 realtime open planning

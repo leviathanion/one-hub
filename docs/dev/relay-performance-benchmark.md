@@ -1,5 +1,11 @@
 # Relay 压测脚本
 
+## 文档状态
+
+- 状态：工具文档。
+- 适用范围：`hack/bench/relay_bench.go` 本地压测脚本、`/v1/chat/completions` 与 `/v1/responses` 热路径指标对照。
+- 文档口径：本文只定义可直接使用的压测工具和推荐口径，不作为线上性能 SLA 或历史压测报告。
+
 用于验证 `/v1/chat/completions` 与 `/v1/responses` 热路径优化是否生效。
 
 脚本位置：

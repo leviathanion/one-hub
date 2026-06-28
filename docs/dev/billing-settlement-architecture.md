@@ -9,7 +9,7 @@ lastUpdated: true
 
 ## 文档状态
 
-- 状态：当前实现 + ResponsesWS v2 目标口径
+- 状态：当前实现 + 目标约束。
 - 适用范围：unary request、Codex realtime turn、ResponsesWS turn、async task
 - 目的：说明 one-hub 统一 settlement truth 入口，以及 ResponsesWS 在不可完全观测 provider 事务边界时采用的保守有界计费政策
 

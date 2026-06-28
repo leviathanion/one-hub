@@ -9,7 +9,7 @@ lastUpdated: true
 
 ## 文档状态
 
-- 状态：正式方案，已选型并已按当前代码落地
+- 状态：当前实现。
 - 目标：统一描述 one-hub 在 `responses`、Codex `realtime`、路由分组、fallback 与 continuation miss 上的 affinity 架构
 - 文档口径：既保留选型说明，也明确当前实现 contract；不再把任何中间过渡形态视为目标方案
 - 范围：`common/groupctx`、`common/config/channel_affinity.go`、`relay/channel_affinity.go`、`runtime/channelaffinity`、Codex routing hint 与 realtime affinity

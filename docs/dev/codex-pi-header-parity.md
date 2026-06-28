@@ -1,5 +1,11 @@
 # Codex / PI OAuth 请求 Header 画像对照
 
+## 文档状态
+
+- 状态：当前诊断。
+- 适用范围：Codex / PI 官方 OAuth 请求 header、body metadata、Responses HTTP / ResponsesWS upstream parity 分析。
+- 文档口径：本文是实测/源码画像与差异诊断，不是最终实现 contract；Codex provider 的目标协议边界以 [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md) 为准。
+
 ## 目标与边界
 
 本文记录 Codex 官方客户端、PI 客户端在 ChatGPT Codex OAuth 路径下的 Responses HTTP / Responses WebSocket header 画像，并对照 one-hub 当前 Codex provider 中转后的差异。

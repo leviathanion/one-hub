@@ -9,7 +9,7 @@ lastUpdated: true
 
 ## 文档状态
 
-- 状态：当前实现
+- 状态：当前实现。
 - 适用范围：Suno、Kling 两类异步任务链路
 - 目的：描述当前代码已经采用的 task 架构、边界和 trade-off，而不是保留未来 task coordinator 草案
 

@@ -1,5 +1,11 @@
 # ResponsesWS Transport 边界重构方案
 
+## 文档状态
+
+- 状态：当前实现 + 目标约束。
+- 适用范围：ResponsesWS native WS / HTTP bridge transport、provider adapter、transport send evidence、bridge open/error classification。
+- 文档口径：主体 transport/evidence 边界已进入当前实现；本文保留 v1 迁移顺序和复审修复记录，阅读时不应把每个“实施时”句式理解为尚未开始。
+
 ## 背景
 
 本文以当前主线架构为基线，定义 ResponsesWS transport 边界的目标方案与迁移顺序。
@@ -549,7 +555,7 @@ OpenAI/Codex 的显式 `http_bridge` 通过同一 `OpenResponsesWS` provider con
 
 actor 需要判断“是否可以把上一轮 final response id 作为 bridge default previous_response_id”时，只依赖 `responsesws.BridgeContinuationDefaultCapable` 这类小 capability interface，不识别 `*responsesws.BridgeSession` 具体类型。Trade-off：多一个可选 interface，但 provider/helper 可以包装或替换 bridge session 而不破坏 continuation 语义；同时避免把 relay actor 重新耦合到某个 transport helper 的 concrete type。
 
-曾评估过的 temporary compatibility flag 未落地，原因是它会让 ResponsesWS 同时存在 `OpenRealtimeSessionWithOptions(...ResponsesWS...)` 与 `OpenResponsesWS` 两条 provider 入口，扩大 accounting/evidence 语义分叉。删除条件与 owner 记录在 `responses-ws-provider-contract.md`：OpenAI/Codex native 与 HTTP bridge 均通过 `OpenResponsesWS`，relay/config 测试覆盖 normalized transport 不进入 legacy realtime open path 后，legacy ResponsesWS 入口视为删除完成。
+曾评估过的 temporary compatibility flag 未落地，原因是它会让 ResponsesWS 同时存在 `OpenRealtimeSessionWithOptions(...ResponsesWS...)` 与 `OpenResponsesWS` 两条 provider 入口，扩大 accounting/evidence 语义分叉。OpenAI/Codex native 与 HTTP bridge 均通过 `OpenResponsesWS`，relay/config 测试覆盖 normalized transport 不进入 legacy realtime open path 后，legacy ResponsesWS 入口视为删除完成。
 
 历史迁移映射仅作为背景，不再是运行路径：
 

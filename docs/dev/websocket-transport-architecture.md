@@ -2,7 +2,9 @@
 
 ## 文档状态
 
-**历史方案，已被 [wsconn 唯一传输边界架构方案](./wsconn-architecture.md) 取代。**
+- 状态：历史方案。
+- 适用范围：旧 `common/requester` WebSocket safety primitives 路线。
+- 文档口径：本文已被 [wsconn 唯一传输边界架构方案](./wsconn-architecture.md) 取代，只保留历史上下文，不代表当前文件结构或新增能力落点；当前 WebSocket 传输边界以 `common/wsconn` 文档为准。
 
 本文记录 one-hub 曾经如何把 `/v1/realtime` 与 `GET /v1/responses` 中重复的 WebSocket I/O 能力收敛为共享 safety primitive。该 primitives-only 路线已完成其阶段性目标，但当前代码已经迁移到 `common/wsconn` 唯一传输边界；下方实现总览仅作为历史上下文保留，不代表当前文件结构。
 
