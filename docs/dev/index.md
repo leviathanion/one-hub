@@ -14,6 +14,7 @@
 | [ResponsesWS 架构说明](./responses-ws-architecture.md) | `/v1/responses` WebSocket、actor、quota、upstream snapshot、conservative billing | 当前 ResponsesWS ingress 架构说明；计费口径是不少计费、允许有界小幅多计费、不追求事务级精确 |
 | [ResponsesWS Transport 边界重构方案](./responses-ws-transport-boundary.md) | ResponsesWS native WS / HTTP bridge transport、provider adapter 边界 | 针对当前 provider 内部分叉的 v1 重构方案 |
 | [ResponsesWS Provider Contract ADR](./responses-ws-provider-contract.md) | ResponsesWS provider-facing contract 决策 | 选择 `OpenResponsesWS` / `responsesws.Upstream` 作为长期 ResponsesWS provider contract |
+| [Codex / PI OAuth 请求 Header 画像对照](./codex-pi-header-parity.md) | Codex / PI 自身 OAuth header 画像、one-hub 中转差异 | 用于后续 Codex provider header parity 修复和回归测试设计 |
 | [WebSocket Transport 复用方案](./websocket-transport-architecture.md) | `/v1/realtime` 与 ResponsesWS 的旧底层 I/O 复用 | 旧方案说明；已被 wsconn 唯一传输边界取代 |
 | [wsconn 唯一传输边界架构方案](./wsconn-architecture.md) | `common/wsconn` 作为唯一 WebSocket 传输边界 | 当前实现；业务层不再持有 `*websocket.Conn` |
 | [one-hub Async Task 架构设计](./task-coordination-architecture.md) | async task、identity、fetch、sweeper、finalize | 当前异步任务架构说明 |
@@ -30,6 +31,7 @@
 | [ResponsesWS 架构说明](./responses-ws-architecture.md) | 当前实现 + 待收敛设计 | `GET /v1/responses` WebSocket ingress、actor/attempt、upstream snapshot、专用 upstream capability、conservative billing 和 actor v2 数据结构 |
 | [ResponsesWS Transport 边界重构方案](./responses-ws-transport-boundary.md) | 目标方案 | 把 native WS / HTTP bridge transport 从 Codex realtime 语义中拆出，供 OpenAI/Codex provider adapter 显式复用 |
 | [ResponsesWS Provider Contract ADR](./responses-ws-provider-contract.md) | ADR | ResponsesWS 长期 provider contract 选择 `OpenResponsesWS(ctx, model, options)` 返回 `responsesws.Upstream` |
+| [Codex / PI OAuth 请求 Header 画像对照](./codex-pi-header-parity.md) | 当前诊断 | 记录 Codex / PI 本体 HTTP/WS header 画像，以及 one-hub 当前中转后的缺失、额外和逻辑不一致字段 |
 | [WebSocket Transport 复用方案](./websocket-transport-architecture.md) | 旧方案说明 | 原 primitives-only safety primitives 路线，已被 `common/wsconn` 唯一传输边界取代 |
 | [wsconn 唯一传输边界架构方案](./wsconn-architecture.md) | 当前实现 | `common/wsconn` 是唯一 WebSocket 传输边界；业务层不再 import gorilla，CloseInfo first-write-wins，PongMiss/Idle 语义拆分 |
 | [one-hub Async Task 架构设计](./task-coordination-architecture.md) | 当前实现 | `tasks` 行、settlement snapshot、local fetch、sweeper、finalize 已形成稳定边界 |
