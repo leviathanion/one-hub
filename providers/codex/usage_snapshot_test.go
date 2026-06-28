@@ -147,7 +147,7 @@ func TestNormalizeUsageSnapshotKeepsExplicitZeroUsage(t *testing.T) {
 	}
 }
 
-func TestNormalizeUsageSnapshotHandlesFiveHourOnlyLimit(t *testing.T) {
+func TestNormalizeUsageSnapshotHandlesPrimaryOnlyWeeklyLimit(t *testing.T) {
 	body := []byte(`{
 		"plan_type": "pro",
 		"rate_limit": {
@@ -164,16 +164,16 @@ func TestNormalizeUsageSnapshotHandlesFiveHourOnlyLimit(t *testing.T) {
 		t.Fatalf("expected normalization to succeed, got %v", err)
 	}
 
-	fiveHourWindow := getCodexUsageWindowFromSlice(snapshot.Windows, "five_hour")
-	if fiveHourWindow == nil || fiveHourWindow.WindowSeconds != 0 || fiveHourWindow.Label != "5h" {
-		t.Fatalf("expected primary-only window without duration to stay usable as 5h, got %+v", snapshot.Windows)
+	weeklyWindow := getCodexUsageWindowFromSlice(snapshot.Windows, "weekly")
+	if weeklyWindow == nil || weeklyWindow.WindowSeconds != 0 || weeklyWindow.Label != "7d" {
+		t.Fatalf("expected primary-only window without duration to stay usable as weekly, got %+v", snapshot.Windows)
 	}
 	if snapshot.LimitReached == nil || !*snapshot.LimitReached || snapshot.Allowed == nil || *snapshot.Allowed {
-		t.Fatalf("expected exhausted 5h-only window to mark snapshot limited, got allowed=%v limit=%v", snapshot.Allowed, snapshot.LimitReached)
+		t.Fatalf("expected exhausted weekly-only window to mark snapshot limited, got allowed=%v limit=%v", snapshot.Allowed, snapshot.LimitReached)
 	}
 }
 
-func TestNormalizeUsageSnapshotHandlesWeeklyOnlyLimit(t *testing.T) {
+func TestNormalizeUsageSnapshotHandlesSecondaryOnlyFiveHourLimit(t *testing.T) {
 	body := []byte(`{
 		"plan_type": "pro",
 		"rate_limit": {
@@ -189,12 +189,12 @@ func TestNormalizeUsageSnapshotHandlesWeeklyOnlyLimit(t *testing.T) {
 		t.Fatalf("expected normalization to succeed, got %v", err)
 	}
 
-	weeklyWindow := getCodexUsageWindowFromSlice(snapshot.Windows, "weekly")
-	if weeklyWindow == nil || weeklyWindow.WindowSeconds != 0 || weeklyWindow.Label != "7d" {
-		t.Fatalf("expected secondary-only window without duration to stay usable as weekly, got %+v", snapshot.Windows)
+	fiveHourWindow := getCodexUsageWindowFromSlice(snapshot.Windows, "five_hour")
+	if fiveHourWindow == nil || fiveHourWindow.WindowSeconds != 0 || fiveHourWindow.Label != "5h" {
+		t.Fatalf("expected secondary-only window without duration to stay usable as 5h, got %+v", snapshot.Windows)
 	}
 	if snapshot.LimitReached == nil || *snapshot.LimitReached || snapshot.Allowed == nil || !*snapshot.Allowed {
-		t.Fatalf("expected non-exhausted weekly-only window to mark snapshot allowed, got allowed=%v limit=%v", snapshot.Allowed, snapshot.LimitReached)
+		t.Fatalf("expected non-exhausted 5h-only window to mark snapshot allowed, got allowed=%v limit=%v", snapshot.Allowed, snapshot.LimitReached)
 	}
 }
 
@@ -622,8 +622,8 @@ func TestClassifyUsageWindowBoundaries(t *testing.T) {
 	}{
 		{name: "empty source", want: ""},
 		{name: "unknown source", source: "custom", want: ""},
-		{name: "mixed case primary fallback", source: " PrImArY ", want: "five_hour"},
-		{name: "mixed case secondary fallback", source: " SeCoNdArY ", want: "weekly"},
+		{name: "mixed case primary fallback", source: " PrImArY ", want: "weekly"},
+		{name: "mixed case secondary fallback", source: " SeCoNdArY ", want: "five_hour"},
 		{name: "duration beats source", source: "custom", windowSeconds: fiveHourWindowSeconds, want: "five_hour"},
 	}
 	for _, tt := range tests {

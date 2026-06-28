@@ -506,10 +506,9 @@ func boolPtr(value bool) *bool {
 
 func classifyUsageWindow(source string, windowSeconds int64) string {
 	// Prefer explicit upstream duration. Some Codex payloads omit one duration
-	// when only the 5h or weekly limiter is active, so we fall back to the stable
-	// field role only when duration is absent. This avoids requiring a complete
-	// primary+secondary JSON shape while still not overriding explicit custom
-	// durations.
+	// when only one limiter is active, so we fall back to the legacy header role
+	// used by CLIProxyAPI/sub2api only when duration is absent: primary is the
+	// weekly window and secondary is the 5h window.
 	switch windowSeconds {
 	case fiveHourWindowSeconds:
 		return "five_hour"
@@ -518,9 +517,9 @@ func classifyUsageWindow(source string, windowSeconds int64) string {
 	case 0:
 		switch strings.ToLower(strings.TrimSpace(source)) {
 		case "primary":
-			return "five_hour"
-		case "secondary":
 			return "weekly"
+		case "secondary":
+			return "five_hour"
 		}
 	}
 	return ""
