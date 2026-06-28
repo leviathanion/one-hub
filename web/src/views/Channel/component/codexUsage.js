@@ -43,6 +43,13 @@ export function normalizeCodexUsageSnapshot(source) {
           account_id: source.account.account_id || ''
         }
       : undefined;
+  const resetCreditCount = Number(source.rate_limit_reset_credits?.available_count);
+  const rateLimitResetCredits =
+    source.rate_limit_reset_credits && typeof source.rate_limit_reset_credits === 'object' && Number.isFinite(resetCreditCount)
+      ? {
+          available_count: resetCreditCount
+        }
+      : undefined;
 
   const normalized = {
     channel_id: channelID,
@@ -50,6 +57,7 @@ export function normalizeCodexUsageSnapshot(source) {
     allowed: source.allowed,
     limit_reached: source.limit_reached,
     fetched_at: source.fetched_at,
+    rate_limit_reset_credits: rateLimitResetCredits,
     windows: Array.isArray(source.windows) ? source.windows : []
   };
 
@@ -318,6 +326,21 @@ export async function fetchCodexUsageDetail(channelID, refresh = true, signal) {
     ...res.data,
     data: normalizeCodexUsageSnapshot(res.data.data)
   };
+}
+
+export async function resetCodexUsageCredit(channelID, signal) {
+  if (!channelID) {
+    return null;
+  }
+
+  const res = await silentAPI.post(`/api/channel/${channelID}/codex/reset-credit`, {}, buildSilentConfig(signal));
+  if (!res?.data) {
+    return null;
+  }
+  if (res.data.success === false) {
+    throw new Error(res.data.message || 'Codex reset credit failed');
+  }
+  return res.data;
 }
 
 function formatCompactNumber(value) {

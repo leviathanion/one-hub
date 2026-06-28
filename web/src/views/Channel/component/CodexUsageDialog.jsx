@@ -2,6 +2,8 @@ import PropTypes from 'prop-types';
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Icon } from '@iconify/react';
+import ConfirmDialog from 'ui-component/confirm-dialog';
+import { showError, showSuccess } from 'utils/common';
 
 import {
   Alert,
@@ -31,6 +33,7 @@ import {
   formatCodexResetCountdown,
   formatCodexWindowSummary,
   getCodexUsageWindow,
+  resetCodexUsageCredit,
   resolveCodexUsageRatio
 } from './codexUsage';
 
@@ -108,13 +111,39 @@ function UsageWindowCard({ t, title, windowData, nowSeconds }) {
 export default function CodexUsageDialog({ open, record, snapshot, loading, errorText, onRefresh, onClose }) {
   const { t } = useTranslation();
   const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1000));
+  const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const statusMeta = usageStatusMeta(t, snapshot);
   const fiveHourWindow = getCodexUsageWindow(snapshot, 'five_hour');
   const weeklyWindow = getCodexUsageWindow(snapshot, 'weekly');
   const rawPayload = snapshot?.raw == null ? '' : typeof snapshot.raw === 'string' ? snapshot.raw : JSON.stringify(snapshot.raw, null, 2);
+  const resetCreditCount = Number(snapshot?.rate_limit_reset_credits?.available_count);
+  const hasResetCreditCount = Number.isFinite(resetCreditCount);
+  const canResetCredit = hasResetCreditCount && resetCreditCount > 0;
+
+  const handleResetCredit = async () => {
+    if (!record?.id || resetting) {
+      return;
+    }
+
+    setResetting(true);
+    try {
+      await resetCodexUsageCredit(record.id);
+      showSuccess(t('channel_row.codexResetCreditSuccess'));
+      setResetConfirmOpen(false);
+      if (typeof onRefresh === 'function') {
+        await onRefresh();
+      }
+    } catch (error) {
+      showError(error?.message || t('channel_row.codexResetCreditFailed'));
+    } finally {
+      setResetting(false);
+    }
+  };
 
   useEffect(() => {
     if (!open) {
+      setResetConfirmOpen(false);
       return undefined;
     }
 
@@ -153,10 +182,33 @@ export default function CodexUsageDialog({ open, record, snapshot, loading, erro
                     size="small"
                     variant="outlined"
                   />
+                  <Chip
+                    label={`${t('channel_row.codexResetCreditsRemaining')}: ${hasResetCreditCount ? resetCreditCount : '--'}`}
+                    size="small"
+                    color={canResetCredit ? 'info' : 'default'}
+                    variant="outlined"
+                  />
                 </Stack>
-                <Button size="small" onClick={onRefresh} disabled={loading} startIcon={<Icon icon="solar:refresh-bold-duotone" />}>
-                  {t('channel_row.codexRefresh')}
-                </Button>
+                <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+                  <Button
+                    size="small"
+                    color="warning"
+                    variant="outlined"
+                    onClick={() => setResetConfirmOpen(true)}
+                    disabled={loading || resetting || !canResetCredit}
+                    startIcon={<Icon icon="solar:restart-bold-duotone" />}
+                  >
+                    {resetting ? t('channel_row.codexResettingCredit') : t('channel_row.codexResetCredit')}
+                  </Button>
+                  <Button
+                    size="small"
+                    onClick={onRefresh}
+                    disabled={loading || resetting}
+                    startIcon={<Icon icon="solar:refresh-bold-duotone" />}
+                  >
+                    {t('channel_row.codexRefresh')}
+                  </Button>
+                </Stack>
               </Stack>
 
               <Divider sx={{ my: 2 }} />
@@ -231,6 +283,27 @@ export default function CodexUsageDialog({ open, record, snapshot, loading, erro
       <DialogActions>
         <Button onClick={onClose}>{t('common.close')}</Button>
       </DialogActions>
+      <ConfirmDialog
+        open={resetConfirmOpen}
+        onClose={() => {
+          if (!resetting) {
+            setResetConfirmOpen(false);
+          }
+        }}
+        title={t('channel_row.codexResetCreditConfirmTitle')}
+        content={t('channel_row.codexResetCreditConfirmContent', { count: hasResetCreditCount ? resetCreditCount : '--' })}
+        action={
+          <Button
+            color="warning"
+            variant="contained"
+            onClick={handleResetCredit}
+            disabled={resetting}
+            startIcon={resetting ? <CircularProgress size={16} color="inherit" /> : <Icon icon="solar:restart-bold-duotone" />}
+          >
+            {resetting ? t('channel_row.codexResettingCredit') : t('channel_row.codexResetCredit')}
+          </Button>
+        }
+      />
     </Dialog>
   );
 }
