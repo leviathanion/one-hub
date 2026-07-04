@@ -12,6 +12,15 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+type repeatingByteReader struct{}
+
+func (repeatingByteReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'x'
+	}
+	return len(p), nil
+}
+
 func TestCacheRequestBodyAndCloneReusableBodyMap(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -50,6 +59,17 @@ func TestCacheRequestBodyAndCloneReusableBodyMap(t *testing.T) {
 	}
 	if secondMap["items"].([]interface{})[0].(map[string]interface{})["k"] != "v" {
 		t.Fatalf("expected array clone to remain unchanged, got %v", secondMap["items"])
+	}
+}
+
+func TestCacheRequestBodyRejectsOversizedBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/", io.LimitReader(repeatingByteReader{}, maxCachedRequestBodyBytes+1))
+
+	if _, err := CacheRequestBody(ctx); err == nil {
+		t.Fatal("expected oversized request body to be rejected")
 	}
 }
 

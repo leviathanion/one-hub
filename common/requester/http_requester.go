@@ -47,12 +47,16 @@ func NewHTTPRequester(proxyAddr string, errorHandler HttpErrorHandler) *HTTPRequ
 type requestOptions struct {
 	body   any
 	header http.Header
+	ctx    context.Context
 }
 
 type requestOption func(*requestOptions)
 
-func (r *HTTPRequester) setProxy() context.Context {
-	return utils.SetProxy(r.proxyAddr, r.Context)
+func (r *HTTPRequester) requestContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = r.Context
+	}
+	return utils.SetProxy(r.proxyAddr, ctx)
 }
 
 // 创建请求
@@ -64,7 +68,7 @@ func (r *HTTPRequester) NewRequest(method, url string, setters ...requestOption)
 	for _, setter := range setters {
 		setter(args)
 	}
-	req, err := utils.RequestBuilder(r.setProxy(), method, url, args.body, args.header)
+	req, err := utils.RequestBuilder(r.requestContext(args.ctx), method, url, args.body, args.header)
 	if err != nil {
 		return nil, err
 	}
@@ -95,11 +99,16 @@ func (r *HTTPRequester) SendRequest(req *http.Request, response any, outputResp 
 
 	if outputResp {
 		var buf bytes.Buffer
-		tee := io.TeeReader(resp.Body, &buf)
+		originalBody := resp.Body
+		tee := io.TeeReader(originalBody, &buf)
 		err = DecodeResponse(tee, response)
+		closeErr := originalBody.Close()
 
 		// 将响应体重新写入 resp.Body
-		resp.Body = io.NopCloser(&buf)
+		resp.Body = io.NopCloser(bytes.NewReader(buf.Bytes()))
+		if err == nil {
+			err = closeErr
+		}
 	} else {
 		err = json.NewDecoder(resp.Body).Decode(response)
 	}
@@ -194,6 +203,21 @@ func (r *HTTPRequester) WithBody(body any) requestOption {
 	return func(args *requestOptions) {
 		args.body = body
 	}
+}
+
+// WithContext sets the request context while preserving requester-owned
+// transport context values such as proxy configuration.
+func (r *HTTPRequester) WithContext(ctx context.Context) requestOption {
+	return func(args *requestOptions) {
+		args.ctx = ctx
+	}
+}
+
+func (r *HTTPRequester) WithRequestContext(req *http.Request, ctx context.Context) *http.Request {
+	if req == nil || ctx == nil {
+		return req
+	}
+	return req.WithContext(r.requestContext(ctx))
 }
 
 // 设置请求头

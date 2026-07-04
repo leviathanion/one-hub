@@ -22,6 +22,8 @@ var StreamClosed = []byte("stream_closed")
 
 var ErrStreamLineTooLarge = errors.New("stream line exceeds configured read limit")
 
+var streamErrorSendTimeout = time.Second
+
 type HandlerPrefix[T streamable] func(rawLine *[]byte, dataChan chan T, errChan chan error)
 type HandlerPrefixWithEmitter[T streamable] func(rawLine *[]byte, emitter StreamEmitter[T])
 
@@ -235,7 +237,7 @@ func sendStreamError[T streamable](stream *streamReader[T], err error) bool {
 		default:
 		}
 	}
-	timer := time.NewTimer(time.Second)
+	timer := time.NewTimer(streamErrorSendTimeout)
 	defer timer.Stop()
 	select {
 	case stream.ErrChan <- err:
@@ -243,7 +245,8 @@ func sendStreamError[T streamable](stream *streamReader[T], err error) bool {
 	case <-streamDone(stream):
 		return false
 	case <-timer.C:
-		logger.SysError(fmt.Sprintf("无法发送流错误: %v", err))
+		logger.SysError(fmt.Sprintf("failed to send stream error: %v", err))
+		stream.Close()
 		return false
 	}
 }

@@ -26,6 +26,8 @@ type CanonicalRequestState struct {
 	DecodeMeta   *requestbody.DecodeMeta
 }
 
+const maxCachedRequestBodyBytes int64 = 64 << 20
+
 func ensureCanonicalRequestState(c *gin.Context) *CanonicalRequestState {
 	if c == nil {
 		return nil
@@ -119,12 +121,15 @@ func CacheRequestBody(c *gin.Context) ([]byte, error) {
 		return requestBody, nil
 	}
 
-	requestBody, err := io.ReadAll(c.Request.Body)
+	requestBody, err := io.ReadAll(io.LimitReader(c.Request.Body, maxCachedRequestBodyBytes+1))
 	if err != nil {
 		return nil, err
 	}
 	if err = c.Request.Body.Close(); err != nil {
 		return nil, err
+	}
+	if int64(len(requestBody)) > maxCachedRequestBodyBytes {
+		return nil, fmt.Errorf("request body exceeds %d bytes", maxCachedRequestBodyBytes)
 	}
 
 	state := ensureCanonicalRequestState(c)

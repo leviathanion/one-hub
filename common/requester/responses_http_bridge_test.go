@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"one-api/types"
+
+	"github.com/spf13/viper"
 )
 
 func stubResponsesHTTPBridgeResolver(t *testing.T, addrs []netip.Addr, err error) {
@@ -139,6 +141,32 @@ func TestResponsesHTTPBridgeRejectsHTTPProxyBecauseTargetCannotBePinned(t *testi
 	}, "http://proxy.example:8080")
 	if !errors.Is(err, errResponsesHTTPBridgeHTTPProxyUnsupported) {
 		t.Fatalf("expected HTTP proxy to be rejected for bridge pinning, got %v", err)
+	}
+}
+
+func TestResponsesHTTPBridgeClientTimeoutUsesRelayTimeoutWhenGlobalClientMissing(t *testing.T) {
+	originalHTTPClient := HTTPClient
+	originalRelayTimeout := viper.Get("relay_timeout")
+	HTTPClient = nil
+	t.Cleanup(func() {
+		HTTPClient = originalHTTPClient
+		viper.Set("relay_timeout", originalRelayTimeout)
+	})
+	viper.Set("relay_timeout", 7)
+
+	client, transport, err := responsesHTTPBridgeClient(ResolvedUpstreamResponsesHTTPURL{
+		Host:         "api.example.com",
+		OriginalHost: "api.example.com",
+		IPs:          []netip.Addr{netip.MustParseAddr("203.0.113.10")},
+	}, "")
+	if err != nil {
+		t.Fatalf("build bridge client: %v", err)
+	}
+	if transport != nil {
+		transport.CloseIdleConnections()
+	}
+	if client.Timeout != 7*time.Second {
+		t.Fatalf("expected relay_timeout fallback, got %v", client.Timeout)
 	}
 }
 

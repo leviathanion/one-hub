@@ -274,6 +274,30 @@ func TestStreamEmitterSendDataUnblocksOnClose(t *testing.T) {
 	assertStreamChannelClosed(t, "error", errChan)
 }
 
+func TestSendStreamErrorClosesStreamWhenErrorChannelBlocked(t *testing.T) {
+	originalTimeout := streamErrorSendTimeout
+	streamErrorSendTimeout = 10 * time.Millisecond
+	t.Cleanup(func() {
+		streamErrorSendTimeout = originalTimeout
+	})
+
+	stream := &streamReader[string]{
+		DataChan: make(chan string),
+		ErrChan:  make(chan error, 1),
+		done:     make(chan struct{}),
+	}
+	stream.ErrChan <- errors.New("first error already queued")
+
+	if sendStreamError(stream, errors.New("second error")) {
+		t.Fatal("expected blocked stream error send to fail")
+	}
+	select {
+	case <-stream.done:
+	case <-time.After(time.Second):
+		t.Fatal("expected blocked stream error send to close the stream")
+	}
+}
+
 func assertStreamChannelClosed[T any](t *testing.T, name string, ch <-chan T) {
 	t.Helper()
 	select {

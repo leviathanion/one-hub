@@ -157,10 +157,19 @@ func responsesHTTPBridgeClient(resolved ResolvedUpstreamResponsesHTTPURL, proxyA
 			return errResponsesHTTPBridgeRedirectUnsupported
 		},
 	}
-	if HTTPClient != nil {
-		client.Timeout = HTTPClient.Timeout
-	}
+	client.Timeout = responsesHTTPBridgeClientTimeout()
 	return client, transport, nil
+}
+
+func responsesHTTPBridgeClientTimeout() time.Duration {
+	if HTTPClient != nil {
+		return HTTPClient.Timeout
+	}
+	relayTimeout := utils.GetOrDefault("relay_timeout", 0)
+	if relayTimeout <= 0 {
+		return 0
+	}
+	return time.Duration(relayTimeout) * time.Second
 }
 
 type closeIdleTransportOnBodyClose struct {
