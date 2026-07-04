@@ -299,18 +299,20 @@ func (q *Quota) Undo(c *gin.Context) {
 	if q == nil || !q.HasPreConsumedSideEffect() {
 		return
 	}
+	// Roll back synchronously even though this keeps failure paths on the
+	// request's critical path. The alternative is a short window where a retry
+	// or resubmission can observe double pre-consumption before the goroutine
+	// returns quota.
 	ctx := q.rollbackContext(c)
-	go func() {
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				logger.LogError(ctx, fmt.Sprintf("panic returning pre-consumed quota: %v", recovered))
-				logger.LogError(ctx, "stacktrace from panic: "+string(debug.Stack()))
-			}
-		}()
-		if err := q.undoSynchronouslyWithContext(ctx); err != nil {
-			logger.LogError(ctx, "error return pre-consumed quota: "+err.Error())
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			logger.LogError(ctx, fmt.Sprintf("panic returning pre-consumed quota: %v", recovered))
+			logger.LogError(ctx, "stacktrace from panic: "+string(debug.Stack()))
 		}
 	}()
+	if err := q.undoSynchronouslyWithContext(ctx); err != nil {
+		logger.LogError(ctx, "error return pre-consumed quota: "+err.Error())
+	}
 }
 
 func (q *Quota) UndoSynchronously(c *gin.Context) error {

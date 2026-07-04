@@ -3,19 +3,88 @@ package relay
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/model"
 	providersBase "one-api/providers/base"
+	"one-api/relay/relay_util"
 	"one-api/types"
 
 	"github.com/gin-gonic/gin"
 )
+
+type mainTestProvider struct {
+	providersBase.BaseProvider
+}
+
+func (p *mainTestProvider) GetRequestHeaders() map[string]string {
+	return nil
+}
+
+type retryProviderSetupFailureRelay struct {
+	c        *gin.Context
+	provider providersBase.ProviderInterface
+	setupErr error
+}
+
+func (r *retryProviderSetupFailureRelay) send() (*types.OpenAIErrorWithStatusCode, bool) {
+	return nil, false
+}
+
+func (r *retryProviderSetupFailureRelay) getPromptTokens() (int, error) {
+	return 0, nil
+}
+
+func (r *retryProviderSetupFailureRelay) setRequest() error {
+	return nil
+}
+
+func (r *retryProviderSetupFailureRelay) getRequest() any {
+	return nil
+}
+
+func (r *retryProviderSetupFailureRelay) setProvider(string) error {
+	return r.setupErr
+}
+
+func (r *retryProviderSetupFailureRelay) getProvider() providersBase.ProviderInterface {
+	return r.provider
+}
+
+func (r *retryProviderSetupFailureRelay) getOriginalModel() string {
+	return "gpt-test"
+}
+
+func (r *retryProviderSetupFailureRelay) getModelName() string {
+	return "gpt-test"
+}
+
+func (r *retryProviderSetupFailureRelay) getContext() *gin.Context {
+	return r.c
+}
+
+func (r *retryProviderSetupFailureRelay) IsStream() bool {
+	return false
+}
+
+func (r *retryProviderSetupFailureRelay) GetFirstResponseTime() time.Time {
+	return time.Time{}
+}
+
+func (r *retryProviderSetupFailureRelay) HandleJsonError(*types.OpenAIErrorWithStatusCode) {}
+
+func (r *retryProviderSetupFailureRelay) HandleStreamError(*types.OpenAIErrorWithStatusCode) {}
+
+func (r *retryProviderSetupFailureRelay) SetHeartbeat(bool) *relay_util.Heartbeat {
+	return nil
+}
 
 func TestApplyPreMappingBeforeRequestReSelectsProviderWhenToolsAreInjected(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -268,5 +337,120 @@ func TestExecuteRelayAttemptsHandlesResponsesContinuationMissOutsideHealthFailur
 	}
 	if meta["responses_continuation_recovery_strategy"] != "manual_replay_required" {
 		t.Fatalf("expected manual replay recovery strategy meta, got %#v", meta)
+	}
+}
+
+func TestExecuteRelayAttemptsReturnsRetryProviderSetupError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	ctx.Set("requestStartTime", time.Now())
+
+	relay := &retryProviderSetupFailureRelay{
+		c: ctx,
+		provider: &mainTestProvider{BaseProvider: providersBase.BaseProvider{
+			Channel: &model.Channel{Id: 17, Name: "primary", Type: config.ChannelTypeOpenAI},
+		}},
+		setupErr: errors.New("provider selection unavailable"),
+	}
+
+	originalRelayHandler := relayHandlerFunc
+	originalProcessChannelRelayError := processChannelRelayErrorFunc
+	originalShouldRetry := shouldRetryFunc
+	originalShouldCooldowns := shouldCooldownsFunc
+	originalRetryTimes := config.RetryTimes
+	originalRetryTimeout := config.RetryTimeOut
+	t.Cleanup(func() {
+		relayHandlerFunc = originalRelayHandler
+		processChannelRelayErrorFunc = originalProcessChannelRelayError
+		shouldRetryFunc = originalShouldRetry
+		shouldCooldownsFunc = originalShouldCooldowns
+		config.RetryTimes = originalRetryTimes
+		config.RetryTimeOut = originalRetryTimeout
+	})
+
+	config.RetryTimes = 1
+	config.RetryTimeOut = 60
+	relayHandlerFunc = func(RelayBaseInterface) (*types.OpenAIErrorWithStatusCode, bool) {
+		return common.StringErrorWrapperLocal("upstream unavailable", "provider_upstream_failed", http.StatusBadGateway), false
+	}
+	processChannelRelayErrorFunc = func(context.Context, int, string, *types.OpenAIErrorWithStatusCode, int) {}
+	shouldRetryFunc = func(*gin.Context, *types.OpenAIErrorWithStatusCode, int) bool {
+		return true
+	}
+	shouldCooldownsFunc = func(*gin.Context, *model.Channel, *types.OpenAIErrorWithStatusCode) {}
+
+	apiErr := executeRelayAttempts(relay)
+	if apiErr == nil {
+		t.Fatal("expected retry provider setup failure to be returned")
+	}
+	if apiErr.StatusCode != http.StatusServiceUnavailable || apiErr.Code != "one_hub_error" {
+		t.Fatalf("expected 503 one_hub_error from retry provider setup, got status=%d code=%#v err=%+v", apiErr.StatusCode, apiErr.Code, apiErr)
+	}
+	if !strings.Contains(apiErr.Message, "provider selection unavailable") {
+		t.Fatalf("expected provider setup error message, got %q", apiErr.Message)
+	}
+}
+
+func TestExecuteRelayAttemptsStopsAfterQuotaRollbackFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ctx.Set("requestStartTime", time.Now())
+
+	relay := &retryProviderSetupFailureRelay{
+		c: ctx,
+		provider: &mainTestProvider{BaseProvider: providersBase.BaseProvider{
+			Channel: &model.Channel{Id: 19, Name: "primary", Type: config.ChannelTypeOpenAI},
+		}},
+		setupErr: errors.New("retry should not select another provider"),
+	}
+
+	originalRelayHandler := relayHandlerFunc
+	originalProcessChannelRelayError := processChannelRelayErrorFunc
+	originalShouldRetry := shouldRetryFunc
+	originalShouldCooldowns := shouldCooldownsFunc
+	originalRetryTimes := config.RetryTimes
+	originalRetryTimeout := config.RetryTimeOut
+	t.Cleanup(func() {
+		relayHandlerFunc = originalRelayHandler
+		processChannelRelayErrorFunc = originalProcessChannelRelayError
+		shouldRetryFunc = originalShouldRetry
+		shouldCooldownsFunc = originalShouldCooldowns
+		config.RetryTimes = originalRetryTimes
+		config.RetryTimeOut = originalRetryTimeout
+	})
+
+	config.RetryTimes = 1
+	config.RetryTimeOut = 60
+	handlerCalls := 0
+	retryChecks := 0
+	relayHandlerFunc = func(RelayBaseInterface) (*types.OpenAIErrorWithStatusCode, bool) {
+		handlerCalls++
+		return common.StringErrorWrapperLocal("quota rollback failed", "quota_rollback_failed", http.StatusInternalServerError), true
+	}
+	processChannelRelayErrorFunc = func(context.Context, int, string, *types.OpenAIErrorWithStatusCode, int) {}
+	shouldRetryFunc = func(*gin.Context, *types.OpenAIErrorWithStatusCode, int) bool {
+		retryChecks++
+		return true
+	}
+	shouldCooldownsFunc = func(*gin.Context, *model.Channel, *types.OpenAIErrorWithStatusCode) {}
+
+	apiErr := executeRelayAttempts(relay)
+	if apiErr == nil {
+		t.Fatal("expected quota rollback failure to be returned")
+	}
+	if apiErr.Code != "quota_rollback_failed" || !apiErr.LocalError {
+		t.Fatalf("expected local quota_rollback_failed error, got %+v", apiErr)
+	}
+	if handlerCalls != 1 {
+		t.Fatalf("expected rollback failure to stop after one attempt, got %d handler calls", handlerCalls)
+	}
+	if retryChecks != 0 {
+		t.Fatalf("expected rollback failure done=true to skip retry checks, got %d", retryChecks)
 	}
 }

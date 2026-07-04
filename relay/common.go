@@ -405,6 +405,18 @@ func currentRealtimeChannelSelection(c *gin.Context) realtimeChannelSelection {
 	return selection
 }
 
+func channelIDInList(ids []int, target int) bool {
+	if target <= 0 {
+		return false
+	}
+	for _, id := range ids {
+		if id == target {
+			return true
+		}
+	}
+	return false
+}
+
 func preferredChannelWaitBudget() time.Duration {
 	if config.PreferredChannelWaitMilliseconds <= 0 {
 		return 0
@@ -550,7 +562,14 @@ func fetchChannelByModelWithSelection(c *gin.Context, modelName string, selectio
 			return nil, err
 		}
 		if selection.preferredChannelID > 0 && (channel == nil || channel.Id != selection.preferredChannelID) {
-			clearCurrentChannelAffinity(c)
+			preferredSkippedForRequest := channelIDInList(selection.skipChannelIDs, selection.preferredChannelID)
+			// A skip-list miss means this request already tried the preferred
+			// channel and is intentionally avoiding it for retry. Do not erase
+			// durable affinity on that transient signal; only clear records when
+			// the preferred channel is genuinely unavailable to normal selection.
+			if !preferredSkippedForRequest {
+				clearCurrentChannelAffinity(c)
+			}
 			if selection.strictPreferredChannel {
 				return nil, errors.New("preferred affinity channel is unavailable")
 			}
@@ -844,7 +863,9 @@ func shouldRetry(c *gin.Context, apiErr *types.OpenAIErrorWithStatusCode, channe
 	switch apiErr.StatusCode {
 	case http.StatusTooManyRequests, http.StatusTemporaryRedirect:
 		return true
-	case http.StatusRequestTimeout, http.StatusGatewayTimeout, 524:
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return false
+	case http.StatusRequestTimeout, 524:
 		return false
 	case http.StatusBadRequest:
 		return shouldRetryBadRequest(channelType, apiErr)
@@ -855,6 +876,9 @@ func shouldRetry(c *gin.Context, apiErr *types.OpenAIErrorWithStatusCode, channe
 	}
 
 	if apiErr.StatusCode/100 == 2 {
+		return false
+	}
+	if apiErr.StatusCode/100 == 4 {
 		return false
 	}
 	return true

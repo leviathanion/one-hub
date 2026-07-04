@@ -164,6 +164,47 @@ func TestFetchChannelByModelWithSelectionRejectsFallbackWhenAffinityIsStrict(t *
 	}
 }
 
+func TestFetchChannelByModelWithSelectionPreservesPreferredBindingWhenSkippedForRetry(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	channelGroupSnapshot := snapshotChannelGroup()
+	t.Cleanup(func() {
+		restoreChannelGroup(channelGroupSnapshot)
+	})
+
+	const (
+		sessionID          = "strict-affinity-retry-skip"
+		defaultChannelID   = 11
+		preferredChannelID = 22
+	)
+
+	model.ChannelGroup = buildRealtimeTestChannelGroup(defaultChannelID, preferredChannelID)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/realtime?model=gpt-5", nil)
+	ctx.Request.Header.Set("X-Session-Id", sessionID)
+	ctx.Set("token_id", 302)
+	ctx.Set("token_group", "default")
+
+	rememberChannelAffinityKey(ctx, channelAffinityKindRealtime, sessionID)
+	recordCurrentChannelAffinity(ctx, channelAffinityKindRealtime, preferredChannelID)
+	setPreferredChannelFromAffinity(ctx, preferredChannelID)
+	ctx.Set(channelAffinityStrictContextKey, true)
+	ctx.Set("skip_channel_ids", []int{preferredChannelID})
+
+	channel, err := fetchChannelByModelWithSelection(ctx, "gpt-5", currentRealtimeChannelSelection(ctx))
+	if err == nil {
+		t.Fatal("expected strict affinity retry skip to reject fallback routing")
+	}
+	if channel != nil {
+		t.Fatalf("expected no channel to be returned, got %#v", channel)
+	}
+	if got, ok := lookupChannelAffinity(ctx, channelAffinityKindRealtime, sessionID); !ok || got != preferredChannelID {
+		t.Fatalf("expected retry-local skip not to clear durable affinity, got channel=%d ok=%v", got, ok)
+	}
+}
+
 func TestFetchChannelByModelWithSelectionWaitsForPreferredCooldown(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

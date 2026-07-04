@@ -117,6 +117,7 @@ func executeRelayAttempts(relay RelayBaseInterface) *types.OpenAIErrorWithStatus
 		}
 
 		if err := relay.setProvider(relay.getOriginalModel()); err != nil {
+			apiErr = wrapRelaySetupError(relay, "provider", err, "one_hub_error", http.StatusServiceUnavailable)
 			break
 		}
 		if err := reparseRequestAfterProviderSelection(relay); err != nil {
@@ -208,7 +209,16 @@ func RelayHandler(relay RelayBaseInterface) (err *types.OpenAIErrorWithStatusCod
 		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	}
 	if err != nil {
-		quota.Undo(relay.getContext())
+		if rollbackErr := quota.UndoSynchronously(relay.getContext()); rollbackErr != nil {
+			message := fmt.Sprintf("quota rollback failed after relay error: provider_error=%s rollback_error=%s", err.Error(), rollbackErr.Error())
+			if c := relay.getContext(); c != nil && c.Request != nil {
+				logger.LogError(c.Request.Context(), message)
+			} else {
+				logger.SysError(message)
+			}
+			err = common.StringErrorWrapperLocal("quota rollback failed", "quota_rollback_failed", http.StatusInternalServerError)
+			done = true
+		}
 		return
 	}
 

@@ -355,6 +355,14 @@ func TestRelayCommonStreamingAndRetryHelpers(t *testing.T) {
 	if !shouldRetry(retryCtx, &types.OpenAIErrorWithStatusCode{StatusCode: http.StatusInternalServerError}, config.ChannelTypeCodex) {
 		t.Fatal("expected 5xx responses to remain retryable")
 	}
+	if !shouldRetry(newRelayTestContext(nil), &types.OpenAIErrorWithStatusCode{StatusCode: http.StatusGatewayTimeout}, config.ChannelTypeCodex) {
+		t.Fatal("expected 504 responses to use the generic 5xx retry policy")
+	}
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound} {
+		if shouldRetry(newRelayTestContext(nil), &types.OpenAIErrorWithStatusCode{StatusCode: status}, config.ChannelTypeCodex) {
+			t.Fatalf("expected status %d to be non-retryable", status)
+		}
+	}
 	retryCtx.Set("specific_channel_id", 99)
 	if shouldRetry(retryCtx, &types.OpenAIErrorWithStatusCode{StatusCode: http.StatusTooManyRequests}, config.ChannelTypeCodex) {
 		t.Fatal("expected explicit channel pins to disable retries")

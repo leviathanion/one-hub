@@ -383,6 +383,58 @@ func TestPreQuotaConsumptionRollbackableIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestQuotaUndoReturnsAfterRollbackIsApplied(t *testing.T) {
+	useQuotaReserveTestDB(t)
+	insertQuotaReserveFixtures(t, 1000)
+
+	originalPricing := model.PricingInstance
+	originalBatch := config.BatchUpdateEnabled
+	originalRedisEnabled := config.RedisEnabled
+	originalPreConsumedQuota := config.PreConsumedQuota
+	model.PricingInstance = &model.Pricing{
+		Prices: map[string]*model.Price{
+			"gpt-5": {Model: "gpt-5", Type: model.TokensPriceType, Input: 1, Output: 1},
+		},
+	}
+	config.BatchUpdateEnabled = false
+	config.RedisEnabled = false
+	config.PreConsumedQuota = 500
+	t.Cleanup(func() {
+		model.PricingInstance = originalPricing
+		config.BatchUpdateEnabled = originalBatch
+		config.RedisEnabled = originalRedisEnabled
+		config.PreConsumedQuota = originalPreConsumedQuota
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ctx.Set("id", 1)
+	ctx.Set("token_id", 1)
+	ctx.Set("group_ratio", 1.0)
+
+	quota := NewQuota(ctx, "gpt-5", 100)
+	if apiErr := quota.PreQuotaConsumptionRollbackable(); apiErr != nil {
+		t.Fatalf("expected preconsume to succeed, got %+v", apiErr)
+	}
+	quota.Undo(ctx)
+
+	if quota.HasPreConsumedSideEffect() {
+		t.Fatalf("expected Undo to clear rollback state before returning, truth=%v cache=%v", quota.PreconsumeTruthApplied, quota.PreconsumeCacheApplied)
+	}
+	var user model.User
+	if err := model.DB.First(&user, 1).Error; err != nil {
+		t.Fatalf("expected user lookup to succeed, got %v", err)
+	}
+	var token model.Token
+	if err := model.DB.First(&token, 1).Error; err != nil {
+		t.Fatalf("expected token lookup to succeed, got %v", err)
+	}
+	if user.Quota != 1000 || token.RemainQuota != 1000 || token.UsedQuota != 0 {
+		t.Fatalf("expected Undo to restore quota before returning, user=%d token_remain=%d token_used=%d", user.Quota, token.RemainQuota, token.UsedQuota)
+	}
+}
+
 func TestConsumeSettlementSuccessClearsPreConsumeRollbackState(t *testing.T) {
 	useQuotaReserveTestDB(t)
 	insertQuotaReserveFixtures(t, 1000)
