@@ -21,6 +21,8 @@ type nativeTestAdapter struct {
 	closeMap   func(context.Context, ProviderCloseInfo) ProviderCloseResult
 }
 
+type nativeTestContextKey string
+
 func (a nativeTestAdapter) PrepareClientFrame(ctx context.Context, frame Frame) (Frame, error) {
 	if a.prepare != nil {
 		return a.prepare(ctx, frame)
@@ -138,6 +140,56 @@ func TestNativeSessionRecvProviderFrameAndCloseOrigins(t *testing.T) {
 	}
 }
 
+func TestNativeSessionReadPumpUsesOptionContext(t *testing.T) {
+	client, server := wstest.Pair(t)
+	key := nativeTestContextKey("trace")
+	baseCtx := context.WithValue(context.Background(), key, "trace-1")
+	seen := make(chan any, 1)
+	session := NewNativeSession(client, nativeTestAdapter{
+		handle: func(ctx context.Context, frame Frame) ProviderFrameResult {
+			seen <- ctx.Value(key)
+			return ProviderFrameResult{EmitFrame: &frame, Origin: RecvDetailOriginProviderFrame}
+		},
+	}, NativeSessionOptions{Context: baseCtx})
+
+	if err := server.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.created"}`)); err != nil {
+		t.Fatalf("write provider frame: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := session.Recv(ctx); err != nil {
+		t.Fatalf("recv provider frame: %v", err)
+	}
+	select {
+	case got := <-seen:
+		if got != "trace-1" {
+			t.Fatalf("expected read pump to pass option context value, got %#v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for adapter context")
+	}
+}
+
+func TestNativeSessionReadPumpSurvivesCanceledOpenContext(t *testing.T) {
+	client, server := wstest.Pair(t)
+	openCtx, cancelOpen := context.WithCancel(context.Background())
+	session := NewNativeSession(client, nativeTestAdapter{}, NativeSessionOptions{Context: openCtx})
+
+	cancelOpen()
+	if err := server.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.created"}`)); err != nil {
+		t.Fatalf("write provider frame after open context cancel: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	event, err := session.Recv(ctx)
+	if err != nil {
+		t.Fatalf("recv provider frame after open context cancel: %v", err)
+	}
+	if event.Frame == nil || string(event.Frame.Payload()) != `{"type":"response.created"}` {
+		t.Fatalf("expected provider frame after open context cancel, got %+v", event)
+	}
+}
+
 func TestNativeSessionRejectsBinaryProviderFrameByDefault(t *testing.T) {
 	client, server := wstest.Pair(t)
 	session := NewNativeSession(client, nativeTestAdapter{}, NativeSessionOptions{})
@@ -236,7 +288,7 @@ func TestNativeSessionFiltersBootstrapWithoutDownstreamFrameOrUsage(t *testing.T
 
 func TestNativeSessionProviderEOFOrigin(t *testing.T) {
 	session := NewNativeSession(nil, nil, NativeSessionOptions{})
-	session.handleProviderClose(wsconn.CloseInfo{Kind: wsconn.CloseKindReadError, Err: io.EOF})
+	session.handleProviderClose(context.Background(), wsconn.CloseInfo{Kind: wsconn.CloseKindReadError, Err: io.EOF})
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -257,7 +309,7 @@ func TestNativeSessionLocalWriteCloseDoesNotBecomeProviderClose(t *testing.T) {
 			return ProviderCloseResult{}
 		},
 	}, NativeSessionOptions{})
-	session.handleProviderClose(wsconn.CloseInfo{Kind: wsconn.CloseKindWriteError, Reason: "write_message_failed", Err: writeErr})
+	session.handleProviderClose(context.Background(), wsconn.CloseInfo{Kind: wsconn.CloseKindWriteError, Reason: "write_message_failed", Err: writeErr})
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -530,6 +582,66 @@ func TestNativeSessionContainsAdapterPanicAtPrepareBoundary(t *testing.T) {
 	}
 	if strings.Contains(result.Err.Error(), "raw secret panic") || strings.Contains(diagnostics[0].DetailError, "raw secret panic") {
 		t.Fatalf("expected recovered value not to be exposed, err=%v diag=%+v", result.Err, diagnostics[0])
+	}
+}
+
+func TestNativeSessionAdapterPanicForceEnqueuesWhenQueueFull(t *testing.T) {
+	client, _ := wstest.Pair(t)
+	session := NewNativeSession(client, nativeTestAdapter{
+		prepare: func(context.Context, Frame) (Frame, error) {
+			panic("raw secret panic")
+		},
+	}, NativeSessionOptions{RecvQueueSize: 1})
+
+	frame := NewTextFrame([]byte(`{"type":"response.created"}`))
+	if !session.enqueue(UpstreamEvent{Frame: &frame, DetailOrigin: RecvDetailOriginProviderFrame}) {
+		t.Fatal("expected seed provider frame to fill queue")
+	}
+
+	result := session.SendClientWithResult(context.Background(), SendRequest{
+		AttemptID: "attempt-panic",
+		Frame:     NewTextFrame([]byte(`{"type":"response.create"}`)),
+	})
+	if result.Status != ResponsesWSTransportSendNotAttempted || !errors.Is(result.Err, ErrAdapterPanic) {
+		t.Fatalf("expected adapter panic send result, got %+v", result)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	event, err := session.Recv(ctx)
+	if err != nil {
+		t.Fatalf("recv forced panic event: %v", err)
+	}
+	if event.DetailOrigin != RecvDetailOriginAdapterPanic || event.DetailPhase != RecvDetailPhasePrepareClientFrame || event.AttemptID != "attempt-panic" || !errors.Is(event.Err, ErrAdapterPanic) {
+		t.Fatalf("expected adapter panic evidence to replace old buffered event, got %+v", event)
+	}
+}
+
+func TestNativeSessionInvalidProviderFrameResultPreservesAdapterError(t *testing.T) {
+	client, server := wstest.Pair(t)
+	adapterErr := errors.New("adapter context")
+	session := NewNativeSession(client, nativeTestAdapter{
+		handle: func(context.Context, Frame) ProviderFrameResult {
+			frame := NewTextFrame([]byte(`{"type":"response.created"}`))
+			return ProviderFrameResult{
+				Origin:    RecvDetailOriginProviderFrame,
+				EmitFrame: &frame,
+				Err:       adapterErr,
+			}
+		},
+	}, NativeSessionOptions{})
+
+	if err := server.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.created"}`)); err != nil {
+		t.Fatalf("write provider frame: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	event, err := session.Recv(ctx)
+	if err != nil {
+		t.Fatalf("recv invalid provider frame result: %v", err)
+	}
+	if event.DetailOrigin != RecvDetailOriginProviderMalformed || !errors.Is(event.Err, ErrInvalidProviderFrameResult) || !errors.Is(event.Err, adapterErr) {
+		t.Fatalf("expected invalid result to preserve adapter error context, got %+v", event)
 	}
 }
 

@@ -220,6 +220,24 @@ func TestBridgeSessionOpenSuccessReturnsAttemptedAndStreamsProviderEvents(t *tes
 	}
 }
 
+func TestBridgeSessionAbortEnqueuesLocalAbortEvidence(t *testing.T) {
+	session := NewBridgeSession(bridgeTestOpener{}, BridgeSessionOptions{})
+	session.Abort("test_abort")
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	event, err := session.Recv(ctx)
+	if err != nil {
+		t.Fatalf("expected local abort evidence before closed error, got %v", err)
+	}
+	if event.DetailOrigin != RecvDetailOriginBridgeLocalAbort || !errors.Is(event.Err, ErrUpstreamClosed) {
+		t.Fatalf("expected bridge local abort evidence, got %+v", event)
+	}
+	if _, err := session.Recv(ctx); !errors.Is(err, ErrUpstreamClosed) {
+		t.Fatalf("expected bridge session to be closed after abort evidence, got %v", err)
+	}
+}
+
 func TestBridgeSessionIgnoresSSEControlLines(t *testing.T) {
 	stream := newBridgeTestStream()
 	session := NewBridgeSession(bridgeTestOpener{stream: stream}, BridgeSessionOptions{})
@@ -1925,34 +1943,91 @@ func (o *bridgeProviderRejectThenStreamOpener) OpenBridgeStream(_ context.Contex
 	return o.stream, nil, nil
 }
 
+func TestBridgeSessionAbortQueueFullPreservesLocalAbortEvidence(t *testing.T) {
+	session := NewBridgeSession(bridgeTestOpener{}, BridgeSessionOptions{RecvQueueSize: 1})
+	session.recvCh <- UpstreamEvent{DetailOrigin: RecvDetailOriginProxyLocal}
+
+	session.Abort("test_abort_queue_full")
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	event, err := session.Recv(ctx)
+	if err != nil {
+		t.Fatalf("expected local abort evidence, got %v", err)
+	}
+	if event.DetailOrigin != RecvDetailOriginBridgeLocalAbort || !errors.Is(event.Err, ErrUpstreamClosed) {
+		t.Fatalf("expected forced local abort event, got %+v", event)
+	}
+	if _, err := session.Recv(ctx); !errors.Is(err, ErrUpstreamClosed) {
+		t.Fatalf("expected upstream closed after local abort evidence, got %v", err)
+	}
+}
+
+func TestBridgeSessionProviderQueueFullPreservesTriggeringFrame(t *testing.T) {
+	stream := newBridgeTestStream()
+	session := NewBridgeSession(bridgeTestOpener{stream: stream}, BridgeSessionOptions{RecvQueueSize: 1})
+
+	result := session.SendClientWithResult(context.Background(), SendRequest{AttemptID: "attempt-test", Frame: NewTextFrame([]byte(`{"type":"response.create"}`))})
+	if result.Status != ResponsesWSTransportSendAttempted {
+		t.Fatalf("expected bridge stream open to be attempted, got %+v", result)
+	}
+	stream.dataCh <- `data: {"type":"response.output_text.delta","delta":"kept"}`
+
+	select {
+	case <-stream.closed:
+	case <-time.After(time.Second):
+		t.Fatal("expected provider queue pressure to close the bridge stream")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	event, err := session.Recv(ctx)
+	if err != nil {
+		t.Fatalf("expected triggering provider frame, got %v", err)
+	}
+	if event.DetailOrigin != RecvDetailOriginProviderStream || event.Frame == nil || !strings.Contains(string(event.Frame.Payload()), `"delta":"kept"`) {
+		t.Fatalf("expected forced provider frame evidence, got %+v", event)
+	}
+	if _, err := session.Recv(ctx); !errors.Is(err, ErrUpstreamClosed) {
+		t.Fatalf("expected upstream closed after triggering provider frame, got %v", err)
+	}
+}
+
 func TestBridgeSessionTerminalQueueFullAbortsInsteadOfDropping(t *testing.T) {
 	cases := []struct {
-		name    string
-		trigger func(*bridgeTestStream)
+		name       string
+		trigger    func(*bridgeTestStream)
+		wantOrigin RecvDetailOrigin
+		wantErr    bool
 	}{
 		{
 			name: "done marker",
 			trigger: func(stream *bridgeTestStream) {
 				stream.dataCh <- "data: [DONE]"
 			},
+			wantOrigin: RecvDetailOriginBridgeStreamEOF,
 		},
 		{
 			name: "malformed payload",
 			trigger: func(stream *bridgeTestStream) {
 				stream.dataCh <- "data: not-json"
 			},
+			wantOrigin: RecvDetailOriginBridgeStreamError,
+			wantErr:    true,
 		},
 		{
 			name: "eof error channel",
 			trigger: func(stream *bridgeTestStream) {
 				stream.errCh <- io.EOF
 			},
+			wantOrigin: RecvDetailOriginBridgeStreamEOF,
 		},
 		{
 			name: "read error channel",
 			trigger: func(stream *bridgeTestStream) {
 				stream.errCh <- errors.New("read failed")
 			},
+			wantOrigin: RecvDetailOriginBridgeStreamError,
+			wantErr:    true,
 		},
 		{
 			name: "both channels closed",
@@ -1960,6 +2035,7 @@ func TestBridgeSessionTerminalQueueFullAbortsInsteadOfDropping(t *testing.T) {
 				close(stream.dataCh)
 				close(stream.errCh)
 			},
+			wantOrigin: RecvDetailOriginBridgeStreamEOF,
 		},
 	}
 
@@ -1985,9 +2061,15 @@ func TestBridgeSessionTerminalQueueFullAbortsInsteadOfDropping(t *testing.T) {
 
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
-			// 第一次 Recv 读走积压的 bridge_stream_opened。
-			if _, err := session.Recv(ctx); err != nil {
-				t.Fatalf("expected buffered bridge_stream_opened event, got %v", err)
+			event, err := session.Recv(ctx)
+			if err != nil {
+				t.Fatalf("expected queue-full trigger event, got %v", err)
+			}
+			if event.DetailOrigin != tc.wantOrigin {
+				t.Fatalf("expected queue-full to preserve trigger origin %s, got %+v", tc.wantOrigin, event)
+			}
+			if (event.Err != nil) != tc.wantErr {
+				t.Fatalf("expected trigger error presence %v, got %+v", tc.wantErr, event)
 			}
 			// done 已被 Abort 关闭，再次 Recv 必须立即返回 ErrUpstreamClosed，而非阻塞到 ctx 超时。
 			if _, err := session.Recv(ctx); !errors.Is(err, ErrUpstreamClosed) {

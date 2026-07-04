@@ -13,6 +13,7 @@ const (
 	RecvDetailOriginBridgeOpenProviderError RecvDetailOrigin = "bridge_open_provider_error"
 	RecvDetailOriginBridgeStreamError       RecvDetailOrigin = "bridge_stream_error"
 	RecvDetailOriginBridgeStreamEOF         RecvDetailOrigin = "bridge_stream_eof"
+	RecvDetailOriginBridgeLocalAbort        RecvDetailOrigin = "bridge_local_abort"
 	RecvDetailOriginNativeProviderClose     RecvDetailOrigin = "native_provider_close"
 	RecvDetailOriginNativeProviderEOF       RecvDetailOrigin = "native_provider_eof"
 	RecvDetailOriginNativeLocalAbort        RecvDetailOrigin = "native_local_abort"
@@ -41,6 +42,7 @@ func RecvDetailOriginKnown(origin RecvDetailOrigin) bool {
 		RecvDetailOriginBridgeOpenProviderError,
 		RecvDetailOriginBridgeStreamError,
 		RecvDetailOriginBridgeStreamEOF,
+		RecvDetailOriginBridgeLocalAbort,
 		RecvDetailOriginNativeProviderClose,
 		RecvDetailOriginNativeProviderEOF,
 		RecvDetailOriginNativeLocalAbort,
@@ -75,6 +77,7 @@ func ExpectedPayloadOriginForRecvDetailOrigin(origin RecvDetailOrigin) (PayloadO
 		RecvDetailOriginSyntheticBridge,
 		RecvDetailOriginBridgeStreamError,
 		RecvDetailOriginBridgeStreamEOF,
+		RecvDetailOriginBridgeLocalAbort,
 		RecvDetailOriginProxyLocal,
 		RecvDetailOriginAdapterPanic,
 		RecvDetailOriginNativeLocalAbort,

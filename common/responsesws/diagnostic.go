@@ -52,5 +52,5 @@ func panicClass(recovered any) string {
 
 func diagnosticStackHash(stack []byte) string {
 	sum := sha256.Sum256(stack)
-	return fmt.Sprintf("%x", sum[:8])
+	return fmt.Sprintf("%x", sum[:16])
 }

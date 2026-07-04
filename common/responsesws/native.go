@@ -21,6 +21,7 @@ var ErrNativeReadPumpPanic = errors.New("responses websocket native read pump pa
 
 // NativeSessionOptions configures the provider-native websocket transport.
 type NativeSessionOptions struct {
+	Context       context.Context
 	RecvQueueSize int
 	Diagnostics   NativeDiagnosticHook
 	ProviderName  string
@@ -33,6 +34,8 @@ type NativeSessionOptions struct {
 type NativeSession struct {
 	conn         *wsconn.ManagedConn
 	adapter      ProviderAdapter
+	base         context.Context
+	cancel       context.CancelFunc
 	diag         NativeDiagnosticHook
 	providerName string
 	channelID    int
@@ -56,9 +59,16 @@ func NewNativeSession(conn *wsconn.ManagedConn, adapter ProviderAdapter, options
 	if queueSize <= 0 {
 		queueSize = defaultNativeRecvQueueSize
 	}
+	base := options.Context
+	if base == nil {
+		base = context.Background()
+	}
+	base, cancel := context.WithCancel(context.WithoutCancel(base))
 	return &NativeSession{
 		conn:         conn,
 		adapter:      adapter,
+		base:         base,
+		cancel:       cancel,
 		diag:         options.Diagnostics,
 		providerName: options.ProviderName,
 		channelID:    options.ChannelID,
@@ -117,7 +127,7 @@ func (s *NativeSession) sendClient(ctx context.Context, req SendRequest) Respons
 		prepared, err = s.prepareClientFrame(ctx, frame)
 		if err != nil {
 			if errors.Is(err, ErrAdapterPanic) {
-				_ = s.enqueue(UpstreamEvent{
+				_ = s.forceEnqueueLatest(UpstreamEvent{
 					AttemptID:    strings.TrimSpace(req.AttemptID),
 					DetailOrigin: RecvDetailOriginAdapterPanic,
 					DetailPhase:  RecvDetailPhasePrepareClientFrame,
@@ -255,6 +265,10 @@ func (s *NativeSession) startReadPump() {
 }
 
 func (s *NativeSession) runReadPump() {
+	ctx := s.base
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err := s.readPumpPanicError(recovered)
@@ -274,11 +288,11 @@ func (s *NativeSession) runReadPump() {
 			s.handleProviderMessage(ctx, mt, payload)
 		},
 		OnClose: func(info wsconn.CloseInfo) {
-			s.handleProviderClose(info)
+			s.handleProviderClose(ctx, info)
 			s.closeDone()
 		},
 	}
-	pump.Run(context.Background())
+	pump.Run(ctx)
 }
 
 func (s *NativeSession) handleProviderMessage(ctx context.Context, mt wsconn.MessageType, payload []byte) {
@@ -304,6 +318,9 @@ func (s *NativeSession) handleProviderMessage(ctx context.Context, mt wsconn.Mes
 	}
 	result := s.handleProviderFrame(ctx, nativeFrameFromMessage(mt, payload))
 	if err := ValidateProviderFrameResult(result); err != nil {
+		if result.Err != nil {
+			err = errors.Join(err, result.Err)
+		}
 		result = ProviderFrameResult{
 			Origin:         RecvDetailOriginProviderMalformed,
 			Err:            err,
@@ -324,7 +341,11 @@ func (s *NativeSession) handleProviderMessage(ctx context.Context, mt wsconn.Mes
 		frame := *result.EmitFrame
 		event.Frame = &frame
 	}
-	_ = s.enqueue(event)
+	if result.Origin == RecvDetailOriginAdapterPanic {
+		_ = s.forceEnqueueLatest(event)
+	} else {
+		_ = s.enqueue(event)
+	}
 	if result.CloseTransport {
 		s.close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Code: wsconn.CloseProtocolError, Reason: string(result.Origin), Err: result.Err})
 	}
@@ -338,12 +359,15 @@ func nativeAdapterSupportsBinary(adapter ProviderAdapter) bool {
 	return ok && capable.SupportsBinaryProviderFrames()
 }
 
-func (s *NativeSession) handleProviderClose(info wsconn.CloseInfo) {
+func (s *NativeSession) handleProviderClose(ctx context.Context, info wsconn.CloseInfo) {
 	if s == nil {
 		return
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if s.adapter != nil && nativeCloseInfoCanMapProviderClose(info) {
-		result := s.mapProviderClose(context.Background(), nativeProviderCloseInfoFromWSConn(info))
+		result := s.mapProviderClose(ctx, nativeProviderCloseInfoFromWSConn(info))
 		if result.ProviderClose != nil {
 			_ = s.enqueue(UpstreamEvent{
 				ProviderClose: &ProviderClose{
@@ -540,6 +564,32 @@ func (s *NativeSession) enqueue(event UpstreamEvent) bool {
 	}
 }
 
+func (s *NativeSession) forceEnqueueLatest(event UpstreamEvent) bool {
+	if s == nil {
+		return false
+	}
+	select {
+	case <-s.done:
+		return false
+	default:
+	}
+	for {
+		select {
+		case s.recvCh <- event:
+			return true
+		default:
+			select {
+			case <-s.recvCh:
+				continue
+			case <-s.done:
+				return false
+			default:
+				return false
+			}
+		}
+	}
+}
+
 func (s *NativeSession) enqueueTerminal(event UpstreamEvent) bool {
 	if s == nil {
 		return false
@@ -564,6 +614,9 @@ func (s *NativeSession) close(info wsconn.CloseInfo) {
 	s.closeOnce.Do(func() {
 		if s.conn != nil {
 			s.conn.Close(info)
+		}
+		if s.cancel != nil {
+			s.cancel()
 		}
 		s.closeDone()
 	})

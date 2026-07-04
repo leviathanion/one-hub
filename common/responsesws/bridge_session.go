@@ -589,6 +589,15 @@ func (s *BridgeSession) Abort(reason string) {
 		s.mu.Unlock()
 		return
 	}
+	attemptID := s.activeAttemptID
+	if strings.TrimSpace(attemptID) == "" {
+		attemptID = s.openingAttemptID
+	}
+	_ = s.forceEnqueueLatestLocked(UpstreamEvent{
+		AttemptID:    attemptID,
+		DetailOrigin: RecvDetailOriginBridgeLocalAbort,
+		Err:          ErrUpstreamClosed,
+	})
 	s.closed = true
 	active := s.active
 	activeCancel := s.activeCancel
@@ -1153,6 +1162,11 @@ func (s *BridgeSession) releaseActiveAndEnqueueEventOrAbort(stream requester.Str
 			case s.recvCh <- event:
 				enqueued = true
 			default:
+				// On terminal queue pressure, preserve the event that caused
+				// shutdown over older buffered bridge bookkeeping. The actor can
+				// reconstruct closure from done, but cannot reconstruct a lost
+				// provider terminal/error frame.
+				enqueued = s.forceEnqueueLatestLocked(event)
 				s.closed = true
 				active = s.active
 				openingCancel = s.openingCancel
@@ -1184,7 +1198,7 @@ func (s *BridgeSession) enqueueEventOrAbort(event UpstreamEvent, abortReason str
 	if s.enqueue(event) {
 		return true
 	}
-	s.Abort(abortReason)
+	s.abortWithFinalEvent(abortReason, event)
 	return false
 }
 
@@ -1217,6 +1231,74 @@ func (s *BridgeSession) enqueueBlocking(event UpstreamEvent) bool {
 func (s *BridgeSession) enqueueLocked(event UpstreamEvent) bool {
 	if s == nil || s.closed {
 		return false
+	}
+	select {
+	case s.recvCh <- event:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *BridgeSession) abortWithFinalEvent(abortReason string, event UpstreamEvent) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	if strings.TrimSpace(event.AttemptID) == "" {
+		event.AttemptID = s.activeAttemptID
+		if strings.TrimSpace(event.AttemptID) == "" {
+			event.AttemptID = s.openingAttemptID
+		}
+	}
+	if event.DetailOrigin == "" {
+		event.DetailOrigin = RecvDetailOriginBridgeLocalAbort
+	}
+	if event.Err == nil && event.DetailOrigin == RecvDetailOriginBridgeLocalAbort {
+		event.Err = ErrUpstreamClosed
+	}
+	_ = s.forceEnqueueLatestLocked(event)
+	s.closed = true
+	active := s.active
+	activeCancel := s.activeCancel
+	openingCancel := s.openingCancel
+	s.active = nil
+	s.activeCancel = nil
+	s.activeAttemptID = ""
+	s.activeStreamID = 0
+	s.opening = false
+	s.openingCancel = nil
+	s.openingAttemptID = ""
+	close(s.done)
+	s.mu.Unlock()
+	logger.LogWarn(context.Background(), fmt.Sprintf("responses websocket bridge abort after recv queue pressure: reason=%s origin=%s", strings.TrimSpace(abortReason), event.DetailOrigin))
+	if activeCancel != nil {
+		activeCancel()
+	}
+	if openingCancel != nil {
+		openingCancel()
+	}
+	if active != nil {
+		active.Close()
+	}
+}
+
+func (s *BridgeSession) forceEnqueueLatestLocked(event UpstreamEvent) bool {
+	if s == nil || s.recvCh == nil {
+		return false
+	}
+	select {
+	case s.recvCh <- event:
+		return true
+	default:
+	}
+	select {
+	case <-s.recvCh:
+	default:
 	}
 	select {
 	case s.recvCh <- event:
