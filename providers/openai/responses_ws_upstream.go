@@ -17,11 +17,15 @@ import (
 
 type openAIResponsesWSAdapter struct{}
 
-func (p *OpenAIProvider) OpenResponsesWS(ctx context.Context, modelName string, options responsesws.OpenOptions) (responsesws.Upstream, *types.OpenAIErrorWithStatusCode) {
+func (p *OpenAIProvider) OpenResponsesWS(ctx context.Context, req *responsesws.OpenRequest) (responsesws.Upstream, *types.OpenAIErrorWithStatusCode) {
 	if p == nil {
 		return nil, common.StringErrorWrapperLocal("provider is required", "ws_request_failed", http.StatusInternalServerError)
 	}
-	switch options.Transport {
+	if req == nil {
+		return nil, common.StringErrorWrapperLocal("responses websocket open request is required", "invalid_request_error", http.StatusBadRequest)
+	}
+	modelName := req.SelectedModel
+	switch req.Transport {
 	case "", runtimesession.TransportModeResponsesWS:
 		if !p.supportsNativeResponsesWSTransport() {
 			return nil, responsesWSUnsupportedForChannel()
@@ -35,11 +39,11 @@ func (p *OpenAIProvider) OpenResponsesWS(ctx context.Context, modelName string, 
 			model:    modelName,
 		}, responsesws.BridgeSessionOptions{
 			Context:                   ctx,
-			Diagnostics:               options.Diagnostics,
+			Diagnostics:               req.Diagnostics,
 			ProviderName:              "openai",
-			ChannelID:                 options.ChannelID,
+			ChannelID:                 req.ChannelID,
 			Transport:                 string(runtimesession.TransportModeResponsesHTTPBridge),
-			InitialPreviousResponseID: options.PreviousResponseID,
+			InitialPreviousResponseID: req.PreviousResponseID,
 			OpenTimeout:               config.ResponsesWSBridgeOpenTimeout(),
 			MaxStreamEventBytes:       config.RealtimeWebsocketReadLimit(),
 		}), nil
@@ -51,9 +55,10 @@ func (p *OpenAIProvider) OpenResponsesWS(ctx context.Context, modelName string, 
 		return nil, errWithCode
 	}
 	return responsesws.NewNativeSession(conn, openAIResponsesWSAdapter{}, responsesws.NativeSessionOptions{
-		Diagnostics:  options.Diagnostics,
+		Context:      ctx,
+		Diagnostics:  req.Diagnostics,
 		ProviderName: "openai",
-		ChannelID:    options.ChannelID,
+		ChannelID:    req.ChannelID,
 		Transport:    string(runtimesession.TransportModeResponsesWS),
 	}), nil
 }
@@ -156,7 +161,7 @@ func (o openAIResponsesWSBridgeOpener) OpenBridgeStream(ctx context.Context, bri
 		return nil, nil, errWithCode
 	}
 	if ctx != nil {
-		req = req.WithContext(ctx)
+		req = o.provider.Requester.WithRequestContext(req, ctx)
 	}
 	defer req.Body.Close()
 	stream, errWithCode := o.provider.createResponsesHTTPBridgeStreamFromRequestWithOptions(req, &request, responsesHTTPBridgeStreamReadOptions())

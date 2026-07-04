@@ -29,6 +29,11 @@ import (
 	"go.uber.org/zap"
 )
 
+func openAIResponsesWSTestSession(provider *OpenAIProvider, ctx context.Context, model string, req responsesws.OpenRequest) (responsesws.Upstream, *types.OpenAIErrorWithStatusCode) {
+	req.SelectedModel = model
+	return provider.OpenResponsesWS(ctx, &req)
+}
+
 func newOpenAIRealtimeHelperSession() *openAIRealtimeSession {
 	return &openAIRealtimeSession{
 		model:     "gpt-4o-realtime-preview",
@@ -436,7 +441,7 @@ func TestOpenAIResponsesWSDefersReadUntilRecvAndFiltersSessionCreated(t *testing
 	defer server.Close()
 
 	provider := newOpenAIRealtimeTestProvider(server.URL)
-	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{})
+	session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{})
 	if errWithCode != nil {
 		t.Fatalf("expected responses websocket session to open, got %v", errWithCode)
 	}
@@ -465,7 +470,7 @@ func TestOpenAIResponsesWSDefersReadUntilRecvAndFiltersSessionCreated(t *testing
 
 func TestOpenAIResponsesWSHTTPBridgeUsesBridgeSession(t *testing.T) {
 	provider := newOpenAIRealtimeTestProvider("http://127.0.0.1")
-	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
+	session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
 		Transport: runtimesession.TransportModeResponsesHTTPBridge,
 	})
 	if errWithCode != nil {
@@ -489,7 +494,7 @@ func TestOpenAIResponsesWSUnsupportedWhenResponsesEndpointMissing(t *testing.T) 
 		{name: "http bridge", transport: runtimesession.TransportModeResponsesHTTPBridge},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
+			session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
 				Transport: tc.transport,
 			})
 			if session != nil {
@@ -510,7 +515,7 @@ func TestOpenAIResponsesWSCustomNativeRequiresExplicitCapability(t *testing.T) {
 		Other: `{"responses_ws_self_hosted":true}`,
 		Proxy: &proxy,
 	}, "http://127.0.0.1:1")
-	session, errWithCode := disabled.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{})
+	session, errWithCode := openAIResponsesWSTestSession(disabled, context.Background(), "gpt-5", responsesws.OpenRequest{})
 	if session != nil {
 		session.Abort("test_cleanup")
 	}
@@ -530,7 +535,7 @@ func TestOpenAIResponsesWSCustomNativeRequiresExplicitCapability(t *testing.T) {
 		Other: `{"responses_ws_native":true,"responses_ws_self_hosted":true}`,
 		Proxy: &proxy,
 	}, server.URL)
-	session, errWithCode = enabled.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{})
+	session, errWithCode = openAIResponsesWSTestSession(enabled, context.Background(), "gpt-5", responsesws.OpenRequest{})
 	if errWithCode != nil {
 		close(releaseDone)
 		t.Fatalf("expected custom native ResponsesWS with explicit capability to open, got %v", errWithCode)
@@ -549,7 +554,7 @@ func TestOpenAIResponsesWSOpenAITypeCustomBaseURLRequiresExplicitNativeCapabilit
 		Other:   `{"responses_ws_self_hosted":true}`,
 		Proxy:   &proxy,
 	}, "https://api.openai.com")
-	session, errWithCode := disabled.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{})
+	session, errWithCode := openAIResponsesWSTestSession(disabled, context.Background(), "gpt-5", responsesws.OpenRequest{})
 	if session != nil {
 		session.Abort("test_cleanup")
 	}
@@ -571,7 +576,7 @@ func TestOpenAIResponsesWSOpenAITypeCustomBaseURLRequiresExplicitNativeCapabilit
 		Other:   `{"responses_ws_native":true,"responses_ws_self_hosted":true}`,
 		Proxy:   &proxy,
 	}, "https://api.openai.com")
-	session, errWithCode = enabled.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{})
+	session, errWithCode = openAIResponsesWSTestSession(enabled, context.Background(), "gpt-5", responsesws.OpenRequest{})
 	if errWithCode != nil {
 		close(releaseDone)
 		t.Fatalf("expected explicit native capability to allow OpenAI type custom base URL, got %v", errWithCode)
@@ -608,7 +613,7 @@ func TestOpenAIResponsesWSHTTPBridgeStreamsResponsesEvents(t *testing.T) {
 
 	provider := newOpenAIRealtimeTestProvider(server.URL)
 	provider.Usage = &types.Usage{}
-	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
+	session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
 		Transport: runtimesession.TransportModeResponsesHTTPBridge,
 	})
 	if errWithCode != nil {
@@ -689,7 +694,7 @@ func TestOpenAIResponsesWSHTTPBridgeDeliversFinalEventWithoutTrailingNewline(t *
 
 	provider := newOpenAIRealtimeTestProvider(server.URL)
 	provider.Usage = &types.Usage{}
-	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
+	session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
 		Transport: runtimesession.TransportModeResponsesHTTPBridge,
 	})
 	if errWithCode != nil {
@@ -757,7 +762,7 @@ func TestOpenAIResponsesWSHTTPBridgeClassicAzureUsesResourceLevelResponsesURL(t 
 	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
 	provider.Context = ctx
 
-	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
+	session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
 		Transport: runtimesession.TransportModeResponsesHTTPBridge,
 	})
 	if errWithCode != nil {
@@ -796,7 +801,7 @@ func TestOpenAIResponsesWSHTTPBridgeURLPolicyRejectsUnsafeDefaults(t *testing.T)
 			Type:  config.ChannelTypeOpenAI,
 			Proxy: &proxy,
 		}, "http://127.0.0.1:1")
-		session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
+		session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
 			Transport: runtimesession.TransportModeResponsesHTTPBridge,
 		})
 		if errWithCode != nil {
@@ -818,7 +823,7 @@ func TestOpenAIResponsesWSHTTPBridgeURLPolicyRejectsUnsafeDefaults(t *testing.T)
 			Other: `{"responses_ws_self_hosted":true}`,
 			Proxy: &proxy,
 		}, "http://169.254.169.254")
-		session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
+		session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
 			Transport: runtimesession.TransportModeResponsesHTTPBridge,
 		})
 		if errWithCode != nil {
@@ -840,7 +845,7 @@ func TestOpenAIResponsesWSHTTPBridgeURLPolicyPrecedesBridgeBodyValidation(t *tes
 		Type:  config.ChannelTypeOpenAI,
 		Proxy: &proxy,
 	}, "http://127.0.0.1:1")
-	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
+	session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
 		Transport: runtimesession.TransportModeResponsesHTTPBridge,
 	})
 	if errWithCode != nil {
@@ -882,7 +887,7 @@ func TestOpenAIResponsesWSHTTPBridgeDoesNotReuseOpenPreviousResponseID(t *testin
 	defer server.Close()
 
 	provider := newOpenAIRealtimeTestProvider(server.URL)
-	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
+	session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
 		Transport:          runtimesession.TransportModeResponsesHTTPBridge,
 		PreviousResponseID: "resp_open_default",
 	})
@@ -943,7 +948,7 @@ func TestOpenAIResponsesWSHTTPBridgeSeparatesOpenFailureAndStreamEOF(t *testing.
 
 	provider := newOpenAIRealtimeTestProvider(rejectServer.URL)
 	provider.Usage = &types.Usage{}
-	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
+	session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
 		Transport: runtimesession.TransportModeResponsesHTTPBridge,
 	})
 	if errWithCode != nil {
@@ -970,7 +975,7 @@ func TestOpenAIResponsesWSHTTPBridgeSeparatesOpenFailureAndStreamEOF(t *testing.
 	defer eofServer.Close()
 	provider = newOpenAIRealtimeTestProvider(eofServer.URL)
 	provider.Usage = &types.Usage{}
-	session, errWithCode = provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
+	session, errWithCode = openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
 		Transport: runtimesession.TransportModeResponsesHTTPBridge,
 	})
 	if errWithCode != nil {
@@ -1021,7 +1026,7 @@ func TestOpenAIOpenResponsesWSUsesResponsesTransportWithoutCompatMode(t *testing
 	defer server.Close()
 
 	provider := newOpenAIRealtimeTestProvider(server.URL)
-	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{})
+	session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{})
 	if errWithCode != nil {
 		t.Fatalf("expected responses websocket session to open, got %v", errWithCode)
 	}
@@ -1061,7 +1066,7 @@ func TestOpenAIResponsesWSUsesInlineResponseCreatePayload(t *testing.T) {
 	defer server.Close()
 
 	provider := newOpenAIRealtimeTestProvider(server.URL)
-	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{})
+	session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{})
 	if errWithCode != nil {
 		t.Fatalf("expected responses websocket session to open, got %v", errWithCode)
 	}
@@ -1094,7 +1099,7 @@ func TestOpenAIResponsesWSMalformedProviderPayloadClosesAsProviderMalformed(t *t
 	defer server.Close()
 
 	provider := newOpenAIRealtimeTestProvider(server.URL)
-	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{})
+	session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{})
 	if errWithCode != nil {
 		t.Fatalf("expected responses websocket session to open, got %v", errWithCode)
 	}
@@ -1120,7 +1125,7 @@ func TestOpenAIResponsesWSSchemaInvalidProviderPayloadClosesAsProviderMalformed(
 	defer server.Close()
 
 	provider := newOpenAIRealtimeTestProvider(server.URL)
-	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{})
+	session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{})
 	if errWithCode != nil {
 		t.Fatalf("expected responses websocket session to open, got %v", errWithCode)
 	}
@@ -1146,7 +1151,7 @@ func TestOpenAIResponsesWSKnownTerminalBadResponseShapeClosesAsProviderMalformed
 	defer server.Close()
 
 	provider := newOpenAIRealtimeTestProvider(server.URL)
-	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{})
+	session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{})
 	if errWithCode != nil {
 		t.Fatalf("expected responses websocket session to open, got %v", errWithCode)
 	}
@@ -1173,7 +1178,7 @@ func TestOpenAIResponsesWSFutureProviderEventShapePassesThrough(t *testing.T) {
 	defer server.Close()
 
 	provider := newOpenAIRealtimeTestProvider(server.URL)
-	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{})
+	session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{})
 	if errWithCode != nil {
 		t.Fatalf("expected responses websocket session to open, got %v", errWithCode)
 	}

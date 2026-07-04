@@ -34,6 +34,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 	"gorm.io/datatypes"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -244,39 +246,39 @@ func TestResponsesWSErrorPayloadMarshalFallbackReturnsSystemErrorJSON(t *testing
 	assertResponsesWSErrorPayload(t, string(payload), http.StatusInternalServerError, "system_error", "system error")
 }
 
-func TestResponsesWSOpenOptionsUseConnectionScopedUpstreamSession(t *testing.T) {
+func TestResponsesWSOpenParamsUseConnectionScopedUpstreamSession(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	options := responsesWSOpenOptions(c)
+	options := responsesWSOpenParams(c)
 
-	if got := options.UpstreamSessionID; !strings.HasPrefix(got, "responses-ws:") {
+	if got := options.upstreamSessionID; !strings.HasPrefix(got, "responses-ws:") {
 		t.Fatalf("expected synthetic responses websocket client session id, got %q", got)
 	}
-	if err := runtimesession.ValidateClientSessionID(options.UpstreamSessionID); err != nil {
+	if err := runtimesession.ValidateClientSessionID(options.upstreamSessionID); err != nil {
 		t.Fatalf("expected synthetic responses websocket client session id to be valid, got %v", err)
 	}
-	if options.UpstreamSessionID != c.GetString(responsesWSConnectionSessionIDKey) {
+	if options.upstreamSessionID != c.GetString(responsesWSConnectionSessionIDKey) {
 		t.Fatal("expected open options to reuse the context connection session id")
 	}
-	if options.Transport != runtimesession.TransportModeResponsesWS {
-		t.Fatalf("expected default responses websocket transport to be native, got %q", options.Transport)
+	if options.transport != runtimesession.TransportModeResponsesWS {
+		t.Fatalf("expected default responses websocket transport to be native, got %q", options.transport)
 	}
 }
 
-func TestResponsesWSOpenOptionsUseExplicitPreviousResponseID(t *testing.T) {
+func TestResponsesWSOpenParamsUseExplicitPreviousResponseID(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
-	options := responsesWSOpenOptionsWithPreviousResponseID(c, " resp_explicit ", runtimesession.TransportModeResponsesHTTPBridge)
+	options := responsesWSOpenParamsWithPreviousResponseID(c, " resp_explicit ", runtimesession.TransportModeResponsesHTTPBridge)
 
-	if options.PreviousResponseID != "resp_explicit" {
-		t.Fatalf("expected explicit previous response id, got %q", options.PreviousResponseID)
+	if options.previousResponseID != "resp_explicit" {
+		t.Fatalf("expected explicit previous response id, got %q", options.previousResponseID)
 	}
-	if options.Transport != runtimesession.TransportModeResponsesHTTPBridge {
-		t.Fatalf("expected explicit bridge transport, got %q", options.Transport)
+	if options.transport != runtimesession.TransportModeResponsesHTTPBridge {
+		t.Fatalf("expected explicit bridge transport, got %q", options.transport)
 	}
 }
 
@@ -357,9 +359,9 @@ func TestParseResponsesWSTransportMode(t *testing.T) {
 }
 
 func TestOpenResponsesWSUpstreamHTTPBridgeRequiresProviderSupport(t *testing.T) {
-	_, apiErr := openResponsesWSUpstream(context.Background(), &relayTestBaseProvider{}, "gpt-5", responsesws.OpenOptions{
-		Transport: runtimesession.TransportModeResponsesHTTPBridge,
-	})
+	_, apiErr := openResponsesWSUpstreamWithFrame(context.Background(), nil, &relayTestBaseProvider{}, "gpt-5", responsesWSUpstreamOpenParams{
+		transport: runtimesession.TransportModeResponsesHTTPBridge,
+	}, responsesWSTestOpenFrame(t))
 	if apiErr == nil || apiErr.StatusCode != http.StatusUpgradeRequired || openAIErrorCodeString(apiErr.Code, "") != "responses_ws_unsupported_for_channel" {
 		t.Fatalf("expected http_bridge without ResponsesWS provider support to return 426 unsupported, got %+v", apiErr)
 	}
@@ -367,24 +369,28 @@ func TestOpenResponsesWSUpstreamHTTPBridgeRequiresProviderSupport(t *testing.T) 
 
 type relayTestResponsesWSProvider struct {
 	relayTestBaseProvider
-	gotTransport runtimesession.TransportMode
+	gotTransport  runtimesession.TransportMode
+	gotFirstFrame bool
 }
 
-func (p *relayTestResponsesWSProvider) OpenResponsesWS(_ context.Context, _ string, options responsesws.OpenOptions) (responsesws.Upstream, *types.OpenAIErrorWithStatusCode) {
-	p.gotTransport = options.Transport
+func (p *relayTestResponsesWSProvider) OpenResponsesWS(_ context.Context, req *responsesws.OpenRequest) (responsesws.Upstream, *types.OpenAIErrorWithStatusCode) {
+	if req != nil {
+		p.gotTransport = req.Transport
+		p.gotFirstFrame = req.FirstFrame != nil
+	}
 	return &responsesWSTestSession{}, nil
 }
 
 func TestOpenResponsesWSUpstreamHTTPBridgePassesNormalizedTransportToProvider(t *testing.T) {
 	provider := &relayTestResponsesWSProvider{}
-	session, apiErr := openResponsesWSUpstream(context.Background(), provider, "gpt-5", responsesws.OpenOptions{
-		Transport: runtimesession.TransportModeResponsesHTTPBridge,
-	})
+	session, apiErr := openResponsesWSUpstreamWithFrame(context.Background(), nil, provider, "gpt-5", responsesWSUpstreamOpenParams{
+		transport: runtimesession.TransportModeResponsesHTTPBridge,
+	}, responsesWSTestOpenFrame(t))
 	if apiErr != nil {
 		t.Fatalf("expected provider to receive http_bridge transport, got %v", apiErr)
 	}
-	if session == nil || provider.gotTransport != runtimesession.TransportModeResponsesHTTPBridge {
-		t.Fatalf("expected http_bridge transport to reach provider, session=%T transport=%q", session, provider.gotTransport)
+	if session == nil || provider.gotTransport != runtimesession.TransportModeResponsesHTTPBridge || !provider.gotFirstFrame {
+		t.Fatalf("expected http_bridge transport and first frame to reach provider, session=%T transport=%q first_frame=%v", session, provider.gotTransport, provider.gotFirstFrame)
 	}
 }
 
@@ -403,7 +409,7 @@ func TestOpenResponsesWSUpstreamDoesNotUseLegacyRealtimeOptions(t *testing.T) {
 		runtimesession.TransportModeResponsesHTTPBridge,
 	} {
 		t.Run(string(transport), func(t *testing.T) {
-			session, apiErr := openResponsesWSUpstream(context.Background(), provider, "gpt-5", responsesws.OpenOptions{Transport: transport})
+			session, apiErr := openResponsesWSUpstreamWithFrame(context.Background(), nil, provider, "gpt-5", responsesWSUpstreamOpenParams{transport: transport}, responsesWSTestOpenFrame(t))
 			if session != nil {
 				t.Fatalf("expected no session from provider without OpenResponsesWS support, got %T", session)
 			}
@@ -417,7 +423,16 @@ func TestOpenResponsesWSUpstreamDoesNotUseLegacyRealtimeOptions(t *testing.T) {
 	}
 }
 
-func TestResponsesWSOpenOptionsIgnoreRequestSessionIDForProviderSessionReuse(t *testing.T) {
+func responsesWSTestOpenFrame(t *testing.T) *responsesws.RawResponsesCreateFrame {
+	t.Helper()
+	frame, err := responsesws.ParseRawResponsesCreateFrame([]byte(`{"type":"response.create","model":"gpt-5","input":"hi"}`))
+	if err != nil {
+		t.Fatalf("parse test response.create frame: %v", err)
+	}
+	return frame
+}
+
+func TestResponsesWSOpenParamsIgnoreRequestSessionIDForProviderSessionReuse(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	reqA := httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
 	reqA.Header.Set("x-session-id", "shared-client-session")
@@ -431,17 +446,17 @@ func TestResponsesWSOpenOptionsIgnoreRequestSessionIDForProviderSessionReuse(t *
 	cB, _ := gin.CreateTestContext(wB)
 	cB.Request = reqB
 
-	optionsA := responsesWSOpenOptions(cA)
-	optionsB := responsesWSOpenOptions(cB)
+	optionsA := responsesWSOpenParams(cA)
+	optionsB := responsesWSOpenParams(cB)
 
-	if optionsA.UpstreamSessionID == "" || optionsB.UpstreamSessionID == "" {
-		t.Fatalf("expected both responses websocket opens to use synthetic session ids, got %q and %q", optionsA.UpstreamSessionID, optionsB.UpstreamSessionID)
+	if optionsA.upstreamSessionID == "" || optionsB.upstreamSessionID == "" {
+		t.Fatalf("expected both responses websocket opens to use synthetic session ids, got %q and %q", optionsA.upstreamSessionID, optionsB.upstreamSessionID)
 	}
-	if optionsA.UpstreamSessionID == "shared-client-session" || optionsB.UpstreamSessionID == "shared-client-session" {
-		t.Fatalf("expected request x-session-id not to be used for provider session reuse, got %q and %q", optionsA.UpstreamSessionID, optionsB.UpstreamSessionID)
+	if optionsA.upstreamSessionID == "shared-client-session" || optionsB.upstreamSessionID == "shared-client-session" {
+		t.Fatalf("expected request x-session-id not to be used for provider session reuse, got %q and %q", optionsA.upstreamSessionID, optionsB.upstreamSessionID)
 	}
-	if optionsA.UpstreamSessionID == optionsB.UpstreamSessionID {
-		t.Fatalf("expected separate downstream websocket connections to get different provider session ids, got %q", optionsA.UpstreamSessionID)
+	if optionsA.upstreamSessionID == optionsB.upstreamSessionID {
+		t.Fatalf("expected separate downstream websocket connections to get different provider session ids, got %q", optionsA.upstreamSessionID)
 	}
 }
 
@@ -1087,6 +1102,103 @@ func TestResponsesWSFrameDiagnosticsSanitizesClientMetadata(t *testing.T) {
 	}
 }
 
+func TestResponsesWSDiagnosticHookLogsCorrelationIDs(t *testing.T) {
+	core, observedLogs := observer.New(zapcore.ErrorLevel)
+	originalLogger := logger.Logger
+	logger.Logger = zap.New(core)
+	t.Cleanup(func() {
+		logger.Logger = originalLogger
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	req := httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	req = req.WithContext(context.WithValue(req.Context(), logger.RequestIdKey, "req-diag-1"))
+	ctx.Request = req
+	ctx.Set(logger.RequestIdKey, "req-diag-1")
+	ctx.Set(responsesWSConnectionSessionIDKey, "responses-ws-session-1")
+	ctx.Set("id", 42)
+	ctx.Set("token_id", 77)
+
+	hook := responsesWSDiagnosticHook(ctx)
+	hook(responsesws.Diagnostic{
+		Code:        "adapter_panic",
+		Provider:    "codex",
+		ChannelID:   13,
+		Transport:   "responses_ws",
+		Phase:       responsesws.RecvDetailPhaseHandleProviderFrame,
+		PanicClass:  "string",
+		StackHash:   "stackhash",
+		DetailError: "adapter panic",
+	})
+
+	logs := observedLogs.All()
+	if len(logs) != 1 {
+		t.Fatalf("expected one diagnostic log, got %d", len(logs))
+	}
+	message := logs[0].Message
+	for _, want := range []string{
+		"request_id=req-diag-1",
+		"connection_session_id=responses-ws-session-1",
+		"user_id=42",
+		"token_id=77",
+		"provider=codex",
+		"channel_id=13",
+	} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("expected diagnostic log to contain %q, got %q", want, message)
+		}
+	}
+}
+
+type responsesWSPanicAfterHookContext struct {
+	context.Context
+	panicOnValue bool
+}
+
+func (c *responsesWSPanicAfterHookContext) Value(key any) any {
+	if c.panicOnValue {
+		panic("request context used after diagnostic hook creation")
+	}
+	return c.Context.Value(key)
+}
+
+func TestResponsesWSDiagnosticHookDetachesRequestContext(t *testing.T) {
+	core, observedLogs := observer.New(zapcore.ErrorLevel)
+	originalLogger := logger.Logger
+	logger.Logger = zap.New(core)
+	t.Cleanup(func() {
+		logger.Logger = originalLogger
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	requestCtx := &responsesWSPanicAfterHookContext{
+		Context: context.WithValue(context.Background(), logger.RequestIdKey, "req-detached-1"),
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	ctx.Request = req.WithContext(requestCtx)
+
+	hook := responsesWSDiagnosticHook(ctx)
+	requestCtx.panicOnValue = true
+
+	hook(responsesws.Diagnostic{
+		Code:      "adapter_panic",
+		Provider:  "codex",
+		ChannelID: 13,
+		Transport: "responses_ws",
+		Phase:     responsesws.RecvDetailPhaseHandleProviderFrame,
+	})
+
+	logs := observedLogs.All()
+	if len(logs) != 1 {
+		t.Fatalf("expected one diagnostic log, got %d", len(logs))
+	}
+	if !strings.Contains(logs[0].Message, "req-detached-1") {
+		t.Fatalf("expected detached diagnostic log to keep request id, got %q", logs[0].Message)
+	}
+}
+
 func TestResponsesWebSocketOversizedFirstFrameClosesOrReturnsInvalidEvent(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	logger.Logger = zap.NewNop()
@@ -1319,7 +1431,7 @@ func TestResponsesWSFirstTurnSetupSkipsOpenAfterClientClosed(t *testing.T) {
 
 	originalOpen := openAndPrimeResponsesWSSessionForActor
 	var openCalls int32
-	openAndPrimeResponsesWSSessionForActor = func(context.Context, *gin.Context, *types.OpenAIResponsesRequest) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
+	openAndPrimeResponsesWSSessionForActor = func(context.Context, *gin.Context, *responsesws.RawResponsesCreateFrame, *types.OpenAIResponsesRequest) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
 		atomic.AddInt32(&openCalls, 1)
 		return nil, common.StringErrorWrapperLocal("unexpected open", "unexpected_open", http.StatusInternalServerError)
 	}
@@ -1421,7 +1533,7 @@ func TestResponsesWSFirstTurnOpenResultAfterClientCloseIsAbortedNotAdopted(t *te
 	openStarted := make(chan struct{})
 	releaseOpen := make(chan struct{})
 	originalOpen := openAndPrimeResponsesWSSessionForActor
-	openAndPrimeResponsesWSSessionForActor = func(context.Context, *gin.Context, *types.OpenAIResponsesRequest) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
+	openAndPrimeResponsesWSSessionForActor = func(context.Context, *gin.Context, *responsesws.RawResponsesCreateFrame, *types.OpenAIResponsesRequest) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
 		close(openStarted)
 		<-releaseOpen
 		return &responsesWSOpenResult{
@@ -1714,7 +1826,7 @@ func TestResponsesWSFirstTurnAdmissionRejectsBeforeUpstreamOpen(t *testing.T) {
 
 	originalOpen := openAndPrimeResponsesWSSessionForActor
 	openCalled := make(chan struct{}, 1)
-	openAndPrimeResponsesWSSessionForActor = func(context.Context, *gin.Context, *types.OpenAIResponsesRequest) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
+	openAndPrimeResponsesWSSessionForActor = func(context.Context, *gin.Context, *responsesws.RawResponsesCreateFrame, *types.OpenAIResponsesRequest) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
 		select {
 		case openCalled <- struct{}{}:
 		default:
@@ -1935,7 +2047,7 @@ func TestResponsesWSFirstTurnRetryOpenDoesNotBlockActorLoop(t *testing.T) {
 
 	openStarted := make(chan struct{})
 	originalOpen := openAndPrimeResponsesWSSessionForActor
-	openAndPrimeResponsesWSSessionForActor = func(ctx context.Context, _ *gin.Context, _ *types.OpenAIResponsesRequest) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
+	openAndPrimeResponsesWSSessionForActor = func(ctx context.Context, _ *gin.Context, _ *responsesws.RawResponsesCreateFrame, _ *types.OpenAIResponsesRequest) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
 		select {
 		case <-openStarted:
 		default:
@@ -2078,7 +2190,7 @@ func installResponsesWSReplayOpenProbe(t *testing.T) (chan struct{}, *int32) {
 	started := make(chan struct{})
 	var calls int32
 	originalOpen := openAndPrimeResponsesWSSessionForActor
-	openAndPrimeResponsesWSSessionForActor = func(ctx context.Context, _ *gin.Context, _ *types.OpenAIResponsesRequest) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
+	openAndPrimeResponsesWSSessionForActor = func(ctx context.Context, _ *gin.Context, _ *responsesws.RawResponsesCreateFrame, _ *types.OpenAIResponsesRequest) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
 		atomic.AddInt32(&calls, 1)
 		select {
 		case <-started:
@@ -10642,7 +10754,7 @@ func TestResponsesWSAmbiguousSendDoesNotRetryAndSettlesFloor(t *testing.T) {
 
 	originalOpen := openAndPrimeResponsesWSSessionForActor
 	var openCalls int32
-	openAndPrimeResponsesWSSessionForActor = func(context.Context, *gin.Context, *types.OpenAIResponsesRequest) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
+	openAndPrimeResponsesWSSessionForActor = func(context.Context, *gin.Context, *responsesws.RawResponsesCreateFrame, *types.OpenAIResponsesRequest) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
 		atomic.AddInt32(&openCalls, 1)
 		return &responsesWSOpenResult{Session: &responsesWSTestSession{}, BillingModel: "gpt-5"}, nil
 	}

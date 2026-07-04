@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"one-api/common/requester"
+	commonresponses "one-api/common/responses"
 	"one-api/common/responsesws"
 	"one-api/model"
 	runtimerealtime "one-api/runtime/realtime"
@@ -150,15 +151,12 @@ type RealtimeSessionProviderWithOptions interface {
 
 type ResponsesWSProvider interface {
 	ProviderInterface
-	// OpenResponsesWS opens a ResponsesWS-specific provider upstream. The
-	// returned Upstream must not carry Codex realtime resume/binding/revocation
-	// semantics; relay owns ResponsesWS admission/accounting/finalization.
-	OpenResponsesWS(ctx context.Context, modelName string, options responsesws.OpenOptions) (responsesws.Upstream, *types.OpenAIErrorWithStatusCode)
+	OpenResponsesWS(ctx context.Context, req *responsesws.OpenRequest) (responsesws.Upstream, *types.OpenAIErrorWithStatusCode)
 }
 
 type ResponsesInterface interface {
 	ProviderInterface
-	CreateResponses(request *types.OpenAIResponsesRequest) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode)
-	CreateResponsesStream(request *types.OpenAIResponsesRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode)
-	CompactResponses(request *types.OpenAIResponsesRequest) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode)
+	CreateResponses(ctx context.Context, req *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode)
+	CreateResponsesStream(ctx context.Context, req *commonresponses.Request) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode)
+	CompactResponses(ctx context.Context, req *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode)
 }

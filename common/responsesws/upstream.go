@@ -3,6 +3,7 @@ package responsesws
 import (
 	"context"
 	"errors"
+	"one-api/common/requestctx"
 	"strings"
 
 	runtimesession "one-api/runtime/session"
@@ -23,7 +24,9 @@ const (
 )
 
 // Frame carries a downstream/upstream data frame without exposing transport
-// message-type integers outside the ResponsesWS boundary.
+// message-type integers outside the ResponsesWS boundary. Constructors copy
+// caller-owned payload bytes, and accessors return copies, so frame ownership is
+// immutable after construction.
 type Frame struct {
 	kind    FrameKind
 	payload []byte
@@ -88,8 +91,14 @@ type UpstreamEvent struct {
 	Err           error
 }
 
-// OpenOptions configures a provider ResponsesWS upstream open.
-type OpenOptions struct {
+// OpenRequest carries the complete evidence required to plan a provider-native
+// ResponsesWS upstream open. Transport remains validation-only for Codex
+// Official; it is not an alternate dialect selector there.
+type OpenRequest struct {
+	InboundHeaders     requestctx.HeaderSnapshot
+	FirstFrame         *RawResponsesCreateFrame
+	Principal          requestctx.Principal
+	SelectedModel      string
 	UpstreamSessionID  string
 	PreviousResponseID string
 	Transport          runtimesession.TransportMode

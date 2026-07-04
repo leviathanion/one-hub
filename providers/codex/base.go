@@ -18,6 +18,7 @@ import (
 	"one-api/common/requester"
 	"one-api/model"
 	"one-api/providers/base"
+	"one-api/providers/codex/wire"
 	"one-api/providers/openai"
 	"one-api/types"
 
@@ -144,9 +145,15 @@ type CodexProvider struct {
 	openai.OpenAIProvider
 	Credentials *OAuth2Credentials // OAuth2 credentials (with refresh_token).
 
+	runtimeMu            sync.RWMutex
 	channelOptionsMu     sync.Mutex
 	channelOptions       *codexChannelOptions
 	channelOptionsLoaded bool
+	officialPolicyMu     sync.Mutex
+	officialPolicyLoaded bool
+	officialPolicyKey    string
+	officialPolicy       wire.ChannelPolicy
+	officialPolicyErr    error
 }
 
 func prepareChannelForProvider(channel *model.Channel) *model.Channel {
@@ -176,7 +183,12 @@ func (p *CodexProvider) rebuildRequester() {
 	if p == nil {
 		return
 	}
+	p.runtimeMu.Lock()
+	defer p.runtimeMu.Unlock()
+	p.rebuildRequesterLocked()
+}
 
+func (p *CodexProvider) rebuildRequesterLocked() {
 	accessToken := ""
 	if p.Credentials != nil {
 		accessToken = p.Credentials.AccessToken
@@ -190,13 +202,69 @@ func (p *CodexProvider) syncRuntimeChannel(channel *model.Channel) {
 	}
 
 	if preparedChannel := prepareChannelForProvider(channel); preparedChannel != nil {
-		p.channelOptionsMu.Lock()
+		p.runtimeMu.Lock()
 		p.Channel = preparedChannel
+		p.rebuildRequesterLocked()
+		p.runtimeMu.Unlock()
+
+		p.channelOptionsMu.Lock()
 		p.channelOptions = nil
 		p.channelOptionsLoaded = false
 		p.channelOptionsMu.Unlock()
+		p.officialPolicyMu.Lock()
+		p.officialPolicyLoaded = false
+		p.officialPolicyKey = ""
+		p.officialPolicy = wire.ChannelPolicy{}
+		p.officialPolicyErr = nil
+		p.officialPolicyMu.Unlock()
+		return
 	}
 	p.rebuildRequester()
+}
+
+func (p *CodexProvider) GetChannel() *model.Channel {
+	return p.codexChannel()
+}
+
+func (p *CodexProvider) codexChannel() *model.Channel {
+	if p == nil {
+		return nil
+	}
+	p.runtimeMu.RLock()
+	defer p.runtimeMu.RUnlock()
+	return p.Channel
+}
+
+func (p *CodexProvider) codexRequester() *requester.HTTPRequester {
+	if p == nil {
+		return nil
+	}
+	p.runtimeMu.RLock()
+	defer p.runtimeMu.RUnlock()
+	return p.Requester
+}
+
+func (p *CodexProvider) codexPreCost() int {
+	channel := p.codexChannel()
+	if channel == nil {
+		return 0
+	}
+	return channel.PreCost
+}
+
+func (p *CodexProvider) GetBaseURL() string {
+	if channel := p.codexChannel(); channel != nil && channel.GetBaseURL() != "" {
+		return channel.GetBaseURL()
+	}
+	if p == nil {
+		return ""
+	}
+	return p.Config.BaseURL
+}
+
+func (p *CodexProvider) GetFullRequestURL(requestURL string, _ string) string {
+	baseURL := strings.TrimSuffix(p.GetBaseURL(), "/")
+	return fmt.Sprintf("%s%s", baseURL, requestURL)
 }
 
 func (p *CodexProvider) syncRuntimeKey(key string) {
@@ -204,23 +272,25 @@ func (p *CodexProvider) syncRuntimeKey(key string) {
 		return
 	}
 
+	p.runtimeMu.Lock()
 	if p.Channel != nil {
 		p.Channel.Key = key
 	}
-	p.rebuildRequester()
+	p.rebuildRequesterLocked()
+	p.runtimeMu.Unlock()
 }
 
 func (p *CodexProvider) getChannelOptions() *codexChannelOptions {
 	if p == nil {
 		return nil
 	}
+	channel := p.codexChannel()
+	if channel == nil || strings.TrimSpace(channel.Other) == "" {
+		return nil
+	}
 
 	p.channelOptionsMu.Lock()
 	defer p.channelOptionsMu.Unlock()
-
-	if p.Channel == nil || strings.TrimSpace(p.Channel.Other) == "" {
-		return nil
-	}
 
 	if p.channelOptionsLoaded {
 		return p.channelOptions
@@ -228,9 +298,9 @@ func (p *CodexProvider) getChannelOptions() *codexChannelOptions {
 
 	p.channelOptionsLoaded = true
 
-	rawOptions, err := p.Channel.GetOtherMap()
+	rawOptions, err := channel.GetOtherMap()
 	if err != nil {
-		logger.LogError(p.channelLogContext(), fmt.Sprintf("failed to parse Codex channel Other JSON for channel #%d(%s): %v", p.Channel.Id, p.Channel.Name, err))
+		logger.LogError(p.channelLogContext(), fmt.Sprintf("failed to parse Codex channel Other JSON for channel #%d(%s): %v", channel.Id, channel.Name, err))
 		return nil
 	}
 	if len(rawOptions) == 0 {
@@ -239,13 +309,13 @@ func (p *CodexProvider) getChannelOptions() *codexChannelOptions {
 
 	payload, err := json.Marshal(rawOptions)
 	if err != nil {
-		logger.LogError(p.channelLogContext(), fmt.Sprintf("failed to normalize Codex channel Other JSON for channel #%d(%s): %v", p.Channel.Id, p.Channel.Name, err))
+		logger.LogError(p.channelLogContext(), fmt.Sprintf("failed to normalize Codex channel Other JSON for channel #%d(%s): %v", channel.Id, channel.Name, err))
 		return nil
 	}
 
 	var options codexChannelOptions
 	if err := json.Unmarshal(payload, &options); err != nil {
-		logger.LogError(p.channelLogContext(), fmt.Sprintf("failed to decode Codex channel options for channel #%d(%s): %v", p.Channel.Id, p.Channel.Name, err))
+		logger.LogError(p.channelLogContext(), fmt.Sprintf("failed to decode Codex channel options for channel #%d(%s): %v", channel.Id, channel.Name, err))
 		return nil
 	}
 
@@ -354,8 +424,8 @@ func (p *CodexProvider) applyCommonRequestHeaders(headers *codexHeaderBag) {
 		headers.Set("Accept", p.Context.Request.Header.Get("Accept"))
 	}
 
-	if p.Channel != nil {
-		customHeaders, err := p.Channel.GetModelHeadersMap()
+	if channel := p.codexChannel(); channel != nil {
+		customHeaders, err := channel.GetModelHeadersMap()
 		if err == nil {
 			for key, value := range customHeaders {
 				// 与 base.CommonRequestHeaders 一致：model_headers 不允许覆盖凭证/
@@ -494,13 +564,13 @@ func (p *CodexProvider) GetToken() (string, error) {
 	fallbackTokenBeforeRefresh := p.Credentials.AccessToken
 	fallbackAccountIDBeforeRefresh := p.Credentials.AccountID
 	fallbackExpiresAtBeforeRefresh := p.Credentials.ExpiresAt
-	fallbackChannelBeforeRefresh := prepareChannelForProvider(p.Channel)
+	fallbackChannelBeforeRefresh := prepareChannelForProvider(p.codexChannel())
 
 	// Use cache while the token remains comfortably outside the refresh lead.
-	cachedToken := p.getCachedToken(3 * time.Minute)
-	if cachedToken != "" {
-		p.Credentials.AccessToken = cachedToken
-		return cachedToken, nil
+	cachedCredentials := p.getCachedCredentialSnapshot(3 * time.Minute)
+	if cachedCredentials.AccessToken != "" {
+		p.adoptCachedCredentials(cachedCredentials)
+		return cachedCredentials.AccessToken, nil
 	}
 
 	if _, err := p.refreshTokenIfNeeded(ctx, 3*time.Minute); err != nil {
@@ -543,7 +613,7 @@ func (p *CodexProvider) GetToken() (string, error) {
 }
 
 func (p *CodexProvider) refreshTokenIfNeeded(ctx context.Context, lead time.Duration) (bool, error) {
-	if p == nil || p.Credentials == nil || p.Channel == nil {
+	if p == nil || p.Credentials == nil || p.codexChannel() == nil {
 		return false, fmt.Errorf("credentials not configured")
 	}
 	if p.Credentials.RefreshToken == "" {
@@ -554,8 +624,8 @@ func (p *CodexProvider) refreshTokenIfNeeded(ctx context.Context, lead time.Dura
 	defer releaseLocalLock()
 
 	// Another goroutine may already have refreshed and cached the token.
-	if cachedToken := p.getCachedToken(lead); cachedToken != "" {
-		p.Credentials.AccessToken = cachedToken
+	if cachedCredentials := p.getCachedCredentialSnapshot(lead); cachedCredentials.AccessToken != "" {
+		p.adoptCachedCredentials(cachedCredentials)
 		return false, nil
 	}
 
@@ -607,7 +677,7 @@ func (p *CodexProvider) refreshTokenIfNeeded(ctx context.Context, lead time.Dura
 }
 
 func (p *CodexProvider) forceRefreshToken(ctx context.Context) (bool, error) {
-	if p == nil || p.Credentials == nil || p.Channel == nil {
+	if p == nil || p.Credentials == nil || p.codexChannel() == nil {
 		return false, fmt.Errorf("credentials not configured")
 	}
 	if p.Credentials.RefreshToken == "" {
@@ -679,14 +749,15 @@ func (p *CodexProvider) forceRefreshToken(ctx context.Context) (bool, error) {
 
 func (p *CodexProvider) refreshCredentials(ctx context.Context) error {
 	proxyURL := ""
-	if p.Channel != nil && p.Channel.Proxy != nil && *p.Channel.Proxy != "" {
-		proxyURL = *p.Channel.Proxy
+	if channel := p.codexChannel(); channel != nil && channel.Proxy != nil && *channel.Proxy != "" {
+		proxyURL = *channel.Proxy
 	}
 	return refreshOAuthCredentials(p.Credentials, ctx, proxyURL, 3)
 }
 
 func (p *CodexProvider) cacheCurrentToken() {
-	if p == nil || p.Channel == nil || p.Credentials == nil || p.Credentials.AccessToken == "" {
+	channel := p.codexChannel()
+	if channel == nil || p.Credentials == nil || p.Credentials.AccessToken == "" {
 		return
 	}
 
@@ -701,13 +772,19 @@ func (p *CodexProvider) cacheCurrentToken() {
 		return
 	}
 
-	cache.SetCache(tokenCacheKey(p.Channel.Id), cachedAccessToken{
+	cache.SetCache(tokenCacheKey(channel.Id), cachedAccessToken{
 		AccessToken: p.Credentials.AccessToken,
+		AccountID:   cachedAccountID(p.Credentials),
 		ExpiresAt:   p.Credentials.ExpiresAt,
 	}, cacheDuration)
 }
 
 func (p *CodexProvider) saveCredentialsToDatabase(ctx context.Context) error {
+	channel := p.codexChannel()
+	if channel == nil || channel.Id <= 0 {
+		return fmt.Errorf("channel not configured")
+	}
+	channelID := channel.Id
 	credentialsJSON, err := p.Credentials.ToJSON()
 	if err != nil {
 		return fmt.Errorf("failed to serialize credentials: %w", err)
@@ -716,18 +793,18 @@ func (p *CodexProvider) saveCredentialsToDatabase(ctx context.Context) error {
 	// Keep the active provider self-consistent even before the chooser reloads.
 	p.syncRuntimeKey(credentialsJSON)
 
-	if err := updateChannelKey(p.Channel.Id, credentialsJSON); err != nil {
+	if err := updateChannelKey(channelID, credentialsJSON); err != nil {
 		return fmt.Errorf("failed to update channel key: %w", err)
 	}
 	if err := p.loadLatestCredentialsFromDatabase(); err != nil {
 		if ctx != nil {
-			logger.LogWarn(ctx, fmt.Sprintf("[Codex] Failed to reload runtime channel state for channel %d after saving credentials: %s", p.Channel.Id, err.Error()))
+			logger.LogWarn(ctx, fmt.Sprintf("[Codex] Failed to reload runtime channel state for channel %d after saving credentials: %s", channelID, err.Error()))
 		} else {
-			logger.SysLog(fmt.Sprintf("[Codex] Failed to reload runtime channel state for channel %d after saving credentials: %s", p.Channel.Id, err.Error()))
+			logger.SysLog(fmt.Sprintf("[Codex] Failed to reload runtime channel state for channel %d after saving credentials: %s", channelID, err.Error()))
 		}
 	}
 
-	logger.LogInfo(ctx, fmt.Sprintf("[Codex] Credentials saved to database for channel %d", p.Channel.Id))
+	logger.LogInfo(ctx, fmt.Sprintf("[Codex] Credentials saved to database for channel %d", channelID))
 	return nil
 }
 
@@ -780,7 +857,31 @@ type channelRefreshLock struct {
 
 type cachedAccessToken struct {
 	AccessToken string    `json:"access_token"`
+	AccountID   string    `json:"account_id,omitempty"`
 	ExpiresAt   time.Time `json:"expires_at,omitempty"`
+}
+
+func (c cachedAccessToken) accountID() string {
+	if accountID := strings.TrimSpace(c.AccountID); accountID != "" {
+		return accountID
+	}
+	return extractAccountIDFromJWT(c.AccessToken)
+}
+
+type cachedCredentialSnapshot struct {
+	AccessToken string
+	AccountID   string
+	ExpiresAt   time.Time
+}
+
+func cachedAccountID(creds *OAuth2Credentials) string {
+	if creds == nil {
+		return ""
+	}
+	if accountID := strings.TrimSpace(creds.AccountID); accountID != "" {
+		return accountID
+	}
+	return extractAccountIDFromJWT(creds.AccessToken)
 }
 
 type credentialVersionSnapshot struct {
@@ -819,10 +920,11 @@ func acquireChannelRefreshLock(channelID int) func() {
 }
 
 func (p *CodexProvider) channelID() int {
-	if p == nil || p.Channel == nil {
+	channel := p.codexChannel()
+	if channel == nil {
 		return 0
 	}
-	return p.Channel.Id
+	return channel.Id
 }
 
 func credentialsVersion(creds *OAuth2Credentials) credentialVersionSnapshot {
@@ -857,32 +959,48 @@ func (p *CodexProvider) credentialsChangedSince(previous credentialVersionSnapsh
 	return current != previous
 }
 
-func (p *CodexProvider) getCachedToken(lead time.Duration) string {
-	if p == nil || p.Channel == nil || p.Channel.Id <= 0 {
-		return ""
+func (p *CodexProvider) getCachedCredentialSnapshot(lead time.Duration) cachedCredentialSnapshot {
+	channel := p.codexChannel()
+	if channel == nil || channel.Id <= 0 {
+		return cachedCredentialSnapshot{}
 	}
 
-	cacheKey := tokenCacheKey(p.Channel.Id)
+	cacheKey := tokenCacheKey(channel.Id)
 
 	cachedEntry, err := cache.GetCache[cachedAccessToken](cacheKey)
 	if err == nil {
 		if cachedEntry.AccessToken == "" {
-			return ""
+			return cachedCredentialSnapshot{}
 		}
 		if !expiresWithinLead(cachedEntry.ExpiresAt, lead) {
-			return cachedEntry.AccessToken
+			return cachedCredentialSnapshot{
+				AccessToken: cachedEntry.AccessToken,
+				AccountID:   cachedEntry.accountID(),
+				ExpiresAt:   cachedEntry.ExpiresAt,
+			}
 		}
-		return ""
+		return cachedCredentialSnapshot{}
 	}
 
 	cachedToken, err := cache.GetCache[string](cacheKey)
 	if err != nil || cachedToken == "" {
-		return ""
+		return cachedCredentialSnapshot{}
 	}
 	if p.Credentials != nil && !p.Credentials.NeedsRefreshWithin(lead) {
-		return cachedToken
+		return cachedCredentialSnapshot{
+			AccessToken: cachedToken,
+			AccountID:   extractAccountIDFromJWT(cachedToken),
+		}
 	}
-	return ""
+	return cachedCredentialSnapshot{}
+}
+
+func (p *CodexProvider) adoptCachedCredentials(snapshot cachedCredentialSnapshot) {
+	if p == nil || p.Credentials == nil || strings.TrimSpace(snapshot.AccessToken) == "" {
+		return
+	}
+	p.Credentials.AccessToken = strings.TrimSpace(snapshot.AccessToken)
+	p.Credentials.AccountID = strings.TrimSpace(snapshot.AccountID)
 }
 
 func (p *CodexProvider) getCurrentValidToken() string {
@@ -890,12 +1008,9 @@ func (p *CodexProvider) getCurrentValidToken() string {
 		return ""
 	}
 
-	if cachedToken := p.getCachedToken(0); cachedToken != "" {
-		p.Credentials.AccessToken = cachedToken
-		if accountID := extractAccountIDFromJWT(cachedToken); accountID != "" {
-			p.Credentials.AccountID = accountID
-		}
-		return cachedToken
+	if cachedCredentials := p.getCachedCredentialSnapshot(0); cachedCredentials.AccessToken != "" {
+		p.adoptCachedCredentials(cachedCredentials)
+		return cachedCredentials.AccessToken
 	}
 
 	if p.Credentials.AccessToken == "" || p.Credentials.NeedsRefreshWithin(0) {
@@ -905,11 +1020,12 @@ func (p *CodexProvider) getCurrentValidToken() string {
 }
 
 func (p *CodexProvider) loadLatestCredentialsFromDatabase() error {
-	if p == nil || p.Channel == nil || p.Channel.Id <= 0 {
+	channelSnapshot := p.codexChannel()
+	if channelSnapshot == nil || channelSnapshot.Id <= 0 {
 		return nil
 	}
 
-	channel, err := loadLatestChannelByID(p.Channel.Id)
+	channel, err := loadLatestChannelByID(channelSnapshot.Id)
 	if err != nil {
 		return err
 	}
@@ -1028,8 +1144,8 @@ func (p *CodexProvider) acquireDistributedForceRefreshLock(ctx context.Context, 
 }
 
 func (p *CodexProvider) refreshNoLongerNeeded(lead time.Duration, reloadFromDatabase bool) bool {
-	if cachedToken := p.getCachedToken(lead); cachedToken != "" {
-		p.Credentials.AccessToken = cachedToken
+	if cachedCredentials := p.getCachedCredentialSnapshot(lead); cachedCredentials.AccessToken != "" {
+		p.adoptCachedCredentials(cachedCredentials)
 		return true
 	}
 	if !reloadFromDatabase {

@@ -9,6 +9,7 @@ import (
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/logger"
+	"one-api/common/requestctx"
 	"one-api/common/responsesws"
 	"one-api/common/wsconn"
 	"one-api/metrics"
@@ -39,6 +40,10 @@ func openAndPrimeResponsesWSSession(c *gin.Context, request *types.OpenAIRespons
 }
 
 func openAndPrimeResponsesWSSessionWithContext(openCtx context.Context, c *gin.Context, request *types.OpenAIResponsesRequest) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
+	return openAndPrimeResponsesWSSessionWithContextAndFrame(openCtx, c, nil, request)
+}
+
+func openAndPrimeResponsesWSSessionWithContextAndFrame(openCtx context.Context, c *gin.Context, firstFrame *responsesws.RawResponsesCreateFrame, request *types.OpenAIResponsesRequest) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
 	if c == nil || request == nil {
 		return nil, common.StringErrorWrapperLocal("request is required", "invalid_request_error", http.StatusBadRequest)
 	}
@@ -57,10 +62,10 @@ func openAndPrimeResponsesWSSessionWithContext(openCtx context.Context, c *gin.C
 	var lastNonUnsupportedErr *types.OpenAIErrorWithStatusCode
 
 	if candidate != nil && candidate.ExplicitPinID > 0 {
-		return openResponsesWSSpecificChannelWithContext(openCtx, c, request.Model, candidate, candidate.ExplicitPinID, request.PreviousResponseID)
+		return openResponsesWSSpecificChannelWithContext(openCtx, c, firstFrame, request.Model, candidate, candidate.ExplicitPinID, request.PreviousResponseID)
 	}
 	if preferred := currentPreferredChannelID(c); preferred > 0 {
-		openResult, openErr := openResponsesWSPreferredChannelWithContext(openCtx, c, request.Model, candidate, preferred, request.PreviousResponseID)
+		openResult, openErr := openResponsesWSPreferredChannelWithContext(openCtx, c, firstFrame, request.Model, candidate, preferred, request.PreviousResponseID)
 		if openErr == nil {
 			return openResult, nil
 		}
@@ -92,7 +97,7 @@ func openAndPrimeResponsesWSSessionWithContext(openCtx context.Context, c *gin.C
 		if apiErr != nil {
 			return nil, apiErr
 		}
-		session, apiErr := openResponsesWSUpstream(openCtx, provider, relay.modelName, responsesWSOpenOptionsWithPreviousResponseID(c, request.PreviousResponseID, transport))
+		session, apiErr := openResponsesWSUpstreamWithFrame(openCtx, c, provider, relay.modelName, responsesWSOpenParamsWithPreviousResponseID(c, request.PreviousResponseID, transport), firstFrame)
 		if apiErr == nil {
 			metrics.RecordProvider(c, 200)
 			return &responsesWSOpenResult{
@@ -175,7 +180,7 @@ func responsesWSUnsupportedScanPolicy() (int, bool) {
 	return channelCount, false
 }
 
-func openResponsesWSSpecificChannelWithContext(openCtx context.Context, c *gin.Context, modelName string, candidate *ResponsesTurnAffinity, channelID int, previousResponseID string) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
+func openResponsesWSSpecificChannelWithContext(openCtx context.Context, c *gin.Context, firstFrame *responsesws.RawResponsesCreateFrame, modelName string, candidate *ResponsesTurnAffinity, channelID int, previousResponseID string) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
 	markResponsesWSStreamRequest(c)
 	channel, err := fetchChannelById(channelID)
 	if err != nil {
@@ -185,14 +190,14 @@ func openResponsesWSSpecificChannelWithContext(openCtx context.Context, c *gin.C
 		}
 		return nil, common.StringErrorWrapperLocal("channel selection failed", "channel_error", http.StatusServiceUnavailable)
 	}
-	return openResponsesWSSelectedChannelWithContext(openCtx, c, modelName, candidate, channel, previousResponseID)
+	return openResponsesWSSelectedChannelWithContext(openCtx, c, firstFrame, modelName, candidate, channel, previousResponseID)
 }
 
 func openResponsesWSPreferredChannel(c *gin.Context, modelName string, candidate *ResponsesTurnAffinity, channelID int) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
-	return openResponsesWSPreferredChannelWithContext(context.Background(), c, modelName, candidate, channelID, "")
+	return openResponsesWSPreferredChannelWithContext(context.Background(), c, nil, modelName, candidate, channelID, "")
 }
 
-func openResponsesWSPreferredChannelWithContext(openCtx context.Context, c *gin.Context, modelName string, candidate *ResponsesTurnAffinity, channelID int, previousResponseID string) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
+func openResponsesWSPreferredChannelWithContext(openCtx context.Context, c *gin.Context, firstFrame *responsesws.RawResponsesCreateFrame, modelName string, candidate *ResponsesTurnAffinity, channelID int, previousResponseID string) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
 	markResponsesWSStreamRequest(c)
 	channel, err := fetchPreferredRealtimeChannel(c, modelName, channelID)
 	if err != nil {
@@ -202,10 +207,10 @@ func openResponsesWSPreferredChannelWithContext(openCtx context.Context, c *gin.
 		}
 		return nil, common.StringErrorWrapperLocal("channel selection failed", "channel_error", http.StatusServiceUnavailable)
 	}
-	return openResponsesWSSelectedChannelWithContext(openCtx, c, modelName, candidate, channel, previousResponseID)
+	return openResponsesWSSelectedChannelWithContext(openCtx, c, firstFrame, modelName, candidate, channel, previousResponseID)
 }
 
-func openResponsesWSSelectedChannelWithContext(openCtx context.Context, c *gin.Context, modelName string, candidate *ResponsesTurnAffinity, channel *model.Channel, previousResponseID string) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
+func openResponsesWSSelectedChannelWithContext(openCtx context.Context, c *gin.Context, firstFrame *responsesws.RawResponsesCreateFrame, modelName string, candidate *ResponsesTurnAffinity, channel *model.Channel, previousResponseID string) (*responsesWSOpenResult, *types.OpenAIErrorWithStatusCode) {
 	if channel == nil {
 		return nil, common.StringErrorWrapperLocal("channel not found", "channel_error", http.StatusServiceUnavailable)
 	}
@@ -228,7 +233,7 @@ func openResponsesWSSelectedChannelWithContext(openCtx context.Context, c *gin.C
 	if apiErr != nil {
 		return nil, apiErr
 	}
-	session, apiErr := openResponsesWSUpstream(openCtx, provider, mappedModel, responsesWSOpenOptionsWithPreviousResponseID(c, previousResponseID, transport))
+	session, apiErr := openResponsesWSUpstreamWithFrame(openCtx, c, provider, mappedModel, responsesWSOpenParamsWithPreviousResponseID(c, previousResponseID, transport), firstFrame)
 	if apiErr != nil {
 		return nil, apiErr
 	}
@@ -367,7 +372,15 @@ func responsesWSSubsequentModelMismatch(requestModel string, lockedSessionModel 
 	return fmt.Sprintf("responses websocket session is locked to model %q", lockedSessionModel)
 }
 
-func openResponsesWSUpstream(openCtx context.Context, provider providersBase.ProviderInterface, modelName string, options responsesws.OpenOptions) (responsesws.Upstream, *types.OpenAIErrorWithStatusCode) {
+type responsesWSUpstreamOpenParams struct {
+	upstreamSessionID  string
+	previousResponseID string
+	transport          runtimesession.TransportMode
+	channelID          int
+	diagnostics        responsesws.DiagnosticHook
+}
+
+func openResponsesWSUpstreamWithFrame(openCtx context.Context, c *gin.Context, provider providersBase.ProviderInterface, modelName string, options responsesWSUpstreamOpenParams, firstFrame *responsesws.RawResponsesCreateFrame) (responsesws.Upstream, *types.OpenAIErrorWithStatusCode) {
 	responsesProvider, ok := provider.(providersBase.ResponsesWSProvider)
 	if !ok {
 		return nil, common.StringErrorWrapperLocal("channel does not support Responses websocket transport", "responses_ws_unsupported_for_channel", http.StatusUpgradeRequired)
@@ -375,18 +388,36 @@ func openResponsesWSUpstream(openCtx context.Context, provider providersBase.Pro
 	if openCtx == nil {
 		openCtx = context.Background()
 	}
-	return responsesProvider.OpenResponsesWS(openCtx, modelName, options)
+	headers := requestctx.HeaderSnapshot{}
+	principal := requestctx.Principal{}
+	if c != nil {
+		if c.Request != nil {
+			headers = requestctx.NewHeaderSnapshot(c.Request.Header)
+		}
+		principal = requestctx.PrincipalFromGin(c)
+	}
+	return responsesProvider.OpenResponsesWS(openCtx, &responsesws.OpenRequest{
+		InboundHeaders:     headers,
+		FirstFrame:         firstFrame,
+		Principal:          principal,
+		SelectedModel:      modelName,
+		UpstreamSessionID:  options.upstreamSessionID,
+		PreviousResponseID: options.previousResponseID,
+		Transport:          options.transport,
+		ChannelID:          options.channelID,
+		Diagnostics:        options.diagnostics,
+	})
 }
 
-// responsesWSOpenOptions builds connection-local upstream options. The internal
+// responsesWSOpenParams builds connection-local upstream options. The internal
 // upstream session id is not derived from request x-session-id; client identity
 // remains available to routing and prompt-cache code without sharing live WS
 // connections across downstream clients.
-func responsesWSOpenOptions(c *gin.Context, transport ...runtimesession.TransportMode) responsesws.OpenOptions {
-	return responsesWSOpenOptionsWithPreviousResponseID(c, "", transport...)
+func responsesWSOpenParams(c *gin.Context, transport ...runtimesession.TransportMode) responsesWSUpstreamOpenParams {
+	return responsesWSOpenParamsWithPreviousResponseID(c, "", transport...)
 }
 
-func responsesWSOpenOptionsWithPreviousResponseID(c *gin.Context, previousResponseID string, transport ...runtimesession.TransportMode) responsesws.OpenOptions {
+func responsesWSOpenParamsWithPreviousResponseID(c *gin.Context, previousResponseID string, transport ...runtimesession.TransportMode) responsesWSUpstreamOpenParams {
 	selectedTransport := runtimesession.TransportModeResponsesWS
 	if len(transport) > 0 && transport[0] != "" {
 		selectedTransport = transport[0]
@@ -395,23 +426,42 @@ func responsesWSOpenOptionsWithPreviousResponseID(c *gin.Context, previousRespon
 	if c != nil {
 		channelID = c.GetInt("channel_id")
 	}
-	return responsesws.OpenOptions{
-		UpstreamSessionID:  ensureResponsesWSConnectionSessionID(c),
-		PreviousResponseID: strings.TrimSpace(previousResponseID),
-		Transport:          selectedTransport,
-		ChannelID:          channelID,
-		Diagnostics:        responsesWSDiagnosticHook(c),
+	return responsesWSUpstreamOpenParams{
+		upstreamSessionID:  ensureResponsesWSConnectionSessionID(c),
+		previousResponseID: strings.TrimSpace(previousResponseID),
+		transport:          selectedTransport,
+		channelID:          channelID,
+		diagnostics:        responsesWSDiagnosticHook(c),
 	}
 }
 
 func responsesWSDiagnosticHook(c *gin.Context) responsesws.DiagnosticHook {
+	requestID := ""
+	connectionSessionID := ""
+	userID := 0
+	tokenID := 0
+	if c != nil {
+		requestID = c.GetString(logger.RequestIdKey)
+		connectionSessionID = c.GetString(responsesWSConnectionSessionIDKey)
+		userID = c.GetInt("id")
+		tokenID = c.GetInt("token_id")
+		if requestID == "" && c.Request != nil && c.Request.Context() != nil {
+			if value, ok := c.Request.Context().Value(logger.RequestIdKey).(string); ok {
+				requestID = value
+			}
+		}
+	}
 	logCtx := context.Background()
-	if c != nil && c.Request != nil {
-		logCtx = c.Request.Context()
+	if requestID != "" {
+		logCtx = context.WithValue(logCtx, logger.RequestIdKey, requestID)
 	}
 	return func(diag responsesws.Diagnostic) {
 		logger.LogError(logCtx, fmt.Sprintf(
-			"responses websocket diagnostic: code=%s provider=%s channel_id=%d transport=%s phase=%s panic_class=%s stack_hash=%s detail=%s",
+			"responses websocket diagnostic: request_id=%s connection_session_id=%s user_id=%d token_id=%d code=%s provider=%s channel_id=%d transport=%s phase=%s panic_class=%s stack_hash=%s detail=%s",
+			responsesWSSafeDiagnosticValue(requestID),
+			responsesWSSafeDiagnosticValue(connectionSessionID),
+			userID,
+			tokenID,
 			responsesWSSafeDiagnosticValue(diag.Code),
 			responsesWSSafeDiagnosticValue(diag.Provider),
 			diag.ChannelID,

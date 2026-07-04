@@ -5,7 +5,10 @@ import (
 	"net/http"
 	"one-api/common"
 	"one-api/common/logger"
+	"one-api/common/requestctx"
 	"one-api/common/requester"
+	commonresponses "one-api/common/responses"
+	"one-api/internal/requesthints"
 	providersBase "one-api/providers/base"
 	"one-api/relay/relay_util"
 	"one-api/types"
@@ -18,6 +21,7 @@ import (
 type relayResponses struct {
 	relayBase
 	responsesRequest types.OpenAIResponsesRequest
+	rawEnvelope      *commonresponses.RawEnvelope
 	operation        responsesOperation
 }
 
@@ -36,23 +40,22 @@ func NewRelayResponses(c *gin.Context) *relayResponses {
 }
 
 func (r *relayResponses) setRequest() error {
-	switch r.operation {
-	case responsesOperationCompact:
-		if err := common.UnmarshalBodyReusable(r.c, &r.responsesRequest); err != nil {
-			return err
-		}
-		r.setOriginalModel(r.responsesRequest.Model)
-		prepareResponsesChannelAffinity(r.c, &r.responsesRequest)
-		return nil
-	default:
-		if err := common.UnmarshalBodyReusable(r.c, &r.responsesRequest); err != nil {
-			return err
-		}
-
-		r.setOriginalModel(r.responsesRequest.Model)
-		prepareResponsesChannelAffinity(r.c, &r.responsesRequest)
-		return nil
+	raw, err := common.CacheRequestBody(r.c)
+	if err != nil {
+		return err
 	}
+	envelope, err := commonresponses.ParseRawEnvelope(raw)
+	if err != nil {
+		return err
+	}
+	r.rawEnvelope = envelope
+	r.responsesRequest = envelope.Projection
+	if strings.TrimSpace(r.responsesRequest.Model) == "" {
+		return fmt.Errorf("field Model is required")
+	}
+	r.setOriginalModel(r.responsesRequest.Model)
+	prepareResponsesChannelAffinity(r.c, &r.responsesRequest)
+	return nil
 }
 
 func (r *relayResponses) getRequest() interface{} {
@@ -104,8 +107,12 @@ func (r *relayResponses) sendCurrentProvider() (err *types.OpenAIErrorWithStatus
 			done = true
 			return
 		}
+		if err = r.requireRawEnvelope(); err != nil {
+			done = true
+			return
+		}
 		var response *types.OpenAIResponsesResponses
-		response, err = responsesProvider.CompactResponses(&r.responsesRequest)
+		response, err = responsesProvider.CompactResponses(r.c.Request.Context(), r.providerRequest(commonresponses.ResponsesCompact))
 		if err != nil {
 			return
 		}
@@ -139,10 +146,14 @@ func (r *relayResponses) sendCurrentProvider() (err *types.OpenAIErrorWithStatus
 
 			return r.compatibleSend(chatProvider)
 		}
+		if err = r.requireRawEnvelope(); err != nil {
+			done = true
+			return
+		}
 
 		if r.responsesRequest.Stream {
 			var response requester.StreamReaderInterface[string]
-			response, err = responsesProvider.CreateResponsesStream(&r.responsesRequest)
+			response, err = responsesProvider.CreateResponsesStream(r.c.Request.Context(), r.providerRequest(commonresponses.ResponsesCreate))
 			if err != nil {
 				return
 			}
@@ -159,7 +170,7 @@ func (r *relayResponses) sendCurrentProvider() (err *types.OpenAIErrorWithStatus
 			}
 		} else {
 			var response *types.OpenAIResponsesResponses
-			response, err = responsesProvider.CreateResponses(&r.responsesRequest)
+			response, err = responsesProvider.CreateResponses(r.c.Request.Context(), r.providerRequest(commonresponses.ResponsesCreate))
 			if err != nil {
 				return
 			}
@@ -174,6 +185,63 @@ func (r *relayResponses) sendCurrentProvider() (err *types.OpenAIErrorWithStatus
 		}
 	}
 	return
+}
+
+func (r *relayResponses) providerRequest(operation commonresponses.Operation) *commonresponses.Request {
+	channelID := 0
+	if r.provider != nil && r.provider.GetChannel() != nil {
+		channelID = r.provider.GetChannel().Id
+	}
+	headers := requestctx.HeaderSnapshot{}
+	principal := requestctx.Principal{}
+	if r.c != nil {
+		if r.c.Request != nil {
+			headers = requestctx.NewHeaderSnapshot(r.c.Request.Header)
+		}
+		principal = requestctx.PrincipalFromGin(r.c)
+	}
+	body := r.rawEnvelope
+	return &commonresponses.Request{
+		Operation: operation,
+		Headers:   headers,
+		Body:      body,
+		Control: commonresponses.Control{
+			DownstreamDialect: commonresponses.DownstreamResponses,
+			Stream:            r.responsesRequest.Stream,
+		},
+		Policy:    r.responsesPolicyInput(),
+		Principal: principal,
+		ChannelID: channelID,
+		Model:     r.modelName,
+	}
+}
+
+func (r *relayResponses) responsesPolicyInput() commonresponses.PolicyInput {
+	policy := commonresponses.PolicyInput{}
+	if r == nil {
+		return policy
+	}
+	if key := strings.TrimSpace(r.responsesRequest.PromptCacheKey); key != "" {
+		policy.PromptCache = &commonresponses.PromptCacheDecision{
+			Key:    key,
+			Source: commonresponses.PromptCacheClientBody,
+		}
+		return policy
+	}
+	if key := requesthints.Get(r.c, requesthints.ResponsesPromptCacheKey); key != "" {
+		policy.PromptCache = &commonresponses.PromptCacheDecision{
+			Key:    key,
+			Source: commonresponses.PromptCacheRouteHint,
+		}
+	}
+	return policy
+}
+
+func (r *relayResponses) requireRawEnvelope() *types.OpenAIErrorWithStatusCode {
+	if r != nil && r.rawEnvelope != nil {
+		return nil
+	}
+	return common.StringErrorWrapperLocal("responses raw request body is required", "invalid_request_error", http.StatusBadRequest)
 }
 
 func (r *relayResponses) clearStalePreviousResponseAffinity() {
@@ -244,7 +312,12 @@ func (r *relayResponses) compatibleSend(chatProvider providersBase.ChatInterface
 		if errWithCode != nil {
 			return
 		}
-		firstResponseTime, finalResponse := r.chatToResponseStreamClient(response)
+		var finalResponse *types.OpenAIResponsesResponses
+		var firstResponseTime time.Time
+		firstResponseTime, finalResponse, errWithCode = r.chatToResponseStreamClient(response)
+		if errWithCode != nil {
+			return
+		}
 		r.SetFirstResponseTime(firstResponseTime)
 		if channel := r.provider.GetChannel(); channel != nil {
 			recordResponsesChannelAffinity(r.c, channel.Id, finalResponse)
@@ -330,7 +403,7 @@ func hasMeaningfulResponsesConversation(conversation any) bool {
 }
 
 // 将chat转换成兼容的responses流处理
-func (r *relayResponses) chatToResponseStreamClient(stream requester.StreamReaderInterface[string]) (firstResponseTime time.Time, finalResponse *types.OpenAIResponsesResponses) {
+func (r *relayResponses) chatToResponseStreamClient(stream requester.StreamReaderInterface[string]) (firstResponseTime time.Time, finalResponse *types.OpenAIResponsesResponses, errWithCode *types.OpenAIErrorWithStatusCode) {
 	requester.SetEventStreamHeaders(r.c)
 	dataChan, errChan := stream.Recv()
 
@@ -408,12 +481,15 @@ func (r *relayResponses) chatToResponseStreamClient(stream requester.StreamReade
 				continue
 			}
 			handleError(err)
-			return firstResponseTime, converter.FinalResponse()
+			if !isStreamTerminalEOF(err) {
+				return firstResponseTime, converter.FinalResponse(), common.ErrorWrapper(err, "stream_read_failed", http.StatusInternalServerError)
+			}
+			return firstResponseTime, converter.FinalResponse(), nil
 		}
 	}
 
 	handleEOF()
-	return firstResponseTime, converter.FinalResponse()
+	return firstResponseTime, converter.FinalResponse(), nil
 }
 
 type responsesOperation int

@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -8,12 +9,13 @@ import (
 	"strings"
 
 	"one-api/common"
+	"one-api/common/logger"
 	"one-api/common/requester"
+	commonresponses "one-api/common/responses"
+	"one-api/providers/codex/wire"
 	"one-api/providers/openai"
 	"one-api/types"
 )
-
-const codexReasoningEncryptedContentInclude = "reasoning.encrypted_content"
 
 // CodexResponsesStreamHandler handles Codex Responses streaming.
 type CodexResponsesStreamHandler struct {
@@ -23,13 +25,12 @@ type CodexResponsesStreamHandler struct {
 	accumulator *codexTurnUsageAccumulator
 }
 
-type codexResponsesUsageEvent struct {
-	Type        string                          `json:"type"`
-	Delta       json.RawMessage                 `json:"delta,omitempty"`
-	Item        *types.ResponsesOutput          `json:"item,omitempty"`
-	OutputIndex *int                            `json:"output_index,omitempty"`
-	Response    *types.OpenAIResponsesResponses `json:"response,omitempty"`
-}
+const codexResponsesStreamMaxLineBytes = 16 << 20
+
+var (
+	codexResponsesStreamMaxEventBytes = 16 << 20
+	errCodexResponsesSSEEventTooLarge = errors.New("codex responses SSE event exceeds configured read limit")
+)
 
 func cloneCodexExtraBilling(extraBilling map[string]types.ExtraBilling) map[string]types.ExtraBilling {
 	if len(extraBilling) == 0 {
@@ -88,50 +89,11 @@ func finalizeCodexResponsesUsage(usage *types.Usage, response *types.OpenAIRespo
 }
 
 func codexResponsesSearchType(response *types.OpenAIResponsesResponses) string {
-	if response == nil || len(response.Tools) == 0 {
-		return ""
-	}
-
-	for _, tool := range response.Tools {
-		if !types.IsResponsesWebSearchToolType(tool.Type) {
-			continue
-		}
-		if searchType := strings.TrimSpace(tool.SearchContextSize); searchType != "" {
-			return searchType
-		}
-		return "medium"
-	}
-
-	return ""
+	return commonresponses.ResponsesSearchType(response)
 }
 
 func applyCodexResponsesAddedToolBilling(usage *types.Usage, item *types.ResponsesOutput, searchType string) {
-	if usage == nil || item == nil {
-		return
-	}
-
-	switch item.Type {
-	case types.InputTypeWebSearchCall:
-		if searchType == "" {
-			searchType = "medium"
-		}
-		usage.IncExtraBilling(types.APIToolTypeWebSearchPreview, searchType)
-	case types.InputTypeCodeInterpreterCall:
-		usage.IncExtraBilling(types.APIToolTypeCodeInterpreter, "")
-	case types.InputTypeFileSearchCall:
-		usage.IncExtraBilling(types.APIToolTypeFileSearch, "")
-	case types.InputTypeImageGenerationCall:
-		usage.IncExtraBilling(types.APIToolTypeImageGeneration, item.Quality+"-"+item.Size)
-	}
-}
-
-func codexResponsesUsageHandlerEventType(eventType string) bool {
-	switch strings.TrimSpace(eventType) {
-	case "response.created", "response.output_text.delta", "response.output_item.added", "response.completed", "response.failed", "response.incomplete", "response.done":
-		return true
-	default:
-		return false
-	}
+	commonresponses.ApplyResponsesOutputItemBilling(usage, item, searchType)
 }
 
 func (h *CodexResponsesStreamHandler) observeUsageEvent(dataLine string) {
@@ -139,15 +101,19 @@ func (h *CodexResponsesStreamHandler) observeUsageEvent(dataLine string) {
 		return
 	}
 
-	var event codexResponsesUsageEvent
-	if err := json.Unmarshal([]byte(dataLine), &event); err != nil || !codexResponsesUsageHandlerEventType(event.Type) {
+	event, ok := commonresponses.ParseStreamUsageEvent([]byte(dataLine))
+	if !ok {
 		return
 	}
 
 	if h.accumulator != nil {
+		var delta any
+		if text, ok := commonresponses.StreamEventDeltaString(event.Delta); ok {
+			delta = text
+		}
 		h.accumulator.ObserveEvent(&types.OpenAIResponsesStreamResponses{
 			Type:        event.Type,
-			Delta:       event.Delta,
+			Delta:       delta,
 			Item:        event.Item,
 			OutputIndex: event.OutputIndex,
 			Response:    event.Response,
@@ -155,10 +121,9 @@ func (h *CodexResponsesStreamHandler) observeUsageEvent(dataLine string) {
 	}
 
 	switch event.Type {
-	case "response.output_text.delta":
+	case "response.output_text.delta", "response.reasoning_summary_text.delta":
 		if h.Usage != nil {
-			var delta string
-			if len(event.Delta) > 0 && json.Unmarshal(event.Delta, &delta) == nil {
+			if delta, ok := commonresponses.StreamEventDeltaString(event.Delta); ok {
 				h.Usage.TextBuilder.WriteString(delta)
 			}
 		}
@@ -186,23 +151,22 @@ func newCodexResponsesStreamHandler(usage *types.Usage) *CodexResponsesStreamHan
 	}
 }
 
-// CreateResponses builds a non-streamed response via streaming.
-func (p *CodexProvider) CreateResponses(request *types.OpenAIResponsesRequest) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
-	// Apply Codex-specific settings.
-	p.prepareCodexRequest(request)
-
-	// Codex requires streaming.
-	request.Stream = true
-
-	// Build request.
-	req, errWithCode := p.getResponsesRequest(request)
+// CreateResponses builds a non-streamed response via Codex Official streaming.
+func (p *CodexProvider) CreateResponses(ctx context.Context, rawReq *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
+	req, errWithCode := p.prepareResponsesCreateRequest(ctx, rawReq)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
 	defer req.Body.Close()
+	request := codexResponsesProjection(rawReq)
+	request.Stream = true
 
 	// Send streaming request.
-	resp, errWithCode := p.Requester.SendRequestRaw(req)
+	httpRequester := p.codexRequester()
+	if httpRequester == nil {
+		return nil, common.StringErrorWrapperLocal("requester is not configured", "channel_error", http.StatusServiceUnavailable)
+	}
+	resp, errWithCode := httpRequester.SendRequestRaw(req)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -211,7 +175,9 @@ func (p *CodexProvider) CreateResponses(request *types.OpenAIResponsesRequest) (
 	handler := newCodexResponsesStreamHandler(p.Usage)
 
 	// Get stream response.
-	stream, errWithCode := requester.RequestNoTrimStreamWithEmitterOptions(p.Requester, resp, handler.HandlerResponsesStreamWithEmitter, requester.StreamReadOptions{})
+	stream, errWithCode := requester.RequestNoTrimStreamWithEmitterOptions(httpRequester, resp, handler.HandlerResponsesStreamWithEmitter, requester.StreamReadOptions{
+		MaxLineBytes: codexResponsesStreamMaxLineBytes,
+	})
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -233,22 +199,21 @@ func (p *CodexProvider) CreateResponses(request *types.OpenAIResponsesRequest) (
 }
 
 // CreateResponsesStream streams Responses.
-func (p *CodexProvider) CreateResponsesStream(request *types.OpenAIResponsesRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
-	// Apply Codex-specific settings.
-	p.prepareCodexRequest(request)
-
-	// Force stream (Codex requirement).
-	request.Stream = true
-
-	// Build request.
-	req, errWithCode := p.getResponsesRequest(request)
+func (p *CodexProvider) CreateResponsesStream(ctx context.Context, rawReq *commonresponses.Request) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+	req, errWithCode := p.prepareResponsesCreateRequest(ctx, rawReq)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
 	defer req.Body.Close()
+	request := codexResponsesProjection(rawReq)
+	request.Stream = true
+	httpRequester := p.codexRequester()
+	if httpRequester == nil {
+		return nil, common.StringErrorWrapperLocal("requester is not configured", "channel_error", http.StatusServiceUnavailable)
+	}
 
 	// Send request.
-	resp, errWithCode := p.Requester.SendRequestRaw(req)
+	resp, errWithCode := httpRequester.SendRequestRaw(req)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -285,25 +250,32 @@ func (p *CodexProvider) CreateResponsesStream(request *types.OpenAIResponsesRequ
 			chatHandler.HandlerChatStream(&normalized, dataChan, errChan)
 		}
 
-		return requester.RequestStream(p.Requester, resp, bridgeHandler)
+		return requester.RequestStreamWithOptions(httpRequester, resp, bridgeHandler, requester.StreamReadOptions{
+			MaxLineBytes: codexResponsesStreamMaxLineBytes,
+		})
 	}
 
 	// Use RequestNoTrimStream to preserve event lines.
-	return requester.RequestNoTrimStreamWithEmitterOptions(p.Requester, resp, handler.HandlerResponsesStreamWithEmitter, requester.StreamReadOptions{})
+	return requester.RequestNoTrimStreamWithEmitterOptions(httpRequester, resp, handler.HandlerResponsesStreamWithEmitter, requester.StreamReadOptions{
+		MaxLineBytes: codexResponsesStreamMaxLineBytes,
+	})
 }
 
-func (p *CodexProvider) CompactResponses(request *types.OpenAIResponsesRequest) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
-	p.prepareCodexCompactRequest(request)
-	request.Stream = false
-
-	req, errWithCode := p.getResponsesOperationRequest(request, "compact")
+func (p *CodexProvider) CompactResponses(ctx context.Context, rawReq *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
+	req, errWithCode := p.prepareResponsesCompactRequest(ctx, rawReq)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
 	defer req.Body.Close()
+	request := codexResponsesProjection(rawReq)
+	request.Stream = false
 
 	response := &types.OpenAIResponsesResponses{}
-	_, errWithCode = p.Requester.SendRequest(req, response, false)
+	httpRequester := p.codexRequester()
+	if httpRequester == nil {
+		return nil, common.StringErrorWrapperLocal("requester is not configured", "channel_error", http.StatusServiceUnavailable)
+	}
+	_, errWithCode = httpRequester.SendRequest(req, response, false)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -317,190 +289,173 @@ func (p *CodexProvider) CompactResponses(request *types.OpenAIResponsesRequest) 
 	return response, nil
 }
 
-// prepareCodexRequest prepares Codex request fields for ordinary responses.
-func (p *CodexProvider) prepareCodexRequest(request *types.OpenAIResponsesRequest) {
-	p.prepareCodexRequestWithReasoning(request, true)
+// codexResponsesProjection keeps raw body planning separate from the
+// local typed projection used for downstream accounting and response shaping.
+func codexResponsesProjection(req *commonresponses.Request) *types.OpenAIResponsesRequest {
+	return commonresponses.ProjectRequest(req, normalizeCodexModelName)
 }
 
-// prepareCodexCompactRequest prepares Codex request fields for compact requests.
-func (p *CodexProvider) prepareCodexCompactRequest(request *types.OpenAIResponsesRequest) {
-	p.prepareCodexRequestWithReasoning(request, false)
+func (p *CodexProvider) prepareResponsesCreateRequest(ctx context.Context, req *commonresponses.Request) (*http.Request, *types.OpenAIErrorWithStatusCode) {
+	if req == nil || req.Body == nil || req.Body.Object == nil {
+		return nil, common.StringErrorWrapperLocal("request body is required", "invalid_request_error", http.StatusBadRequest)
+	}
+	model := normalizeCodexModelName(req.Model)
+	if model == "" {
+		model = normalizeCodexModelName(req.Body.Projection.Model)
+	}
+	policy := responsesPolicyInput(req)
+	body, err := wire.PlanResponsesCreateBody(req.Body.Object, wire.CreateBodyInput{
+		Model:       model,
+		Stream:      true,
+		PromptCache: policy.PromptCache,
+	})
+	if err != nil {
+		return nil, codexWireError(err)
+	}
+	return p.prepareResponsesOfficialHTTPRequest(ctx, req, wire.OpResponsesCreate, "", model, body)
 }
 
-// prepareCodexRequestWithReasoning prepares Codex request fields.
-//
-// Trade-off: Codex regular Responses calls still need
-// `store=false` and `include=["reasoning.encrypted_content"]` so resumed
-// reasoning state can flow through the proxy, but the dedicated
-// `/responses/compact` payload is a different schema and current upstream
-// rejects those structured fields there. Keep them on normal responses and
-// explicitly strip them from compact requests instead of trying to infer
-// support dynamically per upstream response.
-func (p *CodexProvider) prepareCodexRequestWithReasoning(request *types.OpenAIResponsesRequest, includeReasoning bool) {
-	request.Model = normalizeCodexModelName(request.Model)
-
-	if includeReasoning {
-		// Codex regular responses require store=false.
-		storeFalse := false
-		request.Store = &storeFalse
-	} else {
-		request.Store = nil
+func (p *CodexProvider) prepareResponsesCompactRequest(ctx context.Context, req *commonresponses.Request) (*http.Request, *types.OpenAIErrorWithStatusCode) {
+	if req == nil || req.Body == nil || req.Body.Object == nil {
+		return nil, common.StringErrorWrapperLocal("request body is required", "invalid_request_error", http.StatusBadRequest)
 	}
-
-	// Prefer temperature over top_p when both set.
-	if request.Temperature != nil && request.TopP != nil {
-		request.TopP = nil
+	model := normalizeCodexModelName(req.Model)
+	if model == "" {
+		model = normalizeCodexModelName(req.Body.Projection.Model)
 	}
-
-	// Codex upstream currently rejects OpenAI context-management and truncation controls.
-	request.ContextManagement = nil
-	request.Truncation = ""
-
-	ensureStablePromptCacheKey(request, p.Context, p.getPromptCacheKeyStrategy())
-	if includeReasoning {
-		ensureCodexIncludes(request)
-	} else {
-		request.Include = nil
+	policy := responsesPolicyInput(req)
+	body, err := wire.PlanResponsesCompactBody(req.Body.Object, req.Body.Projection, model, policy.PromptCache)
+	if err != nil {
+		return nil, codexWireError(err)
 	}
-	normalizeCodexBuiltinTools(request)
-
-	// Adapt to Codex CLI format.
-	p.adaptCodexCLI(request)
+	return p.prepareResponsesOfficialHTTPRequest(ctx, req, wire.OpResponsesCompact, "compact", model, body)
 }
 
-func ensureCodexIncludes(request *types.OpenAIResponsesRequest) {
-	if request == nil {
+func responsesPolicyInput(req *commonresponses.Request) commonresponses.PolicyInput {
+	if req == nil {
+		return commonresponses.PolicyInput{}
+	}
+	policy := req.Policy
+	if req.Body != nil {
+		if key := strings.TrimSpace(req.Body.Projection.PromptCacheKey); key != "" {
+			policy.PromptCache = &commonresponses.PromptCacheDecision{
+				Key:    key,
+				Source: commonresponses.PromptCacheClientBody,
+			}
+			return policy
+		}
+	}
+	if policy.PromptCache != nil && strings.TrimSpace(policy.PromptCache.Key) != "" {
+		return policy
+	}
+	return policy
+}
+
+func (p *CodexProvider) prepareResponsesOfficialHTTPRequest(ctx context.Context, req *commonresponses.Request, operation wire.Operation, pathSuffix, model string, body []byte) (*http.Request, *types.OpenAIErrorWithStatusCode) {
+	metadata, err := wire.MetadataFromResponsesBody(req.Body.Object)
+	if err != nil {
+		return nil, codexWireError(err)
+	}
+	policy, err := p.codexOfficialChannelPolicy()
+	if err != nil {
+		return nil, common.ErrorWrapperLocal(err, "channel_config_error", http.StatusServiceUnavailable)
+	}
+	token, tokenErr := p.GetToken()
+	if tokenErr != nil {
+		return nil, p.handleTokenError(tokenErr)
+	}
+	identity, decisions, err := wire.ResolveIdentity(wire.IdentityInput{
+		Operation: operation,
+		Headers:   req.Headers,
+		Metadata:  metadata,
+		Policy:    policy,
+		Principal: p.codexPrincipalFingerprint(req.Principal),
+		ChannelID: req.ChannelID,
+		Clock:     wire.RealClock{},
+	})
+	if err != nil {
+		return nil, codexWireError(err)
+	}
+	plan, err := wire.BuildHeaders(wire.HeaderPlanInput{
+		Operation: operation,
+		Headers:   req.Headers,
+		Credential: wire.Credential{
+			AccessToken: token,
+			AccountID:   p.codexAccountID(),
+		},
+		Policy:   policy,
+		Identity: identity,
+	})
+	if err != nil {
+		return nil, codexWireError(err)
+	}
+	plan.Decisions = append(decisions, plan.Decisions...)
+	p.auditCodexOfficialHeaderPlan(ctx, operation, req.ChannelID, plan.Decisions)
+
+	requestPath := strings.TrimRight(p.Config.Responses, "/")
+	if pathSuffix != "" {
+		requestPath += "/" + strings.TrimLeft(pathSuffix, "/")
+	}
+	fullRequestURL := p.GetFullRequestURL(requestPath, model)
+	httpRequester := p.codexRequester()
+	if httpRequester == nil {
+		return nil, common.StringErrorWrapperLocal("requester is not configured", "channel_error", http.StatusServiceUnavailable)
+	}
+	httpReq, buildErr := httpRequester.NewRequest(http.MethodPost, fullRequestURL, httpRequester.WithBody(body), httpRequester.WithHeader(plan.Map()), httpRequester.WithContext(ctx))
+	if buildErr != nil {
+		return nil, common.ErrorWrapper(buildErr, "new_request_failed", http.StatusInternalServerError)
+	}
+	return httpReq, nil
+}
+
+func codexWireError(err error) *types.OpenAIErrorWithStatusCode {
+	if err == nil {
+		return nil
+	}
+	if violation, ok := err.(*wire.Violation); ok {
+		return &types.OpenAIErrorWithStatusCode{
+			OpenAIError: types.OpenAIError{
+				Message: publicWireViolationMessage(violation),
+				Type:    "invalid_request_error",
+				Param:   violation.Param,
+				Code:    "invalid_request_error",
+			},
+			StatusCode: http.StatusBadRequest,
+			LocalError: true,
+		}
+	}
+	return common.ErrorWrapperLocal(err, "internal_server_error", http.StatusInternalServerError)
+}
+
+func publicWireViolationMessage(violation *wire.Violation) string {
+	if violation == nil || strings.TrimSpace(violation.Param) == "" {
+		return "invalid request"
+	}
+	return "invalid request field: " + strings.TrimSpace(violation.Param)
+}
+
+func (p *CodexProvider) auditCodexOfficialHeaderPlan(ctx context.Context, operation wire.Operation, channelID int, decisions []wire.Decision) {
+	if len(decisions) == 0 {
 		return
 	}
-
-	switch include := request.Include.(type) {
-	case nil:
-		request.Include = []string{codexReasoningEncryptedContentInclude}
-	case []string:
-		request.Include = appendUniqueStrings(include, codexReasoningEncryptedContentInclude)
-	case []any:
-		values := make([]string, 0, len(include)+1)
-		for _, item := range include {
-			if str, ok := item.(string); ok && strings.TrimSpace(str) != "" {
-				values = append(values, str)
-			}
-		}
-		request.Include = appendUniqueStrings(values, codexReasoningEncryptedContentInclude)
-	case string:
-		request.Include = appendUniqueStrings([]string{include}, codexReasoningEncryptedContentInclude)
-	default:
-		raw, err := json.Marshal(include)
-		if err != nil {
-			request.Include = []string{codexReasoningEncryptedContentInclude}
-			return
-		}
-
-		var values []string
-		if err := json.Unmarshal(raw, &values); err != nil {
-			request.Include = []string{codexReasoningEncryptedContentInclude}
-			return
-		}
-		request.Include = appendUniqueStrings(values, codexReasoningEncryptedContentInclude)
-	}
-}
-
-func appendUniqueStrings(items []string, extra string) []string {
-	result := make([]string, 0, len(items)+1)
-	hasExtra := false
-	for _, item := range items {
-		trimmed := strings.TrimSpace(item)
-		if trimmed == "" {
-			continue
-		}
-		if trimmed == extra {
-			hasExtra = true
-		}
-		result = append(result, trimmed)
-	}
-	if !hasExtra {
-		result = append(result, extra)
-	}
-	return result
-}
-
-func normalizeCodexBuiltinTools(request *types.OpenAIResponsesRequest) {
-	if request == nil {
+	if !logger.DebugEnabled() {
 		return
 	}
-
-	for i := range request.Tools {
-		request.Tools[i].Type = normalizeCodexBuiltinToolType(request.Tools[i].Type)
-	}
-
-	if request.ToolChoice == nil {
+	payload, err := json.Marshal(struct {
+		Dialect   string          `json:"dialect"`
+		Operation wire.Operation  `json:"operation"`
+		ChannelID int             `json:"channel_id,omitempty"`
+		Decisions []wire.Decision `json:"decisions"`
+	}{
+		Dialect:   "codex_official",
+		Operation: operation,
+		ChannelID: channelID,
+		Decisions: decisions,
+	})
+	if err != nil {
 		return
 	}
-
-	normalized, ok := normalizeCodexToolChoiceValue(request.ToolChoice)
-	if ok {
-		request.ToolChoice = normalized
-	}
-}
-
-func normalizeCodexToolChoiceValue(value any) (any, bool) {
-	switch typed := value.(type) {
-	case map[string]any:
-		return normalizeCodexToolChoiceMap(typed), true
-	case []any:
-		items := make([]any, 0, len(typed))
-		for _, item := range typed {
-			if normalized, ok := normalizeCodexToolChoiceValue(item); ok {
-				items = append(items, normalized)
-			} else {
-				items = append(items, item)
-			}
-		}
-		return items, true
-	default:
-		raw, err := json.Marshal(value)
-		if err != nil {
-			return value, false
-		}
-
-		var mapped map[string]any
-		if err := json.Unmarshal(raw, &mapped); err != nil {
-			return value, false
-		}
-		return normalizeCodexToolChoiceMap(mapped), true
-	}
-}
-
-func normalizeCodexToolChoiceMap(value map[string]any) map[string]any {
-	if value == nil {
-		return value
-	}
-
-	if toolType, ok := value["type"].(string); ok {
-		value["type"] = normalizeCodexBuiltinToolType(toolType)
-	}
-
-	if tools, ok := value["tools"].([]any); ok {
-		for i, tool := range tools {
-			if toolMap, ok := tool.(map[string]any); ok {
-				tools[i] = normalizeCodexToolChoiceMap(toolMap)
-			}
-		}
-		value["tools"] = tools
-	}
-
-	return value
-}
-
-func normalizeCodexBuiltinToolType(toolType string) string {
-	if strings.TrimSpace(toolType) == "" {
-		return toolType
-	}
-
-	if normalized := types.NormalizeResponsesWebSearchToolType(toolType); normalized == types.APIToolTypeWebSearch {
-		return normalized
-	}
-
-	return toolType
+	logger.LogDebug(ctx, "[Codex] official upstream header decisions "+string(payload))
 }
 
 func (p *CodexProvider) getPromptCacheKeyStrategy() string {
@@ -523,173 +478,23 @@ func backfillCodexResponsePromptCacheKey(response *types.OpenAIResponsesResponse
 	response.PromptCacheKey = request.PromptCacheKey
 }
 
-// adaptCodexCLI adapts for Codex CLI.
-func (p *CodexProvider) adaptCodexCLI(request *types.OpenAIResponsesRequest) {
-	// Detect Codex CLI requests via instructions.
-	isCodexCLI := false
-	if request.Instructions != "" {
-		instructions := request.Instructions
-		isCodexCLI = len(instructions) > 50 && (len(instructions) >= len("You are a coding agent running in the Codex CLI") &&
-			instructions[:len("You are a coding agent running in the Codex CLI")] == "You are a coding agent running in the Codex CLI" ||
-			len(instructions) >= len("You are Codex") &&
-				instructions[:len("You are Codex")] == "You are Codex")
-	}
-
-	// Apply defaults for non-CLI requests.
-	if !isCodexCLI {
-		// Remove incompatible fields.
-		request.Temperature = nil
-		request.TopP = nil
-		request.MaxOutputTokens = 0
-
-		// Codex backend rejects system/developer roles in input messages.
-		mergeSystemInputMessagesForCodex(request)
-
-		// Set default Codex CLI instructions.
-		request.Instructions = CodexCLIInstructions
-	}
-}
-
-func mergeSystemInputMessagesForCodex(request *types.OpenAIResponsesRequest) {
-	inputs, err := request.ParseInput()
-	if err != nil || len(inputs) == 0 {
-		return
-	}
-
-	merged := make([]types.InputResponses, 0, len(inputs))
-	pendingSystemText := make([]string, 0, 2)
-
-	for _, input := range inputs {
-		if isSystemInputMessage(input) {
-			systemText := strings.TrimSpace(extractInputMessageText(input))
-			if systemText != "" {
-				pendingSystemText = append(pendingSystemText, systemText)
-			}
-			continue
-		}
-
-		if len(pendingSystemText) > 0 && isMergeableInputMessage(input) {
-			input = prependSystemTextToInputMessage(input, strings.Join(pendingSystemText, "\n\n"))
-			pendingSystemText = pendingSystemText[:0]
-		}
-
-		merged = append(merged, input)
-	}
-
-	// If no following message exists, keep system content as a user message.
-	if len(pendingSystemText) > 0 {
-		merged = append(merged, types.InputResponses{
-			Type: types.InputTypeMessage,
-			Role: types.ChatMessageRoleUser,
-			Content: []types.ContentResponses{
-				{
-					Type: types.ContentTypeInputText,
-					Text: strings.Join(pendingSystemText, "\n\n"),
-				},
-			},
-		})
-	}
-
-	request.Input = merged
-}
-
-func isSystemInputMessage(input types.InputResponses) bool {
-	if input.Type != "" && input.Type != types.InputTypeMessage {
-		return false
-	}
-
-	switch strings.ToLower(strings.TrimSpace(input.Role)) {
-	case types.ChatMessageRoleSystem, types.ChatMessageRoleDeveloper:
-		return true
-	default:
-		return false
-	}
-}
-
-func isMergeableInputMessage(input types.InputResponses) bool {
-	if input.Type != "" && input.Type != types.InputTypeMessage {
-		return false
-	}
-
-	return strings.ToLower(strings.TrimSpace(input.Role)) == types.ChatMessageRoleUser
-}
-
-func extractInputMessageText(input types.InputResponses) string {
-	if input.Content == nil {
-		return ""
-	}
-	if content, ok := input.Content.(string); ok {
-		return content
-	}
-
-	contentList, err := input.ParseContent()
-	if err != nil || len(contentList) == 0 {
-		return ""
-	}
-
-	textParts := make([]string, 0, len(contentList))
-	for _, content := range contentList {
-		if content.Type == types.ContentTypeInputText || content.Type == types.ContentTypeOutputText || content.Type == "" {
-			if strings.TrimSpace(content.Text) != "" {
-				textParts = append(textParts, content.Text)
-			}
-		}
-	}
-
-	return strings.Join(textParts, "\n")
-}
-
-func prependSystemTextToInputMessage(input types.InputResponses, systemText string) types.InputResponses {
-	systemText = strings.TrimSpace(systemText)
-	if systemText == "" {
-		return input
-	}
-
-	if content, ok := input.Content.(string); ok {
-		if strings.TrimSpace(content) == "" {
-			input.Content = systemText
-		} else {
-			input.Content = systemText + "\n\n" + content
-		}
-		return input
-	}
-
-	contentList, err := input.ParseContent()
-	if err != nil || len(contentList) == 0 {
-		input.Content = systemText
-		return input
-	}
-
-	if contentList[0].Type == types.ContentTypeInputText || contentList[0].Type == types.ContentTypeOutputText || contentList[0].Type == "" {
-		if strings.TrimSpace(contentList[0].Text) == "" {
-			contentList[0].Text = systemText
-		} else {
-			contentList[0].Text = systemText + "\n\n" + contentList[0].Text
-		}
-	} else {
-		contentList = append([]types.ContentResponses{
-			{
-				Type: types.ContentTypeInputText,
-				Text: systemText,
-			},
-		}, contentList...)
-	}
-
-	input.Content = contentList
-	return input
-}
-
 // collectResponsesStreamResponse aggregates stream to a response.
 func (p *CodexProvider) collectResponsesStreamResponse(stream requester.StreamReaderInterface[string]) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
+	if stream == nil {
+		return nil, common.StringErrorWrapperLocal("response stream is required", "stream_read_failed", http.StatusInternalServerError)
+	}
+	defer stream.Close()
+
 	var response *types.OpenAIResponsesResponses
 
 	dataChan, errChan := stream.Recv()
 
-	for {
+	for dataChan != nil || errChan != nil {
 		select {
 		case data, ok := <-dataChan:
 			if !ok {
-				goto buildResponse
+				dataChan = nil
+				continue
 			}
 
 			if strings.TrimSpace(data) == "" {
@@ -715,26 +520,24 @@ func (p *CodexProvider) collectResponsesStreamResponse(stream requester.StreamRe
 
 		case err, ok := <-errChan:
 			if !ok {
+				errChan = nil
 				continue
 			}
 			if err != nil {
 				// EOF is normal end-of-stream.
 				if errors.Is(err, io.EOF) {
-					goto buildResponse
+					dataChan = nil
+					errChan = nil
+					continue
 				}
 				return nil, common.ErrorWrapper(err, "stream_read_failed", http.StatusInternalServerError)
 			}
 		}
 	}
 
-buildResponse:
 	if response == nil {
 		return nil, common.StringErrorWrapperLocal("no response received", "no_response", http.StatusInternalServerError)
 	}
-	if p.Usage == nil {
-		p.Usage = &types.Usage{}
-	}
-	finalizeCodexResponsesUsage(p.Usage, response, "", false)
 	return response, nil
 }
 
@@ -747,106 +550,97 @@ func extractJSONFromSSE(sseData string) string {
 	//
 	// Extract JSON after data: prefix.
 
-	lines := strings.Split(sseData, "\n")
-	for _, line := range lines {
+	var payload strings.Builder
+	forEachSSELine(sseData, func(line string) bool {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "data:") {
-			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			if payload == "" || payload == "[DONE]" {
-				continue
+			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if data == "" || data == "[DONE]" {
+				return true
 			}
-			return payload
+			if payload.Len() > 0 {
+				payload.WriteByte('\n')
+			}
+			payload.WriteString(data)
 		}
-	}
-	return ""
+		return true
+	})
+	return payload.String()
 }
 
-// getResponsesRequest builds the Responses request.
-func (p *CodexProvider) getResponsesRequest(request *types.OpenAIResponsesRequest) (*http.Request, *types.OpenAIErrorWithStatusCode) {
-	return p.getResponsesOperationRequestWithSession(request, "", "")
-}
-
-func (p *CodexProvider) getResponsesRequestWithSession(request *types.OpenAIResponsesRequest, sessionID string) (*http.Request, *types.OpenAIErrorWithStatusCode) {
-	return p.getResponsesOperationRequestWithSession(request, "", sessionID)
-}
-
-func (p *CodexProvider) getResponsesOperationRequest(request *types.OpenAIResponsesRequest, pathSuffix string) (*http.Request, *types.OpenAIErrorWithStatusCode) {
-	return p.getResponsesOperationRequestWithSession(request, pathSuffix, "")
-}
-
-func (p *CodexProvider) getResponsesOperationRequestWithSession(request *types.OpenAIResponsesRequest, pathSuffix, sessionID string) (*http.Request, *types.OpenAIErrorWithStatusCode) {
-	ensureStablePromptCacheKey(request, p.Context, p.getPromptCacheKeyStrategy())
-
-	requestPath := strings.TrimRight(p.Config.Responses, "/")
-	if pathSuffix != "" {
-		requestPath += "/" + strings.TrimLeft(pathSuffix, "/")
+func forEachSSELine(sseData string, visit func(string) bool) {
+	for {
+		idx := strings.IndexByte(sseData, '\n')
+		if idx < 0 {
+			if sseData != "" {
+				visit(sseData)
+			}
+			return
+		}
+		if !visit(sseData[:idx]) {
+			return
+		}
+		sseData = sseData[idx+1:]
 	}
-
-	// Build full request URL.
-	fullRequestURL := p.GetFullRequestURL(requestPath, request.Model)
-
-	// Build headers with token error handling.
-	headers, err := p.getRequestHeaderBag()
-	if err != nil {
-		return nil, p.handleTokenError(err)
-	}
-
-	applyCodexExecutionSessionHeader(headers, resolveCodexExecutionSessionID(headers, sessionID))
-
-	// Reuse prompt cache identity as the Codex conversation/session identifier.
-	if strings.TrimSpace(request.PromptCacheKey) != "" {
-		headers.Set("Conversation_id", request.PromptCacheKey)
-		headers.Set("session_id", request.PromptCacheKey)
-	}
-
-	// Apply Codex default headers.
-	p.applyDefaultHeaders(headers)
-
-	if request.Stream {
-		headers.Set("Accept", "text/event-stream")
-	} else {
-		headers.Set("Accept", "application/json")
-	}
-
-	// Create request via requester.
-	req, err := p.Requester.NewRequest(http.MethodPost, fullRequestURL, p.Requester.WithBody(request), p.Requester.WithHeader(headers.Map()))
-	if err != nil {
-		return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
-	}
-
-	return req, nil
 }
 
 // HandlerResponsesStream handles Responses streaming (passthrough).
 func (h *CodexResponsesStreamHandler) HandlerResponsesStream(rawLine *[]byte, dataChan chan string, errChan chan error) {
-	h.handleResponsesStream(rawLine, func(data string) bool {
+	h.handleResponsesStreamWithError(rawLine, func(data string) bool {
 		dataChan <- data
 		return true
+	}, func(err error) bool {
+		select {
+		case errChan <- err:
+			return true
+		default:
+			return false
+		}
 	})
 }
 
 func (h *CodexResponsesStreamHandler) HandlerResponsesStreamWithEmitter(rawLine *[]byte, emitter requester.StreamEmitter[string]) {
-	h.handleResponsesStream(rawLine, emitter.SendData)
+	h.handleResponsesStreamWithError(rawLine, emitter.SendData, emitter.SendError)
 }
 
 func (h *CodexResponsesStreamHandler) handleResponsesStream(rawLine *[]byte, sendData func(string) bool) {
+	h.handleResponsesStreamWithError(rawLine, sendData, nil)
+}
+
+func (h *CodexResponsesStreamHandler) handleResponsesStreamWithError(rawLine *[]byte, sendData func(string) bool, sendError func(error) bool) {
+	if h == nil || rawLine == nil {
+		return
+	}
 	rawStr := string(*rawLine)
 
 	// Handle SSE event lines.
 	if strings.HasPrefix(rawStr, "event: ") {
+		if h.eventBuffer.Len() > 0 {
+			if !sendData(h.eventBuffer.String()) {
+				return
+			}
+			h.eventBuffer.Reset()
+		}
 		// Start new event and capture event type.
 		h.eventType = strings.TrimSpace(strings.TrimPrefix(rawStr, "event: "))
 		h.eventBuffer.Reset()
-		appendCodexSSELine(&h.eventBuffer, rawStr)
+		if err := appendCodexSSELine(&h.eventBuffer, rawStr); err != nil {
+			h.failBufferedSSEEvent(sendError, err)
+		}
 		return
 	}
 
 	// Buffer non-data lines when inside an event.
 	if !strings.HasPrefix(rawStr, "data:") {
 		if h.eventBuffer.Len() > 0 {
-			appendCodexSSELine(&h.eventBuffer, rawStr)
+			if err := appendCodexSSELine(&h.eventBuffer, rawStr); err != nil {
+				h.failBufferedSSEEvent(sendError, err)
+				return
+			}
 			if strings.TrimSpace(rawStr) == "" {
-				sendData(h.eventBuffer.String())
+				if !sendData(h.eventBuffer.String()) {
+					return
+				}
 				h.eventBuffer.Reset()
 				h.eventType = ""
 			}
@@ -865,31 +659,54 @@ func (h *CodexResponsesStreamHandler) handleResponsesStream(rawLine *[]byte, sen
 	if dataLine == "[DONE]" {
 		// Flush buffered event.
 		if h.eventBuffer.Len() > 0 {
-			sendData(h.eventBuffer.String())
+			if !sendData(h.eventBuffer.String()) {
+				return
+			}
 			h.eventBuffer.Reset()
 			h.eventType = ""
 		}
 		return
 	}
 
-	h.observeUsageEvent(dataLine)
-
 	// Passthrough: buffer or forward raw data.
 	if h.eventBuffer.Len() > 0 {
 		// Buffer data line within event.
-		appendCodexSSELine(&h.eventBuffer, rawStr)
+		if err := appendCodexSSELine(&h.eventBuffer, rawStr); err != nil {
+			h.failBufferedSSEEvent(sendError, err)
+			return
+		}
 	} else {
 		// No event type: forward data line.
 		sendData(rawStr)
 	}
+
+	h.observeUsageEvent(dataLine)
 }
 
-func appendCodexSSELine(buffer *strings.Builder, raw string) {
+func (h *CodexResponsesStreamHandler) failBufferedSSEEvent(sendError func(error) bool, err error) {
+	if h != nil {
+		h.eventBuffer.Reset()
+		h.eventType = ""
+	}
+	if sendError != nil {
+		sendError(err)
+	}
+}
+
+func appendCodexSSELine(buffer *strings.Builder, raw string) error {
 	if buffer == nil {
-		return
+		return nil
+	}
+	extraBytes := len(raw)
+	if !strings.HasSuffix(raw, "\n") {
+		extraBytes++
+	}
+	if codexResponsesStreamMaxEventBytes > 0 && buffer.Len()+extraBytes > codexResponsesStreamMaxEventBytes {
+		return errCodexResponsesSSEEventTooLarge
 	}
 	buffer.WriteString(raw)
 	if !strings.HasSuffix(raw, "\n") {
 		buffer.WriteString("\n")
 	}
+	return nil
 }

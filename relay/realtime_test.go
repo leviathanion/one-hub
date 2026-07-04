@@ -520,8 +520,6 @@ func TestRelayModeChatRealtimeGetProviderForceFreshOnSameAffinityChannel(t *test
 	})
 
 	routedChannel := newRelayTestCodexChannel(affinityChannelID)
-	routedHeaders := `{"x-codex-beta-features":"feature-b"}`
-	routedChannel.ModelHeaders = &routedHeaders
 	model.ChannelGroup = buildRealtimeTestChannelGroupForChannels(routedChannel)
 
 	ctx := newRelayTestContext(map[string]string{

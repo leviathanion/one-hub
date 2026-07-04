@@ -1,18 +1,41 @@
 package codex
 
 import (
-	"encoding/json"
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"one-api/common/config"
+	"one-api/common/requestctx"
+	commonresponses "one-api/common/responses"
+	"one-api/common/responsesws"
 	"one-api/internal/requesthints"
+	"one-api/providers/codex/wire"
 	"one-api/types"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
+
+func TestCodexOfficialChannelPolicyValidatesDefaultOriginator(t *testing.T) {
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"codex":{"default_originator":" codex_cli_rs.test-1 "}}`, nil)
+	policy, err := provider.codexOfficialChannelPolicy()
+	if err != nil {
+		t.Fatalf("expected valid default_originator, got %v", err)
+	}
+	if policy.DefaultOriginator != "codex_cli_rs.test-1" {
+		t.Fatalf("expected trimmed default_originator, got %q", policy.DefaultOriginator)
+	}
+
+	provider = newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"codex":{"default_originator":"bad value"}}`, nil)
+	_, err = provider.codexOfficialChannelPolicy()
+	if err == nil || !strings.Contains(err.Error(), "default_originator") {
+		t.Fatalf("expected invalid default_originator rejection, got %v", err)
+	}
+}
 
 func TestCodexResponsesUsageAndBillingHelpers(t *testing.T) {
 	originalDisable := config.DisableTokenEncoders
@@ -74,8 +97,11 @@ func TestCodexResponsesUsageAndBillingHelpers(t *testing.T) {
 		t.Fatalf("expected image generation billing, got %+v", usage.ExtraBilling)
 	}
 
-	if !codexResponsesUsageHandlerEventType("response.done") || codexResponsesUsageHandlerEventType("response.updated") {
-		t.Fatal("expected usage-handler event classification to match supported event types")
+	if _, ok := commonresponses.ParseStreamUsageEvent([]byte(`{"type":"response.done"}`)); !ok {
+		t.Fatal("expected response.done to be tracked by shared usage parser")
+	}
+	if _, ok := commonresponses.ParseStreamUsageEvent([]byte(`{"type":"response.updated"}`)); ok {
+		t.Fatal("expected unsupported response.updated event to be ignored by shared usage parser")
 	}
 
 	response := &types.OpenAIResponsesResponses{
@@ -110,81 +136,118 @@ func TestCodexResponsesUsageAndBillingHelpers(t *testing.T) {
 	}
 }
 
-func TestCodexResponsesIncludePromptCacheAndSystemMessageHelpers(t *testing.T) {
-	request := &types.OpenAIResponsesRequest{}
-	ensureCodexIncludes(request)
-	if includes, ok := request.Include.([]string); !ok || len(includes) != 1 || includes[0] != codexReasoningEncryptedContentInclude {
-		t.Fatalf("expected nil include to default to encrypted content include, got %#v", request.Include)
+func TestCodexWireErrorSeparatesValidationFromInternalErrors(t *testing.T) {
+	apiErr := codexWireError(&wire.Violation{Param: "session-id", Message: "secret detail"})
+	if apiErr == nil || apiErr.StatusCode != http.StatusBadRequest || apiErr.Param != "session-id" || strings.Contains(apiErr.Message, "secret detail") {
+		t.Fatalf("expected sanitized 400 validation error, got %+v", apiErr)
 	}
 
-	request.Include = func() {}
-	ensureCodexIncludes(request)
-	if includes, ok := request.Include.([]string); !ok || len(includes) != 1 || includes[0] != codexReasoningEncryptedContentInclude {
-		t.Fatalf("expected marshal failure include fallback, got %#v", request.Include)
+	apiErr = codexWireError(errors.New("planner bug"))
+	if apiErr == nil || apiErr.StatusCode != http.StatusInternalServerError || apiErr.Code != "internal_server_error" {
+		t.Fatalf("expected internal wire error to map to 500, got %+v", apiErr)
 	}
+}
 
-	request.Include = map[string]any{"bad": "shape"}
-	ensureCodexIncludes(request)
-	if includes, ok := request.Include.([]string); !ok || len(includes) != 1 || includes[0] != codexReasoningEncryptedContentInclude {
-		t.Fatalf("expected object include fallback, got %#v", request.Include)
-	}
-
-	request.Include = "output_text.annotations"
-	ensureCodexIncludes(request)
-	if includes, ok := request.Include.([]string); !ok || len(includes) != 2 || includes[0] != "output_text.annotations" || includes[1] != codexReasoningEncryptedContentInclude {
-		t.Fatalf("expected string include normalization, got %#v", request.Include)
-	}
-
-	if got := appendUniqueStrings([]string{"", " one ", codexReasoningEncryptedContentInclude}, "two"); len(got) != 3 || got[0] != "one" || got[1] != codexReasoningEncryptedContentInclude || got[2] != "two" {
-		t.Fatalf("expected appendUniqueStrings to trim blanks and append unique suffix, got %#v", got)
-	}
-
-	normalizeCodexBuiltinTools(nil)
-	request = &types.OpenAIResponsesRequest{
-		Tools: []types.ResponsesTools{{Type: types.APIToolTypeWebSearchPreview}},
-		ToolChoice: []any{
-			map[string]any{"type": "web_search_preview_2025_03_11"},
-			"unchanged",
-		},
-	}
-	normalizeCodexBuiltinTools(request)
-	if request.Tools[0].Type != types.APIToolTypeWebSearch {
-		t.Fatalf("expected builtin tool alias normalization, got %q", request.Tools[0].Type)
-	}
-	toolChoices, ok := request.ToolChoice.([]any)
-	if !ok {
-		t.Fatalf("expected normalized tool choice slice, got %T", request.ToolChoice)
-	}
-	firstChoice, _ := toolChoices[0].(map[string]any)
-	if firstChoice["type"] != types.APIToolTypeWebSearch || toolChoices[1] != "unchanged" {
-		t.Fatalf("expected normalized tool choice entries, got %#v", toolChoices)
-	}
-
-	type toolChoiceShape struct {
-		Type string `json:"type"`
-	}
-	if normalized, ok := normalizeCodexToolChoiceValue(toolChoiceShape{Type: "web_search_preview_2025_03_11"}); !ok {
-		t.Fatal("expected struct tool_choice to normalize via json round-trip")
-	} else {
-		normalizedMap, _ := normalized.(map[string]any)
-		if normalizedMap["type"] != types.APIToolTypeWebSearch {
-			t.Fatalf("expected struct tool choice normalization, got %#v", normalized)
+func TestPrepareResponsesOfficialHTTPRequestErrorBranches(t *testing.T) {
+	newRawReq := func(t *testing.T, body string, headers map[string]string) *commonresponses.Request {
+		t.Helper()
+		envelope, err := commonresponses.ParseRawEnvelope([]byte(body))
+		if err != nil {
+			t.Fatalf("parse raw envelope: %v", err)
+		}
+		httpHeaders := http.Header{}
+		for key, value := range headers {
+			httpHeaders.Set(key, value)
+		}
+		return &commonresponses.Request{
+			Operation: commonresponses.ResponsesCreate,
+			Headers:   requestctx.NewHeaderSnapshot(httpHeaders),
+			Body:      envelope,
+			ChannelID: 424299,
+			Model:     "gpt-5",
 		}
 	}
-	invalidToolChoice := make(chan int)
-	if _, ok := normalizeCodexToolChoiceValue(invalidToolChoice); ok {
-		t.Fatal("expected unsupported tool_choice value to fail normalization")
-	}
-	if got := normalizeCodexToolChoiceMap(nil); got != nil {
-		t.Fatalf("expected nil tool choice map to remain nil, got %#v", got)
-	}
-	if got := normalizeCodexBuiltinToolType(""); got != "" {
-		t.Fatalf("expected blank builtin tool type to remain blank, got %q", got)
-	}
-	if got := normalizeCodexBuiltinToolType("file_search"); got != "file_search" {
-		t.Fatalf("expected non-web-search builtin tool type to remain unchanged, got %q", got)
-	}
 
+	body := []byte(`{"model":"gpt-5","input":"hello","stream":true}`)
+
+	t.Run("metadata validation error", func(t *testing.T) {
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", nil)
+		req := newRawReq(t, `{"model":"gpt-5","client_metadata":null}`, nil)
+		_, errWithCode := provider.prepareResponsesOfficialHTTPRequest(context.Background(), req, wire.OpResponsesCreate, "", "gpt-5", body)
+		if errWithCode == nil || errWithCode.StatusCode != http.StatusBadRequest || errWithCode.Param != "client_metadata" {
+			t.Fatalf("expected sanitized metadata validation error, got %+v", errWithCode)
+		}
+	})
+
+	t.Run("channel policy error", func(t *testing.T) {
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", nil)
+		staleModelHeaders := `{"User-Agent":"custom"}`
+		provider.Channel.ModelHeaders = &staleModelHeaders
+		req := newRawReq(t, `{"model":"gpt-5","input":"hello"}`, nil)
+		_, errWithCode := provider.prepareResponsesOfficialHTTPRequest(context.Background(), req, wire.OpResponsesCreate, "", "gpt-5", body)
+		if errWithCode == nil || errWithCode.StatusCode != http.StatusServiceUnavailable || errWithCode.Code != "channel_config_error" {
+			t.Fatalf("expected channel config error, got %+v", errWithCode)
+		}
+	})
+
+	t.Run("token error", func(t *testing.T) {
+		provider := newTestCodexProviderWithContext(t, `{}`, "", nil)
+		req := newRawReq(t, `{"model":"gpt-5","input":"hello"}`, nil)
+		_, errWithCode := provider.prepareResponsesOfficialHTTPRequest(context.Background(), req, wire.OpResponsesCreate, "", "gpt-5", body)
+		if errWithCode == nil || errWithCode.StatusCode != http.StatusUnauthorized || errWithCode.Code != "codex_token_error" {
+			t.Fatalf("expected token error, got %+v", errWithCode)
+		}
+	})
+
+	t.Run("identity validation error", func(t *testing.T) {
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", nil)
+		req := newRawReq(t, `{"model":"gpt-5","input":"hello"}`, map[string]string{"x-oai-attestation": "abc.def"})
+		_, errWithCode := provider.prepareResponsesOfficialHTTPRequest(context.Background(), req, wire.OpResponsesCreate, "", "gpt-5", body)
+		if errWithCode == nil || errWithCode.StatusCode != http.StatusBadRequest || errWithCode.Param != "x-oai-attestation" || strings.Contains(errWithCode.Message, "trusted") {
+			t.Fatalf("expected sanitized identity validation error, got %+v", errWithCode)
+		}
+	})
+
+	t.Run("header plan error", func(t *testing.T) {
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", nil)
+		req := newRawReq(t, `{"model":"gpt-5","input":"hello"}`, nil)
+		_, errWithCode := provider.prepareResponsesOfficialHTTPRequest(context.Background(), req, wire.Operation("bad-operation"), "", "gpt-5", body)
+		if errWithCode == nil || errWithCode.StatusCode != http.StatusBadRequest || errWithCode.Param != "operation" {
+			t.Fatalf("expected header plan operation error, got %+v", errWithCode)
+		}
+	})
+
+	t.Run("requester missing", func(t *testing.T) {
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", nil)
+		provider.Requester = nil
+		req := newRawReq(t, `{"model":"gpt-5","input":"hello"}`, nil)
+		_, errWithCode := provider.prepareResponsesOfficialHTTPRequest(context.Background(), req, wire.OpResponsesCreate, "", "gpt-5", body)
+		if errWithCode == nil || errWithCode.StatusCode != http.StatusServiceUnavailable || errWithCode.Code != "channel_error" {
+			t.Fatalf("expected requester missing error, got %+v", errWithCode)
+		}
+	})
+
+	t.Run("new request error", func(t *testing.T) {
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", nil)
+		badBaseURL := "http://[::1"
+		provider.Channel.BaseURL = &badBaseURL
+		req := newRawReq(t, `{"model":"gpt-5","input":"hello"}`, nil)
+		_, errWithCode := provider.prepareResponsesOfficialHTTPRequest(context.Background(), req, wire.OpResponsesCreate, "", "gpt-5", body)
+		if errWithCode == nil || errWithCode.StatusCode != http.StatusInternalServerError || errWithCode.Code != "new_request_failed" {
+			t.Fatalf("expected new request error, got %+v", errWithCode)
+		}
+	})
+}
+
+func TestCodexStaleResponsesWSContinuationErrorIncludesEventID(t *testing.T) {
+	err := codexStaleResponsesWSContinuationError("evt_stale")
+	payload := responsesws.ClientPayloadFromError(err)
+	if !strings.Contains(string(payload), `"event_id":"evt_stale"`) {
+		t.Fatalf("expected stale continuation payload to include event_id, got %s", payload)
+	}
+}
+
+func TestCodexResponsesPromptCacheHelpers(t *testing.T) {
 	response := &types.OpenAIResponsesResponses{}
 	backfillCodexResponsePromptCacheKey(response, &types.OpenAIResponsesRequest{PromptCacheKey: "stable"})
 	if response.PromptCacheKey != "stable" {
@@ -320,6 +383,36 @@ func TestCodexResponsesRoutingHintResolver(t *testing.T) {
 	}
 }
 
+func TestCodexResponsesPolicyUsesRouteHint(t *testing.T) {
+	envelope, err := commonresponses.ParseRawEnvelope([]byte(`{"model":"gpt-5","input":"hi"}`))
+	if err != nil {
+		t.Fatalf("parse raw envelope: %v", err)
+	}
+
+	req := &commonresponses.Request{
+		Body: envelope,
+		Control: commonresponses.Control{
+			DownstreamDialect: commonresponses.DownstreamResponses,
+		},
+		Policy: commonresponses.PolicyInput{
+			PromptCache: &commonresponses.PromptCacheDecision{
+				Key:    "pc-route-hint",
+				Source: commonresponses.PromptCacheRouteHint,
+			},
+		},
+	}
+	policy := responsesPolicyInput(req)
+	if policy.PromptCache == nil || policy.PromptCache.Key != "pc-route-hint" || policy.PromptCache.Source != commonresponses.PromptCacheRouteHint {
+		t.Fatalf("expected route hint prompt-cache policy, got %+v", policy.PromptCache)
+	}
+
+	req.Policy = commonresponses.PolicyInput{}
+	policy = responsesPolicyInput(req)
+	if policy.PromptCache != nil || req.Policy.PromptCache != nil {
+		t.Fatalf("expected provider policy reader not to synthesize or write back prompt cache, got policy=%+v req=%+v", policy.PromptCache, req.Policy.PromptCache)
+	}
+}
+
 func TestCodexPromptCacheAutoPriorityFallsBackAcrossSignals(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -370,77 +463,7 @@ func TestCodexPromptCacheAutoPriorityFallsBackAcrossSignals(t *testing.T) {
 	}
 }
 
-func TestCodexResponsesSystemMessageAndStreamObserverHelpers(t *testing.T) {
-	if !isSystemInputMessage(types.InputResponses{Role: types.ChatMessageRoleDeveloper}) {
-		t.Fatal("expected developer role to be treated as system input")
-	}
-	if isSystemInputMessage(types.InputResponses{Type: types.InputTypeFileSearchCall, Role: types.ChatMessageRoleSystem}) {
-		t.Fatal("expected non-message input type not to be treated as system input")
-	}
-	if !isMergeableInputMessage(types.InputResponses{Role: types.ChatMessageRoleUser}) {
-		t.Fatal("expected user message to be mergeable")
-	}
-	if isMergeableInputMessage(types.InputResponses{Role: types.ChatMessageRoleAssistant}) {
-		t.Fatal("expected assistant message not to be mergeable")
-	}
-	if got := extractInputMessageText(types.InputResponses{Content: "direct"}); got != "direct" {
-		t.Fatalf("expected direct string content extraction, got %q", got)
-	}
-	if got := extractInputMessageText(types.InputResponses{
-		Content: []types.ContentResponses{
-			{Type: types.ContentTypeInputText, Text: "first"},
-			{Type: types.ContentTypeOutputText, Text: "second"},
-		},
-	}); got != "first\nsecond" {
-		t.Fatalf("expected list content extraction, got %q", got)
-	}
-	if got := extractInputMessageText(types.InputResponses{Content: func() {}}); got != "" {
-		t.Fatalf("expected unparsable content extraction fallback, got %q", got)
-	}
-
-	stringPrepended := prependSystemTextToInputMessage(types.InputResponses{Content: "hello"}, "system")
-	if content, _ := stringPrepended.Content.(string); content != "system\n\nhello" {
-		t.Fatalf("expected system text to prepend string content, got %#v", stringPrepended.Content)
-	}
-	listPrepended := prependSystemTextToInputMessage(types.InputResponses{
-		Content: []types.ContentResponses{
-			{Type: types.ContentTypeInputText, Text: "hello"},
-		},
-	}, "system")
-	parsedList, err := listPrepended.ParseContent()
-	if err != nil || parsedList[0].Text != "system\n\nhello" {
-		t.Fatalf("expected system text to prepend list content, parsed=%#v err=%v", parsedList, err)
-	}
-	fallbackPrepended := prependSystemTextToInputMessage(types.InputResponses{Content: func() {}}, "system")
-	if content, _ := fallbackPrepended.Content.(string); content != "system" {
-		t.Fatalf("expected unparsable content prepend fallback, got %#v", fallbackPrepended.Content)
-	}
-
-	request := &types.OpenAIResponsesRequest{
-		Input: []types.InputResponses{
-			{Role: types.ChatMessageRoleSystem, Content: "system one"},
-			{Role: types.ChatMessageRoleDeveloper, Content: []types.ContentResponses{{Type: types.ContentTypeInputText, Text: "system two"}}},
-			{Role: types.ChatMessageRoleUser, Content: []types.ContentResponses{{Type: types.ContentTypeInputText, Text: "hello"}}},
-			{Role: types.ChatMessageRoleSystem, Content: "orphan"},
-		},
-	}
-	mergeSystemInputMessagesForCodex(request)
-	inputs, err := request.ParseInput()
-	if err != nil {
-		t.Fatalf("expected merged request input to parse, got %v", err)
-	}
-	if len(inputs) != 2 {
-		t.Fatalf("expected merged input list, got %#v", inputs)
-	}
-	firstContents, err := inputs[0].ParseContent()
-	if err != nil || firstContents[0].Text != "system one\n\nsystem two\n\nhello" {
-		t.Fatalf("expected leading system text to merge into first user message, contents=%#v err=%v", firstContents, err)
-	}
-	secondContents, err := inputs[1].ParseContent()
-	if err != nil || len(secondContents) != 1 || secondContents[0].Text != "orphan" {
-		t.Fatalf("expected trailing system content to become synthetic user message, contents=%#v err=%v", secondContents, err)
-	}
-
+func TestCodexResponsesStreamObserverHelpers(t *testing.T) {
 	var nilHandler *CodexResponsesStreamHandler
 	nilHandler.observeUsageEvent(`{"type":"response.output_text.delta","delta":"hello"}`)
 
@@ -448,10 +471,11 @@ func TestCodexResponsesSystemMessageAndStreamObserverHelpers(t *testing.T) {
 	handler := newCodexResponsesStreamHandler(usage)
 	handler.observeUsageEvent("{bad-json")
 	handler.observeUsageEvent(`{"type":"response.output_text.delta","delta":"hello"}`)
+	handler.observeUsageEvent(`{"type":"response.reasoning_summary_text.delta","delta":" summary"}`)
 	handler.observeUsageEvent(`{"type":"response.output_item.added","item":{"type":"web_search_call","id":"ws_1"},"response":{"tools":[{"type":"web_search_preview","search_context_size":"high"}]}}`)
 	handler.observeUsageEvent(`{"type":"response.done","response":{"status":"completed","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8},"tools":[{"type":"web_search_preview","search_context_size":"high"}],"output":[{"type":"web_search_call","id":"ws_1","status":"completed"}]}}`)
 
-	if usage.TextBuilder.String() != "hello" {
+	if usage.TextBuilder.String() != "hello summary" {
 		t.Fatalf("expected stream observer to accumulate text deltas, got %q", usage.TextBuilder.String())
 	}
 	if usage.TotalTokens != 8 || usage.PromptTokens != 3 || usage.CompletionTokens != 5 {
@@ -461,8 +485,4 @@ func TestCodexResponsesSystemMessageAndStreamObserverHelpers(t *testing.T) {
 		t.Fatalf("expected stream observer to preserve tool billing, got %+v", usage.ExtraBilling)
 	}
 
-	rawResponse, err := json.Marshal(request)
-	if err != nil || len(rawResponse) == 0 {
-		t.Fatalf("expected merged request to remain json serializable, err=%v", err)
-	}
 }

@@ -119,7 +119,7 @@ func responsesWSPanicClass(recovered any) string {
 
 func responsesWSStackHash(stack []byte) string {
 	sum := sha256.Sum256(stack)
-	return hex.EncodeToString(sum[:8])
+	return hex.EncodeToString(sum[:16])
 }
 
 type ResponsesWSIOBridge struct {
@@ -2213,7 +2213,7 @@ func (a *ResponsesWSSessionActor) startFirstTurnOpenWorker(openingID string, fra
 
 		var apiErr *types.OpenAIErrorWithStatusCode
 		actorContext := actorSnapshot.Context()
-		openResult, apiErr = openAndPrimeResponsesWSSessionForActor(setupCtx, actorContext, &frame.Projection)
+		openResult, apiErr = openAndPrimeResponsesWSSessionForActor(setupCtx, actorContext, frame, &frame.Projection)
 		if setupCtx.Err() != nil {
 			cleanupResponsesWSOpenResult(openResult, "first_turn_open_cancelled")
 			return

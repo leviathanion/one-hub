@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"strings"
 
+	"one-api/common/codexpolicy"
 	"one-api/common/config"
 	runtimesession "one-api/runtime/session"
 )
@@ -62,6 +63,9 @@ func (channel *Channel) ValidateRuntimeConfigJSONWithType(channelType int) error
 	}
 	if err := validateOptionalJSONStringMap("model_headers", modelHeaders); err != nil {
 		return err
+	}
+	if channelType == config.ChannelTypeCodex && !jsonObjectStringEmpty(modelHeaders) {
+		return fmt.Errorf("model_headers is not supported for Codex channels; use other.codex structured policy")
 	}
 	if err := validateOptionalJSONObject("custom_parameter", channel.GetCustomParameter()); err != nil {
 		return err
@@ -148,6 +152,11 @@ func validateOptionalJSONStringMap(fieldName, raw string) error {
 		return fmt.Errorf("%s must be a JSON object with string values: %w", fieldName, err)
 	}
 	return nil
+}
+
+func jsonObjectStringEmpty(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	return trimmed == "" || trimmed == "{}" || trimmed == "null"
 }
 
 func parseOptionalJSONObject(fieldName, raw string) (map[string]json.RawMessage, error) {
@@ -429,7 +438,7 @@ func validateCodexChannelOther(raw string) error {
 				return err
 			}
 		case "responses_ws_transport":
-			if err := validateCodexResponsesWSTransportField(fieldName, value); err != nil {
+			if err := validateCodexNativeResponsesWSTransportField(fieldName, value); err != nil {
 				return err
 			}
 		case "self_hosted", "responses_ws_self_hosted":
@@ -440,11 +449,54 @@ func validateCodexChannelOther(raw string) error {
 			if err := validateCodexPositiveIntField(fieldName, value); err != nil {
 				return err
 			}
+		case "codex":
+			if err := validateCodexOfficialPolicyField(fieldName, value); err != nil {
+				return err
+			}
 		default:
 			return fmt.Errorf("%s is not supported for Codex channels", fieldName)
 		}
 	}
 
+	return nil
+}
+
+func validateCodexOfficialPolicyField(fieldName string, raw json.RawMessage) error {
+	parsed := make(map[string]json.RawMessage)
+	if err := json.Unmarshal(raw, &parsed); err != nil || parsed == nil {
+		if err == nil {
+			err = fmt.Errorf("must be a JSON object")
+		}
+		return fmt.Errorf("%s must be a JSON object: %w", fieldName, err)
+	}
+	for key, value := range parsed {
+		nestedField := fieldName + "." + key
+		if !codexpolicy.KnownKey(key) {
+			return fmt.Errorf("%s is not supported for Codex channels", nestedField)
+		}
+		switch key {
+		case codexpolicy.KeyFedRAMP, codexpolicy.KeyTrustClientAttestation, codexpolicy.KeyGenerateProxyInstallationID:
+			if err := validateCodexBoolField(nestedField, value); err != nil {
+				return err
+			}
+		case codexpolicy.KeyResidency, codexpolicy.KeyDefaultOriginator:
+			var text string
+			if err := json.Unmarshal(value, &text); err != nil {
+				return fmt.Errorf("%s must be a string: %w", nestedField, err)
+			}
+			text = strings.TrimSpace(text)
+			switch key {
+			case codexpolicy.KeyResidency:
+				if text != "" && !codexpolicy.ValidResidency(text) {
+					return fmt.Errorf("%s is invalid", nestedField)
+				}
+			case codexpolicy.KeyDefaultOriginator:
+				if text != "" && normalizeCodexOriginatorValidation(text) == "" {
+					return fmt.Errorf("%s is invalid", nestedField)
+				}
+			}
+		}
+	}
 	return nil
 }
 
@@ -474,6 +526,17 @@ func validateCodexEnumField(fieldName string, raw json.RawMessage, normalize fun
 func validateCodexResponsesWSTransportField(fieldName string, raw json.RawMessage) error {
 	if _, err := runtimesession.ParseResponsesWSTransportField(raw); err != nil {
 		return fmt.Errorf("%s %w", fieldName, err)
+	}
+	return nil
+}
+
+func validateCodexNativeResponsesWSTransportField(fieldName string, raw json.RawMessage) error {
+	mode, err := runtimesession.ParseResponsesWSTransportField(raw)
+	if err != nil {
+		return fmt.Errorf("%s %w", fieldName, err)
+	}
+	if mode == runtimesession.TransportModeResponsesHTTPBridge {
+		return fmt.Errorf("%s must be native for Codex channels; HTTP bridge is not supported", fieldName)
 	}
 	return nil
 }
@@ -535,4 +598,19 @@ func normalizeCodexWebsocketModeValidation(value string) string {
 	default:
 		return ""
 	}
+}
+
+func normalizeCodexOriginatorValidation(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) == 0 || len(value) > 64 {
+		return ""
+	}
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-' {
+			continue
+		}
+		return ""
+	}
+	return value
 }

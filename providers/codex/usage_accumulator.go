@@ -76,7 +76,7 @@ func (a *codexTurnUsageAccumulator) ObserveEvent(event *types.OpenAIResponsesStr
 	}
 
 	switch strings.TrimSpace(event.Type) {
-	case "response.output_text.delta":
+	case "response.output_text.delta", "response.reasoning_summary_text.delta":
 		delta, ok := event.Delta.(string)
 		if ok {
 			a.textBuilder.WriteString(delta)

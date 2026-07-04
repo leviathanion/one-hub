@@ -8,11 +8,16 @@ import (
 	"net/http"
 	"one-api/common"
 	"one-api/common/config"
+	"one-api/common/logger"
+	"one-api/common/requestctx"
 	"one-api/common/requester"
+	commonresponses "one-api/common/responses"
 	"one-api/common/utils"
+	"one-api/internal/requesthints"
 	providersBase "one-api/providers/base"
 	"one-api/safty"
 	"one-api/types"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -78,7 +83,7 @@ func (r *relayChat) getPromptTokens() (int, error) {
 	return common.CountTokenMessages(r.chatRequest.Messages, r.modelName, channel.PreCost), nil
 }
 
-var need2Response = map[string]bool{
+var chatModelsRequiringResponses = map[string]bool{
 	"o3-pro-2025-06-10":                true,
 	"o3-pro":                           true,
 	"o1-pro-2025-03-19":                true,
@@ -90,8 +95,10 @@ var need2Response = map[string]bool{
 	"codex-mini-latest":                true,
 }
 
-func (r *relayChat) send() (err *types.OpenAIErrorWithStatusCode, done bool) {
-	if need2Response[r.modelName] {
+func (r *relayChat) send() (*types.OpenAIErrorWithStatusCode, bool) {
+	r.chatRequest.Model = r.modelName
+
+	if chatModelsRequiringResponses[r.modelName] {
 		resProvider, ok := r.provider.(providersBase.ResponsesInterface)
 		if ok {
 			return r.compatibleSend(resProvider)
@@ -100,21 +107,16 @@ func (r *relayChat) send() (err *types.OpenAIErrorWithStatusCode, done bool) {
 
 	chatProvider, ok := r.provider.(providersBase.ChatInterface)
 	if !ok {
-		err = common.StringErrorWrapperLocal("channel not implemented", "channel_error", http.StatusServiceUnavailable)
-		done = true
-		return
+		return common.StringErrorWrapperLocal("channel not implemented", "channel_error", http.StatusServiceUnavailable), true
 	}
 
-	r.chatRequest.Model = r.modelName
 	// 内容审查
 	if config.EnableSafe {
 		for _, message := range r.chatRequest.Messages {
 			if message.Content != nil {
 				CheckResult, _ := safty.CheckContent(message.Content)
 				if !CheckResult.IsSafe {
-					err = common.StringErrorWrapperLocal(CheckResult.Reason, CheckResult.Code, http.StatusBadRequest)
-					done = true
-					return
+					return common.StringErrorWrapperLocal(CheckResult.Reason, CheckResult.Code, http.StatusBadRequest), true
 				}
 			}
 		}
@@ -122,9 +124,9 @@ func (r *relayChat) send() (err *types.OpenAIErrorWithStatusCode, done bool) {
 
 	if r.chatRequest.Stream {
 		var response requester.StreamReaderInterface[string]
-		response, err = chatProvider.CreateChatCompletionStream(&r.chatRequest)
+		response, err := chatProvider.CreateChatCompletionStream(&r.chatRequest)
 		if err != nil {
-			return
+			return err, false
 		}
 
 		if r.heartbeat != nil {
@@ -136,27 +138,28 @@ func (r *relayChat) send() (err *types.OpenAIErrorWithStatusCode, done bool) {
 		}
 
 		var firstResponseTime time.Time
-		firstResponseTime, err = responseStreamClient(r.c, response, doneStr)
+		firstResponseTime, streamErr := responseStreamClient(r.c, response, doneStr)
 		r.SetFirstResponseTime(firstResponseTime)
+		if streamErr != nil {
+			return streamErr, true
+		}
 	} else {
 		var response *types.ChatCompletionResponse
-		response, err = chatProvider.CreateChatCompletion(&r.chatRequest)
+		response, err := chatProvider.CreateChatCompletion(&r.chatRequest)
 		if err != nil {
-			return
+			return err, false
 		}
 
 		if r.heartbeat != nil {
 			r.heartbeat.Stop()
 		}
 
-		err = responseJsonClient(r.c, response)
+		if err := responseJsonClient(r.c, response); err != nil {
+			return err, true
+		}
 	}
 
-	if err != nil {
-		done = true
-	}
-
-	return
+	return nil, false
 }
 
 func (r *relayChat) getUsageResponse() string {
@@ -181,15 +184,18 @@ func (r *relayChat) getUsageResponse() string {
 	return ""
 }
 
-func (r *relayChat) compatibleSend(resProvider providersBase.ResponsesInterface) (err *types.OpenAIErrorWithStatusCode, done bool) {
+func (r *relayChat) compatibleSend(resProvider providersBase.ResponsesInterface) (*types.OpenAIErrorWithStatusCode, bool) {
 	resRequest := r.chatRequest.ToResponsesRequest()
 	resRequest.ConvertChat = true
+	rawReq, buildErr := r.responsesFallbackRequest(resRequest)
+	if buildErr != nil {
+		return buildErr, true
+	}
 
 	if r.chatRequest.Stream {
-		var response requester.StreamReaderInterface[string]
-		response, err = resProvider.CreateResponsesStream(resRequest)
+		response, err := resProvider.CreateResponsesStream(r.c.Request.Context(), rawReq)
 		if err != nil {
-			return
+			return err, false
 		}
 
 		if r.heartbeat != nil {
@@ -200,25 +206,96 @@ func (r *relayChat) compatibleSend(resProvider providersBase.ResponsesInterface)
 			return r.getUsageResponse()
 		}
 
-		var firstResponseTime time.Time
-		firstResponseTime, err = responseStreamClient(r.c, response, doneStr)
+		firstResponseTime, streamErr := responseStreamClient(r.c, response, doneStr)
 		r.SetFirstResponseTime(firstResponseTime)
+		if streamErr != nil {
+			return streamErr, true
+		}
 	} else {
-		var response *types.OpenAIResponsesResponses
-		response, err = resProvider.CreateResponses(resRequest)
+		response, err := resProvider.CreateResponses(r.c.Request.Context(), rawReq)
 		if err != nil {
-			return
+			return err, false
 		}
 
 		if r.heartbeat != nil {
 			r.heartbeat.Stop()
 		}
-		err = responseJsonClient(r.c, response.ToChat())
+		if err := responseJsonClient(r.c, response.ToChat()); err != nil {
+			return err, true
+		}
 	}
 
+	return nil, false
+}
+
+func (r *relayChat) responsesFallbackRequest(request *types.OpenAIResponsesRequest) (*commonresponses.Request, *types.OpenAIErrorWithStatusCode) {
+	// This fallback authors the synthesized Responses body, so dialect
+	// conflicts are resolved at the conversion boundary. The Codex planner
+	// rejects temperature+top_p; a chat client never wrote this body, so keep
+	// temperature and drop top_p instead of surfacing a 400.
+	if request.Temperature != nil && request.TopP != nil && r.provider != nil {
+		if channel := r.provider.GetChannel(); channel != nil && channel.Type == config.ChannelTypeCodex {
+			request.TopP = nil
+			logger.LogDebug(r.c.Request.Context(), `[Codex] chat fallback decision {"dialect":"codex_official","field":"top_p","action":"drop","source":"chat_adapter","reason":"temperature-and-top_p-both-present"}`)
+		}
+	}
+	raw, err := json.Marshal(request)
 	if err != nil {
-		done = true
+		return nil, common.ErrorWrapperLocal(err, "marshal_request_failed", http.StatusInternalServerError)
 	}
+	envelope, err := commonresponses.ParseRawEnvelope(raw)
+	if err != nil {
+		return nil, common.ErrorWrapperLocal(err, "invalid_request_error", http.StatusBadRequest)
+	}
+	downstreamDialect := commonresponses.DownstreamResponses
+	if request.ConvertChat {
+		downstreamDialect = commonresponses.DownstreamChatCompletions
+	}
+	headers := requestctx.HeaderSnapshot{}
+	principal := requestctx.Principal{}
+	channelID := 0
+	if r != nil {
+		if r.c != nil {
+			if r.c.Request != nil {
+				headers = requestctx.NewHeaderSnapshot(r.c.Request.Header)
+			}
+			principal = requestctx.PrincipalFromGin(r.c)
+		}
+		if r.provider != nil && r.provider.GetChannel() != nil {
+			channelID = r.provider.GetChannel().Id
+		}
+	}
+	return &commonresponses.Request{
+		Operation: commonresponses.ResponsesCreate,
+		Headers:   headers,
+		Body:      envelope,
+		Control: commonresponses.Control{
+			DownstreamDialect: downstreamDialect,
+			Stream:            request.Stream,
+		},
+		Policy:    chatResponsesPolicyInput(request, r.c),
+		Principal: principal,
+		ChannelID: channelID,
+		Model:     request.Model,
+	}, nil
+}
 
-	return
+func chatResponsesPolicyInput(request *types.OpenAIResponsesRequest, c *gin.Context) commonresponses.PolicyInput {
+	policy := commonresponses.PolicyInput{}
+	if request != nil {
+		if key := strings.TrimSpace(request.PromptCacheKey); key != "" {
+			policy.PromptCache = &commonresponses.PromptCacheDecision{
+				Key:    key,
+				Source: commonresponses.PromptCacheClientBody,
+			}
+			return policy
+		}
+	}
+	if key := requesthints.Get(c, requesthints.ResponsesPromptCacheKey); key != "" {
+		policy.PromptCache = &commonresponses.PromptCacheDecision{
+			Key:    key,
+			Source: commonresponses.PromptCacheRouteHint,
+		}
+	}
+	return policy
 }

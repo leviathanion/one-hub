@@ -28,6 +28,7 @@ type codexRealtimeConnPlan struct {
 	wsURL           string
 	headers         map[string]string
 	allowSelfHosted bool
+	proxyAddr       string
 }
 
 func (p *CodexProvider) createChatRealtimeConn(modelName, sessionID string) (*wsconn.ManagedConn, *types.OpenAIErrorWithStatusCode) {
@@ -55,7 +56,7 @@ func (p *CodexProvider) prepareChatRealtimeConnWithSelfHosted(modelName, session
 	}
 
 	httpURL := p.GetFullRequestURL(urlPath, modelName)
-	proxyAddr := channelProxyValue(p.Channel)
+	proxyAddr := channelProxyValue(p.codexChannel())
 	wsURL, err := buildCodexRealtimeURLWithPolicy(httpURL, allowSelfHosted, proxyAddr == "")
 	if err != nil {
 		return nil, common.StringErrorWrapperLocal(err.Error(), "ws_request_failed", requester.UpstreamRealtimeURLStatusCode(err))
@@ -70,6 +71,7 @@ func (p *CodexProvider) prepareChatRealtimeConnWithSelfHosted(modelName, session
 		wsURL:           wsURL,
 		headers:         headers,
 		allowSelfHosted: allowSelfHosted,
+		proxyAddr:       proxyAddr,
 	}, nil
 }
 
@@ -86,7 +88,7 @@ func (p *CodexProvider) dialChatRealtimeConnWithContext(ctx context.Context, pla
 
 	dialCtx, cancel := codexRealtimeDialContext(ctx)
 	defer cancel()
-	wsConn, err := wsconn.DialManaged(dialCtx, plan.wsURL, codexRealtimeHTTPHeader(plan.headers), codexRealtimeWSConfig(), codexRealtimeDialOptions(channelProxyValue(p.Channel), plan.allowSelfHosted)...)
+	wsConn, err := wsconn.DialManaged(dialCtx, plan.wsURL, codexRealtimeHTTPHeader(plan.headers), codexRealtimeWSConfig(), codexRealtimeDialOptions(plan.proxyAddr, plan.allowSelfHosted)...)
 	if err != nil {
 		return nil, mapCodexRealtimeWSDialError(err)
 	}
@@ -262,10 +264,11 @@ func (p *CodexProvider) codexRealtimeSelfHosted() bool {
 	if p.Context != nil && p.Context.GetBool("self_hosted") {
 		return true
 	}
-	if p.Channel == nil {
+	channel := p.codexChannel()
+	if channel == nil {
 		return false
 	}
-	other, err := p.Channel.GetOtherMap()
+	other, err := channel.GetOtherMap()
 	if err != nil {
 		return false
 	}
@@ -279,10 +282,11 @@ func (p *CodexProvider) codexResponsesWSSelfHosted() bool {
 	if p.Context != nil && p.Context.GetBool("responses_ws_self_hosted") {
 		return true
 	}
-	if p.Channel == nil {
+	channel := p.codexChannel()
+	if channel == nil {
 		return false
 	}
-	other, err := p.Channel.GetOtherMap()
+	other, err := channel.GetOtherMap()
 	if err != nil {
 		return false
 	}

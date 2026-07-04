@@ -24,7 +24,7 @@ func TestChannelRuntimeConfigValidationBranches(t *testing.T) {
 	channel := &Channel{
 		Type:            config.ChannelTypeCodex,
 		ModelMapping:    testStringPtr(`{"gpt-5":"gpt-5-codex"}`),
-		ModelHeaders:    testStringPtr(`{"X-Test":"1"}`),
+		ModelHeaders:    testStringPtr(`{}`),
 		CustomParameter: testStringPtr(`{"temperature":0.2}`),
 		Other:           `{"websocket_mode":"auto"}`,
 	}
@@ -43,9 +43,19 @@ func TestChannelRuntimeConfigValidationBranches(t *testing.T) {
 		t.Fatalf("expected invalid model_headers json to fail validation, got %v", err)
 	}
 
+	channel.ModelHeaders = testStringPtr(`{"X-Test":"1"}`)
+	if err := channel.ValidateRuntimeConfigJSONWithType(config.ChannelTypeCodex); err == nil || !strings.Contains(err.Error(), "model_headers") {
+		t.Fatalf("expected Codex model_headers to fail validation, got %v", err)
+	}
+
 	channel.ModelHeaders = testStringPtr(`{"User-Agent":123}`)
 	if err := channel.ValidateRuntimeConfigJSONWithType(config.ChannelTypeCodex); err == nil || !strings.Contains(err.Error(), "model_headers") {
 		t.Fatalf("expected non-string model_headers value to fail validation, got %v", err)
+	}
+
+	channel.ModelHeaders = testStringPtr(`null`)
+	if err := channel.ValidateRuntimeConfigJSONWithType(config.ChannelTypeCodex); err != nil {
+		t.Fatalf("expected Codex null model_headers to validate as empty, got %v", err)
 	}
 
 	channel.ModelHeaders = nil
@@ -93,15 +103,74 @@ func TestValidateCodexChannelOtherAcceptsDocumentedFields(t *testing.T) {
 		Other: `{
 			"prompt_cache_key_strategy":" AUTO ",
 			"websocket_mode":" force ",
-			"responses_ws_transport":" http_bridge ",
+			"responses_ws_transport":" native ",
 			"self_hosted":true,
 			"responses_ws_self_hosted":false,
 			"execution_session_ttl_seconds":600,
-			"websocket_retry_cooldown_seconds":120
+			"websocket_retry_cooldown_seconds":120,
+			"codex":{
+				"fedramp":true,
+				"residency":"us",
+				"default_originator":"codex_cli_rs",
+				"trust_client_attestation":false,
+				"generate_proxy_installation_id":true
+			}
 		}`,
 	}
 	if err := channel.ValidateRuntimeConfigJSON(); err != nil {
 		t.Fatalf("expected documented Codex other fields to validate, got %v", err)
+	}
+}
+
+func TestValidateCodexChannelOtherRejectsResponsesWSHTTPBridge(t *testing.T) {
+	channel := &Channel{
+		Type:  config.ChannelTypeCodex,
+		Other: `{"responses_ws_transport":"http_bridge"}`,
+	}
+	if err := channel.ValidateRuntimeConfigJSON(); err == nil || !strings.Contains(err.Error(), "responses_ws_transport") || !strings.Contains(err.Error(), "HTTP bridge is not supported") {
+		t.Fatalf("expected Codex http_bridge transport to fail validation, got %v", err)
+	}
+}
+
+func TestValidateCodexChannelOtherRejectsUnknownOfficialPolicyKeys(t *testing.T) {
+	cases := []struct {
+		name     string
+		other    string
+		contains string
+	}{
+		{
+			name:     "unknown codex policy key",
+			other:    `{"codex":{"fedramp":false,"legacy_profile":"pi"}}`,
+			contains: "other.codex.legacy_profile",
+		},
+		{
+			name:     "codex policy not object",
+			other:    `{"codex":"legacy"}`,
+			contains: "other.codex",
+		},
+		{
+			name:     "codex policy bool string",
+			other:    `{"codex":{"trust_client_attestation":"false"}}`,
+			contains: "other.codex.trust_client_attestation",
+		},
+		{
+			name:     "codex policy invalid residency",
+			other:    `{"codex":{"residency":"bad value"}}`,
+			contains: "other.codex.residency",
+		},
+		{
+			name:     "codex policy invalid default originator",
+			other:    `{"codex":{"default_originator":"bad value"}}`,
+			contains: "other.codex.default_originator",
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			channel := &Channel{Type: config.ChannelTypeCodex, Other: tt.other}
+			if err := channel.ValidateRuntimeConfigJSON(); err == nil || !strings.Contains(err.Error(), tt.contains) {
+				t.Fatalf("expected %s validation error, got %v", tt.contains, err)
+			}
+		})
 	}
 }
 

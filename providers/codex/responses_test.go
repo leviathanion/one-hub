@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,36 +13,110 @@ import (
 	"testing"
 	"time"
 
+	"one-api/common"
 	"one-api/common/config"
+	"one-api/common/requestctx"
 	"one-api/common/requester"
+	commonresponses "one-api/common/responses"
 	"one-api/common/responsesws"
 	"one-api/types"
 )
 
-func TestCodexResponsesHTTPBridgeURLPreflightUsesOpenContext(t *testing.T) {
-	originalResolver := net.DefaultResolver
-	net.DefaultResolver = &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			<-ctx.Done()
-			return nil, ctx.Err()
+func (p *CodexProvider) CreateResponsesForTest(request *types.OpenAIResponsesRequest) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
+	rawReq, errWithCode := p.rawResponsesRequestForTest(request)
+	if errWithCode != nil {
+		return nil, errWithCode
+	}
+	return p.CreateResponses(context.Background(), rawReq)
+}
+
+func (p *CodexProvider) CreateResponsesStreamForTest(request *types.OpenAIResponsesRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+	rawReq, errWithCode := p.rawResponsesRequestForTest(request)
+	if errWithCode != nil {
+		return nil, errWithCode
+	}
+	return p.CreateResponsesStream(context.Background(), rawReq)
+}
+
+func (p *CodexProvider) CompactResponsesForTest(request *types.OpenAIResponsesRequest) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
+	rawReq, errWithCode := p.rawResponsesRequestForTest(request)
+	if errWithCode != nil {
+		return nil, errWithCode
+	}
+	rawReq.Operation = "responses.compact.http"
+	return p.CompactResponses(context.Background(), rawReq)
+}
+
+func (p *CodexProvider) rawResponsesRequestForTest(request *types.OpenAIResponsesRequest) (*commonresponses.Request, *types.OpenAIErrorWithStatusCode) {
+	if request == nil {
+		return nil, common.StringErrorWrapperLocal("request is required", "invalid_request_error", http.StatusBadRequest)
+	}
+	raw, err := json.Marshal(request)
+	if err != nil {
+		return nil, common.ErrorWrapperLocal(err, "marshal_request_failed", http.StatusInternalServerError)
+	}
+	envelope, err := commonresponses.ParseRawEnvelope(raw)
+	if err != nil {
+		return nil, common.ErrorWrapperLocal(err, "invalid_request_error", http.StatusBadRequest)
+	}
+	downstreamDialect := commonresponses.DownstreamResponses
+	if request.ConvertChat {
+		downstreamDialect = commonresponses.DownstreamChatCompletions
+	}
+	headers := requestctx.HeaderSnapshot{}
+	principal := requestctx.Principal{}
+	channelID := 0
+	if p != nil {
+		if p.Context != nil && p.Context.Request != nil {
+			headers = requestctx.NewHeaderSnapshot(p.Context.Request.Header)
+			principal = requestctx.PrincipalFromGin(p.Context)
+		}
+		if p.Channel != nil {
+			channelID = p.Channel.Id
+		}
+	}
+	return &commonresponses.Request{
+		Operation: commonresponses.ResponsesCreate,
+		Headers:   headers,
+		Body:      envelope,
+		Control: commonresponses.Control{
+			DownstreamDialect: downstreamDialect,
+			Stream:            request.Stream,
 		},
-	}
-	t.Cleanup(func() {
-		net.DefaultResolver = originalResolver
-	})
+		Principal: principal,
+		ChannelID: channelID,
+		Model:     request.Model,
+	}, nil
+}
 
+func TestChatResponsesRequestUsesControlPlaneForChatDialect(t *testing.T) {
 	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", nil)
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-
-	start := time.Now()
-	err := provider.validateResponsesWSHTTPBridgeURL(ctx, "https://slow-dns.test/backend-api/codex/responses")
-	if err == nil {
-		t.Fatal("expected canceled bridge URL preflight to fail")
+	rawReq, errWithCode := provider.chatResponsesRequestFromTyped(&types.OpenAIResponsesRequest{
+		Model:       "gpt-5",
+		Stream:      true,
+		ConvertChat: true,
+		Input: []types.InputResponses{
+			{
+				Type: types.InputTypeMessage,
+				Role: types.ChatMessageRoleUser,
+				Content: []types.ContentResponses{
+					{Type: types.ContentTypeInputText, Text: "hello"},
+				},
+			},
+		},
+	})
+	if errWithCode != nil {
+		t.Fatalf("chatResponsesRequestFromTyped returned error: %v", errWithCode.Message)
 	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("expected bridge URL preflight to honor open context, took %s", elapsed)
+	if rawReq.Control.DownstreamDialect != commonresponses.DownstreamChatCompletions || !rawReq.Control.Stream {
+		t.Fatalf("expected chat-completions stream control, got %+v", rawReq.Control)
+	}
+	if rawReq.Body.Projection.ConvertChat {
+		t.Fatal("expected raw JSON projection not to carry ConvertChat")
+	}
+	rawBody := string(rawReq.Body.Object.Raw)
+	if strings.Contains(rawBody, "ConvertChat") || strings.Contains(rawBody, "convert_chat") {
+		t.Fatalf("expected raw upstream body not to contain ConvertChat control, got %s", rawBody)
 	}
 }
 
@@ -89,6 +162,14 @@ func TestCodexResponsesWSAdapterTreatsMalformedTextProviderFrameAsMalformed(t *t
 	}
 }
 
+func TestCodexResponsesWSAdapterMissingProviderFailsClosed(t *testing.T) {
+	adapter := &codexResponsesWSAdapter{}
+	result := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame([]byte(`{"type":"response.created"}`)))
+	if result.Origin != responsesws.RecvDetailOriginProviderMalformed || result.Err == nil || !result.CloseTransport {
+		t.Fatalf("expected missing provider to fail closed, got %+v", result)
+	}
+}
+
 func TestCodexResponsesWSAdapterFutureProviderEventShapePassesThrough(t *testing.T) {
 	adapter := &codexResponsesWSAdapter{provider: &CodexProvider{}, model: "gpt-5"}
 	payload := []byte(`{"type":"response.future","event_id":"evt_future","response":"opaque","future":{"enabled":true}}`)
@@ -114,6 +195,69 @@ func TestCodexResponsesWSAdapterRejectsDuplicateKeyClientCancel(t *testing.T) {
 	_, err := adapter.PrepareClientFrame(context.Background(), responsesws.NewTextFrame([]byte(`{"type":"response.create","model":"gpt-5","type":"response.cancel"}`)))
 	if err == nil || !strings.Contains(err.Error(), "invalid_event") {
 		t.Fatalf("expected duplicate-key client event to become invalid_event, got %v", err)
+	}
+}
+
+func TestCodexResponsesWSAdapterAppliesOpenPreviousResponseIDDefault(t *testing.T) {
+	tests := []struct {
+		name                   string
+		defaultPrevious        string
+		payload                string
+		wantPrevious           string
+		wantPreviousResponseID bool
+	}{
+		{
+			name:                   "injects open default when client omits previous response",
+			defaultPrevious:        " resp_open_default ",
+			payload:                `{"type":"response.create","model":"gpt-5","input":"hi"}`,
+			wantPrevious:           "resp_open_default",
+			wantPreviousResponseID: true,
+		},
+		{
+			name:                   "preserves explicit client previous response",
+			defaultPrevious:        "resp_open_default",
+			payload:                `{"type":"response.create","model":"gpt-5","previous_response_id":"resp_client","input":"hi"}`,
+			wantPrevious:           "resp_client",
+			wantPreviousResponseID: true,
+		},
+		{
+			name:                   "does not inject blank open default",
+			defaultPrevious:        "   ",
+			payload:                `{"type":"response.create","model":"gpt-5","input":"hi"}`,
+			wantPreviousResponseID: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			adapter := &codexResponsesWSAdapter{
+				provider:                  &CodexProvider{},
+				model:                     "gpt-5",
+				defaultPreviousResponseID: strings.TrimSpace(tc.defaultPrevious),
+			}
+
+			frame, err := adapter.PrepareClientFrame(context.Background(), responsesws.NewTextFrame([]byte(tc.payload)))
+			if err != nil {
+				t.Fatalf("prepare response.create: %v", err)
+			}
+			var object map[string]json.RawMessage
+			if err := json.Unmarshal(frame.Payload(), &object); err != nil {
+				t.Fatalf("decode prepared frame: %v", err)
+			}
+			rawPrevious, exists := object["previous_response_id"]
+			if exists != tc.wantPreviousResponseID {
+				t.Fatalf("previous_response_id presence mismatch: got %v want %v payload=%s", exists, tc.wantPreviousResponseID, frame.Payload())
+			}
+			if !tc.wantPreviousResponseID {
+				return
+			}
+			var gotPrevious string
+			if err := json.Unmarshal(rawPrevious, &gotPrevious); err != nil {
+				t.Fatalf("decode previous_response_id: %v", err)
+			}
+			if gotPrevious != tc.wantPrevious {
+				t.Fatalf("previous_response_id mismatch: got %q want %q payload=%s", gotPrevious, tc.wantPrevious, frame.Payload())
+			}
+		})
 	}
 }
 
@@ -170,8 +314,97 @@ func TestCollectResponsesStreamResponseAcceptsDataWithoutSpace(t *testing.T) {
 		t.Fatalf("unexpected response: %#v", resp)
 	}
 
-	if provider.Usage.TotalTokens != 8 {
-		t.Fatalf("expected usage total tokens to be updated, got %d", provider.Usage.TotalTokens)
+	if provider.Usage.TotalTokens != 0 {
+		t.Fatalf("expected stream collector not to finalize provider usage directly, got %d", provider.Usage.TotalTokens)
+	}
+}
+
+func TestCollectResponsesStreamResponseClosedErrChannelFinishes(t *testing.T) {
+	provider := &CodexProvider{}
+	stream := &fakeStringStream{
+		dataChan: make(chan string, 1),
+		errChan:  make(chan error),
+	}
+	stream.dataChan <- "event: response.completed\ndata:{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_closed_err\",\"status\":\"completed\"}}\n"
+	close(stream.dataChan)
+	close(stream.errChan)
+
+	done := make(chan *types.OpenAIErrorWithStatusCode, 1)
+	go func() {
+		_, errWithCode := provider.collectResponsesStreamResponse(stream)
+		done <- errWithCode
+	}()
+
+	timeout := time.NewTimer(500 * time.Millisecond)
+	defer timeout.Stop()
+	select {
+	case errWithCode := <-done:
+		if errWithCode != nil {
+			t.Fatalf("collectResponsesStreamResponse returned error: %v", errWithCode.Message)
+		}
+	case <-timeout.C:
+		t.Fatal("collectResponsesStreamResponse did not finish after err channel closed")
+	}
+}
+
+func TestCodexResponsesStreamHandlerFlushesUnterminatedEvent(t *testing.T) {
+	handler := newCodexResponsesStreamHandler(&types.Usage{})
+	var emitted []string
+	send := func(data string) bool {
+		emitted = append(emitted, data)
+		return true
+	}
+
+	firstEvent := []byte("event: response.created")
+	firstData := []byte(`data: {"type":"response.created"}`)
+	secondEvent := []byte("event: response.completed")
+	handler.handleResponsesStream(&firstEvent, send)
+	handler.handleResponsesStream(&firstData, send)
+	handler.handleResponsesStream(&secondEvent, send)
+
+	if len(emitted) != 1 || !strings.Contains(emitted[0], "response.created") {
+		t.Fatalf("expected unterminated first event to be flushed before next event, got %#v", emitted)
+	}
+}
+
+func TestExtractJSONFromSSEUsesLineCursorAndCombinesDataLines(t *testing.T) {
+	got := extractJSONFromSSE("event: response.completed\r\ndata: {\r\ndata: \"type\":\"response.completed\"}\r\ndata: [DONE]\r\n")
+	want := "{\n\"type\":\"response.completed\"}"
+	if got != want {
+		t.Fatalf("unexpected SSE payload: got %q want %q", got, want)
+	}
+}
+
+func TestCodexResponsesStreamHandlerRejectsOversizedEvent(t *testing.T) {
+	originalLimit := codexResponsesStreamMaxEventBytes
+	codexResponsesStreamMaxEventBytes = 12
+	t.Cleanup(func() {
+		codexResponsesStreamMaxEventBytes = originalLimit
+	})
+
+	handler := newCodexResponsesStreamHandler(&types.Usage{})
+	var emitted []string
+	var gotErr error
+	sendData := func(data string) bool {
+		emitted = append(emitted, data)
+		return true
+	}
+	sendError := func(err error) bool {
+		gotErr = err
+		return true
+	}
+
+	line := []byte("event: response.created")
+	handler.handleResponsesStreamWithError(&line, sendData, sendError)
+
+	if !errors.Is(gotErr, errCodexResponsesSSEEventTooLarge) {
+		t.Fatalf("expected oversized event error, got %v", gotErr)
+	}
+	if len(emitted) != 0 {
+		t.Fatalf("expected oversized event not to be emitted, got %#v", emitted)
+	}
+	if handler.eventBuffer.Len() != 0 || handler.eventType != "" {
+		t.Fatalf("expected oversized event to reset buffer, len=%d type=%q", handler.eventBuffer.Len(), handler.eventType)
 	}
 }
 
@@ -227,156 +460,6 @@ func TestCollectResponsesStreamResponseAcceptsWrappedEOF(t *testing.T) {
 	}
 }
 
-func TestAdaptCodexCLIAppliesMinimalDefaultInstructions(t *testing.T) {
-	provider := &CodexProvider{}
-	request := &types.OpenAIResponsesRequest{
-		Model:           "gpt-5",
-		Instructions:    "",
-		MaxOutputTokens: 512,
-		Temperature:     ptrFloat64(0.7),
-		TopP:            ptrFloat64(0.9),
-		Input: []types.InputResponses{
-			{
-				Type: types.InputTypeMessage,
-				Role: types.ChatMessageRoleUser,
-				Content: []types.ContentResponses{
-					{Type: types.ContentTypeInputText, Text: "hello"},
-				},
-			},
-		},
-	}
-
-	provider.adaptCodexCLI(request)
-
-	if request.Instructions != CodexCLIInstructions {
-		t.Fatalf("expected minimal default instructions %q, got %q", CodexCLIInstructions, request.Instructions)
-	}
-	if request.MaxOutputTokens != 0 {
-		t.Fatalf("expected max_output_tokens to be cleared, got %d", request.MaxOutputTokens)
-	}
-	if request.Temperature != nil {
-		t.Fatalf("expected temperature to be cleared")
-	}
-	if request.TopP != nil {
-		t.Fatalf("expected top_p to be cleared")
-	}
-}
-
-func TestPrepareCodexRequestRemovesUnsupportedContextManagementAndTruncation(t *testing.T) {
-	provider := &CodexProvider{}
-	request := &types.OpenAIResponsesRequest{
-		Model:      "gpt-5",
-		Truncation: "disabled",
-		ContextManagement: []map[string]any{
-			{
-				"type":              "compaction",
-				"compact_threshold": 12000,
-			},
-		},
-		Input: []types.InputResponses{
-			{
-				Type: types.InputTypeMessage,
-				Role: types.ChatMessageRoleUser,
-				Content: []types.ContentResponses{
-					{Type: types.ContentTypeInputText, Text: "hello"},
-				},
-			},
-		},
-	}
-
-	provider.prepareCodexRequest(request)
-
-	if request.ContextManagement != nil {
-		t.Fatalf("expected context_management to be removed, got %#v", request.ContextManagement)
-	}
-	if request.Truncation != "" {
-		t.Fatalf("expected truncation to be removed, got %q", request.Truncation)
-	}
-}
-
-func TestPrepareCodexRequestEnsuresReasoningEncryptedContentInclude(t *testing.T) {
-	provider := &CodexProvider{}
-	request := &types.OpenAIResponsesRequest{
-		Model:   "gpt-5",
-		Include: []any{"output_text.annotations"},
-		Input: []types.InputResponses{
-			{
-				Type: types.InputTypeMessage,
-				Role: types.ChatMessageRoleUser,
-				Content: []types.ContentResponses{
-					{Type: types.ContentTypeInputText, Text: "hello"},
-				},
-			},
-		},
-	}
-
-	provider.prepareCodexRequest(request)
-
-	includes, ok := request.Include.([]string)
-	if !ok {
-		t.Fatalf("expected include to normalize to []string, got %T", request.Include)
-	}
-	if len(includes) != 2 {
-		t.Fatalf("expected 2 include values, got %#v", includes)
-	}
-	if includes[0] != "output_text.annotations" {
-		t.Fatalf("expected existing include to be preserved, got %#v", includes)
-	}
-	if includes[1] != codexReasoningEncryptedContentInclude {
-		t.Fatalf("expected encrypted content include to be appended, got %#v", includes)
-	}
-}
-
-func TestPrepareCodexRequestNormalizesBuiltinToolAliases(t *testing.T) {
-	provider := &CodexProvider{}
-	request := &types.OpenAIResponsesRequest{
-		Model: "gpt-5",
-		Tools: []types.ResponsesTools{
-			{Type: types.APIToolTypeWebSearchPreview, SearchContextSize: "medium"},
-		},
-		ToolChoice: map[string]any{
-			"type": "web_search_preview_2025_03_11",
-			"tools": []any{
-				map[string]any{"type": types.APIToolTypeWebSearchPreview},
-			},
-		},
-		Input: []types.InputResponses{
-			{
-				Type: types.InputTypeMessage,
-				Role: types.ChatMessageRoleUser,
-				Content: []types.ContentResponses{
-					{Type: types.ContentTypeInputText, Text: "hello"},
-				},
-			},
-		},
-	}
-
-	provider.prepareCodexRequest(request)
-
-	if request.Tools[0].Type != "web_search" {
-		t.Fatalf("expected tools alias to normalize, got %q", request.Tools[0].Type)
-	}
-
-	toolChoice, ok := request.ToolChoice.(map[string]any)
-	if !ok {
-		t.Fatalf("expected tool_choice map, got %T", request.ToolChoice)
-	}
-	if toolChoice["type"] != "web_search" {
-		t.Fatalf("expected tool_choice type to normalize, got %#v", toolChoice["type"])
-	}
-	tools, ok := toolChoice["tools"].([]any)
-	if !ok || len(tools) != 1 {
-		t.Fatalf("expected tool_choice.tools to survive normalization, got %#v", toolChoice["tools"])
-	}
-	firstTool, ok := tools[0].(map[string]any)
-	if !ok {
-		t.Fatalf("expected nested tool map, got %T", tools[0])
-	}
-	if firstTool["type"] != "web_search" {
-		t.Fatalf("expected nested tool type to normalize, got %#v", firstTool["type"])
-	}
-}
-
 func TestCodexResponsesSearchTypeRecognizesNormalizedWebSearchAlias(t *testing.T) {
 	response := &types.OpenAIResponsesResponses{
 		Tools: []types.ResponsesTools{
@@ -421,7 +504,7 @@ func TestCompactResponsesUsesCompactEndpoint(t *testing.T) {
 	provider := newTestCodexProviderWithContext(t, key, "", nil)
 	provider.Channel.BaseURL = &server.URL
 
-	resp, errWithCode := provider.CompactResponses(&types.OpenAIResponsesRequest{
+	resp, errWithCode := provider.CompactResponsesForTest(&types.OpenAIResponsesRequest{
 		Model:   "gpt-5",
 		Input:   "hello",
 		Stream:  true,
@@ -489,7 +572,7 @@ func TestCompactResponsesBackfillsPromptCacheKeyFromRequest(t *testing.T) {
 	provider := newTestCodexProviderWithContext(t, key, "", nil)
 	provider.Channel.BaseURL = &server.URL
 
-	resp, errWithCode := provider.CompactResponses(&types.OpenAIResponsesRequest{
+	resp, errWithCode := provider.CompactResponsesForTest(&types.OpenAIResponsesRequest{
 		Model:          "gpt-5",
 		PromptCacheKey: "stable-cache-key",
 	})
@@ -524,7 +607,7 @@ func TestCompactResponsesDoesNotBackfillUsageFromRetainedOutput(t *testing.T) {
 		TotalTokens:      176,
 	}
 
-	resp, errWithCode := provider.CompactResponses(&types.OpenAIResponsesRequest{
+	resp, errWithCode := provider.CompactResponsesForTest(&types.OpenAIResponsesRequest{
 		Model: "gpt-5",
 		Input: "hello",
 	})
@@ -573,7 +656,7 @@ func TestCompactResponsesPreservesDetailedUsageAndExtraBilling(t *testing.T) {
 	provider.Channel.BaseURL = &server.URL
 	provider.Usage = &types.Usage{PromptTokens: 11}
 
-	_, errWithCode := provider.CompactResponses(&types.OpenAIResponsesRequest{
+	_, errWithCode := provider.CompactResponsesForTest(&types.OpenAIResponsesRequest{
 		Model: "gpt-5",
 		Input: "hello",
 	})
@@ -627,7 +710,7 @@ func TestCreateResponsesBackfillsUsageAndExtraBillingWithoutTerminalUsage(t *tes
 	provider.Channel.BaseURL = &server.URL
 	provider.Usage = &types.Usage{PromptTokens: 11}
 
-	resp, errWithCode := provider.CreateResponses(&types.OpenAIResponsesRequest{
+	resp, errWithCode := provider.CreateResponsesForTest(&types.OpenAIResponsesRequest{
 		Model: "gpt-3.5-turbo",
 		Input: []types.InputResponses{
 			{
@@ -731,7 +814,7 @@ func TestCreateResponsesStreamConvertChatDoesNotDoubleCountToolBilling(t *testin
 	provider.Channel.BaseURL = &server.URL
 	provider.Usage = &types.Usage{PromptTokens: 11}
 
-	stream, errWithCode := provider.CreateResponsesStream(&types.OpenAIResponsesRequest{
+	stream, errWithCode := provider.CreateResponsesStreamForTest(&types.OpenAIResponsesRequest{
 		Model:       "gpt-5",
 		ConvertChat: true,
 		Input: []types.InputResponses{
@@ -751,6 +834,8 @@ func TestCreateResponsesStreamConvertChatDoesNotDoubleCountToolBilling(t *testin
 
 	dataChan, errChan := stream.Recv()
 	receivedChunks := 0
+	timeout := time.NewTimer(500 * time.Millisecond)
+	defer timeout.Stop()
 	for receivedChunks < 2 {
 		select {
 		case _, ok := <-dataChan:
@@ -767,7 +852,7 @@ func TestCreateResponsesStreamConvertChatDoesNotDoubleCountToolBilling(t *testin
 			if err != nil && err != io.EOF {
 				t.Fatalf("unexpected stream error: %v", err)
 			}
-		case <-time.After(2 * time.Second):
+		case <-timeout.C:
 			t.Fatal("timed out waiting for convert-chat stream output")
 		}
 	}
@@ -799,7 +884,7 @@ func TestCreateResponsesBackfillsPromptCacheKeyFromRequest(t *testing.T) {
 	provider := newTestCodexProviderWithContext(t, key, "", nil)
 	provider.Channel.BaseURL = &server.URL
 
-	resp, errWithCode := provider.CreateResponses(&types.OpenAIResponsesRequest{
+	resp, errWithCode := provider.CreateResponsesForTest(&types.OpenAIResponsesRequest{
 		Model:          "gpt-5",
 		PromptCacheKey: "stable-cache-key",
 		Input: []types.InputResponses{
@@ -821,6 +906,62 @@ func TestCreateResponsesBackfillsPromptCacheKeyFromRequest(t *testing.T) {
 	}
 }
 
-func ptrFloat64(v float64) *float64 {
-	return &v
+func TestCreateResponsesBodyIncludesPromptCachePolicyDecision(t *testing.T) {
+	var upstreamBody map[string]json.RawMessage
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream body: %v", err)
+		}
+		if err := json.Unmarshal(body, &upstreamBody); err != nil {
+			t.Fatalf("decode upstream body: %v body=%s", err, body)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.completed\n"))
+		_, _ = w.Write([]byte("data:{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_prompt_policy\",\"object\":\"response\",\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":5,\"total_tokens\":8}}}\n\n"))
+	}))
+	defer server.Close()
+
+	originalHTTPClient := requester.HTTPClient
+	requester.HTTPClient = server.Client()
+	t.Cleanup(func() {
+		requester.HTTPClient = originalHTTPClient
+	})
+
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"prompt_cache_key_strategy":"user_id"}`, nil)
+	provider.Context.Set("id", int64(7))
+	provider.Channel.BaseURL = &server.URL
+
+	request := &types.OpenAIResponsesRequest{
+		Model: "gpt-5",
+		Input: []types.InputResponses{
+			{
+				Type: types.InputTypeMessage,
+				Role: types.ChatMessageRoleUser,
+				Content: []types.ContentResponses{
+					{Type: types.ContentTypeInputText, Text: "hello"},
+				},
+			},
+		},
+	}
+	rawReq, errWithCode := provider.rawResponsesRequestForTest(request)
+	if errWithCode != nil {
+		t.Fatalf("rawResponsesRequestForTest returned error: %v", errWithCode.Message)
+	}
+	expectedKey := promptCacheKeyForRequestStrategy(&types.OpenAIResponsesRequest{Model: "gpt-5"}, provider.Context, codexPromptCacheStrategyUserID)
+	rawReq.Policy.PromptCache = &commonresponses.PromptCacheDecision{
+		Key:    expectedKey,
+		Source: commonresponses.PromptCacheRouteHint,
+	}
+	resp, errWithCode := provider.CreateResponses(context.Background(), rawReq)
+	if errWithCode != nil {
+		t.Fatalf("CreateResponses returned error: %v", errWithCode.Message)
+	}
+
+	if string(upstreamBody["prompt_cache_key"]) != `"`+expectedKey+`"` {
+		t.Fatalf("expected upstream prompt_cache_key %q, got %s body=%#v", expectedKey, upstreamBody["prompt_cache_key"], upstreamBody)
+	}
+	if resp.PromptCacheKey != expectedKey {
+		t.Fatalf("expected response prompt_cache_key backfill from policy, got %q want %q", resp.PromptCacheKey, expectedKey)
+	}
 }

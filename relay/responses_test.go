@@ -1,6 +1,8 @@
 package relay
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -8,9 +10,11 @@ import (
 	"strings"
 	"testing"
 
+	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/logger"
 	"one-api/common/requester"
+	commonresponses "one-api/common/responses"
 	"one-api/model"
 	providersBase "one-api/providers/base"
 	"one-api/types"
@@ -18,6 +22,19 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 )
+
+func responsesTestRawEnvelope(t *testing.T, request types.OpenAIResponsesRequest) *commonresponses.RawEnvelope {
+	t.Helper()
+	raw, err := json.Marshal(request)
+	if err != nil {
+		t.Fatalf("marshal responses test request: %v", err)
+	}
+	envelope, err := commonresponses.ParseRawEnvelope(raw)
+	if err != nil {
+		t.Fatalf("parse responses test raw envelope: %v", err)
+	}
+	return envelope
+}
 
 type affinityResponsesProvider struct {
 	providersBase.BaseProvider
@@ -27,7 +44,7 @@ func (p *affinityResponsesProvider) GetRequestHeaders() map[string]string {
 	return map[string]string{}
 }
 
-func (p *affinityResponsesProvider) CreateResponses(*types.OpenAIResponsesRequest) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
+func (p *affinityResponsesProvider) CreateResponses(context.Context, *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
 	return &types.OpenAIResponsesResponses{
 		ID:     "resp_123",
 		Model:  "gpt-5",
@@ -36,11 +53,11 @@ func (p *affinityResponsesProvider) CreateResponses(*types.OpenAIResponsesReques
 	}, nil
 }
 
-func (p *affinityResponsesProvider) CreateResponsesStream(*types.OpenAIResponsesRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+func (p *affinityResponsesProvider) CreateResponsesStream(context.Context, *commonresponses.Request) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
 	return nil, nil
 }
 
-func (p *affinityResponsesProvider) CompactResponses(*types.OpenAIResponsesRequest) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
+func (p *affinityResponsesProvider) CompactResponses(context.Context, *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
 	return &types.OpenAIResponsesResponses{}, nil
 }
 
@@ -68,15 +85,15 @@ func (p *streamAffinityResponsesProvider) GetRequestHeaders() map[string]string 
 	return map[string]string{}
 }
 
-func (p *streamAffinityResponsesProvider) CreateResponses(*types.OpenAIResponsesRequest) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
+func (p *streamAffinityResponsesProvider) CreateResponses(context.Context, *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
 	return nil, nil
 }
 
-func (p *streamAffinityResponsesProvider) CreateResponsesStream(*types.OpenAIResponsesRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+func (p *streamAffinityResponsesProvider) CreateResponsesStream(context.Context, *commonresponses.Request) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
 	return p.stream, nil
 }
 
-func (p *streamAffinityResponsesProvider) CompactResponses(*types.OpenAIResponsesRequest) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
+func (p *streamAffinityResponsesProvider) CompactResponses(context.Context, *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
 	return nil, nil
 }
 
@@ -90,6 +107,11 @@ type compatibleResponsesChatProvider struct {
 	response          *types.ChatCompletionResponse
 	createCalls       int
 	createStreamCalls int
+}
+
+type chatFallbackResponsesProvider struct {
+	providersBase.BaseProvider
+	request *commonresponses.Request
 }
 
 func (p *compatibleStreamChatProvider) GetRequestHeaders() map[string]string {
@@ -118,19 +140,43 @@ func (p *compatibleResponsesChatProvider) CreateChatCompletionStream(*types.Chat
 	return nil, nil
 }
 
+func (p *chatFallbackResponsesProvider) GetRequestHeaders() map[string]string {
+	return map[string]string{}
+}
+
+func (p *chatFallbackResponsesProvider) CreateResponses(_ context.Context, request *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
+	p.request = request
+	return &types.OpenAIResponsesResponses{
+		ID:     "resp_mapped",
+		Model:  request.Model,
+		Object: "response",
+		Status: types.ResponseStatusCompleted,
+		Output: []types.ResponsesOutput{},
+		Usage:  &types.ResponsesUsage{InputTokens: 1, OutputTokens: 1, TotalTokens: 2},
+	}, nil
+}
+
+func (p *chatFallbackResponsesProvider) CreateResponsesStream(context.Context, *commonresponses.Request) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+	return nil, nil
+}
+
+func (p *chatFallbackResponsesProvider) CompactResponses(context.Context, *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
+	return nil, nil
+}
+
 func (p *compactRejectProvider) GetRequestHeaders() map[string]string {
 	return map[string]string{}
 }
 
-func (p *compactRejectProvider) CreateResponses(*types.OpenAIResponsesRequest) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
+func (p *compactRejectProvider) CreateResponses(context.Context, *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
 	return nil, nil
 }
 
-func (p *compactRejectProvider) CreateResponsesStream(*types.OpenAIResponsesRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+func (p *compactRejectProvider) CreateResponsesStream(context.Context, *commonresponses.Request) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
 	return nil, nil
 }
 
-func (p *compactRejectProvider) CompactResponses(*types.OpenAIResponsesRequest) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
+func (p *compactRejectProvider) CompactResponses(context.Context, *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
 	p.compactCalled = true
 	return &types.OpenAIResponsesResponses{}, nil
 }
@@ -139,15 +185,15 @@ func (p *compactSuccessProvider) GetRequestHeaders() map[string]string {
 	return map[string]string{}
 }
 
-func (p *compactSuccessProvider) CreateResponses(*types.OpenAIResponsesRequest) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
+func (p *compactSuccessProvider) CreateResponses(context.Context, *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
 	return nil, nil
 }
 
-func (p *compactSuccessProvider) CreateResponsesStream(*types.OpenAIResponsesRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+func (p *compactSuccessProvider) CreateResponsesStream(context.Context, *commonresponses.Request) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
 	return nil, nil
 }
 
-func (p *compactSuccessProvider) CompactResponses(*types.OpenAIResponsesRequest) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
+func (p *compactSuccessProvider) CompactResponses(context.Context, *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
 	return p.response, nil
 }
 
@@ -155,8 +201,13 @@ func (p *stalePreviousResponseProvider) GetRequestHeaders() map[string]string {
 	return map[string]string{}
 }
 
-func (p *stalePreviousResponseProvider) CreateResponses(request *types.OpenAIResponsesRequest) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
+func (p *stalePreviousResponseProvider) CreateResponses(_ context.Context, req *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
 	p.createCalls++
+	request := &types.OpenAIResponsesRequest{}
+	if req != nil && req.Body != nil {
+		projection := req.Body.Projection
+		request = &projection
+	}
 	if strings.TrimSpace(request.PreviousResponseID) != "" {
 		return nil, &types.OpenAIErrorWithStatusCode{
 			OpenAIError: types.OpenAIError{
@@ -176,11 +227,11 @@ func (p *stalePreviousResponseProvider) CreateResponses(request *types.OpenAIRes
 	}, nil
 }
 
-func (p *stalePreviousResponseProvider) CreateResponsesStream(*types.OpenAIResponsesRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+func (p *stalePreviousResponseProvider) CreateResponsesStream(context.Context, *commonresponses.Request) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
 	return nil, nil
 }
 
-func (p *stalePreviousResponseProvider) CompactResponses(*types.OpenAIResponsesRequest) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
+func (p *stalePreviousResponseProvider) CompactResponses(context.Context, *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
 	return nil, nil
 }
 
@@ -223,6 +274,41 @@ func TestRelayResponsesCompactRejectsStream(t *testing.T) {
 	}
 	if provider.compactCalled {
 		t.Fatal("expected provider compact call to be skipped")
+	}
+}
+
+func TestRelayResponsesNativeRequiresRawEnvelope(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses/compact", nil)
+
+	provider := &compactRejectProvider{
+		BaseProvider: providersBase.BaseProvider{
+			Channel:         &model.Channel{},
+			SupportResponse: true,
+		},
+	}
+	relay := &relayResponses{
+		relayBase: relayBase{
+			c:         ctx,
+			provider:  provider,
+			modelName: "gpt-5",
+		},
+		responsesRequest: types.OpenAIResponsesRequest{Model: "gpt-5"},
+		operation:        responsesOperationCompact,
+	}
+
+	errWithCode, done := relay.send()
+	if !done {
+		t.Fatal("expected native responses relay to stop without raw envelope")
+	}
+	if errWithCode == nil || errWithCode.StatusCode != http.StatusBadRequest || openAIErrorCodeString(errWithCode.Code, "") != "invalid_request_error" {
+		t.Fatalf("expected missing raw envelope to fail as invalid request, got %+v", errWithCode)
+	}
+	if provider.compactCalled {
+		t.Fatal("expected provider compact call to be skipped without raw envelope")
 	}
 }
 
@@ -282,6 +368,61 @@ func TestResponsesHTTPAttemptReplayPolicy(t *testing.T) {
 	if responsesHTTPAttemptShouldRetry(responsesRelay, apiErr, config.ChannelTypeOpenAI) {
 		t.Fatal("expected committed downstream response to block HTTP attempt replay")
 	}
+
+	responsesRelay, _ = newRelay()
+	if responsesHTTPAttemptShouldRetry(responsesRelay, common.StringErrorWrapperLocal("quota rollback failed", "quota_rollback_failed", http.StatusInternalServerError), config.ChannelTypeOpenAI) {
+		t.Fatal("expected local quota rollback failure to block HTTP attempt replay")
+	}
+}
+
+func TestRelayChatResponsesFallbackUsesMappedModel(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	provider := &chatFallbackResponsesProvider{
+		BaseProvider: providersBase.BaseProvider{
+			Channel: &model.Channel{Id: 71, Type: config.ChannelTypeOpenAI},
+		},
+	}
+	relay := &relayChat{
+		relayBase: relayBase{
+			c:         ctx,
+			provider:  provider,
+			modelName: "o3-pro",
+		},
+		chatRequest: types.ChatCompletionRequest{
+			Model: "client-o3-alias",
+			Messages: []types.ChatCompletionMessage{
+				{Role: types.ChatMessageRoleUser, Content: "hello"},
+			},
+		},
+	}
+
+	errWithCode, done := relay.send()
+	if done || errWithCode != nil {
+		t.Fatalf("expected chat fallback send to succeed, done=%v err=%v", done, errWithCode)
+	}
+	if provider.request == nil {
+		t.Fatal("expected fallback provider to receive a Responses request")
+	}
+	if provider.request.Model != "o3-pro" {
+		t.Fatalf("expected commonresponses request model to use mapped model, got %q", provider.request.Model)
+	}
+	if provider.request.Body == nil || provider.request.Body.Object == nil {
+		t.Fatal("expected raw responses envelope")
+	}
+	if rawModel := strings.TrimSpace(string(provider.request.Body.Object.Fields["model"])); rawModel != `"o3-pro"` {
+		t.Fatalf("expected raw envelope model to use mapped model, got %s", rawModel)
+	}
+	if !strings.Contains(string(provider.request.Body.Object.Raw), `"model":"o3-pro"`) {
+		t.Fatalf("expected serialized fallback body to use mapped model, got %s", provider.request.Body.Object.Raw)
+	}
+	if relay.chatRequest.Model != "o3-pro" {
+		t.Fatalf("expected relay chat request to carry mapped model for send operation, got %q", relay.chatRequest.Model)
+	}
 }
 
 func TestPrepareResponsesChannelAffinityPrefersRecordedChannel(t *testing.T) {
@@ -339,6 +480,7 @@ func TestRelayResponsesSendRecordsChannelAffinityOnSuccess(t *testing.T) {
 			modelName: "gpt-5",
 		},
 		responsesRequest: request,
+		rawEnvelope:      responsesTestRawEnvelope(t, request),
 		operation:        responsesOperationCreate,
 	}
 
@@ -482,6 +624,7 @@ func TestRelayResponsesSendDoesNotRecoverStalePreviousResponseIDInternally(t *te
 			modelName: "gpt-5",
 		},
 		responsesRequest: request,
+		rawEnvelope:      responsesTestRawEnvelope(t, request),
 		operation:        responsesOperationCreate,
 	}
 
@@ -632,6 +775,7 @@ func TestRelayResponsesStreamRecordsPreviousResponseIDAffinity(t *testing.T) {
 			modelName: "gpt-5",
 		},
 		responsesRequest: request,
+		rawEnvelope:      responsesTestRawEnvelope(t, request),
 		operation:        responsesOperationCreate,
 	}
 
@@ -930,6 +1074,7 @@ func TestRelayResponsesSetRequestAndCompactSuccessBranches(t *testing.T) {
 			modelName: "gpt-5",
 		},
 		responsesRequest: request,
+		rawEnvelope:      responsesTestRawEnvelope(t, request),
 		operation:        responsesOperationCompact,
 	}
 	errWithCode, done := sendRelay.send()
@@ -959,12 +1104,44 @@ func TestRelayResponsesSetRequestAndCompactSuccessBranches(t *testing.T) {
 	}
 	close(closedStream.dataChan)
 	close(closedStream.errChan)
-	firstResponseTime, finalResponse := streamRelay.chatToResponseStreamClient(closedStream)
+	firstResponseTime, finalResponse, errWithCode := streamRelay.chatToResponseStreamClient(closedStream)
+	if errWithCode != nil {
+		t.Fatalf("expected closed response stream to finish without error, got %v", errWithCode.Message)
+	}
 	if !firstResponseTime.IsZero() {
 		t.Fatalf("expected closed response stream to return zero first response time, got %v", firstResponseTime)
 	}
 	if finalResponse == nil || finalResponse.Status != types.ResponseStatusCompleted {
 		t.Fatalf("expected closed response stream to process terminal response, got %#v", finalResponse)
+	}
+}
+
+func TestRelayResponsesSetRequestRequiresModel(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{name: "missing model", body: `{"input":"hello"}`},
+		{name: "blank model", body: `{"model":"   ","input":"hello"}`},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(tt.body))
+			ctx.Request.Header.Set("Content-Type", "application/json")
+
+			relay := NewRelayResponses(ctx)
+			err := relay.setRequest()
+			if err == nil || !strings.Contains(err.Error(), "field Model is required") {
+				t.Fatalf("expected required model validation error, got %v", err)
+			}
+			if relay.getOriginalModel() != "" {
+				t.Fatalf("expected missing model request not to populate original model, got %q", relay.getOriginalModel())
+			}
+		})
 	}
 }
 

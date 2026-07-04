@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"one-api/common/logger"
+	"one-api/common/responsesws"
 	"one-api/model"
 	"one-api/providers/base"
 	"one-api/providers/openai"
@@ -204,20 +206,31 @@ func TestCodexTokenErrorSurfaceUsesSafeClientMessageAcrossEntrypoints(t *testing
 		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-secret","account_id":"acct-123"}`, "", nil)
 		provider.Credentials = nil
 
-		req, errWithCode := provider.getResponsesRequest(&types.OpenAIResponsesRequest{Model: "gpt-5"})
+		rawReq, buildErr := provider.rawResponsesRequestForTest(&types.OpenAIResponsesRequest{Model: "gpt-5"})
+		if buildErr != nil {
+			t.Fatalf("unexpected raw request build error: %v", buildErr)
+		}
+		req, errWithCode := provider.prepareResponsesCreateRequest(context.Background(), rawReq)
 		if req != nil {
 			t.Fatalf("expected responses request build to fail on token error, got %#v", req)
 		}
 		assertSafeCodexTokenClientError(t, errWithCode)
 	})
 
-	t.Run("responses websocket bridge", func(t *testing.T) {
+	t.Run("responses websocket", func(t *testing.T) {
 		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-secret","account_id":"acct-123"}`, "", nil)
 		provider.Credentials = nil
 
-		req, errWithCode := provider.getResponsesWSBridgeRequest(&types.OpenAIResponsesRequest{Model: "gpt-5", Stream: true})
-		if req != nil {
-			t.Fatalf("expected bridge request build to fail on token error, got %#v", req)
+		frame, err := responsesws.ParseRawResponsesCreateFrame([]byte(`{"type":"response.create","model":"gpt-5","input":"hi"}`))
+		if err != nil {
+			t.Fatalf("unexpected frame parse error: %v", err)
+		}
+		plan, _, _, errWithCode := provider.prepareResponsesWSOfficialConn(context.Background(), &responsesws.OpenRequest{
+			FirstFrame:    frame,
+			SelectedModel: "gpt-5",
+		}, "gpt-5", "responses-ws-token-error")
+		if plan != nil {
+			t.Fatalf("expected websocket plan preparation to fail on token error, got %#v", plan)
 		}
 		assertSafeCodexTokenClientError(t, errWithCode)
 	})

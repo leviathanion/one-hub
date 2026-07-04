@@ -8,6 +8,7 @@ import (
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/requester"
+	commonresponses "one-api/common/responses"
 	"one-api/common/responsesws"
 	"one-api/common/utils"
 	providersBase "one-api/providers/base"
@@ -28,30 +29,10 @@ type OpenAIResponsesStreamHandler struct {
 }
 
 var (
-	responsesDataPrefix  = []byte("data:")
-	responsesDonePayload = []byte("[DONE]")
-	trackedUsageEvents   = map[string]struct{}{
-		"response.created":           {},
-		"response.output_text.delta": {},
-		"response.output_item.added": {},
-		"response.completed":         {},
-		"response.failed":            {},
-		"response.incomplete":        {},
-	}
+	responsesDataPrefix        = []byte("data:")
+	responsesDonePayload       = []byte("[DONE]")
 	responsesRequestJSONFields = collectJSONFieldNames(reflect.TypeOf(types.OpenAIResponsesRequest{}))
 )
-
-type responsesUsageEvent struct {
-	Type     string                          `json:"type"`
-	Delta    json.RawMessage                 `json:"delta,omitempty"`
-	Item     *types.ResponsesOutput          `json:"item,omitempty"`
-	Response *types.OpenAIResponsesResponses `json:"response,omitempty"`
-}
-
-func shouldTrackResponsesUsageByType(eventType string) bool {
-	_, ok := trackedUsageEvents[eventType]
-	return ok
-}
 
 func joinURLPath(basePath string, suffix string) string {
 	basePath = strings.TrimRight(basePath, "/")
@@ -62,16 +43,20 @@ func joinURLPath(basePath string, suffix string) string {
 	return basePath + "/" + suffix
 }
 
-func (p *OpenAIProvider) CreateResponses(request *types.OpenAIResponsesRequest) (openaiResponse *types.OpenAIResponsesResponses, errWithCode *types.OpenAIErrorWithStatusCode) {
-	req, errWithCode := p.GetRequestTextBody(config.RelayModeResponses, request.Model, request)
+func (p *OpenAIProvider) CreateResponses(ctx context.Context, rawReq *commonresponses.Request) (openaiResponse *types.OpenAIResponsesResponses, errWithCode *types.OpenAIErrorWithStatusCode) {
+	request := responsesRequestProjection(rawReq)
+	httpReq, errWithCode := p.buildResponsesCreateRequest(rawReq, request, false)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
-	defer req.Body.Close()
+	if ctx != nil {
+		httpReq = p.Requester.WithRequestContext(httpReq, ctx)
+	}
+	defer httpReq.Body.Close()
 
 	response := &types.OpenAIResponsesResponses{}
 	// 发送请求
-	_, errWithCode = p.Requester.SendRequest(req, response, false)
+	_, errWithCode = p.Requester.SendRequest(httpReq, response, false)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -94,10 +79,14 @@ func (p *OpenAIProvider) CreateResponses(request *types.OpenAIResponsesRequest) 
 	return response, nil
 }
 
-func (p *OpenAIProvider) CreateResponsesStream(request *types.OpenAIResponsesRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
-	req, errWithCode := p.GetRequestTextBody(config.RelayModeResponses, request.Model, request)
+func (p *OpenAIProvider) CreateResponsesStream(ctx context.Context, rawReq *commonresponses.Request) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+	request := responsesRequestProjection(rawReq)
+	req, errWithCode := p.buildResponsesCreateRequest(rawReq, request, true)
 	if errWithCode != nil {
 		return nil, errWithCode
+	}
+	if ctx != nil {
+		req = p.Requester.WithRequestContext(req, ctx)
 	}
 	defer req.Body.Close()
 
@@ -118,7 +107,7 @@ func (p *OpenAIProvider) CreateResponsesStreamRaw(ctx context.Context, model str
 		return nil, markHTTPBridgePreSendLocalError(errWithCode)
 	}
 	if ctx != nil {
-		req = req.WithContext(ctx)
+		req = p.Requester.WithRequestContext(req, ctx)
 	}
 	defer req.Body.Close()
 
@@ -240,10 +229,14 @@ func (p *OpenAIProvider) createResponsesHTTPBridgeStreamFromRequestWithOptions(r
 	return requester.RequestNoTrimStreamWithEmitterOptions(p.Requester, resp, chatHandler.HandlerResponsesStreamWithEmitter, options)
 }
 
-func (p *OpenAIProvider) CompactResponses(request *types.OpenAIResponsesRequest) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
+func (p *OpenAIProvider) CompactResponses(ctx context.Context, rawReq *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
+	request := responsesRequestProjection(rawReq)
 	req, errWithCode := p.buildCompactResponsesRequest(request)
 	if errWithCode != nil {
 		return nil, errWithCode
+	}
+	if ctx != nil {
+		req = p.Requester.WithRequestContext(req, ctx)
 	}
 	defer req.Body.Close()
 
@@ -267,6 +260,75 @@ func (p *OpenAIProvider) CompactResponses(request *types.OpenAIResponsesRequest)
 	getResponsesExtraBilling(response, p.Usage)
 
 	return response, nil
+}
+
+func responsesRequestProjection(req *commonresponses.Request) *types.OpenAIResponsesRequest {
+	return commonresponses.ProjectRequest(req, nil)
+}
+
+func (p *OpenAIProvider) buildResponsesCreateRequest(rawReq *commonresponses.Request, request *types.OpenAIResponsesRequest, stream bool) (*http.Request, *types.OpenAIErrorWithStatusCode) {
+	if request == nil {
+		request = &types.OpenAIResponsesRequest{}
+	}
+	basePath, errWithCode := p.GetSupportedAPIUri(config.RelayModeResponses)
+	if errWithCode != nil {
+		return nil, errWithCode
+	}
+	if errWithCode := p.validateAzureClassicAPIVersionForRequest(); errWithCode != nil {
+		return nil, errWithCode
+	}
+
+	fullRequestURL := p.GetFullRequestURL(basePath, request.Model)
+	headers := p.GetRequestHeaders()
+
+	bodyMap, errWithCode := p.buildResponsesCreateBody(rawReq, request, stream)
+	if errWithCode != nil {
+		return nil, errWithCode
+	}
+
+	req, err := p.Requester.NewRequest(http.MethodPost, fullRequestURL, p.Requester.WithBody(bodyMap), p.Requester.WithHeader(headers))
+	if err != nil {
+		return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
+	}
+	return req, nil
+}
+
+func (p *OpenAIProvider) buildResponsesCreateBody(rawReq *commonresponses.Request, request *types.OpenAIResponsesRequest, stream bool) (map[string]interface{}, *types.OpenAIErrorWithStatusCode) {
+	bodyMap, err := rawResponsesBodyMap(rawReq)
+	if err != nil {
+		return nil, common.ErrorWrapper(err, "decode_request_failed", http.StatusInternalServerError)
+	}
+	if bodyMap == nil {
+		bodyMap = make(map[string]interface{})
+	}
+
+	if _, exists := bodyMap["prompt_cache_key"]; !exists && rawReq != nil && rawReq.Policy.PromptCache != nil {
+		if key := strings.TrimSpace(rawReq.Policy.PromptCache.Key); key != "" {
+			bodyMap["prompt_cache_key"] = key
+		}
+	}
+
+	customParams, err := p.CustomParameterHandler()
+	if err != nil {
+		return nil, common.ErrorWrapper(err, "custom_parameter_error", http.StatusInternalServerError)
+	}
+	if customParams != nil {
+		bodyMap = providersBase.ApplyCustomParams(bodyMap, customParams, request.Model, true)
+	}
+	if model := strings.TrimSpace(request.Model); model != "" {
+		bodyMap["model"] = model
+	}
+	if stream {
+		bodyMap["stream"] = true
+	}
+	return bodyMap, nil
+}
+
+func rawResponsesBodyMap(req *commonresponses.Request) (map[string]interface{}, error) {
+	if req == nil || req.Body == nil || req.Body.Object == nil {
+		return nil, nil
+	}
+	return rawMessageBodyToInterfaceMap(req.Body.Object.Fields)
 }
 
 func (p *OpenAIProvider) buildCompactResponsesRequest(request *types.OpenAIResponsesRequest) (*http.Request, *types.OpenAIErrorWithStatusCode) {
@@ -419,21 +481,8 @@ func (h *OpenAIResponsesStreamHandler) handleResponsesStream(rawLine *[]byte, se
 		return
 	}
 
-	var eventMeta struct {
-		Type string `json:"type"`
-	}
-	if err := json.Unmarshal(payload, &eventMeta); err != nil || eventMeta.Type == "" {
-		sendData(rawStr)
-		return
-	}
-
-	if !shouldTrackResponsesUsageByType(eventMeta.Type) {
-		sendData(rawStr)
-		return
-	}
-
-	var openaiResponse responsesUsageEvent
-	if err := json.Unmarshal(payload, &openaiResponse); err != nil {
+	openaiResponse, ok := commonresponses.ParseStreamUsageEvent(payload)
+	if !ok {
 		// Usage tracking should not break stream passthrough.
 		sendData(rawStr)
 		return
@@ -441,44 +490,28 @@ func (h *OpenAIResponsesStreamHandler) handleResponsesStream(rawLine *[]byte, se
 
 	switch openaiResponse.Type {
 	case "response.created":
-		if openaiResponse.Response != nil && len(openaiResponse.Response.Tools) > 0 {
-			for _, tool := range openaiResponse.Response.Tools {
-				if types.IsResponsesWebSearchToolType(tool.Type) {
-					h.searchType = "medium"
-					if tool.SearchContextSize != "" {
-						h.searchType = tool.SearchContextSize
-					}
-				}
-			}
+		if searchType := commonresponses.ResponsesSearchType(openaiResponse.Response); searchType != "" {
+			h.searchType = searchType
 		}
-	case "response.output_text.delta":
-		var delta string
-		if len(openaiResponse.Delta) > 0 && json.Unmarshal(openaiResponse.Delta, &delta) == nil {
-			h.Usage.TextBuilder.WriteString(delta)
+	case "response.output_text.delta", "response.reasoning_summary_text.delta":
+		if h.Usage != nil {
+			delta, ok := commonresponses.StreamEventDeltaString(openaiResponse.Delta)
+			if ok {
+				h.Usage.TextBuilder.WriteString(delta)
+			}
 		}
 	case "response.output_item.added":
-		if openaiResponse.Item != nil {
-			switch openaiResponse.Item.Type {
-			case types.InputTypeWebSearchCall:
-				if h.searchType == "" {
-					h.searchType = "medium"
-				}
-				h.Usage.IncExtraBilling(types.APIToolTypeWebSearchPreview, h.searchType)
-			case types.InputTypeCodeInterpreterCall:
-				h.Usage.IncExtraBilling(types.APIToolTypeCodeInterpreter, "")
-			case types.InputTypeFileSearchCall:
-				h.Usage.IncExtraBilling(types.APIToolTypeFileSearch, "")
-			}
-		}
+		commonresponses.ApplyResponsesOutputItemBilling(h.Usage, openaiResponse.Item, h.searchType)
 	default:
-		if openaiResponse.Response != nil && openaiResponse.Response.Usage != nil {
-			usage := openaiResponse.Response.Usage
-			*h.Usage = *usage.ToOpenAIUsage()
-			getResponsesExtraBilling(openaiResponse.Response, h.Usage)
-		}
+		commonresponses.ApplyResponsesUsage(h.Usage, openaiResponse.Response)
 	}
 
 	sendData(rawStr)
+}
+
+func openAIStreamDeltaString(delta any) (string, bool) {
+	text, ok := delta.(string)
+	return text, ok
 }
 
 func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataChan chan string, errChan chan error) {
@@ -516,15 +549,8 @@ func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataCh
 				h.MessageID = openaiResponse.Response.ID
 				chatRes.ID = h.MessageID
 			}
-		}
-		if len(openaiResponse.Response.Tools) > 0 {
-			for _, tool := range openaiResponse.Response.Tools {
-				if types.IsResponsesWebSearchToolType(tool.Type) {
-					h.searchType = "medium"
-					if tool.SearchContextSize != "" {
-						h.searchType = tool.SearchContextSize
-					}
-				}
+			if searchType := commonresponses.ResponsesSearchType(openaiResponse.Response); searchType != "" {
+				h.searchType = searchType
 			}
 		}
 		chatRes.Choices = append(chatRes.Choices, types.ChatCompletionStreamChoice{
@@ -533,8 +559,8 @@ func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataCh
 		})
 		needOutput = true
 	case "response.output_text.delta": // 处理文本输出的增量
-		delta, ok := openaiResponse.Delta.(string)
-		if ok {
+		delta, ok := openAIStreamDeltaString(openaiResponse.Delta)
+		if ok && h.Usage != nil {
 			h.Usage.TextBuilder.WriteString(delta)
 		}
 		chatRes.Choices = append(chatRes.Choices, types.ChatCompletionStreamChoice{
@@ -545,8 +571,8 @@ func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataCh
 		})
 		needOutput = true
 	case "response.reasoning_summary_text.delta": // 处理文本输出的增量
-		delta, ok := openaiResponse.Delta.(string)
-		if ok {
+		delta, ok := openAIStreamDeltaString(openaiResponse.Delta)
+		if ok && h.Usage != nil {
 			h.Usage.TextBuilder.WriteString(delta)
 		}
 		chatRes.Choices = append(chatRes.Choices, types.ChatCompletionStreamChoice{
@@ -558,8 +584,8 @@ func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataCh
 		needOutput = true
 	case "response.function_call_arguments.delta": // 处理函数调用参数的增量
 		h.hasToolCall = true
-		delta, ok := openaiResponse.Delta.(string)
-		if ok {
+		delta, ok := openAIStreamDeltaString(openaiResponse.Delta)
+		if ok && h.Usage != nil {
 			h.Usage.TextBuilder.WriteString(delta)
 		}
 		chatRes.Choices = append(chatRes.Choices, types.ChatCompletionStreamChoice{
@@ -582,17 +608,8 @@ func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataCh
 		h.toolIndex++
 	case "response.output_item.added":
 		if openaiResponse.Item != nil {
+			commonresponses.ApplyResponsesOutputItemBilling(h.Usage, openaiResponse.Item, h.searchType)
 			switch openaiResponse.Item.Type {
-			case types.InputTypeWebSearchCall:
-				if h.searchType == "" {
-					h.searchType = "medium"
-				}
-				h.Usage.IncExtraBilling(types.APIToolTypeWebSearchPreview, h.searchType)
-			case types.InputTypeCodeInterpreterCall:
-				h.Usage.IncExtraBilling(types.APIToolTypeCodeInterpreter, "")
-			case types.InputTypeFileSearchCall:
-				h.Usage.IncExtraBilling(types.APIToolTypeFileSearch, "")
-
 			case types.InputTypeMessage, types.InputTypeReasoning:
 				chatRes.Choices = append(chatRes.Choices, types.ChatCompletionStreamChoice{
 					Index: 0,
@@ -635,10 +652,7 @@ func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataCh
 		}
 	default:
 		if openaiResponse.Response != nil && openaiResponse.Response.Usage != nil {
-			usage := openaiResponse.Response.Usage
-			*h.Usage = *usage.ToOpenAIUsage()
-
-			getResponsesExtraBilling(openaiResponse.Response, h.Usage)
+			commonresponses.ApplyResponsesUsage(h.Usage, openaiResponse.Response)
 			finishReason := types.ConvertResponsesStatusToChat(openaiResponse.Response.Status)
 			if finishReason == types.FinishReasonStop && shouldUseToolCallsFinishReason(openaiResponse.Response, h.hasToolCall) {
 				finishReason = types.FinishReasonToolCalls

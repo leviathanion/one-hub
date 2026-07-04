@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -20,10 +19,8 @@ import (
 	"one-api/providers/openai"
 	runtimerealtime "one-api/runtime/realtime"
 	runtimesession "one-api/runtime/session"
-	"one-api/types"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -35,6 +32,18 @@ func primeCachedToken(t *testing.T, channelID int, accessToken string, expiresAt
 		ExpiresAt:   expiresAt,
 	}, ttl); err != nil {
 		t.Fatalf("failed to prime cache: %v", err)
+	}
+}
+
+func primeCachedCredentialSnapshot(t *testing.T, channelID int, accessToken, accountID string, expiresAt time.Time, ttl time.Duration) {
+	t.Helper()
+
+	if err := cache.SetCache(tokenCacheKey(channelID), cachedAccessToken{
+		AccessToken: accessToken,
+		AccountID:   accountID,
+		ExpiresAt:   expiresAt,
+	}, ttl); err != nil {
+		t.Fatalf("failed to prime credential cache: %v", err)
 	}
 }
 
@@ -128,278 +137,6 @@ func newTestCodexProviderWithContext(t *testing.T, key string, other string, hea
 	provider.Context = ctx
 
 	return provider
-}
-
-func TestGetResponsesRequestAddsCLICompatibleDefaultHeaders(t *testing.T) {
-	key := `{"access_token":"access-token","account_id":"acct-123"}`
-	provider := newTestCodexProviderWithContext(t, key, "", nil)
-
-	req, errWithCode := provider.getResponsesRequest(&types.OpenAIResponsesRequest{
-		Model:  "gpt-5",
-		Stream: true,
-	})
-	if errWithCode != nil {
-		t.Fatalf("expected request build to succeed, got %v", errWithCode)
-	}
-
-	if got := req.Header.Get("Authorization"); got != "Bearer access-token" {
-		t.Fatalf("expected authorization header, got %q", got)
-	}
-	if got := req.Header.Get("Chatgpt-Account-Id"); got != "acct-123" {
-		t.Fatalf("expected account id header, got %q", got)
-	}
-	if got := req.Header.Get("User-Agent"); got != defaultUserAgent {
-		t.Fatalf("expected default user agent %q, got %q", defaultUserAgent, got)
-	}
-	// No client User-Agent or originator means the upstream request uses the
-	// proxy's default Codex UA, so smart originator follows that effective UA.
-	if got := req.Header.Get("Originator"); got != defaultOfficialCodexOriginator {
-		t.Fatalf("expected smart originator %q for default upstream user agent, got %q", defaultOfficialCodexOriginator, got)
-	}
-	if got := req.Header.Get("Session_id"); got == "" {
-		t.Fatalf("expected generated session header")
-	}
-	if got := req.Header.Get("Accept"); got != "text/event-stream" {
-		t.Fatalf("expected SSE accept header, got %q", got)
-	}
-	if got := req.Header.Get("Connection"); got != "Keep-Alive" {
-		t.Fatalf("expected keep-alive connection header, got %q", got)
-	}
-}
-
-func TestGetResponsesRequestPrefersIncomingCodexHeaders(t *testing.T) {
-	key := `{"access_token":"access-token","account_id":"acct-123"}`
-	provider := newTestCodexProviderWithContext(t, key, "", map[string]string{
-		"Version":               "2026-03-28",
-		"X-Codex-Turn-Metadata": "turn-meta",
-		"X-Client-Request-Id":   "request-123",
-		"Originator":            "custom-originator",
-		"X-Session-Id":          "session-123",
-		"User-Agent":            "incoming-codex-ua",
-	})
-
-	req, errWithCode := provider.getResponsesRequest(&types.OpenAIResponsesRequest{
-		Model: "gpt-5",
-	})
-	if errWithCode != nil {
-		t.Fatalf("expected request build to succeed, got %v", errWithCode)
-	}
-
-	if got := req.Header.Get("Version"); got != "2026-03-28" {
-		t.Fatalf("expected version header passthrough, got %q", got)
-	}
-	if got := req.Header.Get("X-Codex-Turn-Metadata"); got != "turn-meta" {
-		t.Fatalf("expected turn metadata passthrough, got %q", got)
-	}
-	if got := req.Header.Get("X-Client-Request-Id"); got != "request-123" {
-		t.Fatalf("expected client request id passthrough, got %q", got)
-	}
-	if got := req.Header.Get("Originator"); got != "custom-originator" {
-		t.Fatalf("expected originator passthrough, got %q", got)
-	}
-	if got := req.Header.Get("X-Session-Id"); got != "session-123" {
-		t.Fatalf("expected session passthrough, got %q", got)
-	}
-	if got := req.Header.Get("User-Agent"); got != "incoming-codex-ua" {
-		t.Fatalf("expected incoming user agent passthrough, got %q", got)
-	}
-}
-
-func TestGetResponsesRequestUsesCodexTUIOriginatorForOfficialClientFallback(t *testing.T) {
-	key := `{"access_token":"access-token","account_id":"acct-123"}`
-	provider := newTestCodexProviderWithContext(t, key, "", map[string]string{
-		"User-Agent": "codex_cli_rs/0.116.0",
-	})
-
-	req, errWithCode := provider.getResponsesRequest(&types.OpenAIResponsesRequest{
-		Model: "gpt-5",
-	})
-	if errWithCode != nil {
-		t.Fatalf("expected request build to succeed, got %v", errWithCode)
-	}
-
-	if got := req.Header.Get("Originator"); got != defaultOfficialCodexOriginator {
-		t.Fatalf("expected official client fallback originator %q, got %q", defaultOfficialCodexOriginator, got)
-	}
-}
-
-func TestGetResponsesRequestPrefersChannelUserAgentOverIncomingClientUserAgent(t *testing.T) {
-	key := `{"access_token":"access-token","account_id":"acct-123"}`
-	provider := newTestCodexProviderWithContext(t, key, "", map[string]string{
-		"User-Agent": "Mozilla/5.0",
-	})
-	provider.Channel.ModelHeaders = stringPtr(`{"User-Agent":"codex-tui/1.0"}`)
-
-	req, errWithCode := provider.getResponsesRequest(&types.OpenAIResponsesRequest{
-		Model: "gpt-5",
-	})
-	if errWithCode != nil {
-		t.Fatalf("expected request build to succeed, got %v", errWithCode)
-	}
-
-	if got := req.Header.Get("User-Agent"); got != "codex-tui/1.0" {
-		t.Fatalf("expected channel user agent to win over incoming user agent, got %q", got)
-	}
-	if got := req.Header.Get("Originator"); got != defaultOfficialCodexOriginator {
-		t.Fatalf("expected smart originator to follow effective channel user agent, got %q", got)
-	}
-}
-
-func TestGetResponsesRequestUsesChannelUserAgentWhenIncomingClientUserAgentMissing(t *testing.T) {
-	key := `{"access_token":"access-token","account_id":"acct-123"}`
-	provider := newTestCodexProviderWithContext(t, key, "", nil)
-	provider.Channel.ModelHeaders = stringPtr(`{"User-Agent":"custom-codex-ua"}`)
-
-	req, errWithCode := provider.getResponsesRequest(&types.OpenAIResponsesRequest{
-		Model: "gpt-5",
-	})
-	if errWithCode != nil {
-		t.Fatalf("expected request build to succeed, got %v", errWithCode)
-	}
-
-	if got := req.Header.Get("User-Agent"); got != "custom-codex-ua" {
-		t.Fatalf("expected channel user agent when incoming user agent is missing, got %q", got)
-	}
-}
-
-func TestGetResponsesRequestSmartOriginatorUsesEffectiveNonOfficialChannelUserAgent(t *testing.T) {
-	key := `{"access_token":"access-token","account_id":"acct-123"}`
-	provider := newTestCodexProviderWithContext(t, key, "", map[string]string{
-		"User-Agent": "codex_cli_rs/0.116.0",
-	})
-	provider.Channel.ModelHeaders = stringPtr(`{"User-Agent":"Mozilla/5.0"}`)
-
-	req, errWithCode := provider.getResponsesRequest(&types.OpenAIResponsesRequest{
-		Model: "gpt-5",
-	})
-	if errWithCode != nil {
-		t.Fatalf("expected request build to succeed, got %v", errWithCode)
-	}
-
-	if got := req.Header.Get("User-Agent"); got != "Mozilla/5.0" {
-		t.Fatalf("expected channel user agent to win over incoming user agent, got %q", got)
-	}
-	if got := req.Header.Get("Originator"); got != defaultNonOfficialCodexOriginator {
-		t.Fatalf("expected smart originator to follow effective non-official channel user agent, got %q", got)
-	}
-}
-
-func TestGetResponsesRequestUsesPromptCacheKeyForConversationAndSession(t *testing.T) {
-	key := `{"access_token":"access-token","account_id":"acct-123"}`
-	provider := newTestCodexProviderWithContext(t, key, "", nil)
-
-	req, errWithCode := provider.getResponsesRequest(&types.OpenAIResponsesRequest{
-		Model:          "gpt-5",
-		PromptCacheKey: "prompt-cache-123",
-	})
-	if errWithCode != nil {
-		t.Fatalf("expected request build to succeed, got %v", errWithCode)
-	}
-
-	if got := req.Header.Get("Conversation_id"); got != "prompt-cache-123" {
-		t.Fatalf("expected conversation header from prompt cache key, got %q", got)
-	}
-	if got := req.Header.Get("Session_id"); got != "prompt-cache-123" {
-		t.Fatalf("expected session header from prompt cache key, got %q", got)
-	}
-}
-
-func TestGetResponsesRequestWithSessionUsesPromptCacheKeyForSessionAndPreservesExecutionSessionHeader(t *testing.T) {
-	key := `{"access_token":"access-token","account_id":"acct-123"}`
-	provider := newTestCodexProviderWithContext(t, key, "", nil)
-
-	req, errWithCode := provider.getResponsesRequestWithSession(&types.OpenAIResponsesRequest{
-		Model:          "gpt-5",
-		PromptCacheKey: "prompt-cache-123",
-	}, "execution-session-456")
-	if errWithCode != nil {
-		t.Fatalf("expected request build to succeed, got %v", errWithCode)
-	}
-
-	if got := req.Header.Get("Conversation_id"); got != "prompt-cache-123" {
-		t.Fatalf("expected conversation header from prompt cache key, got %q", got)
-	}
-	if got := req.Header.Get("Session_id"); got != "prompt-cache-123" {
-		t.Fatalf("expected bridge session header from prompt cache key, got %q", got)
-	}
-	if got := req.Header.Get("X-Session-Id"); got != "execution-session-456" {
-		t.Fatalf("expected execution session id to be preserved in x-session-id, got %q", got)
-	}
-}
-
-func TestGetResponsesRequestWithSessionBackfillsXSessionIDForSessionIDOnlyClients(t *testing.T) {
-	key := `{"access_token":"access-token","account_id":"acct-123"}`
-	provider := newTestCodexProviderWithContext(t, key, "", map[string]string{
-		"session_id": "execution-session-456",
-	})
-
-	req, errWithCode := provider.getResponsesRequestWithSession(&types.OpenAIResponsesRequest{
-		Model:          "gpt-5",
-		PromptCacheKey: "prompt-cache-123",
-	}, "execution-session-456")
-	if errWithCode != nil {
-		t.Fatalf("expected request build to succeed, got %v", errWithCode)
-	}
-
-	if got := req.Header.Get("Conversation_id"); got != "prompt-cache-123" {
-		t.Fatalf("expected conversation header from prompt cache key, got %q", got)
-	}
-	if got := req.Header.Get("Session_id"); got != "prompt-cache-123" {
-		t.Fatalf("expected bridge session header from prompt cache key, got %q", got)
-	}
-	if got := req.Header.Get("X-Session-Id"); got != "execution-session-456" {
-		t.Fatalf("expected session_id-only clients to preserve execution session id in x-session-id, got %q", got)
-	}
-}
-
-func TestGetResponsesRequestUsesPromptCacheKeyForSessionWhenXSessionIDPresent(t *testing.T) {
-	key := `{"access_token":"access-token","account_id":"acct-123"}`
-	provider := newTestCodexProviderWithContext(t, key, "", map[string]string{
-		"X-Session-Id": "execution-session-456",
-	})
-
-	req, errWithCode := provider.getResponsesRequest(&types.OpenAIResponsesRequest{
-		Model:          "gpt-5",
-		PromptCacheKey: "prompt-cache-123",
-	})
-	if errWithCode != nil {
-		t.Fatalf("expected request build to succeed, got %v", errWithCode)
-	}
-
-	if got := req.Header.Get("Conversation_id"); got != "prompt-cache-123" {
-		t.Fatalf("expected conversation header from prompt cache key, got %q", got)
-	}
-	if got := req.Header.Get("Session_id"); got != "prompt-cache-123" {
-		t.Fatalf("expected session header from prompt cache key even when x-session-id is present, got %q", got)
-	}
-	if got := req.Header.Get("X-Session-Id"); got != "execution-session-456" {
-		t.Fatalf("expected execution session id to remain in x-session-id, got %q", got)
-	}
-}
-
-func TestGetResponsesRequestBackfillsXSessionIDForSessionIDOnlyClientsWhenPromptCacheKeyOverridesSession(t *testing.T) {
-	key := `{"access_token":"access-token","account_id":"acct-123"}`
-	provider := newTestCodexProviderWithContext(t, key, "", map[string]string{
-		"session_id": "execution-session-456",
-	})
-
-	req, errWithCode := provider.getResponsesRequest(&types.OpenAIResponsesRequest{
-		Model:          "gpt-5",
-		PromptCacheKey: "prompt-cache-123",
-	})
-	if errWithCode != nil {
-		t.Fatalf("expected request build to succeed, got %v", errWithCode)
-	}
-
-	if got := req.Header.Get("Conversation_id"); got != "prompt-cache-123" {
-		t.Fatalf("expected conversation header from prompt cache key, got %q", got)
-	}
-	if got := req.Header.Get("Session_id"); got != "prompt-cache-123" {
-		t.Fatalf("expected session header from prompt cache key, got %q", got)
-	}
-	if got := req.Header.Get("X-Session-Id"); got != "execution-session-456" {
-		t.Fatalf("expected session_id-only clients to preserve execution session id in x-session-id, got %q", got)
-	}
 }
 
 func TestBuildExecutionSessionMetadataPrefersXSessionIDOverConversationSessionID(t *testing.T) {
@@ -568,217 +305,6 @@ func TestBuildExecutionSessionMetadataRejectsOverlongSessionID(t *testing.T) {
 	}
 }
 
-func TestPrepareCodexRequestDefaultsToOffForPromptCacheKeyGeneration(t *testing.T) {
-	key := `{"access_token":"access-token","account_id":"acct-123"}`
-	provider := newTestCodexProviderWithContext(t, key, "", nil)
-	provider.Context.Set("token_id", 12345)
-
-	request := &types.OpenAIResponsesRequest{Model: "gpt-5"}
-	provider.prepareCodexRequest(request)
-
-	if request.PromptCacheKey != "" {
-		t.Fatalf("expected prompt cache key generation to default off, got %q", request.PromptCacheKey)
-	}
-}
-
-func TestPrepareCodexRequestGeneratesStablePromptCacheKeyFromTokenIDWhenAutoEnabled(t *testing.T) {
-	key := `{"access_token":"access-token","account_id":"acct-123"}`
-	provider := newTestCodexProviderWithContext(t, key, `{"prompt_cache_key_strategy":"auto"}`, nil)
-	provider.Context.Set("token_id", 12345)
-
-	requestA := &types.OpenAIResponsesRequest{Model: "gpt-5"}
-	requestB := &types.OpenAIResponsesRequest{Model: "gpt-5"}
-
-	provider.prepareCodexRequest(requestA)
-	provider.prepareCodexRequest(requestB)
-
-	expected := uuid.NewSHA1(uuid.NameSpaceOID, []byte("one-hub:codex:prompt-cache:token:"+strconv.Itoa(12345))).String()
-	if requestA.PromptCacheKey != expected {
-		t.Fatalf("expected prompt cache key %q, got %q", expected, requestA.PromptCacheKey)
-	}
-	if requestB.PromptCacheKey != expected {
-		t.Fatalf("expected stable prompt cache key %q on repeat call, got %q", expected, requestB.PromptCacheKey)
-	}
-}
-
-func TestPrepareCodexRequestAutoUsesPreviousResponseIDAsPromptCacheKey(t *testing.T) {
-	key := `{"access_token":"access-token","account_id":"acct-123"}`
-	provider := newTestCodexProviderWithContext(t, key, `{"prompt_cache_key_strategy":"auto"}`, map[string]string{
-		"X-Session-Id": "client-session-123",
-	})
-	provider.Context.Set("token_id", 12345)
-	provider.Context.Set("id", 678)
-
-	request := &types.OpenAIResponsesRequest{
-		Model:              "gpt-5",
-		PreviousResponseID: "resp_previous_123",
-	}
-
-	provider.prepareCodexRequest(request)
-
-	if request.PromptCacheKey != "resp_previous_123" {
-		t.Fatalf("expected auto strategy to use previous_response_id directly, got %q", request.PromptCacheKey)
-	}
-}
-
-func TestPrepareCodexRequestGeneratesStablePromptCacheKeyFromSessionIDWhenStrategyEnabled(t *testing.T) {
-	key := `{"access_token":"access-token","account_id":"acct-123"}`
-	provider := newTestCodexProviderWithContext(t, key, `{"prompt_cache_key_strategy":"session_id"}`, map[string]string{
-		"X-Session-Id": "client-session-123",
-	})
-	provider.Context.Set("token_id", 12345)
-	provider.Context.Set("id", 678)
-
-	request := &types.OpenAIResponsesRequest{Model: "gpt-5"}
-	provider.prepareCodexRequest(request)
-
-	expected := uuid.NewSHA1(uuid.NameSpaceOID, []byte("one-hub:codex:prompt-cache:session:client-session-123")).String()
-	if request.PromptCacheKey != expected {
-		t.Fatalf("expected session-scoped prompt cache key %q, got %q", expected, request.PromptCacheKey)
-	}
-}
-
-func TestPrepareCodexRequestGeneratesStablePromptCacheKeyFromNativeSessionID(t *testing.T) {
-	key := `{"access_token":"access-token","account_id":"acct-123"}`
-	provider := newTestCodexProviderWithContext(t, key, `{"prompt_cache_key_strategy":"session_id"}`, map[string]string{
-		"Session-Id": "native-session-123",
-		"session_id": "legacy-session-456",
-	})
-
-	request := &types.OpenAIResponsesRequest{Model: "gpt-5"}
-	provider.prepareCodexRequest(request)
-
-	expected := uuid.NewSHA1(uuid.NameSpaceOID, []byte("one-hub:codex:prompt-cache:session:native-session-123")).String()
-	if request.PromptCacheKey != expected {
-		t.Fatalf("expected native session-id prompt cache key %q, got %q", expected, request.PromptCacheKey)
-	}
-}
-
-func TestPrepareCodexRequestPreservesExplicitPromptCacheKey(t *testing.T) {
-	key := `{"access_token":"access-token","account_id":"acct-123"}`
-	provider := newTestCodexProviderWithContext(t, key, "", nil)
-	provider.Context.Set("token_id", 12345)
-
-	request := &types.OpenAIResponsesRequest{
-		Model:          "gpt-5",
-		PromptCacheKey: "user-provided-cache-key",
-	}
-
-	provider.prepareCodexRequest(request)
-
-	if request.PromptCacheKey != "user-provided-cache-key" {
-		t.Fatalf("expected explicit prompt cache key to survive, got %q", request.PromptCacheKey)
-	}
-}
-
-func TestPrepareCodexRequestCanDisableStablePromptCacheKeyGeneration(t *testing.T) {
-	key := `{"access_token":"access-token","account_id":"acct-123"}`
-	provider := newTestCodexProviderWithContext(t, key, `{"prompt_cache_key_strategy":"off"}`, nil)
-	provider.Context.Set("token_id", 12345)
-
-	request := &types.OpenAIResponsesRequest{Model: "gpt-5"}
-	provider.prepareCodexRequest(request)
-
-	if request.PromptCacheKey != "" {
-		t.Fatalf("expected prompt cache key generation to be disabled, got %q", request.PromptCacheKey)
-	}
-}
-
-func TestPrepareCodexRequestCanForceUserScopedPromptCacheKey(t *testing.T) {
-	key := `{"access_token":"access-token","account_id":"acct-123"}`
-	provider := newTestCodexProviderWithContext(t, key, `{"prompt_cache_key_strategy":"user_id"}`, nil)
-	provider.Context.Set("token_id", 12345)
-	provider.Context.Set("id", 678)
-
-	request := &types.OpenAIResponsesRequest{Model: "gpt-5"}
-	provider.prepareCodexRequest(request)
-
-	expected := uuid.NewSHA1(uuid.NameSpaceOID, []byte("one-hub:codex:prompt-cache:user:678")).String()
-	if request.PromptCacheKey != expected {
-		t.Fatalf("expected user-scoped prompt cache key %q, got %q", expected, request.PromptCacheKey)
-	}
-}
-
-func TestPrepareCodexRequestCanForceAuthHeaderPromptCacheKey(t *testing.T) {
-	key := `{"access_token":"access-token","account_id":"acct-123"}`
-	provider := newTestCodexProviderWithContext(t, key, `{"prompt_cache_key_strategy":"auth_header"}`, map[string]string{
-		"Authorization": "Bearer sk-test-auth-header",
-	})
-	provider.Context.Set("token_id", 12345)
-
-	request := &types.OpenAIResponsesRequest{Model: "gpt-5"}
-	provider.prepareCodexRequest(request)
-
-	expected := uuid.NewSHA1(uuid.NameSpaceOID, []byte("one-hub:codex:prompt-cache:auth:test-auth-header")).String()
-	if request.PromptCacheKey != expected {
-		t.Fatalf("expected auth-scoped prompt cache key %q, got %q", expected, request.PromptCacheKey)
-	}
-}
-
-func TestPrepareCodexRequestAuthHeaderStrategyNormalizesWebsocketCredentialSelectors(t *testing.T) {
-	key := `{"access_token":"access-token","account_id":"acct-123"}`
-	provider := newTestCodexProviderWithContext(t, key, `{"prompt_cache_key_strategy":"auth_header"}`, map[string]string{
-		"Connection":             "Upgrade",
-		"Upgrade":                "websocket",
-		"Sec-WebSocket-Protocol": "realtime, openai-insecure-api-key.sk-test-auth-header#42#ignore",
-	})
-
-	request := &types.OpenAIResponsesRequest{Model: "gpt-5"}
-	provider.prepareCodexRequest(request)
-
-	expected := uuid.NewSHA1(uuid.NameSpaceOID, []byte("one-hub:codex:prompt-cache:auth:test-auth-header")).String()
-	if request.PromptCacheKey != expected {
-		t.Fatalf("expected websocket auth to normalize to %q, got %q", expected, request.PromptCacheKey)
-	}
-}
-
-func TestGetResponsesRequestGeneratesStablePromptCacheHeadersFromTokenID(t *testing.T) {
-	key := `{"access_token":"access-token","account_id":"acct-123"}`
-	provider := newTestCodexProviderWithContext(t, key, `{"prompt_cache_key_strategy":"auto"}`, nil)
-	provider.Context.Set("token_id", 99)
-
-	req, errWithCode := provider.getResponsesRequest(&types.OpenAIResponsesRequest{
-		Model: "gpt-5",
-	})
-	if errWithCode != nil {
-		t.Fatalf("expected request build to succeed, got %v", errWithCode)
-	}
-
-	expected := uuid.NewSHA1(uuid.NameSpaceOID, []byte("one-hub:codex:prompt-cache:token:99")).String()
-	if got := req.Header.Get("Conversation_id"); got != expected {
-		t.Fatalf("expected generated conversation header %q, got %q", expected, got)
-	}
-	if got := req.Header.Get("Session_id"); got != expected {
-		t.Fatalf("expected generated session header %q, got %q", expected, got)
-	}
-}
-
-func TestGetResponsesRequestAutoPromptCachePreservesSessionIDOnlyExecutionSession(t *testing.T) {
-	key := `{"access_token":"access-token","account_id":"acct-123"}`
-	provider := newTestCodexProviderWithContext(t, key, `{"prompt_cache_key_strategy":"auto"}`, map[string]string{
-		"session_id": "execution-session-456",
-	})
-	provider.Context.Set("token_id", 99)
-
-	req, errWithCode := provider.getResponsesRequest(&types.OpenAIResponsesRequest{
-		Model: "gpt-5",
-	})
-	if errWithCode != nil {
-		t.Fatalf("expected request build to succeed, got %v", errWithCode)
-	}
-
-	expected := uuid.NewSHA1(uuid.NameSpaceOID, []byte("one-hub:codex:prompt-cache:session:execution-session-456")).String()
-	if got := req.Header.Get("Conversation_id"); got != expected {
-		t.Fatalf("expected generated conversation header %q, got %q", expected, got)
-	}
-	if got := req.Header.Get("Session_id"); got != expected {
-		t.Fatalf("expected generated session header %q, got %q", expected, got)
-	}
-	if got := req.Header.Get("X-Session-Id"); got != "execution-session-456" {
-		t.Fatalf("expected session_id-only execution session to be preserved in x-session-id, got %q", got)
-	}
-}
-
 func TestGetTokenFallsBackToStillValidAccessTokenWhenRefreshFails(t *testing.T) {
 	cache.InitCacheManager()
 	logger.SetupLogger()
@@ -881,6 +407,80 @@ func TestGetTokenFallsBackToStillValidCachedTokenWhenRefreshFails(t *testing.T) 
 	}
 }
 
+func TestGetTokenCacheHitAdoptsAccessTokenAndAccountID(t *testing.T) {
+	cache.InitCacheManager()
+
+	channelID := 424252
+	cacheKey := tokenCacheKey(channelID)
+	_ = cache.DeleteCache(cacheKey)
+	defer cache.DeleteCache(cacheKey)
+
+	primeCachedCredentialSnapshot(t, channelID, "fresh-access-token", "acct-fresh", time.Now().Add(30*time.Minute), time.Minute)
+
+	provider := &CodexProvider{
+		OpenAIProvider: openai.OpenAIProvider{
+			BaseProvider: base.BaseProvider{
+				Channel: &model.Channel{Id: channelID},
+			},
+		},
+		Credentials: &OAuth2Credentials{
+			AccessToken:  "stale-access-token",
+			AccountID:    "acct-stale",
+			RefreshToken: "refresh-token",
+			ExpiresAt:    time.Now().Add(-time.Minute),
+		},
+	}
+
+	token, err := provider.GetToken()
+	if err != nil {
+		t.Fatalf("expected cache hit to avoid refresh, got error: %v", err)
+	}
+	if token != "fresh-access-token" {
+		t.Fatalf("expected cached access token, got %q", token)
+	}
+	if provider.Credentials.AccessToken != "fresh-access-token" || provider.Credentials.AccountID != "acct-fresh" {
+		t.Fatalf("expected cached credential snapshot adoption, got token=%q account=%q", provider.Credentials.AccessToken, provider.Credentials.AccountID)
+	}
+}
+
+func TestGetTokenLegacyStringCacheClearsStaleAccountIDWhenTokenHasNoAccountID(t *testing.T) {
+	cache.InitCacheManager()
+
+	channelID := 424253
+	cacheKey := tokenCacheKey(channelID)
+	_ = cache.DeleteCache(cacheKey)
+	defer cache.DeleteCache(cacheKey)
+
+	if err := cache.SetCache(cacheKey, "legacy-opaque-token", time.Minute); err != nil {
+		t.Fatalf("failed to prime legacy string cache: %v", err)
+	}
+
+	provider := &CodexProvider{
+		OpenAIProvider: openai.OpenAIProvider{
+			BaseProvider: base.BaseProvider{
+				Channel: &model.Channel{Id: channelID},
+			},
+		},
+		Credentials: &OAuth2Credentials{
+			AccessToken:  "local-access-token",
+			AccountID:    "acct-stale",
+			RefreshToken: "refresh-token",
+			ExpiresAt:    time.Now().Add(30 * time.Minute),
+		},
+	}
+
+	token, err := provider.GetToken()
+	if err != nil {
+		t.Fatalf("expected legacy cache hit to avoid refresh, got error: %v", err)
+	}
+	if token != "legacy-opaque-token" {
+		t.Fatalf("expected legacy cached token, got %q", token)
+	}
+	if provider.Credentials.AccountID != "" {
+		t.Fatalf("expected stale account id to be cleared when legacy token has no account id, got %q", provider.Credentials.AccountID)
+	}
+}
+
 func TestGetTokenStillFailsWhenTokenAlreadyExpired(t *testing.T) {
 	logger.SetupLogger()
 
@@ -919,7 +519,7 @@ func TestRefreshTokenIfNeededUsesCachedTokenWhenOutsideLead(t *testing.T) {
 	defer cache.DeleteCache(cacheKey)
 
 	expiresAt := time.Now().Add(30 * time.Minute)
-	primeCachedToken(t, channelID, "fresh-access-token", expiresAt, time.Minute)
+	primeCachedCredentialSnapshot(t, channelID, "fresh-access-token", "acct-fresh", expiresAt, time.Minute)
 
 	provider := &CodexProvider{
 		OpenAIProvider: openai.OpenAIProvider{
@@ -929,6 +529,7 @@ func TestRefreshTokenIfNeededUsesCachedTokenWhenOutsideLead(t *testing.T) {
 		},
 		Credentials: &OAuth2Credentials{
 			AccessToken:  "stale-access-token",
+			AccountID:    "acct-stale",
 			RefreshToken: "stale-refresh-token",
 			ExpiresAt:    time.Now().Add(-time.Minute),
 		},
@@ -946,6 +547,9 @@ func TestRefreshTokenIfNeededUsesCachedTokenWhenOutsideLead(t *testing.T) {
 	}
 	if provider.Credentials.AccessToken != "fresh-access-token" {
 		t.Fatalf("expected access token to be updated from cache, got %q", provider.Credentials.AccessToken)
+	}
+	if provider.Credentials.AccountID != "acct-fresh" {
+		t.Fatalf("expected account id to be updated from cache, got %q", provider.Credentials.AccountID)
 	}
 }
 
@@ -1328,7 +932,7 @@ func TestRefreshNoLongerNeededUsesCachedToken(t *testing.T) {
 	_ = cache.DeleteCache(cacheKey)
 	defer cache.DeleteCache(cacheKey)
 
-	primeCachedToken(t, channelID, "shared-access-token", time.Now().Add(30*time.Minute), time.Minute)
+	primeCachedCredentialSnapshot(t, channelID, "shared-access-token", "acct-shared", time.Now().Add(30*time.Minute), time.Minute)
 
 	provider := &CodexProvider{
 		OpenAIProvider: openai.OpenAIProvider{
@@ -1338,6 +942,7 @@ func TestRefreshNoLongerNeededUsesCachedToken(t *testing.T) {
 		},
 		Credentials: &OAuth2Credentials{
 			AccessToken:  "stale-access-token",
+			AccountID:    "acct-stale",
 			RefreshToken: "refresh-token",
 			ExpiresAt:    time.Now().Add(-time.Minute),
 		},
@@ -1348,6 +953,9 @@ func TestRefreshNoLongerNeededUsesCachedToken(t *testing.T) {
 	}
 	if provider.Credentials.AccessToken != "shared-access-token" {
 		t.Fatalf("expected access token to be updated from cache, got %q", provider.Credentials.AccessToken)
+	}
+	if provider.Credentials.AccountID != "acct-shared" {
+		t.Fatalf("expected account id to be updated from cache, got %q", provider.Credentials.AccountID)
 	}
 }
 
@@ -1666,8 +1274,8 @@ func TestForceRefreshTokenTreatsChangedDatabaseTokenAsPeerHandled(t *testing.T) 
 	if provider.Credentials.AccessToken != "peer-refreshed-access-token" {
 		t.Fatalf("expected provider credentials to adopt the peer-refreshed token, got %q", provider.Credentials.AccessToken)
 	}
-	if cachedToken := provider.getCachedToken(0); cachedToken != "peer-refreshed-access-token" {
-		t.Fatalf("expected handled-by-peer path to recache the refreshed token, got %q", cachedToken)
+	if cachedCredentials := provider.getCachedCredentialSnapshot(0); cachedCredentials.AccessToken != "peer-refreshed-access-token" {
+		t.Fatalf("expected handled-by-peer path to recache the refreshed token, got %q", cachedCredentials.AccessToken)
 	}
 	if loadCount < 2 {
 		t.Fatalf("expected forced refresh coordination to reload credentials before and during peer detection, got %d loads", loadCount)
@@ -1741,8 +1349,8 @@ func TestForceRefreshTokenTreatsReloadedCredentialsAsPeerHandledWithoutRedis(t *
 	if provider.Credentials.AccessToken != "peer-refreshed-access-token" {
 		t.Fatalf("expected provider credentials to reload the peer-refreshed token, got %q", provider.Credentials.AccessToken)
 	}
-	if cachedToken := provider.getCachedToken(0); cachedToken != "peer-refreshed-access-token" {
-		t.Fatalf("expected reloaded credentials to be recached, got %q", cachedToken)
+	if cachedCredentials := provider.getCachedCredentialSnapshot(0); cachedCredentials.AccessToken != "peer-refreshed-access-token" {
+		t.Fatalf("expected reloaded credentials to be recached, got %q", cachedCredentials.AccessToken)
 	}
 	if loadCount != 1 {
 		t.Fatalf("expected only the initial reload to be needed without redis coordination, got %d loads", loadCount)
@@ -1818,8 +1426,8 @@ func TestForceRefreshTokenTreatsChangedRefreshStateAsPeerHandled(t *testing.T) {
 	if !provider.Credentials.ExpiresAt.Equal(latestCreds.ExpiresAt) {
 		t.Fatalf("expected provider expiry to reload from storage, got %s want %s", provider.Credentials.ExpiresAt, latestCreds.ExpiresAt)
 	}
-	if cachedToken := provider.getCachedToken(0); cachedToken != accessToken {
-		t.Fatalf("expected unchanged access token to be recached after peer handling, got %q", cachedToken)
+	if cachedCredentials := provider.getCachedCredentialSnapshot(0); cachedCredentials.AccessToken != accessToken {
+		t.Fatalf("expected unchanged access token to be recached after peer handling, got %q", cachedCredentials.AccessToken)
 	}
 }
 

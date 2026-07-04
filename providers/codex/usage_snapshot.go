@@ -137,12 +137,13 @@ type codexResetCreditConsumeResponse struct {
 }
 
 func (p *CodexProvider) GetUsagePreview(ctx context.Context, forceRefresh bool) (*CodexUsagePreview, error) {
-	if p == nil || p.Channel == nil {
+	channel := p.codexChannel()
+	if channel == nil {
 		return nil, fmt.Errorf("provider not configured")
 	}
 
 	if !forceRefresh {
-		if cachedPreview, err := getCachedUsagePreview(p.Channel.Id); err == nil {
+		if cachedPreview, err := getCachedUsagePreview(channel.Id); err == nil {
 			return &cachedPreview, nil
 		}
 	}
@@ -160,13 +161,14 @@ func (p *CodexProvider) GetUsagePreview(ctx context.Context, forceRefresh bool) 
 }
 
 func (p *CodexProvider) GetUsageSnapshot(ctx context.Context, forceRefresh bool, includeRaw ...bool) (*CodexUsageSnapshot, error) {
-	if p == nil || p.Channel == nil {
+	channel := p.codexChannel()
+	if channel == nil {
 		return nil, fmt.Errorf("provider not configured")
 	}
 
 	rawRequested := len(includeRaw) > 0 && includeRaw[0]
 	if !forceRefresh && !rawRequested {
-		if cachedSnapshot, err := getCachedUsageSnapshot(p.Channel.Id); err == nil {
+		if cachedSnapshot, err := getCachedUsageSnapshot(channel.Id); err == nil {
 			return cloneCodexUsageSnapshot(&cachedSnapshot, false), nil
 		}
 	}
@@ -220,7 +222,7 @@ func cloneCodexUsageSnapshot(snapshot *CodexUsageSnapshot, includeRaw bool) *Cod
 }
 
 func (p *CodexProvider) ConsumeResetCredit(ctx context.Context) (*CodexResetResult, error) {
-	if p == nil || p.Channel == nil {
+	if p == nil || p.codexChannel() == nil {
 		return nil, fmt.Errorf("provider not configured")
 	}
 
@@ -248,21 +250,27 @@ func (p *CodexProvider) ConsumeResetCredit(ctx context.Context) (*CodexResetResu
 }
 
 func (p *CodexProvider) consumeResetCreditOnce(ctx context.Context) (*CodexResetResult, error) {
+	channel := p.codexChannel()
+	if channel == nil {
+		return nil, fmt.Errorf("provider not configured")
+	}
 	headers, err := p.getUsageRequestHeaders()
 	if err != nil {
 		return nil, err
 	}
 
-	if p.Requester != nil {
-		p.Requester.Context = ensureContext(ctx)
+	httpRequester := p.codexRequester()
+	if httpRequester == nil {
+		return nil, fmt.Errorf("requester is not configured")
 	}
 
 	requestURL := p.GetFullRequestURL("/backend-api/wham/rate-limit-reset-credits/consume", "")
-	req, err := p.Requester.NewRequest(
+	req, err := httpRequester.NewRequest(
 		http.MethodPost,
 		requestURL,
-		p.Requester.WithHeader(headers),
-		p.Requester.WithBody(codexResetCreditConsumeRequest{RedeemRequestID: uuid.NewString()}),
+		httpRequester.WithHeader(headers),
+		httpRequester.WithBody(codexResetCreditConsumeRequest{RedeemRequestID: uuid.NewString()}),
+		httpRequester.WithContext(ensureContext(ctx)),
 	)
 	if err != nil {
 		return nil, err
@@ -279,7 +287,7 @@ func (p *CodexProvider) consumeResetCreditOnce(ctx context.Context) (*CodexReset
 		return nil, err
 	}
 
-	result, normalizeErr := normalizeResetCreditResult(p.Channel.Id, resp.StatusCode, bodyBytes)
+	result, normalizeErr := normalizeResetCreditResult(channel.Id, resp.StatusCode, bodyBytes)
 	if normalizeErr != nil {
 		return result, normalizeErr
 	}
@@ -306,7 +314,7 @@ func cacheSuccessfulUsageSnapshot(snapshot *CodexUsageSnapshot) {
 }
 
 func (p *CodexProvider) fetchUsageSnapshot(ctx context.Context) (*CodexUsageSnapshot, error) {
-	if p == nil || p.Channel == nil {
+	if p == nil || p.codexChannel() == nil {
 		return nil, fmt.Errorf("provider not configured")
 	}
 
@@ -338,17 +346,22 @@ func (p *CodexProvider) fetchUsageSnapshot(ctx context.Context) (*CodexUsageSnap
 }
 
 func (p *CodexProvider) fetchUsageSnapshotOnce(ctx context.Context) (*CodexUsageSnapshot, error) {
+	channel := p.codexChannel()
+	if channel == nil {
+		return nil, fmt.Errorf("provider not configured")
+	}
 	headers, err := p.getUsageRequestHeaders()
 	if err != nil {
 		return nil, err
 	}
 
-	if p.Requester != nil {
-		p.Requester.Context = ensureContext(ctx)
+	httpRequester := p.codexRequester()
+	if httpRequester == nil {
+		return nil, fmt.Errorf("requester is not configured")
 	}
 
 	requestURL := p.GetFullRequestURL("/backend-api/wham/usage", "")
-	req, err := p.Requester.NewRequest(http.MethodGet, requestURL, p.Requester.WithHeader(headers))
+	req, err := httpRequester.NewRequest(http.MethodGet, requestURL, httpRequester.WithHeader(headers), httpRequester.WithContext(ensureContext(ctx)))
 	if err != nil {
 		return nil, err
 	}
@@ -364,7 +377,7 @@ func (p *CodexProvider) fetchUsageSnapshotOnce(ctx context.Context) (*CodexUsage
 		return nil, err
 	}
 
-	snapshot, normalizeErr := normalizeUsageSnapshot(p.Channel.Id, p.Credentials, resp.StatusCode, bodyBytes)
+	snapshot, normalizeErr := normalizeUsageSnapshot(channel.Id, p.Credentials, resp.StatusCode, bodyBytes)
 	if normalizeErr != nil {
 		return snapshot, normalizeErr
 	}

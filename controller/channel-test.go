@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,8 @@ import (
 	"one-api/common/config"
 	"one-api/common/logger"
 	"one-api/common/notify"
+	"one-api/common/requestctx"
+	commonresponses "one-api/common/responses"
 	"one-api/common/utils"
 	"one-api/model"
 	"one-api/providers"
@@ -147,8 +150,27 @@ func testChannel(channel *model.Channel, testModel string) (openaiErr *types.Ope
 			Model:  newModelName,
 			Stream: false,
 		}
-
-		response, openAIErrorWithStatusCode = responseProvider.CreateResponses(testRequest)
+		raw, marshalErr := json.Marshal(testRequest)
+		if marshalErr != nil {
+			return nil, marshalErr
+		}
+		envelope, parseErr := commonresponses.ParseRawEnvelope(raw)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		response, openAIErrorWithStatusCode = responseProvider.CreateResponses(context.Background(), &commonresponses.Request{
+			Operation: commonresponses.ResponsesCreate,
+			Headers:   requestctx.NewHeaderSnapshot(req.Header),
+			Body:      envelope,
+			Control: commonresponses.Control{
+				DownstreamDialect: commonresponses.DownstreamResponses,
+				Stream:            false,
+			},
+			Policy:    commonresponses.PolicyInput{},
+			Principal: requestctx.PrincipalFromGin(c),
+			ChannelID: channel.Id,
+			Model:     newModelName,
+		})
 	case "chat":
 		chatProvider, ok := provider.(providers_base.ChatInterface)
 		if !ok {

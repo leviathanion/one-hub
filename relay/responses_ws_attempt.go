@@ -80,7 +80,7 @@ type SelectedChannelSnapshot struct {
 	Channel              *model.Channel
 }
 
-var openAndPrimeResponsesWSSessionForActor = openAndPrimeResponsesWSSessionWithContext
+var openAndPrimeResponsesWSSessionForActor = openAndPrimeResponsesWSSessionWithContextAndFrame
 
 type ResponsesWSTurnAttempt struct {
 	OpeningID                   string

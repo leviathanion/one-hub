@@ -1723,7 +1723,7 @@ func TestChannelOverwriteUpdateAllowsExplicitNullOptionalBaseURL(t *testing.T) {
 func TestChannelOverwriteUpdatePreservesOptionalRuntimeOtherWhenOmitted(t *testing.T) {
 	useTestChannelDB(t)
 
-	const originalOther = `{"responses_ws_transport":"http_bridge","prompt_cache_key_strategy":"session_id"}`
+	const originalOther = `{"responses_ws_transport":"native","prompt_cache_key_strategy":"session_id"}`
 	insertTestChannel(t, &Channel{
 		Id:     1,
 		Type:   config.ChannelTypeCodex,

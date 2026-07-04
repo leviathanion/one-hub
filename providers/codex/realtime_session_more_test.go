@@ -18,6 +18,7 @@ import (
 	"one-api/common/authutil"
 	"one-api/common/config"
 	"one-api/common/logger"
+	"one-api/common/requestctx"
 	"one-api/common/requester"
 	"one-api/common/responsesws"
 	"one-api/common/wsconn"
@@ -28,7 +29,54 @@ import (
 
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
+
+func openCodexResponsesWSTestSession(provider *CodexProvider, ctx context.Context, model string, req responsesws.OpenRequest) (responsesws.Upstream, *types.OpenAIErrorWithStatusCode) {
+	frame, err := responsesws.ParseRawResponsesCreateFrame([]byte(`{"type":"response.create","model":"` + model + `","input":"hello"}`))
+	if err != nil {
+		panic(err)
+	}
+	headers := requestctx.HeaderSnapshot{}
+	principal := requestctx.Principal{}
+	if provider != nil && provider.Context != nil {
+		if provider.Context.Request != nil {
+			headers = requestctx.NewHeaderSnapshot(provider.Context.Request.Header)
+		}
+		principal = requestctx.PrincipalFromGin(provider.Context)
+	}
+	req.InboundHeaders = headers
+	req.FirstFrame = frame
+	req.Principal = principal
+	req.SelectedModel = model
+	return provider.OpenResponsesWS(ctx, &req)
+}
+
+func TestLogCodexRealtimeInternalErrorRedactsAndIncludesCaller(t *testing.T) {
+	core, observedLogs := observer.New(zapcore.ErrorLevel)
+	originalLogger := logger.Logger
+	logger.Logger = zap.New(core)
+	t.Cleanup(func() {
+		logger.Logger = originalLogger
+	})
+
+	logCodexRealtimeInternalError("codex realtime failed Authorization: Bearer abcdefghij.klmnopqrst.uvwxyzabcd upstream-url https://provider.example/v1?token=secret")
+
+	logs := observedLogs.All()
+	if len(logs) != 1 {
+		t.Fatalf("expected one log entry, got %d", len(logs))
+	}
+	message := logs[0].Message
+	for _, forbidden := range []string{"abcdefghij.klmnopqrst.uvwxyzabcd", "provider.example", "token=secret"} {
+		if strings.Contains(message, forbidden) {
+			t.Fatalf("expected sensitive value %q to be redacted, got %q", forbidden, message)
+		}
+	}
+	if !strings.Contains(message, "caller=realtime_session_more_test.go:") {
+		t.Fatalf("expected caller metadata, got %q", message)
+	}
+}
 
 func codexRealtimeTestWriteTimeout() func() time.Duration {
 	timeout := config.RealtimeWebsocketWriteTimeout()
@@ -154,7 +202,7 @@ func TestCodexResponsesWSOpenBypassesExecutionSessionManager(t *testing.T) {
 	provider.Channel.BaseURL = stringPtr(server.URL)
 
 	before := ExecutionSessionStats()
-	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{UpstreamSessionID: "responses-ws-local-test"})
+	session, errWithCode := openCodexResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{UpstreamSessionID: "responses-ws-local-test"})
 	if errWithCode != nil {
 		t.Fatalf("expected ResponsesWS session to open, got %v", errWithCode)
 	}
@@ -171,351 +219,36 @@ func TestCodexResponsesWSOpenBypassesExecutionSessionManager(t *testing.T) {
 	waitForCodexRealtimeConnectionCount(t, &connections, 1)
 }
 
-func TestCodexResponsesWSHTTPBridgeBypassesWebsocketModeOff(t *testing.T) {
+func TestCodexResponsesWSHTTPBridgeTransportIsRejected(t *testing.T) {
 	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, nil)
 	before := ExecutionSessionStats()
-	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
-		Transport: runtimesession.TransportModeResponsesHTTPBridge,
-	})
-	if errWithCode != nil {
-		t.Fatalf("expected explicit http_bridge to bypass native websocket_mode=off, got %v", errWithCode)
-	}
-	if _, ok := session.(*responsesws.BridgeSession); !ok {
-		t.Fatalf("expected common bridge ResponsesWS upstream, got %T", session)
-	}
-	session.Abort("test_cleanup")
-	after := ExecutionSessionStats()
-	if after.LocalSessions != before.LocalSessions || after.LocalBindings != before.LocalBindings {
-		t.Fatalf("expected bridge open to bypass execution session manager, before=%+v after=%+v", before, after)
-	}
-}
-
-func TestCodexResponsesWSHTTPBridgeRequiresResponsesEndpoint(t *testing.T) {
-	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, nil)
-	provider.Config.Responses = ""
-
-	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
+	session, errWithCode := openCodexResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
 		Transport: runtimesession.TransportModeResponsesHTTPBridge,
 	})
 	if session != nil {
 		session.Abort("test_cleanup")
 	}
 	if errWithCode == nil || errWithCode.StatusCode != http.StatusUpgradeRequired || errWithCode.Code != "responses_ws_unsupported_for_channel" {
-		t.Fatalf("expected missing Responses endpoint to return responses_ws_unsupported_for_channel, session=%T err=%+v", session, errWithCode)
+		t.Fatalf("expected Codex Official http_bridge transport to be rejected, session=%T err=%+v", session, errWithCode)
+	}
+	after := ExecutionSessionStats()
+	if after.LocalSessions != before.LocalSessions || after.LocalBindings != before.LocalBindings {
+		t.Fatalf("expected rejected bridge open not to touch execution session manager, before=%+v after=%+v", before, after)
 	}
 }
 
-func TestCodexResponsesWSHTTPBridgeURLPolicyRejectsUnsafeDefaults(t *testing.T) {
-	t.Run("local http requires explicit responses self hosted", func(t *testing.T) {
-		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, nil)
-		provider.Context.Set("responses_ws_self_hosted", false)
-		provider.Channel.BaseURL = stringPtr("http://127.0.0.1:1")
-		session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
-			Transport: runtimesession.TransportModeResponsesHTTPBridge,
-		})
-		if errWithCode != nil {
-			t.Fatalf("expected bridge session to open lazily, got %v", errWithCode)
-		}
-		defer session.Abort("test_cleanup")
-
-		result := session.(responsesws.TransportSendCapable).SendClientWithResult(context.Background(), responsesws.SendRequest{AttemptID: "attempt-test", Frame: responsesws.NewTextFrame([]byte(`{"type":"response.create","model":"gpt-5","input":"hello"}`))})
-		if result.Status != responsesws.ResponsesWSTransportSendNotAttempted || !errors.Is(result.Err, requester.ErrUpstreamResponsesHTTPURLRequiresHTTPS) {
-			t.Fatalf("expected local http bridge send to be rejected before request, got %+v", result)
-		}
-	})
-
-	t.Run("metadata stays blocked even when responses self hosted", func(t *testing.T) {
-		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off","responses_ws_self_hosted":true}`, nil)
-		provider.Channel.BaseURL = stringPtr("http://169.254.169.254")
-		session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
-			Transport: runtimesession.TransportModeResponsesHTTPBridge,
-		})
-		if errWithCode != nil {
-			t.Fatalf("expected bridge session to open lazily, got %v", errWithCode)
-		}
-		defer session.Abort("test_cleanup")
-
-		result := session.(responsesws.TransportSendCapable).SendClientWithResult(context.Background(), responsesws.SendRequest{AttemptID: "attempt-test", Frame: responsesws.NewTextFrame([]byte(`{"type":"response.create","model":"gpt-5","input":"hello"}`))})
-		if result.Status != responsesws.ResponsesWSTransportSendNotAttempted || !errors.Is(result.Err, requester.ErrUpstreamResponsesHTTPURLHostBlocked) {
-			t.Fatalf("expected metadata bridge send to be rejected before request, got %+v", result)
-		}
-	})
-}
-
-func TestCodexResponsesWSHTTPBridgeURLPolicyPrecedesBridgeBodyValidation(t *testing.T) {
-	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, nil)
-	provider.Context.Set("responses_ws_self_hosted", false)
+func TestCodexResponsesWSHTTPBridgeDoesNotCreateBridgeSession(t *testing.T) {
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"force","responses_ws_self_hosted":true}`, nil)
 	provider.Channel.BaseURL = stringPtr("http://127.0.0.1:1")
-	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
-		Transport: runtimesession.TransportModeResponsesHTTPBridge,
-	})
-	if errWithCode != nil {
-		t.Fatalf("expected bridge session to open lazily, got %v", errWithCode)
-	}
-	defer session.Abort("test_cleanup")
-
-	result := session.(responsesws.TransportSendCapable).SendClientWithResult(context.Background(), responsesws.SendRequest{AttemptID: "attempt-test", Frame: responsesws.NewTextFrame([]byte(`{"type":"response.create","model":"gpt-5","input":"hello","background":true}`))})
-	if result.Status != responsesws.ResponsesWSTransportSendNotAttempted || !errors.Is(result.Err, requester.ErrUpstreamResponsesHTTPURLRequiresHTTPS) {
-		t.Fatalf("expected URL policy error before unsupported background validation, got %+v", result)
-	}
-	if strings.Contains(result.Err.Error(), "background") {
-		t.Fatalf("expected URL policy error to win over background validation, got %v", result.Err)
-	}
-}
-
-func TestCodexResponsesWSHTTPBridgeStreamsAndPreservesRawPayload(t *testing.T) {
-	originalHTTPClient := requester.HTTPClient
-	requester.HTTPClient = &http.Client{}
-	defer func() {
-		requester.HTTPClient = originalHTTPClient
-	}()
-
-	received := make(chan []byte, 1)
-	receivedHeaders := make(chan http.Header, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("read request body: %v", err)
-			return
-		}
-		receivedHeaders <- r.Header.Clone()
-		received <- body
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_codex_bridge\",\"status\":\"completed\",\"usage\":{\"input_tokens\":4,\"output_tokens\":5,\"total_tokens\":9}}}\n\n"))
-	}))
-	defer server.Close()
-
-	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, map[string]string{
-		"X-Session-Id":                          "client-session",
-		"Session_Id":                            "client-session-legacy",
-		"X-Codex-Turn-Metadata":                 "request-turn-metadata",
-		"X-Codex-Turn-State":                    "request-turn-state",
-		"X-Client-Request-Id":                   "request-id",
-		"X-Codex-Beta-Features":                 "beta-feature",
-		"X-Responsesapi-Include-Timing-Metrics": "true",
-	})
-	provider.Channel.ModelHeaders = stringPtr(`{"x-codex-turn-state":"channel-turn-state","x-codex-turn-metadata":"channel-turn-metadata"}`)
-	provider.Channel.BaseURL = stringPtr(server.URL)
-	provider.Usage = &types.Usage{}
-	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
-		Transport: runtimesession.TransportModeResponsesHTTPBridge,
-	})
-	if errWithCode != nil {
-		t.Fatalf("expected http bridge session to open, got %v", errWithCode)
-	}
-	defer session.Abort("test_cleanup")
-
-	result := session.(responsesws.TransportSendCapable).SendClientWithResult(context.Background(), responsesws.SendRequest{AttemptID: "attempt-test", Frame: responsesws.NewTextFrame([]byte(`{"type":"response.create","event_id":"evt_bridge","model":"gpt-5","input":"hi","stream":true,"background":false,"stream_options":{"include_usage":true},"temperature":0.7,"top_p":0.9,"unknown_number":12345678901234567890,"future_object":{"enabled":true}}`))})
-	if result.Status != responsesws.ResponsesWSTransportSendAttempted || result.Err != nil {
-		t.Fatalf("expected bridge create to be attempted, got %+v", result)
-	}
-
-	var body []byte
-	select {
-	case body = <-received:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for Codex bridge HTTP request")
-	}
-	select {
-	case headers := <-receivedHeaders:
-		if got := headers.Get("X-Session-Id"); got != "" {
-			t.Fatalf("expected Codex bridge not to forward x-session-id, got %q", got)
-		}
-		if got := headers.Get("Session_Id"); got != "" {
-			t.Fatalf("expected Codex bridge not to forward session_id, got %q", got)
-		}
-		if got := headers.Get("X-Codex-Turn-Metadata"); got != "" {
-			t.Fatalf("expected Codex bridge not to forward turn metadata, got %q", got)
-		}
-		if got := headers.Get("X-Codex-Turn-State"); got != "" {
-			t.Fatalf("expected Codex bridge not to forward turn state, got %q", got)
-		}
-		if got := headers.Get("X-Client-Request-Id"); got != "request-id" {
-			t.Fatalf("expected non-session request id passthrough, got %q", got)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for Codex bridge HTTP headers")
-	}
-	var decoded map[string]json.RawMessage
-	if err := json.Unmarshal(body, &decoded); err != nil {
-		t.Fatalf("decode bridge request body: %v body=%s", err, body)
-	}
-	if _, ok := decoded["type"]; ok {
-		t.Fatalf("expected websocket event type to be stripped from HTTP bridge body, body=%s", body)
-	}
-	if _, ok := decoded["event_id"]; ok {
-		t.Fatalf("expected websocket event_id to be stripped from HTTP bridge body, body=%s", body)
-	}
-	if _, ok := decoded["background"]; ok {
-		t.Fatalf("expected websocket background to be stripped from HTTP bridge body, body=%s", body)
-	}
-	if string(decoded["stream_options"]) != `{"include_usage":true}` {
-		t.Fatalf("expected stream_options to be preserved in HTTP bridge body, body=%s", body)
-	}
-	if string(decoded["unknown_number"]) != `12345678901234567890` {
-		t.Fatalf("expected unknown numeric field to be preserved, got %s body=%s", decoded["unknown_number"], body)
-	}
-	if string(decoded["future_object"]) != `{"enabled":true}` {
-		t.Fatalf("expected unknown object field to be preserved, got %s body=%s", decoded["future_object"], body)
-	}
-	if _, ok := decoded["previous_response_id"]; ok {
-		t.Fatalf("expected absent previous_response_id to stay absent without open continuation, body=%s", body)
-	}
-	if _, ok := decoded["top_p"]; ok {
-		t.Fatalf("expected top_p to be removed when temperature is set, body=%s", body)
-	}
-	if string(decoded["store"]) != `false` || string(decoded["stream"]) != `true` {
-		t.Fatalf("expected Codex bridge to force store=false and stream=true, body=%s", body)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	opened, err := session.Recv(ctx)
-	if err != nil {
-		t.Fatalf("recv bridge opened: %v", err)
-	}
-	if opened.DetailOrigin != responsesws.RecvDetailOriginBridgeStreamOpened {
-		t.Fatalf("expected bridge_stream_opened, got %+v", opened)
-	}
-	event, err := session.Recv(ctx)
-	if err != nil {
-		t.Fatalf("recv provider stream event: %v", err)
-	}
-	if event.Frame == nil || !strings.Contains(string(event.Frame.Payload()), "resp_codex_bridge") || event.DetailOrigin != responsesws.RecvDetailOriginProviderStream {
-		t.Fatalf("expected Codex provider_stream frame, got %+v", event)
-	}
-	if event.Usage == nil || event.Usage.TotalTokens != 9 {
-		t.Fatalf("expected Codex bridge usage event, got %+v", event.Usage)
-	}
-}
-
-func TestCodexResponsesWSHTTPBridgeUsesOpenPreviousResponseID(t *testing.T) {
-	originalHTTPClient := requester.HTTPClient
-	requester.HTTPClient = &http.Client{}
-	defer func() {
-		requester.HTTPClient = originalHTTPClient
-	}()
-
-	received := make(chan []byte, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("read request body: %v", err)
-			return
-		}
-		received <- body
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_codex_bridge_prev\",\"status\":\"completed\"}}\n\n"))
-	}))
-	defer server.Close()
-
-	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, nil)
-	provider.Channel.BaseURL = stringPtr(server.URL)
-	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
+	session, errWithCode := openCodexResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
 		Transport:          runtimesession.TransportModeResponsesHTTPBridge,
 		PreviousResponseID: "resp_open_default",
 	})
-	if errWithCode != nil {
-		t.Fatalf("expected http bridge session to open, got %v", errWithCode)
+	if session != nil {
+		session.Abort("test_cleanup")
 	}
-	defer session.Abort("test_cleanup")
-
-	result := session.(responsesws.TransportSendCapable).SendClientWithResult(context.Background(), responsesws.SendRequest{AttemptID: "attempt-test", Frame: responsesws.NewTextFrame([]byte(`{"type":"response.create","event_id":"evt_bridge_prev","model":"gpt-5","input":"hi"}`))})
-	if result.Status != responsesws.ResponsesWSTransportSendAttempted || result.Err != nil {
-		t.Fatalf("expected bridge create to be attempted, got %+v", result)
-	}
-
-	var body []byte
-	select {
-	case body = <-received:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for Codex bridge HTTP request")
-	}
-	var decoded map[string]json.RawMessage
-	if err := json.Unmarshal(body, &decoded); err != nil {
-		t.Fatalf("decode bridge request body: %v body=%s", err, body)
-	}
-	if string(decoded["previous_response_id"]) != `"resp_open_default"` {
-		t.Fatalf("expected bridge to use open previous_response_id, got %s body=%s", decoded["previous_response_id"], body)
-	}
-}
-
-func TestCodexResponsesWSHTTPBridgeDoesNotReuseOpenPreviousResponseID(t *testing.T) {
-	originalHTTPClient := requester.HTTPClient
-	requester.HTTPClient = &http.Client{}
-	defer func() {
-		requester.HTTPClient = originalHTTPClient
-	}()
-
-	received := make(chan []byte, 2)
-	var requests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("read request body: %v", err)
-			return
-		}
-		received <- body
-		id := "resp_codex_bridge_first"
-		if requests.Add(1) == 2 {
-			id = "resp_codex_bridge_second"
-		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"` + id + `","status":"completed"}}` + "\n\n"))
-	}))
-	defer server.Close()
-
-	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, nil)
-	provider.Channel.BaseURL = stringPtr(server.URL)
-	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
-		Transport:          runtimesession.TransportModeResponsesHTTPBridge,
-		PreviousResponseID: "resp_open_default",
-	})
-	if errWithCode != nil {
-		t.Fatalf("expected http bridge session to open, got %v", errWithCode)
-	}
-	defer session.Abort("test_cleanup")
-
-	result := session.(responsesws.TransportSendCapable).SendClientWithResult(context.Background(), responsesws.SendRequest{AttemptID: "attempt-test", Frame: responsesws.NewTextFrame([]byte(`{"type":"response.create","event_id":"evt_bridge_prev_first","model":"gpt-5","input":"first"}`))})
-	if result.Status != responsesws.ResponsesWSTransportSendAttempted || result.Err != nil {
-		t.Fatalf("expected first bridge create to be attempted, got %+v", result)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if _, err := session.Recv(ctx); err != nil {
-		t.Fatalf("recv first bridge opened: %v", err)
-	}
-	if _, err := session.Recv(ctx); err != nil {
-		t.Fatalf("recv first bridge terminal: %v", err)
-	}
-	var first map[string]json.RawMessage
-	select {
-	case body := <-received:
-		if err := json.Unmarshal(body, &first); err != nil {
-			t.Fatalf("decode first bridge request body: %v body=%s", err, body)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for first Codex bridge HTTP request")
-	}
-	if string(first["previous_response_id"]) != `"resp_open_default"` {
-		t.Fatalf("expected first bridge request to use open default, got %s", first["previous_response_id"])
-	}
-
-	result = session.(responsesws.TransportSendCapable).SendClientWithResult(context.Background(), responsesws.SendRequest{AttemptID: "attempt-test", Frame: responsesws.NewTextFrame([]byte(`{"type":"response.create","event_id":"evt_bridge_prev_second","model":"gpt-5","input":"second"}`))})
-	if result.Status != responsesws.ResponsesWSTransportSendAttempted || result.Err != nil {
-		t.Fatalf("expected second bridge create to be attempted, got %+v", result)
-	}
-	var second map[string]json.RawMessage
-	select {
-	case body := <-received:
-		if err := json.Unmarshal(body, &second); err != nil {
-			t.Fatalf("decode second bridge request body: %v body=%s", err, body)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for second Codex bridge HTTP request")
-	}
-	if _, ok := second["previous_response_id"]; ok {
-		t.Fatalf("expected second bridge request not to reuse open default, body=%s", second)
+	if errWithCode == nil || errWithCode.StatusCode != http.StatusUpgradeRequired || errWithCode.Code != "responses_ws_unsupported_for_channel" {
+		t.Fatalf("expected Codex Official to reject bridge before lazy stream creation, session=%T err=%+v", session, errWithCode)
 	}
 }
 
@@ -529,12 +262,12 @@ func TestCodexResponsesWSNativeUsesIndependentConnectionsForSameClientSession(t 
 	})
 	provider.Channel.BaseURL = stringPtr(server.URL)
 
-	sessionA, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{})
+	sessionA, errWithCode := openCodexResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{})
 	if errWithCode != nil {
 		t.Fatalf("open first ResponsesWS session: %v", errWithCode)
 	}
 	defer sessionA.Abort("test_cleanup")
-	sessionB, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{})
+	sessionB, errWithCode := openCodexResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{})
 	if errWithCode != nil {
 		t.Fatalf("open second ResponsesWS session: %v", errWithCode)
 	}
@@ -563,6 +296,116 @@ func waitForCodexRealtimeConnectionCount(t *testing.T, connections *atomic.Int32
 	}
 }
 
+func TestCodexResponsesWSNativeInjectsOpenPreviousResponseIDDefault(t *testing.T) {
+	received := make(chan []byte, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, ok := acceptCodexRealtimeTestConn(t, w, r)
+		if !ok {
+			return
+		}
+		defer conn.Close()
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			t.Errorf("read upstream response.create: %v", err)
+			return
+		}
+		received <- payload
+	}))
+	defer server.Close()
+
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"force"}`, nil)
+	provider.Channel.BaseURL = stringPtr(server.URL)
+
+	session, errWithCode := openCodexResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
+		UpstreamSessionID:  "responses-ws-previous-default-test",
+		PreviousResponseID: " resp_open_default ",
+	})
+	if errWithCode != nil {
+		t.Fatalf("open ResponsesWS session: %v", errWithCode)
+	}
+	defer session.Abort("test_cleanup")
+
+	result := session.SendClientWithResult(context.Background(), responsesws.SendRequest{
+		AttemptID: "attempt-previous-default",
+		Frame:     responsesws.NewTextFrame([]byte(`{"type":"response.create","model":"gpt-5","input":"hi"}`)),
+	})
+	if result.Status != responsesws.ResponsesWSTransportSendAttempted || result.Err != nil {
+		t.Fatalf("send response.create: %+v", result)
+	}
+
+	select {
+	case got := <-received:
+		var decoded map[string]json.RawMessage
+		if err := json.Unmarshal(got, &decoded); err != nil {
+			t.Fatalf("decode upstream payload: %v payload=%s", err, got)
+		}
+		if string(decoded["previous_response_id"]) != `"resp_open_default"` {
+			t.Fatalf("expected open previous_response_id default to be injected, got %s payload=%s", decoded["previous_response_id"], got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for upstream response.create")
+	}
+}
+
+func TestCodexResponsesWSNativeRejectsMismatchedSubsequentMetadataBeforeWrite(t *testing.T) {
+	received := make(chan []byte, 1)
+	done := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, ok := acceptCodexRealtimeTestConn(t, w, r)
+		if !ok {
+			return
+		}
+		go func() {
+			for {
+				_, payload, err := conn.ReadMessage()
+				if err != nil {
+					return
+				}
+				received <- payload
+			}
+		}()
+		<-done
+		conn.Close()
+	}))
+	defer func() {
+		close(done)
+		server.Close()
+	}()
+
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"force"}`, nil)
+	provider.Channel.BaseURL = stringPtr(server.URL)
+
+	session, errWithCode := openCodexResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
+		UpstreamSessionID: "responses-ws-metadata-mismatch-test",
+	})
+	if errWithCode != nil {
+		t.Fatalf("open ResponsesWS session: %v", errWithCode)
+	}
+	defer session.Abort("test_cleanup")
+
+	result := session.SendClientWithResult(context.Background(), responsesws.SendRequest{
+		AttemptID: "attempt-bad-metadata",
+		Frame: responsesws.NewTextFrame([]byte(`{
+			"type":"response.create",
+			"model":"gpt-5",
+			"input":"hi",
+			"client_metadata":{"session_id":"sess-frame-other"}
+		}`)),
+	})
+	if result.Status != responsesws.ResponsesWSTransportSendNotAttempted || result.Err == nil {
+		t.Fatalf("expected mismatched metadata to be rejected before upstream write, got %+v", result)
+	}
+	if !strings.Contains(result.Err.Error(), "client_metadata.session_id") {
+		t.Fatalf("expected client_metadata.session_id rejection, got %v", result.Err)
+	}
+
+	select {
+	case payload := <-received:
+		t.Fatalf("expected rejected frame not to reach upstream, got %s", payload)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 func TestCodexResponsesWSNativeRewritesNestedPayloadAndPreservesUnknownFields(t *testing.T) {
 	received := make(chan []byte, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -583,7 +426,7 @@ func TestCodexResponsesWSNativeRewritesNestedPayloadAndPreservesUnknownFields(t 
 	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"force"}`, nil)
 	provider.Channel.BaseURL = stringPtr(server.URL)
 
-	session, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{UpstreamSessionID: "responses-ws-rewrite-test"})
+	session, errWithCode := openCodexResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{UpstreamSessionID: "responses-ws-rewrite-test"})
 	if errWithCode != nil {
 		t.Fatalf("open ResponsesWS session: %v", errWithCode)
 	}
@@ -616,11 +459,11 @@ func TestCodexResponsesWSNativeRewritesNestedPayloadAndPreservesUnknownFields(t 
 		if string(decoded["future_object"]) != `{"enabled":true}` {
 			t.Fatalf("expected unknown object field to be preserved, got %s", decoded["future_object"])
 		}
-		if _, ok := decoded["top_p"]; ok {
-			t.Fatalf("expected top_p to be removed when temperature is set, got %s", decoded["top_p"])
+		if string(decoded["top_p"]) != `0.9` {
+			t.Fatalf("expected top_p to be preserved by raw WS planner, got %s", decoded["top_p"])
 		}
-		if string(decoded["store"]) != `false` {
-			t.Fatalf("expected Codex native adapter to force store=false, got %s", decoded["store"])
+		if _, ok := decoded["store"]; ok {
+			t.Fatalf("expected Codex native adapter not to inject store, got %s", decoded["store"])
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for upstream response.create")
@@ -1260,7 +1103,7 @@ func TestPrepareCodexRealtimeCreatePayloadPreservesUnknownResponseFields(t *test
 	if string(response["store"]) != `false` {
 		t.Fatalf("expected Codex adapter to force store=false, got %s", response["store"])
 	}
-	if !strings.Contains(string(response["include"]), codexReasoningEncryptedContentInclude) {
+	if !strings.Contains(string(response["include"]), codexRealtimeBridgeReasoningEncryptedContentInclude) {
 		t.Fatalf("expected Codex reasoning include to be present, got %s", response["include"])
 	}
 }
@@ -1835,7 +1678,7 @@ func TestCodexResponsesWSUnsupportedOpenDoesNotMutateRealtimeSession(t *testing.
 	}
 	managed.exec.Unlock()
 
-	failedUpstream, errWithCode := provider.OpenResponsesWS(context.Background(), "gpt-5", responsesws.OpenOptions{
+	failedUpstream, errWithCode := openCodexResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
 		UpstreamSessionID: "responses-ws-off-test",
 	})
 	if failedUpstream != nil {

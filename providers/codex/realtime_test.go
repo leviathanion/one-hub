@@ -1347,7 +1347,7 @@ func TestCodexManagedRealtimeWebsocketNormalizesCodexRequestBeforeDispatch(t *te
 	if !ok || len(includes) != 2 {
 		t.Fatalf("expected websocket request includes to normalize, got %#v", event["include"])
 	}
-	if includes[0] != "output_text.annotations" || includes[1] != codexReasoningEncryptedContentInclude {
+	if includes[0] != "output_text.annotations" || includes[1] != codexRealtimeBridgeReasoningEncryptedContentInclude {
 		t.Fatalf("unexpected websocket request includes %#v", includes)
 	}
 
@@ -2265,7 +2265,7 @@ func TestCloneCodexResponsesRequestDoesNotAliasMutableFields(t *testing.T) {
 	cloned.Tools[0].Type = "web_search"
 	cloned.Metadata["request_id"] = "req_2"
 	clonedInclude := cloned.Include.([]string)
-	clonedInclude[0] = codexReasoningEncryptedContentInclude
+	clonedInclude[0] = codexRealtimeBridgeReasoningEncryptedContentInclude
 	cloned.Include = clonedInclude
 	clonedToolChoice := cloned.ToolChoice.(map[string]any)
 	clonedToolChoice["type"] = "web_search"

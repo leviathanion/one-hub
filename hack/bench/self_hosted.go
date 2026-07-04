@@ -11,7 +11,9 @@ import (
 	"one-api/common"
 	cfgpkg "one-api/common/config"
 	"one-api/common/logger"
+	"one-api/common/requestctx"
 	"one-api/common/requester"
+	commonresponses "one-api/common/responses"
 	"one-api/model"
 	baseprovider "one-api/providers/base"
 	"one-api/providers/openai"
@@ -328,11 +330,17 @@ func handleBenchResponses(c *gin.Context, upstreamURL string, channel *model.Cha
 	c.Set(benchTransformModeKey, "native_responses")
 
 	parseStart := time.Now()
-	var request types.OpenAIResponsesRequest
-	if err := common.UnmarshalBodyReusable(c, &request); err != nil {
+	bodyBytes, err := cacheBenchRequestBody(c)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	rawEnvelope, err := commonresponses.ParseRawEnvelope(bodyBytes)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	request := rawEnvelope.Projection
 	c.Set(benchRequestParseKey, elapsedMilliseconds(parseStart))
 
 	providerSelectStart := time.Now()
@@ -345,7 +353,6 @@ func handleBenchResponses(c *gin.Context, upstreamURL string, channel *model.Cha
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	request.Model = mappedModel
 	c.Set("original_model", originalModel)
 	c.Set("new_model", mappedModel)
 	c.Set(benchProviderSelectKey, elapsedMilliseconds(providerSelectStart))
@@ -354,9 +361,22 @@ func handleBenchResponses(c *gin.Context, upstreamURL string, channel *model.Cha
 	_ = common.CountTokenInputMessages(request.Input, mappedModel, channel.PreCost)
 	c.Set(benchPromptCountKey, elapsedMilliseconds(promptCountStart))
 
+	providerRequest := &commonresponses.Request{
+		Operation: commonresponses.ResponsesCreate,
+		Headers:   requestctx.NewHeaderSnapshot(c.Request.Header),
+		Body:      rawEnvelope,
+		Control: commonresponses.Control{
+			DownstreamDialect: commonresponses.DownstreamResponses,
+			Stream:            request.Stream,
+		},
+		Policy:    benchResponsesPolicyInput(&request),
+		Principal: requestctx.PrincipalFromGin(c),
+		ChannelID: channel.Id,
+		Model:     mappedModel,
+	}
 	if request.Stream {
 		upstreamHeaderStart := time.Now()
-		stream, errWithCode := provider.CreateResponsesStream(&request)
+		stream, errWithCode := provider.CreateResponsesStream(c.Request.Context(), providerRequest)
 		c.Set(benchUpstreamHeaderKey, elapsedMilliseconds(upstreamHeaderStart))
 		if errWithCode != nil {
 			c.JSON(errWithCode.StatusCode, errWithCode)
@@ -364,7 +384,7 @@ func handleBenchResponses(c *gin.Context, upstreamURL string, channel *model.Cha
 		}
 		forwardResponsesStream(c, stream)
 	} else {
-		response, errWithCode := provider.CreateResponses(&request)
+		response, errWithCode := provider.CreateResponses(c.Request.Context(), providerRequest)
 		if errWithCode != nil {
 			c.JSON(errWithCode.StatusCode, errWithCode)
 			return
@@ -373,6 +393,20 @@ func handleBenchResponses(c *gin.Context, upstreamURL string, channel *model.Cha
 	}
 
 	finalizeBenchMetrics(c, benchMetrics)
+}
+
+func benchResponsesPolicyInput(request *types.OpenAIResponsesRequest) commonresponses.PolicyInput {
+	policy := commonresponses.PolicyInput{}
+	if request == nil {
+		return policy
+	}
+	if key := strings.TrimSpace(request.PromptCacheKey); key != "" {
+		policy.PromptCache = &commonresponses.PromptCacheDecision{
+			Key:    key,
+			Source: commonresponses.PromptCacheClientBody,
+		}
+	}
+	return policy
 }
 
 func applyBenchPreAdd(c *gin.Context, channel *model.Channel, modelName string) {

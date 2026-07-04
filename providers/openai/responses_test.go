@@ -15,12 +15,57 @@ import (
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/requester"
+	commonresponses "one-api/common/responses"
 	"one-api/common/responsesws"
 	"one-api/model"
 	"one-api/types"
 
 	"github.com/gin-gonic/gin"
 )
+
+func (p *OpenAIProvider) CompactResponsesForTest(request *types.OpenAIResponsesRequest) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
+	raw, err := json.Marshal(request)
+	if err != nil {
+		return nil, common.ErrorWrapperLocal(err, "marshal_request_failed", http.StatusInternalServerError)
+	}
+	envelope, err := commonresponses.ParseRawEnvelope(raw)
+	if err != nil {
+		return nil, common.ErrorWrapperLocal(err, "invalid_request_error", http.StatusBadRequest)
+	}
+	return p.CompactResponses(context.Background(), &commonresponses.Request{
+		Operation: commonresponses.ResponsesCompact,
+		Body:      envelope,
+		Control: commonresponses.Control{
+			DownstreamDialect: commonresponses.DownstreamResponses,
+			Stream:            request.Stream,
+		},
+		Model: request.Model,
+	})
+}
+
+func openAIResponsesRawRequestForTest(t *testing.T, raw, model string, stream bool, promptCacheKey string) *commonresponses.Request {
+	t.Helper()
+	envelope, err := commonresponses.ParseRawEnvelope([]byte(raw))
+	if err != nil {
+		t.Fatalf("parse raw responses envelope: %v", err)
+	}
+	req := &commonresponses.Request{
+		Operation: commonresponses.ResponsesCreate,
+		Body:      envelope,
+		Control: commonresponses.Control{
+			DownstreamDialect: commonresponses.DownstreamResponses,
+			Stream:            stream,
+		},
+		Model: model,
+	}
+	if promptCacheKey != "" {
+		req.Policy.PromptCache = &commonresponses.PromptCacheDecision{
+			Key:    promptCacheKey,
+			Source: commonresponses.PromptCacheRouteHint,
+		}
+	}
+	return req
+}
 
 func TestOpenAIResponsesHTTPBridgeURLPreflightUsesOpenContext(t *testing.T) {
 	originalResolver := net.DefaultResolver
@@ -52,6 +97,122 @@ func TestOpenAIResponsesHTTPBridgeURLPreflightUsesOpenContext(t *testing.T) {
 	}
 }
 
+func TestOpenAIResponsesCreateUsesRawEnvelopeBody(t *testing.T) {
+	var bodyBytes []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		bodyBytes, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_1","object":"response","model":"mapped-model","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`))
+	}))
+	t.Cleanup(server.Close)
+
+	originalHTTPClient := requester.HTTPClient
+	requester.HTTPClient = server.Client()
+	t.Cleanup(func() {
+		requester.HTTPClient = originalHTTPClient
+	})
+
+	proxy := ""
+	provider := CreateOpenAIProvider(&model.Channel{
+		Type:  config.ChannelTypeOpenAI,
+		Key:   "sk-test",
+		Proxy: &proxy,
+	}, server.URL)
+	provider.Usage = &types.Usage{}
+
+	rawReq := openAIResponsesRawRequestForTest(t, `{
+		"model":"client-model",
+		"input":"hello",
+		"prompt_cache_key":"client-cache",
+		"future_field":{"enabled":true},
+		"unknown_number":12345678901234567890
+	}`, "mapped-model", false, "route-cache")
+	if _, errWithCode := provider.CreateResponses(context.Background(), rawReq); errWithCode != nil {
+		t.Fatalf("CreateResponses returned error: %v", errWithCode.Message)
+	}
+
+	body := make(map[string]json.RawMessage)
+	if err := json.Unmarshal(bodyBytes, &body); err != nil {
+		t.Fatalf("decode request body: %v body=%s", err, bodyBytes)
+	}
+	if string(body["model"]) != `"mapped-model"` {
+		t.Fatalf("expected mapped model to overwrite client model, got %s", body["model"])
+	}
+	if string(body["prompt_cache_key"]) != `"client-cache"` {
+		t.Fatalf("expected client prompt_cache_key to win over route hint, got %s", body["prompt_cache_key"])
+	}
+	if string(body["future_field"]) != `{"enabled":true}` {
+		t.Fatalf("expected unknown raw field to be preserved, got %s", body["future_field"])
+	}
+	if string(body["unknown_number"]) != `12345678901234567890` {
+		t.Fatalf("expected unknown numeric field to be preserved, got %s", body["unknown_number"])
+	}
+	if _, exists := body["stream"]; exists {
+		t.Fatalf("expected non-streaming create to preserve stream omission, got %s", body["stream"])
+	}
+}
+
+func TestOpenAIResponsesCreateBodyPlannerPatchesPolicyStreamAndCustom(t *testing.T) {
+	proxy := ""
+	customParameter := `{"extra_metadata":{"operator":"custom","nested":{"operator":true}}}`
+	provider := CreateOpenAIProvider(&model.Channel{
+		Type:            config.ChannelTypeOpenAI,
+		Key:             "sk-test",
+		Proxy:           &proxy,
+		CustomParameter: &customParameter,
+	}, "https://api.openai.com")
+
+	rawReq := openAIResponsesRawRequestForTest(t, `{
+		"model":"client-model",
+		"input":"hello",
+		"stream":false,
+		"extra_metadata":{"client":"kept","nested":{"client":true}}
+	}`, "mapped-model", true, "route-cache")
+	request := responsesRequestProjection(rawReq)
+	body, errWithCode := provider.buildResponsesCreateBody(rawReq, request, true)
+	if errWithCode != nil {
+		t.Fatalf("buildResponsesCreateBody returned error: %v", errWithCode.Message)
+	}
+	if body["model"] != "mapped-model" {
+		t.Fatalf("expected mapped model patch, got %#v", body["model"])
+	}
+	if body["stream"] != true {
+		t.Fatalf("expected streaming create to force stream=true, got %#v", body["stream"])
+	}
+	if body["prompt_cache_key"] != "route-cache" {
+		t.Fatalf("expected route hint prompt_cache_key to be added, got %#v", body["prompt_cache_key"])
+	}
+	metadata, ok := body["extra_metadata"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected extra_metadata object, got %#v", body["extra_metadata"])
+	}
+	if metadata["client"] != "kept" || metadata["operator"] != "custom" {
+		t.Fatalf("expected custom extra_metadata to merge with raw field, got %#v", metadata)
+	}
+
+	rawReq = openAIResponsesRawRequestForTest(t, `{
+		"model":"client-model",
+		"input":"hello",
+		"stream":false,
+		"prompt_cache_key":"client-cache"
+	}`, "mapped-model", false, "route-cache")
+	request = responsesRequestProjection(rawReq)
+	body, errWithCode = provider.buildResponsesCreateBody(rawReq, request, false)
+	if errWithCode != nil {
+		t.Fatalf("buildResponsesCreateBody returned error: %v", errWithCode.Message)
+	}
+	if body["stream"] != false {
+		t.Fatalf("expected non-streaming create to preserve explicit stream=false, got %#v", body["stream"])
+	}
+	if body["prompt_cache_key"] != "client-cache" {
+		t.Fatalf("expected client prompt_cache_key to remain, got %#v", body["prompt_cache_key"])
+	}
+}
+
 func TestHandlerChatStreamToolCallsFinishReasonFromToolEvent(t *testing.T) {
 	handler := OpenAIResponsesStreamHandler{
 		Usage:  &types.Usage{},
@@ -80,6 +241,35 @@ func TestHandlerChatStreamToolCallsFinishReasonFromToolEvent(t *testing.T) {
 	case err := <-errChan:
 		t.Fatalf("unexpected stream error: %v", err)
 	default:
+	}
+}
+
+func TestHandlerResponsesStreamUsesSharedUsageTracker(t *testing.T) {
+	handler := OpenAIResponsesStreamHandler{
+		Usage:  &types.Usage{},
+		Prefix: "data: ",
+		Model:  "gpt-5",
+	}
+	dataChan := make(chan string, 4)
+	errChan := make(chan error, 1)
+
+	reasoning := []byte(`data: {"type":"response.reasoning_summary_text.delta","delta":"think"}`)
+	handler.HandlerResponsesStream(&reasoning, dataChan, errChan)
+	if handler.Usage.TextBuilder.String() != "think" {
+		t.Fatalf("expected reasoning summary delta to be tracked, got %q", handler.Usage.TextBuilder.String())
+	}
+
+	image := []byte(`data: {"type":"response.output_item.added","item":{"type":"image_generation_call","quality":"high","size":"1024x1024"}}`)
+	handler.HandlerResponsesStream(&image, dataChan, errChan)
+	key := types.BuildExtraBillingKey(types.APIToolTypeImageGeneration, "high-1024x1024")
+	if handler.Usage.ExtraBilling[key].CallCount != 1 {
+		t.Fatalf("expected image generation billing through shared tracker, got %+v", handler.Usage.ExtraBilling)
+	}
+
+	done := []byte(`data: {"type":"response.done","response":{"id":"resp_done","status":"completed","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`)
+	handler.HandlerResponsesStream(&done, dataChan, errChan)
+	if handler.Usage.TotalTokens != 3 {
+		t.Fatalf("expected response.done terminal usage to be applied, got %+v", handler.Usage)
 	}
 }
 
@@ -640,7 +830,7 @@ func captureCompactRequestBody(t *testing.T, configure func(*OpenAIProvider), re
 		configure(provider)
 	}
 
-	if _, errWithCode := provider.CompactResponses(request); errWithCode != nil {
+	if _, errWithCode := provider.CompactResponsesForTest(request); errWithCode != nil {
 		t.Fatalf("CompactResponses returned error: %v", errWithCode.Message)
 	}
 

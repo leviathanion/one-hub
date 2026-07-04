@@ -26,8 +26,8 @@ func TestResponsesWSPanicClassDoesNotExposeRecoveredValue(t *testing.T) {
 func TestResponsesWSStackHashIsStableSummary(t *testing.T) {
 	stack := []byte("goroutine 1 [running]:\nsecret payload")
 	got := responsesWSStackHash(stack)
-	if len(got) != 16 {
-		t.Fatalf("expected 8-byte hex stack hash, got %q", got)
+	if len(got) != 32 {
+		t.Fatalf("expected 16-byte hex stack hash, got %q", got)
 	}
 	if strings.Contains(got, "secret") || strings.Contains(got, "payload") {
 		t.Fatalf("stack hash exposed stack contents: %q", got)

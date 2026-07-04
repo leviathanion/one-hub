@@ -16,6 +16,7 @@ func InitConf() {
 	IsMasterNode = viper.GetString("node_type") != "slave"
 	RequestInterval = time.Duration(viper.GetInt("polling_interval")) * time.Second
 	SessionSecret = utils.GetOrDefault("session_secret", SessionSecret)
+	CodexIdentitySecret = utils.GetOrDefault("codex_identity_secret", CodexIdentitySecret)
 	UserInvoiceMonth = viper.GetBool("user_invoice_month")
 	OpenAIRealtimeSessionCompatMode = viper.GetBool("openai.realtime_session_compat")
 	RequestBodyDecodeEnabled = viper.GetBool("request_body_decode.enabled")

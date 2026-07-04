@@ -266,6 +266,10 @@ func LogDebug(ctx context.Context, msg string) {
 	logHelper(ctx, loggerDEBUG, msg)
 }
 
+func DebugEnabled() bool {
+	return isDebugEnabled()
+}
+
 func isDebugEnabled() bool {
 	if Logger == nil {
 		return getLogLevel().Enabled(zapcore.DebugLevel)
