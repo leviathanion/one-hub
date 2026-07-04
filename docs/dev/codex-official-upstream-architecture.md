@@ -42,7 +42,7 @@ raw envelope + control + policy in, official plan out
 6. **一个 control plane**：下游响应形态是本地控制事实，不进入 upstream JSON。Chat-to-Responses streaming conversion 用 `Control.DownstreamDialect` 表达，不使用 body magic field。
 7. **一个 policy plane**：channel affinity / prompt-cache 这类代理策略是 policy 事实；policy 可以产生明示 body patch，但 provider 不在 planner 之后做隐藏生成或二次猜测。
 8. **一个身份解析器**：`session-id`、`thread-id`、`x-client-request-id`、`x-codex-window-id` 等身份字段只在 `IdentityResolver` 中解析。
-9. **一个错误口径**：空 required field 可以 fallback；非空非法 field 直接 `400 invalid_request_error`；多值 singleton header 直接 `400 invalid_request_error`。
+9. **一个错误口径**：空 optional identity field 按缺失处理；只有 `User-Agent`、`originator` 和显式 `auto_generate` 字段可以 fallback；非空非法 field 直接 `400 invalid_request_error`；多值 singleton header 直接 `400 invalid_request_error`。
 10. **无双轨**：没有 `RawResponsesInterface` optional branch，没有 typed adapter，没有 legacy fallback flag，没有按 UA 自动切协议。
 11. **无修补**：proxy 不做 semantic repair。proxy 拥有的字段可以 set；显式 unsupported input 直接 `400 invalid_request_error`；未知 future field raw-preserve。
 
@@ -102,7 +102,7 @@ ResponsesWS native  -> WS handshake parity + response.create client_metadata par
 5. `/responses/compact` 使用 compact 专用 body，不保 ordinary `client_metadata` body，但从 raw metadata 中投影 compact header。
 6. ResponsesWS 只走 native Codex upstream；Codex path 不存在 HTTP bridge。
 7. `Authorization`、`ChatGPT-Account-ID`、FedRAMP、residency 等权威字段只来自 one-hub channel credential / channel policy。
-8. 客户端传空的必需 Codex identity 字段按 official completion 补齐；补齐来源必须是同一请求的官方 header/body metadata 或 proxy-generated identity，不读取 legacy header。
+8. Codex identity 字段优先使用同一请求的官方 header/body metadata；缺失时默认省略，只有 channel policy 显式开启对应 `auto_generate` key 时才生成，不读取 legacy header。
 9. 任意非空但格式非法的 Codex 字段 fail closed，不静默吞掉。
 10. 规则可测试、可审计、可 diff；不靠调用顺序或隐式 side effect。
 
@@ -500,7 +500,7 @@ type PrincipalFingerprint struct {
 }
 ```
 
-`x-codex-installation-id` 缺失时的 proxy-generated 规则：
+`x-codex-installation-id` 缺失且 `other.codex.auto_generate.installation_id=true` 时的 proxy-generated 规则：
 
 ```text
 installation_id = uuidv5(
@@ -528,6 +528,7 @@ HMAC key 的运维约束：
 key 是 server 级 secret，轮换会改变所有 proxy-generated installation id
 "stable" 承诺的作用域是该 secret 的生命周期，不是永久
 该 key 不得与高频轮换的 session/cookie secret 共用轮换周期；应使用独立、长周期的 codex identity secret
+启用 other.codex.auto_generate.installation_id 时必须配置 codex_identity_secret；缺失即渠道配置错误
 ```
 
 文档中不再使用未定义的 `downstream_credential_id`。
@@ -549,22 +550,32 @@ Codex provider 不调用 `applyCommonRequestHeaders`。
     "residency": "",
     "default_originator": "codex_cli_rs",
     "trust_client_attestation": false,
-    "generate_proxy_installation_id": true
+    "auto_generate": {
+      "session_id": false,
+      "thread_id": false,
+      "client_request_id": false,
+      "installation_id": false,
+      "ws_stream_request_start_ms": false
+    }
   }
 }
 ```
+
+`auto_generate` 默认等价于空对象；除显式为 `true` 的子字段外，one-hub 不自动合成 session/thread/client-request/installation/WS timestamp。`User-Agent` 和 `originator` 仍沿用当前默认补齐逻辑，因为它们是上游协议固定请求画像的一部分，不表达客户端会话身份。
 
 配置校验规则：
 
 ```text
 unknown codex policy key -> config error
+unknown codex auto_generate key -> config error
+auto_generate.* 必须是 boolean
 channel.type == codex && model_headers != empty -> config error
 policy.fedramp 只能来自 channel policy / credential claim
 policy.residency 只能来自 channel policy
 trust_client_attestation=false 且客户端发送 x-oai-attestation -> 400 invalid_request_error
 ```
 
-配置错误的故障域是渠道，不是进程：保存/更新时 fail-fast 拒绝写入；启动或运行时发现存量非法配置（例如升级前遗留的非空 `model_headers`），该渠道标记不可用并告警，进程正常启动。一条脏渠道配置不允许放大为全服务不可用。
+配置错误的故障域是渠道，不是进程：保存/更新时 fail-fast 拒绝写入；运行时 policy 解析发现非法配置时，该渠道返回配置错误。一条脏渠道配置不允许放大为全服务不可用。
 
 ## IdentityResolver
 
@@ -655,7 +666,8 @@ HTTP create / compact：
 ```text
 header session-id
 > body client_metadata.session_id
-> generated uuid
+> generated uuid when policy.auto_generate.session_id=true
+> omit
 ```
 
 WS open：
@@ -663,7 +675,8 @@ WS open：
 ```text
 header session-id
 > first frame client_metadata.session_id
-> generated uuid
+> generated uuid when policy.auto_generate.session_id=true
+> omit
 ```
 
 #### `thread-id`
@@ -673,7 +686,8 @@ HTTP create / compact：
 ```text
 header thread-id
 > body client_metadata.thread_id
-> generated uuid
+> generated uuid when policy.auto_generate.thread_id=true
+> omit
 ```
 
 WS open：
@@ -681,17 +695,20 @@ WS open：
 ```text
 header thread-id
 > first frame client_metadata.thread_id
-> generated uuid
+> generated uuid when policy.auto_generate.thread_id=true
+> omit
 ```
 
 #### `x-client-request-id`
 
 ```text
 header x-client-request-id
-> resolved thread-id
+> resolved thread-id when policy.auto_generate.client_request_id=true
+> generated uuid when policy.auto_generate.client_request_id=true and no thread-id exists
+> omit
 ```
 
-依据：Codex 官方客户端在普通 `/responses` 上按 `responses_metadata.thread_id` 生成该字段（见 `codex-pi-header-parity.md`）。fallback 到 resolved thread-id 是 official completion，不是代理发明的每请求随机 id 语义。
+依据：Codex 官方客户端在普通 `/responses` 上按 `responses_metadata.thread_id` 生成该字段（见 `codex-pi-header-parity.md`）。one-hub 只有在 channel policy 显式 opt-in 时才补齐该 official completion；默认缺失时省略，避免代理发明调用方没有表达的 request identity。
 
 #### `x-codex-window-id`
 
@@ -710,6 +727,7 @@ Window id 不默认生成。没有真实客户端窗口语义时，省略比伪�
 ```text
 body client_metadata.x-codex-installation-id
 > header x-codex-installation-id
+> proxy-generated installation id when policy.auto_generate.installation_id=true
 > omit
 ```
 
@@ -718,7 +736,7 @@ body client_metadata.x-codex-installation-id
 ```text
 header x-codex-installation-id
 > body client_metadata.x-codex-installation-id
-> proxy-generated installation id when policy.generate_proxy_installation_id=true
+> proxy-generated installation id when policy.auto_generate.installation_id=true
 > omit
 ```
 
@@ -726,7 +744,7 @@ WS frame metadata：
 
 ```text
 frame client_metadata.x-codex-installation-id
-> proxy-generated installation id when policy.generate_proxy_installation_id=true
+> proxy-generated installation id when policy.auto_generate.installation_id=true
 > omit
 ```
 
@@ -769,9 +787,9 @@ tracestate
 | --- | --- | --- | --- |
 | `User-Agent` | visible ASCII，禁止 CR/LF/CTL，`1..256` bytes | fallback | 400 |
 | `originator` | token：`[A-Za-z0-9._-]{1,64}` | fallback | 400 |
-| `session-id` | id：visible ASCII，禁止 CR/LF/CTL，`1..128` bytes | fallback | 400 |
-| `thread-id` | id：visible ASCII，禁止 CR/LF/CTL，`1..128` bytes | fallback | 400 |
-| `x-client-request-id` | id：visible ASCII，禁止 CR/LF/CTL，`1..128` bytes | fallback | 400 |
+| `session-id` | id：visible ASCII，禁止 CR/LF/CTL，`1..128` bytes | omit；`auto_generate.session_id=true` 时 fallback | 400 |
+| `thread-id` | id：visible ASCII，禁止 CR/LF/CTL，`1..128` bytes | omit；`auto_generate.thread_id=true` 时 fallback | 400 |
+| `x-client-request-id` | id：visible ASCII，禁止 CR/LF/CTL，`1..128` bytes | omit；`auto_generate.client_request_id=true` 时 fallback | 400 |
 | `x-codex-window-id` | id：visible ASCII，禁止 CR/LF/CTL，`1..128` bytes | omit | 400 |
 | `x-codex-parent-thread-id` | id：visible ASCII，禁止 CR/LF/CTL，`1..128` bytes | omit | 400 |
 | `x-openai-subagent` | token：`[A-Za-z0-9._:-]{1,128}` | omit | 400 |
@@ -781,7 +799,7 @@ tracestate
 | `x-openai-internal-codex-responses-lite` | `true` or `false` | omit | 400 |
 | `x-oai-attestation` | trusted policy only；base64url/JWT-like，`<=4096` bytes | omit | 400 |
 | `x-codex-inference-call-id` | id：visible ASCII，禁止 CR/LF/CTL，`1..128` bytes | omit | 400 |
-| `x-codex-installation-id` | UUID / id，visible ASCII，禁止 CR/LF/CTL，`1..128` bytes | compact 可 fallback | 400 |
+| `x-codex-installation-id` | UUID / id，visible ASCII，禁止 CR/LF/CTL，`1..128` bytes | omit；`auto_generate.installation_id=true` 时 fallback | 400 |
 | `traceparent` | W3C basic：`00-<32hex>-<16hex>-<2hex>`，trace/span 非全零 | omit | 400 |
 | `tracestate` | W3C list basic，禁止 CR/LF/CTL，`<=512` bytes | omit | 400 |
 
@@ -807,7 +825,7 @@ Unknown metadata keys are preserved if total serialized `client_metadata` size i
 
 实现上，reserved header / metadata 的 grammar、singleton 属性、metadata alias、operation 输出位置应收敛到一张 field contract 表，并由表驱动测试覆盖。
 
-Trade-off：field contract 表只承载字段事实，不把 `session-id` / `thread-id` 的生成、`x-codex-installation-id` 的 operation precedence、policy fallback 等上下文流程改写成全声明式引擎。这样获得单一协议契约和可测试边界，同时避免为了“纯表驱动”引入收益不成比例的抽象复杂度。
+Trade-off：field contract 表只承载字段事实，不把 `session-id` / `thread-id` 的生成、`x-codex-installation-id` 的 operation precedence、policy auto-generation 等上下文流程改写成全声明式引擎。这样获得单一协议契约和可测试边界，同时避免为了“纯表驱动”引入收益不成比例的抽象复杂度。
 
 ## HeaderPlan
 
@@ -838,7 +856,8 @@ type Decision struct {
 
 ```text
 operation=responses.create.http
-must have: session-id, thread-id
+must have: Authorization, Content-Type, Accept, User-Agent, originator
+identity optional: session-id, thread-id, x-client-request-id
 must not have: session_id, x-session-id, Conversation_id, Connection, OpenAI-Beta
 ```
 
@@ -944,14 +963,14 @@ Required:
 | `Accept: text/event-stream` | Codex streaming requirement |
 | `User-Agent` | client official header, else Codex default |
 | `originator` | client official header, else `codex_cli_rs` |
-| `session-id` | official header, else body `client_metadata.session_id`, else generated |
-| `thread-id` | official header, else body `client_metadata.thread_id`, else generated |
-| `x-client-request-id` | official header, else resolved `thread-id` |
 
 Optional:
 
 | Header | Source |
 | --- | --- |
+| `session-id` | official header, else body `client_metadata.session_id`, else generated only when `auto_generate.session_id=true` |
+| `thread-id` | official header, else body `client_metadata.thread_id`, else generated only when `auto_generate.thread_id=true` |
+| `x-client-request-id` | official header, else generated only when `auto_generate.client_request_id=true` |
 | `X-OpenAI-Fedramp` | channel policy only |
 | `x-openai-internal-codex-residency` | channel policy only |
 | `x-codex-window-id` | official header or body metadata |
@@ -962,10 +981,10 @@ Optional:
 | `x-codex-beta-features` | official header |
 | `x-responsesapi-include-timing-metrics` | official header |
 | `x-codex-turn-state` | official HTTP header only |
-| `x-openai-internal-codex-responses-lite` | official header or model capability |
+| `x-openai-internal-codex-responses-lite` | official header |
 | `x-oai-attestation` | trusted client policy only |
 | `x-codex-inference-call-id` | official header |
-| `x-codex-installation-id` | body `client_metadata.x-codex-installation-id`, else official header |
+| `x-codex-installation-id` | body `client_metadata.x-codex-installation-id`, else official header, else generated only when `auto_generate.installation_id=true` |
 | `traceparent` / `tracestate` | valid W3C tracing header or local tracing injection |
 
 Forbidden:
@@ -1095,9 +1114,9 @@ Compact-specific:
 
 | Header | Source |
 | --- | --- |
-| `x-codex-installation-id` | official header, else body `client_metadata.x-codex-installation-id`, else proxy-generated by policy |
+| `x-codex-installation-id` | official header, else body `client_metadata.x-codex-installation-id`, else proxy-generated only when `auto_generate.installation_id=true` |
 
-没有 installation id 时默认生成 proxy scoped installation id，因为 compact 是 Codex 官方明确投影该字段的路径。生成值只表达 one-hub upstream 请求 identity，不伪装成客户端真实 installation id。
+没有 installation id 时默认省略；显式开启 `auto_generate.installation_id` 后才生成 proxy scoped installation id。生成值只表达 one-hub upstream 请求 identity，不伪装成客户端真实 installation id。
 
 ## ResponsesWS native 链路
 
@@ -1136,13 +1155,13 @@ Required:
 | `User-Agent` | client official header, else Codex default |
 | `originator` | client official header, else `codex_cli_rs` |
 | `OpenAI-Beta: responses_websockets=2026-02-06` | protocol |
-| `session-id` | official header, else frame `client_metadata.session_id`, else generated |
-| `thread-id` | official header, else frame `client_metadata.thread_id`, else generated |
-| `x-client-request-id` | official header, else resolved `thread-id` |
 
 Optional:
 
 ```text
+session-id
+thread-id
+x-client-request-id
 X-OpenAI-Fedramp
 x-codex-window-id
 x-codex-turn-metadata
@@ -1185,21 +1204,21 @@ preserve existing client_metadata
 preserve unknown body fields
 set model to mapped upstream model
 inject previous_response_id only when relay actor owns that default
-stamp x-codex-ws-stream-request-start-ms
+stamp x-codex-ws-stream-request-start-ms only when auto_generate.ws_stream_request_start_ms=true
 ```
 
 Metadata patch 规则：
 
 | Metadata key | 策略 |
 | --- | --- |
-| `x-codex-installation-id` | preserve; missing 可由 identity resolver 生成 |
+| `x-codex-installation-id` | preserve; missing 只有 `auto_generate.installation_id=true` 时可由 identity resolver 生成 |
 | `session_id` | preserve; missing 用 resolved `session-id` |
 | `thread_id` | preserve; missing 用 resolved `thread-id` |
 | `x-codex-window-id` | preserve; missing 用 resolved window id if any |
 | `x-codex-turn-state` | preserve; 不从 handshake header 搬运 |
-| `ws_request_header_x_openai_internal_codex_responses_lite` | preserve or set when model capability requires |
+| `ws_request_header_x_openai_internal_codex_responses_lite` | preserve or set when inbound `x-openai-internal-codex-responses-lite=true` |
 | `ws_request_header_traceparent` / `ws_request_header_tracestate` | preserve or inject local trace context |
-| `x-codex-ws-stream-request-start-ms` | 每次发送前 stamp 当前毫秒 |
+| `x-codex-ws-stream-request-start-ms` | 只有 `auto_generate.ws_stream_request_start_ms=true` 时每次发送前 stamp 当前毫秒 |
 
 ## Audit
 
@@ -1243,12 +1262,12 @@ principal StableID
 | `client_metadata` 存在但不是 object | 400 `invalid_request_error` |
 | singleton official header 多值 | 400 `invalid_request_error` |
 | official header 非空但非法 | 400 `invalid_request_error` |
-| required official field missing/empty | official fallback chain |
+| identity field missing/empty | 默认 omit；显式 `auto_generate` 时 fallback |
 | `temperature` 和 `top_p` 同时存在 | 400 `invalid_request_error` |
 | unsupported body field `context_management` | 400 `invalid_request_error` |
 | unsupported body field `truncation` | 400 `invalid_request_error` |
 | channel credential 缺 token | 401/502，沿用 provider token error 语义 |
-| channel policy 非法 | 保存时拒绝写入；存量配置在启动/运行时降级为 channel unavailable + 告警，不阻断进程 |
+| channel policy 非法 | 保存时拒绝写入；运行时解析失败则该渠道返回配置错误，不阻断进程 |
 | Codex ResponsesWS upstream 不支持 native | 426 wrapped error；不 bridge |
 
 ## 删除旧路径
@@ -1403,10 +1422,10 @@ responses.ws.open
 
 断言：
 
-- required header 全存在。
+- fixed protocol / credential header 全存在。
 - forbidden header 全不存在。
 - header value source 符合 decision log。
-- 空 required field 进入 fallback。
+- 空 identity field 默认省略；显式开启 `auto_generate` 后才进入 fallback。
 - 非空非法 field 400。
 - singleton 多值 400。
 
@@ -1431,9 +1450,9 @@ responses.ws.open
 
 1. compact body 不包含 ordinary `client_metadata`。
 2. compact 从 raw body `client_metadata.x-codex-installation-id` 生成 header。
-3. compact 缺 installation id 时按 policy 生成 stable proxy id。
+3. create / compact / WS 缺 installation id 时默认省略；`auto_generate.installation_id=true` 时按 policy 生成 stable proxy id。
 4. compact 不发送 HTTP `OpenAI-Beta`。
-5. compact generated installation id 不依赖 raw downstream Authorization。
+5. compact opt-in generated installation id 不依赖 raw downstream Authorization。
 
 ### WS tests
 
@@ -1441,8 +1460,8 @@ responses.ws.open
 2. WS handshake 不包含 `Content-Type`、`Accept`、`Connection`、`x-codex-turn-state`。
 3. WS handshake 包含 `OpenAI-Beta: responses_websockets=2026-02-06`。
 4. WS body 保留原始 `client_metadata`。
-5. WS body 缺 `session_id` / `thread_id` 时用 resolved identity 补齐。
-6. WS body 每次 send 前 stamp `x-codex-ws-stream-request-start-ms`。
+5. WS body 缺 `session_id` / `thread_id` 时只用已有或显式生成的 resolved identity 补齐。
+6. WS body 默认不 stamp `x-codex-ws-stream-request-start-ms`；`auto_generate.ws_stream_request_start_ms=true` 时每次 send 前 stamp。
 7. Codex Official path 不走 HTTP bridge。
 8. `OpenRequest.Transport=responses_http_bridge` 直接拒绝，不触发 bridge fallback。
 
@@ -1455,7 +1474,7 @@ responses.ws.open
 
 ### Config tests
 
-1. Codex channel `model_headers` 非空时保存校验失败；存量非法配置使该渠道不可用，不影响进程启动。
+1. Codex channel `model_headers` 非空时保存校验和运行时 policy 解析都失败；该渠道不可用，不影响进程。
 2. `channel.Other.codex` unknown top-level key fail-fast。
 3. `trust_client_attestation=false` 时客户端 `x-oai-attestation` 返回 400，不上游。
 4. `fedramp=true` 时上游设置 `X-OpenAI-Fedramp: true`。
@@ -1507,8 +1526,8 @@ providers/base must not expose OpenResponsesWS(ctx, modelName, options) contract
 2. `/responses/compact` 上游 body 不含 ordinary `client_metadata`，但 header 含 compact `x-codex-installation-id`。
 3. Codex HTTP upstream 不出现 `session_id`、`x-session-id`、`Conversation_id`、`Connection`、HTTP `OpenAI-Beta`。
 4. Codex WS handshake 不出现 `Content-Type`、`Accept`、`Connection`、`x-codex-turn-state`。
-5. `session-id`、`thread-id`、`x-client-request-id` 在三条 Codex operation 上都有确定来源。
-6. 客户端传空 required identity 字段时 fallback；传非法非空字段时 400。
+5. `session-id`、`thread-id`、`x-client-request-id` 在三条 Codex operation 上都有确定来源优先级；缺失时默认不输出。
+6. 客户端传空 identity 字段时按缺失处理；只有显式 `auto_generate` 字段 fallback，传非法非空字段时 400。
 7. 客户端 `Authorization` 不可能进入 upstream；upstream `Authorization` 必然来自 channel token。
 8. Codex channel `model_headers` 必须为空；Codex provider 不再通过 `model_headers` 注入任何 upstream header。
 9. ResponsesWS Codex Official path 不 bridge。
@@ -1520,13 +1539,13 @@ providers/base must not expose OpenResponsesWS(ctx, modelName, options) contract
 
 ## 取舍
 
-这个方案会破坏旧 one-hub Codex provider 的隐式行为：
+Codex Official path 的边界如下：
 
-- 旧客户端如果只发送 `session_id` / `x-session-id`，不再影响 Codex upstream identity。
-- Codex channel 中任何非空 `model_headers` 配置都会保存失败；存量配置在升级后使该渠道不可用（进程不受影响）。
+- `session_id` / `x-session-id` 不影响 Codex upstream identity。
+- Codex channel 中任何非空 `model_headers` 配置都会保存失败；运行时发现非空 `model_headers` 时该渠道不可用（进程不受影响）。
 - ResponsesWS 不再自动切 HTTP bridge。
 - PI 行为不再被 Codex provider smart 推断。
-- 非 Codex official client 依赖 provider 自动注入 instructions、merge messages、normalize tools 的行为在 Responses ingress 上消失。需要兼容语义的客户端应走 `/v1/chat/completions` 适配边界——那里是显式转换契约，而不是 Responses ingress 的隐式 repair。
+- Responses ingress 不自动注入 instructions、merge messages、normalize tools；需要 chat 语义转换的请求走 `/v1/chat/completions` 适配边界，那里是显式转换契约，而不是 Responses ingress 的隐式 repair。
 
 这是有意的。协议代理最怕“看起来能用”的混合语义。Codex Official path 必须是单一 raw envelope protocol：relay 只收集证据，provider 只生成 official plan，transport 只发送 bytes；不兼容旧 header 拼接、typed marshal、semantic repair、WS bridge、`model_headers` 注入。
 
