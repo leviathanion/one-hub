@@ -11,6 +11,7 @@ lastUpdated: true
 
 - 状态：目标架构方案，**无迁移态**。
 - 适用范围：one-hub 中 Codex provider 的 `/v1/responses` HTTP、`/v1/responses/compact` HTTP、`GET /v1/responses` WebSocket upstream 请求构造。
+- 影响范围：本文重写的 `providers/base` Responses / ResponsesWS provider contract 是全仓唯一 contract。OpenAI 等非 Codex Responses provider 同步切换到同一 contract，同样以 raw object 为 body 基底，不得回退 typed 真相；但各自的 body patch 规则属于各自 dialect，本文只定义 Codex 的 planner 规则。
 - 设计取向：一次性切到干净协议边界；不保留 legacy profile；不设置 optional raw interface；不设置 typed fallback；不做 Codex / PI / one-hub legacy 的混合推断。
 - 参考文档：
   - `docs/dev/codex-pi-header-parity.md`
@@ -28,20 +29,22 @@ lastUpdated: true
 本设计只有一个运行态：
 
 ```text
-raw envelope in, official plan out
+raw envelope + control + policy in, official plan out
 ```
 
 对应的硬约束：
 
 1. **一个 dialect**：Codex provider 只实现 Codex Official Upstream，不实现 legacy one-hub Codex dialect。
-2. **一个 HTTP Responses contract**：provider-facing Responses contract 只接收 raw envelope，不再接收 `*types.OpenAIResponsesRequest` 作为请求真相。
+2. **一个 HTTP Responses contract**：provider-facing Responses contract 是 `RawEnvelope + Control + Policy`，不再接收 `*types.OpenAIResponsesRequest` 作为请求真相。
 3. **一个 ResponsesWS open contract**：Codex WS upstream open 必须拿到 inbound headers 和 first `response.create` raw frame；不允许把 handshake identity 延迟到 send path。
 4. **一个 header planner**：所有 Codex upstream header 只能由 `providers/codex/wire` 生成；旧 allowlist 和 mutable header bag 不在 Codex path 中出现。
-5. **一个 body planner**：HTTP body 以 raw JSON object 为序列化真相；typed projection 只读，不作为 upstream marshal 源。
-6. **一个身份解析器**：`session-id`、`thread-id`、`x-client-request-id`、`x-codex-window-id` 等身份字段只在 `IdentityResolver` 中解析。
-7. **一个错误口径**：空 required field 可以 fallback；非空非法 field 直接 `400 invalid_request_error`；多值 singleton header 直接 `400 invalid_request_error`。
-8. **无双轨**：没有 `RawResponsesInterface` optional branch，没有 typed adapter，没有 legacy fallback flag，没有按 UA 自动切协议。
-9. **无修补**：proxy 不做 semantic repair。proxy 拥有的字段可以 set；显式 unsupported input 直接 `400 invalid_request_error`；未知 future field raw-preserve。
+5. **一个 body planner**：HTTP body 以 raw JSON object 为序列化真相；typed projection 只读，不作为 upstream marshal 源。唯一例外是 chat-to-responses 适配边界的一次性合成（见「Chat-to-Responses 适配边界」）：chat ingress 没有 raw Responses body 可保，适配器在 planner 之前合成 raw envelope，合成之后走与 Responses ingress 完全相同的 raw path。
+6. **一个 control plane**：下游响应形态是本地控制事实，不进入 upstream JSON。Chat-to-Responses streaming conversion 用 `Control.DownstreamDialect` 表达，不使用 body magic field。
+7. **一个 policy plane**：channel affinity / prompt-cache 这类代理策略是 policy 事实；policy 可以产生明示 body patch，但 provider 不在 planner 之后做隐藏生成或二次猜测。
+8. **一个身份解析器**：`session-id`、`thread-id`、`x-client-request-id`、`x-codex-window-id` 等身份字段只在 `IdentityResolver` 中解析。
+9. **一个错误口径**：空 required field 可以 fallback；非空非法 field 直接 `400 invalid_request_error`；多值 singleton header 直接 `400 invalid_request_error`。
+10. **无双轨**：没有 `RawResponsesInterface` optional branch，没有 typed adapter，没有 legacy fallback flag，没有按 UA 自动切协议。
+11. **无修补**：proxy 不做 semantic repair。proxy 拥有的字段可以 set；显式 unsupported input 直接 `400 invalid_request_error`；未知 future field raw-preserve。
 
 这不是“在旧系统旁边挂一条新路径”。这是把 Codex provider 的协议边界重写成一个小而确定的 Unix 风格工具：输入证据，输出计划。
 
@@ -117,26 +120,30 @@ ResponsesWS native  -> WS handshake parity + response.create client_metadata par
 
 ## 第一性原理
 
-Codex provider 需要三个分离的真相：
+Codex provider 需要分离不同平面的真相：
 
 ```text
 credential truth  = one-hub channel credential
-request truth     = client raw request envelope
+body truth        = client raw request envelope
+control truth     = local downstream response behavior
+policy truth      = routing / channel / affinity decisions
 upstream truth    = Codex Official dialect plan
 ```
 
 三者不能互相污染：
 
 - 客户端 `Authorization` 是 one-hub ingress credential，不是 upstream credential。
-- 客户端 raw body 是请求语义真相，不能被 typed struct 吃掉未知字段。
+- 客户端 raw body 是 upstream JSON 候选真相，不能被 typed struct 吃掉未知字段。
+- `Control` 不进入 upstream，决定 downstream codec，例如 `responses_sse` 或 `chat_completions_sse`。
+- `Policy` 不来自客户端 JSON，来自 routing、channel policy、affinity planner；它只能通过 planner 产生明示 patch，例如 `prompt_cache_key`。
 - upstream header 是由 Codex Official dialect 构造出来的结果，不是客户端 header map 的子集。
 
 固定数据流：
 
 ```text
 Ingress raw request
-    -> HeaderSnapshot + RawEnvelope + TypedLens
-    -> CodexIntent
+    -> HeaderSnapshot + RawEnvelope + Control + PolicyInput + TypedLens
+    -> responses.Request evidence + wire planner inputs
     -> CodexIdentity
     -> CodexHeaderPlan + CodexBodyPlan
     -> PreparedUpstreamRequest
@@ -250,6 +257,8 @@ type RawEnvelope struct {
 ```text
 读取：Projection 用于 model、stream、prompt_cache_key、quota、routing。
 写出：Object 是 upstream body 基底，只 patch Codex Official 明确拥有的字段。
+控制：Control 是本地下游输出控制面，不进入 upstream body。
+策略：Policy 是 routing / channel / affinity 决策面，只通过 BodyPlanner 产生明示 patch。
 ```
 
 未来 Codex 新增 body 字段时，one-hub 默认保留。
@@ -273,7 +282,7 @@ const (
     FieldMissing FieldState = iota
     FieldEmpty
     FieldPresent
-    FieldInvalid
+    FieldInvalid  // 仅由 validation 层（携带 per-field grammar 读取时）产生；raw snapshot 永不产出
     FieldMultiple
 )
 
@@ -292,10 +301,12 @@ singleton header 的规则：
 ```text
 missing             -> FieldMissing
 present but ""      -> FieldEmpty
-one non-empty value -> FieldPresent, then validate grammar
+one non-empty value -> FieldPresent -> 交给 validation 层做 grammar 判断
 multiple values     -> FieldMultiple -> 400 invalid_request_error
-non-empty invalid   -> FieldInvalid  -> 400 invalid_request_error
+non-empty invalid   -> FieldInvalid  -> 400 invalid_request_error（validation 层判定）
 ```
+
+分层约束：raw snapshot 只描述形态（missing / empty / present / multiple），不做任何 grammar 判断；`FieldInvalid` 只能由 validation 层套用 per-field grammar 后产生。同一字段的合法性只在一处判定。
 
 ## Provider contract
 
@@ -323,10 +334,32 @@ type ResponsesRequest struct {
     Operation ResponsesOperation
     Headers   wire.HeaderSnapshot      // inbound client headers
     Body      *responses.RawEnvelope   // raw body + typed lens
+    Control   responses.Control        // local downstream behavior, never upstream JSON
+    Policy    responses.PolicyInput    // routing/channel/affinity decisions
     Principal requestctx.Principal     // authenticated downstream subject
     ChannelID int
     Model     string                   // relay-selected model name
-    Stream    bool
+}
+
+type DownstreamDialect string
+
+type Control struct {
+    DownstreamDialect DownstreamDialect
+    Stream            bool
+}
+
+const (
+    DownstreamResponses       DownstreamDialect = "responses"
+    DownstreamChatCompletions DownstreamDialect = "chat_completions"
+)
+
+type PolicyInput struct {
+    PromptCache *PromptCacheDecision
+}
+
+type PromptCacheDecision struct {
+    Key    string
+    Source PromptCacheSource
 }
 
 type ResponsesProvider interface {
@@ -341,6 +374,8 @@ type ResponsesProvider interface {
 - `Headers` 是 inbound client headers snapshot，不是 upstream headers。
 - `Body.Object` 是 upstream serialization base。
 - `Body.Projection` 是本地 typed lens。
+- `Control.DownstreamDialect` 决定 downstream response codec；`chat_completions` 表示 upstream 使用 Responses，但下游输出 ChatCompletion chunks。
+- `Policy.PromptCache` 是 prompt-cache / affinity planner 的唯一显式输入；provider 不在 body planner 之后调用 fallback helper。
 - provider 必须显式决定如何使用 raw body；不能 `json.Marshal(Projection)`。
 - 所有 Responses provider 都实现这个 contract。不存在旧 typed contract 并行存在的状态。
 
@@ -406,9 +441,11 @@ Provider 不允许根据 `Transport` 分支到另一个 upstream dialect。Forbi
 
 `FirstFrame` 仍然不等于“已经发送给 upstream”。open 阶段只用它解析 identity 和 handshake。后续 send 阶段使用同一 `Identity` 对 first frame metadata 做 raw-preserving patch。
 
-## CodexIntent
+## Request Evidence
 
-`CodexIntent` 是唯一输入语义：
+Codex Official 的输入语义由 relay 组装出的 `responses.Request` 和
+provider 构造的 wire planner input 共同表达；代码中不需要额外的
+request-intent 聚合类型：
 
 ```go
 type Operation string
@@ -419,7 +456,9 @@ const (
     OpResponsesWSOpen  Operation = "responses.ws.open"
 )
 
-type Intent struct {
+// Conceptual shape only; current code passes responses.Request plus focused
+// wire inputs instead of materializing this aggregate.
+type RequestEvidence struct {
     Operation Operation
     Headers   HeaderSnapshot
     Body      *RawEnvelope
@@ -430,7 +469,7 @@ type Intent struct {
 }
 ```
 
-`CodexIntent` 不读取 legacy session header。它只读取官方 Codex surface：
+这个 evidence 不读取 legacy session header。它只读取官方 Codex surface：
 
 - official inbound headers，例如 `session-id`、`thread-id`、`x-client-request-id`。
 - ordinary `/responses` body `client_metadata`。
@@ -483,6 +522,14 @@ non-reversible
 audit 中只记录 source=proxy_generated
 ```
 
+HMAC key 的运维约束：
+
+```text
+key 是 server 级 secret，轮换会改变所有 proxy-generated installation id
+"stable" 承诺的作用域是该 secret 的生命周期，不是永久
+该 key 不得与高频轮换的 session/cookie secret 共用轮换周期；应使用独立、长周期的 codex identity secret
+```
+
 文档中不再使用未定义的 `downstream_credential_id`。
 
 ## ChannelPolicy
@@ -516,6 +563,8 @@ policy.fedramp 只能来自 channel policy / credential claim
 policy.residency 只能来自 channel policy
 trust_client_attestation=false 且客户端发送 x-oai-attestation -> 400 invalid_request_error
 ```
+
+配置错误的故障域是渠道，不是进程：保存/更新时 fail-fast 拒绝写入；启动或运行时发现存量非法配置（例如升级前遗留的非空 `model_headers`），该渠道标记不可用并告警，进程正常启动。一条脏渠道配置不允许放大为全服务不可用。
 
 ## IdentityResolver
 
@@ -642,6 +691,8 @@ header x-client-request-id
 > resolved thread-id
 ```
 
+依据：Codex 官方客户端在普通 `/responses` 上按 `responses_metadata.thread_id` 生成该字段（见 `codex-pi-header-parity.md`）。fallback 到 resolved thread-id 是 official completion，不是代理发明的每请求随机 id 语义。
+
 #### `x-codex-window-id`
 
 ```text
@@ -678,6 +729,8 @@ frame client_metadata.x-codex-installation-id
 > proxy-generated installation id when policy.generate_proxy_installation_id=true
 > omit
 ```
+
+三条路径的 precedence 不同不是随意选择：precedence 跟随官方客户端在该 operation 上的权威投影面。普通 `/responses` 官方以 body `client_metadata` 携带该字段、header 只是兼容投影，所以 body 优先；`/responses/compact` 官方显式把它投影为 header，所以 header 优先（证据见 `codex-pi-header-parity.md`）。修改任一 precedence 前必须先更新 parity 证据。
 
 ## Validation grammar
 
@@ -740,6 +793,8 @@ tracestate
 session_id                         -> session-id grammar
 thread_id                          -> thread-id grammar
 x-codex-window-id                  -> x-codex-window-id grammar
+x-codex-parent-thread-id           -> x-codex-parent-thread-id grammar
+x-openai-subagent                  -> x-openai-subagent grammar
 x-codex-installation-id            -> x-codex-installation-id grammar
 x-codex-turn-metadata              -> JSON object string, <=16 KiB
 x-codex-turn-state                 -> JSON object string or opaque visible ASCII, <=16 KiB
@@ -749,6 +804,10 @@ x-codex-ws-stream-request-start-ms -> unix milliseconds string
 ```
 
 Unknown metadata keys are preserved if total serialized `client_metadata` size is `<=64 KiB` and no key/value contains control characters where string grammar applies。
+
+实现上，reserved header / metadata 的 grammar、singleton 属性、metadata alias、operation 输出位置应收敛到一张 field contract 表，并由表驱动测试覆盖。
+
+Trade-off：field contract 表只承载字段事实，不把 `session-id` / `thread-id` 的生成、`x-codex-installation-id` 的 operation precedence、policy fallback 等上下文流程改写成全声明式引擎。这样获得单一协议契约和可测试边界，同时避免为了“纯表驱动”引入收益不成比例的抽象复杂度。
 
 ## HeaderPlan
 
@@ -800,7 +859,7 @@ must not have: session_id, x-session-id, Conversation_id, Connection, OpenAI-Bet
 | `Cookie` | never forwarded |
 | `Forwarded` / `X-Forwarded-*` | never forwarded |
 
-下游请求里的 `Authorization` 是 one-hub API credential，只在 ingress middleware 消费。它不是 `CodexIntent` 的一部分。
+下游请求里的 `Authorization` 是 one-hub API credential，只在 ingress middleware 消费。它不是 Codex Official request evidence 的一部分。
 
 ## HTTP `/responses` 链路
 
@@ -822,6 +881,13 @@ projection := DecodeProjection(obj.Raw)
 req := responses.Request{
     Operation: responses.ResponsesCreate,
     Body: &responses.RawEnvelope{Object: obj, Projection: projection},
+    Control: responses.Control{
+        DownstreamDialect: responses.DownstreamResponses,
+        Stream: projection.Stream,
+    },
+    Policy: responses.PolicyInput{
+        PromptCache: route.PromptCacheDecision,
+    },
     Headers: wire.NewHeaderSnapshot(c.Request.Header),
     Principal: requestctx.PrincipalFromContext(c),
     Model: route.SelectedModel,
@@ -839,6 +905,23 @@ input
 ```
 
 用于路由、quota、affinity、stream 判断。但 relay 不再用 typed struct 重组 upstream body。
+
+### Chat-to-Responses 适配边界
+
+`/v1/chat/completions` 通过 Responses provider fallback 时使用同一个 contract，但它的 ingress 没有 raw Responses body 可保。适配边界的规则：
+
+1. **唯一 sanctioned 的 typed→raw 合成点**。适配器把 ChatCompletion 请求转换为 typed Responses request，在转换边界一次性合成 raw envelope（typed marshal → `jsonobject.Parse`），然后交给与 `/v1/responses` ingress 完全相同的 planner。合成发生在 planner 之前，planner 及其之后不存在任何 typed marshal。`/v1/responses` ingress 永远不经过该路径。
+2. **converter 是合成 body 的作者，拥有冲突解决权**。合成 body 必须预先满足 BodyPlanner 的全部 reject 规则；planner 不为任何来源放宽。chat 客户端常规地同时携带 `temperature` 和 `top_p`，converter 在转换边界显式取 `temperature`、丢弃 `top_p`，并产生 `source=chat_adapter` 的 decision。这不是 hidden repair：repair 禁令针对的是"代理修改客户端拥有的 Responses body"；chat 路径的 Responses body 本来就是代理合成的。
+3. **instructions 归属随 ingress 变化**。"client owns instructions" 只对 Responses ingress 成立；chat 客户端无法表达 Codex instructions，system/developer message 到 `instructions` / `input` 的映射是转换契约的一部分，必须显式定义并测试，不允许在 planner 之后隐式注入。
+
+control plane 差异：
+
+```go
+req.Control.DownstreamDialect = responses.DownstreamChatCompletions
+req.Control.Stream = true
+```
+
+这个控制位不序列化进 upstream body。旧 `ConvertChat bool json:"-"` 只表达了同一事实，但在 typed-to-raw marshal 过程中会丢失，因此不再作为 provider contract 的一部分扩散。
 
 ### Provider 阶段
 
@@ -882,6 +965,7 @@ Optional:
 | `x-openai-internal-codex-responses-lite` | official header or model capability |
 | `x-oai-attestation` | trusted client policy only |
 | `x-codex-inference-call-id` | official header |
+| `x-codex-installation-id` | body `client_metadata.x-codex-installation-id`, else official header |
 | `traceparent` / `tracestate` | valid W3C tracing header or local tracing injection |
 
 Forbidden:
@@ -904,13 +988,13 @@ Sec-WebSocket-*
 
 ### HTTP create body planner
 
-`BodyPlanner` emits JSON patches over raw object：
+`BodyPlanner` 接收 raw object 和显式 patch input，输出已序列化的上游 JSON：
 
 ```go
-type BodyPatch struct {
-    Set    map[jsonpointer.Pointer]json.RawMessage
-    Delete []jsonpointer.Pointer
-    Reject []BodyViolation
+type CreateBodyInput struct {
+    Model       string
+    Stream      bool
+    PromptCache *responses.PromptCacheDecision
 }
 ```
 
@@ -923,7 +1007,24 @@ set store   = false
 set include = append reasoning.encrypted_content only when reasoning is present
 preserve client_metadata
 preserve prompt_cache_key when client sent it
+set prompt_cache_key from Policy.PromptCache when body does not contain prompt_cache_key
 preserve unknown fields
+```
+
+Prompt cache patch 规则：
+
+```text
+1. body 已有 prompt_cache_key：
+   - 保留客户端值。
+   - routing / affinity 必须使用同一个 key。
+
+2. body 没有 prompt_cache_key，但 Policy.PromptCache.Key 非空：
+   - BodyPlanner 写入 /prompt_cache_key。
+   - 这个 key 必须是 relay hint 或 channel policy 已经作出的同一个 PromptCacheDecision。
+   - provider 不允许在 body planner 之后重新生成。
+
+3. body 没有，Policy.PromptCache 也没有：
+   - 不生成 prompt_cache_key。
 ```
 
 Explicit rejects:
@@ -937,6 +1038,8 @@ client_metadata not object         -> 400 invalid_request_error
 
 No silent semantic repair.
 
+以上 reject 对所有进入 planner 的 raw body 生效，包括 chat 适配器合成的 body。converter 必须在转换边界预先解决冲突（见「Chat-to-Responses 适配边界」），planner 不为任何来源放宽。
+
 ### Existing Codex request adaptation disposition
 
 | Existing behavior | Final decision | Reason |
@@ -945,14 +1048,14 @@ No silent semantic repair.
 | `stream=true` | keep as `set /stream` | Codex official responses path is streaming |
 | `store=false` | keep as `set /store` | official ChatGPT Codex path does not use OpenAI API store semantics |
 | `ensureCodexIncludes` | keep narrowly | only append `reasoning.encrypted_content` when `/reasoning` exists |
-| `temperature/top_p` prefers temperature | delete | hidden repair; invalid combination returns 400 |
+| `temperature/top_p` prefers temperature | move to chat adapter boundary | Responses ingress 上是 hidden repair，双字段返回 400；chat 适配器作为合成 body 的作者，在转换边界显式取 temperature、弃 top_p |
 | strip `context_management` | delete | hidden repair; unsupported field returns 400 |
 | strip `truncation` | delete | hidden repair; unsupported field returns 400 |
-| `ensureStablePromptCacheKey` | delete | prompt cache key is client body truth or absent; no proxy generation |
+| `ensureStablePromptCacheKey` | delete from HTTP Official body planning | prompt cache key decision must be explicit `Policy.PromptCache` before BodyPlanner; no provider-late mutation |
 | `normalizeCodexBuiltinTools` | delete | Codex official client already speaks official tool schema; proxy does not mutate tools |
 | `adaptCodexCLI` | delete | provider does not infer CLI-ness from instructions |
-| system/developer merge | delete | semantic rewrite outside protocol boundary |
-| default Codex instructions injection | delete | client owns instructions |
+| system/developer merge | delete from Responses ingress | semantic rewrite outside protocol boundary；chat 适配器的 message 映射属于转换契约，另行显式定义 |
+| default Codex instructions injection | delete from Responses ingress | client owns instructions；chat ingress 的 instructions 合成归 converter 契约所有 |
 | typed marshal upstream body | delete | raw object is serialization truth |
 | prompt cache header projection to `Conversation_id` / `session_id` | delete | legacy header pollution |
 
@@ -1017,7 +1120,7 @@ Codex provider 不引入 nested private frame 作为 relay-facing 协议。
 Codex provider 在 `OpenResponsesWS(ctx, req)` 中完成：
 
 1. 从 `req.FirstFrame` 建立 raw frame envelope。
-2. 从 `req.InboundHeaders + first frame client_metadata` 解析 `CodexIntent`。
+2. 从 `req.InboundHeaders + first frame client_metadata` 解析 identity evidence。
 3. 构造 WS handshake header plan。
 4. 用 `wsconn` 打开 native Codex ResponsesWS upstream。
 5. 把 resolved `Identity` 存入 upstream object，供后续 frame planner 使用。
@@ -1145,7 +1248,7 @@ principal StableID
 | unsupported body field `context_management` | 400 `invalid_request_error` |
 | unsupported body field `truncation` | 400 `invalid_request_error` |
 | channel credential 缺 token | 401/502，沿用 provider token error 语义 |
-| channel policy 非法 | channel unavailable / config error |
+| channel policy 非法 | 保存时拒绝写入；存量配置在启动/运行时降级为 channel unavailable + 告警，不阻断进程 |
 | Codex ResponsesWS upstream 不支持 native | 426 wrapped error；不 bridge |
 
 ## 删除旧路径
@@ -1185,7 +1288,7 @@ ResponsesWS actor / settlement / wsconn transport boundary
 
 ```go
 func (p *CodexProvider) prepareResponsesCreate(ctx context.Context, req *responses.Request) (*http.Request, error) {
-    policy, err := p.codexChannelPolicy()
+    policy, err := p.codexOfficialChannelPolicy()
     if err != nil {
         return nil, err
     }
@@ -1195,26 +1298,43 @@ func (p *CodexProvider) prepareResponsesCreate(ctx context.Context, req *respons
         return nil, err
     }
 
-    plan, err := wire.Plan(wire.PlanInput{
+    metadata, err := wire.MetadataFromResponsesBody(req.Body.Object)
+    if err != nil {
+        return nil, err
+    }
+
+    identity, decisions, err := wire.ResolveIdentity(wire.IdentityInput{
         Operation: wire.OpResponsesCreate,
         Headers:   req.Headers,
-        Body:      wire.NewMetadataSnapshot(req.Body.Object),
+        Metadata:  metadata,
         Policy:    policy,
-        Principal: wire.PrincipalFingerprint(req.Principal),
-        Credential: wire.Credential{
-            AccessToken: token,
-            AccountID:   p.Credentials.AccountID,
-        },
-        Model: p.mapModel(req.Model),
-        Clock: wire.RealClock{},
+        Principal: p.codexPrincipalFingerprint(req.Principal),
+        ChannelID: req.ChannelID,
+        Clock:     wire.RealClock{},
     })
     if err != nil {
         return nil, err
     }
 
-    body, err := wire.PlanResponsesCreateBody(req.Body.Object, wire.BodyPatchInput{
-        Model:  p.mapModel(req.Model),
-        Stream: true,
+    headers, err := wire.BuildHeaders(wire.HeaderPlanInput{
+        Operation: wire.OpResponsesCreate,
+        Headers:   req.Headers,
+        Credential: wire.Credential{
+            AccessToken: token,
+            AccountID:   p.Credentials.AccountID,
+        },
+        Policy:   policy,
+        Identity: identity,
+    })
+    if err != nil {
+        return nil, err
+    }
+    headers.Decisions = append(decisions, headers.Decisions...)
+
+    body, err := wire.PlanResponsesCreateBody(req.Body.Object, wire.CreateBodyInput{
+        Model:       p.mapModel(req.Model),
+        Stream:      true,
+        PromptCache: req.Policy.PromptCache,
     })
     if err != nil {
         return nil, err
@@ -1223,8 +1343,9 @@ func (p *CodexProvider) prepareResponsesCreate(ctx context.Context, req *respons
     return p.Requester.NewRequest(
         http.MethodPost,
         p.responsesURL(""),
-        p.Requester.WithRawBody(body),
-        p.Requester.WithHTTPHeader(plan.HTTPHeader()),
+        p.Requester.WithBody(body),
+        p.Requester.WithHeader(headers.Map()),
+        p.Requester.WithContext(ctx),
     )
 }
 ```
@@ -1266,7 +1387,7 @@ func ResolveIdentity(in IdentityInput) (Identity, []Decision, error) {
 }
 ```
 
-关键点：没有 `session_id` header，没有 `x-session-id` header，没有 prompt cache key fallback。
+关键点：没有 `session_id` header，没有 `x-session-id` header，没有 provider-late prompt cache fallback。prompt cache key 只能来自 raw body 或 `Policy.PromptCache`。
 
 ## 测试计划
 
@@ -1301,8 +1422,10 @@ responses.ws.open
 8. 存在 `truncation` 返回 400。
 9. 不再注入默认 instructions。
 10. 不再 merge system/developer messages。
-11. 不再生成 `prompt_cache_key`。
-12. 不再 normalize tools。
+11. body 已有 `prompt_cache_key` 时保留客户端值，不被 policy 覆盖。
+12. body 没有 `prompt_cache_key` 且 `Policy.PromptCache` 存在时，写入同一个 decision 的 key。
+13. body 没有 `prompt_cache_key` 且无 `Policy.PromptCache` 时，不生成 key。
+14. 不再 normalize tools。
 
 ### Compact tests
 
@@ -1323,9 +1446,16 @@ responses.ws.open
 7. Codex Official path 不走 HTTP bridge。
 8. `OpenRequest.Transport=responses_http_bridge` 直接拒绝，不触发 bridge fallback。
 
+### Chat 适配器测试
+
+1. chat 请求同时携带 `temperature` 和 `top_p` 时，合成 Responses body 只含 `temperature`，并产生 `source=chat_adapter` decision，不触发 planner 400。
+2. 合成 body 满足 planner 全部 reject 规则；planner 对 chat 合成 body 与 Responses ingress body 使用同一套规则，无放宽分支。
+3. `/v1/responses` ingress 不经过 typed→raw 合成路径；合成只发生在 chat 适配边界。
+4. system/developer message 到 `instructions` / `input` 的映射符合转换契约。
+
 ### Config tests
 
-1. Codex channel `model_headers` 非空时配置校验失败。
+1. Codex channel `model_headers` 非空时保存校验失败；存量非法配置使该渠道不可用，不影响进程启动。
 2. `channel.Other.codex` unknown top-level key fail-fast。
 3. `trust_client_attestation=false` 时客户端 `x-oai-attestation` 返回 400，不上游。
 4. `fedramp=true` 时上游设置 `X-OpenAI-Fedramp: true`。
@@ -1339,7 +1469,7 @@ responses.ws.open
 raw body metadata preserved
 operation-specific headers correct
 credential headers from channel, not client
-no typed marshal path
+no typed marshal path for Responses ingress（chat 适配边界是唯一 sanctioned 合成点，且在 planner 之前）
 no HTTP bridge path for Codex WS
 ```
 
@@ -1363,7 +1493,7 @@ CI 规则：
 ```text
 providers/codex/*responses*.go may not call applyDefaultHeaders
 providers/codex/*responses*.go may not call getRequestHeaderBag
-providers/codex/*responses*.go may not call ensureStablePromptCacheKey for upstream planning
+providers/codex/responses.go may not call ensureStablePromptCacheKey for HTTP Official create/compact body planning
 providers/codex/*responses*.go may not call adaptCodexCLI
 providers/codex/*responses*.go may not import responses_ws_upstream bridge for Codex Official path
 providers/codex/wire may not import gin/model/requester
@@ -1386,21 +1516,22 @@ providers/base must not expose OpenResponsesWS(ctx, modelName, options) contract
 11. HTTP Responses provider contract 不再暴露 typed request 作为请求真相。
 12. ResponsesWS open contract 明确携带 inbound headers 和 first frame。
 13. ResponsesWS `Transport` 在 Codex Official path 只做 validation，不作为 alternate dialect selector。
+14. chat→responses 合成 body 满足与 Responses ingress 相同的 planner 约束；`temperature` / `top_p` 冲突在转换边界解决，不触发 400。
 
 ## 取舍
 
 这个方案会破坏旧 one-hub Codex provider 的隐式行为：
 
 - 旧客户端如果只发送 `session_id` / `x-session-id`，不再影响 Codex upstream identity。
-- Codex channel 中任何非空 `model_headers` 配置都会保存失败或启动失败。
+- Codex channel 中任何非空 `model_headers` 配置都会保存失败；存量配置在升级后使该渠道不可用（进程不受影响）。
 - ResponsesWS 不再自动切 HTTP bridge。
 - PI 行为不再被 Codex provider smart 推断。
-- 非 Codex official client 依赖 provider 自动注入 instructions、merge messages、normalize tools 的行为会消失。
+- 非 Codex official client 依赖 provider 自动注入 instructions、merge messages、normalize tools 的行为在 Responses ingress 上消失。需要兼容语义的客户端应走 `/v1/chat/completions` 适配边界——那里是显式转换契约，而不是 Responses ingress 的隐式 repair。
 
 这是有意的。协议代理最怕“看起来能用”的混合语义。Codex Official path 必须是单一 raw envelope protocol：relay 只收集证据，provider 只生成 official plan，transport 只发送 bytes；不兼容旧 header 拼接、typed marshal、semantic repair、WS bridge、`model_headers` 注入。
 
 最终形态：
 
 ```text
-raw envelope in, official plan out
+raw envelope + control + policy in, official plan out
 ```

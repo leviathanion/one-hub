@@ -613,7 +613,7 @@ responses_ws:
 | Gemini | `{"api_version":"v1"}` | `api_version` 可选；旧纯字符串版本号会转换为该字段 |
 | Azure Speech | `{"region":"eastasia"}` | `region` 和 `base_url` 至少配置一个；旧纯字符串区域会转换为 `region` |
 | VertexAI | `{"region":"us-central1","project_id":"my-project"}` | `region` / `project_id` 都必填；旧 `Region|ProjectID` 格式会转换为 JSON |
-| Codex | `{"websocket_mode":"auto","responses_ws_transport":"native"}` | 只允许 Codex 文档列出的有限字段；不接受 `extra` / `vendor_extra` |
+| Codex | `{"websocket_mode":"auto","responses_ws_transport":"native"}` | 只支持 native ResponsesWS；`http_bridge` 会在保存/校验时被拒绝；不接受 `extra` / `vendor_extra` |
 
 有限字段合同的 trade-off：显式 JSON 增加了一点填写成本，但可以在保存时发现拼写错误和类型错误，避免旧字符串或错字段被静默忽略。对确实需要保留 provider 私有数据的非 Codex 渠道，请放到 `extra` 或 `vendor_extra` 命名空间；运行时不会解释这两个命名空间。
 
@@ -663,7 +663,7 @@ classic Azure OpenAI (`ChannelTypeAzure`) 的 `Other` 必须是 JSON object，�
 
 ### ResponsesWS transport 🏷️ Web 后台 → 渠道
 
-OpenAI、Codex、classic Azure 等支持 ResponsesWS provider contract 的渠道可以在 `Other` JSON 中显式选择 transport：
+OpenAI、classic Azure、Azure V1、自定义 OpenAI-compatible 等支持 ResponsesWS provider contract 的渠道可以在 `Other` JSON 中显式选择 transport：
 
 ```json
 {
@@ -676,7 +676,7 @@ OpenAI、Codex、classic Azure 等支持 ResponsesWS provider contract 的渠道
 | 空 / `native` | 官方 OpenAI、Azure、Codex 默认使用真实上游 ResponsesWS / provider native WS；自定义兼容渠道需要 `responses_ws_native=true` |
 | `http_bridge` | 主动使用 HTTP Responses stream bridge 模拟 ResponsesWS，需要上游 HTTP Responses endpoint 可用 |
 
-`http_bridge` 是主动兼容模式，不是 native WS 建连失败后的自动 fallback。非法值会返回 `invalid_responses_ws_transport`。
+`http_bridge` 是主动兼容模式，不是 native WS 建连失败后的自动 fallback。Codex 不支持该模式；Codex 渠道设置 `http_bridge` 会在保存/校验时失败。其它 provider 的非法值会返回 `invalid_responses_ws_transport`。
 
 自定义兼容渠道未声明 `responses_ws_native=true` 却请求 native，或显式 bridge 缺少 HTTP Responses endpoint，会返回 `responses_ws_unsupported_for_channel`。
 
@@ -712,12 +712,12 @@ Codex 渠道作为 ResponsesWS 上游时的 `channel.Other` 配置，详见 [Cod
 
 | 字段 | 作用 |
 |------|------|
-| `websocket_mode` | `"auto"`（默认）/ `"force"` / `"off"`。`"off"` 只关闭 native websocket；未显式 `responses_ws_transport=http_bridge` 时 ResponsesWS 返回 `unsupported` |
-| `responses_ws_transport` | `"native"`（默认）/ `"http_bridge"`。显式选择 HTTP bridge 兼容模式；显式 `http_bridge` 不受 native `websocket_mode=off` 影响，也不是 native WS 建连失败后的自动 fallback |
+| `websocket_mode` | `"auto"`（默认）/ `"force"` / `"off"`。`"off"` 关闭 Codex ResponsesWS native，因此 ResponsesWS 返回 `unsupported` |
+| `responses_ws_transport` | `"native"`（默认）。Codex 不支持 `"http_bridge"`；配置后保存/校验失败，运行时也会拒绝 stale 配置 |
 | `responses_ws_self_hosted` | `true` / `false`。只允许 ResponsesWS 使用私有或本地自建上游；不影响 Codex Realtime |
 | `prompt_cache_key_strategy` | 控制 prompt cache key 的生成策略，影响 channel affinity 命中率 |
 
-HTTP bridge 是有限兼容模式：`stream` 会被 bridge 强制为 `true`，显式 `stream=false` 会被拒绝；`background=true` 暂不支持并会在请求上游前失败；`stream_options` 会按原始 JSON 透传给 HTTP `/responses`。
+Codex ResponsesWS 是 native-only。HTTP bridge 的有限兼容规则只适用于支持该 transport 的非 Codex provider：`stream` 会被 bridge 强制为 `true`，显式 `stream=false` 会被拒绝；`background=true` 暂不支持并会在请求上游前失败；`stream_options` 会按原始 JSON 透传给 HTTP `/responses`。
 
 ---
 

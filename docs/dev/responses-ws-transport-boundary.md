@@ -10,7 +10,7 @@
 
 本文以当前主线架构为基线，定义 ResponsesWS transport 边界的目标方案与迁移顺序。
 
-当前 `GET /v1/responses` 的入口层已经收敛到统一 ResponsesWS actor：下游 WebSocket、首帧解析、连接容量、RPM、quota、affinity、terminal side effect 和关闭流程都由 relay 层串行处理。provider-facing 路径使用 `providers/base.ResponsesWSProvider.OpenResponsesWS(ctx, model, options)` 返回 `common/responsesws.Upstream`；`runtime/session.RealtimeSession` / `OpenRealtimeSessionWithOptions` 只保留给 `/v1/realtime`。
+当前 `GET /v1/responses` 的入口层已经收敛到统一 ResponsesWS actor：下游 WebSocket、首帧解析、连接容量、RPM、quota、affinity、terminal side effect 和关闭流程都由 relay 层串行处理。provider-facing 路径使用 `providers/base.ResponsesWSProvider.OpenResponsesWS(ctx, *responsesws.OpenRequest)` 返回 `common/responsesws.Upstream`；`runtime/session.RealtimeSession` / `OpenRealtimeSessionWithOptions` 只保留给 `/v1/realtime`。
 
 问题不在 ingress actor，而在 provider 内部边界：
 
@@ -70,13 +70,13 @@ ResponsesWS 分四层：
 - legacy origin fallback：`DetailOrigin == ""` 有固定兼容规则；unknown non-empty detail origin 不能默默当作 provider terminal evidence。
 - provider evidence helper：provider evidence / terminal evidence / proxy-local terminal 判断必须通过统一 helper，不能在 actor 多处手写 origin 表。
 - inflight owner：actor 拥有 admission/accounting inflight；transport helper 只拥有连接和队列状态，HTTP bridge stream handle 只用于 cancel plumbing。
-- bridge rollout：`http_bridge` 曾在未实现阶段作为合法但 unsupported 的配置返回 426；当前契约是 OpenAI/Codex 显式 `http_bridge` 进入 HTTP bridge，只有 provider/channel 不支持所选 transport 或缺少 HTTP Responses endpoint 时返回 426；非法配置仍返回 400。
+- bridge rollout：`http_bridge` 曾在未实现阶段作为合法但 unsupported 的配置返回 426；当前契约是 OpenAI/Azure/OpenAI-compatible 显式 `http_bridge` 进入 HTTP bridge，只有 provider/channel 不支持所选 transport 或缺少 HTTP Responses endpoint 时返回 426；非法配置仍返回 400。Codex 是例外：Codex Official ResponsesWS native-only，`http_bridge` 在保存校验和 provider runtime 都会被拒绝。
 - bridge upstream URL policy：HTTP bridge 的最终 HTTP request URL 必须执行 ResponsesWS 专用上游 policy。默认要求 `https` public host；`responses_ws_self_hosted=true` 才允许 `http` 与 private/local host；metadata host 与 metadata 解析结果永远拒绝。显式 proxy 模式也必须先做本地 DNS fail-closed 校验；无 proxy 时必须把 HTTP dial pin 到校验得到的 IP。该检查属于 provider opener / raw stream 边界，不下沉到全局 HTTP requester，避免改变普通 HTTP relay 的兼容性和 retry 语义。Trade-off：proxy 侧 split DNS 的灵活性降低，换取携带 provider 凭据的 bridge 请求不绕过 SSRF 边界。
 - bridge open/cancel：stream open failure、stream read error、no-active cancel、cancel-terminal race 有固定 event 与 accounting 语义。
 - native recv ordering：本地 backpressure / abort / read-close lifecycle event 不得越过已经进入 recv queue 的 provider frame / evidence。
 - bridge malformed payload：HTTP bridge stream 中 malformed SSE `data:` payload 与 line-too-large 一样返回安全 `responses_ws_provider_protocol_error`，不得暴露 raw upstream line、headers、request body、session id 或 authorization material。
 - panic safety：adapter panic recovery 不直接记录 recovered 原值，只记录安全摘要和可控 debug 信息。
-- open context ownership：`OpenResponsesWS(ctx, model, options)` 的函数参数 `ctx` 是唯一 open/base context，`OpenOptions` 不携带 context。这样 retry/open worker、provider opener 与 bridge session 的 cancel source 保持单一。
+- open context ownership：`OpenResponsesWS(ctx, *responsesws.OpenRequest)` 的函数参数 `ctx` 是唯一 open/base context，`OpenRequest` 不携带 context。这样 retry/open worker、provider opener 与 bridge session 的 cancel source 保持单一。`OpenRequest` 是 provider-facing evidence envelope，携带 first frame、inbound headers、principal、selected model、transport、channel id、previous response id 和 diagnostics。
 
 ### 2026-06-08 复审修复方案
 
@@ -442,7 +442,7 @@ recv pump delivery rule：no-payload lifecycle failure event 必须投递为 `Pr
 
 ### HTTP bridge transport
 
-HTTP bridge 是 ResponsesWS 的可选兼容模式，不属于 Codex 专属能力；但 v1 不急于把它提升为完整公共 transport。第一阶段只抽共享的 stream-to-WS loop、cancel plumbing 和 event-origin 规范，OpenAI/Codex 的 request construction 与 stream parsing 继续留在 provider adapter。等两个 provider bridge 都稳定后，再判断是否提升为更宽的公共 HTTP bridge transport。
+HTTP bridge 是 ResponsesWS 的可选兼容模式，不属于 Codex 专属能力；Codex Official ResponsesWS 当前也不支持该模式。v1 不急于把 bridge 提升为完整公共 transport。第一阶段只抽共享的 stream-to-WS loop、cancel plumbing 和 event-origin 规范，OpenAI/Azure/OpenAI-compatible 的 request construction 与 stream parsing 继续留在 provider adapter。等非 Codex provider bridge 稳定后，再判断是否提升为更宽的公共 HTTP bridge transport。
 
 HTTP bridge v1 的共享职责：
 
@@ -549,13 +549,13 @@ Azure `api_version` 管理端搜索继续使用 JSON object 语义过滤，不�
 | 空 / `native` | 对官方 OpenAI、Azure、Codex 或显式 `responses_ws_native=true` 的兼容 provider 打开真实上游 ResponsesWS / provider native WS |
 | `http_bridge` | 显式用 HTTP Responses stream bridge 模拟 ResponsesWS，需要 provider HTTP `Responses` endpoint 可用 |
 
-OpenAI/Codex 的显式 `http_bridge` 通过同一 `OpenResponsesWS` provider contract 接入。未实现 `ResponsesWSProvider`、custom provider 未显式声明 native capability，或不支持所选 transport 的 provider 返回 `responses_ws_unsupported_for_channel` / HTTP 426；非法值仍返回 HTTP 400。这样合法但不受当前 provider 支持的模式与无效配置不会混在一起。
+OpenAI/Azure/OpenAI-compatible 的显式 `http_bridge` 通过同一 `OpenResponsesWS` provider contract 接入。未实现 `ResponsesWSProvider`、custom provider 未显式声明 native capability，或不支持所选 transport 的 provider 返回 `responses_ws_unsupported_for_channel` / HTTP 426；非法值仍返回 HTTP 400。Codex 的 `http_bridge` 不是合法 Codex mode，保存校验拒绝，provider runtime 对 stale rows 继续返回 unsupported。
 
-最终态不再使用迁移期 legacy `RealtimeSession` path 承载 ResponsesWS。normalized `responses_ws_transport` 只进入 `ResponsesWSProvider.OpenResponsesWS(ctx, model, responsesws.OpenOptions{Transport: ...})`；没有实现 `ResponsesWSProvider` 的 provider 返回 `responses_ws_unsupported_for_channel`，即使它仍实现 `/v1/realtime` 的 `OpenRealtimeSessionWithOptions`。
+最终态不再使用迁移期 legacy `RealtimeSession` path 承载 ResponsesWS。normalized `responses_ws_transport` 只进入 `ResponsesWSProvider.OpenResponsesWS(ctx, *responsesws.OpenRequest)`；没有实现 `ResponsesWSProvider` 的 provider 返回 `responses_ws_unsupported_for_channel`，即使它仍实现 `/v1/realtime` 的 `OpenRealtimeSessionWithOptions`。
 
 actor 需要判断“是否可以把上一轮 final response id 作为 bridge default previous_response_id”时，只依赖 `responsesws.BridgeContinuationDefaultCapable` 这类小 capability interface，不识别 `*responsesws.BridgeSession` 具体类型。Trade-off：多一个可选 interface，但 provider/helper 可以包装或替换 bridge session 而不破坏 continuation 语义；同时避免把 relay actor 重新耦合到某个 transport helper 的 concrete type。
 
-曾评估过的 temporary compatibility flag 未落地，原因是它会让 ResponsesWS 同时存在 `OpenRealtimeSessionWithOptions(...ResponsesWS...)` 与 `OpenResponsesWS` 两条 provider 入口，扩大 accounting/evidence 语义分叉。OpenAI/Codex native 与 HTTP bridge 均通过 `OpenResponsesWS`，relay/config 测试覆盖 normalized transport 不进入 legacy realtime open path 后，legacy ResponsesWS 入口视为删除完成。
+曾评估过的 temporary compatibility flag 未落地，原因是它会让 ResponsesWS 同时存在 `OpenRealtimeSessionWithOptions(...ResponsesWS...)` 与 `OpenResponsesWS` 两条 provider 入口，扩大 accounting/evidence 语义分叉。OpenAI native/HTTP bridge、Azure native/HTTP bridge、Codex native 均通过 `OpenResponsesWS`，relay/config 测试覆盖 normalized transport 不进入 legacy realtime open path 后，legacy ResponsesWS 入口视为删除完成。
 
 历史迁移映射仅作为背景，不再是运行路径：
 
@@ -577,7 +577,7 @@ actor 需要判断“是否可以把上一轮 final response id 作为 bridge de
 Codex 兼容规则：
 
 - 未设置 `responses_ws_transport` 时保持当前语义：`websocket_mode=off` 表示 ResponsesWS unsupported。
-- 显式 `responses_ws_transport=http_bridge` 时走 bridge；这是用户主动选择的兼容模式，不受 native `websocket_mode` 关闭影响。
+- `responses_ws_transport=http_bridge` 不是 Codex 支持模式；保存校验拒绝新配置，provider runtime 对 stale rows 返回 `responses_ws_unsupported_for_channel`。
 - Codex ResponsesWS 仍使用 connection-local upstream session id，不使用请求 `x-session-id` 复用 live upstream。
 
 `responses_ws.unsupported_scan_limit` 默认保持 correctness-first：`0` / 未配置时按当前加载渠道数扫描 unsupported 候选，只有明确耗尽后才返回 `responses_ws_unsupported_for_channel`。显式配置正数且低于加载渠道数时，命中上限返回 `responses_ws_unsupported_scan_limited`，不伪装成 426。未显式配置且加载渠道数超过 warning 阈值时只打一条 warning，提示管理员可以用 scan limit 换取尾延迟上限。Trade-off：默认路径在大量 unsupported 渠道下尾延迟更高，但不会因为早停错过后续 WS-capable 渠道；需要低尾延迟的部署可以显式接受 scan-limited 语义。
@@ -685,13 +685,13 @@ HTTP bridge 不和 native helper 放在同一阶段落地。它涉及配置、ty
 第二阶段再实现：
 
 - OpenAI bridge 调用现有 `CreateResponsesStream`。
-- Codex bridge 调用 responses stream 创建逻辑，但不进入 execution session manager。
+- Codex bridge 不落地；Codex Official ResponsesWS 保持 native-only，HTTP bridge 只保留为非 Codex provider 的兼容 transport。
 - bridge 只产出 event，由 actor 完成 usage merge/finalize。
 - v1 只支持显式 `responses_ws_transport=http_bridge`。
 
 ### Step 5：保持 `OpenResponsesWS` 为 ResponsesWS provider contract
 
-OpenAI/Codex 通过公共 helper 稳定后，`OpenResponsesWS(ctx, model, options)` + `responsesws.Upstream` 保持为唯一 ResponsesWS provider contract。
+OpenAI/Codex 通过公共 helper 稳定后，`OpenResponsesWS(ctx, *responsesws.OpenRequest)` + `responsesws.Upstream` 保持为唯一 ResponsesWS provider contract。
 
 它替代旧的 `OpenRealtimeSessionWithOptions(...ResponsesWS...)` 路线，而不是长期并存；长期并存会让 `/v1/realtime` 与 `/v1/responses` 的边界更混乱。
 
@@ -781,13 +781,13 @@ OpenAI/Codex 通过公共 helper 稳定后，`OpenResponsesWS(ctx, model, option
 
 - 每条 downstream ResponsesWS 打开独立 upstream WS。
 - 相同 `x-session-id` 的两条 ResponsesWS 不共享 live upstream。
-- `websocket_mode=off` 且未显式 bridge 时返回 unsupported。
+- `websocket_mode=off` 时返回 unsupported；Codex 没有 HTTP bridge fallback。
 - nested payload 改写、unknown field 保留、usage accumulator、bootstrap 过滤通过。
 - Codex provider opener 负责 upstream dial；transport helper 不解析 Codex `websocket_mode` 或 raw channel `Other`。
 
 ### HTTP bridge
 
-- OpenAI/Codex 显式 `http_bridge` 可把 stream event 转为 WS text frame。
+- OpenAI/Azure/OpenAI-compatible 显式 `http_bridge` 可把 stream event 转为 WS text frame。Codex 不支持该 transport。
 - `responses_ws.bridge_open_timeout_ms` 只保护等待 HTTP stream 打开的阶段；stream opened 后不再使用 opening timeout，继续由 active turn watchdog 管理；`<=0` 表示禁用 opening watchdog，保留慢 upstream 兼容性但扩大 opening 资源占用窗口。
 - sequential 两个 `response.create`、active stream 期间第二个 create 被 actor 拒绝为 busy / `NotSent`、create 后 cancel、terminal 后 cancel、stream EOF、stream error、usage delta 累加均覆盖。
 - `response.cancel` 在 active stream 存在时必须关闭 stream；queue full 时延迟投递 synthetic cancel 和 EOF，保持 actor 观察顺序，不保持 active stream 可重试。synthetic event 只作为 downstream ACK，不作为 provider terminal。
@@ -810,11 +810,11 @@ OpenAI/Codex 通过公共 helper 稳定后，`OpenResponsesWS(ctx, model, option
 ### 配置与 raw preservation
 
 - 空值、`native`、`http_bridge`、非法值、provider unsupported 均覆盖。
-- HTTP bridge 当前契约：OpenAI/Codex 显式 `http_bridge` 进入 bridge implementation；只有 provider/channel 不支持所选 transport 或缺少 HTTP Responses endpoint 时返回 426 unsupported；非法值仍为 400。历史未落地阶段中“合法 `http_bridge` 一律返回 426”的测试已不再代表当前行为。
+- HTTP bridge 当前契约：OpenAI/Azure/OpenAI-compatible 显式 `http_bridge` 进入 bridge implementation；只有 provider/channel 不支持所选 transport 或缺少 HTTP Responses endpoint 时返回 426 unsupported；非法值仍为 400。Codex `http_bridge` 是不支持的 Codex mode，保存校验拒绝，stale runtime 配置返回 unsupported。
 - HTTP bridge URL policy 覆盖：默认 local/private/plain HTTP 被拒绝并返回 typed local error；`responses_ws_self_hosted=true` 允许 local/plain HTTP；metadata IP/hostname 即使 self-hosted 也拒绝，至少覆盖 `169.254.169.254`、`100.100.100.200`、`fd00:ec2::254` 和 `metadata.google.internal`。
 - normalized transport 不进入 legacy `RealtimeOpenOptions`；native / http_bridge 均只进入 `OpenResponsesWS` 或返回 provider unsupported。目标 bridge path 不通过 Codex execution session manager。
 - 新增 `UpstreamEvent.DetailOrigin` / `DetailPhase` 前审计所有 `responsesws.UpstreamEvent` literal，确保没有 unkeyed literal 遗留。
-- Codex `websocket_mode=off` + 显式 bridge 组合覆盖。
+- Codex `websocket_mode=off` 返回 unsupported、Codex `responses_ws_transport=http_bridge` 保存校验/运行时拒绝均覆盖。
 - `responses_ws_transport` 只由统一 helper 解析/校验，relay open path 与 model validation 不得各自手写取值表；provider 不直接读取 raw `Other` JSON。
 - OpenAI inline 与 Codex nested payload 改写都验证 unknown raw fields 不丢失；该 raw preservation 不依赖、不读取普通 HTTP relay 的 `AllowExtraBody`。
 

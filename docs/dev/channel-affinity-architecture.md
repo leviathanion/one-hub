@@ -60,12 +60,14 @@ lastUpdated: true
 
 - `responses` 请求在 `relay/channel_affinity.go` 的 `prepareResponsesChannelAffinity(...)` 阶段先调用 `requesthints.ResolveResponses(...)`。
 - Codex routing hint 通过 `providers/codex/routing_hint.go` 生成 `responses.prompt_cache_key`。
-- affinity lookup 和 provider 最终请求都消费同一个 hint；provider 不再在选路之后独占生成 `prompt_cache_key`。
+- affinity lookup 和 Codex Official HTTP provider 最终请求都消费同一个 hint；relay 把该 hint 作为 `Request.Policy.PromptCache` 交给 provider，BodyPlanner 只负责把同一个 decision 序列化进 upstream body。
+- 仅配置 `channel.Other.prompt_cache_key_strategy` 时，Codex Official HTTP `/v1/responses` 不会在选中渠道后生成 `Policy.PromptCache` 并写入上游 body。需要自动生成 HTTP `prompt_cache_key` 或选路前命中时，必须配置 `CodexRoutingHintSetting`。
 
 选择原因：
 
 - 如果稳定 hint 只在 provider 内部事后生成，记录 affinity 和命中 affinity 发生在两个时间层，路由阶段无法看到真正的稳定亲和键。
 - 对 prompt cache 这类会直接影响渠道选择的键，必须在选路之前固定下来。
+- 这里的取舍是把会影响 provider selection 的事实固定在 relay 层；`channel.Other.prompt_cache_key_strategy` 只保留 legacy Realtime/bridge 行为，不再被描述为 Official HTTP 的后选路 body policy。
 
 ### 4. Codex realtime 采用“共享 binding hint + 本地 runtime owner”，不做 strict distributed owner
 

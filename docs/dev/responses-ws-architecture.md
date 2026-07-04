@@ -330,7 +330,7 @@ Terminal side effects 顺序是 actor contract：先 merge terminal usage 并 fi
 
 1. 按 pinned / owner affinity / fresh 规则选 channel。显式 pinned channel 可以 raw `fetchChannelById`；owner/preferred affinity 走 normal selector 的 strict preferred path，不能绕过 group/model/filter/cooldown/skip eligibility。
 2. 若 channel 明确不支持 ResponsesWS：fresh 或非 strict preferred affinity skip 当前 channel；pinned 或 strict owner affinity 写 wrapped fallback frame。
-3. 为本 downstream WS 连接生成内部 upstream session id，并通过 provider 的 `OpenResponsesWS(ctx, model, responsesws.OpenOptions{UpstreamSessionID: ...})` 打开专用 upstream。该内部 id 不来自客户端 `x-session-id`，首帧 retry 其它候选 channel 时复用同一个内部 id。
+3. 为本 downstream WS 连接生成内部 upstream session id，并通过 provider 的 `OpenResponsesWS(ctx, *responsesws.OpenRequest)` 打开专用 upstream。`OpenRequest` 携带 first frame、inbound headers、principal、selected model、transport、channel id、previous response id 和 diagnostics；该内部 id 不来自客户端 `x-session-id`，首帧 retry 其它候选 channel 时复用同一个内部 id。
 4. actor 记录 `sessionChannelID`，只表示物理 session owner，不写共享 affinity。
 5. actor 冻结本连接的 upstream snapshot：channel、resolved base URL、原始/上游/billing model、billing flag 与 pre-cost；不存储 `key_fingerprint`。后续结算、日志和 continuation miss 诊断使用 snapshot，不重新读取 live channel 配置推导本连接事实。
 6. `PrepareResponsesWSTurnAttempt(...)` 完成 prompt-token 估算、quota 对象创建和 passive sink 准备，不执行 quota/RPM 副作用。
