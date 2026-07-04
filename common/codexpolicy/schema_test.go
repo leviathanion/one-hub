@@ -8,14 +8,28 @@ func TestKnownKeyAndResidencyGrammar(t *testing.T) {
 		KeyResidency,
 		KeyDefaultOriginator,
 		KeyTrustClientAttestation,
-		KeyGenerateProxyInstallationID,
+		KeyAutoGenerate,
 	} {
 		if !KnownKey(key) {
 			t.Fatalf("expected %q to be a known Codex policy key", key)
 		}
 	}
+	for _, key := range []string{
+		AutoGenerateSessionID,
+		AutoGenerateThreadID,
+		AutoGenerateClientRequestID,
+		AutoGenerateInstallationID,
+		AutoGenerateWSStreamRequestStartMS,
+	} {
+		if !KnownAutoGenerateKey(key) {
+			t.Fatalf("expected %q to be a known Codex auto_generate key", key)
+		}
+	}
 	if KnownKey("legacy_profile") {
 		t.Fatal("expected legacy_profile to be rejected by shared key schema")
+	}
+	if KnownAutoGenerateKey("everything") {
+		t.Fatal("expected unknown auto_generate key to be rejected")
 	}
 
 	if !ValidResidency("us-east:fedramp") {

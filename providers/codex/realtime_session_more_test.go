@@ -34,9 +34,12 @@ import (
 )
 
 func openCodexResponsesWSTestSession(provider *CodexProvider, ctx context.Context, model string, req responsesws.OpenRequest) (responsesws.Upstream, *types.OpenAIErrorWithStatusCode) {
-	frame, err := responsesws.ParseRawResponsesCreateFrame([]byte(`{"type":"response.create","model":"` + model + `","input":"hello"}`))
-	if err != nil {
-		panic(err)
+	if req.FirstFrame == nil {
+		frame, err := responsesws.ParseRawResponsesCreateFrame([]byte(`{"type":"response.create","model":"` + model + `","input":"hello"}`))
+		if err != nil {
+			panic(err)
+		}
+		req.FirstFrame = frame
 	}
 	headers := requestctx.HeaderSnapshot{}
 	principal := requestctx.Principal{}
@@ -47,7 +50,6 @@ func openCodexResponsesWSTestSession(provider *CodexProvider, ctx context.Contex
 		principal = requestctx.PrincipalFromGin(provider.Context)
 	}
 	req.InboundHeaders = headers
-	req.FirstFrame = frame
 	req.Principal = principal
 	req.SelectedModel = model
 	return provider.OpenResponsesWS(ctx, &req)
@@ -375,8 +377,18 @@ func TestCodexResponsesWSNativeRejectsMismatchedSubsequentMetadataBeforeWrite(t 
 	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"force"}`, nil)
 	provider.Channel.BaseURL = stringPtr(server.URL)
 
+	openFrame, err := responsesws.ParseRawResponsesCreateFrame([]byte(`{
+		"type":"response.create",
+		"model":"gpt-5",
+		"input":"hello",
+		"client_metadata":{"session_id":"sess-open"}
+	}`))
+	if err != nil {
+		t.Fatalf("parse open frame: %v", err)
+	}
 	session, errWithCode := openCodexResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
 		UpstreamSessionID: "responses-ws-metadata-mismatch-test",
+		FirstFrame:        openFrame,
 	})
 	if errWithCode != nil {
 		t.Fatalf("open ResponsesWS session: %v", errWithCode)

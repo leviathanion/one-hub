@@ -181,12 +181,27 @@ func TestPrepareResponsesOfficialHTTPRequestErrorBranches(t *testing.T) {
 
 	t.Run("channel policy error", func(t *testing.T) {
 		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", nil)
-		staleModelHeaders := `{"User-Agent":"custom"}`
-		provider.Channel.ModelHeaders = &staleModelHeaders
+		modelHeaders := `{"User-Agent":"custom"}`
+		provider.Channel.ModelHeaders = &modelHeaders
 		req := newRawReq(t, `{"model":"gpt-5","input":"hello"}`, nil)
 		_, errWithCode := provider.prepareResponsesOfficialHTTPRequest(context.Background(), req, wire.OpResponsesCreate, "", "gpt-5", body)
 		if errWithCode == nil || errWithCode.StatusCode != http.StatusServiceUnavailable || errWithCode.Code != "channel_config_error" {
 			t.Fatalf("expected channel config error, got %+v", errWithCode)
+		}
+	})
+
+	t.Run("missing codex identity secret", func(t *testing.T) {
+		original := config.CodexIdentitySecret
+		config.CodexIdentitySecret = ""
+		t.Cleanup(func() {
+			config.CodexIdentitySecret = original
+		})
+
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"codex":{"auto_generate":{"installation_id":true}}}`, nil)
+		req := newRawReq(t, `{"model":"gpt-5","input":"hello"}`, nil)
+		_, errWithCode := provider.prepareResponsesOfficialHTTPRequest(context.Background(), req, wire.OpResponsesCreate, "", "gpt-5", body)
+		if errWithCode == nil || errWithCode.StatusCode != http.StatusServiceUnavailable || errWithCode.Code != "channel_config_error" || !strings.Contains(errWithCode.Message, "codex_identity_secret") {
+			t.Fatalf("expected missing codex identity secret channel config error, got %+v", errWithCode)
 		}
 	})
 

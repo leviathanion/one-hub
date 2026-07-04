@@ -16,11 +16,11 @@ import (
 )
 
 type codexOfficialPolicyConfig struct {
-	FedRAMP                     bool   `json:"fedramp"`
-	Residency                   string `json:"residency"`
-	DefaultOriginator           string `json:"default_originator"`
-	TrustClientAttestation      bool   `json:"trust_client_attestation"`
-	GenerateProxyInstallationID *bool  `json:"generate_proxy_installation_id"`
+	FedRAMP                bool
+	Residency              string
+	DefaultOriginator      string
+	TrustClientAttestation bool
+	AutoGenerate           wire.AutoGeneratePolicy
 }
 
 func (p *CodexProvider) codexOfficialChannelPolicy() (wire.ChannelPolicy, error) {
@@ -50,8 +50,7 @@ func (p *CodexProvider) codexOfficialChannelPolicy() (wire.ChannelPolicy, error)
 
 func defaultCodexOfficialChannelPolicy() wire.ChannelPolicy {
 	return wire.ChannelPolicy{
-		DefaultOriginator:           "codex_cli_rs",
-		GenerateProxyInstallationID: true,
+		DefaultOriginator: "codex_cli_rs",
 	}
 }
 
@@ -68,15 +67,11 @@ func codexOfficialPolicyCacheKey(channel *model.Channel) string {
 
 func parseCodexOfficialChannelPolicy(channel *model.Channel) (wire.ChannelPolicy, error) {
 	policy := wire.ChannelPolicy{
-		DefaultOriginator:           "codex_cli_rs",
-		GenerateProxyInstallationID: true,
+		DefaultOriginator: "codex_cli_rs",
 	}
 	if channel == nil {
 		return policy, nil
 	}
-	// Save-time validation rejects model_headers on Codex channels; rows that
-	// predate that rule degrade to a channel-scoped config error here instead
-	// of silently adding a second header author to the official plan.
 	if !codexModelHeadersEmpty(channel.ModelHeaders) {
 		return policy, fmt.Errorf("model_headers is not supported for Codex channels; clear it and use other.codex structured policy")
 	}
@@ -109,9 +104,7 @@ func parseCodexOfficialChannelPolicy(channel *model.Channel) (wire.ChannelPolicy
 		policy.DefaultOriginator = defaultOriginator
 	}
 	policy.TrustClientAttestation = cfg.TrustClientAttestation
-	if cfg.GenerateProxyInstallationID != nil {
-		policy.GenerateProxyInstallationID = *cfg.GenerateProxyInstallationID
-	}
+	policy.AutoGenerate = cfg.AutoGenerate
 	return policy, nil
 }
 
@@ -148,37 +141,64 @@ func parseCodexOfficialPolicyConfig(raw json.RawMessage) (codexOfficialPolicyCon
 			if err := json.Unmarshal(value, &cfg.TrustClientAttestation); err != nil {
 				return cfg, fmt.Errorf("other.codex.%s must be a boolean: %w", key, err)
 			}
-		case codexpolicy.KeyGenerateProxyInstallationID:
-			var enabled bool
-			if err := json.Unmarshal(value, &enabled); err != nil {
-				return cfg, fmt.Errorf("other.codex.%s must be a boolean: %w", key, err)
+		case codexpolicy.KeyAutoGenerate:
+			autoGenerate, err := parseCodexOfficialAutoGenerateConfig(value)
+			if err != nil {
+				return cfg, err
 			}
-			cfg.GenerateProxyInstallationID = &enabled
+			cfg.AutoGenerate = autoGenerate
 		}
 	}
 	return cfg, nil
 }
 
-func (p *CodexProvider) codexPrincipalFingerprint(principal requestctx.Principal) wire.PrincipalFingerprint {
-	if principal.IsZero() {
-		return wire.PrincipalFingerprint{}
+func parseCodexOfficialAutoGenerateConfig(raw json.RawMessage) (wire.AutoGeneratePolicy, error) {
+	var policy wire.AutoGeneratePolicy
+	nested := make(map[string]json.RawMessage)
+	if err := json.Unmarshal(raw, &nested); err != nil || nested == nil {
+		if err == nil {
+			err = fmt.Errorf("other.codex.auto_generate must be a JSON object")
+		}
+		return policy, err
 	}
-	mac := hmac.New(sha256.New, []byte(codexIdentityHMACKey()))
+	for key, value := range nested {
+		if !codexpolicy.KnownAutoGenerateKey(key) {
+			return policy, fmt.Errorf("other.codex.auto_generate.%s is not supported", key)
+		}
+		var enabled bool
+		if err := json.Unmarshal(value, &enabled); err != nil {
+			return policy, fmt.Errorf("other.codex.auto_generate.%s must be a boolean: %w", key, err)
+		}
+		switch key {
+		case codexpolicy.AutoGenerateSessionID:
+			policy.SessionID = enabled
+		case codexpolicy.AutoGenerateThreadID:
+			policy.ThreadID = enabled
+		case codexpolicy.AutoGenerateClientRequestID:
+			policy.ClientRequestID = enabled
+		case codexpolicy.AutoGenerateInstallationID:
+			policy.InstallationID = enabled
+		case codexpolicy.AutoGenerateWSStreamRequestStartMS:
+			policy.WSStreamRequestStartMS = enabled
+		}
+	}
+	return policy, nil
+}
+
+func (p *CodexProvider) codexPrincipalFingerprint(principal requestctx.Principal) (wire.PrincipalFingerprint, error) {
+	secret := strings.TrimSpace(config.CodexIdentitySecret)
+	if secret == "" {
+		return wire.PrincipalFingerprint{}, fmt.Errorf("codex_identity_secret is required when other.codex.auto_generate.installation_id is enabled")
+	}
+	if principal.IsZero() {
+		return wire.PrincipalFingerprint{}, nil
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
 	_, _ = mac.Write([]byte(principal.Kind + ":" + principal.StableID))
 	return wire.PrincipalFingerprint{
 		Kind: principal.Kind,
 		HMAC: hex.EncodeToString(mac.Sum(nil)),
-	}
-}
-
-// codexIdentityHMACKey prefers the dedicated long-lived identity secret; the
-// SessionSecret fallback keeps deployments working but ties generated identity
-// stability to session-secret rotation.
-func codexIdentityHMACKey() string {
-	if config.CodexIdentitySecret != "" {
-		return config.CodexIdentitySecret
-	}
-	return config.SessionSecret
+	}, nil
 }
 
 func codexModelHeadersEmpty(raw *string) bool {

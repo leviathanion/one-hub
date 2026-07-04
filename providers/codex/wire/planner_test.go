@@ -120,8 +120,8 @@ func TestResponsesCreatePlannerUsesOfficialHeadersAndRawBody(t *testing.T) {
 	if got := upstreamHeaders.Get("thread-id"); got != "thread-body" {
 		t.Fatalf("expected thread-id from body metadata, got %q", got)
 	}
-	if got := upstreamHeaders.Get("x-client-request-id"); got != "thread-body" {
-		t.Fatalf("expected client request id to fall back to thread-id, got %q", got)
+	if got := upstreamHeaders.Get("x-client-request-id"); got != "" {
+		t.Fatalf("expected missing client request id to stay absent by default, got %q", got)
 	}
 	if got := upstreamHeaders.Get("x-codex-installation-id"); got != "install-body" {
 		t.Fatalf("expected create installation id from body metadata, got %q", got)
@@ -285,7 +285,7 @@ func TestValidUnixMillisStringRejectsOutOfRangeValues(t *testing.T) {
 	}
 }
 
-func TestResolveIdentityFallbacksAndRejectsBadSingletonHeaders(t *testing.T) {
+func TestResolveIdentityDefaultsAndRejectsBadSingletonHeaders(t *testing.T) {
 	identity, _, err := ResolveIdentity(IdentityInput{
 		Operation: OpResponsesCreate,
 		Headers: snapshot(map[string][]string{
@@ -305,11 +305,11 @@ func TestResolveIdentityFallbacksAndRejectsBadSingletonHeaders(t *testing.T) {
 	if identity.Originator != "codex_cli_rs" {
 		t.Fatalf("expected default originator, got %q", identity.Originator)
 	}
-	if identity.SessionID == "" || identity.ThreadID == "" || identity.ClientRequestID != identity.ThreadID {
-		t.Fatalf("expected generated session/thread and client request fallback, got %+v", identity)
+	if identity.SessionID != "" || identity.ThreadID != "" || identity.ClientRequestID != "" {
+		t.Fatalf("expected missing identity headers to stay absent by default, got %+v", identity)
 	}
-	if identity.Sources["session-id"] != SourceGenerated || identity.Sources["thread-id"] != SourceGenerated {
-		t.Fatalf("expected generated sources for empty identity fields, got %+v", identity.Sources)
+	if _, ok := identity.Sources["session-id"]; ok {
+		t.Fatalf("expected no generated source for missing session-id, got %+v", identity.Sources)
 	}
 
 	_, _, err = ResolveIdentity(IdentityInput{
@@ -329,14 +329,35 @@ func TestResolveIdentityFallbacksAndRejectsBadSingletonHeaders(t *testing.T) {
 	}
 }
 
-func TestResponsesCreateOmitsMissingInstallationID(t *testing.T) {
-	identity, decisions, err := ResolveIdentity(IdentityInput{
+func TestResolveIdentityAutoGeneratesOnlyWhenPolicyEnablesIt(t *testing.T) {
+	identity, _, err := ResolveIdentity(IdentityInput{
 		Operation: OpResponsesCreate,
 		Headers:   snapshot(nil),
 		Policy: ChannelPolicy{
-			DefaultOriginator:           "codex_cli_rs",
-			GenerateProxyInstallationID: true,
+			DefaultOriginator: "codex_cli_rs",
+			AutoGenerate: AutoGeneratePolicy{
+				SessionID:       true,
+				ThreadID:        true,
+				ClientRequestID: true,
+			},
 		},
+	})
+	if err != nil {
+		t.Fatalf("expected auto-generated identity to resolve, got %v", err)
+	}
+	if identity.SessionID == "" || identity.ThreadID == "" || identity.ClientRequestID != identity.ThreadID {
+		t.Fatalf("expected opt-in generated session/thread/client request identity, got %+v", identity)
+	}
+	if identity.Sources["session-id"] != SourceGenerated || identity.Sources["thread-id"] != SourceGenerated || identity.Sources["x-client-request-id"] != SourceGenerated {
+		t.Fatalf("expected generated sources when opt-in is enabled, got %+v", identity.Sources)
+	}
+}
+
+func TestResponsesCreateInstallationIDAutoGenerationIsOptIn(t *testing.T) {
+	identity, decisions, err := ResolveIdentity(IdentityInput{
+		Operation: OpResponsesCreate,
+		Headers:   snapshot(nil),
+		Policy:    ChannelPolicy{DefaultOriginator: "codex_cli_rs"},
 		Principal: PrincipalFingerprint{Kind: "api_key", HMAC: "principal-hmac"},
 		ChannelID: 42,
 	})
@@ -355,6 +376,35 @@ func TestResponsesCreateOmitsMissingInstallationID(t *testing.T) {
 	}
 	if !foundOmit {
 		t.Fatalf("expected installation id omit decision, got %+v", decisions)
+	}
+
+	identity, _, err = ResolveIdentity(IdentityInput{
+		Operation: OpResponsesCreate,
+		Headers:   snapshot(nil),
+		Policy: ChannelPolicy{
+			DefaultOriginator: "codex_cli_rs",
+			AutoGenerate:      AutoGeneratePolicy{InstallationID: true},
+		},
+		Principal: PrincipalFingerprint{Kind: "api_key", HMAC: "principal-hmac"},
+		ChannelID: 42,
+	})
+	if err != nil {
+		t.Fatalf("resolve identity with opt-in installation id: %v", err)
+	}
+	if identity.InstallationID == "" || identity.Sources["x-codex-installation-id"] != SourceGenerated {
+		t.Fatalf("expected ordinary create installation id to be generated when opt-in is enabled, got %+v", identity)
+	}
+	plan, err := BuildHeaders(HeaderPlanInput{
+		Operation:  OpResponsesCreate,
+		Credential: Credential{AccessToken: "upstream-token"},
+		Policy:     ChannelPolicy{DefaultOriginator: "codex_cli_rs", AutoGenerate: AutoGeneratePolicy{InstallationID: true}},
+		Identity:   identity,
+	})
+	if err != nil {
+		t.Fatalf("build create headers with opt-in installation id: %v", err)
+	}
+	if got := plan.HTTPHeader().Get("x-codex-installation-id"); got != identity.InstallationID {
+		t.Fatalf("expected generated create installation id header, got %q want %q", got, identity.InstallationID)
 	}
 }
 
@@ -415,7 +465,7 @@ func TestCompactPlannerOmitsClientMetadataAndProjectsInstallationID(t *testing.T
 	identity, _, err := ResolveIdentity(IdentityInput{
 		Operation: OpResponsesCompact,
 		Metadata:  metadata,
-		Policy:    ChannelPolicy{DefaultOriginator: "codex_cli_rs", GenerateProxyInstallationID: true},
+		Policy:    ChannelPolicy{DefaultOriginator: "codex_cli_rs"},
 		Principal: PrincipalFingerprint{Kind: "user", HMAC: "principal-hmac"},
 		ChannelID: 11,
 	})
@@ -425,7 +475,7 @@ func TestCompactPlannerOmitsClientMetadataAndProjectsInstallationID(t *testing.T
 	plan, err := BuildHeaders(HeaderPlanInput{
 		Operation:  OpResponsesCompact,
 		Credential: Credential{AccessToken: "upstream-token"},
-		Policy:     ChannelPolicy{DefaultOriginator: "codex_cli_rs", GenerateProxyInstallationID: true},
+		Policy:     ChannelPolicy{DefaultOriginator: "codex_cli_rs"},
 		Identity:   identity,
 	})
 	if err != nil {
@@ -440,6 +490,57 @@ func TestCompactPlannerOmitsClientMetadataAndProjectsInstallationID(t *testing.T
 	}
 	if got := headers.Get("OpenAI-Beta"); got != "" {
 		t.Fatalf("expected compact HTTP headers to omit OpenAI-Beta, got %q", got)
+	}
+}
+
+func TestCompactInstallationIDAutoGenerationIsOptIn(t *testing.T) {
+	policy := ChannelPolicy{DefaultOriginator: "codex_cli_rs"}
+	identity, _, err := ResolveIdentity(IdentityInput{
+		Operation: OpResponsesCompact,
+		Policy:    policy,
+		Principal: PrincipalFingerprint{Kind: "api_key", HMAC: "principal-hmac"},
+		ChannelID: 42,
+	})
+	if err != nil {
+		t.Fatalf("resolve default compact identity: %v", err)
+	}
+	plan, err := BuildHeaders(HeaderPlanInput{
+		Operation:  OpResponsesCompact,
+		Credential: Credential{AccessToken: "upstream-token"},
+		Policy:     policy,
+		Identity:   identity,
+	})
+	if err != nil {
+		t.Fatalf("build default compact headers: %v", err)
+	}
+	if got := plan.HTTPHeader().Get("x-codex-installation-id"); got != "" {
+		t.Fatalf("expected compact installation id to be absent by default, got %q", got)
+	}
+
+	policy.AutoGenerate.InstallationID = true
+	identity, _, err = ResolveIdentity(IdentityInput{
+		Operation: OpResponsesCompact,
+		Policy:    policy,
+		Principal: PrincipalFingerprint{Kind: "api_key", HMAC: "principal-hmac"},
+		ChannelID: 42,
+	})
+	if err != nil {
+		t.Fatalf("resolve opt-in compact identity: %v", err)
+	}
+	if identity.InstallationID == "" || identity.Sources["x-codex-installation-id"] != SourceGenerated {
+		t.Fatalf("expected compact installation id to be generated when opt-in is enabled, got %+v", identity)
+	}
+	plan, err = BuildHeaders(HeaderPlanInput{
+		Operation:  OpResponsesCompact,
+		Credential: Credential{AccessToken: "upstream-token"},
+		Policy:     policy,
+		Identity:   identity,
+	})
+	if err != nil {
+		t.Fatalf("build opt-in compact headers: %v", err)
+	}
+	if got := plan.HTTPHeader().Get("x-codex-installation-id"); got != identity.InstallationID {
+		t.Fatalf("expected generated compact installation id header, got %q want %q", got, identity.InstallationID)
 	}
 }
 
@@ -570,7 +671,7 @@ func TestResponsesWSPlannerFiltersHandshakeAndPatchesFrameMetadata(t *testing.T)
 		Operation: OpResponsesWSOpen,
 		Headers:   headers,
 		Metadata:  metadata,
-		Policy:    ChannelPolicy{DefaultOriginator: "codex_cli_rs", GenerateProxyInstallationID: true},
+		Policy:    ChannelPolicy{DefaultOriginator: "codex_cli_rs"},
 		Principal: PrincipalFingerprint{Kind: "api_key", HMAC: "principal-hmac"},
 		ChannelID: 12,
 	})
@@ -581,7 +682,7 @@ func TestResponsesWSPlannerFiltersHandshakeAndPatchesFrameMetadata(t *testing.T)
 		Operation:  OpResponsesWSOpen,
 		Headers:    headers,
 		Credential: Credential{AccessToken: "upstream-token", AccountID: "acct-123"},
-		Policy:     ChannelPolicy{DefaultOriginator: "codex_cli_rs", GenerateProxyInstallationID: true},
+		Policy:     ChannelPolicy{DefaultOriginator: "codex_cli_rs"},
 		Identity:   identity,
 	})
 	if err != nil {
@@ -629,11 +730,67 @@ func TestResponsesWSPlannerFiltersHandshakeAndPatchesFrameMetadata(t *testing.T)
 	if string(clientMetadata["ws_request_header_x_openai_internal_codex_responses_lite"]) != `"true"` {
 		t.Fatalf("expected responses-lite metadata stamp, got %s", object["client_metadata"])
 	}
+	if _, ok := clientMetadata["x-codex-ws-stream-request-start-ms"]; ok {
+		t.Fatalf("expected stream-start stamp to stay absent by default, got %s", object["client_metadata"])
+	}
+	if _, ok := clientMetadata["x-codex-installation-id"]; ok {
+		t.Fatalf("expected missing installation id to stay absent by default, got %s", object["client_metadata"])
+	}
+}
+
+func TestResponsesWSPlannerAutoGeneratesOptInMetadata(t *testing.T) {
+	frame, err := responsesws.ParseRawResponsesCreateFrame([]byte(`{"type":"response.create","model":"gpt-5","input":"hi"}`))
+	if err != nil {
+		t.Fatalf("parse frame: %v", err)
+	}
+	policy := ChannelPolicy{
+		DefaultOriginator: "codex_cli_rs",
+		AutoGenerate: AutoGeneratePolicy{
+			SessionID:              true,
+			ThreadID:               true,
+			ClientRequestID:        true,
+			InstallationID:         true,
+			WSStreamRequestStartMS: true,
+		},
+	}
+	metadata, err := MetadataFromResponsesFrame(frame)
+	if err != nil {
+		t.Fatalf("metadata from frame: %v", err)
+	}
+	identity, _, err := ResolveIdentity(IdentityInput{
+		Operation: OpResponsesWSOpen,
+		Metadata:  metadata,
+		Policy:    policy,
+		Principal: PrincipalFingerprint{Kind: "api_key", HMAC: "principal-hmac"},
+		ChannelID: 12,
+	})
+	if err != nil {
+		t.Fatalf("resolve identity: %v", err)
+	}
+	if identity.SessionID == "" || identity.ThreadID == "" || identity.ClientRequestID != identity.ThreadID || identity.InstallationID == "" {
+		t.Fatalf("expected opt-in generated identity, got %+v", identity)
+	}
+	encoded, err := PlanResponsesWSFrame(frame, FramePatchInput{
+		Identity:                           identity,
+		Model:                              "gpt-5-codex",
+		AutoGenerateWSStreamRequestStartMS: policy.AutoGenerate.WSStreamRequestStartMS,
+		Clock:                              fixedClock{now: time.UnixMilli(1710000000123)},
+	})
+	if err != nil {
+		t.Fatalf("plan WS frame: %v", err)
+	}
+	object := mustDecodeObject(t, encoded)
+	var clientMetadata map[string]json.RawMessage
+	if err := json.Unmarshal(object["client_metadata"], &clientMetadata); err != nil {
+		t.Fatalf("decode frame client_metadata: %v body=%s", err, encoded)
+	}
+	for _, key := range []string{"session_id", "thread_id", "x-codex-installation-id", "x-codex-ws-stream-request-start-ms"} {
+		if string(clientMetadata[key]) == "" {
+			t.Fatalf("expected %s to be generated when opt-in is enabled, got %s", key, object["client_metadata"])
+		}
+	}
 	if string(clientMetadata["x-codex-ws-stream-request-start-ms"]) != `"1710000000123"` {
 		t.Fatalf("expected deterministic stream-start stamp, got %s", object["client_metadata"])
-	}
-	if string(clientMetadata["x-codex-installation-id"]) == "" {
-		t.Fatalf("expected generated installation id to be patched into frame metadata, got %s", object["client_metadata"])
 	}
 }
 

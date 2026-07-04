@@ -475,8 +475,12 @@ func validateCodexOfficialPolicyField(fieldName string, raw json.RawMessage) err
 			return fmt.Errorf("%s is not supported for Codex channels", nestedField)
 		}
 		switch key {
-		case codexpolicy.KeyFedRAMP, codexpolicy.KeyTrustClientAttestation, codexpolicy.KeyGenerateProxyInstallationID:
+		case codexpolicy.KeyFedRAMP, codexpolicy.KeyTrustClientAttestation:
 			if err := validateCodexBoolField(nestedField, value); err != nil {
+				return err
+			}
+		case codexpolicy.KeyAutoGenerate:
+			if err := validateCodexOfficialAutoGenerateField(nestedField, value); err != nil {
 				return err
 			}
 		case codexpolicy.KeyResidency, codexpolicy.KeyDefaultOriginator:
@@ -495,6 +499,26 @@ func validateCodexOfficialPolicyField(fieldName string, raw json.RawMessage) err
 					return fmt.Errorf("%s is invalid", nestedField)
 				}
 			}
+		}
+	}
+	return nil
+}
+
+func validateCodexOfficialAutoGenerateField(fieldName string, raw json.RawMessage) error {
+	parsed := make(map[string]json.RawMessage)
+	if err := json.Unmarshal(raw, &parsed); err != nil || parsed == nil {
+		if err == nil {
+			err = fmt.Errorf("must be a JSON object")
+		}
+		return fmt.Errorf("%s must be a JSON object: %w", fieldName, err)
+	}
+	for key, value := range parsed {
+		nestedField := fieldName + "." + key
+		if !codexpolicy.KnownAutoGenerateKey(key) {
+			return fmt.Errorf("%s is not supported for Codex channels", nestedField)
+		}
+		if err := validateCodexBoolField(nestedField, value); err != nil {
+			return err
 		}
 	}
 	return nil

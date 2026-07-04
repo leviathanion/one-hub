@@ -113,7 +113,13 @@ func TestValidateCodexChannelOtherAcceptsDocumentedFields(t *testing.T) {
 				"residency":"us",
 				"default_originator":"codex_cli_rs",
 				"trust_client_attestation":false,
-				"generate_proxy_installation_id":true
+				"auto_generate":{
+					"session_id":true,
+					"thread_id":true,
+					"client_request_id":true,
+					"installation_id":true,
+					"ws_stream_request_start_ms":true
+				}
 			}
 		}`,
 	}
@@ -162,6 +168,21 @@ func TestValidateCodexChannelOtherRejectsUnknownOfficialPolicyKeys(t *testing.T)
 			name:     "codex policy invalid default originator",
 			other:    `{"codex":{"default_originator":"bad value"}}`,
 			contains: "other.codex.default_originator",
+		},
+		{
+			name:     "codex auto generate not object",
+			other:    `{"codex":{"auto_generate":true}}`,
+			contains: "other.codex.auto_generate",
+		},
+		{
+			name:     "codex auto generate unknown key",
+			other:    `{"codex":{"auto_generate":{"everything":true}}}`,
+			contains: "other.codex.auto_generate.everything",
+		},
+		{
+			name:     "codex auto generate non bool",
+			other:    `{"codex":{"auto_generate":{"session_id":"true"}}}`,
+			contains: "other.codex.auto_generate.session_id",
 		},
 	}
 	for _, tt := range cases {

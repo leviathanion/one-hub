@@ -360,6 +360,13 @@ func (p *CodexProvider) prepareResponsesOfficialHTTPRequest(ctx context.Context,
 	if err != nil {
 		return nil, common.ErrorWrapperLocal(err, "channel_config_error", http.StatusServiceUnavailable)
 	}
+	principal := wire.PrincipalFingerprint{}
+	if policy.AutoGenerate.InstallationID {
+		principal, err = p.codexPrincipalFingerprint(req.Principal)
+		if err != nil {
+			return nil, common.ErrorWrapperLocal(err, "channel_config_error", http.StatusServiceUnavailable)
+		}
+	}
 	token, tokenErr := p.GetToken()
 	if tokenErr != nil {
 		return nil, p.handleTokenError(tokenErr)
@@ -369,7 +376,7 @@ func (p *CodexProvider) prepareResponsesOfficialHTTPRequest(ctx context.Context,
 		Headers:   req.Headers,
 		Metadata:  metadata,
 		Policy:    policy,
-		Principal: p.codexPrincipalFingerprint(req.Principal),
+		Principal: principal,
 		ChannelID: req.ChannelID,
 		Clock:     wire.RealClock{},
 	})

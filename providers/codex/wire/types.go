@@ -37,7 +37,6 @@ const (
 	SourceGenerated     Source = "proxy_generated"
 	SourceCredential    Source = "channel_credential"
 	SourceProtocol      Source = "protocol"
-	SourceModel         Source = "model_capability"
 )
 
 type Clock interface {
@@ -49,12 +48,19 @@ type RealClock struct{}
 func (RealClock) Now() time.Time { return time.Now() }
 
 type ChannelPolicy struct {
-	FedRAMP                     bool
-	Residency                   string
-	DefaultOriginator           string
-	TrustClientAttestation      bool
-	GenerateProxyInstallationID bool
-	ResponsesLite               bool
+	FedRAMP                bool
+	Residency              string
+	DefaultOriginator      string
+	TrustClientAttestation bool
+	AutoGenerate           AutoGeneratePolicy
+}
+
+type AutoGeneratePolicy struct {
+	SessionID              bool `json:"session_id"`
+	ThreadID               bool `json:"thread_id"`
+	ClientRequestID        bool `json:"client_request_id"`
+	InstallationID         bool `json:"installation_id"`
+	WSStreamRequestStartMS bool `json:"ws_stream_request_start_ms"`
 }
 
 type Credential struct {

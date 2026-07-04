@@ -225,7 +225,7 @@ func TestCodexTokenErrorSurfaceUsesSafeClientMessageAcrossEntrypoints(t *testing
 		if err != nil {
 			t.Fatalf("unexpected frame parse error: %v", err)
 		}
-		plan, _, _, errWithCode := provider.prepareResponsesWSOfficialConn(context.Background(), &responsesws.OpenRequest{
+		plan, errWithCode := provider.prepareResponsesWSOfficialConn(context.Background(), &responsesws.OpenRequest{
 			FirstFrame:    frame,
 			SelectedModel: "gpt-5",
 		}, "gpt-5", "responses-ws-token-error")

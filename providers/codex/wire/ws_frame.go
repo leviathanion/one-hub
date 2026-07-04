@@ -10,11 +10,12 @@ import (
 )
 
 type FramePatchInput struct {
-	Identity                  Identity
-	Model                     string
-	DefaultPreviousResponseID string
-	ResponsesLite             bool
-	Clock                     Clock
+	Identity                           Identity
+	Model                              string
+	DefaultPreviousResponseID          string
+	ResponsesLite                      bool
+	AutoGenerateWSStreamRequestStartMS bool
+	Clock                              Clock
 }
 
 func PlanResponsesWSFrame(frame *responsesws.RawResponsesCreateFrame, in FramePatchInput) ([]byte, error) {
@@ -26,6 +27,7 @@ func PlanResponsesWSFrame(frame *responsesws.RawResponsesCreateFrame, in FramePa
 		return nil, reject("model", "model is required")
 	}
 	object := cloneRawMap(frame.Object)
+	_, hadClientMetadata := object["client_metadata"]
 	encodedModel, err := json.Marshal(model)
 	if err != nil {
 		return nil, err
@@ -70,17 +72,23 @@ func PlanResponsesWSFrame(frame *responsesws.RawResponsesCreateFrame, in FramePa
 			return nil, err
 		}
 	}
-	clock := in.Clock
-	if clock == nil {
-		clock = RealClock{}
+	if in.AutoGenerateWSStreamRequestStartMS {
+		clock := in.Clock
+		if clock == nil {
+			clock = RealClock{}
+		}
+		metadataFields["x-codex-ws-stream-request-start-ms"], err = marshalRaw(strconv.FormatInt(clock.Now().UnixMilli(), 10))
+		if err != nil {
+			return nil, err
+		}
 	}
-	metadataFields["x-codex-ws-stream-request-start-ms"], err = marshalRaw(strconv.FormatInt(clock.Now().UnixMilli(), 10))
-	if err != nil {
-		return nil, err
-	}
-	object["client_metadata"], err = marshalRaw(metadataFields)
-	if err != nil {
-		return nil, err
+	if hadClientMetadata || len(metadataFields) > 0 {
+		object["client_metadata"], err = marshalRaw(metadataFields)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		delete(object, "client_metadata")
 	}
 	return json.Marshal(object)
 }

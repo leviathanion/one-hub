@@ -62,7 +62,7 @@ func TestChatAdapterKeepsSoleSamplingParameter(t *testing.T) {
 	}
 }
 
-func TestCodexOfficialChannelPolicyRejectsStaleModelHeaders(t *testing.T) {
+func TestCodexOfficialChannelPolicyRejectsModelHeaders(t *testing.T) {
 	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", nil)
 
 	for _, empty := range []string{"", "  ", "{}", "null"} {
@@ -77,7 +77,7 @@ func TestCodexOfficialChannelPolicyRejectsStaleModelHeaders(t *testing.T) {
 	provider.Channel.ModelHeaders = &stale
 	_, err := provider.codexOfficialChannelPolicy()
 	if err == nil || !strings.Contains(err.Error(), "model_headers") {
-		t.Fatalf("expected stale model_headers to degrade to channel config error, got %v", err)
+		t.Fatalf("expected model_headers to be rejected, got %v", err)
 	}
 }
 
@@ -98,18 +98,37 @@ func TestCodexOfficialChannelPolicyValidatesResidency(t *testing.T) {
 }
 
 func TestCodexOfficialChannelPolicyParsesBooleanFields(t *testing.T) {
-	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"codex":{"fedramp":true,"trust_client_attestation":true,"generate_proxy_installation_id":false}}`, nil)
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"codex":{"fedramp":true,"trust_client_attestation":true,"auto_generate":{"session_id":true,"thread_id":true,"client_request_id":true,"installation_id":true,"ws_stream_request_start_ms":true}}}`, nil)
 	policy, err := provider.codexOfficialChannelPolicy()
 	if err != nil {
 		t.Fatalf("expected boolean policy fields to parse, got %v", err)
 	}
-	if !policy.FedRAMP || !policy.TrustClientAttestation || policy.GenerateProxyInstallationID {
+	if !policy.FedRAMP || !policy.TrustClientAttestation {
 		t.Fatalf("unexpected boolean policy values: %+v", policy)
+	}
+	if !policy.AutoGenerate.SessionID || !policy.AutoGenerate.ThreadID || !policy.AutoGenerate.ClientRequestID || !policy.AutoGenerate.InstallationID || !policy.AutoGenerate.WSStreamRequestStartMS {
+		t.Fatalf("expected all auto_generate fields to parse true, got %+v", policy.AutoGenerate)
 	}
 
 	provider = newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"codex":{"trust_client_attestation":"false"}}`, nil)
 	if _, err := provider.codexOfficialChannelPolicy(); err == nil || !strings.Contains(err.Error(), "trust_client_attestation") {
 		t.Fatalf("expected invalid boolean policy field to be rejected, got %v", err)
+	}
+
+	provider = newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"codex":{"auto_generate":{"installation_id":"true"}}}`, nil)
+	if _, err := provider.codexOfficialChannelPolicy(); err == nil || !strings.Contains(err.Error(), "auto_generate.installation_id") {
+		t.Fatalf("expected invalid auto_generate boolean field to be rejected, got %v", err)
+	}
+}
+
+func TestCodexOfficialChannelPolicyDefaultsDoNotAutoGenerateIdentity(t *testing.T) {
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", nil)
+	policy, err := provider.codexOfficialChannelPolicy()
+	if err != nil {
+		t.Fatalf("expected default policy to parse, got %v", err)
+	}
+	if policy.AutoGenerate.SessionID || policy.AutoGenerate.ThreadID || policy.AutoGenerate.ClientRequestID || policy.AutoGenerate.InstallationID || policy.AutoGenerate.WSStreamRequestStartMS {
+		t.Fatalf("expected default policy to leave identity generation disabled, got %+v", policy.AutoGenerate)
 	}
 }
 
@@ -133,32 +152,31 @@ func TestCodexOfficialChannelPolicyCacheInvalidatesOnChannelConfigChange(t *test
 	}
 }
 
-func TestCodexIdentityHMACKeyPrefersDedicatedSecret(t *testing.T) {
+func TestCodexPrincipalFingerprintRequiresDedicatedSecret(t *testing.T) {
 	originalIdentity := config.CodexIdentitySecret
-	originalSession := config.SessionSecret
 	t.Cleanup(func() {
 		config.CodexIdentitySecret = originalIdentity
-		config.SessionSecret = originalSession
 	})
 
 	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", nil)
 	principal := requestctx.Principal{Kind: "api_key", StableID: "42"}
 
 	config.CodexIdentitySecret = ""
-	config.SessionSecret = "session-secret-a"
-	sessionScoped := provider.codexPrincipalFingerprint(principal)
-
-	config.CodexIdentitySecret = "dedicated-identity-secret"
-	dedicated := provider.codexPrincipalFingerprint(principal)
-	if dedicated.HMAC == sessionScoped.HMAC {
-		t.Fatal("expected dedicated identity secret to change the fingerprint")
+	if _, err := provider.codexPrincipalFingerprint(principal); err == nil || !strings.Contains(err.Error(), "codex_identity_secret") {
+		t.Fatalf("expected missing codex identity secret to fail, got %v", err)
 	}
 
-	// Session secret rotation must not move fingerprints while the dedicated
-	// secret is configured.
-	config.SessionSecret = "session-secret-b"
-	rotated := provider.codexPrincipalFingerprint(principal)
-	if rotated.HMAC != dedicated.HMAC {
-		t.Fatal("expected fingerprint to be stable across session secret rotation")
+	config.CodexIdentitySecret = "dedicated-identity-secret-a"
+	first, err := provider.codexPrincipalFingerprint(principal)
+	if err != nil {
+		t.Fatalf("expected dedicated identity secret to produce fingerprint, got %v", err)
+	}
+	config.CodexIdentitySecret = "dedicated-identity-secret-b"
+	second, err := provider.codexPrincipalFingerprint(principal)
+	if err != nil {
+		t.Fatalf("expected changed dedicated identity secret to produce fingerprint, got %v", err)
+	}
+	if first.HMAC == "" || second.HMAC == "" || first.HMAC == second.HMAC {
+		t.Fatalf("expected fingerprint to depend on dedicated identity secret, first=%q second=%q", first.HMAC, second.HMAC)
 	}
 }

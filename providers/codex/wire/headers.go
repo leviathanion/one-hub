@@ -68,10 +68,6 @@ func addOptionalHeaders(plan *HeaderPlan, in HeaderPlanInput, output operationMa
 		}
 		value := identityValue(in.Identity, spec.identity)
 		source := sourceFor(in.Identity, spec.header, SourceClientHeader)
-		if spec.identity == identityResponsesLite && value == "" && in.Policy.ResponsesLite {
-			value = "true"
-			source = SourceModel
-		}
 		addIdentityOptional(plan, spec.header, value, source)
 	}
 }

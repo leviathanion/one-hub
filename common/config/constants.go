@@ -41,9 +41,8 @@ var UserInvoiceMonth = false
 var SessionSecret = uuid.New().String()
 
 // CodexIdentitySecret keys the HMAC behind proxy-generated Codex identity
-// (installation id / principal fingerprint). It must outlive session-secret
-// rotation; when unset it falls back to SessionSecret, which makes generated
-// identities unstable across restarts unless session_secret is pinned.
+// (installation id / principal fingerprint). It is required when Codex
+// installation id auto-generation is enabled.
 var CodexIdentitySecret = ""
 
 var ItemsPerPage = 10

@@ -24,10 +24,18 @@ type codexResponsesWSAdapter struct {
 	identity                  wire.Identity
 	defaultPreviousResponseID string
 	responsesLite             bool
+	autoStampStreamStart      bool
 
 	mu           sync.Mutex
 	lastResponse string
 	accumulator  *codexTurnUsageAccumulator
+}
+
+type codexResponsesWSOfficialOpenPlan struct {
+	conn                 *codexRealtimeConnPlan
+	identity             wire.Identity
+	responsesLite        bool
+	autoStampStreamStart bool
 }
 
 func (p *CodexProvider) OpenResponsesWS(ctx context.Context, req *responsesws.OpenRequest) (responsesws.Upstream, *types.OpenAIErrorWithStatusCode) {
@@ -59,11 +67,11 @@ func (p *CodexProvider) OpenResponsesWS(ctx context.Context, req *responsesws.Op
 		return nil, codexRealtimeInvalidSessionIDError(err)
 	}
 
-	plan, identity, responsesLite, errWithCode := p.prepareResponsesWSOfficialConn(ctx, req, normalizedModel, sessionID)
+	openPlan, errWithCode := p.prepareResponsesWSOfficialConn(ctx, req, normalizedModel, sessionID)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
-	conn, errWithCode := p.dialChatRealtimeConnWithContext(ctx, plan)
+	conn, errWithCode := p.dialChatRealtimeConnWithContext(ctx, openPlan.conn)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -71,9 +79,10 @@ func (p *CodexProvider) OpenResponsesWS(ctx context.Context, req *responsesws.Op
 	adapter := &codexResponsesWSAdapter{
 		provider:                  p,
 		model:                     normalizedModel,
-		identity:                  identity,
+		identity:                  openPlan.identity,
 		defaultPreviousResponseID: strings.TrimSpace(req.PreviousResponseID),
-		responsesLite:             responsesLite,
+		responsesLite:             openPlan.responsesLite,
+		autoStampStreamStart:      openPlan.autoStampStreamStart,
 	}
 	return responsesws.NewNativeSession(conn, adapter, responsesws.NativeSessionOptions{
 		Context:      ctx,
@@ -84,41 +93,48 @@ func (p *CodexProvider) OpenResponsesWS(ctx context.Context, req *responsesws.Op
 	}), nil
 }
 
-func (p *CodexProvider) prepareResponsesWSOfficialConn(ctx context.Context, req *responsesws.OpenRequest, normalizedModel, sessionID string) (*codexRealtimeConnPlan, wire.Identity, bool, *types.OpenAIErrorWithStatusCode) {
+func (p *CodexProvider) prepareResponsesWSOfficialConn(ctx context.Context, req *responsesws.OpenRequest, normalizedModel, sessionID string) (*codexResponsesWSOfficialOpenPlan, *types.OpenAIErrorWithStatusCode) {
 	urlPath, errWithCode := p.GetSupportedAPIUri(config.RelayModeChatRealtime)
 	if errWithCode != nil {
-		return nil, wire.Identity{}, false, errWithCode
+		return nil, errWithCode
 	}
 	httpURL := p.GetFullRequestURL(urlPath, normalizedModel)
 	proxyAddr := channelProxyValue(p.codexChannel())
 	allowSelfHosted := p.codexResponsesWSSelfHosted()
 	wsURL, err := buildCodexRealtimeURLWithPolicy(httpURL, allowSelfHosted, proxyAddr == "")
 	if err != nil {
-		return nil, wire.Identity{}, false, common.StringErrorWrapperLocal(err.Error(), "ws_request_failed", requester.UpstreamRealtimeURLStatusCode(err))
+		return nil, common.StringErrorWrapperLocal(err.Error(), "ws_request_failed", requester.UpstreamRealtimeURLStatusCode(err))
 	}
 	metadata, err := wire.MetadataFromResponsesFrame(req.FirstFrame)
 	if err != nil {
-		return nil, wire.Identity{}, false, codexWireError(err)
+		return nil, codexWireError(err)
 	}
 	policy, err := p.codexOfficialChannelPolicy()
 	if err != nil {
-		return nil, wire.Identity{}, false, common.ErrorWrapperLocal(err, "channel_config_error", http.StatusServiceUnavailable)
+		return nil, common.ErrorWrapperLocal(err, "channel_config_error", http.StatusServiceUnavailable)
+	}
+	principal := wire.PrincipalFingerprint{}
+	if policy.AutoGenerate.InstallationID {
+		principal, err = p.codexPrincipalFingerprint(req.Principal)
+		if err != nil {
+			return nil, common.ErrorWrapperLocal(err, "channel_config_error", http.StatusServiceUnavailable)
+		}
 	}
 	token, err := p.GetToken()
 	if err != nil {
-		return nil, wire.Identity{}, false, p.handleTokenError(err)
+		return nil, p.handleTokenError(err)
 	}
 	identity, decisions, err := wire.ResolveIdentity(wire.IdentityInput{
 		Operation: wire.OpResponsesWSOpen,
 		Headers:   req.InboundHeaders,
 		Metadata:  metadata,
 		Policy:    policy,
-		Principal: p.codexPrincipalFingerprint(req.Principal),
+		Principal: principal,
 		ChannelID: req.ChannelID,
 		Clock:     wire.RealClock{},
 	})
 	if err != nil {
-		return nil, wire.Identity{}, false, codexWireError(err)
+		return nil, codexWireError(err)
 	}
 	plan, err := wire.BuildHeaders(wire.HeaderPlanInput{
 		Operation: wire.OpResponsesWSOpen,
@@ -131,16 +147,21 @@ func (p *CodexProvider) prepareResponsesWSOfficialConn(ctx context.Context, req 
 		Identity: identity,
 	})
 	if err != nil {
-		return nil, wire.Identity{}, false, codexWireError(err)
+		return nil, codexWireError(err)
 	}
 	plan.Decisions = append(decisions, plan.Decisions...)
 	p.auditCodexOfficialHeaderPlan(ctx, wire.OpResponsesWSOpen, req.ChannelID, plan.Decisions)
-	return &codexRealtimeConnPlan{
-		wsURL:           wsURL,
-		headers:         plan.Map(),
-		allowSelfHosted: allowSelfHosted,
-		proxyAddr:       proxyAddr,
-	}, identity, policy.ResponsesLite || identity.ResponsesLite == "true", nil
+	return &codexResponsesWSOfficialOpenPlan{
+		conn: &codexRealtimeConnPlan{
+			wsURL:           wsURL,
+			headers:         plan.Map(),
+			allowSelfHosted: allowSelfHosted,
+			proxyAddr:       proxyAddr,
+		},
+		identity:             identity,
+		responsesLite:        identity.ResponsesLite == "true",
+		autoStampStreamStart: policy.AutoGenerate.WSStreamRequestStartMS,
+	}, nil
 }
 
 func (a *codexResponsesWSAdapter) PrepareClientFrame(_ context.Context, frame responsesws.Frame) (responsesws.Frame, error) {
@@ -173,11 +194,12 @@ func (a *codexResponsesWSAdapter) prepareResponseCreate(payload []byte) (respons
 		return responsesws.Frame{}, err
 	}
 	encodedPayload, err := wire.PlanResponsesWSFrame(parsed, wire.FramePatchInput{
-		Identity:                  a.identity,
-		Model:                     a.model,
-		DefaultPreviousResponseID: a.defaultPreviousResponseID,
-		ResponsesLite:             a.responsesLite,
-		Clock:                     wire.RealClock{},
+		Identity:                           a.identity,
+		Model:                              a.model,
+		DefaultPreviousResponseID:          a.defaultPreviousResponseID,
+		ResponsesLite:                      a.responsesLite,
+		AutoGenerateWSStreamRequestStartMS: a.autoStampStreamStart,
+		Clock:                              wire.RealClock{},
 	})
 	if err != nil {
 		return responsesws.Frame{}, err
