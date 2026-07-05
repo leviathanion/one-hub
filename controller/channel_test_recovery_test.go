@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -55,6 +57,7 @@ func resetChannelProbeTestState(t *testing.T) {
 	originalDisable := config.AutomaticDisableChannelEnabled
 	originalEnable := config.AutomaticEnableChannelEnabled
 	originalRequestInterval := config.RequestInterval
+	originalChannelTestConcurrency := config.ChannelTestConcurrency
 
 	channelProbeStateLock.Lock()
 	fullChannelProbeRunning = false
@@ -68,6 +71,7 @@ func resetChannelProbeTestState(t *testing.T) {
 		config.AutomaticDisableChannelEnabled = originalDisable
 		config.AutomaticEnableChannelEnabled = originalEnable
 		config.RequestInterval = originalRequestInterval
+		config.ChannelTestConcurrency = originalChannelTestConcurrency
 
 		channelProbeStateLock.Lock()
 		fullChannelProbeRunning = false
@@ -87,6 +91,171 @@ func waitForFullChannelProbeCompletion(t *testing.T) {
 	}
 
 	t.Fatal("expected full channel probe task to finish")
+}
+
+func TestFullChannelProbeConcurrencyNormalization(t *testing.T) {
+	resetChannelProbeTestState(t)
+
+	config.ChannelTestConcurrency = 0
+	if got := fullChannelProbeConcurrency(); got != config.DefaultChannelTestConcurrency {
+		t.Fatalf("expected zero concurrency to use default %d, got %d", config.DefaultChannelTestConcurrency, got)
+	}
+
+	config.ChannelTestConcurrency = -4
+	if got := fullChannelProbeConcurrency(); got != config.DefaultChannelTestConcurrency {
+		t.Fatalf("expected negative concurrency to use default %d, got %d", config.DefaultChannelTestConcurrency, got)
+	}
+
+	config.ChannelTestConcurrency = config.MaxChannelTestConcurrency + 10
+	if got := fullChannelProbeConcurrency(); got != config.MaxChannelTestConcurrency {
+		t.Fatalf("expected concurrency to be capped at %d, got %d", config.MaxChannelTestConcurrency, got)
+	}
+
+	config.ChannelTestConcurrency = 3
+	if got := fullChannelProbeConcurrency(); got != 3 {
+		t.Fatalf("expected configured concurrency to be used, got %d", got)
+	}
+}
+
+func TestRunFullChannelProbeTaskHonorsConcurrencyLimit(t *testing.T) {
+	resetChannelProbeTestState(t)
+
+	config.ChannelTestConcurrency = 2
+	config.RequestInterval = 0
+
+	channels := []*model.Channel{
+		{Id: 1, Name: "channel-1", Status: config.ChannelStatusEnabled},
+		{Id: 2, Name: "channel-2", Status: config.ChannelStatusEnabled},
+		{Id: 3, Name: "channel-3", Status: config.ChannelStatusEnabled},
+		{Id: 4, Name: "channel-4", Status: config.ChannelStatusEnabled},
+		{Id: 5, Name: "channel-5", Status: config.ChannelStatusEnabled},
+	}
+
+	started := make(chan struct{}, len(channels))
+	release := make(chan struct{})
+	var mu sync.Mutex
+	active := 0
+	maxActive := 0
+
+	probeChannelFunc = func(channel *model.Channel, testModel string) channelProbeResult {
+		mu.Lock()
+		active++
+		if active > maxActive {
+			maxActive = active
+		}
+		mu.Unlock()
+
+		started <- struct{}{}
+		<-release
+
+		mu.Lock()
+		active--
+		mu.Unlock()
+
+		return channelProbeResult{err: fmt.Errorf("probe failed")}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		runFullChannelProbeTask(channels, channelDisableThresholdMilliseconds())
+		close(done)
+	}()
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatalf("expected probe %d to start", i+1)
+		}
+	}
+
+	select {
+	case <-started:
+		t.Fatal("expected third probe not to start before a worker is released")
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	close(release)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("expected full channel probe task to finish")
+	}
+
+	if maxActive != 2 {
+		t.Fatalf("expected at most 2 concurrent probes, got %d", maxActive)
+	}
+}
+
+func TestRunFullChannelProbeTaskKeepsReportOrder(t *testing.T) {
+	resetChannelProbeTestState(t)
+
+	config.ChannelTestConcurrency = 3
+	config.RequestInterval = 0
+
+	channels := []*model.Channel{
+		{Id: 1, Name: "slowfirst", Status: config.ChannelStatusEnabled},
+		{Id: 2, Name: "fastsecond", Status: config.ChannelStatusEnabled},
+		{Id: 3, Name: "fastthird", Status: config.ChannelStatusEnabled},
+	}
+
+	probeChannelFunc = func(channel *model.Channel, testModel string) channelProbeResult {
+		if channel.Id == 1 {
+			time.Sleep(20 * time.Millisecond)
+		}
+		return channelProbeResult{err: fmt.Errorf("probe failed")}
+	}
+
+	report := runFullChannelProbeTask(channels, channelDisableThresholdMilliseconds())
+	first := strings.Index(report, "slowfirst")
+	second := strings.Index(report, "fastsecond")
+	third := strings.Index(report, "fastthird")
+	if first < 0 || second < 0 || third < 0 {
+		t.Fatalf("expected all channel names in report, got %q", report)
+	}
+	if !(first < second && second < third) {
+		t.Fatalf("expected report to keep channel order, got %q", report)
+	}
+}
+
+func TestTestAllChannelsRejectsConcurrentStart(t *testing.T) {
+	useControllerTestChannelDB(t)
+	resetChannelProbeTestState(t)
+
+	config.RequestInterval = 0
+
+	insertControllerTestChannel(t, &model.Channel{
+		Id:        10,
+		Name:      "blocked",
+		Status:    config.ChannelStatusEnabled,
+		TestModel: "gpt-5",
+	})
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	probeChannelFunc = func(channel *model.Channel, testModel string) channelProbeResult {
+		close(started)
+		<-release
+		return channelProbeResult{err: fmt.Errorf("probe failed")}
+	}
+
+	if err := testAllChannels(false); err != nil {
+		t.Fatalf("expected first full channel test to start, got %v", err)
+	}
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("expected first full channel test to enter probe")
+	}
+
+	if err := testAllChannels(false); err != fullChannelProbeRunningErr {
+		t.Fatalf("expected concurrent start to be rejected with running error, got %v", err)
+	}
+
+	close(release)
+	waitForFullChannelProbeCompletion(t)
 }
 
 func TestTestAllChannelsAutoRecoversHealthyAutoDisabledChannel(t *testing.T) {

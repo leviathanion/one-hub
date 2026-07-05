@@ -70,6 +70,7 @@ const defaultInputs = {
   AutomaticDisableChannelEnabled: '',
   AutomaticEnableChannelEnabled: '',
   ChannelDisableThreshold: 0,
+  ChannelTestConcurrency: 8,
   LogConsumeEnabled: '',
   DisplayInCurrencyEnabled: '',
   ApproximateTokenEnabled: '',
@@ -1145,8 +1146,19 @@ const OperationSetting = () => {
             showError('最长响应时间、额度提醒阈值不能为负数');
             return;
           }
+          if (
+            !isNonNegativeIntegerString(inputs.ChannelTestConcurrency) ||
+            Number(inputs.ChannelTestConcurrency) < 1 ||
+            Number(inputs.ChannelTestConcurrency) > 32
+          ) {
+            showError(t('setting_index.operationSettings.monitoringSettings.channelTestConcurrency.error'));
+            return;
+          }
           if (originInputs['ChannelDisableThreshold'] !== inputs.ChannelDisableThreshold) {
             await putOptionOrThrow('ChannelDisableThreshold', inputs.ChannelDisableThreshold);
+          }
+          if (originInputs['ChannelTestConcurrency'] !== inputs.ChannelTestConcurrency) {
+            await putOptionOrThrow('ChannelTestConcurrency', inputs.ChannelTestConcurrency);
           }
           if (originInputs['QuotaRemindThreshold'] !== inputs.QuotaRemindThreshold) {
             await putOptionOrThrow('QuotaRemindThreshold', inputs.QuotaRemindThreshold);
@@ -1663,6 +1675,22 @@ const OperationSetting = () => {
                 label={t('setting_index.operationSettings.monitoringSettings.channelDisableThreshold.label')}
                 placeholder={t('setting_index.operationSettings.monitoringSettings.channelDisableThreshold.placeholder')}
                 disabled={loading}
+              />
+            </FormControl>
+            <FormControl fullWidth>
+              <InputLabel htmlFor="ChannelTestConcurrency">
+                {t('setting_index.operationSettings.monitoringSettings.channelTestConcurrency.label')}
+              </InputLabel>
+              <OutlinedInput
+                id="ChannelTestConcurrency"
+                name="ChannelTestConcurrency"
+                type="number"
+                value={inputs.ChannelTestConcurrency}
+                onChange={handleInputChange}
+                label={t('setting_index.operationSettings.monitoringSettings.channelTestConcurrency.label')}
+                placeholder={t('setting_index.operationSettings.monitoringSettings.channelTestConcurrency.placeholder')}
+                disabled={loading}
+                inputProps={{ min: 1, max: 32, step: 1 }}
               />
             </FormControl>
             <FormControl fullWidth>

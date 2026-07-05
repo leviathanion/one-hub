@@ -15,6 +15,7 @@ func InitConf() {
 	Language = viper.GetString("language")
 	IsMasterNode = viper.GetString("node_type") != "slave"
 	RequestInterval = time.Duration(viper.GetInt("polling_interval")) * time.Second
+	ChannelTestConcurrency = viper.GetInt("channel_test_concurrency")
 	SessionSecret = utils.GetOrDefault("session_secret", SessionSecret)
 	CodexIdentitySecret = utils.GetOrDefault("codex_identity_secret", CodexIdentitySecret)
 	UserInvoiceMonth = viper.GetBool("user_invoice_month")
@@ -44,6 +45,7 @@ func defaultConfig() {
 	viper.SetDefault("sqlite_path", "one-api.db")
 	viper.SetDefault("sqlite_busy_timeout", 3000)
 	viper.SetDefault("sync_frequency", 600)
+	viper.SetDefault("channel_test_concurrency", DefaultChannelTestConcurrency)
 	viper.SetDefault("batch_update_interval", 5)
 	viper.SetDefault("global.api_rate_limit", 300)
 	viper.SetDefault("global.web_rate_limit", 180)

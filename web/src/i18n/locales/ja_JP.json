@@ -1033,6 +1033,11 @@
           "label": "最大応答時間",
           "placeholder": "秒単位、全ての実行チャネルがこの時間を超えると、チャネルは自動的に無効になります"
         },
+        "channelTestConcurrency": {
+          "label": "チャネルテスト同時実行数",
+          "placeholder": "1-32、デフォルト 8",
+          "error": "チャネルテスト同時実行数は 1 から 32 までの整数である必要があります"
+        },
         "quotaRemindThreshold": {
           "label": "クォータ通知しきい値",
           "placeholder": "このクォータを下回ると、ユーザーに通知メールが送信されます"

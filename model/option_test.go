@@ -26,6 +26,7 @@ func TestInitOptionMapRegistersPreferredChannelWaitOptions(t *testing.T) {
 	originalDB := DB
 	originalWait := config.PreferredChannelWaitMilliseconds
 	originalPoll := config.PreferredChannelWaitPollMilliseconds
+	originalChannelTestConcurrency := config.ChannelTestConcurrency
 	originalLarkClientID := config.LarkClientId
 	originalLarkClientSecret := config.LarkClientSecret
 	originalRetryStatusCodes := config.RetryStatusCodes
@@ -34,6 +35,7 @@ func TestInitOptionMapRegistersPreferredChannelWaitOptions(t *testing.T) {
 		DB = originalDB
 		config.PreferredChannelWaitMilliseconds = originalWait
 		config.PreferredChannelWaitPollMilliseconds = originalPoll
+		config.ChannelTestConcurrency = originalChannelTestConcurrency
 		config.LarkClientId = originalLarkClientID
 		config.LarkClientSecret = originalLarkClientSecret
 		if err := config.SetRetryStatusCodes(originalRetryStatusCodes); err != nil {
@@ -53,6 +55,7 @@ func TestInitOptionMapRegistersPreferredChannelWaitOptions(t *testing.T) {
 	DB = testDB
 	config.PreferredChannelWaitMilliseconds = 125
 	config.PreferredChannelWaitPollMilliseconds = 25
+	config.ChannelTestConcurrency = 6
 	config.LarkClientId = "cli_123"
 	config.LarkClientSecret = "secret_123"
 	if err := config.SetRetryStatusCodes("401,5xx"); err != nil {
@@ -66,6 +69,9 @@ func TestInitOptionMapRegistersPreferredChannelWaitOptions(t *testing.T) {
 	}
 	if got := config.GlobalOption.Get("PreferredChannelWaitPollMilliseconds"); got != "25" {
 		t.Fatalf("expected preferred wait poll option registration, got %q", got)
+	}
+	if got := config.GlobalOption.Get("ChannelTestConcurrency"); got != "6" {
+		t.Fatalf("expected channel test concurrency option registration, got %q", got)
 	}
 	if got := config.GlobalOption.Get("LarkClientId"); got != "cli_123" {
 		t.Fatalf("expected lark client id registration, got %q", got)

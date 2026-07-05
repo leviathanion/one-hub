@@ -1045,6 +1045,11 @@
           "label": "Maximum Response Time",
           "placeholder": "In seconds, if all running channels exceed this time, the channel will be automatically disabled"
         },
+        "channelTestConcurrency": {
+          "label": "Channel Test Concurrency",
+          "placeholder": "1-32, default 8",
+          "error": "Channel test concurrency must be an integer from 1 to 32"
+        },
         "quotaRemindThreshold": {
           "label": "Quota Reminder Threshold",
           "placeholder": "When below this quota, an email will be sent to remind the user"

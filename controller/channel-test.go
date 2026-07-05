@@ -48,6 +48,11 @@ type channelProbeResult struct {
 	milliseconds int64
 }
 
+type fullChannelProbeReport struct {
+	index   int
+	message string
+}
+
 func (result channelProbeResult) consumedSeconds() float64 {
 	return float64(result.milliseconds) / 1000.0
 }
@@ -278,6 +283,17 @@ func channelDisableThresholdMilliseconds() int64 {
 	return disableThreshold
 }
 
+func fullChannelProbeConcurrency() int {
+	concurrency := config.ChannelTestConcurrency
+	if concurrency <= 0 {
+		return config.DefaultChannelTestConcurrency
+	}
+	if concurrency > config.MaxChannelTestConcurrency {
+		return config.MaxChannelTestConcurrency
+	}
+	return concurrency
+}
+
 func startFullChannelProbeTask() error {
 	channelProbeStateLock.Lock()
 	defer channelProbeStateLock.Unlock()
@@ -356,6 +372,119 @@ func TestChannel(c *gin.Context) {
 var channelProbeStateLock sync.Mutex
 var fullChannelProbeRunning bool = false
 
+func testAllChannel(channel *model.Channel, disableThreshold int64) string {
+	isChannelEnabled := channel.Status == config.ChannelStatusEnabled
+	sendMessage := fmt.Sprintf("**通道 %s - #%d - %s** : \n\n", utils.EscapeMarkdownText(channel.Name), channel.Id, channel.StatusToStr())
+	result := probeChannelFunc(channel, "")
+
+	// 通道为禁用状态，并且还是请求错误 或者 响应时间超过阈值 直接跳过，也不需要更新响应时间。
+	if !isChannelEnabled {
+		if result.err != nil {
+			return sendMessage + fmt.Sprintf("- 测试报错: %s \n\n- 无需改变状态，跳过\n\n", utils.EscapeMarkdownText(result.err.Error()))
+		}
+		if result.exceedsThreshold(disableThreshold) {
+			return sendMessage + fmt.Sprintf("- 响应时间 %.2fs 超过阈值 %.2fs \n\n- 无需改变状态，跳过\n\n", result.consumedSeconds(), float64(disableThreshold)/1000.0)
+		}
+		// 如果已被禁用，但是请求成功，需要判断是否需要恢复
+		// 手动禁用的通道，不会自动恢复
+		if config.AutomaticEnableChannelEnabled && result.isHealthy() {
+			if channel.Status == config.ChannelStatusAutoDisabled {
+				updated, err := AutoEnableChannel(channel.Id, channel.Name, false)
+				if err != nil {
+					return sendMessage + fmt.Sprintf("- 自动恢复失败: %s \n\n", utils.EscapeMarkdownText(err.Error()))
+				}
+				if !updated {
+					return sendMessage + "- 状态已变化，跳过自动恢复 \n\n"
+				}
+				sendMessage += "- 已被启用 \n\n"
+			} else {
+				sendMessage += "- 手动禁用的通道，不会自动恢复 \n\n"
+			}
+		}
+	} else {
+		// 如果通道启用状态，但是返回了错误 或者 响应时间超过阈值，需要判断是否需要禁用
+		if result.exceedsThreshold(disableThreshold) {
+			errMsg := fmt.Sprintf("响应时间 %.2fs 超过阈值 %.2fs ", result.consumedSeconds(), float64(disableThreshold)/1000.0)
+			updated, err := AutoDisableChannel(channel.Id, channel.Name, errMsg, false)
+			if err != nil {
+				return sendMessage + fmt.Sprintf("- %s \n\n- 自动禁用失败: %s\n\n", errMsg, utils.EscapeMarkdownText(err.Error()))
+			}
+			if !updated {
+				return sendMessage + fmt.Sprintf("- %s \n\n- 状态已变化，跳过自动禁用\n\n", errMsg)
+			}
+			return sendMessage + fmt.Sprintf("- %s \n\n- 禁用\n\n", errMsg)
+		}
+
+		if ShouldDisableChannel(channel.Type, result.openaiErr) {
+			errMsg := result.err.Error()
+			updated, err := AutoDisableChannel(channel.Id, channel.Name, errMsg, false)
+			if err != nil {
+				return sendMessage + fmt.Sprintf("- 自动禁用失败，原因：%s\n\n", utils.EscapeMarkdownText(err.Error()))
+			}
+			if !updated {
+				return sendMessage + fmt.Sprintf("- 原因：%s\n\n- 状态已变化，跳过自动禁用\n\n", utils.EscapeMarkdownText(errMsg))
+			}
+			return sendMessage + fmt.Sprintf("- 已被禁用，原因：%s\n\n", utils.EscapeMarkdownText(errMsg))
+		}
+
+		if result.err != nil {
+			return sendMessage + fmt.Sprintf("- 测试报错: %s \n\n", utils.EscapeMarkdownText(result.err.Error()))
+		}
+	}
+
+	channel.UpdateResponseTime(result.milliseconds)
+	return sendMessage + fmt.Sprintf("- 测试完成，耗时 %.2fs\n\n", result.consumedSeconds())
+}
+
+func runFullChannelProbeTask(channels []*model.Channel, disableThreshold int64) string {
+	if len(channels) == 0 {
+		return ""
+	}
+
+	// Bound the fan-out: full parallelism lowers wall time but can trip upstream
+	// limits and amplify route reload churn when many probes change status.
+	concurrency := fullChannelProbeConcurrency()
+	if concurrency > len(channels) {
+		concurrency = len(channels)
+	}
+
+	jobs := make(chan int)
+	reports := make([]string, len(channels))
+	reportCh := make(chan fullChannelProbeReport, len(channels))
+	var wg sync.WaitGroup
+
+	for worker := 0; worker < concurrency; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				reportCh <- fullChannelProbeReport{
+					index:   index,
+					message: testAllChannel(channels[index], disableThreshold),
+				}
+			}
+		}()
+	}
+
+	go func() {
+		for index := range channels {
+			if config.RequestInterval > 0 {
+				time.Sleep(config.RequestInterval)
+			}
+			jobs <- index
+		}
+		close(jobs)
+		wg.Wait()
+		close(reportCh)
+	}()
+
+	for report := range reportCh {
+		reports[report.index] = report.message
+	}
+
+	return strings.Join(reports, "")
+}
+
 func testAllChannels(isNotify bool) error {
 	if err := startFullChannelProbeTask(); err != nil {
 		return err
@@ -369,81 +498,7 @@ func testAllChannels(isNotify bool) error {
 	go func() {
 		defer finishFullChannelProbeTask()
 
-		var sendMessage string
-		for _, channel := range channels {
-			time.Sleep(config.RequestInterval)
-
-			isChannelEnabled := channel.Status == config.ChannelStatusEnabled
-			sendMessage += fmt.Sprintf("**通道 %s - #%d - %s** : \n\n", utils.EscapeMarkdownText(channel.Name), channel.Id, channel.StatusToStr())
-			result := probeChannelFunc(channel, "")
-			// 通道为禁用状态，并且还是请求错误 或者 响应时间超过阈值 直接跳过，也不需要更新响应时间。
-			if !isChannelEnabled {
-				if result.err != nil {
-					sendMessage += fmt.Sprintf("- 测试报错: %s \n\n- 无需改变状态，跳过\n\n", utils.EscapeMarkdownText(result.err.Error()))
-					continue
-				}
-				if result.exceedsThreshold(disableThreshold) {
-					sendMessage += fmt.Sprintf("- 响应时间 %.2fs 超过阈值 %.2fs \n\n- 无需改变状态，跳过\n\n", result.consumedSeconds(), float64(disableThreshold)/1000.0)
-					continue
-				}
-				// 如果已被禁用，但是请求成功，需要判断是否需要恢复
-				// 手动禁用的通道，不会自动恢复
-				if config.AutomaticEnableChannelEnabled && result.isHealthy() {
-					if channel.Status == config.ChannelStatusAutoDisabled {
-						updated, err := AutoEnableChannel(channel.Id, channel.Name, false)
-						if err != nil {
-							sendMessage += fmt.Sprintf("- 自动恢复失败: %s \n\n", utils.EscapeMarkdownText(err.Error()))
-							continue
-						}
-						if !updated {
-							sendMessage += "- 状态已变化，跳过自动恢复 \n\n"
-							continue
-						}
-						sendMessage += "- 已被启用 \n\n"
-					} else {
-						sendMessage += "- 手动禁用的通道，不会自动恢复 \n\n"
-					}
-				}
-			} else {
-				// 如果通道启用状态，但是返回了错误 或者 响应时间超过阈值，需要判断是否需要禁用
-				if result.exceedsThreshold(disableThreshold) {
-					errMsg := fmt.Sprintf("响应时间 %.2fs 超过阈值 %.2fs ", result.consumedSeconds(), float64(disableThreshold)/1000.0)
-					updated, err := AutoDisableChannel(channel.Id, channel.Name, errMsg, false)
-					if err != nil {
-						sendMessage += fmt.Sprintf("- %s \n\n- 自动禁用失败: %s\n\n", errMsg, utils.EscapeMarkdownText(err.Error()))
-						continue
-					}
-					if !updated {
-						sendMessage += fmt.Sprintf("- %s \n\n- 状态已变化，跳过自动禁用\n\n", errMsg)
-						continue
-					}
-					sendMessage += fmt.Sprintf("- %s \n\n- 禁用\n\n", errMsg)
-					continue
-				}
-
-				if ShouldDisableChannel(channel.Type, result.openaiErr) {
-					errMsg := result.err.Error()
-					updated, err := AutoDisableChannel(channel.Id, channel.Name, errMsg, false)
-					if err != nil {
-						sendMessage += fmt.Sprintf("- 自动禁用失败，原因：%s\n\n", utils.EscapeMarkdownText(err.Error()))
-						continue
-					}
-					if !updated {
-						sendMessage += fmt.Sprintf("- 原因：%s\n\n- 状态已变化，跳过自动禁用\n\n", utils.EscapeMarkdownText(errMsg))
-						continue
-					}
-					sendMessage += fmt.Sprintf("- 已被禁用，原因：%s\n\n", utils.EscapeMarkdownText(errMsg))
-					continue
-				}
-
-				if result.err != nil {
-					sendMessage += fmt.Sprintf("- 测试报错: %s \n\n", utils.EscapeMarkdownText(result.err.Error()))
-					continue
-				}
-			}
-			channel.UpdateResponseTime(result.milliseconds)
-			sendMessage += fmt.Sprintf("- 测试完成，耗时 %.2fs\n\n", result.consumedSeconds())
-		}
+		sendMessage := runFullChannelProbeTask(channels, disableThreshold)
 		if isNotify {
 			notify.Send("通道测试完成", sendMessage)
 		}

@@ -204,6 +204,12 @@ var DefaultChannelWeight = uint(1)
 var RetryCooldownSeconds = 5
 var PreferredChannelWaitMilliseconds = 0
 var PreferredChannelWaitPollMilliseconds = 50
+var ChannelTestConcurrency = 8
+
+const (
+	DefaultChannelTestConcurrency = 8
+	MaxChannelTestConcurrency     = 32
+)
 
 var CFWorkerImageUrl = ""
 var CFWorkerImageKey = ""

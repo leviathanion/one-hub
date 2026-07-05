@@ -65,6 +65,7 @@ func InitOptionMap() {
 	config.GlobalOption.RegisterBoolOption("LogConsumeEnabled", &config.LogConsumeEnabled, publicOption())
 	config.GlobalOption.RegisterBoolOption("DisplayInCurrencyEnabled", &config.DisplayInCurrencyEnabled, publicOption())
 	config.GlobalOption.RegisterFloatOption("ChannelDisableThreshold", &config.ChannelDisableThreshold, publicOption())
+	config.GlobalOption.RegisterIntOption("ChannelTestConcurrency", &config.ChannelTestConcurrency, publicOption())
 	config.GlobalOption.RegisterBoolOption("EmailDomainRestrictionEnabled", &config.EmailDomainRestrictionEnabled, publicGroupedOption(config.OptionGroupEmailDomainRestriction))
 
 	config.GlobalOption.RegisterCustomOption("EmailDomainWhitelist", func() string {

@@ -942,6 +942,11 @@
           "label": "最长响应时间",
           "placeholder": "单位秒，当运行通道全部测试时，超过此时间将自动禁用通道"
         },
+        "channelTestConcurrency": {
+          "label": "渠道测试并发数",
+          "placeholder": "1-32，默认 8",
+          "error": "渠道测试并发数必须是 1 到 32 之间的整数"
+        },
         "quotaRemindThreshold": {
           "label": "额度提醒阈值",
           "placeholder": "低于此额度时将发送邮件提醒用户"
