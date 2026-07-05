@@ -108,16 +108,17 @@ func TestDecideResponsesAttemptReplay(t *testing.T) {
 			wantBarrier:  ReplayBarrierAccounting,
 		},
 		{
-			name: "continuation rolls back and surfaces",
+			name: "non strict continuation can retry",
 			mutate: func(snapshot *ResponsesAttemptSnapshot) {
 				snapshot.Continuation.PreviousResponseID = "resp_previous"
 			},
-			wantDecision: ResponsesAttemptDecisionRollbackAndSurface,
-			wantBarrier:  ReplayBarrierContinuation,
+			wantDecision: ResponsesAttemptDecisionRollbackAndRetryNextChannel,
+			wantBarrier:  ReplayBarrierNone,
 		},
 		{
 			name: "strict continuation anchor rolls back and surfaces",
 			mutate: func(snapshot *ResponsesAttemptSnapshot) {
+				snapshot.Continuation.PreviousResponseID = "resp_previous"
 				snapshot.Continuation.Strict = true
 			},
 			wantDecision: ResponsesAttemptDecisionRollbackAndSurface,

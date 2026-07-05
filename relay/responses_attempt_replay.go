@@ -196,7 +196,10 @@ func DecideResponsesAttemptReplay(snapshot ResponsesAttemptSnapshot) ResponsesRe
 		return responsesAttemptRollbackSurfaceBlocked(snapshot, ReplayBarrierClientCancel)
 	}
 
-	if snapshot.Continuation.PreviousResponseID != "" || snapshot.Continuation.Strict {
+	// Trade-off: non-strict continuation is allowed to retry on another channel
+	// for availability. The new provider may reject the previous_response_id as
+	// unknown, but strict affinity still preserves the old same-channel contract.
+	if snapshot.Continuation.Strict {
 		if responsesAttemptRollbackableUpstream(snapshot.Upstream) {
 			return responsesAttemptRollbackSurfaceBlocked(snapshot, ReplayBarrierContinuation)
 		}
