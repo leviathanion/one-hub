@@ -65,6 +65,7 @@ type openAIRealtimeSession struct {
 	model      string
 	sessionID  string
 	conn       *wsconn.ManagedConn
+	pumpCtx    context.Context
 	compatMode bool
 
 	recvCh       chan openAIRealtimeOutbound
@@ -107,6 +108,7 @@ func (p *OpenAIProvider) OpenRealtimeSessionWithOptions(modelName string, option
 		model:      strings.TrimSpace(modelName),
 		sessionID:  sessionID,
 		conn:       conn,
+		pumpCtx:    openAIRealtimePumpContext(options.Context),
 		compatMode: config.OpenAIRealtimeSessionCompatMode,
 		recvCh:     make(chan openAIRealtimeOutbound, 128),
 		closed:     make(chan struct{}),
@@ -118,6 +120,13 @@ func (p *OpenAIProvider) OpenRealtimeSessionWithOptions(modelName string, option
 
 func (p *OpenAIProvider) openRealtimeConn(modelName string) (*wsconn.ManagedConn, *types.OpenAIErrorWithStatusCode) {
 	return p.openRealtimeConnWithContext(context.Background(), modelName)
+}
+
+func openAIRealtimePumpContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return context.WithoutCancel(ctx)
 }
 
 func (p *OpenAIProvider) openRealtimeConnWithContext(ctx context.Context, modelName string) (*wsconn.ManagedConn, *types.OpenAIErrorWithStatusCode) {
@@ -679,7 +688,11 @@ func (s *openAIRealtimeSession) readLoop() {
 		},
 		OnClose: finishPump,
 	}
-	go pump.Run(context.Background())
+	pumpCtx := s.pumpCtx
+	if pumpCtx == nil {
+		pumpCtx = context.Background()
+	}
+	go pump.Run(pumpCtx)
 
 	for frame := range frameCh {
 		s.handleProviderFrame(frame)

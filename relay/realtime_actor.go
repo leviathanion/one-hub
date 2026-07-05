@@ -68,10 +68,17 @@ type realtimeRelayActor struct {
 }
 
 func newRealtimeRelayActor(client *wsconn.ManagedConn, session runtimerealtime.RealtimeSession, timeout time.Duration) *realtimeRelayActor {
+	return newRealtimeRelayActorWithContext(context.Background(), client, session, timeout)
+}
+
+func newRealtimeRelayActorWithContext(base context.Context, client *wsconn.ManagedConn, session runtimerealtime.RealtimeSession, timeout time.Duration) *realtimeRelayActor {
 	if timeout <= 0 {
 		timeout = 2 * time.Minute
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	if base == nil {
+		base = context.Background()
+	}
+	ctx, cancel := context.WithCancel(context.WithoutCancel(base))
 	b := &realtimeRelayActor{
 		client:         client,
 		session:        session,

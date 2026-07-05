@@ -2,6 +2,7 @@ package responses
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -30,9 +31,36 @@ const (
 	DownstreamChatCompletions DownstreamDialect = "chat_completions"
 )
 
+type RequestPurpose string
+
+const (
+	RequestPurposeChannelProbe RequestPurpose = "channel_probe"
+)
+
+type requestPurposeContextKey struct{}
+
+func ContextWithRequestPurpose(ctx context.Context, purpose RequestPurpose) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if purpose == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, requestPurposeContextKey{}, purpose)
+}
+
+func RequestPurposeFromContext(ctx context.Context) RequestPurpose {
+	if ctx == nil {
+		return ""
+	}
+	purpose, _ := ctx.Value(requestPurposeContextKey{}).(RequestPurpose)
+	return purpose
+}
+
 type Control struct {
 	DownstreamDialect DownstreamDialect
 	Stream            bool
+	Purpose           RequestPurpose
 }
 
 type PromptCacheSource string

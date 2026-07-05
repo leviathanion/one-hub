@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"one-api/common"
+	"one-api/common/jsonobject"
 	"one-api/common/logger"
 	"one-api/common/requester"
 	commonresponses "one-api/common/responses"
@@ -304,7 +305,17 @@ func (p *CodexProvider) prepareResponsesCreateRequest(ctx context.Context, req *
 		model = normalizeCodexModelName(req.Body.Projection.Model)
 	}
 	policy := responsesPolicyInput(req)
-	body, err := wire.PlanResponsesCreateBody(req.Body.Object, wire.CreateBodyInput{
+	bodyObject := req.Body.Object
+	effectiveReq := req
+	if req.Control.Purpose == commonresponses.RequestPurposeChannelProbe {
+		var errWithCode *types.OpenAIErrorWithStatusCode
+		bodyObject, errWithCode = p.withCodexOfficialProbeMetadata(req, bodyObject)
+		if errWithCode != nil {
+			return nil, errWithCode
+		}
+		effectiveReq = requestWithResponsesBodyObject(req, bodyObject)
+	}
+	body, err := wire.PlanResponsesCreateBody(bodyObject, wire.CreateBodyInput{
 		Model:       model,
 		Stream:      true,
 		PromptCache: policy.PromptCache,
@@ -312,7 +323,7 @@ func (p *CodexProvider) prepareResponsesCreateRequest(ctx context.Context, req *
 	if err != nil {
 		return nil, codexWireError(err)
 	}
-	return p.prepareResponsesOfficialHTTPRequest(ctx, req, wire.OpResponsesCreate, "", model, body)
+	return p.prepareResponsesOfficialHTTPRequest(ctx, effectiveReq, wire.OpResponsesCreate, "", model, body)
 }
 
 func (p *CodexProvider) prepareResponsesCompactRequest(ctx context.Context, req *commonresponses.Request) (*http.Request, *types.OpenAIErrorWithStatusCode) {
@@ -349,6 +360,46 @@ func responsesPolicyInput(req *commonresponses.Request) commonresponses.PolicyIn
 		return policy
 	}
 	return policy
+}
+
+func requestWithResponsesBodyObject(req *commonresponses.Request, object *jsonobject.Object) *commonresponses.Request {
+	if req == nil || req.Body == nil {
+		return req
+	}
+	clonedReq := *req
+	clonedBody := *req.Body
+	clonedBody.Object = object
+	clonedReq.Body = &clonedBody
+	return &clonedReq
+}
+
+func (p *CodexProvider) withCodexOfficialProbeMetadata(req *commonresponses.Request, object *jsonobject.Object) (*jsonobject.Object, *types.OpenAIErrorWithStatusCode) {
+	if object == nil {
+		return nil, common.StringErrorWrapperLocal("request body is required", "invalid_request_error", http.StatusBadRequest)
+	}
+	policy, err := p.codexOfficialChannelPolicy()
+	if err != nil {
+		return nil, common.ErrorWrapperLocal(err, "channel_config_error", http.StatusServiceUnavailable)
+	}
+
+	input := wire.ProbeMetadataInput{
+		ChannelID: req.ChannelID,
+		Clock:     wire.RealClock{},
+	}
+	if policy.AutoGenerate.InstallationID {
+		principal, err := p.codexPrincipalFingerprint(req.Principal)
+		if err != nil {
+			return nil, common.ErrorWrapperLocal(err, "channel_config_error", http.StatusServiceUnavailable)
+		}
+		input.Principal = principal
+		input.AutoGenerateInstallationID = true
+	}
+
+	updated, err := wire.WithOfficialProbeMetadata(object, input)
+	if err != nil {
+		return nil, codexWireError(err)
+	}
+	return updated, nil
 }
 
 func (p *CodexProvider) prepareResponsesOfficialHTTPRequest(ctx context.Context, req *commonresponses.Request, operation wire.Operation, pathSuffix, model string, body []byte) (*http.Request, *types.OpenAIErrorWithStatusCode) {

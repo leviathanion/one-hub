@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 var (
@@ -34,6 +35,7 @@ var (
 
 	probeChannelFunc = probeChannel
 	currentTimeFunc  = time.Now
+	getProviderFunc  = providers.GetProvider
 )
 
 var (
@@ -86,7 +88,11 @@ func testChannel(channel *model.Channel, testModel string) (openaiErr *types.Ope
 		return nil, errors.New("不支持的模型类型")
 	}
 
-	// 创建测试上下文
+	// Mark this synthetic request as a channel probe so provider adapters can
+	// preserve probe-specific protocol metadata without inventing timeout
+	// semantics for legacy provider entrypoints.
+	probeCtx := commonresponses.ContextWithRequestPurpose(context.Background(), commonresponses.RequestPurposeChannelProbe)
+
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	req, err := http.NewRequest("POST", url, nil)
@@ -94,10 +100,10 @@ func testChannel(channel *model.Channel, testModel string) (openaiErr *types.Ope
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	c.Request = req
+	c.Request = req.WithContext(probeCtx)
 
 	// 获取并验证provider
-	provider := providers.GetProvider(channel, c)
+	provider := getProviderFunc(channel, c)
 	if provider == nil {
 		return nil, errors.New("channel not implemented")
 	}
@@ -146,7 +152,18 @@ func testChannel(channel *model.Channel, testModel string) (openaiErr *types.Ope
 		}
 
 		testRequest := &types.OpenAIResponsesRequest{
-			Input:  "You just need to output 'hi' next.",
+			Input: []types.InputResponses{
+				{
+					Type: types.InputTypeMessage,
+					Role: types.ChatMessageRoleUser,
+					Content: []types.ContentResponses{
+						{
+							Type: types.ContentTypeInputText,
+							Text: "You just need to output 'hi' next.",
+						},
+					},
+				},
+			},
 			Model:  newModelName,
 			Stream: false,
 		}
@@ -158,13 +175,14 @@ func testChannel(channel *model.Channel, testModel string) (openaiErr *types.Ope
 		if parseErr != nil {
 			return nil, parseErr
 		}
-		response, openAIErrorWithStatusCode = responseProvider.CreateResponses(context.Background(), &commonresponses.Request{
+		response, openAIErrorWithStatusCode = responseProvider.CreateResponses(c.Request.Context(), &commonresponses.Request{
 			Operation: commonresponses.ResponsesCreate,
-			Headers:   requestctx.NewHeaderSnapshot(req.Header),
+			Headers:   requestctx.NewHeaderSnapshot(c.Request.Header),
 			Body:      envelope,
 			Control: commonresponses.Control{
 				DownstreamDialect: commonresponses.DownstreamResponses,
 				Stream:            false,
+				Purpose:           commonresponses.RequestPurposeChannelProbe,
 			},
 			Policy:    commonresponses.PolicyInput{},
 			Principal: requestctx.PrincipalFromGin(c),
@@ -224,14 +242,31 @@ func getModelType(modelName string) string {
 }
 
 func probeChannel(channel *model.Channel, testModel string) channelProbeResult {
+	probeID := uuid.NewString()
+	modelName := testModel
+	if strings.TrimSpace(modelName) == "" && channel != nil {
+		modelName = channel.TestModel
+	}
 	tik := currentTimeFunc()
 	openaiErr, err := testChannel(channel, testModel)
 	tok := currentTimeFunc()
+	elapsedMS := tok.Sub(tik).Milliseconds()
+	result := "success"
+	if openaiErr != nil {
+		result = "openai_error"
+	} else if err != nil {
+		result = "error"
+	}
+	channelID := 0
+	if channel != nil {
+		channelID = channel.Id
+	}
+	logger.SysLog(fmt.Sprintf("channel_probe probe_id=%s channel_id=%d model=%s elapsed_ms=%d result=%s", probeID, channelID, modelName, elapsedMS, result))
 
 	return channelProbeResult{
 		openaiErr:    openaiErr,
 		err:          err,
-		milliseconds: tok.Sub(tik).Milliseconds(),
+		milliseconds: elapsedMS,
 	}
 }
 

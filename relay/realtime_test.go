@@ -819,6 +819,66 @@ func TestRelayModeChatRealtimeOpenFreshRealtimeSessionRejectsUnsupportedPinnedPr
 	}
 }
 
+func TestRelayModeChatRealtimeOpenFreshRealtimeSessionPassesRequestContext(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	originalRetryTimes := config.RetryTimes
+	config.RetryTimes = 1
+	t.Cleanup(func() {
+		config.RetryTimes = originalRetryTimes
+	})
+
+	ctx := newRelayTestContext(nil)
+	ctx.Set("channel_id", 11)
+	ctx.Set("channel_type", config.ChannelTypeCodex)
+	requestCtx := context.WithValue(ctx.Request.Context(), logger.RequestIdKey, "req-realtime-open")
+	ctx.Request = ctx.Request.WithContext(requestCtx)
+
+	var gotOptions runtimerealtime.RealtimeOpenOptions
+	provider := &relayTestRealtimeProvider{
+		relayTestBaseProvider: relayTestBaseProvider{channel: newRelayTestCodexChannel(11)},
+		openFn: func(modelName string, options runtimerealtime.RealtimeOpenOptions) (runtimerealtime.RealtimeSession, *types.OpenAIErrorWithStatusCode) {
+			gotOptions = options
+			return relayTestRealtimeSession{}, nil
+		},
+	}
+	cacheProviderSelection(ctx, "gpt-5", provider, "gpt-5")
+
+	relay := &RelayModeChatRealtime{
+		relayBase: relayBase{c: ctx},
+	}
+	relay.setOriginalModel("gpt-5")
+
+	if !relay.openFreshRealtimeSession("client-session", false) {
+		t.Fatal("expected fresh realtime session opening to succeed")
+	}
+	if gotOptions.Context == nil {
+		t.Fatal("expected realtime open options to include request context")
+	}
+	if got := gotOptions.Context.Value(logger.RequestIdKey); got != "req-realtime-open" {
+		t.Fatalf("expected request id in realtime open context, got %v", got)
+	}
+	if gotOptions.ClientSessionID != "client-session" {
+		t.Fatalf("expected client session id to be forwarded, got %q", gotOptions.ClientSessionID)
+	}
+}
+
+func TestRealtimeRelayActorContextPreservesRequestValuesWithoutCancel(t *testing.T) {
+	base, cancel := context.WithCancel(context.WithValue(context.Background(), logger.RequestIdKey, "req-realtime-actor"))
+	actor := newRealtimeRelayActorWithContext(base, nil, nil, time.Second)
+	defer actor.cancel()
+	cancel()
+
+	if got := actor.ctx.Value(logger.RequestIdKey); got != "req-realtime-actor" {
+		t.Fatalf("expected request id to be preserved, got %v", got)
+	}
+	select {
+	case <-actor.ctx.Done():
+		t.Fatal("expected actor context to ignore request cancellation")
+	default:
+	}
+}
+
 func newRelayTestContext(headers map[string]string) *gin.Context {
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)

@@ -229,7 +229,7 @@ func ChatRealtime(c *gin.Context) {
 		relay.session.SetTurnObserverFactory(relay_util.NewRealtimeTurnObserverFactory(relay.quota))
 	}
 
-	bridge := newRealtimeRelayActor(relay.userConn, relay.session, time.Minute*2)
+	bridge := newRealtimeRelayActorWithContext(relay.realtimeOpenContext(), relay.userConn, relay.session, time.Minute*2)
 	bridge.providerPayloadObserver = func(_ wsconn.MessageType, payload []byte) {
 		processProviderPayloadAPIError(relay.c, relay.provider.GetChannel(), payload, "chat_realtime_provider_frame")
 	}
@@ -375,6 +375,13 @@ func (r *RelayModeChatRealtime) getProvider() bool {
 	return r.openFreshRealtimeSession(clientSessionID, clientSessionID != "")
 }
 
+func (r *RelayModeChatRealtime) realtimeOpenContext() context.Context {
+	if r == nil || r.c == nil || r.c.Request == nil {
+		return context.Background()
+	}
+	return r.c.Request.Context()
+}
+
 func (r *RelayModeChatRealtime) tryPinnedRealtimeSession(clientSessionID string, channelID int) bool {
 	channel, err := fetchChannelById(channelID)
 	if err != nil {
@@ -394,6 +401,7 @@ func (r *RelayModeChatRealtime) tryPinnedRealtimeSession(clientSessionID string,
 	}
 
 	realtimeSession, apiErr := openRealtimeSessionWithFreshFallback(provider, modelName, runtimerealtime.RealtimeOpenOptions{
+		Context:         r.realtimeOpenContext(),
 		ClientSessionID: clientSessionID,
 	})
 	if apiErr == nil {
@@ -424,6 +432,7 @@ func (r *RelayModeChatRealtime) tryAffinityRealtimeSession(clientSessionID strin
 	}
 
 	realtimeSession, apiErr := openRealtimeSessionWithFreshFallback(provider, modelName, runtimerealtime.RealtimeOpenOptions{
+		Context:         r.realtimeOpenContext(),
 		ClientSessionID: clientSessionID,
 	})
 	if apiErr == nil {
@@ -528,6 +537,7 @@ func (r *RelayModeChatRealtime) openFreshRealtimeSession(clientSessionID string,
 		}
 
 		realtimeSession, apiErr := openRealtimeSessionWithFreshFallback(r.provider, r.modelName, runtimerealtime.RealtimeOpenOptions{
+			Context:         r.realtimeOpenContext(),
 			ClientSessionID: clientSessionID,
 			ForceFresh:      forceFresh,
 		})

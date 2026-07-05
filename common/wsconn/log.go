@@ -17,7 +17,7 @@ type slowHandleObserver interface {
 type slowHandleLogObserver struct{}
 
 func (slowHandleLogObserver) Observe(ctx context.Context, elapsed time.Duration) {
-	logWarnf(ctx, "wsconn: slow Pump.Handle observed: %s", elapsed)
+	logDebugf(ctx, "wsconn: slow Pump.Handle observed: %s", elapsed)
 }
 
 var (
@@ -41,4 +41,13 @@ func logWarnf(ctx context.Context, format string, args ...any) {
 		return
 	}
 	log.Print(msg)
+}
+
+func logDebugf(ctx context.Context, format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	if logger.Logger != nil {
+		logger.LogDebug(ctx, msg)
+		return
+	}
+	logger.LogDebug(ctx, msg)
 }

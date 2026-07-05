@@ -2,7 +2,9 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -426,6 +428,247 @@ func TestCodexResponsesPolicyUsesRouteHint(t *testing.T) {
 	if policy.PromptCache != nil || req.Policy.PromptCache != nil {
 		t.Fatalf("expected provider policy reader not to synthesize or write back prompt cache, got policy=%+v req=%+v", policy.PromptCache, req.Policy.PromptCache)
 	}
+}
+
+func TestCodexChannelProbeMetadataIsProviderOwned(t *testing.T) {
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", nil)
+	rawReq, errWithCode := provider.rawResponsesRequestForTest(&types.OpenAIResponsesRequest{
+		Model: "gpt-5",
+		Input: []types.InputResponses{
+			{
+				Type: types.InputTypeMessage,
+				Role: types.ChatMessageRoleUser,
+				Content: []types.ContentResponses{
+					{Type: types.ContentTypeInputText, Text: "hi"},
+				},
+			},
+		},
+	})
+	if errWithCode != nil {
+		t.Fatalf("rawResponsesRequestForTest returned error: %v", errWithCode.Message)
+	}
+
+	httpReq, errWithCode := provider.prepareResponsesCreateRequest(context.Background(), rawReq)
+	if errWithCode != nil {
+		t.Fatalf("prepareResponsesCreateRequest returned error: %v", errWithCode.Message)
+	}
+	body := readPreparedCodexResponsesBody(t, httpReq)
+	if _, ok := body["client_metadata"]; ok {
+		t.Fatalf("expected ordinary Responses request not to receive probe metadata, got %#v", body["client_metadata"])
+	}
+	if got := httpReq.Header.Get("session-id"); got != "" {
+		t.Fatalf("expected ordinary request not to synthesize session header, got %q", got)
+	}
+
+	rawReq.Control.Purpose = commonresponses.RequestPurposeChannelProbe
+	httpReq, errWithCode = provider.prepareResponsesCreateRequest(context.Background(), rawReq)
+	if errWithCode != nil {
+		t.Fatalf("prepareResponsesCreateRequest returned error: %v", errWithCode.Message)
+	}
+	bodyBytes, probeBody := readPreparedCodexResponsesBodyBytes(t, httpReq)
+	clientMetadata := requireStringMap(t, probeBody["client_metadata"])
+
+	for _, key := range []string{"session_id", "thread_id", "turn_id", "x-codex-window-id", "x-codex-turn-metadata"} {
+		if strings.TrimSpace(stringValue(clientMetadata[key])) == "" {
+			t.Fatalf("expected probe client_metadata.%s to be set, metadata=%#v", key, clientMetadata)
+		}
+	}
+	if _, exists := clientMetadata["x-codex-installation-id"]; exists {
+		t.Fatalf("expected installation id to stay absent when policy does not auto-generate it, metadata=%#v", clientMetadata)
+	}
+	for _, forbidden := range []string{"probe_id", "channel_id", "channel_probe", "one_hub_probe"} {
+		if strings.Contains(mustJSON(t, clientMetadata), forbidden) {
+			t.Fatalf("expected probe metadata not to contain %q, got %#v", forbidden, clientMetadata)
+		}
+	}
+
+	turnMetadata := parseTurnMetadata(t, stringValue(clientMetadata["x-codex-turn-metadata"]))
+	if turnMetadata["request_kind"] != "turn" {
+		t.Fatalf("expected request_kind turn, got %#v", turnMetadata)
+	}
+	if _, exists := turnMetadata["installation_id"]; exists {
+		t.Fatalf("expected turn metadata not to force installation id, got %#v", turnMetadata)
+	}
+	if turnMetadata["session_id"] != clientMetadata["session_id"] || turnMetadata["thread_id"] != clientMetadata["thread_id"] || turnMetadata["turn_id"] != clientMetadata["turn_id"] || turnMetadata["window_id"] != clientMetadata["x-codex-window-id"] {
+		t.Fatalf("expected flat metadata and turn metadata identities to match, flat=%#v turn=%#v", clientMetadata, turnMetadata)
+	}
+	if _, ok := turnMetadata["turn_started_at_unix_ms"].(float64); !ok {
+		t.Fatalf("expected turn_started_at_unix_ms numeric field, got %#v", turnMetadata)
+	}
+	if httpReq.Header.Get("session-id") != stringValue(clientMetadata["session_id"]) || httpReq.Header.Get("thread-id") != stringValue(clientMetadata["thread_id"]) || httpReq.Header.Get("x-codex-window-id") != stringValue(clientMetadata["x-codex-window-id"]) || httpReq.Header.Get("x-codex-turn-metadata") != stringValue(clientMetadata["x-codex-turn-metadata"]) {
+		t.Fatalf("expected headers to be built from injected body metadata, headers=%v metadata=%#v", httpReq.Header, clientMetadata)
+	}
+	if got := httpReq.Header.Get("x-codex-installation-id"); got != "" {
+		t.Fatalf("expected installation header to stay absent when policy does not auto-generate it, got %q", got)
+	}
+
+	envelope, err := commonresponses.ParseRawEnvelope(bodyBytes)
+	if err != nil {
+		t.Fatalf("parse prepared body: %v", err)
+	}
+	metadata, err := wire.MetadataFromResponsesBody(envelope.Object)
+	if err != nil {
+		t.Fatalf("MetadataFromResponsesBody returned error: %v", err)
+	}
+	if got, state, err := metadata.String("session_id", nil); err != nil || state != wire.FieldPresent || got != stringValue(clientMetadata["session_id"]) {
+		t.Fatalf("expected wire metadata reader to see injected session_id, got value=%q state=%v err=%v", got, state, err)
+	}
+}
+
+func TestCodexChannelProbeMetadataRespectsInstallationPolicy(t *testing.T) {
+	originalSecret := config.CodexIdentitySecret
+	config.CodexIdentitySecret = "unit-test-secret"
+	t.Cleanup(func() {
+		config.CodexIdentitySecret = originalSecret
+	})
+
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"codex":{"auto_generate":{"installation_id":true}}}`, nil)
+	provider.Context.Set("token_id", 123)
+	rawReq, errWithCode := provider.rawResponsesRequestForTest(&types.OpenAIResponsesRequest{
+		Model: "gpt-5",
+		Input: []types.InputResponses{
+			{
+				Type: types.InputTypeMessage,
+				Role: types.ChatMessageRoleUser,
+				Content: []types.ContentResponses{
+					{Type: types.ContentTypeInputText, Text: "hi"},
+				},
+			},
+		},
+	})
+	if errWithCode != nil {
+		t.Fatalf("rawResponsesRequestForTest returned error: %v", errWithCode.Message)
+	}
+	rawReq.Control.Purpose = commonresponses.RequestPurposeChannelProbe
+
+	httpReq, errWithCode := provider.prepareResponsesCreateRequest(context.Background(), rawReq)
+	if errWithCode != nil {
+		t.Fatalf("prepareResponsesCreateRequest returned error: %v", errWithCode.Message)
+	}
+	body := readPreparedCodexResponsesBody(t, httpReq)
+	clientMetadata := requireStringMap(t, body["client_metadata"])
+	installationID := stringValue(clientMetadata["x-codex-installation-id"])
+	if installationID == "" {
+		t.Fatalf("expected auto-generated installation id, metadata=%#v", clientMetadata)
+	}
+	if got := httpReq.Header.Get("x-codex-installation-id"); got != installationID {
+		t.Fatalf("expected header installation id %q, got %q", installationID, got)
+	}
+	turnMetadata := parseTurnMetadata(t, stringValue(clientMetadata["x-codex-turn-metadata"]))
+	if turnMetadata["installation_id"] != installationID {
+		t.Fatalf("expected turn metadata installation id to match, turn=%#v flat=%#v", turnMetadata, clientMetadata)
+	}
+	if _, exists := body["prompt_cache_key"]; exists {
+		t.Fatalf("expected probe metadata injection not to synthesize prompt_cache_key, body=%#v", body)
+	}
+}
+
+func TestCodexChatChannelProbeCarriesProviderMetadata(t *testing.T) {
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", nil)
+	typed := &types.OpenAIResponsesRequest{
+		Model:       "gpt-5",
+		ConvertChat: true,
+		Input: []types.InputResponses{
+			{
+				Type: types.InputTypeMessage,
+				Role: types.ChatMessageRoleUser,
+				Content: []types.ContentResponses{
+					{Type: types.ContentTypeInputText, Text: "hi"},
+				},
+			},
+		},
+	}
+
+	rawReq, errWithCode := provider.chatResponsesRequestFromTyped(typed)
+	if errWithCode != nil {
+		t.Fatalf("chatResponsesRequestFromTyped returned error: %v", errWithCode.Message)
+	}
+	httpReq, errWithCode := provider.prepareResponsesCreateRequest(provider.codexProviderContext(), rawReq)
+	if errWithCode != nil {
+		t.Fatalf("prepareResponsesCreateRequest returned error: %v", errWithCode.Message)
+	}
+	body := readPreparedCodexResponsesBody(t, httpReq)
+	if _, ok := body["client_metadata"]; ok {
+		t.Fatalf("expected ordinary chat adapter request not to receive probe metadata, got %#v", body["client_metadata"])
+	}
+
+	probeCtx := commonresponses.ContextWithRequestPurpose(provider.Context.Request.Context(), commonresponses.RequestPurposeChannelProbe)
+	provider.Context.Request = provider.Context.Request.WithContext(probeCtx)
+	rawReq, errWithCode = provider.chatResponsesRequestFromTyped(typed)
+	if errWithCode != nil {
+		t.Fatalf("chatResponsesRequestFromTyped returned error: %v", errWithCode.Message)
+	}
+	if rawReq.Control.Purpose != commonresponses.RequestPurposeChannelProbe {
+		t.Fatalf("expected chat adapter to preserve channel probe purpose, got %+v", rawReq.Control)
+	}
+	httpReq, errWithCode = provider.prepareResponsesCreateRequest(provider.codexProviderContext(), rawReq)
+	if errWithCode != nil {
+		t.Fatalf("prepareResponsesCreateRequest returned error: %v", errWithCode.Message)
+	}
+	body = readPreparedCodexResponsesBody(t, httpReq)
+	clientMetadata := requireStringMap(t, body["client_metadata"])
+	for _, key := range []string{"session_id", "thread_id", "turn_id", "x-codex-window-id", "x-codex-turn-metadata"} {
+		if strings.TrimSpace(stringValue(clientMetadata[key])) == "" {
+			t.Fatalf("expected probe client_metadata.%s to be set, metadata=%#v", key, clientMetadata)
+		}
+	}
+}
+
+func readPreparedCodexResponsesBody(t *testing.T, req *http.Request) map[string]any {
+	t.Helper()
+	_, body := readPreparedCodexResponsesBodyBytes(t, req)
+	return body
+}
+
+func readPreparedCodexResponsesBodyBytes(t *testing.T, req *http.Request) ([]byte, map[string]any) {
+	t.Helper()
+	if req == nil || req.Body == nil {
+		t.Fatal("expected prepared HTTP request with body")
+	}
+	bodyBytes, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("read prepared request body: %v", err)
+	}
+	if err := req.Body.Close(); err != nil {
+		t.Fatalf("close prepared request body: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(bodyBytes, &body); err != nil {
+		t.Fatalf("decode prepared request body %s: %v", string(bodyBytes), err)
+	}
+	return bodyBytes, body
+}
+
+func requireStringMap(t *testing.T, value any) map[string]any {
+	t.Helper()
+	out, ok := value.(map[string]any)
+	if !ok {
+		t.Fatalf("expected JSON object, got %#v", value)
+	}
+	return out
+}
+
+func stringValue(value any) string {
+	text, _ := value.(string)
+	return text
+}
+
+func parseTurnMetadata(t *testing.T, raw string) map[string]any {
+	t.Helper()
+	var metadata map[string]any
+	if err := json.Unmarshal([]byte(raw), &metadata); err != nil {
+		t.Fatalf("decode x-codex-turn-metadata %q: %v", raw, err)
+	}
+	return metadata
+}
+
+func mustJSON(t *testing.T, value any) string {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal value: %v", err)
+	}
+	return string(raw)
 }
 
 func TestCodexPromptCacheAutoPriorityFallsBackAcrossSignals(t *testing.T) {

@@ -110,6 +110,7 @@ func (p *CodexProvider) chatResponsesRequestFromTyped(request *types.OpenAIRespo
 		Control: commonresponses.Control{
 			DownstreamDialect: downstreamDialect,
 			Stream:            request.Stream,
+			Purpose:           commonresponses.RequestPurposeFromContext(p.codexProviderContext()),
 		},
 		Policy:    codexResponsesPolicyFromProjection(request, p.Context),
 		Principal: principal,

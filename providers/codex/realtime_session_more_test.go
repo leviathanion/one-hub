@@ -55,6 +55,21 @@ func openCodexResponsesWSTestSession(provider *CodexProvider, ctx context.Contex
 	return provider.OpenResponsesWS(ctx, &req)
 }
 
+func TestCodexRealtimePumpContextPreservesRequestValuesWithoutCancel(t *testing.T) {
+	base, cancel := context.WithCancel(context.WithValue(context.Background(), logger.RequestIdKey, "req-codex-pump"))
+	pumpCtx := codexRealtimePumpContext(base)
+	cancel()
+
+	if got := pumpCtx.Value(logger.RequestIdKey); got != "req-codex-pump" {
+		t.Fatalf("expected request id to be preserved, got %v", got)
+	}
+	select {
+	case <-pumpCtx.Done():
+		t.Fatal("expected pump context to ignore request cancellation")
+	default:
+	}
+}
+
 func TestLogCodexRealtimeInternalErrorRedactsAndIncludesCaller(t *testing.T) {
 	core, observedLogs := observer.New(zapcore.ErrorLevel)
 	originalLogger := logger.Logger

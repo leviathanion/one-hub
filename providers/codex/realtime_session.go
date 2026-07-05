@@ -92,6 +92,7 @@ type codexManagedRuntimeState struct {
 	wsConn                *wsconn.ManagedConn
 	wsConnGeneration      uint64
 	wsReaderConn          *wsconn.ManagedConn
+	wsReaderContext       context.Context
 	bridgeStream          requester.StreamReaderInterface[string]
 	bridgeOpeningCancel   context.CancelFunc
 	bridgeOpeningSeq      uint64
@@ -1368,6 +1369,13 @@ func (p *CodexProvider) ensureRealtimeTransportLocked(exec *runtimesession.Execu
 	return p.ensureRealtimeTransportWithContextLocked(context.Background(), exec, state, now, "")
 }
 
+func codexRealtimePumpContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return context.WithoutCancel(ctx)
+}
+
 func (p *CodexProvider) ensureRealtimeTransportWithContextLocked(ctx context.Context, exec *runtimesession.ExecutionSession, state *codexManagedRuntimeState, now time.Time, previousResponseID string) *types.OpenAIErrorWithStatusCode {
 	mode := p.getWebsocketMode()
 	requireWS := state != nil && state.requireWS
@@ -1388,6 +1396,7 @@ func (p *CodexProvider) ensureRealtimeTransportWithContextLocked(ctx context.Con
 
 	if state.wsConn != nil {
 		exec.Transport = runtimesession.TransportModeRealtimeWS
+		state.wsReaderContext = codexRealtimePumpContext(ctx)
 		if state == nil || !state.deferWSReader {
 			p.startRealtimeWSReaderLocked(exec, state)
 		}
@@ -1423,6 +1432,7 @@ func (p *CodexProvider) ensureRealtimeTransportWithContextLocked(ctx context.Con
 	if errWithCode == nil {
 		state.wsConn = conn
 		state.wsConnGeneration++
+		state.wsReaderContext = codexRealtimePumpContext(ctx)
 		state.skipBootstrapConn = conn
 		exec.Transport = runtimesession.TransportModeRealtimeWS
 		exec.FallbackUntil = time.Time{}
@@ -1450,6 +1460,10 @@ func (p *CodexProvider) startRealtimeWSReaderLocked(exec *runtimesession.Executi
 	}
 
 	conn := state.wsConn
+	pumpCtx := state.wsReaderContext
+	if pumpCtx == nil {
+		pumpCtx = context.Background()
+	}
 	generation := state.wsConnGeneration
 	if state.wsReaderConn == conn {
 		state.deferWSReader = false
@@ -1520,7 +1534,7 @@ func (p *CodexProvider) startRealtimeWSReaderLocked(exec *runtimesession.Executi
 				},
 				OnClose: finishPump,
 			}
-			pump.Run(context.Background())
+			pump.Run(pumpCtx)
 		}()
 
 		for {
@@ -2188,6 +2202,7 @@ func clearCodexManagedWebsocketLocked(state *codexManagedRuntimeState) codexClea
 	state.wsConn = nil
 	if state.wsReaderConn == cleared.conn {
 		state.wsReaderConn = nil
+		state.wsReaderContext = nil
 	}
 	if state.skipBootstrapConn == cleared.conn {
 		state.skipBootstrapConn = nil

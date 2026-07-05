@@ -34,6 +34,21 @@ func openAIResponsesWSTestSession(provider *OpenAIProvider, ctx context.Context,
 	return provider.OpenResponsesWS(ctx, &req)
 }
 
+func TestOpenAIRealtimePumpContextPreservesRequestValuesWithoutCancel(t *testing.T) {
+	base, cancel := context.WithCancel(context.WithValue(context.Background(), logger.RequestIdKey, "req-openai-pump"))
+	pumpCtx := openAIRealtimePumpContext(base)
+	cancel()
+
+	if got := pumpCtx.Value(logger.RequestIdKey); got != "req-openai-pump" {
+		t.Fatalf("expected request id to be preserved, got %v", got)
+	}
+	select {
+	case <-pumpCtx.Done():
+		t.Fatal("expected pump context to ignore request cancellation")
+	default:
+	}
+}
+
 func newOpenAIRealtimeHelperSession() *openAIRealtimeSession {
 	return &openAIRealtimeSession{
 		model:     "gpt-4o-realtime-preview",

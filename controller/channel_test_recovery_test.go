@@ -50,6 +50,7 @@ func resetChannelProbeTestState(t *testing.T) {
 
 	originalProbe := probeChannelFunc
 	originalNow := currentTimeFunc
+	originalGetProvider := getProviderFunc
 	originalThreshold := config.ChannelDisableThreshold
 	originalDisable := config.AutomaticDisableChannelEnabled
 	originalEnable := config.AutomaticEnableChannelEnabled
@@ -62,6 +63,7 @@ func resetChannelProbeTestState(t *testing.T) {
 	t.Cleanup(func() {
 		probeChannelFunc = originalProbe
 		currentTimeFunc = originalNow
+		getProviderFunc = originalGetProvider
 		config.ChannelDisableThreshold = originalThreshold
 		config.AutomaticDisableChannelEnabled = originalDisable
 		config.AutomaticEnableChannelEnabled = originalEnable
