@@ -25,7 +25,8 @@ func responsesWSProviderRequestRejectionFromPayload(payload []byte) (*types.Open
 	if err := decoder.Decode(&object); err != nil {
 		return nil, false
 	}
-	if jsonStringField(object, "type") != "error" {
+	eventType := jsonStringField(object, "type")
+	if eventType != "" && eventType != "error" {
 		return nil, false
 	}
 	if responsesWSPayloadResponseID(payload) != "" {

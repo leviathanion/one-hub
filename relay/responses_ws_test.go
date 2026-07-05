@@ -2219,6 +2219,7 @@ func TestResponsesWSProviderRequestRejectionFromPayloadBoundaries(t *testing.T) 
 		{name: "response object blocks request rejection", payload: []byte(`{"type":"error","response":{"id":"resp_1"},"error":{"message":"nope"}}`)},
 		{name: "null response request rejection", payload: []byte(`{"type":"error","response":null,"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"slow down"}}`), want: true},
 		{name: "top level request rejection", payload: []byte(`{"type":"error","status":429,"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"slow down"}}`), want: true},
+		{name: "top level request rejection without event type", payload: []byte(`{"status":401,"error":{"type":"invalid_request_error","code":"token_invalidated","message":"token invalidated"}}`), want: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -3171,6 +3172,95 @@ func TestOpenAndPrimeResponsesWSNonStrictUnsupportedPreferredFallsBack(t *testin
 	skippedIDs, _ := skipped.([]int)
 	if !intSliceContains(skippedIDs, preferredChannelID) {
 		t.Fatalf("expected unsupported non-strict preferred channel to be skipped, got %#v", skipped)
+	}
+}
+
+func TestOpenAndPrimeResponsesWSCodexTokenInvalidatedFallsBack(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	channelGroupSnapshot := snapshotChannelGroup()
+	t.Cleanup(func() {
+		restoreChannelGroup(channelGroupSnapshot)
+	})
+	originalRetryTimes := config.RetryTimes
+	config.RetryTimes = 2
+	t.Cleanup(func() {
+		config.RetryTimes = originalRetryTimes
+	})
+
+	authFailedServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{
+			"error": {
+				"message": "Your authentication token has been invalidated. Please try signing in again.",
+				"type": "invalid_request_error",
+				"code": "token_invalidated"
+			},
+			"status": 401
+		}`))
+	}))
+	defer authFailedServer.Close()
+
+	upgraded := make(chan *wsconn.ManagedConn, 1)
+	fallbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := wsconn.AcceptManaged(w, r, wsconn.Config{Label: "responses ws codex token fallback accept"}, wsconn.AcceptOptions{
+			CheckOrigin: func(*http.Request) bool { return true },
+		})
+		if err != nil {
+			t.Errorf("fallback upgrade failed: %v", err)
+			return
+		}
+		upgraded <- conn
+		<-r.Context().Done()
+	}))
+	defer fallbackServer.Close()
+
+	const (
+		failedChannelID   = 91
+		fallbackChannelID = 92
+	)
+	authFailedBaseURL := authFailedServer.URL
+	fallbackBaseURL := fallbackServer.URL
+	failed := newRelayTestCodexChannel(failedChannelID)
+	failed.BaseURL = &authFailedBaseURL
+	failed.Other = `{"websocket_mode":"force","responses_ws_self_hosted":true}`
+	fallback := newRelayTestCodexChannel(fallbackChannelID)
+	fallback.BaseURL = &fallbackBaseURL
+	fallback.Other = `{"websocket_mode":"force","responses_ws_self_hosted":true}`
+	channelGroup := buildRealtimeTestChannelGroupForChannels(failed, fallback)
+	channelGroup.Rule["default"]["gpt-5"] = [][]int{{failedChannelID}, {fallbackChannelID}}
+	model.ChannelGroup = channelGroup
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	ctx.Set("token_group", "default")
+
+	request := &types.OpenAIResponsesRequest{Model: "gpt-5", Input: "hi"}
+	openResult, apiErr := openAndPrimeResponsesWSSessionWithContextAndFrame(context.Background(), ctx, responsesWSTestOpenFrame(t), request)
+	if apiErr != nil {
+		if strings.Contains(apiErr.Message, "invalidated") || strings.Contains(apiErr.Message, "signing in") {
+			t.Fatalf("expected token invalidated detail to remain hidden, got %+v", apiErr)
+		}
+		t.Fatalf("expected token-invalidated channel to fall back, got %v", apiErr)
+	}
+	if openResult == nil || openResult.Channel == nil || openResult.Channel.Id != fallbackChannelID {
+		t.Fatalf("expected fallback channel #%d, got %#v", fallbackChannelID, openResult)
+	}
+	if openResult.Session != nil {
+		openResult.Session.Abort("test_done")
+	}
+	select {
+	case conn := <-upgraded:
+		conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_cleanup"})
+	case <-time.After(time.Second):
+		t.Fatalf("expected fallback websocket server to be used")
+	}
+	skipped, _ := ctx.Get("skip_channel_ids")
+	skippedIDs, _ := skipped.([]int)
+	if !intSliceContains(skippedIDs, failedChannelID) {
+		t.Fatalf("expected token-invalidated channel to be skipped, got %#v", skipped)
 	}
 }
 

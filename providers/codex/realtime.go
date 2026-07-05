@@ -17,6 +17,7 @@ import (
 	"one-api/common/requester"
 	"one-api/common/responsesws"
 	"one-api/common/wsconn"
+	runtimesession "one-api/runtime/session"
 	"one-api/types"
 )
 
@@ -153,9 +154,28 @@ func mapCodexRealtimeWSDialError(err error) *types.OpenAIErrorWithStatusCode {
 
 	var dialErr *wsconn.DialError
 	if errors.As(err, &dialErr) && dialErr != nil {
+		if apiErr := codexRealtimeProviderAPIErrorFromDialError(dialErr); apiErr != nil {
+			return apiErr
+		}
 		return mapCodexRealtimeWSDialStatus(dialErr.StatusCode)
 	}
 	return common.StringErrorWrapperLocal("websocket request failed", "ws_request_failed", http.StatusInternalServerError)
+}
+
+func codexRealtimeProviderAPIErrorFromDialError(dialErr *wsconn.DialError) *types.OpenAIErrorWithStatusCode {
+	if dialErr == nil || len(dialErr.BodySnippet) == 0 {
+		return nil
+	}
+	apiErr := runtimesession.ProviderAPIErrorFromPayload(dialErr.BodySnippet)
+	if apiErr == nil {
+		return nil
+	}
+	if dialErr.StatusCode > 0 {
+		apiErr.StatusCode = dialErr.StatusCode
+	}
+	apiErr.LocalError = false
+	apiErr.Message = codexRealtimeProviderHandshakeMessage(apiErr.OpenAIError, apiErr.StatusCode)
+	return apiErr
 }
 
 func mapCodexRealtimeWSDialStatus(statusCode int) *types.OpenAIErrorWithStatusCode {
@@ -163,15 +183,42 @@ func mapCodexRealtimeWSDialStatus(statusCode int) *types.OpenAIErrorWithStatusCo
 	case http.StatusNotFound, http.StatusUpgradeRequired:
 		return common.StringErrorWrapperLocal("channel does not support Responses websocket transport", "responses_ws_unsupported_for_channel", http.StatusUpgradeRequired)
 	case http.StatusUnauthorized, http.StatusForbidden:
-		return common.StringErrorWrapperLocal("provider authentication failed", "provider_authentication_failed", statusCode)
+		return codexRealtimeProviderHandshakeError("provider authentication failed", "provider_authentication_failed", "authentication_error", statusCode)
 	case http.StatusTooManyRequests:
-		return common.StringErrorWrapperLocal("provider rate limit exceeded", "provider_rate_limit_exceeded", http.StatusTooManyRequests)
+		return codexRealtimeProviderHandshakeError("provider rate limit exceeded", "provider_rate_limit_exceeded", "rate_limit_error", http.StatusTooManyRequests)
 	default:
 		if statusCode >= 500 {
-			return common.StringErrorWrapperLocal("provider websocket request failed", "provider_ws_request_failed", statusCode)
+			return codexRealtimeProviderHandshakeError("provider websocket request failed", "provider_ws_request_failed", "upstream_error", statusCode)
 		}
 	}
 	return common.StringErrorWrapperLocal("websocket request failed", "ws_request_failed", http.StatusInternalServerError)
+}
+
+func codexRealtimeProviderHandshakeError(message, code, errType string, statusCode int) *types.OpenAIErrorWithStatusCode {
+	return &types.OpenAIErrorWithStatusCode{
+		OpenAIError: types.OpenAIError{
+			Message: message,
+			Type:    errType,
+			Code:    code,
+		},
+		StatusCode: statusCode,
+		LocalError: false,
+	}
+}
+
+func codexRealtimeProviderHandshakeMessage(err types.OpenAIError, statusCode int) string {
+	switch {
+	case common.ProviderErrorIsQuotaExhausted(err):
+		return "provider quota exhausted"
+	case common.ProviderErrorIsRateLimited(err) || statusCode == http.StatusTooManyRequests:
+		return "provider rate limit exceeded"
+	case common.ProviderErrorIsAuthRejected(err) || statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden:
+		return "provider authentication failed"
+	case statusCode >= 500:
+		return "provider websocket request failed"
+	default:
+		return "websocket request failed"
+	}
 }
 
 func logCodexRealtimeWSDialFailure(err error) {

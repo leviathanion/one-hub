@@ -111,6 +111,13 @@ func InitOptionMap() {
 	config.GlobalOption.RegisterStringOption("ChatLinks", &config.ChatLinks, publicOption())
 	config.GlobalOption.RegisterFloatOption("QuotaPerUnit", &config.QuotaPerUnit, publicOption())
 	config.GlobalOption.RegisterIntOption("RetryTimes", &config.RetryTimes, publicOption())
+	config.GlobalOption.RegisterCustomOptionWithValidator("RetryStatusCodes", func() string {
+		return config.RetryStatusCodes
+	}, func(value string) error {
+		return config.SetRetryStatusCodes(value)
+	}, func(value string) error {
+		return config.ValidateRetryStatusCodes(value)
+	}, publicOption(), config.DefaultRetryStatusCodes)
 	config.GlobalOption.RegisterIntOption("RetryCooldownSeconds", &config.RetryCooldownSeconds, publicOption())
 	config.GlobalOption.RegisterIntOption("PreferredChannelWaitMilliseconds", &config.PreferredChannelWaitMilliseconds, publicOption())
 	config.GlobalOption.RegisterIntOption("PreferredChannelWaitPollMilliseconds", &config.PreferredChannelWaitPollMilliseconds, publicOption())

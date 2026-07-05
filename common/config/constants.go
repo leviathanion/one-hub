@@ -198,6 +198,7 @@ var ApproximateTokenEnabled = false
 var DisableTokenEncoders = false
 var RetryTimes = 0
 var RetryTimeOut = 10
+var RetryStatusCodes = DefaultRetryStatusCodes
 
 var DefaultChannelWeight = uint(1)
 var RetryCooldownSeconds = 5

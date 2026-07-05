@@ -281,9 +281,16 @@ func TestGroupManagerFallbackAndFetchChannelByID(t *testing.T) {
 
 func TestRelayCommonStreamingAndRetryHelpers(t *testing.T) {
 	originalLogger := logger.Logger
+	originalRetryStatusCodes := config.RetryStatusCodes
 	logger.Logger = zap.NewNop()
+	if err := config.SetRetryStatusCodes(config.DefaultRetryStatusCodes); err != nil {
+		t.Fatalf("expected default retry status codes to parse, got %v", err)
+	}
 	t.Cleanup(func() {
 		logger.Logger = originalLogger
+		if err := config.SetRetryStatusCodes(originalRetryStatusCodes); err != nil {
+			t.Fatalf("restore retry status codes: %v", err)
+		}
 	})
 
 	recorder := httptest.NewRecorder()
@@ -356,12 +363,32 @@ func TestRelayCommonStreamingAndRetryHelpers(t *testing.T) {
 		t.Fatal("expected 5xx responses to remain retryable")
 	}
 	if !shouldRetry(newRelayTestContext(nil), &types.OpenAIErrorWithStatusCode{StatusCode: http.StatusGatewayTimeout}, config.ChannelTypeCodex) {
-		t.Fatal("expected 504 responses to use the generic 5xx retry policy")
+		t.Fatal("expected 504 responses to use the default retry status policy")
 	}
-	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound} {
+	if shouldRetry(newRelayTestContext(nil), &types.OpenAIErrorWithStatusCode{StatusCode: http.StatusNotImplemented}, config.ChannelTypeCodex) {
+		t.Fatal("expected unconfigured 5xx statuses to remain non-retryable by default")
+	}
+	for _, status := range []int{http.StatusNotFound} {
 		if shouldRetry(newRelayTestContext(nil), &types.OpenAIErrorWithStatusCode{StatusCode: status}, config.ChannelTypeCodex) {
 			t.Fatalf("expected status %d to be non-retryable", status)
 		}
+	}
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		if !shouldRetry(newRelayTestContext(nil), &types.OpenAIErrorWithStatusCode{StatusCode: status}, config.ChannelTypeCodex) {
+			t.Fatalf("expected upstream status %d to retry on another channel", status)
+		}
+	}
+	if !shouldRetry(newRelayTestContext(nil), &types.OpenAIErrorWithStatusCode{
+		OpenAIError: types.OpenAIError{Type: "authentication_error", Code: "provider_authentication_failed"},
+		StatusCode:  http.StatusUnauthorized,
+	}, config.ChannelTypeCodex) {
+		t.Fatal("expected upstream provider authentication failures to retry on another channel")
+	}
+	if !shouldRetry(newRelayTestContext(nil), &types.OpenAIErrorWithStatusCode{
+		OpenAIError: types.OpenAIError{Type: "invalid_request_error", Code: "token_invalidated"},
+		StatusCode:  http.StatusUnauthorized,
+	}, config.ChannelTypeCodex) {
+		t.Fatal("expected token_invalidated upstream credential failures to retry on another channel")
 	}
 	retryCtx.Set("specific_channel_id", 99)
 	if shouldRetry(retryCtx, &types.OpenAIErrorWithStatusCode{StatusCode: http.StatusTooManyRequests}, config.ChannelTypeCodex) {
@@ -379,6 +406,16 @@ func TestRelayCommonStreamingAndRetryHelpers(t *testing.T) {
 		LocalError: true,
 	}, config.ChannelTypeCodex) {
 		t.Fatal("expected local stale continuation errors to disable retries")
+	}
+
+	if err := config.SetRetryStatusCodes("401"); err != nil {
+		t.Fatalf("expected retry status override to parse, got %v", err)
+	}
+	if !shouldRetry(newRelayTestContext(nil), &types.OpenAIErrorWithStatusCode{StatusCode: http.StatusUnauthorized}, config.ChannelTypeCodex) {
+		t.Fatal("expected configured status 401 to remain retryable")
+	}
+	if shouldRetry(newRelayTestContext(nil), &types.OpenAIErrorWithStatusCode{StatusCode: http.StatusInternalServerError}, config.ChannelTypeCodex) {
+		t.Fatal("expected status 500 to stop retrying after retry status override")
 	}
 }
 

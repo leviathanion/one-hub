@@ -860,28 +860,19 @@ func shouldRetry(c *gin.Context, apiErr *types.OpenAIErrorWithStatusCode, channe
 		return false
 	}
 
-	switch apiErr.StatusCode {
-	case http.StatusTooManyRequests, http.StatusTemporaryRedirect:
+	// TODO(retry-policy): this status-code gate is a pragmatic interim policy, not
+	// the ideal architecture. The better design is a structured provider failure
+	// classifier whose disposition drives retry, cooldown, disable, and error
+	// presentation decisions; message matching should stay only as a scoped fallback.
+	if config.RetryStatusCodeIsRetryable(apiErr.StatusCode) {
 		return true
-	case http.StatusUnauthorized, http.StatusForbidden:
-		return false
-	case http.StatusRequestTimeout, 524:
-		return false
+	}
+
+	switch apiErr.StatusCode {
 	case http.StatusBadRequest:
 		return shouldRetryBadRequest(channelType, apiErr)
 	}
-
-	if apiErr.StatusCode/100 == 5 {
-		return true
-	}
-
-	if apiErr.StatusCode/100 == 2 {
-		return false
-	}
-	if apiErr.StatusCode/100 == 4 {
-		return false
-	}
-	return true
+	return false
 }
 
 func shouldRetryBadRequest(channelType int, apiErr *types.OpenAIErrorWithStatusCode) bool {

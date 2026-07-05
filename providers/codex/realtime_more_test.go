@@ -304,12 +304,42 @@ func TestCodexRealtimeConnectionPlanningAndDialPaths(t *testing.T) {
 			if gotCode != tc.wantCode || errWithCode.StatusCode != tc.wantStatus {
 				t.Fatalf("%s: expected %s/%d, got code=%v status=%d", tc.name, tc.wantCode, tc.wantStatus, errWithCode.Code, errWithCode.StatusCode)
 			}
+			if tc.statusCode != http.StatusNotFound && tc.statusCode != http.StatusUpgradeRequired && errWithCode.LocalError {
+				t.Fatalf("%s: expected provider handshake status to be retryable control-plane signal, got local error", tc.name)
+			}
 		}
 
 		errWithCode := mapCodexRealtimeWSDialError(errors.New("dial tcp: no route"))
 		gotCode, _ := errWithCode.Code.(string)
 		if gotCode != "ws_request_failed" || errWithCode.StatusCode != http.StatusInternalServerError {
 			t.Fatalf("expected transport errors without HTTP status to remain ws_request_failed, got %+v", errWithCode)
+		}
+	})
+
+	t.Run("handshake provider body preserves code but sanitizes user message", func(t *testing.T) {
+		errWithCode := mapCodexRealtimeWSDialError(&wsconn.DialError{
+			URL:        "wss://provider.example/backend-api/codex/responses",
+			StatusCode: http.StatusUnauthorized,
+			BodySnippet: []byte(`{
+				"error": {
+					"message": "Your authentication token has been invalidated. Please try signing in again.",
+					"type": "invalid_request_error",
+					"code": "token_invalidated"
+				},
+				"status": 401
+			}`),
+			Err: errors.New("websocket: bad handshake"),
+		})
+		if errWithCode == nil {
+			t.Fatal("expected mapped provider error")
+		}
+		if errWithCode.StatusCode != http.StatusUnauthorized || errWithCode.Code != "token_invalidated" || errWithCode.LocalError {
+			t.Fatalf("expected non-local token_invalidated 401, got %+v", errWithCode)
+		}
+		if errWithCode.Message != "provider authentication failed" ||
+			strings.Contains(errWithCode.Message, "invalidated") ||
+			strings.Contains(errWithCode.Message, "signing in") {
+			t.Fatalf("expected sanitized provider auth message, got %q", errWithCode.Message)
 		}
 	})
 

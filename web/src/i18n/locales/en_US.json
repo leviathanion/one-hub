@@ -264,8 +264,8 @@
     "deleteDisabledChannels": "Delete Disabled Channels",
     "description1": "1. The larger the priority, the higher the priority of use; (only when all nodes under this priority are frozen or disabled, will the lower priority nodes be used)",
     "description2": "2. Under the same priority: Load balancing based on weight (weighted random selection)",
-    "description3": "3. If 'Retry Times' and 'Retry Interval' are set in Settings - General Settings, retries will occur after a failure.",
-    "description4": "4. Retry logic: 1) Retry in nodes with higher priority first. If all nodes in higher priority are frozen, retries will be attempted in nodes with lower priority. 2) If 'Retry Interval' is set, a channel will be frozen for a period after a failure, and no one will use this channel until the freezing time ends. 3) After the retry times are used up, it will end directly.",
+    "description3": "3. If cross-channel retry attempts and 429 channel cooldown are set in Settings - General Settings, failed requests can retry on another channel.",
+    "description4": "4. Retry logic: 1) Retry higher-priority nodes first. If all nodes in that priority are frozen, lower-priority nodes are tried. 2) 429 channel cooldown freezes the failed channel+model after a rate-limit failure, so later requests avoid it until cooldown ends. 3) Retries stop after cross-channel retry attempts are exhausted.",
     "disabled": "Disabled",
     "enabled": "Enabled",
     "filterTags": "Filter Tags",
@@ -1007,12 +1007,16 @@
           "placeholder": "The quota that can be exchanged for one unit of currency"
         },
         "retryCooldownSeconds": {
-          "label": "Retry Cooldown (seconds)",
-          "placeholder": "Retry cooldown (seconds)"
+          "label": "429 Channel Cooldown (seconds)",
+          "placeholder": "Seconds to avoid this channel+model after a 429"
         },
         "retryTimes": {
-          "label": "Retry Times",
-          "placeholder": "Number of retries"
+          "label": "Cross-channel Retry Attempts",
+          "placeholder": "Extra attempts on other channels after failure"
+        },
+        "retryStatusCodes": {
+          "label": "Cross-channel Retry Status Codes",
+          "placeholder": "e.g. 307,401,402,403,408,429,500,502,503,504; 5xx is supported"
         },
         "saveButton": "Save General Settings",
         "title": "General Settings",
@@ -1021,8 +1025,8 @@
           "placeholder": "For example, the purchase link of the card issuing website"
         },
         "retryTimeOut": {
-          "label": "Retry Timeout (seconds)",
-          "placeholder": "Retry Timeout (seconds)"
+          "label": "Request Retry Budget (seconds)",
+          "placeholder": "Maximum time for all cross-channel retry attempts"
         }
       },
       "logSettings": {

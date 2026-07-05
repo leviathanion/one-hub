@@ -4,10 +4,9 @@ import (
 	"net/http"
 
 	"one-api/common"
+	"one-api/common/config"
 	"one-api/types"
 )
-
-const cloudflareStatusTimeout = 524
 
 type ResponsesAttemptUpstreamDisposition int
 
@@ -278,21 +277,11 @@ func responsesAttemptRetryableFailure(apiErr *types.OpenAIErrorWithStatusCode) b
 	if apiErr == nil || apiErr.LocalError {
 		return false
 	}
-	switch apiErr.StatusCode {
-	case http.StatusTooManyRequests:
-		return true
-	case http.StatusRequestTimeout, http.StatusGatewayTimeout, cloudflareStatusTimeout:
-		// These timeouts do not prove the provider rejected the request before
-		// accepting it. Treat the attempt as ambiguous and surface it instead of
-		// replaying across channels.
-		return false
-	case http.StatusUnauthorized, http.StatusForbidden:
-		return false
-	}
-	if apiErr.StatusCode/100 == 5 {
-		return true
-	}
-	return false
+	// Status policy is operator-owned, but ResponsesWS still gates replay with
+	// upstream, downstream, accounting, affinity, and continuation barriers
+	// before this function runs. Including timeout statuses here only takes
+	// effect after the attempt is classified as not accepted/committed.
+	return config.RetryStatusCodeIsRetryable(apiErr.StatusCode)
 }
 
 func classifyResponsesChannelFailure(apiErr *types.OpenAIErrorWithStatusCode) ResponsesChannelFailure {

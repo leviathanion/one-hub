@@ -28,6 +28,7 @@ func TestInitOptionMapRegistersPreferredChannelWaitOptions(t *testing.T) {
 	originalPoll := config.PreferredChannelWaitPollMilliseconds
 	originalLarkClientID := config.LarkClientId
 	originalLarkClientSecret := config.LarkClientSecret
+	originalRetryStatusCodes := config.RetryStatusCodes
 	t.Cleanup(func() {
 		config.GlobalOption = originalOptionManager
 		DB = originalDB
@@ -35,6 +36,9 @@ func TestInitOptionMapRegistersPreferredChannelWaitOptions(t *testing.T) {
 		config.PreferredChannelWaitPollMilliseconds = originalPoll
 		config.LarkClientId = originalLarkClientID
 		config.LarkClientSecret = originalLarkClientSecret
+		if err := config.SetRetryStatusCodes(originalRetryStatusCodes); err != nil {
+			t.Fatalf("restore retry status codes: %v", err)
+		}
 	})
 
 	testDB, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
@@ -51,6 +55,9 @@ func TestInitOptionMapRegistersPreferredChannelWaitOptions(t *testing.T) {
 	config.PreferredChannelWaitPollMilliseconds = 25
 	config.LarkClientId = "cli_123"
 	config.LarkClientSecret = "secret_123"
+	if err := config.SetRetryStatusCodes("401,5xx"); err != nil {
+		t.Fatalf("expected retry status code seed to parse, got %v", err)
+	}
 
 	InitOptionMap()
 
@@ -65,6 +72,18 @@ func TestInitOptionMapRegistersPreferredChannelWaitOptions(t *testing.T) {
 	}
 	if got := config.GlobalOption.Get("LarkClientSecret"); got != "secret_123" {
 		t.Fatalf("expected lark client secret registration, got %q", got)
+	}
+	if got := config.GlobalOption.Get("RetryStatusCodes"); got != config.DefaultRetryStatusCodes {
+		t.Fatalf("expected retry status codes default registration, got %q", got)
+	}
+	if err := config.GlobalOption.Set("RetryStatusCodes", "401,403"); err != nil {
+		t.Fatalf("expected retry status codes option update to succeed, got %v", err)
+	}
+	if got := config.GlobalOption.Get("RetryStatusCodes"); got != "401,403" {
+		t.Fatalf("expected retry status codes option to update, got %q", got)
+	}
+	if err := config.GlobalOption.Validate("RetryStatusCodes", "999"); err == nil {
+		t.Fatal("expected invalid retry status codes option to fail validation")
 	}
 	if _, exists := config.GlobalOption.GetPublic()["LarkClientSecret"]; exists {
 		t.Fatal("expected lark client secret to be excluded from public options")

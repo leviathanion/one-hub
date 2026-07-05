@@ -74,6 +74,7 @@ const defaultInputs = {
   DisplayInCurrencyEnabled: '',
   ApproximateTokenEnabled: '',
   RetryTimes: 0,
+  RetryStatusCodes: '',
   RetryTimeOut: 0,
   RetryCooldownSeconds: 0,
   MjNotifyEnabled: '',
@@ -1176,7 +1177,7 @@ const OperationSetting = () => {
           break;
         case 'general':
           if (inputs.QuotaPerUnit < 0 || inputs.RetryTimes < 0 || inputs.RetryCooldownSeconds < 0 || inputs.RetryTimeOut < 0) {
-            showError('单位额度、重试次数、冷却时间、重试超时时间不能为负数');
+            showError('单位额度、跨渠道重试次数、429 渠道冷却时间、请求重试总超时时间不能为负数');
             return;
           }
 
@@ -1191,6 +1192,9 @@ const OperationSetting = () => {
           }
           if (originInputs['RetryTimes'] !== inputs.RetryTimes) {
             await putOptionOrThrow('RetryTimes', inputs.RetryTimes);
+          }
+          if (originInputs['RetryStatusCodes'] !== inputs.RetryStatusCodes) {
+            await putOptionOrThrow('RetryStatusCodes', inputs.RetryStatusCodes);
           }
           if (originInputs['RetryCooldownSeconds'] !== inputs.RetryCooldownSeconds) {
             await putOptionOrThrow('RetryCooldownSeconds', inputs.RetryCooldownSeconds);
@@ -1370,6 +1374,8 @@ const OperationSetting = () => {
                 disabled={loading}
               />
             </FormControl>
+          </Stack>
+          <Stack direction={{ sm: 'column', md: 'row' }} spacing={{ xs: 3, sm: 2, md: 4 }} sx={{ width: '100%' }}>
             <FormControl fullWidth>
               <InputLabel htmlFor="RetryTimes">{t('setting_index.operationSettings.generalSettings.retryTimes.label')}</InputLabel>
               <OutlinedInput
@@ -1379,6 +1385,20 @@ const OperationSetting = () => {
                 onChange={handleInputChange}
                 label={t('setting_index.operationSettings.generalSettings.retryTimes.label')}
                 placeholder={t('setting_index.operationSettings.generalSettings.retryTimes.placeholder')}
+                disabled={loading}
+              />
+            </FormControl>
+            <FormControl fullWidth>
+              <InputLabel htmlFor="RetryStatusCodes">
+                {t('setting_index.operationSettings.generalSettings.retryStatusCodes.label')}
+              </InputLabel>
+              <OutlinedInput
+                id="RetryStatusCodes"
+                name="RetryStatusCodes"
+                value={inputs.RetryStatusCodes}
+                onChange={handleInputChange}
+                label={t('setting_index.operationSettings.generalSettings.retryStatusCodes.label')}
+                placeholder={t('setting_index.operationSettings.generalSettings.retryStatusCodes.placeholder')}
                 disabled={loading}
               />
             </FormControl>

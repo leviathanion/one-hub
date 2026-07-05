@@ -36,7 +36,8 @@ func ProviderErrorIsAuthRejected(err types.OpenAIError) bool {
 		return true
 	}
 	switch strings.ToLower(OpenAIErrorCodeText(err.Code)) {
-	case "invalid_api_key", "account_deactivated", "provider_authentication_failed":
+	case "invalid_api_key", "account_deactivated", "provider_authentication_failed",
+		"token_invalidated", "invalid_token", "expired_token", "invalid_authentication_token":
 		return true
 	}
 	return strings.TrimSpace(err.Param) == "PERMISSIONDENIED"

@@ -5,10 +5,21 @@ import (
 	"net/http"
 	"testing"
 
+	"one-api/common/config"
 	"one-api/types"
 )
 
 func TestDecideResponsesAttemptReplay(t *testing.T) {
+	originalRetryStatusCodes := config.RetryStatusCodes
+	if err := config.SetRetryStatusCodes(config.DefaultRetryStatusCodes); err != nil {
+		t.Fatalf("expected default retry status codes to parse, got %v", err)
+	}
+	t.Cleanup(func() {
+		if err := config.SetRetryStatusCodes(originalRetryStatusCodes); err != nil {
+			t.Fatalf("restore retry status codes: %v", err)
+		}
+	})
+
 	retryableErr := &types.OpenAIErrorWithStatusCode{
 		OpenAIError: types.OpenAIError{Type: "rate_limit_error", Code: "rate_limit_exceeded"},
 		StatusCode:  http.StatusTooManyRequests,
@@ -49,6 +60,17 @@ func TestDecideResponsesAttemptReplay(t *testing.T) {
 			name: "retry provider 5xx rejection before accept",
 			mutate: func(snapshot *ResponsesAttemptSnapshot) {
 				snapshot.Failure = &types.OpenAIErrorWithStatusCode{StatusCode: http.StatusServiceUnavailable}
+			},
+			wantDecision: ResponsesAttemptDecisionRollbackAndRetryNextChannel,
+			wantBarrier:  ReplayBarrierNone,
+		},
+		{
+			name: "retry provider credential rejection before accept",
+			mutate: func(snapshot *ResponsesAttemptSnapshot) {
+				snapshot.Failure = &types.OpenAIErrorWithStatusCode{
+					OpenAIError: types.OpenAIError{Type: "invalid_request_error", Code: "token_invalidated"},
+					StatusCode:  http.StatusUnauthorized,
+				}
 			},
 			wantDecision: ResponsesAttemptDecisionRollbackAndRetryNextChannel,
 			wantBarrier:  ReplayBarrierNone,
@@ -176,24 +198,82 @@ func TestDecideResponsesAttemptReplay(t *testing.T) {
 }
 
 func TestResponsesAttemptRetryableFailureStatuses(t *testing.T) {
+	originalRetryStatusCodes := config.RetryStatusCodes
+	if err := config.SetRetryStatusCodes(config.DefaultRetryStatusCodes); err != nil {
+		t.Fatalf("expected default retry status codes to parse, got %v", err)
+	}
+	t.Cleanup(func() {
+		if err := config.SetRetryStatusCodes(originalRetryStatusCodes); err != nil {
+			t.Fatalf("restore retry status codes: %v", err)
+		}
+	})
+
 	tests := []struct {
 		status int
 		want   bool
 	}{
 		{status: http.StatusTooManyRequests, want: true},
 		{status: http.StatusServiceUnavailable, want: true},
-		{status: http.StatusTemporaryRedirect, want: false},
-		{status: http.StatusRequestTimeout, want: false},
-		{status: http.StatusGatewayTimeout, want: false},
-		{status: cloudflareStatusTimeout, want: false},
-		{status: http.StatusUnauthorized, want: false},
-		{status: http.StatusForbidden, want: false},
+		{status: http.StatusTemporaryRedirect, want: true},
+		{status: http.StatusRequestTimeout, want: true},
+		{status: http.StatusGatewayTimeout, want: true},
+		{status: http.StatusNotImplemented, want: false},
+		{status: 524, want: false},
+		{status: http.StatusUnauthorized, want: true},
+		{status: http.StatusForbidden, want: true},
+		{status: http.StatusNotFound, want: false},
 	}
 	for _, tt := range tests {
 		t.Run(fmt.Sprintf("%d", tt.status), func(t *testing.T) {
 			got := responsesAttemptRetryableFailure(&types.OpenAIErrorWithStatusCode{StatusCode: tt.status})
 			if got != tt.want {
 				t.Fatalf("retryable(%d)=%v, want %v", tt.status, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResponsesAttemptRetryableFailureUsesConfiguredStatusPolicy(t *testing.T) {
+	originalRetryStatusCodes := config.RetryStatusCodes
+	if err := config.SetRetryStatusCodes("401"); err != nil {
+		t.Fatalf("expected retry status override to parse, got %v", err)
+	}
+	t.Cleanup(func() {
+		if err := config.SetRetryStatusCodes(originalRetryStatusCodes); err != nil {
+			t.Fatalf("restore retry status codes: %v", err)
+		}
+	})
+
+	if !responsesAttemptRetryableFailure(&types.OpenAIErrorWithStatusCode{StatusCode: http.StatusUnauthorized}) {
+		t.Fatal("expected configured status 401 to be retryable")
+	}
+	if responsesAttemptRetryableFailure(&types.OpenAIErrorWithStatusCode{StatusCode: http.StatusServiceUnavailable}) {
+		t.Fatal("expected status 503 to stop retrying after retry status override")
+	}
+}
+
+func TestResponsesAttemptRetryableFailureCredentialSignals(t *testing.T) {
+	originalRetryStatusCodes := config.RetryStatusCodes
+	if err := config.SetRetryStatusCodes(config.DefaultRetryStatusCodes); err != nil {
+		t.Fatalf("expected default retry status codes to parse, got %v", err)
+	}
+	t.Cleanup(func() {
+		if err := config.SetRetryStatusCodes(originalRetryStatusCodes); err != nil {
+			t.Fatalf("restore retry status codes: %v", err)
+		}
+	})
+
+	if !responsesAttemptRetryableFailure(&types.OpenAIErrorWithStatusCode{StatusCode: http.StatusUnauthorized}) {
+		t.Fatal("expected status-only 401 to be retryable after provider boundary")
+	}
+	for _, code := range []string{"provider_authentication_failed", "invalid_api_key", "token_invalidated"} {
+		t.Run(code, func(t *testing.T) {
+			got := responsesAttemptRetryableFailure(&types.OpenAIErrorWithStatusCode{
+				OpenAIError: types.OpenAIError{Type: "authentication_error", Code: code},
+				StatusCode:  http.StatusUnauthorized,
+			})
+			if !got {
+				t.Fatalf("expected credential code %q to be retryable", code)
 			}
 		})
 	}

@@ -995,12 +995,16 @@
           "placeholder": "1単位の通貨で交換できるクオータ"
         },
         "retryCooldownSeconds": {
-          "label": "リトライ間隔（秒）",
-          "placeholder": "リトライ間隔（秒）"
+          "label": "429 チャネルクールダウン（秒）",
+          "placeholder": "429 後にこのチャネル+モデルを避ける秒数"
         },
         "retryTimes": {
-          "label": "リトライ回数",
-          "placeholder": "リトライ回数"
+          "label": "チャネル切替リトライ回数",
+          "placeholder": "失敗後に別チャネルで追加試行する回数"
+        },
+        "retryStatusCodes": {
+          "label": "チャネル切替リトライ対象ステータス",
+          "placeholder": "例: 307,401,402,403,408,429,500,502,503,504。5xx も使用できます"
         },
         "saveButton": "一般設定を保存",
         "title": "一般設定",
@@ -1009,8 +1013,8 @@
           "placeholder": "例えば、カード発行ウェブサイトの購入リンク"
         },
         "retryTimeOut": {
-          "label": "再試行のタイムアウト時間（秒）",
-          "placeholder": "再試行のタイムアウト時間（秒）"
+          "label": "リクエスト再試行の総タイムアウト（秒）",
+          "placeholder": "チャネル切替リトライ全体の時間上限"
         }
       },
       "logSettings": {
