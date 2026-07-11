@@ -17,3 +17,13 @@ func GetCodexAutoRefreshStatus(c *gin.Context) {
 		"data":    status,
 	})
 }
+
+// GetCodexUsageAutoRefreshStatus returns Codex usage auto refresh runtime status.
+func GetCodexUsageAutoRefreshStatus(c *gin.Context) {
+	status := codex.GetUsageAutoRefreshStatus()
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data":    status,
+	})
+}

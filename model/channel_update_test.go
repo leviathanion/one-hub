@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -238,9 +239,10 @@ func primeChannelDerivedCaches(t *testing.T, channelID int) {
 	t.Helper()
 
 	cacheEntries := map[string]string{
-		fmt.Sprintf("%s:%d", codexTokenCacheKeyPrefix, channelID):        "cached-token",
-		fmt.Sprintf("%s:%d", codexUsagePreviewCacheKeyPrefix, channelID): "cached-preview",
-		fmt.Sprintf("%s:%d", codexUsageDetailCacheKeyPrefix, channelID):  "cached-detail",
+		fmt.Sprintf("%s:%d", codexTokenCacheKeyPrefix, channelID):           "cached-token",
+		fmt.Sprintf("%s:%d", codexUsagePreviewCacheKeyPrefix, channelID):    "cached-preview",
+		fmt.Sprintf("%s:%d", codexUsageDetailCacheKeyPrefix, channelID):     "cached-detail",
+		fmt.Sprintf("%s:%d", codexUsageGenerationCacheKeyPrefix, channelID): "generation-before-mutation",
 	}
 
 	for key, value := range cacheEntries {
@@ -253,16 +255,20 @@ func primeChannelDerivedCaches(t *testing.T, channelID int) {
 func assertChannelDerivedCachesCleared(t *testing.T, channelID int) {
 	t.Helper()
 
-	cacheKeys := []string{
+	legacyKeys := []string{
 		fmt.Sprintf("%s:%d", codexTokenCacheKeyPrefix, channelID),
 		fmt.Sprintf("%s:%d", codexUsagePreviewCacheKeyPrefix, channelID),
 		fmt.Sprintf("%s:%d", codexUsageDetailCacheKeyPrefix, channelID),
 	}
-
-	for _, key := range cacheKeys {
+	for _, key := range legacyKeys {
 		if _, err := cache.GetCache[string](key); !errors.Is(err, cache.CacheNotFound) {
-			t.Fatalf("expected cache key %s to be cleared, got err=%v", key, err)
+			t.Fatalf("expected legacy cache key %s to be cleared, got err=%v", key, err)
 		}
+	}
+	generationKey := fmt.Sprintf("%s:%d", codexUsageGenerationCacheKeyPrefix, channelID)
+	generation, err := cache.GetCache[string](generationKey)
+	if err != nil || generation == "generation-before-mutation" || generation == "" {
+		t.Fatalf("expected generation %s to be atomically rotated, value=%q err=%v", generationKey, generation, err)
 	}
 }
 
@@ -273,12 +279,36 @@ func assertChannelDerivedCachesPresent(t *testing.T, channelID int) {
 		fmt.Sprintf("%s:%d", codexTokenCacheKeyPrefix, channelID),
 		fmt.Sprintf("%s:%d", codexUsagePreviewCacheKeyPrefix, channelID),
 		fmt.Sprintf("%s:%d", codexUsageDetailCacheKeyPrefix, channelID),
+		fmt.Sprintf("%s:%d", codexUsageGenerationCacheKeyPrefix, channelID),
 	}
 
 	for _, key := range cacheKeys {
 		if _, err := cache.GetCache[string](key); err != nil {
 			t.Fatalf("expected cache key %s to still exist, got err=%v", key, err)
 		}
+	}
+}
+
+func TestChannelCredentialDatabaseOperationsHonorCanceledContext(t *testing.T) {
+	useTestChannelDB(t)
+	insertTestChannel(t, &Channel{Id: 991, Type: config.ChannelTypeCodex, Name: "codex", Key: "old-key"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := GetChannelByIdWithContext(ctx, 991); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected canceled credential load, got %v", err)
+	}
+	if err := UpdateChannelKeyWithContext(ctx, 991, "new-key"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected canceled credential save, got %v", err)
+	}
+
+	persisted, err := GetChannelById(991)
+	if err != nil {
+		t.Fatalf("expected channel lookup after cancellation to succeed, got %v", err)
+	}
+	if persisted.Key != "old-key" {
+		t.Fatalf("canceled save changed persisted credentials: got %q", persisted.Key)
 	}
 }
 
@@ -420,6 +450,29 @@ func TestUpdateChannelKeyClearsCodexDerivedCaches(t *testing.T) {
 		t.Fatalf("expected key update to succeed, got %v", err)
 	}
 
+	assertChannelDerivedCachesCleared(t, 1)
+}
+
+func TestUpdateChannelStatusClearsCodexDerivedCachesAfterCommit(t *testing.T) {
+	useTestChannelDB(t)
+	cache.InitCacheManager()
+	logger.SetupLogger()
+
+	insertTestChannel(t, &Channel{
+		Id:     1,
+		Type:   config.ChannelTypeCodex,
+		Status: config.ChannelStatusEnabled,
+		Name:   "codex-status",
+		Key:    "sk-codex",
+		Group:  "default",
+		Models: "gpt-5",
+	})
+	primeChannelDerivedCaches(t, 1)
+
+	updated, err := UpdateChannelStatusIfCurrent(1, config.ChannelStatusEnabled, config.ChannelStatusAutoDisabled)
+	if err != nil || !updated {
+		t.Fatalf("status update failed: updated=%v err=%v", updated, err)
+	}
 	assertChannelDerivedCachesCleared(t, 1)
 }
 
@@ -2299,6 +2352,80 @@ func TestUpdateChannelsTagClearsCodexDerivedCaches(t *testing.T) {
 	assertChannelDerivedCachesCleared(t, 2)
 }
 
+func TestUpdateChannelsTagRenameRefreshesRoutesAndCaches(t *testing.T) {
+	useTestChannelDB(t)
+	snapshot := snapshotTestChannelGroup(t)
+	t.Cleanup(func() { restoreTestChannelGroup(t, snapshot) })
+
+	const (
+		firstID  = 23501
+		secondID = 23502
+	)
+	for _, channel := range []*Channel{
+		{
+			Id: firstID, Type: config.ChannelTypeCodex, Status: config.ChannelStatusEnabled,
+			Name: "rename-a", Key: `{"access_token":"token-a"}`, Tag: "old-tag",
+			Group: "old-group", Models: "old-model", Other: `{"websocket_mode":"force"}`,
+		},
+		{
+			Id: secondID, Type: config.ChannelTypeCodex, Status: config.ChannelStatusEnabled,
+			Name: "rename-b", Key: `{"access_token":"token-b"}`, Tag: "old-tag",
+			Group: "old-group", Models: "old-model", Other: `{"websocket_mode":"force"}`,
+		},
+	} {
+		insertTestChannel(t, channel)
+	}
+	requireChannelGroupLoad(t)
+
+	invalidated := make(map[int]bool)
+	originalInvalidate := invalidateChannelCodexDerivedCaches
+	invalidateChannelCodexDerivedCaches = func(ids []int) {
+		for _, id := range ids {
+			invalidated[id] = true
+		}
+	}
+	t.Cleanup(func() { invalidateChannelCodexDerivedCaches = originalInvalidate })
+
+	err := UpdateChannelsTagWithSubmittedFields("old-tag", &Channel{
+		Key:    `{"access_token":"token-a"}` + "\n" + `{"access_token":"token-b"}`,
+		Tag:    "new-tag",
+		Group:  "new-group",
+		Models: "new-model",
+	}, ChannelTagSubmittedFields{
+		"tag": {}, "group": {}, "models": {},
+	})
+	if err != nil {
+		t.Fatalf("rename tag config: %v", err)
+	}
+
+	var durable []Channel
+	if err := DB.Where("id IN ?", []int{firstID, secondID}).Order("id").Find(&durable).Error; err != nil {
+		t.Fatalf("load renamed channels: %v", err)
+	}
+	if len(durable) != 2 {
+		t.Fatalf("expected two renamed channels, got %d", len(durable))
+	}
+	for _, channel := range durable {
+		if channel.Tag != "new-tag" || channel.Group != "new-group" || channel.Models != "new-model" {
+			t.Fatalf("tag update was not durable: %+v", channel)
+		}
+		if !invalidated[channel.Id] {
+			t.Errorf("Codex caches were not invalidated for channel %d", channel.Id)
+		}
+	}
+
+	if _, err := ChannelGroup.Next("old-group", "old-model"); err == nil {
+		t.Fatal("old chooser route survived the tag rename")
+	}
+	routed, err := ChannelGroup.Next("new-group", "new-model")
+	if err != nil {
+		t.Fatalf("new chooser route was not published: %v", err)
+	}
+	if routed.Id != firstID && routed.Id != secondID {
+		t.Fatalf("unexpected channel on new chooser route: %+v", routed)
+	}
+}
+
 func TestBatchUpdateChannelsAzureApiRejectsNonAzureChannels(t *testing.T) {
 	useTestChannelDB(t)
 	logger.SetupLogger()
@@ -2505,6 +2632,166 @@ func TestBatchDelModelChannelsRequiresValueAndCountsActualRemovals(t *testing.T)
 	}
 	if channelThree.Models != "" {
 		t.Fatalf("expected sole model to be removed from channel three, got %q", channelThree.Models)
+	}
+}
+
+func TestBatchDelModelChannelsRemovesAllTrimmedDuplicatesOncePerChannel(t *testing.T) {
+	useTestChannelDB(t)
+	logger.SetupLogger()
+
+	testCases := []struct {
+		id     int
+		models string
+		want   string
+	}{
+		{id: 1, models: "gpt-5,gpt-5,other", want: "other"},
+		{id: 2, models: " first , gpt-5 ,second,  gpt-5, third ", want: " first ,second, third "},
+	}
+	for _, testCase := range testCases {
+		insertTestChannel(t, &Channel{
+			Id:     testCase.id,
+			Type:   config.ChannelTypeOpenAI,
+			Name:   fmt.Sprintf("duplicate-models-%d", testCase.id),
+			Key:    fmt.Sprintf("sk-%d", testCase.id),
+			Group:  "default",
+			Models: testCase.models,
+		})
+	}
+
+	count, err := BatchDelModelChannels(&BatchDelModelChannelsParams{
+		Ids:   []int{1, 2},
+		Value: " gpt-5 ",
+	})
+	if err != nil {
+		t.Fatalf("delete duplicate models: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("affected count = %d, want one per mutated channel (2)", count)
+	}
+
+	for _, testCase := range testCases {
+		var channel Channel
+		if err := DB.First(&channel, testCase.id).Error; err != nil {
+			t.Fatalf("load channel %d: %v", testCase.id, err)
+		}
+		if channel.Models != testCase.want {
+			t.Errorf("channel %d models = %q, want %q", testCase.id, channel.Models, testCase.want)
+		}
+		for _, model := range strings.Split(channel.Models, ",") {
+			if strings.TrimSpace(model) == "gpt-5" {
+				t.Errorf("channel %d still contains target model in %q", testCase.id, channel.Models)
+			}
+		}
+	}
+}
+
+func TestBatchDelModelChannelsRollsBackAndSkipsPostCommitEffects(t *testing.T) {
+	useTestChannelDB(t)
+	cache.InitCacheManager()
+	logger.SetupLogger()
+
+	for id := 1; id <= 2; id++ {
+		insertTestChannel(t, &Channel{
+			Id: id, Type: config.ChannelTypeCodex, Name: fmt.Sprintf("codex-%d", id),
+			Key: fmt.Sprintf("sk-%d", id), Group: "default", Models: "gpt-4o,gpt-5",
+		})
+		primeChannelDerivedCaches(t, id)
+	}
+
+	queries := 0
+	queryCallback := "test:count_batch_model_queries:" + t.Name()
+	if err := DB.Callback().Query().Before("gorm:query").Register(queryCallback, func(*gorm.DB) {
+		queries++
+	}); err != nil {
+		t.Fatalf("register query callback: %v", err)
+	}
+	updates := 0
+	updateErr := errors.New("forced second update failure")
+	updateCallback := "test:fail_second_batch_model_update:" + t.Name()
+	if err := DB.Callback().Update().Before("gorm:update").Register(updateCallback, func(tx *gorm.DB) {
+		updates++
+		if updates == 2 {
+			tx.AddError(updateErr)
+		}
+	}); err != nil {
+		t.Fatalf("register update callback: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = DB.Callback().Query().Remove(queryCallback)
+		_ = DB.Callback().Update().Remove(updateCallback)
+	})
+
+	count, err := BatchDelModelChannels(&BatchDelModelChannelsParams{Ids: []int{1, 2}, Value: "gpt-5"})
+	if !errors.Is(err, updateErr) {
+		t.Fatalf("expected second update failure, got count=%d err=%v", count, err)
+	}
+	if count != 0 {
+		t.Fatalf("rolled-back batch reported count %d, want 0", count)
+	}
+	if queries != 1 {
+		t.Fatalf("failed transaction triggered post-commit refresh: query count=%d, want 1", queries)
+	}
+
+	for id := 1; id <= 2; id++ {
+		var channel Channel
+		if err := DB.First(&channel, id).Error; err != nil {
+			t.Fatalf("load channel %d: %v", id, err)
+		}
+		if channel.Models != "gpt-4o,gpt-5" {
+			t.Fatalf("channel %d was not rolled back: models=%q", id, channel.Models)
+		}
+		assertChannelDerivedCachesPresent(t, id)
+		generationKey := fmt.Sprintf("%s:%d", codexUsageGenerationCacheKeyPrefix, id)
+		generation, err := cache.GetCache[string](generationKey)
+		if err != nil || generation != "generation-before-mutation" {
+			t.Fatalf("channel %d generation was invalidated: value=%q err=%v", id, generation, err)
+		}
+	}
+}
+
+func TestBatchDelModelChannelsCASConflictRollsBackWholeBatch(t *testing.T) {
+	useTestChannelDB(t)
+	if err := DB.Exec("DELETE FROM channels").Error; err != nil {
+		t.Fatalf("clear repeated-test fixtures: %v", err)
+	}
+	for id := 1; id <= 2; id++ {
+		insertTestChannel(t, &Channel{
+			Id: id, Type: config.ChannelTypeOpenAI, Name: fmt.Sprintf("channel-%d", id),
+			Key: fmt.Sprintf("sk-%d", id), Group: "default", Models: "gpt-4o,gpt-5",
+		})
+	}
+
+	updates := 0
+	callback := "test:simulate_batch_model_cas_conflict:" + t.Name()
+	if err := DB.Callback().Update().Before("gorm:update").Register(callback, func(tx *gorm.DB) {
+		updates++
+		if updates == 2 {
+			// Deterministically model another writer changing models after the batch
+			// SELECT but before this row's optimistic update.
+			if err := tx.Exec("UPDATE channels SET models = ? WHERE id = ?", "gpt-4o,gpt-5,gpt-x", 2).Error; err != nil {
+				tx.AddError(err)
+			}
+		}
+	}); err != nil {
+		t.Fatalf("register conflict callback: %v", err)
+	}
+	t.Cleanup(func() { _ = DB.Callback().Update().Remove(callback) })
+
+	count, err := BatchDelModelChannels(&BatchDelModelChannelsParams{Ids: []int{1, 2}, Value: "gpt-5"})
+	if !errors.Is(err, errBatchDelModelChannelsConflict) {
+		t.Fatalf("expected explicit CAS conflict, got count=%d err=%v", count, err)
+	}
+	if count != 0 {
+		t.Fatalf("conflicted batch reported count %d, want 0", count)
+	}
+	for id := 1; id <= 2; id++ {
+		var channel Channel
+		if err := DB.First(&channel, id).Error; err != nil {
+			t.Fatalf("load channel %d: %v", id, err)
+		}
+		if channel.Models != "gpt-4o,gpt-5" {
+			t.Fatalf("channel %d escaped whole-batch rollback: models=%q", id, channel.Models)
+		}
 	}
 }
 

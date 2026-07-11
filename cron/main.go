@@ -69,10 +69,10 @@ func InitCron() {
 	}
 
 	err = scheduler.Manager.AddJob(
-		"codex_auto_refresh",
+		"codex_maintenance",
 		gocron.DurationJob(codex.AutoRefreshInterval),
 		gocron.NewTask(func() {
-			codex.RunAutoRefreshWithTimeout(context.Background())
+			codex.RunScheduledMaintenance(context.Background())
 		}),
 	)
 	if err != nil {
@@ -80,7 +80,7 @@ func InitCron() {
 	}
 	if err == nil {
 		common.SafeGoroutine(func() {
-			codex.RunAutoRefreshWithTimeout(context.Background())
+			codex.RunScheduledMaintenance(context.Background())
 		})
 	}
 

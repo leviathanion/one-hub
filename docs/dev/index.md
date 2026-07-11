@@ -31,6 +31,7 @@
 | 2026-06-25 | `526354b9` | 新增 [ResponsesWS Attempt Replay 架构设计方案](./responses-ws-attempt-replay-architecture.md)，把 HTTP / native WS / HTTP bridge 的 request-level rejection retry 收敛成 attempt replay protocol。 | [ResponsesWS Attempt Replay 架构设计方案](./responses-ws-attempt-replay-architecture.md) |
 | 2026-06-28 | `42b03d6c` | 新增 [Codex / PI OAuth 请求 Header 画像对照](./codex-pi-header-parity.md)，作为 Codex upstream parity 的诊断输入。 | [Codex / PI OAuth 请求 Header 画像对照](./codex-pi-header-parity.md) |
 | 未提交 | 当前工作区 | 新增 [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md)，吸收并修正 Codex / PI header parity 诊断，形成 Codex provider official upstream 目标方案。 | [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md) |
+| 未提交 | 当前工作区 | 新增 [Codex Credential Refresh Fence 架构设计](./codex-credential-refresh-fence-architecture.md)，把 rotating OAuth credential 的多节点协调从 process-local journal / Redis lease 收敛为 DB durable fence、revision 与 fail-closed at-most-once protocol。 | [Codex Credential Refresh Fence 架构设计](./codex-credential-refresh-fence-architecture.md) |
 
 阅读规则：
 
@@ -50,6 +51,7 @@
 | [ResponsesWS Transport 边界重构方案](./responses-ws-transport-boundary.md) | ResponsesWS native WS / HTTP bridge transport、provider adapter 边界 | 主体边界已进入当前实现；保留 v1 迁移顺序和复审修复记录 |
 | [Codex / PI OAuth 请求 Header 画像对照](./codex-pi-header-parity.md) | Codex / PI 自身 OAuth header 画像、one-hub 中转差异 | 用于后续 Codex provider header parity 修复和回归测试设计 |
 | [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md) | Codex provider raw envelope、official header/body planner、ResponsesWS native upstream | 目标架构；一次性干净重构，不设 legacy/typed/bridge 运行时兼容态 |
+| [Codex Credential Refresh Fence 架构设计](./codex-credential-refresh-fence-architecture.md) | Codex rotating OAuth credential、DB durable fence、revision、fail-closed recovery | 目标架构；用数据库 attempt fence 取代 process-local pending/ambiguous authority 与 Redis correctness lock |
 | [WebSocket Transport 复用方案](./websocket-transport-architecture.md) | `/v1/realtime` 与 ResponsesWS 的旧底层 I/O 复用 | 历史方案；已被 wsconn 唯一传输边界取代 |
 | [wsconn 唯一传输边界架构方案](./wsconn-architecture.md) | `common/wsconn` 作为唯一 WebSocket 传输边界 | 当前实现；业务层不再持有 `*websocket.Conn` |
 | [one-hub Async Task 架构设计](./task-coordination-architecture.md) | async task、identity、fetch、sweeper、finalize | 当前异步任务架构说明 |
@@ -68,6 +70,7 @@
 | [ResponsesWS Transport 边界重构方案](./responses-ws-transport-boundary.md) | 当前实现 + 目标约束 | 把 native WS / HTTP bridge transport 从 Codex realtime 语义中拆出；主体边界已进入当前实现，文档保留复审修复记录 |
 | [Codex / PI OAuth 请求 Header 画像对照](./codex-pi-header-parity.md) | 当前诊断 | 记录 Codex / PI 本体 HTTP/WS header 画像，以及 one-hub 当前中转后的缺失、额外和逻辑不一致字段 |
 | [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md) | 目标方案 | Codex provider 以 raw envelope contract 和 official planner 作为唯一协议边界；删除 legacy header、typed upstream contract、WS bridge fallback 和 model_headers override |
+| [Codex Credential Refresh Fence 架构设计](./codex-credential-refresh-fence-architecture.md) | 目标方案 | OAuth 前 DB Claim，成功后 ticket-scoped Commit；ambiguous/orphan 无 TTL fail closed，管理员以新 credential 显式恢复 |
 | [WebSocket Transport 复用方案](./websocket-transport-architecture.md) | 历史方案 | 原 primitives-only safety primitives 路线，已被 `common/wsconn` 唯一传输边界取代 |
 | [wsconn 唯一传输边界架构方案](./wsconn-architecture.md) | 当前实现 | `common/wsconn` 是唯一 WebSocket 传输边界；业务层不再 import gorilla，CloseInfo first-write-wins，PongMiss/Idle 语义拆分 |
 | [one-hub Async Task 架构设计](./task-coordination-architecture.md) | 当前实现 | `tasks` 行、settlement snapshot、local fetch、sweeper、finalize 已形成稳定边界 |

@@ -3,14 +3,16 @@ package codex
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"regexp"
+	"sort"
 	"strings"
 	"time"
 
+	"one-api/common"
 	"one-api/common/logger"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -58,13 +60,21 @@ type TokenRefreshError struct {
 	ErrorDescription string `json:"error_description"`
 }
 
-const tokenRefreshErrorBodyLogLimit = 1024
+// ErrOAuthRefreshOutcomeAmbiguous means the OAuth server may have consumed and
+// rotated the submitted one-time refresh token, but the replacement credential
+// could not be recovered from the response. Repeating the exchange with the old
+// token is unsafe; the channel requires explicit reauthorization.
+var ErrOAuthRefreshOutcomeAmbiguous = errors.New("OAuth refresh outcome is ambiguous")
 
-var tokenRefreshSecretFieldPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)("(?:access_token|refresh_token|client_id)"\s*:\s*")[^"]*(")`),
-	regexp.MustCompile(`(?i)('(?:access_token|refresh_token|client_id)'\s*:\s*')[^']*(')`),
-	regexp.MustCompile(`(?i)((?:access_token|refresh_token|client_id)=)[^&\s<>"']+`),
-}
+// ErrOAuthRefreshNotDispatched is the only outcome that permits the durable
+// fence to be canceled automatically.  Every error after client.Do starts is
+// conservatively ambiguous unless the provider publishes a stronger contract.
+var ErrOAuthRefreshNotDispatched = errors.New("OAuth refresh was not dispatched")
+
+const (
+	tokenRefreshErrorBodyLogLimit    = 1024
+	tokenRefreshResponseBodyMaxBytes = 1 << 20
+)
 
 type oauth2CredentialsPayload struct {
 	AccessToken  string   `json:"access_token"`
@@ -92,8 +102,19 @@ func (c *OAuth2Credentials) NeedsRefreshWithin(lead time.Duration) bool {
 	return time.Now().Add(lead).After(c.ExpiresAt)
 }
 
-// Refresh refreshes the access token.
-func (c *OAuth2Credentials) Refresh(ctx context.Context, proxyURL string, maxRetries int) error {
+// Refresh exchanges the current refresh token exactly once.
+//
+// A refresh-token exchange is not safely retryable after a request may have
+// reached the OAuth server: the server can rotate the one-time refresh token even
+// when its response is lost. Retries belong at the maintenance-operation level,
+// after durable state has been inspected, never inside this HTTP exchange.
+//
+// Trade-off: transport failures are classified conservatively as ambiguous even
+// when the server may not have received the request. That can require manual
+// reauthorization instead of an automatic retry, but it cannot destroy a valid
+// replacement token by replaying the old one. A successful response is bounded
+// before parsing; an oversized/unusable 200 is ambiguous for the same reason.
+func (c *OAuth2Credentials) Refresh(ctx context.Context, proxyURL string) error {
 	if c.RefreshToken == "" {
 		return fmt.Errorf("refresh token is empty")
 	}
@@ -115,127 +136,87 @@ func (c *OAuth2Credentials) Refresh(ctx context.Context, proxyURL string, maxRet
 		data.Set("scope", scope)
 	}
 
-	var lastErr error
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("token refresh canceled: %w", err)
-		}
-		if attempt > 0 {
-			// Exponential backoff, max 30s.
-			backoff := time.Duration(1<<uint(attempt-1)) * time.Second
-			if backoff > 30*time.Second {
-				backoff = 30 * time.Second
-			}
-			if hasContext {
-				logger.LogError(ctx, fmt.Sprintf("[Codex] Token refresh retry %d/%d after %v", attempt, maxRetries, backoff))
-			} else {
-				logger.SysLog(fmt.Sprintf("[Codex] Token refresh retry %d/%d after %v", attempt, maxRetries, backoff))
-			}
-			if err := waitForRetry(ctx, backoff); err != nil {
-				return fmt.Errorf("token refresh canceled during backoff: %w", err)
-			}
-		}
-
-		// Create HTTP client.
-		client := &http.Client{
-			Timeout: 30 * time.Second,
-		}
-
-		// Apply proxy when set.
-		if proxyURL != "" {
-			proxyURLParsed, err := url.Parse(proxyURL)
-			if err == nil {
-				client.Transport = &http.Transport{
-					Proxy: http.ProxyURL(proxyURLParsed),
-				}
-			}
-		}
-
-		// Send refresh request.
-		req, err := http.NewRequestWithContext(ctx, "POST", TokenEndpoint, strings.NewReader(data.Encode()))
-		if err != nil {
-			lastErr = fmt.Errorf("failed to create refresh request: %w", err)
-			continue
-		}
-
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		req.Header.Set("Accept", "application/json, text/plain, */*")
-		// Empty key presence suppresses net/http's default "Go-http-client/1.1"
-		// User-Agent on the wire. Trade-off: this relies on Go's documented
-		// request serialization behavior, but keeps OAuth identity separate from
-		// Codex API request identity.
-		req.Header.Set("User-Agent", "")
-
-		resp, err := client.Do(req)
-		if err != nil {
-			lastErr = fmt.Errorf("failed to send refresh request: %w", err)
-			continue
-		}
-
-		bodyBytes, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			lastErr = fmt.Errorf("failed to read refresh response: %w", err)
-			continue
-		}
-
-		// Check response status.
-		if resp.StatusCode != http.StatusOK {
-			logTokenRefreshErrorBody(ctx, hasContext, resp.StatusCode, bodyBytes, c, clientID)
-
-			var errResp TokenRefreshError
-			if isTokenRefreshErrorJSON(bodyBytes, &errResp) {
-				// Abort on non-retryable errors.
-				if isNonRetryableError(errResp.Error) {
-					return fmt.Errorf("token refresh failed (non-retryable): %s - %s", errResp.Error, errResp.ErrorDescription)
-				}
-				lastErr = fmt.Errorf("token refresh failed: %s - %s", errResp.Error, errResp.ErrorDescription)
-			} else {
-				lastErr = fmt.Errorf("token refresh failed with status %d: non-json response", resp.StatusCode)
-			}
-			continue
-		}
-
-		// Parse success response.
-		var tokenResp TokenRefreshResponse
-		if err := json.Unmarshal(bodyBytes, &tokenResp); err != nil {
-			lastErr = fmt.Errorf("failed to parse refresh response: %w", err)
-			continue
-		}
-
-		// Update credentials.
-		c.AccessToken = tokenResp.AccessToken
-		if tokenResp.RefreshToken != "" {
-			c.RefreshToken = tokenResp.RefreshToken
-		}
-		if tokenResp.TokenType != "" {
-			c.TokenType = tokenResp.TokenType
-		}
-
-		// Extract account_id from access_token.
-		if accountID := extractAccountIDFromJWT(tokenResp.AccessToken); accountID != "" {
-			c.AccountID = accountID
-		}
-
-		// Parse scope.
-		if tokenResp.Scope != "" {
-			c.Scopes = strings.Fields(tokenResp.Scope)
-		}
-
-		// Compute expiry time.
-		if tokenResp.ExpiresIn > 0 {
-			c.ExpiresAt = time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
-		}
-
-		if hasContext {
-			logger.LogInfo(ctx, fmt.Sprintf("[Codex] Token refreshed successfully, expires at: %s", c.ExpiresAt.Format(time.RFC3339)))
-		} else {
-			logger.SysLog(fmt.Sprintf("[Codex] Token refreshed successfully, expires at: %s", c.ExpiresAt.Format(time.RFC3339)))
-		}
-		return nil
+	if err := ctx.Err(); err != nil {
+		return sanitizeTokenRefreshError(fmt.Errorf("%w: token refresh canceled: %v", ErrOAuthRefreshNotDispatched, err), c, clientID)
 	}
 
-	return fmt.Errorf("token refresh failed after %d retries: %w", maxRetries, lastErr)
+	client := &http.Client{Timeout: 30 * time.Second}
+	if proxyURL != "" {
+		proxyURLParsed, err := url.Parse(proxyURL)
+		if err != nil {
+			return sanitizeTokenRefreshError(fmt.Errorf("%w: invalid token refresh proxy: %v", ErrOAuthRefreshNotDispatched, err), c, clientID)
+		}
+		client.Transport = &http.Transport{Proxy: http.ProxyURL(proxyURLParsed)}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, TokenEndpoint, strings.NewReader(data.Encode()))
+	if err != nil {
+		return sanitizeTokenRefreshError(fmt.Errorf("%w: failed to create refresh request: %v", ErrOAuthRefreshNotDispatched, err), c, clientID)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	// Empty key presence suppresses net/http's default "Go-http-client/1.1".
+	req.Header.Set("User-Agent", "")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return sanitizeTokenRefreshError(fmt.Errorf("%w: failed to receive response: %v", ErrOAuthRefreshOutcomeAmbiguous, err), c, clientID)
+	}
+	bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, tokenRefreshResponseBodyMaxBytes+1))
+	_ = resp.Body.Close()
+	if readErr != nil {
+		return sanitizeTokenRefreshError(fmt.Errorf("%w while reading response: %v", ErrOAuthRefreshOutcomeAmbiguous, readErr), c, clientID)
+	}
+	if len(bodyBytes) > tokenRefreshResponseBodyMaxBytes {
+		return fmt.Errorf("%w: response with status %d exceeded %d bytes", ErrOAuthRefreshOutcomeAmbiguous, resp.StatusCode, tokenRefreshResponseBodyMaxBytes)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		logTokenRefreshErrorBody(ctx, hasContext, resp.StatusCode, bodyBytes, c, clientID)
+		var errResp TokenRefreshError
+		if isTokenRefreshErrorJSON(bodyBytes, &errResp) {
+			errorType := redactTokenRefreshSecrets(errResp.Error, c, clientID)
+			description := redactTokenRefreshSecrets(errResp.ErrorDescription, c, clientID)
+			if isNonRetryableError(errResp.Error) {
+				return fmt.Errorf("%w: token refresh failed (non-retryable): %s - %s", ErrOAuthRefreshOutcomeAmbiguous, errorType, description)
+			}
+			return fmt.Errorf("%w: token refresh failed: %s - %s", ErrOAuthRefreshOutcomeAmbiguous, errorType, description)
+		}
+		return fmt.Errorf("%w: token refresh failed with status %d: non-json response", ErrOAuthRefreshOutcomeAmbiguous, resp.StatusCode)
+	}
+
+	var tokenResp TokenRefreshResponse
+	if err := json.Unmarshal(bodyBytes, &tokenResp); err != nil {
+		return sanitizeTokenRefreshError(fmt.Errorf("%w: successful response was unusable: %v", ErrOAuthRefreshOutcomeAmbiguous, err), c, clientID)
+	}
+	if strings.TrimSpace(tokenResp.AccessToken) == "" {
+		return fmt.Errorf("%w: successful response omitted access_token", ErrOAuthRefreshOutcomeAmbiguous)
+	}
+	if strings.TrimSpace(tokenResp.RefreshToken) == "" {
+		return fmt.Errorf("%w: successful response omitted rotated refresh_token", ErrOAuthRefreshOutcomeAmbiguous)
+	}
+
+	c.AccessToken = tokenResp.AccessToken
+	c.RefreshToken = tokenResp.RefreshToken
+	if tokenResp.TokenType != "" {
+		c.TokenType = tokenResp.TokenType
+	}
+	if accountID := extractAccountIDFromJWT(tokenResp.AccessToken); accountID != "" {
+		c.AccountID = accountID
+	}
+	if tokenResp.Scope != "" {
+		c.Scopes = strings.Fields(tokenResp.Scope)
+	}
+	if tokenResp.ExpiresIn > 0 {
+		c.ExpiresAt = time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
+	}
+
+	if hasContext {
+		logger.LogInfo(ctx, fmt.Sprintf("[Codex] Token refreshed successfully, expires at: %s", c.ExpiresAt.Format(time.RFC3339)))
+	} else {
+		logger.SysLog(fmt.Sprintf("[Codex] Token refreshed successfully, expires at: %s", c.ExpiresAt.Format(time.RFC3339)))
+	}
+	return nil
 }
 
 func isTokenRefreshErrorJSON(bodyBytes []byte, errResp *TokenRefreshError) bool {
@@ -274,13 +255,42 @@ func tokenRefreshErrorBodyLogSnippet(bodyBytes []byte, creds *OAuth2Credentials,
 	for _, secret := range tokenRefreshKnownSecrets(creds, clientID) {
 		text = strings.ReplaceAll(text, secret, "[redacted]")
 	}
-	for _, pattern := range tokenRefreshSecretFieldPatterns {
-		text = pattern.ReplaceAllString(text, "${1}[redacted]${2}")
-	}
+	text = common.RedactSensitiveAssignments(text)
 	if len(text) > tokenRefreshErrorBodyLogLimit {
 		text = text[:tokenRefreshErrorBodyLogLimit]
 	}
 	return text
+}
+
+func redactTokenRefreshSecrets(text string, creds *OAuth2Credentials, clientID string) string {
+	for _, secret := range tokenRefreshKnownSecrets(creds, clientID) {
+		text = strings.ReplaceAll(text, secret, "[redacted]")
+	}
+	return common.RedactSensitiveAssignments(text)
+}
+
+type sanitizedTokenRefreshError struct {
+	message string
+	cause   error
+}
+
+func (e *sanitizedTokenRefreshError) Error() string { return e.message }
+
+// Is preserves classification (including context cancellation/deadline and
+// caller sentinels) without making the secret-bearing cause reachable through
+// errors.Unwrap or errors.As.
+func (e *sanitizedTokenRefreshError) Is(target error) bool {
+	return e != nil && errors.Is(e.cause, target)
+}
+
+func sanitizeTokenRefreshError(err error, creds *OAuth2Credentials, clientID string) error {
+	if err == nil {
+		return nil
+	}
+	return &sanitizedTokenRefreshError{
+		message: redactTokenRefreshSecrets(err.Error(), creds, clientID),
+		cause:   err,
+	}
 }
 
 func tokenRefreshKnownSecrets(creds *OAuth2Credentials, clientID string) []string {
@@ -304,6 +314,9 @@ func tokenRefreshKnownSecrets(creds *OAuth2Credentials, clientID string) []strin
 		seen[value] = struct{}{}
 		values = append(values, value)
 	}
+	// A shorter credential can be a substring of a longer one. Replacing the
+	// containing value first prevents a secret suffix from surviving redaction.
+	sort.Slice(values, func(i, j int) bool { return len(values[i]) > len(values[j]) })
 	return values
 }
 

@@ -25,9 +25,13 @@ import (
 )
 
 func primeCachedToken(t *testing.T, channelID int, accessToken string, expiresAt time.Time, ttl time.Duration) {
+	primeCachedTokenForKey(t, channelID, "", accessToken, expiresAt, ttl)
+}
+
+func primeCachedTokenForKey(t *testing.T, channelID int, durableKey, accessToken string, expiresAt time.Time, ttl time.Duration) {
 	t.Helper()
 
-	if err := cache.SetCache(tokenCacheKey(channelID), cachedAccessToken{
+	if err := cache.SetCache(tokenCacheKeyV2(channelID, durableKey), cachedAccessToken{
 		AccessToken: accessToken,
 		ExpiresAt:   expiresAt,
 	}, ttl); err != nil {
@@ -38,7 +42,7 @@ func primeCachedToken(t *testing.T, channelID int, accessToken string, expiresAt
 func primeCachedCredentialSnapshot(t *testing.T, channelID int, accessToken, accountID string, expiresAt time.Time, ttl time.Duration) {
 	t.Helper()
 
-	if err := cache.SetCache(tokenCacheKey(channelID), cachedAccessToken{
+	if err := cache.SetCache(tokenCacheKeyV2(channelID, ""), cachedAccessToken{
 		AccessToken: accessToken,
 		AccountID:   accountID,
 		ExpiresAt:   expiresAt,
@@ -56,7 +60,7 @@ func stubLatestChannelByIDForTest(t *testing.T, channelID int, creds *OAuth2Cred
 	}
 
 	originalLoadLatestChannelByID := loadLatestChannelByID
-	loadLatestChannelByID = func(id int) (*model.Channel, error) {
+	loadLatestChannelByID = func(_ context.Context, id int) (*model.Channel, error) {
 		if id != channelID {
 			t.Fatalf("unexpected channel id lookup: got %d want %d", id, channelID)
 		}
@@ -65,6 +69,15 @@ func stubLatestChannelByIDForTest(t *testing.T, channelID int, creds *OAuth2Cred
 	t.Cleanup(func() {
 		loadLatestChannelByID = originalLoadLatestChannelByID
 	})
+}
+
+func stubTokenRefreshFailure(t *testing.T) {
+	t.Helper()
+	originalRefresh := refreshOAuthCredentials
+	refreshOAuthCredentials = func(*OAuth2Credentials, context.Context, string) error {
+		return errors.New("refresh unavailable")
+	}
+	t.Cleanup(func() { refreshOAuthCredentials = originalRefresh })
 }
 
 func newCanceledGinContext(t *testing.T) *gin.Context {
@@ -308,6 +321,7 @@ func TestBuildExecutionSessionMetadataRejectsOverlongSessionID(t *testing.T) {
 func TestGetTokenFallsBackToStillValidAccessTokenWhenRefreshFails(t *testing.T) {
 	cache.InitCacheManager()
 	logger.SetupLogger()
+	stubTokenRefreshFailure(t)
 
 	channelID := 424250
 	latestCreds := &OAuth2Credentials{
@@ -321,7 +335,7 @@ func TestGetTokenFallsBackToStillValidAccessTokenWhenRefreshFails(t *testing.T) 
 	}
 
 	originalLoadLatestChannelByID := loadLatestChannelByID
-	loadLatestChannelByID = func(id int) (*model.Channel, error) {
+	loadLatestChannelByID = func(_ context.Context, id int) (*model.Channel, error) {
 		if id != channelID {
 			t.Fatalf("unexpected channel id lookup: got %d want %d", id, channelID)
 		}
@@ -350,7 +364,7 @@ func TestGetTokenFallsBackToStillValidAccessTokenWhenRefreshFails(t *testing.T) 
 		},
 	}
 
-	token, err := provider.GetToken()
+	token, err := provider.getToken(context.Background())
 	if err != nil {
 		t.Fatalf("expected near-expiry token fallback, got error: %v", err)
 	}
@@ -368,18 +382,24 @@ func TestGetTokenFallsBackToStillValidAccessTokenWhenRefreshFails(t *testing.T) 
 func TestGetTokenFallsBackToStillValidCachedTokenWhenRefreshFails(t *testing.T) {
 	cache.InitCacheManager()
 	logger.SetupLogger()
+	stubTokenRefreshFailure(t)
 
 	channelID := 424249
 	cacheKey := tokenCacheKey(channelID)
 	_ = cache.DeleteCache(cacheKey)
 	defer cache.DeleteCache(cacheKey)
 
-	primeCachedToken(t, channelID, "cached-still-valid-token", time.Now().Add(2*time.Minute), time.Minute)
-	stubLatestChannelByIDForTest(t, channelID, &OAuth2Credentials{
+	latestCredentials := &OAuth2Credentials{
 		AccessToken:  "expired-db-token",
 		RefreshToken: "refresh-token",
 		ExpiresAt:    time.Now().Add(-time.Minute),
-	})
+	}
+	latestKey, err := latestCredentials.ToJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	primeCachedTokenForKey(t, channelID, latestKey, "cached-still-valid-token", time.Now().Add(2*time.Minute), time.Minute)
+	stubLatestChannelByIDForTest(t, channelID, latestCredentials)
 
 	provider := &CodexProvider{
 		OpenAIProvider: openai.OpenAIProvider{
@@ -395,7 +415,7 @@ func TestGetTokenFallsBackToStillValidCachedTokenWhenRefreshFails(t *testing.T) 
 		},
 	}
 
-	token, err := provider.GetToken()
+	token, err := provider.getToken(context.Background())
 	if err != nil {
 		t.Fatalf("expected cached near-expiry token fallback, got error: %v", err)
 	}
@@ -443,7 +463,7 @@ func TestGetTokenCacheHitAdoptsAccessTokenAndAccountID(t *testing.T) {
 	}
 }
 
-func TestGetTokenLegacyStringCacheClearsStaleAccountIDWhenTokenHasNoAccountID(t *testing.T) {
+func TestGetTokenDoesNotReadLegacyV1Cache(t *testing.T) {
 	cache.InitCacheManager()
 
 	channelID := 424253
@@ -454,6 +474,7 @@ func TestGetTokenLegacyStringCacheClearsStaleAccountIDWhenTokenHasNoAccountID(t 
 	if err := cache.SetCache(cacheKey, "legacy-opaque-token", time.Minute); err != nil {
 		t.Fatalf("failed to prime legacy string cache: %v", err)
 	}
+	primeCachedToken(t, channelID, "v2-token", time.Now().Add(30*time.Minute), time.Minute)
 
 	provider := &CodexProvider{
 		OpenAIProvider: openai.OpenAIProvider{
@@ -471,13 +492,10 @@ func TestGetTokenLegacyStringCacheClearsStaleAccountIDWhenTokenHasNoAccountID(t 
 
 	token, err := provider.GetToken()
 	if err != nil {
-		t.Fatalf("expected legacy cache hit to avoid refresh, got error: %v", err)
+		t.Fatalf("expected valid local token, got error: %v", err)
 	}
-	if token != "legacy-opaque-token" {
-		t.Fatalf("expected legacy cached token, got %q", token)
-	}
-	if provider.Credentials.AccountID != "" {
-		t.Fatalf("expected stale account id to be cleared when legacy token has no account id, got %q", provider.Credentials.AccountID)
+	if token != "v2-token" {
+		t.Fatalf("legacy v1 token must not be read when v2 exists, got %q", token)
 	}
 }
 
@@ -505,12 +523,44 @@ func TestGetTokenStillFailsWhenTokenAlreadyExpired(t *testing.T) {
 	if token != "" {
 		t.Fatalf("expected no token on expired credential, got %q", token)
 	}
-	if !strings.Contains(err.Error(), "failed to refresh token") {
-		t.Fatalf("expected refresh failure to surface, got %v", err)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected canceled operation to surface, got %v", err)
 	}
 }
 
-func TestRefreshTokenIfNeededUsesCachedTokenWhenOutsideLead(t *testing.T) {
+func TestGetTokenCanceledContextStopsCacheReadWithoutPublishing(t *testing.T) {
+	cache.InitCacheManager()
+	credentials := &OAuth2Credentials{
+		AccessToken:  "must-not-be-published",
+		RefreshToken: "refresh-token",
+		ExpiresAt:    time.Now().Add(30 * time.Minute),
+	}
+	key, err := credentials.ToJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel := &model.Channel{Id: 424241, Key: key}
+	provider := CodexProviderFactory{}.Create(channel).(*CodexProvider)
+	cacheKey := tokenCacheKeyV2(channel.Id, channel.Key)
+	_ = cache.DeleteCache(cacheKey)
+	t.Cleanup(func() { _ = cache.DeleteCache(cacheKey) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	started := time.Now()
+	token, err := provider.getToken(ctx)
+	if !errors.Is(err, context.Canceled) || token != "" {
+		t.Fatalf("canceled token read = %q, %v; want empty token, context.Canceled", token, err)
+	}
+	if elapsed := time.Since(started); elapsed > 200*time.Millisecond {
+		t.Fatalf("canceled token cache read took %s", elapsed)
+	}
+	if _, cacheErr := cache.GetCache[cachedAccessToken](cacheKey); !errors.Is(cacheErr, cache.CacheNotFound) {
+		t.Fatalf("canceled operation published token: %v", cacheErr)
+	}
+}
+
+func TestRefreshTokenIfNeededCanceledContextDoesNotReadCachedToken(t *testing.T) {
 	cache.InitCacheManager()
 
 	channelID := 424242
@@ -538,18 +588,19 @@ func TestRefreshTokenIfNeededUsesCachedTokenWhenOutsideLead(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
+	started := time.Now()
 	refreshed, err := provider.refreshTokenIfNeeded(ctx, 3*time.Minute)
-	if err != nil {
-		t.Fatalf("expected cached token to avoid refresh, got error: %v", err)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled token cache read returned %v, want context.Canceled", err)
 	}
 	if refreshed {
-		t.Fatalf("expected cached token path to skip refresh")
+		t.Fatal("canceled token cache read must not report a refresh")
 	}
-	if provider.Credentials.AccessToken != "fresh-access-token" {
-		t.Fatalf("expected access token to be updated from cache, got %q", provider.Credentials.AccessToken)
+	if elapsed := time.Since(started); elapsed > 200*time.Millisecond {
+		t.Fatalf("canceled token cache read took %s", elapsed)
 	}
-	if provider.Credentials.AccountID != "acct-fresh" {
-		t.Fatalf("expected account id to be updated from cache, got %q", provider.Credentials.AccountID)
+	if provider.Credentials.AccessToken != "stale-access-token" || provider.Credentials.AccountID != "acct-stale" {
+		t.Fatalf("canceled token cache read published cached credentials: %+v", provider.Credentials)
 	}
 }
 
@@ -594,11 +645,11 @@ func TestRefreshTokenIfNeededIgnoresCachedTokenWithinLead(t *testing.T) {
 	if refreshed {
 		t.Fatalf("expected failed refresh attempt to report refreshed=false")
 	}
-	if !strings.Contains(err.Error(), "token refresh canceled") {
+	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected canceled refresh error, got %v", err)
 	}
-	if provider.Credentials.AccessToken != "db-access-token" {
-		t.Fatalf("expected database credentials to replace stale cache path, got %q", provider.Credentials.AccessToken)
+	if provider.Credentials.AccessToken != "initial-access-token" {
+		t.Fatalf("canceled cache read must not adopt or reload credentials, got %q", provider.Credentials.AccessToken)
 	}
 }
 
@@ -651,7 +702,7 @@ func TestCreateClonesRuntimeChannelAndKeepsSharedStateUntouched(t *testing.T) {
 	}
 
 	originalLoadLatestChannelByID := loadLatestChannelByID
-	loadLatestChannelByID = func(channelID int) (*model.Channel, error) {
+	loadLatestChannelByID = func(_ context.Context, channelID int) (*model.Channel, error) {
 		if channelID != sharedChannel.Id {
 			t.Fatalf("unexpected channel id lookup: got %d want %d", channelID, sharedChannel.Id)
 		}
@@ -666,7 +717,7 @@ func TestCreateClonesRuntimeChannelAndKeepsSharedStateUntouched(t *testing.T) {
 		loadLatestChannelByID = originalLoadLatestChannelByID
 	})
 
-	if err := provider.loadLatestCredentialsFromDatabase(); err != nil {
+	if err := provider.loadLatestCredentialsFromDatabase(context.Background()); err != nil {
 		t.Fatalf("expected runtime channel reload to succeed, got %v", err)
 	}
 
@@ -694,7 +745,200 @@ func TestCreateClonesRuntimeChannelAndKeepsSharedStateUntouched(t *testing.T) {
 	}
 }
 
-func TestSaveCredentialsToDatabaseReloadsRuntimeChannelState(t *testing.T) {
+func TestPostRefreshPersistenceSurvivesOperationCancellation(t *testing.T) {
+	for _, force := range []bool{false, true} {
+		name := "scheduled"
+		if force {
+			name = "forced"
+		}
+		t.Run(name, func(t *testing.T) {
+			cache.InitCacheManager()
+			originalRedisEnabled := config.RedisEnabled
+			config.RedisEnabled = false
+			t.Cleanup(func() { config.RedisEnabled = originalRedisEnabled })
+			channelID := 424270
+			if force {
+				channelID++
+			}
+			initial := &OAuth2Credentials{AccessToken: "old", RefreshToken: "refresh", ExpiresAt: time.Now().Add(-time.Minute)}
+			initialKey, _ := initial.ToJSON()
+			storedKey := initialKey
+			provider := CodexProviderFactory{}.Create(&model.Channel{Id: channelID, Key: initialKey}).(*CodexProvider)
+			opCtx, cancel := context.WithCancel(context.Background())
+
+			originalRefresh := refreshOAuthCredentials
+			refreshOAuthCredentials = func(creds *OAuth2Credentials, _ context.Context, _ string) error {
+				creds.AccessToken = "rotated"
+				creds.RefreshToken = "rotated-refresh"
+				creds.ExpiresAt = time.Now().Add(time.Hour)
+				cancel() // upstream succeeded just as the caller disconnected
+				return nil
+			}
+			originalUpdate := compareAndSetChannelKey
+			compareAndSetChannelKey = func(ctx context.Context, id int, expected, key string) (bool, error) {
+				if id != channelID || ctx.Err() != nil || expected != storedKey {
+					t.Fatalf("persistence must use live detached context: id=%d err=%v expected=%q", id, ctx.Err(), expected)
+				}
+				storedKey = key
+				return true, nil
+			}
+			originalLoad := loadLatestChannelByID
+			loadLatestChannelByID = func(ctx context.Context, id int) (*model.Channel, error) {
+				if id != channelID {
+					t.Fatalf("unexpected channel id %d", id)
+				}
+				// The pre-refresh load respects opCtx; post-refresh reload receives the
+				// detached persistence context.
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				return &model.Channel{Id: id, Key: storedKey}, nil
+			}
+			t.Cleanup(func() {
+				refreshOAuthCredentials = originalRefresh
+				compareAndSetChannelKey = originalUpdate
+				loadLatestChannelByID = originalLoad
+			})
+
+			var refreshed bool
+			var err error
+			if force {
+				refreshed, err = provider.forceRefreshToken(opCtx)
+			} else {
+				refreshed, err = provider.refreshTokenIfNeeded(opCtx, 3*time.Minute)
+			}
+			if err != nil || !refreshed {
+				t.Fatalf("expected rotated credentials to commit after cancellation, refreshed=%v err=%v", refreshed, err)
+			}
+			if !strings.Contains(storedKey, "rotated-refresh") {
+				t.Fatalf("expected rotated refresh token to be stored, got %s", storedKey)
+			}
+		})
+	}
+}
+
+func TestRefreshPersistenceFailureIsReturnedAndNotCached(t *testing.T) {
+	for _, force := range []bool{false, true} {
+		name := "scheduled"
+		if force {
+			name = "forced"
+		}
+		t.Run(name, func(t *testing.T) {
+			cache.InitCacheManager()
+			originalRedisEnabled := config.RedisEnabled
+			config.RedisEnabled = false
+			t.Cleanup(func() { config.RedisEnabled = originalRedisEnabled })
+			channelID := 424280
+			if force {
+				channelID++
+			}
+			credentials := &OAuth2Credentials{AccessToken: "old", RefreshToken: "refresh", ExpiresAt: time.Now().Add(-time.Minute)}
+			key, _ := credentials.ToJSON()
+			provider := CodexProviderFactory{}.Create(&model.Channel{Id: channelID, Key: key}).(*CodexProvider)
+
+			originalRefresh := refreshOAuthCredentials
+			refreshOAuthCredentials = func(creds *OAuth2Credentials, _ context.Context, _ string) error {
+				creds.AccessToken = "unsaved-rotated"
+				creds.RefreshToken = "unsaved-refresh"
+				creds.ExpiresAt = time.Now().Add(time.Hour)
+				return nil
+			}
+			originalUpdate := compareAndSetChannelKey
+			compareAndSetChannelKey = func(context.Context, int, string, string) (bool, error) {
+				return false, errors.New("database unavailable")
+			}
+			originalLoad := loadLatestChannelByID
+			loadLatestChannelByID = func(context.Context, int) (*model.Channel, error) {
+				return &model.Channel{Id: channelID, Key: key}, nil
+			}
+			t.Cleanup(func() {
+				refreshOAuthCredentials = originalRefresh
+				compareAndSetChannelKey = originalUpdate
+				loadLatestChannelByID = originalLoad
+			})
+
+			var refreshed bool
+			var err error
+			if force {
+				refreshed, err = provider.forceRefreshToken(context.Background())
+			} else {
+				refreshed, err = provider.refreshTokenIfNeeded(context.Background(), 3*time.Minute)
+			}
+			if refreshed || !errors.Is(err, errCodexCredentialPersistence) {
+				t.Fatalf("expected persistence failure, refreshed=%v err=%v", refreshed, err)
+			}
+			if provider.Credentials == nil || provider.Credentials.AccessToken != "old" || provider.Credentials.RefreshToken != "refresh" {
+				t.Fatalf("failed persistence mutated active credentials: %+v", provider.Credentials)
+			}
+			provider.cacheCurrentToken(context.Background())
+			if token := provider.getCurrentValidToken(context.Background()); token != "" {
+				t.Fatalf("dirty token must not be published as fallback, got %q", token)
+			}
+			if _, cacheErr := cache.GetCache[cachedAccessToken](tokenCacheKeyV2(channelID, provider.codexChannel().Key)); !errors.Is(cacheErr, cache.CacheNotFound) {
+				t.Fatalf("unsaved token must not be cached, got %v", cacheErr)
+			}
+		})
+	}
+}
+
+func TestDirtyCredentialsRetryPersistenceBeforeLaterTokenUse(t *testing.T) {
+	cache.InitCacheManager()
+	originalRedisEnabled := config.RedisEnabled
+	config.RedisEnabled = false
+	t.Cleanup(func() { config.RedisEnabled = originalRedisEnabled })
+
+	channelID := 424282
+	credentials := &OAuth2Credentials{AccessToken: "old", RefreshToken: "refresh", ExpiresAt: time.Now().Add(-time.Minute)}
+	storedKey, _ := credentials.ToJSON()
+	provider := CodexProviderFactory{}.Create(&model.Channel{Id: channelID, Key: storedKey}).(*CodexProvider)
+	refreshCalls := 0
+	persistCalls := 0
+	originalRefresh := refreshOAuthCredentials
+	refreshOAuthCredentials = func(creds *OAuth2Credentials, _ context.Context, _ string) error {
+		refreshCalls++
+		creds.AccessToken = "rotated"
+		creds.RefreshToken = "rotated-refresh"
+		creds.ExpiresAt = time.Now().Add(time.Hour)
+		return nil
+	}
+	originalUpdate := compareAndSetChannelKey
+	compareAndSetChannelKey = func(_ context.Context, _ int, expected, key string) (bool, error) {
+		persistCalls++
+		if persistCalls == 1 {
+			return false, errors.New("database unavailable")
+		}
+		if expected != storedKey {
+			return false, nil
+		}
+		storedKey = key
+		return true, nil
+	}
+	originalLoad := loadLatestChannelByID
+	loadLatestChannelByID = func(context.Context, int) (*model.Channel, error) {
+		return &model.Channel{Id: channelID, Key: storedKey}, nil
+	}
+	t.Cleanup(func() {
+		refreshOAuthCredentials = originalRefresh
+		compareAndSetChannelKey = originalUpdate
+		loadLatestChannelByID = originalLoad
+	})
+
+	if _, err := provider.refreshTokenIfNeeded(context.Background(), 3*time.Minute); !errors.Is(err, errCodexCredentialPersistence) {
+		t.Fatalf("expected first persistence failure, got %v", err)
+	}
+	// Recovery must not depend on provider-local dirty state: factories commonly
+	// create a new provider for the next request.
+	newProvider := CodexProviderFactory{}.Create(&model.Channel{Id: channelID, Key: storedKey}).(*CodexProvider)
+	token, err := newProvider.GetToken()
+	if err != nil || token != "rotated" {
+		t.Fatalf("new provider must commit pending credentials before use: token=%q err=%v", token, err)
+	}
+	if persistCalls != 2 || refreshCalls != 1 {
+		t.Fatalf("expected persistence retry without another OAuth rotation, persist=%d refresh=%d", persistCalls, refreshCalls)
+	}
+}
+
+func TestSaveCredentialsToDatabasePublishesOnlyDurableCredentialState(t *testing.T) {
 	logger.SetupLogger()
 
 	proxyTemplate := "http://proxy.example/%s"
@@ -722,33 +966,20 @@ func TestSaveCredentialsToDatabaseReloadsRuntimeChannelState(t *testing.T) {
 	}
 
 	var savedKey string
-	originalUpdateChannelKey := updateChannelKey
-	updateChannelKey = func(channelID int, key string) error {
-		if channelID != sharedChannel.Id {
-			t.Fatalf("unexpected channel key update: got %d want %d", channelID, sharedChannel.Id)
+	originalUpdateChannelKey := compareAndSetChannelKey
+	compareAndSetChannelKey = func(_ context.Context, channelID int, expected, key string) (bool, error) {
+		if channelID != sharedChannel.Id || expected != "old-key" {
+			t.Fatalf("unexpected channel key CAS: id=%d expected=%q", channelID, expected)
 		}
 		savedKey = key
-		return nil
+		return true, nil
 	}
 	t.Cleanup(func() {
-		updateChannelKey = originalUpdateChannelKey
+		compareAndSetChannelKey = originalUpdateChannelKey
 	})
 
-	originalLoadLatestChannelByID := loadLatestChannelByID
-	loadLatestChannelByID = func(channelID int) (*model.Channel, error) {
-		if channelID != sharedChannel.Id {
-			t.Fatalf("unexpected channel id lookup: got %d want %d", channelID, sharedChannel.Id)
-		}
-		proxy := "http://proxy.example/%s"
-		return &model.Channel{
-			Id:    channelID,
-			Key:   latestKey,
-			Proxy: &proxy,
-		}, nil
-	}
-	t.Cleanup(func() {
-		loadLatestChannelByID = originalLoadLatestChannelByID
-	})
+	provider.credentialExpectedKey = sharedChannel.Key
+	provider.credentialRotatedKey = latestKey
 
 	if err := provider.saveCredentialsToDatabase(context.Background()); err != nil {
 		t.Fatalf("expected credentials save to succeed, got %v", err)
@@ -766,14 +997,57 @@ func TestSaveCredentialsToDatabaseReloadsRuntimeChannelState(t *testing.T) {
 		t.Fatalf("expected provider channel key to match saved credentials, got %q", provider.Channel.Key)
 	}
 
-	expectedProxy := "http://proxy.example/%s"
-	expectedChannel := &model.Channel{Key: latestKey, Proxy: &expectedProxy}
-	expectedChannel.SetProxy()
-	if provider.Channel.Proxy == nil || *provider.Channel.Proxy != *expectedChannel.Proxy {
-		t.Fatalf("expected provider channel proxy to be reloaded from database, got %v", provider.Channel.Proxy)
+	if provider.Channel.Proxy == nil || *provider.Channel.Proxy != sharedProxy {
+		t.Fatalf("credential persistence changed unrelated runtime proxy: %v", provider.Channel.Proxy)
 	}
-	if proxyAddr := requesterProxyAddr(t, provider); proxyAddr != *expectedChannel.Proxy {
-		t.Fatalf("expected requester proxy %q, got %q", *expectedChannel.Proxy, proxyAddr)
+	if proxyAddr := requesterProxyAddr(t, provider); proxyAddr != sharedProxy {
+		t.Fatalf("expected requester proxy %q, got %q", sharedProxy, proxyAddr)
+	}
+}
+
+func TestCredentialLoadAndSavePropagateOperationContext(t *testing.T) {
+	credentials := &OAuth2Credentials{
+		AccessToken:  "access-token",
+		RefreshToken: "refresh-token",
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}
+	key, err := credentials.ToJSON()
+	if err != nil {
+		t.Fatalf("failed to serialize credentials: %v", err)
+	}
+	channel := &model.Channel{Id: 424260, Key: key}
+	provider, ok := CodexProviderFactory{}.Create(channel).(*CodexProvider)
+	if !ok || provider == nil {
+		t.Fatal("expected Codex provider")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	originalLoad := loadLatestChannelByID
+	loadLatestChannelByID = func(gotCtx context.Context, id int) (*model.Channel, error) {
+		if gotCtx != ctx || id != channel.Id {
+			t.Fatalf("unexpected load arguments: ctx=%v id=%d", gotCtx, id)
+		}
+		return nil, gotCtx.Err()
+	}
+	t.Cleanup(func() { loadLatestChannelByID = originalLoad })
+	if err := provider.loadLatestCredentialsFromDatabase(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected canceled load context to reach database adapter, got %v", err)
+	}
+
+	originalUpdate := compareAndSetChannelKey
+	compareAndSetChannelKey = func(gotCtx context.Context, id int, _, _ string) (bool, error) {
+		if gotCtx != ctx || id != channel.Id {
+			t.Fatalf("unexpected save arguments: ctx=%v id=%d", gotCtx, id)
+		}
+		return false, gotCtx.Err()
+	}
+	t.Cleanup(func() { compareAndSetChannelKey = originalUpdate })
+	provider.credentialExpectedKey = key
+	provider.credentialRotatedKey = key
+	if err := provider.saveCredentialsToDatabase(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected canceled save context to reach database adapter, got %v", err)
 	}
 }
 
@@ -821,7 +1095,7 @@ func TestLoadLatestCredentialsFromDatabaseReloadsChannelOptions(t *testing.T) {
 	}
 
 	originalLoadLatestChannelByID := loadLatestChannelByID
-	loadLatestChannelByID = func(channelID int) (*model.Channel, error) {
+	loadLatestChannelByID = func(_ context.Context, channelID int) (*model.Channel, error) {
 		if channelID != sharedChannel.Id {
 			t.Fatalf("unexpected channel id lookup: got %d want %d", channelID, sharedChannel.Id)
 		}
@@ -835,7 +1109,7 @@ func TestLoadLatestCredentialsFromDatabaseReloadsChannelOptions(t *testing.T) {
 		loadLatestChannelByID = originalLoadLatestChannelByID
 	})
 
-	if err := provider.loadLatestCredentialsFromDatabase(); err != nil {
+	if err := provider.loadLatestCredentialsFromDatabase(context.Background()); err != nil {
 		t.Fatalf("expected runtime channel reload to succeed, got %v", err)
 	}
 
@@ -895,7 +1169,7 @@ func TestLoadLatestCredentialsFromDatabaseReloadsChannelOptionsAfterInvalidOther
 	}
 
 	originalLoadLatestChannelByID := loadLatestChannelByID
-	loadLatestChannelByID = func(channelID int) (*model.Channel, error) {
+	loadLatestChannelByID = func(_ context.Context, channelID int) (*model.Channel, error) {
 		if channelID != sharedChannel.Id {
 			t.Fatalf("unexpected channel id lookup: got %d want %d", channelID, sharedChannel.Id)
 		}
@@ -909,7 +1183,7 @@ func TestLoadLatestCredentialsFromDatabaseReloadsChannelOptionsAfterInvalidOther
 		loadLatestChannelByID = originalLoadLatestChannelByID
 	})
 
-	if err := provider.loadLatestCredentialsFromDatabase(); err != nil {
+	if err := provider.loadLatestCredentialsFromDatabase(context.Background()); err != nil {
 		t.Fatalf("expected runtime channel reload to succeed, got %v", err)
 	}
 
@@ -948,7 +1222,7 @@ func TestRefreshNoLongerNeededUsesCachedToken(t *testing.T) {
 		},
 	}
 
-	if !provider.refreshNoLongerNeeded(3*time.Minute, false) {
+	if !provider.refreshNoLongerNeeded(context.Background(), 3*time.Minute, false) {
 		t.Fatalf("expected cached token to satisfy refresh wait path")
 	}
 	if provider.Credentials.AccessToken != "shared-access-token" {
@@ -1127,7 +1401,7 @@ func TestAcquireDistributedRefreshLockTimesOutAndThrottlesDatabaseReloads(t *tes
 	loadCount := 0
 	expiredAt := time.Now().Add(-time.Minute).Format(time.RFC3339)
 	originalLoadLatestChannelByID := loadLatestChannelByID
-	loadLatestChannelByID = func(channelID int) (*model.Channel, error) {
+	loadLatestChannelByID = func(_ context.Context, channelID int) (*model.Channel, error) {
 		loadCount++
 		return &model.Channel{
 			Id: channelID,
@@ -1220,7 +1494,7 @@ func TestForceRefreshTokenTreatsChangedDatabaseTokenAsPeerHandled(t *testing.T) 
 
 	loadCount := 0
 	originalLoadLatestChannelByID := loadLatestChannelByID
-	loadLatestChannelByID = func(channelID int) (*model.Channel, error) {
+	loadLatestChannelByID = func(_ context.Context, channelID int) (*model.Channel, error) {
 		loadCount++
 		if channelID != 424254 {
 			t.Fatalf("unexpected channel id lookup: got %d want %d", channelID, 424254)
@@ -1240,7 +1514,7 @@ func TestForceRefreshTokenTreatsChangedDatabaseTokenAsPeerHandled(t *testing.T) 
 
 	refreshCalls := 0
 	originalRefreshCredentials := refreshOAuthCredentials
-	refreshOAuthCredentials = func(creds *OAuth2Credentials, ctx context.Context, proxyURL string, maxRetries int) error {
+	refreshOAuthCredentials = func(creds *OAuth2Credentials, ctx context.Context, proxyURL string) error {
 		refreshCalls++
 		return nil
 	}
@@ -1274,7 +1548,7 @@ func TestForceRefreshTokenTreatsChangedDatabaseTokenAsPeerHandled(t *testing.T) 
 	if provider.Credentials.AccessToken != "peer-refreshed-access-token" {
 		t.Fatalf("expected provider credentials to adopt the peer-refreshed token, got %q", provider.Credentials.AccessToken)
 	}
-	if cachedCredentials := provider.getCachedCredentialSnapshot(0); cachedCredentials.AccessToken != "peer-refreshed-access-token" {
+	if cachedCredentials := provider.getCachedCredentialSnapshot(context.Background(), 0); cachedCredentials.AccessToken != "peer-refreshed-access-token" {
 		t.Fatalf("expected handled-by-peer path to recache the refreshed token, got %q", cachedCredentials.AccessToken)
 	}
 	if loadCount < 2 {
@@ -1302,7 +1576,7 @@ func TestForceRefreshTokenTreatsReloadedCredentialsAsPeerHandledWithoutRedis(t *
 
 	loadCount := 0
 	originalLoadLatestChannelByID := loadLatestChannelByID
-	loadLatestChannelByID = func(id int) (*model.Channel, error) {
+	loadLatestChannelByID = func(_ context.Context, id int) (*model.Channel, error) {
 		loadCount++
 		if id != channelID {
 			t.Fatalf("unexpected channel id lookup: got %d want %d", id, channelID)
@@ -1315,7 +1589,7 @@ func TestForceRefreshTokenTreatsReloadedCredentialsAsPeerHandledWithoutRedis(t *
 
 	refreshCalls := 0
 	originalRefreshCredentials := refreshOAuthCredentials
-	refreshOAuthCredentials = func(creds *OAuth2Credentials, ctx context.Context, proxyURL string, maxRetries int) error {
+	refreshOAuthCredentials = func(creds *OAuth2Credentials, ctx context.Context, proxyURL string) error {
 		refreshCalls++
 		return nil
 	}
@@ -1349,7 +1623,7 @@ func TestForceRefreshTokenTreatsReloadedCredentialsAsPeerHandledWithoutRedis(t *
 	if provider.Credentials.AccessToken != "peer-refreshed-access-token" {
 		t.Fatalf("expected provider credentials to reload the peer-refreshed token, got %q", provider.Credentials.AccessToken)
 	}
-	if cachedCredentials := provider.getCachedCredentialSnapshot(0); cachedCredentials.AccessToken != "peer-refreshed-access-token" {
+	if cachedCredentials := provider.getCachedCredentialSnapshot(context.Background(), 0); cachedCredentials.AccessToken != "peer-refreshed-access-token" {
 		t.Fatalf("expected reloaded credentials to be recached, got %q", cachedCredentials.AccessToken)
 	}
 	if loadCount != 1 {
@@ -1377,7 +1651,7 @@ func TestForceRefreshTokenTreatsChangedRefreshStateAsPeerHandled(t *testing.T) {
 	}
 
 	originalLoadLatestChannelByID := loadLatestChannelByID
-	loadLatestChannelByID = func(id int) (*model.Channel, error) {
+	loadLatestChannelByID = func(_ context.Context, id int) (*model.Channel, error) {
 		if id != channelID {
 			t.Fatalf("unexpected channel id lookup: got %d want %d", id, channelID)
 		}
@@ -1389,7 +1663,7 @@ func TestForceRefreshTokenTreatsChangedRefreshStateAsPeerHandled(t *testing.T) {
 
 	refreshCalls := 0
 	originalRefreshCredentials := refreshOAuthCredentials
-	refreshOAuthCredentials = func(creds *OAuth2Credentials, ctx context.Context, proxyURL string, maxRetries int) error {
+	refreshOAuthCredentials = func(creds *OAuth2Credentials, ctx context.Context, proxyURL string) error {
 		refreshCalls++
 		return nil
 	}
@@ -1426,7 +1700,7 @@ func TestForceRefreshTokenTreatsChangedRefreshStateAsPeerHandled(t *testing.T) {
 	if !provider.Credentials.ExpiresAt.Equal(latestCreds.ExpiresAt) {
 		t.Fatalf("expected provider expiry to reload from storage, got %s want %s", provider.Credentials.ExpiresAt, latestCreds.ExpiresAt)
 	}
-	if cachedCredentials := provider.getCachedCredentialSnapshot(0); cachedCredentials.AccessToken != accessToken {
+	if cachedCredentials := provider.getCachedCredentialSnapshot(context.Background(), 0); cachedCredentials.AccessToken != accessToken {
 		t.Fatalf("expected unchanged access token to be recached after peer handling, got %q", cachedCredentials.AccessToken)
 	}
 }
@@ -1438,7 +1712,10 @@ func TestAcquireChannelRefreshLockCleansUpUnusedEntry(t *testing.T) {
 	delete(channelRefreshLocks.locks, channelID)
 	channelRefreshLocks.mu.Unlock()
 
-	release := acquireChannelRefreshLock(channelID)
+	release, err := acquireChannelRefreshLock(context.Background(), channelID)
+	if err != nil {
+		t.Fatalf("expected channel refresh lock acquisition to succeed, got %v", err)
+	}
 
 	channelRefreshLocks.mu.Lock()
 	if _, ok := channelRefreshLocks.locks[channelID]; !ok {
@@ -1454,6 +1731,37 @@ func TestAcquireChannelRefreshLockCleansUpUnusedEntry(t *testing.T) {
 	channelRefreshLocks.mu.Unlock()
 	if ok {
 		t.Fatalf("expected lock entry to be cleaned up after release")
+	}
+}
+
+func TestAcquireChannelRefreshLockHonorsCancellationWhileWaiting(t *testing.T) {
+	channelID := 424246
+
+	channelRefreshLocks.mu.Lock()
+	delete(channelRefreshLocks.locks, channelID)
+	channelRefreshLocks.mu.Unlock()
+
+	release, err := acquireChannelRefreshLock(context.Background(), channelID)
+	if err != nil {
+		t.Fatalf("expected first lock acquisition to succeed, got %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if waitingRelease, waitErr := acquireChannelRefreshLock(ctx, channelID); !errors.Is(waitErr, context.DeadlineExceeded) {
+		if waitingRelease != nil {
+			waitingRelease()
+		}
+		release()
+		t.Fatalf("expected waiting acquisition to honor its deadline, got %v", waitErr)
+	}
+
+	release()
+	channelRefreshLocks.mu.Lock()
+	_, ok := channelRefreshLocks.locks[channelID]
+	channelRefreshLocks.mu.Unlock()
+	if ok {
+		t.Fatal("expected canceled waiter and released holder to clean up lock entry")
 	}
 }
 

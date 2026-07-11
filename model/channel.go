@@ -5,10 +5,12 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"slices"
 	"strings"
+	"time"
 
 	"one-api/common/cache"
 	"one-api/common/config"
@@ -53,6 +55,14 @@ type Channel struct {
 	Plugin    *datatypes.JSONType[PluginType] `json:"plugin" form:"plugin" gorm:"type:json" tag_config:"sync"`
 	DeletedAt gorm.DeletedAt                  `json:"-" gorm:"index"`
 
+	// CredentialRevision is the lifecycle identity of Key/Type/DeletedAt.  The
+	// refresh fence deliberately lives beside the credential authority so claim,
+	// commit and lifecycle supersession are single-row atomic operations.
+	CredentialRevision         uint64  `json:"-" gorm:"column:credential_revision;not null;default:0"`
+	CredentialRefreshFence     *string `json:"-" gorm:"column:credential_refresh_fence;type:varchar(36)"`
+	CredentialRefreshStartedAt *int64  `json:"-" gorm:"column:credential_refresh_started_at"`
+	CredentialRefreshState     string  `json:"credential_refresh_state,omitempty" gorm:"-"`
+
 	parsedModelMapping    map[string]string          `json:"-" gorm:"-"`
 	parsedModelHeaders    map[string]string          `json:"-" gorm:"-"`
 	parsedCustomParameter map[string]interface{}     `json:"-" gorm:"-"`
@@ -66,6 +76,18 @@ type Channel struct {
 	lastModelHeaders      string                     `json:"-" gorm:"-"`
 	lastCustomParameter   string                     `json:"-" gorm:"-"`
 	lastOther             string                     `json:"-" gorm:"-"`
+}
+
+func (c *Channel) AfterFind(_ *gorm.DB) error {
+	if c.CredentialRefreshFence == nil {
+		c.CredentialRefreshState = "ready"
+		return nil
+	}
+	c.CredentialRefreshState = "unresolved"
+	if c.CredentialRefreshStartedAt != nil && time.Since(time.Unix(*c.CredentialRefreshStartedAt, 0)) <= 5*time.Second {
+		c.CredentialRefreshState = "in_progress"
+	}
+	return nil
 }
 
 func (c *Channel) AllowStream(modelName string) bool {
@@ -98,12 +120,11 @@ var allowedChannelOrderFields = map[string]bool{
 
 var azureAPIVersionSearchCandidateWarnThreshold = 1000
 
-var loadChannelByIDForChannelGroupRefresh = GetChannelById
-
 const (
-	codexTokenCacheKeyPrefix        = "api_token:codex"
-	codexUsagePreviewCacheKeyPrefix = "codex:usage:preview"
-	codexUsageDetailCacheKeyPrefix  = "codex:usage:detail"
+	codexTokenCacheKeyPrefix           = "api_token:codex"
+	codexUsagePreviewCacheKeyPrefix    = "codex:usage:preview"
+	codexUsageDetailCacheKeyPrefix     = "codex:usage:detail"
+	codexUsageGenerationCacheKeyPrefix = cache.CodexUsageGenerationKeyPrefix
 )
 
 type SearchChannelsParams struct {
@@ -295,8 +316,15 @@ func GetAllChannels() ([]*Channel, error) {
 }
 
 func GetChannelsByTypeAndStatus(channelType int, status int) ([]*Channel, error) {
+	return GetChannelsByTypeAndStatusWithContext(context.Background(), channelType, status)
+}
+
+func GetChannelsByTypeAndStatusWithContext(ctx context.Context, channelType int, status int) ([]*Channel, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var channels []*Channel
-	err := DB.Where("type = ? AND status = ?", channelType, status).Order("id desc").Find(&channels).Error
+	err := DB.WithContext(ctx).Where("type = ? AND status = ?", channelType, status).Order("id desc").Find(&channels).Error
 	return channels, err
 }
 
@@ -316,8 +344,12 @@ func GetChannelsByIDs(ids []int) ([]*Channel, error) {
 }
 
 func GetChannelById(id int) (*Channel, error) {
+	return GetChannelByIdWithContext(context.Background(), id)
+}
+
+func GetChannelByIdWithContext(ctx context.Context, id int) (*Channel, error) {
 	channel := Channel{Id: id}
-	err := DB.First(&channel, "id = ?", id).Error
+	err := DB.WithContext(ctx).First(&channel, "id = ?", id).Error
 
 	return &channel, err
 }
@@ -329,8 +361,14 @@ func GetChannelsByTag(tag string) ([]*Channel, error) {
 }
 
 func DeleteChannelTag(channelId int) error {
-	err := DB.Model(&Channel{}).Where("id = ?", channelId).Update("tag", "").Error
-	return err
+	result := DB.Model(&Channel{}).Where("id = ?", channelId).Update("tag", "")
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected > 0 {
+		refreshChannelGroupAfterMutation("delete channel tag", []int{channelId})
+	}
+	return nil
 }
 
 func codexChannelIDsFromRows(channels []Channel) []int {
@@ -354,24 +392,34 @@ func channelIDsFromRows(channels []Channel) []int {
 }
 
 func refreshChannelGroupAfterMutation(reason string, failClosedChannelIDs []int) {
-	// Cache-aside trade-off: a post-commit rebuild keeps routing accurate without
-	// coupling API success to an in-memory refresh. Destructive/status mutations
-	// fail closed in the old snapshot first. Non-lifecycle route edits remain
-	// eventually consistent if the reload fails; keeping that trade-off explicit
-	// avoids model/group-scoped tombstones for a low-frequency admin path.
-	//
-	// What this guarantees: if this process disables/deletes a channel, it stops
-	// routing to that channel immediately, even when the following DB reload fails.
-	// That preserves sibling-channel fallback in the same tag/group/model.
-	//
-	// What it does not guarantee: cross-node instant consistency, or instant removal
-	// of model/group/tag route edits when the DB read fails. Those stronger
-	// guarantees require distributed coordination or route tombstones with expiry and
-	// versioning, which are more complex than the original failure justifies.
+	// Route mutations fail closed in this process before any subsequent operation
+	// can block. This trades brief unavailability for the stronger invariant that a
+	// committed config change is never served from the old chooser snapshot.
 	ChannelGroup.failClosedChannels(failClosedChannelIDs)
+	loadChannelGroupAfterMutation(reason)
+}
+
+func loadChannelGroupAfterMutation(reason string) {
 	if err := ChannelGroup.Load(); err != nil {
 		logger.SysError(fmt.Sprintf("failed to refresh channel group after %s; routing snapshot marked dirty: %s", reason, err.Error()))
 	}
+}
+
+var invalidateChannelCodexDerivedCaches = ClearChannelCodexDerivedCaches
+
+// finishChannelRouteMutation has exactly one routing publication path:
+// quarantine, then replace the complete chooser snapshot from durable state.
+// Cache cleanup runs afterward as garbage collection. Content-addressed v2 keys
+// provide isolation, so slow or failed cache I/O has no routing authority.
+//
+// The deliberate cost is one full DB snapshot build per admin mutation and an
+// admin response that may still wait for best-effort cleanup after routing is
+// already correct. Keeping cache I/O out of the publication condition is more
+// important than minimizing mutation latency; never move cleanup before Load or
+// restore a per-channel refresh as an optimization.
+func finishChannelRouteMutation(reason string, affectedChannelIDs, codexChannelIDs []int) {
+	refreshChannelGroupAfterMutation(reason, affectedChannelIDs)
+	invalidateChannelCodexDerivedCaches(codexChannelIDs)
 }
 
 func deleteChannelsMatching(scope func(*gorm.DB) *gorm.DB) (int64, error) {
@@ -386,6 +434,13 @@ func deleteChannelsMatching(scope func(*gorm.DB) *gorm.DB) (int64, error) {
 		return 0, err
 	}
 
+	// A soft delete is a new lifecycle incarnation.  Advance the generation in
+	// the same transaction, but retain a non-empty fence: deleting a row cannot
+	// make its possibly-consumed refresh token safe again.
+	if err := scope(tx.Model(&Channel{})).UpdateColumn("credential_revision", gorm.Expr("credential_revision + 1")).Error; err != nil {
+		tx.Rollback()
+		return 0, err
+	}
 	result := scope(tx).Delete(&Channel{})
 	if result.Error != nil {
 		tx.Rollback()
@@ -396,11 +451,7 @@ func deleteChannelsMatching(scope func(*gorm.DB) *gorm.DB) (int64, error) {
 		return 0, err
 	}
 
-	// Delete-path invalidation is not a trade-off; it is a lifecycle invariant.
-	// These derived caches are keyed by channel id, so leaving them behind risks a
-	// later channel with the same id inheriting another account's cached Codex data.
-	ClearChannelCodexDerivedCaches(codexChannelIDsFromRows(channels))
-	refreshChannelGroupAfterMutation("delete channels", channelIDsFromRows(channels))
+	finishChannelRouteMutation("delete channels", channelIDsFromRows(channels), codexChannelIDsFromRows(channels))
 
 	return result.RowsAffected, nil
 }
@@ -465,6 +516,7 @@ func BatchUpdateChannelsAzureApi(params *BatchChannelsParams) (int64, error) {
 	}
 
 	var rowsAffected int64
+	var affectedIDs []int
 	if err := DB.Transaction(func(tx *gorm.DB) error {
 		for i := range channels {
 			_, other, err := parseAzureChannelOtherObject(channels[i].Other)
@@ -485,6 +537,9 @@ func BatchUpdateChannelsAzureApi(params *BatchChannelsParams) (int64, error) {
 				return result.Error
 			}
 			rowsAffected += result.RowsAffected
+			if result.RowsAffected > 0 {
+				affectedIDs = append(affectedIDs, channels[i].Id)
+			}
 		}
 		return nil
 	}); err != nil {
@@ -492,12 +547,21 @@ func BatchUpdateChannelsAzureApi(params *BatchChannelsParams) (int64, error) {
 	}
 
 	if rowsAffected > 0 {
-		refreshChannelGroupAfterMutation("batch update channel runtime config", nil)
+		refreshChannelGroupAfterMutation("batch update channel runtime config", affectedIDs)
 	}
 	return rowsAffected, nil
 }
 
+var errBatchDelModelChannelsConflict = errors.New("batch delete channel model concurrent update conflict")
+
 func BatchDelModelChannels(params *BatchDelModelChannelsParams) (int64, error) {
+	return BatchDelModelChannelsWithContext(context.Background(), params)
+}
+
+func BatchDelModelChannelsWithContext(ctx context.Context, params *BatchDelModelChannelsParams) (int64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if params == nil {
 		return 0, fmt.Errorf("params is required")
 	}
@@ -506,37 +570,57 @@ func BatchDelModelChannels(params *BatchDelModelChannelsParams) (int64, error) {
 		return 0, fmt.Errorf("value is required")
 	}
 	var count int64
+	var affectedIDs []int
+	var affectedCodexIDs []int
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var channels []*Channel
+		if err := tx.Select("id, type, models, "+quotePostgresField("group")).Find(&channels, "id IN ?", params.Ids).Error; err != nil {
+			return err
+		}
 
-	var channels []*Channel
-	err := DB.Select("id, models, "+quotePostgresField("group")).Find(&channels, "id IN ?", params.Ids).Error
+		for _, channel := range channels {
+			modelsSlice := strings.Split(channel.Models, ",")
+			remainingModels := modelsSlice[:0]
+			removed := false
+			for _, model := range modelsSlice {
+				if strings.TrimSpace(model) == targetModel {
+					removed = true
+					continue
+				}
+				remainingModels = append(remainingModels, model)
+			}
+			if !removed {
+				continue
+			}
+
+			oldModels := channel.Models
+			channel.Models = strings.Join(remainingModels, ",")
+			result := tx.Model(&Channel{}).
+				Where("id = ? AND models = ?", channel.Id, oldModels).
+				Update("models", channel.Models)
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected == 0 {
+				return fmt.Errorf("%w: channel %d models changed", errBatchDelModelChannelsConflict, channel.Id)
+			}
+			count++
+			affectedIDs = append(affectedIDs, channel.Id)
+			if channel.Type == config.ChannelTypeCodex {
+				affectedCodexIDs = append(affectedCodexIDs, channel.Id)
+			}
+		}
+		// A cancellation observed before commit must turn the callback into an
+		// error so gorm rolls the transaction back and post-commit effects remain
+		// strictly coupled to durable changes.
+		return ctx.Err()
+	})
 	if err != nil {
 		return 0, err
 	}
 
-	for _, channel := range channels {
-		modelsSlice := strings.Split(channel.Models, ",")
-		removed := false
-		for i, m := range modelsSlice {
-			if strings.TrimSpace(m) == targetModel {
-				modelsSlice = append(modelsSlice[:i], modelsSlice[i+1:]...)
-				removed = true
-				break
-			}
-		}
-		if !removed {
-			continue
-		}
-
-		channel.Models = strings.Join(modelsSlice, ",")
-		if err := DB.Model(&Channel{}).Where("id = ?", channel.Id).Update("models", channel.Models).Error; err != nil {
-			return count, err
-		}
-		ClearChannelCodexDerivedCache(channel.Id)
-		count++
-	}
-
 	if count > 0 {
-		refreshChannelGroupAfterMutation("batch delete channel model", nil)
+		finishChannelRouteMutation("batch delete channel model", affectedIDs, affectedCodexIDs)
 	}
 
 	return count, nil
@@ -805,17 +889,19 @@ type ChannelUpdateOptions struct {
 }
 
 func (channel *Channel) UpdateWithOptions(overwrite bool, options ChannelUpdateOptions) error {
-	err := channel.UpdateRawWithOptions(overwrite, options)
-
-	if err == nil {
-		var failClosedChannelIDs []int
-		if channel.Status != 0 && channel.Status != config.ChannelStatusEnabled {
-			failClosedChannelIDs = []int{channel.Id}
-		}
-		refreshChannelGroupAfterMutation("update channel", failClosedChannelIDs)
+	invalidateCodex, updated, err := channel.updateRawWithOptions(overwrite, options)
+	if err != nil {
+		return err
 	}
-
-	return err
+	if updated {
+		codexIDs := []int(nil)
+		if invalidateCodex {
+			codexIDs = []int{channel.Id}
+		}
+		finishChannelRouteMutation("update channel", []int{channel.Id}, codexIDs)
+	}
+	channel.reloadAfterSuccessfulUpdate("update channel")
+	return nil
 }
 
 func (channel *Channel) UpdateRaw(overwrite bool) error {
@@ -826,42 +912,128 @@ func (channel *Channel) UpdateRaw(overwrite bool) error {
 }
 
 func (channel *Channel) UpdateRawWithOptions(overwrite bool, options ChannelUpdateOptions) error {
-	var err error
-	if err = channel.hydratePersistedTypeForUpdate(); err != nil {
-		return err
-	}
-	if err = channel.hydratePersistedOtherForUpdate(options.OtherSubmitted); err != nil {
-		return err
-	}
-	if err = channel.hydratePersistedBaseURLForUpdate(options.BaseURLSubmitted); err != nil {
-		return err
-	}
-	if err = channel.CanonicalizeRuntimeConfigJSON(); err != nil {
-		return err
-	}
-	if err = channel.ValidateRuntimeConfigJSON(); err != nil {
-		return err
-	}
-
-	if overwrite {
-		err = DB.Model(channel).Select("*").Omit("UsedQuota").Updates(channel).Error
-	} else {
-		err = DB.Model(channel).Omit("UsedQuota").Updates(channel).Error
-		if err == nil {
-			err = channel.updateSubmittedZeroValueRuntimeConfig(options)
-		}
-	}
+	invalidateCodex, updated, err := channel.updateRawWithOptions(overwrite, options)
 	if err != nil {
 		return err
 	}
-	ClearChannelCodexDerivedCache(channel.Id)
-	DB.Model(channel).First(channel, "id = ?", channel.Id)
-	return err
+	if updated {
+		codexIDs := []int(nil)
+		if invalidateCodex {
+			codexIDs = []int{channel.Id}
+		}
+		finishChannelRouteMutation("raw update channel", []int{channel.Id}, codexIDs)
+	}
+	channel.reloadAfterSuccessfulUpdate("raw update channel")
+	return nil
 }
 
-func (channel *Channel) updateSubmittedZeroValueRuntimeConfig(options ChannelUpdateOptions) error {
-	if channel == nil || channel.Id <= 0 {
+// reloadAfterSuccessfulUpdate restores the historical mutation contract: the
+// receiver reflects the complete persisted row, including fields omitted by a
+// partial update. Reload happens after all post-commit routing/cache effects.
+// A reload failure is diagnostic only; the durable update has already succeeded
+// and must not be reported to callers as failed.
+func (channel *Channel) reloadAfterSuccessfulUpdate(reason string) {
+	persisted, err := GetChannelById(channel.Id)
+	if err != nil {
+		logger.SysError(fmt.Sprintf("failed to reload channel %d after %s: %s", channel.Id, reason, err.Error()))
+		return
+	}
+	*channel = *persisted
+}
+
+func (channel *Channel) updateRawWithOptions(overwrite bool, options ChannelUpdateOptions) (bool, bool, error) {
+	persisted, err := GetChannelById(channel.Id)
+	if err != nil {
+		return false, false, err
+	}
+	oldType := persisted.Type
+	if channel.Type == config.ChannelTypeUnknown {
+		channel.Type = oldType
+	}
+	if err = channel.hydratePersistedOtherForUpdate(options.OtherSubmitted); err != nil {
+		return false, false, err
+	}
+	if err = channel.hydratePersistedBaseURLForUpdate(options.BaseURLSubmitted); err != nil {
+		return false, false, err
+	}
+	if err = channel.CanonicalizeRuntimeConfigJSON(); err != nil {
+		return false, false, err
+	}
+	if err = channel.ValidateRuntimeConfigJSON(); err != nil {
+		return false, false, err
+	}
+
+	var rowsAffected int64
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		credentialChanged := channel.Key != persisted.Key
+		if !overwrite && channel.Key == "" {
+			// GORM omits an empty string in partial struct updates; mirror the
+			// effective mutation here so an unrelated edit cannot supersede a fence.
+			credentialChanged = false
+		}
+		typeChanged := channel.Type != persisted.Type
+		if persisted.CredentialRefreshFence != nil && !credentialChanged && !typeChanged {
+			// Re-submitting the same credential is not proof of reauthorization.
+			// Ordinary config edits are allowed and leave the fence untouched.
+		}
+		if persisted.Type != config.ChannelTypeCodex && channel.Type == config.ChannelTypeCodex && !credentialChanged && persisted.CredentialRefreshFence != nil {
+			return fmt.Errorf("entering Codex requires a new credential")
+		}
+		protocolFields := []string{"CredentialRevision", "CredentialRefreshFence", "CredentialRefreshStartedAt"}
+		if overwrite {
+			result := tx.Model(channel).Select("*").Omit(append([]string{"UsedQuota"}, protocolFields...)...).Updates(channel)
+			rowsAffected += result.RowsAffected
+			if result.Error != nil {
+				return result.Error
+			}
+		} else {
+			result := tx.Model(channel).Omit(append([]string{"UsedQuota"}, protocolFields...)...).Updates(channel)
+			rowsAffected += result.RowsAffected
+			if result.Error != nil {
+				return result.Error
+			}
+			zeroRows, updateErr := channel.updateSubmittedZeroValueRuntimeConfig(tx, options)
+			rowsAffected += zeroRows
+			if updateErr != nil {
+				return updateErr
+			}
+		}
+
+		if credentialChanged || typeChanged {
+			updates := map[string]any{
+				"credential_revision": gorm.Expr("credential_revision + 1"),
+			}
+			// A genuinely new credential explicitly supersedes every older attempt.
+			// A type-only change preserves the fence, preventing ABA reuse of the old
+			// bytes if the row is later changed back to Codex.
+			if credentialChanged {
+				updates["credential_refresh_fence"] = nil
+				updates["credential_refresh_started_at"] = nil
+			}
+			result := tx.Model(&Channel{}).Where("id = ? AND credential_revision = ?", channel.Id, persisted.CredentialRevision).Updates(updates)
+			rowsAffected += result.RowsAffected
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected == 0 {
+				return fmt.Errorf("channel credential lifecycle changed concurrently")
+			}
+		}
 		return nil
+	})
+	if err != nil {
+		return false, false, err
+	}
+	invalidateCodex := oldType == config.ChannelTypeCodex || channel.Type == config.ChannelTypeCodex
+	if !overwrite && channel.Status == 0 {
+		channel.Status = persisted.Status
+	}
+	return invalidateCodex, rowsAffected > 0, nil
+}
+
+func (channel *Channel) updateSubmittedZeroValueRuntimeConfig(tx *gorm.DB, options ChannelUpdateOptions) (int64, error) {
+	if channel == nil || channel.Id <= 0 {
+		return 0, nil
 	}
 	updates := make(map[string]any)
 	if options.OtherSubmitted {
@@ -875,9 +1047,10 @@ func (channel *Channel) updateSubmittedZeroValueRuntimeConfig(options ChannelUpd
 		}
 	}
 	if len(updates) == 0 {
-		return nil
+		return 0, nil
 	}
-	return DB.Model(&Channel{}).Where("id = ?", channel.Id).UpdateColumns(updates).Error
+	result := tx.Model(&Channel{}).Where("id = ?", channel.Id).UpdateColumns(updates)
+	return result.RowsAffected, result.Error
 }
 
 func (channel *Channel) hydratePersistedTypeForUpdate() error {
@@ -1007,12 +1180,20 @@ func updateChannelStatus(id int, targetStatus int, applyScope func(*gorm.DB) *go
 		return false, result.Error
 	}
 
+	updated := result.RowsAffected > 0
+	channelType := config.ChannelTypeUnknown
+	if updated {
+		if err := tx.Model(&Channel{}).Select("type").Where("id = ?", id).Scan(&channelType).Error; err != nil {
+			tx.Rollback()
+			logger.SysError("failed to confirm channel type after status update: " + err.Error())
+			return false, err
+		}
+	}
 	if err := tx.Commit().Error; err != nil {
 		logger.SysError("failed to commit channel status update: " + err.Error())
 		return false, err
 	}
 
-	updated := result.RowsAffected > 0
 	if updated {
 		// Status changes are routing-index changes, not just per-channel flags.
 		// A disabled channel may be absent from Channels after a prior Load, and an
@@ -1024,11 +1205,11 @@ func updateChannelStatus(id int, targetStatus int, applyScope func(*gorm.DB) *go
 		// successful reload instead of locally patching every routing index. That can
 		// delay re-enable during DB read failures, but avoids a second incremental
 		// routing implementation that can diverge from Load().
-		var failClosedChannelIDs []int
-		if targetStatus != config.ChannelStatusEnabled {
-			failClosedChannelIDs = []int{id}
+		codexIDs := []int(nil)
+		if channelType == config.ChannelTypeCodex {
+			codexIDs = []int{id}
 		}
-		refreshChannelGroupAfterMutation("update channel status", failClosedChannelIDs)
+		finishChannelRouteMutation("update channel status", []int{id}, codexIDs)
 	}
 
 	return updated, nil
@@ -1065,36 +1246,31 @@ func updateChannelUsedQuota(id int, quota int) {
 }
 
 func clearChannelCacheKeys(cacheKeys []string) {
-	for _, key := range cacheKeys {
-		if err := cache.DeleteCache(key); err != nil {
-			logger.SysError(fmt.Sprintf("failed to clear cache %s: %v", key, err))
-		}
+	if err := clearChannelCacheKeysWithContext(context.Background(), cacheKeys); err != nil {
+		logger.SysError(fmt.Sprintf("failed to clear %d cache key(s): %v", len(cacheKeys), err))
 	}
+}
+
+func clearChannelCacheKeysWithContext(ctx context.Context, cacheKeys []string) error {
+	return cache.DeleteCacheManyContext(ctx, cacheKeys)
 }
 
 func ClearChannelTokenCache(channelId int) {
-	cacheKeys := []string{
-		fmt.Sprintf("%s:%d", codexTokenCacheKeyPrefix, channelId),
-	}
-
-	clearChannelCacheKeys(cacheKeys)
+	clearChannelCacheKeys([]string{fmt.Sprintf("%s:%d", codexTokenCacheKeyPrefix, channelId)})
 }
 
 func ClearChannelCodexUsageCache(channelId int) {
-	cacheKeys := []string{
+	clearChannelCacheKeys([]string{
 		fmt.Sprintf("%s:%d", codexUsagePreviewCacheKeyPrefix, channelId),
 		fmt.Sprintf("%s:%d", codexUsageDetailCacheKeyPrefix, channelId),
-	}
-
-	clearChannelCacheKeys(cacheKeys)
+	})
 }
 
 func ClearChannelCodexDerivedCaches(channelIds []int) {
 	if len(channelIds) == 0 {
 		return
 	}
-
-	cacheKeys := make([]string, 0, len(channelIds)*3)
+	unique := make([]int, 0, len(channelIds))
 	seen := make(map[int]struct{}, len(channelIds))
 	for _, channelId := range channelIds {
 		if channelId <= 0 {
@@ -1104,18 +1280,20 @@ func ClearChannelCodexDerivedCaches(channelIds []int) {
 			continue
 		}
 		seen[channelId] = struct{}{}
-		// We intentionally over-invalidate Codex derived caches here. Usage data depends
-		// on runtime credentials plus request-shaping fields such as baseURL, proxy,
-		// model headers, and other provider options. A 1-minute cache miss is cheaper
-		// than trying to diff those fields precisely and serving stale admin usage data.
-		cacheKeys = append(cacheKeys,
+		unique = append(unique, channelId)
+	}
+	if err := cache.RotateCodexUsageGenerations(unique); err != nil {
+		logger.SysError(fmt.Sprintf("failed to rotate %d Codex usage generation(s): %v", len(unique), err))
+	}
+	legacyKeys := make([]string, 0, len(unique)*3)
+	for _, channelId := range unique {
+		legacyKeys = append(legacyKeys,
 			fmt.Sprintf("%s:%d", codexTokenCacheKeyPrefix, channelId),
 			fmt.Sprintf("%s:%d", codexUsagePreviewCacheKeyPrefix, channelId),
 			fmt.Sprintf("%s:%d", codexUsageDetailCacheKeyPrefix, channelId),
 		)
 	}
-
-	clearChannelCacheKeys(cacheKeys)
+	clearChannelCacheKeys(legacyKeys)
 }
 
 func ClearChannelCodexDerivedCache(channelId int) {
@@ -1123,17 +1301,45 @@ func ClearChannelCodexDerivedCache(channelId int) {
 }
 
 func UpdateChannelKey(id int, key string) error {
-	err := DB.Model(&Channel{}).Where("id = ?", id).Update("key", key).Error
+	return UpdateChannelKeyWithContext(context.Background(), id, key)
+}
+
+// CompareAndSetChannelKeyWithContext updates credentials only while the database
+// still contains the key from which an OAuth refresh was derived.
+func CompareAndSetChannelKeyWithContext(ctx context.Context, id int, expectedKey, key string) (bool, error) {
+	// Legacy callers may still use key CAS for non-refresh replacement, but it
+	// must never act as a generic fence unlock. Persisted OAuth rotation uses the
+	// attempt-scoped CommitCredentialRotation protocol instead.
+	result := DB.WithContext(ctx).Model(&Channel{}).Where("id = ? AND key = ? AND credential_refresh_fence IS NULL", id, expectedKey).Updates(map[string]any{
+		"key": key, "credential_revision": gorm.Expr("credential_revision + 1"),
+		"credential_refresh_fence": nil, "credential_refresh_started_at": nil,
+	})
+	if result.Error != nil {
+		logger.SysError("failed to compare-and-set channel key: " + result.Error.Error())
+		return false, result.Error
+	}
+	if result.RowsAffected == 0 {
+		return false, nil
+	}
+	// OAuth persistence changes credentials, not routing topology. Quarantine the
+	// old credential-bearing snapshot and let the next routing read publish one
+	// complete DB snapshot. The provider that performed the CAS adopts the durable
+	// key directly, so persistence never waits on cache or chooser I/O.
+	ChannelGroup.failClosedChannels([]int{id})
+	return true, nil
+}
+
+func UpdateChannelKeyWithContext(ctx context.Context, id int, key string) error {
+	updated, err := ReplaceChannelCredentialWithContext(ctx, id, key)
 	if err != nil {
 		logger.SysError("failed to update channel key: " + err.Error())
 		return err
 	}
-
-	ClearChannelCodexDerivedCache(id)
-	if err := ChannelGroup.RefreshChannel(id); err != nil {
-		ChannelGroup.markDirty()
-		logger.SysError("failed to refresh channel state after key update: " + err.Error())
+	if !updated {
+		return nil
 	}
+
+	finishChannelRouteMutation("update channel key", []int{id}, []int{id})
 
 	return nil
 }

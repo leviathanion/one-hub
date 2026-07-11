@@ -3,6 +3,8 @@ package codex
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"one-api/common/cache"
+	"one-api/common/config"
 	"one-api/common/logger"
 	"one-api/common/requester"
 	"one-api/model"
@@ -358,7 +361,7 @@ func TestConsumeResetCreditRetriesAfterUnauthorizedByForceRefreshing(t *testing.
 	})
 
 	originalRefreshCredentials := refreshOAuthCredentials
-	refreshOAuthCredentials = func(creds *OAuth2Credentials, _ context.Context, _ string, _ int) error {
+	refreshOAuthCredentials = func(creds *OAuth2Credentials, _ context.Context, _ string) error {
 		creds.AccessToken = serverToken.Load().(string)
 		creds.ExpiresAt = time.Now().Add(time.Hour)
 		return nil
@@ -380,20 +383,20 @@ func TestConsumeResetCreditRetriesAfterUnauthorizedByForceRefreshing(t *testing.
 	}
 	updatedKey.Store(initialKey)
 
-	originalUpdateChannelKey := updateChannelKey
-	updateChannelKey = func(channelID int, key string) error {
-		if channelID != 424299 {
-			t.Fatalf("unexpected channel id update %d", channelID)
+	originalUpdateChannelKey := compareAndSetChannelKey
+	compareAndSetChannelKey = func(_ context.Context, channelID int, expected, key string) (bool, error) {
+		if channelID != 424299 || expected != updatedKey.Load().(string) {
+			t.Fatalf("unexpected channel key CAS: id=%d expected=%q", channelID, expected)
 		}
 		updatedKey.Store(key)
-		return nil
+		return true, nil
 	}
 	t.Cleanup(func() {
-		updateChannelKey = originalUpdateChannelKey
+		compareAndSetChannelKey = originalUpdateChannelKey
 	})
 
 	originalLoadLatestChannelByID := loadLatestChannelByID
-	loadLatestChannelByID = func(channelID int) (*model.Channel, error) {
+	loadLatestChannelByID = func(_ context.Context, channelID int) (*model.Channel, error) {
 		if channelID != 424299 {
 			t.Fatalf("unexpected channel id reload %d", channelID)
 		}
@@ -422,6 +425,38 @@ func TestConsumeResetCreditRetriesAfterUnauthorizedByForceRefreshing(t *testing.
 	}
 	if !strings.Contains(updatedKey.Load().(string), "refreshed-token") {
 		t.Fatalf("expected refreshed token to be persisted, got %s", updatedKey.Load().(string))
+	}
+}
+
+func TestConsumeResetCreditRedactsEchoedCredentialSecrets(t *testing.T) {
+	const accessToken = "reset-access-secret"
+	const refreshToken = "reset-refresh-secret"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"Authorization: Bearer ` + accessToken + ` refresh=` + refreshToken + `"}}`))
+	}))
+	defer server.Close()
+
+	originalClient := requester.HTTPClient
+	requester.HTTPClient = server.Client()
+	t.Cleanup(func() { requester.HTTPClient = originalClient })
+	cache.InitCacheManager()
+	provider := newTestCodexProviderWithContext(t,
+		`{"access_token":"`+accessToken+`","refresh_token":"`+refreshToken+`"}`, "", nil)
+	provider.Channel.BaseURL = stringPtr(server.URL)
+	primeCachedTokenForKey(t, provider.Channel.Id, provider.Channel.Key, accessToken, time.Now().Add(time.Hour), time.Hour)
+
+	result, err := provider.ConsumeResetCredit(context.Background())
+	if err == nil || result == nil || result.upstreamStatus != http.StatusBadRequest {
+		t.Fatalf("expected sanitized upstream 400, result=%+v err=%v", result, err)
+	}
+	if !strings.Contains(err.Error(), "[redacted]") {
+		t.Fatalf("expected reset error to retain redaction marker, got %q", err.Error())
+	}
+	for _, secret := range []string{accessToken, refreshToken} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("reset error leaked %q: %q", secret, err.Error())
+		}
 	}
 }
 
@@ -502,7 +537,7 @@ func TestGetUsageSnapshotRetriesAfterUnauthorizedByForceRefreshing(t *testing.T)
 	})
 
 	originalRefreshCredentials := refreshOAuthCredentials
-	refreshOAuthCredentials = func(creds *OAuth2Credentials, _ context.Context, _ string, _ int) error {
+	refreshOAuthCredentials = func(creds *OAuth2Credentials, _ context.Context, _ string) error {
 		creds.AccessToken = serverToken.Load().(string)
 		creds.ExpiresAt = time.Now().Add(time.Hour)
 		return nil
@@ -524,20 +559,20 @@ func TestGetUsageSnapshotRetriesAfterUnauthorizedByForceRefreshing(t *testing.T)
 	}
 	updatedKey.Store(initialKey)
 
-	originalUpdateChannelKey := updateChannelKey
-	updateChannelKey = func(channelID int, key string) error {
-		if channelID != 424299 {
-			t.Fatalf("unexpected channel id update %d", channelID)
+	originalUpdateChannelKey := compareAndSetChannelKey
+	compareAndSetChannelKey = func(_ context.Context, channelID int, expected, key string) (bool, error) {
+		if channelID != 424299 || expected != updatedKey.Load().(string) {
+			t.Fatalf("unexpected channel key CAS: id=%d expected=%q", channelID, expected)
 		}
 		updatedKey.Store(key)
-		return nil
+		return true, nil
 	}
 	t.Cleanup(func() {
-		updateChannelKey = originalUpdateChannelKey
+		compareAndSetChannelKey = originalUpdateChannelKey
 	})
 
 	originalLoadLatestChannelByID := loadLatestChannelByID
-	loadLatestChannelByID = func(channelID int) (*model.Channel, error) {
+	loadLatestChannelByID = func(_ context.Context, channelID int) (*model.Channel, error) {
 		if channelID != 424299 {
 			t.Fatalf("unexpected channel id reload %d", channelID)
 		}
@@ -569,6 +604,36 @@ func TestGetUsageSnapshotRetriesAfterUnauthorizedByForceRefreshing(t *testing.T)
 	}
 	if !strings.Contains(updatedKey.Load().(string), "refreshed-token") {
 		t.Fatalf("expected refreshed token to be persisted, got %s", updatedKey.Load().(string))
+	}
+
+	// The fetch captured its generation before OAuth. CAS invalidation must not
+	// rotate it: a provider built from the newly durable key must reach this entry.
+	requestsAfterInteractive := requestCount.Load()
+	newProvider := CodexProviderFactory{}.Create(&model.Channel{
+		Id: 424299, Key: updatedKey.Load().(string), BaseURL: stringPtr(server.URL),
+	}).(*CodexProvider)
+	cached, cacheErr := newProvider.GetUsageSnapshot(context.Background(), false)
+	if cacheErr != nil || cached == nil || cached.UpstreamStatus != http.StatusOK || requestCount.Load() != requestsAfterInteractive {
+		t.Fatalf("OAuth-refreshed interactive cache is unreachable: snapshot=%+v err=%v requests=%d", cached, cacheErr, requestCount.Load())
+	}
+
+	// Exercise the production background path from the old credential again. Its
+	// success summary and the cache written under the refreshed fingerprint must
+	// both remain real, not merely report an upstream success whose write was stranded.
+	updatedKey.Store(initialKey)
+	background := refreshUsageSnapshotForChannel(context.Background(), &model.Channel{
+		Id: 424299, Key: initialKey, BaseURL: stringPtr(server.URL),
+	})
+	if background.Refreshed != 1 || background.Failed != 0 {
+		t.Fatalf("OAuth background refresh did not report a real success: %+v", background)
+	}
+	requestsAfterBackground := requestCount.Load()
+	newProvider = CodexProviderFactory{}.Create(&model.Channel{
+		Id: 424299, Key: updatedKey.Load().(string), BaseURL: stringPtr(server.URL),
+	}).(*CodexProvider)
+	preview, previewErr := newProvider.GetUsagePreview(context.Background(), false)
+	if previewErr != nil || preview == nil || preview.PlanType != "pro" || requestCount.Load() != requestsAfterBackground {
+		t.Fatalf("OAuth-refreshed background cache is unreachable: preview=%+v err=%v requests=%d", preview, previewErr, requestCount.Load())
 	}
 }
 
@@ -621,6 +686,101 @@ func TestGetUsageSnapshotReturnsSnapshotOnUpstreamFailure(t *testing.T) {
 	}
 }
 
+func TestFetchUsageSnapshotEnforcesResponseBodyLimit(t *testing.T) {
+	tests := []struct {
+		name      string
+		bodySize  int
+		wantError bool
+	}{
+		{name: "exact limit accepted", bodySize: usageResponseBodyMaxBytes},
+		{name: "limit plus one rejected", bodySize: usageResponseBodyMaxBytes + 1, wantError: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := make([]byte, test.bodySize)
+			copy(body, `{"plan_type":"pro"}`)
+			for index := len(`{"plan_type":"pro"}`); index < len(body); index++ {
+				body[index] = ' '
+			}
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write(body)
+			}))
+			defer server.Close()
+
+			originalHTTPClient := requester.HTTPClient
+			requester.HTTPClient = server.Client()
+			t.Cleanup(func() {
+				requester.HTTPClient = originalHTTPClient
+			})
+
+			provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token"}`, "", nil)
+			provider.Channel.BaseURL = stringPtr(server.URL)
+			snapshot, err := provider.fetchUsageSnapshotOnce(context.Background())
+
+			if test.wantError {
+				if !errors.Is(err, errCodexUsageResponseTooLarge) {
+					t.Fatalf("expected explicit payload-too-large error, got snapshot=%+v err=%v", snapshot, err)
+				}
+				if !strings.Contains(err.Error(), fmt.Sprintf("limit %d bytes", usageResponseBodyMaxBytes)) {
+					t.Fatalf("expected body limit in error, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected exactly-at-limit body to succeed, got %v", err)
+			}
+			if snapshot == nil || snapshot.PlanType != "pro" {
+				t.Fatalf("unexpected exactly-at-limit snapshot: %+v", snapshot)
+			}
+		})
+	}
+}
+
+func TestConsumeResetCreditEnforcesResponseBodyLimit(t *testing.T) {
+	tests := []struct {
+		name      string
+		bodySize  int
+		wantError bool
+	}{
+		{name: "exact limit accepted", bodySize: usageResponseBodyMaxBytes},
+		{name: "limit plus one rejected", bodySize: usageResponseBodyMaxBytes + 1, wantError: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := make([]byte, test.bodySize)
+			payload := `{"code":"ok","windows_reset":1}`
+			copy(body, payload)
+			for index := len(payload); index < len(body); index++ {
+				body[index] = ' '
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write(body)
+			}))
+			defer server.Close()
+
+			originalHTTPClient := requester.HTTPClient
+			requester.HTTPClient = server.Client()
+			t.Cleanup(func() { requester.HTTPClient = originalHTTPClient })
+
+			provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token"}`, "", nil)
+			provider.Channel.BaseURL = stringPtr(server.URL)
+			result, err := provider.consumeResetCreditOnce(context.Background())
+			if test.wantError {
+				if !errors.Is(err, errCodexUsageResponseTooLarge) {
+					t.Fatalf("expected explicit payload-too-large error, got result=%+v err=%v", result, err)
+				}
+				return
+			}
+			if err != nil || result == nil || result.WindowsReset != 1 {
+				t.Fatalf("expected exactly-at-limit reset body to succeed, got result=%+v err=%v", result, err)
+			}
+		})
+	}
+}
+
 func TestGetUsageSnapshotDoesNotCacheDebugRawPayload(t *testing.T) {
 	cache.InitCacheManager()
 
@@ -667,7 +827,7 @@ func TestGetUsageSnapshotDoesNotCacheDebugRawPayload(t *testing.T) {
 	if defaultSnapshot.Raw != nil {
 		t.Fatalf("expected default cached snapshot to omit raw payload, got %#v", defaultSnapshot.Raw)
 	}
-	cached, cacheErr := getCachedUsageSnapshot(provider.Channel.Id)
+	cached, cacheErr := getCachedUsageSnapshotForChannel(provider.Channel)
 	if cacheErr != nil {
 		t.Fatalf("expected sanitized snapshot cache to be populated, got %v", cacheErr)
 	}
@@ -676,6 +836,254 @@ func TestGetUsageSnapshotDoesNotCacheDebugRawPayload(t *testing.T) {
 	}
 	if requestCount.Load() != 1 {
 		t.Fatalf("expected default fetch to reuse sanitized cache, got %d upstream calls", requestCount.Load())
+	}
+}
+
+func TestUsageCacheRejectsSnapshotFromOldChannelConfiguration(t *testing.T) {
+	cache.InitCacheManager()
+
+	baseURL := "https://old.example.com"
+	oldChannel := &model.Channel{
+		Id:      777,
+		Type:    config.ChannelTypeCodex,
+		Status:  config.ChannelStatusEnabled,
+		Key:     `{"access_token":"old-token"}`,
+		BaseURL: &baseURL,
+	}
+	oldPreview := &CodexUsagePreview{ChannelID: oldChannel.Id, PlanType: "old-plan"}
+	if err := cacheUsagePreview(oldChannel, oldPreview); err != nil {
+		t.Fatalf("expected old preview cache write to succeed, got %v", err)
+	}
+
+	newChannel := *oldChannel
+	newChannel.Key = `{"access_token":"new-token"}`
+	if _, err := getCachedUsagePreviewForChannel(&newChannel); !errors.Is(err, cache.CacheNotFound) {
+		t.Fatalf("expected changed credentials to reject stale preview, got %v", err)
+	}
+
+	// The old physical key remains independently readable until expiry; deleting it
+	// here could race with another old-configuration request still in flight.
+	oldCached, err := getCachedUsagePreviewForChannel(oldChannel)
+	if err != nil || oldCached.PlanType != "old-plan" {
+		t.Fatalf("expected stale preview to remain isolated until expiry, got %+v, %v", oldCached, err)
+	}
+
+	newPreview := &CodexUsagePreview{ChannelID: newChannel.Id, PlanType: "new-plan"}
+	if err := cacheUsagePreview(&newChannel, newPreview); err != nil {
+		t.Fatalf("expected new preview cache write to succeed, got %v", err)
+	}
+
+	// Simulate an old-config request completing after the new value. Its write must
+	// stay on the old fingerprint key rather than overwrite the current cache entry.
+	oldPreview.PlanType = "late-old-plan"
+	if err := cacheUsagePreview(oldChannel, oldPreview); err != nil {
+		t.Fatalf("expected late old-config write to succeed in isolation, got %v", err)
+	}
+	cached, err := getCachedUsagePreviewForChannel(&newChannel)
+	if err != nil || cached.PlanType != "new-plan" {
+		t.Fatalf("expected current channel preview to survive late old write, got %+v, %v", cached, err)
+	}
+
+	legacyKey := fmt.Sprintf("codex:usage:preview:%d", newChannel.Id)
+	if err := cache.SetCache(legacyKey, newPreview, time.Minute); err != nil {
+		t.Fatalf("expected legacy cache priming to succeed, got %v", err)
+	}
+	generation, err := usageCacheGeneration(context.Background(), newChannel.Id)
+	if err != nil {
+		t.Fatalf("expected generation marker, got %v", err)
+	}
+	if usagePreviewCacheKey(newChannel.Id, generation, codexUsageChannelFingerprint(&newChannel)) == legacyKey {
+		t.Fatal("expected v2 cache key to stay isolated from rolling-upgrade legacy keys")
+	}
+}
+
+func TestUsageCacheFingerprintSeparatesRecreatedChannelIdentity(t *testing.T) {
+	first := &model.Channel{Id: 84201, CreatedTime: 100, Type: config.ChannelTypeCodex, Key: `{"access_token":"same"}`}
+	recreated := *first
+	recreated.CreatedTime = 200
+	if codexUsageChannelFingerprint(first) == codexUsageChannelFingerprint(&recreated) {
+		t.Fatal("recreated channel could inherit a prior row's usage projection")
+	}
+}
+
+func TestClearUsageCacheForChannelInvalidatesCurrentFingerprint(t *testing.T) {
+	cache.InitCacheManager()
+	channel := &model.Channel{
+		Id:     779,
+		Type:   config.ChannelTypeCodex,
+		Status: config.ChannelStatusEnabled,
+		Key:    `{"access_token":"token"}`,
+	}
+	preview := &CodexUsagePreview{ChannelID: channel.Id, PlanType: "pro"}
+	snapshot := &CodexUsageSnapshot{ChannelID: channel.Id, PlanType: "pro"}
+	if err := cacheUsagePreview(channel, preview); err != nil {
+		t.Fatalf("failed to prime preview: %v", err)
+	}
+	if err := cacheUsageSnapshotWithTTL(channel, snapshot, time.Minute); err != nil {
+		t.Fatalf("failed to prime detail: %v", err)
+	}
+
+	if err := ClearUsageCacheForChannel(channel); err != nil {
+		t.Fatalf("failed to clear current usage cache: %v", err)
+	}
+	if _, err := getCachedUsagePreviewForChannel(channel); !errors.Is(err, cache.CacheNotFound) {
+		t.Fatalf("expected preview invalidation, got %v", err)
+	}
+	if _, err := getCachedUsageSnapshotForChannel(channel); !errors.Is(err, cache.CacheNotFound) {
+		t.Fatalf("expected detail invalidation, got %v", err)
+	}
+}
+
+func TestUsageCacheGenerationStrandsInflightWritesAcrossCredentialChanges(t *testing.T) {
+	cache.InitCacheManager()
+	channel := &model.Channel{Id: 780, Type: config.ChannelTypeCodex, Status: config.ChannelStatusEnabled, Key: `{"access_token":"old"}`}
+	oldGeneration, err := usageCacheGeneration(context.Background(), channel.Id)
+	if err != nil {
+		t.Fatalf("failed to capture initial generation: %v", err)
+	}
+
+	// Start a fetch that has captured the old generation, then hold it at the
+	// upstream boundary until reset publishes the new namespace.
+	oldPreview := &CodexUsagePreview{ChannelID: channel.Id, PlanType: "stale-old-credential"}
+	allowLateWrite := make(chan struct{})
+	lateWriteDone := make(chan error, 1)
+	go func(capturedGeneration string) {
+		<-allowLateWrite
+		lateWriteDone <- cacheUsagePreviewForGeneration(context.Background(), channel, oldPreview, capturedGeneration, time.Minute)
+	}(oldGeneration)
+
+	if err := RotateUsageCacheGeneration(channel.Id); err != nil {
+		t.Fatalf("failed to rotate generation: %v", err)
+	}
+	newGeneration, err := usageCacheGeneration(context.Background(), channel.Id)
+	if err != nil || newGeneration == oldGeneration {
+		t.Fatalf("expected a fresh generation, old=%q new=%q err=%v", oldGeneration, newGeneration, err)
+	}
+	close(allowLateWrite)
+	if err := <-lateWriteDone; err != nil {
+		t.Fatalf("late old-credential write failed: %v", err)
+	}
+	refreshedChannel := *channel
+	refreshedChannel.Key = `{"access_token":"new","refresh_token":"rotated"}`
+	refreshedPreview := &CodexUsagePreview{ChannelID: channel.Id, PlanType: "stale-new-credential"}
+	if err := cacheUsagePreviewForGeneration(context.Background(), &refreshedChannel, refreshedPreview, oldGeneration, time.Minute); err != nil {
+		t.Fatalf("late refreshed-credential write failed: %v", err)
+	}
+	if _, err := getCachedUsagePreviewForChannel(channel); !errors.Is(err, cache.CacheNotFound) {
+		t.Fatalf("old credentials unexpectedly read pre-reset write: %v", err)
+	}
+	if _, err := getCachedUsagePreviewForChannel(&refreshedChannel); !errors.Is(err, cache.CacheNotFound) {
+		t.Fatalf("refreshed credentials unexpectedly read pre-reset write: %v", err)
+	}
+
+	fresh := &CodexUsagePreview{ChannelID: channel.Id, PlanType: "fresh"}
+	if err := cacheUsagePreviewForGeneration(context.Background(), &refreshedChannel, fresh, newGeneration, time.Minute); err != nil {
+		t.Fatalf("fresh generation write failed: %v", err)
+	}
+	got, err := getCachedUsagePreviewForChannel(&refreshedChannel)
+	if err != nil || got.PlanType != "fresh" {
+		t.Fatalf("expected current generation value, got %+v err=%v", got, err)
+	}
+}
+
+func TestUsageCacheGenerationRandomizesOnEveryMarkerMiss(t *testing.T) {
+	cache.InitCacheManager()
+	channelID := 782
+	first, err := usageCacheGeneration(context.Background(), channelID)
+	if err != nil || first == "" || first == "0" {
+		t.Fatalf("expected random initialized generation, got %q err=%v", first, err)
+	}
+	if err := cache.DeleteCache(usageGenerationKey(channelID)); err != nil {
+		t.Fatalf("failed to evict marker: %v", err)
+	}
+	second, err := usageCacheGeneration(context.Background(), channelID)
+	if err != nil || second == first {
+		t.Fatalf("marker miss must create a new namespace: first=%q second=%q err=%v", first, second, err)
+	}
+}
+
+func TestUsageCacheGenerationTTLExceedsEveryUsageEntryTTL(t *testing.T) {
+	if usageGenerationMarkerTTL <= usagePreviewCacheTTL || usageGenerationMarkerTTL <= usageDetailCacheTTL {
+		t.Fatalf("generation marker TTL %s must exceed preview %s and detail %s", usageGenerationMarkerTTL, usagePreviewCacheTTL, usageDetailCacheTTL)
+	}
+	if cache.CodexUsageRotationPendingTTL <= usagePreviewCacheTTL || cache.CodexUsageRotationPendingTTL <= usageDetailCacheTTL {
+		t.Fatalf("pending rotation TTL %s must outlive preview %s and detail %s", cache.CodexUsageRotationPendingTTL, usagePreviewCacheTTL, usageDetailCacheTTL)
+	}
+}
+
+func TestConsumeResetCreditRejectsNilHTTPClient(t *testing.T) {
+	originalHTTPClient := requester.HTTPClient
+	requester.HTTPClient = nil
+	t.Cleanup(func() { requester.HTTPClient = originalHTTPClient })
+
+	provider := CodexProviderFactory{}.Create(&model.Channel{
+		Id: 784, Type: config.ChannelTypeCodex, Key: `{"access_token":"token"}`,
+	}).(*CodexProvider)
+	if _, err := provider.ConsumeResetCredit(context.Background()); err == nil || !strings.Contains(err.Error(), "HTTP client is not configured") {
+		t.Fatalf("expected explicit nil HTTP client error, got %v", err)
+	}
+}
+
+func TestUsageFetchContextCancelsTokenRefresh(t *testing.T) {
+	cache.InitCacheManager()
+	if logger.Logger == nil {
+		logger.SetupLogger()
+	}
+
+	originalRedisEnabled := config.RedisEnabled
+	config.RedisEnabled = false
+	t.Cleanup(func() {
+		config.RedisEnabled = originalRedisEnabled
+	})
+
+	credentials := &OAuth2Credentials{
+		AccessToken:  "expired-access-token",
+		RefreshToken: "refresh-token",
+		ExpiresAt:    time.Now().Add(-time.Minute),
+	}
+	key, err := credentials.ToJSON()
+	if err != nil {
+		t.Fatalf("failed to encode credentials: %v", err)
+	}
+	channel := &model.Channel{Id: 778, Type: config.ChannelTypeCodex, Status: config.ChannelStatusEnabled, Key: key}
+	provider, ok := CodexProviderFactory{}.Create(channel).(*CodexProvider)
+	if !ok || provider == nil {
+		t.Fatal("expected Codex provider")
+	}
+
+	originalLoadLatest := loadLatestChannelByID
+	loadLatestChannelByID = func(ctx context.Context, channelID int) (*model.Channel, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if channelID != channel.Id {
+			t.Fatalf("unexpected channel id: got %d want %d", channelID, channel.Id)
+		}
+		channelCopy := *channel
+		return &channelCopy, nil
+	}
+	t.Cleanup(func() {
+		loadLatestChannelByID = originalLoadLatest
+	})
+
+	originalRefresh := refreshOAuthCredentials
+	refreshOAuthCredentials = func(_ *OAuth2Credentials, ctx context.Context, _ string) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	t.Cleanup(func() {
+		refreshOAuthCredentials = originalRefresh
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	startedAt := time.Now()
+	_, err = provider.fetchUsageSnapshot(ctx)
+	if err == nil || !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
+		t.Fatalf("expected usage fetch deadline to cancel token refresh, got %v", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed > time.Second {
+		t.Fatalf("expected token refresh cancellation to return promptly, took %v", elapsed)
 	}
 }
 
@@ -724,7 +1132,7 @@ func TestGetUsagePreviewDoesNotCacheFailedSnapshot(t *testing.T) {
 	if preview == nil {
 		t.Fatal("expected partial preview to be returned for diagnostics")
 	}
-	if _, cacheErr := getCachedUsagePreview(provider.Channel.Id); cacheErr == nil {
+	if _, cacheErr := getCachedUsagePreviewForChannel(provider.Channel); cacheErr == nil {
 		t.Fatal("expected failed preview fetch not to populate preview cache")
 	}
 
@@ -741,7 +1149,7 @@ func TestGetUsagePreviewDoesNotCacheFailedSnapshot(t *testing.T) {
 	if got := getCodexUsageWindowFromSlice(preview.Windows, "five_hour"); got == nil || !optionalFloat64Equals(got.UsedPercent, 25) {
 		t.Fatalf("expected recovered preview windows, got %+v", preview.Windows)
 	}
-	if _, cacheErr := getCachedUsagePreview(provider.Channel.Id); cacheErr != nil {
+	if _, cacheErr := getCachedUsagePreviewForChannel(provider.Channel); cacheErr != nil {
 		t.Fatalf("expected successful preview fetch to populate cache, got %v", cacheErr)
 	}
 }
@@ -774,13 +1182,13 @@ func TestBuildUsagePreviewClonesWindowSlice(t *testing.T) {
 	}
 }
 
-func TestNormalizeUsageSnapshotKeepsRawBodyWhenJSONIsInvalid(t *testing.T) {
+func TestNormalizeUsageSnapshotOmitsRawBodyWhenJSONIsInvalid(t *testing.T) {
 	snapshot, err := normalizeUsageSnapshot(9, nil, http.StatusBadGateway, []byte("not-json"))
 	if err == nil {
 		t.Fatal("expected invalid json payload to fail normalization")
 	}
-	if snapshot == nil || snapshot.Raw != "not-json" {
-		t.Fatalf("expected raw string fallback for invalid json, got %+v", snapshot)
+	if snapshot == nil || snapshot.Raw != invalidCodexRawPlaceholder {
+		t.Fatalf("expected safe invalid-json placeholder, got %+v", snapshot)
 	}
 }
 

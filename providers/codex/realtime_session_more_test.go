@@ -78,14 +78,14 @@ func TestLogCodexRealtimeInternalErrorRedactsAndIncludesCaller(t *testing.T) {
 		logger.Logger = originalLogger
 	})
 
-	logCodexRealtimeInternalError("codex realtime failed Authorization: Bearer abcdefghij.klmnopqrst.uvwxyzabcd upstream-url https://provider.example/v1?token=secret")
+	logCodexRealtimeInternalError(`codex realtime failed Authorization="Bearer log-secret\"tail" jwt abcdefghij.klmnopqrst.uvwxyzabcd upstream-url https://provider.example/v1?token=secret`)
 
 	logs := observedLogs.All()
 	if len(logs) != 1 {
 		t.Fatalf("expected one log entry, got %d", len(logs))
 	}
 	message := logs[0].Message
-	for _, forbidden := range []string{"abcdefghij.klmnopqrst.uvwxyzabcd", "provider.example", "token=secret"} {
+	for _, forbidden := range []string{"log-secret", "tail", "abcdefghij.klmnopqrst.uvwxyzabcd", "provider.example", "token=secret"} {
 		if strings.Contains(message, forbidden) {
 			t.Fatalf("expected sensitive value %q to be redacted, got %q", forbidden, message)
 		}

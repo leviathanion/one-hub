@@ -2,6 +2,7 @@ package codex
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,21 +10,33 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"one-api/common/cache"
 	"one-api/common/logger"
 	"one-api/common/requester"
+	"one-api/model"
 
 	"github.com/google/uuid"
 )
 
+var (
+	errCodexUsageResponseTooLarge = errors.New("Codex usage upstream payload too large")
+	// ErrResetCreditCommittedResponseUnusable means the irreversible reset POST
+	// received a successful HTTP status, but its response could not be consumed.
+	// Callers must not retry the business operation.
+	ErrResetCreditCommittedResponseUnusable = errors.New("Codex reset credit accepted but response unusable")
+)
+
 const (
-	usagePreviewCacheKeyPrefix = "codex:usage:preview"
-	usageDetailCacheKeyPrefix  = "codex:usage:detail"
-	// Trade-off: keep a short TTL so admin reads can reuse recent successful
-	// snapshots, but TTL only bounds staleness. Correctness still depends on
-	// explicit invalidation when the underlying channel changes or is deleted.
-	usageCacheTTL         = time.Minute
+	usagePreviewCacheKeyPrefix = "codex:usage:v2:preview"
+	usageDetailCacheKeyPrefix  = "codex:usage:v2:detail"
+	usageResponseBodyMaxBytes  = 1 << 20
+	usageGenerationMarkerTTL   = cache.CodexUsageGenerationTTL
+	// Detail is an interactive view and stays short-lived. Preview has a separate
+	// TTL owned by the background refresh policy in usage_auto_refresh.go.
+	usageDetailCacheTTL   = time.Minute
 	fiveHourWindowSeconds = 5 * 60 * 60
 	weeklyWindowSeconds   = 7 * 24 * 60 * 60
 )
@@ -87,6 +100,10 @@ type CodexResetResult struct {
 	upstreamStatus int
 }
 
+func IsResetCreditCommittedResponseUnusable(err error) bool {
+	return errors.Is(err, ErrResetCreditCommittedResponseUnusable)
+}
+
 type codexWhamUsageResponse struct {
 	PlanType              any                         `json:"plan_type,omitempty"`
 	UserID                any                         `json:"user_id,omitempty"`
@@ -136,26 +153,56 @@ type codexResetCreditConsumeResponse struct {
 	RedeemedAt   string            `json:"redeemed_at,omitempty"`
 }
 
+// Usage-cache boundary:
+//
+// Usage preview/detail is a disposable presentation projection, never part of
+// OAuth credential recovery. A cache hit deliberately returns without calling
+// commitPendingCredentials. Recovery liveness belongs to the scheduled
+// ReconcilePendingCredentials pass, while every operation that actually consumes
+// a token synchronously reconciles under the per-channel refresh lock.
+//
+// Trade-off: the UI may show a TTL-bounded stale usage projection while a rotated
+// credential is waiting for database persistence. This keeps read-only usage
+// views available during DB trouble without risking the credential: the pending
+// journal has no TTL and cannot be removed by cache activity. Do not couple these
+// paths merely to make a cache hit perform maintenance.
 func (p *CodexProvider) GetUsagePreview(ctx context.Context, forceRefresh bool) (*CodexUsagePreview, error) {
 	channel := p.codexChannel()
 	if channel == nil {
 		return nil, fmt.Errorf("provider not configured")
 	}
+	generation, generationErr := usageCacheGeneration(ctx, channel.Id)
+	cacheAvailable := generationErr == nil
+	if generationErr != nil {
+		logger.SysError(fmt.Sprintf("[Codex] bypassing usage cache for channel %d: %v", channel.Id, generationErr))
+	}
 
-	if !forceRefresh {
-		if cachedPreview, err := getCachedUsagePreview(channel.Id); err == nil {
+	if cacheAvailable && !forceRefresh {
+		if cachedPreview, cacheErr := getCachedUsagePreviewForChannelGenerationContext(ctx, channel, generation); cacheErr == nil {
 			return &cachedPreview, nil
+		} else if !errors.Is(cacheErr, cache.CacheNotFound) {
+			cacheAvailable = false
+			logger.SysError(fmt.Sprintf("[Codex] bypassing usage cache for channel %d after read failure: %v", channel.Id, cacheErr))
 		}
 	}
 
-	snapshot, err := p.GetUsageSnapshot(ctx, forceRefresh, false)
+	var snapshot *CodexUsageSnapshot
+	var err error
+	previewWriteAttempted := false
+	if cacheAvailable {
+		snapshot, previewWriteAttempted, err = p.getUsageSnapshotForGeneration(ctx, forceRefresh, false, generation)
+	} else {
+		snapshot, err = p.fetchUsageSnapshot(ctx)
+	}
 	if snapshot == nil {
 		return nil, err
 	}
 
 	preview := BuildUsagePreview(snapshot)
-	if err == nil {
-		cacheUsagePreview(preview)
+	if cacheAvailable && err == nil && !previewWriteAttempted {
+		if cacheErr := cacheUsagePreviewForGeneration(ctx, p.codexChannel(), preview, generation, usagePreviewCacheTTL); cacheErr != nil {
+			logger.SysError(fmt.Sprintf("[Codex] failed to cache usage preview for channel %d: %v", channel.Id, cacheErr))
+		}
 	}
 	return preview, err
 }
@@ -165,22 +212,45 @@ func (p *CodexProvider) GetUsageSnapshot(ctx context.Context, forceRefresh bool,
 	if channel == nil {
 		return nil, fmt.Errorf("provider not configured")
 	}
+	generation, generationErr := usageCacheGeneration(ctx, channel.Id)
+	if generationErr != nil {
+		logger.SysError(fmt.Sprintf("[Codex] bypassing usage cache for channel %d: %v", channel.Id, generationErr))
+		snapshot, err := p.fetchUsageSnapshot(ctx)
+		if snapshot != nil && !(len(includeRaw) > 0 && includeRaw[0]) {
+			snapshot = cloneCodexUsageSnapshot(snapshot, false)
+		}
+		return snapshot, err
+	}
+	snapshot, _, err := p.getUsageSnapshotForGeneration(ctx, forceRefresh, len(includeRaw) > 0 && includeRaw[0], generation)
+	return snapshot, err
+}
 
-	rawRequested := len(includeRaw) > 0 && includeRaw[0]
+func (p *CodexProvider) getUsageSnapshotForGeneration(ctx context.Context, forceRefresh, rawRequested bool, generation string) (*CodexUsageSnapshot, bool, error) {
+	channel := p.codexChannel()
+	cacheAvailable := true
 	if !forceRefresh && !rawRequested {
-		if cachedSnapshot, err := getCachedUsageSnapshot(channel.Id); err == nil {
-			return cloneCodexUsageSnapshot(&cachedSnapshot, false), nil
+		if cachedSnapshot, cacheErr := getCachedUsageSnapshotForChannelGenerationContext(ctx, channel, generation); cacheErr == nil {
+			return cloneCodexUsageSnapshot(&cachedSnapshot, false), false, nil
+		} else if !errors.Is(cacheErr, cache.CacheNotFound) {
+			cacheAvailable = false
+			logger.SysError(fmt.Sprintf("[Codex] bypassing usage detail cache for channel %d after read failure: %v", channel.Id, cacheErr))
 		}
 	}
 
 	snapshot, err := p.fetchUsageSnapshot(ctx)
-	if snapshot != nil && err == nil {
-		cacheSuccessfulUsageSnapshot(cloneCodexUsageSnapshot(snapshot, false))
+	previewWriteAttempted := false
+	if cacheAvailable && snapshot != nil && err == nil {
+		// This helper warms detail and preview together. Report the attempted preview
+		// write so GetUsagePreview does not write it a second time after a real fetch.
+		previewWriteAttempted = true
+		if cacheErr := cacheSuccessfulUsageSnapshotForGeneration(ctx, p.codexChannel(), cloneCodexUsageSnapshot(snapshot, false), generation); cacheErr != nil {
+			logger.SysError(fmt.Sprintf("[Codex] failed to cache successful usage for channel %d: %v", channel.Id, cacheErr))
+		}
 	}
 	if snapshot != nil && !rawRequested {
 		snapshot = cloneCodexUsageSnapshot(snapshot, false)
 	}
-	return snapshot, err
+	return snapshot, previewWriteAttempted, err
 }
 
 func BuildUsagePreview(snapshot *CodexUsageSnapshot) *CodexUsagePreview {
@@ -243,7 +313,7 @@ func (p *CodexProvider) ConsumeResetCredit(ctx context.Context) (*CodexResetResu
 		} else {
 			logger.SysError("[Codex] forced refresh after reset credit failure failed: " + refreshErr.Error())
 		}
-		return result, err
+		return result, fmt.Errorf("forced refresh after reset credit failure: %w", refreshErr)
 	}
 
 	return p.consumeResetCreditOnce(ctx)
@@ -254,7 +324,7 @@ func (p *CodexProvider) consumeResetCreditOnce(ctx context.Context) (*CodexReset
 	if channel == nil {
 		return nil, fmt.Errorf("provider not configured")
 	}
-	headers, err := p.getUsageRequestHeaders()
+	headers, err := p.getUsageRequestHeaders(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -275,6 +345,9 @@ func (p *CodexProvider) consumeResetCreditOnce(ctx context.Context) (*CodexReset
 	if err != nil {
 		return nil, err
 	}
+	if requester.HTTPClient == nil {
+		return nil, fmt.Errorf("HTTP client is not configured")
+	}
 
 	resp, err := requester.HTTPClient.Do(req)
 	if err != nil {
@@ -282,35 +355,49 @@ func (p *CodexProvider) consumeResetCreditOnce(ctx context.Context) (*CodexReset
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, err := io.ReadAll(resp.Body)
+	result := newMinimalResetCreditResult(channel.Id, resp.StatusCode)
+	bodyBytes, err := readCodexUsageResponseBody(resp.Body)
 	if err != nil {
-		return nil, err
+		if isHTTPSuccess(resp.StatusCode) {
+			return result, fmt.Errorf("%w: %w", ErrResetCreditCommittedResponseUnusable, err)
+		}
+		return result, err
 	}
 
-	result, normalizeErr := normalizeResetCreditResult(channel.Id, resp.StatusCode, bodyBytes)
+	result, normalizeErr := normalizeResetCreditResultWithCredentials(channel.Id, p.Credentials, resp.StatusCode, bodyBytes)
 	if normalizeErr != nil {
+		if isHTTPSuccess(resp.StatusCode) {
+			return result, fmt.Errorf("%w: %w", ErrResetCreditCommittedResponseUnusable, normalizeErr)
+		}
 		return result, normalizeErr
 	}
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return result, errors.New(extractUsageErrorMessage(decodeRawJSON(bodyBytes), resp.StatusCode))
+	if !isHTTPSuccess(resp.StatusCode) {
+		message := extractUsageErrorMessage(redactUsageCredentialValues(decodeRawJSON(bodyBytes), p.Credentials), resp.StatusCode)
+		return result, errors.New(redactUsageCredentialSecrets(message, p.Credentials))
 	}
 
 	return result, nil
 }
 
-func cacheSuccessfulUsageSnapshot(snapshot *CodexUsageSnapshot) {
+func cacheSuccessfulUsageSnapshot(ctx context.Context, channel *model.Channel, snapshot *CodexUsageSnapshot) error {
+	generation, err := usageCacheGeneration(ctx, channel.Id)
+	if err != nil {
+		return err
+	}
+	return cacheSuccessfulUsageSnapshotForGeneration(ctx, channel, snapshot, generation)
+}
+
+func cacheSuccessfulUsageSnapshotForGeneration(ctx context.Context, channel *model.Channel, snapshot *CodexUsageSnapshot, generation string) error {
 	if snapshot == nil {
-		return
+		return nil
 	}
 
-	cacheUsageSnapshot(snapshot)
-	// Preview cache is only a projection of the latest successful usage snapshot.
-	// Failed upstream fetches may still return a partial snapshot for diagnostics,
-	// but caching that payload as a preview would hide the upstream failure and make
-	// stale or incomplete data look valid. If we need to dampen repeated failures in
-	// the future, add a dedicated short-lived error cache instead of reusing the
-	// success preview cache.
-	cacheUsagePreview(BuildUsagePreview(snapshot))
+	// Detail remains short-lived, while preview stays available across the periodic
+	// refresh interval. Failed upstream payloads never reach this helper.
+	return errors.Join(
+		cacheUsageSnapshotForGeneration(ctx, channel, snapshot, generation, usageDetailCacheTTL),
+		cacheUsagePreviewForGeneration(ctx, channel, BuildUsagePreview(snapshot), generation, usagePreviewCacheTTL),
+	)
 }
 
 func (p *CodexProvider) fetchUsageSnapshot(ctx context.Context) (*CodexUsageSnapshot, error) {
@@ -335,7 +422,7 @@ func (p *CodexProvider) fetchUsageSnapshot(ctx context.Context) (*CodexUsageSnap
 		} else {
 			logger.SysError("[Codex] forced refresh after usage fetch failure failed: " + refreshErr.Error())
 		}
-		return snapshot, err
+		return snapshot, fmt.Errorf("forced refresh after usage fetch failure: %w", refreshErr)
 	}
 
 	refreshedSnapshot, retryErr := p.fetchUsageSnapshotOnce(ctx)
@@ -350,7 +437,7 @@ func (p *CodexProvider) fetchUsageSnapshotOnce(ctx context.Context) (*CodexUsage
 	if channel == nil {
 		return nil, fmt.Errorf("provider not configured")
 	}
-	headers, err := p.getUsageRequestHeaders()
+	headers, err := p.getUsageRequestHeaders(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -358,6 +445,9 @@ func (p *CodexProvider) fetchUsageSnapshotOnce(ctx context.Context) (*CodexUsage
 	httpRequester := p.codexRequester()
 	if httpRequester == nil {
 		return nil, fmt.Errorf("requester is not configured")
+	}
+	if requester.HTTPClient == nil {
+		return nil, fmt.Errorf("HTTP client is not configured")
 	}
 
 	requestURL := p.GetFullRequestURL("/backend-api/wham/usage", "")
@@ -372,7 +462,7 @@ func (p *CodexProvider) fetchUsageSnapshotOnce(ctx context.Context) (*CodexUsage
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, err := io.ReadAll(resp.Body)
+	bodyBytes, err := readCodexUsageResponseBody(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -383,14 +473,15 @@ func (p *CodexProvider) fetchUsageSnapshotOnce(ctx context.Context) (*CodexUsage
 	}
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return snapshot, errors.New(extractUsageErrorMessage(snapshot.Raw, resp.StatusCode))
+		message := extractUsageErrorMessage(snapshot.Raw, resp.StatusCode)
+		return snapshot, errors.New(redactUsageCredentialSecrets(message, p.Credentials))
 	}
 
 	return snapshot, nil
 }
 
-func (p *CodexProvider) getUsageRequestHeaders() (map[string]string, error) {
-	headers, err := p.getRequestHeaderBag()
+func (p *CodexProvider) getUsageRequestHeaders(ctx context.Context) (map[string]string, error) {
+	headers, err := p.getRequestHeaderBagWithContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -404,6 +495,17 @@ func (p *CodexProvider) getUsageRequestHeaders() (map[string]string, error) {
 	return headers.Map(), nil
 }
 
+func readCodexUsageResponseBody(body io.Reader) ([]byte, error) {
+	bodyBytes, err := io.ReadAll(io.LimitReader(body, usageResponseBodyMaxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(bodyBytes) > usageResponseBodyMaxBytes {
+		return nil, fmt.Errorf("%w (limit %d bytes)", errCodexUsageResponseTooLarge, usageResponseBodyMaxBytes)
+	}
+	return bodyBytes, nil
+}
+
 func normalizeUsageSnapshot(channelID int, credentials *OAuth2Credentials, statusCode int, bodyBytes []byte) (*CodexUsageSnapshot, error) {
 	snapshot := &CodexUsageSnapshot{
 		ChannelID:      channelID,
@@ -413,17 +515,25 @@ func normalizeUsageSnapshot(channelID int, credentials *OAuth2Credentials, statu
 	}
 
 	if len(strings.TrimSpace(string(bodyBytes))) == 0 {
+		snapshot.Raw = invalidCodexRawPlaceholder
 		snapshot.Account = normalizeUsageAccount(nil, credentials)
 		return snapshot, fmt.Errorf("empty Codex usage payload")
 	}
 
 	var raw any
+	if !utf8.Valid(bodyBytes) {
+		snapshot.Raw = invalidCodexRawPlaceholder
+		snapshot.Account = normalizeUsageAccount(nil, credentials)
+		return snapshot, fmt.Errorf("failed to decode Codex usage payload: invalid UTF-8")
+	}
 	if err := json.Unmarshal(bodyBytes, &raw); err != nil {
-		snapshot.Raw = string(bodyBytes)
+		snapshot.Raw = invalidCodexRawPlaceholder
 		snapshot.Account = normalizeUsageAccount(nil, credentials)
 		return snapshot, fmt.Errorf("failed to decode Codex usage payload: %w", err)
 	}
-	snapshot.Raw = raw
+	// Raw is admin-visible on request and can also survive normalize failures.
+	// Sanitize at assignment so every subsequent return path is safe.
+	snapshot.Raw = redactUsageCredentialValues(raw, credentials)
 
 	var payload codexWhamUsageResponse
 	if err := json.Unmarshal(bodyBytes, &payload); err != nil {
@@ -441,24 +551,27 @@ func normalizeUsageSnapshot(channelID int, credentials *OAuth2Credentials, statu
 }
 
 func normalizeResetCreditResult(channelID int, statusCode int, bodyBytes []byte) (*CodexResetResult, error) {
-	result := &CodexResetResult{
-		ChannelID:      channelID,
-		Code:           fmt.Sprintf("%d", statusCode),
-		upstreamStatus: statusCode,
-	}
+	return normalizeResetCreditResultWithCredentials(channelID, nil, statusCode, bodyBytes)
+}
+
+func normalizeResetCreditResultWithCredentials(channelID int, _ *OAuth2Credentials, statusCode int, bodyBytes []byte) (*CodexResetResult, error) {
+	result := newMinimalResetCreditResult(channelID, statusCode)
 
 	if len(strings.TrimSpace(string(bodyBytes))) == 0 {
 		return result, fmt.Errorf("empty Codex reset credit payload")
 	}
+	if !utf8.Valid(bodyBytes) {
+		return result, fmt.Errorf("failed to decode Codex reset credit payload: invalid UTF-8")
+	}
 
 	var payload codexResetCreditConsumeResponse
 	if err := json.Unmarshal(bodyBytes, &payload); err != nil {
-		return result, fmt.Errorf("failed to decode Codex reset credit payload: %w", err)
+		return result, fmt.Errorf("failed to normalize Codex reset credit payload: %w", err)
 	}
 
 	result.Code = firstNonEmptyString(payload.Code, result.Code)
 	result.WindowsReset = payload.WindowsReset
-	if statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices && result.WindowsReset == 0 {
+	if isHTTPSuccess(statusCode) && result.WindowsReset == 0 {
 		result.WindowsReset = 1
 	}
 	if payload.Credit != nil {
@@ -476,10 +589,27 @@ func normalizeResetCreditResult(channelID int, statusCode int, bodyBytes []byte)
 	return result, nil
 }
 
+func newMinimalResetCreditResult(channelID, statusCode int) *CodexResetResult {
+	return &CodexResetResult{
+		ChannelID:      channelID,
+		Code:           fmt.Sprintf("%d", statusCode),
+		upstreamStatus: statusCode,
+	}
+}
+
+func isHTTPSuccess(statusCode int) bool {
+	return statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices
+}
+
+const invalidCodexRawPlaceholder = "[omitted: invalid JSON]"
+
 func decodeRawJSON(bodyBytes []byte) any {
+	if !utf8.Valid(bodyBytes) {
+		return invalidCodexRawPlaceholder
+	}
 	var raw any
 	if err := json.Unmarshal(bodyBytes, &raw); err != nil {
-		return string(bodyBytes)
+		return invalidCodexRawPlaceholder
 	}
 	return raw
 }
@@ -694,6 +824,57 @@ func classifyUsageWindow(source string, windowSeconds int64) string {
 	return ""
 }
 
+func redactUsageCredentialSecrets(text string, credentials *OAuth2Credentials) string {
+	clientID := ""
+	if credentials != nil {
+		clientID = credentials.ClientID
+	}
+	return redactTokenRefreshSecrets(text, credentials, clientID)
+}
+
+func isSensitiveCredentialField(key string) bool {
+	// JSON producers vary between snake_case, kebab-case, camelCase and
+	// PascalCase. Compare a separator-free alphanumeric form so all equivalent
+	// spellings receive whole-value redaction.
+	normalized := strings.Map(func(r rune) rune {
+		if !unicode.IsLetter(r) && !unicode.IsNumber(r) {
+			return -1
+		}
+		return unicode.ToLower(r)
+	}, key)
+	switch normalized {
+	case "accesstoken", "refreshtoken", "idtoken", "authorization", "clientsecret", "clientassertion", "apikey", "xapikey", "token":
+		return true
+	default:
+		return false
+	}
+}
+
+func redactUsageCredentialValues(value any, credentials *OAuth2Credentials) any {
+	switch typed := value.(type) {
+	case string:
+		return redactUsageCredentialSecrets(typed, credentials)
+	case []any:
+		for i := range typed {
+			typed[i] = redactUsageCredentialValues(typed[i], credentials)
+		}
+		return typed
+	case map[string]any:
+		redacted := make(map[string]any, len(typed))
+		for key, item := range typed {
+			redactedKey := redactUsageCredentialSecrets(key, credentials)
+			if isSensitiveCredentialField(key) {
+				redacted[redactedKey] = "[redacted]"
+			} else {
+				redacted[redactedKey] = redactUsageCredentialValues(item, credentials)
+			}
+		}
+		return redacted
+	default:
+		return value
+	}
+}
+
 func extractUsageErrorMessage(raw any, statusCode int) string {
 	if rawMap, ok := raw.(map[string]any); ok {
 		if errorMap, ok := rawMap["error"].(map[string]any); ok {
@@ -827,36 +1008,209 @@ func clampUsageRatio(value float64) float64 {
 	return value
 }
 
-func getCachedUsagePreview(channelID int) (CodexUsagePreview, error) {
-	return cache.GetCache[CodexUsagePreview](usagePreviewCacheKey(channelID))
+type codexUsageCacheEntry[T any] struct {
+	Fingerprint string `msgpack:"fingerprint"`
+	Value       T      `msgpack:"value"`
 }
 
-func getCachedUsageSnapshot(channelID int) (CodexUsageSnapshot, error) {
-	return cache.GetCache[CodexUsageSnapshot](usageDetailCacheKey(channelID))
+var setCodexUsageCache = func(ctx context.Context, key string, value any, ttl time.Duration) error {
+	return cache.SetCacheContext(ctx, key, value, ttl)
 }
 
-func cacheUsagePreview(preview *CodexUsagePreview) {
-	if preview == nil || preview.ChannelID <= 0 {
-		return
+func getCachedUsagePreviewForChannel(channel *model.Channel, operationCtx ...context.Context) (CodexUsagePreview, error) {
+	ctx := usageOperationContext(operationCtx)
+	generation, err := usageCacheGeneration(ctx, channel.Id)
+	if err != nil {
+		return CodexUsagePreview{}, err
 	}
-	if err := cache.SetCache(usagePreviewCacheKey(preview.ChannelID), preview, usageCacheTTL); err != nil {
-		logger.SysError(fmt.Sprintf("[Codex] failed to cache usage preview for channel %d: %v", preview.ChannelID, err))
-	}
+	return getCachedUsagePreviewForChannelGenerationContext(ctx, channel, generation)
 }
 
-func cacheUsageSnapshot(snapshot *CodexUsageSnapshot) {
-	if snapshot == nil || snapshot.ChannelID <= 0 {
-		return
-	}
-	if err := cache.SetCache(usageDetailCacheKey(snapshot.ChannelID), cloneCodexUsageSnapshot(snapshot, false), usageCacheTTL); err != nil {
-		logger.SysError(fmt.Sprintf("[Codex] failed to cache usage snapshot for channel %d: %v", snapshot.ChannelID, err))
-	}
+func getCachedUsagePreviewForChannelGeneration(channel *model.Channel, generation string) (CodexUsagePreview, error) {
+	return getCachedUsagePreviewForChannelGenerationContext(context.Background(), channel, generation)
 }
 
-func usagePreviewCacheKey(channelID int) string {
-	return fmt.Sprintf("%s:%d", usagePreviewCacheKeyPrefix, channelID)
+func getCachedUsagePreviewForChannelGenerationContext(ctx context.Context, channel *model.Channel, generation string) (CodexUsagePreview, error) {
+	fingerprint := codexUsageChannelFingerprint(channel)
+	if fingerprint == "" {
+		return CodexUsagePreview{}, cache.CacheNotFound
+	}
+	entry, err := cache.GetCacheContext[codexUsageCacheEntry[CodexUsagePreview]](ctx, usagePreviewCacheKey(channel.Id, generation, fingerprint))
+	if err != nil {
+		return CodexUsagePreview{}, err
+	}
+	if entry.Fingerprint != fingerprint {
+		return CodexUsagePreview{}, cache.CacheNotFound
+	}
+	return entry.Value, nil
 }
 
-func usageDetailCacheKey(channelID int) string {
-	return fmt.Sprintf("%s:%d", usageDetailCacheKeyPrefix, channelID)
+func getCachedUsageSnapshotForChannel(channel *model.Channel, operationCtx ...context.Context) (CodexUsageSnapshot, error) {
+	ctx := usageOperationContext(operationCtx)
+	generation, err := usageCacheGeneration(ctx, channel.Id)
+	if err != nil {
+		return CodexUsageSnapshot{}, err
+	}
+	return getCachedUsageSnapshotForChannelGenerationContext(ctx, channel, generation)
+}
+
+func getCachedUsageSnapshotForChannelGeneration(channel *model.Channel, generation string) (CodexUsageSnapshot, error) {
+	return getCachedUsageSnapshotForChannelGenerationContext(context.Background(), channel, generation)
+}
+
+func getCachedUsageSnapshotForChannelGenerationContext(ctx context.Context, channel *model.Channel, generation string) (CodexUsageSnapshot, error) {
+	fingerprint := codexUsageChannelFingerprint(channel)
+	if fingerprint == "" {
+		return CodexUsageSnapshot{}, cache.CacheNotFound
+	}
+	entry, err := cache.GetCacheContext[codexUsageCacheEntry[CodexUsageSnapshot]](ctx, usageDetailCacheKey(channel.Id, generation, fingerprint))
+	if err != nil {
+		return CodexUsageSnapshot{}, err
+	}
+	if entry.Fingerprint != fingerprint {
+		return CodexUsageSnapshot{}, cache.CacheNotFound
+	}
+	return entry.Value, nil
+}
+
+func cacheUsagePreview(channel *model.Channel, preview *CodexUsagePreview, operationCtx ...context.Context) error {
+	return cacheUsagePreviewWithTTL(channel, preview, usagePreviewCacheTTL, operationCtx...)
+}
+
+func cacheUsagePreviewWithTTL(channel *model.Channel, preview *CodexUsagePreview, ttl time.Duration, operationCtx ...context.Context) error {
+	generation, err := usageCacheGeneration(usageOperationContext(operationCtx), channel.Id)
+	if err != nil {
+		return err
+	}
+	return cacheUsagePreviewForGeneration(usageOperationContext(operationCtx), channel, preview, generation, ttl)
+}
+
+func cacheUsagePreviewForGeneration(ctx context.Context, channel *model.Channel, preview *CodexUsagePreview, generation string, ttl time.Duration) error {
+	if preview == nil {
+		return nil
+	}
+	if channel == nil || channel.Id <= 0 || preview.ChannelID != channel.Id {
+		return fmt.Errorf("usage preview channel does not match cache channel")
+	}
+	if ttl <= 0 {
+		ttl = usagePreviewCacheTTL
+	}
+	fingerprint := codexUsageChannelFingerprint(channel)
+	entry := codexUsageCacheEntry[CodexUsagePreview]{
+		Fingerprint: fingerprint,
+		Value:       *preview,
+	}
+	if err := setCodexUsageCache(ctx, usagePreviewCacheKey(preview.ChannelID, generation, fingerprint), entry, ttl); err != nil {
+		return fmt.Errorf("cache usage preview for channel %d: %w", preview.ChannelID, err)
+	}
+	return nil
+}
+
+func cacheUsageSnapshotWithTTL(channel *model.Channel, snapshot *CodexUsageSnapshot, ttl time.Duration, operationCtx ...context.Context) error {
+	generation, err := usageCacheGeneration(usageOperationContext(operationCtx), channel.Id)
+	if err != nil {
+		return err
+	}
+	return cacheUsageSnapshotForGeneration(usageOperationContext(operationCtx), channel, snapshot, generation, ttl)
+}
+
+func cacheUsageSnapshotForGeneration(ctx context.Context, channel *model.Channel, snapshot *CodexUsageSnapshot, generation string, ttl time.Duration) error {
+	if snapshot == nil {
+		return nil
+	}
+	if channel == nil || channel.Id <= 0 || snapshot.ChannelID != channel.Id {
+		return fmt.Errorf("usage snapshot channel does not match cache channel")
+	}
+	if ttl <= 0 {
+		ttl = usageDetailCacheTTL
+	}
+	fingerprint := codexUsageChannelFingerprint(channel)
+	entry := codexUsageCacheEntry[CodexUsageSnapshot]{
+		Fingerprint: fingerprint,
+		Value:       *cloneCodexUsageSnapshot(snapshot, false),
+	}
+	if err := setCodexUsageCache(ctx, usageDetailCacheKey(snapshot.ChannelID, generation, fingerprint), entry, ttl); err != nil {
+		return fmt.Errorf("cache usage snapshot for channel %d: %w", snapshot.ChannelID, err)
+	}
+	return nil
+}
+
+func codexUsageChannelFingerprint(channel *model.Channel) string {
+	if channel == nil || channel.Id <= 0 {
+		return ""
+	}
+	// Key isolates credential rotations; CreatedTime distinguishes a deleted and
+	// recreated row that reused the same numeric ID and configuration. Only the
+	// digest becomes part of the cache key, never the raw credential.
+	payload := struct {
+		ID           int    `json:"id"`
+		CreatedTime  int64  `json:"created_time"`
+		Type         int    `json:"type"`
+		Status       int    `json:"status"`
+		Key          string `json:"key"`
+		BaseURL      string `json:"base_url"`
+		Proxy        string `json:"proxy"`
+		Other        string `json:"other"`
+		ModelHeaders string `json:"model_headers"`
+	}{
+		ID:           channel.Id,
+		CreatedTime:  channel.CreatedTime,
+		Type:         channel.Type,
+		Status:       channel.Status,
+		Key:          channel.Key,
+		BaseURL:      usageCachePointerValue(channel.BaseURL),
+		Proxy:        usageCachePointerValue(channel.Proxy),
+		Other:        channel.Other,
+		ModelHeaders: usageCachePointerValue(channel.ModelHeaders),
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	digest := sha256.Sum256(encoded)
+	return fmt.Sprintf("%x", digest[:])
+}
+
+func usageCachePointerValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+func usageOperationContext(contexts []context.Context) context.Context {
+	if len(contexts) > 0 && contexts[0] != nil {
+		return contexts[0]
+	}
+	return context.Background()
+}
+
+var usageCacheGeneration = func(ctx context.Context, channelID int) (string, error) {
+	return cache.GetOrInitCodexUsageGenerationContext(ctx, channelID)
+}
+
+func RotateUsageCacheGeneration(channelID int) error {
+	return cache.RotateCodexUsageGeneration(channelID)
+}
+
+// ClearUsageCacheForChannel is retained for callers that need invalidation; a
+// generation rotation invalidates every credential fingerprint, including writes
+// still in flight on another instance.
+func ClearUsageCacheForChannel(channel *model.Channel) error {
+	if channel == nil {
+		return nil
+	}
+	return RotateUsageCacheGeneration(channel.Id)
+}
+
+func usageGenerationKey(channelID int) string {
+	return fmt.Sprintf("%s:%d", cache.CodexUsageGenerationKeyPrefix, channelID)
+}
+
+func usagePreviewCacheKey(channelID int, generation, fingerprint string) string {
+	return fmt.Sprintf("%s:%d:%s:%s", usagePreviewCacheKeyPrefix, channelID, generation, fingerprint)
+}
+
+func usageDetailCacheKey(channelID int, generation, fingerprint string) string {
+	return fmt.Sprintf("%s:%d:%s:%s", usageDetailCacheKeyPrefix, channelID, generation, fingerprint)
 }

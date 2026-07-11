@@ -188,6 +188,7 @@ func SetApiRouter(router *gin.Engine) {
 			codexRoute.POST("/auth-files/parse", controller.ParseCodexAuthFile)
 			codexRoute.POST("/auth-files/import", controller.ImportCodexAuthFiles)
 			codexRoute.GET("/oauth/refresh/status", controller.GetCodexAutoRefreshStatus)
+			codexRoute.GET("/usage/refresh/status", controller.GetCodexUsageAutoRefreshStatus)
 		}
 		channelTagRoute := apiRouter.Group("/channel_tag")
 		channelTagRoute.Use(middleware.AdminAuth())

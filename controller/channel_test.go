@@ -215,6 +215,37 @@ func TestUpdateChannelCanonicalizesCodexLegacyRequiredWebsocketMode(t *testing.T
 	}
 }
 
+func TestUpdateChannelPartialResponseContainsCompletePersistedChannel(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	useControllerChannelTagTestDB(t)
+
+	fixture := &model.Channel{
+		Id: 1, Type: config.ChannelTypeOpenAI, Name: "before", Key: "persisted-key",
+		Group: "persisted-group", Models: "gpt-old,gpt-stable",
+	}
+	if err := model.DB.Create(fixture).Error; err != nil {
+		t.Fatalf("create channel fixture: %v", err)
+	}
+	ctx, recorder := commonTest.GetContext(http.MethodPut, "/api/channel/", commonTest.RequestJSONConfig(), bytes.NewBufferString(`{"id":1,"name":"after"}`))
+
+	UpdateChannel(ctx)
+
+	var response struct {
+		Success bool          `json:"success"`
+		Message string        `json:"message"`
+		Data    model.Channel `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !response.Success {
+		t.Fatalf("partial update failed: %s", recorder.Body.String())
+	}
+	if response.Data.Name != "after" || response.Data.Models != fixture.Models || response.Data.Group != fixture.Group || response.Data.Key != fixture.Key {
+		t.Fatalf("partial response omitted persisted fields: %#v", response.Data)
+	}
+}
+
 func TestUpdateChannelOmittedOtherPreservesAzureRequiredOther(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	useControllerChannelTagTestDB(t)

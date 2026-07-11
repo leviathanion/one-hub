@@ -141,11 +141,51 @@ func TestOAuth2CredentialsRefreshDoesNotSetUserAgentOrOriginator(t *testing.T) {
 	}))
 
 	creds := &OAuth2Credentials{RefreshToken: "refresh-token"}
-	if err := creds.Refresh(context.Background(), "", 0); err != nil {
+	if err := creds.Refresh(context.Background(), ""); err != nil {
 		t.Fatalf("expected refresh to succeed, got %v", err)
 	}
 	if creds.AccessToken != "new-access-token" || creds.RefreshToken != "new-refresh-token" {
 		t.Fatalf("expected credentials to be updated, got %+v", creds)
+	}
+}
+
+func TestOAuth2CredentialsRefreshNeverRetriesAmbiguousSuccessfulExchange(t *testing.T) {
+	requests := 0
+	withTokenEndpointTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"access_token":`))
+	}))
+
+	creds := &OAuth2Credentials{AccessToken: "old-access", RefreshToken: "one-time-refresh"}
+	err := creds.Refresh(context.Background(), "")
+	if err == nil || !strings.Contains(err.Error(), "response was unusable") {
+		t.Fatalf("expected unusable committed response classification, got %v", err)
+	}
+	if !errors.Is(err, ErrOAuthRefreshOutcomeAmbiguous) {
+		t.Fatalf("ambiguous result lost errors.Is classification: %v", err)
+	}
+	if requests != 1 {
+		t.Fatalf("ambiguous OAuth exchange was retried %d times", requests)
+	}
+	if creds.AccessToken != "old-access" || creds.RefreshToken != "one-time-refresh" {
+		t.Fatalf("unusable response mutated active credentials: %+v", creds)
+	}
+}
+
+func TestOAuth2CredentialsRefreshBoundsAmbiguousSuccessResponse(t *testing.T) {
+	withTokenEndpointTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(strings.Repeat("x", tokenRefreshResponseBodyMaxBytes+1)))
+	}))
+
+	creds := &OAuth2Credentials{AccessToken: "old-access", RefreshToken: "one-time-refresh"}
+	err := creds.Refresh(context.Background(), "")
+	if !errors.Is(err, ErrOAuthRefreshOutcomeAmbiguous) {
+		t.Fatalf("oversized success lost ambiguous classification: %v", err)
+	}
+	if creds.AccessToken != "old-access" {
+		t.Fatalf("oversized response mutated credentials: %+v", creds)
 	}
 }
 
@@ -160,7 +200,7 @@ func TestOAuth2CredentialsRefreshRedactsNonJSONErrorResponse(t *testing.T) {
 		RefreshToken: "refresh-secret",
 		ClientID:     "client-secret",
 	}
-	err := creds.Refresh(context.Background(), "", 0)
+	err := creds.Refresh(context.Background(), "")
 	if err == nil {
 		t.Fatal("expected refresh failure")
 	}
@@ -182,7 +222,7 @@ func TestOAuth2CredentialsRefreshPreservesJSONOAuthErrorDetail(t *testing.T) {
 	}))
 
 	creds := &OAuth2Credentials{RefreshToken: "refresh-token"}
-	err := creds.Refresh(context.Background(), "", 0)
+	err := creds.Refresh(context.Background(), "")
 	if err == nil {
 		t.Fatal("expected refresh failure")
 	}

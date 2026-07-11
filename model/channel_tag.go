@@ -2,6 +2,7 @@ package model
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"one-api/common/config"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
@@ -24,6 +26,61 @@ import (
 const channelTagConfigSyncTag = "sync"
 
 type ChannelTagSubmittedFields map[string]struct{}
+
+type channelTagMutationLockEntry struct {
+	semaphore chan struct{}
+	refs      int
+}
+
+var channelTagMutationLocks = struct {
+	sync.Mutex
+	entries map[string]*channelTagMutationLockEntry
+}{entries: make(map[string]*channelTagMutationLockEntry)}
+
+// lockChannelTagMutation serializes a tag's snapshot, commit, and in-process
+// side effects. It deliberately does not pretend to coordinate multiple masters:
+// that would require a database/advisory lock. The supported master/slave
+// deployment has one mutation master, so adding schema solely for that case is
+// not justified.
+func lockChannelTagMutation(ctx context.Context, tag string) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	channelTagMutationLocks.Lock()
+	entry := channelTagMutationLocks.entries[tag]
+	if entry == nil {
+		entry = &channelTagMutationLockEntry{semaphore: make(chan struct{}, 1)}
+		entry.semaphore <- struct{}{}
+		channelTagMutationLocks.entries[tag] = entry
+	}
+	entry.refs++
+	channelTagMutationLocks.Unlock()
+
+	select {
+	case <-ctx.Done():
+		channelTagMutationLocks.Lock()
+		entry.refs--
+		if entry.refs == 0 {
+			delete(channelTagMutationLocks.entries, tag)
+		}
+		channelTagMutationLocks.Unlock()
+		return nil, ctx.Err()
+	case <-entry.semaphore:
+	}
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			entry.semaphore <- struct{}{}
+			channelTagMutationLocks.Lock()
+			entry.refs--
+			if entry.refs == 0 {
+				delete(channelTagMutationLocks.entries, tag)
+			}
+			channelTagMutationLocks.Unlock()
+		})
+	}, nil
+}
 
 type SearchChannelsTagParams struct {
 	Tag string `json:"tag" form:"tag"`
@@ -267,6 +324,15 @@ func UpdateChannelsTag(tag string, channel *Channel) error {
 }
 
 func UpdateChannelsTagWithSubmittedFields(tag string, channel *Channel, submittedFields ChannelTagSubmittedFields) error {
+	unlock, err := lockChannelTagMutation(context.Background(), tag)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return updateChannelsTagWithSubmittedFieldsLocked(tag, channel, submittedFields)
+}
+
+func updateChannelsTagWithSubmittedFieldsLocked(tag string, channel *Channel, submittedFields ChannelTagSubmittedFields) error {
 	channelTag, err := GetChannelsTag(tag)
 	if err != nil {
 		return err
@@ -350,12 +416,35 @@ func UpdateChannelsTagWithSubmittedFields(tag string, channel *Channel, submitte
 	}
 
 	tx := DB.Begin()
-	// 先处理要删除的数据
+	if tx.Error != nil {
+		return tx.Error
+	}
+	// Membership is a fixed snapshot for this operation. Every destructive or
+	// config statement also checks the current tag, so a snapshotted member moved
+	// out concurrently is untouched, while a row moved in is never adopted by this
+	// batch. New members receive config only through buildChannelTagMember above.
+	var deletedCandidates []Channel
 	if len(delIds) > 0 {
-		err = tx.Where("id IN (?)", delIds).Delete(&Channel{}).Error
-		if err != nil {
+		if err = tx.Model(&Channel{}).Select("id", "type").Where("id IN (?) AND tag = ?", delIds, tag).Find(&deletedCandidates).Error; err != nil {
 			tx.Rollback()
 			return err
+		}
+		if err = tx.Model(&Channel{}).Where("id IN (?) AND tag = ?", delIds, tag).UpdateColumn("credential_revision", gorm.Expr("credential_revision + 1")).Error; err != nil {
+			tx.Rollback()
+			return err
+		}
+		result := tx.Where("id IN (?) AND tag = ?", delIds, tag).Delete(&Channel{})
+		if err = result.Error; err != nil {
+			tx.Rollback()
+			return err
+		}
+		candidateIDs := channelIDsFromRows(deletedCandidates)
+		deletedCandidates = nil
+		if len(candidateIDs) > 0 {
+			if err = tx.Unscoped().Model(&Channel{}).Select("id", "type").Where("id IN (?) AND deleted_at IS NOT NULL", candidateIDs).Find(&deletedCandidates).Error; err != nil {
+				tx.Rollback()
+				return err
+			}
 		}
 	}
 
@@ -369,11 +458,25 @@ func UpdateChannelsTagWithSubmittedFields(tag string, channel *Channel, submitte
 	}
 
 	updateValues := channelTagConfigUpdateValues(channel, configFields)
-	if len(updateValues) > 0 {
-		err = tx.Model(Channel{}).Where("tag = ?", tag).Updates(updateValues).Error
-		if err != nil {
+	var configCandidates []Channel
+	if len(updateValues) > 0 && len(existingMemberIDs) > 0 {
+		candidateScope := tx.Model(&Channel{}).Where("id IN (?) AND tag = ?", existingMemberIDs, tag)
+		if err = candidateScope.Select("id", "type").Find(&configCandidates).Error; err != nil {
 			tx.Rollback()
 			return err
+		}
+		candidateIDs := channelIDsFromRows(configCandidates)
+		if len(candidateIDs) > 0 {
+			result := tx.Model(Channel{}).Where("id IN (?) AND tag = ?", candidateIDs, tag).Updates(updateValues)
+			if err = result.Error; err != nil {
+				tx.Rollback()
+				return err
+			}
+			// Keep the pre-update candidates for post-commit invalidation. The UPDATE
+			// itself may rename the tag, so filtering by the old tag afterward would
+			// drop every durably changed row. Conservatively invalidating a candidate
+			// skipped by a concurrent move costs one cache clear and immediate reload;
+			// omitting an updated row can leave the old route live indefinitely.
 		}
 	}
 
@@ -381,11 +484,17 @@ func UpdateChannelsTagWithSubmittedFields(tag string, channel *Channel, submitte
 		return err
 	}
 
-	if channel.Type == config.ChannelTypeCodex {
-		ClearChannelCodexDerivedCaches(existingMemberIDs)
+	if len(deletedCandidates) == 0 && len(configCandidates) == 0 && len(addChannels) == 0 {
+		return nil
 	}
-
-	refreshChannelGroupAfterMutation("update channel tag", delIds)
+	affectedIDs := append(channelIDsFromRows(deletedCandidates), channelIDsFromRows(configCandidates)...)
+	codexIDs := append(codexChannelIDsFromRows(deletedCandidates), codexChannelIDsFromRows(configCandidates)...)
+	for i := range addChannels {
+		if addChannels[i].Type == config.ChannelTypeCodex {
+			codexIDs = append(codexIDs, addChannels[i].Id)
+		}
+	}
+	finishChannelRouteMutation("update channel tag", affectedIDs, codexIDs)
 	return nil
 }
 
@@ -402,6 +511,15 @@ func AddChannelToTag(tag string, channel *Channel) (*Channel, error) {
 	if strings.TrimSpace(tag) == "" {
 		return nil, errors.New("tag is required")
 	}
+	unlock, err := lockChannelTagMutation(context.Background(), tag)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	return addChannelToTagLocked(tag, channel)
+}
+
+func addChannelToTagLocked(tag string, channel *Channel) (*Channel, error) {
 	if channel == nil {
 		return nil, errors.New("channel is required")
 	}
@@ -436,10 +554,11 @@ func AddChannelToTag(tag string, channel *Channel) (*Channel, error) {
 		return nil, err
 	}
 
+	codexIDs := []int(nil)
 	if newChannel.Type == config.ChannelTypeCodex {
-		ClearChannelCodexDerivedCache(newChannel.Id)
+		codexIDs = []int{newChannel.Id}
 	}
-	refreshChannelGroupAfterMutation("add channel to tag", nil)
+	finishChannelRouteMutation("add channel to tag", nil, codexIDs)
 	return &newChannel, nil
 }
 
@@ -447,8 +566,13 @@ func DeleteChannelsTag(tag string, delDisabled bool) error {
 	if tag == "" {
 		return nil
 	}
+	unlock, err := lockChannelTagMutation(context.Background(), tag)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
-	_, err := deleteChannelsMatching(func(db *gorm.DB) *gorm.DB {
+	_, err = deleteChannelsMatching(func(db *gorm.DB) *gorm.DB {
 		if delDisabled {
 			db = db.Where("(status = ? or status = ?)", config.ChannelStatusAutoDisabled, config.ChannelStatusManuallyDisabled)
 		}
@@ -458,38 +582,146 @@ func DeleteChannelsTag(tag string, delDisabled bool) error {
 }
 
 func ChangeChannelsTagStatus(tag string, status int) error {
+	return ChangeChannelsTagStatusWithContext(context.Background(), tag, status)
+}
+
+func ChangeChannelsTagStatusWithContext(ctx context.Context, tag string, status int) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if tag == "" {
 		return nil
 	}
-
-	var failClosedChannelIDs []int
-	if status != config.ChannelStatusEnabled {
-		// Batch disabling a tag is a lifecycle change, so collect IDs before the
-		// update and fail-close them after commit. Batch enabling intentionally does
-		// not locally patch routing indexes; it converges through Load() to keep one
-		// source of truth for Rule/Match/ModelGroup construction.
-		var channels []Channel
-		if err := DB.Select("id").Where("tag = ?", tag).Find(&channels).Error; err != nil {
-			return err
-		}
-		failClosedChannelIDs = channelIDsFromRows(channels)
-	}
-
-	err := DB.Model(&Channel{}).Where("tag = ?", tag).Update("status", status).Error
+	unlock, err := lockChannelTagMutation(ctx, tag)
 	if err != nil {
 		return err
 	}
+	defer unlock()
 
-	refreshChannelGroupAfterMutation("change channel tag status", failClosedChannelIDs)
+	// Snapshot candidate IDs and their old statuses, then express all per-row
+	// compare-and-swaps as one UPDATE. The tag predicate protects rows moved out
+	// of the tag; pairing IDs with their observed status protects a concurrent
+	// status change. Rows added to the tag after the snapshot are not candidates.
+	var changed []Channel
+	err = DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var candidates []Channel
+		if err := tx.Select("id", "type", "status").Where("tag = ? AND status <> ?", tag, status).Find(&candidates).Error; err != nil {
+			return err
+		}
+		if len(candidates) == 0 {
+			return ctx.Err()
+		}
+
+		candidateIDs := make([]int, 0, len(candidates))
+		idsByStatus := make(map[int][]int)
+		for _, channel := range candidates {
+			candidateIDs = append(candidateIDs, channel.Id)
+			idsByStatus[channel.Status] = append(idsByStatus[channel.Status], channel.Id)
+		}
+
+		var statusGuard *gorm.DB
+		for oldStatus, ids := range idsByStatus {
+			condition := tx.Where("id IN ? AND status = ?", ids, oldStatus)
+			if statusGuard == nil {
+				statusGuard = condition
+			} else {
+				statusGuard = statusGuard.Or(condition)
+			}
+		}
+		result := tx.Model(&Channel{}).
+			Where("tag = ? AND status <> ?", tag, status).
+			Where(statusGuard).
+			Update("status", status)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return ctx.Err()
+		}
+
+		// This post-update set is exact for our serialized transaction and safely
+		// conservative if another writer independently reached the same target.
+		// It drives side effects only after the transaction commits.
+		if err := tx.Select("id", "type", "status").
+			Where("id IN ? AND tag = ? AND status = ?", candidateIDs, tag, status).
+			Find(&changed).Error; err != nil {
+			return err
+		}
+		return ctx.Err()
+	})
+	if err != nil {
+		return err
+	}
+	if len(changed) == 0 {
+		return nil
+	}
+
+	changedIDs := channelIDsFromRows(changed)
+	codexIDs := codexChannelIDsFromRows(changed)
+	// Enabled rows are normally absent, but fail-close is harmless and preserves
+	// one ordering invariant for every durable status transition.
+	finishChannelRouteMutation("change channel tag status", changedIDs, codexIDs)
 	return nil
 }
 
 func UpdateChannelsTagPriority(tag string, value int) error {
-	err := DB.Model(&Channel{}).Where("tag = ?", tag).Update("priority", value).Error
+	return UpdateChannelsTagPriorityWithContext(context.Background(), tag, value)
+}
+
+func UpdateChannelsTagPriorityWithContext(ctx context.Context, tag string, value int) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if tag == "" {
+		return nil
+	}
+	unlock, err := lockChannelTagMutation(ctx, tag)
 	if err != nil {
 		return err
 	}
+	defer unlock()
 
-	refreshChannelGroupAfterMutation("update channel tag priority", nil)
+	// Membership is snapshotted inside the transaction. Keeping both the ID set
+	// and current tag in the UPDATE means a row concurrently moved out is not
+	// modified, while a row moved into the tag is deferred to a later request.
+	var changed []Channel
+	err = DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var candidates []Channel
+		if err := tx.Select("id").Where("tag = ? AND (priority IS NULL OR priority <> ?)", tag, value).Find(&candidates).Error; err != nil {
+			return err
+		}
+		if len(candidates) == 0 {
+			return ctx.Err()
+		}
+
+		candidateIDs := channelIDsFromRows(candidates)
+		result := tx.Model(&Channel{}).
+			Where("id IN ? AND tag = ? AND (priority IS NULL OR priority <> ?)", candidateIDs, tag, value).
+			Update("priority", value)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return ctx.Err()
+		}
+
+		// Re-reading the candidate set confirms rows still in the tag. This is
+		// exact for serialized writes and conservatively includes a candidate if
+		// another writer independently reached the same priority.
+		if err := tx.Select("id").
+			Where("id IN ? AND tag = ? AND priority = ?", candidateIDs, tag, value).
+			Find(&changed).Error; err != nil {
+			return err
+		}
+		return ctx.Err()
+	})
+	if err != nil {
+		return err
+	}
+	if len(changed) == 0 {
+		return nil
+	}
+
+	refreshChannelGroupAfterMutation("update channel tag priority", channelIDsFromRows(changed))
 	return nil
 }

@@ -51,3 +51,65 @@ func TestRedactSensitiveTextRedactsCommonCredentialAndDiagnosticShapes(t *testin
 		}
 	}
 }
+
+func TestRedactSensitiveTextRedactsFullAuthorizationAndCamelCaseTokens(t *testing.T) {
+	input := "safe Authorization: Bearer standard-secret; accessToken=camel-secret, RefreshToken=pascal-secret"
+	got := RedactSensitiveText(input)
+	for _, forbidden := range []string{"standard-secret", "camel-secret", "pascal-secret"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("expected %q to be redacted from %q", forbidden, got)
+		}
+	}
+	if !strings.Contains(got, "safe") {
+		t.Fatalf("safe diagnostic text was removed: %q", got)
+	}
+}
+
+func TestRedactSensitiveTextScansEscapedAndEmbeddedQuotedValues(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		forbidden []string
+	}{
+		{
+			name:      "escaped JSON quote",
+			input:     `prefix {"access_token":"secret-part\\\"secret-tail","detail":"safe-tail"}`,
+			forbidden: []string{"secret-part", "secret-tail"},
+		},
+		{
+			name:      "JSON embedded in text",
+			input:     `outer="{\"access_token\":\"nested-secret\\\"nested-tail\",\"detail\":\"visible-tail\"}"`,
+			forbidden: []string{"nested-secret", "nested-tail"},
+		},
+		{
+			name:      "quoted authorization",
+			input:     `safe Authorization="Bearer quoted-secret" suffix-visible`,
+			forbidden: []string{"quoted-secret", "Bearer"},
+		},
+		{
+			name:      "single quoted camel case token",
+			input:     `safe accessToken='single-secret' suffix-visible`,
+			forbidden: []string{"single-secret"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := RedactSensitiveText(tt.input)
+			for _, forbidden := range tt.forbidden {
+				if strings.Contains(got, forbidden) {
+					t.Fatalf("sensitive quoted content %q leaked from %q", forbidden, got)
+				}
+			}
+		})
+	}
+}
+
+func TestRedactSensitiveTextRedactsRemainderOfMalformedSensitiveQuote(t *testing.T) {
+	got := RedactSensitiveText(`safe-prefix accessToken='unterminated-secret trailing-secret`)
+	if strings.Contains(got, "unterminated-secret") || strings.Contains(got, "trailing-secret") {
+		t.Fatalf("unterminated sensitive value leaked: %q", got)
+	}
+	if !strings.Contains(got, "safe-prefix") || !strings.Contains(got, "[redacted]") {
+		t.Fatalf("expected safe prefix and redaction marker, got %q", got)
+	}
+}

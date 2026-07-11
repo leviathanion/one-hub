@@ -65,22 +65,6 @@ func TestChannelsChooserFilterHelpersAndCooldownLifecycle(t *testing.T) {
 		t.Fatal("expected expired cooldown to be removed")
 	}
 
-	chooser.Disable(1)
-	if !chooser.Channels[1].Disable {
-		t.Fatal("expected Disable to mark channel disabled")
-	}
-	chooser.Enable(1)
-	if chooser.Channels[1].Disable {
-		t.Fatal("expected Enable to re-enable channel")
-	}
-	chooser.ChangeStatus(1, false)
-	if !chooser.Channels[1].Disable {
-		t.Fatal("expected ChangeStatus(false) to disable")
-	}
-	chooser.ChangeStatus(1, true)
-	if chooser.Channels[1].Disable {
-		t.Fatal("expected ChangeStatus(true) to enable")
-	}
 }
 
 func TestChannelsChooserModelHasChannel(t *testing.T) {

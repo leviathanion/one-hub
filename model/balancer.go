@@ -20,6 +20,27 @@ type ChannelChoice struct {
 	Disable       bool
 }
 
+// ChannelsChooser owns one process-local, immutable-at-publication routing
+// snapshot. Route mutations follow one protocol:
+//
+//  1. Commit durable state.
+//  2. Quarantine affected IDs in the current snapshot and mark it dirty.
+//  3. Build a complete replacement from the database.
+//  4. Publish it only if no newer quarantine happened while it was building.
+//
+// Only step 4 may make a quarantined channel selectable again. Do not add an
+// incremental refresh/enable path: it cannot know whether a concurrent mutation
+// has finished publishing all of its groups, models, status and credentials.
+// Cache invalidation is unrelated garbage collection and must never gate routing
+// publication.
+//
+// Trade-offs: every route mutation pays for an O(enabled channels) rebuild, and
+// an affected channel remains unavailable while the DB cannot produce a complete
+// snapshot. In return there is one publication primitive and no partially mixed
+// routing state to reason about. Requests that selected a channel before the
+// quarantine may finish; this protocol governs new selections, not revocation of
+// already-bound work. Cross-node visibility remains eventually consistent through
+// the database; stronger global cutover would require a distributed coordinator.
 type ChannelsChooser struct {
 	sync.RWMutex
 	// Serialize DB snapshot/build/publish so an older reload cannot overwrite a
@@ -140,26 +161,6 @@ func (cc *ChannelsChooser) CleanupExpiredCooldowns() {
 	})
 }
 
-func (cc *ChannelsChooser) Disable(channelId int) {
-	cc.Lock()
-	defer cc.Unlock()
-	if _, ok := cc.Channels[channelId]; !ok {
-		return
-	}
-
-	cc.Channels[channelId].Disable = true
-}
-
-func (cc *ChannelsChooser) Enable(channelId int) {
-	cc.Lock()
-	defer cc.Unlock()
-	if _, ok := cc.Channels[channelId]; !ok {
-		return
-	}
-
-	cc.Channels[channelId].Disable = false
-}
-
 func (cc *ChannelsChooser) failClosedChannels(channelIds []int) {
 	if len(channelIds) == 0 {
 		return
@@ -184,15 +185,11 @@ func (cc *ChannelsChooser) failClosedChannels(channelIds []int) {
 			choice.Disable = true
 		}
 	}
+	// A quarantine is monotonic: only a successful full Load may clear it by
+	// replacing the complete routing snapshot. Marking the chooser dirty here also
+	// gives failed post-commit reloads a deterministic recovery path on the next
+	// routing read.
 	cc.markDirty()
-}
-
-func (cc *ChannelsChooser) ChangeStatus(channelId int, status bool) {
-	if status {
-		cc.Enable(channelId)
-	} else {
-		cc.Disable(channelId)
-	}
 }
 
 func (cc *ChannelsChooser) balancer(channelIds []int, filters []ChannelsFilterFunc, modelName string) *Channel {
@@ -423,6 +420,10 @@ func (cc *ChannelsChooser) GetChannel(channelId int) *Channel {
 	cc.RLock()
 	defer cc.RUnlock()
 
+	// This is an identity/metadata lookup for work that is already bound to a
+	// channel (for example asynchronous task callbacks), not a route-eligibility
+	// decision. It intentionally returns quarantined entries. New work must use
+	// Next/NextWithPreferred, which honor ChannelChoice.Disable.
 	if choice, ok := cc.Channels[channelId]; ok {
 		return choice.Channel
 	}
@@ -445,31 +446,9 @@ func normalizeChannelForChooser(channel *Channel) error {
 	if channel.Weight == nil || *channel.Weight == 0 {
 		channel.Weight = &config.DefaultChannelWeight
 	}
-	return nil
-}
-
-func (cc *ChannelsChooser) RefreshChannel(channelID int) error {
-	if channelID <= 0 {
-		return nil
-	}
-
-	channel, err := loadChannelByIDForChannelGroupRefresh(channelID)
-	if err != nil {
-		return err
-	}
-	if err := normalizeChannelForChooser(channel); err != nil {
-		cc.failClosedChannels([]int{channelID})
-		return err
-	}
-
-	cc.Lock()
-	defer cc.Unlock()
-
-	if cc.Channels == nil {
-		return nil
-	}
-	if choice, ok := cc.Channels[channelID]; ok && choice != nil {
-		choice.Channel = channel
+	if channel.Priority == nil {
+		priority := int64(0)
+		channel.Priority = &priority
 	}
 	return nil
 }

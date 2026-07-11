@@ -241,6 +241,49 @@ func TestConsumeCodexResetCreditAllowsTaggedChannelsAndClearsCache(t *testing.T)
 	}
 }
 
+func TestConsumeCodexResetCreditReportsCacheFailureAsWarningAfterUpstreamSuccess(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cache.InitCacheManager()
+	channelID := 8
+	if err := cache.SetCache("codex:usage:preview:8", "legacy", time.Minute); err != nil {
+		t.Fatalf("failed to seed legacy cache: %v", err)
+	}
+
+	originalLoad := loadCodexUsageChannelByID
+	originalCreate := createCodexUsageProvider
+	originalClear := clearCodexUsageCacheForChannel
+	loadCodexUsageChannelByID = func(int) (*model.Channel, error) {
+		return &model.Channel{Id: channelID, Type: config.ChannelTypeCodex, Key: "credentials"}, nil
+	}
+	createCodexUsageProvider = func(*model.Channel) (codexUsageProvider, error) {
+		return &fakeCodexUsageProvider{resetResult: &codex.CodexResetResult{ChannelID: channelID, WindowsReset: 1}}, nil
+	}
+	clearCodexUsageCacheForChannel = func(*model.Channel) error { return errors.New("cache unavailable") }
+	t.Cleanup(func() {
+		loadCodexUsageChannelByID = originalLoad
+		createCodexUsageProvider = originalCreate
+		clearCodexUsageCacheForChannel = originalClear
+	})
+
+	ctx, recorder := commonTest.GetContext(http.MethodPost, "/api/channel/8/codex/reset-credit", commonTest.RequestJSONConfig(), nil)
+	ctx.Params = gin.Params{{Key: "id", Value: "8"}}
+	ConsumeCodexResetCredit(ctx)
+
+	var response struct {
+		Success bool   `json:"success"`
+		Warning string `json:"warning"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if !response.Success || !strings.Contains(response.Warning, "cache unavailable") {
+		t.Fatalf("irreversible upstream success must remain successful with warning, body=%s", recorder.Body.String())
+	}
+	if _, err := cache.GetCache[string]("codex:usage:preview:8"); !errors.Is(err, cache.CacheNotFound) {
+		t.Fatalf("legacy cleanup must still execute after v2 failure, got %v", err)
+	}
+}
+
 func TestConsumeCodexResetCreditRejectsInvalidChannels(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

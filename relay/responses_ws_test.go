@@ -3228,9 +3228,8 @@ func TestOpenAndPrimeResponsesWSCodexTokenInvalidatedFallsBack(t *testing.T) {
 	fallback := newRelayTestCodexChannel(fallbackChannelID)
 	fallback.BaseURL = &fallbackBaseURL
 	fallback.Other = `{"websocket_mode":"force","responses_ws_self_hosted":true}`
-	channelGroup := buildRealtimeTestChannelGroupForChannels(failed, fallback)
-	channelGroup.Rule["default"]["gpt-5"] = [][]int{{failedChannelID}, {fallbackChannelID}}
-	model.ChannelGroup = channelGroup
+	model.ChannelGroup = buildRealtimeTestChannelGroupForChannels(failed, fallback)
+	model.ChannelGroup.Rule["default"]["gpt-5"] = [][]int{{failedChannelID}, {fallbackChannelID}}
 
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)

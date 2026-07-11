@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -92,6 +93,16 @@ func ImportCodexAuthFiles(c *gin.Context) {
 	if err := model.BatchInsertChannels(channels); err != nil {
 		common.APIRespondWithError(c, http.StatusOK, err)
 		return
+	}
+
+	importedCodexChannels := codex.LimitImmediateUsageWarmup(codex.ChannelsForUsageRefresh(channels))
+	if len(importedCodexChannels) > 0 {
+		if release, acquired := codex.TryAcquireUsageWarmupBatch(); acquired {
+			common.SafeGoroutine(func() {
+				defer release()
+				codex.RefreshUsageSnapshotsForChannelsWithTimeout(context.Background(), importedCodexChannels)
+			})
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{

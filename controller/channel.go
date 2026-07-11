@@ -276,7 +276,7 @@ func BatchDelModelChannels(c *gin.Context) {
 	}
 
 	var count int64
-	count, err = model.BatchDelModelChannels(&params)
+	count, err = model.BatchDelModelChannelsWithContext(c.Request.Context(), &params)
 	if err != nil {
 		common.APIRespondWithError(c, http.StatusOK, err)
 		return

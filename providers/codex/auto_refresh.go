@@ -21,7 +21,10 @@ const (
 	AutoRefreshTimeout  = 10 * time.Minute
 )
 
-var autoRefreshMu sync.Mutex
+var (
+	autoRefreshMu          sync.Mutex
+	scheduledMaintenanceMu sync.Mutex
+)
 
 type AutoRefreshStatus struct {
 	Running        bool               `json:"running"`
@@ -42,6 +45,12 @@ var (
 		IntervalSec: int64(AutoRefreshInterval / time.Second),
 		LeadSec:     int64(AutoRefreshLead / time.Second),
 	}
+	loadAutoRefreshChannels = func(ctx context.Context) ([]*model.Channel, error) {
+		return model.GetChannelsByTypeAndStatusWithContext(ctx, config.ChannelTypeCodex, config.ChannelStatusEnabled)
+	}
+	runScheduledOAuthRefresh = RunAutoRefreshWithTimeout
+	runScheduledUsageRefresh = RunUsageAutoRefreshWithTimeout
+	autoRefreshCursor        codexChannelCursor
 
 	autoRefreshRunsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
@@ -116,8 +125,24 @@ func RunAutoRefreshWithTimeout(parent context.Context) AutoRefreshSummary {
 	return RefreshChannelsInBackground(ctx)
 }
 
+// RunScheduledMaintenance refreshes OAuth credentials before warming usage.
+// The individual runners retain their own status, timeout, and manual entry point.
+func RunScheduledMaintenance(parent context.Context) {
+	if !scheduledMaintenanceMu.TryLock() {
+		logger.SysLog("[Codex] scheduled maintenance is already running, skip this round")
+		return
+	}
+	defer scheduledMaintenanceMu.Unlock()
+
+	runScheduledOAuthRefresh(parent)
+	runScheduledUsageRefresh(parent)
+}
+
 // RefreshChannelsInBackground proactively refreshes eligible Codex OAuth channels.
 func RefreshChannelsInBackground(ctx context.Context) AutoRefreshSummary {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if !autoRefreshMu.TryLock() {
 		logger.SysLog("[Codex] auto refresh is already running, skip this round")
 		return AutoRefreshSummary{}
@@ -130,56 +155,47 @@ func RefreshChannelsInBackground(ctx context.Context) AutoRefreshSummary {
 		autoRefreshRunningGauge.Set(0)
 	}()
 
-	channels, err := model.GetChannelsByTypeAndStatus(config.ChannelTypeCodex, config.ChannelStatusEnabled)
+	summary := AutoRefreshSummary{}
+	firstErr := ""
+	if model.DB == nil {
+		if reconcileErr := ReconcilePendingCredentials(ctx); reconcileErr != nil {
+			summary.Failed++
+			firstErr = "pending credential reconciliation: " + reconcileErr.Error()
+			logger.SysError("[Codex] " + firstErr)
+		}
+	}
+	channels, err := loadAutoRefreshChannels(ctx)
 	if err != nil {
 		logger.SysError("[Codex] failed to load channels for auto refresh: " + err.Error())
-		summary := AutoRefreshSummary{Failed: 1}
-		recordAutoRefreshResult(startedAt, summary, "error", err.Error(), false)
+		summary.Failed++
+		if firstErr == "" {
+			firstErr = err.Error()
+		}
+		recordAutoRefreshResult(startedAt, summary, "error", firstErr, false)
 		return summary
 	}
 
-	summary := AutoRefreshSummary{}
-	firstErr := ""
-	for _, channel := range channels {
-		if channel == nil || strings.TrimSpace(channel.Key) == "" {
-			continue
+	channels = autoRefreshCursor.rotate(channels)
+	var summaryMu sync.Mutex
+	workerResult := runCodexChannelWorkers(ctx, channels, codexWorkerCount(len(channels)), func(workerCtx context.Context, channel *model.Channel) {
+		result := refreshAutoRefreshChannel(workerCtx, channel)
+		summaryMu.Lock()
+		summary.Scanned += result.Scanned
+		summary.Eligible += result.Eligible
+		summary.Refreshed += result.Refreshed
+		summary.SkippedNoRefreshToken += result.SkippedNoRefreshToken
+		summary.SkippedNotDue += result.SkippedNotDue
+		summary.Failed += result.Failed
+		if firstErr == "" && result.FirstErr != "" {
+			firstErr = result.FirstErr
 		}
-
-		summary.Scanned++
-
-		preparedChannel := prepareChannelForAutoRefresh(channel)
-		provider, ok := CodexProviderFactory{}.Create(preparedChannel).(*CodexProvider)
-		if !ok || provider == nil || provider.Credentials == nil {
-			summary.Failed++
-			if firstErr == "" {
-				firstErr = fmt.Sprintf("failed to initialize provider for channel %d", channel.Id)
-			}
-			logger.SysError(fmt.Sprintf("[Codex] failed to initialize provider for channel %d", channel.Id))
-			continue
-		}
-
-		if strings.TrimSpace(provider.Credentials.RefreshToken) == "" {
-			summary.SkippedNoRefreshToken++
-			continue
-		}
-
-		if !provider.Credentials.NeedsRefreshWithin(AutoRefreshLead) {
-			summary.SkippedNotDue++
-			continue
-		}
-
-		summary.Eligible++
-		refreshed, refreshErr := provider.refreshTokenIfNeeded(ctx, AutoRefreshLead)
-		if refreshErr != nil {
-			summary.Failed++
-			if firstErr == "" {
-				firstErr = fmt.Sprintf("channel %d: %s", channel.Id, refreshErr.Error())
-			}
-			logger.SysError(fmt.Sprintf("[Codex] auto refresh failed for channel %d: %s", channel.Id, refreshErr.Error()))
-			continue
-		}
-		if refreshed {
-			summary.Refreshed++
+		summaryMu.Unlock()
+	})
+	autoRefreshCursor.advance(channels, workerResult.StartedPrefix)
+	if workerFailures := workerResult.FailureCount(); workerFailures > 0 {
+		summary.Failed += workerFailures
+		if firstErr == "" {
+			firstErr = codexChannelWorkerError(workerResult)
 		}
 	}
 
@@ -206,6 +222,52 @@ func RefreshChannelsInBackground(ctx context.Context) AutoRefreshSummary {
 	recordAutoRefreshResult(startedAt, summary, result, lastError, succeeded)
 
 	return summary
+}
+
+type autoRefreshChannelResult struct {
+	AutoRefreshSummary
+	FirstErr string
+}
+
+func refreshAutoRefreshChannel(ctx context.Context, channel *model.Channel) autoRefreshChannelResult {
+	result := autoRefreshChannelResult{}
+	if channel == nil || strings.TrimSpace(channel.Key) == "" {
+		return result
+	}
+
+	result.Scanned = 1
+
+	preparedChannel := prepareChannelForAutoRefresh(channel)
+	provider, ok := CodexProviderFactory{}.Create(preparedChannel).(*CodexProvider)
+	if !ok || provider == nil || provider.Credentials == nil {
+		result.Failed = 1
+		result.FirstErr = fmt.Sprintf("failed to initialize provider for channel %d", channel.Id)
+		logger.SysError(fmt.Sprintf("[Codex] failed to initialize provider for channel %d", channel.Id))
+		return result
+	}
+
+	if strings.TrimSpace(provider.Credentials.RefreshToken) == "" {
+		result.SkippedNoRefreshToken = 1
+		return result
+	}
+
+	if !provider.Credentials.NeedsRefreshWithin(AutoRefreshLead) {
+		result.SkippedNotDue = 1
+		return result
+	}
+
+	result.Eligible = 1
+	refreshed, refreshErr := provider.refreshTokenIfNeeded(ctx, AutoRefreshLead)
+	if refreshErr != nil {
+		result.Failed = 1
+		result.FirstErr = fmt.Sprintf("channel %d: %s", channel.Id, refreshErr.Error())
+		logger.SysError(fmt.Sprintf("[Codex] auto refresh failed for channel %d: %s", channel.Id, refreshErr.Error()))
+		return result
+	}
+	if refreshed {
+		result.Refreshed = 1
+	}
+	return result
 }
 
 func prepareChannelForAutoRefresh(channel *model.Channel) *model.Channel {

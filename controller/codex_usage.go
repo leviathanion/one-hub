@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"one-api/common"
 	"one-api/common/config"
+	"one-api/common/logger"
 	"one-api/model"
 	"one-api/providers/codex"
 	"strconv"
@@ -49,9 +50,10 @@ type codexUsagePreviewTarget struct {
 }
 
 var (
-	loadCodexUsageChannelByID  = model.GetChannelById
-	loadCodexUsageChannelsByID = model.GetChannelsByIDs
-	createCodexUsageProvider   = func(channel *model.Channel) (codexUsageProvider, error) {
+	loadCodexUsageChannelByID      = model.GetChannelById
+	loadCodexUsageChannelsByID     = model.GetChannelsByIDs
+	clearCodexUsageCacheForChannel = codex.ClearUsageCacheForChannel
+	createCodexUsageProvider       = func(channel *model.Channel) (codexUsageProvider, error) {
 		provider, ok := codex.CodexProviderFactory{}.Create(channel).(*codex.CodexProvider)
 		if !ok || provider == nil {
 			return nil, errors.New("failed to initialize Codex provider")
@@ -164,7 +166,7 @@ func ConsumeCodexResetCredit(c *gin.Context) {
 		return
 	}
 
-	provider, err := buildCodexUsageProviderByChannelID(channelID)
+	provider, channel, err := buildCodexUsageProviderAndChannelByID(channelID)
 	if err != nil {
 		common.APIRespondWithError(c, http.StatusOK, err)
 		return
@@ -174,7 +176,8 @@ func ConsumeCodexResetCredit(c *gin.Context) {
 	defer cancel()
 
 	result, err := provider.ConsumeResetCredit(ctx)
-	if err != nil {
+	committedResponseUnusable := codex.IsResetCreditCommittedResponseUnusable(err)
+	if err != nil && !committedResponseUnusable {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": err.Error(),
@@ -183,21 +186,50 @@ func ConsumeCodexResetCredit(c *gin.Context) {
 		return
 	}
 
+	// Rotate the shared v2 generation before reporting success. This invalidates
+	// every credential fingerprint and strands writes from pre-reset fetches. Keep
+	// clearing v1 during rolling upgrades even if the v2 cache is unavailable.
+	cacheErr := clearCodexUsageCacheForChannel(channel)
+	// Legacy cleanup is post-commit garbage collection only; v2 generation
+	// rotation above is the correctness boundary.
 	model.ClearChannelCodexUsageCache(channelID)
-
-	c.JSON(http.StatusOK, gin.H{
+	response := gin.H{
 		"success": true,
 		"message": "",
 		"data":    result,
-	})
+	}
+	warnings := make([]string, 0, 2)
+	if committedResponseUnusable {
+		warnings = append(warnings, "reset was accepted by upstream, but its response was unusable; do not retry")
+	}
+	if cacheErr != nil {
+		// Upstream consumption is irreversible. Reporting business failure here would
+		// invite a retry and double consumption; cache invalidation is only a warning.
+		warning := "reset succeeded, but usage cache invalidation failed: " + cacheErr.Error()
+		logger.SysError(warning)
+		warnings = append(warnings, warning)
+	}
+	if len(warnings) > 0 {
+		response["warning"] = strings.Join(warnings, "; ")
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 func buildCodexUsageProviderByChannelID(channelID int) (codexUsageProvider, error) {
+	provider, _, err := buildCodexUsageProviderAndChannelByID(channelID)
+	return provider, err
+}
+
+func buildCodexUsageProviderAndChannelByID(channelID int) (codexUsageProvider, *model.Channel, error) {
 	channel, err := loadCodexUsageChannel(channelID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return createCodexUsageProvider(channel)
+	provider, err := createCodexUsageProvider(channel)
+	if err != nil {
+		return nil, nil, err
+	}
+	return provider, channel, nil
 }
 
 func buildCodexUsageProvider(channel *model.Channel) (codexUsageProvider, error) {

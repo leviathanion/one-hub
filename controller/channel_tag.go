@@ -171,7 +171,7 @@ func UpdateChannelsTagPriority(c *gin.Context) {
 
 	switch params.Type {
 	case "priority":
-		err = model.UpdateChannelsTagPriority(tag, params.Value)
+		err = model.UpdateChannelsTagPriorityWithContext(c.Request.Context(), tag, params.Value)
 		if err != nil {
 			common.APIRespondWithError(c, http.StatusOK, err)
 			return
@@ -208,7 +208,7 @@ func ChangeChannelsTagStatus(c *gin.Context) {
 		return
 	}
 
-	err := model.ChangeChannelsTagStatus(tag, statusInt)
+	err := model.ChangeChannelsTagStatusWithContext(c.Request.Context(), tag, statusInt)
 	if err != nil {
 		common.APIRespondWithError(c, http.StatusOK, err)
 		return
