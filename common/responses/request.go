@@ -15,13 +15,15 @@ import (
 type Operation string
 
 const (
-	ResponsesCreate  Operation = "responses.create.http"
-	ResponsesCompact Operation = "responses.compact.http"
+	ResponsesCreate      Operation = "responses.create.http"
+	ResponsesCompact     Operation = "responses.compact.http"
+	ResponsesInputTokens Operation = "responses.input_tokens.http"
 )
 
 type RawEnvelope struct {
-	Object     *jsonobject.Object
-	Projection types.OpenAIResponsesRequest
+	Object          *jsonobject.Object
+	Projection      types.OpenAIResponsesRequest
+	ProjectionError error
 }
 
 type DownstreamDialect string
@@ -83,6 +85,7 @@ type PolicyInput struct {
 type Request struct {
 	Operation Operation
 	Headers   requestctx.HeaderSnapshot
+	RawQuery  string
 	Body      *RawEnvelope
 	Control   Control
 	Policy    PolicyInput
@@ -96,15 +99,80 @@ func ParseRawEnvelope(raw []byte) (*RawEnvelope, error) {
 	if err != nil {
 		return nil, err
 	}
-	var projection types.OpenAIResponsesRequest
-	decoder := json.NewDecoder(bytes.NewReader(object.Raw))
-	decoder.UseNumber()
-	if err := decoder.Decode(&projection); err != nil {
-		return nil, fmt.Errorf("decode responses projection: %w", err)
+	projection, projectionErr, err := projectRawRequest(object.Raw)
+	if err != nil {
+		return nil, fmt.Errorf("decode responses envelope: %w", err)
 	}
 	return &RawEnvelope{
-		Object:     object,
-		Projection: projection,
+		Object:          object,
+		Projection:      projection,
+		ProjectionError: projectionErr,
+	}, nil
+}
+
+func ProjectRawRequest(raw []byte) (types.OpenAIResponsesRequest, error) {
+	projection, _, err := projectRawRequest(raw)
+	return projection, err
+}
+
+func projectRawRequest(raw []byte) (types.OpenAIResponsesRequest, error, error) {
+	var projection types.OpenAIResponsesRequest
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	projectionErr := decoder.Decode(&projection)
+	if projectionErr != nil {
+		var err error
+		projection, err = decodeCoreProjection(raw)
+		if err != nil {
+			return types.OpenAIResponsesRequest{}, nil, err
+		}
+		projectionErr = fmt.Errorf("decode responses projection: %w", projectionErr)
+	}
+	return projection, projectionErr, nil
+}
+
+// decodeCoreProjection reads only fields whose meaning belongs to the proxy:
+// transport selection, routing/ownership, bounded admission and billing
+// context. Provider-owned unions remain in Object and are validated by the
+// selected upstream unless a cross-protocol adapter must interpret them.
+func decodeCoreProjection(raw []byte) (types.OpenAIResponsesRequest, error) {
+	type coreProjection struct {
+		Input                any    `json:"input,omitempty"`
+		Model                string `json:"model"`
+		Background           *bool  `json:"background,omitempty"`
+		Conversation         any    `json:"conversation,omitempty"`
+		MaxOutputTokens      int    `json:"max_output_tokens,omitempty"`
+		PreviousResponseID   string `json:"previous_response_id,omitempty"`
+		Prompt               any    `json:"prompt,omitempty"`
+		PromptCacheKey       string `json:"prompt_cache_key,omitempty"`
+		PromptCacheRetention string `json:"prompt_cache_retention,omitempty"`
+		SafetyIdentifier     string `json:"safety_identifier,omitempty"`
+		ServiceTier          string `json:"service_tier,omitempty"`
+		ProcessingClass      string `json:"processing_class,omitempty"`
+		Store                *bool  `json:"store,omitempty"`
+		Stream               bool   `json:"stream,omitempty"`
+	}
+	var core coreProjection
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&core); err != nil {
+		return types.OpenAIResponsesRequest{}, err
+	}
+	return types.OpenAIResponsesRequest{
+		Input:                core.Input,
+		Model:                core.Model,
+		Background:           core.Background,
+		Conversation:         core.Conversation,
+		MaxOutputTokens:      core.MaxOutputTokens,
+		PreviousResponseID:   core.PreviousResponseID,
+		Prompt:               core.Prompt,
+		PromptCacheKey:       core.PromptCacheKey,
+		PromptCacheRetention: core.PromptCacheRetention,
+		SafetyIdentifier:     core.SafetyIdentifier,
+		ServiceTier:          core.ServiceTier,
+		ProcessingClass:      core.ProcessingClass,
+		Store:                core.Store,
+		Stream:               core.Stream,
 	}, nil
 }
 
