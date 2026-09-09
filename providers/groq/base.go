@@ -5,10 +5,18 @@ import (
 	"one-api/model"
 	"one-api/providers/base"
 	"one-api/providers/openai"
+	"one-api/types"
 )
 
 // 定义供应商工厂
 type GroqProviderFactory struct{}
+
+func (GroqProviderFactory) AssessChatRemoteMedia(_ *model.Channel, _ *types.ChatCompletionRequest, _ base.ChatRemoteMediaSummary) (base.RemoteMediaMode, error) {
+	if err := base.RequireOperationEndpoint(getConfig().ChatCompletions, "Chat Completions"); err != nil {
+		return base.RemoteMediaReject, err
+	}
+	return base.RemoteMediaPassURL, nil
+}
 
 // 创建 GroqProvider
 func (f GroqProviderFactory) Create(channel *model.Channel) base.ProviderInterface {
