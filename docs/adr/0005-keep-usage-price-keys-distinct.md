@@ -1,0 +1,7 @@
+# Keep usage price keys distinct
+
+Usage fields that providers expose under different names remain independent pricing keys, including `cached_tokens`, `cached_read_tokens`, `cache_write_tokens`, and `cached_write_tokens`. Each key has its own global fallback price and optional administrator override; the system does not alias, merge, or migrate overrides between them. This may require an administrator to configure a newly observed field explicitly, but it avoids treating different provider accounting evidence as interchangeable.
+
+Claude cache creation has a deliberately narrow price-read exception. When a Claude TTL key is absent, `claude_cache_write_5m_tokens` and `claude_cache_write_1h_tokens` may each read the explicit `cached_write_tokens` price, and then use their own built-in defaults of 1.25 and 2 when neither override exists. An explicit zero remains present. This fallback changes only effective price lookup: it does not alias provider usage evidence, merge the TTL partitions, copy or migrate database overrides, or apply the generic price as an additional charge.
+
+Internal pricing evidence is not automatically part of a public response protocol. Typed Responses and Chat projections emit only fields defined by their public wire contracts, while an authorized exact-wire raw replay preserves the original provider JSON, including unknown future and provider-specific fields. Serialization must not erase the internal evidence used by settlement.
