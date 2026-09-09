@@ -90,6 +90,8 @@ func SetApiRouter(router *gin.Engine) {
 				selfRoute.GET("/payment", controller.GetUserPaymentList)
 				selfRoute.POST("/order", controller.CreateOrder)
 				selfRoute.GET("/order/status", controller.CheckOrderStatus)
+				selfRoute.POST("/order/query", controller.QueryOrder)
+				selfRoute.POST("/order/close", controller.CloseOrder)
 			}
 
 			adminRoute := userRoute.Group("/")
@@ -268,6 +270,8 @@ func SetApiRouter(router *gin.Engine) {
 		paymentRoute.Use(middleware.AdminAuth())
 		{
 			paymentRoute.GET("/order", controller.GetOrderList)
+			paymentRoute.POST("/order/:trade_no/query", controller.AdminQueryOrder)
+			paymentRoute.PUT("/:id/credentials", controller.RotatePaymentCredentials)
 			paymentRoute.GET("/", controller.GetPaymentList)
 			paymentRoute.GET("/:id", controller.GetPayment)
 			paymentRoute.POST("/", controller.AddPayment)

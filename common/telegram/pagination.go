@@ -16,6 +16,9 @@ type paginationParams struct {
 }
 
 func paginationHandler(b *gotgbot.Bot, ctx *ext.Context) error {
+	if !requirePrivateChat(b, ctx) {
+		return nil
+	}
 	user := getBindUser(b, ctx)
 	if user == nil {
 		return nil
@@ -23,8 +26,12 @@ func paginationHandler(b *gotgbot.Bot, ctx *ext.Context) error {
 
 	cb := ctx.Update.CallbackQuery
 	parts := strings.Split(strings.TrimPrefix(ctx.CallbackQuery.Data, "p:"), ",")
+	if len(parts) != 2 {
+		_, _ = cb.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "参数错误"})
+		return nil
+	}
 	page, err := strconv.Atoi(parts[1])
-	if err != nil {
+	if err != nil || page <= 0 {
 		cb.Answer(b, &gotgbot.AnswerCallbackQueryOpts{
 			Text: "参数错误!",
 		})

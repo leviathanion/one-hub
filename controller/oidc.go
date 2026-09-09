@@ -1,7 +1,6 @@
 package controller
 
 import (
-	"context"
 	"errors"
 	"net/http"
 
@@ -17,14 +16,14 @@ import (
 )
 
 func OIDCEndpoint(c *gin.Context) {
-	if !config.OIDCAuthEnabled {
+	if !config.GlobalOption.RuntimeSnapshot().Bool("OIDCAuthEnabled", config.OIDCAuthEnabled) {
 		c.JSON(http.StatusOK, gin.H{
 			"message": "管理员未开启通过OIDC登录",
 			"success": false,
 		})
 		return
 	}
-	oidcConfig, err := oidc.GetOIDCConfigInstance()
+	oidcConfig, err := oidc.GetOIDCConfigInstanceWithContext(c.Request.Context())
 	if err != nil {
 		logger.SysError("获取 OIDC 配置失败, err: " + err.Error())
 		c.JSON(http.StatusOK, gin.H{
@@ -54,9 +53,9 @@ func OIDCEndpoint(c *gin.Context) {
 }
 
 // OIDCAuth 通过OIDC登录
-// 首先通过OIDC ID进行登录、如果登录失败尝试使用USERNAME 进行登录（遵循用户禁用条件），如果OIDC ID和USERNAME都不存在则注册新用户（遵循是否开启注册功能条件）
+// 使用签发方与 subject 确定身份；用户名只用于新用户资料。
 func OIDCAuth(c *gin.Context) {
-	if !config.OIDCAuthEnabled {
+	if !config.GlobalOption.RuntimeSnapshot().Bool("OIDCAuthEnabled", config.OIDCAuthEnabled) {
 		c.JSON(http.StatusOK, gin.H{
 			"message": "管理员未开启通过OIDC登录",
 			"success": false,
@@ -76,7 +75,7 @@ func OIDCAuth(c *gin.Context) {
 	}
 
 	// 获取OIDC配置
-	oidcConfig, err := oidc.GetOIDCConfigInstance()
+	oidcConfig, err := oidc.GetOIDCConfigInstanceWithContext(c.Request.Context())
 	if err != nil {
 		logger.SysError("获取 OIDC 配置失败, err: " + err.Error())
 		c.JSON(http.StatusOK, gin.H{
@@ -88,7 +87,7 @@ func OIDCAuth(c *gin.Context) {
 
 	// 处理授权码并获取token
 	code := c.Query("code")
-	ctx := context.Background()
+	ctx := c.Request.Context()
 	token, err := oidcConfig.OAuth2Config.Exchange(ctx, code)
 	if err != nil {
 		c.String(http.StatusBadRequest, "Failed to exchange token: %v", err)
@@ -96,7 +95,12 @@ func OIDCAuth(c *gin.Context) {
 	}
 
 	// 验证ID Token
-	idToken, err := oidcConfig.Verifier.Verify(ctx, token.Extra("id_token").(string))
+	rawIDToken, ok := token.Extra("id_token").(string)
+	if !ok || rawIDToken == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "缺少 ID Token"})
+		return
+	}
+	idToken, err := oidcConfig.Verifier.Verify(ctx, rawIDToken)
 	if err != nil {
 		c.String(http.StatusBadRequest, "Failed to verify ID token: %v", err)
 		return
@@ -119,8 +123,9 @@ func OIDCAuth(c *gin.Context) {
 	}
 
 	// 获取用户名
-	userName, ok := claims[config.OIDCUsernameClaims]
-	if !ok || userName == nil {
+	usernameClaim := config.GlobalOption.RuntimeSnapshot().String("OIDCUsernameClaims", config.OIDCUsernameClaims)
+	username, ok := claims[usernameClaim].(string)
+	if !ok || username == "" {
 		c.JSON(http.StatusOK, gin.H{
 			"message": "用户没有OIDC登录权限",
 			"success": false,
@@ -130,20 +135,22 @@ func OIDCAuth(c *gin.Context) {
 
 	// 初始化用户对象
 	user := model.User{
-		Username: userName.(string),
+		Username: username,
 		OidcId:   idToken.Subject,
 	}
 
-	// 尝试通过OIDCid查询用户
-	if err = user.FillUserByOidcId(); err == nil {
-		if user.Status == config.UserStatusEnabled {
-			setupLogin(&user, c)
+	// 已登录主体显式绑定；否则只按签发方作用域内的稳定 subject 登录。
+	if localID, ok := currentSessionUserID(c); ok {
+		if err := model.UpdateUserIdentity(localID, model.UserIdentityPatch{OIDCId: &user.OidcId, OIDCIssuer: idToken.Issuer}); err != nil {
+			c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{
-			"message": "用户已被封禁或不存在",
-			"success": false,
-		})
+		c.JSON(http.StatusOK, gin.H{"success": true, "message": "bind"})
+		return
+	}
+	existing, err := model.FindUserByOIDC(c.Request.Context(), idToken.Issuer, idToken.Subject)
+	if err == nil {
+		setupLogin(existing, c)
 		return
 	}
 
@@ -152,28 +159,6 @@ func OIDCAuth(c *gin.Context) {
 		logger.SysError("查询用户错误: " + err.Error())
 		c.JSON(http.StatusOK, gin.H{
 			"message": err.Error(),
-			"success": false,
-		})
-		return
-	}
-
-	if err = user.FillUserByUsername(); err == nil {
-		if user.Status == config.UserStatusEnabled {
-			// 如果通过用户名查询用户成功、则补全用户OIDC ID并且登录
-			user.OidcId = idToken.Subject
-			ok := user.Update(false)
-			if ok != nil {
-				c.JSON(http.StatusOK, gin.H{
-					"message": ok.Error(),
-					"success": false,
-				})
-				return
-			}
-			setupLogin(&user, c)
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{
-			"message": "用户已被封禁或不存在",
 			"success": false,
 		})
 		return
@@ -190,7 +175,7 @@ func OIDCAuth(c *gin.Context) {
 	}
 
 	// 注册新用户
-	if !config.RegisterEnabled {
+	if !config.GlobalOption.RuntimeSnapshot().Bool("RegisterEnabled", config.RegisterEnabled) {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": "管理员关闭了新用户注册",
@@ -208,21 +193,22 @@ func OIDCAuth(c *gin.Context) {
 		user.InviterId = inviterId
 	}
 	// 填充用户信息并创建账户
-	user.Username = userName.(string)
+	user.Username = username
 	if email, ok := claims["email"]; ok && email != nil {
-		user.Email = email.(string)
+		user.Email, _ = email.(string)
 	}
 	if displayName, ok := claims["displayName"]; ok && displayName != nil {
-		user.DisplayName = displayName.(string)
+		user.DisplayName, _ = displayName.(string)
 	}
 	if avatarUrl, ok := claims["avatar"]; ok && avatarUrl != nil {
-		user.AvatarUrl = avatarUrl.(string)
+		user.AvatarUrl, _ = avatarUrl.(string)
 	}
 	user.OidcId = idToken.Subject
+	user.OIDCIssuer = idToken.Issuer
 	user.Role = config.RoleCommonUser
 	user.Status = config.UserStatusEnabled
 
-	if err := user.Insert(0); err != nil {
+	if err := user.Insert(inviterId); err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": err.Error(),

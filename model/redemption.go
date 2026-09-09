@@ -5,22 +5,23 @@ import (
 	"fmt"
 	"one-api/common"
 	"one-api/common/config"
-	"one-api/common/logger"
 	"one-api/common/utils"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type Redemption struct {
-	Id           int    `json:"id"`
-	UserId       int    `json:"user_id"`
-	Key          string `json:"key" gorm:"type:char(32);uniqueIndex"`
-	Status       int    `json:"status" gorm:"default:1"`
-	Name         string `json:"name" gorm:"index"`
-	Quota        int    `json:"quota" gorm:"default:100"`
-	CreatedTime  int64  `json:"created_time" gorm:"bigint"`
-	RedeemedTime int64  `json:"redeemed_time" gorm:"bigint"`
-	Count        int    `json:"count" gorm:"-:all"` // only for api request
+	Id               int    `json:"id"`
+	UserId           int    `json:"user_id"`
+	Key              string `json:"key" gorm:"type:char(32);uniqueIndex"`
+	Status           int    `json:"status" gorm:"default:1"`
+	Name             string `json:"name" gorm:"index"`
+	Quota            int    `json:"quota" gorm:"default:100"`
+	CreatedTime      int64  `json:"created_time" gorm:"bigint"`
+	RedeemedTime     int64  `json:"redeemed_time" gorm:"bigint"`
+	RedeemedByUserID *int   `json:"redeemed_by_user_id" gorm:"index"`
+	Count            int    `json:"count" gorm:"-:all"` // only for api request
 }
 
 var allowedRedemptionslOrderFields = map[string]bool{
@@ -66,30 +67,38 @@ func Redeem(key string, userId int, ip string) (quota int, err error) {
 	}
 
 	err = DB.Transaction(func(tx *gorm.DB) error {
-		err := tx.Set("gorm:query_option", "FOR UPDATE").Where(keyCol+" = ?", key).First(redemption).Error
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(keyCol+" = ?", key).First(redemption).Error
 		if err != nil {
-			return errors.New("无效的兑换码")
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errors.New("无效的兑换码")
+			}
+			return err
 		}
 		if redemption.Status != config.RedemptionCodeStatusEnabled {
 			return errors.New("该兑换码已被使用")
 		}
-		err = tx.Model(&User{}).Where("id = ?", userId).Update("quota", gorm.Expr("quota + ?", redemption.Quota)).Error
+		user, err := CreditUserRecharge(tx, userId, int64(redemption.Quota))
 		if err != nil {
 			return err
 		}
+		if user.DeletedAt.Valid || user.Status != config.UserStatusEnabled {
+			return errors.New("兑换用户不可用")
+		}
 		redemption.RedeemedTime = utils.GetTimestamp()
 		redemption.Status = config.RedemptionCodeStatusUsed
-		err = tx.Save(redemption).Error
-		return err
+		redemption.RedeemedByUserID = &userId
+		result := tx.Model(&Redemption{}).Where("id = ? AND status = ?", redemption.Id, config.RedemptionCodeStatusEnabled).
+			Updates(map[string]any{"redeemed_time": redemption.RedeemedTime, "redeemed_by_user_id": userId, "status": redemption.Status})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return errors.New("该兑换码已被使用")
+		}
+		return nil
 	})
 	if err != nil {
 		return 0, errors.New("兑换失败，" + err.Error())
-	}
-
-	// Try to upgrade user group based on cumulative recharge amount
-	err = CheckAndUpgradeUserGroup(userId, redemption.Quota)
-	if err != nil {
-		logger.SysError("failed to check and upgrade user group: " + err.Error())
 	}
 
 	RecordQuotaLog(userId, LogTypeTopup, redemption.Quota, ip, fmt.Sprintf("通过兑换码充值 %s", common.LogQuota(redemption.Quota)))
@@ -97,21 +106,30 @@ func Redeem(key string, userId int, ip string) (quota int, err error) {
 }
 
 func (redemption *Redemption) Insert() error {
-	var err error
-	err = DB.Create(redemption).Error
-	return err
-}
-
-func (redemption *Redemption) SelectUpdate() error {
-	// This can update zero values
-	return DB.Model(redemption).Select("redeemed_time", "status").Updates(redemption).Error
+	if redemption.Quota <= 0 {
+		return errors.New("兑换额度必须大于 0")
+	}
+	redemption.Status = config.RedemptionCodeStatusEnabled
+	redemption.RedeemedTime = 0
+	redemption.RedeemedByUserID = nil
+	return DB.Create(redemption).Error
 }
 
 // Update Make sure your token's fields is completed, because this will update non-zero values
 func (redemption *Redemption) Update() error {
-	var err error
-	err = DB.Model(redemption).Select("name", "status", "quota", "redeemed_time").Updates(redemption).Error
-	return err
+	if redemption.Quota <= 0 || (redemption.Status != config.RedemptionCodeStatusEnabled && redemption.Status != config.RedemptionCodeStatusDisabled) {
+		return errors.New("兑换码状态或额度无效，已兑换记录不可修改")
+	}
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var current Redemption
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&current, "id = ?", redemption.Id).Error; err != nil {
+			return err
+		}
+		if current.Status == config.RedemptionCodeStatusUsed || current.RedeemedByUserID != nil {
+			return errors.New("兑换码已经兑换")
+		}
+		return tx.Model(&current).Select("name", "status", "quota").Updates(redemption).Error
+	})
 }
 
 func (redemption *Redemption) Delete() error {
@@ -155,7 +173,7 @@ func GetStatisticsRedemptionByPeriod(startTimestamp, endTimestamp int64) (redemp
 	err = DB.Raw(`
 		SELECT `+groupSelect+`,
 		sum(quota) as quota,
-		count(distinct user_id) as user_count
+		count(distinct redeemed_by_user_id) as user_count
 		FROM redemptions
 		WHERE status=3
 		AND redeemed_time BETWEEN ? AND ?

@@ -2,10 +2,34 @@ package model
 
 import (
 	"fmt"
+	"reflect"
+	"strings"
+
 	"github.com/go-gormigrate/gormigrate/v2"
 	"gorm.io/gorm"
-	"reflect"
 )
+
+// 先以可空列接住历史数据，回填成功后由正式模型建立最终约束。
+// 只增加缺失列，不改变已经上线的列定义；DDL 中断后可重跑。
+func addStartupMigrationColumns(db *gorm.DB, table string, columns any) error {
+	names, err := databaseColumnNames(db, table)
+	if err != nil || names == nil {
+		return err
+	}
+	stmt := &gorm.Statement{DB: db}
+	if err := stmt.Parse(columns); err != nil {
+		return err
+	}
+	for _, field := range stmt.Schema.Fields {
+		if field.DBName == "" || names[projectionIdentifierKey(db.Dialector.Name(), field.DBName)] {
+			continue
+		}
+		if err := db.Table(table).Migrator().AddColumn(columns, field.Name); err != nil {
+			return fmt.Errorf("启动迁移增加 %s.%s 失败: %w", table, field.DBName, err)
+		}
+	}
+	return nil
+}
 
 func startupMigrationRollback(*gorm.DB) error {
 	return fmt.Errorf("历史数据已转换；回滚须停止写入并恢复匹配的数据库备份和程序")
@@ -61,4 +85,8 @@ func migrateIdenticalPrices() *gormigrate.Migration {
 			return nil
 		})
 	}, Rollback: startupMigrationRollback}
+}
+
+func startupRowError(table string, id int64, reason string) error {
+	return fmt.Errorf("%s 记录 %d 无法自动迁移：%s；请核查历史事实后重新启动", table, id, strings.TrimSpace(reason))
 }

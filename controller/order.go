@@ -1,227 +1,101 @@
 package controller
 
 import (
-	"errors"
-	"fmt"
+	"github.com/gin-gonic/gin"
+	"io"
 	"net/http"
-	"strconv"
-	"sync"
-
 	"one-api/common"
-	"one-api/common/config"
 	"one-api/common/logger"
-	"one-api/common/utils"
 	"one-api/model"
 	"one-api/payment"
 	"one-api/payment/types"
-
-	"github.com/gin-gonic/gin"
 )
 
-type OrderRequest struct {
-	UUID   string `json:"uuid" binding:"required"`
-	Amount int    `json:"amount" binding:"required"`
-}
+type OrderRequest = payment.CreateOrderRequest
 
-type OrderResponse struct {
-	TradeNo string `json:"trade_no"`
-	*types.PayRequest
-}
-
-// CreateOrder
 func CreateOrder(c *gin.Context) {
-	var orderReq OrderRequest
-	if err := c.ShouldBindJSON(&orderReq); err != nil {
-		common.APIRespondWithError(c, http.StatusOK, errors.New("invalid request"))
-
+	var req OrderRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.APIRespondWithError(c, http.StatusBadRequest, err)
 		return
 	}
-
-	if orderReq.Amount <= 0 || orderReq.Amount < config.PaymentMinAmount {
-		common.APIRespondWithError(c, http.StatusOK, fmt.Errorf("金额必须大于等于 %d", config.PaymentMinAmount))
-
-		return
-	}
-
-	userId := c.GetInt("id")
-	user, err := model.GetUserById(userId, false)
-	if err != nil {
-		common.APIRespondWithError(c, http.StatusOK, errors.New("用户不存在"))
-		return
-	}
-
-	// 关闭用户未完成的订单
-	go model.CloseUnfinishedOrder()
-
-	paymentService, err := payment.NewPaymentService(orderReq.UUID)
+	view, err := payment.CreateOrder(c.Request.Context(), c.GetInt("id"), req)
+	orderResponse(c, view, err)
+}
+func orderResponse(c *gin.Context, view *payment.OrderView, err error) {
+	c.Header("Cache-Control", "no-store")
 	if err != nil {
 		common.APIRespondWithError(c, http.StatusOK, err)
 		return
 	}
-	// 获取手续费和支付金额
-	discount, fee, payMoney := calculateOrderAmount(paymentService.Payment, orderReq.Amount)
-	// 开始支付
-	tradeNo := utils.GenerateTradeNo()
-	payRequest, err := paymentService.Pay(tradeNo, payMoney, user)
-	if err != nil {
-		common.APIRespondWithError(c, http.StatusOK, errors.New("创建支付失败，请稍后再试"))
-		return
-	}
-
-	// 创建订单
-	order := &model.Order{
-		UserId:        userId,
-		GatewayId:     paymentService.Payment.ID,
-		TradeNo:       tradeNo,
-		Amount:        orderReq.Amount,
-		OrderAmount:   payMoney,
-		OrderCurrency: paymentService.Payment.Currency,
-		Fee:           fee,
-		Discount:      discount,
-		Status:        model.OrderStatusPending,
-		Quota:         orderReq.Amount * int(config.QuotaPerUnit),
-	}
-
-	err = order.Insert()
-	if err != nil {
-		common.APIRespondWithError(c, http.StatusOK, errors.New("创建订单失败，请稍后再试"))
-		return
-	}
-
-	orderResp := &OrderResponse{
-		TradeNo:    tradeNo,
-		PayRequest: payRequest,
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "",
-		"data":    orderResp,
-	})
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": view})
 }
-
-// tradeNo lock
-var orderLocks sync.Map
-var createLock sync.Mutex
-
-// LockOrder 尝试对给定订单号加锁
-func LockOrder(tradeNo string) {
-	lock, ok := orderLocks.Load(tradeNo)
-	if !ok {
-		createLock.Lock()
-		defer createLock.Unlock()
-		lock, ok = orderLocks.Load(tradeNo)
-		if !ok {
-			lock = new(sync.Mutex)
-			orderLocks.Store(tradeNo, lock)
-		}
-	}
-	lock.(*sync.Mutex).Lock()
-}
-
-// UnlockOrder 释放给定订单号的锁
-func UnlockOrder(tradeNo string) {
-	lock, ok := orderLocks.Load(tradeNo)
-	if ok {
-		lock.(*sync.Mutex).Unlock()
-	}
-}
-
-func PaymentCallback(c *gin.Context) {
-	uuid := c.Param("uuid")
-	paymentService, err := payment.NewPaymentService(uuid)
-	if err != nil {
-		common.APIRespondWithError(c, http.StatusOK, errors.New("payment not found"))
-		return
-	}
-
-	payNotify, err := paymentService.HandleCallback(c, paymentService.Payment.Config)
-	if err != nil {
-		return
-	}
-
-	LockOrder(payNotify.GatewayNo)
-	defer UnlockOrder(payNotify.GatewayNo)
-
-	order, err := model.GetOrderByTradeNo(payNotify.TradeNo)
-	if err != nil {
-		logger.SysError(fmt.Sprintf("gateway callback failed to find order, trade_no: %s,", payNotify.TradeNo))
-		return
-	}
-	fmt.Println(order.Status, order.Status != model.OrderStatusPending)
-
-	if order.Status != model.OrderStatusPending {
-		return
-	}
-
-	order.GatewayNo = payNotify.GatewayNo
-	order.Status = model.OrderStatusSuccess
-	err = order.Update()
-	if err != nil {
-		logger.SysError(fmt.Sprintf("gateway callback failed to update order, trade_no: %s,", payNotify.TradeNo))
-		return
-	}
-
-	err = model.IncreaseUserQuota(order.UserId, order.Quota)
-	if err != nil {
-		logger.SysError(fmt.Sprintf("gateway callback failed to increase user quota, trade_no: %s,", payNotify.TradeNo))
-		return
-	}
-
-	// Try to upgrade user group based on cumulative recharge amount
-	err = model.CheckAndUpgradeUserGroup(order.UserId, order.Quota)
-	if err != nil {
-		logger.SysError(fmt.Sprintf("failed to check and upgrade user group, trade_no: %s, error: %s", payNotify.TradeNo, err.Error()))
-	}
-
-	model.RecordQuotaLog(order.UserId, model.LogTypeTopup, order.Quota, c.ClientIP(), fmt.Sprintf("在线充值成功，充值积分: %d，支付金额：%.2f %s", order.Quota, order.OrderAmount, order.OrderCurrency))
-}
-
 func CheckOrderStatus(c *gin.Context) {
-	tradeNo := c.Query("trade_no")
-	userId := c.GetInt("id")
-	success := false
-
-	if tradeNo != "" {
-		order, err := model.GetUserOrder(userId, tradeNo)
-		if err == nil {
-			if order.Status == model.OrderStatusSuccess {
-				success = true
-			}
+	view, err := payment.Status(c.Request.Context(), c.GetInt("id"), c.Query("trade_no"))
+	orderResponse(c, view, err)
+}
+func QueryOrder(c *gin.Context) {
+	var req struct {
+		TradeNo string `json:"trade_no"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		orderResponse(c, nil, err)
+		return
+	}
+	view, err := payment.QueryOrder(c.Request.Context(), c.GetInt("id"), req.TradeNo)
+	orderResponse(c, view, err)
+}
+func AdminQueryOrder(c *gin.Context) {
+	view, err := payment.QueryOrder(c.Request.Context(), 0, c.Param("trade_no"))
+	orderResponse(c, view, err)
+}
+func CloseOrder(c *gin.Context) {
+	var req struct {
+		TradeNo string `json:"trade_no"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		orderResponse(c, nil, err)
+		return
+	}
+	view, err := payment.CloseOrder(c.Request.Context(), c.GetInt("id"), req.TradeNo)
+	orderResponse(c, view, err)
+}
+func PaymentCallback(c *gin.Context) {
+	service, err := payment.NewHistoricalPaymentService(c.Param("uuid"))
+	if err != nil {
+		c.AbortWithStatus(http.StatusServiceUnavailable)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, 1<<20+1))
+	if err != nil || len(body) > 1<<20 {
+		c.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+	response, err := service.Callback(c.Request.Context(), types.CallbackRequest{Method: c.Request.Method, Query: c.Request.URL.Query(), Headers: c.Request.Header.Clone(), Body: body})
+	if err != nil {
+		logger.SysError("支付通知处理失败: " + err.Error())
+	}
+	for key, values := range response.Headers {
+		for _, value := range values {
+			c.Writer.Header().Add(key, value)
 		}
 	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"success": success,
-		"message": "",
-	})
+	if response.StatusCode == 0 {
+		response.StatusCode = http.StatusServiceUnavailable
+	}
+	c.Status(response.StatusCode)
+	if len(response.Body) > 0 {
+		_, _ = c.Writer.Write(response.Body)
+	}
 }
 
-// discountMoney优惠金额 fee手续费，payMoney实付金额
-func calculateOrderAmount(payment *model.Payment, amount int) (discountMoney, fee, payMoney float64) {
-	// 获取折扣
-	discount := common.GetRechargeDiscount(strconv.Itoa(amount))
-	newMoney := float64(amount) * discount // 折后价值
-	oldTotal := float64(amount)            //原价值
-	if payment.PercentFee > 0 {
-		//手续费=（原始价值*折扣*手续费率）
-		fee = utils.Decimal(newMoney*payment.PercentFee, 2) //折后手续
-		oldTotal = utils.Decimal(oldTotal*(1+payment.PercentFee), 2)
-	} else if payment.FixedFee > 0 {
-		//固定费率不计算折扣
-		fee = payment.FixedFee
+// 管理展示仍使用派生浮点字段；支付核对只使用冻结最小单位金额。
+func calculateOrderAmount(p *model.Payment, amount int) (discount, fee, money float64) {
+	quote, err := payment.CalculateQuote(p, amount)
+	if err != nil {
+		return
 	}
-
-	//实际费用=（折后价+折后手续费）*汇率
-	total := utils.Decimal(newMoney+fee, 2)
-	if payment.Currency == model.CurrencyTypeUSD {
-		payMoney = total
-	} else {
-		oldTotal = utils.Decimal(oldTotal*config.PaymentUSDRate, 2)
-		payMoney = utils.Decimal(total*config.PaymentUSDRate, 2)
-	}
-	discountMoney = oldTotal - payMoney //折扣金额 = 原价值-实际支付价值
-	return
+	return quote.Discount, quote.Fee, float64(quote.Total.Minor) / 100
 }
 
 func GetOrderList(c *gin.Context) {

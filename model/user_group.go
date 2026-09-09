@@ -2,6 +2,8 @@ package model
 
 import (
 	"fmt"
+	"gorm.io/gorm"
+	"math"
 	"one-api/common/config"
 	"one-api/common/limit"
 	"one-api/common/logger"
@@ -67,37 +69,44 @@ func GetUserGroupsAll(isPublic bool) ([]*UserGroup, error) {
 }
 
 func (c *UserGroup) Create() error {
-	err := DB.Create(c).Error
-	if err == nil {
-		GlobalUserGroupRatio.Load()
+	if err := c.validateRatio(); err != nil {
+		return err
 	}
-	return err
+	return mutateUserGroupPolicy(func(tx *gorm.DB) error {
+		// 创建时用非空指针保留显式零，同时保留原表结构和其他字段的默认值。
+		return tx.Table(tx.NamingStrategy.TableName("UserGroup")).Create(&struct {
+			*UserGroup
+			Ratio *float64
+		}{c, &c.Ratio}).Error
+	})
 }
 
 func (c *UserGroup) Update() error {
-	err := DB.Select("name", "ratio", "public", "api_rate", "promotion", "min", "max").Updates(c).Error
-	if err == nil {
-		GlobalUserGroupRatio.Load()
+	if err := c.validateRatio(); err != nil {
+		return err
 	}
+	return mutateUserGroupPolicy(func(tx *gorm.DB) error {
+		return tx.Select("name", "ratio", "public", "api_rate", "promotion", "min", "max").Updates(c).Error
+	})
+}
 
-	return err
+func (c *UserGroup) validateRatio() error {
+	if math.IsNaN(c.Ratio) || math.IsInf(c.Ratio, 0) || c.Ratio < 0 {
+		return fmt.Errorf("分组倍率必须是有限的非负数")
+	}
+	return nil
 }
 
 func (c *UserGroup) Delete() error {
-	err := DB.Delete(c).Error
-
-	if err == nil {
-		GlobalUserGroupRatio.Load()
-	}
-	return err
+	return mutateUserGroupPolicy(func(tx *gorm.DB) error {
+		return tx.Delete(c).Error
+	})
 }
 
 func ChangeUserGroupEnable(id int, enable bool) error {
-	err := DB.Model(&UserGroup{}).Where("id = ?", id).Update("enable", enable).Error
-	if err == nil {
-		GlobalUserGroupRatio.Load()
-	}
-	return err
+	return mutateUserGroupPolicy(func(tx *gorm.DB) error {
+		return tx.Model(&UserGroup{}).Where("id = ?", id).Update("enable", enable).Error
+	})
 }
 
 type UserGroupRatio struct {
@@ -105,38 +114,14 @@ type UserGroupRatio struct {
 	UserGroup   map[string]*UserGroup
 	APILimiter  map[string]limit.RateLimiter
 	PublicGroup []string
+
+	reloadMu         sync.Mutex
+	publishedVersion int64
+	databaseHead     int64
+	lastSyncError    string
 }
 
-var GlobalUserGroupRatio = UserGroupRatio{}
-
-func (cgrm *UserGroupRatio) Load() {
-	userGroups, err := GetUserGroupsAll(false)
-	if err != nil {
-		return
-	}
-
-	newUserGroups := make(map[string]*UserGroup, len(userGroups))
-	newAPILimiter := make(map[string]limit.RateLimiter, len(userGroups))
-	publicGroup := make([]string, 0)
-
-	for _, userGroup := range userGroups {
-		newUserGroups[userGroup.Symbol] = userGroup
-		newAPILimiter[userGroup.Symbol] = limit.NewAPILimiter(userGroup.APIRate)
-		if userGroup.Public {
-			publicGroup = append(publicGroup, userGroup.Symbol)
-		}
-	}
-
-	cgrm.Lock()
-	oldLimiters := cgrm.APILimiter
-
-	cgrm.UserGroup = newUserGroups
-	cgrm.APILimiter = newAPILimiter
-	cgrm.PublicGroup = publicGroup
-	cgrm.Unlock()
-
-	stopUserGroupAPILimiters(oldLimiters)
-}
+var GlobalUserGroupRatio = &UserGroupRatio{}
 
 func stopUserGroupAPILimiters(limiters map[string]limit.RateLimiter) {
 	for symbol, limiter := range limiters {
@@ -212,48 +197,41 @@ func (cgrm *UserGroupRatio) GetAPILimiter(symbol string) limit.RateLimiter {
 	return limiter
 }
 
-// CheckAndUpgradeUserGroup checks if a user's cumulative recharge amount falls within any promotion group's range
-// and upgrades the user to that group if a match is found.
-// The cumulative recharge amount is calculated as Quota + UsedQuota + rechargeAmount.
 func CheckAndUpgradeUserGroup(userId int, rechargeAmount int) error {
-	// Get user's current quota and used quota
+
 	user := &User{}
 	err := DB.Where("id = ?", userId).First(user).Error
 	if err != nil {
 		return err
 	}
 
-	// Calculate cumulative recharge amount
 	cumulativeAmount := user.Quota + user.UsedQuota + rechargeAmount
-	// Get all promotion-enabled user groups
+
 	var promotionGroups []*UserGroup
 	err = DB.Where("promotion = ? AND enable = ?", true, true).Find(&promotionGroups).Error
 	if err != nil {
 		return err
 	}
 
-	// Find a matching group (min <= cumulativeAmount < max)
 	var targetGroup *UserGroup
 	for _, group := range promotionGroups {
 		var minQuota = (float64)(group.Min) * config.QuotaPerUnit
 		var maxQuota = (float64)(group.Max) * config.QuotaPerUnit
 		if (float64)(cumulativeAmount) >= minQuota && (group.Max == 0 || (float64)(cumulativeAmount) < maxQuota) {
-			// If multiple groups match, choose the one with higher min value
+
 			if targetGroup == nil || group.Min > targetGroup.Min {
 				targetGroup = group
 			}
 		}
 	}
 
-	// If a matching group is found, upgrade the user
 	if targetGroup != nil && targetGroup.Symbol != user.Group {
-		// Update user's group
+
 		err = DB.Model(&User{}).Where("id = ?", userId).Update("group", targetGroup.Symbol).Error
 		if err != nil {
 			return err
 		}
 
-		// Delete cache if Redis is enabled
 		if config.RedisEnabled {
 			redis.RedisDel(fmt.Sprintf(UserGroupCacheKey, userId))
 		}

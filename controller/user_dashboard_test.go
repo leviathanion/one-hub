@@ -2,7 +2,6 @@ package controller
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -12,6 +11,7 @@ import (
 	"one-api/common/config"
 	"one-api/common/logger"
 	commonTest "one-api/common/test"
+	"one-api/internal/testutil/sqlitetest"
 	"one-api/model"
 
 	"github.com/gin-gonic/gin"
@@ -29,7 +29,7 @@ func useControllerDashboardTestDB(t *testing.T) {
 	originalUsingSQLite := common.UsingSQLite
 	originalUsingPostgreSQL := common.UsingPostgreSQL
 
-	testDB, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())), &gorm.Config{})
+	testDB, err := gorm.Open(sqlite.Open(sqlitetest.MemoryDSN()), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("expected in-memory sqlite database, got %v", err)
 	}

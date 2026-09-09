@@ -145,7 +145,7 @@ func buildBenchChannel(modelName string) *model.Channel {
 			},
 		},
 	}
-	model.GlobalUserGroupRatio = model.UserGroupRatio{
+	model.GlobalUserGroupRatio = &model.UserGroupRatio{
 		UserGroup: map[string]*model.UserGroup{
 			"default": {
 				Id:      1,

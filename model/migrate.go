@@ -13,6 +13,7 @@ import (
 	"github.com/go-gormigrate/gormigrate/v2"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 func removeKeyIndexMigration() *gormigrate.Migration {
@@ -93,15 +94,18 @@ func migrationBefore(db *gorm.DB) error {
 		return nil
 	}
 
-	// 如果是第一次运行 直接跳过
-	if !db.Migrator().HasTable("channels") {
-		return nil
-	}
-
-	preparations := gormigrate.New(db, gormigrate.DefaultOptions, []*gormigrate.Migration{migrateIdenticalPrices()})
+	// 历史数据表示转换必须早于前置检查和最终 NOT NULL/唯一约束。
+	preparations := gormigrate.New(db, gormigrate.DefaultOptions, []*gormigrate.Migration{
+		migrateHistoricalPaymentRepresentations(),
+		migrateIdenticalPrices(),
+	})
 	if err := preparations.Migrate(); err != nil {
 		return err
 	}
+	if err := ValidatePaymentUpgradePrerequisites(db); err != nil {
+		return err
+	}
+
 	m := gormigrate.New(db, gormigrate.DefaultOptions, beforeAutoMigrateMigrations())
 	return m.Migrate()
 }
@@ -319,6 +323,9 @@ func migrateTokenLimitsStructure() *gormigrate.Migration {
 	return &gormigrate.Migration{
 		ID: "202510160002",
 		Migrate: func(tx *gorm.DB) error {
+			if !tx.Migrator().HasTable("tokens") {
+				return nil
+			}
 			// 直接查询原始JSON字符串，避免GORM自动转换
 			type TokenRaw struct {
 				Id      int    `gorm:"column:id"`
@@ -335,11 +342,16 @@ func migrateTokenLimitsStructure() *gormigrate.Migration {
 
 			// 遍历每个 token，转换 limits 结构
 			for _, token := range tokens {
+				if strings.TrimSpace(token.Setting) == "" {
+					continue
+				}
 				// 解析为 map 以便灵活处理
 				var settingMap map[string]interface{}
 				err = json.Unmarshal([]byte(token.Setting), &settingMap)
-				if err != nil || settingMap == nil {
-					// 如果解析失败或为空，跳过
+				if err != nil {
+					return startupRowError("tokens", int64(token.Id), "setting 不是有效的 JSON 对象")
+				}
+				if settingMap == nil {
 					continue
 				}
 
@@ -352,7 +364,7 @@ func migrateTokenLimitsStructure() *gormigrate.Migration {
 				// 将 limits 转换为 map
 				limitsMap, ok := limitsRaw.(map[string]interface{})
 				if !ok {
-					continue
+					return startupRowError("tokens", int64(token.Id), "setting.limits 必须是 JSON 对象")
 				}
 
 				// 检查是否已经是新结构（包含 limit_model_setting）
@@ -381,15 +393,13 @@ func migrateTokenLimitsStructure() *gormigrate.Migration {
 				// 序列化回 JSON
 				newSettingBytes, err := json.Marshal(settingMap)
 				if err != nil {
-					logger.SysLog("token setting序列化失败: " + err.Error())
-					continue
+					return startupRowError("tokens", int64(token.Id), "setting 序列化失败")
 				}
 
 				// 更新数据库
-				err = tx.Model(&Token{}).Where("id = ?", token.Id).Update("setting", datatypes.JSON(newSettingBytes)).Error
+				err = tx.Unscoped().Model(&Token{}).Where("id = ?", token.Id).Update("setting", datatypes.JSON(newSettingBytes)).Error
 				if err != nil {
-					logger.SysLog("更新token setting失败: " + err.Error())
-					continue
+					return fmt.Errorf("Token %d limits 迁移写入失败: %w", token.Id, err)
 				}
 			}
 
@@ -691,6 +701,7 @@ func beforeAutoMigrateMigrations() []*gormigrate.Migration {
 	return []*gormigrate.Migration{
 		removeKeyIndexMigration(),
 		changeTokenKeyColumnType(),
+		migrateUserIdentityUniqueness(),
 	}
 }
 
@@ -704,6 +715,74 @@ func afterAutoMigrateMigrations() []*gormigrate.Migration {
 		migrateTokenLimitsStructure(),
 		addDashboardCacheTokenMigration(),
 		migrateLegacyChannelOtherJSON(),
+		removeLegacyMediaProxyOptions(),
+		removeLegacyQuotaRemindOption(),
+		removeObsoleteOptions("202609090002", []string{"GitHubOldIdCloseEnabled"}),
+		retryTokenLimitsMigration(),
+	}
+}
+
+// 旧迁移会吞掉逐行错误并记录完成；用新 ID 补迁移曾被跳过的记录。
+func retryTokenLimitsMigration() *gormigrate.Migration {
+	migration := migrateTokenLimitsStructure()
+	migration.ID = "202609090008"
+	return migration
+}
+
+func dropResponsesWSSettlementIntents() *gormigrate.Migration {
+	return &gormigrate.Migration{
+		ID: "202608290001",
+		Migrate: func(tx *gorm.DB) error {
+			const table = "responses_ws_settlement_intents"
+			if !tx.Migrator().HasTable(table) {
+				return nil
+			}
+			return tx.Migrator().DropTable(table)
+		},
+		Rollback: func(*gorm.DB) error { return nil },
+	}
+}
+
+func removeLegacyMediaProxyOptions() *gormigrate.Migration {
+	return removeObsoleteOptions("202608310001", []string{
+		"ChatImageRequestProxy",
+		"CFWorkerImageUrl",
+		"CFWorkerImageKey",
+	})
+}
+
+func removeLegacyQuotaRemindOption() *gormigrate.Migration {
+	return removeObsoleteOptions("202609060001", []string{"QuotaRemindThreshold"})
+}
+
+func removeObsoleteOptions(id string, keys []string) *gormigrate.Migration {
+	return &gormigrate.Migration{
+		ID: id,
+		Migrate: func(db *gorm.DB) error {
+			if !db.Migrator().HasTable(&Option{}) {
+				return nil
+			}
+			return db.Transaction(func(tx *gorm.DB) error {
+				result := tx.Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: keys}).Delete(&Option{})
+				if result.Error != nil {
+					return result.Error
+				}
+				if result.RowsAffected == 0 {
+					return nil
+				}
+				result = tx.Model(&PublicationVersion{}).
+					Where("owner = ? AND version >= ?", PublicationOwnerOptions, 1).
+					UpdateColumn("version", gorm.Expr("version + ?", 1))
+				if result.Error != nil {
+					return result.Error
+				}
+				if result.RowsAffected != 1 {
+					return fmt.Errorf("options publication version row is unavailable")
+				}
+				return nil
+			})
+		},
+		Rollback: func(*gorm.DB) error { return nil },
 	}
 }
 

@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"one-api/common"
@@ -151,25 +152,9 @@ func AddToken(c *gin.Context) {
 		return
 	}
 
-	if token.Group != "" {
-		err = validateTokenGroup(token.Group, userId)
-		if err != nil {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": err.Error(),
-			})
-			return
-		}
-	}
-	if token.BackupGroup != "" {
-		err = validateTokenGroup(token.BackupGroup, userId)
-		if err != nil {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": err.Error(),
-			})
-			return
-		}
+	if err := validateTokenGroups(c.Request.Context(), userId, token.Group, token.BackupGroup); err != nil {
+		common.APIRespondWithError(c, http.StatusOK, err)
+		return
 	}
 
 	setting := token.Setting.Data()
@@ -228,12 +213,17 @@ func DeleteToken(c *gin.Context) {
 	})
 }
 
+type tokenUpdateRequest struct {
+	model.Token
+	ExpectedRemainQuota *int `json:"expected_remain_quota"`
+}
+
 func UpdateToken(c *gin.Context) {
 	userId := c.GetInt("id")
 	userRole := c.GetInt("role")
 	statusOnly := c.Query("status_only")
-	token := model.Token{}
-	err := c.ShouldBindJSON(&token)
+	request := tokenUpdateRequest{}
+	err := c.ShouldBindJSON(&request)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
@@ -241,6 +231,7 @@ func UpdateToken(c *gin.Context) {
 		})
 		return
 	}
+	token := request.Token
 	if len(token.Name) > 30 {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
@@ -281,31 +272,28 @@ func UpdateToken(c *gin.Context) {
 		}
 	}
 
-	if cleanToken.Group != token.Group && token.Group != "" {
-		err = validateTokenGroup(token.Group, userId)
-		if err != nil {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": err.Error(),
-			})
-			return
-		}
+	var changedGroups []string
+	if cleanToken.Group != token.Group {
+		changedGroups = append(changedGroups, token.Group)
 	}
-	if cleanToken.BackupGroup != token.BackupGroup && token.BackupGroup != "" {
-		err = validateTokenGroup(token.BackupGroup, userId)
-		if err != nil {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": err.Error(),
-			})
-			return
-		}
+	if cleanToken.BackupGroup != token.BackupGroup {
+		changedGroups = append(changedGroups, token.BackupGroup)
+	}
+	if err := validateTokenGroups(c.Request.Context(), userId, changedGroups...); err != nil {
+		common.APIRespondWithError(c, http.StatusOK, err)
+		return
 	}
 
 	if statusOnly != "" {
 		cleanToken.Status = token.Status
 	} else {
-		// If you add more fields, please also update token.Update()
+		if request.ExpectedRemainQuota == nil {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "缺少 expected_remain_quota，请刷新令牌后重试",
+			})
+			return
+		}
 		cleanToken.Name = token.Name
 		cleanToken.ExpiredTime = token.ExpiredTime
 		cleanToken.RemainQuota = token.RemainQuota
@@ -322,8 +310,11 @@ func UpdateToken(c *gin.Context) {
 		// 可信用户：直接使用前端传入的值（包括空值，用于清除 BillingTag）
 
 		cleanToken.Setting.Set(newSetting)
+		err = cleanToken.UpdateMutableFields(request.ExpectedRemainQuota)
 	}
-	err = cleanToken.Update()
+	if statusOnly != "" {
+		err = cleanToken.UpdateMutableFields(nil)
+	}
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
@@ -346,11 +337,12 @@ func UpdateToken(c *gin.Context) {
 	})
 }
 
-// UpdateTokenByAdmin 管理员更新任意token（支持转移用户）
+// UpdateTokenByAdmin 管理员更新任意 token。Token principal 在 incarnation
+// 内不可变；更换 owner 必须创建新 token 并撤销旧 token。
 func UpdateTokenByAdmin(c *gin.Context) {
 	statusOnly := c.Query("status_only")
-	token := model.Token{}
-	err := c.ShouldBindJSON(&token)
+	request := tokenUpdateRequest{}
+	err := c.ShouldBindJSON(&request)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
@@ -358,6 +350,7 @@ func UpdateTokenByAdmin(c *gin.Context) {
 		})
 		return
 	}
+	token := request.Token
 	if len(token.Name) > 30 {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
@@ -399,48 +392,38 @@ func UpdateTokenByAdmin(c *gin.Context) {
 		}
 	}
 
-	// 验证目标用户是否存在（如果要转移token）
 	if token.UserId > 0 && token.UserId != cleanToken.UserId {
-		targetUser, err := model.GetUserById(token.UserId, false)
-		if err != nil || targetUser == nil {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "目标用户不存在",
-			})
-			return
-		}
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "令牌所属用户不可修改；请创建新令牌并撤销旧令牌",
+		})
+		return
 	}
 
-	// 验证用户组（使用目标用户ID）
 	targetUserId := cleanToken.UserId
-	if token.UserId > 0 {
-		targetUserId = token.UserId
-	}
 
-	if cleanToken.Group != token.Group && token.Group != "" {
-		err = validateTokenGroupForUser(token.Group, targetUserId)
-		if err != nil {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": err.Error(),
-			})
-			return
-		}
+	var changedGroups []string
+	if cleanToken.Group != token.Group {
+		changedGroups = append(changedGroups, token.Group)
 	}
-	if cleanToken.BackupGroup != token.BackupGroup && token.BackupGroup != "" {
-		err = validateTokenGroupForUser(token.BackupGroup, targetUserId)
-		if err != nil {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": err.Error(),
-			})
-			return
-		}
+	if cleanToken.BackupGroup != token.BackupGroup {
+		changedGroups = append(changedGroups, token.BackupGroup)
+	}
+	if err := validateTokenGroups(c.Request.Context(), targetUserId, changedGroups...); err != nil {
+		common.APIRespondWithError(c, http.StatusOK, err)
+		return
 	}
 
 	if statusOnly != "" {
 		cleanToken.Status = token.Status
 	} else {
+		if request.ExpectedRemainQuota == nil {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "缺少 expected_remain_quota，请刷新令牌后重试",
+			})
+			return
+		}
 		cleanToken.Name = token.Name
 		cleanToken.ExpiredTime = token.ExpiredTime
 		cleanToken.RemainQuota = token.RemainQuota
@@ -448,14 +431,11 @@ func UpdateTokenByAdmin(c *gin.Context) {
 		cleanToken.Group = token.Group
 		cleanToken.BackupGroup = token.BackupGroup
 		cleanToken.Setting.Set(newSetting)
-
-		// 管理员可以转移token给其他用户
-		if token.UserId > 0 {
-			cleanToken.UserId = token.UserId
-		}
+		err = cleanToken.UpdateMutableFields(request.ExpectedRemainQuota)
 	}
-
-	err = cleanToken.UpdateByAdmin()
+	if statusOnly != "" {
+		err = cleanToken.UpdateMutableFields(nil)
+	}
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
@@ -471,40 +451,30 @@ func UpdateTokenByAdmin(c *gin.Context) {
 	})
 }
 
-// validateTokenGroupForUser 验证用户组是否对指定用户有效
-func validateTokenGroupForUser(tokenGroup string, userId int) error {
-	userGroup, _ := model.CacheGetUserGroup(userId)
-	if userGroup == "" {
-		return errors.New("获取用户组信息失败")
+// validateTokenGroups 在一次权限决策中复用权威用户归属。
+func validateTokenGroups(ctx context.Context, userId int, tokenGroups ...string) error {
+	var user *model.UserRoutingState
+	for _, tokenGroup := range tokenGroups {
+		if tokenGroup == "" {
+			continue
+		}
+		if user == nil {
+			var err error
+			user, err = model.GetUserRoutingState(ctx, userId)
+			if err != nil {
+				return err
+			}
+			if user.Status != config.UserStatusEnabled {
+				return errors.New("用户不可用")
+			}
+			if err := model.EnsureUserGroupPolicyAvailable(ctx); err != nil {
+				return err
+			}
+		}
+		if _, err := model.GetAuthorizedUserGroup(user, tokenGroup); err != nil {
+			return err
+		}
 	}
-
-	groupRatio := model.GlobalUserGroupRatio.GetBySymbol(tokenGroup)
-	if groupRatio == nil {
-		return errors.New("无效的用户组")
-	}
-
-	if !groupRatio.Public && userGroup != tokenGroup {
-		return errors.New("目标用户无权使用指定的分组")
-	}
-
-	return nil
-}
-
-func validateTokenGroup(tokenGroup string, userId int) error {
-	userGroup, _ := model.CacheGetUserGroup(userId)
-	if userGroup == "" {
-		return errors.New("获取用户组信息失败")
-	}
-
-	groupRatio := model.GlobalUserGroupRatio.GetBySymbol(tokenGroup)
-	if groupRatio == nil {
-		return errors.New("无效的用户组")
-	}
-
-	if !groupRatio.Public && userGroup != tokenGroup {
-		return errors.New("当前用户组无权使用指定的分组")
-	}
-
 	return nil
 }
 

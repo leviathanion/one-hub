@@ -82,7 +82,12 @@ func getGitHubUserInfoByCode(code string) (*GitHubUser, error) {
 	if code == "" {
 		return nil, errors.New("无效的参数")
 	}
-	values := map[string]string{"client_id": config.GitHubClientId, "client_secret": config.GitHubClientSecret, "code": code}
+	options := config.GlobalOption.RuntimeSnapshot()
+	values := map[string]string{
+		"client_id":     options.String("GitHubClientId", config.GitHubClientId),
+		"client_secret": options.String("GitHubClientSecret", config.GitHubClientSecret),
+		"code":          code,
+	}
 	jsonData, err := json.Marshal(values)
 	if err != nil {
 		return nil, err
@@ -184,32 +189,11 @@ func getGithubEmail(githubEmails []*GithubEmail) string {
 	return ""
 }
 
-func getUserByGitHub(githubUser *GitHubUser) (user *model.User, err error) {
-	// 优先检测 GitHubIdNew
-	if model.IsGitHubIdNewAlreadyTaken(githubUser.Id) {
-		user, err = model.FindUserByField("github_id_new", githubUser.Id)
-		if err != nil {
-			return nil, err
-		}
+func getUserByGitHub(githubUser *GitHubUser) (*model.User, error) {
+	if githubUser == nil || githubUser.Id <= 0 {
+		return nil, errors.New("无效的 GitHub 身份")
 	}
-
-	// 如果 GitHubIdNew 不存在，并且没有关闭 GitHubOldId登录，则检测 GitHubId
-	if user == nil && !config.GitHubOldIdCloseEnabled && model.IsGitHubIdAlreadyTaken(githubUser.Login) {
-		user, err = model.FindUserByField("github_id", githubUser.Login)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// 如果 GitHubId 不存在，则检测 Email
-	if user == nil && model.IsEmailAlreadyTaken(githubUser.Email) {
-		user, err = model.FindUserByField("email", githubUser.Email)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	return user, nil
+	return model.FindUserByField("github_id_new", githubUser.Id)
 }
 
 func GitHubOAuth(c *gin.Context) {
@@ -228,7 +212,7 @@ func GitHubOAuth(c *gin.Context) {
 		return
 	}
 
-	if !config.GitHubOAuthEnabled {
+	if !config.GlobalOption.RuntimeSnapshot().Bool("GitHubOAuthEnabled", config.GitHubOAuthEnabled) {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": "管理员未开启通过 GitHub 登录以及注册",
@@ -258,7 +242,7 @@ func GitHubOAuth(c *gin.Context) {
 
 	// 如果用户不存在，则创建用户
 	if user == nil {
-		if !config.RegisterEnabled {
+		if !config.GlobalOption.RuntimeSnapshot().Bool("RegisterEnabled", config.RegisterEnabled) {
 			c.JSON(http.StatusOK, gin.H{
 				"success": false,
 				"message": "管理员关闭了新用户注册",
@@ -327,11 +311,16 @@ func GitHubOAuth(c *gin.Context) {
 		return
 	}
 
+	if err := model.UpdateUserIdentity(user.Id, model.UserIdentityPatch{GitHubID: &user.GitHubId, GitHubIDNew: &user.GitHubIdNew, EmailIfEmpty: user.Email, AvatarIfEmpty: user.AvatarUrl}); err != nil {
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+
 	setupLogin(user, c)
 }
 
 func GitHubBind(c *gin.Context) {
-	if !config.GitHubOAuthEnabled {
+	if !config.GlobalOption.RuntimeSnapshot().Bool("GitHubOAuthEnabled", config.GitHubOAuthEnabled) {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": "管理员未开启通过 GitHub 登录以及注册",
@@ -350,13 +339,7 @@ func GitHubBind(c *gin.Context) {
 	user := model.User{
 		GitHubId: githubUser.Login,
 	}
-	if model.IsGitHubIdAlreadyTaken(user.GitHubId) {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "该 GitHub 账户已被绑定",
-		})
-		return
-	}
+
 	id, ok := currentSessionUserID(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{
@@ -385,7 +368,7 @@ func GitHubBind(c *gin.Context) {
 		user.Email = githubUser.Email
 	}
 
-	err = user.Update(false)
+	err = model.UpdateUserIdentity(user.Id, model.UserIdentityPatch{GitHubID: &user.GitHubId, GitHubIDNew: &user.GitHubIdNew, EmailIfEmpty: user.Email, AvatarIfEmpty: user.AvatarUrl})
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,

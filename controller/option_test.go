@@ -2,13 +2,16 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
 	"one-api/common/config"
+	"one-api/internal/testutil/sqlitetest"
 	"one-api/model"
 	"one-api/providers/codex"
 	runtimeaffinity "one-api/runtime/channelaffinity"
@@ -26,7 +29,6 @@ func useControllerTestOptionDB(t *testing.T) {
 	originalGitHubOAuthEnabled := config.GitHubOAuthEnabled
 	originalGitHubClientID := config.GitHubClientId
 	originalGitHubClientSecret := config.GitHubClientSecret
-	originalGitHubOldIDCloseEnabled := config.GitHubOldIdCloseEnabled
 	originalWeChatAuthEnabled := config.WeChatAuthEnabled
 	originalWeChatServerAddress := config.WeChatServerAddress
 	originalWeChatServerToken := config.WeChatServerToken
@@ -46,12 +48,15 @@ func useControllerTestOptionDB(t *testing.T) {
 	originalEmailDomainRestrictionEnabled := config.EmailDomainRestrictionEnabled
 	originalEmailDomainWhitelist := append([]string(nil), config.EmailDomainWhitelist...)
 
-	testDB, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	testDB, err := gorm.Open(sqlite.Open(sqlitetest.MemoryDSN()), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("expected in-memory sqlite database, got %v", err)
 	}
-	if err := testDB.AutoMigrate(&model.Option{}); err != nil {
+	if err := testDB.AutoMigrate(&model.Option{}, &model.PublicationVersion{}); err != nil {
 		t.Fatalf("expected option schema migration, got %v", err)
+	}
+	if err := model.EnsurePublicationVersionRows(testDB); err != nil {
+		t.Fatal(err)
 	}
 	if err := testDB.Exec("DELETE FROM options").Error; err != nil {
 		t.Fatalf("expected option table reset, got %v", err)
@@ -62,7 +67,6 @@ func useControllerTestOptionDB(t *testing.T) {
 	config.GitHubOAuthEnabled = false
 	config.GitHubClientId = ""
 	config.GitHubClientSecret = ""
-	config.GitHubOldIdCloseEnabled = false
 	config.WeChatAuthEnabled = false
 	config.WeChatServerAddress = ""
 	config.WeChatServerToken = ""
@@ -118,7 +122,6 @@ func useControllerTestOptionDB(t *testing.T) {
 		config.GitHubOAuthEnabled = originalGitHubOAuthEnabled
 		config.GitHubClientId = originalGitHubClientID
 		config.GitHubClientSecret = originalGitHubClientSecret
-		config.GitHubOldIdCloseEnabled = originalGitHubOldIDCloseEnabled
 		config.WeChatAuthEnabled = originalWeChatAuthEnabled
 		config.WeChatServerAddress = originalWeChatServerAddress
 		config.WeChatServerToken = originalWeChatServerToken
@@ -161,6 +164,24 @@ func seedControllerTestOptions(t *testing.T, values map[string]string) {
 	}
 }
 
+func optionRequestBody(t *testing.T, raw string) *bytes.Buffer {
+	t.Helper()
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		t.Fatalf("invalid option request fixture: %v", err)
+	}
+	version, err := model.ReadPublicationVersion(context.Background(), model.DB, model.PublicationOwnerOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload["expected_version"] = json.RawMessage(strconv.FormatInt(version, 10))
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bytes.NewBuffer(encoded)
+}
+
 func TestGetOptionsIncludesSensitiveOptionStatusesWithoutValues(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	useControllerTestOptionDB(t)
@@ -171,25 +192,35 @@ func TestGetOptionsIncludesSensitiveOptionStatusesWithoutValues(t *testing.T) {
 	if err := model.UpdateOption("GitHubClientSecret", "sec_test"); err != nil {
 		t.Fatalf("expected github client secret seed to persist, got %v", err)
 	}
-	if err := model.UpdateOption("CFWorkerImageKey", "cf-secret"); err != nil {
-		t.Fatalf("expected cf worker image key seed to persist, got %v", err)
-	}
-
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/option/", nil)
 
 	GetOptions(ctx)
+	if bytes.Contains(recorder.Body.Bytes(), []byte("sec_test")) {
+		t.Fatalf("sensitive value leaked in raw response: %s", recorder.Body.String())
+	}
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected 200 status, got %d", recorder.Code)
 	}
 
 	var payload struct {
-		Success bool           `json:"success"`
-		Data    []model.Option `json:"data"`
-		Meta    struct {
-			SensitiveOptions map[string]config.SensitiveOptionStatus `json:"sensitive_options"`
+		Success bool  `json:"success"`
+		Version int64 `json:"version"`
+		Data    []struct {
+			Key       string                     `json:"key"`
+			Effective string                     `json:"effective"`
+			Override  *string                    `json:"override"`
+			Source    config.RuntimeOptionSource `json:"source"`
+			Version   int64                      `json:"version"`
+		} `json:"data"`
+		Meta struct {
+			SensitiveOptions map[string]struct {
+				Configured bool                       `json:"configured"`
+				Source     config.RuntimeOptionSource `json:"source"`
+				Version    int64                      `json:"version"`
+			} `json:"sensitive_options"`
 		} `json:"meta"`
 	}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
@@ -199,16 +230,30 @@ func TestGetOptionsIncludesSensitiveOptionStatusesWithoutValues(t *testing.T) {
 		t.Fatalf("expected success payload, got %#v", payload)
 	}
 
-	for _, option := range payload.Data {
-		if option.Key == "GitHubClientSecret" || option.Key == "CFWorkerImageKey" {
+	var publicClientID *struct {
+		Key       string                     `json:"key"`
+		Effective string                     `json:"effective"`
+		Override  *string                    `json:"override"`
+		Source    config.RuntimeOptionSource `json:"source"`
+		Version   int64                      `json:"version"`
+	}
+	for index := range payload.Data {
+		option := &payload.Data[index]
+		if option.Key == "GitHubClientSecret" {
 			t.Fatalf("expected sensitive options to be omitted from public payload, got %#v", payload.Data)
 		}
+		if option.Key == "GitHubClientId" {
+			publicClientID = option
+		}
+	}
+	if publicClientID == nil || publicClientID.Effective != "cli_test" || publicClientID.Override == nil || *publicClientID.Override != "cli_test" || publicClientID.Source != config.RuntimeOptionSourceOverride || publicClientID.Version != payload.Version {
+		t.Fatalf("public option source/effective/version contract is incomplete: version=%d option=%+v", payload.Version, publicClientID)
 	}
 	if !payload.Meta.SensitiveOptions["GitHubClientSecret"].Configured {
 		t.Fatalf("expected GitHubClientSecret configured status, got %#v", payload.Meta.SensitiveOptions)
 	}
-	if !payload.Meta.SensitiveOptions["CFWorkerImageKey"].Configured {
-		t.Fatalf("expected CFWorkerImageKey configured status, got %#v", payload.Meta.SensitiveOptions)
+	if status := payload.Meta.SensitiveOptions["GitHubClientSecret"]; status.Source != config.RuntimeOptionSourceOverride || status.Version != payload.Version {
+		t.Fatalf("sensitive option source/version is incomplete: %+v", status)
 	}
 	if payload.Meta.SensitiveOptions["SMTPToken"].Configured {
 		t.Fatalf("expected empty SMTPToken to report unconfigured, got %#v", payload.Meta.SensitiveOptions["SMTPToken"])
@@ -219,11 +264,11 @@ func TestUpdateOptionAllowsClearingSensitiveOption(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	useControllerTestOptionDB(t)
 
-	if err := model.UpdateOption("CFWorkerImageKey", "cf-secret"); err != nil {
-		t.Fatalf("expected cf worker image key seed to persist, got %v", err)
+	if err := model.UpdateOption("GitHubClientSecret", "sec_test"); err != nil {
+		t.Fatalf("expected github client secret seed to persist, got %v", err)
 	}
 
-	body := bytes.NewBufferString(`{"key":"CFWorkerImageKey","value":""}`)
+	body := optionRequestBody(t, `{"key":"GitHubClientSecret","value":""}`)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/option/", body)
@@ -239,16 +284,66 @@ func TestUpdateOptionAllowsClearingSensitiveOption(t *testing.T) {
 	if !payload.Success {
 		t.Fatalf("expected sensitive option clear to succeed, got %#v", payload)
 	}
-	if got := config.GlobalOption.Get("CFWorkerImageKey"); got != "" {
+	if got := config.GlobalOption.Get("GitHubClientSecret"); got != "" {
 		t.Fatalf("expected in-memory secret to be cleared, got %q", got)
 	}
 
-	stored, err := model.GetOption("CFWorkerImageKey")
+	stored, err := model.GetOption("GitHubClientSecret")
 	if err != nil {
-		t.Fatalf("expected stored cf worker image key lookup to succeed, got %v", err)
+		t.Fatalf("expected stored github client secret lookup to succeed, got %v", err)
 	}
 	if stored.Value != "" {
 		t.Fatalf("expected stored secret to be cleared, got %q", stored.Value)
+	}
+}
+
+func TestUpdateOptionInheritDeletesOverrideAndPublishesDefaultSource(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	useControllerTestOptionDB(t)
+	override := `{"enabled":false,"default_ttl_seconds":60,"max_entries":10,"rules":[]}`
+	if err := model.UpdateOption("ChannelAffinitySetting", override); err != nil {
+		t.Fatal(err)
+	}
+	before, ok := config.GlobalOption.RuntimeSnapshot().Get("ChannelAffinitySetting")
+	if !ok || before.Source != config.RuntimeOptionSourceOverride {
+		t.Fatalf("override source was not published: %+v", before)
+	}
+
+	body := optionRequestBody(t, `{"key":"ChannelAffinitySetting","inherit":true}`)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/option/", body)
+	UpdateOption(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("inherit status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	after, ok := config.GlobalOption.RuntimeSnapshot().Get("ChannelAffinitySetting")
+	if !ok || after.Source != config.RuntimeOptionSourceDefault || after.Override != nil || after.Effective == "" {
+		t.Fatalf("inherit source/effective value is wrong: %+v", after)
+	}
+	if _, err := model.GetOption("ChannelAffinitySetting"); err == nil {
+		t.Fatal("inherit kept an override row")
+	}
+}
+
+func TestUpdateOptionReturnsConflictForStaleVersion(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	useControllerTestOptionDB(t)
+	first := optionRequestBody(t, `{"key":"PreferredChannelWaitMilliseconds","value":10}`)
+	firstRecorder := httptest.NewRecorder()
+	firstContext, _ := gin.CreateTestContext(firstRecorder)
+	firstContext.Request = httptest.NewRequest(http.MethodPut, "/api/option/", first)
+	UpdateOption(firstContext)
+	if firstRecorder.Code != http.StatusOK {
+		t.Fatalf("first update status=%d body=%s", firstRecorder.Code, firstRecorder.Body.String())
+	}
+
+	staleRecorder := httptest.NewRecorder()
+	staleContext, _ := gin.CreateTestContext(staleRecorder)
+	staleContext.Request = httptest.NewRequest(http.MethodPut, "/api/option/", bytes.NewBufferString(`{"expected_version":1,"key":"PreferredChannelWaitMilliseconds","value":20}`))
+	UpdateOption(staleContext)
+	if staleRecorder.Code != http.StatusConflict {
+		t.Fatalf("stale update status=%d body=%s", staleRecorder.Code, staleRecorder.Body.String())
 	}
 }
 
@@ -266,7 +361,7 @@ func TestUpdateOptionBatchRejectsClearingGitHubSecretWhileOAuthEnabled(t *testin
 		t.Fatalf("expected github oauth seed to persist, got %v", err)
 	}
 
-	body := bytes.NewBufferString(`{"updates":[{"key":"GitHubClientSecret","value":""}]}`)
+	body := optionRequestBody(t, `{"updates":[{"key":"GitHubClientSecret","value":""}]}`)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/option/batch", body)
@@ -306,7 +401,7 @@ func TestUpdateOptionBatchAllowsDisablingGitHubOAuthAndClearingSecretTogether(t 
 		t.Fatalf("expected github oauth seed to persist, got %v", err)
 	}
 
-	body := bytes.NewBufferString(`{"updates":[{"key":"GitHubOAuthEnabled","value":"false"},{"key":"GitHubClientSecret","value":""}]}`)
+	body := optionRequestBody(t, `{"updates":[{"key":"GitHubOAuthEnabled","value":"false"},{"key":"GitHubClientSecret","value":""}]}`)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/option/batch", body)
@@ -337,7 +432,7 @@ func TestUpdateOptionBatchRejectsEnablingGitHubOAuthWithoutSecret(t *testing.T) 
 	gin.SetMode(gin.TestMode)
 	useControllerTestOptionDB(t)
 
-	body := bytes.NewBufferString(`{"updates":[{"key":"GitHubClientId","value":"cli_a"},{"key":"GitHubOAuthEnabled","value":"true"}]}`)
+	body := optionRequestBody(t, `{"updates":[{"key":"GitHubClientId","value":"cli_a"},{"key":"GitHubOAuthEnabled","value":"true"}]}`)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/option/batch", body)
@@ -374,7 +469,7 @@ func TestUpdateOptionBatchRejectsIncrementalGitHubRepairWhenConfigStillInvalid(t
 		"GitHubOAuthEnabled": "true",
 	})
 
-	body := bytes.NewBufferString(`{"updates":[{"key":"GitHubClientId","value":"cli_partial"}]}`)
+	body := optionRequestBody(t, `{"updates":[{"key":"GitHubClientId","value":"cli_partial"}]}`)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/option/batch", body)
@@ -555,7 +650,7 @@ func TestUpdateOptionRejectsInvalidPreferredChannelWaitMillisecondsValue(t *test
 	gin.SetMode(gin.TestMode)
 	useControllerTestOptionDB(t)
 
-	body := bytes.NewBufferString(`{"key":"PreferredChannelWaitMilliseconds","value":1.5}`)
+	body := optionRequestBody(t, `{"key":"PreferredChannelWaitMilliseconds","value":1.5}`)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/option/", body)
@@ -597,7 +692,7 @@ func TestUpdateOptionBatchPersistsCodexSettingsAtomically(t *testing.T) {
 		codex.RoutingHintSettingsInstance = originalRoutingHint
 	})
 
-	body := bytes.NewBufferString(`{"updates":[{"key":"PreferredChannelWaitMilliseconds","value":25},{"key":"PreferredChannelWaitPollMilliseconds","value":5},{"key":"CodexRoutingHintSetting","value":"{\"prompt_cache_key_strategy\":\"auto\",\"model_regex\":\"^gpt-5$\"}"}]}`)
+	body := optionRequestBody(t, `{"updates":[{"key":"PreferredChannelWaitMilliseconds","value":25},{"key":"PreferredChannelWaitPollMilliseconds","value":5},{"key":"CodexRoutingHintSetting","value":"{\"prompt_cache_key_strategy\":\"auto\",\"model_regex\":\"^gpt-5$\"}"}]}`)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/option/batch", body)
@@ -625,8 +720,9 @@ func TestUpdateOptionBatchPersistsCodexSettingsAtomically(t *testing.T) {
 	if got := config.GlobalOption.Get("PreferredChannelWaitPollMilliseconds"); got != "5" {
 		t.Fatalf("expected preferred poll wait to persist as 5, got %q", got)
 	}
-	if codex.RoutingHintSettingsInstance.ModelRegex != "^gpt-5$" {
-		t.Fatalf("expected routing hint model regex to update, got %#v", codex.RoutingHintSettingsInstance)
+	routingHint := codex.DefaultRoutingHintSettings()
+	if err := routingHint.SetFromJSON(config.GlobalOption.Get("CodexRoutingHintSetting")); err != nil || routingHint.ModelRegex != "^gpt-5$" {
+		t.Fatalf("expected routing hint snapshot to update, got %#v err=%v", routingHint, err)
 	}
 
 	storedWait, err := model.GetOption("PreferredChannelWaitMilliseconds")
@@ -646,7 +742,7 @@ func TestUpdateOptionBatchRejectsInvalidCodexJSONWithoutPartialPersistence(t *te
 		t.Fatalf("expected initial wait value to persist, got %v", err)
 	}
 
-	body := bytes.NewBufferString(`{"updates":[{"key":"PreferredChannelWaitMilliseconds","value":25},{"key":"CodexRoutingHintSetting","value":"{"}]}`)
+	body := optionRequestBody(t, `{"updates":[{"key":"PreferredChannelWaitMilliseconds","value":25},{"key":"CodexRoutingHintSetting","value":"{"}]}`)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/option/batch", body)
@@ -684,7 +780,7 @@ func TestUpdateOptionBatchRejectsDuplicateKeys(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	useControllerTestOptionDB(t)
 
-	body := bytes.NewBufferString(`{"updates":[{"key":"PreferredChannelWaitMilliseconds","value":25},{"key":"PreferredChannelWaitMilliseconds","value":30}]}`)
+	body := optionRequestBody(t, `{"updates":[{"key":"PreferredChannelWaitMilliseconds","value":25},{"key":"PreferredChannelWaitMilliseconds","value":30}]}`)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/option/batch", body)
@@ -718,7 +814,7 @@ func TestUpdateOptionBatchRejectsUnknownKeysWithoutPartialPersistence(t *testing
 		t.Fatalf("expected initial wait value to persist, got %v", err)
 	}
 
-	body := bytes.NewBufferString(`{"updates":[{"key":"PreferredChannelWaitMilliseconds","value":25},{"key":"UnknownOption","value":"value"}]}`)
+	body := optionRequestBody(t, `{"updates":[{"key":"PreferredChannelWaitMilliseconds","value":25},{"key":"UnknownOption","value":"value"}]}`)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/option/batch", body)
@@ -761,7 +857,7 @@ func TestUpdateOptionRejectsNonCanonicalBoolString(t *testing.T) {
 
 	original := config.GlobalOption.Get("PasswordLoginEnabled")
 
-	body := bytes.NewBufferString(`{"key":"PasswordLoginEnabled","value":"TRUE"}`)
+	body := optionRequestBody(t, `{"key":"PasswordLoginEnabled","value":"TRUE"}`)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/option/", body)
@@ -798,7 +894,7 @@ func TestUpdateOptionBatchRejectsInvalidCodexRegexWithoutPartialPersistence(t *t
 		t.Fatalf("expected initial wait value to persist, got %v", err)
 	}
 
-	body := bytes.NewBufferString(`{"updates":[{"key":"PreferredChannelWaitMilliseconds","value":25},{"key":"CodexRoutingHintSetting","value":"{\"prompt_cache_key_strategy\":\"auto\",\"model_regex\":\"[\"}"}]}`)
+	body := optionRequestBody(t, `{"updates":[{"key":"PreferredChannelWaitMilliseconds","value":25},{"key":"CodexRoutingHintSetting","value":"{\"prompt_cache_key_strategy\":\"auto\",\"model_regex\":\"[\"}"}]}`)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/option/batch", body)
@@ -832,7 +928,7 @@ func TestUpdateOptionBatchRejectsInvalidCodexRegexWithoutPartialPersistence(t *t
 	}
 }
 
-func TestUpdateOptionAllowsUnrelatedUpdateWhenExistingGitHubConfigInvalid(t *testing.T) {
+func TestUpdateOptionRejectsUnrelatedUpdateWhenDatabaseOverridesAreInvalid(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	useControllerTestOptionDB(t)
 
@@ -840,7 +936,7 @@ func TestUpdateOptionAllowsUnrelatedUpdateWhenExistingGitHubConfigInvalid(t *tes
 		"GitHubOAuthEnabled": "true",
 	})
 
-	body := bytes.NewBufferString(`{"key":"PreferredChannelWaitMilliseconds","value":15}`)
+	body := optionRequestBody(t, `{"key":"PreferredChannelWaitMilliseconds","value":15}`)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/option/", body)
@@ -853,23 +949,18 @@ func TestUpdateOptionAllowsUnrelatedUpdateWhenExistingGitHubConfigInvalid(t *tes
 	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("expected valid json payload, got %v", err)
 	}
-	if !payload.Success {
-		t.Fatalf("expected unrelated update to succeed despite invalid github config, got %#v", payload)
+	if payload.Success {
+		t.Fatalf("expected invalid complete candidate to reject unrelated update, got %#v", payload)
 	}
-	if got := config.GlobalOption.Get("PreferredChannelWaitMilliseconds"); got != "15" {
-		t.Fatalf("expected unrelated update to persist in memory, got %q", got)
+	if got := config.GlobalOption.Get("PreferredChannelWaitMilliseconds"); got == "15" {
+		t.Fatalf("rejected update leaked into runtime snapshot, got %q", got)
 	}
-
-	storedWait, err := model.GetOption("PreferredChannelWaitMilliseconds")
-	if err != nil {
-		t.Fatalf("expected stored preferred wait option, got %v", err)
-	}
-	if storedWait.Value != "15" {
-		t.Fatalf("expected unrelated update to persist stored value 15, got %q", storedWait.Value)
+	if _, err := model.GetOption("PreferredChannelWaitMilliseconds"); err == nil {
+		t.Fatal("rejected update was persisted")
 	}
 }
 
-func TestUpdateOptionAllowsIncrementalGitHubRepairWhenExistingConfigInvalid(t *testing.T) {
+func TestUpdateOptionBatchRepairsCompleteInvalidGitHubOverrideSet(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	useControllerTestOptionDB(t)
 
@@ -877,41 +968,24 @@ func TestUpdateOptionAllowsIncrementalGitHubRepairWhenExistingConfigInvalid(t *t
 		"GitHubOAuthEnabled": "true",
 	})
 
-	firstBody := bytes.NewBufferString(`{"key":"GitHubClientId","value":"cli_repair"}`)
-	firstRecorder := httptest.NewRecorder()
-	firstCtx, _ := gin.CreateTestContext(firstRecorder)
-	firstCtx.Request = httptest.NewRequest(http.MethodPut, "/api/option/", firstBody)
+	body := optionRequestBody(t, `{"updates":[{"key":"GitHubClientId","value":"cli_repair"},{"key":"GitHubClientSecret","value":"sec_repair"}]}`)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/option/batch", body)
 
-	UpdateOption(firstCtx)
+	UpdateOptionBatch(ctx)
 
-	var firstPayload struct {
+	var payload struct {
 		Success bool `json:"success"`
 	}
-	if err := json.Unmarshal(firstRecorder.Body.Bytes(), &firstPayload); err != nil {
-		t.Fatalf("expected valid json payload for first repair step, got %v", err)
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("expected valid json payload for repair batch, got %v", err)
 	}
-	if !firstPayload.Success {
-		t.Fatalf("expected first github repair step to succeed, got %#v", firstPayload)
+	if !payload.Success {
+		t.Fatalf("expected complete github repair batch to succeed, got %#v", payload)
 	}
 	if got := config.GlobalOption.Get("GitHubClientId"); got != "cli_repair" {
 		t.Fatalf("expected github client id repair to persist, got %q", got)
-	}
-
-	secondBody := bytes.NewBufferString(`{"key":"GitHubClientSecret","value":"sec_repair"}`)
-	secondRecorder := httptest.NewRecorder()
-	secondCtx, _ := gin.CreateTestContext(secondRecorder)
-	secondCtx.Request = httptest.NewRequest(http.MethodPut, "/api/option/", secondBody)
-
-	UpdateOption(secondCtx)
-
-	var secondPayload struct {
-		Success bool `json:"success"`
-	}
-	if err := json.Unmarshal(secondRecorder.Body.Bytes(), &secondPayload); err != nil {
-		t.Fatalf("expected valid json payload for second repair step, got %v", err)
-	}
-	if !secondPayload.Success {
-		t.Fatalf("expected second github repair step to succeed, got %#v", secondPayload)
 	}
 	if got := config.GlobalOption.Get("GitHubClientSecret"); got != "sec_repair" {
 		t.Fatalf("expected github client secret repair to persist, got %q", got)
@@ -934,7 +1008,7 @@ func TestUpdateOptionRejectsNoProgressGitHubRepairWhenConfigStillInvalid(t *test
 		"GitHubOAuthEnabled": "true",
 	})
 
-	body := bytes.NewBufferString(`{"key":"GitHubClientId","value":""}`)
+	body := optionRequestBody(t, `{"key":"GitHubClientId","value":""}`)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/option/", body)
@@ -972,7 +1046,7 @@ func TestUpdateOptionRejectsWorseningGitHubRepairWhenConfigStillInvalid(t *testi
 		"GitHubOAuthEnabled": "true",
 	})
 
-	body := bytes.NewBufferString(`{"key":"GitHubClientId","value":""}`)
+	body := optionRequestBody(t, `{"key":"GitHubClientId","value":""}`)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/option/", body)
@@ -993,8 +1067,8 @@ func TestUpdateOptionRejectsWorseningGitHubRepairWhenConfigStillInvalid(t *testi
 	if payload.Data["failed_key"] != "GitHubOAuthEnabled" {
 		t.Fatalf("expected failed_key GitHubOAuthEnabled, got %#v", payload.Data["failed_key"])
 	}
-	if got := config.GlobalOption.Get("GitHubClientId"); got != "cli_seed" {
-		t.Fatalf("expected failed worsening repair to preserve client id, got %q", got)
+	if got := config.GlobalOption.Get("GitHubClientId"); got != "" {
+		t.Fatalf("invalid direct rows must not replace last-good runtime snapshot, got %q", got)
 	}
 	storedClientID, err := model.GetOption("GitHubClientId")
 	if err != nil {
@@ -1019,7 +1093,7 @@ func TestUpdateOptionRejectsClearingGitHubSecretWhileOAuthEnabled(t *testing.T) 
 		t.Fatalf("expected github oauth seed to persist, got %v", err)
 	}
 
-	body := bytes.NewBufferString(`{"key":"GitHubClientSecret","value":""}`)
+	body := optionRequestBody(t, `{"key":"GitHubClientSecret","value":""}`)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/option/", body)
@@ -1057,7 +1131,7 @@ func TestUpdateOptionBatchEnablesLarkWhenCredentialsProvided(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	useControllerTestOptionDB(t)
 
-	body := bytes.NewBufferString(`{"updates":[{"key":"LarkClientId","value":"cli_a"},{"key":"LarkClientSecret","value":"sec_b"},{"key":"LarkAuthEnabled","value":"true"}]}`)
+	body := optionRequestBody(t, `{"updates":[{"key":"LarkClientId","value":"cli_a"},{"key":"LarkClientSecret","value":"sec_b"},{"key":"LarkAuthEnabled","value":"true"}]}`)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/option/batch", body)
@@ -1102,7 +1176,7 @@ func TestUpdateOptionBatchRejectsEnablingLarkWithoutSecret(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	useControllerTestOptionDB(t)
 
-	body := bytes.NewBufferString(`{"updates":[{"key":"LarkClientId","value":"cli_a"},{"key":"LarkAuthEnabled","value":"true"}]}`)
+	body := optionRequestBody(t, `{"updates":[{"key":"LarkClientId","value":"cli_a"},{"key":"LarkAuthEnabled","value":"true"}]}`)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/option/batch", body)

@@ -1,23 +1,59 @@
 package model
 
 import (
-	"errors"
+	"context"
 	"sync"
 	"testing"
 
 	"one-api/common/config"
+	"one-api/internal/testutil/sqlitetest"
 
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
 
+func TestBillingOptionRangesRejectUnsafeValues(t *testing.T) {
+	originalOptionManager := config.GlobalOption
+	originalDB := DB
+	t.Cleanup(func() {
+		config.GlobalOption = originalOptionManager
+		DB = originalDB
+	})
+
+	testDB, err := gorm.Open(sqlite.Open(sqlitetest.MemoryDSN()), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := testDB.AutoMigrate(&Option{}, &PublicationVersion{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsurePublicationVersionRows(testDB); err != nil {
+		t.Fatal(err)
+	}
+	DB = testDB
+	config.GlobalOption = config.NewOptionManager()
+	InitOptionMap()
+
+	for key, values := range map[string][]string{
+		"PreConsumedQuota": {"-1"},
+		"QuotaPerUnit":     {"0", "-0.1", "NaN", "+Inf"},
+	} {
+		for _, value := range values {
+			if _, err := config.GlobalOption.ValidateRuntimeOverrides(map[string]string{key: value}); err == nil {
+				t.Fatalf("%s accepted unsafe value %q", key, value)
+			}
+		}
+	}
+	if _, err := config.GlobalOption.ValidateRuntimeOverrides(map[string]string{"PreConsumedQuota": "0", "QuotaPerUnit": "1"}); err != nil {
+		t.Fatalf("valid billing option ranges rejected: %v", err)
+	}
+}
+
 func resetOptionSyncLogState(t *testing.T) {
 	t.Helper()
 	loggedUnknownOptionKeys = sync.Map{}
-	loggedInvalidOptionLoadErrors = sync.Map{}
 	t.Cleanup(func() {
 		loggedUnknownOptionKeys = sync.Map{}
-		loggedInvalidOptionLoadErrors = sync.Map{}
 	})
 }
 
@@ -43,12 +79,15 @@ func TestInitOptionMapRegistersPreferredChannelWaitOptions(t *testing.T) {
 		}
 	})
 
-	testDB, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	testDB, err := gorm.Open(sqlite.Open(sqlitetest.MemoryDSN()), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("expected in-memory sqlite database, got %v", err)
 	}
-	if err := testDB.AutoMigrate(&Option{}); err != nil {
+	if err := testDB.AutoMigrate(&Option{}, &PublicationVersion{}); err != nil {
 		t.Fatalf("expected option schema migration, got %v", err)
+	}
+	if err := EnsurePublicationVersionRows(testDB); err != nil {
+		t.Fatal(err)
 	}
 
 	config.GlobalOption = config.NewOptionManager()
@@ -82,7 +121,7 @@ func TestInitOptionMapRegistersPreferredChannelWaitOptions(t *testing.T) {
 	if got := config.GlobalOption.Get("RetryStatusCodes"); got != config.DefaultRetryStatusCodes {
 		t.Fatalf("expected retry status codes default registration, got %q", got)
 	}
-	if err := config.GlobalOption.Set("RetryStatusCodes", "401,403"); err != nil {
+	if err := UpdateOption("RetryStatusCodes", "401,403"); err != nil {
 		t.Fatalf("expected retry status codes option update to succeed, got %v", err)
 	}
 	if got := config.GlobalOption.Get("RetryStatusCodes"); got != "401,403" {
@@ -104,18 +143,26 @@ func TestInitOptionMapRegistersExplicitVisibilityForAllOptions(t *testing.T) {
 		DB = originalDB
 	})
 
-	testDB, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	testDB, err := gorm.Open(sqlite.Open(sqlitetest.MemoryDSN()), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("expected in-memory sqlite database, got %v", err)
 	}
-	if err := testDB.AutoMigrate(&Option{}); err != nil {
+	if err := testDB.AutoMigrate(&Option{}, &PublicationVersion{}); err != nil {
 		t.Fatalf("expected option schema migration, got %v", err)
+	}
+	if err := EnsurePublicationVersionRows(testDB); err != nil {
+		t.Fatal(err)
 	}
 
 	config.GlobalOption = config.NewOptionManager()
 	DB = testDB
 
 	InitOptionMap()
+	for _, removed := range []string{"ChatImageRequestProxy", "CFWorkerImageUrl", "CFWorkerImageKey"} {
+		if config.GlobalOption.IsRegistered(removed) {
+			t.Fatalf("legacy media proxy option remains registered: %s", removed)
+		}
+	}
 
 	for key := range config.GlobalOption.GetAll() {
 		metadata, exists := config.GlobalOption.GetMetadata(key)
@@ -128,7 +175,7 @@ func TestInitOptionMapRegistersExplicitVisibilityForAllOptions(t *testing.T) {
 	}
 }
 
-func TestInitOptionMapSkipsUnknownDatabaseOptions(t *testing.T) {
+func TestInitOptionMapRejectsUnknownDatabaseOverrides(t *testing.T) {
 	originalOptionManager := config.GlobalOption
 	originalDB := DB
 	originalWait := config.PreferredChannelWaitMilliseconds
@@ -140,12 +187,15 @@ func TestInitOptionMapSkipsUnknownDatabaseOptions(t *testing.T) {
 		config.PreferredChannelWaitPollMilliseconds = originalPoll
 	})
 
-	testDB, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	testDB, err := gorm.Open(sqlite.Open(sqlitetest.MemoryDSN()), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("expected in-memory sqlite database, got %v", err)
 	}
-	if err := testDB.AutoMigrate(&Option{}); err != nil {
+	if err := testDB.AutoMigrate(&Option{}, &PublicationVersion{}); err != nil {
 		t.Fatalf("expected option schema migration, got %v", err)
+	}
+	if err := EnsurePublicationVersionRows(testDB); err != nil {
+		t.Fatal(err)
 	}
 	if err := testDB.Exec("DELETE FROM options").Error; err != nil {
 		t.Fatalf("expected option table reset, got %v", err)
@@ -164,11 +214,11 @@ func TestInitOptionMapSkipsUnknownDatabaseOptions(t *testing.T) {
 
 	InitOptionMap()
 
-	if got := config.GlobalOption.Get("PreferredChannelWaitMilliseconds"); got != "30" {
-		t.Fatalf("expected known option to load despite unknown rows, got %q", got)
+	if snapshot := config.GlobalOption.RuntimeSnapshot(); snapshot != nil {
+		t.Fatalf("unknown override must prevent publication, got version %d", snapshot.Version())
 	}
-	if got := config.GlobalOption.Get("UnknownOption"); got != "" {
-		t.Fatalf("expected unknown option row to be ignored, got %q", got)
+	if err := CheckOptionsPublication(context.Background()); err == nil {
+		t.Fatal("unknown override must make options unready")
 	}
 }
 
@@ -180,12 +230,15 @@ func TestUpdateOptionRejectsUnknownKeysBeforePersistence(t *testing.T) {
 		DB = originalDB
 	})
 
-	testDB, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	testDB, err := gorm.Open(sqlite.Open(sqlitetest.MemoryDSN()), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("expected in-memory sqlite database, got %v", err)
 	}
-	if err := testDB.AutoMigrate(&Option{}); err != nil {
+	if err := testDB.AutoMigrate(&Option{}, &PublicationVersion{}); err != nil {
 		t.Fatalf("expected option schema migration, got %v", err)
+	}
+	if err := EnsurePublicationVersionRows(testDB); err != nil {
+		t.Fatal(err)
 	}
 	if err := testDB.Exec("DELETE FROM options").Error; err != nil {
 		t.Fatalf("expected option table reset, got %v", err)
@@ -200,114 +253,5 @@ func TestUpdateOptionRejectsUnknownKeysBeforePersistence(t *testing.T) {
 	}
 	if _, err := GetOption("UnknownOption"); err == nil {
 		t.Fatal("expected unknown option update to avoid persistence")
-	}
-}
-
-func TestShouldLogInvalidOptionLoadErrorDeduplicatesByMessage(t *testing.T) {
-	resetOptionSyncLogState(t)
-
-	if !shouldLogInvalidOptionLoadError("PreferredChannelWaitMilliseconds", errors.New("must be an integer")) {
-		t.Fatal("expected first invalid option load error to be logged")
-	}
-	if shouldLogInvalidOptionLoadError("PreferredChannelWaitMilliseconds", errors.New("must be an integer")) {
-		t.Fatal("expected repeated invalid option load error to be deduplicated")
-	}
-	if !shouldLogInvalidOptionLoadError("PreferredChannelWaitMilliseconds", errors.New("must be positive")) {
-		t.Fatal("expected changed invalid option load error to be logged again")
-	}
-}
-
-func TestLoadOptionsFromDatabaseClearsLoggedInvalidOptionLoadErrorAfterSuccessfulReload(t *testing.T) {
-	resetOptionSyncLogState(t)
-
-	originalOptionManager := config.GlobalOption
-	originalDB := DB
-	originalWait := config.PreferredChannelWaitMilliseconds
-	t.Cleanup(func() {
-		config.GlobalOption = originalOptionManager
-		DB = originalDB
-		config.PreferredChannelWaitMilliseconds = originalWait
-	})
-
-	testDB, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
-	if err != nil {
-		t.Fatalf("expected in-memory sqlite database, got %v", err)
-	}
-	if err := testDB.AutoMigrate(&Option{}); err != nil {
-		t.Fatalf("expected option schema migration, got %v", err)
-	}
-	if err := testDB.Exec("DELETE FROM options").Error; err != nil {
-		t.Fatalf("expected option table reset, got %v", err)
-	}
-	if err := testDB.Create(&Option{Key: "PreferredChannelWaitMilliseconds", Value: "bad"}).Error; err != nil {
-		t.Fatalf("expected invalid preferred wait seed to persist, got %v", err)
-	}
-
-	config.GlobalOption = config.NewOptionManager()
-	DB = testDB
-	config.PreferredChannelWaitMilliseconds = 10
-	InitOptionMap()
-
-	if _, exists := loggedInvalidOptionLoadErrors.Load("PreferredChannelWaitMilliseconds"); !exists {
-		t.Fatal("expected invalid preferred wait load to be tracked")
-	}
-
-	if err := testDB.Model(&Option{}).Where("key = ?", "PreferredChannelWaitMilliseconds").Update("value", "7").Error; err != nil {
-		t.Fatalf("expected preferred wait fix to persist, got %v", err)
-	}
-
-	loadOptionsFromDatabase()
-
-	if _, exists := loggedInvalidOptionLoadErrors.Load("PreferredChannelWaitMilliseconds"); exists {
-		t.Fatal("expected invalid preferred wait load state to clear after successful reload")
-	}
-	if got := config.GlobalOption.Get("PreferredChannelWaitMilliseconds"); got != "7" {
-		t.Fatalf("expected repaired preferred wait to reload as 7, got %q", got)
-	}
-}
-
-func TestLoadOptionsFromDatabaseClearsLoggedInvalidOptionLoadErrorWhenOptionDeleted(t *testing.T) {
-	resetOptionSyncLogState(t)
-
-	originalOptionManager := config.GlobalOption
-	originalDB := DB
-	originalWait := config.PreferredChannelWaitMilliseconds
-	t.Cleanup(func() {
-		config.GlobalOption = originalOptionManager
-		DB = originalDB
-		config.PreferredChannelWaitMilliseconds = originalWait
-	})
-
-	testDB, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
-	if err != nil {
-		t.Fatalf("expected in-memory sqlite database, got %v", err)
-	}
-	if err := testDB.AutoMigrate(&Option{}); err != nil {
-		t.Fatalf("expected option schema migration, got %v", err)
-	}
-	if err := testDB.Exec("DELETE FROM options").Error; err != nil {
-		t.Fatalf("expected option table reset, got %v", err)
-	}
-	if err := testDB.Create(&Option{Key: "PreferredChannelWaitMilliseconds", Value: "bad"}).Error; err != nil {
-		t.Fatalf("expected invalid preferred wait seed to persist, got %v", err)
-	}
-
-	config.GlobalOption = config.NewOptionManager()
-	DB = testDB
-	config.PreferredChannelWaitMilliseconds = 10
-	InitOptionMap()
-
-	if _, exists := loggedInvalidOptionLoadErrors.Load("PreferredChannelWaitMilliseconds"); !exists {
-		t.Fatal("expected invalid preferred wait load to be tracked")
-	}
-
-	if err := testDB.Delete(&Option{}, "key = ?", "PreferredChannelWaitMilliseconds").Error; err != nil {
-		t.Fatalf("expected invalid preferred wait row deletion to succeed, got %v", err)
-	}
-
-	loadOptionsFromDatabase()
-
-	if _, exists := loggedInvalidOptionLoadErrors.Load("PreferredChannelWaitMilliseconds"); exists {
-		t.Fatal("expected deleted invalid option load state to be cleared")
 	}
 }

@@ -25,6 +25,7 @@ import (
 	"one-api/metrics"
 	"one-api/middleware"
 	"one-api/model"
+	"one-api/payment"
 	"one-api/providers/codex"
 	"one-api/relay/task"
 	"one-api/router"
@@ -56,7 +57,6 @@ func main() {
 
 	logger.SetupLogger()
 	logger.SysLog("One Hub " + config.Version + " started")
-	config.LogRuntimeConfigWarnings()
 	middleware.WarnResponsesWSAnonymousCapacityBucketIfEnabled()
 
 	// Initialize user token
@@ -70,7 +70,10 @@ func main() {
 	defer model.CloseDB()
 	// Initialize Redis
 	redis.InitRedisClient()
-	model.StartUserQuotaCacheRepairWorker(context.Background(), time.Minute)
+	// 组限流器使用已确定的 Redis/内存后端，后续同版本同步会复用该实例。
+	if err := model.GlobalUserGroupRatio.Load(); err != nil {
+		logger.FatalLog("failed to load user group policy: " + err.Error())
+	}
 	codex.InitExecutionSessionManager()
 	cache.InitCacheManager()
 	// Initialize options
@@ -80,10 +83,12 @@ func main() {
 	// Initialize wenauthn
 	webauthn.InitWebAuthn()
 	model.NewPricing()
+	publicationCtx, stopPublicationWatchers := context.WithCancel(context.Background())
+	defer stopPublicationWatchers()
 	model.HandleOldTokenMaxId()
 
 	initMemoryCache()
-	initSync()
+	initSync(publicationCtx)
 
 	common.InitTokenEncoders()
 	requester.InitHttpClient()
@@ -120,13 +125,15 @@ func initMemoryCache() {
 
 	logger.SysLog("memory cache enabled")
 	logger.SysLog(fmt.Sprintf("sync frequency: %d seconds", syncFrequency))
-	go model.SyncOptions(syncFrequency)
 	go SyncChannelCache(syncFrequency)
 }
 
-func initSync() {
+func initSync(ctx context.Context) {
 	// go controller.AutomaticallyUpdateChannels(viper.GetInt("channel.update_frequency"))
 	go controller.AutomaticallyTestChannels(viper.GetInt("channel.test_frequency"))
+	go model.WatchPricePublication(ctx)
+	go model.WatchOptionsPublication(ctx)
+	go model.WatchUserGroupPublication(ctx)
 }
 
 func initHttpServer() {
@@ -135,7 +142,7 @@ func initHttpServer() {
 	}
 
 	server := gin.New()
-	server.Use(gin.Recovery())
+	server.Use(middleware.Recovery())
 	server.Use(middleware.RequestId())
 	middleware.SetUpLogger(server)
 
@@ -184,13 +191,15 @@ func gracefulShutdown(ctx context.Context, httpServer *http.Server, drainWebSock
 	if httpServer != nil {
 		shutdownHTTP = httpServer.Shutdown
 	}
-	return gracefulShutdownSteps(ctx, shutdownHTTP, drainWebSockets)
+	return gracefulShutdownSteps(ctx, shutdownHTTP, drainWebSockets, payment.Resources.Close)
 }
 
-func gracefulShutdownSteps(ctx context.Context, shutdownHTTP func(context.Context) error, drainWebSockets func(context.Context) error) error {
+func gracefulShutdownSteps(ctx context.Context, shutdownHTTP func(context.Context) error, drainWebSockets func(context.Context) error, closePayments func()) error {
 	var shutdownErrs []error
+	httpDrained := true
 	if shutdownHTTP != nil {
 		if err := shutdownHTTP(ctx); err != nil {
+			httpDrained = false
 			logger.SysError("failed to shutdown HTTP server: " + err.Error())
 			shutdownErrs = append(shutdownErrs, fmt.Errorf("http shutdown: %w", err))
 		}
@@ -200,6 +209,9 @@ func gracefulShutdownSteps(ctx context.Context, shutdownHTTP func(context.Contex
 			logger.SysError("failed to drain active websocket connections: " + err.Error())
 			shutdownErrs = append(shutdownErrs, fmt.Errorf("websocket drain: %w", err))
 		}
+	}
+	if httpDrained && closePayments != nil {
+		closePayments()
 	}
 	return errors.Join(shutdownErrs...)
 }
@@ -216,8 +228,6 @@ func SyncChannelCache(frequency int) {
 		if err := model.ChannelGroup.Load(); err != nil {
 			logger.SysError("failed to sync channels from database: " + err.Error())
 		}
-		model.GlobalUserGroupRatio.Load()
-		model.PricingInstance.Init()
 		model.ModelOwnedBysInstance.Load()
 	}
 }

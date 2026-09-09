@@ -1,8 +1,10 @@
 package model
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"gorm.io/gorm"
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/database"
@@ -10,8 +12,6 @@ import (
 	"one-api/common/redis"
 	"one-api/common/stmp"
 	"one-api/common/utils"
-
-	"gorm.io/gorm"
 )
 
 var (
@@ -21,7 +21,7 @@ var (
 	ErrTokenStatusUnavailable = errors.New("令牌状态不可用")
 	ErrTokenInvalid           = errors.New("无效的令牌")
 	ErrTokenQuotaGet          = errors.New("获取令牌额度失败")
-	ErrUserQuotaInsufficient  = errors.New("user quota is not enough")
+	ErrTokenQuotaConflict     = errors.New("令牌额度已发生变化，请刷新后重试")
 	ErrTokenQuotaInsufficient = errors.New("token quota is not enough")
 )
 
@@ -246,20 +246,6 @@ func ValidateUserToken(key string) (token *Token, err error) {
 		return nil, ErrTokenExpired
 	}
 
-	if !token.UnlimitedQuota {
-		if !token.UnlimitedQuota && token.RemainQuota <= 0 {
-			if !config.RedisEnabled {
-				// in this case, we can make sure the token is exhausted
-				token.Status = config.TokenStatusExhausted
-				err := token.SelectUpdate()
-				if err != nil {
-					logger.SysError("failed to update token status" + err.Error())
-				}
-			}
-			return nil, ErrTokenQuotaExhausted
-		}
-	}
-
 	return token, nil
 }
 
@@ -273,11 +259,18 @@ func GetTokenByIds(id int, userId int) (*Token, error) {
 }
 
 func GetTokenById(id int) (*Token, error) {
+	return GetTokenByIdWithContext(context.Background(), id)
+}
+
+func GetTokenByIdWithContext(ctx context.Context, id int) (*Token, error) {
 	if id == 0 {
 		return nil, errors.New("id 为空！")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var token Token
-	err := DB.First(&token, "id = ?", id).Error
+	err := DB.WithContext(ctx).First(&token, "id = ?", id).Error
 	return &token, err
 }
 
@@ -307,20 +300,31 @@ func (token *Token) Insert() error {
 	return err
 }
 
-// Update Make sure your token's fields is completed, because this will update non-zero values
-func (token *Token) Update() error {
-	err := DB.Model(token).Select("name", "status", "expired_time", "remain_quota", "unlimited_quota", "group", "backup_group", "setting").Updates(token).Error
-	// 防止Redis缓存不生效，直接删除
-	if err == nil && config.RedisEnabled {
-		redis.RedisDel(fmt.Sprintf(UserTokensKey, token.Key))
+// UpdateMutableFields updates token metadata and optionally applies a quota
+// compare-and-swap. UserId is deliberately absent: a token incarnation keeps
+// the principal it was created for. Full edits pass the quota value observed by
+// the caller so concurrent reserve/settlement deltas cause a conflict instead
+// of being overwritten. Status-only edits pass nil.
+func (token *Token) UpdateMutableFields(expectedRemainQuota *int) error {
+	updates := map[string]any{
+		"name":            token.Name,
+		"status":          token.Status,
+		"expired_time":    token.ExpiredTime,
+		"unlimited_quota": token.UnlimitedQuota,
+		"group":           token.Group,
+		"backup_group":    token.BackupGroup,
+		"setting":         token.Setting,
 	}
-
-	return err
-}
-
-// UpdateByAdmin 管理员更新token，支持更新user_id字段
-func (token *Token) UpdateByAdmin() error {
-	err := DB.Model(token).Select("user_id", "name", "status", "expired_time", "remain_quota", "unlimited_quota", "group", "backup_group", "setting").Updates(token).Error
+	db := DB.Model(&Token{}).Where("id = ?", token.Id)
+	if expectedRemainQuota != nil {
+		db = db.Where("remain_quota = ?", *expectedRemainQuota)
+		updates["remain_quota"] = token.RemainQuota
+	}
+	result := db.Updates(updates)
+	err := result.Error
+	if err == nil && expectedRemainQuota != nil && result.RowsAffected == 0 {
+		err = ErrTokenQuotaConflict
+	}
 	// 防止Redis缓存不生效，直接删除
 	if err == nil && config.RedisEnabled {
 		redis.RedisDel(fmt.Sprintf(UserTokensKey, token.Key))
@@ -350,6 +354,30 @@ func DeleteTokenById(id int, userId int) (err error) {
 		return err
 	}
 	err = token.Delete()
+
+	if err == nil && config.RedisEnabled {
+		redis.RedisDel(fmt.Sprintf(UserTokensKey, token.Key))
+	}
+
+	return err
+}
+
+var (
+	ErrUserQuotaInsufficient = errors.New("user quota is not enough")
+)
+
+func (token *Token) Update() error {
+	err := DB.Model(token).Select("name", "status", "expired_time", "remain_quota", "unlimited_quota", "group", "backup_group", "setting").Updates(token).Error
+
+	if err == nil && config.RedisEnabled {
+		redis.RedisDel(fmt.Sprintf(UserTokensKey, token.Key))
+	}
+
+	return err
+}
+
+func (token *Token) UpdateByAdmin() error {
+	err := DB.Model(token).Select("user_id", "name", "status", "expired_time", "remain_quota", "unlimited_quota", "group", "backup_group", "setting").Updates(token).Error
 
 	if err == nil && config.RedisEnabled {
 		redis.RedisDel(fmt.Sprintf(UserTokensKey, token.Key))
@@ -450,7 +478,6 @@ func sendQuotaWarningEmail(userId int, userQuota int, noMoreQuota bool) {
 	}
 }
 
-// PostConsumeTokenQuotaWithInfo 消费 token 配额，直接使用传入的 userId 和 unlimitedQuota，避免数据库查询
 func PostConsumeTokenQuotaWithInfo(tokenId int, userId int, unlimitedQuota bool, quota int) (err error) {
 	if quota == 0 {
 		return nil
@@ -525,9 +552,6 @@ func ApplyTokenUserQuotaDeltaDirect(tokenId int, userId int, unlimitedQuota bool
 		}
 	}
 
-	// Once the SQL commit is attempted after all local guards succeeded, pending
-	// batch reserves must not be replayed on a post-commit panic. If Commit
-	// reports an error, restore the pending adjustments for the next flush.
 	restorePending = false
 	if err = tx.Commit().Error; err != nil {
 		restorePending = true

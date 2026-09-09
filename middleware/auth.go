@@ -16,9 +16,8 @@ import (
 func authHelper(c *gin.Context, minRole int) {
 	session := sessions.Default(c)
 	username := session.Get("username")
-	role := session.Get("role")
 	id := session.Get("id")
-	status := session.Get("status")
+	var current *model.UserRoutingState
 	if username == nil {
 		// Check access token
 		accessToken := c.Request.Header.Get("Authorization")
@@ -38,9 +37,8 @@ func authHelper(c *gin.Context, minRole int) {
 		if user != nil && user.Username != "" {
 			// Token is valid
 			username = user.Username
-			role = user.Role
 			id = user.Id
-			status = user.Status
+			current = &model.UserRoutingState{Id: user.Id, Role: user.Role, Status: user.Status, Group: user.Group}
 		} else {
 			c.JSON(http.StatusOK, gin.H{
 				"success": false,
@@ -59,25 +57,19 @@ func authHelper(c *gin.Context, minRole int) {
 		c.Abort()
 		return
 	}
-	statusInt, ok := status.(int)
-	if !ok {
+	var err error
+	if current == nil {
+		current, err = model.GetUserRoutingState(c.Request.Context(), idInt)
+	}
+	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"success": false,
-			"message": "无权进行此操作，登录状态无效",
+			"message": "无权进行此操作，用户不可用",
 		})
 		c.Abort()
 		return
 	}
-	roleInt, ok := role.(int)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"success": false,
-			"message": "无权进行此操作，登录状态无效",
-		})
-		c.Abort()
-		return
-	}
-	if statusInt == config.UserStatusDisabled {
+	if current.Status != config.UserStatusEnabled {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": "用户已被封禁",
@@ -85,7 +77,7 @@ func authHelper(c *gin.Context, minRole int) {
 		c.Abort()
 		return
 	}
-	if roleInt < minRole {
+	if current.Role < minRole {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": "无权进行此操作，权限不足",
@@ -94,7 +86,7 @@ func authHelper(c *gin.Context, minRole int) {
 		return
 	}
 	c.Set("username", username)
-	c.Set("role", roleInt)
+	c.Set("role", current.Role)
 	c.Set("id", idInt)
 	c.Next()
 }
@@ -115,10 +107,16 @@ func TrySetUserBySession() func(c *gin.Context) {
 		}
 
 		c.Set("id", idInt)
-		userGroup, err := model.CacheGetUserGroup(idInt)
-		if err == nil {
-			c.Set("group", userGroup)
+		user, err := model.GetUserRoutingState(c.Request.Context(), idInt)
+		if err != nil {
+			abortWithMessage(c, http.StatusServiceUnavailable, "用户归属读取失败")
+			return
 		}
+		if user.Status != config.UserStatusEnabled {
+			abortWithMessage(c, http.StatusForbidden, "用户不可用")
+			return
+		}
+		c.Set("group", user.Group)
 		c.Next()
 	}
 }
@@ -161,6 +159,7 @@ func tokenAuth(c *gin.Context, credential authutil.Credential) {
 	c.Set("token_backup_group", token.BackupGroup)
 	c.Set("token_unlimited_quota", token.UnlimitedQuota)
 	c.Set("token_setting", utils.GetPointer(token.Setting.Data()))
+	markLongLivedPrincipalAuthenticated(c)
 	if err := checkLimitIP(c); err != nil {
 		abortWithMessage(c, http.StatusForbidden, err.Error())
 		return
@@ -180,6 +179,8 @@ func tokenAuth(c *gin.Context, credential authutil.Credential) {
 				c.Set("specific_channel_id", channelId)
 				if len(credential.SelectorParts) == 2 && credential.SelectorParts[1] == "ignore" {
 					c.Set("specific_channel_id_ignore", true)
+				} else {
+					c.Set(longLivedAdminSelectedChannelKey, channelId)
 				}
 			}
 		} else {

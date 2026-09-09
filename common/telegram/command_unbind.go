@@ -14,11 +14,7 @@ func commandUnbindStart(b *gotgbot.Bot, ctx *ext.Context) error {
 		return nil
 	}
 
-	updateUser := map[string]interface{}{
-		"telegram_id": 0,
-	}
-
-	err := model.UpdateUser(user.Id, updateUser)
+	err := model.SetUserTelegramID(user.Id, 0)
 	if err != nil {
 		ctx.EffectiveMessage.Reply(b, "绑定失败，请稍后再试", nil)
 		return handlers.EndConversation()

@@ -47,7 +47,7 @@ func GetUserGroupById(c *gin.Context) {
 }
 
 func AddUserGroup(c *gin.Context) {
-	userGroup := model.UserGroup{}
+	userGroup := model.UserGroup{Ratio: 1}
 	if err := c.ShouldBindJSON(&userGroup); err != nil {
 		common.APIRespondWithError(c, http.StatusOK, err)
 		return

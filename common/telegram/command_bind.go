@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"fmt"
+	"one-api/common/config"
 	"one-api/model"
 	"strings"
 
@@ -21,6 +22,9 @@ func commandBindInit() (handler ext.Handler) {
 }
 
 func commandBindStart(b *gotgbot.Bot, ctx *ext.Context) error {
+	if !requirePrivateChat(b, ctx) {
+		return handlers.EndConversation()
+	}
 	user := getBindUser(b, ctx)
 	if user != nil {
 		ctx.EffectiveMessage.Reply(b, "您的账户已绑定，请解邦后再试", nil)
@@ -38,6 +42,9 @@ func commandBindStart(b *gotgbot.Bot, ctx *ext.Context) error {
 }
 
 func commandBindToken(b *gotgbot.Bot, ctx *ext.Context) error {
+	if !requirePrivateChat(b, ctx) {
+		return handlers.EndConversation()
+	}
 	tgUserId := getTGUserId(b, ctx)
 	if tgUserId == 0 {
 		return handlers.EndConversation()
@@ -48,7 +55,7 @@ func commandBindToken(b *gotgbot.Bot, ctx *ext.Context) error {
 	input = strings.TrimSpace(input)
 
 	user := model.ValidateAccessToken(input)
-	if user == nil {
+	if user == nil || user.Status != config.UserStatusEnabled {
 		// If the number is not valid, try again!
 		ctx.EffectiveMessage.Reply(b, "Token 错误，请重试", &gotgbot.SendMessageOpts{
 			ParseMode:   "html",
@@ -74,7 +81,7 @@ func commandBindToken(b *gotgbot.Bot, ctx *ext.Context) error {
 		Id:         user.Id,
 		TelegramId: tgUserId,
 	}
-	err := updateUser.Update(false)
+	err := model.SetUserTelegramID(updateUser.Id, updateUser.TelegramId)
 	if err != nil {
 		ctx.EffectiveMessage.Reply(b, "绑定失败，请稍后再试", nil)
 		return handlers.EndConversation()

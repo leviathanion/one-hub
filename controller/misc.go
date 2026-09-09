@@ -15,6 +15,7 @@ import (
 )
 
 func GetStatus(c *gin.Context) {
+	options := config.GlobalOption.RuntimeSnapshot()
 	telegramBot := ""
 	if telegram.TGEnabled {
 		telegramBot = telegram.TGBot.User.Username
@@ -25,35 +26,35 @@ func GetStatus(c *gin.Context) {
 		"data": gin.H{
 			"version":             config.Version,
 			"start_time":          config.StartTime,
-			"email_verification":  config.EmailVerificationEnabled,
-			"github_oauth":        config.GitHubOAuthEnabled,
-			"github_client_id":    config.GitHubClientId,
-			"oidc_auth":           config.OIDCAuthEnabled,
-			"lark_login":          config.LarkAuthEnabled,
-			"lark_client_id":      config.LarkClientId,
-			"system_name":         config.SystemName,
-			"logo":                config.Logo,
+			"email_verification":  options.Bool("EmailVerificationEnabled", config.EmailVerificationEnabled),
+			"github_oauth":        options.Bool("GitHubOAuthEnabled", config.GitHubOAuthEnabled),
+			"github_client_id":    options.String("GitHubClientId", config.GitHubClientId),
+			"oidc_auth":           options.Bool("OIDCAuthEnabled", config.OIDCAuthEnabled),
+			"lark_login":          options.Bool("LarkAuthEnabled", config.LarkAuthEnabled),
+			"lark_client_id":      options.String("LarkClientId", config.LarkClientId),
+			"system_name":         options.String("SystemName", config.SystemName),
+			"logo":                options.String("Logo", config.Logo),
 			"language":            config.Language,
-			"footer_html":         config.Footer,
-			"analytics_code":      config.AnalyticsCode,
-			"wechat_qrcode":       config.WeChatAccountQRCodeImageURL,
-			"wechat_login":        config.WeChatAuthEnabled,
-			"server_address":      config.ServerAddress,
-			"turnstile_check":     config.TurnstileCheckEnabled,
-			"turnstile_site_key":  config.TurnstileSiteKey,
-			"top_up_link":         config.TopUpLink,
-			"chat_link":           config.ChatLink,
-			"quota_per_unit":      config.QuotaPerUnit,
-			"display_in_currency": config.DisplayInCurrencyEnabled,
+			"footer_html":         options.String("Footer", config.Footer),
+			"analytics_code":      options.String("AnalyticsCode", config.AnalyticsCode),
+			"wechat_qrcode":       options.String("WeChatAccountQRCodeImageURL", config.WeChatAccountQRCodeImageURL),
+			"wechat_login":        options.Bool("WeChatAuthEnabled", config.WeChatAuthEnabled),
+			"server_address":      options.String("ServerAddress", config.ServerAddress),
+			"turnstile_check":     options.Bool("TurnstileCheckEnabled", config.TurnstileCheckEnabled),
+			"turnstile_site_key":  options.String("TurnstileSiteKey", config.TurnstileSiteKey),
+			"top_up_link":         options.String("TopUpLink", config.TopUpLink),
+			"chat_link":           options.String("ChatLink", config.ChatLink),
+			"quota_per_unit":      options.Float64("QuotaPerUnit", config.QuotaPerUnit),
+			"display_in_currency": options.Bool("DisplayInCurrencyEnabled", config.DisplayInCurrencyEnabled),
 			"telegram_bot":        telegramBot,
-			"mj_notify_enabled":   config.MjNotifyEnabled,
-			"chat_links":          config.ChatLinks,
-			"PaymentUSDRate":      config.PaymentUSDRate,
-			"PaymentMinAmount":    config.PaymentMinAmount,
-			"RechargeDiscount":    config.RechargeDiscount,
-			"EnableSafe":          config.EnableSafe,
-			"SafeToolName":        config.SafeToolName,
-			"SafeKeyWords":        config.SafeKeyWords,
+			"mj_notify_enabled":   options.Bool("MjNotifyEnabled", config.MjNotifyEnabled),
+			"chat_links":          options.String("ChatLinks", config.ChatLinks),
+			"PaymentUSDRate":      options.Float64("PaymentUSDRate", config.PaymentUSDRate),
+			"PaymentMinAmount":    options.Int("PaymentMinAmount", config.PaymentMinAmount),
+			"RechargeDiscount":    options.String("RechargeDiscount", config.RechargeDiscount),
+			"EnableSafe":          options.Bool("EnableSafe", config.EnableSafe),
+			"SafeToolName":        options.String("SafeToolName", config.SafeToolName),
+			"SafeKeyWords":        options.Strings("SafeKeyWords", config.SafeKeyWords, "\n"),
 			"UserInvoiceMonth":    config.UserInvoiceMonth,
 			"UptimeDomain":        config.UPTIMEKUMA_DOMAIN,
 			"UptimePageName":      config.UPTIMEKUMA_STATUS_PAGE_NAME,
@@ -66,7 +67,7 @@ func GetNotice(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
-		"data":    config.GlobalOption.Get("Notice"),
+		"data":    config.GlobalOption.RuntimeSnapshot().String("Notice", ""),
 	})
 }
 
@@ -74,7 +75,7 @@ func GetAbout(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
-		"data":    config.GlobalOption.Get("About"),
+		"data":    config.GlobalOption.RuntimeSnapshot().String("About", ""),
 	})
 }
 
@@ -82,11 +83,12 @@ func GetHomePageContent(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
-		"data":    config.GlobalOption.Get("HomePageContent"),
+		"data":    config.GlobalOption.RuntimeSnapshot().String("HomePageContent", ""),
 	})
 }
 
 func SendEmailVerification(c *gin.Context) {
+	options := config.GlobalOption.RuntimeSnapshot()
 	email := c.Query("email")
 	if err := common.Validate.Var(email, "required,email"); err != nil {
 		c.JSON(http.StatusOK, gin.H{
@@ -95,9 +97,9 @@ func SendEmailVerification(c *gin.Context) {
 		})
 		return
 	}
-	if config.EmailDomainRestrictionEnabled {
+	if options.Bool("EmailDomainRestrictionEnabled", config.EmailDomainRestrictionEnabled) {
 		allowed := false
-		for _, domain := range config.EmailDomainWhitelist {
+		for _, domain := range options.Strings("EmailDomainWhitelist", config.EmailDomainWhitelist, ",") {
 			if strings.HasSuffix(email, "@"+domain) {
 				allowed = true
 				break
@@ -119,7 +121,10 @@ func SendEmailVerification(c *gin.Context) {
 		return
 	}
 	code := common.GenerateVerificationCode(6)
-	common.RegisterVerificationCodeWithKey(email, code, common.EmailVerificationPurpose)
+	if err := model.StoreUserVerification(c.Request.Context(), email, common.EmailVerificationPurpose, code, 0); err != nil {
+		common.APIRespondWithError(c, http.StatusOK, err)
+		return
+	}
 	err := stmp.SendVerificationCodeEmail(email, code)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
@@ -135,6 +140,7 @@ func SendEmailVerification(c *gin.Context) {
 }
 
 func SendPasswordResetEmail(c *gin.Context) {
+	options := config.GlobalOption.RuntimeSnapshot()
 	email := c.Query("email")
 	if err := common.Validate.Var(email, "required,email"); err != nil {
 		c.JSON(http.StatusOK, gin.H{
@@ -144,15 +150,9 @@ func SendPasswordResetEmail(c *gin.Context) {
 		return
 	}
 
-	user := &model.User{
-		Email: email,
-	}
-
-	if err := user.FillUserByEmail(); err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "该邮箱地址未注册",
-		})
+	user, err := model.FindPasswordRecoveryUser(c.Request.Context(), email)
+	if err != nil {
+		common.APIRespondWithError(c, http.StatusOK, err)
 		return
 	}
 
@@ -162,9 +162,12 @@ func SendPasswordResetEmail(c *gin.Context) {
 	}
 
 	code := common.GenerateVerificationCode(0)
-	common.RegisterVerificationCodeWithKey(email, code, common.PasswordResetPurpose)
-	link := fmt.Sprintf("%s/user/reset?email=%s&token=%s", config.ServerAddress, email, code)
-	err := stmp.SendPasswordResetEmail(userName, email, link)
+	if err := model.StoreUserVerification(c.Request.Context(), email, common.PasswordResetPurpose, code, user.Id); err != nil {
+		common.APIRespondWithError(c, http.StatusOK, err)
+		return
+	}
+	link := fmt.Sprintf("%s/user/reset?email=%s&token=%s", options.String("ServerAddress", config.ServerAddress), email, code)
+	err = stmp.SendPasswordResetEmail(userName, email, link)
 
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
@@ -202,7 +205,8 @@ func ResetPassword(c *gin.Context) {
 		})
 		return
 	}
-	if !common.VerifyCodeWithKey(req.Email, req.Token, common.PasswordResetPurpose) {
+	userID, err := model.ConsumeUserVerification(c.Request.Context(), req.Email, common.PasswordResetPurpose, req.Token)
+	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": "重置链接非法或已过期",
@@ -210,7 +214,7 @@ func ResetPassword(c *gin.Context) {
 		return
 	}
 	password := common.GenerateVerificationCode(12)
-	err = model.ResetUserPasswordByEmail(req.Email, password)
+	err = model.ResetUserPassword(c.Request.Context(), userID, req.Email, password)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
@@ -218,7 +222,6 @@ func ResetPassword(c *gin.Context) {
 		})
 		return
 	}
-	common.DeleteKey(req.Email, common.PasswordResetPurpose)
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",

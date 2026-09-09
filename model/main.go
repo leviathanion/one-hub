@@ -25,10 +25,15 @@ func SetupDB() {
 	if err != nil {
 		logger.FatalLog("failed to initialize database: " + err.Error())
 	}
+	if err := CheckPaymentOrderSchema(DB); err != nil {
+		logger.FatalLog("failed to verify payment schema: " + err.Error())
+	}
+	if err := ValidatePaymentOrderData(DB); err != nil {
+		logger.FatalLog("failed to verify payment upgrade data: " + err.Error())
+	}
 	if err := ChannelGroup.Load(); err != nil {
 		logger.FatalLog("failed to load channels: " + err.Error())
 	}
-	GlobalUserGroupRatio.Load()
 	config.RootUserEmail = GetRootUserEmail()
 	NewModelOwnedBys()
 
@@ -76,9 +81,7 @@ func chooseDB() (*gorm.DB, error) {
 			return gorm.Open(postgres.New(postgres.Config{
 				DSN:                  dsn,
 				PreferSimpleProtocol: true, // disables implicit prepared statement usage
-			}), &gorm.Config{
-				PrepareStmt: true, // precompile SQL
-			})
+			}), &gorm.Config{})
 		}
 		// Use MySQL
 		logger.SysLog("using MySQL as database")
@@ -86,22 +89,25 @@ func chooseDB() (*gorm.DB, error) {
 		dsn = dsnAddArg(dsn, "loc", localTimezone)
 		dsn = dsnAddArg(dsn, "time_zone", mysqlSessionTimezoneValue(time.Now(), time.Local))
 		// dsn = dsnAddArg(dsn, "parseTime", "true")
-		return gorm.Open(mysql.Open(dsn), &gorm.Config{
-			PrepareStmt: true, // precompile SQL
-		})
+		return gorm.Open(mysql.Open(dsn), &gorm.Config{})
 	}
 	// Use SQLite
 	logger.SysLog("SQL_DSN not set, using SQLite as database")
 	common.UsingSQLite = true
-	config := fmt.Sprintf("?_busy_timeout=%d", utils.GetOrDefault("sqlite_busy_timeout", 3000))
-	return gorm.Open(sqlite.Open(viper.GetString("sqlite_path")+config), &gorm.Config{
-		PrepareStmt: true, // precompile SQL
-	})
+	// SQLite 在 BEGIN 时排队取得写锁，避免资金事务先读后写的锁升级失败。
+	config := fmt.Sprintf("?_busy_timeout=%d&_txlock=immediate", utils.GetOrDefault("sqlite_busy_timeout", 3000))
+	return gorm.Open(sqlite.Open(viper.GetString("sqlite_path")+config), &gorm.Config{})
 }
 
 func InitDB() (err error) {
 	db, err := chooseDB()
 	if err == nil {
+		// DDL 期间不能缓存 SELECT * 的旧列元数据；全部迁移成功后再开启预编译。
+		defer func() {
+			if err == nil {
+				DB = DB.Session(&gorm.Session{PrepareStmt: true})
+			}
+		}()
 		if config.Debug {
 			db = db.Debug()
 		}
@@ -116,7 +122,10 @@ func InitDB() (err error) {
 		sqlDB.SetConnMaxLifetime(time.Second * time.Duration(utils.GetOrDefault("SQL_MAX_LIFETIME", 60)))
 
 		if !config.IsMasterNode {
-			return nil
+			if err := ValidatePaymentUpgradePrerequisites(db); err != nil {
+				return err
+			}
+			return ValidateUserManagementSchema(db)
 		}
 		logger.SysLog("database migration started")
 
@@ -132,8 +141,11 @@ func InitDB() (err error) {
 		if err != nil {
 			return err
 		}
-		err = db.AutoMigrate(&User{})
+		err = db.AutoMigrate(&User{}, &UserVerification{})
 		if err != nil {
+			return err
+		}
+		if err := ensureUserIdentityCollations(db); err != nil {
 			return err
 		}
 		err = db.AutoMigrate(&Option{})
@@ -167,7 +179,6 @@ func InitDB() (err error) {
 		if err != nil {
 			return err
 		}
-
 		err = db.AutoMigrate(&Payment{})
 		if err != nil {
 			return err

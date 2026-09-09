@@ -23,11 +23,12 @@ func getWeChatIdByCode(code string) (string, error) {
 	if code == "" {
 		return "", errors.New("无效的参数")
 	}
-	req, err := http.NewRequest("GET", fmt.Sprintf("%s/api/wechat/user?code=%s", config.WeChatServerAddress, code), nil)
+	options := config.GlobalOption.RuntimeSnapshot()
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s/api/wechat/user?code=%s", options.String("WeChatServerAddress", config.WeChatServerAddress), code), nil)
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Authorization", config.WeChatServerToken)
+	req.Header.Set("Authorization", options.String("WeChatServerToken", config.WeChatServerToken))
 	client := http.Client{
 		Timeout: 5 * time.Second,
 	}
@@ -51,7 +52,7 @@ func getWeChatIdByCode(code string) (string, error) {
 }
 
 func WeChatAuth(c *gin.Context) {
-	if !config.WeChatAuthEnabled {
+	if !config.GlobalOption.RuntimeSnapshot().Bool("WeChatAuthEnabled", config.WeChatAuthEnabled) {
 		c.JSON(http.StatusOK, gin.H{
 			"message": "管理员未开启通过微信登录以及注册",
 			"success": false,
@@ -80,7 +81,7 @@ func WeChatAuth(c *gin.Context) {
 			return
 		}
 	} else {
-		if config.RegisterEnabled {
+		if config.GlobalOption.RuntimeSnapshot().Bool("RegisterEnabled", config.RegisterEnabled) {
 			user.Username = "wechat_" + strconv.Itoa(model.GetMaxUserId()+1)
 			user.DisplayName = "WeChat User"
 			user.Role = config.RoleCommonUser
@@ -113,7 +114,7 @@ func WeChatAuth(c *gin.Context) {
 }
 
 func WeChatBind(c *gin.Context) {
-	if !config.WeChatAuthEnabled {
+	if !config.GlobalOption.RuntimeSnapshot().Bool("WeChatAuthEnabled", config.WeChatAuthEnabled) {
 		c.JSON(http.StatusOK, gin.H{
 			"message": "管理员未开启通过微信登录以及注册",
 			"success": false,
@@ -149,7 +150,7 @@ func WeChatBind(c *gin.Context) {
 		return
 	}
 	user.WeChatId = wechatId
-	err = user.Update(false)
+	err = model.UpdateUserIdentity(user.Id, model.UserIdentityPatch{WeChatId: &user.WeChatId})
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,

@@ -58,15 +58,16 @@ func InitTelegramBot() {
 }
 
 func StartTelegramBot() {
+	serverAddress := config.GlobalOption.RuntimeSnapshot().String("ServerAddress", config.ServerAddress)
 	botWebhook := viper.GetString("tg.webhook_secret")
 	if botWebhook != "" {
-		if config.ServerAddress == "" {
+		if serverAddress == "" {
 			logger.SysLog("Telegram bot is not enabled: Server address is not set")
 			StopTelegramBot()
 			return
 		}
 		TGWebHookSecret = botWebhook
-		serverAddress := strings.TrimSuffix(config.ServerAddress, "/")
+		serverAddress = strings.TrimSuffix(serverAddress, "/")
 		urlPath := fmt.Sprintf("/api/telegram/%s", viper.GetString("tg.bot_api_key"))
 
 		webHookOpts := &ext.AddWebhookOpts{
@@ -209,7 +210,7 @@ func noCommands(msg *gotgbot.Message) bool {
 
 func getTGUserId(b *gotgbot.Bot, ctx *ext.Context) int64 {
 	if ctx.EffectiveSender.User == nil {
-		ctx.EffectiveMessage.Reply(b, "无法使用命令", nil)
+		replyUserCommand(b, ctx, "无法使用命令")
 		return 0
 	}
 
@@ -224,10 +225,14 @@ func getBindUser(b *gotgbot.Bot, ctx *ext.Context) *model.User {
 
 	user, err := model.GetUserByTelegramId(tgUserId)
 	if err != nil {
-		ctx.EffectiveMessage.Reply(b, "您的账户未绑定", nil)
+		replyUserCommand(b, ctx, "您的账户未绑定")
 		return nil
 	}
 
+	if user.Status != config.UserStatusEnabled {
+		replyUserCommand(b, ctx, "账户不可用")
+		return nil
+	}
 	return user
 }
 
@@ -279,5 +284,27 @@ func getBotOpts() *gotgbot.BotOpts {
 		BotClient: &gotgbot.BaseBotClient{
 			Client: *httpClient,
 		},
+	}
+}
+
+// 涉及凭据的交互仅限私聊，密钥分页回调也经过此边界。
+func requirePrivateChat(b *gotgbot.Bot, ctx *ext.Context) bool {
+	if ctx == nil || ctx.EffectiveChat == nil || ctx.EffectiveChat.Type != "private" {
+		replyUserCommand(b, ctx, "请在机器人私聊中操作")
+		return false
+	}
+	return true
+}
+
+func replyUserCommand(b *gotgbot.Bot, ctx *ext.Context, text string) {
+	if ctx == nil {
+		return
+	}
+	if ctx.Update != nil && ctx.CallbackQuery != nil {
+		_, _ = ctx.CallbackQuery.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: text})
+		return
+	}
+	if ctx.EffectiveMessage != nil {
+		_, _ = ctx.EffectiveMessage.Reply(b, text, nil)
 	}
 }

@@ -12,6 +12,9 @@ import (
 )
 
 func commandApikeyStart(b *gotgbot.Bot, ctx *ext.Context) error {
+	if !requirePrivateChat(b, ctx) {
+		return nil
+	}
 	user := getBindUser(b, ctx)
 	if user == nil {
 		return nil
@@ -55,10 +58,7 @@ func getApikeyList(userId, page int) (message string, pageParams *paginationPara
 		return "找不到令牌", nil
 	}
 
-	chatUrlTmp := ""
-	if config.ServerAddress != "" {
-		chatUrlTmp = getChatUrl()
-	}
+	chatUrlTmp := getChatUrl()
 
 	message = "点击令牌可复制：\n"
 
@@ -75,11 +75,15 @@ func getApikeyList(userId, page int) (message string, pageParams *paginationPara
 }
 
 func getChatUrl() string {
-	serverAddress := strings.TrimSuffix(config.ServerAddress, "/")
+	options := config.GlobalOption.RuntimeSnapshot()
+	serverAddress := strings.TrimSuffix(options.String("ServerAddress", config.ServerAddress), "/")
+	if serverAddress == "" {
+		return ""
+	}
 	chatNextUrl := fmt.Sprintf(`{"key":"setToken","url":"%s"}`, serverAddress)
 	chatNextUrl = "https://chat.oneapi.pro/#/?settings=" + url.QueryEscape(chatNextUrl)
-	if config.ChatLink != "" {
-		chatLink := strings.TrimSuffix(config.ChatLink, "/")
+	if chatLink := options.String("ChatLink", config.ChatLink); chatLink != "" {
+		chatLink = strings.TrimSuffix(chatLink, "/")
 		chatNextUrl = strings.ReplaceAll(chatNextUrl, `https://chat.oneapi.pro`, chatLink)
 	}
 

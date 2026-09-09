@@ -3,45 +3,37 @@ package controller
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"one-api/common/config"
 	"one-api/model"
 
 	"github.com/gin-gonic/gin"
-	"gorm.io/gorm"
 )
 
 type optionBatchUpdateRequest struct {
-	Updates []optionUpdateRequest `json:"updates"`
+	ExpectedVersion int64                   `json:"expected_version"`
+	Updates         []optionMutationRequest `json:"updates"`
 }
 
 func UpdateOptionBatch(c *gin.Context) {
 	var request optionBatchUpdateRequest
-	if err := decodeOptionRequest(c, &request); err != nil || request.Updates == nil {
+	if err := decodeOptionRequest(c, &request); err != nil || len(request.Updates) == 0 || request.ExpectedVersion < 1 {
 		writeInvalidOptionRequest(c)
 		return
 	}
 
-	updates := make([]config.OptionUpdate, 0, len(request.Updates))
+	updates := make([]model.OptionMutation, 0, len(request.Updates))
 	for _, update := range request.Updates {
-		value, err := normalizeOptionValue(update.Value)
+		mutation, err := optionRequestMutation(update.Key, update.Value, update.Inherit)
 		if err != nil {
 			writeInvalidOptionRequest(c)
 			return
 		}
-		updates = append(updates, config.OptionUpdate{
-			Key:   update.Key,
-			Value: value,
-		})
+		updates = append(updates, mutation)
 	}
-
-	prepared, err := config.PrepareOptionUpdates(updates, config.OptionGroupValidationStrict)
+	version, err := model.ApplyOptionMutations(c.Request.Context(), request.ExpectedVersion, updates)
 	if err != nil {
-		writeOptionUpdateFailure(c, err)
-		return
-	}
-
-	if err := persistOptionUpdates(prepared); err != nil {
 		writeOptionUpdateFailure(c, err)
 		return
 	}
@@ -50,46 +42,31 @@ func UpdateOptionBatch(c *gin.Context) {
 		"success": true,
 		"message": "",
 		"data": gin.H{
-			"updated_keys": prepared.UpdatedKeys,
+			"updated_keys": optionMutationKeys(updates),
 		},
+		"version": version,
 	})
 }
 
 func decodeOptionRequest(c *gin.Context, dst any) error {
 	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
 	decoder.UseNumber()
-	return decoder.Decode(dst)
+	if err := decoder.Decode(dst); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return errors.New("request must contain one JSON value")
+	}
+	return nil
 }
 
-func persistOptionUpdates(prepared *config.PreparedOptionUpdates) error {
-	if len(prepared.Updates) == 0 {
-		return nil
+func optionMutationKeys(updates []model.OptionMutation) []string {
+	keys := make([]string, 0, len(updates))
+	for _, update := range updates {
+		keys = append(keys, config.GlobalOption.NormalizeKey(update.Key))
 	}
-
-	options := make([]model.Option, 0, len(prepared.Updates))
-	for _, update := range prepared.Updates {
-		options = append(options, model.Option{
-			Key:   update.Key,
-			Value: update.Value,
-		})
-	}
-
-	if err := model.DB.Transaction(func(tx *gorm.DB) error {
-		return model.SaveOptionsTx(tx, options)
-	}); err != nil {
-		return &config.OptionValidationError{Message: err.Error()}
-	}
-
-	for _, update := range prepared.Updates {
-		if err := config.GlobalOption.Set(update.Key, update.Value); err != nil {
-			return &config.OptionValidationError{
-				Key:     update.Key,
-				Message: err.Error(),
-			}
-		}
-	}
-
-	return nil
+	return keys
 }
 
 func writeInvalidOptionRequest(c *gin.Context) {
@@ -101,8 +78,12 @@ func writeInvalidOptionRequest(c *gin.Context) {
 
 func writeOptionUpdateFailure(c *gin.Context, err error) {
 	var validationErr *config.OptionValidationError
+	if errors.Is(err, model.ErrPublicationVersionConflict) {
+		c.JSON(http.StatusConflict, gin.H{"success": false, "message": err.Error()})
+		return
+	}
 	if !errors.As(err, &validationErr) {
-		writeInvalidOptionRequest(c)
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": err.Error()})
 		return
 	}
 

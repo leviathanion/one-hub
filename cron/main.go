@@ -9,6 +9,7 @@ import (
 	"one-api/common/logger"
 	"one-api/common/scheduler"
 	"one-api/model"
+	"one-api/payment"
 	"one-api/providers/codex"
 
 	"github.com/go-co-op/gocron/v2"
@@ -19,6 +20,17 @@ func InitCron() {
 	if !config.IsMasterNode {
 		logger.SysLog("Cron is disabled on slave node")
 		return
+	}
+
+	// 未确认订单只观察，不重放支付创建。SQL 查询额度在多实例间共享。
+	if err := scheduler.Manager.AddJob("payment_reconcile", gocron.DurationJob(30*time.Second), gocron.NewTask(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if err := payment.Reconcile(ctx); err != nil {
+			logger.SysError("支付核查失败: " + err.Error())
+		}
+	})); err != nil {
+		logger.SysError("支付核查调度失败: " + err.Error())
 	}
 
 	// 添加每日统计任务

@@ -12,6 +12,7 @@ import (
 	"one-api/common/utils"
 	"one-api/model"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-contrib/sessions"
@@ -24,7 +25,7 @@ type LoginRequest struct {
 }
 
 func Login(c *gin.Context) {
-	if !config.PasswordLoginEnabled {
+	if !config.GlobalOption.RuntimeSnapshot().Bool("PasswordLoginEnabled", config.PasswordLoginEnabled) {
 		c.JSON(http.StatusOK, gin.H{
 			"message": "管理员关闭了密码登录",
 			"success": false,
@@ -66,12 +67,16 @@ func Login(c *gin.Context) {
 
 // setup session & cookies and then return user info
 func setupLogin(user *model.User, c *gin.Context) {
+	current, err := model.RecordUserLogin(c.Request.Context(), user.Id, c.ClientIP())
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	user = current
 	session := sessions.Default(c)
 	session.Set("id", user.Id)
 	session.Set("username", user.Username)
-	session.Set("role", user.Role)
-	session.Set("status", user.Status)
-	err := session.Save()
+	err = session.Save()
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"message": "无法保存会话信息，请重试",
@@ -79,10 +84,6 @@ func setupLogin(user *model.User, c *gin.Context) {
 		})
 		return
 	}
-	user.LastLoginTime = time.Now().Unix()
-	user.LastLoginIp = c.ClientIP()
-
-	user.Update(false)
 
 	cleanUser := model.User{
 		Id:          user.Id,
@@ -117,14 +118,14 @@ func Logout(c *gin.Context) {
 }
 
 func Register(c *gin.Context) {
-	if !config.RegisterEnabled {
+	if !config.GlobalOption.RuntimeSnapshot().Bool("RegisterEnabled", config.RegisterEnabled) {
 		c.JSON(http.StatusOK, gin.H{
 			"message": "管理员关闭了新用户注册",
 			"success": false,
 		})
 		return
 	}
-	if !config.PasswordRegisterEnabled {
+	if !config.GlobalOption.RuntimeSnapshot().Bool("PasswordRegisterEnabled", config.PasswordRegisterEnabled) {
 		c.JSON(http.StatusOK, gin.H{
 			"message": "管理员关闭了通过密码进行注册，请使用第三方账户验证的形式进行注册",
 			"success": false,
@@ -140,6 +141,10 @@ func Register(c *gin.Context) {
 		})
 		return
 	}
+	if strings.TrimSpace(user.Username) == "" {
+		common.APIRespondWithError(c, http.StatusOK, errors.New("用户名不能为空"))
+		return
+	}
 	if err := common.Validate.Struct(&user); err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
@@ -147,7 +152,8 @@ func Register(c *gin.Context) {
 		})
 		return
 	}
-	if config.EmailVerificationEnabled {
+	emailVerified := false
+	if config.GlobalOption.RuntimeSnapshot().Bool("EmailVerificationEnabled", config.EmailVerificationEnabled) {
 		if user.Email == "" || user.VerificationCode == "" {
 			c.JSON(http.StatusOK, gin.H{
 				"success": false,
@@ -155,13 +161,14 @@ func Register(c *gin.Context) {
 			})
 			return
 		}
-		if !common.VerifyCodeWithKey(user.Email, user.VerificationCode, common.EmailVerificationPurpose) {
+		if _, err := model.ConsumeUserVerification(c.Request.Context(), user.Email, common.EmailVerificationPurpose, user.VerificationCode); err != nil {
 			c.JSON(http.StatusOK, gin.H{
 				"success": false,
 				"message": "验证码错误或已过期",
 			})
 			return
 		}
+		emailVerified = true
 	}
 	affCode := user.AffCode // this code is the inviter's code, not the user's own code
 	inviterId, _ := model.GetUserIdByAffCode(affCode)
@@ -171,7 +178,7 @@ func Register(c *gin.Context) {
 		DisplayName: user.Username,
 		InviterId:   inviterId,
 	}
-	if config.EmailVerificationEnabled {
+	if emailVerified {
 		cleanUser.Email = user.Email
 	}
 	if err := cleanUser.Insert(inviterId); err != nil {
@@ -253,6 +260,10 @@ func GetRateRealtime(c *gin.Context) {
 		return
 	}
 	limiter := model.GlobalUserGroupRatio.GetAPILimiter(user.Group)
+	if limiter == nil {
+		common.APIRespondWithError(c, http.StatusOK, errors.New("用户组不存在或已停用"))
+		return
+	}
 	key := fmt.Sprintf(API_LIMIT_KEY, id)
 	// 获取当前已使用的速率
 	rpm, err := limiter.GetCurrentRate(key)
@@ -330,7 +341,7 @@ func GenerateAccessToken(c *gin.Context) {
 		return
 	}
 
-	if err := user.Update(false); err != nil {
+	if err := model.SetUserAccessToken(user.Id, user.AccessToken); err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": err.Error(),
@@ -356,8 +367,8 @@ func GetAffCode(c *gin.Context) {
 		return
 	}
 	if user.AffCode == "" {
-		user.AffCode = utils.GetRandomString(4)
-		if err := user.Update(false); err != nil {
+		user.AffCode, err = model.EnsureUserAffCode(user.Id)
+		if err != nil {
 			c.JSON(http.StatusOK, gin.H{
 				"success": false,
 				"message": err.Error(),
@@ -390,147 +401,42 @@ func GetSelf(c *gin.Context) {
 }
 
 func UpdateUser(c *gin.Context) {
-	var updatedUser model.User
-	err := json.NewDecoder(c.Request.Body).Decode(&updatedUser)
-	if err != nil || updatedUser.Id == 0 {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "无效的参数",
-		})
+	var patch model.UserAdminPatch
+	if err := json.NewDecoder(c.Request.Body).Decode(&patch); err != nil || patch.Id <= 0 {
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": "无效的参数"})
 		return
 	}
-	if updatedUser.Password == "" {
-		updatedUser.Password = "$I_LOVE_U" // make Validator happy :)
-	}
-	if err := common.Validate.Struct(&updatedUser); err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "输入不合法 " + err.Error(),
-		})
+	if err := model.UpdateUserByAdmin(c.Request.Context(), c.GetInt("id"), patch); err != nil {
+		common.APIRespondWithError(c, http.StatusOK, err)
 		return
 	}
-	originUser, err := model.GetUserById(updatedUser.Id, false)
-	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": err.Error(),
-		})
-		return
-	}
-	myRole := c.GetInt("role")
-	if myRole <= originUser.Role && myRole != config.RoleRootUser {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "无权更新同权限等级或更高权限等级的用户信息",
-		})
-		return
-	}
-	if myRole <= updatedUser.Role && myRole != config.RoleRootUser {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "无权将其他用户权限等级提升到大于等于自己的权限等级",
-		})
-		return
-	}
-	if updatedUser.Password == "$I_LOVE_U" {
-		updatedUser.Password = "" // rollback to what it should be
-	}
-	updatePassword := updatedUser.Password != ""
-	if err := updatedUser.Update(updatePassword); err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": err.Error(),
-		})
-		return
-	}
-	if originUser.Quota != updatedUser.Quota {
-		model.RecordLog(originUser.Id, model.LogTypeManage, fmt.Sprintf("管理员将用户额度从 %s修改为 %s", common.LogQuota(originUser.Quota), common.LogQuota(updatedUser.Quota)))
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "",
-	})
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": ""})
 }
 
 func UpdateSelf(c *gin.Context) {
-	var user model.User
-	err := json.NewDecoder(c.Request.Body).Decode(&user)
-	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "无效的参数",
-		})
+	var patch model.UserProfilePatch
+	if err := c.ShouldBindJSON(&patch); err != nil {
+		common.APIRespondWithError(c, http.StatusOK, err)
 		return
 	}
-	if user.Password == "" {
-		user.Password = "$I_LOVE_U" // make Validator happy :)
-	}
-	if err := common.Validate.Struct(&user); err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "输入不合法 " + err.Error(),
-		})
+	if err := model.UpdateUserProfile(c.GetInt("id"), patch); err != nil {
+		common.APIRespondWithError(c, http.StatusOK, err)
 		return
 	}
-
-	cleanUser := model.User{
-		Id: c.GetInt("id"),
-		// Username:    user.Username,
-		Password:    user.Password,
-		DisplayName: user.DisplayName,
-	}
-	if user.Password == "$I_LOVE_U" {
-		user.Password = "" // rollback to what it should be
-		cleanUser.Password = ""
-	}
-	updatePassword := user.Password != ""
-	if err := cleanUser.Update(updatePassword); err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": err.Error(),
-		})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "",
-	})
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": ""})
 }
 
 func DeleteUser(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": err.Error(),
-		})
+		common.APIRespondWithError(c, http.StatusOK, err)
 		return
 	}
-	originUser, err := model.GetUserById(id, false)
-	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": err.Error(),
-		})
+	if _, err := model.ManageUserByAdmin(c.Request.Context(), c.GetInt("id"), id, "delete"); err != nil {
+		common.APIRespondWithError(c, http.StatusOK, err)
 		return
 	}
-	myRole := c.GetInt("role")
-	if myRole <= originUser.Role {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "无权删除同权限等级或更高权限等级的用户",
-		})
-		return
-	}
-	err = model.DeleteUserById(id)
-	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": true,
-			"message": "",
-		})
-		return
-	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": ""})
 }
 
 func CreateUser(c *gin.Context) {
@@ -589,130 +495,31 @@ type ManageRequest struct {
 // ManageUser Only admin user can do this
 func ManageUser(c *gin.Context) {
 	var req ManageRequest
-	err := json.NewDecoder(c.Request.Body).Decode(&req)
-
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.APIRespondWithError(c, http.StatusOK, err)
+		return
+	}
+	if strings.TrimSpace(req.Username) == "" {
+		common.APIRespondWithError(c, http.StatusOK, errors.New("用户名不能为空"))
+		return
+	}
+	var target model.User
+	if err := model.DB.Select("id").Where("username = ?", req.Username).First(&target).Error; err != nil {
+		common.APIRespondWithError(c, http.StatusOK, err)
+		return
+	}
+	user, err := model.ManageUserByAdmin(c.Request.Context(), c.GetInt("id"), target.Id, req.Action)
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "无效的参数",
-		})
+		common.APIRespondWithError(c, http.StatusOK, err)
 		return
 	}
-	user := model.User{
-		Username: req.Username,
-	}
-	// Fill attributes
-	model.DB.Where(&user).First(&user)
-	if user.Id == 0 {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "用户不存在",
-		})
-		return
-	}
-	myRole := c.GetInt("role")
-	if myRole <= user.Role && myRole != config.RoleRootUser {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "无权更新同权限等级或更高权限等级的用户信息",
-		})
-		return
-	}
-	switch req.Action {
-	case "disable":
-		user.Status = config.UserStatusDisabled
-		if user.Role == config.RoleRootUser {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "无法禁用超级管理员用户",
-			})
-			return
-		}
-	case "enable":
-		user.Status = config.UserStatusEnabled
-	case "delete":
-		if user.Role == config.RoleRootUser {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "无法删除超级管理员用户",
-			})
-			return
-		}
-		if err := user.Delete(); err != nil {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": err.Error(),
-			})
-			return
-		}
-	case "promote":
-		// 设置为管理员：只有超级管理员能操作
-		if myRole != config.RoleRootUser {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "只有超级管理员可以设置其他用户为管理员",
-			})
-			return
-		}
-		if user.Role == config.RoleRootUser {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "无法修改超级管理员的身份",
-			})
-			return
-		}
-		user.Role = config.RoleAdminUser
-	case "demote":
-		// 设置为普通用户：不能操作超级管理员
-		if user.Role == config.RoleRootUser {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "无法修改超级管理员的身份",
-			})
-			return
-		}
-		user.Role = config.RoleCommonUser
-	case "set_reliable":
-		// 设置为可信内部员工：管理员及以上能操作
-		if myRole < config.RoleAdminUser {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "只有管理员或超级管理员可以设置可信内部员工",
-			})
-			return
-		}
-		if user.Role == config.RoleRootUser {
-			c.JSON(http.StatusOK, gin.H{
-				"success": false,
-				"message": "无法修改超级管理员的身份",
-			})
-			return
-		}
-		user.Role = config.RoleReliableUser
-	}
-
-	if err := user.Update(false); err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": err.Error(),
-		})
-		return
-	}
-	clearUser := model.User{
-		Role:   user.Role,
-		Status: user.Status,
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "",
-		"data":    clearUser,
-	})
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": model.User{Role: user.Role, Status: user.Status}})
 }
 
 func EmailBind(c *gin.Context) {
 	email := c.Query("email")
 	code := c.Query("code")
-	if !common.VerifyCodeWithKey(email, code, common.EmailVerificationPurpose) {
+	if _, err := model.ConsumeUserVerification(c.Request.Context(), email, common.EmailVerificationPurpose, code); err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": "验证码错误或已过期",
@@ -732,8 +539,8 @@ func EmailBind(c *gin.Context) {
 		return
 	}
 	user.Email = email
-	// no need to check if this email already taken, because we have used verification code to check it
-	err = user.Update(false)
+	// 数据库唯一约束在绑定提交时保证邮箱归属。
+	err = model.SetUserEmail(user.Id, user.Email)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
@@ -779,7 +586,7 @@ func TopUp(c *gin.Context) {
 }
 
 type ChangeUserQuotaRequest struct {
-	Quota  int    `json:"quota" form:"quota"`
+	Quota  *int   `json:"quota" form:"quota"`
 	Remark string `json:"remark" form:"remark"`
 }
 
@@ -798,12 +605,12 @@ func ChangeUserQuota(c *gin.Context) {
 		return
 	}
 
-	if req.Quota == 0 {
-		common.APIRespondWithError(c, http.StatusOK, errors.New("不能为0"))
+	if req.Quota == nil {
+		common.APIRespondWithError(c, http.StatusOK, errors.New("必须提供额度增减值，0 表示重新计算用户组"))
 		return
 	}
 
-	err = model.ChangeUserQuota(userId, req.Quota, false)
+	before, after, err := model.ChangeUserQuotaByAdmin(c.Request.Context(), c.GetInt("id"), userId, *req.Quota)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
@@ -812,13 +619,16 @@ func ChangeUserQuota(c *gin.Context) {
 		return
 	}
 
-	remark := fmt.Sprintf("管理员增减用户额度 %s", common.LogQuota(req.Quota))
+	remark := fmt.Sprintf("管理员增减用户额度 %s", common.LogQuota(*req.Quota))
+	if *req.Quota == 0 {
+		remark = fmt.Sprintf("管理员重新计算用户组：%s → %s", before, after)
+	}
 
 	if req.Remark != "" {
 		remark = fmt.Sprintf("%s, 备注: %s", remark, req.Remark)
 	}
 
-	model.RecordQuotaLog(userId, model.LogTypeManage, req.Quota, c.ClientIP(), remark)
+	model.RecordQuotaLog(userId, model.LogTypeManage, *req.Quota, c.ClientIP(), remark)
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
@@ -849,25 +659,7 @@ func Unbind(c *gin.Context) {
 		})
 		return
 	}
-	updates := make(map[string]interface{})
-	switch req.Type {
-	case "github":
-		updates["github_id"] = ""
-		updates["github_id_new"] = nil
-	case "wechat":
-		updates["wechat_id"] = ""
-	case "lark":
-		updates["lark_id"] = ""
-	case "oidc":
-		updates["oidc_id"] = ""
-	default:
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "未知的绑定类型",
-		})
-		return
-	}
-	err = model.DB.Model(user).Updates(updates).Error
+	err = model.UnbindUserIdentity(user.Id, req.Type)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,

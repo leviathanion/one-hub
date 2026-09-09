@@ -2,11 +2,10 @@ package epay
 
 import (
 	"crypto/md5"
+	"crypto/subtle"
 	"encoding/hex"
 	"sort"
 	"strings"
-
-	"github.com/mitchellh/mapstructure"
 )
 
 type Client struct {
@@ -38,20 +37,15 @@ func (c *Client) FormPay(args *PayArgs) (string, map[string]string, error) {
 
 func (c *Client) Verify(params map[string]string) (*PaymentResult, bool) {
 	sign := params["sign"]
-	tradeStatus := params["trade_status"]
-
-	if sign == "" || tradeStatus != TradeStatusSuccess {
+	if sign == "" || (params["sign_type"] != "" && params["sign_type"] != FormArgsSignType) {
 		return nil, false
 	}
 
-	if sign != c.Sign(params) {
+	if subtle.ConstantTimeCompare([]byte(sign), []byte(c.Sign(params))) != 1 {
 		return nil, false
 	}
 
-	var paymentResult PaymentResult
-	mapstructure.Decode(params, &paymentResult)
-
-	return &paymentResult, true
+	return &PaymentResult{PartnerID: params["pid"], Type: PayType(params["type"]), TradeNo: params["trade_no"], OutTradeNo: params["out_trade_no"], Name: params["name"], Money: params["money"], TradeStatus: params["trade_status"]}, true
 }
 
 // Sign 签名

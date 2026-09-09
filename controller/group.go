@@ -2,6 +2,7 @@ package controller
 
 import (
 	"net/http"
+	"one-api/common"
 	"one-api/model"
 
 	"github.com/gin-gonic/gin"
@@ -28,7 +29,16 @@ func GetUserGroupRatio(c *gin.Context) {
 	userSymbol := ""
 
 	if userId > 0 {
-		userSymbol, _ = model.CacheGetUserGroup(userId)
+		user, err := model.GetUserRoutingState(c.Request.Context(), userId)
+		if err != nil {
+			common.APIRespondWithError(c, http.StatusServiceUnavailable, err)
+			return
+		}
+		userSymbol = user.Group
+	}
+	if err := model.EnsureUserGroupPolicyAvailable(c.Request.Context()); err != nil {
+		common.APIRespondWithError(c, http.StatusServiceUnavailable, err)
+		return
 	}
 
 	groupRatio := model.GlobalUserGroupRatio.GetAll()
