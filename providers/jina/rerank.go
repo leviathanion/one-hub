@@ -37,8 +37,18 @@ func (p *JinaProvider) CreateRerank(request *types.RerankRequest) (*types.Rerank
 		return nil, errWithCode
 	}
 
-	p.Usage.PromptTokens = jinaResponse.Usage.PromptTokens
-	p.Usage.TotalTokens = jinaResponse.Usage.TotalTokens
+	applyJinaRerankUsage(p.Usage, jinaResponse.Usage)
 
 	return jinaResponse, nil
+}
+
+func applyJinaRerankUsage(target, providerUsage *types.Usage) {
+	if target == nil || providerUsage == nil || !providerUsage.ProviderTokenFields["total_tokens"] {
+		return
+	}
+	target.PromptTokens = providerUsage.TotalTokens
+	target.CompletionTokens = 0
+	target.TotalTokens = providerUsage.TotalTokens
+	target.ProviderTokenFields = map[string]bool{"prompt_tokens": true, "completion_tokens": true, "total_tokens": true}
+	target.MarkProviderReported()
 }
