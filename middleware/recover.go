@@ -104,6 +104,12 @@ func RelaySunoPanicRecover() gin.HandlerFunc {
 }
 
 func handlePanic(c *gin.Context, err interface{}, errorResponse gin.H) {
+	// net/http uses ErrAbortHandler to terminate a partially committed response.
+	// It must reach the server boundary; rendering a JSON error here would turn a
+	// truncated upstream body into an apparently successful response.
+	if err == http.ErrAbortHandler {
+		panic(err)
+	}
 	logger.SysError(fmt.Sprintf("panic detected: %v", err))
 	logger.SysError(fmt.Sprintf("stacktrace from panic: %s", string(debug.Stack())))
 	c.JSON(http.StatusInternalServerError, errorResponse)
