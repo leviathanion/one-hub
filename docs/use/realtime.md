@@ -45,6 +45,10 @@ realtime:
     - "https://app.example.com"
   unsafe_allow_credential_subprotocol_any_origin: false
   websocket_read_limit: 33554432    # 单帧读取上限（字节，默认 32 MiB）
+  client_frame_queue_max_bytes: 67108864   # 客户端 ingress 队列（默认 64 MiB）
+  pending_frame_queue_max_bytes: 67108864  # provider send 等待队列（默认 64 MiB）
+  provider_frame_queue_max_bytes: 67108864 # provider ingress 队列（默认 64 MiB）
+  attachment_queue_max_bytes: 67108864     # provider session 下游队列（默认 64 MiB）
   websocket_ping_interval_ms: 25000 # 服务端主动 Ping 周期（毫秒）
   websocket_write_timeout_ms: 40000 # WebSocket 写超时（毫秒）
 
@@ -178,9 +182,9 @@ realtime:
 ```
 
 **对系统的影响**：
-- 增大：允许更大的帧，每条连接可能占用更多内存（上限为此值）。
+- 增大：允许更大的帧；队列实际保留量仍分别受四项 `*_queue_max_bytes` 独立限制。
 - 减小：内存安全，但可能导致合法大帧被拒绝。
-- **注意**：此限制作用于每条连接。1000 条并发连接 × 16 MiB = 理论峰值 16 GiB（实际低得多，正常帧远小于上限）。
+- **注意**：各 stage 在 handoff 时会短暂同时持有 source/destination credit，单连接峰值按相邻两个队列预算加一个正在处理的帧计算，而不是“帧数 × 单帧上限”。
 
 ---
 
@@ -398,42 +402,10 @@ realtime_websocket_client_inbound_activity_timeout_ms: 60000
 
 ---
 
-### Codex 渠道专用：`websocket_mode` 🏷️ Web 后台 → 渠道 → Codex 配置(JSON)
+### Codex 上游传输
 
-**位置**：`渠道 → Codex → Codex 配置(JSON)` 中的 `websocket_mode` 字段。**注意**：这是渠道级配置，不是 `config.yaml` 全局配置。
+Codex 的 WebSocket 请求始终连接真实上游 WebSocket；握手失败直接返回错误。HTTP Responses 请求由独立接口处理，不作为 WebSocket 的替代传输。
 
-| 值 | 行为 | 影响 |
-|----|------|------|
-| `"auto"`（默认） | 优先 WebSocket，失败后回退 HTTP bridge | 推荐；兼顾性能与可用性 |
-| `"force"` | 强制 WebSocket，不支持则拒绝 | WebSocket 不可用时请求失败 |
-| `"off"` | 禁用 WebSocket，始终走 HTTP bridge | 不使用 Codex Realtime |
-
-**示例（渠道 Codex 配置(JSON)）**：
-
-```json
-{
-  "websocket_mode": "force"
-}
-```
-
-**对系统的影响**：
-- `"force"`：若 Codex upstream 不支持 WebSocket，客户端收到错误。
-- `"off"`：关闭 WebSocket 连接能力，节省连接资源但失去 Realtime 低延迟优势。
-
-Codex 渠道的完整 `channel.Other` 配置见 [Codex 渠道文档](/use/Codex)。
-
----
-
-### Codex 渠道专用：`websocket_retry_cooldown_seconds` 🏷️ Web 后台 → 渠道 → Codex 配置(JSON)
-
-**位置**：`渠道 → Codex → Codex 配置(JSON)` 中的 `websocket_retry_cooldown_seconds` 字段。表示 Codex Realtime websocket 失败后的 bridge 冷却；在冷却期内，同一 Realtime execution session 不重试 websocket，而是继续使用 HTTP bridge。
-
-| 值 | 行为 |
-|----|------|
-| `120`（默认） | 2 分钟冷却 |
-| 正整数 | 指定冷却秒数；保存校验要求大于 0 |
-
----
 
 ## Origin 检查策略
 
@@ -462,5 +434,5 @@ Realtime WebSocket 的 Origin 检查按以下优先级执行：
 ## 相关文档
 
 - [ResponsesWS 配置](/use/responses-ws) — `GET /v1/responses` WebSocket 配置
-- [Codex 渠道](/use/Codex) — Codex 渠道的 `websocket_mode` 完整说明
+- [Codex 渠道](/use/Codex) — Codex 渠道配置说明
 - [WebSocket Transport 架构](/dev/websocket-transport-architecture) — 底层复用方案

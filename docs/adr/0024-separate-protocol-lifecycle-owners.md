@@ -1,0 +1,9 @@
+# Separate protocol lifecycle owners
+
+Realtime, Responses HTTP streaming, and Responses WebSocket have separate wire contracts even when their event names and Response objects look similar. Realtime lifecycle classification is owned by the Realtime context and recognizes `response.done`; Responses WebSocket classification is owned by the Responses WebSocket context and follows the Responses Streaming Event Model; non-streaming Responses HTTP has no event lifecycle. A provider-private supplier dialect is interpreted only inside that provider adapter, which may emit a narrowly normalized public event when its own contract proves a lossless meaning.
+
+Shared lifecycle aliases were rejected because they make the importing package appear protocol-neutral while silently accepting foreign wire events. Similar strings are not compatibility evidence: generic Realtime code does not accept Responses terminals, generic Responses code does not accept Realtime terminals, and provider compatibility rules do not escape the provider boundary.
+
+Wire lifecycle owners live at parallel package boundaries: `common/realtime` owns Realtime event semantics and `common/responsesws` owns Responses WebSocket event semantics. `runtime/realtime` is deliberately limited to long-lived session, frame, and transport contracts; it does not parse either public wire protocol.
+
+Realtime `error` is not a response terminal because most such events are recoverable. A session may release a locally admitted `response.create` only when `error.error.event_id` matches that create and no response has started; otherwise it waits for the standard `response.done` or transport closure. Because public Realtime permits clients to omit `response.create.event_id`, the same-dialect adapter injects a turn-scoped correlation ID only when the field is absent and removes that proxy-owned value from downstream error events. Explicit client values and unrelated errors remain unchanged.

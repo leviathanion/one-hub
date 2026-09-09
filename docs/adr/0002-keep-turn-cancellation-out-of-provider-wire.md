@@ -1,0 +1,3 @@
+# Keep turn cancellation out of the provider wire protocol
+
+The proxy treats cancellation as the lifecycle of one in-flight attempt: downstream cancellation stops that attempt, closes its upstream transport, and prevents retry. It does not define a proxy-specific `response.cancel` contract or synthesize a `response.cancelled` provider event. Native provider client events remain ordered passthrough data, while cross-protocol adapters reject events for which they have no defined mapping. A future agent/session API may introduce targeted cancellation using its own stable turn identifier; this keeps the current relay compatible with provider wire behavior at the cost of not offering targetable cancellation as a proxy feature today.

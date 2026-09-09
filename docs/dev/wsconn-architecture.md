@@ -1366,7 +1366,13 @@ const (
 - `Source=input_audio_transcription, BillingBasis=tokens`：来自 `conversation.item.input_audio_transcription.completed.usage` 的 token usage variant，`ItemID` 取上游 item id。
 - `Source=input_audio_transcription, BillingBasis=duration`：来自 `conversation.item.input_audio_transcription.completed.usage` 的 duration usage variant，`DurationSeconds` 填音频时长秒数。
 
-这些字段只表达**来源、计费维度和关联关系**。`ProviderEventID` / `ResponseID` / `ItemID` 不能替代 ResponsesWS turn settlement identity，也不能让 provider 直接触发 truth 写入；它们用于 actor 归属、幂等辅助、日志和诊断。provider-originated usage 只有在存在 pending 或 active turn 时才有 quota 语义；若没有可归属 turn，actor 只能记录 protocol/diagnostic metric，不能凭关联 ID 自行创建结算事实。最终扣费仍必须由 actor 在 turn finalize 时把累积 usage 合并进 quota，并通过 `Quota -> SettlementEnvelope -> ApplySettlement` 这条统一链路落 truth（见 [Billing / Usage 结算架构](./billing-settlement-architecture.md)）。
+结算投影只在共享 billing 边界进行一次：token basis 把转写 token、duration
+basis 把秒数分别保留为 `input_audio_transcription` 的非整数
+`ExtraUsageUnits`，不混入主模型 input bucket。两者均按“使用量 × 该扩展倍率”
+加入输入计费单位；duration 倍率因此表示每秒对应的输入 token 等价单位，秒数
+不能预先取整。
+
+这些字段只表达**来源、计费维度和关联关系**。`ProviderEventID` / `ResponseID` / `ItemID` 不能替代 ResponsesWS turn owner，也不能让 provider 直接触发 truth 写入；它们用于 actor 归属、日志和诊断。provider-originated usage 只有在存在 pending 或 active turn 时才有 quota 语义；若没有可归属 turn，actor 只能记录 protocol/diagnostic metric，不能凭关联 ID 自行创建结算事实。最终扣费仍必须由 actor 在 turn finalize 时把累积 usage 合并进 quota，并通过 `Quota -> SettlementEnvelope -> ApplySettlement` 这条统一链路落 truth（见 [基于下游 Usage 的 TCC 计费](./usage-confirmed-tcc-billing-architecture.md)）。
 
 为什么不抽更复杂的 schema：actor 只需要"按什么维度结算 + 该模型是否支持该维度的定价 + 这条 usage 归属于哪个 provider 业务对象"这三个语义。其余 usage 细节（tokens 桶、cached/audio/text breakdown）仍走 `types.UsageEvent` 既有字段，不重新发明账务结构。
 
@@ -2387,6 +2393,6 @@ func WithClock(clock wsconn.Clock) Option
 - [ResponsesWS 架构说明](./responses-ws-architecture.md)：Actor / TurnAttempt / quota / settlement 的业务边界不变，本方案只替换 IO 层。
 - [Channel Affinity 架构](./channel-affinity-architecture.md)：affinity 选择和 channel 路由不变。
 - [Execution Session Revocation](./execution-session-revocation-refactor.md)：runtime/session 锁边界和业务能力边界不变；RealtimeSession 接口签名随 typed Frame / RecvEvent 一次性切换。
-- [Billing / Usage 结算架构](./billing-settlement-architecture.md)：结算链路不变。
+- [基于下游 Usage 的 TCC 计费](./usage-confirmed-tcc-billing-architecture.md)：结算链路与收费证据边界。
 
 本方案**只**是传输层的边界重整，不修改任何业务语义。
