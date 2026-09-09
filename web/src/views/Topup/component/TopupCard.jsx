@@ -20,6 +20,8 @@ import UserCard from 'ui-component/cards/UserCard';
 import AnimateButton from 'ui-component/extended/AnimateButton';
 import { useSelector } from 'react-redux';
 import PayDialog from './PayDialog';
+import { estimateTotal, restoreOperation, rememberOperation } from './paymentFlow.mjs';
+import { createPaymentRequestKey } from './paymentRequestKey.mjs';
 
 import { API } from 'utils/api';
 import React, { useEffect, useState, useMemo } from 'react';
@@ -36,7 +38,7 @@ const TopupCard = () => {
   const [payment, setPayment] = useState([]);
   const [selectedPayment, setSelectedPayment] = useState(null);
   const [amount, setAmount] = useState(0);
-  const [discountTotal, setDiscountTotal] = useState(0);
+  const [operation, setOperation] = useState(() => restoreOperation(sessionStorage));
   const [open, setOpen] = useState(false);
   const [disabledPay, setDisabledPay] = useState(false);
   const matchDownSM = useMediaQuery(theme.breakpoints.down('md'));
@@ -78,7 +80,11 @@ const TopupCard = () => {
     }
   };
 
-  const handlePay = () => {
+  const handlePay = (newOrder = false) => {
+    if (operation && !newOrder) {
+      setOpen(true);
+      return;
+    }
     if (!selectedPayment) {
       showError(t('topupCard.selectPaymentMethod'));
       return;
@@ -100,6 +106,25 @@ const TopupCard = () => {
       return;
     }
 
+    let requestKey;
+    try {
+      requestKey = createPaymentRequestKey();
+    } catch (error) {
+      showError(error.message || '无法生成安全付款请求键，请重试');
+      return;
+    }
+
+    const nextOperation = {
+      uuid: selectedPayment.uuid,
+      amount: Number(amount),
+      request_key: requestKey,
+      ...(selectedPayment.default_product ? { product: selectedPayment.default_product } : {})
+    };
+    if (!rememberOperation(sessionStorage, nextOperation)) {
+      showError('无法保存付款请求，请检查浏览器存储后重试');
+      return;
+    }
+    setOperation(nextOperation);
     setDisabledPay(true);
     setOpen(true);
   };
@@ -163,37 +188,6 @@ const TopupCard = () => {
   const handleSetAmount = (amount) => {
     amount = Number(amount);
     setAmount(amount);
-    handleDiscountTotal(amount);
-  };
-
-  const calculateFee = () => {
-    if (!selectedPayment) return 0;
-
-    if (selectedPayment.fixed_fee > 0) {
-      return Number(selectedPayment.fixed_fee); //固定费率不计算折扣
-    }
-    const discount = RechargeDiscount[amount] || 1; // 如果没有折扣，则默认为1（即没有折扣）
-    let newAmount = amount * discount; //折后价格
-    return parseFloat(selectedPayment.percent_fee * Number(newAmount)).toFixed(2);
-  };
-
-  const calculateTotal = () => {
-    if (amount === 0) return 0;
-    const discount = RechargeDiscount[amount] || 1; // 如果没有折扣，则默认为1（即没有折扣）
-    let newAmount = amount * discount; //折后价格
-    let total = Number(newAmount) + Number(calculateFee());
-    if (selectedPayment && selectedPayment.currency === 'CNY') {
-      total = parseFloat((total * siteInfo.PaymentUSDRate).toFixed(2));
-    }
-    return total;
-  };
-
-  const handleDiscountTotal = (amount) => {
-    if (amount === 0) return 0;
-    // 如果金额在RechargeDiscount中，则应用折扣,手续费和货币换算汇率不算在折扣内
-    const discount = RechargeDiscount[amount] || 1; // 如果没有折扣，则默认为1（即没有折扣）
-    console.log(amount, discount);
-    setDiscountTotal(amount * discount);
   };
 
   useEffect(() => {
@@ -209,7 +203,7 @@ const TopupCard = () => {
         <Typography variant="h4">{renderQuota(userQuota)}</Typography>
       </Stack>
 
-      {payment.length > 0 && (
+      {(payment.length > 0 || operation) && (
         <SubCard
           sx={{
             marginTop: '40px'
@@ -231,7 +225,7 @@ const TopupCard = () => {
                   }}
                 >
                   <Box sx={{ mr: { xs: 1, sm: 2, width: 20 }, display: 'flex', alignItems: 'center' }}>
-                    <img src={item.icon} alt="github" width={25} height={25} style={{ marginRight: matchDownSM ? 8 : 16 }} />
+                    <img src={item.icon} alt={item.name} width={25} height={25} style={{ marginRight: matchDownSM ? 8 : 16 }} />
                   </Box>
                   {item.name}
                 </Button>
@@ -265,44 +259,13 @@ const TopupCard = () => {
               <Grid item xs={6} md={3}>
                 ${Number(amount)}
               </Grid>
-              {discountTotal !== amount && (
-                <>
-                  <Grid item xs={6} md={9}>
-                    <Typography variant="h6" style={{ textAlign: 'right', fontSize: '0.875rem' }}>
-                      {t('topupCard.discountedPrice')}:{' '}
-                    </Typography>
-                  </Grid>
-                  <Grid item xs={6} md={3}>
-                    ${discountTotal}
-                  </Grid>
-                </>
-              )}
-              {selectedPayment && (selectedPayment.percent_fee > 0 || selectedPayment.fixed_fee > 0) && (
-                <>
-                  <Grid item xs={6} md={9}>
-                    <Typography variant="h6" style={{ textAlign: 'right', fontSize: '0.875rem' }}>
-                      {t('topupCard.fee')}:{' '}
-                      {selectedPayment &&
-                        (selectedPayment.fixed_fee > 0
-                          ? '(固定)'
-                          : selectedPayment.percent_fee > 0
-                            ? `(${selectedPayment.percent_fee * 100}%)`
-                            : '')}{' '}
-                    </Typography>
-                  </Grid>
-                  <Grid item xs={6} md={3}>
-                    ${calculateFee()}
-                  </Grid>
-                </>
-              )}
-
               <Grid item xs={6} md={9}>
                 <Typography variant="h6" style={{ textAlign: 'right', fontSize: '0.875rem' }}>
-                  {t('topupCard.actualAmountToPay')}:{' '}
+                  预估应付金额（以订单确认为准）:{' '}
                 </Typography>
               </Grid>
               <Grid item xs={6} md={3}>
-                {calculateTotal()}{' '}
+                {estimateTotal(amount, RechargeDiscount[amount] || 1, selectedPayment, siteInfo.PaymentUSDRate)}{' '}
                 {selectedPayment &&
                   (selectedPayment.currency === 'CNY'
                     ? `CNY (${t('topupCard.exchangeRate')}: ${siteInfo.PaymentUSDRate})`
@@ -310,11 +273,19 @@ const TopupCard = () => {
               </Grid>
             </Grid>
             <Divider />
-            <Button variant="contained" onClick={handlePay} disabled={disabledPay}>
-              {t('topupCard.topup')}
+            <Button variant="contained" onClick={() => handlePay()} disabled={disabledPay}>
+              {operation ? '继续查看本单' : '获取订单并确认金额'}
             </Button>
+            {operation && (
+              <>
+                <Typography variant="body2">旧单仍可能付款。需要另一笔充值时，请明确新建订单。</Typography>
+                <Button disabled={disabledPay} onClick={() => handlePay(true)}>
+                  新建另一笔充值
+                </Button>
+              </>
+            )}
           </Stack>
-          <PayDialog open={open} onClose={onClosePayDialog} amount={amount} uuid={selectedPayment.uuid} />
+          <PayDialog open={open} onClose={onClosePayDialog} operation={operation} />
         </SubCard>
       )}
 
