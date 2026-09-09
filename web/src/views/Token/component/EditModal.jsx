@@ -147,11 +147,11 @@ const EditModal = ({ open, tokenId, onCancel, onOk, userGroupOptions, adminMode 
       if (values.is_edit) {
         // 管理员模式使用管理员专用接口
         const apiPath = adminMode ? `/api/token/admin` : `/api/token/`;
-        const payload = { ...values, id: parseInt(tokenId) };
-        // 管理员模式下传递 user_id
-        if (adminMode && values.user_id) {
-          payload.user_id = parseInt(values.user_id);
-        }
+        const payload = {
+          ...values,
+          id: parseInt(tokenId),
+          expected_remain_quota: parseInt(inputs.remain_quota)
+        };
         res = await API.put(apiPath, payload);
       } else {
         res = await API.post(`/api/token/`, values);
@@ -238,29 +238,6 @@ const EditModal = ({ open, tokenId, onCancel, onOk, userGroupOptions, adminMode 
         <Formik initialValues={inputs} enableReinitialize validationSchema={validationSchema} onSubmit={submit}>
           {({ errors, handleBlur, handleChange, handleSubmit, touched, values, setFieldError, setFieldValue, isSubmitting }) => (
             <form noValidate onSubmit={handleSubmit}>
-              {/* 管理员模式下显示用户转移字段 */}
-              {adminMode && values.is_edit && (
-                <>
-                  <Alert severity="warning" sx={{ mb: 2 }}>
-                    {t('token_index.adminEditWarning')}
-                  </Alert>
-                  <FormControl fullWidth sx={{ ...theme.typography.otherInput }}>
-                    <InputLabel htmlFor="token-user-id-label">{t('token_index.transferToUser')}</InputLabel>
-                    <OutlinedInput
-                      id="token-user-id-label"
-                      label={t('token_index.transferToUser')}
-                      type="number"
-                      value={values.user_id || ''}
-                      name="user_id"
-                      onBlur={handleBlur}
-                      onChange={handleChange}
-                      inputProps={{ autoComplete: 'off' }}
-                      aria-describedby="helper-text-token-user-id-label"
-                    />
-                    <FormHelperText id="helper-text-token-user-id-label">{t('token_index.transferToUserHelper')}</FormHelperText>
-                  </FormControl>
-                </>
-              )}
               <FormControl fullWidth error={Boolean(touched.name && errors.name)} sx={{ ...theme.typography.otherInput }}>
                 <InputLabel htmlFor="channel-name-label">{t('token_index.name')}</InputLabel>
                 <OutlinedInput
