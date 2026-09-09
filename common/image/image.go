@@ -2,15 +2,14 @@ package image
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"image"
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
-	"net/http"
-	"one-api/common/config"
+	"one-api/common/safefetch"
 	"strings"
 	"sync"
 
@@ -22,40 +21,11 @@ func GetImageFromUrl(url string) (mimeType string, data string, err error) {
 		return ParseBase64File(url)
 	}
 
-	if !strings.HasPrefix(url, "http") {
-		return "", "", errors.New("invalid image url")
-	}
-
-	resp, err := RequestFile(url, "base64")
+	mimeType, raw, err := safefetch.Fetch(context.Background(), url)
 	if err != nil {
-		return
+		return "", "", err
 	}
-	defer resp.Body.Close()
-
-	if config.CFWorkerImageUrl == "" {
-		buffer := bytes.NewBuffer(nil)
-		_, err = buffer.ReadFrom(resp.Body)
-		if err != nil {
-			return
-		}
-		mimeType = resp.Header.Get("Content-Type")
-		if mimeType == "application/octet-stream" {
-			firstBytes := buffer.Bytes()[:512]
-			actualMime := http.DetectContentType(firstBytes)
-			mimeType = actualMime
-		}
-		data = base64.StdEncoding.EncodeToString(buffer.Bytes())
-	} else {
-		var cfResp *CFResponse
-		err = json.NewDecoder(resp.Body).Decode(&cfResp)
-		if err != nil {
-			return
-		}
-		mimeType = cfResp.MimeType
-		data = cfResp.Data
-	}
-
-	return
+	return mimeType, base64.StdEncoding.EncodeToString(raw), nil
 }
 
 var readerPool = sync.Pool{
@@ -95,13 +65,12 @@ func GetImageSizeFromBase64(encoded string) (width, height int, err error) {
 }
 
 func GetImageSizeFromUrl(url string) (width, height int, err error) {
-	resp, err := RequestFile(url, "get16kb")
+	_, raw, err := safefetch.Fetch(context.Background(), url)
 	if err != nil {
 		return 0, 0, err
 	}
-	defer resp.Body.Close()
 
-	img, _, err := image.DecodeConfig(resp.Body)
+	img, _, err := image.DecodeConfig(bytes.NewReader(raw))
 	if err != nil {
 		return 0, 0, err
 	}

@@ -209,7 +209,14 @@ func TestBase64(t *testing.T) {
 func TestGetImageSize(t *testing.T) {
 	for i, c := range cases {
 		t.Run("Decode:"+strconv.Itoa(i), func(t *testing.T) {
-			width, height, err := img.GetImageSize(c.url)
+			resp, err := http.Get(c.url)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			raw, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			dataURL := "data:image/" + c.format + ";base64," + base64.StdEncoding.EncodeToString(raw)
+
+			width, height, err := img.GetImageSize(dataURL)
 			assert.NoError(t, err)
 			assert.Equal(t, c.width, width)
 			assert.Equal(t, c.height, height)
@@ -244,13 +251,8 @@ func TestGetImageFromUrl(t *testing.T) {
 			require.NoError(t, err)
 			encoded := base64.StdEncoding.EncodeToString(data)
 
-			mimeType, base64Data, err := img.GetImageFromUrl(c.url)
-			require.NoError(t, err)
-			assert.Equal(t, encoded, base64Data)
-			assert.Equal(t, "image/"+c.format, mimeType)
-
 			encodedBase64 := "data:image/" + c.format + ";base64," + encoded
-			mimeType, base64Data, err = img.GetImageFromUrl(encodedBase64)
+			mimeType, base64Data, err := img.GetImageFromUrl(encodedBase64)
 			assert.NoError(t, err)
 			assert.Equal(t, encoded, base64Data)
 			assert.Equal(t, "image/"+c.format, mimeType)
@@ -259,6 +261,10 @@ func TestGetImageFromUrl(t *testing.T) {
 
 	_, _, err := img.GetImageFromUrl("ftp://example.invalid/image.png")
 	assert.Error(t, err)
+	_, _, err = img.GetImageFromUrl(cases[0].url)
+	assert.Error(t, err, "remote image fetch must reject loopback destinations")
+	_, _, err = img.GetImageSizeFromUrl(cases[0].url)
+	assert.Error(t, err, "remote image sizing must reject loopback destinations")
 	encodedBase64 := "data:image/text;base64,"
 	_, _, err = img.GetImageFromUrl(encodedBase64)
 	assert.Error(t, err)
