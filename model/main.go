@@ -120,7 +120,9 @@ func InitDB() (err error) {
 		}
 		logger.SysLog("database migration started")
 
-		migrationBefore(DB)
+		if err := migrationBefore(DB); err != nil {
+			return err
+		}
 
 		err = db.AutoMigrate(&Channel{})
 		if err != nil {
@@ -152,6 +154,13 @@ func InitDB() (err error) {
 		}
 		err = db.AutoMigrate(&Price{})
 		if err != nil {
+			return err
+		}
+		err = db.AutoMigrate(&PublicationVersion{})
+		if err != nil {
+			return err
+		}
+		if err = EnsurePublicationVersionRows(db); err != nil {
 			return err
 		}
 		err = db.AutoMigrate(&Midjourney{})

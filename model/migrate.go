@@ -98,6 +98,10 @@ func migrationBefore(db *gorm.DB) error {
 		return nil
 	}
 
+	preparations := gormigrate.New(db, gormigrate.DefaultOptions, []*gormigrate.Migration{migrateIdenticalPrices()})
+	if err := preparations.Migrate(); err != nil {
+		return err
+	}
 	m := gormigrate.New(db, gormigrate.DefaultOptions, beforeAutoMigrateMigrations())
 	return m.Migrate()
 }
