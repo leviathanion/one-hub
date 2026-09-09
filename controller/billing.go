@@ -11,6 +11,7 @@ import (
 )
 
 func GetSubscription(c *gin.Context) {
+	options := config.GlobalOption.RuntimeSnapshot()
 	var remainQuota int
 	var usedQuota int
 	var err error
@@ -44,8 +45,8 @@ func GetSubscription(c *gin.Context) {
 
 	quota := remainQuota + usedQuota
 	amount := float64(quota)
-	if config.DisplayInCurrencyEnabled {
-		amount /= config.QuotaPerUnit
+	if options.Bool("DisplayInCurrencyEnabled", config.DisplayInCurrencyEnabled) {
+		amount /= options.Float64("QuotaPerUnit", config.QuotaPerUnit)
 	}
 
 	subscription := OpenAISubscriptionResponse{
@@ -60,6 +61,7 @@ func GetSubscription(c *gin.Context) {
 }
 
 func GetUsage(c *gin.Context) {
+	options := config.GlobalOption.RuntimeSnapshot()
 	var quota int
 	var err error
 	var token *model.Token
@@ -85,8 +87,8 @@ func GetUsage(c *gin.Context) {
 	}
 
 	amount := float64(quota)
-	if config.DisplayInCurrencyEnabled {
-		amount /= config.QuotaPerUnit
+	if options.Bool("DisplayInCurrencyEnabled", config.DisplayInCurrencyEnabled) {
+		amount /= options.Float64("QuotaPerUnit", config.QuotaPerUnit)
 	}
 	usage := OpenAIUsageResponse{
 		Object:     "list",

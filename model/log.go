@@ -6,9 +6,15 @@ import (
 	"one-api/common/config"
 	"one-api/common/logger"
 	"one-api/common/utils"
+	"time"
 
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+)
+
+const (
+	consumeLogUsernameLookupTimeout = 250 * time.Millisecond
+	consumeLogWriteTimeout          = 5 * time.Second
 )
 
 type Log struct {
@@ -44,7 +50,7 @@ const (
 )
 
 func RecordQuotaLog(userId int, logType int, quota int, ip string, content string) {
-	if logType == LogTypeConsume && !config.LogConsumeEnabled {
+	if logType == LogTypeConsume && !config.GlobalOption.RuntimeSnapshot().Bool("LogConsumeEnabled", config.LogConsumeEnabled) {
 		return
 	}
 	username, _ := CacheGetUsername(userId)
@@ -64,7 +70,7 @@ func RecordQuotaLog(userId int, logType int, quota int, ip string, content strin
 }
 
 func RecordLog(userId int, logType int, content string) {
-	if logType == LogTypeConsume && !config.LogConsumeEnabled {
+	if logType == LogTypeConsume && !config.GlobalOption.RuntimeSnapshot().Bool("LogConsumeEnabled", config.LogConsumeEnabled) {
 		return
 	}
 	username, _ := CacheGetUsername(userId)
@@ -99,13 +105,19 @@ func RecordConsumeLog(
 	isStream bool,
 	metadata map[string]any,
 	sourceIp string) {
-	if !config.LogConsumeEnabled {
+	if !config.GlobalOption.RuntimeSnapshot().Bool("LogConsumeEnabled", config.LogConsumeEnabled) {
 		return
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	requestCtx := context.WithoutCancel(ctx)
 
-	logger.LogDebug(ctx, fmt.Sprintf("record consume log: userId=%d, channelId=%d, promptTokens=%d, completionTokens=%d, modelName=%s, tokenName=%s, quota=%d, content=%s ,sourceIp=%s", userId, channelId, promptTokens, completionTokens, modelName, tokenName, quota, content, sourceIp))
+	logger.LogDebug(requestCtx, fmt.Sprintf("record consume log: userId=%d, channelId=%d, promptTokens=%d, completionTokens=%d, modelName=%s, tokenName=%s, quota=%d, content=%s ,sourceIp=%s", userId, channelId, promptTokens, completionTokens, modelName, tokenName, quota, content, sourceIp))
 
-	username, _ := CacheGetUsername(userId)
+	usernameCtx, usernameCancel := context.WithTimeout(requestCtx, consumeLogUsernameLookupTimeout)
+	username, _ := GetUsernameByIdWithContext(usernameCtx, userId)
+	usernameCancel()
 
 	log := &Log{
 		UserId:           userId,
@@ -134,9 +146,11 @@ func RecordConsumeLog(
 	if config.BatchUpdateEnabled {
 		AddLogToBatch(log)
 	} else {
-		err := DB.Create(log).Error
+		writeCtx, writeCancel := context.WithTimeout(requestCtx, consumeLogWriteTimeout)
+		defer writeCancel()
+		err := DB.WithContext(writeCtx).Create(log).Error
 		if err != nil {
-			logger.LogError(ctx, "failed to record log: "+err.Error())
+			logger.LogError(writeCtx, "failed to record log: "+err.Error())
 		}
 	}
 }

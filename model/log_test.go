@@ -2,12 +2,12 @@ package model
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"testing"
 
 	"one-api/common/config"
 	"one-api/common/logger"
+	"one-api/internal/testutil/sqlitetest"
 
 	"github.com/spf13/viper"
 	"gorm.io/driver/sqlite"
@@ -20,7 +20,7 @@ func useConsumeLogTestDB(t *testing.T) {
 	originalDB := DB
 	originalRedisEnabled := config.RedisEnabled
 
-	testDB, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())), &gorm.Config{})
+	testDB, err := gorm.Open(sqlite.Open(sqlitetest.MemoryDSN()), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("expected in-memory sqlite database, got %v", err)
 	}
@@ -69,24 +69,51 @@ func TestRecordConsumeLogDebugRuntimeLogVisibility(t *testing.T) {
 	viper.Set("log_level", "info")
 	config.LogConsumeEnabled = true
 	infoMarker := "consume-log-info-hidden"
+	infoBefore := countLatestRuntimeLogs(infoMarker)
 	RecordConsumeLog(context.Background(), 1, 2, 3, 4, 0, 0, 0, "gpt-test", "token-test", 5, infoMarker, 6, false, nil, "127.0.0.1")
-	if countLatestRuntimeLogs(infoMarker) != 0 {
+	if got := countLatestRuntimeLogs(infoMarker); got != infoBefore {
 		t.Fatal("expected consume runtime log to be hidden at info level")
 	}
 
 	viper.Set("log_level", "debug")
 	config.LogConsumeEnabled = false
 	disabledMarker := "consume-log-disabled-hidden"
+	disabledBefore := countLatestRuntimeLogs(disabledMarker)
 	RecordConsumeLog(context.Background(), 1, 2, 3, 4, 0, 0, 0, "gpt-test", "token-test", 5, disabledMarker, 6, false, nil, "127.0.0.1")
-	if countLatestRuntimeLogs(disabledMarker) != 0 {
+	if got := countLatestRuntimeLogs(disabledMarker); got != disabledBefore {
 		t.Fatal("expected disabled consume logging to skip runtime debug log")
 	}
 
 	config.LogConsumeEnabled = true
 	debugMarker := "consume-log-debug-visible"
+	debugBefore := countLatestRuntimeLogs(debugMarker)
 	RecordConsumeLog(context.Background(), 1, 2, 3, 4, 0, 0, 0, "gpt-test", "token-test", 5, debugMarker, 6, false, nil, "127.0.0.1")
-	if countLatestRuntimeLogs(debugMarker) != 1 {
+	if got := countLatestRuntimeLogs(debugMarker); got != debugBefore+1 {
 		t.Fatal("expected consume runtime log to be visible at debug level")
+	}
+}
+
+func TestRecordConsumeLogSurvivesRequestCancellation(t *testing.T) {
+	useConsumeLogTestDB(t)
+	originalLogConsume := config.LogConsumeEnabled
+	originalBatchUpdate := config.BatchUpdateEnabled
+	config.LogConsumeEnabled = true
+	config.BatchUpdateEnabled = false
+	t.Cleanup(func() {
+		config.LogConsumeEnabled = originalLogConsume
+		config.BatchUpdateEnabled = originalBatchUpdate
+	})
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	RecordConsumeLog(requestCtx, 99, 2, 0, 0, 0, 0, 0, "", "token-test", 0, "canceled-request-audit", 1, false, nil, "127.0.0.1")
+
+	var count int64
+	if err := DB.Model(&Log{}).Where("content = ?", "canceled-request-audit").Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("expected consume audit to survive request cancellation, got %d rows", count)
 	}
 }
 
