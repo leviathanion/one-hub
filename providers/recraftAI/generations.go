@@ -5,6 +5,7 @@ import (
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/types"
+	"strings"
 )
 
 func (p *RecraftProvider) CreateImageGenerations(request *types.ImageRequest) (*types.ImageResponse, *types.OpenAIErrorWithStatusCode) {
@@ -45,7 +46,24 @@ func (p *RecraftProvider) CreateImageGenerations(request *types.ImageRequest) (*
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
-	p.Usage.TotalTokens = p.Usage.PromptTokens
+	p.retainImageOperationEvidence(recraftResponse)
 
 	return recraftResponse, nil
+}
+
+func (p *RecraftProvider) retainImageOperationEvidence(response *types.ImageResponse) {
+	if p == nil || p.Usage == nil || response == nil {
+		return
+	}
+	count := 0
+	for _, item := range response.Data {
+		if strings.TrimSpace(item.URL) != "" || strings.TrimSpace(item.B64JSON) != "" {
+			count++
+		}
+	}
+	if count == 0 {
+		return
+	}
+	p.Usage.MarkProviderOperationUnits(count)
+	p.Usage.MergeProviderAttribution(response.Model, "")
 }
