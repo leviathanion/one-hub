@@ -11,6 +11,7 @@ import (
 	"one-api/common/requester"
 	"one-api/model"
 	"one-api/providers/base"
+	"one-api/providers/claude"
 	"one-api/types"
 	"strings"
 	"time"
@@ -20,6 +21,29 @@ import (
 )
 
 type BedrockProviderFactory struct{}
+
+func (BedrockProviderFactory) AssessChatRemoteMedia(_ *model.Channel, request *types.ChatCompletionRequest, _ base.ChatRemoteMediaSummary) (base.RemoteMediaMode, error) {
+	if request == nil {
+		return base.RemoteMediaReject, errors.New("chat request is required")
+	}
+	if _, err := category.GetCategory(request.Model); err != nil {
+		return base.RemoteMediaReject, nil
+	}
+	return base.RemoteMediaMaterialize, nil
+}
+
+func (BedrockProviderFactory) AssessNativeClaudeRemoteMedia(_ *model.Channel, request *claude.ClaudeRequest, summary claude.NativeRemoteMediaSummary) (base.RemoteMediaMode, error) {
+	if request == nil {
+		return base.RemoteMediaReject, nil
+	}
+	if _, err := category.GetCategory(request.Model); err != nil {
+		return base.RemoteMediaReject, nil
+	}
+	if err := claude.ValidateMaterializableNativeRemoteMedia(request, summary); err != nil {
+		return base.RemoteMediaReject, err
+	}
+	return base.RemoteMediaMaterialize, nil
+}
 
 // 创建 BedrockProvider
 func (f BedrockProviderFactory) Create(channel *model.Channel) base.ProviderInterface {
@@ -44,6 +68,14 @@ type BedrockProvider struct {
 	SessionToken    string
 	APIToken        string
 	Category        *category.Category
+}
+
+func (p *BedrockProvider) MaterializeChatRemoteMedia(request *types.ChatCompletionRequest, fetcher base.RemoteMediaFetcher) error {
+	return base.MaterializeChatRemoteMedia(request, fetcher)
+}
+
+func (p *BedrockProvider) MaterializeNativeClaudeRemoteMedia(request *claude.ClaudeRequest, fetcher base.RemoteMediaFetcher) (*claude.ClaudeRequest, error) {
+	return claude.MaterializeNativeRemoteMedia(request, fetcher)
 }
 
 func getConfig() base.ProviderConfig {

@@ -34,7 +34,7 @@ func TestUpdateChannelsTagConfigUsesSnapshottedMembers(t *testing.T) {
 	t.Cleanup(func() { _ = DB.Callback().Update().Remove(callback) })
 
 	fields := ChannelTagSubmittedFields{"models": {}}
-	if err := UpdateChannelsTagWithSubmittedFields("target", &Channel{Key: "key-a\nkey-b", Models: "new-model"}, fields); err != nil {
+	if err := UpdateChannelsTagWithSubmittedFields("target", &Channel{Models: "new-model"}, fields); err != nil {
 		t.Fatalf("update tag config: %v", err)
 	}
 

@@ -61,7 +61,9 @@ type ProviderCloseResult struct {
 // ProviderFrameResult is the adapter's typed interpretation of one provider
 // frame, including any usage evidence or proxy-local transport error.
 type ProviderFrameResult struct {
-	EmitFrame      *Frame
+	EmitFrame *Frame
+	// Usage is one incremental accounting event. Adapters that observe provider
+	// cumulative snapshots must convert them to deltas before returning.
 	Usage          *types.UsageEvent
 	Origin         RecvDetailOrigin
 	Err            error
@@ -73,7 +75,10 @@ func ValidateProviderFrameResult(result ProviderFrameResult) error {
 	switch result.Origin {
 	case RecvDetailOriginProviderFrame:
 	case RecvDetailOriginProviderMalformed, RecvDetailOriginAdapterPanic:
-		if result.Err == nil || !result.CloseTransport || result.EmitFrame != nil || result.Usage != nil || result.Filtered {
+		if result.Err == nil || !result.CloseTransport || result.EmitFrame != nil || result.Filtered {
+			return ErrInvalidProviderFrameResult
+		}
+		if result.Usage != nil && result.Origin != RecvDetailOriginProviderMalformed {
 			return ErrInvalidProviderFrameResult
 		}
 		return nil

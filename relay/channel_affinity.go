@@ -10,6 +10,7 @@ import (
 	"one-api/common/groupctx"
 	commonredis "one-api/common/redis"
 	"one-api/internal/requesthints"
+	"one-api/model"
 	runtimeaffinity "one-api/runtime/channelaffinity"
 	runtimesession "one-api/runtime/session"
 	"one-api/types"
@@ -24,6 +25,7 @@ import (
 type channelAffinityKind string
 
 const (
+	channelAffinityKindChat      channelAffinityKind = "chat"
 	channelAffinityKindResponses channelAffinityKind = "responses"
 	channelAffinityKindRealtime  channelAffinityKind = "realtime"
 
@@ -33,9 +35,16 @@ const (
 	channelAffinitySkipRetryContextKey         = "channel_affinity_skip_retry_on_failure"
 	channelAffinityIgnoreCooldownContextKey    = "channel_affinity_ignore_preferred_cooldown"
 	channelAffinitySelectedPreferredContextKey = "channel_affinity_selected_preferred"
+	channelAffinityInputContextKey             = "channel_affinity_input"
 	defaultChannelAffinityJanitorInterval      = time.Minute
 	defaultChannelAffinityRedisPrefix          = "one-hub:channel-affinity"
 )
+
+var channelAffinityManagerPublication struct {
+	sync.Mutex
+	owner   *config.OptionManager
+	version int64
+}
 
 type channelAffinityTemplate struct {
 	Kind                    channelAffinityKind
@@ -68,6 +77,7 @@ type channelAffinityState struct {
 
 type channelAffinityInput struct {
 	ResponsesRequest  *types.OpenAIResponsesRequest
+	PromptCacheKey    string
 	RealtimeSessionID string
 	ModelName         string
 }
@@ -224,15 +234,7 @@ func recordCurrentChannelAffinity(c *gin.Context, kind channelAffinityKind, chan
 		return
 	}
 
-	for _, binding := range state.RequestBindings {
-		if binding == nil || !binding.Template.RecordOnSuccess || strings.TrimSpace(binding.Key) == "" {
-			continue
-		}
-		channelAffinityManager().SetRecord(binding.Key, runtimeaffinity.Record{
-			ChannelID:         channelID,
-			ResumeFingerprint: channelAffinityStateResumeFingerprint(state),
-		}, binding.Template.TTL)
-	}
+	recordChannelAffinityStateBindings(state, channelID)
 	refreshChannelAffinityMeta(c, state, channelID)
 }
 
@@ -240,13 +242,40 @@ func recordResponsesChannelAffinity(c *gin.Context, channelID int, response *typ
 	if c == nil || channelID <= 0 {
 		return
 	}
-	recordCurrentChannelAffinity(c, channelAffinityKindResponses, channelID)
+	model.ChannelGroup.RLock()
+	choice := model.ChannelGroup.Channels[channelID]
+	var channel *model.Channel
+	if choice != nil {
+		channel = choice.Channel
+	}
+	model.ChannelGroup.RUnlock()
+	requestedModel := ""
+	if value, ok := c.Get(channelAffinityInputContextKey); ok {
+		if input, ok := value.(channelAffinityInput); ok {
+			requestedModel = channelAffinityModelName(channelAffinityKindResponses, input)
+		}
+	}
+	refreshChannelAffinityForSelectedModel(c, channelAffinityKindResponses, channel, requestedModel)
 	if explicitChannelPinID(c) > 0 {
+		recordCurrentChannelAffinity(c, channelAffinityKindResponses, channelID)
 		return
 	}
 
 	state := currentChannelAffinityState(c)
-	if state == nil || state.Kind != channelAffinityKindResponses || response == nil {
+	if state == nil || state.Kind != channelAffinityKindResponses {
+		recordCurrentChannelAffinity(c, channelAffinityKindResponses, channelID)
+		return
+	}
+	recordResponsesChannelAffinityState(c, state, channelID, response)
+}
+
+func recordResponsesChannelAffinityState(c *gin.Context, state *channelAffinityState, channelID int, response *types.OpenAIResponsesResponses) {
+	if c == nil || state == nil || state.Kind != channelAffinityKindResponses || channelID <= 0 {
+		return
+	}
+	recordChannelAffinityStateBindings(state, channelID)
+	if response == nil {
+		refreshChannelAffinityMeta(c, state, channelID)
 		return
 	}
 
@@ -267,6 +296,18 @@ func recordResponsesChannelAffinity(c *gin.Context, channelID int, response *typ
 		}
 	}
 	refreshChannelAffinityMeta(c, state, channelID)
+}
+
+func recordChannelAffinityStateBindings(state *channelAffinityState, channelID int) {
+	for _, binding := range state.RequestBindings {
+		if binding == nil || !binding.Template.RecordOnSuccess || strings.TrimSpace(binding.Key) == "" {
+			continue
+		}
+		channelAffinityManager().SetRecord(binding.Key, runtimeaffinity.Record{
+			ChannelID:         channelID,
+			ResumeFingerprint: channelAffinityStateResumeFingerprint(state),
+		}, binding.Template.TTL)
+	}
 }
 
 func clearCurrentChannelAffinity(c *gin.Context) {
@@ -331,9 +372,10 @@ func channelAffinityLock(c *gin.Context, kind channelAffinityKind, value string)
 func prepareResponsesChannelAffinity(c *gin.Context, request *types.OpenAIResponsesRequest) {
 	requesthints.ResolveResponses(c, request)
 	resolvedPromptCacheKey := requesthints.Get(c, requesthints.ResponsesPromptCacheKey)
-	state := evaluateChannelAffinity(c, channelAffinityKindResponses, channelAffinityInput{
-		ResponsesRequest: request,
-	})
+	requestCopy := *request
+	input := channelAffinityInput{ResponsesRequest: &requestCopy}
+	c.Set(channelAffinityInputContextKey, input)
+	state := evaluateChannelAffinityAcrossCanonicalModels(c, channelAffinityKindResponses, input, request.Model)
 	applyChannelAffinityState(c, state)
 	if strings.TrimSpace(requestPromptCacheKey(request)) == "" && resolvedPromptCacheKey != "" {
 		mergeChannelAffinityMeta(c, map[string]any{
@@ -343,11 +385,110 @@ func prepareResponsesChannelAffinity(c *gin.Context, request *types.OpenAIRespon
 	}
 }
 
+func prepareChatChannelAffinity(c *gin.Context, modelName, promptCacheKey string) {
+	input := channelAffinityInput{
+		ModelName:      modelName,
+		PromptCacheKey: promptCacheKey,
+	}
+	c.Set(channelAffinityInputContextKey, input)
+	state := evaluateChannelAffinityAcrossCanonicalModels(c, channelAffinityKindChat, input, modelName)
+	applyChannelAffinityState(c, state)
+}
+
+func evaluateChannelAffinityAcrossCanonicalModels(c *gin.Context, kind channelAffinityKind, input channelAffinityInput, requestedModel string) *channelAffinityState {
+	models := channelAffinityCanonicalModels(requestedModel)
+	var fallback *channelAffinityState
+	for _, modelName := range models {
+		candidate := input
+		candidate.ModelName = modelName
+		if input.ResponsesRequest != nil {
+			requestCopy := *input.ResponsesRequest
+			requestCopy.Model = modelName
+			candidate.ResponsesRequest = &requestCopy
+		}
+		state := evaluateChannelAffinity(c, kind, candidate)
+		if fallback == nil {
+			fallback = state
+		}
+		if state != nil && state.Hit && channelAffinityHitMatchesCanonicalModel(state, requestedModel, modelName) {
+			return state
+		}
+	}
+	return fallback
+}
+
+func channelAffinityHitMatchesCanonicalModel(state *channelAffinityState, requestedModel, canonicalModel string) bool {
+	if state == nil || !state.Hit || state.PreferredChannelID <= 0 {
+		return false
+	}
+	channel := model.ChannelGroup.GetChannel(state.PreferredChannelID)
+	if channel == nil {
+		return false
+	}
+	mapped, err := mappedModelForChannel(channel, requestedModel)
+	return err == nil && strings.TrimSpace(mapped) == strings.TrimSpace(canonicalModel)
+}
+
+func channelAffinityCanonicalModels(requestedModel string) []string {
+	models := []string{strings.TrimSpace(requestedModel)}
+	seen := map[string]struct{}{strings.TrimSpace(requestedModel): {}}
+	model.ChannelGroup.RLock()
+	channels := make([]*model.Channel, 0, len(model.ChannelGroup.Channels))
+	for _, choice := range model.ChannelGroup.Channels {
+		if choice != nil && choice.Channel != nil {
+			channels = append(channels, choice.Channel)
+		}
+	}
+	model.ChannelGroup.RUnlock()
+	for _, channel := range channels {
+		canonical, err := mappedModelForChannel(channel, requestedModel)
+		canonical = strings.TrimSpace(canonical)
+		if err != nil || canonical == "" {
+			continue
+		}
+		if _, exists := seen[canonical]; exists {
+			continue
+		}
+		seen[canonical] = struct{}{}
+		models = append(models, canonical)
+	}
+	return models
+}
+
+func refreshChannelAffinityForSelectedModel(c *gin.Context, kind channelAffinityKind, channel *model.Channel, requestedModel string) {
+	if c == nil || channel == nil {
+		return
+	}
+	value, ok := c.Get(channelAffinityInputContextKey)
+	if !ok {
+		return
+	}
+	input, ok := value.(channelAffinityInput)
+	if !ok {
+		return
+	}
+	canonical, err := mappedModelForChannel(channel, requestedModel)
+	if err != nil || strings.TrimSpace(canonical) == "" {
+		return
+	}
+	input.ModelName = canonical
+	if input.ResponsesRequest != nil {
+		requestCopy := *input.ResponsesRequest
+		requestCopy.Model = canonical
+		input.ResponsesRequest = &requestCopy
+	}
+	applyChannelAffinityState(c, evaluateChannelAffinity(c, kind, input))
+}
+
 func prepareRealtimeChannelAffinity(c *gin.Context, modelName, clientSessionID string) int {
-	state := evaluateChannelAffinity(c, channelAffinityKindRealtime, channelAffinityInput{
+	input := channelAffinityInput{
 		RealtimeSessionID: clientSessionID,
 		ModelName:         modelName,
-	})
+	}
+	if c != nil {
+		c.Set(channelAffinityInputContextKey, input)
+	}
+	state := evaluateChannelAffinity(c, channelAffinityKindRealtime, input)
 	applyChannelAffinityState(c, state)
 	if state == nil {
 		return 0
@@ -433,9 +574,8 @@ func mergeRoutingGroupLogMeta(c *gin.Context, meta map[string]any) {
 }
 
 func ChannelAffinityCacheStats() map[string]any {
-	settings := config.ChannelAffinitySettingsInstance.Clone()
+	settings := config.RuntimeChannelAffinitySettings(config.GlobalOption.RuntimeSnapshot())
 	manager := channelAffinityManager()
-	manager.UpdateOptions(channelAffinityManagerOptions(settings))
 	stats := manager.Stats()
 
 	return map[string]any{
@@ -477,12 +617,11 @@ func applyChannelAffinityState(c *gin.Context, state *channelAffinityState) {
 }
 
 func evaluateChannelAffinity(c *gin.Context, kind channelAffinityKind, input channelAffinityInput) *channelAffinityState {
-	settings := config.ChannelAffinitySettingsInstance.Clone()
+	settings := config.RuntimeChannelAffinitySettings(config.GlobalOption.RuntimeSnapshot())
 	if !settings.Enabled {
 		return nil
 	}
 	manager := channelAffinityManager()
-	manager.UpdateOptions(channelAffinityManagerOptions(settings))
 
 	state := &channelAffinityState{
 		Kind:              kind,
@@ -555,13 +694,10 @@ func defaultChannelAffinityBinding(c *gin.Context, kind channelAffinityKind, val
 		return nil
 	}
 
-	settings := config.ChannelAffinitySettingsInstance.Clone()
+	settings := config.RuntimeChannelAffinitySettings(config.GlobalOption.RuntimeSnapshot())
 	if !settings.Enabled {
 		return nil
 	}
-	manager := channelAffinityManager()
-	manager.UpdateOptions(channelAffinityManagerOptions(settings))
-
 	var defaultRule config.ChannelAffinityRule
 	var found bool
 	for _, rule := range settings.Rules {
@@ -635,7 +771,12 @@ func extractChannelAffinityValue(c *gin.Context, input channelAffinityInput, sou
 
 	switch source.Source {
 	case "request_field":
-		value = extractChannelAffinityRequestField(input.ResponsesRequest, source.Key)
+		if strings.EqualFold(strings.TrimSpace(source.Key), "prompt_cache_key") {
+			value = strings.TrimSpace(input.PromptCacheKey)
+		}
+		if value == "" {
+			value = extractChannelAffinityRequestField(input.ResponsesRequest, source.Key)
+		}
 	case "header":
 		if c != nil && c.Request != nil {
 			value = strings.TrimSpace(c.Request.Header.Get(source.Key))
@@ -767,7 +908,7 @@ func refreshChannelAffinityMeta(c *gin.Context, state *channelAffinityState, cha
 	}
 	if state == nil || state.Lookup == nil {
 		meta := map[string]any{
-			"channel_affinity_enabled": config.ChannelAffinitySettingsInstance.Enabled,
+			"channel_affinity_enabled": config.RuntimeChannelAffinitySettings(config.GlobalOption.RuntimeSnapshot()).Enabled,
 			"channel_affinity_hit":     false,
 		}
 		mergeRoutingGroupLogMeta(c, meta)
@@ -776,7 +917,7 @@ func refreshChannelAffinityMeta(c *gin.Context, state *channelAffinityState, cha
 	}
 
 	meta := map[string]any{
-		"channel_affinity_enabled":         config.ChannelAffinitySettingsInstance.Enabled,
+		"channel_affinity_enabled":         config.RuntimeChannelAffinitySettings(config.GlobalOption.RuntimeSnapshot()).Enabled,
 		"channel_affinity_kind":            string(state.Kind),
 		"channel_affinity_rule":            state.Lookup.Template.RuleName,
 		"channel_affinity_alias":           state.Lookup.Template.Source,
@@ -788,6 +929,7 @@ func refreshChannelAffinityMeta(c *gin.Context, state *channelAffinityState, cha
 		"channel_affinity_strict":          state.Lookup.Template.Strict,
 		"channel_affinity_ignore_cooldown": state.Lookup.Template.IgnorePreferredCooldown,
 		"channel_affinity_record_bindings": len(state.RequestBindings),
+		"channel_affinity_fallback":        state.Hit && state.PreferredChannelID > 0 && channelID > 0 && channelID != state.PreferredChannelID,
 	}
 	if value := strings.TrimSpace(state.Lookup.Value); value != "" {
 		sum := sha256.Sum256([]byte(value))
@@ -802,6 +944,9 @@ func refreshChannelAffinityMeta(c *gin.Context, state *channelAffinityState, cha
 }
 
 func channelAffinityModelName(kind channelAffinityKind, input channelAffinityInput) string {
+	if modelName := strings.TrimSpace(input.ModelName); modelName != "" {
+		return modelName
+	}
 	switch kind {
 	case channelAffinityKindResponses:
 		if input.ResponsesRequest != nil {
@@ -814,8 +959,18 @@ func channelAffinityModelName(kind channelAffinityKind, input channelAffinityInp
 }
 
 func channelAffinityManager() *runtimeaffinity.Manager {
-	settings := config.ChannelAffinitySettingsInstance.Clone()
-	return runtimeaffinity.ConfigureDefault(channelAffinityManagerOptions(settings))
+	snapshot := config.GlobalOption.RuntimeSnapshot()
+	settings := config.RuntimeChannelAffinitySettings(snapshot)
+	version := snapshot.Version()
+	channelAffinityManagerPublication.Lock()
+	defer channelAffinityManagerPublication.Unlock()
+	if channelAffinityManagerPublication.owner != config.GlobalOption || version > channelAffinityManagerPublication.version {
+		manager := runtimeaffinity.ConfigureDefault(channelAffinityManagerOptions(settings))
+		channelAffinityManagerPublication.owner = config.GlobalOption
+		channelAffinityManagerPublication.version = version
+		return manager
+	}
+	return runtimeaffinity.DefaultManager()
 }
 
 func channelAffinityManagerOptions(settings config.ChannelAffinitySettings) runtimeaffinity.ManagerOptions {
@@ -882,7 +1037,7 @@ func appendChannelAffinityRecorder(recorders map[string][]channelAffinityTemplat
 }
 
 func channelAffinityResumeFingerprint(kind channelAffinityKind, input channelAffinityInput) string {
-	if kind != channelAffinityKindResponses {
+	if kind != channelAffinityKindResponses && kind != channelAffinityKindChat {
 		return ""
 	}
 	modelName := strings.TrimSpace(channelAffinityModelName(kind, input))

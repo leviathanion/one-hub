@@ -7,13 +7,13 @@ import (
 	"math"
 	"net/http"
 	"one-api/common"
-	"one-api/common/config"
-	"one-api/common/logger"
+	"one-api/common/jsonobject"
 	"one-api/common/requestctx"
 	"one-api/common/requester"
 	commonresponses "one-api/common/responses"
 	"one-api/common/utils"
 	"one-api/internal/requesthints"
+	"one-api/providers"
 	providersBase "one-api/providers/base"
 	"one-api/safty"
 	"one-api/types"
@@ -25,7 +25,30 @@ import (
 
 type relayChat struct {
 	relayBase
-	chatRequest types.ChatCompletionRequest
+	chatRequest        types.ChatCompletionRequest
+	rawEnvelope        *jsonobject.Object
+	streamResponseMeta chatStreamResponseMetadata
+}
+
+func chatPromptCacheKey(fields map[string]json.RawMessage) string {
+	raw, ok := fields["prompt_cache_key"]
+	if !ok {
+		return ""
+	}
+	var key string
+	if json.Unmarshal(raw, &key) != nil {
+		return ""
+	}
+	return strings.TrimSpace(key)
+}
+
+type chatStreamResponseMetadata struct {
+	ID          string
+	Object      string
+	Created     json.RawMessage
+	Model       string
+	ServiceTier string
+	UsageSeen   bool
 }
 
 func NewRelayChat(c *gin.Context) *relayChat {
@@ -39,9 +62,36 @@ func NewRelayChat(c *gin.Context) *relayChat {
 }
 
 func (r *relayChat) setRequest() error {
-	r.chatRequest = types.ChatCompletionRequest{}
-	if err := common.UnmarshalBodyReusable(r.c, &r.chatRequest); err != nil {
+	if err := r.decodeCurrentRequestBody(); err != nil {
 		return err
+	}
+	r.setOriginalModel(r.chatRequest.Model)
+	r.c.Set("skip_only_chat", len(r.chatRequest.Tools) > 0)
+	prepareChatChannelAffinity(r.c, r.chatRequest.Model, chatPromptCacheKey(r.rawEnvelope.Fields))
+	setRequestChannelCapability(r.c, requireChatChannelCompatibility(r.chatRequest.Model, &r.chatRequest, r.rawEnvelope.Fields))
+	return nil
+}
+
+func (r *relayChat) materializeSelectedProviderRequest() error {
+	return r.decodeCurrentRequestBody()
+}
+
+func (r *relayChat) decodeCurrentRequestBody() error {
+	r.chatRequest = types.ChatCompletionRequest{}
+	raw, err := common.CacheRequestBody(r.c)
+	if err != nil {
+		return err
+	}
+	envelope, err := jsonobject.Parse(raw)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(raw, &r.chatRequest); err != nil {
+		return err
+	}
+	r.rawEnvelope = envelope
+	if strings.TrimSpace(r.chatRequest.Model) == "" {
+		return errors.New("field Model is required")
 	}
 
 	if r.chatRequest.MaxTokens < 0 || r.chatRequest.MaxTokens > math.MaxInt32/2 {
@@ -56,17 +106,28 @@ func (r *relayChat) setRequest() error {
 
 	// 归一化：统一 ReasoningEffort 和 Reasoning
 	r.chatRequest.NormalizeReasoning()
-
-	if r.chatRequest.Tools != nil {
-		r.c.Set("skip_only_chat", true)
+	if err := validateChatSupportedSurface(&r.chatRequest, envelope.Fields); err != nil {
+		return err
 	}
 
 	if !r.chatRequest.Stream {
 		r.chatRequest.StreamOptions = nil
 	}
+	return nil
+}
 
-	r.setOriginalModel(r.chatRequest.Model)
-
+func (r *relayChat) prepareSelectedProviderRemoteMedia() error {
+	if r == nil || r.provider == nil {
+		return nil
+	}
+	r.chatRequest.Model = r.modelName
+	fetcher := r.remoteMedia
+	if fetcher == nil {
+		fetcher = newRequestRemoteMediaFetcher(r.c.Request.Context())
+	}
+	if err := providers.PrepareChatRemoteMedia(r.provider, &r.chatRequest, fetcher); err != nil {
+		return remoteMediaCapabilityGateError(err)
+	}
 	return nil
 }
 
@@ -83,26 +144,40 @@ func (r *relayChat) getPromptTokens() (int, error) {
 	return common.CountTokenMessages(r.chatRequest.Messages, r.modelName, channel.PreCost), nil
 }
 
-var chatModelsRequiringResponses = map[string]bool{
-	"o3-pro-2025-06-10":                true,
-	"o3-pro":                           true,
-	"o1-pro-2025-03-19":                true,
-	"o1-pro":                           true,
-	"o3-deep-research-2025-06-26":      true,
-	"o3-deep-research":                 true,
-	"o4-mini-deep-research-2025-06-26": true,
-	"o4-mini-deep-research":            true,
-	"codex-mini-latest":                true,
+var chatModelsRequiringResponses = map[string]struct{}{
+	"o3-pro-2025-06-10":                {},
+	"o3-pro":                           {},
+	"o1-pro-2025-03-19":                {},
+	"o1-pro":                           {},
+	"o3-deep-research-2025-06-26":      {},
+	"o3-deep-research":                 {},
+	"o4-mini-deep-research-2025-06-26": {},
+	"o4-mini-deep-research":            {},
+	"codex-mini-latest":                {},
 }
 
-func (r *relayChat) send() (*types.OpenAIErrorWithStatusCode, bool) {
-	r.chatRequest.Model = r.modelName
+func chatModelRequiresResponses(modelName string) bool {
+	_, ok := chatModelsRequiringResponses[strings.ToLower(strings.TrimSpace(modelName))]
+	return ok
+}
 
-	if chatModelsRequiringResponses[r.modelName] {
-		resProvider, ok := r.provider.(providersBase.ResponsesInterface)
-		if ok {
-			return r.compatibleSend(resProvider)
+func (r *relayChat) send() (err *types.OpenAIErrorWithStatusCode, done bool) {
+	err, done = r.sendCurrentProvider()
+	if err == nil && r.provider != nil && r.provider.GetChannel() != nil {
+		refreshChannelAffinityForSelectedModel(r.c, channelAffinityKindChat, r.provider.GetChannel(), r.getOriginalModel())
+		recordCurrentChannelAffinity(r.c, channelAffinityKindChat, r.provider.GetChannel().Id)
+	}
+	return
+}
+
+func (r *relayChat) sendCurrentProvider() (*types.OpenAIErrorWithStatusCode, bool) {
+	r.chatRequest.Model = r.modelName
+	if chatModelRequiresResponses(r.modelName) {
+		responsesProvider, ok := r.provider.(providersBase.ResponsesInterface)
+		if !ok {
+			return common.StringErrorWrapperLocal("selected channel cannot send this model through the Responses API", unsupportedCapabilityCode, http.StatusServiceUnavailable), true
 		}
+		return r.compatibleSend(responsesProvider)
 	}
 
 	chatProvider, ok := r.provider.(providersBase.ChatInterface)
@@ -111,13 +186,11 @@ func (r *relayChat) send() (*types.OpenAIErrorWithStatusCode, bool) {
 	}
 
 	// 内容审查
-	if config.EnableSafe {
-		for _, message := range r.chatRequest.Messages {
-			if message.Content != nil {
-				CheckResult, _ := safty.CheckContent(message.Content)
-				if !CheckResult.IsSafe {
-					return common.StringErrorWrapperLocal(CheckResult.Reason, CheckResult.Code, http.StatusBadRequest), true
-				}
+	for _, message := range r.chatRequest.Messages {
+		if message.Content != nil {
+			CheckResult, _ := safty.CheckContent(message.Content)
+			if !CheckResult.IsSafe {
+				return common.StringErrorWrapperLocal(CheckResult.Reason, CheckResult.Code, http.StatusBadRequest), true
 			}
 		}
 	}
@@ -138,7 +211,7 @@ func (r *relayChat) send() (*types.OpenAIErrorWithStatusCode, bool) {
 		}
 
 		var firstResponseTime time.Time
-		firstResponseTime, streamErr := responseStreamClient(r.c, response, doneStr)
+		firstResponseTime, streamErr := responseStreamClient(r.c, response, doneStr, r.observeStreamResponseMetadata)
 		r.SetFirstResponseTime(firstResponseTime)
 		if streamErr != nil {
 			return streamErr, true
@@ -163,14 +236,35 @@ func (r *relayChat) send() (*types.OpenAIErrorWithStatusCode, bool) {
 }
 
 func (r *relayChat) getUsageResponse() string {
-	if r.chatRequest.StreamOptions != nil && r.chatRequest.StreamOptions.IncludeUsage {
+	if r.chatRequest.StreamOptions == nil || !r.chatRequest.StreamOptions.IncludeUsage || r.streamResponseMeta.UsageSeen || r.provider == nil {
+		return ""
+	}
+	providerUsage := r.provider.GetUsage()
+	if providerUsage.HasProviderUsage() {
+		id := strings.TrimSpace(r.streamResponseMeta.ID)
+		if id == "" {
+			id = fmt.Sprintf("chatcmpl-%s", utils.GetUUID())
+		}
+		created := any(utils.GetTimestamp())
+		if len(r.streamResponseMeta.Created) > 0 {
+			created = r.streamResponseMeta.Created
+		}
+		object := strings.TrimSpace(r.streamResponseMeta.Object)
+		if object == "" {
+			object = "chat.completion.chunk"
+		}
+		modelName := strings.TrimSpace(r.streamResponseMeta.Model)
+		if modelName == "" {
+			modelName = r.chatRequest.Model
+		}
 		usageResponse := types.ChatCompletionStreamResponse{
-			ID:      fmt.Sprintf("chatcmpl-%s", utils.GetUUID()),
-			Object:  "chat.completion.chunk",
-			Created: utils.GetTimestamp(),
-			Model:   r.chatRequest.Model,
-			Choices: []types.ChatCompletionStreamChoice{},
-			Usage:   r.provider.GetUsage(),
+			ID:          id,
+			Object:      object,
+			Created:     created,
+			Model:       modelName,
+			ServiceTier: r.streamResponseMeta.ServiceTier,
+			Choices:     []types.ChatCompletionStreamChoice{},
+			Usage:       providerUsage,
 		}
 
 		responseBody, err := json.Marshal(usageResponse)
@@ -180,8 +274,42 @@ func (r *relayChat) getUsageResponse() string {
 
 		return string(responseBody)
 	}
-
 	return ""
+}
+
+func (r *relayChat) observeStreamResponseMetadata(data string) {
+	if r == nil || strings.TrimSpace(data) == "" || data == "[DONE]" {
+		return
+	}
+	var envelope struct {
+		ID          string          `json:"id"`
+		Object      string          `json:"object"`
+		Created     json.RawMessage `json:"created"`
+		Model       string          `json:"model"`
+		ServiceTier string          `json:"service_tier"`
+		Usage       json.RawMessage `json:"usage"`
+	}
+	if err := json.Unmarshal([]byte(data), &envelope); err != nil {
+		return
+	}
+	if r.streamResponseMeta.ID == "" {
+		r.streamResponseMeta.ID = envelope.ID
+	}
+	if r.streamResponseMeta.Object == "" {
+		r.streamResponseMeta.Object = envelope.Object
+	}
+	if len(r.streamResponseMeta.Created) == 0 && len(envelope.Created) > 0 && string(envelope.Created) != "null" {
+		r.streamResponseMeta.Created = append(json.RawMessage(nil), envelope.Created...)
+	}
+	if envelope.Model != "" {
+		r.streamResponseMeta.Model = envelope.Model
+	}
+	if envelope.ServiceTier != "" {
+		r.streamResponseMeta.ServiceTier = envelope.ServiceTier
+	}
+	if len(envelope.Usage) > 0 && string(envelope.Usage) != "null" {
+		r.streamResponseMeta.UsageSeen = true
+	}
 }
 
 func (r *relayChat) compatibleSend(resProvider providersBase.ResponsesInterface) (*types.OpenAIErrorWithStatusCode, bool) {
@@ -206,7 +334,7 @@ func (r *relayChat) compatibleSend(resProvider providersBase.ResponsesInterface)
 			return r.getUsageResponse()
 		}
 
-		firstResponseTime, streamErr := responseStreamClient(r.c, response, doneStr)
+		firstResponseTime, streamErr := responseStreamClient(r.c, response, doneStr, r.observeStreamResponseMetadata)
 		r.SetFirstResponseTime(firstResponseTime)
 		if streamErr != nil {
 			return streamErr, true
@@ -220,6 +348,9 @@ func (r *relayChat) compatibleSend(resProvider providersBase.ResponsesInterface)
 		if r.heartbeat != nil {
 			r.heartbeat.Stop()
 		}
+		if terminalErr := commonresponses.ChatTerminalError(response); terminalErr != nil {
+			return terminalErr, true
+		}
 		if err := responseJsonClient(r.c, response.ToChat()); err != nil {
 			return err, true
 		}
@@ -229,16 +360,6 @@ func (r *relayChat) compatibleSend(resProvider providersBase.ResponsesInterface)
 }
 
 func (r *relayChat) responsesFallbackRequest(request *types.OpenAIResponsesRequest) (*commonresponses.Request, *types.OpenAIErrorWithStatusCode) {
-	// This fallback authors the synthesized Responses body, so dialect
-	// conflicts are resolved at the conversion boundary. The Codex planner
-	// rejects temperature+top_p; a chat client never wrote this body, so keep
-	// temperature and drop top_p instead of surfacing a 400.
-	if request.Temperature != nil && request.TopP != nil && r.provider != nil {
-		if channel := r.provider.GetChannel(); channel != nil && channel.Type == config.ChannelTypeCodex {
-			request.TopP = nil
-			logger.LogDebug(r.c.Request.Context(), `[Codex] chat fallback decision {"dialect":"codex_official","field":"top_p","action":"drop","source":"chat_adapter","reason":"temperature-and-top_p-both-present"}`)
-		}
-	}
 	raw, err := json.Marshal(request)
 	if err != nil {
 		return nil, common.ErrorWrapperLocal(err, "marshal_request_failed", http.StatusInternalServerError)

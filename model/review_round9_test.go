@@ -54,7 +54,7 @@ func TestNonCodexMutationsDoNotCreateCodexGeneration(t *testing.T) {
 	}
 }
 
-func TestChannelTypeTransitionsRotateCodexGenerationBothDirections(t *testing.T) {
+func TestChannelTypeTransitionIsRejectedWithoutRotatingGeneration(t *testing.T) {
 	useTestChannelDB(t)
 	cache.InitCacheManager()
 	logger.SetupLogger()
@@ -67,20 +67,11 @@ func TestChannelTypeTransitionsRotateCodexGenerationBothDirections(t *testing.T)
 	}
 
 	leaving := &Channel{Id: channelID, Type: config.ChannelTypeOpenAI, Status: config.ChannelStatusEnabled, Name: "switch", Key: "key", Group: "default", Models: "gpt-4o"}
-	if err := leaving.UpdateRaw(true); err != nil {
-		t.Fatal(err)
+	if err := leaving.UpdateRaw(true); err == nil {
+		t.Fatal("expected account-incarnation type change to be rejected")
 	}
 	afterLeave, err := cache.GetOrInitCodexUsageGeneration(channelID)
-	if err != nil || afterLeave == before {
-		t.Fatalf("leaving Codex must rotate generation: before=%q after=%q err=%v", before, afterLeave, err)
-	}
-
-	returning := &Channel{Id: channelID, Type: config.ChannelTypeCodex, Status: config.ChannelStatusEnabled, Name: "switch", Key: "key", Group: "default", Models: "gpt-5"}
-	if err := returning.UpdateRaw(true); err != nil {
-		t.Fatal(err)
-	}
-	afterReturn, err := cache.GetOrInitCodexUsageGeneration(channelID)
-	if err != nil || afterReturn == afterLeave {
-		t.Fatalf("returning to Codex must rotate generation: before=%q after=%q err=%v", afterLeave, afterReturn, err)
+	if err != nil || afterLeave != before {
+		t.Fatalf("rejected type change must preserve generation: before=%q after=%q err=%v", before, afterLeave, err)
 	}
 }

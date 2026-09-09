@@ -19,6 +19,19 @@ import (
 // 定义供应商工厂
 type BaiduProviderFactory struct{}
 
+// The native Baidu adapter projects messages to plain text and cannot carry
+// image_url parts. Only its OpenAI-compatible branch preserves the multimodal
+// message union.
+func (BaiduProviderFactory) AssessChatRemoteMedia(channel *model.Channel, _ *types.ChatCompletionRequest, _ base.ChatRemoteMediaSummary) (base.RemoteMediaMode, error) {
+	if !usesOpenAIAPI(channel) {
+		return base.RemoteMediaReject, nil
+	}
+	if err := base.RequireOperationEndpoint(getConfig(true).ChatCompletions, "Chat Completions"); err != nil {
+		return base.RemoteMediaReject, err
+	}
+	return base.RemoteMediaPassURL, nil
+}
+
 var baiduCacheKey = "api_token:baidu"
 
 const (
@@ -34,16 +47,7 @@ type BaiduProvider struct {
 }
 
 func (f BaiduProviderFactory) Create(channel *model.Channel) base.ProviderInterface {
-	useOpenaiAPI := false
-
-	if channel.Plugin != nil {
-		plugin := channel.Plugin.Data()
-		if pOpenAI, ok := plugin["use_openai_api"]; ok {
-			if enable, ok := pOpenAI["enable"].(bool); ok && enable {
-				useOpenaiAPI = true
-			}
-		}
-	}
+	useOpenaiAPI := usesOpenAIAPI(channel)
 	providers := &BaiduProvider{
 		OpenAIProvider: openai.OpenAIProvider{
 			BaseProvider: base.BaseProvider{

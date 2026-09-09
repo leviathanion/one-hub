@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"errors"
 	runtimesession "one-api/runtime/session"
 	"one-api/types"
 	"strings"
@@ -8,16 +9,42 @@ import (
 )
 
 type openAIRealtimeTurnState struct {
-	seq               int64
-	startedAt         time.Time
-	firstResponseAt   time.Time
-	completedAt       time.Time
-	lastResponseID    string
-	seenResponseIDs   []string
-	terminationReason string
-	usageSnapshot     *types.UsageEvent
-	accountedUsage    *types.UsageEvent
-	observer          runtimesession.TurnObserver
+	seq                   int64
+	clientEventID         string
+	clientEventIDInjected bool
+	startedAt             time.Time
+	firstResponseAt       time.Time
+	completedAt           time.Time
+	lastResponseID        string
+	seenResponseIDs       []string
+	terminationReason     string
+	usageSnapshot         *types.UsageEvent
+	accountedUsage        *types.UsageEvent
+	observer              runtimesession.TurnObserver
+}
+
+const (
+	openAIRealtimeIdentifierMaxBytes = 256
+	openAIRealtimeResponseIDLimit    = 64
+)
+
+var errOpenAIRealtimeUsageStateLimit = errors.New("openai realtime usage state limit exceeded")
+
+func (t *openAIRealtimeTurnState) rejectedCreate(errorEventID string) bool {
+	if t == nil || len(t.seenResponseIDs) != 0 {
+		return false
+	}
+	return strings.TrimSpace(errorEventID) != "" && strings.TrimSpace(errorEventID) == t.clientEventID
+}
+
+func (t *openAIRealtimeTurnState) injectedCorrelationID(errorEventID string) string {
+	if t == nil || !t.clientEventIDInjected {
+		return ""
+	}
+	if strings.TrimSpace(errorEventID) != t.clientEventID {
+		return ""
+	}
+	return t.clientEventID
 }
 
 func newOpenAIRealtimeTurnState(seq int64, startedAt time.Time, observer runtimesession.TurnObserver) *openAIRealtimeTurnState {
@@ -31,20 +58,51 @@ func newOpenAIRealtimeTurnState(seq int64, startedAt time.Time, observer runtime
 	}
 }
 
-func (t *openAIRealtimeTurnState) observeSupplierEvent(eventType, responseID string, now time.Time, isError bool) {
+func (t *openAIRealtimeTurnState) observeSupplierEvent(eventType, responseID string, now time.Time, isError bool) error {
 	if t == nil {
-		return
+		return nil
 	}
 	if now.IsZero() {
 		now = time.Now()
 	}
-	t.rememberResponseID(responseID)
+	if err := t.rememberResponseID(responseID); err != nil {
+		return err
+	}
 	if isError || strings.TrimSpace(eventType) == types.EventTypeSessionCreated {
-		return
+		return nil
 	}
 	if t.firstResponseAt.IsZero() {
 		t.firstResponseAt = now
 	}
+	return nil
+}
+
+func (t *openAIRealtimeTurnState) observeSupplierEventWithUsage(eventType, responseID string, usage *types.UsageEvent, now time.Time, isError bool) (*types.UsageEvent, error) {
+	if err := t.validateSupplierEventMutation(responseID, usage); err != nil {
+		return nil, err
+	}
+	if err := t.observeSupplierEvent(eventType, responseID, now, isError); err != nil {
+		return nil, err
+	}
+	return t.applyUsageSnapshot(usage)
+}
+
+func (t *openAIRealtimeTurnState) validateSupplierEventMutation(responseID string, usage *types.UsageEvent) error {
+	if t == nil {
+		return nil
+	}
+	trimmedResponseID := strings.TrimSpace(responseID)
+	if len(trimmedResponseID) > openAIRealtimeIdentifierMaxBytes {
+		return errOpenAIRealtimeUsageStateLimit
+	}
+	if trimmedResponseID != "" && !t.matchesResponseID(trimmedResponseID) && len(t.seenResponseIDs) >= openAIRealtimeResponseIDLimit {
+		return errOpenAIRealtimeUsageStateLimit
+	}
+	if openAIRealtimeUsageIdentityExceedsLimit(usage) {
+		return errOpenAIRealtimeUsageStateLimit
+	}
+
+	return nil
 }
 
 func (t *openAIRealtimeTurnState) matchesResponseID(responseID string) bool {
@@ -55,8 +113,11 @@ func (t *openAIRealtimeTurnState) matchesResponseID(responseID string) bool {
 	if trimmed == "" {
 		return false
 	}
-	for _, current := range t.seenResponseIDs {
-		if current == trimmed {
+	if len(trimmed) > openAIRealtimeIdentifierMaxBytes {
+		return false
+	}
+	for _, existing := range t.seenResponseIDs {
+		if existing == trimmed {
 			return true
 		}
 	}
@@ -70,36 +131,52 @@ func (t *openAIRealtimeTurnState) responseIDs() []string {
 	return append([]string(nil), t.seenResponseIDs...)
 }
 
-func (t *openAIRealtimeTurnState) rememberResponseID(responseID string) {
+func (t *openAIRealtimeTurnState) rememberResponseID(responseID string) error {
 	if t == nil {
-		return
+		return nil
 	}
 	trimmed := strings.TrimSpace(responseID)
 	if trimmed == "" {
-		return
+		return nil
 	}
-	t.lastResponseID = trimmed
-	for _, current := range t.seenResponseIDs {
-		if current == trimmed {
-			return
+	if len(trimmed) > openAIRealtimeIdentifierMaxBytes {
+		return errOpenAIRealtimeUsageStateLimit
+	}
+	for _, existing := range t.seenResponseIDs {
+		if existing == trimmed {
+			t.lastResponseID = existing
+			return nil
 		}
 	}
-	t.seenResponseIDs = append(t.seenResponseIDs, trimmed)
+	if len(t.seenResponseIDs) >= openAIRealtimeResponseIDLimit {
+		return errOpenAIRealtimeUsageStateLimit
+	}
+	t.lastResponseID = strings.Clone(trimmed)
+	t.seenResponseIDs = append(t.seenResponseIDs, t.lastResponseID)
+	return nil
 }
 
-func (t *openAIRealtimeTurnState) applyUsageSnapshot(snapshot *types.UsageEvent) *types.UsageEvent {
+func (t *openAIRealtimeTurnState) applyUsageSnapshot(snapshot *types.UsageEvent) (*types.UsageEvent, error) {
 	if t == nil || snapshot == nil {
-		return nil
+		return nil, nil
+	}
+	if openAIRealtimeUsageIdentityExceedsLimit(snapshot) {
+		return nil, errOpenAIRealtimeUsageStateLimit
 	}
 
 	resolved := mergeOpenAIRealtimeUsageSnapshot(t.usageSnapshot, snapshot)
 	t.usageSnapshot = resolved
-
 	delta := deltaOpenAIRealtimeUsageSnapshot(resolved, t.accountedUsage)
 	if delta != nil {
 		t.accountedUsage = resolved.Clone()
 	}
-	return delta
+	return delta, nil
+}
+
+func openAIRealtimeUsageIdentityExceedsLimit(usage *types.UsageEvent) bool {
+	return usage != nil && (len(strings.TrimSpace(usage.ResponseID)) > openAIRealtimeIdentifierMaxBytes ||
+		len(strings.TrimSpace(usage.ItemID)) > openAIRealtimeIdentifierMaxBytes ||
+		len(strings.TrimSpace(usage.ProviderEventID)) > openAIRealtimeIdentifierMaxBytes)
 }
 
 func (t *openAIRealtimeTurnState) finalize(sessionID, model, reason string, now time.Time) (runtimesession.TurnObserver, runtimesession.TurnFinalizePayload) {
@@ -186,6 +263,27 @@ func copyOpenAIRealtimeUsageAttribution(dst, src *types.UsageEvent) {
 	dst.ProviderEventID = src.ProviderEventID
 	dst.ResponseID = src.ResponseID
 	dst.ItemID = src.ItemID
+	dst.ResponseModel = src.ResponseModel
+	dst.ServiceTier = src.ServiceTier
+	dst.ProviderTokenEvidence = dst.ProviderTokenEvidence || src.ProviderTokenEvidence
+	dst.ProviderExtraBilling = mergeOpenAIRealtimeEvidence(dst.ProviderExtraBilling, src.ProviderExtraBilling)
+	dst.ProviderIndependentUsageUnits = mergeOpenAIRealtimeEvidence(dst.ProviderIndependentUsageUnits, src.ProviderIndependentUsageUnits)
+	dst.AttributionConflict = dst.AttributionConflict || src.AttributionConflict
+}
+
+func mergeOpenAIRealtimeEvidence(dst, src map[string]bool) map[string]bool {
+	if len(src) == 0 {
+		return dst
+	}
+	if dst == nil {
+		dst = make(map[string]bool, len(src))
+	}
+	for key, present := range src {
+		if present {
+			dst[key] = true
+		}
+	}
+	return dst
 }
 
 func openAIRealtimeUsageHasValue(usage *types.UsageEvent) bool {
@@ -281,6 +379,7 @@ func maxOpenAIRealtimePromptTokenDetails(current, next types.PromptTokensDetails
 		TextTokens:           maxOpenAIRealtimeUsageInt(current.TextTokens, next.TextTokens),
 		ImageTokens:          maxOpenAIRealtimeUsageInt(current.ImageTokens, next.ImageTokens),
 		CachedTokensInternal: maxOpenAIRealtimeUsageInt(current.CachedTokensInternal, next.CachedTokensInternal),
+		CacheWriteTokens:     maxOpenAIRealtimeUsageInt(current.CacheWriteTokens, next.CacheWriteTokens),
 		CachedWriteTokens:    maxOpenAIRealtimeUsageInt(current.CachedWriteTokens, next.CachedWriteTokens),
 		CachedReadTokens:     maxOpenAIRealtimeUsageInt(current.CachedReadTokens, next.CachedReadTokens),
 	}
@@ -293,6 +392,7 @@ func deltaOpenAIRealtimePromptTokenDetails(current, previous types.PromptTokensD
 		TextTokens:           deltaOpenAIRealtimeUsageInt(current.TextTokens, previous.TextTokens),
 		ImageTokens:          deltaOpenAIRealtimeUsageInt(current.ImageTokens, previous.ImageTokens),
 		CachedTokensInternal: deltaOpenAIRealtimeUsageInt(current.CachedTokensInternal, previous.CachedTokensInternal),
+		CacheWriteTokens:     deltaOpenAIRealtimeUsageInt(current.CacheWriteTokens, previous.CacheWriteTokens),
 		CachedWriteTokens:    deltaOpenAIRealtimeUsageInt(current.CachedWriteTokens, previous.CachedWriteTokens),
 		CachedReadTokens:     deltaOpenAIRealtimeUsageInt(current.CachedReadTokens, previous.CachedReadTokens),
 	}
@@ -304,6 +404,7 @@ func openAIRealtimePromptTokenDetailsHasValue(details types.PromptTokensDetails)
 		details.TextTokens > 0 ||
 		details.ImageTokens > 0 ||
 		details.CachedTokensInternal > 0 ||
+		details.CacheWriteTokens > 0 ||
 		details.CachedWriteTokens > 0 ||
 		details.CachedReadTokens > 0
 }

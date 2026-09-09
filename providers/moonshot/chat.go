@@ -2,7 +2,6 @@ package moonshot
 
 import (
 	"net/http"
-	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/requester"
 	"one-api/providers/openai"
@@ -33,39 +32,47 @@ func (p *MoonshotProvider) CreateChatCompletion(request *types.ChatCompletionReq
 		return nil, errWithCode
 	}
 
-	if response.Usage == nil {
-		response.Usage = &types.Usage{
-			PromptTokens:     p.Usage.PromptTokens,
-			CompletionTokens: 0,
-			TotalTokens:      0,
-		}
-		// 那么需要计算
-		response.Usage.CompletionTokens = common.CountTokenText(response.GetContent(), request.Model)
-		response.Usage.TotalTokens = response.Usage.PromptTokens + response.Usage.CompletionTokens
+	if response.Usage != nil {
+		response.Usage.MarkProviderReported()
+		response.Usage.MergeProviderAttribution(response.Model, response.ServiceTier)
+		*p.Usage = *response.Usage
 	}
-
-	*p.Usage = *response.Usage
 
 	return &response.ChatCompletionResponse, nil
 }
 
 func (p *MoonshotProvider) CreateChatCompletionStream(request *types.ChatCompletionRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+	streamOptions := forceMoonshotProviderUsage(request)
 	req, errWithCode := p.GetRequestTextBody(config.RelayModeChatCompletions, request.Model, request)
+	request.StreamOptions = streamOptions
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
 	defer req.Body.Close()
 
 	// 发送请求
-	resp, errWithCode := p.Requester.SendRequestRaw(req)
+	streamRequester := p.Requester.ForHTTPProfile(requester.HTTPProfileLongStream)
+	resp, errWithCode := streamRequester.SendRequestRaw(req)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
 
 	chatHandler := openai.OpenAIStreamHandler{
-		Usage:     p.Usage,
-		ModelName: request.Model,
+		Usage:               p.Usage,
+		ModelName:           request.Model,
+		ExposeProviderUsage: streamOptions != nil && streamOptions.IncludeUsage,
 	}
 
-	return requester.RequestStream(p.Requester, resp, chatHandler.HandlerChatStream)
+	return requester.RequestStreamWithOptions(streamRequester, resp, chatHandler.HandlerChatStream, requester.StreamReadOptions{
+		RequireProtocolTerminal: true,
+	})
+}
+
+func forceMoonshotProviderUsage(request *types.ChatCompletionRequest) *types.StreamOptions {
+	if request == nil {
+		return nil
+	}
+	original := request.StreamOptions
+	request.StreamOptions = &types.StreamOptions{IncludeUsage: true}
+	return original
 }

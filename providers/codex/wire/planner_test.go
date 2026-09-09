@@ -2,6 +2,8 @@ package wire
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -162,6 +164,31 @@ func TestResponsesCreatePlannerUsesOfficialHeadersAndRawBody(t *testing.T) {
 	}
 	if strings.Join(include, ",") != "output_text.annotations,reasoning.encrypted_content" {
 		t.Fatalf("expected reasoning include to be appended without dropping existing include, got %#v", include)
+	}
+}
+
+func TestResponsesCreatePlannerAddsMultiAgentBetaOnlyWhenEnabled(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		multiAgentEnabled bool
+		wantBeta          string
+	}{
+		{name: "disabled"},
+		{name: "enabled", multiAgentEnabled: true, wantBeta: "responses_multi_agent=v1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan, err := BuildHeaders(HeaderPlanInput{
+				Operation:         OpResponsesCreate,
+				Credential:        Credential{AccessToken: "upstream-token"},
+				MultiAgentEnabled: tc.multiAgentEnabled,
+			})
+			if err != nil {
+				t.Fatalf("build create headers: %v", err)
+			}
+			if got := plan.HTTPHeader().Get("OpenAI-Beta"); got != tc.wantBeta {
+				t.Fatalf("expected OpenAI-Beta %q, got %q", tc.wantBeta, got)
+			}
+		})
 	}
 }
 
@@ -438,13 +465,15 @@ func TestCompactPlannerOmitsClientMetadataAndProjectsInstallationID(t *testing.T
 		"model":"gpt-5",
 		"input":"hello",
 		"stream":true,
+		"service_tier":"priority",
+		"future_compact_option":{"enabled":true},
 		"client_metadata":{
 			"session_id":"sess-body",
 			"thread_id":"thread-body",
 			"x-codex-installation-id":"install-body"
 		}
 	}`)
-	body, err := PlanResponsesCompactBody(envelope.Object, envelope.Projection, "gpt-5-codex", nil)
+	body, err := PlanResponsesCompactBody(envelope.Object, "gpt-5-codex", nil)
 	if err != nil {
 		t.Fatalf("plan compact body: %v", err)
 	}
@@ -456,6 +485,9 @@ func TestCompactPlannerOmitsClientMetadataAndProjectsInstallationID(t *testing.T
 	}
 	if string(object["model"]) != `"gpt-5-codex"` || string(object["input"]) != `"hello"` {
 		t.Fatalf("expected compact body to keep compact payload fields, got %s", body)
+	}
+	if string(object["service_tier"]) != `"priority"` || string(object["future_compact_option"]) != `{"enabled":true}` {
+		t.Fatalf("expected compact body to preserve same-dialect and future fields, got %s", body)
 	}
 
 	metadata, err := MetadataFromResponsesBody(envelope.Object)
@@ -490,6 +522,22 @@ func TestCompactPlannerOmitsClientMetadataAndProjectsInstallationID(t *testing.T
 	}
 	if got := headers.Get("OpenAI-Beta"); got != "" {
 		t.Fatalf("expected compact HTTP headers to omit OpenAI-Beta, got %q", got)
+	}
+}
+
+func TestCompactPlannerRejectsUnrepresentableCreateFields(t *testing.T) {
+	for _, field := range []string{"context_management", "truncation"} {
+		t.Run(field, func(t *testing.T) {
+			envelope := mustEnvelope(t, fmt.Sprintf(`{"model":"gpt-5","input":"hello",%q:null}`, field))
+			body, err := PlanResponsesCompactBody(envelope.Object, "gpt-5-codex", nil)
+			if err == nil || body != nil {
+				t.Fatalf("expected %s to fail before body planning, body=%s err=%v", field, body, err)
+			}
+			var violation *Violation
+			if !errors.As(err, &violation) || violation.Param != field {
+				t.Fatalf("expected %s violation, got %v", field, err)
+			}
+		})
 	}
 }
 
@@ -591,7 +639,7 @@ func TestResolveIdentityRejectsInvalidOptionalMetadata(t *testing.T) {
 	}
 }
 
-func TestResponsesCreateBodyRejectsUnsupportedOfficialInputs(t *testing.T) {
+func TestResponsesCreateBodyRejectsProxyOwnedStructuralInputs(t *testing.T) {
 	cases := []struct {
 		name      string
 		raw       string
@@ -607,21 +655,6 @@ func TestResponsesCreateBodyRejectsUnsupportedOfficialInputs(t *testing.T) {
 			raw:       `{"model":"gpt-5","input":"hi","client_metadata":null}`,
 			wantParam: "client_metadata",
 		},
-		{
-			name:      "temperature and top_p",
-			raw:       `{"model":"gpt-5","input":"hi","temperature":0.7,"top_p":0.9}`,
-			wantParam: "temperature",
-		},
-		{
-			name:      "context management",
-			raw:       `{"model":"gpt-5","input":"hi","context_management":[{"type":"compaction"}]}`,
-			wantParam: "context_management",
-		},
-		{
-			name:      "truncation",
-			raw:       `{"model":"gpt-5","input":"hi","truncation":"auto"}`,
-			wantParam: "truncation",
-		},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
@@ -635,6 +668,23 @@ func TestResponsesCreateBodyRejectsUnsupportedOfficialInputs(t *testing.T) {
 
 	if _, err := commonresponses.ParseRawEnvelope([]byte(`{"model":"gpt-5","model":"gpt-4"}`)); err == nil {
 		t.Fatal("expected duplicate top-level key to be rejected before planning")
+	}
+}
+
+func TestResponsesCreateBodyPreservesUpstreamParameterSemantics(t *testing.T) {
+	envelope := mustEnvelope(t, `{"model":"gpt-5","input":"hi","temperature":0.7,"top_p":0.9,"context_management":[{"type":"compaction"}],"truncation":"auto"}`)
+	body, err := PlanResponsesCreateBody(envelope.Object, CreateBodyInput{Model: "gpt-5-codex", Stream: true})
+	if err != nil {
+		t.Fatalf("encodable provider parameters must reach upstream: %v", err)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(body, &object); err != nil {
+		t.Fatalf("decode planned body: %v", err)
+	}
+	for _, field := range []string{"temperature", "top_p", "context_management", "truncation"} {
+		if _, ok := object[field]; !ok {
+			t.Fatalf("planned body dropped %s: %s", field, body)
+		}
 	}
 }
 
@@ -689,8 +739,9 @@ func TestResponsesWSPlannerFiltersHandshakeAndPatchesFrameMetadata(t *testing.T)
 		t.Fatalf("build WS headers: %v", err)
 	}
 	upstreamHeaders := plan.HTTPHeader()
-	if got := upstreamHeaders.Get("OpenAI-Beta"); got != "responses_websockets=2026-02-06" {
-		t.Fatalf("expected ResponsesWS beta header, got %q", got)
+	wantBeta := "responses_websockets=2026-02-06, responses_multi_agent=v1"
+	if got := upstreamHeaders.Get("OpenAI-Beta"); got != wantBeta {
+		t.Fatalf("expected ResponsesWS and multi-agent beta header %q, got %q", wantBeta, got)
 	}
 	for _, forbidden := range []string{"Content-Type", "Accept", "Connection", "x-codex-turn-state", "x-codex-installation-id", "traceparent", "tracestate"} {
 		if got := upstreamHeaders.Get(forbidden); got != "" {
@@ -735,6 +786,54 @@ func TestResponsesWSPlannerFiltersHandshakeAndPatchesFrameMetadata(t *testing.T)
 	}
 	if _, ok := clientMetadata["x-codex-installation-id"]; ok {
 		t.Fatalf("expected missing installation id to stay absent by default, got %s", object["client_metadata"])
+	}
+}
+
+func TestResponsesWSPlannerAdvertisesMultiAgentForLaterTurns(t *testing.T) {
+	firstFrame, err := responsesws.ParseRawResponsesCreateFrame([]byte(`{
+		"type":"response.create",
+		"model":"gpt-5.6",
+		"input":"first",
+		"multi_agent":{"enabled":false}
+	}`))
+	if err != nil {
+		t.Fatalf("parse first frame: %v", err)
+	}
+	if firstFrame.MultiAgentEnabled {
+		t.Fatal("expected first turn to keep multi-agent disabled")
+	}
+
+	plan, err := BuildHeaders(HeaderPlanInput{
+		Operation:  OpResponsesWSOpen,
+		Credential: Credential{AccessToken: "upstream-token"},
+	})
+	if err != nil {
+		t.Fatalf("build WS headers: %v", err)
+	}
+	wantBeta := "responses_websockets=2026-02-06, responses_multi_agent=v1"
+	if got := plan.HTTPHeader().Get("OpenAI-Beta"); got != wantBeta {
+		t.Fatalf("expected connection capabilities %q before later turns, got %q", wantBeta, got)
+	}
+
+	laterFrame, err := responsesws.ParseRawResponsesCreateFrame([]byte(`{
+		"type":"response.create",
+		"model":"gpt-5.6",
+		"input":"later",
+		"multi_agent":{"enabled":true}
+	}`))
+	if err != nil {
+		t.Fatalf("parse later frame: %v", err)
+	}
+	if !laterFrame.MultiAgentEnabled {
+		t.Fatal("expected a later turn to enable multi-agent on the pre-enabled connection")
+	}
+	encoded, err := PlanResponsesWSFrame(laterFrame, FramePatchInput{Model: "gpt-5.6"})
+	if err != nil {
+		t.Fatalf("plan later frame: %v", err)
+	}
+	object := mustDecodeObject(t, encoded)
+	if string(object["multi_agent"]) != `{"enabled":true}` {
+		t.Fatalf("expected later turn multi_agent payload to remain intact, got %s", object["multi_agent"])
 	}
 }
 

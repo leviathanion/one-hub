@@ -7,7 +7,9 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"one-api/common"
+	"one-api/common/config"
 	providersBase "one-api/providers/base"
+	"one-api/providers/openai"
 	"one-api/types"
 )
 
@@ -24,6 +26,9 @@ func NewRelayImageGenerations(c *gin.Context) *relayImageGenerations {
 
 func (r *relayImageGenerations) setRequest() error {
 	if err := common.UnmarshalBodyReusable(r.c, &r.request); err != nil {
+		return err
+	}
+	if err := rejectImageStreamRequest(r.c); err != nil {
 		return err
 	}
 
@@ -46,8 +51,20 @@ func (r *relayImageGenerations) setRequest() error {
 	}
 
 	r.setOriginalModel(r.request.Model)
+	setRequestChannelCapability(r.c, requireEndpointEnabled(config.RelayModeImagesGenerations))
 
 	return nil
+}
+
+func rejectImageStreamRequest(c *gin.Context) error {
+	if c == nil || c.Request == nil {
+		return nil
+	}
+	body, exists := common.GetCanonicalRequestBody(c)
+	if !exists {
+		return nil
+	}
+	return providerCapabilityGateError(openai.ValidateImageStreamRequestBody(body, c.Request.Header.Get("Content-Type")))
 }
 
 func (r *relayImageGenerations) getPromptTokens() (int, error) {

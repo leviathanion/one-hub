@@ -162,6 +162,7 @@ func SetApiRouter(router *gin.Engine) {
 		{
 			channelRoute.GET("/", controller.GetChannelsList)
 			channelRoute.GET("/models", relay.ListModelsForAdmin)
+			channelRoute.GET("/endpoints", controller.GetChannelEndpoints)
 			channelRoute.POST("/codex/usage/previews", controller.GetCodexUsagePreviews)
 			channelRoute.POST("/provider_models_list", controller.GetModelList)
 			channelRoute.GET("/:id", controller.GetChannel)
@@ -258,6 +259,7 @@ func SetApiRouter(router *gin.Engine) {
 		{
 			pricesRoute.GET("/model_list", controller.GetAllModelList)
 			pricesRoute.POST("/single", controller.AddPrice)
+			pricesRoute.POST("/preview", relay.PreviewPriceRules)
 			pricesRoute.PUT("/single/*model", controller.UpdatePrice)
 			pricesRoute.DELETE("/single/*model", controller.DeletePrice)
 			pricesRoute.POST("/multiple", controller.BatchSetPrices)

@@ -16,6 +16,8 @@ type ResponsesTurnAffinity struct {
 	PreviousResponseID string
 	SelectedChannelID  int
 	ExplicitPinID      int
+	OwnershipChannelID int
+	StrictOwnerRoute   bool
 }
 
 type ResponsesAffinityInput struct {
@@ -28,15 +30,29 @@ func PrepareResponsesTurnAffinity(input ResponsesAffinityInput) (*ResponsesTurnA
 		return &ResponsesTurnAffinity{}, nil
 	}
 	prepareResponsesChannelAffinity(input.Context, input.Request)
+	continuationRoute, err := prepareResponsesContinuationOwnership(input.Context, input.Request)
+	if err != nil {
+		return nil, err
+	}
 	state := currentChannelAffinityState(input.Context)
 	pin := explicitChannelPinID(input.Context)
-	if pin > 0 && state != nil && state.Hit && state.PreferredChannelID > 0 && state.PreferredChannelID != pin {
+	if !continuationRoute.Strict && pin > 0 && state != nil && state.Hit && state.PreferredChannelID > 0 && state.PreferredChannelID != pin {
 		return nil, fmt.Errorf("explicit channel pin #%d conflicts with responses affinity owner #%d", pin, state.PreferredChannelID)
+	}
+	ownershipChannelID := continuationRoute.ChannelID
+	if ownershipChannelID == 0 && strings.TrimSpace(input.Request.PreviousResponseID) != "" {
+		if pin > 0 {
+			ownershipChannelID = pin
+		} else {
+			ownershipChannelID = currentPreferredChannelID(input.Context)
+		}
 	}
 	return &ResponsesTurnAffinity{
 		State:              state,
 		PreviousResponseID: strings.TrimSpace(input.Request.PreviousResponseID),
 		ExplicitPinID:      pin,
+		OwnershipChannelID: ownershipChannelID,
+		StrictOwnerRoute:   continuationRoute.Strict,
 	}, nil
 }
 
@@ -54,7 +70,7 @@ func RecordResponsesTurnSuccess(c *gin.Context, active *ResponsesTurnAffinity, f
 		return
 	}
 	if active.ExplicitPinID <= 0 {
-		recordResponsesChannelAffinity(c, active.SelectedChannelID, final)
+		recordResponsesChannelAffinityState(c, active.State, active.SelectedChannelID, final)
 		return
 	}
 	recordPinnedResponsesDerivedAffinity(active, final)
@@ -109,11 +125,14 @@ func ClearResponsesTurnContinuationMissBindings(activeOrCandidate *ResponsesTurn
 }
 
 func responsesAffinityOwnerConflict(candidate *ResponsesTurnAffinity, currentChannelID int) error {
-	if candidate == nil || candidate.State == nil || currentChannelID <= 0 {
+	if candidate == nil || currentChannelID <= 0 {
 		return nil
 	}
-	if candidate.State.Hit && candidate.State.PreferredChannelID > 0 && candidate.State.PreferredChannelID != currentChannelID {
+	if candidate.OwnershipChannelID > 0 && candidate.OwnershipChannelID != currentChannelID {
 		return errors.New("responses continuation owner is bound to a different channel")
+	}
+	if candidate.StrictOwnerRoute {
+		return nil
 	}
 	return nil
 }

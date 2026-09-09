@@ -5,9 +5,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
-	"time"
 
-	"one-api/common/cache"
 	"one-api/common/config"
 	commonTest "one-api/common/test"
 	"one-api/model"
@@ -18,11 +16,7 @@ import (
 
 func TestConsumeCodexResetCreditCommittedUnusableResponseSucceedsAndRotatesCaches(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	cache.InitCacheManager()
 	const channelID = 28
-	if err := cache.SetCache("codex:usage:preview:28", "legacy", time.Minute); err != nil {
-		t.Fatal(err)
-	}
 
 	originalLoad := loadCodexUsageChannelByID
 	originalCreate := createCodexUsageProvider
@@ -57,8 +51,5 @@ func TestConsumeCodexResetCreditCommittedUnusableResponseSucceedsAndRotatesCache
 	}
 	if clearCalls != 1 {
 		t.Fatalf("v2 generation rotation must always run, calls=%d", clearCalls)
-	}
-	if _, err := cache.GetCache[string]("codex:usage:preview:28"); !errors.Is(err, cache.CacheNotFound) {
-		t.Fatalf("legacy cache must always be invalidated: %v", err)
 	}
 }

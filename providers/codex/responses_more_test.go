@@ -16,6 +16,7 @@ import (
 	"one-api/common/responsesws"
 	"one-api/internal/requesthints"
 	"one-api/providers/codex/wire"
+	runtimerealtime "one-api/runtime/realtime"
 	"one-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -64,43 +65,14 @@ func TestCodexResponsesUsageAndBillingHelpers(t *testing.T) {
 	}
 
 	target := &types.Usage{PromptTokens: 1}
-	target.TextBuilder.WriteString("assistant transcript")
 	resolved := &types.Usage{PromptTokens: 3, CompletionTokens: 5, TotalTokens: 8}
 	applyResolvedCodexUsage(target, resolved)
-	if target.PromptTokens != 3 || target.TotalTokens != 8 || target.TextBuilder.String() != "assistant transcript" {
-		t.Fatalf("expected resolved usage to replace counters while preserving text, got %+v text=%q", target, target.TextBuilder.String())
+	if target.PromptTokens != 3 || target.TotalTokens != 8 {
+		t.Fatalf("expected resolved usage to replace counters: %+v", target)
 	}
 
-	if got := codexResponsesSearchType(nil); got != "" {
-		t.Fatalf("expected nil search type to be empty, got %q", got)
-	}
-	if got := codexResponsesSearchType(&types.OpenAIResponsesResponses{Tools: []types.ResponsesTools{{Type: types.APIToolTypeWebSearchPreview}}}); got != "medium" {
-		t.Fatalf("expected web search default search type, got %q", got)
-	}
-	if got := codexResponsesSearchType(&types.OpenAIResponsesResponses{Tools: []types.ResponsesTools{{Type: types.APIToolTypeWebSearchPreview, SearchContextSize: "high"}}}); got != "high" {
-		t.Fatalf("expected explicit web search type, got %q", got)
-	}
-
-	usage := &types.Usage{}
-	applyCodexResponsesAddedToolBilling(usage, &types.ResponsesOutput{Type: types.InputTypeWebSearchCall}, "")
-	applyCodexResponsesAddedToolBilling(usage, &types.ResponsesOutput{Type: types.InputTypeCodeInterpreterCall}, "")
-	applyCodexResponsesAddedToolBilling(usage, &types.ResponsesOutput{Type: types.InputTypeFileSearchCall}, "")
-	applyCodexResponsesAddedToolBilling(usage, &types.ResponsesOutput{Type: types.InputTypeImageGenerationCall, Quality: "high", Size: "1024x1024"}, "")
-	if usage.ExtraBilling[types.BuildExtraBillingKey(types.APIToolTypeWebSearchPreview, "medium")].CallCount != 1 {
-		t.Fatalf("expected web search preview billing, got %+v", usage.ExtraBilling)
-	}
-	if usage.ExtraBilling[types.BuildExtraBillingKey(types.APIToolTypeCodeInterpreter, "")].CallCount != 1 {
-		t.Fatalf("expected code interpreter billing, got %+v", usage.ExtraBilling)
-	}
-	if usage.ExtraBilling[types.BuildExtraBillingKey(types.APIToolTypeFileSearch, "")].CallCount != 1 {
-		t.Fatalf("expected file search billing, got %+v", usage.ExtraBilling)
-	}
-	if usage.ExtraBilling[types.BuildExtraBillingKey(types.APIToolTypeImageGeneration, "high-1024x1024")].CallCount != 1 {
-		t.Fatalf("expected image generation billing, got %+v", usage.ExtraBilling)
-	}
-
-	if _, ok := commonresponses.ParseStreamUsageEvent([]byte(`{"type":"response.done"}`)); !ok {
-		t.Fatal("expected response.done to be tracked by shared usage parser")
+	if _, ok := commonresponses.ParseStreamUsageEvent([]byte(`{"type":"response.done"}`)); ok {
+		t.Fatal("expected Realtime response.done not to be tracked by the Responses usage parser")
 	}
 	if _, ok := commonresponses.ParseStreamUsageEvent([]byte(`{"type":"response.updated"}`)); ok {
 		t.Fatal("expected unsupported response.updated event to be ignored by shared usage parser")
@@ -113,28 +85,32 @@ func TestCodexResponsesUsageAndBillingHelpers(t *testing.T) {
 				Role:    types.ChatMessageRoleAssistant,
 				Content: []types.ContentResponses{{Type: types.ContentTypeOutputText, Text: "hello"}},
 			},
-			{Type: types.InputTypeWebSearchCall, ID: "ws_1", Status: "completed"},
+			{Type: types.InputTypeWebSearchCall, ID: "ws_1", Status: "completed", Action: map[string]any{"type": "search"}},
 		},
 		Tools: []types.ResponsesTools{{Type: types.APIToolTypeWebSearchPreview, SearchContextSize: "high"}},
 	}
 
 	seed := &types.Usage{PromptTokens: 7}
-	seed.TextBuilder.WriteString("seed transcript")
-	resolvedUsage := resolveCodexResponsesUsage(seed, nil, response, "gpt-5", true)
-	if resolvedUsage == nil || resolvedUsage.PromptTokens != 7 || resolvedUsage.CompletionTokens <= 0 || resolvedUsage.TotalTokens <= resolvedUsage.PromptTokens {
-		t.Fatalf("expected resolved usage to backfill prompt/output tokens, got %+v", resolvedUsage)
+	accumulator := newCodexTurnUsageAccumulator()
+	if err := accumulator.ObserveEvent(&types.OpenAIResponsesStreamResponses{Type: "response.completed", Response: response}); err != nil {
+		t.Fatalf("observe terminal billing: %v", err)
+	}
+	resolvedUsage := resolveCodexResponsesUsage(seed, accumulator, response)
+	if resolvedUsage == nil || resolvedUsage.PromptTokens != 7 || resolvedUsage.CompletionTokens != 0 || resolvedUsage.TotalTokens != 7 || resolvedUsage.ProviderReported {
+		t.Fatalf("provider-missing content became authoritative token usage: %+v", resolvedUsage)
 	}
 	if resolvedUsage.ExtraBilling[types.BuildExtraBillingKey(types.APIToolTypeWebSearchPreview, "high")].CallCount != 1 {
 		t.Fatalf("expected resolved usage to preserve extra billing, got %+v", resolvedUsage.ExtraBilling)
 	}
 
 	finalUsage := &types.Usage{PromptTokens: 3}
-	finalUsage.TextBuilder.WriteString("final transcript")
-	finalizeCodexResponsesUsage(finalUsage, &types.OpenAIResponsesResponses{
+	if err := finalizeCodexResponsesUsage(finalUsage, &types.OpenAIResponsesResponses{
 		Usage: &types.ResponsesUsage{InputTokens: 2, OutputTokens: 4, TotalTokens: 6},
-	}, "gpt-5", false)
-	if finalUsage.PromptTokens != 2 || finalUsage.CompletionTokens != 4 || finalUsage.TextBuilder.String() != "final transcript" {
-		t.Fatalf("expected finalizeCodexResponsesUsage to overwrite counters and keep text, got %+v text=%q", finalUsage, finalUsage.TextBuilder.String())
+	}); err != nil {
+		t.Fatalf("finalize Codex usage: %v", err)
+	}
+	if finalUsage.PromptTokens != 2 || finalUsage.CompletionTokens != 4 {
+		t.Fatalf("expected finalizeCodexResponsesUsage to overwrite counters: %+v", finalUsage)
 	}
 }
 
@@ -211,7 +187,7 @@ func TestPrepareResponsesOfficialHTTPRequestErrorBranches(t *testing.T) {
 		provider := newTestCodexProviderWithContext(t, `{}`, "", nil)
 		req := newRawReq(t, `{"model":"gpt-5","input":"hello"}`, nil)
 		_, errWithCode := provider.prepareResponsesOfficialHTTPRequest(context.Background(), req, wire.OpResponsesCreate, "", "gpt-5", body)
-		if errWithCode == nil || errWithCode.StatusCode != http.StatusUnauthorized || errWithCode.Code != "codex_token_error" {
+		if errWithCode == nil || errWithCode.StatusCode != http.StatusServiceUnavailable || !errWithCode.LocalError || errWithCode.Code != "codex_token_error" {
 			t.Fatalf("expected token error, got %+v", errWithCode)
 		}
 	})
@@ -256,11 +232,47 @@ func TestPrepareResponsesOfficialHTTPRequestErrorBranches(t *testing.T) {
 	})
 }
 
+func TestPrepareResponsesCreateRequestProjectsMultiAgentBetaFromRawBody(t *testing.T) {
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", nil)
+	for _, tc := range []struct {
+		name     string
+		body     string
+		wantBeta string
+	}{
+		{name: "absent", body: `{"model":"gpt-5.6","input":"hello"}`},
+		{name: "disabled", body: `{"model":"gpt-5.6","input":"hello","multi_agent":{"enabled":false}}`},
+		{name: "enabled", body: `{"model":"gpt-5.6","input":"hello","multi_agent":{"enabled":true,"max_concurrent_subagents":3}}`, wantBeta: "responses_multi_agent=v1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			envelope, err := commonresponses.ParseRawEnvelope([]byte(tc.body))
+			if err != nil {
+				t.Fatalf("parse raw request: %v", err)
+			}
+			req := &commonresponses.Request{
+				Operation: commonresponses.ResponsesCreate,
+				Body:      envelope,
+				ChannelID: provider.Channel.Id,
+				Model:     "gpt-5.6",
+			}
+			httpReq, errWithCode := provider.prepareResponsesCreateRequest(context.Background(), req)
+			if errWithCode != nil {
+				t.Fatalf("prepare Responses request: %+v", errWithCode)
+			}
+			if got := httpReq.Header.Get("OpenAI-Beta"); got != tc.wantBeta {
+				t.Fatalf("expected OpenAI-Beta %q, got %q", tc.wantBeta, got)
+			}
+		})
+	}
+}
+
 func TestCodexStaleResponsesWSContinuationErrorIncludesEventID(t *testing.T) {
 	err := codexStaleResponsesWSContinuationError("evt_stale")
-	payload := responsesws.ClientPayloadFromError(err)
+	payload := runtimerealtime.ClientPayloadFromError(err)
 	if !strings.Contains(string(payload), `"event_id":"evt_stale"`) {
 		t.Fatalf("expected stale continuation payload to include event_id, got %s", payload)
+	}
+	if !runtimerealtime.ClientPayloadErrorIsRecoverable(err) || responsesws.ClientPayloadFromError(err) != nil {
+		t.Fatal("expected stale continuation to use the recoverable realtime transport carrier only")
 	}
 }
 
@@ -344,23 +356,6 @@ func TestCodexResponsesPromptCacheHelpers(t *testing.T) {
 		t.Fatalf("expected auto strategy to use previous_response_id directly, got %q", got)
 	}
 
-	stableKeyRequest := &types.OpenAIResponsesRequest{}
-	ensureStablePromptCacheKey(stableKeyRequest, ctx, codexPromptCacheStrategyUserID)
-	expectedStableKey := uuid.NewSHA1(uuid.NameSpaceOID, []byte("one-hub:codex:prompt-cache:user:7")).String()
-	if stableKeyRequest.PromptCacheKey != expectedStableKey {
-		t.Fatalf("expected generated stable prompt cache key %q, got %q", expectedStableKey, stableKeyRequest.PromptCacheKey)
-	}
-	ensureStablePromptCacheKey(stableKeyRequest, ctx, codexPromptCacheStrategyOff)
-	if stableKeyRequest.PromptCacheKey != expectedStableKey {
-		t.Fatalf("expected existing prompt cache key to remain stable, got %q", stableKeyRequest.PromptCacheKey)
-	}
-
-	derivedKeyRequest := &types.OpenAIResponsesRequest{}
-	requesthints.Set(ctx, map[string]string{requesthints.ResponsesPromptCacheKey: "derived-prompt-cache"})
-	ensureStablePromptCacheKey(derivedKeyRequest, ctx, codexPromptCacheStrategyOff)
-	if derivedKeyRequest.PromptCacheKey != "derived-prompt-cache" {
-		t.Fatalf("expected derived prompt cache key from relay context to win, got %q", derivedKeyRequest.PromptCacheKey)
-	}
 }
 
 func TestCodexResponsesRoutingHintResolver(t *testing.T) {
@@ -723,19 +718,14 @@ func TestCodexPromptCacheAutoPriorityFallsBackAcrossSignals(t *testing.T) {
 
 func TestCodexResponsesStreamObserverHelpers(t *testing.T) {
 	var nilHandler *CodexResponsesStreamHandler
-	nilHandler.observeUsageEvent(`{"type":"response.output_text.delta","delta":"hello"}`)
+	nilHandler.observeUsageEvent(`{"type":"response.created"}`)
 
 	usage := &types.Usage{}
 	handler := newCodexResponsesStreamHandler(usage)
 	handler.observeUsageEvent("{bad-json")
-	handler.observeUsageEvent(`{"type":"response.output_text.delta","delta":"hello"}`)
-	handler.observeUsageEvent(`{"type":"response.reasoning_summary_text.delta","delta":" summary"}`)
 	handler.observeUsageEvent(`{"type":"response.output_item.added","item":{"type":"web_search_call","id":"ws_1"},"response":{"tools":[{"type":"web_search_preview","search_context_size":"high"}]}}`)
-	handler.observeUsageEvent(`{"type":"response.done","response":{"status":"completed","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8},"tools":[{"type":"web_search_preview","search_context_size":"high"}],"output":[{"type":"web_search_call","id":"ws_1","status":"completed"}]}}`)
+	handler.observeUsageEvent(`{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8},"tools":[{"type":"web_search_preview","search_context_size":"high"}],"output":[{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search"}}]}}`)
 
-	if usage.TextBuilder.String() != "hello summary" {
-		t.Fatalf("expected stream observer to accumulate text deltas, got %q", usage.TextBuilder.String())
-	}
 	if usage.TotalTokens != 8 || usage.PromptTokens != 3 || usage.CompletionTokens != 5 {
 		t.Fatalf("expected terminal usage snapshot to be applied, got %+v", usage)
 	}

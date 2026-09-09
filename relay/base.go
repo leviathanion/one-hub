@@ -2,6 +2,7 @@ package relay
 
 import (
 	"one-api/common"
+	"one-api/common/providerresponse"
 	"one-api/common/surface"
 	"one-api/model"
 	"one-api/relay/relay_util"
@@ -16,6 +17,7 @@ import (
 type relayBase struct {
 	c              *gin.Context
 	provider       providersBase.ProviderInterface
+	remoteMedia    providersBase.RemoteMediaFetcher
 	originalModel  string
 	modelName      string
 	contract       surface.Contract
@@ -58,12 +60,6 @@ func (r *relayBase) IsStream() bool {
 
 func (r *relayBase) setProvider(modelName string) error {
 	common.SetRequestBodyReparseNeeded(r.c, false)
-
-	if provider, newModelName, ok := consumeCachedProviderSelection(r.c, modelName); ok {
-		r.provider = provider
-		r.modelName = newModelName
-		return nil
-	}
 
 	provider, modelName, fail := GetProvider(r.c, modelName)
 	if fail != nil {
@@ -124,6 +120,14 @@ func (r *relayBase) GetError(err *types.OpenAIErrorWithStatusCode) (int, any) {
 }
 
 func (r *relayBase) HandleJsonError(err *types.OpenAIErrorWithStatusCode) {
+	if replayProviderRawResponse(r.c, err, providerresponse.Policy{
+		Operation:        providerresponse.OperationUnknown,
+		DataPath:         providerresponse.DataPathExactWire,
+		BodyUnmodified:   true,
+		PreserveRedirect: true,
+	}) {
+		return
+	}
 	surfaceErr := surface.FromOpenAIError(err)
 	surface.LogLocalError(r.c, surfaceErr)
 	r.getContract().RenderJSONError(r.c, surfaceErr)
@@ -136,7 +140,10 @@ func (r *relayBase) HandleStreamError(err *types.OpenAIErrorWithStatusCode) {
 }
 
 func (r *relayBase) SetHeartbeat(isStream bool) *relay_util.Heartbeat {
-	if !r.allowHeartbeat {
+	// A non-streaming HTTP response cannot carry a heartbeat without committing
+	// its final status code. Keep the connection quiet until the provider status
+	// is known so 4xx/5xx responses remain observable by the client.
+	if !r.allowHeartbeat || !isStream {
 		return nil
 	}
 

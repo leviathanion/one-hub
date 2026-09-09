@@ -2,10 +2,14 @@ package relay_util
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
+
+	"one-api/common/requester"
+	commonresponses "one-api/common/responses"
 	"one-api/common/utils"
 	"one-api/types"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -14,7 +18,6 @@ type responsesHandler func(response *types.OpenAIResponsesStreamResponses)
 
 type OpenAIResponsesStreamConverter struct {
 	sequenceNumber    int
-	lastChoiceIndex   int
 	lastResponseType  string
 	outputIndex       int
 	contentIndex      int
@@ -26,38 +29,38 @@ type OpenAIResponsesStreamConverter struct {
 	itemID            string
 	isFirstResponse   bool
 	isCompleted       bool
+	isTerminal        bool
+	terminalErr       error
 	c                 *gin.Context
 	nowStatus         string
 	lastToolCallIndex int
 	usage             *types.Usage
 	partTextBuilder   strings.Builder
 	argsBuilder       strings.Builder
+	processedBytes    int64
+	maxProcessedBytes int64
 }
 
-type OpenAIResponsesStreamObserver struct {
-	finalResponse *types.OpenAIResponsesResponses
-}
+const responsesStreamConverterMaxProcessedBytes int64 = 64 << 20
+
+var errResponsesStreamConverterStateLimit = errors.New("responses stream converter state limit exceeded")
 
 func NewOpenAIResponsesStreamConverter(c *gin.Context, request *types.OpenAIResponsesRequest, usage *types.Usage) *OpenAIResponsesStreamConverter {
 	converter := &OpenAIResponsesStreamConverter{
 		sequenceNumber:    0,
-		lastChoiceIndex:   -1,
 		outputIndex:       0,
 		contentIndex:      0,
 		summaryIndex:      0,
 		isFirstResponse:   true,
 		c:                 c,
-		lastToolCallIndex: 0,
+		lastToolCallIndex: -1,
 		usage:             usage,
+		maxProcessedBytes: responsesStreamConverterMaxProcessedBytes,
 	}
 
 	converter.initializeResponse(request)
 
 	return converter
-}
-
-func NewOpenAIResponsesStreamObserver() *OpenAIResponsesStreamObserver {
-	return &OpenAIResponsesStreamObserver{}
 }
 
 func (converter *OpenAIResponsesStreamConverter) initializeResponse(request *types.OpenAIResponsesRequest) {
@@ -89,7 +92,7 @@ func (converter *OpenAIResponsesStreamConverter) initializeResponse(request *typ
 		Reasoning:            request.Reasoning,
 		Temperature:          request.Temperature,
 		SafetyIdentifier:     request.SafetyIdentifier,
-		ServiceTier:          request.ServiceTier,
+		ProcessingClass:      request.ProcessingClass,
 		Store:                request.Store,
 		ToolChoice:           request.ToolChoice,
 		TopP:                 request.TopP,
@@ -100,68 +103,143 @@ func (converter *OpenAIResponsesStreamConverter) initializeResponse(request *typ
 	}
 }
 
-func (converter *OpenAIResponsesStreamConverter) ProcessStreamData(jsonStr string) {
+func (converter *OpenAIResponsesStreamConverter) ProcessStreamData(jsonStr string) error {
+	if converter == nil || converter.isTerminal {
+		if converter == nil {
+			return nil
+		}
+		return converter.terminalErr
+	}
 	if jsonStr == "[DONE]" {
 		converter.finalizeStream()
-		return
+		return nil
 	}
+	incomingBytes := int64(len(jsonStr))
+	if incomingBytes > converter.maxProcessedBytes-converter.processedBytes {
+		return converter.sendError("provider_usage_state_limit", "provider stream state limit exceeded", errResponsesStreamConverterStateLimit)
+	}
+	converter.processedBytes += incomingBytes
 
 	var response types.ChatCompletionStreamResponse
 	if err := json.Unmarshal([]byte(jsonStr), &response); err != nil {
-		converter.sendError(fmt.Sprintf("解析JSON失败: %v", err))
-		return
+		return converter.sendError("invalid_provider_response", "stream interrupted", errors.New("chat completion stream payload is malformed"))
+	}
+	if err := converter.validateChatStreamChoicesForResponses(response.Choices); err != nil {
+		return converter.sendError("invalid_provider_response", "stream interrupted", err)
+	}
+
+	if strings.TrimSpace(response.Model) != "" {
+		converter.responses.Model = response.Model
+	}
+	if strings.TrimSpace(response.ServiceTier) != "" {
+		converter.responses.ServiceTier = response.ServiceTier
 	}
 
 	// 第一次响应创建response.created
 	if converter.isFirstResponse {
 		converter.responses.ID = response.ID
 		converter.responses.CreatedAt = response.Created
-		converter.responses.Model = response.Model
 		converter.sendStreamResponse("response.created", converter.populateResponseData)
 		converter.sendStreamResponse("response.in_progress", converter.populateResponseData)
 		converter.isFirstResponse = false
 	}
 
 	converter.processChoices(response.Choices)
+	return nil
 }
 
-func (converter *OpenAIResponsesStreamConverter) ProcessStreamError() {
-	converter.sendError("stream interrupted")
+func ResponsesStreamFailureCode(err error) string {
+	if errors.Is(err, errResponsesStreamConverterStateLimit) || errors.Is(err, requester.ErrSSEEventTooLarge) || errors.Is(err, requester.ErrStreamLineTooLarge) {
+		return "provider_usage_state_limit"
+	}
+	var apiErr *types.OpenAIErrorWithStatusCode
+	if errors.As(err, &apiErr) && apiErr != nil {
+		if code, ok := apiErr.Code.(string); ok {
+			switch strings.TrimSpace(code) {
+			case "provider_usage_state_limit", "provider_protocol_error":
+				return strings.TrimSpace(code)
+			}
+		}
+	}
+	return "invalid_provider_response"
 }
 
-func (observer *OpenAIResponsesStreamObserver) ObserveRawLine(rawLine string) {
-	if observer == nil {
-		return
+func (converter *OpenAIResponsesStreamConverter) validateChatStreamChoicesForResponses(choices []types.ChatCompletionStreamChoice) error {
+	if len(choices) > 1 {
+		return errors.New("chat completion stream returned multiple choices")
 	}
-
-	for _, line := range strings.Split(rawLine, "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "data:") {
+	for _, choice := range choices {
+		if choice.Index != 0 {
+			return errors.New("chat completion stream returned an unsupported choice index")
+		}
+		if role := strings.TrimSpace(choice.Delta.Role); role != "" && role != "assistant" {
+			return errors.New("chat completion stream returned an unsupported output role")
+		}
+		if choice.Delta.FunctionCall != nil || choice.Delta.Reasoning != "" || len(choice.Delta.Image) > 0 || len(choice.Delta.Images) > 0 {
+			return errors.New("chat completion stream contains an unsupported delta shape")
+		}
+		payloadVariants := 0
+		if choice.Delta.Content != "" {
+			payloadVariants++
+		}
+		if choice.Delta.Refusal != "" {
+			payloadVariants++
+		}
+		if choice.Delta.ReasoningContent != "" {
+			payloadVariants++
+		}
+		if len(choice.Delta.ToolCalls) > 0 {
+			payloadVariants++
+		}
+		if payloadVariants > 1 {
+			return errors.New("chat completion stream delta contains multiple output variants")
+		}
+		if len(choice.Delta.ToolCalls) == 0 {
 			continue
 		}
-
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if payload == "" || payload == "[DONE]" {
+		if len(choice.Delta.ToolCalls) != 1 {
+			return errors.New("chat completion stream returned multiple tool calls in one chunk")
+		}
+		tool := choice.Delta.ToolCalls[0]
+		if tool == nil || tool.Function == nil || tool.Custom != nil || strings.TrimSpace(tool.Type) != "" && strings.TrimSpace(tool.Type) != "function" {
+			return errors.New("chat completion stream contains an unsupported tool call")
+		}
+		if tool.Index < 0 {
+			return errors.New("chat completion stream contains an invalid tool call index")
+		}
+		// A tool call that follows a different output item starts a new
+		// function-call item. Require its identity up front, while keeping the
+		// index and identity checks strict for deltas of the active call.
+		if converter.lastResponseType != types.InputTypeFunctionCall {
+			if strings.TrimSpace(tool.Id) == "" || strings.TrimSpace(tool.Function.Name) == "" {
+				return errors.New("chat completion stream tool call requires call_id and function name")
+			}
 			continue
 		}
-
-		var event types.OpenAIResponsesStreamResponses
-		if err := json.Unmarshal([]byte(payload), &event); err != nil || event.Response == nil {
+		if tool.Index != converter.lastToolCallIndex {
+			// Claude's content_block_start is projected as a tool chunk with
+			// the new call's identity and an empty initial argument delta. A
+			// changed index carrying arguments is still an interleaved delta of
+			// the active call and must be rejected.
+			if strings.TrimSpace(tool.Id) == "" || strings.TrimSpace(tool.Function.Name) == "" || tool.Function.Arguments != "" {
+				return errors.New("chat completion stream returned multiple or interleaved tool calls")
+			}
 			continue
 		}
-
-		responseCopy := *event.Response
-		if observer.finalResponse == nil || isResponsesTerminalEventType(event.Type) {
-			observer.finalResponse = &responseCopy
+		if converter.item != nil {
+			if id := strings.TrimSpace(tool.Id); id != "" && converter.item.CallID != "" && id != converter.item.CallID {
+				return errors.New("chat completion stream tool call id changed")
+			}
+			if name := strings.TrimSpace(tool.Function.Name); name != "" && converter.item.Name != "" && name != converter.item.Name {
+				return errors.New("chat completion stream function name changed")
+			}
 		}
 	}
+	return nil
 }
 
-func (observer *OpenAIResponsesStreamObserver) FinalResponse() *types.OpenAIResponsesResponses {
-	if observer == nil {
-		return nil
-	}
-	return observer.finalResponse
+func (converter *OpenAIResponsesStreamConverter) ProcessStreamError() error {
+	return converter.sendError("invalid_provider_response", "stream interrupted", errors.New("chat completion stream interrupted"))
 }
 
 // 处理choices
@@ -204,7 +282,6 @@ func (converter *OpenAIResponsesStreamConverter) processChoices(choices []types.
 			converter.processMessage(choice)
 		}
 
-		converter.lastChoiceIndex = choice.Index
 		converter.lastResponseType = currentType
 	}
 }
@@ -229,17 +306,15 @@ func (converter *OpenAIResponsesStreamConverter) createNewItem(choice types.Chat
 
 	switch currentType {
 	case types.InputTypeFunctionCall:
+		converter.argsBuilder.Reset()
 		if len(choice.Delta.ToolCalls) > 0 && choice.Delta.ToolCalls[0].Function != nil {
-			converter.argsBuilder.Reset()
-			converter.item.Arguments = nil
 			converter.item.CallID = choice.Delta.ToolCalls[0].Id
 			converter.item.Name = choice.Delta.ToolCalls[0].Function.Name
 		}
 	case types.InputTypeReasoning:
-		converter.item.Role = choice.Delta.Role
 		converter.item.Summary = types.SummaryResponsesList{}
 	default:
-		converter.item.Role = choice.Delta.Role
+		converter.item.Role = "assistant"
 		converter.item.Content = []types.ContentResponses{}
 	}
 
@@ -291,18 +366,21 @@ func (converter *OpenAIResponsesStreamConverter) done() {
 
 // 处理message类型的内容
 func (converter *OpenAIResponsesStreamConverter) processMessage(choice types.ChatCompletionStreamChoice) {
+	isRefusal := choice.Delta.Refusal != ""
+	partType := types.ContentTypeOutputText
+	if isRefusal {
+		partType = types.ContentTypeRefusal
+	}
 	// 检查是否需要创建content_part.added
-	if converter.lastChoiceIndex != choice.Index {
+	if converter.part != nil && converter.part.Type != partType {
 		// 先结束掉上一个part
-		if converter.part != nil {
-			converter.doneMessagePart()
-		}
+		converter.doneMessagePart()
 	}
 
 	if converter.part == nil {
 		// 创建新的part
 		converter.part = &types.ContentResponses{
-			Type: types.ContentTypeOutputText,
+			Type: partType,
 			Text: "",
 		}
 		converter.partTextBuilder.Reset()
@@ -314,24 +392,40 @@ func (converter *OpenAIResponsesStreamConverter) processMessage(choice types.Cha
 	}
 
 	// 处理文本内容
-	response := converter.buildStreamResponseWithItemID("response.output_text.delta")
+	eventType := "response.output_text.delta"
+	delta := choice.Delta.Content
+	if isRefusal {
+		eventType = "response.refusal.delta"
+		delta = choice.Delta.Refusal
+	}
+	response := converter.buildStreamResponseWithItemID(eventType)
 	response.ContentIndex = &converter.contentIndex
-	response.Delta = choice.Delta.Content
-	converter.sendStreamEvent(response, "response.output_text.delta")
+	response.Delta = delta
+	converter.sendStreamEvent(response, eventType)
 
 	// 处理文本增量
-	converter.partTextBuilder.WriteString(choice.Delta.Content)
+	converter.partTextBuilder.WriteString(delta)
 }
 
 // 结束message part
 func (converter *OpenAIResponsesStreamConverter) doneMessagePart() {
 	// 先结束掉 response.output_text.done
-	response := converter.buildStreamResponseWithItemID("response.output_text.done")
+	eventType := "response.output_text.done"
+	if converter.part.Type == types.ContentTypeRefusal {
+		eventType = "response.refusal.done"
+	}
+	response := converter.buildStreamResponseWithItemID(eventType)
 	response.ContentIndex = &converter.contentIndex
-	converter.part.Text = converter.partTextBuilder.String()
-	text := converter.part.Text
-	response.Text = &text
-	converter.sendStreamEvent(response, "response.output_text.done")
+	if converter.part.Type == types.ContentTypeRefusal {
+		converter.part.Refusal = converter.partTextBuilder.String()
+		refusal := converter.part.Refusal
+		response.Refusal = &refusal
+	} else {
+		converter.part.Text = converter.partTextBuilder.String()
+		text := converter.part.Text
+		response.Text = &text
+	}
+	converter.sendStreamEvent(response, eventType)
 
 	// 结束 part
 	response = converter.buildStreamResponseWithItemID("response.content_part.done")
@@ -350,14 +444,6 @@ func (converter *OpenAIResponsesStreamConverter) doneMessagePart() {
 
 // 处理reasoning类型的内容
 func (converter *OpenAIResponsesStreamConverter) processReasoning(choice types.ChatCompletionStreamChoice) {
-	// 检查是否需要创建reasoning_summary_part.added
-	if converter.lastChoiceIndex != choice.Index {
-		// 先结束掉上一个part
-		if converter.part != nil {
-			converter.doneReasoningPart()
-		}
-	}
-
 	if converter.part == nil {
 		// 创建新的part
 		converter.part = &types.ContentResponses{
@@ -410,14 +496,14 @@ func (converter *OpenAIResponsesStreamConverter) processFunctionCall(choice type
 
 	if len(choice.Delta.ToolCalls) > 0 && choice.Delta.ToolCalls[0].Function != nil {
 		tool := choice.Delta.ToolCalls[0]
-		response.Delta = tool.Function.Arguments
-
-		if converter.argsBuilder.Len() == 0 && converter.item.Arguments != nil {
-			converter.argsBuilder.WriteString(*converter.item.Arguments)
+		if converter.item.CallID == "" && strings.TrimSpace(tool.Id) != "" {
+			converter.item.CallID = tool.Id
 		}
+		if converter.item.Name == "" && strings.TrimSpace(tool.Function.Name) != "" {
+			converter.item.Name = tool.Function.Name
+		}
+		response.Delta = tool.Function.Arguments
 		converter.argsBuilder.WriteString(tool.Function.Arguments)
-		arguments := converter.argsBuilder.String()
-		converter.item.Arguments = &arguments
 	}
 
 	converter.sendStreamEvent(response, "response.function_call_arguments.delta")
@@ -426,7 +512,7 @@ func (converter *OpenAIResponsesStreamConverter) processFunctionCall(choice type
 // 结束function call
 func (converter *OpenAIResponsesStreamConverter) doneFunctionCall() {
 	response := converter.buildStreamResponseWithItemID("response.function_call_arguments.done")
-	if converter.item != nil && converter.argsBuilder.Len() > 0 {
+	if converter.item != nil {
 		arguments := converter.argsBuilder.String()
 		converter.item.Arguments = &arguments
 	}
@@ -460,6 +546,9 @@ func (converter *OpenAIResponsesStreamConverter) addSummary() {
 
 // 输出最终的数据
 func (converter *OpenAIResponsesStreamConverter) finalizeStream() {
+	if converter == nil || converter.isTerminal {
+		return
+	}
 	if converter.item != nil {
 		converter.done()
 	}
@@ -480,10 +569,11 @@ func (converter *OpenAIResponsesStreamConverter) finalizeStream() {
 	response.Response = converter.responses
 	response.Response.Status = finalStatus
 
-	if converter.usage != nil {
+	if converter.usage != nil && converter.usage.HasProviderUsage() {
 		response.Response.Usage = converter.usage.ToResponsesUsage()
 	}
 	converter.isCompleted = true
+	converter.isTerminal = true
 
 	converter.sendStreamEvent(response, respType)
 }
@@ -513,14 +603,19 @@ func (converter *OpenAIResponsesStreamConverter) sendStreamEvent(resp any, respo
 }
 
 // 错误响应
-func (converter *OpenAIResponsesStreamConverter) sendError(msg string) {
-	respErr := map[string]interface{}{
-		"type":    "error",
-		"code":    "error",
-		"message": msg,
+func (converter *OpenAIResponsesStreamConverter) sendError(code, message string, terminalErr error) error {
+	if converter == nil {
+		return terminalErr
 	}
-
-	converter.sendStreamEvent(respErr, "error")
+	if converter.isTerminal {
+		return converter.terminalErr
+	}
+	converter.isTerminal = true
+	converter.terminalErr = terminalErr
+	response := commonresponses.NewStreamErrorEvent(int64(converter.sequenceNumber), code, message)
+	converter.sequenceNumber++
+	converter.sendStreamEvent(response, "error")
+	return terminalErr
 }
 
 func (converter *OpenAIResponsesStreamConverter) generateResponseItemID(responseType string) {
@@ -586,20 +681,11 @@ func isEmptyChoiceDelta(choice *types.ChatCompletionStreamChoice) bool {
 	}
 
 	return choice.Delta.Content == "" &&
-		choice.Delta.Role == "" &&
+		choice.Delta.Refusal == "" &&
 		choice.Delta.FunctionCall == nil &&
 		len(choice.Delta.ToolCalls) == 0 &&
 		choice.Delta.ReasoningContent == "" &&
 		choice.Delta.Reasoning == "" &&
 		len(choice.Delta.Image) == 0 &&
 		len(choice.Delta.Images) == 0
-}
-
-func isResponsesTerminalEventType(eventType string) bool {
-	switch strings.TrimSpace(eventType) {
-	case "response.completed", "response.failed", "response.incomplete", "response.done":
-		return true
-	default:
-		return false
-	}
 }

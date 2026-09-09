@@ -56,7 +56,8 @@ func (p *BaiduProvider) CreateChatCompletionStream(request *types.ChatCompletion
 	defer req.Body.Close()
 
 	// 发送请求
-	resp, errWithCode := p.Requester.SendRequestRaw(req)
+	streamRequester := p.Requester.ForHTTPProfile(requester.HTTPProfileLongStream)
+	resp, errWithCode := streamRequester.SendRequestRaw(req)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -66,7 +67,7 @@ func (p *BaiduProvider) CreateChatCompletionStream(request *types.ChatCompletion
 		Request: request,
 	}
 
-	return requester.RequestStream[string](p.Requester, resp, chatHandler.handlerStream)
+	return requester.RequestStream[string](streamRequester, resp, chatHandler.handlerStream)
 }
 
 func (p *BaiduProvider) getBaiduChatRequest(request *types.ChatCompletionRequest) (*http.Request, *types.OpenAIErrorWithStatusCode) {
@@ -140,8 +141,11 @@ func (p *BaiduProvider) convertToChatOpenai(response *BaiduChatResponse, request
 		Choices: []types.ChatCompletionChoice{choice},
 		Usage:   response.Usage,
 	}
-
-	*p.Usage = *openaiResponse.Usage
+	if openaiResponse.Usage != nil {
+		openaiResponse.Usage.MarkProviderReported()
+		openaiResponse.Usage.MergeProviderAttribution(response.Model, "")
+		*p.Usage = *openaiResponse.Usage
+	}
 
 	return
 }
@@ -154,6 +158,7 @@ func convertFromChatOpenai(request *types.ChatCompletionRequest) *BaiduChatReque
 		TopP:        request.TopP,
 		// PenaltyScore:    request.FrequencyPenalty,
 		MaxOutputTokens: request.MaxCompletionTokens,
+		DisableSearch:   true,
 	}
 
 	if request.FrequencyPenalty != nil {
@@ -293,7 +298,9 @@ func (h *baiduStreamHandler) convertToOpenaiStream(baiduResponse *BaiduChatStrea
 		}
 	}
 
-	h.Usage.TotalTokens = baiduResponse.Usage.TotalTokens
-	h.Usage.PromptTokens = baiduResponse.Usage.PromptTokens
-	h.Usage.CompletionTokens += baiduResponse.Usage.CompletionTokens
+	if baiduResponse.IsEnd && baiduResponse.Usage != nil {
+		*h.Usage = *baiduResponse.Usage
+		h.Usage.MarkProviderReported()
+		h.Usage.MergeProviderAttribution(baiduResponse.Model, "")
+	}
 }

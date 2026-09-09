@@ -22,8 +22,8 @@ sqlite_busy_timeout: 3000 # sqlite 数据库繁忙超时时间，单位为毫秒
 redis_conn_string: "" # 设置之后将使用指定 Redis 作为缓存，格式为 "redis://default:redispw@localhost:49153"，未设置则不使用 Redis。
 redis_db: 0 # redis 数据库，未设置则不使用 Redis。
 
-memory_cache_enabled: false # 是否启用内存缓存，启用后将缓存部分数据，减少数据库查询次数。
-sync_frequency: 600 # 在启用缓存的情况下与数据库同步配置的频率，单位为秒，默认为 600 秒
+memory_cache_enabled: false # 是否启用用户、渠道等可选内存缓存；全局 Options 的版本发布不依赖此开关。
+sync_frequency: 600 # 可选内存缓存与数据库同步频率，单位为秒；不控制 Options/Price 的版本观察器。
 node_type: "master" # 节点类型，可选值为 "master" 或 "slave"，默认为 "master"。
 frontend_base_url: "" # 设置之后将重定向页面请求到指定的地址，仅限从服务器设置。
 polling_interval: 0 # 批量更新渠道余额以及测试可用性时的请求间隔，单位为秒，默认无间隔。
@@ -46,26 +46,41 @@ realtime:
   allowed_origins: [] # WebSocket Origin 白名单；为空时回退到 cors.allow_origins，若两者都为空则兼容旧行为允许任意 Origin；生产建议配置白名单
   unsafe_allow_credential_subprotocol_any_origin: false # 仅兼容旧浏览器直连；true 时 openai-insecure-api-key.* 子协议可在空/通配 Origin 白名单下使用
   websocket_read_limit: 33554432 # WebSocket 单帧读取上限，默认 32MiB；超限连接会返回静态 invalid_event 后关闭
+  client_frame_queue_max_bytes: 67108864 # 客户端 ingress 队列独立字节预算，默认 64MiB
+  pending_frame_queue_max_bytes: 67108864 # 等待 provider send 的队列独立字节预算，默认 64MiB
+  provider_frame_queue_max_bytes: 67108864 # provider ingress 队列独立字节预算，默认 64MiB
+  attachment_queue_max_bytes: 67108864 # provider session 下游队列独立字节预算，默认 64MiB
   websocket_ping_interval_ms: 25000 # 服务端主动 Ping 周期，默认 25 秒；<=0 仅建议测试禁用
   websocket_write_timeout_ms: 40000 # WebSocket 写超时，默认 40 秒
+realtime_ws:
+  connect_per_user_per_minute: 30 # 同用户所有 token 共用的每分钟建连上限，必须为正数；独立于工作 RPM，Redis 故障时回退到单实例计数
 realtime_websocket_client_ping_interval_ms: 25000 # Realtime 客户端连接主动 Ping 周期，默认 25 秒；<=0 禁用；已建立连接使用创建时配置快照
 realtime_websocket_client_pong_miss_timeout_ms: 0 # Realtime 发出 ping 后未收到对应 pong 的超时；0 禁用；默认依赖业务 idle 回收
 realtime_websocket_client_inbound_activity_timeout_ms: 0 # Realtime 任意客户端入站活动超时；0 禁用；已建立连接使用创建时配置快照
+pricing:
+  required_models: [gpt-5.6, gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna] # 启动 readiness 必需的精确价格；不接受 wildcard，变更后需重启
 responses_websocket_client_ping_interval_ms: 25000 # ResponsesWS 客户端连接主动 Ping 周期，默认 25 秒；<=0 禁用；已建立连接使用创建时配置快照
-responses_websocket_client_pong_miss_timeout_ms: 0 # ResponsesWS 发出 ping 后未收到对应 pong 的超时；0 禁用；默认保持宽松避免误杀
-responses_websocket_client_inbound_activity_timeout_ms: 300000 # ResponsesWS 客户端入站活性超时，默认 5 分钟；0 禁用 watchdog，仅依赖 idle/max lifetime 回收；已建立连接使用创建时配置快照
+responses_websocket_client_pong_miss_timeout_ms: 10000 # ResponsesWS 发出 ping 后未收到对应 pong 的超时；0 显式禁用并在 readiness 中标记 degraded
+responses_websocket_client_inbound_activity_timeout_ms: 60000 # ResponsesWS 客户端入站活性超时；0 显式禁用并在 readiness 中标记 degraded
 responses_ws:
-  connect_per_credential_per_minute: 600 # 每个 credential 每分钟允许的 ResponsesWS 建连尝试数；per minute，窗口/Redis 共享语义同 API RPM limiter，Redis 关闭时进程内限流；显式 -1 表示不限
-  pending_per_credential: 96 # Upgrade 后等待首帧/建连的单凭据 pending 上限；显式 -1 表示不限
-  active_per_credential: 128 # 单凭据已建立 ResponsesWS 连接上限；显式 -1 表示无限
-  active_per_group: 128 # 单分组已建立 ResponsesWS 连接上限；显式 -1 表示无限
-  active_global: 1024 # 全局已建立 ResponsesWS 连接上限；显式 -1 表示无限
+  connect_per_credential_per_minute: 600 # 稳定 user 与 token 同时计数的每分钟建连上限；token 不能绕过 user；显式 -1 表示不限
+  pending_per_credential: 96 # 单 token pending 上限，只能收紧 user 上限；显式 -1 表示不限
+  pending_per_user: 96 # 稳定 user pending 上限；显式 -1 表示不限
+  pending_per_group: 192 # 单分组 pending 上限；显式 -1 表示不限
+  pending_global: 512 # 全局 pending 上限；显式 -1 表示不限
+  pending_bytes_per_credential: 67108864 # 首帧读取期间单 token 实际保留字节上限，默认 64MiB
+  pending_bytes_per_user: 67108864 # 首帧读取期间稳定 user 实际保留字节上限，默认 64MiB
+  pending_bytes_per_group: 134217728 # 首帧读取期间单分组实际保留字节上限，默认 128MiB
+  pending_bytes_global: 268435456 # 首帧读取期间全局实际保留字节上限，默认 256MiB
+  active_per_credential: 16 # 单 token active 上限，只能收紧 user 上限；显式 -1 表示不限
+  active_per_user: 16 # 稳定 user active 上限；显式 -1 表示不限
+  active_per_group: 32 # 单分组已建立 ResponsesWS 连接上限；显式 -1 表示无限
+  active_global: 128 # 全局已建立 ResponsesWS 连接上限；显式 -1 表示无限
   active_lease_redis_fail_open: true # Redis active lease 出错时是否回退进程内计数；多实例容量会短暂失真，false 则拒绝新 active lease
   first_frame_timeout_ms: 30000 # Upgrade 后等待首个 response.create 的超时
-  bridge_open_timeout_ms: 30000 # ResponsesWS HTTP bridge 等待上游 HTTP stream 打开的超时；<=0 禁用 opening watchdog，仍依赖 cancel/request context/client close/max lifetime 回收
   idle_timeout_ms: 1800000 # 已建立 ResponsesWS 连接空闲超时
-  active_turn_timeout_ms: 120000 # 单个 response.create active turn 的 provider inactivity 超时；provider activity 会刷新；<=0 使用默认 2 分钟
-  max_lifetime_ms: 3600000 # 单个 ResponsesWS 连接最长存活时间；显式 0 使用默认 1 小时
+  active_turn_timeout_ms: 120000 # 单个 response.create 的 provider inactivity 超时；0 禁用
+  max_lifetime_ms: 3600000 # 代理施加的连接最长存活时间；0 禁用
   pending_provider_events_max_bytes: 2097152 # send 结果确认前可缓存的上游事件字节上限，默认 2MiB
   unsupported_scan_limit: 0 # 首选渠道不支持 WS 时的显式扫描上限；0/未配置按当前加载渠道数扫描，低于渠道数时命中上限返回 503 scan-limited 而非 426
   allow_anonymous_capacity_bucket: false # 仅测试/本地诊断可开启；生产缺少 token/user 时不进入共享 anonymous bucket
@@ -76,6 +91,8 @@ request_body_decode:
   max_decoder_window_bytes: 134217728 # zstd decoder 允许的最大 window；默认 128MiB 以兼容 Codex，代价是单请求允许更大的解码窗口内存预算
   max_expansion_ratio: 64 # 相对原始 wire body 的整链最大膨胀倍数，用于防止多层压缩炸弹
   max_layers: 2 # 允许的 Content-Encoding 链最大层数
+exact_wire:
+  ingress_owned_headers: [] # 部署身份代理注入且不得转发给上游的自定义 header 名；Pomerium/Vouch/常见身份头已内置阻断
 codex:
   execution_session_revocation_timeout_ms: 200 # Codex execution session revocation 查询超时；超时会收敛为 unknown，并跳过本次 resume
 

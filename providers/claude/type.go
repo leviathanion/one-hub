@@ -160,18 +160,93 @@ type Tools struct {
 }
 
 type Usage struct {
-	InputTokens              int `json:"input_tokens,omitempty"`
-	OutputTokens             int `json:"output_tokens,omitempty"`
-	CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty"`
-	CacheReadInputTokens     int `json:"cache_read_input_tokens,omitempty"`
-	CacheCreation            any `json:"cache_creation,omitempty"`
+	InputTokens              int                 `json:"input_tokens,omitempty"`
+	OutputTokens             int                 `json:"output_tokens,omitempty"`
+	CacheCreationInputTokens int                 `json:"cache_creation_input_tokens,omitempty"`
+	CacheReadInputTokens     int                 `json:"cache_read_input_tokens,omitempty"`
+	ServiceTier              string              `json:"service_tier,omitempty"`
+	Speed                    string              `json:"speed,omitempty"`
+	CacheCreation            *CacheCreationUsage `json:"cache_creation,omitempty"`
 
 	ServerToolUse *ServerToolUse `json:"server_tool_use,omitempty"`
+
+	present                    bool
+	inputTokensPresent         bool
+	outputTokensPresent        bool
+	cacheCreationTokensPresent bool
+	cacheReadTokensPresent     bool
+	serviceTierConflictValue   string
+	speedConflict              bool
+}
+
+type CacheCreationUsage struct {
+	Ephemeral5mInputTokens int `json:"ephemeral_5m_input_tokens"`
+	Ephemeral1hInputTokens int `json:"ephemeral_1h_input_tokens"`
+
+	ephemeral5mPresent bool
+	ephemeral1hPresent bool
+}
+
+func (u *Usage) UnmarshalJSON(data []byte) error {
+	type usageAlias Usage
+	var decoded usageAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*u = Usage(decoded)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err == nil {
+		u.present = fields != nil
+		u.inputTokensPresent = usageIntegerPresent(fields["input_tokens"])
+		u.outputTokensPresent = usageIntegerPresent(fields["output_tokens"])
+		u.cacheCreationTokensPresent = usageIntegerPresent(fields["cache_creation_input_tokens"])
+		u.cacheReadTokensPresent = usageIntegerPresent(fields["cache_read_input_tokens"])
+	}
+	return nil
 }
 
 type ServerToolUse struct {
 	WebSearchRequests int `json:"web_search_requests,omitempty"`
+
+	webSearchRequestsPresent bool
 }
+
+func usageIntegerPresent(raw json.RawMessage) bool {
+	var value *int
+	return len(raw) > 0 && json.Unmarshal(raw, &value) == nil && value != nil
+}
+
+func (u *CacheCreationUsage) UnmarshalJSON(data []byte) error {
+	type alias CacheCreationUsage
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*u = CacheCreationUsage(decoded)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	u.ephemeral5mPresent = usageIntegerPresent(fields["ephemeral_5m_input_tokens"])
+	u.ephemeral1hPresent = usageIntegerPresent(fields["ephemeral_1h_input_tokens"])
+	return nil
+}
+
+func (u *ServerToolUse) UnmarshalJSON(data []byte) error {
+	type alias ServerToolUse
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*u = ServerToolUse(decoded)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	u.webSearchRequestsPresent = usageIntegerPresent(fields["web_search_requests"])
+	return nil
+}
+
 type ClaudeResponse struct {
 	Id           string       `json:"id"`
 	Type         string       `json:"type"`
@@ -184,6 +259,46 @@ type ClaudeResponse struct {
 	Error        *ClaudeError `json:"error,omitempty"`
 
 	Container any `json:"container,omitempty"`
+
+	rawProviderJSON        []byte
+	replayProviderRawJSON  bool
+	captureProviderRawJSON bool
+}
+
+func (r *ClaudeResponse) SetProviderRawJSON(raw []byte) {
+	if r != nil {
+		r.rawProviderJSON = append(r.rawProviderJSON[:0], raw...)
+	}
+}
+
+func (r *ClaudeResponse) ProviderRawJSON() []byte {
+	if r == nil {
+		return nil
+	}
+	return append([]byte(nil), r.rawProviderJSON...)
+}
+
+func (r *ClaudeResponse) EnableProviderRawJSONCapture() {
+	if r != nil {
+		r.captureProviderRawJSON = true
+	}
+}
+
+func (r *ClaudeResponse) CaptureProviderRawJSON() bool {
+	return r != nil && r.captureProviderRawJSON
+}
+
+func (r *ClaudeResponse) EnableProviderRawJSONReplay() {
+	if r != nil {
+		r.replayProviderRawJSON = true
+	}
+}
+
+func (r *ClaudeResponse) ReplayProviderRawJSON() []byte {
+	if r == nil || !r.replayProviderRawJSON {
+		return nil
+	}
+	return r.ProviderRawJSON()
 }
 
 type Delta struct {

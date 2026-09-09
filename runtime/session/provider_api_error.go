@@ -83,6 +83,28 @@ func ProviderAPIErrorFromPayload(payload []byte) *types.OpenAIErrorWithStatusCod
 	}
 }
 
+// OpenAIErrorEnvelopeFromPayload recognizes only the top-level OpenAI error
+// envelope used by Chat and legacy Completions. It deliberately ignores
+// unrelated top-level message/code fields, which remain provider-owned future
+// success fields on exact-wire streams.
+func OpenAIErrorEnvelopeFromPayload(payload []byte) *types.OpenAIErrorWithStatusCode {
+	payload = bytes.TrimSpace(payload)
+	if len(payload) == 0 {
+		return nil
+	}
+	var object map[string]json.RawMessage
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	if err := decoder.Decode(&object); err != nil || !hasProviderAPIOpenAIError(object["error"]) {
+		return nil
+	}
+	restricted, err := json.Marshal(map[string]json.RawMessage{"error": object["error"]})
+	if err != nil {
+		return nil
+	}
+	return ProviderAPIErrorFromPayload(restricted)
+}
+
 type providerAPIErrorDetail struct {
 	ErrType    string
 	Code       string

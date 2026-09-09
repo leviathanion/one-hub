@@ -10,13 +10,9 @@ const (
 	RelayModeMidjourneyBlend
 	RelayModeMidjourneyChange
 	RelayModeMidjourneySimpleChange
-	RelayModeMidjourneyNotify
 	RelayModeMidjourneyTaskFetch
 	RelayModeMidjourneyTaskImageSeed
 	RelayModeMidjourneyTaskFetchByCondition
-	RelayModeAudioSpeech
-	RelayModeAudioTranscription
-	RelayModeAudioTranslation
 	RelayModeMidjourneyAction
 	RelayModeMidjourneyModal
 	RelayModeMidjourneyShorten

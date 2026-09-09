@@ -10,7 +10,7 @@ import (
 	"one-api/types"
 )
 
-func TestChatAdapterResolvesTemperatureTopPConflict(t *testing.T) {
+func TestChatAdapterPreservesSamplingParameters(t *testing.T) {
 	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, "", nil)
 
 	temperature := 0.7
@@ -28,12 +28,11 @@ func TestChatAdapterResolvesTemperatureTopPConflict(t *testing.T) {
 	if converted.Temperature == nil || *converted.Temperature != temperature {
 		t.Fatalf("expected temperature preserved, got %+v", converted.Temperature)
 	}
-	if converted.TopP != nil {
-		t.Fatalf("expected top_p dropped at the adapter boundary, got %v", *converted.TopP)
+	if converted.TopP == nil || *converted.TopP != topP {
+		t.Fatalf("expected top_p preserved, got %+v", converted.TopP)
 	}
 
-	// The synthesized body must satisfy the planner's reject rules: the
-	// planner applies the same rules to every raw body, no relaxation branch.
+	// The shared wire planner preserves both upstream-owned parameters.
 	rawReq, errWithCode := provider.chatResponsesRequestFromTyped(converted)
 	if errWithCode != nil {
 		t.Fatalf("chatResponsesRequestFromTyped returned error: %v", errWithCode.Message)

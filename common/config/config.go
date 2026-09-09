@@ -9,9 +9,12 @@ import (
 	"github.com/spf13/viper"
 )
 
-func InitConf() {
+func InitConf() error {
 	defaultConfig()
 	setEnv()
+	if _, err := RealtimeWSConnectPerUserPerMinute(); err != nil {
+		return err
+	}
 	Language = viper.GetString("language")
 	IsMasterNode = viper.GetString("node_type") != "slave"
 	RequestInterval = time.Duration(viper.GetInt("polling_interval")) * time.Second
@@ -26,11 +29,13 @@ func InitConf() {
 	RequestBodyDecodeMaxDecoderWindowBytes = viper.GetInt64("request_body_decode.max_decoder_window_bytes")
 	RequestBodyDecodeMaxExpansionRatio = viper.GetInt64("request_body_decode.max_expansion_ratio")
 	RequestBodyDecodeMaxLayers = viper.GetInt("request_body_decode.max_layers")
+	ExactWireIngressOwnedHeaders = append([]string(nil), viper.GetStringSlice("exact_wire.ingress_owned_headers")...)
 	GitHubProxy = viper.GetString("github_proxy")
 	MCP_ENABLE = viper.GetBool("mcp.enable") != false
 	UPTIMEKUMA_ENABLE = viper.GetBool("uptime_kuma.enable") != false
 	UPTIMEKUMA_DOMAIN = viper.GetString("uptime_kuma.domain")
 	UPTIMEKUMA_STATUS_PAGE_NAME = viper.GetString("uptime_kuma.status_page_name")
+	return nil
 }
 
 func setEnv() {
@@ -65,13 +70,13 @@ func defaultConfig() {
 	viper.SetDefault("realtime_websocket_client_pong_miss_timeout_ms", 0)
 	viper.SetDefault("realtime_websocket_client_inbound_activity_timeout_ms", 0)
 	viper.SetDefault("realtime.websocket_write_timeout_ms", 40000)
+	viper.SetDefault("realtime_ws.connect_per_user_per_minute", defaultRealtimeWSConnectPerUserPerMinute)
 	viper.SetDefault("responses_ws.connect_per_credential_per_minute", 600)
 	viper.SetDefault("responses_ws.active_lease_redis_fail_open", true)
 	viper.SetDefault("responses_ws.first_frame_timeout_ms", 30000)
-	viper.SetDefault("responses_ws.bridge_open_timeout_ms", 30000)
 	viper.SetDefault("responses_websocket_client_ping_interval_ms", 25000)
-	viper.SetDefault("responses_websocket_client_pong_miss_timeout_ms", 0)
-	viper.SetDefault("responses_websocket_client_inbound_activity_timeout_ms", 300000)
+	viper.SetDefault("responses_websocket_client_pong_miss_timeout_ms", 10000)
+	viper.SetDefault("responses_websocket_client_inbound_activity_timeout_ms", 60000)
 	viper.SetDefault("responses_ws.idle_timeout_ms", 1800000)
 	viper.SetDefault("responses_ws.active_turn_timeout_ms", 120000)
 	viper.SetDefault("responses_ws.max_lifetime_ms", 3600000)
@@ -82,6 +87,7 @@ func defaultConfig() {
 	viper.SetDefault("request_body_decode.max_decoder_window_bytes", int64(128<<20))
 	viper.SetDefault("request_body_decode.max_expansion_ratio", int64(64))
 	viper.SetDefault("request_body_decode.max_layers", 2)
+	viper.SetDefault("exact_wire.ingress_owned_headers", []string{})
 	viper.SetDefault("codex.execution_session_revocation_timeout_ms", 200)
 	viper.SetDefault("mcp.enable", false)
 	viper.SetDefault("uptime_kuma.enable", false)

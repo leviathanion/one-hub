@@ -27,14 +27,10 @@ func TestGeneralDisableRollbackHasNoRoutingOrCacheSideEffects(t *testing.T) {
 	invalidateChannelCodexDerivedCaches = func([]int) { invalidations.Add(1) }
 	t.Cleanup(func() { invalidateChannelCodexDerivedCaches = originalInvalidate })
 
-	updates := 0
-	forcedErr := errors.New("forced zero-value update failure")
+	forcedErr := errors.New("forced metadata update rollback")
 	callback := "test:round22_general_disable_rollback"
-	if err := DB.Callback().Update().Before("gorm:update").Register(callback, func(tx *gorm.DB) {
-		updates++
-		if updates == 2 {
-			tx.AddError(forcedErr)
-		}
+	if err := DB.Callback().Update().After("gorm:update").Before("gorm:commit_or_rollback_transaction").Register(callback, func(tx *gorm.DB) {
+		tx.AddError(forcedErr)
 	}); err != nil {
 		t.Fatalf("register update callback: %v", err)
 	}

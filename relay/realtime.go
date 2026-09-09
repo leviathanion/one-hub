@@ -17,6 +17,7 @@ import (
 	providersBase "one-api/providers/base"
 	"one-api/relay/relay_util"
 	runtimerealtime "one-api/runtime/realtime"
+	runtimesession "one-api/runtime/session"
 	"one-api/types"
 	"strings"
 	"time"
@@ -27,9 +28,11 @@ import (
 
 type RelayModeChatRealtime struct {
 	relayBase
-	userConn *wsconn.ManagedConn
-	session  runtimerealtime.RealtimeSession
-	quota    *relay_util.Quota
+	userConn   *wsconn.ManagedConn
+	session    runtimerealtime.RealtimeSession
+	beforeOpen func() *types.OpenAIErrorWithStatusCode
+	models     runtimesession.ModelBinding
+	workPolicy runtimesession.RealtimeWorkPolicy
 }
 
 func realtimeWebSocketOriginAllowed(r *http.Request) bool {
@@ -188,9 +191,53 @@ func ChatRealtime(c *gin.Context) {
 		return
 	}
 
+	relay := &RelayModeChatRealtime{relayBase: relayBase{c: c}}
+	relay.setOriginalModel(modelName)
+	relay.beforeOpen = relay.acceptClientConnection
+
+	if !relay.getProvider() {
+		return
+	}
+	if relay.session != nil {
+		relay.session.SetTurnObserverFactory(relay_util.NewRealtimeTurnObserverFactory(relay.getContext(), relay.models, relay.workPolicy))
+	}
+
+	bridge := newRealtimeRelayActorWithContext(relay.realtimeOpenContext(), relay.userConn, relay.session, time.Minute*2)
+	bridge.providerPayloadObserver = func(_ wsconn.MessageType, payload []byte) {
+		processProviderPayloadAPIError(relay.c, relay.provider.GetChannel(), payload, "chat_realtime_provider_frame")
+	}
+
+	bridge.Start()
+	var closedBy string
+	select {
+	case <-bridge.UserClosed():
+		closedBy = "user"
+	case <-bridge.SupplierClosed():
+		closedBy = "provider"
+	}
+	bridge.Wait()
+	bridge.Close()
+	logger.LogInfo(c.Request.Context(), fmt.Sprintf("连接由%s关闭", closedBy))
+}
+
+// 渠道准备完成后才申请建连许可和升级；后续安全的上游重试沿用同一连接。
+func (r *RelayModeChatRealtime) acceptClientConnection() *types.OpenAIErrorWithStatusCode {
+	if err := r.workPolicy.CheckFutureWork(r.models, false); err != nil {
+		var apiErr *types.OpenAIErrorWithStatusCode
+		if errors.As(err, &apiErr) {
+			return apiErr
+		}
+		return common.ErrorWrapperLocal(err, "permission_denied", http.StatusForbidden)
+	}
+	if r.userConn != nil {
+		return nil
+	}
+	if apiErr := middleware.AllowRealtimeConnectionAttempt(r.c); apiErr != nil {
+		return apiErr
+	}
 	inboundActivityTimeout := config.RealtimeWebsocketClientInboundActivityTimeout()
 	writeTimeout := config.RealtimeWebsocketWriteTimeout()
-	userConn, err := wsconn.AcceptManaged(c.Writer, c.Request, wsconn.Config{
+	userConn, err := wsconn.AcceptManaged(r.c.Writer, r.c.Request, wsconn.Config{
 		Label:           "client-realtime",
 		PingInterval:    config.RealtimeWebsocketClientPingInterval(),
 		PongMissTimeout: config.RealtimeWebsocketClientPongMissTimeout(),
@@ -201,61 +248,71 @@ func ChatRealtime(c *gin.Context) {
 		WriteTimeout: func() time.Duration { return writeTimeout },
 	}, wsconn.AcceptOptions{
 		CheckOrigin:       realtimeWebSocketOriginAllowed,
-		ResponseHeader:    websocketUpgradeResponseHeader(c.Request),
-		Subprotocols:      echoableClientWebSocketSubprotocols(c.Request),
+		ResponseHeader:    websocketUpgradeResponseHeader(r.c.Request),
+		Subprotocols:      echoableClientWebSocketSubprotocols(r.c.Request),
 		EnableCompression: false,
 	})
 	if err != nil {
 		logger.SysError("realtime websocket upgrade failed: " + err.Error())
-		common.AbortWithMessage(c, http.StatusInternalServerError, "upgrade_failed")
-		return
+		return common.ErrorWrapperLocal(err, "upgrade_failed", http.StatusBadRequest)
 	}
-	relay := &RelayModeChatRealtime{
-		relayBase: relayBase{
-			c: c,
-		},
-		userConn: userConn,
-	}
-	relay.setOriginalModel(modelName)
+	r.userConn = userConn
+	return nil
+}
 
-	if !relay.getProvider() {
-		return
+func (r *RelayModeChatRealtime) openRealtimeSession(provider providersBase.ProviderInterface, modelName string, options runtimerealtime.RealtimeOpenOptions) (runtimerealtime.RealtimeSession, *types.OpenAIErrorWithStatusCode) {
+	models := runtimesession.ModelBinding{
+		RequestedModel:  r.getOriginalModel(),
+		ProviderModel:   modelName,
+		BillingModel:    modelName,
+		BillingOriginal: r.c.GetBool("billing_original_model"),
 	}
-
-	relay.quota = relay_util.NewQuota(relay.getContext(), relay.getModelName(), 0)
-	relay.quota.SetLogProtocol(relay_util.LogProtocolRealtimeWS)
-	if relay.session != nil {
-		// Realtime quota observation lives in the provider session turn observer.
-		relay.session.SetTurnObserverFactory(relay_util.NewRealtimeTurnObserverFactory(relay.quota))
+	if r.c.GetBool("billing_original_model") {
+		models.BillingModel = models.RequestedModel
 	}
-
-	bridge := newRealtimeRelayActorWithContext(relay.realtimeOpenContext(), relay.userConn, relay.session, time.Minute*2)
-	bridge.providerPayloadObserver = func(_ wsconn.MessageType, payload []byte) {
-		processProviderPayloadAPIError(relay.c, relay.provider.GetChannel(), payload, "chat_realtime_provider_frame")
+	mapping, err := provider.GetChannel().GetModelMappingMap()
+	if err != nil {
+		return nil, common.ErrorWrapperLocal(err, "invalid_model_mapping", http.StatusServiceUnavailable)
 	}
-
-	bridge.Start()
-	go func() {
-		var closedBy string
-		select {
-		case <-bridge.UserClosed():
-			closedBy = "user"
-		case <-bridge.SupplierClosed():
-			closedBy = "provider"
+	policy := relay_util.NewRealtimeWorkPolicy(r.c, models, func(requested string) (runtimesession.ModelBinding, error) {
+		if requested == models.RequestedModel {
+			return models, nil
 		}
-
-		logger.LogInfo(relay.c.Request.Context(), fmt.Sprintf("连接由%s关闭", closedBy))
-	}()
-
-	bridge.Wait()
-	bridge.Close()
+		providerModel := requested
+		if mapped := mapping[requested]; mapped != "" {
+			providerModel = mapped
+		}
+		billingModel := providerModel
+		billingOriginal := strings.HasPrefix(providerModel, "+")
+		if billingOriginal {
+			providerModel = strings.TrimPrefix(providerModel, "+")
+			billingModel = requested
+		}
+		return runtimesession.ModelBinding{RequestedModel: requested, ProviderModel: providerModel, BillingModel: billingModel, BillingOriginal: billingOriginal}, nil
+	})
+	r.models, r.workPolicy = models, policy
+	options.Models, options.WorkPolicy = models, policy
+	if r.beforeOpen != nil {
+		if apiErr := r.beforeOpen(); apiErr != nil {
+			return nil, apiErr
+		}
+	}
+	return openRealtimeSessionWithFreshFallback(provider, modelName, options)
 }
 
 func (r *RelayModeChatRealtime) abortWithMessage(message string) {
+	if r != nil && r.userConn == nil && r.c != nil {
+		common.AbortWithMessage(r.c, http.StatusServiceUnavailable, message)
+		return
+	}
 	r.writeAbortPayload(buildRealtimeMessageErrorPayload(message), "system_error")
 }
 
 func (r *RelayModeChatRealtime) abortWithError(apiErr *types.OpenAIErrorWithStatusCode) {
+	if r != nil && r.userConn == nil && r.c != nil && apiErr != nil {
+		common.AbortWithErr(r.c, apiErr.StatusCode, apiErr)
+		return
+	}
 	code := "system_error"
 	if apiErr != nil {
 		code = openAIErrorCodeString(apiErr.Code, code)
@@ -334,15 +391,18 @@ func openAIErrorCodeString(code any, fallback string) string {
 }
 
 func realtimeOpenRetryBudget() int {
-	if config.RetryTimes <= 0 {
+	options := config.GlobalOption.RuntimeSnapshot()
+	retryTimes := options.Int("RetryTimes", config.RetryTimes)
+	if retryTimes <= 0 {
 		return 1
 	}
-	return config.RetryTimes
+	return retryTimes
 }
 
 func (r *RelayModeChatRealtime) getProvider() bool {
 	clientSessionID := realtimeClientSessionIDFromRequest(r.c.Request)
 	preferredChannelID := prepareRealtimeChannelAffinity(r.c, r.getOriginalModel(), clientSessionID)
+	openBudget := realtimeOpenRetryBudget()
 
 	unlockAffinity := channelAffinityLock(r.c, channelAffinityKindRealtime, clientSessionID)
 	defer unlockAffinity()
@@ -351,13 +411,17 @@ func (r *RelayModeChatRealtime) getProvider() bool {
 		if clientSessionID != "" {
 			return r.tryPinnedRealtimeSession(clientSessionID, pinnedChannelID)
 		}
-		return r.openFreshRealtimeSession(clientSessionID, false)
+		return r.openFreshRealtimeSession(clientSessionID, false, openBudget)
 	}
 
 	if explicitChannelPinID(r.c) == 0 && preferredChannelID > 0 {
 		ok, apiErr := r.tryAffinityRealtimeSession(clientSessionID, preferredChannelID)
 		if ok {
 			return true
+		}
+		if apiErr != nil {
+			preferredChannel := model.ChannelGroup.GetChannel(preferredChannelID)
+			observeRelayProviderFailure(r.c, preferredChannel, apiErr)
 		}
 		if currentChannelAffinityStrict(r.c) {
 			if apiErr != nil {
@@ -368,11 +432,21 @@ func (r *RelayModeChatRealtime) getProvider() bool {
 			return false
 		}
 		if apiErr != nil {
+			preferredChannel := model.ChannelGroup.GetChannel(preferredChannelID)
+			if !providerOpenCanRetry(apiErr) || preferredChannel == nil || !shouldRetry(r.c, apiErr, preferredChannel.Type) {
+				r.abortWithError(apiErr)
+				return false
+			}
 			r.excludeRealtimePreferredChannelForCurrentRequest(preferredChannelID, apiErr)
+			openBudget--
+			if openBudget <= 0 {
+				r.abortWithError(apiErr)
+				return false
+			}
 		}
 	}
 
-	return r.openFreshRealtimeSession(clientSessionID, clientSessionID != "")
+	return r.openFreshRealtimeSession(clientSessionID, clientSessionID != "", openBudget)
 }
 
 func (r *RelayModeChatRealtime) realtimeOpenContext() context.Context {
@@ -388,7 +462,6 @@ func (r *RelayModeChatRealtime) tryPinnedRealtimeSession(clientSessionID string,
 		r.abortWithMessage(err.Error())
 		return false
 	}
-
 	provider, modelName, err := prepareProviderForChannel(r.c, r.getOriginalModel(), channel)
 	if err != nil {
 		r.abortWithMessage(err.Error())
@@ -400,7 +473,7 @@ func (r *RelayModeChatRealtime) tryPinnedRealtimeSession(clientSessionID string,
 		return false
 	}
 
-	realtimeSession, apiErr := openRealtimeSessionWithFreshFallback(provider, modelName, runtimerealtime.RealtimeOpenOptions{
+	realtimeSession, apiErr := r.openRealtimeSession(provider, modelName, runtimerealtime.RealtimeOpenOptions{
 		Context:         r.realtimeOpenContext(),
 		ClientSessionID: clientSessionID,
 	})
@@ -409,6 +482,7 @@ func (r *RelayModeChatRealtime) tryPinnedRealtimeSession(clientSessionID string,
 		return true
 	}
 
+	observeRelayProviderFailure(r.c, channel, apiErr)
 	r.abortWithError(apiErr)
 	return false
 }
@@ -416,22 +490,21 @@ func (r *RelayModeChatRealtime) tryPinnedRealtimeSession(clientSessionID string,
 func (r *RelayModeChatRealtime) tryAffinityRealtimeSession(clientSessionID string, preferredChannelID int) (bool, *types.OpenAIErrorWithStatusCode) {
 	channel, err := fetchPreferredRealtimeChannel(r.c, r.getOriginalModel(), preferredChannelID)
 	if err != nil {
-		clearCurrentChannelAffinity(r.c)
+		r.clearUnavailableRealtimeAffinityIfSoft()
 		return false, nil
 	}
-
 	provider, modelName, err := prepareProviderForChannel(r.c, r.getOriginalModel(), channel)
 	if err != nil {
-		clearCurrentChannelAffinity(r.c)
+		r.clearUnavailableRealtimeAffinityIfSoft()
 		return false, nil
 	}
 
 	if !providerSupportsRealtime(provider) {
-		clearCurrentChannelAffinity(r.c)
+		r.clearUnavailableRealtimeAffinityIfSoft()
 		return false, nil
 	}
 
-	realtimeSession, apiErr := openRealtimeSessionWithFreshFallback(provider, modelName, runtimerealtime.RealtimeOpenOptions{
+	realtimeSession, apiErr := r.openRealtimeSession(provider, modelName, runtimerealtime.RealtimeOpenOptions{
 		Context:         r.realtimeOpenContext(),
 		ClientSessionID: clientSessionID,
 	})
@@ -445,6 +518,12 @@ func (r *RelayModeChatRealtime) tryAffinityRealtimeSession(clientSessionID strin
 		fmt.Sprintf("same-channel realtime open failed on channel #%d(%s): %s", channel.Id, channel.Name, apiErr.Error()),
 	)
 	return false, apiErr
+}
+
+func (r *RelayModeChatRealtime) clearUnavailableRealtimeAffinityIfSoft() {
+	if r != nil && !currentChannelAffinityStrict(r.c) {
+		clearCurrentChannelAffinity(r.c)
+	}
 }
 
 func fetchPreferredRealtimeChannel(c *gin.Context, modelName string, preferredChannelID int) (*model.Channel, error) {
@@ -514,11 +593,15 @@ func (r *RelayModeChatRealtime) activateRealtimeSession(provider providersBase.P
 	r.modelName = modelName
 	r.session = realtimeSession
 	metrics.RecordProvider(r.c, 200)
+	refreshChannelAffinityForSelectedModel(r.c, channelAffinityKindRealtime, provider.GetChannel(), r.getOriginalModel())
 	recordCurrentChannelAffinity(r.c, channelAffinityKindRealtime, channelID)
 }
 
-func (r *RelayModeChatRealtime) openFreshRealtimeSession(clientSessionID string, forceFresh bool) bool {
-	retryTimes := realtimeOpenRetryBudget()
+func (r *RelayModeChatRealtime) openFreshRealtimeSession(clientSessionID string, forceFresh bool, retryTimes int) bool {
+	if retryTimes <= 0 {
+		r.abortWithMessage("get provider failed")
+		return false
+	}
 
 	for i := retryTimes; i > 0; i-- {
 		if err := r.setProvider(r.getOriginalModel()); err != nil {
@@ -536,7 +619,7 @@ func (r *RelayModeChatRealtime) openFreshRealtimeSession(clientSessionID string,
 			continue
 		}
 
-		realtimeSession, apiErr := openRealtimeSessionWithFreshFallback(r.provider, r.modelName, runtimerealtime.RealtimeOpenOptions{
+		realtimeSession, apiErr := r.openRealtimeSession(r.provider, r.modelName, runtimerealtime.RealtimeOpenOptions{
 			Context:         r.realtimeOpenContext(),
 			ClientSessionID: clientSessionID,
 			ForceFresh:      forceFresh,
@@ -546,7 +629,8 @@ func (r *RelayModeChatRealtime) openFreshRealtimeSession(clientSessionID string,
 			return true
 		}
 
-		if !shouldRetry(r.c, apiErr, channel.Type) {
+		observeRelayProviderFailure(r.c, channel, apiErr)
+		if !providerOpenCanRetry(apiErr) || !shouldRetry(r.c, apiErr, channel.Type) {
 			logger.LogError(r.c.Request.Context(), fmt.Sprintf("using channel #%d(%s) Error: %s without retry", channel.Id, channel.Name, apiErr.Error()))
 			r.abortWithError(apiErr)
 			return false

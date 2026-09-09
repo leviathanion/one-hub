@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +20,72 @@ import (
 
 	"go.uber.org/zap"
 )
+
+func TestCodexCredentialRotationAndSnapshotsAreSerialized(t *testing.T) {
+	credentials := &OAuth2Credentials{
+		AccessToken:  "expired-access",
+		RefreshToken: "refresh-token",
+		ExpiresAt:    time.Now().Add(-time.Minute),
+	}
+	key, err := credentials.ToJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := CodexProviderFactory{}.Create(&model.Channel{Key: key}).(*CodexProvider)
+
+	originalRefresh := refreshOAuthCredentials
+	var refreshCalls atomic.Int32
+	refreshOAuthCredentials = func(credentials *OAuth2Credentials, _ context.Context, _ string) error {
+		refreshCalls.Add(1)
+		time.Sleep(time.Millisecond)
+		credentials.AccessToken = "fresh-access"
+		credentials.RefreshToken = "fresh-refresh"
+		credentials.ExpiresAt = time.Now().Add(time.Hour)
+		return nil
+	}
+	t.Cleanup(func() { refreshOAuthCredentials = originalRefresh })
+
+	const callers = 24
+	start := make(chan struct{})
+	results := make(chan string, callers)
+	var wait sync.WaitGroup
+	for range callers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			token, err := provider.getToken(context.Background())
+			if err != nil {
+				results <- "error:" + err.Error()
+				return
+			}
+			results <- token
+		}()
+	}
+	for range callers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			_ = provider.credentialsSnapshot()
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+
+	for token := range results {
+		if token != "fresh-access" {
+			t.Fatalf("concurrent token result = %q", token)
+		}
+	}
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("OAuth refresh calls = %d, want 1", got)
+	}
+	if snapshot := provider.credentialsSnapshot(); snapshot == nil || snapshot.AccessToken != "fresh-access" {
+		t.Fatalf("published credential snapshot = %+v", snapshot)
+	}
+}
 
 type codexErrReadCloser struct{}
 
@@ -95,13 +163,6 @@ func TestCodexBaseHelperFunctionsAndHeaderFallbacks(t *testing.T) {
 	if DefaultUserAgent() != defaultUserAgent {
 		t.Fatalf("expected DefaultUserAgent to expose codex default, got %q", DefaultUserAgent())
 	}
-	if got := normalizeCodexModelName(" gpt-5-turbo "); got != "gpt-5" {
-		t.Fatalf("expected gpt-5-* models to normalize to gpt-5, got %q", got)
-	}
-	if got := normalizeCodexModelName("gpt-5-codex"); got != "gpt-5-codex" {
-		t.Fatalf("expected gpt-5-codex to remain stable, got %q", got)
-	}
-
 	if prepared := prepareChannelForProvider(nil); prepared != nil {
 		t.Fatalf("expected nil channel preparation to stay nil, got %#v", prepared)
 	}
@@ -119,7 +180,7 @@ func TestCodexBaseHelperFunctionsAndHeaderFallbacks(t *testing.T) {
 	}
 
 	key := `{"access_token":"access-token","account_id":"acct-123"}`
-	provider := newTestCodexProviderWithContext(t, key, `{"websocket_mode":"auto"}`, map[string]string{
+	provider := newTestCodexProviderWithContext(t, key, `{"execution_session_ttl_seconds":600}`, map[string]string{
 		"Version":             "2026-03-28",
 		"OpenAI-Beta":         "responses=v1",
 		"X-Session-Id":        "session-123",
@@ -144,14 +205,14 @@ func TestCodexBaseHelperFunctionsAndHeaderFallbacks(t *testing.T) {
 	}
 
 	options := provider.getChannelOptions()
-	if options == nil || options.WebsocketMode != "auto" {
+	if options == nil || options.ExecutionSessionTTLSeconds != 600 {
 		t.Fatalf("expected codex channel options to decode once, got %+v", options)
 	}
 	if provider.getChannelOptions() != options {
 		t.Fatal("expected codex channel options to be cached")
 	}
 
-	provider.channelOptions = &codexChannelOptions{WebsocketMode: "cached"}
+	provider.channelOptions = &codexChannelOptions{ExecutionSessionTTLSeconds: 1200}
 	provider.channelOptionsLoaded = true
 	provider.syncRuntimeChannel(&model.Channel{Id: 43, Key: key})
 	if provider.Channel == nil || provider.Channel.Id != 43 || provider.channelOptions != nil || provider.channelOptionsLoaded {
@@ -176,28 +237,52 @@ func TestCodexBaseHelperFunctionsAndHeaderFallbacks(t *testing.T) {
 		t.Fatalf("expected replaceHeader to normalize header map entries, got %+v", fallbackHeaders)
 	}
 
-	if errWithCode := provider.handleTokenError(errors.New("token expired")); errWithCode == nil || errWithCode.StatusCode != http.StatusUnauthorized || errWithCode.Code != "codex_token_error" || errWithCode.Message != safeCodexTokenClientMessage {
-		t.Fatalf("expected handleTokenError to wrap unauthorized token failures, got %+v", errWithCode)
+	if errWithCode := provider.handleTokenError(errors.New("database unavailable")); errWithCode == nil || errWithCode.StatusCode != http.StatusServiceUnavailable || !errWithCode.LocalError || !errWithCode.UpstreamNotAttempted || errWithCode.ProviderAuthRejected || errWithCode.Code != "codex_token_error" || errWithCode.Message != codexTokenUnavailableClientMessage {
+		t.Fatalf("expected handleTokenError to keep local failures local, got %+v", errWithCode)
 	}
 }
 
-const safeCodexTokenClientMessage = "Codex token refresh failed; please check channel OAuth credentials"
-
-func assertSafeCodexTokenClientError(t *testing.T, errWithCode *types.OpenAIErrorWithStatusCode) {
+func assertLocalCodexTokenClientError(t *testing.T, errWithCode *types.OpenAIErrorWithStatusCode) {
 	t.Helper()
 	if errWithCode == nil {
 		t.Fatal("expected codex token error")
 	}
-	if errWithCode.StatusCode != http.StatusUnauthorized || errWithCode.Code != "codex_token_error" || errWithCode.Type != "codex_token_error" {
+	if errWithCode.StatusCode != http.StatusServiceUnavailable || !errWithCode.LocalError || !errWithCode.UpstreamNotAttempted || errWithCode.ProviderAuthRejected || errWithCode.Code != "codex_token_error" || errWithCode.Type != "codex_token_error" {
 		t.Fatalf("expected codex token error envelope, got %+v", errWithCode)
 	}
-	if errWithCode.Message != safeCodexTokenClientMessage {
-		t.Fatalf("expected safe codex token message %q, got %q", safeCodexTokenClientMessage, errWithCode.Message)
+	if errWithCode.Message != codexTokenUnavailableClientMessage {
+		t.Fatalf("expected safe codex token message %q, got %q", codexTokenUnavailableClientMessage, errWithCode.Message)
 	}
 	for _, leaked := range []string{"token expired", "refresh-secret", "access-secret"} {
 		if strings.Contains(errWithCode.Message, leaked) {
 			t.Fatalf("expected codex token client message not to leak %q, got %q", leaked, errWithCode.Message)
 		}
+	}
+}
+
+func TestCodexTokenErrorDispositionUsesTypedEvidence(t *testing.T) {
+	provider := &CodexProvider{}
+	for _, test := range []struct {
+		name             string
+		err              error
+		wantStatus       int
+		wantLocal        bool
+		wantNotAttempted bool
+		wantAuth         bool
+		wantMessage      string
+	}{
+		{name: "database failure", err: errors.New("database unavailable"), wantStatus: http.StatusServiceUnavailable, wantLocal: true, wantNotAttempted: true, wantMessage: codexTokenUnavailableClientMessage},
+		{name: "refresh in progress", err: ErrCredentialRefreshInProgress, wantStatus: http.StatusServiceUnavailable, wantLocal: true, wantNotAttempted: true, wantMessage: codexTokenUnavailableClientMessage},
+		{name: "local persistence after rotation", err: errors.Join(errCodexCredentialPersistence, ErrCredentialReauthorizationRequired), wantStatus: http.StatusServiceUnavailable, wantLocal: true, wantNotAttempted: true, wantMessage: codexTokenUnavailableClientMessage},
+		{name: "ambiguous oauth exchange", err: ErrOAuthRefreshOutcomeAmbiguous, wantStatus: http.StatusUnauthorized, wantAuth: true, wantMessage: codexTokenReauthorizationClientMessage},
+		{name: "reauthorization breaker", err: ErrOAuthCredentialsRequireReauthorization, wantStatus: http.StatusUnauthorized, wantAuth: true, wantMessage: codexTokenReauthorizationClientMessage},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			apiErr := provider.handleTokenError(test.err)
+			if apiErr.StatusCode != test.wantStatus || apiErr.LocalError != test.wantLocal || apiErr.UpstreamNotAttempted != test.wantNotAttempted || apiErr.ProviderAuthRejected != test.wantAuth || apiErr.Message != test.wantMessage {
+				t.Fatalf("unexpected token error disposition: %+v", apiErr)
+			}
+		})
 	}
 }
 
@@ -214,7 +299,7 @@ func TestCodexTokenErrorSurfaceUsesSafeClientMessageAcrossEntrypoints(t *testing
 		if req != nil {
 			t.Fatalf("expected responses request build to fail on token error, got %#v", req)
 		}
-		assertSafeCodexTokenClientError(t, errWithCode)
+		assertLocalCodexTokenClientError(t, errWithCode)
 	})
 
 	t.Run("responses websocket", func(t *testing.T) {
@@ -232,7 +317,7 @@ func TestCodexTokenErrorSurfaceUsesSafeClientMessageAcrossEntrypoints(t *testing
 		if plan != nil {
 			t.Fatalf("expected websocket plan preparation to fail on token error, got %#v", plan)
 		}
-		assertSafeCodexTokenClientError(t, errWithCode)
+		assertLocalCodexTokenClientError(t, errWithCode)
 	})
 
 	t.Run("realtime", func(t *testing.T) {
@@ -243,7 +328,7 @@ func TestCodexTokenErrorSurfaceUsesSafeClientMessageAcrossEntrypoints(t *testing
 		if plan != nil {
 			t.Fatalf("expected realtime plan preparation to fail on token error, got %#v", plan)
 		}
-		assertSafeCodexTokenClientError(t, errWithCode)
+		assertLocalCodexTokenClientError(t, errWithCode)
 	})
 }
 

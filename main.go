@@ -5,6 +5,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"one-api/cli"
 	"one-api/common"
@@ -14,6 +15,7 @@ import (
 	"one-api/common/notify"
 	"one-api/common/oidc"
 	"one-api/common/redis"
+	"one-api/common/requestctx"
 	"one-api/common/requester"
 	"one-api/common/search"
 	"one-api/common/storage"
@@ -49,7 +51,10 @@ var indexPage []byte
 
 func main() {
 	cli.InitCli()
-	config.InitConf()
+	if err := config.InitConf(); err != nil {
+		log.Fatal("配置错误: ", err)
+	}
+	requestctx.ConfigureExactWireOwnedRequestHeaders(config.ExactWireIngressOwnedHeaders)
 	metrics.InitRequestBodyDecodeMetrics()
 	if viper.GetString("log_level") == "debug" {
 		config.Debug = true
@@ -95,7 +100,6 @@ func main() {
 	// Initialize Telegram bot
 	telegram.InitTelegramBot()
 
-	controller.InitMidjourneyTask()
 	task.InitTask()
 	notify.InitNotifier()
 	cron.InitCron()

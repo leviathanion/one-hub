@@ -1,15 +1,28 @@
 package model
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
+	"github.com/google/uuid"
 	"gorm.io/datatypes"
+	"gorm.io/gorm"
 )
 
+var taskOwnerSchemaColumns = []string{
+	"id", "owner_id", "task_id", "platform", "user_id", "channel_id",
+	"provider_state", "provider_namespace", "provider_task_scope_incarnation", "request_fingerprint",
+	"submission_claim_id", "acceptance_recorded_at", "version", "next_action_at",
+	"reserved_quota", "charged_quota", "settlement_decision", "owner_closed_at",
+}
+
 const (
-	TaskPlatformSuno  = "suno"
-	TaskPlatformKling = "kling"
+	TaskPlatformSuno       = "suno"
+	TaskPlatformKling      = "kling"
+	TaskPlatformMidjourney = "midjourney"
 )
 
 var ErrTaskLookupConflict = errors.New("task lookup conflict")
@@ -17,24 +30,35 @@ var ErrTaskLookupConflict = errors.New("task lookup conflict")
 type TaskStatus string
 
 const (
-	TaskStatusNotStart   TaskStatus = "NOT_START"
-	TaskStatusSubmitted             = "SUBMITTED"
-	TaskStatusQueued                = "QUEUED"
-	TaskStatusInProgress            = "IN_PROGRESS"
-	TaskStatusFailure               = "FAILURE"
-	TaskStatusSuccess               = "SUCCESS"
-	TaskStatusUnknown               = "UNKNOWN"
+	TaskStatusNotStart     TaskStatus = "NOT_START"
+	TaskStatusSubmitted               = "SUBMITTED"
+	TaskStatusQueued                  = "QUEUED"
+	TaskStatusInProgress              = "IN_PROGRESS"
+	TaskStatusFailure                 = "FAILURE"
+	TaskStatusCancel                  = "CANCEL"
+	TaskStatusSuccess                 = "SUCCESS"
+	TaskStatusLocalFailure            = "LOCAL_FAILURE"
+	TaskStatusUnknown                 = "UNKNOWN"
+)
+
+type TaskProviderState string
+
+const (
+	TaskProviderStatePrepared      TaskProviderState = "prepared"
+	TaskProviderStateSubmitStarted TaskProviderState = "submit_started"
+	TaskProviderStateAccepted      TaskProviderState = "accepted"
+	TaskProviderStateClosed        TaskProviderState = "closed"
 )
 
 type Task struct {
-	ID         int64          `json:"id" gorm:"primary_key;AUTO_INCREMENT"`
+	ID         int64          `json:"id" gorm:"primary_key;AUTO_INCREMENT;index:idx_tasks_progress,priority:3"`
+	OwnerID    string         `json:"-" gorm:"type:varchar(36);not null;uniqueIndex"`
 	CreatedAt  int64          `json:"created_at" gorm:"index"`
 	UpdatedAt  int64          `json:"updated_at"`
-	TaskID     string         `json:"task_id" gorm:"type:varchar(50);index"`  // 第三方id，不一定有/ song id\ Task id
-	Platform   string         `json:"platform" gorm:"type:varchar(30);index"` // 平台
-	UserId     int            `json:"user_id" gorm:"index"`
+	TaskID     *string        `json:"task_id" gorm:"type:varchar(191);index;uniqueIndex:idx_task_provider_identity,priority:3;uniqueIndex:idx_task_public_identity,priority:3"`
+	Platform   string         `json:"platform" gorm:"type:varchar(30);index;uniqueIndex:idx_task_public_identity,priority:1"` // task family
+	UserId     int            `json:"user_id" gorm:"index;uniqueIndex:idx_task_public_identity,priority:2"`
 	ChannelId  int            `json:"channel_id" gorm:"index"`
-	Quota      int            `json:"quota"`
 	Action     string         `json:"action" gorm:"type:varchar(40);index"` // 任务类型, song, lyrics, description-mode
 	Status     TaskStatus     `json:"status" gorm:"type:varchar(20);index"` // 任务状态
 	FailReason string         `json:"fail_reason"`
@@ -42,15 +66,93 @@ type Task struct {
 	StartTime  int64          `json:"start_time" gorm:"index"`
 	FinishTime int64          `json:"finish_time" gorm:"index"`
 	Progress   int            `json:"progress"`
-	Properties datatypes.JSON `json:"properties" gorm:"type:json"`
 	Data       datatypes.JSON `json:"data" gorm:"type:json"`
-	NotifyHook string         `json:"notify_hook"`
 	TokenID    int            `json:"token_id" gorm:"default:0"`
+
+	ProviderState                TaskProviderState `json:"-" gorm:"type:varchar(20);index:idx_tasks_progress,priority:1"`
+	ProviderNamespace            string            `json:"-" gorm:"type:varchar(64);not null;uniqueIndex:idx_task_provider_identity,priority:1"`
+	ProviderTaskScopeIncarnation string            `json:"-" gorm:"type:varchar(191);not null;uniqueIndex:idx_task_provider_identity,priority:2"`
+	RequestFingerprint           string            `json:"-" gorm:"type:char(64);not null"`
+	SubmissionClaimID            string            `json:"-" gorm:"type:varchar(36)"`
+	AcceptanceRecordedAt         *int64            `json:"-"`
+	Version                      uint64            `json:"-" gorm:"not null;default:0"`
+	NextActionAt                 int64             `json:"-" gorm:"not null;index:idx_tasks_progress,priority:2"`
+	ReservedQuota                int64             `json:"-" gorm:"not null;default:0"`
+	TokenQuotaApplied            bool              `json:"-" gorm:"not null;default:false"`
+	ChargedQuota                 *int64            `json:"-"`
+	SettlementDecision           string            `json:"-" gorm:"type:varchar(24)"`
+	BalanceApplyOutcome          string            `json:"-" gorm:"type:varchar(32)"`
+	SubmitStartedAt              *int64            `json:"-"`
+	OwnerClosedAt                *int64            `json:"-"`
+}
+
+func (task *Task) BeforeCreate(_ *gorm.DB) error {
+	if task == nil {
+		return errors.New("task is required")
+	}
+	if strings.TrimSpace(task.OwnerID) == "" {
+		task.OwnerID = uuid.NewString()
+	}
+	return nil
+}
+
+func (task *Task) FinalQuota() int {
+	if task == nil || task.ChargedQuota == nil {
+		return 0
+	}
+	return int(*task.ChargedQuota)
+}
+
+func (task Task) MarshalJSON() ([]byte, error) {
+	type storedTask Task
+	return json.Marshal(struct {
+		storedTask
+		Quota int `json:"quota"`
+	}{storedTask(task), task.FinalQuota()})
+}
+
+func TaskProviderID(task *Task) string {
+	if task == nil || task.TaskID == nil {
+		return ""
+	}
+	return strings.TrimSpace(*task.TaskID)
+}
+
+func SetTaskProviderID(task *Task, providerTaskID string) {
+	if task == nil {
+		return
+	}
+	providerTaskID = strings.TrimSpace(providerTaskID)
+	if providerTaskID == "" {
+		task.TaskID = nil
+		return
+	}
+	task.TaskID = &providerTaskID
+}
+
+func CheckTaskOwnerSchema(ctx context.Context) error {
+	if DB == nil {
+		return errors.New("database is not initialized")
+	}
+	db := DB.WithContext(normalizeModelContext(ctx))
+	if err := requireProjectionColumnsRemoved(db, "tasks", taskProjectionColumns); err != nil {
+		return err
+	}
+	var tasks []Task
+	if err := db.Select(taskOwnerSchemaColumns).Limit(1).Find(&tasks).Error; err != nil {
+		return err
+	}
+	for _, index := range []string{"idx_tasks_owner_id", "idx_tasks_progress", "idx_task_provider_identity", "idx_task_public_identity"} {
+		if !db.Migrator().HasIndex(&Task{}, index) {
+			return fmt.Errorf("task owner schema is missing index %s", index)
+		}
+	}
+	return nil
 }
 
 func GetTaskByTaskIds(platform string, userId int, taskIds []string) (task []*Task, err error) {
 	// 最多返回100个任务
-	err = DB.Omit("channel_id", "quota", "user_id").Where("platform = ? and user_id = ? and task_id in (?)", platform, userId, taskIds).Limit(100).
+	err = DB.Omit("channel_id", "charged_quota", "user_id").Where("platform = ? and user_id = ? and task_id in (?)", platform, userId, taskIds).Limit(100).
 		Find(&task).Error
 	if err != nil {
 		return nil, err
@@ -60,17 +162,12 @@ func GetTaskByTaskIds(platform string, userId int, taskIds []string) (task []*Ta
 		if item == nil {
 			continue
 		}
-		if _, ok := seen[item.TaskID]; ok {
-			return nil, fmt.Errorf("%w: platform=%s user_id=%d task_id=%s", ErrTaskLookupConflict, platform, userId, item.TaskID)
+		providerTaskID := TaskProviderID(item)
+		if _, ok := seen[providerTaskID]; ok {
+			return nil, fmt.Errorf("%w: platform=%s user_id=%d task_id=%s", ErrTaskLookupConflict, platform, userId, providerTaskID)
 		}
-		seen[item.TaskID] = struct{}{}
+		seen[providerTaskID] = struct{}{}
 	}
-
-	return
-}
-
-func GetTaskActionByTaskIds(platform string, taskIds []string) (task []*Task, err error) {
-	err = DB.Select("id,action,task_id").Where("platform = ? and task_id in (?)", platform, taskIds).Find(&task).Error
 
 	return
 }
@@ -89,62 +186,6 @@ func GetTaskByTaskId(platform string, userId int, taskId string) (task *Task, er
 	}
 
 	return tasks[0], nil
-}
-
-func (task *Task) Insert() error {
-	return DB.Create(task).Error
-}
-
-func (task *Task) Update() error {
-	return DB.Save(task).Error
-}
-
-func (task *Task) UpdateFields(params map[string]any) error {
-	if task.ID == 0 {
-		return errors.New("task id 为空！")
-	}
-	return DB.Model(&Task{}).Where("id = ?", task.ID).Updates(params).Error
-}
-
-func (task *Task) Delete() error {
-	return DB.Delete(task).Error
-}
-
-func TaskBulkUpdate(TaskIds []string, params map[string]any) error {
-	if len(TaskIds) == 0 {
-		return nil
-	}
-	return DB.Model(&Task{}).
-		Where("task_id in (?)", TaskIds).
-		Updates(params).Error
-}
-
-func TaskBulkUpdateByTaskIds(taskIDs []int64, params map[string]any) error {
-	if len(taskIDs) == 0 {
-		return nil
-	}
-	return DB.Model(&Task{}).
-		Where("id in (?)", taskIDs).
-		Updates(params).Error
-}
-
-func TaskBulkUpdateByID(ids []int64, params map[string]any) error {
-	if len(ids) == 0 {
-		return nil
-	}
-	return DB.Model(&Task{}).
-		Where("id in (?)", ids).
-		Updates(params).Error
-}
-
-func GetAllUnFinishSyncTasks(limit int) []*Task {
-	var tasks []*Task
-	// get all tasks progress is not 100%
-	err := DB.Where("progress != ?", "100").Limit(limit).Order("id").Find(&tasks).Error
-	if err != nil {
-		return nil
-	}
-	return tasks
 }
 
 type TaskQueryParams struct {

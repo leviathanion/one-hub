@@ -8,7 +8,6 @@ import (
 
 	"one-api/common/codexpolicy"
 	"one-api/common/config"
-	runtimesession "one-api/runtime/session"
 )
 
 const InvalidChannelRuntimeConfigCode = "invalid_channel_runtime_config"
@@ -64,19 +63,29 @@ func (channel *Channel) ValidateRuntimeConfigJSONWithType(channelType int) error
 	if err := validateOptionalJSONStringMap("model_headers", modelHeaders); err != nil {
 		return err
 	}
+	if _, err := channel.HeaderIdentity(); err != nil {
+		return err
+	}
 	if channelType == config.ChannelTypeCodex && !jsonObjectStringEmpty(modelHeaders) {
 		return fmt.Errorf("model_headers is not supported for Codex channels; use other.codex structured policy")
 	}
 	if err := validateOptionalJSONObject("custom_parameter", channel.GetCustomParameter()); err != nil {
 		return err
 	}
+	if err := validateCustomParameterRoutingIdentity(channel.GetCustomParameter()); err != nil {
+		return err
+	}
 	if err := validateChannelOtherJSON(channel.Other); err != nil {
 		return err
 	}
 	if channelType == config.ChannelTypeCustom {
-		if err := validateCustomChannelClaudePlugin(channel); err != nil {
+		if _, err := channel.CustomResponsesEndpointIdentity(); err != nil {
 			return err
 		}
+		if err := channel.validateEndpointConfig(); err != nil {
+			return err
+		}
+
 	}
 	if channelType == config.ChannelTypeCodex {
 		if err := validateCodexChannelOther(channel.Other); err != nil {
@@ -93,6 +102,9 @@ func (channel *Channel) ValidateRuntimeConfigJSONWithType(channelType int) error
 			return err
 		}
 	}
+	if IsOpenAIDataResidencyChannel(channel) {
+		return fmt.Errorf("OpenAI data-residency endpoints are not supported")
+	}
 	if err := validateProviderKnownOtherFields(channelType, channel.Other); err != nil {
 		return err
 	}
@@ -105,6 +117,95 @@ func (channel *Channel) ValidateRuntimeConfigJSONWithType(channelType int) error
 	return nil
 }
 
+func validateCustomParameterRoutingIdentity(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "{}" {
+		return nil
+	}
+	var value interface{}
+	if json.Unmarshal([]byte(raw), &value) != nil {
+		return nil
+	}
+	var walk func(interface{}) bool
+	walk = func(current interface{}) bool {
+		switch typed := current.(type) {
+		case map[string]interface{}:
+			for key, child := range typed {
+				if strings.EqualFold(strings.TrimSpace(key), "prompt_cache_key") {
+					return true
+				}
+				if strings.EqualFold(strings.TrimSpace(key), "remove_params") {
+					if entries, ok := child.([]interface{}); ok {
+						for _, entry := range entries {
+							if path, ok := entry.(string); ok && strings.EqualFold(strings.TrimSpace(path), "prompt_cache_key") {
+								return true
+							}
+						}
+					}
+				}
+				if walk(child) {
+					return true
+				}
+			}
+		case []interface{}:
+			for _, child := range typed {
+				if walk(child) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if walk(value) {
+		return fmt.Errorf("custom_parameter cannot modify prompt_cache_key; use the request field or a routing hint")
+	}
+	return nil
+}
+
+// IsOpenAIDataResidencyChannel identifies a regional OpenAI authority when the
+// channel uses the OpenAI-compatible adapter. Custom channels share that
+// adapter, so changing only the channel label must not bypass this endpoint
+// boundary.
+func IsOpenAIDataResidencyChannel(channel *Channel) bool {
+	if channel == nil {
+		return false
+	}
+	switch channel.Type {
+	case config.ChannelTypeOpenAI, config.ChannelTypeCustom:
+		return IsOpenAIDataResidencyBaseURL(channel.GetBaseURL())
+	default:
+		return false
+	}
+}
+
+func IsOpenAIDataResidencyBaseURL(baseURL string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	return host != "api.openai.com" && strings.HasSuffix(host, ".api.openai.com")
+}
+
+// IsOfficialOpenAIBaseURL identifies the single upstream authority registered
+// for OpenAI exact-wire handling. Compatible and regional endpoints remain
+// adapter paths even when their channel type is OpenAI.
+func IsOfficialOpenAIBaseURL(baseURL string) bool {
+	baseURL = strings.TrimSpace(baseURL)
+	if baseURL == "" {
+		return true
+	}
+	parsed, err := url.Parse(strings.TrimRight(baseURL, "/"))
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(parsed.Scheme, "https") &&
+		strings.EqualFold(parsed.Hostname(), "api.openai.com") &&
+		(parsed.Port() == "" || parsed.Port() == "443") &&
+		(parsed.Path == "" || parsed.Path == "/") &&
+		parsed.RawQuery == "" && parsed.Fragment == "" && parsed.User == nil
+}
+
 func validateChannelOtherJSON(raw string) error {
 	parsed, err := parseOptionalJSONObject("other", raw)
 	if err != nil {
@@ -113,24 +214,16 @@ func validateChannelOtherJSON(raw string) error {
 	if len(parsed) == 0 {
 		return nil
 	}
-	if rawTransport, ok := parsed["responses_ws_transport"]; ok {
-		if err := validateCodexResponsesWSTransportField("other.responses_ws_transport", rawTransport); err != nil {
-			return err
-		}
-	}
-	if rawNative, ok := parsed["responses_ws_native"]; ok {
-		if err := validateJSONBoolField("other.responses_ws_native", rawNative); err != nil {
-			return err
-		}
-	}
 	if rawSelfHosted, ok := parsed["self_hosted"]; ok {
 		if err := validateJSONBoolField("other.self_hosted", rawSelfHosted); err != nil {
 			return err
 		}
 	}
-	if rawResponsesWSSelfHosted, ok := parsed["responses_ws_self_hosted"]; ok {
-		if err := validateJSONBoolField("other.responses_ws_self_hosted", rawResponsesWSSelfHosted); err != nil {
-			return err
+	for _, field := range []string{"responses_ws_native", "responses_ws_self_hosted", "responses_stored_lifecycle"} {
+		if raw, ok := parsed[field]; ok {
+			if err := validateJSONBoolField("other."+field, raw); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -177,7 +270,6 @@ func parseOptionalJSONObject(fieldName, raw string) (map[string]json.RawMessage,
 
 type AzureChannelOther struct {
 	APIVersion            string `json:"api_version"`
-	ResponsesWSTransport  string `json:"responses_ws_transport,omitempty"`
 	SelfHosted            *bool  `json:"self_hosted,omitempty"`
 	ResponsesWSSelfHosted *bool  `json:"responses_ws_self_hosted,omitempty"`
 }
@@ -209,12 +301,6 @@ func parseAzureChannelOtherObject(raw string) (AzureChannelOther, map[string]jso
 			if options.APIVersion == "" {
 				return AzureChannelOther{}, nil, fmt.Errorf("%s must be a non-empty string", fieldName)
 			}
-		case "responses_ws_transport":
-			mode, err := runtimesession.ParseResponsesWSTransportField(value)
-			if err != nil {
-				return AzureChannelOther{}, nil, fmt.Errorf("%s %w", fieldName, err)
-			}
-			options.ResponsesWSTransport = runtimesession.ResponsesWSTransportConfigValue(mode)
 		case "self_hosted":
 			var selfHosted bool
 			if err := json.Unmarshal(value, &selfHosted); err != nil {
@@ -274,6 +360,25 @@ func (channel *Channel) GetOtherStringField(fieldName string) (string, error) {
 	return strings.TrimSpace(value), nil
 }
 
+func (channel *Channel) GetOtherBoolField(fieldName string) (bool, error) {
+	if channel == nil {
+		return false, nil
+	}
+	other, err := channel.GetOtherMap()
+	if err != nil {
+		return false, err
+	}
+	raw, ok := other[fieldName]
+	if !ok || len(raw) == 0 || strings.TrimSpace(string(raw)) == "null" {
+		return false, nil
+	}
+	var value bool
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return false, fmt.Errorf("other.%s must be a boolean: %w", fieldName, err)
+	}
+	return value, nil
+}
+
 func validateAzureChannelOther(raw string) error {
 	_, err := ParseAzureChannelOther(raw)
 	return err
@@ -282,7 +387,7 @@ func validateAzureChannelOther(raw string) error {
 func validateProviderKnownOtherFields(channelType int, raw string) error {
 	switch channelType {
 	case config.ChannelTypeOpenAI, config.ChannelTypeCustom, config.ChannelTypeAzureV1:
-		return validateKnownOtherFields(raw, nil, nil)
+		return validateKnownOtherFields(raw, []string{"responses_ws_native", "responses_ws_self_hosted", "responses_stored_lifecycle"}, nil)
 	case config.ChannelTypeAli:
 		return validateKnownOtherFields(raw, []string{"dashscope_plugin"}, []string{"dashscope_plugin"})
 	case config.ChannelTypeGemini, config.ChannelTypeXunfei:
@@ -359,15 +464,12 @@ func validateKnownOtherFields(raw string, allowedProviderFields []string, string
 		return nil
 	}
 
-	allowed := make(map[string]struct{}, len(allowedProviderFields)+6)
+	allowed := make(map[string]struct{}, len(allowedProviderFields)+3)
 	for _, field := range allowedProviderFields {
 		allowed[field] = struct{}{}
 	}
 	for _, field := range []string{
-		"responses_ws_transport",
-		"responses_ws_native",
 		"self_hosted",
-		"responses_ws_self_hosted",
 		"extra",
 		"vendor_extra",
 	} {
@@ -429,23 +531,11 @@ func validateCodexChannelOther(raw string) error {
 	for key, value := range parsed {
 		fieldName := "other." + key
 		switch key {
-		case "prompt_cache_key_strategy":
-			if err := validateCodexEnumField(fieldName, value, normalizeCodexPromptCacheStrategyValidation, "auto, off, session_id, auth_header, token_id, user_id"); err != nil {
-				return err
-			}
-		case "websocket_mode":
-			if err := validateCodexEnumField(fieldName, value, normalizeCodexWebsocketModeValidation, "auto, force, off"); err != nil {
-				return err
-			}
-		case "responses_ws_transport":
-			if err := validateCodexNativeResponsesWSTransportField(fieldName, value); err != nil {
-				return err
-			}
 		case "self_hosted", "responses_ws_self_hosted":
 			if err := validateCodexBoolField(fieldName, value); err != nil {
 				return err
 			}
-		case "execution_session_ttl_seconds", "websocket_retry_cooldown_seconds":
+		case "execution_session_ttl_seconds":
 			if err := validateCodexPositiveIntField(fieldName, value); err != nil {
 				return err
 			}
@@ -547,24 +637,6 @@ func validateCodexEnumField(fieldName string, raw json.RawMessage, normalize fun
 	return nil
 }
 
-func validateCodexResponsesWSTransportField(fieldName string, raw json.RawMessage) error {
-	if _, err := runtimesession.ParseResponsesWSTransportField(raw); err != nil {
-		return fmt.Errorf("%s %w", fieldName, err)
-	}
-	return nil
-}
-
-func validateCodexNativeResponsesWSTransportField(fieldName string, raw json.RawMessage) error {
-	mode, err := runtimesession.ParseResponsesWSTransportField(raw)
-	if err != nil {
-		return fmt.Errorf("%s %w", fieldName, err)
-	}
-	if mode == runtimesession.TransportModeResponsesHTTPBridge {
-		return fmt.Errorf("%s must be native for Codex channels; HTTP bridge is not supported", fieldName)
-	}
-	return nil
-}
-
 func validateCodexPositiveIntField(fieldName string, raw json.RawMessage) error {
 	var value int
 	if err := json.Unmarshal(raw, &value); err != nil {
@@ -574,54 +646,6 @@ func validateCodexPositiveIntField(fieldName string, raw json.RawMessage) error 
 		return fmt.Errorf("%s must be greater than 0", fieldName)
 	}
 	return nil
-}
-
-func validateCustomChannelClaudePlugin(channel *Channel) error {
-	if channel == nil || channel.Plugin == nil {
-		return nil
-	}
-
-	claudeConfig, ok := channel.Plugin.Data()[customClaudePluginKey]
-	if !ok || claudeConfig == nil {
-		return nil
-	}
-
-	if rawEnabled, exists := claudeConfig[customClaudeEnabledPluginKey]; exists {
-		if _, ok := rawEnabled.(bool); !ok {
-			return fmt.Errorf("plugin.claude.enabled must be a boolean")
-		}
-	}
-
-	rawBaseURL, exists := claudeConfig[customClaudeBaseURLPluginKey]
-	if !exists || rawBaseURL == nil {
-		return nil
-	}
-
-	baseURL, ok := rawBaseURL.(string)
-	if !ok {
-		return fmt.Errorf("plugin.claude.base_url must be a string")
-	}
-
-	_, err := normalizeClaudeBaseURL("plugin.claude.base_url", baseURL)
-	return err
-}
-
-func normalizeCodexPromptCacheStrategyValidation(value string) string {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "auto", "off", "session_id", "auth_header", "token_id", "user_id":
-		return strings.ToLower(strings.TrimSpace(value))
-	default:
-		return ""
-	}
-}
-
-func normalizeCodexWebsocketModeValidation(value string) string {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "auto", "force", "off":
-		return strings.ToLower(strings.TrimSpace(value))
-	default:
-		return ""
-	}
 }
 
 func normalizeCodexOriginatorValidation(value string) string {

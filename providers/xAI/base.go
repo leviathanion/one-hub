@@ -15,6 +15,13 @@ import (
 // 定义供应商工厂
 type XAIProviderFactory struct{}
 
+func (XAIProviderFactory) AssessChatRemoteMedia(_ *model.Channel, _ *types.ChatCompletionRequest, _ base.ChatRemoteMediaSummary) (base.RemoteMediaMode, error) {
+	if err := base.RequireOperationEndpoint(getConfig().ChatCompletions, "Chat Completions"); err != nil {
+		return base.RemoteMediaReject, err
+	}
+	return base.RemoteMediaPassURL, nil
+}
+
 // 创建 XAIProvider
 func (f XAIProviderFactory) Create(channel *model.Channel) base.ProviderInterface {
 	fmt.Println("Creating XAIProvider for channel:")

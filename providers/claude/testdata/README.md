@@ -1,0 +1,1 @@
+`search_usage.sse` 摘自 Anthropic 官方 [Streaming messages](https://platform.claude.com/docs/en/build-with-claude/streaming#streaming-request-with-web-search-tool-use) 的搜索示例，2026-09-06 核对。保留原样的 message_start、message_delta、message_stop，省略与计量无关的内容块。文档明确 message_delta 的 token 数为累计值；本文件固定该次样例，不随在线文档变化。

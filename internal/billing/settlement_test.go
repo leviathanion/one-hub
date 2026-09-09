@@ -2,13 +2,11 @@ package billing
 
 import (
 	"context"
-	"fmt"
 	"testing"
 
 	"one-api/common/config"
 	"one-api/common/logger"
-	commonredis "one-api/common/redis"
-	"one-api/internal/testutil/fakeredis"
+	"one-api/internal/testutil/sqlitetest"
 	"one-api/model"
 	"one-api/types"
 
@@ -17,17 +15,44 @@ import (
 	"gorm.io/gorm"
 )
 
+func TestUsageSummaryPreservesNonIntegralUsageUnits(t *testing.T) {
+	usage := &types.Usage{ExtraUsageUnits: map[string]float64{config.UsageExtraInputAudioTranscription: 2.5}}
+	summary := NewUsageSummary(usage)
+	restored := summary.ToUsage()
+	if restored.ExtraUsageUnits[config.UsageExtraInputAudioTranscription] != 2.5 {
+		t.Fatalf("settlement usage units were lost: %+v", restored.ExtraUsageUnits)
+	}
+	restored.ExtraUsageUnits[config.UsageExtraInputAudioTranscription] = 7
+	if summary.ExtraUsageUnits[config.UsageExtraInputAudioTranscription] != 2.5 {
+		t.Fatalf("settlement usage units share mutable state: %+v", summary.ExtraUsageUnits)
+	}
+}
+
+func TestUsageSummaryPreservesDistinctProviderCacheEvidence(t *testing.T) {
+	usage := &types.Usage{PromptTokensDetails: types.PromptTokensDetails{
+		CachedTokens:      2,
+		CachedReadTokens:  3,
+		CacheWriteTokens:  5,
+		CachedWriteTokens: 7,
+	}}
+	restored := NewUsageSummary(usage).ToUsage()
+	extraTokens := restored.GetExtraTokens()
+	if extraTokens[config.UsageExtraCache] != 2 || extraTokens[config.UsageExtraCachedRead] != 3 || extraTokens[config.UsageExtraCacheWrite] != 5 || extraTokens[config.UsageExtraCachedWrite] != 7 {
+		t.Fatalf("settlement summary merged or lost provider cache evidence: %+v", extraTokens)
+	}
+}
+
 func useSettlementTestDB(t *testing.T) {
 	t.Helper()
 
 	logger.Logger = zap.NewNop()
 
 	originalDB := model.DB
-	testDB, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())), &gorm.Config{})
+	testDB, err := gorm.Open(sqlite.Open(sqlitetest.MemoryDSN()), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("expected in-memory sqlite database, got %v", err)
 	}
-	if err := testDB.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.Log{}); err != nil {
+	if err := testDB.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.Log{}, &model.UserGroup{}); err != nil {
 		t.Fatalf("expected settlement schema migration to succeed, got %v", err)
 	}
 
@@ -89,15 +114,20 @@ func TestApplySettlementTruthBypassesBatchUpdate(t *testing.T) {
 		config.BatchUpdateEnabled = originalBatch
 		config.LogConsumeEnabled = originalLogConsume
 	})
+	reserve, err := model.ApplyBillingReserve(context.Background(), 1, 1, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	cmd := SettlementCommand{
-		RequestKind:      SettlementRequestKindUnary,
-		UserID:           1,
-		TokenID:          1,
-		ChannelID:        1,
-		ModelName:        "gpt-5",
-		PreConsumedQuota: 100,
-		FinalQuota:       250,
+		RequestKind:            SettlementRequestKindUnary,
+		UserID:                 1,
+		TokenID:                1,
+		ChannelID:              1,
+		ModelName:              "gpt-5",
+		PreConsumedQuota:       100,
+		PreconsumeTokenApplied: reserve.TokenQuotaApplied,
+		FinalQuota:             250,
 		UsageSummary: UsageSummary{
 			PromptTokens:     10,
 			CompletionTokens: 20,
@@ -117,7 +147,7 @@ func TestApplySettlementTruthBypassesBatchUpdate(t *testing.T) {
 	if err := model.DB.First(&user, 1).Error; err != nil {
 		t.Fatalf("expected user lookup to succeed, got %v", err)
 	}
-	if user.Quota != 850 {
+	if user.Quota != 750 {
 		t.Fatalf("expected direct truth path to decrease user quota immediately, got %d", user.Quota)
 	}
 
@@ -125,7 +155,7 @@ func TestApplySettlementTruthBypassesBatchUpdate(t *testing.T) {
 	if err := model.DB.First(&token, 1).Error; err != nil {
 		t.Fatalf("expected token lookup to succeed, got %v", err)
 	}
-	if token.RemainQuota != 850 || token.UsedQuota != 150 {
+	if token.RemainQuota != 750 || token.UsedQuota != 250 {
 		t.Fatalf("expected direct truth path to update token quota immediately, got remain=%d used=%d", token.RemainQuota, token.UsedQuota)
 	}
 }
@@ -142,15 +172,20 @@ func TestApplySettlementProjectionUsesFinalQuota(t *testing.T) {
 		config.BatchUpdateEnabled = originalBatch
 		config.LogConsumeEnabled = originalLogConsume
 	})
+	reserve, err := model.ApplyBillingReserve(context.Background(), 1, 1, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	cmd := SettlementCommand{
-		RequestKind:      SettlementRequestKindUnary,
-		UserID:           1,
-		TokenID:          1,
-		ChannelID:        1,
-		ModelName:        "gpt-5",
-		PreConsumedQuota: 100,
-		FinalQuota:       250,
+		RequestKind:            SettlementRequestKindUnary,
+		UserID:                 1,
+		TokenID:                1,
+		ChannelID:              1,
+		ModelName:              "gpt-5",
+		PreConsumedQuota:       100,
+		PreconsumeTokenApplied: reserve.TokenQuotaApplied,
+		FinalQuota:             250,
 		UsageSummary: UsageSummary{
 			PromptTokens:     10,
 			CompletionTokens: 20,
@@ -160,7 +195,8 @@ func TestApplySettlementProjectionUsesFinalQuota(t *testing.T) {
 			},
 			ExtraTokens: map[string]int{
 				config.UsageExtraCachedRead:  4,
-				config.UsageExtraCachedWrite: 2,
+				config.UsageExtraCacheWrite:  2,
+				config.UsageExtraCachedWrite: 5,
 			},
 		},
 	}
@@ -183,7 +219,7 @@ func TestApplySettlementProjectionUsesFinalQuota(t *testing.T) {
 	if err := model.DB.First(&user, 1).Error; err != nil {
 		t.Fatalf("expected user lookup to succeed, got %v", err)
 	}
-	if user.Quota != 850 || user.UsedQuota != 250 || user.RequestCount != 1 {
+	if user.Quota != 750 || user.UsedQuota != 250 || user.RequestCount != 1 {
 		t.Fatalf("expected final quota projection to update user counters, got quota=%d used=%d requests=%d", user.Quota, user.UsedQuota, user.RequestCount)
 	}
 
@@ -202,211 +238,10 @@ func TestApplySettlementProjectionUsesFinalQuota(t *testing.T) {
 	if log.Quota != 250 || log.PromptTokens != 10 || log.CompletionTokens != 20 {
 		t.Fatalf("expected consume log to record final quota and usage, got %+v", log)
 	}
-	if log.CacheTokens != 3 || log.CacheReadTokens != 4 || log.CacheWriteTokens != 2 {
+	if log.CacheTokens != 3 || log.CacheReadTokens != 4 || log.CacheWriteTokens != 7 {
 		t.Fatalf("expected consume log to persist cache token breakdown, got %+v", log)
 	}
 	if log.Metadata.Data()["user_agent"] != "Codex/1.2" {
 		t.Fatalf("expected consume log to persist metadata user-agent, got %#v", log.Metadata.Data())
-	}
-}
-
-func TestApplySettlementDeduplicatesDetachedFinalize(t *testing.T) {
-	useSettlementTestDB(t)
-	insertSettlementFixtures(t)
-
-	server, err := fakeredis.Start()
-	if err != nil {
-		t.Fatalf("expected fake redis server to start, got %v", err)
-	}
-	defer server.Close()
-	server.RegisterLuaScript(settlementAcquireGateScriptSource, func(keys, args []string) int64 {
-		current, ok := server.GetRaw(keys[0])
-		if !ok {
-			server.SetRaw(keys[0], args[0])
-			return 1
-		}
-		if current == args[0] {
-			return 0
-		}
-		return -1
-	})
-
-	originalRedisEnabled := config.RedisEnabled
-	originalRedisClient := commonredis.RDB
-	originalBatch := config.BatchUpdateEnabled
-	originalLogConsume := config.LogConsumeEnabled
-	config.RedisEnabled = true
-	config.BatchUpdateEnabled = false
-	config.LogConsumeEnabled = false
-	commonredis.RDB = server.Client()
-	t.Cleanup(func() {
-		config.RedisEnabled = originalRedisEnabled
-		config.BatchUpdateEnabled = originalBatch
-		config.LogConsumeEnabled = originalLogConsume
-		commonredis.RDB = originalRedisClient
-	})
-
-	cmd := SettlementCommand{
-		Identity:         "session-1:1:finalize",
-		RequestKind:      SettlementRequestKindRealtimeTurn,
-		UserID:           1,
-		TokenID:          1,
-		ChannelID:        1,
-		ModelName:        "gpt-5",
-		PreConsumedQuota: 100,
-		FinalQuota:       250,
-		UsageSummary: UsageSummary{
-			PromptTokens:     3,
-			CompletionTokens: 5,
-			TotalTokens:      8,
-		},
-	}
-	opts := SettlementOptions{Deduplicate: true}
-
-	first, err := ApplySettlement(context.Background(), cmd, &opts)
-	if err != nil {
-		t.Fatalf("expected first settlement to succeed, got %v", err)
-	}
-	second, err := ApplySettlement(context.Background(), cmd, &opts)
-	if err != nil {
-		t.Fatalf("expected duplicate settlement to be skipped without error, got %v", err)
-	}
-	if !first.TruthApplied || second.TruthApplied || !second.Deduplicated || second.FingerprintConflict {
-		t.Fatalf("expected second settlement to be deduplicated, got first=%+v second=%+v", first, second)
-	}
-
-	var user model.User
-	if err := model.DB.First(&user, 1).Error; err != nil {
-		t.Fatalf("expected user lookup to succeed, got %v", err)
-	}
-	if user.Quota != 850 || user.RequestCount != 1 {
-		t.Fatalf("expected detached finalize dedupe to avoid double projection, got quota=%d requests=%d", user.Quota, user.RequestCount)
-	}
-}
-
-func TestApplySettlementReportsFingerprintConflictOnDeduplicatedMismatch(t *testing.T) {
-	useSettlementTestDB(t)
-	insertSettlementFixtures(t)
-
-	server, err := fakeredis.Start()
-	if err != nil {
-		t.Fatalf("expected fake redis server to start, got %v", err)
-	}
-	defer server.Close()
-	server.RegisterLuaScript(settlementAcquireGateScriptSource, func(keys, args []string) int64 {
-		current, ok := server.GetRaw(keys[0])
-		if !ok {
-			server.SetRaw(keys[0], args[0])
-			return 1
-		}
-		if current == args[0] {
-			return 0
-		}
-		return -1
-	})
-
-	originalRedisEnabled := config.RedisEnabled
-	originalRedisClient := commonredis.RDB
-	originalBatch := config.BatchUpdateEnabled
-	originalLogConsume := config.LogConsumeEnabled
-	config.RedisEnabled = true
-	config.BatchUpdateEnabled = false
-	config.LogConsumeEnabled = false
-	commonredis.RDB = server.Client()
-	t.Cleanup(func() {
-		config.RedisEnabled = originalRedisEnabled
-		config.BatchUpdateEnabled = originalBatch
-		config.LogConsumeEnabled = originalLogConsume
-		commonredis.RDB = originalRedisClient
-	})
-
-	successCmd := SettlementCommand{
-		Identity:         "task-1:finalize",
-		RequestKind:      SettlementRequestKindAsyncTask,
-		UserID:           1,
-		TokenID:          1,
-		ChannelID:        1,
-		ModelName:        "gpt-5",
-		PreConsumedQuota: 100,
-		FinalQuota:       250,
-		UsageSummary: UsageSummary{
-			PromptTokens:     3,
-			CompletionTokens: 5,
-			TotalTokens:      8,
-		},
-	}
-	failureCmd := successCmd
-	failureCmd.FinalQuota = 0
-	failureCmd.Fingerprint = ""
-
-	first, err := ApplySettlement(context.Background(), successCmd, &SettlementOptions{Deduplicate: true})
-	if err != nil {
-		t.Fatalf("expected first settlement to succeed, got %v", err)
-	}
-	second, err := ApplySettlement(context.Background(), failureCmd, &SettlementOptions{Deduplicate: true})
-	if err != nil {
-		t.Fatalf("expected conflicting settlement to be deduplicated without error, got %v", err)
-	}
-	if !first.TruthApplied || !second.Deduplicated || !second.FingerprintConflict || second.TruthApplied {
-		t.Fatalf("expected conflicting duplicate settlement to report fingerprint conflict, got first=%+v second=%+v", first, second)
-	}
-}
-
-func TestApplySettlementFallsBackWhenGateBackendErrors(t *testing.T) {
-	useSettlementTestDB(t)
-	insertSettlementFixtures(t)
-
-	server, err := fakeredis.Start()
-	if err != nil {
-		t.Fatalf("expected fake redis server to start, got %v", err)
-	}
-	defer server.Close()
-	server.FailNext("EVALSHA", "ERR settlement gate unavailable")
-
-	originalRedisEnabled := config.RedisEnabled
-	originalRedisClient := commonredis.RDB
-	originalBatch := config.BatchUpdateEnabled
-	originalLogConsume := config.LogConsumeEnabled
-	config.RedisEnabled = true
-	config.BatchUpdateEnabled = false
-	config.LogConsumeEnabled = false
-	commonredis.RDB = server.Client()
-	t.Cleanup(func() {
-		config.RedisEnabled = originalRedisEnabled
-		config.BatchUpdateEnabled = originalBatch
-		config.LogConsumeEnabled = originalLogConsume
-		commonredis.RDB = originalRedisClient
-	})
-
-	cmd := SettlementCommand{
-		Identity:         "session-1:1:finalize",
-		RequestKind:      SettlementRequestKindRealtimeTurn,
-		UserID:           1,
-		TokenID:          1,
-		ChannelID:        1,
-		ModelName:        "gpt-5",
-		PreConsumedQuota: 100,
-		FinalQuota:       250,
-		UsageSummary: UsageSummary{
-			PromptTokens:     10,
-			CompletionTokens: 20,
-			TotalTokens:      30,
-		},
-	}
-
-	result, err := ApplySettlement(context.Background(), cmd, &SettlementOptions{Deduplicate: true})
-	if err != nil {
-		t.Fatalf("expected settlement to degrade gracefully when redis gate fails, got %v", err)
-	}
-	if !result.TruthApplied || result.Deduplicated {
-		t.Fatalf("expected truth write without dedupe after gate failure, got %+v", result)
-	}
-
-	var user model.User
-	if err := model.DB.First(&user, 1).Error; err != nil {
-		t.Fatalf("expected user lookup to succeed, got %v", err)
-	}
-	if user.Quota != 850 {
-		t.Fatalf("expected settlement fallback to charge user quota, got %d", user.Quota)
 	}
 }

@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -19,43 +18,44 @@ import (
 
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+	gormlogger "gorm.io/gorm/logger"
 )
 
 type Channel struct {
-	Id                 int     `json:"id"`
-	Type               int     `json:"type" form:"type" gorm:"default:0"`
-	Key                string  `json:"key" form:"key" gorm:"type:text"`
-	Status             int     `json:"status" form:"status" gorm:"default:1"`
-	Name               string  `json:"name" form:"name" gorm:"index"`
-	Weight             *uint   `json:"weight" gorm:"default:1"`
-	CreatedTime        int64   `json:"created_time" gorm:"bigint"`
-	TestTime           int64   `json:"test_time" gorm:"bigint"`
-	ResponseTime       int     `json:"response_time"` // in milliseconds
-	BaseURL            *string `json:"base_url" gorm:"column:base_url;default:''" tag_config:"sync"`
-	Other              string  `json:"other" form:"other" tag_config:"sync"`
-	Balance            float64 `json:"balance"` // in USD
-	BalanceUpdatedTime int64   `json:"balance_updated_time" gorm:"bigint"`
-	Models             string  `json:"models" form:"models" tag_config:"sync"`
-	Group              string  `json:"group" form:"group" gorm:"type:varchar(32);default:'default'" tag_config:"sync"`
-	Tag                string  `json:"tag" form:"tag" gorm:"type:varchar(32);default:''" tag_config:"sync"`
-	UsedQuota          int64   `json:"used_quota" gorm:"bigint;default:0"`
-	ModelMapping       *string `json:"model_mapping" gorm:"type:text" tag_config:"sync"`
-	ModelHeaders       *string `json:"model_headers" gorm:"type:varchar(1024);default:''" tag_config:"sync"`
-	CustomParameter    *string `json:"custom_parameter" gorm:"type:varchar(1024);default:''" tag_config:"sync"`
-	Priority           *int64  `json:"priority" gorm:"bigint;default:0"`
-	Proxy              *string `json:"proxy" gorm:"type:varchar(255);default:''" tag_config:"sync"`
-	TestModel          string  `json:"test_model" form:"test_model" gorm:"type:varchar(50);default:''" tag_config:"sync"`
-	OnlyChat           bool    `json:"only_chat" form:"only_chat" gorm:"default:false" tag_config:"sync"`
-	PreCost            int     `json:"pre_cost" form:"pre_cost" gorm:"default:1" tag_config:"sync"`
-	CompatibleResponse bool    `json:"compatible_response" gorm:"default:false" tag_config:"sync"`
-	AllowExtraBody     bool    `json:"allow_extra_body" form:"allow_extra_body" gorm:"default:false" tag_config:"sync"`
-
-	DisabledStream *datatypes.JSONSlice[string] `json:"disabled_stream,omitempty" gorm:"type:json" tag_config:"sync"`
+	Id                 int                          `json:"id"`
+	Type               int                          `json:"type" form:"type" gorm:"default:0"`
+	Key                string                       `json:"key" form:"key" gorm:"type:text"`
+	Status             int                          `json:"status" form:"status" gorm:"default:1"`
+	Name               string                       `json:"name" form:"name" gorm:"index"`
+	Weight             *uint                        `json:"weight" gorm:"default:1"`
+	CreatedTime        int64                        `json:"created_time" gorm:"bigint"`
+	TestTime           int64                        `json:"test_time" gorm:"bigint"`
+	ResponseTime       int                          `json:"response_time"` // in milliseconds
+	BaseURL            *string                      `json:"base_url" gorm:"column:base_url;default:''" tag_config:"sync"`
+	Other              string                       `json:"other" form:"other" tag_config:"sync"`
+	Balance            float64                      `json:"balance"` // in USD
+	BalanceUpdatedTime int64                        `json:"balance_updated_time" gorm:"bigint"`
+	Models             string                       `json:"models" form:"models" tag_config:"sync"`
+	Group              string                       `json:"group" form:"group" gorm:"type:varchar(32);default:'default'" tag_config:"sync"`
+	Tag                string                       `json:"tag" form:"tag" gorm:"type:varchar(32);default:''" tag_config:"sync"`
+	UsedQuota          int64                        `json:"used_quota" gorm:"bigint;default:0"`
+	ModelMapping       *string                      `json:"model_mapping" gorm:"type:text" tag_config:"sync"`
+	ModelHeaders       *string                      `json:"model_headers" gorm:"type:varchar(1024);default:''" tag_config:"sync"`
+	CustomParameter    *string                      `json:"custom_parameter" gorm:"type:varchar(1024);default:''" tag_config:"sync"`
+	Priority           *int64                       `json:"priority" gorm:"bigint;default:0"`
+	Proxy              *string                      `json:"proxy" gorm:"type:varchar(255);default:''" tag_config:"sync"`
+	TestModel          string                       `json:"test_model" form:"test_model" gorm:"type:varchar(50);default:''" tag_config:"sync"`
+	OnlyChat           bool                         `json:"only_chat" form:"only_chat" gorm:"default:false" tag_config:"sync"`
+	PreCost            int                          `json:"pre_cost" form:"pre_cost" gorm:"default:1" tag_config:"sync"`
+	CompatibleResponse bool                         `json:"compatible_response" gorm:"default:false" tag_config:"sync"`
+	AllowExtraBody     bool                         `json:"allow_extra_body" form:"allow_extra_body" gorm:"default:false" tag_config:"sync"`
+	DisabledStream     *datatypes.JSONSlice[string] `json:"disabled_stream,omitempty" gorm:"type:json" tag_config:"sync"`
 
 	Plugin    *datatypes.JSONType[PluginType] `json:"plugin" form:"plugin" gorm:"type:json" tag_config:"sync"`
 	DeletedAt gorm.DeletedAt                  `json:"-" gorm:"index"`
 
-	// CredentialRevision is the lifecycle identity of Key/Type/DeletedAt.  The
+	// CredentialRevision fences credentials, connection identity edits and deletion. The
 	// refresh fence deliberately lives beside the credential authority so claim,
 	// commit and lifecycle supersession are single-row atomic operations.
 	CredentialRevision         uint64  `json:"-" gorm:"column:credential_revision;not null;default:0"`
@@ -100,12 +100,6 @@ func (c *Channel) AllowStream(modelName string) bool {
 
 type PluginType map[string]map[string]interface{}
 
-const (
-	customClaudePluginKey        = "claude"
-	customClaudeEnabledPluginKey = "enabled"
-	customClaudeBaseURLPluginKey = "base_url"
-)
-
 var allowedChannelOrderFields = map[string]bool{
 	"id":            true,
 	"name":          true,
@@ -120,12 +114,7 @@ var allowedChannelOrderFields = map[string]bool{
 
 var azureAPIVersionSearchCandidateWarnThreshold = 1000
 
-const (
-	codexTokenCacheKeyPrefix           = "api_token:codex"
-	codexUsagePreviewCacheKeyPrefix    = "codex:usage:preview"
-	codexUsageDetailCacheKeyPrefix     = "codex:usage:detail"
-	codexUsageGenerationCacheKeyPrefix = cache.CodexUsageGenerationKeyPrefix
-)
+const codexUsageGenerationCacheKeyPrefix = cache.CodexUsageGenerationKeyPrefix
 
 type SearchChannelsParams struct {
 	Channel
@@ -354,6 +343,18 @@ func GetChannelByIdWithContext(ctx context.Context, id int) (*Channel, error) {
 	return &channel, err
 }
 
+// GetChannelIncarnationByID loads the current channel configuration referenced by a
+// durable owner. Route status and soft deletion only block new work; they do
+// not erase credentials needed to finish an already accepted lifecycle.
+func GetChannelIncarnationByID(ctx context.Context, id int) (*Channel, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	channel := Channel{Id: id}
+	err := DB.WithContext(ctx).Unscoped().First(&channel, "id = ?", id).Error
+	return &channel, err
+}
+
 func GetChannelsByTag(tag string) ([]*Channel, error) {
 	var channels []*Channel
 	err := DB.Where("tag = ?", tag).Find(&channels).Error
@@ -409,14 +410,13 @@ var invalidateChannelCodexDerivedCaches = ClearChannelCodexDerivedCaches
 
 // finishChannelRouteMutation has exactly one routing publication path:
 // quarantine, then replace the complete chooser snapshot from durable state.
-// Cache cleanup runs afterward as garbage collection. Content-addressed v2 keys
+// Derived-cache generation rotation runs afterward. Content-addressed keys
 // provide isolation, so slow or failed cache I/O has no routing authority.
 //
 // The deliberate cost is one full DB snapshot build per admin mutation and an
-// admin response that may still wait for best-effort cleanup after routing is
-// already correct. Keeping cache I/O out of the publication condition is more
-// important than minimizing mutation latency; never move cleanup before Load or
-// restore a per-channel refresh as an optimization.
+// admin response that may still wait for best-effort invalidation after routing
+// is already correct. Keeping cache I/O out of the publication condition is
+// more important than minimizing mutation latency; never move it before Load.
 func finishChannelRouteMutation(reason string, affectedChannelIDs, codexChannelIDs []int) {
 	refreshChannelGroupAfterMutation(reason, affectedChannelIDs)
 	invalidateChannelCodexDerivedCaches(codexChannelIDs)
@@ -652,83 +652,6 @@ func (channel *Channel) GetBaseURL() string {
 	return *channel.BaseURL
 }
 
-func (channel *Channel) CustomClaudeRelayEnabled() bool {
-	if channel == nil || channel.Type != config.ChannelTypeCustom || channel.Plugin == nil {
-		return false
-	}
-
-	claudeConfig, ok := channel.Plugin.Data()[customClaudePluginKey]
-	if !ok || claudeConfig == nil {
-		return false
-	}
-
-	enabled, ok := claudeConfig[customClaudeEnabledPluginKey].(bool)
-	return ok && enabled
-}
-
-func (channel *Channel) ResolveCustomClaudeBaseURL(defaultBaseURL string) (string, error) {
-	if channel == nil {
-		return "", fmt.Errorf("channel is nil")
-	}
-	if channel.Type != config.ChannelTypeCustom {
-		return "", fmt.Errorf("channel is not a custom channel")
-	}
-	if !channel.CustomClaudeRelayEnabled() {
-		return "", fmt.Errorf("plugin.claude.enabled must be true for Claude relay")
-	}
-
-	baseURL := ""
-	baseURLField := "plugin.claude.base_url"
-	if channel.Plugin != nil {
-		if claudeConfig, ok := channel.Plugin.Data()[customClaudePluginKey]; ok && claudeConfig != nil {
-			if rawBaseURL, exists := claudeConfig[customClaudeBaseURLPluginKey]; exists && rawBaseURL != nil {
-				value, ok := rawBaseURL.(string)
-				if !ok {
-					return "", fmt.Errorf("plugin.claude.base_url must be a string")
-				}
-				baseURL = strings.TrimSpace(value)
-			}
-		}
-	}
-
-	if baseURL == "" {
-		baseURL = strings.TrimSpace(channel.GetBaseURL())
-		baseURLField = "base_url"
-	}
-	if baseURL == "" {
-		baseURL = strings.TrimSpace(defaultBaseURL)
-		baseURLField = "plugin.claude.default_base_url"
-	}
-	if baseURL == "" {
-		return "", nil
-	}
-
-	return normalizeClaudeBaseURL(baseURLField, baseURL)
-}
-
-func normalizeClaudeBaseURL(fieldName, rawBaseURL string) (string, error) {
-	trimmed := strings.TrimRight(strings.TrimSpace(rawBaseURL), "/")
-	if trimmed == "" {
-		return "", nil
-	}
-
-	parsed, err := url.Parse(trimmed)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return "", fmt.Errorf("%s must be an absolute http(s) base URL", fieldName)
-	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return "", fmt.Errorf("%s must use http or https", fieldName)
-	}
-	if parsed.RawQuery != "" || parsed.Fragment != "" {
-		return "", fmt.Errorf("%s must not include query or fragment", fieldName)
-	}
-
-	// Keep path suffixes exactly as configured. The Claude provider appends its
-	// endpoint path later, so users must supply the upstream base path they mean
-	// instead of relying on this layer to correct duplicated endpoint segments.
-	return trimmed, nil
-}
-
 func (channel *Channel) GetModelMapping() string {
 	if channel.ModelMapping == nil {
 		return ""
@@ -884,8 +807,10 @@ func (channel *Channel) Update(overwrite bool) error {
 }
 
 type ChannelUpdateOptions struct {
-	OtherSubmitted   bool
-	BaseURLSubmitted bool
+	SubmittedFields     map[string]json.RawMessage
+	OtherSubmitted      bool
+	BaseURLSubmitted    bool
+	AllowIdentityChange bool
 }
 
 func (channel *Channel) UpdateWithOptions(overwrite bool, options ChannelUpdateOptions) error {
@@ -941,166 +866,160 @@ func (channel *Channel) reloadAfterSuccessfulUpdate(reason string) {
 	*channel = *persisted
 }
 
-func (channel *Channel) updateRawWithOptions(overwrite bool, options ChannelUpdateOptions) (bool, bool, error) {
-	persisted, err := GetChannelById(channel.Id)
-	if err != nil {
-		return false, false, err
+func (channel *Channel) updateRawWithOptions(overwrite bool, options ChannelUpdateOptions) (invalidateCodex, updated bool, err error) {
+	if !options.AllowIdentityChange {
+		return channel.updateWithDB(DB, overwrite, options)
 	}
-	oldType := persisted.Type
-	if channel.Type == config.ChannelTypeUnknown {
-		channel.Type = oldType
-	}
-	if err = channel.hydratePersistedOtherForUpdate(options.OtherSubmitted); err != nil {
-		return false, false, err
-	}
-	if err = channel.hydratePersistedBaseURLForUpdate(options.BaseURLSubmitted); err != nil {
-		return false, false, err
-	}
-	if err = channel.CanonicalizeRuntimeConfigJSON(); err != nil {
-		return false, false, err
-	}
-	if err = channel.ValidateRuntimeConfigJSON(); err != nil {
-		return false, false, err
-	}
-
-	var rowsAffected int64
 	err = DB.Transaction(func(tx *gorm.DB) error {
-		credentialChanged := channel.Key != persisted.Key
-		if !overwrite && channel.Key == "" {
-			// GORM omits an empty string in partial struct updates; mirror the
-			// effective mutation here so an unrelated edit cannot supersede a fence.
-			credentialChanged = false
-		}
-		typeChanged := channel.Type != persisted.Type
-		if persisted.CredentialRefreshFence != nil && !credentialChanged && !typeChanged {
-			// Re-submitting the same credential is not proof of reauthorization.
-			// Ordinary config edits are allowed and leave the fence untouched.
-		}
-		if persisted.Type != config.ChannelTypeCodex && channel.Type == config.ChannelTypeCodex && !credentialChanged && persisted.CredentialRefreshFence != nil {
-			return fmt.Errorf("entering Codex requires a new credential")
-		}
-		protocolFields := []string{"CredentialRevision", "CredentialRefreshFence", "CredentialRefreshStartedAt"}
-		if overwrite {
-			result := tx.Model(channel).Select("*").Omit(append([]string{"UsedQuota"}, protocolFields...)...).Updates(channel)
-			rowsAffected += result.RowsAffected
-			if result.Error != nil {
-				return result.Error
-			}
-		} else {
-			result := tx.Model(channel).Omit(append([]string{"UsedQuota"}, protocolFields...)...).Updates(channel)
-			rowsAffected += result.RowsAffected
-			if result.Error != nil {
-				return result.Error
-			}
-			zeroRows, updateErr := channel.updateSubmittedZeroValueRuntimeConfig(tx, options)
-			rowsAffected += zeroRows
-			if updateErr != nil {
-				return updateErr
-			}
-		}
-
-		if credentialChanged || typeChanged {
-			updates := map[string]any{
-				"credential_revision": gorm.Expr("credential_revision + 1"),
-			}
-			// A genuinely new credential explicitly supersedes every older attempt.
-			// A type-only change preserves the fence, preventing ABA reuse of the old
-			// bytes if the row is later changed back to Codex.
-			if credentialChanged {
-				updates["credential_refresh_fence"] = nil
-				updates["credential_refresh_started_at"] = nil
-			}
-			result := tx.Model(&Channel{}).Where("id = ? AND credential_revision = ?", channel.Id, persisted.CredentialRevision).Updates(updates)
-			rowsAffected += result.RowsAffected
-			if result.Error != nil {
-				return result.Error
-			}
-			if result.RowsAffected == 0 {
-				return fmt.Errorf("channel credential lifecycle changed concurrently")
-			}
-		}
-		return nil
+		var updateErr error
+		invalidateCodex, updated, updateErr = channel.updateWithDB(tx, overwrite, options)
+		return updateErr
 	})
-	if err != nil {
-		return false, false, err
-	}
-	invalidateCodex := oldType == config.ChannelTypeCodex || channel.Type == config.ChannelTypeCodex
-	if !overwrite && channel.Status == 0 {
-		channel.Status = persisted.Status
-	}
-	return invalidateCodex, rowsAffected > 0, nil
+	return
 }
 
-func (channel *Channel) updateSubmittedZeroValueRuntimeConfig(tx *gorm.DB, options ChannelUpdateOptions) (int64, error) {
-	if channel == nil || channel.Id <= 0 {
-		return 0, nil
+func (channel *Channel) updateWithDB(db *gorm.DB, overwrite bool, options ChannelUpdateOptions) (bool, bool, error) {
+	var persisted Channel
+	query := db
+	if options.AllowIdentityChange {
+		query = query.Clauses(clause.Locking{Strength: "UPDATE"})
 	}
-	updates := make(map[string]any)
-	if options.OtherSubmitted {
-		updates["other"] = channel.Other
+	if err := query.First(&persisted, "id = ?", channel.Id).Error; err != nil {
+		return false, false, err
 	}
-	if options.BaseURLSubmitted {
-		if channel.BaseURL == nil {
-			updates["base_url"] = nil
-		} else {
-			updates["base_url"] = *channel.BaseURL
-		}
+	candidate, updates := channelMetadataUpdate(&persisted, channel, overwrite, options)
+	if err := candidate.CanonicalizeRuntimeConfigJSON(); err != nil {
+		return false, false, err
+	}
+	if err := candidate.ValidateRuntimeConfigJSON(); err != nil {
+		return false, false, err
+	}
+	identityChanged, err := prepareChannelIdentityEdit(&persisted, candidate, options.AllowIdentityChange)
+	if err != nil {
+		return false, false, err
+	}
+	if identityChanged {
+		// 只有管理端身份编辑写这些列；元数据编辑不会覆盖并发轮换得到的凭据。
+		updates["type"], updates["key"], updates["base_url"] = candidate.Type, candidate.Key, candidate.BaseURL
+		updates["credential_revision"] = gorm.Expr("credential_revision + 1")
+	}
+	if _, submitted := updates["other"]; submitted {
+		updates["other"] = candidate.Other
 	}
 	if len(updates) == 0 {
-		return 0, nil
+		return false, false, nil
 	}
-	result := tx.Model(&Channel{}).Where("id = ?", channel.Id).UpdateColumns(updates)
-	return result.RowsAffected, result.Error
+	// 管理端可以提交凭据，禁止失败 SQL 将凭据写入日志。
+	result := db.Session(&gorm.Session{Logger: db.Logger.LogMode(gormlogger.Silent)}).Model(&Channel{}).Where("id = ?", channel.Id).Updates(updates)
+	if result.Error != nil {
+		return false, false, result.Error
+	}
+	return persisted.Type == config.ChannelTypeCodex || candidate.Type == config.ChannelTypeCodex, result.RowsAffected > 0, nil
 }
 
-func (channel *Channel) hydratePersistedTypeForUpdate() error {
-	if channel == nil || channel.Id <= 0 || channel.Type != config.ChannelTypeUnknown {
-		return nil
-	}
+var immutableChannelOtherFields = []string{
+	"account_id", "organization_id", "tenant_id", "project_id", "workspace_id",
+	"resource_name", "region", "location", "endpoint", "host", "base_url",
+}
 
-	persisted, err := GetChannelById(channel.Id)
+func validateChannelIncarnationMutation(persisted, candidate *Channel) error {
+	if persisted == nil || candidate == nil {
+		return errors.New("channel incarnation is required")
+	}
+	if candidate.Type != persisted.Type {
+		return errors.New("渠道类型属于账号身份，不能原地修改；请创建新渠道")
+	}
+	if candidate.Key != persisted.Key {
+		return errors.New("渠道凭据属于账号身份，不能通过普通编辑原地替换；请创建新渠道")
+	}
+	oldHeaders, err := persisted.HeaderIdentity()
 	if err != nil {
 		return err
 	}
-
-	channel.Type = persisted.Type
-	return nil
-}
-
-func (channel *Channel) hydratePersistedRequiredOtherForPartialUpdate() error {
-	return channel.hydratePersistedOtherForUpdate(false)
-}
-
-func (channel *Channel) hydratePersistedOtherForUpdate(otherSubmitted bool) error {
-	if channel == nil || channel.Id <= 0 || otherSubmitted || strings.TrimSpace(channel.Other) != "" {
-		return nil
-	}
-
-	persisted, err := GetChannelById(channel.Id)
+	newHeaders, err := candidate.HeaderIdentity()
 	if err != nil {
 		return err
 	}
-	if channel.Type != config.ChannelTypeUnknown && channel.Type != persisted.Type {
-		return fmt.Errorf("other must be submitted when changing channel type")
+	if oldHeaders != newHeaders {
+		return errors.New("渠道组织/项目属于账号身份，身份字段不可原地编辑，请新建渠道")
 	}
-	channel.Other = persisted.Other
+	baseURL := func(value *string) string {
+		if value == nil {
+			return ""
+		}
+		return strings.TrimRight(strings.TrimSpace(*value), "/")
+	}
+	if baseURL(candidate.BaseURL) != baseURL(persisted.BaseURL) {
+		return errors.New("渠道 BaseURL 属于账号边界，不能原地修改；请创建新渠道")
+	}
+	if persisted.Type == config.ChannelTypeCustom {
+		if err := validateConfiguredEndpointTargets(persisted, candidate); err != nil {
+			return err
+		}
+		for _, identity := range []struct {
+			name    string
+			resolve func(*Channel) (string, error)
+		}{
+			{"HTTP", (*Channel).CustomResponsesEndpointIdentity},
+			{"Claude Messages", (*Channel).CustomClaudeEndpointIdentity},
+			{"WS", (*Channel).customResponsesWSEndpointIdentity},
+			{"WS (-realtime)", (*Channel).customResponsesRealtimeNamedEndpointIdentity},
+		} {
+			oldEndpoint, err := identity.resolve(persisted)
+			if err != nil {
+				return err
+			}
+			newEndpoint, err := identity.resolve(candidate)
+			if err != nil {
+				return err
+			}
+			if oldEndpoint != newEndpoint {
+				return fmt.Errorf("渠道 Custom Responses %s 端点属于资源身份，不能原地修改；请创建新渠道", identity.name)
+			}
+		}
+	}
+	oldOther := strings.TrimSpace(persisted.Other)
+	newOther := strings.TrimSpace(candidate.Other)
+	if oldOther == newOther {
+		return nil
+	}
+	var oldFields, newFields map[string]json.RawMessage
+	if oldOther == "" {
+		oldOther = "{}"
+	}
+	if newOther == "" {
+		newOther = "{}"
+	}
+	oldErr := json.Unmarshal([]byte(oldOther), &oldFields)
+	newErr := json.Unmarshal([]byte(newOther), &newFields)
+	if oldErr != nil || newErr != nil {
+		return errors.New("无法证明渠道 Other 变更保持同一账号；请创建新渠道")
+	}
+	for _, key := range immutableChannelOtherFields {
+		if !jsonRawEqual(oldFields[key], newFields[key]) {
+			return fmt.Errorf("渠道 Other.%s 属于账号身份，不能原地修改；请创建新渠道", key)
+		}
+	}
 	return nil
 }
 
-func (channel *Channel) hydratePersistedBaseURLForUpdate(baseURLSubmitted bool) error {
-	if channel == nil || channel.Id <= 0 || baseURLSubmitted || channel.BaseURL != nil {
-		return nil
+func jsonRawEqual(left, right json.RawMessage) bool {
+	if len(left) == 0 || string(left) == "null" {
+		left = nil
 	}
-
-	persisted, err := GetChannelById(channel.Id)
-	if err != nil {
-		return err
+	if len(right) == 0 || string(right) == "null" {
+		right = nil
 	}
-	if channel.Type != config.ChannelTypeUnknown && channel.Type != persisted.Type {
-		return fmt.Errorf("base_url must be submitted when changing channel type")
+	if left == nil || right == nil {
+		return left == nil && right == nil
 	}
-	channel.BaseURL = persisted.BaseURL
-	return nil
+	var leftValue, rightValue any
+	if json.Unmarshal(left, &leftValue) != nil || json.Unmarshal(right, &rightValue) != nil {
+		return string(left) == string(right)
+	}
+	leftJSON, _ := json.Marshal(leftValue)
+	rightJSON, _ := json.Marshal(rightValue)
+	return string(leftJSON) == string(rightJSON)
 }
 
 func channelTypeRequiresOtherForPartialUpdate(channelType int) bool {
@@ -1231,11 +1150,20 @@ func UpdateChannelStatusIfCurrent(id int, currentStatus int, targetStatus int) (
 }
 
 func UpdateChannelUsedQuota(id int, quota int) {
+	if err := UpdateChannelUsedQuotaWithContext(context.Background(), id, quota); err != nil {
+		logger.SysError("failed to update channel used quota: " + err.Error())
+	}
+}
+
+func UpdateChannelUsedQuotaWithContext(ctx context.Context, id int, quota int) error {
 	if config.BatchUpdateEnabled {
 		addNewRecord(BatchUpdateTypeChannelUsedQuota, id, quota)
-		return
+		return nil
 	}
-	updateChannelUsedQuota(id, quota)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return DB.WithContext(ctx).Model(&Channel{}).Where("id = ?", id).Update("used_quota", gorm.Expr("used_quota + ?", quota)).Error
 }
 
 func updateChannelUsedQuota(id int, quota int) {
@@ -1245,63 +1173,10 @@ func updateChannelUsedQuota(id int, quota int) {
 	}
 }
 
-func clearChannelCacheKeys(cacheKeys []string) {
-	if err := clearChannelCacheKeysWithContext(context.Background(), cacheKeys); err != nil {
-		logger.SysError(fmt.Sprintf("failed to clear %d cache key(s): %v", len(cacheKeys), err))
-	}
-}
-
-func clearChannelCacheKeysWithContext(ctx context.Context, cacheKeys []string) error {
-	return cache.DeleteCacheManyContext(ctx, cacheKeys)
-}
-
-func ClearChannelTokenCache(channelId int) {
-	clearChannelCacheKeys([]string{fmt.Sprintf("%s:%d", codexTokenCacheKeyPrefix, channelId)})
-}
-
-func ClearChannelCodexUsageCache(channelId int) {
-	clearChannelCacheKeys([]string{
-		fmt.Sprintf("%s:%d", codexUsagePreviewCacheKeyPrefix, channelId),
-		fmt.Sprintf("%s:%d", codexUsageDetailCacheKeyPrefix, channelId),
-	})
-}
-
 func ClearChannelCodexDerivedCaches(channelIds []int) {
-	if len(channelIds) == 0 {
-		return
+	if err := cache.RotateCodexUsageGenerations(channelIds); err != nil {
+		logger.SysError(fmt.Sprintf("failed to rotate Codex usage generations: %v", err))
 	}
-	unique := make([]int, 0, len(channelIds))
-	seen := make(map[int]struct{}, len(channelIds))
-	for _, channelId := range channelIds {
-		if channelId <= 0 {
-			continue
-		}
-		if _, ok := seen[channelId]; ok {
-			continue
-		}
-		seen[channelId] = struct{}{}
-		unique = append(unique, channelId)
-	}
-	if err := cache.RotateCodexUsageGenerations(unique); err != nil {
-		logger.SysError(fmt.Sprintf("failed to rotate %d Codex usage generation(s): %v", len(unique), err))
-	}
-	legacyKeys := make([]string, 0, len(unique)*3)
-	for _, channelId := range unique {
-		legacyKeys = append(legacyKeys,
-			fmt.Sprintf("%s:%d", codexTokenCacheKeyPrefix, channelId),
-			fmt.Sprintf("%s:%d", codexUsagePreviewCacheKeyPrefix, channelId),
-			fmt.Sprintf("%s:%d", codexUsageDetailCacheKeyPrefix, channelId),
-		)
-	}
-	clearChannelCacheKeys(legacyKeys)
-}
-
-func ClearChannelCodexDerivedCache(channelId int) {
-	ClearChannelCodexDerivedCaches([]int{channelId})
-}
-
-func UpdateChannelKey(id int, key string) error {
-	return UpdateChannelKeyWithContext(context.Background(), id, key)
 }
 
 // CompareAndSetChannelKeyWithContext updates credentials only while the database
@@ -1310,7 +1185,9 @@ func CompareAndSetChannelKeyWithContext(ctx context.Context, id int, expectedKey
 	// Legacy callers may still use key CAS for non-refresh replacement, but it
 	// must never act as a generic fence unlock. Persisted OAuth rotation uses the
 	// attempt-scoped CommitCredentialRotation protocol instead.
-	result := DB.WithContext(ctx).Model(&Channel{}).Where("id = ? AND key = ? AND credential_refresh_fence IS NULL", id, expectedKey).Updates(map[string]any{
+	// 旧/new 凭据都出现在 WHERE 与更新参数中，不能进入 GORM 的 SQL 日志。
+	// key 是 MySQL 保留字，不能出现在裸 SQL 条件中，必须走引用后的 clause.Eq。
+	result := DB.WithContext(nonNilContext(ctx)).Session(&gorm.Session{Logger: DB.Logger.LogMode(gormlogger.Silent)}).Model(&Channel{}).Where("id = ? AND credential_refresh_fence IS NULL", id).Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: expectedKey}).Updates(map[string]any{
 		"key": key, "credential_revision": gorm.Expr("credential_revision + 1"),
 		"credential_refresh_fence": nil, "credential_refresh_started_at": nil,
 	})
@@ -1327,21 +1204,6 @@ func CompareAndSetChannelKeyWithContext(ctx context.Context, id int, expectedKey
 	// key directly, so persistence never waits on cache or chooser I/O.
 	ChannelGroup.failClosedChannels([]int{id})
 	return true, nil
-}
-
-func UpdateChannelKeyWithContext(ctx context.Context, id int, key string) error {
-	updated, err := ReplaceChannelCredentialWithContext(ctx, id, key)
-	if err != nil {
-		logger.SysError("failed to update channel key: " + err.Error())
-		return err
-	}
-	if !updated {
-		return nil
-	}
-
-	finishChannelRouteMutation("update channel key", []int{id}, []int{id})
-
-	return nil
 }
 
 func DeleteDisabledChannel() (int64, error) {

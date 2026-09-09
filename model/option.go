@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 	"math"
 	"one-api/common"
 	"one-api/common/config"
@@ -17,6 +15,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var loggedUnknownOptionKeys sync.Map
@@ -568,42 +569,4 @@ func logUnknownOptionKeyOnce(key string) {
 	if logger.Logger != nil {
 		logger.SysLog("skipping unknown option key during option sync: " + key)
 	}
-}
-
-var loggedInvalidOptionLoadErrors sync.Map
-
-func SyncOptions(frequency int) {
-	for {
-		time.Sleep(time.Duration(frequency) * time.Second)
-		logger.SysLog("syncing options from database")
-		loadOptionsFromDatabase()
-	}
-}
-
-func shouldLogInvalidOptionLoadError(key string, err error) bool {
-	message := err.Error()
-	previous, exists := loggedInvalidOptionLoadErrors.Load(key)
-	if exists && previous == message {
-		return false
-	}
-	loggedInvalidOptionLoadErrors.Store(key, message)
-	return true
-}
-
-func clearLoggedInvalidOptionLoadError(key string) {
-	loggedInvalidOptionLoadErrors.Delete(key)
-}
-
-func clearStaleLoggedInvalidOptionLoadErrors(loadedOptions map[string]string) {
-	loggedInvalidOptionLoadErrors.Range(func(rawKey, _ any) bool {
-		key, ok := rawKey.(string)
-		if !ok {
-			loggedInvalidOptionLoadErrors.Delete(rawKey)
-			return true
-		}
-		if _, exists := loadedOptions[key]; !exists {
-			loggedInvalidOptionLoadErrors.Delete(key)
-		}
-		return true
-	})
 }

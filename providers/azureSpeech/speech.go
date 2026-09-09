@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"one-api/common"
 	"one-api/common/config"
+	"one-api/common/requester"
 	"one-api/types"
 	"strings"
 )
@@ -107,7 +108,8 @@ func (p *AzureSpeechProvider) CreateSpeech(request *types.SpeechAudioRequest) (*
 	defer req.Body.Close()
 
 	var resp *http.Response
-	resp, errWithCode = p.Requester.SendRequestRaw(req)
+	speechRequester := p.Requester.ForHTTPProfile(requester.HTTPProfileLongStream)
+	resp, errWithCode = speechRequester.SendRequestRaw(req)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}

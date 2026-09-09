@@ -3,6 +3,8 @@ package codex
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -146,6 +148,29 @@ func TestOAuth2CredentialsRefreshDoesNotSetUserAgentOrOriginator(t *testing.T) {
 	}
 	if creds.AccessToken != "new-access-token" || creds.RefreshToken != "new-refresh-token" {
 		t.Fatalf("expected credentials to be updated, got %+v", creds)
+	}
+}
+
+func TestOAuthRefreshRejectsChangedAccountBeforeAdoption(t *testing.T) {
+	for _, accountID := range []string{"original-account", "different-account"} {
+		t.Run(accountID, func(t *testing.T) {
+			claims, _ := json.Marshal(map[string]any{"https://api.openai.com/auth": map[string]string{"chatgpt_account_id": accountID}})
+			token := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256"}`)) + "." + base64.RawURLEncoding.EncodeToString(claims) + ".signature"
+			withTokenEndpointTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"access_token": token, "refresh_token": "rotated-refresh"})
+			}))
+			credentials := &OAuth2Credentials{AccountID: "original-account", AccessToken: "original-access", RefreshToken: "original-refresh"}
+			err := credentials.Refresh(context.Background(), "")
+			if accountID == "original-account" {
+				if err != nil || credentials.AccessToken != token || credentials.AccountID != accountID {
+					t.Fatalf("same-account refresh failed: credentials=%+v err=%v", credentials, err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrOAuthRefreshOutcomeAmbiguous) || credentials.AccountID != "original-account" || credentials.AccessToken != "original-access" || credentials.RefreshToken != "original-refresh" {
+				t.Fatalf("changed-account credential was adopted: credentials=%+v err=%v", credentials, err)
+			}
+		})
 	}
 }
 

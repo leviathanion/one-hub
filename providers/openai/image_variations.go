@@ -14,8 +14,7 @@ func (p *OpenAIProvider) CreateImageVariations(request *types.ImageEditRequest) 
 	defer req.Body.Close()
 
 	response := &OpenAIProviderImageResponse{}
-	// 发送请求
-	_, errWithCode = p.Requester.SendRequest(req, response, false)
+	_, errWithCode = p.sendUnaryJSON(req, response)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -29,7 +28,10 @@ func (p *OpenAIProvider) CreateImageVariations(request *types.ImageEditRequest) 
 		return nil, errWithCode
 	}
 
-	p.Usage.TotalTokens = p.Usage.PromptTokens
+	applyImageEvidence(p.Usage, &response.ImageResponse, response.confirmedDataCount(p.ProviderRawJSONReplay))
+	if p.ProviderRawJSONReplay {
+		response.EnableProviderRawJSONReplay()
+	}
 
 	return &response.ImageResponse, nil
 }

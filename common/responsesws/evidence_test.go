@@ -6,8 +6,8 @@ import (
 )
 
 func TestRecvEventProviderEvidenceAllowlist(t *testing.T) {
-	terminalFrame := NewTextFrame([]byte(`{"type":"response.completed","response":{"id":"resp_1","status":"completed"}}`))
-	binaryTerminalFrame := NewBinaryFrame([]byte(`{"type":"response.completed","response":{"id":"resp_binary","status":"completed"}}`))
+	terminalFrame := NewTextFrame([]byte(`{"type":"response.completed","sequence_number":1,"response":{"id":"resp_1","status":"completed"}}`))
+	binaryTerminalFrame := NewBinaryFrame([]byte(`{"type":"response.completed","sequence_number":1,"response":{"id":"resp_binary","status":"completed"}}`))
 	nonTerminalFrame := NewTextFrame([]byte(`{"type":"response.created","response":{"id":"resp_1"}}`))
 	usage := &types.UsageEvent{TotalTokens: 1}
 	cases := []struct {
@@ -60,20 +60,6 @@ func TestRecvEventProviderEvidenceAllowlist(t *testing.T) {
 			wantLastActivity: RecvDetailOriginProviderFrame,
 		},
 		{
-			name: "bridge stream opened evidence only",
-			event: UpstreamEvent{
-				DetailOrigin: RecvDetailOriginBridgeStreamOpened,
-			},
-			wantActivity:     true,
-			wantLastActivity: RecvDetailOriginBridgeStreamOpened,
-		},
-		{
-			name: "bridge open provider error is not provider activity",
-			event: UpstreamEvent{
-				DetailOrigin: RecvDetailOriginBridgeOpenProviderError,
-			},
-		},
-		{
 			name: "native provider close evidence only",
 			event: UpstreamEvent{
 				ProviderClose: &ProviderClose{Code: 1000},
@@ -116,21 +102,6 @@ func TestRecvEventProviderEvidenceAllowlist(t *testing.T) {
 			},
 		},
 		{
-			name: "bridge stream error is proxy local only",
-			event: UpstreamEvent{
-				DetailOrigin: RecvDetailOriginBridgeStreamError,
-			},
-			wantProxyLocal: true,
-		},
-		{
-			name: "synthetic bridge is proxy local only",
-			event: UpstreamEvent{
-				Frame:        &terminalFrame,
-				DetailOrigin: RecvDetailOriginSyntheticBridge,
-			},
-			wantProxyLocal: true,
-		},
-		{
 			name: "native backpressure is proxy local only",
 			event: UpstreamEvent{
 				DetailOrigin: RecvDetailOriginNativeBackpressure,
@@ -157,7 +128,7 @@ func TestRecvEventProviderEvidenceAllowlist(t *testing.T) {
 			if got := UpstreamEventIsProxyLocalTerminal(tc.event); got != tc.wantProxyLocal {
 				t.Fatalf("proxy-local terminal mismatch: got %v want %v", got, tc.wantProxyLocal)
 			}
-			var projected ProviderSettlementLogProjection
+			var projected ProviderActivityProjection
 			projected.Observe(NewProviderObservation(tc.event))
 			if projected.HasActivity() != tc.wantActivity {
 				t.Fatalf("facts activity mismatch: got %v want %v", projected.HasActivity(), tc.wantActivity)
@@ -174,10 +145,9 @@ func TestRecvEventProviderEvidenceAllowlist(t *testing.T) {
 
 func TestProjectProviderObservationKnownOriginMatrix(t *testing.T) {
 	tests := []struct {
-		origin        RecvDetailOrigin
-		phase         RecvDetailPhase
-		wantActivity  ProviderActivityFact
-		wantCandidate ZeroChargeProofCandidate
+		origin       RecvDetailOrigin
+		phase        RecvDetailPhase
+		wantActivity ProviderActivityFact
 	}{
 		{
 			origin:       RecvDetailOriginProviderFrame,
@@ -198,17 +168,6 @@ func TestProjectProviderObservationKnownOriginMatrix(t *testing.T) {
 			phase:        RecvDetailPhaseHandleProviderFrame,
 			wantActivity: ProviderActivityFact{ProviderFrameSeen: true},
 		},
-		{origin: RecvDetailOriginSyntheticBridge},
-		{
-			origin:       RecvDetailOriginBridgeStreamOpened,
-			wantActivity: ProviderActivityFact{ProviderStreamOpened: true},
-		},
-		{
-			origin:        RecvDetailOriginBridgeOpenProviderError,
-			wantCandidate: ZeroChargeProofCandidateProviderRejectedBeforeStream,
-		},
-		{origin: RecvDetailOriginBridgeStreamError},
-		{origin: RecvDetailOriginBridgeStreamEOF},
 		{
 			origin:       RecvDetailOriginNativeProviderClose,
 			wantActivity: ProviderActivityFact{ProviderPeerCloseSeen: true},
@@ -237,9 +196,6 @@ func TestProjectProviderObservationKnownOriginMatrix(t *testing.T) {
 			if got.Diagnostic.DetailOrigin != tc.origin || got.Diagnostic.DetailPhase != tc.phase {
 				t.Fatalf("diagnostic mismatch: got %+v", got.Diagnostic)
 			}
-			if got.ZeroChargeProofCandidate != tc.wantCandidate {
-				t.Fatalf("zero proof candidate mismatch: got %v want %v", got.ZeroChargeProofCandidate, tc.wantCandidate)
-			}
 		})
 	}
 	for _, origin := range []RecvDetailOrigin{
@@ -248,11 +204,6 @@ func TestProjectProviderObservationKnownOriginMatrix(t *testing.T) {
 		RecvDetailOriginProviderMalformed,
 		RecvDetailOriginProxyLocal,
 		RecvDetailOriginAdapterPanic,
-		RecvDetailOriginSyntheticBridge,
-		RecvDetailOriginBridgeStreamOpened,
-		RecvDetailOriginBridgeOpenProviderError,
-		RecvDetailOriginBridgeStreamError,
-		RecvDetailOriginBridgeStreamEOF,
 		RecvDetailOriginNativeProviderClose,
 		RecvDetailOriginNativeProviderEOF,
 		RecvDetailOriginNativeLocalAbort,
@@ -263,6 +214,26 @@ func TestProjectProviderObservationKnownOriginMatrix(t *testing.T) {
 		if !seenKnown[origin] {
 			t.Fatalf("missing known origin projection test for %q", origin)
 		}
+	}
+}
+
+func TestProviderActivityProjectionStaysFixedSizeAcrossLongStreams(t *testing.T) {
+	var projection ProviderActivityProjection
+	for index := 0; index < 10000; index++ {
+		projection.Observe(ProviderObservation{
+			DetailOrigin: RecvDetailOriginProviderFrame,
+			HasFrame:     true,
+			FrameKind:    FrameKindText,
+		})
+	}
+	if !projection.HasActivity() || projection.LastActivityOrigin() != RecvDetailOriginProviderFrame {
+		t.Fatalf("activity projection lost its fixed facts: %+v", projection)
+	}
+	other := ProviderActivityProjection{}
+	other.Observe(ProviderObservation{DetailOrigin: RecvDetailOriginNativeProviderClose, HasProviderClose: true})
+	projection.Merge(other)
+	if !projection.Activity.ProviderPeerCloseSeen || projection.LastActivityOrigin() != RecvDetailOriginNativeProviderClose {
+		t.Fatalf("activity merge lost latest fixed fact: %+v", projection)
 	}
 }
 

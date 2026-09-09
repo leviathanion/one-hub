@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -186,6 +187,10 @@ func (r *failingAdmissionOpenAIRealtimeObserver) AdmitTurn() error {
 	return r.admitErr
 }
 
+func (r *failingAdmissionOpenAIRealtimeObserver) ObserveProviderInitiatedTurn(runtimesession.TurnAdmission) error {
+	return r.AdmitTurn()
+}
+
 func (r *failingAdmissionOpenAIRealtimeObserver) RollbackTurnAdmission(reason string) error {
 	_ = reason
 	r.mu.Lock()
@@ -316,6 +321,75 @@ func TestOpenAIRealtimeSessionForwardsBootstrapAndFinalizesTurn(t *testing.T) {
 	}
 	if got := recorder.lastPayload().LastResponseID; got != "resp_123" {
 		t.Fatalf("expected finalized turn to preserve response id, got %q", got)
+	}
+}
+
+func TestOpenAIRealtimeSessionFinalizesStandaloneTranscriptionUsage(t *testing.T) {
+	sendUsage := make(chan struct{})
+	release := make(chan struct{})
+	server := newOpenAIRealtimeTestServer(t, func(conn *openAIRealtimeTestConn) {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"session.updated","session":{}}`)); err != nil {
+			t.Error(err)
+			return
+		}
+		<-sendUsage
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"input_audio_buffer.committed","item_id":"item_transcription_only"}`)); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"conversation.item.input_audio_transcription.completed","event_id":"evt_transcription_only","item_id":"item_transcription_only","usage":{"input_tokens":7,"total_tokens":7}}`)); err != nil {
+			t.Errorf("failed to write standalone transcription usage: %v", err)
+			return
+		}
+		<-release
+	})
+	defer server.Close()
+
+	provider := newOpenAIRealtimeTestProvider(server.URL)
+	session, apiErr := provider.OpenRealtimeSession("gpt-4o-realtime-preview")
+	if apiErr != nil {
+		t.Fatalf("expected realtime session to open, got %v", apiErr)
+	}
+	defer session.Abort("test_cleanup")
+	defer close(release)
+
+	recorder := &recordingOpenAIRealtimeObserver{}
+	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return recorder })
+	for _, input := range []string{
+		`{"type":"session.update","session":{"turn_detection":null,"input_audio_transcription":{"model":"transcription-public"}}}`,
+		`{"type":"input_audio_buffer.append","audio":"AAAA"}`,
+		`{"type":"input_audio_buffer.commit"}`,
+	} {
+		if err := session.SendClient(context.Background(), openAITestTextFrame([]byte(input))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(sendUsage)
+	if _, _, _, _, err := openAITestRecv(context.Background(), session); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, _, err := openAITestRecv(context.Background(), session); err != nil {
+		t.Fatal(err)
+	}
+
+	_, payload, usage, _, err := openAITestRecv(context.Background(), session)
+	if err != nil {
+		t.Fatalf("recv standalone transcription usage: %v", err)
+	}
+	if !strings.Contains(string(payload), types.EventTypeInputAudioTranscriptionCompleted) || usage == nil || usage.Source != types.UsageSourceInputAudioTranscription || usage.InputTokens != 7 {
+		t.Fatalf("unexpected standalone transcription event payload=%s usage=%+v", payload, usage)
+	}
+	waitForOpenAIRealtimeFinalize(t, recorder, 1, 2*time.Second)
+	if recorder.observeCount() != 1 {
+		t.Fatalf("expected standalone transcription usage to be observed once, got %d", recorder.observeCount())
+	}
+	finalized := recorder.lastPayload()
+	if finalized.TerminationReason != types.EventTypeInputAudioTranscriptionCompleted || finalized.WorkID != "input-1" || finalized.Usage == nil || finalized.Usage.ItemID != "item_transcription_only" {
+		t.Fatalf("unexpected standalone transcription finalization: %+v", finalized)
 	}
 }
 
@@ -550,7 +624,7 @@ func TestOpenAIRealtimeSessionPassesThroughErrorEventsWithoutClosing(t *testing.
 	}
 }
 
-func TestOpenAIRealtimeSessionErrorEventFinalizesTurnAndReleasesSessionBusy(t *testing.T) {
+func TestOpenAIRealtimeSessionCorrelatedCreateRejectionFinalizesTurnAndReleasesSessionBusy(t *testing.T) {
 	releaseDone := make(chan struct{})
 	secondCreateSeen := make(chan struct{}, 1)
 	server := newOpenAIRealtimeTestServer(t, func(conn *openAIRealtimeTestConn) {
@@ -558,8 +632,8 @@ func TestOpenAIRealtimeSessionErrorEventFinalizesTurnAndReleasesSessionBusy(t *t
 			t.Errorf("failed to read first response.create request: %v", err)
 			return
 		}
-		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"error","error":{"type":"invalid_request_error","code":"bad_input","message":"bad request"}}`)); err != nil {
-			t.Errorf("failed to write terminal error event: %v", err)
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"error","error":{"type":"invalid_request_error","code":"bad_input","message":"bad request","event_id":"evt_create_rejected"}}`)); err != nil {
+			t.Errorf("failed to write correlated create rejection: %v", err)
 			return
 		}
 		if _, _, err := conn.ReadMessage(); err != nil {
@@ -588,8 +662,8 @@ func TestOpenAIRealtimeSessionErrorEventFinalizesTurnAndReleasesSessionBusy(t *t
 	recorder := &recordingOpenAIRealtimeObserver{}
 	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return recorder })
 
-	createPayload := []byte(`{"type":"response.create","response":{"input":[]}}`)
-	if err := session.SendClient(context.Background(), openAITestTextFrame(createPayload)); err != nil {
+	firstCreatePayload := []byte(`{"type":"response.create","event_id":"evt_create_rejected","response":{"input":[]}}`)
+	if err := session.SendClient(context.Background(), openAITestTextFrame(firstCreatePayload)); err != nil {
 		t.Fatalf("expected first response.create send to succeed, got %v", err)
 	}
 
@@ -604,8 +678,9 @@ func TestOpenAIRealtimeSessionErrorEventFinalizesTurnAndReleasesSessionBusy(t *t
 		t.Fatalf("expected passthrough error payload, got %q", payload)
 	}
 
-	if err := session.SendClient(context.Background(), openAITestTextFrame(createPayload)); err != nil {
-		t.Fatalf("expected error event to release session_busy for the next response.create, got %v", err)
+	secondCreatePayload := []byte(`{"type":"response.create","event_id":"evt_create_recovered","response":{"input":[]}}`)
+	if err := session.SendClient(context.Background(), openAITestTextFrame(secondCreatePayload)); err != nil {
+		t.Fatalf("expected correlated create rejection to release session_busy for the next response.create, got %v", err)
 	}
 
 	waitForOpenAIRealtimeFinalize(t, recorder, 1, 2*time.Second)
@@ -631,6 +706,102 @@ func TestOpenAIRealtimeSessionErrorEventFinalizesTurnAndReleasesSessionBusy(t *t
 	}
 }
 
+func TestOpenAIRealtimeSessionInjectsAndRestoresMissingCreateEventID(t *testing.T) {
+	releaseDone := make(chan struct{})
+	upstreamEventIDs := make(chan string, 2)
+	server := newOpenAIRealtimeTestServer(t, func(conn *openAIRealtimeTestConn) {
+		_, firstPayload, err := conn.ReadMessage()
+		if err != nil {
+			t.Errorf("failed to read first response.create request: %v", err)
+			return
+		}
+		firstEventID := openAIRealtimeClientEventID(firstPayload)
+		if firstEventID == "" {
+			t.Error("expected proxy correlation event_id on first response.create")
+			return
+		}
+		upstreamEventIDs <- firstEventID
+		errorPayload := []byte(fmt.Sprintf(`{"type":"error","error":{"type":"invalid_request_error","code":"bad_input","message":"bad request","event_id":%q}}`, firstEventID))
+		if err := conn.WriteMessage(wsconn.TextMessage, errorPayload); err != nil {
+			t.Errorf("failed to write correlated create rejection: %v", err)
+			return
+		}
+
+		_, secondPayload, err := conn.ReadMessage()
+		if err != nil {
+			t.Errorf("failed to read second response.create request: %v", err)
+			return
+		}
+		secondEventID := openAIRealtimeClientEventID(secondPayload)
+		if secondEventID == "" || secondEventID == firstEventID {
+			t.Errorf("expected a distinct proxy correlation event_id on second response.create, got %q", secondEventID)
+			return
+		}
+		upstreamEventIDs <- secondEventID
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_recovered_without_client_event_id","status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)); err != nil {
+			t.Errorf("failed to write recovery response.done event: %v", err)
+			return
+		}
+		<-releaseDone
+	})
+	defer server.Close()
+
+	provider := newOpenAIRealtimeTestProvider(server.URL)
+	session, errWithCode := provider.OpenRealtimeSession("gpt-4o-realtime-preview")
+	if errWithCode != nil {
+		t.Fatalf("expected realtime session to open, got %v", errWithCode)
+	}
+	defer func() {
+		close(releaseDone)
+		session.Abort("test_cleanup")
+	}()
+
+	recorder := &recordingOpenAIRealtimeObserver{}
+	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return recorder })
+	createPayload := []byte(`{"type":"response.create","response":{"input":[]}}`)
+	if err := session.SendClient(context.Background(), openAITestTextFrame(createPayload)); err != nil {
+		t.Fatalf("expected first response.create send to succeed, got %v", err)
+	}
+
+	_, payload, usage, _, err := openAITestRecv(context.Background(), session)
+	if err != nil {
+		t.Fatalf("expected correlated rejection to remain recoverable, got %v", err)
+	}
+	if usage != nil {
+		t.Fatalf("expected create rejection without usage, got %+v", usage)
+	}
+	var downstream struct {
+		Error struct {
+			EventID string `json:"event_id"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(payload, &downstream); err != nil {
+		t.Fatalf("expected downstream error JSON, got %q: %v", payload, err)
+	}
+	if downstream.Error.EventID != "" {
+		t.Fatalf("expected proxy correlation event_id to be removed downstream, got %q", downstream.Error.EventID)
+	}
+
+	if err := session.SendClient(context.Background(), openAITestTextFrame(createPayload)); err != nil {
+		t.Fatalf("expected create rejection to release session_busy for a second create without event_id, got %v", err)
+	}
+	waitForOpenAIRealtimeFinalize(t, recorder, 1, 2*time.Second)
+	if got := recorder.payloadAt(0).TerminationReason; got != types.EventTypeError {
+		t.Fatalf("expected rejected turn to finalize with reason %q, got %q", types.EventTypeError, got)
+	}
+
+	_, payload, usage, _, err = openAITestRecv(context.Background(), session)
+	if err != nil {
+		t.Fatalf("expected recovery response.done, got %v", err)
+	}
+	if !strings.Contains(string(payload), `"resp_recovered_without_client_event_id"`) || usage == nil || usage.TotalTokens != 2 {
+		t.Fatalf("expected recovery response and usage, payload=%q usage=%+v", payload, usage)
+	}
+	if got := len(upstreamEventIDs); got != 2 {
+		t.Fatalf("expected both upstream creates to carry proxy correlation IDs, got %d", got)
+	}
+}
+
 func TestOpenAIRealtimeSessionIgnoresLateFinalizedResponseUsageAfterNewTurnStarts(t *testing.T) {
 	releaseDone := make(chan struct{})
 	allowCurrentDone := make(chan struct{})
@@ -644,7 +815,11 @@ func TestOpenAIRealtimeSessionIgnoresLateFinalizedResponseUsageAfterNewTurnStart
 			return
 		}
 		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"error","error":{"type":"invalid_request_error","code":"bad_input","message":"bad request"}}`)); err != nil {
-			t.Errorf("failed to write terminal error event: %v", err)
+			t.Errorf("failed to write recoverable error event: %v", err)
+			return
+		}
+		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_old","status":"completed","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`)); err != nil {
+			t.Errorf("failed to write first response.done event: %v", err)
 			return
 		}
 		if _, _, err := conn.ReadMessage(); err != nil {
@@ -708,6 +883,17 @@ func TestOpenAIRealtimeSessionIgnoresLateFinalizedResponseUsageAfterNewTurnStart
 		t.Fatalf("expected passthrough error event not to carry usage, got %+v", usage)
 	}
 
+	_, payload, usage, _, err = openAITestRecv(context.Background(), session)
+	if err != nil {
+		t.Fatalf("expected first response.done without error, got %v", err)
+	}
+	if !strings.Contains(string(payload), `"resp_old"`) || !strings.Contains(string(payload), `"response.done"`) {
+		t.Fatalf("expected first response.done payload, got %q", payload)
+	}
+	if usage == nil || usage.TotalTokens != 8 {
+		t.Fatalf("expected first response.done usage to be preserved, got %+v", usage)
+	}
+
 	if err := session.SendClient(context.Background(), openAITestTextFrame(createPayload)); err != nil {
 		t.Fatalf("expected second response.create send to succeed, got %v", err)
 	}
@@ -717,8 +903,8 @@ func TestOpenAIRealtimeSessionIgnoresLateFinalizedResponseUsageAfterNewTurnStart
 	if firstFinalize.LastResponseID != "resp_old" {
 		t.Fatalf("expected first finalized turn to preserve old response id, got %q", firstFinalize.LastResponseID)
 	}
-	if firstFinalize.TerminationReason != types.EventTypeError {
-		t.Fatalf("expected first finalized turn to use error termination, got %q", firstFinalize.TerminationReason)
+	if firstFinalize.TerminationReason != types.EventTypeResponseDone {
+		t.Fatalf("expected first finalized turn to use response.done termination, got %q", firstFinalize.TerminationReason)
 	}
 
 	_, payload, usage, _, err = openAITestRecv(context.Background(), session)
@@ -742,7 +928,7 @@ func TestOpenAIRealtimeSessionIgnoresLateFinalizedResponseUsageAfterNewTurnStart
 	if usage != nil {
 		t.Fatalf("expected late finalized response.done not to attribute usage to the new turn, got %+v", usage)
 	}
-	if recorder.observeCount() != 0 {
+	if recorder.observeCount() != 1 {
 		t.Fatalf("expected late finalized response.done not to bill usage, got %d observations", recorder.observeCount())
 	}
 	if recorder.finalizeCount() != 1 {
@@ -763,8 +949,8 @@ func TestOpenAIRealtimeSessionIgnoresLateFinalizedResponseUsageAfterNewTurnStart
 	}
 
 	waitForOpenAIRealtimeFinalize(t, recorder, 2, 2*time.Second)
-	if recorder.observeCount() != 1 {
-		t.Fatalf("expected only the current turn usage to be observed, got %d", recorder.observeCount())
+	if recorder.observeCount() != 2 {
+		t.Fatalf("expected one usage observation per completed turn, got %d", recorder.observeCount())
 	}
 	if got := recorder.lastPayload().LastResponseID; got != "resp_new" {
 		t.Fatalf("expected second finalized turn to preserve new response id, got %q", got)

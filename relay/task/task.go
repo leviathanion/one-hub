@@ -3,141 +3,194 @@ package task
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
+	"sync"
+	"time"
+
 	"one-api/common"
 	"one-api/common/logger"
 	"one-api/model"
 	"one-api/relay/task/base"
-	"sync"
-	"sync/atomic"
-	"time"
 )
 
-var (
-	taskActive int32 = 0
-	lock       sync.Mutex
-	cond       = sync.NewCond(&lock)
+const (
+	asyncTaskSubmitDeadline       = 10 * time.Minute
+	taskOwnerMutationDeadline     = 5 * time.Second
+	stalePreparedTaskTimeout      = 15 * time.Minute
+	staleSubmitStartedTaskTimeout = 15 * time.Minute
+	taskProgressTick              = 15 * time.Second
+	taskProgressWorkers           = 8
 )
 
-const emptyTaskIDSweepDelay = time.Minute
+var taskWake = make(chan struct{}, 1)
 
 func InitTask() {
-	common.SafeGoroutine(func() {
-		Task()
-	})
-
+	common.SafeGoroutine(Task)
 	ActivateUpdateTaskBulk()
 }
 
+// Task is a fixed-tick durable progressor. Wakeups only reduce latency; a lost
+// wakeup cannot strand an owner because next_action_at remains authoritative.
 func Task() {
+	ticker := time.NewTicker(taskProgressTick)
+	defer ticker.Stop()
 	for {
-		lock.Lock()
-		for atomic.LoadInt32(&taskActive) == 0 {
-			cond.Wait() // 等待激活信号
-		}
-		lock.Unlock()
 		UpdateTaskBulk()
+		select {
+		case <-ticker.C:
+		case <-taskWake:
+		}
 	}
 }
 
 func ActivateUpdateTaskBulk() {
-	if atomic.LoadInt32(&taskActive) == 1 {
-		return
+	select {
+	case taskWake <- struct{}{}:
+	default:
 	}
-
-	lock.Lock()
-	atomic.StoreInt32(&taskActive, 1)
-	cond.Signal() // 通知等待的任务
-	lock.Unlock()
 }
 
-func DeactivateTask() {
-	if atomic.LoadInt32(&taskActive) == 0 {
-		return
-	}
-
-	lock.Lock()
-	atomic.StoreInt32(&taskActive, 0)
-	lock.Unlock()
+type taskPollGroup struct {
+	platform  string
+	channelID int
+	tasks     []*model.Task
 }
 
 func UpdateTaskBulk() {
 	ctx := context.WithValue(context.Background(), logger.RequestIdKey, "Task")
+	var afterNextActionAt, afterID int64
 	for {
-		logger.LogInfo(ctx, "running")
-		allTasks := model.GetAllUnFinishSyncTasks(500)
-		platformTask := make(map[string][]*model.Task)
-
-		if len(allTasks) == 0 {
-			DeactivateTask()
-			logger.LogInfo(ctx, "no tasks, waiting...")
+		due, err := model.ListDueTaskOwners(ctx, time.Now(), afterNextActionAt, afterID, model.TaskProgressPageSize)
+		if err != nil {
+			logger.LogError(ctx, "scan due task owners failed: "+err.Error())
+			return
+		}
+		if len(due) == 0 {
 			return
 		}
 
-		for _, t := range allTasks {
-			platformTask[t.Platform] = append(platformTask[t.Platform], t)
-		}
-		for platform, tasks := range platformTask {
-			if len(tasks) == 0 {
+		groups := make(map[string]*taskPollGroup)
+		for _, owner := range due {
+			if owner == nil {
 				continue
 			}
-			taskChannelM := make(map[int][]string)
-			taskM := make(map[string]*model.Task)
-			nullTaskIds := make([]*model.Task, 0)
-			for _, task := range tasks {
-				trackingHandle := base.TaskTrackingHandle(task)
-				if trackingHandle == "" {
-					if !shouldSweepEmptyTaskID(task) {
-						continue
-					}
-					nullTaskIds = append(nullTaskIds, task)
+			scanNextActionAt, scanID := owner.NextActionAt, owner.ID
+			if scanNextActionAt > afterNextActionAt || (scanNextActionAt == afterNextActionAt && scanID > afterID) {
+				afterNextActionAt, afterID = scanNextActionAt, scanID
+			}
+
+			switch owner.ProviderState {
+			case model.TaskProviderStatePrepared, model.TaskProviderStateSubmitStarted:
+				settleStaleTaskOwner(ctx, owner, time.Now())
+				continue
+			case model.TaskProviderStateAccepted:
+				claim, claimErr := model.ClaimTaskPoll(ctx, owner, time.Now(), model.TaskPollFenceWindow)
+				if claimErr != nil || claim.Outcome != model.TaskMutationApplied {
 					continue
 				}
-				taskM[trackingHandle] = task
-				taskChannelM[task.ChannelId] = append(taskChannelM[task.ChannelId], trackingHandle)
-			}
-
-			if len(nullTaskIds) > 0 {
-				failedTaskIDs := make([]int64, 0, len(nullTaskIds))
-				for _, task := range nullTaskIds {
-					if err := base.FailTaskWithSettlement(ctx, task, "task_id 为空，无法继续同步任务状态"); err != nil {
-						logger.LogError(ctx, fmt.Sprintf("Fix null task_id task error: %v", err))
-						continue
+				if base.TaskTrackingHandle(owner) == "" {
+					owner.Status = model.TaskStatusUnknown
+					if closeErr := base.FailTaskWithSettlement(ctx, owner, "accepted task is missing provider handle"); closeErr != nil {
+						logger.LogError(ctx, "close accepted task without handle: "+closeErr.Error())
 					}
-					failedTaskIDs = append(failedTaskIDs, task.ID)
+					continue
 				}
-				if len(failedTaskIDs) > 0 {
-					logger.LogInfo(ctx, fmt.Sprintf("Fix null task_id task success: %v", failedTaskIDs))
+				key := fmt.Sprintf("%s\x00%d", owner.Platform, owner.ChannelId)
+				group := groups[key]
+				if group == nil {
+					group = &taskPollGroup{platform: owner.Platform, channelID: owner.ChannelId}
+					groups[key] = group
 				}
+				group.tasks = append(group.tasks, owner)
 			}
-			if len(taskChannelM) == 0 {
-				continue
-			}
-			UpdateTaskByPlatform(ctx, platform, taskChannelM, taskM)
 		}
-		time.Sleep(time.Duration(15) * time.Second)
+		progressTaskGroups(ctx, groups)
+		if len(due) < model.TaskProgressPageSize {
+			return
+		}
 	}
 }
 
-func shouldSweepEmptyTaskID(task *model.Task) bool {
-	if task == nil || base.TaskTrackingHandle(task) != "" {
-		return false
+func progressTaskGroups(parent context.Context, groups map[string]*taskPollGroup) {
+	jobs := make(chan *taskPollGroup)
+	var workers sync.WaitGroup
+	workerCount := taskProgressWorkers
+	if len(groups) < workerCount {
+		workerCount = len(groups)
 	}
-	if !base.TaskAcceptedWithoutTrackingHandle(task) {
-		return false
+	for i := 0; i < workerCount; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for group := range jobs {
+				progressTaskGroup(parent, group)
+			}
+		}()
 	}
-	if task.SubmitTime <= 0 {
-		return true
+	for _, group := range groups {
+		jobs <- group
 	}
-	return time.Now().Unix()-task.SubmitTime >= int64(emptyTaskIDSweepDelay/time.Second)
+	close(jobs)
+	workers.Wait()
 }
 
-func UpdateTaskByPlatform(ctx context.Context,
-	platform string, taskChannelM map[int][]string, taskM map[string]*model.Task) {
+func progressTaskGroup(parent context.Context, group *taskPollGroup) {
+	if group == nil || len(group.tasks) == 0 {
+		return
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			logger.LogError(parent, fmt.Sprintf("task poll panic platform=%s channel=%d: %v\n%s", group.platform, group.channelID, recovered, debug.Stack()))
+		}
+	}()
+	taskIDs := make([]string, 0, len(group.tasks))
+	taskMap := make(map[string]*model.Task, len(group.tasks))
+	for _, owner := range group.tasks {
+		handle := base.TaskTrackingHandle(owner)
+		if handle == "" {
+			continue
+		}
+		taskIDs = append(taskIDs, handle)
+		taskMap[handle] = owner
+	}
+	if len(taskIDs) == 0 {
+		return
+	}
+	UpdateTaskByPlatform(parent, group.platform, map[int][]string{group.channelID: taskIDs}, taskMap)
+}
+
+func settleStaleTaskOwner(ctx context.Context, task *model.Task, now time.Time) bool {
+	if task == nil || task.ProviderState == model.TaskProviderStateClosed {
+		return task != nil && task.ProviderState == model.TaskProviderStateClosed
+	}
+	switch task.ProviderState {
+	case model.TaskProviderStatePrepared:
+		if task.CreatedAt > 0 && now.Unix()-task.CreatedAt >= int64(stalePreparedTaskTimeout/time.Second) {
+			task.Status = model.TaskStatusLocalFailure
+			if err := base.FailTaskWithSettlement(ctx, task, "prepared task submission expired before claim"); err != nil {
+				logger.LogError(ctx, "close stale prepared task owner failed: "+err.Error())
+			}
+			return true
+		}
+	case model.TaskProviderStateSubmitStarted:
+		if task.SubmitStartedAt != nil && now.Unix()-*task.SubmitStartedAt >= int64(staleSubmitStartedTaskTimeout/time.Second) {
+			task.Status = model.TaskStatusUnknown
+			if err := base.FailTaskWithSettlement(ctx, task, "task submission outcome remained ambiguous"); err != nil {
+				logger.LogError(ctx, "close stale submit-started task owner failed: "+err.Error())
+			}
+			return true
+		}
+	}
+	return false
+}
+
+func UpdateTaskByPlatform(ctx context.Context, platform string, taskChannelM map[int][]string, taskM map[string]*model.Task) {
 	taskAdaptor, err := GetTaskAdaptorByPlatform(platform)
 	if err != nil {
 		logger.LogError(ctx, fmt.Sprintf("GetTaskAdaptorByPlatform error: %v", err))
 		return
 	}
-
-	taskAdaptor.UpdateTaskStatus(ctx, taskChannelM, taskM)
+	if err := taskAdaptor.UpdateTaskStatus(ctx, taskChannelM, taskM); err != nil {
+		logger.LogError(ctx, fmt.Sprintf("UpdateTaskStatus platform=%s: %v", platform, err))
+	}
 }

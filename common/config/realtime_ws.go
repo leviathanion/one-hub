@@ -14,6 +14,38 @@ func RealtimeWebsocketReadLimit() int64 {
 	return limit
 }
 
+func RealtimeWebsocketClientFrameQueueMaxBytes() int64 {
+	limit := viper.GetInt64("realtime.client_frame_queue_max_bytes")
+	if limit <= 0 {
+		return 64 << 20
+	}
+	return limit
+}
+
+func RealtimeWebsocketPendingFrameQueueMaxBytes() int64 {
+	limit := viper.GetInt64("realtime.pending_frame_queue_max_bytes")
+	if limit <= 0 {
+		return 64 << 20
+	}
+	return limit
+}
+
+func RealtimeWebsocketProviderFrameQueueMaxBytes() int64 {
+	limit := viper.GetInt64("realtime.provider_frame_queue_max_bytes")
+	if limit <= 0 {
+		return 64 << 20
+	}
+	return limit
+}
+
+func RealtimeWebsocketAttachmentQueueMaxBytes() int64 {
+	limit := viper.GetInt64("realtime.attachment_queue_max_bytes")
+	if limit <= 0 {
+		return 64 << 20
+	}
+	return limit
+}
+
 func RealtimeWebsocketWriteTimeout() time.Duration {
 	timeoutMS := viper.GetInt("realtime.websocket_write_timeout_ms")
 	if timeoutMS <= 0 {
@@ -54,15 +86,7 @@ func RealtimeWebsocketClientInboundActivityTimeout() time.Duration {
 }
 
 func ResponsesWSFirstFrameTimeout() time.Duration {
-	timeoutMS := viper.GetInt("responses_ws.first_frame_timeout_ms")
-	if timeoutMS <= 0 {
-		return 30 * time.Second
-	}
-	return time.Duration(timeoutMS) * time.Millisecond
-}
-
-func ResponsesWSBridgeOpenTimeout() time.Duration {
-	return durationFromViperMS("responses_ws.bridge_open_timeout_ms", 30*time.Second, true)
+	return durationFromViperMS("responses_ws.first_frame_timeout_ms", 30*time.Second, true)
 }
 
 func ResponsesWSActiveLeaseRedisFailOpen() bool {
@@ -77,35 +101,23 @@ func ResponsesWebsocketClientPingInterval() time.Duration {
 }
 
 func ResponsesWebsocketClientPongMissTimeout() time.Duration {
-	return durationFromViperMS("responses_websocket_client_pong_miss_timeout_ms", 0, true)
+	return durationFromViperMS("responses_websocket_client_pong_miss_timeout_ms", 10*time.Second, true)
 }
 
 func ResponsesWebsocketClientInboundActivityTimeout() time.Duration {
-	return durationFromViperMS("responses_websocket_client_inbound_activity_timeout_ms", 5*time.Minute, true)
+	return durationFromViperMS("responses_websocket_client_inbound_activity_timeout_ms", time.Minute, true)
 }
 
 func ResponsesWSIdleTimeout() time.Duration {
-	timeoutMS := viper.GetInt("responses_ws.idle_timeout_ms")
-	if timeoutMS <= 0 {
-		return 30 * time.Minute
-	}
-	return time.Duration(timeoutMS) * time.Millisecond
+	return durationFromViperMS("responses_ws.idle_timeout_ms", 30*time.Minute, true)
 }
 
 func ResponsesWSActiveTurnTimeout() time.Duration {
-	timeoutMS := viper.GetInt("responses_ws.active_turn_timeout_ms")
-	if timeoutMS <= 0 {
-		return 2 * time.Minute
-	}
-	return time.Duration(timeoutMS) * time.Millisecond
+	return durationFromViperMS("responses_ws.active_turn_timeout_ms", 2*time.Minute, true)
 }
 
 func ResponsesWSMaxLifetime() time.Duration {
-	timeoutMS := viper.GetInt("responses_ws.max_lifetime_ms")
-	if timeoutMS <= 0 {
-		return time.Hour
-	}
-	return time.Duration(timeoutMS) * time.Millisecond
+	return durationFromViperMS("responses_ws.max_lifetime_ms", time.Hour, true)
 }
 
 func ResponsesWSPendingProviderEventsMaxBytes() int {

@@ -195,13 +195,17 @@ func (c *OAuth2Credentials) Refresh(ctx context.Context, proxyURL string) error 
 	if strings.TrimSpace(tokenResp.RefreshToken) == "" {
 		return fmt.Errorf("%w: successful response omitted rotated refresh_token", ErrOAuthRefreshOutcomeAmbiguous)
 	}
+	accountID := extractAccountIDFromJWT(tokenResp.AccessToken)
+	if currentAccount := cachedAccountID(c); currentAccount != "" && accountID != "" && accountID != currentAccount {
+		return fmt.Errorf("%w: 刷新返回了不同账号，凭证未写入原渠道；请新建渠道", ErrOAuthRefreshOutcomeAmbiguous)
+	}
 
 	c.AccessToken = tokenResp.AccessToken
 	c.RefreshToken = tokenResp.RefreshToken
 	if tokenResp.TokenType != "" {
 		c.TokenType = tokenResp.TokenType
 	}
-	if accountID := extractAccountIDFromJWT(tokenResp.AccessToken); accountID != "" {
+	if accountID != "" {
 		c.AccountID = accountID
 	}
 	if tokenResp.Scope != "" {

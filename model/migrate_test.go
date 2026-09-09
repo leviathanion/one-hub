@@ -1,16 +1,149 @@
 package model
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
 
 	"one-api/common/config"
 	"one-api/common/logger"
+	"one-api/internal/testutil/sqlitetest"
 
 	"go.uber.org/zap"
+	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
+
+func TestRemoveLegacyMediaProxyOptionsIsAtomicAndIdempotent(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(sqlitetest.MemoryDSN()), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&Option{}, &PublicationVersion{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsurePublicationVersionRows(db); err != nil {
+		t.Fatal(err)
+	}
+	rows := []Option{
+		{Key: "ChatImageRequestProxy", Value: "http://proxy.example"},
+		{Key: "CFWorkerImageUrl", Value: "https://worker.example"},
+		{Key: "CFWorkerImageKey", Value: "secret"},
+		{Key: "SystemName", Value: "kept"},
+	}
+	if err := db.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	migration := removeLegacyMediaProxyOptions()
+	if err := migration.Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	var remaining []Option
+	if err := db.Order("key").Find(&remaining).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != 1 || remaining[0].Key != "SystemName" || remaining[0].Value != "kept" {
+		t.Fatalf("migration removed non-target options or retained target options: %#v", remaining)
+	}
+	version, err := ReadPublicationVersion(context.Background(), db, PublicationOwnerOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != 2 {
+		t.Fatalf("options version=%d, want 2 after deleting legacy rows", version)
+	}
+
+	if err := migration.Migrate(db); err != nil {
+		t.Fatalf("idempotent rerun failed: %v", err)
+	}
+	afterRerun, err := ReadPublicationVersion(context.Background(), db, PublicationOwnerOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterRerun != version {
+		t.Fatalf("idempotent rerun advanced options version from %d to %d", version, afterRerun)
+	}
+}
+
+func TestRemoveLegacyMediaProxyOptionsDoesNotPublishWithoutDeletion(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(sqlitetest.MemoryDSN()), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&Option{}, &PublicationVersion{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsurePublicationVersionRows(db); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&Option{Key: "SystemName", Value: "kept"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := removeLegacyMediaProxyOptions().Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	version, err := ReadPublicationVersion(context.Background(), db, PublicationOwnerOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != 1 {
+		t.Fatalf("options version=%d, want 1 when no legacy row was deleted", version)
+	}
+}
+
+func TestRemoveLegacyMediaProxyOptionsRollsBackDeletionWhenRevisionCannotAdvance(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(sqlitetest.MemoryDSN()), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&Option{}, &PublicationVersion{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&Option{Key: "CFWorkerImageKey", Value: "secret"}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := removeLegacyMediaProxyOptions().Migrate(db); err == nil {
+		t.Fatal("migration succeeded without the options publication revision row")
+	}
+	var retained Option
+	if err := db.Where("key = ?", "CFWorkerImageKey").Take(&retained).Error; err != nil {
+		t.Fatalf("legacy option deletion was not rolled back: %v", err)
+	}
+}
+
+func TestOtherMigrationPreservesNativeResponsesWSSettings(t *testing.T) {
+	useTestChannelDB(t)
+	if DB.Migrator().HasColumn(&Channel{}, "responses_ws_native") || DB.Migrator().HasColumn(&Channel{}, "responses_ws_self_hosted") {
+		t.Fatal("Responses WS UI switches must remain in channel.other and must not create channel columns")
+	}
+	insertTestChannel(t, &Channel{Plugin: NewCustomEndpointPlugin(),
+		Id:     100,
+		Type:   config.ChannelTypeCustom,
+		Name:   "custom",
+		Key:    "sk",
+		Group:  "default",
+		Models: "custom-model",
+		Other:  `{"responses_ws_native":true,"responses_ws_self_hosted":true,"vendor_extra":{"owner":"ops"}}`,
+	})
+
+	legacyMigration := migrateLegacyChannelOtherJSON()
+	for iteration := 0; iteration < 2; iteration++ {
+		if err := legacyMigration.Migrate(DB); err != nil {
+			t.Fatalf("repeat current Other migration: %v", err)
+		}
+	}
+	channel, err := GetChannelById(100)
+	if err != nil {
+		t.Fatalf("load migrated channel: %v", err)
+	}
+	assertJSONObjectsEqual(t, channel.Other, `{"responses_ws_native":true,"responses_ws_self_hosted":true,"vendor_extra":{"owner":"ops"}}`)
+	if err := channel.ValidateRuntimeConfigJSON(); err != nil {
+		t.Fatalf("native WS settings and opaque vendor data must remain valid: %v", err)
+	}
+}
 
 func TestMigrateLegacyChannelOtherJSONConvertsLosslessProviderFormats(t *testing.T) {
 	useTestChannelDB(t)
@@ -22,8 +155,7 @@ func TestMigrateLegacyChannelOtherJSONConvertsLosslessProviderFormats(t *testing
 	insertTestChannel(t, &Channel{Id: 5, Type: config.ChannelTypeAli, Name: "ali", Key: "sk", Group: "default", Models: "qwen", Other: "plugin-a"})
 	insertTestChannel(t, &Channel{Id: 6, Type: config.ChannelTypeVertexAI, Name: "vertex", Key: "sk", Group: "default", Models: "gemini-pro", Other: "us-central1|project-a"})
 	insertTestChannel(t, &Channel{Id: 7, Type: config.ChannelTypeOpenAI, Name: "openai", Key: "sk", Group: "default", Models: "gpt-5", Other: "legacy-openai"})
-	insertTestChannel(t, &Channel{Id: 8, Type: config.ChannelTypeCustom, Name: "custom", Key: "sk", Group: "default", Models: "gpt-5", Other: "legacy-custom"})
-	insertTestChannel(t, &Channel{Id: 9, Type: config.ChannelTypeCodex, Name: "codex", Key: "sk", Group: "default", Models: "gpt-5", Other: `{"websocket_mode":"required"}`})
+	insertTestChannel(t, &Channel{Plugin: NewCustomEndpointPlugin(), Id: 8, Type: config.ChannelTypeCustom, Name: "custom", Key: "sk", Group: "default", Models: "gpt-5", Other: "legacy-custom"})
 
 	if err := migrateLegacyChannelOtherJSON().Migrate(DB); err != nil {
 		t.Fatalf("expected legacy Other migration to succeed, got %v", err)
@@ -38,7 +170,6 @@ func TestMigrateLegacyChannelOtherJSONConvertsLosslessProviderFormats(t *testing
 		6: `{"region":"us-central1","project_id":"project-a"}`,
 		7: `{"vendor_extra":{"legacy_other":"legacy-openai"}}`,
 		8: `{"vendor_extra":{"legacy_other":"legacy-custom"}}`,
-		9: `{"websocket_mode":"force"}`,
 	}
 	for id, want := range expected {
 		channel, err := GetChannelById(id)

@@ -19,6 +19,9 @@ type aliStreamHandler struct {
 
 func (p *AliProvider) CreateChatCompletion(request *types.ChatCompletionRequest) (*types.ChatCompletionResponse, *types.OpenAIErrorWithStatusCode) {
 	if p.UseOpenaiAPI {
+		if errWithCode := p.validateEffectiveSearch(request); errWithCode != nil {
+			return nil, errWithCode
+		}
 		return p.OpenAIProvider.CreateChatCompletion(request)
 	}
 
@@ -40,6 +43,9 @@ func (p *AliProvider) CreateChatCompletion(request *types.ChatCompletionRequest)
 
 func (p *AliProvider) CreateChatCompletionStream(request *types.ChatCompletionRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
 	if p.UseOpenaiAPI {
+		if errWithCode := p.validateEffectiveSearch(request); errWithCode != nil {
+			return nil, errWithCode
+		}
 		return p.OpenAIProvider.CreateChatCompletionStream(request)
 	}
 
@@ -50,7 +56,8 @@ func (p *AliProvider) CreateChatCompletionStream(request *types.ChatCompletionRe
 	defer req.Body.Close()
 
 	// 发送请求
-	resp, errWithCode := p.Requester.SendRequestRaw(req)
+	streamRequester := p.Requester.ForHTTPProfile(requester.HTTPProfileLongStream)
+	resp, errWithCode := streamRequester.SendRequestRaw(req)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -60,10 +67,13 @@ func (p *AliProvider) CreateChatCompletionStream(request *types.ChatCompletionRe
 		Request: request,
 	}
 
-	return requester.RequestStream[string](p.Requester, resp, chatHandler.handlerStream)
+	return requester.RequestStream[string](streamRequester, resp, chatHandler.handlerStream)
 }
 
 func (p *AliProvider) getAliChatRequest(request *types.ChatCompletionRequest) (*http.Request, *types.OpenAIErrorWithStatusCode) {
+	if errWithCode := p.validateEffectiveSearch(request); errWithCode != nil {
+		return nil, errWithCode
+	}
 	url, errWithCode := p.GetSupportedAPIUri(config.RelayModeChatCompletions)
 	if errWithCode != nil {
 		return nil, errWithCode
@@ -88,6 +98,20 @@ func (p *AliProvider) getAliChatRequest(request *types.ChatCompletionRequest) (*
 	return req, nil
 }
 
+func (p *AliProvider) validateEffectiveSearch(request *types.ChatCompletionRequest) *types.OpenAIErrorWithStatusCode {
+	if p == nil || request == nil {
+		return nil
+	}
+	raw, _, err := p.GetRawBodyMap()
+	if err != nil {
+		return common.StringErrorWrapperLocal("Chat request cannot be evaluated for DashScope search billing evidence", "ali_search_billing_unsupported", http.StatusBadRequest)
+	}
+	if err := validateAliSearchPlan(p.Channel, request.Model, request, raw); err != nil {
+		return common.StringErrorWrapperLocal(err.Error(), "ali_search_billing_unsupported", http.StatusBadRequest)
+	}
+	return nil
+}
+
 // 转换为OpenAI聊天请求体
 func (p *AliProvider) convertToChatOpenai(response *AliChatResponse, request *types.ChatCompletionRequest) (openaiResponse *types.ChatCompletionResponse, errWithCode *types.OpenAIErrorWithStatusCode) {
 	aiError := errorHandle(&response.AliError)
@@ -105,14 +129,12 @@ func (p *AliProvider) convertToChatOpenai(response *AliChatResponse, request *ty
 		Created: utils.GetTimestamp(),
 		Model:   request.Model,
 		Choices: response.Output.ToChatCompletionChoices(),
-		Usage: &types.Usage{
-			PromptTokens:     response.Usage.InputTokens,
-			CompletionTokens: response.Usage.OutputTokens,
-			TotalTokens:      response.Usage.InputTokens + response.Usage.OutputTokens,
-		},
+		Usage:   aliUsageToOpenAI(&response.Usage),
 	}
-
-	*p.Usage = *openaiResponse.Usage
+	if openaiResponse.Usage != nil {
+		applyAliUsageRequirements(openaiResponse.Usage, request)
+		*p.Usage = *openaiResponse.Usage
+	}
 
 	return
 }
@@ -173,25 +195,7 @@ func (p *AliProvider) convertFromChatOpenai(request *types.ChatCompletionRequest
 }
 
 func (p *AliProvider) pluginHandle(request *AliChatRequest) {
-	if p.Channel.Plugin == nil {
-		return
-	}
-
-	plugin := p.Channel.Plugin.Data()
-
-	// 检测是否开启了 web_search 插件
-	if pWeb, ok := plugin["web_search"]; ok {
-		if enable, ok := pWeb["enable"].(bool); ok && enable {
-			// 检查当前模型是否包含支持列表中的字符串
-			supportedModels := strings.Split(WebSearchSupportedModels, ",")
-			for _, model := range supportedModels {
-				if strings.Contains(request.Model, model) {
-					request.Parameters.EnableSearch = true
-					break
-				}
-			}
-		}
-	}
+	request.Parameters.EnableSearch = aliSearchEnabled(p.Channel, request.Model)
 }
 
 // 转换为OpenAI聊天流式请求体
@@ -251,12 +255,59 @@ func (h *aliStreamHandler) convertToOpenaiStream(aliResponse *AliChatResponse, d
 		Choices: []types.ChatCompletionStreamChoice{choice},
 	}
 
-	if aliResponse.Usage.OutputTokens != 0 {
-		h.Usage.PromptTokens = aliResponse.Usage.InputTokens
-		h.Usage.CompletionTokens = aliResponse.Usage.OutputTokens
-		h.Usage.TotalTokens = aliResponse.Usage.InputTokens + aliResponse.Usage.OutputTokens
+	if usage := aliUsageToOpenAI(&aliResponse.Usage); usage != nil {
+		applyAliUsageRequirements(usage, h.Request)
+		*h.Usage = *usage
 	}
 
 	responseBody, _ := json.Marshal(streamResponse)
 	dataChan <- string(responseBody)
+}
+
+func aliUsageToOpenAI(providerUsage *AliUsage) *types.Usage {
+	if providerUsage == nil || !providerUsage.present {
+		return nil
+	}
+	usage := &types.Usage{
+		PromptTokens:     providerUsage.InputTokens,
+		CompletionTokens: providerUsage.OutputTokens,
+		TotalTokens:      providerUsage.TotalTokens,
+	}
+	if !providerUsage.inputTokensPresent || !providerUsage.outputTokensPresent || !providerUsage.totalTokensPresent {
+		return usage
+	}
+	if usage.PromptTokens+usage.CompletionTokens != usage.TotalTokens {
+		usage.ProviderTokenConflict = true
+	}
+	setAliTokenDetail := func(value *int, key string) {
+		if value != nil {
+			usage.SetExtraTokens(key, *value)
+		}
+	}
+	setAliTokenDetail(providerUsage.InputTokenDetails.CachedTokens, config.UsageExtraCache)
+	setAliTokenDetail(providerUsage.InputTokenDetails.TextTokens, config.UsageExtraInputTextTokens)
+	setAliTokenDetail(providerUsage.InputTokenDetails.ImageTokens, config.UsageExtraInputImageTokens)
+	setAliTokenDetail(providerUsage.InputTokenDetails.AudioTokens, config.UsageExtraInputAudio)
+	setAliTokenDetail(providerUsage.InputTokenDetails.VideoTokens, config.UsageExtraInputVideoTokens)
+	setAliTokenDetail(providerUsage.OutputTokenDetails.TextTokens, config.UsageExtraOutputTextTokens)
+	setAliTokenDetail(providerUsage.OutputTokenDetails.ImageTokens, config.UsageExtraOutputImageTokens)
+	setAliTokenDetail(providerUsage.OutputTokenDetails.AudioTokens, config.UsageExtraOutputAudio)
+	setAliTokenDetail(providerUsage.OutputTokenDetails.VideoTokens, config.UsageExtraOutputVideoTokens)
+	setAliTokenDetail(providerUsage.OutputTokenDetails.ReasoningTokens, config.UsageExtraReasoning)
+	usage.MarkProviderReported()
+	return usage
+}
+
+func applyAliUsageRequirements(usage *types.Usage, request *types.ChatCompletionRequest) {
+	if usage == nil || request == nil {
+		return
+	}
+	for _, message := range request.Messages {
+		for _, part := range message.ParseContent() {
+			if part.Type == types.ContentTypeImageURL {
+				usage.RequireTokenExtraEvidence(config.UsageExtraInputImageTokens)
+				return
+			}
+		}
+	}
 }

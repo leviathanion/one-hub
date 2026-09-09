@@ -14,6 +14,8 @@ import (
 	"one-api/common/requester"
 	"one-api/model"
 	"one-api/providers/base"
+	"one-api/providers/claude"
+	"one-api/providers/gemini"
 	"one-api/providers/vertexai/category"
 	"one-api/types"
 	"strings"
@@ -30,6 +32,31 @@ const TokenCacheKey = "api_token:vertexai"
 const defaultScope = "https://www.googleapis.com/auth/cloud-platform"
 
 type VertexAIProviderFactory struct{}
+
+func (VertexAIProviderFactory) AssessChatRemoteMedia(_ *model.Channel, request *types.ChatCompletionRequest, _ base.ChatRemoteMediaSummary) (base.RemoteMediaMode, error) {
+	if request == nil {
+		return base.RemoteMediaReject, fmt.Errorf("chat request is required")
+	}
+	providerCategory, err := category.GetCategory(request.Model)
+	if err != nil || (providerCategory.Category != "claude" && providerCategory.Category != "gemini") {
+		return base.RemoteMediaReject, nil
+	}
+	return base.RemoteMediaMaterialize, nil
+}
+
+func (VertexAIProviderFactory) AssessNativeClaudeRemoteMedia(_ *model.Channel, request *claude.ClaudeRequest, summary claude.NativeRemoteMediaSummary) (base.RemoteMediaMode, error) {
+	if request == nil {
+		return base.RemoteMediaReject, fmt.Errorf("Claude request is required")
+	}
+	providerCategory, err := category.GetCategory(request.Model)
+	if err != nil || providerCategory.Category != "claude" {
+		return base.RemoteMediaReject, nil
+	}
+	if err := claude.ValidateMaterializableNativeRemoteMedia(request, summary); err != nil {
+		return base.RemoteMediaReject, err
+	}
+	return base.RemoteMediaMaterialize, nil
+}
 
 // 创建 VertexAIProvider
 func (f VertexAIProviderFactory) Create(channel *model.Channel) base.ProviderInterface {
@@ -55,6 +82,25 @@ type VertexAIProvider struct {
 	Region    string
 	ProjectID string
 	Category  *category.Category
+}
+
+func (p *VertexAIProvider) MaterializeChatRemoteMedia(request *types.ChatCompletionRequest, fetcher base.RemoteMediaFetcher) error {
+	return base.MaterializeChatRemoteMedia(request, fetcher)
+}
+
+func (p *VertexAIProvider) NormalizeChatRemoteMedia(request *types.ChatCompletionRequest) error {
+	if request == nil {
+		return nil
+	}
+	providerCategory, err := category.GetCategory(request.Model)
+	if err != nil || providerCategory == nil || providerCategory.Category != "gemini" {
+		return nil
+	}
+	return gemini.NormalizeAssistantImageHistory(request)
+}
+
+func (p *VertexAIProvider) MaterializeNativeClaudeRemoteMedia(request *claude.ClaudeRequest, fetcher base.RemoteMediaFetcher) (*claude.ClaudeRequest, error) {
+	return claude.MaterializeNativeRemoteMedia(request, fetcher)
 }
 
 func getConfig() base.ProviderConfig {

@@ -7,7 +7,7 @@ import (
 	"one-api/common/config"
 )
 
-func TestConcurrentChannelTagReplacementsDoNotFormUnion(t *testing.T) {
+func TestConcurrentChannelTagCredentialPayloadsAreRejected(t *testing.T) {
 	useTestChannelDB(t)
 	if err := DB.Create(&Channel{Name: "original", Key: "key-original", Tag: "replace-team", Type: config.ChannelTypeOpenAI}).Error; err != nil {
 		t.Fatal(err)
@@ -30,8 +30,8 @@ func TestConcurrentChannelTagReplacementsDoNotFormUnion(t *testing.T) {
 	wg.Wait()
 	close(errs)
 	for err := range errs {
-		if err != nil {
-			t.Fatalf("concurrent replacement failed: %v", err)
+		if err == nil {
+			t.Fatal("ordinary tag edit accepted credential replacement")
 		}
 	}
 
@@ -39,8 +39,8 @@ func TestConcurrentChannelTagReplacementsDoNotFormUnion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(members) != 1 || members[0].Key != "key-a" && members[0].Key != "key-b" {
-		t.Fatalf("serialized replacements must leave exactly one submitted set, got %+v", members)
+	if len(members) != 1 || members[0].Key != "key-original" {
+		t.Fatalf("rejected credential edits must preserve the original member, got %+v", members)
 	}
 }
 

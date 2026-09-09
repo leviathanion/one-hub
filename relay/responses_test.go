@@ -4,23 +4,29 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/logger"
+	"one-api/common/requestctx"
 	"one-api/common/requester"
 	commonresponses "one-api/common/responses"
 	"one-api/model"
 	providersBase "one-api/providers/base"
+	"one-api/providers/openai"
 	"one-api/types"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
+	"gorm.io/datatypes"
 )
 
 func responsesTestRawEnvelope(t *testing.T, request types.OpenAIResponsesRequest) *commonresponses.RawEnvelope {
@@ -40,6 +46,22 @@ type affinityResponsesProvider struct {
 	providersBase.BaseProvider
 }
 
+type inputTokensSuccessProvider struct {
+	providersBase.BaseProvider
+}
+
+func (p *inputTokensSuccessProvider) GetRequestHeaders() map[string]string {
+	return map[string]string{}
+}
+
+func (p *inputTokensSuccessProvider) CountResponsesInputTokens(context.Context, *commonresponses.Request) (*http.Response, *types.OpenAIErrorWithStatusCode) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(`{"input_tokens":1}`)),
+	}, nil
+}
+
 func (p *affinityResponsesProvider) GetRequestHeaders() map[string]string {
 	return map[string]string{}
 }
@@ -53,7 +75,7 @@ func (p *affinityResponsesProvider) CreateResponses(context.Context, *commonresp
 	}, nil
 }
 
-func (p *affinityResponsesProvider) CreateResponsesStream(context.Context, *commonresponses.Request) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+func (p *affinityResponsesProvider) CreateResponsesStream(context.Context, *commonresponses.Request) (commonresponses.EventStream, *types.OpenAIErrorWithStatusCode) {
 	return nil, nil
 }
 
@@ -71,6 +93,13 @@ type compactSuccessProvider struct {
 	response *types.OpenAIResponsesResponses
 }
 
+type redirectResponsesProvider struct {
+	providersBase.BaseProvider
+	apiErr       *types.OpenAIErrorWithStatusCode
+	createCalls  int
+	compactCalls int
+}
+
 type stalePreviousResponseProvider struct {
 	providersBase.BaseProvider
 	createCalls int
@@ -78,7 +107,7 @@ type stalePreviousResponseProvider struct {
 
 type streamAffinityResponsesProvider struct {
 	providersBase.BaseProvider
-	stream requester.StreamReaderInterface[string]
+	stream commonresponses.EventStream
 }
 
 func (p *streamAffinityResponsesProvider) GetRequestHeaders() map[string]string {
@@ -89,7 +118,7 @@ func (p *streamAffinityResponsesProvider) CreateResponses(context.Context, *comm
 	return nil, nil
 }
 
-func (p *streamAffinityResponsesProvider) CreateResponsesStream(context.Context, *commonresponses.Request) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+func (p *streamAffinityResponsesProvider) CreateResponsesStream(context.Context, *commonresponses.Request) (commonresponses.EventStream, *types.OpenAIErrorWithStatusCode) {
 	return p.stream, nil
 }
 
@@ -102,6 +131,24 @@ type compatibleStreamChatProvider struct {
 	stream requester.StreamReaderInterface[string]
 }
 
+type cancellationTrackingRelayStream struct {
+	dataChan  chan string
+	errChan   chan error
+	recv      chan struct{}
+	closed    chan struct{}
+	recvOnce  sync.Once
+	closeOnce sync.Once
+}
+
+func (s *cancellationTrackingRelayStream) Recv() (<-chan string, <-chan error) {
+	s.recvOnce.Do(func() { close(s.recv) })
+	return s.dataChan, s.errChan
+}
+
+func (s *cancellationTrackingRelayStream) Close() {
+	s.closeOnce.Do(func() { close(s.closed) })
+}
+
 type compatibleResponsesChatProvider struct {
 	providersBase.BaseProvider
 	response          *types.ChatCompletionResponse
@@ -111,7 +158,8 @@ type compatibleResponsesChatProvider struct {
 
 type chatFallbackResponsesProvider struct {
 	providersBase.BaseProvider
-	request *commonresponses.Request
+	request     *commonresponses.Request
+	chatRequest *types.ChatCompletionRequest
 }
 
 func (p *compatibleStreamChatProvider) GetRequestHeaders() map[string]string {
@@ -156,7 +204,25 @@ func (p *chatFallbackResponsesProvider) CreateResponses(_ context.Context, reque
 	}, nil
 }
 
-func (p *chatFallbackResponsesProvider) CreateResponsesStream(context.Context, *commonresponses.Request) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+func (p *chatFallbackResponsesProvider) CreateChatCompletion(request *types.ChatCompletionRequest) (*types.ChatCompletionResponse, *types.OpenAIErrorWithStatusCode) {
+	p.chatRequest = request
+	return &types.ChatCompletionResponse{
+		ID:     "chatcmpl_compatible",
+		Object: "chat.completion",
+		Model:  request.Model,
+		Choices: []types.ChatCompletionChoice{{
+			Index:   0,
+			Message: types.ChatCompletionMessage{Role: types.ChatMessageRoleAssistant, Content: "ok"},
+		}},
+		Usage: &types.Usage{PromptTokens: 1, CompletionTokens: 1, TotalTokens: 2},
+	}, nil
+}
+
+func (p *chatFallbackResponsesProvider) CreateChatCompletionStream(*types.ChatCompletionRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+	return nil, common.StringErrorWrapperLocal("unexpected stream call", "test_error", http.StatusInternalServerError)
+}
+
+func (p *chatFallbackResponsesProvider) CreateResponsesStream(context.Context, *commonresponses.Request) (commonresponses.EventStream, *types.OpenAIErrorWithStatusCode) {
 	return nil, nil
 }
 
@@ -172,7 +238,7 @@ func (p *compactRejectProvider) CreateResponses(context.Context, *commonresponse
 	return nil, nil
 }
 
-func (p *compactRejectProvider) CreateResponsesStream(context.Context, *commonresponses.Request) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+func (p *compactRejectProvider) CreateResponsesStream(context.Context, *commonresponses.Request) (commonresponses.EventStream, *types.OpenAIErrorWithStatusCode) {
 	return nil, nil
 }
 
@@ -189,12 +255,30 @@ func (p *compactSuccessProvider) CreateResponses(context.Context, *commonrespons
 	return nil, nil
 }
 
-func (p *compactSuccessProvider) CreateResponsesStream(context.Context, *commonresponses.Request) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+func (p *compactSuccessProvider) CreateResponsesStream(context.Context, *commonresponses.Request) (commonresponses.EventStream, *types.OpenAIErrorWithStatusCode) {
 	return nil, nil
 }
 
 func (p *compactSuccessProvider) CompactResponses(context.Context, *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
 	return p.response, nil
+}
+
+func (p *redirectResponsesProvider) GetRequestHeaders() map[string]string {
+	return map[string]string{}
+}
+
+func (p *redirectResponsesProvider) CreateResponses(context.Context, *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
+	p.createCalls++
+	return nil, p.apiErr
+}
+
+func (p *redirectResponsesProvider) CreateResponsesStream(context.Context, *commonresponses.Request) (commonresponses.EventStream, *types.OpenAIErrorWithStatusCode) {
+	return nil, common.StringErrorWrapperLocal("unexpected stream call", "test_error", http.StatusInternalServerError)
+}
+
+func (p *redirectResponsesProvider) CompactResponses(context.Context, *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
+	p.compactCalls++
+	return nil, p.apiErr
 }
 
 func (p *stalePreviousResponseProvider) GetRequestHeaders() map[string]string {
@@ -227,7 +311,7 @@ func (p *stalePreviousResponseProvider) CreateResponses(_ context.Context, req *
 	}, nil
 }
 
-func (p *stalePreviousResponseProvider) CreateResponsesStream(context.Context, *commonresponses.Request) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+func (p *stalePreviousResponseProvider) CreateResponsesStream(context.Context, *commonresponses.Request) (commonresponses.EventStream, *types.OpenAIErrorWithStatusCode) {
 	return nil, nil
 }
 
@@ -244,8 +328,7 @@ func TestRelayResponsesCompactRejectsStream(t *testing.T) {
 
 	provider := &compactRejectProvider{
 		BaseProvider: providersBase.BaseProvider{
-			Channel:         &model.Channel{},
-			SupportResponse: true,
+			Channel: &model.Channel{},
 		},
 	}
 
@@ -286,8 +369,7 @@ func TestRelayResponsesNativeRequiresRawEnvelope(t *testing.T) {
 
 	provider := &compactRejectProvider{
 		BaseProvider: providersBase.BaseProvider{
-			Channel:         &model.Channel{},
-			SupportResponse: true,
+			Channel: &model.Channel{},
 		},
 	}
 	relay := &relayResponses{
@@ -312,70 +394,7 @@ func TestRelayResponsesNativeRequiresRawEnvelope(t *testing.T) {
 	}
 }
 
-func TestResponsesHTTPAttemptReplayPolicy(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-
-	apiErr := &types.OpenAIErrorWithStatusCode{
-		OpenAIError: types.OpenAIError{Type: "rate_limit_error", Code: "rate_limit_exceeded"},
-		StatusCode:  http.StatusTooManyRequests,
-	}
-
-	newRelay := func() (*relayResponses, *httptest.ResponseRecorder) {
-		recorder := httptest.NewRecorder()
-		ctx, _ := gin.CreateTestContext(recorder)
-		ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-		return &relayResponses{
-			relayBase:        relayBase{c: ctx},
-			responsesRequest: types.OpenAIResponsesRequest{Model: "gpt-5"},
-			operation:        responsesOperationCreate,
-		}, recorder
-	}
-
-	responsesRelay, _ := newRelay()
-	if !responsesHTTPAttemptShouldRetry(responsesRelay, apiErr, config.ChannelTypeOpenAI) {
-		t.Fatal("expected first-turn pre-commit 429 to retry")
-	}
-
-	responsesRelay, _ = newRelay()
-	responsesRelay.responsesRequest.PreviousResponseID = "resp_previous"
-	if responsesHTTPAttemptShouldRetry(responsesRelay, apiErr, config.ChannelTypeOpenAI) {
-		t.Fatal("expected previous_response_id continuation to block HTTP attempt replay")
-	}
-
-	responsesRelay, _ = newRelay()
-	responsesRelay.c.Set(channelAffinityPreferredChannelContextKey, 17)
-	responsesRelay.c.Set(channelAffinitySelectedPreferredContextKey, true)
-	responsesRelay.c.Set(channelAffinitySkipRetryContextKey, true)
-	if responsesHTTPAttemptShouldRetry(responsesRelay, apiErr, config.ChannelTypeOpenAI) {
-		t.Fatal("expected preferred skip-retry affinity to block HTTP attempt replay")
-	}
-
-	responsesRelay, _ = newRelay()
-	responsesRelay.c.Set("specific_channel_id", 17)
-	if responsesHTTPAttemptShouldRetry(responsesRelay, apiErr, config.ChannelTypeOpenAI) {
-		t.Fatal("expected explicit channel pin to block HTTP attempt replay")
-	}
-	if responsesHTTPAttemptShouldRetry(responsesRelay, &types.OpenAIErrorWithStatusCode{
-		OpenAIError: types.OpenAIError{Message: "Your credit balance is too low"},
-		StatusCode:  http.StatusBadRequest,
-	}, config.ChannelTypeAnthropic) {
-		t.Fatal("expected explicit channel pin to block channel-specific HTTP 400 retry")
-	}
-
-	responsesRelay, _ = newRelay()
-	responsesRelay.c.Writer.WriteHeader(http.StatusOK)
-	responsesRelay.c.Writer.WriteHeaderNow()
-	if responsesHTTPAttemptShouldRetry(responsesRelay, apiErr, config.ChannelTypeOpenAI) {
-		t.Fatal("expected committed downstream response to block HTTP attempt replay")
-	}
-
-	responsesRelay, _ = newRelay()
-	if responsesHTTPAttemptShouldRetry(responsesRelay, common.StringErrorWrapperLocal("quota rollback failed", "quota_rollback_failed", http.StatusInternalServerError), config.ChannelTypeOpenAI) {
-		t.Fatal("expected local quota rollback failure to block HTTP attempt replay")
-	}
-}
-
-func TestRelayChatResponsesFallbackUsesMappedModel(t *testing.T) {
+func TestRelayChatRoutesResponsesOnlyModelThroughResponsesAPI(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	recorder := httptest.NewRecorder()
@@ -403,25 +422,10 @@ func TestRelayChatResponsesFallbackUsesMappedModel(t *testing.T) {
 
 	errWithCode, done := relay.send()
 	if done || errWithCode != nil {
-		t.Fatalf("expected chat fallback send to succeed, done=%v err=%v", done, errWithCode)
+		t.Fatalf("expected Responses-only model conversion to succeed, done=%v err=%v", done, errWithCode)
 	}
-	if provider.request == nil {
-		t.Fatal("expected fallback provider to receive a Responses request")
-	}
-	if provider.request.Model != "o3-pro" {
-		t.Fatalf("expected commonresponses request model to use mapped model, got %q", provider.request.Model)
-	}
-	if provider.request.Body == nil || provider.request.Body.Object == nil {
-		t.Fatal("expected raw responses envelope")
-	}
-	if rawModel := strings.TrimSpace(string(provider.request.Body.Object.Fields["model"])); rawModel != `"o3-pro"` {
-		t.Fatalf("expected raw envelope model to use mapped model, got %s", rawModel)
-	}
-	if !strings.Contains(string(provider.request.Body.Object.Raw), `"model":"o3-pro"`) {
-		t.Fatalf("expected serialized fallback body to use mapped model, got %s", provider.request.Body.Object.Raw)
-	}
-	if relay.chatRequest.Model != "o3-pro" {
-		t.Fatalf("expected relay chat request to carry mapped model for send operation, got %q", relay.chatRequest.Model)
+	if provider.request == nil || provider.request.Body == nil || provider.request.Body.Projection.Model != "o3-pro" {
+		t.Fatalf("expected the mapped model to reach Responses, request=%+v", provider.request)
 	}
 }
 
@@ -460,16 +464,17 @@ func TestRelayResponsesSendRecordsChannelAffinityOnSuccess(t *testing.T) {
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	ctx.Set("token_id", 12345)
 
+	store := false
 	request := types.OpenAIResponsesRequest{
 		Model:          "gpt-5",
 		PromptCacheKey: "pc-record-success",
+		Store:          &store,
 	}
 	prepareResponsesChannelAffinity(ctx, &request)
 
 	provider := &affinityResponsesProvider{
 		BaseProvider: providersBase.BaseProvider{
-			Channel:         &model.Channel{Id: 88},
-			SupportResponse: true,
+			Channel: &model.Channel{Id: 88, Type: config.ChannelTypeOpenAI},
 		},
 	}
 
@@ -483,7 +488,6 @@ func TestRelayResponsesSendRecordsChannelAffinityOnSuccess(t *testing.T) {
 		rawEnvelope:      responsesTestRawEnvelope(t, request),
 		operation:        responsesOperationCreate,
 	}
-
 	errWithCode, done := relay.send()
 	if done {
 		t.Fatal("expected successful responses relay to keep processing")
@@ -494,6 +498,62 @@ func TestRelayResponsesSendRecordsChannelAffinityOnSuccess(t *testing.T) {
 
 	if got, ok := lookupChannelAffinity(ctx, channelAffinityKindResponses, request.PromptCacheKey); !ok || got != 88 {
 		t.Fatalf("expected responses affinity to be recorded on channel 88, got channel=%d ok=%v", got, ok)
+	}
+}
+
+func TestRelayResponsesInputTokensDoesNotUseChannelAffinity(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	settings := config.DefaultChannelAffinitySettings()
+	for index := range settings.Rules {
+		if settings.Rules[index].Kind == string(channelAffinityKindResponses) {
+			settings.Rules[index].PathRegex = `^/v1/responses(?:/.*)?$`
+		}
+	}
+	settings.Normalize()
+	withChannelAffinitySettings(t, settings)
+
+	seedCtx := newAffinityTestContext(http.MethodPost, "/v1/responses/input_tokens")
+	seedCtx.Set("token_id", 7001)
+	seedCtx.Set("token_group", "default")
+	seedRequest := &types.OpenAIResponsesRequest{Model: "gpt-5", PromptCacheKey: "pc-input-tokens-read"}
+	prepareResponsesChannelAffinity(seedCtx, seedRequest)
+	recordCurrentChannelAffinity(seedCtx, channelAffinityKindResponses, 71)
+
+	readCtx := newAffinityTestContext(http.MethodPost, "/v1/responses/input_tokens")
+	readCtx.Set("token_id", 7001)
+	readCtx.Set("token_group", "default")
+	readCtx.Request.Body = io.NopCloser(strings.NewReader(`{"model":"gpt-5","prompt_cache_key":"pc-input-tokens-read"}`))
+	readCtx.Request.Header.Set("Content-Type", "application/json")
+	readRelay := NewRelayResponses(readCtx)
+	if err := readRelay.setRequest(); err != nil {
+		t.Fatalf("set input_tokens request: %v", err)
+	}
+	if currentChannelAffinityState(readCtx) != nil || currentPreferredChannelID(readCtx) != 0 || currentChannelAffinityLogMeta(readCtx) != nil {
+		t.Fatalf("input_tokens must not prepare or read affinity, state=%#v preferred=%d meta=%#v", currentChannelAffinityState(readCtx), currentPreferredChannelID(readCtx), currentChannelAffinityLogMeta(readCtx))
+	}
+
+	writeCtx := newAffinityTestContext(http.MethodPost, "/v1/responses/input_tokens")
+	writeCtx.Set("token_id", 7001)
+	writeCtx.Set("token_group", "default")
+	writeRequest := types.OpenAIResponsesRequest{Model: "gpt-5", PromptCacheKey: "pc-input-tokens-write"}
+	prepareResponsesChannelAffinity(writeCtx, &writeRequest)
+	provider := &inputTokensSuccessProvider{BaseProvider: providersBase.BaseProvider{Channel: &model.Channel{Id: 72}}}
+	writeRelay := &relayResponses{
+		relayBase:        relayBase{c: writeCtx, provider: provider, modelName: "gpt-5"},
+		responsesRequest: writeRequest,
+		rawEnvelope:      responsesTestRawEnvelope(t, writeRequest),
+		operation:        responsesOperationInputTokens,
+	}
+	originalLogConsumeEnabled := config.LogConsumeEnabled
+	config.LogConsumeEnabled = false
+	t.Cleanup(func() { config.LogConsumeEnabled = originalLogConsumeEnabled })
+	apiErr, done := writeRelay.send()
+	if apiErr != nil || done {
+		t.Fatalf("expected input_tokens success, done=%v err=%v", done, apiErr)
+	}
+	if channelID, ok := lookupChannelAffinity(writeCtx, channelAffinityKindResponses, writeRequest.PromptCacheKey); ok {
+		t.Fatalf("input_tokens must not record affinity, got channel %d", channelID)
 	}
 }
 
@@ -603,20 +663,9 @@ func TestRelayResponsesSendDoesNotRecoverStalePreviousResponseIDInternally(t *te
 
 	initialProvider := &stalePreviousResponseProvider{
 		BaseProvider: providersBase.BaseProvider{
-			Channel:         &model.Channel{Id: 41},
-			SupportResponse: true,
+			Channel: &model.Channel{Id: 41, Type: config.ChannelTypeOpenAI},
 		},
 	}
-	recoveredProvider := &stalePreviousResponseProvider{
-		BaseProvider: providersBase.BaseProvider{
-			Channel:         &model.Channel{Id: 55},
-			SupportResponse: true,
-		},
-	}
-	ctx.Set("channel_id", recoveredProvider.GetChannel().Id)
-	ctx.Set("channel_type", recoveredProvider.GetChannel().Type)
-	cacheProviderSelection(ctx, "gpt-5", recoveredProvider, "gpt-5")
-
 	relay := &relayResponses{
 		relayBase: relayBase{
 			c:         ctx,
@@ -638,17 +687,11 @@ func TestRelayResponsesSendDoesNotRecoverStalePreviousResponseIDInternally(t *te
 	if initialProvider.createCalls != 1 {
 		t.Fatalf("expected initial stale-affinity provider to be called exactly once, got %d calls", initialProvider.createCalls)
 	}
-	if recoveredProvider.createCalls != 0 {
-		t.Fatalf("expected send() not to reroute onto the cached recovery provider, got %d calls", recoveredProvider.createCalls)
-	}
 	if relay.responsesRequest.PreviousResponseID != "resp_stale" {
 		t.Fatalf("expected send() not to clear previous_response_id, got %q", relay.responsesRequest.PreviousResponseID)
 	}
 	if channel := relay.provider.GetChannel(); channel == nil || channel.Id != 41 {
 		t.Fatalf("expected send() to keep the original provider channel 41, got %#v", channel)
-	}
-	if got, ok := lookupChannelAffinity(ctx, channelAffinityKindResponses, "pc-recover-stale"); ok && got == 55 {
-		t.Fatalf("expected send() not to record recovered prompt_cache_key affinity, got channel=%d ok=%v", got, ok)
 	}
 	if ctx.GetBool(responsesPreviousResponseRecoveredContextKey) {
 		t.Fatal("expected send() not to mark the request as recovered")
@@ -738,10 +781,12 @@ func TestRelayResponsesStreamRecordsPreviousResponseIDAffinity(t *testing.T) {
 	ctx.Set("token_id", 456)
 	ctx.Set("token_group", "default")
 
+	store := false
 	request := types.OpenAIResponsesRequest{
 		Model:          "gpt-5",
 		PromptCacheKey: "pc-stream-affinity",
 		Stream:         true,
+		Store:          &store,
 	}
 	prepareResponsesChannelAffinity(ctx, &request)
 
@@ -762,8 +807,7 @@ func TestRelayResponsesStreamRecordsPreviousResponseIDAffinity(t *testing.T) {
 
 	provider := &streamAffinityResponsesProvider{
 		BaseProvider: providersBase.BaseProvider{
-			Channel:         &model.Channel{Id: 66},
-			SupportResponse: true,
+			Channel: &model.Channel{Id: 66, Type: config.ChannelTypeOpenAI},
 		},
 		stream: stream,
 	}
@@ -817,6 +861,8 @@ func TestRelayResponsesCompatibleStreamRecordsPreviousResponseIDAffinity(t *test
 		PromptCacheKey: "pc-compatible-stream",
 		Stream:         true,
 	}
+	storeFalse := false
+	request.Store = &storeFalse
 	prepareResponsesChannelAffinity(ctx, &request)
 
 	stream := &fakeRelayStream{
@@ -831,8 +877,7 @@ func TestRelayResponsesCompatibleStreamRecordsPreviousResponseIDAffinity(t *test
 
 	provider := &compatibleStreamChatProvider{
 		BaseProvider: providersBase.BaseProvider{
-			Channel:         &model.Channel{Id: 67, CompatibleResponse: true},
-			SupportResponse: false,
+			Channel: &model.Channel{Id: 67, Type: config.ChannelTypeAnthropic, CompatibleResponse: true},
 		},
 		stream: stream,
 	}
@@ -845,7 +890,14 @@ func TestRelayResponsesCompatibleStreamRecordsPreviousResponseIDAffinity(t *test
 		},
 		responsesRequest: request,
 		operation:        responsesOperationCreate,
+		selectedDataPath: providersBase.DataPathCrossProtocol,
 	}
+	prepared, err := request.ToChatCompletionRequest()
+	if err != nil {
+		t.Fatalf("prepare compatibility fixture: %v", err)
+	}
+	prepared.Model = relay.modelName
+	relay.preparedChatRequest = prepared
 
 	errWithCode, done := relay.send()
 	if done {
@@ -906,8 +958,7 @@ func TestRelayResponsesHelperFunctionsAndCompatibleNonStream(t *testing.T) {
 
 	relay.provider = &affinityResponsesProvider{
 		BaseProvider: providersBase.BaseProvider{
-			Channel:         &model.Channel{},
-			SupportResponse: true,
+			Channel: &model.Channel{Type: config.ChannelTypeOpenAI},
 		},
 	}
 	relay.modelName = "gpt-5"
@@ -925,23 +976,45 @@ func TestRelayResponsesHelperFunctionsAndCompatibleNonStream(t *testing.T) {
 	if shouldRecoverStalePreviousResponse(&types.OpenAIErrorWithStatusCode{OpenAIError: types.OpenAIError{Message: " "}}) {
 		t.Fatal("expected blank stale previous response message not to trigger recovery")
 	}
-	if !shouldRecoverStalePreviousResponse(&types.OpenAIErrorWithStatusCode{OpenAIError: types.OpenAIError{Message: "previous response was not found by upstream"}}) {
+	if !shouldRecoverStalePreviousResponse(&types.OpenAIErrorWithStatusCode{OpenAIError: types.OpenAIError{Message: "previous response was not found by upstream", Param: "previous_response_id"}, StatusCode: http.StatusNotFound}) {
 		t.Fatal("expected previous response not found message to trigger recovery")
 	}
-	if !shouldRecoverStalePreviousResponse(&types.OpenAIErrorWithStatusCode{OpenAIError: types.OpenAIError{Code: "previous_response_not_found"}}) {
+	if !shouldRecoverStalePreviousResponse(&types.OpenAIErrorWithStatusCode{OpenAIError: types.OpenAIError{Code: "previous_response_not_found"}, StatusCode: http.StatusBadRequest}) {
 		t.Fatal("expected previous_response_not_found code to trigger recovery")
 	}
+	if shouldRecoverStalePreviousResponse(&types.OpenAIErrorWithStatusCode{
+		OpenAIError: types.OpenAIError{Message: "previous response was not found in an unrelated cache"},
+		StatusCode:  http.StatusNotFound,
+	}) {
+		t.Fatal("expected message-only fallback without previous_response_id param not to clear affinity")
+	}
+	if shouldRecoverStalePreviousResponse(&types.OpenAIErrorWithStatusCode{
+		OpenAIError: types.OpenAIError{Message: "previous response was not found in an unrelated cache", Param: "input"},
+		StatusCode:  http.StatusBadRequest,
+	}) {
+		t.Fatal("expected another error param not to clear continuation affinity")
+	}
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusServiceUnavailable} {
+		apiErr := &types.OpenAIErrorWithStatusCode{
+			OpenAIError: types.OpenAIError{Message: "previous response was not found by upstream"},
+			StatusCode:  status,
+		}
+		if shouldRecoverStalePreviousResponse(apiErr) {
+			t.Fatalf("status %d must preserve the provider error instead of triggering stale continuation recovery", status)
+		}
+	}
 
-	if plan := relay.stalePreviousResponseHandlingPlan(&types.OpenAIErrorWithStatusCode{OpenAIError: types.OpenAIError{Code: "previous_response_not_found"}}); plan != nil {
+	if plan := relay.stalePreviousResponseHandlingPlan(&types.OpenAIErrorWithStatusCode{OpenAIError: types.OpenAIError{Code: "previous_response_not_found"}, StatusCode: http.StatusNotFound}); plan != nil {
 		t.Fatal("expected stale previous response handling to require a previous_response_id")
 	}
 	relay.responsesRequest.PreviousResponseID = "resp-stale"
-	plan := relay.stalePreviousResponseHandlingPlan(&types.OpenAIErrorWithStatusCode{OpenAIError: types.OpenAIError{Message: "previous response not found"}})
+	upstreamMiss := &types.OpenAIErrorWithStatusCode{
+		OpenAIError: types.OpenAIError{Code: "previous_response_not_found", Message: "previous response not found"},
+		StatusCode:  http.StatusNotFound,
+	}
+	plan := relay.stalePreviousResponseHandlingPlan(upstreamMiss)
 	if plan == nil {
 		t.Fatal("expected stale previous response handling plan to be created")
-	}
-	if plan.clientError == nil || plan.clientError.StatusCode != http.StatusConflict {
-		t.Fatalf("expected stale previous response plan to return an explicit conflict error, got %#v", plan.clientError)
 	}
 	if plan.recoveryCandidateMeta["responses_continuation_recovery_strategy"] != "manual_replay_required" {
 		t.Fatalf("expected stale previous response plan to expose recovery candidate meta, got %#v", plan.recoveryCandidateMeta)
@@ -965,11 +1038,13 @@ func TestRelayResponsesHelperFunctionsAndCompatibleNonStream(t *testing.T) {
 		Input:          "hello",
 		PromptCacheKey: "pc-compatible-non-stream",
 	}
+	storeFalse := false
+	compatRequest.Store = &storeFalse
 	prepareResponsesChannelAffinity(compatCtx, &compatRequest)
 
 	provider := &compatibleResponsesChatProvider{
 		BaseProvider: providersBase.BaseProvider{
-			Channel: &model.Channel{Id: 77},
+			Channel: &model.Channel{Id: 77, Type: config.ChannelTypeAnthropic, CompatibleResponse: true},
 		},
 		response: &types.ChatCompletionResponse{
 			ID:     "chatcmpl_compatible",
@@ -998,6 +1073,12 @@ func TestRelayResponsesHelperFunctionsAndCompatibleNonStream(t *testing.T) {
 		responsesRequest: compatRequest,
 		operation:        responsesOperationCreate,
 	}
+	prepared, err := compatRequest.ToChatCompletionRequest()
+	if err != nil {
+		t.Fatalf("prepare compatibility fixture: %v", err)
+	}
+	prepared.Model = compatRelay.modelName
+	compatRelay.preparedChatRequest = prepared
 
 	errWithCode, done := compatRelay.compatibleSend(provider)
 	if done {
@@ -1055,8 +1136,7 @@ func TestRelayResponsesSetRequestAndCompactSuccessBranches(t *testing.T) {
 
 	provider := &compactSuccessProvider{
 		BaseProvider: providersBase.BaseProvider{
-			Channel:         &model.Channel{Id: 120},
-			SupportResponse: true,
+			Channel: &model.Channel{Id: 120},
 		},
 		response: &types.OpenAIResponsesResponses{
 			ID:             "resp_compact",
@@ -1116,6 +1196,92 @@ func TestRelayResponsesSetRequestAndCompactSuccessBranches(t *testing.T) {
 	}
 }
 
+func TestRelayResponsesProviderRequestPreservesRawQuery(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses/compact?api-version=preview&feature=one&feature=two", strings.NewReader(`{"model":"gpt-5","input":"hello"}`))
+	relay := NewRelayResponses(ctx)
+	if err := relay.setRequest(); err != nil {
+		t.Fatalf("set Responses request: %v", err)
+	}
+
+	got := relay.providerRequest(commonresponses.ResponsesCompact).RawQuery
+	if got != "api-version=preview&feature=one&feature=two" {
+		t.Fatalf("raw query changed before provider selection: %q", got)
+	}
+}
+
+func TestRelayResponsesSurfacesExactWireRedirectWithoutRetryableSuccessWork(t *testing.T) {
+	store := false
+	for _, operation := range []responsesOperation{responsesOperationCreate, responsesOperationCompact} {
+		name := "create"
+		if operation == responsesOperationCompact {
+			name = "compact"
+		}
+		t.Run(name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			request := types.OpenAIResponsesRequest{Model: "gpt-5", Store: &store}
+			apiErr := &types.OpenAIErrorWithStatusCode{
+				OpenAIError:       types.OpenAIError{Message: "provider returned an HTTP redirect", Code: "provider_redirect_response"},
+				StatusCode:        http.StatusTemporaryRedirect,
+				ReplayRawResponse: true,
+				RawBody:           []byte("redirect body\n"),
+				ResponseHeaders: http.Header{
+					"Content-Type":        {"text/plain"},
+					"Location":            {"https://api.openai.com/v1/responses/redirected"},
+					"X-Request-Id":        {"req-redirect"},
+					"Set-Cookie":          {"provider_session=secret"},
+					"Openai-Organization": {"org-secret"},
+				},
+			}
+			provider := &redirectResponsesProvider{
+				BaseProvider: providersBase.BaseProvider{
+					Channel: &model.Channel{Type: config.ChannelTypeOpenAI},
+				},
+				apiErr: apiErr,
+			}
+			relay := &relayResponses{
+				relayBase:        relayBase{c: ctx, provider: provider, modelName: "gpt-5"},
+				responsesRequest: request,
+				rawEnvelope:      responsesTestRawEnvelope(t, request),
+				operation:        operation,
+			}
+
+			gotErr, done := relay.sendCurrentProvider()
+			if gotErr != apiErr || !done {
+				t.Fatalf("redirect must be terminal before retry/success work: done=%v err=%+v", done, gotErr)
+			}
+			if calls := provider.createCalls + provider.compactCalls; calls != 1 {
+				t.Fatalf("provider calls=%d, want 1", calls)
+			}
+			if recorder.Body.Len() != 0 {
+				t.Fatalf("send path wrote before error rendering: %q", recorder.Body.String())
+			}
+
+			relay.HandleJsonError(gotErr)
+			if recorder.Code != http.StatusTemporaryRedirect || recorder.Body.String() != "redirect body\n" {
+				t.Fatalf("redirect changed: status=%d body=%q", recorder.Code, recorder.Body.String())
+			}
+			for name, want := range map[string]string{
+				"Content-Type": "text/plain",
+				"Location":     "https://api.openai.com/v1/responses/redirected",
+				"X-Request-Id": "req-redirect",
+			} {
+				if got := recorder.Header().Get(name); got != want {
+					t.Fatalf("%s=%q, want %q in %#v", name, got, want, recorder.Header())
+				}
+			}
+			for _, name := range []string{"Set-Cookie", "Openai-Organization"} {
+				if got := recorder.Header().Get(name); got != "" {
+					t.Fatalf("unsafe header %s=%q", name, got)
+				}
+			}
+		})
+	}
+}
+
 func TestRelayResponsesSetRequestRequiresModel(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -1145,6 +1311,28 @@ func TestRelayResponsesSetRequestRequiresModel(t *testing.T) {
 	}
 }
 
+func TestRelayResponsesSetRequestRejectsSavedPromptBeforeModelValidation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"prompt":{"id":"pmpt_123"}}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	relay := NewRelayResponses(ctx)
+	err := relay.setRequest()
+	apiErr := capabilityGateAPIError(err)
+	if apiErr == nil || apiErr.Param != "prompt" || openAIErrorCodeString(apiErr.Code, "") != unsupportedCapabilityCode {
+		t.Fatalf("expected prompt-only request to fail at the saved prompt capability gate, got err=%v api=%+v", err, apiErr)
+	}
+	if !strings.Contains(apiErr.Message, "2026-11-30") || !strings.Contains(apiErr.Message, "instructions or input") {
+		t.Fatalf("expected actionable migration guidance and close date, got %q", apiErr.Message)
+	}
+	if relay.getOriginalModel() != "" {
+		t.Fatalf("expected rejected prompt-only request not to populate original model, got %q", relay.getOriginalModel())
+	}
+}
+
 func TestRelayResponsesChatToResponsesStreamErrorIsClientSafe(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	originalLogger := logger.Logger
@@ -1171,11 +1359,20 @@ func TestRelayResponsesChatToResponsesStreamErrorIsClientSafe(t *testing.T) {
 	stream.errChan <- errors.New("upstream stream broken Authorization: Bearer secret-token api_key=query-secret https://provider.example/v1?token=url-secret session session-secret sk-testSECRET123")
 	close(stream.errChan)
 
-	streamRelay.chatToResponseStreamClient(stream)
+	_, finalResponse, streamErr := streamRelay.chatToResponseStreamClient(stream)
+	if streamErr == nil || streamErr.StatusCode != http.StatusBadGateway || finalResponse != nil {
+		t.Fatalf("expected terminal stream error without a final response, err=%v final=%+v", streamErr, finalResponse)
+	}
 
 	body := recorder.Body.String()
 	if !strings.Contains(body, `"message":"stream interrupted"`) {
 		t.Fatalf("expected stable client stream error message, got %q", body)
+	}
+	if !strings.Contains(body, `"code":"invalid_provider_response"`) || !strings.Contains(body, `"param":null`) || !strings.Contains(body, `"sequence_number":0`) {
+		t.Fatalf("expected a valid sequenced Responses stream error, got %q", body)
+	}
+	if strings.Count(body, "event: error") != 1 || !ctx.GetBool(responsesStreamErrorAlreadyRenderedContextKey) {
+		t.Fatalf("expected one rendered terminal error and outer-render suppression, body=%q rendered=%v", body, ctx.GetBool(responsesStreamErrorAlreadyRenderedContextKey))
 	}
 	for _, forbidden := range []string{"upstream stream broken", "Authorization", "secret-token", "query-secret", "provider.example", "url-secret", "session-secret", "sk-testSECRET123"} {
 		if strings.Contains(body, forbidden) {
@@ -1201,6 +1398,221 @@ func TestRelayResponsesChatToResponsesStreamErrorIsClientSafe(t *testing.T) {
 	}
 }
 
+func TestChatToResponsesConsumesLogicalDataFromExactRawSSE(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	usage := &types.Usage{}
+	provider := &compatibleResponsesChatProvider{BaseProvider: providersBase.BaseProvider{Channel: &model.Channel{}, Usage: usage}}
+	store := false
+	streamRelay := &relayResponses{
+		relayBase:        relayBase{c: ctx, provider: provider, modelName: "gpt-5"},
+		responsesRequest: types.OpenAIResponsesRequest{Model: "gpt-5", Stream: true, Store: &store},
+	}
+	body := ": keepalive\r\n\r\n" +
+		"event: chat.chunk\r\nid: 7\r\ndata: {\"id\":\"chatcmpl_raw\",\"model\":\"gpt-5\",\"message\":\"future success metadata\",\"code\":\"future_code\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello raw\"}}]}\r\n\r\n" +
+		"data: {\"id\":\"chatcmpl_raw\",\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\r\n\r\n" +
+		"data:[DONE]\r\n\r\n"
+	handler := &openai.OpenAIStreamHandler{Usage: usage}
+	stream, apiErr := requester.RequestRawSSEEventStreamWithEmitterOptions(nil, &http.Response{Body: io.NopCloser(strings.NewReader(body))}, handler.HandleExactChatSSE, requester.StreamReadOptions{RequireProtocolTerminal: true})
+	if apiErr != nil {
+		t.Fatalf("create raw Chat stream: %+v", apiErr)
+	}
+
+	_, finalResponse, apiErr := streamRelay.chatToResponseStreamClient(stream)
+	if apiErr != nil {
+		t.Fatalf("convert raw Chat SSE: %+v", apiErr)
+	}
+	if finalResponse == nil || finalResponse.Status != types.ResponseStatusCompleted {
+		t.Fatalf("raw Chat SSE did not produce a completed Responses result: %+v", finalResponse)
+	}
+	if finalResponse.Usage != nil {
+		t.Fatalf("missing provider usage was exposed as a synthetic zero value: %+v", finalResponse.Usage)
+	}
+	output := recorder.Body.String()
+	if !strings.Contains(output, "hello raw") || strings.Contains(output, "keepalive") || strings.Contains(output, "chat.chunk") || strings.Contains(output, "data:[DONE]") {
+		t.Fatalf("raw SSE framing leaked into Chat→Responses conversion: %s", output)
+	}
+	if strings.Count(output, "event: response.completed") != 1 {
+		t.Fatalf("raw [DONE] finalized converter more than once: %s", output)
+	}
+}
+
+func TestUnaryChatObservationFallbackCannotBecomeEmptyResponsesSuccess(t *testing.T) {
+	for _, rawBody := range []string{
+		`{"id":"chat_future","model":"gpt-5","choices":{"future":true},"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`,
+		`{"id":"chat_future","model":"gpt-5","choices":[],"error":"future error"}`,
+		`{"id":"chat_future","model":"gpt-5","choices":[],"error":{"future_error_union":true}}`,
+	} {
+		t.Run(rawBody, func(t *testing.T) {
+			ctx, recorder := responsesOwnerTestContext(221, 222)
+			raw := []byte(rawBody)
+			observed := &openai.OpenAIProviderChatResponse{}
+			if err := observed.DecodeCapturedProviderJSON(raw); err != nil {
+				t.Fatal(err)
+			}
+			observed.SetProviderRawJSON(raw)
+			observed.EnableProviderRawJSONReplay()
+			provider := &compatibleResponsesChatProvider{BaseProvider: providersBase.BaseProvider{Channel: &model.Channel{Type: config.ChannelTypeAnthropic, CompatibleResponse: true}}, response: &observed.ChatCompletionResponse}
+			store := false
+			r := &relayResponses{
+				relayBase:           relayBase{c: ctx, provider: provider, modelName: "gpt-5"},
+				responsesRequest:    types.OpenAIResponsesRequest{Model: "gpt-5", Store: &store},
+				preparedChatRequest: &types.ChatCompletionRequest{Model: "gpt-5"},
+			}
+			apiErr, done := r.compatibleSend(provider)
+			if apiErr == nil || apiErr.Code != "invalid_provider_response" || !apiErr.UpstreamAccepted || !done || provider.createCalls != 1 || recorder.Body.Len() != 0 {
+				t.Fatalf("unrepresentable raw response became success or replayable: error=%+v done=%t calls=%d body=%s", apiErr, done, provider.createCalls, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestChatToResponsesRawProviderErrorStopsBeforeLateUsage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	usage := &types.Usage{}
+	provider := &compatibleResponsesChatProvider{BaseProvider: providersBase.BaseProvider{Channel: &model.Channel{}, Usage: usage}}
+	streamRelay := &relayResponses{
+		relayBase:        relayBase{c: ctx, provider: provider, modelName: "gpt-5"},
+		responsesRequest: types.OpenAIResponsesRequest{Model: "gpt-5", Stream: true},
+	}
+	body := "data: {\"error\":{\"type\":\"invalid_request_error\",\"code\":\"invalid_value\"}}\n\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":9,\"total_tokens\":18}}\n\n" +
+		"data: [DONE]\n\n"
+	handler := &openai.OpenAIStreamHandler{Usage: usage}
+	stream, constructionErr := requester.RequestRawSSEEventStreamWithEmitterOptions(nil, &http.Response{Body: io.NopCloser(strings.NewReader(body))}, handler.HandleExactChatSSE, requester.StreamReadOptions{RequireProtocolTerminal: true})
+	if constructionErr != nil {
+		t.Fatalf("create raw Chat error stream: %+v", constructionErr)
+	}
+
+	_, finalResponse, apiErr := streamRelay.chatToResponseStreamClient(stream)
+	if apiErr == nil || openAIErrorCodeString(apiErr.Code, "") != "invalid_value" || !apiErr.UpstreamAccepted {
+		t.Fatalf("raw provider error was not mapped as a failed accepted stream: %+v", apiErr)
+	}
+	if finalResponse != nil || usage.ProviderReported || usage.TotalTokens != 0 {
+		t.Fatalf("late raw data changed terminal/accounting state: final=%+v usage=%+v", finalResponse, usage)
+	}
+	output := recorder.Body.String()
+	if strings.Count(output, "event: error") != 1 || strings.Contains(output, "response.completed") || strings.Contains(output, `"total_tokens":18`) {
+		t.Fatalf("raw provider error was forged as successful conversion: %s", output)
+	}
+}
+
+func TestCompatibleResponsesConversionFailureIsClientError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	storeFalse := false
+	summary := "auto"
+	provider := &compatibleResponsesChatProvider{BaseProvider: providersBase.BaseProvider{Channel: &model.Channel{Type: config.ChannelTypeAnthropic, CompatibleResponse: true}}}
+	relay := &relayResponses{
+		relayBase: relayBase{c: ctx, provider: provider, modelName: "gpt-5"},
+		responsesRequest: types.OpenAIResponsesRequest{
+			Model:     "gpt-5",
+			Input:     "hello",
+			Store:     &storeFalse,
+			Reasoning: &types.ReasoningEffort{Summary: &summary},
+		},
+		operation: responsesOperationCreate,
+	}
+
+	finalizeErr := finalizeSelectedProviderRequest(relay)
+	apiErr := wrapRelaySetupError(relay, "provider_request", finalizeErr, "one_hub_error", http.StatusServiceUnavailable)
+	if finalizeErr == nil || apiErr == nil || apiErr.StatusCode != http.StatusBadRequest || apiErr.Type != "invalid_request_error" || openAIErrorCodeString(apiErr.Code, "") != unsupportedCapabilityCode || !apiErr.LocalError {
+		t.Fatalf("conversion failure = %+v; want local unsupported capability/400", apiErr)
+	}
+	if provider.createCalls != 0 || provider.createStreamCalls != 0 {
+		t.Fatalf("conversion failure reached provider: create=%d stream=%d", provider.createCalls, provider.createStreamCalls)
+	}
+}
+
+func TestRelayResponsesChatFallbackStopsOnClientCancellation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	requestContext, cancel := context.WithCancel(context.Background())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(requestContext)
+	streamRelay := &relayResponses{
+		relayBase: relayBase{
+			c:        ctx,
+			provider: &compatibleResponsesChatProvider{BaseProvider: providersBase.BaseProvider{Channel: &model.Channel{}}},
+		},
+		responsesRequest: types.OpenAIResponsesRequest{Model: "gpt-5"},
+	}
+	stream := &cancellationTrackingRelayStream{
+		dataChan: make(chan string),
+		errChan:  make(chan error),
+		recv:     make(chan struct{}),
+		closed:   make(chan struct{}),
+	}
+
+	result := make(chan *types.OpenAIErrorWithStatusCode, 1)
+	go func() {
+		_, _, apiErr := streamRelay.chatToResponseStreamClient(stream)
+		result <- apiErr
+	}()
+
+	select {
+	case <-stream.recv:
+	case <-time.After(time.Second):
+		t.Fatal("fallback stream did not start receiving")
+	}
+	cancel()
+
+	select {
+	case apiErr := <-result:
+		if apiErr == nil || openAIErrorCodeString(apiErr.Code, "") != "request_canceled" || apiErr.StatusCode != 499 {
+			t.Fatalf("fallback cancellation = %+v, want request_canceled/499", apiErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fallback stream remained blocked after client cancellation")
+	}
+	select {
+	case <-stream.closed:
+	case <-time.After(time.Second):
+		t.Fatal("fallback stream was not closed after client cancellation")
+	}
+}
+
+func TestCompatibleResponsesStreamFailurePreservesAcceptedQuotaAndStopsRetry(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	stream := &fakeRelayStream{dataChan: make(chan string), errChan: make(chan error, 1)}
+	close(stream.dataChan)
+	stream.errChan <- errors.New("provider stream failed")
+	close(stream.errChan)
+	provider := &compatibleStreamChatProvider{
+		BaseProvider: providersBase.BaseProvider{Channel: &model.Channel{Type: config.ChannelTypeAnthropic, CompatibleResponse: true}},
+		stream:       stream,
+	}
+	storeFalse := false
+	streamRelay := &relayResponses{
+		relayBase: relayBase{c: ctx, provider: provider, modelName: "gpt-5"},
+		responsesRequest: types.OpenAIResponsesRequest{
+			Model:  "gpt-5",
+			Input:  "hello",
+			Stream: true,
+			Store:  &storeFalse,
+		},
+		operation: responsesOperationCreate,
+	}
+	if err := finalizeSelectedProviderRequest(streamRelay); err != nil {
+		t.Fatalf("finalize compatible request: %v", err)
+	}
+
+	apiErr, done := streamRelay.compatibleSend(provider)
+	if apiErr == nil || apiErr.StatusCode != http.StatusBadGateway || !apiErr.UpstreamAccepted || !done {
+		t.Fatalf("accepted stream failure must preserve quota and stop retry, err=%+v done=%v", apiErr, done)
+	}
+}
+
 func TestRelayResponsesCompatibleFallbackRejectsStatefulResponses(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -1210,6 +1622,14 @@ func TestRelayResponsesCompatibleFallbackRejectsStatefulResponses(t *testing.T) 
 		request       types.OpenAIResponsesRequest
 		expectedParam string
 	}{
+		{
+			name: "store omitted defaults to stored",
+			request: types.OpenAIResponsesRequest{
+				Model: "gpt-5",
+				Input: "hello",
+			},
+			expectedParam: "store",
+		},
 		{
 			name: "store true",
 			request: types.OpenAIResponsesRequest{
@@ -1247,7 +1667,7 @@ func TestRelayResponsesCompatibleFallbackRejectsStatefulResponses(t *testing.T) 
 
 			provider := &compatibleResponsesChatProvider{
 				BaseProvider: providersBase.BaseProvider{
-					Channel: &model.Channel{Id: 88, CompatibleResponse: true},
+					Channel: &model.Channel{Id: 88, Type: config.ChannelTypeAnthropic, CompatibleResponse: true},
 				},
 				response: &types.ChatCompletionResponse{
 					ID:     "chatcmpl_unused",
@@ -1264,6 +1684,7 @@ func TestRelayResponsesCompatibleFallbackRejectsStatefulResponses(t *testing.T) 
 				},
 				responsesRequest: tc.request,
 				operation:        responsesOperationCreate,
+				selectedDataPath: providersBase.DataPathCrossProtocol,
 			}
 
 			errWithCode, done := relay.sendCurrentProvider()
@@ -1289,5 +1710,241 @@ func TestRelayResponsesCompatibleFallbackRejectsStatefulResponses(t *testing.T) 
 				t.Fatalf("expected chat fallback not to be attempted, got create=%d stream=%d", provider.createCalls, provider.createStreamCalls)
 			}
 		})
+	}
+}
+
+func TestRelayResponsesSelectedProviderRejectsLossyFallbackBeforeProviderWork(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	storeFalse := false
+	maxToolCalls := 2
+	request := types.OpenAIResponsesRequest{
+		Model:        "gpt-5",
+		Input:        "hello",
+		Store:        &storeFalse,
+		MaxToolCalls: &maxToolCalls,
+	}
+	provider := &compatibleResponsesChatProvider{
+		BaseProvider: providersBase.BaseProvider{
+			Channel: &model.Channel{Id: 89, Type: config.ChannelTypeAnthropic, CompatibleResponse: true},
+		},
+	}
+	relay := &relayResponses{
+		relayBase: relayBase{
+			provider:  provider,
+			modelName: "gpt-5",
+		},
+		responsesRequest: request,
+		rawEnvelope:      responsesTestRawEnvelope(t, request),
+		operation:        responsesOperationCreate,
+	}
+
+	err := relay.validateSelectedProviderRequest()
+	assertCapabilityGateError(t, err, "max_tool_calls")
+	if provider.createCalls != 0 || provider.createStreamCalls != 0 {
+		t.Fatalf("expected representability failure before provider work, got create=%d stream=%d", provider.createCalls, provider.createStreamCalls)
+	}
+}
+
+func TestRelayResponsesSelectedProviderSkipsRepresentabilityGateForNativeResponses(t *testing.T) {
+	maxToolCalls := 2
+	request := types.OpenAIResponsesRequest{Model: "gpt-5", Input: "hello", MaxToolCalls: &maxToolCalls}
+	provider := &compatibleResponsesChatProvider{
+		BaseProvider: providersBase.BaseProvider{
+			Channel: &model.Channel{Id: 90, Type: config.ChannelTypeOpenAI, CompatibleResponse: true},
+		},
+	}
+	relay := &relayResponses{
+		relayBase:        relayBase{provider: provider, modelName: "gpt-5"},
+		responsesRequest: request,
+		rawEnvelope:      responsesTestRawEnvelope(t, request),
+		operation:        responsesOperationCreate,
+	}
+	if err := relay.validateSelectedProviderRequest(); err != nil {
+		t.Fatalf("native Responses provider must retain the complete surface: %v", err)
+	}
+}
+
+func TestRelayResponsesUsesAdapterDataPathForDisabledCustomResponses(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	plugin := datatypes.NewJSONType(model.PluginType{
+		"endpoints": {
+			"openai.chat_completions": map[string]any{"enabled": true, "upstream_url": ""},
+			"openai.responses":        map[string]any{"enabled": false, "upstream_url": ""},
+		},
+	})
+	channel := &model.Channel{
+		Id:                 93,
+		Type:               config.ChannelTypeCustom,
+		CompatibleResponse: true,
+		Plugin:             &plugin,
+	}
+	compatibleBaseURL := "https://compatible.example"
+	channel.BaseURL = &compatibleBaseURL
+	provider := &chatFallbackResponsesProvider{BaseProvider: providersBase.BaseProvider{
+		Channel: channel,
+	}}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	store := false
+	request := types.OpenAIResponsesRequest{Model: "gpt-5", Input: "hello", Store: &store}
+	relay := &relayResponses{
+		relayBase:        relayBase{c: ctx, provider: provider, modelName: "gpt-5"},
+		responsesRequest: request,
+		rawEnvelope:      responsesTestRawEnvelope(t, request),
+		operation:        responsesOperationCreate,
+	}
+
+	if err := relay.validateSelectedProviderRequest(); err != nil {
+		t.Fatalf("representable cross-protocol request was rejected: %v", err)
+	}
+	apiErr, done := relay.sendCurrentProvider()
+	if apiErr != nil || done {
+		t.Fatalf("expected Chat compatibility path, done=%v err=%+v", done, apiErr)
+	}
+	if provider.chatRequest == nil {
+		t.Fatal("expected disabled native Responses endpoint to use Chat compatibility")
+	}
+	if provider.request != nil {
+		t.Fatalf("native Responses endpoint was called despite adapter CrossProtocol path: %+v", provider.request)
+	}
+}
+
+func TestDisabledCustomResponsesMaterializesChatBodyBeforeProvider(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			var providerBody []byte
+			providerCalls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				providerCalls++
+				if request.URL.Path != "/v1/chat/completions" {
+					t.Errorf("provider path=%q", request.URL.Path)
+				}
+				providerBody, _ = io.ReadAll(request.Body)
+				w.Header().Set("X-Request-Id", "chat-provider-request")
+				w.Header().Set("Content-Type", "application/json")
+				if stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl_stream\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":null}]}\n\n")
+					_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl_stream\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+					_, _ = io.WriteString(w, "data: [DONE]\n\n")
+					return
+				}
+				_, _ = io.WriteString(w, `{"id":"chatcmpl_unary","object":"chat.completion","created":1,"model":"gpt-5","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+			}))
+			t.Cleanup(server.Close)
+			previousClient := requester.HTTPClient
+			requester.HTTPClient = server.Client()
+			t.Cleanup(func() { requester.HTTPClient = previousClient })
+
+			raw := fmt.Sprintf(` {"model":"gpt-5","input":"hello","store":false,"stream":%t} `, stream)
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(raw))
+			ctx.Request.Header.Set("Content-Type", "application/json")
+			relay := NewRelayResponses(ctx)
+			if err := relay.setRequest(); err != nil {
+				t.Fatalf("parse Responses request: %v", err)
+			}
+			originalEnvelope := string(relay.rawEnvelope.Object.Raw)
+
+			plugin := datatypes.NewJSONType(model.PluginType{"endpoints": {"openai.chat_completions": map[string]any{"enabled": true, "upstream_url": ""}, "openai.responses": map[string]any{"enabled": false, "upstream_url": ""}}})
+			preAdd := `{"pre_add":true,"temperature":0.37}`
+			proxy := ""
+			channel := &model.Channel{Id: 93, Type: config.ChannelTypeCustom, CompatibleResponse: true, AllowExtraBody: true, Plugin: &plugin, Proxy: &proxy, BaseURL: &server.URL, CustomParameter: &preAdd}
+			provider := openai.CreateOpenAIProvider(channel, server.URL)
+			provider.SetContext(ctx)
+			provider.SetOriginalModel("gpt-5")
+			provider.SetUsage(&types.Usage{})
+			relay.provider = provider
+			relay.modelName = "gpt-5"
+
+			if err := relay.validateSelectedProviderRequest(); err != nil {
+				t.Fatalf("validate compatible request: %v", err)
+			}
+			if err := relay.prepareSelectedProviderRemoteMedia(); err != nil {
+				t.Fatalf("materialize compatible request: %v", err)
+			}
+			apiErr, done := relay.sendCurrentProvider()
+			if apiErr != nil || done {
+				t.Fatalf("compatible provider failed: done=%v err=%+v", done, apiErr)
+			}
+
+			var sent map[string]json.RawMessage
+			if err := json.Unmarshal(providerBody, &sent); err != nil {
+				t.Fatalf("decode provider body: %v body=%s", err, providerBody)
+			}
+			if _, exists := sent["input"]; exists {
+				t.Fatalf("Responses input leaked to Chat provider: %s", providerBody)
+			}
+			if string(sent["model"]) != `"gpt-5"` || !strings.Contains(string(sent["messages"]), "hello") {
+				t.Fatalf("prepared Chat request was not sent: %s", providerBody)
+			}
+			if string(sent["temperature"]) != "0.37" {
+				t.Fatalf("Responses-to-Chat pre_add was not materialized once: %s", providerBody)
+			}
+			if providerCalls != 1 {
+				t.Fatalf("Responses-to-Chat provider calls=%d, want 1", providerCalls)
+			}
+			if stream && string(sent["stream"]) != "true" {
+				t.Fatalf("stream mode was not materialized: %s", providerBody)
+			}
+			if string(relay.rawEnvelope.Object.Raw) != originalEnvelope {
+				t.Fatalf("Responses envelope was overwritten: got=%q want=%q", relay.rawEnvelope.Object.Raw, originalEnvelope)
+			}
+			providerResponseHeaders, ok := ctx.Get(requestctx.ProviderResponseHeadersContextKey)
+			if !ok || providerResponseHeaders.(http.Header).Get("X-Request-Id") != "chat-provider-request" {
+				t.Fatalf("provider response headers were captured on the wrong context: %#v", providerResponseHeaders)
+			}
+			originalBody, ok := common.GetOriginalRequestBody(ctx)
+			if !ok || string(originalBody) != raw {
+				t.Fatalf("original Responses body ownership changed: ok=%v body=%q", ok, originalBody)
+			}
+			canonical, ok := common.GetCanonicalRequestBody(ctx)
+			if !ok || string(canonical) == raw || !strings.Contains(string(canonical), `"messages"`) {
+				t.Fatalf("provider canonical body was not Chat: ok=%v body=%q", ok, canonical)
+			}
+			if stream {
+				if !strings.Contains(recorder.Body.String(), "response.completed") {
+					t.Fatalf("stream was not converted back to Responses: %q", recorder.Body.String())
+				}
+			} else if !strings.Contains(recorder.Body.String(), `"object":"response"`) {
+				t.Fatalf("unary response was not converted back to Responses: %q", recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestRelayResponsesFutureUnionRequiresNonCrossProtocolPath(t *testing.T) {
+	envelope, err := commonresponses.ParseRawEnvelope([]byte(`{"model":"gpt-5","input":"hello","store":false,"tools":[{"type":"future_tool","max_num_results":"future-shape"}]}`))
+	if err != nil || envelope.ProjectionError == nil {
+		t.Fatalf("expected a raw envelope with a partial projection, envelope=%+v err=%v", envelope, err)
+	}
+
+	crossProvider := &compatibleResponsesChatProvider{BaseProvider: providersBase.BaseProvider{
+		Channel: &model.Channel{Id: 91, Type: config.ChannelTypeAnthropic, CompatibleResponse: true},
+	}}
+	crossRelay := &relayResponses{
+		relayBase:        relayBase{provider: crossProvider, modelName: "gpt-5"},
+		responsesRequest: envelope.Projection,
+		rawEnvelope:      envelope,
+		operation:        responsesOperationCreate,
+	}
+	if err := crossRelay.validateSelectedProviderRequest(); err == nil {
+		t.Fatal("expected the cross-protocol adapter to reject an incomplete typed projection")
+	}
+
+	exactProvider := &compatibleResponsesChatProvider{BaseProvider: providersBase.BaseProvider{
+		Channel: &model.Channel{Id: 92, Type: config.ChannelTypeOpenAI},
+	}}
+	exactRelay := &relayResponses{
+		relayBase:        relayBase{provider: exactProvider, modelName: "gpt-5"},
+		responsesRequest: envelope.Projection,
+		rawEnvelope:      envelope,
+		operation:        responsesOperationCreate,
+	}
+	if err := exactRelay.validateSelectedProviderRequest(); err != nil {
+		t.Fatalf("expected exact-wire provider to accept the raw future union: %v", err)
 	}
 }

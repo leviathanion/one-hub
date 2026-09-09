@@ -2,8 +2,9 @@ package claude
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
+	"one-api/common/config"
+	"one-api/common/providerendpoint"
 	"one-api/common/requester"
 	"one-api/model"
 	"one-api/providers/base"
@@ -13,6 +14,14 @@ import (
 
 type ClaudeProviderFactory struct{}
 
+func (ClaudeProviderFactory) AssessChatRemoteMedia(_ *model.Channel, _ *types.ChatCompletionRequest, _ base.ChatRemoteMediaSummary) (base.RemoteMediaMode, error) {
+	return base.RemoteMediaPassURL, nil
+}
+
+func (ClaudeProviderFactory) AssessNativeClaudeRemoteMedia(_ *model.Channel, _ *ClaudeRequest, _ NativeRemoteMediaSummary) (base.RemoteMediaMode, error) {
+	return base.RemoteMediaPassURL, nil
+}
+
 // 创建 ClaudeProvider
 func (f ClaudeProviderFactory) Create(channel *model.Channel) base.ProviderInterface {
 	return CreateClaudeProvider(channel, "")
@@ -20,6 +29,9 @@ func (f ClaudeProviderFactory) Create(channel *model.Channel) base.ProviderInter
 
 func CreateClaudeProvider(channel *model.Channel, baseURL string) *ClaudeProvider {
 	claudeConfig := getConfig()
+	if channel.Type == config.ChannelTypeCustom {
+		claudeConfig.ChatCompletions, claudeConfig.EndpointError = channel.ResolveEndpoint(providerendpoint.Messages)
+	}
 	baseURLOverride := ""
 	if strings.TrimSpace(baseURL) != "" {
 		baseURLOverride = strings.TrimSpace(baseURL)
@@ -42,8 +54,8 @@ type ClaudeProvider struct {
 
 func getConfig() base.ProviderConfig {
 	return base.ProviderConfig{
-		BaseURL:         "https://api.anthropic.com",
-		ChatCompletions: "/v1/messages",
+		BaseURL:         providerendpoint.DefaultClaudeBaseURL,
+		ChatCompletions: providerendpoint.DefaultMessagesURI,
 		ModelList:       "/v1/models",
 	}
 }
@@ -79,6 +91,12 @@ func (p *ClaudeProvider) GetBaseURL() string {
 	if strings.TrimSpace(p.BaseURLOverride) != "" {
 		return strings.TrimSpace(p.BaseURLOverride)
 	}
+	if p.Channel.Type == config.ChannelTypeCustom {
+		if value := strings.TrimSpace(p.Channel.GetBaseURL()); value != "" {
+			return value
+		}
+		return p.Config.BaseURL
+	}
 	return p.BaseProvider.GetBaseURL()
 }
 
@@ -98,16 +116,7 @@ func (p *ClaudeProvider) GetRequestHeaders() (headers map[string]string) {
 }
 
 func (p *ClaudeProvider) GetFullRequestURL(requestURL string) string {
-	baseURL := strings.TrimSuffix(p.GetBaseURL(), "/")
-	if strings.HasPrefix(baseURL, "https://gateway.ai.cloudflare.com") {
-		requestURL = strings.TrimPrefix(requestURL, "/v1")
-	}
-
-	// base_url is treated as the upstream base path, not a full endpoint that
-	// this layer sanitizes. If an admin configures /v1/messages here, the final
-	// URL intentionally includes the endpoint twice so the bad base path remains
-	// visible instead of being silently corrected.
-	return fmt.Sprintf("%s%s", baseURL, requestURL)
+	return providerendpoint.CustomRequestURL(p.GetBaseURL(), requestURL)
 }
 
 func stopReasonClaude2OpenAI(reason string) string {

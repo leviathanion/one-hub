@@ -11,6 +11,7 @@ import (
 	"one-api/common"
 	"one-api/common/jsonobject"
 	"one-api/common/logger"
+	"one-api/common/providerresponse"
 	"one-api/common/requester"
 	commonresponses "one-api/common/responses"
 	"one-api/providers/codex/wire"
@@ -20,18 +21,14 @@ import (
 
 // CodexResponsesStreamHandler handles Codex Responses streaming.
 type CodexResponsesStreamHandler struct {
-	Usage       *types.Usage
-	eventBuffer strings.Builder
-	eventType   string
-	accumulator *codexTurnUsageAccumulator
+	Usage              *types.Usage
+	accumulator        *codexTurnUsageAccumulator
+	ProviderCredential string
 }
 
 const codexResponsesStreamMaxLineBytes = 16 << 20
 
-var (
-	codexResponsesStreamMaxEventBytes = 16 << 20
-	errCodexResponsesSSEEventTooLarge = errors.New("codex responses SSE event exceeds configured read limit")
-)
+var codexResponsesStreamMaxEventBytes = 16 << 20
 
 func cloneCodexExtraBilling(extraBilling map[string]types.ExtraBilling) map[string]types.ExtraBilling {
 	if len(extraBilling) == 0 {
@@ -45,32 +42,14 @@ func cloneCodexExtraBilling(extraBilling map[string]types.ExtraBilling) map[stri
 	return cloned
 }
 
-func safeCountCodexResponseTokens(content string, modelName string) (tokens int) {
-	defer func() {
-		if recover() != nil {
-			tokens = 0
-		}
-	}()
-	return common.CountTokenText(content, modelName)
-}
-
 func applyResolvedCodexUsage(target *types.Usage, resolved *types.Usage) {
 	if target == nil || resolved == nil {
 		return
 	}
-
-	existingText := ""
-	if target.TextBuilder.Len() > 0 {
-		existingText = target.TextBuilder.String()
-	}
-
 	*target = *resolved
-	if existingText != "" {
-		target.TextBuilder.WriteString(existingText)
-	}
 }
 
-func resolveCodexResponsesUsage(seed *types.Usage, accumulator *codexTurnUsageAccumulator, response *types.OpenAIResponsesResponses, modelName string, allowContentFallback bool) *types.Usage {
+func resolveCodexResponsesUsage(seed *types.Usage, accumulator *codexTurnUsageAccumulator, response *types.OpenAIResponsesResponses) *types.Usage {
 	if response == nil {
 		return nil
 	}
@@ -78,68 +57,94 @@ func resolveCodexResponsesUsage(seed *types.Usage, accumulator *codexTurnUsageAc
 		accumulator = newCodexTurnUsageAccumulator()
 	}
 	accumulator.SeedFromUsage(seed)
-	return accumulator.ResolveUsage(response, modelName, allowContentFallback)
+	return accumulator.ResolveUsage(response)
 }
 
-func finalizeCodexResponsesUsage(usage *types.Usage, response *types.OpenAIResponsesResponses, modelName string, allowContentFallback bool) {
-	resolved := resolveCodexResponsesUsage(usage, nil, response, modelName, allowContentFallback)
+func finalizeCodexResponsesUsage(usage *types.Usage, response *types.OpenAIResponsesResponses) error {
+	if response == nil {
+		return nil
+	}
+	accumulator := newCodexTurnUsageAccumulator()
+	accumulator.SeedFromUsage(usage)
+	if err := accumulator.ObserveEvent(&types.OpenAIResponsesStreamResponses{Type: codexTerminalEventType(response), Response: response}); err != nil {
+		mergeCodexAccumulatorBilling(usage, accumulator)
+		return err
+	}
+	resolved := resolveCodexResponsesUsage(usage, accumulator, response)
 	if usage == nil || resolved == nil {
-		return
+		return nil
 	}
 	applyResolvedCodexUsage(usage, resolved)
+	return nil
 }
 
-func codexResponsesSearchType(response *types.OpenAIResponsesResponses) string {
-	return commonresponses.ResponsesSearchType(response)
+func codexTerminalEventType(response *types.OpenAIResponsesResponses) string {
+	if response != nil {
+		switch strings.ToLower(strings.TrimSpace(response.Status)) {
+		case types.ResponseStatusFailed:
+			return "response.failed"
+		case types.ResponseStatusIncomplete, types.ResponseStatusCancelled:
+			return "response.incomplete"
+		}
+	}
+	return "response.completed"
 }
 
-func applyCodexResponsesAddedToolBilling(usage *types.Usage, item *types.ResponsesOutput, searchType string) {
-	commonresponses.ApplyResponsesOutputItemBilling(usage, item, searchType)
-}
-
-func (h *CodexResponsesStreamHandler) observeUsageEvent(dataLine string) {
+func (h *CodexResponsesStreamHandler) observeUsageEvent(dataLine string) error {
 	if h == nil {
-		return
+		return nil
 	}
 
 	event, ok := commonresponses.ParseStreamUsageEvent([]byte(dataLine))
 	if !ok {
-		return
+		return nil
 	}
 
 	if h.accumulator != nil {
-		var delta any
-		if text, ok := commonresponses.StreamEventDeltaString(event.Delta); ok {
-			delta = text
+		if err := h.accumulator.ObserveEvent(&types.OpenAIResponsesStreamResponses{
+			Type:              event.Type,
+			Item:              event.Item,
+			ItemID:            event.ItemID,
+			OutputIndex:       event.OutputIndex,
+			PartialImageIndex: event.PartialImageIndex,
+			Response:          event.Response,
+		}); err != nil {
+			mergeCodexAccumulatorBilling(h.Usage, h.accumulator)
+			return err
 		}
-		h.accumulator.ObserveEvent(&types.OpenAIResponsesStreamResponses{
-			Type:        event.Type,
-			Delta:       delta,
-			Item:        event.Item,
-			OutputIndex: event.OutputIndex,
-			Response:    event.Response,
-		})
 	}
 
 	switch event.Type {
-	case "response.output_text.delta", "response.reasoning_summary_text.delta":
-		if h.Usage != nil {
-			if delta, ok := commonresponses.StreamEventDeltaString(event.Delta); ok {
-				h.Usage.TextBuilder.WriteString(delta)
-			}
-		}
-	case "response.output_item.added":
-		if h.Usage != nil {
-			searchType := ""
-			if h.accumulator != nil {
-				searchType = h.accumulator.searchType
-			}
-			applyCodexResponsesAddedToolBilling(h.Usage, event.Item, searchType)
-		}
-	case "response.completed", "response.failed", "response.incomplete", "response.done":
-		if resolved := resolveCodexResponsesUsage(h.Usage, h.accumulator, event.Response, "", false); resolved != nil {
+	case "response.output_item.done":
+		mergeCodexAccumulatorBilling(h.Usage, h.accumulator)
+	case "response.completed", "response.failed", "response.incomplete":
+		if resolved := resolveCodexResponsesUsage(h.Usage, h.accumulator, event.Response); resolved != nil {
 			applyResolvedCodexUsage(h.Usage, resolved)
 		}
+	}
+	return nil
+}
+
+func (h *CodexResponsesStreamHandler) ObserveAcceptedResponsesEvent(rawEvent string) error {
+	payload, ok := commonresponses.SSEDataPayload(rawEvent)
+	if !ok {
+		return nil
+	}
+	payload = strings.TrimSpace(payload)
+	if payload == "" || payload == "[DONE]" {
+		return nil
+	}
+	return h.observeUsageEvent(payload)
+}
+
+func mergeCodexAccumulatorBilling(usage *types.Usage, accumulator *codexTurnUsageAccumulator) {
+	if usage == nil || accumulator == nil {
+		return
+	}
+	commonresponses.MergeResponsesExtraBillingMax(usage, accumulator.toolUsage.ExtraBilling)
+	usage.MergeBillingDiagnostics(accumulator.toolUsage.BillingDiagnostics)
+	for key, billing := range accumulator.toolUsage.ExtraBilling {
+		usage.MarkProviderExtraBilling(key, billing)
 	}
 }
 
@@ -163,10 +168,11 @@ func (p *CodexProvider) CreateResponses(ctx context.Context, rawReq *commonrespo
 	request.Stream = true
 
 	// Send streaming request.
-	httpRequester := p.codexRequester()
-	if httpRequester == nil {
+	baseRequester := p.codexRequester()
+	if baseRequester == nil {
 		return nil, common.StringErrorWrapperLocal("requester is not configured", "channel_error", http.StatusServiceUnavailable)
 	}
+	httpRequester := baseRequester.ForHTTPProfile(requester.HTTPProfileLongStream)
 	resp, errWithCode := httpRequester.SendRequestRaw(req)
 	if errWithCode != nil {
 		return nil, errWithCode
@@ -174,14 +180,16 @@ func (p *CodexProvider) CreateResponses(ctx context.Context, rawReq *commonrespo
 
 	// Create stream handler.
 	handler := newCodexResponsesStreamHandler(p.Usage)
+	handler.ProviderCredential = p.Channel.Key
 
 	// Get stream response.
-	stream, errWithCode := requester.RequestNoTrimStreamWithEmitterOptions(httpRequester, resp, handler.HandlerResponsesStreamWithEmitter, requester.StreamReadOptions{
+	rawStream, errWithCode := requester.RequestNoTrimStreamWithEmitterOptions(httpRequester, resp, handler.HandlerResponsesStreamWithEmitter, requester.StreamReadOptions{
 		MaxLineBytes: codexResponsesStreamMaxLineBytes,
 	})
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
+	stream := commonresponses.NewEventStream(rawStream, handler.ObserveAcceptedResponsesEvent)
 
 	// Aggregate full response.
 	response, errWithCode := p.collectResponsesStreamResponse(stream)
@@ -192,7 +200,7 @@ func (p *CodexProvider) CreateResponses(ctx context.Context, rawReq *commonrespo
 	if p.Usage == nil {
 		p.Usage = &types.Usage{}
 	}
-	if resolved := resolveCodexResponsesUsage(p.Usage, handler.accumulator, response, request.Model, true); resolved != nil {
+	if resolved := resolveCodexResponsesUsage(p.Usage, handler.accumulator, response); resolved != nil {
 		applyResolvedCodexUsage(p.Usage, resolved)
 	}
 	backfillCodexResponsePromptCacheKey(response, request)
@@ -200,7 +208,7 @@ func (p *CodexProvider) CreateResponses(ctx context.Context, rawReq *commonrespo
 }
 
 // CreateResponsesStream streams Responses.
-func (p *CodexProvider) CreateResponsesStream(ctx context.Context, rawReq *commonresponses.Request) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+func (p *CodexProvider) CreateResponsesStream(ctx context.Context, rawReq *commonresponses.Request) (commonresponses.EventStream, *types.OpenAIErrorWithStatusCode) {
 	req, errWithCode := p.prepareResponsesCreateRequest(ctx, rawReq)
 	if errWithCode != nil {
 		return nil, errWithCode
@@ -208,10 +216,11 @@ func (p *CodexProvider) CreateResponsesStream(ctx context.Context, rawReq *commo
 	defer req.Body.Close()
 	request := codexResponsesProjection(rawReq)
 	request.Stream = true
-	httpRequester := p.codexRequester()
-	if httpRequester == nil {
+	baseRequester := p.codexRequester()
+	if baseRequester == nil {
 		return nil, common.StringErrorWrapperLocal("requester is not configured", "channel_error", http.StatusServiceUnavailable)
 	}
+	httpRequester := baseRequester.ForHTTPProfile(requester.HTTPProfileLongStream)
 
 	// Send request.
 	resp, errWithCode := httpRequester.SendRequestRaw(req)
@@ -221,6 +230,7 @@ func (p *CodexProvider) CreateResponsesStream(ctx context.Context, rawReq *commo
 
 	// Create stream handler.
 	handler := newCodexResponsesStreamHandler(p.Usage)
+	handler.ProviderCredential = p.Channel.Key
 
 	// Convert Responses SSE to ChatCompletion stream when requested.
 	if request.ConvertChat {
@@ -230,36 +240,18 @@ func (p *CodexProvider) CreateResponsesStream(ctx context.Context, rawReq *commo
 			Model:  request.Model,
 		}
 
-		bridgeHandler := func(rawLine *[]byte, dataChan chan string, errChan chan error) {
-			if rawLine == nil || len(*rawLine) == 0 {
-				return
-			}
-
-			rawStr := strings.TrimSpace(string(*rawLine))
-			if !strings.HasPrefix(rawStr, "data:") {
-				return
-			}
-
-			// Normalize "data:{...}" and "data: {...}" to the expected "data: {...}".
-			dataLine := strings.TrimSpace(strings.TrimPrefix(rawStr, "data:"))
-			if dataLine == "" || dataLine == "[DONE]" {
-				return
-			}
-			handler.observeUsageEvent(dataLine)
-
-			normalized := []byte("data: " + dataLine)
-			chatHandler.HandlerChatStream(&normalized, dataChan, errChan)
-		}
-
-		return requester.RequestStreamWithOptions(httpRequester, resp, bridgeHandler, requester.StreamReadOptions{
-			MaxLineBytes: codexResponsesStreamMaxLineBytes,
+		stream, apiErr := requester.RequestNoTrimStreamWithOptions(httpRequester, resp, chatHandler.ChatSSEHandler(handler.ObserveAcceptedResponsesEvent), requester.StreamReadOptions{
+			MaxLineBytes:            codexResponsesStreamMaxLineBytes,
+			RequireProtocolTerminal: true,
 		})
+		return commonresponses.NewEventStream(stream, commonresponses.IgnoreAcceptedResponsesEvent), apiErr
 	}
 
 	// Use RequestNoTrimStream to preserve event lines.
-	return requester.RequestNoTrimStreamWithEmitterOptions(httpRequester, resp, handler.HandlerResponsesStreamWithEmitter, requester.StreamReadOptions{
+	stream, apiErr := requester.RequestNoTrimStreamWithEmitterOptions(httpRequester, resp, handler.HandlerResponsesStreamWithEmitter, requester.StreamReadOptions{
 		MaxLineBytes: codexResponsesStreamMaxLineBytes,
 	})
+	return commonresponses.NewEventStream(stream, handler.ObserveAcceptedResponsesEvent), apiErr
 }
 
 func (p *CodexProvider) CompactResponses(ctx context.Context, rawReq *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
@@ -285,7 +277,14 @@ func (p *CodexProvider) CompactResponses(ctx context.Context, rawReq *commonresp
 		p.Usage = &types.Usage{}
 	}
 
-	finalizeCodexResponsesUsage(p.Usage, response, request.Model, false)
+	if err := finalizeCodexResponsesUsage(p.Usage, response); err != nil {
+		var apiErr *types.OpenAIErrorWithStatusCode
+		if !errors.As(err, &apiErr) || apiErr == nil {
+			apiErr = common.ErrorWrapperLocal(err, commonresponses.ResponsesStreamTrackingFailureCode(err), http.StatusBadGateway)
+		}
+		apiErr.UpstreamAccepted = true
+		return nil, apiErr
+	}
 	backfillCodexResponsePromptCacheKey(response, request)
 	return response, nil
 }
@@ -293,16 +292,16 @@ func (p *CodexProvider) CompactResponses(ctx context.Context, rawReq *commonresp
 // codexResponsesProjection keeps raw body planning separate from the
 // local typed projection used for downstream accounting and response shaping.
 func codexResponsesProjection(req *commonresponses.Request) *types.OpenAIResponsesRequest {
-	return commonresponses.ProjectRequest(req, normalizeCodexModelName)
+	return commonresponses.ProjectRequest(req, strings.TrimSpace)
 }
 
 func (p *CodexProvider) prepareResponsesCreateRequest(ctx context.Context, req *commonresponses.Request) (*http.Request, *types.OpenAIErrorWithStatusCode) {
 	if req == nil || req.Body == nil || req.Body.Object == nil {
 		return nil, common.StringErrorWrapperLocal("request body is required", "invalid_request_error", http.StatusBadRequest)
 	}
-	model := normalizeCodexModelName(req.Model)
+	model := strings.TrimSpace(req.Model)
 	if model == "" {
-		model = normalizeCodexModelName(req.Body.Projection.Model)
+		model = strings.TrimSpace(req.Body.Projection.Model)
 	}
 	policy := responsesPolicyInput(req)
 	bodyObject := req.Body.Object
@@ -330,12 +329,12 @@ func (p *CodexProvider) prepareResponsesCompactRequest(ctx context.Context, req 
 	if req == nil || req.Body == nil || req.Body.Object == nil {
 		return nil, common.StringErrorWrapperLocal("request body is required", "invalid_request_error", http.StatusBadRequest)
 	}
-	model := normalizeCodexModelName(req.Model)
+	model := strings.TrimSpace(req.Model)
 	if model == "" {
-		model = normalizeCodexModelName(req.Body.Projection.Model)
+		model = strings.TrimSpace(req.Body.Projection.Model)
 	}
 	policy := responsesPolicyInput(req)
-	body, err := wire.PlanResponsesCompactBody(req.Body.Object, req.Body.Projection, model, policy.PromptCache)
+	body, err := wire.PlanResponsesCompactBody(req.Body.Object, model, policy.PromptCache)
 	if err != nil {
 		return nil, codexWireError(err)
 	}
@@ -407,6 +406,12 @@ func (p *CodexProvider) prepareResponsesOfficialHTTPRequest(ctx context.Context,
 	if err != nil {
 		return nil, codexWireError(err)
 	}
+	multiAgentEnabled := false
+	if operation == wire.OpResponsesCreate {
+		// This projection only selects a protocol header. The raw request remains
+		// authoritative, including provider-side validation of malformed values.
+		multiAgentEnabled, _ = commonresponses.ProjectMultiAgentEnabled(req.Body.Object.Fields["multi_agent"])
+	}
 	policy, err := p.codexOfficialChannelPolicy()
 	if err != nil {
 		return nil, common.ErrorWrapperLocal(err, "channel_config_error", http.StatusServiceUnavailable)
@@ -441,8 +446,9 @@ func (p *CodexProvider) prepareResponsesOfficialHTTPRequest(ctx context.Context,
 			AccessToken: token,
 			AccountID:   p.codexAccountID(),
 		},
-		Policy:   policy,
-		Identity: identity,
+		Policy:            policy,
+		Identity:          identity,
+		MultiAgentEnabled: multiAgentEnabled,
 	})
 	if err != nil {
 		return nil, codexWireError(err)
@@ -516,13 +522,6 @@ func (p *CodexProvider) auditCodexOfficialHeaderPlan(ctx context.Context, operat
 	logger.LogDebug(ctx, "[Codex] official upstream header decisions "+string(payload))
 }
 
-func (p *CodexProvider) getPromptCacheKeyStrategy() string {
-	if options := p.getChannelOptions(); options != nil {
-		return normalizePromptCacheStrategy(options.PromptCacheKeyStrategy)
-	}
-	return codexPromptCacheStrategyOff
-}
-
 func backfillCodexResponsePromptCacheKey(response *types.OpenAIResponsesResponses, request *types.OpenAIResponsesRequest) {
 	if response == nil || request == nil {
 		return
@@ -537,16 +536,45 @@ func backfillCodexResponsePromptCacheKey(response *types.OpenAIResponsesResponse
 }
 
 // collectResponsesStreamResponse aggregates stream to a response.
-func (p *CodexProvider) collectResponsesStreamResponse(stream requester.StreamReaderInterface[string]) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
+func (p *CodexProvider) collectResponsesStreamResponse(stream commonresponses.EventStream) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
 	if stream == nil {
 		return nil, common.StringErrorWrapperLocal("response stream is required", "stream_read_failed", http.StatusInternalServerError)
 	}
-	defer stream.Close()
-
+	defer requester.CloseAndDrainStream(stream)
+	observer := commonresponses.NewStreamObserver()
+	framer := commonresponses.NewSSEChunkFramer(codexResponsesStreamMaxEventBytes)
 	var response *types.OpenAIResponsesResponses
-
+	var eventError *types.OpenAIErrorWithStatusCode
+	handleEvent := func(event string) (bool, error) {
+		payload, hasData := commonresponses.SSEDataPayload(event)
+		if !hasData || strings.TrimSpace(payload) == "" || strings.TrimSpace(payload) == "[DONE]" {
+			return false, nil
+		}
+		var decoded types.OpenAIResponsesStreamResponses
+		if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+			eventError = codexAcceptedStreamError(err, "stream_decode_failed")
+			return true, nil
+		}
+		if err := observer.AcceptRawEvent(event, func() error {
+			return stream.ObserveAcceptedResponsesEvent(event)
+		}); err != nil {
+			eventError = codexAcceptedStreamError(err, "provider_protocol_error")
+			return true, nil
+		}
+		if observer.TerminalKind() == commonresponses.StreamTerminalError {
+			eventError = codexResponsesStreamProviderError(&decoded, []byte(payload), !observer.ProviderRejected())
+			return true, nil
+		}
+		if observer.TerminalSeen() {
+			response = decoded.Response
+			if response != nil && strings.TrimSpace(response.ID) == "" {
+				response.ID = observer.ObservedResponseID()
+			}
+			return true, nil
+		}
+		return false, nil
+	}
 	dataChan, errChan := stream.Recv()
-
 	for dataChan != nil || errChan != nil {
 		select {
 		case data, ok := <-dataChan:
@@ -554,217 +582,96 @@ func (p *CodexProvider) collectResponsesStreamResponse(stream requester.StreamRe
 				dataChan = nil
 				continue
 			}
-
-			if strings.TrimSpace(data) == "" {
-				continue
+			stop, err := framer.PushChunk(data, handleEvent)
+			if err != nil {
+				return nil, codexAcceptedStreamError(err, commonresponses.ResponsesStreamTrackingFailureCode(err))
 			}
-
-			// Extract JSON payload from SSE.
-			jsonData := extractJSONFromSSE(data)
-			if jsonData == "" {
-				continue
+			if eventError != nil {
+				return nil, eventError
 			}
-
-			// Parse stream payload.
-			var streamResp types.OpenAIResponsesStreamResponses
-			if err := json.Unmarshal([]byte(jsonData), &streamResp); err != nil {
-				continue
+			if stop {
+				return response, nil
 			}
-
-			// Capture terminal response event.
-			if (streamResp.Type == "response.completed" || streamResp.Type == "response.failed" || streamResp.Type == "response.incomplete" || streamResp.Type == "response.done") && streamResp.Response != nil {
-				response = streamResp.Response
-			}
-
 		case err, ok := <-errChan:
 			if !ok {
 				errChan = nil
 				continue
 			}
-			if err != nil {
-				// EOF is normal end-of-stream.
-				if errors.Is(err, io.EOF) {
-					dataChan = nil
-					errChan = nil
-					continue
+			if err == nil {
+				continue
+			}
+			if !errors.Is(err, io.EOF) {
+				if errors.Is(err, requester.ErrSSEEventTooLarge) || errors.Is(err, requester.ErrStreamLineTooLarge) {
+					return nil, codexAcceptedStreamError(err, "provider_usage_state_limit")
 				}
-				return nil, common.ErrorWrapper(err, "stream_read_failed", http.StatusInternalServerError)
+				return nil, codexAcceptedStreamError(err, "stream_read_failed")
 			}
+			return nil, codexAcceptedStreamError(errors.New("no complete terminal response received"), "no_response")
 		}
 	}
+	return nil, codexAcceptedStreamError(errors.New("no complete terminal response received"), "no_response")
+}
 
-	if response == nil {
-		return nil, common.StringErrorWrapperLocal("no response received", "no_response", http.StatusInternalServerError)
+func codexResponsesStreamProviderError(event *types.OpenAIResponsesStreamResponses, payload []byte, providerAccepted bool) *types.OpenAIErrorWithStatusCode {
+	safePayload, _ := common.RedactSensitiveJSON(payload)
+	detail := codexSupplierErrorDetailFromPayload(event, safePayload)
+	status := detail.Status
+	if status < http.StatusBadRequest || status > 599 {
+		status = http.StatusBadGateway
 	}
-	return response, nil
-}
-
-// extractJSONFromSSE extracts JSON payload from SSE data.
-func extractJSONFromSSE(sseData string) string {
-	// SSE format example:
-	// event: response.created
-	//
-	// data: {"type":"response.created",...}
-	//
-	// Extract JSON after data: prefix.
-
-	var payload strings.Builder
-	forEachSSELine(sseData, func(line string) bool {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "data:") {
-			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			if data == "" || data == "[DONE]" {
-				return true
-			}
-			if payload.Len() > 0 {
-				payload.WriteByte('\n')
-			}
-			payload.WriteString(data)
-		}
-		return true
-	})
-	return payload.String()
-}
-
-func forEachSSELine(sseData string, visit func(string) bool) {
-	for {
-		idx := strings.IndexByte(sseData, '\n')
-		if idx < 0 {
-			if sseData != "" {
-				visit(sseData)
-			}
-			return
-		}
-		if !visit(sseData[:idx]) {
-			return
-		}
-		sseData = sseData[idx+1:]
+	message := common.RedactSensitiveText(detail.Message)
+	if message == "" || message == "provider websocket error" {
+		message = "provider rejected request"
 	}
+	errType := strings.TrimSpace(detail.Type)
+	if errType == "" {
+		errType = "provider_error"
+	}
+	code := strings.TrimSpace(detail.Code)
+	if code == "" {
+		code = errType
+	}
+	providerError := types.OpenAIError{
+		Message: message,
+		Type:    errType,
+		Code:    code,
+		Param:   strings.TrimSpace(detail.Param),
+	}
+	quotaExhausted := status == http.StatusPaymentRequired || common.ProviderErrorIsQuotaExhausted(providerError)
+	rateLimited := status == http.StatusTooManyRequests || common.ProviderErrorIsRateLimited(providerError)
+	authRejected := status == http.StatusUnauthorized || common.ProviderErrorIsAuthRejected(providerError)
+	if detail.Status == 0 {
+		switch {
+		case quotaExhausted, rateLimited:
+			status = http.StatusTooManyRequests
+		case authRejected:
+			status = http.StatusUnauthorized
+		}
+	}
+	apiErr := &types.OpenAIErrorWithStatusCode{
+		OpenAIError:            providerError,
+		StatusCode:             status,
+		UpstreamAccepted:       providerAccepted || strings.TrimSpace(detail.ResponseID) != "",
+		ProviderQuotaExhausted: quotaExhausted,
+		ProviderRateLimited:    rateLimited,
+		ProviderAuthRejected:   authRejected,
+	}
+	return providerresponse.SanitizeAPIError(apiErr)
 }
 
-// HandlerResponsesStream handles Responses streaming (passthrough).
-func (h *CodexResponsesStreamHandler) HandlerResponsesStream(rawLine *[]byte, dataChan chan string, errChan chan error) {
-	h.handleResponsesStreamWithError(rawLine, func(data string) bool {
-		dataChan <- data
-		return true
-	}, func(err error) bool {
-		select {
-		case errChan <- err:
-			return true
-		default:
-			return false
-		}
-	})
+func codexAcceptedStreamError(err error, code string) *types.OpenAIErrorWithStatusCode {
+	var apiErr *types.OpenAIErrorWithStatusCode
+	if errors.As(err, &apiErr) && apiErr != nil {
+		cloned := *apiErr
+		cloned.UpstreamAccepted = true
+		return &cloned
+	}
+	errWithCode := common.ErrorWrapper(err, code, http.StatusBadGateway)
+	errWithCode.UpstreamAccepted = true
+	return errWithCode
 }
 
 func (h *CodexResponsesStreamHandler) HandlerResponsesStreamWithEmitter(rawLine *[]byte, emitter requester.StreamEmitter[string]) {
-	h.handleResponsesStreamWithError(rawLine, emitter.SendData, emitter.SendError)
-}
-
-func (h *CodexResponsesStreamHandler) handleResponsesStream(rawLine *[]byte, sendData func(string) bool) {
-	h.handleResponsesStreamWithError(rawLine, sendData, nil)
-}
-
-func (h *CodexResponsesStreamHandler) handleResponsesStreamWithError(rawLine *[]byte, sendData func(string) bool, sendError func(error) bool) {
-	if h == nil || rawLine == nil {
-		return
-	}
-	rawStr := string(*rawLine)
-
-	// Handle SSE event lines.
-	if strings.HasPrefix(rawStr, "event: ") {
-		if h.eventBuffer.Len() > 0 {
-			if !sendData(h.eventBuffer.String()) {
-				return
-			}
-			h.eventBuffer.Reset()
-		}
-		// Start new event and capture event type.
-		h.eventType = strings.TrimSpace(strings.TrimPrefix(rawStr, "event: "))
-		h.eventBuffer.Reset()
-		if err := appendCodexSSELine(&h.eventBuffer, rawStr); err != nil {
-			h.failBufferedSSEEvent(sendError, err)
-		}
-		return
-	}
-
-	// Buffer non-data lines when inside an event.
-	if !strings.HasPrefix(rawStr, "data:") {
-		if h.eventBuffer.Len() > 0 {
-			if err := appendCodexSSELine(&h.eventBuffer, rawStr); err != nil {
-				h.failBufferedSSEEvent(sendError, err)
-				return
-			}
-			if strings.TrimSpace(rawStr) == "" {
-				if !sendData(h.eventBuffer.String()) {
-					return
-				}
-				h.eventBuffer.Reset()
-				h.eventType = ""
-			}
-		} else {
-			// No event type: forward as-is.
-			sendData(rawStr)
-		}
-		return
-	}
-
-	// Handle data line.
-	dataLine := strings.TrimPrefix(rawStr, "data:")
-	dataLine = strings.TrimSpace(dataLine)
-
-	// Skip [DONE].
-	if dataLine == "[DONE]" {
-		// Flush buffered event.
-		if h.eventBuffer.Len() > 0 {
-			if !sendData(h.eventBuffer.String()) {
-				return
-			}
-			h.eventBuffer.Reset()
-			h.eventType = ""
-		}
-		return
-	}
-
-	// Passthrough: buffer or forward raw data.
-	if h.eventBuffer.Len() > 0 {
-		// Buffer data line within event.
-		if err := appendCodexSSELine(&h.eventBuffer, rawStr); err != nil {
-			h.failBufferedSSEEvent(sendError, err)
-			return
-		}
-	} else {
-		// No event type: forward data line.
-		sendData(rawStr)
-	}
-
-	h.observeUsageEvent(dataLine)
-}
-
-func (h *CodexResponsesStreamHandler) failBufferedSSEEvent(sendError func(error) bool, err error) {
-	if h != nil {
-		h.eventBuffer.Reset()
-		h.eventType = ""
-	}
-	if sendError != nil {
-		sendError(err)
-	}
-}
-
-func appendCodexSSELine(buffer *strings.Builder, raw string) error {
-	if buffer == nil {
-		return nil
-	}
-	extraBytes := len(raw)
-	if !strings.HasSuffix(raw, "\n") {
-		extraBytes++
-	}
-	if codexResponsesStreamMaxEventBytes > 0 && buffer.Len()+extraBytes > codexResponsesStreamMaxEventBytes {
-		return errCodexResponsesSSEEventTooLarge
-	}
-	buffer.WriteString(raw)
-	if !strings.HasSuffix(raw, "\n") {
-		buffer.WriteString("\n")
-	}
-	return nil
+	safe, _ := common.RedactCredentialValuesText(string(*rawLine), h.ProviderCredential)
+	emitter.SendData(safe)
 }

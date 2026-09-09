@@ -47,11 +47,7 @@ func (p *AzureProvider) CreateImageGenerations(request *types.ImageRequest) (*ty
 		response = &openaiResponse.ImageResponse
 	}
 
-	if response.Usage != nil && response.Usage.TotalTokens > 0 {
-		*p.Usage = *response.Usage.ToOpenAIUsage()
-	} else {
-		p.Usage.TotalTokens = p.Usage.PromptTokens
-	}
+	openai.ApplyImageEvidence(p.Usage, response)
 
 	return response, nil
 }

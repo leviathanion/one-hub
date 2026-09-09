@@ -6,7 +6,6 @@ import (
 	"one-api/common/requestctx"
 	"strings"
 
-	runtimesession "one-api/runtime/session"
 	"one-api/types"
 )
 
@@ -92,26 +91,22 @@ type UpstreamEvent struct {
 }
 
 // OpenRequest carries the complete evidence required to plan a provider-native
-// ResponsesWS upstream open. Transport remains validation-only for Codex
-// Official; it is not an alternate dialect selector there.
+// ResponsesWS upstream open.
 type OpenRequest struct {
-	InboundHeaders     requestctx.HeaderSnapshot
-	FirstFrame         *RawResponsesCreateFrame
-	Principal          requestctx.Principal
-	SelectedModel      string
-	UpstreamSessionID  string
-	PreviousResponseID string
-	Transport          runtimesession.TransportMode
-	ChannelID          int
-	Diagnostics        DiagnosticHook
+	InboundHeaders    requestctx.HeaderSnapshot
+	FirstFrame        *RawResponsesCreateFrame
+	Principal         requestctx.Principal
+	SelectedModel     string
+	UpstreamSessionID string
+	ChannelID         int
+	Diagnostics       DiagnosticHook
 }
 
 // SendRequest carries ResponsesWS protocol identity explicitly. Context remains
 // for cancellation, deadlines, and logging metadata only.
 type SendRequest struct {
-	AttemptID                 string
-	Frame                     Frame
-	DefaultPreviousResponseID string
+	AttemptID string
+	Frame     Frame
 }
 
 func validateClientAttemptID(req SendRequest) error {
@@ -123,7 +118,7 @@ func validateClientAttemptID(req SendRequest) error {
 		return nil
 	}
 	switch envelope.Type {
-	case "response.create", "response.cancel":
+	case "response.create", "response.inject":
 		if strings.TrimSpace(req.AttemptID) == "" {
 			return ErrMissingAttemptID
 		}
@@ -140,18 +135,6 @@ type Upstream interface {
 	TransportSendCapable
 	Recv(ctx context.Context) (UpstreamEvent, error)
 	Abort(reason string)
-}
-
-// ControlSendCapable marks upstreams with a dedicated control lane for events
-// such as response.cancel.
-type ControlSendCapable interface {
-	SendControl(ctx context.Context, req SendRequest) ResponsesWSTransportSendResult
-}
-
-// BridgeContinuationDefaultCapable marks bridge sessions that can safely inject
-// a relay-owned default previous_response_id.
-type BridgeContinuationDefaultCapable interface {
-	SupportsBridgeContinuationDefault() bool
 }
 
 func PayloadOriginForDetailOrigin(origin RecvDetailOrigin) PayloadOrigin {

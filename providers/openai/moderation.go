@@ -14,8 +14,7 @@ func (p *OpenAIProvider) CreateModeration(request *types.ModerationRequest) (*ty
 	defer req.Body.Close()
 
 	response := &OpenAIProviderModerationResponse{}
-	// 发送请求
-	_, errWithCode = p.Requester.SendRequest(req, response, false)
+	_, errWithCode = p.sendUnaryJSON(req, response)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -30,6 +29,9 @@ func (p *OpenAIProvider) CreateModeration(request *types.ModerationRequest) (*ty
 	}
 
 	p.Usage.TotalTokens = p.Usage.PromptTokens
+	if p.ProviderRawJSONReplay {
+		response.EnableProviderRawJSONReplay()
+	}
 
 	return &response.ModerationResponse, nil
 }

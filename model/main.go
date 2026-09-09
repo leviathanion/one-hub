@@ -175,7 +175,7 @@ func InitDB() (err error) {
 		if err = EnsurePublicationVersionRows(db); err != nil {
 			return err
 		}
-		err = db.AutoMigrate(&Midjourney{})
+		err = db.AutoMigrate(&ResponseOwner{})
 		if err != nil {
 			return err
 		}

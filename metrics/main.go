@@ -21,15 +21,12 @@ var (
 	requestBodyDecodedBytes          *prometheus.HistogramVec
 	responsesWSConnectLimit          *prometheus.CounterVec
 	responsesWSRedisFallback         *prometheus.CounterVec
+	responsesWSActiveLeaseLost       *prometheus.CounterVec
 	responsesWSEventPostTimeout      *prometheus.CounterVec
 	responsesWSPreconsumeForced      *prometheus.CounterVec
 	responsesWSPreconsumeLatency     *prometheus.HistogramVec
-	responsesWSPreconsumeFloor       *prometheus.HistogramVec
+	responsesWSPreconsumeReservation *prometheus.HistogramVec
 	responsesWSPreconsumeSettle      *prometheus.CounterVec
-	responsesWSSettlementConflict    *prometheus.CounterVec
-	responsesWSAttemptReplayDecision *prometheus.CounterVec
-	responsesWSAttemptReplayExecuted *prometheus.CounterVec
-	responsesWSAttemptReplayBlocked  *prometheus.CounterVec
 	usageObservedUnbilled            *prometheus.CounterVec
 	requestBodyDecodeOnce            sync.Once
 )
@@ -108,6 +105,13 @@ func init() {
 		},
 		[]string{"reason"},
 	)
+	responsesWSActiveLeaseLost = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "responses_ws_active_lease_lost_total",
+			Help: "Total number of active Responses WebSocket connections affected by Redis lease loss.",
+		},
+		[]string{"reason"},
+	)
 	responsesWSEventPostTimeout = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "responses_ws_event_post_timeout_total",
@@ -130,10 +134,10 @@ func init() {
 		},
 		[]string{"outcome"},
 	)
-	responsesWSPreconsumeFloor = promauto.NewHistogramVec(
+	responsesWSPreconsumeReservation = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name:    "responses_ws_preconsume_floor_quota",
-			Help:    "Pre-consumed floor quota for Responses WebSocket attempts.",
+			Name:    "responses_ws_preconsume_reservation_quota",
+			Help:    "Reserved quota during Responses WebSocket pre-consumption.",
 			Buckets: prometheus.ExponentialBuckets(1, 2, 18),
 		},
 		[]string{"outcome"},
@@ -144,34 +148,6 @@ func init() {
 			Help: "Total number of Responses WebSocket pre-consume reserve settlements.",
 		},
 		[]string{"action"},
-	)
-	responsesWSSettlementConflict = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "responses_ws_settlement_conflict_total",
-			Help: "Total number of Responses WebSocket settlement evidence conflicts.",
-		},
-		[]string{"kind"},
-	)
-	responsesWSAttemptReplayDecision = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "responses_ws_attempt_replay_decision_total",
-			Help: "Total number of Responses WebSocket attempt replay decisions.",
-		},
-		[]string{"decision", "origin", "status", "barrier", "failure"},
-	)
-	responsesWSAttemptReplayExecuted = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "responses_ws_attempt_replay_executed_total",
-			Help: "Total number of Responses WebSocket attempt replays executed after rollback.",
-		},
-		[]string{"origin", "status", "failure"},
-	)
-	responsesWSAttemptReplayBlocked = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "responses_ws_attempt_replay_blocked_total",
-			Help: "Total number of Responses WebSocket attempt replay decisions blocked by a barrier.",
-		},
-		[]string{"barrier", "origin", "status"},
 	)
 	usageObservedUnbilled = promauto.NewCounterVec(
 		prometheus.CounterOpts{
@@ -265,18 +241,24 @@ func RecordResponsesWSConnectionLimiterRedisFallback(reason string) {
 	})
 }
 
+func RecordResponsesWSActiveLeaseLost(reason string) {
+	SafelyRecordMetric(func() {
+		responsesWSActiveLeaseLost.WithLabelValues(reason).Inc()
+	})
+}
+
 func RecordResponsesWSEventPostTimeout(eventType string) {
 	SafelyRecordMetric(func() {
 		responsesWSEventPostTimeout.WithLabelValues(eventType).Inc()
 	})
 }
 
-func RecordResponsesWSPreconsumeForced(outcome string, latency time.Duration, floorQuota int) {
+func RecordResponsesWSPreconsumeForced(outcome string, latency time.Duration, reservedQuota int) {
 	SafelyRecordMetric(func() {
 		responsesWSPreconsumeForced.WithLabelValues(outcome).Inc()
 		responsesWSPreconsumeLatency.WithLabelValues(outcome).Observe(float64(latency.Milliseconds()))
-		if floorQuota > 0 {
-			responsesWSPreconsumeFloor.WithLabelValues(outcome).Observe(float64(floorQuota))
+		if reservedQuota > 0 {
+			responsesWSPreconsumeReservation.WithLabelValues(outcome).Observe(float64(reservedQuota))
 		}
 	})
 }
@@ -284,30 +266,6 @@ func RecordResponsesWSPreconsumeForced(outcome string, latency time.Duration, fl
 func RecordResponsesWSPreconsumeSettlement(action string) {
 	SafelyRecordMetric(func() {
 		responsesWSPreconsumeSettle.WithLabelValues(action).Inc()
-	})
-}
-
-func RecordResponsesWSSettlementConflict(kind string) {
-	SafelyRecordMetric(func() {
-		responsesWSSettlementConflict.WithLabelValues(kind).Inc()
-	})
-}
-
-func RecordResponsesWSAttemptReplayDecision(decision, origin string, status int, barrier, failure string) {
-	SafelyRecordMetric(func() {
-		responsesWSAttemptReplayDecision.WithLabelValues(decision, origin, strconv.Itoa(status), barrier, failure).Inc()
-	})
-}
-
-func RecordResponsesWSAttemptReplayExecuted(origin string, status int, failure string) {
-	SafelyRecordMetric(func() {
-		responsesWSAttemptReplayExecuted.WithLabelValues(origin, strconv.Itoa(status), failure).Inc()
-	})
-}
-
-func RecordResponsesWSAttemptReplayBlocked(barrier, origin string, status int) {
-	SafelyRecordMetric(func() {
-		responsesWSAttemptReplayBlocked.WithLabelValues(barrier, origin, strconv.Itoa(status)).Inc()
 	})
 }
 

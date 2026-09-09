@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -29,7 +30,15 @@ func resetResponsesWSCapacityForTest(t *testing.T) {
 	t.Helper()
 	responsesWSCapacity.Lock()
 	responsesWSCapacity.pendingByCredential = make(map[string]int)
+	responsesWSCapacity.pendingByUser = make(map[string]int)
+	responsesWSCapacity.pendingByGroup = make(map[string]int)
+	responsesWSCapacity.pendingGlobal = 0
+	responsesWSCapacity.pendingBytesByCredential = make(map[string]int64)
+	responsesWSCapacity.pendingBytesByUser = make(map[string]int64)
+	responsesWSCapacity.pendingBytesByGroup = make(map[string]int64)
+	responsesWSCapacity.pendingBytesGlobal = 0
 	responsesWSCapacity.activeByCredential = make(map[string]int)
+	responsesWSCapacity.activeByUser = make(map[string]int)
 	responsesWSCapacity.activeByGroup = make(map[string]int)
 	responsesWSCapacity.activeGlobal = 0
 	responsesWSCapacity.Unlock()
@@ -37,7 +46,15 @@ func resetResponsesWSCapacityForTest(t *testing.T) {
 		responsesWSCapacity.Lock()
 		defer responsesWSCapacity.Unlock()
 		responsesWSCapacity.pendingByCredential = make(map[string]int)
+		responsesWSCapacity.pendingByUser = make(map[string]int)
+		responsesWSCapacity.pendingByGroup = make(map[string]int)
+		responsesWSCapacity.pendingGlobal = 0
+		responsesWSCapacity.pendingBytesByCredential = make(map[string]int64)
+		responsesWSCapacity.pendingBytesByUser = make(map[string]int64)
+		responsesWSCapacity.pendingBytesByGroup = make(map[string]int64)
+		responsesWSCapacity.pendingBytesGlobal = 0
 		responsesWSCapacity.activeByCredential = make(map[string]int)
+		responsesWSCapacity.activeByUser = make(map[string]int)
 		responsesWSCapacity.activeByGroup = make(map[string]int)
 		responsesWSCapacity.activeGlobal = 0
 	})
@@ -108,6 +125,7 @@ type responsesWSFakeRedis struct {
 	mu       sync.Mutex
 	values   map[string]int64
 	expires  map[string]time.Time
+	leases   map[string]map[string]int64
 	commands []string
 	errors   []string
 }
@@ -123,6 +141,7 @@ func startResponsesWSFakeRedis(t *testing.T) *responsesWSFakeRedis {
 		done:     make(chan struct{}),
 		values:   make(map[string]int64),
 		expires:  make(map[string]time.Time),
+		leases:   make(map[string]map[string]int64),
 	}
 	fake.wg.Add(1)
 	go fake.acceptLoop()
@@ -247,6 +266,49 @@ func (f *responsesWSFakeRedis) handleCommand(conn net.Conn, args []string) {
 	case "del":
 		deleted := f.del(args[1:]...)
 		_, _ = fmt.Fprintf(conn, ":%d\r\n", deleted)
+	case "evalsha":
+		_, _ = io.WriteString(conn, "-NOSCRIPT No matching script. Please use EVAL.\r\n")
+	case "eval":
+		if len(args) < 4 {
+			_, _ = io.WriteString(conn, "-ERR missing eval args\r\n")
+			return
+		}
+		script := args[1]
+		numKeys, _ := strconv.Atoi(args[2])
+		if numKeys != 1 || len(args) < 3+numKeys {
+			_, _ = io.WriteString(conn, "-ERR invalid eval keys\r\n")
+			return
+		}
+		key := args[3]
+		scriptArgs := args[4:]
+		var result int64
+		switch script {
+		case acquireResponsesWSRedisLeaseScriptSource:
+			result = f.acquireLease(key, scriptArgs)
+		case heartbeatResponsesWSRedisLeaseScriptSource:
+			result = f.heartbeatLease(key, scriptArgs)
+		case releaseResponsesWSRedisLeaseScriptSource:
+			result = f.releaseLease(key, scriptArgs)
+		default:
+			if !strings.Contains(script, "local count = redis.call('INCRBY', KEYS[1], ARGV[3])") || len(scriptArgs) != 3 {
+				_, _ = io.WriteString(conn, "-ERR unsupported script\r\n")
+				return
+			}
+			rate, _ := strconv.ParseInt(scriptArgs[0], 10, 64)
+			seconds, _ := strconv.Atoi(scriptArgs[1])
+			increment, _ := strconv.ParseInt(scriptArgs[2], 10, 64)
+			f.mu.Lock()
+			f.cleanupExpiredLocked()
+			f.values[key] += increment
+			if f.values[key] == increment {
+				f.expires[key] = time.Now().Add(time.Duration(seconds) * time.Second)
+			}
+			if f.values[key] <= rate {
+				result = 1
+			}
+			f.mu.Unlock()
+		}
+		_, _ = fmt.Fprintf(conn, ":%d\r\n", result)
 	default:
 		_, _ = io.WriteString(conn, "+OK\r\n")
 	}
@@ -270,7 +332,7 @@ func (f *responsesWSFakeRedis) recordError(err error) {
 func (f *responsesWSFakeRedis) debugState() string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return fmt.Sprintf("commands=%v errors=%v values=%v", f.commands, f.errors, f.values)
+	return fmt.Sprintf("commands=%v errors=%v values=%v leases=%v", f.commands, f.errors, f.values, f.leases)
 }
 
 func (f *responsesWSFakeRedis) incr(key string) int64 {
@@ -315,6 +377,7 @@ func (f *responsesWSFakeRedis) del(keys ...string) int64 {
 		}
 		delete(f.values, key)
 		delete(f.expires, key)
+		delete(f.leases, key)
 	}
 	return deleted
 }
@@ -323,6 +386,9 @@ func (f *responsesWSFakeRedis) value(key string) int64 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.cleanupExpiredLocked()
+	if members := f.leases[key]; members != nil {
+		return int64(len(members))
+	}
 	return f.values[key]
 }
 
@@ -336,6 +402,11 @@ func (f *responsesWSFakeRedis) valuePrefix(prefix string) int64 {
 			total += value
 		}
 	}
+	for key, members := range f.leases {
+		if strings.HasPrefix(key, prefix) {
+			total += int64(len(members))
+		}
+	}
 	return total
 }
 
@@ -347,6 +418,90 @@ func (f *responsesWSFakeRedis) expirePrefix(prefix string) {
 			delete(f.values, key)
 			delete(f.expires, key)
 		}
+	}
+	for key := range f.leases {
+		if strings.HasPrefix(key, prefix) {
+			delete(f.leases, key)
+		}
+	}
+}
+
+func (f *responsesWSFakeRedis) expireOneLeaseMember(key string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for member := range f.leases[key] {
+		f.leases[key][member] = 0
+		return true
+	}
+	return false
+}
+
+func (f *responsesWSFakeRedis) acquireLease(key string, args []string) int64 {
+	if len(args) < 5 {
+		return -1
+	}
+	member := args[0]
+	nowMS, _ := strconv.ParseInt(args[1], 10, 64)
+	expiresAtMS, _ := strconv.ParseInt(args[2], 10, 64)
+	limit, _ := strconv.Atoi(args[4])
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pruneLeasesLocked(key, nowMS)
+	members := f.leases[key]
+	if len(members) >= limit {
+		return 0
+	}
+	if members == nil {
+		members = make(map[string]int64)
+		f.leases[key] = members
+	}
+	members[member] = expiresAtMS
+	return 1
+}
+
+func (f *responsesWSFakeRedis) heartbeatLease(key string, args []string) int64 {
+	if len(args) < 4 {
+		return -1
+	}
+	member := args[0]
+	nowMS, _ := strconv.ParseInt(args[1], 10, 64)
+	expiresAtMS, _ := strconv.ParseInt(args[2], 10, 64)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pruneLeasesLocked(key, nowMS)
+	if _, ok := f.leases[key][member]; !ok {
+		return 0
+	}
+	f.leases[key][member] = expiresAtMS
+	return 1
+}
+
+func (f *responsesWSFakeRedis) releaseLease(key string, args []string) int64 {
+	if len(args) < 1 {
+		return -1
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	members := f.leases[key]
+	if _, ok := members[args[0]]; !ok {
+		return 0
+	}
+	delete(members, args[0])
+	if len(members) == 0 {
+		delete(f.leases, key)
+	}
+	return 1
+}
+
+func (f *responsesWSFakeRedis) pruneLeasesLocked(key string, nowMS int64) {
+	members := f.leases[key]
+	for member, expiresAtMS := range members {
+		if expiresAtMS <= nowMS {
+			delete(members, member)
+		}
+	}
+	if len(members) == 0 {
+		delete(f.leases, key)
 	}
 }
 
@@ -429,8 +584,8 @@ func TestAllowResponsesWSConnectionAttemptCredentialIsolation(t *testing.T) {
 	setViperForTest(t, "responses_ws.connect_per_credential_per_minute", 1)
 
 	tokenA := newResponsesWSCapacityTestContext(101, 7, "default")
-	tokenB := newResponsesWSCapacityTestContext(102, 7, "default")
-	userOnly := newResponsesWSCapacityTestContext(0, 7, "default")
+	tokenB := newResponsesWSCapacityTestContext(102, 8, "default")
+	userOnly := newResponsesWSCapacityTestContext(0, 9, "default")
 	authNamespace := newResponsesWSCapacityTestContext(0, 0, "default")
 	authNamespace.Request.Header.Set("Authorization", "Bearer sk-auth-a")
 
@@ -455,6 +610,21 @@ func TestAllowResponsesWSConnectionAttemptCredentialIsolation(t *testing.T) {
 	}
 	if apiErr := AllowResponsesWSConnectionAttempt(authNamespace); apiErr == nil {
 		t.Fatalf("expected auth namespace second attempt to be limited independently")
+	}
+}
+
+func TestAllowResponsesWSConnectionAttemptMultipleTokensShareUserLimit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logger.Logger = zap.NewNop()
+	resetResponsesWSConnectionLimiterForTest(t)
+	setRedisEnabledForTest(t, false)
+	setViperForTest(t, "responses_ws.connect_per_credential_per_minute", 1)
+
+	if apiErr := AllowResponsesWSConnectionAttempt(newResponsesWSCapacityTestContext(101, 7, "default")); apiErr != nil {
+		t.Fatalf("first user attempt: %v", apiErr)
+	}
+	if apiErr := AllowResponsesWSConnectionAttempt(newResponsesWSCapacityTestContext(102, 7, "default")); apiErr == nil {
+		t.Fatal("second token bypassed the stable user connection-attempt limit")
 	}
 }
 
@@ -591,6 +761,81 @@ func TestAcquireResponsesWSPendingSlotUnlimited(t *testing.T) {
 	}
 }
 
+func TestAcquireResponsesWSPendingSlotMultipleTokensShareUserCapacity(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	resetResponsesWSCapacityForTest(t)
+	setViperForTest(t, "responses_ws.pending_per_credential", -1)
+	setViperForTest(t, "responses_ws.pending_per_user", 1)
+	setViperForTest(t, "responses_ws.pending_per_group", -1)
+	setViperForTest(t, "responses_ws.pending_global", -1)
+
+	lease, apiErr := AcquireResponsesWSPendingSlot(newResponsesWSCapacityTestContext(101, 7, "default"))
+	if apiErr != nil {
+		t.Fatalf("first pending lease: %v", apiErr)
+	}
+	defer lease.Release()
+	if _, apiErr := AcquireResponsesWSPendingSlot(newResponsesWSCapacityTestContext(102, 7, "default")); apiErr == nil || apiErr.Code != "responses_ws_pending_user_limit_exceeded" {
+		t.Fatalf("second token bypassed pending user capacity: %+v", apiErr)
+	}
+}
+
+func TestAcquireResponsesWSPendingSlotEnforcesGroupAndGlobalCapacity(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	resetResponsesWSCapacityForTest(t)
+	setViperForTest(t, "responses_ws.pending_per_credential", -1)
+	setViperForTest(t, "responses_ws.pending_per_user", -1)
+	setViperForTest(t, "responses_ws.pending_per_group", 1)
+	setViperForTest(t, "responses_ws.pending_global", 1)
+
+	lease, apiErr := AcquireResponsesWSPendingSlot(newResponsesWSCapacityTestContext(101, 7, "group-a"))
+	if apiErr != nil {
+		t.Fatalf("first pending lease: %v", apiErr)
+	}
+	defer lease.Release()
+	if _, apiErr := AcquireResponsesWSPendingSlot(newResponsesWSCapacityTestContext(102, 8, "group-a")); apiErr == nil || apiErr.Code != "responses_ws_pending_group_limit_exceeded" {
+		t.Fatalf("expected group pending limit, got %+v", apiErr)
+	}
+	if _, apiErr := AcquireResponsesWSPendingSlot(newResponsesWSCapacityTestContext(103, 9, "group-b")); apiErr == nil || apiErr.Code != "responses_ws_pending_global_limit_exceeded" {
+		t.Fatalf("expected global pending limit, got %+v", apiErr)
+	}
+}
+
+func TestResponsesWSPendingByteLeaseAccountsActualBytesAcrossUserAndReleases(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	resetResponsesWSCapacityForTest(t)
+	setViperForTest(t, "responses_ws.pending_bytes_per_credential", -1)
+	setViperForTest(t, "responses_ws.pending_bytes_per_user", 8)
+	setViperForTest(t, "responses_ws.pending_bytes_per_group", 16)
+	setViperForTest(t, "responses_ws.pending_bytes_global", 16)
+
+	first, apiErr := AcquireResponsesWSPendingByteLease(newResponsesWSCapacityTestContext(101, 7, "default"))
+	if apiErr != nil || !first.TryAcquire(6) {
+		t.Fatalf("first byte reservation failed: lease=%v err=%v", first, apiErr)
+	}
+	second, apiErr := AcquireResponsesWSPendingByteLease(newResponsesWSCapacityTestContext(102, 7, "default"))
+	if apiErr != nil {
+		t.Fatalf("second byte lease: %v", apiErr)
+	}
+	if second.TryAcquire(3) {
+		t.Fatal("second token bypassed stable user pending-byte capacity")
+	}
+	first.Release()
+	first.Release()
+	if !second.TryAcquire(8) {
+		t.Fatal("released bytes did not restore pending capacity")
+	}
+	second.Release()
+	responsesWSCapacity.Lock()
+	defer responsesWSCapacity.Unlock()
+	if responsesWSCapacity.pendingBytesGlobal != 0 || len(responsesWSCapacity.pendingBytesByCredential) != 0 || len(responsesWSCapacity.pendingBytesByUser) != 0 || len(responsesWSCapacity.pendingBytesByGroup) != 0 {
+		t.Fatalf("pending byte lease leaked capacity: global=%d credentials=%d users=%d groups=%d",
+			responsesWSCapacity.pendingBytesGlobal,
+			len(responsesWSCapacity.pendingBytesByCredential),
+			len(responsesWSCapacity.pendingBytesByUser),
+			len(responsesWSCapacity.pendingBytesByGroup))
+	}
+}
+
 func TestAcquireResponsesWSActiveLeaseConcurrentCredentialLimit(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	resetResponsesWSCapacityForTest(t)
@@ -631,6 +876,37 @@ func TestAcquireResponsesWSActiveLeaseConcurrentCredentialLimit(t *testing.T) {
 		t.Fatalf("expected released concurrent leases to free capacity, got %v", apiErr)
 	}
 	lease.Release()
+}
+
+func TestAcquireResponsesWSActiveLeaseMultipleTokensShareUserCapacity(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	resetResponsesWSCapacityForTest(t)
+	setRedisEnabledForTest(t, false)
+	setViperForTest(t, "responses_ws.active_per_credential", -1)
+	setViperForTest(t, "responses_ws.active_per_user", 1)
+	setViperForTest(t, "responses_ws.active_per_group", -1)
+	setViperForTest(t, "responses_ws.active_global", -1)
+
+	lease, apiErr := AcquireResponsesWSActiveLease(newResponsesWSCapacityTestContext(101, 7, "default"))
+	if apiErr != nil {
+		t.Fatalf("first active lease: %v", apiErr)
+	}
+	defer lease.Release()
+	if _, apiErr := AcquireResponsesWSActiveLease(newResponsesWSCapacityTestContext(102, 7, "default")); apiErr == nil || apiErr.Code != "responses_ws_active_user_limit_exceeded" {
+		t.Fatalf("second token bypassed active user capacity: %+v", apiErr)
+	}
+}
+
+func TestResponsesWSTokenCapacityOnlyTightensUserCapacity(t *testing.T) {
+	if got := responsesWSTightenLimit(-1, 4); got != 4 {
+		t.Fatalf("unlimited token widened finite user capacity: %d", got)
+	}
+	if got := responsesWSTightenLimit(8, 4); got != 4 {
+		t.Fatalf("larger token limit widened user capacity: %d", got)
+	}
+	if got := responsesWSTightenLimit(2, 4); got != 2 {
+		t.Fatalf("smaller token limit did not tighten user capacity: %d", got)
+	}
 }
 
 func TestAcquireResponsesWSActiveLeaseRejectsAnonymousByDefault(t *testing.T) {
@@ -720,6 +996,49 @@ func TestAcquireResponsesWSActiveLeaseUsesRedisSharedCounters(t *testing.T) {
 	lease.Release()
 }
 
+func TestProbeResponsesWSActiveLeaseBackendUsesAcquireHeartbeatAndRelease(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	fakeRedis := useResponsesWSFakeRedis(t)
+	if err := ProbeResponsesWSActiveLeaseBackend(context.Background()); err != nil {
+		t.Fatalf("equivalent active lease probe failed: %v; state=%s", err, fakeRedis.debugState())
+	}
+	if got := fakeRedis.valuePrefix(responsesWSActiveLeaseKeyPrefix + "readiness:"); got != 0 {
+		t.Fatalf("readiness probe leaked Redis lease state: %d; state=%s", got, fakeRedis.debugState())
+	}
+	fakeRedis.mu.Lock()
+	commands := append([]string(nil), fakeRedis.commands...)
+	fakeRedis.mu.Unlock()
+	var evalCount int
+	for _, command := range commands {
+		if command == "eval" {
+			evalCount++
+		}
+	}
+	if evalCount < 3 {
+		t.Fatalf("expected acquire, heartbeat and release Lua execution, commands=%v", commands)
+	}
+}
+
+func TestAcquireResponsesWSActiveLeaseRedisSharesUserAcrossTokens(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logger.Logger = zap.NewNop()
+	resetResponsesWSCapacityForTest(t)
+	useResponsesWSFakeRedis(t)
+	setViperForTest(t, "responses_ws.active_per_credential", -1)
+	setViperForTest(t, "responses_ws.active_per_user", 1)
+	setViperForTest(t, "responses_ws.active_per_group", -1)
+	setViperForTest(t, "responses_ws.active_global", -1)
+
+	lease, apiErr := AcquireResponsesWSActiveLease(newResponsesWSCapacityTestContext(930, 7, "default"))
+	if apiErr != nil {
+		t.Fatalf("first Redis user lease: %v", apiErr)
+	}
+	defer lease.Release()
+	if _, apiErr := AcquireResponsesWSActiveLease(newResponsesWSCapacityTestContext(931, 7, "default")); apiErr == nil || apiErr.Code != "responses_ws_active_user_limit_exceeded" {
+		t.Fatalf("second token bypassed Redis user capacity: %+v", apiErr)
+	}
+}
+
 func TestAcquireResponsesWSActiveLeaseRedisTTLExpiryRecoversCapacity(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	logger.Logger = zap.NewNop()
@@ -747,6 +1066,37 @@ func TestAcquireResponsesWSActiveLeaseRedisTTLExpiryRecoversCapacity(t *testing.
 	firstLease.Release()
 }
 
+func TestResponsesWSRedisLeaseMembersExpireIndependently(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logger.Logger = zap.NewNop()
+	resetResponsesWSCapacityForTest(t)
+	fakeRedis := useResponsesWSFakeRedis(t)
+	setViperForTest(t, "responses_ws.active_per_credential", -1)
+	setViperForTest(t, "responses_ws.active_per_group", 2)
+	setViperForTest(t, "responses_ws.active_global", -1)
+
+	first, apiErr := AcquireResponsesWSActiveLease(newResponsesWSCapacityTestContext(920, 7, "shared"))
+	if apiErr != nil {
+		t.Fatalf("first lease: %v", apiErr)
+	}
+	defer first.Release()
+	second, apiErr := AcquireResponsesWSActiveLease(newResponsesWSCapacityTestContext(921, 7, "shared"))
+	if apiErr != nil {
+		t.Fatalf("second lease: %v", apiErr)
+	}
+	defer second.Release()
+
+	groupKey := responsesWSActiveLeaseKeyPrefix + "group:shared"
+	if !fakeRedis.expireOneLeaseMember(groupKey) {
+		t.Fatal("expected one group lease member to exist")
+	}
+	third, apiErr := AcquireResponsesWSActiveLease(newResponsesWSCapacityTestContext(922, 7, "shared"))
+	if apiErr != nil {
+		t.Fatalf("expired member should free capacity while another member remains active: %v", apiErr)
+	}
+	third.Release()
+}
+
 func TestAcquireResponsesWSActiveLeaseSignalsLossWhenRedisLeaseDisappears(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	logger.Logger = zap.NewNop()
@@ -758,6 +1108,10 @@ func TestAcquireResponsesWSActiveLeaseSignalsLossWhenRedisLeaseDisappears(t *tes
 	setViperForTest(t, "responses_ws.active_global", -1)
 
 	ctx := newResponsesWSCapacityTestContext(911, 7, "default")
+	originalRecorder := recordResponsesWSActiveLeaseLost
+	reasons := make(chan string, 1)
+	recordResponsesWSActiveLeaseLost = func(reason string) { reasons <- reason }
+	t.Cleanup(func() { recordResponsesWSActiveLeaseLost = originalRecorder })
 	lease, apiErr := AcquireResponsesWSActiveLease(ctx)
 	if apiErr != nil {
 		t.Fatalf("expected Redis active lease to be acquired, got %v", apiErr)
@@ -773,6 +1127,14 @@ func TestAcquireResponsesWSActiveLeaseSignalsLossWhenRedisLeaseDisappears(t *tes
 	case <-lost:
 	case <-time.After(time.Second):
 		t.Fatal("expected lease loss to be signaled after Redis lease expiry")
+	}
+	select {
+	case reason := <-reasons:
+		if reason != "lease_member_missing" {
+			t.Fatalf("unexpected lease-loss reason metric: %q", reason)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected lease loss to publish an affected-connection metric")
 	}
 
 	lease.Release()

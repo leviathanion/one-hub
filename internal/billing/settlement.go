@@ -2,18 +2,13 @@ package billing
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"one-api/common/config"
 	"one-api/common/logger"
-	commonredis "one-api/common/redis"
 	"one-api/model"
 	"one-api/types"
 	"strings"
-	"time"
 )
 
 type SettlementRequestKind string
@@ -21,28 +16,8 @@ type SettlementRequestKind string
 const (
 	SettlementRequestKindUnary        SettlementRequestKind = "unary"
 	SettlementRequestKindRealtimeTurn SettlementRequestKind = "realtime_turn"
-	SettlementRequestKindAsyncTask    SettlementRequestKind = "async_task"
+	SettlementRequestKindResponsesWS  SettlementRequestKind = "responses_ws"
 )
-
-const settlementGateTTL = 24 * time.Hour
-
-var settlementAcquireGateScriptSource = `
-local key = KEYS[1]
-local fingerprint = ARGV[1]
-local ttl_ms = tonumber(ARGV[2])
-
-local current = redis.call('GET', key)
-if not current then
-	redis.call('SET', key, fingerprint, 'PX', ttl_ms)
-	return 1
-end
-if current == fingerprint then
-	return 0
-end
-return -1
-`
-
-var settlementAcquireGateScript = commonredis.NewScript(settlementAcquireGateScriptSource)
 
 type UsageSummary struct {
 	PromptTokens            int                           `json:"prompt_tokens"`
@@ -51,6 +26,7 @@ type UsageSummary struct {
 	PromptTokensDetails     types.PromptTokensDetails     `json:"prompt_tokens_details,omitempty"`
 	CompletionTokensDetails types.CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
 	ExtraTokens             map[string]int                `json:"extra_tokens,omitempty"`
+	ExtraUsageUnits         map[string]float64            `json:"extra_usage_units,omitempty"`
 	ExtraBilling            map[string]types.ExtraBilling `json:"extra_billing,omitempty"`
 }
 
@@ -66,6 +42,7 @@ func NewUsageSummary(usage *types.Usage) UsageSummary {
 		PromptTokensDetails:     usage.PromptTokensDetails,
 		CompletionTokensDetails: usage.CompletionTokensDetails,
 		ExtraTokens:             cloneSettlementExtraTokens(usage.GetExtraTokens()),
+		ExtraUsageUnits:         cloneSettlementExtraUsageUnits(usage.ExtraUsageUnits),
 		ExtraBilling:            cloneSettlementExtraBilling(usage.ExtraBilling),
 	}
 }
@@ -78,23 +55,33 @@ func (s UsageSummary) ToUsage() *types.Usage {
 		PromptTokensDetails:     s.PromptTokensDetails,
 		CompletionTokensDetails: s.CompletionTokensDetails,
 		ExtraTokens:             cloneSettlementExtraTokens(s.ExtraTokens),
+		ExtraUsageUnits:         cloneSettlementExtraUsageUnits(s.ExtraUsageUnits),
 		ExtraBilling:            cloneSettlementExtraBilling(s.ExtraBilling),
 	}
 	return usage
 }
 
+func cloneSettlementExtraUsageUnits(units map[string]float64) map[string]float64 {
+	if len(units) == 0 {
+		return nil
+	}
+	cloned := make(map[string]float64, len(units))
+	for key, value := range units {
+		cloned[key] = value
+	}
+	return cloned
+}
+
 type SettlementCommand struct {
-	Identity         string                `json:"identity,omitempty"`
-	Fingerprint      string                `json:"fingerprint,omitempty"`
-	RequestKind      SettlementRequestKind `json:"request_kind,omitempty"`
-	UserID           int                   `json:"user_id"`
-	TokenID          int                   `json:"token_id"`
-	ChannelID        int                   `json:"channel_id"`
-	ModelName        string                `json:"model_name,omitempty"`
-	PreConsumedQuota int                   `json:"pre_consumed_quota"`
-	FinalQuota       int                   `json:"final_quota"`
-	UsageSummary     UsageSummary          `json:"usage_summary"`
-	UnlimitedQuota   bool                  `json:"unlimited_quota"`
+	RequestKind            SettlementRequestKind `json:"request_kind,omitempty"`
+	UserID                 int                   `json:"user_id"`
+	TokenID                int                   `json:"token_id"`
+	ChannelID              int                   `json:"channel_id"`
+	ModelName              string                `json:"model_name,omitempty"`
+	PreConsumedQuota       int                   `json:"pre_consumed_quota"`
+	FinalQuota             int                   `json:"final_quota"`
+	UsageSummary           UsageSummary          `json:"usage_summary"`
+	PreconsumeTokenApplied bool                  `json:"preconsume_token_applied"`
 }
 
 func (cmd *SettlementCommand) Normalize() error {
@@ -111,14 +98,9 @@ func (cmd *SettlementCommand) Normalize() error {
 		return errors.New("settlement command final_quota cannot be negative")
 	}
 
-	cmd.Identity = strings.TrimSpace(cmd.Identity)
-	cmd.Fingerprint = strings.TrimSpace(cmd.Fingerprint)
 	cmd.ModelName = strings.TrimSpace(cmd.ModelName)
 	if cmd.RequestKind == "" {
 		cmd.RequestKind = SettlementRequestKindUnary
-	}
-	if cmd.Fingerprint == "" {
-		cmd.Fingerprint = buildSettlementFingerprint(*cmd)
 	}
 	return nil
 }
@@ -136,15 +118,8 @@ type SettlementProjection struct {
 	SourceIP    string         `json:"source_ip,omitempty"`
 }
 
-type SettlementCleanup struct {
-	RealtimeQuotaDelta    int  `json:"realtime_quota_delta,omitempty"`
-	RefreshUserQuotaCache bool `json:"refresh_user_quota_cache,omitempty"`
-}
-
 type SettlementOptions struct {
-	Deduplicate bool                 `json:"deduplicate,omitempty"`
-	Cleanup     SettlementCleanup    `json:"cleanup,omitempty"`
-	Projection  SettlementProjection `json:"projection,omitempty"`
+	Projection SettlementProjection `json:"projection,omitempty"`
 }
 
 type SettlementEnvelope struct {
@@ -153,40 +128,9 @@ type SettlementEnvelope struct {
 }
 
 type SettlementResult struct {
-	Delta               int  `json:"delta"`
-	TruthApplied        bool `json:"truth_applied"`
-	Deduplicated        bool `json:"deduplicated"`
-	FingerprintConflict bool `json:"fingerprint_conflict"`
-	CleanupFailed       bool `json:"cleanup_failed,omitempty"`
-}
-
-type settlementFingerprintPayload struct {
-	RequestKind      SettlementRequestKind `json:"request_kind"`
-	UserID           int                   `json:"user_id"`
-	TokenID          int                   `json:"token_id"`
-	ChannelID        int                   `json:"channel_id"`
-	ModelName        string                `json:"model_name,omitempty"`
-	PreConsumedQuota int                   `json:"pre_consumed_quota"`
-	FinalQuota       int                   `json:"final_quota"`
-	UsageSummary     UsageSummary          `json:"usage_summary"`
-	UnlimitedQuota   bool                  `json:"unlimited_quota"`
-}
-
-func buildSettlementFingerprint(cmd SettlementCommand) string {
-	payload := settlementFingerprintPayload{
-		RequestKind:      cmd.RequestKind,
-		UserID:           cmd.UserID,
-		TokenID:          cmd.TokenID,
-		ChannelID:        cmd.ChannelID,
-		ModelName:        cmd.ModelName,
-		PreConsumedQuota: cmd.PreConsumedQuota,
-		FinalQuota:       cmd.FinalQuota,
-		UsageSummary:     cmd.UsageSummary,
-		UnlimitedQuota:   cmd.UnlimitedQuota,
-	}
-	raw, _ := json.Marshal(payload)
-	sum := sha256.Sum256(raw)
-	return hex.EncodeToString(sum[:16])
+	Delta          int                         `json:"delta"`
+	TruthApplied   bool                        `json:"truth_applied"`
+	BalanceOutcome model.BillingBalanceOutcome `json:"balance_outcome"`
 }
 
 func ApplySettlement(ctx context.Context, cmd SettlementCommand, opts *SettlementOptions) (SettlementResult, error) {
@@ -204,87 +148,15 @@ func ApplySettlement(ctx context.Context, cmd SettlementCommand, opts *Settlemen
 		Delta: cmd.Delta(),
 	}
 
-	gateKey, acquired, conflict, err := acquireSettlementGate(ctx, cmd, *opts)
-	if err != nil {
-		logger.LogWarn(ctx, fmt.Sprintf("settlement gate unavailable for %s %s, continuing without dedupe: %v", cmd.RequestKind, cmd.Identity, err))
-		gateKey = ""
-		acquired = true
-	}
-	if !acquired {
-		result.Deduplicated = true
-		result.FingerprintConflict = conflict
-		return result, nil
-	}
-
-	if err = model.ApplyTokenUserQuotaDeltaDirect(cmd.TokenID, cmd.UserID, cmd.UnlimitedQuota, result.Delta); err != nil {
-		releaseSettlementGate(ctx, gateKey)
-		return result, err
+	applyResult, applyErr := model.ApplyBillingSettlementBalances(ctx, cmd.UserID, cmd.TokenID, int64(cmd.PreConsumedQuota), int64(cmd.FinalQuota), cmd.PreconsumeTokenApplied)
+	result.BalanceOutcome = applyResult.Outcome
+	if applyErr != nil {
+		return result, applyErr
 	}
 	result.TruthApplied = true
 
-	if !runSettlementCleanup(ctx, cmd, *opts) {
-		result.CleanupFailed = true
-	}
 	runSettlementProjection(ctx, cmd, *opts)
 	return result, nil
-}
-
-func acquireSettlementGate(ctx context.Context, cmd SettlementCommand, opts SettlementOptions) (string, bool, bool, error) {
-	if !opts.Deduplicate || cmd.Identity == "" || !config.RedisEnabled || commonredis.GetRedisClient() == nil {
-		return "", true, false, nil
-	}
-
-	key := fmt.Sprintf("settlement:v1:%s:%s", cmd.RequestKind, cmd.Identity)
-	status, err := settlementAcquireGateScript.Run(
-		ctx,
-		commonredis.GetRedisClient(),
-		[]string{key},
-		cmd.Fingerprint,
-		settlementGateTTL.Milliseconds(),
-	).Int64()
-	if err != nil {
-		return "", false, false, err
-	}
-	if status == 1 {
-		return key, true, false, nil
-	}
-	if status == 0 {
-		return key, false, false, nil
-	}
-
-	existingFingerprint, getErr := commonredis.GetRedisClient().Get(ctx, key).Result()
-	if getErr == nil && existingFingerprint != "" && existingFingerprint != cmd.Fingerprint {
-		logger.LogWarn(ctx, fmt.Sprintf("settlement identity %s already exists with different fingerprint: existing=%s current=%s", cmd.Identity, existingFingerprint, cmd.Fingerprint))
-	}
-	return key, false, true, nil
-}
-
-func releaseSettlementGate(ctx context.Context, gateKey string) {
-	if gateKey == "" || !config.RedisEnabled || commonredis.GetRedisClient() == nil {
-		return
-	}
-	if err := commonredis.GetRedisClient().Del(ctx, gateKey).Err(); err != nil {
-		logger.LogError(ctx, "release settlement gate failed: "+err.Error())
-	}
-}
-
-func runSettlementCleanup(ctx context.Context, cmd SettlementCommand, opts SettlementOptions) bool {
-	ok := true
-	if opts.Cleanup.RealtimeQuotaDelta > 0 {
-		if _, err := model.CacheDecreaseUserRealtimeQuota(cmd.UserID, opts.Cleanup.RealtimeQuotaDelta); err != nil {
-			logger.LogError(ctx, "settlement realtime quota cleanup failed: "+err.Error())
-			model.EnqueueUserRealtimeQuotaCacheDecreaseRepair(cmd.UserID, opts.Cleanup.RealtimeQuotaDelta, "settlement_realtime_quota_cleanup_failed")
-			ok = false
-		}
-	}
-	if opts.Cleanup.RefreshUserQuotaCache {
-		if err := model.CacheUpdateUserQuota(cmd.UserID); err != nil {
-			logger.LogError(ctx, "settlement user quota cache refresh failed: "+err.Error())
-			model.EnqueueUserQuotaCacheRepair(cmd.UserID, "settlement_user_quota_cache_refresh_failed")
-			ok = false
-		}
-	}
-	return ok
 }
 
 func runSettlementProjection(ctx context.Context, cmd SettlementCommand, opts SettlementOptions) {
@@ -292,7 +164,12 @@ func runSettlementProjection(ctx context.Context, cmd SettlementCommand, opts Se
 	extraTokens := usage.GetExtraTokens()
 	cacheTokens := extraTokens[config.UsageExtraCache]
 	cacheReadTokens := extraTokens[config.UsageExtraCachedRead]
-	cacheWriteTokens := extraTokens[config.UsageExtraCachedWrite]
+	// Pricing keeps provider evidence keys distinct, while the consume-log schema
+	// exposes a single cache-write total. Project both evidence fields into it.
+	cacheWriteTokens := extraTokens[config.UsageExtraCacheWrite] +
+		extraTokens[config.UsageExtraCachedWrite] +
+		extraTokens[config.UsageExtraClaudeCacheWrite5m] +
+		extraTokens[config.UsageExtraClaudeCacheWrite1h]
 
 	model.RecordConsumeLog(
 		ctx,
@@ -314,9 +191,13 @@ func runSettlementProjection(ctx context.Context, cmd SettlementCommand, opts Se
 	)
 
 	if cmd.ChannelID > 0 && cmd.FinalQuota > 0 {
-		model.UpdateChannelUsedQuota(cmd.ChannelID, cmd.FinalQuota)
+		if err := model.UpdateChannelUsedQuotaWithContext(ctx, cmd.ChannelID, cmd.FinalQuota); err != nil {
+			logger.LogError(ctx, "settlement channel usage projection failed: "+err.Error())
+		}
 	}
-	model.UpdateUserUsedQuotaAndRequestCount(cmd.UserID, cmd.FinalQuota)
+	if err := model.UpdateUserRequestCountWithContext(ctx, cmd.UserID); err != nil {
+		logger.LogError(ctx, "settlement user request-count projection failed: "+err.Error())
+	}
 }
 
 func cloneSettlementExtraTokens(extraTokens map[string]int) map[string]int {

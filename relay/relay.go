@@ -3,12 +3,12 @@ package relay
 import (
 	"net/http"
 	"one-api/common"
-	"one-api/common/config"
+	"one-api/common/providerresponse"
+	"one-api/common/requestctx"
+	commonRequester "one-api/common/requester"
 	"one-api/common/utils"
 	"one-api/model"
-	"one-api/providers/azure"
-	"one-api/providers/openai"
-	"strings"
+	providersBase "one-api/providers/base"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -21,54 +21,63 @@ func RelayOnly(c *gin.Context) {
 		return
 	}
 
-	channel := provider.GetChannel()
-	if channel.Type != config.ChannelTypeOpenAI && channel.Type != config.ChannelTypeAzure {
-		common.AbortWithMessage(c, http.StatusServiceUnavailable, "provider must be of type azureopenai or openai")
+	urlBuilder, ok := provider.(providersBase.RawRelayURLBuilder)
+	if !ok {
+		common.AbortWithMessage(c, http.StatusServiceUnavailable, "selected provider does not support raw resource relay")
 		return
 	}
 
-	// 获取请求的path
-	url := ""
-	path := c.Request.URL.Path
-	openAIProvider, ok := provider.(*openai.OpenAIProvider)
-	if !ok {
-		azureProvider, ok := provider.(*azure.AzureProvider)
-		if !ok {
-			common.AbortWithMessage(c, http.StatusServiceUnavailable, "provider must be of type openai")
-			return
-		}
-		url = azureProvider.GetFullRequestURL(path, "")
-	} else {
-		url = openAIProvider.GetFullRequestURL(path, "")
+	url, err := urlBuilder.BuildRawRelayURL(c.Request.URL.EscapedPath(), c.Request.URL.RawQuery)
+	if err != nil {
+		common.AbortWithMessage(c, http.StatusServiceUnavailable, "selected provider cannot build raw resource relay URL")
+		return
 	}
 
-	headers := c.Request.Header
 	mapHeaders := provider.GetRequestHeaders()
-	// 设置请求头
-	for k, v := range headers {
-		if _, ok := mapHeaders[k]; ok {
-			continue
-		}
-		mapHeaders[k] = strings.Join(v, ", ")
-	}
-
 	requester := provider.GetRequester()
-	req, err := requester.NewRequest(c.Request.Method, url, requester.WithBody(c.Request.Body), requester.WithHeader(mapHeaders))
+	req, err := requester.NewRequest(c.Request.Method, url, requester.WithContext(c.Request.Context()), requester.WithBody(c.Request.Body), requester.WithHeader(mapHeaders))
 	if err != nil {
 		common.AbortWithMessage(c, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	defer req.Body.Close()
+	if req.Body != nil {
+		defer req.Body.Close()
+	}
+	if c.Request.ContentLength >= 0 {
+		req.ContentLength = c.Request.ContentLength
+	}
+	if err := requestctx.ApplyRegisteredExactWireRequestHeaders(req.Header, requestctx.NewHeaderSnapshot(c.Request.Header)); err != nil {
+		common.AbortWithMessage(c, http.StatusBadRequest, "invalid request header")
+		return
+	}
 
-	response, errWithCode := requester.SendRequestRaw(req)
+	response, errWithCode := requester.SendRequestRawNoRedirect(req)
 	if errWithCode != nil {
 		newErrWithCode := FilterOpenAIErr(c, errWithCode)
 		relayResponseWithOpenAIErr(c, &newErrWithCode)
 		return
 	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusBadRequest {
+		errWithCode = commonRequester.HandleErrorResp(response, requester.ErrorHandler, requester.PrefixProviderErrors, true)
+		if replayProviderRawResponse(c, errWithCode, providerresponse.Policy{
+			Operation:      providerresponse.OperationRawRelay,
+			DataPath:       providerresponse.DataPathExactWire,
+			BodyUnmodified: true,
+		}) {
+			return
+		}
+		newErrWithCode := FilterOpenAIErr(c, errWithCode)
+		relayResponseWithOpenAIErr(c, &newErrWithCode)
+		return
+	}
 
-	errWithCode = responseMultipart(c, response)
+	errWithCode = responseMultipart(c, response, providerresponse.Policy{
+		Operation:        providerresponse.OperationRawRelay,
+		DataPath:         providerresponse.DataPathExactWire,
+		BodyUnmodified:   true,
+		PreserveRedirect: true,
+	})
 
 	if errWithCode != nil {
 		newErrWithCode := FilterOpenAIErr(c, errWithCode)
@@ -85,5 +94,12 @@ func RelayOnly(c *gin.Context) {
 		}
 	}
 	metadata := utils.AppendUserAgentMetadata(nil, c.Request.UserAgent())
-	model.RecordConsumeLog(c.Request.Context(), c.GetInt("id"), c.GetInt("channel_id"), 0, 0, 0, 0, 0, "", c.GetString("token_name"), 0, "中继:"+path, requestTime, false, metadata, c.ClientIP())
+	model.RecordConsumeLog(c.Request.Context(), c.GetInt("id"), c.GetInt("channel_id"), 0, 0, 0, 0, 0, "", c.GetString("token_name"), 0, rawRelayConsumeLogContent(c), requestTime, false, metadata, c.ClientIP())
+}
+
+func rawRelayConsumeLogContent(c *gin.Context) string {
+	if c == nil || c.Request == nil || c.Request.URL == nil {
+		return "中继:"
+	}
+	return "中继:" + c.Request.URL.EscapedPath()
 }

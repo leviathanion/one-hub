@@ -3,8 +3,12 @@ package relay
 import (
 	"net/http"
 	"one-api/common"
+	"one-api/common/providerresponse"
+	"one-api/model"
+	"one-api/providers"
 	providersBase "one-api/providers/base"
 	"one-api/types"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -26,12 +30,28 @@ func (r *relayTranscriptions) setRequest() error {
 	}
 
 	r.setOriginalModel(r.request.Model)
-
+	setRequestChannelCapability(r.c, requireTranscriptionChannelCompatibility(r.request.Model, &r.request))
 	return nil
 }
 
 func (r *relayTranscriptions) getPromptTokens() (int, error) {
 	return 0, nil
+}
+
+func (r *relayTranscriptions) IsStream() bool {
+	return r.request.Stream
+}
+
+func requireTranscriptionChannelCompatibility(modelName string, request *types.AudioRequest) requestChannelCapability {
+	return func(channel *model.Channel) error {
+		canonicalModel, err := mappedModelForChannel(channel, modelName)
+		if err != nil {
+			return &capabilityGateError{message: "channel has invalid model mapping configuration", status: http.StatusServiceUnavailable}
+		}
+		effective := *request
+		effective.Model = canonicalModel
+		return providerCapabilityGateError(providers.AssessTranscriptionRequest(channel, &effective))
+	}
 }
 
 func (r *relayTranscriptions) send() (err *types.OpenAIErrorWithStatusCode, done bool) {
@@ -48,7 +68,22 @@ func (r *relayTranscriptions) send() (err *types.OpenAIErrorWithStatusCode, done
 	if err != nil {
 		return
 	}
-	err = responseCustom(r.c, response)
+	if response == nil {
+		return common.StringErrorWrapperLocal("provider returned no transcription response", "invalid_provider_response", http.StatusBadGateway), true
+	}
+	if response.Stream != nil {
+		if r.heartbeat != nil {
+			r.heartbeat.Stop()
+		}
+		var firstResponse time.Time
+		firstResponse, err = responseAudioSSEClient(r.c, response.Stream, audioSSETranscription, providerresponse.OperationAudioTranscription, response.ObserveProviderEvent)
+		r.SetFirstResponseTime(firstResponse)
+		return err, err != nil
+	}
+	if r.heartbeat != nil {
+		r.heartbeat.Stop()
+	}
+	err = responseCustom(r.c, response, providersBase.OperationAudioTranscription)
 
 	if err != nil {
 		done = true

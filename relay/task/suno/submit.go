@@ -7,15 +7,14 @@ import (
 	"net/http"
 	"one-api/common"
 	"one-api/common/logger"
-	"one-api/metrics"
 	"one-api/model"
 	"one-api/providers"
 	sunoProvider "one-api/providers/suno"
 	"one-api/relay/task/base"
 	"sort"
 	"strings"
+	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/samber/lo"
 )
 
@@ -25,6 +24,11 @@ type SunoTask struct {
 	Request  *sunoProvider.SunoSubmitReq
 	Provider *sunoProvider.SunoProvider
 }
+
+var (
+	sunoTaskPollDeadline          = 30 * time.Second
+	sunoTaskOwnerMutationDeadline = 5 * time.Second
+)
 
 func (t *SunoTask) HandleError(err *base.TaskError) {
 	StringError(t.C, err.StatusCode, err.Code, err.Message)
@@ -36,6 +40,9 @@ func (t *SunoTask) Init() *base.TaskError {
 	// 解析
 	if err := common.UnmarshalBodyReusable(t.C, &t.Request); err != nil {
 		return base.StringTaskError(http.StatusBadRequest, "invalid_request", err.Error(), true)
+	}
+	if t.Request == nil {
+		return base.StringTaskError(http.StatusBadRequest, "invalid_request", "request body must be an object", true)
 	}
 
 	err := t.actionValidate()
@@ -75,13 +82,13 @@ func (t *SunoTask) SetProvider() *base.TaskError {
 }
 
 func (t *SunoTask) Relay() *base.TaskError {
-	resp, err := t.Provider.Submit(t.Action, t.Request)
+	resp, err := t.Provider.Submit(t.C.Request.Context(), t.Action, t.Request)
 	if err != nil {
 		return base.OpenAIErrToTaskErr(err)
 	}
 
 	if !resp.IsSuccess() {
-		return base.StringTaskError(http.StatusInternalServerError, "submit_failed", resp.Message, false)
+		return base.RejectedTaskError(http.StatusBadGateway, "submit_rejected", resp.Message)
 	}
 
 	if resp.Data == nil || strings.TrimSpace(*resp.Data) == "" {
@@ -89,7 +96,7 @@ func (t *SunoTask) Relay() *base.TaskError {
 	}
 
 	t.Response = resp
-	t.Task.TaskID = strings.TrimSpace(*resp.Data)
+	model.SetTaskProviderID(t.Task, *resp.Data)
 	t.Task.ChannelId = t.Provider.Channel.Id
 
 	return nil
@@ -124,40 +131,6 @@ func (t *SunoTask) actionValidate() (err error) {
 	return
 }
 
-func (t *SunoTask) ShouldRetry(c *gin.Context, err *base.TaskError) bool {
-	if err == nil {
-		return false
-	}
-
-	metrics.RecordProvider(c, err.StatusCode)
-
-	if err.LocalError {
-		return false
-	}
-
-	if _, ok := t.C.Get("specific_channel_id"); ok {
-		return false
-	}
-
-	if err.StatusCode == http.StatusTooManyRequests {
-		return true
-	}
-
-	if err.StatusCode == 307 {
-		return true
-	}
-
-	if err.StatusCode/100 == 5 {
-		// 超时不重试
-		if err.StatusCode == 504 || err.StatusCode == 524 {
-			return false
-		}
-		return true
-	}
-
-	return true
-}
-
 func (t *SunoTask) UpdateTaskStatus(ctx context.Context, taskChannelM map[int][]string, taskM map[string]*model.Task) error {
 	for channelId, taskIds := range taskChannelM {
 		err := updateSunoTaskAll(ctx, channelId, taskIds, taskM)
@@ -169,109 +142,136 @@ func (t *SunoTask) UpdateTaskStatus(ctx context.Context, taskChannelM map[int][]
 }
 
 func updateSunoTaskAll(ctx context.Context, channelId int, taskIds []string, taskM map[string]*model.Task) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	logger.LogWarn(ctx, fmt.Sprintf("渠道 #%d 未完成的任务有: %d", channelId, len(taskIds)))
 	if len(taskIds) == 0 {
 		return nil
 	}
 
-	channel := model.ChannelGroup.GetChannel(channelId)
-	if channel == nil {
-		reason := fmt.Sprintf("获取渠道信息失败，请联系管理员，渠道ID：%d", channelId)
-		for _, taskID := range taskIds {
-			task := taskM[taskID]
-			if task == nil {
-				continue
-			}
-			if err := base.FailTaskWithSettlement(ctx, task, reason); err != nil {
-				logger.SysError(fmt.Sprintf("UpdateTask error: %v", err))
-			}
-		}
-		return fmt.Errorf("channel not found")
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	queryCtx, cancelQuery := sunoTaskQueryContext(ctx)
+	defer cancelQuery()
+	channel, err := model.GetChannelIncarnationByID(queryCtx, channelId)
+	if err != nil {
+		return fmt.Errorf("load owner channel incarnation %d: %w", channelId, err)
+	}
+	if err := channel.ValidateRuntimeConfigJSON(); err != nil {
+		return fmt.Errorf("invalid owner channel incarnation %d: %w", channelId, err)
 	}
 
 	providers := providers.GetProvider(channel, nil)
 	sunoProvider, ok := providers.(*sunoProvider.SunoProvider)
 	if !ok {
-		for _, taskID := range taskIds {
-			task := taskM[taskID]
-			if task == nil {
-				continue
-			}
-			if err := base.FailTaskWithSettlement(ctx, task, "获取供应商失败，请联系管理员"); err != nil {
-				logger.SysError(fmt.Sprintf("UpdateTask error: %v", err))
-			}
-		}
 		return fmt.Errorf("provider not found")
 	}
 
-	resp, errWithCode := sunoProvider.GetFetchs(taskIds)
+	resp, errWithCode := sunoProvider.GetFetchs(queryCtx, taskIds)
 	if errWithCode != nil {
-		logger.SysError(fmt.Sprintf("Get Task Do req error: %v", errWithCode))
+		return fmt.Errorf("poll provider tasks: %v", errWithCode)
 	}
 
-	if !resp.IsSuccess() {
-		return fmt.Errorf("渠道 #%d 未完成的任务有: %d, 报错: %s", channelId, len(taskIds), resp.Message)
+	if resp == nil || !resp.IsSuccess() || resp.Data == nil {
+		message := "empty provider response"
+		if resp != nil {
+			message = resp.Message
+		}
+		return fmt.Errorf("渠道 #%d 未完成的任务有: %d, 报错: %s", channelId, len(taskIds), message)
 	}
 
+	returned := make(map[string]struct{}, len(*resp.Data))
 	for _, responseItem := range *resp.Data {
 		task := taskM[responseItem.TaskID]
-		if !checkTaskNeedUpdate(task, responseItem) {
+		if task == nil {
 			continue
 		}
-		task.TaskID = responseItem.TaskID
+		returned[responseItem.TaskID] = struct{}{}
+		if !checkTaskNeedUpdate(task, responseItem) {
+			rescheduleSunoTaskPoll(ctx, task, model.TaskPollInterval)
+			continue
+		}
+		model.SetTaskProviderID(task, responseItem.TaskID)
 
 		task.Status = lo.If(model.TaskStatus(responseItem.Status) != "", model.TaskStatus(responseItem.Status)).Else(task.Status)
 		task.FailReason = lo.If(responseItem.FailReason != "", responseItem.FailReason).Else(task.FailReason)
 		task.SubmitTime = lo.If(responseItem.SubmitTime != 0, responseItem.SubmitTime).Else(task.SubmitTime)
 		task.StartTime = lo.If(responseItem.StartTime != 0, responseItem.StartTime).Else(task.StartTime)
 		task.FinishTime = lo.If(responseItem.FinishTime != 0, responseItem.FinishTime).Else(task.FinishTime)
+		task.Data = responseItem.Data
 
-		if responseItem.FailReason != "" || task.Status == model.TaskStatusFailure {
-			logger.LogError(ctx, task.TaskID+" 构建失败，"+task.FailReason)
-			settleResult, settleErr := base.FinalizeTaskSettlement(ctx, task, false)
+		if task.Status == model.TaskStatusFailure {
+			logger.LogError(ctx, model.TaskProviderID(task)+" 构建失败，"+task.FailReason)
+			_, settleErr := finalizeSunoTaskSettlement(ctx, task)
 			if settleErr != nil {
 				logger.LogError(ctx, "finalize failed task settlement: "+settleErr.Error())
-				continue
 			}
-			if !settleResult.Handled {
-				quota := task.Quota
-				if quota > 0 {
-					err := model.IncreaseUserQuota(task.UserId, quota)
-					if err != nil {
-						logger.LogError(ctx, "fail to increase user quota: "+err.Error())
-					}
-					logContent := fmt.Sprintf("异步任务执行失败 %s，补偿 %s", task.TaskID, common.LogQuota(quota))
-					model.RecordLog(task.UserId, model.LogTypeSystem, logContent)
-				}
-			}
-			if !settleResult.PersistTask {
-				continue
-			}
-			task.Progress = 100
+			continue
 		}
 
 		if responseItem.Status == model.TaskStatusSuccess {
-			settleResult, settleErr := base.FinalizeTaskSettlement(ctx, task, true)
+			_, settleErr := finalizeSunoTaskSettlement(ctx, task)
 			if settleErr != nil {
 				logger.LogError(ctx, "finalize success task settlement: "+settleErr.Error())
-				continue
 			}
-			if !settleResult.PersistTask {
-				continue
-			}
-			task.Progress = 100
+			continue
 		}
 
-		task.Data = responseItem.Data
-		err := task.Update()
-		if err != nil {
-			logger.SysError("UpdateTask task error: " + err.Error())
+		if err := saveSunoTaskPollSnapshot(ctx, task, time.Now().Add(model.TaskPollInterval)); err != nil {
+			logger.SysError("save Suno task poll snapshot: " + err.Error())
 		}
+	}
+	for _, taskID := range taskIds {
+		if _, ok := returned[taskID]; ok {
+			continue
+		}
+		rescheduleSunoTaskPoll(ctx, taskM[taskID], 30*time.Second)
 	}
 	return nil
 }
 
+func sunoTaskQueryContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(parent, sunoTaskPollDeadline)
+}
+
+func sunoTaskMutationContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(context.WithoutCancel(parent), sunoTaskOwnerMutationDeadline)
+}
+
+func rescheduleSunoTaskPoll(parent context.Context, task *model.Task, delay time.Duration) {
+	mutationCtx, cancel := sunoTaskMutationContext(parent)
+	if err := base.RescheduleTaskPoll(mutationCtx, task, delay); err != nil {
+		logger.SysError(fmt.Sprintf("reschedule Suno task poll: %v", err))
+	}
+	cancel()
+}
+
+func finalizeSunoTaskSettlement(parent context.Context, task *model.Task) (base.TaskSettlementFinalizeResult, error) {
+	mutationCtx, cancel := sunoTaskMutationContext(parent)
+	result, err := base.FinalizeTaskSettlement(mutationCtx, task)
+	cancel()
+	return result, err
+}
+
+func saveSunoTaskPollSnapshot(parent context.Context, task *model.Task, next time.Time) error {
+	mutationCtx, cancel := sunoTaskMutationContext(parent)
+	_, err := model.SaveTaskPollSnapshot(mutationCtx, task, next)
+	cancel()
+	return err
+}
+
 func checkTaskNeedUpdate(oldTask *model.Task, newTask sunoProvider.SunoDataResponse) bool {
+	if oldTask == nil {
+		return false
+	}
 	if oldTask.SubmitTime != newTask.SubmitTime {
 		return true
 	}

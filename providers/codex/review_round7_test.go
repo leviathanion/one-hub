@@ -20,7 +20,7 @@ func TestTokenV2FingerprintRejectsOldProviderLateWrite(t *testing.T) {
 	newProvider := CodexProviderFactory{}.Create(&model.Channel{Id: channelID, Type: config.ChannelTypeCodex, Key: newKey}).(*CodexProvider)
 
 	// Simulate an old request completing after the durable key was manually
-	// replaced and all known legacy keys were deleted.
+	// replaced. The credential fingerprint alone must isolate the late write.
 	oldProvider.cacheCurrentToken(context.Background())
 	if snapshot := newProvider.getCachedCredentialSnapshot(context.Background(), 0); snapshot.AccessToken != "" {
 		t.Fatalf("new provider consumed old in-flight write: %+v", snapshot)

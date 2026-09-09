@@ -10,6 +10,7 @@ import (
 	"one-api/common/config"
 	"one-api/common/groupctx"
 	"one-api/internal/requesthints"
+	"one-api/model"
 	runtimeaffinity "one-api/runtime/channelaffinity"
 	"one-api/types"
 
@@ -676,5 +677,111 @@ func TestChannelAffinityAdditionalNilAndRecorderBranches(t *testing.T) {
 	wrongMetaCtx.Set(config.GinChannelAffinityMetaKey, "wrong-type")
 	if meta := currentChannelAffinityLogMeta(wrongMetaCtx); meta != nil {
 		t.Fatalf("expected wrong typed affinity metadata to be ignored, got %#v", meta)
+	}
+}
+
+func TestPromptCacheAffinitySharesCanonicalModelAcrossPublicAliases(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	channelGroupSnapshot := snapshotChannelGroup()
+	t.Cleanup(func() { restoreChannelGroup(channelGroupSnapshot) })
+
+	mapping := `{"alias-a":"canonical-model","alias-b":"canonical-model"}`
+	channel := &model.Channel{Id: 77, Type: config.ChannelTypeOpenAI, ModelMapping: &mapping}
+	model.ChannelGroup = buildRealtimeTestChannelGroupForChannels(channel)
+	settings := config.ChannelAffinitySettings{
+		Enabled:           true,
+		DefaultTTLSeconds: 60,
+		Rules: []config.ChannelAffinityRule{{
+			Name:            "chat-prompt-cache",
+			Enabled:         true,
+			Kind:            "chat",
+			IncludeModel:    true,
+			IncludeRuleName: true,
+			RecordOnSuccess: true,
+			KeySources: []config.ChannelAffinityKeySource{{
+				Source: "request_field", Key: "prompt_cache_key", Alias: config.ChannelAffinityAliasPromptCacheKey,
+			}},
+		}},
+	}
+	settings.Normalize()
+	manager := withChannelAffinitySettings(t, settings)
+
+	ctx := newAffinityTestContext(http.MethodPost, "/v1/chat/completions")
+	ctx.Set("token_id", 7)
+	ctx.Set("token_group", "default")
+	groupctx.SetRoutingGroup(ctx, "default", groupctx.RoutingGroupSourceUserGroup)
+	template := newChannelAffinityTemplate(ctx, channelAffinityKindChat, "canonical-model", settings.Rules[0], "request_field", config.ChannelAffinityAliasPromptCacheKey, settings.DefaultTTLSeconds)
+	manager.SetRecord(template.BuildKey("shared-key"), runtimeaffinity.Record{ChannelID: channel.Id, ResumeFingerprint: "model:canonical-model"}, time.Minute)
+
+	prepareChatChannelAffinity(ctx, "alias-b", "shared-key")
+	if got := currentPreferredChannelID(ctx); got != channel.Id {
+		t.Fatalf("canonical alias lookup selected channel %d, want %d", got, channel.Id)
+	}
+}
+
+func TestPromptCacheAffinityRejectsCanonicalHitWhoseBoundChannelMapsDifferently(t *testing.T) {
+	channelGroupSnapshot := snapshotChannelGroup()
+	t.Cleanup(func() { restoreChannelGroup(channelGroupSnapshot) })
+
+	boundMapping := `{"alias-b":"different-model"}`
+	otherMapping := `{"alias-b":"canonical-model"}`
+	bound := &model.Channel{Id: 78, Type: config.ChannelTypeOpenAI, ModelMapping: &boundMapping}
+	other := &model.Channel{Id: 79, Type: config.ChannelTypeOpenAI, ModelMapping: &otherMapping}
+	model.ChannelGroup = buildRealtimeTestChannelGroupForChannels(bound, other)
+	settings := config.ChannelAffinitySettings{
+		Enabled:           true,
+		DefaultTTLSeconds: 60,
+		Rules: []config.ChannelAffinityRule{{
+			Name: "chat-prompt-cache", Enabled: true, Kind: "chat", IncludeGroup: true, IncludeModel: true, IncludeRuleName: true, RecordOnSuccess: true,
+			KeySources: []config.ChannelAffinityKeySource{{Source: "request_field", Key: "prompt_cache_key", Alias: config.ChannelAffinityAliasPromptCacheKey}},
+		}},
+	}
+	settings.Normalize()
+	manager := withChannelAffinitySettings(t, settings)
+
+	ctx := newAffinityTestContext(http.MethodPost, "/v1/chat/completions")
+	ctx.Set("token_id", 8)
+	ctx.Set("token_group", "default")
+	groupctx.SetRoutingGroup(ctx, "default", groupctx.RoutingGroupSourceUserGroup)
+	template := newChannelAffinityTemplate(ctx, channelAffinityKindChat, "canonical-model", settings.Rules[0], "request_field", config.ChannelAffinityAliasPromptCacheKey, settings.DefaultTTLSeconds)
+	manager.SetRecord(template.BuildKey("shared-key"), runtimeaffinity.Record{ChannelID: bound.Id, ResumeFingerprint: "model:canonical-model"}, time.Minute)
+
+	prepareChatChannelAffinity(ctx, "alias-b", "shared-key")
+	if got := currentPreferredChannelID(ctx); got != 0 {
+		t.Fatalf("mismatched bound-channel mapping produced preferred channel %d", got)
+	}
+}
+
+func TestAffinitySuccessRebuildsKeyInActualBackupGroup(t *testing.T) {
+	settings := config.ChannelAffinitySettings{
+		Enabled:           true,
+		DefaultTTLSeconds: 60,
+		Rules: []config.ChannelAffinityRule{{
+			Name: "chat-prompt-cache", Enabled: true, Kind: "chat", IncludeGroup: true, IncludeModel: true, IncludeRuleName: true, RecordOnSuccess: true,
+			KeySources: []config.ChannelAffinityKeySource{{Source: "request_field", Key: "prompt_cache_key", Alias: config.ChannelAffinityAliasPromptCacheKey}},
+		}},
+	}
+	settings.Normalize()
+	manager := withChannelAffinitySettings(t, settings)
+	ctx := newAffinityTestContext(http.MethodPost, "/v1/chat/completions")
+	ctx.Set("token_id", 9)
+	ctx.Set("token_group", "primary")
+	groupctx.SetRoutingGroup(ctx, "primary", groupctx.RoutingGroupSourceUserGroup)
+	prepareChatChannelAffinity(ctx, "alias", "cache-key")
+
+	mapping := `{"alias":"canonical"}`
+	selected := &model.Channel{Id: 80, Type: config.ChannelTypeOpenAI, ModelMapping: &mapping}
+	groupctx.SetRoutingGroup(ctx, "backup", groupctx.RoutingGroupSourceBackupGroup)
+	refreshChannelAffinityForSelectedModel(ctx, channelAffinityKindChat, selected, "alias")
+	recordCurrentChannelAffinity(ctx, channelAffinityKindChat, selected.Id)
+
+	backupTemplate := newChannelAffinityTemplate(ctx, channelAffinityKindChat, "canonical", settings.Rules[0], "request_field", config.ChannelAffinityAliasPromptCacheKey, settings.DefaultTTLSeconds)
+	if record, ok := manager.Get(backupTemplate.BuildKey("cache-key")); !ok || record.ChannelID != selected.Id {
+		t.Fatalf("backup-group affinity was not recorded: record=%+v ok=%v", record, ok)
+	}
+	groupctx.SetRoutingGroup(ctx, "primary", groupctx.RoutingGroupSourceUserGroup)
+	primaryTemplate := newChannelAffinityTemplate(ctx, channelAffinityKindChat, "canonical", settings.Rules[0], "request_field", config.ChannelAffinityAliasPromptCacheKey, settings.DefaultTTLSeconds)
+	if _, ok := manager.Get(primaryTemplate.BuildKey("cache-key")); ok {
+		t.Fatal("backup success leaked an affinity record into the primary-group namespace")
 	}
 }

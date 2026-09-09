@@ -1,10 +1,12 @@
 package controller
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,11 +16,13 @@ import (
 
 	"one-api/common"
 	"one-api/common/cache"
+	"one-api/common/config"
 	"one-api/common/logger"
+	"one-api/model"
 	"one-api/providers/codex"
 
 	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 )
 
 const (
@@ -30,11 +34,14 @@ const (
 
 // CodexOAuthStateData holds OAuth state data.
 type CodexOAuthStateData struct {
-	ChannelID    int    `json:"channel_id"`
-	CodeVerifier string `json:"code_verifier"`
-	State        string `json:"state"`
-	Proxy        string `json:"proxy"` // Proxy config (JSON string).
-	CreatedAt    int64  `json:"created_at"`
+	ChannelID          int    `json:"channel_id"`
+	CodeVerifier       string `json:"code_verifier"`
+	State              string `json:"state"`
+	Proxy              string `json:"proxy"` // Proxy config (JSON string).
+	CreatedAt          int64  `json:"created_at"`
+	CredentialRevision uint64 `json:"credential_revision"`
+	CredentialFence    string `json:"credential_fence,omitempty"`
+	AccountID          string `json:"account_id,omitempty"`
 }
 
 // StartCodexOAuthRequest starts OAuth flow.
@@ -66,6 +73,27 @@ func StartCodexOAuth(c *gin.Context) {
 		common.APIRespondWithError(c, http.StatusOK, err)
 		return
 	}
+	stateData := CodexOAuthStateData{ChannelID: req.ChannelID, Proxy: req.Proxy}
+	if req.ChannelID != 0 {
+		channel, err := model.GetChannelByIdWithContext(c.Request.Context(), req.ChannelID)
+		if err != nil {
+			common.APIRespondWithError(c, http.StatusOK, err)
+			return
+		}
+		if channel.Type != config.ChannelTypeCodex {
+			common.APIRespondWithError(c, http.StatusOK, fmt.Errorf("仅 Codex 渠道支持此授权流程"))
+			return
+		}
+		stateData.AccountID = model.CodexCredentialAccountID(channel.Key)
+		if stateData.AccountID == "" {
+			common.APIRespondWithError(c, http.StatusOK, fmt.Errorf("无法确认原渠道账号，身份字段不可原地编辑，请新建渠道"))
+			return
+		}
+		stateData.CredentialRevision = channel.CredentialRevision
+		if channel.CredentialRefreshFence != nil {
+			stateData.CredentialFence = *channel.CredentialRefreshFence
+		}
+	}
 
 	// Generate random state.
 	stateBytes := make([]byte, 32)
@@ -86,15 +114,14 @@ func StartCodexOAuth(c *gin.Context) {
 	codeChallenge := generateCodexCodeChallenge(codeVerifier)
 
 	// Store state in cache (with proxy).
-	stateData := CodexOAuthStateData{
-		ChannelID:    req.ChannelID,
-		CodeVerifier: codeVerifier,
-		State:        state,
-		Proxy:        req.Proxy, // Store proxy for token exchange.
-		CreatedAt:    time.Now().Unix(),
-	}
+	stateData.CodeVerifier = codeVerifier
+	stateData.State = state
+	stateData.CreatedAt = time.Now().Unix()
 	cacheKey := CodexOAuthStateCachePrefix + state
-	cache.SetCache(cacheKey, stateData, CodexOAuthStateCacheDuration)
+	if err := cache.SetCache(cacheKey, stateData, CodexOAuthStateCacheDuration); err != nil {
+		common.APIRespondWithError(c, http.StatusOK, err)
+		return
+	}
 
 	// Build OAuth authorization URL.
 	params := url.Values{}
@@ -150,16 +177,14 @@ func CodexOAuthCallback(c *gin.Context) {
 
 	state := req.SessionID
 
-	// Load state data from cache.
+	// 原子消费 state；任何消费失败均不得继续交换或回退读取。
 	cacheKey := CodexOAuthStateCachePrefix + state
-	stateData, err := cache.GetCache[CodexOAuthStateData](cacheKey)
-	if err != nil {
+	stateData, err := cache.ConsumeCacheContext[CodexOAuthStateData](c.Request.Context(), cacheKey)
+	now := time.Now().Unix()
+	if err != nil || stateData.State != state || strings.TrimSpace(stateData.CodeVerifier) == "" || stateData.CreatedAt <= 0 || stateData.CreatedAt > now || now-stateData.CreatedAt >= int64(CodexOAuthStateCacheDuration/time.Second) {
 		common.APIRespondWithError(c, http.StatusOK, fmt.Errorf("invalid or expired OAuth session"))
 		return
 	}
-
-	// Delete used state.
-	cache.DeleteCache(cacheKey)
 
 	// Parse auth code (URL or raw code).
 	inputValue := req.CallbackURL
@@ -167,10 +192,36 @@ func CodexOAuthCallback(c *gin.Context) {
 		inputValue = req.AuthorizationCode
 	}
 
-	code, err := parseCodexCallbackURL(inputValue)
+	code, err := parseCodexCallbackURL(inputValue, state)
 	if err != nil {
 		common.APIRespondWithError(c, http.StatusOK, fmt.Errorf("failed to parse authorization code: %w", err))
 		return
+	}
+
+	var ticket model.CredentialRotationTicket
+	credentialSaved := false
+	if stateData.ChannelID != 0 && stateData.CredentialFence == "" {
+		ticket = model.CredentialRotationTicket{ChannelID: stateData.ChannelID, ExpectedRevision: stateData.CredentialRevision, AttemptID: uuid.NewString()}
+		outcome, err := model.ClaimCredentialRotation(c.Request.Context(), ticket, time.Now())
+		if err != nil {
+			common.APIRespondWithError(c, http.StatusOK, err)
+			return
+		}
+		if outcome != model.CredentialRotationClaimAcquired {
+			common.APIRespondWithError(c, http.StatusOK, model.ErrChannelCredentialConflict)
+			return
+		}
+		defer func() {
+			if credentialSaved {
+				return
+			}
+			// 独立授权码交换没有发送原 refresh token，失败时可释放其工作门禁。
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
+			defer cancel()
+			if _, err := model.CancelCredentialRotationBeforeDispatch(cleanupCtx, ticket); err != nil {
+				logger.SysError(fmt.Sprintf("failed to release Codex authorization claim for channel %d: %v", ticket.ChannelID, err))
+			}
+		}()
 	}
 
 	// Exchange code for token (with proxy).
@@ -181,6 +232,13 @@ func CodexOAuthCallback(c *gin.Context) {
 		return
 	}
 
+	// 上游即使返回 HTTP 200，也可能只含 id_token 或空载荷而未签发 access_token。
+	// 此时不得构造空 access 凭据：不保存、不清除 fence、不报告成功，也不回填任何旧凭据。
+	if strings.TrimSpace(tokenResp.AccessToken) == "" {
+		common.APIRespondWithError(c, http.StatusOK, fmt.Errorf("授权结果缺少访问令牌，请重新发起授权"))
+		return
+	}
+
 	// Extract account_id from id_token (fallback to access_token).
 	accountID := ""
 	if tokenResp.IDToken != "" {
@@ -188,6 +246,10 @@ func CodexOAuthCallback(c *gin.Context) {
 	}
 	if accountID == "" && tokenResp.AccessToken != "" {
 		accountID = extractAccountIDFromToken(tokenResp.AccessToken)
+	}
+	if stateData.ChannelID != 0 && (stateData.AccountID == "" || accountID != stateData.AccountID) {
+		common.APIRespondWithError(c, http.StatusOK, fmt.Errorf("授权账号与原渠道不一致，身份字段不可原地编辑，请新建渠道"))
+		return
 	}
 
 	// Build credentials object.
@@ -210,19 +272,41 @@ func CodexOAuthCallback(c *gin.Context) {
 		common.APIRespondWithError(c, http.StatusOK, fmt.Errorf("failed to serialize credentials: %w", err))
 		return
 	}
+	if stateData.ChannelID != 0 {
+		var saveErr error
+		if stateData.CredentialFence != "" {
+			saveErr = model.RecoverChannelCredentialWithContext(c.Request.Context(), model.CredentialRecoverySnapshot{
+				ChannelID: stateData.ChannelID, AccountID: stateData.AccountID,
+				ExpectedRevision: stateData.CredentialRevision, ExpectedFence: stateData.CredentialFence,
+			}, credentialsJSON)
+		} else {
+			saveErr = model.ReplaceChannelCredentialWithContext(c.Request.Context(), ticket, credentialsJSON)
+		}
+		if saveErr != nil {
+			if errors.Is(saveErr, model.ErrChannelCredentialConflict) {
+				common.APIRespondWithError(c, http.StatusOK, model.ErrChannelCredentialConflict)
+			} else {
+				logger.SysError(fmt.Sprintf("Codex credential persistence failed for channel %d", stateData.ChannelID))
+				common.APIRespondWithError(c, http.StatusOK, fmt.Errorf("保存渠道凭据失败，请重新发起授权"))
+			}
+			return
+		}
+		credentialSaved = true
+	}
 
 	// Return success response.
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "Authorization successful",
 		"data": gin.H{
-			"credentials": credentialsJSON,
+			"credentials":      credentialsJSON,
+			"credential_saved": stateData.ChannelID != 0,
 		},
 	})
 }
 
 // parseCodexCallbackURL parses callback URL or raw code.
-func parseCodexCallbackURL(input string) (string, error) {
+func parseCodexCallbackURL(input, expectedState string) (string, error) {
 	if input == "" {
 		return "", fmt.Errorf("empty input")
 	}
@@ -233,15 +317,22 @@ func parseCodexCallbackURL(input string) (string, error) {
 	if strings.HasPrefix(trimmedInput, "http://") || strings.HasPrefix(trimmedInput, "https://") {
 		parsedURL, err := url.Parse(trimmedInput)
 		if err != nil {
-			return "", fmt.Errorf("invalid URL format: %w", err)
+			return "", fmt.Errorf("invalid URL format")
 		}
 
-		code := parsedURL.Query().Get("code")
-		if code == "" {
-			return "", fmt.Errorf("code parameter not found in callback URL")
+		query, err := url.ParseQuery(parsedURL.RawQuery)
+		if err != nil {
+			return "", fmt.Errorf("invalid callback query")
 		}
-
-		return code, nil
+		states := query["state"]
+		if len(states) != 1 || states[0] != expectedState {
+			return "", fmt.Errorf("callback state does not match OAuth session")
+		}
+		codes := query["code"]
+		if len(codes) != 1 || codes[0] == "" {
+			return "", fmt.Errorf("callback URL must contain one authorization code")
+		}
+		return codes[0], nil
 	}
 
 	// Case 2: raw code (may include fragments).
@@ -257,31 +348,7 @@ func parseCodexCallbackURL(input string) (string, error) {
 
 // extractAccountIDFromToken extracts account_id from JWT.
 func extractAccountIDFromToken(accessToken string) string {
-	// Parse JWT without signature verification.
-	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
-	token, _, err := parser.ParseUnverified(accessToken, jwt.MapClaims{})
-	if err != nil {
-		logger.SysError(fmt.Sprintf("Failed to parse JWT: %s", err.Error()))
-		return ""
-	}
-
-	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
-		return ""
-	}
-
-	// Extract https://api.openai.com/auth.chatgpt_account_id.
-	authClaims, ok := claims["https://api.openai.com/auth"].(map[string]interface{})
-	if !ok {
-		return ""
-	}
-
-	accountID, ok := authClaims["chatgpt_account_id"].(string)
-	if !ok {
-		return ""
-	}
-
-	return accountID
+	return model.CodexTokenAccountID(accessToken)
 }
 
 // exchangeCodexCodeForToken exchanges auth code for token (proxy-aware).
@@ -339,7 +406,7 @@ func exchangeCodexCodeForToken(code, codeVerifier, state, proxyURL string) (*cod
 
 	// Check response status.
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("token exchange failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+		return nil, fmt.Errorf("token exchange failed with status %d", resp.StatusCode)
 	}
 
 	// Parse response.

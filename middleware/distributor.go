@@ -3,6 +3,7 @@ package middleware
 import (
 	"fmt"
 	"net/http"
+	"one-api/common/config"
 	"one-api/common/groupctx"
 	"one-api/model"
 	"strings"
@@ -23,7 +24,20 @@ func NewGroupDistributor(c *gin.Context) *GroupDistributor {
 // SetupGroups 设置用户分组和令牌分组
 func (gd *GroupDistributor) SetupGroups() error {
 	userId := gd.context.GetInt("id")
-	userGroup, _ := model.CacheGetUserGroup(userId)
+	user, err := model.GetUserRoutingState(gd.context.Request.Context(), userId)
+	if err != nil {
+		abortWithMessage(gd.context, http.StatusServiceUnavailable, "用户归属读取失败")
+		return err
+	}
+	if user.Status != config.UserStatusEnabled {
+		abortWithMessage(gd.context, http.StatusForbidden, "用户不可用")
+		return fmt.Errorf("用户不可用")
+	}
+	if err := model.EnsureUserGroupPolicyAvailable(gd.context.Request.Context()); err != nil {
+		abortWithMessage(gd.context, http.StatusServiceUnavailable, "用户组策略不可用")
+		return err
+	}
+	userGroup := user.Group
 	gd.context.Set("group", userGroup)
 
 	tokenGroup := gd.context.GetString("token_group")

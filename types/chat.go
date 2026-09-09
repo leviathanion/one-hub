@@ -1009,12 +1009,3 @@ func flattenChatToolChoice(choice any) any {
 	}
 	return flattened
 }
-
-
-func (c *ChatCompletionStreamResponse) GetResponseText() (responseText string) {
-	for _, choice := range c.Choices {
-		responseText += choice.Delta.Content
-	}
-
-	return
-}

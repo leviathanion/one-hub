@@ -97,6 +97,7 @@ func migrationBefore(db *gorm.DB) error {
 	// 历史数据表示转换必须早于前置检查和最终 NOT NULL/唯一约束。
 	preparations := gormigrate.New(db, gormigrate.DefaultOptions, []*gormigrate.Migration{
 		migrateHistoricalPaymentRepresentations(),
+		migrateHistoricalTasks(),
 		migrateIdenticalPrices(),
 	})
 	if err := preparations.Migrate(); err != nil {
@@ -702,6 +703,7 @@ func beforeAutoMigrateMigrations() []*gormigrate.Migration {
 		removeKeyIndexMigration(),
 		changeTokenKeyColumnType(),
 		migrateUserIdentityUniqueness(),
+		consolidatePersistenceProjections(),
 	}
 }
 
@@ -717,8 +719,12 @@ func afterAutoMigrateMigrations() []*gormigrate.Migration {
 		migrateLegacyChannelOtherJSON(),
 		removeLegacyMediaProxyOptions(),
 		removeLegacyQuotaRemindOption(),
+		migrateCustomChannelEndpoints(),
 		removeObsoleteOptions("202609090002", []string{"GitHubOldIdCloseEnabled"}),
+		migrateHistoricalMidjourney(),
 		retryTokenLimitsMigration(),
+		dropResponsesWSSettlementIntents(),
+		dropObsoleteTablesAfterMigration(),
 	}
 }
 

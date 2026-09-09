@@ -1,12 +1,13 @@
 package suno
 
 import (
+	"context"
 	"net/http"
 	"one-api/common"
 	"one-api/types"
 )
 
-func (s *SunoProvider) Submit(action string, request *SunoSubmitReq) (data *types.TaskResponse[string], errWithCode *types.OpenAIErrorWithStatusCode) {
+func (s *SunoProvider) Submit(ctx context.Context, action string, request *SunoSubmitReq) (data *types.TaskResponse[string], errWithCode *types.OpenAIErrorWithStatusCode) {
 	var submitUri string
 	switch action {
 	case SunoActionMusic:
@@ -21,10 +22,12 @@ func (s *SunoProvider) Submit(action string, request *SunoSubmitReq) (data *type
 	headers := s.GetRequestHeaders()
 
 	// 创建请求
-	req, err := s.Requester.NewRequest(http.MethodPost, fullRequestURL, s.Requester.WithHeader(headers), s.Requester.WithBody(request))
+	req, err := s.Requester.NewRequest(http.MethodPost, fullRequestURL, s.Requester.WithContext(ctx), s.Requester.WithHeader(headers), s.Requester.WithBody(request))
 
 	if err != nil {
-		return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
+		apiErr := common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
+		apiErr.UpstreamNotAttempted = true
+		return nil, apiErr
 	}
 
 	data = &types.TaskResponse[string]{}

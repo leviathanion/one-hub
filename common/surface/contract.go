@@ -10,7 +10,6 @@ import (
 	providerMidjourney "one-api/providers/midjourney"
 	providerRecraftAI "one-api/providers/recraftAI"
 	"one-api/types"
-	"regexp"
 	"strconv"
 	"strings"
 
@@ -26,13 +25,15 @@ const (
 )
 
 type SurfaceError struct {
-	StatusCode int
-	Message    string
-	Code       any
-	Type       string
-	Param      string
-	Local      bool
-	Kind       ErrorKind
+	StatusCode      int
+	Message         string
+	Code            any
+	Type            string
+	Param           string
+	Local           bool
+	Kind            ErrorKind
+	RawBody         []byte
+	ResponseHeaders http.Header
 }
 
 func NewLocalError(statusCode int, message string, code any) *SurfaceError {
@@ -61,13 +62,15 @@ func FromOpenAIError(err *types.OpenAIErrorWithStatusCode) *SurfaceError {
 		kind = ErrorKindLocal
 	}
 	return &SurfaceError{
-		StatusCode: err.StatusCode,
-		Message:    err.Message,
-		Code:       err.Code,
-		Type:       err.Type,
-		Param:      err.Param,
-		Local:      err.LocalError,
-		Kind:       kind,
+		StatusCode:      err.StatusCode,
+		Message:         err.Message,
+		Code:            err.Code,
+		Type:            err.Type,
+		Param:           err.Param,
+		Local:           err.LocalError,
+		Kind:            kind,
+		RawBody:         append([]byte(nil), err.RawBody...),
+		ResponseHeaders: err.ResponseHeaders.Clone(),
 	}
 }
 
@@ -86,8 +89,10 @@ func (e *SurfaceError) ToOpenAIErrorWithStatusCode() *types.OpenAIErrorWithStatu
 			Type:    e.Type,
 			Param:   e.Param,
 		},
-		StatusCode: statusCode,
-		LocalError: e.Local,
+		StatusCode:      statusCode,
+		LocalError:      e.Local,
+		RawBody:         append([]byte(nil), e.RawBody...),
+		ResponseHeaders: e.ResponseHeaders.Clone(),
 	}
 }
 
@@ -123,6 +128,8 @@ func NormalizeSurfaceError(c *gin.Context, err *SurfaceError) *SurfaceError {
 	normalized.Type = openAIErr.Type
 	normalized.Param = openAIErr.Param
 	normalized.Local = openAIErr.LocalError
+	normalized.RawBody = append([]byte(nil), openAIErr.RawBody...)
+	normalized.ResponseHeaders = openAIErr.ResponseHeaders.Clone()
 
 	if normalized.Kind == "" {
 		if normalized.Local {
@@ -166,8 +173,7 @@ func (c contract) RenderStreamError(ctx *gin.Context, err *SurfaceError) {
 }
 
 var (
-	requestIDPattern = regexp.MustCompile(`\(request id: [^\)]+\)`)
-	quotaKeywords    = []string{"余额", "额度", "quota", "无可用渠道", "令牌"}
+	quotaKeywords = []string{"余额", "额度", "quota", "无可用渠道", "令牌"}
 
 	openAIContract = contract{
 		name: "openai",
@@ -176,6 +182,12 @@ var (
 				return
 			}
 			normalized := NormalizeSurfaceError(c, err)
+			applyUpstreamResponseHeaders(c, normalized.ResponseHeaders)
+			if normalized.Kind == ErrorKindUpstream && json.Valid(normalized.RawBody) {
+				c.Data(errStatusCode(normalized), "application/json", normalized.RawBody)
+				c.Abort()
+				return
+			}
 			openAIErr := normalized.ToOpenAIErrorWithStatusCode()
 			c.JSON(errStatusCode(normalized), types.OpenAIErrorResponse{
 				Error: openAIErr.OpenAIError,
@@ -187,6 +199,12 @@ var (
 				return
 			}
 			normalized := NormalizeSurfaceError(c, err)
+			applyUpstreamResponseHeaders(c, normalized.ResponseHeaders)
+			if normalized.Kind == ErrorKindUpstream && json.Valid(normalized.RawBody) && !c.Writer.Written() {
+				c.Data(errStatusCode(normalized), "application/json", normalized.RawBody)
+				c.Abort()
+				return
+			}
 			openAIErr := normalized.ToOpenAIErrorWithStatusCode()
 			writeStreamError(c, "data: ", types.OpenAIErrorResponse{
 				Error: openAIErr.OpenAIError,
@@ -378,9 +396,6 @@ func NormalizeOpenAIError(c *gin.Context, err *types.OpenAIErrorWithStatusCode) 
 	if strings.TrimSpace(errWithStatusCode.OpenAIError.Type) == "" {
 		errWithStatusCode.OpenAIError.Type = "one_hub_error"
 	}
-	if strings.Contains(errWithStatusCode.Message, "(request id:") {
-		errWithStatusCode.Message = strings.TrimSpace(requestIDPattern.ReplaceAllString(errWithStatusCode.Message, ""))
-	}
 	if (!errWithStatusCode.LocalError && errWithStatusCode.OpenAIError.Type == "one_hub_error") ||
 		strings.HasSuffix(errWithStatusCode.OpenAIError.Type, "_api_error") {
 		errWithStatusCode.OpenAIError.Type = "system_error"
@@ -394,15 +409,13 @@ func NormalizeOpenAIError(c *gin.Context, err *types.OpenAIErrorWithStatusCode) 
 		strings.TrimSpace(errWithStatusCode.OpenAIError.Message) == "" {
 		errWithStatusCode.OpenAIError.Message = "Provider API error: bad response status code " + errWithStatusCode.OpenAIError.Param
 	}
-	if errWithStatusCode.StatusCode == http.StatusTooManyRequests {
+	if errWithStatusCode.LocalError && errWithStatusCode.StatusCode == http.StatusTooManyRequests {
 		errWithStatusCode.OpenAIError.Message = "当前分组上游负载已饱和，请稍后再试"
 	}
-	requestID := ""
 	if c != nil {
-		requestID = c.GetString(logger.RequestIdKey)
-	}
-	if requestID != "" && strings.TrimSpace(errWithStatusCode.OpenAIError.Message) != "" {
-		errWithStatusCode.OpenAIError.Message = utils.MessageWithRequestId(errWithStatusCode.OpenAIError.Message, requestID)
+		if requestID := strings.TrimSpace(c.GetString(logger.RequestIdKey)); requestID != "" {
+			c.Header(logger.RequestIdKey, requestID)
+		}
 	}
 	return errWithStatusCode
 }
@@ -435,4 +448,16 @@ func errMessage(err *SurfaceError) string {
 		return ""
 	}
 	return err.Message
+}
+
+func applyUpstreamResponseHeaders(c *gin.Context, headers http.Header) {
+	if c == nil {
+		return
+	}
+	for name, values := range headers {
+		if strings.EqualFold(name, logger.RequestIdKey) {
+			continue
+		}
+		c.Writer.Header()[name] = append([]string(nil), values...)
+	}
 }

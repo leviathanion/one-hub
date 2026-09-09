@@ -3,13 +3,13 @@ package controller
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"testing"
 
 	"one-api/common/config"
 	"one-api/common/logger"
 	commonTest "one-api/common/test"
+	"one-api/internal/testutil/sqlitetest"
 	"one-api/model"
 
 	"github.com/gin-gonic/gin"
@@ -25,7 +25,7 @@ func useControllerChannelTagTestDB(t *testing.T) {
 	}
 
 	originalDB := model.DB
-	testDB, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())), &gorm.Config{})
+	testDB, err := gorm.Open(sqlite.Open(sqlitetest.MemoryDSN()), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("expected in-memory sqlite database, got %v", err)
 	}
@@ -58,7 +58,7 @@ func TestUpdateChannelsTagUsesSubmittedFieldsForSync(t *testing.T) {
 		t.Fatalf("expected channel fixture to persist, got %v", err)
 	}
 
-	body := bytes.NewBufferString(`{"key":"sk-one","models":"gpt-new","allow_extra_body":false}`)
+	body := bytes.NewBufferString(`{"models":"gpt-new","allow_extra_body":false}`)
 	ctx, recorder := commonTest.GetContext(http.MethodPut, "/api/channel_tag/field-team", commonTest.RequestJSONConfig(), body)
 	ctx.Params = gin.Params{{Key: "tag", Value: "field-team"}}
 

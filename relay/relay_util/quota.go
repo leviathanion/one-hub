@@ -10,12 +10,11 @@ import (
 	"one-api/common/authutil"
 	"one-api/common/config"
 	"one-api/common/groupctx"
-	"one-api/common/logger"
 	"one-api/common/utils"
 	"one-api/internal/billing"
 	"one-api/model"
 	"one-api/types"
-	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -25,40 +24,60 @@ import (
 )
 
 type Quota struct {
-	modelName              string
-	promptTokens           int
-	price                  model.Price
-	groupName              string
-	tokenGroupName         string
-	isBackupGroup          bool // 新增字段记录是否使用备用分组
-	backupGroupName        string
-	routingGroupSource     string
-	groupRatio             float64
-	inputRatio             float64
-	outputRatio            float64
-	preConsumedQuota       int
-	cacheQuota             int
-	userId                 int
-	channelId              int
-	tokenId                int
-	callerNS               string
-	unlimitedQuota         bool
-	PreconsumeTruthApplied bool
-	PreconsumeCacheApplied bool
+	modelName                    string
+	promptTokens                 int
+	price                        model.Price
+	groupName                    string
+	tokenGroupName               string
+	isBackupGroup                bool // 新增字段记录是否使用备用分组
+	backupGroupName              string
+	routingGroupSource           string
+	groupRatio                   float64
+	inputRatio                   float64
+	outputRatio                  float64
+	freezeRequestPricePolicy     bool
+	preConsumedQuota             int
+	userId                       int
+	channelId                    int
+	tokenId                      int
+	callerNS                     string
+	PreconsumeTruthApplied       bool
+	PreconsumeTruthIndeterminate bool
+	preconsumeTokenApplied       bool
 
-	startTime         time.Time
-	firstResponseTime time.Time
-	requestDuration   time.Duration
-	requestFrozen     bool
-	extraBillingData  map[string]ExtraBillingData
-	affinityMeta      map[string]any
-	requestContext    context.Context
-	tokenName         string
-	sourceIP          string
-	userAgent         string
-	forcePreConsume   bool
-	logProtocol       string
+	startTime                  time.Time
+	firstResponseTime          time.Time
+	requestDuration            time.Duration
+	requestFrozen              bool
+	extraBillingData           map[string]ExtraBillingData
+	affinityMeta               map[string]any
+	billingDiagnostics         map[string]bool
+	settlementModel            string
+	settlementPrice            *model.Price
+	settlementPriceVersion     int64
+	settlementGroupRatio       float64
+	settlementPolicyResolved   bool
+	settlementTier             string
+	settlementSpeed            string
+	settlementRuleResult       model.PriceRuleResult
+	settlementInputMultiplier  float64
+	settlementOutputMultiplier float64
+	settlementInputRatio       float64
+	settlementOutputRatio      float64
+	settlementTokenBilling     *tokenBillingDetails
+	requestContext             context.Context
+	tokenName                  string
+	sourceIP                   string
+	userAgent                  string
+	logProtocol                string
 }
+
+var (
+	applyBillingReserve    = model.ApplyBillingReserve
+	checkBillingAdmission  = model.CheckBillingAdmission
+	applyBillingRefund     = model.ApplyBillingRefund
+	applyBillingSettlement = billing.ApplySettlement
+)
 
 const (
 	LogProtocolHTTP        = "http"
@@ -75,17 +94,21 @@ func NewQuota(c *gin.Context, modelName string, promptTokens int) *Quota {
 	}
 
 	quota := &Quota{
-		modelName:      modelName,
-		promptTokens:   promptTokens,
-		userId:         c.GetInt("id"),
-		channelId:      c.GetInt("channel_id"),
-		tokenId:        c.GetInt("token_id"),
-		callerNS:       readQuotaCallerNamespace(c),
-		unlimitedQuota: c.GetBool("token_unlimited_quota"),
-		isBackupGroup:  isBackupGroup, // 记录是否使用备用分组
-		requestContext: requestContext,
-		tokenName:      c.GetString("token_name"),
-		sourceIP:       c.GetString(config.GinResponsesWSClientIPKey),
+		modelName:                modelName,
+		promptTokens:             promptTokens,
+		userId:                   c.GetInt("id"),
+		channelId:                c.GetInt("channel_id"),
+		tokenId:                  c.GetInt("token_id"),
+		callerNS:                 readQuotaCallerNamespace(c),
+		isBackupGroup:            isBackupGroup, // 记录是否使用备用分组
+		freezeRequestPricePolicy: c.GetBool("billing_original_model"),
+		requestContext:           requestContext,
+		tokenName:                c.GetString("token_name"),
+		sourceIP:                 c.GetString(config.GinResponsesWSClientIPKey),
+		startTime:                c.GetTime("requestStartTime"),
+	}
+	if quota.startTime.IsZero() {
+		quota.startTime = time.Now()
 	}
 	if quota.sourceIP == "" {
 		quota.sourceIP = c.ClientIP()
@@ -105,14 +128,11 @@ func NewQuota(c *gin.Context, modelName string, promptTokens int) *Quota {
 		}
 	}
 
-	quota.price = *model.PricingInstance.GetPrice(quota.modelName)
 	quota.groupName = groupctx.CurrentRoutingGroup(c)
 	quota.tokenGroupName = groupctx.DeclaredTokenGroup(c)
 	quota.backupGroupName = groupctx.BackupGroup(c)
 	quota.routingGroupSource = groupctx.CurrentRoutingGroupSource(c)
 	quota.groupRatio = c.GetFloat64("group_ratio") // 这里的倍率已经在 common.go 中正确设置了
-	quota.inputRatio = quota.price.GetInput() * quota.groupRatio
-	quota.outputRatio = quota.price.GetOutput() * quota.groupRatio
 
 	return quota
 }
@@ -131,6 +151,19 @@ func (q *Quota) PreConsumedQuota() int {
 	return q.preConsumedQuota
 }
 
+// ReservationQuota returns the established small pre-consume amount without
+// applying it. Durable owners use it to reserve quota and create their owner
+// row in one SQL transaction.
+func (q *Quota) ReservationQuota() (int, error) {
+	if q == nil {
+		return 0, errors.New("quota is required")
+	}
+	if err := q.preparePreConsumedQuota(); err != nil {
+		return 0, err
+	}
+	return q.preConsumedQuota, nil
+}
+
 func readQuotaCallerNamespace(c *gin.Context) string {
 	if c != nil {
 		if tokenID := c.GetInt("token_id"); tokenID > 0 {
@@ -146,309 +179,164 @@ func readQuotaCallerNamespace(c *gin.Context) string {
 	return "anonymous"
 }
 
-func (q *Quota) Clone() *Quota {
-	if q == nil {
-		return nil
-	}
-
-	cloned := *q
-	cloned.price = cloneQuotaPrice(q.price)
-	cloned.preConsumedQuota = 0
-	cloned.cacheQuota = 0
-	cloned.PreconsumeTruthApplied = false
-	cloned.PreconsumeCacheApplied = false
-	cloned.startTime = time.Time{}
-	cloned.firstResponseTime = time.Time{}
-	cloned.requestDuration = 0
-	cloned.requestFrozen = false
-	cloned.extraBillingData = nil
-	cloned.requestContext = detachQuotaContext(q.requestContext)
-
-	return &cloned
-}
-
-// Detached async tasks must hold quota synchronously because final settlement can
-// be delayed or retried outside the submit request lifecycle.
-func (q *Quota) ForcePreConsume() {
-	if q == nil {
-		return
-	}
-	q.forcePreConsume = true
-}
-
-func (q *Quota) PreQuotaConsumption() *types.OpenAIErrorWithStatusCode {
-	return q.PreQuotaConsumptionRollbackable()
-}
-
-func (q *Quota) PreQuotaConsumptionRollbackable() *types.OpenAIErrorWithStatusCode {
+func (q *Quota) preQuotaConsumptionWithContext(ctx context.Context) *types.OpenAIErrorWithStatusCode {
 	if q == nil {
 		return common.StringErrorWrapperLocal("quota transaction is required", "quota_transaction_missing", http.StatusInternalServerError)
+	}
+	if ctx == nil {
+		ctx = q.requestContext
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if q.PreconsumeTruthIndeterminate {
+		return common.StringErrorWrapperLocal("pre-consumption commit outcome is indeterminate", "pre_consume_commit_indeterminate", http.StatusInternalServerError)
 	}
 	if q.HasPreConsumedSideEffect() {
 		return nil
 	}
-	q.preparePreConsumedQuota()
-	if q.preConsumedQuota == 0 {
-		return nil
+	var (
+		applyResult model.BillingBalanceResult
+		err         error
+	)
+	if priceErr := q.preparePreConsumedQuota(); priceErr != nil {
+		return common.ErrorWrapperLocal(priceErr, "price_policy_unavailable", http.StatusServiceUnavailable)
 	}
-
-	userQuota, err := model.CacheGetUserQuota(q.userId)
+	if q.preConsumedQuota > 0 {
+		applyResult, err = applyBillingReserve(ctx, q.userId, q.tokenId, int64(q.preConsumedQuota))
+	} else {
+		applyResult, err = checkBillingAdmission(ctx, q.userId, q.tokenId)
+	}
 	if err != nil {
-		return common.ErrorWrapper(err, "get_user_quota_failed", http.StatusInternalServerError)
-	}
-	if userQuota < q.preConsumedQuota {
-		return common.ErrorWrapper(errors.New("user quota is not enough"), "insufficient_user_quota", http.StatusPaymentRequired)
-	}
-	if !q.forcePreConsume && userQuota > 100*q.preConsumedQuota {
-		q.preConsumedQuota = 0
-		return nil
-	}
-
-	token, err := model.GetTokenById(q.tokenId)
-	if err != nil {
-		return common.ErrorWrapper(err, "pre_consume_token_quota_failed", http.StatusForbidden)
-	}
-	if !token.UnlimitedQuota && token.RemainQuota < q.preConsumedQuota {
-		return common.ErrorWrapper(errors.New("令牌额度不足"), "pre_consume_token_quota_failed", http.StatusForbidden)
-	}
-
-	if err := model.ApplyTokenUserQuotaDeltaDirect(q.tokenId, q.userId, q.unlimitedQuota, q.preConsumedQuota); err != nil {
-		return common.ErrorWrapper(err, "pre_consume_token_quota_failed", http.StatusForbidden)
-	}
-	q.PreconsumeTruthApplied = true
-
-	if err := model.CacheDecreaseUserQuota(q.userId, q.preConsumedQuota); err != nil {
-		rollbackErr := q.undoSynchronouslyWithContext(detachQuotaContext(q.requestContext))
-		if rollbackErr != nil {
-			return common.ErrorWrapper(errors.New(err.Error()+"; rollback failed: "+rollbackErr.Error()), "decrease_user_quota_failed", http.StatusInternalServerError)
+		if applyResult.Outcome == model.BillingBalanceCommitUnknown {
+			q.PreconsumeTruthIndeterminate = true
+			return common.ErrorWrapper(err, "pre_consume_commit_indeterminate", http.StatusInternalServerError)
 		}
-		return common.ErrorWrapper(err, "decrease_user_quota_failed", http.StatusInternalServerError)
+		return billingAdmissionError(err)
 	}
-	q.PreconsumeCacheApplied = true
+	q.PreconsumeTruthApplied = q.preConsumedQuota > 0
+	q.preconsumeTokenApplied = applyResult.TokenQuotaApplied
 	return nil
+}
+
+func billingAdmissionError(err error) *types.OpenAIErrorWithStatusCode {
+	switch {
+	case errors.Is(err, model.ErrBillingUserQuotaInsufficient):
+		return common.ErrorWrapperLocal(err, "insufficient_user_quota", http.StatusPaymentRequired)
+	case errors.Is(err, model.ErrTokenQuotaInsufficient):
+		return common.ErrorWrapperLocal(err, "insufficient_token_quota", http.StatusForbidden)
+	case errors.Is(err, model.ErrBillingUserUnavailable), errors.Is(err, model.ErrBillingTokenUnavailable), errors.Is(err, model.ErrBillingOwnership):
+		return common.ErrorWrapperLocal(err, "billing_principal_unavailable", http.StatusForbidden)
+	default:
+		return common.ErrorWrapperLocal(err, "billing_admission_unavailable", http.StatusServiceUnavailable)
+	}
 }
 
 func (q *Quota) HasPreConsumedSideEffect() bool {
-	return q != nil && (q.PreconsumeTruthApplied || q.PreconsumeCacheApplied)
+	return q != nil && (q.PreconsumeTruthApplied || q.PreconsumeTruthIndeterminate)
 }
 
-func (q *Quota) preparePreConsumedQuota() {
+func (q *Quota) preparePreConsumedQuota() error {
 	if q == nil {
-		return
+		return errors.New("quota is required")
+	}
+	if err := q.refreshCurrentRequestPrice(); err != nil {
+		return err
 	}
 	q.preConsumedQuota = 0
 	if q.price.Type == model.TimesPriceType {
-		q.preConsumedQuota = int(1000 * q.inputRatio)
-	} else if q.price.Input != 0 || q.price.Output != 0 {
-		q.preConsumedQuota = int(float64(q.promptTokens)*q.inputRatio) + config.PreConsumedQuota
+		q.preConsumedQuota = saturatingTruncToInt(1000 * q.inputRatio)
+	} else if q.groupRatio > 0 && (q.price.Input != 0 || q.price.Output != 0) {
+		q.preConsumedQuota = saturatingAddInt(saturatingTruncToInt(float64(q.promptTokens)*q.inputRatio), q.effectivePreConsumedQuotaBase())
 	}
-}
-
-// 更新用户实时配额
-func (q *Quota) UpdateUserRealtimeQuota(usage *types.UsageEvent, nowUsage *types.UsageEvent) error {
-	usage.Merge(nowUsage)
-
-	if q.price.Type == model.TimesPriceType {
-		return nil
+	if q.preConsumedQuota < 0 {
+		return errors.New("pre-consumed quota cannot be negative")
 	}
-
-	// 不开启Redis，则不更新实时配额
-	if !config.RedisEnabled {
-		return q.checkNonRedisRealtimeHardCap(usage)
-	}
-
-	increaseQuota := q.GetTotalQuotaByUsageEvent(nowUsage)
-
-	cacheQuota, err := model.CacheIncreaseUserRealtimeQuota(q.userId, increaseQuota)
-	if err != nil {
-		return errors.New("error update user realtime quota cache: " + err.Error())
-	}
-
-	q.cacheQuota += increaseQuota
-	userQuota, err := model.CacheGetUserQuota(q.userId)
-	if err != nil {
-		return errors.New("error get user quota cache: " + err.Error())
-	}
-
-	if cacheQuota >= int64(userQuota) {
-		return errors.New("user quota is not enough")
-	}
-
 	return nil
 }
 
-func (q *Quota) checkNonRedisRealtimeHardCap(usage *types.UsageEvent) error {
-	if q == nil || q.unlimitedQuota || usage == nil || q.userId <= 0 {
-		return nil
+func (q *Quota) effectivePreConsumedQuotaBase() int {
+	return config.GlobalOption.RuntimeSnapshot().Int("PreConsumedQuota", config.PreConsumedQuota)
+}
+
+func (q *Quota) effectiveQuotaPerUnit() float64 {
+	return config.GlobalOption.RuntimeSnapshot().Float64("QuotaPerUnit", config.QuotaPerUnit)
+}
+
+func (q *Quota) refreshCurrentRequestPrice() error {
+	if q == nil || model.PricingInstance == nil {
+		return errors.New("prices are not initialized")
 	}
-	currentQuota := q.GetTotalQuotaByUsageEvent(usage)
-	if currentQuota <= 0 {
-		return nil
+	price, ok := model.PricingInstance.FindPrice(q.modelName)
+	if !ok {
+		return fmt.Errorf("no price policy matches model %q", q.modelName)
 	}
-	userQuota, err := model.GetUserQuota(q.userId)
+	q.price = cloneQuotaPrice(*price)
+	groupRatio, err := q.currentGroupRatio()
 	if err != nil {
 		return err
 	}
-	if userQuota < currentQuota {
-		return errors.New("user quota is not enough")
-	}
+	q.groupRatio = groupRatio
+	q.inputRatio = q.price.GetInput() * groupRatio
+	q.outputRatio = q.price.GetOutput() * groupRatio
 	return nil
 }
 
-func (q *Quota) Undo(c *gin.Context) {
-	if q == nil || !q.HasPreConsumedSideEffect() {
-		return
-	}
-	// Roll back synchronously even though this keeps failure paths on the
-	// request's critical path. The alternative is a short window where a retry
-	// or resubmission can observe double pre-consumption before the goroutine
-	// returns quota.
-	ctx := q.rollbackContext(c)
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			logger.LogError(ctx, fmt.Sprintf("panic returning pre-consumed quota: %v", recovered))
-			logger.LogError(ctx, "stacktrace from panic: "+string(debug.Stack()))
-		}
-	}()
-	if err := q.undoSynchronouslyWithContext(ctx); err != nil {
-		logger.LogError(ctx, "error return pre-consumed quota: "+err.Error())
-	}
-}
-
-func (q *Quota) UndoSynchronously(c *gin.Context) error {
+func (q *Quota) currentGroupRatio() (float64, error) {
 	if q == nil {
-		return nil
+		return 0, errors.New("quota is required")
 	}
-	return q.undoSynchronouslyWithContext(q.rollbackContext(c))
+	if strings.TrimSpace(q.groupName) == "" {
+		return 0, errors.New("billing group is required")
+	}
+	group := model.GlobalUserGroupRatio.GetBySymbol(q.groupName)
+	if group == nil || math.IsNaN(group.Ratio) || math.IsInf(group.Ratio, 0) || group.Ratio < 0 {
+		return 0, fmt.Errorf("billing group %q is unavailable", q.groupName)
+	}
+	return group.Ratio, nil
 }
 
 func (q *Quota) undoSynchronouslyWithContext(ctx context.Context) error {
 	if q == nil || !q.HasPreConsumedSideEffect() {
 		return nil
 	}
+	if ctx == nil {
+		ctx = q.requestContext
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if q.PreconsumeTruthIndeterminate {
+		return errors.New("pre-consumption commit outcome is indeterminate; automatic rollback is unsafe")
+	}
 	if q.PreconsumeTruthApplied {
-		if err := model.ApplyTokenUserQuotaDeltaDirect(q.tokenId, q.userId, q.unlimitedQuota, -q.preConsumedQuota); err != nil {
-			return err
+		var lastErr error
+		for attempt := 0; attempt < 2; attempt++ {
+			result, err := applyBillingRefund(ctx, q.userId, q.tokenId, q.preconsumeTokenApplied, int64(q.preConsumedQuota))
+			if err == nil {
+				lastErr = nil
+				break
+			}
+			lastErr = err
+			if result.Outcome == model.BillingBalanceCommitUnknown {
+				q.PreconsumeTruthApplied = false
+				q.PreconsumeTruthIndeterminate = true
+				return fmt.Errorf("billing rollback commit outcome is unknown: %w", err)
+			}
+			if result.Outcome != model.BillingBalanceDefinitelyRolledBack || ctx.Err() != nil {
+				return err
+			}
 		}
-	}
-	q.PreconsumeTruthApplied = false
-	if err := model.CacheUpdateUserQuota(q.userId); err != nil {
-		logger.LogError(ctx, "error refresh user quota cache after rollback: "+err.Error())
-		if delErr := model.CacheInvalidateUserQuota(q.userId); delErr != nil {
-			model.EnqueueUserQuotaCacheRepair(q.userId, "rollback_refresh_and_invalidate_failed")
-			return errors.New("error refresh user quota cache: " + err.Error() + "; error invalidate user quota cache: " + delErr.Error())
+		if lastErr != nil {
+			return fmt.Errorf("billing rollback remained unsettled: %w", lastErr)
 		}
+		q.PreconsumeTruthApplied = false
+		q.preconsumeTokenApplied = false
 	}
-	q.PreconsumeCacheApplied = false
 	return nil
 }
 
-func (q *Quota) rollbackContext(c *gin.Context) context.Context {
-	if c != nil && c.Request != nil {
-		return detachQuotaContext(c.Request.Context())
-	}
-	return detachQuotaContext(q.requestContext)
-}
-
-func (q *Quota) Consume(c *gin.Context, usage *types.Usage, isStream bool) {
-	q.prepareConsumeContext(c)
-	q.ConsumeUsage(usage, isStream)
-}
-
-func (q *Quota) ConsumeAtLeastPreConsumed(c *gin.Context, usage *types.Usage, isStream bool) {
-	q.prepareConsumeContext(c)
-	q.ConsumeUsageAtLeastPreConsumed(usage, isStream)
-}
-
-func (q *Quota) ConsumeAtLeastPreConsumedWithIdentity(c *gin.Context, usage *types.Usage, isStream bool, requestKind billing.SettlementRequestKind, identity string, deduplicate bool) error {
-	q.prepareConsumeContext(c)
-	return q.ConsumeUsageAtLeastPreConsumedWithIdentity(usage, isStream, requestKind, identity, deduplicate)
-}
-
-func (q *Quota) ConsumeWithIdentity(c *gin.Context, usage *types.Usage, isStream bool, requestKind billing.SettlementRequestKind, identity string, deduplicate bool) error {
-	q.prepareConsumeContext(c)
-	return q.ConsumeUsageWithIdentity(usage, isStream, requestKind, identity, deduplicate)
-}
-
-func (q *Quota) ConsumeFixedFinalQuotaWithIdentity(c *gin.Context, finalQuota int64, requestKind billing.SettlementRequestKind, identity string, deduplicate bool) (int64, string, error) {
-	return q.ConsumeFixedFinalQuotaWithUsageIdentity(c, finalQuota, nil, requestKind, identity, deduplicate)
-}
-
-func (q *Quota) ConsumeFixedFinalQuotaWithUsageIdentity(c *gin.Context, finalQuota int64, usage *types.Usage, requestKind billing.SettlementRequestKind, identity string, deduplicate bool) (int64, string, error) {
-	q.prepareConsumeContext(c)
-	appliedQuota, err := q.consumeFixedFinalQuotaSettlement(finalQuota, usage, true, requestKind, identity, deduplicate)
-	return appliedQuota, identity, err
-}
-
-func (q *Quota) prepareConsumeContext(c *gin.Context) {
-	if q == nil {
-		return
-	}
-	if c != nil {
-		if q.requestContext == nil && c.Request != nil {
-			q.requestContext = detachQuotaContext(c.Request.Context())
-		}
-		if q.tokenName == "" {
-			q.tokenName = c.GetString("token_name")
-		}
-		if q.sourceIP == "" {
-			q.sourceIP = c.GetString(config.GinResponsesWSClientIPKey)
-			if q.sourceIP == "" {
-				q.sourceIP = c.ClientIP()
-			}
-		}
-		if q.userAgent == "" && c.Request != nil {
-			q.userAgent = c.GetString(config.GinResponsesWSUserAgentKey)
-			if q.userAgent == "" {
-				q.userAgent = utils.NormalizeUserAgent(c.Request.UserAgent())
-			}
-		}
-		if q.startTime.IsZero() {
-			q.startTime = c.GetTime("requestStartTime")
-		}
-	}
-}
-
-func (q *Quota) ConsumeUsage(usage *types.Usage, isStream bool) {
-	if err := q.consumeUsageSettlement(usage, isStream, billing.SettlementRequestKindUnary, "", false); err != nil {
-		logger.LogError(q.requestContext, err.Error())
-	}
-}
-
-func (q *Quota) ConsumeUsageAtLeastPreConsumed(usage *types.Usage, isStream bool) {
-	if q == nil {
-		return
-	}
-	if err := q.consumeUsageSettlementWithFinalQuotaFloor(usage, isStream, billing.SettlementRequestKindUnary, "", false, q.preConsumedQuota); err != nil {
-		logger.LogError(q.requestContext, err.Error())
-	}
-}
-
-func (q *Quota) ConsumeUsageAtLeastPreConsumedWithIdentity(usage *types.Usage, isStream bool, requestKind billing.SettlementRequestKind, identity string, deduplicate bool) error {
-	if q == nil {
-		return nil
-	}
-	return q.consumeUsageSettlementWithFinalQuotaFloor(usage, isStream, requestKind, identity, deduplicate, q.preConsumedQuota)
-}
-
-func (q *Quota) ConsumeUsageWithIdentity(usage *types.Usage, isStream bool, requestKind billing.SettlementRequestKind, identity string, deduplicate bool) error {
-	return q.consumeUsageSettlement(usage, isStream, requestKind, identity, deduplicate)
-}
-
-func (q *Quota) BuildSettlementEnvelope(usage *types.Usage, isStream bool, requestKind billing.SettlementRequestKind, identity string, deduplicate bool) *billing.SettlementEnvelope {
-	return q.buildSettlementEnvelopeWithFinalQuotaFloor(usage, isStream, requestKind, identity, deduplicate, 0)
-}
-
-func (q *Quota) buildSettlementEnvelopeWithFixedFinalQuota(finalQuota int, usage *types.Usage, isStream bool, requestKind billing.SettlementRequestKind, identity string, deduplicate bool) *billing.SettlementEnvelope {
-	envelope := q.buildSettlementEnvelopeWithFinalQuotaFloor(usage, isStream, requestKind, identity, deduplicate, 0)
-	if envelope == nil {
-		return nil
-	}
-	envelope.Command.FinalQuota = finalQuota
-	return envelope
-}
-
-func (q *Quota) buildSettlementEnvelopeWithFinalQuotaFloor(usage *types.Usage, isStream bool, requestKind billing.SettlementRequestKind, identity string, deduplicate bool, finalQuotaFloor int) *billing.SettlementEnvelope {
+func (q *Quota) buildSettlementEnvelope(finalQuota int, usage *types.Usage, isStream bool, requestKind billing.SettlementRequestKind) *billing.SettlementEnvelope {
 	if q == nil {
 		return nil
 	}
@@ -457,29 +345,19 @@ func (q *Quota) buildSettlementEnvelopeWithFinalQuotaFloor(usage *types.Usage, i
 		usage = &types.Usage{}
 	}
 
-	finalQuota := q.GetTotalQuotaByUsage(usage)
-	if finalQuota < finalQuotaFloor {
-		finalQuota = finalQuotaFloor
-	}
 	return &billing.SettlementEnvelope{
 		Command: billing.SettlementCommand{
-			Identity:         identity,
-			RequestKind:      requestKind,
-			UserID:           q.userId,
-			TokenID:          q.tokenId,
-			ChannelID:        q.channelId,
-			ModelName:        q.modelName,
-			PreConsumedQuota: q.preConsumedQuota,
-			FinalQuota:       finalQuota,
-			UsageSummary:     billing.NewUsageSummary(usage),
-			UnlimitedQuota:   q.unlimitedQuota,
+			RequestKind:            requestKind,
+			UserID:                 q.userId,
+			TokenID:                q.tokenId,
+			ChannelID:              q.channelId,
+			ModelName:              q.modelName,
+			PreConsumedQuota:       q.preConsumedQuota,
+			FinalQuota:             finalQuota,
+			UsageSummary:           billing.NewUsageSummary(usage),
+			PreconsumeTokenApplied: q.preconsumeTokenApplied,
 		},
 		Options: billing.SettlementOptions{
-			Deduplicate: deduplicate,
-			Cleanup: billing.SettlementCleanup{
-				RealtimeQuotaDelta:    q.cacheQuota,
-				RefreshUserQuotaCache: config.RedisEnabled,
-			},
 			Projection: billing.SettlementProjection{
 				TokenName:   q.tokenName,
 				RequestTime: q.getRequestTime(),
@@ -491,51 +369,7 @@ func (q *Quota) buildSettlementEnvelopeWithFinalQuotaFloor(usage *types.Usage, i
 	}
 }
 
-func (q *Quota) consumeUsageSettlement(usage *types.Usage, isStream bool, requestKind billing.SettlementRequestKind, identity string, deduplicate bool) error {
-	return q.consumeUsageSettlementWithFinalQuotaFloor(usage, isStream, requestKind, identity, deduplicate, 0)
-}
-
-func (q *Quota) consumeUsageSettlementWithFinalQuotaFloor(usage *types.Usage, isStream bool, requestKind billing.SettlementRequestKind, identity string, deduplicate bool, finalQuotaFloor int) error {
-	if q == nil {
-		return nil
-	}
-
-	q.requestContext = detachQuotaContext(q.requestContext)
-	if q.startTime.IsZero() {
-		q.startTime = time.Now()
-	}
-
-	envelope := q.buildSettlementEnvelopeWithFinalQuotaFloor(usage, isStream, requestKind, identity, deduplicate, finalQuotaFloor)
-	if envelope == nil {
-		return nil
-	}
-
-	result, err := billing.ApplySettlement(q.requestContext, envelope.Command, &envelope.Options)
-	if err != nil {
-		// Settlement is called after the provider-side request is considered
-		// admitted. If applying the final delta fails, keep any pre-consumed
-		// truth quota instead of refunding completed upstream work. Explicit
-		// no-send paths still use Undo/RollbackBeforeLocalWriteOK before this
-		// point, where provider absence is provable.
-		q.reconcileRealtimeQuotaCache()
-		return errors.New("error applying settlement: " + err.Error())
-	}
-	if result.Deduplicated {
-		return nil
-	}
-	if result.TruthApplied {
-		if q.cacheQuota > 0 && !result.CleanupFailed {
-			q.cacheQuota = 0
-		}
-		q.PreconsumeTruthApplied = false
-		q.PreconsumeCacheApplied = false
-		return nil
-	}
-	q.reconcileRealtimeQuotaCache()
-	return nil
-}
-
-func (q *Quota) consumeFixedFinalQuotaSettlement(finalQuota int64, usage *types.Usage, isStream bool, requestKind billing.SettlementRequestKind, identity string, deduplicate bool) (int64, error) {
+func (q *Quota) consumeFinalQuota(operationCtx context.Context, finalQuota int64, usage *types.Usage, isStream bool, requestKind billing.SettlementRequestKind) (int64, error) {
 	if q == nil {
 		return 0, nil
 	}
@@ -547,36 +381,44 @@ func (q *Quota) consumeFixedFinalQuotaSettlement(finalQuota int64, usage *types.
 		return 0, errors.New("fixed final quota exceeds platform int range")
 	}
 
-	q.requestContext = detachQuotaContext(q.requestContext)
-	if q.startTime.IsZero() {
-		q.startTime = time.Now()
+	if operationCtx == nil {
+		operationCtx = detachQuotaContext(q.requestContext)
 	}
-
-	envelope := q.buildSettlementEnvelopeWithFixedFinalQuota(int(finalQuota), usage, isStream, requestKind, identity, deduplicate)
+	envelope := q.buildSettlementEnvelope(int(finalQuota), usage, isStream, requestKind)
 	if envelope == nil {
 		return 0, nil
 	}
 
-	result, err := billing.ApplySettlement(q.requestContext, envelope.Command, &envelope.Options)
-	if err != nil {
-		q.reconcileRealtimeQuotaCache()
-		return 0, errors.New("error applying settlement: " + err.Error())
-	}
-	if result.Deduplicated {
-		if result.FingerprintConflict {
-			return 0, errors.New("settlement identity fingerprint conflict")
+	var (
+		result billing.SettlementResult
+		err    error
+	)
+	for attempt := 0; attempt < 2; attempt++ {
+		result, err = applyBillingSettlement(operationCtx, envelope.Command, &envelope.Options)
+		if err == nil {
+			break
 		}
-		return int64(envelope.Command.FinalQuota), nil
+		if result.BalanceOutcome == model.BillingBalanceCommitUnknown {
+			break
+		}
+		if result.BalanceOutcome != model.BillingBalanceDefinitelyRolledBack || operationCtx.Err() != nil {
+			break
+		}
+	}
+	if err != nil {
+		if result.BalanceOutcome == model.BillingBalanceCommitUnknown {
+			return 0, fmt.Errorf("billing settlement commit outcome is unknown: %w", err)
+		}
+		if operationCtx.Err() != nil {
+			return 0, fmt.Errorf("billing settlement deadline exhausted: %w", errors.Join(err, operationCtx.Err()))
+		}
+		return 0, fmt.Errorf("error applying settlement: %w", err)
 	}
 	if result.TruthApplied {
-		if q.cacheQuota > 0 && !result.CleanupFailed {
-			q.cacheQuota = 0
-		}
 		q.PreconsumeTruthApplied = false
-		q.PreconsumeCacheApplied = false
+		q.PreconsumeTruthIndeterminate = false
 		return int64(envelope.Command.FinalQuota), nil
 	}
-	q.reconcileRealtimeQuotaCache()
 	return int64(envelope.Command.FinalQuota), nil
 }
 
@@ -585,19 +427,6 @@ func detachQuotaContext(ctx context.Context) context.Context {
 		return context.Background()
 	}
 	return context.WithoutCancel(ctx)
-}
-
-func (q *Quota) reconcileRealtimeQuotaCache() {
-	if q == nil || q.cacheQuota <= 0 {
-		return
-	}
-
-	if _, err := model.CacheDecreaseUserRealtimeQuota(q.userId, q.cacheQuota); err != nil {
-		logger.LogError(q.requestContext, "error reconcile realtime quota cache: "+err.Error())
-		model.EnqueueUserRealtimeQuotaCacheDecreaseRepair(q.userId, q.cacheQuota, "realtime_quota_reconcile_failed")
-		return
-	}
-	q.cacheQuota = 0
 }
 
 func cloneQuotaPrice(price model.Price) model.Price {
@@ -611,6 +440,10 @@ func cloneQuotaPrice(price model.Price) model.Price {
 		extraRatios := datatypes.NewJSONType(copied)
 		cloned.ExtraRatios = &extraRatios
 	}
+	if price.RateRules != nil {
+		rateRules := datatypes.NewJSONType(model.ClonePriceRateRules(price.RateRules.Data()))
+		cloned.RateRules = &rateRules
+	}
 	if price.ModelInfo != nil {
 		modelInfo := *price.ModelInfo
 		modelInfo.InputModalities = append([]string(nil), price.ModelInfo.InputModalities...)
@@ -620,10 +453,6 @@ func cloneQuotaPrice(price model.Price) model.Price {
 		cloned.ModelInfo = &modelInfo
 	}
 	return cloned
-}
-
-func (q *Quota) GetInputRatio() float64 {
-	return q.inputRatio
 }
 
 func (q *Quota) SetLogProtocol(protocol string) {
@@ -641,6 +470,20 @@ func logProtocolForStream(isStream bool) string {
 }
 
 func (q *Quota) GetLogMeta(usage *types.Usage) map[string]any {
+	price := &q.price
+	if q.settlementPrice != nil {
+		price = q.settlementPrice
+	}
+	inputRatio := price.GetInput()
+	outputRatio := price.GetOutput()
+	if q.settlementPolicyResolved {
+		inputRatio = q.settlementInputRatio
+		outputRatio = q.settlementOutputRatio
+	}
+	groupRatio := q.groupRatio
+	if q.settlementPolicyResolved {
+		groupRatio = q.settlementGroupRatio
+	}
 	meta := map[string]any{
 		"group_name":           q.groupName,
 		"using_group":          q.groupName,
@@ -648,10 +491,19 @@ func (q *Quota) GetLogMeta(usage *types.Usage) map[string]any {
 		"backup_group_name":    q.backupGroupName,
 		"routing_group_source": q.routingGroupSource,
 		"is_backup_group":      q.isBackupGroup, // 添加是否使用备用分组的标识
-		"price_type":           q.price.Type,
-		"group_ratio":          q.groupRatio,
-		"input_ratio":          q.price.GetInput(),
-		"output_ratio":         q.price.GetOutput(),
+		"price_type":           price.Type,
+		"group_ratio":          groupRatio,
+		"input_ratio":          inputRatio,
+		"output_ratio":         outputRatio,
+	}
+	for _, key := range []string{"input_ratio", "output_ratio"} {
+		if value, ok := meta[key].(float64); ok && (math.IsNaN(value) || math.IsInf(value, 0)) {
+			delete(meta, key)
+			q.addBillingDiagnostic("token_billing_rates_unrepresentable")
+		}
+	}
+	if q.settlementPriceVersion > 0 {
+		meta["price_version"] = q.settlementPriceVersion
 	}
 
 	if protocol := strings.TrimSpace(q.logProtocol); protocol != "" {
@@ -665,16 +517,59 @@ func (q *Quota) GetLogMeta(usage *types.Usage) map[string]any {
 
 	if usage != nil {
 		extraTokens := usage.GetExtraTokens()
-
 		for key, value := range extraTokens {
 			meta[key] = value
-			extraRatio := q.price.GetExtraRatio(key)
+			extraRatio := price.GetExtraRatio(key)
 			meta[key+"_ratio"] = extraRatio
+		}
+		for key, value := range usage.ExtraUsageUnits {
+			meta[key+"_units"] = value
+			meta[key+"_ratio"] = price.GetExtraRatio(key)
 		}
 	}
 
 	if q.extraBillingData != nil {
 		meta["extra_billing"] = q.extraBillingData
+	}
+	if q.settlementModel != "" {
+		meta["billing_model"] = q.settlementModel
+	}
+	if q.settlementSpeed != "" {
+		meta["effective_speed"] = q.settlementSpeed
+	}
+	if q.settlementTier != "" {
+		meta["effective_service_tier"] = q.settlementTier
+	}
+	if q.settlementPolicyResolved {
+		meta["billing_input_multiplier"] = q.settlementInputMultiplier
+	}
+	if q.settlementPolicyResolved {
+		meta["billing_output_multiplier"] = q.settlementOutputMultiplier
+	}
+	if q.settlementTokenBilling != nil {
+		effectiveExtras := make(map[string]float64)
+		for key, prompt := range model.ExtraKeyIsPrompt {
+			base := price.GetOutput()
+			if prompt {
+				base = price.GetInput()
+			}
+			rate := base * price.GetExtraRatio(key) * q.settlementRuleResult.For(key, prompt)
+			if !math.IsNaN(rate) && !math.IsInf(rate, 0) {
+				effectiveExtras[key] = rate
+			}
+		}
+		meta["effective_extra_ratios"] = effectiveExtras
+		details := *q.settlementTokenBilling
+		details.Rules = append([]billingRateRule{}, details.Rules...)
+		meta["token_billing"] = details
+	}
+	if len(q.billingDiagnostics) > 0 {
+		diagnostics := make([]string, 0, len(q.billingDiagnostics))
+		for diagnostic := range q.billingDiagnostics {
+			diagnostics = append(diagnostics, diagnostic)
+		}
+		sort.Strings(diagnostics)
+		meta["billing_diagnostics"] = diagnostics
 	}
 	if len(q.affinityMeta) > 0 {
 		for key, value := range q.affinityMeta {
@@ -708,35 +603,176 @@ func (q *Quota) getRequestTime() int {
 	return int(time.Since(q.startTime).Milliseconds())
 }
 
-// 通过 token 数获取消费配额
-func (q *Quota) GetTotalQuota(promptTokens, completionTokens int, extraBilling map[string]types.ExtraBilling) (quota int) {
-	if q.price.Type == model.TimesPriceType {
-		quota = int(1000 * q.inputRatio)
+type quotaPricePolicy struct {
+	price            model.Price
+	modelName        string
+	serviceTier      string
+	inputMultiplier  float64
+	outputMultiplier float64
+	missing          bool
+	version          int64
+	groupRatio       float64
+	rates            model.PriceRuleResult
+	ruleStatus       PriceComponentStatus
+}
+
+func (q *Quota) addBillingDiagnostic(diagnostic string) {
+	if q == nil || strings.TrimSpace(diagnostic) == "" {
+		return
+	}
+	if q.billingDiagnostics == nil {
+		q.billingDiagnostics = make(map[string]bool)
+	}
+	q.billingDiagnostics[diagnostic] = true
+}
+
+func (q *Quota) clearCurrentPolicyDiagnostics() {
+	if q == nil || len(q.billingDiagnostics) == 0 {
+		return
+	}
+	for diagnostic := range q.billingDiagnostics {
+		switch diagnostic {
+		case "billing_group_unavailable", "billing_actual_model_price_missing", "billing_model_price_type_mismatch", "price_policy_missing_at_settlement", "billing_tier_unknown", "billing_speed_unknown", "token_billing_rates_unrepresentable", "token_billing_units_unrepresentable":
+			delete(q.billingDiagnostics, diagnostic)
+		default:
+			if strings.HasPrefix(diagnostic, "billing_rule_") || strings.HasPrefix(diagnostic, "billing_rate_rules_") || strings.HasPrefix(diagnostic, "independent_unit_price_missing:") || strings.HasPrefix(diagnostic, "unit_component_price_missing:") {
+				delete(q.billingDiagnostics, diagnostic)
+			}
+		}
+	}
+}
+
+func (q *Quota) resolveQuotaPricePolicy(actualModel, serviceTier string, usage *types.Usage) quotaPricePolicy {
+	q.clearCurrentPolicyDiagnostics()
+	q.settlementTokenBilling = nil
+	policy := quotaPricePolicy{
+		modelName:        q.modelName,
+		serviceTier:      strings.ToLower(strings.TrimSpace(serviceTier)),
+		inputMultiplier:  1,
+		outputMultiplier: 1,
+	}
+	if groupRatio, err := q.currentGroupRatio(); err == nil {
+		policy.groupRatio = groupRatio
 	} else {
-		quota = int(math.Ceil((float64(promptTokens) * q.inputRatio) + (float64(completionTokens) * q.outputRatio)))
+		policy.missing = true
+		q.addBillingDiagnostic("billing_group_unavailable")
+	}
+	actualModel = strings.TrimSpace(actualModel)
+	if model.PricingInstance != nil {
+		prices, version := model.PricingInstance.FindPricesWithVersion(q.modelName, actualModel)
+		policy.version = version
+		if requestPrice, ok := prices[q.modelName]; ok {
+			policy.price = cloneQuotaPrice(requestPrice)
+		}
+		if !q.freezeRequestPricePolicy && actualModel != "" {
+			if actualPrice, ok := prices[actualModel]; !ok {
+				q.addBillingDiagnostic("billing_actual_model_price_missing")
+			} else if policy.price.Model == "" || actualPrice.Type == policy.price.Type {
+				policy.price = cloneQuotaPrice(actualPrice)
+				policy.modelName = actualModel
+				policy.version = version
+			} else {
+				q.addBillingDiagnostic("billing_model_price_type_mismatch")
+			}
+		}
+	}
+	policy.missing = policy.missing || policy.price.Model == ""
+	if policy.missing {
+		policy.price = model.Price{Model: policy.modelName, Type: model.TokensPriceType}
+		q.addBillingDiagnostic("price_policy_missing_at_settlement")
 	}
 
-	q.GetExtraBillingData(extraBilling)
+	return q.applyRateRules(policy, usage)
+}
+
+func (q *Quota) applyRateRules(policy quotaPricePolicy, usage *types.Usage) quotaPricePolicy {
+	// rate_rules multiply token rates. A times price is already the complete
+	// per-call amount, independent of token count, service tier, and context size.
+	if policy.price.Type == model.TokensPriceType {
+		q.settlementTokenBilling = &tokenBillingDetails{
+			UnitsIncludeRules: true,
+			BaseInputRatio:    policy.price.GetInput(),
+			BaseOutputRatio:   policy.price.GetOutput(),
+			Rules:             make([]billingRateRule, 0, 2),
+		}
+		facts := model.PriceRuleFacts{ServiceTier: policy.serviceTier, Speed: usage.Speed, SpeedConflict: usage.SpeedConflict, StartedAt: q.startTime}
+		if usage.HasProviderBaseUsage() {
+			inputTokens := usage.PromptTokens
+			facts.InputTokens = &inputTokens
+		}
+		policy.rates = policy.price.EffectiveRateRules().Evaluate(facts)
+		policy.inputMultiplier = policy.rates.Input
+		policy.outputMultiplier = policy.rates.Output
+		if policy.rates.Missing {
+			policy.ruleStatus = PriceComponentMissingEvidence
+		}
+		if policy.rates.Conflict {
+			policy.ruleStatus = PriceComponentConflictingEvidence
+		}
+		for _, diagnostic := range policy.rates.Diagnostics {
+			q.addBillingDiagnostic(diagnostic)
+		}
+		q.settlementTokenBilling.Rules = policy.rates.Matches
+		q.settlementTokenBilling.Facts = facts
+		q.settlementTokenBilling.ExtraMultipliers = policy.rates.Extra
+		q.settlementRuleResult = policy.rates
+		q.settlementSpeed = usage.Speed
+
+	}
+
+	q.settlementModel = policy.modelName
+	settlementPrice := cloneQuotaPrice(policy.price)
+	q.settlementPrice = &settlementPrice
+	q.settlementPriceVersion = policy.version
+	q.settlementGroupRatio = policy.groupRatio
+	q.settlementPolicyResolved = true
+	q.settlementTier = policy.serviceTier
+	if q.settlementTier == "" || q.settlementTier == "auto" {
+		q.settlementTier = "default"
+	}
+	q.settlementInputMultiplier = policy.inputMultiplier
+	q.settlementOutputMultiplier = policy.outputMultiplier
+	q.settlementInputRatio = policy.price.GetInput() * policy.inputMultiplier
+	q.settlementOutputRatio = policy.price.GetOutput() * policy.outputMultiplier
+	return policy
+}
+
+func (q *Quota) getTotalQuotaWithPolicyUnits(policy quotaPricePolicy, promptTokenUnits, completionTokenUnits float64, extraBilling map[string]types.ExtraBilling) (quota int) {
+	inputRatio := policy.price.GetInput() * policy.groupRatio
+	outputRatio := policy.price.GetOutput() * policy.groupRatio
+	if policy.price.Type == model.TimesPriceType {
+		quota = saturatingCeilToInt(1000 * inputRatio)
+	} else {
+		inputAmount, outputAmount := 0.0, 0.0
+		if inputRatio != 0 {
+			inputAmount = promptTokenUnits * inputRatio
+		}
+		if outputRatio != 0 {
+			outputAmount = completionTokenUnits * outputRatio
+		}
+		quota = saturatingCeilToInt(inputAmount + outputAmount)
+	}
+
+	q.getExtraBillingDataForModel(extraBilling, policy.modelName)
 	extraBillingQuota := 0
 	if q.extraBillingData != nil {
 		for _, value := range q.extraBillingData {
 			extraBillingQuota += int(math.Ceil(
-				float64(value.Price)*float64(config.QuotaPerUnit),
+				float64(value.Price)*q.effectiveQuotaPerUnit(),
 			)) * value.CallCount
 		}
 	}
 
 	if extraBillingQuota > 0 {
-		quota += int(math.Ceil(
-			float64(extraBillingQuota) * q.groupRatio,
+		quota = saturatingAddInt(quota, saturatingCeilToInt(
+			float64(extraBillingQuota)*policy.groupRatio,
 		))
 	}
 
-	if q.inputRatio != 0 && quota <= 0 {
+	if inputRatio != 0 && quota <= 0 && (promptTokenUnits > 0 || completionTokenUnits > 0) {
 		quota = 1
 	}
-	totalTokens := promptTokens + completionTokens
-	if totalTokens == 0 {
+	if policy.price.Type == model.TokensPriceType && promptTokenUnits == 0 && completionTokenUnits == 0 && extraBillingQuota == 0 {
 		// in this case, must be some error happened
 		// we cannot just return, because we may have to return the pre-consumed quota
 		quota = 0
@@ -745,57 +781,91 @@ func (q *Quota) GetTotalQuota(promptTokens, completionTokens int, extraBilling m
 	return quota
 }
 
-// 获取计算的 token 数
-func (q *Quota) getComputeTokensByUsage(usage *types.Usage) (promptTokens, completionTokens int) {
-	promptTokens = usage.PromptTokens
-	completionTokens = usage.CompletionTokens
+func saturatingCeilToInt(value float64) int {
+	if math.IsNaN(value) {
+		return 0
+	}
+	maxInt := int(^uint(0) >> 1)
+	minInt := -maxInt - 1
+	if value >= float64(maxInt) {
+		return maxInt
+	}
+	if value <= float64(minInt) {
+		return minInt
+	}
+	return int(math.Ceil(value))
+}
 
-	extraTokens := usage.GetExtraTokens()
+func saturatingTruncToInt(value float64) int {
+	if math.IsNaN(value) {
+		return 0
+	}
+	maxInt := int(^uint(0) >> 1)
+	minInt := -maxInt - 1
+	if value >= float64(maxInt) {
+		return maxInt
+	}
+	if value <= float64(minInt) {
+		return minInt
+	}
+	return int(value)
+}
 
+func saturatingAddInt(left, right int) int {
+	maxInt := int(^uint(0) >> 1)
+	minInt := -maxInt - 1
+	if right > 0 && left > maxInt-right {
+		return maxInt
+	}
+	if right < 0 && left < minInt-right {
+		return minInt
+	}
+	return left + right
+}
+
+func weightedTokenUnits(baseTokens int, extraTokens map[string]int, extraUsageUnits map[string]float64, independentUnits map[string]bool, policy quotaPricePolicy, prompt bool) float64 {
+	side := policy.inputMultiplier
+	if !prompt {
+		side = policy.outputMultiplier
+	}
+	units := float64(baseTokens) * side
 	for key, value := range extraTokens {
-		extraRatio := q.price.GetExtraRatio(key)
-		if model.GetExtraPriceIsPrompt(key) {
-			promptTokens += model.GetIncreaseTokens(value, extraRatio)
-		} else {
-			completionTokens += model.GetIncreaseTokens(value, extraRatio)
+		if model.GetExtraPriceIsPrompt(key) != prompt || value <= 0 {
+			continue
 		}
+		ratio := policy.price.GetExtraRatio(key) * policy.rates.For(key, prompt)
+		if math.IsInf(ratio, 1) {
+			return math.Inf(1)
+		}
+		if math.IsNaN(ratio) || ratio < 0 {
+			return math.NaN()
+		}
+		units += float64(value) * (ratio - side)
 	}
-
-	return
+	for key, value := range extraUsageUnits {
+		if independentUnits[key] {
+			continue
+		}
+		if model.GetExtraPriceIsPrompt(key) != prompt || value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+			continue
+		}
+		ratio := policy.price.GetExtraRatio(key) * policy.rates.For(key, prompt)
+		if math.IsInf(ratio, 1) {
+			return math.Inf(1)
+		}
+		if math.IsNaN(ratio) || ratio < 0 {
+			return math.NaN()
+		}
+		// Extra usage units are not already present in the base token bucket.
+		units += value * ratio
+	}
+	return units
 }
 
-func (q *Quota) getComputeTokensByUsageEvent(usage *types.UsageEvent) (promptTokens, completionTokens int) {
-	promptTokens = usage.InputTokens
-	completionTokens = usage.OutputTokens
+func (q *Quota) getComputeTokenUnitsByUsageWithPrice(usage *types.Usage, policy quotaPricePolicy, partitionAdjustment tokenPartitionAdjustment) (float64, float64) {
 	extraTokens := usage.GetExtraTokens()
-
-	for key, value := range extraTokens {
-		extraRatio := q.price.GetExtraRatio(key)
-		if model.GetExtraPriceIsPrompt(key) {
-			promptTokens += model.GetIncreaseTokens(value, extraRatio)
-		} else {
-			completionTokens += model.GetIncreaseTokens(value, extraRatio)
-		}
-	}
-
-	return
-}
-
-// 通过 usage 获取消费配额
-func (q *Quota) GetTotalQuotaByUsage(usage *types.Usage) (quota int) {
-	if usage == nil {
-		return q.GetTotalQuota(0, 0, nil)
-	}
-	promptTokens, completionTokens := q.getComputeTokensByUsage(usage)
-	return q.GetTotalQuota(promptTokens, completionTokens, usage.ExtraBilling)
-}
-
-func (q *Quota) GetTotalQuotaByUsageEvent(usage *types.UsageEvent) (quota int) {
-	if usage == nil {
-		return q.GetTotalQuota(0, 0, nil)
-	}
-	promptTokens, completionTokens := q.getComputeTokensByUsageEvent(usage)
-	return q.GetTotalQuota(promptTokens, completionTokens, usage.ExtraBilling)
+	return weightedTokenUnits(usage.PromptTokens, extraTokens, usage.ExtraUsageUnits, usage.ProviderIndependentUsageUnits, policy, true) + partitionAdjustment.prompt,
+		weightedTokenUnits(usage.CompletionTokens, extraTokens, usage.ExtraUsageUnits, usage.ProviderIndependentUsageUnits, policy, false) + partitionAdjustment.completion
 }
 
 func (q *Quota) GetFirstResponseTime() int64 {
@@ -839,7 +909,7 @@ type ExtraBillingData struct {
 	Price       float64 `json:"price"`
 }
 
-func (q *Quota) GetExtraBillingData(extraBilling map[string]types.ExtraBilling) {
+func (q *Quota) getExtraBillingDataForModel(extraBilling map[string]types.ExtraBilling, modelName string) {
 	if len(extraBilling) == 0 {
 		q.extraBillingData = nil
 		return
@@ -849,11 +919,15 @@ func (q *Quota) GetExtraBillingData(extraBilling map[string]types.ExtraBilling) 
 	for billingKey, value := range extraBilling {
 		serviceType := types.ResolveExtraBillingServiceType(billingKey, value)
 		billingType := types.ResolveExtraBillingType(billingKey, value)
+		price, diagnostic := getDefaultExtraServicePriceDecision(serviceType, modelName, billingType)
+		if diagnostic != "" {
+			q.addBillingDiagnostic(diagnostic)
+		}
 		extraBillingData[billingKey] = ExtraBillingData{
 			ServiceType: serviceType,
 			Type:        billingType,
 			CallCount:   value.CallCount,
-			Price:       getDefaultExtraServicePrice(serviceType, q.modelName, billingType),
+			Price:       price,
 		}
 	}
 

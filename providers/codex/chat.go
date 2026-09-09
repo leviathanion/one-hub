@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"one-api/common"
-	"one-api/common/logger"
 	"one-api/common/requestctx"
 	"one-api/common/requester"
 	commonresponses "one-api/common/responses"
@@ -59,15 +58,7 @@ func (p *CodexProvider) CreateChatCompletionStream(request *types.ChatCompletion
 
 // chatToResponsesRequest converts ChatCompletionRequest to OpenAIResponsesRequest.
 func (p *CodexProvider) chatToResponsesRequest(request *types.ChatCompletionRequest) *types.OpenAIResponsesRequest {
-	converted := request.ToResponsesRequest()
-	// The adapter authors this synthesized body, so parameter conflicts are
-	// resolved here instead of surfacing the Codex planner's 400 for a body
-	// the client never wrote: keep temperature, drop top_p.
-	if converted.Temperature != nil && converted.TopP != nil {
-		converted.TopP = nil
-		logger.LogDebug(p.codexProviderContext(), `[Codex] chat adapter decision {"dialect":"codex_official","field":"top_p","action":"drop","source":"chat_adapter","reason":"temperature-and-top_p-both-present"}`)
-	}
-	return converted
+	return request.ToResponsesRequest()
 }
 
 // chatResponsesRequestFromTyped is only the /v1/chat/completions adapter.

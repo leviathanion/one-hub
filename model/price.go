@@ -373,8 +373,9 @@ func GetDefaultPrice() []*Price {
 		"davinci-002": {[]float64{1, 1}, config.ChannelTypeOpenAI},
 		// 	$0.0004 / 1K tokens
 		"babbage-002": {[]float64{0.2, 0.2}, config.ChannelTypeOpenAI},
-		// $0.006 / minute -> $0.006 / 150 words -> $0.006 / 200 tokens -> $0.03 / 1k tokens
-		"whisper-1": {[]float64{15, 15}, config.ChannelTypeOpenAI},
+		// $0.006 / minute -> $0.0001 / second; seconds are supplied by
+		// input_audio_transcription rather than token estimation.
+		"whisper-1": {[]float64{50, 0}, config.ChannelTypeOpenAI},
 		// $0.015 / 1K characters
 		"tts-1":      {[]float64{7.5, 7.5}, config.ChannelTypeOpenAI},
 		"tts-1-1106": {[]float64{7.5, 7.5}, config.ChannelTypeOpenAI},
@@ -534,12 +535,13 @@ func GetDefaultPrice() []*Price {
 		//$3 /1M TOKENS   $15/1M TOKENS
 		"command-r-plus": {[]float64{1.5, 7.5}, config.ChannelTypeCohere},
 
-		// 0.065
-		"sd3": {[]float64{32.5, 32.5}, config.ChannelTypeStabilityAI},
-		// 0.04
-		"sd3-turbo": {[]float64{20, 20}, config.ChannelTypeStabilityAI},
-		// 0.03
-		"stable-image-core": {[]float64{15, 15}, config.ChannelTypeStabilityAI},
+		// StabilityAI is priced per successful image operation.
+		// 0.065 / image
+		"sd3": {[]float64{32.5, 0}, config.ChannelTypeStabilityAI},
+		// 0.04 / image
+		"sd3-turbo": {[]float64{20, 0}, config.ChannelTypeStabilityAI},
+		// 0.03 / image
+		"stable-image-core": {[]float64{15, 0}, config.ChannelTypeStabilityAI},
 
 		// hunyuan
 		"hunyuan-lite":          {[]float64{0, 0}, config.ChannelTypeHunyuan},
@@ -550,14 +552,28 @@ func GetDefaultPrice() []*Price {
 
 	var prices []*Price
 
+	timesModels := map[string]struct{}{
+		"sd3":               {},
+		"sd3-turbo":         {},
+		"stable-image-core": {},
+	}
 	for model, modelType := range ModelTypes {
-		prices = append(prices, &Price{
+		priceType := TokensPriceType
+		if _, ok := timesModels[model]; ok {
+			priceType = TimesPriceType
+		}
+		price := &Price{
 			Model:       model,
-			Type:        TokensPriceType,
+			Type:        priceType,
 			ChannelType: modelType.Type,
 			Input:       modelType.Ratio[0],
 			Output:      modelType.Ratio[1],
-		})
+		}
+		if model == "whisper-1" {
+			extra := datatypes.NewJSONType(map[string]float64{config.UsageExtraInputAudioTranscription: 1})
+			price.ExtraRatios = &extra
+		}
+		prices = append(prices, price)
 	}
 
 	var DefaultMJPrice = map[string]float64{

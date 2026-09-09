@@ -32,6 +32,7 @@ var RequestBodyDecodeMaxDecodedBytes int64 = 64 << 20
 var RequestBodyDecodeMaxDecoderWindowBytes int64 = 128 << 20
 var RequestBodyDecodeMaxExpansionRatio int64 = 64
 var RequestBodyDecodeMaxLayers = 2
+var ExactWireIngressOwnedHeaders []string
 
 // 是否开启用户月账单功能
 var UserInvoiceMonth = false
@@ -163,12 +164,9 @@ var SMTPAccount = ""
 var SMTPFrom = ""
 var SMTPToken = ""
 
-var ChatImageRequestProxy = ""
-
 var GitHubProxy = ""
 var GitHubClientId = ""
 var GitHubClientSecret = ""
-var GitHubOldIdCloseEnabled = false
 
 var LarkClientId = ""
 var LarkClientSecret = ""
@@ -192,7 +190,6 @@ var QuotaForInvitee = 0
 var ChannelDisableThreshold = 5.0
 var AutomaticDisableChannelEnabled = false
 var AutomaticEnableChannelEnabled = false
-var QuotaRemindThreshold = 1000
 var PreConsumedQuota = 500
 var ApproximateTokenEnabled = false
 var DisableTokenEncoders = false
@@ -210,9 +207,6 @@ const (
 	DefaultChannelTestConcurrency = 8
 	MaxChannelTestConcurrency     = 32
 )
-
-var CFWorkerImageUrl = ""
-var CFWorkerImageKey = ""
 
 var RootUserEmail = ""
 

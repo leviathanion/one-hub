@@ -303,7 +303,7 @@ func (p *CodexProvider) ConsumeResetCredit(ctx context.Context) (*CodexResetResu
 	if result == nil || result.upstreamStatus != http.StatusUnauthorized && result.upstreamStatus != http.StatusForbidden {
 		return result, err
 	}
-	if p.Credentials == nil || strings.TrimSpace(p.Credentials.RefreshToken) == "" {
+	if credentials := p.credentialsSnapshot(); credentials == nil || strings.TrimSpace(credentials.RefreshToken) == "" {
 		return result, err
 	}
 
@@ -364,7 +364,8 @@ func (p *CodexProvider) consumeResetCreditOnce(ctx context.Context) (*CodexReset
 		return result, err
 	}
 
-	result, normalizeErr := normalizeResetCreditResultWithCredentials(channel.Id, p.Credentials, resp.StatusCode, bodyBytes)
+	credentials := p.credentialsSnapshot()
+	result, normalizeErr := normalizeResetCreditResultWithCredentials(channel.Id, credentials, resp.StatusCode, bodyBytes)
 	if normalizeErr != nil {
 		if isHTTPSuccess(resp.StatusCode) {
 			return result, fmt.Errorf("%w: %w", ErrResetCreditCommittedResponseUnusable, normalizeErr)
@@ -372,8 +373,8 @@ func (p *CodexProvider) consumeResetCreditOnce(ctx context.Context) (*CodexReset
 		return result, normalizeErr
 	}
 	if !isHTTPSuccess(resp.StatusCode) {
-		message := extractUsageErrorMessage(redactUsageCredentialValues(decodeRawJSON(bodyBytes), p.Credentials), resp.StatusCode)
-		return result, errors.New(redactUsageCredentialSecrets(message, p.Credentials))
+		message := extractUsageErrorMessage(redactUsageCredentialValues(decodeRawJSON(bodyBytes), credentials), resp.StatusCode)
+		return result, errors.New(redactUsageCredentialSecrets(message, credentials))
 	}
 
 	return result, nil
@@ -412,7 +413,7 @@ func (p *CodexProvider) fetchUsageSnapshot(ctx context.Context) (*CodexUsageSnap
 	if snapshot == nil || snapshot.UpstreamStatus != http.StatusUnauthorized && snapshot.UpstreamStatus != http.StatusForbidden {
 		return snapshot, err
 	}
-	if p.Credentials == nil || strings.TrimSpace(p.Credentials.RefreshToken) == "" {
+	if credentials := p.credentialsSnapshot(); credentials == nil || strings.TrimSpace(credentials.RefreshToken) == "" {
 		return snapshot, err
 	}
 
@@ -467,14 +468,15 @@ func (p *CodexProvider) fetchUsageSnapshotOnce(ctx context.Context) (*CodexUsage
 		return nil, err
 	}
 
-	snapshot, normalizeErr := normalizeUsageSnapshot(channel.Id, p.Credentials, resp.StatusCode, bodyBytes)
+	credentials := p.credentialsSnapshot()
+	snapshot, normalizeErr := normalizeUsageSnapshot(channel.Id, credentials, resp.StatusCode, bodyBytes)
 	if normalizeErr != nil {
 		return snapshot, normalizeErr
 	}
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		message := extractUsageErrorMessage(snapshot.Raw, resp.StatusCode)
-		return snapshot, errors.New(redactUsageCredentialSecrets(message, p.Credentials))
+		return snapshot, errors.New(redactUsageCredentialSecrets(message, credentials))
 	}
 
 	return snapshot, nil

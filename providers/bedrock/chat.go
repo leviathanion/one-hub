@@ -22,8 +22,15 @@ func (p *BedrockProvider) CreateChatCompletion(request *types.ChatCompletionRequ
 }
 
 func (p *BedrockProvider) CreateChatCompletionStream(request *types.ChatCompletionRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+	req, errWithCode := p.getChatRequest(request)
+	if errWithCode != nil {
+		return nil, errWithCode
+	}
+	defer req.Body.Close()
+
 	// 发送请求
-	response, errWithCode := p.Send(request)
+	streamRequester := p.Requester.ForHTTPProfile(requester.HTTPProfileLongStream)
+	response, errWithCode := streamRequester.SendRequestRaw(req)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}

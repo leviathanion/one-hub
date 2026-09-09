@@ -883,18 +883,6 @@ func TestUsageCacheRejectsSnapshotFromOldChannelConfiguration(t *testing.T) {
 	if err != nil || cached.PlanType != "new-plan" {
 		t.Fatalf("expected current channel preview to survive late old write, got %+v, %v", cached, err)
 	}
-
-	legacyKey := fmt.Sprintf("codex:usage:preview:%d", newChannel.Id)
-	if err := cache.SetCache(legacyKey, newPreview, time.Minute); err != nil {
-		t.Fatalf("expected legacy cache priming to succeed, got %v", err)
-	}
-	generation, err := usageCacheGeneration(context.Background(), newChannel.Id)
-	if err != nil {
-		t.Fatalf("expected generation marker, got %v", err)
-	}
-	if usagePreviewCacheKey(newChannel.Id, generation, codexUsageChannelFingerprint(&newChannel)) == legacyKey {
-		t.Fatal("expected v2 cache key to stay isolated from rolling-upgrade legacy keys")
-	}
 }
 
 func TestUsageCacheFingerprintSeparatesRecreatedChannelIdentity(t *testing.T) {

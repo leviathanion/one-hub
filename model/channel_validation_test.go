@@ -26,7 +26,7 @@ func TestChannelRuntimeConfigValidationBranches(t *testing.T) {
 		ModelMapping:    testStringPtr(`{"gpt-5":"gpt-5-codex"}`),
 		ModelHeaders:    testStringPtr(`{}`),
 		CustomParameter: testStringPtr(`{"temperature":0.2}`),
-		Other:           `{"websocket_mode":"auto"}`,
+		Other:           `{"execution_session_ttl_seconds":600}`,
 	}
 	if err := channel.ValidateRuntimeConfigJSON(); err != nil {
 		t.Fatalf("expected valid codex runtime config json, got %v", err)
@@ -87,6 +87,19 @@ func TestChannelRuntimeConfigValidationBranches(t *testing.T) {
 	}
 }
 
+func TestChannelRuntimeConfigRejectsPromptCacheRoutingTransform(t *testing.T) {
+	for _, raw := range []string{
+		`{"pre_add":true,"prompt_cache_key":"forced"}`,
+		`{"per_model":true,"gpt-5":{"prompt_cache_key":"forced"}}`,
+		`{"remove_params":["prompt_cache_key"]}`,
+	} {
+		channel := &Channel{Type: config.ChannelTypeOpenAI, CustomParameter: testStringPtr(raw)}
+		if err := channel.ValidateRuntimeConfigJSON(); err == nil || !strings.Contains(err.Error(), "routing hint") {
+			t.Fatalf("routing identity transform %s was accepted: %v", raw, err)
+		}
+	}
+}
+
 func TestParseAzureChannelOtherRejectsLiteralNullAsJSONObjectContractError(t *testing.T) {
 	_, err := ParseAzureChannelOther("null")
 	if err == nil || !strings.Contains(err.Error(), "other must be a JSON object, not null") {
@@ -101,13 +114,8 @@ func TestValidateCodexChannelOtherAcceptsDocumentedFields(t *testing.T) {
 	channel := &Channel{
 		Type: config.ChannelTypeCodex,
 		Other: `{
-			"prompt_cache_key_strategy":" AUTO ",
-			"websocket_mode":" force ",
-			"responses_ws_transport":" native ",
 			"self_hosted":true,
-			"responses_ws_self_hosted":false,
 			"execution_session_ttl_seconds":600,
-			"websocket_retry_cooldown_seconds":120,
 			"codex":{
 				"fedramp":true,
 				"residency":"us",
@@ -125,16 +133,6 @@ func TestValidateCodexChannelOtherAcceptsDocumentedFields(t *testing.T) {
 	}
 	if err := channel.ValidateRuntimeConfigJSON(); err != nil {
 		t.Fatalf("expected documented Codex other fields to validate, got %v", err)
-	}
-}
-
-func TestValidateCodexChannelOtherRejectsResponsesWSHTTPBridge(t *testing.T) {
-	channel := &Channel{
-		Type:  config.ChannelTypeCodex,
-		Other: `{"responses_ws_transport":"http_bridge"}`,
-	}
-	if err := channel.ValidateRuntimeConfigJSON(); err == nil || !strings.Contains(err.Error(), "responses_ws_transport") || !strings.Contains(err.Error(), "HTTP bridge is not supported") {
-		t.Fatalf("expected Codex http_bridge transport to fail validation, got %v", err)
 	}
 }
 
@@ -195,7 +193,7 @@ func TestValidateCodexChannelOtherRejectsUnknownOfficialPolicyKeys(t *testing.T)
 	}
 }
 
-func TestValidateChannelOtherRejectsNullAndValidatesResponsesWSNative(t *testing.T) {
+func TestValidateChannelOtherRejectsNullAndValidatesRealtimeSelfHosted(t *testing.T) {
 	nullOther := &Channel{
 		Type:  config.ChannelTypeOpenAI,
 		Other: "null",
@@ -204,12 +202,12 @@ func TestValidateChannelOtherRejectsNullAndValidatesResponsesWSNative(t *testing
 		t.Fatalf("expected literal null other to fail validation, got %v", err)
 	}
 
-	validNative := &Channel{
+	valid := &Channel{Plugin: NewCustomEndpointPlugin(),
 		Type:  config.ChannelTypeCustom,
-		Other: `{"responses_ws_native":true,"self_hosted":false,"responses_ws_self_hosted":true}`,
+		Other: `{"self_hosted":false}`,
 	}
-	if err := validNative.ValidateRuntimeConfigJSON(); err != nil {
-		t.Fatalf("expected boolean OpenAI-compatible other flags to validate, got %v", err)
+	if err := valid.ValidateRuntimeConfigJSON(); err != nil {
+		t.Fatalf("expected boolean Realtime self-hosted flag to validate, got %v", err)
 	}
 
 	cases := []struct {
@@ -218,24 +216,14 @@ func TestValidateChannelOtherRejectsNullAndValidatesResponsesWSNative(t *testing
 		contains string
 	}{
 		{
-			name:     "responses ws native string",
-			other:    `{"responses_ws_native":"true"}`,
-			contains: "other.responses_ws_native",
-		},
-		{
 			name:     "realtime self hosted string",
 			other:    `{"self_hosted":"true"}`,
 			contains: "other.self_hosted",
 		},
-		{
-			name:     "responses ws self hosted string",
-			other:    `{"responses_ws_self_hosted":"true"}`,
-			contains: "other.responses_ws_self_hosted",
-		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			invalid := &Channel{
+			invalid := &Channel{Plugin: NewCustomEndpointPlugin(),
 				Type:  config.ChannelTypeCustom,
 				Other: tc.other,
 			}
@@ -255,17 +243,17 @@ func TestValidateOpenAICompatibleOtherRejectsUnsupportedRuntimeField(t *testing.
 		{
 			name:        "openai public fields",
 			channelType: config.ChannelTypeOpenAI,
-			other:       `{"responses_ws_transport":"http_bridge","self_hosted":false,"responses_ws_self_hosted":true,"vendor_extra":{"provider":"x"}}`,
+			other:       `{"self_hosted":false,"vendor_extra":{"provider":"x"}}`,
 		},
 		{
-			name:        "custom native flag",
+			name:        "custom opaque fields",
 			channelType: config.ChannelTypeCustom,
-			other:       `{"responses_ws_native":true,"extra":{"provider":"x"}}`,
+			other:       `{"extra":{"provider":"x"}}`,
 		},
 		{
 			name:        "azure v1 public fields",
 			channelType: config.ChannelTypeAzureV1,
-			other:       `{"responses_ws_transport":"native","self_hosted":true,"responses_ws_self_hosted":false,"vendor_extra":{"provider":"azure-v1"}}`,
+			other:       `{"self_hosted":true,"vendor_extra":{"provider":"azure-v1"}}`,
 		},
 	}
 	for _, tc := range validCases {
@@ -358,10 +346,10 @@ func TestValidateAzureV1RequiresResourceLevelBaseURL(t *testing.T) {
 
 func TestValidateCustomChannelClaudePlugin(t *testing.T) {
 	validPlugin := datatypes.NewJSONType(PluginType{
-		"claude": {
-			"enabled":  true,
-			"base_url": "https://provider.example.com",
-		},
+		"endpoints": {"anthropic.messages": map[string]any{
+			"enabled":      true,
+			"upstream_url": "https://provider.example.com/v1/messages",
+		}},
 	})
 	channel := &Channel{
 		Type:   config.ChannelTypeCustom,
@@ -372,20 +360,20 @@ func TestValidateCustomChannelClaudePlugin(t *testing.T) {
 	}
 
 	invalidEnabledPlugin := datatypes.NewJSONType(PluginType{
-		"claude": {
+		"endpoints": {"anthropic.messages": map[string]any{
 			"enabled": "true",
-		},
+		}},
 	})
 	channel.Plugin = &invalidEnabledPlugin
-	if err := channel.ValidateRuntimeConfigJSON(); err == nil || !strings.Contains(err.Error(), "plugin.claude.enabled") {
+	if err := channel.ValidateRuntimeConfigJSON(); err == nil || !strings.Contains(err.Error(), "enabled") {
 		t.Fatalf("expected invalid Claude enabled flag to fail validation, got %v", err)
 	}
 
 	invalidBaseURLPlugin := datatypes.NewJSONType(PluginType{
-		"claude": {
-			"enabled":  true,
-			"base_url": "https://provider.example.com/v1/messages",
-		},
+		"endpoints": {"anthropic.messages": map[string]any{
+			"enabled":      true,
+			"upstream_url": "https://provider.example.com/v1/messages/v1/messages",
+		}},
 	})
 	channel.Plugin = &invalidBaseURLPlugin
 	if err := channel.ValidateRuntimeConfigJSON(); err != nil {
@@ -405,8 +393,8 @@ func TestValidateCodexChannelOtherRejectsUnsupportedOrInvalidFields(t *testing.T
 			contains: "other.user_agent_regex",
 		},
 		{
-			name:     "invalid websocket mode",
-			other:    `{"websocket_mode":"weird"}`,
+			name:     "removed websocket mode",
+			other:    `{"websocket_mode":"auto"}`,
 			contains: "other.websocket_mode",
 		},
 		{
@@ -415,19 +403,24 @@ func TestValidateCodexChannelOtherRejectsUnsupportedOrInvalidFields(t *testing.T
 			contains: "other.websocket_mode",
 		},
 		{
-			name:     "invalid prompt cache strategy",
-			other:    `{"prompt_cache_key_strategy":"weird"}`,
+			name:     "removed channel prompt cache strategy",
+			other:    `{"prompt_cache_key_strategy":"auto"}`,
 			contains: "other.prompt_cache_key_strategy",
 		},
 		{
-			name:     "invalid responses websocket transport",
-			other:    `{"responses_ws_transport":"auto"}`,
+			name:     "removed bridge cooldown",
+			other:    `{"websocket_retry_cooldown_seconds":300}`,
+			contains: "other.websocket_retry_cooldown_seconds",
+		},
+		{
+			name:     "removed bridge transport",
+			other:    `{"responses_ws_transport":"http_bridge"}`,
 			contains: "other.responses_ws_transport",
 		},
 		{
-			name:     "non-string responses websocket transport",
-			other:    `{"responses_ws_transport":123}`,
-			contains: "other.responses_ws_transport",
+			name:     "removed bridge capabilities",
+			other:    `{"capabilities":null}`,
+			contains: "other.capabilities",
 		},
 		{
 			name:     "non-positive execution session ttl",
@@ -465,7 +458,7 @@ func TestCanonicalizeRuntimeConfigJSONNormalizesLegacyOther(t *testing.T) {
 		t.Fatalf("expected canonicalized OpenAI other to validate, got %v", err)
 	}
 
-	custom := &Channel{Type: config.ChannelTypeCustom, Other: "legacy-custom"}
+	custom := &Channel{Plugin: NewCustomEndpointPlugin(), Type: config.ChannelTypeCustom, Other: "legacy-custom"}
 	if err := custom.CanonicalizeRuntimeConfigJSON(); err != nil {
 		t.Fatalf("expected Custom legacy other canonicalization to succeed, got %v", err)
 	}
@@ -476,23 +469,23 @@ func TestCanonicalizeRuntimeConfigJSONNormalizesLegacyOther(t *testing.T) {
 
 	codex := &Channel{Type: config.ChannelTypeCodex, Other: `{"websocket_mode":"required"}`}
 	if err := codex.CanonicalizeRuntimeConfigJSON(); err != nil {
-		t.Fatalf("expected Codex legacy websocket_mode canonicalization to succeed, got %v", err)
+		t.Fatalf("expected JSON canonicalization to preserve Codex fields for validation, got %v", err)
 	}
-	assertJSONObjectsEqual(t, codex.Other, `{"websocket_mode":"force"}`)
-	if err := codex.ValidateRuntimeConfigJSON(); err != nil {
-		t.Fatalf("expected canonicalized Codex other to validate, got %v", err)
+	assertJSONObjectsEqual(t, codex.Other, `{"websocket_mode":"required"}`)
+	if err := codex.ValidateRuntimeConfigJSON(); err == nil {
+		t.Fatal("removed Codex transport selection setting was accepted")
 	}
 }
 
 func TestCanonicalizeRuntimeConfigJSONPreservesCanonicalAndFailClosedValues(t *testing.T) {
 	canonical := &Channel{
 		Type:  config.ChannelTypeOpenAI,
-		Other: `{"responses_ws_transport":"http_bridge","vendor_extra":{"future":true}}`,
+		Other: `{"vendor_extra":{"future":true}}`,
 	}
 	if err := canonical.CanonicalizeRuntimeConfigJSON(); err != nil {
 		t.Fatalf("expected canonical OpenAI other to remain valid, got %v", err)
 	}
-	if canonical.Other != `{"responses_ws_transport":"http_bridge","vendor_extra":{"future":true}}` {
+	if canonical.Other != `{"vendor_extra":{"future":true}}` {
 		t.Fatalf("expected canonical JSON object to be preserved byte-for-byte, got %q", canonical.Other)
 	}
 
@@ -522,7 +515,7 @@ func TestCanonicalizeRuntimeConfigJSONPreservesCanonicalAndFailClosedValues(t *t
 func TestValidateAzureChannelOtherRequiresJSONAPIConfig(t *testing.T) {
 	valid := &Channel{
 		Type:  config.ChannelTypeAzure,
-		Other: `{"api_version":"2024-10-01-preview","responses_ws_transport":"http_bridge","self_hosted":true,"responses_ws_self_hosted":false,"extra":{"deployment":"x"},"vendor_extra":{"owner":"ops"}}`,
+		Other: `{"api_version":"2024-10-01-preview","self_hosted":true,"responses_ws_self_hosted":false,"extra":{"deployment":"x"},"vendor_extra":{"owner":"ops"}}`,
 	}
 	if err := valid.ValidateRuntimeConfigJSON(); err != nil {
 		t.Fatalf("expected Azure JSON other to validate, got %v", err)
@@ -531,11 +524,11 @@ func TestValidateAzureChannelOtherRequiresJSONAPIConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected Azure other parser to accept responses ws self hosted flag, got %v", err)
 	}
-	if options.ResponsesWSSelfHosted == nil || *options.ResponsesWSSelfHosted {
-		t.Fatalf("expected Azure parser to preserve explicit false responses_ws_self_hosted, got %+v", options.ResponsesWSSelfHosted)
-	}
 	if options.SelfHosted == nil || !*options.SelfHosted {
 		t.Fatalf("expected Azure parser to preserve explicit true self_hosted, got %+v", options.SelfHosted)
+	}
+	if options.ResponsesWSSelfHosted == nil || *options.ResponsesWSSelfHosted {
+		t.Fatalf("expected Azure parser to preserve explicit false responses_ws_self_hosted, got %+v", options.ResponsesWSSelfHosted)
 	}
 	apiVersion, err := valid.GetAzureAPIVersion()
 	if err != nil || apiVersion != "2024-10-01-preview" {
@@ -559,7 +552,7 @@ func TestValidateAzureChannelOtherRequiresJSONAPIConfig(t *testing.T) {
 		},
 		{
 			name:     "missing api version",
-			other:    `{"responses_ws_transport":"native"}`,
+			other:    `{}`,
 			contains: "other.api_version",
 		},
 		{
@@ -571,16 +564,6 @@ func TestValidateAzureChannelOtherRequiresJSONAPIConfig(t *testing.T) {
 			name:     "non string api version",
 			other:    `{"api_version":123}`,
 			contains: "other.api_version",
-		},
-		{
-			name:     "invalid transport",
-			other:    `{"api_version":"2024-10-01-preview","responses_ws_transport":"auto"}`,
-			contains: "other.responses_ws_transport",
-		},
-		{
-			name:     "non string transport",
-			other:    `{"api_version":"2024-10-01-preview","responses_ws_transport":123}`,
-			contains: "other.responses_ws_transport",
 		},
 		{
 			name:     "non boolean responses ws self hosted",
@@ -746,6 +729,89 @@ func TestValidateProviderKnownOtherFieldsRejectsUnsupportedRuntimeField(t *testi
 				t.Fatalf("expected unsupported provider other field error containing %q, got %v", tc.contains, err)
 			}
 		})
+	}
+}
+
+func TestValidateKnownOtherRejectsRetiredTransportSettings(t *testing.T) {
+	for _, channelType := range []int{
+		config.ChannelTypeOpenAI,
+		config.ChannelTypeCustom,
+		config.ChannelTypeGemini,
+		config.ChannelTypeAzure,
+	} {
+		for _, field := range []string{"responses_ws_transport", "capabilities"} {
+			other := `{"` + field + `":null}`
+			if channelType == config.ChannelTypeAzure {
+				other = `{"api_version":"2024-10-01-preview","` + field + `":null}`
+			}
+			channel := &Channel{Type: channelType, Other: other}
+			if err := channel.ValidateRuntimeConfigJSON(); err == nil || !strings.Contains(err.Error(), "other."+field) {
+				t.Fatalf("channel type %d must reject retired field %s, got %v", channelType, field, err)
+			}
+		}
+	}
+}
+
+func TestValidateOpenAIDataResidencyEndpointIsUnsupported(t *testing.T) {
+	for _, channelType := range []int{config.ChannelTypeOpenAI, config.ChannelTypeCustom} {
+		baseURL := "https://eu.api.openai.com/v1"
+		channel := &Channel{Type: channelType, BaseURL: &baseURL}
+		if err := channel.ValidateRuntimeConfigJSON(); err == nil || !strings.Contains(err.Error(), "data-residency") {
+			t.Fatalf("expected channel type %d data-residency endpoint to be rejected, got %v", channelType, err)
+		}
+	}
+}
+
+func TestValidateCustomChannelRejectsDataResidencyCustomizeURI(t *testing.T) {
+	baseURL := "https://compatible.example/v1"
+	for _, tc := range []struct {
+		name    string
+		uri     string
+		wantErr bool
+	}{
+		{name: "区域绝对 URI", uri: "https://eu.api.openai.com/v1/responses", wantErr: true},
+		{name: "相对 URI", uri: "/v1/responses"},
+		{name: "兼容绝对 URI", uri: "https://compatible.example/v1/responses"},
+		{name: "禁用 URI", uri: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plugin := datatypes.NewJSONType(PluginType{
+				"endpoints": {
+					"openai.responses": map[string]any{"enabled": true, "upstream_url": tc.uri},
+				},
+			})
+			channel := &Channel{Type: config.ChannelTypeCustom, BaseURL: &baseURL, Plugin: &plugin}
+			err := channel.ValidateRuntimeConfigJSON()
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "data-residency") {
+					t.Fatalf("expected regional customize URI to fail, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected customize URI %q to remain valid, got %v", tc.uri, err)
+			}
+		})
+	}
+}
+
+func TestIsOfficialOpenAIBaseURLRequiresRegisteredAuthorityAndRootPath(t *testing.T) {
+	for _, baseURL := range []string{"", "https://api.openai.com", "https://api.openai.com/", "https://api.openai.com:443", "https://API.OPENAI.COM:443/"} {
+		if !IsOfficialOpenAIBaseURL(baseURL) {
+			t.Fatalf("expected official OpenAI root endpoint: %q", baseURL)
+		}
+	}
+	for _, baseURL := range []string{
+		"http://api.openai.com",
+		"https://api.openai.com/v1",
+		"https://api.openai.com?proxy=1",
+		"https://api.openai.com:444",
+		"https://api.openai.com.evil.example",
+		"https://eu.api.openai.com",
+	} {
+		if IsOfficialOpenAIBaseURL(baseURL) {
+			t.Fatalf("unexpected exact-wire trust for %q", baseURL)
+		}
 	}
 }
 

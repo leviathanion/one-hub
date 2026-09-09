@@ -7,7 +7,7 @@ import (
 )
 
 // DiagnosticHook receives sanitized transport diagnostics from ResponsesWS
-// native and bridge adapters.
+// native adapters.
 type DiagnosticHook func(Diagnostic)
 
 // Diagnostic is safe metadata for adapter panic or transport diagnostics.
@@ -27,12 +27,6 @@ type NativeDiagnostic = Diagnostic
 
 // NativeDiagnosticHook receives native websocket diagnostics.
 type NativeDiagnosticHook = DiagnosticHook
-
-// BridgeDiagnostic is the HTTP bridge diagnostic shape.
-type BridgeDiagnostic = Diagnostic
-
-// BridgeDiagnosticHook receives HTTP bridge diagnostics.
-type BridgeDiagnosticHook = DiagnosticHook
 
 func panicClass(recovered any) string {
 	if recovered == nil {

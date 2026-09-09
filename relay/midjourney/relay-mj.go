@@ -6,102 +6,30 @@ package midjourney
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"one-api/common"
-	"one-api/common/logger"
-	"one-api/controller"
-	"one-api/model"
-	provider "one-api/providers/midjourney"
-	"one-api/relay"
-	"one-api/relay/relay_util"
-	"one-api/types"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
+	"one-api/common"
+	"one-api/middleware"
+	"one-api/model"
+	"one-api/providers"
+	provider "one-api/providers/midjourney"
+	"one-api/relay"
+	"one-api/relay/relay_util"
+	taskprogress "one-api/relay/task"
+	taskbase "one-api/relay/task/base"
+
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
-
-func RelayMidjourneyImage(c *gin.Context) {
-	taskId := c.Param("id")
-	midjourneyTask := model.GetByOnlyMJId(taskId)
-	if midjourneyTask == nil {
-		c.JSON(400, gin.H{
-			"error": "midjourney_task_not_found",
-		})
-		return
-	}
-	resp, err := http.Get(midjourneyTask.ImageUrl)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "http_get_image_failed",
-		})
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		responseBody, _ := io.ReadAll(resp.Body)
-		c.JSON(resp.StatusCode, gin.H{
-			"error": string(responseBody),
-		})
-		return
-	}
-	// 从Content-Type头获取MIME类型
-	contentType := resp.Header.Get("Content-Type")
-	if contentType == "" {
-		// 如果无法确定内容类型，则默认为jpeg
-		contentType = "image/jpeg"
-	}
-	// 设置响应的内容类型
-	c.Writer.Header().Set("Content-Type", contentType)
-	// 将图片流式传输到响应体
-	_, err = io.Copy(c.Writer, resp.Body)
-	if err != nil {
-		log.Println("Failed to stream image:", err)
-	}
-}
-
-func RelayMidjourneyNotify(c *gin.Context) *provider.MidjourneyResponse {
-	var midjRequest provider.MidjourneyDto
-	err := common.UnmarshalBodyReusable(c, &midjRequest)
-	if err != nil {
-		return &provider.MidjourneyResponse{
-			Code:        4,
-			Description: "bind_request_body_failed",
-			Properties:  nil,
-			Result:      "",
-		}
-	}
-	midjourneyTask := model.GetByOnlyMJId(midjRequest.MjId)
-	if midjourneyTask == nil {
-		return &provider.MidjourneyResponse{
-			Code:        4,
-			Description: "midjourney_task_not_found",
-			Properties:  nil,
-			Result:      "",
-		}
-	}
-	midjourneyTask.Progress = midjRequest.Progress
-	midjourneyTask.PromptEn = midjRequest.PromptEn
-	midjourneyTask.State = midjRequest.State
-	midjourneyTask.SubmitTime = midjRequest.SubmitTime
-	midjourneyTask.StartTime = midjRequest.StartTime
-	midjourneyTask.FinishTime = midjRequest.FinishTime
-	midjourneyTask.ImageUrl = midjRequest.ImageUrl
-	midjourneyTask.Status = midjRequest.Status
-	midjourneyTask.FailReason = midjRequest.FailReason
-	err = midjourneyTask.Update()
-	if err != nil {
-		return &provider.MidjourneyResponse{
-			Code:        4,
-			Description: "update_midjourney_task_failed",
-		}
-	}
-
-	return nil
-}
 
 func coverMidjourneyTaskDto(originTask *model.Midjourney) (midjourneyTask provider.MidjourneyDto) {
 	midjourneyTask.MjId = originTask.MjId
@@ -154,85 +82,39 @@ func RelaySwapFace(c *gin.Context) *provider.MidjourneyResponse {
 		return provider.MidjourneyErrorWrapper(provider.MjRequestError, "sour_base64_and_target_base64_is_required")
 	}
 
-	quotaInstance, errWithOA := getQuota(c, provider.MjActionSwapFace)
-	if errWithOA != nil {
-		return &provider.MidjourneyResponse{
-			Code:        4,
-			Description: errWithOA.Message,
-		}
-	}
 	requestURL := getMjRequestPath(c.Request.URL.String())
+	mjModelType := c.GetString("mj_model")
+	midjourneyTask := &model.Midjourney{
+		UserId: userId, TokenID: tokenId, Action: provider.MjActionSwapFace,
+		Prompt: "InsightFace", SubmitTime: startTime, Progress: "0%",
+		ChannelId: c.GetInt("channel_id"), Mode: mjModelType,
+	}
+	taskOwner, ownerErr := prepareMidjourneyTaskOwner(c, midjourneyTask, true, 0)
+	if ownerErr != nil {
+		return ownerErr
+	}
 
 	mjResp, _, err := mjProvider.Send(60, requestURL)
 	if err != nil {
-		quotaInstance.Undo(c)
-		return &mjResp.Response
-	}
-
-	defer func(ctx context.Context) {
-		if mjResp.StatusCode == 200 && mjResp.Response.Code == 1 {
-			quotaInstance.Consume(c, &types.Usage{CompletionTokens: 0, PromptTokens: 1, TotalTokens: 1}, false)
-		} else {
-			quotaInstance.Undo(c)
-		}
-	}(c.Request.Context())
-
-	quota := quotaInstance.GetTotalQuotaByUsage(&types.Usage{CompletionTokens: 0, PromptTokens: 1, TotalTokens: 1})
-
-	midjResponse := &mjResp.Response
-
-	// 如果帐号负载已满，且是fast模式，则更改为relax模式
-	mjModelType := c.GetString("mj_model")
-	if midjResponse.Code == 3 && mjModelType == "fast" {
-		logger.LogWarn(c, "当前MJ无帐号可用，尝试更改为relax模式")
-		// 退钱
-		quotaInstance.Undo(c)
-		c.Set("mj_model", "relax")
-		mjModelType = "relax"
-		quotaInstance, errWithOA = getQuota(c, provider.MjActionSwapFace)
-		if errWithOA != nil {
-			return &provider.MidjourneyResponse{
-				Code:        4,
-				Description: errWithOA.Message,
-			}
-		}
-		mjResp, _, err = mjProvider.Send(60, requestURL)
-		if err != nil {
-			quotaInstance.Undo(c)
+		closeMidjourneyTaskOwner(c, taskOwner, model.TaskStatusUnknown, err.Error())
+		if mjResp != nil {
 			return &mjResp.Response
 		}
-		quota = quotaInstance.GetTotalQuotaByUsage(&types.Usage{CompletionTokens: 0, PromptTokens: 1, TotalTokens: 1})
-
-		midjResponse = &mjResp.Response
+		return provider.MidjourneyErrorWrapper(provider.MjRequestError, "midjourney_submit_failed")
 	}
 
-	midjourneyTask := &model.Midjourney{
-		UserId:      userId,
-		TokenID:     tokenId,
-		Code:        midjResponse.Code,
-		Action:      provider.MjActionSwapFace,
-		MjId:        midjResponse.Result,
-		Prompt:      "InsightFace",
-		PromptEn:    "",
-		Description: midjResponse.Description,
-		State:       "",
-		SubmitTime:  startTime,
-		StartTime:   time.Now().UnixNano() / int64(time.Millisecond),
-		FinishTime:  0,
-		ImageUrl:    "",
-		Status:      "",
-		Progress:    "0%",
-		FailReason:  "",
-		ChannelId:   c.GetInt("channel_id"),
-		Quota:       quota,
-		Mode:        mjModelType,
+	midjResponse := &mjResp.Response
+	midjourneyTask.Code = midjResponse.Code
+	midjourneyTask.MjId = midjResponse.Result
+	midjourneyTask.Description = midjResponse.Description
+	midjourneyTask.StartTime = time.Now().UnixNano() / int64(time.Millisecond)
+	if midjResponse.Code != 1 && midjResponse.Code != 21 && midjResponse.Code != 22 {
+		closeMidjourneyTaskOwner(c, taskOwner, model.TaskStatusFailure, midjResponse.Description)
+		return midjResponse
 	}
-	err = midjourneyTask.Insert()
-	if err != nil {
-		return provider.MidjourneyErrorWrapper(provider.MjRequestError, "insert_midjourney_task_failed")
+	if acceptErr := acceptMidjourneyTaskOwner(c, taskOwner, midjourneyTask); acceptErr != nil {
+		return acceptErr
 	}
-	// 开始激活任务
-	controller.ActivateUpdateMidjourneyTaskBulk()
 
 	c.Writer.WriteHeader(mjResp.StatusCode)
 	respBody, err := json.Marshal(midjResponse)
@@ -352,11 +234,12 @@ func RelayMidjourneySubmit(c *gin.Context, relayMode int) *provider.MidjourneyRe
 	if err != nil {
 		return provider.MidjourneyErrorWrapper(provider.MjRequestError, "bind_request_body_failed")
 	}
-
-	mjProvider, errWithMJ := getMJProviderWithRequest(c, relayMode, &midjRequest)
-	if errWithMJ != nil {
-		return errWithMJ
+	if mjErr := normalizeMidjourneySubmitRequest(relayMode, &midjRequest); mjErr != nil {
+		return mjErr
 	}
+
+	var mjProvider *provider.MidjourneyProvider
+	ownerChannelID := 0
 
 	if relayMode == provider.RelayModeMidjourneyAction { // midjourney plus，需要从customId中获取任务信息
 		mjErr := CoverPlusActionToNormalAction(&midjRequest)
@@ -374,39 +257,20 @@ func RelayMidjourneySubmit(c *gin.Context, relayMode int) *provider.MidjourneyRe
 	} else if relayMode == provider.RelayModeMidjourneyDescribe { //按图生文任务，此类任务可重复
 		midjRequest.Action = provider.MjActionDescribe
 	} else if relayMode == provider.RelayModeMidjourneyShorten { //缩短任务，此类任务可重复，plus only
+		if strings.TrimSpace(midjRequest.Prompt) == "" {
+			return provider.MidjourneyErrorWrapper(provider.MjRequestError, "prompt_is_required")
+		}
 		midjRequest.Action = provider.MjActionShorten
 	} else if relayMode == provider.RelayModeMidjourneyBlend { //绘画任务，此类任务可重复
 		midjRequest.Action = provider.MjActionBlend
 	} else if relayMode == provider.RelayModeMidjourneyUpload { //绘画任务，此类任务可重复
 		midjRequest.Action = provider.MjActionUpload
-	} else if midjRequest.TaskId != "" { //放大、变换任务，此类任务，如果重复且已有结果，远端api会直接返回最终结果
-		mjId := ""
-		if relayMode == provider.RelayModeMidjourneyChange {
-			if midjRequest.TaskId == "" {
-				return provider.MidjourneyErrorWrapper(provider.MjRequestError, "task_id_is_required")
-			} else if midjRequest.Action == "" {
-				return provider.MidjourneyErrorWrapper(provider.MjRequestError, "action_is_required")
-			} else if midjRequest.Index == 0 {
-				return provider.MidjourneyErrorWrapper(provider.MjRequestError, "index_is_required")
-			}
-			//action = midjRequest.Action
-			mjId = midjRequest.TaskId
-		} else if relayMode == provider.RelayModeMidjourneySimpleChange {
-			if midjRequest.Content == "" {
-				return provider.MidjourneyErrorWrapper(provider.MjRequestError, "content_is_required")
-			}
-			params := ConvertSimpleChangeParams(midjRequest.Content)
-			if params == nil {
-				return provider.MidjourneyErrorWrapper(provider.MjRequestError, "content_parse_failed")
-			}
-			mjId = params.TaskId
-			midjRequest.Action = params.Action
-		} else if relayMode == provider.RelayModeMidjourneyModal {
-			//if midjRequest.MaskBase64 == "" {
-			//	return provider.MidjourneyErrorWrapper(provider.MjRequestError, "mask_base64_is_required")
-			//}
-			mjId = midjRequest.TaskId
-			midjRequest.Action = provider.MjActionModal
+	}
+
+	if midjourneySubmitUsesOriginTask(relayMode) { //放大、变换任务绑定原任务渠道
+		mjId, originErr := midjourneyOriginTaskID(relayMode, &midjRequest)
+		if originErr != nil {
+			return originErr
 		}
 
 		originTask := model.GetByMJId(userId, mjId)
@@ -415,17 +279,26 @@ func RelayMidjourneySubmit(c *gin.Context, relayMode int) *provider.MidjourneyRe
 		} else if originTask.Status != "SUCCESS" && relayMode != provider.RelayModeMidjourneyModal {
 			return provider.MidjourneyErrorWrapper(provider.MjRequestError, "task_status_not_success")
 		} else { //原任务的Status=SUCCESS，则可以做放大UPSCALE、变换VARIATION等动作，此时必须使用原来的请求地址才能正确处理
+			if originTask.Mode != "" {
+				mjModelType = originTask.Mode
+				c.Set("mj_model", mjModelType)
+			}
+			if apiErr := middleware.RefreshAuthenticatedLongLivedPrincipal(c); apiErr != nil {
+				return MidjourneyErrorFromInternal(provider.MjRequestError, "midjourney_work_not_allowed: "+apiErr.Message)
+			}
+			modelName := CoverActionToModelName(midjRequest.Action, mjModelType)
+			if err := middleware.EnsureTokenModelAllowed(c, modelName); err != nil {
+				c.AbortWithStatus(http.StatusNotFound)
+				return MidjourneyErrorFromInternal(provider.MjErrorUnknown, "无法获取provider:"+err.Error())
+			}
+			var errWithMJ *provider.MidjourneyResponse
 			mjProvider, errWithMJ = getMJProviderWithChannelId(c, originTask.ChannelId)
 			if errWithMJ != nil {
 				return errWithMJ
 			}
 
-			if originTask.Mode != "" {
-				mjModelType = originTask.Mode
-				c.Set("mj_model", mjModelType)
-			}
-
 			log.Printf("检测到此操作为放大、变换、重绘，获取原channel信息: %d", originTask.ChannelId)
+			ownerChannelID = originTask.ChannelId
 		}
 		midjRequest.Prompt = originTask.Prompt
 
@@ -436,6 +309,13 @@ func RelayMidjourneySubmit(c *gin.Context, relayMode int) *provider.MidjourneyRe
 		//
 		//}
 	}
+	if mjProvider == nil {
+		var errWithMJ *provider.MidjourneyResponse
+		mjProvider, errWithMJ = getMJProviderWithRequest(c, relayMode, &midjRequest)
+		if errWithMJ != nil {
+			return errWithMJ
+		}
+	}
 
 	if midjRequest.Action == provider.MjActionInPaint || midjRequest.Action == provider.MjActionCustomZoom {
 		consumeQuota = false
@@ -444,56 +324,31 @@ func RelayMidjourneySubmit(c *gin.Context, relayMode int) *provider.MidjourneyRe
 	//baseURL := common.ChannelBaseURLs[channelType]
 	requestURL := getMjRequestPath(c.Request.URL.String())
 
-	//midjRequest.NotifyHook = "http://127.0.0.1:3000/mj/notify"
-
-	quotaInstance, errWithOA := getQuota(c, midjRequest.Action)
-	if errWithOA != nil {
-		return &provider.MidjourneyResponse{
-			Code:        4,
-			Description: errWithOA.Message,
-		}
+	midjourneyTask := &model.Midjourney{
+		UserId: userId, TokenID: tokenId, Action: midjRequest.Action,
+		Prompt: midjRequest.Prompt, SubmitTime: time.Now().UnixNano() / int64(time.Millisecond),
+		Progress: "0%", ChannelId: c.GetInt("channel_id"), Mode: mjModelType,
+	}
+	taskOwner, ownerErr := prepareMidjourneyTaskOwner(c, midjourneyTask, consumeQuota, ownerChannelID)
+	if ownerErr != nil {
+		return ownerErr
 	}
 
 	midjResponseWithStatus, responseBody, err := mjProvider.Send(60, requestURL)
 	if err != nil {
-		quotaInstance.Undo(c)
-		return &midjResponseWithStatus.Response
-	}
-
-	defer func(ctx context.Context) {
-		if consumeQuota && midjResponseWithStatus.StatusCode == 200 {
-			quotaInstance.Consume(c, &types.Usage{CompletionTokens: 0, PromptTokens: 1, TotalTokens: 1}, false)
-		} else {
-			quotaInstance.Undo(c)
-		}
-	}(c.Request.Context())
-
-	quota := quotaInstance.GetTotalQuotaByUsage(&types.Usage{CompletionTokens: 0, PromptTokens: 1, TotalTokens: 1})
-
-	midjResponse := &midjResponseWithStatus.Response
-
-	// 如果帐号负载已满，且是fast模式，则更改为relax模式
-	if midjResponse.Code == 3 && mjModelType == "fast" && midjRequest.TaskId == "" {
-		logger.LogWarn(c, "当前MJ无帐号可用，尝试更改为relax模式")
-		// 退钱
-		quotaInstance.Undo(c)
-		mjModelType = "relax"
-		c.Set("mj_model", mjModelType)
-		quotaInstance, errWithOA = getQuota(c, midjRequest.Action)
-		if errWithOA != nil {
-			return &provider.MidjourneyResponse{
-				Code:        4,
-				Description: errWithOA.Message,
-			}
-		}
-
-		midjResponseWithStatus, responseBody, err = mjProvider.Send(60, requestURL)
-		if err != nil {
-			quotaInstance.Undo(c)
+		closeMidjourneyTaskOwner(c, taskOwner, model.TaskStatusUnknown, err.Error())
+		if midjResponseWithStatus != nil {
 			return &midjResponseWithStatus.Response
 		}
-		quota = quotaInstance.GetTotalQuotaByUsage(&types.Usage{CompletionTokens: 0, PromptTokens: 1, TotalTokens: 1})
-		midjResponse = &midjResponseWithStatus.Response
+		return provider.MidjourneyErrorWrapper(provider.MjRequestError, "midjourney_submit_failed")
+	}
+
+	midjResponse := &midjResponseWithStatus.Response
+	isUpload := relayMode == provider.RelayModeMidjourneyUpload
+	var uploadResponse provider.MidjourneyUploadResponse
+	uploadOK := false
+	if isUpload {
+		uploadResponse, uploadOK = parseMidjourneyUploadSuccess(responseBody)
 	}
 
 	// 文档：https://github.com/novicezk/midjourney-proxy/blob/main/docs/api.md
@@ -503,35 +358,41 @@ func RelayMidjourneySubmit(c *gin.Context, relayMode int) *provider.MidjourneyRe
 	// 23-队列已满，请稍后再试 {"code":23,"description":"队列已满，请稍后尝试","result":"14001929738841620","properties":{"discordInstanceId":"1118138338562560102"}}
 	// 24-prompt包含敏感词 {"code":24,"description":"可能包含敏感词","properties":{"promptEn":"nude body","bannedWord":"nude"}}
 	// other: 提交错误，description为错误描述
-	midjourneyTask := &model.Midjourney{
-		UserId:      userId,
-		TokenID:     tokenId,
-		Code:        midjResponse.Code,
-		Action:      midjRequest.Action,
-		MjId:        midjResponse.Result,
-		Prompt:      midjRequest.Prompt,
-		PromptEn:    "",
-		Description: midjResponse.Description,
-		State:       "",
-		SubmitTime:  time.Now().UnixNano() / int64(time.Millisecond),
-		StartTime:   0,
-		FinishTime:  0,
-		ImageUrl:    "",
-		Status:      "",
-		Progress:    "0%",
-		FailReason:  "",
-		ChannelId:   c.GetInt("channel_id"),
-		Quota:       quota,
-		Mode:        mjModelType,
+	midjourneyTask.Code = midjResponse.Code
+	midjourneyTask.MjId = midjResponse.Result
+	midjourneyTask.Description = midjResponse.Description
+
+	// 上传成功返回 URL 数组，不生成可轮询的 provider task ID。
+	if isUpload && uploadOK {
+		midjourneyTask.Code = uploadResponse.Code
+		midjourneyTask.Description = uploadResponse.Description
+		midjourneyTask.Status = string(model.TaskStatusSuccess)
+		midjourneyTask.Progress = "100%"
+		midjourneyTask.StartTime = time.Now().UnixNano() / int64(time.Millisecond)
+		midjourneyTask.FinishTime = midjourneyTask.StartTime
+		if syncErr := completeMidjourneyUploadOwner(c, taskOwner, midjourneyTask); syncErr != nil {
+			return syncErr
+		}
+	}
+	if isUpload && !uploadOK && len(bytes.TrimSpace(responseBody)) == 0 {
+		midjourneyTask.FailReason = "empty_upload_response"
+		closeMidjourneyTaskOwner(c, taskOwner, model.TaskStatusFailure, midjourneyTask.FailReason)
+		return provider.MidjourneyErrorWrapper(provider.MjRequestError, "midjourney_upload_response_invalid")
 	}
 
-	if midjResponse.Code != 1 && midjResponse.Code != 21 && midjResponse.Code != 22 {
+	if (midjResponse.Code != 1 && midjResponse.Code != 21 && midjResponse.Code != 22) || (isUpload && !uploadOK) {
 		//非1-提交成功,21-任务已存在和22-排队中，则记录错误原因
 		midjourneyTask.FailReason = midjResponse.Description
-		consumeQuota = false
+		if isUpload && midjResponse.Code == 1 {
+			midjourneyTask.FailReason = "invalid_upload_response"
+		}
+		closeMidjourneyTaskOwner(c, taskOwner, model.TaskStatusFailure, midjourneyTask.FailReason)
+		if isUpload && midjResponse.Code == 1 {
+			return provider.MidjourneyErrorWrapper(provider.MjRequestError, "midjourney_upload_response_invalid")
+		}
 	}
 
-	if midjResponse.Code == 21 { //21-任务已存在（处理中或者有结果了）
+	if !isUpload && midjResponse.Code == 21 { //21-任务已存在（处理中或者有结果了）
 		// 将 properties 转换为一个 map
 		properties, ok := midjResponse.Properties.(map[string]interface{})
 		if ok {
@@ -555,22 +416,18 @@ func RelayMidjourneySubmit(c *gin.Context, relayMode int) *provider.MidjourneyRe
 		}
 	}
 
-	if midjResponse.Code == 1 && midjRequest.Action == "UPLOAD" {
+	if !isUpload && midjResponse.Code == 1 && midjRequest.Action == "UPLOAD" {
 		midjourneyTask.Progress = "100%"
 		midjourneyTask.Status = "SUCCESS"
 	}
 
-	err = midjourneyTask.Insert()
-	if err != nil {
-		return &provider.MidjourneyResponse{
-			Code:        4,
-			Description: "insert_midjourney_task_failed",
+	if !isUpload && (midjResponse.Code == 1 || midjResponse.Code == 21 || midjResponse.Code == 22) {
+		if acceptErr := acceptMidjourneyTaskOwner(c, taskOwner, midjourneyTask); acceptErr != nil {
+			return acceptErr
 		}
 	}
-	// 开始激活任务
-	controller.ActivateUpdateMidjourneyTaskBulk()
 
-	if midjResponse.Code == 22 { //22-排队中，说明任务已存在
+	if !isUpload && midjResponse.Code == 22 { //22-排队中，说明任务已存在
 		//修改返回值
 		newBody := strings.Replace(string(responseBody), `"code":22`, `"code":1`, -1)
 		responseBody = []byte(newBody)
@@ -613,15 +470,283 @@ func getMjRequestPath(path string) string {
 	return requestURL
 }
 
-func getQuota(c *gin.Context, action string) (*relay_util.Quota, *types.OpenAIErrorWithStatusCode) {
-	model := c.GetString("mj_model")
-	modelName := CoverActionToModelName(action, model)
-	quota := relay_util.NewQuota(c, modelName, 1)
-	if err := quota.PreQuotaConsumption(); err != nil {
-		return nil, err
+func prepareMidjourneyTaskOwner(c *gin.Context, view *model.Midjourney, chargeable bool, ownerChannelID int) (*model.Task, *provider.MidjourneyResponse) {
+	if c == nil || view == nil {
+		return nil, provider.MidjourneyErrorWrapper(provider.MjRequestError, "task_owner_required")
+	}
+	modelName := CoverActionToModelName(view.Action, view.Mode)
+	if apiErr := middleware.AdmitAuthenticatedChannelWork(c, modelName, c.GetInt("channel_id")); apiErr != nil {
+		return nil, MidjourneyErrorFromInternal(provider.MjRequestError, "midjourney_work_not_allowed: "+apiErr.Message)
+	}
+	fingerprint := midjourneyTaskRequestFingerprint(c, view)
+	task := &model.Task{
+		Platform:                     model.TaskPlatformMidjourney,
+		UserId:                       c.GetInt("id"),
+		TokenID:                      c.GetInt("token_id"),
+		ChannelId:                    c.GetInt("channel_id"),
+		Action:                       view.Action,
+		Status:                       model.TaskStatusSubmitted,
+		SubmitTime:                   view.SubmitTime,
+		Progress:                     0,
+		Data:                         model.EncodeMidjourneyTaskData(view),
+		ReservedQuota:                0,
+		ProviderNamespace:            "task-platform:midjourney",
+		ProviderTaskScopeIncarnation: "provider-wide",
+		RequestFingerprint:           fingerprint,
+	}
+	if ownerChannelID > 0 && task.ChannelId != ownerChannelID {
+		return nil, provider.MidjourneyErrorWrapper(provider.MjRequestError, "midjourney_owner_channel_conflict")
+	}
+	var (
+		reserve model.BillingBalanceResult
+		err     error
+	)
+	createOwner := model.CreateTaskBillingOwner
+	if ownerChannelID > 0 {
+		createOwner = model.CreateTaskBillingOwnerForBoundChannel
+	}
+	if chargeable {
+		quota, priceErr := relay_util.NewPricedQuota(c, modelName, 1)
+		if priceErr != nil {
+			return nil, provider.MidjourneyErrorWrapper(provider.MjRequestError, "midjourney_price_unavailable")
+		}
+		reservationQuota, priceErr := quota.ReservationQuota()
+		if priceErr != nil {
+			return nil, provider.MidjourneyErrorWrapper(provider.MjRequestError, "midjourney_price_unavailable")
+		}
+		task.ReservedQuota = int64(reservationQuota)
+		admissionCtx, cancelAdmission := relay_util.BoundedBillingAdmissionContext(c.Request.Context())
+		reserve, err = createOwner(admissionCtx, task)
+		cancelAdmission()
+	} else {
+		admissionCtx, cancelAdmission := relay_util.BoundedBillingAdmissionContext(c.Request.Context())
+		reserve, err = createOwner(admissionCtx, task)
+		cancelAdmission()
+	}
+	if err != nil || reserve.Outcome != model.BillingBalanceCommitted {
+		return nil, provider.MidjourneyErrorWrapper(provider.MjRequestError, "midjourney_billing_admission_failed")
+	}
+	claimID := uuid.NewString()
+	var claim model.TaskMutationResult
+	for attempt := 0; attempt < 2; attempt++ {
+		claim, err = model.ClaimTaskSubmission(c.Request.Context(), task, claimID)
+		if claim.Outcome != model.TaskMutationDefinitelyNotApplied || err == nil {
+			break
+		}
+	}
+	if err != nil || claim.Outcome != model.TaskMutationApplied {
+		if claim.Outcome == model.TaskMutationDefinitelyNotApplied {
+			task.Status = model.TaskStatusLocalFailure
+			ownerCtx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
+			_ = taskbase.FailTaskWithSettlement(ownerCtx, task, "Midjourney submission claim failed")
+			cancel()
+		}
+		return nil, provider.MidjourneyErrorWrapper(provider.MjRequestError, "midjourney_submission_claim_failed")
+	}
+	return task, nil
+}
+
+type midjourneyFingerprintEnvelope struct {
+	Path      string `json:"path"`
+	UserID    int    `json:"user_id"`
+	ChannelID int    `json:"channel_id"`
+	Action    string `json:"action"`
+	Model     string `json:"model"`
+	Body      string `json:"body"`
+}
+
+func midjourneyTaskRequestFingerprint(c *gin.Context, view *model.Midjourney) string {
+	path := ""
+	userID := 0
+	channelID := 0
+	if c != nil {
+		userID = c.GetInt("id")
+		channelID = c.GetInt("channel_id")
+		if c.Request != nil && c.Request.URL != nil {
+			path = c.Request.URL.Path
+		}
+	}
+	if view != nil {
+		if userID == 0 {
+			userID = view.UserId
+		}
+		if channelID == 0 {
+			channelID = view.ChannelId
+		}
 	}
 
-	return quota, nil
+	// 规范化只服务于 owner 身份比较；provider 仍读取同一份 canonical body 出站。
+	requestBody, _ := common.GetCanonicalRequestBody(c)
+	canonicalBody := canonicalizeMidjourneyFingerprintJSON(requestBody)
+	envelope := midjourneyFingerprintEnvelope{
+		Path:      path,
+		UserID:    userID,
+		ChannelID: channelID,
+		Body:      string(canonicalBody),
+	}
+	if view != nil {
+		envelope.Action = view.Action
+		envelope.Model = CoverActionToModelName(view.Action, view.Mode)
+	}
+	encoded, err := json.Marshal(envelope)
+	if err != nil {
+		// The envelope contains only strings and integers, so this is defensive.
+		encoded = []byte(fmt.Sprintf("%s\x00%d\x00%d\x00%s\x00%s\x00%s", path, userID, channelID, envelope.Action, envelope.Model, envelope.Body))
+	}
+	digest := sha256.Sum256(encoded)
+	return fmt.Sprintf("%x", digest[:])
+}
+
+func canonicalizeMidjourneyFingerprintJSON(body []byte) []byte {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return body
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return body
+	}
+	canonical, err := json.Marshal(value)
+	if err != nil {
+		return body
+	}
+	return canonical
+}
+
+func acceptMidjourneyTaskOwner(c *gin.Context, task *model.Task, view *model.Midjourney) *provider.MidjourneyResponse {
+	if c == nil || task == nil || view == nil || strings.TrimSpace(view.MjId) == "" {
+		return provider.MidjourneyErrorWrapper(provider.MjRequestError, "provider_task_id_missing")
+	}
+	provisionalOwnerID := task.OwnerID
+	model.SetTaskProviderID(task, view.MjId)
+	legacyFingerprint := legacyMidjourneyTaskRequestFingerprint(c)
+	ownerCtx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
+	defer cancel()
+	var result model.TaskMutationResult
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		result, err = model.AcceptTaskSubmissionWithLegacyFingerprint(ownerCtx, task, view.MjId, legacyFingerprint)
+		if result.Outcome != model.TaskMutationDefinitelyNotApplied || err == nil {
+			break
+		}
+	}
+	if err != nil || result.Outcome != model.TaskMutationApplied {
+		if result.Outcome == model.TaskMutationCommitUnknown {
+			_, _ = model.PreserveTaskSubmissionHandle(ownerCtx, task, view.MjId)
+		}
+		return provider.MidjourneyErrorWrapper(provider.MjRequestError, "persist_midjourney_acceptance_failed")
+	}
+	if task.OwnerID != provisionalOwnerID {
+		taskprogress.ActivateUpdateTaskBulk()
+		return nil
+	}
+
+	view.Id = int(task.ID)
+	view.UserId = task.UserId
+	view.TokenID = task.TokenID
+	view.ChannelId = task.ChannelId
+	task.Data = model.EncodeMidjourneyTaskData(view)
+	task.SubmitTime = view.SubmitTime
+	task.StartTime = view.StartTime
+	task.FinishTime = view.FinishTime
+	task.FailReason = view.FailReason
+	progress := strings.TrimSuffix(strings.TrimSpace(view.Progress), "%")
+	if parsed, parseErr := strconv.Atoi(progress); parseErr == nil && parsed >= 0 && parsed <= 100 {
+		task.Progress = parsed
+	}
+	switch strings.ToUpper(strings.TrimSpace(view.Status)) {
+	case string(model.TaskStatusSuccess):
+		task.Status = model.TaskStatusSuccess
+	case string(model.TaskStatusFailure):
+		task.Status = model.TaskStatusFailure
+	case string(model.TaskStatusCancel):
+		task.Status = model.TaskStatusCancel
+	case string(model.TaskStatusQueued):
+		task.Status = model.TaskStatusQueued
+	case string(model.TaskStatusInProgress):
+		task.Status = model.TaskStatusInProgress
+	default:
+		task.Status = model.TaskStatusSubmitted
+	}
+	if task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure || task.Status == model.TaskStatusCancel {
+		task.Progress = 100
+		if _, err := taskbase.FinalizeTaskSettlement(ownerCtx, task); err != nil {
+			return provider.MidjourneyErrorWrapper(provider.MjRequestError, "finalize_midjourney_task_failed")
+		}
+	} else if _, err := model.SaveTaskPollSnapshot(ownerCtx, task, time.Now()); err != nil {
+		return provider.MidjourneyErrorWrapper(provider.MjRequestError, "persist_midjourney_snapshot_failed")
+	}
+	taskprogress.ActivateUpdateTaskBulk()
+	return nil
+}
+
+func legacyMidjourneyTaskRequestFingerprint(c *gin.Context) string {
+	path := ""
+	if c != nil && c.Request != nil && c.Request.URL != nil {
+		path = c.Request.URL.Path
+	}
+	requestBody, _ := common.GetCanonicalRequestBody(c)
+	digest := sha256.Sum256(append([]byte(path+"\x00"), requestBody...))
+	return fmt.Sprintf("%x", digest[:])
+}
+
+func parseMidjourneyUploadSuccess(responseBody []byte) (provider.MidjourneyUploadResponse, bool) {
+	var response provider.MidjourneyUploadResponse
+	if err := json.Unmarshal(responseBody, &response); err != nil || response.Code != 1 || len(response.Result) == 0 {
+		return response, false
+	}
+	for _, imageURL := range response.Result {
+		candidate := strings.TrimSpace(imageURL)
+		parsed, err := url.ParseRequestURI(candidate)
+		if candidate == "" || err != nil || !parsed.IsAbs() || parsed.Host == "" {
+			return response, false
+		}
+	}
+	return response, true
+}
+
+func completeMidjourneyUploadOwner(c *gin.Context, task *model.Task, view *model.Midjourney) *provider.MidjourneyResponse {
+	if c == nil || task == nil || view == nil || task.ID <= 0 {
+		return provider.MidjourneyErrorWrapper(provider.MjRequestError, "task_owner_required")
+	}
+	now := time.Now().UnixNano() / int64(time.Millisecond)
+	view.Id = int(task.ID)
+	view.UserId = task.UserId
+	view.TokenID = task.TokenID
+	view.ChannelId = task.ChannelId
+	view.MjId = ""
+	view.Status = string(model.TaskStatusSuccess)
+	view.Progress = "100%"
+	view.StartTime = now
+	view.FinishTime = now
+	view.FailReason = ""
+	task.Status = model.TaskStatusSuccess
+	task.Progress = 100
+	task.StartTime = now
+	task.FinishTime = now
+	task.FailReason = ""
+	task.Data = model.EncodeMidjourneyTaskData(view)
+	ownerCtx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
+	defer cancel()
+	finalized, err := taskbase.FinalizeTaskSettlement(ownerCtx, task)
+	if err != nil || !finalized.Handled {
+		return provider.MidjourneyErrorWrapper(provider.MjRequestError, "finalize_midjourney_upload_failed")
+	}
+	return nil
+}
+
+func closeMidjourneyTaskOwner(c *gin.Context, task *model.Task, status model.TaskStatus, reason string) {
+	if c == nil || task == nil {
+		return
+	}
+	task.Status = status
+	task.FailReason = reason
+	task.Progress = 100
+	ownerCtx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
+	_ = taskbase.FailTaskWithSettlement(ownerCtx, task, reason)
+	cancel()
 }
 
 func getMJProviderWithRequest(c *gin.Context, relayMode int, request *provider.MidjourneyRequest) (*provider.MidjourneyProvider, *provider.MidjourneyResponse) {
@@ -638,9 +763,21 @@ func getMJProviderWithRequest(c *gin.Context, relayMode int, request *provider.M
 }
 
 func getMJProviderWithChannelId(c *gin.Context, channelId int) (*provider.MidjourneyProvider, *provider.MidjourneyResponse) {
-	c.Set("specific_channel_id", channelId)
-
-	return getMJProvider(c, "")
+	channel, err := model.GetChannelIncarnationByID(c.Request.Context(), channelId)
+	if err != nil {
+		return nil, MidjourneyErrorFromInternal(provider.MjErrorUnknown, "无法读取任务 owner 渠道")
+	}
+	if err := channel.ValidateRuntimeConfigJSON(); err != nil {
+		return nil, MidjourneyErrorFromInternal(provider.MjErrorUnknown, "任务 owner 渠道配置无效")
+	}
+	baseProvider := providers.GetProvider(channel, c)
+	midjourneyProvider, ok := baseProvider.(*provider.MidjourneyProvider)
+	if !ok {
+		return nil, MidjourneyErrorFromInternal(provider.MjErrorUnknown, "任务 owner 渠道 provider 无效")
+	}
+	c.Set("channel_id", channelId)
+	c.Set("channel_type", channel.Type)
+	return midjourneyProvider, nil
 }
 
 func getMJProvider(c *gin.Context, modelName string) (*provider.MidjourneyProvider, *provider.MidjourneyResponse) {

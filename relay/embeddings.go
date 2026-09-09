@@ -33,6 +33,7 @@ func (r *relayEmbeddings) setRequest() error {
 	}
 
 	r.setOriginalModel(r.request.Model)
+	setRequestChannelCapability(r.c, requireEndpointEnabled(config.RelayModeEmbeddings))
 
 	return nil
 }
@@ -50,14 +51,12 @@ func (r *relayEmbeddings) send() (err *types.OpenAIErrorWithStatusCode, done boo
 	}
 
 	// 内容审查
-	if config.EnableSafe {
-		if r.request.Input != nil {
-			CheckResult, _ := safty.CheckContent(r.request)
-			if !CheckResult.IsSafe {
-				err = common.StringErrorWrapperLocal(CheckResult.Reason, CheckResult.Code, http.StatusBadRequest)
-				done = true
-				return
-			}
+	if r.request.Input != nil {
+		CheckResult, _ := safty.CheckContent(r.request)
+		if !CheckResult.IsSafe {
+			err = common.StringErrorWrapperLocal(CheckResult.Reason, CheckResult.Code, http.StatusBadRequest)
+			done = true
+			return
 		}
 	}
 

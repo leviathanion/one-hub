@@ -12,6 +12,10 @@ import (
 // 定义供应商工厂
 type OpenRouterProviderFactory struct{}
 
+func (OpenRouterProviderFactory) AssessChatRemoteMedia(_ *model.Channel, _ *types.ChatCompletionRequest, _ base.ChatRemoteMediaSummary) (base.RemoteMediaMode, error) {
+	return base.RemoteMediaPassURL, nil
+}
+
 // 创建 OpenRouterProvider
 // https://platform.-ai.com/docs/api
 func (f OpenRouterProviderFactory) Create(channel *model.Channel) base.ProviderInterface {

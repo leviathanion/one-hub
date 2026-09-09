@@ -52,7 +52,7 @@ func codexTestMeta(t *testing.T, provider *CodexProvider) runtimesession.Metadat
 func TestCodexPlanRealtimeOpenBranches(t *testing.T) {
 	t.Run("miss publishes create_if_absent", func(t *testing.T) {
 		manager, _, _ := newCodexFakeRedisManager(t)
-		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, map[string]string{"X-Session-Id": "plan-miss"})
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{}`, map[string]string{"X-Session-Id": "plan-miss"})
 		provider.Context.Set("token_id", 401)
 		meta := codexTestMeta(t, provider)
 
@@ -64,7 +64,7 @@ func TestCodexPlanRealtimeOpenBranches(t *testing.T) {
 
 	t.Run("compatible hit resumes existing candidate", func(t *testing.T) {
 		manager, _, _ := newCodexFakeRedisManager(t)
-		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, map[string]string{"X-Session-Id": "plan-hit"})
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{}`, map[string]string{"X-Session-Id": "plan-hit"})
 		provider.Context.Set("token_id", 402)
 		meta := codexTestMeta(t, provider)
 		binding := (&runtimesession.ExecutionSession{
@@ -86,7 +86,7 @@ func TestCodexPlanRealtimeOpenBranches(t *testing.T) {
 
 	t.Run("compatible hit with unknown revocation avoids resume", func(t *testing.T) {
 		manager, server, _ := newCodexFakeRedisManager(t)
-		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, map[string]string{"X-Session-Id": "plan-unknown-revocation"})
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{}`, map[string]string{"X-Session-Id": "plan-unknown-revocation"})
 		provider.Context.Set("token_id", 403)
 		meta := codexTestMeta(t, provider)
 		if status := manager.CreateBindingIfAbsent((&runtimesession.ExecutionSession{
@@ -108,7 +108,7 @@ func TestCodexPlanRealtimeOpenBranches(t *testing.T) {
 
 	t.Run("incompatible hit plans replace_if_matches", func(t *testing.T) {
 		manager, _, prefix := newCodexFakeRedisManager(t)
-		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, map[string]string{"X-Session-Id": "plan-incompatible"})
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{}`, map[string]string{"X-Session-Id": "plan-incompatible"})
 		provider.Context.Set("token_id", 404)
 		meta := codexTestMeta(t, provider)
 		incompatible := (&runtimesession.ExecutionSession{
@@ -130,7 +130,7 @@ func TestCodexPlanRealtimeOpenBranches(t *testing.T) {
 
 	t.Run("backend error returns empty plan", func(t *testing.T) {
 		_, server, _ := newCodexFakeRedisManager(t)
-		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, map[string]string{"X-Session-Id": "plan-backend-error"})
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{}`, map[string]string{"X-Session-Id": "plan-backend-error"})
 		provider.Context.Set("token_id", 405)
 		meta := codexTestMeta(t, provider)
 		server.FailNext("GET", "ERR forced get failure")
@@ -143,7 +143,7 @@ func TestCodexPlanRealtimeOpenBranches(t *testing.T) {
 
 	t.Run("revoked compatible hit plans legal replace", func(t *testing.T) {
 		manager, server, prefix := newCodexFakeRedisManager(t)
-		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, map[string]string{"X-Session-Id": "plan-revoked"})
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{}`, map[string]string{"X-Session-Id": "plan-revoked"})
 		provider.Context.Set("token_id", 406)
 		meta := codexTestMeta(t, provider)
 		binding := (&runtimesession.ExecutionSession{
@@ -168,7 +168,7 @@ func TestCodexPlanRealtimeOpenBranches(t *testing.T) {
 func TestCodexPlanForceFreshRealtimeOpenBranches(t *testing.T) {
 	t.Run("miss publishes create_if_absent", func(t *testing.T) {
 		_, _, _ = newCodexFakeRedisManager(t)
-		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, map[string]string{"X-Session-Id": "force-fresh-miss"})
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{}`, map[string]string{"X-Session-Id": "force-fresh-miss"})
 		provider.Context.Set("token_id", 407)
 		meta := codexTestMeta(t, provider)
 		if plan := provider.planForceFreshRealtimeOpen(meta); plan.publishIntent != runtimesession.PublishIntentCreateIfAbsent {
@@ -178,7 +178,7 @@ func TestCodexPlanForceFreshRealtimeOpenBranches(t *testing.T) {
 
 	t.Run("hit revokes shared binding and deletes local session", func(t *testing.T) {
 		manager, _, _ := newCodexFakeRedisManager(t)
-		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, map[string]string{"X-Session-Id": "force-fresh-hit"})
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{}`, map[string]string{"X-Session-Id": "force-fresh-hit"})
 		provider.Context.Set("token_id", 408)
 		meta := codexTestMeta(t, provider)
 		sess, _, err := manager.GetOrCreate(meta)
@@ -200,7 +200,7 @@ func TestCodexPlanForceFreshRealtimeOpenBranches(t *testing.T) {
 
 	t.Run("backend error returns empty plan", func(t *testing.T) {
 		_, server, _ := newCodexFakeRedisManager(t)
-		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, map[string]string{"X-Session-Id": "force-fresh-backend-error"})
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{}`, map[string]string{"X-Session-Id": "force-fresh-backend-error"})
 		provider.Context.Set("token_id", 409)
 		meta := codexTestMeta(t, provider)
 		server.FailNext("GET", "ERR forced get failure")
@@ -214,7 +214,7 @@ func TestCodexPlanForceFreshRealtimeOpenBranches(t *testing.T) {
 func TestCodexMaybePromoteExecutionSessionBranches(t *testing.T) {
 	t.Run("backend error leaves session local_only", func(t *testing.T) {
 		manager, server, _ := newCodexFakeRedisManager(t)
-		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, map[string]string{"X-Session-Id": "promote-backend-error"})
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{}`, map[string]string{"X-Session-Id": "promote-backend-error"})
 		provider.Context.Set("token_id", 410)
 		meta := codexTestMeta(t, provider)
 		exec, _, err := manager.GetOrCreate(meta)
@@ -236,7 +236,7 @@ func TestCodexMaybePromoteExecutionSessionBranches(t *testing.T) {
 
 	t.Run("existing shared binding marks session shared", func(t *testing.T) {
 		manager, _, _ := newCodexFakeRedisManager(t)
-		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, map[string]string{"X-Session-Id": "promote-shared"})
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{}`, map[string]string{"X-Session-Id": "promote-shared"})
 		provider.Context.Set("token_id", 411)
 		meta := codexTestMeta(t, provider)
 		exec, _, err := manager.GetOrCreate(meta)
@@ -261,7 +261,7 @@ func TestCodexMaybePromoteExecutionSessionBranches(t *testing.T) {
 
 	t.Run("create_if_absent conflict stops republish", func(t *testing.T) {
 		manager, _, _ := newCodexFakeRedisManager(t)
-		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, map[string]string{"X-Session-Id": "promote-create-conflict"})
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{}`, map[string]string{"X-Session-Id": "promote-create-conflict"})
 		provider.Context.Set("token_id", 412)
 		meta := codexTestMeta(t, provider)
 		exec, _, err := manager.GetOrCreate(meta)
@@ -286,7 +286,7 @@ func TestCodexMaybePromoteExecutionSessionBranches(t *testing.T) {
 
 	t.Run("replace_if_matches success promotes to shared", func(t *testing.T) {
 		manager, _, _ := newCodexFakeRedisManager(t)
-		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, map[string]string{"X-Session-Id": "promote-replace-success"})
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{}`, map[string]string{"X-Session-Id": "promote-replace-success"})
 		provider.Context.Set("token_id", 413)
 		meta := codexTestMeta(t, provider)
 		exec, _, err := manager.GetOrCreate(meta)
@@ -312,7 +312,7 @@ func TestCodexMaybePromoteExecutionSessionBranches(t *testing.T) {
 
 	t.Run("replace_if_matches mismatch stops republish", func(t *testing.T) {
 		manager, _, _ := newCodexFakeRedisManager(t)
-		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, map[string]string{"X-Session-Id": "promote-replace-mismatch"})
+		provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{}`, map[string]string{"X-Session-Id": "promote-replace-mismatch"})
 		provider.Context.Set("token_id", 414)
 		meta := codexTestMeta(t, provider)
 		exec, _, err := manager.GetOrCreate(meta)
@@ -338,7 +338,7 @@ func TestCodexMaybePromoteExecutionSessionBranches(t *testing.T) {
 
 func TestCodexAcquireLocalOnlyExecutionSessionBranches(t *testing.T) {
 	manager, _, _ := newCodexFakeRedisManager(t)
-	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, map[string]string{"X-Session-Id": "acquire-local-only"})
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{}`, map[string]string{"X-Session-Id": "acquire-local-only"})
 	provider.Context.Set("token_id", 415)
 	meta := codexTestMeta(t, provider)
 
@@ -380,7 +380,7 @@ func TestCodexAcquireLocalOnlyExecutionSessionBranches(t *testing.T) {
 func TestExecutionSessionStatsUsesConfiguredRedisBackend(t *testing.T) {
 	manager, _, _ := newCodexFakeRedisManager(t)
 
-	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, map[string]string{"X-Session-Id": "stats"})
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{}`, map[string]string{"X-Session-Id": "stats"})
 	provider.Context.Set("token_id", 416)
 	meta := codexTestMeta(t, provider)
 	if exec, _, err := manager.GetOrCreate(meta); err != nil {
@@ -484,7 +484,7 @@ func TestCodexRealtimeSessionIDAndErrorHelpers(t *testing.T) {
 func TestCodexRealtimeAdminAndIdentityHelpers(t *testing.T) {
 	manager, _, _ := newCodexFakeRedisManager(t)
 
-	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_retry_cooldown_seconds":15,"websocket_mode":"weird"}`, map[string]string{"X-Session-Id": "admin-stats"})
+	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{}`, map[string]string{"X-Session-Id": "admin-stats"})
 	provider.Context.Set("token_id", 417)
 	meta := codexTestMeta(t, provider)
 	if exec, _, err := manager.GetOrCreate(meta); err != nil {
@@ -496,12 +496,6 @@ func TestCodexRealtimeAdminAndIdentityHelpers(t *testing.T) {
 		t.Fatalf("expected admin stats wrapper to reflect redis backend, got %+v", stats)
 	}
 
-	if got := provider.getWebsocketRetryCooldown(); got != 15*time.Second {
-		t.Fatalf("expected websocket retry cooldown from channel options, got %s", got)
-	}
-	if got := provider.getWebsocketMode(); got != codexWebsocketModeAuto {
-		t.Fatalf("expected invalid websocket mode to normalize to auto, got %q", got)
-	}
 	if got := (*CodexProvider)(nil).readRealtimeCallerNamespace(); got != "anonymous" {
 		t.Fatalf("expected nil provider caller namespace to be anonymous, got %q", got)
 	}
@@ -512,19 +506,19 @@ func TestCodexRealtimeAdminAndIdentityHelpers(t *testing.T) {
 		t.Fatalf("expected nil provider credential identity fallback, got %q", got)
 	}
 
-	accountProvider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"websocket_mode":"off"}`, nil)
+	accountProvider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{}`, nil)
 	if got := accountProvider.readRealtimeCredentialIdentity(); got != "account:acct-123" {
 		t.Fatalf("expected account credential identity, got %q", got)
 	}
-	refreshProvider := newTestCodexProviderWithContext(t, `{"refresh_token":"refresh-secret"}`, `{"websocket_mode":"off"}`, nil)
+	refreshProvider := newTestCodexProviderWithContext(t, `{"refresh_token":"refresh-secret"}`, `{}`, nil)
 	if got := refreshProvider.readRealtimeCredentialIdentity(); !strings.HasPrefix(got, "refresh:") {
 		t.Fatalf("expected refresh-token credential identity, got %q", got)
 	}
-	accessProvider := newTestCodexProviderWithContext(t, `{"access_token":"access-secret"}`, `{"websocket_mode":"off"}`, nil)
+	accessProvider := newTestCodexProviderWithContext(t, `{"access_token":"access-secret"}`, `{}`, nil)
 	if got := accessProvider.readRealtimeCredentialIdentity(); !strings.HasPrefix(got, "access:") {
 		t.Fatalf("expected access-token credential identity, got %q", got)
 	}
-	channelKeyProvider := newTestCodexProviderWithContext(t, `{"access_token":"access-token"}`, `{"websocket_mode":"off"}`, nil)
+	channelKeyProvider := newTestCodexProviderWithContext(t, `{"access_token":"access-token"}`, `{}`, nil)
 	channelKeyProvider.Credentials = nil
 	channelKeyProvider.Channel.Key = "channel-secret"
 	if got := channelKeyProvider.readRealtimeCredentialIdentity(); !strings.HasPrefix(got, "channel_key:") {

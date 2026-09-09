@@ -3,6 +3,7 @@ package relay
 import (
 	"net/http"
 	"one-api/common"
+	"one-api/common/config"
 	providersBase "one-api/providers/base"
 	"one-api/types"
 
@@ -26,6 +27,7 @@ func (r *relayTranslations) setRequest() error {
 	}
 
 	r.setOriginalModel(r.request.Model)
+	setRequestChannelCapability(r.c, requireEndpointEnabled(config.RelayModeAudioTranslation))
 
 	return nil
 }
@@ -48,7 +50,7 @@ func (r *relayTranslations) send() (err *types.OpenAIErrorWithStatusCode, done b
 	if err != nil {
 		return
 	}
-	err = responseCustom(r.c, response)
+	err = responseCustom(r.c, response, providersBase.OperationAudioTranslation)
 
 	if err != nil {
 		done = true

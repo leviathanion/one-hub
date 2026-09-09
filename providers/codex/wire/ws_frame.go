@@ -12,7 +12,6 @@ import (
 type FramePatchInput struct {
 	Identity                           Identity
 	Model                              string
-	DefaultPreviousResponseID          string
 	ResponsesLite                      bool
 	AutoGenerateWSStreamRequestStartMS bool
 	Clock                              Clock
@@ -33,14 +32,6 @@ func PlanResponsesWSFrame(frame *responsesws.RawResponsesCreateFrame, in FramePa
 		return nil, err
 	}
 	object["model"] = encodedModel
-	if _, exists := object["previous_response_id"]; !exists && strings.TrimSpace(in.DefaultPreviousResponseID) != "" {
-		encodedPrevious, err := json.Marshal(strings.TrimSpace(in.DefaultPreviousResponseID))
-		if err != nil {
-			return nil, err
-		}
-		object["previous_response_id"] = encodedPrevious
-	}
-
 	metadata, err := MetadataFromResponsesFrame(frame)
 	if err != nil {
 		return nil, err

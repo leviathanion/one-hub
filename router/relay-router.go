@@ -35,12 +35,15 @@ func setOpenAIRouter(router *gin.Engine) {
 	relayV1Shared.Use(middleware.RelayPanicRecover(), middleware.OpenaiAuth(), middleware.Distribute())
 	{
 		relayV1Shared.GET("/responses", relay.ResponsesWebSocket)
+		relayV1Shared.GET("/realtime", relay.ChatRealtime)
 	}
 
 	relayV1Router := relayV1Shared.Group("")
 	relayV1Router.Use(middleware.DynamicRedisRateLimiter())
 	{
-		relayV1Router.GET("/realtime", relay.ChatRealtime)
+		relayV1Router.GET("/responses/:response_id", relay.StoredResponses)
+		relayV1Router.DELETE("/responses/:response_id", relay.StoredResponses)
+		relayV1Router.GET("/responses/:response_id/input_items", relay.StoredResponses)
 	}
 
 	// Trade-off: only structured relay endpoints opt into request-body decode.
@@ -53,6 +56,7 @@ func setOpenAIRouter(router *gin.Engine) {
 		structuredRelayV1Router.POST("/chat/completions", relay.Relay)
 		structuredRelayV1Router.POST("/responses", relay.Relay)
 		structuredRelayV1Router.POST("/responses/compact", relay.Relay)
+		structuredRelayV1Router.POST("/responses/input_tokens", relay.Relay)
 		// structuredRelayV1Router.POST("/edits", controller.Relay)
 		structuredRelayV1Router.POST("/images/generations", relay.Relay)
 		structuredRelayV1Router.POST("/images/edits", relay.Relay)
@@ -81,9 +85,21 @@ func setOpenAIRouter(router *gin.Engine) {
 		rawRelayV1Router.Any("/assistants/*any", relay.RelayOnly)
 		rawRelayV1Router.Any("/threads", relay.RelayOnly)
 		rawRelayV1Router.Any("/threads/*any", relay.RelayOnly)
+		rawRelayV1Router.Any("/batches", relay.RelayOnly)
 		rawRelayV1Router.Any("/batches/*any", relay.RelayOnly)
-		rawRelayV1Router.Any("/vector_stores/*any", relay.RelayOnly)
 		rawRelayV1Router.DELETE("/models/:model", relay.RelayOnly)
+	}
+
+	unsupportedRelayV1Router := relayV1Router.Group("")
+	{
+		unsupportedRelayV1Router.POST("/responses/:response_id/cancel", relay.UnsupportedCapability("operation", "response cancellation is not supported"))
+		unsupportedRelayV1Router.POST("/responses/:response_id/resume", relay.UnsupportedCapability("operation", "response resumption is not supported"))
+		unsupportedRelayV1Router.Any("/uploads", relay.UnsupportedCapability("uploads", "upload lifecycle is not supported"))
+		unsupportedRelayV1Router.Any("/uploads/*any", relay.UnsupportedCapability("uploads", "upload lifecycle is not supported"))
+		unsupportedRelayV1Router.Any("/conversations", relay.UnsupportedCapability("conversations", "conversation lifecycle is not supported"))
+		unsupportedRelayV1Router.Any("/conversations/*any", relay.UnsupportedCapability("conversations", "conversation lifecycle is not supported"))
+		unsupportedRelayV1Router.Any("/vector_stores", relay.UnsupportedCapabilityUnlessSpecifiedChannel("vector_stores", "vector store lifecycle is not supported"))
+		unsupportedRelayV1Router.Any("/vector_stores/*any", relay.UnsupportedCapabilityUnlessSpecifiedChannel("vector_stores", "vector store lifecycle is not supported"))
 	}
 }
 
@@ -99,7 +115,6 @@ func setMJRouter(router *gin.Engine) {
 // GitHub: https://github.com/Calcium-Ion/new-api
 // Path: router/relay-router.go
 func registerMjRouterGroup(relayMjRouter *gin.RouterGroup) {
-	relayMjRouter.GET("/image/:id", midjourney.RelayMidjourneyImage)
 	relayMjRouter.Use(middleware.RelayMJPanicRecover(), middleware.MjAuth(), middleware.Distribute(), middleware.DynamicRedisRateLimiter())
 	{
 		relayMjRouter.GET("/task/:id/fetch", midjourney.RelayMidjourney)
@@ -117,7 +132,6 @@ func registerMjRouterGroup(relayMjRouter *gin.RouterGroup) {
 		structuredRelayMjRouter.POST("/submit/simple-change", midjourney.RelayMidjourney)
 		structuredRelayMjRouter.POST("/submit/describe", midjourney.RelayMidjourney)
 		structuredRelayMjRouter.POST("/submit/blend", midjourney.RelayMidjourney)
-		structuredRelayMjRouter.POST("/notify", midjourney.RelayMidjourney)
 		structuredRelayMjRouter.POST("/task/list-by-condition", midjourney.RelayMidjourney)
 		structuredRelayMjRouter.POST("/insight-face/swap", midjourney.RelayMidjourney)
 		structuredRelayMjRouter.POST("/submit/upload-discord-images", midjourney.RelayMidjourney)

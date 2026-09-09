@@ -3,6 +3,7 @@ package relay
 import (
 	"net/http"
 	"one-api/common"
+	"one-api/common/config"
 	providersBase "one-api/providers/base"
 	"one-api/types"
 
@@ -30,6 +31,7 @@ func (r *relayModerations) setRequest() error {
 	}
 
 	r.setOriginalModel(r.request.Model)
+	setRequestChannelCapability(r.c, requireEndpointEnabled(config.RelayModeModerations))
 
 	return nil
 }

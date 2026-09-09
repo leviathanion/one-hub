@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"strings"
 	"testing"
-	"time"
 
 	"one-api/common/cache"
 	"one-api/common/config"
@@ -164,7 +163,7 @@ func TestGetCodexChannelUsageDebugRawRequestsRawSnapshot(t *testing.T) {
 	}
 }
 
-func TestConsumeCodexResetCreditAllowsTaggedChannelsAndClearsCache(t *testing.T) {
+func TestConsumeCodexResetCreditAllowsTaggedChannelsAndRotatesUsageGeneration(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	cache.InitCacheManager()
 
@@ -176,11 +175,9 @@ func TestConsumeCodexResetCreditAllowsTaggedChannelsAndClearsCache(t *testing.T)
 	})
 
 	channelID := 7
-	if err := cache.SetCache("codex:usage:preview:7", "cached-preview", time.Minute); err != nil {
-		t.Fatalf("failed to seed preview cache: %v", err)
-	}
-	if err := cache.SetCache("codex:usage:detail:7", "cached-detail", time.Minute); err != nil {
-		t.Fatalf("failed to seed detail cache: %v", err)
+	initialGeneration, err := cache.GetOrInitCodexUsageGeneration(channelID)
+	if err != nil {
+		t.Fatalf("initialize usage generation: %v", err)
 	}
 
 	provider := &fakeCodexUsageProvider{
@@ -233,11 +230,9 @@ func TestConsumeCodexResetCreditAllowsTaggedChannelsAndClearsCache(t *testing.T)
 	if resp.Data == nil || resp.Data.ChannelID != channelID || resp.Data.WindowsReset != 1 {
 		t.Fatalf("expected reset result payload, got %+v", resp.Data)
 	}
-	if _, err := cache.GetCache[string]("codex:usage:preview:7"); !errors.Is(err, cache.CacheNotFound) {
-		t.Fatalf("expected preview cache to be cleared, got err=%v", err)
-	}
-	if _, err := cache.GetCache[string]("codex:usage:detail:7"); !errors.Is(err, cache.CacheNotFound) {
-		t.Fatalf("expected detail cache to be cleared, got err=%v", err)
+	currentGeneration, err := cache.GetOrInitCodexUsageGeneration(channelID)
+	if err != nil || currentGeneration == "" || currentGeneration == initialGeneration {
+		t.Fatalf("usage generation was not rotated after reset: before=%q after=%q err=%v", initialGeneration, currentGeneration, err)
 	}
 }
 
@@ -245,9 +240,6 @@ func TestConsumeCodexResetCreditReportsCacheFailureAsWarningAfterUpstreamSuccess
 	gin.SetMode(gin.TestMode)
 	cache.InitCacheManager()
 	channelID := 8
-	if err := cache.SetCache("codex:usage:preview:8", "legacy", time.Minute); err != nil {
-		t.Fatalf("failed to seed legacy cache: %v", err)
-	}
 
 	originalLoad := loadCodexUsageChannelByID
 	originalCreate := createCodexUsageProvider
@@ -278,9 +270,6 @@ func TestConsumeCodexResetCreditReportsCacheFailureAsWarningAfterUpstreamSuccess
 	}
 	if !response.Success || !strings.Contains(response.Warning, "cache unavailable") {
 		t.Fatalf("irreversible upstream success must remain successful with warning, body=%s", recorder.Body.String())
-	}
-	if _, err := cache.GetCache[string]("codex:usage:preview:8"); !errors.Is(err, cache.CacheNotFound) {
-		t.Fatalf("legacy cleanup must still execute after v2 failure, got %v", err)
 	}
 }
 

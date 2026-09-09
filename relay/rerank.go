@@ -1,12 +1,10 @@
 package relay
 
 import (
-	"fmt"
 	"net/http"
 	"one-api/common"
-	"one-api/common/config"
-	"one-api/common/logger"
 	"one-api/common/surface"
+	"one-api/metrics"
 	providersBase "one-api/providers/base"
 	"one-api/types"
 
@@ -31,47 +29,18 @@ func RelayRerank(c *gin.Context) {
 		return
 	}
 
-	apiErr, done := RelayHandler(relay)
+	apiErr, _ := RelayHandler(relay)
 	if apiErr == nil {
+		metrics.RecordProvider(c, http.StatusOK)
 		return
 	}
 
 	channel := relay.getProvider().GetChannel()
-	go processChannelRelayError(c.Request.Context(), channel.Id, channel.Name, apiErr, channel.Type)
+	observeRelayProviderFailure(c, channel, apiErr)
 
-	retryTimes := config.RetryTimes
-	if done || !shouldRetry(c, apiErr, channel.Type) {
-		logger.LogError(c.Request.Context(), fmt.Sprintf("relay error happen, status code is %d, won't retry in this case", apiErr.StatusCode))
-		retryTimes = 0
-	}
-
-	for i := retryTimes; i > 0; i-- {
-		// 冻结通道
-		shouldCooldowns(c, channel, apiErr)
-		if err := relay.setProvider(relay.getOriginalModel()); err != nil {
-			continue
-		}
-
-		channel = relay.getProvider().GetChannel()
-		logger.LogError(c.Request.Context(), fmt.Sprintf("using channel #%d(%s) to retry (remain times %d)", channel.Id, channel.Name, i))
-		apiErr, done = RelayHandler(relay)
-		if apiErr == nil {
-			return
-		}
-		go processChannelRelayError(c.Request.Context(), channel.Id, channel.Name, apiErr, channel.Type)
-		if done || !shouldRetry(c, apiErr, channel.Type) {
-			break
-		}
-	}
-
-	if apiErr != nil {
-		if apiErr.StatusCode == http.StatusTooManyRequests {
-			apiErr.OpenAIError.Message = "当前分组上游负载已饱和，请稍后再试"
-		}
-		surfaceErr := surface.FromOpenAIError(apiErr)
-		surface.LogLocalError(c, surfaceErr)
-		contract.RenderJSONError(c, surfaceErr)
-	}
+	surfaceErr := surface.FromOpenAIError(apiErr)
+	surface.LogLocalError(c, surfaceErr)
+	contract.RenderJSONError(c, surfaceErr)
 }
 
 type relayRerank struct {

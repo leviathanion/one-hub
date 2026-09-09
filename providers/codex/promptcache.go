@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	"one-api/common/authutil"
-	"one-api/internal/requesthints"
 	runtimesession "one-api/runtime/session"
 	"one-api/types"
 
@@ -49,19 +48,6 @@ func promptCacheKeyForRequestStrategy(request *types.OpenAIResponsesRequest, ctx
 		}
 	}
 	return promptCacheKeyForStrategy(ctx, strategy)
-}
-
-func ensureStablePromptCacheKey(request *types.OpenAIResponsesRequest, ctx *gin.Context, strategy string) {
-	if request == nil || strings.TrimSpace(request.PromptCacheKey) != "" {
-		return
-	}
-
-	if resolvedHint := requesthints.Get(ctx, requesthints.ResponsesPromptCacheKey); resolvedHint != "" {
-		request.PromptCacheKey = resolvedHint
-		return
-	}
-
-	request.PromptCacheKey = promptCacheKeyForRequestStrategy(request, ctx, strategy)
 }
 
 func requestPreviousResponseID(request *types.OpenAIResponsesRequest) string {

@@ -151,6 +151,18 @@ func ReconcilePendingCredentials(ctx context.Context) error {
 // prevents a request from consuming the stale durable refresh token while a
 // rotated successor still awaits commit.
 func (p *CodexProvider) commitPendingCredentials(ctx context.Context) error {
+	if p == nil {
+		return nil
+	}
+	p.credentialsMu.Lock()
+	defer p.credentialsMu.Unlock()
+	return p.commitPendingCredentialsWithCredentialLock(ctx)
+}
+
+// commitPendingCredentialsWithCredentialLock requires the caller to hold
+// credentialsMu. It serializes recovery with request-triggered OAuth rotation,
+// so the durable winner and the published in-memory snapshot cannot interleave.
+func (p *CodexProvider) commitPendingCredentialsWithCredentialLock(ctx context.Context) error {
 	if p == nil || p.channelID() <= 0 {
 		return nil
 	}

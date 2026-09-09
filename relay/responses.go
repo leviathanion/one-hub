@@ -1,16 +1,23 @@
 package relay
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"one-api/common"
 	"one-api/common/logger"
+	"one-api/common/providerresponse"
 	"one-api/common/requestctx"
 	"one-api/common/requester"
 	commonresponses "one-api/common/responses"
 	"one-api/internal/requesthints"
+	"one-api/middleware"
+	"one-api/model"
+	"one-api/providers"
 	providersBase "one-api/providers/base"
 	"one-api/relay/relay_util"
+	runtimesession "one-api/runtime/session"
 	"one-api/types"
 	"strings"
 	"time"
@@ -20,16 +27,18 @@ import (
 
 type relayResponses struct {
 	relayBase
-	responsesRequest types.OpenAIResponsesRequest
-	rawEnvelope      *commonresponses.RawEnvelope
-	operation        responsesOperation
+	responsesRequest    types.OpenAIResponsesRequest
+	preparedChatRequest *types.ChatCompletionRequest
+	rawEnvelope         *commonresponses.RawEnvelope
+	operation           responsesOperation
+	strictOwnerRoute    bool
+	selectedDataPath    providersBase.DataPath
 }
 
 const responsesPreviousResponseRecoveredContextKey = "responses_previous_response_recovered"
 
 type responsesContinuationMissHandlingPlan struct {
 	recoveryCandidateMeta map[string]any
-	clientError           *types.OpenAIErrorWithStatusCode
 }
 
 func NewRelayResponses(c *gin.Context) *relayResponses {
@@ -37,6 +46,23 @@ func NewRelayResponses(c *gin.Context) *relayResponses {
 	relay.c = c
 	relay.operation = detectResponsesOperation(c.Request.URL.Path)
 	return relay
+}
+
+func (r *relayResponses) setProvider(modelName string) error {
+	refreshPrincipal := middleware.RefreshAuthenticatedLongLivedPrincipal
+	if r.operation == responsesOperationInputTokens {
+		refreshPrincipal = middleware.RefreshLongLivedPrincipal
+	}
+	if apiErr := refreshPrincipal(r.c); apiErr != nil {
+		return apiErr
+	}
+	if err := r.relayBase.setProvider(modelName); err != nil {
+		return err
+	}
+	if apiErr := middleware.AdmitAuthenticatedChannelWork(r.c, modelName, r.provider.GetChannel().Id); apiErr != nil {
+		return apiErr
+	}
+	return nil
 }
 
 func (r *relayResponses) setRequest() error {
@@ -50,12 +76,153 @@ func (r *relayResponses) setRequest() error {
 	}
 	r.rawEnvelope = envelope
 	r.responsesRequest = envelope.Projection
+	if err := validateResponsesSupportedSurface(&r.responsesRequest, envelope.Object.Fields, r.operation); err != nil {
+		return err
+	}
 	if strings.TrimSpace(r.responsesRequest.Model) == "" {
 		return fmt.Errorf("field Model is required")
 	}
 	r.setOriginalModel(r.responsesRequest.Model)
-	prepareResponsesChannelAffinity(r.c, &r.responsesRequest)
+	requireStored := r.operation == responsesOperationCreate && (r.responsesRequest.Store == nil || *r.responsesRequest.Store)
+	operation := r.providerOperation()
+	setRequestChannelCapability(r.c, requireResponsesRequestCompatibility(operation, requireStored, envelope.Object.Fields, r.responsesRequest.Model))
+	if r.usesChannelAffinity() {
+		prepareResponsesChannelAffinity(r.c, &r.responsesRequest)
+	}
+	continuationRoute, err := prepareResponsesContinuationOwnership(r.c, &r.responsesRequest)
+	if err != nil {
+		return err
+	}
+	r.strictOwnerRoute = continuationRoute.Strict
 	return nil
+}
+
+func (r *relayResponses) WrapSetupError(_ string, err error) *types.OpenAIErrorWithStatusCode {
+	var apiErr *types.OpenAIErrorWithStatusCode
+	if errors.As(err, &apiErr) {
+		return apiErr
+	}
+	return responsesOwnershipAPIError(err)
+}
+
+func (r *relayResponses) HandleJsonError(apiErr *types.OpenAIErrorWithStatusCode) {
+	if replayProviderRawResponse(r.c, apiErr, providerresponse.Policy{
+		Operation:        r.providerOperation(),
+		DataPath:         providerresponse.DataPathExactWire,
+		BodyUnmodified:   true,
+		PreserveRedirect: true,
+	}) {
+		return
+	}
+	r.relayBase.HandleJsonError(apiErr)
+}
+
+func (r *relayResponses) validateSelectedProviderRequest() error {
+	if r == nil || r.provider == nil || r.provider.GetChannel() == nil {
+		return nil
+	}
+	r.preparedChatRequest = nil
+	r.selectedDataPath = ""
+	operation := r.providerOperation()
+	path, supported := providers.ResolveAdapterSupport(r.provider.GetChannel()).DataPath(operation)
+	if !supported {
+		return &capabilityGateError{message: fmt.Sprintf("channel adapter cannot relay operation %s", operation), status: http.StatusServiceUnavailable}
+	}
+	r.selectedDataPath = path
+	if r.rawEnvelope != nil && r.rawEnvelope.ProjectionError != nil && path == providersBase.DataPathCrossProtocol {
+		return newCapabilityGateError("request", "request contains fields that cannot be represented by the selected cross-protocol adapter")
+	}
+	if r.operation != responsesOperationCreate || path != providersBase.DataPathCrossProtocol {
+		return nil
+	}
+	fields := map[string]json.RawMessage(nil)
+	if r.rawEnvelope != nil && r.rawEnvelope.Object != nil {
+		fields = r.rawEnvelope.Object.Fields
+	}
+	if err := validateResponsesToChatRepresentability(&r.responsesRequest, fields); err != nil {
+		return err
+	}
+	chatRequest, err := r.responsesRequest.ToChatCompletionRequest()
+	if err != nil {
+		return newCapabilityGateError("request", err.Error())
+	}
+	chatRequest.Model = r.modelName
+	chatRequest, err = materializeResponsesChatPreAdd(r.provider.GetChannel(), r.modelName, chatRequest)
+	if err != nil {
+		return err
+	}
+	r.preparedChatRequest = chatRequest
+	return nil
+}
+
+func materializeResponsesChatPreAdd(channel *model.Channel, modelName string, request *types.ChatCompletionRequest) (*types.ChatCompletionRequest, error) {
+	if channel == nil || request == nil {
+		return request, nil
+	}
+	customParams, err := channel.GetCustomParameterMap()
+	if err != nil {
+		return nil, &capabilityGateError{message: "channel has invalid request transform configuration", status: http.StatusServiceUnavailable}
+	}
+	preAdd, _ := customParams["pre_add"].(bool)
+	if !preAdd {
+		return request, nil
+	}
+	// Cross-protocol pre_add targets the converted Chat request immediately
+	// before provider mapping; it never mutates the source Responses envelope.
+	body, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+	fields := make(map[string]json.RawMessage)
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return nil, err
+	}
+	prepared, _, err := effectiveChatRequestForChannel(channel, modelName, request, fields)
+	return prepared, err
+}
+
+func (r *relayResponses) prepareSelectedProviderRemoteMedia() error {
+	if r == nil || r.preparedChatRequest == nil {
+		return nil
+	}
+	fetcher := r.remoteMedia
+	if fetcher == nil {
+		fetcher = newRequestRemoteMediaFetcher(r.c.Request.Context())
+	}
+	if err := providers.PrepareChatRemoteMedia(r.provider, r.preparedChatRequest, fetcher); err != nil {
+		return remoteMediaCapabilityGateError(err)
+	}
+	return r.publishPreparedChatBody()
+}
+
+// publishPreparedChatBody materializes the explicit Responses -> Chat adapter
+// output for provider code that starts from the current canonical request body.
+// rawEnvelope remains the immutable Responses source for retries and native
+// Responses providers.
+func (r *relayResponses) publishPreparedChatBody() error {
+	if r == nil || r.c == nil || r.preparedChatRequest == nil {
+		return nil
+	}
+	body, err := json.Marshal(r.preparedChatRequest)
+	if err != nil {
+		return fmt.Errorf("marshal prepared Chat request: %w", err)
+	}
+	common.SetReusableRequestBody(r.c, body)
+	return nil
+}
+
+func (r *relayResponses) providerOperation() providersBase.Operation {
+	if r == nil {
+		return providersBase.OperationResponsesCreate
+	}
+	switch r.operation {
+	case responsesOperationCompact:
+		return providersBase.OperationResponsesCompact
+	case responsesOperationInputTokens:
+		return providersBase.OperationResponsesInputTokens
+	default:
+		return providersBase.OperationResponsesCreate
+	}
 }
 
 func (r *relayResponses) getRequest() interface{} {
@@ -71,12 +238,15 @@ func (r *relayResponses) IsStream() bool {
 
 func (r *relayResponses) getPromptTokens() (int, error) {
 	channel := r.provider.GetChannel()
+	if r.preparedChatRequest != nil {
+		return common.CountTokenMessages(r.preparedChatRequest.Messages, r.modelName, channel.PreCost), nil
+	}
 	return common.CountTokenInputMessages(r.responsesRequest.Input, r.modelName, channel.PreCost), nil
 }
 
 func (r *relayResponses) send() (err *types.OpenAIErrorWithStatusCode, done bool) {
 	err, done = r.sendCurrentProvider()
-	if err == nil {
+	if err == nil && r.usesChannelAffinity() {
 		if channel := r.provider.GetChannel(); channel != nil {
 			recordCurrentChannelAffinity(r.c, channelAffinityKindResponses, channel.Id)
 		}
@@ -90,8 +260,36 @@ func (r *relayResponses) send() (err *types.OpenAIErrorWithStatusCode, done bool
 	return
 }
 
+func (r *relayResponses) usesChannelAffinity() bool {
+	return r != nil && r.operation != responsesOperationInputTokens
+}
+
 func (r *relayResponses) sendCurrentProvider() (err *types.OpenAIErrorWithStatusCode, done bool) {
 	switch r.operation {
+	case responsesOperationInputTokens:
+		if r.responsesRequest.Stream {
+			return common.StringErrorWrapperLocal("streaming is not supported for /responses/input_tokens", "invalid_request_error", http.StatusBadRequest), true
+		}
+		provider, ok := r.provider.(providersBase.ResponsesInputTokensInterface)
+		if !ok {
+			return common.StringErrorWrapperLocal("channel does not support responses input token counting", unsupportedCapabilityCode, http.StatusServiceUnavailable), true
+		}
+		if err = r.requireRawEnvelope(); err != nil {
+			return err, true
+		}
+		r.responsesRequest.Model = r.modelName
+		var response *http.Response
+		response, err = provider.CountResponsesInputTokens(r.c.Request.Context(), r.providerRequest(commonresponses.ResponsesInputTokens))
+		if err != nil {
+			return err, false
+		}
+		if err = responseMultipart(r.c, response, providerResponsePolicyForChannel(r.provider.GetChannel(), providersBase.OperationResponsesInputTokens, true)); err != nil {
+			return err, true
+		}
+		if channel := r.provider.GetChannel(); channel != nil {
+			recordZeroQuotaResponsesAudit(r.c, channel.Id, "responses input_tokens")
+		}
+		return nil, false
 	case responsesOperationCompact:
 		if r.responsesRequest.Stream {
 			err = common.StringErrorWrapperLocal("streaming not supported for /responses/compact", "invalid_request_error", http.StatusBadRequest)
@@ -101,8 +299,7 @@ func (r *relayResponses) sendCurrentProvider() (err *types.OpenAIErrorWithStatus
 
 		r.responsesRequest.Model = r.modelName
 		responsesProvider, ok := r.provider.(providersBase.ResponsesInterface)
-		canNative := ok && r.provider.GetSupportedResponse()
-		if !canNative {
+		if !ok || r.selectedDataPath == providersBase.DataPathCrossProtocol {
 			err = common.StringErrorWrapperLocal("channel not implemented", "channel_error", http.StatusServiceUnavailable)
 			done = true
 			return
@@ -114,6 +311,7 @@ func (r *relayResponses) sendCurrentProvider() (err *types.OpenAIErrorWithStatus
 		var response *types.OpenAIResponsesResponses
 		response, err = responsesProvider.CompactResponses(r.c.Request.Context(), r.providerRequest(commonresponses.ResponsesCompact))
 		if err != nil {
+			done = err.ReplayRawResponse
 			return
 		}
 		if channel := r.provider.GetChannel(); channel != nil {
@@ -127,24 +325,20 @@ func (r *relayResponses) sendCurrentProvider() (err *types.OpenAIErrorWithStatus
 		r.responsesRequest.Model = r.modelName
 		channel := r.provider.GetChannel()
 		responsesProvider, ok := r.provider.(providersBase.ResponsesInterface)
-		canNative := ok && r.provider.GetSupportedResponse()
 
-		if !canNative {
-			if !channel.CompatibleResponse {
+		if r.selectedDataPath == providersBase.DataPathCrossProtocol {
+			chatProvider, chatOK := r.provider.(providersBase.ChatInterface)
+			if !chatOK {
 				err = common.StringErrorWrapperLocal("channel not implemented", "channel_error", http.StatusServiceUnavailable)
 				done = true
 				return
 			}
-
-			// 做一层Chat的兼容
-			chatProvider, ok := r.provider.(providersBase.ChatInterface)
-			if !ok {
-				err = common.StringErrorWrapperLocal("channel not implemented", "channel_error", http.StatusServiceUnavailable)
-				done = true
-				return
-			}
-
 			return r.compatibleSend(chatProvider)
+		}
+		if !ok {
+			err = common.StringErrorWrapperLocal("channel not implemented", "channel_error", http.StatusServiceUnavailable)
+			done = true
+			return
 		}
 		if err = r.requireRawEnvelope(); err != nil {
 			done = true
@@ -152,29 +346,55 @@ func (r *relayResponses) sendCurrentProvider() (err *types.OpenAIErrorWithStatus
 		}
 
 		if r.responsesRequest.Stream {
-			var response requester.StreamReaderInterface[string]
+			var response commonresponses.EventStream
 			response, err = responsesProvider.CreateResponsesStream(r.c.Request.Context(), r.providerRequest(commonresponses.ResponsesCreate))
 			if err != nil {
 				return
 			}
 
-			doneStr := func() string {
-				return ""
+			observer := commonresponses.NewStreamObserver()
+			if channel != nil && !responseRequiresDurableOwner(&r.responsesRequest) {
+				observer.SetResponseIDObserver(func(responseID string) {
+					recordResponsesEphemeralProof(r.c, responseID, channel.Id)
+				})
 			}
-
-			observer := relay_util.NewOpenAIResponsesStreamObserver()
-			firstResponseTime := responseGeneralStreamClientWithObserver(r.c, response, doneStr, observer.ObserveRawLine)
+			var firstResponseTime time.Time
+			var streamErr *types.OpenAIErrorWithStatusCode
+			if responseRequiresDurableOwner(&r.responsesRequest) {
+				firstResponseTime, streamErr = responseStoredResponsesStreamClient(r.c, response, observer, channel.Id)
+			} else {
+				firstResponseTime, streamErr = responseNativeResponsesStreamClient(r.c, response, observer)
+			}
 			r.SetFirstResponseTime(firstResponseTime)
+			if streamErr != nil {
+				// Only an error before any accepted non-error payload establishes
+				// provider rejection; a missing response ID alone proves nothing.
+				providerRejected := observer.ProviderRejected()
+				if !providerRejected {
+					streamErr.UpstreamAccepted = true
+				}
+				return streamErr, true
+			}
 			if channel := r.provider.GetChannel(); channel != nil {
-				recordResponsesChannelAffinity(r.c, channel.Id, observer.FinalResponse())
+				finalResponse := observer.FinalResponse()
+				recordResponsesChannelAffinity(r.c, channel.Id, finalResponse)
 			}
 		} else {
 			var response *types.OpenAIResponsesResponses
 			response, err = responsesProvider.CreateResponses(r.c.Request.Context(), r.providerRequest(commonresponses.ResponsesCreate))
 			if err != nil {
+				done = err.ReplayRawResponse
 				return
 			}
 			if channel := r.provider.GetChannel(); channel != nil {
+				if responseRequiresDurableOwner(&r.responsesRequest) {
+					if ownerErr := persistStoredResponseOwner(r.c, response.ID, channel.Id); ownerErr != nil {
+						ownerErr.UpstreamAccepted = true
+						return ownerErr, true
+					}
+				} else {
+					recordResponsesEphemeralProof(r.c, response.ID, channel.Id)
+				}
 				recordResponsesChannelAffinity(r.c, channel.Id, response)
 			}
 			openErr := responseJsonClient(r.c, response)
@@ -201,9 +421,14 @@ func (r *relayResponses) providerRequest(operation commonresponses.Operation) *c
 		principal = requestctx.PrincipalFromGin(r.c)
 	}
 	body := r.rawEnvelope
+	rawQuery := ""
+	if r.c != nil && r.c.Request != nil && r.c.Request.URL != nil {
+		rawQuery = r.c.Request.URL.RawQuery
+	}
 	return &commonresponses.Request{
 		Operation: operation,
 		Headers:   headers,
+		RawQuery:  rawQuery,
 		Body:      body,
 		Control: commonresponses.Control{
 			DownstreamDialect: commonresponses.DownstreamResponses,
@@ -249,8 +474,18 @@ func (r *relayResponses) clearStalePreviousResponseAffinity() {
 		return
 	}
 
+	ownerChannelID := 0
+	if r.provider != nil && r.provider.GetChannel() != nil {
+		ownerChannelID = r.provider.GetChannel().Id
+	}
+	if ownerChannelID <= 0 {
+		ownerChannelID = currentPreferredChannelID(r.c)
+	}
+	clearResponsesEphemeralProof(r.c, r.responsesRequest.PreviousResponseID, ownerChannelID)
 	clearCurrentChannelAffinityBindings(r.c)
-	prepareResponsesChannelAffinity(r.c, &r.responsesRequest)
+	if r.usesChannelAffinity() {
+		prepareResponsesChannelAffinity(r.c, &r.responsesRequest)
+	}
 }
 
 func (r *relayResponses) stalePreviousResponseHandlingPlan(apiErr *types.OpenAIErrorWithStatusCode) *responsesContinuationMissHandlingPlan {
@@ -268,16 +503,6 @@ func (r *relayResponses) stalePreviousResponseHandlingPlan(apiErr *types.OpenAIE
 			"responses_continuation_recovery_strategy":  "manual_replay_required",
 			"responses_continuation_error_code":         openAIErrorCodeString(apiErr.Code, "previous_response_not_found"),
 		},
-		clientError: &types.OpenAIErrorWithStatusCode{
-			OpenAIError: types.OpenAIError{
-				Code:    "previous_response_not_found",
-				Type:    "invalid_request_error",
-				Param:   "previous_response_id",
-				Message: "previous_response_id is stale. one-hub cannot safely recover this responses request without replay; resend the request with full context.",
-			},
-			StatusCode: http.StatusConflict,
-			LocalError: true,
-		},
 	}
 }
 
@@ -285,8 +510,21 @@ func shouldRecoverStalePreviousResponse(apiErr *types.OpenAIErrorWithStatusCode)
 	if apiErr == nil {
 		return false
 	}
-	if openAIErrorCodeString(apiErr.Code, "") == "previous_response_not_found" {
+	// Only client-visible missing-resource statuses can prove that the
+	// continuation target is stale. Rewriting a throttling or server failure by
+	// message text would hide the provider status, clear valid affinity, and turn
+	// a retryable failure into a local 400.
+	if apiErr.StatusCode != http.StatusBadRequest && apiErr.StatusCode != http.StatusNotFound {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(openAIErrorCodeString(apiErr.Code, "")), "previous_response_not_found") {
 		return true
+	}
+	// Message matching is only a compatibility fallback for providers that omit
+	// a structured code. The parameter keeps an unrelated 400/404 containing
+	// similar prose from clearing valid response affinity.
+	if !strings.EqualFold(strings.TrimSpace(apiErr.Param), "previous_response_id") {
+		return false
 	}
 	message := strings.ToLower(strings.TrimSpace(apiErr.Message))
 	if message == "" {
@@ -301,9 +539,17 @@ func (r *relayResponses) compatibleSend(chatProvider providersBase.ChatInterface
 		return errWithCode, false
 	}
 
-	chatReq, err := r.responsesRequest.ToChatCompletionRequest()
-	if err != nil {
-		return common.ErrorWrapperLocal(err, "invalid_claude_config", http.StatusInternalServerError), true
+	chatReq := r.preparedChatRequest
+	if chatReq == nil {
+		return &types.OpenAIErrorWithStatusCode{
+			OpenAIError: types.OpenAIError{
+				Message: "responses compatibility request was not finalized",
+				Type:    "internal_error",
+				Code:    "provider_request_not_finalized",
+			},
+			StatusCode: http.StatusInternalServerError,
+			LocalError: true,
+		}, true
 	}
 
 	if r.responsesRequest.Stream {
@@ -315,10 +561,11 @@ func (r *relayResponses) compatibleSend(chatProvider providersBase.ChatInterface
 		var finalResponse *types.OpenAIResponsesResponses
 		var firstResponseTime time.Time
 		firstResponseTime, finalResponse, errWithCode = r.chatToResponseStreamClient(response)
-		if errWithCode != nil {
-			return
-		}
 		r.SetFirstResponseTime(firstResponseTime)
+		if errWithCode != nil {
+			errWithCode.UpstreamAccepted = true
+			return errWithCode, true
+		}
 		if channel := r.provider.GetChannel(); channel != nil {
 			recordResponsesChannelAffinity(r.c, channel.Id, finalResponse)
 		}
@@ -329,6 +576,21 @@ func (r *relayResponses) compatibleSend(chatProvider providersBase.ChatInterface
 			return
 		}
 
+		// Captured native responses may have only a partial observation DTO.
+		// A protocol conversion must retain its strict representability boundary.
+		if raw := response.ReplayProviderRawJSON(); len(raw) > 0 {
+			if runtimesession.OpenAIErrorEnvelopeFromPayload(raw) != nil {
+				apiErr := common.StringErrorWrapperLocal("provider error cannot be converted to a successful Responses result", "invalid_provider_response", http.StatusBadGateway)
+				apiErr.UpstreamAccepted = true
+				return apiErr, true
+			}
+			var mapped types.ChatCompletionResponse
+			if decodeErr := json.Unmarshal(raw, &mapped); decodeErr != nil {
+				apiErr := common.ErrorWrapperLocal(decodeErr, "invalid_provider_response", http.StatusBadGateway)
+				apiErr.UpstreamAccepted = true
+				return apiErr, true
+			}
+		}
 		responseResp := response.ToResponses(&r.responsesRequest)
 		if channel := r.provider.GetChannel(); channel != nil {
 			recordResponsesChannelAffinity(r.c, channel.Id, responseResp)
@@ -344,7 +606,7 @@ func (r *relayResponses) compatibleSend(chatProvider providersBase.ChatInterface
 }
 
 // Fail closed instead of silently degrading stateful Responses requests to Chat
-// Completions. store=true, previous_response_id, and conversation all depend on
+// Completions. store omitted/true, previous_response_id, and conversation all depend on
 // response-native state semantics that cannot be preserved across compatibility
 // fallback, especially once multi-channel routing may move follow-up requests to
 // a different upstream account or region.
@@ -374,16 +636,16 @@ func responsesStatefulFallbackRequirement(request *types.OpenAIResponsesRequest)
 		return "", ""
 	}
 
-	if request.Store != nil && *request.Store {
-		return "store", "responses request with store=true"
-	}
-
 	if strings.TrimSpace(request.PreviousResponseID) != "" {
 		return "previous_response_id", "responses request with previous_response_id"
 	}
 
 	if hasMeaningfulResponsesConversation(request.Conversation) {
 		return "conversation", "responses request with conversation state"
+	}
+
+	if request.Store == nil || *request.Store {
+		return "store", "responses request with stored response semantics"
 	}
 
 	return "", ""
@@ -406,8 +668,9 @@ func hasMeaningfulResponsesConversation(conversation any) bool {
 func (r *relayResponses) chatToResponseStreamClient(stream requester.StreamReaderInterface[string]) (firstResponseTime time.Time, finalResponse *types.OpenAIResponsesResponses, errWithCode *types.OpenAIErrorWithStatusCode) {
 	requester.SetEventStreamHeaders(r.c)
 	dataChan, errChan := stream.Recv()
+	rawSSEEvents := requester.IsRawSSEEventStream(stream)
 
-	defer stream.Close()
+	defer requester.CloseAndDrainStream(stream)
 	streamWriter := relay_util.NewBufferedStreamWriter(r.c.Writer, 0)
 	relay_util.SetStreamWriter(r.c, streamWriter)
 	defer func() {
@@ -420,20 +683,41 @@ func (r *relayResponses) chatToResponseStreamClient(stream requester.StreamReade
 	dataOpen := dataChan != nil
 	errOpen := errChan != nil
 
-	handleData := func(data string) {
+	handleData := func(data string) *types.OpenAIErrorWithStatusCode {
+		if r.c.Request.Context().Err() != nil {
+			return responsesStreamClientCanceledError()
+		}
 		if !isFirstResponse {
 			firstResponseTime = time.Now()
 			isFirstResponse = true
 		}
-
-		select {
-		case <-r.c.Request.Context().Done():
-		default:
-			converter.ProcessStreamData(data)
+		if rawSSEEvents {
+			payload, hasData := commonresponses.SSEDataPayload(data)
+			if !hasData || strings.TrimSpace(payload) == "" || strings.TrimSpace(payload) == "[DONE]" {
+				return nil
+			}
+			if providerErr := runtimesession.OpenAIErrorEnvelopeFromPayload([]byte(payload)); providerErr != nil {
+				if converter.ProcessStreamError() != nil {
+					r.c.Set(responsesStreamErrorAlreadyRenderedContextKey, true)
+				}
+				safeErr := providerresponse.SanitizeAPIError(providerErr)
+				safeErr.UpstreamAccepted = true
+				return safeErr
+			}
+			data = payload
 		}
+
+		if err := converter.ProcessStreamData(data); err != nil {
+			r.c.Set(responsesStreamErrorAlreadyRenderedContextKey, true)
+			return common.ErrorWrapper(err, relay_util.ResponsesStreamFailureCode(err), http.StatusBadGateway)
+		}
+		return nil
 	}
 
 	handleEOF := func() {
+		// EOF/terminal has been dequeued, but the producer may still be returning
+		// from its handler. Drain it before the converter reads provider-owned usage.
+		requester.CloseAndDrainStream(stream)
 		converter.ProcessStreamData("[DONE]")
 	}
 
@@ -445,7 +729,9 @@ func (r *relayResponses) chatToResponseStreamClient(stream requester.StreamReade
 		select {
 		case <-r.c.Request.Context().Done():
 		default:
-			converter.ProcessStreamError()
+			if converter.ProcessStreamError() != nil {
+				r.c.Set(responsesStreamErrorAlreadyRenderedContextKey, true)
+			}
 		}
 
 		logger.LogError(r.c.Request.Context(), "Stream err:"+common.RedactSensitiveText(err.Error()))
@@ -460,20 +746,26 @@ func (r *relayResponses) chatToResponseStreamClient(stream requester.StreamReade
 					dataChan = nil
 					continue
 				}
-				handleData(data)
+				if errWithCode := handleData(data); errWithCode != nil {
+					return firstResponseTime, converter.FinalResponse(), errWithCode
+				}
 				continue
 			default:
 			}
 		}
 
 		select {
+		case <-r.c.Request.Context().Done():
+			return firstResponseTime, converter.FinalResponse(), responsesStreamClientCanceledError()
 		case data, ok := <-dataChan:
 			if !ok {
 				dataOpen = false
 				dataChan = nil
 				continue
 			}
-			handleData(data)
+			if errWithCode := handleData(data); errWithCode != nil {
+				return firstResponseTime, converter.FinalResponse(), errWithCode
+			}
 		case err, ok := <-errChan:
 			if !ok {
 				errOpen = false
@@ -482,7 +774,7 @@ func (r *relayResponses) chatToResponseStreamClient(stream requester.StreamReade
 			}
 			handleError(err)
 			if !isStreamTerminalEOF(err) {
-				return firstResponseTime, converter.FinalResponse(), common.ErrorWrapper(err, "stream_read_failed", http.StatusInternalServerError)
+				return firstResponseTime, converter.FinalResponse(), common.ErrorWrapper(err, "stream_read_failed", http.StatusBadGateway)
 			}
 			return firstResponseTime, converter.FinalResponse(), nil
 		}
@@ -497,11 +789,24 @@ type responsesOperation int
 const (
 	responsesOperationCreate responsesOperation = iota
 	responsesOperationCompact
+	responsesOperationInputTokens
 )
 
 func detectResponsesOperation(path string) responsesOperation {
+	if strings.HasSuffix(path, "/input_tokens") {
+		return responsesOperationInputTokens
+	}
 	if strings.HasSuffix(path, "/compact") {
 		return responsesOperationCompact
 	}
 	return responsesOperationCreate
+}
+
+func (r *relayResponses) skipQuotaSettlement() bool {
+	return r != nil && r.operation == responsesOperationInputTokens
+}
+
+func (r *relayResponses) allowsSideEffectFreeObservationRetry() bool {
+	return r != nil && r.operation == responsesOperationInputTokens &&
+		!r.strictOwnerRoute && strings.TrimSpace(r.responsesRequest.PreviousResponseID) == ""
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,18 +14,40 @@ import (
 	"one-api/common/config"
 	"one-api/common/logger"
 	"one-api/common/requester"
+	commonresponses "one-api/common/responses"
 	"one-api/model"
+	"one-api/providers/openai"
+	"one-api/types"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 )
 
 type fakeRelayStream struct {
-	dataChan chan string
-	errChan  chan error
+	dataChan        chan string
+	errChan         chan error
+	observeAccepted func(string) error
 }
 
-var _ requester.StreamReaderInterface[string] = (*fakeRelayStream)(nil)
+type failingRelayResponseWriter struct {
+	header http.Header
+	err    error
+}
+
+func (w *failingRelayResponseWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+
+func (w *failingRelayResponseWriter) WriteHeader(int) {}
+
+func (w *failingRelayResponseWriter) Write([]byte) (int, error) { return 0, w.err }
+
+func (w *failingRelayResponseWriter) Flush() {}
+
+var _ commonresponses.EventStream = (*fakeRelayStream)(nil)
 
 func (s *fakeRelayStream) Recv() (<-chan string, <-chan error) {
 	return s.dataChan, s.errChan
@@ -32,7 +55,14 @@ func (s *fakeRelayStream) Recv() (<-chan string, <-chan error) {
 
 func (s *fakeRelayStream) Close() {}
 
-func TestResponseStreamClientDoesNotReturnMidStreamError(t *testing.T) {
+func (s *fakeRelayStream) ObserveAcceptedResponsesEvent(event string) error {
+	if s == nil || s.observeAccepted == nil {
+		return nil
+	}
+	return s.observeAccepted(event)
+}
+
+func TestResponseStreamClientReturnsAcceptedMidStreamError(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	logger.Logger = zap.NewNop()
 
@@ -51,8 +81,8 @@ func TestResponseStreamClientDoesNotReturnMidStreamError(t *testing.T) {
 	}()
 
 	firstResponseTime, errWithCode := responseStreamClient(ctx, stream, nil)
-	if errWithCode != nil {
-		t.Fatalf("expected nil error, got: %v", errWithCode.Message)
+	if errWithCode == nil || errWithCode.Code != "stream_read_failed" || !errWithCode.UpstreamAccepted {
+		t.Fatalf("expected accepted stream failure, got: %+v", errWithCode)
 	}
 
 	if firstResponseTime.IsZero() {
@@ -83,6 +113,66 @@ func TestResponseStreamClientDoesNotReturnMidStreamError(t *testing.T) {
 		if strings.Contains(body, forbidden) {
 			t.Fatalf("expected stream error body not to leak %q, got %q", forbidden, body)
 		}
+	}
+}
+
+func TestResponseStreamClientPreservesSanitizedProviderAPIError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logger.Logger = zap.NewNop()
+
+	tests := []struct {
+		name        string
+		provider    *types.OpenAIErrorWithStatusCode
+		controlCode string
+		contains    []string
+		forbidden   []string
+	}{
+		{
+			name: "business error",
+			provider: &types.OpenAIErrorWithStatusCode{
+				OpenAIError: types.OpenAIError{Type: "invalid_request_error", Code: "bad_input", Message: "invalid tool", Param: "tools[0]"},
+				StatusCode:  http.StatusBadRequest,
+			},
+			controlCode: "bad_input",
+			contains:    []string{`"type":"invalid_request_error"`, `"code":"bad_input"`, `"message":"invalid tool"`, `"param":"tools[0]"`},
+			forbidden:   []string{`"stream_error"`, "[DONE]"},
+		},
+		{
+			name: "provider account error",
+			provider: &types.OpenAIErrorWithStatusCode{
+				OpenAIError: types.OpenAIError{Type: "authentication_error", Code: "invalid_api_key", Message: "organization org-secret rejected at https://provider.example"},
+				StatusCode:  http.StatusUnauthorized,
+			},
+			controlCode: "provider_account_error",
+			contains:    []string{`"type":"upstream_error"`, `"code":"provider_account_error"`, `"message":"upstream provider account is unavailable"`},
+			forbidden:   []string{"org-secret", "provider.example", "invalid_api_key", "authentication_error", "[DONE]"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			stream := &fakeRelayStream{dataChan: make(chan string), errChan: make(chan error, 1)}
+			stream.errChan <- test.provider
+
+			_, apiErr := responseStreamClient(ctx, stream, nil)
+			if apiErr == nil || apiErr.Code != test.controlCode {
+				t.Fatalf("expected provider stream failure to reach control flow: %+v", apiErr)
+			}
+			body := recorder.Body.String()
+			for _, value := range test.contains {
+				if !strings.Contains(body, value) {
+					t.Fatalf("provider error field %q missing from %q", value, body)
+				}
+			}
+			for _, value := range test.forbidden {
+				if strings.Contains(body, value) {
+					t.Fatalf("provider error leaked or invented %q in %q", value, body)
+				}
+			}
+		})
 	}
 }
 
@@ -124,6 +214,259 @@ func TestResponseStreamClientClosedChannelsFinishAsEOF(t *testing.T) {
 	}
 }
 
+func TestResponseStreamClientInBandProviderErrorDoesNotAppendSuccessTerminal(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logger.Logger = zap.NewNop()
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	stream := &fakeRelayStream{
+		dataChan: make(chan string, 1),
+		errChan:  make(chan error),
+	}
+	stream.dataChan <- `{"error":{"message":"invalid field","type":"invalid_request_error","code":"invalid_value"}}`
+	close(stream.dataChan)
+	close(stream.errChan)
+
+	if _, apiErr := responseStreamClient(ctx, stream, func() string {
+		return `{"id":"synthetic-usage"}`
+	}); apiErr == nil || apiErr.Code != "invalid_value" {
+		t.Fatalf("expected rendered in-band provider error fact, got %+v", apiErr)
+	}
+	if !ctx.GetBool(streamErrorAlreadyRenderedContextKey) {
+		t.Fatal("in-band provider error did not publish its egress receipt")
+	}
+
+	body := recorder.Body.String()
+	if !strings.Contains(body, `data: {"error":{"message":"invalid field","type":"invalid_request_error","code":"invalid_value"}}`) {
+		t.Fatalf("expected in-band provider error to be delivered, got %q", body)
+	}
+	for _, unexpected := range []string{"synthetic-usage", "data: [DONE]"} {
+		if strings.Contains(body, unexpected) {
+			t.Fatalf("in-band provider error was followed by a success terminal %q: %q", unexpected, body)
+		}
+	}
+}
+
+func TestExactChatSSEInBandErrorDoesNotAppendSuccessTerminal(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logger.Logger = zap.NewNop()
+
+	handler := openai.OpenAIStreamHandler{Usage: &types.Usage{}}
+	stream, apiErr := requester.RequestRawSSEEventStreamWithEmitterOptions(nil, &http.Response{
+		Body: io.NopCloser(strings.NewReader("data: {\"error\":{\"message\":\"invalid field\",\"type\":\"invalid_request_error\",\"code\":\"invalid_value\"}}\n\n")),
+	}, handler.HandleExactChatSSE, requester.StreamReadOptions{RequireProtocolTerminal: true})
+	if apiErr != nil {
+		t.Fatalf("create exact chat stream: %+v", apiErr)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	if _, apiErr := responseStreamClient(ctx, stream, func() string {
+		return `{"id":"synthetic-usage"}`
+	}); apiErr == nil || apiErr.Code != "invalid_value" {
+		t.Fatalf("expected exact in-band provider error fact, got %+v", apiErr)
+	}
+
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"code":"invalid_value"`) {
+		t.Fatalf("expected exact in-band error to reach the client, got %q", body)
+	}
+	for _, unexpected := range []string{"synthetic-usage", "data: [DONE]"} {
+		if strings.Contains(body, unexpected) {
+			t.Fatalf("exact in-band error was followed by a success terminal %q: %q", unexpected, body)
+		}
+	}
+}
+
+func TestExactChatSSEEgressPreservesCompleteRawEventsAndTerminal(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logger.Logger = zap.NewNop()
+	rawEvent := ": keep  two\r\nid: 007\r\nevent: chunk\r\ndata:  {\"id\":\"chatcmpl_raw\",\"model\":\"gpt-5\",\"message\":\"future success https://example.com\",\"code\":\"future_code\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}],\"future\":12345678901234567890}  \r\n\r\n"
+	doneEvent := "data:[DONE]\r\n\r\n"
+	handler := openai.OpenAIStreamHandler{Usage: &types.Usage{}}
+	stream, apiErr := requester.RequestRawSSEEventStreamWithEmitterOptions(nil, &http.Response{
+		Body: io.NopCloser(strings.NewReader(rawEvent + doneEvent)),
+	}, handler.HandleExactChatSSE, requester.StreamReadOptions{RequireProtocolTerminal: true})
+	if apiErr != nil {
+		t.Fatalf("create exact Chat stream: %+v", apiErr)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	first, apiErr := responseStreamClient(ctx, stream, func() string { return `{"id":"synthetic-usage"}` })
+	if apiErr != nil {
+		t.Fatalf("exact Chat egress failed: %+v", apiErr)
+	}
+	if first.IsZero() {
+		t.Fatal("exact raw event did not establish first response time")
+	}
+	if got, want := recorder.Body.String(), rawEvent+doneEvent; got != want {
+		t.Fatalf("exact Chat egress rewrote or synthesized SSE:\nwant %q\n got %q", want, got)
+	}
+}
+
+func TestNativeResponseStreamStopsOnDownstreamWriteFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	writer := &failingRelayResponseWriter{err: errors.New("client disconnected")}
+	ctx, _ := gin.CreateTestContext(writer)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	stream := &fakeRelayStream{
+		dataChan: make(chan string, 1),
+		errChan:  make(chan error),
+	}
+	stream.dataChan <- "data: {\"type\":\"response.output_text.delta\"}\n\n"
+
+	_, err := responseGeneralStreamClientWithObserverResult(ctx, stream, nil, nil, nil, false)
+	if err == nil || !strings.Contains(err.Error(), "client disconnected") {
+		t.Fatalf("downstream write failure was not returned: %v", err)
+	}
+}
+
+func TestSanitizeProviderSSELinePreservesFramingAndHidesAccountError(t *testing.T) {
+	input := "data: {\"type\":\"error\",\"sequence_number\":4,\"code\":\"insufficient_quota\",\"message\":\"organization org-secret exhausted\",\"account_id\":\"acct-secret\"}\r\n"
+	got := sanitizeProviderSSEEvent(input)
+	if !strings.HasPrefix(got, "data: ") || !strings.HasSuffix(got, "\r\n") || !strings.Contains(got, `"sequence_number":4`) || !strings.Contains(got, `"code":"provider_account_error"`) {
+		t.Fatalf("SSE framing or error envelope changed: %q", got)
+	}
+	for _, secret := range []string{"org-secret", "acct-secret", "insufficient_quota"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("provider account detail %q leaked from %q", secret, got)
+		}
+	}
+}
+
+func TestSanitizeProviderSSELinePreservesOrdinaryPayloadBytes(t *testing.T) {
+	input := "  data:\t{\"type\":\"response.output_text.delta\",\"delta\":\"a  b\\n\\nhttps://example.com\",\"api_key\":\"model-authored-value\"}  \r\n"
+	if got := sanitizeProviderSSEEvent(input); got != input {
+		t.Fatalf("ordinary SSE payload changed:\nwant: %q\n got: %q", input, got)
+	}
+}
+
+func TestSanitizeProviderSSEEventHandlesEventPrefixAndSuccessMetadata(t *testing.T) {
+	errorEvent := "event: error\ndata: {\"type\":\"error\",\"message\":\"organization org-secret exhausted\",\"account_id\":\"acct-secret\"}\n\n"
+	safeError := sanitizeProviderSSEEvent(errorEvent)
+	if !strings.HasPrefix(safeError, "event: error\ndata: ") || !strings.HasSuffix(safeError, "\n\n") {
+		t.Fatalf("SSE event framing changed: %q", safeError)
+	}
+	for _, secret := range []string{"org-secret", "acct-secret"} {
+		if strings.Contains(safeError, secret) {
+			t.Fatalf("provider error metadata %q leaked from %q", secret, safeError)
+		}
+	}
+
+	successEvent := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"account_id\":\"acct-success\",\"output\":[{\"account_id\":\"model-authored\"}]}}\n\n"
+	safeSuccess := sanitizeProviderSSEEvent(successEvent)
+	if strings.Contains(safeSuccess, "acct-success") || !strings.Contains(safeSuccess, "model-authored") {
+		t.Fatalf("success metadata policy was not scoped correctly: %q", safeSuccess)
+	}
+}
+
+func TestSanitizeProviderSSEEventHandlesMultilineData(t *testing.T) {
+	for _, newline := range []string{"\n", "\r\n"} {
+		for _, payload := range [][]string{
+			{`{"type":"error",`, `"message":"organization org-secret exhausted","account_id":"acct-secret"}`},
+			{`{"type":"response.created",`, `"response":{"id":"resp_1","account_id":"acct-secret","output":[{"account_id":"model-authored"}]}}`},
+		} {
+			prefix := "event: future" + newline + "id: 7" + newline + "retry: 123" + newline
+			input := prefix + "data: " + payload[0] + newline + ": comment" + newline + "data: " + payload[1] + newline + newline
+			got := sanitizeProviderSSEEvent(input)
+			if strings.Contains(got, "acct-secret") || strings.Contains(got, "org-secret") || !strings.HasPrefix(got, prefix) || !strings.Contains(got, ": comment"+newline) || !strings.HasSuffix(got, newline+newline) {
+				t.Fatalf("multiline security rewrite lost framing or leaked metadata: %q", got)
+			}
+			if strings.Contains(input, "model-authored") && !strings.Contains(got, "model-authored") {
+				t.Fatal("model-authored output was rewritten")
+			}
+		}
+		ordinary := "event: future" + newline + "data: {\"future\":1e3," + newline + "data: \"content\":{\"account_id\":\"model-authored\"}}" + newline + newline
+		if got := sanitizeProviderSSEEvent(ordinary); got != ordinary {
+			t.Fatalf("ordinary multiline raw changed: %q", got)
+		}
+	}
+}
+
+func TestChatResponseStreamReturnsDownstreamWriteFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	writer := &failingRelayResponseWriter{err: errors.New("client disconnected")}
+	ctx, _ := gin.CreateTestContext(writer)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	stream := &fakeRelayStream{
+		dataChan: make(chan string, 1),
+		errChan:  make(chan error),
+	}
+	stream.dataChan <- `{"id":"chunk-1"}`
+
+	_, apiErr := responseStreamClient(ctx, stream, nil)
+	if apiErr == nil || apiErr.Code != "stream_write_failed" || !apiErr.UpstreamAccepted {
+		t.Fatalf("downstream write failure was not surfaced with accepted state: %+v", apiErr)
+	}
+}
+
+func TestChatResponseStreamWriteFailureDrainsBlockedLegacyHandler(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handlerSecondSendFinished := make(chan struct{})
+	stream, apiErr := requester.RequestStream[string](nil, &http.Response{
+		Body: io.NopCloser(strings.NewReader("first\nsecond\n")),
+	}, func(rawLine *[]byte, dataChan chan string, _ chan error) {
+		dataChan <- string(*rawLine)
+		if string(*rawLine) == "second" {
+			close(handlerSecondSendFinished)
+		}
+	})
+	if apiErr != nil {
+		t.Fatalf("create stream: %+v", apiErr)
+	}
+
+	writer := &failingRelayResponseWriter{err: errors.New("client disconnected")}
+	ctx, _ := gin.CreateTestContext(writer)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	_, apiErr = responseStreamClient(ctx, stream, nil)
+	if apiErr == nil || apiErr.Code != "stream_write_failed" {
+		t.Fatalf("expected downstream write failure, got %+v", apiErr)
+	}
+	select {
+	case <-handlerSecondSendFinished:
+	case <-time.After(time.Second):
+		t.Fatal("legacy handler remained blocked on its second send")
+	}
+}
+
+func TestChatResponseStreamRejectsMissingProtocolTerminal(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logger.Logger = zap.NewNop()
+
+	handler := openai.OpenAIStreamHandler{Usage: &types.Usage{}}
+	stream, apiErr := requester.RequestRawSSEEventStreamWithEmitterOptions(nil, &http.Response{
+		Body: io.NopCloser(strings.NewReader("data: {\"id\":\"chatcmpl_partial\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n")),
+	}, handler.HandleExactChatSSE, requester.StreamReadOptions{RequireProtocolTerminal: true})
+	if apiErr != nil {
+		t.Fatalf("create chat stream: %+v", apiErr)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	_, apiErr = responseStreamClient(ctx, stream, func() string { return `{"id":"synthetic-usage"}` })
+	if apiErr == nil || apiErr.Code != "stream_read_failed" || !apiErr.UpstreamAccepted {
+		t.Fatalf("expected accepted missing-terminal failure, got %+v", apiErr)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, "partial") || !strings.Contains(body, `"code":"stream_error"`) {
+		t.Fatalf("expected partial data followed by a stream error, got %q", body)
+	}
+	if !ctx.GetBool(streamErrorAlreadyRenderedContextKey) {
+		t.Fatal("rendered stream failure did not publish its egress receipt")
+	}
+	for _, unexpected := range []string{"synthetic-usage", "data: [DONE]"} {
+		if strings.Contains(body, unexpected) {
+			t.Fatalf("missing terminal was converted to success %q: %q", unexpected, body)
+		}
+	}
+}
+
 func TestFetchChannelByModelWithSelectionRejectsFallbackWhenAffinityIsStrict(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -159,8 +502,8 @@ func TestFetchChannelByModelWithSelectionRejectsFallbackWhenAffinityIsStrict(t *
 	if channel != nil {
 		t.Fatalf("expected no channel to be returned, got %#v", channel)
 	}
-	if _, ok := lookupChannelAffinity(ctx, channelAffinityKindRealtime, sessionID); ok {
-		t.Fatal("expected stale strict affinity binding to be cleared after rejection")
+	if channelID, ok := lookupChannelAffinity(ctx, channelAffinityKindRealtime, sessionID); !ok || channelID != staleChannelID {
+		t.Fatalf("expected strict affinity binding to survive temporary unavailability, channel=%d ok=%v", channelID, ok)
 	}
 }
 
@@ -367,6 +710,109 @@ func TestFetchChannelByModelWithSelectionStopsWaitingWhenRequestCanceled(t *test
 	}
 	if meta["channel_affinity_wait_canceled"] != true {
 		t.Fatalf("expected wait cancellation metadata to be recorded, got %#v", meta)
+	}
+}
+
+func TestFetchChannelByModelPreservesAvailabilityWhenCompatibleCandidateIsUnavailable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, test := range []struct {
+		name     string
+		disabled bool
+		cooldown bool
+	}{
+		{name: "cooldown", cooldown: true},
+		{name: "disabled", disabled: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			channelGroupSnapshot := snapshotChannelGroup()
+			t.Cleanup(func() { restoreChannelGroup(channelGroupSnapshot) })
+
+			weight := uint(1)
+			incompatible := &model.Channel{Id: 1, Type: config.ChannelTypeAnthropic, Weight: &weight}
+			compatible := &model.Channel{Id: 2, Type: config.ChannelTypeOpenAI, Weight: &weight}
+			model.ChannelGroup = model.ChannelsChooser{
+				Channels: map[int]*model.ChannelChoice{
+					1: {Channel: incompatible},
+					2: {Channel: compatible, Disable: test.disabled},
+				},
+				Rule: map[string]map[string][][]int{"default": {"gpt-5": {{1, 2}}}},
+			}
+			if test.cooldown {
+				model.ChannelGroup.Cooldowns.Store("2:gpt-5", time.Now().Add(time.Minute).Unix())
+			}
+
+			ctx := newRelayTestContext(nil)
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			ctx.Set("token_group", "default")
+			capabilityErr := errors.New("request cannot be represented by channel 1")
+			setRequestChannelCapability(ctx, func(channel *model.Channel) error {
+				if channel.Id == incompatible.Id {
+					return capabilityErr
+				}
+				return nil
+			})
+
+			channel, err := fetchChannelByModelWithSelection(ctx, "gpt-5", realtimeChannelSelection{})
+			if channel != nil || err == nil {
+				t.Fatalf("expected unavailable compatible candidate to leave selection failed, channel=%+v err=%v", channel, err)
+			}
+			if errors.Is(err, capabilityErr) {
+				t.Fatalf("capability rejection masked %s availability failure: %v", test.name, err)
+			}
+		})
+	}
+}
+
+func TestFetchChannelByModelReturnsCapabilityOnlyWhenAllCandidatesReject(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	channelGroupSnapshot := snapshotChannelGroup()
+	t.Cleanup(func() { restoreChannelGroup(channelGroupSnapshot) })
+
+	weight := uint(1)
+	model.ChannelGroup = model.ChannelsChooser{
+		Channels: map[int]*model.ChannelChoice{
+			1: {Channel: &model.Channel{Id: 1, Type: config.ChannelTypeAnthropic, Weight: &weight}},
+			2: {Channel: &model.Channel{Plugin: model.NewCustomEndpointPlugin(), Id: 2, Type: config.ChannelTypeCustom, Weight: &weight}},
+		},
+		Rule: map[string]map[string][][]int{"default": {"gpt-5": {{1, 2}}}},
+	}
+	ctx := newRelayTestContext(nil)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ctx.Set("token_group", "default")
+	capabilityErr := errors.New("request cannot be represented by any candidate")
+	setRequestChannelCapability(ctx, func(*model.Channel) error { return capabilityErr })
+
+	channel, err := fetchChannelByModelWithSelection(ctx, "gpt-5", realtimeChannelSelection{})
+	if channel != nil || !errors.Is(err, capabilityErr) {
+		t.Fatalf("all-candidate capability exhaustion must return the capability error, channel=%+v err=%v", channel, err)
+	}
+}
+
+func TestFetchChannelByModelContextCancellationDominatesRecordedCapability(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	channelGroupSnapshot := snapshotChannelGroup()
+	t.Cleanup(func() { restoreChannelGroup(channelGroupSnapshot) })
+
+	weight := uint(1)
+	model.ChannelGroup = model.ChannelsChooser{
+		Channels: map[int]*model.ChannelChoice{
+			1: {Channel: &model.Channel{Id: 1, Type: config.ChannelTypeAnthropic, Weight: &weight}},
+		},
+		Rule: map[string]map[string][][]int{"default": {"gpt-5": {{1}}}},
+	}
+	requestCtx, cancel := context.WithCancel(context.Background())
+	ctx := newRelayTestContext(nil)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(requestCtx)
+	ctx.Set("token_group", "default")
+	capabilityErr := errors.New("recorded capability rejection")
+	setRequestChannelCapability(ctx, func(*model.Channel) error {
+		cancel()
+		return capabilityErr
+	})
+
+	channel, err := fetchChannelByModelWithSelection(ctx, "gpt-5", realtimeChannelSelection{})
+	if channel != nil || !errors.Is(err, context.Canceled) || errors.Is(err, capabilityErr) {
+		t.Fatalf("context cancellation must dominate recorded capability, channel=%+v err=%v", channel, err)
 	}
 }
 

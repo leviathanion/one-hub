@@ -1,10 +1,12 @@
 package deepseek
 
 import (
+	"one-api/common/config"
 	"one-api/common/requester"
 	"one-api/model"
 	"one-api/providers/base"
 	"one-api/providers/openai"
+	"one-api/types"
 )
 
 type DeepseekProviderFactory struct{}
@@ -20,8 +22,24 @@ func (f DeepseekProviderFactory) Create(channel *model.Channel) base.ProviderInt
 				Requester: requester.NewHTTPRequester(*channel.Proxy, openai.RequestErrorHandle),
 			},
 			BalanceAction: false,
+			UsageHandler:  deepSeekUsageHandler,
 		},
 	}
+}
+
+func deepSeekUsageHandler(usage *types.Usage) bool {
+	if usage == nil {
+		return false
+	}
+	if usage.ProviderTokenFields[config.UsageExtraDeepSeekCacheHit] {
+		usage.SetExtraTokens(config.UsageExtraDeepSeekCacheHit, usage.ProviderPromptCacheHitTokens)
+	}
+	if usage.ProviderTokenFields[config.UsageExtraDeepSeekCacheMiss] {
+		usage.SetExtraTokens(config.UsageExtraDeepSeekCacheMiss, usage.ProviderPromptCacheMissTokens)
+	}
+	usage.RequireTokenExtraEvidence(config.UsageExtraDeepSeekCacheHit, config.UsageExtraDeepSeekCacheMiss)
+	usage.MarkProviderReported()
+	return false
 }
 
 func getDeepseekConfig() base.ProviderConfig {

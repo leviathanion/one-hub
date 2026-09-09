@@ -8,15 +8,9 @@ type ResponsesWSTransportSendStatus string
 type ResponsesWSTransportSendReason string
 
 const (
-	ResponsesWSTransportSendNotAttempted         ResponsesWSTransportSendStatus = "not_attempted"
-	ResponsesWSTransportSendAttempted            ResponsesWSTransportSendStatus = "attempted"
-	ResponsesWSTransportSendRejectedBeforeStream ResponsesWSTransportSendStatus = "rejected_before_stream"
-	ResponsesWSTransportSendAmbiguous            ResponsesWSTransportSendStatus = "ambiguous"
-)
-
-const (
-	ResponsesWSTransportSendReasonNoActiveBridgeCancel ResponsesWSTransportSendReason = "no_active_bridge_cancel"
-	ResponsesWSTransportSendReasonStaleBridgeCancel    ResponsesWSTransportSendReason = "stale_bridge_cancel"
+	ResponsesWSTransportSendNotAttempted ResponsesWSTransportSendStatus = "not_attempted"
+	ResponsesWSTransportSendAttempted    ResponsesWSTransportSendStatus = "attempted"
+	ResponsesWSTransportSendAmbiguous    ResponsesWSTransportSendStatus = "ambiguous"
 )
 
 type ResponsesWSTransportSendResult struct {
@@ -28,7 +22,7 @@ type ResponsesWSTransportSendResult struct {
 
 func ValidateResponsesWSTransportSendResult(result ResponsesWSTransportSendResult) error {
 	switch result.Status {
-	case ResponsesWSTransportSendAttempted, ResponsesWSTransportSendRejectedBeforeStream:
+	case ResponsesWSTransportSendAttempted:
 		if result.Err != nil || result.Reason != "" {
 			return ErrInvalidResponsesWSTransportSendResult
 		}

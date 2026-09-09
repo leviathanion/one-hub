@@ -13,6 +13,7 @@ import (
 	providersBase "one-api/providers/base"
 	"one-api/safty"
 	"one-api/types"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -20,7 +21,8 @@ import (
 
 type relayCompletions struct {
 	relayBase
-	request types.CompletionRequest
+	request         types.CompletionRequest
+	streamUsageSeen bool
 }
 
 func NewRelayCompletions(c *gin.Context) *relayCompletions {
@@ -30,6 +32,19 @@ func NewRelayCompletions(c *gin.Context) *relayCompletions {
 }
 
 func (r *relayCompletions) setRequest() error {
+	if err := r.decodeCurrentRequestBody(); err != nil {
+		return err
+	}
+	r.setOriginalModel(r.request.Model)
+	setRequestChannelCapability(r.c, requireEndpointEnabled(config.RelayModeCompletions))
+	return nil
+}
+
+func (r *relayCompletions) materializeSelectedProviderRequest() error {
+	return r.decodeCurrentRequestBody()
+}
+
+func (r *relayCompletions) decodeCurrentRequestBody() error {
 	r.request = types.CompletionRequest{}
 	if err := common.UnmarshalBodyReusable(r.c, &r.request); err != nil {
 		return err
@@ -42,8 +57,6 @@ func (r *relayCompletions) setRequest() error {
 	if !r.request.Stream && r.request.StreamOptions != nil {
 		return errors.New("the 'stream_options' parameter is only allowed when 'stream' is enabled")
 	}
-
-	r.setOriginalModel(r.request.Model)
 
 	return nil
 }
@@ -71,14 +84,12 @@ func (r *relayCompletions) send() (err *types.OpenAIErrorWithStatusCode, done bo
 	r.request.Model = r.modelName
 
 	// 内容审查
-	if config.EnableSafe {
-		if r.request.Prompt != nil {
-			CheckResult, _ := safty.CheckContent(r.request.Prompt)
-			if !CheckResult.IsSafe {
-				err = common.StringErrorWrapperLocal(CheckResult.Reason, CheckResult.Code, http.StatusBadRequest)
-				done = true
-				return
-			}
+	if r.request.Prompt != nil {
+		CheckResult, _ := safty.CheckContent(r.request.Prompt)
+		if !CheckResult.IsSafe {
+			err = common.StringErrorWrapperLocal(CheckResult.Reason, CheckResult.Code, http.StatusBadRequest)
+			done = true
+			return
 		}
 	}
 
@@ -94,7 +105,7 @@ func (r *relayCompletions) send() (err *types.OpenAIErrorWithStatusCode, done bo
 		}
 
 		var firstResponseTime time.Time
-		firstResponseTime, err = responseStreamClient(r.c, response, doneStr)
+		firstResponseTime, err = responseStreamClient(r.c, response, doneStr, r.observeStreamUsage)
 		r.SetFirstResponseTime(firstResponseTime)
 	} else {
 		var response *types.CompletionResponse
@@ -113,7 +124,7 @@ func (r *relayCompletions) send() (err *types.OpenAIErrorWithStatusCode, done bo
 }
 
 func (r *relayCompletions) getUsageResponse() string {
-	if r.request.StreamOptions != nil && r.request.StreamOptions.IncludeUsage {
+	if r.request.StreamOptions != nil && r.request.StreamOptions.IncludeUsage && !r.streamUsageSeen && r.provider != nil && r.provider.GetUsage().HasProviderUsage() {
 		usageResponse := types.CompletionResponse{
 			ID:      fmt.Sprintf("chatcmpl-%s", utils.GetUUID()),
 			Object:  "chat.completion.chunk",
@@ -132,4 +143,16 @@ func (r *relayCompletions) getUsageResponse() string {
 	}
 
 	return ""
+}
+
+func (r *relayCompletions) observeStreamUsage(data string) {
+	if r == nil || strings.TrimSpace(data) == "" || data == "[DONE]" {
+		return
+	}
+	var envelope struct {
+		Usage json.RawMessage `json:"usage"`
+	}
+	if json.Unmarshal([]byte(data), &envelope) == nil && len(envelope.Usage) > 0 && string(envelope.Usage) != "null" {
+		r.streamUsageSeen = true
+	}
 }

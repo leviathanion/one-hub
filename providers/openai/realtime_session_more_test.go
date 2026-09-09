@@ -4,18 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
 
+	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/logger"
-	"one-api/common/requester"
 	"one-api/common/responsesws"
 	"one-api/common/wsconn"
 	"one-api/common/wsconn/wstest"
@@ -25,8 +25,6 @@ import (
 	"one-api/types"
 
 	"github.com/gin-gonic/gin"
-	"github.com/spf13/viper"
-	"go.uber.org/zap"
 )
 
 func openAIResponsesWSTestSession(provider *OpenAIProvider, ctx context.Context, model string, req responsesws.OpenRequest) (responsesws.Upstream, *types.OpenAIErrorWithStatusCode) {
@@ -51,11 +49,12 @@ func TestOpenAIRealtimePumpContextPreservesRequestValuesWithoutCancel(t *testing
 
 func newOpenAIRealtimeHelperSession() *openAIRealtimeSession {
 	return &openAIRealtimeSession{
-		model:     "gpt-4o-realtime-preview",
-		sessionID: "sess_helper",
-		recvCh:    make(chan openAIRealtimeOutbound, 8),
-		closed:    make(chan struct{}),
-		detached:  make(chan struct{}),
+		model:                       "gpt-4o-realtime-preview",
+		sessionID:                   "sess_helper",
+		recvCh:                      make(chan openAIRealtimeOutbound, 8),
+		closed:                      make(chan struct{}),
+		detached:                    make(chan struct{}),
+		outboundBackpressureTimeout: openAIRealtimeOutboundBackpressureTimeout,
 	}
 }
 
@@ -375,11 +374,11 @@ func TestOpenAIRealtimeSessionHelperNormalizationAndIDs(t *testing.T) {
 	if got := anyToString(123); got != "" {
 		t.Fatalf("expected non-string conversion to return empty string, got %q", got)
 	}
-	if usage := openAIRealtimeResponseUsage("evt_ignored", nil); usage != nil {
+	if usage := openAIRealtimeResponseUsage("evt_ignored", nil, nil); usage != nil {
 		t.Fatalf("expected nil response usage to stay nil, got %+v", usage)
 	}
 	responseEvent := &types.ResponseEvent{ID: " resp_usage ", Usage: &types.UsageEvent{TotalTokens: 9}}
-	if usage := openAIRealtimeResponseUsage(" evt_usage ", responseEvent); usage == nil || usage.TotalTokens != 9 ||
+	if usage := openAIRealtimeResponseUsage(" evt_usage ", responseEvent, nil); usage == nil || usage.TotalTokens != 9 ||
 		usage.Source != types.UsageSourceRealtimeResponse ||
 		usage.BillingBasis != types.UsageBillingBasisTokens ||
 		usage.ProviderEventID != "evt_usage" ||
@@ -387,7 +386,7 @@ func TestOpenAIRealtimeSessionHelperNormalizationAndIDs(t *testing.T) {
 		t.Fatalf("expected response usage passthrough, got %+v", usage)
 	}
 
-	tokenUsagePayload := []byte(`{"event_id":" evt_transcript_tokens ","type":"conversation.item.input_audio_transcription.completed","item_id":" item_1 ","usage":{"input_tokens":7,"total_tokens":7}}`)
+	tokenUsagePayload := []byte(`{"event_id":" evt_transcript_tokens ","type":"conversation.item.input_audio_transcription.completed","item_id":" item_1 ","usage":{"type":"tokens","input_tokens":7,"output_tokens":3,"total_tokens":10,"input_token_details":{"audio_tokens":7}}}`)
 	tokenUsage := openAIRealtimeInputAudioTranscriptionUsage("conversation.item.input_audio_transcription.completed", " evt_override ", tokenUsagePayload)
 	if tokenUsage == nil ||
 		tokenUsage.Source != types.UsageSourceInputAudioTranscription ||
@@ -395,30 +394,44 @@ func TestOpenAIRealtimeSessionHelperNormalizationAndIDs(t *testing.T) {
 		tokenUsage.ProviderEventID != "evt_override" ||
 		tokenUsage.ItemID != "item_1" ||
 		tokenUsage.InputTokens != 7 ||
-		tokenUsage.TotalTokens != 7 ||
+		tokenUsage.OutputTokens != 3 ||
+		tokenUsage.TotalTokens != 10 ||
+		tokenUsage.InputTokenDetails.AudioTokens != 7 ||
 		tokenUsage.DurationSeconds != 0 {
 		t.Fatalf("expected token transcription usage attribution, got %+v", tokenUsage)
 	}
 
-	durationUsagePayload := []byte(`{"event_id":" evt_transcript_duration ","type":"conversation.item.input_audio_transcription.completed","item_id":" item_2 ","usage":{"duration_seconds":2.5}}`)
+	durationUsagePayload := []byte(`{"event_id":" evt_transcript_duration ","type":"conversation.item.input_audio_transcription.completed","item_id":" item_2 ","usage":{"type":"duration","seconds":2.5}}`)
 	durationUsage := openAIRealtimeInputAudioTranscriptionUsage("conversation.item.input_audio_transcription.completed", "", durationUsagePayload)
 	if durationUsage == nil ||
 		durationUsage.Source != types.UsageSourceInputAudioTranscription ||
 		durationUsage.BillingBasis != types.UsageBillingBasisDuration ||
 		durationUsage.ProviderEventID != "evt_transcript_duration" ||
 		durationUsage.ItemID != "item_2" ||
-		durationUsage.DurationSeconds != 2.5 {
+		durationUsage.DurationSeconds != 2.5 ||
+		durationUsage.ProviderOperationUnits == nil || *durationUsage.ProviderOperationUnits != 1 {
 		t.Fatalf("expected duration transcription usage attribution, got %+v", durationUsage)
 	}
 }
 
-func TestOpenAIRealtimeReadLoopWithNilConnClosesSession(t *testing.T) {
-	originalLogger := logger.Logger
-	logger.Logger = zap.NewNop()
-	t.Cleanup(func() {
-		logger.Logger = originalLogger
-	})
+func TestOpenAIRealtimeUsageUsesSessionCreatedModel(t *testing.T) {
+	session := &openAIRealtimeSession{model: "requested-alias"}
+	created := []byte(`{"type":"session.created","session":{"id":"sess_1","model":"gpt-realtime-2026-08-01"}}`)
+	if outbound, shouldClose := session.observeSupplierMessage(wsconn.TextMessage, created); shouldClose || outbound.usage != nil {
+		t.Fatalf("expected session bootstrap without usage, got close=%v outbound=%+v", shouldClose, outbound)
+	}
 
+	done := []byte(`{"event_id":"evt_done","type":"response.done","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}`)
+	outbound, shouldClose := session.observeSupplierMessage(wsconn.TextMessage, done)
+	if shouldClose || outbound.usage == nil {
+		t.Fatalf("expected terminal usage, got close=%v outbound=%+v", shouldClose, outbound)
+	}
+	if outbound.usage.ResponseModel != "gpt-realtime-2026-08-01" {
+		t.Fatalf("expected session-created actual model attribution, got %+v", outbound.usage)
+	}
+}
+
+func TestOpenAIRealtimeReadLoopWithNilConnClosesSession(t *testing.T) {
 	session := &openAIRealtimeSession{
 		model:     "gpt-5",
 		sessionID: "nil-conn-session",
@@ -483,48 +496,22 @@ func TestOpenAIResponsesWSDefersReadUntilRecvAndFiltersSessionCreated(t *testing
 	}
 }
 
-func TestOpenAIResponsesWSHTTPBridgeUsesBridgeSession(t *testing.T) {
-	provider := newOpenAIRealtimeTestProvider("http://127.0.0.1")
-	session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
-		Transport: runtimesession.TransportModeResponsesHTTPBridge,
-	})
-	if errWithCode != nil {
-		t.Fatalf("expected http bridge session to open without native websocket dial, got %v", errWithCode)
-	}
-	if _, ok := session.(*responsesws.BridgeSession); !ok {
-		t.Fatalf("expected common bridge ResponsesWS upstream, got %T", session)
-	}
-	session.Abort("test_cleanup")
-}
-
 func TestOpenAIResponsesWSUnsupportedWhenResponsesEndpointMissing(t *testing.T) {
 	provider := newOpenAIRealtimeTestProvider("http://127.0.0.1:1")
 	provider.Config.Responses = ""
 
-	for _, tc := range []struct {
-		name      string
-		transport runtimesession.TransportMode
-	}{
-		{name: "native", transport: runtimesession.TransportModeResponsesWS},
-		{name: "http bridge", transport: runtimesession.TransportModeResponsesHTTPBridge},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
-				Transport: tc.transport,
-			})
-			if session != nil {
-				session.Abort("test_cleanup")
-			}
-			if errWithCode == nil || errWithCode.StatusCode != http.StatusUpgradeRequired || errWithCode.Code != "responses_ws_unsupported_for_channel" {
-				t.Fatalf("expected missing Responses endpoint to return responses_ws_unsupported_for_channel, session=%T err=%+v", session, errWithCode)
-			}
-		})
+	session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{})
+	if session != nil {
+		session.Abort("test_cleanup")
+	}
+	if errWithCode == nil || errWithCode.StatusCode != http.StatusUpgradeRequired || errWithCode.Code != "responses_ws_unsupported_for_channel" {
+		t.Fatalf("expected missing Responses endpoint to return responses_ws_unsupported_for_channel, session=%T err=%+v", session, errWithCode)
 	}
 }
 
 func TestOpenAIResponsesWSCustomNativeRequiresExplicitCapability(t *testing.T) {
 	proxy := ""
-	disabled := CreateOpenAIProvider(&model.Channel{
+	disabled := CreateOpenAIProvider(&model.Channel{Plugin: model.NewCustomEndpointPlugin(),
 		Key:   "sk-test",
 		Type:  config.ChannelTypeCustom,
 		Other: `{"responses_ws_self_hosted":true}`,
@@ -544,7 +531,7 @@ func TestOpenAIResponsesWSCustomNativeRequiresExplicitCapability(t *testing.T) {
 	})
 	defer server.Close()
 
-	enabled := CreateOpenAIProvider(&model.Channel{
+	enabled := CreateOpenAIProvider(&model.Channel{Plugin: model.NewCustomEndpointPlugin(),
 		Key:   "sk-test",
 		Type:  config.ChannelTypeCustom,
 		Other: `{"responses_ws_native":true,"responses_ws_self_hosted":true}`,
@@ -598,425 +585,6 @@ func TestOpenAIResponsesWSOpenAITypeCustomBaseURLRequiresExplicitNativeCapabilit
 	}
 	close(releaseDone)
 	session.Abort("test_cleanup")
-}
-
-func TestOpenAIResponsesWSHTTPBridgeStreamsResponsesEvents(t *testing.T) {
-	originalHTTPClient := requester.HTTPClient
-	requester.HTTPClient = &http.Client{}
-	defer func() {
-		requester.HTTPClient = originalHTTPClient
-	}()
-	seenRequest := make(chan types.OpenAIResponsesRequest, 1)
-	seenRawRequest := make(chan map[string]json.RawMessage, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var rawRequest map[string]json.RawMessage
-		if err := json.NewDecoder(r.Body).Decode(&rawRequest); err != nil {
-			t.Errorf("decode bridge request: %v", err)
-		} else {
-			seenRawRequest <- rawRequest
-			requestBytes, _ := json.Marshal(rawRequest)
-			var request types.OpenAIResponsesRequest
-			if err := json.Unmarshal(requestBytes, &request); err != nil {
-				t.Errorf("decode typed bridge request: %v", err)
-			}
-			seenRequest <- request
-		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_bridge\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n"))
-	}))
-	defer server.Close()
-
-	provider := newOpenAIRealtimeTestProvider(server.URL)
-	provider.Usage = &types.Usage{}
-	session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
-		Transport: runtimesession.TransportModeResponsesHTTPBridge,
-	})
-	if errWithCode != nil {
-		t.Fatalf("expected http bridge session to open, got %v", errWithCode)
-	}
-	defer session.Abort("test_cleanup")
-
-	result := session.(responsesws.TransportSendCapable).SendClientWithResult(context.Background(), responsesws.SendRequest{AttemptID: "attempt-test", Frame: responsesws.NewTextFrame([]byte(`{"type":"response.create","event_id":"evt_bridge","model":"gpt-5","input":"hello","stream":true,"background":false,"stream_options":{"include_usage":true},"generate":true,"unknown_number":12345678901234567890}`))})
-	if result.Status != responsesws.ResponsesWSTransportSendAttempted || result.Err != nil {
-		t.Fatalf("expected bridge create to be attempted, got %+v", result)
-	}
-	select {
-	case request := <-seenRequest:
-		if request.Model != "gpt-5" || !request.Stream {
-			t.Fatalf("expected top-level response.create to become streamed provider request, got %+v", request)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("expected provider request to be observed")
-	}
-	select {
-	case rawRequest := <-seenRawRequest:
-		if _, ok := rawRequest["type"]; ok {
-			t.Fatalf("expected websocket event type to be stripped from HTTP bridge body, got %s", rawRequest["type"])
-		}
-		if _, ok := rawRequest["event_id"]; ok {
-			t.Fatalf("expected websocket event_id to be stripped from HTTP bridge body, got %s", rawRequest["event_id"])
-		}
-		if _, ok := rawRequest["background"]; ok {
-			t.Fatalf("expected websocket background to be stripped from HTTP bridge body, got %s", rawRequest["background"])
-		}
-		if string(rawRequest["stream_options"]) != `{"include_usage":true}` {
-			t.Fatalf("expected stream_options to be preserved in HTTP bridge body, got %s", rawRequest["stream_options"])
-		}
-		if string(rawRequest["generate"]) != "true" {
-			t.Fatalf("expected unknown/future generate field to be preserved, got %s", rawRequest["generate"])
-		}
-		if string(rawRequest["unknown_number"]) != "12345678901234567890" {
-			t.Fatalf("expected unknown numeric field to preserve raw precision, got %s", rawRequest["unknown_number"])
-		}
-		if string(rawRequest["stream"]) != "true" {
-			t.Fatalf("expected bridge body to force stream true, got %s", rawRequest["stream"])
-		}
-	case <-time.After(time.Second):
-		t.Fatal("expected raw provider request to be observed")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	opened, err := session.Recv(ctx)
-	if err != nil {
-		t.Fatalf("recv bridge opened: %v", err)
-	}
-	if opened.DetailOrigin != responsesws.RecvDetailOriginBridgeStreamOpened {
-		t.Fatalf("expected bridge_stream_opened, got %+v", opened)
-	}
-	event, err := session.Recv(ctx)
-	if err != nil {
-		t.Fatalf("recv bridge provider event: %v", err)
-	}
-	if event.Frame == nil || !strings.Contains(string(event.Frame.Payload()), "resp_bridge") || event.DetailOrigin != responsesws.RecvDetailOriginProviderStream {
-		t.Fatalf("expected provider_stream bridge frame, got %+v", event)
-	}
-	if event.Usage == nil || event.Usage.TotalTokens != 3 {
-		t.Fatalf("expected usage to be surfaced to actor path, got %+v", event.Usage)
-	}
-}
-
-func TestOpenAIResponsesWSHTTPBridgeDeliversFinalEventWithoutTrailingNewline(t *testing.T) {
-	originalHTTPClient := requester.HTTPClient
-	requester.HTTPClient = &http.Client{}
-	defer func() {
-		requester.HTTPClient = originalHTTPClient
-	}()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_no_trailing_newline","status":"completed","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}`))
-	}))
-	defer server.Close()
-
-	provider := newOpenAIRealtimeTestProvider(server.URL)
-	provider.Usage = &types.Usage{}
-	session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
-		Transport: runtimesession.TransportModeResponsesHTTPBridge,
-	})
-	if errWithCode != nil {
-		t.Fatalf("expected http bridge session to open, got %v", errWithCode)
-	}
-	defer session.Abort("test_cleanup")
-
-	result := session.(responsesws.TransportSendCapable).SendClientWithResult(context.Background(), responsesws.SendRequest{AttemptID: "attempt-test", Frame: responsesws.NewTextFrame([]byte(`{"type":"response.create","event_id":"evt_no_newline","model":"gpt-5","input":"hello"}`))})
-	if result.Status != responsesws.ResponsesWSTransportSendAttempted || result.Err != nil {
-		t.Fatalf("expected bridge create to be attempted, got %+v", result)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	opened, err := session.Recv(ctx)
-	if err != nil {
-		t.Fatalf("recv bridge opened: %v", err)
-	}
-	if opened.DetailOrigin != responsesws.RecvDetailOriginBridgeStreamOpened {
-		t.Fatalf("expected bridge_stream_opened, got %+v", opened)
-	}
-	event, err := session.Recv(ctx)
-	if err != nil {
-		t.Fatalf("recv bridge provider event without trailing newline: %v", err)
-	}
-	if event.Frame == nil || !strings.Contains(string(event.Frame.Payload()), "resp_no_trailing_newline") || event.DetailOrigin != responsesws.RecvDetailOriginProviderStream {
-		t.Fatalf("expected provider_stream bridge terminal frame, got %+v", event)
-	}
-	if event.Usage == nil || event.Usage.TotalTokens != 5 {
-		t.Fatalf("expected terminal usage to be surfaced, got %+v", event.Usage)
-	}
-}
-
-func TestOpenAIResponsesWSHTTPBridgeClassicAzureUsesResourceLevelResponsesURL(t *testing.T) {
-	originalHTTPClient := requester.HTTPClient
-	requester.HTTPClient = &http.Client{}
-	defer func() {
-		requester.HTTPClient = originalHTTPClient
-	}()
-
-	seenURL := make(chan string, 1)
-	seenRawRequest := make(chan map[string]json.RawMessage, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seenURL <- r.URL.String()
-		var rawRequest map[string]json.RawMessage
-		if err := json.NewDecoder(r.Body).Decode(&rawRequest); err != nil {
-			t.Errorf("decode Azure bridge request: %v", err)
-		} else {
-			seenRawRequest <- rawRequest
-		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_azure_bridge","status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"))
-	}))
-	defer server.Close()
-
-	proxy := ""
-	provider := CreateOpenAIProvider(&model.Channel{
-		Key:   "azure-key",
-		Type:  config.ChannelTypeAzure,
-		Other: `{"api_version":"2024-10-01-preview","responses_ws_transport":"http_bridge","responses_ws_self_hosted":true}`,
-		Proxy: &proxy,
-	}, server.URL)
-	provider.IsAzure = true
-	provider.Usage = &types.Usage{}
-	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
-	provider.Context = ctx
-
-	session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
-		Transport: runtimesession.TransportModeResponsesHTTPBridge,
-	})
-	if errWithCode != nil {
-		t.Fatalf("expected classic Azure http bridge session to open, got %v", errWithCode)
-	}
-	defer session.Abort("test_cleanup")
-
-	result := session.(responsesws.TransportSendCapable).SendClientWithResult(context.Background(), responsesws.SendRequest{AttemptID: "attempt-test", Frame: responsesws.NewTextFrame([]byte(`{"type":"response.create","event_id":"evt_azure_bridge","model":"gpt-5","input":"hello"}`))})
-	if result.Status != responsesws.ResponsesWSTransportSendAttempted || result.Err != nil {
-		t.Fatalf("expected Azure bridge create to be attempted, got %+v", result)
-	}
-
-	select {
-	case got := <-seenURL:
-		if got != "/openai/responses?api-version=2024-10-01-preview" {
-			t.Fatalf("expected classic Azure bridge to use resource-level Responses URL, got %q", got)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("expected Azure bridge request URL to be observed")
-	}
-	select {
-	case rawRequest := <-seenRawRequest:
-		if string(rawRequest["model"]) != `"gpt-5"` {
-			t.Fatalf("expected Azure bridge request body to preserve model, got %s", rawRequest["model"])
-		}
-	case <-time.After(time.Second):
-		t.Fatal("expected Azure bridge request body to be observed")
-	}
-}
-
-func TestOpenAIResponsesWSHTTPBridgeURLPolicyRejectsUnsafeDefaults(t *testing.T) {
-	t.Run("local http requires explicit responses self hosted", func(t *testing.T) {
-		proxy := ""
-		provider := CreateOpenAIProvider(&model.Channel{
-			Key:   "sk-test",
-			Type:  config.ChannelTypeOpenAI,
-			Proxy: &proxy,
-		}, "http://127.0.0.1:1")
-		session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
-			Transport: runtimesession.TransportModeResponsesHTTPBridge,
-		})
-		if errWithCode != nil {
-			t.Fatalf("expected bridge session to open lazily, got %v", errWithCode)
-		}
-		defer session.Abort("test_cleanup")
-
-		result := session.(responsesws.TransportSendCapable).SendClientWithResult(context.Background(), responsesws.SendRequest{AttemptID: "attempt-test", Frame: responsesws.NewTextFrame([]byte(`{"type":"response.create","model":"gpt-5","input":"hello"}`))})
-		if result.Status != responsesws.ResponsesWSTransportSendNotAttempted || !errors.Is(result.Err, requester.ErrUpstreamResponsesHTTPURLRequiresHTTPS) {
-			t.Fatalf("expected local http bridge send to be rejected before request, got %+v", result)
-		}
-	})
-
-	t.Run("metadata stays blocked even when responses self hosted", func(t *testing.T) {
-		proxy := ""
-		provider := CreateOpenAIProvider(&model.Channel{
-			Key:   "sk-test",
-			Type:  config.ChannelTypeOpenAI,
-			Other: `{"responses_ws_self_hosted":true}`,
-			Proxy: &proxy,
-		}, "http://169.254.169.254")
-		session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
-			Transport: runtimesession.TransportModeResponsesHTTPBridge,
-		})
-		if errWithCode != nil {
-			t.Fatalf("expected bridge session to open lazily, got %v", errWithCode)
-		}
-		defer session.Abort("test_cleanup")
-
-		result := session.(responsesws.TransportSendCapable).SendClientWithResult(context.Background(), responsesws.SendRequest{AttemptID: "attempt-test", Frame: responsesws.NewTextFrame([]byte(`{"type":"response.create","model":"gpt-5","input":"hello"}`))})
-		if result.Status != responsesws.ResponsesWSTransportSendNotAttempted || !errors.Is(result.Err, requester.ErrUpstreamResponsesHTTPURLHostBlocked) {
-			t.Fatalf("expected metadata bridge send to be rejected before request, got %+v", result)
-		}
-	})
-}
-
-func TestOpenAIResponsesWSHTTPBridgeURLPolicyPrecedesBridgeBodyValidation(t *testing.T) {
-	proxy := ""
-	provider := CreateOpenAIProvider(&model.Channel{
-		Key:   "sk-test",
-		Type:  config.ChannelTypeOpenAI,
-		Proxy: &proxy,
-	}, "http://127.0.0.1:1")
-	session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
-		Transport: runtimesession.TransportModeResponsesHTTPBridge,
-	})
-	if errWithCode != nil {
-		t.Fatalf("expected bridge session to open lazily, got %v", errWithCode)
-	}
-	defer session.Abort("test_cleanup")
-
-	result := session.(responsesws.TransportSendCapable).SendClientWithResult(context.Background(), responsesws.SendRequest{AttemptID: "attempt-test", Frame: responsesws.NewTextFrame([]byte(`{"type":"response.create","model":"gpt-5","input":"hello","background":true}`))})
-	if result.Status != responsesws.ResponsesWSTransportSendNotAttempted || !errors.Is(result.Err, requester.ErrUpstreamResponsesHTTPURLRequiresHTTPS) {
-		t.Fatalf("expected URL policy error before unsupported background validation, got %+v", result)
-	}
-	if strings.Contains(result.Err.Error(), "background") {
-		t.Fatalf("expected URL policy error to win over background validation, got %v", result.Err)
-	}
-}
-
-func TestOpenAIResponsesWSHTTPBridgeDoesNotReuseOpenPreviousResponseID(t *testing.T) {
-	originalHTTPClient := requester.HTTPClient
-	requester.HTTPClient = &http.Client{}
-	defer func() {
-		requester.HTTPClient = originalHTTPClient
-	}()
-	seenRawRequest := make(chan map[string]json.RawMessage, 2)
-	var requests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var rawRequest map[string]json.RawMessage
-		if err := json.NewDecoder(r.Body).Decode(&rawRequest); err != nil {
-			t.Errorf("decode bridge request: %v", err)
-		} else {
-			seenRawRequest <- rawRequest
-		}
-		id := "resp_openai_bridge_first"
-		if requests.Add(1) == 2 {
-			id = "resp_openai_bridge_second"
-		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"` + id + `","status":"completed"}}` + "\n\n"))
-	}))
-	defer server.Close()
-
-	provider := newOpenAIRealtimeTestProvider(server.URL)
-	session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
-		Transport:          runtimesession.TransportModeResponsesHTTPBridge,
-		PreviousResponseID: "resp_open_default",
-	})
-	if errWithCode != nil {
-		t.Fatalf("expected http bridge session to open, got %v", errWithCode)
-	}
-	defer session.Abort("test_cleanup")
-
-	result := session.(responsesws.TransportSendCapable).SendClientWithResult(context.Background(), responsesws.SendRequest{AttemptID: "attempt-test", Frame: responsesws.NewTextFrame([]byte(`{"type":"response.create","event_id":"evt_first","model":"gpt-5","input":"first"}`))})
-	if result.Status != responsesws.ResponsesWSTransportSendAttempted || result.Err != nil {
-		t.Fatalf("expected first bridge create to be attempted, got %+v", result)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if _, err := session.Recv(ctx); err != nil {
-		t.Fatalf("recv first bridge opened: %v", err)
-	}
-	if _, err := session.Recv(ctx); err != nil {
-		t.Fatalf("recv first bridge terminal: %v", err)
-	}
-	first := recvSeenRawRequest(t, seenRawRequest)
-	if string(first["previous_response_id"]) != `"resp_open_default"` {
-		t.Fatalf("expected first bridge request to use open default, got %s", first["previous_response_id"])
-	}
-
-	result = session.(responsesws.TransportSendCapable).SendClientWithResult(context.Background(), responsesws.SendRequest{AttemptID: "attempt-test", Frame: responsesws.NewTextFrame([]byte(`{"type":"response.create","event_id":"evt_second","model":"gpt-5","input":"second"}`))})
-	if result.Status != responsesws.ResponsesWSTransportSendAttempted || result.Err != nil {
-		t.Fatalf("expected second bridge create to be attempted, got %+v", result)
-	}
-	second := recvSeenRawRequest(t, seenRawRequest)
-	if _, ok := second["previous_response_id"]; ok {
-		t.Fatalf("expected second bridge request not to reuse open default, body=%#v", second)
-	}
-}
-
-func recvSeenRawRequest(t *testing.T, seen <-chan map[string]json.RawMessage) map[string]json.RawMessage {
-	t.Helper()
-	select {
-	case rawRequest := <-seen:
-		return rawRequest
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for provider bridge HTTP request")
-		return nil
-	}
-}
-
-func TestOpenAIResponsesWSHTTPBridgeSeparatesOpenFailureAndStreamEOF(t *testing.T) {
-	originalHTTPClient := requester.HTTPClient
-	requester.HTTPClient = &http.Client{}
-	defer func() {
-		requester.HTTPClient = originalHTTPClient
-	}()
-
-	rejectServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, `{"error":{"code":"rate_limit","type":"provider_error","message":"provider busy"}}`, http.StatusTooManyRequests)
-	}))
-	defer rejectServer.Close()
-
-	provider := newOpenAIRealtimeTestProvider(rejectServer.URL)
-	provider.Usage = &types.Usage{}
-	session, errWithCode := openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
-		Transport: runtimesession.TransportModeResponsesHTTPBridge,
-	})
-	if errWithCode != nil {
-		t.Fatalf("expected reject bridge session to open, got %v", errWithCode)
-	}
-	result := session.(responsesws.TransportSendCapable).SendClientWithResult(context.Background(), responsesws.SendRequest{AttemptID: "attempt-test", Frame: responsesws.NewTextFrame([]byte(`{"type":"response.create","model":"gpt-5","input":"hello"}`))})
-	if result.Status != responsesws.ResponsesWSTransportSendRejectedBeforeStream || result.Err != nil {
-		t.Fatalf("expected provider HTTP rejection to be rejected_before_stream, got %+v", result)
-	}
-	rejectCtx, rejectCancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer rejectCancel()
-	rejectEvent, err := session.Recv(rejectCtx)
-	if err != nil {
-		t.Fatalf("recv provider HTTP rejection: %v", err)
-	}
-	if rejectEvent.DetailOrigin != responsesws.RecvDetailOriginBridgeOpenProviderError || responsesws.ClientPayloadFromError(rejectEvent.Err) == nil || rejectEvent.ProviderClose != nil {
-		t.Fatalf("expected provider HTTP rejection payload through event path without provider close, got %+v", rejectEvent)
-	}
-	session.Abort("test_cleanup")
-
-	eofServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-	}))
-	defer eofServer.Close()
-	provider = newOpenAIRealtimeTestProvider(eofServer.URL)
-	provider.Usage = &types.Usage{}
-	session, errWithCode = openAIResponsesWSTestSession(provider, context.Background(), "gpt-5", responsesws.OpenRequest{
-		Transport: runtimesession.TransportModeResponsesHTTPBridge,
-	})
-	if errWithCode != nil {
-		t.Fatalf("expected eof bridge session to open, got %v", errWithCode)
-	}
-	defer session.Abort("test_cleanup")
-	result = session.(responsesws.TransportSendCapable).SendClientWithResult(context.Background(), responsesws.SendRequest{AttemptID: "attempt-test", Frame: responsesws.NewTextFrame([]byte(`{"type":"response.create","model":"gpt-5","input":"hello"}`))})
-	if result.Status != responsesws.ResponsesWSTransportSendAttempted || result.Err != nil {
-		t.Fatalf("expected stream open to be attempted, got %+v", result)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	opened, err := session.Recv(ctx)
-	if err != nil {
-		t.Fatalf("recv stream opened: %v", err)
-	}
-	if opened.DetailOrigin != responsesws.RecvDetailOriginBridgeStreamOpened {
-		t.Fatalf("expected bridge_stream_opened before EOF, got %+v", opened)
-	}
-	event, err := session.Recv(ctx)
-	if err != nil {
-		t.Fatalf("recv stream EOF: %v", err)
-	}
-	if event.DetailOrigin != responsesws.RecvDetailOriginBridgeStreamEOF || event.ProviderClose != nil {
-		t.Fatalf("expected bridge_stream_eof without provider close, got %+v", event)
-	}
 }
 
 func TestOpenAIOpenResponsesWSUsesResponsesTransportWithoutCompatMode(t *testing.T) {
@@ -1210,15 +778,104 @@ func TestOpenAIResponsesWSFutureProviderEventShapePassesThrough(t *testing.T) {
 	}
 }
 
-func TestOpenAIRealtimeConfigureConnAppliesUpstreamReadLimit(t *testing.T) {
+func TestOpenAIResponsesWSInterpretsOnlyResponsesUsageEvents(t *testing.T) {
+	adapter := openAIResponsesWSAdapter{}
+	terminalPayload := []byte(`{"type":"response.completed","event_id":"evt_responses_usage","sequence_number":0,"response":{"id":"resp_usage","status":"completed","model":"gpt-5.6","service_tier":"priority","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8,"input_tokens_details":{"cached_tokens":2},"output_tokens_details":{"reasoning_tokens":1}}}}`)
+	terminal := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame(terminalPayload))
+	if terminal.Err != nil || terminal.EmitFrame == nil || string(terminal.EmitFrame.Payload()) != string(terminalPayload) {
+		t.Fatalf("expected Responses terminal to pass through unchanged, got %+v", terminal)
+	}
+	if terminal.Usage == nil || !terminal.Usage.ProviderTokenEvidence || terminal.Usage.Source != types.UsageSourceResponsesResponse || terminal.Usage.ProviderEventID != "evt_responses_usage" || terminal.Usage.ResponseID != "resp_usage" || terminal.Usage.TotalTokens != 8 || terminal.Usage.InputTokenDetails.CachedTokens != 2 || terminal.Usage.OutputTokenDetails.ReasoningTokens != 1 {
+		t.Fatalf("expected Responses DTO usage evidence, got %+v", terminal.Usage)
+	}
+
+	transcriptionPayload := []byte(`{"type":"conversation.item.input_audio_transcription.completed","event_id":"evt_transcription","item_id":"item_1","usage":{"input_tokens":7,"output_tokens":0,"total_tokens":7}}`)
+	transcription := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame(transcriptionPayload))
+	if transcription.Err != nil || transcription.EmitFrame == nil || string(transcription.EmitFrame.Payload()) != string(transcriptionPayload) {
+		t.Fatalf("expected unknown Realtime-only event to remain passthrough, got %+v", transcription)
+	}
+	if transcription.Usage != nil {
+		t.Fatalf("Responses adapter must not interpret Realtime transcription usage, got %+v", transcription.Usage)
+	}
+}
+
+func TestOpenAIResponsesWSRequiresCompleteProviderTokenPartition(t *testing.T) {
+	adapter := openAIResponsesWSAdapter{}
+	for name, payload := range map[string][]byte{
+		"missing output": []byte(`{"type":"response.completed","sequence_number":0,"response":{"id":"resp_partial","status":"completed","usage":{"input_tokens":3,"total_tokens":3}}}`),
+		"null output":    []byte(`{"type":"response.completed","sequence_number":0,"response":{"id":"resp_partial","status":"completed","usage":{"input_tokens":3,"output_tokens":null,"total_tokens":3}}}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			result := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame(payload))
+			if result.Err != nil || result.Usage == nil {
+				t.Fatalf("partial usage observation was not preserved: %+v", result)
+			}
+			if result.Usage.ProviderTokenEvidence {
+				t.Fatalf("partial provider partition was authorized: %+v", result.Usage)
+			}
+		})
+	}
+}
+
+func TestOpenAIRealtimeRequiresCompleteProviderTokenPartition(t *testing.T) {
+	for name, payload := range map[string][]byte{
+		"complete":        []byte(`{"type":"response.done","response":{"id":"resp_usage","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`),
+		"missing output":  []byte(`{"type":"response.done","response":{"id":"resp_usage","usage":{"input_tokens":3,"total_tokens":3}}}`),
+		"null output":     []byte(`{"type":"response.done","response":{"id":"resp_usage","usage":{"input_tokens":3,"output_tokens":null,"total_tokens":3}}}`),
+		"negative output": []byte(`{"type":"response.done","response":{"id":"resp_usage","usage":{"input_tokens":3,"output_tokens":-1,"total_tokens":2}}}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			var event types.Event
+			if err := json.Unmarshal(payload, &event); err != nil {
+				t.Fatal(err)
+			}
+			usage := openAIRealtimeResponseUsage("evt_usage", event.Response, payload)
+			if usage == nil {
+				t.Fatal("provider usage observation was lost")
+			}
+			want := name == "complete"
+			if usage.ProviderTokenEvidence != want {
+				t.Fatalf("provider token evidence=%v want %v: %+v", usage.ProviderTokenEvidence, want, usage)
+			}
+		})
+	}
+}
+
+func TestOpenAIRealtimeExplicitTurnAdmissionRequiresAutomaticWorkDisabled(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		payload string
+		want    bool
+		present bool
+	}{
+		{name: "top-level null", payload: `{"type":"session.update","session":{"turn_detection":null}}`, want: true, present: true},
+		{name: "top-level create disabled", payload: `{"type":"session.update","session":{"turn_detection":{"type":"server_vad","create_response":false}}}`, want: true, present: true},
+		{name: "nested create disabled", payload: `{"type":"session.update","session":{"audio":{"input":{"turn_detection":{"type":"semantic_vad","create_response":false}}}}}`, want: true, present: true},
+		{name: "automatic create enabled", payload: `{"type":"session.update","session":{"turn_detection":{"create_response":true}}}`, want: false, present: true},
+		{name: "unrelated update", payload: `{"type":"session.update","session":{"voice":"alloy"}}`, present: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, present := openAIRealtimeAutomaticFeaturesDisabled([]byte(test.payload))
+			if got != test.want || present != test.present {
+				t.Fatalf("automatic feature state=(%v,%v), want (%v,%v)", got, present, test.want, test.present)
+			}
+		})
+	}
+
+	payload := []byte(`{"type":"response.create","response":{"model":"gpt-realtime-selected","max_output_tokens":512,"service_tier":"priority","tools":[{"type":"function"}]}}`)
+	admission := openAIRealtimeBoundedTurnAdmission(payload, runtimesession.ModelBinding{RequestedModel: "voice-public", ProviderModel: "gpt-realtime-default", BillingModel: "voice-public"}, true)
+	if !admission.ExplicitClientCreate || !admission.AutomaticFeaturesDisabled || admission.Models.RequestedModel != "voice-public" || admission.Models.ProviderModel != "gpt-realtime-default" || admission.MaxOutputTokens != 512 || admission.ServiceTier != "priority" || admission.UnknownChargeDimensions {
+		t.Fatalf("bounded turn admission lost billing dimensions: %+v", admission)
+	}
+	unknown := openAIRealtimeBoundedTurnAdmission([]byte(`{"type":"response.create","response":{"tools":[{"type":"web_search"}]}}`), runtimesession.ModelBinding{RequestedModel: "gpt-realtime", ProviderModel: "gpt-realtime", BillingModel: "gpt-realtime"}, true)
+	if !unknown.UnknownChargeDimensions {
+		t.Fatalf("unknown realtime charge dimension was accepted: %+v", unknown)
+	}
+}
+
+func TestOpenAIRealtimeConnEnforcesUpstreamReadLimit(t *testing.T) {
 	const limit = int64(64)
 	const oversizedPayloadBytes = 512
-
-	previousLimit := viper.Get("realtime.websocket_read_limit")
-	viper.Set("realtime.websocket_read_limit", limit)
-	t.Cleanup(func() {
-		viper.Set("realtime.websocket_read_limit", previousLimit)
-	})
 
 	releaseWrite := make(chan struct{})
 	wsURL, cleanupServer := wstest.Server(t, func(conn *wsconn.ManagedConn) {
@@ -1232,7 +889,7 @@ func TestOpenAIRealtimeConfigureConnAppliesUpstreamReadLimit(t *testing.T) {
 
 	conn := dialOpenAIRealtimeManagedTestConn(t, wsURL, wsconn.Config{
 		Label:        "openai realtime read limit test upstream",
-		ReadLimit:    config.RealtimeWebsocketReadLimit(),
+		ReadLimit:    limit,
 		WriteTimeout: openAIRealtimeTestWriteTimeout(),
 	})
 	defer conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_cleanup"})
@@ -1318,10 +975,6 @@ func TestOpenAIRealtimeSessionSelectionAndFinalizationHelpers(t *testing.T) {
 	session := newOpenAIRealtimeHelperSession()
 	session.turn = newOpenAIRealtimeTurnState(1, now, recorder)
 	session.turn.rememberResponseID("resp-active")
-
-	pending := newOpenAIRealtimeTurnState(2, now, recorder)
-	pending.rememberResponseID("resp-pending")
-	session.pendingTurns = []openAIRealtimePendingTurn{{state: pending, reason: "pending_recovery"}}
 	session.recentFinalizedIDs = []string{"resp-finalized"}
 
 	if selected := session.selectSupplierTurnLocked(""); selected.state != session.turn || selected.dropAttribution {
@@ -1330,76 +983,235 @@ func TestOpenAIRealtimeSessionSelectionAndFinalizationHelpers(t *testing.T) {
 	if selected := session.selectSupplierTurnLocked("resp-active"); selected.state != session.turn || selected.dropAttribution {
 		t.Fatalf("expected active response id lookup to return current turn, got %+v", selected)
 	}
-	if selected := session.selectSupplierTurnLocked("resp-pending"); selected.state != pending || selected.dropAttribution {
-		t.Fatalf("expected pending response id lookup to return pending turn, got %+v", selected)
-	}
 	if selected := session.selectSupplierTurnLocked("resp-finalized"); !selected.dropAttribution || selected.state != nil {
 		t.Fatalf("expected finalized response id lookup to drop attribution, got %+v", selected)
 	}
-
-	session.releaseTurnStateForRecovery(session.turn, "supplier_recovery")
-	if session.turn != nil || len(session.pendingTurns) != 2 || session.pendingTurns[1].reason != "supplier_recovery" {
-		t.Fatalf("expected active turn release to move turn into pending queue, pending=%+v", session.pendingTurns)
-	}
-	session.releaseTurnStateForRecovery(pending, "updated_reason")
-	if session.pendingTurns[0].reason != "updated_reason" {
-		t.Fatalf("expected pending release to update recovery reason, got %+v", session.pendingTurns[0])
-	}
-	if index := session.pendingTurnIndexLocked(pending); index != 0 {
-		t.Fatalf("expected pending turn index 0, got %d", index)
-	}
-	if index := session.pendingTurnIndexLocked(newOpenAIRealtimeTurnState(3, now, recorder)); index != -1 {
-		t.Fatalf("expected unknown pending turn index -1, got %d", index)
-	}
-
-	session.turn = newOpenAIRealtimeTurnState(3, now, recorder)
 	session.turn.rememberResponseID("resp-finalize-current")
 	finalizedCurrent := session.finalizeObservedTurnState(session.turn, "response.done", now)
 	if len(finalizedCurrent) != 1 || session.turn != nil {
 		t.Fatalf("expected current turn finalization to produce one finalizer, finalized=%d turn=%+v", len(finalizedCurrent), session.turn)
 	}
-	runOpenAIRealtimeFinalizers(finalizedCurrent)
-
-	pendingFinalizer := newOpenAIRealtimeTurnState(4, now, recorder)
-	pendingFinalizer.rememberResponseID("resp-finalize-pending")
-	session.pendingTurns = []openAIRealtimePendingTurn{
-		{state: pendingFinalizer, reason: ""},
-		{state: nil, reason: "ignored"},
-	}
-	finalizedPending := session.finalizeObservedTurnState(pendingFinalizer, "fallback_reason", now)
-	if len(finalizedPending) != 1 || len(session.pendingTurns) != 1 {
-		t.Fatalf("expected pending turn finalization to remove one pending turn, finalized=%d pending=%d", len(finalizedPending), len(session.pendingTurns))
-	}
-	runOpenAIRealtimeFinalizers(finalizedPending)
-
-	session.pendingTurns = []openAIRealtimePendingTurn{
-		{state: newOpenAIRealtimeTurnState(5, now, recorder), reason: ""},
-		{state: nil, reason: "ignored"},
-	}
-	finalizedAll := session.finalizePendingTurns("default_reason", now)
-	if len(finalizedAll) != 1 || len(session.pendingTurns) != 0 {
-		t.Fatalf("expected finalizePendingTurns to flush pending queue, finalized=%d pending=%d", len(finalizedAll), len(session.pendingTurns))
-	}
-	runOpenAIRealtimeFinalizers(finalizedAll)
+	session.runFinalizers(finalizedCurrent)
 
 	session.rememberFinalizedResponseIDsLocked("", "dup", "dup")
 	for i := 0; i < openAIRealtimeFinalizedResponseIDLimit+2; i++ {
-		session.rememberFinalizedResponseIDsLocked("resp-limit-" + string(rune('a'+i)))
+		session.rememberFinalizedResponseIDsLocked(fmt.Sprintf("resp-limit-%d", i))
 	}
 	if len(session.recentFinalizedIDs) != openAIRealtimeFinalizedResponseIDLimit {
 		t.Fatalf("expected finalized response id history cap %d, got %d", openAIRealtimeFinalizedResponseIDLimit, len(session.recentFinalizedIDs))
 	}
-	if !session.isRecentlyFinalizedResponseIDLocked("resp-limit-r") {
+	if !session.isRecentlyFinalizedResponseIDLocked(fmt.Sprintf("resp-limit-%d", openAIRealtimeFinalizedResponseIDLimit+1)) {
 		t.Fatal("expected newest finalized response id to be remembered")
 	}
-	if session.isRecentlyFinalizedResponseIDLocked("dup") {
+	if session.isRecentlyFinalizedResponseIDLocked("dup") || session.isRecentlyFinalizedResponseIDLocked("resp-limit-0") {
 		t.Fatal("expected oldest finalized response ids to be evicted after limit overflow")
 	}
 	if session.isRecentlyFinalizedResponseIDLocked("") {
 		t.Fatal("expected blank finalized response id lookup to return false")
 	}
-	if recorder.finalizeCount() < 3 {
-		t.Fatalf("expected multiple helper finalizers to run, got %d", recorder.finalizeCount())
+	oversizedID := strings.Repeat("r", openAIRealtimeIdentifierMaxBytes+1)
+	session.rememberFinalizedResponseIDsLocked(oversizedID)
+	if len(session.recentFinalizedIDs) != openAIRealtimeFinalizedResponseIDLimit || session.isRecentlyFinalizedResponseIDLocked(oversizedID) {
+		t.Fatal("expected oversized finalized response id to be ignored without disturbing the bounded history")
+	}
+	if recorder.finalizeCount() != 1 {
+		t.Fatalf("expected active helper finalizer to run once, got %d", recorder.finalizeCount())
+	}
+}
+
+func TestOpenAIRealtimeFinalizedHistoryCoversEveryIdentityFromPreviousTurn(t *testing.T) {
+	session := newOpenAIRealtimeHelperSession()
+	previous := newOpenAIRealtimeTurnState(1, time.Now(), &recordingOpenAIRealtimeObserver{})
+	for i := 0; i < openAIRealtimeResponseIDLimit; i++ {
+		if err := previous.rememberResponseID(fmt.Sprintf("resp-previous-%d", i)); err != nil {
+			t.Fatalf("remember previous response %d: %v", i, err)
+		}
+	}
+	session.turn = previous
+	session.runFinalizers(session.finalizeObservedTurnState(previous, types.EventTypeResponseDone, time.Now()))
+	if len(session.recentFinalizedIDs) != openAIRealtimeResponseIDLimit {
+		t.Fatalf("finalized history count=%d, want full previous-turn capacity %d", len(session.recentFinalizedIDs), openAIRealtimeResponseIDLimit)
+	}
+
+	current := newOpenAIRealtimeTurnState(2, time.Now(), &recordingOpenAIRealtimeObserver{})
+	if err := current.rememberResponseID("resp-current"); err != nil {
+		t.Fatalf("remember current response: %v", err)
+	}
+	session.turn = current
+	selected := session.selectSupplierTurnLocked("resp-previous-0")
+	if !selected.dropAttribution || selected.state != nil {
+		t.Fatalf("oldest identity from immediately previous full turn must not be attributed to current turn: %+v", selected)
+	}
+}
+
+func TestOpenAIRealtimeSessionRejectsOversizedClientEventIDBeforeStartingTurn(t *testing.T) {
+	conn, cleanup := newOpenAIRealtimeConnPair(t)
+	defer cleanup()
+
+	session := newOpenAIRealtimeHelperSession()
+	session.conn = conn
+	session.turnObserverFactory = func() runtimesession.TurnObserver { return &recordingOpenAIRealtimeObserver{} }
+	clientEventID := strings.Repeat("e", openAIRealtimeIdentifierMaxBytes+1)
+	payload := []byte(fmt.Sprintf(`{"type":"response.create","event_id":%q,"response":{"input":[]}}`, clientEventID))
+
+	err := session.SendClient(context.Background(), openAITestTextFrame(payload))
+	var event *types.Event
+	if !errors.As(err, &event) || event.ErrorDetail == nil || event.ErrorDetail.Code != "invalid_event" {
+		t.Fatalf("oversized client event id error=%v, want invalid_event", err)
+	}
+	if session.turn != nil || session.turnSeq != 0 {
+		t.Fatalf("oversized client event id must not start provider work: turn=%+v seq=%d", session.turn, session.turnSeq)
+	}
+}
+
+func TestOpenAIRealtimeSessionUsageStateOverflowReplacesProviderFrameAndFinalizesPrefix(t *testing.T) {
+	recorder := &recordingOpenAIRealtimeObserver{}
+	session := newOpenAIRealtimeHelperSession()
+	session.turn = newOpenAIRealtimeTurnState(1, time.Now(), recorder)
+
+	firstPayload := []byte(`{"type":"response.created","response":{"id":"resp-0","status":"in_progress","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`)
+	first, shouldClose := session.observeSupplierMessage(wsconn.TextMessage, firstPayload)
+	if shouldClose || first.usage == nil || first.usage.TotalTokens != 3 || recorder.observeCount() != 1 {
+		t.Fatalf("expected accepted prefix usage before overflow: outbound=%+v close=%v observed=%d", first, shouldClose, recorder.observeCount())
+	}
+	for i := 1; i < openAIRealtimeResponseIDLimit; i++ {
+		if err := session.turn.rememberResponseID(fmt.Sprintf("resp-%d", i)); err != nil {
+			t.Fatalf("seed response identity %d: %v", i, err)
+		}
+	}
+
+	overflowPayload := []byte(`{"type":"response.done","response":{"id":"resp-overflow","status":"completed","usage":{"input_tokens":4,"output_tokens":5,"total_tokens":9}}}`)
+	outbound, shouldClose := session.observeSupplierMessage(wsconn.TextMessage, overflowPayload)
+	if !shouldClose || outbound.origin != runtimerealtime.RealtimePayloadOriginProxyLocal || outbound.usage != nil {
+		t.Fatalf("overflow must close with a local error and no current-frame usage: outbound=%+v close=%v", outbound, shouldClose)
+	}
+	if strings.Contains(string(outbound.payload), "resp-overflow") || string(outbound.payload) == string(overflowPayload) {
+		t.Fatalf("overflowing provider frame must not be delivered: %s", outbound.payload)
+	}
+	var errorEnvelope struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type string `json:"type"`
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(outbound.payload, &errorEnvelope); err != nil || errorEnvelope.Type != types.EventTypeError || errorEnvelope.Error.Type != "provider_error" || errorEnvelope.Error.Code != "provider_usage_state_limit" {
+		t.Fatalf("unexpected realtime overflow error payload: payload=%s err=%v decoded=%+v", outbound.payload, err, errorEnvelope)
+	}
+	if session.turn != nil || recorder.observeCount() != 1 || recorder.finalizeCount() != 1 {
+		t.Fatalf("overflow must finalize exactly the accepted prefix: turn=%+v observed=%d finalized=%d", session.turn, recorder.observeCount(), recorder.finalizeCount())
+	}
+	finalized := recorder.lastPayload()
+	if finalized.TerminationReason != "provider_usage_state_limit" || finalized.Usage == nil || finalized.Usage.TotalTokens != 3 || finalized.LastResponseID == "resp-overflow" {
+		t.Fatalf("overflow finalization must preserve only accepted prefix facts: %+v", finalized)
+	}
+}
+
+func TestOpenAIRealtimeProviderFrameQueueStopsObservationAfterUsageStateOverflow(t *testing.T) {
+	recorder := &recordingOpenAIRealtimeObserver{}
+	session := newOpenAIRealtimeHelperSession()
+	session.turn = newOpenAIRealtimeTurnState(1, time.Now(), recorder)
+	for i := 0; i < openAIRealtimeResponseIDLimit-1; i++ {
+		if err := session.turn.rememberResponseID(fmt.Sprintf("resp-seed-%d", i)); err != nil {
+			t.Fatalf("seed response identity %d: %v", i, err)
+		}
+	}
+
+	frames := make(chan openAIRealtimeProviderFrame, 3)
+	frames <- openAIRealtimeProviderFrame{
+		messageType: wsconn.TextMessage,
+		payload:     []byte(`{"type":"response.created","response":{"id":"resp-prefix","status":"in_progress","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`),
+	}
+	frames <- openAIRealtimeProviderFrame{
+		messageType: wsconn.TextMessage,
+		payload:     []byte(`{"type":"response.done","response":{"id":"resp-overflow","status":"completed","usage":{"input_tokens":4,"output_tokens":5,"total_tokens":9}}}`),
+	}
+	frames <- openAIRealtimeProviderFrame{
+		messageType: wsconn.TextMessage,
+		payload:     []byte(`{"type":"response.done","response":{"id":"resp-after-limit","status":"completed","usage":{"input_tokens":50,"output_tokens":50,"total_tokens":100}}}`),
+	}
+	close(frames)
+
+	session.consumeProviderFrames(frames)
+	first, err, handled := session.recvQueuedOutbound()
+	if !handled || err != nil || first.Frame == nil || first.Usage == nil || first.Usage.TotalTokens != 3 || !strings.Contains(string(first.Frame.Payload()), "resp-prefix") {
+		t.Fatalf("expected accepted prefix frame first: event=%+v handled=%v err=%v", first, handled, err)
+	}
+	limitEvent, err, handled := session.recvQueuedOutbound()
+	if !handled || err != nil || limitEvent.Frame == nil || limitEvent.Usage != nil || !strings.Contains(string(limitEvent.Frame.Payload()), "provider_usage_state_limit") {
+		t.Fatalf("expected local state-limit event second: event=%+v handled=%v err=%v", limitEvent, handled, err)
+	}
+	select {
+	case extra := <-session.recvCh:
+		t.Fatalf("provider frame after hard limit boundary was still delivered: %+v", extra)
+	default:
+	}
+	if recorder.observeCount() != 1 || recorder.finalizeCount() != 1 || session.turn != nil {
+		t.Fatalf("frames after hard limit boundary must not be observed: observed=%d finalized=%d turn=%+v", recorder.observeCount(), recorder.finalizeCount(), session.turn)
+	}
+	finalized := recorder.lastPayload()
+	if finalized.Usage == nil || finalized.Usage.TotalTokens != 3 || finalized.LastResponseID != "resp-prefix" {
+		t.Fatalf("hard limit finalization included a queued follow-up frame: %+v", finalized)
+	}
+}
+
+func TestOpenAIRealtimeUnknownTranscriptionDoesNotAffectResponseOwner(t *testing.T) {
+	recorder := &recordingOpenAIRealtimeObserver{}
+	session := newOpenAIRealtimeHelperSession()
+	session.turn = newOpenAIRealtimeTurnState(1, time.Now(), recorder)
+	payload := []byte(`{"type":"conversation.item.input_audio_transcription.completed","item_id":"unknown-input","usage":{"input_tokens":7,"total_tokens":7},"response":{"id":"resp-unrelated"}}`)
+	if outbound, close := session.observeSupplierMessage(wsconn.TextMessage, payload); close || outbound.err != nil {
+		t.Fatalf("unknown input closed response: %+v", outbound)
+	}
+	if recorder.observeCount() != 0 || recorder.finalizeCount() != 0 || session.turn == nil || session.turn.lastResponseID != "" {
+		t.Fatal("unowned input usage affected current response")
+	}
+}
+
+func TestOpenAIRealtimeSessionUsageStateOverflowDoesNotCommitSessionModel(t *testing.T) {
+	recorder := &recordingOpenAIRealtimeObserver{}
+	session := newOpenAIRealtimeHelperSession()
+	session.actualModel = "model-accepted"
+	session.turn = newOpenAIRealtimeTurnState(1, time.Now(), recorder)
+
+	prefixPayload := []byte(`{"type":"response.created","response":{"id":"resp-prefix","status":"in_progress","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`)
+	if outbound, shouldClose := session.observeSupplierMessage(wsconn.TextMessage, prefixPayload); shouldClose || outbound.usage == nil || outbound.usage.TotalTokens != 3 {
+		t.Fatalf("expected accepted response prefix, outbound=%+v close=%v", outbound, shouldClose)
+	}
+	overflowID := strings.Repeat("r", openAIRealtimeIdentifierMaxBytes+1)
+	overflowPayload := []byte(fmt.Sprintf(`{"type":"session.created","session":{"id":"session-1","model":"model-offending"},"response":{"id":%q}}`, overflowID))
+
+	outbound, shouldClose := session.observeSupplierMessage(wsconn.TextMessage, overflowPayload)
+	if !shouldClose || outbound.usage != nil || outbound.origin != runtimerealtime.RealtimePayloadOriginProxyLocal || !strings.Contains(string(outbound.payload), "provider_usage_state_limit") {
+		t.Fatalf("offending session model frame must be replaced by local state-limit error: outbound=%+v close=%v", outbound, shouldClose)
+	}
+	if session.actualModel != "model-accepted" || session.turn != nil || recorder.observeCount() != 1 || recorder.finalizeCount() != 1 {
+		t.Fatalf("offending session model mutated accepted state: model=%q turn=%+v observed=%d finalized=%d", session.actualModel, session.turn, recorder.observeCount(), recorder.finalizeCount())
+	}
+	finalized := recorder.lastPayload()
+	if finalized.Models.ReportedModel != "model-accepted" || finalized.Models.BillingModel != session.model || finalized.Usage == nil || finalized.Usage.TotalTokens != 3 || finalized.LastResponseID != "resp-prefix" {
+		t.Fatalf("offending session model changed finalized prefix: %+v", finalized)
+	}
+}
+
+func TestOpenAIRealtimeLateFinalizedUsageIdentityDoesNotCloseCurrentTurn(t *testing.T) {
+	recorder := &recordingOpenAIRealtimeObserver{}
+	session := newOpenAIRealtimeHelperSession()
+	current := newOpenAIRealtimeTurnState(2, time.Now(), recorder)
+	if err := current.rememberResponseID("resp-current"); err != nil {
+		t.Fatalf("remember current response: %v", err)
+	}
+	session.turn = current
+	session.recentFinalizedIDs = []string{"resp-old"}
+	providerEventID := strings.Repeat("e", openAIRealtimeIdentifierMaxBytes+1)
+	payload := []byte(fmt.Sprintf(`{"event_id":%q,"type":"response.done","response":{"id":"resp-old","status":"completed","usage":{"input_tokens":4,"output_tokens":5,"total_tokens":9}}}`, providerEventID))
+
+	outbound, shouldClose := session.observeSupplierMessage(wsconn.TextMessage, payload)
+	if shouldClose || outbound.usage != nil || outbound.origin != runtimerealtime.RealtimePayloadOriginProvider || string(outbound.payload) != string(payload) {
+		t.Fatalf("late finalized frame must pass through without attribution or local failure: outbound=%+v close=%v", outbound, shouldClose)
+	}
+	if session.turn != current || recorder.observeCount() != 0 || recorder.finalizeCount() != 0 {
+		t.Fatalf("late finalized frame disturbed current turn: turn=%+v observed=%d finalized=%d", session.turn, recorder.observeCount(), recorder.finalizeCount())
 	}
 }
 
@@ -1442,6 +1254,28 @@ func TestOpenAIRealtimeSessionQueueLifecycleAndSendClientGuards(t *testing.T) {
 	}
 	if event, err, handled := session.recvQueuedOutbound(); !handled || err != nil || event.Frame == nil || event.Frame.Kind() != runtimerealtime.FrameKindText || string(event.Frame.Payload()) != "queued" {
 		t.Fatalf("expected queued outbound recv, event=%+v err=%v handled=%v", event, err, handled)
+	}
+	byteBoundedSession := newOpenAIRealtimeHelperSession()
+	byteBoundedSession.outboundBudget = runtimerealtime.NewByteBudget(4)
+	if handled := byteBoundedSession.enqueueOutbound(openAIRealtimeOutbound{messageType: wsconn.TextMessage, payload: []byte("four")}); !handled {
+		t.Fatal("expected outbound within the session byte budget")
+	}
+	if got := byteBoundedSession.outboundBudget.Used(); got != 4 {
+		t.Fatalf("expected queued outbound to own four bytes, got %d", got)
+	}
+	if _, err, handled := byteBoundedSession.recvQueuedOutbound(); !handled || err != nil {
+		t.Fatalf("expected byte-budgeted outbound consumption, handled=%v err=%v", handled, err)
+	}
+	if got := byteBoundedSession.outboundBudget.Used(); got != 0 {
+		t.Fatalf("outbound consumption leaked byte credit: %d", got)
+	}
+	oversizeSession := newOpenAIRealtimeHelperSession()
+	oversizeSession.outboundBudget = runtimerealtime.NewByteBudget(3)
+	if handled := oversizeSession.enqueueOutbound(openAIRealtimeOutbound{messageType: wsconn.TextMessage, payload: []byte("four")}); handled {
+		t.Fatal("session admitted an outbound frame larger than its byte budget")
+	}
+	if got := oversizeSession.outboundBudget.Used(); got != 0 {
+		t.Fatalf("oversize outbound leaked byte credit: %d", got)
 	}
 	observerErr := runtimerealtime.NewClientPayloadError(errors.New("quota"), []byte(`{"type":"error","error":{"message":"quota"}}`))
 	if handled := session.enqueueOutbound(openAIRealtimeOutbound{
@@ -1536,21 +1370,17 @@ func TestOpenAIRealtimeSessionQueueLifecycleAndSendClientGuards(t *testing.T) {
 	}
 
 	backpressuredSession := &openAIRealtimeSession{
-		recvCh:   make(chan openAIRealtimeOutbound, 1),
-		closed:   make(chan struct{}),
-		detached: make(chan struct{}),
+		recvCh:                      make(chan openAIRealtimeOutbound, 1),
+		closed:                      make(chan struct{}),
+		detached:                    make(chan struct{}),
+		outboundBackpressureTimeout: 10 * time.Millisecond,
 	}
 	backpressuredSession.recvCh <- openAIRealtimeOutbound{messageType: wsconn.TextMessage}
-	originalOutboundTimeout := openAIRealtimeOutboundBackpressureTimeout
-	openAIRealtimeOutboundBackpressureTimeout = 10 * time.Millisecond
-	t.Cleanup(func() {
-		openAIRealtimeOutboundBackpressureTimeout = originalOutboundTimeout
-	})
 	start := time.Now()
 	if handled := backpressuredSession.enqueueOutbound(openAIRealtimeOutbound{messageType: wsconn.TextMessage}); handled {
 		t.Fatal("expected backpressured realtime session enqueue to fail")
 	}
-	if elapsed := time.Since(start); elapsed < openAIRealtimeOutboundBackpressureTimeout {
+	if elapsed := time.Since(start); elapsed < backpressuredSession.outboundBackpressureTimeout {
 		t.Fatalf("expected enqueue to wait for bounded backpressure timeout, elapsed=%s", elapsed)
 	}
 
@@ -1560,6 +1390,8 @@ func TestOpenAIRealtimeSessionQueueLifecycleAndSendClientGuards(t *testing.T) {
 
 	writeFailSession := newOpenAIRealtimeHelperSession()
 	writeFailSession.conn = conn
+	prewriteObserver := &failingAdmissionOpenAIRealtimeObserver{}
+	writeFailSession.turnObserverFactory = func() runtimesession.TurnObserver { return prewriteObserver }
 	if err := writeFailSession.SendClient(context.Background(), openAITestTextFrame([]byte(`{"type":"response.create","response":{"input":[]}}`))); err == nil {
 		t.Fatal("expected closed websocket write to fail")
 	} else {
@@ -1570,6 +1402,31 @@ func TestOpenAIRealtimeSessionQueueLifecycleAndSendClientGuards(t *testing.T) {
 	}
 	if writeFailSession.turn != nil {
 		t.Fatalf("expected failed response.create write to roll back active turn, got %+v", writeFailSession.turn)
+	}
+	if admitted, rolledBack := prewriteObserver.counts(); admitted != 1 || rolledBack != 1 || prewriteObserver.finalizeCount() != 0 {
+		t.Fatalf("definitive pre-write failure admission=%d rollback=%d finalize=%d, want 1/1/0", admitted, rolledBack, prewriteObserver.finalizeCount())
+	}
+
+	ambiguousObserver := &failingAdmissionOpenAIRealtimeObserver{}
+	ambiguousSession := newOpenAIRealtimeHelperSession()
+	ambiguousSession.turnObserverFactory = func() runtimesession.TurnObserver { return ambiguousObserver }
+	ambiguousTurn, err := ambiguousSession.startTurnWithClientEventID("evt_ambiguous_write", false)
+	if err != nil {
+		t.Fatalf("start ambiguous write turn: %v", err)
+	}
+	if err := runtimesession.AdmitTurn(ambiguousTurn.observer); err != nil {
+		t.Fatalf("admit ambiguous write turn: %v", err)
+	}
+	rollbackAdmission := ambiguousSession.resolveOpenAIRealtimeWriteFailure(ambiguousTurn, true)
+	if rollbackAdmission || ambiguousSession.turn != ambiguousTurn {
+		t.Fatal("ambiguous write discarded the owner before draining evidence")
+	}
+	ambiguousSession.close("ws_write_failed")
+	if admitted, rolledBack := ambiguousObserver.counts(); admitted != 1 || rolledBack != 0 || ambiguousObserver.finalizeCount() != 1 {
+		t.Fatalf("ambiguous write admission=%d rollback=%d finalize=%d, want 1/0/1", admitted, rolledBack, ambiguousObserver.finalizeCount())
+	}
+	if reason := ambiguousObserver.lastPayload().TerminationReason; reason != "ws_write_failed" {
+		t.Fatalf("ambiguous write termination reason=%q, want ws_write_failed", reason)
 	}
 
 	busySession := newOpenAIRealtimeHelperSession()
@@ -1591,12 +1448,9 @@ func TestOpenAIRealtimeSessionQueueLifecycleAndSendClientGuards(t *testing.T) {
 	finalizerRecorder := &recordingOpenAIRealtimeObserver{}
 	closingSession := newOpenAIRealtimeHelperSession()
 	closingSession.turn = newOpenAIRealtimeTurnState(11, time.Now(), finalizerRecorder)
-	closingSession.pendingTurns = []openAIRealtimePendingTurn{
-		{state: newOpenAIRealtimeTurnState(12, time.Now(), finalizerRecorder), reason: "pending_reason"},
-	}
 	closingSession.close("provider_closed")
-	if finalizerRecorder.finalizeCount() != 2 {
-		t.Fatalf("expected close to finalize active and pending turns, got %d", finalizerRecorder.finalizeCount())
+	if finalizerRecorder.finalizeCount() != 1 {
+		t.Fatalf("expected close to finalize the active turn, got %d", finalizerRecorder.finalizeCount())
 	}
 }
 
@@ -1610,21 +1464,18 @@ func TestOpenAIRealtimeSessionReadRealtimeConnHeaders(t *testing.T) {
 	if terminal, reason := openAIRealtimeTurnTerminal(types.EventTypeResponseDone, nil); !terminal || reason != types.EventTypeResponseDone {
 		t.Fatalf("expected response.done to be terminal, terminal=%v reason=%q", terminal, reason)
 	}
-	if terminal, reason := openAIRealtimeTurnTerminal("response.updated", types.NewErrorEvent("", "invalid_request_error", "bad_request", "boom")); !terminal || reason != types.EventTypeError {
-		t.Fatalf("expected error event to be terminal, terminal=%v reason=%q", terminal, reason)
+	if terminal, reason := openAIRealtimeTurnTerminal("response.updated", types.NewErrorEvent("", "invalid_request_error", "bad_request", "boom")); terminal || reason != "" {
+		t.Fatalf("expected generic error event not to terminate a realtime response, terminal=%v reason=%q", terminal, reason)
 	}
 	if terminal, reason := openAIRealtimeTurnTerminal("response.updated", nil); terminal || reason != "" {
 		t.Fatalf("expected non-terminal event to remain open, terminal=%v reason=%q", terminal, reason)
 	}
+	if terminal, reason := openAIRealtimeTurnTerminal("response.completed", &types.Event{Response: &types.ResponseEvent{Status: types.ResponseStatusCompleted}}); terminal || reason != "" {
+		t.Fatalf("expected Responses streaming terminal not to classify as Realtime, terminal=%v reason=%q", terminal, reason)
+	}
 }
 
 func TestOpenAIRealtimeSessionConnectionErrorsAndAzureHeaders(t *testing.T) {
-	originalLogger := logger.Logger
-	logger.Logger = zap.NewNop()
-	t.Cleanup(func() {
-		logger.Logger = originalLogger
-	})
-
 	t.Run("unsupported realtime API bubbles from open", func(t *testing.T) {
 		proxy := ""
 		provider := CreateOpenAIProvider(&model.Channel{Key: "sk-test", Proxy: &proxy}, "https://api.openai.com")
@@ -1743,6 +1594,84 @@ func TestOpenAIRealtimeSessionConnectionErrorsAndAzureHeaders(t *testing.T) {
 		}
 	})
 
+	t.Run("realtime forwards only a singleton client safety identifier", func(t *testing.T) {
+		headerCh := make(chan http.Header, 1)
+		server := newOpenAIRealtimeHeaderCaptureServer(t, headerCh, nil)
+		defer server.Close()
+
+		proxy := ""
+		provider := CreateOpenAIProvider(&model.Channel{
+			Key:   "sk-test",
+			Proxy: &proxy,
+			Other: `{"self_hosted":true}`,
+		}, server.URL)
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/realtime", nil)
+		ctx.Request.Header.Set(openAISafetyIdentifierHeader, "stable-user-hash")
+		ctx.Request.Header.Set("OpenAI-Beta", "client-must-not-own-realtime-beta")
+		provider.Context = ctx
+
+		conn, errWithCode := provider.openRealtimeConn("gpt-4o-realtime-preview")
+		if errWithCode != nil {
+			t.Fatalf("expected realtime websocket to connect, got %v", errWithCode)
+		}
+		conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_done"})
+
+		headers := <-headerCh
+		if got := headers.Get(openAISafetyIdentifierHeader); got != "stable-user-hash" {
+			t.Fatalf("expected client safety identifier to be forwarded, got %q", got)
+		}
+		if got := headers.Get("OpenAI-Beta"); got != "" {
+			t.Fatalf("client realtime beta header crossed the controlled allowlist: %q", got)
+		}
+	})
+
+	t.Run("realtime channel safety identifier overrides the client value", func(t *testing.T) {
+		headerCh := make(chan http.Header, 1)
+		server := newOpenAIRealtimeHeaderCaptureServer(t, headerCh, nil)
+		defer server.Close()
+
+		proxy := ""
+		modelHeaders := `{"OpenAI-Safety-Identifier":"channel-owned-hash"}`
+		provider := CreateOpenAIProvider(&model.Channel{
+			Key:          "sk-test",
+			Proxy:        &proxy,
+			Other:        `{"self_hosted":true}`,
+			ModelHeaders: &modelHeaders,
+		}, server.URL)
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/realtime", nil)
+		ctx.Request.Header.Set(openAISafetyIdentifierHeader, "client-hash")
+		provider.Context = ctx
+
+		conn, errWithCode := provider.openRealtimeConn("gpt-4o-realtime-preview")
+		if errWithCode != nil {
+			t.Fatalf("expected realtime websocket to connect, got %v", errWithCode)
+		}
+		conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "test_done"})
+		if got := (<-headerCh).Get(openAISafetyIdentifierHeader); got != "channel-owned-hash" {
+			t.Fatalf("expected channel-owned safety identifier, got %q", got)
+		}
+	})
+
+	t.Run("realtime rejects multiple client safety identifiers before dialing", func(t *testing.T) {
+		proxy := ""
+		provider := CreateOpenAIProvider(&model.Channel{
+			Key:   "sk-test",
+			Proxy: &proxy,
+			Other: `{"self_hosted":true}`,
+		}, "http://127.0.0.1:1")
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/realtime", nil)
+		ctx.Request.Header[openAISafetyIdentifierHeader] = []string{"first", "second"}
+		provider.Context = ctx
+
+		conn, errWithCode := provider.openRealtimeConn("gpt-4o-realtime-preview")
+		if conn != nil || errWithCode == nil || errWithCode.Code != "invalid_request_header" || errWithCode.StatusCode != http.StatusBadRequest || !errWithCode.LocalError {
+			t.Fatalf("expected pre-dial singleton validation error, conn=%v err=%+v", conn, errWithCode)
+		}
+	})
+
 	t.Run("responses websocket merges custom headers", func(t *testing.T) {
 		headerCh := make(chan http.Header, 1)
 		server := newOpenAIRealtimeHeaderCaptureServer(t, headerCh, nil)
@@ -1827,7 +1756,7 @@ func TestOpenAIResponsesWSURLConstruction(t *testing.T) {
 		t.Fatalf("expected official responses websocket URL, got %q", got)
 	}
 
-	disabled := CreateOpenAIProvider(&model.Channel{Key: "sk-test", Type: config.ChannelTypeCustom, Proxy: &proxy}, "https://compat.example")
+	disabled := CreateOpenAIProvider(&model.Channel{Plugin: model.NewCustomEndpointPlugin(), Key: "sk-test", Type: config.ChannelTypeCustom, Proxy: &proxy}, "https://compat.example")
 	disabled.Config.Responses = ""
 	got, errWithCode = disabled.responsesWSURL("gpt-5")
 	if errWithCode == nil || errWithCode.Code != "unsupported_api" || got != "" {
@@ -1899,6 +1828,32 @@ func TestOpenAIResponsesWSURLConstruction(t *testing.T) {
 	}
 }
 
+func TestOpenAIResponsesWSTransportUsesSharedOfficialURLPolicy(t *testing.T) {
+	proxy := "http://proxy.example"
+	for _, test := range []struct {
+		name    string
+		baseURL string
+		want    bool
+	}{
+		{name: "default TLS port", baseURL: "https://api.openai.com:443", want: true},
+		{name: "uppercase authority", baseURL: "https://API.OPENAI.COM:443/", want: true},
+		{name: "non-default port", baseURL: "https://api.openai.com:444"},
+		{name: "subpath", baseURL: "https://api.openai.com/proxy"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			provider := CreateOpenAIProvider(&model.Channel{Type: config.ChannelTypeOpenAI, Key: "sk-test", Proxy: &proxy}, test.baseURL)
+			if got := provider.supportsNativeResponsesWSTransport(); got != test.want {
+				t.Fatalf("supportsNativeResponsesWSTransport()=%t, want %t", got, test.want)
+			}
+			if test.want {
+				if wsURL, errWithCode := provider.responsesWSURL("gpt-5"); errWithCode != nil || wsURL == "" {
+					t.Fatalf("official URL passed capability but failed runtime URL construction: url=%q err=%+v", wsURL, errWithCode)
+				}
+			}
+		})
+	}
+}
+
 func TestOpenAIRealtimeWSURLConstruction(t *testing.T) {
 	proxy := "http://proxy.invalid"
 	provider := CreateOpenAIProvider(&model.Channel{Key: "sk-test", Proxy: &proxy}, "https://api.openai.com")
@@ -1910,7 +1865,7 @@ func TestOpenAIRealtimeWSURLConstruction(t *testing.T) {
 		t.Fatalf("expected official realtime websocket URL, got %q", got)
 	}
 
-	disabled := CreateOpenAIProvider(&model.Channel{Key: "sk-test", Type: config.ChannelTypeCustom, Proxy: &proxy}, "https://compat.example")
+	disabled := CreateOpenAIProvider(&model.Channel{Plugin: model.NewCustomEndpointPlugin(), Key: "sk-test", Type: config.ChannelTypeCustom, Proxy: &proxy}, "https://compat.example")
 	disabled.Config.ChatRealtime = ""
 	got, errWithCode = disabled.realtimeWSURL("gpt-4o")
 	if errWithCode == nil || errWithCode.Code != "unsupported_api" || got != "" {
@@ -2064,12 +2019,6 @@ func TestOpenAIRealtimeSelfHostedDialOptionsStillBlockMetadataIP(t *testing.T) {
 }
 
 func TestMapOpenAIResponsesWSDialErrorPreservesHandshakeStatus(t *testing.T) {
-	originalLogger := logger.Logger
-	logger.Logger = zap.NewNop()
-	t.Cleanup(func() {
-		logger.Logger = originalLogger
-	})
-
 	cases := []struct {
 		name       string
 		statusCode int
@@ -2098,6 +2047,12 @@ func TestMapOpenAIResponsesWSDialErrorPreservesHandshakeStatus(t *testing.T) {
 			if gotCode != tc.wantCode || errWithCode.StatusCode != tc.wantStatus {
 				t.Fatalf("expected %s/%d, got code=%v status=%d", tc.wantCode, tc.wantStatus, errWithCode.Code, errWithCode.StatusCode)
 			}
+			if !errWithCode.UpstreamNotAttempted || errWithCode.UpstreamAmbiguous || errWithCode.UpstreamAccepted {
+				t.Fatalf("handshake failure lost safe pre-write disposition: %+v", errWithCode)
+			}
+			if !errWithCode.ProviderOpenRetrySafe {
+				t.Fatalf("handshake failure did not authorize safe route retry: %+v", errWithCode)
+			}
 			if strings.Contains(errWithCode.Message, "provider.example") || strings.Contains(errWithCode.Message, "secret") {
 				t.Fatalf("expected mapped client message to omit upstream URL, got %q", errWithCode.Message)
 			}
@@ -2112,15 +2067,12 @@ func TestMapOpenAIResponsesWSDialErrorPreservesHandshakeStatus(t *testing.T) {
 	if gotCode != "ws_request_failed" || errWithCode.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("expected transport errors without HTTP status to remain ws_request_failed, got %+v", errWithCode)
 	}
+	if !errWithCode.UpstreamNotAttempted || errWithCode.UpstreamAmbiguous {
+		t.Fatalf("dial transport failure lost pre-write disposition: %+v", errWithCode)
+	}
 }
 
 func TestMapOpenAIResponsesWSDialErrorDoesNotLogSecrets(t *testing.T) {
-	originalLogger := logger.Logger
-	logger.Logger = zap.NewNop()
-	t.Cleanup(func() {
-		logger.Logger = originalLogger
-	})
-
 	_ = mapOpenAIResponsesWSDialError(errors.New("dial failed with Authorization: Bearer sk-responses-ws-secret"))
 
 	entries, err := logger.GetLatestLogs(5)
@@ -2170,11 +2122,21 @@ func TestOpenAIRealtimeSessionAdditionalHelperBranches(t *testing.T) {
 
 	session.compatMode = false
 	session.turn = nil
-	session.pendingTurns = nil
 	session.recentFinalizedIDs = nil
+	providerInitiatedObserver := &failingAdmissionOpenAIRealtimeObserver{}
+	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return providerInitiatedObserver })
 	outbound, shouldClose := session.observeSupplierMessage(wsconn.TextMessage, []byte(`{"type":"response.done","response":{"id":"resp_orphan","status":"completed","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`))
 	if shouldClose || outbound.usage == nil || outbound.usage.TotalTokens != 3 {
-		t.Fatalf("expected orphan terminal usage to be forwarded without closing, outbound=%+v should_close=%v", outbound, shouldClose)
+		t.Fatalf("expected provider-initiated terminal usage to be forwarded without closing, outbound=%+v should_close=%v", outbound, shouldClose)
+	}
+	if admits, rollbacks := providerInitiatedObserver.counts(); admits != 1 || rollbacks != 0 {
+		t.Fatalf("expected provider-initiated turn admission once, admits=%d rollbacks=%d", admits, rollbacks)
+	}
+	if providerInitiatedObserver.observeCount() != 1 || providerInitiatedObserver.finalizeCount() != 1 {
+		t.Fatalf("expected provider-initiated usage observation and settlement, observed=%d finalized=%d", providerInitiatedObserver.observeCount(), providerInitiatedObserver.finalizeCount())
+	}
+	if payload := providerInitiatedObserver.lastPayload(); payload.LastResponseID != "resp_orphan" || payload.Usage == nil || payload.Usage.TotalTokens != 3 {
+		t.Fatalf("unexpected provider-initiated finalization payload: %+v", payload)
 	}
 
 	session.recentFinalizedIDs = []string{"resp_orphan"}
@@ -2183,39 +2145,17 @@ func TestOpenAIRealtimeSessionAdditionalHelperBranches(t *testing.T) {
 		t.Fatalf("expected late finalized response usage to be dropped, outbound=%+v should_close=%v", outbound, shouldClose)
 	}
 
-	pendingRecorder := &recordingOpenAIRealtimeObserver{}
 	startSession := newOpenAIRealtimeHelperSession()
-	startSession.pendingTurns = []openAIRealtimePendingTurn{
-		{state: newOpenAIRealtimeTurnState(2, now, pendingRecorder), reason: "stale_pending"},
-	}
 	startSession.turnObserverFactory = func() runtimesession.TurnObserver { return recorder }
-	startedTurn, finalized, err := startSession.startTurn()
+	startedTurn, err := startSession.startTurnWithClientEventID("evt_started", false)
 	if err != nil {
 		t.Fatalf("expected helper startTurn to succeed, got %v", err)
 	}
 	if startedTurn == nil || startedTurn.observer == nil {
 		t.Fatalf("expected startTurn to attach a guarded observer, got %+v", startedTurn)
 	}
-	if len(finalized) != 1 {
-		t.Fatalf("expected startTurn to finalize stale pending turns, got %d", len(finalized))
-	}
-	runOpenAIRealtimeFinalizers(finalized)
-	if pendingRecorder.finalizeCount() != 1 {
-		t.Fatalf("expected pending turn finalizer to run once, got %d", pendingRecorder.finalizeCount())
-	}
-
 	if observer, payload := (&openAIRealtimeSession{}).finalizeTurn("ignored", now); observer != nil || payload.TurnSeq != 0 {
 		t.Fatalf("expected finalizeTurn without an active turn to no-op, observer=%+v payload=%+v", observer, payload)
-	}
-
-	pendingState := newOpenAIRealtimeTurnState(3, now, nil)
-	pendingState.rememberResponseID("resp_pending")
-	startSession.recentFinalizedIDs = nil
-	if finalized := startSession.finalizePendingTurn(openAIRealtimePendingTurn{state: pendingState}, "default_reason", now); len(finalized) != 0 {
-		t.Fatalf("expected pending turns without observers not to emit finalizers, got %+v", finalized)
-	}
-	if !startSession.isRecentlyFinalizedResponseIDLocked("resp_pending") {
-		t.Fatal("expected finalizePendingTurn to still remember finalized response ids")
 	}
 
 	timerSession := newOpenAIRealtimeHelperSession()
@@ -2227,4 +2167,27 @@ func TestOpenAIRealtimeSessionAdditionalHelperBranches(t *testing.T) {
 	}
 	timerSession.stopDetachTimer()
 	timerSession.stopDetachTimer()
+}
+
+func TestOpenAIRealtimeProviderInitiatedTurnAdmissionFailureStopsSession(t *testing.T) {
+	session := newOpenAIRealtimeHelperSession()
+	observer := &failingAdmissionOpenAIRealtimeObserver{
+		admitErr: common.StringErrorWrapperLocal("quota exhausted", "quota_exhausted", http.StatusForbidden),
+	}
+	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return observer })
+
+	outbound, shouldClose := session.observeSupplierMessage(wsconn.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_auto","status":"in_progress"}}`))
+	if !shouldClose || outbound.err == nil || outbound.origin != runtimerealtime.RealtimePayloadOriginProxyLocal {
+		t.Fatalf("provider-initiated admission failure must stop the session with a local error, outbound=%+v should_close=%v", outbound, shouldClose)
+	}
+	if admits, rollbacks := observer.counts(); admits != 1 || rollbacks != 0 {
+		t.Fatalf("provider-observed work must not synthesize a pre-send rollback, admits=%d rollbacks=%d", admits, rollbacks)
+	}
+	if observer.observeCount() != 0 || observer.finalizeCount() != 0 || session.turn == nil {
+		t.Fatal("failed future admission discarded in-flight response before drain")
+	}
+	session.close("provider_initiated_admission_failed")
+	if observer.finalizeCount() != 1 || session.turn != nil {
+		t.Fatal("failed live admission was not finalized at final close")
+	}
 }

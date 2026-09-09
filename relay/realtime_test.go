@@ -53,6 +53,73 @@ type relayActorTestSession struct {
 	abortReasons  []string
 }
 
+type relayActorRecoverableSendSession struct {
+	mu       sync.Mutex
+	calls    int
+	accepted chan runtimerealtime.Frame
+}
+
+type relayActorConcurrentControlSession struct {
+	relayTestRealtimeSession
+	createStarted  chan struct{}
+	createRelease  chan struct{}
+	controlHandled chan struct{}
+	controlReturn  chan struct{}
+	serialFrames   chan runtimerealtime.Frame
+	startOnce      sync.Once
+	releaseOnce    sync.Once
+	controlOnce    sync.Once
+}
+
+func (s *relayActorConcurrentControlSession) SendClient(ctx context.Context, frame runtimerealtime.Frame) error {
+	if strings.Contains(string(frame.Payload()), `"type":"response.create"`) {
+		s.startOnce.Do(func() { close(s.createStarted) })
+		select {
+		case <-s.createRelease:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	s.serialFrames <- frame
+	return nil
+}
+
+func (s *relayActorConcurrentControlSession) TrySendClientControl(_ context.Context, active runtimerealtime.Frame, control runtimerealtime.Frame) (bool, error) {
+	if !strings.Contains(string(active.Payload()), `"type":"response.create"`) || !strings.Contains(string(control.Payload()), `"type":"response.cancel"`) {
+		return false, nil
+	}
+	s.controlOnce.Do(func() { close(s.controlHandled) })
+	<-s.controlReturn
+	s.releaseOnce.Do(func() { close(s.createRelease) })
+	return true, nil
+}
+
+func (s *relayActorRecoverableSendSession) SendClient(_ context.Context, frame runtimerealtime.Frame) error {
+	s.mu.Lock()
+	s.calls++
+	call := s.calls
+	s.mu.Unlock()
+	if call == 1 {
+		return runtimerealtime.NewRecoverableClientPayloadError(
+			errors.New("stale continuation"),
+			[]byte(`{"type":"error","status":400,"error":{"code":"previous_response_not_found","message":"previous response was not found"}}`),
+		)
+	}
+	s.accepted <- frame
+	return nil
+}
+
+func (s *relayActorRecoverableSendSession) Recv(ctx context.Context) (runtimerealtime.RecvEvent, error) {
+	<-ctx.Done()
+	return runtimerealtime.RecvEvent{}, ctx.Err()
+}
+
+func (s *relayActorRecoverableSendSession) Detach(string) {}
+func (s *relayActorRecoverableSendSession) Abort(string)  {}
+func (s *relayActorRecoverableSendSession) SetTurnObserverFactory(runtimesession.TurnObserverFactory) {
+}
+
 func newRelayActorTestSession() *relayActorTestSession {
 	return &relayActorTestSession{
 		sendCh: make(chan runtimerealtime.Frame, 8),
@@ -110,7 +177,6 @@ func (p *relayTestBaseProvider) GetRequester() *requester.HTTPRequester { return
 func (p *relayTestBaseProvider) CustomParameterHandler() (map[string]interface{}, error) {
 	return nil, nil
 }
-func (p *relayTestBaseProvider) GetSupportedResponse() bool { return false }
 
 type relayTestRealtimeProvider struct {
 	relayTestBaseProvider
@@ -138,8 +204,12 @@ type relayTestClientFrame struct {
 
 type relayTestManagedClient struct {
 	conn   *wsconn.ManagedConn
-	frames chan relayTestClientFrame
-	closed chan wsconn.CloseInfo
+	events chan relayTestClientEvent
+}
+
+type relayTestClientEvent struct {
+	frame relayTestClientFrame
+	close *wsconn.CloseInfo
 }
 
 func newRelayWebsocketPair(t *testing.T) (*wsconn.ManagedConn, *relayTestManagedClient) {
@@ -148,16 +218,15 @@ func newRelayWebsocketPair(t *testing.T) (*wsconn.ManagedConn, *relayTestManaged
 	clientConn, serverConn := wstest.Pair(t)
 	client := &relayTestManagedClient{
 		conn:   clientConn,
-		frames: make(chan relayTestClientFrame, 8),
-		closed: make(chan wsconn.CloseInfo, 1),
+		events: make(chan relayTestClientEvent, 9),
 	}
 	go wsconn.Pump{
 		Conn: clientConn,
 		Handle: func(_ context.Context, messageType wsconn.MessageType, payload []byte) {
-			client.frames <- relayTestClientFrame{messageType: messageType, payload: append([]byte(nil), payload...)}
+			client.events <- relayTestClientEvent{frame: relayTestClientFrame{messageType: messageType, payload: append([]byte(nil), payload...)}}
 		},
 		OnClose: func(info wsconn.CloseInfo) {
-			client.closed <- info
+			client.events <- relayTestClientEvent{close: &info}
 		},
 	}.Run(context.Background())
 	t.Cleanup(func() {
@@ -170,10 +239,11 @@ func newRelayWebsocketPair(t *testing.T) (*wsconn.ManagedConn, *relayTestManaged
 func (c *relayTestManagedClient) readFrame(t *testing.T) relayTestClientFrame {
 	t.Helper()
 	select {
-	case frame := <-c.frames:
-		return frame
-	case info := <-c.closed:
-		t.Fatalf("expected downstream frame before close, got close %+v", info)
+	case event := <-c.events:
+		if event.close != nil {
+			t.Fatalf("expected downstream frame before close, got close %+v", *event.close)
+		}
+		return event.frame
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for downstream frame")
 	}
@@ -183,14 +253,28 @@ func (c *relayTestManagedClient) readFrame(t *testing.T) relayTestClientFrame {
 func (c *relayTestManagedClient) readClose(t *testing.T) wsconn.CloseInfo {
 	t.Helper()
 	select {
-	case info := <-c.closed:
-		return info
-	case frame := <-c.frames:
-		t.Fatalf("expected downstream close before frame, got frame %+v", frame)
+	case event := <-c.events:
+		if event.close == nil {
+			t.Fatalf("expected downstream close before frame, got frame %+v", event.frame)
+		}
+		return *event.close
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for downstream close")
 	}
 	return wsconn.CloseInfo{}
+}
+
+func TestRelayTestManagedClientKeepsFrameCloseOrder(t *testing.T) {
+	client := &relayTestManagedClient{events: make(chan relayTestClientEvent, 2)}
+	info := wsconn.CloseInfo{Kind: wsconn.CloseKindPeerClose, Code: wsconn.CloseNormalClosure}
+	client.events <- relayTestClientEvent{frame: relayTestClientFrame{messageType: wsconn.TextMessage, payload: []byte("terminal")}}
+	client.events <- relayTestClientEvent{close: &info}
+	if got := client.readFrame(t); string(got.payload) != "terminal" {
+		t.Fatalf("queued terminal frame lost: %+v", got)
+	}
+	if got := client.readClose(t); got.Code != wsconn.CloseNormalClosure {
+		t.Fatalf("queued close lost: %+v", got)
+	}
 }
 
 func TestRealtimeClientSessionIDFromRequestPrefersExplicitHeader(t *testing.T) {
@@ -402,7 +486,7 @@ func TestRelayModeChatRealtimeGetProviderUsesAffinityChannel(t *testing.T) {
 		affinityChannelID = 424299
 	)
 
-	model.ChannelGroup = buildRealtimeTestChannelGroup(defaultChannelID, affinityChannelID)
+	model.ChannelGroup = buildRealtimeNativeWSTestChannelGroup(t, defaultChannelID, affinityChannelID)
 
 	ctx := newRelayTestContext(map[string]string{
 		"X-Session-Id": sessionID,
@@ -455,7 +539,7 @@ func TestRelayModeChatRealtimeGetProviderFallsBackWhenAffinityChannelUnavailable
 		staleAffinityID  = 424299
 	)
 
-	model.ChannelGroup = buildRealtimeTestChannelGroup(defaultChannelID)
+	model.ChannelGroup = buildRealtimeNativeWSTestChannelGroup(t, defaultChannelID)
 
 	ctx := newRelayTestContext(map[string]string{
 		"X-Session-Id": sessionID,
@@ -519,7 +603,7 @@ func TestRelayModeChatRealtimeGetProviderForceFreshOnSameAffinityChannel(t *test
 		sourceSession.Abort("test_cleanup")
 	})
 
-	routedChannel := newRelayTestCodexChannel(affinityChannelID)
+	routedChannel := newRelayNativeCodexChannel(t, affinityChannelID)
 	model.ChannelGroup = buildRealtimeTestChannelGroupForChannels(routedChannel)
 
 	ctx := newRelayTestContext(map[string]string{
@@ -582,7 +666,7 @@ func TestRelayModeChatRealtimeGetProviderFreshRerouteReplacesStaleBindingAfterAf
 		sourceSession.Abort("test_cleanup")
 	})
 
-	model.ChannelGroup = buildRealtimeTestChannelGroup(defaultChannelID)
+	model.ChannelGroup = buildRealtimeNativeWSTestChannelGroup(t, defaultChannelID)
 
 	ctx := newRelayTestContext(map[string]string{
 		"X-Session-Id": sessionID,
@@ -641,7 +725,7 @@ func TestRelayModeChatRealtimeGetProviderPinnedChannelOverridesAffinity(t *testi
 		sourceSession.Abort("test_cleanup")
 	})
 
-	pinnedChannel := newRelayTestCodexChannel(pinnedChannelID)
+	pinnedChannel := newRelayNativeCodexChannel(t, pinnedChannelID)
 	if err := model.DB.Create(pinnedChannel).Error; err != nil {
 		t.Fatalf("expected pinned channel fixture to persist, got %v", err)
 	}
@@ -720,7 +804,7 @@ func TestRelayModeChatRealtimeGetProviderStrictAffinityUnavailableAborts(t *test
 	settings.Normalize()
 	manager := withChannelAffinitySettings(t, settings)
 
-	model.ChannelGroup = buildRealtimeTestChannelGroup(defaultChannelID)
+	model.ChannelGroup = buildRealtimeNativeWSTestChannelGroup(t, defaultChannelID)
 
 	serverConn, client := newRelayWebsocketPair(t)
 	ctx := newRelayTestContext(map[string]string{
@@ -765,17 +849,19 @@ func TestRelayModeChatRealtimeOpenFreshRealtimeSessionSkipsUnsupportedProviderWi
 	})
 
 	ctx := newRelayTestContext(nil)
-	ctx.Set("channel_id", 11)
-	ctx.Set("channel_type", config.ChannelTypeCodex)
-
-	cacheProviderSelection(ctx, "gpt-5", &relayTestBaseProvider{channel: newRelayTestCodexChannel(11)}, "gpt-5")
+	ctx.Set("token_group", "default")
+	channelGroupSnapshot := snapshotChannelGroup()
+	t.Cleanup(func() { restoreChannelGroup(channelGroupSnapshot) })
+	weight := uint(1)
+	proxy := ""
+	model.ChannelGroup = buildRealtimeTestChannelGroupForChannels(&model.Channel{Id: 11, Type: config.ChannelTypeAnthropic, Status: config.ChannelStatusEnabled, Group: "default", Models: "gpt-5", Weight: &weight, Proxy: &proxy})
 
 	relay := &RelayModeChatRealtime{
 		relayBase: relayBase{c: ctx},
 	}
 	relay.setOriginalModel("gpt-5")
 
-	if relay.openFreshRealtimeSession("", false) {
+	if relay.openFreshRealtimeSession("", false, realtimeOpenRetryBudget()) {
 		t.Fatal("expected unsupported realtime provider to fail fresh session opening")
 	}
 
@@ -799,19 +885,22 @@ func TestRelayModeChatRealtimeOpenFreshRealtimeSessionRejectsUnsupportedPinnedPr
 	})
 
 	ctx := newRelayTestContext(nil)
+	weight := uint(1)
+	proxy := ""
+	pinned := &model.Channel{Id: 11, Type: config.ChannelTypeAnthropic, Status: config.ChannelStatusEnabled, Group: "default", Models: "gpt-5", Weight: &weight, Proxy: &proxy}
+	testDB := setupRelayTestDB(t, &model.Channel{})
+	if err := testDB.Create(pinned).Error; err != nil {
+		t.Fatalf("create pinned channel: %v", err)
+	}
 	ctx.Set("specific_channel_id", 11)
 	ctx.Set("specific_channel_id_ignore", false)
-	ctx.Set("channel_id", 11)
-	ctx.Set("channel_type", config.ChannelTypeCodex)
-
-	cacheProviderSelection(ctx, "gpt-5", &relayTestBaseProvider{channel: newRelayTestCodexChannel(11)}, "gpt-5")
 
 	relay := &RelayModeChatRealtime{
 		relayBase: relayBase{c: ctx},
 	}
 	relay.setOriginalModel("gpt-5")
 
-	if relay.openFreshRealtimeSession("", false) {
+	if relay.openFreshRealtimeSession("", false, realtimeOpenRetryBudget()) {
 		t.Fatal("expected pinned unsupported realtime provider to fail fresh session opening")
 	}
 	if _, ok := ctx.Get("skip_channel_ids"); ok {
@@ -822,44 +911,16 @@ func TestRelayModeChatRealtimeOpenFreshRealtimeSessionRejectsUnsupportedPinnedPr
 func TestRelayModeChatRealtimeOpenFreshRealtimeSessionPassesRequestContext(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	originalRetryTimes := config.RetryTimes
-	config.RetryTimes = 1
-	t.Cleanup(func() {
-		config.RetryTimes = originalRetryTimes
-	})
-
 	ctx := newRelayTestContext(nil)
-	ctx.Set("channel_id", 11)
-	ctx.Set("channel_type", config.ChannelTypeCodex)
 	requestCtx := context.WithValue(ctx.Request.Context(), logger.RequestIdKey, "req-realtime-open")
 	ctx.Request = ctx.Request.WithContext(requestCtx)
-
-	var gotOptions runtimerealtime.RealtimeOpenOptions
-	provider := &relayTestRealtimeProvider{
-		relayTestBaseProvider: relayTestBaseProvider{channel: newRelayTestCodexChannel(11)},
-		openFn: func(modelName string, options runtimerealtime.RealtimeOpenOptions) (runtimerealtime.RealtimeSession, *types.OpenAIErrorWithStatusCode) {
-			gotOptions = options
-			return relayTestRealtimeSession{}, nil
-		},
-	}
-	cacheProviderSelection(ctx, "gpt-5", provider, "gpt-5")
 
 	relay := &RelayModeChatRealtime{
 		relayBase: relayBase{c: ctx},
 	}
-	relay.setOriginalModel("gpt-5")
-
-	if !relay.openFreshRealtimeSession("client-session", false) {
-		t.Fatal("expected fresh realtime session opening to succeed")
-	}
-	if gotOptions.Context == nil {
-		t.Fatal("expected realtime open options to include request context")
-	}
-	if got := gotOptions.Context.Value(logger.RequestIdKey); got != "req-realtime-open" {
+	gotContext := relay.realtimeOpenContext()
+	if got := gotContext.Value(logger.RequestIdKey); got != "req-realtime-open" {
 		t.Fatalf("expected request id in realtime open context, got %v", got)
-	}
-	if gotOptions.ClientSessionID != "client-session" {
-		t.Fatalf("expected client session id to be forwarded, got %q", gotOptions.ClientSessionID)
 	}
 }
 
@@ -895,6 +956,26 @@ func buildRealtimeTestChannelGroup(channelIDs ...int) model.ChannelsChooser {
 		channels = append(channels, newRelayTestCodexChannel(channelID))
 	}
 	return buildRealtimeTestChannelGroupForChannels(channels...)
+}
+
+func buildRealtimeNativeWSTestChannelGroup(t *testing.T, channelIDs ...int) model.ChannelsChooser {
+	t.Helper()
+	channels := make([]*model.Channel, 0, len(channelIDs))
+	for _, id := range channelIDs {
+		channels = append(channels, newRelayNativeCodexChannel(t, id))
+	}
+	return buildRealtimeTestChannelGroupForChannels(channels...)
+}
+
+func newRelayNativeCodexChannel(t *testing.T, channelID int) *model.Channel {
+	t.Helper()
+	channel := newRelayTestCodexChannel(channelID)
+	upstreamURL, cleanup := wstest.Server(t, func(conn *wsconn.ManagedConn) {
+		(&wsconn.Pump{Conn: conn, Handle: func(context.Context, wsconn.MessageType, []byte) {}}).Run(t.Context())
+	})
+	t.Cleanup(cleanup)
+	channel.BaseURL = &upstreamURL
+	return channel
 }
 
 func buildRealtimeTestChannelGroupForChannels(channels ...*model.Channel) model.ChannelsChooser {
@@ -940,12 +1021,16 @@ func newRelayTestCodexChannel(channelID int) *model.Channel {
 		Models: "gpt-5",
 		Weight: &weight,
 		Proxy:  &proxy,
-		Other:  `{"websocket_mode":"off"}`,
+		Other:  `{"self_hosted":true}`,
 	}
 }
 
 func newRelayTestCodexProviderForChannel(t *testing.T, channel *model.Channel, headers map[string]string) *codex.CodexProvider {
 	t.Helper()
+	if channel.BaseURL == nil {
+		upstream := newRelayNativeCodexChannel(t, channel.Id)
+		channel.BaseURL = upstream.BaseURL
+	}
 
 	provider, ok := codex.CodexProviderFactory{}.Create(channel).(*codex.CodexProvider)
 	if !ok || provider == nil {
@@ -989,7 +1074,7 @@ func TestRealtimeHelperFunctionsAndFallbacks(t *testing.T) {
 	}
 	config.RetryTimes = 3
 	if got := realtimeOpenRetryBudget(); got != 3 {
-		t.Fatalf("expected configured retry budget, got %d", got)
+		t.Fatalf("expected configured total attempt budget, got %d", got)
 	}
 	config.RetryTimes = originalRetryTimes
 
@@ -1051,6 +1136,28 @@ func TestRealtimeHelperFunctionsAndFallbacks(t *testing.T) {
 
 	if _, apiErr := openRealtimeSessionWithOptions(&relayTestBaseProvider{}, "gpt-5", runtimerealtime.RealtimeOpenOptions{}); apiErr == nil || apiErr.Message != "channel not implemented" {
 		t.Fatalf("expected unsupported provider to return channel-not-implemented, got %v", apiErr)
+	}
+}
+
+func TestRealtimeOpenRetryBudgetReadsLatestRuntimePublication(t *testing.T) {
+	originalManager := config.GlobalOption
+	manager := config.NewOptionManager()
+	retryTimes := 0
+	manager.RegisterIntOption("RetryTimes", &retryTimes, config.OptionMetadata{Visibility: config.OptionVisibilityPublic})
+	if _, err := manager.PublishRuntimeOverrides(1, map[string]string{"RetryTimes": "0"}); err != nil {
+		t.Fatalf("publish initial retry budget: %v", err)
+	}
+	config.GlobalOption = manager
+	t.Cleanup(func() { config.GlobalOption = originalManager })
+
+	if got := realtimeOpenRetryBudget(); got != 1 {
+		t.Fatalf("initial attempt budget=%d, want 1", got)
+	}
+	if _, err := manager.PublishRuntimeOverrides(2, map[string]string{"RetryTimes": "3"}); err != nil {
+		t.Fatalf("publish updated retry budget: %v", err)
+	}
+	if got := realtimeOpenRetryBudget(); got != 3 {
+		t.Fatalf("a later open should observe the newer publication, budget=%d", got)
 	}
 }
 
@@ -1182,6 +1289,53 @@ func TestRealtimeRelayActorClientFrameBackpressureClosesTryAgainLater(t *testing
 	}
 }
 
+func TestRealtimeRelayFrameCreditTransfersAndReleases(t *testing.T) {
+	clientBudget := runtimerealtime.NewByteBudget(8)
+	pendingBudget := runtimerealtime.NewByteBudget(8)
+	credit, ok := clientBudget.TryAcquire(8)
+	if !ok {
+		t.Fatal("expected client stage credit")
+	}
+	frame := realtimeRelayClientFrame{mt: wsconn.TextMessage, payload: make([]byte, 8), credit: credit}
+	if _, ok := clientBudget.TryAcquire(1); ok {
+		t.Fatal("client stage exceeded its byte budget")
+	}
+	if !frame.transferCredit(pendingBudget) {
+		t.Fatal("expected handoff to acquire destination before releasing source")
+	}
+	if got := clientBudget.Used(); got != 0 {
+		t.Fatalf("expected source credit released after handoff, got %d", got)
+	}
+	if got := pendingBudget.Used(); got != 8 {
+		t.Fatalf("expected destination to own frame bytes, got %d", got)
+	}
+	frame.release()
+	frame.release()
+	if got := pendingBudget.Used(); got != 0 {
+		t.Fatalf("expected idempotent release to restore destination budget, got %d", got)
+	}
+}
+
+func TestRealtimeRelayFrameCreditFailedHandoffKeepsSourceOwnership(t *testing.T) {
+	clientBudget := runtimerealtime.NewByteBudget(8)
+	pendingBudget := runtimerealtime.NewByteBudget(4)
+	credit, ok := clientBudget.TryAcquire(8)
+	if !ok {
+		t.Fatal("expected client stage credit")
+	}
+	frame := realtimeRelayClientFrame{mt: wsconn.TextMessage, payload: make([]byte, 8), credit: credit}
+	if frame.transferCredit(pendingBudget) {
+		t.Fatal("oversized handoff unexpectedly succeeded")
+	}
+	if got := clientBudget.Used(); got != 8 {
+		t.Fatalf("failed handoff released source credit early, got %d", got)
+	}
+	if got := pendingBudget.Used(); got != 0 {
+		t.Fatalf("failed handoff leaked destination credit, got %d", got)
+	}
+	frame.release()
+}
+
 func TestRealtimeRelayActorProviderFrameWritesDownstream(t *testing.T) {
 	serverConn, client := newRelayWebsocketPair(t)
 	actor := newRealtimeRelayActor(serverConn, newRelayActorTestSession(), time.Second)
@@ -1208,6 +1362,106 @@ func TestRealtimeRelayActorProviderFrameWritesDownstream(t *testing.T) {
 	frame = client.readFrame(t)
 	if frame.messageType != wsconn.BinaryMessage || string(frame.payload) != string(binaryFrame.Payload()) {
 		t.Fatalf("unexpected downstream binary frame mt=%d payload=%v", frame.messageType, frame.payload)
+	}
+
+	var observedPayload string
+	actor.providerPayloadObserver = func(_ wsconn.MessageType, payload []byte) {
+		observedPayload = string(payload)
+	}
+	errorFrame := runtimerealtime.NewTextFrame([]byte(`{"type":"error","status_code":401,"error":{"type":"authentication_error","code":"invalid_api_key","message":"account org-secret rejected"},"account_id":"acct-secret"}`))
+	if !actor.deliverEventFrame(runtimerealtime.RecvEvent{Frame: &errorFrame, Origin: runtimerealtime.RealtimePayloadOriginProvider}) {
+		t.Fatal("expected provider error frame to be delivered")
+	}
+	frame = client.readFrame(t)
+	if !strings.Contains(string(frame.payload), `"code":"provider_account_error"`) || strings.Contains(string(frame.payload), "org-secret") || strings.Contains(string(frame.payload), "acct-secret") {
+		t.Fatalf("expected safe downstream provider error, got %s", frame.payload)
+	}
+	if !strings.Contains(observedPayload, "invalid_api_key") || !strings.Contains(observedPayload, "org-secret") {
+		t.Fatalf("control-plane observer must retain original provider evidence, got %q", observedPayload)
+	}
+}
+
+func TestRealtimeRelayActorContinuesAfterRecoverableTypedClientError(t *testing.T) {
+	serverConn, client := newRelayWebsocketPair(t)
+	session := &relayActorRecoverableSendSession{accepted: make(chan runtimerealtime.Frame, 1)}
+	actor := newRealtimeRelayActor(serverConn, session, time.Second)
+	actor.workers.Add(1)
+	go actor.runWorker(actor.clientToSession)
+
+	actor.clientFrames <- realtimeRelayClientFrame{mt: wsconn.TextMessage, payload: []byte(`{"type":"response.create","previous_response_id":"resp_stale"}`)}
+	errorFrame := client.readFrame(t)
+	if !strings.Contains(string(errorFrame.payload), `"previous_response_not_found"`) || strings.Contains(string(errorFrame.payload), `"system_error"`) {
+		t.Fatalf("expected typed stale-continuation payload without generic fallback, got %s", errorFrame.payload)
+	}
+
+	secondPayload := []byte(`{"type":"response.create","input":"full context"}`)
+	actor.clientFrames <- realtimeRelayClientFrame{mt: wsconn.TextMessage, payload: secondPayload}
+	select {
+	case accepted := <-session.accepted:
+		if string(accepted.Payload()) != string(secondPayload) {
+			t.Fatalf("expected second request to reach the session unchanged, got %s", accepted.Payload())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for second request after recoverable client error")
+	}
+	select {
+	case exit := <-actor.exitCh:
+		t.Fatalf("recoverable client error must not exit the actor, got %+v", exit)
+	default:
+	}
+
+	close(actor.clientFrames)
+	actor.workers.Wait()
+}
+
+func TestRealtimeRelayActorDispatchesOptInControlWhileCreateIsBlocked(t *testing.T) {
+	session := &relayActorConcurrentControlSession{
+		createStarted:  make(chan struct{}),
+		createRelease:  make(chan struct{}),
+		controlHandled: make(chan struct{}),
+		controlReturn:  make(chan struct{}),
+		serialFrames:   make(chan runtimerealtime.Frame, 1),
+	}
+	actor := newRealtimeRelayActor(nil, session, time.Second)
+	actor.workers.Add(1)
+	go actor.runWorker(actor.clientToSession)
+
+	actor.clientFrames <- realtimeRelayClientFrame{mt: wsconn.TextMessage, payload: []byte(`{"type":"response.create","input":"hello"}`)}
+	select {
+	case <-session.createStarted:
+	case <-time.After(time.Second):
+		t.Fatal("response.create did not start")
+	}
+	queued := []byte(`{"type":"session.update"}`)
+	actor.clientFrames <- realtimeRelayClientFrame{mt: wsconn.TextMessage, payload: queued}
+	actor.clientFrames <- realtimeRelayClientFrame{mt: wsconn.TextMessage, payload: []byte(`{"type":"response.cancel"}`)}
+
+	select {
+	case <-session.controlHandled:
+	case <-time.After(time.Second):
+		t.Fatal("response.cancel waited behind the blocked create")
+	}
+	select {
+	case frame := <-session.serialFrames:
+		t.Fatalf("ordinary frame overtook the active create: %s", frame.Payload())
+	default:
+	}
+	close(session.controlReturn)
+	select {
+	case frame := <-session.serialFrames:
+		if string(frame.Payload()) != string(queued) {
+			t.Fatalf("queued ordinary frame changed: %s", frame.Payload())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued ordinary frame was not sent after create cancellation")
+	}
+
+	close(actor.clientFrames)
+	actor.workers.Wait()
+	select {
+	case exit := <-actor.exitCh:
+		t.Fatalf("successful concurrent control exited actor: %+v", exit)
+	default:
 	}
 }
 
@@ -1256,6 +1510,20 @@ func TestRealtimeRelayActorProviderClosePreservesPrivateWireCode(t *testing.T) {
 
 	if info := client.readClose(t); info.Code != wsconn.CloseCode(4408) || info.Reason != "session_expired" {
 		t.Fatalf("expected downstream close 4408 session_expired, got %+v", info)
+	}
+}
+
+func TestRealtimeRelayActorProviderCloseRedactsReason(t *testing.T) {
+	actor := newRealtimeRelayActor(nil, newRelayActorTestSession(), time.Second)
+	exit := actor.providerCloseExit(&runtimerealtime.ProviderClose{
+		Code:   4408,
+		Reason: "organization org-secret access_token=provider-secret",
+	}, nil)
+	if strings.Contains(exit.downstreamCloseReason, "org-secret") || strings.Contains(exit.downstreamCloseReason, "provider-secret") {
+		t.Fatalf("provider close reason leaked: %q", exit.downstreamCloseReason)
+	}
+	if !strings.Contains(exit.downstreamCloseReason, "organization [redacted]") {
+		t.Fatalf("provider close diagnostic lost safe context: %q", exit.downstreamCloseReason)
 	}
 }
 

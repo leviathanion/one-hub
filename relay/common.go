@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,11 +12,14 @@ import (
 	"one-api/common/config"
 	"one-api/common/groupctx"
 	"one-api/common/logger"
+	"one-api/common/providerresponse"
+	"one-api/common/requestctx"
 	"one-api/common/requester"
+	commonresponses "one-api/common/responses"
 	"one-api/common/surface"
 	"one-api/common/utils"
 	"one-api/controller"
-	"one-api/metrics"
+	"one-api/middleware"
 	"one-api/model"
 	"one-api/providers"
 	providersBase "one-api/providers/base"
@@ -37,7 +41,32 @@ type realtimeChannelSelection struct {
 	skipChannelIDs          []int
 }
 
-const defaultClaudeBaseURL = "https://api.anthropic.com"
+const requestChannelCapabilityContextKey = "request_channel_capability"
+
+type requestChannelCapability func(channel *model.Channel) error
+
+func setRequestChannelCapability(c *gin.Context, capability requestChannelCapability) {
+	if c == nil {
+		return
+	}
+	if capability == nil {
+		c.Set(requestChannelCapabilityContextKey, nil)
+		return
+	}
+	c.Set(requestChannelCapabilityContextKey, capability)
+}
+
+func currentRequestChannelCapability(c *gin.Context) requestChannelCapability {
+	if c == nil {
+		return nil
+	}
+	value, ok := c.Get(requestChannelCapabilityContextKey)
+	if !ok || value == nil {
+		return nil
+	}
+	capability, _ := value.(requestChannelCapability)
+	return capability
+}
 
 func invalidChannelRuntimeConfigAPIError(err error) *types.OpenAIErrorWithStatusCode {
 	var invalidConfig *model.InvalidChannelRuntimeConfigError
@@ -83,44 +112,7 @@ func Path2Relay(c *gin.Context, path string) RelayBaseInterface {
 }
 
 func checkLimitModel(c *gin.Context, modelName string) (error error) {
-	// 判断modelName是否在token的setting.limits.LimitModelSetting.models[]范围内
-
-	// 从context中获取token设置
-	tokenSetting, exists := c.Get("token_setting")
-	if !exists {
-		// 如果没有token设置，则不进行限制
-		return nil
-	}
-
-	// 类型断言为TokenSetting指针
-	setting, ok := tokenSetting.(*model.TokenSetting)
-	if !ok || setting == nil {
-		// 类型断言失败或为空，不进行限制
-		return nil
-	}
-
-	// 检查是否启用了模型限制
-	if !setting.Limits.LimitModelSetting.Enabled {
-		// 未启用模型限制，允许所有模型
-		return nil
-	}
-
-	// 检查模型列表是否为空
-	if len(setting.Limits.LimitModelSetting.Models) == 0 {
-		// Empty model list means no models are allowed
-		return errors.New("No available models configured for current token")
-	}
-
-	// Check if modelName is in the allowed models list
-	for _, allowedModel := range setting.Limits.LimitModelSetting.Models {
-		if allowedModel == modelName {
-			// Found matching model, allow usage
-			return nil
-		}
-	}
-
-	// modelName is not in the allowed models list
-	return fmt.Errorf("Model %s is not supported for current token", modelName)
+	return middleware.EnsureTokenModelAllowed(c, modelName)
 }
 
 func GetProvider(c *gin.Context, modelName string) (provider providersBase.ProviderInterface, newModelName string, fail error) {
@@ -139,6 +131,37 @@ func GetProvider(c *gin.Context, modelName string) (provider providersBase.Provi
 	return prepareProviderForChannel(c, modelName, channel)
 }
 
+// GetProviderForOwnerChannel resolves an exact channel incarnation after the
+// caller has located it through a durable owner. New child work still requires
+// current principal, group and model permission on that exact channel.
+func GetProviderForOwnerChannel(c *gin.Context, modelName string, channelID int) (provider providersBase.ProviderInterface, newModelName string, fail error) {
+	if c == nil || channelID <= 0 {
+		return nil, "", errors.New("durable owner channel is invalid")
+	}
+	if apiErr := middleware.RefreshAuthenticatedLongLivedPrincipal(c); apiErr != nil {
+		return nil, "", apiErr
+	}
+	if modelName != "" {
+		if err := checkLimitModel(c, modelName); err != nil {
+			c.AbortWithStatus(http.StatusNotFound)
+			return nil, "", err
+		}
+	}
+	channel, err := fetchOwnerChannelById(c.Request.Context(), channelID)
+	if err != nil {
+		return nil, "", err
+	}
+	if apiErr := middleware.AdmitAuthenticatedChannelWork(c, modelName, channelID); apiErr != nil {
+		return nil, "", apiErr
+	}
+	if capability := currentRequestChannelCapability(c); capability != nil {
+		if err := capability(channel); err != nil {
+			return nil, "", err
+		}
+	}
+	return prepareProviderForChannel(c, modelName, channel)
+}
+
 func prepareProviderForChannel(c *gin.Context, modelName string, channel *model.Channel) (provider providersBase.ProviderInterface, newModelName string, fail error) {
 	if channel == nil {
 		fail = errors.New("channel not found")
@@ -154,12 +177,11 @@ func prepareProviderForChannel(c *gin.Context, modelName string, channel *model.
 	c.Set("channel_type", channel.Type)
 
 	if strings.HasPrefix(c.Request.URL.Path, "/claude") && channel.Type == config.ChannelTypeCustom {
-		baseURL, err := channel.ResolveCustomClaudeBaseURL(defaultClaudeBaseURL)
-		if err != nil {
-			fail = err
+		if !channel.CustomClaudeRelayEnabled() {
+			fail = errors.New("selected channel does not enable native Claude Messages")
 			return
 		}
-		provider = claude.CreateClaudeProvider(channel, baseURL)
+		provider = claude.CreateClaudeProvider(channel, "")
 	} else {
 		provider = providers.GetProvider(channel, c)
 	}
@@ -189,67 +211,21 @@ func prepareProviderForChannel(c *gin.Context, modelName string, channel *model.
 	return
 }
 
-type cachedProviderSelection struct {
-	provider        providersBase.ProviderInterface
-	originalModel   string
-	newModelName    string
-	channelID       int
-	channelType     int
-	billingOriginal bool
-	skipOnlyChat    bool
-	isStream        bool
-}
-
-func cacheProviderSelection(c *gin.Context, originalModel string, provider providersBase.ProviderInterface, newModelName string) {
-	billingOriginalModel := c.GetBool("billing_original_model")
-	selection := &cachedProviderSelection{
-		provider:        provider,
-		originalModel:   originalModel,
-		newModelName:    newModelName,
-		channelID:       c.GetInt("channel_id"),
-		channelType:     c.GetInt("channel_type"),
-		billingOriginal: billingOriginalModel,
-		skipOnlyChat:    c.GetBool("skip_only_chat"),
-		isStream:        c.GetBool("is_stream"),
-	}
-	c.Set(config.GinProviderCacheKey, selection)
-}
-
-func consumeCachedProviderSelection(c *gin.Context, originalModel string) (providersBase.ProviderInterface, string, bool) {
-	cached, exists := c.Get(config.GinProviderCacheKey)
-	if !exists || cached == nil {
-		return nil, "", false
-	}
-
-	selection, ok := cached.(*cachedProviderSelection)
-	if !ok || selection == nil || selection.provider == nil || selection.originalModel != originalModel {
-		c.Set(config.GinProviderCacheKey, nil)
-		return nil, "", false
-	}
-
-	if selection.skipOnlyChat != c.GetBool("skip_only_chat") || selection.isStream != c.GetBool("is_stream") {
-		c.Set(config.GinProviderCacheKey, nil)
-		return nil, "", false
-	}
-
-	// Keep this restore list in sync with every provider-selection context write in GetProvider.
-	// Cache hits must restore the full selection context: channel_id, channel_type,
-	// original_model, new_model, and billing_original_model.
-	c.Set(config.GinProviderCacheKey, nil)
-	c.Set("channel_id", selection.channelID)
-	c.Set("channel_type", selection.channelType)
-	c.Set("original_model", selection.originalModel)
-	c.Set("new_model", selection.newModelName)
-	c.Set("billing_original_model", selection.billingOriginal)
-	return selection.provider, selection.newModelName, true
-}
-
 func fetchChannel(c *gin.Context, modelName string) (channel *model.Channel, fail error) {
 	channelId := explicitChannelPinID(c)
 	if channelId > 0 {
-		channel, err := fetchChannelById(channelId)
-		if err != nil {
-			return nil, err
+		if responseOwnerChannelID(c) == channelId {
+			channel, fail = fetchOwnerChannelById(c.Request.Context(), channelId)
+		} else {
+			channel, fail = fetchChannelById(channelId)
+		}
+		if fail != nil {
+			return nil, fail
+		}
+		if capability := currentRequestChannelCapability(c); capability != nil {
+			if err := capability(channel); err != nil {
+				return nil, err
+			}
 		}
 		return channel, nil
 	}
@@ -276,6 +252,17 @@ func fetchChannelById(channelId int) (*model.Channel, error) {
 		return nil, model.NewInvalidChannelRuntimeConfigError(channel.Id, err)
 	}
 
+	return channel, nil
+}
+
+func fetchOwnerChannelById(ctx context.Context, channelID int) (*model.Channel, error) {
+	channel, err := model.GetChannelIncarnationByID(ctx, channelID)
+	if err != nil {
+		return nil, errors.New("无效的 owner 渠道 Id")
+	}
+	if err := channel.ValidateRuntimeConfigJSON(); err != nil {
+		return nil, model.NewInvalidChannelRuntimeConfigError(channel.Id, err)
+	}
 	return channel, nil
 }
 
@@ -371,8 +358,7 @@ func isClaudeRouteEligibleChannel(channel *model.Channel) bool {
 	case config.ChannelTypeAnthropic, config.ChannelTypeVertexAI, config.ChannelTypeBedrock:
 		return true
 	case config.ChannelTypeCustom:
-		_, err := channel.ResolveCustomClaudeBaseURL(defaultClaudeBaseURL)
-		return err == nil
+		return channel.CustomClaudeRelayEnabled()
 	default:
 		return false
 	}
@@ -417,18 +403,30 @@ func channelIDInList(ids []int, target int) bool {
 	return false
 }
 
-func preferredChannelWaitBudget() time.Duration {
-	if config.PreferredChannelWaitMilliseconds <= 0 {
+func preferredChannelWaitBudget(c *gin.Context) time.Duration {
+	waitMilliseconds := 0
+	if snapshot := config.GlobalOption.RuntimeSnapshot(); snapshot != nil {
+		waitMilliseconds = snapshot.Int("PreferredChannelWaitMilliseconds", 0)
+	} else {
+		waitMilliseconds = config.PreferredChannelWaitMilliseconds
+	}
+	if waitMilliseconds <= 0 {
 		return 0
 	}
-	return time.Duration(config.PreferredChannelWaitMilliseconds) * time.Millisecond
+	return time.Duration(waitMilliseconds) * time.Millisecond
 }
 
-func preferredChannelWaitPollInterval() time.Duration {
-	if config.PreferredChannelWaitPollMilliseconds <= 0 {
+func preferredChannelWaitPollInterval(c *gin.Context) time.Duration {
+	pollMilliseconds := 50
+	if snapshot := config.GlobalOption.RuntimeSnapshot(); snapshot != nil {
+		pollMilliseconds = snapshot.Int("PreferredChannelWaitPollMilliseconds", 50)
+	} else {
+		pollMilliseconds = config.PreferredChannelWaitPollMilliseconds
+	}
+	if pollMilliseconds <= 0 {
 		return 50 * time.Millisecond
 	}
-	return time.Duration(config.PreferredChannelWaitPollMilliseconds) * time.Millisecond
+	return time.Duration(pollMilliseconds) * time.Millisecond
 }
 
 func requestContextErr(c *gin.Context) error {
@@ -453,7 +451,7 @@ func waitForPreferredChannelCooldown(c *gin.Context, group, modelName string, se
 		return nil
 	}
 
-	budget := preferredChannelWaitBudget()
+	budget := preferredChannelWaitBudget(c)
 	if budget <= 0 {
 		return nil
 	}
@@ -463,7 +461,7 @@ func waitForPreferredChannelCooldown(c *gin.Context, group, modelName string, se
 		return nil
 	}
 
-	pollInterval := preferredChannelWaitPollInterval()
+	pollInterval := preferredChannelWaitPollInterval(c)
 	if pollInterval <= 0 {
 		pollInterval = 50 * time.Millisecond
 	}
@@ -531,29 +529,47 @@ func fetchChannelByModelWithSelection(c *gin.Context, modelName string, selectio
 	isStream := c.GetBool("is_stream")
 	setChannelAffinitySelectedPreferred(c, false)
 
-	var filters []model.ChannelsFilterFunc
+	var baseFilters []model.ChannelsFilterFunc
+	var rejectedCapabilityErr error
 	if skipOnlyChat {
-		filters = append(filters, model.FilterOnlyChat())
+		baseFilters = append(baseFilters, model.FilterOnlyChat())
 	}
 
 	if len(selection.skipChannelIDs) > 0 {
-		filters = append(filters, model.FilterChannelId(selection.skipChannelIDs))
+		baseFilters = append(baseFilters, model.FilterChannelId(selection.skipChannelIDs))
 	}
 
 	if len(selection.allowChannelTypes) > 0 {
-		filters = append(filters, model.FilterChannelTypes(selection.allowChannelTypes))
+		baseFilters = append(baseFilters, model.FilterChannelTypes(selection.allowChannelTypes))
 	}
 	if strings.HasPrefix(c.Request.URL.Path, "/claude") {
-		filters = append(filters, model.FilterFunc(filterNonClaudeRouteEligibleChannel))
+		baseFilters = append(baseFilters, model.FilterFunc(filterNonClaudeRouteEligibleChannel))
 	}
 
 	if isStream {
-		filters = append(filters, model.FilterDisabledStream(modelName))
+		baseFilters = append(baseFilters, model.FilterDisabledStream(modelName))
+	}
+	filters := append([]model.ChannelsFilterFunc(nil), baseFilters...)
+	var capabilityFilter model.ChannelsFilterFunc
+	if capability := currentRequestChannelCapability(c); capability != nil {
+		capabilityFilter = model.FilterFunc(func(_ int, choice *model.ChannelChoice) bool {
+			if choice == nil || choice.Channel == nil {
+				return true
+			}
+			if err := capability(choice.Channel); err != nil {
+				if rejectedCapabilityErr == nil {
+					rejectedCapabilityErr = err
+				}
+				return true
+			}
+			return false
+		})
+		filters = append(filters, capabilityFilter)
 	}
 
 	// 使用统一的分组管理器
 	groupManager := NewGroupManager(c)
-	return groupManager.TryWithGroups(modelName, filters, func(group string) (*model.Channel, error) {
+	channel, err := groupManager.TryWithGroups(modelName, filters, func(group string) (*model.Channel, error) {
 		if err := waitForPreferredChannelCooldown(c, group, modelName, selection, filters); err != nil {
 			return nil, err
 		}
@@ -567,7 +583,7 @@ func fetchChannelByModelWithSelection(c *gin.Context, modelName string, selectio
 			// channel and is intentionally avoiding it for retry. Do not erase
 			// durable affinity on that transient signal; only clear records when
 			// the preferred channel is genuinely unavailable to normal selection.
-			if !preferredSkippedForRequest {
+			if !preferredSkippedForRequest && !selection.strictPreferredChannel {
 				clearCurrentChannelAffinity(c)
 			}
 			if selection.strictPreferredChannel {
@@ -577,19 +593,73 @@ func fetchChannelByModelWithSelection(c *gin.Context, modelName string, selectio
 		setChannelAffinitySelectedPreferred(c, channel != nil && selection.preferredChannelID > 0 && channel.Id == selection.preferredChannelID)
 		return channel, nil
 	})
+	if err != nil {
+		if contextErr := requestContextErr(c); contextErr != nil {
+			return nil, contextErr
+		}
+		if rejectedCapabilityErr != nil && capabilityFilter != nil && allSelectionCandidatesRejectCapability(groupManager, modelName, baseFilters, capabilityFilter) {
+			return nil, rejectedCapabilityErr
+		}
+	}
+	return channel, err
+}
+
+func allSelectionCandidatesRejectCapability(groupManager *GroupManager, modelName string, baseFilters []model.ChannelsFilterFunc, capabilityFilter model.ChannelsFilterFunc) bool {
+	if groupManager == nil || capabilityFilter == nil {
+		return false
+	}
+	groups := []string{groupManager.primaryGroup, groupManager.backupGroup}
+	seen := make(map[string]struct{}, len(groups))
+	foundBaseCandidate := false
+	capabilityFilters := make([]model.ChannelsFilterFunc, 0, len(baseFilters)+1)
+	capabilityFilters = append(capabilityFilters, baseFilters...)
+	capabilityFilters = append(capabilityFilters, capabilityFilter)
+	for _, group := range groups {
+		group = strings.TrimSpace(group)
+		if group == "" {
+			continue
+		}
+		if _, exists := seen[group]; exists {
+			continue
+		}
+		seen[group] = struct{}{}
+		if !model.ChannelGroup.ModelHasCandidate(group, modelName, baseFilters...) {
+			continue
+		}
+		foundBaseCandidate = true
+		if model.ChannelGroup.ModelHasCandidate(group, modelName, capabilityFilters...) {
+			return false
+		}
+	}
+	return foundBaseCandidate
 }
 
 func responseJsonClient(c *gin.Context, data interface{}) *types.OpenAIErrorWithStatusCode {
-	// 将data转换为 JSON
-	responseBody, err := json.Marshal(data)
-	if err != nil {
-		logger.LogError(c.Request.Context(), "marshal_response_body_failed:"+err.Error())
-		return nil
+	var responseBody []byte
+	if rawResponse, ok := data.(requester.ProviderRawJSONReplayer); ok {
+		responseBody = rawResponse.ReplayProviderRawJSON()
+	}
+	if len(responseBody) == 0 {
+		var err error
+		responseBody, err = json.Marshal(data)
+		if err != nil {
+			logger.LogError(c.Request.Context(), "marshal_response_body_failed:"+err.Error())
+			return nil
+		}
+		// JSON marshaling is a new representation even when the dialect is the
+		// same. Do this before copying provider headers so Content-Length,
+		// Content-Encoding, validators, and ranges cannot describe the old body.
+		invalidateProviderRepresentationHeaders(c)
+	}
+	if safeBody, changed := common.RedactProviderMetadataJSON(responseBody); changed {
+		responseBody = safeBody
+		invalidateProviderRepresentationHeaders(c)
 	}
 
+	applyProviderResponseHeaders(c)
 	c.Writer.Header().Set("Content-Type", "application/json")
-	c.Writer.WriteHeader(http.StatusOK)
-	_, err = c.Writer.Write(responseBody)
+	c.Writer.WriteHeader(providerResponseStatus(c, http.StatusOK))
+	_, err := c.Writer.Write(responseBody)
 	if err != nil {
 		logger.LogError(c.Request.Context(), "write_response_body_failed:"+err.Error())
 	}
@@ -597,28 +667,156 @@ func responseJsonClient(c *gin.Context, data interface{}) *types.OpenAIErrorWith
 	return nil
 }
 
+func invalidateProviderRepresentationHeaders(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	value, ok := c.Get(requestctx.ProviderResponseHeadersContextKey)
+	if !ok || value == nil {
+		return
+	}
+	headers, ok := value.(http.Header)
+	if !ok {
+		return
+	}
+	headers = headers.Clone()
+	for _, name := range []string{
+		"Content-Encoding",
+		"Content-Length",
+		"Content-Range",
+		"Digest",
+		"Etag",
+	} {
+		headers.Del(name)
+	}
+	c.Set(requestctx.ProviderResponseHeadersContextKey, headers)
+}
+
+func providerResponseStatus(c *gin.Context, fallback int) int {
+	if c == nil {
+		return fallback
+	}
+	status := c.GetInt(requestctx.ProviderResponseStatusContextKey)
+	if status < 100 || status > 599 {
+		return fallback
+	}
+	return status
+}
+
+func applyProviderResponseHeaders(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	value, ok := c.Get(requestctx.ProviderResponseHeadersContextKey)
+	if !ok || value == nil {
+		return
+	}
+	headers, ok := value.(http.Header)
+	if !ok {
+		return
+	}
+	for name, values := range headers {
+		c.Writer.Header()[name] = append([]string(nil), values...)
+	}
+}
+
 type StreamEndHandler func() string
 
 const streamErrorClientMessage = "stream interrupted"
+
+type sseBoundaryTracker struct {
+	tail string
+}
+
+func (t *sseBoundaryTracker) Observe(data string) {
+	if t == nil || data == "" {
+		return
+	}
+	t.tail += data
+	if len(t.tail) > 4 {
+		t.tail = t.tail[len(t.tail)-4:]
+	}
+}
+
+func (t *sseBoundaryTracker) CompleteEvent(write func(string) error) error {
+	if t == nil || write == nil {
+		return nil
+	}
+	suffix := "\n\n"
+	switch {
+	case strings.HasSuffix(t.tail, "\r\n\r\n"), strings.HasSuffix(t.tail, "\n\n"), strings.HasSuffix(t.tail, "\r\r"):
+		return nil
+	case strings.HasSuffix(t.tail, "\r\n"):
+		suffix = "\r\n"
+	case strings.HasSuffix(t.tail, "\n"):
+		suffix = "\n"
+	case strings.HasSuffix(t.tail, "\r"):
+		suffix = "\r"
+	}
+	if err := write(suffix); err != nil {
+		return err
+	}
+	t.Observe(suffix)
+	return nil
+}
 
 func isStreamTerminalEOF(err error) bool {
 	return err == nil || errors.Is(err, io.EOF)
 }
 
-func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface[string], endHandler StreamEndHandler) (firstResponseTime time.Time, errWithOP *types.OpenAIErrorWithStatusCode) {
+func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface[string], endHandler StreamEndHandler, observers ...func(string)) (firstResponseTime time.Time, errWithOP *types.OpenAIErrorWithStatusCode) {
+	applyProviderResponseHeaders(c)
 	requester.SetEventStreamHeaders(c)
+	c.Writer.WriteHeader(providerResponseStatus(c, http.StatusOK))
 	dataChan, errChan := stream.Recv()
+	rawSSEEvents := requester.IsRawSSEEventStream(stream)
 
-	defer stream.Close()
+	defer requester.CloseAndDrainStream(stream)
 	streamWriter := relay_util.NewBufferedStreamWriter(c.Writer, 0)
 	defer streamWriter.Close()
 
 	var isFirstResponse bool
+	var sawProviderInBandError bool
+	var providerInBandError *types.OpenAIErrorWithStatusCode
+	var sawProviderData bool
 	dataOpen := dataChan != nil
 	errOpen := errChan != nil
 
-	handleData := func(data string) {
-		streamData := "data: " + data + "\n\n"
+	handleData := func(data string) error {
+		payload := data
+		hasPayload := true
+		if rawSSEEvents {
+			payload, hasPayload = commonresponses.SSEDataPayload(data)
+			if hasPayload && strings.TrimSpace(payload) == "[DONE]" {
+				hasPayload = false
+			}
+		}
+		if hasPayload {
+			apiErr := runtimesession.ProviderAPIErrorFromPayload([]byte(payload))
+			if rawSSEEvents {
+				apiErr = runtimesession.OpenAIErrorEnvelopeFromPayload([]byte(payload))
+			}
+			if apiErr != nil {
+				sawProviderInBandError = true
+				if providerInBandError == nil {
+					providerInBandError = providerresponse.SanitizeAPIError(apiErr)
+				}
+			} else {
+				sawProviderData = true
+			}
+			for _, observe := range observers {
+				if observe != nil {
+					observe(payload)
+				}
+			}
+		}
+		streamData := ""
+		if rawSSEEvents {
+			streamData = sanitizeOpenAIChatCompletionSSEEvent(data)
+		} else {
+			payload = string(sanitizeProviderJSONPayload([]byte(payload)))
+			streamData = "data: " + payload + "\n\n"
+		}
 		if !isFirstResponse {
 			firstResponseTime = time.Now()
 			isFirstResponse = true
@@ -626,34 +824,59 @@ func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface
 
 		select {
 		case <-c.Request.Context().Done():
+			return c.Request.Context().Err()
 		default:
-			_, _ = streamWriter.WriteString(streamData)
+			_, err := streamWriter.WriteString(streamData)
+			return err
 		}
 	}
 
-	handleEOF := func() {
+	handleEOF := func() error {
+		if rawSSEEvents {
+			return nil
+		}
+		if sawProviderInBandError {
+			return nil
+		}
 		if endHandler != nil {
 			streamData := endHandler()
 			if streamData != "" {
 				select {
 				case <-c.Request.Context().Done():
+					return c.Request.Context().Err()
 				default:
-					_, _ = streamWriter.WriteString("data: " + streamData + "\n\n")
+					if _, err := streamWriter.WriteString("data: " + streamData + "\n\n"); err != nil {
+						return err
+					}
 				}
 			}
 		}
 
 		select {
 		case <-c.Request.Context().Done():
+			return c.Request.Context().Err()
 		default:
-			_, _ = streamWriter.WriteString("data: [DONE]\n\n")
+			_, err := streamWriter.WriteString("data: [DONE]\n\n")
+			return err
 		}
 	}
+	renderedProviderInBandError := func() *types.OpenAIErrorWithStatusCode {
+		if providerInBandError == nil {
+			return nil
+		}
+		failure := *providerInBandError
+		failure.UpstreamAccepted = failure.UpstreamAccepted || sawProviderData
+		c.Set(streamErrorAlreadyRenderedContextKey, true)
+		return &failure
+	}
 
-	handleError := func(err error) {
+	handleError := func(err error) error {
 		if isStreamTerminalEOF(err) {
-			handleEOF()
-			return
+			return handleEOF()
+		}
+		if sawProviderInBandError {
+			c.Set(streamErrorAlreadyRenderedContextKey, true)
+			return nil
 		}
 		errPayload := map[string]any{
 			"error": map[string]any{
@@ -662,15 +885,51 @@ func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface
 				"code":    "stream_error",
 			},
 		}
+		var providerErr *types.OpenAIErrorWithStatusCode
+		if errors.As(err, &providerErr) && providerErr != nil && !providerErr.LocalError {
+			safeErr := providerresponse.SanitizeAPIError(providerErr)
+			errPayload["error"] = safeErr.OpenAIError
+		}
 		errJSON, _ := json.Marshal(errPayload)
 		errMsg := "data: " + string(errJSON) + "\n\n"
 		select {
 		case <-c.Request.Context().Done():
+			return c.Request.Context().Err()
 		default:
-			_, _ = streamWriter.WriteString(errMsg)
+			if _, writeErr := streamWriter.WriteString(errMsg); writeErr != nil {
+				return writeErr
+			}
 		}
+		c.Set(streamErrorAlreadyRenderedContextKey, true)
 
 		logger.LogError(c.Request.Context(), "Stream err:"+common.RedactSensitiveText(err.Error()))
+		return nil
+	}
+
+	writeFailure := func(err error) *types.OpenAIErrorWithStatusCode {
+		c.Set(streamErrorAlreadyRenderedContextKey, true)
+		apiErr := common.ErrorWrapper(err, "stream_write_failed", http.StatusInternalServerError)
+		apiErr.UpstreamAccepted = true
+		return apiErr
+	}
+	streamFailure := func(err error) *types.OpenAIErrorWithStatusCode {
+		var providerErr *types.OpenAIErrorWithStatusCode
+		if errors.As(err, &providerErr) && providerErr != nil {
+			safeErr := providerresponse.SanitizeAPIError(providerErr)
+			failure := *safeErr
+			// A stream has already opened. Local parsing/framing failures cannot
+			// establish provider rejection, even before the first converted chunk.
+			failure.UpstreamAccepted = failure.UpstreamAccepted || sawProviderData || failure.LocalError
+			return &failure
+		}
+		code := "stream_read_failed"
+		if errors.Is(err, requester.ErrStreamLineTooLarge) || errors.Is(err, requester.ErrSSEEventTooLarge) {
+			code = "provider_usage_state_limit"
+		}
+		apiErr := common.ErrorWrapper(err, code, http.StatusBadGateway)
+		apiErr.LocalError = code == "provider_usage_state_limit"
+		apiErr.UpstreamAccepted = true
+		return apiErr
 	}
 
 	for dataOpen || errOpen {
@@ -682,7 +941,12 @@ func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface
 					dataChan = nil
 					continue
 				}
-				handleData(data)
+				if err := handleData(data); err != nil {
+					return firstResponseTime, writeFailure(err)
+				}
+				if inBandErr := renderedProviderInBandError(); inBandErr != nil {
+					return firstResponseTime, inBandErr
+				}
 				continue
 			default:
 			}
@@ -695,19 +959,37 @@ func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface
 				dataChan = nil
 				continue
 			}
-			handleData(data)
+			if err := handleData(data); err != nil {
+				return firstResponseTime, writeFailure(err)
+			}
+			if inBandErr := renderedProviderInBandError(); inBandErr != nil {
+				return firstResponseTime, inBandErr
+			}
 		case err, ok := <-errChan:
 			if !ok {
 				errOpen = false
 				errChan = nil
 				continue
 			}
-			handleError(err)
+			if writeErr := handleError(err); writeErr != nil {
+				return firstResponseTime, writeFailure(writeErr)
+			}
+			if inBandErr := renderedProviderInBandError(); inBandErr != nil {
+				return firstResponseTime, inBandErr
+			}
+			if !isStreamTerminalEOF(err) {
+				return firstResponseTime, streamFailure(err)
+			}
 			return firstResponseTime, nil
 		}
 	}
 
-	handleEOF()
+	if err := handleEOF(); err != nil {
+		return firstResponseTime, writeFailure(err)
+	}
+	if inBandErr := renderedProviderInBandError(); inBandErr != nil {
+		return firstResponseTime, inBandErr
+	}
 	return firstResponseTime, nil
 }
 
@@ -716,17 +998,31 @@ func responseGeneralStreamClient(c *gin.Context, stream requester.StreamReaderIn
 }
 
 func responseGeneralStreamClientWithObserver(c *gin.Context, stream requester.StreamReaderInterface[string], endHandler StreamEndHandler, observer func(string)) (firstResponseTime time.Time) {
+	firstResponseTime, _ = responseGeneralStreamClientWithObserverResult(c, stream, endHandler, observer, nil, true)
+	return firstResponseTime
+}
+
+func responseGeneralStreamClientWithObserverResult(c *gin.Context, stream requester.StreamReaderInterface[string], endHandler StreamEndHandler, observer func(string), transform func(string) string, renderStreamError bool) (firstResponseTime time.Time, streamErr error) {
+	applyProviderResponseHeaders(c)
 	requester.SetEventStreamHeaders(c)
+	c.Writer.WriteHeader(providerResponseStatus(c, http.StatusOK))
 	dataChan, errChan := stream.Recv()
 
-	defer stream.Close()
+	defer requester.CloseAndDrainStream(stream)
 	streamWriter := relay_util.NewBufferedStreamWriter(c.Writer, 0)
 	defer streamWriter.Close()
+	var framing sseBoundaryTracker
+	ensureEventBoundary := func() error {
+		return framing.CompleteEvent(func(data string) error {
+			_, writeErr := streamWriter.WriteString(data)
+			return writeErr
+		})
+	}
 	var isFirstResponse bool
 	dataOpen := dataChan != nil
 	errOpen := errChan != nil
 
-	handleData := func(data string) {
+	handleData := func(data string) error {
 		if !isFirstResponse {
 			firstResponseTime = time.Now()
 			isFirstResponse = true
@@ -734,35 +1030,44 @@ func responseGeneralStreamClientWithObserver(c *gin.Context, stream requester.St
 		if observer != nil {
 			observer(data)
 		}
+		if transform != nil {
+			data = transform(data)
+		}
 		select {
 		case <-c.Request.Context().Done():
+			return c.Request.Context().Err()
 		default:
-			_, _ = streamWriter.WriteString(data)
+			if _, err := streamWriter.WriteString(data); err != nil {
+				return err
+			}
+			framing.Observe(data)
 		}
+		return nil
 	}
 
-	handleEOF := func() {
+	handleEOF := func() error {
 		if endHandler == nil {
-			return
+			return nil
 		}
 		streamData := endHandler()
 		if streamData == "" {
-			return
+			return nil
 		}
 		if observer != nil {
 			observer(streamData)
 		}
 		select {
 		case <-c.Request.Context().Done():
+			return c.Request.Context().Err()
 		default:
-			_, _ = streamWriter.WriteString(streamData)
+			_, err := streamWriter.WriteString(streamData)
+			return err
 		}
 	}
 
-	handleError := func(err error) {
+	handleError := func(err error) error {
 		if isStreamTerminalEOF(err) {
-			handleEOF()
-			return
+			return handleEOF()
 		}
 		errPayload := map[string]any{
 			"type":    "error",
@@ -771,13 +1076,22 @@ func responseGeneralStreamClientWithObserver(c *gin.Context, stream requester.St
 		}
 		errJSON, _ := json.Marshal(errPayload)
 		errEvent := "event: error\ndata: " + string(errJSON) + "\n\n"
+		if boundaryErr := ensureEventBoundary(); boundaryErr != nil {
+			return boundaryErr
+		}
 		select {
 		case <-c.Request.Context().Done():
+			return c.Request.Context().Err()
 		default:
-			_, _ = streamWriter.WriteString(errEvent)
+			if _, writeErr := streamWriter.WriteString(errEvent); writeErr != nil {
+				return writeErr
+			}
 		}
+		framing.Observe(errEvent)
+		c.Set(streamErrorAlreadyRenderedContextKey, true)
 
 		logger.LogError(c.Request.Context(), "Stream err:"+common.RedactSensitiveText(err.Error()))
+		return nil
 	}
 
 	for dataOpen || errOpen {
@@ -789,55 +1103,173 @@ func responseGeneralStreamClientWithObserver(c *gin.Context, stream requester.St
 					dataChan = nil
 					continue
 				}
-				handleData(data)
+				if err := handleData(data); err != nil {
+					return firstResponseTime, err
+				}
 				continue
 			default:
 			}
 		}
 
 		select {
+		case <-c.Request.Context().Done():
+			return firstResponseTime, c.Request.Context().Err()
 		case data, ok := <-dataChan:
 			if !ok {
 				dataOpen = false
 				dataChan = nil
 				continue
 			}
-			handleData(data)
+			if err := handleData(data); err != nil {
+				return firstResponseTime, err
+			}
 		case err, ok := <-errChan:
 			if !ok {
 				errOpen = false
 				errChan = nil
 				continue
 			}
-			handleError(err)
-			return firstResponseTime
+			if renderStreamError {
+				if writeErr := handleError(err); writeErr != nil {
+					return firstResponseTime, writeErr
+				}
+			} else if !isStreamTerminalEOF(err) {
+				if writeErr := ensureEventBoundary(); writeErr != nil {
+					return firstResponseTime, writeErr
+				}
+			}
+			if !isStreamTerminalEOF(err) {
+				return firstResponseTime, err
+			}
+			return firstResponseTime, nil
 		}
 	}
 
-	handleEOF()
-	return firstResponseTime
+	if err := handleEOF(); err != nil {
+		return firstResponseTime, err
+	}
+	return firstResponseTime, nil
 }
 
-func responseMultipart(c *gin.Context, resp *http.Response) *types.OpenAIErrorWithStatusCode {
+func sanitizeProviderJSONPayload(payload []byte) []byte {
+	return sanitizeProviderJSONPayloadWithError(payload, runtimesession.ProviderAPIErrorFromPayload(payload))
+}
+
+func sanitizeProviderJSONPayloadWithError(payload []byte, apiErr *types.OpenAIErrorWithStatusCode) []byte {
+	safe := providerresponse.SanitizeErrorPayload(payload, apiErr)
+	if redacted, changed := common.RedactProviderMetadataJSON(safe); changed {
+		return redacted
+	}
+	return safe
+}
+
+func sanitizeProviderSSEEvent(data string) string {
+	return sanitizeProviderSSEEventWithErrorDetector(data, runtimesession.ProviderAPIErrorFromPayload)
+}
+
+func sanitizeOpenAIChatCompletionSSEEvent(data string) string {
+	return sanitizeProviderSSEEventWithErrorDetector(data, runtimesession.OpenAIErrorEnvelopeFromPayload)
+}
+
+func sanitizeProviderSSEEventWithErrorDetector(data string, detectError func([]byte) *types.OpenAIErrorWithStatusCode) string {
+	payload, hasData := commonresponses.SSEDataPayload(data)
+	if !hasData {
+		return data
+	}
+	var apiErr *types.OpenAIErrorWithStatusCode
+	if detectError != nil {
+		apiErr = detectError([]byte(payload))
+	}
+	safe := string(sanitizeProviderJSONPayloadWithError([]byte(payload), apiErr))
+	if safe == payload {
+		return data
+	}
+	// Only a security rewrite replaces the logical data payload. Preserve all
+	// event/id/retry/comment fields and the original event-ending bytes.
+	var out strings.Builder
+	wroteData := false
+	remaining := data
+	for len(remaining) > 0 {
+		lineEnd := strings.IndexByte(remaining, '\n')
+		line := remaining
+		if lineEnd >= 0 {
+			line = remaining[:lineEnd+1]
+		}
+		remaining = remaining[len(line):]
+		content := strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+		if content != "data" && !strings.HasPrefix(content, "data:") {
+			out.WriteString(line)
+			continue
+		}
+		if !wroteData {
+			out.WriteString("data: ")
+			out.WriteString(safe)
+			out.WriteString(line[len(content):])
+			wroteData = true
+		}
+	}
+	return out.String()
+}
+
+func responseMultipart(c *gin.Context, resp *http.Response, policy providerresponse.Policy) *types.OpenAIErrorWithStatusCode {
 	defer resp.Body.Close()
 
-	for k, v := range resp.Header {
-		c.Writer.Header().Set(k, v[0])
+	for k, v := range providerresponse.Filter(resp.Header, policy) {
+		c.Writer.Header()[k] = append([]string(nil), v...)
 	}
 
 	c.Writer.WriteHeader(resp.StatusCode)
+	c.Writer.WriteHeaderNow()
 
 	_, err := io.Copy(c.Writer, resp.Body)
 	if err != nil {
-		return common.ErrorWrapper(err, "write_response_body_failed", http.StatusInternalServerError)
+		// Status and possibly a body prefix are already committed. Abort the
+		// transport so HTTP/1.x clients do not receive a clean chunk terminator and
+		// HTTP/2 clients receive a reset for the truncated provider body.
+		logger.LogError(c.Request.Context(), "failed to deliver provider response body: "+common.RedactSensitiveText(err.Error()))
+		panic(http.ErrAbortHandler)
 	}
 
 	return nil
 }
 
-func responseCustom(c *gin.Context, response *types.AudioResponseWrapper) *types.OpenAIErrorWithStatusCode {
-	for k, v := range response.Headers {
-		c.Writer.Header().Set(k, v)
+func replayProviderRawResponse(c *gin.Context, apiErr *types.OpenAIErrorWithStatusCode, policy providerresponse.Policy) bool {
+	if c == nil || apiErr == nil || !apiErr.ReplayRawResponse {
+		return false
+	}
+	response := &http.Response{
+		StatusCode: apiErr.StatusCode,
+		Header:     apiErr.ResponseHeaders.Clone(),
+		Body:       io.NopCloser(bytes.NewReader(apiErr.RawBody)),
+	}
+	_ = responseMultipart(c, response, policy)
+	c.Abort()
+	return true
+}
+
+func providerResponsePolicyForChannel(channel *model.Channel, operation providersBase.Operation, bodyUnmodified bool) providerresponse.Policy {
+	dataPath := providersBase.DataPathCrossProtocol
+	if resolved, ok := providers.ResolveAdapterSupport(channel).DataPath(operation); ok {
+		dataPath = resolved
+	}
+	return providerresponse.Policy{
+		Operation:      operation,
+		DataPath:       dataPath,
+		BodyUnmodified: bodyUnmodified,
+	}
+}
+
+func responseCustom(c *gin.Context, response *types.AudioResponseWrapper, operation providerresponse.Operation) *types.OpenAIErrorWithStatusCode {
+	headers := make(http.Header, len(response.Headers))
+	for name, value := range response.Headers {
+		headers.Set(name, value)
+	}
+	for name, values := range providerresponse.Filter(headers, providerresponse.Policy{
+		Operation:      operation,
+		DataPath:       providerresponse.DataPathCrossProtocol,
+		BodyUnmodified: true,
+	}) {
+		c.Writer.Header()[name] = append([]string(nil), values...)
 	}
 	c.Writer.WriteHeader(http.StatusOK)
 
@@ -853,10 +1285,17 @@ func shouldRetry(c *gin.Context, apiErr *types.OpenAIErrorWithStatusCode, channe
 	if apiErr == nil {
 		return false
 	}
+	if requestContextErr(c) != nil {
+		return false
+	}
 
-	metrics.RecordProvider(c, apiErr.StatusCode)
-
-	if apiErr.LocalError || explicitChannelPinID(c) > 0 {
+	if explicitChannelPinID(c) > 0 {
+		return false
+	}
+	if apiErr.UpstreamNotAttempted {
+		return true
+	}
+	if apiErr.LocalError {
 		return false
 	}
 
@@ -864,7 +1303,7 @@ func shouldRetry(c *gin.Context, apiErr *types.OpenAIErrorWithStatusCode, channe
 	// the ideal architecture. The better design is a structured provider failure
 	// classifier whose disposition drives retry, cooldown, disable, and error
 	// presentation decisions; message matching should stay only as a scoped fallback.
-	if config.RetryStatusCodeIsRetryable(apiErr.StatusCode) {
+	if config.RuntimeRetryStatusCodeIsRetryable(config.GlobalOption.RuntimeSnapshot(), apiErr.StatusCode) {
 		return true
 	}
 
@@ -876,23 +1315,25 @@ func shouldRetry(c *gin.Context, apiErr *types.OpenAIErrorWithStatusCode, channe
 }
 
 func shouldRetryBadRequest(channelType int, apiErr *types.OpenAIErrorWithStatusCode) bool {
+	if apiErr.ProviderRateLimited {
+		return true
+	}
 	switch channelType {
 	case config.ChannelTypeAnthropic:
-		return strings.Contains(apiErr.OpenAIError.Message, "Your credit balance is too low")
+		return apiErr.ProviderQuotaExhausted || strings.Contains(apiErr.OpenAIError.Message, "Your credit balance is too low")
 	case config.ChannelTypeBedrock:
 		return strings.Contains(apiErr.OpenAIError.Message, "Operation not allowed")
+	case config.ChannelTypeGemini:
+		return apiErr.ProviderAuthRejected ||
+			(apiErr.OpenAIError.Param == "INVALID_ARGUMENT" && strings.Contains(apiErr.OpenAIError.Message, "API key not valid"))
 	default:
-		// gemini
-		if apiErr.OpenAIError.Param == "INVALID_ARGUMENT" && strings.Contains(apiErr.OpenAIError.Message, "API key not valid") {
-			return true
-		}
 		return false
 	}
 }
 
 func processChannelRelayError(ctx context.Context, channelId int, channelName string, err *types.OpenAIErrorWithStatusCode, channelType int) {
 	if controller.ShouldDisableChannel(channelType, err) {
-		disabled, disableErr := controller.AutoDisableChannel(channelId, channelName, err.Message, true)
+		disabled, disableErr := controller.AutoDisableChannel(channelId, channelName, err.Message, true, ctx)
 		if disableErr != nil {
 			logger.LogError(ctx, fmt.Sprintf("failed to auto disable channel #%d(%s): %s", channelId, channelName, disableErr.Error()))
 			return
@@ -918,19 +1359,22 @@ func processProviderAPIError(c *gin.Context, channel *model.Channel, apiErr *typ
 	if c == nil || apiErr == nil {
 		return
 	}
-	metrics.RecordProvider(c, apiErr.StatusCode)
-	if channel == nil {
-		return
-	}
+	apiErr = providerresponse.SanitizeAPIError(apiErr)
 	ctx := context.Background()
 	if c.Request != nil {
 		ctx = c.Request.Context()
 	}
 	source = strings.TrimSpace(source)
 	if source != "" {
-		logger.LogError(ctx, fmt.Sprintf("provider api error source=%s channel #%d(%s): status=%d code=%v message=%s", source, channel.Id, channel.Name, apiErr.StatusCode, apiErr.Code, apiErr.Message))
+		channelID := 0
+		channelName := ""
+		if channel != nil {
+			channelID = channel.Id
+			channelName = channel.Name
+		}
+		logger.LogError(ctx, fmt.Sprintf("provider api error source=%s channel #%d(%s): status=%d code=%v message=%s", source, channelID, channelName, apiErr.StatusCode, apiErr.Code, apiErr.Message))
 	}
-	go processChannelRelayErrorFunc(ctx, channel.Id, channel.Name, apiErr, channel.Type)
+	observeRelayProviderFailure(c, channel, apiErr)
 }
 
 func FilterOpenAIErr(c *gin.Context, err *types.OpenAIErrorWithStatusCode) (errWithStatusCode types.OpenAIErrorWithStatusCode) {

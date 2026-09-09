@@ -436,7 +436,7 @@ func finalizeBenchMetrics(c *gin.Context, benchMetrics *benchMetrics) {
 }
 
 func forwardChatStream(c *gin.Context, stream requester.StreamReaderInterface[string]) {
-	defer stream.Close()
+	defer requester.CloseAndDrainStream(stream)
 	requester.SetEventStreamHeaders(c)
 	dataChan, errChan := stream.Recv()
 	first := true
@@ -468,11 +468,13 @@ func forwardChatStream(c *gin.Context, stream requester.StreamReaderInterface[st
 	}
 }
 
-func forwardResponsesStream(c *gin.Context, stream requester.StreamReaderInterface[string]) {
-	defer stream.Close()
+func forwardResponsesStream(c *gin.Context, stream commonresponses.EventStream) {
+	defer requester.CloseAndDrainStream(stream)
 	requester.SetEventStreamHeaders(c)
 	dataChan, errChan := stream.Recv()
 	first := true
+	framer := commonresponses.NewSSEChunkFramer(16 << 20)
+	observer := commonresponses.NewStreamObserver()
 
 	for {
 		select {
@@ -480,12 +482,21 @@ func forwardResponsesStream(c *gin.Context, stream requester.StreamReaderInterfa
 			if !ok {
 				return
 			}
-			if first {
-				first = false
-				setTTFT(c)
+			stop, framingErr := framer.PushChunk(data, func(event string) (bool, error) {
+				if err := observer.AcceptRawEvent(event, func() error { return stream.ObserveAcceptedResponsesEvent(event) }); err != nil {
+					return true, err
+				}
+				if first {
+					first = false
+					setTTFT(c)
+				}
+				_, err := c.Writer.Write([]byte(event))
+				c.Writer.Flush()
+				return observer.TerminalSeen(), err
+			})
+			if framingErr != nil || stop {
+				return
 			}
-			_, _ = c.Writer.Write([]byte(data))
-			c.Writer.Flush()
 		case err := <-errChan:
 			if err == nil {
 				continue

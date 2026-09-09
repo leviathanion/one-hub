@@ -2,12 +2,18 @@ package wire
 
 import "strings"
 
+const (
+	responsesWebsocketBetaHeaderValue  = "responses_websockets=2026-02-06"
+	responsesMultiAgentBetaHeaderValue = "responses_multi_agent=v1"
+)
+
 type HeaderPlanInput struct {
-	Operation  Operation
-	Headers    HeaderSnapshot
-	Credential Credential
-	Policy     ChannelPolicy
-	Identity   Identity
+	Operation         Operation
+	Headers           HeaderSnapshot
+	Credential        Credential
+	Policy            ChannelPolicy
+	Identity          Identity
+	MultiAgentEnabled bool
 }
 
 func BuildHeaders(in HeaderPlanInput) (HeaderPlan, error) {
@@ -42,13 +48,16 @@ func BuildHeaders(in HeaderPlanInput) (HeaderPlan, error) {
 	case OpResponsesCreate:
 		add("Content-Type", "application/json", SourceProtocol, "http-json")
 		add("Accept", "text/event-stream", SourceProtocol, "codex-streaming")
+		if in.MultiAgentEnabled {
+			add("OpenAI-Beta", responsesMultiAgentBetaHeaderValue, SourceProtocol, "responses-multi-agent")
+		}
 		addOptionalHeaders(&plan, in, outputHTTPCreate)
 	case OpResponsesCompact:
 		add("Content-Type", "application/json", SourceProtocol, "http-json")
 		add("Accept", "application/json", SourceProtocol, "compact-json")
 		addOptionalHeaders(&plan, in, outputHTTPCompact)
 	case OpResponsesWSOpen:
-		add("OpenAI-Beta", "responses_websockets=2026-02-06", SourceProtocol, "responses-websocket")
+		add("OpenAI-Beta", strings.Join([]string{responsesWebsocketBetaHeaderValue, responsesMultiAgentBetaHeaderValue}, ", "), SourceProtocol, "responses-websocket-multi-agent")
 		addOptionalHeaders(&plan, in, outputWSHandshake)
 	default:
 		return HeaderPlan{}, reject("operation", "unsupported Codex operation %q", in.Operation)

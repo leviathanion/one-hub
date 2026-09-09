@@ -2,13 +2,12 @@ package model
 
 import (
 	"fmt"
-	"gorm.io/gorm"
 	"math"
-	"one-api/common/config"
 	"one-api/common/limit"
 	"one-api/common/logger"
-	"one-api/common/redis"
 	"sync"
+
+	"gorm.io/gorm"
 )
 
 type UserGroup struct {
@@ -195,47 +194,4 @@ func (cgrm *UserGroupRatio) GetAPILimiter(symbol string) limit.RateLimiter {
 	}
 
 	return limiter
-}
-
-func CheckAndUpgradeUserGroup(userId int, rechargeAmount int) error {
-
-	user := &User{}
-	err := DB.Where("id = ?", userId).First(user).Error
-	if err != nil {
-		return err
-	}
-
-	cumulativeAmount := user.Quota + user.UsedQuota + rechargeAmount
-
-	var promotionGroups []*UserGroup
-	err = DB.Where("promotion = ? AND enable = ?", true, true).Find(&promotionGroups).Error
-	if err != nil {
-		return err
-	}
-
-	var targetGroup *UserGroup
-	for _, group := range promotionGroups {
-		var minQuota = (float64)(group.Min) * config.QuotaPerUnit
-		var maxQuota = (float64)(group.Max) * config.QuotaPerUnit
-		if (float64)(cumulativeAmount) >= minQuota && (group.Max == 0 || (float64)(cumulativeAmount) < maxQuota) {
-
-			if targetGroup == nil || group.Min > targetGroup.Min {
-				targetGroup = group
-			}
-		}
-	}
-
-	if targetGroup != nil && targetGroup.Symbol != user.Group {
-
-		err = DB.Model(&User{}).Where("id = ?", userId).Update("group", targetGroup.Symbol).Error
-		if err != nil {
-			return err
-		}
-
-		if config.RedisEnabled {
-			redis.RedisDel(fmt.Sprintf(UserGroupCacheKey, userId))
-		}
-	}
-
-	return nil
 }

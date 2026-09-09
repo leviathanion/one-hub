@@ -61,19 +61,34 @@ func (f Frame) valid() bool {
 // websocket payload. Callers should forward Payload as-is after delivering any
 // primary Recv payload, instead of serializing err.Error() generically.
 type ClientPayloadError struct {
-	cause   error
-	payload []byte
+	cause       error
+	payload     []byte
+	recoverable bool
 }
 
 func NewClientPayloadError(cause error, payload []byte) error {
+	return newClientPayloadError(cause, payload, false)
+}
+
+func NewRecoverableClientPayloadError(cause error, payload []byte) error {
+	return newClientPayloadError(cause, payload, true)
+}
+
+func newClientPayloadError(cause error, payload []byte, recoverable bool) error {
 	if cause == nil && len(payload) == 0 {
 		return nil
 	}
 	clonedPayload := append([]byte(nil), payload...)
 	return &ClientPayloadError{
-		cause:   cause,
-		payload: clonedPayload,
+		cause:       cause,
+		payload:     clonedPayload,
+		recoverable: recoverable,
 	}
+}
+
+func ClientPayloadErrorIsRecoverable(err error) bool {
+	var payloadErr *ClientPayloadError
+	return errors.As(err, &payloadErr) && payloadErr != nil && payloadErr.recoverable
 }
 
 func (e *ClientPayloadError) Error() string {
@@ -140,6 +155,13 @@ type RealtimeSession interface {
 	SetTurnObserverFactory(factory runtimesession.TurnObserverFactory)
 }
 
+// ConcurrentClientControlSession lets a session opt into a narrow control
+// lane while the relay is waiting for the active SendClient call. Ordinary
+// client frames remain serialized by the relay.
+type ConcurrentClientControlSession interface {
+	TrySendClientControl(ctx context.Context, active Frame, control Frame) (handled bool, err error)
+}
+
 // GracefulDetachCapable lets sessions opt into downstream detach-on-close
 // semantics when the client disconnects gracefully. Sessions that do not
 // implement this interface, or return false, are aborted instead.
@@ -148,10 +170,10 @@ type GracefulDetachCapable interface {
 }
 
 type RealtimeOpenOptions struct {
+	Models                    runtimesession.ModelBinding
+	WorkPolicy                runtimesession.RealtimeWorkPolicy
 	Context                   context.Context
 	ClientSessionID           string
 	ResolvedUpstreamSessionID string
 	ForceFresh                bool
-	PreferredTransport        runtimesession.TransportMode
-	RequireWS                 bool
 }

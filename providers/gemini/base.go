@@ -17,9 +17,32 @@ import (
 
 type GeminiProviderFactory struct{}
 
+func (GeminiProviderFactory) AssessChatRemoteMedia(channel *model.Channel, _ *types.ChatCompletionRequest, _ base.ChatRemoteMediaSummary) (base.RemoteMediaMode, error) {
+	if UsesOpenAIAPI(channel) {
+		return base.RemoteMediaPassURL, nil
+	}
+	return base.RemoteMediaMaterialize, nil
+}
+
+// UsesOpenAIAPI is the single provider-owned interpretation of the Gemini
+// channel dialect switch. Candidate policy, representability, and provider
+// construction must all use this function.
+func UsesOpenAIAPI(channel *model.Channel) bool {
+	if channel == nil || channel.Plugin == nil {
+		return false
+	}
+	plugin := channel.Plugin.Data()
+	pWeb, ok := plugin["use_openai_api"]
+	if !ok {
+		return false
+	}
+	enabled, _ := pWeb["enable"].(bool)
+	return enabled
+}
+
 // 创建 GeminiProvider
 func (f GeminiProviderFactory) Create(channel *model.Channel) base.ProviderInterface {
-	useOpenaiAPI := false
+	useOpenaiAPI := UsesOpenAIAPI(channel)
 	useCodeExecution := false
 
 	if channel.Plugin != nil {
@@ -30,11 +53,6 @@ func (f GeminiProviderFactory) Create(channel *model.Channel) base.ProviderInter
 			}
 		}
 
-		if pWeb, ok := plugin["use_openai_api"]; ok {
-			if enable, ok := pWeb["enable"].(bool); ok && enable {
-				useOpenaiAPI = true
-			}
-		}
 	}
 
 	version := geminiAPIVersionWithContext(nil, channel)
@@ -57,6 +75,10 @@ type GeminiProvider struct {
 	openai.OpenAIProvider
 	UseOpenaiAPI     bool
 	UseCodeExecution bool
+}
+
+func (p *GeminiProvider) MaterializeChatRemoteMedia(request *types.ChatCompletionRequest, fetcher base.RemoteMediaFetcher) error {
+	return base.MaterializeChatRemoteMedia(request, fetcher)
 }
 
 func getConfig(version string) base.ProviderConfig {

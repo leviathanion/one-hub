@@ -12,6 +12,7 @@ import (
 
 	"one-api/common/config"
 	"one-api/common/logger"
+	"one-api/internal/testutil/sqlitetest"
 	"one-api/model"
 
 	"github.com/gin-gonic/gin"
@@ -84,13 +85,10 @@ func TestParseCodexChannelTemplateRejectsInvalidRuntimeConfigJSON(t *testing.T) 
 	}
 }
 
-func TestParseCodexChannelTemplateCanonicalizesLegacyRequiredWebsocketMode(t *testing.T) {
-	channel, err := parseCodexChannelTemplate(`{"type":101,"name":"codex","models":"gpt-5","group":"default","other":"{\"websocket_mode\":\"required\"}"}`)
-	if err != nil {
-		t.Fatalf("expected legacy Codex websocket_mode template to be accepted, got %v", err)
-	}
-	if channel.Other != `{"websocket_mode":"force"}` {
-		t.Fatalf("expected legacy Codex websocket_mode to canonicalize to force, got %q", channel.Other)
+func TestParseCodexChannelTemplateRejectsRemovedWebsocketMode(t *testing.T) {
+	_, err := parseCodexChannelTemplate(`{"type":101,"name":"codex","models":"gpt-5","group":"default","other":"{\"websocket_mode\":\"required\"}"}`)
+	if err == nil || !strings.Contains(err.Error(), "other.websocket_mode") {
+		t.Fatalf("expected removed Codex websocket_mode to be rejected, got %v", err)
 	}
 }
 
@@ -322,7 +320,7 @@ func useControllerChannelDB(t *testing.T) {
 	}
 
 	originalDB := model.DB
-	testDB, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))), &gorm.Config{})
+	testDB, err := gorm.Open(sqlite.Open(sqlitetest.MemoryDSN()), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("expected in-memory sqlite database, got %v", err)
 	}

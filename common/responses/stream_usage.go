@@ -13,7 +13,6 @@ import (
 )
 
 type StreamUsageEvent struct {
-	Delta json.RawMessage `json:"delta,omitempty"`
 	Type              string                          `json:"type"`
 	Item              *types.ResponsesOutput          `json:"item,omitempty"`
 	ItemID            string                          `json:"item_id,omitempty"`
@@ -448,50 +447,4 @@ func mergeResponsesExtraBillingMax(usage *types.Usage, source map[string]types.E
 
 func MergeResponsesExtraBillingMax(usage *types.Usage, source map[string]types.ExtraBilling) {
 	mergeResponsesExtraBillingMax(usage, source)
-}
-
-func StreamEventDeltaString(delta json.RawMessage) (string, bool) {
-	if len(delta) == 0 {
-		return "", false
-	}
-	var text string
-	if err := json.Unmarshal(delta, &text); err != nil {
-		return "", false
-	}
-	return text, true
-}
-
-func ResponsesSearchType(response *types.OpenAIResponsesResponses) string {
-	if response == nil || len(response.Tools) == 0 {
-		return ""
-	}
-	for _, tool := range response.Tools {
-		if !types.IsResponsesWebSearchToolType(tool.Type) {
-			continue
-		}
-		if searchType := strings.TrimSpace(tool.SearchContextSize); searchType != "" {
-			return searchType
-		}
-		return "medium"
-	}
-	return ""
-}
-
-func ApplyResponsesOutputItemBilling(usage *types.Usage, item *types.ResponsesOutput, searchType string) {
-	if usage == nil || item == nil {
-		return
-	}
-	switch item.Type {
-	case types.InputTypeWebSearchCall:
-		if searchType == "" {
-			searchType = "medium"
-		}
-		usage.IncExtraBilling(types.APIToolTypeWebSearchPreview, searchType)
-	case types.InputTypeCodeInterpreterCall:
-		usage.IncExtraBilling(types.APIToolTypeCodeInterpreter, "")
-	case types.InputTypeFileSearchCall:
-		usage.IncExtraBilling(types.APIToolTypeFileSearch, "")
-	case types.InputTypeImageGenerationCall:
-		usage.IncExtraBilling(types.APIToolTypeImageGeneration, item.Quality+"-"+item.Size)
-	}
 }

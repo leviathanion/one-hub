@@ -10,7 +10,6 @@ import (
 	"one-api/common/config"
 	"one-api/common/logger"
 	"one-api/common/requester"
-	"one-api/common/utils"
 	"one-api/model"
 	"one-api/types"
 	"strings"
@@ -40,13 +39,12 @@ type ProviderConfig struct {
 }
 
 type BaseProvider struct {
-	SupportResponse bool
-	OriginalModel   string
-	Usage           *types.Usage
-	Config          ProviderConfig
-	Context         *gin.Context
-	Channel         *model.Channel
-	Requester       *requester.HTTPRequester
+	OriginalModel string
+	Usage         *types.Usage
+	Config        ProviderConfig
+	Context       *gin.Context
+	Channel       *model.Channel
+	Requester     *requester.HTTPRequester
 }
 
 var (
@@ -649,43 +647,4 @@ func DeepMergeMap(existing map[string]interface{}, new map[string]interface{}) m
 	}
 
 	return result
-}
-
-func (pc *ProviderConfig) SetAPIUri(customMapping map[string]interface{}) {
-	relayModeMap := map[int]*string{
-		config.RelayModeChatCompletions:    &pc.ChatCompletions,
-		config.RelayModeCompletions:        &pc.Completions,
-		config.RelayModeEmbeddings:         &pc.Embeddings,
-		config.RelayModeAudioSpeech:        &pc.AudioSpeech,
-		config.RelayModeAudioTranscription: &pc.AudioTranscriptions,
-		config.RelayModeAudioTranslation:   &pc.AudioTranslations,
-		config.RelayModeModerations:        &pc.Moderation,
-		config.RelayModeImagesGenerations:  &pc.ImagesGenerations,
-		config.RelayModeImagesEdits:        &pc.ImagesEdit,
-		config.RelayModeImagesVariations:   &pc.ImagesVariations,
-		config.RelayModeResponses:          &pc.Responses,
-	}
-
-	for key, value := range customMapping {
-		keyInt := utils.String2Int(key)
-		customValue, isString := value.(string)
-		if !isString || customValue == "" {
-			continue
-		}
-
-		if _, exists := relayModeMap[keyInt]; !exists {
-			continue
-		}
-
-		value := customValue
-		if value == "disable" {
-			value = ""
-		}
-
-		*relayModeMap[keyInt] = value
-	}
-}
-
-func (p *BaseProvider) GetSupportedResponse() bool {
-	return p.SupportResponse
 }

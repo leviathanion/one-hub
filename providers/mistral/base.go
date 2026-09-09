@@ -13,6 +13,13 @@ import (
 
 type MistralProviderFactory struct{}
 
+func (MistralProviderFactory) AssessChatRemoteMedia(_ *model.Channel, _ *types.ChatCompletionRequest, _ base.ChatRemoteMediaSummary) (base.RemoteMediaMode, error) {
+	if err := base.RequireOperationEndpoint(getMistralConfig("https://api.mistral.ai").ChatCompletions, "Chat Completions"); err != nil {
+		return base.RemoteMediaReject, err
+	}
+	return base.RemoteMediaPassURL, nil
+}
+
 type MistralProvider struct {
 	openai.OpenAIProvider
 }

@@ -3,7 +3,6 @@ package responsesws
 import (
 	"encoding/json"
 	"errors"
-	"strings"
 	"testing"
 )
 
@@ -59,33 +58,28 @@ func TestRawResponsesCreateFrameCloneForSameModelReturnsRawFrame(t *testing.T) {
 	}
 }
 
-func TestRawResponsesCreateFrameCloneWithDefaultPreviousResponseID(t *testing.T) {
-	frame, err := ParseRawResponsesCreateFrame([]byte(`{"type":"response.create","model":"gpt-5","input":"hi"}`))
+func TestParseRawResponsesCreateFrameKeepsFutureProviderUnionRaw(t *testing.T) {
+	raw := []byte(`{"type":"response.create","model":"gpt-5","input":"hi","tools":[{"type":"future_tool","max_num_results":"future-shape"}]}`)
+	frame, err := ParseRawResponsesCreateFrame(raw)
 	if err != nil {
-		t.Fatalf("parse frame: %v", err)
+		t.Fatalf("parse future frame: %v", err)
 	}
-	cloned, err := frame.CloneWithDefaultPreviousResponseID("resp_default")
-	if err != nil {
-		t.Fatalf("clone frame: %v", err)
+	if frame.Projection.Model != "gpt-5" || string(frame.Raw) != string(raw) {
+		t.Fatalf("unexpected projected future frame: %+v raw=%s", frame.Projection, frame.Raw)
 	}
-	var got map[string]json.RawMessage
-	if err := json.Unmarshal(cloned, &got); err != nil {
-		t.Fatalf("decode cloned frame: %v", err)
-	}
-	if string(got["previous_response_id"]) != `"resp_default"` {
-		t.Fatalf("expected default previous_response_id, got %s", got["previous_response_id"])
-	}
+}
 
-	frame, err = ParseRawResponsesCreateFrame([]byte(`{"type":"response.create","model":"gpt-5","previous_response_id":"resp_client","input":"hi"}`))
+func TestParseRawResponsesCreateFrameDoesNotValidateProviderOwnedMultiAgentShape(t *testing.T) {
+	raw := []byte(`{"type":"response.create","model":"gpt-5","input":"hi","multi_agent":{"enabled":"provider-future","future":true}}`)
+	frame, err := ParseRawResponsesCreateFrame(raw)
 	if err != nil {
-		t.Fatalf("parse frame with previous_response_id: %v", err)
+		t.Fatalf("provider-owned multi_agent shape must remain upstream validation: %v", err)
 	}
-	cloned, err = frame.CloneWithDefaultPreviousResponseID("resp_default")
-	if err != nil {
-		t.Fatalf("clone frame with previous_response_id: %v", err)
+	if frame.MultiAgentEnabled {
+		t.Fatal("unconfirmed local multi-agent semantics must remain disabled")
 	}
-	if string(cloned) != string(frame.Raw) {
-		t.Fatalf("expected client previous_response_id to be preserved\nwant: %s\n got: %s", string(frame.Raw), string(cloned))
+	if string(frame.Object["multi_agent"]) != `{"enabled":"provider-future","future":true}` {
+		t.Fatalf("expected raw multi_agent payload to remain unchanged, got %s", frame.Object["multi_agent"])
 	}
 }
 
@@ -134,135 +128,5 @@ func TestValidateClientEventPayloadRequiresStrictEnvelope(t *testing.T) {
 	}
 	if envelope.Type != "response.cancel" || envelope.EventID != "evt_cancel" || string(envelope.Object["future"]) != `{"keep":true}` {
 		t.Fatalf("unexpected client event envelope: %+v", envelope)
-	}
-}
-
-func TestBuildResponsesHTTPBridgeBodyStripsEnvelopeAndForcesHTTPFields(t *testing.T) {
-	frame, err := ParseRawResponsesCreateFrame([]byte(`{"type":"response.create","event_id":"evt_1","model":"gpt-5","input":"hi","stream":true,"background":false,"stream_options":{"include_usage":true},"unknown_number":12345678901234567890,"future_object":{"enabled":true}}`))
-	if err != nil {
-		t.Fatalf("parse frame: %v", err)
-	}
-	body, err := BuildResponsesHTTPBridgeBody(frame.Object, "gpt-5-mini", "resp_default")
-	if err != nil {
-		t.Fatalf("build HTTP bridge body: %v", err)
-	}
-
-	for _, key := range []string{"type", "event_id", "background"} {
-		if _, ok := body[key]; ok {
-			t.Fatalf("expected %s to be stripped from HTTP bridge body, got %s", key, body[key])
-		}
-	}
-	if string(body["stream_options"]) != `{"include_usage":true}` {
-		t.Fatalf("expected stream_options to be preserved, got %s", body["stream_options"])
-	}
-	if string(body["model"]) != `"gpt-5-mini"` {
-		t.Fatalf("expected normalized model, got %s", body["model"])
-	}
-	if string(body["stream"]) != `true` {
-		t.Fatalf("expected HTTP bridge body to force stream=true, got %s", body["stream"])
-	}
-	if string(body["previous_response_id"]) != `"resp_default"` {
-		t.Fatalf("expected default previous_response_id, got %s", body["previous_response_id"])
-	}
-	if string(body["unknown_number"]) != `12345678901234567890` {
-		t.Fatalf("expected numeric raw value to be preserved, got %s", body["unknown_number"])
-	}
-	if string(body["future_object"]) != `{"enabled":true}` {
-		t.Fatalf("expected unknown object raw value to be preserved, got %s", body["future_object"])
-	}
-}
-
-func TestBuildResponsesHTTPBridgeBodyRejectsUnsupportedTransportFields(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		raw   string
-		param string
-	}{
-		{name: "stream false", raw: `{"type":"response.create","model":"gpt-5","input":"hi","stream":false}`, param: "stream"},
-		{name: "background true", raw: `{"type":"response.create","model":"gpt-5","input":"hi","background":true}`, param: "background"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			frame, err := ParseRawResponsesCreateFrame([]byte(tc.raw))
-			if err != nil {
-				t.Fatalf("parse frame: %v", err)
-			}
-			_, err = BuildResponsesHTTPBridgeBody(frame.Object, "gpt-5", "")
-			if err == nil {
-				t.Fatal("expected unsupported bridge field to fail")
-			}
-			payload := string(ClientPayloadFromError(err))
-			if !strings.Contains(payload, `"unsupported_responses_ws_bridge_field"`) || !strings.Contains(payload, `"`+tc.param+`"`) {
-				t.Fatalf("expected client payload to name unsupported field %q, got %s", tc.param, payload)
-			}
-		})
-	}
-}
-
-func TestNormalizeResponsesHTTPBridgeRequestMapReappliesFinalTransportContract(t *testing.T) {
-	body := map[string]interface{}{
-		"type":       "response.create",
-		"event_id":   "evt_1",
-		"model":      "gpt-5",
-		"background": false,
-	}
-
-	if err := NormalizeResponsesHTTPBridgeRequestMap(body); err != nil {
-		t.Fatalf("normalize bridge request: %v", err)
-	}
-	for _, key := range []string{"type", "event_id", "background"} {
-		if _, ok := body[key]; ok {
-			t.Fatalf("expected %s to be stripped from normalized bridge request, got %#v", key, body)
-		}
-	}
-	if body["stream"] != true {
-		t.Fatalf("expected bridge request to force stream=true, got %#v", body["stream"])
-	}
-}
-
-func TestNormalizeResponsesHTTPBridgeRequestMapRejectsUnsupportedTransportFields(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		body  map[string]interface{}
-		param string
-	}{
-		{name: "stream false", body: map[string]interface{}{"stream": false}, param: "stream"},
-		{name: "stream non bool", body: map[string]interface{}{"stream": "false"}, param: "stream"},
-		{name: "background true", body: map[string]interface{}{"background": true}, param: "background"},
-		{name: "background non bool", body: map[string]interface{}{"background": "true"}, param: "background"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			err := NormalizeResponsesHTTPBridgeRequestMap(tc.body)
-			if err == nil {
-				t.Fatal("expected unsupported bridge field to fail")
-			}
-			payload := string(ClientPayloadFromError(err))
-			if !strings.Contains(payload, `"unsupported_responses_ws_bridge_field"`) || !strings.Contains(payload, `"`+tc.param+`"`) {
-				t.Fatalf("expected client payload to name unsupported field %q, got %s", tc.param, payload)
-			}
-		})
-	}
-}
-
-func TestBuildResponsesHTTPBridgeBodyPreservesClientPreviousResponseID(t *testing.T) {
-	frame, err := ParseRawResponsesCreateFrame([]byte(`{"type":"response.create","model":"gpt-5","previous_response_id":"resp_client","input":"hi"}`))
-	if err != nil {
-		t.Fatalf("parse frame: %v", err)
-	}
-	body, err := BuildResponsesHTTPBridgeBody(frame.Object, "gpt-5", "resp_default")
-	if err != nil {
-		t.Fatalf("build HTTP bridge body: %v", err)
-	}
-	if string(body["previous_response_id"]) != `"resp_client"` {
-		t.Fatalf("expected client previous_response_id to be preserved, got %s", body["previous_response_id"])
-	}
-}
-
-func TestBuildResponsesHTTPBridgeBodyRequiresModel(t *testing.T) {
-	frame, err := ParseRawResponsesCreateFrame([]byte(`{"type":"response.create","model":"gpt-5","input":"hi"}`))
-	if err != nil {
-		t.Fatalf("parse frame: %v", err)
-	}
-	if _, err := BuildResponsesHTTPBridgeBody(frame.Object, "", ""); err == nil {
-		t.Fatal("expected empty model to be rejected")
 	}
 }

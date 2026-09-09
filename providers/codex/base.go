@@ -55,31 +55,15 @@ const (
 	codexPromptCacheStrategyTokenID    = "token_id"
 	codexPromptCacheStrategyUserID     = "user_id"
 	codexPromptCacheStrategyAuthHeader = "auth_header"
-
-	codexWebsocketModeAuto  = "auto"
-	codexWebsocketModeForce = "force"
-	codexWebsocketModeOff   = "off"
 )
 
 type codexChannelOptions struct {
-	PromptCacheKeyStrategy        string `json:"prompt_cache_key_strategy"`
-	WebsocketMode                 string `json:"websocket_mode"`
-	SelfHosted                    bool   `json:"self_hosted"`
-	ResponsesWSSelfHosted         bool   `json:"responses_ws_self_hosted"`
-	ExecutionSessionTTLSeconds    int    `json:"execution_session_ttl_seconds"`
-	WebsocketRetryCooldownSeconds int    `json:"websocket_retry_cooldown_seconds"`
+	SelfHosted                 bool `json:"self_hosted"`
+	ExecutionSessionTTLSeconds int  `json:"execution_session_ttl_seconds"`
 }
 
 func DefaultUserAgent() string {
 	return defaultUserAgent
-}
-
-func normalizeCodexModelName(modelName string) string {
-	modelName = strings.TrimSpace(modelName)
-	if strings.HasPrefix(modelName, "gpt-5-") && modelName != "gpt-5-codex" {
-		return "gpt-5"
-	}
-	return modelName
 }
 
 var channelRefreshLocks = struct {
@@ -128,10 +112,9 @@ func (f CodexProviderFactory) Create(channel *model.Channel) base.ProviderInterf
 	provider := &CodexProvider{
 		OpenAIProvider: openai.OpenAIProvider{
 			BaseProvider: base.BaseProvider{
-				Config:          getConfig(),
-				Channel:         runtimeChannel,
-				Requester:       requester.NewHTTPRequester(channelProxyValue(runtimeChannel), RequestErrorHandle("")),
-				SupportResponse: true,
+				Config:    getConfig(),
+				Channel:   runtimeChannel,
+				Requester: requester.NewHTTPRequester(channelProxyValue(runtimeChannel), RequestErrorHandle("")),
 			},
 			SupportStreamOptions: true,
 		},
@@ -141,7 +124,7 @@ func (f CodexProviderFactory) Create(channel *model.Channel) base.ProviderInterf
 	parseCodexConfig(provider)
 
 	// Update RequestErrorHandle with actual token.
-	if provider.Credentials != nil {
+	if provider.credentialsSnapshot() != nil {
 		provider.rebuildRequester()
 	}
 
@@ -163,6 +146,7 @@ type CodexProvider struct {
 	openai.OpenAIProvider
 	Credentials *OAuth2Credentials // OAuth2 credentials (with refresh_token).
 
+	credentialsMu           sync.RWMutex
 	runtimeMu               sync.RWMutex
 	credentialPersistenceMu sync.Mutex
 	credentialDirty         bool
@@ -205,20 +189,29 @@ func (p *CodexProvider) rebuildRequester() {
 	if p == nil {
 		return
 	}
-	p.runtimeMu.Lock()
-	defer p.runtimeMu.Unlock()
-	p.rebuildRequesterLocked()
+	credentials := p.credentialsSnapshot()
+	p.rebuildRequesterWithAccessToken(credentialsAccessToken(credentials))
 }
 
-func (p *CodexProvider) rebuildRequesterLocked() {
-	accessToken := ""
-	if p.Credentials != nil {
-		accessToken = p.Credentials.AccessToken
+func (p *CodexProvider) rebuildRequesterWithAccessToken(accessToken string) {
+	if p == nil {
+		return
 	}
+	p.runtimeMu.Lock()
+	defer p.runtimeMu.Unlock()
+	p.rebuildRequesterLocked(accessToken)
+}
+
+func (p *CodexProvider) rebuildRequesterLocked(accessToken string) {
 	p.Requester = requester.NewHTTPRequester(channelProxyValue(p.Channel), RequestErrorHandle(accessToken))
 }
 
 func (p *CodexProvider) syncRuntimeChannel(channel *model.Channel) {
+	credentials := p.credentialsSnapshot()
+	p.syncRuntimeChannelWithAccessToken(channel, credentialsAccessToken(credentials))
+}
+
+func (p *CodexProvider) syncRuntimeChannelWithAccessToken(channel *model.Channel, accessToken string) {
 	if p == nil {
 		return
 	}
@@ -226,7 +219,7 @@ func (p *CodexProvider) syncRuntimeChannel(channel *model.Channel) {
 	if preparedChannel := prepareChannelForProvider(channel); preparedChannel != nil {
 		p.runtimeMu.Lock()
 		p.Channel = preparedChannel
-		p.rebuildRequesterLocked()
+		p.rebuildRequesterLocked(accessToken)
 		p.runtimeMu.Unlock()
 
 		p.channelOptionsMu.Lock()
@@ -241,7 +234,7 @@ func (p *CodexProvider) syncRuntimeChannel(channel *model.Channel) {
 		p.officialPolicyMu.Unlock()
 		return
 	}
-	p.rebuildRequester()
+	p.rebuildRequesterWithAccessToken(accessToken)
 }
 
 func (p *CodexProvider) GetChannel() *model.Channel {
@@ -290,6 +283,11 @@ func (p *CodexProvider) GetFullRequestURL(requestURL string, _ string) string {
 }
 
 func (p *CodexProvider) syncRuntimeKey(key string) {
+	credentials := p.credentialsSnapshot()
+	p.syncRuntimeKeyWithAccessToken(key, credentialsAccessToken(credentials))
+}
+
+func (p *CodexProvider) syncRuntimeKeyWithAccessToken(key string, accessToken string) {
 	if p == nil {
 		return
 	}
@@ -298,7 +296,7 @@ func (p *CodexProvider) syncRuntimeKey(key string) {
 	if p.Channel != nil {
 		p.Channel.Key = key
 	}
-	p.rebuildRequesterLocked()
+	p.rebuildRequesterLocked(accessToken)
 	p.runtimeMu.Unlock()
 }
 
@@ -503,8 +501,8 @@ func (p *CodexProvider) getRequestHeaderBagWithContext(ctx context.Context) (*co
 	headers.Set("Content-Type", "application/json")
 
 	// Set chatgpt-account-id when available.
-	if p.Credentials != nil && p.Credentials.AccountID != "" {
-		headers.Set("chatgpt-account-id", p.Credentials.AccountID)
+	if credentials := p.credentialsSnapshot(); credentials != nil && credentials.AccountID != "" {
+		headers.Set("chatgpt-account-id", credentials.AccountID)
 	}
 
 	return headers, nil
@@ -560,19 +558,33 @@ func (p *CodexProvider) GetRequestHeaders() map[string]string {
 	return fallback.Map()
 }
 
-func (p *CodexProvider) handleTokenError(_ error) *types.OpenAIErrorWithStatusCode {
+const (
+	codexTokenUnavailableClientMessage     = "Codex credentials are temporarily unavailable"
+	codexTokenReauthorizationClientMessage = "Codex token refresh failed; please check channel OAuth credentials"
+)
+
+func (p *CodexProvider) handleTokenError(err error) *types.OpenAIErrorWithStatusCode {
 	// Keep the client-facing token error static. Refresh failures may contain
 	// provider response bodies or credential fragments; detailed diagnostics stay
 	// on the server-side logging path.
-	return &types.OpenAIErrorWithStatusCode{
+	apiErr := &types.OpenAIErrorWithStatusCode{
 		OpenAIError: types.OpenAIError{
-			Message: "Codex token refresh failed; please check channel OAuth credentials",
+			Message: codexTokenUnavailableClientMessage,
 			Type:    "codex_token_error",
 			Code:    "codex_token_error",
 		},
-		StatusCode: http.StatusUnauthorized,
-		LocalError: false,
+		StatusCode:           http.StatusServiceUnavailable,
+		LocalError:           true,
+		UpstreamNotAttempted: true,
 	}
+	if errors.Is(err, ErrOAuthRefreshOutcomeAmbiguous) || errors.Is(err, ErrOAuthCredentialsRequireReauthorization) {
+		apiErr.Message = codexTokenReauthorizationClientMessage
+		apiErr.StatusCode = http.StatusUnauthorized
+		apiErr.LocalError = false
+		apiErr.UpstreamNotAttempted = false
+		apiErr.ProviderAuthRejected = true
+	}
+	return apiErr
 }
 
 func (p *CodexProvider) GetToken() (string, error) {
@@ -580,9 +592,18 @@ func (p *CodexProvider) GetToken() (string, error) {
 }
 
 func (p *CodexProvider) getToken(ctx context.Context) (string, error) {
+	if p == nil {
+		return "", fmt.Errorf("credentials not configured")
+	}
+	p.credentialsMu.Lock()
+	defer p.credentialsMu.Unlock()
+	return p.getTokenLocked(ctx)
+}
+
+func (p *CodexProvider) getTokenLocked(ctx context.Context) (string, error) {
 	ctx = ensureContext(ctx)
 
-	if err := p.commitPendingCredentials(ctx); err != nil {
+	if err := p.commitPendingCredentialsWithCredentialLock(ctx); err != nil {
 		return "", fmt.Errorf("failed to commit pending credentials: %w", err)
 	}
 	if p.Credentials == nil {
@@ -619,7 +640,7 @@ func (p *CodexProvider) getToken(ctx context.Context) (string, error) {
 		return cachedCredentials.AccessToken, nil
 	}
 
-	if _, err := p.refreshTokenIfNeeded(ctx, 3*time.Minute); err != nil {
+	if _, err := p.refreshTokenIfNeededLocked(ctx, 3*time.Minute); err != nil {
 		if errors.Is(err, errCodexCredentialPersistence) {
 			return "", fmt.Errorf("failed to refresh token: %w", err)
 		}
@@ -629,9 +650,9 @@ func (p *CodexProvider) getToken(ctx context.Context) (string, error) {
 		if fallbackToken := p.getCurrentValidToken(ctx); fallbackToken != "" {
 			if fallbackToken == fallbackTokenBeforeRefresh && !expiresWithinLead(fallbackExpiresAtBeforeRefresh, 0) {
 				if fallbackChannelBeforeRefresh != nil {
-					p.syncRuntimeChannel(fallbackChannelBeforeRefresh)
+					p.syncRuntimeChannelWithAccessToken(fallbackChannelBeforeRefresh, p.Credentials.AccessToken)
 				} else {
-					p.rebuildRequester()
+					p.rebuildRequesterWithAccessToken(p.Credentials.AccessToken)
 				}
 			}
 			if p.Context != nil {
@@ -645,9 +666,9 @@ func (p *CodexProvider) getToken(ctx context.Context) (string, error) {
 			p.Credentials.AccessToken = fallbackTokenBeforeRefresh
 			p.Credentials.AccountID = fallbackAccountIDBeforeRefresh
 			if fallbackChannelBeforeRefresh != nil {
-				p.syncRuntimeChannel(fallbackChannelBeforeRefresh)
+				p.syncRuntimeChannelWithAccessToken(fallbackChannelBeforeRefresh, p.Credentials.AccessToken)
 			} else {
-				p.rebuildRequester()
+				p.rebuildRequesterWithAccessToken(p.Credentials.AccessToken)
 			}
 			if p.Context != nil {
 				logger.LogWarn(ctx, fmt.Sprintf("[Codex] Token refresh failed after credential reload but the prior access token remains valid, using fallback: %s", err.Error()))
@@ -665,6 +686,15 @@ func (p *CodexProvider) getToken(ctx context.Context) (string, error) {
 }
 
 func (p *CodexProvider) refreshTokenIfNeeded(ctx context.Context, lead time.Duration) (refreshed bool, returnErr error) {
+	if p == nil {
+		return false, fmt.Errorf("credentials not configured")
+	}
+	p.credentialsMu.Lock()
+	defer p.credentialsMu.Unlock()
+	return p.refreshTokenIfNeededLocked(ctx, lead)
+}
+
+func (p *CodexProvider) refreshTokenIfNeededLocked(ctx context.Context, lead time.Duration) (refreshed bool, returnErr error) {
 	defer func() {
 		returnErr = p.sanitizeRefreshError(returnErr)
 	}()
@@ -672,6 +702,15 @@ func (p *CodexProvider) refreshTokenIfNeeded(ctx context.Context, lead time.Dura
 }
 
 func (p *CodexProvider) forceRefreshToken(ctx context.Context) (refreshed bool, returnErr error) {
+	if p == nil {
+		return false, fmt.Errorf("credentials not configured")
+	}
+	p.credentialsMu.Lock()
+	defer p.credentialsMu.Unlock()
+	return p.forceRefreshTokenLocked(ctx)
+}
+
+func (p *CodexProvider) forceRefreshTokenLocked(ctx context.Context) (refreshed bool, returnErr error) {
 	defer func() {
 		returnErr = p.sanitizeRefreshError(returnErr)
 	}()
@@ -679,14 +718,9 @@ func (p *CodexProvider) forceRefreshToken(ctx context.Context) (refreshed bool, 
 		return false, fmt.Errorf("credentials not configured")
 	}
 	previousCredentialsVersion := credentialsVersion(p.Credentials)
-	// Trade-off: once upstream has replied 401/403 for this token, we prefer to stop
-	// serving the cached token immediately even if that briefly hurts cache hit rate.
-	// Safety wins here, but every handled-by-peer path below must recache the latest
-	// token so this deliberate invalidation does not leave the channel cold.
-	if err := cache.DeleteCacheManyContext(ctx, []string{
-		tokenCacheKey(p.channelID()),
-		tokenCacheKeyV2(p.channelID(), p.codexChannel().Key),
-	}); err != nil {
+	// Once upstream has rejected this token, stop serving the current credential
+	// fingerprint immediately. A later credential version has a different key.
+	if err := cache.DeleteCacheContext(ctx, tokenCacheKeyV2(p.channelID(), p.codexChannel().Key)); err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return false, err
 		}
@@ -824,7 +858,7 @@ func (p *CodexProvider) rotateOnce(ctx context.Context, lead time.Duration, forc
 		case model.CredentialRotationCommitApplied, model.CredentialRotationCommitAlreadyApplied:
 			credentialRotations.WithLabelValues("committed", reason).Inc()
 			p.Credentials = rotated
-			p.syncRuntimeKey(rotatedKey)
+			p.syncRuntimeKeyWithAccessToken(rotatedKey, rotated.AccessToken)
 			p.cacheCurrentToken(ctx)
 			return true, nil
 		case model.CredentialRotationCommitSuperseded:
@@ -1069,7 +1103,7 @@ func (p *CodexProvider) saveCredentialsToDatabase(ctx context.Context) error {
 	clearPendingCredentialCommit(channelID, rotatedKey)
 	// Publish runtime credentials only after durable storage accepts them.
 	p.Credentials = rotatedCredentials
-	p.syncRuntimeKey(rotatedKey)
+	p.syncRuntimeKeyWithAccessToken(rotatedKey, rotatedCredentials.AccessToken)
 
 	logger.LogInfo(ctx, fmt.Sprintf("[Codex] Credentials saved to database for channel %d", channelID))
 	return nil
@@ -1114,6 +1148,25 @@ func cloneOAuth2Credentials(credentials *OAuth2Credentials) *OAuth2Credentials {
 	return &cloned
 }
 
+func credentialsAccessToken(credentials *OAuth2Credentials) string {
+	if credentials == nil {
+		return ""
+	}
+	return credentials.AccessToken
+}
+
+// credentialsSnapshot is the only production read boundary for credentials
+// outside a serialized OAuth operation. Callers receive a deep copy so a
+// rotation can atomically replace the active pointer without racing on fields.
+func (p *CodexProvider) credentialsSnapshot() *OAuth2Credentials {
+	if p == nil {
+		return nil
+	}
+	p.credentialsMu.RLock()
+	defer p.credentialsMu.RUnlock()
+	return cloneOAuth2Credentials(p.Credentials)
+}
+
 func normalizeCredentials(creds *OAuth2Credentials) {
 	if creds == nil {
 		return
@@ -1132,11 +1185,6 @@ func normalizeCredentials(creds *OAuth2Credentials) {
 	if creds.RefreshToken != "" && creds.ExpiresAt.IsZero() {
 		creds.ExpiresAt = time.Now().Add(legacyCredentialExpiryFallback)
 	}
-}
-
-// tokenCacheKey is the legacy v1 key retained only for rolling-upgrade deletion.
-func tokenCacheKey(channelID int) string {
-	return fmt.Sprintf("%s:%d", TokenCacheKey, channelID)
 }
 
 func tokenCacheKeyV2(channelID int, durableRuntimeKey string) string {
@@ -1312,16 +1360,6 @@ func (p *CodexProvider) getCachedCredentialSnapshot(ctx context.Context, lead ti
 		return cachedCredentialSnapshot{}
 	}
 
-	cachedToken, err := cache.GetCacheContext[string](ctx, cacheKey)
-	if err != nil || cachedToken == "" {
-		return cachedCredentialSnapshot{}
-	}
-	if p.Credentials != nil && !p.Credentials.NeedsRefreshWithin(lead) {
-		return cachedCredentialSnapshot{
-			AccessToken: cachedToken,
-			AccountID:   extractAccountIDFromJWT(cachedToken),
-		}
-	}
 	return cachedCredentialSnapshot{}
 }
 
@@ -1366,7 +1404,7 @@ func (p *CodexProvider) loadLatestCredentialsFromDatabase(ctx context.Context) e
 	}
 
 	p.Credentials = latestCreds
-	p.syncRuntimeChannel(channel)
+	p.syncRuntimeChannelWithAccessToken(channel, latestCreds.AccessToken)
 	return nil
 }
 

@@ -6,7 +6,9 @@ import (
 	"errors"
 	"net/http"
 	"one-api/common/logger"
+	commonresponses "one-api/common/responses"
 	"one-api/common/responsesws"
+	"one-api/relay/relay_util"
 	"one-api/types"
 	"strings"
 )
@@ -66,7 +68,7 @@ func responsesWSMarshalErrorPayload(payload any) []byte {
 }
 
 func responsesWSPreviousResponseNotFoundPayload() []byte {
-	return responsesWSErrorPayloadWithParam(http.StatusConflict, "previous_response_not_found", responsesWSStaticErrorMessage("previous_response_not_found"), "previous_response_id")
+	return responsesWSErrorPayloadWithParam(http.StatusBadRequest, "previous_response_not_found", responsesWSStaticErrorMessage("previous_response_not_found"), "previous_response_id")
 }
 
 func responsesWSFallbackPayload() []byte {
@@ -82,6 +84,9 @@ func responsesWSErrorFromOpenAI(apiErr *types.OpenAIErrorWithStatusCode) []byte 
 		errType = "one_hub_error"
 	}
 	code := openAIErrorCodeString(apiErr.Code, "system_error")
+	if code == "previous_response_not_found" {
+		return responsesWSPreviousResponseNotFoundPayload()
+	}
 	message := responsesWSClientMessageFromOpenAI(apiErr, code)
 	param := responsesWSClientParamFromOpenAI(apiErr)
 	payload := map[string]any{
@@ -101,6 +106,9 @@ func responsesWSClientMessageFromOpenAI(apiErr *types.OpenAIErrorWithStatusCode,
 	if apiErr == nil {
 		return responsesWSStaticErrorMessage("system_error")
 	}
+	if apiErr.LocalError && code == unsupportedCapabilityCode && strings.TrimSpace(apiErr.Message) != "" {
+		return apiErr.Message
+	}
 	if !apiErr.LocalError && strings.TrimSpace(apiErr.Message) != "" && apiErr.StatusCode < http.StatusInternalServerError {
 		return apiErr.Message
 	}
@@ -108,7 +116,10 @@ func responsesWSClientMessageFromOpenAI(apiErr *types.OpenAIErrorWithStatusCode,
 }
 
 func responsesWSClientParamFromOpenAI(apiErr *types.OpenAIErrorWithStatusCode) string {
-	if apiErr == nil || apiErr.LocalError {
+	if apiErr == nil {
+		return ""
+	}
+	if apiErr.LocalError && openAIErrorCodeString(apiErr.Code, "") != unsupportedCapabilityCode {
 		return ""
 	}
 	param := strings.TrimSpace(apiErr.Param)
@@ -116,7 +127,7 @@ func responsesWSClientParamFromOpenAI(apiErr *types.OpenAIErrorWithStatusCode) s
 		return ""
 	}
 	switch param {
-	case "model", "input", "instructions", "tools", "tool_choice", "temperature", "top_p", "max_output_tokens", "previous_response_id", "metadata", "stream":
+	case "model", "input", "instructions", "tools", "tool_choice", "temperature", "top_p", "max_output_tokens", "previous_response_id", "metadata", "stream", "truncation", "context_management", "client_metadata", "service_tier", "processing_class":
 		return param
 	default:
 		return ""
@@ -146,56 +157,6 @@ func responsesWSErrorFromErr(err error) []byte {
 	logCtx := context.Background()
 	logger.LogError(logCtx, "responses websocket upstream error: "+err.Error())
 	return responsesWSErrorPayload(http.StatusBadGateway, "upstream_error", responsesWSStaticErrorMessage("upstream_error"))
-}
-
-func isResponsesWSBridgeOpenProviderError(err error) bool {
-	var bridgeErr *responsesws.BridgeOpenProviderError
-	return errors.As(err, &bridgeErr)
-}
-
-func responsesWSBridgeOpenProviderAPIError(err error) *types.OpenAIErrorWithStatusCode {
-	var bridgeErr *responsesws.BridgeOpenProviderError
-	if !errors.As(err, &bridgeErr) || bridgeErr == nil {
-		return nil
-	}
-	status := bridgeErr.StatusCode
-	if status <= 0 {
-		status = http.StatusBadGateway
-	}
-	// Trade-off: carry the typed provider rejection through the actor instead of
-	// reparsing the safe client payload. This preserves HTTP status for metrics
-	// and auto-disable while keeping the websocket payload redacted.
-	return &types.OpenAIErrorWithStatusCode{
-		OpenAIError: types.OpenAIError{
-			Type:    bridgeErr.Type,
-			Code:    bridgeErr.Code,
-			Message: bridgeErr.Message,
-		},
-		StatusCode: status,
-		LocalError: false,
-	}
-}
-
-func responsesWSBridgeOpenProviderContinuationMiss(event ResponsesWSEventBridgeOpenProviderError) bool {
-	if event.ProviderAPIError != nil {
-		code := openAIErrorCodeString(event.ProviderAPIError.Code, "")
-		if code == "previous_response_not_found" {
-			return true
-		}
-		message := strings.ToLower(strings.TrimSpace(event.ProviderAPIError.Message))
-		if strings.Contains(message, "previous_response_not_found") ||
-			(strings.Contains(message, "previous response") && strings.Contains(message, "not found")) {
-			return true
-		}
-	}
-	if len(event.Payload) == 0 {
-		return false
-	}
-	classified := responsesws.ClassifyResponsesWSEvent(event.Payload)
-	if classified.ContinuationMiss {
-		return true
-	}
-	return strings.Contains(strings.ToLower(string(event.Payload)), "previous_response_not_found")
 }
 
 func responsesWSStaticErrorMessage(code string) string {
@@ -245,13 +206,70 @@ func mergeResponsesWSUsageEvent(usage *types.Usage, event *types.UsageEvent) {
 	if usage == nil || event == nil {
 		return
 	}
-	usage.PromptTokens += event.InputTokens
-	usage.CompletionTokens += event.OutputTokens
-	usage.TotalTokens += event.TotalTokens
-	usage.PromptTokensDetails.Merge(&event.InputTokenDetails)
-	usage.CompletionTokensDetails.Merge(&event.OutputTokenDetails)
-	usage.ExtraTokens = mergeIntMaps(usage.ExtraTokens, event.ExtraTokens)
+	mergeProjectedResponsesWSUsageEvent(usage, relay_util.ProviderUsageEventForBilling(event))
+}
+
+func mergeProjectedResponsesWSUsageEvent(usage *types.Usage, event *types.UsageEvent) {
+	if event.ProviderTokenEvidence {
+		usage.MarkProviderReported()
+		usage.PromptTokens += event.InputTokens
+		usage.CompletionTokens += event.OutputTokens
+		usage.TotalTokens += event.TotalTokens
+		usage.PromptTokensDetails.Merge(&event.InputTokenDetails)
+		usage.CompletionTokensDetails.Merge(&event.OutputTokenDetails)
+		usage.ExtraTokens = mergeIntMaps(usage.ExtraTokens, event.ExtraTokens)
+	}
+	if len(event.ExtraUsageUnits) > 0 {
+		if usage.ExtraUsageUnits == nil {
+			usage.ExtraUsageUnits = make(map[string]float64, len(event.ExtraUsageUnits))
+		}
+		for key, value := range event.ExtraUsageUnits {
+			usage.ExtraUsageUnits[key] += value
+		}
+	}
+	markResponsesWSIndependentUsageEvidence(usage, event.ProviderIndependentUsageUnits)
 	usage.MergeExtraBilling(event.ExtraBilling)
+	if usage.ProviderExtraBilling == nil && len(event.ProviderExtraBilling) > 0 {
+		usage.ProviderExtraBilling = make(map[string]bool)
+	}
+	for key, present := range event.ProviderExtraBilling {
+		if present {
+			usage.ProviderExtraBilling[key] = true
+		}
+	}
+	usage.MergeBillingDiagnostics(event.BillingDiagnostics)
+	usage.AttributionConflict = usage.AttributionConflict || event.AttributionConflict
+	usage.MergeProviderAttribution(event.ResponseModel, event.ServiceTier)
+	usage.MergeProviderSpeed(event.Speed, event.SpeedConflict)
+}
+
+func markResponsesWSIndependentUsageEvidence(usage *types.Usage, providerEvidence map[string]bool) {
+	if usage == nil || len(providerEvidence) == 0 {
+		return
+	}
+	if usage.ProviderIndependentUsageUnits == nil {
+		usage.ProviderIndependentUsageUnits = make(map[string]bool, len(providerEvidence))
+	}
+	for key, present := range providerEvidence {
+		if !present {
+			continue
+		}
+		usage.ProviderIndependentUsageUnits[key] = true
+	}
+}
+
+func mergeResponsesWSIndependentUsageUnits(usage *types.Usage, units map[string]float64, providerEvidence map[string]bool) {
+	markResponsesWSIndependentUsageEvidence(usage, providerEvidence)
+	for key, present := range providerEvidence {
+		value, exists := units[key]
+		if !present || !exists {
+			continue
+		}
+		if usage.ExtraUsageUnits == nil {
+			usage.ExtraUsageUnits = make(map[string]float64)
+		}
+		usage.ExtraUsageUnits[key] += value
+	}
 }
 
 func mergeResponsesWSResponsesUsage(usage *types.Usage, responseUsage *types.ResponsesUsage) {
@@ -271,12 +289,16 @@ func mergeResponsesWSResponsesUsage(usage *types.Usage, responseUsage *types.Res
 		overwritePositiveInt(&usage.PromptTokensDetails.AudioTokens, responseUsage.InputTokensDetails.AudioTokens)
 		overwritePositiveInt(&usage.PromptTokensDetails.CachedTokens, responseUsage.InputTokensDetails.CachedTokens)
 		overwritePositiveInt(&usage.PromptTokensDetails.CachedReadTokens, responseUsage.InputTokensDetails.CachedReadTokens)
+		overwritePositiveInt(&usage.PromptTokensDetails.CacheWriteTokens, responseUsage.InputTokensDetails.CacheWriteTokens)
 		overwritePositiveInt(&usage.PromptTokensDetails.CachedWriteTokens, responseUsage.InputTokensDetails.CachedWriteTokens)
 		overwritePositiveInt(&usage.PromptTokensDetails.TextTokens, responseUsage.InputTokensDetails.TextTokens)
 		overwritePositiveInt(&usage.PromptTokensDetails.ImageTokens, responseUsage.InputTokensDetails.ImageTokens)
 	}
 	if responseUsage.OutputTokensDetails != nil {
 		overwritePositiveInt(&usage.CompletionTokensDetails.ReasoningTokens, responseUsage.OutputTokensDetails.ReasoningTokens)
+	}
+	if responseUsage.ProviderReported {
+		usage.MarkProviderReported()
 	}
 }
 
@@ -286,18 +308,24 @@ func overwritePositiveInt(dst *int, src int) {
 	}
 }
 
-func mergeResponsesWSTerminalResponse(usage *types.Usage, response *types.OpenAIResponsesResponses) {
+func mergeResponsesWSTerminalResponse(usage *types.Usage, response *types.OpenAIResponsesResponses, imageTrackers ...*commonresponses.ImageGenerationStreamTracker) {
 	if usage == nil || response == nil {
 		return
 	}
 	mergeResponsesWSResponsesUsage(usage, response.Usage)
+	usage.MergeProviderAttribution(response.Model, response.ServiceTier)
 	// Terminal response output is the fallback source for Responses tool billing.
 	// Provider UsageEvents can already contain the same charges, so merge by max
 	// count per normalized key rather than adding and risking double billing.
-	usage.ExtraBilling = mergeExtraBillingMapsMax(usage.ExtraBilling, types.GetResponsesExtraBilling(response))
+	extraBilling, diagnostics := responsesWSTerminalExtraBilling(response, firstResponsesWSImageTracker(imageTrackers))
+	usage.ExtraBilling = mergeExtraBillingMapsMax(usage.ExtraBilling, extraBilling)
+	for key, billing := range extraBilling {
+		usage.MarkProviderExtraBilling(key, billing)
+	}
+	usage.MergeBillingDiagnostics(diagnostics)
 }
 
-func responsesWSTerminalUsageSnapshot(response *types.OpenAIResponsesResponses) *types.Usage {
+func responsesWSTerminalUsageSnapshot(response *types.OpenAIResponsesResponses, imageTrackers ...*commonresponses.ImageGenerationStreamTracker) *types.Usage {
 	if response == nil || response.Usage == nil {
 		return nil
 	}
@@ -306,8 +334,33 @@ func responsesWSTerminalUsageSnapshot(response *types.OpenAIResponsesResponses) 
 	// settlement and diagnostics, but must not inflate or overwrite exact
 	// terminal billing.
 	usage := response.Usage.ToOpenAIUsage()
-	usage.ExtraBilling = mergeExtraBillingMapsMax(usage.ExtraBilling, types.GetResponsesExtraBilling(response))
+	usage.ResponseModel = response.Model
+	usage.ServiceTier = response.ServiceTier
+	extraBilling, diagnostics := responsesWSTerminalExtraBilling(response, firstResponsesWSImageTracker(imageTrackers))
+	usage.ExtraBilling = mergeExtraBillingMapsMax(usage.ExtraBilling, extraBilling)
+	for key, billing := range extraBilling {
+		usage.MarkProviderExtraBilling(key, billing)
+	}
+	usage.MergeBillingDiagnostics(diagnostics)
 	return usage
+}
+
+func firstResponsesWSImageTracker(trackers []*commonresponses.ImageGenerationStreamTracker) *commonresponses.ImageGenerationStreamTracker {
+	for _, tracker := range trackers {
+		if tracker != nil {
+			return tracker
+		}
+	}
+	return nil
+}
+
+func responsesWSTerminalExtraBilling(response *types.OpenAIResponsesResponses, imageTracker *commonresponses.ImageGenerationStreamTracker) (map[string]types.ExtraBilling, map[string]bool) {
+	if imageTracker == nil {
+		return types.GetResponsesExtraBilling(response), types.GetResponsesBillingDiagnostics(response)
+	}
+	usage := &types.Usage{}
+	imageTracker.ApplyExtraBilling(response, usage)
+	return usage.ExtraBilling, usage.BillingDiagnostics
 }
 
 func cloneResponsesWSUsage(usage *types.Usage) *types.Usage {
@@ -320,11 +373,54 @@ func cloneResponsesWSUsage(usage *types.Usage) *types.Usage {
 		TotalTokens:             usage.TotalTokens,
 		PromptTokensDetails:     usage.PromptTokensDetails,
 		CompletionTokensDetails: usage.CompletionTokensDetails,
+		ResponseModel:           usage.ResponseModel,
+		ServiceTier:             usage.ServiceTier,
+		Speed:                   usage.Speed,
+		SpeedConflict:           usage.SpeedConflict,
+		ProviderReported:        usage.ProviderReported,
+		AttributionConflict:     usage.AttributionConflict,
+		ProviderTokenConflict:   usage.ProviderTokenConflict,
+		BillingDiagnostics:      make(map[string]bool, len(usage.BillingDiagnostics)),
+	}
+	if usage.ProviderOperationUnits != nil {
+		cloned.ProviderOperationUnits = new(int)
+		*cloned.ProviderOperationUnits = *usage.ProviderOperationUnits
+	}
+	if len(usage.ProviderTokenFields) > 0 {
+		cloned.ProviderTokenFields = make(map[string]bool, len(usage.ProviderTokenFields))
+		for key, value := range usage.ProviderTokenFields {
+			cloned.ProviderTokenFields[key] = value
+		}
+	}
+	cloned.RequiredTokenExtraKeys = append([]string(nil), usage.RequiredTokenExtraKeys...)
+	if len(usage.ProviderExtraBilling) > 0 {
+		cloned.ProviderExtraBilling = make(map[string]bool, len(usage.ProviderExtraBilling))
+		for key, value := range usage.ProviderExtraBilling {
+			cloned.ProviderExtraBilling[key] = value
+		}
+	}
+	if len(usage.ProviderIndependentUsageUnits) > 0 {
+		cloned.ProviderIndependentUsageUnits = make(map[string]bool, len(usage.ProviderIndependentUsageUnits))
+		for key, value := range usage.ProviderIndependentUsageUnits {
+			cloned.ProviderIndependentUsageUnits[key] = value
+		}
+	}
+	for key, value := range usage.BillingDiagnostics {
+		cloned.BillingDiagnostics[key] = value
+	}
+	if len(cloned.BillingDiagnostics) == 0 {
+		cloned.BillingDiagnostics = nil
 	}
 	if len(usage.ExtraTokens) > 0 {
 		cloned.ExtraTokens = make(map[string]int, len(usage.ExtraTokens))
 		for key, value := range usage.ExtraTokens {
 			cloned.ExtraTokens[key] = value
+		}
+	}
+	if len(usage.ExtraUsageUnits) > 0 {
+		cloned.ExtraUsageUnits = make(map[string]float64, len(usage.ExtraUsageUnits))
+		for key, value := range usage.ExtraUsageUnits {
+			cloned.ExtraUsageUnits[key] = value
 		}
 	}
 	if len(usage.ExtraBilling) > 0 {
@@ -333,39 +429,39 @@ func cloneResponsesWSUsage(usage *types.Usage) *types.Usage {
 			cloned.ExtraBilling[key] = value
 		}
 	}
-	if usage.TextBuilder.Len() > 0 {
-		cloned.TextBuilder.WriteString(usage.TextBuilder.String())
-	}
 	return cloned
 }
 
-func responsesWSShouldMergeAttachedFrameUsage(classified responsesws.ResponsesTerminalResult, eventUsage *types.UsageEvent) bool {
-	if eventUsage == nil {
-		return false
+func mergeResponsesWSAttachedFrameUsage(usage *types.Usage, classified responsesws.ResponsesTerminalResult, eventUsage *types.UsageEvent) {
+	if usage == nil || eventUsage == nil {
+		return
 	}
-	// Native adapters and the HTTP bridge may attach Usage extracted from the
-	// same provider frame that still carries response.usage. response.usage is
-	// an absolute snapshot, not a delta, so adding the attached copy would bill
-	// the same terminal frame twice.
-	return classified.Response == nil || classified.Response.Usage == nil
-}
-
-func responsesWSUsageHasBillableEvidence(usage *types.Usage) bool {
-	if usage == nil {
-		return false
+	eventUsage = relay_util.ProviderUsageEventForBilling(eventUsage)
+	// response.usage is an absolute token snapshot. Attached provider usage may
+	// carry the same token values, so only merge token deltas when the frame has
+	// no authoritative response usage. Provider adapters expose ExtraBilling as
+	// increments, so distinct tool calls must be added rather than max-merged.
+	if classified.Response == nil || classified.Response.Usage == nil {
+		tokens := *eventUsage
+		tokens.ExtraBilling = nil
+		tokens.BillingDiagnostics = nil
+		mergeProjectedResponsesWSUsageEvent(usage, &tokens)
+	} else {
+		mergeResponsesWSIndependentUsageUnits(usage, eventUsage.ExtraUsageUnits, eventUsage.ProviderIndependentUsageUnits)
 	}
-	if usage.PromptTokens > 0 || usage.CompletionTokens > 0 || usage.TotalTokens > 0 {
-		return true
+	usage.MergeExtraBilling(eventUsage.ExtraBilling)
+	if usage.ProviderExtraBilling == nil && len(eventUsage.ProviderExtraBilling) > 0 {
+		usage.ProviderExtraBilling = make(map[string]bool)
 	}
-	if len(usage.GetExtraTokens()) > 0 {
-		return true
-	}
-	for _, extra := range usage.ExtraBilling {
-		if extra.CallCount > 0 {
-			return true
+	for key, present := range eventUsage.ProviderExtraBilling {
+		if present {
+			usage.ProviderExtraBilling[key] = true
 		}
 	}
-	return false
+	usage.MergeBillingDiagnostics(eventUsage.BillingDiagnostics)
+	usage.AttributionConflict = usage.AttributionConflict || eventUsage.AttributionConflict
+	usage.MergeProviderAttribution(eventUsage.ResponseModel, eventUsage.ServiceTier)
+	usage.MergeProviderSpeed(eventUsage.Speed, eventUsage.SpeedConflict)
 }
 
 func mergeIntMaps(dst map[string]int, src map[string]int) map[string]int {

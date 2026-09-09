@@ -14,8 +14,7 @@ func (p *OpenAIProvider) CreateEmbeddings(request *types.EmbeddingRequest) (*typ
 	defer req.Body.Close()
 
 	response := &OpenAIProviderEmbeddingsResponse{}
-	// 发送请求
-	_, errWithCode = p.Requester.SendRequest(req, response, false)
+	_, errWithCode = p.sendUnaryJSON(req, response)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -29,9 +28,30 @@ func (p *OpenAIProvider) CreateEmbeddings(request *types.EmbeddingRequest) (*typ
 		return nil, errWithCode
 	}
 
-	if response.Usage != nil {
-		*p.Usage = *response.Usage
+	applyOpenAIEmbeddingUsage(p.Usage, response.Usage, response.Model)
+	if p.ProviderRawJSONReplay {
+		response.EnableProviderRawJSONReplay()
 	}
 
 	return &response.EmbeddingResponse, nil
+}
+
+func applyOpenAIEmbeddingUsage(target, providerUsage *types.Usage, actualModel string) {
+	if target == nil || providerUsage == nil || !providerUsage.ProviderTokenFields["prompt_tokens"] || providerUsage.PromptTokens < 0 {
+		return
+	}
+	if providerUsage.ProviderTokenFields["completion_tokens"] && providerUsage.CompletionTokens != 0 {
+		return
+	}
+	candidate := *providerUsage
+	candidate.CompletionTokens = 0
+	candidate.TotalTokens = candidate.PromptTokens
+	candidate.ProviderTokenFields = map[string]bool{
+		"prompt_tokens":     true,
+		"completion_tokens": true,
+		"total_tokens":      true,
+	}
+	candidate.MarkProviderReported()
+	candidate.MergeProviderAttribution(actualModel, "")
+	*target = candidate
 }

@@ -2,14 +2,22 @@ package stabilityAI
 
 import (
 	"bytes"
-	"encoding/base64"
+	"image/png"
 	"net/http"
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/storage"
 	"one-api/common/utils"
+	providersBase "one-api/providers/base"
 	"one-api/types"
+	"strings"
 	"time"
+)
+
+const (
+	maxStabilityImageBytes            = providersBase.MaxChatRemoteMediaItemBytes
+	maxStabilityImagePixels    uint64 = 8 << 20
+	maxStabilityImageDimension uint64 = 16384
 )
 
 func convertModelName(modelName string) string {
@@ -65,16 +73,15 @@ func (p *StabilityAIProvider) CreateImageGenerations(request *types.ImageRequest
 		return nil, errWithCode
 	}
 
+	imageBody, hasImage := decodeStabilityImage(stabilityAIResponse)
+
 	openaiResponse := &types.ImageResponse{
 		Created: time.Now().Unix(),
 	}
 
 	imgUrl := ""
-	if request.ResponseFormat == "" || request.ResponseFormat == "url" {
-		body, err := base64.StdEncoding.DecodeString(stabilityAIResponse.Image)
-		if err == nil {
-			imgUrl = storage.Upload(body, utils.GetUUID()+".png")
-		}
+	if hasImage && (request.ResponseFormat == "" || request.ResponseFormat == "url") {
+		imgUrl = storage.Upload(imageBody, utils.GetUUID()+".png")
 	}
 
 	if imgUrl == "" {
@@ -83,7 +90,35 @@ func (p *StabilityAIProvider) CreateImageGenerations(request *types.ImageRequest
 		openaiResponse.Data = []types.ImageResponseDataInner{{URL: imgUrl}}
 	}
 
-	p.Usage.PromptTokens = 1000
+	if hasImage && p.Usage != nil {
+		p.Usage.MarkProviderOperationUnits(1)
+	}
 
 	return openaiResponse, nil
+}
+
+func decodeStabilityImage(response *generateResponse) ([]byte, bool) {
+	if response == nil {
+		return nil, false
+	}
+	finishReason := strings.ToUpper(strings.TrimSpace(response.FinishReason))
+	if finishReason != "" && finishReason != "SUCCESS" {
+		return nil, false
+	}
+	body, err := providersBase.DecodeBase64Bounded(response.Image, maxStabilityImageBytes)
+	if err != nil || len(body) == 0 {
+		return nil, false
+	}
+	config, err := png.DecodeConfig(bytes.NewReader(body))
+	if err != nil || config.Width <= 0 || config.Height <= 0 {
+		return nil, false
+	}
+	width, height := uint64(config.Width), uint64(config.Height)
+	if width > maxStabilityImageDimension || height > maxStabilityImageDimension || height > maxStabilityImagePixels/width {
+		return nil, false
+	}
+	if _, err := png.Decode(bytes.NewReader(body)); err != nil {
+		return nil, false
+	}
+	return body, true
 }

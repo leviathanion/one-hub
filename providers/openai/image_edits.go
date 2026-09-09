@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"one-api/common"
 	"one-api/common/config"
+	"one-api/common/requestctx"
 	"one-api/common/requester"
 	"one-api/types"
 )
@@ -18,8 +19,7 @@ func (p *OpenAIProvider) CreateImageEdits(request *types.ImageEditRequest) (*typ
 	defer req.Body.Close()
 
 	response := &OpenAIProviderImageResponse{}
-	// 发送请求
-	_, errWithCode = p.Requester.SendRequest(req, response, false)
+	_, errWithCode = p.sendUnaryJSON(req, response)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -33,10 +33,9 @@ func (p *OpenAIProvider) CreateImageEdits(request *types.ImageEditRequest) (*typ
 		return nil, errWithCode
 	}
 
-	if response.Usage != nil && response.Usage.TotalTokens > 0 {
-		*p.Usage = *response.Usage.ToOpenAIUsage()
-	} else {
-		p.Usage.TotalTokens = p.Usage.PromptTokens
+	applyImageEvidence(p.Usage, &response.ImageResponse, response.confirmedDataCount(p.ProviderRawJSONReplay))
+	if p.ProviderRawJSONReplay {
+		response.EnableProviderRawJSONReplay()
 	}
 
 	return &response.ImageResponse, nil
@@ -55,10 +54,36 @@ func (p *OpenAIProvider) getRequestImageBody(relayMode int, ModelName string, re
 
 	// 获取请求头
 	headers := p.GetRequestHeaders()
-	// 创建请求
+	body, exists, rawErr := p.nativeRawBody()
+	if rawErr != nil {
+		return nil, common.ErrorWrapperLocal(rawErr, "read_request_body_failed", http.StatusInternalServerError)
+	}
 	var req *http.Request
 	var err error
-	if p.OriginalModel != request.Model {
+	if exists {
+		if p.Context == nil || p.Context.Request == nil {
+			return nil, common.StringErrorWrapperLocal("request body not found", "request_body_not_found", http.StatusInternalServerError)
+		}
+		contentType := p.Context.Request.Header.Get("Content-Type")
+		if p.OriginalModel != "" && p.OriginalModel != request.Model {
+			body, contentType, rawErr = rewriteMultipartModel(body, contentType, request.Model)
+			if rawErr != nil {
+				return nil, common.ErrorWrapperLocal(rawErr, "invalid_multipart_request", http.StatusBadRequest)
+			}
+		}
+		if errWithCode := rejectUnsupportedImageStream(body, contentType); errWithCode != nil {
+			return nil, errWithCode
+		}
+		req, err = p.Requester.NewRequest(
+			http.MethodPost,
+			fullRequestURL,
+			p.Requester.WithBody(body),
+			p.Requester.WithHeader(headers),
+			p.Requester.WithContentType(contentType))
+		if req != nil {
+			req.ContentLength = int64(len(body))
+		}
+	} else {
 		var formBody bytes.Buffer
 		builder := p.Requester.CreateFormBuilder(&formBody)
 		if err := imagesEditsMultipartForm(request, builder); err != nil {
@@ -70,23 +95,18 @@ func (p *OpenAIProvider) getRequestImageBody(relayMode int, ModelName string, re
 			p.Requester.WithBody(&formBody),
 			p.Requester.WithHeader(headers),
 			p.Requester.WithContentType(builder.FormDataContentType()))
-		req.ContentLength = int64(formBody.Len())
-	} else {
-		body, exists := p.GetRawBody()
-		if !exists {
-			return nil, common.StringErrorWrapperLocal("request body not found", "request_body_not_found", http.StatusInternalServerError)
+		if req != nil {
+			req.ContentLength = int64(formBody.Len())
 		}
-		req, err = p.Requester.NewRequest(
-			http.MethodPost,
-			fullRequestURL,
-			p.Requester.WithBody(body),
-			p.Requester.WithHeader(headers),
-			p.Requester.WithContentType(p.Context.Request.Header.Get("Content-Type")))
-		req.ContentLength = p.Context.Request.ContentLength
 	}
 
 	if err != nil {
 		return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
+	}
+	if exists && p.usesNativeOpenAIWire() && p.Context != nil && p.Context.Request != nil {
+		if err := p.applyOpenAIHTTPHeaders(req.Header, requestctx.NewHeaderSnapshot(p.Context.Request.Header)); err != nil {
+			return nil, common.ErrorWrapperLocal(err, "invalid_request_header", http.StatusBadRequest)
+		}
 	}
 
 	return req, nil

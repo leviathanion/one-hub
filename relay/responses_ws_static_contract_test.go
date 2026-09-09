@@ -27,6 +27,19 @@ func TestResponsesWSProviderHelpersDoNotCallTurnObserverAccounting(t *testing.T)
 	}
 }
 
+func TestResponsesWSFirstTurnSetupIsQueuedBeforeClientReadPump(t *testing.T) {
+	root := responsesWSTestRepoRoot(t)
+	source, err := os.ReadFile(filepath.Join(root, "relay/responses_ws.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	setup := strings.Index(string(source), "actor.PostReliable(ResponsesWSEventFirstTurnSetup")
+	pump := strings.Index(string(source), "go clientPump.Run(c.Request.Context())")
+	if setup < 0 || pump < 0 || setup > pump {
+		t.Fatalf("first-turn setup must be enqueued before the client read pump starts: setup=%d pump=%d", setup, pump)
+	}
+}
+
 func TestRuntimeSessionDoesNotDeclareProtocolSpecificTypes(t *testing.T) {
 	root := responsesWSTestRepoRoot(t)
 	responsesWSAssertNoTypeDeclarations(t, filepath.Join(root, "runtime/session"),
@@ -54,8 +67,6 @@ func TestResponsesWSProxyLocalEventsDoNotStoreDuplicateKind(t *testing.T) {
 	root := responsesWSTestRepoRoot(t)
 	responsesWSAssertStructsDoNotDeclareFields(t, filepath.Join(root, "relay/responses_ws_events.go"),
 		[]string{
-			"ResponsesWSEventBridgeOpenProviderError",
-			"ResponsesWSEventBridgeOpenLocalError",
 			"ResponsesWSEventProxyLocalError",
 		},
 		"Kind",
@@ -76,46 +87,6 @@ func TestResponsesWSEvidenceEventsDoNotStoreDuplicateCoarseOrigin(t *testing.T) 
 	}
 	for filePath, typeNames := range targets {
 		responsesWSAssertStructsDoNotDeclareFields(t, filePath, typeNames, "Origin")
-	}
-}
-
-func TestResponsesWSBridgeOpenSettlementRoutingDoesNotBranchRawDetailOrigin(t *testing.T) {
-	root := responsesWSTestRepoRoot(t)
-	fset := token.NewFileSet()
-	filePath := filepath.Join(root, "relay/responses_ws.go")
-	file, err := parser.ParseFile(fset, filePath, nil, 0)
-	if err != nil {
-		t.Fatalf("parse %s: %v", filePath, err)
-	}
-	targets := map[string]bool{
-		"handleEvent":                true,
-		"handleBridgeLocalOpenError": true,
-	}
-	seen := make(map[string]bool, len(targets))
-	for _, decl := range file.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || !targets[fn.Name.Name] {
-			continue
-		}
-		seen[fn.Name.Name] = true
-		ast.Inspect(fn.Body, func(node ast.Node) bool {
-			switch stmt := node.(type) {
-			case *ast.IfStmt:
-				if responsesWSExprBranchesBridgeOpenDetailOrigin(stmt.Cond) {
-					t.Fatalf("%s:%d: %s must route bridge open settlement by typed event facts, not raw DetailOrigin", filePath, fset.Position(stmt.Pos()).Line, fn.Name.Name)
-				}
-			case *ast.SwitchStmt:
-				if responsesWSExprContainsDetailOrigin(stmt.Tag) && responsesWSSwitchContainsBridgeOpenDetailOriginCase(stmt) {
-					t.Fatalf("%s:%d: %s must route bridge open settlement by typed event facts, not raw DetailOrigin", filePath, fset.Position(stmt.Pos()).Line, fn.Name.Name)
-				}
-			}
-			return true
-		})
-	}
-	for name := range targets {
-		if !seen[name] {
-			t.Fatalf("%s: missing %s", filePath, name)
-		}
 	}
 }
 
@@ -154,20 +125,63 @@ func TestResponsesWSActorLifecycleCleanupUsesTurnSlotHelpers(t *testing.T) {
 func TestResponsesWSAccountingPathDoesNotBranchRawDetailOrigin(t *testing.T) {
 	root := responsesWSTestRepoRoot(t)
 	targets := map[string][]string{
-		filepath.Join(root, "relay/responses_ws_settlement.go"): {
-			"decideResponsesWSSettlement",
-		},
 		filepath.Join(root, "relay/responses_ws_actor_settlement.go"): {
-			"buildPendingSettlementInput",
-			"buildActiveSettlementInput",
-			"buildSettlementInputFromAttempt",
-		},
-		filepath.Join(root, "relay/responses_ws_settlement_projection.go"): {
-			"ProjectResponsesWSProviderEvidence",
+			"projectResponsesWSSharedDecision",
+			"applyPendingSettlement",
+			"applyActiveSettlement",
 		},
 	}
 	for filePath, names := range targets {
 		responsesWSAssertFunctionsDoNotBranchRawDetailOrigin(t, filePath, names...)
+	}
+}
+
+func TestResponsesWSStreamEvidenceIsObservedOnlyAtProviderIngress(t *testing.T) {
+	root := responsesWSTestRepoRoot(t)
+	fset := token.NewFileSet()
+	filePath := filepath.Join(root, "relay/responses_ws.go")
+	file, err := parser.ParseFile(fset, filePath, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", filePath, err)
+	}
+
+	functions := make(map[string]*ast.FuncDecl)
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if ok {
+			functions[function.Name.Name] = function
+		}
+	}
+
+	handler := functions["handleProviderDownstreamWithObservation"]
+	if handler == nil {
+		t.Fatalf("%s: missing handleProviderDownstreamWithObservation", filePath)
+	}
+	allCalls := responsesWSMethodCallPositions(handler.Body, "ObserveResponsesStreamPayload")
+	if len(allCalls) != 1 {
+		t.Fatalf("%s: provider ingress must have exactly one stream evidence observation, got %d", filePath, len(allCalls))
+	}
+	guardedCalls := make(map[token.Pos]struct{})
+	ast.Inspect(handler.Body, func(node ast.Node) bool {
+		conditional, ok := node.(*ast.IfStmt)
+		if !ok || !responsesWSExprContainsIdent(conditional.Cond, "observe") {
+			return true
+		}
+		for _, position := range responsesWSMethodCallPositions(conditional.Body, "ObserveResponsesStreamPayload") {
+			guardedCalls[position] = struct{}{}
+		}
+		return true
+	})
+	if _, ok := guardedCalls[allCalls[0]]; !ok {
+		t.Fatalf("%s:%d: stream evidence observation must be guarded from pending journal replay", filePath, fset.Position(allCalls[0]).Line)
+	}
+
+	closeReplay := functions["applyBufferedPendingTerminalEvidence"]
+	if closeReplay == nil {
+		t.Fatalf("%s: missing applyBufferedPendingTerminalEvidence", filePath)
+	}
+	if calls := responsesWSMethodCallPositions(closeReplay.Body, "ObserveResponsesStreamPayload"); len(calls) != 0 {
+		t.Fatalf("%s:%d: close replay must consume previously observed stream evidence", filePath, fset.Position(calls[0]).Line)
 	}
 }
 
@@ -188,29 +202,6 @@ func TestRuntimeSessionDoesNotImportCommonResponsesWS(t *testing.T) {
 		`common/responsesws`,
 		`common/responsesws"`,
 	)
-}
-
-func TestResponsesWSDocsUseCurrentProviderContract(t *testing.T) {
-	root := responsesWSTestRepoRoot(t)
-	files := []string{
-		filepath.Join(root, "docs/dev/responses-ws-architecture.md"),
-		filepath.Join(root, "docs/dev/responses-ws-settlement-core-actor-v2.md"),
-		filepath.Join(root, "docs/dev/responses-ws-transport-boundary.md"),
-	}
-	responsesWSAssertDocsDoNotContain(t, files,
-		"ResponsesWSSendResult",
-		"ResponsesWSSendStatus",
-		"ResponsesWSSendReason",
-		"ResponsesWSSendOutcome",
-		"runtimesession.Frame",
-		"runtimesession.Recv",
-		"runtime/session.Responses",
-		"runtime/session.responsesws",
-		"SendClientWithResult(ctx, runtime/session.Frame)",
-		"SendClient(ctx, responsesws.Frame) error",
-	)
-	responsesWSAssertDocTokenOnlyWhenLineContains(t, files, "runtime/session.Frame", "/v1/realtime")
-	responsesWSAssertDocTokenOnlyWhenLineContains(t, files, "RecvEvent", "/v1/realtime")
 }
 
 func responsesWSTestRepoRoot(t *testing.T) string {
@@ -255,8 +246,6 @@ func responsesWSForbiddenTurnSlotCleanupAssignment(path string, rhs ast.Expr) bo
 		return responsesWSExprIsNil(rhs)
 	case strings.HasSuffix(path, ".turns.active.channelID"):
 		return responsesWSExprIsIntegerLiteral(rhs, "0")
-	case strings.HasSuffix(path, ".turns.active.bridgeCancelPendingAttemptID"):
-		return responsesWSExprIsStringLiteral(rhs, "")
 	default:
 		return false
 	}
@@ -272,40 +261,33 @@ func responsesWSExprIsIntegerLiteral(expr ast.Expr, value string) bool {
 	return ok && lit.Kind == token.INT && lit.Value == value
 }
 
-func responsesWSExprIsStringLiteral(expr ast.Expr, value string) bool {
-	lit, ok := expr.(*ast.BasicLit)
-	return ok && lit.Kind == token.STRING && lit.Value == `"`+value+`"`
+func responsesWSMethodCallPositions(node ast.Node, method string) []token.Pos {
+	var positions []token.Pos
+	ast.Inspect(node, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if ok && selector.Sel.Name == method {
+			positions = append(positions, call.Pos())
+		}
+		return true
+	})
+	return positions
 }
 
-func responsesWSAssertDocsDoNotContain(t *testing.T, files []string, tokens ...string) {
-	t.Helper()
-	for _, filePath := range files {
-		content, err := os.ReadFile(filePath)
-		if err != nil {
-			t.Fatalf("read %s: %v", filePath, err)
+func responsesWSExprContainsIdent(expr ast.Expr, name string) bool {
+	found := false
+	ast.Inspect(expr, func(node ast.Node) bool {
+		identifier, ok := node.(*ast.Ident)
+		if ok && identifier.Name == name {
+			found = true
+			return false
 		}
-		text := string(content)
-		for _, token := range tokens {
-			if strings.Contains(text, token) {
-				t.Fatalf("%s must not contain legacy ResponsesWS contract token %q", filePath, token)
-			}
-		}
-	}
-}
-
-func responsesWSAssertDocTokenOnlyWhenLineContains(t *testing.T, files []string, token, required string) {
-	t.Helper()
-	for _, filePath := range files {
-		content, err := os.ReadFile(filePath)
-		if err != nil {
-			t.Fatalf("read %s: %v", filePath, err)
-		}
-		for i, line := range strings.Split(string(content), "\n") {
-			if strings.Contains(line, token) && !strings.Contains(line, required) {
-				t.Fatalf("%s:%d contains %q without %q: %s", filePath, i+1, token, required, line)
-			}
-		}
-	}
+		return !found
+	})
+	return found
 }
 
 func responsesWSAssertStructsDoNotDeclareFields(t *testing.T, filePath string, typeNames []string, forbiddenFields ...string) {
@@ -385,10 +367,6 @@ func responsesWSAssertNoTypeDeclarations(t *testing.T, path string, typeNames ..
 	})
 }
 
-func responsesWSExprBranchesBridgeOpenDetailOrigin(expr ast.Expr) bool {
-	return responsesWSExprContainsDetailOrigin(expr) && responsesWSExprContainsBridgeOpenDetailOrigin(expr)
-}
-
 func responsesWSExprBranchesRawDetailOrigin(expr ast.Expr) bool {
 	found := false
 	ast.Inspect(expr, func(node ast.Node) bool {
@@ -437,45 +415,6 @@ func responsesWSExprContainsRecvDetailOrigin(expr ast.Expr) bool {
 		return true
 	})
 	return found
-}
-
-func responsesWSExprContainsBridgeOpenDetailOrigin(expr ast.Expr) bool {
-	if expr == nil {
-		return false
-	}
-	found := false
-	ast.Inspect(expr, func(node ast.Node) bool {
-		sel, ok := node.(*ast.SelectorExpr)
-		if !ok {
-			return true
-		}
-		switch sel.Sel.Name {
-		case "RecvDetailOriginBridgeOpenProviderError", "RecvDetailOriginBridgeStreamError":
-			found = true
-			return false
-		default:
-			return true
-		}
-	})
-	return found
-}
-
-func responsesWSSwitchContainsBridgeOpenDetailOriginCase(stmt *ast.SwitchStmt) bool {
-	if stmt == nil || stmt.Body == nil {
-		return false
-	}
-	for _, bodyStmt := range stmt.Body.List {
-		clause, ok := bodyStmt.(*ast.CaseClause)
-		if !ok {
-			continue
-		}
-		for _, expr := range clause.List {
-			if responsesWSExprContainsBridgeOpenDetailOrigin(expr) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func responsesWSSwitchContainsRecvDetailOriginCase(stmt *ast.SwitchStmt) bool {

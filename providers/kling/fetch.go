@@ -1,6 +1,7 @@
 package kling
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -10,7 +11,7 @@ import (
 	"gorm.io/datatypes"
 )
 
-func (s *KlingProvider) GetFetchs(class, action string, ids []string) (response []*types.TaskDto, errWithCode *types.OpenAIErrorWithStatusCode) {
+func (s *KlingProvider) GetFetchs(ctx context.Context, class, action string, ids []string) (response []*types.TaskDto, errWithCode *types.OpenAIErrorWithStatusCode) {
 	fetchUri := fmt.Sprintf(s.Fetchs, class, action)
 
 	fullRequestURL := s.GetFullRequestURL(fetchUri, "")
@@ -18,7 +19,7 @@ func (s *KlingProvider) GetFetchs(class, action string, ids []string) (response 
 	headers := s.GetRequestHeaders()
 
 	// 创建请求
-	req, err := s.Requester.NewRequest(http.MethodGet, fullRequestURL, s.Requester.WithHeader(headers))
+	req, err := s.Requester.NewRequest(http.MethodGet, fullRequestURL, s.Requester.WithContext(ctx), s.Requester.WithHeader(headers))
 	if err != nil {
 		return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
 	}
@@ -59,14 +60,14 @@ func (s *KlingProvider) GetFetchs(class, action string, ids []string) (response 
 	return response, errWithCode
 }
 
-func (s *KlingProvider) GetFetch(class, action string, id string) (response *types.TaskResponse[types.TaskDto], errWithCode *types.OpenAIErrorWithStatusCode) {
+func (s *KlingProvider) GetFetch(ctx context.Context, class, action string, id string) (response *types.TaskResponse[types.TaskDto], errWithCode *types.OpenAIErrorWithStatusCode) {
 	fetchUri := fmt.Sprintf(s.Fetch, class, action, id)
 
 	fullRequestURL := s.GetFullRequestURL(fetchUri, "")
 	headers := s.GetRequestHeaders()
 
 	// 创建请求
-	req, err := s.Requester.NewRequest(http.MethodGet, fullRequestURL, s.Requester.WithHeader(headers))
+	req, err := s.Requester.NewRequest(http.MethodGet, fullRequestURL, s.Requester.WithContext(ctx), s.Requester.WithHeader(headers))
 	if err != nil {
 		return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
 	}

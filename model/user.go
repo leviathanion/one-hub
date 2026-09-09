@@ -4,16 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/go-webauthn/webauthn/webauthn"
-	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/logger"
-	"one-api/common/redis"
 	"one-api/common/utils"
 	"strings"
 	"time"
+
+	"github.com/go-webauthn/webauthn/webauthn"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // User if you add sensitive fields, don't forget to clean them in setupLogin function.
@@ -634,107 +634,4 @@ func GetUserByWebAuthnCredentialId(credentialId []byte) (*User, error) {
 		return nil, err
 	}
 	return GetUserById(cred.UserId, false)
-}
-
-func DeleteUserById(id int) (err error) {
-	if id == 0 {
-		return errors.New("id 为空！")
-	}
-	user := User{Id: id}
-	return user.Delete()
-}
-
-func (user *User) Update(updatePassword bool) error {
-	var err error
-	omitFields := []string{"quota", "used_quota", "request_count", "aff_count", "aff_quota", "aff_history"}
-
-	if updatePassword {
-		user.Password, err = common.Password2Hash(user.Password)
-		if err != nil {
-			return err
-		}
-	} else {
-		omitFields = append(omitFields, "password")
-	}
-
-	err = DB.Model(user).Omit(omitFields...).Updates(user).Error
-
-	if err == nil && user.Role == config.RoleRootUser {
-		config.RootUserEmail = user.Email
-	}
-
-	if config.RedisEnabled {
-		redis.RedisDel(fmt.Sprintf(UserGroupCacheKey, user.Id))
-	}
-
-	return err
-}
-
-func UpdateUser(id int, fields map[string]interface{}) error {
-	return DB.Model(&User{}).Where("id = ?", id).Updates(fields).Error
-}
-
-func ResetUserPasswordByEmail(email string, password string) error {
-	if email == "" || password == "" {
-		return errors.New("邮箱地址或密码为空！")
-	}
-	hashedPassword, err := common.Password2Hash(password)
-	if err != nil {
-		return err
-	}
-	err = DB.Model(&User{}).Where("email = ?", email).Update("password", hashedPassword).Error
-	return err
-}
-
-func increaseUserQuota(id int, quota int) (err error) {
-	err = DB.Model(&User{}).Where("id = ?", id).Update("quota", gorm.Expr("quota + ?", quota)).Error
-	return err
-}
-
-func DecreaseUserQuota(id int, quota int) (err error) {
-	if quota < 0 {
-		return errors.New("quota 不能为负数！")
-	}
-	if config.BatchUpdateEnabled {
-		addNewRecord(BatchUpdateTypeUserQuota, id, -quota)
-		return nil
-	}
-	return decreaseUserQuota(id, quota)
-}
-
-func decreaseUserQuota(id int, quota int) (err error) {
-	err = DB.Model(&User{}).Where("id = ?", id).Update("quota", gorm.Expr("quota - ?", quota)).Error
-	return err
-}
-
-func UpdateUserUsedQuotaAndRequestCount(id int, quota int) {
-	if config.BatchUpdateEnabled {
-		addNewRecord(BatchUpdateTypeUsedQuota, id, quota)
-		addNewRecord(BatchUpdateTypeRequestCount, id, 1)
-		return
-	}
-	updateUserUsedQuotaAndRequestCount(id, quota, 1)
-}
-
-func updateUserUsedQuotaAndRequestCount(id int, quota int, count int) {
-	err := DB.Model(&User{}).Where("id = ?", id).Updates(
-		map[string]interface{}{
-			"used_quota":    gorm.Expr("used_quota + ?", quota),
-			"request_count": gorm.Expr("request_count + ?", count),
-		},
-	).Error
-	if err != nil {
-		logger.SysError("failed to update user used quota and request count: " + err.Error())
-	}
-}
-
-func updateUserUsedQuota(id int, quota int) {
-	err := DB.Model(&User{}).Where("id = ?", id).Updates(
-		map[string]interface{}{
-			"used_quota": gorm.Expr("used_quota + ?", quota),
-		},
-	).Error
-	if err != nil {
-		logger.SysError("failed to update user used quota: " + err.Error())
-	}
 }

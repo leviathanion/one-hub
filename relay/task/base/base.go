@@ -3,6 +3,7 @@ package base
 import (
 	"context"
 	"errors"
+	"net/http"
 	"one-api/model"
 	"one-api/providers/base"
 	"one-api/relay"
@@ -13,27 +14,30 @@ import (
 )
 
 type TaskBase struct {
-	Platform      string
-	C             *gin.Context
-	OriginalModel string
-	ModelName     string
-	Task          *model.Task
-	OriginTaskID  string
-	BaseProvider  base.ProviderInterface
-	Response      any
+	Platform       string
+	C              *gin.Context
+	OriginalModel  string
+	ModelName      string
+	Task           *model.Task
+	OriginTaskID   string
+	ownerChannelID int
+	BaseProvider   base.ProviderInterface
+	Response       any
 }
 
 type TaskInterface interface {
 	Init() *TaskError
 	Relay() *TaskError
 	HandleError(err *TaskError)
-	ShouldRetry(c *gin.Context, err *TaskError) bool
 	GetModelName() string
 	GetTask() *model.Task
 	SetProvider() *TaskError
 	GetProvider() base.ProviderInterface
+	OwnerChannelIncarnationID() int
 	GinResponse()
+}
 
+type TaskProgressInterface interface {
 	UpdateTaskStatus(ctx context.Context, taskChannelM map[int][]string, taskM map[string]*model.Task) error
 }
 
@@ -70,13 +74,29 @@ func (t *TaskBase) GetProvider() base.ProviderInterface {
 }
 
 func (t *TaskBase) GetProviderByModel() (base.ProviderInterface, error) {
-	provider, modelName, fail := relay.GetProvider(t.C, t.OriginalModel)
+	var (
+		provider  base.ProviderInterface
+		modelName string
+		fail      error
+	)
+	if t.ownerChannelID > 0 {
+		provider, modelName, fail = relay.GetProviderForOwnerChannel(t.C, t.OriginalModel, t.ownerChannelID)
+	} else {
+		provider, modelName, fail = relay.GetProvider(t.C, t.OriginalModel)
+	}
 	if fail != nil {
 		return nil, fail
 	}
 	t.ModelName = modelName
 
 	return provider, nil
+}
+
+func (t *TaskBase) OwnerChannelIncarnationID() int {
+	if t == nil {
+		return 0
+	}
+	return t.ownerChannelID
 }
 
 func (t *TaskBase) HandleOriginTaskID() error {
@@ -94,7 +114,10 @@ func (t *TaskBase) HandleOriginTaskID() error {
 		return errors.New("origin task not found")
 	}
 
-	t.C.Set("specific_channel_id", task.ChannelId)
+	if task.ChannelId <= 0 {
+		return errors.New("origin task owner channel is invalid")
+	}
+	t.ownerChannelID = task.ChannelId
 
 	return nil
 }
@@ -104,22 +127,36 @@ func (t *TaskBase) GinResponse() {
 }
 
 type TaskError struct {
-	Code       string `json:"code"`
-	Message    string `json:"message"`
-	Data       any    `json:"data"`
-	StatusCode int    `json:"-"`
-	LocalError bool   `json:"-"`
-	Error      error  `json:"-"`
+	Code                 string `json:"code"`
+	Message              string `json:"message"`
+	Data                 any    `json:"data"`
+	StatusCode           int    `json:"-"`
+	LocalError           bool   `json:"-"`
+	UpstreamNotAttempted bool   `json:"-"`
+	UpstreamAmbiguous    bool   `json:"-"`
+	UpstreamAccepted     bool   `json:"-"`
+	ProviderRejected     bool   `json:"-"`
+	Error                error  `json:"-"`
 }
 
 func OpenAIErrToTaskErr(errWithCode *types.OpenAIErrorWithStatusCode) *TaskError {
 	code, _ := errWithCode.Code.(string)
+	providerRejected := !errWithCode.LocalError && !errWithCode.UpstreamNotAttempted && !errWithCode.UpstreamAmbiguous && !errWithCode.UpstreamAccepted && errWithCode.StatusCode >= http.StatusBadRequest && errWithCode.StatusCode < http.StatusInternalServerError && errWithCode.StatusCode != http.StatusRequestTimeout
 
 	return &TaskError{
-		Code:       code,
-		Message:    errWithCode.Message,
-		StatusCode: errWithCode.StatusCode,
+		Code:                 code,
+		Message:              errWithCode.Message,
+		StatusCode:           errWithCode.StatusCode,
+		LocalError:           errWithCode.LocalError,
+		UpstreamNotAttempted: errWithCode.UpstreamNotAttempted,
+		UpstreamAmbiguous:    errWithCode.UpstreamAmbiguous,
+		UpstreamAccepted:     errWithCode.UpstreamAccepted,
+		ProviderRejected:     providerRejected,
 	}
+}
+
+func RejectedTaskError(httpCode int, code, message string) *TaskError {
+	return &TaskError{Code: code, Message: message, StatusCode: httpCode, ProviderRejected: true}
 }
 
 func StringTaskError(httpCode int, code, message string, local bool) *TaskError {

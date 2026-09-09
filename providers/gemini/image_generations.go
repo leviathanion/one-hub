@@ -72,8 +72,8 @@ func (p *GeminiProvider) CreateImageGenerations(request *types.ImageRequest) (*t
 	}
 
 	usage := p.GetUsage()
-	usage.PromptTokens = imageCount * 258
-	usage.TotalTokens = usage.PromptTokens
+	usage.MarkProviderOperationUnits(imageCount)
+	usage.MergeProviderAttribution(request.Model, "")
 
 	return openaiResponse, nil
 }

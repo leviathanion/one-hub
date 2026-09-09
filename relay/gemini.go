@@ -83,15 +83,13 @@ func (r *relayGeminiOnly) send() (err *types.OpenAIErrorWithStatusCode, done boo
 	}
 
 	// 内容审查
-	if config.EnableSafe {
-		for _, message := range r.geminiRequest.Contents {
-			if message.Parts != nil {
-				CheckResult, _ := safty.CheckContent(message.Parts)
-				if !CheckResult.IsSafe {
-					err = common.StringErrorWrapperLocal(CheckResult.Reason, CheckResult.Code, http.StatusBadRequest)
-					done = true
-					return
-				}
+	for _, message := range r.geminiRequest.Contents {
+		if message.Parts != nil {
+			CheckResult, _ := safty.CheckContent(message.Parts)
+			if !CheckResult.IsSafe {
+				err = common.StringErrorWrapperLocal(CheckResult.Reason, CheckResult.Code, http.StatusBadRequest)
+				done = true
+				return
 			}
 		}
 	}
@@ -109,11 +107,28 @@ func (r *relayGeminiOnly) send() (err *types.OpenAIErrorWithStatusCode, done boo
 			r.heartbeat.Stop()
 		}
 
-		doneStr := func() string {
-			return ""
+		providerErrorDelivered := false
+		observe := func(event string) {
+			providerErrorDelivered = providerErrorDelivered || sseEventContainsError([]byte(event))
 		}
-		firstResponseTime := responseGeneralStreamClient(r.c, response, doneStr)
+		firstResponseTime, streamErr := responseGeneralStreamClientWithObserverResult(r.c, response, nil, observe, sanitizeProviderSSEEvent, false)
 		r.SetFirstResponseTime(firstResponseTime)
+		if streamErr != nil {
+			if providerErrorDelivered {
+				r.c.Set(streamErrorAlreadyRenderedContextKey, true)
+			} else if r.c.Request.Context().Err() == nil {
+				_, _ = r.c.Writer.Write([]byte("data: {\"error\":{\"code\":502,\"message\":\"stream interrupted\",\"status\":\"INVALID_PROVIDER_RESPONSE\"}}\n\n"))
+				r.c.Writer.Flush()
+				r.c.Set(streamErrorAlreadyRenderedContextKey, true)
+			}
+			var providerErr *types.OpenAIErrorWithStatusCode
+			if errors.As(streamErr, &providerErr) && providerErr != nil {
+				return providerErr, true
+			}
+			apiErr := common.ErrorWrapper(streamErr, "invalid_provider_response", http.StatusBadGateway)
+			apiErr.UpstreamAccepted = true
+			return apiErr, true
+		}
 	} else {
 		var response *gemini.GeminiChatResponse
 		response, err = chatProvider.CreateGeminiChat(r.geminiRequest)

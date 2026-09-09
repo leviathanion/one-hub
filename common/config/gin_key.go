@@ -7,7 +7,6 @@ const (
 	GinRequestBodyMapKey        = "cached_request_body_map"
 	GinWireRequestBodyKey       = "wire_request_body"
 	GinRequestBodyDecodeMetaKey = "request_body_decode_meta"
-	GinProviderCacheKey         = "cached_provider_selection"
 	GinRequestBodyReparseKey    = "request_body_reparse_needed"
 	GinChannelAffinityMetaKey   = "channel_affinity_meta"
 	GinRoutingGroupKey          = "routing_group"

@@ -1,14 +1,10 @@
 package config
 
 import (
-	"strings"
 	"testing"
 	"time"
 
-	"one-api/common/logger"
-
 	"github.com/spf13/viper"
-	"go.uber.org/zap"
 )
 
 func TestInitConfLoadsRealtimeSessionCompatFlagAndDefaults(t *testing.T) {
@@ -69,17 +65,17 @@ func TestInitConfLoadsRealtimeSessionCompatFlagAndDefaults(t *testing.T) {
 	if got := viper.GetInt("responses_websocket_client_ping_interval_ms"); got != 25000 {
 		t.Fatalf("expected responses websocket client ping interval default 25000ms, got %d", got)
 	}
-	if got := viper.GetInt("responses_websocket_client_pong_miss_timeout_ms"); got != 0 {
-		t.Fatalf("expected responses websocket client pong miss timeout default 0ms, got %d", got)
+	if got := viper.GetInt("responses_websocket_client_pong_miss_timeout_ms"); got != 10000 {
+		t.Fatalf("expected responses websocket client pong miss timeout default 10000ms, got %d", got)
 	}
-	if got := viper.GetInt("responses_websocket_client_inbound_activity_timeout_ms"); got != 300000 {
-		t.Fatalf("expected responses websocket client inbound activity timeout default 300000ms, got %d", got)
+	if got := viper.GetInt("responses_websocket_client_inbound_activity_timeout_ms"); got != 60000 {
+		t.Fatalf("expected responses websocket client inbound activity timeout default 60000ms, got %d", got)
 	}
 	if got := viper.GetInt("responses_ws.active_turn_timeout_ms"); got != 120000 {
 		t.Fatalf("expected ResponsesWS active turn timeout default 120000ms, got %d", got)
 	}
-	if got := viper.GetInt("responses_ws.bridge_open_timeout_ms"); got != 30000 {
-		t.Fatalf("expected ResponsesWS bridge open timeout default 30000ms, got %d", got)
+	if got := viper.GetInt("responses_ws.max_lifetime_ms"); got != 3600000 {
+		t.Fatalf("expected ResponsesWS max lifetime default 3600000ms, got %d", got)
 	}
 	if !viper.GetBool("responses_ws.active_lease_redis_fail_open") {
 		t.Fatal("expected ResponsesWS active lease Redis fail-open compatibility to be enabled by default")
@@ -173,49 +169,6 @@ func TestRealtimeWebsocketPingIntervalExplicitNonPositiveDisables(t *testing.T) 
 	}
 }
 
-func TestLogRuntimeConfigWarningsBridgeOpenTimeoutDisabled(t *testing.T) {
-	originalLogger := logger.Logger
-	logger.Logger = zap.NewNop()
-	originalWarnings := runtimeConfigWarningsLogged
-	runtimeConfigWarningsLogged = map[string]bool{}
-	viper.Reset()
-	t.Cleanup(func() {
-		logger.Logger = originalLogger
-		runtimeConfigWarningsLogged = originalWarnings
-		viper.Reset()
-	})
-
-	before := countRuntimeWarningLogs("bridge opening watchdog")
-	defaultConfig()
-	LogRuntimeConfigWarnings()
-	if got := countRuntimeWarningLogs("bridge opening watchdog"); got != before {
-		t.Fatalf("expected default bridge_open_timeout_ms not to warn, before=%d after=%d", before, got)
-	}
-
-	viper.Set("responses_ws.bridge_open_timeout_ms", 0)
-	LogRuntimeConfigWarnings()
-	afterFirst := countRuntimeWarningLogs("bridge opening watchdog")
-	if afterFirst != before+1 {
-		t.Fatalf("expected explicit disabled bridge open timeout to warn once, before=%d after=%d", before, afterFirst)
-	}
-
-	LogRuntimeConfigWarnings()
-	if got := countRuntimeWarningLogs("bridge opening watchdog"); got != afterFirst {
-		t.Fatalf("expected runtime config warning to be emitted once, afterFirst=%d afterSecond=%d", afterFirst, got)
-	}
-}
-
-func countRuntimeWarningLogs(needle string) int {
-	entries, _ := logger.GetLatestLogs(500)
-	count := 0
-	for _, entry := range entries {
-		if strings.Contains(entry.Message, needle) {
-			count++
-		}
-	}
-	return count
-}
-
 func TestConnectTimeoutUsesConfiguredSecondsWithFallback(t *testing.T) {
 	viper.Reset()
 	t.Cleanup(func() {
@@ -260,16 +213,16 @@ func TestSplitWebsocketClientLivenessConfig(t *testing.T) {
 	if got := ResponsesWebsocketClientPingInterval(); got != 25*time.Second {
 		t.Fatalf("expected unset responses client ping interval to use default 25s, got %s", got)
 	}
-	if got := ResponsesWebsocketClientPongMissTimeout(); got != 0 {
-		t.Fatalf("expected unset responses client pong miss timeout to default disabled, got %s", got)
+	if got := ResponsesWebsocketClientPongMissTimeout(); got != 10*time.Second {
+		t.Fatalf("expected unset responses client pong miss timeout to default to 10s, got %s", got)
 	}
-	if got := ResponsesWebsocketClientInboundActivityTimeout(); got != 5*time.Minute {
-		t.Fatalf("expected unset responses client inbound activity timeout to use default 5m, got %s", got)
+	if got := ResponsesWebsocketClientInboundActivityTimeout(); got != time.Minute {
+		t.Fatalf("expected unset responses client inbound activity timeout to default to 1m, got %s", got)
 	}
 
 	defaultConfig()
-	if got := ResponsesWebsocketClientInboundActivityTimeout(); got != 5*time.Minute {
-		t.Fatalf("expected configured responses client inbound activity timeout default 5m, got %s", got)
+	if got := ResponsesWebsocketClientInboundActivityTimeout(); got != time.Minute {
+		t.Fatalf("expected configured responses client inbound activity timeout default 1m, got %s", got)
 	}
 
 	viper.Set("responses_websocket_client_inbound_activity_timeout_ms", 0)
@@ -283,31 +236,19 @@ func TestSplitWebsocketClientLivenessConfig(t *testing.T) {
 	}
 
 	if got := ResponsesWSActiveTurnTimeout(); got != 2*time.Minute {
-		t.Fatalf("expected unset responses active turn timeout to default 2m, got %s", got)
+		t.Fatalf("expected responses active turn timeout to default to 2m, got %s", got)
 	}
 	viper.Set("responses_ws.active_turn_timeout_ms", 1500)
 	if got := ResponsesWSActiveTurnTimeout(); got != 1500*time.Millisecond {
 		t.Fatalf("expected explicit responses active turn timeout to apply, got %s", got)
 	}
 	viper.Set("responses_ws.active_turn_timeout_ms", 0)
-	if got := ResponsesWSActiveTurnTimeout(); got != 2*time.Minute {
-		t.Fatalf("expected non-positive responses active turn timeout to fall back to 2m, got %s", got)
+	if got := ResponsesWSActiveTurnTimeout(); got != 0 {
+		t.Fatalf("expected zero responses active turn timeout to disable watchdog, got %s", got)
 	}
-	if got := ResponsesWSBridgeOpenTimeout(); got != 30*time.Second {
-		t.Fatalf("expected unset responses bridge open timeout to default 30s, got %s", got)
-	}
-	viper.Set("responses_ws.bridge_open_timeout_ms", 1500)
-	if got := ResponsesWSBridgeOpenTimeout(); got != 1500*time.Millisecond {
-		t.Fatalf("expected explicit responses bridge open timeout to apply, got %s", got)
-	}
-	viper.Set("responses_ws.bridge_open_timeout_ms", 0)
-	if got := ResponsesWSBridgeOpenTimeout(); got != 0 {
-		t.Fatalf("expected non-positive responses bridge open timeout to disable watchdog, got %s", got)
-	}
-
 	viper.Reset()
 	viper.Set("responses_ws.client_pong_timeout_ms", 1500)
-	if got := ResponsesWebsocketClientInboundActivityTimeout(); got != 5*time.Minute {
+	if got := ResponsesWebsocketClientInboundActivityTimeout(); got != time.Minute {
 		t.Fatalf("expected legacy responses_ws.client_pong_timeout_ms to be ignored, got %s", got)
 	}
 
@@ -322,5 +263,78 @@ func TestSplitWebsocketClientLivenessConfig(t *testing.T) {
 	}
 	if got := RealtimeWebsocketClientInboundActivityTimeout(); got != 5*time.Second {
 		t.Fatalf("expected realtime client inbound activity timeout override, got %s", got)
+	}
+}
+
+func TestRealtimeWebsocketFrameQueueByteBudgets(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+
+	if got := RealtimeWebsocketClientFrameQueueMaxBytes(); got != 64<<20 {
+		t.Fatalf("expected default client frame queue budget 64 MiB, got %d", got)
+	}
+	if got := RealtimeWebsocketPendingFrameQueueMaxBytes(); got != 64<<20 {
+		t.Fatalf("expected default pending frame queue budget 64 MiB, got %d", got)
+	}
+	if got := RealtimeWebsocketProviderFrameQueueMaxBytes(); got != 64<<20 {
+		t.Fatalf("expected default provider frame queue budget 64 MiB, got %d", got)
+	}
+	if got := RealtimeWebsocketAttachmentQueueMaxBytes(); got != 64<<20 {
+		t.Fatalf("expected default attachment queue budget 64 MiB, got %d", got)
+	}
+	viper.Set("realtime.client_frame_queue_max_bytes", 1024)
+	viper.Set("realtime.pending_frame_queue_max_bytes", 2048)
+	viper.Set("realtime.provider_frame_queue_max_bytes", 4096)
+	viper.Set("realtime.attachment_queue_max_bytes", 8192)
+	if got := RealtimeWebsocketClientFrameQueueMaxBytes(); got != 1024 {
+		t.Fatalf("expected configured client frame queue budget, got %d", got)
+	}
+	if got := RealtimeWebsocketPendingFrameQueueMaxBytes(); got != 2048 {
+		t.Fatalf("expected configured pending frame queue budget, got %d", got)
+	}
+	if got := RealtimeWebsocketProviderFrameQueueMaxBytes(); got != 4096 {
+		t.Fatalf("expected configured provider frame queue budget, got %d", got)
+	}
+	if got := RealtimeWebsocketAttachmentQueueMaxBytes(); got != 8192 {
+		t.Fatalf("expected configured attachment queue budget, got %d", got)
+	}
+}
+
+func TestResponsesWSOptionalTimeoutsCanBeDisabled(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+
+	if got := ResponsesWSFirstFrameTimeout(); got != 30*time.Second {
+		t.Fatalf("expected unset first-frame timeout to use 30s, got %s", got)
+	}
+	if got := ResponsesWSIdleTimeout(); got != 30*time.Minute {
+		t.Fatalf("expected unset idle cleanup timeout to use 30m, got %s", got)
+	}
+	if got := ResponsesWSActiveTurnTimeout(); got != 2*time.Minute {
+		t.Fatalf("expected unset active-turn timeout to use 2m, got %s", got)
+	}
+	if got := ResponsesWSMaxLifetime(); got != time.Hour {
+		t.Fatalf("expected unset proxy max lifetime to use 1h, got %s", got)
+	}
+
+	for _, key := range []string{
+		"responses_ws.first_frame_timeout_ms",
+		"responses_ws.idle_timeout_ms",
+		"responses_ws.active_turn_timeout_ms",
+		"responses_ws.max_lifetime_ms",
+	} {
+		viper.Set(key, 0)
+	}
+	if got := ResponsesWSFirstFrameTimeout(); got != 0 {
+		t.Fatalf("expected zero first-frame timeout to disable it, got %s", got)
+	}
+	if got := ResponsesWSIdleTimeout(); got != 0 {
+		t.Fatalf("expected zero idle timeout to disable it, got %s", got)
+	}
+	if got := ResponsesWSActiveTurnTimeout(); got != 0 {
+		t.Fatalf("expected zero active-turn timeout to disable it, got %s", got)
+	}
+	if got := ResponsesWSMaxLifetime(); got != 0 {
+		t.Fatalf("expected zero max lifetime to disable it, got %s", got)
 	}
 }

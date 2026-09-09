@@ -4,43 +4,110 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
+	"net/url"
+	"strings"
+
 	"one-api/common"
 	"one-api/common/config"
+	"one-api/common/providerendpoint"
+	"one-api/common/providerresponse"
 	"one-api/common/requester"
 	commonresponses "one-api/common/responses"
-	"one-api/common/responsesws"
 	"one-api/common/utils"
+	"one-api/model"
 	providersBase "one-api/providers/base"
+	runtimesession "one-api/runtime/session"
 	"one-api/types"
-	"reflect"
-	"strings"
 )
 
 type OpenAIResponsesStreamHandler struct {
-	Usage     *types.Usage
-	Prefix    string
-	Model     string
-	MessageID string
+	Usage              *types.Usage
+	Prefix             string
+	Model              string
+	ProviderCredential string
+	ServiceTier        string
+	MessageID          string
 
-	searchType  string
-	toolIndex   int
-	hasToolCall bool
+	searchType         string
+	searchServiceType  string
+	imageTracker       commonresponses.ImageGenerationStreamTracker
+	toolBillingTracker commonresponses.ToolBillingStreamTracker
+	toolIndex          int
+	hasToolCall        bool
 }
 
 var (
-	responsesDataPrefix        = []byte("data:")
-	responsesDonePayload       = []byte("[DONE]")
-	responsesRequestJSONFields = collectJSONFieldNames(reflect.TypeOf(types.OpenAIResponsesRequest{}))
+	responsesDataPrefix  = []byte("data:")
+	responsesDonePayload = []byte("[DONE]")
+	// These fields determine proxy-owned lifecycle admission, ownership, and
+	// routing before the provider request is built. Channel transforms may tune
+	// provider parameters, but they cannot change those already-frozen facts.
+	responsesLifecycleFieldsOwnedByRelay = []string{
+		"background",
+		"conversation",
+		"previous_response_id",
+		"prompt",
+		"store",
+	}
 )
 
-func joinURLPath(basePath string, suffix string) string {
-	basePath = strings.TrimRight(basePath, "/")
-	suffix = strings.TrimLeft(suffix, "/")
-	if suffix == "" {
-		return basePath
+type responsesLifecycleFieldState struct {
+	present bool
+	value   json.RawMessage
+}
+
+func appendURLPathSegment(rawURL string, segment string) (string, error) {
+	parsed, err := providerendpoint.ParseResponsesURI(rawURL)
+	if err != nil {
+		return "", err
 	}
-	return basePath + "/" + suffix
+	if segment == "" {
+		return parsed.String(), nil
+	}
+	basePath := strings.TrimRight(parsed.Path, "/")
+	baseRawPath := strings.TrimRight(parsed.EscapedPath(), "/")
+	parsed.Path = basePath + "/" + segment
+	candidateRawPath := baseRawPath + "/" + url.PathEscape(segment)
+	parsed.RawPath = ""
+	if decoded, decodeErr := url.PathUnescape(candidateRawPath); decodeErr == nil && decoded == parsed.Path && candidateRawPath != parsed.Path {
+		parsed.RawPath = candidateRawPath
+	}
+	return parsed.String(), nil
+}
+
+func mergeURLRawQuery(rawURL string, additionalRawQuery string) (string, error) {
+	parsed, err := providerendpoint.ParseResponsesURI(rawURL)
+	if err != nil {
+		return "", err
+	}
+	additionalRawQuery = strings.TrimPrefix(strings.TrimSpace(additionalRawQuery), "?")
+	if additionalRawQuery == "" {
+		return parsed.String(), nil
+	}
+	if parsed.RawQuery == "" {
+		parsed.RawQuery = additionalRawQuery
+	} else {
+		parsed.RawQuery += "&" + additionalRawQuery
+	}
+	return parsed.String(), nil
+}
+
+func (p *OpenAIProvider) responsesRequestPath(rawReq *commonresponses.Request, basePath string, segments ...string) (string, error) {
+	requestPath := basePath
+	var err error
+	for _, segment := range segments {
+		requestPath, err = appendURLPathSegment(requestPath, segment)
+		if err != nil {
+			return "", err
+		}
+	}
+	if rawReq == nil {
+		return requestPath, nil
+	}
+	return mergeURLRawQuery(requestPath, rawReq.RawQuery)
 }
 
 func (p *OpenAIProvider) CreateResponses(ctx context.Context, rawReq *commonresponses.Request) (openaiResponse *types.OpenAIResponsesResponses, errWithCode *types.OpenAIErrorWithStatusCode) {
@@ -55,31 +122,39 @@ func (p *OpenAIProvider) CreateResponses(ctx context.Context, rawReq *commonresp
 	defer httpReq.Body.Close()
 
 	response := &types.OpenAIResponsesResponses{}
+	if p.ProviderRawJSONReplay {
+		response.EnableProviderRawJSONCapture()
+	}
 	// 发送请求
-	_, errWithCode = p.Requester.SendRequest(httpReq, response, false)
+	var httpResponse *http.Response
+	if p.preserveResponsesRedirect(rawReq) {
+		httpResponse, errWithCode = p.Requester.SendRequestPreservingRedirect(httpReq, response, false)
+	} else {
+		httpResponse, errWithCode = p.Requester.SendRequest(httpReq, response, false)
+	}
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
+	// Responses create is typed for compatible channels and may also cross into
+	// Chat; preserve representation headers only for exact raw replay.
+	p.captureProviderResponseHeaders(httpResponse, p.ProviderRawJSONReplay)
 
-	if response.Usage == nil || response.Usage.OutputTokens == 0 {
-		response.Usage = &types.ResponsesUsage{
-			InputTokens:  p.Usage.PromptTokens,
-			OutputTokens: 0,
-			TotalTokens:  0,
-		}
-		// // 那么需要计算
-		response.Usage.OutputTokens = common.CountTokenText(response.GetContent(), request.Model)
-		response.Usage.TotalTokens = response.Usage.InputTokens + response.Usage.OutputTokens
+	if response.Usage != nil {
+		response.Usage.MarkProviderReported()
+		*p.Usage = *response.Usage.ToOpenAIUsage()
 	}
-
-	*p.Usage = *response.Usage.ToOpenAIUsage()
+	p.Usage.ResponseModel = response.Model
+	p.Usage.ServiceTier = response.ServiceTier
 
 	getResponsesExtraBilling(response, p.Usage)
+	if p.ProviderRawJSONReplay {
+		response.EnableProviderRawJSONReplay()
+	}
 
 	return response, nil
 }
 
-func (p *OpenAIProvider) CreateResponsesStream(ctx context.Context, rawReq *commonresponses.Request) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+func (p *OpenAIProvider) CreateResponsesStream(ctx context.Context, rawReq *commonresponses.Request) (commonresponses.EventStream, *types.OpenAIErrorWithStatusCode) {
 	request := responsesRequestProjection(rawReq)
 	req, errWithCode := p.buildResponsesCreateRequest(rawReq, request, true)
 	if errWithCode != nil {
@@ -91,82 +166,6 @@ func (p *OpenAIProvider) CreateResponsesStream(ctx context.Context, rawReq *comm
 	defer req.Body.Close()
 
 	return p.createResponsesStreamFromRequest(req, request)
-}
-
-func (p *OpenAIProvider) CreateResponsesStreamRaw(ctx context.Context, model string, body map[string]json.RawMessage, request *types.OpenAIResponsesRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
-	fullRequestURL, errWithCode := p.responsesHTTPBridgeRequestURL(model)
-	if errWithCode != nil {
-		return nil, errWithCode
-	}
-	if err := p.validateResponsesWSHTTPBridgeURL(ctx, fullRequestURL); err != nil {
-		return nil, common.StringErrorWrapperLocal(err.Error(), "ws_request_failed", requester.UpstreamResponsesHTTPURLStatusCode(err))
-	}
-	headers := p.requestHeaders(openAIRequestAuthBearer)
-	req, errWithCode := p.buildResponsesHTTPBridgeRequest(body, fullRequestURL, headers, model)
-	if errWithCode != nil {
-		return nil, markHTTPBridgePreSendLocalError(errWithCode)
-	}
-	if ctx != nil {
-		req = p.Requester.WithRequestContext(req, ctx)
-	}
-	defer req.Body.Close()
-
-	stream, errWithCode := p.createResponsesHTTPBridgeStreamFromRequestWithOptions(req, request, responsesHTTPBridgeStreamReadOptions())
-	if errWithCode != nil {
-		return nil, responsesws.MarkHTTPBridgeTransportError(errWithCode)
-	}
-	return stream, nil
-}
-
-func markHTTPBridgePreSendLocalError(errWithStatus *types.OpenAIErrorWithStatusCode) *types.OpenAIErrorWithStatusCode {
-	if errWithStatus != nil {
-		errWithStatus.LocalError = true
-	}
-	return errWithStatus
-}
-
-func (p *OpenAIProvider) responsesHTTPBridgeRequestURL(model string) (string, *types.OpenAIErrorWithStatusCode) {
-	url, errWithCode := p.GetSupportedAPIUri(config.RelayModeResponses)
-	if errWithCode != nil {
-		return "", errWithCode
-	}
-	if errWithCode := p.validateAzureClassicAPIVersionForRequest(); errWithCode != nil {
-		return "", errWithCode
-	}
-	return p.GetFullRequestURL(url, model), nil
-}
-
-func responsesHTTPBridgeStreamReadOptions() requester.StreamReadOptions {
-	return requester.StreamReadOptions{MaxLineBytes: config.RealtimeWebsocketReadLimit()}
-}
-
-func (p *OpenAIProvider) buildResponsesHTTPBridgeRequest(body map[string]json.RawMessage, fullRequestURL string, headers map[string]string, model string) (*http.Request, *types.OpenAIErrorWithStatusCode) {
-	requestMap, err := rawMessageBodyToInterfaceMap(body)
-	if err != nil {
-		return nil, common.ErrorWrapper(err, "decode_request_failed", http.StatusInternalServerError)
-	}
-	if requestMap == nil {
-		requestMap = make(map[string]interface{})
-	}
-	customParams, err := p.CustomParameterHandler()
-	if err != nil {
-		return nil, common.ErrorWrapper(err, "custom_parameter_error", http.StatusInternalServerError)
-	}
-	if customParams != nil {
-		requestMap = p.MergeCustomParams(requestMap, customParams, model)
-	}
-	if err := responsesws.NormalizeResponsesHTTPBridgeRequestMap(requestMap); err != nil {
-		return nil, common.StringErrorWrapperLocal(err.Error(), "unsupported_responses_ws_bridge_field", http.StatusBadRequest)
-	}
-	requestBytes, err := json.Marshal(requestMap)
-	if err != nil {
-		return nil, common.ErrorWrapper(err, "marshal_request_failed", http.StatusInternalServerError)
-	}
-	req, err := p.Requester.NewRequest(http.MethodPost, fullRequestURL, p.Requester.WithBody(requestBytes), p.Requester.WithHeader(headers))
-	if err != nil {
-		return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
-	}
-	return req, nil
 }
 
 func rawMessageBodyToInterfaceMap(body map[string]json.RawMessage) (map[string]interface{}, error) {
@@ -186,52 +185,39 @@ func rawMessageBodyToInterfaceMap(body map[string]json.RawMessage) (map[string]i
 	return converted, nil
 }
 
-func (p *OpenAIProvider) createResponsesStreamFromRequest(req *http.Request, request *types.OpenAIResponsesRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+func (p *OpenAIProvider) createResponsesStreamFromRequest(req *http.Request, request *types.OpenAIResponsesRequest) (commonresponses.EventStream, *types.OpenAIErrorWithStatusCode) {
 	return p.createResponsesStreamFromRequestWithOptions(req, request, requester.StreamReadOptions{})
 }
 
-func (p *OpenAIProvider) createResponsesStreamFromRequestWithOptions(req *http.Request, request *types.OpenAIResponsesRequest, options requester.StreamReadOptions) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+func (p *OpenAIProvider) createResponsesStreamFromRequestWithOptions(req *http.Request, request *types.OpenAIResponsesRequest, options requester.StreamReadOptions) (commonresponses.EventStream, *types.OpenAIErrorWithStatusCode) {
 	// 发送请求
-	resp, errWithCode := p.Requester.SendRequestRaw(req)
+	streamRequester := p.Requester.ForHTTPProfile(requester.HTTPProfileLongStream)
+	resp, errWithCode := streamRequester.SendRequestRaw(req)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
+	p.captureProviderResponseHeaders(resp)
 
 	chatHandler := OpenAIResponsesStreamHandler{
-		Usage:  p.Usage,
-		Prefix: `data: `,
-		Model:  request.Model,
+		Usage:              p.Usage,
+		Prefix:             `data: `,
+		Model:              request.Model,
+		ProviderCredential: p.Channel.Key,
 	}
 
 	if request.ConvertChat {
-		return requester.RequestStreamWithOptions(p.Requester, resp, chatHandler.HandlerChatStream, options)
+		options.RequireProtocolTerminal = true
+		stream, apiErr := requester.RequestNoTrimStreamWithOptions(streamRequester, resp, chatHandler.ChatSSEHandler(chatHandler.ObserveAcceptedResponsesEvent), options)
+		return commonresponses.NewEventStream(stream, commonresponses.IgnoreAcceptedResponsesEvent), apiErr
 	}
 
-	return requester.RequestNoTrimStreamWithEmitterOptions(p.Requester, resp, chatHandler.HandlerResponsesStreamWithEmitter, options)
-}
-
-func (p *OpenAIProvider) createResponsesHTTPBridgeStreamFromRequestWithOptions(req *http.Request, request *types.OpenAIResponsesRequest, options requester.StreamReadOptions) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
-	resp, errWithCode := p.Requester.SendResponsesHTTPBridgeRaw(req, p.responsesHTTPBridgeSecurity())
-	if errWithCode != nil {
-		return nil, errWithCode
-	}
-
-	chatHandler := OpenAIResponsesStreamHandler{
-		Usage:  p.Usage,
-		Prefix: `data: `,
-		Model:  request.Model,
-	}
-
-	if request.ConvertChat {
-		return requester.RequestStreamWithOptions(p.Requester, resp, chatHandler.HandlerChatStream, options)
-	}
-
-	return requester.RequestNoTrimStreamWithEmitterOptions(p.Requester, resp, chatHandler.HandlerResponsesStreamWithEmitter, options)
+	stream, apiErr := requester.RequestNoTrimStreamWithEmitterOptions(streamRequester, resp, chatHandler.HandlerResponsesStreamWithEmitter, options)
+	return commonresponses.NewEventStream(stream, chatHandler.ObserveAcceptedResponsesEvent), apiErr
 }
 
 func (p *OpenAIProvider) CompactResponses(ctx context.Context, rawReq *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
 	request := responsesRequestProjection(rawReq)
-	req, errWithCode := p.buildCompactResponsesRequest(request)
+	req, errWithCode := p.buildCompactResponsesRequest(rawReq, request)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -241,25 +227,149 @@ func (p *OpenAIProvider) CompactResponses(ctx context.Context, rawReq *commonres
 	defer req.Body.Close()
 
 	response := &types.OpenAIResponsesResponses{}
-	_, errWithCode = p.Requester.SendRequest(req, response, false)
+	if p.ProviderRawJSONReplay {
+		response.EnableProviderRawJSONCapture()
+	}
+	var httpResponse *http.Response
+	if p.preserveResponsesRedirect(rawReq) {
+		httpResponse, errWithCode = p.Requester.SendRequestPreservingRedirect(req, response, false)
+	} else {
+		httpResponse, errWithCode = p.Requester.SendRequest(req, response, false)
+	}
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
+	// Compact follows the same typed/rewritten response path as create.
+	p.captureProviderResponseHeaders(httpResponse, p.ProviderRawJSONReplay)
 
-	if response.Usage == nil || response.Usage.OutputTokens == 0 {
-		response.Usage = &types.ResponsesUsage{
-			InputTokens:  p.Usage.PromptTokens,
-			OutputTokens: 0,
-			TotalTokens:  0,
-		}
-		response.Usage.OutputTokens = common.CountTokenText(response.GetContent(), request.Model)
-		response.Usage.TotalTokens = response.Usage.InputTokens + response.Usage.OutputTokens
+	if response.Usage != nil {
+		response.Usage.MarkProviderReported()
+		*p.Usage = *response.Usage.ToOpenAIUsage()
+	}
+	p.Usage.ResponseModel = response.Model
+	p.Usage.ServiceTier = response.ServiceTier
+	getResponsesExtraBilling(response, p.Usage)
+	if p.ProviderRawJSONReplay {
+		response.EnableProviderRawJSONReplay()
 	}
 
-	*p.Usage = *response.Usage.ToOpenAIUsage()
-	getResponsesExtraBilling(response, p.Usage)
-
 	return response, nil
+}
+
+func (p *OpenAIProvider) CountResponsesInputTokens(ctx context.Context, rawReq *commonresponses.Request) (*http.Response, *types.OpenAIErrorWithStatusCode) {
+	request := responsesRequestProjection(rawReq)
+	basePath, errWithCode := p.GetSupportedAPIUri(config.RelayModeResponses)
+	if errWithCode != nil {
+		return nil, errWithCode
+	}
+	if errWithCode := p.validateAzureClassicAPIVersionForRequest(); errWithCode != nil {
+		return nil, errWithCode
+	}
+	body, errWithCode := p.buildResponsesCreateBody(rawReq, request, false)
+	if errWithCode != nil {
+		return nil, errWithCode
+	}
+	requestPath, err := p.responsesRequestPath(rawReq, basePath, "input_tokens")
+	if err != nil {
+		return nil, common.ErrorWrapperLocal(err, "invalid_channel_config", http.StatusInternalServerError)
+	}
+	fullRequestURL := p.GetFullRequestURL(requestPath, request.Model)
+	headers := p.GetRequestHeaders()
+	httpReq, err := p.Requester.NewRequest(http.MethodPost, fullRequestURL, p.Requester.WithBody(body), p.Requester.WithHeader(headers))
+	if err != nil {
+		return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
+	}
+	if rawReq != nil {
+		if err := p.applyOpenAIHTTPHeaders(httpReq.Header, rawReq.Headers); err != nil {
+			return nil, common.ErrorWrapperLocal(err, "invalid_request_header", http.StatusBadRequest)
+		}
+	}
+	if ctx != nil {
+		httpReq = p.Requester.WithRequestContext(httpReq, ctx)
+	}
+	if httpReq.Body != nil {
+		defer httpReq.Body.Close()
+	}
+	var response *http.Response
+	if p.ProviderRawJSONReplay {
+		response, errWithCode = p.Requester.SendRequestRawCheckedPreservingRedirect(httpReq, providerresponse.OperationResponsesInputTokens)
+	} else {
+		response, errWithCode = p.Requester.SendRequestRaw(httpReq)
+	}
+	if errWithCode == nil {
+		p.captureProviderResponseHeaders(response)
+	}
+	return response, errWithCode
+}
+
+func (p *OpenAIProvider) RelayStoredResponse(ctx context.Context, input providersBase.StoredResponsesRequest) (*http.Response, *types.OpenAIErrorWithStatusCode) {
+	responseID := strings.TrimSpace(input.ResponseID)
+	if responseID == "" {
+		return nil, common.StringErrorWrapperLocal("response id is required", "invalid_request_error", http.StatusBadRequest)
+	}
+	basePath, errWithCode := p.GetSupportedAPIUri(config.RelayModeResponses)
+	if errWithCode != nil {
+		return nil, errWithCode
+	}
+	if errWithCode := p.validateAzureClassicAPIVersionForRequest(); errWithCode != nil {
+		return nil, errWithCode
+	}
+
+	method := ""
+	requestPath, err := appendURLPathSegment(basePath, responseID)
+	if err != nil {
+		return nil, common.ErrorWrapperLocal(err, "invalid_channel_config", http.StatusInternalServerError)
+	}
+	switch input.Operation {
+	case providersBase.OperationResponsesRetrieve:
+		method = http.MethodGet
+	case providersBase.OperationResponsesDelete:
+		method = http.MethodDelete
+	case providersBase.OperationResponsesInputItems:
+		method = http.MethodGet
+		requestPath, err = appendURLPathSegment(requestPath, "input_items")
+		if err != nil {
+			return nil, common.ErrorWrapperLocal(err, "invalid_channel_config", http.StatusInternalServerError)
+		}
+	default:
+		return nil, common.StringErrorWrapperLocal("stored responses operation is unsupported", "invalid_request_error", http.StatusBadRequest)
+	}
+	requestPath, err = mergeURLRawQuery(requestPath, input.RawQuery)
+	if err != nil {
+		return nil, common.ErrorWrapperLocal(err, "invalid_channel_config", http.StatusInternalServerError)
+	}
+
+	headers := p.GetRequestHeaders()
+	requestURL := p.GetFullRequestURL(requestPath, "")
+	httpReq, err := p.Requester.NewRequest(method, requestURL, p.Requester.WithHeader(headers))
+	if err != nil {
+		return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
+	}
+	if err := p.applyOpenAIHTTPHeaders(httpReq.Header, input.Headers); err != nil {
+		return nil, common.ErrorWrapperLocal(err, "invalid_request_header", http.StatusBadRequest)
+	}
+	if input.Operation == providersBase.OperationResponsesRetrieve || input.Operation == providersBase.OperationResponsesInputItems {
+		if err := applyResponsesConditionalReadHeaders(httpReq.Header, input.Headers); err != nil {
+			return nil, common.ErrorWrapperLocal(err, "invalid_request_header", http.StatusBadRequest)
+		}
+	}
+	if ctx != nil {
+		httpReq = p.Requester.WithRequestContext(httpReq, ctx)
+	}
+	var response *http.Response
+	if p.ProviderRawJSONReplay {
+		response, errWithCode = p.Requester.SendRequestRawCheckedPreservingRedirect(httpReq, input.Operation)
+	} else {
+		response, errWithCode = p.Requester.SendRequestRawCheckedNoRedirect(httpReq)
+	}
+	if response != nil {
+		p.captureProviderResponseHeaders(response)
+	}
+	return response, errWithCode
+}
+
+func (p *OpenAIProvider) preserveResponsesRedirect(req *commonresponses.Request) bool {
+	return p != nil && p.ProviderRawJSONReplay && req != nil && req.Control.DownstreamDialect == commonresponses.DownstreamResponses
 }
 
 func responsesRequestProjection(req *commonresponses.Request) *types.OpenAIResponsesRequest {
@@ -278,7 +388,11 @@ func (p *OpenAIProvider) buildResponsesCreateRequest(rawReq *commonresponses.Req
 		return nil, errWithCode
 	}
 
-	fullRequestURL := p.GetFullRequestURL(basePath, request.Model)
+	requestPath, err := p.responsesRequestPath(rawReq, basePath)
+	if err != nil {
+		return nil, common.ErrorWrapperLocal(err, "invalid_channel_config", http.StatusInternalServerError)
+	}
+	fullRequestURL := p.GetFullRequestURL(requestPath, request.Model)
 	headers := p.GetRequestHeaders()
 
 	bodyMap, errWithCode := p.buildResponsesCreateBody(rawReq, request, stream)
@@ -289,6 +403,11 @@ func (p *OpenAIProvider) buildResponsesCreateRequest(rawReq *commonresponses.Req
 	req, err := p.Requester.NewRequest(http.MethodPost, fullRequestURL, p.Requester.WithBody(bodyMap), p.Requester.WithHeader(headers))
 	if err != nil {
 		return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
+	}
+	if rawReq != nil {
+		if err := p.applyOpenAIHTTPHeaders(req.Header, rawReq.Headers); err != nil {
+			return nil, common.ErrorWrapperLocal(err, "invalid_request_header", http.StatusBadRequest)
+		}
 	}
 	return req, nil
 }
@@ -313,7 +432,17 @@ func (p *OpenAIProvider) buildResponsesCreateBody(rawReq *commonresponses.Reques
 		return nil, common.ErrorWrapper(err, "custom_parameter_error", http.StatusInternalServerError)
 	}
 	if customParams != nil {
-		bodyMap = providersBase.ApplyCustomParams(bodyMap, customParams, request.Model, true)
+		var field string
+		var changed bool
+		inputTokens := rawReq != nil && rawReq.Operation == commonresponses.ResponsesInputTokens
+		applyPreAdd := rawReq == nil || rawReq.Control.DownstreamDialect != commonresponses.DownstreamChatCompletions
+		bodyMap, field, changed, err = applyResponsesCustomParameters(bodyMap, customParams, request.Model, inputTokens, applyPreAdd)
+		if err != nil {
+			return nil, common.ErrorWrapper(err, "custom_parameter_error", http.StatusInternalServerError)
+		}
+		if changed {
+			return nil, responsesLifecycleCustomParameterError(field)
+		}
 	}
 	if model := strings.TrimSpace(request.Model); model != "" {
 		bodyMap["model"] = model
@@ -321,7 +450,111 @@ func (p *OpenAIProvider) buildResponsesCreateBody(rawReq *commonresponses.Reques
 	if stream {
 		bodyMap["stream"] = true
 	}
+	if err := commonresponses.ValidateNoAccountScopedResources(bodyMap); err != nil {
+		return nil, common.StringErrorWrapperLocal(err.Error(), "unsupported_resource_reference", http.StatusBadRequest)
+	}
 	return bodyMap, nil
+}
+
+func applyResponsesCustomParameters(bodyMap map[string]interface{}, customParams map[string]interface{}, modelName string, inputTokens, applyPreAdd bool) (map[string]interface{}, string, bool, error) {
+	lifecycleFields := responsesLifecycleFieldsOwnedByRelay
+	if inputTokens {
+		lifecycleFields = []string{"previous_response_id"}
+	}
+	lifecycleBefore, err := snapshotResponsesLifecycleFields(bodyMap, lifecycleFields)
+	if err != nil {
+		return nil, "", false, err
+	}
+	bodyMap = providersBase.ApplyCustomParams(bodyMap, customParams, modelName, applyPreAdd)
+	field, changed, err := changedResponsesLifecycleField(lifecycleBefore, bodyMap, lifecycleFields)
+	return bodyMap, field, changed, err
+}
+
+// ValidateResponsesCustomParameterCompatibility performs the same lifecycle
+// freeze used by request construction, but on a disposable body projection so
+// routing can skip an incompatible candidate before provider work.
+func ValidateResponsesCustomParameterCompatibility(channel *model.Channel, fields map[string]json.RawMessage, modelName string, operation providerresponse.Operation, applyPreAdd bool) error {
+	if channel == nil {
+		return nil
+	}
+	customParams, err := channel.GetCustomParameterMap()
+	if err != nil {
+		return &providersBase.RequestCapabilityError{Param: "custom_parameter", Message: "channel custom parameters are invalid"}
+	}
+	if len(customParams) == 0 {
+		return nil
+	}
+	bodyMap, err := rawMessageBodyToInterfaceMap(fields)
+	if err != nil {
+		return &providersBase.RequestCapabilityError{Param: "request", Message: "request cannot be checked against channel custom parameters"}
+	}
+	if bodyMap == nil {
+		bodyMap = make(map[string]interface{})
+	}
+	var field string
+	var changed bool
+	bodyMap, field, changed, err = applyResponsesCustomParameters(bodyMap, customParams, modelName, operation == providerresponse.OperationResponsesInputTokens, applyPreAdd)
+	if err != nil {
+		return &providersBase.RequestCapabilityError{Param: "custom_parameter", Message: "channel custom parameters cannot be evaluated"}
+	}
+	if changed {
+		return &providersBase.RequestCapabilityError{Param: field, Message: "channel custom parameters cannot modify Responses lifecycle fields"}
+	}
+	if err := commonresponses.ValidateNoAccountScopedResources(bodyMap); err != nil {
+		return &providersBase.RequestCapabilityError{Param: "custom_parameter", Message: err.Error()}
+	}
+	return nil
+}
+
+func snapshotResponsesLifecycleFields(body map[string]interface{}, lifecycleFields []string) (map[string]responsesLifecycleFieldState, error) {
+	snapshot := make(map[string]responsesLifecycleFieldState, len(lifecycleFields))
+	for _, field := range lifecycleFields {
+		value, present := body[field]
+		state := responsesLifecycleFieldState{present: present}
+		if present {
+			encoded, err := json.Marshal(value)
+			if err != nil {
+				return nil, err
+			}
+			state.value = encoded
+		}
+		snapshot[field] = state
+	}
+	return snapshot, nil
+}
+
+func changedResponsesLifecycleField(before map[string]responsesLifecycleFieldState, body map[string]interface{}, lifecycleFields []string) (string, bool, error) {
+	for _, field := range lifecycleFields {
+		prior := before[field]
+		value, present := body[field]
+		if prior.present != present {
+			return field, true, nil
+		}
+		if !present {
+			continue
+		}
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return "", false, err
+		}
+		if !bytes.Equal(prior.value, encoded) {
+			return field, true, nil
+		}
+	}
+	return "", false, nil
+}
+
+func responsesLifecycleCustomParameterError(field string) *types.OpenAIErrorWithStatusCode {
+	return &types.OpenAIErrorWithStatusCode{
+		OpenAIError: types.OpenAIError{
+			Message: "channel custom parameters cannot modify Responses lifecycle fields",
+			Type:    "channel_error",
+			Param:   field,
+			Code:    "responses_lifecycle_custom_parameter_conflict",
+		},
+		StatusCode: http.StatusServiceUnavailable,
+		LocalError: true,
+	}
 }
 
 func rawResponsesBodyMap(req *commonresponses.Request) (map[string]interface{}, error) {
@@ -331,7 +564,7 @@ func rawResponsesBodyMap(req *commonresponses.Request) (map[string]interface{}, 
 	return rawMessageBodyToInterfaceMap(req.Body.Object.Fields)
 }
 
-func (p *OpenAIProvider) buildCompactResponsesRequest(request *types.OpenAIResponsesRequest) (*http.Request, *types.OpenAIErrorWithStatusCode) {
+func (p *OpenAIProvider) buildCompactResponsesRequest(rawReq *commonresponses.Request, request *types.OpenAIResponsesRequest) (*http.Request, *types.OpenAIErrorWithStatusCode) {
 	basePath, errWithCode := p.GetSupportedAPIUri(config.RelayModeResponses)
 	if errWithCode != nil {
 		return nil, errWithCode
@@ -340,10 +573,14 @@ func (p *OpenAIProvider) buildCompactResponsesRequest(request *types.OpenAIRespo
 		return nil, errWithCode
 	}
 
-	fullRequestURL := p.GetFullRequestURL(joinURLPath(basePath, "compact"), request.Model)
+	requestPath, err := p.responsesRequestPath(rawReq, basePath, "compact")
+	if err != nil {
+		return nil, common.ErrorWrapperLocal(err, "invalid_channel_config", http.StatusInternalServerError)
+	}
+	fullRequestURL := p.GetFullRequestURL(requestPath, request.Model)
 	headers := p.GetRequestHeaders()
 
-	bodyMap, errWithCode := p.buildCompactRequestBody(request)
+	bodyMap, errWithCode := p.buildResponsesCreateBody(rawReq, request, false)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -352,161 +589,100 @@ func (p *OpenAIProvider) buildCompactResponsesRequest(request *types.OpenAIRespo
 	if err != nil {
 		return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
 	}
+	if rawReq != nil {
+		if err := p.applyOpenAIHTTPHeaders(req.Header, rawReq.Headers); err != nil {
+			return nil, common.ErrorWrapperLocal(err, "invalid_request_header", http.StatusBadRequest)
+		}
+	}
 
 	return req, nil
 }
 
-func (p *OpenAIProvider) buildCompactRequestBody(request *types.OpenAIResponsesRequest) (map[string]interface{}, *types.OpenAIErrorWithStatusCode) {
-	// Trade-off: `/responses/compact` has a materially narrower structured
-	// request schema than ordinary `/responses`. Start from the documented
-	// compact-safe fields only, then reattach unknown extra-body fields and let
-	// `custom_parameter` override last. This keeps normal typed request fields
-	// like `store`/`include` from leaking into compact while preserving operator
-	// passthrough semantics for intentionally-added custom keys.
-	bodyMap := make(map[string]interface{}, 6)
-	bodyMap["model"] = request.Model
-	if request.Input != nil {
-		bodyMap["input"] = request.Input
-	}
-	if request.Instructions != "" {
-		bodyMap["instructions"] = request.Instructions
-	}
-	if request.PreviousResponseID != "" {
-		bodyMap["previous_response_id"] = request.PreviousResponseID
-	}
-	if request.PromptCacheKey != "" {
-		bodyMap["prompt_cache_key"] = request.PromptCacheKey
-	}
-	if request.PromptCacheRetention != "" {
-		bodyMap["prompt_cache_retention"] = request.PromptCacheRetention
-	}
-
-	if p.Channel.AllowExtraBody {
-		rawMap, ok, err := p.GetRawBodyMap()
-		if err != nil {
-			return nil, common.ErrorWrapper(err, "unmarshal_request_failed", http.StatusInternalServerError)
-		}
-		if ok && rawMap != nil {
-			for key, value := range rawMap {
-				if responsesRequestJSONFields[key] {
-					continue
-				}
-				bodyMap[key] = value
-			}
-		}
-	}
-
-	customParams, err := p.CustomParameterHandler()
-	if err != nil {
-		return nil, common.ErrorWrapper(err, "custom_parameter_error", http.StatusInternalServerError)
-	}
-	if customParams != nil {
-		bodyMap = providersBase.ApplyCustomParams(bodyMap, customParams, request.Model, true)
-	}
-
-	return bodyMap, nil
-}
-
-func collectJSONFieldNames(t reflect.Type) map[string]bool {
-	fields := make(map[string]bool)
-	if t.Kind() == reflect.Pointer {
-		t = t.Elem()
-	}
-	if t.Kind() != reflect.Struct {
-		return fields
-	}
-
-	for i := 0; i < t.NumField(); i++ {
-		field := t.Field(i)
-		if field.PkgPath != "" && !field.Anonymous {
-			continue
-		}
-
-		tag := strings.TrimSpace(field.Tag.Get("json"))
-		name := field.Name
-		if tag != "" {
-			parts := strings.Split(tag, ",")
-			switch parts[0] {
-			case "-":
-				continue
-			case "":
-			default:
-				name = parts[0]
-			}
-		}
-
-		if field.Anonymous && (tag == "" || tag == ",omitempty") {
-			for nested := range collectJSONFieldNames(field.Type) {
-				fields[nested] = true
-			}
-			continue
-		}
-
-		fields[name] = true
-	}
-
-	return fields
-}
-
-func (h *OpenAIResponsesStreamHandler) HandlerResponsesStream(rawLine *[]byte, dataChan chan string, errChan chan error) {
-	h.handleResponsesStream(rawLine, func(data string) bool {
-		dataChan <- data
-		return true
-	})
-}
-
 func (h *OpenAIResponsesStreamHandler) HandlerResponsesStreamWithEmitter(rawLine *[]byte, emitter requester.StreamEmitter[string]) {
-	h.handleResponsesStream(rawLine, emitter.SendData)
+	emitter.SendData(h.safeProviderEvent(string(*rawLine)))
 }
 
-func (h *OpenAIResponsesStreamHandler) handleResponsesStream(rawLine *[]byte, sendData func(string) bool) {
-	rawStr := string(*rawLine)
-
-	// 如果rawLine 前缀不为data:，则直接返回
-	if !strings.HasPrefix(rawStr, h.Prefix) {
-		sendData(rawStr)
-		return
+func (h *OpenAIResponsesStreamHandler) ObserveAcceptedResponsesEvent(rawEvent string) error {
+	if err := h.observeAcceptedResponsesEvent(rawEvent); err != nil {
+		return responsesUsageTrackingError(err)
 	}
+	return nil
+}
 
-	noSpaceLine := bytes.TrimSpace(*rawLine)
-	if !bytes.HasPrefix(noSpaceLine, responsesDataPrefix) {
-		sendData(rawStr)
-		return
-	}
-
-	payload := bytes.TrimSpace(noSpaceLine[len(responsesDataPrefix):])
-
-	if len(payload) == 0 || bytes.Equal(payload, responsesDonePayload) {
-		sendData(rawStr)
-		return
-	}
-
-	openaiResponse, ok := commonresponses.ParseStreamUsageEvent(payload)
+func (h *OpenAIResponsesStreamHandler) observeAcceptedResponsesEvent(rawEvent string) error {
+	payload, ok := commonresponses.SSEDataPayload(rawEvent)
 	if !ok {
-		// Usage tracking should not break stream passthrough.
-		sendData(rawStr)
-		return
+		return nil
+	}
+	payload = strings.TrimSpace(payload)
+	if payload == "" || payload == string(responsesDonePayload) {
+		return nil
 	}
 
+	openaiResponse, ok := commonresponses.ParseStreamUsageEvent([]byte(payload))
+	if !ok {
+		return nil
+	}
+	serviceType, searchType := commonresponses.ResponsesSearchBilling(openaiResponse.Response)
+	if openaiResponse.Type == "response.created" && serviceType != "" {
+		if err := commonresponses.ValidateResponsesStreamToolBillingDimensions(serviceType, searchType); err != nil {
+			return err
+		}
+	}
+	candidateImage := h.imageTracker
+	if err := candidateImage.ObserveUsageEvent(openaiResponse); err != nil {
+		return err
+	}
 	switch openaiResponse.Type {
 	case "response.created":
-		if searchType := commonresponses.ResponsesSearchType(openaiResponse.Response); searchType != "" {
-			h.searchType = searchType
+		if h.Usage != nil && openaiResponse.Response != nil {
+			h.Usage.ResponseModel = openaiResponse.Response.Model
+			h.Usage.ServiceTier = openaiResponse.Response.ServiceTier
 		}
-	case "response.output_text.delta", "response.reasoning_summary_text.delta":
-		if h.Usage != nil {
-			delta, ok := commonresponses.StreamEventDeltaString(openaiResponse.Delta)
-			if ok {
-				h.Usage.TextBuilder.WriteString(delta)
-			}
+		if serviceType != "" {
+			h.searchServiceType = strings.Clone(serviceType)
+			h.searchType = strings.Clone(searchType)
 		}
-	case "response.output_item.added":
-		commonresponses.ApplyResponsesOutputItemBilling(h.Usage, openaiResponse.Item, h.searchType)
+	case "response.output_item.added", "response.output_item.done":
+		if err := commonresponses.ApplyResponsesStreamOutputItemBillingWithToolTracker(h.Usage, openaiResponse.Type, openaiResponse.Item, openaiResponse.ItemID, openaiResponse.OutputIndex, h.searchServiceType, h.searchType, &h.toolBillingTracker); err != nil {
+			return err
+		}
 	default:
-		commonresponses.ApplyResponsesUsage(h.Usage, openaiResponse.Response)
+		// This observer is the provider-owned acceptance boundary for Responses
+		// stream usage. Decode presence alone is not billing authority; only usage
+		// carried by an accepted terminal response is marked before the shared
+		// projection copies its fields into the attempt-local Usage. Partial image
+		// events may carry a response snapshot for tracker context, but they are
+		// not a token terminal and cannot authorize token billing.
+		terminalUsageEvent := openaiResponse.Type == "response.completed" || openaiResponse.Type == "response.failed" || openaiResponse.Type == "response.incomplete"
+		if terminalUsageEvent && openaiResponse.Response != nil && openaiResponse.Response.Usage != nil {
+			openaiResponse.Response.Usage.MarkProviderReported()
+		}
+		commonresponses.ApplyResponsesUsageWithImageTracker(h.Usage, openaiResponse.Response, &candidateImage)
 	}
+	h.imageTracker = candidateImage
+	return nil
+}
 
-	sendData(rawStr)
+func responsesUsageTrackingError(err error) error {
+	return common.ErrorWrapperLocal(err, commonresponses.ResponsesStreamTrackingFailureCode(err), http.StatusBadGateway)
+}
+
+func (h *OpenAIResponsesStreamHandler) safeProviderEvent(event string) string {
+	safe, _ := common.RedactCredentialValuesText(event, h.ProviderCredential)
+	return safe
+}
+
+func (h *OpenAIResponsesStreamHandler) sseDataPayload(rawLine []byte) ([]byte, bool) {
+	prefix := []byte(strings.TrimSpace(h.Prefix))
+	if len(prefix) == 0 {
+		prefix = responsesDataPrefix
+	}
+	line := bytes.TrimSpace(rawLine)
+	if !bytes.HasPrefix(line, prefix) {
+		return nil, false
+	}
+	return bytes.TrimSpace(line[len(prefix):]), true
 }
 
 func openAIStreamDeltaString(delta any) (string, bool) {
@@ -514,33 +690,94 @@ func openAIStreamDeltaString(delta any) (string, bool) {
 	return text, ok
 }
 
-func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataChan chan string, errChan chan error) {
-	// 如果rawLine 前缀不为data:，则直接返回
-	if !strings.HasPrefix(string(*rawLine), h.Prefix) {
+func (h *OpenAIResponsesStreamHandler) ChatSSEHandler(observe func(string) error) requester.HandlerPrefix[string] {
+	framer := commonresponses.NewSSEChunkFramer(16 << 20)
+	observer := commonresponses.NewStreamObserver()
+	return func(rawLine *[]byte, dataChan chan string, errChan chan error) {
+		stop, err := framer.PushChunk(string(*rawLine), func(event string) (bool, error) {
+			payload, ok := commonresponses.SSEDataPayload(event)
+			if !ok || strings.TrimSpace(payload) == "" || strings.TrimSpace(payload) == "[DONE]" {
+				return false, nil
+			}
+			line := []byte("data: " + payload)
+			h.handleChatStream(&line, dataChan, errChan, func() (bool, error) {
+				err := observer.AcceptRawEvent(event, func() error { return observe(event) })
+				return !observer.ProviderRejected(), err
+			})
+			return bytes.Equal(line, requester.StreamClosed), nil
+		})
+		if err != nil {
+			errChan <- responsesUsageTrackingError(err)
+		}
+		if stop || err != nil {
+			*rawLine = requester.StreamClosed
+		}
+	}
+}
+
+func (h *OpenAIResponsesStreamHandler) handleChatStream(rawLine *[]byte, dataChan chan string, errChan chan error, accept func() (bool, error)) {
+	payload, ok := h.sseDataPayload(*rawLine)
+	if !ok || len(payload) == 0 || bytes.Equal(payload, responsesDonePayload) {
 		*rawLine = nil
 		return
 	}
-
-	// 去除前缀
-	*rawLine = (*rawLine)[6:]
+	if safe, changed := common.RedactCredentialValuesText(string(payload), h.ProviderCredential); changed {
+		payload = []byte(safe)
+	}
+	*rawLine = payload
 
 	var openaiResponse types.OpenAIResponsesStreamResponses
 	err := json.Unmarshal(*rawLine, &openaiResponse)
 	if err != nil {
+		*rawLine = requester.StreamClosed
 		errChan <- common.ErrorToOpenAIError(err)
 		return
 	}
+	providerAccepted, err := accept()
+	if err != nil {
+		*rawLine = requester.StreamClosed
+		var apiErr *types.OpenAIErrorWithStatusCode
+		if errors.As(err, &apiErr) && apiErr != nil {
+			failure := *apiErr
+			failure.UpstreamAccepted = true
+			errChan <- &failure
+		} else {
+			failure := common.ErrorWrapperLocal(err, "invalid_provider_response", http.StatusBadGateway)
+			failure.UpstreamAccepted = true
+			errChan <- failure
+		}
+		return
+	}
+	if openaiResponse.Response != nil {
+		if modelName := strings.TrimSpace(openaiResponse.Response.Model); modelName != "" {
+			h.Model = modelName
+		}
+		if serviceTier := strings.TrimSpace(openaiResponse.Response.ServiceTier); serviceTier != "" {
+			h.ServiceTier = serviceTier
+		}
+	}
 
 	chatRes := types.ChatCompletionStreamResponse{
-		ID:      h.MessageID,
-		Object:  "chat.completion.chunk",
-		Created: utils.GetTimestamp(),
-		Model:   h.Model,
-		Choices: make([]types.ChatCompletionStreamChoice, 0),
+		ID:          h.MessageID,
+		Object:      "chat.completion.chunk",
+		Created:     utils.GetTimestamp(),
+		Model:       h.Model,
+		ServiceTier: h.ServiceTier,
+		Choices:     make([]types.ChatCompletionStreamChoice, 0),
 	}
 	needOutput := false
+	terminal := false
 
 	switch openaiResponse.Type {
+	case types.EventTypeError:
+		apiErr := runtimesession.ProviderAPIErrorFromPayload(*rawLine)
+		safeErr := providerresponse.SanitizeAPIError(apiErr)
+		if safeErr != nil {
+			safeErr.UpstreamAccepted = safeErr.UpstreamAccepted || providerAccepted
+		}
+		*rawLine = requester.StreamClosed
+		errChan <- safeErr
+		return
 	case "response.created":
 		h.hasToolCall = false
 		h.toolIndex = 0
@@ -549,9 +786,6 @@ func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataCh
 				h.MessageID = openaiResponse.Response.ID
 				chatRes.ID = h.MessageID
 			}
-			if searchType := commonresponses.ResponsesSearchType(openaiResponse.Response); searchType != "" {
-				h.searchType = searchType
-			}
 		}
 		chatRes.Choices = append(chatRes.Choices, types.ChatCompletionStreamChoice{
 			Index: 0,
@@ -559,10 +793,7 @@ func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataCh
 		})
 		needOutput = true
 	case "response.output_text.delta": // 处理文本输出的增量
-		delta, ok := openAIStreamDeltaString(openaiResponse.Delta)
-		if ok && h.Usage != nil {
-			h.Usage.TextBuilder.WriteString(delta)
-		}
+		delta, _ := openAIStreamDeltaString(openaiResponse.Delta)
 		chatRes.Choices = append(chatRes.Choices, types.ChatCompletionStreamChoice{
 			Index: 0,
 			Delta: types.ChatCompletionStreamChoiceDelta{
@@ -570,11 +801,15 @@ func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataCh
 			},
 		})
 		needOutput = true
+	case "response.refusal.delta":
+		delta, _ := openAIStreamDeltaString(openaiResponse.Delta)
+		chatRes.Choices = append(chatRes.Choices, types.ChatCompletionStreamChoice{
+			Index: 0,
+			Delta: types.ChatCompletionStreamChoiceDelta{Refusal: delta},
+		})
+		needOutput = true
 	case "response.reasoning_summary_text.delta": // 处理文本输出的增量
-		delta, ok := openAIStreamDeltaString(openaiResponse.Delta)
-		if ok && h.Usage != nil {
-			h.Usage.TextBuilder.WriteString(delta)
-		}
+		delta, _ := openAIStreamDeltaString(openaiResponse.Delta)
 		chatRes.Choices = append(chatRes.Choices, types.ChatCompletionStreamChoice{
 			Index: 0,
 			Delta: types.ChatCompletionStreamChoiceDelta{
@@ -584,10 +819,7 @@ func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataCh
 		needOutput = true
 	case "response.function_call_arguments.delta": // 处理函数调用参数的增量
 		h.hasToolCall = true
-		delta, ok := openAIStreamDeltaString(openaiResponse.Delta)
-		if ok && h.Usage != nil {
-			h.Usage.TextBuilder.WriteString(delta)
-		}
+		delta, _ := openAIStreamDeltaString(openaiResponse.Delta)
 		chatRes.Choices = append(chatRes.Choices, types.ChatCompletionStreamChoice{
 			Index: 0,
 			Delta: types.ChatCompletionStreamChoiceDelta{
@@ -606,9 +838,30 @@ func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataCh
 	case "response.function_call_arguments.done":
 		h.hasToolCall = true
 		h.toolIndex++
+	case "response.custom_tool_call_input.delta":
+		h.hasToolCall = true
+		delta, _ := openAIStreamDeltaString(openaiResponse.Delta)
+		chatRes.Choices = append(chatRes.Choices, types.ChatCompletionStreamChoice{
+			Index: 0,
+			Delta: types.ChatCompletionStreamChoiceDelta{
+				Role: types.ChatMessageRoleAssistant,
+				ToolCalls: []*types.ChatCompletionToolCalls{
+					{
+						Index: h.toolIndex,
+						Custom: &types.ChatCompletionToolCallsCustom{
+							Input: delta,
+						},
+					},
+				},
+			},
+		})
+		needOutput = true
+	case "response.custom_tool_call_input.done":
+		// done 携带完整输入，重复输出会使 Chat 客户端再次拼接；这里只关闭当前调用槽位。
+		h.hasToolCall = true
+		h.toolIndex++
 	case "response.output_item.added":
 		if openaiResponse.Item != nil {
-			commonresponses.ApplyResponsesOutputItemBilling(h.Usage, openaiResponse.Item, h.searchType)
 			switch openaiResponse.Item.Type {
 			case types.InputTypeMessage, types.InputTypeReasoning:
 				chatRes.Choices = append(chatRes.Choices, types.ChatCompletionStreamChoice{
@@ -644,15 +897,43 @@ func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataCh
 					},
 				})
 				needOutput = true
+			case types.InputTypeCustomToolCall:
+				h.hasToolCall = true
+				chatRes.Choices = append(chatRes.Choices, types.ChatCompletionStreamChoice{
+					Index: 0,
+					Delta: types.ChatCompletionStreamChoiceDelta{
+						Role: types.ChatMessageRoleAssistant,
+						ToolCalls: []*types.ChatCompletionToolCalls{
+							{
+								Index: h.toolIndex,
+								Id:    openaiResponse.Item.CallID,
+								Type:  types.ToolChoiceTypeCustom,
+								Custom: &types.ChatCompletionToolCallsCustom{
+									Name:  openaiResponse.Item.Name,
+									Input: openaiResponse.Item.Input,
+								},
+							},
+						},
+					},
+				})
+				needOutput = true
 			}
 		}
 	case "response.output_item.done":
-		if openaiResponse.Item != nil && openaiResponse.Item.Type == types.InputTypeFunctionCall {
-			h.hasToolCall = true
+		if openaiResponse.Item != nil {
+			switch openaiResponse.Item.Type {
+			case types.InputTypeFunctionCall, types.InputTypeCustomToolCall:
+				h.hasToolCall = true
+			}
 		}
-	default:
-		if openaiResponse.Response != nil && openaiResponse.Response.Usage != nil {
-			commonresponses.ApplyResponsesUsage(h.Usage, openaiResponse.Response)
+	case "response.completed", "response.failed", "response.incomplete":
+		terminal = true
+		if openaiResponse.Response != nil {
+			if terminalErr := commonresponses.ChatTerminalError(openaiResponse.Response); terminalErr != nil {
+				*rawLine = requester.StreamClosed
+				errChan <- terminalErr
+				return
+			}
 			finishReason := types.ConvertResponsesStatusToChat(openaiResponse.Response.Status)
 			if finishReason == types.FinishReasonStop && shouldUseToolCallsFinishReason(openaiResponse.Response, h.hasToolCall) {
 				finishReason = types.FinishReasonToolCalls
@@ -673,7 +954,13 @@ func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataCh
 			return
 		}
 		dataChan <- string(jsonData)
-
+	}
+	if terminal {
+		*rawLine = requester.StreamClosed
+		errChan <- io.EOF
+		return
+	}
+	if needOutput {
 		return
 	}
 
@@ -690,7 +977,7 @@ func shouldUseToolCallsFinishReason(response *types.OpenAIResponsesResponses, ha
 	}
 
 	for _, output := range response.Output {
-		if output.Type == types.InputTypeFunctionCall {
+		if output.Type == types.InputTypeFunctionCall || output.Type == types.InputTypeCustomToolCall {
 			return true
 		}
 	}
@@ -702,5 +989,5 @@ func getResponsesExtraBilling(response *types.OpenAIResponsesResponses, usage *t
 	if usage == nil {
 		return
 	}
-	usage.MergeExtraBilling(types.GetResponsesExtraBilling(response))
+	types.ApplyResponsesExtraBilling(response, usage)
 }

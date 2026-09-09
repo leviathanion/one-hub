@@ -117,7 +117,17 @@ func (codexResponsesHintResolver) ResolveResponsesHints(ctx *gin.Context, reques
 		return nil
 	}
 
-	settings := RoutingHintSettingsInstance
+	var settings RoutingHintSettings
+	if snapshot := config.GlobalOption.RuntimeSnapshot(); snapshot != nil {
+		if option, ok := snapshot.Get("CodexRoutingHintSetting"); ok {
+			settings = DefaultRoutingHintSettings()
+			if err := settings.SetFromJSON(option.Effective); err != nil {
+				return nil
+			}
+		}
+	} else {
+		settings = RoutingHintSettingsInstance
+	}
 	settings.Normalize()
 	if settings.PromptCacheKeyStrategy == codexPromptCacheStrategyOff {
 		return nil

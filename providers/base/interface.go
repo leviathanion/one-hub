@@ -20,7 +20,6 @@ type Requestable interface {
 
 // 基础接口
 type ProviderInterface interface {
-	GetSupportedResponse() bool
 	// 获取基础URL
 	// GetBaseURL() string
 	// 获取完整请求URL
@@ -164,7 +163,7 @@ type ResponsesWSProvider interface {
 type ResponsesInterface interface {
 	ProviderInterface
 	CreateResponses(ctx context.Context, req *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode)
-	CreateResponsesStream(ctx context.Context, req *commonresponses.Request) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode)
+	CreateResponsesStream(ctx context.Context, req *commonresponses.Request) (commonresponses.EventStream, *types.OpenAIErrorWithStatusCode)
 	CompactResponses(ctx context.Context, req *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode)
 }
 

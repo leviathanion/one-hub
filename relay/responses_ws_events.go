@@ -14,9 +14,7 @@ type ResponsesWSSendPurpose string
 
 const (
 	ResponsesWSSendPurposeResponseCreate ResponsesWSSendPurpose = "response_create"
-	ResponsesWSSendPurposeResponseCancel ResponsesWSSendPurpose = "response_cancel"
-	ResponsesWSSendPurposeControl        ResponsesWSSendPurpose = "control"
-	ResponsesWSSendPurposePingPong       ResponsesWSSendPurpose = "ping_pong"
+	ResponsesWSSendPurposeResponseInject ResponsesWSSendPurpose = "response_inject"
 )
 
 const (
@@ -24,8 +22,12 @@ const (
 	responsesWSSendQueueSize            = 64
 	responsesWSPendingProviderEventsMax = 32
 	responsesWSRecentResponseIDLimit    = 16
-	responsesWSBusyRejectLimit          = 16
-	responsesWSBusyRejectWindow         = 10 * time.Second
+	responsesWSQueuedCreateMaxFrames    = 16
+	responsesWSQueuedCreateMaxBytes     = 4 << 20
+	responsesWSInjectMaxPending         = 64
+	responsesWSInjectMaxDeferredBytes   = 4 << 20
+	responsesWSSendQueueMaxBytes        = 32 << 20
+	responsesWSEventQueueMaxBytes       = 64 << 20
 	responsesWSConnectionSessionIDKey   = "responses_ws_connection_session_id"
 )
 
@@ -39,11 +41,7 @@ const (
 )
 
 const (
-	responsesWSActiveTurnTimeoutReason                    = "responses_ws_active_turn_timeout"
-	responsesWSBridgeProviderRejectionWaitTimeoutReason   = "responses_ws_bridge_provider_rejection_wait_timeout"
-	responsesWSBridgeLocalOpenErrorWaitTimeoutReason      = "responses_ws_bridge_local_open_error_wait_timeout"
-	responsesWSBridgeProviderRejectionFallbackErrorCode   = "provider_rejected_before_stream"
-	responsesWSBridgeProviderRejectionFallbackErrorReason = "upstream rejected response before stream"
+	responsesWSActiveTurnTimeoutReason = "responses_ws_active_turn_timeout"
 )
 
 var (
@@ -55,14 +53,8 @@ var (
 const defaultResponsesWSReliablePostTimeout = 30 * time.Second
 
 var (
-	responsesWSBridgeProviderRejectionWaitTimeout = 200 * time.Millisecond
-	responsesWSBridgeLocalOpenErrorWaitTimeout    = 200 * time.Millisecond
-	recordUsageObservedUnbilled                   = metrics.RecordUsageObservedUnbilled
-	recordResponsesWSEventPostTimeout             = metrics.RecordResponsesWSEventPostTimeout
-	recordResponsesWSSettlementConflict           = metrics.RecordResponsesWSSettlementConflict
-	recordResponsesWSAttemptReplayDecision        = metrics.RecordResponsesWSAttemptReplayDecision
-	recordResponsesWSAttemptReplayExecuted        = metrics.RecordResponsesWSAttemptReplayExecuted
-	recordResponsesWSAttemptReplayBlocked         = metrics.RecordResponsesWSAttemptReplayBlocked
+	recordUsageObservedUnbilled       = metrics.RecordUsageObservedUnbilled
+	recordResponsesWSEventPostTimeout = metrics.RecordResponsesWSEventPostTimeout
 )
 
 type ResponsesWSEvent interface{ responsesWSEvent() }
@@ -103,29 +95,6 @@ const (
 	ProviderDownstreamFrame ResponsesWSProviderDownstreamKind = iota
 	ProviderDownstreamClose
 )
-
-type ResponsesWSEventBridgeOpenProviderError struct {
-	UpstreamSessionGeneration string
-	ChannelID                 int
-	AttemptID                 string
-	DetailPhase               responsesws.RecvDetailPhase
-	Payload                   []byte
-	ProviderAPIError          *types.OpenAIErrorWithStatusCode
-	Recoverable               bool
-}
-
-func (ResponsesWSEventBridgeOpenProviderError) responsesWSEvent() {}
-
-type ResponsesWSEventBridgeOpenLocalError struct {
-	UpstreamSessionGeneration string
-	ChannelID                 int
-	AttemptID                 string
-	DetailPhase               responsesws.RecvDetailPhase
-	Payload                   []byte
-	Recoverable               bool
-}
-
-func (ResponsesWSEventBridgeOpenLocalError) responsesWSEvent() {}
 
 type ResponsesWSEventProxyLocalError struct {
 	UpstreamSessionGeneration string
@@ -215,6 +184,7 @@ func (ResponsesWSEventClientClosed) responsesWSEvent() {}
 type ResponsesWSEventFirstTurnSetup struct {
 	Frame        *responsesws.RawResponsesCreateFrame
 	PendingLease middleware.ResponsesWSLease
+	PendingBytes middleware.ResponsesWSByteLease
 	ReceivedAt   time.Time
 }
 
@@ -246,6 +216,45 @@ type ResponsesWSEventCloseIntent struct {
 
 func (ResponsesWSEventCloseIntent) responsesWSEvent() {}
 
+type responsesWSProviderAccountingEventProjection struct {
+	UpstreamEvent               responsesws.UpstreamEvent
+	HasProviderActivityEvidence bool
+}
+
+func projectResponsesWSProviderDownstreamAccountingEvent(event ResponsesWSEventProviderDownstream) responsesWSProviderAccountingEventProjection {
+	return projectResponsesWSUpstreamAccountingEvent(upstreamEventFromProviderDownstream(event))
+}
+
+func projectResponsesWSProviderUsageAccountingEvent(event ResponsesWSEventProviderUsageObserved) responsesWSProviderAccountingEventProjection {
+	return projectResponsesWSUpstreamAccountingEvent(upstreamEventFromProviderUsage(event))
+}
+
+func projectResponsesWSUpstreamAccountingEvent(event responsesws.UpstreamEvent) responsesWSProviderAccountingEventProjection {
+	projected := responsesws.ProjectProviderObservationForSettlement(responsesws.NewProviderObservation(event))
+	return responsesWSProviderAccountingEventProjection{
+		UpstreamEvent:               event,
+		HasProviderActivityEvidence: projected.HasProviderActivity,
+	}
+}
+
+func responsesWSEventPayloadBytes(event ResponsesWSEvent) int {
+	switch typed := event.(type) {
+	case ResponsesWSEventClientFrame:
+		return typed.Frame.PayloadLen()
+	case ResponsesWSEventProxyLocalError:
+		return len(typed.Payload)
+	case ResponsesWSEventProviderDownstream:
+		if typed.Frame != nil {
+			return typed.Frame.PayloadLen()
+		}
+	case ResponsesWSEventFirstTurnSetup:
+		if typed.Frame != nil {
+			return len(typed.Frame.Raw)
+		}
+	}
+	return 0
+}
+
 func responsesWSEventTypeLabel(event ResponsesWSEvent) string {
 	switch event.(type) {
 	case ResponsesWSEventClientFrame:
@@ -254,10 +263,6 @@ func responsesWSEventTypeLabel(event ResponsesWSEvent) string {
 		return "send_result"
 	case ResponsesWSEventTransportContractViolation:
 		return "transport_contract_violation"
-	case ResponsesWSEventBridgeOpenProviderError:
-		return "bridge_open_provider_error"
-	case ResponsesWSEventBridgeOpenLocalError:
-		return "bridge_open_local_error"
 	case ResponsesWSEventProxyLocalError:
 		return "proxy_local_error"
 	case ResponsesWSEventProviderDownstream:

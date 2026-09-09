@@ -1,13 +1,13 @@
 package claude
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"one-api/common"
 	"one-api/common/config"
-	"one-api/common/image"
 	"one-api/common/requester"
 	"one-api/common/utils"
 	"one-api/providers/base"
@@ -17,6 +17,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream"
 )
 
+// Kept for source compatibility with callers that inspect the stream handler;
+// per-content-block state below is authoritative for conversion.
 const (
 	StreamTollsNone = 0
 	StreamTollsUse  = 1
@@ -24,10 +26,29 @@ const (
 )
 
 type ClaudeStreamHandler struct {
-	Usage       *types.Usage
-	Request     *types.ChatCompletionRequest
-	StreamTolls int
-	Prefix      string
+	Usage            *types.Usage
+	Request          *types.ChatCompletionRequest
+	StreamTolls      int
+	Prefix           string
+	AccumulatedUsage Usage
+	toolCallIndexes  map[int]int
+	nextToolIndex    int
+	toolBlocks       map[int]*claudeToolBlockState
+}
+
+type claudeToolBlockState struct {
+	toolIndex        int
+	emptyInputObject bool
+	hasArguments     bool
+	invalidDelta     bool
+}
+
+func isEmptyJSONObject(value any) bool {
+	if value == nil {
+		return false
+	}
+	encoded, err := json.Marshal(value)
+	return err == nil && string(encoded) == "{}"
 }
 
 func (p *ClaudeProvider) CreateChatCompletion(request *types.ChatCompletionRequest) (*types.ChatCompletionResponse, *types.OpenAIErrorWithStatusCode) {
@@ -65,7 +86,8 @@ func (p *ClaudeProvider) CreateChatCompletionStream(request *types.ChatCompletio
 	defer req.Body.Close()
 
 	// 发送请求
-	resp, errWithCode := p.Requester.SendRequestRaw(req)
+	streamRequester := p.Requester.ForHTTPProfile(requester.HTTPProfileLongStream)
+	resp, errWithCode := streamRequester.SendRequestRaw(req)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -78,7 +100,7 @@ func (p *ClaudeProvider) CreateChatCompletionStream(request *types.ChatCompletio
 
 	eventstream.NewDecoder()
 
-	return requester.RequestStream(p.Requester, resp, chatHandler.HandlerStream)
+	return requester.RequestStream(streamRequester, resp, chatHandler.HandlerStream)
 }
 
 func (p *ClaudeProvider) getChatRequest(claudeRequest *ClaudeRequest) (*http.Request, *types.OpenAIErrorWithStatusCode) {
@@ -111,6 +133,7 @@ func (p *ClaudeProvider) getChatRequest(claudeRequest *ClaudeRequest) (*http.Req
 }
 
 func ConvertFromChatOpenai(request *types.ChatCompletionRequest) (*ClaudeRequest, *types.OpenAIErrorWithStatusCode) {
+	reasoning := request.EffectiveReasoning()
 	claudeRequest := ClaudeRequest{
 		Model:         request.Model,
 		Messages:      make([]Message, 0),
@@ -136,7 +159,7 @@ func ConvertFromChatOpenai(request *types.ChatCompletionRequest) (*ClaudeRequest
 	// 处理 system 字段（支持 cache_control）
 	systemMessage := ""
 	mgsLen := len(request.Messages) - 1
-	isThink := (request.Reasoning != nil)
+	isThink := reasoning != nil
 
 	// 如果请求中已经有 system 字段（如数组格式带 cache_control），直接使用
 	if request.System != nil {
@@ -190,9 +213,9 @@ func ConvertFromChatOpenai(request *types.ChatCompletionRequest) (*ClaudeRequest
 	}
 
 	// 如果请求中包含reasoning参数，开启thinking
-	if request.Reasoning != nil {
+	if reasoning != nil {
 		var opErr *types.OpenAIErrorWithStatusCode
-		claudeRequest.Thinking, claudeRequest.OutputConfig, opErr = getThinking(claudeRequest.MaxTokens, request.Reasoning)
+		claudeRequest.Thinking, claudeRequest.OutputConfig, opErr = getThinking(claudeRequest.MaxTokens, reasoning)
 
 		if opErr != nil {
 			return nil, opErr
@@ -313,21 +336,28 @@ func convertMessageContent(msg *types.ChatCompletionMessage) (*Message, error) {
 			continue
 		}
 		if part.Type == types.ContentTypeImageURL {
-			mimeType, data, err := image.GetImageFromUrl(part.ImageURL.URL)
-			if err != nil {
-				return nil, common.ErrorWrapper(err, "image_url_invalid", http.StatusBadRequest)
-			}
-			claudeType := "image"
-
-			if mimeType == "application/pdf" {
-				claudeType = "document"
+			imageURL := part.ImageURL.URL
+			trimmedImageURL := strings.TrimSpace(imageURL)
+			if len(trimmedImageURL) >= len("data:") && strings.EqualFold(trimmedImageURL[:len("data:")], "data:") {
+				mimeType, body, err := base.DecodeChatMediaDataURI(trimmedImageURL)
+				if err != nil {
+					return nil, common.ErrorWrapper(err, "image_url_invalid", http.StatusBadRequest)
+				}
+				content = append(content, MessageContent{
+					Type: "image",
+					Source: &ContentSource{
+						Type:      "base64",
+						MediaType: mimeType,
+						Data:      base64.StdEncoding.EncodeToString(body),
+					},
+				})
+				continue
 			}
 			content = append(content, MessageContent{
-				Type: claudeType,
+				Type: "image",
 				Source: &ContentSource{
-					Type:      "base64",
-					MediaType: mimeType,
-					Data:      data,
+					Type: "url",
+					Url:  imageURL,
 				},
 			})
 		}
@@ -430,6 +460,7 @@ func ConvertToChatOpenai(provider base.ProviderInterface, response *ClaudeRespon
 		usage.CompletionTokens = ClaudeOutputUsage(response)
 		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	}
+	usage.MergeProviderAttribution(response.Model, "")
 
 	openaiResponse.Usage = usage
 
@@ -471,18 +502,25 @@ func (h *ClaudeStreamHandler) HandlerStream(rawLine *[]byte, dataChan chan strin
 	switch claudeResponse.Type {
 	case "message_start":
 		h.convertToOpenaiStream(&claudeResponse, dataChan)
-		h.Usage.PromptTokens = claudeResponse.Message.Usage.InputTokens
+		h.Usage.MergeProviderAttribution("", claudeResponse.Message.Usage.ServiceTier)
+		ClaudeUsageMerge(&h.AccumulatedUsage, &claudeResponse.Message.Usage)
+		ClaudeUsageToOpenaiUsage(&h.AccumulatedUsage, h.Usage)
+		h.Usage.MergeProviderAttribution(claudeResponse.Message.Model, "")
 
 	case "message_delta":
 		h.convertToOpenaiStream(&claudeResponse, dataChan)
-		h.Usage.CompletionTokens = claudeResponse.Usage.OutputTokens
-		h.Usage.TotalTokens = h.Usage.PromptTokens + h.Usage.CompletionTokens
+		h.Usage.MergeProviderAttribution("", claudeResponse.Usage.ServiceTier)
+		ClaudeUsageMerge(&h.AccumulatedUsage, &claudeResponse.Usage)
+		ClaudeUsageToOpenaiUsage(&h.AccumulatedUsage, h.Usage)
 
 	case "content_block_delta":
+		h.observeToolContentDelta(&claudeResponse)
 		h.convertToOpenaiStream(&claudeResponse, dataChan)
-		h.Usage.TextBuilder.WriteString(claudeResponse.Delta.Text)
 	case "content_block_start":
+		h.startToolContentBlock(&claudeResponse)
 		h.convertToOpenaiStream(&claudeResponse, dataChan)
+	case "content_block_stop":
+		h.stopToolContentBlock(&claudeResponse, dataChan)
 
 	default:
 		return
@@ -491,7 +529,9 @@ func (h *ClaudeStreamHandler) HandlerStream(rawLine *[]byte, dataChan chan strin
 
 func (h *ClaudeStreamHandler) convertToOpenaiStream(claudeResponse *ClaudeStreamResponse, dataChan chan string) {
 	choice := types.ChatCompletionStreamChoice{
-		Index: claudeResponse.Index,
+		// Claude's index identifies a content block. Chat Completions has one
+		// completion choice here, so every content block belongs to choice 0.
+		Index: 0,
 		Delta: types.ChatCompletionStreamChoiceDelta{
 			Role:    claudeResponse.Message.Role,
 			Content: claudeResponse.Delta.Text,
@@ -505,15 +545,16 @@ func (h *ClaudeStreamHandler) convertToOpenaiStream(claudeResponse *ClaudeStream
 	var toolCalls []*types.ChatCompletionToolCalls
 
 	if claudeResponse.ContentBlock.Type == ContentTypeToolUes {
+		toolIndex := h.toolCallIndexForContentBlock(claudeResponse.Index)
 		toolCalls = append(toolCalls, &types.ChatCompletionToolCalls{
-			Id:   claudeResponse.ContentBlock.Id,
-			Type: types.ChatMessageRoleFunction,
+			Id:    claudeResponse.ContentBlock.Id,
+			Type:  types.ChatMessageRoleFunction,
+			Index: toolIndex,
 			Function: &types.ChatCompletionToolCallsFunction{
 				Name:      claudeResponse.ContentBlock.Name,
 				Arguments: "",
 			},
 		})
-		h.StreamTolls = StreamTollsUse
 	}
 
 	switch claudeResponse.Delta.Type {
@@ -521,31 +562,19 @@ func (h *ClaudeStreamHandler) convertToOpenaiStream(claudeResponse *ClaudeStream
 		if claudeResponse.Delta.PartialJson == "" {
 			return
 		}
+		toolIndex := h.toolCallIndexForContentBlock(claudeResponse.Index)
 		toolCalls = append(toolCalls, &types.ChatCompletionToolCalls{
-			Type: types.ChatMessageRoleFunction,
+			Type:  types.ChatMessageRoleFunction,
+			Index: toolIndex,
 			Function: &types.ChatCompletionToolCallsFunction{
 				Arguments: claudeResponse.Delta.PartialJson,
 			},
 		})
-		h.StreamTolls = StreamTollsArg
 	case ContentStreamTypeSignatureDelta:
 		// 加密的不处理
 		choice.Delta.ReasoningContent = "\n"
 	case ContentStreamTypeThinking:
 		choice.Delta.ReasoningContent = claudeResponse.Delta.Thinking
-	}
-
-	if claudeResponse.ContentBlock.Type != ContentTypeToolUes && claudeResponse.Delta.Type != "input_json_delta" && h.StreamTolls != StreamTollsNone {
-		if h.StreamTolls == StreamTollsUse {
-			toolCalls = append(toolCalls, &types.ChatCompletionToolCalls{
-				Type: types.ChatMessageRoleFunction,
-				Function: &types.ChatCompletionToolCallsFunction{
-					Arguments: "{}",
-				},
-			})
-		}
-
-		h.StreamTolls = StreamTollsNone
 	}
 
 	if toolCalls != nil {
@@ -556,6 +585,69 @@ func (h *ClaudeStreamHandler) convertToOpenaiStream(claudeResponse *ClaudeStream
 	if finishReason != "" {
 		choice.FinishReason = &finishReason
 	}
+	h.sendChatStreamChoice(choice, dataChan)
+}
+
+func (h *ClaudeStreamHandler) startToolContentBlock(response *ClaudeStreamResponse) {
+	if response == nil || response.ContentBlock.Type != ContentTypeToolUes {
+		return
+	}
+	if h.toolBlocks == nil {
+		h.toolBlocks = make(map[int]*claudeToolBlockState)
+	}
+	h.toolBlocks[response.Index] = &claudeToolBlockState{
+		toolIndex:        h.toolCallIndexForContentBlock(response.Index),
+		emptyInputObject: isEmptyJSONObject(response.ContentBlock.Input),
+	}
+}
+
+func (h *ClaudeStreamHandler) observeToolContentDelta(response *ClaudeStreamResponse) {
+	if response == nil {
+		return
+	}
+	block, ok := h.toolBlocks[response.Index]
+	if !ok {
+		return
+	}
+	if response.Delta.Type != ContentStreamTypeInputJsonDelta {
+		block.invalidDelta = true
+		return
+	}
+	if response.Delta.PartialJson != "" {
+		block.hasArguments = true
+	}
+}
+
+func (h *ClaudeStreamHandler) stopToolContentBlock(response *ClaudeStreamResponse, dataChan chan string) {
+	if response == nil || h.toolBlocks == nil {
+		return
+	}
+	block, ok := h.toolBlocks[response.Index]
+	if !ok {
+		return
+	}
+	delete(h.toolBlocks, response.Index)
+	if block.emptyInputObject && !block.hasArguments && !block.invalidDelta {
+		h.sendToolArguments(dataChan, block.toolIndex, "{}")
+	}
+}
+
+func (h *ClaudeStreamHandler) sendToolArguments(dataChan chan string, toolIndex int, arguments string) {
+	h.sendChatStreamChoice(types.ChatCompletionStreamChoice{
+		Index: 0,
+		Delta: types.ChatCompletionStreamChoiceDelta{
+			ToolCalls: []*types.ChatCompletionToolCalls{{
+				Type:  types.ChatMessageRoleFunction,
+				Index: toolIndex,
+				Function: &types.ChatCompletionToolCallsFunction{
+					Arguments: arguments,
+				},
+			}},
+		},
+	}, dataChan)
+}
+
+func (h *ClaudeStreamHandler) sendChatStreamChoice(choice types.ChatCompletionStreamChoice, dataChan chan string) {
 	chatCompletion := types.ChatCompletionStreamResponse{
 		ID:      fmt.Sprintf("chatcmpl-%s", utils.GetUUID()),
 		Object:  "chat.completion.chunk",
@@ -566,4 +658,17 @@ func (h *ClaudeStreamHandler) convertToOpenaiStream(claudeResponse *ClaudeStream
 
 	responseBody, _ := json.Marshal(chatCompletion)
 	dataChan <- string(responseBody)
+}
+
+func (h *ClaudeStreamHandler) toolCallIndexForContentBlock(contentBlockIndex int) int {
+	if h.toolCallIndexes == nil {
+		h.toolCallIndexes = make(map[int]int)
+	}
+	if toolIndex, ok := h.toolCallIndexes[contentBlockIndex]; ok {
+		return toolIndex
+	}
+	toolIndex := h.nextToolIndex
+	h.nextToolIndex++
+	h.toolCallIndexes[contentBlockIndex] = toolIndex
+	return toolIndex
 }

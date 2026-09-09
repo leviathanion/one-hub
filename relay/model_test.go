@@ -116,14 +116,14 @@ func TestListClaudeModelsByTokenIncludesCustomClaudeRelayModels(t *testing.T) {
 	weight := uint(1)
 	proxy := ""
 	enabledPlugin := datatypes.NewJSONType(model.PluginType{
-		"claude": {
+		"endpoints": {"anthropic.messages": map[string]any{
 			"enabled": true,
-		},
+		}},
 	})
 	disabledPlugin := datatypes.NewJSONType(model.PluginType{
-		"claude": {
+		"endpoints": {"anthropic.messages": map[string]any{
 			"enabled": false,
-		},
+		}},
 	})
 
 	model.ChannelGroup = model.ChannelsChooser{

@@ -62,11 +62,7 @@ func (p *AliProvider) convertToEmbeddingOpenai(response *AliEmbeddingResponse, r
 		Object: "list",
 		Data:   make([]types.Embedding, 0, len(response.Output.Embeddings)),
 		Model:  request.Model,
-		Usage: &types.Usage{
-			PromptTokens:     response.Usage.TotalTokens,
-			CompletionTokens: response.Usage.OutputTokens,
-			TotalTokens:      response.Usage.TotalTokens,
-		},
+		Usage:  aliEmbeddingUsageToOpenAI(&response.Usage),
 	}
 
 	for _, item := range response.Output.Embeddings {
@@ -77,7 +73,30 @@ func (p *AliProvider) convertToEmbeddingOpenai(response *AliEmbeddingResponse, r
 		})
 	}
 
-	*p.Usage = *openaiResponse.Usage
+	if openaiResponse.Usage != nil && p.Usage != nil {
+		*p.Usage = *openaiResponse.Usage
+	}
 
 	return
+}
+
+// Ali 文本向量接口只把 total_tokens 定义为输入 token 数。该语义不能
+// 复用聊天接口的 input/output/total 三字段证据要求。
+func aliEmbeddingUsageToOpenAI(providerUsage *AliUsage) *types.Usage {
+	if providerUsage == nil || !providerUsage.present || !providerUsage.totalTokensPresent || providerUsage.TotalTokens < 0 {
+		return nil
+	}
+
+	usage := &types.Usage{
+		PromptTokens:     providerUsage.TotalTokens,
+		CompletionTokens: 0,
+		TotalTokens:      providerUsage.TotalTokens,
+		ProviderTokenFields: map[string]bool{
+			"prompt_tokens":     true,
+			"completion_tokens": true,
+			"total_tokens":      true,
+		},
+	}
+	usage.MarkProviderReported()
+	return usage
 }

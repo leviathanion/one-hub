@@ -83,7 +83,7 @@ func UpdateChannelsTag(c *gin.Context) {
 		return
 	}
 
-	err = model.UpdateChannelsTagWithSubmittedFields(tag, &channel, submittedFields)
+	err = model.UpdateChannelsTagWithSubmittedFields(tag, &channel, submittedFields, model.ChannelUpdateOptions{AllowIdentityChange: true})
 	if err != nil {
 		common.APIRespondWithError(c, http.StatusOK, err)
 		return

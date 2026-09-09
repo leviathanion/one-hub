@@ -117,13 +117,10 @@ func TestCodexRealtimeHelperFunctionsAndCompatibilityHeaders(t *testing.T) {
 		t.Fatalf("expected nil provider passthrough header lookup to be empty, got %q", got)
 	}
 
-	if !isCodexRealtimeTerminalStatus(types.ResponseStatusCompleted) || isCodexRealtimeTerminalStatus("in_progress") {
-		t.Fatal("expected terminal status helper to distinguish completed from in-progress states")
+	if isCodexSupplierTerminalEvent(nil) {
+		t.Fatal("expected nil supplier event not to be terminal")
 	}
-	if isCodexRealtimeTerminalEvent(nil) {
-		t.Fatal("expected nil realtime event not to be terminal")
-	}
-	if !isCodexRealtimeTerminalEvent(&types.OpenAIResponsesStreamResponses{
+	if !isCodexSupplierTerminalEvent(&types.OpenAIResponsesStreamResponses{
 		Type: "response.updated",
 		Response: &types.OpenAIResponsesResponses{
 			Status: types.ResponseStatusCancelled,
@@ -132,31 +129,54 @@ func TestCodexRealtimeHelperFunctionsAndCompatibilityHeaders(t *testing.T) {
 		t.Fatal("expected cancelled response status to be treated as terminal")
 	}
 
-	if usage := codexRealtimeUsageEvent(nil, nil, "gpt-5"); usage != nil {
-		t.Fatalf("expected nil realtime response usage input to stay nil, got %+v", usage)
+	if usage := codexSupplierUsageEvent(nil, nil); usage != nil {
+		t.Fatalf("expected nil supplier response usage input to stay nil, got %+v", usage)
 	}
-	if usage := codexRealtimeUsageEvent(&types.OpenAIResponsesResponses{Status: types.ResponseStatusCancelled}, nil, "gpt-5"); usage != nil {
-		t.Fatalf("expected cancelled realtime responses without usage not to emit usage events, got %+v", usage)
+	if usage := codexSupplierUsageEvent(&types.OpenAIResponsesResponses{Status: types.ResponseStatusCancelled}, nil); usage != nil {
+		t.Fatalf("expected cancelled supplier responses without usage not to emit usage events, got %+v", usage)
 	}
 
-	if shouldContinue, usage, rewritten, err := provider.handleRealtimeSupplierMessage(wsconn.BinaryMessage, []byte("ignored"), nil, "gpt-5"); !shouldContinue || usage != nil || rewritten != nil || err != nil {
-		t.Fatalf("expected non-text realtime supplier messages to be ignored, continue=%v usage=%+v rewritten=%v err=%v", shouldContinue, usage, rewritten, err)
+	if shouldContinue, usage, rewritten, err := provider.handleCodexSupplierMessage(wsconn.BinaryMessage, []byte("ignored"), nil); !shouldContinue || usage != nil || rewritten != nil || err != nil {
+		t.Fatalf("expected non-text supplier messages to be ignored, continue=%v usage=%+v rewritten=%v err=%v", shouldContinue, usage, rewritten, err)
 	}
-	if shouldContinue, usage, rewritten, err := provider.handleRealtimeSupplierMessage(wsconn.TextMessage, []byte("bad-json"), nil, "gpt-5"); !shouldContinue || usage != nil || rewritten != nil || err != nil {
-		t.Fatalf("expected invalid realtime supplier json to be ignored, continue=%v usage=%+v rewritten=%v err=%v", shouldContinue, usage, rewritten, err)
+	if shouldContinue, usage, rewritten, err := provider.handleCodexSupplierMessage(wsconn.TextMessage, []byte("bad-json"), nil); !shouldContinue || usage != nil || rewritten != nil || err != nil {
+		t.Fatalf("expected invalid supplier json to be ignored, continue=%v usage=%+v rewritten=%v err=%v", shouldContinue, usage, rewritten, err)
 	}
-	if shouldContinue, usage, rewritten, err := provider.handleRealtimeSupplierMessage(wsconn.TextMessage, []byte(`{"type":"error"}`), nil, "gpt-5"); !shouldContinue || usage != nil || rewritten != nil || err != nil {
+	if shouldContinue, usage, rewritten, err := provider.handleCodexSupplierMessage(wsconn.TextMessage, []byte(`{"type":"error"}`), nil); !shouldContinue || usage != nil || rewritten != nil || err != nil {
 		t.Fatalf("expected provider error events to pass through unchanged, continue=%v usage=%+v rewritten=%v err=%v", shouldContinue, usage, rewritten, err)
 	}
 
 	nestedErrorPayload := []byte(`{"type":"error","status":429,"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"slow down","param":"model"},"response":{"id":"resp_error_1"}}`)
-	shouldContinue, usage, rewritten, err := provider.handleRealtimeSupplierMessage(wsconn.TextMessage, nestedErrorPayload, nil, "gpt-5")
+	shouldContinue, usage, rewritten, err := provider.handleCodexSupplierMessage(wsconn.TextMessage, nestedErrorPayload, nil)
 	if !shouldContinue || usage != nil || rewritten != nil || err != nil {
 		t.Fatalf("expected nested provider error event to pass through unchanged, continue=%v usage=%+v rewritten=%v err=%v", shouldContinue, usage, rewritten, err)
 	}
-	detail := codexRealtimeProviderErrorDetailFromPayload(nil, nestedErrorPayload)
+	detail := codexSupplierErrorDetailFromPayload(nil, nestedErrorPayload)
 	if detail.Type != "rate_limit_error" || detail.Code != "rate_limit_exceeded" || detail.Message != "slow down" {
 		t.Fatalf("expected nested provider error detail to be preserved for logging, got %+v", detail)
+	}
+
+	sensitiveErrorPayload := []byte(`{"type":"error","error":{"message":"authorization=Bearer supplier-secret","access_token":"provider-secret","account_id":"acct-secret","organization_id":"org-secret","project_id":"proj-secret","tenant_id":"tenant-secret","secret":"shared-secret","credential":"shared-credential","credentials":"shared-credentials"},"response":{"id":"resp_error_2"}}`)
+	shouldContinue, usage, rewritten, err = provider.handleCodexSupplierMessage(wsconn.TextMessage, sensitiveErrorPayload, nil)
+	if !shouldContinue || usage != nil || len(rewritten) == 0 || err != nil {
+		t.Fatalf("expected sensitive provider error event to be rewritten, continue=%v usage=%+v rewritten=%s err=%v", shouldContinue, usage, rewritten, err)
+	}
+	if strings.Contains(string(rewritten), "supplier-secret") || strings.Contains(string(rewritten), "provider-secret") || strings.Contains(string(rewritten), "acct-secret") || strings.Contains(string(rewritten), "org-secret") || strings.Contains(string(rewritten), "proj-secret") || strings.Contains(string(rewritten), "tenant-secret") || strings.Contains(string(rewritten), "shared-secret") || strings.Contains(string(rewritten), "shared-credential") || strings.Contains(string(rewritten), "shared-credentials") {
+		t.Fatalf("provider credentials leaked in rewritten error payload: %s", rewritten)
+	}
+	if !strings.Contains(string(rewritten), `"type":"error"`) || !strings.Contains(string(rewritten), `"id":"resp_error_2"`) {
+		t.Fatalf("safe provider error fields were lost: %s", rewritten)
+	}
+}
+
+func TestCodexProviderOpenRetryRequiresCredentialImmutability(t *testing.T) {
+	provider := &CodexProvider{Credentials: &OAuth2Credentials{AccessToken: "static-token"}}
+	if provider.codexOpenMayMutateCredentials() {
+		t.Fatal("static credential was treated as a possible open-time mutation")
+	}
+	provider.Credentials.RefreshToken = "refresh-token"
+	if !provider.codexOpenMayMutateCredentials() {
+		t.Fatal("refreshable OAuth credential must disable cross-channel handshake fallback")
 	}
 }
 
@@ -229,7 +249,7 @@ func TestCodexRealtimeConnectionPlanningAndDialPaths(t *testing.T) {
 		if plan != nil {
 			t.Fatalf("expected missing credentials to fail plan preparation, got %#v", plan)
 		}
-		if errWithCode == nil || errWithCode.Code != "codex_token_error" || errWithCode.StatusCode != http.StatusUnauthorized {
+		if errWithCode == nil || errWithCode.Code != "codex_token_error" || errWithCode.StatusCode != http.StatusServiceUnavailable || !errWithCode.LocalError {
 			t.Fatalf("expected codex token error, got %+v", errWithCode)
 		}
 	})
@@ -304,6 +324,9 @@ func TestCodexRealtimeConnectionPlanningAndDialPaths(t *testing.T) {
 			if gotCode != tc.wantCode || errWithCode.StatusCode != tc.wantStatus {
 				t.Fatalf("%s: expected %s/%d, got code=%v status=%d", tc.name, tc.wantCode, tc.wantStatus, errWithCode.Code, errWithCode.StatusCode)
 			}
+			if !errWithCode.UpstreamNotAttempted || errWithCode.UpstreamAmbiguous || errWithCode.UpstreamAccepted {
+				t.Fatalf("%s: handshake failure lost safe pre-write disposition: %+v", tc.name, errWithCode)
+			}
 			if tc.statusCode != http.StatusNotFound && tc.statusCode != http.StatusUpgradeRequired && errWithCode.LocalError {
 				t.Fatalf("%s: expected provider handshake status to be retryable control-plane signal, got local error", tc.name)
 			}
@@ -313,6 +336,9 @@ func TestCodexRealtimeConnectionPlanningAndDialPaths(t *testing.T) {
 		gotCode, _ := errWithCode.Code.(string)
 		if gotCode != "ws_request_failed" || errWithCode.StatusCode != http.StatusInternalServerError {
 			t.Fatalf("expected transport errors without HTTP status to remain ws_request_failed, got %+v", errWithCode)
+		}
+		if !errWithCode.UpstreamNotAttempted || errWithCode.UpstreamAmbiguous {
+			t.Fatalf("dial transport failure lost pre-write disposition: %+v", errWithCode)
 		}
 	})
 
@@ -369,6 +395,23 @@ func TestCodexRealtimeConnectionPlanningAndDialPaths(t *testing.T) {
 			if strings.Contains(message, forbidden) {
 				t.Fatalf("expected diagnostic log to redact %q, got %q", forbidden, message)
 			}
+		}
+	})
+
+	t.Run("handshake diagnostic log redacts response body secrets", func(t *testing.T) {
+		message := codexRealtimeWSDialFailureLogMessage(&wsconn.DialError{
+			URL:         "wss://provider.example/backend-api/codex/responses",
+			StatusCode:  http.StatusBadGateway,
+			BodySnippet: []byte(`{"error":{"code":"upstream_failed","message":"Authorization: Bearer sk-provider-secret-12345","account_id":"acct-secret","debug_url":"https://internal.example/private"}}`),
+			Err:         errors.New("websocket: bad handshake"),
+		})
+		for _, forbidden := range []string{"sk-provider-secret", "acct-secret", "internal.example", "Bearer"} {
+			if strings.Contains(message, forbidden) {
+				t.Fatalf("handshake body leaked %q: %s", forbidden, message)
+			}
+		}
+		if !strings.Contains(message, "upstream_failed") || !strings.Contains(message, "[redacted]") {
+			t.Fatalf("expected useful error code and redaction marker, got %s", message)
 		}
 	})
 

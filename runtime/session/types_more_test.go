@@ -1,79 +1,12 @@
 package session
 
 import (
-	"encoding/json"
 	"net/http"
 	"testing"
 	"time"
 
 	"one-api/types"
 )
-
-func TestNormalizeResponsesWSTransport(t *testing.T) {
-	cases := []struct {
-		name   string
-		value  string
-		want   TransportMode
-		wantOK bool
-	}{
-		{name: "empty defaults native", value: "", want: TransportModeResponsesWS, wantOK: true},
-		{name: "native", value: "native", want: TransportModeResponsesWS, wantOK: true},
-		{name: "native trims case", value: " Native ", want: TransportModeResponsesWS, wantOK: true},
-		{name: "http bridge", value: "http_bridge", want: TransportModeResponsesHTTPBridge, wantOK: true},
-		{name: "http bridge trims case", value: " HTTP_BRIDGE ", want: TransportModeResponsesHTTPBridge, wantOK: true},
-		{name: "invalid auto", value: "auto"},
-		{name: "invalid websocket", value: "websocket"},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got, ok := NormalizeResponsesWSTransport(tc.value)
-			if got != tc.want || ok != tc.wantOK {
-				t.Fatalf("expected mode=%q ok=%v, got mode=%q ok=%v", tc.want, tc.wantOK, got, ok)
-			}
-		})
-	}
-}
-
-func TestParseResponsesWSTransportField(t *testing.T) {
-	cases := []struct {
-		name    string
-		raw     json.RawMessage
-		want    TransportMode
-		wantErr bool
-	}{
-		{name: "missing defaults native", raw: nil, want: TransportModeResponsesWS},
-		{name: "null defaults native", raw: json.RawMessage(`null`), want: TransportModeResponsesWS},
-		{name: "native", raw: json.RawMessage(`"native"`), want: TransportModeResponsesWS},
-		{name: "http bridge", raw: json.RawMessage(`" HTTP_BRIDGE "`), want: TransportModeResponsesHTTPBridge},
-		{name: "non string", raw: json.RawMessage(`123`), wantErr: true},
-		{name: "invalid value", raw: json.RawMessage(`"auto"`), wantErr: true},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := ParseResponsesWSTransportField(tc.raw)
-			if tc.wantErr {
-				if err == nil {
-					t.Fatalf("expected parse error, got mode=%q", got)
-				}
-				return
-			}
-			if err != nil || got != tc.want {
-				t.Fatalf("expected mode=%q without error, got mode=%q err=%v", tc.want, got, err)
-			}
-		})
-	}
-}
-
-func TestResponsesWSTransportConfigValue(t *testing.T) {
-	if got := ResponsesWSTransportConfigValue(TransportModeResponsesWS); got != "native" {
-		t.Fatalf("expected native config value, got %q", got)
-	}
-	if got := ResponsesWSTransportConfigValue(TransportModeResponsesHTTPBridge); got != "http_bridge" {
-		t.Fatalf("expected http_bridge config value, got %q", got)
-	}
-}
 
 func TestProviderAPIErrorFromPayloadParsesNestedProviderPayload(t *testing.T) {
 	payload := []byte(`{"type":"error","status_code":429,"error":{"type":"usage_limit_reached","message":"monthly usage limit reached","param":"account"},"headers":{"x-ratelimit-reset":"60"}}`)
@@ -115,6 +48,19 @@ func TestProviderAPIErrorFromPayloadParsesTopLevelProviderPayload(t *testing.T) 
 	}
 	if statusWithoutMessage.StatusCode != http.StatusServiceUnavailable || statusWithoutMessage.Message == "" {
 		t.Fatalf("expected top-level status-only error to preserve status and default message, got %#v", statusWithoutMessage)
+	}
+}
+
+func TestOpenAIErrorEnvelopeFromPayloadRequiresTopLevelErrorField(t *testing.T) {
+	if apiErr := OpenAIErrorEnvelopeFromPayload([]byte(`{"message":"future success metadata","code":"future_code","choices":[{"delta":{"content":"ok"}}]}`)); apiErr != nil {
+		t.Fatalf("future top-level Chat fields were misclassified as an error: %+v", apiErr)
+	}
+	apiErr := OpenAIErrorEnvelopeFromPayload([]byte(`{"error":{"type":"invalid_request_error","code":"invalid_value"}}`))
+	if apiErr == nil || apiErr.Code != "invalid_value" || apiErr.Type != "invalid_request_error" {
+		t.Fatalf("code-only OpenAI error envelope was not recognized: %+v", apiErr)
+	}
+	if apiErr := OpenAIErrorEnvelopeFromPayload([]byte(`{"error":null,"message":"ordinary"}`)); apiErr != nil {
+		t.Fatalf("null error envelope was misclassified: %+v", apiErr)
 	}
 }
 
@@ -306,9 +252,46 @@ func TestGuardTurnObserverFinalizesOnlyOnce(t *testing.T) {
 	}
 }
 
+func TestGuardTurnObserverRollbackEndsObserverLifecycle(t *testing.T) {
+	recorder := &recordingAdmissionGuardTurnObserver{}
+	guarded := GuardTurnObserver(recorder)
+	if err := AdmitTurn(guarded); err != nil {
+		t.Fatalf("admit guarded turn: %v", err)
+	}
+	if err := guarded.ObserveTurnUsage(&types.UsageEvent{TotalTokens: 1}); err != nil {
+		t.Fatalf("observe before rollback: %v", err)
+	}
+	if err := RollbackTurnAdmission(guarded, "not_attempted"); err != nil {
+		t.Fatalf("rollback guarded turn: %v", err)
+	}
+	if err := guarded.ObserveTurnUsage(&types.UsageEvent{TotalTokens: 2}); err != nil {
+		t.Fatalf("observe after rollback must be a no-op: %v", err)
+	}
+	guarded.FinalizeTurn(TurnFinalizePayload{SessionID: "late"})
+	if recorder.admitCount != 1 || recorder.rollbackCount != 1 || recorder.observeCount != 1 || recorder.finalizeCount != 0 {
+		t.Fatalf("rollback did not seal observer lifecycle: %+v", recorder)
+	}
+}
+
 type recordingGuardTurnObserver struct {
 	observeCount  int
 	finalizeCount int
+}
+
+type recordingAdmissionGuardTurnObserver struct {
+	recordingGuardTurnObserver
+	admitCount    int
+	rollbackCount int
+}
+
+func (r *recordingAdmissionGuardTurnObserver) AdmitTurn() error {
+	r.admitCount++
+	return nil
+}
+
+func (r *recordingAdmissionGuardTurnObserver) RollbackTurnAdmission(string) error {
+	r.rollbackCount++
+	return nil
 }
 
 func (r *recordingGuardTurnObserver) ObserveTurnUsage(usage *types.UsageEvent) error {

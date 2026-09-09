@@ -67,6 +67,7 @@ func (p *SiliconflowProvider) ConvertToRerank(response *RerankResponse, request 
 			TotalTokens:      response.Meta.Tokens.InputTokens + response.Meta.Tokens.OutputTokens,
 		},
 	}
+	rerank.Usage.MarkProviderReported()
 
 	*p.Usage = *rerank.Usage
 

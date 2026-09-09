@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"one-api/common"
+	"one-api/common/config"
 	providersBase "one-api/providers/base"
 	"one-api/types"
 
@@ -25,9 +26,11 @@ func (r *relayImageEdits) setRequest() error {
 	if err := common.UnmarshalBodyReusable(r.c, &r.request); err != nil {
 		return err
 	}
-
 	if r.request.Prompt == "" {
 		return errors.New("field prompt is required")
+	}
+	if err := rejectImageStreamRequest(r.c); err != nil {
+		return err
 	}
 
 	if r.request.Model == "" {
@@ -39,6 +42,7 @@ func (r *relayImageEdits) setRequest() error {
 	}
 
 	r.setOriginalModel(r.request.Model)
+	setRequestChannelCapability(r.c, requireEndpointEnabled(config.RelayModeImagesEdits))
 
 	return nil
 }

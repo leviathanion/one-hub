@@ -104,3 +104,14 @@ func TestClientPayloadErrorHelpersWithCauseAndNilReceiver(t *testing.T) {
 		t.Fatalf("expected non-payload errors to return nil payload, got %q", string(payload))
 	}
 }
+
+func TestRecoverableClientPayloadErrorIsExplicit(t *testing.T) {
+	baseErr := errors.New("request rejected")
+	recoverable := NewRecoverableClientPayloadError(baseErr, []byte(`{"type":"error"}`))
+	if !ClientPayloadErrorIsRecoverable(recoverable) || !errors.Is(recoverable, baseErr) {
+		t.Fatalf("expected recoverable client payload error with original cause, got %v", recoverable)
+	}
+	if ClientPayloadErrorIsRecoverable(NewClientPayloadError(baseErr, []byte(`{"type":"error"}`))) || ClientPayloadErrorIsRecoverable(baseErr) {
+		t.Fatal("ordinary client payload and plain errors must remain non-recoverable")
+	}
+}

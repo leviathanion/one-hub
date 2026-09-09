@@ -11,6 +11,7 @@ import (
 
 	"one-api/common/wsconn"
 	"one-api/common/wsconn/wstest"
+	"one-api/types"
 )
 
 type nativeTestAdapter struct {
@@ -22,6 +23,32 @@ type nativeTestAdapter struct {
 }
 
 type nativeTestContextKey string
+
+type nativeDoneHookContext struct {
+	context.Context
+	done chan struct{}
+	once sync.Once
+	hook func()
+}
+
+func (c *nativeDoneHookContext) Done() <-chan struct{} {
+	c.once.Do(func() {
+		if c.hook != nil {
+			c.hook()
+		}
+		close(c.done)
+	})
+	return c.done
+}
+
+func (c *nativeDoneHookContext) Err() error {
+	select {
+	case <-c.done:
+		return context.Canceled
+	default:
+		return nil
+	}
+}
 
 func (a nativeTestAdapter) PrepareClientFrame(ctx context.Context, frame Frame) (Frame, error) {
 	if a.prepare != nil {
@@ -96,6 +123,20 @@ func TestNativeSessionSendClientWithResultClassifiesWriteErrorAfterEntryAsAmbigu
 	}
 }
 
+func TestNativeSessionSendClientWithResultKeepsPreWriteFailureReplayable(t *testing.T) {
+	client, _ := wstest.Pair(t)
+	session := NewNativeSession(client, nativeTestAdapter{}, NativeSessionOptions{})
+	writeErr := errors.New("connection closed before raw writer")
+	session.writeMessageResult = func(wsconn.MessageType, []byte) wsconn.WriteResult {
+		return wsconn.WriteResult{Attempted: false, Err: writeErr}
+	}
+
+	result := session.SendClientWithResult(context.Background(), SendRequest{AttemptID: "attempt-test", Frame: NewTextFrame([]byte(`{"type":"response.create"}`))})
+	if result.Status != ResponsesWSTransportSendNotAttempted || !errors.Is(result.Err, writeErr) {
+		t.Fatalf("pre-write fact was turned ambiguous: %+v", result)
+	}
+}
+
 func TestNativeSessionRecvProviderFrameAndCloseOrigins(t *testing.T) {
 	client, server := wstest.Pair(t)
 	closeInfos := make(chan ProviderCloseInfo, 1)
@@ -137,6 +178,11 @@ func TestNativeSessionRecvProviderFrameAndCloseOrigins(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("expected adapter close mapping to run")
+	}
+	select {
+	case <-session.base.Done():
+	case <-time.After(time.Second):
+		t.Fatal("expected provider close to cancel the native session context")
 	}
 }
 
@@ -259,10 +305,10 @@ func TestNativeSessionFiltersBootstrapWithoutDownstreamFrameOrUsage(t *testing.T
 	}
 	recvCtx, recvCancel := context.WithCancel(context.Background())
 	defer recvCancel()
-	recvCh := make(chan recvResult, 1)
+	resultCh := make(chan recvResult, 1)
 	go func() {
 		event, err := session.Recv(recvCtx)
-		recvCh <- recvResult{event: event, err: err}
+		resultCh <- recvResult{event: event, err: err}
 	}()
 
 	if err := server.WriteMessage(wsconn.TextMessage, []byte(`{"type":"session.created"}`)); err != nil {
@@ -274,13 +320,13 @@ func TestNativeSessionFiltersBootstrapWithoutDownstreamFrameOrUsage(t *testing.T
 		t.Fatal("expected adapter to handle provider bootstrap frame")
 	}
 	select {
-	case got := <-recvCh:
+	case got := <-resultCh:
 		t.Fatalf("expected filtered bootstrap frame to produce no recv event, event=%+v err=%v", got.event, got.err)
 	case <-time.After(50 * time.Millisecond):
 	}
 	recvCancel()
 	select {
-	case <-recvCh:
+	case <-resultCh:
 	case <-time.After(time.Second):
 		t.Fatal("expected pending Recv to exit after context cancellation")
 	}
@@ -360,6 +406,12 @@ func TestNativeSessionRecvDrainsBufferedProviderEventBeforeTerminal(t *testing.T
 	}) {
 		t.Fatal("expected terminal event to enqueue")
 	}
+	if session.enqueueTerminal(UpstreamEvent{
+		DetailOrigin: RecvDetailOriginNativeLocalAbort,
+		Err:          ErrUpstreamClosed,
+	}) {
+		t.Fatal("expected a full terminal queue to report that the second event was not enqueued")
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -377,6 +429,79 @@ func TestNativeSessionRecvDrainsBufferedProviderEventBeforeTerminal(t *testing.T
 	}
 	if terminal.DetailOrigin != RecvDetailOriginNativeBackpressure || !errors.Is(terminal.Err, ErrNativeQueueFull) {
 		t.Fatalf("expected backpressure terminal after provider frame, got %+v", terminal)
+	}
+}
+
+func TestNativeSessionFullOrdinaryQueuePreservesProviderTerminalAndUsage(t *testing.T) {
+	session := NewNativeSession(nil, nativeTestAdapter{}, NativeSessionOptions{RecvQueueSize: 1})
+	ordinaryFrame := NewTextFrame([]byte(`{"type":"response.created","sequence_number":0,"response":{"id":"resp_1","status":"in_progress"}}`))
+	if !session.enqueue(UpstreamEvent{Frame: &ordinaryFrame, DetailOrigin: RecvDetailOriginProviderFrame}) {
+		t.Fatal("expected ordinary provider frame to fill recv queue")
+	}
+	terminalFrame := NewTextFrame([]byte(`{"type":"response.completed","sequence_number":1,"response":{"id":"resp_1","status":"completed"}}`))
+	usage := &types.UsageEvent{InputTokens: 7, OutputTokens: 3, TotalTokens: 10}
+	if !session.enqueue(UpstreamEvent{Frame: &terminalFrame, Usage: usage, AttemptID: "attempt-1", DetailOrigin: RecvDetailOriginProviderFrame}) {
+		t.Fatal("expected provider terminal to use reserved terminal lane")
+	}
+
+	first, err := session.Recv(context.Background())
+	if err != nil || first.Frame == nil || string(first.Frame.Payload()) != string(ordinaryFrame.Payload()) {
+		t.Fatalf("expected ordinary queued event first, event=%+v err=%v", first, err)
+	}
+	terminal, err := session.Recv(context.Background())
+	if err != nil {
+		t.Fatalf("recv provider terminal: %v", err)
+	}
+	if terminal.Frame == nil || string(terminal.Frame.Payload()) != string(terminalFrame.Payload()) || terminal.Usage != usage || terminal.AttemptID != "attempt-1" {
+		t.Fatalf("provider terminal/usage changed while queue was full: %+v", terminal)
+	}
+	if errors.Is(terminal.Err, ErrNativeQueueFull) || terminal.DetailOrigin != RecvDetailOriginProviderFrame {
+		t.Fatalf("provider terminal was replaced by proxy backpressure: %+v", terminal)
+	}
+}
+
+func TestNativeSessionOrderedQueuePreservesOrdinaryFrameBeforeTerminal(t *testing.T) {
+	session := NewNativeSession(nil, nil, NativeSessionOptions{})
+	terminal := UpstreamEvent{AttemptID: "attempt-terminal", DetailOrigin: RecvDetailOriginAdapterPanic, Err: ErrAdapterPanic}
+	frame := NewTextFrame([]byte(`{"type":"response.created"}`))
+	if !session.enqueue(UpstreamEvent{AttemptID: "attempt-terminal", Frame: &frame, DetailOrigin: RecvDetailOriginProviderFrame}) {
+		t.Fatal("expected ordinary provider frame to enqueue")
+	}
+	if !session.enqueueTerminal(terminal) {
+		t.Fatal("expected terminal event to enqueue")
+	}
+
+	first, err := session.Recv(context.Background())
+	if err != nil || first.Frame == nil || first.DetailOrigin != RecvDetailOriginProviderFrame {
+		t.Fatalf("expected ordinary provider frame first, event=%+v err=%v", first, err)
+	}
+	second, err := session.Recv(context.Background())
+	if err != nil || second.DetailOrigin != RecvDetailOriginAdapterPanic || !errors.Is(second.Err, ErrAdapterPanic) {
+		t.Fatalf("expected deferred terminal to remain available, event=%+v err=%v", second, err)
+	}
+}
+
+func TestNativeSessionRecvCancellationDrainsTerminalThatBecameReadyAtSelect(t *testing.T) {
+	session := NewNativeSession(nil, nil, NativeSessionOptions{})
+	terminal := UpstreamEvent{AttemptID: "attempt-terminal", DetailOrigin: RecvDetailOriginNativeProviderClose, Err: io.EOF}
+	enqueued := false
+	ctx := &nativeDoneHookContext{
+		Context: context.Background(),
+		done:    make(chan struct{}),
+		hook: func() {
+			enqueued = session.enqueueTerminal(terminal)
+		},
+	}
+
+	event, err := session.Recv(ctx)
+	if err != nil {
+		t.Fatalf("ready terminal lost to context cancellation: %v", err)
+	}
+	if event.AttemptID != terminal.AttemptID || event.DetailOrigin != terminal.DetailOrigin || !errors.Is(event.Err, io.EOF) {
+		t.Fatalf("unexpected terminal after cancellation race: %+v", event)
+	}
+	if !enqueued {
+		t.Fatal("expected terminal event to enter the ordered queue during cancellation")
 	}
 }
 
@@ -585,7 +710,7 @@ func TestNativeSessionContainsAdapterPanicAtPrepareBoundary(t *testing.T) {
 	}
 }
 
-func TestNativeSessionAdapterPanicForceEnqueuesWhenQueueFull(t *testing.T) {
+func TestNativeSessionAdapterPanicPreservesQueuedEvidenceBeforeTerminal(t *testing.T) {
 	client, _ := wstest.Pair(t)
 	session := NewNativeSession(client, nativeTestAdapter{
 		prepare: func(context.Context, Frame) (Frame, error) {
@@ -610,10 +735,18 @@ func TestNativeSessionAdapterPanicForceEnqueuesWhenQueueFull(t *testing.T) {
 	defer cancel()
 	event, err := session.Recv(ctx)
 	if err != nil {
-		t.Fatalf("recv forced panic event: %v", err)
+		t.Fatalf("recv queued provider event: %v", err)
 	}
-	if event.DetailOrigin != RecvDetailOriginAdapterPanic || event.DetailPhase != RecvDetailPhasePrepareClientFrame || event.AttemptID != "attempt-panic" || !errors.Is(event.Err, ErrAdapterPanic) {
-		t.Fatalf("expected adapter panic evidence to replace old buffered event, got %+v", event)
+	if event.DetailOrigin != RecvDetailOriginProviderFrame || event.Frame == nil || string(event.Frame.Payload()) != `{"type":"response.created"}` {
+		t.Fatalf("expected queued provider evidence to remain first, got %+v", event)
+	}
+
+	terminal, err := session.Recv(ctx)
+	if err != nil {
+		t.Fatalf("recv adapter panic terminal: %v", err)
+	}
+	if terminal.DetailOrigin != RecvDetailOriginAdapterPanic || terminal.DetailPhase != RecvDetailPhasePrepareClientFrame || terminal.AttemptID != "attempt-panic" || !errors.Is(terminal.Err, ErrAdapterPanic) {
+		t.Fatalf("expected adapter panic after queued provider evidence, got %+v", terminal)
 	}
 }
 
@@ -730,7 +863,7 @@ func TestNativeSessionContainsReadPumpPanic(t *testing.T) {
 		session.runReadPump()
 	}()
 
-	event, ok := session.recvBufferedEvent()
+	event, ok := session.events.dequeue()
 	if !ok {
 		t.Fatal("expected contained read pump panic event")
 	}

@@ -1,18 +1,17 @@
 package controller
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"one-api/common"
 	"one-api/common/config"
+	"one-api/common/providerendpoint"
 	"one-api/common/utils"
 	"one-api/model"
 	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/gin-gonic/gin/binding"
 )
 
 func GetChannelsList(c *gin.Context) {
@@ -79,7 +78,7 @@ func AddChannel(c *gin.Context) {
 	if tagExists {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
-			"message": "标签已存在，请到标签编辑里新增 key",
+			"message": "标签已存在，请使用标签的新增渠道入口",
 		})
 		return
 	}
@@ -190,34 +189,12 @@ func DeleteDisabledChannel(c *gin.Context) {
 }
 
 func UpdateChannel(c *gin.Context) {
-	channel := model.Channel{}
-	// ShouldBindBodyWith caches the raw body in Gin's context, so the second
-	// bind below can distinguish omitted fields from submitted zero values.
-	err := c.ShouldBindBodyWith(&channel, binding.JSON)
-	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": err.Error(),
-		})
+	var request model.ChannelEditRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		common.APIRespondWithError(c, http.StatusOK, err)
 		return
 	}
-	var submitted map[string]json.RawMessage
-	if err := c.ShouldBindBodyWith(&submitted, binding.JSON); err != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": err.Error(),
-		})
-		return
-	}
-	updateOptions := model.ChannelUpdateOptions{
-		OtherSubmitted:   submitted != nil && mapHasJSONField(submitted, "other"),
-		BaseURLSubmitted: submitted != nil && mapHasJSONField(submitted, "base_url"),
-	}
-	if channel.Models == "" {
-		err = channel.UpdateWithOptions(false, updateOptions)
-	} else {
-		err = channel.UpdateWithOptions(true, updateOptions)
-	}
+	err := request.Update()
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
@@ -228,13 +205,8 @@ func UpdateChannel(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
-		"data":    channel,
+		"data":    request.Channel,
 	})
-}
-
-func mapHasJSONField(fields map[string]json.RawMessage, field string) bool {
-	_, ok := fields[field]
-	return ok
 }
 
 func BatchUpdateChannelsAzureApi(c *gin.Context) {
@@ -311,4 +283,8 @@ func BatchDeleteChannel(c *gin.Context) {
 		"message": "",
 		"data":    count,
 	})
+}
+
+func GetChannelEndpoints(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": providerendpoint.Definitions()})
 }

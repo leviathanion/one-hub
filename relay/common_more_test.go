@@ -7,12 +7,18 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/groupctx"
 	"one-api/common/logger"
+	"one-api/common/providerresponse"
+	"one-api/common/requestctx"
+	"one-api/common/requester"
+	"one-api/internal/testutil/sqlitetest"
 	"one-api/model"
 	claudeprovider "one-api/providers/claude"
 	"one-api/providers/openai"
@@ -24,6 +30,71 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
+
+type partialErrorReadCloser struct {
+	sent bool
+}
+
+func (r *partialErrorReadCloser) Read(data []byte) (int, error) {
+	if !r.sent {
+		r.sent = true
+		data[0] = '{'
+		return 1, nil
+	}
+	return 0, errors.New("provider body read failed")
+}
+
+func (*partialErrorReadCloser) Close() error { return nil }
+
+func TestResponseCustomFiltersProviderHeaders(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", nil)
+
+	err := responseCustom(ctx, &types.AudioResponseWrapper{
+		Headers: map[string]string{
+			"Content-Type":        "text/plain",
+			"X-Request-Id":        "req_audio",
+			"Set-Cookie":          "provider_session=secret",
+			"Openai-Organization": "org_shared",
+			"X-Provider-Debug":    "internal",
+		},
+		Body: []byte("transcript"),
+	}, providerresponse.OperationAudioTranscription)
+	if err != nil {
+		t.Fatalf("expected audio response to succeed, got %v", err)
+	}
+	if recorder.Body.String() != "transcript" || recorder.Header().Get("Content-Type") != "text/plain" || recorder.Header().Get("X-Request-Id") != "req_audio" {
+		t.Fatalf("expected response body and safe headers, got body=%q headers=%#v", recorder.Body.String(), recorder.Header())
+	}
+	for _, forbidden := range []string{"Set-Cookie", "Openai-Organization", "X-Provider-Debug"} {
+		if recorder.Header().Get(forbidden) != "" {
+			t.Fatalf("expected %s to be filtered, got %#v", forbidden, recorder.Header())
+		}
+	}
+}
+
+func TestResponseMultipartAbortsCommittedCopyFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logger.Logger = zap.NewNop()
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses/resp_1", nil)
+
+	defer func() {
+		if recovered := recover(); recovered != http.ErrAbortHandler {
+			t.Fatalf("expected http.ErrAbortHandler, got %#v", recovered)
+		}
+		if got := recorder.Body.String(); got != "{" {
+			t.Fatalf("expected only the committed provider prefix, got %q", got)
+		}
+	}()
+	responseMultipart(ctx, &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       &partialErrorReadCloser{},
+	}, providerresponse.Policy{Operation: providerresponse.OperationResponsesRetrieve, DataPath: providerresponse.DataPathExactWire, BodyUnmodified: true})
+}
 
 func TestPath2RelayAndLimitModelHelpers(t *testing.T) {
 	ginCtx := newRelayTestContext(nil)
@@ -82,36 +153,8 @@ func TestPath2RelayAndLimitModelHelpers(t *testing.T) {
 	}
 }
 
-func TestProviderSelectionCachingAndChannelSelectionHelpers(t *testing.T) {
+func TestChannelSelectionHelpers(t *testing.T) {
 	ctx := newRelayTestContext(nil)
-	provider := &relayTestBaseProvider{channel: newRelayTestCodexChannel(11)}
-
-	ctx.Set("channel_id", 11)
-	ctx.Set("channel_type", config.ChannelTypeCodex)
-	ctx.Set("billing_original_model", true)
-	ctx.Set("skip_only_chat", true)
-	ctx.Set("is_stream", false)
-	cacheProviderSelection(ctx, "gpt-5", provider, "gpt-5-codex")
-
-	cachedProvider, newModelName, ok := consumeCachedProviderSelection(ctx, "gpt-5")
-	if !ok || cachedProvider != provider || newModelName != "gpt-5-codex" {
-		t.Fatalf("expected cached provider selection round-trip, got provider=%#v model=%q ok=%v", cachedProvider, newModelName, ok)
-	}
-	if ctx.GetInt("channel_id") != 11 || ctx.GetString("new_model") != "gpt-5-codex" || !ctx.GetBool("billing_original_model") {
-		t.Fatalf("expected provider selection context to be restored, got channel_id=%d new_model=%q billing_original=%v", ctx.GetInt("channel_id"), ctx.GetString("new_model"), ctx.GetBool("billing_original_model"))
-	}
-
-	cacheProviderSelection(ctx, "gpt-5", provider, "gpt-5-codex")
-	ctx.Set("skip_only_chat", false)
-	if _, _, ok := consumeCachedProviderSelection(ctx, "gpt-5"); ok {
-		t.Fatal("expected cache miss when skip_only_chat changes")
-	}
-	ctx.Set("skip_only_chat", true)
-
-	cacheProviderSelection(ctx, "gpt-5", provider, "gpt-5-codex")
-	if _, _, ok := consumeCachedProviderSelection(ctx, "gpt-4o"); ok {
-		t.Fatal("expected cache miss when original model changes")
-	}
 
 	if explicitChannelPinID(nil) != 0 {
 		t.Fatal("expected nil context to have no explicit channel pin")
@@ -143,13 +186,13 @@ func TestProviderSelectionCachingAndChannelSelectionHelpers(t *testing.T) {
 	originalWaitPoll := config.PreferredChannelWaitPollMilliseconds
 	config.PreferredChannelWaitMilliseconds = 0
 	config.PreferredChannelWaitPollMilliseconds = 0
-	if preferredChannelWaitBudget() != 0 || preferredChannelWaitPollInterval() != 50*time.Millisecond {
-		t.Fatalf("expected wait helpers to normalize zero config values, got budget=%v poll=%v", preferredChannelWaitBudget(), preferredChannelWaitPollInterval())
+	if preferredChannelWaitBudget(nil) != 0 || preferredChannelWaitPollInterval(nil) != 50*time.Millisecond {
+		t.Fatalf("expected wait helpers to normalize zero config values, got budget=%v poll=%v", preferredChannelWaitBudget(nil), preferredChannelWaitPollInterval(nil))
 	}
 	config.PreferredChannelWaitMilliseconds = 125
 	config.PreferredChannelWaitPollMilliseconds = 10
-	if preferredChannelWaitBudget() != 125*time.Millisecond || preferredChannelWaitPollInterval() != 10*time.Millisecond {
-		t.Fatalf("unexpected wait helper values, got budget=%v poll=%v", preferredChannelWaitBudget(), preferredChannelWaitPollInterval())
+	if preferredChannelWaitBudget(nil) != 125*time.Millisecond || preferredChannelWaitPollInterval(nil) != 10*time.Millisecond {
+		t.Fatalf("unexpected wait helper values, got budget=%v poll=%v", preferredChannelWaitBudget(nil), preferredChannelWaitPollInterval(nil))
 	}
 	config.PreferredChannelWaitMilliseconds = originalWaitBudget
 	config.PreferredChannelWaitPollMilliseconds = originalWaitPoll
@@ -234,7 +277,7 @@ func TestGroupManagerFallbackAndFetchChannelByID(t *testing.T) {
 	}
 
 	originalDB := model.DB
-	testDB, err := gorm.Open(sqlite.Open("file:"+strings.ReplaceAll(t.Name(), "/", "_")+"?mode=memory&cache=shared"), &gorm.Config{})
+	testDB, err := gorm.Open(sqlite.Open(sqlitetest.MemoryDSN()), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("expected in-memory sqlite database, got %v", err)
 	}
@@ -358,6 +401,58 @@ func TestRelayCommonStreamingAndRetryHelpers(t *testing.T) {
 		t.Fatalf("expected json client helper to write response body, got %q", body)
 	}
 
+	rawResponse := &types.ChatCompletionResponse{
+		ID:     "chatcmpl_typed",
+		Object: "chat.completion",
+		Model:  "gpt-5",
+		Choices: []types.ChatCompletionChoice{{
+			Index: 0,
+			Message: types.ChatCompletionMessage{
+				Role:             types.ChatMessageRoleAssistant,
+				Content:          "answer",
+				ReasoningContent: "plan",
+			},
+			FinishReason: types.FinishReasonStop,
+		}},
+		Usage: &types.Usage{PromptTokens: 1, CompletionTokens: 2, TotalTokens: 3},
+	}
+	rawResponse.SetProviderRawJSON([]byte(`{"id":"chatcmpl_raw","account_id":"acct-secret","choices":[{"message":{"content":"model says access_token is a public label","reasoning":"plan"}}],"future":{"exact":true}}`))
+
+	typedRecorder := httptest.NewRecorder()
+	typedCtx, _ := gin.CreateTestContext(typedRecorder)
+	typedCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	if errWithCode := responseJsonClient(typedCtx, rawResponse); errWithCode != nil {
+		t.Fatalf("expected captured provider response to succeed, got %v", errWithCode)
+	}
+	if body := typedRecorder.Body.String(); !strings.Contains(body, `"id":"chatcmpl_typed"`) || !strings.Contains(body, `"reasoning_content":"plan"`) || !strings.Contains(body, `"completion_tokens":2`) || strings.Contains(body, `"chatcmpl_raw"`) {
+		t.Fatalf("expected raw capture without replay opt-in to render normalized response, got %q", body)
+	}
+
+	rawResponse.EnableProviderRawJSONReplay()
+	rawRecorder := httptest.NewRecorder()
+	rawCtx, _ := gin.CreateTestContext(rawRecorder)
+	rawCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	rawCtx.Set(requestctx.ProviderResponseStatusContextKey, http.StatusCreated)
+	rawCtx.Set(requestctx.ProviderResponseHeadersContextKey, http.Header{
+		"Cache-Control":    {"private, no-store"},
+		"Content-Encoding": {"gzip"},
+		"Content-Length":   {"123"},
+		"Digest":           {"sha-256=:YWJj:"},
+		"Etag":             {`"raw-v1"`},
+	})
+	if errWithCode := responseJsonClient(rawCtx, rawResponse); errWithCode != nil {
+		t.Fatalf("expected opted-in raw provider response to succeed, got %v", errWithCode)
+	}
+	if rawRecorder.Code != http.StatusCreated || strings.Contains(rawRecorder.Body.String(), "acct-secret") || !strings.Contains(rawRecorder.Body.String(), `"account_id":"[redacted]"`) || !strings.Contains(rawRecorder.Body.String(), `"content":"model says access_token is a public label"`) || !strings.Contains(rawRecorder.Body.String(), `"future":{"exact":true}`) {
+		t.Fatalf("expected exact provider status/body after replay opt-in, got status=%d body=%q", rawRecorder.Code, rawRecorder.Body.String())
+	}
+	if rawRecorder.Header().Get("Content-Encoding") != "" || rawRecorder.Header().Get("Content-Length") != "" || rawRecorder.Header().Get("Digest") != "" || rawRecorder.Header().Get("Etag") != "" {
+		t.Fatalf("security rewrite retained invalid representation validators: %#v", rawRecorder.Header())
+	}
+	if rawRecorder.Header().Get("Cache-Control") != "private, no-store" {
+		t.Fatalf("security rewrite dropped cache safety directive: %#v", rawRecorder.Header())
+	}
+
 	retryCtx := newRelayTestContext(nil)
 	if !shouldRetry(retryCtx, &types.OpenAIErrorWithStatusCode{StatusCode: http.StatusInternalServerError}, config.ChannelTypeCodex) {
 		t.Fatal("expected 5xx responses to remain retryable")
@@ -397,6 +492,14 @@ func TestRelayCommonStreamingAndRetryHelpers(t *testing.T) {
 	if shouldRetry(newRelayTestContext(nil), &types.OpenAIErrorWithStatusCode{StatusCode: http.StatusTooManyRequests, LocalError: true}, config.ChannelTypeCodex) {
 		t.Fatal("expected local realtime errors to disable retries")
 	}
+	if !shouldRetry(newRelayTestContext(nil), &types.OpenAIErrorWithStatusCode{StatusCode: http.StatusServiceUnavailable, LocalError: true, UpstreamNotAttempted: true}, config.ChannelTypeCodex) {
+		t.Fatal("expected channel-local pre-provider failure to retry another channel")
+	}
+	pinnedLocal := newRelayTestContext(nil)
+	pinnedLocal.Set("specific_channel_id", 99)
+	if shouldRetry(pinnedLocal, &types.OpenAIErrorWithStatusCode{StatusCode: http.StatusServiceUnavailable, LocalError: true, UpstreamNotAttempted: true}, config.ChannelTypeCodex) {
+		t.Fatal("expected explicit channel pin to block pre-provider fallback")
+	}
 	if shouldRetry(newRelayTestContext(nil), &types.OpenAIErrorWithStatusCode{
 		OpenAIError: types.OpenAIError{
 			Code:  "previous_response_not_found",
@@ -407,6 +510,27 @@ func TestRelayCommonStreamingAndRetryHelpers(t *testing.T) {
 	}, config.ChannelTypeCodex) {
 		t.Fatal("expected local stale continuation errors to disable retries")
 	}
+	if !shouldRetryBadRequest(config.ChannelTypeAnthropic, &types.OpenAIErrorWithStatusCode{
+		OpenAIError:            types.OpenAIError{Message: "provider account rejected the request"},
+		StatusCode:             http.StatusBadRequest,
+		ProviderQuotaExhausted: true,
+	}) {
+		t.Fatal("expected redacted Anthropic balance exhaustion to retain retry disposition")
+	}
+	if !shouldRetryBadRequest(config.ChannelTypeGemini, &types.OpenAIErrorWithStatusCode{
+		OpenAIError:          types.OpenAIError{Message: "provider account rejected the request"},
+		StatusCode:           http.StatusBadRequest,
+		ProviderAuthRejected: true,
+	}) {
+		t.Fatal("expected redacted Gemini credential rejection to retain retry disposition")
+	}
+	if !shouldRetryBadRequest(config.ChannelTypeAnthropic, &types.OpenAIErrorWithStatusCode{
+		OpenAIError:         types.OpenAIError{Message: "provider account rejected the request"},
+		StatusCode:          http.StatusBadRequest,
+		ProviderRateLimited: true,
+	}) {
+		t.Fatal("expected redacted provider rate limit to retain retry disposition")
+	}
 
 	if err := config.SetRetryStatusCodes("401"); err != nil {
 		t.Fatalf("expected retry status override to parse, got %v", err)
@@ -416,6 +540,68 @@ func TestRelayCommonStreamingAndRetryHelpers(t *testing.T) {
 	}
 	if shouldRetry(newRelayTestContext(nil), &types.OpenAIErrorWithStatusCode{StatusCode: http.StatusInternalServerError}, config.ChannelTypeCodex) {
 		t.Fatal("expected status 500 to stop retrying after retry status override")
+	}
+}
+
+func TestShouldRetryReadsLatestRuntimePublication(t *testing.T) {
+	originalManager := config.GlobalOption
+	manager := config.NewOptionManager()
+	retryStatusCodes := "401"
+	manager.RegisterStringOption("RetryStatusCodes", &retryStatusCodes, config.OptionMetadata{Visibility: config.OptionVisibilityPublic})
+	if _, err := manager.PublishRuntimeOverrides(1, map[string]string{"RetryStatusCodes": "401"}); err != nil {
+		t.Fatalf("publish initial retry policy: %v", err)
+	}
+	config.GlobalOption = manager
+	t.Cleanup(func() { config.GlobalOption = originalManager })
+
+	ctx := newRelayTestContext(nil)
+	if !shouldRetry(ctx, &types.OpenAIErrorWithStatusCode{StatusCode: http.StatusUnauthorized}, config.ChannelTypeCodex) {
+		t.Fatal("initial publication should retry 401")
+	}
+	if _, err := manager.PublishRuntimeOverrides(2, map[string]string{"RetryStatusCodes": "503"}); err != nil {
+		t.Fatalf("publish updated retry policy: %v", err)
+	}
+	if shouldRetry(ctx, &types.OpenAIErrorWithStatusCode{StatusCode: http.StatusUnauthorized}, config.ChannelTypeCodex) {
+		t.Fatal("a later retry decision retained the old publication")
+	}
+	if !shouldRetry(ctx, &types.OpenAIErrorWithStatusCode{StatusCode: http.StatusServiceUnavailable}, config.ChannelTypeCodex) {
+		t.Fatal("a later retry decision should observe the newer publication")
+	}
+}
+
+func TestResponseJSONClientProjectsOnlyPublicResponsesCacheFields(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	response := &types.OpenAIResponsesResponses{
+		ID: "resp_typed_cache",
+		Usage: &types.ResponsesUsage{
+			InputTokens: 18,
+			InputTokensDetails: &types.ResponsesUsageInputTokensDetails{
+				CachedTokens:      2,
+				CachedReadTokens:  3,
+				CacheWriteTokens:  5,
+				CachedWriteTokens: 7,
+			},
+		},
+	}
+
+	if apiErr := responseJsonClient(ctx, response); apiErr != nil {
+		t.Fatalf("typed Responses delivery failed: %v", apiErr)
+	}
+	body := recorder.Body.String()
+	for _, publicField := range []string{`"cached_tokens":2`, `"cache_write_tokens":5`} {
+		if !strings.Contains(body, publicField) {
+			t.Fatalf("public cache field %s missing from typed Responses wire: %s", publicField, body)
+		}
+	}
+	for _, privateField := range []string{"cached_read_tokens", "cached_write_tokens"} {
+		if strings.Contains(body, privateField) {
+			t.Fatalf("provider cache evidence %q leaked from typed Responses wire: %s", privateField, body)
+		}
+	}
+	if response.Usage.InputTokensDetails.CachedReadTokens != 3 || response.Usage.InputTokensDetails.CachedWriteTokens != 7 {
+		t.Fatalf("typed delivery mutated internal evidence: %+v", response.Usage.InputTokensDetails)
 	}
 }
 
@@ -461,8 +647,8 @@ func TestProcessProviderPayloadAPIErrorBestEffortControlPlane(t *testing.T) {
 	processProviderPayloadAPIError(ctx, channel, []byte(`{"type":"error","error":{"type":"usage_limit_reached","message":"usage limit reached"}}`), "test_provider_error")
 	select {
 	case apiErr := <-errCh:
-		if apiErr == nil || apiErr.StatusCode != http.StatusTooManyRequests || apiErr.Type != "usage_limit_reached" {
-			t.Fatalf("expected parsed usage-limit provider error, got %#v", apiErr)
+		if apiErr == nil || apiErr.StatusCode != http.StatusTooManyRequests || apiErr.Code != "provider_account_error" || !apiErr.ProviderQuotaExhausted {
+			t.Fatalf("expected safe usage-limit provider error, got %#v", apiErr)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for provider error control-plane handling")
@@ -479,15 +665,15 @@ func TestFetchChannelByModelWithSelectionFiltersCustomClaudeRelayChannels(t *tes
 	proxy := ""
 	modelName := "claude-3-5-sonnet-20241022"
 	disabledPlugin := datatypes.NewJSONType(model.PluginType{
-		"claude": {
+		"endpoints": {"anthropic.messages": map[string]any{
 			"enabled": false,
-		},
+		}},
 	})
 	invalidPlugin := datatypes.NewJSONType(model.PluginType{
-		"claude": {
-			"enabled":  true,
-			"base_url": "://bad-url",
-		},
+		"endpoints": {"anthropic.messages": map[string]any{
+			"enabled":      true,
+			"upstream_url": "://bad-url/v1/messages",
+		}},
 	})
 
 	model.ChannelGroup = model.ChannelsChooser{
@@ -558,10 +744,10 @@ func TestPrepareProviderForCustomClaudeRelay(t *testing.T) {
 	weight := uint(1)
 	proxy := ""
 	plugin := datatypes.NewJSONType(model.PluginType{
-		"claude": {
-			"enabled":  true,
-			"base_url": "https://claude-proxy.example.com/api",
-		},
+		"endpoints": {"anthropic.messages": map[string]any{
+			"enabled":      true,
+			"upstream_url": "https://claude-proxy.example.com/api/v1/messages",
+		}},
 	})
 	channel := &model.Channel{
 		Id:     81,
@@ -593,7 +779,7 @@ func TestPrepareProviderForCustomClaudeRelay(t *testing.T) {
 	if newModelName != "claude-3-5-sonnet-20241022" {
 		t.Fatalf("unexpected mapped model name: %q", newModelName)
 	}
-	if fullURL := claudeProvider.GetFullRequestURL("/v1/messages"); fullURL != "https://claude-proxy.example.com/api/v1/messages" {
+	if fullURL := claudeProvider.GetFullRequestURL(claudeProvider.Config.ChatCompletions); fullURL != "https://claude-proxy.example.com/api/v1/messages" {
 		t.Fatalf("unexpected Claude request URL: %q", fullURL)
 	}
 	headers := claudeProvider.GetRequestHeaders()
@@ -612,10 +798,10 @@ func TestPrepareProviderForCustomClaudeRelay(t *testing.T) {
 	}
 
 	invalidPlugin := datatypes.NewJSONType(model.PluginType{
-		"claude": {
-			"enabled":  true,
-			"base_url": "https://claude-proxy.example.com/v1/messages",
-		},
+		"endpoints": {"anthropic.messages": map[string]any{
+			"enabled":      true,
+			"upstream_url": "https://claude-proxy.example.com/v1/messages/v1/messages",
+		}},
 	})
 	channel.Plugin = &invalidPlugin
 	provider, _, err = prepareProviderForChannel(claudeCtx, "claude-3-5-sonnet-20241022", channel)
@@ -626,8 +812,65 @@ func TestPrepareProviderForCustomClaudeRelay(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected Claude provider after preserving full Claude URL, got %T", provider)
 	}
-	if fullURL := claudeProvider.GetFullRequestURL("/v1/messages"); fullURL != "https://claude-proxy.example.com/v1/messages/v1/messages" {
+	if fullURL := claudeProvider.GetFullRequestURL(claudeProvider.Config.ChatCompletions); fullURL != "https://claude-proxy.example.com/v1/messages/v1/messages" {
 		t.Fatalf("unexpected preserved Claude request URL: %q", fullURL)
+	}
+}
+
+func TestCustomClaudeSelectionPreservesMappedRemoteMediaRawWire(t *testing.T) {
+	var mediaGets atomic.Int32
+	media := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mediaGets.Add(1)
+		_, _ = io.WriteString(w, "must not fetch")
+	}))
+	t.Cleanup(media.Close)
+	var gotBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"msg_custom","type":"message","role":"assistant","model":"claude-sonnet-4","content":[],"usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	t.Cleanup(upstream.Close)
+	originalHTTPClient := requester.HTTPClient
+	requester.HTTPClient = upstream.Client()
+	t.Cleanup(func() { requester.HTTPClient = originalHTTPClient })
+
+	proxy := ""
+	plugin := datatypes.NewJSONType(model.PluginType{"endpoints": {"anthropic.messages": map[string]any{"enabled": true, "upstream_url": upstream.URL + "/v1/messages"}}})
+	mapping := `{"public-claude":"claude-sonnet-4"}`
+	channel := &model.Channel{Type: config.ChannelTypeCustom, Key: "sk-custom", Proxy: &proxy, Plugin: &plugin, ModelMapping: &mapping}
+	raw := `{"model":"public-claude","max_tokens":16,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"url","url":"` + media.URL + `/a.png","future_source":true}}]}],"future_request":{"kept":true}}`
+	ctx := newRelayTestContext(nil)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/claude/v1/messages", strings.NewReader(raw))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	if _, err := common.CacheRequestBody(ctx); err != nil {
+		t.Fatalf("cache custom Claude request: %v", err)
+	}
+	provider, mappedModel, err := prepareProviderForChannel(ctx, "public-claude", channel)
+	if err != nil {
+		t.Fatalf("select custom Claude provider: %v", err)
+	}
+	claudeProvider, ok := provider.(*claudeprovider.ClaudeProvider)
+	if !ok {
+		t.Fatalf("selected provider=%T, want ClaudeProvider", provider)
+	}
+	request := &claudeprovider.ClaudeRequest{}
+	if err := common.UnmarshalBodyReusable(ctx, request); err != nil {
+		t.Fatalf("decode custom Claude request: %v", err)
+	}
+	request.Model = mappedModel
+	claudeProvider.SetUsage(&types.Usage{})
+	if _, apiErr := claudeProvider.CreateClaudeChat(request); apiErr != nil {
+		t.Fatalf("send custom Claude request: %v", apiErr)
+	}
+	if mediaGets.Load() != 0 {
+		t.Fatalf("custom Claude path fetched remote media %d times", mediaGets.Load())
+	}
+	for _, want := range []string{`"model":"claude-sonnet-4"`, `"future_source":true`, `"future_request":{"kept":true}`} {
+		if !strings.Contains(gotBody, want) {
+			t.Fatalf("custom Claude mapped raw body lost %s: %s", want, gotBody)
+		}
 	}
 }
 

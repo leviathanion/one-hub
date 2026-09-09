@@ -22,15 +22,6 @@ func TestResponsesWSTransportSendResultLegality(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:   "rejected before stream without error",
-			result: ResponsesWSTransportSendResult{Status: ResponsesWSTransportSendRejectedBeforeStream},
-		},
-		{
-			name:    "rejected before stream with error rejected",
-			result:  ResponsesWSTransportSendResult{Status: ResponsesWSTransportSendRejectedBeforeStream, Err: baseErr},
-			wantErr: true,
-		},
-		{
 			name:   "not attempted with error",
 			result: ResponsesWSTransportSendResult{Status: ResponsesWSTransportSendNotAttempted, Err: baseErr},
 		},
@@ -43,14 +34,14 @@ func TestResponsesWSTransportSendResultLegality(t *testing.T) {
 			name: "not attempted with reason",
 			result: ResponsesWSTransportSendResult{
 				Status: ResponsesWSTransportSendNotAttempted,
-				Reason: ResponsesWSTransportSendReasonNoActiveBridgeCancel,
+				Reason: ResponsesWSTransportSendReason("not_sent_control"),
 			},
 		},
 		{
 			name: "attempted with reason rejected",
 			result: ResponsesWSTransportSendResult{
 				Status: ResponsesWSTransportSendAttempted,
-				Reason: ResponsesWSTransportSendReasonNoActiveBridgeCancel,
+				Reason: ResponsesWSTransportSendReason("not_sent_control"),
 			},
 			wantErr: true,
 		},
@@ -67,7 +58,7 @@ func TestResponsesWSTransportSendResultLegality(t *testing.T) {
 			name: "ambiguous with reason rejected",
 			result: ResponsesWSTransportSendResult{
 				Status: ResponsesWSTransportSendAmbiguous,
-				Reason: ResponsesWSTransportSendReasonNoActiveBridgeCancel,
+				Reason: ResponsesWSTransportSendReason("not_sent_control"),
 			},
 			wantErr: true,
 		},
@@ -147,7 +138,6 @@ func TestRecvDetailOriginTerminalAllowlist(t *testing.T) {
 		RecvDetailOriginNativeProviderClose,
 		RecvDetailOriginProviderMalformed,
 		RecvDetailOriginProxyLocal,
-		RecvDetailOriginSyntheticBridge,
 	} {
 		if RecvDetailOriginCanCarryProviderTerminal(origin) {
 			t.Fatalf("expected origin %q not to be terminal-capable", origin)
@@ -159,8 +149,6 @@ func TestRecvDetailOriginPayloadOriginMatrix(t *testing.T) {
 	providerOrigins := []RecvDetailOrigin{
 		RecvDetailOriginProviderFrame,
 		RecvDetailOriginProviderStream,
-		RecvDetailOriginBridgeStreamOpened,
-		RecvDetailOriginBridgeOpenProviderError,
 		RecvDetailOriginNativeProviderClose,
 		RecvDetailOriginNativeProviderEOF,
 	}
@@ -176,9 +164,6 @@ func TestRecvDetailOriginPayloadOriginMatrix(t *testing.T) {
 
 	proxyLocalOrigins := []RecvDetailOrigin{
 		RecvDetailOriginProviderMalformed,
-		RecvDetailOriginSyntheticBridge,
-		RecvDetailOriginBridgeStreamError,
-		RecvDetailOriginBridgeStreamEOF,
 		RecvDetailOriginProxyLocal,
 		RecvDetailOriginAdapterPanic,
 		RecvDetailOriginNativeLocalAbort,

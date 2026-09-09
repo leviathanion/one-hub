@@ -64,7 +64,7 @@ func (p *MidjourneyProvider) Send(timeout int, requestURL string) (*MidjourneyRe
 			"modes": {strings.ToUpper(mjModel)},
 		}
 
-		if !config.MjNotifyEnabled {
+		if !config.GlobalOption.RuntimeSnapshot().Bool("MjNotifyEnabled", config.MjNotifyEnabled) {
 			delete(mapResult, "notifyHook")
 		}
 	}

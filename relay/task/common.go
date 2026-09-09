@@ -6,6 +6,7 @@ import (
 	"one-api/model"
 	"one-api/relay/task/base"
 	"one-api/relay/task/kling"
+	taskmidjourney "one-api/relay/task/midjourney"
 	"one-api/relay/task/suno"
 
 	"github.com/gin-gonic/gin"
@@ -26,7 +27,7 @@ func GetTaskAdaptor(relayType int, c *gin.Context) (base.TaskInterface, error) {
 	}
 }
 
-func GetTaskAdaptorByPlatform(platform string) (base.TaskInterface, error) {
+func GetTaskAdaptorByPlatform(platform string) (base.TaskProgressInterface, error) {
 	relayType := config.RelayModeUnknown
 
 	switch platform {
@@ -34,9 +35,19 @@ func GetTaskAdaptorByPlatform(platform string) (base.TaskInterface, error) {
 		relayType = config.RelayModeSuno
 	case model.TaskPlatformKling:
 		relayType = config.RelayModeKling
+	case model.TaskPlatformMidjourney:
+		return &taskmidjourney.Task{}, nil
 	}
 
-	return GetTaskAdaptor(relayType, nil)
+	adaptor, err := GetTaskAdaptor(relayType, nil)
+	if err != nil {
+		return nil, err
+	}
+	progressor, ok := adaptor.(base.TaskProgressInterface)
+	if !ok {
+		return nil, errors.New("task progress adaptor not found")
+	}
+	return progressor, nil
 }
 
 func getTaskBase(c *gin.Context, platform string) base.TaskBase {

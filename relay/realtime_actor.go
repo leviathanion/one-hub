@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"one-api/common"
+	"one-api/common/config"
 	"one-api/common/logger"
 	"one-api/common/wsconn"
 	runtimerealtime "one-api/runtime/realtime"
@@ -29,6 +31,40 @@ const (
 type realtimeRelayClientFrame struct {
 	mt      wsconn.MessageType
 	payload []byte
+	credit  *runtimerealtime.ByteCredit
+}
+
+func (f *realtimeRelayClientFrame) transferCredit(destination *runtimerealtime.ByteBudget) bool {
+	if f == nil {
+		return false
+	}
+	credit, ok := destination.TryAcquire(len(f.payload))
+	if !ok {
+		return false
+	}
+	if f.credit != nil {
+		f.credit.Release()
+	}
+	f.credit = credit
+	return true
+}
+
+func (f *realtimeRelayClientFrame) release() {
+	if f == nil {
+		return
+	}
+	if f.credit != nil {
+		f.credit.Release()
+		f.credit = nil
+	}
+	f.payload = nil
+}
+
+type realtimeRelayClientSend struct {
+	frame runtimerealtime.Frame
+	ctx   context.Context
+	done  chan struct{}
+	err   error
 }
 
 type realtimeRelayExit struct {
@@ -49,6 +85,8 @@ type realtimeRelayActor struct {
 	cancel context.CancelFunc
 
 	clientFrames   chan realtimeRelayClientFrame
+	clientBudget   *runtimerealtime.ByteBudget
+	pendingBudget  *runtimerealtime.ByteBudget
 	done           chan struct{}
 	userClosed     chan struct{}
 	supplierClosed chan struct{}
@@ -86,6 +124,8 @@ func newRealtimeRelayActorWithContext(base context.Context, client *wsconn.Manag
 		ctx:            ctx,
 		cancel:         cancel,
 		clientFrames:   make(chan realtimeRelayClientFrame, realtimeRelayClientFrameQueueSize),
+		clientBudget:   runtimerealtime.NewByteBudget(config.RealtimeWebsocketClientFrameQueueMaxBytes()),
+		pendingBudget:  runtimerealtime.NewByteBudget(config.RealtimeWebsocketPendingFrameQueueMaxBytes()),
 		done:           make(chan struct{}),
 		userClosed:     make(chan struct{}),
 		supplierClosed: make(chan struct{}),
@@ -173,11 +213,23 @@ func (b *realtimeRelayActor) clientPump() {
 	pump := wsconn.Pump{
 		Conn: b.client,
 		Handle: func(_ context.Context, mt wsconn.MessageType, payload []byte) {
-			frame := realtimeRelayClientFrame{mt: mt, payload: append([]byte(nil), payload...)}
+			credit, ok := b.clientBudget.TryAcquire(len(payload))
+			if !ok {
+				if b.client != nil {
+					b.client.Close(wsconn.CloseInfo{
+						Kind:   wsconn.CloseKindBackpressure,
+						Code:   wsconn.CloseMessageTooBig,
+						Reason: "client_frame_byte_budget_exceeded",
+					})
+				}
+				return
+			}
+			frame := realtimeRelayClientFrame{mt: mt, payload: append([]byte(nil), payload...), credit: credit}
 			select {
 			case b.clientFrames <- frame:
 				b.markActivity(time.Now())
 			default:
+				frame.release()
 				if b.client != nil {
 					b.client.Close(wsconn.CloseInfo{
 						Kind:   wsconn.CloseKindBackpressure,
@@ -203,33 +255,127 @@ func (b *realtimeRelayActor) clientPump() {
 }
 
 func (b *realtimeRelayActor) clientToSession() {
+	if b.session == nil {
+		b.emitExit(realtimeRelayExit{source: "user", err: net.ErrClosed})
+		return
+	}
+	var active *realtimeRelayClientSend
+	pending := make([]realtimeRelayClientFrame, 0, 4)
+	input := b.clientFrames
+	defer func() {
+		for i := range pending {
+			pending[i].release()
+		}
+	}()
+
 	for {
+		if active == nil {
+			if len(pending) > 0 {
+				frame := pending[0]
+				pending = pending[1:]
+				active = b.startClientSend(frame)
+				continue
+			}
+			if input == nil {
+				return
+			}
+			select {
+			case <-b.ctx.Done():
+				return
+			case frame, ok := <-input:
+				if !ok {
+					input = nil
+					continue
+				}
+				active = b.startClientSend(frame)
+			}
+			continue
+		}
+
 		select {
 		case <-b.ctx.Done():
 			return
-		case frame, ok := <-b.clientFrames:
+		case <-active.done:
+			err := active.err
+			active = nil
+			if !b.handleClientSendResult(err) {
+				return
+			}
+		case frame, ok := <-input:
 			if !ok {
-				return
+				input = nil
+				continue
 			}
-			if b.session == nil {
-				b.emitExit(realtimeRelayExit{source: "user", err: net.ErrClosed})
-				return
-			}
-			if err := b.session.SendClient(b.ctx, realtimeRelayFrameFromMessage(frame.mt, frame.payload)); err != nil {
-				if payload := realtimeRelayErrorPayload(err); payload != nil && !b.dropDownstreamWrites.Load() {
-					if writeErr := b.writeClientMessage(wsconn.TextMessage, payload); writeErr != nil {
-						b.emitExit(realtimeRelayExit{source: "user", err: writeErr})
+			control := realtimeRelayFrameFromMessage(frame.mt, frame.payload)
+			if controller, ok := b.session.(runtimerealtime.ConcurrentClientControlSession); ok {
+				handled, err := controller.TrySendClientControl(active.ctx, active.frame, control)
+				if handled {
+					frame.release()
+					if !b.handleClientSendResult(err) {
 						return
 					}
-					if realtimeRelayRecoverableError(err) {
-						continue
-					}
+					continue
 				}
-				b.emitExit(realtimeRelayExit{source: "user", err: err})
+			}
+			if len(pending) >= realtimeRelayClientFrameQueueSize {
+				frame.release()
+				if b.client != nil {
+					b.client.Close(wsconn.CloseInfo{
+						Kind:   wsconn.CloseKindBackpressure,
+						Code:   wsconn.CloseTryAgainLater,
+						Reason: "client_frame_backpressure",
+					})
+				}
 				return
 			}
+			if !frame.transferCredit(b.pendingBudget) {
+				frame.release()
+				if b.client != nil {
+					b.client.Close(wsconn.CloseInfo{
+						Kind:   wsconn.CloseKindBackpressure,
+						Code:   wsconn.CloseMessageTooBig,
+						Reason: "pending_frame_byte_budget_exceeded",
+					})
+				}
+				return
+			}
+			pending = append(pending, frame)
 		}
 	}
+}
+
+func (b *realtimeRelayActor) startClientSend(frame realtimeRelayClientFrame) *realtimeRelayClientSend {
+	ctx, cancel := context.WithCancel(b.ctx)
+	send := &realtimeRelayClientSend{
+		frame: realtimeRelayFrameFromMessage(frame.mt, frame.payload),
+		ctx:   ctx,
+		done:  make(chan struct{}),
+	}
+	b.workers.Add(1)
+	go b.runWorker(func() {
+		defer close(send.done)
+		defer cancel()
+		defer frame.release()
+		send.err = b.session.SendClient(send.ctx, send.frame)
+	})
+	return send
+}
+
+func (b *realtimeRelayActor) handleClientSendResult(err error) bool {
+	if err == nil {
+		return true
+	}
+	if payload := realtimeRelayErrorPayload(err); payload != nil && !b.dropDownstreamWrites.Load() {
+		if writeErr := b.writeClientMessage(wsconn.TextMessage, payload); writeErr != nil {
+			b.emitExit(realtimeRelayExit{source: "user", err: writeErr})
+			return false
+		}
+		if realtimeRelayRecoverableError(err) {
+			return true
+		}
+	}
+	b.emitExit(realtimeRelayExit{source: "user", err: err})
+	return false
 }
 
 func (b *realtimeRelayActor) sessionToClient() {
@@ -298,11 +444,14 @@ func (b *realtimeRelayActor) deliverEventFrame(event runtimerealtime.RecvEvent) 
 	}
 	mt := realtimeRelayMessageTypeFromFrame(*event.Frame)
 	payload := event.Frame.Payload()
+	b.observeProviderPayload(mt, payload, event.Origin)
+	if event.Origin == runtimerealtime.RealtimePayloadOriginProvider {
+		payload = sanitizeProviderJSONPayload(payload)
+	}
 	if err := b.writeClientMessage(mt, payload); err != nil {
 		b.emitExit(realtimeRelayExit{source: "supplier", err: err, graceful: realtimeRelayDisconnectError(err)})
 		return false
 	}
-	b.observeProviderPayload(mt, payload, event.Origin)
 	return true
 }
 
@@ -320,7 +469,7 @@ func (b *realtimeRelayActor) providerCloseExit(closeInfo *runtimerealtime.Provid
 		graceful:              true,
 		hasDownstreamClose:    true,
 		downstreamCloseCode:   wsconn.SanitizeWireCloseCode(closeInfo.Code),
-		downstreamCloseReason: closeInfo.Reason,
+		downstreamCloseReason: common.RedactSensitiveText(closeInfo.Reason),
 	}
 }
 
@@ -403,7 +552,25 @@ func (b *realtimeRelayActor) finishCoordinate() {
 		b.emergencyShutdown("proxy_panic")
 	}
 	b.workers.Wait()
+	b.releaseQueuedClientFrames()
 	b.signalDone()
+}
+
+func (b *realtimeRelayActor) releaseQueuedClientFrames() {
+	if b == nil {
+		return
+	}
+	for {
+		select {
+		case frame, ok := <-b.clientFrames:
+			if !ok {
+				return
+			}
+			frame.release()
+		default:
+			return
+		}
+	}
 }
 
 func (b *realtimeRelayActor) emitExit(exit realtimeRelayExit) {
@@ -549,6 +716,9 @@ func realtimeRelayStaticErrorMessage(code string) string {
 func realtimeRelayRecoverableError(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, runtimerealtime.ErrSessionClosed) {
 		return false
+	}
+	if runtimerealtime.ClientPayloadErrorIsRecoverable(err) {
+		return true
 	}
 
 	var event *types.Event

@@ -56,11 +56,12 @@ func (p *BaiduProvider) convertToEmbeddingOpenai(response *BaiduEmbeddingRespons
 		return
 	}
 
+	usage := baiduEmbeddingUsage(&response.Usage)
 	openAIEmbeddingResponse := &types.EmbeddingResponse{
 		Object: "list",
 		Data:   make([]types.Embedding, 0, len(response.Data)),
 		Model:  request.Model,
-		Usage:  &response.Usage,
+		Usage:  usage,
 	}
 
 	for _, item := range response.Data {
@@ -71,7 +72,44 @@ func (p *BaiduProvider) convertToEmbeddingOpenai(response *BaiduEmbeddingRespons
 		})
 	}
 
-	*p.Usage = response.Usage
+	if p.Usage != nil && usage != nil {
+		*p.Usage = *usage
+	}
 
 	return openAIEmbeddingResponse, nil
+}
+
+// baiduEmbeddingUsage 在公开 usage 前验证百度向量的输入型计量合同。百度
+// 可以省略显式的 completion 零值，但 prompt 和 total 必须都存在且相等；
+// 否则仍交付响应，但不建立可结算的供应商证据。
+func baiduEmbeddingUsage(providerUsage *types.Usage) *types.Usage {
+	if providerUsage == nil {
+		return nil
+	}
+
+	usage := *providerUsage
+	// 解码结果通常未授权；清除复用 response 值时可能残留的旧标记。
+	usage.ProviderReported = false
+	valid := providerUsage.ProviderTokenFields["prompt_tokens"] &&
+		providerUsage.ProviderTokenFields["total_tokens"] &&
+		providerUsage.PromptTokens >= 0 &&
+		providerUsage.TotalTokens >= 0 &&
+		providerUsage.PromptTokens == providerUsage.TotalTokens &&
+		providerUsage.CompletionTokens == 0
+	if !valid {
+		if providerUsage.ProviderTokenFields["prompt_tokens"] &&
+			providerUsage.ProviderTokenFields["total_tokens"] &&
+			(providerUsage.PromptTokens != providerUsage.TotalTokens || providerUsage.CompletionTokens != 0) {
+			usage.ProviderTokenConflict = true
+		}
+		return &usage
+	}
+	// completion 是该 operation 的结构性零值；这里显式记录它，包括省略字段的
+	// wire 形式，避免把任意解码结果自动当成供应商证据。
+	usage.CompletionTokens = 0
+	usage.MarkProviderTokenField("prompt_tokens")
+	usage.MarkProviderTokenField("completion_tokens")
+	usage.MarkProviderTokenField("total_tokens")
+	usage.MarkProviderReported()
+	return &usage
 }

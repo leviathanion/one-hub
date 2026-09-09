@@ -239,19 +239,26 @@ func refreshAutoRefreshChannel(ctx context.Context, channel *model.Channel) auto
 
 	preparedChannel := prepareChannelForAutoRefresh(channel)
 	provider, ok := CodexProviderFactory{}.Create(preparedChannel).(*CodexProvider)
-	if !ok || provider == nil || provider.Credentials == nil {
+	if !ok || provider == nil {
+		result.Failed = 1
+		result.FirstErr = fmt.Sprintf("failed to initialize provider for channel %d", channel.Id)
+		logger.SysError(fmt.Sprintf("[Codex] failed to initialize provider for channel %d", channel.Id))
+		return result
+	}
+	credentials := provider.credentialsSnapshot()
+	if credentials == nil {
 		result.Failed = 1
 		result.FirstErr = fmt.Sprintf("failed to initialize provider for channel %d", channel.Id)
 		logger.SysError(fmt.Sprintf("[Codex] failed to initialize provider for channel %d", channel.Id))
 		return result
 	}
 
-	if strings.TrimSpace(provider.Credentials.RefreshToken) == "" {
+	if strings.TrimSpace(credentials.RefreshToken) == "" {
 		result.SkippedNoRefreshToken = 1
 		return result
 	}
 
-	if !provider.Credentials.NeedsRefreshWithin(AutoRefreshLead) {
+	if !credentials.NeedsRefreshWithin(AutoRefreshLead) {
 		result.SkippedNotDue = 1
 		return result
 	}

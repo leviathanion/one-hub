@@ -2,10 +2,10 @@ package model
 
 import (
 	"errors"
-	"fmt"
 	"testing"
 
 	"one-api/common/logger"
+	"one-api/internal/testutil/sqlitetest"
 
 	"go.uber.org/zap"
 	"gorm.io/driver/sqlite"
@@ -18,7 +18,7 @@ func useTaskLookupTestDB(t *testing.T) {
 	logger.Logger = zap.NewNop()
 
 	originalDB := DB
-	testDB, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())), &gorm.Config{})
+	testDB, err := gorm.Open(sqlite.Open(sqlitetest.MemoryDSN()), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("expected in-memory sqlite database, got %v", err)
 	}
@@ -34,11 +34,19 @@ func useTaskLookupTestDB(t *testing.T) {
 
 func TestGetTaskByTaskIdFailsClosedOnDuplicateMatches(t *testing.T) {
 	useTaskLookupTestDB(t)
+	if err := DB.Migrator().DropIndex(&Task{}, "idx_task_provider_identity"); err != nil {
+		t.Fatalf("drop provider identity index: %v", err)
+	}
+	if err := DB.Migrator().DropIndex(&Task{}, "idx_task_public_identity"); err != nil {
+		t.Fatalf("drop public identity index: %v", err)
+	}
 
 	duplicateTasks := []Task{
-		{Platform: TaskPlatformSuno, UserId: 1, TaskID: "dup-task"},
-		{Platform: TaskPlatformSuno, UserId: 1, TaskID: "dup-task"},
+		{Platform: TaskPlatformSuno, UserId: 1},
+		{Platform: TaskPlatformSuno, UserId: 1},
 	}
+	SetTaskProviderID(&duplicateTasks[0], "dup-task")
+	SetTaskProviderID(&duplicateTasks[1], "dup-task")
 	for i := range duplicateTasks {
 		if err := DB.Create(&duplicateTasks[i]).Error; err != nil {
 			t.Fatalf("expected duplicate task fixture insert to succeed, got %v", err)
@@ -56,12 +64,21 @@ func TestGetTaskByTaskIdFailsClosedOnDuplicateMatches(t *testing.T) {
 
 func TestGetTaskByTaskIdsFailsClosedOnDuplicateMatches(t *testing.T) {
 	useTaskLookupTestDB(t)
+	if err := DB.Migrator().DropIndex(&Task{}, "idx_task_provider_identity"); err != nil {
+		t.Fatalf("drop provider identity index: %v", err)
+	}
+	if err := DB.Migrator().DropIndex(&Task{}, "idx_task_public_identity"); err != nil {
+		t.Fatalf("drop public identity index: %v", err)
+	}
 
 	fixtures := []Task{
-		{Platform: TaskPlatformSuno, UserId: 1, TaskID: "dup-task"},
-		{Platform: TaskPlatformSuno, UserId: 1, TaskID: "dup-task"},
-		{Platform: TaskPlatformSuno, UserId: 1, TaskID: "ok-task"},
+		{Platform: TaskPlatformSuno, UserId: 1},
+		{Platform: TaskPlatformSuno, UserId: 1},
+		{Platform: TaskPlatformSuno, UserId: 1},
 	}
+	SetTaskProviderID(&fixtures[0], "dup-task")
+	SetTaskProviderID(&fixtures[1], "dup-task")
+	SetTaskProviderID(&fixtures[2], "ok-task")
 	for i := range fixtures {
 		if err := DB.Create(&fixtures[i]).Error; err != nil {
 			t.Fatalf("expected task fixture insert to succeed, got %v", err)

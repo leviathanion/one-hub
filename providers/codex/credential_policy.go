@@ -210,8 +210,9 @@ func codexModelHeadersEmpty(raw *string) bool {
 }
 
 func (p *CodexProvider) codexAccountID() string {
-	if p == nil || p.Credentials == nil {
+	credentials := p.credentialsSnapshot()
+	if credentials == nil {
 		return ""
 	}
-	return p.Credentials.AccountID
+	return credentials.AccountID
 }

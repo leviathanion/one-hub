@@ -186,13 +186,9 @@ func ConsumeCodexResetCredit(c *gin.Context) {
 		return
 	}
 
-	// Rotate the shared v2 generation before reporting success. This invalidates
-	// every credential fingerprint and strands writes from pre-reset fetches. Keep
-	// clearing v1 during rolling upgrades even if the v2 cache is unavailable.
+	// Rotate the shared generation before reporting success. This invalidates every
+	// credential fingerprint and strands writes from pre-reset fetches.
 	cacheErr := clearCodexUsageCacheForChannel(channel)
-	// Legacy cleanup is post-commit garbage collection only; v2 generation
-	// rotation above is the correctness boundary.
-	model.ClearChannelCodexUsageCache(channelID)
 	response := gin.H{
 		"success": true,
 		"message": "",

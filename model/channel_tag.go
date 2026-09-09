@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+	gormlogger "gorm.io/gorm/logger"
 )
 
 // Tag-level config sync is declared on Channel fields with tag_config:"sync"
@@ -222,33 +224,6 @@ func normalizeChannelTagKey(key string, channelType int) (string, error) {
 	return compact.String(), nil
 }
 
-func splitChannelTagKeys(keyText string, channelType int) ([]string, error) {
-	keyText = strings.TrimSpace(keyText)
-	if keyText == "" {
-		return nil, nil
-	}
-
-	if channelType == config.ChannelTypeCodex {
-		if key, err := normalizeChannelTagKey(keyText, channelType); err == nil && key != "" {
-			return []string{key}, nil
-		}
-	}
-
-	lines := strings.Split(keyText, "\n")
-	keys := make([]string, 0, len(lines))
-	for _, line := range lines {
-		key, err := normalizeChannelTagKey(line, channelType)
-		if err != nil {
-			return nil, err
-		}
-		if key == "" {
-			continue
-		}
-		keys = append(keys, key)
-	}
-	return keys, nil
-}
-
 func channelTagKeyDigest(key string) string {
 	keyMd5 := md5.Sum([]byte(key))
 	return hex.EncodeToString(keyMd5[:])
@@ -262,26 +237,21 @@ func normalizeExistingChannelTagKey(key string, channelType int) string {
 	return normalized
 }
 
-func buildChannelTagMember(channelTag *ChannelTagCollection, channel *Channel, fields []channelTagConfigField, key string, name string, memberIndex int) Channel {
+func buildChannelTagMember(channelTag *ChannelTagCollection, key string, name string, memberIndex int) Channel {
 	addChannel := channelTag.Channel
-	if channel != nil && len(fields) > 0 {
-		applyChannelTagConfigFields(&addChannel, channel, fields)
-	}
 
 	if name == "" {
-		baseName := ""
-		if channel != nil {
-			baseName = strings.TrimSpace(channel.Name)
-		}
-		if baseName == "" {
-			baseName = channelTag.Name
-		}
+		baseName := channelTag.Name
 		name = fmt.Sprintf("%s_%d", baseName, memberIndex)
 	}
 
 	addChannel.Id = 0
 	addChannel.Name = name
 	addChannel.Key = key
+	addChannel.CredentialRevision = 0
+	addChannel.CredentialRefreshFence = nil
+	addChannel.CredentialRefreshStartedAt = nil
+	addChannel.CredentialRefreshState = "ready"
 	addChannel.Balance = 0
 	addChannel.BalanceUpdatedTime = 0
 	addChannel.UsedQuota = 0
@@ -323,23 +293,34 @@ func UpdateChannelsTag(tag string, channel *Channel) error {
 	return UpdateChannelsTagWithSubmittedFields(tag, channel, nil)
 }
 
-func UpdateChannelsTagWithSubmittedFields(tag string, channel *Channel, submittedFields ChannelTagSubmittedFields) error {
+func UpdateChannelsTagWithSubmittedFields(tag string, channel *Channel, submittedFields ChannelTagSubmittedFields, editOptions ...ChannelUpdateOptions) error {
 	unlock, err := lockChannelTagMutation(context.Background(), tag)
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	return updateChannelsTagWithSubmittedFieldsLocked(tag, channel, submittedFields)
+	allowIdentityChange := false
+	if len(editOptions) > 0 {
+		allowIdentityChange = editOptions[0].AllowIdentityChange
+	}
+	return updateChannelsTagWithSubmittedFieldsLocked(tag, channel, submittedFields, allowIdentityChange)
 }
 
-func updateChannelsTagWithSubmittedFieldsLocked(tag string, channel *Channel, submittedFields ChannelTagSubmittedFields) error {
-	channelTag, err := GetChannelsTag(tag)
+func updateChannelsTagWithSubmittedFieldsLocked(tag string, channel *Channel, submittedFields ChannelTagSubmittedFields, allowIdentityChange bool) error {
+	if _, submitted := submittedFields["key"]; submitted || channel.Key != "" {
+		return errors.New("标签普通编辑不接受 key；请使用单渠道新增、删除或同账号授权入口")
+	}
+	members, err := GetChannelsByTag(tag)
 	if err != nil {
 		return err
 	}
-	existingMemberIDs := make([]int, 0, len(channelTag.KeyMap))
-	for _, id := range channelTag.KeyMap {
-		existingMemberIDs = append(existingMemberIDs, id)
+	if len(members) == 0 {
+		return errors.New("tag不存在")
+	}
+	channelTag := members[0]
+	existingMemberIDs := make([]int, 0, len(members))
+	for _, member := range members {
+		existingMemberIDs = append(existingMemberIDs, member.Id)
 	}
 	channel.Type = channelTag.Type
 	configFields := channelTagConfigFields(submittedFields)
@@ -356,127 +337,58 @@ func updateChannelsTagWithSubmittedFieldsLocked(tag string, channel *Channel, su
 		return err
 	}
 
-	if channel.Key == "" {
-		return errors.New("key不能为空")
-	}
-
-	addKeys := []string{}
-	delIds := []int{}
-
-	newKeysMap := make(map[string]bool)
-
-	keys, err := splitChannelTagKeys(channel.Key, channelTag.Type)
-	if err != nil {
-		return err
-	}
-	if len(keys) == 0 {
-		return errors.New("key不能为空")
-	}
-	for _, key := range keys {
-		keyMd5Str := channelTagKeyDigest(key)
-		if newKeysMap[keyMd5Str] {
-			continue
-		}
-		newKeysMap[keyMd5Str] = true
-
-		// 如果key不在现有的KeyMap中，则添加到addKeys
-		if _, ok := channelTag.KeyMap[keyMd5Str]; !ok {
-			addKeys = append(addKeys, key)
-		}
-	}
-
-	// 检查现有的keys，如果不在新的keys中，则需要删除
-	for keyMd5Str, id := range channelTag.KeyMap {
-		if _, ok := newKeysMap[keyMd5Str]; !ok {
-			delIds = append(delIds, id)
-		}
-	}
-
-	addChannels := make([]Channel, 0, len(addKeys))
-	if len(addKeys) > 0 {
-		maxKey := len(channelTag.KeyMap)
-		baseName := channel.Name
-		if baseName == "" {
-			baseName = channelTag.Name
-		}
-		for _, key := range addKeys {
-			// Partial tag updates only carry changed config fields. New members
-			// start from the existing tag representative, then receive the
-			// submitted tag-level overlay; runtime counters are reset below.
-			addChannel := buildChannelTagMember(channelTag, channel, configFields, key, fmt.Sprintf("%s_%d", baseName, maxKey), maxKey)
-			if err := addChannel.CanonicalizeRuntimeConfigJSONWithType(channelTag.Type); err != nil {
-				return err
-			}
-			if err := addChannel.ValidateRuntimeConfigJSONWithType(channelTag.Type); err != nil {
-				return err
-			}
-			addChannels = append(addChannels, addChannel)
-			maxKey++
-		}
-	}
-
 	tx := DB.Begin()
 	if tx.Error != nil {
 		return tx.Error
 	}
-	// Membership is a fixed snapshot for this operation. Every destructive or
-	// config statement also checks the current tag, so a snapshotted member moved
-	// out concurrently is untouched, while a row moved in is never adopted by this
-	// batch. New members receive config only through buildChannelTagMember above.
-	var deletedCandidates []Channel
-	if len(delIds) > 0 {
-		if err = tx.Model(&Channel{}).Select("id", "type").Where("id IN (?) AND tag = ?", delIds, tag).Find(&deletedCandidates).Error; err != nil {
+
+	updateValues := channelTagConfigUpdateValues(channel, configFields)
+	if !allowIdentityChange {
+		delete(updateValues, "base_url") // 自动同步不能改写账号连接身份。
+	}
+	var configCandidates []Channel
+	if len(configFields) > 0 && len(existingMemberIDs) > 0 {
+		candidateScope := tx.Model(&Channel{}).Clauses(clause.Locking{Strength: "UPDATE"}).Where("id IN (?) AND tag = ?", existingMemberIDs, tag).Order("id")
+		if err = candidateScope.Find(&configCandidates).Error; err != nil {
 			tx.Rollback()
 			return err
 		}
-		if err = tx.Model(&Channel{}).Where("id IN (?) AND tag = ?", delIds, tag).UpdateColumn("credential_revision", gorm.Expr("credential_revision + 1")).Error; err != nil {
-			tx.Rollback()
-			return err
-		}
-		result := tx.Where("id IN (?) AND tag = ?", delIds, tag).Delete(&Channel{})
-		if err = result.Error; err != nil {
-			tx.Rollback()
-			return err
-		}
-		candidateIDs := channelIDsFromRows(deletedCandidates)
-		deletedCandidates = nil
-		if len(candidateIDs) > 0 {
-			if err = tx.Unscoped().Model(&Channel{}).Select("id", "type").Where("id IN (?) AND deleted_at IS NOT NULL", candidateIDs).Find(&deletedCandidates).Error; err != nil {
+		identityChanges := make(map[int]bool)
+		for i := range configCandidates {
+			candidate := configCandidates[i]
+			applyChannelTagConfigFields(&candidate, channel, configFields)
+			if err = candidate.CanonicalizeRuntimeConfigJSON(); err == nil {
+				err = candidate.ValidateRuntimeConfigJSON()
+			}
+			if err != nil {
 				tx.Rollback()
 				return err
 			}
+			changed, editErr := prepareChannelIdentityEdit(&configCandidates[i], &candidate, allowIdentityChange)
+			if editErr != nil {
+				tx.Rollback()
+				return fmt.Errorf("渠道 %d: %w", configCandidates[i].Id, editErr)
+			}
+			if changed {
+				identityChanges[candidate.Id] = true
+			}
 		}
-	}
-
-	// 处理要添加的数据
-	if len(addChannels) > 0 {
-		err = BatchInsertStrict(tx, addChannels)
-		if err != nil {
-			tx.Rollback()
-			return err
-		}
-	}
-
-	updateValues := channelTagConfigUpdateValues(channel, configFields)
-	var configCandidates []Channel
-	if len(updateValues) > 0 && len(existingMemberIDs) > 0 {
-		candidateScope := tx.Model(&Channel{}).Where("id IN (?) AND tag = ?", existingMemberIDs, tag)
-		if err = candidateScope.Select("id", "type").Find(&configCandidates).Error; err != nil {
-			tx.Rollback()
-			return err
-		}
-		candidateIDs := channelIDsFromRows(configCandidates)
-		if len(candidateIDs) > 0 {
-			result := tx.Model(Channel{}).Where("id IN (?) AND tag = ?", candidateIDs, tag).Updates(updateValues)
+		for _, member := range configCandidates {
+			if len(updateValues) == 0 {
+				continue
+			}
+			updates := make(map[string]any, len(updateValues)+1)
+			for field, value := range updateValues {
+				updates[field] = value
+			}
+			if identityChanges[member.Id] {
+				updates["credential_revision"] = gorm.Expr("credential_revision + 1")
+			}
+			result := tx.Session(&gorm.Session{Logger: tx.Logger.LogMode(gormlogger.Silent)}).Model(&Channel{}).Where("id = ? AND tag = ?", member.Id, tag).Updates(updates)
 			if err = result.Error; err != nil {
 				tx.Rollback()
 				return err
 			}
-			// Keep the pre-update candidates for post-commit invalidation. The UPDATE
-			// itself may rename the tag, so filtering by the old tag afterward would
-			// drop every durably changed row. Conservatively invalidating a candidate
-			// skipped by a concurrent move costs one cache clear and immediate reload;
-			// omitting an updated row can leave the old route live indefinitely.
 		}
 	}
 
@@ -484,17 +396,9 @@ func updateChannelsTagWithSubmittedFieldsLocked(tag string, channel *Channel, su
 		return err
 	}
 
-	if len(deletedCandidates) == 0 && len(configCandidates) == 0 && len(addChannels) == 0 {
-		return nil
+	if len(configCandidates) > 0 && len(updateValues) > 0 {
+		finishChannelRouteMutation("update channel tag", channelIDsFromRows(configCandidates), codexChannelIDsFromRows(configCandidates))
 	}
-	affectedIDs := append(channelIDsFromRows(deletedCandidates), channelIDsFromRows(configCandidates)...)
-	codexIDs := append(codexChannelIDsFromRows(deletedCandidates), codexChannelIDsFromRows(configCandidates)...)
-	for i := range addChannels {
-		if addChannels[i].Type == config.ChannelTypeCodex {
-			codexIDs = append(codexIDs, addChannels[i].Id)
-		}
-	}
-	finishChannelRouteMutation("update channel tag", affectedIDs, codexIDs)
 	return nil
 }
 
@@ -543,7 +447,7 @@ func addChannelToTagLocked(tag string, channel *Channel) (*Channel, error) {
 		return nil, errors.New("key已存在")
 	}
 
-	newChannel := buildChannelTagMember(channelTag, nil, nil, key, strings.TrimSpace(channel.Name), len(channelTag.KeyMap))
+	newChannel := buildChannelTagMember(channelTag, key, strings.TrimSpace(channel.Name), len(channelTag.KeyMap))
 	if err := newChannel.CanonicalizeRuntimeConfigJSONWithType(channelTag.Type); err != nil {
 		return nil, err
 	}

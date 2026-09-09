@@ -254,34 +254,3 @@ func dialAndSend(ctx context.Context, c *mail.Client, messages ...*mail.Msg) err
 	}
 	return nil
 }
-
-func SendQuotaWarningCodeEmail(userName, email string, quota int, noMoreQuota bool) error {
-	stmp, err := GetSystemStmp()
-
-	if err != nil {
-		return err
-	}
-
-	contentTemp := `<p style="font-size: 30px">Hi <strong>%s,</strong></p>
-		<p>
-			%s，当前剩余额度为 %d，为了不影响您的使用，请及时充值。
-		</p>
-		
-		<p style="text-align: center; font-size: 13px;">
-			<a target="__blank" href="%s" class="button" style="color: #ffffff;">点击充值</a>
-		</p>
-		
-		<p style="color: #858585; padding-top: 15px;">
-			如果链接无法点击，请尝试点击下面的链接或将其复制到浏览器中打开<br> %s
-		</p>`
-
-	subject := "您的额度即将用尽"
-	if noMoreQuota {
-		subject = "您的额度已用尽"
-	}
-	topUpLink := fmt.Sprintf("%s/topup", config.ServerAddress)
-
-	content := fmt.Sprintf(contentTemp, userName, subject, quota, topUpLink, topUpLink)
-
-	return stmp.Render(email, subject, content)
-}

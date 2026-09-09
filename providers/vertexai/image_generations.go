@@ -115,11 +115,17 @@ func (p *VertexAIProvider) CreateImageGenerations(request *types.ImageRequest) (
 		})
 	}
 
-	// 设置使用量 - 使用与Gemini相同的计算方式
-	p.Usage.PromptTokens = imageCount * 258
-	p.Usage.TotalTokens = p.Usage.PromptTokens
+	applyVertexAIImageUsage(p.Usage, request.Model, imageCount)
 
 	return openaiResponse, nil
+}
+
+func applyVertexAIImageUsage(usage *types.Usage, modelName string, imageCount int) {
+	if usage == nil || imageCount < 0 {
+		return
+	}
+	usage.MarkProviderOperationUnits(imageCount)
+	usage.MergeProviderAttribution(modelName, "")
 }
 
 // 将尺寸转换为比例

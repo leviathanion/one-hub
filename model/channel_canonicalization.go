@@ -36,9 +36,9 @@ func canonicalizeChannelOtherJSON(channelType int, raw string) (string, bool, er
 		return "", false, nil
 	}
 
-	parsed, err := parseOptionalJSONObject("other", trimmed)
+	_, err := parseOptionalJSONObject("other", trimmed)
 	if err == nil {
-		return canonicalizeChannelOtherObject(channelType, parsed)
+		return "", false, nil
 	}
 	if legacyOtherLooksLikeJSON(trimmed) {
 		return "", false, nil
@@ -79,36 +79,6 @@ func canonicalizeChannelOtherJSON(channelType int, raw string) (string, bool, er
 	default:
 		return "", false, nil
 	}
-}
-
-func canonicalizeChannelOtherObject(channelType int, parsed map[string]json.RawMessage) (string, bool, error) {
-	if channelType != config.ChannelTypeCodex || len(parsed) == 0 {
-		return "", false, nil
-	}
-
-	rawMode, ok := parsed["websocket_mode"]
-	if !ok || len(rawMode) == 0 {
-		return "", false, nil
-	}
-
-	var mode string
-	if err := json.Unmarshal(rawMode, &mode); err != nil {
-		return "", false, nil
-	}
-	if strings.ToLower(strings.TrimSpace(mode)) != "required" {
-		return "", false, nil
-	}
-
-	encodedMode, err := json.Marshal("force")
-	if err != nil {
-		return "", false, err
-	}
-	parsed["websocket_mode"] = encodedMode
-	encoded, err := json.Marshal(parsed)
-	if err != nil {
-		return "", false, err
-	}
-	return string(encoded), true, nil
 }
 
 func marshalLegacyOpaqueOtherString(value string) (string, bool, error) {

@@ -2,20 +2,33 @@ package openai
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 
 	"one-api/common"
-	"one-api/common/config"
-	"one-api/common/requester"
+	commonresponses "one-api/common/responses"
 	"one-api/common/responsesws"
-	runtimesession "one-api/runtime/session"
+	"one-api/model"
 	"one-api/types"
 )
 
-type openAIResponsesWSAdapter struct{}
+// openAIResponsesWSAdapter is scoped to one native Responses websocket.  The
+// provider's output_item.done event carries the completed item but does not
+// repeat the response tool declaration, so the accepted response.created
+// snapshot must remain available until that item is observed.  The tracker is
+// bounded by commonresponses and is reset at each new response lifecycle.
+type openAIResponsesWSAdapter struct {
+	mu                 sync.Mutex
+	searchServiceType  string
+	searchType         string
+	responseID         string
+	responseModel      string
+	serviceTier        string
+	responseCreated    bool
+	toolBillingTracker commonresponses.ToolBillingStreamTracker
+}
 
 func (p *OpenAIProvider) OpenResponsesWS(ctx context.Context, req *responsesws.OpenRequest) (responsesws.Upstream, *types.OpenAIErrorWithStatusCode) {
 	if p == nil {
@@ -25,41 +38,19 @@ func (p *OpenAIProvider) OpenResponsesWS(ctx context.Context, req *responsesws.O
 		return nil, common.StringErrorWrapperLocal("responses websocket open request is required", "invalid_request_error", http.StatusBadRequest)
 	}
 	modelName := req.SelectedModel
-	switch req.Transport {
-	case "", runtimesession.TransportModeResponsesWS:
-		if !p.supportsNativeResponsesWSTransport() {
-			return nil, responsesWSUnsupportedForChannel()
-		}
-	case runtimesession.TransportModeResponsesHTTPBridge:
-		if !p.supportsHTTPBridgeResponsesWSTransport() {
-			return nil, responsesWSUnsupportedForChannel()
-		}
-		return responsesws.NewBridgeSession(openAIResponsesWSBridgeOpener{
-			provider: p,
-			model:    modelName,
-		}, responsesws.BridgeSessionOptions{
-			Context:                   ctx,
-			Diagnostics:               req.Diagnostics,
-			ProviderName:              "openai",
-			ChannelID:                 req.ChannelID,
-			Transport:                 string(runtimesession.TransportModeResponsesHTTPBridge),
-			InitialPreviousResponseID: req.PreviousResponseID,
-			OpenTimeout:               config.ResponsesWSBridgeOpenTimeout(),
-			MaxStreamEventBytes:       config.RealtimeWebsocketReadLimit(),
-		}), nil
-	default:
-		return nil, common.StringErrorWrapperLocal("invalid responses websocket transport", "invalid_transport", http.StatusBadRequest)
+	if !p.supportsNativeResponsesWSTransport() {
+		return nil, responsesWSUnsupportedForChannel()
 	}
-	conn, errWithCode := p.openResponsesWSConnWithContext(ctx, modelName)
+	conn, errWithCode := p.openResponsesWSConnWithHeaders(ctx, modelName, req.InboundHeaders)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
-	return responsesws.NewNativeSession(conn, openAIResponsesWSAdapter{}, responsesws.NativeSessionOptions{
+	return responsesws.NewNativeSession(conn, &openAIResponsesWSAdapter{}, responsesws.NativeSessionOptions{
 		Context:      ctx,
 		Diagnostics:  req.Diagnostics,
 		ProviderName: "openai",
 		ChannelID:    req.ChannelID,
-		Transport:    string(runtimesession.TransportModeResponsesWS),
+		Transport:    "responses-ws",
 	}), nil
 }
 
@@ -80,7 +71,7 @@ func (p *OpenAIProvider) supportsNativeResponsesWSTransport() bool {
 	if strings.TrimSpace(p.Config.Responses) == "" {
 		return false
 	}
-	if p.usesOfficialOpenAIBaseURL() {
+	if model.IsOfficialOpenAIBaseURL(p.GetBaseURL()) {
 		return true
 	}
 	if p.responsesWSNativeExplicitlyEnabled() {
@@ -89,115 +80,35 @@ func (p *OpenAIProvider) supportsNativeResponsesWSTransport() bool {
 	return false
 }
 
-func (p *OpenAIProvider) supportsHTTPBridgeResponsesWSTransport() bool {
-	return p != nil && strings.TrimSpace(p.Config.Responses) != ""
-}
-
 func (p *OpenAIProvider) responsesWSNativeExplicitlyEnabled() bool {
 	if p == nil || p.Channel == nil {
 		return false
 	}
-	other, err := p.Channel.GetOtherMap()
-	if err != nil {
-		return false
-	}
-	raw, ok := other["responses_ws_native"]
-	if !ok || len(raw) == 0 || strings.TrimSpace(string(raw)) == "null" {
-		return false
-	}
-	var enabled bool
-	if err := json.Unmarshal(raw, &enabled); err != nil {
-		return false
-	}
+	enabled, _ := p.Channel.GetOtherBoolField("responses_ws_native")
 	return enabled
 }
 
-func (p *OpenAIProvider) usesOfficialOpenAIBaseURL() bool {
-	if p == nil {
-		return false
-	}
-	baseURL := strings.TrimRight(strings.ToLower(strings.TrimSpace(p.GetBaseURL())), "/")
-	return baseURL == "https://api.openai.com" || strings.HasPrefix(baseURL, "https://api.openai.com/")
-}
-
-type openAIResponsesWSBridgeOpener struct {
-	provider *OpenAIProvider
-	model    string
-}
-
-func (o openAIResponsesWSBridgeOpener) OpenBridgeStream(ctx context.Context, bridgeReq responsesws.BridgeStreamRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode, error) {
-	frame := bridgeReq.Frame
-	if frame.Kind() != responsesws.FrameKindText {
-		return nil, nil, responsesws.ErrInvalidFrame
-	}
-	parsed, err := responsesws.ParseRawResponsesCreateFrame(frame.Payload())
-	if err != nil {
-		return nil, nil, err
-	}
-	request := parsed.Projection
-	if strings.TrimSpace(request.Model) == "" {
-		request.Model = o.model
-	}
-	if _, exists := parsed.Object["previous_response_id"]; !exists && strings.TrimSpace(request.PreviousResponseID) == "" {
-		if previousResponseID := strings.TrimSpace(bridgeReq.DefaultPreviousResponseID); previousResponseID != "" {
-			request.PreviousResponseID = previousResponseID
-		}
-	}
-	request.Stream = true
-	fullRequestURL, errWithCode := o.provider.responsesHTTPBridgeRequestURL(request.Model)
-	if errWithCode != nil {
-		return nil, nil, errWithCode
-	}
-	if err := o.provider.validateResponsesWSHTTPBridgeURL(ctx, fullRequestURL); err != nil {
-		apiErr := common.StringErrorWrapperLocal(err.Error(), "ws_request_failed", requester.UpstreamResponsesHTTPURLStatusCode(err))
-		return nil, nil, responsesws.NewOpenAIErrorWithCause(apiErr, err)
-	}
-	body, err := responsesws.BuildResponsesHTTPBridgeBody(parsed.Object, request.Model, request.PreviousResponseID)
-	if err != nil {
-		return nil, nil, err
-	}
-	req, errWithCode := o.provider.buildResponsesHTTPBridgeRequest(body, fullRequestURL, o.provider.requestHeaders(openAIRequestAuthBearer), request.Model)
-	if errWithCode != nil {
-		return nil, nil, errWithCode
-	}
-	if ctx != nil {
-		req = o.provider.Requester.WithRequestContext(req, ctx)
-	}
-	defer req.Body.Close()
-	stream, errWithCode := o.provider.createResponsesHTTPBridgeStreamFromRequestWithOptions(req, &request, responsesHTTPBridgeStreamReadOptions())
-	if errWithCode != nil {
-		return nil, responsesws.MarkHTTPBridgeTransportError(errWithCode), nil
-	}
-	return stream, nil, nil
-}
-
-func (p *OpenAIProvider) validateResponsesWSHTTPBridgeURL(ctx context.Context, rawURL string) error {
-	_, err := requester.ValidateAndResolveUpstreamResponsesHTTPURL(ctx, rawURL, p.responsesHTTPBridgeSecurity())
-	return err
-}
-
-func (p *OpenAIProvider) responsesHTTPBridgeSecurity() requester.ResponsesHTTPBridgeSecurity {
-	proxyAddr := ""
-	if p != nil && p.Channel != nil && p.Channel.Proxy != nil {
-		proxyAddr = *p.Channel.Proxy
-	}
-	return requester.ResponsesHTTPBridgeSecurity{
-		AllowSelfHosted: openAIResponsesWSSelfHosted(p),
-		ProxyAddr:       proxyAddr,
-	}
-}
-
-func (a openAIResponsesWSAdapter) PrepareClientFrame(_ context.Context, frame responsesws.Frame) (responsesws.Frame, error) {
+func (a *openAIResponsesWSAdapter) PrepareClientFrame(_ context.Context, frame responsesws.Frame) (responsesws.Frame, error) {
 	if frame.Kind() != responsesws.FrameKindText {
 		return responsesws.Frame{}, responsesws.ErrInvalidFrame
 	}
-	if _, err := responsesws.ParseClientEventEnvelope(frame.Payload()); err != nil {
+	envelope, err := responsesws.ParseClientEventEnvelope(frame.Payload())
+	if err != nil {
 		return responsesws.Frame{}, err
+	}
+	// A native session may carry more than one Responses turn.  Resetting on
+	// an accepted turn-start frame prevents an item identity from suppressing a
+	// same-named item in a later turn.  response.created below also resets the
+	// state at the provider acceptance boundary, covering callers that inject a
+	// first frame through the transport fixture.
+	switch strings.TrimSpace(envelope.Type) {
+	case "response.create":
+		a.resetSearchState()
 	}
 	return frame, nil
 }
 
-func (a openAIResponsesWSAdapter) HandleProviderFrame(_ context.Context, frame responsesws.Frame) responsesws.ProviderFrameResult {
+func (a *openAIResponsesWSAdapter) HandleProviderFrame(_ context.Context, frame responsesws.Frame) responsesws.ProviderFrameResult {
 	if frame.Kind() != responsesws.FrameKindText {
 		return responsesws.ProviderFrameResult{
 			Origin:         responsesws.RecvDetailOriginProviderMalformed,
@@ -229,33 +140,171 @@ func (a openAIResponsesWSAdapter) HandleProviderFrame(_ context.Context, frame r
 			CloseTransport: true,
 		}
 	}
+	usage, usageErr := a.acceptedProviderUsage(envelope.EventID, payload)
+	if usageErr != nil {
+		return responsesws.ProviderFrameResult{
+			Origin:         responsesws.RecvDetailOriginProviderMalformed,
+			Err:            usageErr,
+			CloseTransport: true,
+		}
+	}
 
 	out := responsesws.NewTextFrame(append([]byte(nil), payload...))
 	return responsesws.ProviderFrameResult{
 		EmitFrame: &out,
-		Usage:     openAIResponsesWSEventUsage(eventType, envelope.EventID, envelope.Object, payload).Clone(),
+		Usage:     usage,
 		Origin:    responsesws.RecvDetailOriginProviderFrame,
 	}
 }
 
-func openAIResponsesWSEventUsage(eventType string, providerEventID string, object map[string]json.RawMessage, payload []byte) *types.UsageEvent {
-	if object != nil {
-		if rawResponse, ok := object["response"]; ok && len(rawResponse) > 0 {
-			var response types.ResponseEvent
-			// Provider events are passthrough-first. Decode known usage evidence
-			// best-effort so future event shapes do not make native ResponsesWS
-			// stricter than the HTTP bridge transport.
-			if err := json.Unmarshal(rawResponse, &response); err == nil {
-				if usage := openAIRealtimeResponseUsage(providerEventID, &response); usage != nil {
-					return usage
-				}
-			}
-		}
+func (a *openAIResponsesWSAdapter) resetSearchState() {
+	if a == nil {
+		return
 	}
-	return openAIRealtimeInputAudioTranscriptionUsage(eventType, providerEventID, payload)
+	a.mu.Lock()
+	a.resetSearchStateLocked()
+	a.mu.Unlock()
 }
 
-func (a openAIResponsesWSAdapter) MapProviderClose(_ context.Context, info responsesws.ProviderCloseInfo) responsesws.ProviderCloseResult {
+func (a *openAIResponsesWSAdapter) resetSearchStateLocked() {
+	if a == nil {
+		return
+	}
+	a.searchServiceType = ""
+	a.searchType = ""
+	a.responseID = ""
+	a.responseModel = ""
+	a.serviceTier = ""
+	a.responseCreated = false
+	a.toolBillingTracker = commonresponses.ToolBillingStreamTracker{}
+}
+
+// acceptedProviderUsage extracts only facts accepted at the provider-frame
+// boundary.  Token snapshots keep the existing terminal path.  A completed
+// web_search_call is emitted as an independent delta because it is valid
+// provider billing evidence even when the overall response has no usage.
+func (a *openAIResponsesWSAdapter) acceptedProviderUsage(providerEventID string, payload []byte) (*types.UsageEvent, error) {
+	if a == nil {
+		return openAIResponsesWSEventUsage(providerEventID, payload), nil
+	}
+	event, ok := commonresponses.ParseStreamUsageEvent(payload)
+	if !ok {
+		return nil, nil
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	switch event.Type {
+	case "response.created":
+		// The tool declaration is attribution metadata, not execution evidence.
+		// Only a later completed output item can create a billable unit.
+		incomingServiceType, incomingSearchType := commonresponses.ResponsesSearchBilling(event.Response)
+		incomingResponseID := ""
+		incomingResponseModel := ""
+		incomingServiceTier := ""
+		if event.Response != nil {
+			incomingResponseID = strings.TrimSpace(event.Response.ID)
+			incomingResponseModel = strings.TrimSpace(event.Response.Model)
+			incomingServiceTier = strings.TrimSpace(event.Response.ServiceTier)
+		}
+		if a.responseCreated && incomingResponseID != "" && a.responseID != "" && incomingResponseID != a.responseID {
+			// A different provider response is a new lifecycle.  It may reuse an
+			// item ID, so its evidence must not inherit the prior turn's tracker.
+			a.resetSearchStateLocked()
+		} else if a.responseCreated {
+			// Repeated declarations for the current response, including an
+			// ownerless declaration, must not clear accepted item evidence.  Fill
+			// metadata that the first declaration omitted, but keep the original
+			// owner dimensions and tracker decisions authoritative.
+			if a.searchServiceType == "" {
+				a.searchServiceType = incomingServiceType
+			}
+			if a.searchType == "" {
+				a.searchType = incomingSearchType
+			}
+			if a.responseID == "" {
+				a.responseID = incomingResponseID
+			}
+			if a.responseModel == "" {
+				a.responseModel = incomingResponseModel
+			}
+			if a.serviceTier == "" {
+				a.serviceTier = incomingServiceTier
+			}
+			return nil, nil
+		}
+		a.searchServiceType = incomingServiceType
+		a.searchType = incomingSearchType
+		a.responseID = incomingResponseID
+		a.responseModel = incomingResponseModel
+		a.serviceTier = incomingServiceTier
+		a.responseCreated = true
+		a.toolBillingTracker = commonresponses.ToolBillingStreamTracker{}
+		return nil, nil
+	case "response.output_item.done":
+		if event.Item == nil || event.Item.Type != types.InputTypeWebSearchCall {
+			return nil, nil
+		}
+		observed := &types.Usage{}
+		if err := commonresponses.ApplyResponsesStreamOutputItemBillingWithToolTracker(
+			observed,
+			event.Type,
+			event.Item,
+			event.ItemID,
+			event.OutputIndex,
+			a.searchServiceType,
+			a.searchType,
+			&a.toolBillingTracker,
+		); err != nil {
+			return nil, common.ErrorWrapperLocal(err, commonresponses.ResponsesStreamTrackingFailureCode(err), http.StatusBadGateway)
+		}
+		if len(observed.ExtraBilling) == 0 {
+			return nil, nil
+		}
+		return &types.UsageEvent{
+			ProviderEventID:      strings.TrimSpace(providerEventID),
+			ResponseID:           a.responseID,
+			ResponseModel:        a.responseModel,
+			ServiceTier:          a.serviceTier,
+			ItemID:               strings.TrimSpace(event.ItemID),
+			ExtraBilling:         observed.ExtraBilling,
+			BillingDiagnostics:   observed.BillingDiagnostics,
+			ProviderExtraBilling: observed.ProviderExtraBilling,
+		}, nil
+	default:
+		return openAIResponsesWSEventUsage(providerEventID, payload), nil
+	}
+}
+
+func openAIResponsesWSEventUsage(providerEventID string, payload []byte) *types.UsageEvent {
+	event, ok := commonresponses.ParseStreamUsageEvent(payload)
+	if !ok || event.Response == nil || event.Response.Usage == nil {
+		return nil
+	}
+	event.Response.Usage.MarkProviderReported()
+	usage := event.Response.Usage.ToOpenAIUsage()
+	if usage == nil {
+		return nil
+	}
+	return &types.UsageEvent{
+		InputTokens:           usage.PromptTokens,
+		OutputTokens:          usage.CompletionTokens,
+		TotalTokens:           usage.TotalTokens,
+		InputTokenDetails:     usage.PromptTokensDetails,
+		OutputTokenDetails:    usage.CompletionTokensDetails,
+		Source:                types.UsageSourceResponsesResponse,
+		BillingBasis:          types.UsageBillingBasisTokens,
+		ProviderEventID:       strings.TrimSpace(providerEventID),
+		ResponseID:            strings.TrimSpace(event.Response.ID),
+		ResponseModel:         strings.TrimSpace(event.Response.Model),
+		ServiceTier:           strings.TrimSpace(event.Response.ServiceTier),
+		ExtraTokens:           usage.GetExtraTokens(),
+		ProviderTokenEvidence: usage.HasProviderUsage(),
+	}
+}
+
+func (a *openAIResponsesWSAdapter) MapProviderClose(_ context.Context, info responsesws.ProviderCloseInfo) responsesws.ProviderCloseResult {
 	if openAIResponsesWSNativeProviderCloseInfo(info) {
 		return responsesws.ProviderCloseResult{
 			ProviderClose: &responsesws.ProviderClose{Code: info.Code, Reason: info.Reason, Err: info.Err},
@@ -269,4 +318,4 @@ func openAIResponsesWSNativeProviderCloseInfo(info responsesws.ProviderCloseInfo
 	return info.Kind == responsesws.ProviderCloseKindPeerClose
 }
 
-var _ responsesws.ProviderAdapter = openAIResponsesWSAdapter{}
+var _ responsesws.ProviderAdapter = (*openAIResponsesWSAdapter)(nil)

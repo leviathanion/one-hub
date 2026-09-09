@@ -96,8 +96,8 @@ func ListGeminiModelsByToken(c *gin.Context) {
 	var geminiModels []gemini.ModelDetails
 	for _, modelName := range models {
 		// Get the price to check if it's a Gemini model (channel_type=25)
-		price := model.PricingInstance.GetPrice(modelName)
-		if price.ChannelType == config.ChannelTypeGemini {
+		price, ok := model.PricingInstance.FindPrice(modelName)
+		if ok && price.ChannelType == config.ChannelTypeGemini {
 			geminiModels = append(geminiModels, gemini.ModelDetails{
 				Name:        fmt.Sprintf("models/%s", modelName),
 				DisplayName: cases.Title(language.Und).String(strings.ReplaceAll(modelName, "-", " ")),
@@ -205,7 +205,10 @@ func getModelOwnedBy(channelType int) (ownedBy *string) {
 }
 
 func getOpenAIModelWithName(modelName string) *OpenAIModels {
-	price := model.PricingInstance.GetPrice(modelName)
+	price, ok := model.PricingInstance.FindPrice(modelName)
+	if !ok {
+		return &OpenAIModels{Id: modelName, Object: "model", Created: 1677649963, OwnedBy: &model.UnknownOwnedBy}
+	}
 
 	return &OpenAIModels{
 		Id:      modelName,
@@ -271,7 +274,10 @@ func getAvailableModels(groupName string) map[string]*AvailableModelResponse {
 		}
 
 		if _, ok := availableModels[modelName]; !ok {
-			price := model.PricingInstance.GetPrice(modelName)
+			price, priced := model.PricingInstance.FindPrice(modelName)
+			if !priced {
+				continue
+			}
 			availableModels[modelName] = &AvailableModelResponse{
 				Groups:  groups,
 				OwnedBy: *getModelOwnedBy(price.ChannelType),

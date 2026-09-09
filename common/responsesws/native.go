@@ -24,6 +24,9 @@ type NativeSessionOptions struct {
 	Context       context.Context
 	RecvQueueSize int
 	Diagnostics   NativeDiagnosticHook
+	// EventEnqueued 在事件被有序接收队列接纳后同步触发。它是可选观察点，
+	// 不应阻塞正常调用方。
+	EventEnqueued func(UpstreamEvent)
 	ProviderName  string
 	ChannelID     int
 	Transport     string
@@ -32,26 +35,135 @@ type NativeSessionOptions struct {
 // NativeSession adapts a provider websocket into the ResponsesWS upstream
 // contract. It emits transport evidence; relay actor code owns accounting.
 type NativeSession struct {
-	conn         *wsconn.ManagedConn
-	adapter      ProviderAdapter
-	base         context.Context
-	cancel       context.CancelFunc
-	diag         NativeDiagnosticHook
-	providerName string
-	channelID    int
-	transport    string
+	conn          *wsconn.ManagedConn
+	adapter       ProviderAdapter
+	base          context.Context
+	cancel        context.CancelFunc
+	diag          NativeDiagnosticHook
+	providerName  string
+	channelID     int
+	transport     string
+	eventEnqueued func(UpstreamEvent)
 
-	recvCh     chan UpstreamEvent
-	terminalCh chan UpstreamEvent
-	done       chan struct{}
+	done   chan struct{}
+	events nativeEventQueue
 
-	sendMu          sync.Mutex
-	attemptMu       sync.Mutex
-	activeAttemptID string
-	closeOnce       sync.Once
-	doneOnce        sync.Once
-	readPumpOnce    sync.Once
-	writeMessage    func(wsconn.MessageType, []byte) error
+	sendMu             sync.Mutex
+	attemptMu          sync.Mutex
+	activeAttemptID    string
+	closeOnce          sync.Once
+	doneOnce           sync.Once
+	readPumpOnce       sync.Once
+	writeMessage       func(wsconn.MessageType, []byte) error
+	writeMessageResult func(wsconn.MessageType, []byte) wsconn.WriteResult
+}
+
+// nativeQueuedEvent 由 nativeEventQueue.mu 保护。sequence 在事件被接纳时
+// 分配，使并发生产者在 relay actor 观察事件前只有一个确定顺序。
+type nativeQueuedEvent struct {
+	event    UpstreamEvent
+	sequence uint64
+	terminal bool
+}
+
+// nativeEventQueue 是原生 read pump 使用的有序接收队列。普通事件使用配置
+// 容量，另保留一个终态（或本地终态失败）槽位；终态不能绕过更早的普通帧，
+// 同时保留原有背压边界。
+type nativeEventQueue struct {
+	mu            sync.Mutex
+	items         []nativeQueuedEvent
+	ordinaryLimit int
+	ordinaryCount int
+	terminalCount int
+	nextSequence  uint64
+	closed        bool
+	notify        chan struct{}
+}
+
+func newNativeEventQueue(ordinaryLimit int) nativeEventQueue {
+	return nativeEventQueue{
+		// 由下方的 ordinaryCount/terminalCount 限制容量，避免从选项整数直接
+		// 推导分配大小。
+		items:         make([]nativeQueuedEvent, 0),
+		ordinaryLimit: ordinaryLimit,
+		notify:        make(chan struct{}, 1),
+	}
+}
+
+// enqueue 仅在队列仍开放但无法接纳事件时返回 full=true。已关闭的队列拒绝
+// 迟到生产者，不再触发新的背压关闭。
+func (q *nativeEventQueue) enqueue(event UpstreamEvent, terminal bool) (accepted, full bool) {
+	if q == nil {
+		return false, false
+	}
+	q.mu.Lock()
+	if q.closed {
+		q.mu.Unlock()
+		return false, false
+	}
+	if terminal {
+		if q.terminalCount >= 1 {
+			q.mu.Unlock()
+			return false, true
+		}
+	} else if q.ordinaryCount >= q.ordinaryLimit {
+		q.mu.Unlock()
+		return false, true
+	}
+	q.nextSequence++
+	q.items = append(q.items, nativeQueuedEvent{
+		event:    event,
+		sequence: q.nextSequence,
+		terminal: terminal,
+	})
+	if terminal {
+		q.terminalCount++
+	} else {
+		q.ordinaryCount++
+	}
+	q.mu.Unlock()
+	q.signal()
+	return true, false
+}
+
+func (q *nativeEventQueue) dequeue() (UpstreamEvent, bool) {
+	if q == nil {
+		return UpstreamEvent{}, false
+	}
+	q.mu.Lock()
+	if len(q.items) == 0 {
+		q.mu.Unlock()
+		return UpstreamEvent{}, false
+	}
+	queued := q.items[0]
+	q.items[0] = nativeQueuedEvent{}
+	q.items = q.items[1:]
+	if queued.terminal {
+		q.terminalCount--
+	} else {
+		q.ordinaryCount--
+	}
+	q.mu.Unlock()
+	return queued.event, true
+}
+
+func (q *nativeEventQueue) signal() {
+	if q == nil || q.notify == nil {
+		return
+	}
+	select {
+	case q.notify <- struct{}{}:
+	default:
+	}
+}
+
+func (q *nativeEventQueue) close() {
+	if q == nil {
+		return
+	}
+	q.mu.Lock()
+	q.closed = true
+	q.mu.Unlock()
 }
 
 func NewNativeSession(conn *wsconn.ManagedConn, adapter ProviderAdapter, options NativeSessionOptions) *NativeSession {
@@ -65,17 +177,17 @@ func NewNativeSession(conn *wsconn.ManagedConn, adapter ProviderAdapter, options
 	}
 	base, cancel := context.WithCancel(context.WithoutCancel(base))
 	return &NativeSession{
-		conn:         conn,
-		adapter:      adapter,
-		base:         base,
-		cancel:       cancel,
-		diag:         options.Diagnostics,
-		providerName: options.ProviderName,
-		channelID:    options.ChannelID,
-		transport:    options.Transport,
-		recvCh:       make(chan UpstreamEvent, queueSize),
-		terminalCh:   make(chan UpstreamEvent, 1),
-		done:         make(chan struct{}),
+		conn:          conn,
+		adapter:       adapter,
+		base:          base,
+		cancel:        cancel,
+		diag:          options.Diagnostics,
+		eventEnqueued: options.EventEnqueued,
+		providerName:  options.ProviderName,
+		channelID:     options.ChannelID,
+		transport:     options.Transport,
+		done:          make(chan struct{}),
+		events:        newNativeEventQueue(queueSize),
 	}
 }
 
@@ -127,7 +239,7 @@ func (s *NativeSession) sendClient(ctx context.Context, req SendRequest) Respons
 		prepared, err = s.prepareClientFrame(ctx, frame)
 		if err != nil {
 			if errors.Is(err, ErrAdapterPanic) {
-				_ = s.forceEnqueueLatest(UpstreamEvent{
+				_ = s.enqueueTerminal(UpstreamEvent{
 					AttemptID:    strings.TrimSpace(req.AttemptID),
 					DetailOrigin: RecvDetailOriginAdapterPanic,
 					DetailPhase:  RecvDetailPhasePrepareClientFrame,
@@ -143,13 +255,21 @@ func (s *NativeSession) sendClient(ctx context.Context, req SendRequest) Respons
 		return ResponsesWSTransportSendResult{Status: ResponsesWSTransportSendNotAttempted, Err: err}
 	}
 	s.setActiveAttemptID(strings.TrimSpace(req.AttemptID))
-	writeMessage := s.conn.WriteMessage
-	if s.writeMessage != nil {
-		writeMessage = s.writeMessage
+	var writeResult wsconn.WriteResult
+	switch {
+	case s.writeMessageResult != nil:
+		writeResult = s.writeMessageResult(mt, payload)
+	case s.writeMessage != nil:
+		writeResult = wsconn.WriteResult{Attempted: true, Err: s.writeMessage(mt, payload)}
+	default:
+		writeResult = s.conn.WriteMessageResult(mt, payload)
 	}
-	err = writeMessage(mt, payload)
-	if err != nil {
-		return ResponsesWSTransportSendResult{Status: ResponsesWSTransportSendAmbiguous, Err: err}
+	if writeResult.Err != nil {
+		status := ResponsesWSTransportSendAmbiguous
+		if !writeResult.Attempted {
+			status = ResponsesWSTransportSendNotAttempted
+		}
+		return ResponsesWSTransportSendResult{Status: status, Err: writeResult.Err}
 	}
 	return ResponsesWSTransportSendResult{Status: ResponsesWSTransportSendAttempted}
 }
@@ -187,48 +307,25 @@ func (s *NativeSession) recvEvent(ctx context.Context) (UpstreamEvent, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if event, ok := s.recvBufferedEvent(); ok {
-		return event, nil
-	}
-	select {
-	case terminal := <-s.terminalCh:
-		if event, ok := s.recvBufferedEvent(); ok {
-			return event, nil
-		}
-		return terminal, nil
-	case event, ok := <-s.recvCh:
-		if !ok {
-			return UpstreamEvent{}, ErrUpstreamClosed
-		}
-		return event, nil
-	case <-ctx.Done():
-		return UpstreamEvent{}, ctx.Err()
-	case <-s.done:
-		if event, ok := s.recvBufferedEvent(); ok {
+	for {
+		if event, ok := s.events.dequeue(); ok {
 			return event, nil
 		}
 		select {
-		case event := <-s.terminalCh:
-			return event, nil
-		default:
+		case <-s.events.notify:
+			// 循环顶部会再次检查队列。notify 仅负责唤醒，不参与事件排序。
+		case <-ctx.Done():
+			if event, ok := s.events.dequeue(); ok {
+				return event, nil
+			}
+			return UpstreamEvent{}, ctx.Err()
+		case <-s.done:
+			if event, ok := s.events.dequeue(); ok {
+				return event, nil
+			}
+			return UpstreamEvent{}, ErrUpstreamClosed
 		}
-		return UpstreamEvent{}, ErrUpstreamClosed
 	}
-}
-
-func (s *NativeSession) recvBufferedEvent() (UpstreamEvent, bool) {
-	if s == nil {
-		return UpstreamEvent{}, false
-	}
-	select {
-	case event, ok := <-s.recvCh:
-		if !ok {
-			return UpstreamEvent{}, false
-		}
-		return event, true
-	default:
-	}
-	return UpstreamEvent{}, false
 }
 
 func (s *NativeSession) Abort(reason string) {
@@ -289,6 +386,9 @@ func (s *NativeSession) runReadPump() {
 		},
 		OnClose: func(info wsconn.CloseInfo) {
 			s.handleProviderClose(ctx, info)
+			if s.cancel != nil {
+				s.cancel()
+			}
 			s.closeDone()
 		},
 	}
@@ -342,7 +442,7 @@ func (s *NativeSession) handleProviderMessage(ctx context.Context, mt wsconn.Mes
 		event.Frame = &frame
 	}
 	if result.Origin == RecvDetailOriginAdapterPanic {
-		_ = s.forceEnqueueLatest(event)
+		_ = s.enqueueTerminal(event)
 	} else {
 		_ = s.enqueue(event)
 	}
@@ -545,66 +645,51 @@ func nativeDiagnosticTransport(transport string) string {
 }
 
 func (s *NativeSession) enqueue(event UpstreamEvent) bool {
-	select {
-	case <-s.done:
-		return false
-	default:
-	}
-	select {
-	case s.recvCh <- event:
-		return true
-	default:
-		_ = s.enqueueTerminal(UpstreamEvent{
-			AttemptID:    s.currentAttemptID(),
-			DetailOrigin: RecvDetailOriginNativeBackpressure,
-			Err:          ErrNativeQueueFull,
-		})
-		s.close(wsconn.CloseInfo{Kind: wsconn.CloseKindBackpressure, Code: wsconn.CloseTryAgainLater, Reason: "responses_ws_native_recv_backpressure", Err: ErrNativeQueueFull})
-		return false
-	}
-}
-
-func (s *NativeSession) forceEnqueueLatest(event UpstreamEvent) bool {
 	if s == nil {
 		return false
 	}
-	select {
-	case <-s.done:
-		return false
-	default:
-	}
-	for {
-		select {
-		case s.recvCh <- event:
-			return true
-		default:
-			select {
-			case <-s.recvCh:
-				continue
-			case <-s.done:
-				return false
-			default:
-				return false
-			}
+	terminal := UpstreamEventHasProviderTerminalEvidence(event)
+	if terminal {
+		accepted, _ := s.events.enqueue(event, true)
+		if accepted {
+			s.notifyEventEnqueued(event)
 		}
+		return accepted
 	}
+	if accepted, full := s.events.enqueue(event, false); accepted {
+		s.notifyEventEnqueued(event)
+		return true
+	} else if !full {
+		return false
+	}
+	backpressure := UpstreamEvent{
+		AttemptID:    s.currentAttemptID(),
+		DetailOrigin: RecvDetailOriginNativeBackpressure,
+		Err:          ErrNativeQueueFull,
+	}
+	if accepted, _ := s.events.enqueue(backpressure, true); accepted {
+		s.notifyEventEnqueued(backpressure)
+	}
+	s.close(wsconn.CloseInfo{Kind: wsconn.CloseKindBackpressure, Code: wsconn.CloseTryAgainLater, Reason: "responses_ws_native_recv_backpressure", Err: ErrNativeQueueFull})
+	return false
 }
 
 func (s *NativeSession) enqueueTerminal(event UpstreamEvent) bool {
 	if s == nil {
 		return false
 	}
-	select {
-	case <-s.done:
-		return false
-	default:
+	accepted, _ := s.events.enqueue(event, true)
+	if accepted {
+		s.notifyEventEnqueued(event)
 	}
-	select {
-	case s.terminalCh <- event:
-		return true
-	default:
-		return true
+	return accepted
+}
+
+func (s *NativeSession) notifyEventEnqueued(event UpstreamEvent) {
+	if s == nil || s.eventEnqueued == nil {
+		return
 	}
+	s.eventEnqueued(event)
 }
 
 func (s *NativeSession) close(info wsconn.CloseInfo) {
@@ -623,6 +708,10 @@ func (s *NativeSession) close(info wsconn.CloseInfo) {
 }
 
 func (s *NativeSession) closeDone() {
+	if s == nil {
+		return
+	}
+	s.events.close()
 	s.doneOnce.Do(func() {
 		close(s.done)
 	})

@@ -3,23 +3,17 @@ package responsesws
 type RecvDetailOrigin string
 
 const (
-	RecvDetailOriginProviderFrame           RecvDetailOrigin = "provider_frame"
-	RecvDetailOriginProviderStream          RecvDetailOrigin = "provider_stream"
-	RecvDetailOriginProviderMalformed       RecvDetailOrigin = "provider_malformed_frame"
-	RecvDetailOriginProxyLocal              RecvDetailOrigin = "proxy_local"
-	RecvDetailOriginAdapterPanic            RecvDetailOrigin = "adapter_panic"
-	RecvDetailOriginSyntheticBridge         RecvDetailOrigin = "synthetic_bridge"
-	RecvDetailOriginBridgeStreamOpened      RecvDetailOrigin = "bridge_stream_opened"
-	RecvDetailOriginBridgeOpenProviderError RecvDetailOrigin = "bridge_open_provider_error"
-	RecvDetailOriginBridgeStreamError       RecvDetailOrigin = "bridge_stream_error"
-	RecvDetailOriginBridgeStreamEOF         RecvDetailOrigin = "bridge_stream_eof"
-	RecvDetailOriginBridgeLocalAbort        RecvDetailOrigin = "bridge_local_abort"
-	RecvDetailOriginNativeProviderClose     RecvDetailOrigin = "native_provider_close"
-	RecvDetailOriginNativeProviderEOF       RecvDetailOrigin = "native_provider_eof"
-	RecvDetailOriginNativeLocalAbort        RecvDetailOrigin = "native_local_abort"
-	RecvDetailOriginNativeLocalDetach       RecvDetailOrigin = "native_local_detach"
-	RecvDetailOriginNativeBackpressure      RecvDetailOrigin = "native_backpressure"
-	RecvDetailOriginNativeReadError         RecvDetailOrigin = "native_read_error"
+	RecvDetailOriginProviderFrame       RecvDetailOrigin = "provider_frame"
+	RecvDetailOriginProviderStream      RecvDetailOrigin = "provider_stream"
+	RecvDetailOriginProviderMalformed   RecvDetailOrigin = "provider_malformed_frame"
+	RecvDetailOriginProxyLocal          RecvDetailOrigin = "proxy_local"
+	RecvDetailOriginAdapterPanic        RecvDetailOrigin = "adapter_panic"
+	RecvDetailOriginNativeProviderClose RecvDetailOrigin = "native_provider_close"
+	RecvDetailOriginNativeProviderEOF   RecvDetailOrigin = "native_provider_eof"
+	RecvDetailOriginNativeLocalAbort    RecvDetailOrigin = "native_local_abort"
+	RecvDetailOriginNativeLocalDetach   RecvDetailOrigin = "native_local_detach"
+	RecvDetailOriginNativeBackpressure  RecvDetailOrigin = "native_backpressure"
+	RecvDetailOriginNativeReadError     RecvDetailOrigin = "native_read_error"
 )
 
 type RecvDetailPhase string
@@ -37,12 +31,6 @@ func RecvDetailOriginKnown(origin RecvDetailOrigin) bool {
 		RecvDetailOriginProviderMalformed,
 		RecvDetailOriginProxyLocal,
 		RecvDetailOriginAdapterPanic,
-		RecvDetailOriginSyntheticBridge,
-		RecvDetailOriginBridgeStreamOpened,
-		RecvDetailOriginBridgeOpenProviderError,
-		RecvDetailOriginBridgeStreamError,
-		RecvDetailOriginBridgeStreamEOF,
-		RecvDetailOriginBridgeLocalAbort,
 		RecvDetailOriginNativeProviderClose,
 		RecvDetailOriginNativeProviderEOF,
 		RecvDetailOriginNativeLocalAbort,
@@ -68,16 +56,10 @@ func ExpectedPayloadOriginForRecvDetailOrigin(origin RecvDetailOrigin) (PayloadO
 	switch origin {
 	case RecvDetailOriginProviderFrame,
 		RecvDetailOriginProviderStream,
-		RecvDetailOriginBridgeStreamOpened,
-		RecvDetailOriginBridgeOpenProviderError,
 		RecvDetailOriginNativeProviderClose,
 		RecvDetailOriginNativeProviderEOF:
 		return PayloadOriginProvider, true
 	case RecvDetailOriginProviderMalformed,
-		RecvDetailOriginSyntheticBridge,
-		RecvDetailOriginBridgeStreamError,
-		RecvDetailOriginBridgeStreamEOF,
-		RecvDetailOriginBridgeLocalAbort,
 		RecvDetailOriginProxyLocal,
 		RecvDetailOriginAdapterPanic,
 		RecvDetailOriginNativeLocalAbort,

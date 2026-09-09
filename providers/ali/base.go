@@ -21,6 +21,20 @@ const (
 // 定义供应商工厂
 type AliProviderFactory struct{}
 
+// AssessChatRemoteMedia covers both DashScope's native multimodal request and
+// its OpenAI-compatible endpoint. The native converter maps image_url parts
+// to AliMessagePart.Image, while the compatible branch delegates to OpenAI.
+func (AliProviderFactory) AssessChatRemoteMedia(channel *model.Channel, request *types.ChatCompletionRequest, _ base.ChatRemoteMediaSummary) (base.RemoteMediaMode, error) {
+	useOpenAIAPI := usesOpenAIAPI(channel)
+	if err := base.RequireOperationEndpoint(getConfig(useOpenAIAPI).ChatCompletions, "Chat Completions"); err != nil {
+		return base.RemoteMediaReject, err
+	}
+	if !useOpenAIAPI && (request == nil || !aliVisionModel(request.Model)) {
+		return base.RemoteMediaReject, fmt.Errorf("DashScope native Chat adapter cannot represent image media for this model")
+	}
+	return base.RemoteMediaPassURL, nil
+}
+
 type AliProvider struct {
 	openai.OpenAIProvider
 
@@ -30,16 +44,7 @@ type AliProvider struct {
 // 创建 AliProvider
 // https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation
 func (f AliProviderFactory) Create(channel *model.Channel) base.ProviderInterface {
-	useOpenaiAPI := false
-
-	if channel.Plugin != nil {
-		plugin := channel.Plugin.Data()
-		if pOpenAI, ok := plugin["use_openai_api"]; ok {
-			if enable, ok := pOpenAI["enable"].(bool); ok && enable {
-				useOpenaiAPI = true
-			}
-		}
-	}
+	useOpenaiAPI := usesOpenAIAPI(channel)
 
 	provider := &AliProvider{
 		OpenAIProvider: openai.OpenAIProvider{
@@ -108,15 +113,20 @@ func errorHandle(aliError *AliError) *types.OpenAIError {
 func (p *AliProvider) GetFullRequestURL(requestURL string, modelName string) string {
 	baseURL := strings.TrimSuffix(p.GetBaseURL(), "/")
 
-	modelKeywords := strings.Split(VisionModelKeywords, ",")
-	for _, keyword := range modelKeywords {
-		if strings.Contains(modelName, keyword) {
-			requestURL = "/api/v1/services/aigc/multimodal-generation/generation"
-			break
-		}
+	if aliVisionModel(modelName) {
+		requestURL = "/api/v1/services/aigc/multimodal-generation/generation"
 	}
 
 	return fmt.Sprintf("%s%s", baseURL, requestURL)
+}
+
+func aliVisionModel(modelName string) bool {
+	for _, keyword := range strings.Split(VisionModelKeywords, ",") {
+		if strings.Contains(modelName, keyword) {
+			return true
+		}
+	}
+	return false
 }
 
 // 获取请求头

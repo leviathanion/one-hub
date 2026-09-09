@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 
 	"one-api/common/config"
@@ -83,7 +84,7 @@ func TestAddChannelRejectsExistingTag(t *testing.T) {
 	if resp.Success {
 		t.Fatalf("expected existing tag create to be rejected, got %s", recorder.Body.String())
 	}
-	if resp.Message != "标签已存在，请到标签编辑里新增 key" {
+	if resp.Message != "标签已存在，请使用标签的新增渠道入口" {
 		t.Fatalf("unexpected rejection message: %q", resp.Message)
 	}
 
@@ -125,7 +126,7 @@ func TestAddChannelAllowsNewTag(t *testing.T) {
 	}
 }
 
-func TestAddChannelCanonicalizesCodexLegacyRequiredWebsocketMode(t *testing.T) {
+func TestAddChannelRejectsRemovedCodexWebsocketMode(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	useControllerChannelTagTestDB(t)
 
@@ -151,20 +152,20 @@ func TestAddChannelCanonicalizesCodexLegacyRequiredWebsocketMode(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("expected JSON response, got %v", err)
 	}
-	if !resp.Success {
-		t.Fatalf("expected Codex legacy websocket_mode create to succeed, got %s", recorder.Body.String())
+	if resp.Success || !strings.Contains(resp.Message, "other.websocket_mode") {
+		t.Fatalf("expected removed Codex websocket_mode to be rejected, got %s", recorder.Body.String())
 	}
 
-	var persisted model.Channel
-	if err := model.DB.Where("name = ?", "codex-required").First(&persisted).Error; err != nil {
-		t.Fatalf("expected created Codex channel lookup to succeed, got %v", err)
+	var count int64
+	if err := model.DB.Model(&model.Channel{}).Where("name = ?", "codex-required").Count(&count).Error; err != nil {
+		t.Fatal(err)
 	}
-	if persisted.Other != `{"websocket_mode":"force"}` {
-		t.Fatalf("expected Codex websocket_mode to persist as force, got %q", persisted.Other)
+	if count != 0 {
+		t.Fatal("rejected config was persisted")
 	}
 }
 
-func TestUpdateChannelCanonicalizesCodexLegacyRequiredWebsocketMode(t *testing.T) {
+func TestUpdateChannelRejectsRemovedCodexWebsocketMode(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	useControllerChannelTagTestDB(t)
 
@@ -202,16 +203,16 @@ func TestUpdateChannelCanonicalizesCodexLegacyRequiredWebsocketMode(t *testing.T
 	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("expected JSON response, got %v", err)
 	}
-	if !resp.Success {
-		t.Fatalf("expected Codex legacy websocket_mode update to succeed, got %s", recorder.Body.String())
+	if resp.Success || !strings.Contains(resp.Message, "other.websocket_mode") {
+		t.Fatalf("expected removed Codex websocket_mode to be rejected, got %s", recorder.Body.String())
 	}
 
 	persisted, err := model.GetChannelById(1)
 	if err != nil {
 		t.Fatalf("expected persisted Codex channel lookup to succeed, got %v", err)
 	}
-	if persisted.Other != `{"websocket_mode":"force"}` {
-		t.Fatalf("expected Codex websocket_mode to persist as force, got %q", persisted.Other)
+	if persisted.Other != "" || persisted.Name != "codex-old" {
+		t.Fatalf("rejected update changed the channel: name=%q other=%q", persisted.Name, persisted.Other)
 	}
 }
 
@@ -250,7 +251,7 @@ func TestUpdateChannelOmittedOtherPreservesAzureRequiredOther(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	useControllerChannelTagTestDB(t)
 
-	const originalOther = `{"api_version":"2024-05-01-preview","responses_ws_transport":"http_bridge"}`
+	const originalOther = `{"api_version":"2024-05-01-preview"}`
 	if err := model.DB.Create(&model.Channel{
 		Id:     1,
 		Type:   config.ChannelTypeAzure,
@@ -292,7 +293,7 @@ func TestUpdateChannelOmittedOtherPreservesOpenAIOptionalOther(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	useControllerChannelTagTestDB(t)
 
-	const originalOther = `{"responses_ws_transport":"http_bridge","responses_ws_native":false}`
+	const originalOther = `{"vendor_extra":{"owner":"ops"}}`
 	if err := model.DB.Create(&model.Channel{
 		Id:     1,
 		Type:   config.ChannelTypeOpenAI,
@@ -383,7 +384,7 @@ func TestBatchUpdateChannelsAzureApiRejectsLegacyValuePayload(t *testing.T) {
 		Key:    "sk-azure",
 		Group:  "default",
 		Models: "gpt-5",
-		Other:  `{"api_version":"2024-05-01-preview","responses_ws_transport":"http_bridge"}`,
+		Other:  `{"api_version":"2024-05-01-preview"}`,
 	}).Error; err != nil {
 		t.Fatalf("expected Azure channel fixture to persist, got %v", err)
 	}
@@ -408,7 +409,7 @@ func TestBatchUpdateChannelsAzureApiRejectsLegacyValuePayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected persisted Azure channel lookup to succeed, got %v", err)
 	}
-	if persisted.Other != `{"api_version":"2024-05-01-preview","responses_ws_transport":"http_bridge"}` {
+	if persisted.Other != `{"api_version":"2024-05-01-preview"}` {
 		t.Fatalf("expected rejected legacy payload not to mutate other, got %q", persisted.Other)
 	}
 }

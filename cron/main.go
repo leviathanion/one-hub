@@ -96,6 +96,24 @@ func InitCron() {
 		})
 	}
 
+	err = scheduler.Manager.AddJob(
+		"cleanup_response_owners",
+		gocron.DailyJob(1, gocron.NewAtTimes(gocron.NewAtTime(3, 30, 0))),
+		gocron.NewTask(func() {
+			deleted, cleanupErr := model.DeleteExpiredResponseOwners(context.Background(), time.Now())
+			if cleanupErr != nil {
+				logger.SysError("Cleanup response owners error: " + cleanupErr.Error())
+				return
+			}
+			if deleted > 0 {
+				logger.SysLog("清理过期 Responses 归属记录")
+			}
+		}),
+	)
+	if err != nil {
+		logger.SysError("Cron job error: " + err.Error())
+	}
+
 	// 开启自动更新 并且设置了有效自动更新时间 同时自动更新模式不是system 则会从服务器拉取最新价格表
 	autoPriceUpdatesInterval := viper.GetInt("auto_price_updates_interval")
 	autoPriceUpdates := viper.GetBool("auto_price_updates")

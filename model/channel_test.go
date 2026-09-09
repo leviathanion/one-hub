@@ -104,10 +104,10 @@ func TestChannelValidateRuntimeConfigJSONRejectsPlainOtherForAllChannels(t *test
 
 func TestCustomClaudeRelayConfigHelpers(t *testing.T) {
 	plugin := datatypes.NewJSONType(PluginType{
-		"claude": {
-			"enabled":  true,
-			"base_url": "https://proxy.example.com/root/",
-		},
+		"endpoints": {"anthropic.messages": map[string]any{
+			"enabled":      true,
+			"upstream_url": "https://proxy.example.com/root/v1/messages",
+		}},
 	})
 	channel := &Channel{
 		Type:   config.ChannelTypeCustom,
@@ -118,53 +118,53 @@ func TestCustomClaudeRelayConfigHelpers(t *testing.T) {
 		t.Fatal("expected custom Claude relay to be enabled")
 	}
 
-	baseURL, err := channel.ResolveCustomClaudeBaseURL("https://api.anthropic.com")
+	baseURL, err := channel.CustomClaudeEndpointIdentity()
 	if err != nil {
 		t.Fatalf("expected plugin Claude base_url to resolve, got %v", err)
 	}
-	if baseURL != "https://proxy.example.com/root" {
+	if baseURL != "https://proxy.example.com/root/v1/messages" {
 		t.Fatalf("unexpected resolved plugin Claude base_url: %q", baseURL)
 	}
 
 	channel.Plugin = func() *datatypes.JSONType[PluginType] {
 		fallbackPlugin := datatypes.NewJSONType(PluginType{
-			"claude": {
+			"endpoints": {"anthropic.messages": map[string]any{
 				"enabled": true,
-			},
+			}},
 		})
 		return &fallbackPlugin
 	}()
 	channel.BaseURL = testStringPtr("https://channel-base.example.com/api/")
 
-	baseURL, err = channel.ResolveCustomClaudeBaseURL("https://api.anthropic.com")
+	baseURL, err = channel.CustomClaudeEndpointIdentity()
 	if err != nil {
 		t.Fatalf("expected channel base_url fallback to resolve, got %v", err)
 	}
-	if baseURL != "https://channel-base.example.com/api" {
+	if baseURL != "https://channel-base.example.com/api/v1/messages" {
 		t.Fatalf("unexpected channel base_url fallback: %q", baseURL)
 	}
 
 	channel.BaseURL = nil
-	baseURL, err = channel.ResolveCustomClaudeBaseURL("https://api.anthropic.com")
+	baseURL, err = channel.CustomClaudeEndpointIdentity()
 	if err != nil {
 		t.Fatalf("expected default Claude base_url fallback to resolve, got %v", err)
 	}
-	if baseURL != "https://api.anthropic.com" {
+	if baseURL != "https://api.anthropic.com/v1/messages" {
 		t.Fatalf("unexpected default Claude base_url fallback: %q", baseURL)
 	}
 
 	channel.Plugin = func() *datatypes.JSONType[PluginType] {
 		disabledPlugin := datatypes.NewJSONType(PluginType{
-			"claude": {
+			"endpoints": {"anthropic.messages": map[string]any{
 				"enabled": false,
-			},
+			}},
 		})
 		return &disabledPlugin
 	}()
 	if channel.CustomClaudeRelayEnabled() {
 		t.Fatal("expected disabled custom Claude relay to be reported as disabled")
 	}
-	if _, err := channel.ResolveCustomClaudeBaseURL("https://api.anthropic.com"); err == nil {
+	if uri, err := channel.CustomClaudeEndpointIdentity(); err != nil || uri != "" {
 		t.Fatal("expected disabled custom Claude relay to reject resolution")
 	}
 }
@@ -194,10 +194,6 @@ func TestChannelInsertAndHydrateValidationBranches(t *testing.T) {
 		Other:  `{"prompt_cache_key_strategy":`,
 	}).Insert(); err == nil {
 		t.Fatal("expected insert to reject invalid Codex runtime config")
-	}
-
-	if err := (&Channel{}).hydratePersistedTypeForUpdate(); err != nil {
-		t.Fatalf("expected hydratePersistedTypeForUpdate to ignore zero-value channels, got %v", err)
 	}
 
 	if err := (&Channel{
@@ -238,22 +234,22 @@ func TestChannelPersistenceCanonicalizesLegacyOther(t *testing.T) {
 			Key:    "sk-batch",
 			Group:  "default",
 			Models: "gpt-5",
-			Other:  `{"websocket_mode":"required"}`,
+			Other:  `{"execution_session_ttl_seconds":600}`,
 		},
 	}); err != nil {
-		t.Fatalf("expected batch insert to canonicalize Codex legacy websocket_mode, got %v", err)
+		t.Fatalf("expected batch insert to preserve Codex session settings, got %v", err)
 	}
 	var batch Channel
 	if err := DB.Where("name = ?", "codex-batch").First(&batch).Error; err != nil {
 		t.Fatalf("expected batch-inserted Codex channel lookup to succeed, got %v", err)
 	}
-	assertJSONObjectsEqual(t, batch.Other, `{"websocket_mode":"force"}`)
+	assertJSONObjectsEqual(t, batch.Other, `{"execution_session_ttl_seconds":600}`)
 
 	update := &Channel{
 		Id:     inserted.Id,
 		Type:   config.ChannelTypeOpenAI,
 		Name:   "openai-update",
-		Key:    "sk-update",
+		Key:    "sk-insert",
 		Group:  "default",
 		Models: "gpt-5",
 		Other:  "legacy-update",
@@ -284,7 +280,7 @@ func TestChannelPartialUpdatesReloadCompletePersistedReceiver(t *testing.T) {
 			useTestChannelDB(t)
 			persisted := &Channel{
 				Type: config.ChannelTypeOpenAI, Name: "before", Key: "persisted-key",
-				Group: "persisted-group", Models: "gpt-old,gpt-stable", Other: `{"responses_ws_transport":"http_bridge"}`,
+				Group: "persisted-group", Models: "gpt-old,gpt-stable", Other: `{"vendor_extra":{"owner":"ops"}}`,
 			}
 			if err := DB.Create(persisted).Error; err != nil {
 				t.Fatalf("create fixture: %v", err)
@@ -398,12 +394,12 @@ func TestChannelGetOtherMapParsesAndReparsesOtherJSON(t *testing.T) {
 		t.Fatalf("expected parsed prompt cache strategy, got %s", got)
 	}
 
-	channel.Other = `{"websocket_mode":"force"}`
+	channel.Other = `{"execution_session_ttl_seconds":600}`
 	other, err = channel.GetOtherMap()
 	if err != nil {
 		t.Fatalf("expected runtime config reparse after other change, got %v", err)
 	}
-	if got := string(other["websocket_mode"]); got != `"force"` {
+	if got := string(other["execution_session_ttl_seconds"]); got != `600` {
 		t.Fatalf("expected reparsed websocket mode, got %s", got)
 	}
 }

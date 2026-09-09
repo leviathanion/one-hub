@@ -10,6 +10,10 @@ import (
 )
 
 func (p *VertexAIProvider) CreateGeminiChat(request *gemini.GeminiChatRequest) (*gemini.GeminiChatResponse, *types.OpenAIErrorWithStatusCode) {
+	raw, _ := p.GetRawBody()
+	if request.UsesGoogleSearchInRaw(raw) {
+		return nil, common.StringErrorWrapperLocal("Google Search grounding has no configured provider-unit price contract", "gemini_grounding_billing_unsupported", http.StatusBadRequest)
+	}
 	req, errWithCode := p.getGeminiRequest(request)
 	if errWithCode != nil {
 		return nil, errWithCode
@@ -24,12 +28,21 @@ func (p *VertexAIProvider) CreateGeminiChat(request *gemini.GeminiChatRequest) (
 	}
 
 	usage := p.GetUsage()
-	*usage = gemini.ConvertOpenAIUsage(geminiResponse.UsageMetadata)
+	actualModel := geminiResponse.ModelVersion
+	if actualModel == "" {
+		actualModel = geminiResponse.Model
+	}
+	*usage = gemini.ConvertOpenAIUsage(geminiResponse.UsageMetadata, actualModel)
+	request.ApplyUsageRequirements(usage)
 
 	return geminiResponse, nil
 }
 
 func (p *VertexAIProvider) CreateGeminiChatStream(request *gemini.GeminiChatRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+	raw, _ := p.GetRawBody()
+	if request.UsesGoogleSearchInRaw(raw) {
+		return nil, common.StringErrorWrapperLocal("Google Search grounding has no configured provider-unit price contract", "gemini_grounding_billing_unsupported", http.StatusBadRequest)
+	}
 	req, errWithCode := p.getGeminiRequest(request)
 	if errWithCode != nil {
 		return nil, errWithCode
@@ -37,18 +50,21 @@ func (p *VertexAIProvider) CreateGeminiChatStream(request *gemini.GeminiChatRequ
 	defer req.Body.Close()
 
 	chatHandler := &gemini.GeminiRelayStreamHandler{
-		Usage:     p.Usage,
-		ModelName: request.Model,
-		Prefix:    `data: `,
+		Usage:                p.Usage,
+		ModelName:            request.Model,
+		Prefix:               `data: `,
+		RequireCachedContent: request.UsesCachedContent(),
+		RequireInputImage:    request.UsesInputImages(),
 	}
 
 	// 发送请求
-	resp, openaiErr := p.Requester.SendRequestRaw(req)
+	streamRequester := p.Requester.ForHTTPProfile(requester.HTTPProfileLongStream)
+	resp, openaiErr := streamRequester.SendRequestRaw(req)
 	if openaiErr != nil {
 		return nil, openaiErr
 	}
 
-	stream, openaiErr := requester.RequestNoTrimStream(p.Requester, resp, chatHandler.HandlerStream)
+	stream, openaiErr := requester.RequestNoTrimStream(streamRequester, resp, chatHandler.HandlerStream)
 	if openaiErr != nil {
 		return nil, openaiErr
 	}

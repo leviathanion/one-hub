@@ -1,20 +1,21 @@
 package suno
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"one-api/common"
 	"one-api/types"
 )
 
-func (s *SunoProvider) GetFetchs(ids []string) (data *types.TaskResponse[[]SunoDataResponse], errWithCode *types.OpenAIErrorWithStatusCode) {
+func (s *SunoProvider) GetFetchs(ctx context.Context, ids []string) (data *types.TaskResponse[[]SunoDataResponse], errWithCode *types.OpenAIErrorWithStatusCode) {
 	fullRequestURL := s.GetFullRequestURL(s.Fetchs, "")
 	headers := s.GetRequestHeaders()
 	fetchReq := &FetchReq{
 		IDs: ids,
 	}
 	// 创建请求
-	req, err := s.Requester.NewRequest(http.MethodPost, fullRequestURL, s.Requester.WithHeader(headers), s.Requester.WithBody(fetchReq))
+	req, err := s.Requester.NewRequest(http.MethodPost, fullRequestURL, s.Requester.WithContext(ctx), s.Requester.WithHeader(headers), s.Requester.WithBody(fetchReq))
 	if err != nil {
 		return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
 	}
@@ -25,14 +26,14 @@ func (s *SunoProvider) GetFetchs(ids []string) (data *types.TaskResponse[[]SunoD
 	return data, errWithCode
 }
 
-func (s *SunoProvider) GetFetch(id string) (data *types.TaskResponse[SunoDataResponse], errWithCode *types.OpenAIErrorWithStatusCode) {
+func (s *SunoProvider) GetFetch(ctx context.Context, id string) (data *types.TaskResponse[SunoDataResponse], errWithCode *types.OpenAIErrorWithStatusCode) {
 	fetchUri := fmt.Sprintf(s.Fetch, id)
 
 	fullRequestURL := s.GetFullRequestURL(fetchUri, "")
 	headers := s.GetRequestHeaders()
 
 	// 创建请求
-	req, err := s.Requester.NewRequest(http.MethodGet, fullRequestURL, s.Requester.WithHeader(headers))
+	req, err := s.Requester.NewRequest(http.MethodGet, fullRequestURL, s.Requester.WithContext(ctx), s.Requester.WithHeader(headers))
 	if err != nil {
 		return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
 	}

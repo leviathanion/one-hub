@@ -42,12 +42,13 @@ func (p *VertexAIProvider) CreateClaudeChatStream(request *claude.ClaudeRequest)
 	}
 
 	// 发送请求
-	resp, openaiErr := p.Requester.SendRequestRaw(req)
+	streamRequester := p.Requester.ForHTTPProfile(requester.HTTPProfileLongStream)
+	resp, openaiErr := streamRequester.SendRequestRaw(req)
 	if openaiErr != nil {
 		return nil, openaiErr
 	}
 
-	stream, openaiErr := requester.RequestNoTrimStream(p.Requester, resp, chatHandler.HandlerStream)
+	stream, openaiErr := requester.RequestNoTrimStream(streamRequester, resp, chatHandler.HandlerStream)
 	if openaiErr != nil {
 		return nil, openaiErr
 	}

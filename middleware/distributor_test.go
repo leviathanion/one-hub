@@ -7,6 +7,7 @@ import (
 
 	"one-api/common/config"
 	"one-api/common/groupctx"
+	"one-api/internal/testutil/sqlitetest"
 	"one-api/model"
 
 	"github.com/gin-gonic/gin"
@@ -18,11 +19,11 @@ func TestGroupDistributorSetupGroupsPreservesTokenGroupAndInitializesRoutingGrou
 	gin.SetMode(gin.TestMode)
 
 	originalDB := model.DB
-	testDB, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	testDB, err := gorm.Open(sqlite.Open(sqlitetest.MemoryDSN()), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("expected in-memory sqlite database, got %v", err)
 	}
-	if err := testDB.AutoMigrate(&model.User{}); err != nil {
+	if err := testDB.AutoMigrate(&model.User{}, &model.UserGroup{}, &model.PublicationVersion{}); err != nil {
 		t.Fatalf("expected user schema migration, got %v", err)
 	}
 	model.DB = testDB
@@ -30,21 +31,24 @@ func TestGroupDistributorSetupGroupsPreservesTokenGroupAndInitializesRoutingGrou
 		model.DB = originalDB
 	})
 
-	originalUserGroups := model.GlobalUserGroupRatio.UserGroup
-	originalAPILimiter := model.GlobalUserGroupRatio.APILimiter
-	originalPublicGroups := append([]string(nil), model.GlobalUserGroupRatio.PublicGroup...)
-	model.GlobalUserGroupRatio.UserGroup = map[string]*model.UserGroup{
-		"token-a":  {Symbol: "token-a", Ratio: 1.5},
-		"user-a":   {Symbol: "user-a", Ratio: 1.25},
-		"backup-a": {Symbol: "backup-a", Ratio: 1.75},
+	originalGroups := model.GlobalUserGroupRatio
+	model.GlobalUserGroupRatio = &model.UserGroupRatio{}
+	t.Cleanup(func() { model.GlobalUserGroupRatio = originalGroups })
+	if err := model.EnsurePublicationVersionRows(testDB); err != nil {
+		t.Fatal(err)
 	}
-	model.GlobalUserGroupRatio.APILimiter = nil
-	model.GlobalUserGroupRatio.PublicGroup = nil
-	t.Cleanup(func() {
-		model.GlobalUserGroupRatio.UserGroup = originalUserGroups
-		model.GlobalUserGroupRatio.APILimiter = originalAPILimiter
-		model.GlobalUserGroupRatio.PublicGroup = originalPublicGroups
-	})
+	for _, group := range []model.UserGroup{
+		{Symbol: "token-a", Ratio: 1.5},
+		{Symbol: "user-a", Ratio: 1.25},
+		{Symbol: "backup-a", Ratio: 1.75},
+	} {
+		if err := testDB.Create(&group).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := model.GlobalUserGroupRatio.Load(); err != nil {
+		t.Fatal(err)
+	}
 
 	user := &model.User{
 		Id:       99,

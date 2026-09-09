@@ -17,14 +17,6 @@ type OpenAIProviderCompletionResponse struct {
 	types.OpenAIErrorResponse
 }
 
-func (c *OpenAIProviderCompletionResponse) getResponseText() (responseText string) {
-	for _, choice := range c.Choices {
-		responseText += choice.Text
-	}
-
-	return
-}
-
 type OpenAIProviderEmbeddingsResponse struct {
 	types.EmbeddingResponse
 	types.OpenAIErrorResponse
@@ -49,6 +41,7 @@ func (a *OpenAIProviderTranscriptionsTextResponse) GetString() *string {
 type OpenAIProviderImageResponse struct {
 	types.ImageResponse
 	types.OpenAIErrorResponse
+	providerDataCount *int
 }
 
 type OpenAISubscriptionResponse struct {

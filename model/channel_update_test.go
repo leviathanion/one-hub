@@ -14,6 +14,7 @@ import (
 	"one-api/common/cache"
 	"one-api/common/config"
 	"one-api/common/logger"
+	"one-api/internal/testutil/sqlitetest"
 
 	"go.uber.org/zap"
 	"gorm.io/datatypes"
@@ -29,7 +30,7 @@ func useTestChannelDB(t *testing.T) {
 	}
 
 	originalDB := DB
-	testDB, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())), &gorm.Config{})
+	testDB, err := gorm.Open(sqlite.Open(sqlitetest.MemoryDSN()), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("expected in-memory sqlite database, got %v", err)
 	}
@@ -238,33 +239,15 @@ func stringPtr(value string) *string {
 func primeChannelDerivedCaches(t *testing.T, channelID int) {
 	t.Helper()
 
-	cacheEntries := map[string]string{
-		fmt.Sprintf("%s:%d", codexTokenCacheKeyPrefix, channelID):           "cached-token",
-		fmt.Sprintf("%s:%d", codexUsagePreviewCacheKeyPrefix, channelID):    "cached-preview",
-		fmt.Sprintf("%s:%d", codexUsageDetailCacheKeyPrefix, channelID):     "cached-detail",
-		fmt.Sprintf("%s:%d", codexUsageGenerationCacheKeyPrefix, channelID): "generation-before-mutation",
-	}
-
-	for key, value := range cacheEntries {
-		if err := cache.SetCache(key, value, time.Minute); err != nil {
-			t.Fatalf("expected cache priming to succeed for %s, got %v", key, err)
-		}
+	key := fmt.Sprintf("%s:%d", codexUsageGenerationCacheKeyPrefix, channelID)
+	if err := cache.SetCache(key, "generation-before-mutation", time.Minute); err != nil {
+		t.Fatalf("expected cache priming to succeed for %s, got %v", key, err)
 	}
 }
 
 func assertChannelDerivedCachesCleared(t *testing.T, channelID int) {
 	t.Helper()
 
-	legacyKeys := []string{
-		fmt.Sprintf("%s:%d", codexTokenCacheKeyPrefix, channelID),
-		fmt.Sprintf("%s:%d", codexUsagePreviewCacheKeyPrefix, channelID),
-		fmt.Sprintf("%s:%d", codexUsageDetailCacheKeyPrefix, channelID),
-	}
-	for _, key := range legacyKeys {
-		if _, err := cache.GetCache[string](key); !errors.Is(err, cache.CacheNotFound) {
-			t.Fatalf("expected legacy cache key %s to be cleared, got err=%v", key, err)
-		}
-	}
 	generationKey := fmt.Sprintf("%s:%d", codexUsageGenerationCacheKeyPrefix, channelID)
 	generation, err := cache.GetCache[string](generationKey)
 	if err != nil || generation == "generation-before-mutation" || generation == "" {
@@ -275,17 +258,10 @@ func assertChannelDerivedCachesCleared(t *testing.T, channelID int) {
 func assertChannelDerivedCachesPresent(t *testing.T, channelID int) {
 	t.Helper()
 
-	cacheKeys := []string{
-		fmt.Sprintf("%s:%d", codexTokenCacheKeyPrefix, channelID),
-		fmt.Sprintf("%s:%d", codexUsagePreviewCacheKeyPrefix, channelID),
-		fmt.Sprintf("%s:%d", codexUsageDetailCacheKeyPrefix, channelID),
-		fmt.Sprintf("%s:%d", codexUsageGenerationCacheKeyPrefix, channelID),
-	}
-
-	for _, key := range cacheKeys {
-		if _, err := cache.GetCache[string](key); err != nil {
-			t.Fatalf("expected cache key %s to still exist, got err=%v", key, err)
-		}
+	key := fmt.Sprintf("%s:%d", codexUsageGenerationCacheKeyPrefix, channelID)
+	generation, err := cache.GetCache[string](key)
+	if err != nil || generation != "generation-before-mutation" {
+		t.Fatalf("expected generation %s to remain unchanged, value=%q err=%v", key, generation, err)
 	}
 }
 
@@ -299,7 +275,7 @@ func TestChannelCredentialDatabaseOperationsHonorCanceledContext(t *testing.T) {
 	if _, err := GetChannelByIdWithContext(ctx, 991); !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected canceled credential load, got %v", err)
 	}
-	if err := UpdateChannelKeyWithContext(ctx, 991, "new-key"); !errors.Is(err, context.Canceled) {
+	if _, err := CommitCredentialRotation(ctx, CredentialRotationTicket{ChannelID: 991, AttemptID: "test"}, "new-key"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected canceled credential save, got %v", err)
 	}
 
@@ -359,7 +335,7 @@ func TestChannelUpdateRawOverwritePreservesPersistedTypeWhenTypeOmitted(t *testi
 	update := &Channel{
 		Id:     1,
 		Name:   "codex-updated",
-		Key:    "sk-codex-updated",
+		Key:    "sk-codex",
 		Group:  "default",
 		Models: "gpt-5",
 	}
@@ -429,28 +405,6 @@ func TestChannelUpdateRawIgnoresMissingCodexDerivedCaches(t *testing.T) {
 	if err := update.UpdateRaw(false); err != nil {
 		t.Fatalf("expected channel update to ignore missing derived caches, got %v", err)
 	}
-}
-
-func TestUpdateChannelKeyClearsCodexDerivedCaches(t *testing.T) {
-	useTestChannelDB(t)
-	cache.InitCacheManager()
-	logger.SetupLogger()
-
-	insertTestChannel(t, &Channel{
-		Id:     1,
-		Type:   config.ChannelTypeCodex,
-		Name:   "codex",
-		Key:    "sk-codex",
-		Group:  "default",
-		Models: "gpt-5",
-	})
-	primeChannelDerivedCaches(t, 1)
-
-	if err := UpdateChannelKey(1, "sk-codex-updated"); err != nil {
-		t.Fatalf("expected key update to succeed, got %v", err)
-	}
-
-	assertChannelDerivedCachesCleared(t, 1)
 }
 
 func TestUpdateChannelStatusClearsCodexDerivedCachesAfterCommit(t *testing.T) {
@@ -1119,7 +1073,6 @@ func TestUpdateChannelsTagRejectsInvalidCodexOtherWhenTypeOmitted(t *testing.T) 
 	})
 
 	if err := UpdateChannelsTag("codex-team", &Channel{
-		Key:   "sk-tagged",
 		Other: `{"prompt_cache_key_strategy":`,
 	}); err == nil {
 		t.Fatal("expected tag update to reject invalid Codex other JSON when payload omits type")
@@ -1279,7 +1232,7 @@ func TestUpdateChannelsTagRejectsWhitespaceOnlyKeyWithoutDeletingMembers(t *test
 	})
 
 	err := UpdateChannelsTag("whitespace-team", &Channel{Key: " \n\t "})
-	if err == nil || !strings.Contains(err.Error(), "key不能为空") {
+	if err == nil || !strings.Contains(err.Error(), "普通编辑不接受 key") {
 		t.Fatalf("expected whitespace-only key to be rejected, got %v", err)
 	}
 
@@ -1303,7 +1256,7 @@ func TestAddChannelToTagNormalizesCodexJSONKeyAndRejectsDuplicate(t *testing.T) 
 		Group:  "default",
 		Models: "gpt-5",
 		Tag:    "codex-team",
-		Other:  `{"prompt_cache_key_strategy":"auto"}`,
+		Other:  `{"self_hosted":true}`,
 	})
 
 	prettyKey := "{\n  \"access_token\": \"new-token\",\n  \"refresh_token\": \"new-refresh\"\n}"
@@ -1323,7 +1276,7 @@ func TestAddChannelToTagNormalizesCodexJSONKeyAndRejectsDuplicate(t *testing.T) 
 	}
 }
 
-func TestUpdateChannelsTagNormalizesSingleCodexPrettyJSONKey(t *testing.T) {
+func TestUpdateChannelsTagRejectsReadOnlyCredentialPayload(t *testing.T) {
 	useTestChannelDB(t)
 
 	insertTestChannel(t, &Channel{
@@ -1342,8 +1295,8 @@ func TestUpdateChannelsTagNormalizesSingleCodexPrettyJSONKey(t *testing.T) {
 		Group:  "default",
 		Models: "gpt-5",
 		Tag:    "codex-team",
-	}); err != nil {
-		t.Fatalf("expected tag update to accept single pretty Codex JSON key, got %v", err)
+	}); err == nil {
+		t.Fatal("ordinary tag update accepted credential payload")
 	}
 
 	channels, err := GetChannelsByTag("codex-team")
@@ -1377,7 +1330,7 @@ func TestAddChannelToTagRejectsInvalidInheritedCodexOther(t *testing.T) {
 	}
 }
 
-func TestUpdateChannelsTagRejectsNewMemberWithInvalidInheritedCodexOther(t *testing.T) {
+func TestUpdateChannelsTagRejectsImplicitMemberChanges(t *testing.T) {
 	useTestChannelDB(t)
 
 	insertTestChannel(t, &Channel{
@@ -1479,9 +1432,9 @@ func TestUpdateChannelsTagSynchronizesSubmittedTagConfigZeroValues(t *testing.T)
 	empty := ""
 	emptyObject := "{}"
 	emptyDisabledStream := datatypes.JSONSlice[string]{}
-	if err := UpdateChannelsTag("sync-team", &Channel{
-		Name:               "ignored-name",
-		Key:                "sk-one\nsk-two",
+	if err := UpdateChannelsTagWithSubmittedFields("sync-team", &Channel{
+		Name: "ignored-name",
+
 		Status:             config.ChannelStatusEnabled,
 		Group:              "default",
 		Models:             "gpt-new",
@@ -1498,6 +1451,10 @@ func TestUpdateChannelsTagSynchronizesSubmittedTagConfigZeroValues(t *testing.T)
 		CompatibleResponse: false,
 		AllowExtraBody:     false,
 		DisabledStream:     &emptyDisabledStream,
+	}, ChannelTagSubmittedFields{
+		"group": {}, "models": {}, "model_mapping": {}, "model_headers": {},
+		"custom_parameter": {}, "proxy": {}, "test_model": {}, "only_chat": {},
+		"pre_cost": {}, "compatible_response": {}, "allow_extra_body": {}, "disabled_stream": {},
 	}); err != nil {
 		t.Fatalf("expected tag update to succeed, got %v", err)
 	}
@@ -1513,8 +1470,8 @@ func TestUpdateChannelsTagSynchronizesSubmittedTagConfigZeroValues(t *testing.T)
 		if channel.Models != "gpt-new" || channel.Group != "default" {
 			t.Fatalf("expected routing config to sync, got models=%q group=%q", channel.Models, channel.Group)
 		}
-		if channel.BaseURL == nil || *channel.BaseURL != "" || channel.Other != "" || channel.TestModel != "" {
-			t.Fatalf("expected string config to clear, got base_url=%v other=%q test_model=%q", channel.BaseURL, channel.Other, channel.TestModel)
+		if channel.BaseURL == nil || *channel.BaseURL != "https://old.example" || channel.Other != `{"vendor_extra":{"legacy":"other"}}` || channel.TestModel != "" {
+			t.Fatalf("expected account identity config to remain and other strings to clear, got base_url=%v other=%q test_model=%q", channel.BaseURL, channel.Other, channel.TestModel)
 		}
 		if channel.ModelMapping == nil || *channel.ModelMapping != "{}" {
 			t.Fatalf("expected model_mapping to clear to {}, got %#v", channel.ModelMapping)
@@ -1571,7 +1528,6 @@ func TestUpdateChannelsTagWithSubmittedFieldsPreservesOmittedTagConfig(t *testin
 	})
 
 	if err := UpdateChannelsTagWithSubmittedFields("partial-team", &Channel{
-		Key:            "sk-one",
 		Models:         "gpt-new",
 		Other:          "",
 		TestModel:      "",
@@ -1636,7 +1592,7 @@ func TestChannelOverwriteUpdatePreservesRequiredOtherWhenOmitted(t *testing.T) {
 		Group:  "default",
 		Status: config.ChannelStatusEnabled,
 		Models: "gpt-old",
-		Other:  `{"api_version":"2024-05-01-preview","responses_ws_transport":"http_bridge"}`,
+		Other:  `{"api_version":"2024-05-01-preview"}`,
 	})
 
 	update := &Channel{
@@ -1656,7 +1612,7 @@ func TestChannelOverwriteUpdatePreservesRequiredOtherWhenOmitted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected persisted Azure channel lookup to succeed, got %v", err)
 	}
-	if persisted.Models != "gpt-new" || persisted.Other != `{"api_version":"2024-05-01-preview","responses_ws_transport":"http_bridge"}` {
+	if persisted.Models != "gpt-new" || persisted.Other != `{"api_version":"2024-05-01-preview"}` {
 		t.Fatalf("expected omitted other to be preserved while updating models, models=%q other=%q", persisted.Models, persisted.Other)
 	}
 }
@@ -1735,7 +1691,7 @@ func TestChannelOverwriteUpdatePreservesOptionalBaseURLWhenOmitted(t *testing.T)
 	}
 }
 
-func TestChannelOverwriteUpdateAllowsExplicitNullOptionalBaseURL(t *testing.T) {
+func TestChannelOverwriteUpdateRejectsExplicitBaseURLIdentityChange(t *testing.T) {
 	useTestChannelDB(t)
 
 	insertTestChannel(t, &Channel{
@@ -1761,22 +1717,22 @@ func TestChannelOverwriteUpdateAllowsExplicitNullOptionalBaseURL(t *testing.T) {
 		Other:   `{}`,
 		BaseURL: nil,
 	}
-	if err := update.UpdateRawWithOptions(true, ChannelUpdateOptions{OtherSubmitted: true, BaseURLSubmitted: true}); err != nil {
-		t.Fatalf("expected overwrite update with explicit null optional base_url to succeed, got %v", err)
+	if err := update.UpdateRawWithOptions(true, ChannelUpdateOptions{OtherSubmitted: true, BaseURLSubmitted: true}); err == nil {
+		t.Fatal("expected account-bound BaseURL change to be rejected")
 	}
 	persisted, err := GetChannelById(1)
 	if err != nil {
 		t.Fatalf("expected persisted OpenAI channel lookup to succeed, got %v", err)
 	}
-	if persisted.BaseURL != nil || persisted.Models != "gpt-new" {
-		t.Fatalf("expected explicit null optional base_url to clear value, got %+v", persisted)
+	if persisted.BaseURL == nil || *persisted.BaseURL != "https://proxy.example.com/v1" || persisted.Models != "gpt-old" {
+		t.Fatalf("rejected BaseURL change mutated channel, got %+v", persisted)
 	}
 }
 
 func TestChannelOverwriteUpdatePreservesOptionalRuntimeOtherWhenOmitted(t *testing.T) {
 	useTestChannelDB(t)
 
-	const originalOther = `{"responses_ws_transport":"native","prompt_cache_key_strategy":"session_id"}`
+	const originalOther = `{"execution_session_ttl_seconds":600}`
 	insertTestChannel(t, &Channel{
 		Id:     1,
 		Type:   config.ChannelTypeCodex,
@@ -1821,7 +1777,7 @@ func TestChannelOverwriteUpdateAllowsExplicitEmptyOptionalOther(t *testing.T) {
 		Group:  "default",
 		Status: config.ChannelStatusEnabled,
 		Models: "gpt-old",
-		Other:  `{"responses_ws_transport":"http_bridge"}`,
+		Other:  `{"vendor_extra":{"owner":"ops"}}`,
 	})
 
 	update := &Channel{
@@ -1857,7 +1813,7 @@ func TestChannelOverwriteUpdateRejectsTypeChangeWhenOtherOmitted(t *testing.T) {
 		Group:  "default",
 		Status: config.ChannelStatusEnabled,
 		Models: "gpt-old",
-		Other:  `{"responses_ws_transport":"http_bridge"}`,
+		Other:  `{"extra":{"owner":"ops"}}`,
 	})
 
 	update := &Channel{
@@ -1877,7 +1833,7 @@ func TestChannelOverwriteUpdateRejectsTypeChangeWhenOtherOmitted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected persisted OpenAI channel lookup to succeed, got %v", err)
 	}
-	if persisted.Type != config.ChannelTypeOpenAI || persisted.Models != "gpt-old" || persisted.Other != `{"responses_ws_transport":"http_bridge"}` {
+	if persisted.Type != config.ChannelTypeOpenAI || persisted.Models != "gpt-old" || persisted.Other != `{"extra":{"owner":"ops"}}` {
 		t.Fatalf("expected rejected type change not to mutate channel, type=%d models=%q other=%q", persisted.Type, persisted.Models, persisted.Other)
 	}
 }
@@ -1893,7 +1849,7 @@ func TestChannelPartialUpdateWritesSubmittedZeroValueRuntimeConfig(t *testing.T)
 		Group:   "default",
 		Status:  config.ChannelStatusEnabled,
 		Models:  "gpt-old",
-		Other:   `{"responses_ws_transport":"http_bridge"}`,
+		Other:   `{"vendor_extra":{"owner":"ops"}}`,
 		BaseURL: stringPtr("https://old.example.com"),
 	})
 
@@ -1920,15 +1876,122 @@ func TestChannelPartialUpdateWritesSubmittedZeroValueRuntimeConfig(t *testing.T)
 		Status:  config.ChannelStatusEnabled,
 		BaseURL: nil,
 	}
-	if err := clearBaseURL.UpdateRawWithOptions(false, ChannelUpdateOptions{BaseURLSubmitted: true}); err != nil {
-		t.Fatalf("expected partial update with explicit null base_url to succeed, got %v", err)
+	if err := clearBaseURL.UpdateRawWithOptions(false, ChannelUpdateOptions{BaseURLSubmitted: true}); err == nil {
+		t.Fatal("expected partial BaseURL identity change to be rejected")
 	}
 	persisted, err = GetChannelById(1)
 	if err != nil {
 		t.Fatalf("expected persisted OpenAI channel lookup to succeed, got %v", err)
 	}
-	if persisted.BaseURL != nil || persisted.Other != "" {
-		t.Fatalf("expected explicit base_url null to clear and omitted other to stay empty, got %+v", persisted)
+	if persisted.BaseURL == nil || *persisted.BaseURL != "https://old.example.com" || persisted.Other != "" {
+		t.Fatalf("rejected BaseURL change mutated channel, got %+v", persisted)
+	}
+}
+
+func TestChannelIncarnationLoaderIncludesDisabledAndSoftDeletedRows(t *testing.T) {
+	useTestChannelDB(t)
+
+	insertTestChannel(t, &Channel{
+		Id:     1,
+		Type:   config.ChannelTypeOpenAI,
+		Name:   "disabled-owner",
+		Key:    "sk-disabled",
+		Group:  "default",
+		Status: config.ChannelStatusManuallyDisabled,
+		Models: "gpt-5",
+		Other:  `{}`,
+	})
+	if channel, err := GetChannelIncarnationByID(context.Background(), 1); err != nil || channel.Key != "sk-disabled" {
+		t.Fatalf("disabled owner channel must remain loadable: channel=%+v err=%v", channel, err)
+	}
+
+	insertTestChannel(t, &Channel{
+		Id:     2,
+		Type:   config.ChannelTypeOpenAI,
+		Name:   "deleted-owner",
+		Key:    "sk-deleted",
+		Group:  "default",
+		Status: config.ChannelStatusEnabled,
+		Models: "gpt-5",
+		Other:  `{}`,
+	})
+	if err := DB.Delete(&Channel{}, 2).Error; err != nil {
+		t.Fatalf("soft delete owner channel: %v", err)
+	}
+	if _, err := GetChannelById(2); !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("new-work loader must exclude soft-deleted channel, got %v", err)
+	}
+	if channel, err := GetChannelIncarnationByID(context.Background(), 2); err != nil || channel.Key != "sk-deleted" || !channel.DeletedAt.Valid {
+		t.Fatalf("owner loader must retain soft-deleted incarnation: channel=%+v err=%v", channel, err)
+	}
+}
+
+func TestChannelIncarnationRejectsIdentityMutationButAllowsRouteConfig(t *testing.T) {
+	useTestChannelDB(t)
+
+	insertTestChannel(t, &Channel{
+		Id:      1,
+		Type:    config.ChannelTypeVertexAI,
+		Name:    "openai",
+		Key:     "sk-original",
+		Group:   "default",
+		Status:  config.ChannelStatusEnabled,
+		Models:  "gpt-old",
+		BaseURL: stringPtr("https://api.example.com/v1"),
+		Other:   `{"project_id":"project-a","region":"us-east","extra":{"timeout":10}}`,
+	})
+
+	base := func() *Channel {
+		return &Channel{
+			Id:      1,
+			Type:    config.ChannelTypeVertexAI,
+			Name:    "openai",
+			Key:     "sk-original",
+			Group:   "default",
+			Status:  config.ChannelStatusEnabled,
+			Models:  "gpt-old",
+			BaseURL: stringPtr("https://api.example.com/v1"),
+			Other:   `{"project_id":"project-a","region":"us-east","extra":{"timeout":10}}`,
+		}
+	}
+
+	identityMutations := []struct {
+		name   string
+		mutate func(*Channel)
+	}{
+		{name: "credential", mutate: func(channel *Channel) { channel.Key = "sk-other" }},
+		{name: "provider type", mutate: func(channel *Channel) { channel.Type = config.ChannelTypeCodex }},
+		{name: "project", mutate: func(channel *Channel) {
+			channel.Other = `{"project_id":"project-b","region":"us-east","extra":{"timeout":10}}`
+		}},
+		{name: "region", mutate: func(channel *Channel) {
+			channel.Other = `{"project_id":"project-a","region":"eu-west","extra":{"timeout":10}}`
+		}},
+	}
+	for _, test := range identityMutations {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := base()
+			test.mutate(candidate)
+			if err := candidate.UpdateRawWithOptions(true, ChannelUpdateOptions{OtherSubmitted: true, BaseURLSubmitted: true}); err == nil {
+				t.Fatal("expected identity mutation to be rejected")
+			}
+		})
+	}
+
+	routeConfig := base()
+	routeConfig.Name = "openai-route-updated"
+	routeConfig.Status = config.ChannelStatusManuallyDisabled
+	routeConfig.Models = "gpt-new"
+	routeConfig.Other = `{"project_id":"project-a","region":"us-east","extra":{"timeout":20}}`
+	if err := routeConfig.UpdateRawWithOptions(true, ChannelUpdateOptions{OtherSubmitted: true, BaseURLSubmitted: true}); err != nil {
+		t.Fatalf("same-incarnation route/runtime update should succeed: %v", err)
+	}
+	persisted, err := GetChannelById(1)
+	if err != nil {
+		t.Fatalf("load updated channel: %v", err)
+	}
+	if persisted.Name != routeConfig.Name || persisted.Status != routeConfig.Status || persisted.Models != routeConfig.Models || persisted.Other != routeConfig.Other {
+		t.Fatalf("route/runtime update was not persisted: %+v", persisted)
 	}
 }
 
@@ -1982,7 +2045,6 @@ func TestUpdateChannelsTagPartialSubmitPreservesRequiredVertexAIOther(t *testing
 	})
 
 	if err := UpdateChannelsTagWithSubmittedFields("vertex-team", &Channel{
-		Key:    "vertex-key",
 		Models: "gemini-new",
 		Other:  "",
 	}, ChannelTagSubmittedFields{"models": struct{}{}}); err != nil {
@@ -2002,10 +2064,10 @@ func TestUpdateChannelsTagPartialSubmitNewMemberInheritsExistingTagConfig(t *tes
 
 	oldDisabledStream := datatypes.JSONSlice[string]{"gpt-old"}
 	oldPlugin := datatypes.NewJSONType(PluginType{
-		"claude": {
-			"enabled":  true,
-			"base_url": "https://old-plugin.example.com",
-		},
+		"endpoints": {"anthropic.messages": map[string]any{
+			"enabled":      true,
+			"upstream_url": "https://old-plugin.example.com/v1/messages",
+		}},
 	})
 	insertTestChannel(t, &Channel{
 		Id:                 1,
@@ -2032,13 +2094,15 @@ func TestUpdateChannelsTagPartialSubmitNewMemberInheritsExistingTagConfig(t *tes
 	})
 
 	if err := UpdateChannelsTagWithSubmittedFields("partial-member-team", &Channel{
-		Key:    "sk-one\nsk-two",
 		Models: "gpt-new",
 	}, ChannelTagSubmittedFields{
-		"key":    struct{}{},
 		"models": struct{}{},
 	}); err != nil {
 		t.Fatalf("expected partial tag update with new key to succeed, got %v", err)
+	}
+
+	if _, err := AddChannelToTag("partial-member-team", &Channel{Key: `sk-two`}); err != nil {
+		t.Fatal(err)
 	}
 
 	channels, err := GetChannelsByTag("partial-member-team")
@@ -2079,7 +2143,7 @@ func TestUpdateChannelsTagPartialSubmitNewMemberInheritsExistingTagConfig(t *tes
 		if channel.DisabledStream == nil || len(*channel.DisabledStream) != 1 || (*channel.DisabledStream)[0] != "gpt-old" {
 			t.Fatalf("expected omitted disabled_stream to be inherited for %q, got %#v", key, channel.DisabledStream)
 		}
-		if channel.Plugin == nil || channel.Plugin.Data()["claude"]["base_url"] != "https://old-plugin.example.com" {
+		if channel.Plugin == nil || channel.EndpointSettings()["anthropic.messages"].(map[string]any)["upstream_url"] != "https://old-plugin.example.com/v1/messages" {
 			t.Fatalf("expected omitted plugin to be inherited for %q, got %#v", key, channel.Plugin)
 		}
 	}
@@ -2090,14 +2154,14 @@ func TestUpdateChannelsTagPartialSubmitNewMemberInheritsExistingTagConfig(t *tes
 	}
 }
 
-func TestUpdateChannelsTagWithSubmittedFieldsWritesNilPointersAndPlugin(t *testing.T) {
+func TestUpdateChannelsTagRejectsAccountBoundaryAndAllowsNonIdentityNilPointer(t *testing.T) {
 	useTestChannelDB(t)
 
 	oldPlugin := datatypes.NewJSONType(PluginType{
-		"claude": {
-			"enabled":  true,
-			"base_url": "https://old-plugin.example.com",
-		},
+		"endpoints": {"anthropic.messages": map[string]any{
+			"enabled":      true,
+			"upstream_url": "https://old-plugin.example.com/v1/messages",
+		}},
 	})
 	insertTestChannel(t, &Channel{
 		Id:      1,
@@ -2113,30 +2177,32 @@ func TestUpdateChannelsTagWithSubmittedFieldsWritesNilPointersAndPlugin(t *testi
 	})
 
 	newPlugin := datatypes.NewJSONType(PluginType{
-		"claude": {
-			"enabled":  true,
-			"base_url": "https://new-plugin.example.com",
-		},
+		"endpoints": {"anthropic.messages": map[string]any{
+			"enabled":      true,
+			"upstream_url": "https://new-plugin.example.com/v1/messages",
+		}},
 	})
 	if err := UpdateChannelsTagWithSubmittedFields("nil-plugin-team", &Channel{
-		Key:     "sk-one",
 		BaseURL: nil,
-		Proxy:   nil,
 		Plugin:  &newPlugin,
 	}, ChannelTagSubmittedFields{
 		"base_url": struct{}{},
-		"proxy":    struct{}{},
 		"plugin":   struct{}{},
-	}); err != nil {
-		t.Fatalf("expected nil pointer and plugin tag update to succeed, got %v", err)
+	}); err == nil {
+		t.Fatal("expected account-bound BaseURL/plugin mutation to be rejected")
+	}
+	if err := UpdateChannelsTagWithSubmittedFields("nil-plugin-team", &Channel{
+		Proxy: nil,
+	}, ChannelTagSubmittedFields{"proxy": {}}); err != nil {
+		t.Fatalf("expected non-identity proxy clear to succeed, got %v", err)
 	}
 
 	persisted, err := GetChannelById(1)
 	if err != nil {
 		t.Fatalf("expected persisted tagged channel lookup to succeed, got %v", err)
 	}
-	if persisted.BaseURL != nil {
-		t.Fatalf("expected submitted base_url=null to write NULL, got %#v", persisted.BaseURL)
+	if persisted.BaseURL == nil || *persisted.BaseURL != "https://old.example" {
+		t.Fatalf("expected rejected base_url mutation to preserve identity, got %#v", persisted.BaseURL)
 	}
 	if persisted.Proxy != nil {
 		t.Fatalf("expected submitted proxy=null to write NULL, got %#v", persisted.Proxy)
@@ -2144,9 +2210,9 @@ func TestUpdateChannelsTagWithSubmittedFieldsWritesNilPointersAndPlugin(t *testi
 	if persisted.Plugin == nil {
 		t.Fatal("expected submitted plugin config to sync")
 	}
-	claudeConfig := persisted.Plugin.Data()["claude"]
-	if claudeConfig["base_url"] != "https://new-plugin.example.com" {
-		t.Fatalf("expected submitted plugin config to sync, got %#v", persisted.Plugin.Data())
+	claudeConfig := persisted.EndpointSettings()["anthropic.messages"].(map[string]any)
+	if claudeConfig["upstream_url"] != "https://old-plugin.example.com/v1/messages" {
+		t.Fatalf("expected rejected plugin mutation to preserve identity, got %#v", persisted.Plugin.Data())
 	}
 }
 
@@ -2165,10 +2231,8 @@ func TestUpdateChannelsTagPartialAzureSpeechInheritsRuntimeEndpoint(t *testing.T
 	})
 
 	if err := UpdateChannelsTagWithSubmittedFields("speech-team", &Channel{
-		Key:    "speech-key",
 		Models: "tts-new",
 	}, ChannelTagSubmittedFields{
-		"key":    struct{}{},
 		"models": struct{}{},
 	}); err != nil {
 		t.Fatalf("expected Azure Speech partial tag update to inherit base_url and pass validation, got %v", err)
@@ -2199,13 +2263,15 @@ func TestUpdateChannelsTagPartialAzureV1InheritsRuntimeEndpoint(t *testing.T) {
 	})
 
 	if err := UpdateChannelsTagWithSubmittedFields("azure-v1-team", &Channel{
-		Key:    "azure-v1-key\nazure-v1-new-key",
 		Models: "gpt-new",
 	}, ChannelTagSubmittedFields{
-		"key":    struct{}{},
 		"models": struct{}{},
 	}); err != nil {
 		t.Fatalf("expected Azure V1 partial tag update to inherit base_url and pass validation, got %v", err)
+	}
+
+	if _, err := AddChannelToTag("azure-v1-team", &Channel{Key: "azure-v1-key-new"}); err != nil {
+		t.Fatal(err)
 	}
 
 	channels, err := GetChannelsByTag("azure-v1-team")
@@ -2236,8 +2302,8 @@ func TestUpdateChannelsTagNewMembersInheritSubmittedTagConfig(t *testing.T) {
 	})
 
 	if err := UpdateChannelsTag("member-team", &Channel{
-		Name:           "member-team",
-		Key:            "sk-one\nsk-two",
+		Name: "member-team",
+
 		Group:          "default",
 		Models:         "gpt-new",
 		Tag:            "member-team",
@@ -2245,6 +2311,10 @@ func TestUpdateChannelsTagNewMembersInheritSubmittedTagConfig(t *testing.T) {
 		AllowExtraBody: true,
 	}); err != nil {
 		t.Fatalf("expected tag update with new key to succeed, got %v", err)
+	}
+
+	if _, err := AddChannelToTag("member-team", &Channel{Key: `sk-two`}); err != nil {
+		t.Fatal(err)
 	}
 
 	channels, err := GetChannelsByTag("member-team")
@@ -2269,7 +2339,7 @@ func TestUpdateChannelsTagNewMembersInheritSubmittedTagConfig(t *testing.T) {
 	}
 }
 
-func TestUpdateChannelsTagCanonicalizesSubmittedLegacyCodexOther(t *testing.T) {
+func TestUpdateChannelsTagPreservesSubmittedCodexOther(t *testing.T) {
 	useTestChannelDB(t)
 
 	insertTestChannel(t, &Channel{
@@ -2283,18 +2353,20 @@ func TestUpdateChannelsTagCanonicalizesSubmittedLegacyCodexOther(t *testing.T) {
 	})
 
 	err := UpdateChannelsTagWithSubmittedFields("codex-team", &Channel{
-		Key:    `{"access_token":"old-token"}` + "\n" + `{"access_token":"new-token"}`,
 		Group:  "default",
 		Models: "gpt-5",
-		Other:  `{"websocket_mode":"required"}`,
+		Other:  `{"execution_session_ttl_seconds":600}`,
 	}, ChannelTagSubmittedFields{
-		"key":    struct{}{},
 		"group":  struct{}{},
 		"models": struct{}{},
 		"other":  struct{}{},
 	})
 	if err != nil {
-		t.Fatalf("expected tag update to canonicalize submitted Codex legacy other, got %v", err)
+		t.Fatalf("expected tag update to preserve submitted Codex session settings, got %v", err)
+	}
+
+	if _, err := AddChannelToTag("codex-team", &Channel{Key: `{"access_token":"new-token"}`}); err != nil {
+		t.Fatal(err)
 	}
 
 	channels, err := GetChannelsByTag("codex-team")
@@ -2305,7 +2377,7 @@ func TestUpdateChannelsTagCanonicalizesSubmittedLegacyCodexOther(t *testing.T) {
 		t.Fatalf("expected tag update to add one member, got %d", len(channels))
 	}
 	for _, persisted := range channels {
-		assertJSONObjectsEqual(t, persisted.Other, `{"websocket_mode":"force"}`)
+		assertJSONObjectsEqual(t, persisted.Other, `{"execution_session_ttl_seconds":600}`)
 	}
 }
 
@@ -2337,14 +2409,13 @@ func TestUpdateChannelsTagClearsCodexDerivedCaches(t *testing.T) {
 	primeChannelDerivedCaches(t, 1)
 	primeChannelDerivedCaches(t, 2)
 
-	if err := UpdateChannelsTag("codex-team", &Channel{
-		Name:    "codex-tag",
-		Key:     "sk-tagged\nsk-tagged-2",
-		Group:   "default",
-		Models:  "gpt-5",
-		Tag:     "codex-team",
-		BaseURL: stringPtr("https://new.example"),
-	}); err != nil {
+	if err := UpdateChannelsTagWithSubmittedFields("codex-team", &Channel{
+		Name: "codex-tag",
+
+		Group:  "default",
+		Models: "gpt-5-updated",
+		Tag:    "codex-team",
+	}, ChannelTagSubmittedFields{"models": {}}); err != nil {
 		t.Fatalf("expected tag update to succeed, got %v", err)
 	}
 
@@ -2365,12 +2436,12 @@ func TestUpdateChannelsTagRenameRefreshesRoutesAndCaches(t *testing.T) {
 		{
 			Id: firstID, Type: config.ChannelTypeCodex, Status: config.ChannelStatusEnabled,
 			Name: "rename-a", Key: `{"access_token":"token-a"}`, Tag: "old-tag",
-			Group: "old-group", Models: "old-model", Other: `{"websocket_mode":"force"}`,
+			Group: "old-group", Models: "old-model", Other: `{"execution_session_ttl_seconds":600}`,
 		},
 		{
 			Id: secondID, Type: config.ChannelTypeCodex, Status: config.ChannelStatusEnabled,
 			Name: "rename-b", Key: `{"access_token":"token-b"}`, Tag: "old-tag",
-			Group: "old-group", Models: "old-model", Other: `{"websocket_mode":"force"}`,
+			Group: "old-group", Models: "old-model", Other: `{"execution_session_ttl_seconds":600}`,
 		},
 	} {
 		insertTestChannel(t, channel)
@@ -2387,7 +2458,6 @@ func TestUpdateChannelsTagRenameRefreshesRoutesAndCaches(t *testing.T) {
 	t.Cleanup(func() { invalidateChannelCodexDerivedCaches = originalInvalidate })
 
 	err := UpdateChannelsTagWithSubmittedFields("old-tag", &Channel{
-		Key:    `{"access_token":"token-a"}` + "\n" + `{"access_token":"token-b"}`,
 		Tag:    "new-tag",
 		Group:  "new-group",
 		Models: "new-model",
@@ -2465,7 +2535,7 @@ func TestGetChannelsListFiltersAzureAPIVersionAcrossJSONFormatting(t *testing.T)
 		Key:    "sk-compact",
 		Group:  "default",
 		Models: "gpt-5",
-		Other:  `{"api_version":"2024-06-01","responses_ws_transport":"native"}`,
+		Other:  `{"api_version":"2024-06-01"}`,
 	})
 	insertTestChannel(t, &Channel{
 		Id:     2,
@@ -2474,7 +2544,7 @@ func TestGetChannelsListFiltersAzureAPIVersionAcrossJSONFormatting(t *testing.T)
 		Key:    "sk-pretty",
 		Group:  "default",
 		Models: "gpt-5",
-		Other:  "{\n  \"api_version\": \"2024-06-15\",\n  \"responses_ws_transport\": \"http_bridge\"\n}",
+		Other:  "{\n  \"api_version\": \"2024-06-15\"\n}",
 	})
 	insertTestChannel(t, &Channel{
 		Id:     3,
@@ -2806,7 +2876,7 @@ func TestBatchUpdateChannelsAzureApiRejectsMixedChannelTypes(t *testing.T) {
 		Key:    "sk-azure",
 		Group:  "default",
 		Models: "gpt-4o",
-		Other:  `{"api_version":"2024-05-01-preview","responses_ws_transport":"http_bridge"}`,
+		Other:  `{"api_version":"2024-05-01-preview"}`,
 	})
 	insertTestChannel(t, &Channel{
 		Id:     2,
@@ -2815,7 +2885,7 @@ func TestBatchUpdateChannelsAzureApiRejectsMixedChannelTypes(t *testing.T) {
 		Key:    "sk-openai",
 		Group:  "default",
 		Models: "gpt-4o",
-		Other:  `{"responses_ws_transport":"native"}`,
+		Other:  `{"vendor_extra":{"owner":"ops"}}`,
 	})
 
 	if _, err := BatchUpdateChannelsAzureApi(&BatchChannelsParams{
@@ -2829,7 +2899,7 @@ func TestBatchUpdateChannelsAzureApiRejectsMixedChannelTypes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected persisted Azure channel lookup to succeed, got %v", err)
 	}
-	if persisted.Other != `{"api_version":"2024-05-01-preview","responses_ws_transport":"http_bridge"}` {
+	if persisted.Other != `{"api_version":"2024-05-01-preview"}` {
 		t.Fatalf("expected rejected mixed update not to mutate Azure other, got %q", persisted.Other)
 	}
 }
@@ -2874,7 +2944,7 @@ func TestBatchUpdateChannelsAzureApiAcceptsJSONOtherForAzureChannels(t *testing.
 		Key:    "sk-azure",
 		Group:  "default",
 		Models: "gpt-4o",
-		Other:  `{"api_version":"2024-05-01-preview","responses_ws_transport":"http_bridge","responses_ws_self_hosted":false}`,
+		Other:  `{"api_version":"2024-05-01-preview","responses_ws_self_hosted":true}`,
 	})
 
 	count, err := BatchUpdateChannelsAzureApi(&BatchChannelsParams{
@@ -2892,7 +2962,7 @@ func TestBatchUpdateChannelsAzureApiAcceptsJSONOtherForAzureChannels(t *testing.
 	if err != nil {
 		t.Fatalf("expected persisted Azure channel lookup to succeed, got %v", err)
 	}
-	assertJSONObjectsEqual(t, persisted.Other, `{"api_version":"2024-06-01","responses_ws_transport":"http_bridge","responses_ws_self_hosted":false}`)
+	assertJSONObjectsEqual(t, persisted.Other, `{"api_version":"2024-06-01","responses_ws_self_hosted":true}`)
 }
 
 func TestBatchUpdateChannelsAzureApiPreservesOpaqueOtherNamespaces(t *testing.T) {
@@ -2906,7 +2976,7 @@ func TestBatchUpdateChannelsAzureApiPreservesOpaqueOtherNamespaces(t *testing.T)
 		Key:    "sk-azure",
 		Group:  "default",
 		Models: "gpt-4o",
-		Other:  `{"api_version":"2024-05-01-preview","responses_ws_transport":"native","extra":{"deployment":"x","enabled":true},"vendor_extra":{"owner":"ops"}}`,
+		Other:  `{"api_version":"2024-05-01-preview","extra":{"deployment":"x","enabled":true},"vendor_extra":{"owner":"ops"}}`,
 	})
 
 	count, err := BatchUpdateChannelsAzureApi(&BatchChannelsParams{
@@ -2924,7 +2994,7 @@ func TestBatchUpdateChannelsAzureApiPreservesOpaqueOtherNamespaces(t *testing.T)
 	if err != nil {
 		t.Fatalf("expected persisted Azure channel lookup to succeed, got %v", err)
 	}
-	assertJSONObjectsEqual(t, persisted.Other, `{"api_version":"2024-06-01","responses_ws_transport":"native","extra":{"deployment":"x","enabled":true},"vendor_extra":{"owner":"ops"}}`)
+	assertJSONObjectsEqual(t, persisted.Other, `{"api_version":"2024-06-01","extra":{"deployment":"x","enabled":true},"vendor_extra":{"owner":"ops"}}`)
 }
 
 func TestBatchUpdateChannelsAzureApiPreservesRealtimeSelfHosted(t *testing.T) {
@@ -2938,7 +3008,7 @@ func TestBatchUpdateChannelsAzureApiPreservesRealtimeSelfHosted(t *testing.T) {
 		Key:    "sk-azure",
 		Group:  "default",
 		Models: "gpt-4o",
-		Other:  `{"api_version":"2024-05-01-preview","self_hosted":true,"responses_ws_self_hosted":false}`,
+		Other:  `{"api_version":"2024-05-01-preview","self_hosted":true}`,
 	})
 
 	count, err := BatchUpdateChannelsAzureApi(&BatchChannelsParams{
@@ -2956,5 +3026,5 @@ func TestBatchUpdateChannelsAzureApiPreservesRealtimeSelfHosted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected persisted Azure channel lookup to succeed, got %v", err)
 	}
-	assertJSONObjectsEqual(t, persisted.Other, `{"api_version":"2024-06-01","self_hosted":true,"responses_ws_self_hosted":false}`)
+	assertJSONObjectsEqual(t, persisted.Other, `{"api_version":"2024-06-01","self_hosted":true}`)
 }

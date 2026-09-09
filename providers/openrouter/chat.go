@@ -3,9 +3,7 @@ package openrouter
 import (
 	"encoding/json"
 	"net/http"
-	"one-api/common"
 	"one-api/common/config"
-	"one-api/common/image"
 	"one-api/common/requester"
 	"one-api/providers/openai"
 	"one-api/types"
@@ -44,18 +42,12 @@ func (p *OpenRouterProvider) CreateChatCompletion(request *types.ChatCompletionR
 		return nil, errWithCode
 	}
 
-	if response.Usage == nil || response.Usage.CompletionTokens == 0 {
-		response.Usage = &types.Usage{
-			PromptTokens:     p.Usage.PromptTokens,
-			CompletionTokens: 0,
-			TotalTokens:      0,
-		}
-		// 那么需要计算
-		response.Usage.CompletionTokens = common.CountTokenText(response.GetContent(), request.Model)
-		response.Usage.TotalTokens = response.Usage.PromptTokens + response.Usage.CompletionTokens
+	if response.Usage != nil {
+		response.Usage.MarkProviderReported()
+		response.Usage.MergeProviderAttribution(response.Model, response.ServiceTier)
+		p.observeOpenRouterUsage(response.Usage)
+		*p.Usage = *response.Usage
 	}
-
-	*p.Usage = *response.Usage
 
 	for index, choices := range response.Choices {
 		if choices.Message.ReasoningContent == "" && choices.Message.Reasoning != "" {
@@ -91,7 +83,8 @@ func (p *OpenRouterProvider) CreateChatCompletionStream(request *types.ChatCompl
 	orRequest.StreamOptions = streamOptions
 
 	// 发送请求
-	resp, errWithCode := p.Requester.SendRequestRaw(req)
+	streamRequester := p.Requester.ForHTTPProfile(requester.HTTPProfileLongStream)
+	resp, errWithCode := streamRequester.SendRequestRaw(req)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -102,9 +95,25 @@ func (p *OpenRouterProvider) CreateChatCompletionStream(request *types.ChatCompl
 		EscapeJSON: p.StreamEscapeJSON,
 
 		ReasoningHandler: p.ReasoningHandler,
+		UsageHandler:     p.observeOpenRouterUsage,
 	}
 
-	return requester.RequestStream(p.Requester, resp, chatHandler.HandlerChatStream)
+	return requester.RequestStreamWithOptions(streamRequester, resp, chatHandler.HandlerChatStream, requester.StreamReadOptions{
+		RequireProtocolTerminal: true,
+	})
+}
+
+// observeOpenRouterUsage is called only at the OpenRouter provider boundary.
+// The generic OpenAI handler keeps server_tool_use as opaque usage metadata;
+// this provider-specific hook authorizes the documented search counter.
+func (p *OpenRouterProvider) observeOpenRouterUsage(usage *types.Usage) bool {
+	if usage == nil || usage.ProviderServerToolUse == nil {
+		return false
+	}
+	if usage.ProviderServerToolUse.WebSearchRequests > 0 {
+		usage.SetProviderExtraBilling(types.APIToolTypeWebSearch, "", usage.ProviderServerToolUse.WebSearchRequests)
+	}
+	return false
 }
 
 func (p *OpenRouterProvider) ConvertFromChatOpenai(request *ChatCompletionRequest, modelProvider string) {
@@ -123,29 +132,4 @@ func (p *OpenRouterProvider) ConvertFromChatOpenai(request *ChatCompletionReques
 		}
 	}
 
-	for indexM, message := range request.Messages {
-		openaiContent := message.ParseContent()
-		needConvert := false
-		for indexP, part := range openaiContent {
-			if part.Type == types.ContentTypeImageURL {
-				mimeType, data, err := image.GetImageFromUrl(part.ImageURL.URL)
-				if err != nil {
-					continue
-				}
-
-				if mimeType == "application/pdf" {
-					openaiContent[indexP] = types.ChatMessagePart{
-						Type: "file",
-						File: &types.ChatMessageFile{
-							FileData: "data:application/pdf;base64," + data,
-						},
-					}
-					needConvert = true
-				}
-			}
-		}
-		if needConvert {
-			request.Messages[indexM].Content = openaiContent
-		}
-	}
 }

@@ -1,6 +1,8 @@
 package openai
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -8,6 +10,66 @@ import (
 	runtimesession "one-api/runtime/session"
 	"one-api/types"
 )
+
+func (s *openAIRealtimeTurnState) applyUsageSnapshotForTest(usage *types.UsageEvent) *types.UsageEvent {
+	delta, err := s.applyUsageSnapshot(usage)
+	if err != nil {
+		panic(err)
+	}
+	return delta
+}
+
+func TestOpenAIRealtimeTurnStateRecognizesOnlyCorrelatedCreateRejection(t *testing.T) {
+	state := newOpenAIRealtimeTurnState(1, time.Now(), nil)
+	state.clientEventID = "evt_create"
+	if state.rejectedCreate("") || state.rejectedCreate("evt_other") {
+		t.Fatal("expected missing or unrelated error event ids not to reject the active create")
+	}
+	if !state.rejectedCreate("evt_create") {
+		t.Fatal("expected matching error.event_id to reject a create before a response exists")
+	}
+	state.rememberResponseID("resp_started")
+	if state.rejectedCreate("evt_create") {
+		t.Fatal("expected an error not to reject a create after the response has started")
+	}
+}
+
+func TestOpenAIRealtimeTurnStateBoundsResponseIdentities(t *testing.T) {
+	state := newOpenAIRealtimeTurnState(1, time.Now(), nil)
+	for i := 0; i < openAIRealtimeResponseIDLimit; i++ {
+		responseID := fmt.Sprintf("resp-%d", i)
+		if err := state.rememberResponseID(responseID); err != nil {
+			t.Fatalf("remember response %d: %v", i, err)
+		}
+	}
+	if got := len(state.seenResponseIDs); got != openAIRealtimeResponseIDLimit {
+		t.Fatalf("response identity count=%d, want %d", got, openAIRealtimeResponseIDLimit)
+	}
+	if err := state.rememberResponseID("resp-0"); err != nil {
+		t.Fatalf("duplicate response identity at capacity must remain idempotent: %v", err)
+	}
+	if state.lastResponseID != "resp-0" {
+		t.Fatalf("duplicate response identity should remain observable as latest, got %q", state.lastResponseID)
+	}
+	if err := state.rememberResponseID("resp-overflow"); !errors.Is(err, errOpenAIRealtimeUsageStateLimit) {
+		t.Fatalf("overflow error=%v, want usage state limit", err)
+	}
+	if got := len(state.seenResponseIDs); got != openAIRealtimeResponseIDLimit || state.lastResponseID != "resp-0" {
+		t.Fatalf("overflow mutated response state: count=%d last=%q", got, state.lastResponseID)
+	}
+
+	boundaryState := newOpenAIRealtimeTurnState(2, time.Now(), nil)
+	maxID := strings.Repeat("r", openAIRealtimeIdentifierMaxBytes)
+	if err := boundaryState.rememberResponseID(maxID); err != nil || !boundaryState.matchesResponseID(maxID) {
+		t.Fatalf("identifier at byte limit must be retained, err=%v", err)
+	}
+	if err := boundaryState.rememberResponseID(maxID + "x"); !errors.Is(err, errOpenAIRealtimeUsageStateLimit) {
+		t.Fatalf("oversized response identity error=%v, want usage state limit", err)
+	}
+	if got := boundaryState.responseIDs(); len(got) != 1 || got[0] != maxID || boundaryState.lastResponseID != maxID {
+		t.Fatalf("oversized identity mutated retained state: ids=%d last=%q", len(got), boundaryState.lastResponseID)
+	}
+}
 
 func TestOpenAIRealtimeTurnStateLifecycleAndFinalize(t *testing.T) {
 	startedAt := time.Unix(1700000000, 0)
@@ -40,7 +102,7 @@ func TestOpenAIRealtimeTurnStateLifecycleAndFinalize(t *testing.T) {
 		t.Fatalf("expected 3 unique response ids, got %#v", got)
 	}
 
-	firstDelta := state.applyUsageSnapshot(&types.UsageEvent{
+	firstDelta := state.applyUsageSnapshotForTest(&types.UsageEvent{
 		InputTokens:  3,
 		OutputTokens: 5,
 		TotalTokens:  8,
@@ -61,7 +123,7 @@ func TestOpenAIRealtimeTurnStateLifecycleAndFinalize(t *testing.T) {
 		t.Fatalf("expected first usage delta to be reported, got %+v", firstDelta)
 	}
 
-	secondDelta := state.applyUsageSnapshot(&types.UsageEvent{
+	secondDelta := state.applyUsageSnapshotForTest(&types.UsageEvent{
 		InputTokens:  4,
 		OutputTokens: 8,
 		TotalTokens:  12,
@@ -87,7 +149,7 @@ func TestOpenAIRealtimeTurnStateLifecycleAndFinalize(t *testing.T) {
 	if got := secondDelta.ExtraBilling[types.APIToolTypeWebSearchPreview].CallCount; got != 2 {
 		t.Fatalf("expected extra billing delta=2, got %d", got)
 	}
-	if noDelta := state.applyUsageSnapshot(&types.UsageEvent{
+	if noDelta := state.applyUsageSnapshotForTest(&types.UsageEvent{
 		InputTokens:  4,
 		OutputTokens: 8,
 		TotalTokens:  12,
@@ -116,49 +178,6 @@ func TestOpenAIRealtimeTurnStateLifecycleAndFinalize(t *testing.T) {
 	}
 }
 
-func TestOpenAIRealtimeTurnStateEmitsDurationOnlyUsage(t *testing.T) {
-	state := newOpenAIRealtimeTurnState(1, time.Unix(1700000000, 0), nil)
-	firstDelta := state.applyUsageSnapshot(&types.UsageEvent{
-		Source:          types.UsageSourceInputAudioTranscription,
-		BillingBasis:    types.UsageBillingBasisDuration,
-		ProviderEventID: "evt_duration_1",
-		ItemID:          "item_duration_1",
-		DurationSeconds: 2.5,
-	})
-	if firstDelta == nil ||
-		firstDelta.Source != types.UsageSourceInputAudioTranscription ||
-		firstDelta.BillingBasis != types.UsageBillingBasisDuration ||
-		firstDelta.ProviderEventID != "evt_duration_1" ||
-		firstDelta.ItemID != "item_duration_1" ||
-		firstDelta.DurationSeconds != 2.5 {
-		t.Fatalf("expected duration-only usage delta, got %+v", firstDelta)
-	}
-
-	if noDelta := state.applyUsageSnapshot(&types.UsageEvent{
-		Source:          types.UsageSourceInputAudioTranscription,
-		BillingBasis:    types.UsageBillingBasisDuration,
-		ProviderEventID: "evt_duration_1",
-		ItemID:          "item_duration_1",
-		DurationSeconds: 2.5,
-	}); noDelta != nil {
-		t.Fatalf("expected repeated duration snapshot not to emit a delta, got %+v", noDelta)
-	}
-
-	nextDelta := state.applyUsageSnapshot(&types.UsageEvent{
-		Source:          types.UsageSourceInputAudioTranscription,
-		BillingBasis:    types.UsageBillingBasisDuration,
-		ProviderEventID: "evt_duration_2",
-		ItemID:          "item_duration_2",
-		DurationSeconds: 4,
-	})
-	if nextDelta == nil ||
-		nextDelta.ProviderEventID != "evt_duration_2" ||
-		nextDelta.ItemID != "item_duration_2" ||
-		nextDelta.DurationSeconds != 1.5 {
-		t.Fatalf("expected incremental duration delta, got %+v", nextDelta)
-	}
-}
-
 func TestOpenAIRealtimeTurnStateHelpersAndUsageSnapshots(t *testing.T) {
 	if got := newOpenAIRealtimeTurnState(1, time.Time{}, nil); got == nil || got.startedAt.IsZero() {
 		t.Fatal("expected zero start time to be backfilled")
@@ -171,7 +190,7 @@ func TestOpenAIRealtimeTurnStateHelpersAndUsageSnapshots(t *testing.T) {
 	if got := nilState.responseIDs(); got != nil {
 		t.Fatalf("expected nil state response IDs to be nil, got %#v", got)
 	}
-	if delta := nilState.applyUsageSnapshot(&types.UsageEvent{TotalTokens: 1}); delta != nil {
+	if delta := nilState.applyUsageSnapshotForTest(&types.UsageEvent{TotalTokens: 1}); delta != nil {
 		t.Fatalf("expected nil state to ignore usage snapshots, got %+v", delta)
 	}
 	if observer, payload := nilState.finalize("session", "model", "reason", time.Time{}); observer != nil || payload != (runtimesession.TurnFinalizePayload{}) {
@@ -199,6 +218,7 @@ func TestOpenAIRealtimeTurnStateHelpersAndUsageSnapshots(t *testing.T) {
 		TotalTokens:  11,
 		InputTokenDetails: types.PromptTokensDetails{
 			TextTokens:        4,
+			CacheWriteTokens:  3,
 			CachedWriteTokens: 2,
 		},
 		OutputTokenDetails: types.CompletionTokensDetails{
@@ -213,7 +233,7 @@ func TestOpenAIRealtimeTurnStateHelpersAndUsageSnapshots(t *testing.T) {
 	}
 
 	merged := mergeOpenAIRealtimeUsageSnapshot(base, update)
-	if merged == nil || merged.TotalTokens != 11 || merged.InputTokenDetails.CachedWriteTokens != 2 || merged.OutputTokenDetails.ReasoningTokens != 2 {
+	if merged == nil || merged.TotalTokens != 11 || merged.InputTokenDetails.CacheWriteTokens != 3 || merged.InputTokenDetails.CachedWriteTokens != 2 || merged.OutputTokenDetails.ReasoningTokens != 2 {
 		t.Fatalf("expected merge to keep max usage fields, got %+v", merged)
 	}
 	if got := merged.ExtraTokens["cached"]; got != 4 {
@@ -229,6 +249,9 @@ func TestOpenAIRealtimeTurnStateHelpersAndUsageSnapshots(t *testing.T) {
 	delta := deltaOpenAIRealtimeUsageSnapshot(merged, base)
 	if delta == nil || delta.TotalTokens != 7 || delta.InputTokens != 2 || delta.OutputTokens != 5 {
 		t.Fatalf("expected delta snapshot to be incremental, got %+v", delta)
+	}
+	if delta.InputTokenDetails.CacheWriteTokens != 3 {
+		t.Fatalf("expected independent cache_write_tokens delta=3, got %+v", delta.InputTokenDetails)
 	}
 	if got := delta.ExtraTokens["cached"]; got != 3 {
 		t.Fatalf("expected extra token delta=3, got %d", got)

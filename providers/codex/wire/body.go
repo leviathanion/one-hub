@@ -7,7 +7,6 @@ import (
 
 	"one-api/common/jsonobject"
 	commonresponses "one-api/common/responses"
-	"one-api/types"
 )
 
 type CreateBodyInput struct {
@@ -23,7 +22,7 @@ func PlanResponsesCreateBody(object *jsonobject.Object, in CreateBodyInput) ([]b
 	if strings.TrimSpace(in.Model) == "" {
 		return nil, reject("model", "model is required")
 	}
-	if err := validateCreateBody(object); err != nil {
+	if err := ValidateResponsesCreateBody(object); err != nil {
 		return nil, err
 	}
 
@@ -48,20 +47,9 @@ func PlanResponsesCreateBody(object *jsonobject.Object, in CreateBodyInput) ([]b
 	return out.MarshalJSON()
 }
 
-func validateCreateBody(object *jsonobject.Object) error {
+func ValidateResponsesCreateBody(object *jsonobject.Object) error {
 	if object == nil {
 		return reject("body", "request body is required")
-	}
-	if _, hasTemperature := object.Fields["temperature"]; hasTemperature {
-		if _, hasTopP := object.Fields["top_p"]; hasTopP {
-			return reject("temperature", "temperature and top_p cannot both be present")
-		}
-	}
-	if _, ok := object.Fields["context_management"]; ok {
-		return reject("context_management", "context_management is not supported by Codex Official upstream")
-	}
-	if _, ok := object.Fields["truncation"]; ok {
-		return reject("truncation", "truncation is not supported by Codex Official upstream")
 	}
 	if raw, ok := object.Fields["client_metadata"]; ok {
 		trimmed := bytes.TrimSpace(raw)
@@ -140,11 +128,11 @@ func applyPromptCacheDecision(object *jsonobject.Object, decision *commonrespons
 	return object.SetJSON("prompt_cache_key", key)
 }
 
-func PlanResponsesCompactBody(object *jsonobject.Object, request types.OpenAIResponsesRequest, model string, promptCache *commonresponses.PromptCacheDecision) ([]byte, error) {
+func PlanResponsesCompactBody(object *jsonobject.Object, model string, promptCache *commonresponses.PromptCacheDecision) ([]byte, error) {
 	if object == nil {
 		return nil, reject("body", "request body is required")
 	}
-	if err := validateCreateBody(object); err != nil {
+	if err := ValidateResponsesCompactBody(object); err != nil {
 		return nil, err
 	}
 	model = strings.TrimSpace(model)
@@ -152,31 +140,50 @@ func PlanResponsesCompactBody(object *jsonobject.Object, request types.OpenAIRes
 		return nil, reject("model", "model is required")
 	}
 
-	body := make(map[string]any, 6)
-	body["model"] = model
-	if request.Input != nil {
-		body["input"] = request.Input
+	// Compact is a same-dialect operation. Preserve fields the proxy does not
+	// own and remove only create-only fields that cannot be represented by the
+	// compact endpoint.
+	out := object.Clone()
+	if err := out.SetJSON("model", model); err != nil {
+		return nil, err
 	}
-	if strings.TrimSpace(request.Instructions) != "" {
-		body["instructions"] = request.Instructions
+	// Compact has a fixed non-streaming response shape, so create-only response
+	// controls do not belong on its wire. client_metadata is consumed locally to
+	// derive identity headers and must not be forwarded as provider input.
+	for _, field := range []string{"stream", "store", "include", "client_metadata"} {
+		out.Delete(field)
 	}
-	if strings.TrimSpace(request.PreviousResponseID) != "" {
-		body["previous_response_id"] = request.PreviousResponseID
-	}
-	if key := strings.TrimSpace(request.PromptCacheKey); key != "" {
+	if raw, ok := out.Fields["prompt_cache_key"]; ok {
+		key, err := promptCacheKeyFromRaw(raw)
+		if err != nil {
+			return nil, err
+		}
 		if !validPromptCacheKey(key) {
 			return nil, reject("prompt_cache_key", "prompt_cache_key is invalid")
 		}
-		body["prompt_cache_key"] = key
-	} else if promptCache != nil && strings.TrimSpace(promptCache.Key) != "" {
-		key := strings.TrimSpace(promptCache.Key)
-		if !validPromptCacheKey(key) {
-			return nil, reject("prompt_cache_key", "prompt_cache_key is invalid")
+	} else if err := applyPromptCacheDecision(out, promptCache); err != nil {
+		return nil, err
+	}
+	return out.MarshalJSON()
+}
+
+func ValidateResponsesCompactBody(object *jsonobject.Object) error {
+	if object == nil {
+		return reject("body", "request body is required")
+	}
+	for _, field := range []string{"context_management", "truncation"} {
+		if _, present := object.Fields[field]; present {
+			return reject(field, "%s cannot be represented by the Codex compact endpoint", field)
 		}
-		body["prompt_cache_key"] = key
 	}
-	if strings.TrimSpace(request.PromptCacheRetention) != "" {
-		body["prompt_cache_retention"] = request.PromptCacheRetention
+	if raw, ok := object.Fields["prompt_cache_key"]; ok {
+		key, err := promptCacheKeyFromRaw(raw)
+		if err != nil {
+			return err
+		}
+		if !validPromptCacheKey(key) {
+			return reject("prompt_cache_key", "prompt_cache_key is invalid")
+		}
 	}
-	return json.Marshal(body)
+	return nil
 }

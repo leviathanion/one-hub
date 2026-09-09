@@ -3,8 +3,10 @@ package responsesws
 import (
 	"bytes"
 	"encoding/json"
-	"one-api/types"
 	"strings"
+
+	commonresponses "one-api/common/responses"
+	"one-api/types"
 )
 
 // ResponsesTerminalKind classifies whether a ResponsesWS payload is terminal.
@@ -22,49 +24,61 @@ const (
 type ResponsesTerminalResult struct {
 	Kind              ResponsesTerminalKind
 	EventType         string
-	NormalizedPayload []byte
 	Response          *types.OpenAIResponsesResponses
 	ErrorCode         string
 	ContinuationMiss  bool
+	RequestError      bool
+	ConnectionError   bool
+	HasSequenceNumber bool
+	SequenceNumber    int64
 	Malformed         bool
 	MalformedError    string
 }
 
 func ClassifyResponsesWSEvent(payload []byte) ResponsesTerminalResult {
 	result := ResponsesTerminalResult{Kind: ResponsesNonTerminal}
-	var object map[string]json.RawMessage
-	if err := json.Unmarshal(payload, &object); err != nil {
+	observed, err := commonresponses.ObserveEventLifecycle(payload)
+	if err != nil {
 		result.Kind = ResponsesFailedTerminal
 		result.Malformed = true
 		result.MalformedError = err.Error()
 		return result
 	}
 
-	eventType := rawStringField(object, "type")
+	eventType := observed.Type
 	result.EventType = eventType
+	if isForeignResponsesWSEventType(eventType) {
+		return malformedResponsesTerminalResult(result, "Realtime terminal event is not valid on a Responses websocket")
+	}
+	if observed.SequenceError == nil {
+		result.HasSequenceNumber = observed.HasSequence
+		result.SequenceNumber = observed.Sequence
+	} else if strings.HasPrefix(eventType, "response.") {
+		return malformedResponsesTerminalResult(result, "sequence_number must be a non-negative integer")
+	}
 
-	var response *types.OpenAIResponsesResponses
-	if rawResponse, ok := object["response"]; ok && !isJSONNull(rawResponse) {
-		var decoded types.OpenAIResponsesResponses
-		decoder := json.NewDecoder(bytes.NewReader(rawResponse))
-		decoder.UseNumber()
-		if err := decoder.Decode(&decoded); err == nil {
-			response = &decoded
-			result.Response = response
-		} else if isKnownResponsesTerminalEventType(eventType) {
-			result.Kind = ResponsesFailedTerminal
-			result.Malformed = true
-			result.MalformedError = "terminal response must be an object: " + err.Error()
-			return result
+	response := observed.Response
+	result.Response = response
+	if isKnownResponsesTerminalEventType(eventType) {
+		if !observed.ResponsePresent || !observed.ResponseObject || response == nil {
+			return malformedResponsesTerminalResult(result, "terminal response object is required")
+		}
+		if observed.ResponseFieldError != nil {
+			return malformedResponsesTerminalResult(result, observed.ResponseFieldError.Error())
+		}
+		if strings.TrimSpace(response.ID) == "" {
+			return malformedResponsesTerminalResult(result, "terminal response.id is required")
+		}
+		if !result.HasSequenceNumber {
+			return malformedResponsesTerminalResult(result, "terminal sequence_number is required")
 		}
 	}
 
-	topLevelErrorCode, topLevelErrorMessage, hasTopLevelError := rawOpenAIErrorFields(object["error"])
+	topLevelErrorCode, topLevelErrorMessage, hasTopLevelError := rawOpenAIErrorFields(observed.TopLevelError)
 	responseErrorCode := ""
 	responseErrorMessage := ""
-	hasResponseError := false
+	hasResponseError := observed.ResponseErrorPresent
 	if response != nil && response.Error != nil {
-		hasResponseError = true
 		responseErrorCode = openAIErrorCode(response.Error.Code)
 		responseErrorMessage = response.Error.Message
 	}
@@ -72,8 +86,10 @@ func ClassifyResponsesWSEvent(payload []byte) ResponsesTerminalResult {
 		result.ErrorCode = topLevelErrorCode
 	} else if responseErrorCode != "" {
 		result.ErrorCode = responseErrorCode
-	} else if code := rawStringField(object, "code"); code != "" {
-		result.ErrorCode = code
+	} else {
+		var code string
+		_ = json.Unmarshal(observed.TopLevelCode, &code)
+		result.ErrorCode = strings.TrimSpace(code)
 	}
 
 	status := ""
@@ -83,38 +99,47 @@ func ClassifyResponsesWSEvent(payload []byte) ResponsesTerminalResult {
 
 	switch eventType {
 	case "error":
-		result.Kind = ResponsesFailedTerminal
-	case "response.completed", "response.done":
+		if isResponsesWSConnectionError(result.ErrorCode) {
+			result.ConnectionError = true
+		} else {
+			result.RequestError = true
+		}
+	case "response.completed":
 		switch {
 		case hasTopLevelError || hasResponseError:
 			result.Kind = ResponsesFailedTerminal
-		case status == "" || status == types.ResponseStatusCompleted:
-			result.Kind = ResponsesSuccessTerminal
-		case isResponsesCancelledStatus(status):
-			result.Kind = ResponsesCancelledTerminal
-		case isResponsesFailedStatus(status):
+		case isResponsesFailedStatus(status), isResponsesCancelledStatus(status):
 			result.Kind = ResponsesFailedTerminal
+		default:
+			// The lifecycle event type is authoritative. Treat future or
+			// contradictory non-terminal response statuses as completed here so
+			// a valid response.completed event cannot strand the active turn.
+			result.Kind = ResponsesSuccessTerminal
 		}
-	case "response.cancelled", "response.canceled":
-		result.Kind = ResponsesCancelledTerminal
 	case "response.failed", "response.incomplete":
 		result.Kind = ResponsesFailedTerminal
 	}
 
-	if result.Kind != ResponsesNonTerminal {
-		result.ContinuationMiss = isContinuationMiss(result.ErrorCode, topLevelErrorMessage, responseErrorMessage, rawStringField(object, "message"))
-		result.NormalizedPayload = normalizeTerminalPayload(object, eventType, result.Kind)
+	if result.Kind != ResponsesNonTerminal || result.RequestError || result.ConnectionError {
+		var topLevelMessage string
+		_ = json.Unmarshal(observed.TopLevelMessage, &topLevelMessage)
+		result.ContinuationMiss = isContinuationMiss(result.ErrorCode, topLevelErrorMessage, responseErrorMessage, topLevelMessage)
 	}
 	return result
 }
 
+func isResponsesWSConnectionError(errorCode string) bool {
+	switch strings.TrimSpace(errorCode) {
+	case "websocket_connection_limit_reached":
+		return true
+	default:
+		return false
+	}
+}
+
 func isKnownResponsesTerminalEventType(eventType string) bool {
 	switch strings.TrimSpace(eventType) {
-	case "error",
-		"response.completed",
-		"response.done",
-		"response.cancelled",
-		"response.canceled",
+	case "response.completed",
 		"response.failed",
 		"response.incomplete":
 		return true
@@ -123,77 +148,48 @@ func isKnownResponsesTerminalEventType(eventType string) bool {
 	}
 }
 
-func ClassifyResponsesWSTerminal(eventType string, response *types.OpenAIResponsesResponses, hasEventError bool) ResponsesTerminalResult {
-	status := ""
-	hasResponseError := false
-	errorCode := ""
-	if response != nil {
-		status = response.Status
-		if response.Error != nil {
-			hasResponseError = true
-			errorCode = openAIErrorCode(response.Error.Code)
-		}
+// isForeignResponsesWSEventType is a Responses WebSocket protocol gate, not a
+// Realtime lifecycle classifier. It rejects known foreign terminal markers at
+// the public Responses boundary.
+func isForeignResponsesWSEventType(eventType string) bool {
+	switch strings.TrimSpace(eventType) {
+	case "response.done", "response.cancelled", "response.canceled":
+		return true
+	default:
+		return false
 	}
-	result := ClassifyResponsesWSTerminalStatus(eventType, status, hasEventError, hasResponseError, errorCode)
-	result.Response = response
+}
+
+func malformedResponsesTerminalResult(result ResponsesTerminalResult, message string) ResponsesTerminalResult {
+	result.Kind = ResponsesFailedTerminal
+	result.Malformed = true
+	result.MalformedError = strings.TrimSpace(message)
 	return result
 }
 
-func ClassifyResponsesWSTerminalStatus(eventType string, status string, hasEventError bool, hasResponseError bool, errorCode string) ResponsesTerminalResult {
+// ClassifyResponsesWSTerminal classifies already-decoded official Responses
+// lifecycle events. Raw provider frames must use ClassifyResponsesWSEvent so
+// required wire fields are validated.
+func ClassifyResponsesWSTerminal(eventType string, response *types.OpenAIResponsesResponses, hasEventError bool) ResponsesTerminalResult {
 	result := ResponsesTerminalResult{
 		Kind:      ResponsesNonTerminal,
 		EventType: strings.TrimSpace(eventType),
+		Response:  response,
 	}
-	status = strings.ToLower(strings.TrimSpace(status))
-	result.ErrorCode = strings.TrimSpace(errorCode)
-	if hasEventError {
-		result.Kind = ResponsesFailedTerminal
-		result.ContinuationMiss = isContinuationMiss(result.ErrorCode)
+	if hasEventError || result.EventType == "error" {
+		result.RequestError = true
 		return result
 	}
 	switch result.EventType {
-	case "error":
-		result.Kind = ResponsesFailedTerminal
-	case "response.completed", "response.done":
-		switch {
-		case hasEventError || hasResponseError:
-			result.Kind = ResponsesFailedTerminal
-		case status == "" || status == types.ResponseStatusCompleted:
-			result.Kind = ResponsesSuccessTerminal
-		case isResponsesCancelledStatus(status):
-			result.Kind = ResponsesCancelledTerminal
-		case isResponsesFailedStatus(status):
+	case "response.completed":
+		result.Kind = ResponsesSuccessTerminal
+		if response != nil && (response.Error != nil || isResponsesFailedStatus(response.Status) || isResponsesCancelledStatus(response.Status)) {
 			result.Kind = ResponsesFailedTerminal
 		}
-	case "response.cancelled", "response.canceled":
-		result.Kind = ResponsesCancelledTerminal
 	case "response.failed", "response.incomplete":
 		result.Kind = ResponsesFailedTerminal
 	}
-	if result.Kind != ResponsesNonTerminal {
-		result.ContinuationMiss = isContinuationMiss(result.ErrorCode)
-	}
 	return result
-}
-
-func normalizeTerminalPayload(object map[string]json.RawMessage, eventType string, kind ResponsesTerminalKind) []byte {
-	if eventType == "response.done" && kind == ResponsesSuccessTerminal {
-		object = cloneRawObject(object)
-		object["type"] = json.RawMessage(`"response.completed"`)
-		normalized, err := json.Marshal(object)
-		if err == nil {
-			return normalized
-		}
-	}
-	if (eventType == "response.done" || eventType == "response.completed") && kind == ResponsesFailedTerminal {
-		object = cloneRawObject(object)
-		object["type"] = json.RawMessage(`"response.failed"`)
-		normalized, err := json.Marshal(object)
-		if err == nil {
-			return normalized
-		}
-	}
-	return nil
 }
 
 func isResponsesFailedStatus(status string) bool {
@@ -219,9 +215,7 @@ func rawOpenAIErrorFields(raw json.RawMessage) (code string, message string, ok 
 		return "", "", false
 	}
 	var openaiErr types.OpenAIError
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	if err := decoder.Decode(&openaiErr); err != nil {
+	if err := json.Unmarshal(raw, &openaiErr); err != nil {
 		return "", "", true
 	}
 	return openAIErrorCode(openaiErr.Code), openaiErr.Message, true

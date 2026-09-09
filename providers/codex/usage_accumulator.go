@@ -1,21 +1,25 @@
 package codex
 
 import (
-	"fmt"
+	"net/http"
 	"strings"
 
 	"one-api/common"
+	commonresponses "one-api/common/responses"
 	"one-api/types"
 )
 
 type codexTurnUsageAccumulator struct {
-	seedPromptTokens        int
-	seedPromptTokenDetails  types.PromptTokensDetails
-	observedResponsesUsage  *types.ResponsesUsage
-	searchType              string
-	textBuilder             strings.Builder
-	extraBilling            map[string]types.ExtraBilling
-	countedToolBillingItems map[string]struct{}
+	seedPromptTokens       int
+	seedPromptTokenDetails types.PromptTokensDetails
+	observedResponsesUsage *types.ResponsesUsage
+	searchServiceType      string
+	searchType             string
+	imageTracker           commonresponses.ImageGenerationStreamTracker
+	toolTracker            commonresponses.ToolBillingStreamTracker
+	toolUsage              types.Usage
+	emittedExtraBilling    map[string]int
+	emittedDiagnostics     map[string]bool
 }
 
 func newCodexTurnUsageAccumulator() *codexTurnUsageAccumulator {
@@ -30,18 +34,17 @@ func (a *codexTurnUsageAccumulator) SeedFromUsage(usage *types.Usage) {
 		a.seedPromptTokens = usage.PromptTokens
 	}
 	a.seedPromptTokenDetails = usage.PromptTokensDetails
-	if usage.TextBuilder.Len() > 0 {
-		a.textBuilder.Reset()
-		a.textBuilder.WriteString(usage.TextBuilder.String())
-	}
 }
 
 func (a *codexTurnUsageAccumulator) SeedPromptFromRequest(request *types.OpenAIResponsesRequest, preCostType int) {
-	if a == nil || request == nil {
+	if a == nil {
+		return
+	}
+	if request == nil {
 		return
 	}
 
-	modelName := normalizeCodexModelName(request.Model)
+	modelName := strings.TrimSpace(request.Model)
 	if modelName == "" {
 		return
 	}
@@ -61,81 +64,235 @@ func safeCountCodexPromptTokens(input any, modelName string, preCostType int) (t
 	return common.CountTokenInputMessages(input, modelName, preCostType)
 }
 
-func (a *codexTurnUsageAccumulator) ObserveEvent(event *types.OpenAIResponsesStreamResponses) {
+func (a *codexTurnUsageAccumulator) ObserveEvent(event *types.OpenAIResponsesStreamResponses) error {
 	if a == nil || event == nil {
-		return
+		return nil
+	}
+	event = normalizeCodexUsageEvent(event)
+	// Image item events cannot also change tool state; terminal/created events
+	// only change image scalar metadata. Stage that metadata until tool checks
+	// succeed, without copying the accumulated per-image maps on every delta.
+	candidateImage := a.imageTracker
+	candidateSearch := *a
+	if event.Type == "response.created" {
+		if err := candidateSearch.updateSearchBilling(event.Response); err != nil {
+			return err
+		}
+	}
+	if err := candidateImage.ObserveResponsesEvent(event); err != nil {
+		return common.ErrorWrapperLocal(err, commonresponses.ResponsesStreamTrackingFailureCode(err), http.StatusBadGateway)
 	}
 
+	eventType := strings.TrimSpace(event.Type)
+	switch eventType {
+	case "response.output_item.done":
+		if event.Item != nil && event.Item.Type == types.InputTypeWebSearchCall {
+			if err := commonresponses.ApplyResponsesStreamOutputItemBillingWithToolTracker(
+				&a.toolUsage, eventType, event.Item, event.ItemID, event.OutputIndex,
+				a.searchServiceType, a.searchType, &a.toolTracker,
+			); err != nil {
+				return common.ErrorWrapperLocal(err, commonresponses.ResponsesStreamTrackingFailureCode(err), http.StatusBadGateway)
+			}
+		}
+	case "response.completed", "response.failed", "response.incomplete":
+		serviceType, billingType := commonresponses.ResponsesSearchBilling(event.Response)
+		if serviceType == "" {
+			serviceType, billingType = a.searchServiceType, a.searchType
+		}
+		if err := commonresponses.ApplyResponsesTerminalOutputItemBillingWithToolTracker(
+			&a.toolUsage, event.Response, serviceType, billingType, &a.toolTracker,
+		); err != nil {
+			return common.ErrorWrapperLocal(err, commonresponses.ResponsesStreamTrackingFailureCode(err), http.StatusBadGateway)
+		}
+		imageUsage := &types.Usage{}
+		candidateImage.ApplyImageGenerationBilling(event.Response, imageUsage)
+		commonresponses.MergeResponsesExtraBillingMax(&a.toolUsage, imageUsage.ExtraBilling)
+	}
+	a.imageTracker = candidateImage
+	a.searchServiceType, a.searchType = candidateSearch.searchServiceType, candidateSearch.searchType
 	if event.Response != nil {
 		if usage := cloneCodexResponsesUsage(event.Response.Usage); usage != nil {
 			a.observedResponsesUsage = usage
 		}
-		if searchType := codexResponsesSearchType(event.Response); searchType != "" {
-			a.searchType = searchType
-		}
 	}
-
-	switch strings.TrimSpace(event.Type) {
-	case "response.output_text.delta", "response.reasoning_summary_text.delta":
-		delta, ok := event.Delta.(string)
-		if ok {
-			a.textBuilder.WriteString(delta)
-		}
-	case "response.output_item.added":
-		a.observeToolItem(event.Item, event.OutputIndex, 0)
-	}
+	return nil
 }
 
-func (a *codexTurnUsageAccumulator) ResolveUsage(response *types.OpenAIResponsesResponses, modelName string, allowContentFallback bool) *types.Usage {
+func (a *codexTurnUsageAccumulator) updateSearchBilling(response *types.OpenAIResponsesResponses) error {
+	if a == nil {
+		return nil
+	}
+	serviceType, billingType := commonresponses.ResponsesSearchBilling(response)
+	if serviceType == "" {
+		return nil
+	}
+	if billingType == "" {
+		billingType = "medium"
+	}
+	serviceType = strings.TrimSpace(serviceType)
+	billingType = strings.TrimSpace(billingType)
+	if err := commonresponses.ValidateResponsesStreamToolBillingDimensions(serviceType, billingType); err != nil {
+		return common.ErrorWrapperLocal(err, commonresponses.ResponsesStreamTrackingFailureCode(err), http.StatusBadGateway)
+	}
+	// Web search price is keyed by service (and model tier), not context type.
+	// The type remains diagnostic; if pricing becomes type-dependent, its
+	// aggregate key and settlement contract must change together.
+	a.searchServiceType = strings.Clone(serviceType)
+	a.searchType = strings.Clone(billingType)
+	return nil
+}
+
+func normalizeCodexUsageEvent(event *types.OpenAIResponsesStreamResponses) *types.OpenAIResponsesStreamResponses {
+	if event == nil || event.Type != types.EventTypeResponseDone {
+		return event
+	}
+	evidence, terminal := interpretCodexSupplierTerminal(event.Type, event.Response)
+	if !terminal || evidence.publicEventType == "" {
+		return event
+	}
+	normalized := *event
+	normalized.Type = evidence.publicEventType
+	if event.Response != nil {
+		response := *event.Response
+		if strings.TrimSpace(response.Status) == "" {
+			response.Status = evidence.responseStatus
+		}
+		normalized.Response = &response
+	}
+	return &normalized
+}
+
+func (a *codexTurnUsageAccumulator) ResolveUsage(response *types.OpenAIResponsesResponses) *types.Usage {
 	if response == nil {
 		return nil
 	}
 
+	providerUsage := response.Usage != nil
 	usageSource := cloneCodexResponsesUsage(response.Usage)
 	if usageSource == nil {
 		usageSource = cloneCodexResponsesUsage(a.observedResponsesUsage)
+		providerUsage = usageSource != nil
 	}
 	if usageSource == nil {
 		usageSource = a.seedResponsesUsage()
+	}
+	if providerUsage {
+		usageSource.MarkProviderReported()
 	}
 	if usageSource == nil {
 		usageSource = &types.ResponsesUsage{}
 	}
 
-	shouldBackfillContent := allowContentFallback && usageSource.OutputTokens == 0
-	if shouldBackfillContent {
-		content := response.GetContent()
-		if content == "" && a != nil && a.textBuilder.Len() > 0 {
-			content = a.textBuilder.String()
-		}
-		if strings.TrimSpace(content) != "" {
-			usageSource.OutputTokens = safeCountCodexResponseTokens(content, modelName)
-		}
-	}
-
-	if usageSource.TotalTokens == 0 || shouldBackfillContent {
-		usageSource.TotalTokens = usageSource.InputTokens + usageSource.OutputTokens
-	}
-
 	response.Usage = usageSource
 	resolved := usageSource.ToOpenAIUsage()
-	resolved.ExtraBilling = resolveCodexExtraBilling(response, a)
+	resolved.ResponseModel = response.Model
+	resolved.ServiceTier = response.ServiceTier
+	resolved.ExtraBilling = cloneCodexExtraBilling(a.toolUsage.ExtraBilling)
+	for key, billing := range resolved.ExtraBilling {
+		resolved.MarkProviderExtraBilling(key, billing)
+	}
+	resolved.MergeBillingDiagnostics(a.toolUsage.BillingDiagnostics)
 	return resolved
 }
 
-func (a *codexTurnUsageAccumulator) ResolveUsageEvent(response *types.OpenAIResponsesResponses, modelName string, allowContentFallback bool) *types.UsageEvent {
-	resolved := a.ResolveUsage(response, modelName, allowContentFallback)
+func (a *codexTurnUsageAccumulator) ResolveUsageEvent(response *types.OpenAIResponsesResponses) *types.UsageEvent {
+	resolved := a.ResolveUsage(response)
 	if resolved == nil {
 		return nil
 	}
-	return &types.UsageEvent{
-		InputTokens:        resolved.PromptTokens,
-		OutputTokens:       resolved.CompletionTokens,
-		TotalTokens:        resolved.TotalTokens,
-		InputTokenDetails:  resolved.PromptTokensDetails,
-		OutputTokenDetails: resolved.CompletionTokensDetails,
-		ExtraBilling:       cloneCodexExtraBilling(resolved.ExtraBilling),
+	extraBilling := a.takeExtraBillingDelta(resolved.ExtraBilling)
+	event := &types.UsageEvent{
+		InputTokens:           resolved.PromptTokens,
+		OutputTokens:          resolved.CompletionTokens,
+		TotalTokens:           resolved.TotalTokens,
+		InputTokenDetails:     resolved.PromptTokensDetails,
+		OutputTokenDetails:    resolved.CompletionTokensDetails,
+		ResponseModel:         resolved.ResponseModel,
+		ServiceTier:           resolved.ServiceTier,
+		ExtraBilling:          extraBilling,
+		BillingDiagnostics:    a.takeBillingDiagnosticsDelta(resolved.BillingDiagnostics),
+		ProviderExtraBilling:  providerExtraBillingEvidence(extraBilling),
+		ProviderTokenEvidence: resolved.HasProviderUsage(),
 	}
+	if resolved.ProviderReported {
+		event.Source = types.UsageSourceResponsesResponse
+	}
+	return event
+}
+
+func (a *codexTurnUsageAccumulator) BillingUsageEvent() *types.UsageEvent {
+	if a == nil || (len(a.toolUsage.ExtraBilling) == 0 && len(a.toolUsage.BillingDiagnostics) == 0) {
+		return nil
+	}
+	extraBilling := a.takeExtraBillingDelta(a.toolUsage.ExtraBilling)
+	diagnostics := a.takeBillingDiagnosticsDelta(a.toolUsage.BillingDiagnostics)
+	if len(extraBilling) == 0 && len(diagnostics) == 0 {
+		return nil
+	}
+	return &types.UsageEvent{
+		ExtraBilling:         extraBilling,
+		BillingDiagnostics:   diagnostics,
+		ProviderExtraBilling: providerExtraBillingEvidence(extraBilling),
+	}
+}
+
+func providerExtraBillingEvidence(extraBilling map[string]types.ExtraBilling) map[string]bool {
+	if len(extraBilling) == 0 {
+		return nil
+	}
+	evidence := make(map[string]bool, len(extraBilling))
+	for key := range extraBilling {
+		evidence[key] = true
+	}
+	return evidence
+}
+
+// Provider UsageEvents are merged as increments by the relay. The Codex
+// accumulator owns the cumulative supplier evidence, so it converts snapshots
+// to deltas exactly once at this boundary.
+func (a *codexTurnUsageAccumulator) takeExtraBillingDelta(current map[string]types.ExtraBilling) map[string]types.ExtraBilling {
+	if a == nil || len(current) == 0 {
+		return nil
+	}
+	if a.emittedExtraBilling == nil {
+		a.emittedExtraBilling = make(map[string]int, len(current))
+	}
+	var delta map[string]types.ExtraBilling
+	for key, billing := range current {
+		alreadyEmitted := a.emittedExtraBilling[key]
+		if billing.CallCount <= alreadyEmitted {
+			continue
+		}
+		if delta == nil {
+			delta = make(map[string]types.ExtraBilling)
+		}
+		increment := billing
+		increment.CallCount -= alreadyEmitted
+		delta[key] = increment
+		a.emittedExtraBilling[key] = billing.CallCount
+	}
+	return delta
+}
+
+func (a *codexTurnUsageAccumulator) takeBillingDiagnosticsDelta(current map[string]bool) map[string]bool {
+	if a == nil || len(current) == 0 {
+		return nil
+	}
+	if a.emittedDiagnostics == nil {
+		a.emittedDiagnostics = make(map[string]bool, len(current))
+	}
+	var delta map[string]bool
+	for diagnostic, present := range current {
+		if !present || a.emittedDiagnostics[diagnostic] {
+			continue
+		}
+		if delta == nil {
+			delta = make(map[string]bool)
+		}
+		delta[diagnostic] = true
+		a.emittedDiagnostics[diagnostic] = true
+	}
+	return delta
 }
 
 func (a *codexTurnUsageAccumulator) seedResponsesUsage() *types.ResponsesUsage {
@@ -153,63 +310,6 @@ func (a *codexTurnUsageAccumulator) seedResponsesUsage() *types.ResponsesUsage {
 	return seed
 }
 
-func (a *codexTurnUsageAccumulator) observeToolItem(item *types.ResponsesOutput, outputIndex *int, ordinal int) {
-	if a == nil || item == nil {
-		return
-	}
-
-	key, billingKey, billingType, ok := codexToolBillingDescriptor(item, outputIndex, ordinal, a.searchType)
-	if !ok {
-		return
-	}
-	if a.countedToolBillingItems == nil {
-		a.countedToolBillingItems = make(map[string]struct{})
-	}
-	if _, exists := a.countedToolBillingItems[key]; exists {
-		return
-	}
-	a.countedToolBillingItems[key] = struct{}{}
-	if a.extraBilling == nil {
-		a.extraBilling = make(map[string]types.ExtraBilling)
-	}
-	serviceType := billingKey
-	billingKey = types.BuildExtraBillingKey(serviceType, billingType)
-	if billingKey == "" {
-		return
-	}
-	billing := a.extraBilling[billingKey]
-	if billing.ServiceType == "" {
-		billing.ServiceType = serviceType
-	}
-	if billing.Type == "" {
-		billing.Type = billingType
-	}
-	billing.CallCount++
-	a.extraBilling[billingKey] = billing
-}
-
-func resolveCodexExtraBilling(response *types.OpenAIResponsesResponses, accumulator *codexTurnUsageAccumulator) map[string]types.ExtraBilling {
-	if accumulator == nil {
-		return types.GetResponsesExtraBilling(response)
-	}
-	if response != nil && accumulator.searchType == "" {
-		accumulator.searchType = codexResponsesSearchType(response)
-	}
-
-	resolved := cloneCodexExtraBilling(accumulator.extraBilling)
-	if response == nil || len(response.Output) == 0 {
-		return resolved
-	}
-
-	for index := range response.Output {
-		accumulator.observeToolItem(&response.Output[index], intPtr(index), index)
-	}
-	if len(accumulator.extraBilling) == 0 {
-		return resolved
-	}
-	return cloneCodexExtraBilling(accumulator.extraBilling)
-}
-
 func cloneCodexResponsesUsage(usage *types.ResponsesUsage) *types.ResponsesUsage {
 	if usage == nil {
 		return nil
@@ -225,50 +325,4 @@ func cloneCodexResponsesUsage(usage *types.ResponsesUsage) *types.ResponsesUsage
 		cloned.OutputTokensDetails = &details
 	}
 	return &cloned
-}
-
-func codexToolBillingDescriptor(item *types.ResponsesOutput, outputIndex *int, ordinal int, searchType string) (string, string, string, bool) {
-	if item == nil {
-		return "", "", "", false
-	}
-
-	key := codexToolBillingItemKey(item, outputIndex, ordinal)
-	switch item.Type {
-	case types.InputTypeWebSearchCall:
-		if searchType == "" {
-			searchType = "medium"
-		}
-		return key, types.APIToolTypeWebSearchPreview, searchType, true
-	case types.InputTypeCodeInterpreterCall:
-		return key, types.APIToolTypeCodeInterpreter, "", true
-	case types.InputTypeFileSearchCall:
-		return key, types.APIToolTypeFileSearch, "", true
-	case types.InputTypeImageGenerationCall:
-		return key, types.APIToolTypeImageGeneration, item.Quality + "-" + item.Size, true
-	default:
-		return "", "", "", false
-	}
-}
-
-func codexToolBillingItemKey(item *types.ResponsesOutput, outputIndex *int, ordinal int) string {
-	if item == nil {
-		return ""
-	}
-	if id := strings.TrimSpace(item.ID); id != "" {
-		return "id:" + id
-	}
-	if callID := strings.TrimSpace(item.CallID); callID != "" {
-		return "call:" + callID
-	}
-	if outputIndex != nil {
-		return fmt.Sprintf("index:%d:type:%s", *outputIndex, item.Type)
-	}
-	if name := strings.TrimSpace(item.Name); name != "" {
-		return fmt.Sprintf("type:%s:name:%s:ordinal:%d", item.Type, name, ordinal)
-	}
-	return fmt.Sprintf("type:%s:ordinal:%d", item.Type, ordinal)
-}
-
-func intPtr(v int) *int {
-	return &v
 }

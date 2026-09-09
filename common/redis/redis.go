@@ -125,8 +125,3 @@ func RedisSIsMember(key string, member interface{}) (bool, error) {
 	ctx := context.Background()
 	return RDB.SIsMember(ctx, key, member).Result()
 }
-
-func RedisDecrease(key string, value int64) error {
-	ctx := context.Background()
-	return RDB.DecrBy(ctx, key, value).Err()
-}

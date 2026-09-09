@@ -2,12 +2,15 @@ package relay
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/logger"
+	"one-api/common/providerresponse"
 	"one-api/common/utils"
 	"one-api/metrics"
 	"one-api/model"
@@ -34,9 +37,6 @@ func Relay(c *gin.Context) {
 		return
 	}
 
-	// Apply pre-mapping before setRequest to ensure request body modifications take effect
-	applyPreMappingBeforeRequest(c)
-
 	if err := relay.setRequest(); err != nil {
 		openaiErr := wrapRelaySetupError(relay, "request", err, "one_hub_error", http.StatusBadRequest)
 		relay.HandleJsonError(openaiErr)
@@ -49,9 +49,8 @@ func Relay(c *gin.Context) {
 		relay.HandleJsonError(openaiErr)
 		return
 	}
-	if err := reparseRequestAfterProviderSelection(relay); err != nil {
-		openaiErr := wrapRelaySetupError(relay, "reparse", err, "one_hub_error", http.StatusBadRequest)
-		relay.HandleJsonError(openaiErr)
+	if err := finalizeSelectedProviderRequest(relay); err != nil {
+		relay.HandleJsonError(wrapRelaySetupError(relay, "provider_request", err, "one_hub_error", http.StatusServiceUnavailable))
 		return
 	}
 
@@ -62,6 +61,9 @@ func Relay(c *gin.Context) {
 
 	apiErr := executeRelayAttempts(relay)
 	if apiErr != nil {
+		if c.GetBool(streamErrorAlreadyRenderedContextKey) {
+			return
+		}
 		if heartbeat != nil && heartbeat.IsSafeWriteStream() {
 			relay.HandleStreamError(apiErr)
 			return
@@ -72,6 +74,9 @@ func Relay(c *gin.Context) {
 }
 
 func wrapRelaySetupError(relay RelayBaseInterface, stage string, err error, defaultCode string, statusCode int) *types.OpenAIErrorWithStatusCode {
+	if wrapped := capabilityGateAPIError(err); wrapped != nil {
+		return wrapped
+	}
 	if wrapped := invalidChannelRuntimeConfigAPIError(err); wrapped != nil {
 		return wrapped
 	}
@@ -87,6 +92,7 @@ func executeRelayAttempts(relay RelayBaseInterface) *types.OpenAIErrorWithStatus
 	c := relay.getContext()
 
 	apiErr, done := relayHandlerFunc(relay)
+	apiErr = sanitizeRelayAttemptError(apiErr)
 	if apiErr == nil {
 		metrics.RecordProvider(c, 200)
 		return nil
@@ -97,22 +103,22 @@ func executeRelayAttempts(relay RelayBaseInterface) *types.OpenAIErrorWithStatus
 	}
 
 	channel := relay.getProvider().GetChannel()
-	go processChannelRelayErrorFunc(c.Request.Context(), channel.Id, channel.Name, apiErr, channel.Type)
+	observeRelayProviderFailure(c, channel, apiErr)
 
-	retryTimes := config.RetryTimes
+	options := config.GlobalOption.RuntimeSnapshot()
+	retryTimes := options.Int("RetryTimes", config.RetryTimes)
 	if done || !relayAttemptShouldRetry(relay, apiErr, channel.Type) || relayShouldSkipRetryAfterAffinityFailure(relay) {
 		logger.LogError(c.Request.Context(), fmt.Sprintf("relay error happen, status code is %d, won't retry in this case", apiErr.StatusCode))
 		retryTimes = 0
 	}
 
 	startTime := c.GetTime("requestStartTime")
-	timeout := time.Duration(config.RetryTimeOut) * time.Second
+	timeout := time.Duration(options.Int("RetryTimeOut", config.RetryTimeOut)) * time.Second
 
 	for i := retryTimes; i > 0; i-- {
 		shouldCooldownsFunc(c, channel, apiErr)
 
-		if time.Since(startTime) > timeout {
-			apiErr = common.StringErrorWrapperLocal("重试超时，上游负载已饱和，请稍后再试", "system_error", http.StatusTooManyRequests)
+		if timeout <= 0 || time.Since(startTime) > timeout {
 			break
 		}
 
@@ -120,14 +126,15 @@ func executeRelayAttempts(relay RelayBaseInterface) *types.OpenAIErrorWithStatus
 			apiErr = wrapRelaySetupError(relay, "provider", err, "one_hub_error", http.StatusServiceUnavailable)
 			break
 		}
-		if err := reparseRequestAfterProviderSelection(relay); err != nil {
-			apiErr = common.StringErrorWrapperLocal(err.Error(), "one_hub_error", http.StatusBadRequest)
+		if err := finalizeSelectedProviderRequest(relay); err != nil {
+			apiErr = wrapRelaySetupError(relay, "provider_request", err, "one_hub_error", http.StatusServiceUnavailable)
 			break
 		}
 
 		channel = relay.getProvider().GetChannel()
 		logger.LogError(c.Request.Context(), fmt.Sprintf("using channel #%d(%s) to retry (remain times %d)", channel.Id, channel.Name, i))
 		apiErr, done = relayHandlerFunc(relay)
+		apiErr = sanitizeRelayAttemptError(apiErr)
 		if apiErr == nil {
 			metrics.RecordProvider(c, 200)
 			return nil
@@ -136,7 +143,7 @@ func executeRelayAttempts(relay RelayBaseInterface) *types.OpenAIErrorWithStatus
 			metrics.RecordProvider(c, apiErr.StatusCode)
 			return handledErr
 		}
-		go processChannelRelayErrorFunc(c.Request.Context(), channel.Id, channel.Name, apiErr, channel.Type)
+		observeRelayProviderFailure(c, channel, apiErr)
 		if done || !relayAttemptShouldRetry(relay, apiErr, channel.Type) || relayShouldSkipRetryAfterAffinityFailure(relay) {
 			break
 		}
@@ -145,18 +152,56 @@ func executeRelayAttempts(relay RelayBaseInterface) *types.OpenAIErrorWithStatus
 	return apiErr
 }
 
+func sanitizeRelayAttemptError(apiErr *types.OpenAIErrorWithStatusCode) *types.OpenAIErrorWithStatusCode {
+	if apiErr == nil || apiErr.LocalError {
+		return apiErr
+	}
+	return providerresponse.SanitizeAPIError(apiErr)
+}
+
 func relayAttemptShouldRetry(relay RelayBaseInterface, apiErr *types.OpenAIErrorWithStatusCode, channelType int) bool {
-	responsesRelay, ok := relay.(*relayResponses)
-	if ok && responsesRelay.operation == responsesOperationCreate {
-		metrics.RecordProvider(responsesRelay.getContext(), apiErr.StatusCode)
-		return responsesHTTPAttemptShouldRetry(responsesRelay, apiErr, channelType)
+	if apiErr != nil && (apiErr.UpstreamAccepted || apiErr.UpstreamAmbiguous) && !relayAllowsSideEffectFreeObservationRetry(relay) {
+		return false
 	}
 	return shouldRetryFunc(relay.getContext(), apiErr, channelType)
 }
 
+func relayAllowsSideEffectFreeObservationRetry(relay RelayBaseInterface) bool {
+	policy, ok := relay.(interface{ allowsSideEffectFreeObservationRetry() bool })
+	return ok && policy.allowsSideEffectFreeObservationRetry()
+}
+
+// observeRelayProviderFailure projects provider health once per attempt. It
+// affects future selection without granting the current submission a replay.
+func observeRelayProviderFailure(c *gin.Context, channel *model.Channel, apiErr *types.OpenAIErrorWithStatusCode) {
+	if c == nil || apiErr == nil {
+		return
+	}
+	if apiErr.LocalError {
+		return
+	}
+	metrics.RecordProvider(c, apiErr.StatusCode)
+	if channel == nil {
+		return
+	}
+	if apiErr.StatusCode == http.StatusTooManyRequests {
+		model.ChannelGroup.SetCooldowns(channel.Id, c.GetString("new_model"))
+	}
+	requestCtx := context.Background()
+	if c.Request != nil {
+		requestCtx = context.WithoutCancel(c.Request.Context())
+	}
+	healthCtx, cancel := context.WithTimeout(requestCtx, 5*time.Second)
+	process := processChannelRelayErrorFunc
+	go func() {
+		defer cancel()
+		process(healthCtx, channel.Id, channel.Name, apiErr, channel.Type)
+	}()
+}
+
 func relayShouldSkipRetryAfterAffinityFailure(relay RelayBaseInterface) bool {
-	if responsesRelay, ok := relay.(*relayResponses); ok && responsesRelay.operation == responsesOperationCreate {
-		return false
+	if responsesRelay, ok := relay.(*relayResponses); ok && responsesRelay.strictOwnerRoute {
+		return true
 	}
 	return shouldSkipRetryAfterAffinityFailure(relay.getContext())
 }
@@ -174,10 +219,43 @@ func handleResponsesContinuationMiss(relay RelayBaseInterface, apiErr *types.Ope
 
 	responsesRelay.clearStalePreviousResponseAffinity()
 	mergeChannelAffinityMeta(responsesRelay.getContext(), plan.recoveryCandidateMeta)
-	return plan.clientError, true
+	return apiErr, true
+}
+
+func validateSelectedProviderRequest(relay RelayBaseInterface) error {
+	validator, ok := relay.(interface{ validateSelectedProviderRequest() error })
+	if !ok {
+		return nil
+	}
+	err := validator.validateSelectedProviderRequest()
+	if err == nil {
+		return nil
+	}
+	return &selectedProviderRepresentabilityError{err: err}
+}
+
+type selectedProviderRepresentabilityError struct {
+	err error
+}
+
+func (e *selectedProviderRepresentabilityError) Error() string {
+	if e == nil || e.err == nil {
+		return "selected provider cannot represent the request"
+	}
+	return e.err.Error()
+}
+
+func (e *selectedProviderRepresentabilityError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
 }
 
 func RelayHandler(relay RelayBaseInterface) (err *types.OpenAIErrorWithStatusCode, done bool) {
+	if noQuota, ok := relay.(interface{ skipQuotaSettlement() bool }); ok && noQuota.skipQuotaSettlement() {
+		return relay.send()
+	}
 	promptTokens, tonkeErr := relay.getPromptTokens()
 	if tonkeErr != nil {
 		err = common.ErrorWrapperLocal(tonkeErr, "token_error", http.StatusBadRequest)
@@ -185,46 +263,51 @@ func RelayHandler(relay RelayBaseInterface) (err *types.OpenAIErrorWithStatusCod
 		return
 	}
 
-	usage := &types.Usage{
-		PromptTokens: promptTokens,
-	}
+	usage := &types.Usage{PromptTokens: promptTokens}
 
 	relay.getProvider().SetUsage(usage)
 
-	quota := relay_util.NewQuota(relay.getContext(), relay.getModelName(), promptTokens)
+	protocol := relay_util.LogProtocolHTTP
 	if relay.IsStream() {
-		quota.SetLogProtocol(relay_util.LogProtocolHTTPStream)
-	} else {
-		quota.SetLogProtocol(relay_util.LogProtocolHTTP)
+		protocol = relay_util.LogProtocolHTTPStream
 	}
-	if err = quota.PreQuotaConsumption(); err != nil {
+	quota, billingErr := relay_util.NewAttemptQuota(relay.getContext(), relay.getModelName(), int64(promptTokens), relay_util.BillingAttemptSpec{
+		LogProtocol: protocol,
+	})
+	if billingErr != nil {
+		err = common.ErrorWrapperLocal(billingErr, "billing_admission_failed", http.StatusServiceUnavailable)
 		done = true
 		return
 	}
-
-	err, done = relay.send()
-	// 最后处理流式中断时计算tokens
-	if usage.CompletionTokens == 0 && usage.TextBuilder.Len() > 0 {
-		usage.CompletionTokens = common.CountTokenText(usage.TextBuilder.String(), relay.getModelName())
-		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
-	}
-	if err != nil {
-		if rollbackErr := quota.UndoSynchronously(relay.getContext()); rollbackErr != nil {
-			message := fmt.Sprintf("quota rollback failed after relay error: provider_error=%s rollback_error=%s", err.Error(), rollbackErr.Error())
-			if c := relay.getContext(); c != nil && c.Request != nil {
-				logger.LogError(c.Request.Context(), message)
-			} else {
-				logger.SysError(message)
-			}
-			err = common.StringErrorWrapperLocal("quota rollback failed", "quota_rollback_failed", http.StatusInternalServerError)
-			done = true
-		}
+	requestCtx := relay.getContext().Request.Context()
+	if billingErr = quota.ApplyReserve(requestCtx); billingErr != nil {
+		err = relay_util.BillingAPIError(billingErr, "billing_reserve_failed", http.StatusServiceUnavailable)
+		done = true
 		return
 	}
+	if billingErr = quota.ClaimSubmission(); billingErr != nil {
+		_, _ = quota.CloseWithoutSubmission(requestCtx)
+		err = common.ErrorWrapperLocal(billingErr, "billing_submission_claim_failed", http.StatusInternalServerError)
+		done = true
+		return
+	}
+	// A claimed submission is never replayed by the outer channel loop.
+	done = true
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			_, _ = quota.CloseFromProviderResult(requestCtx, usage, relay.IsStream())
+			panic(recovered)
+		}
+	}()
 
-	quota.SetFirstResponseTime(relay.GetFirstResponseTime())
-
-	quota.Consume(relay.getContext(), usage, relay.IsStream())
+	err, _ = relay.send()
+	if quota.Quota() != nil {
+		quota.Quota().SetFirstResponseTime(relay.GetFirstResponseTime())
+	}
+	_, billingErr = quota.CloseFromProviderResult(requestCtx, usage, relay.IsStream())
+	if billingErr != nil {
+		logger.LogError(requestCtx, "billing final balance action failed after provider submission: "+billingErr.Error())
+	}
 
 	return
 }
@@ -266,7 +349,14 @@ func parsePreMappingRequestState(bodyBytes []byte) (preMappingRequestState, erro
 	}
 
 	trimmedTools := strings.TrimSpace(string(state.Tools))
-	state.SkipOnlyChat = trimmedTools != "" && trimmedTools != "null"
+	if trimmedTools != "" && trimmedTools != "null" {
+		var tools []json.RawMessage
+		if err := json.Unmarshal(state.Tools, &tools); err != nil {
+			state.SkipOnlyChat = true
+		} else {
+			state.SkipOnlyChat = len(tools) > 0
+		}
+	}
 	return state, nil
 }
 
@@ -329,43 +419,45 @@ func applyPreMappingForProvider(c *gin.Context, modelName string, provider provi
 	return bodyChanged, nil
 }
 
-func reparseRequestAfterProviderSelection(relay RelayBaseInterface) error {
+func materializeSelectedProviderRequest(relay RelayBaseInterface) error {
 	c := relay.getContext()
 	if !common.GetRequestBodyReparseNeeded(c) {
 		return nil
 	}
 
 	common.SetRequestBodyReparseNeeded(c, false)
-	if err := relay.setRequest(); err != nil {
+	materializer, ok := relay.(interface{ materializeSelectedProviderRequest() error })
+	if !ok {
+		return errors.New("selected provider request transform cannot be materialized")
+	}
+	if err := materializer.materializeSelectedProviderRequest(); err != nil {
 		return err
 	}
 	c.Set("is_stream", relay.IsStream())
 	return nil
 }
 
-// applies pre-mapping before setRequest to ensure modifications take effect
-func applyPreMappingBeforeRequest(c *gin.Context) {
-	// check if this is a chat completion request that needs pre-mapping
-	path := c.Request.URL.Path
-	if !shouldApplyPreMapping(path) {
-		return
+func finalizeSelectedProviderRequest(relay RelayBaseInterface) error {
+	if err := materializeSelectedProviderRequest(relay); err != nil {
+		return err
 	}
-
-	bodyBytes, err := common.CacheRequestBody(c)
-	if err != nil {
-		return
+	if relay == nil || relay.getProvider() == nil || relay.getProvider().GetChannel() == nil {
+		return errors.New("selected provider is unavailable")
 	}
-
-	requestState, err := updatePreMappingSelectionContext(c, bodyBytes)
-	if err != nil || requestState.Model == "" {
-		return
+	channel := relay.getProvider().GetChannel()
+	if relay.getContext().GetBool("skip_only_chat") && channel.OnlyChat {
+		return errors.New("selected channel cannot represent requests with tools")
 	}
-
-	provider, _, err := GetProvider(c, requestState.Model)
-	if err != nil {
-		return
+	if relay.IsStream() && !channel.AllowStream(relay.getOriginalModel()) {
+		return errors.New("selected channel does not support streaming")
 	}
-	cacheProviderSelection(c, requestState.Model, provider, c.GetString("new_model"))
-	_, _ = applyPreMappingForProvider(c, requestState.Model, provider)
-	common.SetRequestBodyReparseNeeded(c, false)
+	if capability := currentRequestChannelCapability(relay.getContext()); capability != nil {
+		if err := capability(channel); err != nil {
+			return err
+		}
+	}
+	if err := validateSelectedProviderRequest(relay); err != nil {
+		return err
+	}
+	return prepareSelectedProviderRemoteMedia(relay)
 }

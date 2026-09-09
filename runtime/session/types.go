@@ -1,9 +1,7 @@
 package session
 
 import (
-	"encoding/json"
 	"errors"
-	"fmt"
 	"net/url"
 	"strings"
 	"sync"
@@ -12,51 +10,6 @@ import (
 
 	"one-api/types"
 )
-
-type TransportMode string
-
-const (
-	TransportModeRealtimeWS          TransportMode = "realtime-ws"
-	TransportModeResponsesWS         TransportMode = "responses-ws"
-	TransportModeResponsesHTTPBridge TransportMode = "responses-http-bridge"
-)
-
-func NormalizeResponsesWSTransport(value string) (TransportMode, bool) {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "", "native":
-		return TransportModeResponsesWS, true
-	case "http_bridge":
-		return TransportModeResponsesHTTPBridge, true
-	default:
-		return "", false
-	}
-}
-
-func ParseResponsesWSTransportField(raw json.RawMessage) (TransportMode, error) {
-	if len(raw) == 0 || strings.TrimSpace(string(raw)) == "null" {
-		return TransportModeResponsesWS, nil
-	}
-	var value string
-	if err := json.Unmarshal(raw, &value); err != nil {
-		return "", fmt.Errorf("must be a string: %w", err)
-	}
-	mode, ok := NormalizeResponsesWSTransport(value)
-	if !ok {
-		return "", errors.New("must be one of: native, http_bridge")
-	}
-	return mode, nil
-}
-
-func ResponsesWSTransportConfigValue(mode TransportMode) string {
-	switch mode {
-	case "", TransportModeResponsesWS:
-		return "native"
-	case TransportModeResponsesHTTPBridge:
-		return "http_bridge"
-	default:
-		return strings.TrimSpace(string(mode))
-	}
-}
 
 const BindingScopeChatRealtime = "chat-realtime"
 
@@ -122,9 +75,33 @@ type Metadata struct {
 	IdleTTL           time.Duration
 }
 
+// ModelBinding 将公开权限名称与供应商、计价及结果证据分开。
+type ModelBinding struct {
+	RequestedModel  string
+	ProviderModel   string
+	BillingModel    string
+	BillingOriginal bool
+	ReportedModel   string
+}
+
+// RealtimeWorkPolicy 只授权未来工作；已有工作仍由原 observer 收尾。
+type RealtimeWorkPolicy interface {
+	ResolveModel(requested string) (ModelBinding, error)
+	CheckFutureWork(models ModelBinding, countWork bool) error
+}
+
+type TurnFinalizationResult struct {
+	Unsettled      bool
+	Err            error
+	StopFutureWork bool
+}
+
 type TurnFinalizePayload struct {
 	SessionID         string
 	Model             string
+	Models            ModelBinding
+	WorkID            string
+	InputItemID       string
 	TurnSeq           int64
 	LastResponseID    string
 	TerminationReason string
@@ -137,6 +114,31 @@ type TurnFinalizePayload struct {
 type TurnObserver interface {
 	ObserveTurnUsage(usage *types.UsageEvent) error
 	FinalizeTurn(payload TurnFinalizePayload)
+}
+
+type TurnAdmission struct {
+	ExplicitClientCreate      bool
+	AutomaticFeaturesDisabled bool
+	Models                    ModelBinding
+	SessionID                 string
+	WorkID                    string
+	InputItemID               string
+	WorkAuthorized            bool
+	Transcription             bool
+	PromptTokens              int64
+	MaxOutputTokens           int64
+	ServiceTier               string
+	UnknownChargeDimensions   bool
+}
+
+type BoundedTurnAdmissionObserver interface {
+	AdmitBoundedTurn(TurnAdmission) error
+}
+
+// ProviderInitiatedTurnObserver binds work first observed from the provider to
+// the same turn owner without pretending that a pre-send reservation occurred.
+type ProviderInitiatedTurnObserver interface {
+	ObserveProviderInitiatedTurn(admission TurnAdmission) error
 }
 
 // TurnAdmissionObserver is an optional extension for observers that must reserve
@@ -166,6 +168,29 @@ func AdmitTurn(observer TurnObserver) error {
 	return nil
 }
 
+func AdmitBoundedTurn(observer TurnObserver, admission TurnAdmission) error {
+	if observer == nil {
+		return nil
+	}
+	if bounded, ok := observer.(BoundedTurnAdmissionObserver); ok {
+		return bounded.AdmitBoundedTurn(admission)
+	}
+	if admission.MaxOutputTokens < 0 || admission.PromptTokens < 0 {
+		return errors.New("turn billing bounds cannot be negative")
+	}
+	return AdmitTurn(observer)
+}
+
+func ObserveProviderInitiatedTurn(observer TurnObserver, admission TurnAdmission) error {
+	if observer == nil {
+		return errors.New("provider-initiated realtime work has no observer")
+	}
+	if observed, ok := observer.(ProviderInitiatedTurnObserver); ok {
+		return observed.ObserveProviderInitiatedTurn(admission)
+	}
+	return errors.New("realtime observer does not support provider-initiated work")
+}
+
 func RollbackTurnAdmission(observer TurnObserver, reason string) error {
 	if admission, ok := observer.(TurnAdmissionObserver); ok {
 		return admission.RollbackTurnAdmission(reason)
@@ -174,6 +199,13 @@ func RollbackTurnAdmission(observer TurnObserver, reason string) error {
 }
 
 type TurnObserverFactory func() TurnObserver
+
+func TurnResult(observer TurnObserver) TurnFinalizationResult {
+	if result, ok := observer.(interface{ FinalizationResult() TurnFinalizationResult }); ok {
+		return result.FinalizationResult()
+	}
+	return TurnFinalizationResult{}
+}
 
 type guardedTurnObserver struct {
 	mu        sync.Mutex
@@ -217,7 +249,7 @@ func (o *guardedTurnObserver) AdmitTurn() error {
 	return AdmitTurn(o.observer)
 }
 
-func (o *guardedTurnObserver) RollbackTurnAdmission(reason string) error {
+func (o *guardedTurnObserver) AdmitBoundedTurn(admission TurnAdmission) error {
 	if o == nil {
 		return nil
 	}
@@ -227,7 +259,48 @@ func (o *guardedTurnObserver) RollbackTurnAdmission(reason string) error {
 	if o.finalized || o.observer == nil {
 		return nil
 	}
-	return RollbackTurnAdmission(o.observer, reason)
+	return AdmitBoundedTurn(o.observer, admission)
+}
+
+func (o *guardedTurnObserver) ObserveProviderInitiatedTurn(admission TurnAdmission) error {
+	if o == nil {
+		return errors.New("provider-initiated realtime work has no observer")
+	}
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.finalized || o.observer == nil {
+		return errors.New("realtime observer is already finalized")
+	}
+	return ObserveProviderInitiatedTurn(o.observer, admission)
+}
+
+func (o *guardedTurnObserver) FinalizationResult() TurnFinalizationResult {
+	if o == nil {
+		return TurnFinalizationResult{}
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return TurnResult(o.observer)
+}
+
+func (o *guardedTurnObserver) RollbackTurnAdmission(reason string) error {
+	if o == nil {
+		return nil
+	}
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.finalized || o.observer == nil {
+		return TurnResult(o.observer).Err
+	}
+	err := RollbackTurnAdmission(o.observer, reason)
+	// Admission rollback is a terminal observer transition. Blocking later usage
+	// and finalize calls prevents a provider event already in flight from creating
+	// a new reservation after the turn state has been discarded. An error is also
+	// terminal: replaying an indeterminate quota rollback would be unsafe.
+	o.finalized = true
+	return err
 }
 
 func (o *guardedTurnObserver) FinalizeTurn(payload TurnFinalizePayload) {
@@ -274,10 +347,8 @@ type ExecutionSession struct {
 	Protocol          string
 	IdleTTL           time.Duration
 
-	Transport             TransportMode
 	State                 SessionState
 	LastResponseID        string
-	FallbackUntil         time.Time
 	LastUsedAt            time.Time
 	Inflight              bool
 	Attached              bool

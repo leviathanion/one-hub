@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"one-api/common"
 	"one-api/common/config"
+	"one-api/common/providerresponse"
 	"one-api/common/surface"
 	providersBase "one-api/providers/base"
 	"one-api/types"
@@ -68,16 +69,6 @@ func (r *relayRecraftNative) setRequest() error {
 func (r *relayRecraftNative) setProvider(modelName string) error {
 	common.SetRequestBodyReparseNeeded(r.c, false)
 
-	if provider, newModelName, ok := consumeCachedProviderSelection(r.c, modelName); ok {
-		rawProvider, rawOK := provider.(providersBase.RawRelayInterface)
-		if !rawOK {
-			return errors.New("provider not found")
-		}
-		r.provider = rawProvider
-		r.modelName = newModelName
-		return nil
-	}
-
 	provider, newModelName, fail := getRecraftRawProviderFunc(r.c, modelName)
 	if fail != nil {
 		return fail
@@ -119,7 +110,11 @@ func (r *relayRecraftNative) send() (err *types.OpenAIErrorWithStatusCode, done 
 		return
 	}
 
-	err = responseMultipart(r.c, response)
+	err = responseMultipart(r.c, response, providerresponse.Policy{
+		Operation:      providerresponse.OperationBinaryDownload,
+		DataPath:       providerresponse.DataPathSameDialect,
+		BodyUnmodified: true,
+	})
 	if err != nil {
 		done = true
 	}

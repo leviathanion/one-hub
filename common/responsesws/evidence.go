@@ -4,15 +4,13 @@ package responsesws
 // derived from transport detail. It deliberately keeps DetailOrigin out of the
 // settlement core.
 type ProviderActivityFact struct {
-	ProviderStreamOpened  bool
 	ProviderFrameSeen     bool
 	ProviderUsageSeen     bool
 	ProviderPeerCloseSeen bool
 }
 
 func (f ProviderActivityFact) HasActivity() bool {
-	return f.ProviderStreamOpened ||
-		f.ProviderFrameSeen ||
+	return f.ProviderFrameSeen ||
 		f.ProviderUsageSeen ||
 		f.ProviderPeerCloseSeen
 }
@@ -21,21 +19,9 @@ func (f *ProviderActivityFact) Merge(other ProviderActivityFact) {
 	if f == nil {
 		return
 	}
-	f.ProviderStreamOpened = f.ProviderStreamOpened || other.ProviderStreamOpened
 	f.ProviderFrameSeen = f.ProviderFrameSeen || other.ProviderFrameSeen
 	f.ProviderUsageSeen = f.ProviderUsageSeen || other.ProviderUsageSeen
 	f.ProviderPeerCloseSeen = f.ProviderPeerCloseSeen || other.ProviderPeerCloseSeen
-}
-
-type ZeroChargeProofCandidate int
-
-const (
-	ZeroChargeProofCandidateNone ZeroChargeProofCandidate = iota
-	ZeroChargeProofCandidateProviderRejectedBeforeStream
-)
-
-func (c ZeroChargeProofCandidate) Present() bool {
-	return c != ZeroChargeProofCandidateNone
 }
 
 // DiagnosticDetail preserves the provider/transport facts needed for trace and
@@ -51,8 +37,8 @@ type DiagnosticDetail struct {
 }
 
 // ProviderObservation is the canonical event log entry kept by the relay actor.
-// It stores the transport detail once; activity evidence, diagnostics, and
-// zero-charge proof candidates are all projected from this shape.
+// It stores the transport detail once; activity evidence and diagnostics are
+// projected from this shape.
 type ProviderObservation struct {
 	DetailOrigin     RecvDetailOrigin
 	DetailPhase      RecvDetailPhase
@@ -96,10 +82,9 @@ func (o ProviderObservation) IsZero() bool {
 }
 
 type ProviderSettlementProjection struct {
-	Activity                 ProviderActivityFact
-	Diagnostic               DiagnosticDetail
-	HasProviderActivity      bool
-	ZeroChargeProofCandidate ZeroChargeProofCandidate
+	Activity            ProviderActivityFact
+	Diagnostic          DiagnosticDetail
+	HasProviderActivity bool
 }
 
 type ProviderTransportPolicy struct {
@@ -110,9 +95,8 @@ type ProviderTransportPolicy struct {
 }
 
 type providerObservationOriginSpec struct {
-	Activity                 ProviderActivityFact
-	ZeroChargeProofCandidate ZeroChargeProofCandidate
-	Transport                ProviderTransportPolicy
+	Activity  ProviderActivityFact
+	Transport ProviderTransportPolicy
 }
 
 func ProjectProviderObservationForSettlement(obs ProviderObservation) ProviderSettlementProjection {
@@ -125,7 +109,6 @@ func ProjectProviderObservationForSettlement(obs ProviderObservation) ProviderSe
 		projection.Activity.ProviderUsageSeen = true
 	}
 	projection.HasProviderActivity = projection.Activity.HasActivity()
-	projection.ZeroChargeProofCandidate = spec.ZeroChargeProofCandidate
 	return projection
 }
 
@@ -156,8 +139,6 @@ func providerObservationOriginSpecFor(obs ProviderObservation) providerObservati
 		},
 	}
 	switch obs.DetailOrigin {
-	case RecvDetailOriginBridgeStreamOpened:
-		spec.Activity.ProviderStreamOpened = true
 	case RecvDetailOriginProviderFrame,
 		RecvDetailOriginProviderStream,
 		RecvDetailOriginProviderMalformed:
@@ -168,90 +149,55 @@ func providerObservationOriginSpecFor(obs ProviderObservation) providerObservati
 		}
 	case RecvDetailOriginNativeProviderClose:
 		spec.Activity.ProviderPeerCloseSeen = true
-	case RecvDetailOriginBridgeOpenProviderError:
-		spec.ZeroChargeProofCandidate = ZeroChargeProofCandidateProviderRejectedBeforeStream
 	}
 	return spec
 }
 
 func recvDetailOriginCanCarryProviderUsage(origin RecvDetailOrigin) bool {
 	switch origin {
-	case RecvDetailOriginProviderFrame, RecvDetailOriginProviderStream:
+	case RecvDetailOriginProviderFrame, RecvDetailOriginProviderStream, RecvDetailOriginProviderMalformed:
 		return true
 	default:
 		return false
 	}
 }
 
-type ProviderSettlementLogProjection struct {
-	Activity                  ProviderActivityFact
-	Diagnostics               []DiagnosticDetail
-	DetailOrigins             []RecvDetailOrigin
-	ZeroChargeProofCandidates []ZeroChargeProofCandidate
+type ProviderActivityProjection struct {
+	Activity   ProviderActivityFact
+	LastOrigin RecvDetailOrigin
 }
 
-func (p *ProviderSettlementLogProjection) Observe(obs ProviderObservation) {
+func (p *ProviderActivityProjection) Observe(obs ProviderObservation) {
 	if p == nil || obs.IsZero() {
 		return
 	}
 	projected := ProjectProviderObservationForSettlement(obs)
 	p.Activity.Merge(projected.Activity)
-	p.Diagnostics = append(p.Diagnostics, projected.Diagnostic)
-	if projected.Diagnostic.DetailOrigin != "" {
-		p.DetailOrigins = append(p.DetailOrigins, projected.Diagnostic.DetailOrigin)
-	}
-	if projected.ZeroChargeProofCandidate.Present() {
-		p.ZeroChargeProofCandidates = append(p.ZeroChargeProofCandidates, projected.ZeroChargeProofCandidate)
+	if projected.Activity.HasActivity() && projected.Diagnostic.DetailOrigin != "" {
+		p.LastOrigin = projected.Diagnostic.DetailOrigin
 	}
 }
 
-func (p *ProviderSettlementLogProjection) Merge(other ProviderSettlementLogProjection) {
+func (p *ProviderActivityProjection) Merge(other ProviderActivityProjection) {
 	if p == nil {
 		return
 	}
 	p.Activity.Merge(other.Activity)
-	p.Diagnostics = append(p.Diagnostics, other.Diagnostics...)
-	p.DetailOrigins = append(p.DetailOrigins, other.DetailOrigins...)
-	p.ZeroChargeProofCandidates = append(p.ZeroChargeProofCandidates, other.ZeroChargeProofCandidates...)
+	if other.LastOrigin != "" {
+		p.LastOrigin = other.LastOrigin
+	}
 }
 
-func (p ProviderSettlementLogProjection) HasActivity() bool {
+func (p ProviderActivityProjection) HasActivity() bool {
 	return p.Activity.HasActivity()
 }
 
-func (p ProviderSettlementLogProjection) IsZero() bool {
-	return !p.Activity.HasActivity() &&
-		len(p.Diagnostics) == 0 &&
-		len(p.DetailOrigins) == 0 &&
-		len(p.ZeroChargeProofCandidates) == 0
+func (p ProviderActivityProjection) IsZero() bool {
+	return !p.Activity.HasActivity()
 }
 
-func (p ProviderSettlementLogProjection) LastActivityOrigin() RecvDetailOrigin {
-	for i := len(p.Diagnostics) - 1; i >= 0; i-- {
-		detail := p.Diagnostics[i]
-		obs := ProviderObservation{
-			DetailOrigin:     detail.DetailOrigin,
-			DetailPhase:      detail.DetailPhase,
-			HasFrame:         detail.HasFrame,
-			FrameKind:        detail.FrameKind,
-			HasUsage:         detail.HasUsage,
-			HasProviderClose: detail.HasProviderClose,
-			HasError:         detail.HasError,
-		}
-		if obs.DetailOrigin != "" && ProjectProviderObservationForSettlement(obs).Activity.HasActivity() {
-			return obs.DetailOrigin
-		}
-	}
-	return ""
-}
-
-func (p ProviderSettlementLogProjection) FirstZeroChargeProofCandidate() ZeroChargeProofCandidate {
-	for _, candidate := range p.ZeroChargeProofCandidates {
-		if candidate.Present() {
-			return candidate
-		}
-	}
-	return ZeroChargeProofCandidateNone
+func (p ProviderActivityProjection) LastActivityOrigin() RecvDetailOrigin {
+	return p.LastOrigin
 }
 
 func NormalizeUpstreamEventDetailOrigin(event UpstreamEvent) RecvDetailOrigin {
@@ -287,9 +233,6 @@ func UpstreamEventIsProxyLocalTerminal(event UpstreamEvent) bool {
 	origin := NormalizeUpstreamEventDetailOrigin(event)
 	switch origin {
 	case RecvDetailOriginProxyLocal,
-		RecvDetailOriginSyntheticBridge,
-		RecvDetailOriginBridgeStreamError,
-		RecvDetailOriginBridgeStreamEOF,
 		RecvDetailOriginNativeBackpressure,
 		RecvDetailOriginNativeLocalAbort,
 		RecvDetailOriginNativeLocalDetach,

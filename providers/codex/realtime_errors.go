@@ -2,17 +2,15 @@ package codex
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
-	"net/http"
 	"runtime"
 	"strings"
 
 	"one-api/common"
 	"one-api/common/logger"
-	"one-api/common/responsesws"
+	"one-api/common/providerresponse"
 	runtimerealtime "one-api/runtime/realtime"
 	runtimesession "one-api/runtime/session"
 	"one-api/types"
@@ -26,30 +24,21 @@ func newCodexRealtimeProviderError(eventID, code, message string) error {
 	return types.NewErrorEvent(eventID, "provider_error", code, message)
 }
 
-func codexStaleResponsesWSContinuationError(eventID string) error {
-	return responsesws.NewClientPayloadError(responsesws.ErrStaleContinuation, codexResponsesWSPreviousResponseNotFoundPayload(eventID))
-}
-
-func codexResponsesWSPreviousResponseNotFoundPayload(eventID string) []byte {
-	payload := map[string]any{
-		"type":   "error",
-		"status": http.StatusConflict,
-		"error": map[string]any{
-			"type":    "invalid_request_error",
-			"code":    "previous_response_not_found",
-			"message": "previous response was not found",
-			"param":   "previous_response_id",
-		},
-	}
-	if eventID = strings.TrimSpace(eventID); eventID != "" {
-		payload["event_id"] = eventID
-	}
-	encoded, _ := json.Marshal(payload)
-	return encoded
-}
-
 func codexRealtimeProviderErrorEventPayload(eventID, code, message string) []byte {
 	return []byte(types.NewErrorEvent(eventID, "provider_error", code, message).Error())
+}
+
+func codexStreamTrackingErrorCode(err error) string {
+	var apiErr *types.OpenAIErrorWithStatusCode
+	if !errors.As(err, &apiErr) || apiErr == nil {
+		return ""
+	}
+	switch code := codexRealtimeErrorCodeString(apiErr.Code, ""); code {
+	case "provider_usage_state_limit", "provider_protocol_error":
+		return code
+	default:
+		return ""
+	}
 }
 
 func codexRealtimeClientPayloadErrorFromObserver(eventID string, err error) error {
@@ -72,7 +61,7 @@ func codexRealtimeClientPayloadErrorFromObserver(eventID string, err error) erro
 	return runtimerealtime.NewClientPayloadError(event, []byte(event.Error()))
 }
 
-func rollbackCodexTurnAdmissionLocked(observer runtimesession.TurnObserver, reason string) {
+func rollbackCodexTurnAdmission(observer runtimesession.TurnObserver, reason string) {
 	if observer == nil {
 		return
 	}
@@ -90,11 +79,20 @@ func codexRealtimeShouldRollbackAdmissionAfterLocalFailure(err error) bool {
 		return false
 	}
 	switch codexRealtimeErrorCodeString(event.ErrorDetail.Code, "") {
-	case "responses_ws_unsupported_for_channel", "transport_unavailable", "bridge_open_cancelled", "bridge_open_failed":
+	case "responses_ws_unsupported_for_channel", "transport_unavailable":
 		return true
 	default:
 		return false
 	}
+}
+
+func codexRealtimeIsAmbiguousWSWriteFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	var event *types.Event
+	return errors.As(err, &event) && event != nil && event.IsError() &&
+		codexRealtimeErrorCodeString(event.ErrorDetail.Code, "") == "ws_write_failed"
 }
 
 func codexRealtimeStaticErrorMessage(code string) string {
@@ -109,12 +107,10 @@ func codexRealtimeStaticErrorMessage(code string) string {
 		return "upstream websocket write failed"
 	case "provider_connection_closed":
 		return "upstream websocket connection closed"
-	case "bridge_open_cancelled":
-		return "provider bridge open cancelled"
-	case "bridge_open_failed":
-		return "provider bridge open failed"
-	case "bridge_stream_failed":
-		return "provider bridge stream failed"
+	case "provider_usage_state_limit":
+		return "provider usage state limit exceeded"
+	case "provider_protocol_error":
+		return "provider response protocol is inconsistent"
 	default:
 		return "codex realtime request failed"
 	}
@@ -168,8 +164,9 @@ func codexRealtimeErrorFromOpenAIError(eventID string, errWithCode *types.OpenAI
 		return newCodexRealtimeProviderError(eventID, "provider_error", "provider error")
 	}
 
-	code := codexRealtimeErrorCodeString(errWithCode.Code, "provider_error")
-	message := strings.TrimSpace(errWithCode.Message)
+	safeErr := providerresponse.SanitizeAPIError(errWithCode)
+	code := codexRealtimeErrorCodeString(safeErr.Code, "provider_error")
+	message := strings.TrimSpace(safeErr.Message)
 	if message == "" {
 		message = "provider error"
 	}

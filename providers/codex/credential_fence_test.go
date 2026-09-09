@@ -3,13 +3,13 @@ package codex
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"one-api/common/cache"
 	"one-api/common/config"
+	"one-api/internal/testutil/sqlitetest"
 	"one-api/model"
 
 	"gorm.io/driver/sqlite"
@@ -19,7 +19,7 @@ import (
 func useCodexFenceDB(t *testing.T) {
 	t.Helper()
 	original := model.DB
-	db, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())), &gorm.Config{})
+	db, err := gorm.Open(sqlite.Open(sqlitetest.MemoryDSN()), &gorm.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -197,7 +197,6 @@ func (p *recordingResponsesProbeProvider) GetRequester() *requester.HTTPRequeste
 func (p *recordingResponsesProbeProvider) CustomParameterHandler() (map[string]interface{}, error) {
 	return nil, nil
 }
-func (p *recordingResponsesProbeProvider) GetSupportedResponse() bool { return true }
 func (p *recordingResponsesProbeProvider) CreateResponses(ctx context.Context, req *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
 	p.req = req
 	p.contextPurpose = commonresponses.RequestPurposeFromContext(ctx)
@@ -219,7 +218,7 @@ func (p *recordingResponsesProbeProvider) CreateResponses(ctx context.Context, r
 		Usage: &types.ResponsesUsage{InputTokens: 1, OutputTokens: 1, TotalTokens: 2},
 	}, nil
 }
-func (p *recordingResponsesProbeProvider) CreateResponsesStream(context.Context, *commonresponses.Request) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+func (p *recordingResponsesProbeProvider) CreateResponsesStream(context.Context, *commonresponses.Request) (commonresponses.EventStream, *types.OpenAIErrorWithStatusCode) {
 	return nil, nil
 }
 func (p *recordingResponsesProbeProvider) CompactResponses(context.Context, *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {

@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
+	commonresponses "one-api/common/responses"
 	"one-api/types"
 	"strings"
 )
@@ -14,10 +14,11 @@ import (
 // RawResponsesCreateFrame preserves the original response.create envelope and
 // a typed projection for relay-side admission and provider rewrite.
 type RawResponsesCreateFrame struct {
-	Raw        json.RawMessage
-	Object     map[string]json.RawMessage
-	Projection types.OpenAIResponsesRequest
-	EventID    string
+	Raw               json.RawMessage
+	Object            map[string]json.RawMessage
+	Projection        types.OpenAIResponsesRequest
+	EventID           string
+	MultiAgentEnabled bool
 }
 
 // ProviderEventEnvelope is the minimal parsed shape of a provider event.
@@ -38,6 +39,16 @@ var ErrInvalidClientEventPayload = errors.New("responses websocket client event 
 var ErrInvalidProviderEventPayload = errors.New("responses websocket provider event payload is invalid")
 
 func ParseRawResponsesCreateFrame(raw []byte) (*RawResponsesCreateFrame, error) {
+	return parseRawResponsesCreateFrame(raw, false)
+}
+
+// ParseRawResponsesCreateFrameOwned transfers ownership of raw to the returned
+// frame. Callers must not mutate raw after a successful call.
+func ParseRawResponsesCreateFrameOwned(raw []byte) (*RawResponsesCreateFrame, error) {
+	return parseRawResponsesCreateFrame(raw, true)
+}
+
+func parseRawResponsesCreateFrame(raw []byte, owned bool) (*RawResponsesCreateFrame, error) {
 	object, err := decodeTopLevelObjectNoDuplicateKeys(raw)
 	if err != nil {
 		return nil, err
@@ -48,11 +59,9 @@ func ParseRawResponsesCreateFrame(raw []byte) (*RawResponsesCreateFrame, error) 
 		return nil, fmt.Errorf("unsupported responses websocket event type %q", eventType)
 	}
 
-	var projection types.OpenAIResponsesRequest
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	if err := decoder.Decode(&projection); err != nil {
-		return nil, fmt.Errorf("decode response.create projection: %w", err)
+	projection, err := commonresponses.ProjectRawRequest(raw)
+	if err != nil {
+		return nil, fmt.Errorf("decode response.create envelope: %w", err)
 	}
 	if strings.TrimSpace(projection.Model) == "" {
 		projection.Model = rawStringField(object, "model")
@@ -60,12 +69,21 @@ func ParseRawResponsesCreateFrame(raw []byte) (*RawResponsesCreateFrame, error) 
 	if strings.TrimSpace(projection.Model) == "" {
 		return nil, errors.New("response.create model is required")
 	}
+	multiAgentEnabled, err := commonresponses.ProjectMultiAgentEnabled(object["multi_agent"])
+	if err != nil {
+		return nil, err
+	}
 
+	retainedRaw := bytes.TrimSpace(raw)
+	if !owned {
+		retainedRaw = append([]byte(nil), retainedRaw...)
+	}
 	return &RawResponsesCreateFrame{
-		Raw:        append(json.RawMessage(nil), bytes.TrimSpace(raw)...),
-		Object:     cloneRawObject(object),
-		Projection: projection,
-		EventID:    rawStringField(object, "event_id"),
+		Raw:               json.RawMessage(retainedRaw),
+		Object:            object,
+		Projection:        projection,
+		EventID:           rawStringField(object, "event_id"),
+		MultiAgentEnabled: multiAgentEnabled,
 	}, nil
 }
 
@@ -86,23 +104,6 @@ func (f *RawResponsesCreateFrame) CloneForModel(model string) ([]byte, error) {
 		return nil, err
 	}
 	object["model"] = encodedModel
-	return json.Marshal(object)
-}
-
-func (f *RawResponsesCreateFrame) CloneWithDefaultPreviousResponseID(previousResponseID string) ([]byte, error) {
-	if f == nil {
-		return nil, errors.New("responses create frame is required")
-	}
-	trimmedPreviousResponseID := strings.TrimSpace(previousResponseID)
-	if _, exists := f.Object["previous_response_id"]; trimmedPreviousResponseID == "" || exists {
-		return append([]byte(nil), f.Raw...), nil
-	}
-	object := cloneRawObject(f.Object)
-	encodedPreviousResponseID, err := json.Marshal(trimmedPreviousResponseID)
-	if err != nil {
-		return nil, err
-	}
-	object["previous_response_id"] = encodedPreviousResponseID
 	return json.Marshal(object)
 }
 
@@ -146,138 +147,6 @@ func ParseProviderEventEnvelope(raw []byte) (*ProviderEventEnvelope, error) {
 		EventID: rawStringField(object, "event_id"),
 		Object:  cloneRawObject(object),
 	}, nil
-}
-
-func BuildResponsesHTTPBridgeBody(object map[string]json.RawMessage, model string, previousResponseID string) (map[string]json.RawMessage, error) {
-	if object == nil {
-		return nil, errors.New("responses websocket bridge request is required")
-	}
-	trimmedModel := strings.TrimSpace(model)
-	if trimmedModel == "" {
-		return nil, errors.New("response.create model is required")
-	}
-
-	body := cloneRawObject(object)
-	// The bridge converts a ResponsesWS client event into an HTTP /responses
-	// body. Keep future create-body fields raw, but do not forward WebSocket
-	// envelope fields into the HTTP endpoint.
-	for _, key := range []string{"type", "event_id"} {
-		delete(body, key)
-	}
-	if err := validateResponsesHTTPBridgeTransportFields(body); err != nil {
-		return nil, err
-	}
-	delete(body, "background")
-
-	encodedModel, err := json.Marshal(trimmedModel)
-	if err != nil {
-		return nil, err
-	}
-	body["model"] = encodedModel
-	if _, exists := body["previous_response_id"]; !exists {
-		trimmedPreviousResponseID := strings.TrimSpace(previousResponseID)
-		if trimmedPreviousResponseID != "" {
-			encodedPreviousResponseID, err := json.Marshal(trimmedPreviousResponseID)
-			if err != nil {
-				return nil, err
-			}
-			body["previous_response_id"] = encodedPreviousResponseID
-		}
-	}
-	body["stream"] = json.RawMessage("true")
-	return body, nil
-}
-
-func NormalizeResponsesHTTPBridgeRequestMap(requestMap map[string]interface{}) error {
-	if requestMap == nil {
-		return nil
-	}
-	// The HTTP bridge contract is enforced after channel custom_parameter
-	// merging too. This is deliberately a final boundary check: provider-specific
-	// customization stays available, but it cannot turn the bridge request into a
-	// non-streaming/background Responses call that the WS relay cannot consume.
-	for _, key := range []string{"type", "event_id"} {
-		delete(requestMap, key)
-	}
-	if raw, ok := requestMap["background"]; ok {
-		if raw == nil {
-			delete(requestMap, "background")
-		} else if background, ok := raw.(bool); ok {
-			if background {
-				return unsupportedResponsesWSBridgeFieldError("background")
-			}
-			delete(requestMap, "background")
-		} else {
-			return unsupportedResponsesWSBridgeFieldError("background")
-		}
-	}
-	if raw, ok := requestMap["stream"]; ok {
-		if raw != nil {
-			stream, ok := raw.(bool)
-			if !ok || !stream {
-				return unsupportedResponsesWSBridgeFieldError("stream")
-			}
-		}
-	}
-	requestMap["stream"] = true
-	return nil
-}
-
-func validateResponsesHTTPBridgeTransportFields(body map[string]json.RawMessage) error {
-	if body == nil {
-		return nil
-	}
-	if raw, ok := body["stream"]; ok && len(raw) > 0 && strings.TrimSpace(string(raw)) != "null" {
-		var stream bool
-		if err := json.Unmarshal(raw, &stream); err != nil {
-			return err
-		}
-		if !stream {
-			return unsupportedResponsesWSBridgeFieldError("stream")
-		}
-	}
-	if raw, ok := body["background"]; ok && len(raw) > 0 && strings.TrimSpace(string(raw)) != "null" {
-		var background bool
-		if err := json.Unmarshal(raw, &background); err != nil {
-			return err
-		}
-		if background {
-			return unsupportedResponsesWSBridgeFieldError("background")
-		}
-	}
-	return nil
-}
-
-func unsupportedResponsesWSBridgeFieldError(field string) error {
-	err := fmt.Errorf("responses websocket HTTP bridge does not support %s", field)
-	payload, marshalErr := json.Marshal(struct {
-		Type   string `json:"type"`
-		Status int    `json:"status"`
-		Error  struct {
-			Type    string `json:"type"`
-			Code    string `json:"code"`
-			Message string `json:"message"`
-			Param   string `json:"param"`
-		} `json:"error"`
-	}{
-		Type:   "error",
-		Status: http.StatusBadRequest,
-		Error: struct {
-			Type    string `json:"type"`
-			Code    string `json:"code"`
-			Message string `json:"message"`
-			Param   string `json:"param"`
-		}{
-			Type:    "invalid_request_error",
-			Code:    "unsupported_responses_ws_bridge_field",
-			Message: "field is not supported by Responses websocket HTTP bridge",
-			Param:   field,
-		},
-	})
-	if marshalErr != nil {
-		return err
-	}
-	return NewClientPayloadError(err, payload)
 }
 
 func decodeTopLevelObjectNoDuplicateKeys(raw []byte) (map[string]json.RawMessage, error) {

@@ -2,7 +2,6 @@ package model
 
 import (
 	"encoding/json"
-	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -10,6 +9,7 @@ import (
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/logger"
+	"one-api/internal/testutil/sqlitetest"
 
 	"github.com/go-gormigrate/gormigrate/v2"
 	"go.uber.org/zap"
@@ -27,7 +27,7 @@ func useDashboardCacheTokenTestDB(t *testing.T) {
 	originalUsingSQLite := common.UsingSQLite
 	originalUsingPostgreSQL := common.UsingPostgreSQL
 
-	testDB, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())), &gorm.Config{})
+	testDB, err := gorm.Open(sqlite.Open(sqlitetest.MemoryDSN()), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("expected in-memory sqlite database, got %v", err)
 	}

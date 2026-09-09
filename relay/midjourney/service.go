@@ -50,12 +50,11 @@ func GetMjRequestModel(relayMode int, midjRequest *mjProvider.MidjourneyRequest,
 		case mjProvider.RelayModeMidjourneyUpload:
 			action = mjProvider.MjActionUpload
 		case mjProvider.RelayModeMidjourneySimpleChange:
-			params := ConvertSimpleChangeParams(midjRequest.Content)
-			if params == nil {
+			if midjRequest == nil || midjRequest.Action == "" {
 				return "", mjProvider.MidjourneyErrorWrapper(mjProvider.MjRequestError, "invalid_request"), false
 			}
-			action = params.Action
-		case mjProvider.RelayModeMidjourneyTaskFetch, mjProvider.RelayModeMidjourneyTaskFetchByCondition, mjProvider.RelayModeMidjourneyNotify:
+			action = midjRequest.Action
+		case mjProvider.RelayModeMidjourneyTaskFetch, mjProvider.RelayModeMidjourneyTaskFetchByCondition:
 			return "", nil, true
 		default:
 			return "", mjProvider.MidjourneyErrorWrapper(mjProvider.MjRequestError, "unknown_relay_action"), false
@@ -66,15 +65,73 @@ func GetMjRequestModel(relayMode int, midjRequest *mjProvider.MidjourneyRequest,
 	return modelName, nil, true
 }
 
+func normalizeMidjourneySubmitRequest(relayMode int, request *mjProvider.MidjourneyRequest) *mjProvider.MidjourneyResponse {
+	if relayMode != mjProvider.RelayModeMidjourneySimpleChange {
+		return nil
+	}
+	if request == nil || strings.TrimSpace(request.Content) == "" {
+		return mjProvider.MidjourneyErrorWrapper(mjProvider.MjRequestError, "content_is_required")
+	}
+	params := ConvertSimpleChangeParams(request.Content)
+	if params == nil {
+		return mjProvider.MidjourneyErrorWrapper(mjProvider.MjRequestError, "content_parse_failed")
+	}
+	request.TaskId = params.TaskId
+	request.Action = params.Action
+	request.Index = params.Index
+	return nil
+}
+
+func midjourneySubmitUsesOriginTask(relayMode int) bool {
+	switch relayMode {
+	case mjProvider.RelayModeMidjourneyChange,
+		mjProvider.RelayModeMidjourneySimpleChange,
+		mjProvider.RelayModeMidjourneyModal:
+		return true
+	default:
+		return false
+	}
+}
+
+func midjourneyOriginTaskID(relayMode int, request *mjProvider.MidjourneyRequest) (string, *mjProvider.MidjourneyResponse) {
+	if !midjourneySubmitUsesOriginTask(relayMode) {
+		return "", nil
+	}
+	if request == nil || strings.TrimSpace(request.TaskId) == "" {
+		return "", mjProvider.MidjourneyErrorWrapper(mjProvider.MjRequestError, "task_id_is_required")
+	}
+	switch relayMode {
+	case mjProvider.RelayModeMidjourneyChange:
+		if request.Action == "" {
+			return "", mjProvider.MidjourneyErrorWrapper(mjProvider.MjRequestError, "action_is_required")
+		}
+		if request.Index == 0 {
+			return "", mjProvider.MidjourneyErrorWrapper(mjProvider.MjRequestError, "index_is_required")
+		}
+	case mjProvider.RelayModeMidjourneyModal:
+		request.Action = mjProvider.MjActionModal
+	}
+	return strings.TrimSpace(request.TaskId), nil
+}
+
 func CoverPlusActionToNormalAction(midjRequest *mjProvider.MidjourneyRequest) *mjProvider.MidjourneyResponse {
 	// "customId": "MJ::JOB::upsample::2::3dbbd469-36af-4a0f-8f02-df6c579e7011"
+	if midjRequest == nil {
+		return mjProvider.MidjourneyErrorWrapper(mjProvider.MjRequestError, "invalid_request")
+	}
 	customId := midjRequest.CustomId
 	if customId == "" {
 		return mjProvider.MidjourneyErrorWrapper(mjProvider.MjRequestError, "custom_id_is_required")
 	}
 	splits := strings.Split(customId, "::")
+	if len(splits) < 2 {
+		return mjProvider.MidjourneyErrorWrapper(mjProvider.MjRequestError, "custom_id_parse_failed")
+	}
 	var action string
 	if splits[1] == "JOB" {
+		if len(splits) < 3 {
+			return mjProvider.MidjourneyErrorWrapper(mjProvider.MjRequestError, "custom_id_parse_failed")
+		}
 		action = splits[2]
 	} else {
 		action = splits[1]
@@ -84,6 +141,9 @@ func CoverPlusActionToNormalAction(midjRequest *mjProvider.MidjourneyRequest) *m
 		return mjProvider.MidjourneyErrorWrapper(mjProvider.MjRequestError, "unknown_action")
 	}
 	if strings.Contains(action, "upsample") {
+		if len(splits) < 4 {
+			return mjProvider.MidjourneyErrorWrapper(mjProvider.MjRequestError, "custom_id_parse_failed")
+		}
 		index, err := strconv.Atoi(splits[3])
 		if err != nil {
 			return mjProvider.MidjourneyErrorWrapper(mjProvider.MjRequestError, "index_parse_failed")
@@ -93,6 +153,9 @@ func CoverPlusActionToNormalAction(midjRequest *mjProvider.MidjourneyRequest) *m
 	} else if strings.Contains(action, "variation") {
 		midjRequest.Index = 1
 		if action == "variation" {
+			if len(splits) < 4 {
+				return mjProvider.MidjourneyErrorWrapper(mjProvider.MjRequestError, "custom_id_parse_failed")
+			}
 			index, err := strconv.Atoi(splits[3])
 			if err != nil {
 				return mjProvider.MidjourneyErrorWrapper(mjProvider.MjRequestError, "index_parse_failed")
@@ -126,7 +189,7 @@ func CoverPlusActionToNormalAction(midjRequest *mjProvider.MidjourneyRequest) *m
 }
 
 func ConvertSimpleChangeParams(content string) *mjProvider.MidjourneyRequest {
-	split := strings.Split(content, " ")
+	split := strings.Fields(content)
 	if len(split) != 2 {
 		return nil
 	}
@@ -135,13 +198,17 @@ func ConvertSimpleChangeParams(content string) *mjProvider.MidjourneyRequest {
 	changeParams := &mjProvider.MidjourneyRequest{}
 	changeParams.TaskId = split[0]
 
-	if action[0] == 'u' {
-		changeParams.Action = "UPSCALE"
-	} else if action[0] == 'v' {
-		changeParams.Action = "VARIATION"
-	} else if action == "r" {
-		changeParams.Action = "REROLL"
+	if action == "r" {
+		changeParams.Action = mjProvider.MjActionReRoll
 		return changeParams
+	}
+	if len(action) != 2 {
+		return nil
+	}
+	if action[0] == 'u' {
+		changeParams.Action = mjProvider.MjActionUpscale
+	} else if action[0] == 'v' {
+		changeParams.Action = mjProvider.MjActionVariation
 	} else {
 		return nil
 	}

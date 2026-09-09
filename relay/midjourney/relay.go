@@ -17,8 +17,6 @@ func RelayMidjourney(c *gin.Context) {
 	relayMode := Path2RelayModeMidjourney(c.Request.URL.Path)
 	var err *provider.MidjourneyResponse
 	switch relayMode {
-	case provider.RelayModeMidjourneyNotify:
-		err = RelayMidjourneyNotify(c)
 	case provider.RelayModeMidjourneyTaskFetch, provider.RelayModeMidjourneyTaskFetchByCondition:
 		err = RelayMidjourneyTask(c, relayMode)
 	case provider.RelayModeMidjourneyTaskImageSeed:
@@ -81,12 +79,10 @@ func Path2RelayModeMidjourney(path string) int {
 		relayMode = provider.RelayModeMidjourneyBlend
 	} else if strings.HasSuffix(path, "/mj/submit/describe") {
 		relayMode = provider.RelayModeMidjourneyDescribe
-	} else if strings.HasSuffix(path, "/mj/notify") {
-		relayMode = provider.RelayModeMidjourneyNotify
 	} else if strings.HasSuffix(path, "/mj/submit/change") {
 		relayMode = provider.RelayModeMidjourneyChange
 	} else if strings.HasSuffix(path, "/mj/submit/simple-change") {
-		relayMode = provider.RelayModeMidjourneyChange
+		relayMode = provider.RelayModeMidjourneySimpleChange
 	} else if strings.HasSuffix(path, "/fetch") {
 		relayMode = provider.RelayModeMidjourneyTaskFetch
 	} else if strings.HasSuffix(path, "/image-seed") {

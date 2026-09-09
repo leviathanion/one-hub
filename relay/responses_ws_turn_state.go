@@ -11,11 +11,12 @@ import (
 	"one-api/common/responsesws"
 	"one-api/common/wsconn"
 	"one-api/middleware"
+	providersBase "one-api/providers/base"
 	"one-api/types"
 )
 
 type responsesWSIOState struct {
-	bridge *ResponsesWSIOBridge
+	pump   *ResponsesWSIOPump
 	client *wsconn.ManagedConn
 }
 
@@ -27,6 +28,7 @@ type responsesWSSnapshotState struct {
 type responsesWSLeaseState struct {
 	mu           sync.Mutex
 	pendingLease middleware.ResponsesWSLease
+	pendingBytes middleware.ResponsesWSByteLease
 	activeLease  middleware.ResponsesWSLease
 }
 
@@ -34,6 +36,7 @@ type responsesWSUpstreamState struct {
 	sessionGeneration string
 	channelID         int
 	session           responsesws.Upstream
+	provider          providersBase.ProviderInterface
 	recvArmed         bool
 }
 
@@ -45,6 +48,8 @@ type responsesWSTurnSlots struct {
 	opening responsesWSOpeningTurn
 	pending responsesWSPendingTurn
 	active  responsesWSActiveTurn
+	queue   responsesWSCreateQueue
+	inject  responsesWSInjectState
 
 	history responsesWSTurnHistory
 }
@@ -52,6 +57,7 @@ type responsesWSTurnSlots struct {
 type responsesWSTurnHistory struct {
 	lastFinal                  *types.OpenAIResponsesResponses
 	recentFinalizedResponseIDs []string
+	localEphemeralResponseIDs  []string
 }
 
 type responsesWSOpeningTurn struct {
@@ -65,34 +71,158 @@ type responsesWSPendingTurn struct {
 	phase     responsesWSPendingTurnPhase
 	openingID string
 
-	attempt *ResponsesWSTurnAttempt
+	attempt        *ResponsesWSTurnAttempt
+	sendCompletion <-chan ResponsesWSEventSendResult
 
 	provider responsesWSPendingProviderState
-	cancel   responsesWSPendingCancelState
 }
 
 type responsesWSPendingProviderState struct {
 	journal responsesWSProviderJournal
-
-	bridgeOpenLocalErrorAttemptID string
-	bridgeOpenProviderErr         *ResponsesWSEventBridgeOpenProviderError
-}
-
-type responsesWSPendingCancelState struct {
-	sendAttemptID string
-	sendCancel    context.CancelFunc
-
-	createAttemptID string
-	createFrame     responsesws.Frame
 }
 
 type responsesWSActiveTurn struct {
-	attempt   *ResponsesWSTurnAttempt
-	evidence  responsesws.ProviderSettlementLogProjection
-	affinity  *ResponsesTurnAffinity
-	channelID int
+	attempt                 *ResponsesWSTurnAttempt
+	evidence                responsesws.ProviderActivityProjection
+	affinity                *ResponsesTurnAffinity
+	channelID               int
+	lastProviderSequence    int64
+	hasLastProviderSequence bool
+}
 
-	bridgeCancelPendingAttemptID string
+type responsesWSQueuedCreate struct {
+	payload    []byte
+	receivedAt time.Time
+}
+
+type responsesWSCreateQueue struct {
+	items []responsesWSQueuedCreate
+	bytes int
+}
+
+func (q *responsesWSCreateQueue) Push(event ResponsesWSEventClientFrame, maxFrames, maxBytes int) bool {
+	if q == nil || maxFrames <= 0 || maxBytes <= 0 || len(q.items) >= maxFrames {
+		return false
+	}
+	payload := event.Frame.Payload()
+	if len(payload) > maxBytes-q.bytes {
+		return false
+	}
+	q.items = append(q.items, responsesWSQueuedCreate{payload: payload, receivedAt: event.ReceivedAt})
+	q.bytes += len(payload)
+	return true
+}
+
+func (q *responsesWSCreateQueue) Pop() (responsesWSQueuedCreate, bool) {
+	if q == nil || len(q.items) == 0 {
+		return responsesWSQueuedCreate{}, false
+	}
+	item := q.items[0]
+	q.items[0] = responsesWSQueuedCreate{}
+	q.items = q.items[1:]
+	q.bytes -= len(item.payload)
+	if q.bytes < 0 {
+		q.bytes = 0
+	}
+	return item, true
+}
+
+func (q *responsesWSCreateQueue) Clear() {
+	if q == nil {
+		return
+	}
+	for i := range q.items {
+		q.items[i] = responsesWSQueuedCreate{}
+	}
+	q.items = nil
+	q.bytes = 0
+}
+
+type responsesWSInjectState struct {
+	pending        int
+	pendingTargets map[string]int
+	terminalSeen   bool
+	deferred       []responsesws.Frame
+	deferredBytes  int
+	sendContext    context.Context
+	cancelSend     context.CancelFunc
+}
+
+func (s *responsesWSInjectState) AddPending(payload []byte) {
+	if s == nil {
+		return
+	}
+	s.pending++
+	responseID := strings.TrimSpace(responsesWSPayloadResponseID(payload))
+	if responseID == "" {
+		return
+	}
+	if s.pendingTargets == nil {
+		s.pendingTargets = make(map[string]int)
+	}
+	s.pendingTargets[responseID]++
+}
+
+func (s *responsesWSInjectState) CanAcknowledge(payload []byte) bool {
+	if s == nil || s.pending <= 0 || !responsesWSIsProviderInjectAcknowledgement(payload) {
+		return false
+	}
+	if len(s.pendingTargets) == 0 {
+		return true
+	}
+	return s.pendingTargets[strings.TrimSpace(responsesWSPayloadResponseID(payload))] > 0
+}
+
+func (s *responsesWSInjectState) Acknowledge(payload []byte) bool {
+	if !s.CanAcknowledge(payload) {
+		return false
+	}
+	s.pending--
+	responseID := strings.TrimSpace(responsesWSPayloadResponseID(payload))
+	if count := s.pendingTargets[responseID]; count > 1 {
+		s.pendingTargets[responseID] = count - 1
+	} else if count == 1 {
+		delete(s.pendingTargets, responseID)
+	}
+	return true
+}
+
+func (s *responsesWSInjectState) MarkTerminal() bool {
+	if s == nil {
+		return true
+	}
+	s.terminalSeen = true
+	return s.pending == 0
+}
+
+func (s *responsesWSInjectState) TerminalBarrierComplete() bool {
+	return s == nil || (s.terminalSeen && s.pending == 0)
+}
+
+func (s *responsesWSInjectState) Context(parent context.Context) context.Context {
+	if s == nil {
+		return parent
+	}
+	if s.sendContext == nil {
+		if parent == nil {
+			parent = context.Background()
+		}
+		s.sendContext, s.cancelSend = context.WithCancel(parent)
+	}
+	return s.sendContext
+}
+
+func (s *responsesWSInjectState) Reset() {
+	if s == nil {
+		return
+	}
+	if s.cancelSend != nil {
+		s.cancelSend()
+	}
+	for i := range s.deferred {
+		s.deferred[i] = responsesws.Frame{}
+	}
+	*s = responsesWSInjectState{}
 }
 
 type responsesWSTurnFinalization struct {
@@ -104,7 +234,6 @@ type responsesWSPendingCleanup struct {
 	openingID string
 	phase     responsesWSPendingTurnPhase
 	provider  responsesWSPendingProviderState
-	cancel    responsesWSPendingCancelState
 }
 
 type responsesWSProviderJournal struct {
@@ -124,8 +253,8 @@ type responsesWSProviderJournalAppendResult struct {
 	OverLimit bool
 }
 
-func (j *responsesWSProviderJournal) appendEntry(entry responsesWSProviderJournalEntry, replayBytes int, maxBytes int, enforceBytes bool, allowReplayOnly bool) responsesWSProviderJournalAppendResult {
-	if j == nil || (entry.Observation.IsZero() && (!allowReplayOnly || (entry.Downstream == nil && entry.Failure == nil))) {
+func (j *responsesWSProviderJournal) appendEntry(entry responsesWSProviderJournalEntry, replayBytes int, maxBytes int, enforceBytes bool) responsesWSProviderJournalAppendResult {
+	if j == nil || entry.Observation.IsZero() {
 		return responsesWSProviderJournalAppendResult{}
 	}
 	overLimit := len(j.entries) >= responsesWSPendingProviderEventsMax
@@ -133,9 +262,8 @@ func (j *responsesWSProviderJournal) appendEntry(entry responsesWSProviderJourna
 		overLimit = true
 	}
 	if overLimit {
-		// Keep the triggering observation, when one exists, before failing closed
-		// so settlement projection cannot accidentally turn provider activity into
-		// a rollback. Replay payload is intentionally dropped on overflow.
+		// Keep the triggering provider lifecycle observation before failing closed;
+		// only the replay payload is intentionally dropped on overflow.
 		entry.Downstream = nil
 		entry.Failure = nil
 	} else if entry.Downstream != nil {
@@ -153,7 +281,7 @@ func (j *responsesWSProviderJournal) AppendDownstream(event ResponsesWSEventProv
 	eventBytes := len(responsesWSProviderDownstreamPayload(event))
 	copied := event
 	entry.Downstream = &copied
-	result := j.appendEntry(entry, eventBytes, maxBytes, true, false)
+	result := j.appendEntry(entry, eventBytes, maxBytes, true)
 	return result.Buffered, result.OverLimit
 }
 
@@ -165,42 +293,8 @@ func (j *responsesWSProviderJournal) AppendFailure(event ResponsesWSEventProvide
 	result := j.appendEntry(responsesWSProviderJournalEntry{
 		Observation: responsesws.NewProviderObservation(upstream),
 		Failure:     &copied,
-	}, 0, 0, false, false)
+	}, 0, 0, false)
 	return result.OverLimit
-}
-
-func (j *responsesWSProviderJournal) AppendDownstreamReplay(event ResponsesWSEventProviderDownstream) {
-	if j == nil {
-		return
-	}
-	copied := event
-	j.entries = append(j.entries, responsesWSProviderJournalEntry{
-		Observation: responsesws.NewProviderObservation(upstreamEventFromProviderDownstream(event)),
-		Downstream:  &copied,
-	})
-	j.bytes += len(responsesWSProviderDownstreamPayload(event))
-}
-
-func (j *responsesWSProviderJournal) AppendReplayableRequestRejection(event ResponsesWSEventProviderDownstream, maxBytes int) (bool, bool) {
-	if j == nil {
-		return false, false
-	}
-	copied := event
-	result := j.appendEntry(responsesWSProviderJournalEntry{
-		Downstream: &copied,
-	}, len(responsesWSProviderDownstreamPayload(event)), maxBytes, true, true)
-	return result.Buffered, result.OverLimit
-}
-
-func (j *responsesWSProviderJournal) AppendFailureReplay(event ResponsesWSEventProviderRecvFailed) {
-	if j == nil {
-		return
-	}
-	copied := event
-	j.entries = append(j.entries, responsesWSProviderJournalEntry{
-		Observation: responsesws.NewProviderObservation(upstreamEventFromProviderRecvFailed(event)),
-		Failure:     &copied,
-	})
 }
 
 func (j *responsesWSProviderJournal) AppendLifecycle(upstream responsesws.UpstreamEvent) bool {
@@ -218,15 +312,15 @@ func (j *responsesWSProviderJournal) AppendObservation(obs responsesws.ProviderO
 	if j == nil || obs.IsZero() {
 		return false
 	}
-	result := j.appendEntry(responsesWSProviderJournalEntry{Observation: obs}, 0, 0, false, false)
+	result := j.appendEntry(responsesWSProviderJournalEntry{Observation: obs}, 0, 0, false)
 	return result.OverLimit
 }
 
-func (j *responsesWSProviderJournal) Project() responsesws.ProviderSettlementLogProjection {
+func (j *responsesWSProviderJournal) Project() responsesws.ProviderActivityProjection {
 	if j == nil || len(j.entries) == 0 {
-		return responsesws.ProviderSettlementLogProjection{}
+		return responsesws.ProviderActivityProjection{}
 	}
-	var out responsesws.ProviderSettlementLogProjection
+	var out responsesws.ProviderActivityProjection
 	for _, entry := range j.entries {
 		out.Observe(entry.Observation)
 	}
@@ -322,7 +416,7 @@ func (s *responsesWSTurnSlots) CommitPendingToActive(channelID int) (responsesWS
 	}
 	replay := pending.provider.journal.Replay()
 	s.active = active
-	s.pending = responsesWSPendingTurn{cancel: pending.cancel}
+	s.pending = responsesWSPendingTurn{}
 	return active, replay, nil
 }
 
@@ -349,7 +443,6 @@ func (s *responsesWSTurnSlots) ClearPending() responsesWSPendingCleanup {
 		openingID: s.pending.openingID,
 		phase:     s.pending.phase,
 		provider:  s.pending.provider,
-		cancel:    s.pending.cancel,
 	}
 	s.pending = responsesWSPendingTurn{}
 	return cleanup
@@ -363,11 +456,10 @@ func (s *responsesWSTurnSlots) ResetPendingProvider() {
 }
 
 type responsesWSWorkerState struct {
-	runWG           sync.WaitGroup
-	sendCommands    chan responsesWSSendCommand
-	controlCommands chan responsesWSSendCommand
-	sendOnce        sync.Once
-	controlOnce     sync.Once
+	runWG        sync.WaitGroup
+	sendCommands chan responsesWSSendCommand
+	sendBytes    atomic.Int64
+	sendOnce     sync.Once
 
 	setupCancelMu sync.Mutex
 	setupCancel   context.CancelFunc
@@ -375,10 +467,16 @@ type responsesWSWorkerState struct {
 
 type responsesWSCloseState struct {
 	closed              atomic.Bool
+	ingressClosed       atomic.Bool
 	clientClosed        atomic.Bool
 	closeIntentPosted   atomic.Bool
 	downstreamCloseSent atomic.Bool
 	backpressurePosted  atomic.Bool
+
+	postMu             sync.Mutex
+	postedSequence     uint64
+	closureCutSequence uint64
+	reducingCut        bool
 }
 
 type responsesWSWatchdogState struct {
@@ -388,7 +486,4 @@ type responsesWSWatchdogState struct {
 	activeTurnMu       sync.Mutex
 	activeTurnTimer    *time.Timer
 	activeTurnTimerGen int64
-
-	busyRejectWindowStart time.Time
-	busyRejects           int
 }

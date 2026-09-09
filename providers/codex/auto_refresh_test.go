@@ -105,6 +105,7 @@ func TestRunScheduledMaintenanceRunsOAuthBeforeUsage(t *testing.T) {
 }
 
 func TestOAuthRunnerCancellationReachesChannelLoader(t *testing.T) {
+	isolatePendingCredentialJournal(t)
 	originalLoadChannels := loadAutoRefreshChannels
 	loaderCanceled := make(chan struct{})
 	loadAutoRefreshChannels = func(ctx context.Context) ([]*model.Channel, error) {
@@ -128,6 +129,7 @@ func TestOAuthRunnerCancellationReachesChannelLoader(t *testing.T) {
 }
 
 func TestRefreshChannelsInBackgroundMarksCanceledDispatchPartial(t *testing.T) {
+	isolatePendingCredentialJournal(t)
 	autoRefreshStatusMu.Lock()
 	autoRefreshStatus = AutoRefreshStatus{
 		LastSuccessAt: 456,

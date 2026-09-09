@@ -44,7 +44,8 @@ func (p *BedrockProvider) CreateClaudeChatStream(request *claude.ClaudeRequest) 
 	}
 
 	// 发送请求
-	resp, openaiErr := p.Requester.SendRequestRaw(req)
+	streamRequester := p.Requester.ForHTTPProfile(requester.HTTPProfileLongStream)
+	resp, openaiErr := streamRequester.SendRequestRaw(req)
 	if openaiErr != nil {
 		return nil, openaiErr
 	}
