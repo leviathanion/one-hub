@@ -12,8 +12,7 @@ import { useLogType } from '../type/LogType';
 import { useTranslation } from 'react-i18next';
 import QuotaWithDetailRow from './QuotaWithDetailRow';
 import QuotaWithDetailContent from './QuotaWithDetailContent';
-import { calculatePrice } from './QuotaWithDetailContent';
-import { calculateTokenBreakdown } from './quotaDetail';
+import { calculatePrice, calculateTokenBreakdown, getBasePriceRatio } from './quotaDetail';
 import { styled } from '@mui/material/styles';
 
 function renderType(type, logTypes, t) {
@@ -179,22 +178,14 @@ export default function LogTableRow({ item, userIsAdmin, userGroup, columnVisibi
         {columnVisibility.user_agent && (
           <TableCell sx={{ p: '10px 8px' }}>{viewUserAgent(item.metadata?.user_agent, t('logPage.userAgent'))}</TableCell>
         )}
-        {columnVisibility.detail && (
-          <TableCell sx={{ p: '10px 8px' }}>{viewLogContent(item, t, totalInputTokens, totalOutputTokens)}</TableCell>
-        )}
+        {columnVisibility.detail && <TableCell sx={{ p: '10px 8px' }}>{viewLogContent(item, t)}</TableCell>}
       </TableRow>
       {/* 展开行 */}
       {showExpand && (
         <TableRow>
           <TableCell colSpan={colCount} sx={{ p: 0, border: 0, bgcolor: 'transparent' }}>
             <Collapse in={open} timeout="auto" unmountOnExit>
-              <QuotaWithDetailContent
-                item={item}
-                userGroup={userGroup}
-                t={t}
-                totalInputTokens={totalInputTokens}
-                totalOutputTokens={totalOutputTokens}
-              />
+              <QuotaWithDetailContent item={item} />
             </Collapse>
           </TableCell>
         </TableRow>
@@ -323,59 +314,33 @@ function viewInput(item, t, totalInputTokens, totalOutputTokens, show, tokenDeta
 }
 
 function viewLogContent(item, t) {
-  // totalOutputTokens is passed but not used in this function
-  // Check if we have the necessary data to calculate prices
-  if (!item?.metadata?.input_ratio) {
-    const free = (item.quota === 0 || item.quota === undefined) && item.type === 2;
-    return free ? (
+  if (item.type !== 2) return <>{item.content || ''}</>;
+  if (item.quota === 0) {
+    return (
       <Stack direction="column" spacing={0.3}>
-        <Label color={free ? 'success' : 'secondary'} variant="soft">
+        <Label color="success" variant="soft">
           {t('logPage.content.free')}
         </Label>
       </Stack>
-    ) : (
-      <>{item.content || ''}</>
     );
   }
 
-  // Ensure we have valid values with appropriate defaults
-  const groupDiscount = item?.metadata?.group_ratio ?? 1;
-  const priceType = item?.metadata?.price_type || '';
-  const originalCompletionRatio = item?.metadata?.output_ratio || 0;
-  const originalInputRatio = item?.metadata?.input_ratio || 0;
-
-  let inputPriceInfo;
-  let outputPriceInfo = '';
-  if (priceType === 'times') {
-    // Calculate prices for 'times' price type
-    const inputPrice = calculatePrice(originalInputRatio, groupDiscount, true);
-
-    inputPriceInfo = t('logPage.content.times_price', {
-      times: inputPrice
-    });
-  } else {
-    // Calculate prices for a standard price type
-    const inputPrice = calculatePrice(originalInputRatio, groupDiscount, false);
-    const outputPrice = calculatePrice(originalCompletionRatio, groupDiscount, false);
-
-    inputPriceInfo = t('logPage.content.input_price', {
-      price: inputPrice
-    });
-    outputPriceInfo = t('logPage.content.output_price', {
-      price: outputPrice
-    });
-  }
+  const isTimes = item.metadata?.price_type === 'times';
+  const basePrice = (bucket) => {
+    const ratio = getBasePriceRatio(item.metadata, bucket);
+    if (ratio === null) return t('logPage.quotaDetail.notRecorded');
+    const price = calculatePrice(ratio, 1, isTimes);
+    return isTimes ? t('logPage.quotaDetail.perCall', { price }) : `$${price} /M`;
+  };
 
   return (
     <Stack direction="column" spacing={0.3}>
-      {inputPriceInfo && (
+      <Label color="info" variant="soft">
+        {t(isTimes ? 'logPage.quotaDetail.baseCallPrice' : 'logPage.quotaDetail.inputBasePrice', { price: basePrice('input') })}
+      </Label>
+      {!isTimes && (
         <Label color="info" variant="soft">
-          {inputPriceInfo}
-        </Label>
-      )}
-      {outputPriceInfo && (
-        <Label color="info" variant="soft">
-          {outputPriceInfo}
+          {t('logPage.quotaDetail.outputBasePrice', { price: basePrice('output') })}
         </Label>
       )}
     </Stack>

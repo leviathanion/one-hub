@@ -62,7 +62,17 @@ const EXTRA_TOKEN_FIELDS = [
     label: 'logPage.outputImageTokens',
     ratioKey: 'output_image_tokens_ratio',
     bucket: 'output'
-  }
+  },
+  ...[
+    ['cache_write_tokens', 'input'],
+    ['claude_cache_write_5m_tokens', 'input'],
+    ['claude_cache_write_1h_tokens', 'input'],
+    ['tool_use_prompt_tokens', 'input'],
+    ['input_video_tokens', 'input'],
+    ['output_video_tokens', 'output'],
+    ['deepseek_cache_hit_tokens', 'input'],
+    ['deepseek_cache_miss_tokens', 'input']
+  ].map(([key, bucket]) => ({ key, bucket, label: `logPage.quotaDetail.tokenKinds.${key}`, ratioKey: `${key}_ratio` }))
 ];
 
 function toNumber(value, fallback = 0) {
@@ -79,8 +89,43 @@ function getQuotaPerUnit() {
   return Number.isFinite(quotaPerUnit) && quotaPerUnit > 0 ? quotaPerUnit : DEFAULT_QUOTA_PER_UNIT;
 }
 
+export function calculatePrice(ratio, groupDiscount, isTimes) {
+  const value = new Decimal(ratio || 0)
+    .mul(groupDiscount || 0)
+    .mul(isTimes ? 1000 : 1000000)
+    .div(getQuotaPerUnit());
+  return value.toFixed(6).replace(/(\.\d*?[1-9])0+$|\.0*$/, '$1');
+}
+
+export function formatBillingNumber(value, locale) {
+  return new Intl.NumberFormat(locale?.replaceAll('_', '-'), { maximumFractionDigits: 6 }).format(value);
+}
+
 export function getGroupRatio(metadata) {
   return toNumber(metadata?.group_ratio, 1);
+}
+
+export function getTokenBillingDetails(metadata) {
+  const details = metadata?.token_billing;
+  if (!details || typeof details.status !== 'string' || !Array.isArray(details.rules)) return null;
+  for (const key of ['base_input_ratio', 'base_output_ratio', 'input_units', 'output_units', 'charge']) {
+    if (typeof details[key] !== 'number' || !Number.isFinite(details[key]) || details[key] < 0) return null;
+  }
+  if (details.rules.some((rule) => !rule || typeof rule.kind !== 'string')) return null;
+  return details;
+}
+
+export function getBasePriceRatio(metadata, bucket) {
+  // 缺价时后端记录的零是占位值，不是免费定价。
+  if (Array.isArray(metadata?.billing_diagnostics) && metadata.billing_diagnostics.includes('price_policy_missing_at_settlement'))
+    return null;
+  const value =
+    metadata?.price_type === 'times'
+      ? bucket === 'input'
+        ? metadata.input_ratio
+        : null
+      : getTokenBillingDetails(metadata)?.[`base_${bucket}_ratio`];
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
 }
 
 export function getStoredOriginalQuota(metadata) {
@@ -118,7 +163,7 @@ export function calculateTokenBreakdown(item) {
     }
 
     const rate = toNumber(metadata[ratioKey], 1);
-    const tokens = Math.trunc(value * (rate - 1));
+    const tokens = value * (rate - 1);
     if (tokens !== 0) {
       if (bucket === 'input') {
         totalInputTokens += tokens;
@@ -131,6 +176,7 @@ export function calculateTokenBreakdown(item) {
     return {
       key,
       label,
+      bucket,
       tokens,
       value,
       rate,
@@ -138,9 +184,10 @@ export function calculateTokenBreakdown(item) {
     };
   }).filter(Boolean);
 
+  const recorded = getTokenBillingDetails(metadata);
   return {
-    totalInputTokens,
-    totalOutputTokens,
+    totalInputTokens: recorded ? recorded.input_units : totalInputTokens,
+    totalOutputTokens: recorded ? recorded.output_units : totalOutputTokens,
     show,
     tokenDetails
   };
@@ -178,8 +225,9 @@ export function calculateQuotaDetail(item, tokenBreakdown = calculateTokenBreakd
   const quota = toNumber(item?.quota);
   const priceType = metadata?.price_type || 'tokens';
   const groupRatio = getGroupRatio(metadata);
-  const inputRatio = toNumber(metadata?.input_ratio);
-  const outputRatio = toNumber(metadata?.output_ratio);
+  const recorded = getTokenBillingDetails(metadata);
+  const inputRatio = toNumber(recorded?.units_include_rules ? recorded.base_input_ratio : metadata?.input_ratio);
+  const outputRatio = toNumber(recorded?.units_include_rules ? recorded.base_output_ratio : metadata?.output_ratio);
   const { totalInputTokens, totalOutputTokens } = tokenBreakdown;
   const storedOriginalQuota = getStoredOriginalQuota(metadata);
   const originalExtraBillingQuota = calculateOriginalExtraBillingQuota(metadata?.extra_billing);
@@ -205,7 +253,7 @@ export function calculateQuotaDetail(item, tokenBreakdown = calculateTokenBreakd
       originalExtraBillingQuota: originalExtraBillingQuota.toNumber(),
       actualExtraBillingQuota: actualExtraBillingQuota.toNumber(),
       originalQuota: storedOriginalQuota ?? originalInputQuota.plus(originalExtraBillingQuota).toNumber(),
-      actualQuota: quota || computedActualQuota.toNumber(),
+      actualQuota: quota,
       computedActualQuota: computedActualQuota.toNumber(),
       usedStoredOriginalQuota: storedOriginalQuota !== null
     };
@@ -244,7 +292,7 @@ export function calculateQuotaDetail(item, tokenBreakdown = calculateTokenBreakd
     originalExtraBillingQuota: originalExtraBillingQuota.toNumber(),
     actualExtraBillingQuota: actualExtraBillingQuota.toNumber(),
     originalQuota,
-    actualQuota: quota || computedActualQuota.toNumber(),
+    actualQuota: quota,
     computedActualQuota: computedActualQuota.toNumber(),
     usedStoredOriginalQuota: storedOriginalQuota !== null
   };
@@ -255,4 +303,96 @@ export function calculateQuotaDetail(item, tokenBreakdown = calculateTokenBreakd
 // charge and rounding in the backend.
 export function calculateOriginalQuota(item) {
   return calculateQuotaDetail(item).originalQuota;
+}
+
+// 分项金额只用于解释费用，不复刻后端的取整、最低扣费或结算规则。
+export function getBillingCostRows(item) {
+  const metadata = item?.metadata || {};
+  const groupRatio = getGroupRatio(metadata);
+  const details = getTokenBillingDetails(metadata);
+  const breakdown = calculateTokenBreakdown(item);
+  const validNumber = (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+  const rate = (value) => (validNumber(value) && validNumber(value * groupRatio) ? value * groupRatio : null);
+  const groupMultipliers = groupRatio === 1 ? [] : [groupRatio];
+  let rows;
+  if (metadata.price_type === 'times') {
+    // 按次计费也可能是多次操作，日志未记录次数时不能假定为一次。
+    rows = [
+      {
+        key: 'times',
+        label: 'perCallBilling',
+        kind: 'times',
+        count: null,
+        ratio: rate(metadata.input_ratio),
+        baseRatio: getBasePriceRatio(metadata, 'input'),
+        multipliers: groupMultipliers,
+        amount: null
+      }
+    ];
+  } else {
+    const notCharged = details !== null && details.status !== 'priceable';
+    rows = ['input', 'output'].map((bucket) => {
+      const ratio = rate(metadata[`${bucket}_ratio`]);
+      const count = item?.[bucket === 'input' ? 'prompt_tokens' : 'completion_tokens'];
+      const units = bucket === 'input' ? breakdown.totalInputTokens : breakdown.totalOutputTokens;
+      const parts = breakdown.tokenDetails.filter((part) => part.bucket === bucket);
+      const completeRates = details !== null || parts.every((part) => validNumber(metadata[`${part.key}_ratio`]));
+      return {
+        key: bucket,
+        label: bucket,
+        kind: 'tokens',
+        count: validNumber(count) ? count : null,
+        ratio,
+        baseRatio: getBasePriceRatio(metadata, bucket),
+        multipliers:
+          details?.status === 'priceable'
+            ? [...details.rules.map((rule) => rule[`${bucket}_multiplier`]).filter((value) => value !== 1), ...groupMultipliers]
+            : null,
+        notCharged,
+        amount: notCharged
+          ? 0
+          : ratio !== null && validNumber(count) && validNumber(units) && completeRates
+            ? new Decimal(units).mul(details?.units_include_rules ? rate(details[`base_${bucket}_ratio`]) : ratio).toNumber()
+            : null,
+        adjustments: notCharged
+          ? []
+          : parts.map((part) => ({
+              ...part,
+              ratio: details?.units_include_rules
+                ? rate(metadata.effective_extra_ratios?.[part.key])
+                : ratio !== null && validNumber(metadata[`${part.key}_ratio`])
+                  ? ratio * metadata[`${part.key}_ratio`]
+                  : null
+            }))
+      };
+    });
+  }
+  const toolLabels = {
+    web_search: 'webSearch',
+    web_search_preview: 'webSearch',
+    file_search: 'fileSearch',
+    code_interpreter: 'codeInterpreter',
+    image_generation: 'imageGeneration'
+  };
+  for (const [key, data] of Object.entries(metadata.extra_billing || {})) {
+    if (!data || typeof data !== 'object') continue;
+    const ratio = rate(data.price);
+    const count = validNumber(data.call_count) ? data.call_count : null;
+    const service = data.service_type || key;
+    rows.push({
+      key: `tool:${key}`,
+      label: toolLabels[service] || service,
+      variant: data.type,
+      kind: 'tool',
+      count,
+      ratio,
+      baseRatio: validNumber(data.price) ? data.price : null,
+      multipliers: groupMultipliers,
+      amount: ratio !== null && count !== null ? new Decimal(ratio).mul(count).mul(getQuotaPerUnit()).toNumber() : null
+    });
+  }
+  for (const row of rows) {
+    if (!validNumber(row.amount)) row.amount = null;
+  }
+  return rows;
 }
