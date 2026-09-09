@@ -1,8 +1,10 @@
 package middleware
 
 import (
+	"net/url"
 	"one-api/common/logger"
 	"one-api/metrics"
+	"sort"
 	"strings"
 	"time"
 
@@ -20,20 +22,7 @@ func GinzapWithConfig() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
 		path := c.Request.URL.Path
-		query := c.Request.URL.RawQuery
-		// 如果query的值包含key=sk-fsdfsdfsdf 则把sk-fsdfsdfsdf脱敏处理
-		if query != "" {
-			if i := strings.Index(query, "key=sk-"); i >= 0 {
-				start := i + 4 // "key=" length
-				end := strings.Index(query[start:], "&")
-				if end == -1 {
-					end = len(query)
-				} else {
-					end += start
-				}
-				query = query[:start] + "sk-***" + query[end:]
-			}
-		}
+		queryKeys := queryKeySummary(c.Request.URL.RawQuery)
 		c.Next()
 		end := time.Now()
 		latency := end.Sub(start)
@@ -45,7 +34,7 @@ func GinzapWithConfig() gin.HandlerFunc {
 			zap.String("request_id", requestID),
 			zap.String("method", c.Request.Method),
 			zap.String("path", path),
-			zap.String("query", query),
+			zap.String("query_keys", queryKeys),
 			zap.String("ip", c.ClientIP()),
 			zap.String("user-agent", c.Request.UserAgent()),
 			zap.Duration("latency", latency),
@@ -67,4 +56,20 @@ func GinzapWithConfig() gin.HandlerFunc {
 		}
 		metrics.RecordHttp(c, latency)
 	}
+}
+
+func queryKeySummary(rawQuery string) string {
+	if strings.TrimSpace(rawQuery) == "" {
+		return ""
+	}
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return "invalid"
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ",")
 }
