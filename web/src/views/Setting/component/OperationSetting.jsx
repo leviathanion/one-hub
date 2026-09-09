@@ -1,4 +1,4 @@
-import { useContext, useEffect, useState } from 'react';
+import { useContext, useEffect, useRef, useState } from 'react';
 import SubCard from 'ui-component/cards/SubCard';
 import {
   Alert,
@@ -46,22 +46,19 @@ import { useTranslation } from 'react-i18next';
 import 'dayjs/locale/zh-cn';
 import { DateTimePicker } from '@mui/x-date-pickers';
 import { useSelector } from 'react-redux';
-import SecretOptionField from './SecretOptionField';
 import {
-  OPERATION_SECRET_OPTION_KEYS,
-  buildSecretOptionUpdates,
-  createInitialSecretStates,
-  mergeSecretStatesFromMeta,
-  markSecretOptionForClear,
-  resetSecretOptionAction,
-  updateSecretOptionDraft
-} from './secretOptionState.mjs';
+  buildChannelAffinityUpdates,
+  buildCodexHintUpdates,
+  createRoutingDraft,
+  isRoutingDraftDirty,
+  markRoutingDraftStale,
+  preserveRoutingDrafts
+} from './routingSettings.mjs';
 
 const defaultInputs = {
   QuotaForNewUser: 0,
   QuotaForInviter: 0,
   QuotaForInvitee: 0,
-  QuotaRemindThreshold: 0,
   PreConsumedQuota: 0,
   TopUpLink: '',
   ChatLink: '',
@@ -79,12 +76,9 @@ const defaultInputs = {
   RetryTimeOut: 0,
   RetryCooldownSeconds: 0,
   MjNotifyEnabled: '',
-  ChatImageRequestProxy: '',
   PaymentUSDRate: 0,
   PaymentMinAmount: 1,
   RechargeDiscount: '',
-  CFWorkerImageUrl: '',
-  CFWorkerImageKey: '',
   ClaudeAPIEnabled: '',
   GeminiAPIEnabled: '',
   DisableChannelKeywords: '',
@@ -101,7 +95,7 @@ const defaultInputs = {
 
 const CODEX_ROUTING_HINT_RECOMMENDED = {
   prompt_cache_key_strategy: 'auto',
-  model_regex: '^gpt-5$',
+  model_regex: '',
   user_agent_regex: ''
 };
 
@@ -112,6 +106,7 @@ const CODEX_ROUTING_HINT_DEFAULT = {
 };
 
 const CODEX_ROUTING_HINT_DEFAULT_TEMPLATE = JSON.stringify(CODEX_ROUTING_HINT_DEFAULT, null, 2);
+const ROUTING_STALE_MESSAGE = '设置已被其他管理员更新，请加载最新数据后重新编辑。';
 
 const DEFAULT_CHANNEL_AFFINITY_RULES = [
   {
@@ -171,6 +166,31 @@ const DEFAULT_CHANNEL_AFFINITY_RULES = [
     ]
   },
   {
+    name: 'chat-prompt-cache-key',
+    enabled: true,
+    kind: 'chat',
+    model_regex: '',
+    path_regex: '^/v1/chat/completions$',
+    user_agent_regex: '',
+    include_group: true,
+    include_model: true,
+    include_path: false,
+    include_rule_name: true,
+    ignore_preferred_cooldown: false,
+    strict: false,
+    skip_retry_on_failure: false,
+    record_on_success: true,
+    ttl_seconds: '',
+    key_sources: [
+      {
+        source: 'request_field',
+        key: 'prompt_cache_key',
+        alias: 'prompt_cache_key',
+        value_regex: ''
+      }
+    ]
+  },
+  {
     name: 'realtime-session',
     enabled: true,
     kind: 'realtime',
@@ -221,7 +241,7 @@ const CHANNEL_AFFINITY_DEFAULT_TEMPLATE = JSON.stringify(
 );
 
 const PROMPT_CACHE_STRATEGIES = ['off', 'auto', 'session_id', 'auth_header', 'token_id', 'user_id'];
-const CHANNEL_AFFINITY_KINDS = ['responses', 'realtime'];
+const CHANNEL_AFFINITY_KINDS = ['chat', 'responses', 'realtime'];
 const CHANNEL_AFFINITY_KEY_SOURCES = ['request_field', 'header', 'query', 'request_hint'];
 const CHANNEL_AFFINITY_BOOLEAN_GROUPS = [
   {
@@ -381,7 +401,12 @@ const OperationSetting = () => {
     channelAffinityBackendDefault: false
   }));
   const [originInputs, setOriginInputs] = useState({});
-  const [secretStates, setSecretStates] = useState(() => createInitialSecretStates(OPERATION_SECRET_OPTION_KEYS));
+  const optionVersion = useRef(0);
+  const [optionSources, setOptionSources] = useState({});
+  const [routingDrafts, setRoutingDrafts] = useState(() => ({
+    channelAffinity: createRoutingDraft(inputs, 'channelAffinity', 0),
+    codexHint: createRoutingDraft(inputs, 'codexHint', 0)
+  }));
   let [loading, setLoading] = useState(false);
   const [codexHelpTopic, setCodexHelpTopic] = useState(null);
   let [historyTimestamp, setHistoryTimestamp] = useState(now.getTime() / 1000 - 30 * 24 * 3600); // a month ago new Date().getTime() / 1000 + 3600
@@ -403,44 +428,68 @@ const OperationSetting = () => {
     }
   };
 
-  const buildCodexFormInputs = (sourceInputs) => ({
+  const buildCodexFormInputs = (sourceInputs, sources = optionSources) => ({
     ...sourceInputs,
     codexRoutingHintForm: parseCodexRoutingHintForm(sourceInputs.CodexRoutingHintSetting),
     channelAffinityForm: parseChannelAffinityForm(sourceInputs.ChannelAffinitySetting),
-    channelAffinityBackendDefault: String(sourceInputs.ChannelAffinitySetting ?? '').trim() === ''
+    channelAffinityBackendDefault: sources.ChannelAffinitySetting === 'default'
   });
 
-  const getOptions = async () => {
+  const getOptions = async (preserveSections = []) => {
     try {
       const res = await API.get('/api/option/');
-      const { success, message, data, meta } = res.data;
+      const { success, message, data, version } = res.data;
       if (success) {
         let newInputs = { ...defaultInputs };
+        let newSources = {};
         data.forEach((item) => {
+          let effective = item.effective;
           if (item.key === 'RechargeDiscount') {
-            item.value = JSON.stringify(JSON.parse(item.value), null, 2);
+            effective = JSON.stringify(JSON.parse(effective), null, 2);
           }
-          if (item.key === 'SafeKeyWords' && typeof item.value === 'string' && item.value.startsWith('[')) {
+          if (item.key === 'SafeKeyWords' && typeof effective === 'string' && effective.startsWith('[')) {
             try {
-              item.value = JSON.parse(item.value);
+              effective = JSON.parse(effective);
             } catch (e) {
               console.error('解析SafeKeyWords失败:', e);
             }
           }
-          newInputs[item.key] = item.value;
+          newInputs[item.key] = effective;
+          newSources[item.key] = item.source;
         });
         newInputs.CodexRoutingHintSetting = formatJSONObjectOption(newInputs.CodexRoutingHintSetting);
         newInputs.ChannelAffinitySetting = formatJSONObjectOption(newInputs.ChannelAffinitySetting);
+        const serverInputs = buildCodexFormInputs(newInputs, newSources);
         // 确保不会覆盖 safeTools
-        setInputs((prev) => ({ ...buildCodexFormInputs(newInputs), safeTools: prev.safeTools }));
+        setInputs((prev) => ({
+          ...preserveRoutingDrafts(
+            serverInputs,
+            prev,
+            buildCodexFormInputs(originInputs, optionSources),
+            preserveSections
+          ),
+          safeTools: prev.safeTools
+        }));
         setOriginInputs(newInputs);
-        setSecretStates(mergeSecretStatesFromMeta(OPERATION_SECRET_OPTION_KEYS, meta?.sensitive_options));
-      } else {
-        showError(message);
+        setOptionSources(newSources);
+        optionVersion.current = version;
+        setRoutingDrafts((prev) => {
+          const next = { ...prev };
+          for (const section of ['channelAffinity', 'codexHint']) {
+            if (preserveSections.includes(section) && (prev[section]?.stale || isRoutingDraftDirty(inputs, prev[section], section))) {
+              continue;
+            }
+            next[section] = createRoutingDraft(serverInputs, section, version);
+          }
+          return next;
+        });
+        return true;
       }
+      showError(message);
     } catch (error) {
-      return;
+      showError(getRequestErrorMessage(error, '获取设置失败'));
     }
+    return false;
   };
 
   const getSafeTools = async () => {
@@ -487,11 +536,11 @@ const OperationSetting = () => {
     return error?.response?.data?.message || error?.message || fallbackMessage;
   };
 
-  const refreshSettings = async (includeSafeTools = true) => {
+  const refreshSettings = async (includeSafeTools = true, preserveSections = ['channelAffinity', 'codexHint']) => {
     if (includeSafeTools) {
       await getSafeTools();
     }
-    await getOptions();
+    await getOptions(preserveSections);
     await loadStatus();
   };
 
@@ -501,66 +550,89 @@ const OperationSetting = () => {
     try {
       const res = await API.put('/api/option/', {
         key,
-        value: normalizedValue
+        value: normalizedValue,
+        expected_version: optionVersion.current
       });
-      const { success, message } = res.data;
+      const { success, message, version } = res.data;
       if (!success) {
         throw new Error(message || '保存失败');
       }
+      optionVersion.current = version;
     } catch (error) {
-      throw new Error(getRequestErrorMessage(error, '保存失败'));
+      error.message = getRequestErrorMessage(error, '保存失败');
+      throw error;
     }
   };
 
-  const putOptionBatchOrThrow = async (updates) => {
+  const putOptionBatchOrThrow = async (updates, expectedVersion = optionVersion.current) => {
+    if (updates.length === 0) return;
     try {
-      const res = await API.put('/api/option/batch', { updates });
-      const { success, message } = res.data;
+      const res = await API.put('/api/option/batch', { updates, expected_version: expectedVersion });
+      const { success, message, version } = res.data;
       if (!success) {
         throw new Error(message || '保存失败');
       }
+      optionVersion.current = version;
     } catch (error) {
-      throw new Error(getRequestErrorMessage(error, '保存失败'));
+      error.message = getRequestErrorMessage(error, '保存失败');
+      throw error;
     }
   };
 
-  const buildOptionUpdates = (keys) => {
-    return keys
-      .filter((key) => originInputs[key] !== inputs[key])
-      .map((key) => ({
-        key,
-        value: normalizeOptionPayloadValue(inputs[key])
-      }));
+  const submitRoutingSettings = async (section) => {
+    if (routingDrafts[section]?.stale) {
+      showError(ROUTING_STALE_MESSAGE);
+      return;
+    }
+    setLoading(true);
+    try {
+      const draftVersion = routingDrafts[section]?.baseVersion ?? optionVersion.current;
+      let updates;
+      if (section === 'channelAffinity') {
+        validateChannelAffinityConfig();
+        updates = buildChannelAffinityUpdates(
+          inputs,
+          originInputs,
+          optionSources,
+          serializeChannelAffinityForm(inputs.channelAffinityForm)
+        );
+      } else {
+        updates = buildCodexHintUpdates(serializeCodexRoutingHintForm(inputs.codexRoutingHintForm), originInputs.CodexRoutingHintSetting);
+      }
+      await putOptionBatchOrThrow(updates, draftVersion);
+      const sibling = section === 'channelAffinity' ? 'codexHint' : 'channelAffinity';
+      if (!(await getOptions([sibling]))) return;
+      await loadStatus();
+      showSuccess('保存成功！');
+    } catch (error) {
+      if (error?.response?.status === 409) {
+        setRoutingDrafts((prev) => ({ ...prev, [section]: markRoutingDraftStale(prev[section]) }));
+        showError(ROUTING_STALE_MESSAGE);
+      } else {
+        showError('保存失败：' + (error.message || '未知错误'));
+      }
+    } finally {
+      setLoading(false);
+    }
   };
 
-  const buildCodexOptionUpdates = () => {
-    const codexRoutingHintSetting = serializeCodexRoutingHintForm(inputs.codexRoutingHintForm);
-    const channelAffinitySetting = inputs.channelAffinityBackendDefault ? '' : serializeChannelAffinityForm(inputs.channelAffinityForm);
-    const codexInputs = {
-      ...inputs,
-      CodexRoutingHintSetting: codexRoutingHintSetting,
-      ChannelAffinitySetting: channelAffinitySetting
-    };
-
-    return [
-      ...['PreferredChannelWaitMilliseconds', 'PreferredChannelWaitPollMilliseconds']
-        .filter((key) => originInputs[key] !== inputs[key])
-        .map((key) => ({
-          key,
-          value: normalizeOptionPayloadValue(inputs[key])
-        })),
-      ...['CodexRoutingHintSetting', 'ChannelAffinitySetting']
-        .filter((key) => originInputs[key] !== codexInputs[key])
-        .map((key) => ({
-          key,
-          value: codexInputs[key]
-        }))
-    ];
+  const reloadRoutingSection = async (section) => {
+    setLoading(true);
+    const sibling = section === 'channelAffinity' ? 'codexHint' : 'channelAffinity';
+    try {
+      if (!(await getOptions([sibling]))) {
+        showError('加载最新数据失败。');
+        return;
+      }
+      await loadStatus();
+    } finally {
+      setLoading(false);
+    }
   };
 
   const isNonNegativeIntegerString = (value) => /^(0|[1-9]\d*)$/.test(String(value ?? '').trim());
 
-  const validateCodexConfig = () => {
+  const validateChannelAffinityConfig = () => {
     if (
       originInputs.PreferredChannelWaitMilliseconds !== inputs.PreferredChannelWaitMilliseconds &&
       !isNonNegativeIntegerString(inputs.PreferredChannelWaitMilliseconds)
@@ -574,6 +646,8 @@ const OperationSetting = () => {
     ) {
       throw new Error(t('setting_index.operationSettings.codexSettings.errors.invalidWaitPollMilliseconds'));
     }
+
+    if (inputs.channelAffinityBackendDefault) return;
 
     if (!isNonNegativeIntegerString(inputs.channelAffinityForm.default_ttl_seconds)) {
       throw new Error(t('setting_index.operationSettings.codexSettings.errors.invalidDefaultTTL'));
@@ -593,10 +667,6 @@ const OperationSetting = () => {
   const handleInputChange = async (event) => {
     let { name, value } = event.target;
 
-    if (OPERATION_SECRET_OPTION_KEYS.includes(name)) {
-      setSecretStates((prev) => updateSecretOptionDraft(prev, name, value));
-      return;
-    }
     if (name.endsWith('Enabled')) {
       setLoading(true);
       try {
@@ -737,110 +807,7 @@ const OperationSetting = () => {
     });
   };
 
-  const applyCodexSafeDefaults = () => {
-    setInputs((prev) => ({
-      ...prev,
-      PreferredChannelWaitMilliseconds: 0,
-      PreferredChannelWaitPollMilliseconds: 50,
-      codexRoutingHintForm: cloneJSON(CODEX_ROUTING_HINT_DEFAULT),
-      channelAffinityForm: parseChannelAffinityForm(''),
-      channelAffinityBackendDefault: true
-    }));
-  };
-
-  const applyCodexRecommendedPreset = () => {
-    setInputs((prev) => ({
-      ...prev,
-      PreferredChannelWaitMilliseconds: 250,
-      PreferredChannelWaitPollMilliseconds: 50,
-      codexRoutingHintForm: cloneJSON(CODEX_ROUTING_HINT_RECOMMENDED),
-      channelAffinityForm: parseChannelAffinityForm(''),
-      channelAffinityBackendDefault: true
-    }));
-  };
-
   const enabledAffinityRules = inputs.channelAffinityForm.rules.filter((rule) => rule.enabled).length;
-  const codexHintEnabled = inputs.codexRoutingHintForm.prompt_cache_key_strategy !== 'off';
-  const codexHintScope = inputs.codexRoutingHintForm.model_regex || t('setting_index.operationSettings.codexSettings.summary.allModels');
-  const affinityModeLabel = inputs.channelAffinityBackendDefault
-    ? t('setting_index.operationSettings.codexSettings.summary.backendDefault')
-    : inputs.channelAffinityForm.enabled
-      ? t('setting_index.operationSettings.codexSettings.summary.customEnabled')
-      : t('setting_index.operationSettings.codexSettings.summary.customDisabled');
-
-  const renderCodexSummaryItem = ({ label, value, detail, color = 'default' }) => (
-    <Box
-      sx={{
-        border: '1px solid',
-        borderColor: 'divider',
-        borderRadius: 1,
-        p: 1.5,
-        minHeight: 96,
-        bgcolor: 'background.default'
-      }}
-    >
-      <Stack spacing={0.75}>
-        <Typography variant="caption" color="text.secondary">
-          {label}
-        </Typography>
-        <Chip label={value} color={color} size="small" sx={{ alignSelf: 'flex-start', fontWeight: 600 }} />
-        {detail && (
-          <Typography variant="body2" color="text.secondary">
-            {detail}
-          </Typography>
-        )}
-      </Stack>
-    </Box>
-  );
-
-  const renderCodexFlowStep = (key, index) => (
-    <Box
-      key={key}
-      sx={{
-        border: '1px solid',
-        borderColor: 'divider',
-        borderRadius: 1,
-        p: 1.5,
-        bgcolor: index === 1 ? 'action.hover' : 'background.paper'
-      }}
-    >
-      <Stack spacing={0.5}>
-        <Chip label={index + 1} size="small" color={index === 1 ? 'primary' : 'default'} sx={{ width: 32, fontWeight: 700 }} />
-        <Typography variant="subtitle2">{t(`setting_index.operationSettings.codexSettings.flow.${key}.title`)}</Typography>
-        <Typography variant="body2" color="text.secondary">
-          {t(`setting_index.operationSettings.codexSettings.flow.${key}.body`)}
-        </Typography>
-      </Stack>
-    </Box>
-  );
-
-  const renderCodexQuickAction = ({ icon, title, body, onClick, color = 'primary' }) => (
-    <Button
-      variant="outlined"
-      color={color}
-      onClick={onClick}
-      disabled={loading}
-      startIcon={icon}
-      sx={{
-        justifyContent: 'flex-start',
-        alignItems: 'flex-start',
-        textAlign: 'left',
-        py: 1.25,
-        px: 1.5,
-        minHeight: 92,
-        whiteSpace: 'normal'
-      }}
-    >
-      <Stack spacing={0.25}>
-        <Typography variant="subtitle2" component="span">
-          {title}
-        </Typography>
-        <Typography variant="caption" color="text.secondary" component="span">
-          {body}
-        </Typography>
-      </Stack>
-    </Button>
-  );
 
   const renderRuleKeySourceSummary = (rule) => {
     const keySources = rule.key_sources || [];
@@ -1142,8 +1109,8 @@ const OperationSetting = () => {
     try {
       switch (group) {
         case 'monitor':
-          if (inputs.ChannelDisableThreshold < 0 || inputs.QuotaRemindThreshold < 0) {
-            showError('最长响应时间、额度提醒阈值不能为负数');
+          if (inputs.ChannelDisableThreshold < 0) {
+            showError('最长响应时间不能为负数');
             return;
           }
           if (
@@ -1159,9 +1126,6 @@ const OperationSetting = () => {
           }
           if (originInputs['ChannelTestConcurrency'] !== inputs.ChannelTestConcurrency) {
             await putOptionOrThrow('ChannelTestConcurrency', inputs.ChannelTestConcurrency);
-          }
-          if (originInputs['QuotaRemindThreshold'] !== inputs.QuotaRemindThreshold) {
-            await putOptionOrThrow('QuotaRemindThreshold', inputs.QuotaRemindThreshold);
           }
           break;
         case 'chatlinks':
@@ -1213,17 +1177,6 @@ const OperationSetting = () => {
           }
           if (originInputs['RetryTimeOut'] !== inputs.RetryTimeOut) {
             await putOptionOrThrow('RetryTimeOut', inputs.RetryTimeOut);
-          }
-          break;
-        case 'other':
-          {
-            const updates = [
-              ...buildOptionUpdates(['ChatImageRequestProxy', 'CFWorkerImageUrl']),
-              ...buildSecretOptionUpdates(['CFWorkerImageKey'], secretStates)
-            ];
-            if (updates.length > 0) {
-              await putOptionBatchOrThrow(updates);
-            }
           }
           break;
         case 'payment':
@@ -1279,10 +1232,6 @@ const OperationSetting = () => {
             await putOptionOrThrow('GeminiOpenThink', inputs.GeminiOpenThink);
           }
           break;
-        case 'codex':
-          validateCodexConfig();
-          await putOptionBatchOrThrow(buildCodexOptionUpdates());
-          break;
       }
 
       await refreshSettings();
@@ -1335,14 +1284,6 @@ const OperationSetting = () => {
     } catch (error) {
       return;
     }
-  };
-
-  const handleSecretClear = (key) => {
-    setSecretStates((prev) => markSecretOptionForClear(prev, key));
-  };
-
-  const handleSecretReset = (key) => {
-    setSecretStates((prev) => resetSecretOptionAction(prev, key));
   };
 
   return (
@@ -1500,62 +1441,6 @@ const OperationSetting = () => {
               control={<Checkbox checked={inputs.GeminiAPIEnabled === 'true'} onChange={handleInputChange} name="GeminiAPIEnabled" />}
             />
           </Stack>
-          <Stack spacing={2}>
-            <Alert severity="info">{t('setting_index.operationSettings.otherSettings.alert')}</Alert>
-            <FormControl>
-              <InputLabel htmlFor="ChatImageRequestProxy">
-                {t('setting_index.operationSettings.otherSettings.chatImageRequestProxy.label')}
-              </InputLabel>
-              <OutlinedInput
-                id="ChatImageRequestProxy"
-                name="ChatImageRequestProxy"
-                value={inputs.ChatImageRequestProxy}
-                onChange={handleInputChange}
-                label={t('setting_index.operationSettings.otherSettings.chatImageRequestProxy.label')}
-                placeholder={t('setting_index.operationSettings.otherSettings.chatImageRequestProxy.placeholder')}
-                disabled={loading}
-              />
-            </FormControl>
-          </Stack>
-
-          <Stack spacing={2}>
-            <Alert severity="info">{t('setting_index.operationSettings.otherSettings.CFWorkerImageUrl.alert')}</Alert>
-            <FormControl>
-              <InputLabel htmlFor="CFWorkerImageUrl">
-                {t('setting_index.operationSettings.otherSettings.CFWorkerImageUrl.label')}
-              </InputLabel>
-              <OutlinedInput
-                id="CFWorkerImageUrl"
-                name="CFWorkerImageUrl"
-                value={inputs.CFWorkerImageUrl}
-                onChange={handleInputChange}
-                label={t('setting_index.operationSettings.otherSettings.CFWorkerImageUrl.label')}
-                placeholder={t('setting_index.operationSettings.otherSettings.CFWorkerImageUrl.label')}
-                disabled={loading}
-              />
-            </FormControl>
-
-            <SecretOptionField
-              id="CFWorkerImageKey"
-              name="CFWorkerImageKey"
-              label={t('setting_index.operationSettings.otherSettings.CFWorkerImageUrl.key')}
-              placeholder={t('setting_index.operationSettings.otherSettings.CFWorkerImageUrl.key')}
-              secretState={secretStates.CFWorkerImageKey}
-              onChange={handleInputChange}
-              onClear={() => handleSecretClear('CFWorkerImageKey')}
-              onReset={() => handleSecretReset('CFWorkerImageKey')}
-              disabled={loading}
-              t={t}
-            />
-          </Stack>
-          <Button
-            variant="contained"
-            onClick={() => {
-              submitConfig('other').then();
-            }}
-          >
-            {t('setting_index.operationSettings.otherSettings.saveButton')}
-          </Button>
         </Stack>
       </SubCard>
       <SubCard title={t('setting_index.operationSettings.logSettings.title')}>
@@ -1691,21 +1576,6 @@ const OperationSetting = () => {
                 placeholder={t('setting_index.operationSettings.monitoringSettings.channelTestConcurrency.placeholder')}
                 disabled={loading}
                 inputProps={{ min: 1, max: 32, step: 1 }}
-              />
-            </FormControl>
-            <FormControl fullWidth>
-              <InputLabel htmlFor="QuotaRemindThreshold">
-                {t('setting_index.operationSettings.monitoringSettings.quotaRemindThreshold.label')}
-              </InputLabel>
-              <OutlinedInput
-                id="QuotaRemindThreshold"
-                name="QuotaRemindThreshold"
-                type="number"
-                value={inputs.QuotaRemindThreshold}
-                onChange={handleInputChange}
-                label={t('setting_index.operationSettings.monitoringSettings.quotaRemindThreshold.label')}
-                placeholder={t('setting_index.operationSettings.monitoringSettings.quotaRemindThreshold.placeholder')}
-                disabled={loading}
               />
             </FormControl>
           </Stack>
@@ -1956,265 +1826,103 @@ const OperationSetting = () => {
         </Stack>
       </SubCard>
 
-      <SubCard title={t('setting_index.operationSettings.codexSettings.title')}>
-        <Stack spacing={2.5}>
-          <Box
-            sx={{
-              border: '1px solid',
-              borderColor: 'divider',
-              borderRadius: 1,
-              p: { xs: 2, md: 2.5 },
-              bgcolor: 'background.default'
-            }}
-          >
+      <SubCard title={t('setting_index.operationSettings.codexSettings.affinitySectionTitle')}>
+        <Stack spacing={2}>
+          {routingDrafts.channelAffinity?.stale && (
+            <Alert
+              severity="warning"
+              action={
+                <Button color="inherit" size="small" onClick={() => reloadRoutingSection('channelAffinity')} disabled={loading}>
+                  {loading ? '加载中…' : '加载最新数据并重新编辑'}
+                </Button>
+              }
+              sx={{ alignItems: 'center' }}
+            >
+              {ROUTING_STALE_MESSAGE}
+            </Alert>
+          )}
+          <Typography variant="body2" color="text.secondary">
+            {t('setting_index.operationSettings.codexSettings.affinityDescription')}
+          </Typography>
+          <Box sx={{ border: '1px solid', borderColor: 'divider', borderRadius: 1, p: 2 }}>
             <Stack spacing={2}>
-              <Stack direction={{ xs: 'column', md: 'row' }} spacing={2} alignItems={{ xs: 'stretch', md: 'flex-start' }}>
-                <Stack spacing={0.75} sx={{ flexGrow: 1 }}>
-                  <Chip
-                    label={t('setting_index.operationSettings.codexSettings.globalOptionBadge')}
-                    size="small"
-                    color="info"
-                    variant="outlined"
-                    sx={{ alignSelf: 'flex-start', fontWeight: 600 }}
-                  />
-                  <Typography variant="h4" sx={{ fontWeight: 700 }}>
-                    {t('setting_index.operationSettings.codexSettings.decisionTitle')}
-                  </Typography>
-                  <Typography variant="body2" color="text.secondary">
-                    {t('setting_index.operationSettings.codexSettings.description')}
-                  </Typography>
-                </Stack>
-                <Box
-                  sx={{
-                    display: 'grid',
-                    gridTemplateColumns: { xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))', md: 'repeat(2, minmax(220px, 1fr))' },
-                    gap: 1.25,
-                    minWidth: { md: 460 }
-                  }}
-                >
-                  {renderCodexQuickAction({
-                    icon: <AutoFixHighIcon />,
-                    title: t('setting_index.operationSettings.codexSettings.quickActions.recommended.title'),
-                    body: t('setting_index.operationSettings.codexSettings.quickActions.recommended.body'),
-                    onClick: applyCodexRecommendedPreset
-                  })}
-                  {renderCodexQuickAction({
-                    icon: <RestoreIcon />,
-                    title: t('setting_index.operationSettings.codexSettings.quickActions.safeDefault.title'),
-                    body: t('setting_index.operationSettings.codexSettings.quickActions.safeDefault.body'),
-                    onClick: applyCodexSafeDefaults,
-                    color: 'inherit'
-                  })}
-                </Box>
-              </Stack>
-              <Alert severity="warning">{t('setting_index.operationSettings.codexSettings.globalWarning')}</Alert>
-            </Stack>
-          </Box>
-
-          <Box
-            sx={{
-              display: 'grid',
-              gridTemplateColumns: { xs: '1fr', md: 'repeat(4, minmax(0, 1fr))' },
-              gap: 1.5
-            }}
-          >
-            {renderCodexSummaryItem({
-              label: t('setting_index.operationSettings.codexSettings.summary.affinityMode'),
-              value: affinityModeLabel,
-              detail: t('setting_index.operationSettings.codexSettings.summary.ruleCount', {
-                count: enabledAffinityRules,
-                total: inputs.channelAffinityForm.rules.length
-              }),
-              color: inputs.channelAffinityBackendDefault ? 'success' : inputs.channelAffinityForm.enabled ? 'warning' : 'error'
-            })}
-            {renderCodexSummaryItem({
-              label: t('setting_index.operationSettings.codexSettings.summary.hintStrategy'),
-              value: inputs.codexRoutingHintForm.prompt_cache_key_strategy,
-              detail: t('setting_index.operationSettings.codexSettings.summary.hintScope', { scope: codexHintScope }),
-              color: codexHintEnabled ? 'success' : 'default'
-            })}
-            {renderCodexSummaryItem({
-              label: t('setting_index.operationSettings.codexSettings.summary.waitBudget'),
-              value: `${inputs.PreferredChannelWaitMilliseconds || 0} / ${inputs.PreferredChannelWaitPollMilliseconds || 50} ms`,
-              detail: t('setting_index.operationSettings.codexSettings.summary.waitBudgetDetail'),
-              color: Number(inputs.PreferredChannelWaitMilliseconds) > 0 ? 'warning' : 'default'
-            })}
-            {renderCodexSummaryItem({
-              label: t('setting_index.operationSettings.codexSettings.summary.storage'),
-              value: t('setting_index.operationSettings.codexSettings.summary.globalOption'),
-              detail: t('setting_index.operationSettings.codexSettings.summary.storageDetail'),
-              color: 'info'
-            })}
-          </Box>
-
-          <Box
-            sx={{
-              display: 'grid',
-              gridTemplateColumns: { xs: '1fr', md: 'repeat(3, minmax(0, 1fr))' },
-              gap: 1.5
-            }}
-          >
-            {['request', 'hint', 'affinity'].map(renderCodexFlowStep)}
-          </Box>
-
-          <Box
-            sx={{
-              display: 'grid',
-              gridTemplateColumns: { xs: '1fr', lg: 'minmax(0, 1fr) minmax(0, 1fr)' },
-              gap: 2
-            }}
-          >
-            <Box sx={{ border: '1px solid', borderColor: 'divider', borderRadius: 1, p: 2 }}>
-              <Stack spacing={2}>
-                <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1}>
-                  {renderCodexFieldTitle(
-                    'ChannelAffinitySetting',
-                    t('setting_index.operationSettings.codexSettings.channelAffinitySetting.label')
-                  )}
-                  <Chip
-                    label={
-                      inputs.channelAffinityBackendDefault
-                        ? t('setting_index.operationSettings.codexSettings.summary.backendDefault')
-                        : t('setting_index.operationSettings.codexSettings.summary.customOverride')
-                    }
-                    color={inputs.channelAffinityBackendDefault ? 'success' : 'warning'}
-                    size="small"
-                    variant="outlined"
-                  />
-                </Stack>
-                <Typography variant="body2" color="text.secondary">
-                  {t('setting_index.operationSettings.codexSettings.channelAffinitySetting.help')}
-                </Typography>
-                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
-                  <Button
-                    variant="outlined"
-                    size="small"
-                    startIcon={<CheckCircleOutlineIcon />}
-                    onClick={() => applyCodexTemplate('ChannelAffinitySetting', '')}
-                    disabled={loading}
-                  >
-                    {t('setting_index.operationSettings.codexSettings.channelAffinitySetting.useBlankDefault')}
-                  </Button>
-                  <Button
-                    variant="outlined"
-                    size="small"
-                    startIcon={<AutoFixHighIcon />}
-                    onClick={() => applyCodexTemplate('ChannelAffinitySetting', CHANNEL_AFFINITY_DEFAULT_TEMPLATE)}
-                    disabled={loading}
-                  >
-                    {t('setting_index.operationSettings.codexSettings.channelAffinitySetting.useDefault')}
-                  </Button>
-                </Stack>
-                {inputs.channelAffinityBackendDefault ? (
-                  <Alert severity="success">
-                    {t('setting_index.operationSettings.codexSettings.channelAffinitySetting.backendDefaultAlert')}
-                  </Alert>
-                ) : (
-                  <Alert severity="warning">{t('setting_index.operationSettings.codexSettings.channelAffinitySetting.customAlert')}</Alert>
-                )}
-                <Stack direction={{ xs: 'column', md: 'row' }} spacing={2} alignItems={{ xs: 'stretch', md: 'center' }}>
-                  <FormControlLabel
-                    control={
-                      <Switch
-                        checked={Boolean(inputs.channelAffinityForm.enabled)}
-                        onChange={(event) => updateChannelAffinityForm('enabled', event.target.checked)}
-                        disabled={loading}
-                      />
-                    }
-                    label={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.fields.enabled')}
-                  />
-                  <TextField
-                    fullWidth
-                    type="number"
-                    label={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.fields.defaultTTL')}
-                    value={inputs.channelAffinityForm.default_ttl_seconds}
-                    onChange={(event) => updateChannelAffinityForm('default_ttl_seconds', event.target.value)}
-                    inputProps={{ min: 0, step: 1, inputMode: 'numeric' }}
-                    disabled={loading}
-                  />
-                  <TextField
-                    fullWidth
-                    type="number"
-                    label={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.fields.maxEntries')}
-                    value={inputs.channelAffinityForm.max_entries}
-                    onChange={(event) => updateChannelAffinityForm('max_entries', event.target.value)}
-                    inputProps={{ min: 0, step: 1, inputMode: 'numeric' }}
-                    disabled={loading}
-                  />
-                </Stack>
-              </Stack>
-            </Box>
-
-            <Box sx={{ border: '1px solid', borderColor: 'divider', borderRadius: 1, p: 2 }}>
-              <Stack spacing={2}>
+              <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1}>
                 {renderCodexFieldTitle(
-                  'CodexRoutingHintSetting',
-                  t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.label')
+                  'ChannelAffinitySetting',
+                  t('setting_index.operationSettings.codexSettings.channelAffinitySetting.label')
                 )}
-                <Typography variant="body2" color="text.secondary">
-                  {t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.help')}
-                </Typography>
-                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
-                  <Button
-                    variant="outlined"
-                    size="small"
-                    startIcon={<AutoFixHighIcon />}
-                    onClick={() => applyCodexTemplate('CodexRoutingHintSetting', JSON.stringify(CODEX_ROUTING_HINT_RECOMMENDED, null, 2))}
-                    disabled={loading}
-                  >
-                    {t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.useRecommended')}
-                  </Button>
-                  <Button
-                    variant="outlined"
-                    size="small"
-                    startIcon={<RestoreIcon />}
-                    onClick={() => applyCodexTemplate('CodexRoutingHintSetting', CODEX_ROUTING_HINT_DEFAULT_TEMPLATE)}
-                    disabled={loading}
-                  >
-                    {t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.useDefault')}
-                  </Button>
-                </Stack>
-                <TextField
-                  select
-                  fullWidth
-                  id="CodexRoutingHintStrategy"
-                  label={t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.fields.strategy')}
-                  value={inputs.codexRoutingHintForm.prompt_cache_key_strategy}
-                  onChange={(event) => updateCodexRoutingHintForm('prompt_cache_key_strategy', event.target.value)}
-                  disabled={loading}
-                  SelectProps={{ renderValue: (value) => value }}
-                >
-                  {PROMPT_CACHE_STRATEGIES.map((strategy) => (
-                    <MenuItem key={strategy} value={strategy}>
-                      <Stack spacing={0.25}>
-                        <Typography variant="body2">{strategy}</Typography>
-                        <Typography variant="caption" color="text.secondary">
-                          {t(`setting_index.operationSettings.codexSettings.codexRoutingHintSetting.strategyDescriptions.${strategy}`)}
-                        </Typography>
-                      </Stack>
-                    </MenuItem>
-                  ))}
-                </TextField>
-                <Stack direction={{ xs: 'column', md: 'row' }} spacing={2}>
-                  <TextField
-                    fullWidth
-                    id="CodexRoutingHintModelRegex"
-                    label={t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.fields.modelRegex')}
-                    value={inputs.codexRoutingHintForm.model_regex}
-                    onChange={(event) => updateCodexRoutingHintForm('model_regex', event.target.value)}
-                    disabled={loading}
-                  />
-                  <TextField
-                    fullWidth
-                    id="CodexRoutingHintUserAgentRegex"
-                    label={t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.fields.userAgentRegex')}
-                    value={inputs.codexRoutingHintForm.user_agent_regex}
-                    onChange={(event) => updateCodexRoutingHintForm('user_agent_regex', event.target.value)}
-                    disabled={loading}
-                  />
-                </Stack>
+                <Chip
+                  label={
+                    inputs.channelAffinityBackendDefault
+                      ? t('setting_index.operationSettings.codexSettings.summary.backendDefault')
+                      : t('setting_index.operationSettings.codexSettings.summary.customOverride')
+                  }
+                  color={inputs.channelAffinityBackendDefault ? 'success' : 'warning'}
+                  size="small"
+                  variant="outlined"
+                />
               </Stack>
-            </Box>
+              <Typography variant="body2" color="text.secondary">
+                {t('setting_index.operationSettings.codexSettings.channelAffinitySetting.help')}
+              </Typography>
+              <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
+                <Button
+                  variant="outlined"
+                  size="small"
+                  startIcon={<CheckCircleOutlineIcon />}
+                  onClick={() => applyCodexTemplate('ChannelAffinitySetting', '')}
+                  disabled={loading}
+                >
+                  {t('setting_index.operationSettings.codexSettings.channelAffinitySetting.useBlankDefault')}
+                </Button>
+                <Button
+                  variant="outlined"
+                  size="small"
+                  startIcon={<AutoFixHighIcon />}
+                  onClick={() => applyCodexTemplate('ChannelAffinitySetting', CHANNEL_AFFINITY_DEFAULT_TEMPLATE)}
+                  disabled={loading}
+                >
+                  {t('setting_index.operationSettings.codexSettings.channelAffinitySetting.useDefault')}
+                </Button>
+              </Stack>
+              {inputs.channelAffinityBackendDefault ? (
+                <Alert severity="success">
+                  {t('setting_index.operationSettings.codexSettings.channelAffinitySetting.backendDefaultAlert')}
+                </Alert>
+              ) : (
+                <Alert severity="warning">{t('setting_index.operationSettings.codexSettings.channelAffinitySetting.customAlert')}</Alert>
+              )}
+              <Stack direction={{ xs: 'column', md: 'row' }} spacing={2} alignItems={{ xs: 'stretch', md: 'center' }}>
+                <FormControlLabel
+                  control={
+                    <Switch
+                      checked={Boolean(inputs.channelAffinityForm.enabled)}
+                      onChange={(event) => updateChannelAffinityForm('enabled', event.target.checked)}
+                      disabled={loading}
+                    />
+                  }
+                  label={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.fields.enabled')}
+                />
+                <TextField
+                  fullWidth
+                  type="number"
+                  label={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.fields.defaultTTL')}
+                  value={inputs.channelAffinityForm.default_ttl_seconds}
+                  onChange={(event) => updateChannelAffinityForm('default_ttl_seconds', event.target.value)}
+                  inputProps={{ min: 0, step: 1, inputMode: 'numeric' }}
+                  disabled={loading}
+                />
+                <TextField
+                  fullWidth
+                  type="number"
+                  label={t('setting_index.operationSettings.codexSettings.channelAffinitySetting.fields.maxEntries')}
+                  value={inputs.channelAffinityForm.max_entries}
+                  onChange={(event) => updateChannelAffinityForm('max_entries', event.target.value)}
+                  inputProps={{ min: 0, step: 1, inputMode: 'numeric' }}
+                  disabled={loading}
+                />
+              </Stack>
+            </Stack>
           </Box>
 
           <Box sx={{ border: '1px solid', borderColor: 'divider', borderRadius: 1, p: 2 }}>
@@ -2275,7 +1983,7 @@ const OperationSetting = () => {
             </Stack>
           </Box>
 
-          {/* Trade-off: keep the low-risk configuration path visible and move full rule editing behind one advanced section. */}
+          {/* 完整规则编辑保持折叠，不影响常用设置。 */}
           <Accordion
             disableGutters
             sx={{
@@ -2332,17 +2040,104 @@ const OperationSetting = () => {
             </AccordionDetails>
           </Accordion>
 
-          <Button
-            variant="contained"
-            onClick={() => {
-              submitConfig('codex').then();
-            }}
-          >
+          <Button variant="contained" disabled={loading || routingDrafts.channelAffinity?.stale} onClick={() => submitRoutingSettings('channelAffinity')}>
             {t('setting_index.operationSettings.codexSettings.save')}
           </Button>
-          {renderCodexHelpDialog()}
         </Stack>
       </SubCard>
+
+      <SubCard title={t('setting_index.operationSettings.codexSettings.codexHintSectionTitle')}>
+        <Stack spacing={2}>
+          {routingDrafts.codexHint?.stale && (
+            <Alert
+              severity="warning"
+              action={
+                <Button color="inherit" size="small" onClick={() => reloadRoutingSection('codexHint')} disabled={loading}>
+                  {loading ? '加载中…' : '加载最新数据并重新编辑'}
+                </Button>
+              }
+              sx={{ alignItems: 'center' }}
+            >
+              {ROUTING_STALE_MESSAGE}
+            </Alert>
+          )}
+          <Box sx={{ border: '1px solid', borderColor: 'divider', borderRadius: 1, p: 2 }}>
+            <Stack spacing={2}>
+              {renderCodexFieldTitle(
+                'CodexRoutingHintSetting',
+                t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.label')
+              )}
+              <Typography variant="body2" color="text.secondary">
+                {t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.help')}
+              </Typography>
+              <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
+                <Button
+                  variant="outlined"
+                  size="small"
+                  startIcon={<AutoFixHighIcon />}
+                  onClick={() => applyCodexTemplate('CodexRoutingHintSetting', JSON.stringify(CODEX_ROUTING_HINT_RECOMMENDED, null, 2))}
+                  disabled={loading}
+                >
+                  {t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.useRecommended')}
+                </Button>
+                <Button
+                  variant="outlined"
+                  size="small"
+                  startIcon={<RestoreIcon />}
+                  onClick={() => applyCodexTemplate('CodexRoutingHintSetting', CODEX_ROUTING_HINT_DEFAULT_TEMPLATE)}
+                  disabled={loading}
+                >
+                  {t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.useDefault')}
+                </Button>
+              </Stack>
+              <TextField
+                select
+                fullWidth
+                id="CodexRoutingHintStrategy"
+                label={t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.fields.strategy')}
+                value={inputs.codexRoutingHintForm.prompt_cache_key_strategy}
+                onChange={(event) => updateCodexRoutingHintForm('prompt_cache_key_strategy', event.target.value)}
+                disabled={loading}
+                SelectProps={{ renderValue: (value) => value }}
+              >
+                {PROMPT_CACHE_STRATEGIES.map((strategy) => (
+                  <MenuItem key={strategy} value={strategy}>
+                    <Stack spacing={0.25}>
+                      <Typography variant="body2">{strategy}</Typography>
+                      <Typography variant="caption" color="text.secondary">
+                        {t(`setting_index.operationSettings.codexSettings.codexRoutingHintSetting.strategyDescriptions.${strategy}`)}
+                      </Typography>
+                    </Stack>
+                  </MenuItem>
+                ))}
+              </TextField>
+              <Stack direction={{ xs: 'column', md: 'row' }} spacing={2}>
+                <TextField
+                  fullWidth
+                  id="CodexRoutingHintModelRegex"
+                  label={t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.fields.modelRegex')}
+                  value={inputs.codexRoutingHintForm.model_regex}
+                  onChange={(event) => updateCodexRoutingHintForm('model_regex', event.target.value)}
+                  disabled={loading}
+                />
+                <TextField
+                  fullWidth
+                  id="CodexRoutingHintUserAgentRegex"
+                  label={t('setting_index.operationSettings.codexSettings.codexRoutingHintSetting.fields.userAgentRegex')}
+                  value={inputs.codexRoutingHintForm.user_agent_regex}
+                  onChange={(event) => updateCodexRoutingHintForm('user_agent_regex', event.target.value)}
+                  disabled={loading}
+                />
+              </Stack>
+            </Stack>
+          </Box>
+
+          <Button variant="contained" disabled={loading || routingDrafts.codexHint?.stale} onClick={() => submitRoutingSettings('codexHint')}>
+            {t('setting_index.operationSettings.codexSettings.saveCodexHint')}
+          </Button>
+        </Stack>
+      </SubCard>
+      {renderCodexHelpDialog()}
 
       <SubCard title={t('setting_index.operationSettings.safetySettings.title')}>
         <Stack spacing={2}>

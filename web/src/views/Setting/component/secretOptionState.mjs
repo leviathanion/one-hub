@@ -13,8 +13,6 @@ export const SYSTEM_SECRET_OPTION_KEYS = [
   'OIDCClientSecret'
 ];
 
-export const OPERATION_SECRET_OPTION_KEYS = ['CFWorkerImageKey'];
-
 export const SECRET_OPTION_DEPENDENT_TOGGLES = Object.freeze({
   GitHubClientSecret: 'GitHubOAuthEnabled',
   WeChatServerToken: 'WeChatAuthEnabled',

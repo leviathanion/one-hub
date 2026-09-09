@@ -1,4 +1,4 @@
-import { useState, useEffect, useContext } from 'react';
+import { useState, useEffect, useContext, useRef } from 'react';
 import SubCard from 'ui-component/cards/SubCard';
 import {
   Stack,
@@ -40,19 +40,21 @@ const OtherSetting = () => {
     content: ''
   });
   const loadStatus = useContext(LoadStatusContext);
+  const optionVersion = useRef(0);
 
   const getOptions = async () => {
     try {
       const res = await API.get('/api/option/');
-      const { success, message, data } = res.data;
+      const { success, message, data, version } = res.data;
       if (success) {
         let newInputs = {};
         data.forEach((item) => {
           if (item.key in inputs) {
-            newInputs[item.key] = item.value;
+            newInputs[item.key] = item.effective;
           }
         });
         setInputs(newInputs);
+        optionVersion.current = version;
       } else {
         showError(message);
       }
@@ -71,19 +73,23 @@ const OtherSetting = () => {
     try {
       const res = await API.put('/api/option/', {
         key,
-        value
+        value,
+        expected_version: optionVersion.current
       });
-      const { success, message } = res.data;
+      const { success, message, version } = res.data;
       if (success) {
+        optionVersion.current = version;
         showSuccess('保存成功');
         getOptions();
         await loadStatus();
       } else {
         showError(message);
       }
-      setLoading(false);
     } catch (error) {
-      return;
+      showError(error?.response?.data?.message || error.message);
+      await getOptions();
+    } finally {
+      setLoading(false);
     }
   };
 

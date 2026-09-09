@@ -1,4 +1,4 @@
-import { useState, useEffect, useContext } from 'react';
+import { useState, useEffect, useContext, useRef } from 'react';
 import SubCard from 'ui-component/cards/SubCard';
 import {
   Stack,
@@ -48,7 +48,6 @@ const defaultInputs = {
   GitHubOAuthEnabled: '',
   GitHubClientId: '',
   GitHubClientSecret: '',
-  GitHubOldIdCloseEnabled: '',
   LarkAuthEnabled: '',
   LarkClientId: '',
   LarkClientSecret: '',
@@ -87,15 +86,16 @@ const SystemSetting = () => {
   const [EmailDomainWhitelist, setEmailDomainWhitelist] = useState([]);
   const [showPasswordWarningModal, setShowPasswordWarningModal] = useState(false);
   const loadStatus = useContext(LoadStatusContext);
+  const optionVersion = useRef(0);
 
   const getOptions = async () => {
     try {
       const res = await API.get('/api/option/');
-      const { success, message, data, meta } = res.data;
+      const { success, message, data, meta, version } = res.data;
       if (success) {
         let newInputs = { ...defaultInputs };
         data.forEach((item) => {
-          newInputs[item.key] = item.value;
+          newInputs[item.key] = item.effective;
         });
         const emailDomains = (newInputs.EmailDomainWhitelist || '').split(',');
         setInputs({
@@ -106,6 +106,7 @@ const SystemSetting = () => {
         setSecretStates(mergeSecretStatesFromMeta(SYSTEM_SECRET_OPTION_KEYS, meta?.sensitive_options));
 
         setEmailDomainWhitelist(emailDomains);
+        optionVersion.current = version;
       } else {
         showError(message);
       }
@@ -140,7 +141,6 @@ const SystemSetting = () => {
       case 'PasswordLoginEnabled':
       case 'PasswordRegisterEnabled':
       case 'EmailVerificationEnabled':
-      case 'GitHubOldIdCloseEnabled':
       case 'RegisterEnabled':
         value = inputs[key] === 'true' ? 'false' : 'true';
         break;
@@ -151,10 +151,12 @@ const SystemSetting = () => {
     try {
       const res = await API.put('/api/option/', {
         key,
-        value: normalizeOptionPayloadValue(value)
+        value: normalizeOptionPayloadValue(value),
+        expected_version: optionVersion.current
       });
-      const { success, message } = res.data;
+      const { success, message, version } = res.data;
       if (success) {
+        optionVersion.current = version;
         if (key === 'EmailDomainWhitelist') {
           value = value.split(',');
         }
@@ -169,19 +171,23 @@ const SystemSetting = () => {
       }
     } catch (error) {
       showError(getRequestErrorMessage(error, '设置失败'));
+      await getOptions();
     } finally {
       setLoading(false);
     }
   };
 
   const putOptionBatchOrThrow = async (updates) => {
+    if (updates.length === 0) return;
     try {
-      const res = await API.put('/api/option/batch', { updates });
-      const { success, message } = res.data;
+      const res = await API.put('/api/option/batch', { updates, expected_version: optionVersion.current });
+      const { success, message, version } = res.data;
       if (!success) {
         throw new Error(message || '设置失败');
       }
+      optionVersion.current = version;
     } catch (error) {
+      await getOptions();
       throw new Error(getRequestErrorMessage(error, '设置失败'));
     }
   };
@@ -411,19 +417,6 @@ const SystemSetting = () => {
               <FormControlLabel
                 label={t('setting_index.systemSettings.configureLoginRegister.registerEnabled')}
                 control={<Checkbox checked={inputs.RegisterEnabled === 'true'} onChange={handleInputChange} name="RegisterEnabled" />}
-              />
-            </Grid>
-
-            <Grid xs={12} md={3}>
-              <FormControlLabel
-                label={t('setting_index.systemSettings.configureLoginRegister.gitHubOldIdClose')}
-                control={
-                  <Checkbox
-                    checked={inputs.GitHubOldIdCloseEnabled === 'true'}
-                    onChange={handleInputChange}
-                    name="GitHubOldIdCloseEnabled"
-                  />
-                }
               />
             </Grid>
           </Grid>
