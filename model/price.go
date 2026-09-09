@@ -58,8 +58,6 @@ var ExtraKeyIsPrompt = map[string]bool{
 	config.UsageExtraOutputImageTokens:       false,
 	config.UsageExtraInputVideoTokens:        true,
 	config.UsageExtraOutputVideoTokens:       false,
-	config.UsageExtraDeepSeekCacheHit:        true,
-	config.UsageExtraDeepSeekCacheMiss:       true,
 }
 
 func GetExtraPriceIsPrompt(key string) bool {
@@ -81,8 +79,6 @@ var defaultExtraPrice = map[string]float64{
 	config.UsageExtraOutputTextTokens:   1,
 	config.UsageExtraInputVideoTokens:   1,
 	config.UsageExtraOutputVideoTokens:  1,
-	config.UsageExtraDeepSeekCacheHit:   0.1,
-	config.UsageExtraDeepSeekCacheMiss:  1,
 }
 
 type Price struct {

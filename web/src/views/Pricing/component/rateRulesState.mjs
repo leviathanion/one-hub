@@ -15,9 +15,7 @@ export const RATE_EXTRA_KEYS = [
   'input_image_tokens',
   'output_image_tokens',
   'input_video_tokens',
-  'output_video_tokens',
-  'deepseek_cache_hit_tokens',
-  'deepseek_cache_miss_tokens'
+  'output_video_tokens'
 ];
 export const rateRulesApplyToBillingType = (type) => type === 'tokens';
 export const getRateGroupRules = (rules, group) => (group === 'schedule' ? rules?.schedule?.rules || [] : rules?.[group] || []);

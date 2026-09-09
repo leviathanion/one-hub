@@ -68,10 +68,10 @@ func (u *Usage) UnmarshalJSON(data []byte) error {
 		markUsageDetailPresence(u.ProviderTokenFields, fields["prompt_tokens_details"], true)
 		markUsageDetailPresence(u.ProviderTokenFields, fields["completion_tokens_details"], false)
 		if validUsageInteger(fields["prompt_cache_hit_tokens"]) {
-			u.ProviderTokenFields[config.UsageExtraDeepSeekCacheHit] = true
+			u.ProviderTokenFields["prompt_cache_hit_tokens"] = true
 		}
 		if validUsageInteger(fields["prompt_cache_miss_tokens"]) {
-			u.ProviderTokenFields[config.UsageExtraDeepSeekCacheMiss] = true
+			u.ProviderTokenFields["prompt_cache_miss_tokens"] = true
 		}
 	}
 	return nil

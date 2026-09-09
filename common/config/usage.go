@@ -19,6 +19,4 @@ const (
 	UsageExtraOutputImageTokens       = "output_image_tokens"       // 输出图像
 	UsageExtraInputVideoTokens        = "input_video_tokens"
 	UsageExtraOutputVideoTokens       = "output_video_tokens"
-	UsageExtraDeepSeekCacheHit        = "deepseek_cache_hit_tokens"
-	UsageExtraDeepSeekCacheMiss       = "deepseek_cache_miss_tokens"
 )
