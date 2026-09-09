@@ -29,6 +29,8 @@ var defaultCORSAllowHeaders = []string{
 	"X-Session-Id",
 	"Session-Id",
 	"OpenAI-Beta",
+	"OpenAI-Safety-Identifier",
+	"Idempotency-Key",
 	"Sec-WebSocket-Protocol",
 }
 
