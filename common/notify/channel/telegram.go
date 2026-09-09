@@ -47,7 +47,7 @@ func (t *Telegram) Send(ctx context.Context, title, message string) error {
 
 	client := requester.NewHTTPRequester(t.httpProxy, telegramErrFunc)
 	client.Context = ctx
-	client.IsOpenAI = false
+	client.PrefixProviderErrors = false
 
 	for _, msg := range messages {
 		err := t.sendMessage(msg, client)

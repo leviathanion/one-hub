@@ -22,7 +22,7 @@ func (p *OpenAIProvider) CreateSpeech(request *types.SpeechAudioRequest) (*http.
 	}
 
 	if resp.Header.Get("Content-Type") == "application/json" {
-		return nil, requester.HandleErrorResp(resp, p.Requester.ErrorHandler, p.Requester.IsOpenAI)
+		return nil, requester.HandleErrorResp(resp, p.Requester.ErrorHandler, p.Requester.PrefixProviderErrors, p.Requester.ReplayOpenAIErrorEnvelopes)
 	}
 
 	p.Usage.TotalTokens = p.Usage.PromptTokens

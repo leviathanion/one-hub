@@ -75,7 +75,7 @@ func (d *DingTalk) Send(ctx context.Context, title, message string) error {
 
 	client := requester.NewHTTPRequester("", dingtalkErrFunc)
 	client.Context = ctx
-	client.IsOpenAI = false
+	client.PrefixProviderErrors = false
 
 	req, err := client.NewRequest(http.MethodPost, uri, client.WithHeader(requester.GetJsonHeaders()), client.WithBody(msg))
 	if err != nil {

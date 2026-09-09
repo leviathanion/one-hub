@@ -39,7 +39,7 @@ func (s *Searxng) Query(query string) (*search_type.SearchResponses, error) {
 	queryUrl = strings.Replace(s.Url, "{query}", queryUrl, 1)
 
 	client := requester.NewHTTPRequester("", nil)
-	client.IsOpenAI = false
+	client.PrefixProviderErrors = false
 
 	req, err := client.NewRequest(http.MethodGet, queryUrl, client.WithHeader(requester.GetJsonHeaders()))
 	if err != nil {

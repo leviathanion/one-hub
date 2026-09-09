@@ -22,7 +22,13 @@ var StreamClosed = []byte("stream_closed")
 
 var ErrStreamLineTooLarge = errors.New("stream line exceeds configured read limit")
 
+// ErrStreamProtocolTerminalMissing means a stream whose protocol promises an
+// explicit terminal marker reached the transport EOF without observing it.
+var ErrStreamProtocolTerminalMissing = errors.New("provider stream ended without protocol terminal")
+
 var streamErrorSendTimeout = time.Second
+
+const defaultProviderStreamMaxLineBytes int64 = 16 << 20
 
 type HandlerPrefix[T streamable] func(rawLine *[]byte, dataChan chan T, errChan chan error)
 type HandlerPrefixWithEmitter[T streamable] func(rawLine *[]byte, emitter StreamEmitter[T])
@@ -37,6 +43,21 @@ type StreamReaderInterface[T streamable] interface {
 	// Close must be idempotent and safe to call concurrently. Implementations
 	// should make the channels returned by Recv stop blocking or close promptly.
 	Close()
+}
+
+// CloseAndDrainStream closes a stream and, when supported by its concrete
+// implementation, drains the delivery channels until the reader exits. The
+// drain is what releases legacy handlers that may already be blocked in a raw
+// channel send when their downstream consumer stops early.
+func CloseAndDrainStream[T streamable](stream StreamReaderInterface[T]) {
+	if stream == nil {
+		return
+	}
+	if drainable, ok := stream.(interface{ CloseAndDrain() }); ok {
+		drainable.CloseAndDrain()
+		return
+	}
+	stream.Close()
 }
 
 type streamReader[T streamable] struct {
@@ -57,7 +78,19 @@ type streamReader[T streamable] struct {
 }
 
 type StreamReadOptions struct {
-	MaxLineBytes int64
+	MaxLineBytes            int64
+	RequireProtocolTerminal bool
+	// ProtocolTerminalPredicate is consulted only for transport EOF. A true
+	// result preserves io.EOF as the handler's valid protocol terminal while
+	// all other read errors, including timeouts, keep their original meaning.
+	ProtocolTerminalPredicate func() bool
+}
+
+func normalizeStreamReadOptions(options StreamReadOptions) StreamReadOptions {
+	if options.MaxLineBytes <= 0 {
+		options.MaxLineBytes = defaultProviderStreamMaxLineBytes
+	}
+	return options
 }
 
 type StreamEmitter[T streamable] struct {
@@ -116,6 +149,15 @@ func (stream *streamReader[T]) processLines() {
 	for {
 		rawLine, readErr := stream.readLine()
 		if readErr != nil {
+			if errors.Is(readErr, io.EOF) && stream.options.RequireProtocolTerminal {
+				terminalObserved := false
+				if stream.options.ProtocolTerminalPredicate != nil {
+					terminalObserved = stream.options.ProtocolTerminalPredicate()
+				}
+				if !terminalObserved {
+					readErr = ErrStreamProtocolTerminalMissing
+				}
+			}
 			if errors.Is(readErr, ErrStreamLineTooLarge) {
 				if stream.response != nil && stream.response.Body != nil {
 					_ = stream.response.Body.Close()
@@ -203,6 +245,26 @@ func (stream *streamReader[T]) Close() {
 			_ = stream.response.Body.Close()
 		}
 	})
+}
+
+func (stream *streamReader[T]) CloseAndDrain() {
+	if stream == nil {
+		return
+	}
+	dataChan, errChan := stream.Recv()
+	stream.Close()
+	for dataChan != nil || errChan != nil {
+		select {
+		case _, ok := <-dataChan:
+			if !ok {
+				dataChan = nil
+			}
+		case _, ok := <-errChan:
+			if !ok {
+				errChan = nil
+			}
+		}
+	}
 }
 
 func (stream *streamReader[T]) finish() {

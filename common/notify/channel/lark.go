@@ -98,7 +98,7 @@ func (l *Lark) Send(ctx context.Context, title, message string) error {
 	uri := larkURL + l.token
 	client := requester.NewHTTPRequester("", larkErrFunc)
 	client.Context = ctx
-	client.IsOpenAI = false
+	client.PrefixProviderErrors = false
 
 	req, err := client.NewRequest(http.MethodPost, uri, client.WithHeader(requester.GetJsonHeaders()), client.WithBody(msg))
 	if err != nil {

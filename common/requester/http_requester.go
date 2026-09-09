@@ -5,27 +5,74 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
+	"net/url"
 	"one-api/common"
+	"one-api/common/logger"
+	"one-api/common/providerresponse"
+	"one-api/common/requestctx"
 	"one-api/common/utils"
 	"one-api/types"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unicode"
 
 	"github.com/gin-gonic/gin"
 )
 
 type HttpErrorHandler func(*http.Response) *types.OpenAIError
 
+const maxProviderErrorBodyBytes int64 = 1 << 20
+const maxProviderRawJSONBodyBytes int64 = 64 << 20
+const maxProviderErrorJSONDepth = 64
+
+var errProviderRawJSONBodyTooLarge = fmt.Errorf("provider response body exceeds %d bytes", maxProviderRawJSONBodyBytes)
+
+// ProviderRawJSON captures the provider response before adapters normalize it.
+// Capturing raw JSON does not by itself authorize replaying it to the client.
+type ProviderRawJSON interface {
+	SetProviderRawJSON([]byte)
+	ProviderRawJSON() []byte
+}
+
+// ProviderRawJSONCapturer is the explicit buffering opt-in. Merely
+// implementing ProviderRawJSON must not turn every successful response into
+// an unbounded in-memory replay buffer.
+type ProviderRawJSONCapturer interface {
+	ProviderRawJSON
+	CaptureProviderRawJSON() bool
+}
+
+// ProviderRawJSONDecoder lets an exact-wire response extract only the stable
+// evidence the proxy owns without making successful delivery depend on every
+// provider-owned response union fitting the current DTO.
+type ProviderRawJSONDecoder interface {
+	DecodeCapturedProviderJSON([]byte) error
+}
+
+// ProviderRawJSONReplayer is the explicit exact-wire delivery contract.
+// Adapters must opt in only after all response processing is complete.
+type ProviderRawJSONReplayer interface {
+	ReplayProviderRawJSON() []byte
+}
+
 type HTTPRequester struct {
 	// requestBuilder    utils.RequestBuilder
-	CreateFormBuilder func(io.Writer) FormBuilder
-	ErrorHandler      HttpErrorHandler
-	proxyAddr         string
-	Context           context.Context
-	IsOpenAI          bool
+	CreateFormBuilder          func(io.Writer) FormBuilder
+	ErrorHandler               HttpErrorHandler
+	proxyAddr                  string
+	Context                    context.Context
+	PrefixProviderErrors       bool
+	ReplayOpenAIErrorEnvelopes bool
+	profile                    HTTPProfile
+	transports                 *providerHTTPTransportSet
 }
 
 // NewHTTPRequester 创建一个新的 HTTPRequester 实例。
@@ -37,11 +84,53 @@ func NewHTTPRequester(proxyAddr string, errorHandler HttpErrorHandler) *HTTPRequ
 		CreateFormBuilder: func(body io.Writer) FormBuilder {
 			return NewFormBuilder(body)
 		},
-		ErrorHandler: errorHandler,
-		proxyAddr:    proxyAddr,
-		Context:      context.Background(),
-		IsOpenAI:     true,
+		ErrorHandler:         errorHandler,
+		proxyAddr:            proxyAddr,
+		Context:              context.Background(),
+		PrefixProviderErrors: true,
+		profile:              HTTPProfileWorkAction,
+		transports:           providerHTTPTransportsForCurrentClient(),
 	}
+}
+
+func providerHTTPTransportsForCurrentClient() *providerHTTPTransportSet {
+	if HTTPClient == nil {
+		return defaultProviderHTTPTransports
+	}
+	source := HTTPClient.Transport
+	if source == nil {
+		source = http.DefaultTransport
+	}
+	transport, ok := source.(*http.Transport)
+	if !ok {
+		return nil
+	}
+	if defaultProviderHTTPTransports != nil && defaultProviderHTTPTransports.normal == transport {
+		return defaultProviderHTTPTransports
+	}
+	return newProviderHTTPTransportSet(transport)
+}
+
+// UseHTTPProfile selects one code-owned transport policy for subsequent
+// requests made by this requester. It does not change protocol parsing.
+func (r *HTTPRequester) UseHTTPProfile(profile HTTPProfile) {
+	if r == nil {
+		return
+	}
+	r.profile = profile
+}
+
+// ForHTTPProfile returns a request-local view of an already configured
+// requester. Adapters with multi-stage workflows can therefore apply a long
+// stream policy only to the request that actually opens the stream. As with
+// ordinary struct reads, callers must not mutate the base concurrently.
+func (r *HTTPRequester) ForHTTPProfile(profile HTTPProfile) *HTTPRequester {
+	if r == nil {
+		return nil
+	}
+	cloned := *r
+	cloned.profile = profile
+	return &cloned
 }
 
 type requestOptions struct {
@@ -57,6 +146,199 @@ func (r *HTTPRequester) requestContext(ctx context.Context) context.Context {
 		ctx = r.Context
 	}
 	return utils.SetProxy(r.proxyAddr, ctx)
+}
+
+func doHTTPRequest(client *http.Client, req *http.Request, policy httpPolicy, noKeepAlive ...*http.Transport) (*http.Response, error, bool) {
+	if client == nil || req == nil {
+		return nil, errors.New("http client and request are required"), false
+	}
+
+	requestCtx := req.Context()
+	var cancel context.CancelFunc
+	if policy.maxLifetime > 0 {
+		requestCtx, cancel = context.WithTimeout(requestCtx, policy.maxLifetime)
+	} else if policy.responseHeaderTimeout > 0 || policy.bodyIdleTimeout > 0 {
+		requestCtx, cancel = context.WithCancel(requestCtx)
+	}
+
+	var wroteRequest atomic.Bool
+	headerDeadline := newResponseHeaderDeadline(policy.responseHeaderTimeout, cancel)
+	trace := &httptrace.ClientTrace{WroteRequest: func(httptrace.WroteRequestInfo) {
+		wroteRequest.Store(true)
+		headerDeadline.Start()
+	}}
+	// 当前 requester 调用方没有为非安全方法声明上游幂等合同。保留安全读方法
+	// 的 net/http 既有重试路径，但不能让客户端 Idempotency-Key 把自动重建的
+	// 工作请求体变成第二次提交。
+	transportReq := requestWithoutImplicitReplay(req)
+	if requestNeedsNoKeepAlives(req) {
+		if len(noKeepAlive) == 0 || noKeepAlive[0] == nil {
+			if cancel != nil {
+				cancel()
+			}
+			return nil, errNoImplicitReplayTransport, false
+		}
+		clientCopy := *client
+		clientCopy.Transport = noKeepAlive[0]
+		client = &clientCopy
+	}
+	traced := transportReq.WithContext(httptrace.WithClientTrace(requestCtx, trace))
+	resp, err := client.Do(traced)
+	headerDeadline.Stop()
+	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
+		return resp, err, wroteRequest.Load()
+	}
+	if cancel != nil {
+		if resp == nil || resp.Body == nil {
+			cancel()
+		} else {
+			resp.Body = newPolicyResponseBody(resp.Body, requestCtx, cancel, policy.bodyIdleTimeout)
+		}
+	}
+	return resp, err, wroteRequest.Load()
+}
+
+func requestWithoutImplicitReplay(req *http.Request) *http.Request {
+	if req == nil || safeTransportRetryMethod(req.Method) {
+		return req
+	}
+
+	bodyPresent := req.Body != nil && req.Body != http.NoBody
+	if bodyPresent && req.GetBody != nil {
+		cloned := req.Clone(req.Context())
+		cloned.GetBody = nil
+		return cloned
+	}
+
+	return req
+}
+
+func requestNeedsNoKeepAlives(req *http.Request) bool {
+	return req != nil && !safeTransportRetryMethod(req.Method) &&
+		(req.Body == nil || req.Body == http.NoBody)
+}
+
+func safeTransportRetryMethod(method string) bool {
+	switch method {
+	case "", http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return true
+	default:
+		return false
+	}
+}
+
+type responseHeaderDeadline struct {
+	mu      sync.Mutex
+	timeout time.Duration
+	cancel  context.CancelFunc
+	timer   *time.Timer
+	done    bool
+}
+
+func newResponseHeaderDeadline(timeout time.Duration, cancel context.CancelFunc) *responseHeaderDeadline {
+	return &responseHeaderDeadline{timeout: timeout, cancel: cancel}
+}
+
+func (d *responseHeaderDeadline) Start() {
+	if d == nil || d.timeout <= 0 || d.cancel == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.done || d.timer != nil {
+		return
+	}
+	d.timer = time.AfterFunc(d.timeout, d.cancel)
+}
+
+func (d *responseHeaderDeadline) Stop() {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	d.done = true
+	if d.timer != nil {
+		d.timer.Stop()
+	}
+	d.mu.Unlock()
+}
+
+type policyResponseBody struct {
+	body       io.ReadCloser
+	cancel     context.CancelFunc
+	idle       time.Duration
+	stopCancel func() bool
+	closeOnce  sync.Once
+	closeError error
+}
+
+func newPolicyResponseBody(body io.ReadCloser, requestCtx context.Context, cancel context.CancelFunc, idle time.Duration) io.ReadCloser {
+	wrapped := &policyResponseBody{body: body, cancel: cancel, idle: idle}
+	if requestCtx != nil {
+		wrapped.stopCancel = context.AfterFunc(requestCtx, func() {
+			wrapped.close(false)
+		})
+	}
+	return wrapped
+}
+
+func (b *policyResponseBody) Read(p []byte) (int, error) {
+	if b == nil || b.body == nil {
+		return 0, io.EOF
+	}
+	var idleTimer *time.Timer
+	if b.idle > 0 {
+		idleTimer = time.AfterFunc(b.idle, func() {
+			_ = b.Close()
+		})
+	}
+	n, err := b.body.Read(p)
+	idleExpired := false
+	if idleTimer != nil {
+		idleExpired = !idleTimer.Stop()
+	}
+	if err != nil && !idleExpired {
+		_ = b.Close()
+	}
+	return n, err
+}
+
+func (b *policyResponseBody) Close() error {
+	return b.close(true)
+}
+
+func (b *policyResponseBody) close(stopCancelObserver bool) error {
+	if b == nil {
+		return nil
+	}
+	b.closeOnce.Do(func() {
+		if stopCancelObserver && b.stopCancel != nil {
+			b.stopCancel()
+		}
+		if b.cancel != nil {
+			b.cancel()
+		}
+		if b.body != nil {
+			b.closeError = b.body.Close()
+		}
+	})
+	return b.closeError
+}
+
+func httpTransportError(err error, wroteRequest bool) *types.OpenAIErrorWithStatusCode {
+	if err != nil {
+		logger.SysError(fmt.Sprintf("provider http transport error: %s", common.RedactSensitiveText(err.Error())))
+	}
+	apiErr := common.StringErrorWrapper("请求上游地址失败", "http_request_failed", http.StatusInternalServerError)
+	if wroteRequest {
+		apiErr.UpstreamAmbiguous = true
+	} else {
+		apiErr.UpstreamNotAttempted = true
+	}
+	return apiErr
 }
 
 // 创建请求
@@ -78,9 +360,30 @@ func (r *HTTPRequester) NewRequest(method, url string, setters ...requestOption)
 
 // 发送请求
 func (r *HTTPRequester) SendRequest(req *http.Request, response any, outputResp bool) (*http.Response, *types.OpenAIErrorWithStatusCode) {
-	resp, err := HTTPClient.Do(req)
+	return r.sendRequest(req, response, outputResp, false, r.ReplayOpenAIErrorEnvelopes)
+}
+
+// SendRequestPreservingRedirect keeps an un-followed provider 3xx available
+// for an explicitly authorized exact-wire response surface.
+func (r *HTTPRequester) SendRequestPreservingRedirect(req *http.Request, response any, outputResp bool) (*http.Response, *types.OpenAIErrorWithStatusCode) {
+	return r.sendRequest(req, response, outputResp, true, r.ReplayOpenAIErrorEnvelopes)
+}
+
+// SendRequestPreservingNativeDialect keeps a native provider's safe error and
+// redirect wire without changing the requester's behavior for cross-protocol
+// consumers that share the same configured channel.
+func (r *HTTPRequester) SendRequestPreservingNativeDialect(req *http.Request, response any, outputResp bool) (*http.Response, *types.OpenAIErrorWithStatusCode) {
+	return r.sendRequest(req, response, outputResp, true, true)
+}
+
+func (r *HTTPRequester) sendRequest(req *http.Request, response any, outputResp bool, preserveRedirect bool, replayProviderEnvelope bool) (*http.Response, *types.OpenAIErrorWithStatusCode) {
+	client, noKeepAlive, clientErr := r.configuredHTTPClient(r.profile, preserveRedirect)
+	if clientErr != nil {
+		return nil, clientErr
+	}
+	resp, err, wroteRequest := doHTTPRequest(client, req, policyForHTTPProfile(r.profile), noKeepAlive)
 	if err != nil {
-		return nil, common.ErrorWrapper(err, "http_request_failed", http.StatusInternalServerError)
+		return nil, httpTransportError(err, wroteRequest)
 	}
 
 	if !outputResp {
@@ -89,7 +392,14 @@ func (r *HTTPRequester) SendRequest(req *http.Request, response any, outputResp 
 
 	// 处理响应
 	if r.IsFailureStatusCode(resp) {
-		return nil, HandleErrorResp(resp, r.ErrorHandler, r.IsOpenAI)
+		if preserveRedirect && isRedirectStatus(resp.StatusCode) {
+			return nil, preservedRedirectResponse(resp, providerresponse.OperationUnknown)
+		}
+		apiErr := HandleErrorResp(resp, r.ErrorHandler, r.PrefixProviderErrors, replayProviderEnvelope)
+		if apiErr != nil && (resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode >= http.StatusInternalServerError) {
+			apiErr.UpstreamAmbiguous = true
+		}
+		return nil, apiErr
 	}
 
 	// 解析响应
@@ -109,31 +419,230 @@ func (r *HTTPRequester) SendRequest(req *http.Request, response any, outputResp 
 		if err == nil {
 			err = closeErr
 		}
+	} else if rawResponse, ok := response.(ProviderRawJSONCapturer); ok && rawResponse.CaptureProviderRawJSON() {
+		var body []byte
+		body, err = readProviderBodyBounded(resp.Body, maxProviderRawJSONBodyBytes)
+		if err == nil {
+			if safe, changed := common.RedactCredentialValuesText(string(body), requestProviderCredentialValues(resp.Request)...); changed {
+				body = []byte(safe)
+				invalidateRewrittenRepresentationHeaders(resp.Header)
+			}
+		}
+		if err == nil {
+			if decoder, ok := response.(ProviderRawJSONDecoder); ok {
+				err = decoder.DecodeCapturedProviderJSON(body)
+			} else {
+				err = DecodeResponse(bytes.NewReader(body), response)
+			}
+		}
+		if err == nil {
+			rawResponse.SetProviderRawJSON(body)
+		}
 	} else {
 		err = json.NewDecoder(resp.Body).Decode(response)
 	}
 
 	if err != nil {
-		return nil, common.ErrorWrapper(err, "decode_response_failed", http.StatusInternalServerError)
+		apiErr := common.ErrorWrapper(err, "decode_response_failed", http.StatusInternalServerError)
+		if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+			apiErr.UpstreamAccepted = true
+		}
+		apiErr.ResponseHeaders = requestctx.SafeProviderResponseHeaders(resp.Header)
+		return nil, apiErr
 	}
 
 	return resp, nil
 }
 
+func invalidateRewrittenRepresentationHeaders(headers http.Header) {
+	for _, name := range []string{"Content-Encoding", "Content-Length", "Content-Range", "Digest", "Etag"} {
+		headers.Del(name)
+	}
+}
+
+func readProviderBodyBounded(reader io.Reader, maxBytes int64) ([]byte, error) {
+	if reader == nil || maxBytes <= 0 {
+		return nil, errors.New("provider response body limit is invalid")
+	}
+	body, err := io.ReadAll(io.LimitReader(reader, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > maxBytes {
+		return nil, errProviderRawJSONBodyTooLarge
+	}
+	return body, nil
+}
+
 // 发送请求 RAW
 func (r *HTTPRequester) SendRequestRaw(req *http.Request) (*http.Response, *types.OpenAIErrorWithStatusCode) {
 	// 发送请求
-	resp, err := HTTPClient.Do(req)
+	client, noKeepAlive, clientErr := r.configuredHTTPClient(r.profile, false)
+	if clientErr != nil {
+		return nil, clientErr
+	}
+	resp, err, wroteRequest := doHTTPRequest(client, req, policyForHTTPProfile(r.profile), noKeepAlive)
 	if err != nil {
-		return nil, common.ErrorWrapper(err, "http_request_failed", http.StatusInternalServerError)
+		return nil, httpTransportError(err, wroteRequest)
 	}
 
 	// 处理响应
 	if r.IsFailureStatusCode(resp) {
-		return nil, HandleErrorResp(resp, r.ErrorHandler, r.IsOpenAI)
+		apiErr := HandleErrorResp(resp, r.ErrorHandler, r.PrefixProviderErrors, r.ReplayOpenAIErrorEnvelopes)
+		if apiErr != nil && (resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode >= http.StatusInternalServerError) {
+			apiErr.UpstreamAmbiguous = true
+		}
+		return nil, apiErr
 	}
 
 	return resp, nil
+}
+
+// SendRequestRawNoRedirect is reserved for explicit raw relay surfaces. It
+// returns every HTTP status unchanged and prevents the proxy from turning an
+// upstream redirect into a second request with different authority semantics.
+func (r *HTTPRequester) SendRequestRawNoRedirect(req *http.Request) (*http.Response, *types.OpenAIErrorWithStatusCode) {
+	return r.sendRequestRawNoRedirect(req)
+}
+
+// SendRequestRawCheckedNoRedirect prevents authority-changing redirects while
+// keeping provider failures behind the shared bounded redaction policy.
+func (r *HTTPRequester) SendRequestRawCheckedNoRedirect(req *http.Request) (*http.Response, *types.OpenAIErrorWithStatusCode) {
+	return r.sendRequestRawCheckedNoRedirect(req, false, providerresponse.OperationUnknown)
+}
+
+// SendRequestRawCheckedPreservingRedirect applies the normal bounded provider
+// error policy while retaining an explicitly authorized 3xx status, safe
+// headers, and body for exact-wire downstream delivery.
+func (r *HTTPRequester) SendRequestRawCheckedPreservingRedirect(req *http.Request, operation providerresponse.Operation) (*http.Response, *types.OpenAIErrorWithStatusCode) {
+	return r.sendRequestRawCheckedNoRedirect(req, true, operation)
+}
+
+func (r *HTTPRequester) SendRequestRawCheckedNativeDialect(req *http.Request, operation providerresponse.Operation) (*http.Response, *types.OpenAIErrorWithStatusCode) {
+	resp, errWithCode := r.sendRequestRawNoRedirect(req)
+	if errWithCode != nil {
+		return nil, errWithCode
+	}
+	if isRedirectStatus(resp.StatusCode) {
+		return nil, preservedRedirectResponse(resp, operation)
+	}
+	if r.IsFailureStatusCode(resp) {
+		return nil, HandleErrorResp(resp, r.ErrorHandler, r.PrefixProviderErrors, true)
+	}
+	return resp, nil
+}
+
+func (r *HTTPRequester) sendRequestRawCheckedNoRedirect(req *http.Request, preserveRedirect bool, operation providerresponse.Operation) (*http.Response, *types.OpenAIErrorWithStatusCode) {
+	resp, errWithCode := r.sendRequestRawNoRedirect(req)
+	if errWithCode != nil {
+		return nil, errWithCode
+	}
+	if req != nil && req.Method == http.MethodGet && resp.StatusCode == http.StatusNotModified {
+		return resp, nil
+	}
+	if preserveRedirect && isRedirectStatus(resp.StatusCode) {
+		return nil, preservedRedirectResponse(resp, operation)
+	}
+	if r.IsFailureStatusCode(resp) {
+		return nil, HandleErrorResp(resp, r.ErrorHandler, r.PrefixProviderErrors, r.ReplayOpenAIErrorEnvelopes)
+	}
+	return resp, nil
+}
+
+func isRedirectStatus(statusCode int) bool {
+	return statusCode >= http.StatusMultipleChoices && statusCode < http.StatusBadRequest
+}
+
+func preservedRedirectResponse(resp *http.Response, operation providerresponse.Operation) *types.OpenAIErrorWithStatusCode {
+	if resp == nil {
+		return common.StringErrorWrapper("provider redirect response is missing", "invalid_provider_response", http.StatusBadGateway)
+	}
+	defer resp.Body.Close()
+	body, err := readProviderBodyBounded(resp.Body, maxProviderRawJSONBodyBytes)
+	if err != nil {
+		apiErr := common.ErrorWrapperLocal(err, "invalid_provider_response", http.StatusBadGateway)
+		apiErr.UpstreamAccepted = true
+		return apiErr
+	}
+	credentials := requestProviderCredentialValues(resp.Request)
+	safeBody, bodyChanged := common.RedactCredentialValuesText(string(body), credentials...)
+	headers := providerresponse.Filter(resp.Header, providerresponse.Policy{
+		Operation:        operation,
+		DataPath:         providerresponse.DataPathExactWire,
+		BodyUnmodified:   true,
+		PreserveRedirect: true,
+	})
+	if bodyChanged {
+		body = []byte(safeBody)
+		invalidateRewrittenRepresentationHeaders(headers)
+	}
+	for _, location := range headers.Values("Location") {
+		_, containsCredential := common.RedactCredentialValuesText(location, credentials...)
+		if decoded, err := url.QueryUnescape(location); err == nil {
+			_, decodedContainsCredential := common.RedactCredentialValuesText(decoded, credentials...)
+			containsCredential = containsCredential || decodedContainsCredential
+		}
+		if containsCredential {
+			// A redacted URL is not the provider's redirect target. Omit it.
+			headers.Del("Location")
+			break
+		}
+	}
+	return &types.OpenAIErrorWithStatusCode{
+		OpenAIError: types.OpenAIError{
+			Message: "provider returned an HTTP redirect",
+			Type:    "upstream_response",
+			Code:    "provider_redirect_response",
+		},
+		StatusCode:        resp.StatusCode,
+		ReplayRawResponse: true,
+		RawBody:           body,
+		ResponseHeaders:   headers,
+	}
+}
+
+func (r *HTTPRequester) sendRequestRawNoRedirect(req *http.Request) (*http.Response, *types.OpenAIErrorWithStatusCode) {
+	client, noKeepAlive, clientErr := r.configuredHTTPClient(r.profile, true)
+	if clientErr != nil {
+		return nil, clientErr
+	}
+	resp, err, wroteRequest := doHTTPRequest(client, req, policyForHTTPProfile(r.profile), noKeepAlive)
+	if err != nil {
+		return nil, httpTransportError(err, wroteRequest)
+	}
+	return resp, nil
+}
+
+func providerHTTPClient(profile HTTPProfile, forceNoRedirect bool) (*http.Client, *types.OpenAIErrorWithStatusCode) {
+	if HTTPClient == nil {
+		return nil, common.StringErrorWrapperLocal("http client is not initialized", "http_request_failed", http.StatusInternalServerError)
+	}
+	client := *HTTPClient
+	policy := policyForHTTPProfile(profile)
+	if forceNoRedirect {
+		policy.redirect = redirectReject
+	}
+	client.CheckRedirect = checkRedirectForPolicy(policy)
+	if policy.overrideTimeout {
+		client.Timeout = policy.overallTimeout
+	}
+	return &client, nil
+}
+
+func (r *HTTPRequester) configuredHTTPClient(profile HTTPProfile, forceNoRedirect bool) (*http.Client, *http.Transport, *types.OpenAIErrorWithStatusCode) {
+	client, apiErr := providerHTTPClient(profile, forceNoRedirect)
+	if apiErr != nil {
+		return nil, nil, apiErr
+	}
+	if r == nil || r.transports == nil {
+		return client, nil, nil
+	}
+	source := client.Transport
+	if source == nil {
+		source = http.DefaultTransport
+	}
+	transport, _ := r.transports.noKeepAliveFor(source)
+	return client, transport, nil
 }
 
 // 获取流式响应
@@ -144,7 +653,7 @@ func RequestStream[T streamable](requester *HTTPRequester, resp *http.Response, 
 func RequestStreamWithOptions[T streamable](requester *HTTPRequester, resp *http.Response, handlerPrefix HandlerPrefix[T], options StreamReadOptions) (*streamReader[T], *types.OpenAIErrorWithStatusCode) {
 	// 如果返回的头是json格式 说明有错误
 	// if strings.Contains(resp.Header.Get("Content-Type"), "application/json") {
-	// 	return nil, HandleErrorResp(resp, requester.ErrorHandler, requester.IsOpenAI)
+	// 	return nil, HandleErrorResp(resp, requester.ErrorHandler, requester.PrefixProviderErrors, requester.ReplayOpenAIErrorEnvelopes)
 	// }
 
 	stream := &streamReader[T]{
@@ -152,7 +661,7 @@ func RequestStreamWithOptions[T streamable](requester *HTTPRequester, resp *http
 		response:      resp,
 		handlerPrefix: handlerPrefix,
 		NoTrim:        false,
-		options:       options,
+		options:       normalizeStreamReadOptions(options),
 
 		// Keep data unbuffered so terminal errors cannot overtake emitted chunks.
 		DataChan: make(chan T),
@@ -238,13 +747,17 @@ func (r *HTTPRequester) WithContentType(contentType string) requestOption {
 
 // 判断是否为失败状态码
 func (r *HTTPRequester) IsFailureStatusCode(resp *http.Response) bool {
-	return resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusBadRequest
+	return resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices
 }
 
 // 处理错误响应
-func HandleErrorResp(resp *http.Response, toOpenAIError HttpErrorHandler, isPrefix bool) *types.OpenAIErrorWithStatusCode {
+func HandleErrorResp(resp *http.Response, toOpenAIError HttpErrorHandler, prefixProviderError bool, replayOpenAIEnvelope bool) *types.OpenAIErrorWithStatusCode {
 	openAIErrorWithStatusCode := &types.OpenAIErrorWithStatusCode{
-		StatusCode: resp.StatusCode,
+		StatusCode:             resp.StatusCode,
+		ResponseHeaders:        requestctx.SafeProviderResponseHeaders(resp.Header),
+		ProviderQuotaExhausted: resp.StatusCode == http.StatusPaymentRequired,
+		ProviderAuthRejected:   resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusProxyAuthRequired,
+		ProviderRateLimited:    resp.StatusCode == http.StatusTooManyRequests,
 		OpenAIError: types.OpenAIError{
 			Message: "",
 			Type:    "upstream_error",
@@ -256,8 +769,8 @@ func HandleErrorResp(resp *http.Response, toOpenAIError HttpErrorHandler, isPref
 	defer resp.Body.Close()
 
 	if toOpenAIError != nil {
-		bodyBytes, err := io.ReadAll(resp.Body)
-		if err == nil {
+		bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxProviderErrorBodyBytes+1))
+		if err == nil && int64(len(bodyBytes)) <= maxProviderErrorBodyBytes {
 			resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 			errorResponse := toOpenAIError(resp)
 
@@ -267,10 +780,35 @@ func HandleErrorResp(resp *http.Response, toOpenAIError HttpErrorHandler, isPref
 				}
 
 				openAIErrorWithStatusCode.OpenAIError = *errorResponse
-				if common.ProviderErrorIsQuotaExhausted(openAIErrorWithStatusCode.OpenAIError) {
+				quotaExhausted := common.ProviderErrorIsQuotaExhausted(*errorResponse) ||
+					(!common.ProviderErrorIsRateLimited(*errorResponse) && strings.Contains(errorResponse.Message, "Your credit balance is too low"))
+				authRejected := common.ProviderErrorIsAuthRejected(*errorResponse) ||
+					(errorResponse.Param == "INVALID_ARGUMENT" && strings.Contains(errorResponse.Message, "API key not valid"))
+				openAIErrorWithStatusCode.ProviderQuotaExhausted = openAIErrorWithStatusCode.ProviderQuotaExhausted || quotaExhausted
+				openAIErrorWithStatusCode.ProviderAuthRejected = openAIErrorWithStatusCode.ProviderAuthRejected || authRejected
+				openAIErrorWithStatusCode.ProviderRateLimited = openAIErrorWithStatusCode.ProviderRateLimited || common.ProviderErrorIsRateLimited(*errorResponse)
+				providerSecrets := requestProviderCredentialValues(resp.Request)
+				validOpenAIEnvelope, containsSensitiveDetails, inspectionErr := inspectProviderErrorBody(bodyBytes, errorResponse, resp.StatusCode, providerSecrets...)
+				confirmedAccountFailure := openAIErrorWithStatusCode.ProviderQuotaExhausted || openAIErrorWithStatusCode.ProviderAuthRejected
+				if confirmedAccountFailure {
+					// Do not retain the shared-account body. The provider-response
+					// boundary below owns the stable public replacement.
+				} else if inspectionErr != nil {
+					openAIErrorWithStatusCode.OpenAIError = safeMalformedProviderError(resp.StatusCode)
+				} else if containsSensitiveDetails {
+					// A field name such as project_id or text mentioning api_key is
+					// enough to suppress exact-wire replay, but it is not evidence that
+					// the provider account failed. Keep the mapped business error while
+					// redacting any actual credential material it contains.
+					openAIErrorWithStatusCode.OpenAIError = sanitizeMappedProviderError(*errorResponse, providerSecrets)
+				} else if replayOpenAIEnvelope && validOpenAIEnvelope {
+					openAIErrorWithStatusCode.RawBody = append([]byte(nil), bodyBytes...)
+					openAIErrorWithStatusCode.ReplayRawResponse = true
+				}
+				if quotaExhausted && !replayOpenAIEnvelope {
 					openAIErrorWithStatusCode.StatusCode = http.StatusTooManyRequests
 				}
-				if isPrefix {
+				if prefixProviderError {
 					openAIErrorWithStatusCode.OpenAIError.Message = fmt.Sprintf("Provider API error: %s", openAIErrorWithStatusCode.OpenAIError.Message)
 				}
 			}
@@ -282,14 +820,224 @@ func HandleErrorResp(resp *http.Response, toOpenAIError HttpErrorHandler, isPref
 	}
 
 	if openAIErrorWithStatusCode.OpenAIError.Message == "" {
-		if isPrefix {
+		if prefixProviderError {
 			openAIErrorWithStatusCode.OpenAIError.Message = fmt.Sprintf("Provider API error: bad response status code %d", resp.StatusCode)
 		} else {
 			openAIErrorWithStatusCode.OpenAIError.Message = fmt.Sprintf("bad response status code %d", resp.StatusCode)
 		}
 	}
 
-	return openAIErrorWithStatusCode
+	// Status and control classification remain available for routing, while the
+	// shared provider-response boundary owns account-error replacement and final
+	// text redaction. Ordinary authorized exact-wire envelopes remain unchanged.
+	return providerresponse.SanitizeAPIError(openAIErrorWithStatusCode)
+}
+
+type providerErrorBodyInspection struct {
+	keys    []string
+	strings []string
+}
+
+func inspectProviderErrorBody(body []byte, providerErr *types.OpenAIError, status int, providerSecrets ...string) (bool, bool, error) {
+	inspection, err := inspectProviderErrorJSON(body)
+	containsSecret := providerErrorBodyHasSensitiveDetails(status, providerErr, inspection, providerSecrets...)
+	if err != nil {
+		return false, containsSecret, err
+	}
+
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(body, &envelope); err != nil || envelope == nil {
+		return false, containsSecret, nil
+	}
+	var errorObject map[string]json.RawMessage
+	if err := json.Unmarshal(envelope["error"], &errorObject); err != nil || errorObject == nil {
+		return false, containsSecret, nil
+	}
+	return true, containsSecret, nil
+}
+
+func inspectProviderErrorJSON(body []byte) (providerErrorBodyInspection, error) {
+	inspection := providerErrorBodyInspection{}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if err := inspectProviderErrorJSONValue(decoder, &inspection, 0); err != nil {
+		return inspection, err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		if err == nil {
+			err = fmt.Errorf("multiple JSON values")
+		}
+		return inspection, err
+	}
+	return inspection, nil
+}
+
+func inspectProviderErrorJSONValue(decoder *json.Decoder, inspection *providerErrorBodyInspection, depth int) error {
+	if depth > maxProviderErrorJSONDepth {
+		return fmt.Errorf("provider error JSON exceeds maximum depth %d", maxProviderErrorJSONDepth)
+	}
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, ok := token.(json.Delim)
+	if !ok {
+		if value, ok := token.(string); ok {
+			inspection.strings = append(inspection.strings, value)
+		}
+		return nil
+	}
+
+	switch delimiter {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return fmt.Errorf("JSON object key is not a string")
+			}
+			if _, duplicate := seen[key]; duplicate {
+				return fmt.Errorf("duplicate JSON object key %q", key)
+			}
+			seen[key] = struct{}{}
+			inspection.keys = append(inspection.keys, key)
+			if err := inspectProviderErrorJSONValue(decoder, inspection, depth+1); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil || closing != json.Delim('}') {
+			return fmt.Errorf("invalid JSON object")
+		}
+	case '[':
+		for decoder.More() {
+			if err := inspectProviderErrorJSONValue(decoder, inspection, depth+1); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil || closing != json.Delim(']') {
+			return fmt.Errorf("invalid JSON array")
+		}
+	default:
+		return fmt.Errorf("unexpected JSON delimiter %q", delimiter)
+	}
+	return nil
+}
+
+func providerErrorBodyHasSensitiveDetails(status int, providerErr *types.OpenAIError, inspection providerErrorBodyInspection, providerSecrets ...string) bool {
+	if status == http.StatusUnauthorized || status == http.StatusProxyAuthRequired {
+		return true
+	}
+	if providerErr != nil {
+		if common.ProviderErrorIsQuotaExhausted(*providerErr) || common.ProviderErrorIsAuthRejected(*providerErr) {
+			return true
+		}
+	}
+
+	for _, key := range inspection.keys {
+		switch canonicalProviderErrorKey(key) {
+		case "apikey", "authorization", "token", "accesstoken", "refreshtoken",
+			"credential", "credentials", "secret", "clientsecret", "accountid", "organizationid",
+			"orgid", "projectid", "subscriptionid", "tenantid", "billingaccount", "billingaccountid":
+			return true
+		}
+	}
+
+	classification := ""
+	if providerErr != nil {
+		classification = strings.ToLower(strings.Join([]string{
+			fmt.Sprint(providerErr.Code), providerErr.Type, providerErr.Message,
+		}, " "))
+	}
+	classification += " " + strings.ToLower(strings.Join(inspection.strings, " "))
+	for _, secret := range providerSecrets {
+		secret = strings.TrimSpace(secret)
+		if len(secret) < 8 {
+			continue
+		}
+		for _, value := range inspection.strings {
+			if strings.Contains(value, secret) {
+				return true
+			}
+		}
+	}
+	for _, evidence := range []string{
+		"api key", "api_key", "invalid_api_key", "bearer ", "credential", "authentication_error",
+		"insufficient_quota", "billing_not_active", "billing hard limit", "billing_hard_limit",
+		"credit balance", "current quota", "account deactivated", "organization deactivated",
+		"organization org-", "project proj_", "account acct_",
+	} {
+		if strings.Contains(classification, evidence) {
+			return true
+		}
+	}
+	return false
+}
+
+func sanitizeMappedProviderError(providerErr types.OpenAIError, providerSecrets []string) types.OpenAIError {
+	providerErr.Message = redactMappedProviderErrorText(providerErr.Message, providerSecrets)
+	providerErr.Type = redactMappedProviderErrorText(providerErr.Type, providerSecrets)
+	providerErr.Param = redactMappedProviderErrorText(providerErr.Param, providerSecrets)
+	if code, ok := providerErr.Code.(string); ok {
+		providerErr.Code = redactMappedProviderErrorText(code, providerSecrets)
+	}
+	return providerErr
+}
+
+func redactMappedProviderErrorText(text string, providerSecrets []string) string {
+	for _, secret := range providerSecrets {
+		secret = strings.TrimSpace(secret)
+		if len(secret) >= 8 {
+			text = strings.ReplaceAll(text, secret, "[redacted]")
+		}
+	}
+	return common.RedactSensitiveText(text)
+}
+
+func requestProviderCredentialValues(req *http.Request) []string {
+	if req == nil {
+		return nil
+	}
+	values := make([]string, 0, 6)
+	for _, name := range []string{"Authorization", "Api-Key", "X-Api-Key", "X-Goog-Api-Key", "Proxy-Authorization"} {
+		for _, value := range req.Header.Values(name) {
+			value = strings.TrimSpace(value)
+			if value == "" {
+				continue
+			}
+			values = append(values, value)
+			if index := strings.IndexByte(value, ' '); index >= 0 {
+				if credential := strings.TrimSpace(value[index+1:]); credential != "" {
+					values = append(values, credential)
+				}
+			}
+		}
+	}
+	return values
+}
+
+func canonicalProviderErrorKey(key string) string {
+	var normalized strings.Builder
+	for _, r := range strings.TrimSpace(key) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			normalized.WriteRune(unicode.ToLower(r))
+		}
+	}
+	return normalized.String()
+}
+
+func safeMalformedProviderError(status int) types.OpenAIError {
+	return types.OpenAIError{
+		Message: "upstream provider returned an invalid error response",
+		Type:    "upstream_error",
+		Code:    "bad_response_status_code",
+		Param:   strconv.Itoa(status),
+	}
 }
 
 func SetEventStreamHeaders(c *gin.Context) {

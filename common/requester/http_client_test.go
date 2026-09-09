@@ -2,6 +2,7 @@ package requester
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -34,9 +35,32 @@ func TestInitHttpClientDoesNotClampResponseHeaderTimeout(t *testing.T) {
 	if transport.ResponseHeaderTimeout != 0 {
 		t.Fatalf("expected no response header timeout clamp, got %s", transport.ResponseHeaderTimeout)
 	}
+	if !transport.DisableCompression {
+		t.Fatal("expected provider transport transparent decompression to be disabled")
+	}
 
 	if HTTPClient.Timeout != 300*time.Second {
 		t.Fatalf("expected relay timeout to configure client timeout, got %s", HTTPClient.Timeout)
+	}
+	original, _ := http.NewRequest(http.MethodPost, "http://provider.example/v1/responses", nil)
+	upgrade, _ := http.NewRequest(http.MethodPost, "https://provider.example/v1/responses", nil)
+	if err := HTTPClient.CheckRedirect(upgrade, []*http.Request{original}); !errors.Is(err, http.ErrUseLastResponse) {
+		t.Fatalf("expected provider redirect not to create a second submission, got %v", err)
+	}
+	crossAuthority, _ := http.NewRequest(http.MethodPost, "https://other.example/v1/responses", nil)
+	if err := HTTPClient.CheckRedirect(crossAuthority, []*http.Request{upgrade}); !errors.Is(err, http.ErrUseLastResponse) {
+		t.Fatalf("expected cross-authority redirect to remain un-followed, got %v", err)
+	}
+	downgrade, _ := http.NewRequest(http.MethodPost, "http://provider.example/v1/responses", nil)
+	if err := HTTPClient.CheckRedirect(downgrade, []*http.Request{upgrade}); !errors.Is(err, http.ErrUseLastResponse) {
+		t.Fatalf("expected HTTPS downgrade to remain un-followed, got %v", err)
+	}
+}
+
+func TestHTTPRequesterTreatsRedirectAsProviderResponseStatus(t *testing.T) {
+	requester := NewHTTPRequester("", nil)
+	if !requester.IsFailureStatusCode(&http.Response{StatusCode: http.StatusTemporaryRedirect}) {
+		t.Fatal("expected 307 to avoid success-body decoding and replay")
 	}
 }
 
@@ -66,7 +90,7 @@ func TestHandleErrorRespNormalizesUsageExhaustedStatus(t *testing.T) {
 			errWithStatus := HandleErrorResp(resp, func(*http.Response) *types.OpenAIError {
 				errCopy := tt.err
 				return &errCopy
-			}, true)
+			}, true, false)
 
 			if errWithStatus == nil || errWithStatus.StatusCode != http.StatusTooManyRequests {
 				t.Fatalf("expected status %d, got %+v", http.StatusTooManyRequests, errWithStatus)
@@ -87,10 +111,74 @@ func TestHandleErrorRespNormalizesNonStringQuotaCode(t *testing.T) {
 			Code:    json.Number("12345"),
 			Message: "numeric provider code",
 		}
-	}, true)
+	}, true, false)
 
 	if errWithStatus == nil || errWithStatus.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected non-quota numeric code to preserve status, got %+v", errWithStatus)
+	}
+}
+
+func TestHandleErrorRespKeepsControlDispositionAfterPublicRedaction(t *testing.T) {
+	tests := []struct {
+		name          string
+		providerError types.OpenAIError
+		body          string
+		wantStatus    int
+		wantQuota     bool
+		wantAuth      bool
+	}{
+		{
+			name:          "anthropic exhausted balance",
+			providerError: types.OpenAIError{Message: "Your credit balance is too low to access the API"},
+			body:          `{"type":"error","error":{"message":"Your credit balance is too low to access the API"}}`,
+			wantStatus:    http.StatusTooManyRequests,
+			wantQuota:     true,
+		},
+		{
+			name:          "gemini invalid key",
+			providerError: types.OpenAIError{Message: "API key not valid. Please pass a valid API key.", Param: "INVALID_ARGUMENT"},
+			body:          `{"error":{"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT"}}`,
+			wantStatus:    http.StatusBadRequest,
+			wantAuth:      true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := &http.Response{
+				StatusCode: http.StatusBadRequest,
+				Body:       io.NopCloser(strings.NewReader(test.body)),
+				Header:     make(http.Header),
+			}
+			got := HandleErrorResp(response, func(*http.Response) *types.OpenAIError {
+				mapped := test.providerError
+				return &mapped
+			}, false, false)
+			if got.StatusCode != test.wantStatus || got.ProviderQuotaExhausted != test.wantQuota || got.ProviderAuthRejected != test.wantAuth {
+				t.Fatalf("unexpected provider disposition: %+v", got)
+			}
+			if got.Code != "provider_account_error" || strings.Contains(got.Message, "credit balance") || strings.Contains(got.Message, "API key") {
+				t.Fatalf("expected public error to remain redacted: %+v", got)
+			}
+		})
+	}
+}
+
+func TestHandleErrorRespDoesNotTurnRateLimitTextIntoQuotaExhaustion(t *testing.T) {
+	response := &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"Your credit balance is too low but this is only a short rate limit"}}`)),
+		Header:     make(http.Header),
+	}
+	got := HandleErrorResp(response, func(*http.Response) *types.OpenAIError {
+		return &types.OpenAIError{
+			Type:    "rate_limit_error",
+			Code:    "rate_limit_exceeded",
+			Message: "Your credit balance is too low but this is only a short rate limit",
+		}
+	}, false, false)
+	if got.ProviderQuotaExhausted || !got.ProviderRateLimited || got.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected explicit rate-limit classification to win over message fallback, got %+v", got)
 	}
 }
 
@@ -104,7 +192,7 @@ func TestHandleErrorRespDoesNotExposeRawJSONWhenMapperReturnsNil(t *testing.T) {
 
 	errWithStatus := HandleErrorResp(resp, func(*http.Response) *types.OpenAIError {
 		return nil
-	}, false)
+	}, false, false)
 
 	if errWithStatus == nil {
 		t.Fatal("expected normalized upstream error")

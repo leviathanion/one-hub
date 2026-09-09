@@ -55,7 +55,7 @@ func (w *WeCom) Send(c context.Context, title, message string) error {
 	// init client
 	client := requester.NewHTTPRequester("", weComErrFunc)
 	client.Context = c
-	client.IsOpenAI = false
+	client.PrefixProviderErrors = false
 
 	// init req
 	req, err := client.NewRequest(http.MethodPost, w.Webhook, client.WithHeader(requester.GetJsonHeaders()), client.WithBody(msg))

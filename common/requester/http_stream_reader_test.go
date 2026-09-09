@@ -128,6 +128,109 @@ func TestRequestStreamWithReadLimitDeliversFinalFragmentBeforeEOF(t *testing.T) 
 	assertStreamChannelClosed(t, "error", errChan)
 }
 
+func TestRequestStreamUsesBoundedDefaultLineSize(t *testing.T) {
+	stream, errWithCode := RequestNoTrimStream[string](nil, &http.Response{
+		Body: io.NopCloser(strings.NewReader("")),
+	}, func(*[]byte, chan string, chan error) {})
+	if errWithCode != nil {
+		t.Fatalf("unexpected stream construction error: %v", errWithCode)
+	}
+	defer stream.Close()
+	if stream.options.MaxLineBytes != defaultProviderStreamMaxLineBytes {
+		t.Fatalf("expected default line limit %d, got %d", defaultProviderStreamMaxLineBytes, stream.options.MaxLineBytes)
+	}
+}
+
+func TestRequestStreamRequiredTerminalRejectsTransportEOF(t *testing.T) {
+	stream, errWithCode := RequestStreamWithOptions[string](nil, &http.Response{
+		Body: io.NopCloser(bytes.NewBufferString("partial chunk\n")),
+	}, func(rawLine *[]byte, dataChan chan string, _ chan error) {
+		dataChan <- string(*rawLine)
+	}, StreamReadOptions{RequireProtocolTerminal: true})
+	if errWithCode != nil {
+		t.Fatalf("unexpected stream construction error: %v", errWithCode)
+	}
+
+	dataChan, errChan := stream.Recv()
+	defer stream.Close()
+	if got := <-dataChan; got != "partial chunk" {
+		t.Fatalf("unexpected stream chunk: %q", got)
+	}
+	if err := <-errChan; !errors.Is(err, ErrStreamProtocolTerminalMissing) {
+		t.Fatalf("error=%v, want ErrStreamProtocolTerminalMissing", err)
+	}
+}
+
+func TestRequestStreamRequiredTerminalPredicateAcceptsTransportEOF(t *testing.T) {
+	predicateCalls := 0
+	stream, errWithCode := RequestStreamWithOptions[string](nil, &http.Response{
+		Body: io.NopCloser(bytes.NewBufferString("complete\n")),
+	}, func(rawLine *[]byte, dataChan chan string, _ chan error) {
+		dataChan <- string(*rawLine)
+	}, StreamReadOptions{
+		RequireProtocolTerminal: true,
+		ProtocolTerminalPredicate: func() bool {
+			predicateCalls++
+			return true
+		},
+	})
+	if errWithCode != nil {
+		t.Fatalf("unexpected stream construction error: %v", errWithCode)
+	}
+
+	dataChan, errChan := stream.Recv()
+	defer stream.Close()
+	if got := <-dataChan; got != "complete" {
+		t.Fatalf("unexpected stream chunk: %q", got)
+	}
+	if err := <-errChan; !errors.Is(err, io.EOF) || errors.Is(err, ErrStreamProtocolTerminalMissing) {
+		t.Fatalf("error=%v, want accepted transport EOF", err)
+	}
+	if predicateCalls != 1 {
+		t.Fatalf("terminal predicate called %d times, want once", predicateCalls)
+	}
+}
+
+func TestRequestStreamRequiredTerminalPredicateDoesNotConvertReadTimeout(t *testing.T) {
+	readErr := &streamReadTimeoutError{}
+	stream, errWithCode := RequestStreamWithOptions[string](nil, &http.Response{
+		Body: &streamReadTimeoutBody{err: readErr},
+	}, func(*[]byte, chan string, chan error) {}, StreamReadOptions{
+		RequireProtocolTerminal: true,
+		ProtocolTerminalPredicate: func() bool {
+			t.Fatal("terminal predicate must not run for a read timeout")
+			return true
+		},
+	})
+	if errWithCode != nil {
+		t.Fatalf("unexpected stream construction error: %v", errWithCode)
+	}
+
+	_, errChan := stream.Recv()
+	defer stream.Close()
+	if err := <-errChan; err != readErr {
+		t.Fatalf("read error=%v, want original timeout %v", err, readErr)
+	}
+}
+
+func TestRequestStreamRequiredTerminalAcceptsHandlerEOF(t *testing.T) {
+	stream, errWithCode := RequestStreamWithOptions[string](nil, &http.Response{
+		Body: io.NopCloser(bytes.NewBufferString("[DONE]\n")),
+	}, func(rawLine *[]byte, _ chan string, errChan chan error) {
+		*rawLine = StreamClosed
+		errChan <- io.EOF
+	}, StreamReadOptions{RequireProtocolTerminal: true})
+	if errWithCode != nil {
+		t.Fatalf("unexpected stream construction error: %v", errWithCode)
+	}
+
+	_, errChan := stream.Recv()
+	defer stream.Close()
+	if err := <-errChan; !errors.Is(err, io.EOF) || errors.Is(err, ErrStreamProtocolTerminalMissing) {
+		t.Fatalf("error=%v, want protocol io.EOF", err)
+	}
+}
+
 func TestRequestNoTrimStreamWithOptionsRejectsOversizedLine(t *testing.T) {
 	stream, errWithCode := RequestNoTrimStreamWithOptions[string](nil, &http.Response{
 		Body: io.NopCloser(bytes.NewBufferString("data: 123456789\n")),
@@ -274,6 +377,46 @@ func TestStreamEmitterSendDataUnblocksOnClose(t *testing.T) {
 	assertStreamChannelClosed(t, "error", errChan)
 }
 
+func TestCloseAndDrainStreamUnblocksLegacyHandlerSend(t *testing.T) {
+	handlerStarted := make(chan struct{})
+	handlerDone := make(chan struct{})
+	stream, errWithCode := RequestNoTrimStream[string](nil, &http.Response{
+		Body: io.NopCloser(bytes.NewBufferString("data: blocked\n")),
+	}, func(rawLine *[]byte, dataChan chan string, _ chan error) {
+		close(handlerStarted)
+		dataChan <- string(*rawLine)
+		close(handlerDone)
+	})
+	if errWithCode != nil {
+		t.Fatalf("unexpected stream construction error: %v", errWithCode)
+	}
+
+	dataChan, errChan := stream.Recv()
+	select {
+	case <-handlerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for legacy handler")
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		CloseAndDrainStream[string](stream)
+		close(closed)
+	}()
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("legacy handler send remained blocked after close")
+	}
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("close-and-drain did not finish")
+	}
+	assertStreamChannelClosed(t, "data", dataChan)
+	assertStreamChannelClosed(t, "error", errChan)
+}
+
 func TestSendStreamErrorClosesStreamWhenErrorChannelBlocked(t *testing.T) {
 	originalTimeout := streamErrorSendTimeout
 	streamErrorSendTimeout = 10 * time.Millisecond
@@ -359,6 +502,19 @@ type blockingReadCloser struct {
 	closed chan struct{}
 	once   sync.Once
 }
+
+type streamReadTimeoutError struct{}
+
+func (*streamReadTimeoutError) Error() string   { return "stream read timeout" }
+func (*streamReadTimeoutError) Timeout() bool   { return true }
+func (*streamReadTimeoutError) Temporary() bool { return true }
+
+type streamReadTimeoutBody struct {
+	err error
+}
+
+func (b *streamReadTimeoutBody) Read([]byte) (int, error) { return 0, b.err }
+func (*streamReadTimeoutBody) Close() error               { return nil }
 
 func newBlockingReadCloser() *blockingReadCloser {
 	return &blockingReadCloser{closed: make(chan struct{})}

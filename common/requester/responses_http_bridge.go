@@ -138,7 +138,7 @@ func (r *HTTPRequester) SendResponsesHTTPBridgeRaw(req *http.Request, security R
 		transport.CloseIdleConnections()
 	}
 	if r != nil && r.IsFailureStatusCode(resp) {
-		return nil, HandleErrorResp(resp, r.ErrorHandler, r.IsOpenAI)
+		return nil, HandleErrorResp(resp, r.ErrorHandler, r.PrefixProviderErrors, r.ReplayOpenAIErrorEnvelopes)
 	}
 	return resp, nil
 }

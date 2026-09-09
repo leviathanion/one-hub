@@ -12,6 +12,7 @@ import (
 	"one-api/common/requester"
 	"one-api/types"
 	"strings"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream"
 	"github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream/eventstreamapi"
@@ -24,18 +25,22 @@ type streamReader[T any] struct {
 
 	handlerPrefix requester.HandlerPrefix[T]
 
-	DataChan chan T
-	ErrChan  chan error
+	DataChan   chan T
+	ErrChan    chan error
+	recvOnce   sync.Once
+	closeOnce  sync.Once
+	finishOnce sync.Once
 }
 
 func (stream *streamReader[T]) Recv() (<-chan T, <-chan error) {
-	go stream.processLines()
+	stream.recvOnce.Do(func() { go stream.processLines() })
 
 	return stream.DataChan, stream.ErrChan
 }
 
 //nolint:gocognit
 func (stream *streamReader[T]) processLines() {
+	defer stream.finish()
 	decode := eventstream.NewDecoder()
 	payloadBuf := make([]byte, 0*1024)
 	for {
@@ -65,7 +70,44 @@ func (stream *streamReader[T]) processLines() {
 }
 
 func (stream *streamReader[T]) Close() {
-	stream.response.Body.Close()
+	if stream == nil {
+		return
+	}
+	stream.closeOnce.Do(func() {
+		if stream.response != nil && stream.response.Body != nil {
+			_ = stream.response.Body.Close()
+		}
+	})
+}
+
+func (stream *streamReader[T]) CloseAndDrain() {
+	if stream == nil {
+		return
+	}
+	data, streamErrors := stream.Recv()
+	stream.Close()
+	for data != nil || streamErrors != nil {
+		select {
+		case _, ok := <-data:
+			if !ok {
+				data = nil
+			}
+		case _, ok := <-streamErrors:
+			if !ok {
+				streamErrors = nil
+			}
+		}
+	}
+}
+
+func (stream *streamReader[T]) finish() {
+	if stream == nil {
+		return
+	}
+	stream.finishOnce.Do(func() {
+		close(stream.DataChan)
+		close(stream.ErrChan)
+	})
 }
 
 func (stream *streamReader[T]) deserializeEventMessage(msg *eventstream.Message) ([]byte, error) {
@@ -112,7 +154,7 @@ func (stream *streamReader[T]) deserializeEventMessage(msg *eventstream.Message)
 func RequestStream[T any](resp *http.Response, handlerPrefix requester.HandlerPrefix[T]) (*streamReader[T], *types.OpenAIErrorWithStatusCode) {
 	// 如果返回的头是json格式 说明有错误
 	if strings.Contains(resp.Header.Get("Content-Type"), "application/json") {
-		return nil, requester.HandleErrorResp(resp, requestErrorHandle, true)
+		return nil, requester.HandleErrorResp(resp, requestErrorHandle, true, false)
 	}
 
 	stream := &streamReader[T]{

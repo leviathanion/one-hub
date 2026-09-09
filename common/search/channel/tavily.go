@@ -70,7 +70,7 @@ func (t *Tavily) Query(query string) (*search_type.SearchResponses, error) {
 	}
 
 	client := requester.NewHTTPRequester("", tavilyErrFunc)
-	client.IsOpenAI = false
+	client.PrefixProviderErrors = false
 
 	headers := requester.GetJsonHeaders()
 	headers["Authorization"] = fmt.Sprintf("Bearer %s", t.apiKey)
