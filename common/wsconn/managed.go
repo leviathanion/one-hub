@@ -106,6 +106,13 @@ type ManagedConn struct {
 	unregisterActive func()
 }
 
+// WriteResult distinguishes failures that happened before the raw websocket
+// writer was invoked from failures whose delivery outcome is unknown.
+type WriteResult struct {
+	Attempted bool
+	Err       error
+}
+
 func newManagedConn(raw *websocket.Conn, cfg Config) *ManagedConn {
 	clock := normalizeClock(cfg.Clock)
 	c := &ManagedConn{
@@ -126,25 +133,31 @@ func newManagedConn(raw *websocket.Conn, cfg Config) *ManagedConn {
 }
 
 func (c *ManagedConn) WriteMessage(mt MessageType, payload []byte) error {
+	return c.WriteMessageResult(mt, payload).Err
+}
+
+func (c *ManagedConn) WriteMessageResult(mt MessageType, payload []byte) WriteResult {
 	if c == nil || c.raw == nil {
-		return net.ErrClosed
+		return WriteResult{Err: net.ErrClosed}
 	}
 	if !validDataMessageType(mt) {
-		return ErrInvalidMessageType
+		return WriteResult{Err: ErrInvalidMessageType}
 	}
 	c.writeMu.Lock()
 	if c.closeStarted.Load() {
 		c.writeMu.Unlock()
-		return net.ErrClosed
+		return WriteResult{Err: net.ErrClosed}
 	}
+	attempted := false
 	err := c.withWriteDeadlineLocked(func() error {
+		attempted = true
 		return c.raw.WriteMessage(int(mt), payload)
 	})
 	c.writeMu.Unlock()
 	if err != nil {
 		c.Close(CloseInfo{Kind: CloseKindWriteError, Reason: "write_message_failed", Err: err})
 	}
-	return err
+	return WriteResult{Attempted: attempted, Err: err}
 }
 
 func (c *ManagedConn) Close(info CloseInfo) {

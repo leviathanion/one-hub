@@ -181,6 +181,30 @@ func TestWriteMessageErrorClosesWithoutDeadlock(t *testing.T) {
 	}
 }
 
+func TestWriteMessageResultReportsWhetherRawWriteWasAttempted(t *testing.T) {
+	t.Run("closed before write", func(t *testing.T) {
+		client, server := managedPairForTest(t)
+		defer server.Close(CloseInfo{Kind: CloseKindAbort})
+		client.Close(CloseInfo{Kind: CloseKindAbort})
+		result := client.WriteMessageResult(TextMessage, []byte("payload"))
+		if result.Attempted || !errors.Is(result.Err, net.ErrClosed) {
+			t.Fatalf("pre-write close result=%+v, want not attempted net.ErrClosed", result)
+		}
+	})
+
+	t.Run("raw write error", func(t *testing.T) {
+		client, server := managedPairForTest(t)
+		defer server.Close(CloseInfo{Kind: CloseKindAbort})
+		if err := client.raw.Close(); err != nil {
+			t.Fatalf("close raw websocket: %v", err)
+		}
+		result := client.WriteMessageResult(TextMessage, []byte("payload"))
+		if !result.Attempted || result.Err == nil {
+			t.Fatalf("raw write failure result=%+v, want attempted error", result)
+		}
+	})
+}
+
 func TestRuntimeNegativeTimeoutFallbacks(t *testing.T) {
 	conn := &ManagedConn{
 		cfg: Config{

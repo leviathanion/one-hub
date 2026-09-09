@@ -137,6 +137,50 @@ func TestReadInitialOversizedReturnsSentinelAndAllowsWrite(t *testing.T) {
 	}
 }
 
+func TestReadInitialWithReservationAccountsActualBytesBeforeRetention(t *testing.T) {
+	client, server := managedPairForTestWithConfigs(t, Config{ReadLimit: 1 << 20}, Config{})
+	defer client.Close(CloseInfo{Kind: CloseKindAbort})
+	defer server.Close(CloseInfo{Kind: CloseKindAbort})
+	payload := make([]byte, 96<<10)
+	if err := server.WriteMessage(TextMessage, payload); err != nil {
+		t.Fatal(err)
+	}
+	var reserved int
+	mt, got, err := client.ReadInitialWithReservation(context.Background(), func(bytes int) bool {
+		reserved += bytes
+		return true
+	})
+	if err != nil || mt != TextMessage || len(got) != len(payload) {
+		t.Fatalf("streaming initial read failed: mt=%d bytes=%d err=%v", mt, len(got), err)
+	}
+	if reserved != len(payload) {
+		t.Fatalf("reservation counted %d bytes, want actual retained %d", reserved, len(payload))
+	}
+}
+
+func TestReadInitialWithReservationFailsBeforeExceedingBudget(t *testing.T) {
+	client, server := managedPairForTestWithConfigs(t, Config{ReadLimit: 1 << 20}, Config{})
+	defer client.Close(CloseInfo{Kind: CloseKindAbort})
+	defer server.Close(CloseInfo{Kind: CloseKindAbort})
+	if err := server.WriteMessage(TextMessage, make([]byte, 96<<10)); err != nil {
+		t.Fatal(err)
+	}
+	reserved := 0
+	_, got, err := client.ReadInitialWithReservation(context.Background(), func(bytes int) bool {
+		if reserved+bytes > 48<<10 {
+			return false
+		}
+		reserved += bytes
+		return true
+	})
+	if !errors.Is(err, ErrFirstFrameByteBudget) || got != nil {
+		t.Fatalf("expected explicit byte-budget failure without returned payload, bytes=%d err=%v", len(got), err)
+	}
+	if reserved > 48<<10 {
+		t.Fatalf("reservation exceeded configured budget: %d", reserved)
+	}
+}
+
 func TestReadInitialPeerCloseReturnsCloseError(t *testing.T) {
 	client, server := managedPairForTest(t)
 	defer client.Close(CloseInfo{Kind: CloseKindAbort})

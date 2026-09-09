@@ -63,8 +63,13 @@ func (c *ManagedConn) finishPump() {
 }
 
 var ErrFirstFrameTooLarge = errors.New("wsconn: first frame too large")
+var ErrFirstFrameByteBudget = errors.New("wsconn: first frame byte budget exceeded")
 
 func (c *ManagedConn) ReadInitial(ctx context.Context) (MessageType, []byte, error) {
+	return c.ReadInitialWithReservation(ctx, nil)
+}
+
+func (c *ManagedConn) ReadInitialWithReservation(ctx context.Context, reserve func(int) bool) (MessageType, []byte, error) {
 	if c == nil || c.raw == nil {
 		return 0, nil, net.ErrClosed
 	}
@@ -85,15 +90,29 @@ func (c *ManagedConn) ReadInitial(ctx context.Context) (MessageType, []byte, err
 		retErr = ErrInvalidMessageType
 		return 0, nil, retErr
 	}
-	limit := c.readLimit() + 1
-	payload, err := io.ReadAll(io.LimitReader(reader, limit))
-	if err != nil {
-		retErr = classifyContextReadError(ctx, err)
-		return 0, nil, retErr
-	}
-	if int64(len(payload)) > c.readLimit() {
-		retErr = fmt.Errorf("%w: limit %d", ErrFirstFrameTooLarge, c.readLimit())
-		return 0, nil, retErr
+	limit := c.readLimit()
+	payload := make([]byte, 0, min(limit, 32<<10))
+	chunk := make([]byte, 32<<10)
+	for {
+		n, readErr := reader.Read(chunk)
+		if n > 0 {
+			if int64(len(payload))+int64(n) > limit {
+				retErr = fmt.Errorf("%w: limit %d", ErrFirstFrameTooLarge, limit)
+				return 0, nil, retErr
+			}
+			if reserve != nil && !reserve(n) {
+				retErr = ErrFirstFrameByteBudget
+				return 0, nil, retErr
+			}
+			payload = append(payload, chunk[:n]...)
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			retErr = classifyContextReadError(ctx, readErr)
+			return 0, nil, retErr
+		}
 	}
 	return MessageType(mt), payload, nil
 }
