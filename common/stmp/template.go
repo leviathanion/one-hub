@@ -5,13 +5,15 @@ import (
 )
 
 func getLogo() string {
-	if config.Logo == "" {
+	options := config.GlobalOption.RuntimeSnapshot()
+	logo := options.String("Logo", config.Logo)
+	if logo == "" {
 		return ""
 	}
 	return `<table class="logo" width="100%">
 	<tr>
 	  <td>
-		<img src="` + config.Logo + `" width="130" style="max-width: 100%"
+		<img src="` + logo + `" width="130" style="max-width: 100%"
 		/>
 	  </td>
 	</tr>
@@ -19,11 +21,13 @@ func getLogo() string {
 }
 
 func getSystemName() string {
-	if config.SystemName == "" {
+	options := config.GlobalOption.RuntimeSnapshot()
+	systemName := options.String("SystemName", config.SystemName)
+	if systemName == "" {
 		return "One Hub"
 	}
 
-	return config.SystemName
+	return systemName
 }
 
 func getDefaultTemplate(content string) string {
