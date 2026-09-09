@@ -61,13 +61,13 @@ lastUpdated: true
 - `responses` 请求在 `relay/channel_affinity.go` 的 `prepareResponsesChannelAffinity(...)` 阶段先调用 `requesthints.ResolveResponses(...)`。
 - Codex routing hint 通过 `providers/codex/routing_hint.go` 生成 `responses.prompt_cache_key`。
 - affinity lookup 和 Codex Official HTTP provider 最终请求都消费同一个 hint；relay 把该 hint 作为 `Request.Policy.PromptCache` 交给 provider，BodyPlanner 只负责把同一个 decision 序列化进 upstream body。
-- 仅配置 `channel.Other.prompt_cache_key_strategy` 时，Codex Official HTTP `/v1/responses` 不会在选中渠道后生成 `Policy.PromptCache` 并写入上游 body。需要自动生成 HTTP `prompt_cache_key` 或选路前命中时，必须配置 `CodexRoutingHintSetting`。
+- 需要自动生成 HTTP `prompt_cache_key` 或选路前命中时，配置全局 `CodexRoutingHintSetting`；渠道不提供选中后的缓存提示修补。
 
 选择原因：
 
 - 如果稳定 hint 只在 provider 内部事后生成，记录 affinity 和命中 affinity 发生在两个时间层，路由阶段无法看到真正的稳定亲和键。
 - 对 prompt cache 这类会直接影响渠道选择的键，必须在选路之前固定下来。
-- 这里的取舍是把会影响 provider selection 的事实固定在 relay 层；`channel.Other.prompt_cache_key_strategy` 只保留 legacy Realtime/bridge 行为，不再被描述为 Official HTTP 的后选路 body policy。
+- 缓存提示在 provider selection 前由 relay 解析；渠道不在选中后生成或替换 `prompt_cache_key`。
 
 ### 4. Codex realtime 采用“共享 binding hint + 本地 runtime owner”，不做 strict distributed owner
 
@@ -101,7 +101,7 @@ lastUpdated: true
 已选方案：
 
 - 当上游返回 `previous_response_not_found` 时，外层统一清理本次请求涉及的 affinity binding。
-- 记录“可恢复候选”元数据，但直接返回显式 `409 conflict` 错误给客户端。
+- 记录“可恢复候选”元数据，并保留上游 `previous_response_not_found` 的原 status/body；本地 owner/proof miss 使用统一的 400 分类。
 - 不自动清空 `previous_response_id`，不在无 replay 能力前提下做静默重放。
 
 选择原因：
@@ -133,13 +133,13 @@ lastUpdated: true
 1. 作用域层：`groupctx.CurrentRoutingGroup(...)` 定义请求当前真实选路作用域。
 2. 规则层：`ChannelAffinitySettings` 定义哪些请求、哪些键、哪些上下文维度参与 affinity。
 3. 存储层：`runtime/channelaffinity.Manager` 提供本地内存 + 可选 Redis 的 hybrid affinity record 存储。
-4. 协议层：`responses`、Codex routing hint、Codex realtime、fallback 与 continuation miss 共同消费同一套 affinity contract。
+4. 协议层：Chat Completions、`responses`、Codex routing hint、Codex realtime、fallback 与 continuation miss 共同消费同一套 affinity contract。
 
 ## 配置与数据模型
 
 ### 默认规则
 
-`common/config/channel_affinity.go` 当前内置三条默认规则：
+`common/config/channel_affinity.go` 当前内置四条默认规则：
 
 1. `responses-continuation`
    - kind: `responses`
@@ -151,7 +151,12 @@ lastUpdated: true
    - key source: `request_field.prompt_cache_key`
    - key source: `request_hint.responses.prompt_cache_key`
    - `record_on_success: true`
-3. `realtime-session`
+3. `chat-prompt-cache-key`
+   - kind: `chat`
+   - key source: `request_field.prompt_cache_key`
+   - 按当前 routing group 和 model 隔离
+   - `record_on_success: true`
+4. `realtime-session`
    - kind: `realtime`
    - key source: `header.x-session-id`
    - key source: `header.session_id`
@@ -207,6 +212,8 @@ manager 支持：
 - 本地 `MaxEntries` 容量控制
 - Redis 过期清理与超量裁剪
 
+Redis 写热路径由一个原子脚本完成 entry `SET`、index `ZADD` 和必要的最老成员容量淘汰，脚本缓存命中后只有一次网络往返；它不在请求内执行过期扫描、`ZCARD -> ZRANGE -> pipeline` 多阶段维护。过期 index 由 janitor 在同一个 2 秒预算内按 1024 条批次排空。仅当 manager 构造时没有 janitor 且 `MaxEntries=0` 时，写路径至多每分钟异步触发一次 sweep 作为无界 index 的安全兜底；触发本身不等待 Redis。Redis 仍是 best-effort hint，写入或清理失败不阻断已成功的业务请求。
+
 ## 核心流程
 
 ### 1. 请求初始化与路由作用域建立
@@ -237,7 +244,13 @@ manager 支持：
 - `request_hint` 只解决“选路前可见的稳定 identity”问题，不改变 provider 的最终请求语义。
 - 如果请求已显式 pin 渠道，则只记录元数据，不写共享 affinity。
 
-### 3. Codex prompt-cache pre-routing
+### 3. Chat Completions prompt-cache affinity
+
+原生 Chat Completions 在解析 raw envelope 后读取顶层字符串 `prompt_cache_key`，通过与 Responses 相同的规则评估、选路和成功写回机制建立 soft affinity。该观察不会重写请求，也不会接管上游对字段类型和值的校验；非字符串值仅跳过本地 affinity。
+
+显式配置的 `rules` 是运维拥有的完整规则集，升级不会隐式合并新默认规则。旧配置若显式保存过默认数组，需要由运维加入 `chat-prompt-cache-key`。
+
+### 4. Codex prompt-cache pre-routing
 
 Codex 的 `responses.prompt_cache_key` 派生由 `providers/codex/routing_hint.go` 提供：
 
@@ -248,7 +261,7 @@ Codex 的 `responses.prompt_cache_key` 派生由 `providers/codex/routing_hint.g
 
 当前选型不是“provider 内部晚生成”，而是“路由阶段先派生，provider 阶段复用”。
 
-### 4. Codex realtime affinity
+### 5. Codex realtime affinity
 
 Codex realtime 的共享亲和逻辑由 `providers/codex/realtime_session.go` 和 `runtime/session` 共同实现。
 
@@ -272,7 +285,7 @@ Codex realtime 的共享亲和逻辑由 `providers/codex/realtime_session.go` �
 - `VisibilityLocalOnly` 表示本地可继续服务，但不宣称自己已成为新的共享 binding。
 - publish/write 失败时优先保住本地可用性，而不是为了追求共享状态强一致而放弃服务。
 
-### 5. Preferred channel fallback
+### 6. Preferred channel fallback
 
 当 affinity 命中某个 preferred channel 时：
 
@@ -291,7 +304,7 @@ Codex realtime 的共享亲和逻辑由 `providers/codex/realtime_session.go` �
 - 非 strict affinity 明确承担可用性优先；
 - 失败影响只局限在当前请求。
 
-### 6. Continuation miss 处理
+### 7. Continuation miss 处理
 
 `relay/main.go` 在外层统一处理 `responses` continuation miss：
 
@@ -299,7 +312,7 @@ Codex realtime 的共享亲和逻辑由 `providers/codex/realtime_session.go` �
 2. 清理当前请求的所有 affinity binding。
 3. 重新准备请求级 affinity 状态，避免 stale binding 残留。
 4. 记录恢复候选元数据。
-5. 返回本地构造的显式 `409 conflict` 错误。
+5. 保留上游错误的 status/body 返回，不合成新的 409。
 
 当前明确不做：
 
@@ -307,7 +320,7 @@ Codex realtime 的共享亲和逻辑由 `providers/codex/realtime_session.go` �
 - 静默回放。
 - 把 continuation miss 视为普通渠道错误并走通用 retry/cooldown。
 
-ResponsesWS 也遵守同一 correctness 边界，但错误交互形态不同：actor 在当前 upstream session 内透传或规范化为 WS error frame，并记录连接建立时的 upstream snapshot；不得因为 `previous_response_not_found` 重新选 channel/key、重放业务事件或清空 `previous_response_id` 后继续发送。HTTP bridge omitted turn 使用 actor 的 `lastFinal.ID` 作为 default `previous_response_id` 时，该 default 也是本次实际 attempted continuation key；若 provider 返回 miss，actor 必须按 owner 条件清理对应 response-id binding，并在匹配时清除 `lastFinal`，防止后续 omitted turn 重复注入 stale id。
+ResponsesWS 也遵守同一 correctness 边界，但错误交互形态不同：actor 在当前 native upstream session 内透传 provider request error 或返回本地 WS error frame，并记录连接建立时的 upstream snapshot；不得因为 `previous_response_not_found` 重新选 channel/key、重放业务事件或清空 `previous_response_id` 后继续发送。命中 miss 时只清理对应 soft affinity/ephemeral proof；durable owner 不因一次 provider miss 被改写。
 
 ## 一致性模型
 
