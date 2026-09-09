@@ -305,7 +305,13 @@ export default function Gateway() {
           showFirstButton
           showLastButton
         />
-        <EditeModal open={openModal} onCancel={handleCloseModal} onOk={handleOkModal} paymentId={editPaymentId} />
+        <EditeModal
+          onCreated={setEditPaymentId}
+          open={openModal}
+          onCancel={handleCloseModal}
+          onOk={handleOkModal}
+          paymentId={editPaymentId}
+        />
       </Card>
     </>
   );

@@ -1,362 +1,255 @@
 import PropTypes from 'prop-types';
 import * as Yup from 'yup';
 import { Formik } from 'formik';
-import { useTheme } from '@mui/material/styles';
 import { useState, useEffect } from 'react';
-import {
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  DialogActions,
-  Button,
-  Divider,
-  FormControl,
-  InputLabel,
-  OutlinedInput,
-  TextField,
-  Select,
-  MenuItem,
-  FormHelperText
-} from '@mui/material';
-
-import { showSuccess, showError, trims } from 'utils/common';
+import { Alert, Dialog, DialogTitle, DialogContent, DialogActions, Button, Stack, TextField, MenuItem, Typography } from '@mui/material';
+import { showSuccess, showError } from 'utils/common';
 import { API } from 'utils/api';
-import { PaymentType, CurrencyType, PaymentConfig } from '../type/Config';
-import { useTranslation } from 'react-i18next';
+import { PaymentType, CurrencyType, PaymentConfig, PaymentProducts, defaultConfig } from '../type/Config';
 
-const getValidationSchema = (t) =>
-  Yup.object().shape({
-    is_edit: Yup.boolean(),
-    name: Yup.string().required(t('validation.requiredName')),
-    icon: Yup.string().required(t('payment_edit.requiredIcon')),
-    fixed_fee: Yup.number().min(0, t('payment_edit.requiredFixedFee')),
-    percent_fee: Yup.number().min(0, t('payment_edit.requiredPercentFee')),
-    currency: Yup.string().required(t('payment_edit.requiredCurrency'))
-  });
-
-const originInputs = {
-  is_edit: false,
+const initialPayment = () => ({
   type: 'epay',
-  uuid: '',
   name: '',
   icon: '',
   notify_domain: '',
   fixed_fee: 0,
   percent_fee: 0,
   currency: 'CNY',
-  config: {},
+  default_product: Object.keys(PaymentProducts.epay)[0],
+  config: defaultConfig('epay'),
   sort: 0,
   enable: true
-};
+});
+const schema = Yup.object({
+  name: Yup.string().required('请输入名称'),
+  icon: Yup.string().required('请输入图标地址'),
+  fixed_fee: Yup.number().min(0, '固定手续费不能为负'),
+  percent_fee: Yup.number().min(0, '手续费率不能为负'),
+  currency: Yup.string().required('请选择币种'),
+  default_product: Yup.string().required('请选择支付产品')
+});
 
-const EditModal = ({ open, paymentId, onCancel, onOk }) => {
-  const { t } = useTranslation();
-  const theme = useTheme();
-  const [inputs, setInputs] = useState(originInputs);
-
-  const submit = async (values, { setErrors, setStatus, setSubmitting }) => {
-    setSubmitting(true);
-
-    let config = JSON.stringify(values.config);
-    let res;
-    values = trims(values);
-    try {
-      if (values.is_edit) {
-        res = await API.put(`/api/payment/`, { ...values, id: parseInt(paymentId), config });
-      } else {
-        res = await API.post(`/api/payment/`, { ...values, config });
-      }
-      const { success, message } = res.data;
-      if (success) {
-        if (values.is_edit) {
-          showSuccess(t('payment_edit.updateOk'));
-        } else {
-          showSuccess(t('payment_edit.addOk'));
-        }
-        setSubmitting(false);
-        setStatus({ success: true });
-        onOk(true);
-      } else {
-        showError(message);
-        setErrors({ submit: message });
-      }
-    } catch (error) {
-      return;
-    }
-  };
-
-  const loadPayment = async () => {
-    try {
-      let res = await API.get(`/api/payment/${paymentId}`);
-      const { success, message, data } = res.data;
-      if (success) {
-        data.is_edit = true;
-        data.config = JSON.parse(data.config);
-        setInputs(data);
-      } else {
-        showError(message);
-      }
-    } catch (error) {
-      return;
-    }
-  };
-
+const EditModal = ({ open, paymentId, onCancel, onOk, onCreated, credentialsOnly = false }) => {
+  const [inputs, setInputs] = useState(initialPayment);
+  const [rotation, setRotation] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState('');
   useEffect(() => {
-    if (paymentId) {
-      loadPayment().then();
-    } else {
-      setInputs(originInputs);
+    if (!open) return;
+    setRotation(credentialsOnly);
+    setLoadError('');
+    if (!paymentId) {
+      setLoading(false);
+      setInputs(initialPayment());
+      return;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [paymentId]);
+    let active = true;
+    setLoading(true);
+    API.get(`/api/payment/${paymentId}`)
+      .then(({ data }) => {
+        if (!data.success) throw new Error(data.message || '读取网关失败');
+        if (active) {
+          setInputs({ ...data.data, config: JSON.parse(data.data.config) });
+          setRotation(credentialsOnly || data.data.setup_status === 'failed');
+        }
+      })
+      .catch((err) => {
+        if (active) setLoadError(err.message || '读取网关失败');
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [open, paymentId, credentialsOnly]);
+
+  const submit = async (values, { setErrors, setSubmitting }) => {
+    try {
+      let response;
+      if (paymentId && rotation) {
+        response = await API.put(`/api/payment/${paymentId}/credentials`, {
+          expected_revision: inputs.credential_revision,
+          config: JSON.stringify(values.config)
+        });
+      } else {
+        const business = {
+          name: values.name.trim(),
+          icon: values.icon.trim(),
+          notify_domain: values.notify_domain.trim(),
+          fixed_fee: Number(values.fixed_fee),
+          percent_fee: Number(values.percent_fee),
+          currency: values.currency,
+          default_product: values.default_product,
+          sort: Number(values.sort),
+          enable: values.enable
+        };
+        response = paymentId
+          ? await API.put('/api/payment/', { id: paymentId, ...business })
+          : await API.post('/api/payment/', { ...business, type: values.type, config: JSON.stringify(values.config) });
+      }
+      if (!response.data.success) {
+        if (!paymentId && response.data.data?.id) onCreated?.(response.data.data.id);
+        throw new Error(response.data.message || '保存失败');
+      }
+      showSuccess(rotation ? '凭证已轮换' : '支付网关已保存');
+      onOk(true);
+    } catch (err) {
+      const message = err.response?.data?.message || err.message || '保存失败';
+      showError(message);
+      setErrors({ submit: message });
+    } finally {
+      setSubmitting(false);
+    }
+  };
 
   return (
-    <Dialog open={open} onClose={onCancel} fullWidth maxWidth={'md'}>
-      <DialogTitle sx={{ margin: '0px', fontWeight: 700, lineHeight: '1.55556', padding: '24px', fontSize: '1.125rem' }}>
-        {paymentId ? t('payment_edit.paymentEdit') : t('paymentGatewayPage.createPayment')}
-      </DialogTitle>
-      <Divider />
+    <Dialog open={open} onClose={onCancel} fullWidth maxWidth="md">
+      <DialogTitle>{paymentId ? (rotation ? '轮换支付凭证' : '编辑支付网关') : '创建支付网关'}</DialogTitle>
       <DialogContent>
-        <Formik initialValues={inputs} enableReinitialize validationSchema={getValidationSchema(t)} onSubmit={submit}>
-          {({ errors, handleBlur, handleChange, handleSubmit, touched, values, isSubmitting }) => (
-            <form noValidate onSubmit={handleSubmit}>
-              <FormControl fullWidth error={Boolean(touched.type && errors.type)} sx={{ ...theme.typography.otherInput }}>
-                <InputLabel htmlFor="channel-type-label">{t('paymentGatewayPage.tableHeaders.type')}</InputLabel>
-                <Select
-                  id="channel-type-label"
-                  label={t('paymentGatewayPage.tableHeaders.type')}
-                  value={values.type}
-                  name="type"
-                  onBlur={handleBlur}
-                  onChange={handleChange}
-                  MenuProps={{
-                    PaperProps: {
-                      style: {
-                        maxHeight: 200
-                      }
-                    }
-                  }}
-                >
-                  {Object.entries(PaymentType).map(([value, text]) => (
-                    <MenuItem key={value} value={value}>
-                      {text}
-                    </MenuItem>
-                  ))}
-                </Select>
-                {touched.type && errors.type ? (
-                  <FormHelperText error id="helper-tex-channel-type-label">
-                    {errors.type}
-                  </FormHelperText>
-                ) : (
-                  <FormHelperText id="helper-tex-channel-type-label"> {t('payment_edit.paymentType')} </FormHelperText>
-                )}
-              </FormControl>
-
-              <FormControl fullWidth error={Boolean(touched.name && errors.name)} sx={{ ...theme.typography.otherInput }}>
-                <InputLabel htmlFor="channel-name-label">{t('paymentGatewayPage.tableHeaders.name')}</InputLabel>
-                <OutlinedInput
-                  id="channel-name-label"
-                  label={t('paymentGatewayPage.tableHeaders.name')}
-                  type="text"
-                  value={values.name}
-                  name="name"
-                  onBlur={handleBlur}
-                  onChange={handleChange}
-                  inputProps={{ autoComplete: 'name' }}
-                  aria-describedby="helper-text-channel-name-label"
-                />
-                {touched.name && errors.name && (
-                  <FormHelperText error id="helper-tex-channel-name-label">
-                    {errors.name}
-                  </FormHelperText>
-                )}
-              </FormControl>
-
-              <FormControl fullWidth error={Boolean(touched.icon && errors.icon)} sx={{ ...theme.typography.otherInput }}>
-                <InputLabel htmlFor="channel-icon-label">{t('paymentGatewayPage.tableHeaders.icon')}</InputLabel>
-                <OutlinedInput
-                  id="channel-icon-label"
-                  label={t('paymentGatewayPage.tableHeaders.icon')}
-                  type="text"
-                  value={values.icon}
-                  name="icon"
-                  onBlur={handleBlur}
-                  onChange={handleChange}
-                  inputProps={{ autoComplete: 'icon' }}
-                  aria-describedby="helper-text-channel-icon-label"
-                />
-                {touched.icon && errors.icon && (
-                  <FormHelperText error id="helper-tex-channel-icon-label">
-                    {errors.icon}
-                  </FormHelperText>
-                )}
-              </FormControl>
-
-              <FormControl fullWidth error={Boolean(touched.notify_domain && errors.notify_domain)} sx={{ ...theme.typography.otherInput }}>
-                <InputLabel htmlFor="channel-notify_domain-label">{t('payment_edit.notifyDomain')}</InputLabel>
-                <OutlinedInput
-                  id="channel-notify_domain-label"
-                  label={t('payment_edit.notifyDomain')}
-                  type="text"
-                  value={values.notify_domain}
-                  name="notify_domain"
-                  onBlur={handleBlur}
-                  onChange={handleChange}
-                  inputProps={{ autoComplete: 'notify_domain' }}
-                  aria-describedby="helper-text-channel-notify_domain-label"
-                />
-                {touched.notify_domain && errors.notify_domain ? (
-                  <FormHelperText error id="helper-tex-notify_domain-label">
-                    {errors.notify_domain}
-                  </FormHelperText>
-                ) : (
-                  <FormHelperText id="helper-tex-notify_domain-label"> {t('payment_edit.notifyDomainTip')} </FormHelperText>
-                )}
-              </FormControl>
-
-              <FormControl fullWidth error={Boolean(touched.fixed_fee && errors.fixed_fee)} sx={{ ...theme.typography.otherInput }}>
-                <InputLabel htmlFor="channel-fixed_fee-label">{t('paymentGatewayPage.tableHeaders.fixedFee')}</InputLabel>
-                <OutlinedInput
-                  id="channel-fixed_fee-label"
-                  label={t('paymentGatewayPage.tableHeaders.fixedFee')}
-                  type="number"
-                  value={values.fixed_fee}
-                  name="fixed_fee"
-                  onBlur={handleBlur}
-                  onChange={handleChange}
-                  inputProps={{ autoComplete: 'fixed_fee' }}
-                  aria-describedby="helper-text-channel-fixed_fee-label"
-                />
-                {touched.fixed_fee && errors.fixed_fee ? (
-                  <FormHelperText error id="helper-tex-fixed_fee-label">
-                    {errors.fixed_fee}
-                  </FormHelperText>
-                ) : (
-                  <FormHelperText id="helper-tex-fixed_fee-label"> {t('payment_edit.FixedTip')} </FormHelperText>
-                )}
-              </FormControl>
-
-              <FormControl fullWidth error={Boolean(touched.percent_fee && errors.percent_fee)} sx={{ ...theme.typography.otherInput }}>
-                <InputLabel htmlFor="channel-percent_fee-label">{t('paymentGatewayPage.tableHeaders.percentFee')}</InputLabel>
-                <OutlinedInput
-                  id="channel-percent_fee-label"
-                  label={t('paymentGatewayPage.tableHeaders.percentFee')}
-                  type="number"
-                  value={values.percent_fee}
-                  name="percent_fee"
-                  onBlur={handleBlur}
-                  onChange={handleChange}
-                  inputProps={{ autoComplete: 'percent_fee' }}
-                  aria-describedby="helper-text-channel-percent_fee-label"
-                />
-                {touched.percent_fee && errors.percent_fee ? (
-                  <FormHelperText error id="helper-tex-percent_fee-label">
-                    {errors.percent_fee}
-                  </FormHelperText>
-                ) : (
-                  <FormHelperText id="helper-tex-percent_fee-label"> {t('payment_edit.percentTip')} </FormHelperText>
-                )}
-              </FormControl>
-
-              <FormControl fullWidth error={Boolean(touched.currency && errors.currency)} sx={{ ...theme.typography.otherInput }}>
-                <InputLabel htmlFor="channel-currency-label">{t('payment_edit.currencyType')}</InputLabel>
-                <Select
-                  id="channel-currency-label"
-                  label={t('payment_edit.currencyType')}
-                  value={values.currency}
-                  name="currency"
-                  onBlur={handleBlur}
-                  onChange={handleChange}
-                  MenuProps={{
-                    PaperProps: {
-                      style: {
-                        maxHeight: 200
-                      }
-                    }
-                  }}
-                >
-                  {Object.entries(CurrencyType).map(([value, text]) => (
-                    <MenuItem key={value} value={value}>
-                      {text}
-                    </MenuItem>
-                  ))}
-                </Select>
-                {touched.currency && errors.currency ? (
-                  <FormHelperText error id="helper-tex-channel-currency-label">
-                    {errors.currency}
-                  </FormHelperText>
-                ) : (
-                  <FormHelperText id="helper-tex-channel-currency-label"> {t('payment_edit.currencyTip')} </FormHelperText>
-                )}
-              </FormControl>
-
-              {PaymentConfig[values.type] &&
-                Object.keys(PaymentConfig[values.type]).map((configKey) => {
-                  const param = PaymentConfig[values.type][configKey];
-                  const name = `config.${configKey}`;
-                  return param.type === 'select' ? (
-                    <FormControl key={name} fullWidth>
-                      <InputLabel htmlFor="channel-currency-label">{param.name}</InputLabel>
-                      <Select
-                        label={param.name}
-                        value={values.config?.[configKey] || ''}
-                        key={name}
-                        name={name}
-                        onBlur={handleBlur}
+        {loadError && <Alert severity="error">{loadError}</Alert>}
+        {loading ? (
+          <Typography>正在读取网关…</Typography>
+        ) : (
+          !loadError && (
+            <Formik initialValues={inputs} enableReinitialize validationSchema={schema} onSubmit={submit}>
+              {({ values, errors, handleChange, handleSubmit, setFieldValue, isSubmitting, resetForm }) => (
+                <form noValidate onSubmit={handleSubmit}>
+                  <Stack spacing={2} sx={{ pt: 1 }}>
+                    {paymentId && (
+                      <Alert severity="info">
+                        商户、应用、环境与协议身份已冻结；更换主体请新建网关。凭证版本：{inputs.credential_revision}；配置状态：
+                        {inputs.setup_status || '—'}。
+                      </Alert>
+                    )}
+                    {inputs.setup_status === 'failed' && (
+                      <Alert severity="warning">
+                        网关 #{inputs.id} 已保留，配置尚未完成（{inputs.setup_error || '请核查配置'}）。请在本网关修正凭证并重新配置。
+                      </Alert>
+                    )}
+                    {credentialsOnly && (
+                      <Typography variant="body2">维护原网关凭证供历史订单验证使用；不会重新开放该网关的新订单。</Typography>
+                    )}
+                    <TextField
+                      select
+                      label="网关类型"
+                      name="type"
+                      value={values.type}
+                      disabled={Boolean(paymentId)}
+                      onChange={(event) => {
+                        handleChange(event);
+                        setFieldValue('config', defaultConfig(event.target.value));
+                        setFieldValue('default_product', Object.keys(PaymentProducts[event.target.value])[0]);
+                      }}
+                    >
+                      {Object.entries(PaymentType).map(([key, name]) => (
+                        <MenuItem key={key} value={key}>
+                          {name}
+                        </MenuItem>
+                      ))}
+                    </TextField>
+                    {[
+                      ['name', '名称'],
+                      ['icon', '图标地址'],
+                      ['notify_domain', '通知域名'],
+                      ['fixed_fee', '固定手续费'],
+                      ['percent_fee', '手续费率']
+                    ].map(([key, label]) => (
+                      <TextField
+                        key={key}
+                        name={key}
+                        label={label}
+                        value={values[key]}
+                        disabled={rotation}
+                        type={key.endsWith('fee') ? 'number' : 'text'}
+                        inputProps={key.endsWith('fee') ? { step: 'any', min: 0 } : undefined}
                         onChange={handleChange}
-                        MenuProps={{
-                          PaperProps: {
-                            style: {
-                              maxHeight: 200
-                            }
-                          }
-                        }}
+                        error={Boolean(errors[key])}
+                        helperText={errors[key]}
+                      />
+                    ))}
+                    <TextField select label="币种" name="currency" value={values.currency} disabled={rotation} onChange={handleChange}>
+                      {Object.entries(CurrencyType).map(([key, name]) => (
+                        <MenuItem key={key} value={key}>
+                          {name}
+                        </MenuItem>
+                      ))}
+                    </TextField>
+                    <TextField
+                      select
+                      label="默认支付产品"
+                      name="default_product"
+                      value={values.default_product || ''}
+                      disabled={rotation}
+                      onChange={handleChange}
+                    >
+                      {(inputs.products || Object.keys(PaymentProducts[values.type] || {})).map((key) => (
+                        <MenuItem key={key} value={key}>
+                          {PaymentProducts[values.type]?.[key] || key}
+                        </MenuItem>
+                      ))}
+                    </TextField>
+                    {Object.entries(PaymentConfig[values.type] || {}).map(([key, field]) => (
+                      <TextField
+                        key={key}
+                        label={field.name}
+                        name={`config.${key}`}
+                        value={values.config[key] || ''}
+                        select={field.type === 'select'}
+                        multiline={field.type !== 'select'}
+                        disabled={field.generated || (Boolean(paymentId) && (!rotation || field.identity))}
+                        helperText={field.description}
+                        onChange={handleChange}
                       >
-                        {Object.values(param.options).map((option) => {
-                          return (
+                        {field.type === 'select' &&
+                          field.options.map((option) => (
                             <MenuItem key={option.value} value={option.value}>
                               {option.name}
                             </MenuItem>
-                          );
-                        })}
-                      </Select>
-                      <FormHelperText id="helper-tex-channel-currency-label"> {param.description} </FormHelperText>
-                    </FormControl>
-                  ) : (
-                    <FormControl key={name} fullWidth sx={{ ...theme.typography.otherInput }}>
-                      <TextField
-                        multiline
-                        key={name}
-                        name={name}
-                        value={values.config?.[configKey] || ''}
-                        label={param.name}
-                        placeholder={param.description}
-                        onChange={handleChange}
-                      />
-                      <FormHelperText id="helper-tex-channel-key-label"> {param.description} </FormHelperText>
-                    </FormControl>
-                  );
-                })}
-
-              <DialogActions>
-                <Button onClick={onCancel}>{t('common.cancel')}</Button>
-                <Button disableElevation disabled={isSubmitting} type="submit" variant="contained" color="primary">
-                  {t('common.submit')}
-                </Button>
-              </DialogActions>
-            </form>
-          )}
-        </Formik>
+                          ))}
+                      </TextField>
+                    ))}
+                    {inputs.capabilities && (
+                      <Alert severity="info">
+                        支持币种：{inputs.capabilities.currencies?.join('、')}； 查单：
+                        {inputs.capabilities.query_by_merchant_ref || inputs.capabilities.query_by_resource_ref ? '支持' : '不支持'}；
+                        关单：{inputs.capabilities.can_close ? '支持' : '不支持'}； 动作：{inputs.capabilities.action_kinds?.join('、')}。
+                      </Alert>
+                    )}
+                    {errors.submit && <Alert severity="error">{errors.submit}</Alert>}
+                  </Stack>
+                  <DialogActions>
+                    {paymentId && !credentialsOnly && (
+                      <Button
+                        disabled={isSubmitting}
+                        onClick={() => {
+                          resetForm();
+                          setRotation(!rotation);
+                        }}
+                      >
+                        {rotation ? '返回业务编辑' : '轮换同主体凭证'}
+                      </Button>
+                    )}
+                    <Button onClick={onCancel}>取消</Button>
+                    <Button type="submit" variant="contained" disabled={isSubmitting}>
+                      {rotation ? '确认轮换凭证' : '保存'}
+                    </Button>
+                  </DialogActions>
+                </form>
+              )}
+            </Formik>
+          )
+        )}
       </DialogContent>
     </Dialog>
   );
 };
-
-export default EditModal;
-
 EditModal.propTypes = {
   open: PropTypes.bool,
   paymentId: PropTypes.number,
   onCancel: PropTypes.func,
-  onOk: PropTypes.func
+  onOk: PropTypes.func,
+  onCreated: PropTypes.func,
+  credentialsOnly: PropTypes.bool
 };
+export default EditModal;
