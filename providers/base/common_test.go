@@ -8,6 +8,7 @@ import (
 	"one-api/common/config"
 	"one-api/common/logger"
 	"one-api/common/requestbody"
+	"one-api/common/requester"
 	"strings"
 	"testing"
 	"time"
@@ -45,6 +46,38 @@ func TestGetRawBodyCachesRequestBodyOnDemand(t *testing.T) {
 	}
 	if string(gotCanonical) != body {
 		t.Fatalf("unexpected canonical request body: got %q want %q", gotCanonical, body)
+	}
+}
+
+func TestSetContextMakesInboundCancellationTheRequesterDefault(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	requestContext, cancel := context.WithCancel(context.Background())
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(requestContext)
+
+	provider := &BaseProvider{
+		Channel:   &model.Channel{},
+		Requester: requester.NewHTTPRequester("", nil),
+	}
+	provider.SetContext(ctx)
+	req, err := provider.Requester.NewRequest(http.MethodPost, "https://provider.example/v1/chat/completions")
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	if err := req.Context().Err(); err != nil {
+		t.Fatalf("new upstream request started canceled: %v", err)
+	}
+
+	cancel()
+	select {
+	case <-req.Context().Done():
+		if !errors.Is(req.Context().Err(), context.Canceled) {
+			t.Fatalf("upstream request context error = %v, want context.Canceled", req.Context().Err())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("upstream request did not observe inbound cancellation")
 	}
 }
 
@@ -168,6 +201,13 @@ func TestLogChannelConfigParseErrorRedactsAndRateLimits(t *testing.T) {
 	provider := "unit-provider-" + strings.NewReplacer("/", "-", " ", "-").Replace(t.Name())
 	ctx := context.WithValue(context.Background(), logger.RequestIdKey, "req-provider-config-log")
 	err := errors.New("bad Authorization: Bearer secret-token token=query-secret https://provider.example/v1?token=url-secret session session-secret sk-testSECRET123")
+	entriesBefore, _ := logger.GetLatestLogs(500)
+	matchingBefore := 0
+	for _, entry := range entriesBefore {
+		if strings.Contains(entry.Message, provider) {
+			matchingBefore++
+		}
+	}
 
 	LogChannelConfigParseError(ctx, provider, &model.Channel{Id: 11, Type: config.ChannelTypeGemini}, "api_version", err)
 	LogChannelConfigParseError(ctx, provider, &model.Channel{Id: 11, Type: config.ChannelTypeGemini}, "api_version", err)
@@ -182,10 +222,10 @@ func TestLogChannelConfigParseErrorRedactsAndRateLimits(t *testing.T) {
 			matches = append(matches, entry.Message)
 		}
 	}
-	if len(matches) != 3 {
-		t.Fatalf("expected same provider/channel/field to log once per interval and different channel separately, got %d entries: %#v", len(matches), matches)
+	if len(matches) != matchingBefore+3 {
+		t.Fatalf("expected this invocation to add three rate-limited entries, before=%d after=%d entries=%#v", matchingBefore, len(matches), matches)
 	}
-	for _, message := range matches {
+	for _, message := range matches[matchingBefore:] {
 		if !strings.Contains(message, "provider="+provider) || !strings.Contains(message, "channel_id=") || !strings.Contains(message, "field=api_version") {
 			t.Fatalf("expected provider/channel/field in log message, got %q", message)
 		}
@@ -194,5 +234,59 @@ func TestLogChannelConfigParseErrorRedactsAndRateLimits(t *testing.T) {
 				t.Fatalf("expected provider config log to redact %q, got %q", forbidden, message)
 			}
 		}
+	}
+}
+
+func TestApplyCustomParamsCannotRewriteSelectedModel(t *testing.T) {
+	request := map[string]interface{}{
+		"model":       "gpt-5.6",
+		"stream":      true,
+		"temperature": 0.2,
+		"generationConfig": map[string]interface{}{
+			"thinkingConfig": map[string]interface{}{"budget": 128},
+			"keep":           true,
+		},
+	}
+	got := ApplyCustomParams(request, map[string]interface{}{
+		"overwrite": true,
+		"model":     "late-deployment",
+		"stream":    false,
+		"remove_params": []interface{}{
+			"model",
+			"stream",
+			"generationConfig.thinkingConfig",
+		},
+		"temperature": 0.7,
+	}, "gpt-5.6", false)
+	if got["model"] != "gpt-5.6" {
+		t.Fatalf("expected routing-selected model to remain unchanged, got %#v", got["model"])
+	}
+	if got["stream"] != true {
+		t.Fatalf("expected relay-selected stream mode to remain unchanged, got %#v", got["stream"])
+	}
+	if got["temperature"] != 0.7 {
+		t.Fatalf("expected ordinary custom parameter overwrite to remain supported, got %#v", got["temperature"])
+	}
+	if _, exists := got["remove_params"]; exists {
+		t.Fatalf("custom parameter control field leaked upstream: %#v", got)
+	}
+	generationConfig, ok := got["generationConfig"].(map[string]interface{})
+	if !ok || generationConfig["keep"] != true {
+		t.Fatalf("ordinary nested provider parameters changed unexpectedly: %#v", got["generationConfig"])
+	}
+	if _, exists := generationConfig["thinkingConfig"]; exists {
+		t.Fatalf("ordinary nested provider parameter was not removed: %#v", generationConfig)
+	}
+}
+
+func TestApplyCustomParamsCannotRewriteSpeechStreamFormat(t *testing.T) {
+	request := map[string]interface{}{"stream_format": "sse", "input": "hello"}
+	got := ApplyCustomParams(request, map[string]interface{}{
+		"overwrite":     true,
+		"stream_format": "binary",
+		"remove_params": []interface{}{"stream_format", "stream_format.mode"},
+	}, "gpt-5", true)
+	if got["stream_format"] != "sse" {
+		t.Fatalf("channel parameters changed relay-owned stream_format: %#v", got)
 	}
 }

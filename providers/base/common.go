@@ -1,6 +1,7 @@
 package base
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 )
 
 type ProviderConfig struct {
+	EndpointError       error
 	BaseURL             string
 	Completions         string
 	ChatCompletions     string
@@ -37,49 +39,14 @@ type ProviderConfig struct {
 	Responses           string
 }
 
-func (pc *ProviderConfig) SetAPIUri(customMapping map[string]interface{}) {
-	relayModeMap := map[int]*string{
-		config.RelayModeChatCompletions:    &pc.ChatCompletions,
-		config.RelayModeCompletions:        &pc.Completions,
-		config.RelayModeEmbeddings:         &pc.Embeddings,
-		config.RelayModeAudioSpeech:        &pc.AudioSpeech,
-		config.RelayModeAudioTranscription: &pc.AudioTranscriptions,
-		config.RelayModeAudioTranslation:   &pc.AudioTranslations,
-		config.RelayModeModerations:        &pc.Moderation,
-		config.RelayModeImagesGenerations:  &pc.ImagesGenerations,
-		config.RelayModeImagesEdits:        &pc.ImagesEdit,
-		config.RelayModeImagesVariations:   &pc.ImagesVariations,
-		config.RelayModeResponses:          &pc.Responses,
-	}
-
-	for key, value := range customMapping {
-		keyInt := utils.String2Int(key)
-		customValue, isString := value.(string)
-		if !isString || customValue == "" {
-			continue
-		}
-
-		if _, exists := relayModeMap[keyInt]; !exists {
-			continue
-		}
-
-		value := customValue
-		if value == "disable" {
-			value = ""
-		}
-
-		*relayModeMap[keyInt] = value
-	}
-}
-
 type BaseProvider struct {
+	SupportResponse bool
 	OriginalModel   string
 	Usage           *types.Usage
 	Config          ProviderConfig
 	Context         *gin.Context
 	Channel         *model.Channel
 	Requester       *requester.HTTPRequester
-	SupportResponse bool
 }
 
 var (
@@ -169,6 +136,9 @@ func (p *BaseProvider) CommonRequestHeaders(headers map[string]string) {
 	customHeaders, err := p.Channel.GetModelHeadersMap()
 	if err == nil {
 		for key, value := range customHeaders {
+			if strings.EqualFold(strings.TrimSpace(key), "OpenAI-Organization") || strings.EqualFold(strings.TrimSpace(key), "OpenAI-Project") {
+				continue // 身份头由下方统一绑定生成，不参与业务 header 覆盖。
+			}
 			// model_headers 不允许覆盖凭证/路由头、hop-by-hop 头和 WebSocket
 			// handshake 协议头。业务头(Content-Type/Accept)不在保护范围，渠道
 			// 可以合法覆盖。
@@ -178,6 +148,9 @@ func (p *BaseProvider) CommonRequestHeaders(headers map[string]string) {
 			}
 			headers[key] = value
 		}
+	}
+	if identity, err := p.Channel.HeaderIdentity(); err == nil {
+		identity.ApplyTo(headers)
 	}
 }
 
@@ -193,6 +166,8 @@ const (
 // 这些头属于凭证/路由、RFC 7230 hop-by-hop 或 WebSocket handshake 协议面；
 // Content-Type/Accept 等业务头不在保护范围，渠道可以合法覆盖。
 var protectedModelHeaders = map[string]ModelHeaderProtectionReason{
+	"openai-organization": ModelHeaderProtectionCredentialRouting,
+	"openai-project":      ModelHeaderProtectionCredentialRouting,
 	"authorization":       ModelHeaderProtectionCredentialRouting,
 	"api-key":             ModelHeaderProtectionCredentialRouting,
 	"host":                ModelHeaderProtectionCredentialRouting,
@@ -230,6 +205,9 @@ func (p *BaseProvider) SetUsage(usage *types.Usage) {
 
 func (p *BaseProvider) SetContext(c *gin.Context) {
 	p.Context = c
+	if p.Requester != nil && c != nil && c.Request != nil {
+		p.Requester.Context = c.Request.Context()
+	}
 }
 
 func (p *BaseProvider) SetOriginalModel(ModelName string) {
@@ -301,21 +279,19 @@ func (p *BaseProvider) GetAPIUri(relayMode int) string {
 }
 
 func (p *BaseProvider) GetSupportedAPIUri(relayMode int) (url string, err *types.OpenAIErrorWithStatusCode) {
+	if p.Config.EndpointError != nil {
+		return "", common.ErrorWrapperLocal(p.Config.EndpointError, "invalid_channel_config", http.StatusInternalServerError)
+	}
 	url = p.GetAPIUri(relayMode)
 	if url == "" {
 		err = common.StringErrorWrapperLocal("The API interface is not supported", "unsupported_api", http.StatusNotImplemented)
 		return
 	}
-
 	return
 }
 
 func (p *BaseProvider) GetRequester() *requester.HTTPRequester {
 	return p.Requester
-}
-
-func (p *BaseProvider) GetSupportedResponse() bool {
-	return p.SupportResponse
 }
 
 func (p *BaseProvider) GetRawBody() ([]byte, bool) {
@@ -356,25 +332,100 @@ func (p *BaseProvider) MergeCustomParams(requestMap map[string]interface{}, cust
 // 以用户原始请求为基础，再反序列化处理后的请求字段进行覆盖，
 // 这样额外字段自然保留，并减少中间 map 拷贝。
 func (p *BaseProvider) MergeExtraBodyFromRawRequest(requestBytes []byte) (map[string]interface{}, error) {
-	merged := make(map[string]interface{})
-
 	rawMap, ok, err := p.GetRawBodyMap()
 	if err != nil {
 		return nil, err
 	}
-	if ok && rawMap != nil {
-		merged = rawMap
+	if !ok {
+		rawMap = nil
+	}
+	return mergeRawRequestBody(requestBytes, rawMap)
+}
+
+// requestBodyPlanError 保留 BuildRequestWithMerge 的错误分类，供能力门禁
+// 复用同一精确 body 规划器且不执行 I/O。
+type requestBodyPlanError struct {
+	code string
+	err  error
+}
+
+func (e *requestBodyPlanError) Error() string {
+	return e.err.Error()
+}
+
+func (e *requestBodyPlanError) Unwrap() error {
+	return e.err
+}
+
+// PlanRequestBodyWithMerge 按 BuildRequestWithMerge 的顺序应用 typed body、原始
+// extra body 和 custom parameter，只规划 body map；传输与请求构造仍由调用方负责。
+func PlanRequestBodyWithMerge(originalBody interface{}, allowExtraBody bool, rawBody map[string]interface{}, customParams map[string]interface{}, modelName string) (map[string]interface{}, error) {
+	var requestMap map[string]interface{}
+	if bodyMap, ok := originalBody.(map[string]interface{}); ok {
+		if allowExtraBody {
+			var err error
+			requestMap, err = cloneRequestBodyMap(rawBody)
+			if err != nil {
+				return nil, &requestBodyPlanError{code: "unmarshal_request_failed", err: err}
+			}
+		} else {
+			requestMap = make(map[string]interface{}, len(bodyMap))
+		}
+		for key, value := range bodyMap {
+			requestMap[key] = value
+		}
+	} else {
+		// 保留 struct -> JSON，使 json tag 和 omitempty 精确决定 typed 覆盖层。
+		requestBytes, err := json.Marshal(originalBody)
+		if err != nil {
+			return nil, &requestBodyPlanError{code: "marshal_request_failed", err: err}
+		}
+
+		if allowExtraBody {
+			requestMap, err = mergeRawRequestBody(requestBytes, rawBody)
+			if err != nil {
+				return nil, &requestBodyPlanError{code: "unmarshal_request_failed", err: err}
+			}
+		} else if err := json.Unmarshal(requestBytes, &requestMap); err != nil {
+			return nil, &requestBodyPlanError{code: "unmarshal_request_failed", err: err}
+		}
 	}
 
+	if customParams != nil {
+		requestMap = ApplyCustomParams(requestMap, customParams, modelName, false)
+	}
+	return requestMap, nil
+}
+
+func mergeRawRequestBody(requestBytes []byte, rawBody map[string]interface{}) (map[string]interface{}, error) {
+	merged, err := cloneRequestBodyMap(rawBody)
+	if err != nil {
+		return nil, err
+	}
 	if len(requestBytes) == 0 {
 		return merged, nil
 	}
-
 	if err := json.Unmarshal(requestBytes, &merged); err != nil {
 		return nil, err
 	}
-
 	return merged, nil
+}
+
+func cloneRequestBodyMap(rawBody map[string]interface{}) (map[string]interface{}, error) {
+	if rawBody == nil {
+		return make(map[string]interface{}), nil
+	}
+	encoded, err := json.Marshal(rawBody)
+	if err != nil {
+		return nil, err
+	}
+	clone := make(map[string]interface{}, len(rawBody))
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.UseNumber()
+	if err := decoder.Decode(&clone); err != nil {
+		return nil, err
+	}
+	return clone, nil
 }
 
 // BuildRequestWithMerge 通用的请求体构建方法，支持 CustomParameter 和 AllowExtraBody
@@ -393,42 +444,20 @@ func (p *BaseProvider) BuildRequestWithMerge(originalBody interface{}, fullReque
 	needMerge := customParams != nil || p.Channel.AllowExtraBody
 
 	if needMerge {
-		var requestMap map[string]interface{}
-		if bodyMap, ok := originalBody.(map[string]interface{}); ok {
-			if p.Channel.AllowExtraBody {
-				requestMap, err = p.MergeExtraBodyFromRawRequest(nil)
-				if err != nil {
-					return nil, common.ErrorWrapper(err, "unmarshal_request_failed", http.StatusInternalServerError)
-				}
-			} else {
-				requestMap = make(map[string]interface{}, len(bodyMap))
-			}
-			for key, value := range bodyMap {
-				requestMap[key] = value
-			}
-		} else {
-			// 保留 struct -> JSON 这一步，以遵循 json tag/omitempty 语义。
-			requestBytes, err := json.Marshal(originalBody)
+		var rawBody map[string]interface{}
+		if p.Channel.AllowExtraBody {
+			rawBody, _, err = p.GetRawBodyMap()
 			if err != nil {
-				return nil, common.ErrorWrapper(err, "marshal_request_failed", http.StatusInternalServerError)
-			}
-
-			if p.Channel.AllowExtraBody {
-				requestMap, err = p.MergeExtraBodyFromRawRequest(requestBytes)
-				if err != nil {
-					return nil, common.ErrorWrapper(err, "unmarshal_request_failed", http.StatusInternalServerError)
-				}
-			} else {
-				err = json.Unmarshal(requestBytes, &requestMap)
-				if err != nil {
-					return nil, common.ErrorWrapper(err, "unmarshal_request_failed", http.StatusInternalServerError)
-				}
+				return nil, common.ErrorWrapper(err, "unmarshal_request_failed", http.StatusInternalServerError)
 			}
 		}
 
-		// 处理自定义额外参数
-		if customParams != nil {
-			requestMap = p.MergeCustomParams(requestMap, customParams, modelName)
+		requestMap, err := PlanRequestBodyWithMerge(originalBody, p.Channel.AllowExtraBody, rawBody, customParams, modelName)
+		if err != nil {
+			if planErr, ok := err.(*requestBodyPlanError); ok {
+				return nil, common.ErrorWrapper(planErr.err, planErr.code, http.StatusInternalServerError)
+			}
+			return nil, common.ErrorWrapper(err, "unmarshal_request_failed", http.StatusInternalServerError)
 		}
 
 		requestBytes, err := json.Marshal(requestMap)
@@ -505,6 +534,9 @@ func ApplyCustomParams(requestMap map[string]interface{}, customParams map[strin
 		if paramsList, ok := removeParams.([]interface{}); ok {
 			for _, param := range paramsList {
 				if paramName, ok := param.(string); ok {
+					if isRelayOwnedCustomParameterPath(paramName) {
+						continue
+					}
 					removeNestedParam(requestMap, paramName)
 				}
 			}
@@ -513,8 +545,9 @@ func ApplyCustomParams(requestMap map[string]interface{}, customParams map[strin
 
 	// 添加额外参数
 	for key, value := range customParamsModel {
-		// 忽略 keys "stream", "overwrite", "per_model", "pre_add"
-		if key == "stream" || key == "overwrite" || key == "per_model" || key == "pre_add" {
+		// Model and stream mode are relay-owned routing/delivery facts; channel
+		// parameters must not rewrite them after those decisions.
+		if isRelayOwnedCustomParameterPath(key) || isCustomParameterControlField(key) {
 			continue
 		}
 
@@ -541,6 +574,25 @@ func ApplyCustomParams(requestMap map[string]interface{}, customParams map[strin
 	}
 
 	return requestMap
+}
+
+func isCustomParameterControlField(key string) bool {
+	switch key {
+	case "overwrite", "per_model", "pre_add", "remove_params":
+		return true
+	default:
+		return false
+	}
+}
+
+func isRelayOwnedCustomParameterPath(path string) bool {
+	topLevel, _, _ := strings.Cut(path, ".")
+	switch topLevel {
+	case "model", "stream", "stream_format":
+		return true
+	default:
+		return false
+	}
 }
 
 // removeNestedParam removes a parameter from the map, supporting nested paths like "generationConfig.thinkingConfig"
@@ -597,4 +649,43 @@ func DeepMergeMap(existing map[string]interface{}, new map[string]interface{}) m
 	}
 
 	return result
+}
+
+func (pc *ProviderConfig) SetAPIUri(customMapping map[string]interface{}) {
+	relayModeMap := map[int]*string{
+		config.RelayModeChatCompletions:    &pc.ChatCompletions,
+		config.RelayModeCompletions:        &pc.Completions,
+		config.RelayModeEmbeddings:         &pc.Embeddings,
+		config.RelayModeAudioSpeech:        &pc.AudioSpeech,
+		config.RelayModeAudioTranscription: &pc.AudioTranscriptions,
+		config.RelayModeAudioTranslation:   &pc.AudioTranslations,
+		config.RelayModeModerations:        &pc.Moderation,
+		config.RelayModeImagesGenerations:  &pc.ImagesGenerations,
+		config.RelayModeImagesEdits:        &pc.ImagesEdit,
+		config.RelayModeImagesVariations:   &pc.ImagesVariations,
+		config.RelayModeResponses:          &pc.Responses,
+	}
+
+	for key, value := range customMapping {
+		keyInt := utils.String2Int(key)
+		customValue, isString := value.(string)
+		if !isString || customValue == "" {
+			continue
+		}
+
+		if _, exists := relayModeMap[keyInt]; !exists {
+			continue
+		}
+
+		value := customValue
+		if value == "disable" {
+			value = ""
+		}
+
+		*relayModeMap[keyInt] = value
+	}
+}
+
+func (p *BaseProvider) GetSupportedResponse() bool {
+	return p.SupportResponse
 }

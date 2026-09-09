@@ -3,6 +3,7 @@ package base
 import (
 	"context"
 	"net/http"
+	"one-api/common/requestctx"
 	"one-api/common/requester"
 	commonresponses "one-api/common/responses"
 	"one-api/common/responsesws"
@@ -19,6 +20,7 @@ type Requestable interface {
 
 // 基础接口
 type ProviderInterface interface {
+	GetSupportedResponse() bool
 	// 获取基础URL
 	// GetBaseURL() string
 	// 获取完整请求URL
@@ -41,7 +43,6 @@ type ProviderInterface interface {
 	ModelMappingHandler(modelName string) (string, error)
 	GetRequester() *requester.HTTPRequester
 	CustomParameterHandler() (map[string]interface{}, error)
-	GetSupportedResponse() bool
 }
 
 // 完成接口
@@ -120,6 +121,12 @@ type RawRelayInterface interface {
 	CreateRelay(requestURL string) (*http.Response, *types.OpenAIErrorWithStatusCode)
 }
 
+// RawRelayURLBuilder marks providers that can map an authenticated downstream
+// resource path to their own upstream URL without relay knowing provider types.
+type RawRelayURLBuilder interface {
+	BuildRawRelayURL(escapedPath, rawQuery string) (string, error)
+}
+
 // 余额接口
 type BalanceInterface interface {
 	Balance() (float64, error)
@@ -159,4 +166,21 @@ type ResponsesInterface interface {
 	CreateResponses(ctx context.Context, req *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode)
 	CreateResponsesStream(ctx context.Context, req *commonresponses.Request) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode)
 	CompactResponses(ctx context.Context, req *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode)
+}
+
+type ResponsesInputTokensInterface interface {
+	ProviderInterface
+	CountResponsesInputTokens(ctx context.Context, req *commonresponses.Request) (*http.Response, *types.OpenAIErrorWithStatusCode)
+}
+
+type StoredResponsesRequest struct {
+	Operation  Operation
+	ResponseID string
+	RawQuery   string
+	Headers    requestctx.HeaderSnapshot
+}
+
+type StoredResponsesInterface interface {
+	ProviderInterface
+	RelayStoredResponse(ctx context.Context, req StoredResponsesRequest) (*http.Response, *types.OpenAIErrorWithStatusCode)
 }
