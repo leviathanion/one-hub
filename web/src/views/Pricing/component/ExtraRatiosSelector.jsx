@@ -5,6 +5,14 @@ import { Box, Typography, FormControl, InputLabel, OutlinedInput, Select, MenuIt
 import { Icon } from '@iconify/react';
 import { useTranslation } from 'react-i18next';
 import { extraRatiosConfig } from './config';
+import {
+  addExtraRatio,
+  getAddedExtraRatioConfigs,
+  getAvailableExtraRatioConfigs,
+  getExtraRatioLabel,
+  removeExtraRatio,
+  updateExtraRatio
+} from './extraRatiosState.mjs';
 
 export const ExtraRatiosSelector = ({ value = {}, onChange }) => {
   const { t } = useTranslation();
@@ -13,39 +21,34 @@ export const ExtraRatiosSelector = ({ value = {}, onChange }) => {
 
   // 过滤掉已经添加的配置项
   const availableRatios = useMemo(() => {
-    return extraRatiosConfig.filter((config) => value[config.key] === undefined);
+    return getAvailableExtraRatioConfigs(extraRatiosConfig, value);
   }, [value]);
 
   // 已添加的配置项
   const addedRatios = useMemo(() => {
-    return extraRatiosConfig.filter((config) => value[config.key] !== undefined);
+    return getAddedExtraRatioConfigs(extraRatiosConfig, value);
   }, [value]);
 
   // 添加新的扩展倍率，初始值为与基础价格相同
   const handleAddRatio = () => {
-    if (selectedRatio && !value[selectedRatio]) {
-      const newValue = { ...value, [selectedRatio]: 0 };
-      onChange(newValue);
-      setSelectedRatio('');
-    }
+    if (!selectedRatio) return;
+    onChange(addExtraRatio(value, selectedRatio));
+    setSelectedRatio('');
   };
 
   // 移除扩展倍率
   const handleRemoveRatio = (key) => {
-    const newValue = { ...value };
-    delete newValue[key];
-    onChange(newValue);
+    onChange(removeExtraRatio(value, key));
   };
 
   // 更新扩展倍率的值
   const handleChangeRatioValue = (key, newValue) => {
-    onChange({ ...value, [key]: newValue });
+    onChange(updateExtraRatio(value, key, newValue));
   };
 
   // 获取配置项的名称
   const getRatioNameByKey = (key) => {
-    const config = extraRatiosConfig.find((item) => item.key === key);
-    return config ? config.name : key;
+    return getExtraRatioLabel(t, key);
   };
 
   // 获取图标
@@ -101,7 +104,7 @@ export const ExtraRatiosSelector = ({ value = {}, onChange }) => {
                 <MenuItem key={option.key} value={option.key}>
                   <Stack direction="row" alignItems="center" spacing={1}>
                     <Icon icon={getIcon(option.isPrompt)} color={getIconColor(option.isPrompt)} width={16} />
-                    <Typography variant="body2">{option.name}</Typography>
+                    <Typography variant="body2">{getRatioNameByKey(option.key)}</Typography>
                   </Stack>
                 </MenuItem>
               ))
@@ -224,6 +227,5 @@ export const ExtraRatiosSelector = ({ value = {}, onChange }) => {
 
 ExtraRatiosSelector.propTypes = {
   value: PropTypes.object,
-  onChange: PropTypes.func.isRequired,
-  handleStartAdornment: PropTypes.func.isRequired
+  onChange: PropTypes.func.isRequired
 };

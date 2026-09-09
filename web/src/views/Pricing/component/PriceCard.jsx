@@ -5,6 +5,8 @@ import LockIcon from '@mui/icons-material/Lock';
 import { Icon } from '@iconify/react';
 import { useTranslation } from 'react-i18next';
 import { ValueFormatter } from 'utils/common';
+import { getExtraRatioLabel } from './extraRatiosState.mjs';
+import RateRulesChips from './RateRulesChips';
 
 const PriceCard = ({ price, onEdit, onDelete, ownedby, unit = 'K' }) => {
   const theme = useTheme();
@@ -22,24 +24,9 @@ const PriceCard = ({ price, onEdit, onDelete, ownedby, unit = 'K' }) => {
 
   // 判断是否有extra_ratios
   const hasExtraRatios = price.extra_ratios && Object.keys(price.extra_ratios).length > 0;
+  const hasRateRules = price.rate_rules && Object.keys(price.rate_rules).length > 0;
 
-  // 为extra_ratios中的key获取更易读的名称
-  const getReadableRatioName = (key) => {
-    const ratioNames = {
-      cached_tokens: t('modelpricePage.cached_tokens'),
-      cached_write_tokens: t('modelpricePage.cached_write_tokens'),
-      cached_read_tokens: t('modelpricePage.cached_read_tokens'),
-      input_audio_tokens: t('modelpricePage.input_audio_tokens'),
-      output_audio_tokens: t('modelpricePage.output_audio_tokens'),
-      reasoning_tokens: t('modelpricePage.reasoning_tokens'),
-      input_text_tokens: t('modelpricePage.input_text_tokens'),
-      output_text_tokens: t('modelpricePage.output_text_tokens'),
-      input_image_tokens: t('modelpricePage.input_image_tokens'),
-      output_image_tokens: t('modelpricePage.output_image_tokens')
-    };
-
-    return ratioNames[key] || key;
-  };
+  const getReadableRatioName = (key) => getExtraRatioLabel(t, key);
 
   const handleEdit = () => {
     onEdit(price);
@@ -59,7 +46,8 @@ const PriceCard = ({ price, onEdit, onDelete, ownedby, unit = 'K' }) => {
       theme.palette.warning.main
     ];
     // 根据channel_type确定颜色
-    return colors[(price.channel_type - 1) % colors.length];
+    const channelType = Number(price.channel_type);
+    return Number.isInteger(channelType) && channelType > 0 ? colors[(channelType - 1) % colors.length] : theme.palette.text.secondary;
   };
 
   // 根据单位格式化价格
@@ -296,6 +284,11 @@ const PriceCard = ({ price, onEdit, onDelete, ownedby, unit = 'K' }) => {
           <Typography variant="caption" color="text.secondary" sx={{ fontStyle: 'italic' }}>
             {t('modelpricePage.noExtraRatios')}
           </Typography>
+        )}
+        {hasRateRules && (
+          <Box sx={{ mt: 0.75 }}>
+            <RateRulesChips rateRules={price.rate_rules} billingType={price.type} />
+          </Box>
         )}
       </TableCell>
 

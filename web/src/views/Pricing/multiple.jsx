@@ -29,6 +29,7 @@ import {
 import SearchIcon from '@mui/icons-material/Search';
 import { Icon } from '@iconify/react';
 import PricesTableRow from './component/TableRow';
+import { stablePricingJson } from './component/pricingComparison.mjs';
 import KeywordTableHead from 'ui-component/TableHead';
 import { API } from 'utils/api';
 import { useTranslation } from 'react-i18next';
@@ -38,7 +39,7 @@ import EditModal from './component/EditModal';
 import ToggleButtonGroup from 'ui-component/ToggleButton';
 
 // ----------------------------------------------------------------------
-export default function Multiple({ prices, reloadData, ownedby, noPriceModels }) {
+export default function Multiple({ prices, reloadData, ownedby, noPriceModels, expectedVersion }) {
   const { t } = useTranslation();
   const theme = useTheme();
   const [rows, setRows] = useState([]);
@@ -98,9 +99,10 @@ export default function Multiple({ prices, reloadData, ownedby, noPriceModels })
 
   useEffect(() => {
     const grouped = prices.reduce((acc, item, index) => {
-      // 需要保证 extra_ratios 和 locked 字段也相同才能合并
-      const extraRatiosStr = item.extra_ratios ? JSON.stringify(item.extra_ratios) : '';
-      const key = `${item.type}-${item.channel_type}-${item.input}-${item.output}-${extraRatiosStr}-${item.locked}`;
+      // 需要保证完整价格策略相同才能合并
+      const extraRatiosStr = stablePricingJson(item.extra_ratios || {});
+      const rateRulesStr = stablePricingJson(item.rate_rules || {});
+      const key = `${item.type}-${item.channel_type}-${item.input}-${item.output}-${extraRatiosStr}-${rateRulesStr}-${item.locked}`;
 
       if (!acc[key]) {
         acc[key] = {
@@ -123,7 +125,8 @@ export default function Multiple({ prices, reloadData, ownedby, noPriceModels })
       switch (action) {
         case 'delete':
           res = await API.put('/api/prices/multiple/delete', {
-            models: item.models
+            models: item.models,
+            expected_version: expectedVersion
           });
           break;
       }
@@ -139,6 +142,8 @@ export default function Multiple({ prices, reloadData, ownedby, noPriceModels })
 
       return res.data;
     } catch (error) {
+      showError(error.message);
+      reloadData();
       return;
     }
   };
@@ -392,12 +397,14 @@ export default function Multiple({ prices, reloadData, ownedby, noPriceModels })
         open={editRow !== null}
         onCancel={handleEditClose}
         onOk={handleModalOK}
+        onConflict={reloadData}
         ownedby={ownedby}
         singleMode={false}
         pricesItem={editRow}
         rows={rows}
         unit={unit}
         noPriceModel={noPriceModels}
+        expectedVersion={expectedVersion}
       />
     </>
   );
@@ -407,5 +414,6 @@ Multiple.propTypes = {
   prices: PropTypes.array,
   ownedby: PropTypes.array,
   reloadData: PropTypes.func,
-  noPriceModels: PropTypes.array
+  noPriceModels: PropTypes.array,
+  expectedVersion: PropTypes.number.isRequired
 };

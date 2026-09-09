@@ -5,6 +5,8 @@ import LockIcon from '@mui/icons-material/Lock';
 import { Icon } from '@iconify/react';
 import { useTranslation } from 'react-i18next';
 import { ValueFormatter } from 'utils/common';
+import { getExtraRatioLabel } from './extraRatiosState.mjs';
+import RateRulesChips from './RateRulesChips';
 
 const PricesTableRow = ({ item, onEdit, onDelete, ownedby, unit = 'K' }) => {
   const { t } = useTranslation();
@@ -21,7 +23,8 @@ const PricesTableRow = ({ item, onEdit, onDelete, ownedby, unit = 'K' }) => {
       theme.palette.warning.main
     ];
     // 根据channel_type确定颜色
-    return colors[(item.channel_type - 1) % colors.length];
+    const channelType = Number(item.channel_type);
+    return Number.isInteger(channelType) && channelType > 0 ? colors[(channelType - 1) % colors.length] : theme.palette.text.secondary;
   };
 
   const channelColor = getChannelColor();
@@ -72,24 +75,9 @@ const PricesTableRow = ({ item, onEdit, onDelete, ownedby, unit = 'K' }) => {
 
   // 判断是否有extra_ratios
   const hasExtraRatios = item.extra_ratios && Object.keys(item.extra_ratios).length > 0;
+  const hasRateRules = item.rate_rules && Object.keys(item.rate_rules).length > 0;
 
-  // 为extra_ratios中的key获取更易读的名称
-  const getReadableRatioName = (key) => {
-    const ratioNames = {
-      cached_tokens: t('modelpricePage.cached_tokens'),
-      cached_write_tokens: t('modelpricePage.cached_write_tokens'),
-      cached_read_tokens: t('modelpricePage.cached_read_tokens'),
-      input_audio_tokens: t('modelpricePage.input_audio_tokens'),
-      output_audio_tokens: t('modelpricePage.output_audio_tokens'),
-      reasoning_tokens: t('modelpricePage.reasoning_tokens'),
-      input_text_tokens: t('modelpricePage.input_text_tokens'),
-      output_text_tokens: t('modelpricePage.output_text_tokens'),
-      input_image_tokens: t('modelpricePage.input_image_tokens'),
-      output_image_tokens: t('modelpricePage.output_image_tokens')
-    };
-
-    return ratioNames[key] || key;
-  };
+  const getReadableRatioName = (key) => getExtraRatioLabel(t, key);
 
   const handleEdit = () => {
     onEdit && onEdit(item);
@@ -261,7 +249,7 @@ const PricesTableRow = ({ item, onEdit, onDelete, ownedby, unit = 'K' }) => {
 
       {/* 扩展价格 */}
       <TableCell width="25%" sx={{ pl: 2 }}>
-        {hasExtraRatios ? (
+        {hasExtraRatios || hasRateRules ? (
           <Box
             sx={{
               display: 'flex',
@@ -305,6 +293,7 @@ const PricesTableRow = ({ item, onEdit, onDelete, ownedby, unit = 'K' }) => {
                 }
               />
             ))}
+            {hasRateRules && <RateRulesChips rateRules={item.rate_rules} billingType={item.type} compact />}
           </Box>
         ) : (
           <Typography variant="caption" color="text.secondary" sx={{ fontStyle: 'italic' }}>

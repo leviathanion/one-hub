@@ -43,6 +43,7 @@ const Pricing = () => {
   const [openaddModal, setOpenaddModal] = useState(false);
   const [errPrices, setErrPrices] = useState('');
   const [prices, setPrices] = useState([]);
+  const [priceVersion, setPriceVersion] = useState(0);
   const [noPriceModel, setNoPriceModel] = useState([]);
 
   const location = useLocation();
@@ -61,11 +62,6 @@ const Pricing = () => {
     setValue(newValue);
     const hashArray = Object.keys(tabMap);
     navigate(`#${hashArray[newValue]}`);
-  };
-
-  const reloadData = () => {
-    fetchModelList();
-    fetchPrices();
   };
 
   const handleOkModal = (status) => {
@@ -137,27 +133,37 @@ const Pricing = () => {
       const { success, message, data } = res.data;
       if (success) {
         setModelList(data);
+        return true;
       } else {
         showError(message);
       }
     } catch (error) {
       console.error(error);
     }
+    return false;
   }, []);
 
   const fetchPrices = useCallback(async () => {
     try {
       const res = await API.get('/api/prices');
-      const { success, message, data } = res.data;
+      const { success, message, data, version } = res.data;
       if (success) {
         setPrices(data);
+        setPriceVersion(version);
+        return true;
       } else {
         showError(message);
       }
     } catch (error) {
       console.error(error);
     }
+    return false;
   }, []);
+
+  const reloadData = useCallback(async () => {
+    const [modelListLoaded, pricesLoaded] = await Promise.all([fetchModelList(), fetchPrices()]);
+    return modelListLoaded && pricesLoaded;
+  }, [fetchModelList, fetchPrices]);
 
   useEffect(() => {
     const handleHashChange = () => {
@@ -249,9 +255,11 @@ const Pricing = () => {
         open={openaddModal}
         onCancel={handleCloseModal}
         onOk={handleOkaddModal}
+        onConflict={reloadData}
         pricesItem={editPricesItem}
         ownedby={ownedby}
         noPriceModel={noPriceModel}
+        expectedVersion={priceVersion}
       />
       <Card>
         <AdminContainer>
@@ -273,7 +281,7 @@ const Pricing = () => {
               </Tabs>
             </Box>
             <CustomTabPanel value={value} index={0}>
-              <Single ownedby={ownedby} reloadData={reloadData} prices={prices} />
+              <Single ownedby={ownedby} reloadData={reloadData} prices={prices} expectedVersion={priceVersion} />
             </CustomTabPanel>
             <CustomTabPanel value={value} index={1}>
               <Multiple
@@ -282,6 +290,7 @@ const Pricing = () => {
                 prices={prices}
                 handleOpenModal={handleOpenaddModal}
                 noPriceModels={noPriceModel}
+                expectedVersion={priceVersion}
               />
             </CustomTabPanel>
           </Box>
@@ -292,7 +301,6 @@ const Pricing = () => {
         onCancel={() => {
           setOpenModal(false);
         }}
-        row={prices}
         onOk={handleOkModal}
       />
     </Stack>

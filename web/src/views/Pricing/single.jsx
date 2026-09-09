@@ -29,8 +29,9 @@ import PriceCard from './component/PriceCard';
 import { alpha } from '@mui/material/styles';
 import EditModal from './component/EditModal';
 import ToggleButtonGroup from 'ui-component/ToggleButton';
+import { buildManualPriceRequest } from './component/manualPriceRequest.mjs';
 
-const Single = ({ ownedby, prices, reloadData }) => {
+const Single = ({ ownedby, prices, reloadData, expectedVersion }) => {
   const { t } = useTranslation();
   const theme = useTheme();
   const [rows, setRows] = useState([]);
@@ -78,33 +79,31 @@ const Single = ({ ownedby, prices, reloadData }) => {
     }
   };
 
-  const handleSaveEdit = async (formData) => {
-    try {
-      let res;
-      formData = trims(formData);
-      if (formData.isNew || !editRow?.model) {
-        res = await API.post('/api/prices/single', formData);
-      } else {
-        let modelEncode = encodeURIComponent(editRow.model);
-        res = await API.put('/api/prices/single/' + modelEncode, formData);
-      }
-      const { success, message } = res.data;
-      if (success) {
-        showSuccess(t('pricing_edit.saveOk'));
-        reloadData();
-        setEditRow(null);
-      } else {
-        showError(message);
-      }
-    } catch (error) {
-      showError(error.message);
+  const handleSaveEdit = async (formData, draftVersion) => {
+    let res;
+    formData = trims(formData);
+    const isNew = formData.isNew || !editRow?.model;
+    const request = buildManualPriceRequest(formData, draftVersion ?? expectedVersion);
+    if (isNew) {
+      res = await API.post('/api/prices/single', request);
+    } else {
+      let modelEncode = encodeURIComponent(editRow.model);
+      res = await API.put('/api/prices/single/' + modelEncode, request);
+    }
+    const { success, message } = res.data;
+    if (success) {
+      showSuccess(t('pricing_edit.saveOk'));
+      reloadData();
+      setEditRow(null);
+    } else {
+      throw new Error(message || '保存失败');
     }
   };
 
   const deletePirces = async (modelName) => {
     try {
       let modelEncode = encodeURIComponent(modelName);
-      const res = await API.delete('/api/prices/single/' + modelEncode);
+      const res = await API.delete('/api/prices/single/' + modelEncode, { data: { expected_version: expectedVersion } });
       const { success, message } = res.data;
       if (success) {
         showSuccess(t('pricing_edit.saveOk'));
@@ -113,7 +112,8 @@ const Single = ({ ownedby, prices, reloadData }) => {
         showError(message);
       }
     } catch (error) {
-      console.error(error);
+      showError(error.message);
+      reloadData();
     }
   };
 
@@ -179,6 +179,10 @@ const Single = ({ ownedby, prices, reloadData }) => {
       modelRatioList.push({ id: id++, ...prices[key] });
     }
     setRows(modelRatioList);
+    setEditRow((current) => {
+      if (!current) return current;
+      return modelRatioList.find((row) => row.model === current.model) || current;
+    });
   }, [prices]);
 
   // 当搜索词变化时重置到第一页
@@ -429,11 +433,13 @@ const Single = ({ ownedby, prices, reloadData }) => {
         open={editRow !== null}
         onCancel={handleEditClose}
         onSaveSingle={handleSaveEdit}
+        onConflict={reloadData}
         ownedby={ownedby}
         singleMode={true}
         price={editRow}
         rows={rows}
         unit={unit}
+        expectedVersion={expectedVersion}
       />
     </Box>
   );
@@ -444,5 +450,6 @@ export default Single;
 Single.propTypes = {
   prices: PropTypes.array,
   ownedby: PropTypes.array,
-  reloadData: PropTypes.func
+  reloadData: PropTypes.func,
+  expectedVersion: PropTypes.number.isRequired
 };

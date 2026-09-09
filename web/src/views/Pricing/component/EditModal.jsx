@@ -2,7 +2,7 @@ import PropTypes from 'prop-types';
 import * as Yup from 'yup';
 import { Formik } from 'formik';
 import { useTheme } from '@mui/material/styles';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Alert,
   Autocomplete,
@@ -36,6 +36,10 @@ import { useTranslation } from 'react-i18next';
 import ToggleButtonGroup from 'ui-component/ToggleButton';
 import Decimal from 'decimal.js';
 import { ExtraRatiosSelector } from './ExtraRatiosSelector';
+import RateRulesEditor from './RateRulesEditor';
+import PriceRulesPreview from './PriceRulesPreview';
+import { rateRulesPayload, validateRateRules } from './rateRulesState.mjs';
+import { createPricingDraft, markPricingDraftStale, PRICING_STALE_MESSAGE, recoverPricingConflict } from './pricingMutationRecovery.mjs';
 
 const icon = <CheckBoxOutlineBlankIcon fontSize="small" />;
 const checkedIcon = <CheckBoxIcon fontSize="small" />;
@@ -111,7 +115,8 @@ const multipleOriginInputs = {
   output: 0,
   locked: false,
   models: [],
-  extra_ratios: {}
+  extra_ratios: {},
+  rate_rules: {}
 };
 
 // 单一模式初始值
@@ -122,7 +127,8 @@ const singleOriginInputs = {
   input: 0,
   output: 0,
   locked: false,
-  extra_ratios: {}
+  extra_ratios: {},
+  rate_rules: {}
 };
 
 const EditModal = ({
@@ -130,19 +136,24 @@ const EditModal = ({
   pricesItem,
   onCancel,
   onOk,
+  onConflict,
   ownedby,
   noPriceModel,
   singleMode = false,
   price = null,
   rows = [],
   onSaveSingle = null,
-  unit = 'K'
+  unit = 'K',
+  expectedVersion
 }) => {
   const { t } = useTranslation();
   const theme = useTheme();
   const [inputs, setInputs] = useState(singleMode ? singleOriginInputs : multipleOriginInputs);
   const [selectModel, setSelectModel] = useState([]);
   const [errors, setErrors] = useState({});
+  const [draft, setDraft] = useState(() => createPricingDraft(singleMode ? singleOriginInputs : multipleOriginInputs, expectedVersion));
+  const [loadingLatest, setLoadingLatest] = useState(false);
+  const modalWasOpen = useRef(false);
 
   const [unitType, setUnitType] = useState('rate');
   const [localUnit, setLocalUnit] = useState(unit);
@@ -229,7 +240,14 @@ const EditModal = ({
 
   // 表单提交处理
   const submit = async (values, { setErrors, setStatus, setSubmitting }) => {
+    if (draft?.stale) {
+      setStatus({ success: false });
+      setErrors({ submit: PRICING_STALE_MESSAGE });
+      setSubmitting(false);
+      return;
+    }
     setSubmitting(true);
+    const draftVersion = draft?.baseVersion ?? expectedVersion;
 
     // Ensure extra_ratios values are numbers
     if (values.extra_ratios) {
@@ -239,6 +257,13 @@ const EditModal = ({
       });
       values.extra_ratios = processedRatios;
     }
+    if (Object.keys(validateRateRules(values.rate_rules)).length > 0) {
+      setStatus({ success: false });
+      setErrors({ general: t('pricing_edit.rateRules.invalid') });
+      setSubmitting(false);
+      return;
+    }
+    values.rate_rules = rateRulesPayload(values.rate_rules, singleMode || Object.keys(inputs.rate_rules || {}).length > 0);
 
     // 单一模式处理
     if (singleMode) {
@@ -254,17 +279,29 @@ const EditModal = ({
         if (onSaveSingle) {
           const calculatedInput = calculateRate(values.input);
           const calculatedOutput = values.type === 'times' ? calculatedInput : calculateRate(values.output);
-          await onSaveSingle({
-            ...values,
-            input: calculatedInput,
-            output: calculatedOutput
-          });
+          await onSaveSingle(
+            {
+              ...values,
+              input: calculatedInput,
+              output: calculatedOutput
+            },
+            draftVersion
+          );
         }
         setSubmitting(false);
         return;
       } catch (error) {
+        const conflict = await recoverPricingConflict(error, {
+          onStale: () => setDraft((current) => markPricingDraftStale(current))
+        });
         setStatus({ success: false });
-        setErrors({ submit: error.message });
+        setErrors({ submit: conflict ? PRICING_STALE_MESSAGE : error.message });
+        if (conflict) {
+          showError(PRICING_STALE_MESSAGE);
+        } else {
+          showError(error.message);
+        }
+        setSubmitting(false);
         return;
       }
     }
@@ -276,6 +313,7 @@ const EditModal = ({
       const calculatedOutput = values.type === 'times' ? calculatedInput : calculateRate(values.output);
       const res = await API.post(`/api/prices/multiple`, {
         original_models: inputs.models,
+        expected_version: draftVersion,
         models: values.models,
         price: {
           model: 'batch',
@@ -284,7 +322,8 @@ const EditModal = ({
           input: calculatedInput,
           output: calculatedOutput,
           locked: values.locked,
-          extra_ratios: values.extra_ratios
+          extra_ratios: values.extra_ratios,
+          rate_rules: values.rate_rules
         }
       });
       const { success, message } = res.data;
@@ -300,9 +339,14 @@ const EditModal = ({
         setErrors({ submit: message });
       }
     } catch (error) {
+      const conflict = await recoverPricingConflict(error, {
+        onStale: () => setDraft((current) => markPricingDraftStale(current))
+      });
       setStatus({ success: false });
-      showError(error.message);
-      setErrors({ submit: error.message });
+      const message = conflict ? PRICING_STALE_MESSAGE : error.message;
+      showError(message);
+      setErrors({ submit: message });
+      setSubmitting(false);
       return;
     }
     onOk();
@@ -341,29 +385,42 @@ const EditModal = ({
     }));
   };
 
-  useEffect(() => {
+  const initialDraftValues = useCallback(() => {
     if (singleMode) {
-      // 单一模式初始化表单
-      if (price) {
-        setInputs({
-          ...price,
-          extra_ratios: price.extra_ratios || {}
-        });
-      } else {
-        setInputs(singleOriginInputs);
-      }
-      setErrors({});
-    } else {
-      // 多选模式初始化
-      if (pricesItem) {
-        setSelectModel(pricesItem.models.concat(noPriceModel));
-        setInputs(pricesItem);
-      } else {
-        setSelectModel(noPriceModel);
-        setInputs(multipleOriginInputs);
-      }
+      return price
+        ? {
+            ...price,
+            extra_ratios: price.extra_ratios || {},
+            rate_rules: price.rate_rules || {}
+          }
+        : { ...singleOriginInputs };
     }
-  }, [singleMode, price, pricesItem, noPriceModel]);
+    return pricesItem ? { ...pricesItem } : { ...multipleOriginInputs };
+  }, [singleMode, price, pricesItem]);
+
+  const initializeDraft = useCallback(() => {
+    const initialValues = initialDraftValues();
+    if (!singleMode) {
+      setSelectModel(pricesItem ? pricesItem.models.concat(noPriceModel) : noPriceModel);
+    }
+    setInputs(initialValues);
+    setDraft(createPricingDraft(initialValues, expectedVersion));
+    setErrors({});
+    setLoadingLatest(false);
+  }, [expectedVersion, initialDraftValues, noPriceModel, pricesItem, singleMode]);
+
+  // Bind a draft to the version visible when the dialog opens. A background
+  // list refresh must not silently replace an open draft's base version.
+  useEffect(() => {
+    if (!open) {
+      modalWasOpen.current = false;
+      return;
+    }
+    if (!modalWasOpen.current) {
+      modalWasOpen.current = true;
+      initializeDraft();
+    }
+  }, [initializeDraft, open]);
 
   useEffect(() => {
     if (open) {
@@ -371,6 +428,42 @@ const EditModal = ({
       setLocalUnit('K');
     }
   }, [open]);
+
+  const handleReloadLatest = async () => {
+    if (!onConflict) {
+      showError('无法加载最新数据，请关闭后重新打开。');
+      return;
+    }
+    setLoadingLatest(true);
+    try {
+      const loaded = await onConflict();
+      if (!loaded) {
+        setLoadingLatest(false);
+        return;
+      }
+      onCancel?.();
+    } catch (error) {
+      showError(error.message || '加载最新数据失败。');
+      setLoadingLatest(false);
+    }
+  };
+
+  const renderStaleNotice = () => {
+    if (!draft?.stale) return null;
+    return (
+      <Alert
+        severity="warning"
+        action={
+          <Button color="inherit" size="small" onClick={handleReloadLatest} disabled={loadingLatest}>
+            {loadingLatest ? '加载中…' : '加载最新数据并重新编辑'}
+          </Button>
+        }
+        sx={{ alignItems: 'center' }}
+      >
+        {PRICING_STALE_MESSAGE}
+      </Alert>
+    );
+  };
 
   // 渲染类型选择表单
   const renderTypeSelector = (formProps) => {
@@ -609,9 +702,37 @@ const EditModal = ({
           onChange={(newExtraRatios) => {
             setFieldValue('extra_ratios', newExtraRatios);
           }}
-          handleStartAdornment={handleStartAdornment}
         />
       </FormControl>
+    );
+  };
+
+  const renderRateRulesEditor = (formProps) => {
+    const billingType = singleMode ? inputs.type : formProps.values.type;
+    const value = singleMode ? inputs.rate_rules || {} : formProps.values.rate_rules || {};
+    const onChange = singleMode
+      ? (rateRules) => setInputs((prev) => ({ ...prev, rate_rules: rateRules }))
+      : (rateRules) => formProps.setFieldValue('rate_rules', rateRules);
+    return (
+      <Stack spacing={1} sx={{ mt: singleMode ? 0 : 2 }}>
+        {billingType === 'times' && <Alert severity="info">{t('pricing_edit.rateRules.inactiveForTimes')}</Alert>}
+        <Paper variant="outlined" sx={{ p: 2 }}>
+          <RateRulesEditor value={value} onChange={onChange} />
+          {billingType === 'tokens' && (
+            <PriceRulesPreview
+              price={{
+                model: (singleMode ? inputs.model : formProps.values.models?.[0]) || 'preview',
+                type: billingType,
+                channel_type: Number((singleMode ? inputs : formProps.values).channel_type),
+                input: Number(calculateRate((singleMode ? inputs : formProps.values).input)),
+                output: Number(calculateRate((singleMode ? inputs : formProps.values).output)),
+                extra_ratios: (singleMode ? inputs : formProps.values).extra_ratios || {},
+                rate_rules: value
+              }}
+            />
+          )}
+        </Paper>
+      </Stack>
     );
   };
 
@@ -687,11 +808,18 @@ const EditModal = ({
             }
             variant="contained"
             color="primary"
+            disabled={draft?.stale || loadingLatest}
           >
             {t('common.submit')}
           </Button>
         ) : (
-          <Button disableElevation disabled={isSubmitting} type="submit" variant="contained" color="primary">
+          <Button
+            disableElevation
+            disabled={isSubmitting || draft?.stale || loadingLatest}
+            type="submit"
+            variant="contained"
+            color="primary"
+          >
             {t('common.submit')}
           </Button>
         )}
@@ -706,6 +834,7 @@ const EditModal = ({
       </DialogTitle>
       <Divider />
       <DialogContent>
+        {renderStaleNotice()}
         {singleMode ? (
           // 单一模式表单
           <Stack spacing={2} sx={{ mt: 1 }}>
@@ -732,6 +861,7 @@ const EditModal = ({
             <Alert severity="warning">{t('pricing_edit.lockedTip')}</Alert>
 
             {renderExtraRatioSelector()}
+            {renderRateRulesEditor()}
 
             {errors.general && (
               <Typography color="error" variant="body2">
@@ -757,6 +887,7 @@ const EditModal = ({
                 {renderLockedToggle(formProps)}
                 <Alert severity="warning">{t('pricing_edit.lockedTip')}</Alert>
                 {renderExtraRatioSelector(formProps)}
+                {renderRateRulesEditor(formProps)}
                 {renderActions(formProps)}
               </form>
             )}
@@ -774,6 +905,7 @@ EditModal.propTypes = {
   pricesItem: PropTypes.oneOfType([PropTypes.object, PropTypes.any]),
   onCancel: PropTypes.func,
   onOk: PropTypes.func,
+  onConflict: PropTypes.func,
   ownedby: PropTypes.array,
   noPriceModel: PropTypes.array,
   // 以下是单一模式专用
@@ -781,5 +913,6 @@ EditModal.propTypes = {
   price: PropTypes.object,
   rows: PropTypes.array,
   onSaveSingle: PropTypes.func,
-  unit: PropTypes.string
+  unit: PropTypes.string,
+  expectedVersion: PropTypes.number
 };

@@ -1,433 +1,355 @@
 import PropTypes from 'prop-types';
-import React, { useState, useEffect, useCallback } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  Dialog,
-  DialogContent,
-  DialogActions,
-  Button,
-  TextField,
   Alert,
-  Stack,
-  Typography,
   Box,
-  Chip,
+  Button,
+  ButtonGroup,
   Card,
   CardContent,
-  IconButton,
-  Tooltip,
+  Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
   Divider,
-  List,
-  ListItem,
-  ListItemText
+  IconButton,
+  Stack,
+  TextField,
+  Tooltip,
+  Typography
 } from '@mui/material';
+import LoadingButton from '@mui/lab/LoadingButton';
+import { Icon } from '@iconify/react';
 import { useTranslation } from 'react-i18next';
 import { API } from 'utils/api';
 import { showError, showSuccess } from 'utils/common';
-import LoadingButton from '@mui/lab/LoadingButton';
-import { Icon } from '@iconify/react';
-import { extraRatiosConfig } from './config';
+import { canAcceptDefaultPricingUrl, createPricingFetchController, resolveDefaultPricingUrl } from './pricingFetchState.mjs';
 
-export const CheckUpdates = ({ open, onCancel, onOk, row }) => {
+const updateModes = ['add', 'update', 'overwrite'];
+
+const actionColor = {
+  add: 'success',
+  update: 'warning',
+  delete: 'error',
+  locked: 'default'
+};
+
+const policyText = (policy) => (policy == null ? '—' : JSON.stringify(policy, null, 2));
+const PRICE_UPDATE_URL_STORAGE_KEY = 'oneapi_price_update_url';
+
+export const CheckUpdates = ({ open, onCancel, onOk }) => {
   const { t } = useTranslation();
-  const [url, setUrl] = useState('');
+  const [url, setUrl] = useState(() => localStorage.getItem(PRICE_UPDATE_URL_STORAGE_KEY) || '');
+  const urlRef = useRef(url);
+  const userEditedUrlRef = useRef(false);
   const [loading, setLoading] = useState(false);
-  const [updateLoading, setUpdateLoading] = useState(false);
-  const [newPricing, setNewPricing] = useState([]);
-  const [addModel, setAddModel] = useState([]);
-  const [diffModel, setDiffModel] = useState([]);
+  const [applyLoading, setApplyLoading] = useState(false);
+  const [mode, setMode] = useState('overwrite');
+  const [source, setSource] = useState([]);
+  const [preview, setPreview] = useState(null);
+  const defaultUrlController = useRef(null);
+  const catalogRequestController = useRef(null);
+  if (defaultUrlController.current === null) {
+    defaultUrlController.current = createPricingFetchController();
+  }
+  if (catalogRequestController.current === null) {
+    catalogRequestController.current = createPricingFetchController();
+  }
 
-  // 从localStorage获取保存的URL
-  useEffect(() => {
-    const savedUrl = localStorage.getItem('oneapi_price_update_url');
-    if (savedUrl) {
-      setUrl(savedUrl);
-    } else {
-      fetchDefaultUrl();
+  const fetchDefaultUrl = useCallback(async (requestGeneration) => {
+    try {
+      const response = await API.get('/api/prices/updateService');
+      const nextUrl = resolveDefaultPricingUrl(response.data?.data);
+      if (
+        canAcceptDefaultPricingUrl({
+          controller: defaultUrlController.current,
+          generation: requestGeneration,
+          currentUrl: urlRef.current,
+          cachedUrl: localStorage.getItem(PRICE_UPDATE_URL_STORAGE_KEY),
+          userEdited: userEditedUrlRef.current
+        })
+      ) {
+        urlRef.current = nextUrl;
+        setUrl(nextUrl);
+        localStorage.setItem(PRICE_UPDATE_URL_STORAGE_KEY, nextUrl);
+      }
+    } catch {
+      const fallbackUrl = resolveDefaultPricingUrl();
+      if (
+        canAcceptDefaultPricingUrl({
+          controller: defaultUrlController.current,
+          generation: requestGeneration,
+          currentUrl: urlRef.current,
+          cachedUrl: localStorage.getItem(PRICE_UPDATE_URL_STORAGE_KEY),
+          userEdited: userEditedUrlRef.current
+        })
+      ) {
+        urlRef.current = fallbackUrl;
+        setUrl(fallbackUrl);
+        localStorage.setItem(PRICE_UPDATE_URL_STORAGE_KEY, fallbackUrl);
+      }
     }
   }, []);
 
-  const fetchDefaultUrl = async () => {
-    try {
-      const res = await API.get('/api/prices/updateService');
-      if (res.data?.data) {
-        const serviceUrl = res.data.data;
-        setUrl(serviceUrl);
-        localStorage.setItem('oneapi_price_update_url', serviceUrl);
-      }
-    } catch (err) {
-      console.error(err);
-      const defaultUrl = 'https://raw.githubusercontent.com/MartialBE/one-api/prices/prices.json';
-      setUrl(defaultUrl);
-      localStorage.setItem('oneapi_price_update_url', defaultUrl);
+  useEffect(() => {
+    if (!localStorage.getItem(PRICE_UPDATE_URL_STORAGE_KEY)) {
+      fetchDefaultUrl(defaultUrlController.current.begin());
     }
-  };
+    return () => {
+      defaultUrlController.current.invalidate();
+      catalogRequestController.current.invalidate();
+    };
+  }, [fetchDefaultUrl]);
 
-  const handleUrlChange = (e) => {
-    const newUrl = e.target.value;
-    setUrl(newUrl);
-    localStorage.setItem('oneapi_price_update_url', newUrl);
+  useEffect(() => {
+    if (!open) {
+      catalogRequestController.current.invalidate();
+      setSource([]);
+      setPreview(null);
+      setLoading(false);
+    }
+  }, [open]);
+
+  const requestPreview = useCallback(
+    async (catalog, selectedMode, requestGeneration) => {
+      const response = await API.post('/api/prices/sync/preview', { mode: selectedMode, source: catalog });
+      if (!catalogRequestController.current.isCurrent(requestGeneration)) {
+        return;
+      }
+      if (!response.data?.success) {
+        throw new Error(response.data?.message || t('CheckUpdatesTable.dataFormatIncorrect'));
+      }
+      setPreview(response.data.data);
+    },
+    [t]
+  );
+
+  const handleUrlChange = (event) => {
+    const nextUrl = event.target.value;
+    userEditedUrlRef.current = true;
+    urlRef.current = nextUrl;
+    defaultUrlController.current.invalidate();
+    catalogRequestController.current.invalidate();
+    setUrl(nextUrl);
+    setSource([]);
+    setPreview(null);
+    setLoading(false);
+    localStorage.setItem(PRICE_UPDATE_URL_STORAGE_KEY, nextUrl);
   };
 
   const handleCheckUpdates = async () => {
+    const requestGeneration = catalogRequestController.current.begin();
     setLoading(true);
+    setSource([]);
+    setPreview(null);
     try {
-      const res = await API.get(url);
-      let responseData = Array.isArray(res?.data) ? res.data : res?.data?.data ?? [];
-      // 检测是否是一个列表
-      if (!Array.isArray(responseData)) {
-        showError(t('CheckUpdatesTable.dataFormatIncorrect'));
-      } else {
-        setNewPricing(responseData);
+      const response = await API.get(url);
+      const catalog = Array.isArray(response?.data) ? response.data : response?.data?.data;
+      if (!Array.isArray(catalog) || catalog.length === 0) {
+        throw new Error(t('CheckUpdatesTable.dataFormatIncorrect'));
       }
-    } catch (err) {
-      showError(err.message);
-      console.error(err);
+      if (!catalogRequestController.current.isCurrent(requestGeneration)) {
+        return;
+      }
+      setSource(catalog);
+      await requestPreview(catalog, mode, requestGeneration);
+    } catch (error) {
+      if (catalogRequestController.current.isCurrent(requestGeneration)) {
+        showError(error.response?.data?.message || error.message);
+      }
+    } finally {
+      if (catalogRequestController.current.isCurrent(requestGeneration)) {
+        setLoading(false);
+      }
     }
-    setLoading(false);
   };
 
-  const syncPricing = async (updateMode) => {
-    setUpdateLoading(true);
-    if (!newPricing.length) {
-      showError(t('CheckUpdatesTable.pleaseFetchData'));
-      setUpdateLoading(false);
+  const handleModeChange = async (selectedMode) => {
+    setMode(selectedMode);
+    setPreview(null);
+    if (source.length === 0) {
       return;
     }
-
-    if (updateMode === 'add' && !addModel.length) {
-      showError(t('CheckUpdatesTable.noNewModels'));
-      setUpdateLoading(false);
-      return;
-    }
+    const requestGeneration = catalogRequestController.current.begin();
+    setLoading(true);
     try {
-      const res = await API.post('/api/prices/sync?updateMode=' + updateMode, newPricing);
-      const { success, message } = res.data;
-      if (success) {
+      await requestPreview(source, selectedMode, requestGeneration);
+    } catch (error) {
+      if (catalogRequestController.current.isCurrent(requestGeneration)) {
+        showError(error.response?.data?.message || error.message);
+      }
+    } finally {
+      if (catalogRequestController.current.isCurrent(requestGeneration)) {
+        setLoading(false);
+      }
+    }
+  };
+
+  const applyPreview = async () => {
+    if (!preview || source.length === 0) {
+      showError(t('CheckUpdatesTable.pleaseFetchData'));
+      return;
+    }
+    setApplyLoading(true);
+    try {
+      const response = await API.post('/api/prices/sync/apply', {
+        mode,
+        source,
+        base_version: preview.base_version,
+        digest: preview.digest
+      });
+      if (response.data?.success) {
         showSuccess(t('CheckUpdatesTable.operationCompleted'));
         onOk(true);
       } else {
-        showError(message);
+        showError(response.data?.message);
       }
-    } catch (err) {
-      console.error(err);
+    } catch (error) {
+      showError(error.response?.data?.message || error.message);
+      setPreview(null);
+    } finally {
+      setApplyLoading(false);
     }
-    setUpdateLoading(false);
   };
 
-  // 检查两个 extra_ratios 对象是否有差异
-  const hasExtraRatiosDiff = useCallback((oldRatios, newRatios) => {
-    if (!oldRatios && !newRatios) return false;
-    if (!oldRatios && newRatios) return true;
-    if (oldRatios && !newRatios) return true;
-
-    const allKeys = [...new Set([...Object.keys(oldRatios), ...Object.keys(newRatios)])];
-    return allKeys.some((key) => oldRatios[key] !== newRatios[key]);
-  }, []);
-
-  // 获取扩展价格的显示名称
-  const getExtraRatioDisplayName = useCallback((key) => {
-    const config = extraRatiosConfig.find((item) => item.key === key);
-    return config ? config.name : key;
-  }, []);
-
-  // 获取 extra_ratios 的变化信息
-  const getExtraRatiosChanges = useCallback(
-    (oldRatios, newRatios) => {
-      if (!oldRatios && newRatios) {
-        // 全新增加的扩展价格
-        const added = Object.entries(newRatios).map(([key, value]) => {
-          const displayName = getExtraRatioDisplayName(key);
-          return `${t('CheckUpdatesTable.added')} ${displayName} ${value}`;
-        });
-        return added;
+  const refreshPreview = async () => {
+    if (source.length === 0) return;
+    const requestGeneration = catalogRequestController.current.begin();
+    setLoading(true);
+    try {
+      await requestPreview(source, mode, requestGeneration);
+    } catch (error) {
+      if (catalogRequestController.current.isCurrent(requestGeneration)) {
+        showError(error.response?.data?.message || error.message);
       }
-
-      if (oldRatios && !newRatios) {
-        // 全部删除的扩展价格
-        const removed = Object.keys(oldRatios).map((key) => {
-          const displayName = getExtraRatioDisplayName(key);
-          return `${t('CheckUpdatesTable.removed')} ${displayName}`;
-        });
-        return removed;
-      }
-
-      const changes = [];
-      const allKeys = [...new Set([...Object.keys(oldRatios), ...Object.keys(newRatios)])];
-
-      allKeys.forEach((key) => {
-        const oldValue = oldRatios[key];
-        const newValue = newRatios[key];
-        const displayName = getExtraRatioDisplayName(key);
-
-        if (oldValue === undefined && newValue !== undefined) {
-          changes.push(`${t('CheckUpdatesTable.added')} ${displayName} ${newValue}`);
-        } else if (oldValue !== undefined && newValue === undefined) {
-          changes.push(`${t('CheckUpdatesTable.removed')} ${displayName}`);
-        } else if (oldValue !== newValue) {
-          changes.push(`${t('CheckUpdatesTable.modified')} ${displayName} ${oldValue}->${newValue}`);
-        }
-      });
-
-      return changes;
-    },
-    [t, getExtraRatioDisplayName]
-  );
-
-  useEffect(() => {
-    const newModels = newPricing.filter((np) => !row.some((r) => r.model === np.model));
-
-    const changeModel = row.filter((r) =>
-      newPricing.some(
-        (np) =>
-          np.model === r.model && (np.input !== r.input || np.output !== r.output || hasExtraRatiosDiff(r.extra_ratios, np.extra_ratios))
-      )
-    );
-
-    if (newModels.length > 0) {
-      const newModelsList = newModels.map((model) => model.model);
-      setAddModel(newModelsList);
-    } else {
-      setAddModel([]);
+    } finally {
+      if (catalogRequestController.current.isCurrent(requestGeneration)) setLoading(false);
     }
+  };
 
-    if (changeModel.length > 0) {
-      const changeModelList = changeModel.map((model) => {
-        const newModel = newPricing.find((np) => np.model === model.model);
-        let changes = '';
-        let extraRatiosChanges = '';
-
-        if (model.input !== newModel.input) {
-          changes += `${t('CheckUpdatesTable.inputMultiplierChanged')} ${model.input} ${t('CheckUpdatesTable.to')} ${newModel.input}, `;
-        }
-        if (model.output !== newModel.output) {
-          changes += `${t('CheckUpdatesTable.outputMultiplierChanged')} ${model.output} ${t('CheckUpdatesTable.to')} ${newModel.output}, `;
-        }
-
-        // 单独处理扩展价格变动
-        if (hasExtraRatiosDiff(model.extra_ratios, newModel.extra_ratios)) {
-          extraRatiosChanges = getExtraRatiosChanges(model.extra_ratios, newModel.extra_ratios);
-        }
-
-        // 去除末尾可能多余的逗号和空格
-        changes = changes.replace(/,\s*$/, '');
-
-        return {
-          model: model.model,
-          basicChanges: changes,
-          extraRatiosChanges: extraRatiosChanges
-        };
-      });
-      setDiffModel(changeModelList);
-    } else {
-      setDiffModel([]);
-    }
-  }, [row, newPricing, t, hasExtraRatiosDiff, getExtraRatiosChanges]);
+  const changes = preview?.plan?.changes || [];
 
   return (
-    <Dialog
-      open={open}
-      onClose={onCancel}
-      fullWidth
-      maxWidth={'md'}
-      PaperProps={{
-        sx: {
-          borderRadius: 1,
-          overflow: 'hidden',
-          backgroundImage: 'none'
-        }
-      }}
-    >
+    <Dialog open={open} onClose={onCancel} fullWidth maxWidth="md">
       <Box sx={{ display: 'flex', alignItems: 'center', px: 2.5, py: 2 }}>
         <Icon icon="solar:restart-bold" width={20} height={20} style={{ marginRight: 8 }} />
         <Typography variant="h6" sx={{ flexGrow: 1 }}>
           {t('CheckUpdatesTable.checkUpdates')}
         </Typography>
-        <IconButton edge="end" color="inherit" onClick={onCancel} aria-label="close" size="small">
+        <IconButton edge="end" onClick={onCancel} aria-label={t('common.close')} size="small">
           <Icon icon="solar:close-circle-bold" />
         </IconButton>
       </Box>
-
       <Divider />
 
       <DialogContent sx={{ p: 2 }}>
-        <Box sx={{ mb: 2.5 }}>
+        <Stack spacing={2}>
           <TextField
             fullWidth
             size="small"
-            variant="outlined"
             placeholder={t('CheckUpdatesTable.url')}
             value={url}
             onChange={handleUrlChange}
             InputProps={{
               endAdornment: (
                 <Tooltip title={t('CheckUpdatesTable.fetchData')}>
-                  <IconButton edge="end" onClick={handleCheckUpdates} disabled={loading} color="primary" size="small">
+                  <IconButton onClick={handleCheckUpdates} disabled={loading || !url} color="primary" size="small">
                     <Icon icon={loading ? 'svg-spinners:180-ring' : 'solar:refresh-bold'} fontSize="1.2rem" />
                   </IconButton>
                 </Tooltip>
-              ),
-              sx: { borderRadius: 1 }
+              )
             }}
           />
-        </Box>
 
-        {newPricing.length > 0 && (
-          <>
-            <Card variant="outlined" sx={{ mb: 2, borderRadius: 1 }}>
-              <CardContent sx={{ p: '12px !important' }}>
-                <Stack direction="row" spacing={1} sx={{ flexWrap: 'wrap', gap: 1 }}>
-                  <Chip
-                    size="small"
-                    label={`${t('CheckUpdatesTable.priceServerTotal')}: ${newPricing.length}`}
-                    color="primary"
-                    sx={{ borderRadius: '16px' }}
-                  />
-                  <Chip
-                    size="small"
-                    label={`${t('CheckUpdatesTable.newModels')}: ${addModel.length}`}
-                    color="success"
-                    sx={{ borderRadius: '16px' }}
-                  />
-                  <Chip
-                    size="small"
-                    label={`${t('CheckUpdatesTable.priceChangeModels')}: ${diffModel.length}`}
-                    color="warning"
-                    sx={{ borderRadius: '16px' }}
-                  />
-                </Stack>
-              </CardContent>
-            </Card>
-
-            {!addModel.length && !diffModel.length && (
-              <Alert severity="success" variant="outlined" sx={{ mb: 2, borderRadius: 1 }}>
-                {t('CheckUpdatesTable.noUpdates')}
-              </Alert>
-            )}
-
-            <Stack spacing={2}>
-              {addModel.length > 0 && (
-                <Card variant="outlined" sx={{ borderRadius: 1 }}>
-                  <Box sx={{ px: 2, py: 1.5, borderBottom: 1, borderColor: 'divider' }}>
-                    <Typography variant="subtitle2" sx={{ display: 'flex', alignItems: 'center' }}>
-                      <Icon icon="solar:add-circle-bold" style={{ marginRight: 8 }} />
-                      {t('CheckUpdatesTable.newModels')}
-                    </Typography>
-                  </Box>
-                  <Box sx={{ p: 2, maxHeight: '150px', overflow: 'auto' }}>
-                    <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.8 }}>
-                      {addModel.map((model) => (
-                        <Chip
-                          key={model}
-                          label={model}
-                          size="small"
-                          variant="outlined"
-                          sx={{ borderRadius: '14px', fontSize: '0.75rem' }}
-                        />
-                      ))}
-                    </Box>
-                  </Box>
-                </Card>
-              )}
-
-              {diffModel.length > 0 && (
-                <Card variant="outlined" sx={{ borderRadius: 1 }}>
-                  <Box sx={{ px: 2, py: 1.5, borderBottom: 1, borderColor: 'divider' }}>
-                    <Typography variant="subtitle2" sx={{ display: 'flex', alignItems: 'center' }}>
-                      <Icon icon="solar:pen-bold" style={{ marginRight: 8 }} />
-                      {t('CheckUpdatesTable.priceChangeModels')}
-                    </Typography>
-                  </Box>
-                  <List disablePadding sx={{ maxHeight: '200px', overflow: 'auto' }}>
-                    {diffModel.map((item, idx) => (
-                      <React.Fragment key={item.model}>
-                        {idx > 0 && <Divider component="li" />}
-                        <ListItem sx={{ px: 2, py: 1 }}>
-                          <ListItemText
-                            primary={
-                              <Typography variant="body2" sx={{ fontWeight: 'medium' }}>
-                                {item.model}
-                              </Typography>
-                            }
-                            secondary={
-                              <Box sx={{ mt: 0.5 }}>
-                                {item.basicChanges && (
-                                  <Typography variant="caption" display="block" sx={{ mb: 0.5 }}>
-                                    {item.basicChanges}
-                                  </Typography>
-                                )}
-
-                                {item.extraRatiosChanges && item.extraRatiosChanges.length > 0 && (
-                                  <Box sx={{ ml: 1, borderLeft: 1, borderColor: 'warning.main', pl: 1.5 }}>
-                                    {item.extraRatiosChanges.map((change, index) => (
-                                      <Typography key={index} variant="caption" display="block" sx={{ fontSize: '0.7rem' }}>
-                                        • {change}
-                                      </Typography>
-                                    ))}
-                                  </Box>
-                                )}
-                              </Box>
-                            }
-                          />
-                        </ListItem>
-                      </React.Fragment>
-                    ))}
-                  </List>
-                </Card>
-              )}
-
-              <Alert
-                severity="info"
-                variant="outlined"
-                icon={<Icon icon="solar:info-circle-bold" />}
-                sx={{ borderRadius: 1, fontSize: '0.75rem' }}
+          <ButtonGroup fullWidth aria-label={t('CheckUpdatesTable.updatePrices')}>
+            {updateModes.map((item) => (
+              <Button
+                key={item}
+                variant={mode === item ? 'contained' : 'outlined'}
+                onClick={() => handleModeChange(item)}
+                disabled={loading}
               >
-                {t('CheckUpdatesTable.note')}: {t('CheckUpdatesTable.overwriteOrAddOnly')}
-              </Alert>
-            </Stack>
-          </>
-        )}
+                {t(`CheckUpdatesTable.updateMode${item.charAt(0).toUpperCase()}${item.slice(1)}`)}
+              </Button>
+            ))}
+          </ButtonGroup>
+
+          {source.length > 0 && !preview && (
+            <Button variant="outlined" onClick={refreshPreview} disabled={loading}>
+              {t('CheckUpdatesTable.fetchData')}
+            </Button>
+          )}
+
+          {preview && (
+            <>
+              <Card variant="outlined">
+                <CardContent sx={{ p: '12px !important' }}>
+                  <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+                    <Chip label={`${t('CheckUpdatesTable.priceServerTotal')}: ${source.length}`} color="primary" size="small" />
+                    <Chip label={`base_version: ${preview.base_version}`} size="small" />
+                    {Object.entries(actionColor).map(([action, color]) => (
+                      <Chip
+                        key={action}
+                        label={`${action}: ${changes.filter((change) => change.action === action).length}`}
+                        color={color}
+                        size="small"
+                      />
+                    ))}
+                  </Stack>
+                </CardContent>
+              </Card>
+
+              {changes.length === 0 ? (
+                <Alert severity="success">{t('CheckUpdatesTable.noUpdates')}</Alert>
+              ) : (
+                <Stack spacing={1.5}>
+                  {changes.map((change) => (
+                    <Card key={`${change.action}:${change.model}`} variant="outlined">
+                      <CardContent>
+                        <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1 }}>
+                          <Chip label={change.action} color={actionColor[change.action] || 'default'} size="small" />
+                          <Typography variant="subtitle2">{change.model}</Typography>
+                        </Stack>
+                        <Stack direction={{ xs: 'column', md: 'row' }} spacing={2}>
+                          <Box sx={{ minWidth: 0, flex: 1 }}>
+                            <Typography variant="caption" color="text.secondary">
+                              before
+                            </Typography>
+                            <Box component="pre" sx={{ m: 0, p: 1, overflow: 'auto', bgcolor: 'action.hover', fontSize: 11 }}>
+                              {policyText(change.before)}
+                            </Box>
+                          </Box>
+                          <Box sx={{ minWidth: 0, flex: 1 }}>
+                            <Typography variant="caption" color="text.secondary">
+                              after
+                            </Typography>
+                            <Box component="pre" sx={{ m: 0, p: 1, overflow: 'auto', bgcolor: 'action.hover', fontSize: 11 }}>
+                              {policyText(change.after)}
+                            </Box>
+                          </Box>
+                        </Stack>
+                      </CardContent>
+                    </Card>
+                  ))}
+                </Stack>
+              )}
+            </>
+          )}
+        </Stack>
       </DialogContent>
 
       <DialogActions sx={{ px: 2, py: 1.5, justifyContent: 'space-between' }}>
-        <Button onClick={onCancel} variant="outlined" size="small" color="inherit" sx={{ borderRadius: '18px' }}>
+        <Button onClick={onCancel} variant="outlined" color="inherit">
           {t('CheckUpdatesTable.cancel')}
         </Button>
-
-        {newPricing.length > 0 && (
-          <Stack direction="row" spacing={1}>
-            <LoadingButton
-              variant="contained"
-              size="small"
-              color="success"
-              onClick={() => syncPricing('add')}
-              loading={updateLoading}
-              disabled={addModel.length === 0}
-              sx={{ borderRadius: '18px' }}
-            >
-              {t('CheckUpdatesTable.updateModeAdd')}
-            </LoadingButton>
-            <LoadingButton
-              variant="contained"
-              size="small"
-              color="warning"
-              onClick={() => syncPricing('update')}
-              loading={updateLoading}
-              sx={{ borderRadius: '18px' }}
-            >
-              {t('CheckUpdatesTable.updateModeUpdate')}
-            </LoadingButton>
-            <LoadingButton
-              variant="contained"
-              size="small"
-              color="primary"
-              onClick={() => syncPricing('overwrite')}
-              loading={updateLoading}
-              sx={{ borderRadius: '18px' }}
-            >
-              {t('CheckUpdatesTable.updateModeOverwrite')}
-            </LoadingButton>
-          </Stack>
-        )}
+        <LoadingButton
+          variant="contained"
+          onClick={applyPreview}
+          loading={applyLoading}
+          disabled={!preview || loading || changes.length === 0}
+        >
+          {t(`CheckUpdatesTable.updateMode${mode.charAt(0).toUpperCase()}${mode.slice(1)}`)}
+        </LoadingButton>
       </DialogActions>
     </Dialog>
   );
@@ -435,7 +357,6 @@ export const CheckUpdates = ({ open, onCancel, onOk, row }) => {
 
 CheckUpdates.propTypes = {
   open: PropTypes.bool,
-  row: PropTypes.array,
   onCancel: PropTypes.func,
   onOk: PropTypes.func
 };
