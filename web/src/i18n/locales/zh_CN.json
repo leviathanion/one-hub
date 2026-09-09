@@ -205,6 +205,18 @@
     "batchDelete": "批量删除模型"
   },
   "channel_edit": {
+    "endpoints": {
+      "description": "开关控制当前渠道的上游接口。地址留空使用默认路径，也可填写以 / 开头的路径或完整 HTTP(S) URL；继续使用当前渠道凭据。",
+      "enable": "启用 {{name}}",
+      "upstreamURL": "上游地址",
+      "address": "{{name}} 上游地址",
+      "effectiveURL": "生效地址：{{url}}",
+      "missingBaseURL": "请先填写渠道 API 地址",
+      "disabled": "已停用，保存时保留地址",
+      "responsesScope": "Responses 地址同时用于已支持的资源操作、Compact 和 Responses WebSocket。显式协议转换仍由独立配置控制。",
+      "loadError": "接口目录加载失败，请重新打开编辑窗口。",
+      "loading": "正在加载接口目录…"
+    },
     "customModelTip": "自定义：点击或回车输入",
     "modelListError": "获取模型列表失败",
     "editSuccess": "更新成功!",
@@ -283,10 +295,15 @@
     "overwriteMappingsTip": "启用后将清空原有的映射关系，仅保留此次创建的映射",
     "clearModels": "重置",
     "clearModelsTip": "重置所有已选择的模型",
+    "responsesWSNative": "启用原生 Responses WebSocket",
+    "responsesWSNativeHelp": "仅当该 OpenAI 兼容端点实现了原生 Responses WebSocket 协议时开启，不影响 HTTP Responses 请求。",
+    "responsesWSSelfHosted": "允许自建 Responses WebSocket 上游",
+    "responsesWSSelfHostedHelp": "允许 Responses WebSocket 连接私有或本地上游地址，并允许使用明文 ws。",
+    "responsesWSSelfHostedWarning": "安全警告：仅对你信任的上游开启。云 metadata 地址仍会被阻断。",
     "codexConfigHelp": {
       "title": "Codex 配置帮助",
       "tooltip": "查看 Codex 配置帮助",
-      "intro": "这里填写的是渠道级 JSON，对应后端 channel.Other。留空可用默认值；如果你已经在请求里显式传 prompt_cache_key，通常不需要配置 prompt_cache_key_strategy。",
+      "intro": "渠道级 JSON 配置，对应 channel.Other。WebSocket 始终连接真实上游 WebSocket，握手失败直接返回错误。",
       "fieldsTitle": "支持字段",
       "examplesTitle": "可复制模板",
       "positiveIntegerSeconds": "正整数秒",
@@ -294,26 +311,12 @@
       "acceptedValue": "{{accepted}}；{{description}}",
       "close": "关闭",
       "fields": {
-        "promptCacheKeyStrategy": "未显式传 prompt_cache_key 时在 provider 侧生成稳定值；预路由亲和需配置 CodexRoutingHintSetting",
-        "websocketMode": "控制 Codex Realtime/Responses native websocket；off 会关闭 native WS，但不影响普通 /v1/responses 或显式 http_bridge",
-        "responsesWSTransport": "Responses websocket 上游传输；http_bridge 需显式启用，且不是 native 失败后的自动 fallback",
         "executionSessionTTL": "Codex Realtime execution session 空闲保留时长",
-        "websocketRetryCooldown": "Codex Realtime websocket 失败后的 bridge 冷却",
-        "selfHosted": "仅允许 Codex Realtime 使用私有或本地自建上游",
-        "responsesWSSelfHosted": "仅允许 Responses websocket 使用私有或本地自建上游"
+        "selfHosted": "仅允许 Codex Realtime 使用私有或本地自建上游"
       },
       "examples": {
-        "defaultPromptCache": "默认行为：不自动生成 prompt_cache_key",
-        "autoPromptCache": "常用：自动生成稳定 prompt_cache_key",
-        "realtimeAuto": "Realtime/Responses native WS：优先 websocket；ResponsesWS 不自动回退 HTTP bridge",
-        "realtimeForce": "Realtime/Responses native WS：必须走 websocket",
-        "realtimeOff": "Realtime/Responses native WS：禁用；ResponsesWS native 返回 unsupported",
-        "sessionIDCache": "按 session_id 绑定缓存",
-        "userIDCache": "同一用户多个令牌共享缓存",
-        "tokenIDCache": "每个令牌独立缓存",
-        "authHeaderCache": "按外部认证头共享缓存",
-        "selfHosted": "自建或内网上游：分别放开 Realtime 与 ResponsesWS 私有地址",
-        "ttlCooldown": "进阶：调整 session TTL 与 Realtime bridge 冷却"
+        "selfHosted": "为 Realtime 放开自建或内网上游",
+        "sessionTTL": "调整会话空闲保留时间"
       }
     },
     "otherConfigHelp": {
@@ -321,7 +324,7 @@
       "tooltip": "查看 Other 配置帮助",
       "intro": "这里填写的是渠道级 JSON，对应后端 channel.Other。字段必须是 JSON object；未列出的 provider 私有数据请放入 extra 或 vendor_extra，运行时不会解释这两个命名空间。",
       "providerFieldsTitle": "当前渠道字段",
-      "commonFieldsTitle": "公共 ResponsesWS / websocket 字段",
+      "commonFieldsTitle": "公共字段",
       "opaqueFieldsTitle": "保留命名空间",
       "examplesTitle": "可复制模板",
       "required": "必填",
@@ -329,10 +332,7 @@
       "noProviderFields": "当前渠道没有额外的 provider 专用字段。",
       "close": "关闭",
       "fields": {
-        "responsesWSTransport": "ResponsesWS 上游传输；http_bridge 需显式配置，不是 native 失败后的自动回退；只对支持 ResponsesWS 的渠道生效",
-        "responsesWSNative": "声明 OpenAI-compatible 自定义上游支持原生 ResponsesWS；官方或明确支持的渠道通常不需要",
         "selfHosted": "允许 Realtime native websocket 使用私有或本地自建上游；会放开私有地址和明文 ws，但仍阻断云 metadata 地址",
-        "responsesWSSelfHosted": "允许 ResponsesWS native/HTTP bridge 使用私有或本地自建上游；会放开私有地址和明文 ws/http，但仍阻断云 metadata 地址",
         "extra": "保留给非运行时扩展数据的 JSON object；后端保存但不会解释",
         "vendorExtra": "保留给供应商私有数据的 JSON object；后端保存但不会解释",
         "azureAPIVersion": "Azure OpenAI classic 的 API version，必填；配置 ResponsesWS 时也必须保留",
@@ -344,7 +344,7 @@
         "vertexProjectID": "VertexAI project_id，必填"
       },
       "examples": {
-        "responsesBridge": "ResponsesWS 使用 HTTP bridge",
+        "responsesBridge": "ResponsesWS 使用原生上游",
         "customNative": "自定义上游声明原生 ResponsesWS",
         "azureClassic": "Azure classic",
         "azureV1": "Azure V1",
@@ -515,20 +515,63 @@
       "illustrate": "* 本条记录为系统升级前所记录的log"
     },
     "quotaDetail": {
-      "saved": "节省 ",
-      "originalPrice": "原始价格",
-      "inputPrice": "原输入价格",
-      "outputPrice": "原输出价格",
-      "groupRatio": "分组倍率",
-      "groupRatioValue": "分组倍率",
-      "actualPrice": "实际价格",
-      "input": "实际输入价格",
-      "output": "实际输出价格",
-      "finalCalculation": "最终计算",
-      "originalBilling": "原始计费",
-      "actualBilling": "实际计费",
-      "calculationNote": "PS：本系统按照积分计算，所有金额均为积分换算而来，1积分=$0.000002，最低消费为1积分，本计算步骤仅供参考，以实际扣费为准",
-      "times": "倍"
+      "costBreakdown": "费用组成",
+      "item": "项目",
+      "usage": "用量",
+      "unitPriceCalculation": "单价计算（原价 × 倍率）",
+      "inputBasePrice": "输入原价：{{price}}",
+      "outputBasePrice": "输出原价：{{price}}",
+      "baseCallPrice": "原价：{{price}}",
+      "basePriceNotRecorded": "原价未记录",
+      "multipliersNotRecorded": "倍率未记录",
+      "referenceAmount": "金额（参考）",
+      "input": "输入",
+      "output": "输出",
+      "perCallBilling": "按次计费",
+      "perMillionTokens": "${{price}} / 百万 tokens",
+      "perCall": "${{price}} / 次",
+      "tokenCount": "{{countText}} tokens",
+      "callCount": "{{countText}} 次",
+      "includedUsage": "其中{{name}} {{countText}} tokens，单价 {{price}}",
+      "tokenKinds": {
+        "input_text_tokens": "文本",
+        "output_text_tokens": "文本",
+        "input_audio_tokens": "音频",
+        "output_audio_tokens": "音频",
+        "cached_tokens": "缓存命中",
+        "cached_write_tokens": "缓存写入",
+        "cached_read_tokens": "缓存读取",
+        "reasoning_tokens": "推理",
+        "input_image_tokens": "图像",
+        "output_image_tokens": "图像",
+        "cache_write_tokens": "缓存写入",
+        "claude_cache_write_5m_tokens": "5 分钟缓存写入",
+        "claude_cache_write_1h_tokens": "1 小时缓存写入",
+        "tool_use_prompt_tokens": "工具输入",
+        "input_video_tokens": "视频",
+        "output_video_tokens": "视频",
+        "deepseek_cache_hit_tokens": "缓存命中",
+        "deepseek_cache_miss_tokens": "未命中缓存"
+      },
+      "webSearch": "联网搜索",
+      "fileSearch": "文件搜索",
+      "codeInterpreter": "代码执行",
+      "imageGeneration": "图片生成",
+      "referenceNote": "单价计算已列入本次调价倍率，金额无需再乘；分项金额仅供核对，实际扣费以合计为准。",
+      "tokenCharge": "Token 实扣",
+      "actualCharge": "实扣合计",
+      "notRecorded": "未记录",
+      "priceReasons": "价格调整原因",
+      "longContextReason": "本次输入 {{countText}} tokens，超过 {{threshold}} 的长上下文门槛：全部输入单价 ×{{input}}，输出单价 ×{{output}}。",
+      "fastReason": "本次使用快速模式（Fast / Priority）：输入单价 ×{{input}}，输出单价 ×{{output}}。",
+      "flexReason": "本次使用弹性模式（Flex）：输入单价 ×{{input}}，输出单价 ×{{output}}。",
+      "otherPriceReason": "本次调整了 Token 价格：输入单价 ×{{input}}，输出单价 ×{{output}}。",
+      "groupDiscountReason": "所在分组优惠 {{percent}}%，已计入上方单价。",
+      "groupMarkupReason": "所在分组加价 {{percent}}%，已计入上方单价。",
+      "missingRuleDetails": "这条记录未保存价格调整明细。",
+      "conflictingUsage": "用量信息不一致，Token 部分未收费。",
+      "missingUsage": "用量或价格信息不完整，Token 部分未收费。",
+      "noTokenCharge": "本次 Token 部分未收费。"
     }
   },
   "redemptionPage": {
@@ -621,6 +664,8 @@
     "failureReason": "失败原因"
   },
   "userPage": {
+    "recalculateGroup": "重新计算用户组",
+    "invalidQuota": "请输入有效的额度增减值",
     "editUser": "编辑用户",
     "createUser": "新建用户",
     "username": "用户名",
@@ -772,9 +817,13 @@
     "noneGroup": "当前分组不可用",
     "other": "其他",
     "input_audio_tokens": "音频输入倍率",
+    "input_audio_transcription": "输入音频转写倍率",
     "output_audio_tokens": "音频输出倍率",
     "cached_tokens": "缓存倍率",
+    "cache_write_tokens": "缓存写入倍率（OpenAI）",
     "cached_write_tokens": "缓存写入倍率",
+    "claude_cache_write_5m_tokens": "Claude 5 分钟缓存写入倍率（未设置时回退到通用缓存写入倍率）",
+    "claude_cache_write_1h_tokens": "Claude 1 小时缓存写入倍率（未设置时回退到通用缓存写入倍率）",
     "cached_read_tokens": "缓存读取倍率",
     "reasoning_tokens": "推理倍率",
     "input_text_tokens": "输入文本倍率",
@@ -914,18 +963,7 @@
         "title": "其他设置",
         "mjNotify": "Midjourney 允许回调（会泄露服务器ip地址）",
         "claudeAPIEnabled": "是否开启Claude API",
-        "geminiAPIEnabled": "是否开启Gemini API",
-        "alert": "当用户使用vision模型并提供了图片链接时，我们的服务器需要下载这些图片并计算 tokens。为了在下载图片时保护服务器的 IP 地址不被泄露，可以在下方配置一个代理。这个代理配置使用的是 HTTP 或 SOCKS5 代理。如果你是个人用户，这个配置可以不用理会。代理格式为 http://127.0.0.1:1080 或 socks5://127.0.0.1:1080",
-        "chatImageRequestProxy": {
-          "label": "图片检测代理",
-          "placeholder": "聊天图片检测代理设置，如果不设置可能会泄漏服务器ip"
-        },
-        "CFWorkerImageUrl": {
-          "label": "Cloudflare Worker 图片代理",
-          "key": "Cloudflare Worker 图片代理key,如果没有配置请忽略",
-          "alert": "这里是Cloudflare Worker的图片代理地址，你可以通过部署https://github.com/MartialBE/get-image-by-cf，来使用，它和图片检测代理可以只设置其中一个。注意有些图片链接可能会拒绝CF的访问导致检测失败。"
-        },
-        "saveButton": "保存其他设置"
+        "geminiAPIEnabled": "是否开启Gemini API"
       },
       "logSettings": {
         "title": "日志设置",
@@ -946,10 +984,6 @@
           "label": "渠道测试并发数",
           "placeholder": "1-32，默认 8",
           "error": "渠道测试并发数必须是 1 到 32 之间的整数"
-        },
-        "quotaRemindThreshold": {
-          "label": "额度提醒阈值",
-          "placeholder": "低于此额度时将发送邮件提醒用户"
         },
         "automaticDisableChannel": "失败时自动禁用通道",
         "automaticEnableChannel": "成功时自动启用通道",
@@ -1026,24 +1060,9 @@
         "save": "保存Gemini设置"
       },
       "codexSettings": {
-        "title": "路由亲和与 Codex Hint",
-        "globalOptionBadge": "全局 Option",
-        "decisionTitle": "先选择目标，再改细节",
-        "description": "这些配置走全局 option，不属于单个渠道。ChannelAffinitySetting 是通用路由亲和规则；CodexRoutingHintSetting 只负责为 Codex Responses 派生 prompt_cache_key hint。留空时会回到后端默认值，两个等待时间单位都是毫秒。",
-        "globalWarning": "这些配置会影响所有用户以及匹配规则的请求。不了解 affinity / prompt_cache_key 时，建议 ChannelAffinitySetting 保持默认，只在需要 Codex prompt cache 预路由命中时启用 CodexRoutingHintSetting。",
         "waitSectionTitle": "首选渠道等待",
-        "affinitySectionTitle": "通用 Channel Affinity",
-        "codexHintSectionTitle": "Codex Routing Hint",
-        "quickActions": {
-          "recommended": {
-            "title": "启用 Codex 推荐",
-            "body": "开启 auto hint，路由亲和使用后端默认规则，等待预算设为 250 / 50ms。"
-          },
-          "safeDefault": {
-            "title": "恢复稳妥默认",
-            "body": "关闭 hint，路由亲和回到后端默认，等待预算设为 0 / 50ms。"
-          }
-        },
+        "affinitySectionTitle": "路由亲和",
+        "codexHintSectionTitle": "Codex 自动缓存键",
         "summary": {
           "affinityMode": "亲和模式",
           "backendDefault": "后端默认",
@@ -1060,20 +1079,6 @@
           "storageDetail": "保存到 options 表，会影响匹配规则的所有请求。",
           "ruleCount": "{{count}} / {{total}} 条规则启用"
         },
-        "flow": {
-          "request": {
-            "title": "请求身份",
-            "body": "从 previous_response_id、prompt_cache_key、session 或认证信息里取稳定身份。"
-          },
-          "hint": {
-            "title": "Codex Hint",
-            "body": "当请求没显式传 prompt_cache_key 时，可提前派生 responses.prompt_cache_key。"
-          },
-          "affinity": {
-            "title": "路由亲和",
-            "body": "ChannelAffinitySetting 读取身份并优先回到上次成功的渠道。"
-          }
-        },
         "preferredChannelWaitMilliseconds": {
           "label": "首选渠道等待时间（毫秒）",
           "placeholder": "例如：250",
@@ -1085,9 +1090,9 @@
           "help": "等待首选渠道恢复时的检查间隔。通常保持 50ms；过小会增加轮询开销，过大会让等待更钝。"
         },
         "codexRoutingHintSetting": {
-          "label": "Codex 高级配置",
+          "label": "缓存键生成",
           "placeholder": "",
-          "help": "Codex 专用配置：控制 one-hub 是否在选择 Codex 渠道前自动生成稳定的 prompt_cache_key hint。生成的 hint 可被 ChannelAffinitySetting 的 request_hint 规则读取。推荐 auto；off 表示不生成。",
+          "help": "客户端未提供 prompt_cache_key 时，可按以下策略为 Codex 自动生成缓存键，供选路和上游使用。这里不配置渠道选择规则，也不会修改路由亲和设置。",
           "useRecommended": "使用推荐模板",
           "useDefault": "使用关闭模板",
           "fields": {
@@ -1109,14 +1114,14 @@
           "placeholder": "",
           "help": "通用路由亲和配置：控制哪些 Responses / Realtime 请求会记录 identity -> channel，以及下次相同 identity 是否优先回到上次成功的渠道。不要填写 rules: []，那会清空规则。",
           "useDefault": "使用默认规则模板",
-          "useBlankDefault": "留空使用后端默认",
+          "useBlankDefault": "跟随后端默认值",
           "rulesTitle": "亲和规则",
           "keySourcesTitle": "Key 来源",
           "addRule": "添加规则",
           "removeRule": "删除规则",
           "addKeySource": "添加 Key 来源",
           "removeKeySource": "删除 Key 来源",
-          "backendDefaultAlert": "当前会保存为空字符串，运行时使用后端内置默认规则。这是最稳妥的选择。",
+          "backendDefaultAlert": "当前跟随后端默认规则。保存时移除显式覆盖，后续后端默认规则变化会自动生效。",
           "customAlert": "当前会保存自定义 JSON，后续后端默认规则变化不会自动覆盖这份配置。",
           "advancedTitle": "高级亲和规则",
           "advancedDescription": "只有需要改 identity 来源、strict 行为或匹配范围时才展开。大多数场景保留默认规则即可。",
@@ -1229,11 +1234,11 @@
             },
             "filters": {
               "title": "过滤条件",
-              "body": "model_regex 和 user_agent_regex 都为空时，对所有 Responses 请求生效。\n如果只想对 Codex CLI 或指定模型生效，可以加正则，例如 model_regex 使用 ^gpt-5$。"
+              "body": "model_regex 和 user_agent_regex 都为空时，对所有 Responses 请求生效。\n只有明确需要缩小运维范围时才填写过滤正则；过滤器不是模型支持列表。"
             },
             "recommended": {
               "title": "怎么配",
-              "body": "推荐模板：{\"prompt_cache_key_strategy\":\"auto\",\"model_regex\":\"^gpt-5$\"}\n这是 Codex 专用 hint 生成策略。如果你不确定影响范围，先限制模型；确认没问题后再放宽。"
+              "body": "推荐模板：{\"prompt_cache_key_strategy\":\"auto\",\"model_regex\":\"\",\"user_agent_regex\":\"\"}\n模板不按模型名推导能力，对当前和未来 Responses 模型使用同一策略。"
             },
             "impact": {
               "title": "配置后的影响",
@@ -1241,7 +1246,7 @@
             },
             "risk": {
               "title": "风险和取舍",
-              "body": "选择 token_id 或 user_id 会让同 token / 同用户的请求更倾向同一渠道，复用更强但负载可能更集中。建议同时让 Codex 渠道的 prompt_cache_key_strategy 保持同样策略，避免路由 hint 和上游实际 key 不一致。"
+              "body": "选择 token_id 或 user_id 会让同 token / 同用户的请求更倾向同一渠道，复用更强但负载可能更集中。缓存 key 在选路前统一生成，渠道不会再次改写。"
             }
           },
           "ChannelAffinitySetting": {
@@ -1256,7 +1261,7 @@
             },
             "ruleFields": {
               "title": "rules 字段",
-              "body": "name：规则名。\nenabled：是否启用。\nkind：responses 或 realtime。\nmodel_regex / path_regex / user_agent_regex：匹配条件。\ninclude_group / include_model / include_path / include_rule_name：是否把这些维度拼进 affinity key。\nstrict：首选渠道不可用时是否直接失败。\nskip_retry_on_failure：首选渠道失败后是否跳过重试。\nrecord_on_success：成功后是否写回亲和记录。\nttl_seconds：本规则记录保留秒数。"
+              "body": "name：规则名。\nenabled：是否启用。\nkind：chat、responses 或 realtime。\nmodel_regex / path_regex / user_agent_regex：匹配条件。\ninclude_group / include_model / include_path / include_rule_name：是否把这些维度拼进 affinity key。\nstrict：首选渠道不可用时是否直接失败。\nskip_retry_on_failure：首选渠道失败后是否跳过重试。\nrecord_on_success：成功后是否写回亲和记录。\nttl_seconds：本规则记录保留秒数。"
             },
             "keySources": {
               "title": "key_sources 字段",
@@ -1264,7 +1269,7 @@
             },
             "defaults": {
               "title": "默认规则",
-              "body": "默认包含三条规则：\nresponses-continuation：按 previous_response_id 回原渠道，strict=true。\nresponses-prompt-cache-key：按 prompt_cache_key 或 responses.prompt_cache_key hint 回原渠道。\nrealtime-session：按 x-session-id / session_id 回原渠道。"
+              "body": "默认包含四条规则：\nresponses-continuation：按 previous_response_id 回原渠道，strict=true。\nresponses-prompt-cache-key：按 prompt_cache_key 或 responses.prompt_cache_key hint 回原渠道。\nchat-prompt-cache-key：按 Chat prompt_cache_key 建立软亲和。\nrealtime-session：按 x-session-id / session_id 回原渠道。显式保存过 rules 的旧配置需要手动加入新规则。"
             },
             "recommended": {
               "title": "怎么配",
@@ -1289,7 +1294,9 @@
           "invalidMaxEntries": "渠道亲和最大缓存条数必须是非负整数",
           "invalidRuleTTL": "第 {{index}} 条亲和规则的 TTL 必须是非负整数"
         },
-        "save": "保存路由亲和配置"
+        "save": "保存路由亲和配置",
+        "affinityDescription": "根据请求标识优先选择之前成功的渠道，适用于 Chat、Responses 和 Realtime。这里配置亲和规则与首选渠道等待时间，不修改 Codex 缓存键策略。",
+        "saveCodexHint": "保存 Codex 缓存键配置"
       },
       "safetySettings": {
         "title": "系统安全设置",
@@ -1744,7 +1751,94 @@
     "promptRatio": "提示倍率",
     "completionRatio": "完成倍率",
     "noAvailableRatios": "没有可用的扩展倍率",
-    "delMultipleInfoTip": "确定删除所选的 {{count}} 个价格吗？"
+    "delMultipleInfoTip": "确定删除所选的 {{count}} 个价格吗？",
+    "rateRules": {
+      "title": "条件价格规则",
+      "disabled": "未勾选时不应用规则",
+      "inactive": "按次计费未生效",
+      "inactiveForTimes": "按次计费时这些规则会保留但不生效；切回按 Token 计费后会恢复使用，也可以在此清除。",
+      "flex": "Flex",
+      "fastPriority": "Fast / Priority",
+      "longContext": "Long Context",
+      "inputThreshold": "输入阈值",
+      "inputMultiplier": "输入倍率",
+      "outputMultiplier": "输出倍率",
+      "positiveNumber": "请输入大于零的数值",
+      "positiveInteger": "请输入正整数",
+      "invalid": "提交前请修正无效的条件价格规则",
+      "service_tier": "实际服务档位（service_tier）",
+      "speed": "实际速度（speed）",
+      "long_context": "长上下文",
+      "schedule": "时间折扣",
+      "scope": "条件倍率仅影响当前模型的 Token 计价及相关扩展项，不调整独立工具费用或按次价格。",
+      "composition": "各类倍率独立配置并相乘；档位、速度和长度区间不能重复覆盖同一请求。",
+      "timezone": "时区",
+      "timezoneHelp": "时间条件必须指定 IANA 时区，例如 Asia/Shanghai。",
+      "add": "添加规则／覆盖项",
+      "enumHelp": "选择或输入值后按回车；同一个取值只能配置一次。",
+      "gt": "完整输入 Token 大于",
+      "lte": "完整输入 Token 小于等于",
+      "weekdays": "星期",
+      "weekdayHelp": "周一至周日；留空表示每天。按操作开始时的当地日期判断。",
+      "start": "开始时间（包含）",
+      "end": "结束时间（不包含）",
+      "allDay": "全天",
+      "all": "统一倍率",
+      "inheritHelp": "留空默认 1；局部倍率覆盖统一倍率，填 0 表示免费。",
+      "inherit": "留空／跟随时的倍率：{{value}}",
+      "overrides": "自定义输入、输出、缓存等倍率",
+      "extra": "独立调整项",
+      "selectExtra": "选择计量项",
+      "follow": "恢复跟随",
+      "remove": "删除规则",
+      "preview": "试算当前价格草稿",
+      "previewHelp": "模拟实际执行事实；只计算不扣费。完整输入包含缓存，额外缓存数量必须属于该总量。",
+      "running": "计算中…",
+      "previewResult": "试算结果（用户组倍率为 1）",
+      "started_at": "操作开始时间（ISO 8601，含时区）",
+      "prompt_tokens": "完整输入 Token",
+      "completion_tokens": "输出 Token",
+      "ruleReason": "{{name}}：输入 ×{{input}}，输出 ×{{output}}",
+      "extraReason": "独立倍率：{{items}}",
+      "day1": "周一",
+      "day2": "周二",
+      "day3": "周三",
+      "day4": "周四",
+      "day5": "周五",
+      "day6": "周六",
+      "day7": "周日",
+      "meters": {
+        "cached_tokens": "缓存命中",
+        "cache_write_tokens": "缓存写入",
+        "cached_write_tokens": "通用缓存写入",
+        "cached_read_tokens": "缓存读取",
+        "claude_cache_write_5m_tokens": "Claude 5 分钟缓存写入",
+        "claude_cache_write_1h_tokens": "Claude 1 小时缓存写入",
+        "tool_use_prompt_tokens": "工具输入",
+        "input_audio_tokens": "音频输入",
+        "output_audio_tokens": "音频输出",
+        "reasoning_tokens": "推理输出",
+        "input_text_tokens": "文本输入",
+        "output_text_tokens": "文本输出",
+        "input_image_tokens": "图像输入",
+        "output_image_tokens": "图像输出",
+        "input_video_tokens": "视频输入",
+        "output_video_tokens": "视频输出",
+        "deepseek_cache_hit_tokens": "DeepSeek 缓存命中",
+        "deepseek_cache_miss_tokens": "DeepSeek 缓存未命中"
+      },
+      "schedulePriority": "时间折扣可能重叠，按优先级从高到低只取第一条匹配规则。将“周末夜间”放在“夜间”和“周末”之前即可。",
+      "raisePriority": "提高优先级",
+      "lowerPriority": "降低优先级",
+      "priority": "优先级 {{value}}",
+      "addRule": "添加规则",
+      "selectValues": "请选择取值",
+      "inputRange": "输入 {{range}} Token",
+      "everyDay": "每天",
+      "applicableSpeed": "适用速度（speed，可选）",
+      "applicableSpeedHelp": "不选择表示不限速度。只选择 standard 可使 Fast 不叠加长上下文倍率。",
+      "overlap": "此规则与同组规则的取值或区间重叠，请调整条件。"
+    }
   },
   "redemption_edit": {
     "requiredQuota": "必须大于等于0",
@@ -1938,16 +2032,11 @@
   "Gemini 配置(JSON)": "Gemini 配置(JSON)",
   "Azure Speech 配置(JSON)": "Azure Speech 配置(JSON)",
   "请输入 JSON，例如：{\"api_version\":\"2024-05-01-preview\"}": "请输入 JSON，例如：{\"api_version\":\"2024-05-01-preview\"}",
-  "请输入 JSON，例如：{\"api_version\":\"2024-05-01-preview\",\"responses_ws_transport\":\"native\"}": "请输入 JSON，例如：{\"api_version\":\"2024-05-01-preview\",\"responses_ws_transport\":\"native\"}",
   "可选 JSON 配置，例如：{}": "可选 JSON 配置，例如：{}",
-  "可选 JSON 配置，例如：{\"responses_ws_transport\":\"native\"}": "可选 JSON 配置，例如：{\"responses_ws_transport\":\"native\"}",
-  "可选 JSON 配置，例如：{\"responses_ws_native\":true}；仅当自定义兼容上游明确支持原生 Responses WebSocket 时填写。": "可选 JSON 配置，例如：{\"responses_ws_native\":true}；仅当自定义兼容上游明确支持原生 Responses WebSocket 时填写。",
-  "可选 JSON 配置，例如：{\"responses_ws_transport\":\"http_bridge\"}；如需原生 Responses WebSocket，可使用 {\"responses_ws_transport\":\"native\"}。": "可选 JSON 配置，例如：{\"responses_ws_transport\":\"http_bridge\"}；如需原生 Responses WebSocket，可使用 {\"responses_ws_transport\":\"native\"}。",
-  "可选 JSON 配置，例如：{\"responses_ws_transport\":\"http_bridge\"}；如自定义兼容上游支持原生 Responses WebSocket，可使用 {\"responses_ws_native\":true,\"responses_ws_transport\":\"native\"}。": "可选 JSON 配置，例如：{\"responses_ws_transport\":\"http_bridge\"}；如自定义兼容上游支持原生 Responses WebSocket，可使用 {\"responses_ws_native\":true,\"responses_ws_transport\":\"native\"}。",
   "请输入 JSON，例如：{\"dashscope_plugin\":\"plugin-name\"}": "请输入 JSON，例如：{\"dashscope_plugin\":\"plugin-name\"}",
   "请输入 JSON，例如：{\"api_version\":\"v3.1\"}": "请输入 JSON，例如：{\"api_version\":\"v3.1\"}",
   "请输入 JSON，例如：{\"api_version\":\"v1\"}": "请输入 JSON，例如：{\"api_version\":\"v1\"}",
   "请输入 JSON，例如：{\"region\":\"eastasia\"}": "请输入 JSON，例如：{\"region\":\"eastasia\"}",
   "请输入 JSON，例如：{\"region\":\"us-central1\",\"project_id\":\"my-project\"}": "请输入 JSON，例如：{\"region\":\"us-central1\",\"project_id\":\"my-project\"}",
-  "开启后，将会透传普通 HTTP 请求中的额外字段（如 OpenAI SDK 的 extra_body 参数）；ResponsesWS HTTP bridge 按 WebSocket raw frame 契约保留未知字段，不受此开关控制": "开启后，将会透传普通 HTTP 请求中的额外字段（如 OpenAI SDK 的 extra_body 参数）；ResponsesWS HTTP bridge 按 WebSocket raw frame 契约保留未知字段，不受此开关控制"
+  "开启后，将会透传普通 HTTP 请求中的额外字段（如 OpenAI SDK 的 extra_body 参数）": "开启后，将会透传普通 HTTP 请求中的额外字段（如 OpenAI SDK 的 extra_body 参数）"
 }

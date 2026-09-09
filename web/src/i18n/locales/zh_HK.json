@@ -98,6 +98,18 @@
   },
   "channel": "渠道",
   "channel_edit": {
+    "endpoints": {
+      "description": "开关控制当前渠道的上游接口。地址留空使用默认路径，也可填写以 / 开头的路径或完整 HTTP(S) URL；继续使用当前渠道凭据。",
+      "enable": "启用 {{name}}",
+      "upstreamURL": "上游地址",
+      "address": "{{name}} 上游地址",
+      "effectiveURL": "生效地址：{{url}}",
+      "missingBaseURL": "请先填写渠道 API 地址",
+      "disabled": "已停用，保存时保留地址",
+      "responsesScope": "Responses 地址同时用于已支持的资源操作、Compact 和 Responses WebSocket。显式协议转换仍由独立配置控制。",
+      "loadError": "接口目录加载失败，请重新打开编辑窗口。",
+      "loading": "正在加载接口目录…"
+    },
     "addModelHeader": "添加自定義Header",
     "addModelMapping": "添加模型映射",
     "addModelMappingByJson": "添加模型映射(JSON)",
@@ -156,10 +168,15 @@
     "removeSuffix": "刪除後缀",
     "collapseList": "收起列表",
     "expandList": "展開列表",
+    "responsesWSNative": "啟用原生 Responses WebSocket",
+    "responsesWSNativeHelp": "僅當該 OpenAI 兼容端點實現了原生 Responses WebSocket 協議時啟用，不影響 HTTP Responses 請求。",
+    "responsesWSSelfHosted": "允許自建 Responses WebSocket 上游",
+    "responsesWSSelfHostedHelp": "允許 Responses WebSocket 連接私有或本地上游地址，並允許使用明文 ws。",
+    "responsesWSSelfHostedWarning": "安全警告：僅對你信任的上游啟用。雲 metadata 地址仍會被阻斷。",
     "codexConfigHelp": {
       "title": "Codex 配置幫助",
       "tooltip": "查看 Codex 配置幫助",
-      "intro": "這裏填寫的是渠道級 JSON，對應後端 channel.Other。留空可用默認值；如果你已經在請求裏顯式傳 prompt_cache_key，通常不需要配置 prompt_cache_key_strategy。",
+      "intro": "渠道級 JSON 配置，對應 channel.Other。WebSocket 始終連接真實上游 WebSocket，握手失敗直接返回錯誤。",
       "fieldsTitle": "支持字段",
       "examplesTitle": "可複製模板",
       "positiveIntegerSeconds": "正整數秒",
@@ -167,26 +184,12 @@
       "acceptedValue": "{{accepted}}；{{description}}",
       "close": "關閉",
       "fields": {
-        "promptCacheKeyStrategy": "未顯式傳 prompt_cache_key 時在 provider 側生成穩定值；預路由親和需配置 CodexRoutingHintSetting",
-        "websocketMode": "控制 Codex Realtime/Responses native websocket；off 會關閉 native WS，但不影響普通 /v1/responses 或顯式 http_bridge",
-        "responsesWSTransport": "Responses websocket 上游傳輸；http_bridge 需顯式啟用，且不是 native 失敗後的自動 fallback",
         "executionSessionTTL": "Codex Realtime execution session 空閒保留時長",
-        "websocketRetryCooldown": "Codex Realtime websocket 失敗後的 bridge 冷卻",
-        "selfHosted": "僅允許 Codex Realtime 使用私有或本地自建上游",
-        "responsesWSSelfHosted": "僅允許 Responses websocket 使用私有或本地自建上游"
+        "selfHosted": "僅允許 Codex Realtime 使用私有或本地自建上游"
       },
       "examples": {
-        "defaultPromptCache": "默認行為：不自動生成 prompt_cache_key",
-        "autoPromptCache": "常用：自動生成穩定 prompt_cache_key",
-        "realtimeAuto": "Realtime/Responses native WS：優先 websocket；ResponsesWS 不自動回退 HTTP bridge",
-        "realtimeForce": "Realtime/Responses native WS：必須走 websocket",
-        "realtimeOff": "Realtime/Responses native WS：禁用；ResponsesWS native 返回 unsupported",
-        "sessionIDCache": "按 session_id 綁定緩存",
-        "userIDCache": "同一用戶多個令牌共享緩存",
-        "tokenIDCache": "每個令牌獨立緩存",
-        "authHeaderCache": "按外部認證頭共享緩存",
-        "selfHosted": "自建或內網上游：分別放開 Realtime 與 ResponsesWS 私有地址",
-        "ttlCooldown": "進階：調整 session TTL 與 Realtime bridge 冷卻"
+        "selfHosted": "為 Realtime 放開自建或內網上游",
+        "sessionTTL": "調整會話空閒保留時間"
       }
     },
     "otherConfigHelp": {
@@ -194,7 +197,7 @@
       "tooltip": "查看 Other 配置幫助",
       "intro": "這裏填寫的是渠道級 JSON，對應後端 channel.Other。字段必須是 JSON object；未列出的 provider 私有數據請放入 extra 或 vendor_extra，運行時不會解釋這兩個命名空間。",
       "providerFieldsTitle": "當前渠道字段",
-      "commonFieldsTitle": "公共 ResponsesWS / websocket 字段",
+      "commonFieldsTitle": "公共字段",
       "opaqueFieldsTitle": "保留命名空間",
       "examplesTitle": "可複製模板",
       "required": "必填",
@@ -202,10 +205,7 @@
       "noProviderFields": "當前渠道沒有額外的 provider 專用字段。",
       "close": "關閉",
       "fields": {
-        "responsesWSTransport": "ResponsesWS 上游傳輸；http_bridge 需顯式配置，不是 native 失敗後的自動回退；只對支持 ResponsesWS 的渠道生效",
-        "responsesWSNative": "聲明 OpenAI-compatible 自定義上游支持原生 ResponsesWS；官方或明確支持的渠道通常不需要",
         "selfHosted": "允許 Realtime native websocket 使用私有或本地自建上游；會放開私有地址和明文 ws，但仍阻斷雲 metadata 地址",
-        "responsesWSSelfHosted": "允許 ResponsesWS native/HTTP bridge 使用私有或本地自建上游；會放開私有地址和明文 ws/http，但仍阻斷雲 metadata 地址",
         "extra": "保留給非運行時擴展數據的 JSON object；後端保存但不會解釋",
         "vendorExtra": "保留給供應商私有數據的 JSON object；後端保存但不會解釋",
         "azureAPIVersion": "Azure OpenAI classic 的 API version，必填；配置 ResponsesWS 時也必須保留",
@@ -217,7 +217,7 @@
         "vertexProjectID": "VertexAI project_id，必填"
       },
       "examples": {
-        "responsesBridge": "ResponsesWS 使用 HTTP bridge",
+        "responsesBridge": "ResponsesWS 使用原生上游",
         "customNative": "自定義上游聲明原生 ResponsesWS",
         "azureClassic": "Azure classic",
         "azureV1": "Azure V1",
@@ -590,20 +590,63 @@
       "illustrate": "* 本筆記錄為系統升級前所記錄的log"
     },
     "quotaDetail": {
-      "saved": "節省 ",
-      "originalPrice": "原始價格",
-      "inputPrice": "輸入價格",
-      "outputPrice": "輸出價格",
-      "groupRatio": "分組倍率",
-      "groupRatioValue": "分組倍率",
-      "actualPrice": "實際價格",
+      "costBreakdown": "費用組成",
+      "item": "項目",
+      "usage": "用量",
+      "unitPriceCalculation": "單價計算（原價 × 倍率）",
+      "inputBasePrice": "輸入原價：{{price}}",
+      "outputBasePrice": "輸出原價：{{price}}",
+      "baseCallPrice": "原價：{{price}}",
+      "basePriceNotRecorded": "原價未記錄",
+      "multipliersNotRecorded": "倍率未記錄",
+      "referenceAmount": "金額（參考）",
       "input": "輸入",
       "output": "輸出",
-      "finalCalculation": "最終計算",
-      "originalBilling": "原始計費",
-      "actualBilling": "實際計費",
-      "calculationNote": "PS：本系統按照積分計算，所有金額均為積分換算而來，1積分=$0.000002，最低消費為1積分，本計算步驟僅供參考，以實際扣費為準。",
-      "times": "倍"
+      "perCallBilling": "按次計費",
+      "perMillionTokens": "${{price}} / 百萬 tokens",
+      "perCall": "${{price}} / 次",
+      "tokenCount": "{{countText}} tokens",
+      "callCount": "{{countText}} 次",
+      "includedUsage": "其中{{name}} {{countText}} tokens，單價 {{price}}",
+      "tokenKinds": {
+        "input_text_tokens": "文字",
+        "output_text_tokens": "文字",
+        "input_audio_tokens": "音訊",
+        "output_audio_tokens": "音訊",
+        "cached_tokens": "快取命中",
+        "cached_write_tokens": "快取寫入",
+        "cached_read_tokens": "快取讀取",
+        "reasoning_tokens": "推理",
+        "input_image_tokens": "圖像",
+        "output_image_tokens": "圖像",
+        "cache_write_tokens": "快取寫入",
+        "claude_cache_write_5m_tokens": "5 分鐘快取寫入",
+        "claude_cache_write_1h_tokens": "1 小時快取寫入",
+        "tool_use_prompt_tokens": "工具輸入",
+        "input_video_tokens": "影片",
+        "output_video_tokens": "影片",
+        "deepseek_cache_hit_tokens": "快取命中",
+        "deepseek_cache_miss_tokens": "未命中快取"
+      },
+      "webSearch": "聯網搜尋",
+      "fileSearch": "檔案搜尋",
+      "codeInterpreter": "程式碼執行",
+      "imageGeneration": "圖片生成",
+      "referenceNote": "單價計算已列入本次調價倍率，金額毋須再乘；分項金額僅供核對，實際扣費以合計為準。",
+      "tokenCharge": "Token 實扣",
+      "actualCharge": "實扣合計",
+      "notRecorded": "未記錄",
+      "priceReasons": "價格調整原因",
+      "longContextReason": "本次輸入 {{countText}} tokens，超過 {{threshold}} 的長上下文門檻：全部輸入單價 ×{{input}}，輸出單價 ×{{output}}。",
+      "fastReason": "本次使用快速模式（Fast / Priority）：輸入單價 ×{{input}}，輸出單價 ×{{output}}。",
+      "flexReason": "本次使用彈性模式（Flex）：輸入單價 ×{{input}}，輸出單價 ×{{output}}。",
+      "otherPriceReason": "本次調整了 Token 價格：輸入單價 ×{{input}}，輸出單價 ×{{output}}。",
+      "groupDiscountReason": "所在分組優惠 {{percent}}%，已計入上方單價。",
+      "groupMarkupReason": "所在分組加價 {{percent}}%，已計入上方單價。",
+      "missingRuleDetails": "這條記錄未儲存價格調整明細。",
+      "conflictingUsage": "用量資訊不一致，Token 部分未收費。",
+      "missingUsage": "用量或價格資訊不完整，Token 部分未收費。",
+      "noTokenCharge": "本次 Token 部分未收費。"
     },
     "cachedReadTokens": "緩存讀取Tokens (* {{ ratio }})",
     "reasoningTokens": "推理Tokens (* {{ ratio }})",
@@ -680,13 +723,17 @@
     "tokens": "按量付費",
     "type": "類型",
     "input_audio_tokens": "音頻輸入倍率",
+    "input_audio_transcription": "輸入音頻轉寫倍率",
     "other": "其他",
     "output_audio_tokens": "音頻輸出倍率",
     "rate": "倍率",
     "RPM": "API速率",
     "free": "免費",
     "cached_tokens": "快取倍率",
+    "cache_write_tokens": "快取寫入倍率（OpenAI）",
     "cached_write_tokens": "快取寫入倍率",
+    "claude_cache_write_5m_tokens": "Claude 5 分鐘快取寫入倍率（未設定時回退至通用快取寫入倍率）",
+    "claude_cache_write_1h_tokens": "Claude 1 小時快取寫入倍率（未設定時回退至通用快取寫入倍率）",
     "cached_read_tokens": "快取讀取倍率",
     "reasoning_tokens": "推理倍率",
     "input_text_tokens": "輸入文本倍率",
@@ -859,10 +906,98 @@
     "lockedTip": "價格鎖定後無法通過價格更新伺服器和程序覆蓋。如果您所配置的價格希望隨程序或價格伺服器同步更新，請勿鎖定",
     "completionRatio": "完成倍率",
     "delMultipleInfoTip": "確定刪除所選的 {{count}} 個價格嗎？",
+    "extraRatios": "額外擴展倍率",
     "noAvailableRatios": "冇可用嘅擴展倍率",
     "noExtraRatios": "暫無額外擴展倍率，請從下拉框選擇添加",
     "promptRatio": "提示倍率",
-    "selectExtraRatio": "選擇擴展倍率"
+    "selectExtraRatio": "選擇擴展倍率",
+    "rateRules": {
+      "title": "條件價格規則",
+      "disabled": "未勾選時不套用規則",
+      "inactive": "按次計費未生效",
+      "inactiveForTimes": "按次計費時會保留但唔會套用呢啲規則；切返按 Token 計費後會恢復使用，亦可以喺呢度清除。",
+      "flex": "Flex",
+      "fastPriority": "Fast / Priority",
+      "longContext": "Long Context",
+      "inputThreshold": "輸入閾值",
+      "inputMultiplier": "輸入倍率",
+      "outputMultiplier": "輸出倍率",
+      "positiveNumber": "請輸入大於零嘅數值",
+      "positiveInteger": "請輸入正整數",
+      "invalid": "提交前請修正無效嘅條件價格規則",
+      "service_tier": "實際服務檔位（service_tier）",
+      "speed": "實際速度（speed）",
+      "long_context": "长上下文",
+      "schedule": "时间折扣",
+      "scope": "条件倍率仅影响当前模型的 Token 计价及相关扩展项，不调整独立工具费用或按次价格。",
+      "composition": "各类倍率独立配置并相乘；档位、速度和长度区间不能重复覆盖同一请求。",
+      "timezone": "时区",
+      "timezoneHelp": "时间条件必须指定 IANA 时区，例如 Asia/Shanghai。",
+      "add": "添加规则／覆盖项",
+      "enumHelp": "选择或输入值后按回车；同一个取值只能配置一次。",
+      "gt": "完整输入 Token 大于",
+      "lte": "完整输入 Token 小于等于",
+      "weekdays": "星期",
+      "weekdayHelp": "周一至周日；留空表示每天。按操作开始时的当地日期判断。",
+      "start": "开始时间（包含）",
+      "end": "结束时间（不包含）",
+      "allDay": "全天",
+      "all": "统一倍率",
+      "inheritHelp": "留空默认 1；局部倍率覆盖统一倍率，填 0 表示免费。",
+      "inherit": "留空／跟随时的倍率：{{value}}",
+      "overrides": "自定义输入、输出、缓存等倍率",
+      "extra": "独立调整项",
+      "selectExtra": "选择计量项",
+      "follow": "恢复跟随",
+      "remove": "删除规则",
+      "preview": "试算当前价格草稿",
+      "previewHelp": "模拟实际执行事实；只计算不扣费。完整输入包含缓存，额外缓存数量必须属于该总量。",
+      "running": "计算中…",
+      "previewResult": "试算结果（用户组倍率为 1）",
+      "started_at": "操作开始时间（ISO 8601，含时区）",
+      "prompt_tokens": "完整输入 Token",
+      "completion_tokens": "输出 Token",
+      "ruleReason": "{{name}}：输入 ×{{input}}，输出 ×{{output}}",
+      "extraReason": "独立倍率：{{items}}",
+      "day1": "周一",
+      "day2": "周二",
+      "day3": "周三",
+      "day4": "周四",
+      "day5": "周五",
+      "day6": "周六",
+      "day7": "周日",
+      "meters": {
+        "cached_tokens": "缓存命中",
+        "cache_write_tokens": "缓存写入",
+        "cached_write_tokens": "通用缓存写入",
+        "cached_read_tokens": "缓存读取",
+        "claude_cache_write_5m_tokens": "Claude 5 分钟缓存写入",
+        "claude_cache_write_1h_tokens": "Claude 1 小时缓存写入",
+        "tool_use_prompt_tokens": "工具输入",
+        "input_audio_tokens": "音频输入",
+        "output_audio_tokens": "音频输出",
+        "reasoning_tokens": "推理输出",
+        "input_text_tokens": "文本输入",
+        "output_text_tokens": "文本输出",
+        "input_image_tokens": "图像输入",
+        "output_image_tokens": "图像输出",
+        "input_video_tokens": "视频输入",
+        "output_video_tokens": "视频输出",
+        "deepseek_cache_hit_tokens": "DeepSeek 缓存命中",
+        "deepseek_cache_miss_tokens": "DeepSeek 缓存未命中"
+      },
+      "schedulePriority": "时间折扣可能重叠，按优先级从高到低只取第一条匹配规则。将“周末夜间”放在“夜间”和“周末”之前即可。",
+      "raisePriority": "提高优先级",
+      "lowerPriority": "降低优先级",
+      "priority": "优先级 {{value}}",
+      "addRule": "添加规则",
+      "selectValues": "请选择取值",
+      "inputRange": "输入 {{range}} Token",
+      "everyDay": "每天",
+      "applicableSpeed": "適用速度（speed，可選）",
+      "applicableSpeedHelp": "不选择表示不限速度。只选择 standard 可使 Fast 不叠加长上下文倍率。",
+      "overlap": "此规则与同组规则的取值或区间重叠，请调整条件。"
+    }
   },
   "profile": "個人設定",
   "profilePage": {
@@ -1041,26 +1176,11 @@
           "placeholder": "1-32，默認 8",
           "error": "渠道測試並發數必須是 1 到 32 之間的整數"
         },
-        "quotaRemindThreshold": {
-          "label": "額度提醒閾值",
-          "placeholder": "低於此額度時將發送郵件提醒用戶"
-        },
         "saveMonitoringSettings": "保存監控設置",
         "title": "監控設置"
       },
       "otherSettings": {
-        "CFWorkerImageUrl": {
-          "alert": "這裡是 Cloudflare Worker 的圖片代理地址，你可以通過部署 https://github.com/MartialBE/get-image-by-cf，來使用，它和圖片檢測代理可以只設置其中一個。注意有些圖片鏈接可能會拒絕 CF 的訪問導致檢測失敗。",
-          "key": "Cloudflare Worker 圖片代理 key, 如果沒有配置請忽略",
-          "label": "Cloudflare Worker 圖片代理"
-        },
-        "alert": "當用戶使用 vision 模型並提供了圖片鏈接時，我們的伺服器需要下載這些圖片並計算 tokens。為了在下載圖片時保護伺服器的 IP 地址不被洩露，可以在下方配置一個代理。這個代理配置使用的是 HTTP 或 SOCKS5 代理。如果你是個人用戶，這個配置可以不用理會。代理格式為 http://127.0.0.1:1080 或 socks5://127.0.0.1:1080",
-        "chatImageRequestProxy": {
-          "label": "圖片檢測代理",
-          "placeholder": "聊天圖片檢測代理設置，如果不設置可能會洩漏伺服器 IP"
-        },
         "mjNotify": "Midjourney 允許回調（會洩露伺服器 IP 地址）",
-        "saveButton": "保存其他設置",
         "title": "其他設置",
         "claudeAPIEnabled": "是否開啟Claude API",
         "geminiAPIEnabled": "是否開啟Gemini API"
@@ -1123,24 +1243,9 @@
         "title": "停用通道關鍵詞設置"
       },
       "codexSettings": {
-        "title": "路由親和與 Codex Hint",
-        "globalOptionBadge": "全局 Option",
-        "decisionTitle": "先選擇目標，再改細節",
-        "description": "這些配置走全局 option，不屬於單個通道。ChannelAffinitySetting 是通用路由親和規則；CodexRoutingHintSetting 只負責為 Codex Responses 派生 prompt_cache_key hint。留空時會回到後端默認值，兩個等待時間單位都是毫秒。",
-        "globalWarning": "這些配置會影響所有用戶以及匹配規則的請求。不了解 affinity / prompt_cache_key 時，建議 ChannelAffinitySetting 保持默認，只在需要 Codex prompt cache 預路由命中時啟用 CodexRoutingHintSetting。",
         "waitSectionTitle": "首選通道等待",
-        "affinitySectionTitle": "通用 Channel Affinity",
-        "codexHintSectionTitle": "Codex Routing Hint",
-        "quickActions": {
-          "recommended": {
-            "title": "啟用 Codex 推薦",
-            "body": "開啟 auto hint，路由親和使用後端默認規則，等待預算設為 250 / 50ms。"
-          },
-          "safeDefault": {
-            "title": "恢復穩妥默認",
-            "body": "關閉 hint，路由親和回到後端默認，等待預算設為 0 / 50ms。"
-          }
-        },
+        "affinitySectionTitle": "路由親和",
+        "codexHintSectionTitle": "Codex 自動快取鍵",
         "summary": {
           "affinityMode": "親和模式",
           "backendDefault": "後端默認",
@@ -1157,20 +1262,6 @@
           "storageDetail": "保存到 options 表，會影響匹配規則的所有請求。",
           "ruleCount": "{{count}} / {{total}} 條規則啟用"
         },
-        "flow": {
-          "request": {
-            "title": "請求身份",
-            "body": "從 previous_response_id、prompt_cache_key、session 或認證信息裏取穩定身份。"
-          },
-          "hint": {
-            "title": "Codex Hint",
-            "body": "當請求未顯式傳 prompt_cache_key 時，可提前派生 responses.prompt_cache_key。"
-          },
-          "affinity": {
-            "title": "路由親和",
-            "body": "ChannelAffinitySetting 讀取身份並優先回到上次成功的通道。"
-          }
-        },
         "preferredChannelWaitMilliseconds": {
           "label": "首選通道等待時間（毫秒）",
           "placeholder": "例如：250",
@@ -1182,9 +1273,9 @@
           "help": "等待首選通道恢復時的檢查間隔。通常保持 50ms；過小會增加輪詢開銷，過大會讓等待更鈍。"
         },
         "codexRoutingHintSetting": {
-          "label": "CodexRoutingHintSetting",
-          "placeholder": "{\n  \"prompt_cache_key_strategy\": \"auto\",\n  \"model_regex\": \"^gpt-5$\"\n}",
-          "help": "Codex 專用配置：控制 one-hub 是否在選擇 Codex 通道前自動生成穩定的 prompt_cache_key hint。生成的 hint 可被 ChannelAffinitySetting 的 request_hint 規則讀取。推薦 auto；off 表示不生成。",
+          "label": "快取鍵產生",
+          "placeholder": "{\n  \"prompt_cache_key_strategy\": \"auto\",\n  \"model_regex\": \"\"\n}",
+          "help": "客戶端未提供 prompt_cache_key 時，可按以下策略為 Codex 自動產生快取鍵，供選路和上游使用。此處不設定渠道選擇規則，也不會修改路由親和設定。",
           "useRecommended": "使用推薦模板",
           "useDefault": "使用關閉模板",
           "fields": {
@@ -1206,14 +1297,14 @@
           "placeholder": "{\n  \"enabled\": true,\n  \"default_ttl_seconds\": 3600,\n  \"max_entries\": 50000\n}",
           "help": "通用路由親和配置：控制哪些 Responses / Realtime 請求會記錄 identity -> channel，以及下次相同 identity 是否優先回到上次成功的通道。不要填寫 rules: []，那會清空規則。",
           "useDefault": "使用默認規則模板",
-          "useBlankDefault": "留空使用後端默認",
+          "useBlankDefault": "跟隨後端預設值",
           "rulesTitle": "親和規則",
           "keySourcesTitle": "Key 來源",
           "addRule": "添加規則",
           "removeRule": "刪除規則",
           "addKeySource": "添加 Key 來源",
           "removeKeySource": "刪除 Key 來源",
-          "backendDefaultAlert": "當前會保存為空字符串，運行時使用後端內置默認規則。這是最穩妥的選擇。",
+          "backendDefaultAlert": "目前跟隨後端預設規則。儲存時移除明確覆寫，後續後端預設規則變更會自動生效。",
           "customAlert": "當前會保存自定義 JSON，後續後端默認規則變化不會自動覆蓋這份配置。",
           "advancedTitle": "高級親和規則",
           "advancedDescription": "只有需要改 identity 來源、strict 行為或匹配範圍時才展開。大多數場景保留默認規則即可。",
@@ -1326,11 +1417,11 @@
             },
             "filters": {
               "title": "過濾條件",
-              "body": "model_regex 和 user_agent_regex 都為空時，對所有 Responses 請求生效。\n如果只想對 Codex CLI 或指定模型生效，可以加正則，例如 model_regex 使用 ^gpt-5$。"
+              "body": "model_regex 和 user_agent_regex 都為空時，對所有 Responses 請求生效。\n只有明確需要縮小運維範圍時才填寫過濾正則；過濾器不是模型支持列表。"
             },
             "recommended": {
               "title": "怎麼配",
-              "body": "推薦模板：{\"prompt_cache_key_strategy\":\"auto\",\"model_regex\":\"^gpt-5$\"}\n這是 Codex 專用 hint 生成策略。如果你不確定影響範圍，先限制模型；確認沒問題後再放寬。"
+              "body": "推薦模板：{\"prompt_cache_key_strategy\":\"auto\",\"model_regex\":\"\",\"user_agent_regex\":\"\"}\n模板不按模型名推導能力，對當前和未來 Responses 模型使用同一策略。"
             },
             "impact": {
               "title": "配置後的影響",
@@ -1338,7 +1429,7 @@
             },
             "risk": {
               "title": "風險和取捨",
-              "body": "選擇 token_id 或 user_id 會讓同 token / 同用戶的請求更傾向同一通道，復用更強但負載可能更集中。建議同時讓 Codex 通道的 prompt_cache_key_strategy 保持同樣策略，避免路由 hint 和上游實際 key 不一致。"
+              "body": "選擇 token_id 或 user_id 會讓同 token / 同用戶的請求更傾向同一通道，復用更強但負載可能更集中。快取 key 在選路前統一生成，通道不會再次改寫。"
             }
           },
           "ChannelAffinitySetting": {
@@ -1353,7 +1444,7 @@
             },
             "ruleFields": {
               "title": "rules 字段",
-              "body": "name：規則名。\nenabled：是否啟用。\nkind：responses 或 realtime。\nmodel_regex / path_regex / user_agent_regex：匹配條件。\ninclude_group / include_model / include_path / include_rule_name：是否把這些維度拼進 affinity key。\nstrict：首選通道不可用時是否直接失敗。\nskip_retry_on_failure：首選通道失敗後是否跳過重試。\nrecord_on_success：成功後是否寫回親和記錄。\nttl_seconds：本規則記錄保留秒數。"
+              "body": "name：規則名。\nenabled：是否啟用。\nkind：chat、responses 或 realtime。\nmodel_regex / path_regex / user_agent_regex：匹配條件。\ninclude_group / include_model / include_path / include_rule_name：是否把這些維度拼進 affinity key。\nstrict：首選通道不可用時是否直接失敗。\nskip_retry_on_failure：首選通道失敗後是否跳過重試。\nrecord_on_success：成功後是否寫回親和記錄。\nttl_seconds：本規則記錄保留秒數。"
             },
             "keySources": {
               "title": "key_sources 字段",
@@ -1361,7 +1452,7 @@
             },
             "defaults": {
               "title": "默認規則",
-              "body": "默認包含三條規則：\nresponses-continuation：按 previous_response_id 回原通道，strict=true。\nresponses-prompt-cache-key：按 prompt_cache_key 或 responses.prompt_cache_key hint 回原通道。\nrealtime-session：按 x-session-id / session_id 回原通道。"
+              "body": "默認包含四條規則：\nresponses-continuation：按 previous_response_id 回原通道，strict=true。\nresponses-prompt-cache-key：按 prompt_cache_key 或 responses.prompt_cache_key hint 回原通道。\nchat-prompt-cache-key：按 Chat prompt_cache_key 建立軟親和。\nrealtime-session：按 x-session-id / session_id 回原通道。顯式保存過 rules 的舊配置需要手動加入新規則。"
             },
             "recommended": {
               "title": "怎麼配",
@@ -1386,7 +1477,9 @@
           "invalidMaxEntries": "通道親和最大緩存條數必須是非負整數",
           "invalidRuleTTL": "第 {{index}} 條親和規則的 TTL 必須是非負整數"
         },
-        "save": "保存路由親和配置"
+        "save": "保存路由親和配置",
+        "affinityDescription": "根據請求識別優先選擇之前成功的渠道，適用於 Chat、Responses 和 Realtime。此處設定親和規則與首選渠道等待時間，不修改 Codex 快取鍵策略。",
+        "saveCodexHint": "儲存 Codex 快取鍵設定"
       },
       "safetySettings": {
         "title": "系統安全設置",
@@ -1747,6 +1840,8 @@
     "apiRateTip": "每分鐘允許的請求數，當速率小於60時，使用計數器限制器，當速率大於等於60時，使用令牌桶限制器，僅在啟用Redis時有效。"
   },
   "userPage": {
+    "recalculateGroup": "重新計算使用者群組",
+    "invalidQuota": "請輸入有效的額度增減值",
     "action": "操作",
     "adminUserRole": "管理員",
     "bind": "綁定",
@@ -1819,12 +1914,7 @@
   "Gemini 配置(JSON)": "Gemini 配置(JSON)",
   "Azure Speech 配置(JSON)": "Azure Speech 配置(JSON)",
   "请输入 JSON，例如：{\"api_version\":\"2024-05-01-preview\"}": "請輸入 JSON，例如：{\"api_version\":\"2024-05-01-preview\"}",
-  "请输入 JSON，例如：{\"api_version\":\"2024-05-01-preview\",\"responses_ws_transport\":\"native\"}": "請輸入 JSON，例如：{\"api_version\":\"2024-05-01-preview\",\"responses_ws_transport\":\"native\"}",
   "可选 JSON 配置，例如：{}": "可選 JSON 配置，例如：{}",
-  "可选 JSON 配置，例如：{\"responses_ws_transport\":\"native\"}": "可選 JSON 配置，例如：{\"responses_ws_transport\":\"native\"}",
-  "可选 JSON 配置，例如：{\"responses_ws_native\":true}；仅当自定义兼容上游明确支持原生 Responses WebSocket 时填写。": "可選 JSON 配置，例如：{\"responses_ws_native\":true}；僅當自定義兼容上游明確支持原生 Responses WebSocket 時填寫。",
-  "可选 JSON 配置，例如：{\"responses_ws_transport\":\"http_bridge\"}；如需原生 Responses WebSocket，可使用 {\"responses_ws_transport\":\"native\"}。": "可選 JSON 配置，例如：{\"responses_ws_transport\":\"http_bridge\"}；如需原生 Responses WebSocket，可使用 {\"responses_ws_transport\":\"native\"}。",
-  "可选 JSON 配置，例如：{\"responses_ws_transport\":\"http_bridge\"}；如自定义兼容上游支持原生 Responses WebSocket，可使用 {\"responses_ws_native\":true,\"responses_ws_transport\":\"native\"}。": "可選 JSON 配置，例如：{\"responses_ws_transport\":\"http_bridge\"}；如自定義兼容上游支持原生 Responses WebSocket，可使用 {\"responses_ws_native\":true,\"responses_ws_transport\":\"native\"}。",
   "请输入 JSON，例如：{\"dashscope_plugin\":\"plugin-name\"}": "請輸入 JSON，例如：{\"dashscope_plugin\":\"plugin-name\"}",
   "请输入 JSON，例如：{\"api_version\":\"v3.1\"}": "請輸入 JSON，例如：{\"api_version\":\"v3.1\"}",
   "请输入 JSON，例如：{\"api_version\":\"v1\"}": "請輸入 JSON，例如：{\"api_version\":\"v1\"}",
@@ -1997,5 +2087,5 @@
   },
   "禁用流式的模型": "停用流動式的模型",
   "这里填写禁用流式的模型，注意：如果填写了禁用流式的模型，那么这些模型在流式请求时会跳过该渠道": "呢度填寫禁用流式嘅模型，注意：如果填寫咗禁用流式嘅模型，咁就會喺流式請求時跳過呢個渠道。",
-  "开启后，将会透传普通 HTTP 请求中的额外字段（如 OpenAI SDK 的 extra_body 参数）；ResponsesWS HTTP bridge 按 WebSocket raw frame 契约保留未知字段，不受此开关控制": "開啟後，將會透傳普通 HTTP 請求中的額外欄位（如 OpenAI SDK 的 extra_body 參數）；ResponsesWS HTTP bridge 會依照 WebSocket raw frame 契約保留未知欄位，不受此開關控制"
+  "开启后，将会透传普通 HTTP 请求中的额外字段（如 OpenAI SDK 的 extra_body 参数）": "開啟後，將會透傳普通 HTTP 請求中的額外欄位（如 OpenAI SDK 的 extra_body 參數）"
 }

@@ -107,6 +107,18 @@
   },
   "channel": "Channel",
   "channel_edit": {
+    "endpoints": {
+      "description": "Controls upstream endpoints for this channel. Leave the address empty for the default path, or enter a path starting with / or a full HTTP(S) URL. Channel credentials are reused.",
+      "enable": "Enable {{name}}",
+      "upstreamURL": "Upstream address",
+      "address": "{{name}} upstream address",
+      "effectiveURL": "Effective address: {{url}}",
+      "missingBaseURL": "Enter the channel API base URL first",
+      "disabled": "Disabled; the address will be retained on save",
+      "responsesScope": "The Responses address also applies to supported resource operations, Compact and Responses WebSocket. Explicit protocol conversion is configured separately.",
+      "loadError": "Failed to load the endpoint catalog. Reopen the editor to retry.",
+      "loading": "Loading endpoint catalog…"
+    },
     "addModelHeader": "Add Custom Header",
     "addModelMapping": "Add model mapping",
     "addModelMappingByJson": "Add model mapping (JSON)",
@@ -172,10 +184,15 @@
     "overwriteMappingsTip": "When enabled, existing mappings will be cleared and only new mappings will be preserved",
     "clearModels": "Reset",
     "clearModelsTip": "Reset all selected models",
+    "responsesWSNative": "Enable native Responses WebSocket",
+    "responsesWSNativeHelp": "Use this only when this OpenAI-compatible endpoint implements the native Responses WebSocket protocol. HTTP Responses requests are unaffected.",
+    "responsesWSSelfHosted": "Allow self-hosted Responses WebSocket upstream",
+    "responsesWSSelfHostedHelp": "Allows Responses WebSocket to connect to private or local upstream addresses and to use plaintext ws.",
+    "responsesWSSelfHostedWarning": "Security warning: enable this only for an upstream you trust. Cloud metadata addresses remain blocked.",
     "codexConfigHelp": {
       "title": "Codex Configuration Help",
       "tooltip": "View Codex configuration help",
-      "intro": "This field is channel-level JSON and maps to backend channel.Other. Leave it blank to use defaults. If the request already sends prompt_cache_key explicitly, prompt_cache_key_strategy is usually unnecessary.",
+      "intro": "Channel-level JSON mapped to channel.Other. WebSocket requests always use an upstream WebSocket; handshake failures return an error.",
       "fieldsTitle": "Supported fields",
       "examplesTitle": "Copyable templates",
       "positiveIntegerSeconds": "positive integer seconds",
@@ -183,26 +200,12 @@
       "acceptedValue": "{{accepted}}; {{description}}",
       "close": "Close",
       "fields": {
-        "promptCacheKeyStrategy": "Generates a provider-side stable value when prompt_cache_key is absent; pre-routing affinity requires CodexRoutingHintSetting",
-        "websocketMode": "Controls Codex Realtime/Responses native websocket; off disables native WS, but not regular /v1/responses or explicit http_bridge",
-        "responsesWSTransport": "Responses websocket upstream transport; http_bridge must be explicit and is not automatic fallback after native failure",
         "executionSessionTTL": "Codex Realtime execution session idle retention",
-        "websocketRetryCooldown": "Bridge cooldown after Codex Realtime websocket failure",
-        "selfHosted": "Allows private or local self-hosted upstreams for Codex Realtime only",
-        "responsesWSSelfHosted": "Allows private or local self-hosted upstreams for Responses websocket only"
+        "selfHosted": "Allows private or local self-hosted upstreams for Codex Realtime only"
       },
       "examples": {
-        "defaultPromptCache": "Default: do not generate prompt_cache_key",
-        "autoPromptCache": "Common: generate a stable prompt_cache_key",
-        "realtimeAuto": "Realtime/Responses native WS: prefer websocket; ResponsesWS does not auto-fallback to HTTP bridge",
-        "realtimeForce": "Realtime/Responses native WS: require websocket",
-        "realtimeOff": "Realtime/Responses native WS: disable; ResponsesWS native returns unsupported",
-        "sessionIDCache": "Bind cache by session_id",
-        "userIDCache": "Share cache across one user's tokens",
-        "tokenIDCache": "Keep cache separate per token",
-        "authHeaderCache": "Share cache by external auth header",
-        "selfHosted": "Self-hosted or intranet upstream: allow private addresses separately for Realtime and ResponsesWS",
-        "ttlCooldown": "Advanced: adjust session TTL and Realtime bridge cooldown"
+        "selfHosted": "Self-hosted or intranet upstream for Realtime",
+        "sessionTTL": "Adjust session idle retention"
       }
     },
     "otherConfigHelp": {
@@ -210,7 +213,7 @@
       "tooltip": "View Other configuration help",
       "intro": "This field is channel-level JSON and maps to backend channel.Other. It must be a JSON object. Put unlisted provider-private data under extra or vendor_extra; runtime logic does not interpret those namespaces.",
       "providerFieldsTitle": "Current Channel Fields",
-      "commonFieldsTitle": "Shared ResponsesWS / Websocket Fields",
+      "commonFieldsTitle": "Shared Fields",
       "opaqueFieldsTitle": "Reserved Namespaces",
       "examplesTitle": "Copyable templates",
       "required": "required",
@@ -218,10 +221,7 @@
       "noProviderFields": "This channel has no additional provider-specific fields.",
       "close": "Close",
       "fields": {
-        "responsesWSTransport": "ResponsesWS upstream transport; http_bridge must be explicit and is not automatic fallback after native failure; only applies to channels that support ResponsesWS",
-        "responsesWSNative": "Declares that an OpenAI-compatible custom upstream supports native ResponsesWS; official or explicitly supported channels usually do not need this",
         "selfHosted": "Allows Realtime native websocket to use private or local self-hosted upstreams; permits private addresses and plaintext ws while still blocking cloud metadata addresses",
-        "responsesWSSelfHosted": "Allows ResponsesWS native/HTTP bridge to use private or local self-hosted upstreams; permits private addresses and plaintext ws/http while still blocking cloud metadata addresses",
         "extra": "JSON object reserved for non-runtime extension data; saved by the backend but not interpreted",
         "vendorExtra": "JSON object reserved for vendor-private data; saved by the backend but not interpreted",
         "azureAPIVersion": "Azure OpenAI classic API version, required; keep it when configuring ResponsesWS",
@@ -233,7 +233,7 @@
         "vertexProjectID": "VertexAI project_id, required"
       },
       "examples": {
-        "responsesBridge": "ResponsesWS over HTTP bridge",
+        "responsesBridge": "ResponsesWS over a native upstream",
         "customNative": "Custom upstream with native ResponsesWS",
         "azureClassic": "Azure classic",
         "azureV1": "Azure V1",
@@ -609,20 +609,63 @@
       "illustrate": "* This record is the log recorded before the system upgrade"
     },
     "quotaDetail": {
-      "saved": "Saved ",
-      "originalPrice": "Original Price",
-      "inputPrice": "Input Price",
-      "outputPrice": "Output Price",
-      "groupRatio": "Group Ratio",
-      "groupRatioValue": "Group Ratio",
-      "actualPrice": "Actual Price",
+      "costBreakdown": "Cost breakdown",
+      "item": "Item",
+      "usage": "Usage",
+      "unitPriceCalculation": "Unit price (base × multipliers)",
+      "inputBasePrice": "Base input: {{price}}",
+      "outputBasePrice": "Base output: {{price}}",
+      "baseCallPrice": "Base price: {{price}}",
+      "basePriceNotRecorded": "Base price not recorded",
+      "multipliersNotRecorded": "Multipliers not recorded",
+      "referenceAmount": "Amount (reference)",
       "input": "Input",
       "output": "Output",
-      "finalCalculation": "Final Calculation",
-      "originalBilling": "Original Billing",
-      "actualBilling": "Actual Billing",
-      "calculationNote": "PS: This system calculates based on points, and all amounts are converted from points. 1 point = $0.000002, with a minimum spending of 1 point. This calculation is for reference only; actual charges may vary.",
-      "times": "times"
+      "perCallBilling": "Per-call billing",
+      "perMillionTokens": "${{price}} / million tokens",
+      "perCall": "${{price}} / call",
+      "tokenCount": "{{countText}} tokens",
+      "callCount": "{{countText}} calls",
+      "includedUsage": "Includes {{countText}} {{name}} tokens at {{price}}",
+      "tokenKinds": {
+        "input_text_tokens": "text",
+        "output_text_tokens": "text",
+        "input_audio_tokens": "audio",
+        "output_audio_tokens": "audio",
+        "cached_tokens": "cache-hit",
+        "cached_write_tokens": "cache-write",
+        "cached_read_tokens": "cache-read",
+        "reasoning_tokens": "reasoning",
+        "input_image_tokens": "image",
+        "output_image_tokens": "image",
+        "cache_write_tokens": "cache-write",
+        "claude_cache_write_5m_tokens": "5-minute cache-write",
+        "claude_cache_write_1h_tokens": "1-hour cache-write",
+        "tool_use_prompt_tokens": "tool-input",
+        "input_video_tokens": "video",
+        "output_video_tokens": "video",
+        "deepseek_cache_hit_tokens": "cache-hit",
+        "deepseek_cache_miss_tokens": "cache-miss"
+      },
+      "webSearch": "Web search",
+      "fileSearch": "File search",
+      "codeInterpreter": "Code execution",
+      "imageGeneration": "Image generation",
+      "referenceNote": "The unit price calculation includes this request’s multipliers; do not apply them again to the amounts. Item amounts are for reference; the total is the recorded charge.",
+      "tokenCharge": "Recorded token charge",
+      "actualCharge": "Total charged",
+      "notRecorded": "Not recorded",
+      "priceReasons": "Why these prices apply",
+      "longContextReason": "The {{countText}} input tokens exceed the {{threshold}} long-context threshold: all input unit prices ×{{input}}, output unit prices ×{{output}}.",
+      "fastReason": "This request used Fast / Priority mode: input unit price ×{{input}}, output unit price ×{{output}}.",
+      "flexReason": "This request used Flex mode: input unit price ×{{input}}, output unit price ×{{output}}.",
+      "otherPriceReason": "Token prices were adjusted: input unit price ×{{input}}, output unit price ×{{output}}.",
+      "groupDiscountReason": "Your group’s {{percent}}% discount is included in the unit prices above.",
+      "groupMarkupReason": "Your group’s {{percent}}% markup is included in the unit prices above.",
+      "missingRuleDetails": "Price adjustment details were not saved for this record.",
+      "conflictingUsage": "Usage information is inconsistent. No token charge was applied.",
+      "missingUsage": "Usage or price information is incomplete. No token charge was applied.",
+      "noTokenCharge": "No token charge was applied."
     },
     "cachedReadTokens": "Cache read Tokens (* {{ ratio }})",
     "cachedWriteTokens": "Write tokens to cache (* {{ ratio }})",
@@ -688,13 +731,17 @@
     "tokens": "Pay per token",
     "type": "Type",
     "input_audio_tokens": "Audio Input Ratio",
+    "input_audio_transcription": "Input Audio Transcription Ratio",
     "other": "Other",
     "output_audio_tokens": "Audio Output Ratio",
     "rate": "Rate",
     "RPM": "API Rate",
     "free": "Free",
     "cached_tokens": "Cache Ratio",
+    "cache_write_tokens": "Cache Write Ratio (OpenAI)",
     "cached_write_tokens": "Cache Write Ratio",
+    "claude_cache_write_5m_tokens": "Claude 5-minute cache-write ratio (falls back to generic cache-write ratio when unset)",
+    "claude_cache_write_1h_tokens": "Claude 1-hour cache-write ratio (falls back to generic cache-write ratio when unset)",
     "cached_read_tokens": "Cache Read Ratio",
     "reasoning_tokens": "Reasoning Ratio",
     "input_text_tokens": "Input Text Ratio",
@@ -872,7 +919,94 @@
     "noAvailableRatios": "No available extension ratio",
     "noExtraRatios": "No additional magnification rate is available, please select to add from the drop-down menu.",
     "promptRatio": "Leverage ratio",
-    "selectExtraRatio": "Select magnification ratio"
+    "selectExtraRatio": "Select magnification ratio",
+    "rateRules": {
+      "title": "Conditional price rules",
+      "disabled": "no rule when unchecked",
+      "inactive": "Inactive for per-call",
+      "inactiveForTimes": "These rules are retained but inactive for per-request pricing. They apply again after switching back to token pricing, or you can clear them here.",
+      "flex": "Flex",
+      "fastPriority": "Fast / Priority",
+      "longContext": "Long Context",
+      "inputThreshold": "Input threshold",
+      "inputMultiplier": "Input multiplier",
+      "outputMultiplier": "Output multiplier",
+      "positiveNumber": "Enter a number greater than zero",
+      "positiveInteger": "Enter a positive integer",
+      "invalid": "Fix the invalid conditional price rule values before submitting",
+      "service_tier": "Effective service tier (service_tier)",
+      "speed": "Effective speed (speed)",
+      "long_context": "Long context",
+      "schedule": "Calendar discounts",
+      "scope": "Rules affect this model’s token pricing and related extras; independent tools and per-call prices are unchanged.",
+      "composition": "Pricing dimensions multiply independently. Tier values, speed values and input ranges must not overlap for the same request.",
+      "timezone": "Time zone",
+      "timezoneHelp": "Calendar conditions require an IANA time zone, e.g. Asia/Shanghai.",
+      "add": "Add rule / override",
+      "enumHelp": "Select or enter a value and press Enter. Each value can appear in only one rule.",
+      "gt": "Total input tokens greater than",
+      "lte": "Total input tokens less than or equal to",
+      "weekdays": "Weekdays",
+      "weekdayHelp": "Monday to Sunday. Empty means every day. Uses the operation’s local start date.",
+      "start": "Start time (inclusive)",
+      "end": "End time (exclusive)",
+      "allDay": "All day",
+      "all": "Uniform multiplier",
+      "inheritHelp": "Empty defaults to 1. Specific multipliers override it; zero means free.",
+      "inherit": "Inherited multiplier: {{value}}",
+      "overrides": "Customize input, output, cache and other multipliers",
+      "extra": "Independent override",
+      "selectExtra": "Select a meter",
+      "follow": "Inherit",
+      "remove": "Delete rule",
+      "preview": "Preview this price draft",
+      "previewHelp": "Simulates actual execution facts without charging. Total input includes cache; cache quantities must be part of that total.",
+      "running": "Calculating…",
+      "previewResult": "Preview (group multiplier 1)",
+      "started_at": "Operation start (ISO 8601 with time zone)",
+      "prompt_tokens": "Total input tokens",
+      "completion_tokens": "Output tokens",
+      "ruleReason": "{{name}}: input ×{{input}}, output ×{{output}}",
+      "extraReason": "Meter multipliers: {{items}}",
+      "day1": "Monday",
+      "day2": "Tuesday",
+      "day3": "Wednesday",
+      "day4": "Thursday",
+      "day5": "Friday",
+      "day6": "Saturday",
+      "day7": "Sunday",
+      "meters": {
+        "cached_tokens": "Cache hit",
+        "cache_write_tokens": "Cache write",
+        "cached_write_tokens": "Generic cache write",
+        "cached_read_tokens": "Cache read",
+        "claude_cache_write_5m_tokens": "Claude 5-minute cache write",
+        "claude_cache_write_1h_tokens": "Claude 1-hour cache write",
+        "tool_use_prompt_tokens": "Tool input",
+        "input_audio_tokens": "Audio input",
+        "output_audio_tokens": "Audio output",
+        "reasoning_tokens": "Reasoning output",
+        "input_text_tokens": "Text input",
+        "output_text_tokens": "Text output",
+        "input_image_tokens": "Image input",
+        "output_image_tokens": "Image output",
+        "input_video_tokens": "Video input",
+        "output_video_tokens": "Video output",
+        "deepseek_cache_hit_tokens": "DeepSeek cache hit",
+        "deepseek_cache_miss_tokens": "DeepSeek cache miss"
+      },
+      "schedulePriority": "Calendar discounts may overlap. Only the first matching rule by priority applies. Put weekend nights before general night and weekend rules.",
+      "raisePriority": "Raise priority",
+      "lowerPriority": "Lower priority",
+      "priority": "Priority {{value}}",
+      "addRule": "Add rule",
+      "selectValues": "Select values",
+      "inputRange": "Input {{range}} tokens",
+      "everyDay": "Every day",
+      "applicableSpeed": "Applicable speeds (speed, optional)",
+      "applicableSpeedHelp": "Empty means any speed. Select standard to exclude fast requests from long-context rates.",
+      "overlap": "This rule overlaps another rule in the same pricing dimension. Adjust its values or range."
+    }
   },
   "profile": "Profile",
   "profilePage": {
@@ -1050,27 +1184,12 @@
           "placeholder": "1-32, default 8",
           "error": "Channel test concurrency must be an integer from 1 to 32"
         },
-        "quotaRemindThreshold": {
-          "label": "Quota Reminder Threshold",
-          "placeholder": "When below this quota, an email will be sent to remind the user"
-        },
         "automaticEnableChannelTip": "Auto-disabled channels are re-enabled only after an existing channel probe path returns a healthy result. Manually disabled channels stay disabled.",
         "saveMonitoringSettings": "Save Monitoring Settings",
         "title": "Monitoring Settings"
       },
       "otherSettings": {
-        "CFWorkerImageUrl": {
-          "alert": "Here is the image proxy address of Cloudflare Worker. You can use it by deploying https://github.com/MartialBE/get-image-by-cf. You can set only one of it and the image detection proxy. \nNote that some image links may deny CF access and cause detection failure.",
-          "key": "Cloudflare Worker image proxy key, please ignore if not configured",
-          "label": "Cloudflare Worker Image Proxy"
-        },
-        "alert": "When users use the vision model and provide an image link, our server needs to download these images and calculate tokens. To protect the server's IP address from being exposed when downloading images, you can configure a proxy below. This proxy configuration uses HTTP or SOCKS5 proxy. If you are an individual user, you can ignore this configuration. The proxy format is http://127.0.0.1:1080 or socks5://127.0.0.1:1080",
-        "chatImageRequestProxy": {
-          "label": "Image Detection Proxy",
-          "placeholder": "Chat image detection proxy settings, may leak server IP if not set"
-        },
         "mjNotify": "Midjourney allows callbacks (will expose server IP address)",
-        "saveButton": "Save Other Settings",
         "title": "Other Settings",
         "claudeAPIEnabled": "Enable Claude API?",
         "geminiAPIEnabled": "Enable Gemini API?"
@@ -1133,24 +1252,9 @@
         "title": "Disable channel keyword settings"
       },
       "codexSettings": {
-        "title": "Routing Affinity and Codex Hints",
-        "globalOptionBadge": "Global Option",
-        "decisionTitle": "Pick the goal first, then tune details",
-        "description": "These settings are stored as global options rather than per-channel configuration. ChannelAffinitySetting is the general routing affinity rule set; CodexRoutingHintSetting only derives prompt_cache_key hints for Codex Responses. Blank values fall back to backend defaults, and both wait values are in milliseconds.",
-        "globalWarning": "These settings affect all users and requests that match the rules. If you are not tuning affinity or prompt_cache_key behavior, keep ChannelAffinitySetting on defaults and enable CodexRoutingHintSetting only when Codex prompt-cache pre-routing is needed.",
         "waitSectionTitle": "Preferred Channel Waiting",
-        "affinitySectionTitle": "General Channel Affinity",
-        "codexHintSectionTitle": "Codex Routing Hint",
-        "quickActions": {
-          "recommended": {
-            "title": "Enable Codex recommendation",
-            "body": "Turns on auto hints, keeps backend affinity rules, and sets wait budget to 250 / 50ms."
-          },
-          "safeDefault": {
-            "title": "Restore safe default",
-            "body": "Turns hints off, restores backend affinity defaults, and sets wait budget to 0 / 50ms."
-          }
-        },
+        "affinitySectionTitle": "Routing Affinity",
+        "codexHintSectionTitle": "Codex Automatic Cache Keys",
         "summary": {
           "affinityMode": "Affinity mode",
           "backendDefault": "Backend default",
@@ -1167,20 +1271,6 @@
           "storageDetail": "Saved in the options table and affects all requests matched by the rules.",
           "ruleCount": "{{count}} / {{total}} rules enabled"
         },
-        "flow": {
-          "request": {
-            "title": "Request identity",
-            "body": "Reads stable identity from previous_response_id, prompt_cache_key, session, or credentials."
-          },
-          "hint": {
-            "title": "Codex Hint",
-            "body": "Can derive responses.prompt_cache_key before routing when the request does not send one."
-          },
-          "affinity": {
-            "title": "Routing affinity",
-            "body": "ChannelAffinitySetting reads the identity and prefers the last successful channel."
-          }
-        },
         "preferredChannelWaitMilliseconds": {
           "label": "Preferred Channel Wait (ms)",
           "placeholder": "e.g. 250",
@@ -1192,9 +1282,9 @@
           "help": "How often to check whether the preferred channel has recovered while waiting. 50ms is usually enough; lower values add polling overhead, higher values react more slowly."
         },
         "codexRoutingHintSetting": {
-          "label": "Codex Advanced Configuration",
+          "label": "Cache-Key Generation",
           "placeholder": "",
-          "help": "Codex-specific setting: controls whether one-hub derives a stable prompt_cache_key hint before Codex channel selection. ChannelAffinitySetting request_hint rules can read the generated hint. auto is recommended; off disables hint generation.",
+          "help": "When the client omits prompt_cache_key, generate a Codex cache key using the selected strategy for routing and upstream requests. This section does not change channel-selection rules or routing affinity settings.",
           "useRecommended": "Use recommended template",
           "useDefault": "Use off template",
           "fields": {
@@ -1216,14 +1306,14 @@
           "placeholder": "",
           "help": "General routing affinity setting: controls which Responses / Realtime requests record identity -> channel, and whether the same identity later prefers the previously successful channel. Do not set rules: []; that clears the rules.",
           "useDefault": "Use default-rule template",
-          "useBlankDefault": "Blank for backend default",
+          "useBlankDefault": "Follow Backend Defaults",
           "rulesTitle": "Affinity Rules",
           "keySourcesTitle": "Key Sources",
           "addRule": "Add rule",
           "removeRule": "Remove rule",
           "addKeySource": "Add key source",
           "removeKeySource": "Remove key source",
-          "backendDefaultAlert": "This saves a blank value, so runtime uses the backend's built-in default rules. This is the safest option.",
+          "backendDefaultAlert": "Follow backend default rules. Saving removes the explicit override so future backend defaults also apply.",
           "customAlert": "This saves custom JSON. Future backend default-rule changes will not automatically replace this config.",
           "advancedTitle": "Advanced Affinity Rules",
           "advancedDescription": "Open only when you need to change identity sources, strict behavior, or match scope. Defaults fit most cases.",
@@ -1336,11 +1426,11 @@
             },
             "filters": {
               "title": "Filters",
-              "body": "When model_regex and user_agent_regex are blank, the setting applies to all Responses requests.\nUse regex filters to limit scope, for example model_regex: ^gpt-5$."
+              "body": "When model_regex and user_agent_regex are blank, the setting applies to all Responses requests.\nSet filters only to narrow an intentional operational scope; they are not a model support list."
             },
             "recommended": {
               "title": "How to set it",
-              "body": "Recommended template: {\"prompt_cache_key_strategy\":\"auto\",\"model_regex\":\"^gpt-5$\"}\nThis is a Codex-specific hint generation strategy. If the scope is unclear, start with a model filter and broaden it after verification."
+              "body": "Recommended template: {\"prompt_cache_key_strategy\":\"auto\",\"model_regex\":\"\",\"user_agent_regex\":\"\"}\nThe template does not infer capability from model names and applies the same strategy to current and future Responses models."
             },
             "impact": {
               "title": "Effect",
@@ -1348,7 +1438,7 @@
             },
             "risk": {
               "title": "Risk and trade-off",
-              "body": "token_id and user_id make traffic from the same token or user prefer the same channel, which improves reuse but may concentrate load. Keep the Codex channel prompt_cache_key_strategy aligned with this setting to avoid routing hint and upstream key mismatch."
+              "body": "token_id and user_id make traffic from the same token or user prefer the same channel, which improves reuse but may concentrate load. The cache key is generated before routing and is not rewritten by the channel."
             }
           },
           "ChannelAffinitySetting": {
@@ -1363,7 +1453,7 @@
             },
             "ruleFields": {
               "title": "rules fields",
-              "body": "name: rule name.\nenabled: whether the rule is active.\nkind: responses or realtime.\nmodel_regex / path_regex / user_agent_regex: match filters.\ninclude_group / include_model / include_path / include_rule_name: dimensions included in the affinity key.\nstrict: fail instead of falling back when the preferred channel is unavailable.\nskip_retry_on_failure: skip retry after preferred channel failure.\nrecord_on_success: write affinity records after success.\nttl_seconds: record lifetime for this rule."
+              "body": "name: rule name.\nenabled: whether the rule is active.\nkind: chat, responses, or realtime.\nmodel_regex / path_regex / user_agent_regex: match filters.\ninclude_group / include_model / include_path / include_rule_name: dimensions included in the affinity key.\nstrict: fail instead of falling back when the preferred channel is unavailable.\nskip_retry_on_failure: skip retry after preferred channel failure.\nrecord_on_success: write affinity records after success.\nttl_seconds: record lifetime for this rule."
             },
             "keySources": {
               "title": "key_sources fields",
@@ -1371,7 +1461,7 @@
             },
             "defaults": {
               "title": "Default rules",
-              "body": "responses-continuation: uses previous_response_id and returns to the original channel with strict=true.\nresponses-prompt-cache-key: uses prompt_cache_key or responses.prompt_cache_key hint.\nrealtime-session: uses x-session-id / session_id."
+              "body": "Four rules are enabled by default.\nresponses-continuation: uses previous_response_id and returns to the original channel with strict=true.\nresponses-prompt-cache-key: uses prompt_cache_key or responses.prompt_cache_key hint.\nchat-prompt-cache-key: uses Chat prompt_cache_key for soft affinity.\nrealtime-session: uses x-session-id / session_id. Older configurations that explicitly saved rules must add the new rule manually."
             },
             "recommended": {
               "title": "How to set it",
@@ -1396,7 +1486,9 @@
           "invalidMaxEntries": "Channel affinity max entries must be a non-negative integer",
           "invalidRuleTTL": "Affinity rule {{index}} TTL must be a non-negative integer"
         },
-        "save": "Save Routing Affinity Settings"
+        "save": "Save Routing Affinity Settings",
+        "affinityDescription": "Prefer previously successful channels using request identities for Chat, Responses and Realtime. Configure affinity rules and preferred-channel waiting here; Codex cache-key settings are saved separately.",
+        "saveCodexHint": "Save Codex Cache-Key Settings"
       },
       "safetySettings": {
         "title": "System Safety Settings",
@@ -1757,6 +1849,8 @@
     "title": "User grouping"
   },
   "userPage": {
+    "recalculateGroup": "Recalculate user group",
+    "invalidQuota": "Enter a valid quota adjustment",
     "action": "Action",
     "adminUserRole": "administrator",
     "bind": "Bind",
@@ -1990,16 +2084,11 @@
   "Gemini 配置(JSON)": "Gemini config (JSON)",
   "Azure Speech 配置(JSON)": "Azure Speech config (JSON)",
   "请输入 JSON，例如：{\"api_version\":\"2024-05-01-preview\"}": "Enter JSON, for example: {\"api_version\":\"2024-05-01-preview\"}",
-  "请输入 JSON，例如：{\"api_version\":\"2024-05-01-preview\",\"responses_ws_transport\":\"native\"}": "Enter JSON, for example: {\"api_version\":\"2024-05-01-preview\",\"responses_ws_transport\":\"native\"}",
   "可选 JSON 配置，例如：{}": "Optional JSON config, for example: {}",
-  "可选 JSON 配置，例如：{\"responses_ws_transport\":\"native\"}": "Optional JSON config, for example: {\"responses_ws_transport\":\"native\"}",
-  "可选 JSON 配置，例如：{\"responses_ws_native\":true}；仅当自定义兼容上游明确支持原生 Responses WebSocket 时填写。": "Optional JSON config, for example: {\"responses_ws_native\":true}; fill this only when the custom compatible upstream explicitly supports native Responses WebSocket.",
-  "可选 JSON 配置，例如：{\"responses_ws_transport\":\"http_bridge\"}；如需原生 Responses WebSocket，可使用 {\"responses_ws_transport\":\"native\"}。": "Optional JSON config, for example: {\"responses_ws_transport\":\"http_bridge\"}; for native Responses WebSocket, use {\"responses_ws_transport\":\"native\"}.",
-  "可选 JSON 配置，例如：{\"responses_ws_transport\":\"http_bridge\"}；如自定义兼容上游支持原生 Responses WebSocket，可使用 {\"responses_ws_native\":true,\"responses_ws_transport\":\"native\"}。": "Optional JSON config, for example: {\"responses_ws_transport\":\"http_bridge\"}; if the custom compatible upstream supports native Responses WebSocket, use {\"responses_ws_native\":true,\"responses_ws_transport\":\"native\"}.",
   "请输入 JSON，例如：{\"dashscope_plugin\":\"plugin-name\"}": "Enter JSON, for example: {\"dashscope_plugin\":\"plugin-name\"}",
   "请输入 JSON，例如：{\"api_version\":\"v3.1\"}": "Enter JSON, for example: {\"api_version\":\"v3.1\"}",
   "请输入 JSON，例如：{\"api_version\":\"v1\"}": "Enter JSON, for example: {\"api_version\":\"v1\"}",
   "请输入 JSON，例如：{\"region\":\"eastasia\"}": "Enter JSON, for example: {\"region\":\"eastasia\"}",
   "请输入 JSON，例如：{\"region\":\"us-central1\",\"project_id\":\"my-project\"}": "Enter JSON, for example: {\"region\":\"us-central1\",\"project_id\":\"my-project\"}",
-  "开启后，将会透传普通 HTTP 请求中的额外字段（如 OpenAI SDK 的 extra_body 参数）；ResponsesWS HTTP bridge 按 WebSocket raw frame 契约保留未知字段，不受此开关控制": "When enabled, extra fields in ordinary HTTP requests are passed through, such as the OpenAI SDK extra_body parameter. ResponsesWS HTTP bridge preserves unknown fields under the WebSocket raw frame contract and is not controlled by this switch."
+  "开启后，将会透传普通 HTTP 请求中的额外字段（如 OpenAI SDK 的 extra_body 参数）": "When enabled, extra fields in ordinary HTTP requests are passed through, such as the OpenAI SDK extra_body parameter."
 }

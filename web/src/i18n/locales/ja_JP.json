@@ -95,6 +95,18 @@
   },
   "channel": "チャネル",
   "channel_edit": {
+    "endpoints": {
+      "description": "Controls upstream endpoints for this channel. Leave the address empty for the default path, or enter a path starting with / or a full HTTP(S) URL. Channel credentials are reused.",
+      "enable": "Enable {{name}}",
+      "upstreamURL": "Upstream address",
+      "address": "{{name}} upstream address",
+      "effectiveURL": "Effective address: {{url}}",
+      "missingBaseURL": "Enter the channel API base URL first",
+      "disabled": "Disabled; the address will be retained on save",
+      "responsesScope": "The Responses address also applies to supported resource operations, Compact and Responses WebSocket. Explicit protocol conversion is configured separately.",
+      "loadError": "Failed to load the endpoint catalog. Reopen the editor to retry.",
+      "loading": "Loading endpoint catalog…"
+    },
     "addModelHeader": "カスタムヘッダーを追加",
     "addModelMapping": "モデルマッピングの追加",
     "addModelMappingByJson": "モデルマッピング（JSON）の追加",
@@ -152,10 +164,15 @@
     "removeSuffix": "後缀を削除",
     "collapseList": "リストを折りたたむ",
     "expandList": "リストを展開",
+    "responsesWSNative": "native Responses WebSocket を有効にする",
+    "responsesWSNativeHelp": "この OpenAI-compatible endpoint が native Responses WebSocket protocol を実装している場合のみ有効にします。HTTP Responses には影響しません。",
+    "responsesWSSelfHosted": "self-hosted Responses WebSocket upstream を許可",
+    "responsesWSSelfHostedHelp": "Responses WebSocket からプライベートまたはローカル upstream への接続と、平文 ws を許可します。",
+    "responsesWSSelfHostedWarning": "セキュリティ警告: 信頼できる upstream に対してのみ有効にしてください。cloud metadata address は引き続きブロックされます。",
     "codexConfigHelp": {
       "title": "Codex 設定ヘルプ",
       "tooltip": "Codex 設定ヘルプを表示",
-      "intro": "ここに入力するのはチャネル単位の JSON で、バックエンドの channel.Other に対応します。空欄の場合はデフォルトを使用します。リクエストで prompt_cache_key を明示している場合、通常 prompt_cache_key_strategy の設定は不要です。",
+      "intro": "channel.Other に対応するチャネル単位の JSON 設定です。WebSocket は常に上流 WebSocket に接続し、ハンドシェイク失敗時はエラーを返します。",
       "fieldsTitle": "対応フィールド",
       "examplesTitle": "コピー可能なテンプレート",
       "positiveIntegerSeconds": "正の整数秒",
@@ -163,26 +180,12 @@
       "acceptedValue": "{{accepted}}; {{description}}",
       "close": "閉じる",
       "fields": {
-        "promptCacheKeyStrategy": "prompt_cache_key がない場合に provider 側の安定値を生成します。事前ルーティング affinity には CodexRoutingHintSetting が必要です",
-        "websocketMode": "Codex Realtime/Responses native websocket を制御します。off は native WS を無効にしますが、通常の /v1/responses や明示的な http_bridge には影響しません",
-        "responsesWSTransport": "Responses websocket の upstream transport。http_bridge は明示的に有効化する必要があり、native 失敗後の自動 fallback ではありません",
         "executionSessionTTL": "Codex Realtime execution session のアイドル保持時間",
-        "websocketRetryCooldown": "Codex Realtime websocket 失敗後の bridge クールダウン",
-        "selfHosted": "Codex Realtime のみ、プライベートまたはローカルの self-hosted upstream を許可します",
-        "responsesWSSelfHosted": "Responses websocket のみ、プライベートまたはローカルの self-hosted upstream を許可します"
+        "selfHosted": "Codex Realtime のみ、プライベートまたはローカルの self-hosted upstream を許可します"
       },
       "examples": {
-        "defaultPromptCache": "デフォルト: prompt_cache_key を自動生成しない",
-        "autoPromptCache": "一般的: 安定した prompt_cache_key を生成",
-        "realtimeAuto": "Realtime/Responses native WS: websocket を優先。ResponsesWS は HTTP bridge に自動 fallback しません",
-        "realtimeForce": "Realtime/Responses native WS: websocket を必須にする",
-        "realtimeOff": "Realtime/Responses native WS: 無効化。ResponsesWS native は unsupported を返します",
-        "sessionIDCache": "session_id でキャッシュを紐付ける",
-        "userIDCache": "同一ユーザーの複数トークンでキャッシュを共有",
-        "tokenIDCache": "トークンごとにキャッシュを分離",
-        "authHeaderCache": "外部認証ヘッダーでキャッシュを共有",
-        "selfHosted": "Self-hosted またはイントラネット upstream: Realtime と ResponsesWS で個別にプライベートアドレスを許可",
-        "ttlCooldown": "高度: session TTL と Realtime bridge クールダウンを調整"
+        "selfHosted": "Realtime 用の self-hosted またはイントラネット upstream",
+        "sessionTTL": "セッションのアイドル保持時間を調整"
       }
     },
     "otherConfigHelp": {
@@ -190,7 +193,7 @@
       "tooltip": "Other 設定ヘルプを表示",
       "intro": "ここに入力するのはチャネル単位の JSON で、バックエンドの channel.Other に対応します。JSON object である必要があります。未記載の provider 固有データは extra または vendor_extra に入れてください。runtime はこれらの namespace を解釈しません。",
       "providerFieldsTitle": "現在のチャネルのフィールド",
-      "commonFieldsTitle": "共通 ResponsesWS / websocket フィールド",
+      "commonFieldsTitle": "共通フィールド",
       "opaqueFieldsTitle": "予約 namespace",
       "examplesTitle": "コピー可能なテンプレート",
       "required": "必須",
@@ -198,10 +201,7 @@
       "noProviderFields": "このチャネルには追加の provider 固有フィールドはありません。",
       "close": "閉じる",
       "fields": {
-        "responsesWSTransport": "ResponsesWS upstream transport。http_bridge は明示的に設定する必要があり、native 失敗後の自動 fallback ではありません。ResponsesWS 対応チャネルにのみ有効です",
-        "responsesWSNative": "OpenAI-compatible のカスタム upstream が native ResponsesWS をサポートすることを宣言します。公式または明示的に対応しているチャネルでは通常不要です",
         "selfHosted": "Realtime native websocket でプライベートまたはローカル self-hosted upstream を許可します。プライベートアドレスと平文 ws を許可しますが、cloud metadata アドレスは引き続きブロックします",
-        "responsesWSSelfHosted": "ResponsesWS native/HTTP bridge でプライベートまたはローカル self-hosted upstream を許可します。プライベートアドレスと平文 ws/http を許可しますが、cloud metadata アドレスは引き続きブロックします",
         "extra": "runtime では解釈しない拡張データ用の JSON object。バックエンドは保存しますが解釈しません",
         "vendorExtra": "vendor 固有データ用の JSON object。バックエンドは保存しますが解釈しません",
         "azureAPIVersion": "Azure OpenAI classic の API version。必須です。ResponsesWS を設定する場合も保持してください",
@@ -213,7 +213,7 @@
         "vertexProjectID": "VertexAI project_id。必須です"
       },
       "examples": {
-        "responsesBridge": "ResponsesWS over HTTP bridge",
+        "responsesBridge": "ResponsesWS over native upstream",
         "customNative": "native ResponsesWS 対応カスタム upstream",
         "azureClassic": "Azure classic",
         "azureV1": "Azure V1",
@@ -585,20 +585,63 @@
       "illustrate": "* この記録はシステムアップグレード前のログであり"
     },
     "quotaDetail": {
-      "saved": "節約 ",
-      "originalPrice": "元の価格",
-      "inputPrice": "入力価格",
-      "outputPrice": "出力価格",
-      "groupRatio": "グループ倍率",
-      "groupRatioValue": "グループ倍率",
-      "actualPrice": "実際の価格",
+      "costBreakdown": "料金の内訳",
+      "item": "項目",
+      "usage": "使用量",
+      "unitPriceCalculation": "単価計算（基本単価 × 倍率）",
+      "inputBasePrice": "入力基本単価：{{price}}",
+      "outputBasePrice": "出力基本単価：{{price}}",
+      "baseCallPrice": "基本単価：{{price}}",
+      "basePriceNotRecorded": "基本単価は未記録",
+      "multipliersNotRecorded": "倍率は未記録",
+      "referenceAmount": "金額（参考）",
       "input": "入力",
       "output": "出力",
-      "finalCalculation": "最終計算",
-      "originalBilling": "元の請求",
-      "actualBilling": "実際の請求",
-      "calculationNote": "PS：このシステムはポイントに基づいて計算され、すべての金額はポイント換算であり、1ポイント＝$0.000002です。最低消費額は1ポイントであり、この計算手順は参考用として提供されます。実際の料金が優先されます。",
-      "times": "倍"
+      "perCallBilling": "回数課金",
+      "perMillionTokens": "${{price}} / 100万トークン",
+      "perCall": "${{price}} / 回",
+      "tokenCount": "{{countText}} トークン",
+      "callCount": "{{countText}} 回",
+      "includedUsage": "うち{{name}} {{countText}} トークン、単価 {{price}}",
+      "tokenKinds": {
+        "input_text_tokens": "テキスト",
+        "output_text_tokens": "テキスト",
+        "input_audio_tokens": "音声",
+        "output_audio_tokens": "音声",
+        "cached_tokens": "キャッシュヒット",
+        "cached_write_tokens": "キャッシュ書き込み",
+        "cached_read_tokens": "キャッシュ読み取り",
+        "reasoning_tokens": "推論",
+        "input_image_tokens": "画像",
+        "output_image_tokens": "画像",
+        "cache_write_tokens": "キャッシュ書き込み",
+        "claude_cache_write_5m_tokens": "5分キャッシュ書き込み",
+        "claude_cache_write_1h_tokens": "1時間キャッシュ書き込み",
+        "tool_use_prompt_tokens": "ツール入力",
+        "input_video_tokens": "動画",
+        "output_video_tokens": "動画",
+        "deepseek_cache_hit_tokens": "キャッシュヒット",
+        "deepseek_cache_miss_tokens": "キャッシュミス"
+      },
+      "webSearch": "ウェブ検索",
+      "fileSearch": "ファイル検索",
+      "codeInterpreter": "コード実行",
+      "imageGeneration": "画像生成",
+      "referenceNote": "単価計算には今回の倍率が反映されています。金額に再度掛ける必要はありません。各項目の金額は参考値で、実際の請求額は合計をご確認ください。",
+      "tokenCharge": "トークンの実際の請求額",
+      "actualCharge": "請求額合計",
+      "notRecorded": "未記録",
+      "priceReasons": "価格調整の理由",
+      "longContextReason": "入力 {{countText}} トークンが長文コンテキストの基準 {{threshold}} を超えたため、入力全体の単価 ×{{input}}、出力単価 ×{{output}} が適用されました。",
+      "fastReason": "高速モード（Fast / Priority）を使用：入力単価 ×{{input}}、出力単価 ×{{output}}。",
+      "flexReason": "柔軟モード（Flex）を使用：入力単価 ×{{input}}、出力単価 ×{{output}}。",
+      "otherPriceReason": "トークン単価を調整：入力単価 ×{{input}}、出力単価 ×{{output}}。",
+      "groupDiscountReason": "所属グループの {{percent}}% 割引は上記の単価に反映済みです。",
+      "groupMarkupReason": "所属グループの {{percent}}% 割増は上記の単価に反映済みです。",
+      "missingRuleDetails": "この記録には価格調整の詳細が保存されていません。",
+      "conflictingUsage": "使用量の情報が一致しないため、トークン料金は請求されていません。",
+      "missingUsage": "使用量または価格の情報が不足しているため、トークン料金は請求されていません。",
+      "noTokenCharge": "今回はトークン料金が請求されていません。"
     },
     "cachedReadTokens": "キャッシュからトークンを読み取ります（* {{ ratio }} )",
     "cachedWriteTokens": "トークンのキャッシュ書き込み（* {{ ratio }} ）",
@@ -676,13 +719,17 @@
     "tokens": "量に応じて支払う",
     "type": "タイプ",
     "input_audio_tokens": "オーディオ入力倍率",
+    "input_audio_transcription": "入力音声文字起こし倍率",
     "other": "その他",
     "output_audio_tokens": "オーディオ出力倍率",
     "rate": "倍率",
     "RPM": "APIレート",
     "free": "無料",
     "cached_tokens": "キャッシュ倍率",
+    "cache_write_tokens": "キャッシュ書き込み倍率 (OpenAI)",
     "cached_write_tokens": "キャッシュ書き込み倍率",
+    "claude_cache_write_5m_tokens": "Claude 5分キャッシュ書き込み倍率（未設定時は共通キャッシュ書き込み倍率にフォールバック）",
+    "claude_cache_write_1h_tokens": "Claude 1時間キャッシュ書き込み倍率（未設定時は共通キャッシュ書き込み倍率にフォールバック）",
     "cached_read_tokens": "キャッシュ読み取り倍率",
     "reasoning_tokens": "推論倍率",
     "input_text_tokens": "入力テキスト倍率",
@@ -860,7 +907,94 @@
     "noAvailableRatios": "利用可能な拡張倍率はありません",
     "noExtraRatios": "追加の拡張倍率はありません。ドロップダウンメニューから選択してください。",
     "promptRatio": "倍率係数",
-    "selectExtraRatio": "拡大率を選択します"
+    "selectExtraRatio": "拡大率を選択します",
+    "rateRules": {
+      "title": "条件付き価格ルール",
+      "disabled": "未選択時はルールを適用しない",
+      "inactive": "回数課金では無効",
+      "inactiveForTimes": "回数課金ではこれらのルールは保持されますが適用されません。トークン課金に戻すと再び適用され、ここで削除することもできます。",
+      "flex": "Flex",
+      "fastPriority": "Fast / Priority",
+      "longContext": "Long Context",
+      "inputThreshold": "入力しきい値",
+      "inputMultiplier": "入力倍率",
+      "outputMultiplier": "出力倍率",
+      "positiveNumber": "0 より大きい数値を入力してください",
+      "positiveInteger": "正の整数を入力してください",
+      "invalid": "送信前に無効な条件付き価格ルールを修正してください",
+      "service_tier": "実際のサービス階層（service_tier）",
+      "speed": "実際の速度（speed）",
+      "long_context": "Long context",
+      "schedule": "Calendar discounts",
+      "scope": "Rules affect this model’s token pricing and related extras; independent tools and per-call prices are unchanged.",
+      "composition": "Pricing dimensions multiply independently. Tier values, speed values and input ranges must not overlap for the same request.",
+      "timezone": "Time zone",
+      "timezoneHelp": "Calendar conditions require an IANA time zone, e.g. Asia/Shanghai.",
+      "add": "Add rule / override",
+      "enumHelp": "Select or enter a value and press Enter. Each value can appear in only one rule.",
+      "gt": "Total input tokens greater than",
+      "lte": "Total input tokens less than or equal to",
+      "weekdays": "Weekdays",
+      "weekdayHelp": "Monday to Sunday. Empty means every day. Uses the operation’s local start date.",
+      "start": "Start time (inclusive)",
+      "end": "End time (exclusive)",
+      "allDay": "All day",
+      "all": "Uniform multiplier",
+      "inheritHelp": "Empty defaults to 1. Specific multipliers override it; zero means free.",
+      "inherit": "Inherited multiplier: {{value}}",
+      "overrides": "Customize input, output, cache and other multipliers",
+      "extra": "Independent override",
+      "selectExtra": "Select a meter",
+      "follow": "Inherit",
+      "remove": "Delete rule",
+      "preview": "Preview this price draft",
+      "previewHelp": "Simulates actual execution facts without charging. Total input includes cache; cache quantities must be part of that total.",
+      "running": "Calculating…",
+      "previewResult": "Preview (group multiplier 1)",
+      "started_at": "Operation start (ISO 8601 with time zone)",
+      "prompt_tokens": "Total input tokens",
+      "completion_tokens": "Output tokens",
+      "ruleReason": "{{name}}: input ×{{input}}, output ×{{output}}",
+      "extraReason": "Meter multipliers: {{items}}",
+      "day1": "Monday",
+      "day2": "Tuesday",
+      "day3": "Wednesday",
+      "day4": "Thursday",
+      "day5": "Friday",
+      "day6": "Saturday",
+      "day7": "Sunday",
+      "meters": {
+        "cached_tokens": "Cache hit",
+        "cache_write_tokens": "Cache write",
+        "cached_write_tokens": "Generic cache write",
+        "cached_read_tokens": "Cache read",
+        "claude_cache_write_5m_tokens": "Claude 5-minute cache write",
+        "claude_cache_write_1h_tokens": "Claude 1-hour cache write",
+        "tool_use_prompt_tokens": "Tool input",
+        "input_audio_tokens": "Audio input",
+        "output_audio_tokens": "Audio output",
+        "reasoning_tokens": "Reasoning output",
+        "input_text_tokens": "Text input",
+        "output_text_tokens": "Text output",
+        "input_image_tokens": "Image input",
+        "output_image_tokens": "Image output",
+        "input_video_tokens": "Video input",
+        "output_video_tokens": "Video output",
+        "deepseek_cache_hit_tokens": "DeepSeek cache hit",
+        "deepseek_cache_miss_tokens": "DeepSeek cache miss"
+      },
+      "schedulePriority": "Calendar discounts may overlap. Only the first matching rule by priority applies. Put weekend nights before general night and weekend rules.",
+      "raisePriority": "Raise priority",
+      "lowerPriority": "Lower priority",
+      "priority": "Priority {{value}}",
+      "addRule": "Add rule",
+      "selectValues": "Select values",
+      "inputRange": "Input {{range}} tokens",
+      "everyDay": "Every day",
+      "applicableSpeed": "適用する速度（speed、任意）",
+      "applicableSpeedHelp": "Empty means any speed. Select standard to exclude fast requests from long-context rates.",
+      "overlap": "This rule overlaps another rule in the same pricing dimension. Adjust its values or range."
+    }
   },
   "profile": "プロフィール",
   "profilePage": {
@@ -1038,27 +1172,12 @@
           "placeholder": "1-32、デフォルト 8",
           "error": "チャネルテスト同時実行数は 1 から 32 までの整数である必要があります"
         },
-        "quotaRemindThreshold": {
-          "label": "クォータ通知しきい値",
-          "placeholder": "このクォータを下回ると、ユーザーに通知メールが送信されます"
-        },
         "automaticEnableChannelTip": "既存のチャネル探測フローが正常結果を返した場合に限り、「自動無効化」チャネルを再有効化します。手動で無効化したチャネルはそのまま維持されます。",
         "saveMonitoringSettings": "モニタリング設定を保存",
         "title": "モニタリング設定"
       },
       "otherSettings": {
-        "CFWorkerImageUrl": {
-          "alert": "Cloudflare Workerのイメージプロキシアドレスはこちら https://github.com/MartialBE/get-image-by-cf とイメージ検出プロキシのどちらか一方のみを設定することで利用できます。\n一部のイメージ リンクは CF アクセスを拒否し、検出エラーを引き起こす可能性があることに注意してください。",
-          "key": "Cloudflare Worker イメージ プロキシ キー、設定されていない場合は無視してください",
-          "label": "Cloudflareワーカーイメージプロキシ"
-        },
-        "alert": "ユーザーがvisionモデルを使用して画像リンクを提供した場合、サーバーはこれらの画像をダウンロードしてトークンを計算する必要があります。画像をダウンロードする際にサーバーのIPアドレスが漏洩しないように、以下にプロキシを設定できます。このプロキシ設定はHTTPまたはSOCKS5プロキシを使用します。個人ユーザーの場合、この設定は無視できます。プロキシ形式はhttp://127.0.0.1:1080またはsocks5://127.0.0.1:1080です",
-        "chatImageRequestProxy": {
-          "label": "画像検出プロキシ",
-          "placeholder": "チャット画像検出プロキシ設定、設定しないとサーバーのIPが漏洩する可能性があります"
-        },
         "mjNotify": "Midjourneyはコールバックを許可します（サーバーのIPアドレスが漏洩する可能性があります）",
-        "saveButton": "その他の設定を保存",
         "title": "その他の設定",
         "claudeAPIEnabled": "Claude APIを有効にしますか？",
         "geminiAPIEnabled": "Gemini APIを有効にしますか？"
@@ -1121,24 +1240,9 @@
         "title": "チャネルキーワード設定を無効にする"
       },
       "codexSettings": {
-        "title": "Routing Affinity と Codex Hint",
-        "globalOptionBadge": "グローバル Option",
-        "decisionTitle": "まず目的を選び、必要な箇所だけ調整",
-        "description": "これらの設定は個別チャネルではなく、グローバル option として保存されます。ChannelAffinitySetting は汎用ルーティング affinity ルールで、CodexRoutingHintSetting は Codex Responses 向けの prompt_cache_key hint 生成だけを担当します。空欄の場合はバックエンドのデフォルト値に戻り、待機時間の単位はどちらもミリ秒です。",
-        "globalWarning": "これらの設定はすべてのユーザーと、ルールにマッチするリクエストに影響します。affinity / prompt_cache_key を調整しない場合は ChannelAffinitySetting をデフォルトのままにし、Codex prompt cache の pre-routing 命中が必要な場合だけ CodexRoutingHintSetting を有効にしてください。",
         "waitSectionTitle": "優先チャネル待機",
-        "affinitySectionTitle": "汎用 Channel Affinity",
-        "codexHintSectionTitle": "Codex Routing Hint",
-        "quickActions": {
-          "recommended": {
-            "title": "Codex 推奨を有効化",
-            "body": "auto hint を有効化し、affinity はバックエンド既定ルール、待機予算は 250 / 50ms にします。"
-          },
-          "safeDefault": {
-            "title": "安全な既定値に戻す",
-            "body": "hint を無効化し、affinity はバックエンド既定値、待機予算は 0 / 50ms に戻します。"
-          }
-        },
+        "affinitySectionTitle": "ルーティングアフィニティ",
+        "codexHintSectionTitle": "Codex 自動キャッシュキー",
         "summary": {
           "affinityMode": "Affinity モード",
           "backendDefault": "バックエンド既定",
@@ -1155,20 +1259,6 @@
           "storageDetail": "options テーブルに保存され、ルールに一致する全リクエストへ影響します。",
           "ruleCount": "{{count}} / {{total}} 件のルールが有効"
         },
-        "flow": {
-          "request": {
-            "title": "リクエスト ID",
-            "body": "previous_response_id、prompt_cache_key、session、認証情報から安定 ID を読み取ります。"
-          },
-          "hint": {
-            "title": "Codex Hint",
-            "body": "リクエストが prompt_cache_key を送らない場合に responses.prompt_cache_key を事前生成できます。"
-          },
-          "affinity": {
-            "title": "Routing Affinity",
-            "body": "ChannelAffinitySetting が ID を読み取り、前回成功したチャネルを優先します。"
-          }
-        },
         "preferredChannelWaitMilliseconds": {
           "label": "優先チャネル待機時間（ミリ秒）",
           "placeholder": "例：250",
@@ -1180,9 +1270,9 @@
           "help": "待機中に優先チャネルの復帰を確認する間隔です。通常は 50ms のままで十分です。小さすぎるとポーリング負荷が増え、大きすぎると復帰検知が遅くなります。"
         },
         "codexRoutingHintSetting": {
-          "label": "CodexRoutingHintSetting",
-          "placeholder": "{\n  \"prompt_cache_key_strategy\": \"auto\",\n  \"model_regex\": \"^gpt-5$\"\n}",
-          "help": "Codex 専用設定です。Codex チャネル選択前に one-hub が安定した prompt_cache_key hint を生成するかを制御します。生成された hint は ChannelAffinitySetting の request_hint ルールで読み取れます。auto を推奨します。off は生成しません。",
+          "label": "キャッシュキーの生成",
+          "placeholder": "{\n  \"prompt_cache_key_strategy\": \"auto\",\n  \"model_regex\": \"\"\n}",
+          "help": "クライアントが prompt_cache_key を省略した場合、選択した方法で Codex のキャッシュキーを生成し、ルーティングと上流リクエストに使用します。この設定はチャネル選択ルールやルーティングアフィニティを変更しません。",
           "useRecommended": "推奨テンプレートを使用",
           "useDefault": "off テンプレートを使用",
           "fields": {
@@ -1204,14 +1294,14 @@
           "placeholder": "{\n  \"enabled\": true,\n  \"default_ttl_seconds\": 3600,\n  \"max_entries\": 50000\n}",
           "help": "汎用 routing affinity 設定です。どの Responses / Realtime リクエストで identity -> channel を記録し、次回同じ identity が来たときに前回成功したチャネルを優先するかを制御します。rules: [] はルールを消すため指定しないでください。",
           "useDefault": "デフォルトルールテンプレートを使用",
-          "useBlankDefault": "空欄でバックエンドデフォルト",
+          "useBlankDefault": "バックエンドのデフォルトに従う",
           "rulesTitle": "Affinity ルール",
           "keySourcesTitle": "Key ソース",
           "addRule": "ルールを追加",
           "removeRule": "ルールを削除",
           "addKeySource": "Key ソースを追加",
           "removeKeySource": "Key ソースを削除",
-          "backendDefaultAlert": "空文字列として保存し、実行時はバックエンド内蔵の既定ルールを使います。これが最も安全です。",
+          "backendDefaultAlert": "バックエンドのデフォルトルールを使用します。保存すると明示的な上書きを削除し、以後のデフォルト変更にも追従します。",
           "customAlert": "カスタム JSON として保存します。今後バックエンドの既定ルールが変わっても、この設定は自動では置き換わりません。",
           "advancedTitle": "高度な Affinity ルール",
           "advancedDescription": "identity ソース、strict 動作、マッチ範囲を変える必要がある場合だけ開いてください。多くの場合は既定ルールで十分です。",
@@ -1324,11 +1414,11 @@
             },
             "filters": {
               "title": "フィルタ",
-              "body": "model_regex と user_agent_regex が空の場合、すべての Responses リクエストに適用されます。\n範囲を絞るには正規表現を使います。例：model_regex に ^gpt-5$ を設定します。"
+              "body": "model_regex と user_agent_regex が空の場合、すべての Responses リクエストに適用されます。\n運用範囲を明示的に狭める場合だけフィルターを設定します。フィルターはモデル対応表ではありません。"
             },
             "recommended": {
               "title": "設定方法",
-              "body": "推奨テンプレート：{\"prompt_cache_key_strategy\":\"auto\",\"model_regex\":\"^gpt-5$\"}\nこれは Codex 専用の hint 生成戦略です。影響範囲が不明な場合は、まずモデルで絞り、確認後に広げます。"
+              "body": "推奨テンプレート：{\"prompt_cache_key_strategy\":\"auto\",\"model_regex\":\"\",\"user_agent_regex\":\"\"}\nモデル名から能力を推測せず、現在および将来の Responses モデルに同じ戦略を適用します。"
             },
             "impact": {
               "title": "影響",
@@ -1336,7 +1426,7 @@
             },
             "risk": {
               "title": "リスクとトレードオフ",
-              "body": "token_id や user_id は同じ token / ユーザーのトラフィックを同じチャネルへ寄せやすくし、再利用は強くなりますが負荷が集中する可能性があります。Codex チャネル側の prompt_cache_key_strategy も同じ方針に揃えることを推奨します。"
+              "body": "token_id や user_id は同じ token / ユーザーのトラフィックを同じチャネルへ寄せやすくし、再利用は強くなりますが負荷が集中する可能性があります。キャッシュ key はルーティング前に生成され、チャネル側では書き換えません。"
             }
           },
           "ChannelAffinitySetting": {
@@ -1351,7 +1441,7 @@
             },
             "ruleFields": {
               "title": "rules フィールド",
-              "body": "name：ルール名。\nenabled：有効かどうか。\nkind：responses または realtime。\nmodel_regex / path_regex / user_agent_regex：マッチ条件。\ninclude_group / include_model / include_path / include_rule_name：affinity key に含める分離次元。\nstrict：優先チャネルが使えない場合にフォールバックせず失敗させるか。\nskip_retry_on_failure：優先チャネル失敗後に retry を省略するか。\nrecord_on_success：成功後に affinity 記録を書き戻すか。\nttl_seconds：このルールの記録保持秒数。"
+              "body": "name：ルール名。\nenabled：有効かどうか。\nkind：chat、responses または realtime。\nmodel_regex / path_regex / user_agent_regex：マッチ条件。\ninclude_group / include_model / include_path / include_rule_name：affinity key に含める分離次元。\nstrict：優先チャネルが使えない場合にフォールバックせず失敗させるか。\nskip_retry_on_failure：優先チャネル失敗後に retry を省略するか。\nrecord_on_success：成功後に affinity 記録を書き戻すか。\nttl_seconds：このルールの記録保持秒数。"
             },
             "keySources": {
               "title": "key_sources フィールド",
@@ -1359,7 +1449,7 @@
             },
             "defaults": {
               "title": "デフォルトルール",
-              "body": "デフォルトでは 3 つのルールがあります：\nresponses-continuation：previous_response_id で元チャネルへ戻します。strict=true。\nresponses-prompt-cache-key：prompt_cache_key または responses.prompt_cache_key hint を使います。\nrealtime-session：x-session-id / session_id を使います。"
+              "body": "デフォルトでは 4 つのルールがあります：\nresponses-continuation：previous_response_id で元チャネルへ戻します。strict=true。\nresponses-prompt-cache-key：prompt_cache_key または responses.prompt_cache_key hint を使います。\nchat-prompt-cache-key：Chat prompt_cache_key の soft affinity を使います。\nrealtime-session：x-session-id / session_id を使います。rules を明示保存した旧設定には新ルールを手動で追加してください。"
             },
             "recommended": {
               "title": "設定方法",
@@ -1384,7 +1474,9 @@
           "invalidMaxEntries": "Channel affinity 最大キャッシュ件数は 0 以上の整数で入力してください",
           "invalidRuleTTL": "{{index}} 件目の affinity ルール TTL は 0 以上の整数で入力してください"
         },
-        "save": "Routing Affinity 設定を保存"
+        "save": "Routing Affinity 設定を保存",
+        "affinityDescription": "Chat、Responses、Realtime のリクエスト識別子を使い、以前成功したチャネルを優先します。親和ルールと優先チャネルの待機時間を設定します。Codex キャッシュキー設定は変更しません。",
+        "saveCodexHint": "Codex キャッシュキー設定を保存"
       },
       "safetySettings": {
         "title": "システムセキュリティ設定",
@@ -1745,6 +1837,8 @@
     "title": "ユーザーグループ"
   },
   "userPage": {
+    "recalculateGroup": "ユーザーグループを再計算",
+    "invalidQuota": "有効なクォータ調整値を入力してください",
     "action": "アクション",
     "adminUserRole": "管理者",
     "bind": "バインド",
@@ -1817,12 +1911,7 @@
   "Gemini 配置(JSON)": "Gemini 構成 (JSON)",
   "Azure Speech 配置(JSON)": "Azure Speech 構成 (JSON)",
   "请输入 JSON，例如：{\"api_version\":\"2024-05-01-preview\"}": "JSON を入力してください。例: {\"api_version\":\"2024-05-01-preview\"}",
-  "请输入 JSON，例如：{\"api_version\":\"2024-05-01-preview\",\"responses_ws_transport\":\"native\"}": "JSON を入力してください。例: {\"api_version\":\"2024-05-01-preview\",\"responses_ws_transport\":\"native\"}",
   "可选 JSON 配置，例如：{}": "任意の JSON 構成です。例: {}",
-  "可选 JSON 配置，例如：{\"responses_ws_transport\":\"native\"}": "任意の JSON 構成です。例: {\"responses_ws_transport\":\"native\"}",
-  "可选 JSON 配置，例如：{\"responses_ws_native\":true}；仅当自定义兼容上游明确支持原生 Responses WebSocket 时填写。": "任意の JSON 構成です。例: {\"responses_ws_native\":true}。カスタム互換 upstream が native Responses WebSocket を明示的にサポートする場合のみ入力してください。",
-  "可选 JSON 配置，例如：{\"responses_ws_transport\":\"http_bridge\"}；如需原生 Responses WebSocket，可使用 {\"responses_ws_transport\":\"native\"}。": "任意の JSON 構成です。例: {\"responses_ws_transport\":\"http_bridge\"}。native Responses WebSocket を使う場合は {\"responses_ws_transport\":\"native\"} を使用してください。",
-  "可选 JSON 配置，例如：{\"responses_ws_transport\":\"http_bridge\"}；如自定义兼容上游支持原生 Responses WebSocket，可使用 {\"responses_ws_native\":true,\"responses_ws_transport\":\"native\"}。": "任意の JSON 構成です。例: {\"responses_ws_transport\":\"http_bridge\"}。カスタム互換 upstream が native Responses WebSocket をサポートする場合は {\"responses_ws_native\":true,\"responses_ws_transport\":\"native\"} を使用してください。",
   "请输入 JSON，例如：{\"dashscope_plugin\":\"plugin-name\"}": "JSON を入力してください。例: {\"dashscope_plugin\":\"plugin-name\"}",
   "请输入 JSON，例如：{\"api_version\":\"v3.1\"}": "JSON を入力してください。例: {\"api_version\":\"v3.1\"}",
   "请输入 JSON，例如：{\"api_version\":\"v1\"}": "JSON を入力してください。例: {\"api_version\":\"v1\"}",
@@ -1968,5 +2057,5 @@
     }
   },
   "这里填写禁用流式的模型，注意：如果填写了禁用流式的模型，那么这些模型在流式请求时会跳过该渠道": "ここには、ストリーミングを無効にするモデルを記入してください。注意：ストリーミングを無効にするモデルを記入した場合、これらのモデルはストリームリクエスト時にそのチャンネルをスキップします。",
-  "开启后，将会透传普通 HTTP 请求中的额外字段（如 OpenAI SDK 的 extra_body 参数）；ResponsesWS HTTP bridge 按 WebSocket raw frame 契约保留未知字段，不受此开关控制": "有効にすると、通常の HTTP リクエスト内の追加フィールド（OpenAI SDK の extra_body パラメータなど）を透過的に転送します。ResponsesWS HTTP bridge は WebSocket raw frame 契約に従って未知フィールドを保持するため、このスイッチの制御対象外です。"
+  "开启后，将会透传普通 HTTP 请求中的额外字段（如 OpenAI SDK 的 extra_body 参数）": "有効にすると、通常の HTTP リクエスト内の追加フィールド（OpenAI SDK の extra_body パラメータなど）を透過的に転送します。"
 }
