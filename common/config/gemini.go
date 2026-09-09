@@ -59,3 +59,25 @@ func (c *GeminiSettings) GetOpenThinkJSONString() string {
 	}
 	return string(str)
 }
+
+func RuntimeGeminiOpenThink(model string) bool {
+	return RuntimeGeminiOpenThinkFromSnapshot(GlobalOption.RuntimeSnapshot(), model)
+}
+
+func RuntimeGeminiOpenThinkFromSnapshot(snapshot *RuntimeOptionsSnapshot, model string) bool {
+	if snapshot == nil {
+		return GeminiSettingsInstance.GetOpenThink(model)
+	}
+	value, ok := snapshot.Get("GeminiOpenThink")
+	if !ok {
+		return false
+	}
+	var openThink map[string]bool
+	if value.Effective == "" {
+		return false
+	}
+	if err := json.Unmarshal([]byte(value.Effective), &openThink); err != nil {
+		return false
+	}
+	return openThink[model]
+}

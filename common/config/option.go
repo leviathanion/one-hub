@@ -1,10 +1,13 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // OptionHandler 定义配置项处理器接口
@@ -45,15 +48,18 @@ const (
 )
 
 type optionEntry struct {
-	handler  OptionHandler
-	metadata OptionMetadata
+	handler      OptionHandler
+	metadata     OptionMetadata
+	defaultValue string
 }
 
 // OptionManager 配置管理器
 type OptionManager struct {
-	entries map[string]*optionEntry
-	aliases map[string]string
-	mutex   *sync.RWMutex
+	entries   map[string]*optionEntry
+	aliases   map[string]string
+	mutex     *sync.RWMutex
+	publishMu sync.Mutex
+	runtime   atomic.Pointer[RuntimeOptionsSnapshot]
 }
 
 var GlobalOption = NewOptionManager()
@@ -81,6 +87,7 @@ func (cm *OptionManager) Register(key string, handler OptionHandler, defaultValu
 	if defaultValue != "" {
 		handler.SetValue(defaultValue)
 	}
+	cm.entries[trimmedKey].defaultValue = handler.GetValue()
 }
 
 func (cm *OptionManager) RegisterOption(key string, handler OptionHandler, metadata OptionMetadata, defaultValue string) {
@@ -196,6 +203,11 @@ func (cm *OptionManager) RegisterValueOption(key string, metadata OptionMetadata
 
 // Get 获取配置值(字符串)
 func (cm *OptionManager) Get(key string) string {
+	if snapshot := cm.RuntimeSnapshot(); snapshot != nil {
+		if value, ok := snapshot.Get(key); ok {
+			return value.Effective
+		}
+	}
 	entry, _, exists := cm.getEntry(key)
 	if !exists {
 		return ""
@@ -231,6 +243,9 @@ func (cm *OptionManager) NormalizeKey(key string) string {
 }
 
 func (cm *OptionManager) GetAll() map[string]string {
+	if snapshot := cm.RuntimeSnapshot(); snapshot != nil {
+		return snapshot.EffectiveValues()
+	}
 	cm.mutex.RLock()
 	defer cm.mutex.RUnlock()
 
@@ -242,6 +257,9 @@ func (cm *OptionManager) GetAll() map[string]string {
 }
 
 func (cm *OptionManager) GetPublic() map[string]string {
+	if snapshot := cm.RuntimeSnapshot(); snapshot != nil {
+		return snapshot.PublicEffectiveValues()
+	}
 	cm.mutex.RLock()
 	defer cm.mutex.RUnlock()
 
@@ -256,6 +274,9 @@ func (cm *OptionManager) GetPublic() map[string]string {
 }
 
 func (cm *OptionManager) GetSensitiveStatuses() map[string]SensitiveOptionStatus {
+	if snapshot := cm.RuntimeSnapshot(); snapshot != nil {
+		return snapshot.SensitiveStatuses()
+	}
 	cm.mutex.RLock()
 	defer cm.mutex.RUnlock()
 
@@ -428,7 +449,7 @@ type FloatOptionHandler struct {
 }
 
 func (h *FloatOptionHandler) SetValue(value string) error {
-	val, err := strconv.ParseFloat(value, 64)
+	val, err := parseFiniteFloatOptionValue(value)
 	if err != nil {
 		return err
 	}
@@ -441,8 +462,19 @@ func (h *FloatOptionHandler) GetValue() string {
 }
 
 func (h *FloatOptionHandler) ValidateValue(value string) error {
-	_, err := strconv.ParseFloat(value, 64)
+	_, err := parseFiniteFloatOptionValue(value)
 	return err
+}
+
+func parseFiniteFloatOptionValue(value string) (float64, error) {
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 0, err
+	}
+	if math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+		return 0, errors.New("option value must be a finite number")
+	}
+	return parsed, nil
 }
 
 type CustomOptionHandler struct {

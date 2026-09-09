@@ -56,6 +56,25 @@ func RetryStatusCodeIsRetryable(status int) bool {
 	return exists
 }
 
+func RuntimeRetryStatusCodeIsRetryable(snapshot *RuntimeOptionsSnapshot, status int) bool {
+	if status < 100 || status > 599 {
+		return false
+	}
+	if snapshot == nil {
+		snapshot = GlobalOption.RuntimeSnapshot()
+	}
+	value := snapshot.String("RetryStatusCodes", RetryStatusCodes)
+	_, policy, err := parseRetryStatusCodePolicy(value)
+	if err != nil {
+		return false
+	}
+	if _, exists := policy.exact[status]; exists {
+		return true
+	}
+	_, exists := policy.families[status/100]
+	return exists
+}
+
 func parseRetryStatusCodePolicy(value string) (string, retryStatusCodePolicy, error) {
 	policy := retryStatusCodePolicy{
 		exact:    make(map[int]struct{}),

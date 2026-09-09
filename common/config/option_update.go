@@ -155,6 +155,10 @@ func PrepareOptionUpdates(requests []OptionUpdate, validationMode OptionGroupVal
 }
 
 func validateOptionValue(key, value string) error {
+	return validateOptionValueWithManager(GlobalOption, key, value)
+}
+
+func validateOptionValueWithManager(manager *OptionManager, key, value string) error {
 	switch key {
 	case "PreferredChannelWaitMilliseconds":
 		wait, err := strconv.Atoi(value)
@@ -188,7 +192,7 @@ func validateOptionValue(key, value string) error {
 		return nil
 	}
 
-	if err := GlobalOption.Validate(key, value); err != nil {
+	if err := manager.Validate(key, value); err != nil {
 		return &OptionValidationError{
 			Key:     key,
 			Message: err.Error(),
