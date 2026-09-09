@@ -47,7 +47,8 @@ func (p *ReplicateProvider) CreateImageGenerations(request *types.ImageRequest) 
 		replicateResponse.Output = replicateResponse.Urls.Stream
 	}
 
-	p.Usage.TotalTokens = p.Usage.PromptTokens
+	p.Usage.MarkProviderOperationUnits(1)
+	p.Usage.MergeProviderAttribution(replicateResponse.Model, "")
 
 	return p.convertToImageOpenai(replicateResponse)
 }

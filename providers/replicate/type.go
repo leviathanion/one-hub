@@ -1,5 +1,7 @@
 package replicate
 
+import "encoding/json"
+
 type ReplicateError struct {
 	Detail string `json:"detail"`
 	Status int    `json:"status"`
@@ -50,4 +52,22 @@ type ReplicateImageUrl struct {
 type ReplicateMetrics struct {
 	InputTokenCount  int `json:"input_token_count,omitempty"`
 	OutputTokenCount int `json:"output_token_count,omitempty"`
+
+	inputTokenCountPresent  bool
+	outputTokenCountPresent bool
+}
+
+func (m *ReplicateMetrics) UnmarshalJSON(data []byte) error {
+	type metricsAlias ReplicateMetrics
+	var decoded metricsAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*m = ReplicateMetrics(decoded)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err == nil {
+		_, m.inputTokenCountPresent = fields["input_token_count"]
+		_, m.outputTokenCountPresent = fields["output_token_count"]
+	}
+	return nil
 }

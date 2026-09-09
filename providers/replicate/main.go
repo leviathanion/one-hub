@@ -81,8 +81,11 @@ func (p *ReplicateProvider) GetFullRequestURL(requestURL string, model string) s
 }
 
 func getPrediction[T any](p *ReplicateProvider, response *ReplicateResponse[T]) (*ReplicateResponse[T], error) {
-	if response.Status == "succeeded" {
-		return response, nil
+	if response == nil {
+		return nil, errors.New("prediction response is nil")
+	}
+	if isReplicateTerminalStatus(response.Status) {
+		return replicateTerminalResult(response)
 	}
 
 	predictionResponse := getPredictionResponse[T](p, response.ID)
@@ -90,11 +93,31 @@ func getPrediction[T any](p *ReplicateProvider, response *ReplicateResponse[T]) 
 		return response, errors.New("prediction response is nil")
 	}
 
-	if predictionResponse.Status == "failed" {
-		return nil, errors.New(predictionResponse.Error)
-	}
+	return replicateTerminalResult(predictionResponse)
+}
 
-	return predictionResponse, nil
+func isReplicateTerminalStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "succeeded", "failed", "canceled", "aborted":
+		return true
+	default:
+		return false
+	}
+}
+
+func replicateTerminalResult[T any](response *ReplicateResponse[T]) (*ReplicateResponse[T], error) {
+	if response == nil {
+		return nil, errors.New("prediction response is nil")
+	}
+	status := strings.ToLower(strings.TrimSpace(response.Status))
+	if status == "succeeded" {
+		return response, nil
+	}
+	detail := strings.TrimSpace(response.Error)
+	if detail == "" {
+		detail = "prediction " + status
+	}
+	return nil, errors.New(detail)
 }
 
 func getPredictionResponse[T any](p *ReplicateProvider, predictionID string) *ReplicateResponse[T] {
@@ -114,8 +137,10 @@ func getPredictionResponse[T any](p *ReplicateProvider, predictionID string) *Re
 		if err != nil {
 			return nil
 		}
-		p.Requester.SendRequest(req, replicateResponse, false)
-		if replicateResponse.Status == "succeeded" || replicateResponse.Status == "failed" {
+		if _, apiErr := p.Requester.SendRequest(req, replicateResponse, false); apiErr != nil {
+			return nil
+		}
+		if isReplicateTerminalStatus(replicateResponse.Status) {
 			return replicateResponse
 		}
 		retry++

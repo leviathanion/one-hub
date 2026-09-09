@@ -13,10 +13,11 @@ import (
 )
 
 type ReplicateStreamHandler struct {
-	Usage     *types.Usage
-	ModelName string
-	ID        string
-	Provider  *ReplicateProvider
+	Usage           *types.Usage
+	ModelName       string
+	ID              string
+	framer          *requester.SSEEventFramer
+	fetchPrediction func() *ReplicateResponse[[]string]
 }
 
 func (p *ReplicateProvider) CreateChatCompletion(request *types.ChatCompletionRequest) (response *types.ChatCompletionResponse, errWithCode *types.OpenAIErrorWithStatusCode) {
@@ -125,9 +126,7 @@ func (p *ReplicateProvider) convertToChatOpenai(response *ReplicateResponse[[]st
 		},
 	}
 
-	p.Usage.PromptTokens = response.Metrics.InputTokenCount
-	p.Usage.CompletionTokens = response.Metrics.OutputTokenCount
-	p.Usage.TotalTokens = p.Usage.PromptTokens + p.Usage.CompletionTokens
+	applyReplicateSucceededEvidence(p.Usage, response.Model, response.Metrics)
 	openaiResponse.Usage = p.Usage
 
 	return openaiResponse, nil
@@ -170,8 +169,9 @@ func (p *ReplicateProvider) CreateChatCompletionStream(request *types.ChatComple
 		return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
 	}
 
-	// 发送请求
-	resp, errWithCode := p.Requester.SendRequestRaw(req)
+	// 只有打开 SSE 的 GET 使用长流策略；创建 POST 和终态轮询保持原策略。
+	streamRequester := p.Requester.ForHTTPProfile(requester.HTTPProfileLongStream)
+	resp, errWithCode := streamRequester.SendRequestRaw(req)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -180,56 +180,118 @@ func (p *ReplicateProvider) CreateChatCompletionStream(request *types.ChatComple
 		Usage:     p.Usage,
 		ModelName: request.Model,
 		ID:        replicateResponse.ID,
-		Provider:  p,
+		framer:    requester.NewSSEEventFramer(16 << 20),
+	}
+	chatHandler.fetchPrediction = func() *ReplicateResponse[[]string] {
+		return getPredictionResponse[[]string](p, replicateResponse.ID)
 	}
 
-	return requester.RequestStream(p.Requester, resp, chatHandler.HandlerChatStream)
+	return requester.RequestNoTrimStreamWithEmitterOptions(streamRequester, resp, chatHandler.HandlerChatStreamWithEmitter, requester.StreamReadOptions{RequireProtocolTerminal: true})
 }
 
-func (h *ReplicateStreamHandler) HandlerChatStream(rawLine *[]byte, dataChan chan string, errChan chan error) {
-	if strings.HasPrefix(string(*rawLine), "event: done") {
-		// 获取用量
-		replicateResponse := getPredictionResponse[[]string](h.Provider, h.ID)
-
-		h.Usage.PromptTokens = replicateResponse.Metrics.InputTokenCount
-		h.Usage.CompletionTokens = replicateResponse.Metrics.OutputTokenCount
-		h.Usage.TotalTokens = h.Usage.PromptTokens + h.Usage.CompletionTokens
-
-		// 需要有一个stop
-		choice := types.ChatCompletionStreamChoice{
-			Index: 0,
-			Delta: types.ChatCompletionStreamChoiceDelta{
-				Role: types.ChatMessageRoleAssistant,
-			},
-			FinishReason: types.FinishReasonStop,
-		}
-
-		dataChan <- getStreamResponse(h.ID, choice, h.ModelName)
-
-		errChan <- io.EOF
+func (h *ReplicateStreamHandler) HandlerChatStreamWithEmitter(rawLine *[]byte, emitter requester.StreamEmitter[string]) {
+	if h == nil || rawLine == nil {
+		return
+	}
+	if h.framer == nil {
+		h.framer = requester.NewSSEEventFramer(16 << 20)
+	}
+	event, complete, err := h.framer.PushLine(*rawLine)
+	*rawLine = nil
+	if err != nil {
 		*rawLine = requester.StreamClosed
-
+		emitter.SendError(err)
 		return
 	}
-
-	// 如果rawLine 前缀不为data:，则直接返回
-	if !strings.HasPrefix(string(*rawLine), "data: ") {
-		*rawLine = nil
+	if !complete {
 		return
 	}
-
-	// 去除前缀
-	*rawLine = (*rawLine)[6:]
-
-	choice := types.ChatCompletionStreamChoice{
-		Index: 0,
-		Delta: types.ChatCompletionStreamChoiceDelta{
-			Role:    types.ChatMessageRoleAssistant,
-			Content: string(*rawLine),
-		},
+	eventType, data := replicateSSEEvent(event)
+	switch eventType {
+	case "error":
+		*rawLine = requester.StreamClosed
+		apiErr := common.StringErrorWrapper(strings.TrimSpace(data), "prediction_failed", http.StatusBadGateway)
+		if strings.TrimSpace(apiErr.Message) == "" {
+			apiErr.Message = "prediction failed"
+		}
+		apiErr.UpstreamAccepted = true
+		emitter.SendError(apiErr)
+		return
+	case "done":
+		var prediction *ReplicateResponse[[]string]
+		if h.fetchPrediction != nil {
+			prediction = h.fetchPrediction()
+		}
+		if prediction == nil {
+			*rawLine = requester.StreamClosed
+			apiErr := common.StringErrorWrapper("prediction terminal state is unavailable", "prediction_failed", http.StatusBadGateway)
+			apiErr.UpstreamAccepted = true
+			emitter.SendError(apiErr)
+			return
+		}
+		if _, terminalErr := replicateTerminalResult(prediction); terminalErr != nil {
+			*rawLine = requester.StreamClosed
+			apiErr := common.ErrorWrapper(terminalErr, "prediction_failed", http.StatusBadGateway)
+			apiErr.UpstreamAccepted = true
+			emitter.SendError(apiErr)
+			return
+		}
+		applyReplicateSucceededEvidence(h.Usage, prediction.Model, prediction.Metrics)
+		choice := types.ChatCompletionStreamChoice{Index: 0, Delta: types.ChatCompletionStreamChoiceDelta{Role: types.ChatMessageRoleAssistant}, FinishReason: types.FinishReasonStop}
+		if !emitter.SendData(getStreamResponse(h.ID, choice, h.ModelName)) {
+			return
+		}
+		*rawLine = requester.StreamClosed
+		emitter.SendError(io.EOF)
+		return
+	default:
+		if data == "" {
+			return
+		}
+		choice := types.ChatCompletionStreamChoice{Index: 0, Delta: types.ChatCompletionStreamChoiceDelta{Role: types.ChatMessageRoleAssistant, Content: data}}
+		emitter.SendData(getStreamResponse(h.ID, choice, h.ModelName))
 	}
+}
 
-	dataChan <- getStreamResponse(h.ID, choice, h.ModelName)
+func applyReplicateSucceededEvidence(usage *types.Usage, modelName string, metrics ReplicateMetrics) {
+	if usage == nil {
+		return
+	}
+	usage.MarkProviderOperationUnits(1)
+	usage.MergeProviderAttribution(modelName, "")
+	if metrics.inputTokenCountPresent && metrics.outputTokenCountPresent {
+		usage.PromptTokens = metrics.InputTokenCount
+		usage.CompletionTokens = metrics.OutputTokenCount
+		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+		usage.MarkProviderReported()
+	}
+}
+
+func replicateSSEEvent(event []byte) (eventType, data string) {
+	dataLines := make([]string, 0, 1)
+	for _, line := range strings.Split(string(event), "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		if line == "" {
+			continue
+		}
+		field, value := line, ""
+		if colon := strings.IndexByte(line, ':'); colon >= 0 {
+			field, value = line[:colon], line[colon+1:]
+			if strings.HasPrefix(value, " ") {
+				value = value[1:]
+			}
+		}
+		switch field {
+		case "event":
+			// 事件名是控制字段；保留原有宽松的名称匹配语义。
+			eventType = strings.ToLower(strings.TrimSpace(value))
+		case "data":
+			// SSE 只允许去掉冒号后的一个可选分隔空格。其余空格、tab
+			// 和空 data 行都属于模型载荷，必须原样保留。
+			dataLines = append(dataLines, value)
+		}
+	}
+	return eventType, strings.Join(dataLines, "\n")
 }
 
 func getStreamResponse(id string, choice types.ChatCompletionStreamChoice, modelName string) string {
