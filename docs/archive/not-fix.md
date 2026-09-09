@@ -19,19 +19,11 @@ are explicitly added to the compact schema. We keep the more important property:
 compact has a small, auditable payload surface and never leaks ordinary
 `client_metadata` or unrelated create-only fields.
 
-## H-17: Raw Responses Reject `temperature` + `top_p`
+## H-17: Preserve `temperature` + `top_p`
 
-Decision: not fixed.
-
-The planner intentionally rejects `temperature` and `top_p` when both are
-present on raw `/v1/responses` ingress. The architecture calls hidden semantic
-repair out as forbidden. The chat adapter is the only sanctioned typed-to-raw
-synthesis boundary and already resolves this conflict before planner entry.
-
-Trade-off: some non-official Responses clients get a 400 instead of proxy repair.
-The gain is a clean ownership rule: client-owned raw Responses bodies are not
-silently rewritten; synthesized chat bodies are normalized only at the adapter
-boundary.
+Superseded. Both fields are upstream-owned parameters. Raw Responses ingress and
+Chat-to-Responses conversion preserve them, and the shared wire planner leaves
+their validation to the provider.
 
 ## H-18 / M-28: Do Not Reintroduce System/Developer Merge For Responses Ingress
 
