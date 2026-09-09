@@ -2,15 +2,79 @@ package common
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 
+	"one-api/common/logger"
 	"one-api/common/requestbody"
 
 	"github.com/gin-gonic/gin"
 )
+
+func TestReusableBodyMapPreservesLargeJSONIntegers(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	body := []byte(`{"future":{"large_integer":9007199254740993}}`)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+
+	requestMap, err := CloneReusableBodyMap(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	large, ok := requestMap["future"].(map[string]interface{})["large_integer"].(json.Number)
+	if !ok || large.String() != "9007199254740993" {
+		t.Fatalf("expected exact json.Number, got %T(%v)", requestMap["future"].(map[string]interface{})["large_integer"], requestMap["future"])
+	}
+}
+
+func TestUnmarshalBodyReusableRejectsTopLevelNullWithoutValidatorPanic(t *testing.T) {
+	for _, contentType := range []string{"", "application/json"} {
+		t.Run(contentType, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/", strings.NewReader("null"))
+			if contentType != "" {
+				ctx.Request.Header.Set("Content-Type", contentType)
+			}
+			var target *struct {
+				Model string `json:"model" binding:"required"`
+			}
+			if err := UnmarshalBodyReusable(ctx, &target); err == nil || target != nil {
+				t.Fatalf("top-level null was not rejected: target=%+v err=%v", target, err)
+			}
+		})
+	}
+}
+
+func TestErrorWrapperRedactsTransportURLBeforeLogging(t *testing.T) {
+	err := &url.Error{
+		Op:  "Post",
+		URL: "https://open.feishu.cn/open-apis/bot/v2/hook/webhook-secret?access_token=query-secret&sign=signature-secret",
+		Err: errors.New("dial tcp: connection refused"),
+	}
+	apiErr := ErrorWrapper(err, "http_request_failed", http.StatusInternalServerError)
+	if apiErr.Message != "请求上游地址失败" {
+		t.Fatalf("unexpected public transport error: %+v", apiErr)
+	}
+	entries, _ := logger.GetLatestLogs(1)
+	if len(entries) != 1 {
+		t.Fatalf("expected one latest transport log, got %d", len(entries))
+	}
+	for _, secret := range []string{"webhook-secret", "query-secret", "signature-secret", "open.feishu.cn"} {
+		if strings.Contains(entries[0].Message, secret) {
+			t.Fatalf("transport log leaked %q: %s", secret, entries[0].Message)
+		}
+	}
+	if !strings.Contains(entries[0].Message, "[redacted]") {
+		t.Fatalf("expected transport URL redaction marker, got %s", entries[0].Message)
+	}
+}
 
 type repeatingByteReader struct{}
 
@@ -47,14 +111,14 @@ func TestCacheRequestBodyAndCloneReusableBodyMap(t *testing.T) {
 
 	firstMap["model"] = "changed"
 	nested := firstMap["nested"].(map[string]interface{})
-	nested["value"] = float64(9)
+	nested["value"] = json.Number("9")
 	items := firstMap["items"].([]interface{})
 	items[0].(map[string]interface{})["k"] = "changed"
 
 	if secondMap["model"] != "gpt-4o" {
 		t.Fatalf("expected cloned maps to be isolated, got %v", secondMap["model"])
 	}
-	if secondMap["nested"].(map[string]interface{})["value"] != float64(1) {
+	if secondMap["nested"].(map[string]interface{})["value"] != json.Number("1") {
 		t.Fatalf("expected nested map clone to remain unchanged, got %v", secondMap["nested"])
 	}
 	if secondMap["items"].([]interface{})[0].(map[string]interface{})["k"] != "v" {

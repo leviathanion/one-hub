@@ -250,7 +250,15 @@ func GetReusableBodyMap(c *gin.Context) (map[string]interface{}, error) {
 	}
 
 	requestMap := make(map[string]interface{})
-	if err = json.Unmarshal(requestBody, &requestMap); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(requestBody))
+	decoder.UseNumber()
+	if err = decoder.Decode(&requestMap); err != nil {
+		return nil, err
+	}
+	if err = decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			err = fmt.Errorf("request body contains multiple JSON values")
+		}
 		return nil, err
 	}
 
@@ -278,6 +286,9 @@ func UnmarshalBodyReusable(c *gin.Context, v any) error {
 	requestBody, err := CacheRequestBody(c)
 	if err != nil {
 		return err
+	}
+	if bytes.Equal(bytes.TrimSpace(requestBody), []byte("null")) {
+		return fmt.Errorf("request body must be an object")
 	}
 
 	c.Request.Body = io.NopCloser(bytes.NewBuffer(requestBody))
@@ -309,7 +320,8 @@ func GetRequestBodyReparseNeeded(c *gin.Context) bool {
 }
 
 func cloneJSONValue(value interface{}) interface{} {
-	// Only clones the standard Go shapes produced by json.Unmarshal.
+	// Only container values need deep copies; scalar values, including
+	// json.Number, are immutable.
 	switch typed := value.(type) {
 	case map[string]interface{}:
 		cloned := make(map[string]interface{}, len(typed))
@@ -335,7 +347,7 @@ func ErrorWrapper(err error, code string, statusCode int) *types.OpenAIErrorWith
 	}
 
 	if strings.Contains(errString, "Post") || strings.Contains(errString, "dial") {
-		logger.SysError(fmt.Sprintf("error: %s", errString))
+		logger.SysError(fmt.Sprintf("error: %s", RedactSensitiveText(errString)))
 		errString = "请求上游地址失败"
 	}
 
