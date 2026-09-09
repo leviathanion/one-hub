@@ -12,8 +12,16 @@ import (
 
 type OllamaProviderFactory struct{}
 
+func (OllamaProviderFactory) AssessChatRemoteMedia(_ *model.Channel, _ *types.ChatCompletionRequest, _ base.ChatRemoteMediaSummary) (base.RemoteMediaMode, error) {
+	return base.RemoteMediaMaterialize, nil
+}
+
 type OllamaProvider struct {
 	base.BaseProvider
+}
+
+func (p *OllamaProvider) MaterializeChatRemoteMedia(request *types.ChatCompletionRequest, fetcher base.RemoteMediaFetcher) error {
+	return base.MaterializeChatRemoteMedia(request, fetcher)
 }
 
 // 创建 OllamaProvider

@@ -1,14 +1,15 @@
 package ollama
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"one-api/common"
 	"one-api/common/config"
-	"one-api/common/image"
 	"one-api/common/requester"
 	"one-api/common/utils"
+	"one-api/providers/base"
 	"one-api/types"
 	"strings"
 )
@@ -43,7 +44,8 @@ func (p *OllamaProvider) CreateChatCompletionStream(request *types.ChatCompletio
 	defer req.Body.Close()
 
 	// 发送请求
-	resp, errWithCode := p.Requester.SendRequestRaw(req)
+	streamRequester := p.Requester.ForHTTPProfile(requester.HTTPProfileLongStream)
+	resp, errWithCode := streamRequester.SendRequestRaw(req)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -53,7 +55,7 @@ func (p *OllamaProvider) CreateChatCompletionStream(request *types.ChatCompletio
 		Request: request,
 	}
 
-	return requester.RequestStream(p.Requester, resp, chatHandler.handlerStream)
+	return requester.RequestStream(streamRequester, resp, chatHandler.handlerStream)
 }
 
 func (p *OllamaProvider) getChatRequest(request *types.ChatCompletionRequest) (*http.Request, *types.OpenAIErrorWithStatusCode) {
@@ -107,11 +109,7 @@ func (p *OllamaProvider) convertToChatOpenai(response *ChatResponse, request *ty
 		Created: utils.GetTimestamp(),
 		Model:   request.Model,
 		Choices: []types.ChatCompletionChoice{choices},
-		Usage: &types.Usage{
-			PromptTokens:     response.PromptEvalCount,
-			CompletionTokens: response.EvalCount,
-			TotalTokens:      response.PromptEvalCount + response.EvalCount,
-		},
+		Usage:   ollamaProviderUsage(response),
 	}
 
 	*p.Usage = *openaiResponse.Usage
@@ -142,11 +140,11 @@ func convertFromChatOpenai(request *types.ChatCompletionRequest) (*ChatRequest, 
 			if openaiPart.Type == types.ContentTypeText {
 				ollamaMessage.Content += openaiPart.Text
 			} else if openaiPart.Type == types.ContentTypeImageURL {
-				_, data, err := image.GetImageFromUrl(openaiPart.ImageURL.URL)
+				_, body, err := base.DecodeChatMediaDataURI(openaiPart.ImageURL.URL)
 				if err != nil {
 					return nil, common.ErrorWrapper(err, "image_url_invalid", http.StatusBadRequest)
 				}
-				ollamaMessage.Images = append(ollamaMessage.Images, data)
+				ollamaMessage.Images = append(ollamaMessage.Images, base64.StdEncoding.EncodeToString(body))
 			}
 		}
 		ollamaRequest.Messages = append(ollamaRequest.Messages, ollamaMessage)
@@ -190,10 +188,8 @@ func (h *ollamaStreamHandler) handlerStream(rawLine *[]byte, dataChan chan strin
 		choice.FinishReason = types.FinishReasonStop
 	}
 
-	if chatResponse.EvalCount > 0 {
-		h.Usage.PromptTokens = chatResponse.PromptEvalCount
-		h.Usage.CompletionTokens = chatResponse.EvalCount
-		h.Usage.TotalTokens = h.Usage.PromptTokens + chatResponse.EvalCount
+	if chatResponse.Done {
+		*h.Usage = *ollamaProviderUsage(&chatResponse)
 	}
 
 	chatCompletion := types.ChatCompletionStreamResponse{
@@ -206,4 +202,19 @@ func (h *ollamaStreamHandler) handlerStream(rawLine *[]byte, dataChan chan strin
 
 	responseBody, _ := json.Marshal(chatCompletion)
 	dataChan <- string(responseBody)
+}
+
+func ollamaProviderUsage(response *ChatResponse) *types.Usage {
+	usage := &types.Usage{}
+	if response == nil {
+		return usage
+	}
+	usage.PromptTokens = response.PromptEvalCount
+	usage.CompletionTokens = response.EvalCount
+	usage.TotalTokens = response.PromptEvalCount + response.EvalCount
+	if response.promptEvalCountPresent && response.evalCountPresent {
+		usage.MarkProviderReported()
+		usage.MergeProviderAttribution(response.Model, "")
+	}
+	return usage
 }

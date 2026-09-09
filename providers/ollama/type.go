@@ -1,6 +1,9 @@
 package ollama
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 type OllamaError struct {
 	Error string `json:"error,omitempty"`
@@ -29,6 +32,24 @@ type ChatResponse struct {
 	Done            bool      `json:"done"`
 	EvalCount       int       `json:"eval_count,omitempty"`
 	PromptEvalCount int       `json:"prompt_eval_count,omitempty"`
+
+	evalCountPresent       bool
+	promptEvalCountPresent bool
+}
+
+func (r *ChatResponse) UnmarshalJSON(data []byte) error {
+	type responseAlias ChatResponse
+	var decoded responseAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*r = ChatResponse(decoded)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err == nil {
+		_, r.evalCountPresent = fields["eval_count"]
+		_, r.promptEvalCountPresent = fields["prompt_eval_count"]
+	}
+	return nil
 }
 
 type Message struct {

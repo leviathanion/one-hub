@@ -78,6 +78,8 @@ func (p *OllamaProvider) CreateEmbeddings(request *types.EmbeddingRequest) (*typ
 			TotalTokens:      ollamaResponse.PromptEvalCount,
 		},
 	}
+	response.Usage.MarkProviderReported()
+	response.Usage.MergeProviderAttribution(ollamaResponse.Model, "")
 
 	*p.Usage = *response.Usage
 
