@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -37,7 +38,7 @@ func TestSendXunfeiWSJSONRequestWritesTextFrame(t *testing.T) {
 	defer client.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort})
 	defer server.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort})
 
-	stream, apiErr := sendXunfeiWSJSONRequest[string](client, map[string]string{"type": "test"}, func(*[]byte, chan string, chan error) {})
+	stream, apiErr := sendXunfeiWSJSONRequest[string](context.Background(), client, map[string]string{"type": "test"}, func(*[]byte, chan string, chan error) {})
 	if apiErr != nil {
 		t.Fatalf("sendXunfeiWSJSONRequest apiErr=%v", apiErr)
 	}
@@ -79,7 +80,7 @@ func TestXunfeiWSReaderProcessesFramesOutsidePumpHandle(t *testing.T) {
 	defer client.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort})
 	defer server.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort})
 
-	stream, apiErr := sendXunfeiWSJSONRequest[string](client, map[string]string{"type": "test"}, func(raw *[]byte, data chan string, errCh chan error) {
+	stream, apiErr := sendXunfeiWSJSONRequest[string](context.Background(), client, map[string]string{"type": "test"}, func(raw *[]byte, data chan string, errCh chan error) {
 		data <- string(*raw)
 		*raw = requester.StreamClosed
 		errCh <- io.EOF
@@ -126,7 +127,7 @@ func TestXunfeiWSReaderRecoversHandlerPanic(t *testing.T) {
 	client, server := wstest.Pair(t)
 	defer server.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort})
 
-	stream, apiErr := sendXunfeiWSJSONRequest[string](client, map[string]string{"type": "test"}, func(*[]byte, chan string, chan error) {
+	stream, apiErr := sendXunfeiWSJSONRequest[string](context.Background(), client, map[string]string{"type": "test"}, func(*[]byte, chan string, chan error) {
 		panic("secret panic detail")
 	})
 	if apiErr != nil {
@@ -172,7 +173,7 @@ func TestConvertToChatOpenaiClosesStream(t *testing.T) {
 	stream.errChan <- io.EOF
 
 	handler := &xunfeiHandler{Request: &types.ChatCompletionRequest{Model: "spark"}}
-	response, apiErr := handler.convertToChatOpenai(stream)
+	response, apiErr := handler.convertToChatOpenai(context.Background(), stream)
 	if apiErr != nil {
 		t.Fatalf("convertToChatOpenai apiErr=%v", apiErr)
 	}
@@ -183,5 +184,28 @@ func TestConvertToChatOpenaiClosesStream(t *testing.T) {
 	case <-stream.closed:
 	case <-time.After(time.Second):
 		t.Fatal("expected convertToChatOpenai to close stream")
+	}
+}
+
+func TestXunfeiUnaryUsageOnlyTerminalRetainsFunctionCall(t *testing.T) {
+	stream := &xunfeiFakeStream{dataChan: make(chan XunfeiChatResponse, 2), errChan: make(chan error, 1), closed: make(chan struct{})}
+	var prefix, terminal XunfeiChatResponse
+	if err := json.Unmarshal([]byte(`{"header":{"sid":"prefix"},"payload":{"choices":{"status":1,"text":[{"function_call":{"name":"weather","arguments":"{\"city\":\"Paris\"}"}}]}}}`), &prefix); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(`{"header":{"sid":"terminal"},"payload":{"choices":{"status":2},"usage":{"text":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}}}`), &terminal); err != nil {
+		t.Fatal(err)
+	}
+	stream.dataChan <- prefix
+	stream.dataChan <- terminal
+	stream.errChan <- io.EOF
+	handler := &xunfeiHandler{Request: &types.ChatCompletionRequest{Model: "spark", Tools: []*types.ChatCompletionTool{{Type: "function"}}}}
+	response, apiErr := handler.convertToChatOpenai(context.Background(), stream)
+	if apiErr != nil || response.ID != "terminal" || response.Usage == nil || response.Usage.PromptTokens != 3 {
+		t.Fatalf("terminal facts lost: response=%+v err=%+v", response, apiErr)
+	}
+	calls := response.Choices[0].Message.ToolCalls
+	if len(calls) != 1 || calls[0].Function == nil || calls[0].Function.Name != "weather" || !strings.Contains(calls[0].Function.Arguments, "Paris") {
+		t.Fatalf("usage-only terminal erased function: %+v", response.Choices)
 	}
 }

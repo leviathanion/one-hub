@@ -26,6 +26,7 @@ type xunfeiHandler struct {
 }
 
 type xunfeiWSReader[T any] struct {
+	ctx            context.Context
 	conn           *wsconn.ManagedConn
 	handlerPrefix  requester.HandlerPrefix[T]
 	DataChan       chan T
@@ -33,68 +34,74 @@ type xunfeiWSReader[T any] struct {
 	frameChan      chan []byte
 	startOnce      sync.Once
 	closeFrameOnce sync.Once
+	finishOnce     sync.Once
+	done           chan struct{}
 }
 
 func (p *XunfeiProvider) CreateChatCompletion(request *types.ChatCompletionRequest) (*types.ChatCompletionResponse, *types.OpenAIErrorWithStatusCode) {
-	wsConn, errWithCode := p.getChatRequest(request)
+	wsConn, xunfeiRequest, errWithCode := p.getChatRequest(request)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
-
-	xunfeiRequest := p.convertFromChatOpenai(request)
 
 	chatHandler := &xunfeiHandler{
 		Usage:   p.Usage,
 		Request: request,
 	}
 
-	stream, errWithCode := sendXunfeiWSJSONRequest[XunfeiChatResponse](wsConn, xunfeiRequest, chatHandler.handlerNotStream)
+	stream, errWithCode := sendXunfeiWSJSONRequest[XunfeiChatResponse](p.LogContext(), wsConn, xunfeiRequest, chatHandler.handlerNotStream)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
 
-	return chatHandler.convertToChatOpenai(stream)
+	return chatHandler.convertToChatOpenai(p.LogContext(), stream)
 }
 
 func (p *XunfeiProvider) CreateChatCompletionStream(request *types.ChatCompletionRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
-	wsConn, errWithCode := p.getChatRequest(request)
+	wsConn, xunfeiRequest, errWithCode := p.getChatRequest(request)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
-
-	xunfeiRequest := p.convertFromChatOpenai(request)
 
 	chatHandler := &xunfeiHandler{
 		Usage:   p.Usage,
 		Request: request,
 	}
 
-	return sendXunfeiWSJSONRequest[string](wsConn, xunfeiRequest, chatHandler.handlerStream)
+	return sendXunfeiWSJSONRequest[string](p.LogContext(), wsConn, xunfeiRequest, chatHandler.handlerStream)
 }
 
-func (p *XunfeiProvider) getChatRequest(request *types.ChatCompletionRequest) (*wsconn.ManagedConn, *types.OpenAIErrorWithStatusCode) {
+func (p *XunfeiProvider) getChatRequest(request *types.ChatCompletionRequest) (*wsconn.ManagedConn, *XunfeiChatRequest, *types.OpenAIErrorWithStatusCode) {
+	requestCtx := p.LogContext()
+	if err := requestCtx.Err(); err != nil {
+		return nil, nil, common.ErrorWrapperLocal(err, "ws_request_failed", http.StatusInternalServerError)
+	}
 	_, errWithCode := p.GetSupportedAPIUri(config.RelayModeChatCompletions)
 	if errWithCode != nil {
-		return nil, errWithCode
+		return nil, nil, errWithCode
 	}
 
 	authUrl := p.GetFullRequestURL(request.Model)
+	xunfeiRequest, err := p.convertFromChatOpenai(request)
+	if err != nil {
+		return nil, nil, common.ErrorWrapperLocal(err, "unsupported_capability", http.StatusBadRequest)
+	}
 
 	proxyAddr := ""
 	if p != nil && p.Channel != nil && p.Channel.Proxy != nil {
 		proxyAddr = *p.Channel.Proxy
 	}
-	dialCtx, cancel := context.WithTimeout(context.Background(), config.ConnectTimeout())
+	dialCtx, cancel := context.WithTimeout(requestCtx, config.ConnectTimeout())
 	defer cancel()
 	wsConn, err := wsconn.DialManaged(dialCtx, authUrl, nil, xunfeiWSConfig(),
 		wsconn.WithHandshakeTimeout(config.ConnectTimeout()),
 		wsconn.WithProxyURL(proxyAddr),
 	)
 	if err != nil {
-		return nil, common.ErrorWrapper(err, "ws_request_failed", http.StatusInternalServerError)
+		return nil, nil, common.ErrorWrapper(err, "ws_request_failed", http.StatusInternalServerError)
 	}
 
-	return wsConn, nil
+	return wsConn, xunfeiRequest, nil
 }
 
 func xunfeiWSConfig() wsconn.Config {
@@ -104,20 +111,33 @@ func xunfeiWSConfig() wsconn.Config {
 	}
 }
 
-func sendXunfeiWSJSONRequest[T any](conn *wsconn.ManagedConn, data any, handlerPrefix requester.HandlerPrefix[T]) (*xunfeiWSReader[T], *types.OpenAIErrorWithStatusCode) {
+func sendXunfeiWSJSONRequest[T any](ctx context.Context, conn *wsconn.ManagedConn, data any, handlerPrefix requester.HandlerPrefix[T]) (*xunfeiWSReader[T], *types.OpenAIErrorWithStatusCode) {
+	closeOnCancel := func() {
+		conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "ctx_done", Err: ctx.Err()})
+	}
+	if err := ctx.Err(); err != nil {
+		closeOnCancel()
+		return nil, common.ErrorWrapper(err, "ws_request_failed", http.StatusInternalServerError)
+	}
+	stopCancellation := context.AfterFunc(ctx, closeOnCancel)
+	defer stopCancellation()
 	payload, err := json.Marshal(data)
 	if err != nil {
+		conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "xunfei_request_build_failed"})
 		return nil, common.ErrorWrapper(err, "ws_request_failed", http.StatusInternalServerError)
 	}
 	if err := conn.WriteMessage(wsconn.TextMessage, payload); err != nil {
+		conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "xunfei_request_write_failed", Err: err})
 		return nil, common.ErrorWrapper(err, "ws_request_failed", http.StatusInternalServerError)
 	}
 	return &xunfeiWSReader[T]{
+		ctx:           ctx,
 		conn:          conn,
 		handlerPrefix: handlerPrefix,
 		DataChan:      make(chan T, 1),
 		ErrChan:       make(chan error, 1),
 		frameChan:     make(chan []byte, 128),
+		done:          make(chan struct{}),
 	}, nil
 }
 
@@ -130,10 +150,30 @@ func (stream *xunfeiWSReader[T]) Recv() (<-chan T, <-chan error) {
 }
 
 func (stream *xunfeiWSReader[T]) Close() {
-	if stream == nil || stream.conn == nil {
+	if stream == nil {
+		return
+	}
+	if stream.conn == nil {
+		stream.closeFrameChan()
 		return
 	}
 	stream.conn.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "xunfei_reader_close"})
+}
+
+func (stream *xunfeiWSReader[T]) CloseAndDrain() {
+	if stream == nil {
+		return
+	}
+	data, streamErrors := stream.Recv()
+	stream.Close()
+	for {
+		select {
+		case <-data:
+		case <-streamErrors:
+		case <-stream.done:
+			return
+		}
+	}
 }
 
 func (stream *xunfeiWSReader[T]) runPump() {
@@ -151,28 +191,28 @@ func (stream *xunfeiWSReader[T]) runPump() {
 			}
 		},
 		OnClose: func(info wsconn.CloseInfo) {
+			if info.Kind != wsconn.CloseKindNormal {
+				var err error
+				if info.Err != nil {
+					err = info.Err
+				} else {
+					err = io.EOF
+				}
+				select {
+				case stream.ErrChan <- err:
+				default:
+				}
+			}
 			stream.closeFrameChan()
-			if info.Kind == wsconn.CloseKindNormal {
-				return
-			}
-			var err error
-			if info.Err != nil {
-				err = info.Err
-			} else {
-				err = io.EOF
-			}
-			select {
-			case stream.ErrChan <- err:
-			default:
-			}
 		},
-	}.Run(context.Background())
+	}.Run(stream.ctx)
 }
 
 func (stream *xunfeiWSReader[T]) processFrames() {
 	if stream == nil {
 		return
 	}
+	defer stream.finish()
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			logger.SysError(fmt.Sprintf("xunfei websocket handler panic: %v", recovered))
@@ -195,6 +235,17 @@ func (stream *xunfeiWSReader[T]) processFrames() {
 	}
 }
 
+func (stream *xunfeiWSReader[T]) finish() {
+	if stream == nil {
+		return
+	}
+	stream.finishOnce.Do(func() {
+		if stream.done != nil {
+			close(stream.done)
+		}
+	})
+}
+
 func (stream *xunfeiWSReader[T]) closeFrameChan() {
 	if stream == nil {
 		return
@@ -204,13 +255,16 @@ func (stream *xunfeiWSReader[T]) closeFrameChan() {
 	})
 }
 
-func (p *XunfeiProvider) convertFromChatOpenai(request *types.ChatCompletionRequest) *XunfeiChatRequest {
+func (p *XunfeiProvider) convertFromChatOpenai(request *types.ChatCompletionRequest) (*XunfeiChatRequest, error) {
+	if err := validateXunfeiChatRequest(request); err != nil {
+		return nil, err
+	}
 	messages := make([]XunfeiMessage, 0, len(request.Messages))
 	for _, message := range request.Messages {
-		if message.FunctionCall != nil || message.ToolCalls != nil {
+		if message.FunctionCall != nil || len(message.ToolCalls) > 0 {
 			useToolName := ""
 			useToolArgs := ""
-			if message.ToolCalls != nil {
+			if len(message.ToolCalls) > 0 {
 				useToolName = message.ToolCalls[0].Function.Name
 				useToolArgs = message.ToolCalls[0].Function.Arguments
 			} else {
@@ -254,21 +308,43 @@ func (p *XunfeiProvider) convertFromChatOpenai(request *types.ChatCompletionRequ
 	xunfeiRequest.Parameter.Chat.TopK = request.N
 	xunfeiRequest.Parameter.Chat.MaxTokens = request.MaxCompletionTokens
 	xunfeiRequest.Payload.Message.Text = messages
-	return &xunfeiRequest
+	return &xunfeiRequest, nil
 }
 
-func (h *xunfeiHandler) convertToChatOpenai(stream requester.StreamReaderInterface[XunfeiChatResponse]) (*types.ChatCompletionResponse, *types.OpenAIErrorWithStatusCode) {
+func validateXunfeiChatRequest(request *types.ChatCompletionRequest) error {
+	if request == nil {
+		return errors.New("Xunfei requires a Chat request")
+	}
+	for _, message := range request.Messages {
+		if len(message.ToolCalls) == 0 {
+			continue
+		}
+		if len(message.ToolCalls) != 1 || message.ToolCalls[0] == nil || message.ToolCalls[0].Function == nil ||
+			(message.ToolCalls[0].Type != "" && message.ToolCalls[0].Type != types.ToolChoiceTypeFunction) || message.ToolCalls[0].Custom != nil {
+			return errors.New("Xunfei cannot represent these Chat tool calls")
+		}
+	}
+	for _, tool := range request.Tools {
+		if tool == nil || tool.Function.Name == "" || (tool.Type != "" && tool.Type != types.ToolChoiceTypeFunction) {
+			return errors.New("Xunfei cannot represent this Chat tool")
+		}
+	}
+	return nil
+}
+
+func (h *xunfeiHandler) convertToChatOpenai(ctx context.Context, stream requester.StreamReaderInterface[XunfeiChatResponse]) (*types.ChatCompletionResponse, *types.OpenAIErrorWithStatusCode) {
 	var content string
 	var xunfeiResponse XunfeiChatResponse
 	dataChan, errChan := stream.Recv()
-	defer stream.Close()
+	defer requester.CloseAndDrainStream(stream)
 
 	appendResponse := func(response XunfeiChatResponse) {
-		if len(response.Payload.Choices.Text) == 0 {
-			return
+		if len(response.Payload.Choices.Text) > 0 {
+			content += response.Payload.Choices.Text[0].Content
+		} else {
+			response.Payload.Choices.Text = xunfeiResponse.Payload.Choices.Text
 		}
 		xunfeiResponse = response
-		content += xunfeiResponse.Payload.Choices.Text[0].Content
 	}
 	drainBufferedData := func() {
 		for dataChan != nil {
@@ -288,6 +364,8 @@ func (h *xunfeiHandler) convertToChatOpenai(stream requester.StreamReaderInterfa
 	stop := false
 	for !stop {
 		select {
+		case <-ctx.Done():
+			return nil, common.ErrorWrapper(ctx.Err(), "xunfei_failed", http.StatusInternalServerError)
 		case response, ok := <-dataChan:
 			if !ok {
 				dataChan = nil
@@ -359,7 +437,7 @@ func (h *xunfeiHandler) convertToChatOpenai(stream requester.StreamReaderInterfa
 		Model:   h.Request.Model,
 		Created: utils.GetTimestamp(),
 		Choices: []types.ChatCompletionChoice{choice},
-		Usage:   &xunfeiResponse.Payload.Usage.Text,
+		Usage:   xunfeiResponse.Payload.Usage.Text,
 	}
 
 	return fullTextResponse, nil
@@ -387,9 +465,13 @@ func (h *xunfeiHandler) handlerData(rawLine *[]byte, isFinished *bool) (*XunfeiC
 		*isFinished = true
 	}
 
-	h.Usage.PromptTokens = xunfeiChatResponse.Payload.Usage.Text.PromptTokens
-	h.Usage.CompletionTokens = xunfeiChatResponse.Payload.Usage.Text.CompletionTokens
-	h.Usage.TotalTokens = xunfeiChatResponse.Payload.Usage.Text.TotalTokens
+	if *isFinished && xunfeiChatResponse.Payload.Usage.Text != nil && h.Usage != nil {
+		usage := *xunfeiChatResponse.Payload.Usage.Text
+		usage.MarkProviderReported()
+		if usage.HasProviderUsage() {
+			*h.Usage = usage
+		}
+	}
 
 	return &xunfeiChatResponse, nil
 }

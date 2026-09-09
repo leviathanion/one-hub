@@ -62,7 +62,7 @@ type XunfeiChatResponse struct {
 			Text   []XunfeiChatResponseTextItem `json:"text"`
 		} `json:"choices"`
 		Usage struct {
-			Text types.Usage `json:"text"`
+			Text *types.Usage `json:"text"`
 		} `json:"usage"`
 	} `json:"payload"`
 }
