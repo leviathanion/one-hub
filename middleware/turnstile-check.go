@@ -18,7 +18,8 @@ type turnstileCheckResponse struct {
 
 func TurnstileCheck() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if config.TurnstileCheckEnabled {
+		options := config.GlobalOption.RuntimeSnapshot()
+		if options.Bool("TurnstileCheckEnabled", config.TurnstileCheckEnabled) {
 			session := sessions.Default(c)
 			turnstileChecked := session.Get("turnstile")
 			if turnstileChecked != nil {
@@ -35,7 +36,7 @@ func TurnstileCheck() gin.HandlerFunc {
 				return
 			}
 			rawRes, err := http.PostForm("https://challenges.cloudflare.com/turnstile/v0/siteverify", url.Values{
-				"secret":   {config.TurnstileSecretKey},
+				"secret":   {options.String("TurnstileSecretKey", config.TurnstileSecretKey)},
 				"response": {response},
 				"remoteip": {c.ClientIP()},
 			})

@@ -38,7 +38,8 @@ func CreateCheckImgProcess(modelName string) *CheckImgProcess {
 		ModelName: modelName,
 	}
 	id := utils.GetRandomString(10)
-	c.ImageUrl = fmt.Sprintf("%s/api/image/%s", config.ServerAddress, id)
+	serverAddress := config.GlobalOption.RuntimeSnapshot().String("ServerAddress", config.ServerAddress)
+	c.ImageUrl = fmt.Sprintf("%s/api/image/%s", serverAddress, id)
 	c.ID = id
 	accessRecord := make([]*AccessRecord, 0)
 	err := cache.SetCache(fmt.Sprintf(checkKey, id), accessRecord, 10*time.Minute)

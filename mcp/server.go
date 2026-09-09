@@ -21,6 +21,7 @@ type Server struct {
 }
 
 func NewMcpServer() *Server {
+	systemName := config.GlobalOption.RuntimeSnapshot().String("SystemName", config.SystemName)
 	messageEndpointURL := "/mcp/message"
 	sseTransport, sseHandler, err := transport.NewSSEServerTransportAndHandler(messageEndpointURL)
 	if err != nil {
@@ -33,7 +34,7 @@ func NewMcpServer() *Server {
 		return nil
 	}
 	sseServer, err := server.NewServer(sseTransport, server.WithServerInfo(protocol.Implementation{
-		Name:    config.SystemName + "-MCP SERVER",
+		Name:    systemName + "-MCP SERVER",
 		Version: config.Version,
 	}))
 	if err != nil {
@@ -41,7 +42,7 @@ func NewMcpServer() *Server {
 		return nil
 	}
 	streamableServer, err := server.NewServer(streamableTransport, server.WithServerInfo(protocol.Implementation{
-		Name:    config.SystemName + "-MCP SERVER",
+		Name:    systemName + "-MCP SERVER",
 		Version: config.Version,
 	}))
 	if err != nil {

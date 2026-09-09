@@ -78,7 +78,8 @@ func GetAllSafeToolsName() []string {
 //   - CheckResult: 检查结果，包括是否安全、风险级别、原因和详细信息
 //   - error: 检查过程中发生的错误
 func CheckContentByToolName(toolName string, content interface{}) (types.CheckResult, error) {
-	if config.EnableSafe == false {
+	options := config.GlobalOption.RuntimeSnapshot()
+	if !options.Bool("EnableSafe", config.EnableSafe) {
 		result := types.CheckResult{
 			IsSafe:    true,
 			RiskLevel: 0,
@@ -127,7 +128,8 @@ func CheckContentByToolName(toolName string, content interface{}) (types.CheckRe
 //   - CheckResult: 检查结果，包括是否安全、风险级别、原因和详细信息
 //   - error: 检查过程中发生的错误
 func CheckContent(content interface{}) (types.CheckResult, error) {
-	if config.EnableSafe == false {
+	options := config.GlobalOption.RuntimeSnapshot()
+	if !options.Bool("EnableSafe", config.EnableSafe) {
 		result := types.CheckResult{
 			IsSafe:    true,
 			RiskLevel: 0,
@@ -143,12 +145,13 @@ func CheckContent(content interface{}) (types.CheckResult, error) {
 	result.Code = types.SafeDefaultSuccessCode
 	result.Reason = types.SafeDefaultErrorMessage
 	result.Details = make([]string, 0)
-	tool, err := getTool(config.SafeToolName)
+	toolName := options.String("SafeToolName", config.SafeToolName)
+	tool, err := getTool(toolName)
 	if err != nil {
 		result.RiskLevel = 1
 		result.Code = types.SafeDefaultErrorCode
 		result.Reason = types.SafeDefaultErrorMessage
-		logger.SysLog(fmt.Sprintf("Safety tool %s not found", config.SafeToolName))
+		logger.SysLog(fmt.Sprintf("Safety tool %s not found", toolName))
 		return result, err
 	}
 
@@ -158,7 +161,7 @@ func CheckContent(content interface{}) (types.CheckResult, error) {
 		result.RiskLevel = 1
 		result.Code = types.SafeDefaultErrorCode
 		result.Reason = types.SafeDefaultErrorMessage
-		logger.SysLog(fmt.Sprintf("Safety tool %s convert to string failed", config.SafeToolName))
+		logger.SysLog(fmt.Sprintf("Safety tool %s convert to string failed", toolName))
 		return result, err
 	}
 

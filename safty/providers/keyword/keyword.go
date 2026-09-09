@@ -45,7 +45,7 @@ func (k *KeywordChecker) Name() string {
 //   - error: 初始化过程中发生的错误
 func (k *KeywordChecker) Init() error {
 	// 特殊供应商可以在这里进行相关配置初始化
-	k.keywords = config.SafeKeyWords
+	k.keywords = config.GlobalOption.RuntimeSnapshot().Strings("SafeKeyWords", config.SafeKeyWords, "\n")
 	logger.SysLog(fmt.Sprintf("SafeTools %s loda keyword：%d pcs", k.Name(), len(k.keywords)))
 	return nil
 }
@@ -67,7 +67,8 @@ func (k *KeywordChecker) Check(data string) (types.CheckResult, error) {
 		Details:   make([]string, 0),
 	}
 
-	for _, keyword := range config.SafeKeyWords {
+	options := config.GlobalOption.RuntimeSnapshot()
+	for _, keyword := range options.Strings("SafeKeyWords", k.keywords, "\n") {
 		if strings.Contains(strings.ToLower(data), strings.ToLower(keyword)) {
 			result.IsSafe = false
 			result.Details = append(result.Details, types.SafeDefaultErrorMessage)

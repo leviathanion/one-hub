@@ -9,9 +9,10 @@ import (
 
 func APIEnabled(types string) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		options := config.GlobalOption.RuntimeSnapshot()
 		switch types {
 		case "gemini":
-			if !config.GeminiAPIEnabled {
+			if !options.Bool("GeminiAPIEnabled", config.GeminiAPIEnabled) {
 				c.JSON(http.StatusForbidden, gin.H{
 					"error": gin.H{
 						"code":    500,
@@ -23,7 +24,7 @@ func APIEnabled(types string) gin.HandlerFunc {
 				return
 			}
 		case "claude":
-			if !config.ClaudeAPIEnabled {
+			if !options.Bool("ClaudeAPIEnabled", config.ClaudeAPIEnabled) {
 				c.JSON(http.StatusForbidden, gin.H{
 					"type": "one_hub_error",
 					"error": gin.H{
