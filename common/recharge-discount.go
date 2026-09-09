@@ -2,6 +2,7 @@ package common
 
 import (
 	"encoding/json"
+	"one-api/common/config"
 	"one-api/common/logger"
 )
 
@@ -37,7 +38,20 @@ func UpdateRechargeDiscountByJSONString(jsonStr string) error {
 }
 
 func GetRechargeDiscount(name string) float64 {
-	ratio, ok := RechargeDiscount[name]
+	return GetRechargeDiscountFromSnapshot(config.GlobalOption.RuntimeSnapshot(), name)
+}
+
+func GetRechargeDiscountFromSnapshot(options *config.RuntimeOptionsSnapshot, name string) float64 {
+	discounts := make(map[string]float64)
+	if options == nil {
+		options = config.GlobalOption.RuntimeSnapshot()
+	}
+	raw := options.String("RechargeDiscount", config.RechargeDiscount)
+	if err := json.Unmarshal([]byte(raw), &discounts); err != nil {
+		logger.SysError("invalid recharge discount runtime option: " + err.Error())
+		return 1
+	}
+	ratio, ok := discounts[name]
 	if !ok {
 		logger.SysError("recharge discount not found: " + name)
 		return 1
