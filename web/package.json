@@ -59,6 +59,7 @@
   "scripts": {
     "dev": "vite",
     "start": "vite preview",
+    "test": "node --test",
     "build": "vite build --outDir build",
     "i18n": "lobe-i18n",
     "lint": "eslint \"src/**/*.{js,jsx,ts,tsx}\"",
