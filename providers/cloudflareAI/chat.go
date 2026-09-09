@@ -42,7 +42,8 @@ func (p *CloudflareAIProvider) CreateChatCompletionStream(request *types.ChatCom
 	defer req.Body.Close()
 
 	// 发送请求
-	resp, errWithCode := p.Requester.SendRequestRaw(req)
+	streamRequester := p.Requester.ForHTTPProfile(requester.HTTPProfileLongStream)
+	resp, errWithCode := streamRequester.SendRequestRaw(req)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -52,7 +53,7 @@ func (p *CloudflareAIProvider) CreateChatCompletionStream(request *types.ChatCom
 		Request: request,
 	}
 
-	return requester.RequestStream[string](p.Requester, resp, chatHandler.handlerStream)
+	return requester.RequestStream[string](streamRequester, resp, chatHandler.handlerStream)
 }
 
 func (p *CloudflareAIProvider) getChatRequest(request *types.ChatCompletionRequest) (*http.Request, *types.OpenAIErrorWithStatusCode) {
@@ -100,10 +101,7 @@ func (p *CloudflareAIProvider) convertToChatOpenai(response *ChatRespone, reques
 		}},
 	}
 
-	completionTokens := common.CountTokenText(response.Result.Response, request.Model)
-
-	p.Usage.CompletionTokens = completionTokens
-	p.Usage.TotalTokens = p.Usage.PromptTokens + completionTokens
+	cloudflareUsageToOpenAI(response.Result.Usage, p.Usage)
 	openaiResponse.Usage = p.Usage
 
 	return
@@ -150,6 +148,7 @@ func (h *CloudflareAIStreamHandler) handlerStream(rawLine *[]byte, dataChan chan
 		return
 	}
 
+	cloudflareUsageToOpenAI(chatResponse.Usage, h.Usage)
 	h.convertToOpenaiStream(chatResponse, dataChan, false)
 }
 
@@ -173,10 +172,19 @@ func (h *CloudflareAIStreamHandler) convertToOpenaiStream(chatResponse *ChatResu
 		choice.FinishReason = types.FinishReasonStop
 	} else {
 		choice.Delta.Content = chatResponse.Response
-		h.Usage.TextBuilder.WriteString(chatResponse.Response)
 	}
 
 	streamResponse.Choices = []types.ChatCompletionStreamChoice{choice}
 	responseBody, _ := json.Marshal(streamResponse)
 	dataChan <- string(responseBody)
+}
+
+// Cloudflare 已返回的计量快照直接替换此前快照；缺字段保留原始 presence，
+// 由共享 reducer 决定是否具备完整证据，不用正文长度补齐。
+func cloudflareUsageToOpenAI(reported *types.Usage, usage *types.Usage) {
+	if reported == nil || usage == nil {
+		return
+	}
+	*usage = *reported
+	usage.MarkProviderReported()
 }

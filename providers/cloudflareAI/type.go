@@ -44,7 +44,8 @@ type ChatRespone struct {
 }
 
 type ChatResult struct {
-	Response string `json:"response"`
+	Response string       `json:"response"`
+	Usage    *types.Usage `json:"usage,omitempty"`
 }
 
 type AudioResponse struct {
