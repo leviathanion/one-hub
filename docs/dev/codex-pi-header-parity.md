@@ -134,7 +134,7 @@ Codex HTTP `/responses` body 同样包含 `client_metadata`，主要 keys 为 `x
 
 ## one-hub ResponsesWS 对比 Codex
 
-当前 one-hub 的 `GET /v1/responses` Codex upstream 已不再走 `getRealtimeHeaders()` / mutable header bag。provider-facing contract 是 `responsesws.OpenRequest{InboundHeaders, FirstFrame, Principal, ...}`，由 `providers/codex/wire` 在 open 阶段一次性规划 Codex Official WS handshake；`TransportModeResponsesHTTPBridge` 会被 Codex provider 直接拒绝。
+当前 one-hub 的 `GET /v1/responses` Codex upstream 已不再走 `getRealtimeHeaders()` / mutable header bag。provider-facing contract 是 `responsesws.OpenRequest{InboundHeaders, FirstFrame, Principal, ...}`，由 `providers/codex/wire` 在 open 阶段规划 Codex Official WS handshake。Codex 的所有 WebSocket 入口均直接连接上游 WebSocket，握手失败直接返回错误。
 
 | 字段 | 当前 one-hub 生成逻辑 | 不一致信息 |
 | --- | --- | --- |

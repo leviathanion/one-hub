@@ -65,16 +65,15 @@ ResponsesWS native  -> WS handshake parity + response.create client_metadata par
 
 不要把 ordinary `/responses` 的 body preservation 规则套到 `/responses/compact`。
 
-## 当前问题
+## 改造背景
 
-当前 Codex provider 的 header / body 构造散落在多处：
+改造前，Codex provider 的 header / body 构造散落在多处；以下用于说明设计背景，不是当前待办清单。HTTP↔WS bridge 已删除：
 
 - `providers/codex/base.go:getRequestHeaderBag`
 - `providers/codex/base.go:filterAndPassthroughClientHeaders`
 - `providers/codex/chat.go:applyDefaultHeaders`
 - `providers/codex/realtime.go:getRealtimeHeaders`
 - `providers/codex/responses.go:getResponsesOperationRequestWithSession`
-- `providers/codex/responses_ws_upstream.go:getResponsesWSBridgeRequest`
 
 这些函数把四类语义混在一张 mutable header map 里：
 
@@ -400,7 +399,6 @@ type OpenRequest struct {
     SelectedModel      string
     UpstreamSessionID  string
     PreviousResponseID string
-    Transport          runtimesession.TransportMode
     ChannelID          int
     Diagnostics        DiagnosticHook
 }
@@ -419,25 +417,7 @@ provider 在 OpenResponsesWS 中完成 WS handshake header plan
 provider 不允许在 Send path 中临时构造 handshake identity
 ```
 
-`OpenRequest.Transport` 在 Codex Official path 中只是 validation-only 输入，不是 upstream dialect selector。
-
-Allowed:
-
-```text
-empty
-responses_ws
-```
-
-Forbidden:
-
-```text
-responses_http_bridge
-realtime
-legacy
-any unknown value
-```
-
-Provider 不允许根据 `Transport` 分支到另一个 upstream dialect。Forbidden transport 返回 `400 invalid_request_error` 或 `426 responses_ws_unsupported_for_channel`，但永远不 fallback 到 HTTP bridge。
+`OpenResponsesWS` 只建立原生 WebSocket，不接受 transport 选择参数；不支持 WS 的渠道由能力检查在 provider work 前拒绝。
 
 `FirstFrame` 仍然不等于“已经发送给 upstream”。open 阶段只用它解析 identity 和 handshake。后续 send 阶段使用同一 `Identity` 对 first frame metadata 做 raw-preserving patch。
 
@@ -930,7 +910,7 @@ input
 `/v1/chat/completions` 通过 Responses provider fallback 时使用同一个 contract，但它的 ingress 没有 raw Responses body 可保。适配边界的规则：
 
 1. **唯一 sanctioned 的 typed→raw 合成点**。适配器把 ChatCompletion 请求转换为 typed Responses request，在转换边界一次性合成 raw envelope（typed marshal → `jsonobject.Parse`），然后交给与 `/v1/responses` ingress 完全相同的 planner。合成发生在 planner 之前，planner 及其之后不存在任何 typed marshal。`/v1/responses` ingress 永远不经过该路径。
-2. **converter 是合成 body 的作者，拥有冲突解决权**。合成 body 必须预先满足 BodyPlanner 的全部 reject 规则；planner 不为任何来源放宽。chat 客户端常规地同时携带 `temperature` 和 `top_p`，converter 在转换边界显式取 `temperature`、丢弃 `top_p`，并产生 `source=chat_adapter` 的 decision。这不是 hidden repair：repair 禁令针对的是"代理修改客户端拥有的 Responses body"；chat 路径的 Responses body 本来就是代理合成的。
+2. **converter 只负责有明确语义的协议映射**。`temperature` 和 `top_p` 都是上游拥有的采样参数，转换器与 BodyPlanner 均原样保留，不在代理内复制上游参数校验或静默丢字段。
 3. **instructions 归属随 ingress 变化**。"client owns instructions" 只对 Responses ingress 成立；chat 客户端无法表达 Codex instructions，system/developer message 到 `instructions` / `input` 的映射是转换契约的一部分，必须显式定义并测试，不允许在 planner 之后隐式注入。
 
 control plane 差异：
@@ -1049,7 +1029,6 @@ Prompt cache patch 规则：
 Explicit rejects:
 
 ```text
-temperature and top_p both present -> 400 invalid_request_error
 context_management present         -> 400 invalid_request_error
 truncation present                 -> 400 invalid_request_error
 client_metadata not object         -> 400 invalid_request_error
@@ -1063,11 +1042,11 @@ No silent semantic repair.
 
 | Existing behavior | Final decision | Reason |
 | --- | --- | --- |
-| `request.Model = normalizeCodexModelName` | keep as `set /model` | provider model mapping is an upstream authority decision |
+| `request.Model` | keep as `set /model` | model selection and aliases come from channel configuration; the provider only trims surrounding whitespace |
 | `stream=true` | keep as `set /stream` | Codex official responses path is streaming |
 | `store=false` | keep as `set /store` | official ChatGPT Codex path does not use OpenAI API store semantics |
 | `ensureCodexIncludes` | keep narrowly | only append `reasoning.encrypted_content` when `/reasoning` exists |
-| `temperature/top_p` prefers temperature | move to chat adapter boundary | Responses ingress 上是 hidden repair，双字段返回 400；chat 适配器作为合成 body 的作者，在转换边界显式取 temperature、弃 top_p |
+| `temperature` / `top_p` | preserve | 参数语义归上游所有，Responses ingress 与 Chat 适配器均不静默改写 |
 | strip `context_management` | delete | hidden repair; unsupported field returns 400 |
 | strip `truncation` | delete | hidden repair; unsupported field returns 400 |
 | `ensureStablePromptCacheKey` | delete from HTTP Official body planning | prompt cache key decision must be explicit `Policy.PromptCache` before BodyPlanner; no provider-late mutation |
@@ -1263,7 +1242,7 @@ principal StableID
 | singleton official header 多值 | 400 `invalid_request_error` |
 | official header 非空但非法 | 400 `invalid_request_error` |
 | identity field missing/empty | 默认 omit；显式 `auto_generate` 时 fallback |
-| `temperature` 和 `top_p` 同时存在 | 400 `invalid_request_error` |
+| `temperature` 和 `top_p` 同时存在 | 原样转发，由上游决定参数语义 |
 | unsupported body field `context_management` | 400 `invalid_request_error` |
 | unsupported body field `truncation` | 400 `invalid_request_error` |
 | channel credential 缺 token | 401/502，沿用 provider token error 语义 |
@@ -1284,7 +1263,6 @@ providers/codex/responses.go 中 Conversation_id / session_id prompt_cache proje
 providers/codex/responses.go:ensureStablePromptCacheKey in upstream body planning
 providers/codex/responses.go:normalizeCodexBuiltinTools in Codex Official path
 providers/codex/responses.go:adaptCodexCLI
-providers/codex/responses_ws_upstream.go Codex Official bridge path
 codexHeaderBag as cross-function mutable header carrier
 ```
 
@@ -1436,7 +1414,7 @@ responses.ws.open
 3. ordinary `/responses` patch `model` / `stream` / `store` 后不丢字段。
 4. duplicate top-level key 400。
 5. `client_metadata` 非 object 400。
-6. 同时存在 `temperature` 和 `top_p` 返回 400。
+6. 同时存在 `temperature` 和 `top_p` 时均原样保留。
 7. 存在 `context_management` 返回 400。
 8. 存在 `truncation` 返回 400。
 9. 不再注入默认 instructions。
@@ -1463,11 +1441,11 @@ responses.ws.open
 5. WS body 缺 `session_id` / `thread_id` 时只用已有或显式生成的 resolved identity 补齐。
 6. WS body 默认不 stamp `x-codex-ws-stream-request-start-ms`；`auto_generate.ws_stream_request_start_ms=true` 时每次 send 前 stamp。
 7. Codex Official path 不走 HTTP bridge。
-8. `OpenRequest.Transport=responses_http_bridge` 直接拒绝，不触发 bridge fallback。
+8. WS 握手失败直接返回错误，不触发 HTTP fallback。
 
 ### Chat 适配器测试
 
-1. chat 请求同时携带 `temperature` 和 `top_p` 时，合成 Responses body 只含 `temperature`，并产生 `source=chat_adapter` decision，不触发 planner 400。
+1. chat 请求同时携带 `temperature` 和 `top_p` 时，合成 Responses body 保留两者。
 2. 合成 body 满足 planner 全部 reject 规则；planner 对 chat 合成 body 与 Responses ingress body 使用同一套规则，无放宽分支。
 3. `/v1/responses` ingress 不经过 typed→raw 合成路径；合成只发生在 chat 适配边界。
 4. system/developer message 到 `instructions` / `input` 的映射符合转换契约。
@@ -1535,7 +1513,7 @@ providers/base must not expose OpenResponsesWS(ctx, modelName, options) contract
 11. HTTP Responses provider contract 不再暴露 typed request 作为请求真相。
 12. ResponsesWS open contract 明确携带 inbound headers 和 first frame。
 13. ResponsesWS `Transport` 在 Codex Official path 只做 validation，不作为 alternate dialect selector。
-14. chat→responses 合成 body 满足与 Responses ingress 相同的 planner 约束；`temperature` / `top_p` 冲突在转换边界解决，不触发 400。
+14. chat→responses 与 Responses ingress 都保留 `temperature` / `top_p`，参数语义由上游拥有。
 
 ## 取舍
 

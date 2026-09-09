@@ -42,7 +42,7 @@ Codex 渠道当前通过 OpenAI 兼容接口使用，支持以下路径：
 
 ```json
 {
-  "prompt_cache_key_strategy": "off"
+  "execution_session_ttl_seconds": 600
 }
 ```
 
@@ -64,7 +64,7 @@ Codex 渠道当前通过 OpenAI 兼容接口使用，支持以下路径：
 - `密钥`
   填 Codex OAuth 凭据 JSON，或者使用上面的页面按钮导入/授权。
 - `Codex 配置(JSON)`
-  这是 Codex 渠道的额外配置，对应后端的 `channel.Other`。`websocket_mode` 就是在这里配置，不是全局配置项。大多数用户只会改这里，不需要去碰系统级高级项。
+  这是 Codex 渠道的额外配置，对应后端的 `channel.Other`。这里不提供 WebSocket 到 HTTP 的传输选择配置。大多数用户只会改这里，不需要去碰系统级高级项。
 - `模型`
   这里填写你希望这个渠道承接的模型名，例如 `gpt-5`。如果你给多个渠道分流，建议按实际可用模型填写，避免把不支持的模型也挂进来。
 - `用户组`
@@ -76,13 +76,17 @@ Codex 渠道当前通过 OpenAI 兼容接口使用，支持以下路径：
 
 | 字段 | 是否必填 | 默认值 | 作用 |
 | --- | --- | --- | --- |
-| `prompt_cache_key_strategy` | 否 | `off` | legacy Realtime/bridge 路径的渠道侧 prompt-cache 策略；Official HTTP `/v1/responses` 的自动生成必须配置 `CodexRoutingHintSetting` |
-| `websocket_mode` | 否 | `auto` | 控制 Codex Realtime websocket 和 Codex ResponsesWS native 是否可用；`off` 会让 Codex ResponsesWS 不可用 |
-| `responses_ws_transport` | 否 | `native` | Codex ResponsesWS 仅支持 `native`；`http_bridge` 不是 Codex 支持模式，保存配置时会被拒绝 |
 | `execution_session_ttl_seconds` | 否 | `600` | Codex Realtime execution session 空闲保留时长 |
-| `websocket_retry_cooldown_seconds` | 否 | `120` | Codex Realtime websocket 失败后的 bridge 冷却 |
 | `self_hosted` | 否 | `false` | 仅允许 Codex Realtime 使用私有或本地自建上游 |
-| `responses_ws_self_hosted` | 否 | `false` | 仅允许 ResponsesWS 使用私有或本地自建上游 |
+| `responses_ws_self_hosted` | 否 | `false` | 允许 ResponsesWS 使用私有或本地自建上游；在 `Codex 配置(JSON)` 中设置 |
+
+`Codex 配置(JSON)` 就是 `channel.Other` 的页面编辑入口，没有另一个 ResponsesWS 开关或数据库列。例如：
+
+```json
+{
+  "responses_ws_self_hosted": true
+}
+```
 
 ### `User-Agent` 透传与兜底优先级
 
@@ -133,7 +137,7 @@ Codex 渠道会优先使用客户端请求中的有效 `User-Agent`；客户端�
 
 - `设置 -> 运营设置 -> Codex 高级配置`
 
-这 4 项仍然属于根管理员全局选项，底层依旧走 `options` 表和 `/api/option/` 接口存储；前端页面只是把它们接到了现有全局选项保存链路上。
+这 4 项属于根管理员全局选项，通过 `/api/option/` 管理接口保存。每次写入都基于当前 options version 做 CAS；所有实例独立观察数据库 version 并原子发布完整运行时快照。
 
 如果你只是通过 Web 页面正常创建 Codex 渠道，一般不需要额外配置这些项。只有你明确要调优 Responses/Realtime 的渠道亲和、等待首选渠道回归等行为时，才需要额外调整。
 
@@ -150,7 +154,7 @@ Codex 渠道会优先使用客户端请求中的有效 `User-Agent`；客户端�
 - `ChannelAffinitySetting`
   JSON 文本框。用于控制渠道亲和缓存自身的开关、TTL、容量和规则。
 
-其中两个 JSON 文本框支持直接留空；留空时会回退到后端默认值。
+`ChannelAffinitySetting` 可以在页面选择“跟随后端默认值”。该操作删除显式 override；显式空字符串仍是一个 override，不再兼作“继承默认值”。
 
 如果你完全不额外修改这 4 个全局项，当前默认等效于：
 
@@ -175,7 +179,7 @@ Codex 渠道会优先使用客户端请求中的有效 `User-Agent`；客户端�
 
 | 字段 | 是否必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `prompt_cache_key_strategy` | 否 | `off` | 控制 routing 层是否在 provider 选择前派生稳定的 `responses.prompt_cache_key` |
+| `prompt_cache_key_strategy` | 否 | `off` | 选路前的缓存 key 派生策略：`off`、`auto`、`session_id`、`token_id`、`user_id`、`auth_header`；客户端显式 key 优先 |
 | `model_regex` | 否 | 空 | 只对匹配该模型名正则的请求生效 |
 | `user_agent_regex` | 否 | 空 | 只对匹配该 `User-Agent` 正则的请求生效 |
 
@@ -212,17 +216,16 @@ Codex 渠道会优先使用客户端请求中的有效 `User-Agent`；客户端�
 
 1. 根管理员登录后的 Web 页面：`设置 -> 运营设置 -> Codex 高级配置`
 2. 根管理员登录后的全局选项接口 `PUT /api/option/`
-3. 直接写数据库 `options` 表中的 `CodexRoutingHintSetting`
 
-如果只是人工维护，优先用 Web 页面即可；只有批量变更、自动化部署或排障时，才更适合直接调接口或改库。
+如果只是人工维护，优先用 Web 页面；批量变更或自动化部署使用管理接口。直接修改 `options` 表不属于支持面。
 
-如果要一次同时改多个互相关联的字段，优先用 `PUT /api/option/batch` 保证原子更新；`PUT /api/option/` 更适合单项调整，或在已有错误配置上逐项修复。
+如果要一次同时改多个互相关联的字段，使用 `PUT /api/option/batch` 保证完整候选配置一次验证、一次提交。单项接口同样要求完整候选配置有效。
 
 它的值本身是一个 JSON 对象，但通过 `/api/option/` 提交时，`value` 字段仍然要用字符串传，也就是“JSON 字符串里再包一层 JSON”。
 
 如果你在 Web 页面里填写，则直接粘贴普通 JSON 即可，不需要再额外转义一层字符串。
 
-示例：把 Responses 的 pre-routing prompt cache affinity 打开，并只对 `gpt-5` 生效：
+示例：把 Responses 的 pre-routing prompt cache affinity 打开，不按模型名限制：
 
 ```bash
 curl --request PUT \
@@ -230,8 +233,9 @@ curl --request PUT \
   --header 'Content-Type: application/json' \
   --header 'Cookie: session=你的-root-登录会话' \
   --data '{
+    "expected_version": 12,
     "key": "CodexRoutingHintSetting",
-    "value": "{\"prompt_cache_key_strategy\":\"auto\",\"model_regex\":\"^gpt-5$\"}"
+    "value": "{\"prompt_cache_key_strategy\":\"auto\"}"
   }'
 ```
 
@@ -240,7 +244,7 @@ curl --request PUT \
 ```json
 {
   "prompt_cache_key_strategy": "auto",
-  "model_regex": "^gpt-5$",
+  "model_regex": "",
   "user_agent_regex": "CodexClient"
 }
 ```
@@ -248,18 +252,11 @@ curl --request PUT \
 查看当前是否生效，推荐用下面两个入口：
 
 - `GET /api/option/`
-  可以直接看到 `CodexRoutingHintSetting` 当前保存的原始字符串值
+  返回当前 version，以及每项的 `effective`、`override` 和 `source`。敏感项只返回 configured/source/version
 - `GET /api/option/channel_affinity_cache`
   可以同时看到当前 `ChannelAffinitySetting`、缓存后端、缓存条目数、以及等待首选渠道相关配置
 
-如果你需要把它和渠道级配置配合起来，推荐这样理解：
-
-- `CodexRoutingHintSetting`
-  决定 relay 层是否在 provider 选择前派生 `responses.prompt_cache_key`
-- `channel.Other.prompt_cache_key_strategy`
-  只保留 legacy Realtime/bridge 路径的渠道侧策略；不会让 Codex Official HTTP `/v1/responses` 在选中渠道后再生成 `prompt_cache_key`
-
-Official HTTP `/v1/responses` 的最佳实践是把自动生成策略放在 `CodexRoutingHintSetting`。这样 routing 命中的 key 和最终写给上游的 key 会一致。
+`CodexRoutingHintSetting` 在 provider 选择前派生 `responses.prompt_cache_key`，渠道不再维护另一套生成策略。
 
 ### `ChannelAffinitySetting` 完整配置
 
@@ -380,6 +377,28 @@ Official HTTP `/v1/responses` 的最佳实践是把自动生成策略放在 `Cod
       ]
     },
     {
+      "name": "chat-prompt-cache-key",
+      "enabled": true,
+      "kind": "chat",
+      "path_regex": "^/v1/chat/completions$",
+      "include_group": true,
+      "include_model": true,
+      "include_path": false,
+      "include_rule_name": true,
+      "ignore_preferred_cooldown": false,
+      "strict": false,
+      "skip_retry_on_failure": false,
+      "record_on_success": true,
+      "ttl_seconds": 0,
+      "key_sources": [
+        {
+          "source": "request_field",
+          "key": "prompt_cache_key",
+          "alias": "prompt_cache_key"
+        }
+      ]
+    },
+    {
       "name": "realtime-session",
       "enabled": true,
       "kind": "realtime",
@@ -409,6 +428,8 @@ Official HTTP `/v1/responses` 的最佳实践是把自动生成策略放在 `Cod
   ]
 }
 ```
+
+显式保存过 `rules` 数组的配置会原样保留，不会在升级时被后台补写默认规则。若该数组来自旧版本默认值，需要手动加入 `chat-prompt-cache-key`；只配置容量或 TTL、未显式提供 `rules` 时会使用当前完整默认值。
 
 ### `ChannelAffinitySetting` 配置模板
 
@@ -476,6 +497,23 @@ trade-off：
         {
           "source": "request_hint",
           "key": "responses.prompt_cache_key",
+          "alias": "prompt_cache_key"
+        }
+      ]
+    },
+    {
+      "name": "chat-prompt-cache-key",
+      "enabled": true,
+      "kind": "chat",
+      "path_regex": "^/v1/chat/completions$",
+      "include_group": true,
+      "include_model": true,
+      "include_rule_name": true,
+      "record_on_success": true,
+      "key_sources": [
+        {
+          "source": "request_field",
+          "key": "prompt_cache_key",
           "alias": "prompt_cache_key"
         }
       ]
@@ -726,158 +764,17 @@ trade-off：
 
 ## 推荐模板
 
-### 默认行为
+HTTP Responses 与 WebSocket 是独立入口。WebSocket 请求必须连接真实上游 WebSocket；握手失败直接返回错误，不发起 HTTP Responses 请求。
 
-不填写 `Codex 配置(JSON)` 时，默认等效于：
-
-```json
-{
-  "prompt_cache_key_strategy": "off"
-}
-```
-
-### 最常见：`websocket_mode` 怎么配
-
-填写位置：
-
-- `渠道 -> 新建/编辑 -> Codex -> Codex 配置(JSON)`
-
-这个字段控制 Codex Realtime websocket 和 Codex ResponsesWS native 是否可用。它不影响普通的 `/v1/responses` 和 `/v1/chat/completions`；但 `off` 会让 Codex ResponsesWS 返回 `unsupported`，因为 Codex ResponsesWS 当前只支持 native。
-
-推荐默认配置：
+渠道可配置会话空闲保留时间：
 
 ```json
 {
-  "websocket_mode": "auto"
+  "execution_session_ttl_seconds": 600
 }
 ```
 
-如果你希望“必须走 websocket，失败就直接报错”，可以改成：
-
-```json
-{
-  "websocket_mode": "force"
-}
-```
-
-Codex ResponsesWS 不支持 HTTP bridge。`responses_ws_transport` 只能留空或设置为 `native`；设置为 `http_bridge` 会在保存/校验时失败。`websocket_mode` 约束 Codex Realtime websocket 和 ResponsesWS native；ResponsesWS 不会静默从 native WS 切到 HTTP bridge。
-
-### 自动生成稳定缓存身份
-
-```json
-{
-  "prompt_cache_key_strategy": "auto"
-}
-```
-
-`auto` 的实际优先级是：
-
-1. 显式请求字段 `prompt_cache_key`
-2. 请求头 `x-session-id` / `session-id` / `session_id`
-3. 外部认证头
-4. One Hub 令牌 ID
-5. One Hub 用户 ID
-
-### 按 session_id 绑定缓存
-
-```json
-{
-  "prompt_cache_key_strategy": "session_id"
-}
-```
-
-### 同一用户多个令牌共享缓存
-
-```json
-{
-  "prompt_cache_key_strategy": "user_id"
-}
-```
-
-### 每个令牌独立缓存
-
-```json
-{
-  "prompt_cache_key_strategy": "token_id"
-}
-```
-
-### 按外部认证头共享缓存
-
-```json
-{
-  "prompt_cache_key_strategy": "auth_header"
-}
-```
-
-### Realtime 优先 websocket，失败后进入 bridge 冷却
-
-```json
-{
-  "prompt_cache_key_strategy": "off",
-  "websocket_mode": "auto",
-  "execution_session_ttl_seconds": 600,
-  "websocket_retry_cooldown_seconds": 120,
-  "self_hosted": false
-}
-```
-
-## `prompt_cache_key_strategy`
-
-当请求本身没有显式传 `prompt_cache_key` 时，Codex Official HTTP `/v1/responses` 只使用 relay 层已经可见的 request hint。也就是说，HTTP Official body planner 会写入以下来源之一：
-
-- `prompt_cache_key`
-
-客户端显式 body `prompt_cache_key` 优先。如果需要 one-hub 自动生成稳定值，并让这个稳定值同时作为 Responses 路径的 channel affinity key，必须配置系统级 `CodexRoutingHintSetting`，让 hint 在 provider 选择前生成。
-
-如果客户端已经显式传入 `prompt_cache_key`，客户端值优先，自动生成逻辑不会覆盖它。
-
-`CodexRoutingHintSetting` 和 `channel.Other.prompt_cache_key_strategy` 的边界如下：
-
-- `CodexRoutingHintSetting`
-  - 负责在 relay 层提前派生 `responses.prompt_cache_key` request hint，让 affinity 命中和 Official HTTP body 写入都发生在同一个 pre-routing key 上
-- `channel.Other.prompt_cache_key_strategy`
-  - 不会在 Codex Official HTTP `/v1/responses` 选中渠道后再合成 request policy；它只保留 legacy Realtime/bridge 路径的渠道侧行为
-
-默认的 `ChannelAffinitySetting` 已经同时读取：
-
-- 显式请求字段 `prompt_cache_key`
-- request hint `responses.prompt_cache_key`
-
-因此只要 `CodexRoutingHintSetting` 生成了稳定 hint，Responses affinity 和 Official HTTP upstream body 都会复用它；provider 不会再单独生成另一份值。
-
-推荐模板：
-
-```json
-{
-  "prompt_cache_key_strategy": "auto",
-  "model_regex": "^gpt-5$",
-  "user_agent_regex": "CodexClient"
-}
-```
-
-如果不配置 `CodexRoutingHintSetting`，且客户端 body 也没有显式 `prompt_cache_key`，Codex Official HTTP `/v1/responses` 不会因为 `channel.Other.prompt_cache_key_strategy` 生成并写入新的 `prompt_cache_key`。
-
-也就是说，只在渠道里把 `Codex 配置(JSON)` 设成下面这样：
-
-```json
-{
-  "prompt_cache_key_strategy": "auto"
-}
-```
-
-不能让 Codex Official HTTP `/v1/responses` 自动写入 provider-side `prompt_cache_key`，也不能让下一次请求在“选渠道之前”看到这个值。需要自动生成 HTTP `prompt_cache_key` 时，请配置 `CodexRoutingHintSetting`。
-
-| 策略 | 稳定身份来源 | 适用场景 |
-| --- | --- | --- |
-| `off` | 不自动生成 | 默认行为，或希望完全由客户端自己控制 |
-| `auto` | 显式 `prompt_cache_key` -> `previous_response_id` -> `x-session-id/session-id/session_id` -> 请求头认证值 -> `token_id` -> `user_id` | 大多数场景的推荐配置；`previous_response_id` 会直接复用为 `prompt_cache_key` |
-| `session_id` | 请求头中的 `x-session-id` / `session-id` / `session_id` | 客户端稳定传会话 ID，希望按会话维度粘住缓存 |
-| `token_id` | One Hub 令牌 ID | 希望每个令牌独立维护缓存 |
-| `user_id` | One Hub 用户 ID | 同一用户多个令牌共享缓存 |
-| `auth_header` | 请求头中的认证值 | 想按外部调用凭证划分缓存身份 |
-
-如果你打算在请求体中自己传 `prompt_cache_key`，保持默认 `off` 即可，不需要额外模板。
+需要在选路前生成稳定缓存提示时，使用全局 `CodexRoutingHintSetting`，或由客户端显式发送 `prompt_cache_key`。
 
 ## Responses 使用注意事项
 
@@ -891,43 +788,16 @@ Codex ResponsesWS 不支持 HTTP bridge。`responses_ws_transport` 只能留空�
 
 当上游返回陈旧的 `previous_response_id` 时，one-hub 会直接返回：
 
-- `409 Conflict`
+- `400 Bad Request`
 - 错误码 `previous_response_not_found`
 
-此时 one-hub 不会自动帮客户端改写请求并重试，客户端需要携带完整上下文重新发送请求。
+此时 one-hub 不会自动帮客户端改写请求并重试，客户端需要携带完整上下文重新发送请求。若错误直接来自上游，one-hub 保留上游实际状态与错误协议。
 
 ## Realtime/Responses native websocket 相关配置
 
-这些配置主要影响 Codex 的 `/v1/realtime` 路径，不影响普通的 `/v1/responses` 和 `/v1/chat/completions`。其中 `websocket_mode` 也会影响 Codex ResponsesWS native 是否可用；Codex ResponsesWS 当前不支持 HTTP bridge。
+Codex 的 `/v1/realtime` 与原生 Responses WebSocket 都只使用上游 WebSocket。普通 `POST /v1/responses` 和 `/v1/chat/completions` 继续使用各自的 HTTP 接口。
 
-### `websocket_mode`
-
-配置位置：
-
-- `渠道 -> 新建/编辑 -> Codex -> Codex 配置(JSON)`
-
-最小示例：
-
-```json
-{
-  "websocket_mode": "auto"
-}
-```
-
-| 值 | 行为 |
-| --- | --- |
-| `auto` | Realtime 优先 websocket；ResponsesWS 要求 native WS |
-| `force` | 必须使用 websocket，握手失败直接报错，不做回退 |
-| `off` | Realtime 不尝试 websocket；Codex ResponsesWS 返回 unsupported |
-
-推荐默认使用 `auto`。
-
-补充说明：
-
-- `auto` 适合大多数 Realtime 场景，优先吃到 websocket 的低延迟；ResponsesWS 不做 native-to-HTTP bridge 自动回退
-- `force` 适合你明确要求上游必须支持 realtime websocket 的场景；任何 websocket 建连失败都会直接返回错误
-- 默认只允许 `wss` 公网上游，并拒绝 loopback、内网、link-local、云 metadata IP 和 metadata hostname（例如 `metadata.google.internal`）。Codex Realtime 私有/本地自建上游必须显式设置 `"self_hosted": true`；ResponsesWS 私有/本地自建上游必须显式设置 `"responses_ws_self_hosted": true`。两个 key 不互相放开对方协议。开启后会允许本机/内网自建地址和明文 `ws`，但云 metadata IP/hostname 仍会被硬拦截。代价是你需要自行保证链路可信，尤其是明文 `ws` 会暴露 bearer 凭据。
-- `off` 适合 Realtime 网络环境对 websocket 不友好，或者你希望行为更稳定、更容易排查时使用。Codex ResponsesWS 没有 HTTP bridge fallback，关闭 native 后即不可用。
+默认要求公网 `wss` 上游。Realtime 自建上游使用 `self_hosted`，ResponsesWS 自建上游使用 `responses_ws_self_hosted`；两个安全开关互不放开对方协议，云 metadata 地址始终拒绝。
 
 ### `execution_session_ttl_seconds`
 
@@ -964,17 +834,6 @@ trade-off：
 
 - 这是全局 manager 拨盘，不是 `渠道 -> Codex 配置(JSON)` 的字段
 - 它影响的是 revocation probe，不改变 `execution_session_ttl_seconds` 的本地空闲回收语义
-
-### `websocket_retry_cooldown_seconds`
-
-当 Codex websocket 握手失败，或者 session 内 websocket 发送失败后，runtime 会进入 bridge 冷却时间。默认 `120` 秒。
-
-在冷却时间内：
-
-- 同一个 execution session 继续走 HTTP bridge
-- 不会每次请求都重新尝试 websocket 握手
-
-Codex Responses WebSocket 入口不会静默切到 HTTP bridge，也不能通过 `responses_ws_transport=http_bridge` 启用 bridge。如果 Codex 渠道不支持或暂时无法建立 native ResponsesWS，会返回 `unsupported` 或上游 websocket 错误，不会自动改走 HTTP bridge。
 
 ## Realtime 渠道亲和
 
