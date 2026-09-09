@@ -55,43 +55,37 @@ const defaultConfig = {
     model_mapping: '模型映射关系：例如用户请求A模型，实际转发给渠道的模型为B。在B模型加前缀+，表示使用传入模型计费，例如：+gpt-3.5-turbo',
     model_headers: '自定义模型请求头，例如：{"key": "value"}',
     custom_parameter:
-      '支持通过 JSON 注入额外参数（可嵌套）。可用控制项：overwrite：设为 true 覆盖同名字段，未设置或 false 时仅补充缺失字段；per_model：设为 true 后按模型名进行参数覆盖，如 {"per_model":true,"gpt-3.5-turbo":{"temperature": 0.7},"gpt-4":{"temperature": 0.5}}；pre_add：设为 true 时在请求入口即完成参数覆盖，否则会在发送请求前再进行参数覆盖，适用于所有渠道（含 Claude、Gemini），如 {"pre_add":true,"overwrite":true,"stream":false}。',
+      '支持通过 JSON 注入额外参数（可嵌套）。overwrite：设为 true 覆盖同名字段，否则仅补充缺失字段；per_model：设为 true 后按模型名配置参数，如 {"per_model":true,"gpt-4":{"temperature":0.5}}。pre_add：设为 true 时在适配上游协议前覆盖请求字段，如 {"pre_add":true,"overwrite":true,"temperature":0.7}；否则在转换后的上游原生请求中添加参数。Responses→Chat 兼容路径的 pre_add 使用转换后的 Chat 字段。model、stream、stream_format 属于代理的选路和交付字段，不能通过这些参数改写。',
     groups: '请选择该渠道所支持的用户组',
     only_chat: '如果选择了仅支持聊天，那么遇到有函数调用的请求会跳过该渠道',
     provider_models_list: '必须填写所有数据后才能获取模型列表',
     tag: '你可以为你的渠道打一个标签，打完标签后，可以通过标签进行批量管理渠道，注意：设置标签后某些设置只能通过渠道标签修改，无法在渠道列表中修改。',
     pre_cost:
-      '这里选择预计费选项，用于预估费用，如果你觉得计算图片占用太多资源，可以选择关闭图片计费。但是请注意：有些渠道在stream下是不会返回tokens的，这会导致输入tokens计算错误。',
+      '该选项只影响预扣额度的用量估算，可跳过图片等高开销估算。最终结算只使用上游确认的用量，不以本地估算补收。',
     disabled_stream: '这里填写禁用流式的模型，注意：如果填写了禁用流式的模型，那么这些模型在流式请求时会跳过该渠道',
     compatible_response: '兼容Response API',
-    allow_extra_body:
-      '开启后，将会透传普通 HTTP 请求中的额外字段（如 OpenAI SDK 的 extra_body 参数）；ResponsesWS HTTP bridge 按 WebSocket raw frame 契约保留未知字段，不受此开关控制'
+    allow_extra_body: '开启后，将会透传普通 HTTP 请求中的额外字段（如 OpenAI SDK 的 extra_body 参数）'
   },
   modelGroup: 'OpenAI'
 };
 
 const typeConfig = {
   1: {
+    fields: { other: true },
     inputLabel: {
       other: 'Other(JSON)',
       provider_models_list: '从OpenAI获取模型列表'
-    },
-    prompt: {
-      other:
-        '可选 JSON 配置，例如：{"responses_ws_transport":"http_bridge"}；官方 OpenAI 可使用 {"responses_ws_transport":"native"}，自定义兼容上游还需 {"responses_ws_native":true}。'
     }
   },
   8: {
+    fields: { other: true },
     inputLabel: {
       other: 'Other(JSON)',
       provider_models_list: '从渠道获取模型列表'
-    },
-    prompt: {
-      other:
-        '可选 JSON 配置，例如：{"responses_ws_transport":"http_bridge"}；如自定义兼容上游支持原生 Responses WebSocket，可使用 {"responses_ws_native":true,"responses_ws_transport":"native"}。'
     }
   },
   3: {
+    fields: { other: true },
     inputLabel: {
       base_url: 'AZURE_OPENAI_ENDPOINT',
       other: 'Azure 配置(JSON)',
@@ -99,19 +93,18 @@ const typeConfig = {
     },
     prompt: {
       base_url: '请填写AZURE_OPENAI_ENDPOINT',
-      other: '请输入 JSON，例如：{"api_version":"2024-05-01-preview","responses_ws_transport":"native"}'
+      other: '请输入 JSON，例如：{"api_version":"2024-05-01-preview"}'
     }
   },
   55: {
+    fields: { other: true },
     inputLabel: {
       base_url: 'AZURE_OPENAI_ENDPOINT',
       other: 'Other(JSON)',
       provider_models_list: '从Azure获取已部署模型列表'
     },
     prompt: {
-      base_url: '请填写 resource-level AZURE_OPENAI_ENDPOINT，不要包含 /openai/deployments 路径',
-      other:
-        '可选 JSON 配置，例如：{"responses_ws_transport":"http_bridge"}；如需原生 Responses WebSocket，可使用 {"responses_ws_transport":"native"}。'
+      base_url: '请填写 resource-level AZURE_OPENAI_ENDPOINT，不要包含 /openai/deployments 路径'
     }
   },
   // 11: {
@@ -189,6 +182,7 @@ const typeConfig = {
     modelGroup: 'Zhipu'
   },
   17: {
+    fields: { other: true },
     inputLabel: {
       other: 'Ali 配置(JSON)',
       provider_models_list: '从Ali获取模型列表'
@@ -203,6 +197,7 @@ const typeConfig = {
     modelGroup: 'Ali'
   },
   18: {
+    fields: { other: true },
     inputLabel: {
       other: 'Xunfei 配置(JSON)'
     },
@@ -238,6 +233,7 @@ const typeConfig = {
     modelGroup: 'Tencent'
   },
   25: {
+    fields: { other: true },
     inputLabel: {
       other: 'Gemini 配置(JSON)',
       provider_models_list: '从Gemini获取模型列表'
@@ -259,6 +255,7 @@ const typeConfig = {
     modelGroup: 'Baichuan'
   },
   24: {
+    fields: { other: true },
     inputLabel: {
       other: 'Azure Speech 配置(JSON)'
     },
@@ -475,6 +472,7 @@ const typeConfig = {
     modelGroup: 'Suno'
   },
   42: {
+    fields: { other: true },
     input: {
       models: ['claude-3-opus-20240229', 'claude-3-sonnet-20240229', 'claude-3-haiku-20240307']
     },
@@ -575,6 +573,7 @@ const typeConfig = {
     }
   },
   101: {
+    fields: { other: true },
     inputLabel: {
       other: 'Codex 配置(JSON)'
     },

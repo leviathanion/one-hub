@@ -1,24 +1,47 @@
 export const DEFAULT_AZURE_API_VERSION = '2024-05-01-preview';
 
-const OPENAI_COMPATIBLE_OTHER_FIELDS = new Set([
-  'responses_ws_transport',
-  'responses_ws_native',
-  'self_hosted',
-  'responses_ws_self_hosted',
-  'extra',
-  'vendor_extra'
-]);
+const OPENAI_COMPATIBLE_OTHER_FIELDS = new Set(['responses_ws_native', 'responses_ws_self_hosted', 'self_hosted', 'extra', 'vendor_extra']);
+
+const parseOtherObject = (raw) => {
+  const trimmed = String(raw ?? '').trim();
+  if (trimmed === '') {
+    return {};
+  }
+  const parsed = JSON.parse(trimmed);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('other must be a JSON object');
+  }
+  return parsed;
+};
+
+export const isSelfHostedResponsesWSEnabled = (rawOther) => {
+  try {
+    const other = parseOtherObject(rawOther);
+    return other.responses_ws_self_hosted === true;
+  } catch {
+    return false;
+  }
+};
 
 export const normalizeChannelOtherForRequest = (sourceValues) => {
   const values = { ...sourceValues };
   if (Number(values.type) === 3 && String(values.other ?? '').trim() === '') {
     values.other = JSON.stringify({ api_version: DEFAULT_AZURE_API_VERSION });
   }
+  if (String(values.other ?? '').trim() !== '') {
+    parseOtherObject(values.other);
+  }
+  // Drop obsolete form mirrors without changing the raw JSON, which is the
+  // sole owner of Responses WS channel settings.
+  delete values.responses_ws_native;
+  delete values.responses_ws_self_hosted;
   return values;
 };
 
 export const normalizeOpenAICompatibleOtherForRequest = (sourceValues, options = {}) => {
   const values = { ...sourceValues, type: 1 };
+  delete values.responses_ws_native;
+  delete values.responses_ws_self_hosted;
   const raw = String(values.other ?? '').trim();
   if (raw === '') {
     return values;

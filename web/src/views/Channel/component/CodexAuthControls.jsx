@@ -70,7 +70,7 @@ export default function CodexAuthControls({ channelId, proxy, currentName, onCre
       }
 
       onCredentials(res.data.data.credentials);
-      showSuccess('OAuth successful. Credentials have been filled in.');
+      showSuccess(res.data.data.credential_saved ? '同账号凭证已更新。' : 'OAuth successful. Credentials have been filled in.');
 
       handleCancelOAuth();
     } catch (error) {
@@ -129,18 +129,20 @@ export default function CodexAuthControls({ channelId, proxy, currentName, onCre
   return (
     <Box sx={{ mt: 2, mb: 2 }}>
       <input ref={authFileInputRef} hidden type="file" accept=".json,application/json" onChange={handleAuthFileImport} />
-      <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', mb: 2 }}>
-        <Button
-          variant="outlined"
-          color="secondary"
-          disabled={authFileImporting}
-          onClick={() => authFileInputRef.current?.click()}
-          startIcon={authFileImporting ? null : <Icon icon="solar:upload-bold-duotone" />}
-        >
-          {authFileImporting ? 'Importing auth file...' : 'Import Auth File'}
-        </Button>
-        {authFileActions}
-      </Box>
+      {!(Number(channelId) > 0) && (
+        <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', mb: 2 }}>
+          <Button
+            variant="outlined"
+            color="secondary"
+            disabled={authFileImporting}
+            onClick={() => authFileInputRef.current?.click()}
+            startIcon={authFileImporting ? null : <Icon icon="solar:upload-bold-duotone" />}
+          >
+            {authFileImporting ? 'Importing auth file...' : 'Import Auth File'}
+          </Button>
+          {authFileActions}
+        </Box>
+      )}
       <Button
         variant="outlined"
         color="primary"

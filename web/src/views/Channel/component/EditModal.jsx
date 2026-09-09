@@ -41,7 +41,7 @@ import CheckBoxOutlineBlankIcon from '@mui/icons-material/CheckBoxOutlineBlank';
 import CheckBoxIcon from '@mui/icons-material/CheckBox';
 import { useTranslation } from 'react-i18next';
 import useCustomizeT from 'hooks/useCustomizeT';
-import { PreCostType, normalizeChannelOtherForRequest } from '../type/other';
+import { PreCostType, isSelfHostedResponsesWSEnabled, normalizeChannelOtherForRequest } from '../type/other';
 import MapInput from './MapInput';
 import ListInput from './ListInput';
 import ModelSelectorModal from './ModelSelectorModal';
@@ -49,6 +49,9 @@ import pluginList from '../type/Plugin.json';
 import { Icon } from '@iconify/react';
 import Editor from '@monaco-editor/react';
 import CodexAuthControls from './CodexAuthControls';
+import ConfirmDialog from 'ui-component/confirm-dialog';
+import ChannelEndpointsEditor from './ChannelEndpointsEditor';
+import { createEndpointPreset } from '../type/endpoints.mjs';
 
 const icon = <CheckBoxOutlineBlankIcon fontSize="small" />;
 const checkedIcon = <CheckBoxIcon fontSize="small" />;
@@ -124,11 +127,51 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
   const isMobile = useMediaQuery(theme.breakpoints.down('sm'));
   // const [loading, setLoading] = useState(false);
   const [initialInput, setInitialInput] = useState(defaultConfig.input);
+  const [editConfirmationOpen, setEditConfirmationOpen] = useState(false);
+  const editConfirmationResolver = useRef(null);
+  const editSession = useRef(0);
+
+  const resolveEditConfirmation = (confirmed) => {
+    const resolve = editConfirmationResolver.current;
+    editConfirmationResolver.current = null;
+    setEditConfirmationOpen(false);
+    resolve?.(confirmed);
+  };
+
+  useEffect(() => {
+    setEditConfirmationOpen(false);
+    return () => {
+      editSession.current += 1;
+      editConfirmationResolver.current?.(false);
+      editConfirmationResolver.current = null;
+    };
+  }, [open, channelId]);
   const [inputLabel, setInputLabel] = useState(defaultConfig.inputLabel); //
   const [inputPrompt, setInputPrompt] = useState(defaultConfig.prompt);
   const [batchAdd, setBatchAdd] = useState(false);
   const [hasTag, setHasTag] = useState(false);
   const [expanded, setExpanded] = useState(false);
+  const [endpointDefinitions, setEndpointDefinitions] = useState(null);
+  const [endpointLoadError, setEndpointLoadError] = useState(false);
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    setEndpointLoadError(false);
+    setEndpointDefinitions(null);
+    API.get('/api/channel/endpoints')
+      .then(({ data }) => {
+        if (cancelled) return;
+        if (!data.success || !Array.isArray(data.data)) throw new Error('invalid endpoint catalog');
+        setEndpointDefinitions(data.data);
+      })
+      .catch(() => {
+        if (!cancelled) setEndpointLoadError(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
+
   const [inputValue, setInputValue] = useState('');
   const [batchFileImporting, setBatchFileImporting] = useState(false);
   const [codexBatchAuthFileImporting, setCodexBatchAuthFileImporting] = useState(false);
@@ -143,175 +186,85 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
   const otherConfigHelpKey = 'channel_edit.otherConfigHelp';
   const codexConfigFields = [
     [
-      'prompt_cache_key_strategy',
-      'off',
-      'auto / off / session_id / auth_header / token_id / user_id',
-      t(`${codexConfigHelpKey}.fields.promptCacheKeyStrategy`)
-    ],
-    ['websocket_mode', 'auto', 'auto / force / off', t(`${codexConfigHelpKey}.fields.websocketMode`)],
-    ['responses_ws_transport', 'native', 'native / http_bridge', t(`${codexConfigHelpKey}.fields.responsesWSTransport`)],
-    [
       'execution_session_ttl_seconds',
       '600',
       t(`${codexConfigHelpKey}.positiveIntegerSeconds`),
       t(`${codexConfigHelpKey}.fields.executionSessionTTL`)
     ],
-    [
-      'websocket_retry_cooldown_seconds',
-      '120',
-      t(`${codexConfigHelpKey}.positiveIntegerSeconds`),
-      t(`${codexConfigHelpKey}.fields.websocketRetryCooldown`)
-    ],
     ['self_hosted', 'false', 'true / false', t(`${codexConfigHelpKey}.fields.selfHosted`)],
-    ['responses_ws_self_hosted', 'false', 'true / false', t(`${codexConfigHelpKey}.fields.responsesWSSelfHosted`)]
+    ['responses_ws_self_hosted', 'false', 'true / false', t('channel_edit.responsesWSSelfHostedHelp')]
   ];
+  const responsesWSNativeExample = {
+    title: t('channel_edit.responsesWSNative'),
+    value: `{
+  "responses_ws_native": true
+}`
+  };
+  const responsesWSSelfHostedExample = {
+    title: t('channel_edit.responsesWSSelfHosted'),
+    value: `{
+  "responses_ws_self_hosted": true
+}`
+  };
   const codexConfigExamples = [
-    {
-      title: t(`${codexConfigHelpKey}.examples.defaultPromptCache`),
-      value: `{
-  "prompt_cache_key_strategy": "off"
-}`
-    },
-    {
-      title: t(`${codexConfigHelpKey}.examples.autoPromptCache`),
-      value: `{
-  "prompt_cache_key_strategy": "auto"
-}`
-    },
-    {
-      title: t(`${codexConfigHelpKey}.examples.realtimeAuto`),
-      value: `{
-  "websocket_mode": "auto"
-}`
-    },
-    {
-      title: t(`${codexConfigHelpKey}.examples.realtimeForce`),
-      value: `{
-  "websocket_mode": "force"
-}`
-    },
-    {
-      title: t(`${codexConfigHelpKey}.examples.realtimeOff`),
-      value: `{
-  "websocket_mode": "off"
-}`
-    },
-    {
-      title: t(`${codexConfigHelpKey}.examples.sessionIDCache`),
-      value: `{
-  "prompt_cache_key_strategy": "session_id"
-}`
-    },
-    {
-      title: t(`${codexConfigHelpKey}.examples.userIDCache`),
-      value: `{
-  "prompt_cache_key_strategy": "user_id"
-}`
-    },
-    {
-      title: t(`${codexConfigHelpKey}.examples.tokenIDCache`),
-      value: `{
-  "prompt_cache_key_strategy": "token_id"
-}`
-    },
-    {
-      title: t(`${codexConfigHelpKey}.examples.authHeaderCache`),
-      value: `{
-  "prompt_cache_key_strategy": "auth_header"
-}`
-    },
     {
       title: t(`${codexConfigHelpKey}.examples.selfHosted`),
       value: `{
-  "websocket_mode": "auto",
-  "responses_ws_transport": "native",
-  "self_hosted": true,
-  "responses_ws_self_hosted": true
+  "self_hosted": true
 }`
     },
+    responsesWSSelfHostedExample,
     {
-      title: t(`${codexConfigHelpKey}.examples.ttlCooldown`),
+      title: t(`${codexConfigHelpKey}.examples.sessionTTL`),
       value: `{
-  "execution_session_ttl_seconds": 600,
-  "websocket_retry_cooldown_seconds": 120
+  "execution_session_ttl_seconds": 600
 }`
     }
   ];
   const commonOtherConfigFields = {
-    responses_ws_transport: [
-      'responses_ws_transport',
-      'native',
-      'native / http_bridge',
-      t(`${otherConfigHelpKey}.fields.responsesWSTransport`)
-    ],
-    responses_ws_native: ['responses_ws_native', 'false', 'true / false', t(`${otherConfigHelpKey}.fields.responsesWSNative`)],
+    responses_ws_native: ['responses_ws_native', 'false', 'true / false', t('channel_edit.responsesWSNativeHelp')],
+    responses_ws_self_hosted: ['responses_ws_self_hosted', 'false', 'true / false', t('channel_edit.responsesWSSelfHostedHelp')],
     self_hosted: ['self_hosted', 'false', 'true / false', t(`${otherConfigHelpKey}.fields.selfHosted`)],
-    responses_ws_self_hosted: [
-      'responses_ws_self_hosted',
-      'false',
-      'true / false',
-      t(`${otherConfigHelpKey}.fields.responsesWSSelfHosted`)
-    ],
     extra: ['extra', '{}', 'JSON object', t(`${otherConfigHelpKey}.fields.extra`)],
     vendor_extra: ['vendor_extra', '{}', 'JSON object', t(`${otherConfigHelpKey}.fields.vendorExtra`)]
   };
-  const commonResponsesWSFieldKeys = ['responses_ws_transport', 'responses_ws_native', 'self_hosted', 'responses_ws_self_hosted'];
   const commonOpaqueFieldKeys = ['extra', 'vendor_extra'];
   const providerOtherConfigHelp = {
     1: {
-      commonFieldKeys: commonResponsesWSFieldKeys,
-      examples: [
-        {
-          title: t(`${otherConfigHelpKey}.examples.responsesBridge`),
-          value: `{
-  "responses_ws_transport": "http_bridge"
-}`
-        }
-      ]
+      commonFieldKeys: ['responses_ws_native', 'responses_ws_self_hosted', 'self_hosted'],
+      examples: [responsesWSNativeExample, responsesWSSelfHostedExample]
     },
     8: {
-      commonFieldKeys: commonResponsesWSFieldKeys,
-      examples: [
-        {
-          title: t(`${otherConfigHelpKey}.examples.customNative`),
-          value: `{
-  "responses_ws_native": true,
-  "responses_ws_transport": "native"
-}`
-        }
-      ]
+      commonFieldKeys: ['responses_ws_native', 'responses_ws_self_hosted', 'self_hosted'],
+      examples: [responsesWSNativeExample, responsesWSSelfHostedExample]
     },
     3: {
       providerFields: [
         ['api_version', t(`${otherConfigHelpKey}.required`), 'non-empty string', t(`${otherConfigHelpKey}.fields.azureAPIVersion`)]
       ],
-      commonFieldKeys: ['responses_ws_transport', 'self_hosted', 'responses_ws_self_hosted'],
+      commonFieldKeys: ['responses_ws_self_hosted', 'self_hosted'],
       examples: [
         {
           title: t(`${otherConfigHelpKey}.examples.azureClassic`),
           value: `{
+  "api_version": "2024-05-01-preview"
+}`
+        },
+        {
+          title: t('channel_edit.responsesWSSelfHosted'),
+          value: `{
   "api_version": "2024-05-01-preview",
-  "responses_ws_transport": "native"
+  "responses_ws_self_hosted": true
 }`
         }
       ]
     },
     55: {
-      commonFieldKeys: commonResponsesWSFieldKeys,
-      examples: [
-        {
-          title: t(`${otherConfigHelpKey}.examples.azureV1`),
-          value: `{
-  "responses_ws_transport": "native"
-}`
-        }
-      ]
+      commonFieldKeys: ['responses_ws_self_hosted', 'self_hosted'],
+      examples: [responsesWSSelfHostedExample]
     },
     17: {
-      providerFields: [
-        ['dashscope_plugin', t(`${otherConfigHelpKey}.empty`), 'string', t(`${otherConfigHelpKey}.fields.dashscopePlugin`)]
-      ],
-      commonFieldKeys: commonResponsesWSFieldKeys,
+      providerFields: [['dashscope_plugin', t(`${otherConfigHelpKey}.empty`), 'string', t(`${otherConfigHelpKey}.fields.dashscopePlugin`)]],
       examples: [
         {
           title: t(`${otherConfigHelpKey}.examples.ali`),
@@ -323,7 +276,6 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
     },
     18: {
       providerFields: [['api_version', t(`${otherConfigHelpKey}.empty`), 'string', t(`${otherConfigHelpKey}.fields.xunfeiAPIVersion`)]],
-      commonFieldKeys: commonResponsesWSFieldKeys,
       examples: [
         {
           title: t(`${otherConfigHelpKey}.examples.xunfei`),
@@ -335,7 +287,6 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
     },
     25: {
       providerFields: [['api_version', t(`${otherConfigHelpKey}.empty`), 'string', t(`${otherConfigHelpKey}.fields.geminiAPIVersion`)]],
-      commonFieldKeys: commonResponsesWSFieldKeys,
       examples: [
         {
           title: t(`${otherConfigHelpKey}.examples.gemini`),
@@ -347,7 +298,6 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
     },
     24: {
       providerFields: [['region', t(`${otherConfigHelpKey}.empty`), 'string', t(`${otherConfigHelpKey}.fields.azureSpeechRegion`)]],
-      commonFieldKeys: commonResponsesWSFieldKeys,
       examples: [
         {
           title: t(`${otherConfigHelpKey}.examples.azureSpeech`),
@@ -362,7 +312,6 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
         ['region', t(`${otherConfigHelpKey}.required`), 'string', t(`${otherConfigHelpKey}.fields.vertexRegion`)],
         ['project_id', t(`${otherConfigHelpKey}.required`), 'string', t(`${otherConfigHelpKey}.fields.vertexProjectID`)]
       ],
-      commonFieldKeys: commonResponsesWSFieldKeys,
       examples: [
         {
           title: t(`${otherConfigHelpKey}.examples.vertex`),
@@ -388,7 +337,6 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
     }
 
     const config = providerOtherConfigHelp[channelType] || {
-      commonFieldKeys: commonResponsesWSFieldKeys,
       examples: [
         {
           title: t(`${otherConfigHelpKey}.examples.opaque`),
@@ -408,7 +356,11 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
       title: t(`${otherConfigHelpKey}.title`, { channel: channelName }),
       intro: t(`${otherConfigHelpKey}.intro`),
       sections: [
-        { title: t(`${otherConfigHelpKey}.providerFieldsTitle`), fields: providerFields, emptyText: t(`${otherConfigHelpKey}.noProviderFields`) },
+        {
+          title: t(`${otherConfigHelpKey}.providerFieldsTitle`),
+          fields: providerFields,
+          emptyText: t(`${otherConfigHelpKey}.noProviderFields`)
+        },
         { title: t(`${otherConfigHelpKey}.commonFieldsTitle`), fields: commonFields },
         { title: t(`${otherConfigHelpKey}.opaqueFieldsTitle`), fields: opaqueFields }
       ],
@@ -465,6 +417,10 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
   const handleTypeChange = (setFieldValue, typeValue, values) => {
     if (typeValue === 101) {
       setBatchAdd(false);
+    }
+
+    if (Number(typeValue) === 8 && endpointDefinitions) {
+      setFieldValue('plugin', values.plugin?.endpoints ? values.plugin : { endpoints: createEndpointPreset(endpointDefinitions) });
     }
 
     // 处理插件事务
@@ -593,6 +549,7 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
 
   const prepareChannelPayload = (sourceValues) => {
     let values = trims(JSON.parse(JSON.stringify(sourceValues)));
+    if (Number(sourceValues.type) === 8) values.plugin = structuredClone(sourceValues.plugin);
     const modelMappingModel = [];
 
     if (!Array.isArray(values.models) || values.models.length === 0) {
@@ -715,52 +672,39 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
 
   const submit = async (values, { setErrors, setStatus, setSubmitting }) => {
     setSubmitting(true);
-    let res;
-    let payload;
-
-    let baseApiUrl = '/api/channel/';
-
-    if (isTag) {
-      baseApiUrl = '/api/channel_tag/' + encodeURIComponent(channelId);
-    }
-
+    const session = editSession.current;
+    const baseApiUrl = isTag ? '/api/channel_tag/' + encodeURIComponent(channelId) : '/api/channel/';
     try {
-      payload = prepareChannelPayload(values);
-    } catch (error) {
-      setSubmitting(false);
-      setStatus({ success: false });
-      showError(error.message);
-      setErrors({ submit: error.message });
-      return;
-    }
-
-    try {
+      const payload = prepareChannelPayload(values);
+      if (channelId && (isTag || !payload.key?.trim() || payload.key === initialInput.key)) {
+        delete payload.key;
+      }
+      let res;
       if (channelId) {
-        res = await API.put(baseApiUrl, { ...payload, id: parseInt(channelId) });
+        const update = { ...payload, id: parseInt(channelId) };
+        const confirmed = await new Promise((resolve) => {
+          editConfirmationResolver.current = resolve;
+          setEditConfirmationOpen(true);
+        });
+        if (!confirmed || session !== editSession.current) return;
+        res = await API.put(baseApiUrl, update);
       } else {
         res = await API.post(baseApiUrl, payload);
       }
+      if (session !== editSession.current) return;
       const { success, message } = res.data;
-      if (success) {
-        if (channelId) {
-          showSuccess(t('channel_edit.editSuccess'));
-        } else {
-          showSuccess(t('channel_edit.addSuccess'));
-        }
-        setSubmitting(false);
-        setStatus({ success: true });
-        onOk(true);
-        return;
-      } else {
-        setStatus({ success: false });
-        showError(message);
-        setErrors({ submit: message });
+      if (!success) {
+        throw new Error(message);
       }
+      showSuccess(t(channelId ? 'channel_edit.editSuccess' : 'channel_edit.addSuccess'));
+      setStatus({ success: true });
+      onOk(true);
     } catch (error) {
       setStatus({ success: false });
       showError(error.message);
       setErrors({ submit: error.message });
-      return;
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -902,6 +846,29 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
 
   return (
     <Dialog open={open} onClose={onCancel} fullWidth maxWidth={'md'}>
+      <ConfirmDialog
+        open={editConfirmationOpen}
+        title="确认保存渠道修改"
+        aria-label="确认保存渠道修改"
+        aria-describedby="channel-edit-impact-description"
+        content={
+          <Box id="channel-edit-impact-description">
+            <Typography sx={{ mb: 1 }}>
+              {isTag ? '本次修改将应用到该标签下的渠道。' : '本次修改将保存到当前渠道，渠道 ID 保持不变。'}
+            </Typography>
+            <Typography sx={{ mb: 1 }}>
+              修改地址、账号或凭据可能导致已有任务的查询、续作、结果获取，以及已存储响应、文件和会话等上游资源的后续访问失败。
+            </Typography>
+            <Typography variant="body2">模型、分组、路由或功能配置的修改也会影响后续请求。确认后保存，取消则保留当前表单。</Typography>
+          </Box>
+        }
+        onClose={() => resolveEditConfirmation(false)}
+        action={
+          <Button color="warning" variant="contained" onClick={() => resolveEditConfirmation(true)}>
+            确认保存
+          </Button>
+        }
+      />
       <DialogTitle sx={{ margin: '0px', fontWeight: 700, lineHeight: '1.55556', padding: '24px', fontSize: '1.125rem' }}>
         {channelId ? t('common.edit') : t('common.create')}
       </DialogTitle>
@@ -916,9 +883,18 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
               setModelSelectorOpen(true);
             };
             const activeOtherConfigHelp = buildOtherConfigHelp(values.type);
+            const showResponsesWSSelfHostedWarning = isSelfHostedResponsesWSEnabled(values.other);
+            const otherHelperTextId = 'helper-text-channel-other-label';
+            const otherWarningId = 'helper-text-channel-other-self-hosted-warning';
+            const otherDescriptionIds = showResponsesWSSelfHostedWarning ? `${otherHelperTextId} ${otherWarningId}` : otherHelperTextId;
 
             return (
               <form noValidate onSubmit={handleSubmit}>
+                {channelId && (
+                  <Typography role="note" color="text.secondary" sx={{ mb: 2 }}>
+                    保存前会提示修改的影响范围，确认后原地更新渠道。凭据留空则保留原值。
+                  </Typography>
+                )}
                 {!isTag && (
                   <FormControl fullWidth error={Boolean(touched.type && errors.type)} sx={{ ...theme.typography.otherInput }}>
                     <InputLabel htmlFor="channel-type-label">{customizeT(inputLabel.type)}</InputLabel>
@@ -943,7 +919,11 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                     >
                       {Object.values(CHANNEL_OPTIONS).map((option) => {
                         return (
-                          <MenuItem key={option.value} value={option.value}>
+                          <MenuItem
+                            key={option.value}
+                            value={option.value}
+                            disabled={Number(option.value) === 8 && (!endpointDefinitions || endpointLoadError)}
+                          >
                             {option.text}
                           </MenuItem>
                         );
@@ -955,6 +935,11 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                       </FormHelperText>
                     ) : (
                       <FormHelperText id="helper-tex-channel-type-label"> {customizeT(inputPrompt.type)} </FormHelperText>
+                    )}
+                    {endpointLoadError && Number(values.type) !== 8 && (
+                      <FormHelperText error role="alert">
+                        {t('channel_edit.endpoints.loadError')}
+                      </FormHelperText>
                     )}
                   </FormControl>
                 )}
@@ -1029,7 +1014,7 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                   </FormControl>
                 )}
 
-                {inputPrompt.other && (
+                {typeConfig[Number(values.type)]?.fields?.other === true && (
                   <Box sx={{ ...theme.typography.otherInput }}>
                     <FormControl fullWidth error={Boolean(touched.other && errors.other)}>
                       <InputLabel htmlFor="channel-other-label">{customizeT(inputLabel.other)}</InputLabel>
@@ -1047,7 +1032,9 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                         endAdornment={
                           activeOtherConfigHelp ? (
                             <InputAdornment position="end" sx={{ alignSelf: values.type === 101 ? 'flex-start' : 'center', mt: 0.5 }}>
-                              <Tooltip title={values.type === 101 ? t(`${codexConfigHelpKey}.tooltip`) : t(`${otherConfigHelpKey}.tooltip`)}>
+                              <Tooltip
+                                title={values.type === 101 ? t(`${codexConfigHelpKey}.tooltip`) : t(`${otherConfigHelpKey}.tooltip`)}
+                              >
                                 <IconButton
                                   aria-label={values.type === 101 ? t(`${codexConfigHelpKey}.tooltip`) : t(`${otherConfigHelpKey}.tooltip`)}
                                   edge="end"
@@ -1061,15 +1048,19 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                             </InputAdornment>
                           ) : null
                         }
-                        inputProps={{}}
-                        aria-describedby="helper-text-channel-other-label"
+                        inputProps={{ 'aria-describedby': otherDescriptionIds }}
                       />
                       {touched.other && errors.other ? (
-                        <FormHelperText error id="helper-tex-channel-other-label">
+                        <FormHelperText error id={otherHelperTextId}>
                           {errors.other}
                         </FormHelperText>
                       ) : (
-                        <FormHelperText id="helper-tex-channel-other-label"> {customizeT(inputPrompt.other)} </FormHelperText>
+                        <FormHelperText id={otherHelperTextId}> {customizeT(inputPrompt.other)} </FormHelperText>
+                      )}
+                      {showResponsesWSSelfHostedWarning && (
+                        <FormHelperText id={otherWarningId} role="alert" sx={{ color: 'warning.main', fontWeight: 600 }}>
+                          {t('channel_edit.responsesWSSelfHostedWarning')}
+                        </FormHelperText>
                       )}
                     </FormControl>
 
@@ -1343,6 +1334,7 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                           label={customizeT(inputLabel.key)}
                           value={values.key}
                           name="key"
+                          disabled={isTag}
                           onBlur={handleBlur}
                           onChange={handleChange}
                           aria-describedby="helper-text-channel-key-label"
@@ -1358,6 +1350,7 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                             type="text"
                             value={values.key}
                             name="key"
+                            disabled={isTag}
                             onBlur={handleBlur}
                             onChange={handleChange}
                             inputProps={{}}
@@ -1375,6 +1368,7 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                         label={customizeT(inputLabel.key)}
                         value={values.key}
                         name="key"
+                        disabled={isTag}
                         onBlur={handleBlur}
                         onChange={handleChange}
                         aria-describedby="helper-text-channel-key-label"
@@ -1442,10 +1436,10 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                   )}
                 </FormControl>
 
-                {values.type === 101 && !batchAdd && (
+                {values.type === 101 && !batchAdd && !isTag && (
                   <Box sx={{ mt: 2, mb: 2 }}>
                     <CodexAuthControls
-                      channelId={channelId}
+                      channelId={isTag ? 0 : channelId}
                       proxy={values.proxy}
                       currentName={values.name}
                       onCredentials={(credentials) => setFieldValue('key', credentials)}
@@ -1750,6 +1744,20 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                     <FormHelperText id="helper-tex-allow_extra_body-label">{customizeT(inputPrompt.allow_extra_body)}</FormHelperText>
                   </FormControl>
                 )}
+                {Number(values.type) === 8 &&
+                  (endpointLoadError || !endpointDefinitions ? (
+                    <Typography role={endpointLoadError ? 'alert' : 'status'} color={endpointLoadError ? 'error' : 'text.secondary'}>
+                      {t(endpointLoadError ? 'channel_edit.endpoints.loadError' : 'channel_edit.endpoints.loading')}
+                    </Typography>
+                  ) : (
+                    <ChannelEndpointsEditor
+                      definitions={endpointDefinitions}
+                      plugin={values.plugin}
+                      baseURL={values.base_url}
+                      disabled={hasTag}
+                      onChange={(plugin) => setFieldValue('plugin', plugin)}
+                    />
+                  ))}
                 {pluginList[values.type] &&
                   Object.keys(pluginList[values.type]).map((pluginId) => {
                     const plugin = pluginList[values.type][pluginId];
@@ -1840,7 +1848,13 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                   })}
                 <DialogActions>
                   <Button onClick={onCancel}>{t('common.cancel')}</Button>
-                  <Button disableElevation disabled={isSubmitting} type="submit" variant="contained" color="primary">
+                  <Button
+                    disableElevation
+                    disabled={isSubmitting || (Number(values.type) === 8 && (!endpointDefinitions || endpointLoadError))}
+                    type="submit"
+                    variant="contained"
+                    color="primary"
+                  >
                     {t('common.submit')}
                   </Button>
                 </DialogActions>
