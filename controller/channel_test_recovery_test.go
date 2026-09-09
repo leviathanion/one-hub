@@ -12,6 +12,7 @@ import (
 
 	"one-api/common/config"
 	"one-api/common/logger"
+	"one-api/internal/testutil/sqlitetest"
 	"one-api/model"
 	"one-api/types"
 
@@ -24,10 +25,18 @@ func useControllerTestChannelDB(t *testing.T) {
 	t.Helper()
 
 	originalDB := model.DB
-	testDB, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())), &gorm.Config{})
+	testDB, err := gorm.Open(sqlite.Open(sqlitetest.MemoryDSN()), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("expected in-memory sqlite database, got %v", err)
 	}
+	sqlDB, err := testDB.DB()
+	if err != nil {
+		t.Fatalf("expected sqlite connection pool, got %v", err)
+	}
+	// Shared-cache in-memory SQLite returns SQLITE_LOCKED when concurrent pooled
+	// connections write the same table. A single connection keeps this fixture
+	// deterministic while the controller workers themselves remain concurrent.
+	sqlDB.SetMaxOpenConns(1)
 	if err := testDB.AutoMigrate(&model.Channel{}); err != nil {
 		t.Fatalf("expected channel schema migration for test database, got %v", err)
 	}
@@ -35,6 +44,7 @@ func useControllerTestChannelDB(t *testing.T) {
 	model.DB = testDB
 	t.Cleanup(func() {
 		model.DB = originalDB
+		_ = sqlDB.Close()
 	})
 }
 
@@ -117,6 +127,42 @@ func TestFullChannelProbeConcurrencyNormalization(t *testing.T) {
 	}
 }
 
+func TestFullChannelProbeUsesCurrentThresholdAfterProbe(t *testing.T) {
+	resetChannelProbeTestState(t)
+	useControllerTestChannelDB(t)
+
+	originalManager := config.GlobalOption
+	manager := config.NewOptionManager()
+	thresholdSeconds := 1.0
+	manager.RegisterFloatOption("ChannelDisableThreshold", &thresholdSeconds, config.OptionMetadata{Visibility: config.OptionVisibilityPublic})
+	if _, err := manager.PublishRuntimeOverrides(1, map[string]string{"ChannelDisableThreshold": "1"}); err != nil {
+		t.Fatalf("publish initial threshold: %v", err)
+	}
+	config.GlobalOption = manager
+	t.Cleanup(func() { config.GlobalOption = originalManager })
+
+	channel := &model.Channel{Id: 71, Name: "threshold-refresh", Status: config.ChannelStatusEnabled}
+	insertControllerTestChannel(t, channel)
+	probeChannelFunc = func(*model.Channel, string) channelProbeResult {
+		if _, err := manager.PublishRuntimeOverrides(2, map[string]string{"ChannelDisableThreshold": "10"}); err != nil {
+			t.Fatalf("publish updated threshold: %v", err)
+		}
+		return channelProbeResult{milliseconds: 5_000}
+	}
+
+	report := testAllChannel(channel)
+	if strings.Contains(report, "禁用") {
+		t.Fatalf("post-probe decision retained the stale one-second threshold: %s", report)
+	}
+	var persisted model.Channel
+	if err := model.DB.First(&persisted, channel.Id).Error; err != nil {
+		t.Fatalf("reload channel: %v", err)
+	}
+	if persisted.Status != config.ChannelStatusEnabled {
+		t.Fatalf("new ten-second threshold should keep the channel enabled, status=%d", persisted.Status)
+	}
+}
+
 func TestRunFullChannelProbeTaskHonorsConcurrencyLimit(t *testing.T) {
 	resetChannelProbeTestState(t)
 
@@ -157,7 +203,7 @@ func TestRunFullChannelProbeTaskHonorsConcurrencyLimit(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		runFullChannelProbeTask(channels, channelDisableThresholdMilliseconds())
+		runFullChannelProbeTask(channels)
 		close(done)
 	}()
 
@@ -207,7 +253,7 @@ func TestRunFullChannelProbeTaskKeepsReportOrder(t *testing.T) {
 		return channelProbeResult{err: fmt.Errorf("probe failed")}
 	}
 
-	report := runFullChannelProbeTask(channels, channelDisableThresholdMilliseconds())
+	report := runFullChannelProbeTask(channels)
 	first := strings.Index(report, "slowfirst")
 	second := strings.Index(report, "fastsecond")
 	third := strings.Index(report, "fastthird")

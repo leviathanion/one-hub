@@ -85,6 +85,24 @@ func TestShouldDisableChannelProviderPayloadCodes(t *testing.T) {
 			},
 			wantDisable: true,
 		},
+		{
+			name: "redacted quota disposition disables",
+			err: &types.OpenAIErrorWithStatusCode{
+				OpenAIError:            types.OpenAIError{Type: "upstream_error", Code: "provider_account_error", Message: "provider account rejected the request"},
+				StatusCode:             http.StatusTooManyRequests,
+				ProviderQuotaExhausted: true,
+			},
+			wantDisable: true,
+		},
+		{
+			name: "redacted auth disposition disables",
+			err: &types.OpenAIErrorWithStatusCode{
+				OpenAIError:          types.OpenAIError{Type: "upstream_error", Code: "provider_account_error", Message: "provider account rejected the request"},
+				StatusCode:           http.StatusBadRequest,
+				ProviderAuthRejected: true,
+			},
+			wantDisable: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -97,5 +115,59 @@ func TestShouldDisableChannelProviderPayloadCodes(t *testing.T) {
 				t.Fatalf("expected disable=%v, got %v", tt.wantDisable, got)
 			}
 		})
+	}
+}
+
+func TestShouldDisableChannelReadsLatestRuntimePublication(t *testing.T) {
+	originalManager := config.GlobalOption
+	manager := config.NewOptionManager()
+	automaticDisable := false
+	manager.RegisterBoolOption("AutomaticDisableChannelEnabled", &automaticDisable, config.OptionMetadata{Visibility: config.OptionVisibilityPublic})
+	if _, err := manager.PublishRuntimeOverrides(1, map[string]string{"AutomaticDisableChannelEnabled": "false"}); err != nil {
+		t.Fatalf("publish disabled policy: %v", err)
+	}
+	config.GlobalOption = manager
+	t.Cleanup(func() { config.GlobalOption = originalManager })
+
+	providerAuthError := &types.OpenAIErrorWithStatusCode{StatusCode: http.StatusUnauthorized}
+	if ShouldDisableChannel(config.ChannelTypeOpenAI, providerAuthError) {
+		t.Fatal("disabled automatic policy should not disable the channel")
+	}
+	if _, err := manager.PublishRuntimeOverrides(2, map[string]string{"AutomaticDisableChannelEnabled": "true"}); err != nil {
+		t.Fatalf("publish enabled policy: %v", err)
+	}
+	if !ShouldDisableChannel(config.ChannelTypeOpenAI, providerAuthError) {
+		t.Fatal("a later disable decision should observe the newer publication")
+	}
+}
+
+func TestShouldDisableChannelKeywordMatchingRemainsCaseSensitive(t *testing.T) {
+	originalManager := config.GlobalOption
+	manager := config.NewOptionManager()
+	automaticDisable := true
+	keywords := "Quota Exhausted"
+	manager.RegisterBoolOption("AutomaticDisableChannelEnabled", &automaticDisable, config.OptionMetadata{Visibility: config.OptionVisibilityPublic})
+	manager.RegisterValueOption("DisableChannelKeywords", config.OptionMetadata{Visibility: config.OptionVisibilityPublic})
+	if _, err := manager.PublishRuntimeOverrides(1, map[string]string{
+		"AutomaticDisableChannelEnabled": "true",
+		"DisableChannelKeywords":         keywords,
+	}); err != nil {
+		t.Fatalf("publish disable policy: %v", err)
+	}
+	config.GlobalOption = manager
+	t.Cleanup(func() { config.GlobalOption = originalManager })
+
+	providerError := &types.OpenAIErrorWithStatusCode{
+		StatusCode: http.StatusBadGateway,
+		OpenAIError: types.OpenAIError{
+			Message: "quota exhausted",
+		},
+	}
+	if ShouldDisableChannel(config.ChannelTypeOpenAI, providerError) {
+		t.Fatal("keyword matching must preserve its case-sensitive contract")
+	}
+	providerError.Message = "Quota Exhausted"
+	if !ShouldDisableChannel(config.ChannelTypeOpenAI, providerError) {
+		t.Fatal("exact-case keyword should disable the channel")
 	}
 }

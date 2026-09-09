@@ -67,6 +67,29 @@ func TestChannelsChooserFilterHelpersAndCooldownLifecycle(t *testing.T) {
 
 }
 
+func TestSetCooldownsReadsLatestRuntimePublication(t *testing.T) {
+	originalManager := config.GlobalOption
+	manager := config.NewOptionManager()
+	cooldownSeconds := 0
+	manager.RegisterIntOption("RetryCooldownSeconds", &cooldownSeconds, config.OptionMetadata{Visibility: config.OptionVisibilityPublic})
+	if _, err := manager.PublishRuntimeOverrides(1, map[string]string{"RetryCooldownSeconds": "0"}); err != nil {
+		t.Fatalf("publish disabled cooldown: %v", err)
+	}
+	config.GlobalOption = manager
+	t.Cleanup(func() { config.GlobalOption = originalManager })
+
+	chooser := &ChannelsChooser{}
+	if chooser.SetCooldowns(1, "gpt-5") {
+		t.Fatal("zero cooldown publication should leave the channel unfrozen")
+	}
+	if _, err := manager.PublishRuntimeOverrides(2, map[string]string{"RetryCooldownSeconds": "60"}); err != nil {
+		t.Fatalf("publish enabled cooldown: %v", err)
+	}
+	if !chooser.SetCooldowns(1, "gpt-5") || !chooser.IsInCooldown(1, "gpt-5") {
+		t.Fatal("a later cooldown decision should observe the newer publication")
+	}
+}
+
 func TestChannelsChooserModelHasChannel(t *testing.T) {
 	chooser := &ChannelsChooser{
 		Channels: map[int]*ChannelChoice{
@@ -194,5 +217,15 @@ func TestChannelsChooserPreferredEligibilityAndNextWrapperBranches(t *testing.T)
 	}
 	if channel, err := chooser.Next("default", "gpt-5"); err != nil || channel == nil || channel.Id != 1 {
 		t.Fatalf("expected Next wrapper to delegate to preferred routing, channel=%#v err=%v", channel, err)
+	}
+	chooser.Channels[1].Disable = true
+	if chooser.ModelHasChannel("default", "gpt-5") {
+		t.Fatal("disabled channel must not count as available")
+	}
+	if !chooser.ModelHasCandidate("default", "gpt-5") {
+		t.Fatal("disabled but representable channel must remain a diagnostic candidate")
+	}
+	if chooser.ModelHasCandidate("default", "gpt-5", FilterChannelId([]int{1})) {
+		t.Fatal("diagnostic candidates must still honor request-static filters")
 	}
 }

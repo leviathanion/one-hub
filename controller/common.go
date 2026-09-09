@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"one-api/common"
@@ -14,7 +15,8 @@ import (
 )
 
 func ShouldDisableChannel(channelType int, err *types.OpenAIErrorWithStatusCode) bool {
-	if !config.AutomaticDisableChannelEnabled || err == nil || err.LocalError {
+	options := config.GlobalOption.RuntimeSnapshot()
+	if !options.Bool("AutomaticDisableChannelEnabled", config.AutomaticDisableChannelEnabled) || err == nil || err.LocalError {
 		return false
 	}
 
@@ -26,8 +28,12 @@ func ShouldDisableChannel(channelType int, err *types.OpenAIErrorWithStatusCode)
 		return true
 	}
 
-	if common.ProviderErrorIsQuotaExhausted(err.OpenAIError) || common.ProviderErrorIsAuthRejected(err.OpenAIError) {
+	if err.ProviderQuotaExhausted || err.ProviderAuthRejected ||
+		common.ProviderErrorIsQuotaExhausted(err.OpenAIError) || common.ProviderErrorIsAuthRejected(err.OpenAIError) {
 		return true
+	}
+	if err.ProviderRateLimited {
+		return false
 	}
 
 	code := strings.ToLower(common.OpenAIErrorCodeText(err.OpenAIError.Code))
@@ -35,7 +41,14 @@ func ShouldDisableChannel(channelType int, err *types.OpenAIErrorWithStatusCode)
 	if common.ProviderErrorIsRateLimited(err.OpenAIError) || code == "invalid_request_error" || errType == "invalid_request_error" {
 		return false
 	}
-	return common.DisableChannelKeywordsInstance.IsContains(err.OpenAIError.Message)
+	message := err.OpenAIError.Message
+	currentKeywords := strings.Split(common.DisableChannelKeywordsInstance.GetKeywords(), "\n")
+	for _, keyword := range options.Strings("DisableChannelKeywords", currentKeywords, "\n") {
+		if strings.Contains(message, keyword) {
+			return true
+		}
+	}
+	return false
 }
 
 // disable & notify
@@ -50,7 +63,7 @@ func DisableChannel(channelId int, channelName string, reason string, sendNotify
 	notify.Send(subject, content)
 }
 
-func AutoDisableChannel(channelId int, channelName string, reason string, sendNotify bool) (bool, error) {
+func AutoDisableChannel(channelId int, channelName string, reason string, sendNotify bool, notifyContexts ...context.Context) (bool, error) {
 	updated, err := model.UpdateChannelStatusIfCurrent(channelId, config.ChannelStatusEnabled, config.ChannelStatusAutoDisabled)
 	if err != nil || !updated {
 		return updated, err
@@ -61,7 +74,11 @@ func AutoDisableChannel(channelId int, channelName string, reason string, sendNo
 
 	subject := fmt.Sprintf("通道「%s」（#%d）已被禁用", channelName, channelId)
 	content := fmt.Sprintf("通道「%s」（#%d）已被禁用，原因：%s", channelName, channelId, reason)
-	notify.Send(subject, content)
+	if len(notifyContexts) > 0 {
+		notify.SendContext(notifyContexts[0], subject, content)
+	} else {
+		notify.Send(subject, content)
+	}
 	return true, nil
 }
 

@@ -124,7 +124,9 @@ func init() {
 }
 
 func (cc *ChannelsChooser) SetCooldowns(channelId int, modelName string) bool {
-	if channelId == 0 || modelName == "" || config.RetryCooldownSeconds == 0 {
+	options := config.GlobalOption.RuntimeSnapshot()
+	retryCooldownSeconds := options.Int("RetryCooldownSeconds", config.RetryCooldownSeconds)
+	if channelId == 0 || modelName == "" || retryCooldownSeconds == 0 {
 		return false
 	}
 
@@ -136,7 +138,7 @@ func (cc *ChannelsChooser) SetCooldowns(channelId int, modelName string) bool {
 		return true
 	}
 
-	cc.Cooldowns.LoadOrStore(key, nowTime+int64(config.RetryCooldownSeconds))
+	cc.Cooldowns.LoadOrStore(key, nowTime+int64(retryCooldownSeconds))
 	return true
 }
 
@@ -402,6 +404,41 @@ func (cc *ChannelsChooser) ModelHasChannel(group string, modelName string, filte
 		}
 	}
 
+	return false
+}
+
+// ModelHasCandidate reports whether the routing snapshot contains a channel
+// that matches the model and request-static filters. It intentionally ignores
+// Disable (and, like ModelHasChannel, cooldown): callers use it only after a
+// failed selection to distinguish representability from runtime availability.
+func (cc *ChannelsChooser) ModelHasCandidate(group string, modelName string, filters ...ChannelsFilterFunc) bool {
+	cc.reloadIfDirty()
+
+	cc.RLock()
+	defer cc.RUnlock()
+
+	channelsPriority, err := cc.channelsPriority(group, modelName)
+	if err != nil {
+		return false
+	}
+	for _, priority := range channelsPriority {
+		for _, channelID := range priority {
+			choice, ok := cc.Channels[channelID]
+			if !ok || choice == nil || choice.Channel == nil {
+				continue
+			}
+			skipped := false
+			for _, filter := range filters {
+				if filter(channelID, choice) {
+					skipped = true
+					break
+				}
+			}
+			if !skipped {
+				return true
+			}
+		}
+	}
 	return false
 }
 

@@ -276,7 +276,8 @@ func probeChannel(channel *model.Channel, testModel string) channelProbeResult {
 }
 
 func channelDisableThresholdMilliseconds() int64 {
-	disableThreshold := int64(config.ChannelDisableThreshold * 1000)
+	options := config.GlobalOption.RuntimeSnapshot()
+	disableThreshold := int64(options.Float64("ChannelDisableThreshold", config.ChannelDisableThreshold) * 1000)
 	if disableThreshold <= 0 {
 		return 10000000 // an impossible value in practice
 	}
@@ -284,7 +285,8 @@ func channelDisableThresholdMilliseconds() int64 {
 }
 
 func fullChannelProbeConcurrency() int {
-	concurrency := config.ChannelTestConcurrency
+	options := config.GlobalOption.RuntimeSnapshot()
+	concurrency := options.Int("ChannelTestConcurrency", config.ChannelTestConcurrency)
 	if concurrency <= 0 {
 		return config.DefaultChannelTestConcurrency
 	}
@@ -372,10 +374,11 @@ func TestChannel(c *gin.Context) {
 var channelProbeStateLock sync.Mutex
 var fullChannelProbeRunning bool = false
 
-func testAllChannel(channel *model.Channel, disableThreshold int64) string {
+func testAllChannel(channel *model.Channel) string {
 	isChannelEnabled := channel.Status == config.ChannelStatusEnabled
 	sendMessage := fmt.Sprintf("**通道 %s - #%d - %s** : \n\n", utils.EscapeMarkdownText(channel.Name), channel.Id, channel.StatusToStr())
 	result := probeChannelFunc(channel, "")
+	disableThreshold := channelDisableThresholdMilliseconds()
 
 	// 通道为禁用状态，并且还是请求错误 或者 响应时间超过阈值 直接跳过，也不需要更新响应时间。
 	if !isChannelEnabled {
@@ -387,7 +390,7 @@ func testAllChannel(channel *model.Channel, disableThreshold int64) string {
 		}
 		// 如果已被禁用，但是请求成功，需要判断是否需要恢复
 		// 手动禁用的通道，不会自动恢复
-		if config.AutomaticEnableChannelEnabled && result.isHealthy() {
+		if config.GlobalOption.RuntimeSnapshot().Bool("AutomaticEnableChannelEnabled", config.AutomaticEnableChannelEnabled) && result.isHealthy() {
 			if channel.Status == config.ChannelStatusAutoDisabled {
 				updated, err := AutoEnableChannel(channel.Id, channel.Name, false)
 				if err != nil {
@@ -436,7 +439,7 @@ func testAllChannel(channel *model.Channel, disableThreshold int64) string {
 	return sendMessage + fmt.Sprintf("- 测试完成，耗时 %.2fs\n\n", result.consumedSeconds())
 }
 
-func runFullChannelProbeTask(channels []*model.Channel, disableThreshold int64) string {
+func runFullChannelProbeTask(channels []*model.Channel) string {
 	if len(channels) == 0 {
 		return ""
 	}
@@ -460,7 +463,7 @@ func runFullChannelProbeTask(channels []*model.Channel, disableThreshold int64) 
 			for index := range jobs {
 				reportCh <- fullChannelProbeReport{
 					index:   index,
-					message: testAllChannel(channels[index], disableThreshold),
+					message: testAllChannel(channels[index]),
 				}
 			}
 		}()
@@ -494,11 +497,10 @@ func testAllChannels(isNotify bool) error {
 		finishFullChannelProbeTask()
 		return err
 	}
-	disableThreshold := channelDisableThresholdMilliseconds()
 	go func() {
 		defer finishFullChannelProbeTask()
 
-		sendMessage := runFullChannelProbeTask(channels, disableThreshold)
+		sendMessage := runFullChannelProbeTask(channels)
 		if isNotify {
 			notify.Send("通道测试完成", sendMessage)
 		}
