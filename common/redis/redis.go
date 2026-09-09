@@ -60,23 +60,36 @@ func ParseRedisOption() *redis.Options {
 }
 
 func RedisSet(key string, value string, expiration time.Duration) error {
-	ctx := context.Background()
+	return RedisSetContext(context.Background(), key, value, expiration)
+}
+
+func RedisSetContext(ctx context.Context, key string, value string, expiration time.Duration) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	return RDB.Set(ctx, key, value, expiration).Err()
 }
 
 func RedisGet(key string) (string, error) {
-	ctx := context.Background()
+	return RedisGetContext(context.Background(), key)
+}
+
+func RedisGetContext(ctx context.Context, key string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	return RDB.Get(ctx, key).Result()
 }
 
 func RedisDel(key string) error {
-	ctx := context.Background()
-	return RDB.Del(ctx, key).Err()
+	return RedisDelContext(context.Background(), key)
 }
 
-func RedisDecrease(key string, value int64) error {
-	ctx := context.Background()
-	return RDB.DecrBy(ctx, key, value).Err()
+func RedisDelContext(ctx context.Context, key string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return RDB.Del(ctx, key).Err()
 }
 
 func NewScript(script string) *redis.Script {
@@ -92,7 +105,13 @@ func ScriptRunCtx(ctx context.Context, script *redis.Script, keys []string, args
 }
 
 func RedisExists(key string) (bool, error) {
-	ctx := context.Background()
+	return RedisExistsContext(context.Background(), key)
+}
+
+func RedisExistsContext(ctx context.Context, key string) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	exists, err := RDB.Exists(ctx, key).Result()
 	return exists > 0, err
 }
@@ -105,4 +124,9 @@ func RedisSAdd(key string, members ...interface{}) error {
 func RedisSIsMember(key string, member interface{}) (bool, error) {
 	ctx := context.Background()
 	return RDB.SIsMember(ctx, key, member).Result()
+}
+
+func RedisDecrease(key string, value int64) error {
+	ctx := context.Background()
+	return RDB.DecrBy(ctx, key, value).Err()
 }

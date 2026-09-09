@@ -3,6 +3,8 @@ package cache
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -10,6 +12,17 @@ import (
 	commonredis "one-api/common/redis"
 	"one-api/internal/testutil/fakeredis"
 )
+
+type doneObservedContext struct {
+	context.Context
+	observed chan struct{}
+	once     sync.Once
+}
+
+func (c *doneObservedContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.observed) })
+	return c.Context.Done()
+}
 
 func useTestCacheManager(t *testing.T) {
 	t.Helper()
@@ -120,6 +133,127 @@ func TestSetCacheReportsUninitializedManager(t *testing.T) {
 	}
 }
 
+func TestGetOrSetCacheContextReturnsLoaderValueWhenCacheIsUnavailable(t *testing.T) {
+	originalCacheClient, originalKVCache := cacheClient, kvCache
+	cacheClient, kvCache = nil, nil
+	t.Cleanup(func() {
+		cacheClient, kvCache = originalCacheClient, originalKVCache
+	})
+
+	value, err := GetOrSetCacheContext(context.Background(), "unavailable-cache", time.Minute, func(context.Context) (string, error) {
+		return "database-value", nil
+	}, time.Second)
+	if err != nil || value != "database-value" {
+		t.Fatalf("expected the authoritative loader value despite cache failure, got %q, %v", value, err)
+	}
+}
+
+func TestGetOrSetCacheContextSingleflightsConcurrentMisses(t *testing.T) {
+	originalCacheClient, originalKVCache := cacheClient, kvCache
+	cacheClient, kvCache = nil, nil
+	t.Cleanup(func() {
+		cacheClient, kvCache = originalCacheClient, originalKVCache
+	})
+
+	var calls atomic.Int32
+	loaderStarted := make(chan struct{})
+	releaseLoader := make(chan struct{})
+	loader := func(context.Context) (string, error) {
+		if calls.Add(1) == 1 {
+			close(loaderStarted)
+		}
+		<-releaseLoader
+		return "database-value", nil
+	}
+	type result struct {
+		value string
+		err   error
+	}
+	results := make(chan result, 2)
+	go func() {
+		value, err := GetOrSetCacheContext(context.Background(), "singleflight-unavailable-cache", time.Minute, loader, time.Second)
+		results <- result{value: value, err: err}
+	}()
+	<-loaderStarted
+	secondWaiting := make(chan struct{})
+	secondCtx := &doneObservedContext{Context: context.Background(), observed: secondWaiting}
+	go func() {
+		value, err := GetOrSetCacheContext(secondCtx, "singleflight-unavailable-cache", time.Minute, loader, time.Second)
+		results <- result{value: value, err: err}
+	}()
+	// GetOrSet evaluates Done only after DoChan has registered this waiter.
+	<-secondWaiting
+	close(releaseLoader)
+	for range 2 {
+		got := <-results
+		if got.err != nil || got.value != "database-value" {
+			t.Fatalf("unexpected shared loader result: %+v", got)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("expected one authoritative loader call, got %d", got)
+	}
+}
+
+func TestGetOrSetCacheContextCallerCancellationDoesNotPoisonSharedLoad(t *testing.T) {
+	originalCacheClient, originalKVCache := cacheClient, kvCache
+	cacheClient, kvCache = nil, nil
+	t.Cleanup(func() {
+		cacheClient, kvCache = originalCacheClient, originalKVCache
+	})
+
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	var calls atomic.Int32
+	loaderStarted := make(chan struct{})
+	releaseLoader := make(chan struct{})
+	loader := func(ctx context.Context) (string, error) {
+		if calls.Add(1) == 1 {
+			close(loaderStarted)
+		}
+		select {
+		case <-releaseLoader:
+			return "database-value", nil
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := GetOrSetCacheContext(firstCtx, "detached-singleflight-loader", time.Minute, loader, time.Second)
+		firstResult <- err
+	}()
+	<-loaderStarted
+
+	secondWaiting := make(chan struct{})
+	secondCtx := &doneObservedContext{Context: context.Background(), observed: secondWaiting}
+	secondResult := make(chan struct {
+		value string
+		err   error
+	}, 1)
+	go func() {
+		value, err := GetOrSetCacheContext(secondCtx, "detached-singleflight-loader", time.Minute, loader, time.Second)
+		secondResult <- struct {
+			value string
+			err   error
+		}{value: value, err: err}
+	}()
+	// GetOrSet evaluates Done only after DoChan has registered this waiter.
+	<-secondWaiting
+	cancelFirst()
+	if err := <-firstResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected canceled caller to return its own cancellation, got %v", err)
+	}
+	close(releaseLoader)
+	got := <-secondResult
+	if got.err != nil || got.value != "database-value" {
+		t.Fatalf("expected healthy caller to receive the shared loader result, got %+v", got)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("expected both callers to share one detached loader, got %d calls", calls.Load())
+	}
+}
+
 func TestDeleteCacheMissingKeyIsNoOp(t *testing.T) {
 	useTestCacheManager(t)
 
@@ -128,7 +262,7 @@ func TestDeleteCacheMissingKeyIsNoOp(t *testing.T) {
 	}
 }
 
-func TestDeleteCacheManyUsesRedisBatchDeletionBehavior(t *testing.T) {
+func TestDeleteCacheContextHandlesRedisMissCancellationAndExistingKey(t *testing.T) {
 	server, err := fakeredis.Start()
 	if err != nil {
 		t.Fatal(err)
@@ -144,39 +278,26 @@ func TestDeleteCacheManyUsesRedisBatchDeletionBehavior(t *testing.T) {
 		cacheClient, kvCache = originalCacheClient, originalKVCache
 	})
 
-	for _, key := range []string{"redis-batch-a", "redis-batch-b"} {
-		if err := SetCache(key, "value", time.Minute); err != nil {
-			t.Fatal(err)
-		}
+	const key = "redis-single"
+	if err := SetCache(key, "value", time.Minute); err != nil {
+		t.Fatal(err)
 	}
-	if err := DeleteCacheMany([]string{"redis-batch-a", "redis-missing", "redis-batch-b"}); err != nil {
-		t.Fatalf("expected Redis batch deletion to normalize misses, got %v", err)
+	if err := DeleteCacheContext(context.Background(), "redis-missing"); err != nil {
+		t.Fatalf("expected Redis delete miss to succeed, got %v", err)
 	}
-	for _, key := range []string{"redis-batch-a", "redis-batch-b"} {
-		if _, err := GetCache[string](key); !errors.Is(err, CacheNotFound) {
-			t.Fatalf("expected Redis key %s to be deleted, got %v", key, err)
-		}
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := DeleteCacheContext(canceledCtx, key); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected canceled Redis deletion to stop, got %v", err)
 	}
-}
-
-func TestDeleteCacheManyRemovesExistingKeysAndNormalizesMisses(t *testing.T) {
-	useTestCacheManager(t)
-
-	for _, key := range []string{"batch-a", "batch-b"} {
-		if err := SetCache(key, "value", time.Minute); err != nil {
-			t.Fatal(err)
-		}
+	if got, err := GetCache[string](key); err != nil || got != "value" {
+		t.Fatalf("canceled Redis deletion changed the value: got=%q err=%v", got, err)
 	}
-	if err := DeleteCacheMany([]string{"batch-a", "missing", "batch-b"}); err != nil {
-		t.Fatalf("expected mixed batch deletion to succeed, got %v", err)
+	if err := DeleteCacheContext(context.Background(), key); err != nil {
+		t.Fatalf("delete existing Redis key: %v", err)
 	}
-	for _, key := range []string{"batch-a", "batch-b"} {
-		if _, err := GetCache[string](key); !errors.Is(err, CacheNotFound) {
-			t.Fatalf("expected %s to be deleted, got %v", key, err)
-		}
-	}
-	if err := DeleteCacheMany([]string{"batch-a", "missing", "batch-b"}); err != nil {
-		t.Fatalf("expected repeated batch deletion to be idempotent, got %v", err)
+	if _, err := GetCache[string](key); !errors.Is(err, CacheNotFound) {
+		t.Fatalf("expected Redis key to be deleted, got %v", err)
 	}
 }
 

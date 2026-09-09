@@ -84,6 +84,13 @@ func SetCacheContext(operationCtx context.Context, key string, value any, expira
 	if kvCache == nil {
 		return CacheNotInitialized
 	}
+	if !config.RedisEnabled {
+		localCacheMutationMu.Lock()
+		defer localCacheMutationMu.Unlock()
+		if err := operationCtx.Err(); err != nil {
+			return err
+		}
+	}
 	return kvCache.Set(operationCtx, key, value, store.WithExpiration(expiration))
 }
 
@@ -92,46 +99,37 @@ func DeleteCache(key string) error {
 }
 
 func DeleteCacheContext(operationCtx context.Context, key string) error {
-	return DeleteCacheManyContext(operationCtx, []string{key})
-}
-
-func DeleteCacheMany(keys []string) error {
-	return DeleteCacheManyContext(context.Background(), keys)
-}
-
-// DeleteCacheManyContext gives invalidation one bounded operation in Redis and
-// one fast in-process pass locally. Delete misses are success in both modes.
-func DeleteCacheManyContext(operationCtx context.Context, keys []string) error {
 	if operationCtx == nil {
 		operationCtx = context.Background()
 	}
 	if err := operationCtx.Err(); err != nil {
 		return err
 	}
-	if len(keys) == 0 || kvCache == nil || cacheClient == nil {
+	if kvCache == nil || cacheClient == nil {
 		return nil
 	}
 
 	if config.RedisEnabled && redis.GetRedisClient() != nil {
 		deleteCtx, cancel := context.WithTimeout(operationCtx, CacheTimeout)
 		defer cancel()
-		return redis.GetRedisClient().Del(deleteCtx, keys...).Err()
+		return redis.GetRedisClient().Del(deleteCtx, key).Err()
 	}
 
-	for _, key := range keys {
-		err := kvCache.Delete(operationCtx, key)
-		if err == nil {
-			continue
-		}
-
-		// freecache reports a generic error for delete-miss. Normalize it without
-		// making callers distinguish adapter-specific behavior.
-		if _, getErr := cacheClient.Get(operationCtx, key); errors.Is(getErr, store.NotFound{}) {
-			continue
-		}
+	localCacheMutationMu.Lock()
+	defer localCacheMutationMu.Unlock()
+	if err := operationCtx.Err(); err != nil {
 		return err
 	}
-	return nil
+	err := kvCache.Delete(operationCtx, key)
+	if err == nil {
+		return nil
+	}
+	// freecache reports a generic error for delete-miss. Normalize it without
+	// making callers distinguish adapter-specific behavior.
+	if _, getErr := cacheClient.Get(operationCtx, key); errors.Is(getErr, store.NotFound{}) {
+		return nil
+	}
+	return err
 }
 
 func GetOrSetCache[T any](key string, expiration time.Duration, fn func() (T, error), timeout time.Duration) (T, error) {
@@ -167,4 +165,85 @@ func GetOrSetCache[T any](key string, expiration time.Duration, fn func() (T, er
 	case <-t:
 		return *new(T), errors.New("超时")
 	}
+}
+
+// GetOrSetCacheContext implements fail-open cache-aside reads for data whose
+// source of truth is the loader. Cache read/write failures never replace a
+// successfully loaded value, and concurrent misses share one loader call.
+func GetOrSetCacheContext[T any](operationCtx context.Context, key string, expiration time.Duration, fn func(context.Context) (T, error), timeout time.Duration) (T, error) {
+	if operationCtx == nil {
+		operationCtx = context.Background()
+	}
+	if err := operationCtx.Err(); err != nil {
+		return *new(T), err
+	}
+	if value, err := GetCacheContext[T](operationCtx, key); err == nil {
+		return value, nil
+	}
+
+	result := sfGroup.DoChan(key, func() (interface{}, error) {
+		loaderCtx, cancel := context.WithTimeout(context.WithoutCancel(operationCtx), timeout)
+		defer cancel()
+		value, err := fn(loaderCtx)
+		if err != nil {
+			return nil, err
+		}
+		_ = SetCacheContext(loaderCtx, key, value, expiration)
+		return value, nil
+	})
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case r := <-result:
+		if r.Err != nil {
+			return *new(T), r.Err
+		}
+		value, ok := r.Val.(T)
+		if !ok {
+			return *new(T), errors.New("类型断言失败")
+		}
+		return value, nil
+	case <-operationCtx.Done():
+		return *new(T), operationCtx.Err()
+	case <-timer.C:
+		return *new(T), errors.New("超时")
+	}
+}
+
+func DeleteCacheMany(keys []string) error {
+	return DeleteCacheManyContext(context.Background(), keys)
+}
+
+func DeleteCacheManyContext(operationCtx context.Context, keys []string) error {
+	if operationCtx == nil {
+		operationCtx = context.Background()
+	}
+	if err := operationCtx.Err(); err != nil {
+		return err
+	}
+	if len(keys) == 0 || kvCache == nil || cacheClient == nil {
+		return nil
+	}
+
+	if config.RedisEnabled && redis.GetRedisClient() != nil {
+		deleteCtx, cancel := context.WithTimeout(operationCtx, CacheTimeout)
+		defer cancel()
+		return redis.GetRedisClient().Del(deleteCtx, keys...).Err()
+	}
+
+	for _, key := range keys {
+		err := kvCache.Delete(operationCtx, key)
+		if err == nil {
+			continue
+		}
+
+		// freecache reports a generic error for delete-miss. Normalize it without
+		// making callers distinguish adapter-specific behavior.
+		if _, getErr := cacheClient.Get(operationCtx, key); errors.Is(getErr, store.NotFound{}) {
+			continue
+		}
+		return err
+	}
+	return nil
 }
