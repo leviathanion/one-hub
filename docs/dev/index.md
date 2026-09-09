@@ -24,12 +24,13 @@
 | 时间 | 提交 | 递进关系 | 当前阅读入口 |
 | --- | --- | --- | --- |
 | 2026-03-21 | `6e197c2f` | 删除旧 `performance-optimization-backlog.md`，改为可执行的 [Relay 压测脚本](./relay-performance-benchmark.md)。这是“优化想法列表”到“可重复压测工具”的收敛。 | [Relay 压测脚本](./relay-performance-benchmark.md) |
-| 2026-04-05 | `d57a21f8` | 删除多份 affinity / recovery / billing 草案，收敛成当前 routing、task、billing 主文档。旧草案不再作为实现入口。 | [Channel Affinity 架构设计方案](./channel-affinity-architecture.md)、[one-hub Async Task 架构设计](./task-coordination-architecture.md)、[Billing / Usage 结算架构](./billing-settlement-architecture.md) |
+| 2026-04-05 | `d57a21f8` | 删除多份 affinity / recovery / billing 草案；其中当时的 billing 主文档后来由 ADR-0030 取代并删除。 | [Channel Affinity 架构设计方案](./channel-affinity-architecture.md)、[one-hub Async Task 架构设计](./task-coordination-architecture.md) |
 | 2026-05-20 | `0e59a1d1` | 新增 [ResponsesWS 架构说明](./responses-ws-architecture.md) 与 [WebSocket Transport 复用方案](./websocket-transport-architecture.md)。这是 ResponsesWS 初始 actor / safety primitives 阶段。 | [ResponsesWS 架构说明](./responses-ws-architecture.md) |
 | 2026-05-25 | `186d8396` | 新增 [wsconn 唯一传输边界架构方案](./wsconn-architecture.md)，取代 primitives-only 的 [WebSocket Transport 复用方案](./websocket-transport-architecture.md)。这是“共享工具函数”到“强制传输边界”的升级。 | [wsconn 唯一传输边界架构方案](./wsconn-architecture.md) |
-| 2026-06-21 | `21c925a2` | 在 ResponsesWS 主架构之后，拆出 [ResponsesWS Settlement Core / Actor v2](./responses-ws-settlement-core-actor-v2.md) 与 [ResponsesWS Transport 边界重构方案](./responses-ws-transport-boundary.md)。这是把账务决策和 provider transport/evidence 边界从 actor 叙述中独立出来。 | 先读 [ResponsesWS 架构说明](./responses-ws-architecture.md)，再读 settlement 与 transport 两篇专项 |
-| 2026-06-25 | `526354b9` | 新增 [ResponsesWS Attempt Replay 架构设计方案](./responses-ws-attempt-replay-architecture.md)，把 HTTP / native WS / HTTP bridge 的 request-level rejection retry 收敛成 attempt replay protocol。 | [ResponsesWS Attempt Replay 架构设计方案](./responses-ws-attempt-replay-architecture.md) |
+| 2026-06-21 | `21c925a2` | 曾从 ResponsesWS 主架构拆出 settlement core 与 transport 专项；旧 settlement core 已随 floor/unresolved 路线删除。 | [ResponsesWS 架构说明](./responses-ws-architecture.md)、[ResponsesWS Transport 边界](./responses-ws-transport-boundary.md) |
+| 2026-06-25 | `526354b9` | 曾新增跨 transport attempt replay；当前已删除 replay actor，并收敛为 submission 后统一 no-replay。 | [Responses 请求重试边界](./responses-ws-attempt-replay-architecture.md) |
 | 2026-06-28 | `42b03d6c` | 新增 [Codex / PI OAuth 请求 Header 画像对照](./codex-pi-header-parity.md)，作为 Codex upstream parity 的诊断输入。 | [Codex / PI OAuth 请求 Header 画像对照](./codex-pi-header-parity.md) |
+| 未提交 | 当前工作区 | 放弃完整上界 `U`、floor、Redis gate 与 unresolved intent 路线，删除三份冲突方案，落地 [基于下游 Usage 的 TCC 计费](./usage-confirmed-tcc-billing-architecture.md)。 | 计费以当前实现文档和 ADR-0030 为准 |
 | 未提交 | 当前工作区 | 新增 [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md)，吸收并修正 Codex / PI header parity 诊断，形成 Codex provider official upstream 目标方案。 | [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md) |
 | 未提交 | 当前工作区 | 新增 [Codex Credential Refresh Fence 架构设计](./codex-credential-refresh-fence-architecture.md)，把 rotating OAuth credential 的多节点协调从 process-local journal / Redis lease 收敛为 DB durable fence、revision 与 fail-closed at-most-once protocol。 | [Codex Credential Refresh Fence 架构设计](./codex-credential-refresh-fence-architecture.md) |
 
@@ -44,11 +45,14 @@
 | 文档 | 主题 | 说明 |
 | --- | --- | --- |
 | [Channel Affinity 架构设计方案](./channel-affinity-architecture.md) | 渠道路由、responses affinity、Codex realtime affinity | 当前 routing / affinity 架构说明 |
-| [Billing / Usage 结算架构](./billing-settlement-architecture.md) | usage / settlement / finalize / ResponsesWS conservative billing | 当前统一结算架构说明；ResponsesWS 采用保守有界计费 |
-| [ResponsesWS Settlement Core / Actor v2](./responses-ws-settlement-core-actor-v2.md) | ResponsesWS defensive settlement core、trace、actor 账务边界 | ResponsesWS 账务主规格；`ExpectedFinalQuota` 是真实扣费唯一金额来源 |
-| [ResponsesWS 架构说明](./responses-ws-architecture.md) | `/v1/responses` WebSocket、actor、quota、upstream snapshot、conservative billing | 当前 ResponsesWS ingress 架构说明；计费口径是不少计费、允许有界小幅多计费、不追求事务级精确 |
-| [ResponsesWS Attempt Replay 架构设计方案](./responses-ws-attempt-replay-architecture.md) | HTTP / ResponsesWS request-level rejection replay、attempt barrier、rollback-before-retry | 当前 attempt replay 协议说明；只在 pre-accept、pre-visibility、可 rollback 的边界内重放 |
-| [ResponsesWS Transport 边界重构方案](./responses-ws-transport-boundary.md) | ResponsesWS native WS / HTTP bridge transport、provider adapter 边界 | 主体边界已进入当前实现；保留 v1 迁移顺序和复审修复记录 |
+| [基于下游 Usage 的 TCC 计费](./usage-confirmed-tcc-billing-architecture.md) | 小额预扣、provider usage、Confirm/Cancel | 当前实现；只有合格下游 usage 才收费，没有 usage 全额取消预扣 |
+| [用户管理消融实验与精简方案](./user-management-ablation-plan.md) | 用户授权、身份归属、验证码、额度分组 | 当前实现；消融验证、17 项修复、SQL 一次性凭据与身份约束 |
+| [条件倍率规则设计](./pricing-rate-rules.md) | 统一倍率、缓存覆盖、档位与日历条件 | 当前实现；保留基础价格和现有结算，只扩展 `rate_rules` |
+| [渠道编辑确认方案](./immutable-channel-identity-architecture.md) | 渠道连接配置、保存确认、credential refresh | 每次编辑保存前确认影响，原地更新 |
+| [Payment Order 原子入账方案](./payment-order-architecture.md) | gateway create、callback、用户 credit | 最终方案；Payment Order原子credit，强幂等contract内允许有界create retry |
+| [ResponsesWS 架构说明](./responses-ws-architecture.md) | `/v1/responses` WebSocket、actor、quota、upstream snapshot | 当前 ResponsesWS ingress 架构；计费遵循 usage Confirm / otherwise Cancel |
+| [Responses 请求重试边界](./responses-ws-attempt-replay-architecture.md) | HTTP / Native WS no-replay 边界 | provider work 前完成筛选；submission 后不换渠道、不重放 |
+| [ResponsesWS Native Transport 边界](./responses-ws-transport-boundary.md) | Native WS send result、provider adapter、evidence 边界 | ResponsesWS 只有 native upstream，没有 HTTP bridge |
 | [Codex / PI OAuth 请求 Header 画像对照](./codex-pi-header-parity.md) | Codex / PI 自身 OAuth header 画像、one-hub 中转差异 | 用于后续 Codex provider header parity 修复和回归测试设计 |
 | [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md) | Codex provider raw envelope、official header/body planner、ResponsesWS native upstream | 目标架构；一次性干净重构，不设 legacy/typed/bridge 运行时兼容态 |
 | [Codex Credential Refresh Fence 架构设计](./codex-credential-refresh-fence-architecture.md) | Codex rotating OAuth credential、DB durable fence、revision、fail-closed recovery | 目标架构；用数据库 attempt fence 取代 process-local pending/ambiguous authority 与 Redis correctness lock |
@@ -63,17 +67,20 @@
 | 文档 | 当前状态 | 说明 |
 | --- | --- | --- |
 | [Channel Affinity 架构设计方案](./channel-affinity-architecture.md) | 当前实现 | 当前代码已按该方案收敛，用于解释现有 routing / affinity 行为 |
-| [Billing / Usage 结算架构](./billing-settlement-architecture.md) | 当前实现 + 目标约束 | `Quota -> SettlementEnvelope -> ApplySettlement` 是统一结算主链路；ResponsesWS uncertain/no-terminal 使用 preconsume floor |
-| [ResponsesWS Settlement Core / Actor v2](./responses-ws-settlement-core-actor-v2.md) | 当前实现 + 目标约束 | settlement input/decision/applied trace 是 ResponsesWS 账务审计主规格；actor 不根据 diagnostic reason 改钱 |
-| [ResponsesWS 架构说明](./responses-ws-architecture.md) | 当前实现 + 目标约束 | `GET /v1/responses` WebSocket ingress、actor/attempt、upstream snapshot、专用 upstream capability、conservative billing 和 actor v2 数据结构 |
-| [ResponsesWS Attempt Replay 架构设计方案](./responses-ws-attempt-replay-architecture.md) | 当前实现 | request-level rejection replay 已按 attempt barrier、rollback-before-retry 和 downstream visibility barrier 落地 |
-| [ResponsesWS Transport 边界重构方案](./responses-ws-transport-boundary.md) | 当前实现 + 目标约束 | 把 native WS / HTTP bridge transport 从 Codex realtime 语义中拆出；主体边界已进入当前实现，文档保留复审修复记录 |
+| [基于下游 Usage 的 TCC 计费](./usage-confirmed-tcc-billing-architecture.md) | 当前实现 | 沿用旧预扣与差额计算；provider usage 才 Confirm，其余 Cancel；不采用完整上界 `U` |
+| [条件倍率规则设计](./pricing-rate-rules.md) | 当前实现 | 新版有限条件规则、统一倍率、缓存覆盖与共享试算 |
+| [渠道编辑确认方案](./immutable-channel-identity-architecture.md) | 当前方案 | channel ID 保持；确认弹窗不承诺存量资源不受影响 |
+| [自定义渠道上游接口配置](./channel-endpoints.md) | 当前实现 | 接口开关与地址分离、单一新格式、一次性全量迁移及升级步骤 |
+| [Payment Order 原子入账方案](./payment-order-architecture.md) | 最终方案 | Payment Order在gateway work前成为owner，callback原子credit |
+| [ResponsesWS 架构](./responses-ws-architecture.md) | 当前实现 | `GET /v1/responses` native-only ingress、turn actor、owner barrier 与 usage-only 结算 |
+| [Responses 请求重试边界](./responses-ws-attempt-replay-architecture.md) | 当前实现 | HTTP 与 Native WS 在 submission 后都没有 request replay actor |
+| [ResponsesWS Native Transport 边界](./responses-ws-transport-boundary.md) | 当前实现 | native send result、provider adapter 与 evidence contract；无 HTTP/SSE bridge |
 | [Codex / PI OAuth 请求 Header 画像对照](./codex-pi-header-parity.md) | 当前诊断 | 记录 Codex / PI 本体 HTTP/WS header 画像，以及 one-hub 当前中转后的缺失、额外和逻辑不一致字段 |
 | [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md) | 目标方案 | Codex provider 以 raw envelope contract 和 official planner 作为唯一协议边界；删除 legacy header、typed upstream contract、WS bridge fallback 和 model_headers override |
 | [Codex Credential Refresh Fence 架构设计](./codex-credential-refresh-fence-architecture.md) | 目标方案 | OAuth 前 DB Claim，成功后 ticket-scoped Commit；ambiguous/orphan 无 TTL fail closed，管理员以新 credential 显式恢复 |
 | [WebSocket Transport 复用方案](./websocket-transport-architecture.md) | 历史方案 | 原 primitives-only safety primitives 路线，已被 `common/wsconn` 唯一传输边界取代 |
 | [wsconn 唯一传输边界架构方案](./wsconn-architecture.md) | 当前实现 | `common/wsconn` 是唯一 WebSocket 传输边界；业务层不再 import gorilla，CloseInfo first-write-wins，PongMiss/Idle 语义拆分 |
-| [one-hub Async Task 架构设计](./task-coordination-architecture.md) | 当前实现 | `tasks` 行、settlement snapshot、local fetch、sweeper、finalize 已形成稳定边界 |
+| [one-hub Async Task 架构设计](./task-coordination-architecture.md) | 当前实现 | `tasks` 行持久拥有 reserve、submission、provider identity 与一次 Cancel/Confirm |
 | [Execution Session Revocation 架构设计方案](./execution-session-revocation-refactor.md) | 当前实现 | `runtime/session` revocation 锁外化、批量 sweep 检查与 Codex execution session timeout 配置已落地 |
 | [Relay 压测脚本](./relay-performance-benchmark.md) | 工具文档 | 对应 `hack/bench/relay_bench.go`，用于热路径压测与指标对照 |
 

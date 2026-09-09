@@ -31,6 +31,7 @@ export default defineConfig({
           { text: '环境变量', link: '/deployment/env' },
           { text: '图床配置', link: '/deployment/storage' },
           { text: '自动升级', link: '/deployment/update' },
+          { text: 'GPT-5.6 发布手册', link: '/deployment/gpt-5.6-rollout' },
           { text: '消息通知', link: '/deployment/notify' },
           { text: '命令行参数', link: '/deployment/cli' },
           { text: '扩展价格', link: '/deployment/ExtraRatios' },
@@ -45,6 +46,7 @@ export default defineConfig({
           { text: 'Rerank 接口', link: '/use/Rerank' },
           { text: '推理设置', link: '/use/reasoning' },
           { text: '价格更新', link: '/use/prices_update' },
+          { text: '条件倍率配置', link: '/use/pricing-rate-rules' },
           { text: '特殊调用', link: '/use/special' },
           { text: '常见问题', link: '/use/FAQ' }
 
@@ -54,6 +56,8 @@ export default defineConfig({
         text: '开发',
         items: [
           { text: '开发说明', link: '/dev/index' },
+          { text: '自定义渠道上游接口配置', link: '/dev/channel-endpoints' },
+          { text: '条件倍率规则设计', link: '/dev/pricing-rate-rules' },
           { text: 'Codex Realtime Best-Effort Affinity', link: '/dev/codex-realtime-best-effort-affinity' },
           { text: 'Codex Realtime Preferred Fallback', link: '/dev/codex-realtime-preferred-channel-fallback' },
           { text: 'Codex Prompt Cache Affinity', link: '/dev/codex-prompt-cache-affinity-derivation' },
