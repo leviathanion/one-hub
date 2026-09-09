@@ -67,8 +67,8 @@ func GetTokenEncoder(model string) *tiktoken.Tiktoken {
 		var err error
 		tokenEncoder, err = tiktoken.EncodingForModel(model)
 		if err != nil {
-			logger.SysError(fmt.Sprintf("failed to get token encoder for model %s: %s, using encoder for gpt-3.5-turbo", model, err.Error()))
-			tokenEncoder = gpt35TokenEncoder
+			logger.SysError(fmt.Sprintf("failed to get token encoder for model %s: %s, using the default o200k encoder", model, err.Error()))
+			tokenEncoder = gpt4oTokenEncoder
 		}
 	}
 
@@ -77,7 +77,8 @@ func GetTokenEncoder(model string) *tiktoken.Tiktoken {
 }
 
 func GetTokenNum(tokenEncoder *tiktoken.Tiktoken, text string) int {
-	if config.DisableTokenEncoders || config.ApproximateTokenEnabled {
+	options := config.GlobalOption.RuntimeSnapshot()
+	if config.DisableTokenEncoders || options.Bool("ApproximateTokenEnabled", config.ApproximateTokenEnabled) {
 		return int(float64(len(text)) * 0.38)
 	}
 	return len(tokenEncoder.Encode(text, nil, nil))
@@ -254,6 +255,8 @@ func appendMapContentPartTokenData(textMsg *strings.Builder, part map[string]any
 			return 0
 		}
 		return countImagePartTokens(part["image_url"], part["detail"], model)
+	case types.ContentTypeInputFile:
+		return countResponsesFilePartTokens(part["file_data"], part["file_url"], part["filename"], part["detail"])
 	default:
 		return 0
 	}
@@ -289,8 +292,69 @@ func appendResponsesContentTokenData(textMsg *strings.Builder, part types.Conten
 			return 0
 		}
 		return countImagePartTokens(part.ImageUrl, part.Detail, model)
+	case types.ContentTypeInputFile:
+		return countResponsesFilePartTokens(part.FileData, part.FileUrl, part.FileName, part.Detail)
 	}
 	return 0
+}
+
+const (
+	// This is a proxy-owned per-input resource bound for admission fallback, not
+	// a model capability. Raise it only when the supported surface intentionally
+	// admits larger single multimodal inputs and the quota path can represent them.
+	multimodalAdmissionTokenBound = 16 << 10
+	patchGridLowImageTokenFloor   = 256
+	pdfLowVisualTokenFloor        = 1_024
+	pdfHighVisualTokenFloor       = 4_096
+)
+
+func countResponsesFilePartTokens(rawData, rawURL, rawName, rawDetail any) int {
+	fileData, _ := rawData.(string)
+	fileURL, _ := rawURL.(string)
+	fileName, _ := rawName.(string)
+	detail, _ := rawDetail.(string)
+	if !isPDFInputFile(fileData, fileURL, fileName, detail) {
+		return 0
+	}
+
+	highDetail := responsesPDFUsesHighDetail(detail)
+	floor := pdfLowVisualTokenFloor
+	if highDetail {
+		floor = pdfHighVisualTokenFloor
+	}
+	// Admission never downloads remote files or converts request bytes into
+	// token truth. Keep only a small visual floor; provider terminal usage owns
+	// the final amount.
+	return floor
+}
+
+func isPDFInputFile(fileData, fileURL, fileName, detail string) bool {
+	lowerData := strings.ToLower(strings.TrimSpace(fileData))
+	lowerURL := strings.ToLower(strings.TrimSpace(fileURL))
+	lowerName := strings.ToLower(strings.TrimSpace(fileName))
+	return strings.HasPrefix(lowerData, "data:application/pdf") ||
+		strings.HasSuffix(strings.SplitN(lowerURL, "?", 2)[0], ".pdf") ||
+		strings.HasSuffix(lowerName, ".pdf") || strings.TrimSpace(detail) != ""
+}
+
+func responsesPDFUsesHighDetail(detail string) bool {
+	switch strings.ToLower(strings.TrimSpace(detail)) {
+	case "low":
+		return false
+	default:
+		// high, auto, omitted, and future values use the conservative path.
+		return true
+	}
+}
+
+func minSaturatingProduct(value, multiplier, limit int) int {
+	if value <= 0 || multiplier <= 0 || limit <= 0 {
+		return 0
+	}
+	if value >= limit/multiplier {
+		return limit
+	}
+	return value * multiplier
 }
 
 func countImagePartTokens(rawURL any, rawDetail any, model string) int {
@@ -416,70 +480,58 @@ var OpenAIImageCostMap = map[string]*OpenAIImageCost{
 	},
 }
 
-// https://platform.openai.com/docs/guides/vision/calculating-costs
-// https://github.com/openai/openai-cookbook/blob/05e3f9be4c7a2ae7ecf029a7c32065b024730ebe/examples/How_to_count_tokens_with_tiktoken.ipynb
+// Admission uses the larger of patch- and tile-based estimates for every
+// non-low detail. This stays conservative without deriving wire semantics from
+// a model name; final provider usage remains authoritative for settlement.
 func countOpenaiImageTokens(url, detail, modelName string) (_ int, err error) {
-	// var fetchSize = true
-	var width, height int
 	var openAIImageCost *OpenAIImageCost
 	if strings.HasPrefix(modelName, "gpt-4o-mini") {
 		openAIImageCost = OpenAIImageCostMap["gpt-4o-mini"]
 	} else {
 		openAIImageCost = OpenAIImageCostMap["general"]
 	}
-	// Reference: https://platform.openai.com/docs/guides/vision/low-or-high-fidelity-image-understanding
-	// detail == "auto" is undocumented on how it works, it just said the model will use the auto setting which will look at the image input size and decide if it should use the low or high setting.
-	// According to the official guide, "low" disable the high-res model,
-	// and only receive low-res 512px x 512px version of the image, indicating
-	// that image is treated as low-res when size is smaller than 512px x 512px,
-	// then we can assume that image size larger than 512px x 512px is treated
-	// as high-res. Then we have the following logic:
-	// if detail == "" || detail == "auto" {
-	// 	width, height, err = image.GetImageSize(url)
-	// 	if err != nil {
-	// 		return 0, err
-	// 	}
-	// 	fetchSize = false
-	// 	// not sure if this is correct
-	// 	if width > 512 || height > 512 {
-	// 		detail = "high"
-	// 	} else {
-	// 		detail = "low"
-	// 	}
-	// }
+	detail = strings.ToLower(strings.TrimSpace(detail))
+	if detail == "low" {
+		return max(openAIImageCost.Low, patchGridLowImageTokenFloor), nil
+	}
+	if isRemoteMediaURL(url) {
+		return max(openAIImageCost.High+openAIImageCost.Additional, patchGridLowImageTokenFloor), nil
+	}
 
-	// However, in my test, it seems to be always the same as "high".
-	// The following image, which is 125x50, is still treated as high-res, taken
-	// 255 tokens in the response of non-stream chat completion api.
-	// https://upload.wikimedia.org/wikipedia/commons/1/10/18_Infantry_Division_Messina.jpg
-	if detail == "" || detail == "auto" {
-		// assume by test, not sure if this is correct
-		detail = "high"
+	width, height, err := image.GetImageSize(url)
+	if err != nil {
+		return max(openAIImageCost.High+openAIImageCost.Additional, patchGridLowImageTokenFloor), nil
 	}
-	switch detail {
-	case "low":
-		return openAIImageCost.Low, nil
-	case "high":
-		width, height, err = image.GetImageSize(url)
-		if err != nil {
-			return 0, err
-		}
-		if width > 2048 || height > 2048 { // max(width, height) > 2048
-			ratio := float64(2048) / math.Max(float64(width), float64(height))
-			width = int(float64(width) * ratio)
-			height = int(float64(height) * ratio)
-		}
-		if width > 768 && height > 768 { // min(width, height) > 768
-			ratio := float64(768) / math.Min(float64(width), float64(height))
-			width = int(float64(width) * ratio)
-			height = int(float64(height) * ratio)
-		}
-		numSquares := int(math.Ceil(float64(width)/512) * math.Ceil(float64(height)/512))
-		result := numSquares*openAIImageCost.High + openAIImageCost.Additional
-		return result, nil
-	default:
-		return 0, errors.New("invalid detail option")
+	patchEstimate := imagePatchCount(width, height)
+	tileEstimate := openAITileImageTokenEstimate(width, height, openAIImageCost)
+	return max(patchEstimate, tileEstimate), nil
+}
+
+func openAITileImageTokenEstimate(width, height int, cost *OpenAIImageCost) int {
+	if width <= 0 || height <= 0 || cost == nil {
+		return patchGridLowImageTokenFloor
 	}
+	if width > 2048 || height > 2048 {
+		ratio := float64(2048) / math.Max(float64(width), float64(height))
+		width = int(float64(width) * ratio)
+		height = int(float64(height) * ratio)
+	}
+	if width > 768 && height > 768 {
+		ratio := float64(768) / math.Min(float64(width), float64(height))
+		width = int(float64(width) * ratio)
+		height = int(float64(height) * ratio)
+	}
+	numSquares := int(math.Ceil(float64(width)/512) * math.Ceil(float64(height)/512))
+	return numSquares*cost.High + cost.Additional
+}
+
+func imagePatchCount(width, height int) int {
+	if width <= 0 || height <= 0 {
+		return patchGridLowImageTokenFloor
+	}
+	patchesWide := (width + 31) / 32
+	patchesHigh := (height + 31) / 32
+	return minSaturatingProduct(patchesWide, patchesHigh, multimodalAdmissionTokenBound)
 }
 
 func countGeminiImageTokens(_, _, _ string) (int, error) {
@@ -487,12 +539,20 @@ func countGeminiImageTokens(_, _, _ string) (int, error) {
 }
 
 func countClaudeImageTokens(url, _, _ string) (int, error) {
+	if isRemoteMediaURL(url) {
+		return patchGridLowImageTokenFloor, nil
+	}
 	width, height, err := image.GetImageSize(url)
 	if err != nil {
 		return 0, err
 	}
 
 	return int(math.Ceil(float64(width*height) / 750)), nil
+}
+
+func isRemoteMediaURL(value string) bool {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
 }
 
 func countGlmImageTokens(_, _, _ string) (int, error) {
