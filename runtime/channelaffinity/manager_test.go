@@ -75,3 +75,31 @@ func TestManagerEnforcesMaxEntries(t *testing.T) {
 		t.Fatal("expected the oldest affinity entry to be evicted")
 	}
 }
+
+func TestManagerBulkCapacityReductionKeepsNewestEntries(t *testing.T) {
+	manager := NewManagerWithOptions(ManagerOptions{DefaultTTL: time.Minute, MaxEntries: 100})
+	now := time.Now()
+	manager.mu.Lock()
+	manager.entries["expired"] = entry{
+		record:    Record{ChannelID: 100, UpdatedAt: now.Add(time.Hour)},
+		expiresAt: now.Add(-time.Second),
+	}
+	for i := 0; i < 10; i++ {
+		key := string(rune('a' + i))
+		manager.entries[key] = entry{record: Record{ChannelID: i, UpdatedAt: now.Add(time.Duration(i) * time.Second)}}
+	}
+	manager.enforceCapacityLocked(now, 3)
+	manager.mu.Unlock()
+
+	if len(manager.entries) != 3 {
+		t.Fatalf("bulk capacity reduction kept %d entries, want 3", len(manager.entries))
+	}
+	for _, key := range []string{"h", "i", "j"} {
+		if _, ok := manager.entries[key]; !ok {
+			t.Fatalf("bulk capacity reduction evicted recent key %q: %#v", key, manager.entries)
+		}
+	}
+	if _, ok := manager.entries["expired"]; ok {
+		t.Fatal("bulk capacity reduction retained an expired entry")
+	}
+}

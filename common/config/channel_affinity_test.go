@@ -10,7 +10,7 @@ func TestChannelAffinitySettingsDefaultsCloneAndRoundTrip(t *testing.T) {
 	if !settings.Enabled || settings.DefaultTTLSeconds != 3600 || settings.MaxEntries != 50000 {
 		t.Fatalf("unexpected default channel affinity settings: %+v", settings)
 	}
-	if len(settings.Rules) != 3 {
+	if len(settings.Rules) != 4 {
 		t.Fatalf("expected default rules to be populated, got %+v", settings.Rules)
 	}
 	if got := settings.Rules[0].KeySources[0].Alias; got != ChannelAffinityAliasResponseID {
@@ -22,7 +22,10 @@ func TestChannelAffinitySettingsDefaultsCloneAndRoundTrip(t *testing.T) {
 	if got := settings.Rules[1].KeySources[1].Source; got != "request_hint" {
 		t.Fatalf("expected prompt cache request hint source, got %q", got)
 	}
-	if got := settings.Rules[2].KeySources[0].Alias; got != ChannelAffinityAliasSessionID {
+	if got := settings.Rules[2].Kind; got != "chat" || settings.Rules[2].KeySources[0].Alias != ChannelAffinityAliasPromptCacheKey {
+		t.Fatalf("expected chat prompt cache rule, got %+v", settings.Rules[2])
+	}
+	if got := settings.Rules[3].KeySources[0].Alias; got != ChannelAffinityAliasSessionID {
 		t.Fatalf("expected realtime session alias normalization, got %q", got)
 	}
 
@@ -37,7 +40,7 @@ func TestChannelAffinitySettingsDefaultsCloneAndRoundTrip(t *testing.T) {
 	if err := roundTrip.SetFromJSON(settings.JSONString()); err != nil {
 		t.Fatalf("expected JSONString round-trip to succeed, got %v", err)
 	}
-	if len(roundTrip.Rules) != len(settings.Rules) || roundTrip.Rules[2].Kind != "realtime" {
+	if len(roundTrip.Rules) != len(settings.Rules) || roundTrip.Rules[3].Kind != "realtime" {
 		t.Fatalf("unexpected settings round-trip: %+v", roundTrip)
 	}
 }
@@ -115,7 +118,7 @@ func TestChannelAffinitySettingsSetFromJSONNormalizesRulesAndAliases(t *testing.
 	if err := settings.SetFromJSON(""); err != nil {
 		t.Fatalf("expected blank JSON to reset defaults, got %v", err)
 	}
-	if len(settings.Rules) != 3 {
+	if len(settings.Rules) != 4 {
 		t.Fatalf("expected blank JSON reset to defaults, got %+v", settings)
 	}
 	if err := settings.SetFromJSON("{"); err == nil {

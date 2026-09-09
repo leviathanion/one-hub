@@ -48,6 +48,21 @@ type ChannelAffinitySettings struct {
 
 var ChannelAffinitySettingsInstance = DefaultChannelAffinitySettings()
 
+func RuntimeChannelAffinitySettings(snapshot *RuntimeOptionsSnapshot) ChannelAffinitySettings {
+	if snapshot == nil {
+		return ChannelAffinitySettingsInstance.Clone()
+	}
+	value, ok := snapshot.Get("ChannelAffinitySetting")
+	if !ok {
+		return DefaultChannelAffinitySettings()
+	}
+	settings := DefaultChannelAffinitySettings()
+	if err := settings.SetFromJSON(value.Effective); err != nil {
+		return DefaultChannelAffinitySettings()
+	}
+	return settings.Clone()
+}
+
 func init() {
 	GlobalOption.RegisterCustomOptionWithValidator("ChannelAffinitySetting", func() string {
 		return ChannelAffinitySettingsInstance.JSONString()
@@ -103,6 +118,23 @@ func DefaultChannelAffinitySettings() ChannelAffinitySettings {
 					{
 						Source: "request_hint",
 						Key:    "responses.prompt_cache_key",
+						Alias:  ChannelAffinityAliasPromptCacheKey,
+					},
+				},
+			},
+			{
+				Name:            "chat-prompt-cache-key",
+				Enabled:         true,
+				Kind:            "chat",
+				PathRegex:       "^/v1/chat/completions$",
+				IncludeGroup:    true,
+				IncludeModel:    true,
+				IncludeRuleName: true,
+				RecordOnSuccess: true,
+				KeySources: []ChannelAffinityKeySource{
+					{
+						Source: "request_field",
+						Key:    "prompt_cache_key",
 						Alias:  ChannelAffinityAliasPromptCacheKey,
 					},
 				},

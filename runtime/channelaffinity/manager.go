@@ -4,15 +4,59 @@ import (
 	"context"
 	"encoding/json"
 	"hash/fnv"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-const defaultRedisPrefix = "one-hub:channel-affinity"
+const (
+	defaultRedisPrefix    = "one-hub:channel-affinity"
+	redisOperationTimeout = 2 * time.Second
+	redisSweepBatchSize   = 1024
+	redisFallbackSweepGap = time.Minute
+)
+
+var setRedisEntryScriptSource = `
+local operation = 'channel_affinity_set_v1'
+local entry_key = KEYS[1]
+local index_key = KEYS[2]
+local payload = ARGV[1]
+local score = ARGV[2]
+local member = ARGV[3]
+local ttl_ms = tonumber(ARGV[4])
+local max_entries = tonumber(ARGV[5])
+local entry_prefix = ARGV[6]
+
+if ttl_ms and ttl_ms > 0 then
+  redis.call('SET', entry_key, payload, 'PX', ttl_ms)
+else
+  redis.call('SET', entry_key, payload)
+end
+redis.call('ZADD', index_key, score, member)
+
+if not max_entries or max_entries <= 0 then
+  return 0
+end
+local excess = redis.call('ZCARD', index_key) - max_entries
+if excess <= 0 then
+  return 0
+end
+local victims = redis.call('ZRANGE', index_key, 0, excess - 1)
+for _, victim in ipairs(victims) do
+  redis.call('DEL', entry_prefix .. victim)
+end
+if #victims > 0 then
+  redis.call('ZREMRANGEBYRANK', index_key, 0, #victims - 1)
+end
+return #victims
+`
+
+var setRedisEntryScript = redis.NewScript(setRedisEntryScriptSource)
 
 type Record struct {
 	ChannelID         int       `json:"channel_id"`
@@ -47,18 +91,22 @@ type persistedEntry struct {
 	ExpiresAt time.Time `json:"expires_at,omitempty"`
 }
 
+type managerRuntimeOptions struct {
+	defaultTTL  time.Duration
+	maxEntries  int
+	redisClient *redis.Client
+	redisPrefix string
+}
+
 type Manager struct {
 	mu              sync.RWMutex
 	entries         map[string]entry
-	defaultTTL      time.Duration
 	janitorInterval time.Duration
-	maxEntries      int
 	stopCh          chan struct{}
 	stopOnce        sync.Once
 	locks           [64]sync.Mutex
-
-	redisClient *redis.Client
-	redisPrefix string
+	runtime         atomic.Pointer[managerRuntimeOptions]
+	lastRedisSweep  atomic.Int64
 }
 
 func NewManager(defaultTTL, janitorInterval time.Duration) *Manager {
@@ -74,7 +122,7 @@ func NewManagerWithOptions(options ManagerOptions) *Manager {
 		janitorInterval: options.JanitorInterval,
 		stopCh:          make(chan struct{}),
 	}
-	manager.applyRuntimeOptions(options)
+	manager.runtime.Store(applyManagerRuntimeOptions(nil, options))
 	if manager.janitorInterval > 0 {
 		go manager.runJanitor()
 	}
@@ -88,24 +136,41 @@ func (m *Manager) UpdateOptions(options ManagerOptions) {
 		return
 	}
 
-	m.mu.Lock()
-	m.applyRuntimeOptions(options)
-	m.mu.Unlock()
+	for {
+		current := m.runtime.Load()
+		next := applyManagerRuntimeOptions(current, options)
+		if m.runtime.CompareAndSwap(current, next) {
+			return
+		}
+	}
 }
 
-func (m *Manager) applyRuntimeOptions(options ManagerOptions) {
+func applyManagerRuntimeOptions(current *managerRuntimeOptions, options ManagerOptions) *managerRuntimeOptions {
+	next := &managerRuntimeOptions{}
+	if current != nil {
+		*next = *current
+	}
 	if options.DefaultTTL > 0 {
-		m.defaultTTL = options.DefaultTTL
+		next.defaultTTL = options.DefaultTTL
 	}
 	if options.MaxEntries >= 0 {
-		m.maxEntries = options.MaxEntries
+		next.maxEntries = options.MaxEntries
 	}
-	if options.RedisClient != nil || m.redisClient == nil {
-		m.redisClient = options.RedisClient
+	if options.RedisClient != nil || current == nil || current.redisClient == nil {
+		next.redisClient = options.RedisClient
 	}
-	if prefix := normalizeRedisPrefix(options.RedisPrefix); prefix != "" {
-		m.redisPrefix = prefix
+	next.redisPrefix = normalizeRedisPrefix(options.RedisPrefix)
+	return next
+}
+
+func (m *Manager) runtimeOptions() *managerRuntimeOptions {
+	if m == nil {
+		return &managerRuntimeOptions{redisPrefix: defaultRedisPrefix}
 	}
+	if options := m.runtime.Load(); options != nil {
+		return options
+	}
+	return &managerRuntimeOptions{redisPrefix: defaultRedisPrefix}
 }
 
 func (m *Manager) Close() {
@@ -127,33 +192,34 @@ func (m *Manager) Get(key string) (Record, bool) {
 	}
 
 	now := time.Now()
+	options := m.runtimeOptions()
 	m.mu.RLock()
 	current, ok := m.entries[key]
 	m.mu.RUnlock()
 	if ok {
 		if current.expired(now) {
-			m.Delete(key)
+			m.delete(key, options)
 			return Record{}, false
 		}
 		return current.record, true
 	}
 
-	if m.redisClient == nil {
+	if options.redisClient == nil {
 		return Record{}, false
 	}
 
-	persisted, ok := m.getFromRedis(key)
+	persisted, ok := m.getFromRedis(key, options)
 	if !ok {
 		return Record{}, false
 	}
 	if persisted.expired(now) {
-		m.Delete(key)
+		m.delete(key, options)
 		return Record{}, false
 	}
 
 	m.mu.Lock()
 	m.entries[key] = persisted
-	m.enforceCapacityLocked(now)
+	m.enforceCapacityLocked(now, options.maxEntries)
 	m.mu.Unlock()
 
 	return persisted.record, true
@@ -171,8 +237,9 @@ func (m *Manager) SetRecord(key string, record Record, ttl time.Duration) {
 	if key == "" {
 		return
 	}
+	options := m.runtimeOptions()
 	if ttl <= 0 {
-		ttl = m.defaultTTL
+		ttl = options.defaultTTL
 	}
 
 	now := time.Now()
@@ -187,11 +254,12 @@ func (m *Manager) SetRecord(key string, record Record, ttl time.Duration) {
 
 	m.mu.Lock()
 	m.entries[key] = current
-	m.enforceCapacityLocked(now)
+	m.enforceCapacityLocked(now, options.maxEntries)
 	m.mu.Unlock()
 
-	if m.redisClient != nil {
-		m.setToRedis(key, current, ttl)
+	if options.redisClient != nil {
+		m.setToRedis(key, current, ttl, options)
+		m.maybeSweepRedisAsync(options)
 	}
 }
 
@@ -203,13 +271,16 @@ func (m *Manager) Delete(key string) {
 	if key == "" {
 		return
 	}
+	m.delete(key, m.runtimeOptions())
+}
 
+func (m *Manager) delete(key string, options *managerRuntimeOptions) {
 	m.mu.Lock()
 	delete(m.entries, key)
 	m.mu.Unlock()
 
-	if m.redisClient != nil {
-		m.deleteFromRedis(key)
+	if options.redisClient != nil {
+		m.deleteFromRedis(key, options)
 	}
 }
 
@@ -218,23 +289,25 @@ func (m *Manager) Clear() int {
 		return 0
 	}
 
+	options := m.runtimeOptions()
 	m.mu.Lock()
 	localEntries := len(m.entries)
 	m.entries = make(map[string]entry)
 	m.mu.Unlock()
 
-	if m.redisClient == nil {
+	if options.redisClient == nil {
 		return localEntries
 	}
 
-	ctx := context.Background()
-	indexKey := m.redisIndexKey()
-	members, err := m.redisClient.ZRange(ctx, indexKey, 0, -1).Result()
+	ctx, cancel := context.WithTimeout(context.Background(), redisOperationTimeout)
+	defer cancel()
+	indexKey := redisIndexKey(options.redisPrefix)
+	members, err := options.redisClient.ZRange(ctx, indexKey, 0, -1).Result()
 	if err == nil && len(members) > 0 {
-		pipe := m.redisClient.Pipeline()
+		pipe := options.redisClient.Pipeline()
 		keys := make([]string, 0, len(members))
 		for _, member := range members {
-			keys = append(keys, m.redisEntryKey(member))
+			keys = append(keys, redisEntryKey(options.redisPrefix, member))
 		}
 		pipe.Del(ctx, keys...)
 		pipe.Del(ctx, indexKey)
@@ -242,7 +315,7 @@ func (m *Manager) Clear() int {
 		return max(localEntries, len(members))
 	}
 
-	_ = m.redisClient.Del(ctx, indexKey).Err()
+	_ = options.redisClient.Del(ctx, indexKey).Err()
 	return localEntries
 }
 
@@ -269,6 +342,7 @@ func (m *Manager) Sweep(now time.Time) int {
 	if now.IsZero() {
 		now = time.Now()
 	}
+	options := m.runtimeOptions()
 
 	removed := 0
 	m.mu.Lock()
@@ -280,8 +354,8 @@ func (m *Manager) Sweep(now time.Time) int {
 	}
 	m.mu.Unlock()
 
-	if m.redisClient != nil {
-		removed += m.sweepRedis(now)
+	if options.redisClient != nil {
+		removed += m.sweepRedis(now, options)
 	}
 	return removed
 }
@@ -291,23 +365,25 @@ func (m *Manager) Stats() Stats {
 		return Stats{}
 	}
 
+	options := m.runtimeOptions()
 	stats := Stats{
 		Backend:    "memory",
-		MaxEntries: m.maxEntries,
-		DefaultTTL: int64(m.defaultTTL.Seconds()),
+		MaxEntries: options.maxEntries,
+		DefaultTTL: int64(options.defaultTTL.Seconds()),
 	}
 
 	m.mu.RLock()
 	stats.LocalEntries = len(m.entries)
 	m.mu.RUnlock()
 
-	if m.redisClient == nil {
+	if options.redisClient == nil {
 		return stats
 	}
 
 	stats.Backend = "hybrid"
-	ctx := context.Background()
-	count, err := m.redisClient.ZCard(ctx, m.redisIndexKey()).Result()
+	ctx, cancel := context.WithTimeout(context.Background(), redisOperationTimeout)
+	defer cancel()
+	count, err := options.redisClient.ZCard(ctx, redisIndexKey(options.redisPrefix)).Result()
 	if err == nil {
 		stats.BackendEntries = count
 	}
@@ -328,8 +404,8 @@ func (m *Manager) runJanitor() {
 	}
 }
 
-func (m *Manager) enforceCapacityLocked(now time.Time) {
-	if m.maxEntries <= 0 {
+func (m *Manager) enforceCapacityLocked(now time.Time, maxEntries int) {
+	if maxEntries <= 0 {
 		return
 	}
 
@@ -339,36 +415,66 @@ func (m *Manager) enforceCapacityLocked(now time.Time) {
 		}
 	}
 
-	for len(m.entries) > m.maxEntries {
+	excess := len(m.entries) - maxEntries
+	if excess <= 0 {
+		return
+	}
+
+	// A normal Set overflows by one; keep that path allocation-free. Large
+	// runtime capacity reductions sort once instead of rescanning the map for
+	// every eviction.
+	if excess == 1 {
 		oldestKey := ""
 		var oldestAt time.Time
 		for key, current := range m.entries {
-			candidateAt := current.record.UpdatedAt
-			if !current.expiresAt.IsZero() && (candidateAt.IsZero() || current.expiresAt.Before(candidateAt)) {
-				candidateAt = current.expiresAt
-			}
-			if oldestKey == "" || candidateAt.Before(oldestAt) {
+			candidateAt := capacityEvictionTime(current)
+			if oldestKey == "" || candidateAt.Before(oldestAt) || (candidateAt.Equal(oldestAt) && key < oldestKey) {
 				oldestKey = key
 				oldestAt = candidateAt
 			}
 		}
-		if oldestKey == "" {
-			return
-		}
 		delete(m.entries, oldestKey)
+		return
+	}
+
+	type evictionCandidate struct {
+		key string
+		at  time.Time
+	}
+	candidates := make([]evictionCandidate, 0, len(m.entries))
+	for key, current := range m.entries {
+		candidates = append(candidates, evictionCandidate{key: key, at: capacityEvictionTime(current)})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].at.Equal(candidates[j].at) {
+			return candidates[i].key < candidates[j].key
+		}
+		return candidates[i].at.Before(candidates[j].at)
+	})
+	for i := 0; i < excess; i++ {
+		delete(m.entries, candidates[i].key)
 	}
 }
 
-func (m *Manager) getFromRedis(key string) (entry, bool) {
-	ctx := context.Background()
-	raw, err := m.redisClient.Get(ctx, m.redisEntryKey(key)).Result()
+func capacityEvictionTime(current entry) time.Time {
+	candidateAt := current.record.UpdatedAt
+	if !current.expiresAt.IsZero() && (candidateAt.IsZero() || current.expiresAt.Before(candidateAt)) {
+		candidateAt = current.expiresAt
+	}
+	return candidateAt
+}
+
+func (m *Manager) getFromRedis(key string, options *managerRuntimeOptions) (entry, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), redisOperationTimeout)
+	defer cancel()
+	raw, err := options.redisClient.Get(ctx, redisEntryKey(options.redisPrefix, key)).Result()
 	if err != nil {
 		return entry{}, false
 	}
 
 	var persisted persistedEntry
 	if err := json.Unmarshal([]byte(raw), &persisted); err != nil {
-		m.deleteFromRedis(key)
+		m.deleteFromRedis(key, options)
 		return entry{}, false
 	}
 	return entry{
@@ -377,8 +483,9 @@ func (m *Manager) getFromRedis(key string) (entry, bool) {
 	}, true
 }
 
-func (m *Manager) setToRedis(key string, current entry, ttl time.Duration) {
-	ctx := context.Background()
+func (m *Manager) setToRedis(key string, current entry, ttl time.Duration, options *managerRuntimeOptions) {
+	ctx, cancel := context.WithTimeout(context.Background(), redisOperationTimeout)
+	defer cancel()
 	payload, err := json.Marshal(persistedEntry{
 		Record:    current.record,
 		ExpiresAt: current.expiresAt,
@@ -387,100 +494,103 @@ func (m *Manager) setToRedis(key string, current entry, ttl time.Duration) {
 		return
 	}
 
-	indexKey := m.redisIndexKey()
-	entryKey := m.redisEntryKey(key)
-	score := float64(redisScoreForEntry(current))
+	indexKey := redisIndexKey(options.redisPrefix)
+	entryKey := redisEntryKey(options.redisPrefix, key)
+	score := redisScoreForEntry(current)
 
-	pipe := m.redisClient.Pipeline()
+	ttlMilliseconds := int64(0)
 	if ttl > 0 {
-		pipe.Set(ctx, entryKey, payload, ttl)
-	} else {
-		pipe.Set(ctx, entryKey, payload, 0)
+		ttlMilliseconds = ttl.Milliseconds()
+		if ttlMilliseconds <= 0 {
+			ttlMilliseconds = 1
+		}
 	}
-	pipe.ZAdd(ctx, indexKey, redis.Z{
-		Score:  score,
-		Member: key,
-	})
-	_, _ = pipe.Exec(ctx)
-
-	m.trimRedis(time.Now())
+	_, _ = setRedisEntryScript.Run(
+		ctx,
+		options.redisClient,
+		[]string{entryKey, indexKey},
+		payload,
+		strconv.FormatInt(score, 10),
+		key,
+		strconv.FormatInt(ttlMilliseconds, 10),
+		strconv.Itoa(options.maxEntries),
+		redisEntryKey(options.redisPrefix, ""),
+	).Result()
 }
 
-func (m *Manager) deleteFromRedis(key string) {
-	ctx := context.Background()
-	pipe := m.redisClient.Pipeline()
-	pipe.Del(ctx, m.redisEntryKey(key))
-	pipe.ZRem(ctx, m.redisIndexKey(), key)
-	_, _ = pipe.Exec(ctx)
+func (m *Manager) maybeSweepRedisAsync(options *managerRuntimeOptions) {
+	if m == nil || options == nil || options.redisClient == nil || options.maxEntries > 0 || m.janitorInterval > 0 {
+		return
+	}
+	now := time.Now()
+	last := m.lastRedisSweep.Load()
+	if last > 0 && now.UnixNano()-last < redisFallbackSweepGap.Nanoseconds() {
+		return
+	}
+	if !m.lastRedisSweep.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+	go m.sweepRedis(now, options)
 }
 
-func (m *Manager) trimRedis(now time.Time) {
-	if m.redisClient == nil {
-		return
-	}
-	_ = m.sweepRedis(now)
-
-	if m.maxEntries <= 0 {
-		return
-	}
-
-	ctx := context.Background()
-	indexKey := m.redisIndexKey()
-	count, err := m.redisClient.ZCard(ctx, indexKey).Result()
-	if err != nil || count <= int64(m.maxEntries) {
-		return
-	}
-
-	overflow := count - int64(m.maxEntries)
-	members, err := m.redisClient.ZRange(ctx, indexKey, 0, overflow-1).Result()
-	if err != nil || len(members) == 0 {
-		return
-	}
-
-	pipe := m.redisClient.Pipeline()
-	for _, member := range members {
-		pipe.Del(ctx, m.redisEntryKey(member))
-	}
-	pipe.ZRem(ctx, indexKey, stringSliceToInterfaceSlice(members)...)
+func (m *Manager) deleteFromRedis(key string, options *managerRuntimeOptions) {
+	ctx, cancel := context.WithTimeout(context.Background(), redisOperationTimeout)
+	defer cancel()
+	pipe := options.redisClient.Pipeline()
+	pipe.Del(ctx, redisEntryKey(options.redisPrefix, key))
+	pipe.ZRem(ctx, redisIndexKey(options.redisPrefix), key)
 	_, _ = pipe.Exec(ctx)
 }
 
-func (m *Manager) sweepRedis(now time.Time) int {
-	if m.redisClient == nil {
+func (m *Manager) sweepRedis(now time.Time, options *managerRuntimeOptions) int {
+	if options.redisClient == nil {
 		return 0
 	}
 	if now.IsZero() {
 		now = time.Now()
 	}
 
-	ctx := context.Background()
-	indexKey := m.redisIndexKey()
+	ctx, cancel := context.WithTimeout(context.Background(), redisOperationTimeout)
+	defer cancel()
+	indexKey := redisIndexKey(options.redisPrefix)
 	cutoff := strconv.FormatInt(now.UnixNano(), 10)
-	members, err := m.redisClient.ZRangeByScore(ctx, indexKey, &redis.ZRangeBy{
-		Min:   "-inf",
-		Max:   cutoff,
-		Count: 1024,
-	}).Result()
-	if err != nil || len(members) == 0 {
-		return 0
-	}
+	removed := 0
+	for {
+		members, err := options.redisClient.ZRangeByScore(ctx, indexKey, &redis.ZRangeBy{
+			Min:   "-inf",
+			Max:   cutoff,
+			Count: redisSweepBatchSize,
+		}).Result()
+		if err != nil || len(members) == 0 {
+			return removed
+		}
 
-	pipe := m.redisClient.Pipeline()
-	for _, member := range members {
-		pipe.Del(ctx, m.redisEntryKey(member))
+		pipe := options.redisClient.Pipeline()
+		for _, member := range members {
+			pipe.Del(ctx, redisEntryKey(options.redisPrefix, member))
+		}
+		pipe.ZRem(ctx, indexKey, stringSliceToInterfaceSlice(members)...)
+		if _, err := pipe.Exec(ctx); err != nil {
+			return removed
+		}
+		removed += len(members)
+		if len(members) < redisSweepBatchSize {
+			return removed
+		}
 	}
-	pipe.ZRem(ctx, indexKey, stringSliceToInterfaceSlice(members)...)
-	_, _ = pipe.Exec(ctx)
-	return len(members)
 }
 
 func (m *Manager) redisEntryKey(key string) string {
-	return m.redisPrefix + ":entry:" + key
+	return redisEntryKey(m.runtimeOptions().redisPrefix, key)
 }
 
 func (m *Manager) redisIndexKey() string {
-	return m.redisPrefix + ":index"
+	return redisIndexKey(m.runtimeOptions().redisPrefix)
 }
+
+func redisEntryKey(prefix, key string) string { return prefix + ":entry:" + key }
+
+func redisIndexKey(prefix string) string { return prefix + ":index" }
 
 func (m *Manager) lockIndex(key string) uint32 {
 	hasher := fnv.New32a()

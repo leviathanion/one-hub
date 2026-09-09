@@ -1,11 +1,37 @@
 package channelaffinity
 
 import (
+	"context"
+	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"one-api/internal/testutil/fakeredis"
+
+	"github.com/redis/go-redis/v9"
 )
+
+type redisCommandCounter struct {
+	count atomic.Int64
+}
+
+func (h *redisCommandCounter) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *redisCommandCounter) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		h.count.Add(1)
+		return next(ctx, cmd)
+	}
+}
+
+func (h *redisCommandCounter) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		h.count.Add(1)
+		return next(ctx, cmds)
+	}
+}
 
 func newRedisBackedManager(t *testing.T, options ManagerOptions) (*Manager, *fakeredis.Server) {
 	t.Helper()
@@ -232,7 +258,7 @@ func TestManagerRedisGetSetTrimSweepAndClear(t *testing.T) {
 	}
 
 	server.SetRaw(mirror.redisEntryKey("broken"), "{not-json")
-	if _, ok := mirror.getFromRedis("broken"); ok {
+	if _, ok := mirror.getFromRedis("broken", mirror.runtimeOptions()); ok {
 		t.Fatal("expected invalid redis payload to be rejected")
 	}
 	if _, exists := server.GetRaw(mirror.redisEntryKey("broken")); exists {
@@ -254,6 +280,62 @@ func TestManagerRedisGetSetTrimSweepAndClear(t *testing.T) {
 	if stats := manager.Stats(); stats.BackendEntries != 0 {
 		t.Fatalf("expected redis backend to be empty after Clear, got %+v", stats)
 	}
+}
+
+func TestManagerRedisSetUsesOneHotPathRoundTrip(t *testing.T) {
+	server, err := fakeredis.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	client := server.Client()
+	counter := &redisCommandCounter{}
+	client.AddHook(counter)
+	manager := NewManagerWithOptions(ManagerOptions{
+		DefaultTTL:  time.Minute,
+		MaxEntries:  2,
+		RedisClient: client,
+		RedisPrefix: "test:single-round-trip",
+	})
+	defer manager.Close()
+
+	// Warm the script cache; real Redis performs the same one-time EVAL fallback.
+	manager.Set("warm", 1, time.Minute)
+	counter.count.Store(0)
+	manager.Set("hot", 2, time.Minute)
+	if got := counter.count.Load(); got != 1 {
+		t.Fatalf("SetRecord hot path used %d Redis round trips, want one atomic script", got)
+	}
+	if _, ok := server.GetRaw(manager.redisEntryKey("hot")); !ok {
+		t.Fatal("single-round-trip set did not persist the entry")
+	}
+}
+
+func TestManagerWithoutJanitorOrCapacitySchedulesLowFrequencyRedisSweep(t *testing.T) {
+	manager, _ := newRedisBackedManager(t, ManagerOptions{
+		DefaultTTL:      time.Minute,
+		JanitorInterval: 0,
+		MaxEntries:      0,
+	})
+	options := manager.runtimeOptions()
+	ctx := context.Background()
+
+	manager.Set("warm", 1, time.Minute)
+	time.Sleep(10 * time.Millisecond)
+	if err := options.redisClient.ZAdd(ctx, redisIndexKey(options.redisPrefix), redis.Z{Score: 1, Member: "expired-orphan"}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	manager.lastRedisSweep.Store(0)
+	manager.Set("trigger", 2, time.Minute)
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if count := options.redisClient.ZCard(ctx, redisIndexKey(options.redisPrefix)).Val(); count == 2 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("asynchronous fallback sweep did not remove expired index member, count=%d", options.redisClient.ZCard(ctx, redisIndexKey(options.redisPrefix)).Val())
 }
 
 func TestManagerAdditionalDefaultAndGuardBranches(t *testing.T) {
@@ -357,13 +439,76 @@ func TestManagerSweepRedisRemovesExpiredBackendEntries(t *testing.T) {
 		MaxEntries: 4,
 	})
 
-	manager.SetRecord("redis-expired", Record{ChannelID: 91}, time.Millisecond)
-	time.Sleep(5 * time.Millisecond)
+	manager.SetRecord("redis-expired", Record{ChannelID: 91}, time.Minute)
 
-	if removed := manager.sweepRedis(time.Now()); removed != 1 {
+	if removed := manager.sweepRedis(time.Now().Add(2*time.Minute), manager.runtimeOptions()); removed != 1 {
 		t.Fatalf("expected sweepRedis to remove one expired backend entry, got %d", removed)
 	}
 	if _, ok := server.GetRaw(manager.redisEntryKey("redis-expired")); ok {
 		t.Fatal("expected expired backend entry to be deleted from redis")
+	}
+}
+
+func TestManagerSweepRedisDrainsAllExpiredBatches(t *testing.T) {
+	manager, _ := newRedisBackedManager(t, ManagerOptions{
+		DefaultTTL: time.Minute,
+		MaxEntries: 0,
+	})
+	options := manager.runtimeOptions()
+	ctx := context.Background()
+	members := make([]redis.Z, 0, redisSweepBatchSize+1)
+	for i := 0; i < redisSweepBatchSize+1; i++ {
+		members = append(members, redis.Z{Score: 1, Member: "expired-" + strconv.Itoa(i)})
+	}
+	if err := options.redisClient.ZAdd(ctx, redisIndexKey(options.redisPrefix), members...).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if removed := manager.sweepRedis(time.Unix(0, 2), options); removed != len(members) {
+		t.Fatalf("janitor removed %d expired members, want %d", removed, len(members))
+	}
+	if count := options.redisClient.ZCard(ctx, redisIndexKey(options.redisPrefix)).Val(); count != 0 {
+		t.Fatalf("expired index backlog remained after janitor sweep: %d", count)
+	}
+}
+
+func TestManagerRuntimeOptionsRemainAnAtomicBackendSnapshot(t *testing.T) {
+	serverA, err := fakeredis.Start()
+	if err != nil {
+		t.Fatalf("start redis A: %v", err)
+	}
+	defer serverA.Close()
+	serverB, err := fakeredis.Start()
+	if err != nil {
+		t.Fatalf("start redis B: %v", err)
+	}
+	defer serverB.Close()
+
+	manager := NewManagerWithOptions(ManagerOptions{DefaultTTL: time.Minute, MaxEntries: 64, RedisClient: serverA.Client(), RedisPrefix: "affinity:a"})
+	defer manager.Close()
+
+	var wg sync.WaitGroup
+	for worker := 0; worker < 4; worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for iteration := 0; iteration < 100; iteration++ {
+				if (worker+iteration)%2 == 0 {
+					manager.UpdateOptions(ManagerOptions{DefaultTTL: time.Minute, MaxEntries: 64, RedisClient: serverA.Client(), RedisPrefix: "affinity:a"})
+				} else {
+					manager.UpdateOptions(ManagerOptions{DefaultTTL: time.Minute, MaxEntries: 64, RedisClient: serverB.Client(), RedisPrefix: "affinity:b"})
+				}
+				manager.SetRecord("shared", Record{ChannelID: worker + 1}, time.Minute)
+				_, _ = manager.Get("missing")
+				_ = manager.Stats()
+			}
+		}(worker)
+	}
+	wg.Wait()
+
+	if _, ok := serverA.GetRaw("affinity:b:entry:shared"); ok {
+		t.Fatal("redis A received a key from prefix B")
+	}
+	if _, ok := serverB.GetRaw("affinity:a:entry:shared"); ok {
+		t.Fatal("redis B received a key from prefix A")
 	}
 }
