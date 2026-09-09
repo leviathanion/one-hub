@@ -42,7 +42,8 @@ func (p *TencentProvider) CreateChatCompletionStream(request *types.ChatCompleti
 	defer req.Body.Close()
 
 	// 发送请求
-	resp, errWithCode := p.Requester.SendRequestRaw(req)
+	streamRequester := p.Requester.ForHTTPProfile(requester.HTTPProfileLongStream)
+	resp, errWithCode := streamRequester.SendRequestRaw(req)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -52,7 +53,7 @@ func (p *TencentProvider) CreateChatCompletionStream(request *types.ChatCompleti
 		Request: request,
 	}
 
-	return requester.RequestStream[string](p.Requester, resp, chatHandler.handlerStream)
+	return requester.RequestStream[string](streamRequester, resp, chatHandler.handlerStream)
 }
 
 func (p *TencentProvider) getChatRequest(request *types.ChatCompletionRequest) (*http.Request, *types.OpenAIErrorWithStatusCode) {
@@ -107,6 +108,10 @@ func (p *TencentProvider) convertToChatOpenai(response *TencentChatResponse, req
 		Usage:   response.Usage,
 		Model:   request.Model,
 	}
+	if openaiResponse.Usage != nil {
+		openaiResponse.Usage.MarkProviderReported()
+		openaiResponse.Usage.MergeProviderAttribution(response.Model, "")
+	}
 	if len(response.Choices) > 0 {
 		choice := types.ChatCompletionChoice{
 			Index: 0,
@@ -119,7 +124,9 @@ func (p *TencentProvider) convertToChatOpenai(response *TencentChatResponse, req
 		openaiResponse.Choices = append(openaiResponse.Choices, choice)
 	}
 
-	*p.Usage = *response.Usage
+	if openaiResponse.Usage != nil {
+		*p.Usage = *openaiResponse.Usage
+	}
 
 	return
 }
@@ -199,5 +206,11 @@ func (h *tencentStreamHandler) convertToOpenaiStream(tencentChatResponse *Tencen
 	responseBody, _ := json.Marshal(streamResponse)
 	dataChan <- string(responseBody)
 
-	h.Usage.TextBuilder.WriteString(tencentChatResponse.Choices[0].Delta.Content)
+	if len(tencentChatResponse.Choices) > 0 {
+		if tencentChatResponse.Choices[0].FinishReason != "" && tencentChatResponse.Usage != nil {
+			*h.Usage = *tencentChatResponse.Usage
+			h.Usage.MarkProviderReported()
+			h.Usage.MergeProviderAttribution(tencentChatResponse.Model, "")
+		}
+	}
 }
