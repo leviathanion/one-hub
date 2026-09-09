@@ -23,9 +23,11 @@ type ImageRequest struct {
 }
 
 type ImageResponse struct {
-	Created any                      `json:"created,omitempty"`
-	Data    []ImageResponseDataInner `json:"data,omitempty"`
-	Usage   *ResponsesUsage          `json:"usage,omitempty"`
+	ProviderRawJSONState `json:"-"`
+	Created              any                      `json:"created,omitempty"`
+	Model                string                   `json:"model,omitempty"`
+	Data                 []ImageResponseDataInner `json:"data,omitempty"`
+	Usage                *ResponsesUsage          `json:"usage,omitempty"`
 }
 
 type ImageResponseDataInner struct {

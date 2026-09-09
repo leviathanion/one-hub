@@ -34,4 +34,44 @@ type CompletionResponse struct {
 	Model   string             `json:"model"`
 	Choices []CompletionChoice `json:"choices"`
 	Usage   *Usage             `json:"usage,omitempty"`
+
+	rawProviderJSON        []byte
+	replayProviderRawJSON  bool
+	captureProviderRawJSON bool
+}
+
+func (r *CompletionResponse) SetProviderRawJSON(raw []byte) {
+	if r != nil {
+		r.rawProviderJSON = append(r.rawProviderJSON[:0], raw...)
+	}
+}
+
+func (r *CompletionResponse) ProviderRawJSON() []byte {
+	if r == nil {
+		return nil
+	}
+	return append([]byte(nil), r.rawProviderJSON...)
+}
+
+func (r *CompletionResponse) EnableProviderRawJSONCapture() {
+	if r != nil {
+		r.captureProviderRawJSON = true
+	}
+}
+
+func (r *CompletionResponse) CaptureProviderRawJSON() bool {
+	return r != nil && r.captureProviderRawJSON
+}
+
+func (r *CompletionResponse) EnableProviderRawJSONReplay() {
+	if r != nil {
+		r.replayProviderRawJSON = true
+	}
+}
+
+func (r *CompletionResponse) ReplayProviderRawJSON() []byte {
+	if r == nil || !r.replayProviderRawJSON {
+		return nil
+	}
+	return r.ProviderRawJSON()
 }

@@ -68,14 +68,13 @@ func (p *AzureSpeechProvider) GetVoiceMap() map[string][]string {
 
 func (p *AzureSpeechProvider) getRequestBody(request *types.SpeechAudioRequest) *bytes.Buffer {
 	var voice, role string
+	voice, _ = request.VoiceString()
 	voiceMap := p.GetVoiceMap()
-	if voiceMap[request.Voice] != nil {
-		voice = voiceMap[request.Voice][0]
-		if len(voiceMap[request.Voice]) > 1 {
-			role = voiceMap[request.Voice][1]
+	if mapped := voiceMap[voice]; mapped != nil {
+		voice = mapped[0]
+		if len(mapped) > 1 {
+			role = mapped[1]
 		}
-	} else {
-		voice = request.Voice
 	}
 
 	ssml := CreateSSML(request.Input, voice, role)
@@ -84,6 +83,9 @@ func (p *AzureSpeechProvider) getRequestBody(request *types.SpeechAudioRequest) 
 }
 
 func (p *AzureSpeechProvider) CreateSpeech(request *types.SpeechAudioRequest) (*http.Response, *types.OpenAIErrorWithStatusCode) {
+	if _, ok := request.VoiceString(); !ok {
+		return nil, common.StringErrorWrapperLocal("selected provider requires a string voice", "unsupported_capability", http.StatusBadRequest)
+	}
 	url, errWithCode := p.GetSupportedAPIUri(config.RelayModeAudioSpeech)
 	if errWithCode != nil {
 		return nil, errWithCode

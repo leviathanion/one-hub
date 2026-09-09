@@ -2,11 +2,13 @@ package types
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"one-api/common/utils"
 	"reflect"
+	"strconv"
 	"strings"
 )
 
@@ -16,6 +18,8 @@ const (
 	APIToolTypeFileSearch       = "file_search"
 	APIToolTypeCodeInterpreter  = "code_interpreter"
 	APIToolTypeImageGeneration  = "image_generation"
+	APIToolTypeShell            = "shell"
+	APIToolTypeLocalShell       = "local_shell"
 )
 
 const apiToolTypeWebSearchPreview20250311 = "web_search_preview_2025_03_11"
@@ -50,9 +54,13 @@ const (
 	InputTypeComputerCallOutput   = "computer_call_output"
 	InputTypeFunctionCall         = "function_call"
 	InputTypeFunctionCallOutput   = "function_call_output"
+	InputTypeCustomToolCall       = "custom_tool_call"
+	InputTypeCustomToolCallOutput = "custom_tool_call_output"
 	InputTypeReasoning            = "reasoning"
 	InputTypeImageGenerationCall  = "image_generation_call"
 	InputTypeCodeInterpreterCall  = "code_interpreter_call"
+	InputTypeShellCall            = "shell_call"
+	InputTypeShellCallOutput      = "shell_call_output"
 	InputTypeLocalShellCall       = "local_shell_call"
 	InputTypeLocalShellCallOutput = "local_shell_call_output"
 	InputTypeMCPListTools         = "mcp_list_tools"
@@ -100,6 +108,7 @@ type OpenAIResponsesRequest struct {
 	Reasoning            *ReasoningEffort  `json:"reasoning,omitempty"`
 	SafetyIdentifier     string            `json:"safety_identifier,omitempty"`
 	ServiceTier          string            `json:"service_tier,omitempty"`
+	ProcessingClass      string            `json:"processing_class,omitempty"`
 	Store                *bool             `json:"store,omitempty"` // 是否存储响应结果
 	Stream               bool              `json:"stream,omitempty"`
 	StreamOptions        any               `json:"stream_options,omitempty"`
@@ -134,25 +143,28 @@ func (r *OpenAIResponsesRequest) ToChatCompletionRequest() (*ChatCompletionReque
 		MaxCompletionTokens: r.MaxOutputTokens,
 		Stream:              r.Stream,
 		Temperature:         r.Temperature,
+		ServiceTier:         r.ServiceTier,
+		ProcessingClass:     r.ProcessingClass,
+		SafetyIdentifier:    r.SafetyIdentifier,
+		Store:               r.Store,
 		// ResponseFormat:    r.Text,
-		ToolChoice: r.ToolChoice,
+		ToolChoice: responsesToolChoiceToChat(r.ToolChoice),
 		TopP:       r.TopP,
 	}
 	if r.ParallelToolCalls != nil {
-		chat.ParallelToolCalls = *r.ParallelToolCalls
+		value := *r.ParallelToolCalls
+		chat.ParallelToolCalls = &value
 	}
 
 	if r.Reasoning != nil {
-		chat.Reasoning = &ChatReasoning{
-			Summary: r.Reasoning.Summary,
+		if r.Reasoning.Summary != nil || r.Reasoning.GenerateSummary != nil {
+			return nil, errors.New("reasoning summary cannot be represented by Chat Completions")
 		}
-
 		if r.Reasoning.Effort != nil {
-			chat.Reasoning.Effort = *r.Reasoning.Effort
+			effort := *r.Reasoning.Effort
+			chat.ReasoningEffort = &effort
 		}
 	}
-
-	chat.NormalizeReasoning()
 
 	if r.Text != nil && r.Text.Format != nil {
 		chat.ResponseFormat = &ChatCompletionResponseFormat{
@@ -202,6 +214,28 @@ func (r *OpenAIResponsesRequest) ToChatCompletionRequest() (*ChatCompletionReque
 	}
 
 	return chat, nil
+}
+
+func responsesToolChoiceToChat(choice any) any {
+	object, ok := choice.(map[string]any)
+	if !ok || strings.TrimSpace(responsesStringValue(object["type"])) != "function" {
+		return choice
+	}
+	name := strings.TrimSpace(responsesStringValue(object["name"]))
+	if name == "" {
+		return choice
+	}
+	return map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name": name,
+		},
+	}
+}
+
+func responsesStringValue(value any) string {
+	text, _ := value.(string)
+	return text
 }
 
 func (r *OpenAIResponsesRequest) ParseInput() ([]InputResponses, error) {
@@ -293,10 +327,44 @@ func (r *OpenAIResponsesRequest) InputToMessages() ([]ChatCompletionMessage, err
 			})
 
 		case InputTypeFunctionCallOutput:
+			content, err := responsesToolOutputToChat(item.Output)
+			if err != nil {
+				return nil, fmt.Errorf("convert function_call_output: %w", err)
+			}
 			messages = append(messages, ChatCompletionMessage{
 				Role:       "tool",
 				ToolCallID: item.CallID,
-				Content:    item.Output,
+				Content:    content,
+			})
+
+		case InputTypeCustomToolCall:
+			input, ok := item.Input.(string)
+			if !ok {
+				return nil, errors.New("custom_tool_call input must be a string")
+			}
+			messages = append(messages, ChatCompletionMessage{
+				Role: "assistant",
+				ToolCalls: []*ChatCompletionToolCalls{
+					{
+						Id:   item.CallID,
+						Type: ToolChoiceTypeCustom,
+						Custom: &ChatCompletionToolCallsCustom{
+							Name:  item.Name,
+							Input: input,
+						},
+					},
+				},
+			})
+
+		case InputTypeCustomToolCallOutput:
+			content, err := responsesToolOutputToChat(item.Output)
+			if err != nil {
+				return nil, fmt.Errorf("convert custom_tool_call_output: %w", err)
+			}
+			messages = append(messages, ChatCompletionMessage{
+				Role:       "tool",
+				ToolCallID: item.CallID,
+				Content:    content,
 			})
 
 		default:
@@ -305,6 +373,41 @@ func (r *OpenAIResponsesRequest) InputToMessages() ([]ChatCompletionMessage, err
 	}
 
 	return messages, nil
+}
+
+func responsesToolOutputToChat(output any) (any, error) {
+	if text, ok := output.(string); ok {
+		return text, nil
+	}
+
+	raw, err := json.Marshal(output)
+	if err != nil {
+		return nil, errors.New("tool output cannot be represented as Chat content")
+	}
+	var rawParts []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &rawParts); err != nil || len(rawParts) == 0 {
+		return nil, errors.New("tool output must be a string or a non-empty input_text array")
+	}
+
+	chatParts := make([]ChatMessagePart, 0, len(rawParts))
+	for index, rawPart := range rawParts {
+		for field, value := range rawPart {
+			if field != "type" && field != "text" && !isResponsesJSONNull(value) {
+				return nil, fmt.Errorf("tool output part %d field %q cannot be represented as Chat content", index, field)
+			}
+		}
+		var part ContentResponses
+		partJSON, err := json.Marshal(rawPart)
+		if err != nil || json.Unmarshal(partJSON, &part) != nil || part.Type != ContentTypeInputText {
+			return nil, fmt.Errorf("tool output part %d cannot be represented as Chat content", index)
+		}
+		chatParts = append(chatParts, ChatMessagePart{Type: ContentTypeText, Text: part.Text})
+	}
+	return chatParts, nil
+}
+
+func isResponsesJSONNull(raw json.RawMessage) bool {
+	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
 }
 
 type InputResponses struct {
@@ -434,21 +537,65 @@ type ContentResponses struct {
 	Text string `json:"text,omitempty"`
 
 	//input_image
-	Detail   string `json:"detail,omitempty"`    // The detail level of the image to be sent to the model. One of high, low, or auto. Defaults to auto.
+	Detail   string `json:"detail,omitempty"`    // Image: low/high/original/auto. PDF input_file: low/high/auto.
 	FileId   string `json:"file_id,omitempty"`   // The ID of the file to be sent to the model.
 	ImageUrl string `json:"image_url,omitempty"` // The URL of the image to be sent to the model. A fully qualified URL or base64 encoded image in a data URL.
 
 	// input_file
 	FileData string `json:"file_data,omitempty"` // The content of the file to be sent to the model.
 	FileUrl  string `json:"file_url,omitempty"`  // The URL of the file to be sent to the model.
-	FileName string `json:"file_name,omitempty"` // The name of the file to be sent to the model.
+	FileName string `json:"filename,omitempty"`  // The name of the file to be sent to the model.
 
 	// output_text
 	Annotations []Annotations `json:"annotations,omitempty"` // The annotations of the text output.
 	Logprobs    any           `json:"logprobs,omitempty"`
 
 	// refusal
-	Refusal *RefusalResponses `json:"refusal,omitempty"`
+	Refusal string `json:"refusal,omitempty"`
+
+	rawFields map[string]json.RawMessage `json:"-"`
+}
+
+var contentResponsesJSONFields = collectJSONFieldNames(reflect.TypeOf(ContentResponses{}))
+
+func (c *ContentResponses) UnmarshalJSON(data []byte) error {
+	type contentResponsesAlias ContentResponses
+	var alias contentResponsesAlias
+	if err := json.Unmarshal(data, &alias); err != nil {
+		return err
+	}
+	var rawFields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &rawFields); err != nil {
+		return err
+	}
+	*c = ContentResponses(alias)
+	c.rawFields = rawFields
+	return nil
+}
+
+func (c ContentResponses) MarshalJSON() ([]byte, error) {
+	type contentResponsesAlias ContentResponses
+	knownJSON, err := json.Marshal(contentResponsesAlias(c))
+	if err != nil {
+		return nil, err
+	}
+	var knownFields map[string]json.RawMessage
+	if err := json.Unmarshal(knownJSON, &knownFields); err != nil {
+		return nil, err
+	}
+	fields := make(map[string]json.RawMessage, len(c.rawFields)+len(knownFields))
+	for field, raw := range c.rawFields {
+		fields[field] = raw
+	}
+	for field := range contentResponsesJSONFields {
+		if _, projected := knownFields[field]; !projected && !isExplicitJSONEmpty(c.rawFields[field]) {
+			delete(fields, field)
+		}
+	}
+	for field, raw := range knownFields {
+		fields[field] = raw
+	}
+	return json.Marshal(fields)
 }
 
 func (c *ContentResponses) ToChatContent() (*ChatMessagePart, error) {
@@ -471,23 +618,19 @@ func (c *ContentResponses) ToChatContent() (*ChatMessagePart, error) {
 		}, nil
 	case ContentTypeInputFile:
 		if c.FileData == "" && c.FileName == "" {
-			return nil, errors.New("input_file must have either file_data or file_name")
+			return nil, errors.New("input_file must have either file_data or filename")
 		}
 		return &ChatMessagePart{
 			Type: "file",
 			File: &ChatMessageFile{
 				Filename: c.FileName,
 				FileData: c.FileData,
+				FileID:   c.FileId,
 			},
 		}, nil
 	default:
 		return nil, nil
 	}
-}
-
-type RefusalResponses struct {
-	Refusal string `json:"refusal,omitempty"`
-	Type    string `json:"type,omitempty"`
 }
 
 type Annotations struct {
@@ -560,9 +703,9 @@ type ResponsesTools struct {
 	Filters        any      `json:"filters,omitempty"`
 	RankingOptions any      `json:"ranking_options,omitempty"`
 	// Computer Use
-	DisplayWidth  uint   `json:"display_width,omitempty"`
-	DisplayHeight uint   `json:"display_height,omitempty"`
-	Environment   string `json:"environment,omitempty"`
+	DisplayWidth  uint            `json:"display_width,omitempty"`
+	DisplayHeight uint            `json:"display_height,omitempty"`
+	Environment   json.RawMessage `json:"environment,omitempty"`
 	// Function
 	Name        string `json:"name,omitempty"`
 	Description string `json:"description,omitempty"`
@@ -697,6 +840,50 @@ type ReasoningEffort struct {
 	Effort          *string `json:"effort,omitempty"`
 	GenerateSummary *string `json:"generate_summary,omitempty"` // Deprecated
 	Summary         *string `json:"summary,omitempty"`
+
+	rawFields map[string]json.RawMessage `json:"-"`
+}
+
+var reasoningEffortJSONFields = collectJSONFieldNames(reflect.TypeOf(ReasoningEffort{}))
+
+func (r *ReasoningEffort) UnmarshalJSON(data []byte) error {
+	type reasoningEffortAlias ReasoningEffort
+	var alias reasoningEffortAlias
+	if err := json.Unmarshal(data, &alias); err != nil {
+		return err
+	}
+	var rawFields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &rawFields); err != nil {
+		return err
+	}
+	*r = ReasoningEffort(alias)
+	r.rawFields = rawFields
+	return nil
+}
+
+func (r ReasoningEffort) MarshalJSON() ([]byte, error) {
+	type reasoningEffortAlias ReasoningEffort
+	knownJSON, err := json.Marshal(reasoningEffortAlias(r))
+	if err != nil {
+		return nil, err
+	}
+	var knownFields map[string]json.RawMessage
+	if err := json.Unmarshal(knownJSON, &knownFields); err != nil {
+		return nil, err
+	}
+	fields := make(map[string]json.RawMessage, len(r.rawFields)+len(knownFields))
+	for field, raw := range r.rawFields {
+		fields[field] = raw
+	}
+	for field := range reasoningEffortJSONFields {
+		if _, projected := knownFields[field]; !projected && !isExplicitJSONEmpty(r.rawFields[field]) {
+			delete(fields, field)
+		}
+	}
+	for field, raw := range knownFields {
+		fields[field] = raw
+	}
+	return json.Marshal(fields)
 }
 
 type OpenAIResponsesResponses struct {
@@ -710,7 +897,7 @@ type OpenAIResponsesResponses struct {
 	MaxOutputTokens      int               `json:"max_output_tokens,omitempty"`
 	MaxToolCalls         *int              `json:"max_tool_calls,omitempty"`
 	Metadata             map[string]string `json:"metadata,omitempty"`
-	Model                string            `json:"model"`
+	Model                string            `json:"model,omitempty"`
 	Object               string            `json:"object"`
 	Output               []ResponsesOutput `json:"output,omitempty"`
 	ParallelToolCalls    *bool             `json:"parallel_tool_calls,omitempty"`
@@ -721,7 +908,8 @@ type OpenAIResponsesResponses struct {
 	Reasoning            *ReasoningEffort  `json:"reasoning,omitempty"`
 	SafetyIdentifier     string            `json:"safety_identifier,omitempty"`
 	ServiceTier          string            `json:"service_tier,omitempty"`
-	Status               string            `json:"status"`
+	ProcessingClass      string            `json:"processing_class,omitempty"`
+	Status               string            `json:"status,omitempty"`
 	Store                *bool             `json:"store,omitempty"`
 	Temperature          *float64          `json:"temperature,omitempty"`
 	Text                 any               `json:"text,omitempty"`
@@ -731,6 +919,167 @@ type OpenAIResponsesResponses struct {
 	Truncation           string            `json:"truncation,omitempty"`
 
 	Usage *ResponsesUsage `json:"usage,omitempty"`
+
+	rawFields                map[string]json.RawMessage   `json:"-"`
+	originalKnownFieldHashes map[string][sha256.Size]byte `json:"-"`
+	rawProviderJSON          []byte                       `json:"-"`
+	captureProviderRawJSON   bool                         `json:"-"`
+	replayProviderRawJSON    bool                         `json:"-"`
+}
+
+func (r *OpenAIResponsesResponses) SetProviderRawJSON(raw []byte) {
+	if r == nil {
+		return
+	}
+	r.rawProviderJSON = append(r.rawProviderJSON[:0], raw...)
+}
+
+// DecodeCapturedProviderJSON prefers the complete current DTO, then falls
+// back to the stable response evidence used by ownership and billing. The raw
+// JSON remains the exact-wire delivery truth in either case.
+func (r *OpenAIResponsesResponses) DecodeCapturedProviderJSON(raw []byte) error {
+	if r == nil {
+		return errors.New("responses response is required")
+	}
+	if err := json.Unmarshal(raw, r); err == nil {
+		return nil
+	}
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return err
+	}
+	if fields == nil {
+		return errors.New("provider response must be a JSON object")
+	}
+
+	*r = OpenAIResponsesResponses{rawFields: fields}
+	DecodeOptionalRawField(fields, "id", &r.ID)
+	DecodeOptionalRawField(fields, "model", &r.Model)
+	DecodeOptionalRawField(fields, "object", &r.Object)
+	DecodeOptionalRawField(fields, "status", &r.Status)
+	DecodeOptionalRawField(fields, "service_tier", &r.ServiceTier)
+	DecodeOptionalRawField(fields, "store", &r.Store)
+	DecodeOptionalRawField(fields, "created_at", &r.CreatedAt)
+	DecodeOptionalRawField(fields, "error", &r.Error)
+	DecodeOptionalRawField(fields, "incomplete_details", &r.IncompleteDetail)
+	DecodeOptionalRawField(fields, "output", &r.Output)
+	DecodeOptionalRawField(fields, "tools", &r.Tools)
+	DecodeOptionalRawField(fields, "usage", &r.Usage)
+	return nil
+}
+
+// DecodeOptionalRawField stages one observation field. Unknown or malformed
+// observations do not block raw delivery and never publish a partial value.
+func DecodeOptionalRawField(fields map[string]json.RawMessage, name string, destination any) {
+	raw, ok := fields[name]
+	if !ok || len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return
+	}
+	target := reflect.ValueOf(destination)
+	if target.Kind() != reflect.Pointer || target.IsNil() || target.Elem().Kind() == reflect.Invalid {
+		return
+	}
+	temporary := reflect.New(target.Elem().Type())
+	if err := json.Unmarshal(raw, temporary.Interface()); err == nil {
+		target.Elem().Set(temporary.Elem())
+	}
+}
+
+func (r *OpenAIResponsesResponses) ProviderRawJSON() []byte {
+	if r == nil {
+		return nil
+	}
+	return append([]byte(nil), r.rawProviderJSON...)
+}
+
+func (r *OpenAIResponsesResponses) EnableProviderRawJSONCapture() {
+	if r != nil {
+		r.captureProviderRawJSON = true
+	}
+}
+
+func (r *OpenAIResponsesResponses) CaptureProviderRawJSON() bool {
+	return r != nil && r.captureProviderRawJSON
+}
+
+func (r *OpenAIResponsesResponses) EnableProviderRawJSONReplay() {
+	if r != nil {
+		r.replayProviderRawJSON = true
+	}
+}
+
+func (r *OpenAIResponsesResponses) ReplayProviderRawJSON() []byte {
+	if r == nil || !r.replayProviderRawJSON {
+		return nil
+	}
+	return r.ProviderRawJSON()
+}
+
+var openAIResponsesResponseJSONFields = collectJSONFieldNames(reflect.TypeOf(OpenAIResponsesResponses{}))
+
+func (r *OpenAIResponsesResponses) UnmarshalJSON(data []byte) error {
+	type responseAlias OpenAIResponsesResponses
+	var alias responseAlias
+	if err := json.Unmarshal(data, &alias); err != nil {
+		return err
+	}
+	var rawFields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &rawFields); err != nil {
+		return err
+	}
+	*r = OpenAIResponsesResponses(alias)
+	r.rawFields = rawFields
+	knownJSON, err := json.Marshal(alias)
+	if err != nil {
+		return err
+	}
+	var originalKnownFields map[string]json.RawMessage
+	if err := json.Unmarshal(knownJSON, &originalKnownFields); err != nil {
+		return err
+	}
+	r.originalKnownFieldHashes = make(map[string][sha256.Size]byte, len(originalKnownFields))
+	for field, raw := range originalKnownFields {
+		r.originalKnownFieldHashes[field] = sha256.Sum256(raw)
+	}
+	return nil
+}
+
+func (r OpenAIResponsesResponses) MarshalJSON() ([]byte, error) {
+	type responseAlias OpenAIResponsesResponses
+	knownJSON, err := json.Marshal(responseAlias(r))
+	if err != nil {
+		return nil, err
+	}
+	var knownFields map[string]json.RawMessage
+	if err := json.Unmarshal(knownJSON, &knownFields); err != nil {
+		return nil, err
+	}
+	fields := make(map[string]json.RawMessage, len(r.rawFields)+len(knownFields))
+	for field, raw := range r.rawFields {
+		fields[field] = raw
+	}
+	for field := range openAIResponsesResponseJSONFields {
+		if _, projected := knownFields[field]; !projected && !isExplicitJSONEmpty(r.rawFields[field]) {
+			delete(fields, field)
+		}
+	}
+	for field, raw := range knownFields {
+		// A same-dialect response owns no provider response fields. If the typed
+		// projection is unchanged, retain the original JSON for the whole field so
+		// future nested unions, extension members, and JSON numbers survive without
+		// teaching every nested DTO about them. Error objects deliberately remain on
+		// the typed path because provider-account details have a stricter exposure
+		// boundary than ordinary response extensions.
+		originalHash, originallyKnown := r.originalKnownFieldHashes[field]
+		if field != "error" && originallyKnown && sha256.Sum256(raw) == originalHash {
+			if _, present := r.rawFields[field]; present {
+				continue
+			}
+		}
+		fields[field] = raw
+	}
+	return json.Marshal(fields)
 }
 
 type TextResponses struct {
@@ -748,27 +1097,37 @@ func (cc *OpenAIResponsesResponses) GetContent() string {
 }
 
 func (m ResponsesOutput) StringContent() string {
+	text, _ := m.messageContentStrings()
+	return text
+}
+
+func (m ResponsesOutput) messageContentStrings() (string, string) {
 	if m.Type != "message" {
-		return ""
+		return "", ""
 	}
 
 	content, ok := m.Content.(string)
 	if ok {
-		return content
+		return content, ""
 	}
 	contentItems, ok := m.Content.([]ContentResponses)
 	if ok {
-		var contentStr strings.Builder
+		var text strings.Builder
+		var refusal strings.Builder
 		for _, contentItem := range contentItems {
 			if contentItem.Text != "" {
-				contentStr.WriteString(contentItem.Text)
+				text.WriteString(contentItem.Text)
+			}
+			if contentItem.Type == ContentTypeRefusal && contentItem.Refusal != "" {
+				refusal.WriteString(contentItem.Refusal)
 			}
 		}
-		return contentStr.String()
+		return text.String(), refusal.String()
 	}
 	contentList, ok := m.Content.([]any)
 	if ok {
-		var contentStr strings.Builder
+		var text strings.Builder
+		var refusal strings.Builder
 		for _, contentItem := range contentList {
 			contentMap, ok := contentItem.(map[string]any)
 			if !ok {
@@ -776,12 +1135,17 @@ func (m ResponsesOutput) StringContent() string {
 			}
 
 			if subStr, ok := contentMap["text"].(string); ok && subStr != "" {
-				contentStr.WriteString(subStr)
+				text.WriteString(subStr)
+			}
+			if contentType, _ := contentMap["type"].(string); contentType == ContentTypeRefusal {
+				if subStr, ok := contentMap["refusal"].(string); ok && subStr != "" {
+					refusal.WriteString(subStr)
+				}
 			}
 		}
-		return contentStr.String()
+		return text.String(), refusal.String()
 	}
-	return ""
+	return "", ""
 }
 
 func (m ResponsesOutput) GetSummaryString() string {
@@ -814,6 +1178,7 @@ type ResponsesOutput struct {
 	Arguments           *string              `json:"arguments,omitempty"`
 	CallID              string               `json:"call_id,omitempty"`
 	Name                string               `json:"name,omitempty"`
+	Input               string               `json:"input,omitempty"`
 	Action              any                  `json:"action,omitempty"`
 	PendingSafetyChecks any                  `json:"pending_safety_checks,omitempty"`
 	Summary             SummaryResponsesList `json:"summary,omitempty"`
@@ -833,13 +1198,18 @@ type ResponsesOutput struct {
 	Result        any    `json:"result,omitempty"`         // The result of the image generation call.
 	Size          string `json:"size,omitempty"`           // The size of the image to be generated.
 	RevisedPrompt any    `json:"revised_prompt,omitempty"` // The revised prompt for the image generation call.
+
+	rawFields map[string]json.RawMessage `json:"-"`
 }
+
+var responsesOutputJSONFields = collectJSONFieldNames(reflect.TypeOf(ResponsesOutput{}))
 
 func (m *ResponsesOutput) UnmarshalJSON(data []byte) error {
 	type responsesOutputAlias ResponsesOutput
 	type responsesOutputPayload struct {
 		*responsesOutputAlias
 		Arguments json.RawMessage `json:"arguments"`
+		Quality   json.RawMessage `json:"quality"`
 	}
 
 	alias := responsesOutputAlias(*m)
@@ -849,6 +1219,9 @@ func (m *ResponsesOutput) UnmarshalJSON(data []byte) error {
 	}
 
 	*m = ResponsesOutput(alias)
+	if err := json.Unmarshal(data, &m.rawFields); err != nil {
+		return err
+	}
 	if payload.Arguments != nil {
 		arguments, present, err := responsesArgumentsString(payload.Arguments)
 		if err != nil {
@@ -860,28 +1233,124 @@ func (m *ResponsesOutput) UnmarshalJSON(data []byte) error {
 			m.Arguments = nil
 		}
 	}
+	if payload.Quality != nil {
+		var quality string
+		if err := json.Unmarshal(payload.Quality, &quality); err == nil {
+			m.Quality = quality
+		} else {
+			// 保留未来 union 的原始字段；本地仅将已知字符串质量用于计费。
+			m.Quality = ""
+		}
+	}
 	return nil
 }
 
 func (m ResponsesOutput) MarshalJSON() ([]byte, error) {
 	type responsesOutputAlias ResponsesOutput
 
-	raw, err := json.Marshal(responsesOutputAlias(m))
+	knownJSON, err := json.Marshal(responsesOutputAlias(m))
 	if err != nil {
 		return nil, err
 	}
-
-	if m.Type != InputTypeReasoning {
-		return raw, nil
+	if !isKnownResponsesOutputType(m.Type) && len(m.rawFields) > 0 {
+		return json.Marshal(m.rawFields)
 	}
-
-	var payload map[string]any
-	if err := json.Unmarshal(raw, &payload); err != nil {
+	var knownFields map[string]json.RawMessage
+	if err := json.Unmarshal(knownJSON, &knownFields); err != nil {
 		return nil, err
 	}
+	fields := make(map[string]json.RawMessage, len(m.rawFields)+len(knownFields))
+	for field, raw := range m.rawFields {
+		fields[field] = raw
+	}
+	for field := range responsesOutputJSONFields {
+		if _, projected := knownFields[field]; !projected && !isExplicitJSONEmpty(m.rawFields[field]) {
+			if field == "quality" && isUnknownResponsesOutputQuality(m.rawFields[field]) {
+				continue
+			}
+			delete(fields, field)
+		}
+	}
+	for field, raw := range knownFields {
+		fields[field] = raw
+	}
+	if m.Type == InputTypeReasoning {
+		summary, err := json.Marshal(summaryResponsesForMarshal(m.Summary))
+		if err != nil {
+			return nil, err
+		}
+		fields["summary"] = summary
+	}
+	if m.Type == InputTypeCustomToolCall {
+		input, err := json.Marshal(m.Input)
+		if err != nil {
+			return nil, err
+		}
+		fields["input"] = input
+	}
+	return json.Marshal(fields)
+}
 
-	payload["summary"] = summaryResponsesForMarshal(m.Summary)
-	return json.Marshal(payload)
+func isUnknownResponsesOutputQuality(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && trimmed[0] != '"' && !bytes.Equal(trimmed, []byte("null"))
+}
+
+func isExplicitJSONEmpty(raw json.RawMessage) bool {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return false
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return false
+	}
+	switch typed := value.(type) {
+	case nil:
+		return true
+	case bool:
+		return !typed
+	case string:
+		return typed == ""
+	case json.Number:
+		number, err := typed.Float64()
+		return err == nil && number == 0
+	case []any:
+		return len(typed) == 0
+	case map[string]any:
+		return len(typed) == 0
+	default:
+		return false
+	}
+}
+
+func isKnownResponsesOutputType(outputType string) bool {
+	switch strings.TrimSpace(outputType) {
+	case InputTypeMessage,
+		InputTypeFileSearchCall,
+		InputTypeComputerCall,
+		InputTypeWebSearchCall,
+		InputTypeComputerCallOutput,
+		InputTypeFunctionCall,
+		InputTypeFunctionCallOutput,
+		InputTypeCustomToolCall,
+		InputTypeCustomToolCallOutput,
+		InputTypeReasoning,
+		InputTypeImageGenerationCall,
+		InputTypeCodeInterpreterCall,
+		InputTypeShellCall,
+		InputTypeShellCallOutput,
+		InputTypeLocalShellCall,
+		InputTypeLocalShellCallOutput,
+		InputTypeMCPListTools,
+		InputTypeMCPApprovalRequest,
+		InputTypeMCPApprovalResponse,
+		InputTypeMCPCall:
+		return true
+	default:
+		return false
+	}
 }
 
 func responsesArgumentsString(data json.RawMessage) (string, bool, error) {
@@ -957,24 +1426,82 @@ type OpenAIResponsesStreamResponses struct {
 }
 
 type ResponsesUsage struct {
-	InputTokens         int                                `json:"input_tokens"`
-	OutputTokens        int                                `json:"output_tokens"`
-	TotalTokens         int                                `json:"total_tokens"`
-	OutputTokensDetails *ResponsesUsageOutputTokensDetails `json:"output_tokens_details"`
-	InputTokensDetails  *ResponsesUsageInputTokensDetails  `json:"input_tokens_details"`
+	InputTokens          int                                `json:"input_tokens"`
+	OutputTokens         int                                `json:"output_tokens"`
+	TotalTokens          int                                `json:"total_tokens"`
+	OutputTokensDetails  *ResponsesUsageOutputTokensDetails `json:"output_tokens_details"`
+	InputTokensDetails   *ResponsesUsageInputTokensDetails  `json:"input_tokens_details"`
+	ProviderReported     bool                               `json:"-"`
+	ProviderTokenFields  map[string]bool                    `json:"-"`
+	providerWireObserved bool                               `json:"-"`
+}
+
+func (u *ResponsesUsage) UnmarshalJSON(data []byte) error {
+	type responsesUsageAlias ResponsesUsage
+	var decoded responsesUsageAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*u = ResponsesUsage(decoded)
+	u.providerWireObserved = true
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(data, &fields) == nil {
+		u.ProviderTokenFields = make(map[string]bool)
+		for _, field := range []string{"input_tokens", "output_tokens", "total_tokens"} {
+			if validUsageInteger(fields[field]) {
+				u.ProviderTokenFields[field] = true
+			}
+		}
+		markUsageDetailPresence(u.ProviderTokenFields, fields["input_tokens_details"], true)
+		markUsageDetailPresence(u.ProviderTokenFields, fields["output_tokens_details"], false)
+	}
+	return nil
+}
+
+func (u *ResponsesUsage) MarkProviderReported() {
+	if u == nil {
+		return
+	}
+	u.ProviderReported = true
+	if len(u.ProviderTokenFields) == 0 && !u.providerWireObserved {
+		u.ProviderTokenFields = map[string]bool{"input_tokens": true, "output_tokens": true, "total_tokens": true}
+	}
 }
 
 type ResponsesUsageOutputTokensDetails struct {
 	ReasoningTokens int `json:"reasoning_tokens"`
+	TextTokens      int `json:"text_tokens,omitempty"`
+	ImageTokens     int `json:"image_tokens,omitempty"`
 }
 
 type ResponsesUsageInputTokensDetails struct {
 	AudioTokens       int `json:"audio_tokens,omitempty"`
 	CachedTokens      int `json:"cached_tokens"`
 	CachedReadTokens  int `json:"cached_read_tokens,omitempty"`
+	CacheWriteTokens  int `json:"cache_write_tokens,omitempty"`
 	CachedWriteTokens int `json:"cached_write_tokens,omitempty"`
 	TextTokens        int `json:"text_tokens,omitempty"`
 	ImageTokens       int `json:"image_tokens,omitempty"`
+}
+
+// MarshalJSON keeps provider-specific cache evidence internal while preserving
+// the cache fields defined by the public Responses wire. Exact-wire relays
+// preserve provider JSON before this typed representation is involved.
+func (d ResponsesUsageInputTokensDetails) MarshalJSON() ([]byte, error) {
+	type responsesUsageInputTokensDetailsWire struct {
+		AudioTokens      int `json:"audio_tokens,omitempty"`
+		CachedTokens     int `json:"cached_tokens"`
+		CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
+		TextTokens       int `json:"text_tokens,omitempty"`
+		ImageTokens      int `json:"image_tokens,omitempty"`
+	}
+	return json.Marshal(responsesUsageInputTokensDetailsWire{
+		AudioTokens:      d.AudioTokens,
+		CachedTokens:     d.CachedTokens,
+		CacheWriteTokens: d.CacheWriteTokens,
+		TextTokens:       d.TextTokens,
+		ImageTokens:      d.ImageTokens,
+	})
 }
 
 func GetResponsesExtraBilling(response *OpenAIResponsesResponses) map[string]ExtraBilling {
@@ -983,56 +1510,290 @@ func GetResponsesExtraBilling(response *OpenAIResponsesResponses) map[string]Ext
 	}
 
 	usage := &Usage{}
-	for _, output := range response.Output {
-		switch output.Type {
-		case InputTypeWebSearchCall:
-			searchType := "medium"
-			for _, tool := range response.Tools {
-				if IsResponsesWebSearchToolType(tool.Type) && tool.SearchContextSize != "" {
-					searchType = tool.SearchContextSize
-				}
-			}
-			usage.IncExtraBilling(APIToolTypeWebSearchPreview, searchType)
-		case InputTypeCodeInterpreterCall:
-			usage.IncExtraBilling(APIToolTypeCodeInterpreter, "")
-		case InputTypeFileSearchCall:
-			usage.IncExtraBilling(APIToolTypeFileSearch, "")
-		case InputTypeImageGenerationCall:
-			usage.IncExtraBilling(APIToolTypeImageGeneration, output.Quality+"-"+output.Size)
-		}
-	}
-
+	ApplyResponsesExtraBilling(response, usage)
 	return cloneExtraBillingMap(usage.ExtraBilling)
 }
 
+func GetResponsesBillingDiagnostics(response *OpenAIResponsesResponses) map[string]bool {
+	if response == nil || len(response.Output) == 0 {
+		return nil
+	}
+	usage := &Usage{}
+	ApplyResponsesExtraBilling(response, usage)
+	return cloneBillingDiagnostics(usage.BillingDiagnostics)
+}
+
+func ApplyResponsesExtraBilling(response *OpenAIResponsesResponses, usage *Usage) {
+	ApplyResponsesExtraBillingWithImagePartialCounts(response, usage, nil)
+}
+
+// ApplyResponsesExtraBillingWithImagePartialCounts applies tool billing from a
+// completed Responses object. Image partials are streaming output evidence, so
+// callers that observed the stream can supply the actual distinct count for
+// each output item. A nil resolver means that no partial image was observed.
+func ApplyResponsesExtraBillingWithImagePartialCounts(response *OpenAIResponsesResponses, usage *Usage, imagePartialCount func(output *ResponsesOutput, outputIndex int) int) {
+	if response == nil || usage == nil {
+		return
+	}
+	imageGenerationType := ResponsesImageGenerationBillingType(response)
+	searchServiceType, searchType := ResponsesWebSearchBilling(response)
+	if searchServiceType == "" {
+		searchServiceType = APIToolTypeWebSearchPreview
+	}
+	if searchType == "" {
+		searchType = "medium"
+	}
+	for outputIndex := range response.Output {
+		output := &response.Output[outputIndex]
+		switch output.Type {
+		case InputTypeWebSearchCall:
+			bill, unknownAction := ShouldBillResponsesWebSearch(*output)
+			if unknownAction {
+				usage.AddBillingDiagnostic("web_search_action_unknown")
+			}
+			if !bill {
+				continue
+			}
+			usage.IncProviderExtraBilling(searchServiceType, searchType)
+		case InputTypeImageGenerationCall:
+			if ShouldBillResponsesImageGenerationResponse(response) {
+				applyResponsesImageGenerationOutputBilling(usage, output, outputIndex, imageGenerationType, imagePartialCount)
+			}
+		}
+	}
+}
+
+func ResponsesWebSearchBilling(response *OpenAIResponsesResponses) (serviceType, billingType string) {
+	if response == nil {
+		return "", ""
+	}
+	for _, tool := range response.Tools {
+		toolType := strings.TrimSpace(tool.Type)
+		if !IsResponsesWebSearchToolType(toolType) {
+			continue
+		}
+		toolBillingType := strings.TrimSpace(tool.SearchContextSize)
+		if toolBillingType == "" {
+			toolBillingType = "medium"
+		}
+		if toolType == APIToolTypeWebSearch {
+			if serviceType == "" {
+				serviceType = APIToolTypeWebSearch
+				billingType = toolBillingType
+			}
+			continue
+		}
+		// Preview dominates an ambiguous mixed tool list because output events do
+		// not identify which search declaration produced the call.
+		if serviceType != APIToolTypeWebSearchPreview {
+			billingType = toolBillingType
+		}
+		serviceType = APIToolTypeWebSearchPreview
+	}
+	return serviceType, billingType
+}
+
+func ApplyResponsesImageGenerationBillingWithPartialCounts(response *OpenAIResponsesResponses, usage *Usage, imagePartialCount func(output *ResponsesOutput, outputIndex int) int) {
+	if response == nil || usage == nil || !ShouldBillResponsesImageGenerationResponse(response) {
+		return
+	}
+	imageGenerationType := ResponsesImageGenerationBillingType(response)
+	for outputIndex := range response.Output {
+		output := &response.Output[outputIndex]
+		if output.Type == InputTypeImageGenerationCall {
+			applyResponsesImageGenerationOutputBilling(usage, output, outputIndex, imageGenerationType, imagePartialCount)
+		}
+	}
+}
+
+func applyResponsesImageGenerationOutputBilling(usage *Usage, output *ResponsesOutput, outputIndex int, imageGenerationType string, imagePartialCount func(output *ResponsesOutput, outputIndex int) int) {
+	if usage == nil || output == nil || !ShouldBillResponsesImageGeneration(*output) {
+		return
+	}
+	partialImages := 0
+	if imagePartialCount != nil {
+		partialImages = imagePartialCount(output, outputIndex)
+		if partialImages < 0 {
+			return
+		}
+	}
+	usage.IncProviderExtraBilling(APIToolTypeImageGeneration, ResponsesImageGenerationOutputBillingType(imageGenerationType, output, partialImages))
+}
+
+// ResponsesImageGenerationBillingType captures the pricing-relevant image tool
+// configuration carried by a Responses object. The output item can later refine
+// quality and size when the provider resolves an "auto" request.
+func ResponsesImageGenerationBillingType(response *OpenAIResponsesResponses) string {
+	if response == nil {
+		return ""
+	}
+	for _, tool := range response.Tools {
+		if tool.Type != APIToolTypeImageGeneration {
+			continue
+		}
+		// partial_images is a request limit, not evidence that the provider
+		// emitted that many partial image events.
+		return BuildResponsesImageGenerationBillingType(tool.Model, tool.Quality, tool.Size, 0)
+	}
+	return ""
+}
+
+func BuildResponsesImageGenerationBillingType(model, quality, size string, partialImages int) string {
+	if partialImages < 0 {
+		partialImages = 0
+	}
+	return strings.Join([]string{
+		strings.ToLower(strings.TrimSpace(model)),
+		strings.ToLower(strings.TrimSpace(quality)),
+		strings.ToLower(strings.TrimSpace(size)),
+		strconv.Itoa(partialImages),
+	}, "|")
+}
+
+func ResponsesImageGenerationOutputBillingType(configuredType string, output *ResponsesOutput, observedPartialImages ...int) string {
+	model, quality, size, partialImages := "", "", "", 0
+	parts := strings.Split(configuredType, "|")
+	if len(parts) == 4 {
+		model, quality, size = parts[0], parts[1], parts[2]
+		if parsed, err := strconv.Atoi(parts[3]); err == nil && parsed > 0 {
+			partialImages = parsed
+		}
+	}
+	if output != nil {
+		if value := strings.TrimSpace(output.Quality); value != "" {
+			quality = value
+		}
+		if value := strings.TrimSpace(output.Size); value != "" {
+			size = value
+		}
+	}
+	if len(observedPartialImages) > 0 {
+		partialImages = observedPartialImages[0]
+		if partialImages < 0 {
+			partialImages = 0
+		}
+	}
+	if configuredType == "" && model == "" && partialImages == 0 && quality != "" && size != "" {
+		return strings.ToLower(strings.TrimSpace(quality)) + "-" + strings.ToLower(strings.TrimSpace(size))
+	}
+	return BuildResponsesImageGenerationBillingType(model, quality, size, partialImages)
+}
+
+func ShouldBillResponsesImageGenerationResponse(response *OpenAIResponsesResponses) bool {
+	if response == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(response.Status)) {
+	case "failed", "cancelled", "canceled", "incomplete":
+		return false
+	default:
+		return true
+	}
+}
+
+func ShouldBillResponsesImageGeneration(output ResponsesOutput) bool {
+	switch strings.ToLower(strings.TrimSpace(output.Status)) {
+	case "completed":
+		return true
+	case "failed", "cancelled", "canceled", "incomplete":
+		return false
+	default:
+		return output.Result != nil
+	}
+}
+
+func ShouldBillResponsesWebSearch(output ResponsesOutput) (bill bool, unknownAction bool) {
+	if !strings.EqualFold(strings.TrimSpace(output.Status), "completed") {
+		return false, false
+	}
+	actionType := responsesActionType(output.Action)
+	switch actionType {
+	case "search":
+		return true, false
+	case "open_page", "find_in_page":
+		return false, false
+	default:
+		// A completed provider-originated web_search_call proves one billable
+		// action even when a future/omitted subtype cannot be classified.
+		return true, true
+	}
+}
+
+func responsesActionType(action any) string {
+	if action == nil {
+		return ""
+	}
+	if object, ok := action.(map[string]any); ok {
+		if actionType, ok := object["type"].(string); ok {
+			return strings.ToLower(strings.TrimSpace(actionType))
+		}
+	}
+	raw, err := json.Marshal(action)
+	if err != nil {
+		return ""
+	}
+	var envelope struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(envelope.Type))
+}
+
 func (u *ResponsesUsage) ToOpenAIUsage() *Usage {
+	if u == nil {
+		return nil
+	}
 	usage := &Usage{
 		PromptTokens:     u.InputTokens,
 		CompletionTokens: u.OutputTokens,
 		TotalTokens:      u.TotalTokens,
+		ProviderTokenFields: map[string]bool{
+			"prompt_tokens":     u.ProviderTokenFields["input_tokens"],
+			"completion_tokens": u.ProviderTokenFields["output_tokens"],
+			"total_tokens":      u.ProviderTokenFields["total_tokens"],
+		},
+		providerWireObserved: u.providerWireObserved,
+	}
+	for key, present := range u.ProviderTokenFields {
+		if key != "input_tokens" && key != "output_tokens" && key != "total_tokens" {
+			usage.ProviderTokenFields[key] = present
+		}
 	}
 
 	if u.OutputTokensDetails != nil {
 		usage.CompletionTokensDetails.ReasoningTokens = u.OutputTokensDetails.ReasoningTokens
+		usage.CompletionTokensDetails.TextTokens = u.OutputTokensDetails.TextTokens
+		usage.CompletionTokensDetails.ImageTokens = u.OutputTokensDetails.ImageTokens
 	}
 
 	if u.InputTokensDetails != nil {
 		usage.PromptTokensDetails.AudioTokens = u.InputTokensDetails.AudioTokens
 		usage.PromptTokensDetails.CachedTokens = u.InputTokensDetails.CachedTokens
 		usage.PromptTokensDetails.CachedReadTokens = u.InputTokensDetails.CachedReadTokens
+		usage.PromptTokensDetails.CacheWriteTokens = u.InputTokensDetails.CacheWriteTokens
 		usage.PromptTokensDetails.CachedWriteTokens = u.InputTokensDetails.CachedWriteTokens
 		usage.PromptTokensDetails.TextTokens = u.InputTokensDetails.TextTokens
 		usage.PromptTokensDetails.ImageTokens = u.InputTokensDetails.ImageTokens
+	}
+	if u.ProviderReported {
+		usage.MarkProviderReported()
 	}
 
 	return usage
 }
 
 func (u *Usage) ToResponsesUsage() *ResponsesUsage {
+	if u == nil {
+		return nil
+	}
+
 	responsesUsage := &ResponsesUsage{
-		InputTokens:  u.PromptTokens,
-		OutputTokens: u.CompletionTokens,
-		TotalTokens:  u.TotalTokens,
+		InputTokens:      u.PromptTokens,
+		OutputTokens:     u.CompletionTokens,
+		TotalTokens:      u.TotalTokens,
+		ProviderReported: u.ProviderReported,
 	}
 
 	if u.CompletionTokensDetails.ReasoningTokens > 0 {
@@ -1045,6 +1806,7 @@ func (u *Usage) ToResponsesUsage() *ResponsesUsage {
 		AudioTokens:       u.PromptTokensDetails.AudioTokens,
 		CachedTokens:      u.PromptTokensDetails.CachedTokens,
 		CachedReadTokens:  u.PromptTokensDetails.CachedReadTokens,
+		CacheWriteTokens:  u.PromptTokensDetails.CacheWriteTokens,
 		CachedWriteTokens: u.PromptTokensDetails.CachedWriteTokens,
 		TextTokens:        u.PromptTokensDetails.TextTokens,
 		ImageTokens:       u.PromptTokensDetails.ImageTokens,
@@ -1108,7 +1870,8 @@ func (cc *ChatCompletionResponse) ToResponses(request *OpenAIResponsesRequest) *
 		Reasoning:            request.Reasoning,
 		Temperature:          request.Temperature,
 		SafetyIdentifier:     request.SafetyIdentifier,
-		ServiceTier:          request.ServiceTier,
+		ServiceTier:          cc.ServiceTier,
+		ProcessingClass:      request.ProcessingClass,
 		Store:                request.Store,
 		ToolChoice:           request.ToolChoice,
 		TopP:                 request.TopP,
@@ -1122,36 +1885,15 @@ func (cc *ChatCompletionResponse) ToResponses(request *OpenAIResponsesRequest) *
 	for _, choice := range cc.Choices {
 		status = ConvertChatStatusToResponses(choice.FinishReason)
 
-		// 函数调用
-		if choice.FinishReason == FinishReasonToolCalls {
-			for _, tool := range choice.Message.ToolCalls {
-				if tool.Function == nil {
-					continue
-				}
-				outputs = append(outputs, ResponsesOutput{
-					Type:      InputTypeFunctionCall,
-					ID:        fmt.Sprintf("fc_%s", utils.GetRandomString(48)),
-					Status:    ResponseStatusCompleted,
-					CallID:    tool.Id,
-					Name:      tool.Function.Name,
-					Arguments: &tool.Function.Arguments,
-				})
-			}
-		} else {
-			// 不支持音频
-			if choice.Message.Audio != nil {
-				continue
-			}
-
+		// Chat responses may carry assistant content and tool calls together.
+		// finish_reason describes why generation stopped; it is not a union tag.
+		if choice.Message.Audio == nil {
 			content := make([]ContentResponses, 0)
 
 			if choice.Message.Refusal != "" {
 				content = append(content, ContentResponses{
-					Type: ContentTypeRefusal,
-					Refusal: &RefusalResponses{
-						Type:    "refusal",
-						Refusal: choice.Message.Refusal,
-					},
+					Type:    ContentTypeRefusal,
+					Refusal: choice.Message.Refusal,
 				})
 			}
 
@@ -1187,6 +1929,34 @@ func (cc *ChatCompletionResponse) ToResponses(request *OpenAIResponsesRequest) *
 				})
 			}
 		}
+
+		for _, tool := range choice.Message.ToolCalls {
+			if tool == nil {
+				continue
+			}
+			if tool.Type == ToolChoiceTypeCustom && tool.Custom != nil {
+				outputs = append(outputs, ResponsesOutput{
+					Type:   InputTypeCustomToolCall,
+					ID:     fmt.Sprintf("ctc_%s", utils.GetRandomString(48)),
+					Status: ResponseStatusCompleted,
+					CallID: tool.Id,
+					Name:   tool.Custom.Name,
+					Input:  tool.Custom.Input,
+				})
+				continue
+			}
+			if tool.Function == nil {
+				continue
+			}
+			outputs = append(outputs, ResponsesOutput{
+				Type:      InputTypeFunctionCall,
+				ID:        fmt.Sprintf("fc_%s", utils.GetRandomString(48)),
+				Status:    ResponseStatusCompleted,
+				CallID:    tool.Id,
+				Name:      tool.Function.Name,
+				Arguments: &tool.Function.Arguments,
+			})
+		}
 	}
 
 	res.Status = status
@@ -1197,12 +1967,13 @@ func (cc *ChatCompletionResponse) ToResponses(request *OpenAIResponsesRequest) *
 
 func (r *OpenAIResponsesResponses) ToChat() *ChatCompletionResponse {
 	resp := &ChatCompletionResponse{
-		Created: r.CreatedAt,
-		ID:      r.ID,
-		Model:   r.Model,
-		Object:  "chat.completion",
-		Usage:   r.Usage.ToOpenAIUsage(),
-		Choices: make([]ChatCompletionChoice, 0),
+		Created:     r.CreatedAt,
+		ID:          r.ID,
+		Model:       r.Model,
+		Object:      "chat.completion",
+		ServiceTier: r.ServiceTier,
+		Usage:       r.Usage.ToOpenAIUsage(),
+		Choices:     make([]ChatCompletionChoice, 0),
 	}
 
 	choice := ChatCompletionChoice{
@@ -1215,7 +1986,7 @@ func (r *OpenAIResponsesResponses) ToChat() *ChatCompletionResponse {
 	for _, output := range r.Output {
 		switch output.Type {
 		case InputTypeMessage:
-			choice.Message.Content = output.StringContent()
+			choice.Message.Content, choice.Message.Refusal = output.messageContentStrings()
 		case InputTypeReasoning:
 			choice.Message.ReasoningContent = output.GetSummaryString()
 		case InputTypeFunctionCall:
@@ -1232,6 +2003,19 @@ func (r *OpenAIResponsesResponses) ToChat() *ChatCompletionResponse {
 				Function: &ChatCompletionToolCallsFunction{
 					Name:      output.Name,
 					Arguments: arguments,
+				},
+			})
+			choice.FinishReason = FinishReasonToolCalls
+		case InputTypeCustomToolCall:
+			if choice.Message.ToolCalls == nil {
+				choice.Message.ToolCalls = make([]*ChatCompletionToolCalls, 0)
+			}
+			choice.Message.ToolCalls = append(choice.Message.ToolCalls, &ChatCompletionToolCalls{
+				Id:   output.CallID,
+				Type: ToolChoiceTypeCustom,
+				Custom: &ChatCompletionToolCallsCustom{
+					Name:  output.Name,
+					Input: output.Input,
 				},
 			})
 			choice.FinishReason = FinishReasonToolCalls

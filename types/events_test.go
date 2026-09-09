@@ -11,6 +11,9 @@ func TestUsageEventToChatUsagePreservesExtraBilling(t *testing.T) {
 		InputTokens:  3,
 		OutputTokens: 5,
 		TotalTokens:  8,
+		ExtraUsageUnits: map[string]float64{
+			config.UsageExtraInputAudioTranscription: 2.5,
+		},
 		ExtraBilling: map[string]ExtraBilling{
 			APIToolTypeWebSearchPreview: {
 				Type:      "high",
@@ -29,6 +32,9 @@ func TestUsageEventToChatUsagePreservesExtraBilling(t *testing.T) {
 	}
 	if billing.Type != "high" || billing.CallCount != 1 {
 		t.Fatalf("expected a single high web search tool charge, got %+v", billing)
+	}
+	if usage.ExtraUsageUnits[config.UsageExtraInputAudioTranscription] != 2.5 {
+		t.Fatalf("expected non-integral usage units to survive conversion, got %+v", usage.ExtraUsageUnits)
 	}
 }
 
@@ -64,9 +70,10 @@ func TestUsageEventMergeAccumulatesExtraBilling(t *testing.T) {
 
 func TestUsageEventMergeAccumulatesAllTokenDetailBuckets(t *testing.T) {
 	usage := &UsageEvent{
-		InputTokens:  2,
-		OutputTokens: 3,
-		TotalTokens:  5,
+		ProviderTokenEvidence: true,
+		InputTokens:           2,
+		OutputTokens:          3,
+		TotalTokens:           5,
 		InputTokenDetails: PromptTokensDetails{
 			AudioTokens:          1,
 			CachedTokens:         2,
@@ -87,9 +94,10 @@ func TestUsageEventMergeAccumulatesAllTokenDetailBuckets(t *testing.T) {
 	}
 
 	usage.Merge(&UsageEvent{
-		InputTokens:  17,
-		OutputTokens: 19,
-		TotalTokens:  36,
+		ProviderTokenEvidence: true,
+		InputTokens:           17,
+		OutputTokens:          19,
+		TotalTokens:           36,
 		InputTokenDetails: PromptTokensDetails{
 			AudioTokens:          21,
 			CachedTokens:         22,
@@ -167,6 +175,7 @@ func TestUsageEventCloneDeepCopiesExtraMaps(t *testing.T) {
 		ExtraTokens: map[string]int{
 			"cached": 2,
 		},
+		ExtraUsageUnits: map[string]float64{"duration": 2.5},
 		ExtraBilling: map[string]ExtraBilling{
 			APIToolTypeWebSearchPreview: {
 				Type:      "high",
@@ -181,6 +190,7 @@ func TestUsageEventCloneDeepCopiesExtraMaps(t *testing.T) {
 	}
 
 	cloned.ExtraTokens["cached"] = 99
+	cloned.ExtraUsageUnits["duration"] = 99
 	cloned.ExtraBilling[APIToolTypeWebSearchPreview] = ExtraBilling{
 		Type:      "low",
 		CallCount: 3,
@@ -188,6 +198,9 @@ func TestUsageEventCloneDeepCopiesExtraMaps(t *testing.T) {
 
 	if got := usage.ExtraTokens["cached"]; got != 2 {
 		t.Fatalf("expected source extra tokens to stay unchanged, got %d", got)
+	}
+	if got := usage.ExtraUsageUnits["duration"]; got != 2.5 {
+		t.Fatalf("expected source extra usage units to stay unchanged, got %v", got)
 	}
 	if got := usage.ExtraBilling[APIToolTypeWebSearchPreview].CallCount; got != 1 {
 		t.Fatalf("expected source extra billing to stay unchanged, got %d", got)
@@ -276,5 +289,28 @@ func TestUsageEventAdditionalGuardBranches(t *testing.T) {
 	usage.IncExtraBilling("", "ignored")
 	if len(usage.ExtraBilling) != 0 {
 		t.Fatalf("expected empty extra billing increments to be ignored, got %+v", usage.ExtraBilling)
+	}
+}
+
+func TestUsageEventSourceDoesNotAuthorizeProviderEvidence(t *testing.T) {
+	key := APIToolTypeWebSearch
+	event := &UsageEvent{
+		InputTokens: 1,
+		TotalTokens: 1,
+		Source:      UsageSourceResponsesResponse,
+		ExtraBilling: map[string]ExtraBilling{
+			key: {ServiceType: key, CallCount: 1},
+		},
+	}
+	usage := event.ToChatUsage()
+	if usage.ProviderReported || usage.HasProviderExtraBilling(key) {
+		t.Fatalf("source label authorized provider evidence: %+v", usage)
+	}
+
+	event.ProviderTokenEvidence = true
+	event.ProviderExtraBilling = map[string]bool{key: true}
+	usage = event.ToChatUsage()
+	if !usage.ProviderReported || !usage.HasProviderExtraBilling(key) {
+		t.Fatalf("explicit provider evidence was lost: %+v", usage)
 	}
 }

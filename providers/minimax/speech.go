@@ -50,14 +50,13 @@ func (p *MiniMaxProvider) GetVoiceMap() map[string][]string {
 
 func (p *MiniMaxProvider) getRequestBody(request *types.SpeechAudioRequest) *SpeechRequest {
 	var voice, emotion string
+	voice, _ = request.VoiceString()
 	voiceMap := p.GetVoiceMap()
-	if voiceMap[request.Voice] != nil {
-		voice = voiceMap[request.Voice][0]
-		if len(voiceMap[request.Voice]) > 1 {
-			emotion = voiceMap[request.Voice][1]
+	if mapped := voiceMap[voice]; mapped != nil {
+		voice = mapped[0]
+		if len(mapped) > 1 {
+			emotion = mapped[1]
 		}
-	} else {
-		voice = request.Voice
 	}
 
 	speechRequest := &SpeechRequest{
@@ -91,6 +90,9 @@ func (p *MiniMaxProvider) getRequestBody(request *types.SpeechAudioRequest) *Spe
 }
 
 func (p *MiniMaxProvider) CreateSpeech(request *types.SpeechAudioRequest) (*http.Response, *types.OpenAIErrorWithStatusCode) {
+	if _, ok := request.VoiceString(); !ok {
+		return nil, common.StringErrorWrapperLocal("selected provider requires a string voice", "unsupported_capability", http.StatusBadRequest)
+	}
 	url, errWithCode := p.GetSupportedAPIUri(config.RelayModeAudioSpeech)
 	if errWithCode != nil {
 		return nil, errWithCode
@@ -135,6 +137,7 @@ func (p *MiniMaxProvider) CreateSpeech(request *types.SpeechAudioRequest) (*http
 
 	p.Usage.PromptTokens = speechResponse.ExtraInfo.UsageCharacters
 	p.Usage.TotalTokens = speechResponse.ExtraInfo.UsageCharacters
+	p.Usage.MarkProviderReported()
 
 	return response, nil
 }

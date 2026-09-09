@@ -6,7 +6,8 @@ type ModerationRequest struct {
 }
 
 type ModerationResponse struct {
-	ID      string `json:"id"`
-	Model   string `json:"model"`
-	Results any    `json:"results"`
+	ProviderRawJSONState `json:"-"`
+	ID                   string `json:"id"`
+	Model                string `json:"model"`
+	Results              any    `json:"results"`
 }

@@ -1,7 +1,10 @@
 package types
 
 import (
+	"bytes"
 	"encoding/json"
+	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -35,6 +38,59 @@ func TestSummaryResponsesListUnmarshalSupportsArrayAndObject(t *testing.T) {
 				t.Fatalf("expected summary type %q, got %q", ContentTypeSummaryText, input.Summary[0].Type)
 			}
 		})
+	}
+}
+
+func TestResponsesToChatAllowsTerminalWithoutUsage(t *testing.T) {
+	response := &OpenAIResponsesResponses{
+		ID:     "resp_failed",
+		Model:  "gpt-5",
+		Status: ResponseStatusFailed,
+	}
+	chat := response.ToChat()
+	if chat == nil || chat.Usage != nil || len(chat.Choices) != 1 {
+		t.Fatalf("expected a Chat response without fabricated usage, got %+v", chat)
+	}
+}
+
+func TestResponsesRefusalUsesFlatWireStringAndConvertsBothWays(t *testing.T) {
+	var event OpenAIResponsesStreamResponses
+	if err := json.Unmarshal([]byte(`{"type":"response.content_part.added","sequence_number":1,"output_index":0,"content_index":0,"item_id":"msg_1","part":{"type":"refusal","refusal":"cannot comply"}}`), &event); err != nil {
+		t.Fatalf("decode refusal content-part event: %v", err)
+	}
+	if event.Part == nil || event.Part.Type != ContentTypeRefusal || event.Part.Refusal != "cannot comply" {
+		t.Fatalf("unexpected refusal content-part: %+v", event.Part)
+	}
+
+	chatResponse := &ChatCompletionResponse{
+		ID: "chatcmpl_1", Model: "gpt-5", Usage: &Usage{},
+		Choices: []ChatCompletionChoice{{
+			FinishReason: FinishReasonStop,
+			Message: ChatCompletionMessage{
+				Role:    ChatMessageRoleAssistant,
+				Refusal: "cannot comply",
+			},
+		}},
+	}
+	responses := chatResponse.ToResponses(&OpenAIResponsesRequest{Model: "gpt-5"})
+	encoded, err := json.Marshal(responses)
+	if err != nil {
+		t.Fatalf("encode converted Responses refusal: %v", err)
+	}
+	if !bytes.Contains(encoded, []byte(`"refusal":"cannot comply"`)) || !bytes.Contains(encoded, []byte(`"type":"refusal"`)) {
+		t.Fatalf("Chat to Responses emitted a non-flat refusal: %s", encoded)
+	}
+	if bytes.Contains(encoded, []byte(`"refusal":{"`)) {
+		t.Fatalf("Chat to Responses emitted the old nested refusal shape: %s", encoded)
+	}
+
+	var providerResponse OpenAIResponsesResponses
+	if err := json.Unmarshal([]byte(`{"id":"resp_1","model":"gpt-5","status":"completed","output":[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"refusal","refusal":"cannot comply"}]}]}`), &providerResponse); err != nil {
+		t.Fatalf("decode provider refusal response: %v", err)
+	}
+	chat := providerResponse.ToChat()
+	if len(chat.Choices) != 1 || chat.Choices[0].Message.Refusal != "cannot comply" {
+		t.Fatalf("Responses refusal was not mapped to Chat: %+v", chat.Choices)
 	}
 }
 
@@ -89,6 +145,314 @@ func TestResponsesOutputMarshalKeepsEmptySummaryForReasoning(t *testing.T) {
 	}
 	if len(summary) != 0 {
 		t.Fatalf("expected empty summary array, got %#v", summary)
+	}
+}
+
+func TestResponsesResponseMarshalPreservesExplicitEmptyKnownFields(t *testing.T) {
+	raw := []byte(`{"id":"resp_1","model":"gpt-5","object":"response","status":"completed","output":[],"error":null,"previous_response_id":null,"metadata":{},"parallel_tool_calls":false,"max_output_tokens":0}`)
+	var response OpenAIResponsesResponses
+	if err := json.Unmarshal(raw, &response); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatalf("decode marshaled response: %v", err)
+	}
+	for field, want := range map[string]string{
+		"output": "[]", "error": "null", "previous_response_id": "null",
+		"metadata": "{}", "parallel_tool_calls": "false", "max_output_tokens": "0",
+	} {
+		if got := string(fields[field]); got != want {
+			t.Fatalf("explicit empty field %s changed: got %q want %q; body=%s", field, got, want, encoded)
+		}
+	}
+}
+
+func TestResponsesResponseMarshalPreservesMissingModelAndStatus(t *testing.T) {
+	raw := []byte(`{"id":"resp_compact","object":"response.compaction","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
+	var response OpenAIResponsesResponses
+	if err := json.Unmarshal(raw, &response); err != nil {
+		t.Fatalf("unmarshal compact response: %v", err)
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal compact response: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatalf("decode marshaled compact response: %v", err)
+	}
+	for _, field := range []string{"model", "status"} {
+		if value, ok := fields[field]; ok {
+			t.Fatalf("missing provider field %q was injected as %s: %s", field, value, encoded)
+		}
+	}
+	if string(fields["object"]) != `"response.compaction"` || string(fields["output"]) != "[]" {
+		t.Fatalf("compact response fields changed: %s", encoded)
+	}
+}
+
+func TestResponsesResponseMarshalPreservesExplicitEmptyModelAndStatus(t *testing.T) {
+	raw := []byte(`{"id":"resp_explicit_empty","model":"","status":""}`)
+	var response OpenAIResponsesResponses
+	if err := json.Unmarshal(raw, &response); err != nil {
+		t.Fatalf("unmarshal explicit empty response: %v", err)
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal explicit empty response: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatalf("decode explicit empty response: %v", err)
+	}
+	if string(fields["model"]) != `""` || string(fields["status"]) != `""` {
+		t.Fatalf("explicit empty model/status were not preserved: %s", encoded)
+	}
+}
+
+func TestDecodeCapturedProviderJSONAllowsFutureOutputUnion(t *testing.T) {
+	raw := []byte(`{"id":"resp_future","model":"gpt-5","object":"response","status":"completed","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5},"output":[{"type":"future_output","quality":{"future":true}}]}`)
+	var response OpenAIResponsesResponses
+	if err := response.DecodeCapturedProviderJSON(raw); err != nil {
+		t.Fatalf("decode captured provider JSON: %v", err)
+	}
+	if response.ID != "resp_future" || response.Model != "gpt-5" || response.Usage == nil || response.Usage.TotalTokens != 5 {
+		t.Fatalf("expected stable evidence from future response, got %+v", response)
+	}
+	response.SetProviderRawJSON(raw)
+	response.EnableProviderRawJSONReplay()
+	if got := response.ReplayProviderRawJSON(); string(got) != string(raw) {
+		t.Fatalf("expected raw future response replay, got %s", got)
+	}
+}
+
+func TestDecodeCapturedProviderJSONKeepsRawDeliveryWhenUsageShapeIsUnknown(t *testing.T) {
+	raw := []byte(`{"id":"resp_future_usage","model":"gpt-5","object":"response","status":"completed","usage":"future-shape","output":[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[]}]}`)
+	var response OpenAIResponsesResponses
+	if err := response.DecodeCapturedProviderJSON(raw); err != nil {
+		t.Fatalf("decode stable fields independently: %v", err)
+	}
+	if response.ID != "resp_future_usage" || response.Status != "completed" || response.Usage != nil || len(response.Output) != 1 {
+		t.Fatalf("unexpected independent evidence: %+v", response)
+	}
+	response.SetProviderRawJSON(raw)
+	response.EnableProviderRawJSONReplay()
+	if got := response.ReplayProviderRawJSON(); string(got) != string(raw) {
+		t.Fatalf("raw response changed: %s", got)
+	}
+}
+
+func TestResponsesOutputMarshalPreservesExplicitNullKnownField(t *testing.T) {
+	var output ResponsesOutput
+	if err := json.Unmarshal([]byte(`{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[],"error":null}`), &output); err != nil {
+		t.Fatalf("unmarshal output: %v", err)
+	}
+	encoded, err := json.Marshal(output)
+	if err != nil {
+		t.Fatalf("marshal output: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatalf("decode output: %v", err)
+	}
+	if string(fields["content"]) != "[]" || string(fields["error"]) != "null" {
+		t.Fatalf("explicit output empties were lost: %s", encoded)
+	}
+}
+
+func TestResponsesOutputQualityFutureUnionPreservesRawField(t *testing.T) {
+	raw := []byte(`{"type":"image_generation_call","id":"img_future","status":"completed","quality":{"future":"quality"},"size":"1024x1024"}`)
+	var output ResponsesOutput
+	if err := json.Unmarshal(raw, &output); err != nil {
+		t.Fatalf("unmarshal future quality union: %v", err)
+	}
+	if output.Quality != "" {
+		t.Fatalf("future quality union must not be treated as a local string, got %q", output.Quality)
+	}
+	encoded, err := json.Marshal(output)
+	if err != nil {
+		t.Fatalf("marshal future quality union: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatalf("decode future quality output: %v", err)
+	}
+	if got := string(fields["quality"]); got != `{"future":"quality"}` {
+		t.Fatalf("future quality union was not preserved: %s", encoded)
+	}
+}
+
+func TestResponsesResponseRoundTripPreservesNestedUnknownAndNullFields(t *testing.T) {
+	raw := []byte(`{"id":"resp_nested","model":"gpt-5","object":"response","status":"completed","output":[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ok","refusal":null,"future_nested":{"keep":true}}]}]}`)
+	var response OpenAIResponsesResponses
+	if err := json.Unmarshal(raw, &response); err != nil {
+		t.Fatalf("unmarshal nested response: %v", err)
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal nested response: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatalf("decode response fields: %v", err)
+	}
+	var output []map[string]json.RawMessage
+	if err := json.Unmarshal(fields["output"], &output); err != nil || len(output) != 1 {
+		t.Fatalf("decode output: %v body=%s", err, encoded)
+	}
+	var content []map[string]json.RawMessage
+	if err := json.Unmarshal(output[0]["content"], &content); err != nil || len(content) != 1 {
+		t.Fatalf("decode content: %v body=%s", err, encoded)
+	}
+	if string(content[0]["refusal"]) != "null" || string(content[0]["future_nested"]) != `{"keep":true}` {
+		t.Fatalf("nested fields changed during same-dialect round trip: %s", encoded)
+	}
+}
+
+func TestResponsesResponseRoundTripPreservesFutureFieldsInsideKnownContainers(t *testing.T) {
+	raw := []byte(`{
+		"id":"resp_future_nested",
+		"model":"gpt-5.6",
+		"object":"response",
+		"status":"completed",
+		"usage":{
+			"input_tokens":2,
+			"output_tokens":3,
+			"total_tokens":5,
+			"future_usage":{"large_integer":12345678901234567890},
+			"output_tokens_details":{"reasoning_tokens":1,"future_detail":{"keep":true}}
+		},
+		"output":[{
+			"type":"message",
+			"id":"msg_1",
+			"status":"completed",
+			"role":"assistant",
+			"content":[{
+				"type":"output_text",
+				"text":"ok",
+				"logprobs":{"future_number":12345678901234567890},
+				"annotations":[{"type":"future_citation","future":{"keep":true}}]
+			}]
+		}]
+	}`)
+	var response OpenAIResponsesResponses
+	if err := json.Unmarshal(raw, &response); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+
+	var original, roundTripped any
+	for name, input := range map[string][]byte{"original": raw, "round-tripped": encoded} {
+		decoder := json.NewDecoder(bytes.NewReader(input))
+		decoder.UseNumber()
+		var decoded any
+		if err := decoder.Decode(&decoded); err != nil {
+			t.Fatalf("decode %s response: %v", name, err)
+		}
+		if name == "original" {
+			original = decoded
+		} else {
+			roundTripped = decoded
+		}
+	}
+	if !reflect.DeepEqual(roundTripped, original) {
+		t.Fatalf("future fields inside known response containers changed:\noriginal=%s\nround-tripped=%s", raw, encoded)
+	}
+}
+
+func TestResponsesResponseMarshalLetsChangedKnownFieldOverrideOriginal(t *testing.T) {
+	var response OpenAIResponsesResponses
+	if err := json.Unmarshal([]byte(`{"id":"resp_original","model":"gpt-5","object":"response","status":"completed","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3,"future":{"keep":true}}}`), &response); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	response.Usage.TotalTokens = 9
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	var usage map[string]json.RawMessage
+	if err := json.Unmarshal(fields["usage"], &usage); err != nil {
+		t.Fatalf("decode usage: %v", err)
+	}
+	if string(usage["total_tokens"]) != "9" {
+		t.Fatalf("changed known usage must override original provider field: %s", encoded)
+	}
+	if _, retained := usage["future"]; retained {
+		t.Fatalf("a modified known container must not replay stale extension state: %s", encoded)
+	}
+}
+
+func TestResponsesResponseRoundTripPreservesUnknownReasoningFields(t *testing.T) {
+	raw := []byte(`{"id":"resp_reasoning","model":"gpt-5.6","object":"response","status":"completed","output":[],"reasoning":{"effort":"medium","mode":"pro","context":"all_turns","future":{"keep":true}}}`)
+	var response OpenAIResponsesResponses
+	if err := json.Unmarshal(raw, &response); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if response.Reasoning == nil || response.Reasoning.Effort == nil || *response.Reasoning.Effort != "medium" {
+		t.Fatalf("known reasoning fields were not decoded: %+v", response.Reasoning)
+	}
+
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	var reasoning map[string]json.RawMessage
+	if err := json.Unmarshal(fields["reasoning"], &reasoning); err != nil {
+		t.Fatalf("decode reasoning: %v body=%s", err, encoded)
+	}
+	for field, want := range map[string]string{
+		"effort": `"medium"`, "mode": `"pro"`, "context": `"all_turns"`, "future": `{"keep":true}`,
+	} {
+		if got := string(reasoning[field]); got != want {
+			t.Fatalf("reasoning field %s changed: got %q want %q; body=%s", field, got, want, encoded)
+		}
+	}
+}
+
+func TestReasoningEffortMarshalLetsKnownFieldsOverrideRawAndPreservesExplicitNull(t *testing.T) {
+	var reasoning ReasoningEffort
+	if err := json.Unmarshal([]byte(`{"effort":null,"mode":"pro"}`), &reasoning); err != nil {
+		t.Fatalf("unmarshal reasoning: %v", err)
+	}
+	encoded, err := json.Marshal(reasoning)
+	if err != nil {
+		t.Fatalf("marshal reasoning: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatalf("decode reasoning: %v", err)
+	}
+	if got := string(fields["effort"]); got != "null" {
+		t.Fatalf("explicit null effort was not preserved: %s", encoded)
+	}
+
+	high := "high"
+	reasoning.Effort = &high
+	encoded, err = json.Marshal(reasoning)
+	if err != nil {
+		t.Fatalf("marshal updated reasoning: %v", err)
+	}
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatalf("decode updated reasoning: %v", err)
+	}
+	if got := string(fields["effort"]); got != `"high"` || string(fields["mode"]) != `"pro"` {
+		t.Fatalf("known update or unknown field preservation failed: %s", encoded)
 	}
 }
 
@@ -159,6 +523,7 @@ func TestResponsesOutputFunctionArgumentsAcceptJSONValues(t *testing.T) {
 	data := []byte(`{
 		"id":"resp_1",
 		"model":"gpt-5",
+		"service_tier":"flex",
 		"status":"completed",
 		"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0},
 		"output":[
@@ -189,6 +554,9 @@ func TestResponsesOutputFunctionArgumentsAcceptJSONValues(t *testing.T) {
 	}
 
 	chat := response.ToChat()
+	if chat.ServiceTier != "flex" {
+		t.Fatalf("expected actual service tier in chat conversion, got %q", chat.ServiceTier)
+	}
 	if len(chat.Choices) != 1 || len(chat.Choices[0].Message.ToolCalls) != 3 {
 		t.Fatalf("expected three chat tool calls, got %#v", chat.Choices)
 	}
@@ -313,6 +681,67 @@ func TestChatCompletionToolRoundTripPreservesResponsesTool(t *testing.T) {
 	}
 	if _, ok := payload["vendor_extension"]; !ok {
 		t.Fatalf("expected vendor_extension to be preserved, got %#v", payload)
+	}
+}
+
+func TestChatCompletionRequestToResponsesRequestFlattensCustomTool(t *testing.T) {
+	var request ChatCompletionRequest
+	if err := json.Unmarshal([]byte(`{
+		"model":"gpt-5",
+		"messages":[{"role":"user","content":"hello"}],
+		"tools":[{"type":"custom","custom":{"name":"shell","description":"Run shell commands","format":{"type":"text"}}}]
+	}`), &request); err != nil {
+		t.Fatalf("unmarshal chat request: %v", err)
+	}
+
+	responses := request.ToResponsesRequest()
+	if len(responses.Tools) != 1 {
+		t.Fatalf("expected one converted custom tool, got %#v", responses.Tools)
+	}
+	encoded, err := json.Marshal(responses.Tools[0])
+	if err != nil {
+		t.Fatalf("marshal converted custom tool: %v", err)
+	}
+	var tool map[string]any
+	if err := json.Unmarshal(encoded, &tool); err != nil {
+		t.Fatalf("decode converted custom tool: %v", err)
+	}
+	if tool["type"] != "custom" || tool["name"] != "shell" || tool["description"] != "Run shell commands" {
+		t.Fatalf("expected required custom tool fields to be flattened, got %#v", tool)
+	}
+	if _, exists := tool["custom"]; exists {
+		t.Fatalf("expected Responses custom tool to be flat, got %#v", tool)
+	}
+	if _, exists := tool["format"]; !exists {
+		t.Fatalf("expected custom tool format to survive flattening, got %#v", tool)
+	}
+}
+
+func TestChatCompletionRequestToResponsesRequestDoesNotLeakChatStreamOptions(t *testing.T) {
+	falseValue := false
+	trueValue := true
+	for _, test := range []struct {
+		name          string
+		streamOptions *StreamOptions
+	}{
+		{name: "usage only is omitted", streamOptions: &StreamOptions{IncludeUsage: true}},
+		{name: "explicit false is omitted", streamOptions: &StreamOptions{IncludeUsage: true, IncludeObfuscation: &falseValue}},
+		{name: "explicit true is omitted", streamOptions: &StreamOptions{IncludeObfuscation: &trueValue}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			converted := (&ChatCompletionRequest{Stream: true, StreamOptions: test.streamOptions}).ToResponsesRequest()
+			body, err := json.Marshal(converted)
+			if err != nil {
+				t.Fatalf("marshal converted request: %v", err)
+			}
+			var object map[string]json.RawMessage
+			if err := json.Unmarshal(body, &object); err != nil {
+				t.Fatalf("decode converted request: %v", err)
+			}
+			if streamOptions, exists := object["stream_options"]; exists {
+				t.Fatalf("Chat stream options leaked to Responses: %s", streamOptions)
+			}
+		})
 	}
 }
 
@@ -502,13 +931,13 @@ func TestGetResponsesExtraBillingRecognizesNormalizedWebSearchAlias(t *testing.T
 			{Type: APIToolTypeWebSearch, SearchContextSize: "high"},
 		},
 		Output: []ResponsesOutput{
-			{Type: InputTypeWebSearchCall, ID: "ws_1"},
+			{Type: InputTypeWebSearchCall, ID: "ws_1", Status: "completed", Action: map[string]any{"type": "search"}},
 		},
 	})
 
-	entry, ok := billing[APIToolTypeWebSearchPreview]
+	entry, ok := billing[APIToolTypeWebSearch]
 	if !ok {
-		t.Fatalf("expected normalized web_search alias to map to web search billing, got %+v", billing)
+		t.Fatalf("expected GA web_search to retain its product billing key, got %+v", billing)
 	}
 	if entry.Type != "high" || entry.CallCount != 1 {
 		t.Fatalf("expected a single high web search charge, got %+v", entry)
@@ -521,9 +950,9 @@ func TestGetResponsesExtraBillingAccumulatesMultipleWebSearchCalls(t *testing.T)
 			{Type: APIToolTypeWebSearchPreview, SearchContextSize: "medium"},
 		},
 		Output: []ResponsesOutput{
-			{Type: InputTypeWebSearchCall, ID: "ws_1"},
-			{Type: InputTypeWebSearchCall, ID: "ws_2"},
-			{Type: InputTypeWebSearchCall, ID: "ws_3"},
+			{Type: InputTypeWebSearchCall, ID: "ws_1", Status: "completed", Action: map[string]any{"type": "search"}},
+			{Type: InputTypeWebSearchCall, ID: "ws_2", Status: "completed", Action: map[string]any{"type": "search"}},
+			{Type: InputTypeWebSearchCall, ID: "ws_3", Status: "completed", Action: map[string]any{"type": "search"}},
 		},
 	})
 
@@ -536,24 +965,78 @@ func TestGetResponsesExtraBillingAccumulatesMultipleWebSearchCalls(t *testing.T)
 	}
 }
 
+func TestResponsesWebSearchBillingPreviewDominatesWithItsOwnVariant(t *testing.T) {
+	serviceType, billingType := ResponsesWebSearchBilling(&OpenAIResponsesResponses{Tools: []ResponsesTools{
+		{Type: APIToolTypeWebSearch, SearchContextSize: "high"},
+		{Type: APIToolTypeWebSearchPreview, SearchContextSize: "low"},
+	}})
+	if serviceType != APIToolTypeWebSearchPreview || billingType != "low" {
+		t.Fatalf("ambiguous search declaration mixed product and variant: service=%q type=%q", serviceType, billingType)
+	}
+}
+
+func TestResponsesWebSearchBillingUsesCompletedActionEvidence(t *testing.T) {
+	response := &OpenAIResponsesResponses{
+		Output: []ResponsesOutput{
+			{Type: InputTypeWebSearchCall, ID: "search", Status: "completed", Action: map[string]any{"type": "search"}},
+			{Type: InputTypeWebSearchCall, ID: "open", Status: "completed", Action: map[string]any{"type": "open_page"}},
+			{Type: InputTypeWebSearchCall, ID: "find", Status: "completed", Action: map[string]any{"type": "find_in_page"}},
+			{Type: InputTypeWebSearchCall, ID: "pending", Status: "in_progress", Action: map[string]any{"type": "search"}},
+			{Type: InputTypeWebSearchCall, ID: "unknown", Status: "completed"},
+		},
+	}
+	billing := GetResponsesExtraBilling(response)
+	if got := billing[APIToolTypeWebSearchPreview].CallCount; got != 2 {
+		t.Fatalf("expected search plus one conservative unknown action charge, got %d in %+v", got, billing)
+	}
+	diagnostics := GetResponsesBillingDiagnostics(response)
+	if !diagnostics["web_search_action_unknown"] {
+		t.Fatalf("expected unknown action diagnostic, got %+v", diagnostics)
+	}
+}
+
 func TestGetResponsesExtraBillingSeparatesImageGenerationVariants(t *testing.T) {
 	billing := GetResponsesExtraBilling(&OpenAIResponsesResponses{
 		Output: []ResponsesOutput{
-			{Type: InputTypeImageGenerationCall, ID: "img_1", Quality: "low", Size: "1024x1024"},
-			{Type: InputTypeImageGenerationCall, ID: "img_2", Quality: "high", Size: "1536x1024"},
+			{Type: InputTypeImageGenerationCall, ID: "img_1", Status: "completed", Quality: "low", Size: "1024x1024"},
+			{Type: InputTypeImageGenerationCall, ID: "img_2", Status: "completed", Quality: "high", Size: "1536x1024"},
+			{Type: InputTypeImageGenerationCall, ID: "img_failed", Status: "failed", Quality: "high", Size: "1536x1024"},
 		},
 	})
 
 	lowKey := BuildExtraBillingKey(APIToolTypeImageGeneration, "low-1024x1024")
 	highKey := BuildExtraBillingKey(APIToolTypeImageGeneration, "high-1536x1024")
 	if len(billing) != 2 {
-		t.Fatalf("expected image generation variants to be tracked separately, got %+v", billing)
+		t.Fatalf("expected completed image variants to be tracked without the failed call, got %+v", billing)
 	}
 	if entry := billing[lowKey]; entry.ServiceType != APIToolTypeImageGeneration || entry.Type != "low-1024x1024" || entry.CallCount != 1 {
 		t.Fatalf("expected low image generation variant billing entry, got %+v", entry)
 	}
 	if entry := billing[highKey]; entry.ServiceType != APIToolTypeImageGeneration || entry.Type != "high-1536x1024" || entry.CallCount != 1 {
 		t.Fatalf("expected high image generation variant billing entry, got %+v", entry)
+	}
+}
+
+func TestResponsesImageGenerationBillingCarriesToolPricingEvidence(t *testing.T) {
+	response := &OpenAIResponsesResponses{
+		Tools: []ResponsesTools{{
+			Type:          APIToolTypeImageGeneration,
+			Model:         "gpt-image-2",
+			Quality:       "auto",
+			Size:          "auto",
+			PartialImages: float64(2),
+		}},
+		Output: []ResponsesOutput{{
+			Type:    InputTypeImageGenerationCall,
+			Status:  "completed",
+			Quality: "high",
+			Size:    "2048x2048",
+		}},
+	}
+	billing := GetResponsesExtraBilling(response)
+	key := BuildExtraBillingKey(APIToolTypeImageGeneration, "gpt-image-2|high|2048x2048|0")
+	if entry := billing[key]; entry.CallCount != 1 || entry.Type != "gpt-image-2|high|2048x2048|0" {
+		t.Fatalf("expected request partial image limit not to become billing evidence, got %+v", billing)
 	}
 }
 
@@ -574,11 +1057,8 @@ func TestResponsesToolTypeHelpersAndAdditionalBillingBranches(t *testing.T) {
 			{Type: InputTypeFileSearchCall, ID: "file_1"},
 		},
 	})
-	if got := billing[APIToolTypeCodeInterpreter].CallCount; got != 1 {
-		t.Fatalf("expected code interpreter usage billing, got %+v", billing[APIToolTypeCodeInterpreter])
-	}
-	if got := billing[APIToolTypeFileSearch].CallCount; got != 1 {
-		t.Fatalf("expected file search usage billing, got %+v", billing[APIToolTypeFileSearch])
+	if len(billing) != 0 {
+		t.Fatalf("unsupported hosted tools must not produce dormant billing evidence, got %+v", billing)
 	}
 }
 
@@ -606,8 +1086,11 @@ func TestChatCompletionResponseToResponsesCopiesResponseObjectFields(t *testing.
 			Effort:  &effort,
 			Summary: &summary,
 		},
-		Store:       &store,
-		Temperature: &temperature,
+		Store:            &store,
+		Temperature:      &temperature,
+		ServiceTier:      "priority",
+		ProcessingClass:  "flex",
+		SafetyIdentifier: "user_123",
 		Text: &ResponsesText{
 			Verbosity: "low",
 		},
@@ -615,10 +1098,11 @@ func TestChatCompletionResponseToResponsesCopiesResponseObjectFields(t *testing.
 	}
 
 	response := (&ChatCompletionResponse{
-		ID:      "resp_123",
-		Model:   "gpt-5",
-		Created: 1,
-		Usage:   &Usage{},
+		ID:          "resp_123",
+		Model:       "gpt-5",
+		Created:     1,
+		ServiceTier: "flex",
+		Usage:       &Usage{},
 		Choices: []ChatCompletionChoice{
 			{
 				Message: ChatCompletionMessage{
@@ -648,6 +1132,52 @@ func TestChatCompletionResponseToResponsesCopiesResponseObjectFields(t *testing.
 	if response.Text != request.Text {
 		t.Fatalf("expected response text to use request text config")
 	}
+	if response.ServiceTier != "flex" || response.ProcessingClass != request.ProcessingClass || response.SafetyIdentifier != request.SafetyIdentifier {
+		t.Fatalf("expected shared Responses fields to survive Chat fallback response conversion, got service_tier=%q processing_class=%q safety_identifier=%q", response.ServiceTier, response.ProcessingClass, response.SafetyIdentifier)
+	}
+}
+
+func TestResponsesUsageMarshalKeepsProviderCacheEvidenceInternal(t *testing.T) {
+	usage := ResponsesUsage{
+		InputTokens: 1,
+		InputTokensDetails: &ResponsesUsageInputTokensDetails{
+			CachedTokens:      2,
+			CachedReadTokens:  3,
+			CacheWriteTokens:  5,
+			CachedWriteTokens: 7,
+		},
+	}
+	raw, err := json.Marshal(usage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire := string(raw)
+	if !strings.Contains(wire, `"cached_tokens":2`) {
+		t.Fatalf("official cached_tokens missing from wire: %s", wire)
+	}
+	if !strings.Contains(wire, `"cache_write_tokens":5`) {
+		t.Fatalf("official cache_write_tokens missing from wire: %s", wire)
+	}
+	for _, internalField := range []string{"cached_read_tokens", "cached_write_tokens"} {
+		if strings.Contains(wire, internalField) {
+			t.Fatalf("provider billing evidence %q leaked onto Responses wire: %s", internalField, wire)
+		}
+	}
+	if usage.InputTokensDetails.CachedReadTokens != 3 || usage.InputTokensDetails.CacheWriteTokens != 5 || usage.InputTokensDetails.CachedWriteTokens != 7 {
+		t.Fatalf("marshalling mutated billing evidence: %+v", usage.InputTokensDetails)
+	}
+}
+
+func TestChatToResponsesDoesNotInventServiceTierFromRequest(t *testing.T) {
+	response := (&ChatCompletionResponse{
+		ID:      "resp_no_tier",
+		Model:   "gpt-5",
+		Usage:   &Usage{},
+		Choices: []ChatCompletionChoice{{FinishReason: FinishReasonStop}},
+	}).ToResponses(&OpenAIResponsesRequest{Model: "gpt-5", ServiceTier: "priority"})
+	if response.ServiceTier != "" {
+		t.Fatalf("request tier is not final billing evidence, got %q", response.ServiceTier)
+	}
 }
 
 func TestOpenAIResponsesRequestToChatCompletionRequestCopiesTextVerbosity(t *testing.T) {
@@ -666,6 +1196,78 @@ func TestOpenAIResponsesRequestToChatCompletionRequestCopiesTextVerbosity(t *tes
 
 	if chat.Verbosity != "low" {
 		t.Fatalf("expected chat verbosity %q, got %q", "low", chat.Verbosity)
+	}
+}
+
+func TestOpenAIResponsesRequestToChatCompletionRequestCopiesSharedRequestFields(t *testing.T) {
+	store := false
+	effort := "high"
+	request := &OpenAIResponsesRequest{
+		Model:            "gpt-5",
+		Input:            "hello",
+		Store:            &store,
+		ServiceTier:      "priority",
+		ProcessingClass:  "flex",
+		SafetyIdentifier: "user_123",
+		Reasoning:        &ReasoningEffort{Effort: &effort},
+		ToolChoice:       map[string]any{"type": "function", "name": "lookup"},
+	}
+
+	chat, err := request.ToChatCompletionRequest()
+	if err != nil {
+		t.Fatalf("unexpected conversion error: %v", err)
+	}
+	if chat.Store == nil || *chat.Store {
+		t.Fatalf("expected explicit store=false to be preserved, got %#v", chat.Store)
+	}
+	if chat.ServiceTier != request.ServiceTier || chat.ProcessingClass != request.ProcessingClass || chat.SafetyIdentifier != request.SafetyIdentifier {
+		t.Fatalf("expected shared request fields to be copied, got service_tier=%q processing_class=%q safety_identifier=%q", chat.ServiceTier, chat.ProcessingClass, chat.SafetyIdentifier)
+	}
+	if chat.Reasoning != nil || chat.ReasoningEffort == nil || *chat.ReasoningEffort != effort {
+		t.Fatalf("expected only official reasoning_effort to be emitted, got reasoning=%#v reasoning_effort=%#v", chat.Reasoning, chat.ReasoningEffort)
+	}
+	if effective := chat.EffectiveReasoning(); effective == nil || effective.Effort != effort {
+		t.Fatalf("expected adapter reasoning effort %q, got %#v", effort, effective)
+	}
+	choice, ok := chat.ToolChoice.(map[string]any)
+	if !ok || choice["type"] != "function" {
+		t.Fatalf("expected named function tool choice to be converted, got %#v", chat.ToolChoice)
+	}
+	function, ok := choice["function"].(map[string]any)
+	if !ok || function["name"] != "lookup" {
+		t.Fatalf("expected Chat function tool choice shape, got %#v", chat.ToolChoice)
+	}
+	encoded, err := json.Marshal(chat)
+	if err != nil {
+		t.Fatalf("marshal converted Chat request: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatalf("decode converted Chat request: %v", err)
+	}
+	if _, ok := fields["reasoning"]; ok {
+		t.Fatalf("converted Chat request must not contain non-standard reasoning: %s", encoded)
+	}
+	if _, ok := fields["reasoning_effort"]; !ok {
+		t.Fatalf("converted Chat request must contain reasoning_effort: %s", encoded)
+	}
+}
+
+func TestOpenAIResponsesRequestToChatCompletionRequestRejectsReasoningSummary(t *testing.T) {
+	value := "auto"
+	for _, test := range []struct {
+		name      string
+		reasoning ReasoningEffort
+	}{
+		{name: "summary", reasoning: ReasoningEffort{Summary: &value}},
+		{name: "generate_summary", reasoning: ReasoningEffort{GenerateSummary: &value}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := &OpenAIResponsesRequest{Model: "gpt-5", Input: "hello", Reasoning: &test.reasoning}
+			if _, err := request.ToChatCompletionRequest(); err == nil {
+				t.Fatal("expected lossy reasoning summary conversion to fail")
+			}
+		})
 	}
 }
 
@@ -759,5 +1361,234 @@ func TestChatCompletionRequestToResponsesRequestMapsResponseFormatAndVerbosity(t
 	}
 	if responses.Text.Format.Strict != true {
 		t.Fatalf("expected strict=true, got %#v", responses.Text.Format.Strict)
+	}
+}
+
+func TestChatCompletionRequestToResponsesRequestPreservesToolChoiceAndCustomHistory(t *testing.T) {
+	var request ChatCompletionRequest
+	if err := json.Unmarshal([]byte(`{
+		"model":"gpt-5",
+		"tool_choice":{"type":"function","function":{"name":"lookup"}},
+		"messages":[
+			{"role":"assistant","tool_calls":[
+				{"id":"call_custom","type":"custom","custom":{"name":"shell","input":"echo ok"}},
+				{"id":"call_function","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"ok\"}"}}
+			]},
+			{"role":"tool","tool_call_id":"call_custom","content":[{"type":"text","text":"custom result"}]},
+			{"role":"tool","tool_call_id":"call_function","content":"function result"}
+		]
+	}`), &request); err != nil {
+		t.Fatalf("unmarshal Chat request: %v", err)
+	}
+
+	responses := request.ToResponsesRequest()
+	choice, ok := responses.ToolChoice.(map[string]any)
+	if !ok || choice["type"] != ToolChoiceTypeFunction || choice["name"] != "lookup" {
+		t.Fatalf("expected flat Responses function tool choice, got %#v", responses.ToolChoice)
+	}
+	if _, nested := choice["function"]; nested {
+		t.Fatalf("Responses tool choice must not retain Chat nesting: %#v", choice)
+	}
+	inputs, ok := responses.Input.([]InputResponses)
+	if !ok || len(inputs) != 4 {
+		t.Fatalf("expected four converted tool history items, got %#v", responses.Input)
+	}
+	if inputs[0].Type != InputTypeCustomToolCall || inputs[0].CallID != "call_custom" || inputs[0].Name != "shell" || inputs[0].Input != "echo ok" {
+		t.Fatalf("unexpected custom tool call conversion: %#v", inputs[0])
+	}
+	customOutput, ok := inputs[2].Output.([]ContentResponses)
+	if inputs[2].Type != InputTypeCustomToolCallOutput || !ok || len(customOutput) != 1 || customOutput[0].Type != ContentTypeInputText || customOutput[0].Text != "custom result" {
+		t.Fatalf("unexpected custom tool output conversion: %#v", inputs[2])
+	}
+	if inputs[1].Type != InputTypeFunctionCall || inputs[3].Type != InputTypeFunctionCallOutput || inputs[3].Output != "function result" {
+		t.Fatalf("unexpected function tool history conversion: %#v", inputs)
+	}
+
+	encoded, err := json.Marshal(request.Messages[0].ToolCalls[0])
+	if err != nil {
+		t.Fatalf("marshal custom Chat tool call: %v", err)
+	}
+	var customCall map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &customCall); err != nil {
+		t.Fatalf("decode custom Chat tool call: %v", err)
+	}
+	if _, ok := customCall["custom"]; !ok {
+		t.Fatalf("custom payload missing after round trip: %s", encoded)
+	}
+	if _, ok := customCall["function"]; ok {
+		t.Fatalf("custom tool call must not emit function:null: %s", encoded)
+	}
+}
+
+func TestChatCompletionRequestToResponsesRequestPreservesAssistantContentWithToolCalls(t *testing.T) {
+	var request ChatCompletionRequest
+	if err := json.Unmarshal([]byte(`{
+		"model":"gpt-5",
+		"messages":[{
+			"role":"assistant",
+			"content":"I will check that now.",
+			"tool_calls":[{
+				"id":"call_1",
+				"type":"function",
+				"function":{"name":"lookup","arguments":"{\"q\":\"ok\"}"}
+			}]
+		}]
+	}`), &request); err != nil {
+		t.Fatalf("unmarshal Chat request: %v", err)
+	}
+
+	responses := request.ToResponsesRequest()
+	inputs, ok := responses.Input.([]InputResponses)
+	if !ok || len(inputs) != 2 {
+		t.Fatalf("expected assistant message and tool call, got %#v", responses.Input)
+	}
+	if inputs[0].Type != InputTypeMessage || inputs[0].Role != ChatMessageRoleAssistant {
+		t.Fatalf("expected assistant message before tool call, got %#v", inputs[0])
+	}
+	content, ok := inputs[0].Content.([]ContentResponses)
+	if !ok || len(content) != 1 || content[0].Type != ContentTypeOutputText || content[0].Text != "I will check that now." {
+		t.Fatalf("assistant content was not preserved: %#v", inputs[0].Content)
+	}
+	if inputs[1].Type != InputTypeFunctionCall || inputs[1].CallID != "call_1" || inputs[1].Name != "lookup" || inputs[1].Arguments != `{"q":"ok"}` {
+		t.Fatalf("tool call was not preserved: %#v", inputs[1])
+	}
+}
+
+func TestChatCompletionResponseToResponsesPreservesContentWithToolCalls(t *testing.T) {
+	chatResponse := &ChatCompletionResponse{
+		ID: "chatcmpl_mixed", Model: "gpt-5", Usage: &Usage{},
+		Choices: []ChatCompletionChoice{{
+			FinishReason: FinishReasonToolCalls,
+			Message: ChatCompletionMessage{
+				Role:    ChatMessageRoleAssistant,
+				Content: "I will check that now.",
+				ToolCalls: []*ChatCompletionToolCalls{{
+					Id: "call_1", Type: ToolChoiceTypeFunction,
+					Function: &ChatCompletionToolCallsFunction{Name: "lookup", Arguments: `{"q":"ok"}`},
+				}},
+			},
+		}},
+	}
+
+	responses := chatResponse.ToResponses(&OpenAIResponsesRequest{Model: "gpt-5"})
+	if len(responses.Output) != 2 {
+		t.Fatalf("expected message and tool call outputs, got %#v", responses.Output)
+	}
+	message := responses.Output[0]
+	content, ok := message.Content.([]ContentResponses)
+	if message.Type != InputTypeMessage || !ok || len(content) != 1 || content[0].Type != ContentTypeOutputText || content[0].Text != "I will check that now." {
+		t.Fatalf("assistant content was not preserved before tool call: %#v", message)
+	}
+	tool := responses.Output[1]
+	if tool.Type != InputTypeFunctionCall || tool.CallID != "call_1" || tool.Name != "lookup" || tool.Arguments == nil || *tool.Arguments != `{"q":"ok"}` {
+		t.Fatalf("tool call was not preserved: %#v", tool)
+	}
+}
+
+func TestOpenAIResponsesRequestToChatCompletionRequestPreservesInlineFileAndToolHistory(t *testing.T) {
+	var request OpenAIResponsesRequest
+	if err := json.Unmarshal([]byte(`{
+		"model":"gpt-5",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_file","file_data":"data:application/pdf;base64,AA==","filename":"a.pdf"}]},
+			{"type":"function_call","call_id":"call_function","name":"lookup","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_function","output":[{"type":"input_text","text":"function result"}]},
+			{"type":"custom_tool_call","call_id":"call_custom","name":"shell","input":"echo ok"},
+			{"type":"custom_tool_call_output","call_id":"call_custom","output":"custom result"}
+		]
+	}`), &request); err != nil {
+		t.Fatalf("unmarshal Responses request: %v", err)
+	}
+
+	chat, err := request.ToChatCompletionRequest()
+	if err != nil {
+		t.Fatalf("convert Responses request: %v", err)
+	}
+	if len(chat.Messages) != 5 {
+		t.Fatalf("expected five Chat history messages, got %#v", chat.Messages)
+	}
+	parts, ok := chat.Messages[0].Content.([]ChatMessagePart)
+	if !ok || len(parts) != 1 || parts[0].File == nil || parts[0].File.Filename != "a.pdf" {
+		t.Fatalf("official filename was not preserved in Chat file content: %#v", chat.Messages[0].Content)
+	}
+	outputParts, ok := chat.Messages[2].Content.([]ChatMessagePart)
+	if !ok || len(outputParts) != 1 || outputParts[0].Type != ContentTypeText || outputParts[0].Text != "function result" {
+		t.Fatalf("Responses input_text tool output was not converted to Chat text: %#v", chat.Messages[2].Content)
+	}
+	custom := chat.Messages[3].ToolCalls
+	if len(custom) != 1 || custom[0].Type != ToolChoiceTypeCustom || custom[0].Custom == nil || custom[0].Custom.Name != "shell" || custom[0].Custom.Input != "echo ok" {
+		t.Fatalf("unexpected custom Chat assistant history: %#v", custom)
+	}
+	if chat.Messages[4].ToolCallID != "call_custom" || chat.Messages[4].Content != "custom result" {
+		t.Fatalf("unexpected custom Chat tool result: %#v", chat.Messages[4])
+	}
+}
+
+func TestOpenAIResponsesRequestToChatCompletionRequestRejectsNonTextToolOutput(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		output any
+	}{
+		{name: "image", output: []any{map[string]any{"type": ContentTypeInputImage, "image_url": "https://example.com/a.png"}}},
+		{name: "text extension", output: []any{map[string]any{"type": ContentTypeInputText, "text": "ok", "future": true}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := &OpenAIResponsesRequest{
+				Model: "gpt-5",
+				Input: []any{map[string]any{
+					"type":    InputTypeFunctionCallOutput,
+					"call_id": "call_1",
+					"output":  test.output,
+				}},
+			}
+			if _, err := request.ToChatCompletionRequest(); err == nil {
+				t.Fatal("expected lossy tool output conversion to fail")
+			}
+		})
+	}
+}
+
+func TestNonStreamToolCallConversionPreservesCustomUnion(t *testing.T) {
+	chatResponse := &ChatCompletionResponse{
+		ID: "chatcmpl_1", Model: "gpt-5", Usage: &Usage{},
+		Choices: []ChatCompletionChoice{{
+			FinishReason: FinishReasonToolCalls,
+			Message: ChatCompletionMessage{Role: ChatMessageRoleAssistant, ToolCalls: []*ChatCompletionToolCalls{
+				{Id: "call_custom", Type: ToolChoiceTypeCustom, Custom: &ChatCompletionToolCallsCustom{Name: "shell", Input: "echo ok"}},
+				{Id: "call_function", Type: ToolChoiceTypeFunction, Function: &ChatCompletionToolCallsFunction{Name: "lookup", Arguments: "{}"}},
+			}},
+		}},
+	}
+	responses := chatResponse.ToResponses(&OpenAIResponsesRequest{Model: "gpt-5"})
+	if len(responses.Output) != 2 || responses.Output[0].Type != InputTypeCustomToolCall || responses.Output[0].Input != "echo ok" || responses.Output[1].Type != InputTypeFunctionCall {
+		t.Fatalf("unexpected Chat to Responses custom union conversion: %#v", responses.Output)
+	}
+
+	arguments := "{}"
+	responsesResponse := &OpenAIResponsesResponses{
+		ID: "resp_1", Model: "gpt-5", Usage: &ResponsesUsage{},
+		Output: []ResponsesOutput{
+			{Type: InputTypeCustomToolCall, CallID: "call_custom", Name: "shell", Input: "echo ok", Status: ResponseStatusCompleted},
+			{Type: InputTypeFunctionCall, CallID: "call_function", Name: "lookup", Arguments: &arguments, Status: ResponseStatusCompleted},
+		},
+	}
+	chat := responsesResponse.ToChat()
+	if len(chat.Choices) != 1 || len(chat.Choices[0].Message.ToolCalls) != 2 || chat.Choices[0].FinishReason != FinishReasonToolCalls {
+		t.Fatalf("unexpected Responses to Chat tool call conversion: %#v", chat.Choices)
+	}
+	if custom := chat.Choices[0].Message.ToolCalls[0]; custom.Type != ToolChoiceTypeCustom || custom.Custom == nil || custom.Custom.Input != "echo ok" || custom.Function != nil {
+		t.Fatalf("custom Responses output was not preserved as Chat custom union: %#v", custom)
+	}
+
+	emptyInput, err := json.Marshal(ResponsesOutput{Type: InputTypeCustomToolCall, CallID: "call_empty", Name: "shell"})
+	if err != nil {
+		t.Fatalf("marshal empty custom tool input: %v", err)
+	}
+	var emptyFields map[string]json.RawMessage
+	if err := json.Unmarshal(emptyInput, &emptyFields); err != nil {
+		t.Fatalf("decode empty custom tool input: %v", err)
+	}
+	if input, ok := emptyFields["input"]; !ok || string(input) != `""` {
+		t.Fatalf("custom tool call must preserve an explicitly empty input: %s", emptyInput)
 	}
 }

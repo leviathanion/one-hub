@@ -15,10 +15,11 @@ type Embedding struct {
 }
 
 type EmbeddingResponse struct {
-	Object string      `json:"object"`
-	Data   []Embedding `json:"data"`
-	Model  string      `json:"model"`
-	Usage  *Usage      `json:"usage,omitempty"`
+	ProviderRawJSONState `json:"-"`
+	Object               string      `json:"object"`
+	Data                 []Embedding `json:"data"`
+	Model                string      `json:"model"`
+	Usage                *Usage      `json:"usage,omitempty"`
 }
 
 func (r EmbeddingRequest) ParseInput() []string {

@@ -1,10 +1,14 @@
 package types
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
 
 const (
 	ContentTypeText     = "text"
 	ContentTypeImageURL = "image_url"
+	ContentTypeFile     = "file"
 )
 
 const (
@@ -27,6 +31,7 @@ const (
 
 const (
 	ToolChoiceTypeFunction = "function"
+	ToolChoiceTypeCustom   = "custom"
 	ToolChoiceTypeAuto     = "auto"
 	ToolChoiceTypeNone     = "none"
 	ToolChoiceTypeRequired = "required"
@@ -35,6 +40,11 @@ const (
 type ChatCompletionToolCallsFunction struct {
 	Name      string `json:"name,omitempty"`
 	Arguments string `json:"arguments"`
+}
+
+type ChatCompletionToolCallsCustom struct {
+	Name  string `json:"name,omitempty"`
+	Input string `json:"input"`
 }
 
 func (f *ChatCompletionToolCallsFunction) UnmarshalJSON(data []byte) error {
@@ -64,7 +74,8 @@ func (f *ChatCompletionToolCallsFunction) UnmarshalJSON(data []byte) error {
 type ChatCompletionToolCalls struct {
 	Id       string                           `json:"id,omitempty"`
 	Type     string                           `json:"type,omitempty"`
-	Function *ChatCompletionToolCallsFunction `json:"function"`
+	Function *ChatCompletionToolCallsFunction `json:"function,omitempty"`
+	Custom   *ChatCompletionToolCallsCustom   `json:"custom,omitempty"`
 	Index    int                              `json:"index"`
 }
 
@@ -149,7 +160,7 @@ func (m *ChatCompletionMessage) ToolToFuncCalls() {
 	if m.FunctionCall != nil {
 		return
 	}
-	if m.ToolCalls != nil {
+	if len(m.ToolCalls) > 0 && m.ToolCalls[0] != nil && m.ToolCalls[0].Function != nil {
 		m.FunctionCall = &ChatCompletionToolCallsFunction{
 			Name:      m.ToolCalls[0].Function.Name,
 			Arguments: m.ToolCalls[0].Function.Arguments,
@@ -185,6 +196,7 @@ type InputAudio struct {
 type ChatMessageFile struct {
 	Filename string `json:"filename,omitempty"`
 	FileData string `json:"file_data,omitempty"`
+	FileID   string `json:"file_id,omitempty"`
 }
 
 type ChatCompletionResponseFormat struct {
@@ -224,12 +236,16 @@ type ChatCompletionRequest struct {
 	FunctionCall        any                           `json:"function_call,omitempty"`
 	Tools               []*ChatCompletionTool         `json:"tools,omitempty"`
 	ToolChoice          any                           `json:"tool_choice,omitempty"`
-	ParallelToolCalls   bool                          `json:"parallel_tool_calls,omitempty"`
+	ParallelToolCalls   *bool                         `json:"parallel_tool_calls,omitempty"`
 	Modalities          []string                      `json:"modalities,omitempty"`
 	Audio               *ChatAudio                    `json:"audio,omitempty"`
 	ReasoningEffort     *string                       `json:"reasoning_effort,omitempty"`
 	Prediction          any                           `json:"prediction,omitempty"`
 	WebSearchOptions    *WebSearchOptions             `json:"web_search_options,omitempty"`
+	ServiceTier         string                        `json:"service_tier,omitempty"`
+	ProcessingClass     string                        `json:"processing_class,omitempty"`
+	SafetyIdentifier    string                        `json:"safety_identifier,omitempty"`
+	PromptCacheKey      any                           `json:"prompt_cache_key,omitempty"`
 	Verbosity           string                        `json:"verbosity,omitempty"`    // 用于控制输出的详细程度
 	Store               *bool                         `json:"store,omitempty"`        // ChatGPT 是否存储对话（Codex 要求设置为 false）
 	Instructions        *string                       `json:"instructions,omitempty"` // Codex CLI 系统提示词
@@ -238,9 +254,64 @@ type ChatCompletionRequest struct {
 }
 
 type ChatReasoning struct {
-	MaxTokens int     `json:"max_tokens,omitempty"`
+	MaxTokens int     `json:"-"`
 	Effort    string  `json:"effort,omitempty"`
 	Summary   *string `json:"summary,omitempty"`
+
+	maxTokensPresent bool
+}
+
+// HasMaxTokens reports whether max_tokens was explicitly supplied. The
+// distinction matters because some provider dialects use zero as a real value.
+func (r *ChatReasoning) HasMaxTokens() bool {
+	return r != nil && (r.maxTokensPresent || r.MaxTokens != 0)
+}
+
+// SetMaxTokens records a programmatically supplied max_tokens value, including
+// zero. JSON decoding records the same presence information automatically.
+func (r *ChatReasoning) SetMaxTokens(maxTokens int) {
+	if r == nil {
+		return
+	}
+	r.MaxTokens = maxTokens
+	r.maxTokensPresent = true
+}
+
+func (r ChatReasoning) MarshalJSON() ([]byte, error) {
+	type chatReasoningWire struct {
+		MaxTokens *int    `json:"max_tokens,omitempty"`
+		Effort    string  `json:"effort,omitempty"`
+		Summary   *string `json:"summary,omitempty"`
+	}
+
+	var maxTokens *int
+	if r.HasMaxTokens() {
+		value := r.MaxTokens
+		maxTokens = &value
+	}
+	return json.Marshal(chatReasoningWire{
+		MaxTokens: maxTokens,
+		Effort:    r.Effort,
+		Summary:   r.Summary,
+	})
+}
+
+func (r *ChatReasoning) UnmarshalJSON(data []byte) error {
+	type chatReasoningWire struct {
+		MaxTokens *int    `json:"max_tokens"`
+		Effort    string  `json:"effort"`
+		Summary   *string `json:"summary"`
+	}
+
+	var wire chatReasoningWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*r = ChatReasoning{Effort: wire.Effort, Summary: wire.Summary}
+	if wire.MaxTokens != nil {
+		r.SetMaxTokens(*wire.MaxTokens)
+	}
+	return nil
 }
 
 // NormalizeReasoning 归一化 ReasoningEffort 和 Reasoning 字段，确保两者一致。
@@ -255,11 +326,22 @@ func (r *ChatCompletionRequest) NormalizeReasoning() {
 		return
 	}
 
-	if r.ReasoningEffort != nil {
-		r.Reasoning = &ChatReasoning{
-			Effort: *r.ReasoningEffort,
-		}
+	r.Reasoning = r.EffectiveReasoning()
+}
+
+// EffectiveReasoning returns the adapter-facing reasoning configuration
+// without changing the Chat wire representation.
+func (r *ChatCompletionRequest) EffectiveReasoning() *ChatReasoning {
+	if r == nil {
+		return nil
 	}
+	if r.Reasoning != nil {
+		return r.Reasoning
+	}
+	if r.ReasoningEffort == nil {
+		return nil
+	}
+	return &ChatReasoning{Effort: *r.ReasoningEffort}
 }
 
 type WebSearchOptions struct {
@@ -396,14 +478,104 @@ func (c *ChatCompletionChoice) CheckChoice(request *ChatCompletionRequest) {
 }
 
 type ChatCompletionResponse struct {
-	ID                  string                 `json:"id"`
-	Object              string                 `json:"object"`
-	Created             any                    `json:"created"`
-	Model               string                 `json:"model"`
-	Choices             []ChatCompletionChoice `json:"choices"`
-	Usage               *Usage                 `json:"usage,omitempty"`
-	SystemFingerprint   string                 `json:"system_fingerprint,omitempty"`
-	PromptFilterResults any                    `json:"prompt_filter_results,omitempty"`
+	ID                     string                 `json:"id"`
+	Object                 string                 `json:"object"`
+	Created                any                    `json:"created"`
+	Model                  string                 `json:"model"`
+	Choices                []ChatCompletionChoice `json:"choices"`
+	Usage                  *Usage                 `json:"usage,omitempty"`
+	SystemFingerprint      string                 `json:"system_fingerprint,omitempty"`
+	ServiceTier            string                 `json:"service_tier,omitempty"`
+	PromptFilterResults    any                    `json:"prompt_filter_results,omitempty"`
+	rawProviderJSON        []byte                 `json:"-"`
+	captureProviderRawJSON bool                   `json:"-"`
+	replayProviderRawJSON  bool                   `json:"-"`
+}
+
+// chatCompletionUsage is the Chat Completions wire projection of Usage.
+// Usage also carries provider-specific accounting details that must remain
+// available internally but are not part of the downstream Chat contract.
+type chatCompletionUsage struct {
+	PromptTokens            int                               `json:"prompt_tokens"`
+	CompletionTokens        int                               `json:"completion_tokens"`
+	TotalTokens             int                               `json:"total_tokens"`
+	PromptTokensDetails     chatCompletionPromptTokensDetails `json:"prompt_tokens_details"`
+	CompletionTokensDetails CompletionTokensDetails           `json:"completion_tokens_details"`
+}
+
+type chatCompletionPromptTokensDetails struct {
+	AudioTokens      int `json:"audio_tokens,omitempty"`
+	CachedTokens     int `json:"cached_tokens,omitempty"`
+	TextTokens       int `json:"text_tokens,omitempty"`
+	ImageTokens      int `json:"image_tokens,omitempty"`
+	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
+}
+
+func projectChatCompletionUsage(usage *Usage) *chatCompletionUsage {
+	if usage == nil {
+		return nil
+	}
+	return &chatCompletionUsage{
+		PromptTokens:     usage.PromptTokens,
+		CompletionTokens: usage.CompletionTokens,
+		TotalTokens:      usage.TotalTokens,
+		PromptTokensDetails: chatCompletionPromptTokensDetails{
+			AudioTokens:      usage.PromptTokensDetails.AudioTokens,
+			CachedTokens:     usage.PromptTokensDetails.CachedTokens,
+			TextTokens:       usage.PromptTokensDetails.TextTokens,
+			ImageTokens:      usage.PromptTokensDetails.ImageTokens,
+			CacheWriteTokens: usage.PromptTokensDetails.CacheWriteTokens,
+		},
+		CompletionTokensDetails: usage.CompletionTokensDetails,
+	}
+}
+
+func (r ChatCompletionResponse) MarshalJSON() ([]byte, error) {
+	type responseAlias ChatCompletionResponse
+	return json.Marshal(struct {
+		responseAlias
+		Usage *chatCompletionUsage `json:"usage,omitempty"`
+	}{
+		responseAlias: responseAlias(r),
+		Usage:         projectChatCompletionUsage(r.Usage),
+	})
+}
+
+func (r *ChatCompletionResponse) SetProviderRawJSON(raw []byte) {
+	if r == nil {
+		return
+	}
+	r.rawProviderJSON = append(r.rawProviderJSON[:0], raw...)
+}
+
+func (r *ChatCompletionResponse) ProviderRawJSON() []byte {
+	if r == nil {
+		return nil
+	}
+	return append([]byte(nil), r.rawProviderJSON...)
+}
+
+func (r *ChatCompletionResponse) EnableProviderRawJSONCapture() {
+	if r != nil {
+		r.captureProviderRawJSON = true
+	}
+}
+
+func (r *ChatCompletionResponse) CaptureProviderRawJSON() bool {
+	return r != nil && r.captureProviderRawJSON
+}
+
+func (r *ChatCompletionResponse) EnableProviderRawJSONReplay() {
+	if r != nil {
+		r.replayProviderRawJSON = true
+	}
+}
+
+func (r *ChatCompletionResponse) ReplayProviderRawJSON() []byte {
+	if r == nil || !r.replayProviderRawJSON {
+		return nil
+	}
+	return r.ProviderRawJSON()
 }
 
 func (cc *ChatCompletionResponse) GetContent() string {
@@ -485,6 +657,7 @@ func (f *ChatCompletionToolCallsFunction) Split(c *ChatCompletionStreamChoice, s
 
 type ChatCompletionStreamChoiceDelta struct {
 	Content          string                           `json:"content,omitempty"`
+	Refusal          string                           `json:"refusal,omitempty"`
 	Role             string                           `json:"role,omitempty"`
 	FunctionCall     *ChatCompletionToolCallsFunction `json:"function_call,omitempty"`
 	ToolCalls        []*ChatCompletionToolCalls       `json:"tool_calls,omitempty"`
@@ -498,7 +671,7 @@ func (m *ChatCompletionStreamChoiceDelta) ToolToFuncCalls() {
 	if m.FunctionCall != nil {
 		return
 	}
-	if m.ToolCalls != nil {
+	if len(m.ToolCalls) > 0 && m.ToolCalls[0] != nil && m.ToolCalls[0].Function != nil {
 		m.FunctionCall = &ChatCompletionToolCallsFunction{
 			Name:      m.ToolCalls[0].Function.Name,
 			Arguments: m.ToolCalls[0].Function.Arguments,
@@ -513,6 +686,17 @@ type ChatCompletionStreamChoice struct {
 	FinishReason         any                             `json:"finish_reason"`
 	ContentFilterResults any                             `json:"content_filter_results,omitempty"`
 	Usage                *Usage                          `json:"usage,omitempty"`
+}
+
+func (c ChatCompletionStreamChoice) MarshalJSON() ([]byte, error) {
+	type choiceAlias ChatCompletionStreamChoice
+	return json.Marshal(struct {
+		choiceAlias
+		Usage *chatCompletionUsage `json:"usage,omitempty"`
+	}{
+		choiceAlias: choiceAlias(c),
+		Usage:       projectChatCompletionUsage(c.Usage),
+	})
 }
 
 func (c *ChatCompletionStreamChoice) CheckChoice(request *ChatCompletionRequest) {
@@ -530,14 +714,18 @@ type ChatCompletionStreamResponse struct {
 	Choices           []ChatCompletionStreamChoice `json:"choices"`
 	PromptAnnotations any                          `json:"prompt_annotations,omitempty"`
 	Usage             *Usage                       `json:"usage,omitempty"`
+	ServiceTier       string                       `json:"service_tier,omitempty"`
 }
 
-func (c *ChatCompletionStreamResponse) GetResponseText() (responseText string) {
-	for _, choice := range c.Choices {
-		responseText += choice.Delta.Content
-	}
-
-	return
+func (r ChatCompletionStreamResponse) MarshalJSON() ([]byte, error) {
+	type responseAlias ChatCompletionStreamResponse
+	return json.Marshal(struct {
+		responseAlias
+		Usage *chatCompletionUsage `json:"usage,omitempty"`
+	}{
+		responseAlias: responseAlias(r),
+		Usage:         projectChatCompletionUsage(r.Usage),
+	})
 }
 
 type ChatAudio struct {
@@ -554,19 +742,31 @@ type MultimediaData struct {
 
 func (c *ChatCompletionRequest) ToResponsesRequest() *OpenAIResponsesRequest {
 	res := &OpenAIResponsesRequest{
-		Model:           c.Model,
-		MaxOutputTokens: c.MaxCompletionTokens,
-		Stream:          c.Stream,
-		Temperature:     c.Temperature,
-		ToolChoice:      c.ToolChoice,
-		TopP:            c.TopP,
+		Model:            c.Model,
+		MaxOutputTokens:  c.MaxCompletionTokens,
+		Stream:           c.Stream,
+		Temperature:      c.Temperature,
+		ToolChoice:       c.ToolChoice,
+		TopP:             c.TopP,
+		ServiceTier:      c.ServiceTier,
+		ProcessingClass:  c.ProcessingClass,
+		SafetyIdentifier: c.SafetyIdentifier,
+		PromptCacheKey:   c.PromptCacheKeyString(),
 	}
-	if c.ParallelToolCalls {
-		res.ParallelToolCalls = &c.ParallelToolCalls
+	// Chat stream options control the downstream Chat stream contract. They are
+	// not forwarded across this protocol conversion.
+	if c.ParallelToolCalls != nil {
+		value := *c.ParallelToolCalls
+		res.ParallelToolCalls = &value
 	}
+	// Chat Completions does not create retained application state by default,
+	// while Responses does. Preserve the Chat contract across the protocol
+	// boundary by making the otherwise different default explicit.
+	store := false
 	if c.Store != nil {
-		res.Store = c.Store
+		store = *c.Store
 	}
+	res.Store = &store
 	if c.Instructions != nil {
 		res.Instructions = *c.Instructions
 	}
@@ -626,8 +826,18 @@ func (c *ChatCompletionRequest) ToResponsesRequest() *OpenAIResponsesRequest {
 				continue
 			}
 
-			tool.ResponsesTool.Type = tool.Type
-			resTools = append(resTools, tool.ResponsesTool)
+			responsesTool := tool.ResponsesTool
+			responsesTool.Type = tool.Type
+			if tool.Type == "custom" {
+				if nested, ok := responsesTool.rawFields["custom"]; ok {
+					var customTool ResponsesTools
+					if json.Unmarshal(nested, &customTool) == nil {
+						customTool.Type = tool.Type
+						responsesTool = customTool
+					}
+				}
+			}
+			resTools = append(resTools, responsesTool)
 		}
 
 		if len(resTools) > 0 {
@@ -636,66 +846,57 @@ func (c *ChatCompletionRequest) ToResponsesRequest() *OpenAIResponsesRequest {
 	}
 
 	inputs := make([]InputResponses, 0)
+	toolCallTypes := make(map[string]string)
 	for _, msg := range c.Messages {
-		// 处理ToolCalls
+		// Chat allows assistant content and tool calls on the same message. Responses
+		// represents them as adjacent input items, with the message content first.
 		if len(msg.ToolCalls) > 0 {
+			if input, ok := chatMessageToResponsesInput(msg); ok {
+				inputs = append(inputs, input)
+			}
 			for _, tool := range msg.ToolCalls {
-				if tool == nil || tool.Function == nil {
+				if tool == nil {
 					continue
 				}
-				inputs = append(inputs, InputResponses{
-					Type:      InputTypeFunctionCall,
-					CallID:    tool.Id,
-					Name:      tool.Function.Name,
-					Arguments: tool.Function.Arguments,
-				})
+				if tool.Type == ToolChoiceTypeCustom && tool.Custom != nil {
+					inputs = append(inputs, InputResponses{
+						Type:   InputTypeCustomToolCall,
+						CallID: tool.Id,
+						Name:   tool.Custom.Name,
+						Input:  tool.Custom.Input,
+					})
+					toolCallTypes[tool.Id] = ToolChoiceTypeCustom
+					continue
+				}
+				if tool.Function != nil {
+					inputs = append(inputs, InputResponses{
+						Type:      InputTypeFunctionCall,
+						CallID:    tool.Id,
+						Name:      tool.Function.Name,
+						Arguments: tool.Function.Arguments,
+					})
+					toolCallTypes[tool.Id] = ToolChoiceTypeFunction
+				}
 			}
 
 			continue
 		}
 
 		if msg.ToolCallID != "" {
+			outputType := InputTypeFunctionCallOutput
+			if toolCallTypes[msg.ToolCallID] == ToolChoiceTypeCustom {
+				outputType = InputTypeCustomToolCallOutput
+			}
 			inputs = append(inputs, InputResponses{
-				Type:   InputTypeFunctionCallOutput,
+				Type:   outputType,
 				CallID: msg.ToolCallID,
-				Output: msg.Content,
+				Output: chatToolOutputToResponses(msg.Content),
 			})
 
 			continue
 		}
 
-		input := InputResponses{
-			Type: InputTypeMessage,
-			Role: msg.Role,
-		}
-
-		inputContent := make([]ContentResponses, 0)
-
-		messges := msg.ParseContent()
-		for _, part := range messges {
-			switch part.Type {
-			case ContentTypeImageURL:
-				if part.ImageURL == nil {
-					continue
-				}
-				inputContent = append(inputContent, ContentResponses{
-					Type:     ContentTypeInputImage,
-					ImageUrl: part.ImageURL.URL,
-				})
-			case ContentTypeText:
-				roleType := ContentTypeInputText
-				if msg.Role == ChatMessageRoleAssistant {
-					roleType = ContentTypeOutputText
-				}
-				inputContent = append(inputContent, ContentResponses{
-					Type: roleType,
-					Text: part.Text,
-				})
-			}
-		}
-
-		if len(inputContent) > 0 {
-			input.Content = inputContent
+		if input, ok := chatMessageToResponsesInput(msg); ok {
 			inputs = append(inputs, input)
 		}
 	}
@@ -703,6 +904,117 @@ func (c *ChatCompletionRequest) ToResponsesRequest() *OpenAIResponsesRequest {
 	if len(inputs) > 0 {
 		res.Input = inputs
 	}
+	res.ToolChoice = flattenChatToolChoice(c.ToolChoice)
 
 	return res
+}
+
+// PromptCacheKeyString returns the client key only when its wire value is a
+// string. Chat exact-wire paths leave other current or future upstream-owned
+// shapes untouched; cross-protocol adapters can reject them as unrepresentable.
+func (c *ChatCompletionRequest) PromptCacheKeyString() string {
+	if c == nil {
+		return ""
+	}
+	key, _ := c.PromptCacheKey.(string)
+	return strings.TrimSpace(key)
+}
+
+func chatMessageToResponsesInput(msg ChatCompletionMessage) (InputResponses, bool) {
+	input := InputResponses{
+		Type: InputTypeMessage,
+		Role: msg.Role,
+	}
+	inputContent := make([]ContentResponses, 0)
+
+	for _, part := range msg.ParseContent() {
+		switch part.Type {
+		case ContentTypeImageURL:
+			if part.ImageURL == nil {
+				continue
+			}
+			inputContent = append(inputContent, ContentResponses{
+				Type:     ContentTypeInputImage,
+				ImageUrl: part.ImageURL.URL,
+				Detail:   part.ImageURL.Detail,
+			})
+		case ContentTypeFile:
+			if part.File == nil {
+				continue
+			}
+			inputContent = append(inputContent, ContentResponses{
+				Type:     ContentTypeInputFile,
+				FileId:   part.File.FileID,
+				FileData: part.File.FileData,
+				FileName: part.File.Filename,
+			})
+		case ContentTypeText:
+			roleType := ContentTypeInputText
+			if msg.Role == ChatMessageRoleAssistant {
+				roleType = ContentTypeOutputText
+			}
+			inputContent = append(inputContent, ContentResponses{
+				Type: roleType,
+				Text: part.Text,
+			})
+		}
+	}
+
+	if len(inputContent) == 0 {
+		return InputResponses{}, false
+	}
+	input.Content = inputContent
+	return input, true
+}
+
+func chatToolOutputToResponses(output any) any {
+	if _, ok := output.(string); ok {
+		return output
+	}
+	raw, err := json.Marshal(output)
+	if err != nil {
+		return output
+	}
+	var parts []ChatMessagePart
+	if err := json.Unmarshal(raw, &parts); err != nil || len(parts) == 0 {
+		return output
+	}
+	responsesParts := make([]ContentResponses, 0, len(parts))
+	for _, part := range parts {
+		if part.Type != ContentTypeText {
+			return output
+		}
+		responsesParts = append(responsesParts, ContentResponses{Type: ContentTypeInputText, Text: part.Text})
+	}
+	return responsesParts
+}
+
+func flattenChatToolChoice(choice any) any {
+	object, ok := choice.(map[string]any)
+	if !ok {
+		return choice
+	}
+	typeName, _ := object["type"].(string)
+	if typeName != ToolChoiceTypeFunction && typeName != ToolChoiceTypeCustom {
+		return choice
+	}
+	nested, ok := object[typeName].(map[string]any)
+	if !ok {
+		return choice
+	}
+	flattened := make(map[string]any, len(nested)+1)
+	flattened["type"] = typeName
+	for key, value := range nested {
+		flattened[key] = value
+	}
+	return flattened
+}
+
+
+func (c *ChatCompletionStreamResponse) GetResponseText() (responseText string) {
+	for _, choice := range c.Choices {
+		responseText += choice.Delta.Content
+	}
+
+	return
 }
