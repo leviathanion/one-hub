@@ -51,6 +51,7 @@ export default function UsersTableRow({ item, manageUser, handleOpenModal, setMo
   const [statusSwitch, setStatusSwitch] = useState(item.status);
   const [money, setMoney] = useState(0);
   const [remark, setRemark] = useState('');
+  const [recalculating, setRecalculating] = useState(false);
 
   const handleDeleteOpen = () => {
     handleCloseMenu();
@@ -70,19 +71,34 @@ export default function UsersTableRow({ item, manageUser, handleOpenModal, setMo
   };
 
   const handleChangeQuota = async () => {
-    if (money === 0) {
-      showError(t('userPage.changeQuotaNotEmpty'));
+    if (String(money).trim() === '' || !Number.isFinite(Number(money))) {
+      showError(t('userPage.invalidQuota'));
+      return;
     }
-
     const quota = Number(renderQuotaByMoney(money));
+    if (!Number.isSafeInteger(quota)) {
+      showError(t('userPage.invalidQuota'));
+      return;
+    }
 
     if (money < 0 && Math.abs(quota) > item.quota) {
       showError(t('userPage.changeQuotaNotEnough'));
       return;
     }
     const ok = await manageUser(item.id, 'quota', { quota: Number(quota), remark });
-    if (ok) {
+    if (ok?.success) {
       setOpenChangeQuota(false);
+    }
+  };
+
+  const handleRecalculateGroup = async () => {
+    if (recalculating) return;
+    setRecalculating(true);
+    try {
+      await manageUser(item.id, 'quota', { quota: 0 });
+      handleCloseMenu();
+    } finally {
+      setRecalculating(false);
     }
   };
 
@@ -227,6 +243,10 @@ export default function UsersTableRow({ item, manageUser, handleOpenModal, setMo
         >
           <Icon icon="solar:wallet-money-bold-duotone" style={{ marginRight: '16px' }} />
           {t('userPage.changeQuota')}
+        </MenuItem>
+        <MenuItem onClick={handleRecalculateGroup} disabled={recalculating}>
+          <Icon icon="solar:refresh-bold-duotone" style={{ marginRight: '16px' }} />
+          {t('userPage.recalculateGroup')}
         </MenuItem>
         <MenuItem onClick={handleDeleteOpen} sx={{ color: 'error.main' }}>
           <Icon icon="solar:trash-bin-trash-bold-duotone" style={{ marginRight: '16px' }} />

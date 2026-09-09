@@ -25,6 +25,7 @@ import VisibilityOff from '@mui/icons-material/VisibilityOff';
 
 import { showSuccess, showError, trims } from 'utils/common';
 import { API } from 'utils/api';
+import { buildUserEditPatch } from './userPatch';
 import { useTranslation } from 'react-i18next';
 
 const validationSchema = Yup.object().shape({
@@ -70,7 +71,8 @@ const EditModal = ({ open, userId, onCancel, onOk }) => {
     values = trims(values);
     try {
       if (values.is_edit) {
-        res = await API.put(`/api/user/`, { ...values, id: parseInt(userId) });
+        const patch = buildUserEditPatch(values, inputs, userId);
+        res = await API.put(`/api/user/`, patch);
       } else {
         res = await API.post(`/api/user/`, values);
       }
