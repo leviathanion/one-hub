@@ -1,7 +1,6 @@
 package model
 
 import (
- "encoding/json"
 	"context"
 	"errors"
 	"fmt"
@@ -957,31 +956,3 @@ func GetPricesList(pricingType string) []*Price {
 
 // 	return batchPrices
 // }
-
-func GetOldPricesList() []*Price {
-	oldDataJson, err := GetOption("ModelRatio")
-	if err != nil || oldDataJson.Value == "" {
-		return nil
-	}
-
-	oldData := make(map[string][]float64)
-	err = json.Unmarshal([]byte(oldDataJson.Value), &oldData)
-
-	if err != nil {
-		return nil
-	}
-
-	var prices []*Price
-	for modelName, oldPrice := range oldData {
-		price := PricingInstance.GetPrice(modelName)
-		prices = append(prices, &Price{
-			Model:       modelName,
-			Type:        TokensPriceType,
-			ChannelType: price.ChannelType,
-			Input:       oldPrice[0],
-			Output:      oldPrice[1],
-		})
-	}
-
-	return prices
-}
