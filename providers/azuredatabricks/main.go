@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 
@@ -44,14 +45,14 @@ func (p *AzureDatabricksProvider) GetFullRequestURL(modelName string) string {
 	return fmt.Sprintf("%s/serving-endpoints/%s/invocations", baseURL, modelName)
 }
 
-func (p *AzureDatabricksProvider) prepareRequest(request *types.ChatCompletionRequest) (*http.Response, *types.OpenAIErrorWithStatusCode) {
+func (p *AzureDatabricksProvider) prepareRequest(httpRequester *requester.HTTPRequester, request *types.ChatCompletionRequest) (*http.Response, *types.OpenAIErrorWithStatusCode) {
 	req, errWithCode := p.convertRequest(request)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
 
 	requestURL := p.GetFullRequestURL(request.Model)
-	httpResponse, errWithCode := p.doRequest(req, requestURL)
+	httpResponse, errWithCode := p.doRequest(httpRequester, req, requestURL)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -60,7 +61,7 @@ func (p *AzureDatabricksProvider) prepareRequest(request *types.ChatCompletionRe
 }
 
 func (p *AzureDatabricksProvider) CreateChatCompletion(request *types.ChatCompletionRequest) (*types.ChatCompletionResponse, *types.OpenAIErrorWithStatusCode) {
-	httpResponse, errWithCode := p.prepareRequest(request)
+	httpResponse, errWithCode := p.prepareRequest(p.Requester, request)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -74,15 +75,15 @@ func (p *AzureDatabricksProvider) CreateChatCompletion(request *types.ChatComple
 	return response, nil
 }
 
-func (p *AzureDatabricksProvider) doRequest(request any, requestURL string) (*http.Response, *types.OpenAIErrorWithStatusCode) {
-	req, err := p.Requester.NewRequest(http.MethodPost, requestURL,
-		p.Requester.WithBody(request),
-		p.Requester.WithHeader(p.GetRequestHeaders()),
+func (p *AzureDatabricksProvider) doRequest(httpRequester *requester.HTTPRequester, request any, requestURL string) (*http.Response, *types.OpenAIErrorWithStatusCode) {
+	req, err := httpRequester.NewRequest(http.MethodPost, requestURL,
+		httpRequester.WithBody(request),
+		httpRequester.WithHeader(p.GetRequestHeaders()),
 	)
 	if err != nil {
 		return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
 	}
-	return p.Requester.SendRequestRaw(req)
+	return httpRequester.SendRequestRaw(req)
 }
 
 func (p *AzureDatabricksProvider) convertRequest(request *types.ChatCompletionRequest) (*databricksChatRequest, *types.OpenAIErrorWithStatusCode) {
@@ -123,9 +124,9 @@ func (p *AzureDatabricksProvider) convertRequest(request *types.ChatCompletionRe
 		databricksRequest.FrequencyPenalty = float64(*request.FrequencyPenalty)
 	}
 
-	if request.Reasoning != nil {
+	if reasoning := request.EffectiveReasoning(); reasoning != nil {
 		var opErr *types.OpenAIErrorWithStatusCode
-		databricksRequest.MaxTokens, databricksRequest.Thinking, opErr = getThinking(databricksRequest.MaxTokens, request.Reasoning)
+		databricksRequest.MaxTokens, databricksRequest.Thinking, opErr = getThinking(databricksRequest.MaxTokens, reasoning)
 		if opErr != nil {
 			return nil, opErr
 		}
@@ -199,23 +200,22 @@ func (p *AzureDatabricksProvider) convertResponse(resp *http.Response) (response
 	}
 
 	if databricksResponse.Usage != nil {
-		response.Usage = &types.Usage{
-			PromptTokens:     databricksResponse.Usage.PromptTokens,
-			CompletionTokens: databricksResponse.Usage.CompletionTokens,
-			TotalTokens:      databricksResponse.Usage.TotalTokens,
-		}
+		response.Usage = databricksResponse.Usage
+		publishDatabricksUsage(p.Usage, response.Usage, databricksResponse.Model, databricksResponse.ServiceTier)
 	}
+	response.ServiceTier = databricksResponse.ServiceTier
 
 	return response, nil
 }
 
 func (p *AzureDatabricksProvider) CreateChatCompletionStream(request *types.ChatCompletionRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
-	httpResponse, errWithCode := p.prepareRequest(request)
+	streamRequester := p.Requester.ForHTTPProfile(requester.HTTPProfileLongStream)
+	httpResponse, errWithCode := p.prepareRequest(streamRequester, request)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
 
-	stream, err := requester.RequestStream(p.Requester, httpResponse, streamHandler)
+	stream, err := requester.RequestStream(streamRequester, httpResponse, p.streamHandler)
 	if err != nil {
 		return nil, common.ErrorWrapper(err, "request_stream_failed", http.StatusInternalServerError)
 	}
@@ -223,7 +223,7 @@ func (p *AzureDatabricksProvider) CreateChatCompletionStream(request *types.Chat
 	return stream, nil
 }
 
-func streamHandler(rawLine *[]byte, dataChan chan string, errChan chan error) {
+func (p *AzureDatabricksProvider) streamHandler(rawLine *[]byte, dataChan chan string, errChan chan error) {
 	if !strings.HasPrefix(string(*rawLine), "data:") {
 		*rawLine = nil
 		return
@@ -238,7 +238,118 @@ func streamHandler(rawLine *[]byte, dataChan chan string, errChan chan error) {
 		return
 	}
 
+	observeDatabricksStreamUsage(p, *rawLine)
 	dataChan <- string(*rawLine)
+}
+
+type databricksStreamEnvelope struct {
+	Model       string          `json:"model"`
+	ServiceTier string          `json:"service_tier"`
+	Usage       json.RawMessage `json:"usage"`
+}
+
+func observeDatabricksStreamUsage(provider *AzureDatabricksProvider, payload []byte) {
+	if provider == nil || provider.Usage == nil {
+		return
+	}
+
+	var envelope databricksStreamEnvelope
+	if err := json.Unmarshal(payload, &envelope); err != nil {
+		return
+	}
+
+	var usage types.Usage
+	var usagePtr *types.Usage
+	if len(envelope.Usage) > 0 && !strings.EqualFold(strings.TrimSpace(string(envelope.Usage)), "null") {
+		if err := json.Unmarshal(envelope.Usage, &usage); err == nil {
+			usagePtr = &usage
+		}
+	}
+	publishDatabricksUsage(provider.Usage, usagePtr, envelope.Model, envelope.ServiceTier)
+}
+
+func publishDatabricksUsage(target, candidate *types.Usage, model, serviceTier string) bool {
+	if candidate == nil {
+		if target != nil {
+			target.MergeProviderAttribution(model, serviceTier)
+		}
+		return false
+	}
+	if !validDatabricksUsage(candidate) {
+		if target != nil {
+			target.MergeProviderAttribution(model, serviceTier)
+		}
+		return false
+	}
+
+	previousModel := ""
+	previousTier := ""
+	previousConflict := false
+	if target != nil {
+		previousModel = target.ResponseModel
+		previousTier = target.ServiceTier
+		previousConflict = target.AttributionConflict
+	}
+
+	candidate.MarkProviderReported()
+	candidate.MergeProviderAttribution(model, serviceTier)
+	if target == nil {
+		return true
+	}
+	*target = *candidate
+	target.MergeProviderAttribution(previousModel, previousTier)
+	target.AttributionConflict = target.AttributionConflict || previousConflict
+	return true
+}
+
+func validDatabricksUsage(usage *types.Usage) bool {
+	if usage == nil || usage.PromptTokens < 0 || usage.CompletionTokens < 0 || usage.TotalTokens < 0 {
+		return false
+	}
+	for _, value := range []int{
+		usage.PromptTokensDetails.AudioTokens,
+		usage.PromptTokensDetails.CachedTokens,
+		usage.PromptTokensDetails.TextTokens,
+		usage.PromptTokensDetails.ImageTokens,
+		usage.PromptTokensDetails.CachedTokensInternal,
+		usage.PromptTokensDetails.CacheWriteTokens,
+		usage.PromptTokensDetails.CachedWriteTokens,
+		usage.PromptTokensDetails.CachedReadTokens,
+		usage.CompletionTokensDetails.AudioTokens,
+		usage.CompletionTokensDetails.TextTokens,
+		usage.CompletionTokensDetails.ReasoningTokens,
+		usage.CompletionTokensDetails.AcceptedPredictionTokens,
+		usage.CompletionTokensDetails.RejectedPredictionTokens,
+		usage.CompletionTokensDetails.ImageTokens,
+	} {
+		if value < 0 {
+			return false
+		}
+	}
+	for _, value := range usage.ExtraTokens {
+		if value < 0 {
+			return false
+		}
+	}
+	for _, value := range usage.ExtraUsageUnits {
+		if value < 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+			return false
+		}
+	}
+	for _, value := range usage.ExtraBilling {
+		if value.CallCount < 0 {
+			return false
+		}
+	}
+	if !usage.ProviderTokenFields["prompt_tokens"] ||
+		!usage.ProviderTokenFields["completion_tokens"] ||
+		!usage.ProviderTokenFields["total_tokens"] {
+		return false
+	}
+	if usage.PromptTokens > usage.TotalTokens || usage.TotalTokens-usage.PromptTokens != usage.CompletionTokens {
+		return false
+	}
+	return true
 }
 
 func requestErrorHandle(resp *http.Response) *types.OpenAIError {
@@ -271,11 +382,12 @@ type Thinking struct {
 
 // databricksChatResponse is the response body for Azure Databricks
 type databricksChatResponse struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created int64  `json:"created"`
-	Model   string `json:"model"`
-	Choices []struct {
+	ID          string `json:"id"`
+	Object      string `json:"object"`
+	Created     int64  `json:"created"`
+	Model       string `json:"model"`
+	ServiceTier string `json:"service_tier,omitempty"`
+	Choices     []struct {
 		Index   int `json:"index"`
 		Message struct {
 			Role    string `json:"role"`
@@ -283,9 +395,5 @@ type databricksChatResponse struct {
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
-	Usage *struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-		TotalTokens      int `json:"total_tokens"`
-	} `json:"usage,omitempty"`
+	Usage *types.Usage `json:"usage,omitempty"`
 }
