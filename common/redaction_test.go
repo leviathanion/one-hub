@@ -1,9 +1,133 @@
 package common
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
+
+func TestRedactSensitiveJSONPreservesEnvelopeAndSafeFields(t *testing.T) {
+	input := []byte(`{"type":"error","message":"upstream rejected Bearer abcdefghijklmnop","error":{"access_token":"provider-secret","code":"invalid_api_key"},"items":[{"authorization":"Basic hidden"}],"count":12345678901234567890}`)
+	redacted, changed := RedactSensitiveJSON(input)
+	if !changed {
+		t.Fatal("expected credential-bearing JSON to be redacted")
+	}
+	for _, secret := range []string{"abcdefghijklmnop", "provider-secret", "Basic hidden"} {
+		if strings.Contains(string(redacted), secret) {
+			t.Fatalf("secret %q leaked from %s", secret, redacted)
+		}
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(redacted, &payload); err != nil {
+		t.Fatalf("redacted payload is not valid JSON: %v", err)
+	}
+	if string(payload["count"]) != "12345678901234567890" {
+		t.Fatalf("number changed during redaction: %s", payload["count"])
+	}
+	if !strings.Contains(string(payload["error"]), `"code":"invalid_api_key"`) {
+		t.Fatalf("safe error code was lost: %s", payload["error"])
+	}
+}
+
+func TestRedactSensitiveJSONReturnsOriginalWhenSafe(t *testing.T) {
+	input := []byte(`{ "type": "error", "message": "rate limited" }`)
+	redacted, changed := RedactSensitiveJSON(input)
+	if changed || string(redacted) != string(input) {
+		t.Fatalf("safe JSON changed: changed=%v payload=%s", changed, redacted)
+	}
+}
+
+func TestRedactSensitiveJSONRemovesProviderAccountIdentity(t *testing.T) {
+	input := []byte(`{"type":"error","account_id":"acct-secret","organization_id":"org-secret","project_id":"proj-secret","tenant_id":"tenant-secret","message":"safe"}`)
+	redacted, changed := RedactSensitiveJSON(input)
+	if !changed {
+		t.Fatal("expected provider identity fields to be redacted")
+	}
+	for _, secret := range []string{"acct-secret", "org-secret", "proj-secret", "tenant-secret"} {
+		if strings.Contains(string(redacted), secret) {
+			t.Fatalf("provider identity %q leaked from %s", secret, redacted)
+		}
+	}
+	if !strings.Contains(string(redacted), `"message":"safe"`) {
+		t.Fatalf("safe provider error fields were lost: %s", redacted)
+	}
+}
+
+func TestRedactProviderMetadataJSONPreservesSuccessfulPayloadSemantics(t *testing.T) {
+	input := []byte(`{"account_id":"acct-secret","choices":[{"message":{"content":"line 1\n  line 2 mentions session token"},"logprobs":{"content":[{"token":" hello","logprob":-0.1}]}}]}`)
+	redacted, changed := RedactProviderMetadataJSON(input)
+	if !changed {
+		t.Fatal("expected provider account metadata to be redacted")
+	}
+
+	var payload struct {
+		AccountID string `json:"account_id"`
+		Choices   []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+			Logprobs struct {
+				Content []struct {
+					Token string `json:"token"`
+				} `json:"content"`
+			} `json:"logprobs"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(redacted, &payload); err != nil {
+		t.Fatalf("decode redacted payload: %v", err)
+	}
+	if payload.AccountID != "[redacted]" {
+		t.Fatalf("provider account metadata was not redacted: %s", redacted)
+	}
+	if got := payload.Choices[0].Message.Content; got != "line 1\n  line 2 mentions session token" {
+		t.Fatalf("successful response content changed: %q", got)
+	}
+	if got := payload.Choices[0].Logprobs.Content[0].Token; got != " hello" {
+		t.Fatalf("logprobs token changed: %q", got)
+	}
+}
+
+func TestRedactSensitiveJSONRedactsExplicitErrorCredentialFields(t *testing.T) {
+	input := []byte(`{"type":"error","message":"invalid tool","secret":"shared-secret","credential":"shared-credential","nested":{"credentials":"shared-credentials"}}`)
+	redacted, changed := RedactSensitiveJSON(input)
+	if !changed {
+		t.Fatal("expected explicit error credential fields to be redacted")
+	}
+	for _, value := range []string{"shared-secret", "shared-credential", "shared-credentials"} {
+		if strings.Contains(string(redacted), value) {
+			t.Fatalf("error credential %q leaked from %s", value, redacted)
+		}
+	}
+	if !strings.Contains(string(redacted), `"message":"invalid tool"`) {
+		t.Fatalf("ordinary error semantics changed: %s", redacted)
+	}
+}
+
+func TestRedactProviderMetadataJSONDoesNotApplyErrorOnlyLabels(t *testing.T) {
+	input := []byte(`{"object":"provider.result","secret":"public-result","credential":"public-credential"}`)
+	redacted, changed := RedactProviderMetadataJSON(input)
+	if changed || string(redacted) != string(input) {
+		t.Fatalf("successful provider payload used error-only redaction: changed=%v payload=%s", changed, redacted)
+	}
+}
+
+func TestRedactProviderMetadataJSONDoesNotTraverseModelOutput(t *testing.T) {
+	input := []byte(`{"account_id":"acct-secret","response":{"project_id":"proj-secret","output":[{"authorization":"model-authored","api_key":"example-value"}]},"choices":[{"message":{"content":{"access_token":"model-authored-token"}}}]}`)
+	redacted, changed := RedactProviderMetadataJSON(input)
+	if !changed {
+		t.Fatal("expected envelope metadata to be redacted")
+	}
+	for _, secret := range []string{"acct-secret", "proj-secret"} {
+		if strings.Contains(string(redacted), secret) {
+			t.Fatalf("provider metadata %q leaked from %s", secret, redacted)
+		}
+	}
+	for _, authored := range []string{"model-authored", "example-value", "model-authored-token"} {
+		if !strings.Contains(string(redacted), authored) {
+			t.Fatalf("model-authored structured content %q changed in %s", authored, redacted)
+		}
+	}
+}
 
 func TestRedactSensitiveAssignmentsUsesEscapeAwareQuotedBoundary(t *testing.T) {
 	tests := []struct {
@@ -94,6 +218,31 @@ func TestRedactSensitiveAssignmentsConsumesMalformedQuotedRemainder(t *testing.T
 	got := RedactSensitiveAssignments(`safe accessToken='secret tail-with-secret`)
 	if got != `safe accessToken='[redacted]` {
 		t.Fatalf("unexpected malformed quoted redaction: %q", got)
+	}
+}
+
+func TestRedactSensitiveTextRemovesProviderIdentityFreeText(t *testing.T) {
+	input := "request rejected for organization org-secret_1, project proj_secret-2 and account acct_secret-3"
+	got := RedactSensitiveText(input)
+	for _, secret := range []string{"org-secret_1", "proj_secret-2", "acct_secret-3"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("provider identity %q leaked from %q", secret, got)
+		}
+	}
+	for _, label := range []string{"organization", "project", "account"} {
+		if !strings.Contains(got, label+" [redacted]") {
+			t.Fatalf("diagnostic label %q was not retained in %q", label, got)
+		}
+	}
+}
+
+func TestRedactCredentialValuesTextMatchesOnlyRealSecret(t *testing.T) {
+	got, changed := RedactCredentialValuesText("model mentions api_key and actual provider-secret-123", "provider-secret-123")
+	if !changed || strings.Contains(got, "provider-secret-123") || !strings.Contains(got, "model mentions api_key") {
+		t.Fatalf("credential value redaction changed the wrong text: %q changed=%v", got, changed)
+	}
+	if unchanged, changed := RedactCredentialValuesText("ordinary sk-example-like text", "short"); changed || unchanged != "ordinary sk-example-like text" {
+		t.Fatalf("short/non-matching credential changed text: %q changed=%v", unchanged, changed)
 	}
 }
 

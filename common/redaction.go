@@ -1,10 +1,168 @@
 package common
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
 	"regexp"
 	"strconv"
 	"strings"
 )
+
+// RedactSensitiveJSON preserves a valid JSON envelope while removing
+// credential-bearing fields and sensitive strings before the envelope crosses
+// a logging or downstream trust boundary. It returns the original bytes when
+// no redaction is needed so ordinary provider errors retain their wire form.
+func RedactSensitiveJSON(raw []byte) ([]byte, bool) {
+	return redactJSON(raw, redactSensitiveJSONValue)
+}
+
+// RedactProviderMetadataJSON removes structured provider-owned credentials and
+// account identifiers from a successful payload without interpreting ordinary
+// response strings. In particular, protocol fields such as logprobs[].token and
+// assistant-authored text must retain their values.
+func RedactProviderMetadataJSON(raw []byte) ([]byte, bool) {
+	return redactJSON(raw, redactProviderMetadataJSONValue)
+}
+
+func redactJSON(raw []byte, redactValue func(*any) bool) ([]byte, bool) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return raw, false
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return raw, false
+	}
+	if redactValue == nil || !redactValue(&value) {
+		return raw, false
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return raw, false
+	}
+	return encoded, true
+}
+
+func redactSensitiveJSONValue(value *any) bool {
+	return redactJSONValue(value, sensitiveErrorJSONField, true)
+}
+
+func redactProviderMetadataJSONValue(value *any) bool {
+	if value == nil {
+		return false
+	}
+	root, ok := (*value).(map[string]any)
+	if !ok {
+		return false
+	}
+	changed := false
+	if providerMetadataMayLiveAtRoot(root) {
+		changed = redactProviderMetadataFields(root)
+	}
+	// Responses lifecycle events wrap response-owned metadata one level below
+	// the event envelope. Do not recurse into output/choices/content trees.
+	if response, ok := root["response"].(map[string]any); ok {
+		changed = redactProviderMetadataFields(response) || changed
+	}
+	return changed
+}
+
+func providerMetadataMayLiveAtRoot(root map[string]any) bool {
+	eventType, _ := root["type"].(string)
+	eventType = strings.ToLower(strings.TrimSpace(eventType))
+	if !strings.HasPrefix(eventType, "response.") {
+		return true
+	}
+	switch eventType {
+	case "response.created", "response.in_progress", "response.completed", "response.incomplete", "response.failed", "response.queued":
+		return true
+	default:
+		// Delta and item events carry model/tool output at the event root. A
+		// same-named field there is content, not provider account metadata.
+		return false
+	}
+}
+
+func redactProviderMetadataFields(object map[string]any) bool {
+	changed := false
+	for key, value := range object {
+		if !sensitiveProviderMetadataJSONField(key) {
+			continue
+		}
+		if text, ok := value.(string); !ok || text != "[redacted]" {
+			object[key] = "[redacted]"
+			changed = true
+		}
+	}
+	return changed
+}
+
+func redactJSONValue(value *any, sensitiveField func(string) bool, redactStrings bool) bool {
+	if value == nil {
+		return false
+	}
+	switch typed := (*value).(type) {
+	case map[string]any:
+		changed := false
+		for key, fieldValue := range typed {
+			if sensitiveField != nil && sensitiveField(key) {
+				if text, ok := fieldValue.(string); !ok || text != "[redacted]" {
+					typed[key] = "[redacted]"
+					changed = true
+				}
+				continue
+			}
+			if redactJSONValue(&fieldValue, sensitiveField, redactStrings) {
+				typed[key] = fieldValue
+				changed = true
+			}
+		}
+		return changed
+	case []any:
+		changed := false
+		for index := range typed {
+			if redactJSONValue(&typed[index], sensitiveField, redactStrings) {
+				changed = true
+			}
+		}
+		return changed
+	case string:
+		if !redactStrings {
+			return false
+		}
+		redacted := RedactSensitiveText(typed)
+		if redacted == typed {
+			return false
+		}
+		*value = redacted
+		return true
+	default:
+		return false
+	}
+}
+
+func sensitiveErrorJSONField(key string) bool {
+	if sensitiveProviderMetadataJSONField(key) || strings.EqualFold(strings.TrimSpace(key), "token") {
+		return true
+	}
+	switch normalizedSensitiveLabel(key) {
+	case "secret", "credential", "credentials":
+		return true
+	default:
+		return false
+	}
+}
+
+func sensitiveProviderMetadataJSONField(key string) bool {
+	// `token` is a public Chat/Responses protocol field used by logprobs. More
+	// specific credential labels such as access_token remain provider-owned.
+	if strings.EqualFold(strings.TrimSpace(key), "token") {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(key), "authorization") || sensitiveCredentialLabel(key)
+}
 
 var (
 	sensitiveOpenAIKeyPattern           = regexp.MustCompile(`\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}\b`)
@@ -14,6 +172,7 @@ var (
 	sensitiveFieldValuePattern          = regexp.MustCompile(`(?i)((?:` + sensitiveFieldNames + `)\s*[:=]\s*)[^,;&\s<>"']+`)
 	sensitiveBearerPattern              = regexp.MustCompile(`(?i)\bbearer\s+[A-Za-z0-9._~+/-]+=*`)
 	sensitiveJWTLikePattern             = regexp.MustCompile(`\b[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`)
+	sensitiveProviderIdentityPattern    = regexp.MustCompile(`(?i)\b(organization|org|project|account)([ \t]+)(?:org[-_]|proj[-_]|acct[-_])[A-Za-z0-9_-]+`)
 	sensitiveURLPattern                 = regexp.MustCompile(`(?i)\bhttps?://[^\s"'<>]+`)
 	sensitiveBodyLabelValuePattern      = regexp.MustCompile(`(?i)\b(request|response)[-_ ]?body\b\s*[:=]?\s*\S*`)
 )
@@ -30,6 +189,7 @@ func RedactSensitiveText(message string) string {
 	message = RedactSensitiveAssignments(message)
 	message = sensitiveBearerPattern.ReplaceAllString(message, "[redacted]")
 	message = sensitiveJWTLikePattern.ReplaceAllString(message, "[redacted]")
+	message = sensitiveProviderIdentityPattern.ReplaceAllString(message, "${1}${2}[redacted]")
 	message = sensitiveURLPattern.ReplaceAllString(message, "[redacted]")
 	message = sensitiveBodyLabelValuePattern.ReplaceAllString(message, "[redacted]")
 
@@ -47,6 +207,25 @@ func RedactSensitiveText(message string) string {
 		redactNext = sensitiveDiagnosticFieldRequiresValue(lower)
 	}
 	return strings.Join(fields, " ")
+}
+
+// RedactCredentialValuesText removes only concrete credentials already known
+// to the proxy. It is safe to apply to model-authored text because ordinary
+// credential-like strings are untouched; an exact real secret must never cross
+// the downstream boundary regardless of which provider field carries it.
+func RedactCredentialValuesText(message string, values ...string) (string, bool) {
+	changed := false
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if len(value) < 8 {
+			continue
+		}
+		if strings.Contains(message, value) {
+			message = strings.ReplaceAll(message, value, "[redacted]")
+			changed = true
+		}
+	}
+	return message, changed
 }
 
 // RedactSensitiveAssignments redacts credential assignments while preserving
@@ -223,7 +402,7 @@ func sensitiveDiagnosticField(lower string) bool {
 		sensitiveCredentialLabel(lower) ||
 		strings.Contains(lower, "authorization") ||
 		strings.Contains(lower, "bearer") ||
-		strings.Contains(lower, "session") ||
+		sensitiveSessionLabel(lower) ||
 		strings.Contains(lower, "header") ||
 		strings.Contains(lower, "request-body") ||
 		strings.Contains(lower, "request_body") ||
@@ -239,7 +418,7 @@ func sensitiveDiagnosticFieldRequiresValue(lower string) bool {
 	return strings.Contains(lower, "authorization") ||
 		strings.Contains(lower, "bearer") ||
 		sensitiveCredentialLabel(lower) ||
-		strings.Contains(lower, "session") ||
+		sensitiveSessionLabel(lower) ||
 		strings.Contains(lower, "header") ||
 		strings.Contains(lower, "request-body") ||
 		strings.Contains(lower, "request_body") ||
@@ -251,19 +430,27 @@ func sensitiveDiagnosticFieldRequiresValue(lower string) bool {
 		strings.Contains(lower, "upstream_url")
 }
 
+func sensitiveSessionLabel(lower string) bool {
+	if delimiter := strings.IndexAny(lower, "=:"); delimiter >= 0 {
+		lower = lower[:delimiter]
+	}
+	switch normalizedSensitiveLabel(lower) {
+	case "session", "sessionid", "sessionkey", "sessiontoken":
+		return true
+	default:
+		return false
+	}
+}
+
 func sensitiveCredentialLabel(lower string) bool {
 	if delimiter := strings.IndexAny(lower, "=:"); delimiter >= 0 {
 		lower = lower[:delimiter]
 	}
 	lower = strings.ToLower(lower)
-	normalized := strings.Map(func(r rune) rune {
-		if (r < 'a' || r > 'z') && (r < '0' || r > '9') {
-			return -1
-		}
-		return r
-	}, lower)
+	normalized := normalizedSensitiveLabel(lower)
 	switch normalized {
-	case "apikey", "xapikey", "token", "accesstoken", "refreshtoken", "idtoken", "clientsecret", "clientassertion":
+	case "apikey", "xapikey", "token", "accesstoken", "refreshtoken", "idtoken", "clientsecret", "clientassertion",
+		"accountid", "organizationid", "orgid", "projectid", "subscriptionid", "tenantid", "billingaccount", "billingaccountid":
 		return true
 	default:
 		// Preserve the legacy safe-superset behavior for provider-prefixed
@@ -272,4 +459,13 @@ func sensitiveCredentialLabel(lower string) bool {
 		// error codes such as "invalid_api_key" remain useful diagnostics.
 		return strings.Contains(lower, "api-key") || strings.Contains(lower, "access-token")
 	}
+}
+
+func normalizedSensitiveLabel(label string) string {
+	return strings.Map(func(r rune) rune {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') {
+			return -1
+		}
+		return r
+	}, strings.ToLower(label))
 }
