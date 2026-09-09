@@ -5,47 +5,36 @@ import (
 	"net/url"
 	"one-api/common/config"
 	"strings"
-	"sync"
 
 	"github.com/go-webauthn/webauthn/webauthn"
 )
 
-var w *webauthn.WebAuthn
-
-// InitWebAuthn 初始化 WebAuthn 配置，用于在服务中启用 WebAuthn 身份验证功能。
-// 如果初始化失败，将会记录致命错误，并终止程序运行。
+// InitWebAuthn 验证当前 WebAuthn 配置。
 func InitWebAuthn() error {
-	rpID := extractRPID(config.ServerAddress)
-	var err error
-	w, err = webauthn.New(&webauthn.Config{
-		RPDisplayName: config.SystemName, // 显示名称
-		RPID:          rpID,              // FQDN
+	_, err := newWebAuthn()
+	return err
+}
+
+func newWebAuthn() (*webauthn.WebAuthn, error) {
+	options := config.GlobalOption.RuntimeSnapshot()
+	serverAddress := options.String("ServerAddress", config.ServerAddress)
+	rpID := extractRPID(serverAddress)
+	instance, err := webauthn.New(&webauthn.Config{
+		RPDisplayName: options.String("SystemName", config.SystemName), // 显示名称
+		RPID:          rpID,                                            // FQDN
 		RPOrigins: []string{
-			config.ServerAddress,
+			serverAddress,
 		}, // 添加允许的源地址列表
 	})
 	if err != nil {
-		log.Fatal("无法配置和创建WebAuthn:", err)
-		return err
+		return nil, err
 	}
-	return nil
+	return instance, nil
 }
 
-// 确保线程安全
-var mu sync.Mutex
-
-// GetWebAuthn 返回 WebAuthn 实例，如果尚未初始化，则初始化并返回。
-// 如果初始化失败，返回错误。
+// GetWebAuthn 按当前配置为本次 ceremony 创建 WebAuthn 实例。
 func GetWebAuthn() (*webauthn.WebAuthn, error) {
-	mu.Lock()
-	defer mu.Unlock()
-	if w == nil {
-		err := InitWebAuthn()
-		if err != nil {
-			return nil, err
-		}
-	}
-	return w, nil
+	return newWebAuthn()
 }
 
 // extractRPID 从服务器地址提取有效的 RPID
