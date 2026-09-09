@@ -54,6 +54,7 @@ func (w *WeCom) Send(c context.Context, title, message string) error {
 
 	// init client
 	client := requester.NewHTTPRequester("", weComErrFunc)
+	client.UseHTTPProfile(requester.HTTPProfileNotification)
 	client.Context = c
 	client.PrefixProviderErrors = false
 

@@ -74,6 +74,7 @@ func (d *DingTalk) Send(ctx context.Context, title, message string) error {
 	uri := dingTalkURL + query.Encode()
 
 	client := requester.NewHTTPRequester("", dingtalkErrFunc)
+	client.UseHTTPProfile(requester.HTTPProfileNotification)
 	client.Context = ctx
 	client.PrefixProviderErrors = false
 
@@ -88,12 +89,7 @@ func (d *DingTalk) Send(ctx context.Context, title, message string) error {
 	}
 	defer resp.Body.Close()
 
-	dingtalkErr := dingtalkErrFunc(resp)
-	if dingtalkErr != nil {
-		return fmt.Errorf("%s", dingtalkErr.Message)
-	}
-
-	return nil
+	return decodeDingTalkACK(resp)
 }
 
 func (d *DingTalk) sign(timestamp int64) string {
@@ -123,4 +119,15 @@ func dingtalkErrFunc(resp *http.Response) *types.OpenAIError {
 		Type:    "dingtalk_error",
 		Code:    fmt.Sprintf("%d", respMsg.ErrCode),
 	}
+}
+
+func decodeDingTalkACK(resp *http.Response) error {
+	ack := &dingTalkResponse{}
+	if err := decodeNotificationACK(resp, ack); err != nil {
+		return err
+	}
+	if ack.ErrCode != 0 {
+		return fmt.Errorf("send msg err. err msg: %s", ack.ErrMsg)
+	}
+	return nil
 }

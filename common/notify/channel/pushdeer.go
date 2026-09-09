@@ -57,6 +57,7 @@ func (p *Pushdeer) Send(ctx context.Context, title, message string) error {
 	uri := fmt.Sprintf("%s/message/push?pushkey=%s", url, p.pushkey)
 
 	client := requester.NewHTTPRequester("", pushdeerErrFunc)
+	client.UseHTTPProfile(requester.HTTPProfileNotification)
 	client.Context = ctx
 	client.PrefixProviderErrors = false
 

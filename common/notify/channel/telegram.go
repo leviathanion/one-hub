@@ -46,6 +46,7 @@ func (t *Telegram) Send(ctx context.Context, title, message string) error {
 	messages := splitTelegramMessageIntoParts(message, maxMessageLength)
 
 	client := requester.NewHTTPRequester(t.httpProxy, telegramErrFunc)
+	client.UseHTTPProfile(requester.HTTPProfileNotification)
 	client.Context = ctx
 	client.PrefixProviderErrors = false
 
@@ -79,12 +80,7 @@ func (t *Telegram) sendMessage(message string, client *requester.HTTPRequester) 
 	}
 	defer resp.Body.Close()
 
-	telegramErr := telegramErrFunc(resp)
-	if telegramErr != nil {
-		return fmt.Errorf("%s", telegramErr.Message)
-	}
-
-	return nil
+	return decodeTelegramACK(resp)
 }
 
 func splitTelegramMessageIntoParts(message string, partSize int) []string {
@@ -113,4 +109,15 @@ func telegramErrFunc(resp *http.Response) *types.OpenAIError {
 		Message: fmt.Sprintf("send msg err. err msg: %s", respMsg.Description),
 		Type:    "telegram_error",
 	}
+}
+
+func decodeTelegramACK(resp *http.Response) error {
+	ack := &telegramResponse{}
+	if err := decodeNotificationACK(resp, ack); err != nil {
+		return err
+	}
+	if !ack.Ok {
+		return fmt.Errorf("send msg err. err msg: %s", ack.Description)
+	}
+	return nil
 }

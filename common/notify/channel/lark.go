@@ -97,6 +97,7 @@ func (l *Lark) Send(ctx context.Context, title, message string) error {
 
 	uri := larkURL + l.token
 	client := requester.NewHTTPRequester("", larkErrFunc)
+	client.UseHTTPProfile(requester.HTTPProfileNotification)
 	client.Context = ctx
 	client.PrefixProviderErrors = false
 
@@ -111,12 +112,7 @@ func (l *Lark) Send(ctx context.Context, title, message string) error {
 	}
 	defer resp.Body.Close()
 
-	larkErr := larkErrFunc(resp)
-	if larkErr != nil {
-		return fmt.Errorf("%s", larkErr.Message)
-	}
-
-	return nil
+	return decodeLarkACK(resp)
 }
 
 func (l *Lark) sign(timestamp int64) string {
@@ -145,4 +141,15 @@ func larkErrFunc(resp *http.Response) *types.OpenAIError {
 		Type:    "lark_error",
 		Code:    respMsg.Code,
 	}
+}
+
+func decodeLarkACK(resp *http.Response) error {
+	ack := &larkResponse{}
+	if err := decodeNotificationACK(resp, ack); err != nil {
+		return err
+	}
+	if ack.Code != 0 {
+		return fmt.Errorf("send msg err. err msg: %s", ack.Message)
+	}
+	return nil
 }

@@ -25,13 +25,17 @@ func (e *Email) Name() string {
 	return "Email"
 }
 
-func (e *Email) Send(_ context.Context, title, message string) error {
+func (e *Email) Send(ctx context.Context, title, message string) error {
+	options := config.GlobalOption.RuntimeSnapshot()
 	to := e.To
 	if to == "" {
 		to = config.RootUserEmail
 	}
 
-	if config.SMTPServer == "" || config.SMTPAccount == "" || config.SMTPToken == "" || to == "" {
+	host := options.String("SMTPServer", config.SMTPServer)
+	account := options.String("SMTPAccount", config.SMTPAccount)
+	token := options.String("SMTPToken", config.SMTPToken)
+	if host == "" || account == "" || token == "" || to == "" {
 		return errors.New("smtp config is not set, skip send email notifier")
 	}
 
@@ -44,7 +48,7 @@ func (e *Email) Send(_ context.Context, title, message string) error {
 
 	body := markdown.Render(doc, renderer)
 
-	emailClient := stmp.NewStmp(config.SMTPServer, config.SMTPPort, config.SMTPAccount, config.SMTPToken, config.SMTPFrom)
+	emailClient := stmp.NewStmp(host, options.Int("SMTPPort", config.SMTPPort), account, token, options.String("SMTPFrom", config.SMTPFrom))
 
-	return emailClient.Send(to, title, string(body))
+	return emailClient.SendContext(ctx, to, title, string(body))
 }
