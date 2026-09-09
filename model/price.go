@@ -1,7 +1,10 @@
 package model
 
 import (
+	"errors"
+	"math"
 	"one-api/common/config"
+	"strings"
 
 	"github.com/shopspring/decimal"
 	"gorm.io/datatypes"
@@ -16,26 +19,47 @@ const (
 	RMBRate            = 0.014
 	DefaultCacheRatios = 0.5
 	DefaultAudioRatio  = 40
-
-	DefaultCachedWriteRatio = 1.25
-	DefaultCachedReadRatio  = 0.1
 )
 
 func GetIncreaseTokens(tokens int, ratio float64) int {
-	return int(float64(tokens) * (ratio - 1))
+	if tokens <= 0 || math.IsNaN(ratio) || ratio < 0 {
+		return 0
+	}
+	if ratio == 0 {
+		return -tokens
+	}
+	delta := float64(tokens) * (ratio - 1)
+	maxInt := int(^uint(0) >> 1)
+	minInt := -maxInt - 1
+	if delta >= float64(maxInt) {
+		return maxInt
+	}
+	if delta <= float64(minInt) {
+		return minInt
+	}
+	return int(delta)
 }
 
 var ExtraKeyIsPrompt = map[string]bool{
-	config.UsageExtraCache:             true,
-	config.UsageExtraCachedWrite:       true,
-	config.UsageExtraCachedRead:        true,
-	config.UsageExtraInputAudio:        true,
-	config.UsageExtraOutputAudio:       false,
-	config.UsageExtraReasoning:         false,
-	config.UsageExtraInputTextTokens:   true,
-	config.UsageExtraOutputTextTokens:  false,
-	config.UsageExtraInputImageTokens:  true,
-	config.UsageExtraOutputImageTokens: false,
+	config.UsageExtraCache:                   true,
+	config.UsageExtraCacheWrite:              true,
+	config.UsageExtraCachedWrite:             true,
+	config.UsageExtraCachedRead:              true,
+	config.UsageExtraClaudeCacheWrite5m:      true,
+	config.UsageExtraClaudeCacheWrite1h:      true,
+	config.UsageExtraToolUsePrompt:           true,
+	config.UsageExtraInputAudio:              true,
+	config.UsageExtraInputAudioTranscription: true,
+	config.UsageExtraOutputAudio:             false,
+	config.UsageExtraReasoning:               false,
+	config.UsageExtraInputTextTokens:         true,
+	config.UsageExtraOutputTextTokens:        false,
+	config.UsageExtraInputImageTokens:        true,
+	config.UsageExtraOutputImageTokens:       false,
+	config.UsageExtraInputVideoTokens:        true,
+	config.UsageExtraOutputVideoTokens:       false,
+	config.UsageExtraDeepSeekCacheHit:        true,
+	config.UsageExtraDeepSeekCacheMiss:       true,
 }
 
 func GetExtraPriceIsPrompt(key string) bool {
@@ -43,18 +67,26 @@ func GetExtraPriceIsPrompt(key string) bool {
 }
 
 var defaultExtraPrice = map[string]float64{
-	config.UsageExtraCache:            1,
-	config.UsageExtraCachedWrite:      1.25,
-	config.UsageExtraCachedRead:       0.1,
-	config.UsageExtraInputAudio:       1,
-	config.UsageExtraOutputAudio:      1,
-	config.UsageExtraReasoning:        1,
-	config.UsageExtraInputTextTokens:  1,
-	config.UsageExtraOutputTextTokens: 1,
+	config.UsageExtraCache:              1,
+	config.UsageExtraCacheWrite:         1.25,
+	config.UsageExtraCachedWrite:        1.25,
+	config.UsageExtraCachedRead:         0.1,
+	config.UsageExtraClaudeCacheWrite5m: 1.25,
+	config.UsageExtraClaudeCacheWrite1h: 2,
+	config.UsageExtraToolUsePrompt:      1,
+	config.UsageExtraInputAudio:         1,
+	config.UsageExtraOutputAudio:        1,
+	config.UsageExtraReasoning:          1,
+	config.UsageExtraInputTextTokens:    1,
+	config.UsageExtraOutputTextTokens:   1,
+	config.UsageExtraInputVideoTokens:   1,
+	config.UsageExtraOutputVideoTokens:  1,
+	config.UsageExtraDeepSeekCacheHit:   0.1,
+	config.UsageExtraDeepSeekCacheMiss:  1,
 }
 
 type Price struct {
-	Model       string  `json:"model" gorm:"type:varchar(100)" binding:"required"`
+	Model       string  `json:"model" gorm:"type:varchar(100);uniqueIndex:idx_prices_model_unique" binding:"required"`
 	Type        string  `json:"type"  gorm:"default:'tokens'" binding:"required"`
 	ChannelType int     `json:"channel_type" gorm:"default:0" binding:"gte=0"`
 	Input       float64 `json:"input" gorm:"default:0" binding:"gte=0"`
@@ -62,7 +94,54 @@ type Price struct {
 	Locked      bool    `json:"locked" gorm:"default:false"` // 如果模型为locked 则覆盖模式不会更新locked的模型价格
 
 	ExtraRatios *datatypes.JSONType[map[string]float64] `json:"extra_ratios,omitempty" gorm:"type:json"`
+	RateRules   *datatypes.JSONType[PriceRateRules]     `json:"rate_rules,omitempty" gorm:"type:json"`
 	ModelInfo   *ModelInfoResponse                      `json:"model_info,omitempty" gorm:"-"`
+}
+
+// ValidatePrice 校验完整价格草稿，不执行数据库写入。
+func ValidatePrice(price *Price) error { return price.prepareForPersistence() }
+
+func (price *Price) prepareForPersistence() error {
+	if price == nil {
+		return errors.New("price is required")
+	}
+	price.Model = strings.TrimSpace(price.Model)
+	if price.Model == "" {
+		return errors.New("price model is required")
+	}
+	if len([]rune(price.Model)) > config.MaxPricingModelRunes {
+		return errors.New("price model exceeds the database length limit")
+	}
+	if strings.Contains(price.Model, "*") && (strings.Count(price.Model, "*") != 1 || !strings.HasSuffix(price.Model, "*")) {
+		return errors.New("price wildcard must be a single trailing *")
+	}
+	switch price.Type {
+	case TokensPriceType, TimesPriceType:
+	default:
+		return errors.New("price type must be tokens or times")
+	}
+	if price.ChannelType < 0 {
+		return errors.New("channel type must be non-negative")
+	}
+	if math.IsNaN(price.Input) || math.IsInf(price.Input, 0) || price.Input < 0 {
+		return errors.New("input price must be a finite non-negative number")
+	}
+	if math.IsNaN(price.Output) || math.IsInf(price.Output, 0) || price.Output < 0 {
+		return errors.New("output price must be a finite non-negative number")
+	}
+	if price.RateRules != nil {
+		if err := validatePriceRateRules(price.RateRules.Data()); err != nil {
+			return err
+		}
+	}
+	if price.ExtraRatios != nil {
+		for name, ratio := range price.ExtraRatios.Data() {
+			if math.IsNaN(ratio) || math.IsInf(ratio, 0) || ratio < 0 {
+				return errors.New("extra ratio " + name + " must be a finite non-negative number")
+			}
+		}
+	}
+	return nil
 }
 
 func GetAllPrices() ([]*Price, error) {
@@ -90,14 +169,28 @@ func GetAllPrices() ([]*Price, error) {
 }
 
 func (price *Price) Update(modelName string) error {
-	if err := DB.Model(price).Select("*").Where("model = ?", modelName).Updates(price).Error; err != nil {
+	return price.updateColumns(modelName, true)
+}
+
+func (price *Price) UpdatePreservingRateRules(modelName string) error {
+	return price.updateColumns(modelName, false)
+}
+
+func (price *Price) updateColumns(modelName string, updateRateRules bool) error {
+	if err := price.prepareForPersistence(); err != nil {
 		return err
 	}
-
-	return nil
+	columns := []string{"model", "type", "channel_type", "input", "output", "locked", "extra_ratios"}
+	if updateRateRules {
+		columns = append(columns, "rate_rules")
+	}
+	return DB.Model(&Price{}).Where("model = ?", modelName).Select(columns).Updates(price).Error
 }
 
 func (price *Price) Insert() error {
+	if err := price.prepareForPersistence(); err != nil {
+		return err
+	}
 	if err := DB.Create(price).Error; err != nil {
 		return err
 	}
@@ -121,13 +214,21 @@ func (price *Price) GetOutput() float64 {
 }
 
 func (price *Price) GetExtraRatio(key string) float64 {
-	if price.ExtraRatios != nil {
-		extraRatios := price.ExtraRatios.Data()
-		if ratio, ok := extraRatios[key]; ok {
+	var extraRatios map[string]float64
+	if price != nil && price.ExtraRatios != nil {
+		extraRatios = price.ExtraRatios.Data()
+	}
+	if ratio, ok := extraRatios[key]; ok {
+		return ratio
+	}
+	// Claude TTL 是价格读取层的回退例外：仅当对应 TTL 没有显式值时，
+	// 才读取通用 cached_write_tokens；provider usage 证据仍保持独立。
+	switch key {
+	case config.UsageExtraClaudeCacheWrite5m, config.UsageExtraClaudeCacheWrite1h:
+		if ratio, ok := extraRatios[config.UsageExtraCachedWrite]; ok {
 			return ratio
 		}
 	}
-
 	ratio, ok := defaultExtraPrice[key]
 	if !ok {
 		return 1
@@ -147,15 +248,47 @@ func (price *Price) FetchOutputCurrencyPrice(rate float64) string {
 }
 
 func UpdatePrices(tx *gorm.DB, models []string, prices *Price) error {
-	err := tx.Model(Price{}).Where("model IN (?)", models).Select("*").Omit("model").Updates(
-		Price{
-			Type:        prices.Type,
-			ChannelType: prices.ChannelType,
-			Input:       prices.Input,
-			Output:      prices.Output,
-			Locked:      prices.Locked,
-			ExtraRatios: prices.ExtraRatios,
-		}).Error
+	if prices == nil {
+		return errors.New("price is required")
+	}
+	if len(models) == 0 {
+		return errors.New("models are required")
+	}
+	validation := *prices
+	if strings.TrimSpace(validation.Model) == "" {
+		validation.Model = models[0]
+	}
+	if err := validation.prepareForPersistence(); err != nil {
+		return err
+	}
+	if prices.Locked {
+		for _, modelName := range models {
+			prepared := *prices
+			prepared.Model = modelName
+			if err := prepared.prepareForPersistence(); err != nil {
+				return err
+			}
+			columns := []string{"type", "channel_type", "input", "output", "locked"}
+			if prepared.ExtraRatios != nil {
+				columns = append(columns, "extra_ratios")
+			}
+			if prepared.RateRules != nil {
+				columns = append(columns, "rate_rules")
+			}
+			if err := tx.Model(Price{}).Where("model = ?", modelName).Select(columns).Updates(&prepared).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	columns := []string{"type", "channel_type", "input", "output", "locked"}
+	if prices.ExtraRatios != nil {
+		columns = append(columns, "extra_ratios")
+	}
+	if prices.RateRules != nil {
+		columns = append(columns, "rate_rules")
+	}
+	err := tx.Model(Price{}).Where("model IN (?)", models).Select(columns).Updates(prices).Error
 
 	return err
 }
@@ -167,6 +300,11 @@ func DeletePrices(tx *gorm.DB, models []string) error {
 }
 
 func InsertPrices(tx *gorm.DB, prices []*Price) error {
+	for _, price := range prices {
+		if err := price.prepareForPersistence(); err != nil {
+			return err
+		}
+	}
 	err := tx.CreateInBatches(prices, 100).Error
 	return err
 }
