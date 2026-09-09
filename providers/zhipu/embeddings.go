@@ -64,7 +64,11 @@ func (p *ZhipuProvider) convertToEmbeddingOpenai(response *ZhipuEmbeddingRespons
 		Usage:  response.Usage,
 	}
 
-	*p.Usage = *response.Usage
+	if response.Usage != nil {
+		response.Usage.MarkProviderReported()
+		response.Usage.MergeProviderAttribution(response.Model, "")
+		*p.Usage = *response.Usage
+	}
 
 	return openAIEmbeddingResponse, nil
 }

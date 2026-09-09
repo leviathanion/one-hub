@@ -54,6 +54,7 @@ type ZhipuResponse struct {
 type ZhipuStreamResponse struct {
 	ID      string        `json:"id"`
 	Created int64         `json:"created"`
+	Model   string        `json:"model,omitempty"`
 	Choices []ZhipuChoice `json:"choices"`
 	Usage   *types.Usage  `json:"usage,omitempty"`
 	ZhipuResponseError
@@ -240,14 +241,6 @@ func (z CodeInterpreterPlugin) ToMarkdown() string {
 	}
 
 	return markdown
-}
-
-func (z *ZhipuStreamResponse) GetResponseText() (responseText string) {
-	for _, choice := range z.Choices {
-		responseText += choice.Delta.Content
-	}
-
-	return
 }
 
 type ZhipuResponseError struct {

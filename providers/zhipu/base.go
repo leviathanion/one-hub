@@ -22,6 +22,13 @@ var zhiPuCacheKey = "api_token:zhipu"
 
 type ZhipuProviderFactory struct{}
 
+func (ZhipuProviderFactory) AssessChatRemoteMedia(_ *model.Channel, _ *types.ChatCompletionRequest, _ base.ChatRemoteMediaSummary) (base.RemoteMediaMode, error) {
+	if err := base.RequireOperationEndpoint(getConfig().ChatCompletions, "Chat Completions"); err != nil {
+		return base.RemoteMediaReject, err
+	}
+	return base.RemoteMediaPassURL, nil
+}
+
 // 创建 ZhipuProvider
 func (f ZhipuProviderFactory) Create(channel *model.Channel) base.ProviderInterface {
 	return &ZhipuProvider{

@@ -20,10 +20,6 @@ type zhipuStreamHandler struct {
 }
 
 func (p *ZhipuProvider) CreateChatCompletion(request *types.ChatCompletionRequest) (*types.ChatCompletionResponse, *types.OpenAIErrorWithStatusCode) {
-	if request.Model == "glm-4-alltools" {
-		return nil, common.ErrorWrapper(nil, "glm-4-alltools 只能stream模式下请求", http.StatusBadRequest)
-	}
-
 	req, errWithCode := p.getChatRequest(request)
 	if errWithCode != nil {
 		return nil, errWithCode
@@ -48,7 +44,8 @@ func (p *ZhipuProvider) CreateChatCompletionStream(request *types.ChatCompletion
 	defer req.Body.Close()
 
 	// 发送请求
-	resp, errWithCode := p.Requester.SendRequestRaw(req)
+	streamRequester := p.Requester.ForHTTPProfile(requester.HTTPProfileLongStream)
+	resp, errWithCode := streamRequester.SendRequestRaw(req)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -58,10 +55,13 @@ func (p *ZhipuProvider) CreateChatCompletionStream(request *types.ChatCompletion
 		Request: request,
 	}
 
-	return requester.RequestStream[string](p.Requester, resp, chatHandler.handlerStream)
+	return requester.RequestStream[string](streamRequester, resp, chatHandler.handlerStream)
 }
 
 func (p *ZhipuProvider) getChatRequest(request *types.ChatCompletionRequest) (*http.Request, *types.OpenAIErrorWithStatusCode) {
+	if err := validateZhipuSearchCapability(p.Channel, request.Model, request); err != nil {
+		return nil, common.StringErrorWrapperLocal(err.Error(), "zhipu_search_billing_unsupported", http.StatusBadRequest)
+	}
 	url, errWithCode := p.GetSupportedAPIUri(config.RelayModeChatCompletions)
 	if errWithCode != nil {
 		return nil, errWithCode
@@ -112,7 +112,11 @@ func (p *ZhipuProvider) convertToChatOpenai(response *ZhipuResponse, request *ty
 		}
 	}
 
-	*p.Usage = *response.Usage
+	if response.Usage != nil {
+		response.Usage.MarkProviderReported()
+		response.Usage.MergeProviderAttribution(response.Model, "")
+		*p.Usage = *response.Usage
+	}
 
 	return
 }
@@ -353,7 +357,7 @@ func (h *zhipuStreamHandler) convertToOpenaiStream(zhipuResponse *ZhipuStreamRes
 
 	if zhipuResponse.Usage != nil {
 		*h.Usage = *zhipuResponse.Usage
-	} else {
-		h.Usage.TextBuilder.WriteString(zhipuResponse.GetResponseText())
+		h.Usage.MarkProviderReported()
+		h.Usage.MergeProviderAttribution(zhipuResponse.Model, "")
 	}
 }

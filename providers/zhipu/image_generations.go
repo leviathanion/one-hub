@@ -5,6 +5,7 @@ import (
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/types"
+	"strings"
 	"time"
 )
 
@@ -56,9 +57,25 @@ func (p *ZhipuProvider) convertToImageOpenai(response *ZhipuImageGenerationRespo
 		Data:    response.Data,
 	}
 
-	p.Usage.PromptTokens = 1000
+	if p.Usage != nil {
+		count := zhipuImageResultCount(response.Data)
+		if count > 0 {
+			p.Usage.MarkProviderOperationUnits(count)
+			p.Usage.MergeProviderAttribution(response.Model, "")
+		}
+	}
 
 	return
+}
+
+func zhipuImageResultCount(data []types.ImageResponseDataInner) int {
+	count := 0
+	for _, item := range data {
+		if strings.TrimSpace(item.URL) != "" || strings.TrimSpace(item.B64JSON) != "" {
+			count++
+		}
+	}
+	return count
 }
 
 func convertFromIamgeOpenai(request *types.ImageRequest) *ZhipuImageGenerationRequest {
