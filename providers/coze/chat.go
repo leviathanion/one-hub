@@ -43,7 +43,8 @@ func (p *CozeProvider) CreateChatCompletionStream(request *types.ChatCompletionR
 	defer req.Body.Close()
 
 	// 发送请求
-	resp, errWithCode := p.Requester.SendRequestRaw(req)
+	streamRequester := p.Requester.ForHTTPProfile(requester.HTTPProfileLongStream)
+	resp, errWithCode := streamRequester.SendRequestRaw(req)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -53,7 +54,7 @@ func (p *CozeProvider) CreateChatCompletionStream(request *types.ChatCompletionR
 		Request: request,
 	}
 
-	return requester.RequestStream[string](p.Requester, resp, chatHandler.handlerStream)
+	return requester.RequestStream[string](streamRequester, resp, chatHandler.handlerStream)
 }
 
 func (p *CozeProvider) getChatRequest(request *types.ChatCompletionRequest) (*http.Request, *types.OpenAIErrorWithStatusCode) {
@@ -187,7 +188,6 @@ func (h *CozeStreamHandler) convertToOpenaiStream(chatResponse *CozeStreamRespon
 		choice.FinishReason = types.FinishReasonStop
 	} else {
 		choice.Delta.Content = chatResponse.Message.Content
-		h.Usage.TextBuilder.WriteString(chatResponse.Message.Content)
 	}
 
 	streamResponse.Choices = []types.ChatCompletionStreamChoice{choice}
