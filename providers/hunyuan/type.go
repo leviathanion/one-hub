@@ -1,5 +1,7 @@
 package hunyuan
 
+import "encoding/json"
+
 type HunyuanError struct {
 	Message string `json:"Message,omitempty" name:"Message"`
 	Code    string `json:"Code,omitempty" name:"Code"`
@@ -76,7 +78,30 @@ type HunyuanUsage struct {
 	CompletionTokens int `json:"CompletionTokens,omitempty" name:"CompletionTokens"`
 
 	// 总 Token 数量。
-	TotalTokens int `json:"TotalTokens,omitempty" name:"TotalTokens"`
+	TotalTokens         int `json:"TotalTokens,omitempty" name:"TotalTokens"`
+	PromptTokensDetails struct {
+		CachedTokens *int `json:"CachedTokens,omitempty" name:"CachedTokens"`
+	} `json:"PromptTokensDetails,omitempty" name:"PromptTokensDetails"`
+
+	promptTokensPresent     bool
+	completionTokensPresent bool
+	totalTokensPresent      bool
+}
+
+func (u *HunyuanUsage) UnmarshalJSON(data []byte) error {
+	type usageAlias HunyuanUsage
+	var decoded usageAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*u = HunyuanUsage(decoded)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err == nil {
+		_, u.promptTokensPresent = fields["PromptTokens"]
+		_, u.completionTokensPresent = fields["CompletionTokens"]
+		_, u.totalTokensPresent = fields["TotalTokens"]
+	}
+	return nil
 }
 
 type HunyuanResponseError struct {

@@ -40,7 +40,8 @@ func (p *HunyuanProvider) CreateChatCompletionStream(request *types.ChatCompleti
 	defer req.Body.Close()
 
 	// 发送请求
-	resp, errWithCode := p.Requester.SendRequestRaw(req)
+	streamRequester := p.Requester.ForHTTPProfile(requester.HTTPProfileLongStream)
+	resp, errWithCode := streamRequester.SendRequestRaw(req)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -50,7 +51,7 @@ func (p *HunyuanProvider) CreateChatCompletionStream(request *types.ChatCompleti
 		Request: request,
 	}
 
-	return requester.RequestStream[string](p.Requester, resp, chatHandler.handlerStream)
+	return requester.RequestStream[string](streamRequester, resp, chatHandler.handlerStream)
 }
 
 func (p *HunyuanProvider) getChatRequest(request *types.ChatCompletionRequest) (*http.Request, *types.OpenAIErrorWithStatusCode) {
@@ -83,12 +84,8 @@ func (p *HunyuanProvider) convertToChatOpenai(response *ChatCompletionsResponse,
 	openaiResponse = &types.ChatCompletionResponse{
 		Object:  "chat.completion",
 		Created: txResponse.Created,
-		Usage: &types.Usage{
-			PromptTokens:     txResponse.Usage.PromptTokens,
-			CompletionTokens: txResponse.Usage.CompletionTokens,
-			TotalTokens:      txResponse.Usage.TotalTokens,
-		},
-		Model: request.Model,
+		Usage:   hunyuanUsageToOpenAI(txResponse.Usage),
+		Model:   request.Model,
 	}
 
 	for _, choice := range txResponse.Choices {
@@ -99,7 +96,9 @@ func (p *HunyuanProvider) convertToChatOpenai(response *ChatCompletionsResponse,
 		})
 	}
 
-	*p.Usage = *openaiResponse.Usage
+	if openaiResponse.Usage != nil {
+		*p.Usage = *openaiResponse.Usage
+	}
 
 	return
 }
@@ -170,9 +169,38 @@ func (h *tunyuanStreamHandler) convertToOpenaiStream(tunyuanChatResponse *ChatCo
 	responseBody, _ := json.Marshal(streamResponse)
 	dataChan <- string(responseBody)
 
-	*h.Usage = types.Usage{
-		PromptTokens:     tunyuanChatResponse.Usage.PromptTokens,
-		CompletionTokens: tunyuanChatResponse.Usage.CompletionTokens,
-		TotalTokens:      tunyuanChatResponse.Usage.TotalTokens,
+	terminal := false
+	for _, choice := range tunyuanChatResponse.Choices {
+		if strings.TrimSpace(choice.FinishReason) != "" {
+			terminal = true
+			break
+		}
 	}
+	if terminal {
+		if usage := hunyuanUsageToOpenAI(tunyuanChatResponse.Usage); usage != nil {
+			*h.Usage = *usage
+		}
+	}
+}
+
+func hunyuanUsageToOpenAI(providerUsage *HunyuanUsage) *types.Usage {
+	if providerUsage == nil {
+		return nil
+	}
+	usage := &types.Usage{
+		PromptTokens:     providerUsage.PromptTokens,
+		CompletionTokens: providerUsage.CompletionTokens,
+		TotalTokens:      providerUsage.TotalTokens,
+	}
+	if !providerUsage.promptTokensPresent || !providerUsage.completionTokensPresent || !providerUsage.totalTokensPresent {
+		return usage
+	}
+	if providerUsage.PromptTokensDetails.CachedTokens != nil {
+		usage.SetExtraTokens(config.UsageExtraCache, *providerUsage.PromptTokensDetails.CachedTokens)
+	}
+	if usage.PromptTokens+usage.CompletionTokens != usage.TotalTokens {
+		usage.ProviderTokenConflict = true
+	}
+	usage.MarkProviderReported()
+	return usage
 }
