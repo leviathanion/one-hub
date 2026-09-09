@@ -725,6 +725,7 @@ func afterAutoMigrateMigrations() []*gormigrate.Migration {
 		retryTokenLimitsMigration(),
 		dropResponsesWSSettlementIntents(),
 		dropObsoleteTablesAfterMigration(),
+		removeRetiredRuntimeOptions(),
 	}
 }
 
@@ -759,6 +760,15 @@ func removeLegacyMediaProxyOptions() *gormigrate.Migration {
 
 func removeLegacyQuotaRemindOption() *gormigrate.Migration {
 	return removeObsoleteOptions("202609060001", []string{"QuotaRemindThreshold"})
+}
+
+func removeRetiredRuntimeOptions() *gormigrate.Migration {
+	return removeObsoleteOptions("202609100001", []string{
+		"ChatCacheEnabled",
+		"ChatCacheExpireMinute",
+		"ClaudeBudgetTokensPercentage",
+		"ClaudeDefaultMaxTokens",
+	})
 }
 
 func removeObsoleteOptions(id string, keys []string) *gormigrate.Migration {
