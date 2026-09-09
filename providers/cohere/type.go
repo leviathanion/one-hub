@@ -1,6 +1,7 @@
 package cohere
 
 import (
+	"encoding/json"
 	"one-api/types"
 )
 
@@ -96,6 +97,26 @@ type UsageBilledUnits struct {
 	OutputTokens    int `json:"output_tokens,omitempty"`
 	SearchUnits     int `json:"search_units,omitempty"`
 	Classifications int `json:"classifications,omitempty"`
+
+	inputTokensPresent  bool
+	outputTokensPresent bool
+	searchUnitsPresent  bool
+}
+
+func (u *UsageBilledUnits) UnmarshalJSON(data []byte) error {
+	type usageAlias UsageBilledUnits
+	var decoded usageAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*u = UsageBilledUnits(decoded)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err == nil {
+		_, u.inputTokensPresent = fields["input_tokens"]
+		_, u.outputTokensPresent = fields["output_tokens"]
+		_, u.searchUnitsPresent = fields["search_units"]
+	}
+	return nil
 }
 
 type ModelListResponse struct {

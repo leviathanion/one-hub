@@ -13,6 +13,13 @@ import (
 
 type CohereProviderFactory struct{}
 
+func (CohereProviderFactory) AssessChatRemoteMedia(_ *model.Channel, _ *types.ChatCompletionRequest, _ base.ChatRemoteMediaSummary) (base.RemoteMediaMode, error) {
+	if err := base.RequireOperationEndpoint(getConfig().ChatCompletions, "Chat Completions"); err != nil {
+		return base.RemoteMediaReject, err
+	}
+	return base.RemoteMediaPassURL, nil
+}
+
 // 创建 CohereProvider
 func (f CohereProviderFactory) Create(channel *model.Channel) base.ProviderInterface {
 	return &CohereProvider{

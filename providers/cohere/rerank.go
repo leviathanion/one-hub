@@ -58,13 +58,19 @@ func getRerankRequest(request *types.RerankRequest, documents []string) *RerankR
 }
 
 func (p *CohereProvider) ConvertToRerank(response *RerankResponse, request *types.RerankRequest) (*types.RerankResponse, *types.OpenAIErrorWithStatusCode) {
+	searchUnits := 0
+	searchUnitsPresent := false
+	if response.Meta != nil && response.Meta.BilledUnits != nil {
+		searchUnits = response.Meta.BilledUnits.SearchUnits
+		searchUnitsPresent = response.Meta.BilledUnits.searchUnitsPresent
+	}
 	rerank := &types.RerankResponse{
 		Model:   request.Model,
 		Results: make([]types.RerankResult, 0),
-		Usage: &types.Usage{
-			PromptTokens: response.Meta.BilledUnits.SearchUnits,
-			TotalTokens:  response.Meta.BilledUnits.SearchUnits,
-		},
+		Usage:   &types.Usage{},
+	}
+	if searchUnitsPresent {
+		rerank.Usage.MarkProviderOperationUnits(searchUnits)
 	}
 
 	for _, result := range response.Results {

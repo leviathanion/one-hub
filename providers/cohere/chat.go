@@ -46,7 +46,8 @@ func (p *CohereProvider) CreateChatCompletionStream(request *types.ChatCompletio
 	defer req.Body.Close()
 
 	// 发送请求
-	resp, errWithCode := p.Requester.SendRequestRaw(req)
+	streamRequester := p.Requester.ForHTTPProfile(requester.HTTPProfileLongStream)
+	resp, errWithCode := streamRequester.SendRequestRaw(req)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -56,7 +57,7 @@ func (p *CohereProvider) CreateChatCompletionStream(request *types.ChatCompletio
 		Request: request,
 	}
 
-	return requester.RequestStream(p.Requester, resp, chatHandler.HandlerStream)
+	return requester.RequestStream(streamRequester, resp, chatHandler.HandlerStream)
 }
 
 func (p *CohereProvider) getChatRequest(request *types.ChatCompletionRequest) (*http.Request, *types.OpenAIErrorWithStatusCode) {
@@ -125,7 +126,9 @@ func ConvertToChatOpenai(provider base.ProviderInterface, response *ChatResponse
 		Usage:   &types.Usage{},
 	}
 
-	*openaiResponse.Usage = usageHandle(response.Usage.BilledUnits)
+	if response.Usage != nil {
+		*openaiResponse.Usage = usageHandle(response.Usage.BilledUnits)
+	}
 
 	usage := provider.GetUsage()
 	*usage = *openaiResponse.Usage
@@ -194,8 +197,13 @@ func (h *CohereStreamHandler) convertToOpenaiStream(cohereResponse *ChatStreamRe
 	}
 
 	if cohereResponse.Type == "message-end" {
+		if cohereResponse.Delta == nil {
+			return
+		}
 		choice.FinishReason = convertFinishReason(cohereResponse.Delta.FinishReason)
-		*h.Usage = usageHandle(cohereResponse.Delta.Usage.BilledUnits)
+		if cohereResponse.Delta.Usage != nil {
+			*h.Usage = usageHandle(cohereResponse.Delta.Usage.BilledUnits)
+		}
 	} else {
 		if cohereResponse.Delta == nil || cohereResponse.Delta.Message == nil {
 			return
@@ -213,7 +221,6 @@ func (h *CohereStreamHandler) convertToOpenaiStream(cohereResponse *ChatStreamRe
 			choice.Delta.ToolCalls = []*types.ChatCompletionToolCalls{delta.Message.ToolCalls}
 		}
 
-		h.Usage.TextBuilder.WriteString(choice.Delta.Content)
 	}
 
 	chatCompletion := types.ChatCompletionStreamResponse{
@@ -229,11 +236,23 @@ func (h *CohereStreamHandler) convertToOpenaiStream(cohereResponse *ChatStreamRe
 }
 
 func usageHandle(token *UsageBilledUnits) types.Usage {
+	if token == nil {
+		return types.Usage{}
+	}
 	usage := types.Usage{
 		PromptTokens:     token.InputTokens,
-		CompletionTokens: token.OutputTokens + token.SearchUnits + token.Classifications,
+		CompletionTokens: token.OutputTokens,
+		TotalTokens:      token.InputTokens + token.OutputTokens,
 	}
-	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	if token.inputTokensPresent && token.outputTokensPresent {
+		usage.MarkProviderReported()
+	}
+	if token.SearchUnits > 0 {
+		usage.SetProviderExtraBilling("cohere_search_unit", "", token.SearchUnits)
+	}
+	if token.Classifications > 0 {
+		usage.SetProviderExtraBilling("cohere_classification_unit", "", token.Classifications)
+	}
 
 	return usage
 }
