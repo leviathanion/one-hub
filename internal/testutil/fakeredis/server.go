@@ -93,6 +93,12 @@ func (s *Server) SetRaw(key, value string) {
 	s.values[key] = value
 }
 
+func (s *Server) DeleteRaw(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.values, key)
+}
+
 func (s *Server) GetRaw(key string) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -486,6 +492,7 @@ func (s *Server) execute(command string, args []string, writer *bufio.Writer) er
 		keys := append([]string(nil), args[2:2+numKeys]...)
 		scriptArgs := append([]string(nil), args[2+numKeys:]...)
 		if handler := s.handlerForScript(script); handler != nil {
+			s.RegisterLuaScript(script, handler)
 			writeInteger(writer, handler(keys, scriptArgs))
 			return nil
 		}
@@ -507,6 +514,90 @@ func (s *Server) handlerForScript(script string) func(keys, args []string) int64
 	script = strings.ReplaceAll(script, "\n", " ")
 	script = strings.Join(strings.Fields(script), " ")
 	switch {
+	case strings.Contains(script, "channel_affinity_set_v1"):
+		return func(keys, args []string) int64 {
+			if len(keys) < 2 || len(args) < 6 {
+				return -1
+			}
+			score, err := strconv.ParseFloat(args[1], 64)
+			if err != nil {
+				return -1
+			}
+			maxEntries, err := strconv.Atoi(args[4])
+			if err != nil {
+				return -1
+			}
+
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			s.values[keys[0]] = args[0]
+			members := s.zsets[keys[1]]
+			if members == nil {
+				members = make(map[string]float64)
+				s.zsets[keys[1]] = members
+			}
+			members[args[2]] = score
+			if maxEntries <= 0 || len(members) <= maxEntries {
+				return 0
+			}
+
+			type scoredMember struct {
+				member string
+				score  float64
+			}
+			ordered := make([]scoredMember, 0, len(members))
+			for member, memberScore := range members {
+				ordered = append(ordered, scoredMember{member: member, score: memberScore})
+			}
+			sort.Slice(ordered, func(i, j int) bool {
+				if ordered[i].score == ordered[j].score {
+					return ordered[i].member < ordered[j].member
+				}
+				return ordered[i].score < ordered[j].score
+			})
+			excess := len(ordered) - maxEntries
+			for i := 0; i < excess; i++ {
+				delete(s.values, args[5]+ordered[i].member)
+				delete(members, ordered[i].member)
+			}
+			if len(members) == 0 {
+				delete(s.zsets, keys[1])
+			}
+			return int64(excess)
+		}
+	case strings.Contains(script, "local pending = 'pending|' .. owner .. '|' .. fingerprint"):
+		return func(keys, args []string) int64 {
+			current, ok := s.GetRaw(keys[0])
+			if !ok {
+				s.SetRaw(keys[0], "pending|"+args[1]+"|"+args[0])
+				return 1
+			}
+			if current == "committed|"+args[0] {
+				return 0
+			}
+			if strings.HasPrefix(current, "pending|") {
+				return -2
+			}
+			return -1
+		}
+	case strings.Contains(script, "redis.call('SET', key, committed, 'PX', ttl_ms)"):
+		return func(keys, args []string) int64 {
+			current, ok := s.GetRaw(keys[0])
+			if !ok || current != args[0] {
+				return 0
+			}
+			s.SetRaw(keys[0], args[1])
+			return 1
+		}
+	case strings.Contains(script, "redis.call('DEL', key)") && strings.Contains(script, "~= pending"):
+		return func(keys, args []string) int64 {
+			current, ok := s.GetRaw(keys[0])
+			if !ok || current != args[0] {
+				return 0
+			}
+			s.DeleteRaw(keys[0])
+			return 1
+		}
 	case strings.Contains(script, "redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])") && !strings.Contains(script, "KEYS[2]"):
 		return func(keys, args []string) int64 {
 			currentRaw, ok := s.GetRaw(keys[0])
