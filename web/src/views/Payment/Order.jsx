@@ -14,6 +14,7 @@ import { Button, Card, Stack, Container, Typography, Box } from '@mui/material';
 import LogTableRow from './component/OrderTableRow';
 import KeywordTableHead from 'ui-component/TableHead';
 import TableToolBar from './component/OrderTableToolBar';
+import EditPaymentModal from './component/EditModal';
 import { API } from 'utils/api';
 import { PAGE_SIZE_OPTIONS, getPageSize, savePageSize } from 'constants';
 import { Icon } from '@iconify/react';
@@ -22,6 +23,7 @@ import PerfectScrollbar from 'react-perfect-scrollbar';
 
 export default function Order() {
   const { t } = useTranslation();
+  const [credentialPaymentId, setCredentialPaymentId] = useState(0);
 
   const originalKeyword = {
     p: 0,
@@ -165,18 +167,23 @@ export default function Order() {
                   { id: 'gateway_id', label: t('orderlogPage.tableHeaders.gateway_id'), disableSort: false },
                   { id: 'user_id', label: t('orderlogPage.tableHeaders.user_id'), disableSort: false },
                   { id: 'trade_no', label: t('orderlogPage.tableHeaders.trade_no'), disableSort: true },
-                  { id: 'gateway_no', label: t('orderlogPage.tableHeaders.gateway_no'), disableSort: true },
-                  { id: 'amount', label: t('orderlogPage.tableHeaders.amount'), disableSort: true },
-                  { id: 'fee', label: t('orderlogPage.tableHeaders.fee'), disableSort: true },
-                  { id: 'discount', label: t('orderlogPage.tableHeaders.discount'), disableSort: true },
-                  { id: 'order_amount', label: t('orderlogPage.tableHeaders.order_amount'), disableSort: true },
-                  { id: 'quota', label: t('orderlogPage.tableHeaders.quota'), disableSort: true },
-                  { id: 'status', label: t('orderlogPage.tableHeaders.status'), disableSort: false }
+                  { id: 'transaction_namespace', label: '交易命名空间', disableSort: true },
+                  { id: 'provider_resource_ref', label: '上游资源引用', disableSort: true },
+                  { id: 'provider_transaction_id', label: '上游交易号', disableSort: true },
+                  { id: 'expected_amount_minor', label: '订单应付金额', disableSort: true },
+                  { id: 'quota', label: '冻结充值额度', disableSort: true },
+                  { id: 'status', label: '订单状态', disableSort: false },
+                  { id: 'diagnostics', label: '上游状态与诊断', disableSort: true }
                 ]}
               />
               <TableBody>
                 {orderList.map((row, index) => (
-                  <LogTableRow item={row} key={`${row.id}_${index}`} />
+                  <LogTableRow
+                    onGatewayCredentials={setCredentialPaymentId}
+                    onRefresh={handleRefresh}
+                    item={row}
+                    key={`${row.id}_${index}`}
+                  />
                 ))}
               </TableBody>
             </Table>
@@ -194,6 +201,16 @@ export default function Order() {
           showLastButton
         />
       </Card>
+      <EditPaymentModal
+        open={credentialPaymentId > 0}
+        paymentId={credentialPaymentId}
+        credentialsOnly
+        onCancel={() => setCredentialPaymentId(0)}
+        onOk={() => {
+          setCredentialPaymentId(0);
+          handleRefresh();
+        }}
+      />
     </>
   );
 }
