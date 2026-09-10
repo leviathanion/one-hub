@@ -172,7 +172,7 @@ func (a *codexResponsesWSAdapter) PrepareClientFrame(ctx context.Context, frame 
 	switch strings.TrimSpace(envelope.Type) {
 	case "response.create":
 		return a.prepareResponseCreate(ctx, payload)
-	case "response.inject":
+	case "response.inject", "response.steer":
 		return frame, nil
 	default:
 		return responsesws.Frame{}, newCodexRealtimeClientError(envelope.EventID, "unsupported_client_event", "unsupported responses websocket client event")
@@ -257,8 +257,18 @@ func (a *codexResponsesWSAdapter) HandleProviderFrame(_ context.Context, frame r
 }
 
 func (a *codexResponsesWSAdapter) handleProviderPayloadLocked(payload []byte, envelope *responsesws.ProviderEventEnvelope) (bool, []byte, *types.UsageEvent, error) {
+	if responsesws.IsSteeringControlEvent(envelope.Type) {
+		return true, payload, nil, nil
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	// 自动 steering 续接没有客户端 create；按新的上游响应初始化观察状态。
+	if envelope.Type == "response.created" && a.accumulator == nil {
+		a.accumulator = newCodexTurnUsageAccumulator()
+		a.lastSequence = 0
+		a.hasSequence = false
+		a.lastTerminal = ""
+	}
 
 	normalized, err := a.normalizeProviderPayloadLocked(payload, envelope)
 	if err != nil {

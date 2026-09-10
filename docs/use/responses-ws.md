@@ -13,7 +13,7 @@ one-hub 通过 `GET /v1/responses` 的 WebSocket Upgrade 提供 Responses WebSoc
 
 ## 协议边界
 
-- 客户端事件支持 `response.create`；启用 `multi_agent.enabled=true` 的当前 turn 另支持 `response.inject`。
+- 客户端事件支持 `response.create`、针对当前活动响应的 `response.steer`；启用 `multi_agent.enabled=true` 的当前 turn 另支持 `response.inject`。
 - `response.cancel` 属于 Realtime API，在 Responses WebSocket 上返回 `unsupported_client_event`。客户端断开连接会关闭当前上游 transport。
 - 同一连接固定一个渠道。每个 `response.create` 独立读取其原始 `model`、`store`、continuation 和工具门禁；预扣与结算分别使用当时的当前价格，配置更新可能使两者不同。
 - 渠道必须支持该 turn 的精确 model；连接内不切换渠道、不做 model mapping，也不改写请求 model。
@@ -21,6 +21,34 @@ one-hub 通过 `GET /v1/responses` 的 WebSocket Upgrade 提供 Responses WebSoc
 - 只有 `response.completed`、`response.failed`、`response.incomplete` 是 Responses lifecycle terminal。已知 terminal 必须包含非空 `response.id` 和非负整数 `sequence_number`，并且同一 turn 内 sequence 严格递增。
 - Realtime 的 `response.done`、`response.cancelled/canceled` 会被视为上游协议错误；未知未来事件保持原样透传，但不会被当作 terminal。
 - provider terminal 先交付客户端，再执行日志和结算。结算失败不会用本地 error 替换已经交付的 terminal。
+
+## 执行中追加指令
+
+收到 `response.created` 后，可用该响应 ID 发送 `response.steer`。代理保留原始事件；具体模型、执行模式和消息内容是否支持 steering，由真实上游判断。
+
+```json
+{"type":"response.steer","previous_response_id":"resp_1","input":"将范围缩小到两周内可完成。"}
+```
+
+代理在发送第一条 steering 前完成自动续接的权限、渠道、RPM 和余额准入，并预扣一次。一个尚未绑定的自动续接最多保留 64 条待观察提交，每个已接管 ID 最多 1024 字节；原始帧沿用现有队列字节限制，不累计已发送的历史流量。连接最多保留 64 个待续接父资源证明，ID 总量最多 4 MiB；状态只在当前连接存在，断线不会自动重放。
+
+`response.steer.accepted` 表示上游已接管输入。原响应可能以 `response.incomplete`（`reason: "steered"`）或 `response.completed` 结束，随后上游自动发出新的 `response.created`。每个实际响应分别持久化资源归属、提取用量并结算，代理不发送额外的 `response.create`。
+
+如果上游返回 `response.steer.pending`，用其 `required_input` 填入已保存的工具结果或批准决定，再发一个带同一 `previous_response_id` 的 `response.create`。该显式请求使用自己的参数重新准入；不要重跑工具或重复发送已被接管的 steering 输入。`response.steer.failed` 也会原样返回。全部提交明确失败，或父已完成、全部初始回执已消解且上游明确等待客户端输入时，释放尚未使用的自动续接预扣。未知 pending reason 原样交付，不作为提前退款依据。
+
+同一已验证上游连接的迟到 steering 回执原样交付，不依赖当前候选或最近完成历史，不计入新响应用量。每条发送独立消费结果；已消费的重复结果不影响新响应，原发送首次报告的歧义仍会关闭连接。等待客户端续接所需的临时父资源证明独立保留，无关请求不会消费它；匹配显式请求收到新 Response 的 created 后才释放。如果仍有未确认的 steering 时收到请求级 `error`，代理交付错误后关闭连接并执行结算清理，因为该错误不能证明上游已撤销续接；此时不启动排队请求或自动重放。
+
+## Astra 请求与安全监控
+
+原生 HTTP Responses 和 WebSocket `response.create` 保留工具的 `async: true`、`configuration_update` 输入项、`prompt_cache_options` 和 `prompt_cache_breakpoint`。工具由客户端执行，结果按原始 `call_id` 回传；异步工具与代理不支持的 `background:true` 是不同能力。推理更新的模型和压缩兼容性限制由上游校验；跨协议 Chat 适配器会在上游工作前拒绝无法表示的字段。
+
+`cached_tokens`、`cache_write_tokens` 从上游用量进入结算。管理员仍需配置模型价格与缓存倍率，代理不会自动覆盖已有价格。
+
+收到 `misalignment_policy_violation` 时，代理保留上游错误，不受可重试 HTTP 状态配置影响；WebSocket 会在交付该错误后关闭连接并停止排队工作。同一已验证上游连接的迟到停止信号也会生效，不受当前回合切换影响。
+
+上游项目的 `safety.alert.created` Webhook 应直接配置到运营方接收端，并按 OpenAI 文档验证签名和处理重复通知。查询告警使用 `GET /v1/safety/alerts/:alert_id`，只允许管理员凭据显式指定渠道；它使用该渠道的上游项目凭据，普通用户不能查询项目级告警。代理不代管上游 Webhook 密钥或业务侧工具任务。
+
+官方协议：[Steering](https://developers.openai.com/api/docs/guides/steering)、[异步工具](https://developers.openai.com/api/docs/guides/async-tool-calling)、[监控与告警](https://developers.openai.com/api/docs/guides/safety-checks/misalignment-monitoring)。
 
 ## 状态与路由
 

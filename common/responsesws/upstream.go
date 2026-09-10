@@ -118,7 +118,7 @@ func validateClientAttemptID(req SendRequest) error {
 		return nil
 	}
 	switch envelope.Type {
-	case "response.create", "response.inject":
+	case "response.create", "response.inject", "response.steer":
 		if strings.TrimSpace(req.AttemptID) == "" {
 			return ErrMissingAttemptID
 		}

@@ -1677,3 +1677,28 @@ func (h *CodexResponsesStreamHandler) HandlerResponsesStream(rawLine *[]byte, da
 	}
 	dataChan <- string(*rawLine)
 }
+
+func TestCodexResponsesWSLateSteeringDoesNotChangeChildObservation(t *testing.T) {
+	adapter := &codexResponsesWSAdapter{provider: &CodexProvider{}, model: "gpt-5", turnModel: "gpt-5", accumulator: newCodexTurnUsageAccumulator()}
+	created := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame([]byte(`{"type":"response.created","sequence_number":0,"response":{"id":"resp_child","status":"in_progress"}}`)))
+	if created.Err != nil {
+		t.Fatal(created.Err)
+	}
+	for _, payload := range []string{
+		`{"type":"response.steer.pending","sequence_number":999,"steer":{"id":"old","previous_response_id":"resp_parent"},"reason":"future_reason"}`,
+		`{"type":"response.steer.failed","sequence_number":{"future":true},"steer":{"future":[9007199254740993]}}`,
+	} {
+		result := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame([]byte(payload)))
+		if result.Err != nil || result.EmitFrame == nil || string(result.EmitFrame.Payload()) != payload || result.Usage != nil || result.CloseTransport {
+			t.Fatalf("control not transparent: %+v", result)
+		}
+	}
+	terminal := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame([]byte(`{"type":"response.done","response":{"status":"completed","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`)))
+	if terminal.Err != nil || terminal.EmitFrame == nil {
+		t.Fatalf("child terminal failed: %+v", terminal)
+	}
+	classified := responsesws.ClassifyResponsesWSEvent(terminal.EmitFrame.Payload())
+	if classified.Malformed || classified.SequenceNumber != 1 || classified.Response.ID != "resp_child" || terminal.Usage == nil || terminal.Usage.InputTokens != 3 || terminal.Usage.OutputTokens != 5 {
+		t.Fatalf("old control polluted child terminal: %+v, usage=%+v", classified, terminal.Usage)
+	}
+}

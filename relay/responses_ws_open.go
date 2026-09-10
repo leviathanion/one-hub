@@ -462,6 +462,8 @@ func responsesWSBillingModel(c *gin.Context, originalModel string, providerModel
 	return strings.TrimSpace(providerModel)
 }
 
+type responsesWSOpenPermitKey struct{}
+
 type responsesWSUpstreamOpenParams struct {
 	upstreamSessionID string
 	channelID         int
@@ -483,6 +485,12 @@ func openResponsesWSUpstreamWithFrame(openCtx context.Context, c *gin.Context, p
 			headers = requestctx.NewHeaderSnapshot(c.Request.Header)
 		}
 		principal = requestctx.PrincipalFromGin(c)
+	}
+	if err := openCtx.Err(); err != nil {
+		return nil, common.ErrorWrapperLocal(err, "responses_ws_closing", http.StatusServiceUnavailable)
+	}
+	if allow, ok := openCtx.Value(responsesWSOpenPermitKey{}).(func() bool); ok && !allow() {
+		return nil, common.ErrorWrapperLocal(context.Canceled, "responses_ws_closing", http.StatusServiceUnavailable)
 	}
 	return responsesProvider.OpenResponsesWS(openCtx, &responsesws.OpenRequest{
 		InboundHeaders:    headers,

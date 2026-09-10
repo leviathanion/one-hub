@@ -460,6 +460,23 @@ func TestNativeSessionFullOrdinaryQueuePreservesProviderTerminalAndUsage(t *test
 	}
 }
 
+func TestNativeSessionQueuesAutomaticSuccessorTerminalsInOrder(t *testing.T) {
+	session := NewNativeSession(nil, nativeTestAdapter{}, NativeSessionOptions{RecvQueueSize: 2})
+	t.Cleanup(func() { session.Abort("test_cleanup") })
+	for _, id := range []string{"resp_parent", "resp_successor"} {
+		frame := NewTextFrame([]byte(`{"type":"response.completed","sequence_number":1,"response":{"id":"` + id + `","status":"completed"}}`))
+		if !session.enqueue(UpstreamEvent{Frame: &frame, AttemptID: "transport-parent", DetailOrigin: RecvDetailOriginProviderFrame}) {
+			t.Fatal("successor terminal dropped")
+		}
+	}
+	for _, id := range []string{"resp_parent", "resp_successor"} {
+		event, err := session.Recv(context.Background())
+		if err != nil || event.Frame == nil || !strings.Contains(string(event.Frame.Payload()), id) {
+			t.Fatalf("terminal lost or reordered: %+v %v", event, err)
+		}
+	}
+}
+
 func TestNativeSessionOrderedQueuePreservesOrdinaryFrameBeforeTerminal(t *testing.T) {
 	session := NewNativeSession(nil, nil, NativeSessionOptions{})
 	terminal := UpstreamEvent{AttemptID: "attempt-terminal", DetailOrigin: RecvDetailOriginAdapterPanic, Err: ErrAdapterPanic}

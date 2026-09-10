@@ -28,6 +28,17 @@ type ProviderEventEnvelope struct {
 	Object  map[string]json.RawMessage
 }
 
+// Steering 控制回执没有当前 Response 的用量或序号语义。仅识别公开事件名，
+// 其余字段由上游定义；不能因观察器不认识扩展字段而丢弃原帧。
+func IsSteeringControlEvent(eventType string) bool {
+	switch eventType {
+	case "response.steer.accepted", "response.steer.pending", "response.steer.failed":
+		return true
+	default:
+		return false
+	}
+}
+
 // ClientEventEnvelope is the minimal parsed shape of a client event.
 type ClientEventEnvelope struct {
 	Type    string

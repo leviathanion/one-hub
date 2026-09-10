@@ -2191,3 +2191,12 @@ func TestOpenAIRealtimeProviderInitiatedTurnAdmissionFailureStopsSession(t *test
 		t.Fatal("failed live admission was not finalized at final close")
 	}
 }
+
+func TestOpenAIResponsesWSUnknownSteeringControlPreservesWire(t *testing.T) {
+	adapter := openAIResponsesWSAdapter{}
+	payload := `{"type":"response.steer.pending","sequence_number":{"future":true},"steer":{"previous_response_id":"old","future":[9007199254740993]},"reason":"future_reason"}`
+	result := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame([]byte(payload)))
+	if result.Err != nil || result.EmitFrame == nil || string(result.EmitFrame.Payload()) != payload || result.Usage != nil || result.CloseTransport {
+		t.Fatalf("control not transparent: %+v", result)
+	}
+}

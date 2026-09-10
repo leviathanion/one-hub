@@ -466,6 +466,7 @@ type responsesWSWorkerState struct {
 }
 
 type responsesWSCloseState struct {
+	workStopped         atomic.Bool
 	closed              atomic.Bool
 	ingressClosed       atomic.Bool
 	clientClosed        atomic.Bool

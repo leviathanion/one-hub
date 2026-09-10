@@ -18,6 +18,11 @@ func OpenAIErrorCodeText(code any) string {
 	}
 }
 
+// ProviderErrorStopsWorkflow 表示上游已停止整个工作流，不能通过重试或换渠道继续。
+func ProviderErrorStopsWorkflow(err types.OpenAIError) bool {
+	return OpenAIErrorCodeText(err.Code) == "misalignment_policy_violation"
+}
+
 func ProviderErrorIsQuotaExhausted(err types.OpenAIError) bool {
 	switch strings.ToLower(strings.TrimSpace(err.Type)) {
 	case "usage_limit_reached", "insufficient_quota":

@@ -45,11 +45,11 @@ A request body that the relay can open again from the beginning without rereadin
 _Avoid_: Small request, idempotent request
 
 **Work Action**:
-One independently claimable command that can create or enlarge provider work, cost, durable state, or another irreversible side effect. One Billing Attempt owns exactly one Work Action.
+可独立认领的上游执行机会，能够产生或扩大工作、费用、持久状态或其他不可逆副作用；一个 Billing Attempt 只拥有一个 Work Action。原生 Responses steering 中，同父输入共同触发的一个后继 Response 是一个 Work Action。
 _Avoid_: Billing owner, transport attempt, polling call
 
 **Application Submission**:
-The Billing Attempt's one invocation of its configured requester, SDK, or adapter for a Work Action. It prevents one-hub application retry or failover after the attempt becomes active, but does not claim provider-observable at-most-once without a provider idempotency contract.
+Billing Attempt 为其 Work Action 认领的一次协议提交，通常对应一次 requester、SDK 或 adapter 调用；仅原生 Responses steering 的同父、尚未绑定的共同后继允许以多帧完成这次提交。它不授权应用重试或换渠道，也不在缺少上游幂等契约时承诺上游至多执行一次。
 _Avoid_: Provider receipt, TCP write, client-request idempotency
 
 **Observation/Control Call**:
@@ -231,6 +231,14 @@ _Avoid_: Native OpenAI channel, exact-wire channel
 **Native Responses WebSocket**:
 A Responses WebSocket session backed by a real provider WebSocket operation rather than an HTTP/SSE bridge. Native describes the transport boundary, not wire equivalence: each provider operation is still classified as exact-wire, same-dialect, or cross-protocol.
 _Avoid_: HTTP bridge, exact-wire guarantee
+
+**Steering Submission**:
+客户端针对已有 Response 提交的一次追加用户指令。供应商接管后，指令可等待所需的工具结果或批准，再并入后续 Response，也可能明确失败。
+_Avoid_: Response、Billing Attempt、普通工具结果注入
+
+**Steering Commitment**:
+供应商将已接管的追加指令并入后续 Response 的协议事实，以关联的 `response.created` 为提交点。接受回执与等待通知均不表示已经提交。
+_Avoid_: Steering acceptance、传输发送成功、原 Response 完成
 
 **Exact Channel Model Admission**:
 The Native Responses WebSocket rule that a turn's wire model must be explicitly covered by the selected channel's model set, including an administrator-configured wildcard, and must not be changed by model mapping. Similar names or provider aliases do not establish equivalence.

@@ -58,6 +58,7 @@ type ResponsesWSTurnAttemptInput struct {
 	BillingModel      string
 	PromptModel       string
 	Request           *types.OpenAIResponsesRequest
+	RequestFrame      *responsesws.RawResponsesCreateFrame
 	MultiAgentEnabled bool
 	StartedAt         time.Time
 }
@@ -88,6 +89,9 @@ const (
 )
 
 type ResponsesWSTurnAttempt struct {
+	// 自动续接拥有独立结算 ID，但事件仍来自原始客户端提交的 transport ID。
+	TransportAttemptID          string
+	RequestFrame                *responsesws.RawResponsesCreateFrame
 	OpeningID                   string
 	AttemptID                   string
 	Admission                   *ResponsesWSTurnAdmission
@@ -96,6 +100,7 @@ type ResponsesWSTurnAttempt struct {
 	Session                     responsesws.Upstream
 	Billing                     *relay_util.AttemptQuota
 	QuotaPreconsumed            bool
+	OwnerPersistenceError       *types.OpenAIErrorWithStatusCode
 	PreconsumeAttempted         bool
 	PreconsumeTruthApplied      bool
 	QuotaFinalized              bool
@@ -166,6 +171,7 @@ func PrepareResponsesWSTurnAttempt(input ResponsesWSTurnAttemptInput) (*Response
 		return nil, common.ErrorWrapperLocal(billingErr, "responses_ws_billing_admission_failed", http.StatusServiceUnavailable)
 	}
 	return &ResponsesWSTurnAttempt{
+		RequestFrame:                input.RequestFrame,
 		OpeningID:                   input.OpeningID,
 		Admission:                   input.Admission,
 		Candidate:                   input.Candidate,
@@ -181,12 +187,23 @@ func PrepareResponsesWSTurnAttempt(input ResponsesWSTurnAttemptInput) (*Response
 	}, nil
 }
 
+func (a *ResponsesWSTurnAttempt) transportAttemptID() string {
+	if a.TransportAttemptID != "" {
+		return a.TransportAttemptID
+	}
+	return a.AttemptID
+}
+
 func (a *ResponsesWSTurnAttempt) EnsureResponseOwnership(c *gin.Context, responseID string) *types.OpenAIErrorWithStatusCode {
 	if a == nil || strings.TrimSpace(responseID) == "" || a.StoredOwnerPersisted {
 		return nil
 	}
+	if a.OwnerPersistenceError != nil {
+		return a.OwnerPersistenceError
+	}
 	if a.RequireStoredOwner {
 		if err := persistStoredResponseOwner(c, responseID, a.SelectedChannelID); err != nil {
+			a.OwnerPersistenceError = err
 			return err
 		}
 	} else {
@@ -210,8 +227,7 @@ func (a *ResponsesWSTurnAttempt) BeginCandidate(actor *ResponsesWSSessionActor) 
 	if a.CandidateBegun {
 		return nil
 	}
-	a.AttemptID = uuid.NewString()
-	a.CandidateBegun = true
+	a.initializeIdentity()
 	actor.clearPendingProviderState("begin_candidate")
 	pending := actor.turns.pending
 	pending.attempt = a
@@ -220,6 +236,13 @@ func (a *ResponsesWSTurnAttempt) BeginCandidate(actor *ResponsesWSSessionActor) 
 		return err
 	}
 	return nil
+}
+
+func (a *ResponsesWSTurnAttempt) initializeIdentity() {
+	if a.AttemptID == "" {
+		a.AttemptID = uuid.NewString()
+	}
+	a.CandidateBegun = true
 }
 
 func (a *ResponsesWSTurnAttempt) PreConsumeQuota() *types.OpenAIErrorWithStatusCode {
@@ -520,4 +543,55 @@ func responsesWSAttemptLogContext(c *gin.Context, attempt *ResponsesWSTurnAttemp
 func cloneResponsesWSAppliedSettlement(applied ResponsesWSAppliedSettlement) *ResponsesWSAppliedSettlement {
 	cloned := applied
 	return &cloned
+}
+
+// 每阶段只领取紧邻操作的许可；已返回的 Try 即使遇到关闭也由原 attempt 收尾。
+func (a *ResponsesWSSessionActor) reserveAndClaimResponsesWork(attempt *ResponsesWSTurnAttempt) *types.OpenAIErrorWithStatusCode {
+	stopped := func() *types.OpenAIErrorWithStatusCode {
+		return common.ErrorWrapperLocal(context.Canceled, "responses_ws_closing", http.StatusServiceUnavailable)
+	}
+	if !a.allowNewWork() {
+		return stopped()
+	}
+	ctx, cancel := boundedResponsesLifecycleContext(context.WithoutCancel(a.logContext()))
+	err := attempt.PreConsumeQuotaWithContext(ctx)
+	cancel()
+	if err != nil {
+		return err
+	}
+	if !a.allowNewWork() {
+		return stopped()
+	}
+	return attempt.ClaimSubmission()
+}
+
+// 资源持久化只限制可见性，不能挡住同一执行在 closure cut 内的合法用量。
+func (a *ResponsesWSSessionActor) ensureProviderResponseDelivery(attempt *ResponsesWSTurnAttempt, event ResponsesWSEventProviderDownstream) bool {
+	if attempt == nil {
+		return true
+	}
+	responseID := responsesWSProviderDownstreamResponseID(event)
+	if a.isOutstandingProviderInjectAcknowledgement(responsesWSProviderDownstreamPayload(event)) {
+		return true
+	}
+	if event.Frame != nil && event.Frame.Kind() == responsesws.FrameKindText {
+		envelope, err := responsesws.ParseProviderEventEnvelope(event.Frame.Payload())
+		if err == nil && envelope.Type == "response.created" && responseID != "" && attempt.TransportAttemptID == "" {
+			a.releaseSteeringParent(attempt.AttemptedPreviousResponseID)
+		}
+	}
+	if attempt.OwnerPersistenceError != nil && a.closing.reducingCut {
+		return false
+	}
+	if ownershipErr := attempt.EnsureResponseOwnership(a.Context(), responseID); ownershipErr != nil {
+		a.stopNewWork()
+		a.logErrorf("responses websocket ownership barrier failed: %s", ownershipErr.Message)
+		a.writeProxyLocalForAttempt(attempt, responsesWSErrorFromOpenAI(ownershipErr), "responses_owner_persist_failed")
+		a.close("responses_owner_persist_failed")
+		return false
+	}
+	if !attempt.RequireStoredOwner && responseID != "" {
+		a.rememberConnectionLocalEphemeralResponseID(responseID)
+	}
+	return true
 }

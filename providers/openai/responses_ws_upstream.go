@@ -133,6 +133,10 @@ func (a *openAIResponsesWSAdapter) HandleProviderFrame(_ context.Context, frame 
 			Origin:   responsesws.RecvDetailOriginProviderFrame,
 		}
 	}
+	if responsesws.IsSteeringControlEvent(envelope.Type) {
+		out := responsesws.NewTextFrame(payload)
+		return responsesws.ProviderFrameResult{EmitFrame: &out, Origin: responsesws.RecvDetailOriginProviderFrame}
+	}
 	if classified := responsesws.ClassifyResponsesWSEvent(payload); classified.Malformed {
 		return responsesws.ProviderFrameResult{
 			Origin:         responsesws.RecvDetailOriginProviderMalformed,

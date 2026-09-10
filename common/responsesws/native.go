@@ -651,8 +651,15 @@ func (s *NativeSession) enqueue(event UpstreamEvent) bool {
 	terminal := UpstreamEventHasProviderTerminalEvidence(event)
 	if terminal {
 		accepted, _ := s.events.enqueue(event, true)
+		if !accepted {
+			// Steering 可在消费上一响应终态前产生下一响应终态。保留终态
+			// 专用槽位的同时，允许后续终态占用普通有界队列，不能静默丢弃。
+			accepted, _ = s.events.enqueue(event, false)
+		}
 		if accepted {
 			s.notifyEventEnqueued(event)
+		} else {
+			s.close(wsconn.CloseInfo{Kind: wsconn.CloseKindBackpressure, Code: wsconn.CloseTryAgainLater, Reason: "responses_ws_native_recv_backpressure", Err: ErrNativeQueueFull})
 		}
 		return accepted
 	}

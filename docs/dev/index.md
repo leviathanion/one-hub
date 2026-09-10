@@ -51,6 +51,7 @@
 | [渠道编辑确认方案](./immutable-channel-identity-architecture.md) | 渠道连接配置、保存确认、credential refresh | 每次编辑保存前确认影响，原地更新 |
 | [Payment Order 原子入账方案](./payment-order-architecture.md) | gateway create、callback、用户 credit | 最终方案；Payment Order原子credit，强幂等contract内允许有界create retry |
 | [ResponsesWS 架构说明](./responses-ws-architecture.md) | `/v1/responses` WebSocket、actor、quota、upstream snapshot | 当前 ResponsesWS ingress 架构；计费遵循 usage Confirm / otherwise Cancel |
+| [Responses WS 透明转发与计费设计](./responses-ws-steering-lifecycle-design.md) | 原始交付、授权证明、steering 预扣和关闭 | 目标方案；按代理职责限制观察状态，复用现有 TCC |
 | [Responses 请求重试边界](./responses-ws-attempt-replay-architecture.md) | HTTP / Native WS no-replay 边界 | provider work 前完成筛选；submission 后不换渠道、不重放 |
 | [ResponsesWS Native Transport 边界](./responses-ws-transport-boundary.md) | Native WS send result、provider adapter、evidence 边界 | ResponsesWS 只有 native upstream，没有 HTTP bridge |
 | [Codex / PI OAuth 请求 Header 画像对照](./codex-pi-header-parity.md) | Codex / PI 自身 OAuth header 画像、one-hub 中转差异 | 用于后续 Codex provider header parity 修复和回归测试设计 |

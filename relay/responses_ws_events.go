@@ -15,6 +15,7 @@ type ResponsesWSSendPurpose string
 const (
 	ResponsesWSSendPurposeResponseCreate ResponsesWSSendPurpose = "response_create"
 	ResponsesWSSendPurposeResponseInject ResponsesWSSendPurpose = "response_inject"
+	ResponsesWSSendPurposeResponseSteer  ResponsesWSSendPurpose = "response_steer"
 )
 
 const (
@@ -67,6 +68,7 @@ type ResponsesWSEventClientFrame struct {
 func (ResponsesWSEventClientFrame) responsesWSEvent() {}
 
 type ResponsesWSEventSendResult struct {
+	Completion                *responsesWSSendCompletion
 	AttemptID                 string
 	ResponseID                string
 	UpstreamSessionGeneration string
@@ -78,6 +80,7 @@ type ResponsesWSEventSendResult struct {
 func (ResponsesWSEventSendResult) responsesWSEvent() {}
 
 type ResponsesWSEventTransportContractViolation struct {
+	Completion                *responsesWSSendCompletion
 	AttemptID                 string
 	ResponseID                string
 	UpstreamSessionGeneration string

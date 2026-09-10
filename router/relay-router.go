@@ -87,6 +87,8 @@ func setOpenAIRouter(router *gin.Engine) {
 		rawRelayV1Router.Any("/threads/*any", relay.RelayOnly)
 		rawRelayV1Router.Any("/batches", relay.RelayOnly)
 		rawRelayV1Router.Any("/batches/*any", relay.RelayOnly)
+		// 告警属于上游项目；复用仅管理员可用的指定渠道授权，避免跨用户查询。
+		rawRelayV1Router.GET("/safety/alerts/:alert_id", relay.RelayOnly)
 		rawRelayV1Router.DELETE("/models/:model", relay.RelayOnly)
 	}
 

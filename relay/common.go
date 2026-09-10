@@ -1285,6 +1285,9 @@ func shouldRetry(c *gin.Context, apiErr *types.OpenAIErrorWithStatusCode, channe
 	if apiErr == nil {
 		return false
 	}
+	if common.ProviderErrorStopsWorkflow(apiErr.OpenAIError) {
+		return false
+	}
 	if requestContextErr(c) != nil {
 		return false
 	}

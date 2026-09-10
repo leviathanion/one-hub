@@ -13,6 +13,8 @@ lastUpdated: true
 - 范围：`GET /v1/responses` WebSocket ingress、Native Responses WebSocket upstream、turn actor、Stored Response owner barrier 和结算边界。
 - 非范围：普通 HTTP Responses、`/v1/realtime`、WS 到 HTTP/SSE 的协议转换。
 
+Steering 的计费映射、回执观察与资源证明生命周期见[透明转发与计费设计](./responses-ws-steering-lifecycle-design.md)。该文档是本文的 steering 专项契约；本地回归不代替真实上游协议验证。
+
 ## 核心结论
 
 Responses WebSocket 只连接显式具备 native 能力的渠道。系统不把 Responses WS 转成 HTTP/SSE，也不把 Realtime 事件转换成 Responses 事件。没有合格渠道时，在 provider work 前返回 `426 responses_ws_unsupported_for_channel`。
@@ -60,10 +62,10 @@ Responses WebSocket 只连接显式具备 native 能力的渠道。系统不把 
 
 ## Client event 与排队
 
-- 支持 `response.create`。
+- 支持 `response.create` 和针对当前活动 Response 的原始 `response.steer`；自动后继复用事前准入的独立预扣。
 - `multi_agent.enabled=true` 的 turn 支持 beta `response.inject`；frame 原样转发。
 - `response.cancel` 是 Realtime 事件，在 Responses WS 上拒绝。客户端断开通过关闭 upstream transport 终止工作。
-- opening、pending 或 active turn 存在时，新的 `response.create` 进入有界 FIFO。队列同时限制 frame 数和 payload bytes；超限 fail closed。
+- opening、pending、active turn 或尚未绑定的自动续接预扣存在时，新的 `response.create` 进入有界 FIFO。队列同时限制 frame 数和 payload bytes；超限 fail closed。
 - actor mailbox 对所有在途 client/provider frame 使用每连接 64 MiB 的共享 payload 预算，事件出队后立即释放。
 - terminal 前后收到的 `inject.created` / `inject.failed` 都会减少 pending 计数。客户端已提交的 inject 继续按序发送；provider terminal 只阻止新的 inject，turn 要等 pending acknowledgement 清零后才释放。
 
@@ -77,13 +79,13 @@ Responses WebSocket 只连接显式具备 native 能力的渠道。系统不把 
 
 每个已知 terminal 必须包含非空 `response.id` 和非负整数 `sequence_number`。同一 turn 的 provider `sequence_number` 必须严格递增。`response.done`、`response.cancelled`、`response.canceled` 属于 Realtime 语义，视为上游协议错误。
 
-顶层 `error` 默认是 request-level error，不伪装成 response terminal；它结束并结算当前 attempt，然后在同一连接推进 FIFO。只有明确分类的 connection-level error 关闭连接。provider close、EOF、malformed frame、timeout 和本地错误都不能合成 `response.completed`。未知未来事件可以透传，但不会被误判为 terminal。
+顶层 `error` 默认是 request-level error，不伪装成 response terminal；它结束并结算当前 attempt，然后在同一连接推进 FIFO。明确分类的 connection-level error 或 workflow stop 会关闭连接；自动续接尚未消解时，request-level error 也在交付后关闭，避免在歧义执行后推进 FIFO。provider close、EOF、malformed frame、timeout 和本地错误都不能合成 `response.completed`。未知未来事件可以透传，但不会被误判为 terminal。
 
 ## `store` 与 owner delivery barrier
 
-`store` 省略或为 `true` 时，只选择同时支持 create 和完整 Stored Response lifecycle 的渠道。OpenAI Data Residency 区域端点在价格与能力契约完成前不进入候选；Azure、AWS 和 Google Cloud 的部署 region 不属于这个判定。首个携带 Response ID 的 provider frame 对客户端可见前，actor 必须把 `response_id → UserId/channel_id` 持久化；持久化失败则中止交付。
+`store` 省略或为 `true` 时，只选择同时支持 create 和完整 Stored Response lifecycle 的渠道。OpenAI Data Residency 区域端点在价格与能力契约完成前不进入候选；Azure、AWS 和 Google Cloud 的部署 region 不属于这个判定。首个携带 Response ID 的 provider frame 对客户端可见前，actor 必须把 `response_id → UserId/channel_id` 持久化；持久化失败则中止交付并停止新工作，但已归属的合法 provider evidence 先进入原 attempt，closure cut 内后续用量仍进入结算；关闭排空不重试失败的 owner 写入。
 
-`store:false` 不写 durable owner。当前连接已经观察到的 response ID 由 actor 以有界列表持有，后续 turn 不依赖数据库或 ephemeral cache；跨请求只接受用户域内、有限 TTL 的 ephemeral proof，它只是来源证明和 soft preference，不能代替 durable owner。
+`store:false` 不写 durable owner。当前连接已经观察到的 response ID 由 actor 以最近历史或独立持有的 steering 父证明保存，对应续接不依赖数据库或 ephemeral cache；跨请求只接受用户域内、有限 TTL 的 ephemeral proof，它只是来源证明和 soft preference，不能代替 durable owner。
 
 后续 Stored Response 操作严格固定 owner channel，不 fallback。普通用户无法区分 owner miss、跨用户、tombstone 与过期记录。
 
@@ -96,8 +98,9 @@ Responses WebSocket 只连接显式具备 native 能力的渠道。系统不把 
 ## Liveness
 
 - 首帧 timeout 只约束 Upgrade 后等待第一个 `response.create`。
-- idle timeout 只清理没有 opening、pending、active turn 的业务空闲连接。
+- idle timeout 只清理没有 opening、pending、active turn 或未绑定自动续接的业务空闲连接。
 - active-turn provider-inactivity 默认 2 分钟，max-lifetime 默认 1 小时，均可设为 0 禁用；触发后关闭代理 turn；若仍无 provider usage，则 Cancel 预扣，不产生 provider terminal。
+- 同一个 active watchdog 随当前 Response、未绑定自动候选和实际 child 切换目标及 generation；仅保留父资源证明时按 idle 管理，迟到旧父回执不刷新 child 的期限。
 - ping/pong、read limit、write deadline 由共享 `wsconn.ManagedConn` 边界执行。
 
 ## 配置和运维

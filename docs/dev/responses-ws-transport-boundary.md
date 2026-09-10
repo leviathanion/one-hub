@@ -47,6 +47,8 @@ Native WS send 结果只有三种：
 
 关闭 actor 会停止 mailbox 投递，但不会抹掉已经完成的 transport 事实。pending `response.create` 持有独立的单元素 completion channel；在没有 provider evidence 且 send result 仍未知时，关闭路径最多等待 100ms 接收结果。send result 不授予重放权，也不决定收费；closure 只依据可归属的 provider usage Confirm，否则 Cancel。
 
+每条 steering command 另有独立的一次消费标识；候选释放后，原发送仍负责自己的结果。关闭与各新工作阶段共用 `postMu` 短锁许可，锁外进行 SQL/I/O；关闭排空只接收事实，不重新准入客户端工作。晚到 open 结果先登记清理责任并确认 `Adopted`，再使用或清理资源；`done` 不把清理权转回 worker。
+
 ## Receive evidence
 
 `UpstreamEvent` 分离：
@@ -57,6 +59,8 @@ Native WS send 结果只有三种：
 - attempt/response correlation；
 - typed detail origin/phase；
 - adapter 或 transport error。
+
+接收事件中的 transport attempt ID 仅是发送诊断关联；已绑定的 Response ID 优先决定证据归属。Steering 控制回执不参与当前 Response 的序号和用量观察，adapter 在首次状态修改前将其透传。
 
 I/O pump 只负责把这些事实可靠投递给 actor。pending write 结果未确认前，provider event 写入有事件数和字节数上限的 journal；超限时保留已有 evidence 并 fail closed，不能把已观察到的 provider 活动退化成 zero-charge。
 
