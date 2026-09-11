@@ -656,7 +656,10 @@ func RequestStreamWithOptions[T streamable](requester *HTTPRequester, resp *http
 	// 	return nil, HandleErrorResp(resp, requester.ErrorHandler, requester.PrefixProviderErrors, requester.ReplayOpenAIErrorEnvelopes)
 	// }
 
+	readContext, readEnded := context.WithCancelCause(context.Background())
 	stream := &streamReader[T]{
+		readContext:   readContext,
+		readEnded:     readEnded,
 		reader:        bufio.NewReader(resp.Body),
 		response:      resp,
 		handlerPrefix: handlerPrefix,

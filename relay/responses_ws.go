@@ -51,7 +51,6 @@ type responsesWSSendCommand struct {
 	Session                   responsesws.Upstream
 	Frame                     responsesws.Frame
 	Context                   context.Context
-	Completion                chan<- ResponsesWSEventSendResult
 	Receipt                   *responsesWSSendCompletion
 }
 
@@ -510,6 +509,11 @@ func (a *ResponsesWSSessionActor) postTransportSendResult(command responsesWSSen
 	if a == nil {
 		return false
 	}
+	if command.Purpose == ResponsesWSSendPurposeResponseInject || command.Purpose == ResponsesWSSendPurposeResponseSteer {
+		if result.Status == responsesws.ResponsesWSTransportSendAmbiguous || responsesws.ValidateResponsesWSTransportSendResult(result) != nil {
+			a.stopNewWork()
+		}
+	}
 	event := ResponsesWSEventSendResult{
 		Completion:                command.Receipt,
 		AttemptID:                 command.AttemptID,
@@ -519,12 +523,7 @@ func (a *ResponsesWSSessionActor) postTransportSendResult(command responsesWSSen
 		Purpose:                   command.Purpose,
 		TransportResult:           result,
 	}
-	if command.Completion != nil {
-		select {
-		case command.Completion <- event:
-		default:
-		}
-	}
+
 	if err := responsesws.ValidateResponsesWSTransportSendResult(result); err != nil {
 		if result.Err != nil {
 			err = errors.Join(result.Err, err)
@@ -596,7 +595,6 @@ func (a *ResponsesWSSessionActor) SendProviderFrame(attemptID string, selectedCh
 	if actorCtx := a.Context(); actorCtx != nil && actorCtx.Request != nil {
 		ctx = actorCtx.Request.Context()
 	}
-	completion := make(chan ResponsesWSEventSendResult, 1)
 	command := responsesWSSendCommand{
 		AttemptID:                 attemptID,
 		UpstreamSessionGeneration: a.upstream.sessionGeneration,
@@ -605,15 +603,8 @@ func (a *ResponsesWSSessionActor) SendProviderFrame(attemptID string, selectedCh
 		Session:                   session,
 		Frame:                     frame,
 		Context:                   ctx,
-		Completion:                completion,
 	}
-	if a.enqueueProviderSend(command) {
-		if a.turns.pending.attempt != nil && a.turns.pending.attempt.AttemptID == attemptID {
-			a.turns.pending.sendCompletion = completion
-		}
-		return true
-	}
-	return false
+	return a.enqueueProviderSend(command)
 }
 
 func (a *ResponsesWSSessionActor) SendProviderAuxiliaryFrame(attemptID string, selectedChannelID int, session responsesws.Upstream, frame responsesws.Frame, purpose ResponsesWSSendPurpose) bool {
@@ -625,9 +616,6 @@ func (a *ResponsesWSSessionActor) SendProviderAuxiliaryFrame(attemptID string, s
 	if actorCtx := a.Context(); actorCtx != nil && actorCtx.Request != nil {
 		ctx = actorCtx.Request.Context()
 	}
-	if purpose == ResponsesWSSendPurposeResponseInject {
-		ctx = a.turns.inject.Context(ctx)
-	}
 	command := responsesWSSendCommand{
 		AttemptID:                 strings.TrimSpace(attemptID),
 		UpstreamSessionGeneration: a.upstream.sessionGeneration,
@@ -637,6 +625,7 @@ func (a *ResponsesWSSessionActor) SendProviderAuxiliaryFrame(attemptID string, s
 		Frame:                     frame,
 		Context:                   ctx,
 	}
+	command.Receipt = &responsesWSSendCompletion{}
 	if purpose == ResponsesWSSendPurposeResponseSteer {
 		if a.steering.next == nil {
 			return false
@@ -645,7 +634,6 @@ func (a *ResponsesWSSessionActor) SendProviderAuxiliaryFrame(attemptID string, s
 		command.AttemptID = a.steering.next.AttemptID
 		command.TransportAttemptID = strings.TrimSpace(attemptID)
 		command.ResponseID = a.steering.parentID
-		command.Receipt = &responsesWSSendCompletion{}
 	}
 	return a.enqueueProviderSend(command)
 }
@@ -905,17 +893,10 @@ const (
 	responsesWSPendingTurnSend
 )
 
-type responsesWSCompletedResponseRecovery struct {
-	responseID   string
-	multiAgent   bool
-	nextSequence int64
-}
-
 const (
 	responsesWSBackpressurePostTimeout      = 5 * time.Second
 	responsesWSIdleWatchdogMaxInterval      = 5 * time.Second
 	responsesWSHandlerPanicCleanupGraceTime = 5 * time.Second
-	responsesWSCloseSendResultGrace         = 100 * time.Millisecond
 )
 
 type ResponsesWSSessionActor struct {
@@ -934,12 +915,11 @@ type ResponsesWSSessionActor struct {
 	lease    responsesWSLeaseState
 	upstream responsesWSUpstreamState
 
-	turns             responsesWSTurnSlots
-	workers           responsesWSWorkerState
-	closing           responsesWSCloseState
-	watchdog          responsesWSWatchdogState
-	downstreamSeq     uint64
-	completedRecovery responsesWSCompletedResponseRecovery
+	turns         responsesWSTurnSlots
+	workers       responsesWSWorkerState
+	closing       responsesWSCloseState
+	watchdog      responsesWSWatchdogState
+	downstreamSeq uint64
 
 	state               responsesWSSessionState
 	reliablePostTimeout time.Duration
@@ -1096,7 +1076,6 @@ func (a *ResponsesWSSessionActor) tryEnqueueReservedEvent(event ResponsesWSEvent
 	}
 	select {
 	case a.events <- event:
-		a.closing.postedSequence++
 		return true, false
 	default:
 		return false, false
@@ -1700,7 +1679,7 @@ func (a *ResponsesWSSessionActor) handleActiveTurnTimeout(event ResponsesWSEvent
 		return
 	}
 	if attempt.TerminalObserved {
-		a.logWarnf("responses websocket inject acknowledgement timed out after provider terminal: attempt_id=%s", responsesWSSafeDiagnosticValue(event.AttemptID))
+		a.logWarnf("responses websocket completed owner remained on active watchdog: attempt_id=%s", responsesWSSafeDiagnosticValue(event.AttemptID))
 		a.close(responsesWSActiveTurnTimeoutReason)
 		return
 	}
@@ -2060,181 +2039,15 @@ func (a *ResponsesWSSessionActor) handleClientFrame(event ResponsesWSEventClient
 	}
 }
 
-type responsesWSCompletedInjectRequest struct {
-	responseID string
-	input      []json.RawMessage
-}
-
-func parseResponsesWSCompletedInject(payload []byte) (responsesWSCompletedInjectRequest, error) {
-	envelope, err := responsesws.ParseClientEventEnvelope(payload)
-	if err != nil {
-		return responsesWSCompletedInjectRequest{}, err
-	}
-	var responseID string
-	if rawResponseID, ok := envelope.Object["response_id"]; !ok || json.Unmarshal(rawResponseID, &responseID) != nil || strings.TrimSpace(responseID) == "" {
-		return responsesWSCompletedInjectRequest{}, errors.New("response.inject response_id is required")
-	}
-	responseID = strings.TrimSpace(responseID)
-	rawInput, ok := envelope.Object["input"]
-	if !ok {
-		return responsesWSCompletedInjectRequest{}, errors.New("response.inject input is required")
-	}
-	var input []json.RawMessage
-	if json.Unmarshal(rawInput, &input) != nil || len(input) == 0 {
-		return responsesWSCompletedInjectRequest{}, errors.New("response.inject input must be a non-empty array")
-	}
-	return responsesWSCompletedInjectRequest{responseID: responseID, input: input}, nil
-}
-
-func responsesWSCompletedResponseAcceptsInject(response *types.OpenAIResponsesResponses, input []json.RawMessage) bool {
-	if response == nil || len(input) == 0 {
-		return false
-	}
-	callIDs := make(map[string]struct{})
-	for _, item := range response.Output {
-		if strings.TrimSpace(item.Type) == types.InputTypeFunctionCall && strings.TrimSpace(item.CallID) != "" {
-			callIDs[strings.TrimSpace(item.CallID)] = struct{}{}
-		}
-	}
-	if len(callIDs) == 0 {
-		return false
-	}
-	for _, rawItem := range input {
-		var item map[string]json.RawMessage
-		if json.Unmarshal(rawItem, &item) != nil || item == nil {
-			return false
-		}
-		var itemType, callID string
-		rawType, typeOK := item["type"]
-		rawCallID, callIDOK := item["call_id"]
-		if !typeOK || !callIDOK || json.Unmarshal(rawType, &itemType) != nil || json.Unmarshal(rawCallID, &callID) != nil ||
-			strings.TrimSpace(itemType) != types.InputTypeFunctionCallOutput || strings.TrimSpace(callID) == "" {
-			return false
-		}
-		if _, ok := item["output"]; !ok {
-			return false
-		}
-		if _, ok := callIDs[strings.TrimSpace(callID)]; !ok {
-			return false
-		}
-	}
-	return true
-}
-
-func responsesWSCompletedInjectFailedPayload(responseID string, sequence int64, input []json.RawMessage) []byte {
-	payload := map[string]any{
-		"type":            "response.inject.failed",
-		"sequence_number": sequence,
-		"response_id":     responseID,
-		"input":           input,
-		"error": map[string]string{
-			"type":    "invalid_request_error",
-			"code":    "response_already_completed",
-			"message": fmt.Sprintf("Response '%s' has already completed.", responseID),
-		},
-	}
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		return responsesWSErrorPayload(http.StatusInternalServerError, "system_error", "system error")
-	}
-	return encoded
-}
-
-func (a *ResponsesWSSessionActor) handleCompletedResponseInject(event ResponsesWSEventClientFrame) bool {
-	if a == nil || a.state != responsesWSStateIdle || a.turns.pending.attempt != nil || a.turns.active.attempt != nil ||
-		a.completedRecovery.responseID == "" || a.turns.history.lastFinal == nil {
-		return false
-	}
-	recovery, err := parseResponsesWSCompletedInject(event.Frame.Payload())
-	if !a.completedRecovery.multiAgent {
-		a.writeProxyLocal(responsesWSErrorPayload(http.StatusConflict, "responses_ws_multi_agent_required", "response.inject requires multi_agent.enabled=true on the current response.create"))
-		return true
-	}
-	if err != nil {
-		a.writeProxyLocal(responsesWSErrorPayload(http.StatusBadRequest, "invalid_response_inject", "invalid response.inject input"))
-		return true
-	}
-	if recovery.responseID != a.completedRecovery.responseID || strings.TrimSpace(a.turns.history.lastFinal.ID) != a.completedRecovery.responseID {
-		a.writeProxyLocal(responsesWSErrorPayload(http.StatusBadRequest, "response_not_found", "response was not found"))
-		return true
-	}
-	if !responsesWSCompletedResponseAcceptsInject(a.turns.history.lastFinal, recovery.input) {
-		a.writeProxyLocal(responsesWSErrorPayload(http.StatusBadRequest, "invalid_response_inject", "invalid response.inject input"))
-		return true
-	}
-	sequence := a.completedRecovery.nextSequence
-	if sequence <= 0 {
-		sequence = 1
-	}
-	nextSequence := sequence + 1
-	if nextSequence <= sequence {
-		nextSequence = 1
-	}
-	a.completedRecovery.nextSequence = nextSequence
-	a.writeProxyLocal(responsesWSCompletedInjectFailedPayload(recovery.responseID, sequence, recovery.input))
-	return true
-}
-
-func (a *ResponsesWSSessionActor) handleClientInject(event ResponsesWSEventClientFrame) {
-	if a == nil {
+func (a *ResponsesWSSessionActor) flushDeferredResponseInjects() {
+	if a == nil || len(a.turns.deferredInjects.deferred) == 0 {
 		return
 	}
-	if a.handleCompletedResponseInject(event) {
-		return
-	}
-	if a.turns.inject.terminalSeen {
-		a.writeProxyLocal(responsesWSErrorPayload(http.StatusConflict, "response_already_terminal", "response.inject cannot be sent after the current response is terminal"))
-		return
-	}
-	attempt := a.currentTurnAttempt()
-	multiAgentEnabled := attempt != nil && attempt.MultiAgentEnabled
-	if attempt == nil && a.turns.opening.firstFrame != nil {
-		multiAgentEnabled = a.turns.opening.firstFrame.MultiAgentEnabled
-	}
-	if !multiAgentEnabled {
-		a.writeProxyLocal(responsesWSErrorPayload(http.StatusConflict, "responses_ws_multi_agent_required", "response.inject requires multi_agent.enabled=true on the current response.create"))
-		return
-	}
-	if a.turns.inject.pending >= responsesWSInjectMaxPending {
-		a.writeProxyLocal(responsesWSErrorPayload(http.StatusTooManyRequests, "responses_ws_inject_queue_full", "too many response.inject events are awaiting acknowledgement"))
-		a.close("responses_ws_inject_queue_full")
-		return
-	}
-	if a.upstream.session == nil || attempt == nil || strings.TrimSpace(attempt.AttemptID) == "" || a.turns.active.attempt != attempt {
-		if a.turns.pending.phase != responsesWSPendingTurnOpening &&
-			a.turns.pending.phase != responsesWSPendingTurnPrepare &&
-			a.turns.pending.phase != responsesWSPendingTurnSend &&
-			a.state != responsesWSStateOpening {
-			a.writeProxyLocal(responsesWSErrorPayload(http.StatusConflict, "session_closed", "responses websocket session is not open"))
-			return
-		}
-		if event.Frame.PayloadLen() > responsesWSInjectMaxDeferredBytes-a.turns.inject.deferredBytes {
-			a.writeProxyLocal(responsesWSErrorPayload(http.StatusTooManyRequests, "responses_ws_inject_queue_full", "response.inject queue exceeds its byte limit"))
-			a.close("responses_ws_inject_queue_full")
-			return
-		}
-		a.turns.inject.deferred = append(a.turns.inject.deferred, event.Frame)
-		a.turns.inject.deferredBytes += event.Frame.PayloadLen()
-		a.turns.inject.AddPending(event.Frame.Payload())
-		return
-	}
-	if !a.SendProviderAuxiliaryFrame(attempt.AttemptID, a.upstream.channelID, a.upstream.session, event.Frame, ResponsesWSSendPurposeResponseInject) {
-		a.writeProxyLocal(responsesWSErrorPayload(http.StatusServiceUnavailable, "responses_ws_send_queue_full", responsesWSStaticErrorMessage("responses_ws_send_queue_full")))
-		a.close("responses_ws_inject_send_queue_full")
-		return
-	}
-	a.turns.inject.AddPending(event.Frame.Payload())
-}
-
-func (a *ResponsesWSSessionActor) flushDeferredResponseInjects(attemptID string) {
-	if a == nil || len(a.turns.inject.deferred) == 0 {
-		return
-	}
-	frames := a.turns.inject.deferred
-	a.turns.inject.deferred = nil
-	a.turns.inject.deferredBytes = 0
+	frames := a.turns.deferredInjects.deferred
+	a.turns.deferredInjects.deferred = nil
+	a.turns.deferredInjects.deferredBytes = 0
 	for i := range frames {
-		if !a.SendProviderAuxiliaryFrame(attemptID, a.upstream.channelID, a.upstream.session, frames[i], ResponsesWSSendPurposeResponseInject) {
+		if !a.SendProviderAuxiliaryFrame(uuid.NewString(), a.upstream.channelID, a.upstream.session, frames[i], ResponsesWSSendPurposeResponseInject) {
 			a.writeProxyLocal(responsesWSErrorPayload(http.StatusServiceUnavailable, "responses_ws_send_queue_full", responsesWSStaticErrorMessage("responses_ws_send_queue_full")))
 			a.close("responses_ws_inject_send_queue_full")
 			return
@@ -2570,6 +2383,10 @@ func (a *ResponsesWSSessionActor) handleSendResult(event ResponsesWSEventSendRes
 		a.consumeSteeringSend(event)
 		return
 	}
+	if event.Purpose == ResponsesWSSendPurposeResponseInject {
+		a.consumeInjectSend(event)
+		return
+	}
 	if err := responsesws.ValidateResponsesWSTransportSendResult(event.TransportResult); err != nil {
 		if event.TransportResult.Err != nil {
 			err = errors.Join(event.TransportResult.Err, err)
@@ -2586,26 +2403,6 @@ func (a *ResponsesWSSessionActor) handleSendResult(event ResponsesWSEventSendRes
 		return
 	}
 	sendErr := event.TransportResult.Err
-	if event.Purpose == ResponsesWSSendPurposeResponseInject {
-		if event.UpstreamSessionGeneration != "" && event.UpstreamSessionGeneration != a.upstream.sessionGeneration {
-			a.logIgnoredSendResult(event, "stale_generation_response_inject_send_result")
-			return
-		}
-		attempt := a.currentTurnAttempt()
-		if attempt == nil || attempt.AttemptID != event.AttemptID || attempt.SelectedChannelID != event.SelectedChannelID {
-			a.logIgnoredSendResult(event, "stale_response_inject_send_result")
-			return
-		}
-		if responsesWSTransportSendStatus(event.TransportResult) != responsesws.ResponsesWSTransportSendAttempted {
-			if sendErr != nil {
-				a.writeProxyLocal(responsesWSErrorFromErr(sendErr))
-			} else {
-				a.writeProxyLocal(responsesWSErrorPayload(http.StatusBadGateway, "responses_ws_inject_send_failed", "response.inject was not accepted by the upstream transport"))
-			}
-			a.close("responses_ws_inject_send_failed")
-		}
-		return
-	}
 	if event.AttemptID == "" {
 		if sendErr != nil {
 			a.writeProxyLocal(responsesWSErrorFromErr(sendErr))
@@ -2634,9 +2431,9 @@ func (a *ResponsesWSSessionActor) handleSendResult(event ResponsesWSEventSendRes
 	switch status {
 	case responsesws.ResponsesWSTransportSendAttempted:
 		attempt.CommitLocalWriteOK()
-		a.commitPendingAttempt(attempt)
-		if !a.closing.closed.Load() && a.turns.active.attempt == attempt {
-			a.flushDeferredResponseInjects(event.AttemptID)
+		a.flushDeferredResponseInjects()
+		if !a.closing.closed.Load() {
+			a.commitPendingAttempt(attempt)
 		}
 	case responsesws.ResponsesWSTransportSendNotAttempted:
 		hadProviderEvidence := a.hasPendingProviderEvidence()
@@ -2651,7 +2448,7 @@ func (a *ResponsesWSSessionActor) handleSendResult(event ResponsesWSEventSendRes
 			return
 		}
 		a.clearPendingTurn("send_not_sent")
-		a.turns.inject.Reset()
+		a.turns.deferredInjects.Reset()
 		a.state = responsesWSStateIdle
 		payload := responsesWSErrorFromErr(sendErr)
 		if len(payload) == 0 {
@@ -2669,12 +2466,9 @@ func (a *ResponsesWSSessionActor) handleSendResult(event ResponsesWSEventSendRes
 			a.close("ambiguous_upstream_write")
 			return
 		}
-		a.commitPendingAttempt(attempt)
-		if a.closing.closed.Load() {
-			return
-		}
-		if a.turns.active.attempt == attempt {
-			a.flushDeferredResponseInjects(event.AttemptID)
+		a.flushDeferredResponseInjects()
+		if !a.closing.closed.Load() {
+			a.commitPendingAttempt(attempt)
 		}
 	default:
 		a.failClosed("responses_ws_unknown_send_result")
@@ -2687,6 +2481,10 @@ func (a *ResponsesWSSessionActor) handleTransportContractViolation(event Respons
 	}
 	if event.Purpose == ResponsesWSSendPurposeResponseSteer {
 		a.consumeSteeringSend(ResponsesWSEventSendResult{Completion: event.Completion, AttemptID: event.AttemptID, ResponseID: event.ResponseID, UpstreamSessionGeneration: event.UpstreamSessionGeneration, SelectedChannelID: event.SelectedChannelID, Purpose: event.Purpose, TransportResult: event.TransportResult})
+		return
+	}
+	if event.Purpose == ResponsesWSSendPurposeResponseInject {
+		a.consumeInjectSend(ResponsesWSEventSendResult{Completion: event.Completion, AttemptID: event.AttemptID, ResponseID: event.ResponseID, UpstreamSessionGeneration: event.UpstreamSessionGeneration, SelectedChannelID: event.SelectedChannelID, Purpose: event.Purpose, TransportResult: event.TransportResult})
 		return
 	}
 	err := event.Err
@@ -2845,13 +2643,7 @@ func (a *ResponsesWSSessionActor) connectionLocalTurnAffinity(c *gin.Context, re
 	if responseID == "" {
 		return nil, false
 	}
-	found := a.hasHeldSteeringParent(c, responseID)
-	for _, current := range a.turns.history.localEphemeralResponseIDs {
-		if current == responseID {
-			found = true
-			break
-		}
-	}
+	found := a.hasConnectionLocalResponseProof(c, responseID)
 	if !found {
 		return nil, false
 	}
@@ -3002,7 +2794,7 @@ func (a *ResponsesWSSessionActor) handleProviderDownstreamWithObservation(event 
 	}
 	// Steering 回执属于目标 response，可能在新 create 开始后才进入 actor。
 	// 先检查连接与渠道，再原样交付；是否保留计费观察不决定帧能否交付。
-	if a.handleProviderSteeringControl(event) {
+	if a.handleProviderAuxiliaryControl(event) {
 		return
 	}
 	// adapter 附带的归属不能覆盖原帧中相反的 Response 身份。
@@ -3030,24 +2822,39 @@ func (a *ResponsesWSSessionActor) handleProviderDownstreamWithObservation(event 
 			return
 		}
 	}
-	// 父已结束且等待自动后继时，请求级错误仍需交付，并结束不确定执行。
-	if a.turns.active.attempt == nil && a.turns.pending.attempt == nil && a.steering.next != nil && event.Frame != nil {
-		classified := responsesws.ClassifyResponsesWSEvent(event.Frame.Payload())
-		if classified.RequestError || classified.ConnectionError {
+	var classified responsesws.ResponsesTerminalResult
+	if event.Frame != nil && event.Frame.Kind() == responsesws.FrameKindText {
+		classified = responsesws.ClassifyResponsesWSEvent(event.Frame.Payload())
+	}
+	// 诊断与已完成对象的迟到帧只依赖连接来源，不接管当前执行。
+	if event.DetailOrigin == responsesws.RecvDetailOriginProviderFrame && event.Frame != nil && event.Frame.Kind() == responsesws.FrameKindText {
+		if classified.Malformed {
+			a.handleMalformedProviderFrame(classified)
+			return
+		}
+		responseID := responsesWSProviderDownstreamResponseID(event)
+		attempt := a.currentTurnAttempt()
+		if classified.ConnectionError && attempt == nil {
 			a.stopNewWork()
-			if err := a.emitProviderFrameForAttempt(nil, responsesws.NewTextFrame(sanitizeProviderJSONPayload(event.Frame.Payload())), "provider_steering_error"); err != nil {
+			if err := a.emitProviderFrameForAttempt(nil, responsesws.NewTextFrame(sanitizeProviderJSONPayload(event.Frame.Payload())), "provider_connection_error"); err != nil {
+				a.close("client_write_failed")
+				return
+			}
+			a.close("responses_ws_provider_connection_error")
+			return
+		}
+		oldResponse := responseID != "" && (attempt == nil || attempt.SeenProviderResponseID != responseID) &&
+			(a.isRecentlyFinalizedResponseID(responseID) || a.hasConnectionLocalResponseProof(a.Context(), responseID))
+		unassociatedError := classified.RequestError && responseID == "" && !responsesWSExplicitCreateRejection(classified, attempt)
+		idleDiagnostic := attempt == nil && !responsesWSResourceLifecycleEvent(classified.EventType)
+		if !workflowStop && !classified.ConnectionError && (oldResponse || unassociatedError || idleDiagnostic) {
+			if err := a.emitProviderFrameForAttempt(nil, responsesws.NewTextFrame(sanitizeProviderJSONPayload(event.Frame.Payload())), "provider_diagnostic"); err != nil {
 				a.close("client_write_failed")
 			}
-			a.close("responses_ws_request_error_with_steering")
 			return
 		}
 	}
-	if event.Kind == ProviderDownstreamClose {
-		if !a.providerSessionLifecycleAttemptMatches(event.AttemptID) {
-			a.logIgnoredProviderEvent("provider_downstream_attempt_mismatch", event.ChannelID, event.DetailOrigin, event.DetailPhase)
-			return
-		}
-	} else if !a.providerResponseEvidenceMatches(event.AttemptID, responsesWSProviderDownstreamResponseID(event)) {
+	if event.Kind != ProviderDownstreamClose && !a.providerResponseEvidenceMatches(event.AttemptID, responsesWSProviderDownstreamResponseID(event)) {
 		a.logIgnoredProviderEvent("provider_downstream_attempt_mismatch", event.ChannelID, event.DetailOrigin, event.DetailPhase)
 		return
 	}
@@ -3078,14 +2885,14 @@ func (a *ResponsesWSSessionActor) handleProviderDownstreamWithObservation(event 
 		if attempt == nil {
 			attempt = a.turns.active.attempt
 		}
-		injectAcknowledgement := a.isOutstandingProviderInjectAcknowledgement(payload)
 		responseIDDecision := a.checkProviderResponseID(attempt, responseID)
-		if responseIDDecision != responsesWSProviderResponseIDAccepted && injectAcknowledgement {
-			responseIDDecision = responsesWSProviderResponseIDAccepted
-		}
 		switch responseIDDecision {
 		case responsesWSProviderResponseIDStaleFinalized:
-			a.logIgnoredProviderEvent("provider_downstream_finalized_response_id", event.ChannelID, event.DetailOrigin, event.DetailPhase)
+			if event.Frame != nil {
+				if err := a.emitProviderFrameForAttempt(nil, responsesws.NewTextFrame(sanitizeProviderJSONPayload(payload)), "provider_late_frame"); err != nil {
+					a.close("client_write_failed")
+				}
+			}
 			return
 		case responsesWSProviderResponseIDConflict:
 			a.failClosed("responses_ws_provider_response_id_mismatch")
@@ -3141,7 +2948,7 @@ func (a *ResponsesWSSessionActor) handleProviderDownstreamWithObservation(event 
 	}
 	if a.turns.pending.attempt != nil {
 		if event.Usage != nil {
-			mergeResponsesWSAttachedFrameUsage(a.turns.pending.attempt.Usage, responsesws.ClassifyResponsesWSEvent(payload), event.Usage)
+			mergeResponsesWSAttachedFrameUsage(a.turns.pending.attempt.Usage, classified, event.Usage)
 			// Pending downstream frames are replayed after the send result. Usage
 			// attached to the frame has already entered the pending attempt, so the
 			// replayed copy must keep the provider payload but not bill the same
@@ -3190,42 +2997,19 @@ func (a *ResponsesWSSessionActor) handleProviderDownstreamWithObservation(event 
 		return
 	}
 
-	classified := responsesws.ClassifyResponsesWSEvent(payload)
 	if classified.Malformed {
-		if a.turns.inject.terminalSeen {
-			a.logWarnf("responses websocket malformed provider event after terminal: %s", responsesWSSafeDiagnosticValue(classified.MalformedError))
-			a.close("responses_ws_provider_event_after_terminal")
-			return
-		}
 		a.handleMalformedProviderFrame(classified)
 		return
 	}
-	steeringFailure := a.steering.next != nil && (classified.RequestError || classified.ConnectionError)
-	if steeringFailure || classified.ConnectionError {
+	if classified.ConnectionError {
 		a.stopNewWork()
 	}
-	if a.turns.inject.terminalSeen && !steeringFailure && !a.isOutstandingProviderInjectAcknowledgement(payload) &&
-		!common.ProviderErrorStopsWorkflow(types.OpenAIError{Code: classified.ErrorCode}) {
-		a.logWarnf("responses websocket unexpected provider event after terminal")
-		a.close("responses_ws_provider_event_after_terminal")
-		return
-	}
-	if classified.HasSequenceNumber {
-		if a.turns.active.hasLastProviderSequence && classified.SequenceNumber <= a.turns.active.lastProviderSequence {
-			if a.turns.inject.terminalSeen {
-				a.logWarnf("responses websocket non-increasing provider sequence after terminal")
-				a.close("responses_ws_provider_event_after_terminal")
-				return
-			}
-			classified.Malformed = true
-			classified.MalformedError = "provider sequence_number must increase within a response turn"
-			a.handleMalformedProviderFrame(classified)
-			return
-		}
+	if classified.HasSequenceNumber && (classified.EventType == "response.created" || commonresponses.IsTerminalEventType(classified.EventType)) &&
+		(!a.turns.active.hasLastProviderSequence || classified.SequenceNumber > a.turns.active.lastProviderSequence) {
 		a.turns.active.lastProviderSequence = classified.SequenceNumber
 		a.turns.active.hasLastProviderSequence = true
 	}
-	if event.DetailOrigin == responsesws.RecvDetailOriginProviderFrame && classified.Response != nil && classified.Response.Usage != nil {
+	if event.DetailOrigin == responsesws.RecvDetailOriginProviderFrame && commonresponses.IsTerminalEventType(classified.EventType) && classified.Response != nil && classified.Response.Usage != nil {
 		classified.Response.Usage.MarkProviderReported()
 	}
 	mergeResponsesWSAttachedFrameUsage(a.turns.active.attempt.Usage, classified, event.Usage)
@@ -3238,7 +3022,6 @@ func (a *ResponsesWSSessionActor) handleProviderDownstreamWithObservation(event 
 		classified.Kind == responsesws.ResponsesFailedTerminal)
 	writeAttempt := a.turns.active.attempt
 	if isTerminal {
-		a.completedRecovery = responsesWSCompletedResponseRecovery{}
 		a.logProviderTerminal(classified, receivedAt)
 		writeAttempt.MarkCompleted(receivedAt)
 		writeAttempt.MarkProviderTerminalEvidence(classified)
@@ -3264,31 +3047,12 @@ func (a *ResponsesWSSessionActor) handleProviderDownstreamWithObservation(event 
 			a.close("provider_workflow_stopped")
 			return
 		}
-		if classified.Kind == responsesws.ResponsesSuccessTerminal && classified.Response != nil {
-			responseID := strings.TrimSpace(classified.Response.ID)
-			if responseID != "" {
-				nextSequence := int64(1)
-				if classified.HasSequenceNumber && classified.SequenceNumber >= 0 {
-					nextSequence = classified.SequenceNumber + 1
-					if nextSequence <= classified.SequenceNumber {
-						nextSequence = 1
-					}
-				}
-				a.completedRecovery = responsesWSCompletedResponseRecovery{
-					responseID:   responseID,
-					multiAgent:   writeAttempt.MultiAgentEnabled,
-					nextSequence: nextSequence,
-				}
-			}
-		}
 		if a.steering.next != nil && a.steering.parentID == writeAttempt.SeenProviderResponseID {
 			a.steering.parentTerminal = true
 			a.steering.parentCompleted = classified.Response != nil && classified.Response.Status == "completed"
 			a.steering.lastSequence, a.steering.hasSequence = a.turns.active.lastProviderSequence, a.turns.active.hasLastProviderSequence
 		}
-		if a.turns.inject.MarkTerminal() {
-			a.completeActiveTurn()
-		}
+		a.completeActiveTurn()
 		a.resolveSteeringReservation()
 		if observe {
 			a.startQueuedResponseCreates()
@@ -3304,7 +3068,7 @@ func (a *ResponsesWSSessionActor) handleProviderDownstreamWithObservation(event 
 		a.close("responses_ws_provider_connection_error")
 		return
 	}
-	if classified.RequestError {
+	if classified.RequestError && responsesWSExplicitCreateRejection(classified, a.turns.active.attempt) {
 		if classified.ContinuationMiss {
 			a.applyContinuationMissSideEffects(a.turns.active.affinity, a.turns.active.channelID, a.turns.active.attempt.AttemptedPreviousResponseID)
 		}
@@ -3325,7 +3089,6 @@ func (a *ResponsesWSSessionActor) handleProviderDownstreamWithObservation(event 
 		}
 		return
 	}
-	a.handleProviderInjectAcknowledgement(payload)
 	if observe {
 		a.startQueuedResponseCreates()
 	}
@@ -3514,10 +3277,6 @@ func (a *ResponsesWSSessionActor) handleProviderClosed(event ResponsesWSEventPro
 		a.failClosed("responses_ws_provider_channel_mismatch")
 		return
 	}
-	if !a.providerSessionLifecycleAttemptMatches(event.AttemptID) {
-		a.logIgnoredProviderEvent("provider_closed_attempt_mismatch", event.ChannelID, event.DetailOrigin, event.DetailPhase)
-		return
-	}
 	receivedAt := event.ReceivedAt
 	if receivedAt.IsZero() {
 		receivedAt = time.Now()
@@ -3649,16 +3408,11 @@ func (a *ResponsesWSSessionActor) providerPayloadChannel(_ int) *model.Channel {
 }
 
 func (a *ResponsesWSSessionActor) handleMalformedProviderFrame(classified responsesws.ResponsesTerminalResult) {
-	if a == nil || a.turns.active.attempt == nil {
+	if a == nil {
 		return
 	}
 	a.stopNewWork()
-	payload := responsesWSProviderProtocolErrorPayload(classified.MalformedError)
-	attempt := a.turns.active.attempt
-	if err := a.emitProviderFrameForAttempt(attempt, responsesws.NewTextFrame(payload), "malformed_provider_frame"); err != nil {
-		a.close("client_write_failed")
-		return
-	}
+	a.writeProxyLocalForAttempt(a.currentTurnAttempt(), responsesWSProviderProtocolErrorPayload(classified.MalformedError), "malformed_provider_frame")
 	a.close("responses_ws_provider_protocol_error")
 }
 
@@ -3727,7 +3481,6 @@ func (a *ResponsesWSSessionActor) applyActiveTerminalSideEffects(classified resp
 	switch classified.Kind {
 	case responsesws.ResponsesSuccessTerminal:
 		RecordResponsesTurnSuccess(a.Context(), a.turns.active.affinity, classified.Response)
-		a.turns.history.lastFinal = classified.Response
 	case responsesws.ResponsesFailedTerminal:
 		if classified.ContinuationMiss {
 			attemptedPreviousResponseID := ""
@@ -3737,35 +3490,6 @@ func (a *ResponsesWSSessionActor) applyActiveTerminalSideEffects(classified resp
 			a.applyContinuationMissSideEffects(a.turns.active.affinity, a.turns.active.channelID, attemptedPreviousResponseID)
 		}
 	}
-}
-
-func (a *ResponsesWSSessionActor) handleProviderInjectAcknowledgement(payload []byte) {
-	if a == nil || len(payload) == 0 || a.turns.inject.pending <= 0 {
-		return
-	}
-	if !a.turns.inject.Acknowledge(payload) {
-		return
-	}
-	if a.turns.inject.TerminalBarrierComplete() {
-		a.completeActiveTurn()
-	}
-}
-
-func responsesWSIsProviderInjectAcknowledgement(payload []byte) bool {
-	envelope, err := responsesws.ParseProviderEventEnvelope(payload)
-	if err != nil {
-		return false
-	}
-	switch strings.TrimSpace(envelope.Type) {
-	case "response.inject.created", "response.inject.failed":
-		return true
-	default:
-		return false
-	}
-}
-
-func (a *ResponsesWSSessionActor) isOutstandingProviderInjectAcknowledgement(payload []byte) bool {
-	return a != nil && a.turns.inject.CanAcknowledge(payload)
 }
 
 func (a *ResponsesWSSessionActor) applyContinuationMissSideEffects(turn *ResponsesTurnAffinity, ownerChannelID int, attemptedPreviousResponseID string) {
@@ -3779,12 +3503,7 @@ func (a *ResponsesWSSessionActor) applyContinuationMissSideEffects(turn *Respons
 	ClearResponsesTurnContinuationMissBindings(turn, ownerChannelID, attemptedPreviousResponseID)
 	clearResponsesEphemeralProof(a.Context(), attemptedPreviousResponseID, ownerChannelID)
 	a.forgetConnectionLocalEphemeralResponseID(attemptedPreviousResponseID)
-	if attemptedPreviousResponseID == "" || a.turns.history.lastFinal == nil {
-		return
-	}
-	if strings.TrimSpace(a.turns.history.lastFinal.ID) == attemptedPreviousResponseID {
-		a.turns.history.lastFinal = nil
-	}
+
 }
 
 func (a *ResponsesWSSessionActor) finalizeActiveAttempt() error {
@@ -3858,7 +3577,6 @@ func (a *ResponsesWSSessionActor) clearActiveTurn() {
 		a.logErrorf("responses websocket active finish transition failed: %v", err)
 	}
 	a.turns.pending.phase = responsesWSPendingTurnNone
-	a.turns.inject.Reset()
 	a.state = responsesWSStateIdle
 }
 
@@ -4136,19 +3854,10 @@ func (a *ResponsesWSSessionActor) providerEventAttemptMatches(attemptID string) 
 	return true
 }
 
-func (a *ResponsesWSSessionActor) providerSessionLifecycleAttemptMatches(attemptID string) bool {
-	if a == nil || strings.TrimSpace(attemptID) == "" {
-		return true
-	}
-	if a.turns.pending.attempt != nil || a.turns.active.attempt != nil {
-		return a.providerEventAttemptMatches(attemptID)
-	}
-	return true
-}
-
 func (a *ResponsesWSSessionActor) providerRecvFailureAttemptMatches(event ResponsesWSEventProviderRecvFailed) bool {
 	if responsesWSIdleRecvFailureClosesSession(upstreamEventFromProviderRecvFailed(event)) {
-		return a.providerSessionLifecycleAttemptMatches(event.AttemptID)
+		// 连接级失败已按 channel/generation 校验，不受发送调用 ID 限制。
+		return true
 	}
 	return a.providerEventAttemptMatches(event.AttemptID)
 }
@@ -4336,7 +4045,6 @@ func (a *ResponsesWSSessionActor) applyBufferedPendingTerminalSideEffects(termin
 	case responsesws.ResponsesSuccessTerminal:
 		a.processProviderPayloadAPIError(terminal.payload, terminal.event.ChannelID, "responses_ws_provider_frame")
 		RecordResponsesTurnSuccess(a.Context(), active, classified.Response)
-		a.turns.history.lastFinal = classified.Response
 	case responsesws.ResponsesFailedTerminal:
 		a.processProviderPayloadAPIError(terminal.payload, terminal.event.ChannelID, "responses_ws_provider_frame")
 		if classified.ContinuationMiss {
@@ -4416,7 +4124,6 @@ func (a *ResponsesWSSessionActor) captureClosureCut() int {
 	defer a.closing.postMu.Unlock()
 	a.closing.workStopped.Store(true)
 	a.closing.ingressClosed.Store(true)
-	a.closing.closureCutSequence = a.closing.postedSequence
 	return len(a.events)
 }
 
@@ -4440,11 +4147,10 @@ func (a *ResponsesWSSessionActor) closeAfterClosureCut(effectiveReason string) {
 		effectiveReason == "quota_settlement_failed_after_provider_close"
 	a.stopActiveTurnWatchdog()
 	a.turns.queue.Clear()
-	a.turns.inject.Reset()
+	a.turns.deferredInjects.Reset()
 	a.cancelSetup()
 	a.releasePendingLease()
 	defer a.releaseActiveLease()
-	a.capturePendingSendResultOnClose()
 	effectiveReason = a.settlePendingAttemptOnClose(effectiveReason)
 	if !a.releaseSteeringReservation() {
 		effectiveReason = "quota_settlement_failed"
@@ -4482,36 +4188,6 @@ func (a *ResponsesWSSessionActor) closeAfterClosureCut(effectiveReason string) {
 	a.heldSteeringParentBytes = 0
 	a.state = responsesWSStateClosed
 	a.finish()
-}
-
-// capturePendingSendResultOnClose gives an already-running response.create
-// write a short opportunity to publish its typed transport fact after the
-// actor stops accepting mailbox events. Only a validated NotAttempted result
-// can become zero-charge proof; a timeout remains conservative.
-func (a *ResponsesWSSessionActor) capturePendingSendResultOnClose() {
-	if a == nil || a.turns.pending.attempt == nil || a.turns.pending.sendCompletion == nil ||
-		a.turns.pending.phase != responsesWSPendingTurnSend || a.hasPendingProviderEvidence() ||
-		responsesWSTransportSendStatus(a.turns.pending.attempt.TransportResult) != "" {
-		return
-	}
-	timer := time.NewTimer(responsesWSCloseSendResultGrace)
-	defer timer.Stop()
-	select {
-	case event := <-a.turns.pending.sendCompletion:
-		attempt := a.turns.pending.attempt
-		if event.Purpose != ResponsesWSSendPurposeResponseCreate || event.AttemptID != attempt.AttemptID ||
-			event.SelectedChannelID != attempt.SelectedChannelID ||
-			(event.UpstreamSessionGeneration != "" && event.UpstreamSessionGeneration != a.upstream.sessionGeneration) {
-			a.logIgnoredSendResult(event, "close_send_result_identity_mismatch")
-			return
-		}
-		if err := responsesws.ValidateResponsesWSTransportSendResult(event.TransportResult); err != nil {
-			a.logErrorf("responses websocket close ignored invalid transport result: %v", err)
-			return
-		}
-		attempt.TransportResult = event.TransportResult
-	case <-timer.C:
-	}
 }
 
 func (a *ResponsesWSSessionActor) markDownstreamCloseSent() {

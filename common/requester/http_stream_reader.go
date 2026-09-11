@@ -3,6 +3,7 @@ package requester
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -60,6 +61,17 @@ func CloseAndDrainStream[T streamable](stream StreamReaderInterface[T]) {
 	stream.Close()
 }
 
+func CloseAndDrainStreamContext[T streamable](ctx context.Context, stream StreamReaderInterface[T]) error {
+	if stream == nil {
+		return nil
+	}
+	if drainable, ok := stream.(interface{ CloseAndDrainContext(context.Context) error }); ok {
+		return drainable.CloseAndDrainContext(ctx)
+	}
+	stream.Close()
+	return nil
+}
+
 type streamReader[T streamable] struct {
 	reader   *bufio.Reader
 	response *http.Response
@@ -69,16 +81,19 @@ type streamReader[T streamable] struct {
 	handlerPrefix        HandlerPrefix[T]
 	handlerPrefixEmitter HandlerPrefixWithEmitter[T]
 
-	DataChan   chan T
-	ErrChan    chan error
-	done       chan struct{}
-	closeOnce  sync.Once
-	recvOnce   sync.Once
-	finishOnce sync.Once
+	DataChan    chan T
+	ErrChan     chan error
+	done        chan struct{}
+	closeOnce   sync.Once
+	recvOnce    sync.Once
+	finishOnce  sync.Once
+	readContext context.Context
+	readEnded   context.CancelCauseFunc
 }
 
 type StreamReadOptions struct {
 	MaxLineBytes            int64
+	SSELines                bool
 	RequireProtocolTerminal bool
 	// ProtocolTerminalPredicate is consulted only for transport EOF. A true
 	// result preserves io.EOF as the handler's valid protocol terminal while
@@ -148,19 +163,30 @@ func (stream *streamReader[T]) Recv() (<-chan T, <-chan error) {
 func (stream *streamReader[T]) processLines() {
 	for {
 		rawLine, readErr := stream.readLine()
+		if !stream.NoTrim {
+			rawLine = bytes.TrimSpace(rawLine)
+		}
+		// Reader 可以同时返回字节和错误；先有序移交这些字节。
+		if len(rawLine) > 0 {
+			if stream.handlerPrefixEmitter != nil {
+				stream.handlerPrefixEmitter(&rawLine, StreamEmitter[T]{stream: stream})
+			} else if stream.handlerPrefix != nil {
+				stream.handlerPrefix(&rawLine, stream.DataChan, stream.ErrChan)
+			}
+			select {
+			case <-streamDone(stream):
+				return
+			default:
+			}
+			if bytes.Equal(rawLine, StreamClosed) {
+				return
+			}
+		}
 		if readErr != nil {
 			if errors.Is(readErr, io.EOF) && stream.options.RequireProtocolTerminal {
-				terminalObserved := false
-				if stream.options.ProtocolTerminalPredicate != nil {
-					terminalObserved = stream.options.ProtocolTerminalPredicate()
-				}
+				terminalObserved := stream.options.ProtocolTerminalPredicate != nil && stream.options.ProtocolTerminalPredicate()
 				if !terminalObserved {
 					readErr = ErrStreamProtocolTerminalMissing
-				}
-			}
-			if errors.Is(readErr, ErrStreamLineTooLarge) {
-				if stream.response != nil && stream.response.Body != nil {
-					_ = stream.response.Body.Close()
 				}
 			}
 			stream.sendErr(readErr)
@@ -169,38 +195,15 @@ func (stream *streamReader[T]) processLines() {
 			}
 			return
 		}
-
-		if !stream.NoTrim {
-			rawLine = bytes.TrimSpace(rawLine)
-			if len(rawLine) == 0 {
-				continue
-			}
-		}
-
-		if stream.handlerPrefixEmitter != nil {
-			stream.handlerPrefixEmitter(&rawLine, StreamEmitter[T]{stream: stream})
-		} else if stream.handlerPrefix != nil {
-			stream.handlerPrefix(&rawLine, stream.DataChan, stream.ErrChan)
-		}
-		select {
-		case <-streamDone(stream):
-			return
-		default:
-		}
-
-		if rawLine == nil {
-			continue
-		}
-
-		if bytes.Equal(rawLine, StreamClosed) {
-			return
-		}
 	}
 }
 
 func (stream *streamReader[T]) readLine() ([]byte, error) {
 	if stream == nil || stream.reader == nil {
 		return nil, io.ErrClosedPipe
+	}
+	if stream.options.SSELines {
+		return stream.readSSELine()
 	}
 	limit := stream.options.MaxLineBytes
 	if limit <= 0 {
@@ -229,7 +232,28 @@ func (stream *streamReader[T]) readLine() ([]byte, error) {
 		if len(line) > 0 && errors.Is(err, io.EOF) {
 			return line, nil
 		}
-		return nil, err
+		return line, err
+	}
+}
+
+// readSSELine 不等待 CR 后的下一字节，避免 CR-only 事件被缓冲至 EOF。
+func (stream *streamReader[T]) readSSELine() ([]byte, error) {
+	var line []byte
+	for {
+		if _, err := stream.reader.Peek(1); err != nil {
+			return line, err
+		}
+		buffered, _ := stream.reader.Peek(stream.reader.Buffered())
+		segment, _ := SplitSSELine(string(buffered))
+		if limit := stream.options.MaxLineBytes; limit > 0 && int64(len(line)+len(segment)) > limit {
+			return nil, ErrStreamLineTooLarge
+		}
+		line = append(line, segment...)
+		_, _ = stream.reader.Discard(len(segment))
+		last := segment[len(segment)-1]
+		if last == '\r' || last == '\n' {
+			return line, nil
+		}
 	}
 }
 
@@ -238,6 +262,9 @@ func (stream *streamReader[T]) Close() {
 		return
 	}
 	stream.closeOnce.Do(func() {
+		if stream.readEnded != nil {
+			stream.readEnded(io.ErrClosedPipe)
+		}
 		if stream.done != nil {
 			close(stream.done)
 		}
@@ -247,14 +274,32 @@ func (stream *streamReader[T]) Close() {
 	})
 }
 
+// ReadContext 的 cause 只表示读取事实，正常 EOF 与主动 Close 保持可区分。
+func (stream *streamReader[T]) ReadContext() context.Context {
+	return stream.readContext
+}
+
+func StreamReadContext[T streamable](stream StreamReaderInterface[T]) context.Context {
+	if source, ok := stream.(interface{ ReadContext() context.Context }); ok {
+		return source.ReadContext()
+	}
+	return nil
+}
+
 func (stream *streamReader[T]) CloseAndDrain() {
+	_ = stream.CloseAndDrainContext(context.Background())
+}
+
+func (stream *streamReader[T]) CloseAndDrainContext(ctx context.Context) error {
 	if stream == nil {
-		return
+		return nil
 	}
 	dataChan, errChan := stream.Recv()
 	stream.Close()
 	for dataChan != nil || errChan != nil {
 		select {
+		case <-ctx.Done():
+			return ctx.Err()
 		case _, ok := <-dataChan:
 			if !ok {
 				dataChan = nil
@@ -265,6 +310,7 @@ func (stream *streamReader[T]) CloseAndDrain() {
 			}
 		}
 	}
+	return nil
 }
 
 func (stream *streamReader[T]) finish() {
@@ -289,6 +335,9 @@ func streamDone[T streamable](stream *streamReader[T]) <-chan struct{} {
 }
 
 func sendStreamError[T streamable](stream *streamReader[T], err error) bool {
+	if stream != nil && stream.readEnded != nil && err != nil {
+		stream.readEnded(err)
+	}
 	if stream == nil || err == nil {
 		return false
 	}

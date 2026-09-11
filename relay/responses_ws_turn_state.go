@@ -12,7 +12,6 @@ import (
 	"one-api/common/wsconn"
 	"one-api/middleware"
 	providersBase "one-api/providers/base"
-	"one-api/types"
 )
 
 type responsesWSIOState struct {
@@ -45,17 +44,16 @@ type responsesWSUpstreamState struct {
 // a slot is live only when its identity field is populated (openingID, attempt,
 // or active attempt), and transitions go through the helpers below.
 type responsesWSTurnSlots struct {
-	opening responsesWSOpeningTurn
-	pending responsesWSPendingTurn
-	active  responsesWSActiveTurn
-	queue   responsesWSCreateQueue
-	inject  responsesWSInjectState
+	opening         responsesWSOpeningTurn
+	pending         responsesWSPendingTurn
+	active          responsesWSActiveTurn
+	queue           responsesWSCreateQueue
+	deferredInjects responsesWSInjectQueue
 
 	history responsesWSTurnHistory
 }
 
 type responsesWSTurnHistory struct {
-	lastFinal                  *types.OpenAIResponsesResponses
 	recentFinalizedResponseIDs []string
 	localEphemeralResponseIDs  []string
 }
@@ -71,8 +69,7 @@ type responsesWSPendingTurn struct {
 	phase     responsesWSPendingTurnPhase
 	openingID string
 
-	attempt        *ResponsesWSTurnAttempt
-	sendCompletion <-chan ResponsesWSEventSendResult
+	attempt *ResponsesWSTurnAttempt
 
 	provider responsesWSPendingProviderState
 }
@@ -138,91 +135,17 @@ func (q *responsesWSCreateQueue) Clear() {
 	q.bytes = 0
 }
 
-type responsesWSInjectState struct {
-	pending        int
-	pendingTargets map[string]int
-	terminalSeen   bool
-	deferred       []responsesws.Frame
-	deferredBytes  int
-	sendContext    context.Context
-	cancelSend     context.CancelFunc
+// 只保留发送前原帧的容量，不跟踪上游 inject 回执。
+type responsesWSInjectQueue struct {
+	deferred      []responsesws.Frame
+	deferredBytes int
 }
 
-func (s *responsesWSInjectState) AddPending(payload []byte) {
-	if s == nil {
-		return
-	}
-	s.pending++
-	responseID := strings.TrimSpace(responsesWSPayloadResponseID(payload))
-	if responseID == "" {
-		return
-	}
-	if s.pendingTargets == nil {
-		s.pendingTargets = make(map[string]int)
-	}
-	s.pendingTargets[responseID]++
-}
-
-func (s *responsesWSInjectState) CanAcknowledge(payload []byte) bool {
-	if s == nil || s.pending <= 0 || !responsesWSIsProviderInjectAcknowledgement(payload) {
-		return false
-	}
-	if len(s.pendingTargets) == 0 {
-		return true
-	}
-	return s.pendingTargets[strings.TrimSpace(responsesWSPayloadResponseID(payload))] > 0
-}
-
-func (s *responsesWSInjectState) Acknowledge(payload []byte) bool {
-	if !s.CanAcknowledge(payload) {
-		return false
-	}
-	s.pending--
-	responseID := strings.TrimSpace(responsesWSPayloadResponseID(payload))
-	if count := s.pendingTargets[responseID]; count > 1 {
-		s.pendingTargets[responseID] = count - 1
-	} else if count == 1 {
-		delete(s.pendingTargets, responseID)
-	}
-	return true
-}
-
-func (s *responsesWSInjectState) MarkTerminal() bool {
-	if s == nil {
-		return true
-	}
-	s.terminalSeen = true
-	return s.pending == 0
-}
-
-func (s *responsesWSInjectState) TerminalBarrierComplete() bool {
-	return s == nil || (s.terminalSeen && s.pending == 0)
-}
-
-func (s *responsesWSInjectState) Context(parent context.Context) context.Context {
-	if s == nil {
-		return parent
-	}
-	if s.sendContext == nil {
-		if parent == nil {
-			parent = context.Background()
-		}
-		s.sendContext, s.cancelSend = context.WithCancel(parent)
-	}
-	return s.sendContext
-}
-
-func (s *responsesWSInjectState) Reset() {
-	if s == nil {
-		return
-	}
-	if s.cancelSend != nil {
-		s.cancelSend()
-	}
+func (s *responsesWSInjectQueue) Reset() {
 	for i := range s.deferred {
 		s.deferred[i] = responsesws.Frame{}
 	}
-	*s = responsesWSInjectState{}
+	*s = responsesWSInjectQueue{}
 }
 
 type responsesWSTurnFinalization struct {
@@ -474,10 +397,8 @@ type responsesWSCloseState struct {
 	downstreamCloseSent atomic.Bool
 	backpressurePosted  atomic.Bool
 
-	postMu             sync.Mutex
-	postedSequence     uint64
-	closureCutSequence uint64
-	reducingCut        bool
+	postMu      sync.Mutex
+	reducingCut bool
 }
 
 type responsesWSWatchdogState struct {

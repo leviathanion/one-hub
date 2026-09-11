@@ -1,6 +1,7 @@
 package responses
 
 import (
+	"context"
 	"errors"
 	"strings"
 
@@ -13,6 +14,7 @@ type SSEChunkFramer struct {
 	framer      *requester.SSEEventFramer
 	pendingLine strings.Builder
 	maxBytes    int
+	afterCR     bool
 }
 
 func NewSSEChunkFramer(maxBytes int) *SSEChunkFramer {
@@ -27,8 +29,28 @@ func (f *SSEChunkFramer) PushChunk(chunk string, visit func(string) (bool, error
 		return false, errors.New("Responses SSE event framer is required")
 	}
 	for len(chunk) > 0 {
-		lineEnd := strings.IndexByte(chunk, '\n')
-		if lineEnd < 0 {
+		if f.afterCR {
+			f.afterCR = false
+			if chunk[0] == '\n' {
+				chunk = chunk[1:]
+				// CR 已完成分帧；跨 chunk 的 LF 只补交 wire 字节。
+				if f.framer.BufferedLen() == 0 {
+					if stop, err := visit("\n"); stop || err != nil {
+						f.Reset()
+						return stop, err
+					}
+				} else {
+					if f.wouldExceedLimit(1) {
+						f.Reset()
+						return false, requester.ErrSSEEventTooLarge
+					}
+					f.pendingLine.WriteByte('\n')
+				}
+				continue
+			}
+		}
+		segment, rest := requester.SplitSSELine(chunk)
+		if !strings.HasSuffix(segment, "\r") && !strings.HasSuffix(segment, "\n") {
 			if f.wouldExceedLimit(len(chunk)) {
 				f.Reset()
 				return false, requester.ErrSSEEventTooLarge
@@ -37,8 +59,8 @@ func (f *SSEChunkFramer) PushChunk(chunk string, visit func(string) (bool, error
 			break
 		}
 
-		segment := chunk[:lineEnd+1]
-		chunk = chunk[lineEnd+1:]
+		chunk = rest
+		f.afterCR = strings.HasSuffix(segment, "\r")
 		if f.wouldExceedLimit(len(segment)) {
 			f.Reset()
 			return false, requester.ErrSSEEventTooLarge
@@ -84,48 +106,64 @@ func (f *SSEChunkFramer) HasPending() bool {
 func (f *SSEChunkFramer) Reset() {
 	if f != nil {
 		f.pendingLine.Reset()
+		f.afterCR = false
 		if f.framer != nil {
 			f.framer.Reset()
 		}
 	}
 }
 
-// EventStream couples Responses transport with its request-local accounting
-// observer. Every consumer must accept an event before provider accounting can
-// advance, so missing accounting cannot silently degrade to a plain stream.
-type EventStream interface {
-	requester.StreamReaderInterface[string]
-	ObserveAcceptedResponsesEvent(rawEvent string) error
+func (f *SSEChunkFramer) TakePending() string {
+	if f == nil {
+		return ""
+	}
+	raw := f.framer.TakePending() + f.pendingLine.String()
+	f.Reset()
+	return raw
 }
 
-func IgnoreAcceptedResponsesEvent(string) error { return nil }
-
-type streamWithAcceptedEventCommitter struct {
+// EventStream 将原始传输与请求内证据观察接线；观察不授予交付许可。
+type EventStream interface {
 	requester.StreamReaderInterface[string]
-	commit func(string) error
+	ObserveResponsesEvent(rawEvent string) error
+}
+
+func IgnoreResponsesEvent(string) error { return nil }
+
+type streamWithObserver struct {
+	requester.StreamReaderInterface[string]
+	observe func(string) error
 }
 
 func NewEventStream(stream requester.StreamReaderInterface[string], observe func(string) error) EventStream {
 	if stream == nil {
 		return nil
 	}
-	return &streamWithAcceptedEventCommitter{
+	return &streamWithObserver{
 		StreamReaderInterface: stream,
-		commit:                observe,
+		observe:               observe,
 	}
 }
 
-func (s *streamWithAcceptedEventCommitter) ObserveAcceptedResponsesEvent(rawEvent string) error {
-	if s == nil || s.commit == nil {
-		return errors.New("Responses stream accepted-event observer is required")
+func (s *streamWithObserver) ObserveResponsesEvent(rawEvent string) error {
+	if s == nil || s.observe == nil {
+		return errors.New("Responses stream evidence observer is required")
 	}
-	return s.commit(rawEvent)
+	return s.observe(rawEvent)
 }
 
-func (s *streamWithAcceptedEventCommitter) CloseAndDrain() {
+func (s *streamWithObserver) CloseAndDrain() {
 	if s != nil {
 		requester.CloseAndDrainStream(s.StreamReaderInterface)
 	}
+}
+
+func (s *streamWithObserver) CloseAndDrainContext(ctx context.Context) error {
+	return requester.CloseAndDrainStreamContext(ctx, s.StreamReaderInterface)
+}
+
+func (s *streamWithObserver) ReadContext() context.Context {
+	return requester.StreamReadContext(s.StreamReaderInterface)
 }
 
 // SSEDataPayload returns the logical data payload of one complete SSE event.
@@ -134,15 +172,9 @@ func SSEDataPayload(rawEvent string) (string, bool) {
 	var payload strings.Builder
 	hasData := false
 	for len(rawEvent) > 0 {
-		lineEnd := strings.IndexByte(rawEvent, '\n')
-		line := rawEvent
-		if lineEnd >= 0 {
-			line = rawEvent[:lineEnd]
-			rawEvent = rawEvent[lineEnd+1:]
-		} else {
-			rawEvent = ""
-		}
-		line = strings.TrimSuffix(line, "\r")
+		line, rest := requester.SplitSSELine(rawEvent)
+		rawEvent = rest
+		line = requester.SSELineContent(line)
 		if line == "" || strings.HasPrefix(line, ":") {
 			continue
 		}

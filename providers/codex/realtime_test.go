@@ -2226,7 +2226,7 @@ func TestCodexManagedRealtimeWebsocketCarriesUsageOnFailedTerminalEvent(t *testi
 	}
 }
 
-func TestCodexManagedRealtimeWebsocketRejectsConflictingImageIdentityBeforeDelivery(t *testing.T) {
+func TestCodexManagedRealtimeWebsocketIsolatesConflictingImageEvidence(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, ok := acceptCodexRealtimeTestConn(t, w, r)
 		if !ok {
@@ -2267,11 +2267,13 @@ func TestCodexManagedRealtimeWebsocketRejectsConflictingImageIdentityBeforeDeliv
 		t.Fatalf("unexpected accepted prefix search evidence: payload=%s usage=%+v origin=%v err=%v", prefix, prefixUsage, prefixOrigin, err)
 	}
 	_, errorPayload, errorUsage, errorOrigin, err := codexTestRecv(ctx, session)
-	if err != nil || errorUsage != nil || errorOrigin != runtimerealtime.RealtimePayloadOriginProxyLocal ||
-		!containsAll(string(errorPayload), `"type":"error"`, "provider_protocol_error") ||
-		strings.Contains(string(errorPayload), "img_top") || strings.Contains(string(errorPayload), "img_item") {
-		t.Fatalf("unexpected native tracker error event: payload=%s usage=%+v origin=%v err=%v", errorPayload, errorUsage, errorOrigin, err)
+	if err != nil || errorUsage == nil || errorOrigin != runtimerealtime.RealtimePayloadOriginProvider || !errorUsage.BillingDiagnostics["unit_service_conflict:image_generation"] || !strings.Contains(string(errorPayload), "img_top") {
+		t.Fatalf("component conflict affected wire: %s %+v %v", errorPayload, errorUsage, err)
 	}
+	if recorder.finalizeCount() != 0 {
+		t.Fatal("component conflict terminated active work")
+	}
+	session.Abort("test_close")
 
 	deadline := time.Now().Add(2 * time.Second)
 	for recorder.finalizeCount() != 1 && time.Now().Before(deadline) {
@@ -2281,18 +2283,8 @@ func TestCodexManagedRealtimeWebsocketRejectsConflictingImageIdentityBeforeDeliv
 		t.Fatalf("expected native turn to finalize once, got %d", got)
 	}
 	finalized := recorder.lastPayload()
-	if finalized.TerminationReason != "provider_protocol_error" || finalized.Usage == nil || finalized.Usage.ExtraBilling[toolKey].CallCount != 1 {
+	if finalized.TerminationReason == "provider_protocol_error" || finalized.Usage == nil || finalized.Usage.ExtraBilling[toolKey].CallCount != 1 {
 		t.Fatalf("expected prefix billing and protocol termination, got %+v", finalized)
-	}
-	managed := session.(*codexManagedRealtimeSession)
-	managed.exec.Lock()
-	state := getCodexManagedRuntimeStateLocked(managed.exec)
-	websocketAttached := state.wsConn != nil
-	inflight := managed.exec.Inflight
-	sessionState := managed.exec.State
-	managed.exec.Unlock()
-	if websocketAttached || inflight || sessionState != runtimesession.SessionStateIdle {
-		t.Fatalf("native state not cleared after tracker error: websocket=%v inflight=%v state=%s", websocketAttached, inflight, sessionState)
 	}
 }
 

@@ -101,7 +101,7 @@ func TestCodexTurnUsageAccumulatorHelpers(t *testing.T) {
 		Item:        &types.ResponsesOutput{Type: types.InputTypeWebSearchCall, ID: "ws_1"},
 	})
 	accumulator.ObserveEvent(&types.OpenAIResponsesStreamResponses{
-		Type: "response.updated",
+		Type: "response.completed",
 		Response: &types.OpenAIResponsesResponses{
 			Usage: &types.ResponsesUsage{
 				InputTokens:  5,
@@ -363,15 +363,14 @@ func TestCodexTurnUsageAccumulatorRejectsTerminalToolOverflowAtomically(t *testi
 	}
 }
 
-func TestCodexTurnUsageAccumulatorRejectsToolAliasConflictAsProviderProtocolError(t *testing.T) {
+func TestCodexTurnUsageAccumulatorIsolatesToolAliasConflict(t *testing.T) {
 	accumulator := newCodexTurnUsageAccumulator()
 	outputIndex := 0
 	err := accumulator.ObserveEvent(&types.OpenAIResponsesStreamResponses{
 		Type: "response.output_item.done", ItemID: "ws_top", OutputIndex: &outputIndex,
 		Item: &types.ResponsesOutput{ID: "ws_item", Type: types.InputTypeWebSearchCall, Status: "completed", Action: map[string]any{"type": "search"}},
 	})
-	var apiErr *types.OpenAIErrorWithStatusCode
-	if !errors.As(err, &apiErr) || apiErr.Code != "provider_protocol_error" || apiErr.StatusCode != http.StatusBadGateway {
+	if err != nil || !accumulator.toolUsage.HasExtraBillingConflict(types.APIToolTypeWebSearchPreview) {
 		t.Fatalf("unexpected tool alias conflict error: %#v", err)
 	}
 	if len(accumulator.toolUsage.ExtraBilling) != 0 {

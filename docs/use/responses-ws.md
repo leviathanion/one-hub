@@ -9,18 +9,26 @@ lastUpdated: true
 
 one-hub 通过 `GET /v1/responses` 的 WebSocket Upgrade 提供 Responses WebSocket。该入口只连接声明了 Native Responses WebSocket 能力的上游；不会把 WebSocket 请求降级为 HTTP/SSE，也不会把 Realtime 或其他协议转换成 Responses 事件。
 
-如果候选渠道不支持 Native Responses WebSocket，请求会在上游工作开始前返回 `426 responses_ws_unsupported_for_channel`。普通 HTTP Chat/Responses 请求不受此限制，仍使用原有 HTTP 路由、适配和重试逻辑。
+如果候选渠道不支持 Native Responses WebSocket，请求会在上游工作开始前返回 `426 responses_ws_unsupported_for_channel`。普通 HTTP 请求不受 native WS 能力限制；HTTP Responses create 的工作后重放边界见[请求重试说明](../dev/responses-ws-attempt-replay-architecture.md)。
+
+本文记录当前实现；交付、资源授权与账务的职责边界见[透明转发设计](../dev/responses-transparent-relay-design.md)。
 
 ## 协议边界
 
-- 客户端事件支持 `response.create`、针对当前活动响应的 `response.steer`；启用 `multi_agent.enabled=true` 的当前 turn 另支持 `response.inject`。
+- 客户端事件支持 `response.create`、针对当前活动响应的 `response.steer`，以及针对已授权响应的 `response.inject`。inject 的 multi-agent 模式和工具输入 schema 由上游校验。
 - `response.cancel` 属于 Realtime API，在 Responses WebSocket 上返回 `unsupported_client_event`。客户端断开连接会关闭当前上游 transport。
 - 同一连接固定一个渠道。每个 `response.create` 独立读取其原始 `model`、`store`、continuation 和工具门禁；预扣与结算分别使用当时的当前价格，配置更新可能使两者不同。
 - 渠道必须支持该 turn 的精确 model；连接内不切换渠道、不做 model mapping，也不改写请求 model。
-- busy 时合法的 `response.create` 进入有界 FIFO，不返回 `session_busy`。官方 terminal 会阻止当前 turn 接受新的 `response.inject`；此前已接受的 inject 继续按序发送，等对应的 `response.inject.created` / `response.inject.failed` acknowledgement 全部到达后再开始下一项。
-- 只有 `response.completed`、`response.failed`、`response.incomplete` 是 Responses lifecycle terminal。已知 terminal 必须包含非空 `response.id` 和非负整数 `sequence_number`，并且同一 turn 内 sequence 严格递增。
-- Realtime 的 `response.done`、`response.cancelled/canceled` 会被视为上游协议错误；未知未来事件保持原样透传，但不会被当作 terminal。
+- busy 时合法的 `response.create` 进入有界 FIFO，不返回 `session_busy`。父响应结束后可开始下一项，无需等待旧 inject 回执；可能创建自动后继的 steering 预扣仍会阻挡新 create。已发布的发送命令保持顺序。
+- `response.completed`、`response.failed`、`response.incomplete` 为本地提供终结和用量事实。未知事件、缺省或非递增序号不阻止原帧交付；代理不会据此猜测上游已结束。新资源的归属屏障和已准入执行关联仍须成立。
+- 同一已验证连接上的迟到控制回执和安全诊断仍会交付，不重开旧账务，也不计入新响应。供应商私有事件仅在 adapter 有明确语义映射时转换；公共事件不补造序号。
 - provider terminal 先交付客户端，再执行日志和结算。结算失败不会用本地 error 替换已经交付的 terminal。
+
+## 注入工具结果
+
+`response.inject` 保留原始帧。目标可以是当前响应，也可以是仍有同连接资源证明或有效 Stored owner 的已完成响应；未知、跨用户或不属于当前渠道的目标在发送前拒绝。代理不保存完整工具调用历史，不替客户端检查 `call_id`，也不生成注入失败回执。
+
+注入是否成功由上游的 `response.inject.created/failed` 告知。若目标已结束，客户端根据上游回执构造下一次 `response.create`。注入回执可能晚于下一响应的事件；需要先收齐回执的客户端应自行等待。单条 inject 不创建新的计费 attempt；发送结果歧义会停止连接，不自动重发。
 
 ## 执行中追加指令
 
@@ -36,7 +44,7 @@ one-hub 通过 `GET /v1/responses` 的 WebSocket Upgrade 提供 Responses WebSoc
 
 如果上游返回 `response.steer.pending`，用其 `required_input` 填入已保存的工具结果或批准决定，再发一个带同一 `previous_response_id` 的 `response.create`。该显式请求使用自己的参数重新准入；不要重跑工具或重复发送已被接管的 steering 输入。`response.steer.failed` 也会原样返回。全部提交明确失败，或父已完成、全部初始回执已消解且上游明确等待客户端输入时，释放尚未使用的自动续接预扣。未知 pending reason 原样交付，不作为提前退款依据。
 
-同一已验证上游连接的迟到 steering 回执原样交付，不依赖当前候选或最近完成历史，不计入新响应用量。每条发送独立消费结果；已消费的重复结果不影响新响应，原发送首次报告的歧义仍会关闭连接。等待客户端续接所需的临时父资源证明独立保留，无关请求不会消费它；匹配显式请求收到新 Response 的 created 后才释放。如果仍有未确认的 steering 时收到请求级 `error`，代理交付错误后关闭连接并执行结算清理，因为该错误不能证明上游已撤销续接；此时不启动排队请求或自动重放。
+同一已验证上游连接的迟到 steering 回执原样交付，不依赖当前候选或最近完成历史，不计入新响应用量。每条发送独立消费结果；已消费的重复结果不影响新响应，原发送首次报告的歧义仍会关闭连接。等待客户端续接所需的临时父资源证明独立保留，无关请求不会消费它；匹配显式请求收到新 Response 的 created 后才释放。无关联的泛化 `error` 只交付，不取消候选或推进 FIFO；连接关闭和既有超时负责有界收尾。明确关联的 create 拒绝可结束该准入，已知 workflow stop 则停止连接。
 
 ## Astra 请求与安全监控
 
@@ -196,7 +204,7 @@ busy `response.create` FIFO 同时限制帧数和 4 MiB payload bytes；上游 s
   → Upgrade 并以 streaming reader 读取首个 response.create
   → capability / OpenAI Data Residency / exact-model gate
   → 获取 active lease 并建立 native upstream
-  → response.create FIFO + terminal 前的 response.inject acknowledgement 计数
+  → response.create FIFO + 已授权 inject / steer 原帧发送
   → provider terminal 先交付，后结算
   → 释放 lease 并关闭 upstream
 ```

@@ -12,7 +12,7 @@ const issue034CompletedEvent = `data: {"type":"response.completed","response":{"
 func TestFixI034AcceptedResponsesUsageAuthorizesOnlyProviderEvidence(t *testing.T) {
 	t.Run("complete usage is marked at accepted producer boundary", func(t *testing.T) {
 		handler := &OpenAIResponsesStreamHandler{Usage: &types.Usage{}, Prefix: "data: ", Model: "requested-model"}
-		if err := handler.ObserveAcceptedResponsesEvent(issue034CompletedEvent); err != nil {
+		if err := handler.ObserveResponsesEvent(issue034CompletedEvent); err != nil {
 			t.Fatalf("accepted completed event failed: %v", err)
 		}
 		usage := handler.Usage
@@ -29,7 +29,7 @@ func TestFixI034AcceptedResponsesUsageAuthorizesOnlyProviderEvidence(t *testing.
 			t.Fatalf("accepted token details changed: %+v", usage)
 		}
 
-		if err := handler.ObserveAcceptedResponsesEvent(issue034CompletedEvent); err != nil {
+		if err := handler.ObserveResponsesEvent(issue034CompletedEvent); err != nil {
 			t.Fatalf("repeated completed event failed: %v", err)
 		}
 		if usage.PromptTokens != 100 || usage.CompletionTokens != 20 || usage.TotalTokens != 120 {
@@ -68,7 +68,7 @@ func TestFixI034AcceptedResponsesUsageAuthorizesOnlyProviderEvidence(t *testing.
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			handler := &OpenAIResponsesStreamHandler{Usage: &types.Usage{}}
-			if err := handler.ObserveAcceptedResponsesEvent(testCase.event); err != nil {
+			if err := handler.ObserveResponsesEvent(testCase.event); err != nil {
 				t.Fatalf("negative event failed unexpectedly: %v", err)
 			}
 			if handler.Usage.ProviderReported || handler.Usage.HasProviderUsage() {
@@ -81,15 +81,11 @@ func TestFixI034AcceptedResponsesUsageAuthorizesOnlyProviderEvidence(t *testing.
 func TestFixI034AcceptedResponsesUsagePreservesLifecycleObserverConflict(t *testing.T) {
 	handler := &OpenAIResponsesStreamHandler{Usage: &types.Usage{}}
 	observer := commonresponses.NewStreamObserver()
-	if err := observer.AcceptRawEvent(`data: {"type":"response.created","response":{"id":"resp_i034_a","model":"gpt-5"}}`, func() error {
-		return handler.ObserveAcceptedResponsesEvent(`data: {"type":"response.created","response":{"id":"resp_i034_a","model":"gpt-5"}}`)
-	}); err != nil {
+	if err := observer.ObserveEvent(`data: {"type":"response.created","response":{"id":"resp_i034_a","model":"gpt-5"}}`); err != nil {
 		t.Fatalf("created event failed: %v", err)
 	}
 	conflict := `data: {"type":"response.completed","response":{"id":"resp_i034_b","status":"completed","usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120}}}`
-	if err := observer.AcceptRawEvent(conflict, func() error {
-		return handler.ObserveAcceptedResponsesEvent(conflict)
-	}); err == nil {
+	if err := observer.ObserveEvent(conflict); err == nil {
 		t.Fatal("response identity conflict was accepted")
 	}
 	if handler.Usage.ProviderReported || handler.Usage.HasProviderUsage() {

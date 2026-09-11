@@ -405,3 +405,17 @@ func TestApplyResponsesUsageMarksTerminalSearchWithoutTokenUsage(t *testing.T) {
 		t.Fatalf("terminal search without token usage lost provider evidence: %+v", usage)
 	}
 }
+
+func TestStreamUsageProjectionDoesNotTurnInvalidIdentityIntoAnonymousCharge(t *testing.T) {
+	for _, field := range []string{`"item_id":{}`, `"output_index":[]`, `"partial_image_index":"future"`} {
+		payload := []byte(`{"type":"response.output_item.done",` + field + `,"item":{"type":"web_search_call","status":"completed","action":{"type":"search"}}}`)
+		if event, ok := ParseStreamUsageEvent(payload); ok {
+			t.Fatalf("uninterpretable identity became a billable anonymous item: %+v", event)
+		}
+		terminal := []byte(`{"type":"response.completed",` + field + `,"response":{"id":"resp_valid","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`)
+		event, ok := ParseStreamUsageEvent(terminal)
+		if !ok || event.Response == nil || event.Response.ID != "resp_valid" || event.Response.Usage == nil || event.Response.Usage.TotalTokens != 5 {
+			t.Fatalf("unrelated item projection erased terminal evidence: %+v", event)
+		}
+	}
+}

@@ -254,7 +254,10 @@ func (s *NativeSession) sendClient(ctx context.Context, req SendRequest) Respons
 	if err != nil {
 		return ResponsesWSTransportSendResult{Status: ResponsesWSTransportSendNotAttempted, Err: err}
 	}
-	s.setActiveAttemptID(strings.TrimSpace(req.AttemptID))
+	// 辅助命令只携带自己的完成关联，不能覆盖当前 create 的接收归属。
+	if envelope, parseErr := ParseClientEventEnvelope(payload); parseErr == nil && envelope.Type == "response.create" {
+		s.setActiveAttemptID(strings.TrimSpace(req.AttemptID))
+	}
 	var writeResult wsconn.WriteResult
 	switch {
 	case s.writeMessageResult != nil:

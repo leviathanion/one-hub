@@ -314,6 +314,7 @@ func mergeResponsesWSTerminalResponse(usage *types.Usage, response *types.OpenAI
 	}
 	mergeResponsesWSResponsesUsage(usage, response.Usage)
 	usage.MergeProviderAttribution(response.Model, response.ServiceTier)
+	response.ApplyUsageAttribution(usage)
 	// Terminal response output is the fallback source for Responses tool billing.
 	// Provider UsageEvents can already contain the same charges, so merge by max
 	// count per normalized key rather than adding and risking double billing.
@@ -334,8 +335,7 @@ func responsesWSTerminalUsageSnapshot(response *types.OpenAIResponsesResponses, 
 	// settlement and diagnostics, but must not inflate or overwrite exact
 	// terminal billing.
 	usage := response.Usage.ToOpenAIUsage()
-	usage.ResponseModel = response.Model
-	usage.ServiceTier = response.ServiceTier
+	response.ApplyUsageAttribution(usage)
 	extraBilling, diagnostics := responsesWSTerminalExtraBilling(response, firstResponsesWSImageTracker(imageTrackers))
 	usage.ExtraBilling = mergeExtraBillingMapsMax(usage.ExtraBilling, extraBilling)
 	for key, billing := range extraBilling {
@@ -499,4 +499,13 @@ func mergeExtraBillingMapsMax(dst map[string]types.ExtraBilling, src map[string]
 		dst[normalizedKey] = value
 	}
 	return dst
+}
+
+// 明确的 create 续接拒绝发生在绑定 Response 之前；泛化 error 不提供该事实。
+func responsesWSExplicitCreateRejection(event responsesws.ResponsesTerminalResult, attempt *ResponsesWSTurnAttempt) bool {
+	return event.RequestError && event.ErrorCode == "previous_response_not_found" && attempt != nil && attempt.SeenProviderResponseID == "" && attempt.AttemptedPreviousResponseID != ""
+}
+
+func responsesWSResourceLifecycleEvent(eventType string) bool {
+	return commonresponses.IsResponseLifecycleEvent(eventType)
 }

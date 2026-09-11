@@ -9,11 +9,11 @@ lastUpdated: true
 
 ## 文档状态
 
-- 状态：当前实现。
+- 状态：当前实现；包含本次透明转发与计费边界调整。
 - 范围：`GET /v1/responses` WebSocket ingress、Native Responses WebSocket upstream、turn actor、Stored Response owner barrier 和结算边界。
 - 非范围：普通 HTTP Responses、`/v1/realtime`、WS 到 HTTP/SSE 的协议转换。
 
-Steering 的计费映射、回执观察与资源证明生命周期见[透明转发与计费设计](./responses-ws-steering-lifecycle-design.md)。该文档是本文的 steering 专项契约；本地回归不代替真实上游协议验证。
+共享接收边界见[Responses 透明转发与计费边界设计](./responses-transparent-relay-design.md)，覆盖 HTTP SSE、inject、Stored owner 失败收尾及独立计费组件。
 
 ## 核心结论
 
@@ -41,8 +41,8 @@ Responses WebSocket 只连接显式具备 native 能力的渠道。系统不把 
 | capability / routing | native、exact-model、OpenAI Data Residency、Stored lifecycle 门禁；首 turn 选路 | 已写入 upstream 后换渠道 |
 | provider adapter | native 握手、原始 frame 转发、usage/close evidence 提取 | turn 调度、owner、扣费 |
 | I/O pump | 双向搬运 frame，把 provider evidence 串行投递给 actor | 构造 provider lifecycle event |
-| session actor | FIFO、turn 状态、owner delivery barrier、terminal/sequence 校验、结算触发 | 修改 provider terminal |
-| settlement core | 根据 transport 与 provider evidence 计算唯一 final quota | 决定协议输出 |
+| session actor | FIFO、执行归属、owner delivery barrier、最小终结观察、结算触发 | 修改 provider terminal |
+| settlement core | 根据合法 provider evidence 计算唯一 final quota | 决定协议输出 |
 
 ## 连接与 turn 流程
 
@@ -53,21 +53,21 @@ Responses WebSocket 只连接显式具备 native 能力的渠道。系统不把 
   → 选择渠道并建立 native upstream
   → 为 turn 做 RPM 与 quota admission
   → 原样发送 response.create
-  → provider frame 先经 actor 校验，再交付客户端
+  → provider frame 经安全与资源屏障交付，独立提取合法证据
   → 官方 terminal 先交付，随后结算和记录
-  → inject ack barrier 完成后推进 FIFO 下一 turn
+  → 父执行结束后推进 FIFO；未消解 steering 后继继续阻挡
 ```
 
-连接建立前的候选失败仍可使用既有候选预算；一旦任何 `response.create` 进入 upstream write，就不跨渠道重放。普通 HTTP create 的历史 retry 不受此限制。
+连接建立前的候选失败仍可使用既有候选预算；一旦任何 `response.create` 进入 upstream write，就不跨渠道重放。HTTP create 的工作后重放同样被禁止，详见[Responses 请求重试边界](./responses-ws-attempt-replay-architecture.md)。
 
 ## Client event 与排队
 
 - 支持 `response.create` 和针对当前活动 Response 的原始 `response.steer`；自动后继复用事前准入的独立预扣。
-- `multi_agent.enabled=true` 的 turn 支持 beta `response.inject`；frame 原样转发。
+- `response.inject` 在目标资源授权及输入资源检查后按原始 frame 发送；上游校验 multi-agent 模式和工具 schema，并决定活动或已完成目标的注入结果。
 - `response.cancel` 是 Realtime 事件，在 Responses WS 上拒绝。客户端断开通过关闭 upstream transport 终止工作。
 - opening、pending、active turn 或尚未绑定的自动续接预扣存在时，新的 `response.create` 进入有界 FIFO。队列同时限制 frame 数和 payload bytes；超限 fail closed。
 - actor mailbox 对所有在途 client/provider frame 使用每连接 64 MiB 的共享 payload 预算，事件出队后立即释放。
-- terminal 前后收到的 `inject.created` / `inject.failed` 都会减少 pending 计数。客户端已提交的 inject 继续按序发送；provider terminal 只阻止新的 inject，turn 要等 pending acknowledgement 清零后才释放。
+- inject 回执不拥有父账务或 create FIFO。已提交辅助命令的发送资源及一次完成独立于父 reset，父 terminal 后的回执仍可交付；首次真实辅助发送歧义停止连接。
 
 ## Provider lifecycle contract
 
@@ -77,9 +77,11 @@ Responses WebSocket 只连接显式具备 native 能力的渠道。系统不把 
 - `response.failed`
 - `response.incomplete`
 
-每个已知 terminal 必须包含非空 `response.id` 和非负整数 `sequence_number`。同一 turn 的 provider `sequence_number` 必须严格递增。`response.done`、`response.cancelled`、`response.canceled` 属于 Realtime 语义，视为上游协议错误。
+Response ID 用于资源和账务关联；缺失、重复或非递增序号不构成交付门禁。未识别的事件名保留原帧，不猜测其终结意义；Codex 私有别名由 adapter 根据明确契约转换，公共事件不补造序号。
 
-顶层 `error` 默认是 request-level error，不伪装成 response terminal；它结束并结算当前 attempt，然后在同一连接推进 FIFO。明确分类的 connection-level error 或 workflow stop 会关闭连接；自动续接尚未消解时，request-level error 也在交付后关闭，避免在歧义执行后推进 FIFO。provider close、EOF、malformed frame、timeout 和本地错误都不能合成 `response.completed`。未知未来事件可以透传，但不会被误判为 terminal。
+泛化 `error` 原样交付，不结束当前 Response 或提前释放 steering 预扣。明确 connection fatal / workflow stop 停止新工作并收尾；当前尚未绑定 Response 的 create 收到明确 `previous_response_not_found` 且本次确有续接目标时，按 create 拒绝结束准入并推进 FIFO。其他无关联错误等待原执行或连接事实。未知事件、安全诊断和迟到回执不需要本地完整生命周期接受才能交付。
+
+单命令的发送完成与当前 create 接收关联分离，辅助发送不能覆盖新 create 的无 ID 输出归属。关闭时按 `postMu` 固定截止数量收尾；不再等待 100ms 发送结果，也不保留 inject 回执计数、恢复对象或完整终结响应历史。HTTP SSE 读至 EOF 的原始交付、异常 abort/reset 及上下游时限见[共享设计](./responses-transparent-relay-design.md)。
 
 ## `store` 与 owner delivery barrier
 

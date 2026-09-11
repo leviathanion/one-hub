@@ -176,6 +176,10 @@ func (q *Quota) evaluateProviderUsageWithPolicy(usage *types.Usage, policy quota
 	for _, key := range keys {
 		billing := usage.ExtraBilling[key]
 		componentName := "unit:" + key
+		if usage.HasExtraBillingConflict(types.ResolveExtraBillingServiceType(key, billing)) {
+			decision.Components = append(decision.Components, PriceComponentDecision{Name: componentName, Status: PriceComponentConflictingEvidence})
+			continue
+		}
 		if !usage.HasProviderExtraBilling(key) {
 			q.addBillingDiagnostic("unit_component_untrusted:" + key)
 			decision.Components = append(decision.Components, PriceComponentDecision{Name: componentName, Status: PriceComponentMissingEvidence})

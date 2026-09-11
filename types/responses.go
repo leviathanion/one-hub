@@ -934,6 +934,25 @@ func (r *OpenAIResponsesResponses) SetProviderRawJSON(raw []byte) {
 	r.rawProviderJSON = append(r.rawProviderJSON[:0], raw...)
 }
 
+// ApplyUsageAttribution 保留前后冲突和无法解析的计价维度，避免回退默认值收费。
+func (r *OpenAIResponsesResponses) ApplyUsageAttribution(usage *Usage) {
+	if r == nil || usage == nil {
+		return
+	}
+	usage.MergeProviderAttribution(r.Model, r.ServiceTier)
+	for _, field := range []string{"model", "service_tier"} {
+		raw := r.rawFields[field]
+		if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			continue
+		}
+		var value string
+		if json.Unmarshal(raw, &value) != nil {
+			usage.AttributionConflict = true
+			usage.AddBillingDiagnostic("responses_" + field + "_uninterpretable")
+		}
+	}
+}
+
 // DecodeCapturedProviderJSON prefers the complete current DTO, then falls
 // back to the stable response evidence used by ownership and billing. The raw
 // JSON remains the exact-wire delivery truth in either case.
@@ -971,19 +990,21 @@ func (r *OpenAIResponsesResponses) DecodeCapturedProviderJSON(raw []byte) error 
 
 // DecodeOptionalRawField stages one observation field. Unknown or malformed
 // observations do not block raw delivery and never publish a partial value.
-func DecodeOptionalRawField(fields map[string]json.RawMessage, name string, destination any) {
+func DecodeOptionalRawField(fields map[string]json.RawMessage, name string, destination any) bool {
 	raw, ok := fields[name]
 	if !ok || len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		return
+		return true
 	}
 	target := reflect.ValueOf(destination)
 	if target.Kind() != reflect.Pointer || target.IsNil() || target.Elem().Kind() == reflect.Invalid {
-		return
+		return false
 	}
 	temporary := reflect.New(target.Elem().Type())
 	if err := json.Unmarshal(raw, temporary.Interface()); err == nil {
 		target.Elem().Set(temporary.Elem())
+		return true
 	}
+	return false
 }
 
 func (r *OpenAIResponsesResponses) ProviderRawJSON() []byte {

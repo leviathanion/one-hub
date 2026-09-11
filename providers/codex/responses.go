@@ -110,6 +110,11 @@ func (h *CodexResponsesStreamHandler) observeUsageEvent(dataLine string) error {
 			Response:          event.Response,
 		}); err != nil {
 			mergeCodexAccumulatorBilling(h.Usage, h.accumulator)
+			if commonresponses.IsTerminalEventType(event.Type) {
+				if resolved := resolveCodexResponsesUsage(h.Usage, h.accumulator, event.Response); resolved != nil {
+					applyResolvedCodexUsage(h.Usage, resolved)
+				}
+			}
 			return err
 		}
 	}
@@ -125,7 +130,7 @@ func (h *CodexResponsesStreamHandler) observeUsageEvent(dataLine string) error {
 	return nil
 }
 
-func (h *CodexResponsesStreamHandler) ObserveAcceptedResponsesEvent(rawEvent string) error {
+func (h *CodexResponsesStreamHandler) ObserveResponsesEvent(rawEvent string) error {
 	payload, ok := commonresponses.SSEDataPayload(rawEvent)
 	if !ok {
 		return nil
@@ -184,12 +189,13 @@ func (p *CodexProvider) CreateResponses(ctx context.Context, rawReq *commonrespo
 
 	// Get stream response.
 	rawStream, errWithCode := requester.RequestNoTrimStreamWithEmitterOptions(httpRequester, resp, handler.HandlerResponsesStreamWithEmitter, requester.StreamReadOptions{
+		SSELines:     true,
 		MaxLineBytes: codexResponsesStreamMaxLineBytes,
 	})
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
-	stream := commonresponses.NewEventStream(rawStream, handler.ObserveAcceptedResponsesEvent)
+	stream := commonresponses.NewEventStream(rawStream, handler.ObserveResponsesEvent)
 
 	// Aggregate full response.
 	response, errWithCode := p.collectResponsesStreamResponse(stream)
@@ -240,18 +246,19 @@ func (p *CodexProvider) CreateResponsesStream(ctx context.Context, rawReq *commo
 			Model:  request.Model,
 		}
 
-		stream, apiErr := requester.RequestNoTrimStreamWithOptions(httpRequester, resp, chatHandler.ChatSSEHandler(handler.ObserveAcceptedResponsesEvent), requester.StreamReadOptions{
+		stream, apiErr := requester.RequestNoTrimStreamWithOptions(httpRequester, resp, chatHandler.ChatSSEHandler(handler.ObserveResponsesEvent), requester.StreamReadOptions{
 			MaxLineBytes:            codexResponsesStreamMaxLineBytes,
 			RequireProtocolTerminal: true,
 		})
-		return commonresponses.NewEventStream(stream, commonresponses.IgnoreAcceptedResponsesEvent), apiErr
+		return commonresponses.NewEventStream(stream, commonresponses.IgnoreResponsesEvent), apiErr
 	}
 
 	// Use RequestNoTrimStream to preserve event lines.
 	stream, apiErr := requester.RequestNoTrimStreamWithEmitterOptions(httpRequester, resp, handler.HandlerResponsesStreamWithEmitter, requester.StreamReadOptions{
+		SSELines:     true,
 		MaxLineBytes: codexResponsesStreamMaxLineBytes,
 	})
-	return commonresponses.NewEventStream(stream, handler.ObserveAcceptedResponsesEvent), apiErr
+	return commonresponses.NewEventStream(stream, handler.ObserveResponsesEvent), apiErr
 }
 
 func (p *CodexProvider) CompactResponses(ctx context.Context, rawReq *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
@@ -555,9 +562,11 @@ func (p *CodexProvider) collectResponsesStreamResponse(stream commonresponses.Ev
 			eventError = codexAcceptedStreamError(err, "stream_decode_failed")
 			return true, nil
 		}
-		if err := observer.AcceptRawEvent(event, func() error {
-			return stream.ObserveAcceptedResponsesEvent(event)
-		}); err != nil {
+		if err := observer.ObserveEvent(event); err != nil {
+			eventError = codexAcceptedStreamError(err, "provider_protocol_error")
+			return true, nil
+		}
+		if err := stream.ObserveResponsesEvent(event); err != nil {
 			eventError = codexAcceptedStreamError(err, "provider_protocol_error")
 			return true, nil
 		}

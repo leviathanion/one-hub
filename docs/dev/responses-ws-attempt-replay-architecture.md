@@ -27,9 +27,11 @@ Responses WS 没有 request-level replay：
 1. native upstream 建立前，可以在既有 open 候选预算内跳过不支持或握手失败的候选；
 2. 任何 `response.create` 一旦进入 upstream write，就不换渠道、不重放；
 3. write 前失败仍结束本次 turn，不把 submission 权恢复给另一渠道；
-4. write 结果不确定时关闭连接；有 provider usage 才 Confirm，否则 Cancel；
-5. request-level provider `error` 原样交付，结算并结束当前 turn，在同一连接推进 FIFO；明确的 connection-level error 才结束连接，两者都不在另一渠道重放；
+4. create write 结果不确定且没有已关联的 provider 事件时关闭连接；已有事件可证明执行归属时，沿用该执行观察，不重新发送。inject/steer 的首次歧义发送结果停止连接。有 provider usage 才 Confirm，否则 Cancel；
+5. 泛化 provider `error` 不结束当前执行；明确关联的 create 拒绝才结束该准入，connection fatal / workflow stop 关闭连接。原始错误与无关联诊断均保留，任何路径都不在另一渠道重放；
 6. connection 内 FIFO 只是 turn 排队，不是 replay。
+
+生命周期与交付边界见[Responses 透明转发与计费边界设计](./responses-transparent-relay-design.md)，不改变本文的 no-replay 契约。
 
 删除 replay 后，不再需要 cross-channel replay command、zero-charge replay proof、candidate rebuild、replay metrics 或 pending rejection 重放分支。
 

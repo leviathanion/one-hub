@@ -2,7 +2,6 @@ package openai
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -133,16 +132,9 @@ func (a *openAIResponsesWSAdapter) HandleProviderFrame(_ context.Context, frame 
 			Origin:   responsesws.RecvDetailOriginProviderFrame,
 		}
 	}
-	if responsesws.IsSteeringControlEvent(envelope.Type) {
+	if responsesws.IsAuxiliaryControlEvent(envelope.Type) {
 		out := responsesws.NewTextFrame(payload)
 		return responsesws.ProviderFrameResult{EmitFrame: &out, Origin: responsesws.RecvDetailOriginProviderFrame}
-	}
-	if classified := responsesws.ClassifyResponsesWSEvent(payload); classified.Malformed {
-		return responsesws.ProviderFrameResult{
-			Origin:         responsesws.RecvDetailOriginProviderMalformed,
-			Err:            fmt.Errorf("%w: %s", responsesws.ErrInvalidProviderEventPayload, classified.MalformedError),
-			CloseTransport: true,
-		}
 	}
 	usage, usageErr := a.acceptedProviderUsage(envelope.EventID, payload)
 	if usageErr != nil {
@@ -198,6 +190,9 @@ func (a *openAIResponsesWSAdapter) acceptedProviderUsage(providerEventID string,
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if event.Type != "response.created" && event.Response != nil && event.Response.ID != "" && a.responseID != "" && event.Response.ID != a.responseID {
+		return nil, nil
+	}
 
 	switch event.Type {
 	case "response.created":
@@ -261,9 +256,15 @@ func (a *openAIResponsesWSAdapter) acceptedProviderUsage(providerEventID string,
 			a.searchType,
 			&a.toolBillingTracker,
 		); err != nil {
-			return nil, common.ErrorWrapperLocal(err, commonresponses.ResponsesStreamTrackingFailureCode(err), http.StatusBadGateway)
+			service := a.searchServiceType
+			if service == "" {
+				service = types.APIToolTypeWebSearchPreview
+			}
+			if fatal := commonresponses.ObserveBillingFailure(observed, service, err); fatal != nil {
+				return nil, common.ErrorWrapperLocal(fatal, commonresponses.ResponsesStreamTrackingFailureCode(fatal), http.StatusBadGateway)
+			}
 		}
-		if len(observed.ExtraBilling) == 0 {
+		if len(observed.ExtraBilling) == 0 && len(observed.BillingDiagnostics) == 0 {
 			return nil, nil
 		}
 		return &types.UsageEvent{
@@ -291,6 +292,7 @@ func openAIResponsesWSEventUsage(providerEventID string, payload []byte) *types.
 	if usage == nil {
 		return nil
 	}
+	event.Response.ApplyUsageAttribution(usage)
 	return &types.UsageEvent{
 		InputTokens:           usage.PromptTokens,
 		OutputTokens:          usage.CompletionTokens,
@@ -305,6 +307,8 @@ func openAIResponsesWSEventUsage(providerEventID string, payload []byte) *types.
 		ServiceTier:           strings.TrimSpace(event.Response.ServiceTier),
 		ExtraTokens:           usage.GetExtraTokens(),
 		ProviderTokenEvidence: usage.HasProviderUsage(),
+		AttributionConflict:   usage.AttributionConflict,
+		BillingDiagnostics:    usage.BillingDiagnostics,
 	}
 }
 

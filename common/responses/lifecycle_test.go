@@ -13,7 +13,7 @@ func TestObserveEventLifecycleIgnoresMalformedUsageEvidence(t *testing.T) {
 	if !event.ResponseObject || event.Response == nil || event.Response.ID != "resp_1" || event.Response.Status != "completed" {
 		t.Fatalf("stable lifecycle facts were lost: %+v", event)
 	}
-	if event.Response.Usage != nil || event.ResponseFieldError != nil {
+	if event.Response.Usage != nil {
 		t.Fatalf("malformed usage became lifecycle data/error: %+v", event)
 	}
 }
@@ -28,13 +28,13 @@ func TestObserveEventLifecycleKeepsUnknownOpaqueEventNonFatal(t *testing.T) {
 	}
 }
 
-func TestObserveEventLifecycleReportsLifecycleFieldErrorsOnly(t *testing.T) {
+func TestObserveEventLifecycleDoesNotInventInvalidResourceIdentity(t *testing.T) {
 	event, err := ObserveEventLifecycle([]byte(`{"type":"response.completed","sequence_number":1,"response":{"id":42,"usage":{"input_tokens":1}}}`))
 	if err != nil {
 		t.Fatalf("parse envelope: %v", err)
 	}
-	if event.ResponseFieldError == nil {
-		t.Fatalf("invalid response.id was not reported: %+v", event)
+	if event.Response == nil || event.Response.ID != "" {
+		t.Fatalf("invalid response.id became an owner identity: %+v", event)
 	}
 	if _, err := ObserveEventLifecycle([]byte(`{"type":"response.created","type":"response.completed"}`)); err == nil {
 		t.Fatal("duplicate top-level type was accepted")

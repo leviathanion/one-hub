@@ -48,6 +48,18 @@ func ResponsesStreamTrackingFailureCode(err error) string {
 	return "provider_usage_state_limit"
 }
 
+// 组件身份冲突是局部计费事实；容量错误仍终止接收。
+func ObserveBillingFailure(usage *types.Usage, service string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, errImageGenerationStreamIdentityConflict) || errors.Is(err, errToolBillingStreamIdentityConflict) {
+		usage.MarkExtraBillingConflict(service)
+		return nil
+	}
+	return err
+}
+
 func (t *ImageGenerationStreamTracker) ObserveUsageEvent(event StreamUsageEvent) error {
 	return t.observe(event.Type, event.Response, event.Item, event.ItemID, event.OutputIndex, event.PartialImageIndex)
 }

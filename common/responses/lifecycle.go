@@ -21,10 +21,8 @@ type ObservedEvent struct {
 	Sequence      int64
 	SequenceError error
 
-	ResponsePresent      bool
 	ResponseObject       bool
 	Response             *types.OpenAIResponsesResponses
-	ResponseFieldError   error
 	ResponseErrorPresent bool
 	TopLevelError        json.RawMessage
 	TopLevelCode         json.RawMessage
@@ -52,7 +50,6 @@ func ObserveEventLifecycle(payload []byte) (ObservedEvent, error) {
 	}
 
 	rawResponse, responsePresent := object.Fields["response"]
-	observed.ResponsePresent = responsePresent
 	if !responsePresent || isRawNull(rawResponse) {
 		return observed, nil
 	}
@@ -61,36 +58,16 @@ func ObserveEventLifecycle(payload []byte) (ObservedEvent, error) {
 		return observed, nil
 	}
 	observed.ResponseObject = true
-	response := &types.OpenAIResponsesResponses{}
-	var fieldErrors []error
-	if response.ID, err = optionalRawString(responseObject.Fields, "id"); err != nil {
-		fieldErrors = append(fieldErrors, fmt.Errorf("response.id: %w", err))
-	}
-	if response.Status, err = optionalRawString(responseObject.Fields, "status"); err != nil {
-		fieldErrors = append(fieldErrors, fmt.Errorf("response.status: %w", err))
-	}
-	if response.Model, err = optionalRawString(responseObject.Fields, "model"); err != nil {
-		fieldErrors = append(fieldErrors, fmt.Errorf("response.model: %w", err))
-	}
-	if response.ServiceTier, err = optionalRawString(responseObject.Fields, "service_tier"); err != nil {
-		fieldErrors = append(fieldErrors, fmt.Errorf("response.service_tier: %w", err))
-	}
 	if rawError, ok := responseObject.Fields["error"]; ok && !isRawNull(rawError) {
 		observed.ResponseErrorPresent = true
-		var responseError types.OpenAIError
-		if err := json.Unmarshal(rawError, &responseError); err == nil {
-			response.Error = &responseError
-		}
 	}
 
-	// A full decode enriches output and valid usage, but failure in a
-	// non-lifecycle field must not erase the lifecycle facts above.
-	var full types.OpenAIResponsesResponses
-	if err := json.Unmarshal(rawResponse, &full); err == nil {
-		response = &full
+	// 容错投影独立保留资源身份和计费字段的原始证据。
+	var response types.OpenAIResponsesResponses
+	if err := response.DecodeCapturedProviderJSON(rawResponse); err != nil {
+		return observed, err
 	}
-	observed.Response = response
-	observed.ResponseFieldError = errors.Join(fieldErrors...)
+	observed.Response = &response
 	return observed, nil
 }
 

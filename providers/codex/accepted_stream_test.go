@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"reflect"
 	"strings"
 	"testing"
 
@@ -26,7 +25,7 @@ func TestCodexCollectorIDLessPrefixPreventsDefinitiveRejection(t *testing.T) {
 			if apiErr != nil {
 				t.Fatal(apiErr)
 			}
-			_, apiErr = (&CodexProvider{}).collectResponsesStreamResponse(commonresponses.NewEventStream(rawStream, handler.ObserveAcceptedResponsesEvent))
+			_, apiErr = (&CodexProvider{}).collectResponsesStreamResponse(commonresponses.NewEventStream(rawStream, handler.ObserveResponsesEvent))
 			if apiErr == nil || apiErr.UpstreamAccepted != prefix {
 				t.Fatalf("incorrect prefix acceptance: prefix=%t err=%+v", prefix, apiErr)
 			}
@@ -34,19 +33,20 @@ func TestCodexCollectorIDLessPrefixPreventsDefinitiveRejection(t *testing.T) {
 	}
 }
 
-func TestCodexTerminalToolFailureDoesNotCommitImageOrTokenState(t *testing.T) {
+func TestCodexTerminalToolFailurePreservesIndependentImageAndTokens(t *testing.T) {
 	a := newCodexTurnUsageAccumulator()
 	if err := a.ObserveEvent(&types.OpenAIResponsesStreamResponses{Type: "response.created", Response: &types.OpenAIResponsesResponses{Usage: &types.ResponsesUsage{InputTokens: 3}}}); err != nil {
 		t.Fatal(err)
 	}
-	beforeImage := a.imageTracker
-	beforeUsage := cloneCodexResponsesUsage(a.observedResponsesUsage)
 	outputs := []types.ResponsesOutput{{ID: "img_1", Type: types.InputTypeImageGenerationCall, Status: "completed", Quality: "high", Size: "1024x1024"}}
 	for i := 0; i < 1025; i++ {
 		outputs = append(outputs, types.ResponsesOutput{ID: fmt.Sprintf("ws_%d", i), Type: types.InputTypeWebSearchCall, Status: "completed", Action: map[string]any{"type": "search"}})
 	}
-	err := a.ObserveEvent(&types.OpenAIResponsesStreamResponses{Type: "response.completed", Response: &types.OpenAIResponsesResponses{ID: "resp_1", Status: "completed", Output: outputs, Usage: &types.ResponsesUsage{InputTokens: 999}}})
-	if err == nil || !reflect.DeepEqual(beforeImage, a.imageTracker) || !reflect.DeepEqual(beforeUsage, a.observedResponsesUsage) || len(a.toolUsage.ExtraBilling) != 0 {
+	response := &types.OpenAIResponsesResponses{ID: "resp_1", Status: "completed", Output: outputs, Usage: &types.ResponsesUsage{InputTokens: 999, OutputTokens: 1, TotalTokens: 1000}}
+	err := a.ObserveEvent(&types.OpenAIResponsesStreamResponses{Type: "response.completed", Response: response})
+	resolved := a.ResolveUsage(response)
+	imageKey := types.BuildExtraBillingKey(types.APIToolTypeImageGeneration, "high-1024x1024")
+	if err == nil || !resolved.HasProviderUsage() || resolved.TotalTokens != 1000 || resolved.ExtraBilling[imageKey].CallCount != 1 {
 		t.Fatalf("rejected terminal changed another accounting component: err=%v usage=%+v billing=%+v", err, a.observedResponsesUsage, a.toolUsage)
 	}
 }
@@ -63,7 +63,7 @@ func TestCodexCollectorIgnoresIncompleteBillingAndStopsAtTerminal(t *testing.T) 
 			if apiErr != nil {
 				t.Fatal(apiErr)
 			}
-			stream := commonresponses.NewEventStream(rawStream, handler.ObserveAcceptedResponsesEvent)
+			stream := commonresponses.NewEventStream(rawStream, handler.ObserveResponsesEvent)
 			response, apiErr := (&CodexProvider{}).collectResponsesStreamResponse(stream)
 			if incomplete {
 				if apiErr == nil || response != nil || handler.Usage.TotalTokens != 0 || handler.accumulator.observedResponsesUsage != nil {
@@ -88,9 +88,30 @@ func TestCodexCollectorPreservesProviderEventOverflow(t *testing.T) {
 		t.Fatal(apiErr)
 	}
 	calls := 0
-	stream := commonresponses.NewEventStream(rawStream, func(event string) error { calls++; return handler.ObserveAcceptedResponsesEvent(event) })
+	stream := commonresponses.NewEventStream(rawStream, func(event string) error { calls++; return handler.ObserveResponsesEvent(event) })
 	response, apiErr := (&CodexProvider{}).collectResponsesStreamResponse(stream)
 	if response != nil || apiErr == nil || apiErr.Code != "provider_usage_state_limit" || !apiErr.UpstreamAccepted || calls != 0 || handler.Usage.TotalTokens != 0 {
 		t.Fatalf("provider event overflow changed classification or committed accounting: response=%+v err=%v calls=%d usage=%+v", response, apiErr, calls, handler.Usage)
+	}
+}
+
+func TestCodexResponsesStreamPreservesAttributionConflict(t *testing.T) {
+	for _, terminalTier := range []string{"flex", "priority"} {
+		t.Run(terminalTier, func(t *testing.T) {
+			usage := &types.Usage{}
+			handler := newCodexResponsesStreamHandler(usage)
+			for _, raw := range []string{
+				`data: {"type":"response.created","response":{"id":"resp_price","model":"gpt-5","service_tier":"flex"}}` + "\n\n",
+				`data: {"type":"response.completed","response":{"id":"resp_price","model":"gpt-5","service_tier":"` + terminalTier + `","usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}}}` + "\n\n",
+			} {
+				if err := handler.ObserveResponsesEvent(raw); err != nil {
+					t.Fatal(err)
+				}
+			}
+			conflict := terminalTier != "flex"
+			if usage.AttributionConflict != conflict || usage.HasProviderUsage() == conflict || usage.TotalTokens != 110 {
+				t.Fatalf("Codex 归属冲突未保留或累计快照丢失：%+v", usage)
+			}
+		})
 	}
 }

@@ -38,7 +38,7 @@ func TestIssue048ResponsesHTTPToolEvidenceReachesSQL(t *testing.T) {
 			name:        "search done then provider EOF",
 			wantCharge:  5000,
 			wantSearch:  true,
-			wantFailure: true,
+			wantFailure: false,
 			body: "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_i048_search_eof\",\"model\":\"gpt-5.6\",\"status\":\"in_progress\",\"tools\":[{\"type\":\"web_search_preview\",\"search_context_size\":\"medium\"}]}}\n\n" +
 				"data: {\"type\":\"response.output_item.done\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"ws_i048_search_eof\",\"type\":\"web_search_call\",\"status\":\"completed\",\"action\":{\"type\":\"search\"}}}\n\n",
 		},
@@ -63,13 +63,13 @@ func TestIssue048ResponsesHTTPToolEvidenceReachesSQL(t *testing.T) {
 		},
 		{
 			name:        "image output then provider EOF",
-			wantFailure: true,
+			wantFailure: false,
 			body: "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_i048_image_eof\",\"model\":\"gpt-5.6\",\"status\":\"in_progress\",\"tools\":[{\"type\":\"image_generation\",\"model\":\"gpt-image-1-mini\",\"quality\":\"medium\",\"size\":\"1024x1024\"}]}}\n\n" +
 				"data: {\"type\":\"response.output_item.done\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"img_i048_eof\",\"type\":\"image_generation_call\",\"status\":\"completed\",\"quality\":\"medium\",\"size\":\"1024x1024\"}}\n\n",
 		},
 		{
 			name:        "image tool declaration then provider EOF",
-			wantFailure: true,
+			wantFailure: false,
 			body:        "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_i048_image_declared\",\"model\":\"gpt-5.6\",\"status\":\"in_progress\",\"tools\":[{\"type\":\"image_generation\",\"model\":\"gpt-image-1-mini\",\"quality\":\"medium\",\"size\":\"1024x1024\"}]}}\n\n",
 		},
 	} {
@@ -81,42 +81,7 @@ func TestIssue048ResponsesHTTPToolEvidenceReachesSQL(t *testing.T) {
 
 func issue048RunHTTPSettlement(t *testing.T, testCase issue048HTTPCase) {
 	t.Helper()
-	setupRelayTestDB(t, &model.User{}, &model.Token{}, &model.Log{})
-	if err := model.DB.Create(&model.User{
-		Id: 1, Username: "i048-user", Password: "password123", AccessToken: "i048-access",
-		Quota: 100000, Group: "default", Status: config.UserStatusEnabled, Role: config.RoleCommonUser,
-	}).Error; err != nil {
-		t.Fatalf("create I048 user fixture: %v", err)
-	}
-	if err := model.DB.Session(&gorm.Session{SkipHooks: true}).Create(&model.Token{
-		Id: 1, UserId: 1, Key: "i048-token", Name: "i048-token", Status: config.TokenStatusEnabled,
-		ExpiredTime: -1, RemainQuota: 100000, Group: "default",
-	}).Error; err != nil {
-		t.Fatalf("create I048 token fixture: %v", err)
-	}
-
-	originalPricing := model.PricingInstance
-	originalBatch := config.BatchUpdateEnabled
-	originalRedis := config.RedisEnabled
-	originalReserve := config.PreConsumedQuota
-	originalLog := config.LogConsumeEnabled
-	originalDisableTokenEncoders := config.DisableTokenEncoders
-	model.PricingInstance = &model.Pricing{Prices: map[string]*model.Price{
-		issue048HTTPModel: {Model: issue048HTTPModel, Type: model.TokensPriceType},
-	}}
-	config.BatchUpdateEnabled = false
-	config.RedisEnabled = false
-	config.PreConsumedQuota = 0
-	config.LogConsumeEnabled = true
-	config.DisableTokenEncoders = true
-	t.Cleanup(func() {
-		model.PricingInstance = originalPricing
-		config.BatchUpdateEnabled = originalBatch
-		config.RedisEnabled = originalRedis
-		config.PreConsumedQuota = originalReserve
-		config.LogConsumeEnabled = originalLog
-		config.DisableTokenEncoders = originalDisableTokenEncoders
-	})
+	setupResponsesHTTPBillingFixture(t)
 
 	var upstreamCalls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -132,6 +97,7 @@ func issue048RunHTTPSettlement(t *testing.T, testCase issue048HTTPCase) {
 	rawRequest := `{"model":"` + issue048HTTPModel + `","input":"hello","stream":true,"store":false}`
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
+	enableResponsesTestDeadline(ctx)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses?stream=true", strings.NewReader(rawRequest)).WithContext(context.Background())
 	ctx.Request.Header.Set("Content-Type", "application/json")
 	ctx.Set("id", 1)
@@ -224,4 +190,45 @@ func issue048AssertSQLSettlement(t *testing.T, charge int) {
 	if len(logs) != wantRequests || len(logs) == 1 && logs[0].Quota != charge {
 		t.Fatalf("I048 SQL consume log mismatch: logs=%+v charge=%d", logs, charge)
 	}
+}
+
+func setupResponsesHTTPBillingFixture(t *testing.T) {
+	t.Helper()
+	setupRelayTestDB(t, &model.User{}, &model.Token{}, &model.Log{})
+	if err := model.DB.Create(&model.User{
+		Id: 1, Username: "i048-user", Password: "password123", AccessToken: "i048-access",
+		Quota: 100000, Group: "default", Status: config.UserStatusEnabled, Role: config.RoleCommonUser,
+	}).Error; err != nil {
+		t.Fatalf("create I048 user fixture: %v", err)
+	}
+	if err := model.DB.Session(&gorm.Session{SkipHooks: true}).Create(&model.Token{
+		Id: 1, UserId: 1, Key: "i048-token", Name: "i048-token", Status: config.TokenStatusEnabled,
+		ExpiredTime: -1, RemainQuota: 100000, Group: "default",
+	}).Error; err != nil {
+		t.Fatalf("create I048 token fixture: %v", err)
+	}
+
+	originalPricing := model.PricingInstance
+	originalBatch := config.BatchUpdateEnabled
+	originalRedis := config.RedisEnabled
+	originalReserve := config.PreConsumedQuota
+	originalLog := config.LogConsumeEnabled
+	originalDisableTokenEncoders := config.DisableTokenEncoders
+	model.PricingInstance = &model.Pricing{Prices: map[string]*model.Price{
+		issue048HTTPModel: {Model: issue048HTTPModel, Type: model.TokensPriceType},
+	}}
+	config.BatchUpdateEnabled = false
+	config.RedisEnabled = false
+	config.PreConsumedQuota = 0
+	config.LogConsumeEnabled = true
+	config.DisableTokenEncoders = true
+	t.Cleanup(func() {
+		model.PricingInstance = originalPricing
+		config.BatchUpdateEnabled = originalBatch
+		config.RedisEnabled = originalRedis
+		config.PreConsumedQuota = originalReserve
+		config.LogConsumeEnabled = originalLog
+		config.DisableTokenEncoders = originalDisableTokenEncoders
+	})
+
 }

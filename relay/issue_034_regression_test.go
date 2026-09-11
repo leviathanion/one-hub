@@ -290,7 +290,7 @@ func drainI034ResponsesStream(t *testing.T, stream commonresponses.EventStream, 
 			}
 			delivered.WriteString(data)
 			if observe {
-				if err := stream.ObserveAcceptedResponsesEvent(data); err != nil {
+				if err := stream.ObserveResponsesEvent(data); err != nil {
 					t.Fatalf("accepted Responses event failed: %v", err)
 				}
 			}

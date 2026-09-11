@@ -83,7 +83,11 @@ func TestIssue048CodexSearchUsageSettlesThroughAttemptOnce(t *testing.T) {
 				t.Fatalf("open Codex Realtime session: session=%T error=%+v", session, apiErr)
 			}
 			t.Cleanup(func() { session.Abort("issue_048_test_cleanup") })
-			session.SetTurnObserverFactory(NewRealtimeTurnObserverFactory(c, models, nil))
+			finalized := make(chan struct{})
+			observerFactory := NewRealtimeTurnObserverFactory(c, models, nil)
+			session.SetTurnObserverFactory(func() runtimesession.TurnObserver {
+				return &issue048NotifyingTurnObserver{RealtimeTurnObserver: observerFactory().(*RealtimeTurnObserver), done: finalized}
+			})
 
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -103,6 +107,12 @@ func TestIssue048CodexSearchUsageSettlesThroughAttemptOnce(t *testing.T) {
 			case <-ctx.Done():
 				t.Fatalf("Codex upstream termination control was not exercised: %s", test.termination)
 			}
+			// 先等待真实结算完成，避免测试轮询与 SQLite 余额事务争抢表锁。
+			select {
+			case <-finalized:
+			case <-ctx.Done():
+				t.Fatalf("Codex turn settlement did not finish: %s", test.termination)
+			}
 
 			wantCharge := int64(5000)
 			if test.withTokens {
@@ -116,6 +126,17 @@ func TestIssue048CodexSearchUsageSettlesThroughAttemptOnce(t *testing.T) {
 			waitIssue048CodexSQLSettlement(t, startingQuota, wantCharge, 3*boolInt(test.withTokens), 2*boolInt(test.withTokens))
 		})
 	}
+}
+
+type issue048NotifyingTurnObserver struct {
+	*RealtimeTurnObserver
+	done chan struct{}
+	once sync.Once
+}
+
+func (o *issue048NotifyingTurnObserver) FinalizeTurn(payload runtimesession.TurnFinalizePayload) {
+	o.RealtimeTurnObserver.FinalizeTurn(payload)
+	o.once.Do(func() { close(o.done) })
 }
 
 type issue048CodexTermination string

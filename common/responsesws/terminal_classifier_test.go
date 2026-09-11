@@ -93,20 +93,20 @@ func TestClassifyResponsesWSEventTerminalCases(t *testing.T) {
 	}
 }
 
-func TestClassifyResponsesWSEventRejectsRealtimeTerminalDialect(t *testing.T) {
+func TestClassifyResponsesWSEventDoesNotInterpretForeignTerminalDialect(t *testing.T) {
 	for _, payload := range []string{
 		`{"type":"response.done","response":{"id":"resp_1","status":"completed"}}`,
 		`{"type":"response.cancelled","response":{"id":"resp_1","status":"cancelled"}}`,
 		`{"type":"response.canceled","response":{"id":"resp_1","status":"cancelled"}}`,
 	} {
 		got := ClassifyResponsesWSEvent([]byte(payload))
-		if !got.Malformed || got.Kind != ResponsesFailedTerminal || got.MalformedError == "" {
-			t.Fatalf("expected Realtime terminal dialect to be malformed, payload=%s got=%+v", payload, got)
+		if got.Malformed || got.Kind != ResponsesNonTerminal {
+			t.Fatalf("未知终结方言不应构成本地协议错误, payload=%s got=%+v", payload, got)
 		}
 	}
 }
 
-func TestClassifyResponsesWSEventRequiresTerminalIdentityAndSequence(t *testing.T) {
+func TestClassifyResponsesWSEventProjectsTerminalWithoutWireValidation(t *testing.T) {
 	for _, payload := range []string{
 		`{"type":"response.completed"}`,
 		`{"type":"response.completed","sequence_number":1,"response":null}`,
@@ -119,8 +119,8 @@ func TestClassifyResponsesWSEventRequiresTerminalIdentityAndSequence(t *testing.
 		`{"type":"response.completed","sequence_number":-1,"response":{"id":"resp_1"}}`,
 	} {
 		got := ClassifyResponsesWSEvent([]byte(payload))
-		if !got.Malformed || got.Kind != ResponsesFailedTerminal || got.MalformedError == "" {
-			t.Fatalf("expected invalid terminal identity/sequence to be malformed, payload=%s got=%+v", payload, got)
+		if got.Malformed || got.Kind != ResponsesSuccessTerminal {
+			t.Fatalf("观察字段不能构成原帧拒绝条件, payload=%s got=%+v", payload, got)
 		}
 	}
 

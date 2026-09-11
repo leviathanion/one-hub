@@ -55,7 +55,7 @@ func (s *fakeRelayStream) Recv() (<-chan string, <-chan error) {
 
 func (s *fakeRelayStream) Close() {}
 
-func (s *fakeRelayStream) ObserveAcceptedResponsesEvent(event string) error {
+func (s *fakeRelayStream) ObserveResponsesEvent(event string) error {
 	if s == nil || s.observeAccepted == nil {
 		return nil
 	}

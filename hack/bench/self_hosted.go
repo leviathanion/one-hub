@@ -483,7 +483,10 @@ func forwardResponsesStream(c *gin.Context, stream commonresponses.EventStream) 
 				return
 			}
 			stop, framingErr := framer.PushChunk(data, func(event string) (bool, error) {
-				if err := observer.AcceptRawEvent(event, func() error { return stream.ObserveAcceptedResponsesEvent(event) }); err != nil {
+				if err := observer.ObserveEvent(event); err != nil {
+					return true, err
+				}
+				if err := stream.ObserveResponsesEvent(event); err != nil {
 					return true, err
 				}
 				if first {

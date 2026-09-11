@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 
@@ -69,51 +70,38 @@ func (a *codexTurnUsageAccumulator) ObserveEvent(event *types.OpenAIResponsesStr
 		return nil
 	}
 	event = normalizeCodexUsageEvent(event)
-	// Image item events cannot also change tool state; terminal/created events
-	// only change image scalar metadata. Stage that metadata until tool checks
-	// succeed, without copying the accumulated per-image maps on every delta.
+	event.Response.ApplyUsageAttribution(&a.toolUsage)
 	candidateImage := a.imageTracker
-	candidateSearch := *a
+	trackingErr := commonresponses.ObserveBillingFailure(&a.toolUsage, types.APIToolTypeImageGeneration, candidateImage.ObserveResponsesEvent(event))
+	a.imageTracker = candidateImage
 	if event.Type == "response.created" {
-		if err := candidateSearch.updateSearchBilling(event.Response); err != nil {
-			return err
-		}
+		trackingErr = errors.Join(trackingErr, a.updateSearchBilling(event.Response))
 	}
-	if err := candidateImage.ObserveResponsesEvent(event); err != nil {
-		return common.ErrorWrapperLocal(err, commonresponses.ResponsesStreamTrackingFailureCode(err), http.StatusBadGateway)
+	serviceType, billingType := a.searchServiceType, a.searchType
+	if serviceType == "" {
+		serviceType = types.APIToolTypeWebSearchPreview
 	}
-
-	eventType := strings.TrimSpace(event.Type)
-	switch eventType {
+	switch event.Type {
 	case "response.output_item.done":
-		if event.Item != nil && event.Item.Type == types.InputTypeWebSearchCall {
-			if err := commonresponses.ApplyResponsesStreamOutputItemBillingWithToolTracker(
-				&a.toolUsage, eventType, event.Item, event.ItemID, event.OutputIndex,
-				a.searchServiceType, a.searchType, &a.toolTracker,
-			); err != nil {
-				return common.ErrorWrapperLocal(err, commonresponses.ResponsesStreamTrackingFailureCode(err), http.StatusBadGateway)
-			}
-		}
+		err := commonresponses.ApplyResponsesStreamOutputItemBillingWithToolTracker(&a.toolUsage, event.Type, event.Item, event.ItemID, event.OutputIndex, serviceType, billingType, &a.toolTracker)
+		trackingErr = errors.Join(trackingErr, commonresponses.ObserveBillingFailure(&a.toolUsage, serviceType, err))
 	case "response.completed", "response.failed", "response.incomplete":
-		serviceType, billingType := commonresponses.ResponsesSearchBilling(event.Response)
-		if serviceType == "" {
-			serviceType, billingType = a.searchServiceType, a.searchType
+		if service, kind := commonresponses.ResponsesSearchBilling(event.Response); service != "" {
+			serviceType, billingType = service, kind
 		}
-		if err := commonresponses.ApplyResponsesTerminalOutputItemBillingWithToolTracker(
-			&a.toolUsage, event.Response, serviceType, billingType, &a.toolTracker,
-		); err != nil {
-			return common.ErrorWrapperLocal(err, commonresponses.ResponsesStreamTrackingFailureCode(err), http.StatusBadGateway)
-		}
+		err := commonresponses.ApplyResponsesTerminalOutputItemBillingWithToolTracker(&a.toolUsage, event.Response, serviceType, billingType, &a.toolTracker)
+		trackingErr = errors.Join(trackingErr, commonresponses.ObserveBillingFailure(&a.toolUsage, serviceType, err))
 		imageUsage := &types.Usage{}
 		candidateImage.ApplyImageGenerationBilling(event.Response, imageUsage)
 		commonresponses.MergeResponsesExtraBillingMax(&a.toolUsage, imageUsage.ExtraBilling)
-	}
-	a.imageTracker = candidateImage
-	a.searchServiceType, a.searchType = candidateSearch.searchServiceType, candidateSearch.searchType
-	if event.Response != nil {
-		if usage := cloneCodexResponsesUsage(event.Response.Usage); usage != nil {
-			a.observedResponsesUsage = usage
+		if event.Response != nil {
+			if usage := cloneCodexResponsesUsage(event.Response.Usage); usage != nil {
+				a.observedResponsesUsage = usage
+			}
 		}
+	}
+	if trackingErr != nil {
+		return common.ErrorWrapperLocal(trackingErr, commonresponses.ResponsesStreamTrackingFailureCode(trackingErr), http.StatusBadGateway)
 	}
 	return nil
 }
@@ -185,8 +173,8 @@ func (a *codexTurnUsageAccumulator) ResolveUsage(response *types.OpenAIResponses
 
 	response.Usage = usageSource
 	resolved := usageSource.ToOpenAIUsage()
-	resolved.ResponseModel = response.Model
-	resolved.ServiceTier = response.ServiceTier
+	response.ApplyUsageAttribution(resolved)
+	resolved.AttributionConflict = resolved.AttributionConflict || a.toolUsage.AttributionConflict
 	resolved.ExtraBilling = cloneCodexExtraBilling(a.toolUsage.ExtraBilling)
 	for key, billing := range resolved.ExtraBilling {
 		resolved.MarkProviderExtraBilling(key, billing)
@@ -213,6 +201,7 @@ func (a *codexTurnUsageAccumulator) ResolveUsageEvent(response *types.OpenAIResp
 		BillingDiagnostics:    a.takeBillingDiagnosticsDelta(resolved.BillingDiagnostics),
 		ProviderExtraBilling:  providerExtraBillingEvidence(extraBilling),
 		ProviderTokenEvidence: resolved.HasProviderUsage(),
+		AttributionConflict:   resolved.AttributionConflict,
 	}
 	if resolved.ProviderReported {
 		event.Source = types.UsageSourceResponsesResponse

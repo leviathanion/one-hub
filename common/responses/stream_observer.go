@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"one-api/types"
 	"strings"
 )
@@ -13,9 +12,6 @@ type StreamObserver struct {
 	finalResponse      *types.OpenAIResponsesResponses
 	terminalSeen       bool
 	terminalKind       StreamTerminalKind
-	lastSequence       int64
-	hasSequence        bool
-	sequenceReliable   bool
 	lifecycleError     error
 	terminalError      *StreamErrorEvent
 	observedResponseID string
@@ -32,7 +28,7 @@ const (
 )
 
 func NewStreamObserver() *StreamObserver {
-	return &StreamObserver{sequenceReliable: true}
+	return &StreamObserver{}
 }
 
 func (observer *StreamObserver) SetResponseIDObserver(callback func(string)) {
@@ -42,7 +38,7 @@ func (observer *StreamObserver) SetResponseIDObserver(callback func(string)) {
 }
 
 func (observer *StreamObserver) ObserveRawEvent(rawEvent string) {
-	if observer == nil || observer.lifecycleError != nil || observer.terminalSeen {
+	if observer == nil || observer.lifecycleError != nil {
 		return
 	}
 	payload, ok := SSEDataPayload(rawEvent)
@@ -52,40 +48,10 @@ func (observer *StreamObserver) ObserveRawEvent(rawEvent string) {
 	observer.observeSSEPayload(payload)
 }
 
-// AcceptRawEvent stages lifecycle state, commits provider-local accounting,
-// then publishes both as one accepted event. A rejected accounting event does
-// not advance sequence, terminal, response identity, or affinity proof state.
-func (observer *StreamObserver) AcceptRawEvent(rawEvent string, commitAccounting func() error) error {
-	if observer == nil {
-		return errors.New("responses stream observer is required")
-	}
-	if observer.lifecycleError != nil {
-		return observer.lifecycleError
-	}
-	if observer.terminalSeen {
-		return nil
-	}
-
-	candidate := *observer
-	candidate.responseIDObserver = nil
-	candidate.ObserveRawEvent(rawEvent)
-	if candidate.lifecycleError != nil {
-		return candidate.lifecycleError
-	}
-	if commitAccounting != nil {
-		if err := commitAccounting(); err != nil {
-			return err
-		}
-	}
-
-	previousResponseID := observer.observedResponseID
-	responseIDObserver := observer.responseIDObserver
-	*observer = candidate
-	observer.responseIDObserver = responseIDObserver
-	if previousResponseID == "" && observer.observedResponseID != "" && responseIDObserver != nil {
-		responseIDObserver(observer.observedResponseID)
-	}
-	return nil
+// ObserveEvent 只校验已准入执行的资源归属；计费和交付由各自所有者推进。
+func (observer *StreamObserver) ObserveEvent(rawEvent string) error {
+	observer.ObserveRawEvent(rawEvent)
+	return observer.LifecycleError()
 }
 
 func (observer *StreamObserver) observeSSEPayload(payload string) {
@@ -103,6 +69,11 @@ func (observer *StreamObserver) observeSSEPayload(payload string) {
 		return
 	}
 	eventType := strings.TrimSpace(observed.Type)
+	wasResponseTerminal := observer.terminalSeen && observer.terminalKind == StreamTerminalResponse
+	if !IsResponseLifecycleEvent(eventType) && eventType != "error" {
+		// 未知事件不授予新的资源 owner；其原始字节仍由调用者交付。
+		observed.Response = nil
+	}
 	if eventType != "error" {
 		observer.nonErrorEventSeen = true
 	}
@@ -110,7 +81,7 @@ func (observer *StreamObserver) observeSSEPayload(payload string) {
 	if observed.Response != nil {
 		responseID = strings.TrimSpace(observed.Response.ID)
 	}
-	if IsTerminalEventType(eventType) && (!observed.ResponseObject || observed.ResponseFieldError != nil || responseID == "" && observer.observedResponseID == "") {
+	if IsTerminalEventType(eventType) && (!observed.ResponseObject || responseID == "" && observer.observedResponseID == "") {
 		// A terminal response ID is a relay-owned ownership and settlement
 		// boundary. Unlike provider sequence validation, this cannot be inferred
 		// or deferred after the stream ends.
@@ -120,25 +91,6 @@ func (observer *StreamObserver) observeSSEPayload(payload string) {
 	if responseID != "" && observer.observedResponseID != "" && responseID != observer.observedResponseID {
 		observer.setLifecycleError(fmt.Errorf("responses stream response.id changed from %s to %s", observer.observedResponseID, responseID))
 		return
-	}
-
-	sequencePresent := observed.HasSequence
-	sequence := observed.Sequence
-	if !sequencePresent {
-		observer.sequenceReliable = false
-	} else if observed.SequenceError != nil {
-		observer.sequenceReliable = false
-		sequencePresent = false
-	}
-	if sequencePresent && sequence < 0 {
-		observer.sequenceReliable = false
-	} else if sequencePresent {
-		if observer.hasSequence && sequence <= observer.lastSequence {
-			observer.sequenceReliable = false
-		} else {
-			observer.lastSequence = sequence
-			observer.hasSequence = true
-		}
 	}
 
 	switch eventType {
@@ -157,7 +109,7 @@ func (observer *StreamObserver) observeSSEPayload(payload string) {
 		if strings.TrimSpace(responseCopy.ID) == "" && IsTerminalEventType(eventType) {
 			responseCopy.ID = observer.observedResponseID
 		}
-		if observer.finalResponse == nil || IsTerminalEventType(eventType) {
+		if observer.finalResponse == nil || IsTerminalEventType(eventType) && !wasResponseTerminal {
 			observer.finalResponse = &responseCopy
 		}
 		if responseID != "" && observer.observedResponseID == "" {
@@ -179,7 +131,7 @@ func (observer *StreamObserver) markTerminal(kind StreamTerminalKind) {
 	if observer == nil {
 		return
 	}
-	if observer.terminalSeen {
+	if observer.terminalSeen && observer.terminalKind == StreamTerminalResponse {
 		return
 	}
 	observer.terminalSeen = true
@@ -190,23 +142,9 @@ func (observer *StreamObserver) setLifecycleError(err error) {
 	if observer == nil {
 		return
 	}
-	observer.sequenceReliable = false
 	if observer.lifecycleError == nil {
 		observer.lifecycleError = err
 	}
-}
-
-func (observer *StreamObserver) StreamCompletionError() error {
-	if observer == nil {
-		return errors.New("responses stream observer is required")
-	}
-	if observer.lifecycleError != nil {
-		return observer.lifecycleError
-	}
-	if !observer.terminalSeen {
-		return errors.New("responses stream ended without a terminal event")
-	}
-	return nil
 }
 
 func (observer *StreamObserver) LifecycleError() error {
@@ -214,14 +152,6 @@ func (observer *StreamObserver) LifecycleError() error {
 		return errors.New("responses stream observer is required")
 	}
 	return observer.lifecycleError
-}
-
-func (observer *StreamObserver) ReliableNextSequenceNumber() *int64 {
-	if observer == nil || !observer.hasSequence || !observer.sequenceReliable || observer.lastSequence == math.MaxInt64 {
-		return nil
-	}
-	next := observer.lastSequence + 1
-	return &next
 }
 
 func (observer *StreamObserver) TerminalSeen() bool {
@@ -264,4 +194,8 @@ func IsTerminalEventType(eventType string) bool {
 	default:
 		return false
 	}
+}
+
+func IsResponseLifecycleEvent(eventType string) bool {
+	return eventType == "response.created" || eventType == "response.queued" || eventType == "response.in_progress" || IsTerminalEventType(eventType)
 }

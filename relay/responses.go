@@ -346,8 +346,14 @@ func (r *relayResponses) sendCurrentProvider() (err *types.OpenAIErrorWithStatus
 		}
 
 		if r.responsesRequest.Stream {
+			ioOwner, ioErr := newResponsesHTTPIO(r.c)
+			if ioErr != nil {
+				return common.ErrorWrapperLocal(ioErr, "response_write_deadline_unsupported", http.StatusInternalServerError), true
+			}
+			defer ioOwner.Close()
+			r.c.Set(responsesHTTPIOContextKey, ioOwner)
 			var response commonresponses.EventStream
-			response, err = responsesProvider.CreateResponsesStream(r.c.Request.Context(), r.providerRequest(commonresponses.ResponsesCreate))
+			response, err = responsesProvider.CreateResponsesStream(ioOwner.ctx, r.providerRequest(commonresponses.ResponsesCreate))
 			if err != nil {
 				return
 			}
@@ -367,6 +373,10 @@ func (r *relayResponses) sendCurrentProvider() (err *types.OpenAIErrorWithStatus
 			}
 			r.SetFirstResponseTime(firstResponseTime)
 			if streamErr != nil {
+				if streamErr.LocalError && r.c.Writer.Written() {
+					// RelayHandler 的 panic guard 先按已取得证据结算，net/http 再 abort/reset。
+					panic(http.ErrAbortHandler)
+				}
 				// Only an error before any accepted non-error payload establishes
 				// provider rejection; a missing response ID alone proves nothing.
 				providerRejected := observer.ProviderRejected()

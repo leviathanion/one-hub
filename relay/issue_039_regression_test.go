@@ -106,7 +106,7 @@ func issue039AssertSecondSettlement(t *testing.T, first *ResponsesWSTurnAttempt,
 	}
 }
 
-func TestIssue039ResponsesWSCompletedInjectRecoversThroughNextTurn(t *testing.T) {
+func TestIssue039ResponsesWSCompletedInjectUsesUpstreamReplyAndClientContinuation(t *testing.T) {
 	harness := newIssue004RelayHarness(t, "attempt-issue-039-first", true)
 	originalApproximate := config.ApproximateTokenEnabled
 	config.ApproximateTokenEnabled = true
@@ -115,12 +115,13 @@ func TestIssue039ResponsesWSCompletedInjectRecoversThroughNextTurn(t *testing.T)
 	// The shared I004 harness seeds a pending inject for its terminal-ack test.
 	// This scenario starts with no prior inject so the completed response can
 	// enter the completed-response recovery path directly.
-	harness.actor.turns.inject.Reset()
+	harness.actor.turns.deferredInjects.Reset()
 
 	providerFrames := make(chan []byte, 8)
 	var providerReady sync.Once
 	providerSeed := make(chan struct{})
 	issue039StartManagedReadPump(t, harness.providerServer, func(payload []byte) {
+		issue039ReplyCompletedInject(t, harness.providerServer, payload)
 		select {
 		case providerFrames <- payload:
 		default:
@@ -210,8 +211,8 @@ func TestIssue039ResponsesWSCompletedInjectRecoversThroughNextTurn(t *testing.T)
 		t.Fatalf("second response did not complete through the real relay path: got=%s want=%s", secondFrame.payload, secondCompleted)
 	}
 	issue004WaitRelayActorEvents(t, harness.actor)
-	if harness.actor.closing.closed.Load() || harness.actor.turns.history.lastFinal == nil || harness.actor.turns.history.lastFinal.ID != "resp-039-second" {
-		t.Fatalf("second response did not leave a reusable session: closed=%v final=%+v", harness.actor.closing.closed.Load(), harness.actor.turns.history.lastFinal)
+	if harness.actor.closing.closed.Load() || !harness.actor.isRecentlyFinalizedResponseID("resp-039-second") {
+		t.Fatalf("second response did not leave a reusable session: closed=%v final=%+v", harness.actor.closing.closed.Load(), harness.actor.turns.history.recentFinalizedResponseIDs)
 	}
 	issue039AssertSecondSettlement(t, harness.attempt, firstCharge)
 }
@@ -242,7 +243,7 @@ func issue039CompletedRecoveryActor(t *testing.T) (*ResponsesWSSessionActor, *re
 	return actor, conn, attempt
 }
 
-func TestIssue039CompletedInjectRejectsUnknownResponseAndCall(t *testing.T) {
+func TestIssue039CompletedInjectChecksOwnerAndPassesUnknownCall(t *testing.T) {
 	actor, conn, _ := issue039CompletedRecoveryActor(t)
 	defer actor.finish()
 	session := actor.upstream.session.(*responsesWSCaptureSendSession)
@@ -266,13 +267,24 @@ func TestIssue039CompletedInjectRejectsUnknownResponseAndCall(t *testing.T) {
 		{
 			name:    "wrong function call id",
 			payload: `{"type":"response.inject","response_id":"resp-039-owner","input":[{"type":"function_call_output","call_id":"call-039-other","output":"tool result"}]}`,
-			code:    "invalid_response_inject",
+			code:    "",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			conn.lastWrite.Store("")
 			actor.handleClientFrame(responsesWSTestClientTextFrame([]byte(test.payload)))
 			got, _ := conn.lastWrite.Load().(string)
+			if test.code == "" {
+				select {
+				case request := <-session.requests:
+					if string(request.Frame.Payload()) != test.payload || got != "" {
+						t.Fatalf("inject was interpreted locally: %s %s", request.Frame.Payload(), got)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("authorized unknown call was not sent")
+				}
+				return
+			}
 			if !strings.Contains(got, `"code":"`+test.code+`"`) {
 				t.Fatalf("expected completed inject rejection %q, got %q", test.code, got)
 			}
@@ -294,9 +306,10 @@ func TestIssue039RevokedPrincipalRejectsRecoveredNextTurnBeforeProvider(t *testi
 	config.ApproximateTokenEnabled = true
 	t.Cleanup(func() { config.ApproximateTokenEnabled = originalApproximate })
 	installResponsesWSTestAPILimiter(t, 100)
-	harness.actor.turns.inject.Reset()
+	harness.actor.turns.deferredInjects.Reset()
 	providerFrames := make(chan []byte, 4)
 	issue039StartManagedReadPump(t, harness.providerServer, func(payload []byte) {
+		issue039ReplyCompletedInject(t, harness.providerServer, payload)
 		select {
 		case providerFrames <- payload:
 		default:
@@ -371,5 +384,26 @@ func TestIssue039RevokedPrincipalRejectsRecoveredNextTurnBeforeProvider(t *testi
 			}
 		}
 	default:
+	}
+}
+
+// 回执由真实测试上游产生，代理只转发；客户端仍负责下一次 create。
+func issue039ReplyCompletedInject(t *testing.T, server *wsconn.ManagedConn, payload []byte) {
+	t.Helper()
+	var request struct {
+		Type       string          `json:"type"`
+		ResponseID string          `json:"response_id"`
+		Input      json.RawMessage `json:"input"`
+	}
+	if json.Unmarshal(payload, &request) != nil || request.Type != "response.inject" {
+		return
+	}
+	reply, err := json.Marshal(map[string]any{"type": "response.inject.failed", "sequence_number": 2, "response_id": request.ResponseID, "input": request.Input, "error": map[string]string{"code": "response_already_completed", "message": "upstream completed"}})
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	if err := server.WriteMessage(wsconn.TextMessage, reply); err != nil {
+		t.Error(err)
 	}
 }

@@ -102,8 +102,7 @@ type OpenRequest struct {
 	Diagnostics       DiagnosticHook
 }
 
-// SendRequest carries ResponsesWS protocol identity explicitly. Context remains
-// for cancellation, deadlines, and logging metadata only.
+// SendRequest 的 AttemptID 标识发送完成；仅 create 会建立当前接收关联。
 type SendRequest struct {
 	AttemptID string
 	Frame     Frame

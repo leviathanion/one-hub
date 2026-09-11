@@ -594,8 +594,8 @@ func TestIssue048NativeResponsesWSTwoClientTurnsReuseItemIDAndSettleSeparately(t
 	if len(logs) != 2 || logs[0].Quota != 5000 || logs[1].Quota != 5000 {
 		t.Fatalf("expected two independent 5000 SQL settlements for reused item ID, logs=%+v", logs)
 	}
-	if harness.actor.turns.history.lastFinal == nil || harness.actor.turns.history.lastFinal.ID != "resp-i048-turn-two" {
-		t.Fatalf("second native response did not become the final turn: %+v", harness.actor.turns.history.lastFinal)
+	if !harness.actor.isRecentlyFinalizedResponseID("resp-i048-turn-two") {
+		t.Fatalf("second native response did not become the final turn: %+v", harness.actor.turns.history.recentFinalizedResponseIDs)
 	}
 }
 

@@ -111,7 +111,7 @@ func TestResponsesWSSteeringSendResultUsesBatchIdentity(t *testing.T) {
 	}
 }
 
-func TestResponsesWSSteeringRequestErrorClosesAndReleasesReserve(t *testing.T) {
+func TestResponsesWSSteeringGenericErrorWaitsForConnectionClose(t *testing.T) {
 	for _, phase := range []string{"before_terminal", "after_terminal"} {
 		t.Run(phase, func(t *testing.T) {
 			a, session, conn := newSteeringTestActor(t, 1000)
@@ -128,6 +128,10 @@ func TestResponsesWSSteeringRequestErrorClosesAndReleasesReserve(t *testing.T) {
 			if got, _ := conn.lastWrite.Load().(string); got != payload {
 				t.Fatalf("request error changed: %s", got)
 			}
+			if a.closing.closed.Load() || a.steering.next != next || next.RolledBack || len(a.turns.queue.items) != 1 {
+				t.Fatal("unassociated generic error advanced work or canceled its reservation")
+			}
+			a.close("client_closed")
 			if !a.closing.closed.Load() || a.turns.active.attempt != nil || a.steering.next != nil || !next.RolledBack || parent.AppliedSettlement == nil {
 				t.Fatal("failed request kept its turn or reservation")
 			}

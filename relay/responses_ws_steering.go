@@ -186,24 +186,27 @@ func (a *ResponsesWSSessionActor) resolveSteeringReservation() {
 }
 
 // 交付只依赖已验证的连接；缺失、过期和未来回执不参与账务观察。
-func (a *ResponsesWSSessionActor) handleProviderSteeringControl(event ResponsesWSEventProviderDownstream) bool {
+func (a *ResponsesWSSessionActor) handleProviderAuxiliaryControl(event ResponsesWSEventProviderDownstream) bool {
 	if event.Frame == nil || event.Frame.Kind() != responsesws.FrameKindText || event.DetailOrigin != responsesws.RecvDetailOriginProviderFrame {
 		return false
 	}
 	envelope, err := responsesws.ParseProviderEventEnvelope(event.Frame.Payload())
-	if err != nil || !responsesws.IsSteeringControlEvent(envelope.Type) {
+	if err != nil || !responsesws.IsAuxiliaryControlEvent(envelope.Type) {
 		return false
 	}
 	stop := responsesWSWorkflowStop(event)
 	if stop {
 		a.stopNewWork()
 	}
-	if err := a.emitProviderFrameForAttempt(nil, responsesws.NewTextFrame(sanitizeProviderJSONPayload(event.Frame.Payload())), "provider_steering_control"); err != nil {
+	if err := a.emitProviderFrameForAttempt(nil, responsesws.NewTextFrame(sanitizeProviderJSONPayload(event.Frame.Payload())), "provider_auxiliary_control"); err != nil {
 		a.close("client_write_failed")
 		return true
 	}
 	if stop {
 		a.close("provider_workflow_stopped")
+		return true
+	}
+	if !responsesws.IsSteeringControlEvent(envelope.Type) {
 		return true
 	}
 	var steer struct {

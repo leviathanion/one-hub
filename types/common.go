@@ -46,6 +46,17 @@ type ProviderServerToolUse struct {
 	WebSearchRequests int `json:"web_search_requests"`
 }
 
+// MarkExtraBillingConflict 只使依赖该服务身份的组件失效。
+func (u *Usage) MarkExtraBillingConflict(service string) {
+	if u != nil {
+		u.AddBillingDiagnostic("unit_service_conflict:" + service)
+	}
+}
+
+func (u *Usage) HasExtraBillingConflict(service string) bool {
+	return u != nil && u.BillingDiagnostics["unit_service_conflict:"+service]
+}
+
 // UnmarshalJSON records wire presence but does not authorize billing. Only a
 // provider-local extractor may call MarkProviderReported after it has verified
 // correlation and the operation's evidence contract.

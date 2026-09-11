@@ -56,7 +56,7 @@ func (h *OpenAIResponsesStreamHandler) HandlerResponsesStream(rawLine *[]byte, d
 	if !strings.HasSuffix(rawEvent, "\n\n") && !strings.HasSuffix(rawEvent, "\r\n\r\n") {
 		rawEvent += "\n\n"
 	}
-	if err := h.ObserveAcceptedResponsesEvent(rawEvent); err != nil {
+	if err := h.ObserveResponsesEvent(rawEvent); err != nil {
 		*rawLine = requester.StreamClosed
 		errChan <- responsesUsageTrackingError(err)
 		return
@@ -1157,12 +1157,12 @@ func TestAcceptedResponsesEventStopsAtToolIdentityLimit(t *testing.T) {
 	handler := OpenAIResponsesStreamHandler{Usage: &types.Usage{}, Prefix: "data: ", Model: "gpt-5"}
 	for index := 0; index < 1024; index++ {
 		event := fmt.Sprintf("data: {\"type\":\"response.output_item.done\",\"item_id\":\"ws_%d\",\"item\":{\"id\":\"ws_%d\",\"type\":\"web_search_call\",\"status\":\"completed\",\"action\":{\"type\":\"search\"}}}\n\n", index, index)
-		if err := handler.ObserveAcceptedResponsesEvent(event); err != nil {
+		if err := handler.ObserveResponsesEvent(event); err != nil {
 			t.Fatalf("accepted event %d failed: %v", index, err)
 		}
 	}
 	overflow := "data: {\"type\":\"response.output_item.done\",\"item_id\":\"ws_overflow\",\"item\":{\"id\":\"ws_overflow\",\"type\":\"web_search_call\",\"status\":\"completed\",\"action\":{\"type\":\"search\"}}}\n\n"
-	if err := handler.ObserveAcceptedResponsesEvent(overflow); err == nil || commonresponses.ResponsesStreamTrackingFailureCode(err) != "provider_usage_state_limit" {
+	if err := handler.ObserveResponsesEvent(overflow); err == nil || commonresponses.ResponsesStreamTrackingFailureCode(err) != "provider_usage_state_limit" {
 		t.Fatalf("unexpected tool identity overflow error: %#v", err)
 	}
 	key := types.BuildExtraBillingKey(types.APIToolTypeWebSearchPreview, "medium")
@@ -1201,7 +1201,7 @@ func TestAcceptedResponsesEventRejectsOversizedImageIdentityAtomically(t *testin
 	handler := OpenAIResponsesStreamHandler{Usage: &types.Usage{}, Prefix: "data: ", Model: "gpt-5"}
 	itemID := strings.Repeat("i", 257)
 	event := fmt.Sprintf("data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":%q,\"type\":\"image_generation_call\",\"status\":\"completed\",\"quality\":\"high\",\"size\":\"1024x1024\"}}\n\n", itemID)
-	if err := handler.ObserveAcceptedResponsesEvent(event); err == nil || commonresponses.ResponsesStreamTrackingFailureCode(err) != "provider_usage_state_limit" {
+	if err := handler.ObserveResponsesEvent(event); err == nil || commonresponses.ResponsesStreamTrackingFailureCode(err) != "provider_usage_state_limit" {
 		t.Fatalf("unexpected image identity overflow error: %#v", err)
 	}
 	if len(handler.Usage.ExtraBilling) != 0 {
@@ -1236,29 +1236,20 @@ func TestHandlerChatStreamRejectsOversizedImageIdentityBeforeConversion(t *testi
 	}
 }
 
-func TestHandlerChatStreamRejectsConflictingImageIdentityAsProviderProtocolError(t *testing.T) {
+func TestHandlerChatStreamIsolatesConflictingImageEvidence(t *testing.T) {
 	handler := OpenAIResponsesStreamHandler{Usage: &types.Usage{}, Prefix: "data: ", Model: "gpt-5"}
 	dataChan := make(chan string, 1)
 	errChan := make(chan error, 1)
 	raw := []byte(`data: {"type":"response.output_item.done","item_id":"img_top","output_index":0,"item":{"id":"img_item","type":"image_generation_call","status":"completed","quality":"high","size":"1024x1024"}}`)
 	handler.HandlerChatStream(&raw, dataChan, errChan)
 
-	if !bytes.Equal(raw, requester.StreamClosed) {
-		t.Fatalf("conflicting image identity did not close converted stream: %q", raw)
-	}
-	select {
-	case data := <-dataChan:
-		t.Fatalf("conflicting image event produced a converted chunk: %q", data)
-	default:
+	if bytes.Equal(raw, requester.StreamClosed) || !handler.Usage.HasExtraBillingConflict(types.APIToolTypeImageGeneration) {
+		t.Fatalf("image conflict affected stream: %q %+v", raw, handler.Usage)
 	}
 	select {
 	case err := <-errChan:
-		var providerErr *types.OpenAIErrorWithStatusCode
-		if !errors.As(err, &providerErr) || providerErr.StatusCode != http.StatusBadGateway || providerErr.Code != "provider_protocol_error" {
-			t.Fatalf("unexpected conflicting image identity error: %#v", err)
-		}
+		t.Fatalf("component conflict became transport error: %v", err)
 	default:
-		t.Fatal("conflicting image identity did not surface a stream error")
 	}
 }
 
@@ -1793,7 +1784,7 @@ func captureCompactRequestBody(t *testing.T, configure func(*OpenAIProvider), re
 func (h *OpenAIResponsesStreamHandler) HandlerChatStream(rawLine *[]byte, dataChan chan string, errChan chan error) {
 	event := string(*rawLine) + "\n\n"
 	h.handleChatStream(rawLine, dataChan, errChan, func() (bool, error) {
-		return true, h.ObserveAcceptedResponsesEvent(event)
+		return true, h.ObserveResponsesEvent(event)
 	})
 }
 

@@ -3,9 +3,27 @@ package requester
 import (
 	"bytes"
 	"errors"
+	"strings"
 )
 
 var ErrSSEEventTooLarge = errors.New("SSE event exceeds configured limit")
+
+// SplitSSELine 返回包含原始分隔符的一行；没有分隔符时返回全部尾部。
+func SplitSSELine(raw string) (line, rest string) {
+	end := strings.IndexAny(raw, "\r\n")
+	if end < 0 {
+		return raw, ""
+	}
+	end++
+	if raw[end-1] == '\r' && end < len(raw) && raw[end] == '\n' {
+		end++
+	}
+	return raw[:end], raw[end:]
+}
+
+func SSELineContent(line string) string {
+	return strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+}
 
 // SSEEventFramer is a protocol-neutral framing leaf. It preserves every byte
 // of a complete event while keeping lifecycle interpretation in the caller.
@@ -51,4 +69,14 @@ func (f *SSEEventFramer) BufferedLen() int {
 		return 0
 	}
 	return f.buffer.Len()
+}
+
+// TakePending 只交还原始尾部，不把 EOF 当成事件分隔符。
+func (f *SSEEventFramer) TakePending() string {
+	if f == nil {
+		return ""
+	}
+	raw := f.buffer.String()
+	f.buffer.Reset()
+	return raw
 }

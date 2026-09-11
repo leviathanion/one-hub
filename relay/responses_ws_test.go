@@ -1878,11 +1878,8 @@ func TestResponsesWSClosureCutReducesQueuedTerminalBeforeSettlement(t *testing.T
 	if !attempt.QuotaFinalized || attempt.RolledBack || attempt.Usage.PromptTokens != 3 || attempt.Usage.CompletionTokens != 2 || attempt.Usage.TotalTokens != 5 {
 		t.Fatalf("queued terminal was not reduced before close settlement: attempt=%+v usage=%+v", attempt, attempt.Usage)
 	}
-	if actor.turns.history.lastFinal == nil || actor.turns.history.lastFinal.ID != "resp_closure_cut" {
-		t.Fatalf("expected queued terminal lifecycle side effects, got %+v", actor.turns.history.lastFinal)
-	}
-	if got := actor.closing.closureCutSequence; got != 2 {
-		t.Fatalf("expected closure cut to include both accepted mailbox events, got sequence %d", got)
+	if !actor.isRecentlyFinalizedResponseID("resp_closure_cut") {
+		t.Fatalf("expected queued terminal lifecycle side effects, got %+v", actor.turns.history.recentFinalizedResponseIDs)
 	}
 	if got := actor.eventBytes.Load(); got != 0 {
 		t.Fatalf("closure cut leaked actor event bytes: %d", got)
@@ -3688,7 +3685,7 @@ func TestResponsesWSNoTurnProviderEventFailsClosedAndAbortsSession(t *testing.T)
 	if session.abortReason != "responses_ws_provider_event_without_turn" {
 		t.Fatalf("expected session abort on no-turn provider event, got %q", session.abortReason)
 	}
-	if actor.turns.history.lastFinal != nil || actor.turns.active.attempt != nil {
+	if len(actor.turns.history.recentFinalizedResponseIDs) != 0 || actor.turns.active.attempt != nil {
 		t.Fatalf("expected no terminal classification or active turn commit, actor=%+v", actor)
 	}
 }
@@ -3706,7 +3703,7 @@ func TestResponsesWSProviderCloseAfterTerminalIsForwarded(t *testing.T) {
 	actor.SetPump(bridge)
 	session := &responsesWSTestSession{}
 	upstreamSessionGeneration := actor.AttachUpstreamSession(session, 17)
-	actor.turns.history.lastFinal = &types.OpenAIResponsesResponses{ID: "resp_done"}
+	actor.rememberFinalizedResponseID("resp_done")
 
 	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
 		AttemptID:                 responsesWSTestCurrentAttemptID(actor),
@@ -3741,7 +3738,7 @@ func TestResponsesWSNativeProviderClosedAfterTurnClearedClosesSession(t *testing
 	actor.SetPump(NewResponsesWSIOPump(conn, actor))
 	session := &responsesWSTestSession{}
 	generation := actor.AttachUpstreamSession(session, 17)
-	actor.turns.history.lastFinal = &types.OpenAIResponsesResponses{ID: "resp_done"}
+	actor.rememberFinalizedResponseID("resp_done")
 	actor.state = responsesWSStateIdle
 
 	actor.handleProviderClosed(ResponsesWSEventProviderClosed{
@@ -3774,7 +3771,7 @@ func TestResponsesWSNativeRecvFailureAfterTurnClearedClosesSession(t *testing.T)
 	actor.SetPump(NewResponsesWSIOPump(conn, actor))
 	session := &responsesWSTestSession{}
 	generation := actor.AttachUpstreamSession(session, 17)
-	actor.turns.history.lastFinal = &types.OpenAIResponsesResponses{ID: "resp_done"}
+	actor.rememberFinalizedResponseID("resp_done")
 	actor.state = responsesWSStateIdle
 
 	actor.handleProviderRecvFailed(ResponsesWSEventProviderRecvFailed{
@@ -3893,14 +3890,14 @@ func TestResponsesWSDuplicateProviderTerminalDoesNotDoubleFinalize(t *testing.T)
 		ReceivedAt:                time.Now(),
 	}
 	actor.handleProviderDownstream(event)
-	if actor.turns.history.lastFinal == nil || actor.turns.history.lastFinal.ID != "resp_once" || !attempt.QuotaFinalized {
-		t.Fatalf("expected first terminal to finalize once, final=%+v finalized=%v", actor.turns.history.lastFinal, attempt.QuotaFinalized)
+	if !actor.isRecentlyFinalizedResponseID("resp_once") || !attempt.QuotaFinalized {
+		t.Fatalf("expected first terminal to finalize once, final=%+v finalized=%v", actor.turns.history.recentFinalizedResponseIDs, attempt.QuotaFinalized)
 	}
 	firstUsage := *attempt.Usage
 
 	actor.handleProviderDownstream(event)
-	if actor.turns.history.lastFinal == nil || actor.turns.history.lastFinal.ID != "resp_once" {
-		t.Fatalf("expected duplicate terminal not to overwrite final, got %+v", actor.turns.history.lastFinal)
+	if !actor.isRecentlyFinalizedResponseID("resp_once") {
+		t.Fatalf("expected duplicate terminal not to overwrite final, got %+v", actor.turns.history.recentFinalizedResponseIDs)
 	}
 	if !attempt.QuotaFinalized || attempt.Usage.TotalTokens != firstUsage.TotalTokens {
 		t.Fatalf("expected duplicate terminal not to mutate quota/usage, finalized=%v usage=%+v first=%+v", attempt.QuotaFinalized, attempt.Usage, firstUsage)
@@ -4505,7 +4502,7 @@ func TestResponsesWSPendingProviderBufferHasByteCap(t *testing.T) {
 		UpstreamSessionGeneration: generation,
 		ChannelID:                 17,
 		Kind:                      ProviderDownstreamFrame,
-		Frame:                     responsesWSTestProviderTextFrame([]byte(strings.Repeat("x", config.ResponsesWSPendingProviderEventsMaxBytes()+1))),
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.future","data":"` + strings.Repeat("x", config.ResponsesWSPendingProviderEventsMaxBytes()+1) + `"}`)),
 		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
 	})
 
@@ -4631,15 +4628,15 @@ func TestResponsesWSTerminalSideEffectsRequireSuccessfulClientDelivery(t *testin
 		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
 	})
 
-	if actor.turns.history.lastFinal != nil {
-		t.Fatalf("terminal affinity side effects must not run when client delivery fails, got %+v", actor.turns.history.lastFinal)
+	if len(actor.turns.history.recentFinalizedResponseIDs) != 0 {
+		t.Fatalf("terminal affinity side effects must not run when client delivery fails, got %+v", actor.turns.history.recentFinalizedResponseIDs)
 	}
 	if !actor.closing.closed.Load() {
 		t.Fatal("expected client terminal write failure to close the session")
 	}
 }
 
-func TestResponsesWSRejectsNonIncreasingProviderSequence(t *testing.T) {
+func TestResponsesWSPreservesNonIncreasingProviderSequence(t *testing.T) {
 	for _, tc := range []struct {
 		name           string
 		secondSequence int
@@ -4677,118 +4674,13 @@ func TestResponsesWSRejectsNonIncreasingProviderSequence(t *testing.T) {
 				DetailOrigin: responsesws.RecvDetailOriginProviderFrame,
 			})
 
-			if !actor.closing.closed.Load() || attempt.TerminalObserved {
-				t.Fatalf("expected non-increasing sequence to fail closed without terminal result, closed=%v terminal=%v", actor.closing.closed.Load(), attempt.TerminalObserved)
+			if actor.closing.closed.Load() || attempt.TerminalObserved {
+				t.Fatalf("非递增序号不应关闭连接或结束执行, closed=%v terminal=%v", actor.closing.closed.Load(), attempt.TerminalObserved)
 			}
-			if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "responses_ws_provider_protocol_error") {
-				t.Fatalf("expected provider protocol error, got %q", got)
+			if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "response.in_progress") {
+				t.Fatalf("原始 response.in_progress 未交付：%q", got)
 			}
 		})
-	}
-}
-
-func TestResponsesWSMultiAgentTerminalWaitsForAcceptedInjectAcknowledgement(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-multi-agent-terminal")
-	attempt.MultiAgentEnabled = true
-	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
-	actor := NewResponsesWSSessionActor(ctx)
-	actor.SetPump(NewResponsesWSIOPump(conn, actor))
-	generation := actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
-	actor.turns.active.attempt = attempt
-	actor.turns.active.affinity = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
-	actor.turns.active.channelID = 17
-	actor.turns.inject.pending = 1
-	injectContext := actor.turns.inject.Context(ctx.Request.Context())
-	actor.state = responsesWSStateInFlight
-
-	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
-		AttemptID:                 attempt.AttemptID,
-		UpstreamSessionGeneration: generation,
-		ChannelID:                 17,
-		Kind:                      ProviderDownstreamFrame,
-		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.completed","sequence_number":1,"response":{"id":"resp_multi_agent","status":"completed","usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}}`)),
-		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
-	})
-	terminalWrite, _ := conn.lastWrite.Load().(string)
-
-	if actor.turns.active.attempt != attempt || actor.state != responsesWSStateInFlight || actor.turns.inject.pending != 1 || !actor.turns.inject.terminalSeen {
-		t.Fatalf("terminal must retain the turn until accepted injects are acknowledged, state=%v active=%+v inject=%+v", actor.state, actor.turns.active.attempt, actor.turns.inject)
-	}
-	select {
-	case <-injectContext.Done():
-		t.Fatal("terminal must not cancel an already accepted inject")
-	default:
-	}
-	queuedSession := &responsesWSCaptureSendSession{requests: make(chan responsesws.SendRequest, 1)}
-	result := actor.sendResultForCommand(injectContext, responsesWSSendCommand{
-		AttemptID: attempt.AttemptID,
-		Purpose:   ResponsesWSSendPurposeResponseInject,
-		Session:   queuedSession,
-		Frame:     responsesws.NewTextFrame([]byte(`{"type":"response.inject"}`)),
-	})
-	if result.Status != responsesws.ResponsesWSTransportSendAttempted {
-		t.Fatalf("accepted inject must still reach the provider after terminal: %+v", result)
-	}
-	select {
-	case <-queuedSession.requests:
-	default:
-		t.Fatal("accepted inject did not reach provider after terminal")
-	}
-	if !strings.Contains(terminalWrite, "response.completed") {
-		t.Fatalf("expected terminal to be delivered, got %q", terminalWrite)
-	}
-
-	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
-		AttemptID:                 attempt.AttemptID,
-		UpstreamSessionGeneration: generation,
-		ChannelID:                 17,
-		Kind:                      ProviderDownstreamFrame,
-		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.inject.created","sequence_number":2,"response_id":"resp_multi_agent"}`)),
-		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
-	})
-
-	if actor.turns.active.attempt != nil || actor.state != responsesWSStateIdle || actor.turns.inject.pending != 0 {
-		t.Fatalf("final inject acknowledgement must release the turn, state=%v active=%+v inject=%+v", actor.state, actor.turns.active.attempt, actor.turns.inject)
-	}
-	select {
-	case <-injectContext.Done():
-	default:
-		t.Fatal("turn completion must release the inject send context")
-	}
-}
-
-func TestResponsesWSInjectAcknowledgementTimeoutAfterTerminalDoesNotEmitSecondError(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-inject-timeout")
-	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
-	actor := NewResponsesWSSessionActor(ctx)
-	actor.SetPump(NewResponsesWSIOPump(conn, actor))
-	actor.AttachUpstreamSession(&responsesWSTestSession{}, 17)
-	attempt.TerminalObserved = true
-	actor.turns.active.attempt = attempt
-	actor.turns.active.channelID = 17
-	actor.turns.inject.pending = 1
-	actor.turns.inject.terminalSeen = true
-	actor.state = responsesWSStateInFlight
-	actor.armActiveTurnWatchdog()
-
-	actor.watchdog.activeTurnMu.Lock()
-	timerGeneration := actor.watchdog.activeTurnTimerGen
-	actor.watchdog.activeTurnMu.Unlock()
-	actor.handleTimeout(ResponsesWSEventTimeout{
-		Reason:                    responsesWSActiveTurnTimeoutReason,
-		UpstreamSessionGeneration: actor.upstream.sessionGeneration,
-		ChannelID:                 17,
-		AttemptID:                 attempt.AttemptID,
-		TimeoutGeneration:         timerGeneration,
-	})
-
-	if !actor.closing.closed.Load() {
-		t.Fatal("inject acknowledgement timeout must close the stalled connection")
-	}
-	if got := atomic.LoadInt32(&conn.writeCount); got != 0 {
-		t.Fatalf("terminal acknowledgement timeout must not emit a second wire result, writes=%d last=%q", got, conn.lastWrite.Load())
 	}
 }
 
@@ -4796,34 +4688,32 @@ func TestResponsesWSResponseInjectIsForwardedUnchanged(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Set("id", 1)
 	ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
 
 	session := &responsesWSCaptureSendSession{requests: make(chan responsesws.SendRequest, 1)}
 	actor := NewResponsesWSSessionActor(ctx)
 	defer actor.finish()
 	actor.AttachUpstreamSession(session, 17)
-	attempt := &ResponsesWSTurnAttempt{AttemptID: "attempt-inject", SelectedChannelID: 17, MultiAgentEnabled: true}
+	attempt := &ResponsesWSTurnAttempt{AttemptID: "attempt-inject", SelectedChannelID: 17, MultiAgentEnabled: true, SeenProviderResponseID: "resp-inject"}
 	actor.turns.active.attempt = attempt
 	actor.turns.active.channelID = 17
 	actor.state = responsesWSStateInFlight
-	payload := []byte(`{"type":"response.inject","event_id":"inject-client-1","input":{"future":true}}`)
+	payload := []byte(`{"type":"response.inject","event_id":"inject-client-1","response_id":"resp-inject","input":{"future":true}}`)
 
 	actor.handleClientFrame(responsesWSTestClientTextFrame(payload))
 
 	select {
 	case req := <-session.requests:
-		if req.AttemptID != attempt.AttemptID || string(req.Frame.Payload()) != string(payload) {
-			t.Fatalf("expected unchanged response.inject with active attempt identity, got attempt=%q payload=%s", req.AttemptID, req.Frame.Payload())
+		if req.AttemptID == "" || req.AttemptID == attempt.AttemptID || string(req.Frame.Payload()) != string(payload) {
+			t.Fatalf("inject 应保持原帧并使用独立发送 ID, got attempt=%q payload=%s", req.AttemptID, req.Frame.Payload())
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for response.inject upstream send")
 	}
-	if actor.turns.inject.pending != 1 {
-		t.Fatalf("expected one pending inject acknowledgement, got %d", actor.turns.inject.pending)
-	}
 }
 
-func TestResponsesWSResponseInjectRequiresMultiAgent(t *testing.T) {
+func TestResponsesWSResponseInjectRequiresAuthorizedTarget(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
@@ -4840,12 +4730,12 @@ func TestResponsesWSResponseInjectRequiresMultiAgent(t *testing.T) {
 
 	actor.handleClientFrame(responsesWSTestClientTextFrame([]byte(`{"type":"response.inject","event_id":"inject-disabled"}`)))
 
-	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "responses_ws_multi_agent_required") {
-		t.Fatalf("expected multi-agent requirement error, got %q", got)
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "response_not_found") {
+		t.Fatalf("缺少目标资源授权错误, got %q", got)
 	}
 	select {
 	case req := <-session.requests:
-		t.Fatalf("disabled response.inject must not reach upstream, got %+v", req)
+		t.Fatalf("未授权 inject 不得到达上游, got %+v", req)
 	default:
 	}
 }
@@ -4966,6 +4856,7 @@ func TestResponsesWSRequestErrorFinalizesTurnAndStartsQueuedCreate(t *testing.T)
 	gin.SetMode(gin.TestMode)
 
 	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-request-error")
+	attempt.AttemptedPreviousResponseID = "resp_missing"
 	installResponsesWSTestAPILimiter(t, 100)
 	ctx.Set("responses_ws_selected_channel", &model.Channel{Id: 17, Type: config.ChannelTypeOpenAI, Models: "gpt-5"})
 
@@ -5232,8 +5123,8 @@ func TestResponsesWSCloseReplaysBufferedTerminalForUsage(t *testing.T) {
 	if attempt.Usage.PromptTokens != 3 || attempt.Usage.CompletionTokens != 4 || attempt.Usage.TotalTokens != 7 {
 		t.Fatalf("expected buffered terminal usage to be merged before close settlement, got %+v", attempt.Usage)
 	}
-	if actor.turns.history.lastFinal == nil || actor.turns.history.lastFinal.ID != "resp_close_buffered" {
-		t.Fatalf("expected buffered terminal final response to be recorded, got %+v", actor.turns.history.lastFinal)
+	if !actor.isRecentlyFinalizedResponseID("resp_close_buffered") {
+		t.Fatalf("expected buffered terminal final response to be recorded, got %+v", actor.turns.history.recentFinalizedResponseIDs)
 	}
 	if !attempt.CompletedAt.Equal(terminalReceivedAt) {
 		t.Fatalf("expected close replay to preserve provider terminal timestamp, got %s want %s", attempt.CompletedAt, terminalReceivedAt)
@@ -5276,8 +5167,8 @@ func TestResponsesWSCloseBufferedTerminalExactZeroIgnoresObservedUsage(t *testin
 	if user.Quota != 1000 || user.UsedQuota != 0 || token.RemainQuota != 1000 || token.UsedQuota != 0 {
 		t.Fatalf("expected buffered terminal exact zero to refund observed/floor reserve, user=%+v token=%+v", user, token)
 	}
-	if actor.turns.history.lastFinal == nil || actor.turns.history.lastFinal.ID != "resp_close_buffered_zero" {
-		t.Fatalf("expected buffered terminal side effects after exact zero settlement, last=%+v", actor.turns.history.lastFinal)
+	if !actor.isRecentlyFinalizedResponseID("resp_close_buffered_zero") {
+		t.Fatalf("expected buffered terminal side effects after exact zero settlement, last=%+v", actor.turns.history.recentFinalizedResponseIDs)
 	}
 }
 
@@ -5324,8 +5215,8 @@ func TestResponsesWSCloseBufferedTerminalSettlementFailureSkipsSuccessSideEffect
 	if attempt.QuotaFinalized || attempt.RolledBack {
 		t.Fatalf("expected nil quota settlement failure not to mark attempt settled, attempt=%+v", attempt)
 	}
-	if actor.turns.history.lastFinal != nil || len(actor.turns.history.recentFinalizedResponseIDs) != 0 {
-		t.Fatalf("expected terminal success side effects to wait for settlement success, last=%+v recent=%+v", actor.turns.history.lastFinal, actor.turns.history.recentFinalizedResponseIDs)
+	if len(actor.turns.history.recentFinalizedResponseIDs) != 0 {
+		t.Fatalf("expected terminal success side effects to wait for settlement success, last=%+v recent=%+v", actor.turns.history.recentFinalizedResponseIDs, actor.turns.history.recentFinalizedResponseIDs)
 	}
 	if session.abortReason != "quota_settlement_failed" {
 		t.Fatalf("expected pending close settlement failure to abort with quota_settlement_failed, got %q", session.abortReason)
@@ -6086,7 +5977,7 @@ func TestResponsesWSRejectsOversizedImageIdentityBeforeProviderFrameDelivery(t *
 	}
 }
 
-func TestResponsesWSRejectsConflictingImageIdentityAsProviderProtocolError(t *testing.T) {
+func TestResponsesWSIsolatesConflictingImageEvidence(t *testing.T) {
 	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-image-conflict")
 	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
 	actor := NewResponsesWSSessionActor(ctx)
@@ -6101,19 +5992,13 @@ func TestResponsesWSRejectsConflictingImageIdentityAsProviderProtocolError(t *te
 		Kind: ProviderDownstreamFrame, Frame: responsesWSTestProviderTextFrame(payload), DetailOrigin: responsesws.RecvDetailOriginProviderFrame,
 	})
 
-	if !actor.closing.closed.Load() {
-		t.Fatal("conflicting image identity did not close Responses WebSocket session")
+	if actor.closing.closed.Load() || !attempt.Usage.HasExtraBillingConflict(types.APIToolTypeImageGeneration) {
+		t.Fatalf("component conflict affected lifecycle: closed=%v usage=%+v", actor.closing.closed.Load(), attempt.Usage)
 	}
-	if got := atomic.LoadInt32(&conn.writeCount); got != 1 {
-		t.Fatalf("writes=%d, want only one proxy-local error and no provider frame", got)
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "img_top") {
+		t.Fatalf("conflicting component lost wire: %s", got)
 	}
-	got, _ := conn.lastWrite.Load().(string)
-	if !strings.Contains(got, "responses_ws_provider_protocol_error") || strings.Contains(got, "img_top") || strings.Contains(got, "img_item") {
-		t.Fatalf("unexpected downstream payload after image identity conflict: %q", got)
-	}
-	if len(attempt.Usage.ExtraBilling) != 0 {
-		t.Fatalf("conflicting image identity changed billing: %+v", attempt.Usage.ExtraBilling)
-	}
+	actor.close("test_cleanup")
 }
 
 func TestResponsesWSTerminalFrameWithResponseUsageAndAttachedUsageBillsOnce(t *testing.T) {
@@ -6319,8 +6204,8 @@ func TestResponsesWSPendingProviderBinaryFrameReplaysWithoutTerminalSideEffects(
 	if actor.closing.closed.Load() {
 		t.Fatal("expected pending binary replay not to close as malformed JSON")
 	}
-	if actor.turns.active.attempt != attempt || attempt.QuotaFinalized || actor.turns.history.lastFinal != nil {
-		t.Fatalf("expected binary replay to stay non-terminal, active=%+v finalized=%v last_final=%+v", actor.turns.active.attempt, attempt.QuotaFinalized, actor.turns.history.lastFinal)
+	if actor.turns.active.attempt != attempt || attempt.QuotaFinalized || len(actor.turns.history.recentFinalizedResponseIDs) != 0 {
+		t.Fatalf("expected binary replay to stay non-terminal, active=%+v finalized=%v last_final=%+v", actor.turns.active.attempt, attempt.QuotaFinalized, actor.turns.history.recentFinalizedResponseIDs)
 	}
 	if got := atomic.LoadInt32(&conn.lastMessageType); int(got) != responsesWSBinaryMessageType {
 		t.Fatalf("expected pending binary replay as binary message type, got %d", got)
@@ -6374,9 +6259,9 @@ func TestResponsesWSPendingTerminalWithUsageReplaysSideEffectsWithoutDoubleBilli
 	if got := attempt.Usage.ExtraBilling[types.APIToolTypeWebSearchPreview].CallCount; got != 1 {
 		t.Fatalf("expected extra billing not to double count after replay, got %d in %+v", got, attempt.Usage.ExtraBilling)
 	}
-	if actor.turns.history.lastFinal == nil || actor.turns.history.lastFinal.ID != "resp_pending_usage" {
+	if !actor.isRecentlyFinalizedResponseID("resp_pending_usage") {
 		t.Fatalf("expected terminal side effects to run during replay, final=%+v closed=%v state=%v active=%+v finalized=%v rolled_back=%v settlement=%+v recent=%+v",
-			actor.turns.history.lastFinal, actor.closing.closed.Load(), actor.state, actor.turns.active.attempt, attempt.QuotaFinalized, attempt.RolledBack, attempt.AppliedSettlement, actor.turns.history.recentFinalizedResponseIDs)
+			actor.turns.history.recentFinalizedResponseIDs, actor.closing.closed.Load(), actor.state, actor.turns.active.attempt, attempt.QuotaFinalized, attempt.RolledBack, attempt.AppliedSettlement, actor.turns.history.recentFinalizedResponseIDs)
 	}
 	if got, _ := conn.lastWrite.Load().(string); got != string(payload) {
 		t.Fatalf("expected terminal provider payload to be replayed, got %q", got)
@@ -6479,6 +6364,7 @@ func TestResponsesWSAmbiguousSendWithBufferedTerminalHasSingleTerminalResult(t *
 func TestResponsesWSAmbiguousBufferedTerminalFlushesDeferredInjectBeforeRelease(t *testing.T) {
 	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, "attempt-ambiguous-buffered-inject")
 	attempt.MultiAgentEnabled = true
+	attempt.SeenProviderResponseID = "resp_ambiguous_inject"
 	conn := &responsesWSFakeUserConn{reads: make(chan responsesWSReadResult, 1)}
 	session := &responsesWSCaptureSendSession{requests: make(chan responsesws.SendRequest, 1)}
 	actor := NewResponsesWSSessionActor(ctx)
@@ -6488,10 +6374,10 @@ func TestResponsesWSAmbiguousBufferedTerminalFlushesDeferredInjectBeforeRelease(
 	actor.turns.pending.attempt = attempt
 	actor.turns.pending.phase = responsesWSPendingTurnSend
 	actor.state = responsesWSStatePendingSend
-	injectPayload := []byte(`{"type":"response.inject","event_id":"inject-buffered","input":{"text":"continue"}}`)
+	injectPayload := []byte(`{"type":"response.inject","event_id":"inject-buffered","response_id":"resp_ambiguous_inject","input":{"text":"continue"}}`)
 	actor.handleClientFrame(responsesWSTestClientTextFrame(injectPayload))
-	if actor.turns.inject.pending != 1 || len(actor.turns.inject.deferred) != 1 {
-		t.Fatalf("expected inject to wait for pending create admission, inject=%+v", actor.turns.inject)
+	if len(actor.turns.deferredInjects.deferred) != 1 {
+		t.Fatalf("expected inject to wait for pending create admission, inject=%+v", actor.turns.deferredInjects)
 	}
 
 	terminalPayload := []byte(`{"type":"response.completed","sequence_number":1,"response":{"id":"resp_ambiguous_inject","status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)
@@ -6522,8 +6408,8 @@ func TestResponsesWSAmbiguousBufferedTerminalFlushesDeferredInjectBeforeRelease(
 	case <-time.After(time.Second):
 		t.Fatal("accepted deferred inject was not sent after terminal replay")
 	}
-	if actor.closing.closed.Load() || actor.turns.active.attempt != attempt || actor.state != responsesWSStateInFlight || actor.turns.inject.pending != 1 || !actor.turns.inject.terminalSeen {
-		t.Fatalf("expected terminal to wait for deferred inject acknowledgement, closed=%v state=%v active=%+v inject=%+v", actor.closing.closed.Load(), actor.state, actor.turns.active.attempt, actor.turns.inject)
+	if actor.closing.closed.Load() || actor.turns.active.attempt != nil || actor.state != responsesWSStateIdle {
+		t.Fatalf("expected terminal to release parent independently of inject reply, closed=%v state=%v active=%+v inject=%+v", actor.closing.closed.Load(), actor.state, actor.turns.active.attempt, actor.turns.deferredInjects)
 	}
 	if got, _ := conn.lastWrite.Load().(string); strings.Contains(got, "ambiguous_upstream_write") {
 		t.Fatalf("buffered terminal must not be followed by an ambiguous proxy error, got %q", got)
@@ -6538,8 +6424,8 @@ func TestResponsesWSAmbiguousBufferedTerminalFlushesDeferredInjectBeforeRelease(
 		Kind: ProviderDownstreamFrame, DetailOrigin: responsesws.RecvDetailOriginProviderFrame,
 		Frame: responsesWSTestProviderTextFrame([]byte(`{"type":"response.inject.created","sequence_number":2,"response_id":"resp_ambiguous_inject"}`)),
 	})
-	if actor.closing.closed.Load() || actor.turns.active.attempt != nil || actor.state != responsesWSStateIdle || actor.turns.inject.pending != 0 {
-		t.Fatalf("expected inject acknowledgement to release replayed terminal turn, closed=%v state=%v active=%+v inject=%+v", actor.closing.closed.Load(), actor.state, actor.turns.active.attempt, actor.turns.inject)
+	if actor.closing.closed.Load() || actor.turns.active.attempt != nil || actor.state != responsesWSStateIdle || len(actor.turns.deferredInjects.deferred) != 0 {
+		t.Fatalf("expected inject acknowledgement to release replayed terminal turn, closed=%v state=%v active=%+v inject=%+v", actor.closing.closed.Load(), actor.state, actor.turns.active.attempt, actor.turns.deferredInjects)
 	}
 }
 
@@ -7613,8 +7499,8 @@ func TestResponsesWSActiveSettlementFailureStopsTerminalSideEffects(t *testing.T
 	if !actor.closing.closed.Load() {
 		t.Fatal("expected settlement failure to close session")
 	}
-	if actor.turns.history.lastFinal != nil {
-		t.Fatalf("expected terminal success side effects not to run, lastFinal=%+v", actor.turns.history.lastFinal)
+	if len(actor.turns.history.recentFinalizedResponseIDs) != 0 {
+		t.Fatalf("expected terminal success side effects not to run, recentFinalizedResponseIDs=%+v", actor.turns.history.recentFinalizedResponseIDs)
 	}
 	if actor.turns.active.attempt != nil || attempt.QuotaFinalized || attempt.RolledBack {
 		t.Fatalf("expected failed settlement to clear actor state without changing quota, active=%v attempt=%+v", actor.turns.active.attempt, attempt)
@@ -7656,8 +7542,8 @@ func TestResponsesWSActiveTerminalNilQuotaFailsBeforeSideEffects(t *testing.T) {
 	if !actor.closing.closed.Load() {
 		t.Fatal("expected nil quota settlement failure to close session")
 	}
-	if actor.turns.history.lastFinal != nil {
-		t.Fatalf("expected nil quota terminal side effects not to run, lastFinal=%+v", actor.turns.history.lastFinal)
+	if len(actor.turns.history.recentFinalizedResponseIDs) != 0 {
+		t.Fatalf("expected nil quota terminal side effects not to run, recentFinalizedResponseIDs=%+v", actor.turns.history.recentFinalizedResponseIDs)
 	}
 	if actor.turns.active.attempt != nil || attempt.QuotaFinalized || attempt.RolledBack {
 		t.Fatalf("expected nil quota settlement failure to clear actor state without changing quota, active=%v attempt=%+v", actor.turns.active.attempt, attempt)
@@ -7906,8 +7792,8 @@ func TestResponsesWSProviderDownstreamFinalizedResponseIDIgnoredForNewAttempt(t 
 		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.completed","sequence_number":1,"response":{"id":"resp_old","status":"completed"}}`)),
 		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
 	})
-	if actor.turns.history.lastFinal == nil || actor.turns.history.lastFinal.ID != "resp_old" {
-		t.Fatalf("expected first terminal response to be finalized, got %+v", actor.turns.history.lastFinal)
+	if !actor.isRecentlyFinalizedResponseID("resp_old") {
+		t.Fatalf("expected first terminal response to be finalized, got %+v", actor.turns.history.recentFinalizedResponseIDs)
 	}
 
 	nextAttempt := &ResponsesWSTurnAttempt{
@@ -7982,8 +7868,8 @@ func TestResponsesWSProviderDownstreamResponseIDMismatchFailsClosed(t *testing.T
 	if !actor.closing.closed.Load() {
 		t.Fatal("expected response id mismatch to fail closed")
 	}
-	if actor.turns.history.lastFinal != nil {
-		t.Fatalf("expected response id mismatch not to submit terminal side effect, got %+v", actor.turns.history.lastFinal)
+	if len(actor.turns.history.recentFinalizedResponseIDs) != 0 {
+		t.Fatalf("expected response id mismatch not to submit terminal side effect, got %+v", actor.turns.history.recentFinalizedResponseIDs)
 	}
 }
 
@@ -7999,7 +7885,6 @@ func TestResponsesWSInjectFailedMayReferenceRejectedTargetID(t *testing.T) {
 	attempt := &ResponsesWSTurnAttempt{AttemptID: "attempt-inject-target", SelectedChannelID: 17, Usage: &types.Usage{}}
 	actor.turns.active.attempt = attempt
 	actor.turns.active.channelID = 17
-	actor.turns.inject.AddPending([]byte(`{"type":"response.inject","response_id":"resp_missing","input":[]}`))
 	actor.state = responsesWSStateInFlight
 
 	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
@@ -8013,8 +7898,8 @@ func TestResponsesWSInjectFailedMayReferenceRejectedTargetID(t *testing.T) {
 		Frame: responsesWSTestProviderTextFrame([]byte(`{"type":"response.inject.failed","response_id":"resp_missing","error":{"code":"response_not_found"},"input":[]}`)),
 	})
 
-	if actor.closing.closed.Load() || actor.turns.inject.pending != 0 || attempt.SeenProviderResponseID != "resp_current" {
-		t.Fatalf("valid inject failure acknowledgement was rejected: closed=%v pending=%d attempt=%+v", actor.closing.closed.Load(), actor.turns.inject.pending, attempt)
+	if actor.closing.closed.Load() || attempt.SeenProviderResponseID != "resp_current" {
+		t.Fatalf("valid inject failure acknowledgement was rejected: closed=%v pending=%d attempt=%+v", actor.closing.closed.Load(), actor.state, attempt)
 	}
 }
 

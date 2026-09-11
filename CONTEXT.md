@@ -49,7 +49,7 @@ _Avoid_: Small request, idempotent request
 _Avoid_: Billing owner, transport attempt, polling call
 
 **Application Submission**:
-Billing Attempt 为其 Work Action 认领的一次协议提交，通常对应一次 requester、SDK 或 adapter 调用；仅原生 Responses steering 的同父、尚未绑定的共同后继允许以多帧完成这次提交。它不授权应用重试或换渠道，也不在缺少上游幂等契约时承诺上游至多执行一次。
+Billing Attempt 为其 Work Action 认领的一次协议提交许可；原生 Responses 对同一已准入 Response 的 inject 输入追加，以及 steering 同父、尚未绑定的共同后继，可以使用多帧而不新增执行许可。它不授权重试、换渠道或恢复已结算执行，也不在缺少上游幂等契约时承诺上游至多执行一次。
 _Avoid_: Provider receipt, TCP write, client-request idempotency
 
 **Observation/Control Call**:

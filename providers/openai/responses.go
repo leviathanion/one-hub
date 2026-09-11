@@ -143,8 +143,7 @@ func (p *OpenAIProvider) CreateResponses(ctx context.Context, rawReq *commonresp
 		response.Usage.MarkProviderReported()
 		*p.Usage = *response.Usage.ToOpenAIUsage()
 	}
-	p.Usage.ResponseModel = response.Model
-	p.Usage.ServiceTier = response.ServiceTier
+	response.ApplyUsageAttribution(p.Usage)
 
 	getResponsesExtraBilling(response, p.Usage)
 	if p.ProviderRawJSONReplay {
@@ -207,12 +206,13 @@ func (p *OpenAIProvider) createResponsesStreamFromRequestWithOptions(req *http.R
 
 	if request.ConvertChat {
 		options.RequireProtocolTerminal = true
-		stream, apiErr := requester.RequestNoTrimStreamWithOptions(streamRequester, resp, chatHandler.ChatSSEHandler(chatHandler.ObserveAcceptedResponsesEvent), options)
-		return commonresponses.NewEventStream(stream, commonresponses.IgnoreAcceptedResponsesEvent), apiErr
+		stream, apiErr := requester.RequestNoTrimStreamWithOptions(streamRequester, resp, chatHandler.ChatSSEHandler(chatHandler.ObserveResponsesEvent), options)
+		return commonresponses.NewEventStream(stream, commonresponses.IgnoreResponsesEvent), apiErr
 	}
 
+	options.SSELines = true
 	stream, apiErr := requester.RequestNoTrimStreamWithEmitterOptions(streamRequester, resp, chatHandler.HandlerResponsesStreamWithEmitter, options)
-	return commonresponses.NewEventStream(stream, chatHandler.ObserveAcceptedResponsesEvent), apiErr
+	return commonresponses.NewEventStream(stream, chatHandler.ObserveResponsesEvent), apiErr
 }
 
 func (p *OpenAIProvider) CompactResponses(ctx context.Context, rawReq *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
@@ -246,8 +246,7 @@ func (p *OpenAIProvider) CompactResponses(ctx context.Context, rawReq *commonres
 		response.Usage.MarkProviderReported()
 		*p.Usage = *response.Usage.ToOpenAIUsage()
 	}
-	p.Usage.ResponseModel = response.Model
-	p.Usage.ServiceTier = response.ServiceTier
+	response.ApplyUsageAttribution(p.Usage)
 	getResponsesExtraBilling(response, p.Usage)
 	if p.ProviderRawJSONReplay {
 		response.EnableProviderRawJSONReplay()
@@ -602,14 +601,14 @@ func (h *OpenAIResponsesStreamHandler) HandlerResponsesStreamWithEmitter(rawLine
 	emitter.SendData(h.safeProviderEvent(string(*rawLine)))
 }
 
-func (h *OpenAIResponsesStreamHandler) ObserveAcceptedResponsesEvent(rawEvent string) error {
-	if err := h.observeAcceptedResponsesEvent(rawEvent); err != nil {
+func (h *OpenAIResponsesStreamHandler) ObserveResponsesEvent(rawEvent string) error {
+	if err := h.observeResponsesEvent(rawEvent); err != nil {
 		return responsesUsageTrackingError(err)
 	}
 	return nil
 }
 
-func (h *OpenAIResponsesStreamHandler) observeAcceptedResponsesEvent(rawEvent string) error {
+func (h *OpenAIResponsesStreamHandler) observeResponsesEvent(rawEvent string) error {
 	payload, ok := commonresponses.SSEDataPayload(rawEvent)
 	if !ok {
 		return nil
@@ -630,14 +629,12 @@ func (h *OpenAIResponsesStreamHandler) observeAcceptedResponsesEvent(rawEvent st
 		}
 	}
 	candidateImage := h.imageTracker
-	if err := candidateImage.ObserveUsageEvent(openaiResponse); err != nil {
-		return err
-	}
+	imageErr := candidateImage.ObserveUsageEvent(openaiResponse)
+	trackingErr := commonresponses.ObserveBillingFailure(h.Usage, types.APIToolTypeImageGeneration, imageErr)
 	switch openaiResponse.Type {
 	case "response.created":
 		if h.Usage != nil && openaiResponse.Response != nil {
-			h.Usage.ResponseModel = openaiResponse.Response.Model
-			h.Usage.ServiceTier = openaiResponse.Response.ServiceTier
+			openaiResponse.Response.ApplyUsageAttribution(h.Usage)
 		}
 		if serviceType != "" {
 			h.searchServiceType = strings.Clone(serviceType)
@@ -645,7 +642,11 @@ func (h *OpenAIResponsesStreamHandler) observeAcceptedResponsesEvent(rawEvent st
 		}
 	case "response.output_item.added", "response.output_item.done":
 		if err := commonresponses.ApplyResponsesStreamOutputItemBillingWithToolTracker(h.Usage, openaiResponse.Type, openaiResponse.Item, openaiResponse.ItemID, openaiResponse.OutputIndex, h.searchServiceType, h.searchType, &h.toolBillingTracker); err != nil {
-			return err
+			service := h.searchServiceType
+			if service == "" {
+				service = types.APIToolTypeWebSearchPreview
+			}
+			trackingErr = errors.Join(trackingErr, commonresponses.ObserveBillingFailure(h.Usage, service, err))
 		}
 	default:
 		// This observer is the provider-owned acceptance boundary for Responses
@@ -661,7 +662,7 @@ func (h *OpenAIResponsesStreamHandler) observeAcceptedResponsesEvent(rawEvent st
 		commonresponses.ApplyResponsesUsageWithImageTracker(h.Usage, openaiResponse.Response, &candidateImage)
 	}
 	h.imageTracker = candidateImage
-	return nil
+	return trackingErr
 }
 
 func responsesUsageTrackingError(err error) error {
@@ -701,7 +702,10 @@ func (h *OpenAIResponsesStreamHandler) ChatSSEHandler(observe func(string) error
 			}
 			line := []byte("data: " + payload)
 			h.handleChatStream(&line, dataChan, errChan, func() (bool, error) {
-				err := observer.AcceptRawEvent(event, func() error { return observe(event) })
+				err := observer.ObserveEvent(event)
+				if err == nil {
+					err = observe(event)
+				}
 				return !observer.ProviderRejected(), err
 			})
 			return bytes.Equal(line, requester.StreamClosed), nil

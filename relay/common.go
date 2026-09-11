@@ -1190,13 +1190,9 @@ func sanitizeProviderSSEEventWithErrorDetector(data string, detectError func([]b
 	wroteData := false
 	remaining := data
 	for len(remaining) > 0 {
-		lineEnd := strings.IndexByte(remaining, '\n')
-		line := remaining
-		if lineEnd >= 0 {
-			line = remaining[:lineEnd+1]
-		}
-		remaining = remaining[len(line):]
-		content := strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+		line, rest := requester.SplitSSELine(remaining)
+		remaining = rest
+		content := requester.SSELineContent(line)
 		if content != "data" && !strings.HasPrefix(content, "data:") {
 			out.WriteString(line)
 			continue

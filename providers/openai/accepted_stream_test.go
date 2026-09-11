@@ -16,7 +16,7 @@ func TestResponsesChatSSEWaitsForCompleteEventsBeforeBilling(t *testing.T) {
 	handler := &OpenAIResponsesStreamHandler{Usage: &types.Usage{}}
 	body := "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n" +
 		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":99,\"output_tokens\":99,\"total_tokens\":198}}}\n"
-	stream, apiErr := requester.RequestNoTrimStreamWithOptions[string](nil, &http.Response{Body: io.NopCloser(strings.NewReader(body))}, handler.ChatSSEHandler(handler.ObserveAcceptedResponsesEvent), requester.StreamReadOptions{RequireProtocolTerminal: true})
+	stream, apiErr := requester.RequestNoTrimStreamWithOptions[string](nil, &http.Response{Body: io.NopCloser(strings.NewReader(body))}, handler.ChatSSEHandler(handler.ObserveResponsesEvent), requester.StreamReadOptions{RequireProtocolTerminal: true})
 	if apiErr != nil {
 		t.Fatal(apiErr)
 	}
@@ -56,7 +56,7 @@ func TestResponsesChatSSEStopsBeforeRejectedAccountingAndLaterEvents(t *testing.
 		if strings.Contains(event, "rejected") {
 			return common.StringErrorWrapperLocal("tracking failed", "provider_usage_state_limit", 502)
 		}
-		return handler.ObserveAcceptedResponsesEvent(event)
+		return handler.ObserveResponsesEvent(event)
 	}
 	stream, apiErr := requester.RequestNoTrimStreamWithOptions[string](nil, &http.Response{Body: io.NopCloser(strings.NewReader(body))}, handler.ChatSSEHandler(observe), requester.StreamReadOptions{RequireProtocolTerminal: true})
 	if apiErr != nil {

@@ -17,6 +17,11 @@ const (
 	HTTPProfileNotification   HTTPProfile = "notification"
 )
 
+// LongStreamTimeouts 供同一响应的下游 I/O 复用现有时限。
+func LongStreamTimeouts() (idle, lifetime time.Duration) {
+	return longStreamBodyIdleTimeout, longStreamMaxLifetime
+}
+
 const (
 	longStreamResponseHeaderTimeout = 30 * time.Second
 	longStreamBodyIdleTimeout       = 2 * time.Minute

@@ -47,32 +47,13 @@ func ClassifyResponsesWSEvent(payload []byte) ResponsesTerminalResult {
 
 	eventType := observed.Type
 	result.EventType = eventType
-	if isForeignResponsesWSEventType(eventType) {
-		return malformedResponsesTerminalResult(result, "Realtime terminal event is not valid on a Responses websocket")
-	}
 	if observed.SequenceError == nil {
 		result.HasSequenceNumber = observed.HasSequence
 		result.SequenceNumber = observed.Sequence
-	} else if strings.HasPrefix(eventType, "response.") {
-		return malformedResponsesTerminalResult(result, "sequence_number must be a non-negative integer")
 	}
 
 	response := observed.Response
 	result.Response = response
-	if isKnownResponsesTerminalEventType(eventType) {
-		if !observed.ResponsePresent || !observed.ResponseObject || response == nil {
-			return malformedResponsesTerminalResult(result, "terminal response object is required")
-		}
-		if observed.ResponseFieldError != nil {
-			return malformedResponsesTerminalResult(result, observed.ResponseFieldError.Error())
-		}
-		if strings.TrimSpace(response.ID) == "" {
-			return malformedResponsesTerminalResult(result, "terminal response.id is required")
-		}
-		if !result.HasSequenceNumber {
-			return malformedResponsesTerminalResult(result, "terminal sequence_number is required")
-		}
-	}
 
 	topLevelErrorCode, topLevelErrorMessage, hasTopLevelError := rawOpenAIErrorFields(observed.TopLevelError)
 	responseErrorCode := ""
@@ -137,39 +118,9 @@ func isResponsesWSConnectionError(errorCode string) bool {
 	}
 }
 
-func isKnownResponsesTerminalEventType(eventType string) bool {
-	switch strings.TrimSpace(eventType) {
-	case "response.completed",
-		"response.failed",
-		"response.incomplete":
-		return true
-	default:
-		return false
-	}
-}
-
-// isForeignResponsesWSEventType is a Responses WebSocket protocol gate, not a
-// Realtime lifecycle classifier. It rejects known foreign terminal markers at
-// the public Responses boundary.
-func isForeignResponsesWSEventType(eventType string) bool {
-	switch strings.TrimSpace(eventType) {
-	case "response.done", "response.cancelled", "response.canceled":
-		return true
-	default:
-		return false
-	}
-}
-
-func malformedResponsesTerminalResult(result ResponsesTerminalResult, message string) ResponsesTerminalResult {
-	result.Kind = ResponsesFailedTerminal
-	result.Malformed = true
-	result.MalformedError = strings.TrimSpace(message)
-	return result
-}
-
 // ClassifyResponsesWSTerminal classifies already-decoded official Responses
-// lifecycle events. Raw provider frames must use ClassifyResponsesWSEvent so
-// required wire fields are validated.
+// lifecycle events. Raw provider frames use ClassifyResponsesWSEvent for minimal
+// observation; resource association belongs to the relay.
 func ClassifyResponsesWSTerminal(eventType string, response *types.OpenAIResponsesResponses, hasEventError bool) ResponsesTerminalResult {
 	result := ResponsesTerminalResult{
 		Kind:      ResponsesNonTerminal,

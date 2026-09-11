@@ -110,9 +110,6 @@ func newIssue004RelayHarness(t *testing.T, attemptID string, multiAgent bool) *i
 	actor.turns.active.affinity = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
 	actor.turns.active.channelID = 17
 	actor.state = responsesWSStateInFlight
-	if multiAgent {
-		actor.turns.inject.pending = 1
-	}
 
 	harness := &issue004RelayHarness{
 		actor:          actor,
@@ -230,8 +227,8 @@ func TestIssue004RelayNativeCompletedThenInjectAckKeepsSequenceAndSettlesOnce(t 
 		t.Fatalf("completed/inject acknowledgement order changed at client boundary: first=%q second=%q", first.payload, second.payload)
 	}
 	issue004WaitRelayActorEvents(t, harness.actor)
-	if harness.actor.closing.closed.Load() || harness.actor.turns.inject.pending != 0 {
-		t.Fatalf("inject acknowledgement after terminal incorrectly closed or remained pending: closed=%v pending=%d", harness.actor.closing.closed.Load(), harness.actor.turns.inject.pending)
+	if harness.actor.closing.closed.Load() || harness.actor.turns.active.attempt != nil {
+		t.Fatalf("inject acknowledgement after terminal incorrectly closed or remained pending: closed=%v pending=%d", harness.actor.closing.closed.Load(), harness.actor.state)
 	}
 	if harness.attempt.QuotaFinalized == false || harness.attempt.RolledBack || harness.attempt.AppliedSettlement == nil {
 		t.Fatalf("completed provider event did not settle exactly once before acknowledgement: %+v", harness.attempt)

@@ -57,38 +57,28 @@ var trackedStreamUsageEvents = map[string]struct{}{
 }
 
 func ParseStreamUsageEvent(payload []byte) (StreamUsageEvent, bool) {
-	var wire struct {
-		Type              string          `json:"type"`
-		Item              json.RawMessage `json:"item"`
-		ItemID            string          `json:"item_id"`
-		OutputIndex       *int            `json:"output_index"`
-		PartialImageIndex *int            `json:"partial_image_index"`
-		Response          json.RawMessage `json:"response"`
-	}
-	if err := json.Unmarshal(payload, &wire); err != nil {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &fields); err != nil {
 		return StreamUsageEvent{}, false
 	}
-	wire.Type = strings.TrimSpace(wire.Type)
-	if _, ok := trackedStreamUsageEvents[wire.Type]; !ok {
+	var event StreamUsageEvent
+	types.DecodeOptionalRawField(fields, "type", &event.Type)
+	event.Type = strings.TrimSpace(event.Type)
+	if _, ok := trackedStreamUsageEvents[event.Type]; !ok {
 		return StreamUsageEvent{}, false
 	}
-
-	event := StreamUsageEvent{
-		Type:              wire.Type,
-		ItemID:            wire.ItemID,
-		OutputIndex:       wire.OutputIndex,
-		PartialImageIndex: wire.PartialImageIndex,
+	types.DecodeOptionalRawField(fields, "item", &event.Item)
+	itemIDValid := types.DecodeOptionalRawField(fields, "item_id", &event.ItemID)
+	outputIndexValid := types.DecodeOptionalRawField(fields, "output_index", &event.OutputIndex)
+	partialIndexValid := types.DecodeOptionalRawField(fields, "partial_image_index", &event.PartialImageIndex)
+	if (event.Type == "response.output_item.added" || event.Type == "response.output_item.done" || event.Type == "response.image_generation_call.partial_image") && (!itemIDValid || !outputIndexValid || !partialIndexValid) {
+		// 无法关联的 item 不能降级为匿名收费；其他事件的独立 Response 证据仍可提取。
+		return StreamUsageEvent{}, false
 	}
-	if len(wire.Item) > 0 && !bytes.Equal(bytes.TrimSpace(wire.Item), []byte("null")) {
-		event.Item = &types.ResponsesOutput{}
-		if err := json.Unmarshal(wire.Item, event.Item); err != nil {
-			return StreamUsageEvent{}, false
-		}
-	}
-	if len(wire.Response) > 0 && !bytes.Equal(bytes.TrimSpace(wire.Response), []byte("null")) {
+	if raw := fields["response"]; len(raw) > 0 && !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 		event.Response = &types.OpenAIResponsesResponses{}
-		if err := event.Response.DecodeCapturedProviderJSON(wire.Response); err != nil {
-			return StreamUsageEvent{}, false
+		if err := event.Response.DecodeCapturedProviderJSON(raw); err != nil {
+			event.Response = nil
 		}
 	}
 	return event, true
@@ -349,6 +339,8 @@ func ApplyResponsesUsageWithImageTracker(usage *types.Usage, response *types.Ope
 	if usage == nil || response == nil {
 		return
 	}
+	response.ApplyUsageAttribution(usage)
+	attributionConflict := usage.AttributionConflict
 	existingExtraBilling := cloneResponsesExtraBilling(usage.ExtraBilling)
 	existingProviderExtraBilling := cloneResponsesProviderExtraBilling(usage.ProviderExtraBilling)
 	existingDiagnostics := cloneResponsesBillingDiagnostics(usage.BillingDiagnostics)
@@ -376,6 +368,7 @@ func ApplyResponsesUsageWithImageTracker(usage *types.Usage, response *types.Ope
 	mergeResponsesProviderExtraBilling(resolved, existingProviderExtraBilling)
 	resolved.MergeBillingDiagnostics(existingDiagnostics)
 	*usage = *resolved
+	usage.AttributionConflict = usage.AttributionConflict || attributionConflict
 	usage.ResponseModel = responseModel
 	usage.ServiceTier = serviceTier
 }

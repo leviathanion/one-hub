@@ -347,7 +347,8 @@ func (a *ResponsesWSTurnAttempt) ObserveResponsesStreamPayload(payload []byte) e
 	if !ok {
 		return nil
 	}
-	return a.imageGenerationTracker.ObserveUsageEvent(event)
+	event.Response.ApplyUsageAttribution(a.Usage)
+	return commonresponses.ObserveBillingFailure(a.Usage, types.APIToolTypeImageGeneration, a.imageGenerationTracker.ObserveUsageEvent(event))
 }
 
 func (a *ResponsesWSTurnAttempt) RememberProviderResponseID(responseID string) bool {
@@ -571,9 +572,6 @@ func (a *ResponsesWSSessionActor) ensureProviderResponseDelivery(attempt *Respon
 		return true
 	}
 	responseID := responsesWSProviderDownstreamResponseID(event)
-	if a.isOutstandingProviderInjectAcknowledgement(responsesWSProviderDownstreamPayload(event)) {
-		return true
-	}
 	if event.Frame != nil && event.Frame.Kind() == responsesws.FrameKindText {
 		envelope, err := responsesws.ParseProviderEventEnvelope(event.Frame.Payload())
 		if err == nil && envelope.Type == "response.created" && responseID != "" && attempt.TransportAttemptID == "" {

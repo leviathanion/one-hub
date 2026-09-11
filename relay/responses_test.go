@@ -324,6 +324,7 @@ func TestRelayResponsesCompactRejectsStream(t *testing.T) {
 
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
+	enableResponsesTestDeadline(ctx)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses/compact", nil)
 
 	provider := &compactRejectProvider{
@@ -365,6 +366,7 @@ func TestRelayResponsesNativeRequiresRawEnvelope(t *testing.T) {
 
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
+	enableResponsesTestDeadline(ctx)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses/compact", nil)
 
 	provider := &compactRejectProvider{
@@ -399,6 +401,7 @@ func TestRelayChatRoutesResponsesOnlyModelThroughResponsesAPI(t *testing.T) {
 
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
+	enableResponsesTestDeadline(ctx)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 
 	provider := &chatFallbackResponsesProvider{
@@ -434,6 +437,7 @@ func TestPrepareResponsesChannelAffinityPrefersRecordedChannel(t *testing.T) {
 
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
+	enableResponsesTestDeadline(ctx)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	ctx.Set("token_id", 99)
 
@@ -446,6 +450,8 @@ func TestPrepareResponsesChannelAffinityPrefersRecordedChannel(t *testing.T) {
 	recordCurrentChannelAffinity(ctx, channelAffinityKindResponses, 9527)
 
 	nextCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	enableResponsesTestDeadline(nextCtx)
 	nextCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	nextCtx.Set("token_id", 99)
 
@@ -461,6 +467,7 @@ func TestRelayResponsesSendRecordsChannelAffinityOnSuccess(t *testing.T) {
 
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
+	enableResponsesTestDeadline(ctx)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	ctx.Set("token_id", 12345)
 
@@ -562,6 +569,7 @@ func TestPrepareResponsesChannelAffinityUsesPreviousResponseIDBinding(t *testing
 
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
+	enableResponsesTestDeadline(ctx)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	ctx.Set("token_id", 321)
 	ctx.Set("token_group", "default")
@@ -578,6 +586,8 @@ func TestPrepareResponsesChannelAffinityUsesPreviousResponseIDBinding(t *testing
 	})
 
 	nextCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	enableResponsesTestDeadline(nextCtx)
 	nextCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	nextCtx.Set("token_id", 321)
 	nextCtx.Set("token_group", "default")
@@ -597,6 +607,8 @@ func TestPrepareResponsesChannelAffinitySkipsMismatchedResumeFingerprint(t *test
 	gin.SetMode(gin.TestMode)
 
 	initialCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	enableResponsesTestDeadline(initialCtx)
 	initialCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	initialCtx.Set("token_id", 322)
 	initialCtx.Set("token_group", "default")
@@ -615,6 +627,8 @@ func TestPrepareResponsesChannelAffinitySkipsMismatchedResumeFingerprint(t *test
 	})
 
 	nextCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	enableResponsesTestDeadline(nextCtx)
 	nextCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	nextCtx.Set("token_id", 322)
 	nextCtx.Set("token_group", "default")
@@ -634,6 +648,8 @@ func TestRelayResponsesSendDoesNotRecoverStalePreviousResponseIDInternally(t *te
 	gin.SetMode(gin.TestMode)
 
 	seedCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	enableResponsesTestDeadline(seedCtx)
 	seedCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	seedCtx.Set("token_id", 777)
 	seedCtx.Set("token_group", "default")
@@ -647,6 +663,7 @@ func TestRelayResponsesSendDoesNotRecoverStalePreviousResponseIDInternally(t *te
 
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
+	enableResponsesTestDeadline(ctx)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	ctx.Set("token_id", 777)
 	ctx.Set("token_group", "default")
@@ -702,6 +719,8 @@ func TestRelayResponsesClearStalePreviousResponseAffinityRemovesAllRequestBindin
 	gin.SetMode(gin.TestMode)
 
 	seedCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	enableResponsesTestDeadline(seedCtx)
 	seedCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	seedCtx.Set("token_id", 888)
 	seedCtx.Set("token_group", "default")
@@ -719,6 +738,7 @@ func TestRelayResponsesClearStalePreviousResponseAffinityRemovesAllRequestBindin
 
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
+	enableResponsesTestDeadline(ctx)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	ctx.Set("token_id", 888)
 	ctx.Set("token_group", "default")
@@ -740,6 +760,8 @@ func TestRelayResponsesClearStalePreviousResponseAffinityRemovesAllRequestBindin
 	relay.clearStalePreviousResponseAffinity()
 
 	staleLookupCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	enableResponsesTestDeadline(staleLookupCtx)
 	staleLookupCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	staleLookupCtx.Set("token_id", 888)
 	staleLookupCtx.Set("token_group", "default")
@@ -753,6 +775,8 @@ func TestRelayResponsesClearStalePreviousResponseAffinityRemovesAllRequestBindin
 	}
 
 	lookupCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	enableResponsesTestDeadline(lookupCtx)
 	lookupCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	lookupCtx.Set("token_id", 888)
 	lookupCtx.Set("token_group", "default")
@@ -777,6 +801,7 @@ func TestRelayResponsesStreamRecordsPreviousResponseIDAffinity(t *testing.T) {
 
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
+	enableResponsesTestDeadline(ctx)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	ctx.Set("token_id", 456)
 	ctx.Set("token_group", "default")
@@ -832,6 +857,8 @@ func TestRelayResponsesStreamRecordsPreviousResponseIDAffinity(t *testing.T) {
 	}
 
 	nextCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	enableResponsesTestDeadline(nextCtx)
 	nextCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	nextCtx.Set("token_id", 456)
 	nextCtx.Set("token_group", "default")
@@ -852,6 +879,7 @@ func TestRelayResponsesCompatibleStreamRecordsPreviousResponseIDAffinity(t *test
 
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
+	enableResponsesTestDeadline(ctx)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	ctx.Set("token_id", 654)
 	ctx.Set("token_group", "default")
@@ -908,6 +936,8 @@ func TestRelayResponsesCompatibleStreamRecordsPreviousResponseIDAffinity(t *test
 	}
 
 	nextCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	enableResponsesTestDeadline(nextCtx)
 	nextCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	nextCtx.Set("token_id", 654)
 	nextCtx.Set("token_group", "default")
@@ -928,6 +958,7 @@ func TestRelayResponsesHelperFunctionsAndCompatibleNonStream(t *testing.T) {
 
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
+	enableResponsesTestDeadline(ctx)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 
 	relay := &relayResponses{
@@ -1029,6 +1060,7 @@ func TestRelayResponsesHelperFunctionsAndCompatibleNonStream(t *testing.T) {
 
 	compatRecorder := httptest.NewRecorder()
 	compatCtx, _ := gin.CreateTestContext(compatRecorder)
+	enableResponsesTestDeadline(compatCtx)
 	compatCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	compatCtx.Set("token_id", 999)
 	compatCtx.Set("token_group", "default")
@@ -1100,6 +1132,7 @@ func TestRelayResponsesSetRequestAndCompactSuccessBranches(t *testing.T) {
 
 	compactRecorder := httptest.NewRecorder()
 	compactCtx, _ := gin.CreateTestContext(compactRecorder)
+	enableResponsesTestDeadline(compactCtx)
 	compactCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses/compact", strings.NewReader(`{"model":"gpt-5","prompt_cache_key":"pc-compact"}`))
 	compactCtx.Request.Header.Set("Content-Type", "application/json")
 	compactRelay := NewRelayResponses(compactCtx)
@@ -1112,6 +1145,7 @@ func TestRelayResponsesSetRequestAndCompactSuccessBranches(t *testing.T) {
 
 	createRecorder := httptest.NewRecorder()
 	createCtx, _ := gin.CreateTestContext(createRecorder)
+	enableResponsesTestDeadline(createCtx)
 	createCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5","prompt_cache_key":"pc-create"}`))
 	createCtx.Request.Header.Set("Content-Type", "application/json")
 	createRelay := NewRelayResponses(createCtx)
@@ -1124,6 +1158,7 @@ func TestRelayResponsesSetRequestAndCompactSuccessBranches(t *testing.T) {
 
 	sendRecorder := httptest.NewRecorder()
 	sendCtx, _ := gin.CreateTestContext(sendRecorder)
+	enableResponsesTestDeadline(sendCtx)
 	sendCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses/compact", nil)
 	sendCtx.Set("token_id", 88)
 	sendCtx.Set("token_group", "default")
@@ -1170,6 +1205,7 @@ func TestRelayResponsesSetRequestAndCompactSuccessBranches(t *testing.T) {
 
 	streamRecorder := httptest.NewRecorder()
 	streamCtx, _ := gin.CreateTestContext(streamRecorder)
+	enableResponsesTestDeadline(streamCtx)
 	streamCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	streamRelay := &relayResponses{
 		relayBase: relayBase{
@@ -1199,6 +1235,7 @@ func TestRelayResponsesSetRequestAndCompactSuccessBranches(t *testing.T) {
 func TestRelayResponsesProviderRequestPreservesRawQuery(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
+	enableResponsesTestDeadline(ctx)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses/compact?api-version=preview&feature=one&feature=two", strings.NewReader(`{"model":"gpt-5","input":"hello"}`))
 	relay := NewRelayResponses(ctx)
 	if err := relay.setRequest(); err != nil {
@@ -1221,6 +1258,7 @@ func TestRelayResponsesSurfacesExactWireRedirectWithoutRetryableSuccessWork(t *t
 		t.Run(name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			ctx, _ := gin.CreateTestContext(recorder)
+			enableResponsesTestDeadline(ctx)
 			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 			request := types.OpenAIResponsesRequest{Model: "gpt-5", Store: &store}
 			apiErr := &types.OpenAIErrorWithStatusCode{
@@ -1296,6 +1334,7 @@ func TestRelayResponsesSetRequestRequiresModel(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			ctx, _ := gin.CreateTestContext(recorder)
+			enableResponsesTestDeadline(ctx)
 			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(tt.body))
 			ctx.Request.Header.Set("Content-Type", "application/json")
 
@@ -1316,6 +1355,7 @@ func TestRelayResponsesSetRequestRejectsSavedPromptBeforeModelValidation(t *test
 
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
+	enableResponsesTestDeadline(ctx)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"prompt":{"id":"pmpt_123"}}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
 
@@ -1343,6 +1383,7 @@ func TestRelayResponsesChatToResponsesStreamErrorIsClientSafe(t *testing.T) {
 
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
+	enableResponsesTestDeadline(ctx)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	streamRelay := &relayResponses{
 		relayBase: relayBase{
@@ -1402,6 +1443,7 @@ func TestChatToResponsesConsumesLogicalDataFromExactRawSSE(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
+	enableResponsesTestDeadline(ctx)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	usage := &types.Usage{}
 	provider := &compatibleResponsesChatProvider{BaseProvider: providersBase.BaseProvider{Channel: &model.Channel{}, Usage: usage}}
@@ -1473,6 +1515,7 @@ func TestChatToResponsesRawProviderErrorStopsBeforeLateUsage(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
+	enableResponsesTestDeadline(ctx)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	usage := &types.Usage{}
 	provider := &compatibleResponsesChatProvider{BaseProvider: providersBase.BaseProvider{Channel: &model.Channel{}, Usage: usage}}
@@ -1506,6 +1549,7 @@ func TestCompatibleResponsesConversionFailureIsClientError(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
+	enableResponsesTestDeadline(ctx)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	storeFalse := false
 	summary := "auto"
@@ -1535,6 +1579,7 @@ func TestRelayResponsesChatFallbackStopsOnClientCancellation(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
+	enableResponsesTestDeadline(ctx)
 	requestContext, cancel := context.WithCancel(context.Background())
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(requestContext)
 	streamRelay := &relayResponses{
@@ -1583,6 +1628,7 @@ func TestCompatibleResponsesStreamFailurePreservesAcceptedQuotaAndStopsRetry(t *
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
+	enableResponsesTestDeadline(ctx)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	stream := &fakeRelayStream{dataChan: make(chan string), errChan: make(chan error, 1)}
 	close(stream.dataChan)
@@ -1663,6 +1709,7 @@ func TestRelayResponsesCompatibleFallbackRejectsStatefulResponses(t *testing.T) 
 		t.Run(tc.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			ctx, _ := gin.CreateTestContext(recorder)
+			enableResponsesTestDeadline(ctx)
 			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 
 			provider := &compatibleResponsesChatProvider{
@@ -1786,6 +1833,7 @@ func TestRelayResponsesUsesAdapterDataPathForDisabledCustomResponses(t *testing.
 	}}
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
+	enableResponsesTestDeadline(ctx)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	store := false
 	request := types.OpenAIResponsesRequest{Model: "gpt-5", Input: "hello", Store: &store}
@@ -1841,6 +1889,7 @@ func TestDisabledCustomResponsesMaterializesChatBodyBeforeProvider(t *testing.T)
 			raw := fmt.Sprintf(` {"model":"gpt-5","input":"hello","store":false,"stream":%t} `, stream)
 			recorder := httptest.NewRecorder()
 			ctx, _ := gin.CreateTestContext(recorder)
+			enableResponsesTestDeadline(ctx)
 			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(raw))
 			ctx.Request.Header.Set("Content-Type", "application/json")
 			relay := NewRelayResponses(ctx)

@@ -141,7 +141,7 @@ func (s *fakeStringStream) Close() {
 	})
 }
 
-func (s *fakeStringStream) ObserveAcceptedResponsesEvent(event string) error {
+func (s *fakeStringStream) ObserveResponsesEvent(event string) error {
 	if s == nil || s.observeAccepted == nil {
 		return nil
 	}
@@ -190,27 +190,20 @@ func TestCodexResponsesWSAdapterFutureProviderEventShapePassesThrough(t *testing
 	}
 }
 
-func TestCodexResponsesWSAdapterKnownTerminalBadResponseShapeClosesAsProviderMalformed(t *testing.T) {
+func TestCodexResponsesWSAdapterOpaqueTerminalPreservesWire(t *testing.T) {
 	adapter := &codexResponsesWSAdapter{provider: &CodexProvider{}, model: "gpt-5"}
 	result := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame([]byte(`{"type":"response.completed","sequence_number":1,"response":"opaque"}`)))
-	if result.Origin != responsesws.RecvDetailOriginProviderMalformed || !errors.Is(result.Err, responsesws.ErrInvalidProviderEventPayload) || !result.CloseTransport || result.EmitFrame != nil {
-		t.Fatalf("expected bad known terminal shape to become provider_malformed, got %+v", result)
+	if result.Origin != responsesws.RecvDetailOriginProviderFrame || result.Err != nil || result.CloseTransport || result.EmitFrame == nil || string(result.EmitFrame.Payload()) != `{"type":"response.completed","sequence_number":1,"response":"opaque"}` {
+		t.Fatalf("无法投影的公共 terminal 应保持原帧, got %+v", result)
 	}
 }
 
-func TestCodexResponsesWSAdapterRejectsConflictingImageIdentityBeforeEmit(t *testing.T) {
+func TestCodexResponsesWSAdapterIsolatesConflictingImageEvidence(t *testing.T) {
 	adapter := &codexResponsesWSAdapter{provider: &CodexProvider{}, model: "gpt-5", accumulator: newCodexTurnUsageAccumulator()}
 	payload := []byte(`{"type":"response.output_item.done","item_id":"img_top","output_index":0,"item":{"id":"img_item","type":"image_generation_call","status":"completed","quality":"high","size":"1024x1024"}}`)
 	result := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame(payload))
-	if result.Origin != responsesws.RecvDetailOriginProviderMalformed || !result.CloseTransport || result.EmitFrame != nil {
-		t.Fatalf("expected conflicting image identity to close before emit, got %+v", result)
-	}
-	var providerErr *types.OpenAIErrorWithStatusCode
-	if !errors.As(result.Err, &providerErr) || providerErr.Code != "provider_protocol_error" || providerErr.StatusCode != http.StatusBadGateway {
-		t.Fatalf("unexpected conflicting image identity error: %#v", result.Err)
-	}
-	if result.Usage != nil {
-		t.Fatalf("conflicting image frame produced usage: %+v", result.Usage)
+	if result.Err != nil || result.CloseTransport || result.EmitFrame == nil || string(result.EmitFrame.Payload()) != string(payload) || result.Usage == nil || !result.Usage.BillingDiagnostics["unit_service_conflict:image_generation"] {
+		t.Fatalf("component conflict affected wire or lost diagnostics: %+v", result)
 	}
 }
 
@@ -242,7 +235,7 @@ func TestCodexResponsesWSAdapterRejectsTerminalToolOverflowWithoutPartialFrameBi
 	if !errors.As(result.Err, &providerErr) || providerErr.Code != "provider_usage_state_limit" {
 		t.Fatalf("unexpected terminal overflow error: %#v", result.Err)
 	}
-	if result.Usage != nil {
+	if result.Usage != nil && (result.Usage.ProviderTokenEvidence || len(result.Usage.ExtraBilling) != 0) {
 		t.Fatalf("failed terminal re-emitted or partially added billing: %+v", result.Usage)
 	}
 }
@@ -432,7 +425,7 @@ func TestCodexResponsesWSAdapterNormalizesPrivateTerminalAliasesBeforePublicClas
 				t.Fatalf("expected supplier terminal alias to normalize, got %+v", result)
 			}
 			classified := responsesws.ClassifyResponsesWSEvent(result.EmitFrame.Payload())
-			if classified.Malformed || classified.Kind != test.kind || classified.EventType != test.publicType || !classified.HasSequenceNumber || classified.SequenceNumber != 0 || classified.Response == nil {
+			if classified.Malformed || classified.Kind != test.kind || classified.EventType != test.publicType || classified.Response == nil {
 				t.Fatalf("expected public terminal %q, classified=%+v payload=%s", test.publicType, classified, result.EmitFrame.Payload())
 			}
 			if classified.Response.Status != test.publicStatus || classified.Response.ID != "resp_alias" {
@@ -551,7 +544,7 @@ func TestCodexResponsesWSAdapterSynthesizesResponseDoneSequenceAfterProviderFram
 	}
 }
 
-func TestCodexResponsesWSAdapterFiltersDuplicateTerminalDialects(t *testing.T) {
+func TestCodexResponsesWSAdapterForwardsDuplicateTerminalWithoutBilling(t *testing.T) {
 	adapter := &codexResponsesWSAdapter{
 		provider:    &CodexProvider{},
 		model:       "gpt-5",
@@ -563,7 +556,7 @@ func TestCodexResponsesWSAdapterFiltersDuplicateTerminalDialects(t *testing.T) {
 		t.Fatalf("expected first terminal to pass through, got %+v", completed)
 	}
 	done := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame([]byte(`{"type":"response.done","response":{"id":"resp_duplicate","status":"completed","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`)))
-	if done.Err != nil || !done.Filtered || done.EmitFrame != nil || done.Usage != nil || done.CloseTransport {
+	if done.Err != nil || done.Filtered || done.EmitFrame == nil || done.Usage != nil || done.CloseTransport {
 		t.Fatalf("expected duplicate Codex terminal dialect to be filtered, got %+v", done)
 	}
 }
@@ -654,7 +647,7 @@ func TestCollectResponsesStreamResponseDecodeFailureDrainsBlockedLegacyProducer(
 		t.Fatalf("create legacy stream: %+v", apiErr)
 	}
 
-	_, collectedErr := provider.collectResponsesStreamResponse(commonresponses.NewEventStream(stream, commonresponses.IgnoreAcceptedResponsesEvent))
+	_, collectedErr := provider.collectResponsesStreamResponse(commonresponses.NewEventStream(stream, commonresponses.IgnoreResponsesEvent))
 	if collectedErr == nil || collectedErr.Code != "stream_decode_failed" {
 		t.Fatalf("expected malformed stream error, got %+v", collectedErr)
 	}
@@ -855,7 +848,7 @@ func TestCodexAcceptedResponsesEventRejectsOversizedImageIdentityAtomically(t *t
 	handler := newCodexResponsesStreamHandler(&types.Usage{})
 	itemID := strings.Repeat("i", 257)
 	event := fmt.Sprintf("data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":%q,\"type\":\"image_generation_call\",\"status\":\"completed\",\"quality\":\"high\",\"size\":\"1024x1024\"}}\n\n", itemID)
-	gotErr := handler.ObserveAcceptedResponsesEvent(event)
+	gotErr := handler.ObserveResponsesEvent(event)
 	var providerErr *types.OpenAIErrorWithStatusCode
 	if !errors.As(gotErr, &providerErr) || providerErr.StatusCode != http.StatusBadGateway || providerErr.Code != "provider_usage_state_limit" {
 		t.Fatalf("unexpected Codex image identity overflow error: %#v", gotErr)
@@ -883,10 +876,10 @@ func TestCodexAcceptedResponsesEventRejectsTerminalToolOverflowAtomically(t *tes
 		t.Fatalf("marshal prefix fixture: %v", err)
 	}
 	handler := newCodexResponsesStreamHandler(&types.Usage{})
-	if err := handler.ObserveAcceptedResponsesEvent("data: " + string(prefixPayload) + "\n\n"); err != nil {
+	if err := handler.ObserveResponsesEvent("data: " + string(prefixPayload) + "\n\n"); err != nil {
 		t.Fatalf("accepted prefix failed: %v", err)
 	}
-	streamErr := handler.ObserveAcceptedResponsesEvent("data: " + string(terminal) + "\n\n")
+	streamErr := handler.ObserveResponsesEvent("data: " + string(terminal) + "\n\n")
 	var providerErr *types.OpenAIErrorWithStatusCode
 	if !errors.As(streamErr, &providerErr) || providerErr.Code != "provider_usage_state_limit" || providerErr.StatusCode != http.StatusBadGateway {
 		t.Fatalf("unexpected terminal tool overflow error: %#v", streamErr)
@@ -1432,7 +1425,7 @@ func TestCreateResponsesStreamConvertChatDoesNotDoubleCountToolBilling(t *testin
 	}
 }
 
-func TestCreateResponsesStreamConvertChatRejectsImageTrackerErrorBeforeConversion(t *testing.T) {
+func TestCreateResponsesStreamConvertChatRequiresTerminalAfterImageConflict(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("data:{\"type\":\"response.output_item.done\",\"item_id\":\"img_top\",\"output_index\":0,\"item\":{\"id\":\"img_item\",\"type\":\"image_generation_call\",\"status\":\"completed\",\"quality\":\"high\",\"size\":\"1024x1024\"}}\n\n"))
@@ -1472,8 +1465,7 @@ func TestCreateResponsesStreamConvertChatRejectsImageTrackerErrorBeforeConversio
 				continue
 			}
 			errorCount++
-			var providerErr *types.OpenAIErrorWithStatusCode
-			if !errors.As(err, &providerErr) || providerErr.Code != "provider_protocol_error" {
+			if !errors.Is(err, requester.ErrStreamProtocolTerminalMissing) {
 				t.Fatalf("unexpected convert-chat tracker error: %#v", err)
 			}
 		case <-deadline:
@@ -1670,7 +1662,7 @@ func TestCreateResponsesBodyIncludesPromptCachePolicyDecision(t *testing.T) {
 }
 
 func (h *CodexResponsesStreamHandler) HandlerResponsesStream(rawLine *[]byte, dataChan chan string, errChan chan error) {
-	if err := h.ObserveAcceptedResponsesEvent(string(*rawLine)); err != nil {
+	if err := h.ObserveResponsesEvent(string(*rawLine)); err != nil {
 		*rawLine = requester.StreamClosed
 		errChan <- err
 		return

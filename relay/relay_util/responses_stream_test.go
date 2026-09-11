@@ -515,11 +515,8 @@ func TestResponsesStreamObserverTracksTerminalResponse(t *testing.T) {
 	if finalResponse.PromptCacheKey != "pc-final" {
 		t.Fatalf("expected terminal prompt_cache_key %q, got %q", "pc-final", finalResponse.PromptCacheKey)
 	}
-	if err := observer.StreamCompletionError(); err != nil {
+	if err := observer.LifecycleError(); err != nil {
 		t.Fatalf("expected valid terminal lifecycle, got %v", err)
-	}
-	if got := observer.ReliableNextSequenceNumber(); got == nil || *got != 2 {
-		t.Fatalf("expected next sequence number 2, got %v", got)
 	}
 }
 
@@ -527,7 +524,7 @@ func TestResponsesStreamObserverAcceptsMultiLineAndNoSpaceData(t *testing.T) {
 	observer := commonresponses.NewStreamObserver()
 	observer.ObserveRawEvent("event: response.completed\ndata:{\"type\":\"response.completed\",\ndata:\"sequence_number\":0,\"response\":{\"id\":\"resp_multiline\",\"status\":\"completed\",\"usage\":{\"input_tokens\":2,\"output_tokens\":3,\"total_tokens\":5}}}\n\n")
 
-	if err := observer.StreamCompletionError(); err != nil {
+	if err := observer.LifecycleError(); err != nil {
 		t.Fatalf("expected legal multi-line SSE event, got %v", err)
 	}
 	final := observer.FinalResponse()
@@ -572,7 +569,8 @@ func TestResponsesStreamObserverFreezesFirstTerminal(t *testing.T) {
 			name:  "error before response",
 			first: "data: {\"type\":\"error\",\"code\":\"first\"}\n\n",
 			late:  "data: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"id\":\"resp_late\",\"status\":\"completed\"}}\n\n",
-			kind:  commonresponses.StreamTerminalError,
+			kind:  commonresponses.StreamTerminalResponse,
+			id:    "resp_late",
 		},
 	}
 
@@ -596,16 +594,13 @@ func TestResponsesStreamObserverFreezesFirstTerminal(t *testing.T) {
 	}
 }
 
-func TestResponsesStreamObserverRejectsIdentityBeforeConsumingSequence(t *testing.T) {
+func TestResponsesStreamObserverRejectsConflictingIdentity(t *testing.T) {
 	observer := commonresponses.NewStreamObserver()
 	observer.ObserveRawEvent("data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_a\"}}\n\n")
 	observer.ObserveRawEvent("data: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"id\":\"resp_b\",\"status\":\"completed\"}}\n\n")
 
 	if observer.LifecycleError() == nil || observer.TerminalSeen() {
 		t.Fatalf("conflicting identity must fail before terminal commit: err=%v terminal=%v", observer.LifecycleError(), observer.TerminalSeen())
-	}
-	if next := observer.ReliableNextSequenceNumber(); next != nil {
-		t.Fatalf("rejected provider event must make synthetic sequence unreliable, next=%v", *next)
 	}
 	if final := observer.FinalResponse(); final == nil || final.ID != "resp_a" {
 		t.Fatalf("conflicting terminal mutated accepted response facts: %+v", final)
@@ -615,16 +610,13 @@ func TestResponsesStreamObserverRejectsIdentityBeforeConsumingSequence(t *testin
 func TestResponsesStreamObserverDoesNotIncrementMaxSequence(t *testing.T) {
 	observer := commonresponses.NewStreamObserver()
 	observer.ObserveRawEvent("data: {\"type\":\"response.created\",\"sequence_number\":9223372036854775807,\"response\":{\"id\":\"resp_max_sequence\"}}\n\n")
-	if next := observer.ReliableNextSequenceNumber(); next != nil {
-		t.Fatalf("max sequence cannot be incremented safely: %d", *next)
-	}
 }
 
 func TestResponsesStreamObserverAcceptsFutureOutputQualityUnionOnTerminal(t *testing.T) {
 	observer := commonresponses.NewStreamObserver()
 	observer.ObserveRawEvent(`data: {"type":"response.completed","sequence_number":0,"response":{"id":"resp_future_quality","status":"completed","output":[{"type":"image_generation_call","id":"img_future","status":"completed","quality":{"future":"quality"}}]}}` + "\n\n")
 
-	if err := observer.StreamCompletionError(); err != nil {
+	if err := observer.LifecycleError(); err != nil {
 		t.Fatalf("future output quality union must not invalidate terminal lifecycle: %v", err)
 	}
 	final := observer.FinalResponse()
@@ -638,7 +630,7 @@ func TestResponsesStreamObserverAcceptsNormalizedCodexEvents(t *testing.T) {
 	observer.ObserveRawEvent("event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_unterminated\",\"status\":\"in_progress\"}}\n\n")
 	observer.ObserveRawEvent("event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"id\":\"resp_unterminated\",\"status\":\"completed\"}}\n\n")
 
-	if err := observer.StreamCompletionError(); err != nil {
+	if err := observer.LifecycleError(); err != nil {
 		t.Fatalf("expected Codex-style unterminated event boundary to stay valid, got %v", err)
 	}
 	if final := observer.FinalResponse(); final == nil || final.ID != "resp_unterminated" || final.Status != "completed" {
@@ -651,15 +643,16 @@ func TestResponsesStreamObserverAcceptsRefusalContentPart(t *testing.T) {
 	observer.ObserveRawEvent(`data: {"type":"response.content_part.added","sequence_number":0,"output_index":0,"content_index":0,"item_id":"msg_1","part":{"type":"refusal","refusal":"cannot comply"}}` + "\n\n")
 	observer.ObserveRawEvent(`data: {"type":"response.completed","sequence_number":1,"response":{"id":"resp_1","status":"completed"}}` + "\n\n")
 
-	if err := observer.StreamCompletionError(); err != nil {
+	if err := observer.LifecycleError(); err != nil {
 		t.Fatalf("expected flat refusal content-part to be a valid provider event: %v", err)
 	}
 }
 
-func TestResponsesStreamObserverRejectsInvalidLifecycle(t *testing.T) {
+func TestResponsesStreamObserverOnlyRejectsResourceConflicts(t *testing.T) {
 	tests := []struct {
-		name   string
-		events []string
+		name      string
+		events    []string
+		wantError bool
 	}{
 		{
 			name:   "missing terminal",
@@ -674,11 +667,13 @@ func TestResponsesStreamObserverRejectsInvalidLifecycle(t *testing.T) {
 			events: []string{`data: {not-json}`},
 		},
 		{
-			name:   "terminal missing response id",
-			events: []string{`data: {"type":"response.completed","sequence_number":0,"response":{"status":"completed"}}`},
+			name:      "terminal missing response id",
+			wantError: true,
+			events:    []string{`data: {"type":"response.completed","sequence_number":0,"response":{"status":"completed"}}`},
 		},
 		{
-			name: "response id changes",
+			name:      "response id changes",
+			wantError: true,
 			events: []string{
 				`data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_a"}}`,
 				`data: {"type":"response.completed","sequence_number":1,"response":{"id":"resp_b","status":"completed"}}`,
@@ -692,7 +687,7 @@ func TestResponsesStreamObserverRejectsInvalidLifecycle(t *testing.T) {
 			for _, event := range tt.events {
 				observer.ObserveRawEvent(event + "\n\n")
 			}
-			if err := observer.StreamCompletionError(); err == nil {
+			if err := observer.LifecycleError(); (err != nil) != tt.wantError {
 				t.Fatal("expected invalid lifecycle to fail")
 			}
 		})
@@ -709,18 +704,15 @@ func TestResponsesStreamObserverTreatsProviderSequenceAndTailAsBestEffort(t *tes
 	} {
 		observer.ObserveRawEvent(event + "\n\n")
 	}
-	if err := observer.StreamCompletionError(); err != nil {
+	if err := observer.LifecycleError(); err != nil {
 		t.Fatalf("provider-owned sequence and trailing-event details must not invalidate exact-wire delivery: %v", err)
-	}
-	if observer.ReliableNextSequenceNumber() != nil {
-		t.Fatal("an unreliable provider sequence must not be reused for a synthetic event")
 	}
 }
 
 func TestResponsesStreamObserverAcceptsIncompleteTopLevelErrorEnvelope(t *testing.T) {
 	observer := commonresponses.NewStreamObserver()
 	observer.ObserveRawEvent("data: {\"type\":\"error\",\"future_detail\":true}\n\n")
-	if err := observer.StreamCompletionError(); err != nil {
+	if err := observer.LifecycleError(); err != nil {
 		t.Fatalf("top-level provider error must remain terminal without local field validation: %v", err)
 	}
 	if observer.TerminalKind() != commonresponses.StreamTerminalError {
@@ -771,11 +763,8 @@ func TestResponsesStreamConverterPreservesChatRefusalDelta(t *testing.T) {
 func TestResponsesStreamObserverAcceptsTopLevelErrorTerminal(t *testing.T) {
 	observer := commonresponses.NewStreamObserver()
 	observer.ObserveRawEvent(`data: {"type":"error","sequence_number":7,"code":"server_error","message":"failed","param":"model"}` + "\n\n")
-	if err := observer.StreamCompletionError(); err != nil {
+	if err := observer.LifecycleError(); err != nil {
 		t.Fatalf("expected valid error terminal, got %v", err)
-	}
-	if got := observer.ReliableNextSequenceNumber(); got == nil || *got != 8 {
-		t.Fatalf("expected next sequence number 8, got %v", got)
 	}
 	streamError := observer.TerminalError()
 	if streamError == nil || streamError.Code != "server_error" || streamError.Message != "failed" || streamError.Param == nil || *streamError.Param != "model" {
@@ -906,7 +895,7 @@ func TestResponsesStreamObserverKeepsTerminalIndependentFromUsageEvidence(t *tes
 	raw := "data: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":\"future-shape\"}}\n\n"
 	observer.ObserveRawEvent(raw)
 
-	if err := observer.StreamCompletionError(); err != nil {
+	if err := observer.LifecycleError(); err != nil {
 		t.Fatalf("valid terminal was rejected because usage was malformed: %v", err)
 	}
 	if !observer.TerminalSeen() || observer.TerminalKind() != commonresponses.StreamTerminalResponse {

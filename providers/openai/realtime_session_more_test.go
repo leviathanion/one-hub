@@ -725,7 +725,7 @@ func TestOpenAIResponsesWSSchemaInvalidProviderPayloadClosesAsProviderMalformed(
 	}
 }
 
-func TestOpenAIResponsesWSKnownTerminalBadResponseShapeClosesAsProviderMalformed(t *testing.T) {
+func TestOpenAIResponsesWSKnownTerminalOpaqueResponsePreservesWire(t *testing.T) {
 	server := newOpenAIRealtimeTestServer(t, func(conn *openAIRealtimeTestConn) {
 		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"response.completed","response":"opaque"}`)); err != nil {
 			t.Errorf("failed to write bad terminal provider event: %v", err)
@@ -746,8 +746,8 @@ func TestOpenAIResponsesWSKnownTerminalBadResponseShapeClosesAsProviderMalformed
 	if err != nil {
 		t.Fatalf("recv bad terminal provider event: %v", err)
 	}
-	if event.DetailOrigin != responsesws.RecvDetailOriginProviderMalformed || responsesws.PayloadOriginForDetailOrigin(event.DetailOrigin) != responsesws.PayloadOriginProxyLocal || !errors.Is(event.Err, responsesws.ErrInvalidProviderEventPayload) || event.Frame != nil {
-		t.Fatalf("expected provider_malformed proxy-local event for bad terminal shape, got %+v", event)
+	if event.DetailOrigin != responsesws.RecvDetailOriginProviderFrame || event.Err != nil || event.Frame == nil || string(event.Frame.Payload()) != `{"type":"response.completed","response":"opaque"}` {
+		t.Fatalf("无法投影的 terminal 应保持原帧, got %+v", event)
 	}
 }
 
@@ -2198,5 +2198,23 @@ func TestOpenAIResponsesWSUnknownSteeringControlPreservesWire(t *testing.T) {
 	result := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame([]byte(payload)))
 	if result.Err != nil || result.EmitFrame == nil || string(result.EmitFrame.Payload()) != payload || result.Usage != nil || result.CloseTransport {
 		t.Fatalf("control not transparent: %+v", result)
+	}
+}
+
+func TestOpenAIResponsesWSToolIdentityConflictPreservesWireAndIndependentTokens(t *testing.T) {
+	adapter := &openAIResponsesWSAdapter{}
+	adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame([]byte(`{"type":"response.created","response":{"id":"resp_conflict","tools":[{"type":"web_search"}]}}`)))
+	payload := []byte(`{"type":"response.output_item.done","item_id":"search_a","item":{"id":"search_b","type":"web_search_call","status":"completed","action":{"type":"search"}},"future":9007199254740993}`)
+	result := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame(payload))
+	if result.Err != nil || result.CloseTransport || result.EmitFrame == nil || string(result.EmitFrame.Payload()) != string(payload) || result.Usage == nil {
+		t.Fatalf("component conflict blocked raw delivery or lost diagnostic: %+v", result)
+	}
+	usage := result.Usage.ToChatUsage()
+	if !usage.HasExtraBillingConflict(types.APIToolTypeWebSearch) || usage.AttributionConflict || len(usage.ExtraBilling) != 0 {
+		t.Fatalf("tool conflict contaminated independent attribution: %+v", usage)
+	}
+	terminal := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame([]byte(`{"type":"response.completed","response":{"id":"resp_conflict","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`)))
+	if terminal.Err != nil || terminal.Usage == nil || !terminal.Usage.ProviderTokenEvidence || terminal.Usage.TotalTokens != 5 || terminal.Usage.AttributionConflict {
+		t.Fatalf("tool conflict prevented independent token evidence: %+v", terminal)
 	}
 }

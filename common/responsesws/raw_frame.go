@@ -39,6 +39,11 @@ func IsSteeringControlEvent(eventType string) bool {
 	}
 }
 
+// 辅助回执及其未来扩展不修改当前 Response 的使用量或序号。
+func IsAuxiliaryControlEvent(eventType string) bool {
+	return strings.HasPrefix(eventType, "response.steer.") || strings.HasPrefix(eventType, "response.inject.")
+}
+
 // ClientEventEnvelope is the minimal parsed shape of a client event.
 type ClientEventEnvelope struct {
 	Type    string
