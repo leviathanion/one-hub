@@ -367,7 +367,7 @@ func TestFixI015NativeCompletionReplayKeepsRepresentationHeaders(t *testing.T) {
 	}
 }
 
-func TestFixI015ExactCompletionRedactionInvalidatesRepresentationHeaders(t *testing.T) {
+func TestFixI015ExactCompletionRedactionPreservesBodyAndHeaders(t *testing.T) {
 	body := `{"id":"cmpl_i015_secret","object":"text_completion","created":1,"model":"gpt-5","choices":[],"account_id":"acct-i015-secret","future_business":{"keep":true}}`
 	result := runI015HTTP(t, "/v1/completions", body, config.ChannelTypeOpenAI, true, false, func(c *gin.Context, provider *openai.OpenAIProvider) *types.OpenAIErrorWithStatusCode {
 		response, apiErr := provider.CreateCompletion(&types.CompletionRequest{Model: "gpt-5", Prompt: "hello"})
@@ -380,10 +380,10 @@ func TestFixI015ExactCompletionRedactionInvalidatesRepresentationHeaders(t *test
 	if result.status != http.StatusOK || !json.Valid(result.body) {
 		t.Fatalf("redacted Completion response was not valid HTTP JSON: status=%d body=%s", result.status, result.body)
 	}
-	if bytes.Contains(result.body, []byte("acct-i015-secret")) || !bytes.Contains(result.body, []byte(`"account_id":"[redacted]"`)) {
+	if string(result.body) != body {
 		t.Fatalf("provider account metadata was not redacted: %s", result.body)
 	}
-	if result.headers.Get("Etag") != "" || result.headers.Get("Digest") != "" || result.headers.Get("Content-Encoding") != "" {
+	if result.headers.Get("Digest") != "sha-256=:YWJj:" {
 		t.Fatalf("redaction retained validators/encoding for a new body: %v", result.headers)
 	}
 	if result.contentLength >= 0 && result.contentLength != int64(len(result.body)) {

@@ -52,7 +52,7 @@ func TestUnmarshalBodyReusableRejectsTopLevelNullWithoutValidatorPanic(t *testin
 	}
 }
 
-func TestErrorWrapperRedactsTransportURLBeforeLogging(t *testing.T) {
+func TestErrorWrapperKeepsTransportDetailInLogOnly(t *testing.T) {
 	err := &url.Error{
 		Op:  "Post",
 		URL: "https://open.feishu.cn/open-apis/bot/v2/hook/webhook-secret?access_token=query-secret&sign=signature-secret",
@@ -66,13 +66,8 @@ func TestErrorWrapperRedactsTransportURLBeforeLogging(t *testing.T) {
 	if len(entries) != 1 {
 		t.Fatalf("expected one latest transport log, got %d", len(entries))
 	}
-	for _, secret := range []string{"webhook-secret", "query-secret", "signature-secret", "open.feishu.cn"} {
-		if strings.Contains(entries[0].Message, secret) {
-			t.Fatalf("transport log leaked %q: %s", secret, entries[0].Message)
-		}
-	}
-	if !strings.Contains(entries[0].Message, "[redacted]") {
-		t.Fatalf("expected transport URL redaction marker, got %s", entries[0].Message)
+	if !strings.Contains(entries[0].Message, err.Error()) {
+		t.Fatalf("系统日志丢失原始传输错误: %s", entries[0].Message)
 	}
 }
 

@@ -3,6 +3,7 @@ package realtime
 import (
 	"context"
 	"errors"
+	"one-api/common/providerresponse"
 
 	runtimesession "one-api/runtime/session"
 	"one-api/types"
@@ -130,6 +131,8 @@ type ProviderClose struct {
 }
 
 type RecvEvent struct {
+	// Credentials 绑定产生该消息的物理连接，避免重连后使用新凭据检查旧消息。
+	Credentials   *providerresponse.CredentialSnapshot
 	Frame         *Frame
 	ProviderClose *ProviderClose
 	Usage         *types.UsageEvent

@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	"one-api/common"
-	"one-api/common/providerresponse"
 	"one-api/types"
 )
 
@@ -37,5 +36,5 @@ func ChatTerminalError(response *types.OpenAIResponsesResponses) *types.OpenAIEr
 		apiErr.Param = response.IncompleteDetail.Reason
 	}
 	apiErr.UpstreamAccepted = true
-	return providerresponse.SanitizeAPIError(apiErr)
+	return apiErr
 }

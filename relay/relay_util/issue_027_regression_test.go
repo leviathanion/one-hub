@@ -111,7 +111,7 @@ func TestI027ClaudeThinkingThenTextReachesResponsesCompleted(t *testing.T) {
 		t.Fatalf("创建 Claude Chat stream 失败：%+v", apiErr)
 	}
 	store := false
-	converter := NewOpenAIResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: request.Model, Stream: true, Store: &store}, provider.GetUsage())
+	converter := newTestResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: request.Model, Stream: true, Store: &store}, provider.GetUsage())
 	collectI027ClaudeChatIntoResponses(t, stream, converter)
 	if requests.Load() != 1 {
 		t.Fatalf("上游请求次数=%d，期望1次", requests.Load())
@@ -150,7 +150,7 @@ func TestI027ClaudePlainTextStreamReachesResponsesCompleted(t *testing.T) {
 		t.Fatalf("创建 Claude plain stream 失败：%+v", apiErr)
 	}
 	store := false
-	converter := NewOpenAIResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: request.Model, Stream: true, Store: &store}, provider.GetUsage())
+	converter := newTestResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: request.Model, Stream: true, Store: &store}, provider.GetUsage())
 	collectI027ClaudeChatIntoResponses(t, stream, converter)
 	completed := mustUnmarshalEvent(t, parseSSEEvents(t, recorder.Body.String()), "response.completed")
 	if completed.Response == nil || completed.Response.Status != types.ResponseStatusCompleted || len(completed.Response.Output) != 1 || completed.Response.Output[0].Type != types.InputTypeMessage {
@@ -183,7 +183,7 @@ func TestI027ClaudeInterleavedTextAndToolsReachResponsesCompleted(t *testing.T) 
 		t.Fatalf("创建 Claude interleaved stream 失败：%+v", apiErr)
 	}
 	store := false
-	converter := NewOpenAIResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: request.Model, Stream: true, Store: &store}, provider.GetUsage())
+	converter := newTestResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: request.Model, Stream: true, Store: &store}, provider.GetUsage())
 	collectI027ClaudeChatIntoResponses(t, stream, converter)
 	if requests.Load() != 1 {
 		t.Fatalf("上游请求次数=%d，期望1次", requests.Load())
@@ -235,7 +235,7 @@ func TestI027ClaudeAdjacentToolsReachResponsesCompleted(t *testing.T) {
 		t.Fatalf("创建 Claude adjacent tools stream 失败：%+v", apiErr)
 	}
 	store := false
-	converter := NewOpenAIResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: request.Model, Stream: true, Store: &store}, provider.GetUsage())
+	converter := newTestResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: request.Model, Stream: true, Store: &store}, provider.GetUsage())
 	collectI027ClaudeChatIntoResponses(t, stream, converter)
 	if requests.Load() != 1 {
 		t.Fatalf("上游请求次数=%d，期望1次", requests.Load())
@@ -261,7 +261,7 @@ func TestI027ResponsesConverterStillRejectsTrueMultipleChoices(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodGet, "/", nil)
-	converter := NewOpenAIResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: "claude-i027"}, &types.Usage{})
+	converter := newTestResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: "claude-i027"}, &types.Usage{})
 	err := converter.ProcessStreamData(`{"id":"chatcmpl_i027","choices":[{"index":0,"delta":{"content":"one"}},{"index":1,"delta":{"content":"two"}}]}`)
 	if err == nil || !strings.Contains(err.Error(), "multiple choices") {
 		t.Fatalf("真正多 choice 未被 Responses converter 拒绝：%v", err)

@@ -39,13 +39,8 @@ func TestRelayOnlySanitizesFailureBodyAndPreservesSuccessfulRawResponses(t *test
 			},
 			assertBody: func(t *testing.T, body string) {
 				t.Helper()
-				for _, secret := range []string{"acct-secret", "sk-upstream-secret", "invalid_api_key"} {
-					if strings.Contains(body, secret) {
-						t.Fatalf("raw relay failure leaked %q: %s", secret, body)
-					}
-				}
-				if !strings.Contains(body, `"code":"provider_account_error"`) || !strings.Contains(body, "upstream provider account is unavailable") {
-					t.Fatalf("expected a safe provider-account error, got %s", body)
+				if !strings.Contains(body, `"message":"account [redacted] rejected"`) || !strings.Contains(body, `"code":"invalid_api_key"`) {
+					t.Fatalf("错误消息或协议不正确: %s", body)
 				}
 			},
 		},

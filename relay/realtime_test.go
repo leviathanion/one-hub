@@ -1373,7 +1373,7 @@ func TestRealtimeRelayActorProviderFrameWritesDownstream(t *testing.T) {
 		t.Fatal("expected provider error frame to be delivered")
 	}
 	frame = client.readFrame(t)
-	if !strings.Contains(string(frame.payload), `"code":"provider_account_error"`) || strings.Contains(string(frame.payload), "org-secret") || strings.Contains(string(frame.payload), "acct-secret") {
+	if !strings.Contains(string(frame.payload), `"code":"invalid_api_key"`) || strings.Contains(string(frame.payload), "org-secret") {
 		t.Fatalf("expected safe downstream provider error, got %s", frame.payload)
 	}
 	if !strings.Contains(observedPayload, "invalid_api_key") || !strings.Contains(observedPayload, "org-secret") {

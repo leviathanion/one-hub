@@ -14,7 +14,7 @@ import (
 	"one-api/types"
 )
 
-func TestExactEmbeddingRedirectDoesNotExposeInjectedCredential(t *testing.T) {
+func TestExactEmbeddingRedirectPreservesBodyAndTarget(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
@@ -37,12 +37,7 @@ func TestExactEmbeddingRedirectDoesNotExposeInjectedCredential(t *testing.T) {
 	if apiErr == nil || apiErr.StatusCode != http.StatusTemporaryRedirect || !apiErr.ReplayRawResponse || calls.Load() != 1 {
 		t.Fatalf("redirect was followed or lost: calls=%d err=%+v", calls.Load(), apiErr)
 	}
-	if strings.Contains(string(apiErr.RawBody), "provider-secret-123") || apiErr.ResponseHeaders.Get("Location") != "" {
-		t.Fatalf("redirect exposes provider credential: body=%q headers=%v", apiErr.RawBody, apiErr.ResponseHeaders)
-	}
-	for _, name := range []string{"Content-Length", "Content-Encoding", "Content-Range", "Etag", "Digest"} {
-		if apiErr.ResponseHeaders.Get(name) != "" {
-			t.Fatalf("rewritten body retains %s", name)
-		}
+	if string(apiErr.RawBody) != `{"debug":"Bearer provider-secret-123"}` || apiErr.ResponseHeaders.Get("Location") != "/result/provider-secret-123" || apiErr.ResponseHeaders.Get("Digest") != "original" {
+		t.Fatalf("脱敏干扰重定向: body=%q headers=%v", apiErr.RawBody, apiErr.ResponseHeaders)
 	}
 }

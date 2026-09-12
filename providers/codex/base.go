@@ -203,7 +203,7 @@ func (p *CodexProvider) rebuildRequesterWithAccessToken(accessToken string) {
 }
 
 func (p *CodexProvider) rebuildRequesterLocked(accessToken string) {
-	p.Requester = requester.NewHTTPRequester(channelProxyValue(p.Channel), RequestErrorHandle(accessToken))
+	p.SetRequester(requester.NewHTTPRequester(channelProxyValue(p.Channel), RequestErrorHandle(accessToken)))
 }
 
 func (p *CodexProvider) syncRuntimeChannel(channel *model.Channel) {

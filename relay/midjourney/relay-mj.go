@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"one-api/common"
+	"one-api/common/providerresponse"
 	"one-api/middleware"
 	"one-api/model"
 	"one-api/providers"
@@ -43,7 +44,7 @@ func coverMidjourneyTaskDto(originTask *model.Midjourney) (midjourneyTask provid
 
 	midjourneyTask.ImageUrl = originTask.ImageUrl
 	midjourneyTask.Status = originTask.Status
-	midjourneyTask.FailReason = originTask.FailReason
+	midjourneyTask.FailReason = providerresponse.SanitizeErrorText(originTask.FailReason)
 	midjourneyTask.Action = originTask.Action
 	midjourneyTask.Description = originTask.Description
 	midjourneyTask.Prompt = originTask.Prompt

@@ -2,7 +2,6 @@ package relay
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -12,7 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"one-api/common"
 	"one-api/common/logger"
-	"one-api/common/providerresponse"
+	"one-api/common/requestctx"
 	"one-api/common/requester"
 	commonresponses "one-api/common/responses"
 	"one-api/relay/relay_util"
@@ -55,6 +54,7 @@ func responseResponsesStreamClient(c *gin.Context, stream commonresponses.EventS
 		ctx = ioOwner.ctx
 		defer ioOwner.WatchStream(stream)()
 	}
+	credentials := requestctx.ProviderCredentials(c)
 	framer := newResponsesSSEEventFramer(responsesStreamMaxEventBytes)
 	var firstResponseTime time.Time
 	var failure *types.OpenAIErrorWithStatusCode
@@ -107,15 +107,7 @@ func responseResponsesStreamClient(c *gin.Context, stream commonresponses.EventS
 		if failure != nil {
 			return
 		}
-		// 脱敏依赖完整 JSON；解析失败不能当作无需脱敏，不校验上游字段 schema。
-		if payload, hasData := commonresponses.SSEDataPayload(raw); hasData {
-			payload = strings.TrimSpace(payload)
-			if payload != "" && payload != "[DONE]" && !json.Valid([]byte(payload)) {
-				fail(common.StringErrorWrapperLocal("provider stream payload cannot be safely redacted", "invalid_provider_response", http.StatusBadGateway))
-				return
-			}
-		}
-		raw = sanitizeProviderSSEEvent(raw)
+		raw = redactProviderSSEEvent(raw, credentials...)
 		if ownerPersisted {
 			write(raw)
 			return
@@ -183,7 +175,7 @@ func responseResponsesStreamClient(c *gin.Context, stream commonresponses.EventS
 		if failure != nil {
 			if c.Writer.Written() {
 				c.Set(responsesStreamErrorAlreadyRenderedContextKey, true)
-				logger.LogError(c.Request.Context(), "Responses stream interrupted: "+common.RedactSensitiveText(failure.Message))
+				logger.LogError(c.Request.Context(), "Responses stream interrupted: "+failure.Message)
 				// HTTP ingress 在返回本地失败后中止已提交响应。
 			}
 			return firstResponseTime, failure
@@ -245,7 +237,7 @@ func responsesProviderTerminalError(c *gin.Context, observer *commonresponses.St
 		apiErr.Param = *streamError.Param
 	}
 	c.Set(responsesStreamErrorAlreadyRenderedContextKey, true)
-	return providerresponse.SanitizeAPIError(apiErr)
+	return apiErr
 }
 
 func responsesStreamClientCanceledError() *types.OpenAIErrorWithStatusCode {

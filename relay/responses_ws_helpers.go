@@ -31,11 +31,7 @@ func responsesWSSafeErrorDiagnostic(err error) string {
 	if err == nil {
 		return ""
 	}
-	return responsesWSRedactAndLimitDiagnostic(err.Error())
-}
-
-func responsesWSRedactAndLimitDiagnostic(message string) string {
-	return responsesWSSafeDiagnosticValue(responsesws.RedactSensitiveText(message))
+	return responsesWSSafeDiagnosticValue(err.Error())
 }
 
 func responsesWSErrorPayloadWithParam(status int, code string, message string, param string) []byte {
@@ -155,7 +151,7 @@ func responsesWSErrorFromErr(err error) []byte {
 		return responsesWSErrorPayload(http.StatusBadGateway, code, message)
 	}
 	logCtx := context.Background()
-	logger.LogError(logCtx, "responses websocket upstream error: "+err.Error())
+	logger.LogError(logCtx, "responses websocket upstream error: "+responsesWSSafeErrorDiagnostic(err))
 	return responsesWSErrorPayload(http.StatusBadGateway, "upstream_error", responsesWSStaticErrorMessage("upstream_error"))
 }
 

@@ -24,12 +24,12 @@ import (
 )
 
 type OpenAIResponsesStreamHandler struct {
-	Usage              *types.Usage
-	Prefix             string
-	Model              string
-	ProviderCredential string
-	ServiceTier        string
-	MessageID          string
+	Usage  *types.Usage
+	Prefix string
+	Model  string
+
+	ServiceTier string
+	MessageID   string
 
 	searchType         string
 	searchServiceType  string
@@ -198,10 +198,9 @@ func (p *OpenAIProvider) createResponsesStreamFromRequestWithOptions(req *http.R
 	p.captureProviderResponseHeaders(resp)
 
 	chatHandler := OpenAIResponsesStreamHandler{
-		Usage:              p.Usage,
-		Prefix:             `data: `,
-		Model:              request.Model,
-		ProviderCredential: p.Channel.Key,
+		Usage:  p.Usage,
+		Prefix: `data: `,
+		Model:  request.Model,
 	}
 
 	if request.ConvertChat {
@@ -598,7 +597,7 @@ func (p *OpenAIProvider) buildCompactResponsesRequest(rawReq *commonresponses.Re
 }
 
 func (h *OpenAIResponsesStreamHandler) HandlerResponsesStreamWithEmitter(rawLine *[]byte, emitter requester.StreamEmitter[string]) {
-	emitter.SendData(h.safeProviderEvent(string(*rawLine)))
+	emitter.SendData(string(*rawLine))
 }
 
 func (h *OpenAIResponsesStreamHandler) ObserveResponsesEvent(rawEvent string) error {
@@ -669,11 +668,6 @@ func responsesUsageTrackingError(err error) error {
 	return common.ErrorWrapperLocal(err, commonresponses.ResponsesStreamTrackingFailureCode(err), http.StatusBadGateway)
 }
 
-func (h *OpenAIResponsesStreamHandler) safeProviderEvent(event string) string {
-	safe, _ := common.RedactCredentialValuesText(event, h.ProviderCredential)
-	return safe
-}
-
 func (h *OpenAIResponsesStreamHandler) sseDataPayload(rawLine []byte) ([]byte, bool) {
 	prefix := []byte(strings.TrimSpace(h.Prefix))
 	if len(prefix) == 0 {
@@ -725,9 +719,6 @@ func (h *OpenAIResponsesStreamHandler) handleChatStream(rawLine *[]byte, dataCha
 		*rawLine = nil
 		return
 	}
-	if safe, changed := common.RedactCredentialValuesText(string(payload), h.ProviderCredential); changed {
-		payload = []byte(safe)
-	}
 	*rawLine = payload
 
 	var openaiResponse types.OpenAIResponsesStreamResponses
@@ -775,7 +766,7 @@ func (h *OpenAIResponsesStreamHandler) handleChatStream(rawLine *[]byte, dataCha
 	switch openaiResponse.Type {
 	case types.EventTypeError:
 		apiErr := runtimesession.ProviderAPIErrorFromPayload(*rawLine)
-		safeErr := providerresponse.SanitizeAPIError(apiErr)
+		safeErr := apiErr
 		if safeErr != nil {
 			safeErr.UpstreamAccepted = safeErr.UpstreamAccepted || providerAccepted
 		}

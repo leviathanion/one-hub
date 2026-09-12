@@ -15,6 +15,7 @@ import (
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/logger"
+	"one-api/common/providerresponse"
 	"one-api/common/requester"
 	commonresponses "one-api/common/responses"
 	"one-api/common/responsesws"
@@ -744,9 +745,9 @@ func responsesWSFrameDiagnosticsFromRaw(raw []byte) responsesWSFrameDiagnostics 
 	if err := json.Unmarshal(raw, &object); err != nil {
 		return diag
 	}
-	diag.EventType = responsesWSRedactAndLimitDiagnostic(jsonStringField(object, "type"))
-	diag.Model = responsesWSRedactAndLimitDiagnostic(jsonStringField(object, "model"))
-	diag.PreviousResponse = responsesWSRedactAndLimitDiagnostic(jsonStringField(object, "previous_response_id"))
+	diag.EventType = responsesWSSafeDiagnosticValue(jsonStringField(object, "type"))
+	diag.Model = responsesWSSafeDiagnosticValue(jsonStringField(object, "model"))
+	diag.PreviousResponse = responsesWSSafeDiagnosticValue(jsonStringField(object, "previous_response_id"))
 	diag.Generate = jsonBoolPresence(object, "generate")
 
 	var metadata map[string]json.RawMessage
@@ -762,7 +763,7 @@ func responsesWSFrameDiagnosticsFromRaw(raw []byte) responsesWSFrameDiagnostics 
 			diag.ParentThreadHash = responsesWSDiagnosticHash(parentThreadID)
 			turnMetadata := jsonStringField(metadata, "x-codex-turn-metadata")
 			diag.TurnMetadataBytes = len(turnMetadata)
-			diag.TurnRequestKind = responsesWSRedactAndLimitDiagnostic(responsesWSTurnRequestKind(turnMetadata))
+			diag.TurnRequestKind = responsesWSSafeDiagnosticValue(responsesWSTurnRequestKind(turnMetadata))
 		}
 	}
 	return diag
@@ -2816,7 +2817,7 @@ func (a *ResponsesWSSessionActor) handleProviderDownstreamWithObservation(event 
 		attempt := a.currentTurnAttempt()
 		responseID := responsesWSProviderDownstreamResponseID(event)
 		if attempt == nil || !a.providerResponseEvidenceMatches(event.AttemptID, responseID) || (responseID != "" && attempt.SeenProviderResponseID != "" && responseID != attempt.SeenProviderResponseID) {
-			if err := a.emitProviderFrameForAttempt(nil, responsesws.NewTextFrame(sanitizeProviderJSONPayload(event.Frame.Payload())), "provider_workflow_stop"); err != nil {
+			if err := a.emitProviderFrameForAttempt(nil, responsesws.NewTextFrame(event.Frame.Payload()), "provider_workflow_stop"); err != nil {
 				a.close("client_write_failed")
 			}
 			return
@@ -2836,7 +2837,7 @@ func (a *ResponsesWSSessionActor) handleProviderDownstreamWithObservation(event 
 		attempt := a.currentTurnAttempt()
 		if classified.ConnectionError && attempt == nil {
 			a.stopNewWork()
-			if err := a.emitProviderFrameForAttempt(nil, responsesws.NewTextFrame(sanitizeProviderJSONPayload(event.Frame.Payload())), "provider_connection_error"); err != nil {
+			if err := a.emitProviderFrameForAttempt(nil, responsesws.NewTextFrame(event.Frame.Payload()), "provider_connection_error"); err != nil {
 				a.close("client_write_failed")
 				return
 			}
@@ -2848,7 +2849,7 @@ func (a *ResponsesWSSessionActor) handleProviderDownstreamWithObservation(event 
 		unassociatedError := classified.RequestError && responseID == "" && !responsesWSExplicitCreateRejection(classified, attempt)
 		idleDiagnostic := attempt == nil && !responsesWSResourceLifecycleEvent(classified.EventType)
 		if !workflowStop && !classified.ConnectionError && (oldResponse || unassociatedError || idleDiagnostic) {
-			if err := a.emitProviderFrameForAttempt(nil, responsesws.NewTextFrame(sanitizeProviderJSONPayload(event.Frame.Payload())), "provider_diagnostic"); err != nil {
+			if err := a.emitProviderFrameForAttempt(nil, responsesws.NewTextFrame(event.Frame.Payload()), "provider_diagnostic"); err != nil {
 				a.close("client_write_failed")
 			}
 			return
@@ -2889,7 +2890,7 @@ func (a *ResponsesWSSessionActor) handleProviderDownstreamWithObservation(event 
 		switch responseIDDecision {
 		case responsesWSProviderResponseIDStaleFinalized:
 			if event.Frame != nil {
-				if err := a.emitProviderFrameForAttempt(nil, responsesws.NewTextFrame(sanitizeProviderJSONPayload(payload)), "provider_late_frame"); err != nil {
+				if err := a.emitProviderFrameForAttempt(nil, responsesws.NewTextFrame(payload), "provider_late_frame"); err != nil {
 					a.close("client_write_failed")
 				}
 			}
@@ -3030,7 +3031,7 @@ func (a *ResponsesWSSessionActor) handleProviderDownstreamWithObservation(event 
 	if !a.ensureProviderResponseDelivery(writeAttempt, event) {
 		return
 	}
-	deliveryPayload := sanitizeProviderJSONPayload(payload)
+	deliveryPayload := payload
 	if err := a.emitProviderFrameForAttempt(writeAttempt, responsesws.NewTextFrame(deliveryPayload), "provider_text_frame"); err != nil {
 		a.close("client_write_failed")
 		return
@@ -3265,7 +3266,11 @@ func (a *ResponsesWSSessionActor) handleProviderMalformedRecvFailed(event Respon
 }
 
 func (a *ResponsesWSSessionActor) handleProviderClosed(event ResponsesWSEventProviderClosed) {
-	event.Reason = responsesws.RedactSensitiveText(event.Reason)
+	var credentials []string
+	if source, ok := a.upstream.session.(providerresponse.CredentialSource); ok {
+		credentials = source.ProviderCredentials()
+	}
+	event.Reason = common.SafeClientErrorText(event.Reason, credentials...)
 	if event.UpstreamSessionGeneration == "" && a.upstream.sessionGeneration != "" {
 		a.logIgnoredProviderEvent("provider_closed_missing_generation", event.ChannelID, event.DetailOrigin, event.DetailPhase)
 		return
@@ -3763,6 +3768,15 @@ func (a *ResponsesWSSessionActor) emitProxyLocalForAttempt(attempt *ResponsesWST
 func (a *ResponsesWSSessionActor) emitProviderFrameForAttempt(attempt *ResponsesWSTurnAttempt, frame responsesws.Frame, reason string) error {
 	if a == nil || a.io.pump == nil || frame.IsZero() {
 		return nil
+	}
+	if frame.Kind() == responsesws.FrameKindText {
+		var credentials []string
+		if source, ok := a.upstream.session.(providerresponse.CredentialSource); ok {
+			credentials = source.ProviderCredentials()
+		}
+		if payload, changed := providerresponse.SanitizeErrorPayload(frame.Payload(), credentials...); changed {
+			frame = responsesws.NewTextFrame(payload)
+		}
 	}
 	return a.emitDownstream(attempt, DownstreamCommitProviderFrame, frame, ResponsesWSWriteProvider, reason)
 }

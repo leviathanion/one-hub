@@ -158,14 +158,8 @@ func TestCodexRealtimeHelperFunctionsAndCompatibilityHeaders(t *testing.T) {
 
 	sensitiveErrorPayload := []byte(`{"type":"error","error":{"message":"authorization=Bearer supplier-secret","access_token":"provider-secret","account_id":"acct-secret","organization_id":"org-secret","project_id":"proj-secret","tenant_id":"tenant-secret","secret":"shared-secret","credential":"shared-credential","credentials":"shared-credentials"},"response":{"id":"resp_error_2"}}`)
 	shouldContinue, usage, rewritten, err = provider.handleCodexSupplierMessage(wsconn.TextMessage, sensitiveErrorPayload, nil)
-	if !shouldContinue || usage != nil || len(rewritten) == 0 || err != nil {
-		t.Fatalf("expected sensitive provider error event to be rewritten, continue=%v usage=%+v rewritten=%s err=%v", shouldContinue, usage, rewritten, err)
-	}
-	if strings.Contains(string(rewritten), "supplier-secret") || strings.Contains(string(rewritten), "provider-secret") || strings.Contains(string(rewritten), "acct-secret") || strings.Contains(string(rewritten), "org-secret") || strings.Contains(string(rewritten), "proj-secret") || strings.Contains(string(rewritten), "tenant-secret") || strings.Contains(string(rewritten), "shared-secret") || strings.Contains(string(rewritten), "shared-credential") || strings.Contains(string(rewritten), "shared-credentials") {
-		t.Fatalf("provider credentials leaked in rewritten error payload: %s", rewritten)
-	}
-	if !strings.Contains(string(rewritten), `"type":"error"`) || !strings.Contains(string(rewritten), `"id":"resp_error_2"`) {
-		t.Fatalf("safe provider error fields were lost: %s", rewritten)
+	if !shouldContinue || usage != nil || rewritten != nil || err != nil {
+		t.Fatalf("观察器不应改写交付数据: continue=%v usage=%+v rewritten=%s err=%v", shouldContinue, usage, rewritten, err)
 	}
 }
 
@@ -398,20 +392,27 @@ func TestCodexRealtimeConnectionPlanningAndDialPaths(t *testing.T) {
 		}
 	})
 
-	t.Run("handshake diagnostic log redacts response body secrets", func(t *testing.T) {
+	t.Run("handshake diagnostic log preserves response body", func(t *testing.T) {
 		message := codexRealtimeWSDialFailureLogMessage(&wsconn.DialError{
 			URL:         "wss://provider.example/backend-api/codex/responses",
 			StatusCode:  http.StatusBadGateway,
 			BodySnippet: []byte(`{"error":{"code":"upstream_failed","message":"Authorization: Bearer sk-provider-secret-12345","account_id":"acct-secret","debug_url":"https://internal.example/private"}}`),
 			Err:         errors.New("websocket: bad handshake"),
 		})
-		for _, forbidden := range []string{"sk-provider-secret", "acct-secret", "internal.example", "Bearer"} {
-			if strings.Contains(message, forbidden) {
-				t.Fatalf("handshake body leaked %q: %s", forbidden, message)
+		for _, expected := range []string{"sk-provider-secret", "acct-secret", "internal.example", "Bearer", "upstream_failed"} {
+			if !strings.Contains(message, expected) {
+				t.Fatalf("系统日志丢失诊断 %q: %s", expected, message)
 			}
 		}
-		if !strings.Contains(message, "upstream_failed") || !strings.Contains(message, "[redacted]") {
-			t.Fatalf("expected useful error code and redaction marker, got %s", message)
+	})
+
+	t.Run("handshake diagnostic bounds raw fields", func(t *testing.T) {
+		field := strings.Repeat("x", codexRealtimeDiagnosticValueLogLimit-8) + "provider-secret-crossing-log-limit"
+		message := codexRealtimeWSDialFailureLogMessage(&wsconn.DialError{
+			StatusCode: 502, Header: http.Header{"X-Request-Id": {field}}, Err: errors.New(field),
+		})
+		if !strings.Contains(message, field[:codexRealtimeDiagnosticValueLogLimit]+"...(truncated)") {
+			t.Fatalf("日志未保留限长字段: %s", message)
 		}
 	})
 

@@ -108,12 +108,16 @@ func (r *relayGeminiOnly) send() (err *types.OpenAIErrorWithStatusCode, done boo
 		}
 
 		providerErrorDelivered := false
-		observe := func(event string) {
+		onDelivered := func(event string) {
 			providerErrorDelivered = providerErrorDelivered || sseEventContainsError([]byte(event))
 		}
-		firstResponseTime, streamErr := responseGeneralStreamClientWithObserverResult(r.c, response, nil, observe, sanitizeProviderSSEEvent, false)
+		firstResponseTime, streamErr := responseGeneralStreamClientWithObserverResult(r.c, response, nil, onDelivered, providerSSETransform(r.c), false)
 		r.SetFirstResponseTime(firstResponseTime)
 		if streamErr != nil {
+			var providerErr *types.OpenAIErrorWithStatusCode
+			if errors.As(streamErr, &providerErr) && providerErr != nil && providerErr.LocalError {
+				return providerErr, true
+			}
 			if providerErrorDelivered {
 				r.c.Set(streamErrorAlreadyRenderedContextKey, true)
 			} else if r.c.Request.Context().Err() == nil {
@@ -121,7 +125,6 @@ func (r *relayGeminiOnly) send() (err *types.OpenAIErrorWithStatusCode, done boo
 				r.c.Writer.Flush()
 				r.c.Set(streamErrorAlreadyRenderedContextKey, true)
 			}
-			var providerErr *types.OpenAIErrorWithStatusCode
 			if errors.As(streamErr, &providerErr) && providerErr != nil {
 				return providerErr, true
 			}

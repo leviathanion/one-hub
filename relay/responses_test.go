@@ -1432,9 +1432,9 @@ func TestRelayResponsesChatToResponsesStreamErrorIsClientSafe(t *testing.T) {
 	if streamLog == "" {
 		t.Fatal("expected stream error to be logged")
 	}
-	for _, forbidden := range []string{"secret-token", "query-secret", "provider.example", "url-secret", "session-secret", "sk-testSECRET123"} {
-		if strings.Contains(streamLog, forbidden) {
-			t.Fatalf("expected stream error log to redact %q, got %q", forbidden, streamLog)
+	for _, expected := range []string{"secret-token", "query-secret", "provider.example", "url-secret", "session-secret", "sk-testSECRET123"} {
+		if !strings.Contains(streamLog, expected) {
+			t.Fatalf("系统日志丢失原始诊断 %q: %q", expected, streamLog)
 		}
 	}
 }
@@ -1995,5 +1995,74 @@ func TestRelayResponsesFutureUnionRequiresNonCrossProtocolPath(t *testing.T) {
 	}
 	if err := exactRelay.validateSelectedProviderRequest(); err != nil {
 		t.Fatalf("expected exact-wire provider to accept the raw future union: %v", err)
+	}
+}
+
+func TestProviderRedactionChatToResponsesPreservesBody(t *testing.T) {
+	for _, test := range []struct{ name, delta, event string }{
+		{"text", `{"role":"assistant","content":"provider-secret-12345"}`, "response.output_text"},
+		{"tool", `{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"test","arguments":"{\"key\":\"provider-secret-12345\"}"}}]}`, "response.function_call_arguments"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			enableResponsesTestDeadline(ctx)
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			requestctx.SetProviderCredentials(ctx, []string{"provider-secret-12345"})
+			r := &relayResponses{relayBase: relayBase{c: ctx, provider: &compatibleResponsesChatProvider{BaseProvider: providersBase.BaseProvider{Channel: &model.Channel{}, Usage: &types.Usage{}}}}, responsesRequest: types.OpenAIResponsesRequest{Model: "gpt-5"}}
+			stream := &fakeRelayStream{dataChan: make(chan string, 1), errChan: make(chan error)}
+			stream.dataChan <- `{"id":"chat_1","choices":[{"index":0,"delta":` + test.delta + `}]}`
+			close(stream.dataChan)
+			close(stream.errChan)
+			_, final, err := r.chatToResponseStreamClient(stream)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := recorder.Body.String()
+			if !strings.Contains(body, "provider-secret-12345") {
+				t.Fatalf("转换正文被脱敏改变: %s", body)
+			}
+			for _, event := range []string{test.event + ".delta", test.event + ".done", "response.completed"} {
+				if !strings.Contains(body, "event: "+event+"\n") {
+					t.Fatalf("转换事件缺失 %s: %s", event, body)
+				}
+			}
+			rawFinal, _ := json.Marshal(final)
+			if !strings.Contains(string(rawFinal), "provider-secret-12345") {
+				t.Fatalf("交付脱敏修改了内部聚合证据: %s", rawFinal)
+			}
+		})
+	}
+}
+
+func TestProviderRedactionConvertedMetadataDoesNotBlockDelivery(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	requestctx.SetProviderCredentials(ctx, []string{"provider-secret"})
+	r := &relayResponses{relayBase: relayBase{c: ctx, provider: &compatibleResponsesChatProvider{BaseProvider: providersBase.BaseProvider{Channel: &model.Channel{}, Usage: &types.Usage{}}}}, responsesRequest: types.OpenAIResponsesRequest{Metadata: map[string]string{"provider-secret": "value"}}}
+	stream := &fakeRelayStream{dataChan: make(chan string, 1), errChan: make(chan error)}
+	stream.dataChan <- `{"id":"chat_1","choices":[{"index":0,"delta":{"content":"hello"}}]}`
+	close(stream.dataChan)
+	close(stream.errChan)
+	_, final, err := r.chatToResponseStreamClient(stream)
+	if err != nil || final == nil || recorder.Code != 200 || !strings.Contains(recorder.Body.String(), "provider-secret") {
+		t.Fatalf("正文 key 与凭据相同不应拒绝: body=%q err=%v", recorder.Body.String(), err)
+	}
+}
+
+func TestProviderRedactionDoesNotBlockConvertedErrorDelivery(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	requestctx.SetProviderCredentials(ctx, []string{"sequence_number"})
+	r := &relayResponses{relayBase: relayBase{c: ctx, provider: &compatibleResponsesChatProvider{BaseProvider: providersBase.BaseProvider{Channel: &model.Channel{}, Usage: &types.Usage{}}}}}
+	stream := &fakeRelayStream{dataChan: make(chan string), errChan: make(chan error, 1)}
+	close(stream.dataChan)
+	stream.errChan <- errors.New("upstream interrupted")
+	close(stream.errChan)
+	_, _, err := r.chatToResponseStreamClient(stream)
+	if err == nil || !ctx.Writer.Written() || !ctx.GetBool(responsesStreamErrorAlreadyRenderedContextKey) || !strings.Contains(recorder.Body.String(), "stream interrupted") {
+		t.Fatalf("脱敏不应拒绝错误事件交付: body=%q err=%v", recorder.Body.String(), err)
 	}
 }

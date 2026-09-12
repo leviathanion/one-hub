@@ -13,6 +13,7 @@ import (
 	"one-api/common/authutil"
 	"one-api/common/config"
 	"one-api/common/logger"
+	"one-api/common/providerresponse"
 	realtimeprotocol "one-api/common/realtime"
 	"one-api/common/requestctx"
 	"one-api/common/requester"
@@ -80,6 +81,7 @@ type openAIRealtimeTurnSelection struct {
 }
 
 type openAIRealtimeSession struct {
+	credentials []string
 	provider    *OpenAIProvider
 	model       string
 	models      runtimesession.ModelBinding
@@ -132,7 +134,7 @@ func (p *OpenAIProvider) OpenRealtimeSession(modelName string) (runtimerealtime.
 }
 
 func (p *OpenAIProvider) OpenRealtimeSessionWithOptions(modelName string, options runtimerealtime.RealtimeOpenOptions) (runtimerealtime.RealtimeSession, *types.OpenAIErrorWithStatusCode) {
-	conn, errWithCode := p.openRealtimeConnWithContext(options.Context, modelName)
+	conn, credentials, errWithCode := p.openRealtimeConnWithCredentials(options.Context, modelName)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -143,6 +145,7 @@ func (p *OpenAIProvider) OpenRealtimeSessionWithOptions(modelName string, option
 		return nil, sessionIDErr
 	}
 	session := &openAIRealtimeSession{
+		credentials:                 credentials,
 		provider:                    p,
 		models:                      options.Models,
 		workPolicy:                  options.WorkPolicy,
@@ -175,9 +178,18 @@ func openAIRealtimePumpContext(ctx context.Context) context.Context {
 }
 
 func (p *OpenAIProvider) openRealtimeConnWithContext(ctx context.Context, modelName string) (*wsconn.ManagedConn, *types.OpenAIErrorWithStatusCode) {
+	conn, _, err := p.openRealtimeConnWithCredentials(ctx, modelName)
+	return conn, err
+}
+
+func (s *openAIRealtimeSession) ProviderCredentials() []string {
+	return append([]string(nil), s.credentials...)
+}
+
+func (p *OpenAIProvider) openRealtimeConnWithCredentials(ctx context.Context, modelName string) (*wsconn.ManagedConn, []string, *types.OpenAIErrorWithStatusCode) {
 	fullRequestURL, errWithCode := p.realtimeWSURL(modelName)
 	if errWithCode != nil {
-		return nil, errWithCode
+		return nil, nil, errWithCode
 	}
 
 	proxyAddr := ""
@@ -194,7 +206,7 @@ func (p *OpenAIProvider) openRealtimeConnWithContext(ctx context.Context, modelN
 		inbound = requestctx.NewHeaderSnapshot(p.Context.Request.Header)
 	}
 	if err := applyRealtimeBusinessHeaders(headers, inbound); err != nil {
-		return nil, common.ErrorWrapperLocal(err, "invalid_request_header", http.StatusBadRequest)
+		return nil, nil, common.ErrorWrapperLocal(err, "invalid_request_header", http.StatusBadRequest)
 	}
 	httpHeaders := httpHeaderFromOpenAIHeaders(headers)
 
@@ -202,9 +214,9 @@ func (p *OpenAIProvider) openRealtimeConnWithContext(ctx context.Context, modelN
 	defer cancel()
 	wsConn, err := wsconn.DialManaged(dialCtx, fullRequestURL, httpHeaders, openAIRealtimeWSConfig("openai realtime upstream"), openAIRealtimeDialOptions(proxyAddr, openAIRealtimeSelfHosted(p), openAIUpstreamWebsocketSubprotocols(p))...)
 	if err != nil {
-		return nil, mapOpenAIRealtimeWSDialError(err)
+		return nil, nil, mapOpenAIRealtimeWSDialError(err)
 	}
-	return wsConn, nil
+	return wsConn, providerresponse.ConnectionCredentials(fullRequestURL, httpHeaders), nil
 }
 
 func (p *OpenAIProvider) realtimeWSURL(modelName string) (string, *types.OpenAIErrorWithStatusCode) {
@@ -316,18 +328,19 @@ func (p *OpenAIProvider) openResponsesWSConn(modelName string) (*wsconn.ManagedC
 }
 
 func (p *OpenAIProvider) openResponsesWSConnWithContext(ctx context.Context, modelName string) (*wsconn.ManagedConn, *types.OpenAIErrorWithStatusCode) {
-	return p.openResponsesWSConnWithHeaders(ctx, modelName, requestctx.HeaderSnapshot{})
+	conn, _, err := p.openResponsesWSConnWithHeaders(ctx, modelName, requestctx.HeaderSnapshot{})
+	return conn, err
 }
 
-func (p *OpenAIProvider) openResponsesWSConnWithHeaders(ctx context.Context, modelName string, inbound requestctx.HeaderSnapshot) (*wsconn.ManagedConn, *types.OpenAIErrorWithStatusCode) {
+func (p *OpenAIProvider) openResponsesWSConnWithHeaders(ctx context.Context, modelName string, inbound requestctx.HeaderSnapshot) (*wsconn.ManagedConn, []string, *types.OpenAIErrorWithStatusCode) {
 	fullRequestURL, errWithCode := p.responsesWSURL(modelName)
 	if errWithCode != nil {
-		return nil, errWithCode
+		return nil, nil, errWithCode
 	}
 
 	headers := p.requestHeaders(openAIRequestAuthBearer)
 	if err := applyResponsesBusinessHeaders(headers, inbound); err != nil {
-		return nil, common.ErrorWrapperLocal(err, "invalid_request_header", http.StatusBadRequest)
+		return nil, nil, common.ErrorWrapperLocal(err, "invalid_request_header", http.StatusBadRequest)
 	}
 	httpHeaders := httpHeaderFromOpenAIHeaders(headers)
 
@@ -339,9 +352,9 @@ func (p *OpenAIProvider) openResponsesWSConnWithHeaders(ctx context.Context, mod
 	defer cancel()
 	wsConn, err := wsconn.DialManaged(dialCtx, fullRequestURL, httpHeaders, openAIRealtimeWSConfig("openai responses websocket upstream"), openAIRealtimeDialOptions(proxyAddr, openAIResponsesWSSelfHosted(p), openAIUpstreamWebsocketSubprotocols(p))...)
 	if err != nil {
-		return nil, mapOpenAIResponsesWSDialError(err)
+		return nil, nil, mapOpenAIResponsesWSDialError(err)
 	}
-	return wsConn, nil
+	return wsConn, providerresponse.ConnectionCredentials(fullRequestURL, httpHeaders), nil
 }
 
 func openAIRealtimeDialContext(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -541,7 +554,7 @@ func mapOpenAIRealtimeWSDialError(err error) *types.OpenAIErrorWithStatusCode {
 	if errors.As(err, &dialErr) && dialErr != nil {
 		return markOpenAIRealtimeOpenNotAttempted(mapOpenAIRealtimeWSDialStatus(dialErr.StatusCode))
 	}
-	logOpenAIRealtimeInternalError("openai realtime websocket dial failed: " + err.Error())
+	logOpenAIRealtimeInternalError("openai realtime websocket dial failed: " + openAIResponsesWSDialErrorSummary(err))
 	return markOpenAIRealtimeOpenNotAttempted(common.StringErrorWrapperLocal("websocket request failed", "ws_request_failed", http.StatusInternalServerError))
 }
 
@@ -1206,7 +1219,6 @@ func (s *openAIRealtimeSession) observeSupplierMessage(messageType wsconn.Messag
 				logOpenAIRealtimeInternalError("openai realtime observer usage error: " + err.Error())
 				s.runFinalizers(s.finalizeObservedTurnState(turnState, "quota_exhausted", receivedAt))
 				outbound.err = openAIRealtimeClientPayloadErrorFromObserver(err)
-				outbound.origin = runtimerealtime.RealtimePayloadOriginProxyLocal
 				return outbound, true
 			}
 		}
@@ -1231,7 +1243,6 @@ func (s *openAIRealtimeSession) observeSupplierMessage(messageType wsconn.Messag
 		// 已开始的 response 保留到已接收帧排空；未来工作拒绝不等于本轮没有费用。
 		s.stopFutureWork(providerAdmissionErr)
 		outbound.err = openAIRealtimeClientPayloadErrorFromObserver(providerAdmissionErr)
-		outbound.origin = runtimerealtime.RealtimePayloadOriginProxyLocal
 		return outbound, true
 	}
 

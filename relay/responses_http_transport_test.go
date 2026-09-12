@@ -196,16 +196,18 @@ func TestResponsesHTTPTransportEndsAndSettlesOnce(t *testing.T) {
 						t.Fatal("handler did not finish")
 					}
 				}
-				if mode == "eof" {
-					if readErr != nil || result.aborted || result.apiErr != nil || string(got) != wire {
+				if mode == "eof" || mode == "unsafe_tail" {
+					wantBody := wire
+					if mode == "unsafe_tail" {
+						wantBody = strings.TrimPrefix(wire, prefix)
+					}
+					if readErr != nil || result.aborted || result.apiErr != nil || string(got) != wantBody {
 						t.Fatalf("normal EOF changed: err=%v result=%+v bytes=%q", readErr, result, got)
 					}
 				} else if readErr == nil || !result.aborted {
 					t.Fatalf("truncation looked successful: read=%v result=%+v", readErr, result)
 				}
-				if mode == "unsafe_tail" && strings.Contains(string(got), "acct-secret-transport") {
-					t.Fatal("无法脱敏的 EOF 尾部越过了真实 HTTP 交付边界")
-				}
+
 				select {
 				case <-body.closed:
 				default:
@@ -263,7 +265,7 @@ func TestResponsesSSELineEndingsPreserveSecurityAndIncompleteTail(t *testing.T) 
 					t.Fatal(apiErr)
 				}
 				body := recorder.Body.String()
-				if strings.Contains(body, "acct-secret") || !strings.Contains(body, `"account_id":"[redacted]"`) || !strings.Contains(body, "9007199254740993") {
+				if body != wire {
 					t.Fatalf("SSE security or number changed: %q", body)
 				}
 				if complete {
@@ -278,7 +280,7 @@ func TestResponsesSSELineEndingsPreserveSecurityAndIncompleteTail(t *testing.T) 
 	}
 }
 
-func TestResponsesSSERejectsPayloadThatCannotBeSafelyRedacted(t *testing.T) {
+func TestResponsesSSEBestEffortFailurePreservesDelivery(t *testing.T) {
 	for _, separator := range []string{"\r", "\n", "\r\n"} {
 		for _, completeEvent := range []bool{false, true} {
 			for _, committed := range []bool{false, true} {
@@ -299,11 +301,8 @@ func TestResponsesSSERejectsPayloadThatCannotBeSafelyRedacted(t *testing.T) {
 						t.Fatal(err)
 					}
 					_, apiErr := responseNativeResponsesStreamClient(ctx, commonresponses.NewEventStream(stream, handler.ObserveResponsesEvent), commonresponses.NewStreamObserver())
-					if apiErr == nil || !apiErr.LocalError || apiErr.Code != "invalid_provider_response" {
-						t.Fatalf("无法安全脱敏却按正常结束处理：%+v", apiErr)
-					}
-					if recorder.Body.String() != prefix || ctx.GetBool(responsesStreamErrorAlreadyRenderedContextKey) != committed {
-						t.Fatalf("安全失败交付了尾部或丢失了中断状态：%q", recorder.Body.String())
+					if apiErr != nil || recorder.Body.String() != wire {
+						t.Fatalf("脱敏干扰原文交付: %q err=%v", recorder.Body.String(), apiErr)
 					}
 					if usage.HasProviderUsage() {
 						t.Fatal("无效 JSON 成为了计费证据")

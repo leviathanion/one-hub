@@ -22,10 +22,9 @@ type ClaudeRelayStreamHandler struct {
 	Prefix           string
 	AccumulatedUsage Usage
 
-	AddEvent           bool
-	framer             *requester.SSEEventFramer
-	ErrorSeen          bool
-	ProviderCredential string
+	AddEvent  bool
+	framer    *requester.SSEEventFramer
+	ErrorSeen bool
 }
 
 func (p *ClaudeProvider) CreateClaudeChat(request *ClaudeRequest) (*ClaudeResponse, *types.OpenAIErrorWithStatusCode) {
@@ -68,11 +67,10 @@ func (p *ClaudeProvider) CreateClaudeChatStream(request *ClaudeRequest) (request
 	defer req.Body.Close()
 
 	chatHandler := &ClaudeRelayStreamHandler{
-		Usage:              p.Usage,
-		ModelName:          request.Model,
-		Prefix:             `data: {"type"`,
-		framer:             requester.NewSSEEventFramer(16 << 20),
-		ProviderCredential: p.Channel.Key,
+		Usage:     p.Usage,
+		ModelName: request.Model,
+		Prefix:    `data: {"type"`,
+		framer:    requester.NewSSEEventFramer(16 << 20),
 	}
 
 	// 发送请求
@@ -115,7 +113,7 @@ func (h *ClaudeRelayStreamHandler) HandlerStreamWithEmitter(rawLine *[]byte, emi
 	var claudeResponse ClaudeStreamResponse
 	if json.Unmarshal(payload, &claudeResponse) != nil {
 		// Observation failure cannot replace a valid same-dialect raw event.
-		safe, _ := common.RedactCredentialValuesText(string(event), h.ProviderCredential)
+		safe := string(event)
 		emitter.SendData(safe)
 		return
 	}
@@ -130,7 +128,7 @@ func (h *ClaudeRelayStreamHandler) HandlerStreamWithEmitter(rawLine *[]byte, emi
 		ClaudeUsageMerge(&h.AccumulatedUsage, &claudeResponse.Usage)
 		ClaudeUsageToOpenaiUsage(&h.AccumulatedUsage, h.Usage)
 	}
-	safeEvent, _ := common.RedactCredentialValuesText(string(event), h.ProviderCredential)
+	safeEvent := string(event)
 	if !emitter.SendData(safeEvent) {
 		return
 	}

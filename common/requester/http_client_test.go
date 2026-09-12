@@ -157,7 +157,7 @@ func TestHandleErrorRespKeepsControlDispositionAfterPublicRedaction(t *testing.T
 			if got.StatusCode != test.wantStatus || got.ProviderQuotaExhausted != test.wantQuota || got.ProviderAuthRejected != test.wantAuth {
 				t.Fatalf("unexpected provider disposition: %+v", got)
 			}
-			if got.Code != "provider_account_error" || strings.Contains(got.Message, "credit balance") || strings.Contains(got.Message, "API key") {
+			if got.Code != test.providerError.Code || got.Message != test.providerError.Message {
 				t.Fatalf("expected public error to remain redacted: %+v", got)
 			}
 		})

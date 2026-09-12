@@ -29,37 +29,15 @@ func TestRedirectBodyFailurePreservesExecutionFact(t *testing.T) {
 	}
 }
 
-func TestPreservedRedirectRedactsOnlyCredentialRepresentations(t *testing.T) {
-	for _, bodyHasCredential := range []bool{false, true} {
-		for _, location := range []string{"https://example.test/safe", "https://example.test/provider-secret-123", "https://example.test/%70rovider-secret-123"} {
-			t.Run(location+"/body="+map[bool]string{false: "safe", true: "secret"}[bodyHasCredential], func(t *testing.T) {
-				body := "redirect body\n"
-				if bodyHasCredential {
-					body += "provider-secret-123"
-				}
-				req, _ := http.NewRequest(http.MethodPost, "https://upstream.test", nil)
-				req.Header.Set("Authorization", "Bearer provider-secret-123")
-				resp := &http.Response{StatusCode: 307, Request: req, Body: io.NopCloser(strings.NewReader(body)), Header: http.Header{
-					"Location": {location}, "Content-Length": {"42"}, "Digest": {"original"}, "Content-Type": {"text/plain"},
-				}}
-				apiErr := preservedRedirectResponse(resp, providerresponse.OperationUnknown)
-				if apiErr.StatusCode != 307 || !apiErr.ReplayRawResponse || strings.Contains(string(apiErr.RawBody), "provider-secret-123") {
-					t.Fatalf("redirect semantics/security: %+v", apiErr)
-				}
-				if !bodyHasCredential && string(apiErr.RawBody) != body {
-					t.Fatalf("safe body changed: %q", apiErr.RawBody)
-				}
-				if (apiErr.ResponseHeaders.Get("Content-Length") == "") != bodyHasCredential || (apiErr.ResponseHeaders.Get("Digest") == "") != bodyHasCredential {
-					t.Fatalf("representation headers mismatch: %v", apiErr.ResponseHeaders)
-				}
-				wantLocation := ""
-				if location == "https://example.test/safe" {
-					wantLocation = location
-				}
-				if apiErr.ResponseHeaders.Get("Location") != wantLocation {
-					t.Fatalf("redirect target changed/leaked: %v", apiErr.ResponseHeaders)
-				}
-			})
+func TestPreservedRedirectDoesNotRunBodyRedaction(t *testing.T) {
+	for _, body := range []string{"redirect provider-secret", `{"text":"provider\u002dsecret","future":9007199254740993}`, `{"text":"one","text":"two"}`, `{"text":`} {
+		req, _ := http.NewRequest(http.MethodPost, "https://upstream.test", nil)
+		req.Header.Set("Authorization", "Bearer provider-secret")
+		location := "https://example.test/provider-secret"
+		resp := &http.Response{StatusCode: 307, Request: req, Body: io.NopCloser(strings.NewReader(body)), Header: http.Header{"Location": {location}, "Digest": {"original"}, "Content-Type": {"application/json"}}}
+		apiErr := preservedRedirectResponse(resp, providerresponse.OperationUnknown)
+		if apiErr.StatusCode != 307 || !apiErr.ReplayRawResponse || string(apiErr.RawBody) != body || apiErr.ResponseHeaders.Get("Location") != location || apiErr.ResponseHeaders.Get("Digest") != "original" {
+			t.Fatalf("脱敏干扰重定向: %+v", apiErr)
 		}
 	}
 }

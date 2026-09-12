@@ -8,7 +8,6 @@ import (
 	"runtime"
 	"strings"
 
-	"one-api/common"
 	"one-api/common/logger"
 	"one-api/common/providerresponse"
 	runtimerealtime "one-api/runtime/realtime"
@@ -130,7 +129,6 @@ func codexRealtimeObserverErrorMessage(code string) string {
 }
 
 func logCodexRealtimeInternalError(message string) {
-	message = common.RedactSensitiveText(message)
 	if _, file, line, ok := runtime.Caller(1); ok {
 		if idx := strings.LastIndex(file, "/"); idx >= 0 {
 			file = file[idx+1:]

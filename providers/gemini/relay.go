@@ -23,10 +23,9 @@ type GeminiRelayStreamHandler struct {
 	finishedCandidates   map[int64]struct{}
 	terminalObserved     bool
 
-	key                string
-	framer             *requester.SSEEventFramer
-	ErrorSeen          bool
-	ProviderCredential string
+	key       string
+	framer    *requester.SSEEventFramer
+	ErrorSeen bool
 }
 
 func (p *GeminiProvider) CreateGeminiChat(request *GeminiChatRequest) (*GeminiChatResponse, *types.OpenAIErrorWithStatusCode) {
@@ -84,9 +83,8 @@ func (p *GeminiProvider) CreateGeminiChatStream(request *GeminiChatRequest) (req
 		RequireInputImage:    request.UsesInputImages(),
 		expectedCandidates:   geminiExpectedCandidateCount(request, rawRequest),
 
-		key:                channel.Key,
-		framer:             requester.NewSSEEventFramer(16 << 20),
-		ProviderCredential: channel.Key,
+		key:    channel.Key,
+		framer: requester.NewSSEEventFramer(16 << 20),
 	}
 
 	// 发送请求
@@ -131,7 +129,7 @@ func (h *GeminiRelayStreamHandler) HandlerStreamWithEmitter(rawLine *[]byte, emi
 	payload := geminiSSEPayload(event)
 	var geminiResponse GeminiChatResponse
 	if json.Unmarshal(payload, &geminiResponse) != nil {
-		safe, _ := common.RedactCredentialValuesText(string(event), h.ProviderCredential)
+		safe := string(event)
 		emitter.SendData(safe)
 		return
 	}
@@ -144,7 +142,7 @@ func (h *GeminiRelayStreamHandler) HandlerStreamWithEmitter(rawLine *[]byte, emi
 		applyGeminiUsageRequirements(&usage, h.RequireCachedContent, h.RequireInputImage)
 		*h.Usage = usage
 	}
-	safeEvent, _ := common.RedactCredentialValuesText(string(event), h.ProviderCredential)
+	safeEvent := string(event)
 	if !emitter.SendData(safeEvent) {
 		return
 	}

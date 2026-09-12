@@ -22,6 +22,7 @@ import (
 	"one-api/common/authutil"
 	"one-api/common/config"
 	"one-api/common/logger"
+	"one-api/common/providerresponse"
 	commonredis "one-api/common/redis"
 	commonresponses "one-api/common/responses"
 	"one-api/common/wsconn"
@@ -49,6 +50,7 @@ type codexRealtimeClientEvent struct {
 }
 
 type codexRealtimeOutbound struct {
+	credentials   *providerresponse.CredentialSnapshot
 	messageType   wsconn.MessageType
 	payload       []byte
 	providerClose *runtimerealtime.ProviderClose
@@ -90,6 +92,7 @@ func (i *codexAttachmentItem) release() {
 }
 
 type codexManagedRuntimeState struct {
+	wsCredentials         *providerresponse.CredentialSnapshot
 	attachment            *codexAttachment
 	ownerSeq              uint64
 	wsConn                *wsconn.ManagedConn
@@ -755,6 +758,7 @@ func (s *codexManagedRealtimeSession) Recv(ctx context.Context) (runtimerealtime
 		return runtimerealtime.RecvEvent{}, err
 	}
 	event := runtimerealtime.RecvEvent{
+		Credentials:   outbound.credentials,
 		ProviderClose: outbound.providerClose,
 		Usage:         outbound.usage,
 		Origin:        outbound.origin,
@@ -1373,6 +1377,7 @@ func (p *CodexProvider) ensureRealtimeTransportLocked(ctx context.Context, exec 
 		return apiErr
 	}
 	state.wsConn = conn
+	state.wsCredentials = providerresponse.NewCredentialSnapshot(providerresponse.ConnectionCredentials(plan.wsURL, codexRealtimeHTTPHeader(plan.headers)))
 	state.wsConnGeneration++
 	state.wsReaderContext = codexRealtimePumpContext(ctx)
 	state.skipBootstrapConn = conn
@@ -1388,6 +1393,7 @@ func (p *CodexProvider) startRealtimeWSReaderLocked(exec *runtimesession.Executi
 	}
 
 	conn := state.wsConn
+	credentials := state.wsCredentials
 	pumpCtx := state.wsReaderContext
 	if pumpCtx == nil {
 		pumpCtx = context.Background()
@@ -1513,6 +1519,7 @@ func (p *CodexProvider) startRealtimeWSReaderLocked(exec *runtimesession.Executi
 
 				if wasCurrent && wasInflight && currentAttachment != nil {
 					outbound := codexRealtimeOutboundFromCloseInfo(info)
+					outbound.credentials = credentials
 					if !enqueueCodexOutbound(currentAttachment, outbound) {
 						cleanupCodexExecutionSession(exec)
 						return
@@ -1671,6 +1678,7 @@ func (p *CodexProvider) startRealtimeWSReaderLocked(exec *runtimesession.Executi
 				codexMaybeDeleteDetachedExecutionSession(exec, "detached_ephemeral_session")
 				if attachment != nil {
 					_ = enqueueCodexOutbound(attachment, codexRealtimeOutbound{
+						credentials: credentials,
 						messageType: messageType,
 						payload:     payload,
 						usage:       usage,
@@ -1699,6 +1707,7 @@ func (p *CodexProvider) startRealtimeWSReaderLocked(exec *runtimesession.Executi
 					}
 					errorPayload := codexRealtimeProviderErrorEventPayload("", errorCode, codexRealtimeStaticErrorMessage(errorCode))
 					_ = enqueueCodexOutbound(attachment, codexRealtimeOutbound{
+						credentials: credentials,
 						messageType: wsconn.TextMessage,
 						payload:     errorPayload,
 						origin:      runtimerealtime.RealtimePayloadOriginProxyLocal,
@@ -1712,6 +1721,7 @@ func (p *CodexProvider) startRealtimeWSReaderLocked(exec *runtimesession.Executi
 
 			if attachment != nil {
 				if !enqueueCodexOutbound(attachment, codexRealtimeOutbound{
+					credentials: credentials,
 					messageType: messageType,
 					payload:     payload,
 					usage:       usage,
@@ -1724,6 +1734,7 @@ func (p *CodexProvider) startRealtimeWSReaderLocked(exec *runtimesession.Executi
 			if providerInitiatedAdmissionErr != nil || finalResult.StopFutureWork {
 				if attachment != nil {
 					_ = enqueueCodexOutbound(attachment, codexRealtimeOutbound{
+						credentials: credentials,
 						providerClose: &runtimerealtime.ProviderClose{
 							Code:   int(wsconn.ClosePolicyViolation),
 							Reason: "principal_revoked",
@@ -1854,6 +1865,7 @@ func clearCodexManagedWebsocketLocked(state *codexManagedRuntimeState) codexClea
 		conn: state.wsConn,
 	}
 	state.wsConn = nil
+	state.wsCredentials = nil
 	if state.wsReaderConn == cleared.conn {
 		state.wsReaderConn = nil
 		state.wsReaderContext = nil

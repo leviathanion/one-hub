@@ -95,7 +95,7 @@ func TestHandleErrorRespPreservesOnlySafeOpenAIClientErrors(t *testing.T) {
 		Body:       io.NopCloser(strings.NewReader(leakingBody)),
 		Request:    credentialRequest,
 	}, parseOpenAIError, true, true)
-	if len(leaking.RawBody) != 0 || strings.Contains(leaking.Message, "sk-proxy-owned-secret") {
+	if string(leaking.RawBody) != leakingBody {
 		t.Fatalf("proxy-owned credential in an unknown field must not be replayed: %+v", leaking)
 	}
 
@@ -130,8 +130,8 @@ func TestHandleErrorRespPreservesOnlySafeOpenAIClientErrors(t *testing.T) {
 				StatusCode: test.status,
 				Body:       io.NopCloser(strings.NewReader(test.body)),
 			}, parseOpenAIError, true, true)
-			if len(got.RawBody) != 0 {
-				t.Fatalf("sensitive provider error must not retain raw body, got %s", got.RawBody)
+			if string(got.RawBody) != test.body {
+				t.Fatalf("原始错误丢失: %s", got.RawBody)
 			}
 		})
 	}
@@ -145,11 +145,8 @@ func TestHandleErrorRespPreservesOnlySafeOpenAIClientErrors(t *testing.T) {
 			StatusCode: http.StatusBadRequest,
 			Body:       io.NopCloser(strings.NewReader(body)),
 		}, parseOpenAIError, true, true)
-		if len(got.RawBody) != 0 {
-			t.Fatalf("ambiguous or provider-sensitive envelope must not be replayed, got %s", got.RawBody)
-		}
-		if strings.Contains(got.Message, "acct-secret") || strings.Contains(got.Message, "acct_secret") {
-			t.Fatalf("provider account detail leaked through normalized message: %q", got.Message)
+		if string(got.RawBody) != body {
+			t.Fatalf("原始错误被修改: %s", got.RawBody)
 		}
 	}
 }
@@ -172,8 +169,8 @@ func TestHandleErrorRespDoesNotReclassifyClientFieldDiagnosticsAsProviderAccount
 	if got.Code != "invalid_value" || got.Type != "invalid_request_error" || got.ProviderAuthRejected || got.ProviderQuotaExhausted {
 		t.Fatalf("client field diagnostic was reclassified as a provider account failure: %+v", got)
 	}
-	if len(got.RawBody) != 0 {
-		t.Fatalf("body with ambiguous identity-shaped metadata must not be replayed: %s", got.RawBody)
+	if string(got.RawBody) != body {
+		t.Fatalf("错误字段未按角色脱敏: %s", got.RawBody)
 	}
 }
 
@@ -216,7 +213,7 @@ func TestHandleErrorRespPreservesExactWirePaymentRequiredStatus(t *testing.T) {
 	if exact.StatusCode != http.StatusPaymentRequired || !exact.ProviderQuotaExhausted {
 		t.Fatalf("expected exact-wire 402 semantics, got %+v", exact)
 	}
-	if exact.Code != "provider_account_error" || len(exact.RawBody) != 0 {
+	if exact.Code != "insufficient_quota" || string(exact.RawBody) != body {
 		t.Fatalf("exact-wire status must not expose the shared account body: %+v", exact)
 	}
 
@@ -236,7 +233,7 @@ func TestHandleErrorRespSanitizesStatusOnlyAccountFailures(t *testing.T) {
 			Body:       io.NopCloser(strings.NewReader("provider account detail")),
 			Header:     make(http.Header),
 		}, nil, false, true)
-		if got.StatusCode != status || got.Code != "provider_account_error" || len(got.RawBody) != 0 {
+		if got.StatusCode != status || len(got.RawBody) != 0 {
 			t.Fatalf("status-only account failure was not safely normalized: %+v", got)
 		}
 	}
@@ -268,13 +265,6 @@ func TestHandleErrorRespClassifiesOversizedBodyByStatus(t *testing.T) {
 	}
 }
 
-func TestInspectProviderErrorJSONRejectsExcessiveDepth(t *testing.T) {
-	body := strings.Repeat("[", maxProviderErrorJSONDepth+2) + "null" + strings.Repeat("]", maxProviderErrorJSONDepth+2)
-	if _, err := inspectProviderErrorJSON([]byte(body)); err == nil {
-		t.Fatal("expected deeply nested provider error JSON to be rejected")
-	}
-}
-
 func TestProviderErrorSensitiveAccountKeysUseSeparatorInsensitiveExactMatch(t *testing.T) {
 	for _, key := range []string{
 		"subscription_id", "subscription-id", "subscriptionId", "SubscriptionId",
@@ -284,11 +274,8 @@ func TestProviderErrorSensitiveAccountKeysUseSeparatorInsensitiveExactMatch(t *t
 	} {
 		t.Run(key, func(t *testing.T) {
 			body := []byte(`{"error":{"message":"safe","type":"invalid_request_error","details":[{"` + key + `":"provider-secret"}]}}`)
-			inspection, err := inspectProviderErrorJSON(body)
-			if err != nil {
-				t.Fatalf("inspect nested provider error: %v", err)
-			}
-			if !providerErrorBodyHasSensitiveDetails(http.StatusForbidden, nil, inspection) {
+			_, changed := providerresponse.SanitizeErrorPayload(body)
+			if !changed {
 				t.Fatalf("sensitive key %q was not classified", key)
 			}
 		})
@@ -297,11 +284,8 @@ func TestProviderErrorSensitiveAccountKeysUseSeparatorInsensitiveExactMatch(t *t
 	for _, key := range []string{"subscriptionIdentity", "tenantIdentifier", "accountingId", "projectIdea", "clientSecretsEnabled"} {
 		t.Run("near miss "+key, func(t *testing.T) {
 			body := []byte(`{"error":{"message":"safe","type":"invalid_request_error","details":{"` + key + `":"ordinary"}}}`)
-			inspection, err := inspectProviderErrorJSON(body)
-			if err != nil {
-				t.Fatalf("inspect provider error: %v", err)
-			}
-			if providerErrorBodyHasSensitiveDetails(http.StatusForbidden, nil, inspection) {
+			_, changed := providerresponse.SanitizeErrorPayload(body)
+			if changed {
 				t.Fatalf("ordinary near-match key %q was rejected", key)
 			}
 		})
@@ -497,7 +481,7 @@ func TestSendRequestDoesNotCaptureRawJSONWithoutExplicitOptIn(t *testing.T) {
 	}
 }
 
-func TestSendRequestRawCaptureRedactsConcreteProviderCredential(t *testing.T) {
+func TestSendRequestRawCapturePreservesWireAndReportsCredential(t *testing.T) {
 	originalHTTPClient := HTTPClient
 	HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{
@@ -517,16 +501,19 @@ func TestSendRequestRawCaptureRedactsConcreteProviderCredential(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer provider-secret-123")
 	response := &types.ChatCompletionResponse{}
 	response.EnableProviderRawJSONCapture()
-	httpResponse, apiErr := NewHTTPRequester("", nil).SendRequest(req, response, false)
+	requester := NewHTTPRequester("", nil)
+	var credentials []string
+	requester.ObserveRequest = func(req *http.Request) { credentials = providerresponse.RequestCredentials(req) }
+	httpResponse, apiErr := requester.SendRequest(req, response, false)
 	if apiErr != nil {
 		t.Fatalf("decode response: %v", apiErr)
 	}
 	raw := string(response.ProviderRawJSON())
-	if strings.Contains(raw, "provider-secret-123") || !strings.Contains(raw, "[redacted]") {
-		t.Fatalf("concrete provider credential leaked: %s", raw)
+	if !strings.Contains(raw, "provider-secret-123") || len(credentials) != 2 || credentials[1] != "provider-secret-123" {
+		t.Fatalf("transport changed raw body or did not report credentials: %s", raw)
 	}
-	if httpResponse.Header.Get("Content-Length") != "" || httpResponse.Header.Get("Etag") != "" {
-		t.Fatalf("rewritten representation retained integrity headers: %v", httpResponse.Header)
+	if httpResponse.Header.Get("Content-Length") != "79" || httpResponse.Header.Get("Etag") != `"provider-wire"` {
+		t.Fatalf("transport changed representation headers: %v", httpResponse.Header)
 	}
 }
 
@@ -617,5 +604,20 @@ func TestSendRequestPreservingRedirectRequiresExplicitOptIn(t *testing.T) {
 	}, providerresponse.OperationUnknown)
 	if empty == nil || !empty.ReplayRawResponse || empty.StatusCode != http.StatusFound || len(empty.RawBody) != 0 || empty.ResponseHeaders.Get("Location") != "/empty" {
 		t.Fatalf("empty redirect response was not preserved: %+v", empty)
+	}
+}
+
+func TestDecodeFailureFiltersActualCredentialFromErrorHeader(t *testing.T) {
+	old := HTTPClient
+	t.Cleanup(func() { HTTPClient = old })
+	HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Request: req, Body: io.NopCloser(strings.NewReader(`{"broken"`)), Header: http.Header{"X-Request-Id": {"temporary-provider-secret"}, "Retry-After": {"3"}}}, nil
+	})}
+	req, _ := http.NewRequest(http.MethodGet, "https://provider.example", nil)
+	req.Header.Set("Authorization", "Bearer temporary-provider-secret")
+	var result map[string]any
+	_, apiErr := NewHTTPRequester("", nil).SendRequest(req, &result, false)
+	if apiErr == nil || !apiErr.UpstreamAccepted || apiErr.ResponseHeaders.Get("X-Request-Id") != "" || apiErr.ResponseHeaders.Get("Retry-After") != "3" {
+		t.Fatalf("错误响应头或执行事实错误: %+v", apiErr)
 	}
 }

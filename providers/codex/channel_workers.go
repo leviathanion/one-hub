@@ -9,7 +9,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"one-api/common"
 	"one-api/common/logger"
 	"one-api/model"
 )
@@ -218,9 +217,9 @@ func runCodexChannelWorkerJob(ctx context.Context, channel *model.Channel, fn fu
 			if channel != nil {
 				channelID = channel.Id
 			}
-			panicText := common.RedactSensitiveText(fmt.Sprint(r))
+			panicText := fmt.Sprint(r)
 			logger.SysError(fmt.Sprintf("[Codex] channel worker panic on channel %d: %s, stack: %s", channelID, panicText, string(debug.Stack())))
-			err = fmt.Errorf("%w on channel %d: %s", errCodexChannelWorkerPanic, channelID, panicText)
+			err = fmt.Errorf("%w on channel %d", errCodexChannelWorkerPanic, channelID)
 		}
 	}()
 	fn(ctx, channel)

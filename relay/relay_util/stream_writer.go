@@ -6,52 +6,16 @@ import (
 	"io"
 	"net/http"
 	"strings"
-
-	"github.com/gin-gonic/gin"
 )
 
 const (
-	GinStreamWriterKey      = "relay_stream_writer"
 	defaultStreamFlushBytes = 4 * 1024
 	sseDelimiterTailBytes   = 3
 )
 
-type StreamWriter interface {
-	Write([]byte) (int, error)
-	WriteString(string) (int, error)
-	Flush() error
-	Close() error
-}
-
 type streamFlushTarget interface {
 	io.Writer
 	http.Flusher
-}
-
-type directStreamWriter struct {
-	target streamFlushTarget
-}
-
-func (w *directStreamWriter) Write(p []byte) (int, error) {
-	n, err := w.target.Write(p)
-	if err != nil {
-		return n, err
-	}
-	w.target.Flush()
-	return n, nil
-}
-
-func (w *directStreamWriter) WriteString(s string) (int, error) {
-	return w.Write([]byte(s))
-}
-
-func (w *directStreamWriter) Flush() error {
-	w.target.Flush()
-	return nil
-}
-
-func (w *directStreamWriter) Close() error {
-	return w.Flush()
 }
 
 type BufferedStreamWriter struct {
@@ -72,26 +36,6 @@ func NewBufferedStreamWriter(target streamFlushTarget, flushBytes int) *Buffered
 		buffer:     bufio.NewWriterSize(target, flushBytes),
 		flushBytes: flushBytes,
 	}
-}
-
-func SetStreamWriter(c *gin.Context, writer StreamWriter) {
-	c.Set(GinStreamWriterKey, writer)
-}
-
-func ClearStreamWriter(c *gin.Context) {
-	c.Set(GinStreamWriterKey, nil)
-}
-
-func GetStreamWriter(c *gin.Context) StreamWriter {
-	if c != nil {
-		if cached, exists := c.Get(GinStreamWriterKey); exists {
-			if writer, ok := cached.(StreamWriter); ok && writer != nil {
-				return writer
-			}
-		}
-	}
-
-	return &directStreamWriter{target: c.Writer}
 }
 
 func (w *BufferedStreamWriter) Write(p []byte) (int, error) {

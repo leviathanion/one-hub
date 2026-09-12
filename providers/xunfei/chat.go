@@ -11,6 +11,8 @@ import (
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/logger"
+	"one-api/common/providerresponse"
+	"one-api/common/requestctx"
 	"one-api/common/requester"
 	"one-api/common/utils"
 	"one-api/common/wsconn"
@@ -91,6 +93,7 @@ func (p *XunfeiProvider) getChatRequest(request *types.ChatCompletionRequest) (*
 	if p != nil && p.Channel != nil && p.Channel.Proxy != nil {
 		proxyAddr = *p.Channel.Proxy
 	}
+	requestctx.SetProviderCredentials(p.Context, providerresponse.ConnectionCredentials(authUrl, nil))
 	dialCtx, cancel := context.WithTimeout(requestCtx, config.ConnectTimeout())
 	defer cancel()
 	wsConn, err := wsconn.DialManaged(dialCtx, authUrl, nil, xunfeiWSConfig(),

@@ -61,7 +61,7 @@ func (h *OpenAIResponsesStreamHandler) HandlerResponsesStream(rawLine *[]byte, d
 		errChan <- responsesUsageTrackingError(err)
 		return
 	}
-	dataChan <- h.safeProviderEvent(string(*rawLine))
+	dataChan <- string(*rawLine)
 }
 
 func openAIResponsesRawRequestForTest(t *testing.T, raw, model string, stream bool, promptCacheKey string) *commonresponses.Request {

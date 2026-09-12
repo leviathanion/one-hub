@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"one-api/common/logger"
+	"one-api/common/providerresponse"
+	"one-api/common/requestctx"
 	"one-api/common/utils"
 	"one-api/providers/claude"
 	"one-api/providers/gemini"
@@ -121,7 +123,9 @@ func NormalizeSurfaceError(c *gin.Context, err *SurfaceError) *SurfaceError {
 	}
 
 	normalized := *err
+	// 协议决策只读取原始错误；脱敏后的诊断不参与状态与分类判断。
 	openAIErr := NormalizeOpenAIError(c, err.ToOpenAIErrorWithStatusCode())
+	openAIErr = *providerresponse.SanitizeAPIError(&openAIErr, requestctx.ProviderCredentials(c)...)
 	normalized.StatusCode = openAIErr.StatusCode
 	normalized.Message = openAIErr.Message
 	normalized.Code = openAIErr.Code

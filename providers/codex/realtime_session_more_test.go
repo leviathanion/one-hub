@@ -68,7 +68,7 @@ func TestCodexRealtimePumpContextPreservesRequestValuesWithoutCancel(t *testing.
 	}
 }
 
-func TestLogCodexRealtimeInternalErrorRedactsAndIncludesCaller(t *testing.T) {
+func TestLogCodexRealtimeInternalErrorPreservesDetailAndCaller(t *testing.T) {
 	core, observedLogs := observer.New(zapcore.ErrorLevel)
 	originalLogger := logger.Logger
 	logger.Logger = zap.New(core)
@@ -83,9 +83,9 @@ func TestLogCodexRealtimeInternalErrorRedactsAndIncludesCaller(t *testing.T) {
 		t.Fatalf("expected one log entry, got %d", len(logs))
 	}
 	message := logs[0].Message
-	for _, forbidden := range []string{"log-secret", "tail", "abcdefghij.klmnopqrst.uvwxyzabcd", "provider.example", "token=secret"} {
-		if strings.Contains(message, forbidden) {
-			t.Fatalf("expected sensitive value %q to be redacted, got %q", forbidden, message)
+	for _, expected := range []string{"log-secret", "tail", "abcdefghij.klmnopqrst.uvwxyzabcd", "provider.example", "token=secret"} {
+		if !strings.Contains(message, expected) {
+			t.Fatalf("系统日志丢失原始诊断 %q: %q", expected, message)
 		}
 	}
 	if !strings.Contains(message, "caller=realtime_session_more_test.go:") {
@@ -946,7 +946,7 @@ func TestCodexRealtimeWSReaderForwardsProviderCloseCode(t *testing.T) {
 		t.Fatalf("expected provider close not to be forwarded as data frame, got message_type=%d payload=%q", outbound.messageType, outbound.payload)
 	}
 	if outbound.origin != runtimerealtime.RealtimePayloadOriginProvider {
-		t.Fatalf("expected provider close origin, got %q", outbound.origin)
+		t.Fatalf("expected provider close origin, got %v", outbound.origin)
 	}
 	if outbound.providerClose == nil {
 		t.Fatalf("expected provider close event, got outbound=%+v", outbound)

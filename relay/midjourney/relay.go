@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"one-api/common/logger"
+	"one-api/common/providerresponse"
+	"one-api/common/requestctx"
 	provider "one-api/providers/midjourney"
 	"strings"
 
@@ -39,7 +41,7 @@ func RelayMidjourney(c *gin.Context) {
 			typeMsg = err.Type
 		}
 		c.JSON(statusCode, gin.H{
-			"description": fmt.Sprintf("%s %s", err.Description, err.Result),
+			"description": providerresponse.SanitizeErrorText(fmt.Sprintf("%s %s", err.Description, err.Result), requestctx.ProviderCredentials(c)...),
 			"type":        typeMsg,
 			"code":        err.Code,
 		})

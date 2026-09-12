@@ -10,7 +10,6 @@ import (
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/logger"
-	"one-api/common/providerresponse"
 	"one-api/common/utils"
 	"one-api/metrics"
 	"one-api/model"
@@ -92,7 +91,6 @@ func executeRelayAttempts(relay RelayBaseInterface) *types.OpenAIErrorWithStatus
 	c := relay.getContext()
 
 	apiErr, done := relayHandlerFunc(relay)
-	apiErr = sanitizeRelayAttemptError(apiErr)
 	if apiErr == nil {
 		metrics.RecordProvider(c, 200)
 		return nil
@@ -134,7 +132,6 @@ func executeRelayAttempts(relay RelayBaseInterface) *types.OpenAIErrorWithStatus
 		channel = relay.getProvider().GetChannel()
 		logger.LogError(c.Request.Context(), fmt.Sprintf("using channel #%d(%s) to retry (remain times %d)", channel.Id, channel.Name, i))
 		apiErr, done = relayHandlerFunc(relay)
-		apiErr = sanitizeRelayAttemptError(apiErr)
 		if apiErr == nil {
 			metrics.RecordProvider(c, 200)
 			return nil
@@ -150,13 +147,6 @@ func executeRelayAttempts(relay RelayBaseInterface) *types.OpenAIErrorWithStatus
 	}
 
 	return apiErr
-}
-
-func sanitizeRelayAttemptError(apiErr *types.OpenAIErrorWithStatusCode) *types.OpenAIErrorWithStatusCode {
-	if apiErr == nil || apiErr.LocalError {
-		return apiErr
-	}
-	return providerresponse.SanitizeAPIError(apiErr)
 }
 
 func relayAttemptShouldRetry(relay RelayBaseInterface, apiErr *types.OpenAIErrorWithStatusCode, channelType int) bool {

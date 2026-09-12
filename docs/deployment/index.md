@@ -183,6 +183,8 @@ docker-compose ps
 
 ## 手动部署
 
+源码构建要求 **Go 1.27.1 或更新版本**及 C 编译器（SQLite 使用 CGO）。macOS 运行环境要求 **macOS 13 或更新版本**。使用预编译程序或 Docker 镜像时，无需在宿主机安装 Go。
+
 1. **获取源码**：从 [GitHub Releases](https://github.com/MartialBE/one-hub/releases/latest) 下载最新的可执行文件，或者直接从源码编译。如果你选择编译源码，可以使用以下命令：
 
    ```shell

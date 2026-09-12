@@ -1,175 +1,18 @@
 package common
 
 import (
-	"bytes"
-	"encoding/json"
-	"io"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
-
-// RedactSensitiveJSON preserves a valid JSON envelope while removing
-// credential-bearing fields and sensitive strings before the envelope crosses
-// a logging or downstream trust boundary. It returns the original bytes when
-// no redaction is needed so ordinary provider errors retain their wire form.
-func RedactSensitiveJSON(raw []byte) ([]byte, bool) {
-	return redactJSON(raw, redactSensitiveJSONValue)
-}
-
-// RedactProviderMetadataJSON removes structured provider-owned credentials and
-// account identifiers from a successful payload without interpreting ordinary
-// response strings. In particular, protocol fields such as logprobs[].token and
-// assistant-authored text must retain their values.
-func RedactProviderMetadataJSON(raw []byte) ([]byte, bool) {
-	return redactJSON(raw, redactProviderMetadataJSONValue)
-}
-
-func redactJSON(raw []byte, redactValue func(*any) bool) ([]byte, bool) {
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	var value any
-	if err := decoder.Decode(&value); err != nil {
-		return raw, false
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return raw, false
-	}
-	if redactValue == nil || !redactValue(&value) {
-		return raw, false
-	}
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		return raw, false
-	}
-	return encoded, true
-}
-
-func redactSensitiveJSONValue(value *any) bool {
-	return redactJSONValue(value, sensitiveErrorJSONField, true)
-}
-
-func redactProviderMetadataJSONValue(value *any) bool {
-	if value == nil {
-		return false
-	}
-	root, ok := (*value).(map[string]any)
-	if !ok {
-		return false
-	}
-	changed := false
-	if providerMetadataMayLiveAtRoot(root) {
-		changed = redactProviderMetadataFields(root)
-	}
-	// Responses lifecycle events wrap response-owned metadata one level below
-	// the event envelope. Do not recurse into output/choices/content trees.
-	if response, ok := root["response"].(map[string]any); ok {
-		changed = redactProviderMetadataFields(response) || changed
-	}
-	return changed
-}
-
-func providerMetadataMayLiveAtRoot(root map[string]any) bool {
-	eventType, _ := root["type"].(string)
-	eventType = strings.ToLower(strings.TrimSpace(eventType))
-	if !strings.HasPrefix(eventType, "response.") {
-		return true
-	}
-	switch eventType {
-	case "response.created", "response.in_progress", "response.completed", "response.incomplete", "response.failed", "response.queued":
-		return true
-	default:
-		// Delta and item events carry model/tool output at the event root. A
-		// same-named field there is content, not provider account metadata.
-		return false
-	}
-}
-
-func redactProviderMetadataFields(object map[string]any) bool {
-	changed := false
-	for key, value := range object {
-		if !sensitiveProviderMetadataJSONField(key) {
-			continue
-		}
-		if text, ok := value.(string); !ok || text != "[redacted]" {
-			object[key] = "[redacted]"
-			changed = true
-		}
-	}
-	return changed
-}
-
-func redactJSONValue(value *any, sensitiveField func(string) bool, redactStrings bool) bool {
-	if value == nil {
-		return false
-	}
-	switch typed := (*value).(type) {
-	case map[string]any:
-		changed := false
-		for key, fieldValue := range typed {
-			if sensitiveField != nil && sensitiveField(key) {
-				if text, ok := fieldValue.(string); !ok || text != "[redacted]" {
-					typed[key] = "[redacted]"
-					changed = true
-				}
-				continue
-			}
-			if redactJSONValue(&fieldValue, sensitiveField, redactStrings) {
-				typed[key] = fieldValue
-				changed = true
-			}
-		}
-		return changed
-	case []any:
-		changed := false
-		for index := range typed {
-			if redactJSONValue(&typed[index], sensitiveField, redactStrings) {
-				changed = true
-			}
-		}
-		return changed
-	case string:
-		if !redactStrings {
-			return false
-		}
-		redacted := RedactSensitiveText(typed)
-		if redacted == typed {
-			return false
-		}
-		*value = redacted
-		return true
-	default:
-		return false
-	}
-}
-
-func sensitiveErrorJSONField(key string) bool {
-	if sensitiveProviderMetadataJSONField(key) || strings.EqualFold(strings.TrimSpace(key), "token") {
-		return true
-	}
-	switch normalizedSensitiveLabel(key) {
-	case "secret", "credential", "credentials":
-		return true
-	default:
-		return false
-	}
-}
-
-func sensitiveProviderMetadataJSONField(key string) bool {
-	// `token` is a public Chat/Responses protocol field used by logprobs. More
-	// specific credential labels such as access_token remain provider-owned.
-	if strings.EqualFold(strings.TrimSpace(key), "token") {
-		return false
-	}
-	return strings.EqualFold(strings.TrimSpace(key), "authorization") || sensitiveCredentialLabel(key)
-}
 
 var (
 	sensitiveOpenAIKeyPattern           = regexp.MustCompile(`\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}\b`)
-	sensitiveFieldNames                 = `access[_-]?token|refresh[_-]?token|id[_-]?token|authorization|client[_-]?secret|client[_-]?assertion|api[_-]?key|x[_-]?api[_-]?key|token`
 	sensitiveAuthorizationHeaderPattern = regexp.MustCompile(`(?im)(authorization[ \t]*:[ \t]*)[^\r\n]*(?:\r?\n[ \t]+[^\r\n]*)*`)
 	sensitiveAuthorizationValuePattern  = regexp.MustCompile(`(?i)(authorization\s*[:=]\s*)[^\r\n,;&<>"']+`)
-	sensitiveFieldValuePattern          = regexp.MustCompile(`(?i)((?:` + sensitiveFieldNames + `)\s*[:=]\s*)[^,;&\s<>"']+`)
+	sensitiveFieldValuePattern          = regexp.MustCompile(`(?i)([a-z][a-z0-9_-]*\s*[:=]\s*)[^,;&\s<>"']+`)
 	sensitiveBearerPattern              = regexp.MustCompile(`(?i)\bbearer\s+[A-Za-z0-9._~+/-]+=*`)
 	sensitiveJWTLikePattern             = regexp.MustCompile(`\b[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`)
 	sensitiveProviderIdentityPattern    = regexp.MustCompile(`(?i)\b(organization|org|project|account)([ \t]+)(?:org[-_]|proj[-_]|acct[-_])[A-Za-z0-9_-]+`)
@@ -177,10 +20,7 @@ var (
 	sensitiveBodyLabelValuePattern      = regexp.MustCompile(`(?i)\b(request|response)[-_ ]?body\b\s*[:=]?\s*\S*`)
 )
 
-// RedactSensitiveText is intentionally a safe superset shared by relay
-// diagnostics and ResponsesWS provider errors. The trade-off is occasional
-// over-redaction of diagnostic labels in exchange for one boundary rule that
-// does not drift for credentials, URLs, headers, sessions, or raw bodies.
+// RedactSensitiveText 处理非结构化诊断，不能应用于 JSON 协议字段。
 func RedactSensitiveText(message string) string {
 	if message == "" {
 		return ""
@@ -209,23 +49,52 @@ func RedactSensitiveText(message string) string {
 	return strings.Join(fields, " ")
 }
 
-// RedactCredentialValuesText removes only concrete credentials already known
-// to the proxy. It is safe to apply to model-authored text because ordinary
-// credential-like strings are untouched; an exact real secret must never cross
-// the downstream boundary regardless of which provider field carries it.
+// RedactCredentialValuesText 匹配已经解码的文本；JSON/SSE 必须先经过协议边界。
 func RedactCredentialValuesText(message string, values ...string) (string, bool) {
-	changed := false
+	var secrets []string
 	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if len(value) < 8 {
-			continue
-		}
-		if strings.Contains(message, value) {
-			message = strings.ReplaceAll(message, value, "[redacted]")
-			changed = true
+		if value != "" && strings.Contains(message, value) {
+			secrets = append(secrets, value)
 		}
 	}
-	return message, changed
+	if len(secrets) == 0 {
+		return message, false
+	}
+	sort.SliceStable(secrets, func(i, j int) bool { return len(secrets[i]) > len(secrets[j]) })
+	marker := CredentialRedactionMarker(values...)
+	pairs := []string{}
+	if marker != "" {
+		pairs = append(pairs, marker, marker)
+	}
+	for _, secret := range secrets {
+		pairs = append(pairs, secret, marker)
+	}
+	safe := strings.NewReplacer(pairs...).Replace(message)
+	// 替换可能与前后文本重新拼成秘密；仅用于诊断值的有界兜底。
+	for _, value := range values {
+		if value != "" && strings.Contains(safe, value) {
+			return marker, marker != message
+		}
+	}
+	return safe, safe != message
+}
+
+// RedactProviderErrorText 保留错误消息的空白和正常协议词，只遮盖明确敏感内容。
+func RedactProviderErrorText(message string) string {
+	message = sensitiveOpenAIKeyPattern.ReplaceAllString(message, "[redacted]")
+	message = RedactSensitiveAssignments(message)
+	message = sensitiveBearerPattern.ReplaceAllString(message, "[redacted]")
+	message = sensitiveJWTLikePattern.ReplaceAllString(message, "[redacted]")
+	return sensitiveProviderIdentityPattern.ReplaceAllString(message, "${1}${2}[redacted]")
+}
+
+// SensitiveCredentialLabel 是协议字段与诊断赋值共用的凭据标签词表。
+func SensitiveCredentialLabel(label string) bool {
+	switch normalizedSensitiveLabel(label) {
+	case "apikey", "xapikey", "token", "accesstoken", "refreshtoken", "idtoken", "clientsecret", "clientassertion", "accountid", "organizationid", "orgid", "projectid", "subscriptionid", "tenantid", "billingaccount", "billingaccountid":
+		return true
+	}
+	return false
 }
 
 // RedactSensitiveAssignments redacts credential assignments while preserving
@@ -239,7 +108,21 @@ func RedactSensitiveAssignments(message string) string {
 	// apparently unrelated line.
 	message = sensitiveAuthorizationHeaderPattern.ReplaceAllString(message, "${1}[redacted]")
 	message = sensitiveAuthorizationValuePattern.ReplaceAllString(message, "${1}[redacted]")
-	return sensitiveFieldValuePattern.ReplaceAllString(message, "${1}[redacted]")
+	return sensitiveFieldValuePattern.ReplaceAllStringFunc(message, func(assignment string) string {
+		index := strings.IndexAny(assignment, ":=")
+		if index < 0 {
+			return assignment
+		}
+		label := strings.TrimSpace(assignment[:index])
+		if !SensitiveCredentialLabel(label) {
+			return assignment
+		}
+		start := index + 1
+		for start < len(assignment) && isJSONWhitespace(assignment[start]) {
+			start++
+		}
+		return assignment[:start] + "[redacted]"
+	})
 }
 
 // redactSensitiveQuotedAssignments scans quoted values rather than matching them
@@ -442,23 +325,12 @@ func sensitiveSessionLabel(lower string) bool {
 	}
 }
 
-func sensitiveCredentialLabel(lower string) bool {
-	if delimiter := strings.IndexAny(lower, "=:"); delimiter >= 0 {
-		lower = lower[:delimiter]
+func sensitiveCredentialLabel(label string) bool {
+	if delimiter := strings.IndexAny(label, "=:"); delimiter >= 0 {
+		label = label[:delimiter]
 	}
-	lower = strings.ToLower(lower)
-	normalized := normalizedSensitiveLabel(lower)
-	switch normalized {
-	case "apikey", "xapikey", "token", "accesstoken", "refreshtoken", "idtoken", "clientsecret", "clientassertion",
-		"accountid", "organizationid", "orgid", "projectid", "subscriptionid", "tenantid", "billingaccount", "billingaccountid":
-		return true
-	default:
-		// Preserve the legacy safe-superset behavior for provider-prefixed
-		// labels such as "openai-api-key" and "codex-access-token". Restrict
-		// this fallback to the two original hyphenated fragments so structured
-		// error codes such as "invalid_api_key" remain useful diagnostics.
-		return strings.Contains(lower, "api-key") || strings.Contains(lower, "access-token")
-	}
+	lower := strings.ToLower(label)
+	return SensitiveCredentialLabel(label) || strings.Contains(lower, "api-key") || strings.Contains(lower, "access-token")
 }
 
 func normalizedSensitiveLabel(label string) string {
@@ -468,4 +340,31 @@ func normalizedSensitiveLabel(label string) string {
 		}
 		return r
 	}, strings.ToLower(label))
+}
+
+// SafeClientErrorText 只用于对客的非 JSON 错误与关闭原因；截断前完成脱敏。
+func SafeClientErrorText(message string, credentials ...string) string {
+	message, _ = RedactCredentialValuesText(message, credentials...)
+	message = RedactSensitiveText(message)
+	// 启发式规则可能生成与短凭据重叠的占位符。
+	message, _ = RedactCredentialValuesText(message, credentials...)
+	const maxBytes = 4096
+	if len(message) > maxBytes {
+		message = message[:maxBytes]
+		for !utf8.ValidString(message) {
+			message = message[:len(message)-1]
+		}
+		message += " [truncated]"
+	}
+	return message
+}
+
+// CredentialRedactionMarker 防止短凭据与占位符重叠，必要时使用空字符串。
+func CredentialRedactionMarker(credentials ...string) string {
+	for _, value := range credentials {
+		if value != "" && strings.Contains("[redacted]", value) {
+			return ""
+		}
+	}
+	return "[redacted]"
 }

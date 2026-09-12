@@ -466,7 +466,7 @@ func TestExecuteRelayAttemptsNeverReplaysClaimedWorkActionProviderResponse(t *te
 		wantCode any
 	}{
 		{status: http.StatusBadRequest, wantCode: "provider_error"},
-		{status: http.StatusUnauthorized, wantCode: "provider_account_error"},
+		{status: http.StatusUnauthorized, wantCode: "provider_error"},
 		{status: http.StatusTooManyRequests, wantCode: "provider_error"},
 		{status: http.StatusInternalServerError, wantCode: "provider_error"},
 	}
@@ -621,7 +621,7 @@ func TestRelayHandlerConfirmsProviderUsage(t *testing.T) {
 	}
 }
 
-func TestExecuteRelayAttemptsSanitizesProviderErrorBeforeControlAndRender(t *testing.T) {
+func TestExecuteRelayAttemptsPreservesOriginalErrorForControl(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	provider := &mainTestProvider{BaseProvider: providersBase.BaseProvider{Channel: &model.Channel{
@@ -658,12 +658,12 @@ func TestExecuteRelayAttemptsSanitizesProviderErrorBeforeControlAndRender(t *tes
 	})
 
 	apiErr := executeRelayAttempts(relay)
-	if apiErr == nil || apiErr.Code != "provider_account_error" || strings.Contains(apiErr.Message, "provider-secret") || len(apiErr.RawBody) != 0 || apiErr.ReplayRawResponse {
+	if apiErr == nil || apiErr.Code != "invalid_api_key" || !strings.Contains(apiErr.Message, "provider-secret") || len(apiErr.RawBody) == 0 || !apiErr.ReplayRawResponse {
 		t.Fatalf("provider error was not sanitized before render: %+v", apiErr)
 	}
 	select {
 	case controlled := <-processed:
-		if controlled.Code != "provider_account_error" || strings.Contains(controlled.Message, "provider-secret") {
+		if controlled.Code != "invalid_api_key" || !strings.Contains(controlled.Message, "provider-secret") {
 			t.Fatalf("control path received unsanitized provider error: %+v", controlled)
 		}
 	case <-time.After(time.Second):

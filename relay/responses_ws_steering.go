@@ -198,7 +198,7 @@ func (a *ResponsesWSSessionActor) handleProviderAuxiliaryControl(event Responses
 	if stop {
 		a.stopNewWork()
 	}
-	if err := a.emitProviderFrameForAttempt(nil, responsesws.NewTextFrame(sanitizeProviderJSONPayload(event.Frame.Payload())), "provider_auxiliary_control"); err != nil {
+	if err := a.emitProviderFrameForAttempt(nil, responsesws.NewTextFrame(event.Frame.Payload()), "provider_auxiliary_control"); err != nil {
 		a.close("client_write_failed")
 		return true
 	}

@@ -3,6 +3,7 @@ package relay_util
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	commonresponses "one-api/common/responses"
 	"strings"
@@ -26,7 +27,7 @@ func TestResponsesStreamConverterStoresReasoningSummaryOnSummaryField(t *testing
 	maxToolCalls := 2
 	effort := "medium"
 	summary := "auto"
-	converter := NewOpenAIResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{
+	converter := newTestResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{
 		Model:              "gpt-5",
 		Background:         &background,
 		Instructions:       "Answer briefly.",
@@ -133,7 +134,7 @@ func TestResponsesStreamConverterResetsPartIndexesPerOutputItem(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest("GET", "/", nil)
 
-	converter := NewOpenAIResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: "gpt-5"}, &types.Usage{})
+	converter := newTestResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: "gpt-5"}, &types.Usage{})
 
 	converter.ProcessStreamData(`{"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"gpt-5","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"plan one"},"finish_reason":null}]}`)
 	converter.ProcessStreamData(`{"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"gpt-5","choices":[{"index":0,"delta":{"content":"answer one"},"finish_reason":null}]}`)
@@ -172,7 +173,7 @@ func TestResponsesStreamConverterFunctionArgumentsDoNotDuplicate(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest("GET", "/", nil)
 
-	converter := NewOpenAIResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: "gpt-5"}, &types.Usage{})
+	converter := newTestResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: "gpt-5"}, &types.Usage{})
 
 	converter.ProcessStreamData(`{"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"gpt-5","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"lookup","arguments":"{\"a\":"}}]},"finish_reason":null}]}`)
 	if converter.item == nil || converter.item.Arguments != nil {
@@ -200,7 +201,7 @@ func TestResponsesStreamConverterPreservesEmptyFunctionArguments(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest("GET", "/", nil)
-	converter := NewOpenAIResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: "gpt-5"}, &types.Usage{})
+	converter := newTestResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: "gpt-5"}, &types.Usage{})
 
 	roleOnly := `{"id":"chatcmpl_empty_args","object":"chat.completion.chunk","created":1,"model":"gpt-5","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}`
 	if err := converter.ProcessStreamData(roleOnly); err != nil {
@@ -234,7 +235,7 @@ func TestResponsesStreamConverterAcceptsExactCumulativePayloadLimit(t *testing.T
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest("GET", "/", nil)
-	converter := NewOpenAIResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: "gpt-5"}, &types.Usage{})
+	converter := newTestResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: "gpt-5"}, &types.Usage{})
 	first := `{"id":"chatcmpl_limit","object":"chat.completion.chunk","created":1,"model":"gpt-5","choices":[{"index":0,"delta":{"content":"accepted-prefix"},"finish_reason":null}]}`
 	second := `{"id":"chatcmpl_limit","object":"chat.completion.chunk","created":1,"model":"gpt-5","choices":[{"index":0,"delta":{"content":"-at-limit"},"finish_reason":"stop"}]}`
 	converter.maxProcessedBytes = int64(len(first) + len(second))
@@ -263,7 +264,7 @@ func TestResponsesStreamConverterRejectsCumulativePayloadBeforeMutation(t *testi
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest("GET", "/", nil)
-	converter := NewOpenAIResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: "gpt-5"}, &types.Usage{})
+	converter := newTestResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: "gpt-5"}, &types.Usage{})
 	first := `{"id":"chatcmpl_limit","object":"chat.completion.chunk","created":1,"model":"gpt-5","choices":[{"index":0,"delta":{"content":"accepted-prefix"},"finish_reason":null}]}`
 	overflow := `{"id":"chatcmpl_limit","object":"chat.completion.chunk","created":1,"model":"model-offending","choices":[{"index":0,"delta":{"content":"offending-delta"},"finish_reason":"stop"}]}`
 	converter.maxProcessedBytes = int64(len(first) + len(overflow) - 1)
@@ -303,7 +304,7 @@ func TestResponsesStreamConverterFinalResponseAvailableAfterDone(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest("GET", "/", nil)
 
-	converter := NewOpenAIResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{
+	converter := newTestResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{
 		Model:          "gpt-5",
 		PromptCacheKey: "pc-stream-final",
 	}, &types.Usage{})
@@ -333,7 +334,7 @@ func TestResponsesStreamConverterMalformedChunkEmitsSingleSequencedTerminalError
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest("GET", "/", nil)
-	converter := NewOpenAIResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: "gpt-5"}, &types.Usage{})
+	converter := newTestResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: "gpt-5"}, &types.Usage{})
 
 	if err := converter.ProcessStreamData(`{"id":"chatcmpl_error","object":"chat.completion.chunk","created":1,"model":"gpt-5","choices":[]}`); err != nil {
 		t.Fatalf("expected valid chat chunk, got %v", err)
@@ -417,7 +418,7 @@ func TestResponsesStreamConverterRejectsUnsupportedChoiceShapesWithoutPartialOut
 			recorder := httptest.NewRecorder()
 			ctx, _ := gin.CreateTestContext(recorder)
 			ctx.Request = httptest.NewRequest("GET", "/", nil)
-			converter := NewOpenAIResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: "gpt-5"}, &types.Usage{})
+			converter := newTestResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: "gpt-5"}, &types.Usage{})
 
 			if err := converter.ProcessStreamData(test.chunk); err == nil {
 				t.Fatal("unsupported provider delta must fail")
@@ -461,7 +462,7 @@ func TestResponsesStreamConverterRejectsToolCallIndexAndIdentityChangesBeforeClo
 			recorder := httptest.NewRecorder()
 			ctx, _ := gin.CreateTestContext(recorder)
 			ctx.Request = httptest.NewRequest("GET", "/", nil)
-			converter := NewOpenAIResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: "gpt-5"}, &types.Usage{})
+			converter := newTestResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: "gpt-5"}, &types.Usage{})
 			prefix := `{"id":"chatcmpl_tools","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_0","function":{"name":"lookup","arguments":"{\"a\":"}}]}}]}`
 
 			if err := converter.ProcessStreamData(prefix); err != nil {
@@ -724,7 +725,7 @@ func TestResponsesStreamConverterDoesNotEchoUnconfirmedRequestTier(t *testing.T)
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
-	converter := NewOpenAIResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{
+	converter := newTestResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{
 		Model:       "gpt-5",
 		ServiceTier: "priority",
 	}, &types.Usage{})
@@ -744,7 +745,7 @@ func TestResponsesStreamConverterPreservesChatRefusalDelta(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
-	converter := NewOpenAIResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: "gpt-5"}, &types.Usage{})
+	converter := newTestResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: "gpt-5"}, &types.Usage{})
 	if err := converter.ProcessStreamData(`{"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"gpt-5","choices":[{"index":0,"delta":{"refusal":"cannot comply"}}]}`); err != nil {
 		t.Fatalf("convert refusal delta: %v", err)
 	}
@@ -794,7 +795,7 @@ func TestResponsesStreamHelperGuardBranches(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest("GET", "/", nil)
-	converter := NewOpenAIResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: "gpt-5"}, &types.Usage{})
+	converter := newTestResponsesStreamConverter(ctx, &types.OpenAIResponsesRequest{Model: "gpt-5"}, &types.Usage{})
 	if finalResponse := converter.FinalResponse(); finalResponse != nil {
 		t.Fatalf("expected incomplete converter not to expose a final response, got %+v", finalResponse)
 	}
@@ -904,5 +905,44 @@ func TestResponsesStreamObserverKeepsTerminalIndependentFromUsageEvidence(t *tes
 	final := observer.FinalResponse()
 	if final == nil || final.ID != "resp_1" || final.Status != "completed" || final.Usage != nil {
 		t.Fatalf("unexpected stable response facts: %+v", final)
+	}
+}
+
+func newTestResponsesStreamConverter(c *gin.Context, request *types.OpenAIResponsesRequest, usage *types.Usage) *OpenAIResponsesStreamConverter {
+	return NewOpenAIResponsesStreamConverter(func(event string, payload []byte) error {
+		_, err := c.Writer.WriteString("event: " + event + "\ndata: " + string(payload) + "\n\n")
+		if err == nil {
+			c.Writer.Flush()
+		}
+		return err
+	}, request, usage)
+}
+
+func TestResponsesStreamConverterStopsOnDeliveryFailure(t *testing.T) {
+	for _, failAt := range []int{1, 4, 9} {
+		t.Run(fmt.Sprint(failAt), func(t *testing.T) {
+			failure := errors.New("delivery failed")
+			calls := 0
+			converter := NewOpenAIResponsesStreamConverter(func(event string, payload []byte) error {
+				calls++
+				if !json.Valid(payload) || event == "" {
+					t.Fatal("出口未获得完整事件")
+				}
+				if calls == failAt {
+					return failure
+				}
+				return nil
+			}, &types.OpenAIResponsesRequest{}, &types.Usage{})
+			err := converter.ProcessStreamData(`{"id":"chat_1","choices":[{"index":0,"delta":{"content":"hello"}}]}`)
+			if err == nil {
+				err = converter.ProcessStreamData("[DONE]")
+			}
+			if !errors.Is(err, failure) || calls != failAt {
+				t.Fatalf("交付错误被吞或继续写入: err=%v calls=%d", err, calls)
+			}
+			if !errors.Is(converter.ProcessStreamData("[DONE]"), failure) || calls != failAt || converter.FinalResponse() != nil {
+				t.Fatal("失败后仍发送终结或生成可持久化响应")
+			}
+		})
 	}
 }

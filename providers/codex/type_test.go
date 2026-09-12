@@ -257,28 +257,10 @@ func TestOAuth2CredentialsRefreshPreservesJSONOAuthErrorDetail(t *testing.T) {
 	}
 }
 
-func TestTokenRefreshErrorBodyLogSnippetSanitizesBody(t *testing.T) {
-	body := []byte("line\x00\naccess_token=access-secret&refresh_token=refresh-secret&client_id=client-secret " + strings.Repeat("x", tokenRefreshErrorBodyLogLimit+32))
-	snippet := tokenRefreshErrorBodyLogSnippet(body, &OAuth2Credentials{
-		AccessToken:  "access-secret",
-		RefreshToken: "refresh-secret",
-		ClientID:     "client-secret",
-	}, "client-secret")
-	if len(snippet) > tokenRefreshErrorBodyLogLimit {
-		t.Fatalf("expected log snippet to be capped at %d bytes, got %d", tokenRefreshErrorBodyLogLimit, len(snippet))
-	}
-	for _, forbidden := range []string{"\x00", "\n", "access-secret", "refresh-secret", "client-secret"} {
-		if strings.Contains(snippet, forbidden) {
-			t.Fatalf("expected log snippet to omit %q, got %q", forbidden, snippet)
-		}
-	}
-	for _, r := range snippet {
-		if r < 0x20 || r == 0x7f {
-			t.Fatalf("expected log snippet to omit control character %q in %q", r, snippet)
-		}
-	}
-	if strings.Count(snippet, "[redacted]") < 3 {
-		t.Fatalf("expected known token fields to be redacted, got %q", snippet)
+func TestTokenRefreshErrorBodyLogSnippetPreservesBoundedBody(t *testing.T) {
+	body := []byte("access_token=access-secret\n" + strings.Repeat("x", tokenRefreshErrorBodyLogLimit))
+	if got := tokenRefreshErrorBodyLogSnippet(body); got != string(body[:tokenRefreshErrorBodyLogLimit]) {
+		t.Fatalf("系统日志应保留限长的原始 body: %q", got)
 	}
 }
 

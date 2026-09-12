@@ -14,6 +14,7 @@ import (
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/logger"
+	"one-api/common/providerresponse"
 	"one-api/common/requester"
 	"one-api/common/wsconn"
 	runtimesession "one-api/runtime/session"
@@ -92,7 +93,7 @@ func (p *CodexProvider) dialChatRealtimeConnWithContext(ctx context.Context, pla
 	defer cancel()
 	wsConn, err := wsconn.DialManaged(dialCtx, plan.wsURL, codexRealtimeHTTPHeader(plan.headers), codexRealtimeWSConfig(), codexRealtimeDialOptions(plan.proxyAddr, plan.allowSelfHosted)...)
 	if err != nil {
-		apiErr := mapCodexRealtimeWSDialError(err)
+		apiErr := mapCodexRealtimeWSDialError(err, providerresponse.ConnectionCredentials(plan.wsURL, codexRealtimeHTTPHeader(plan.headers))...)
 		if apiErr != nil {
 			apiErr.ProviderOpenRetrySafe = plan.safeRouteRetry
 		}
@@ -164,7 +165,7 @@ func codexRealtimeDialOptions(proxyAddr string, allowSelfHosted bool) []wsconn.D
 	return options
 }
 
-func mapCodexRealtimeWSDialError(err error) *types.OpenAIErrorWithStatusCode {
+func mapCodexRealtimeWSDialError(err error, credentials ...string) *types.OpenAIErrorWithStatusCode {
 	logCodexRealtimeWSDialFailure(err)
 
 	var dialErr *wsconn.DialError
@@ -172,16 +173,19 @@ func mapCodexRealtimeWSDialError(err error) *types.OpenAIErrorWithStatusCode {
 		if apiErr := codexRealtimeProviderAPIErrorFromDialError(dialErr); apiErr != nil {
 			apiErr.LocalError = false
 			apiErr.UpstreamNotAttempted = true
+			apiErr.OpenAIError = providerresponse.SanitizeErrorFields(apiErr.OpenAIError, credentials...)
 			return apiErr
 		}
 		apiErr := mapCodexRealtimeWSDialStatus(dialErr.StatusCode)
 		apiErr.LocalError = false
 		apiErr.UpstreamNotAttempted = true
+		apiErr.OpenAIError = providerresponse.SanitizeErrorFields(apiErr.OpenAIError, credentials...)
 		return apiErr
 	}
 	apiErr := common.StringErrorWrapperLocal("websocket request failed", "ws_request_failed", http.StatusInternalServerError)
 	apiErr.LocalError = false
 	apiErr.UpstreamNotAttempted = true
+	apiErr.OpenAIError = providerresponse.SanitizeErrorFields(apiErr.OpenAIError, credentials...)
 	return apiErr
 }
 
@@ -286,15 +290,7 @@ func codexRealtimeBodyForLog(body []byte) string {
 	if len(body) == 0 {
 		return ""
 	}
-	if redacted, changed := common.RedactSensitiveJSON(body); changed {
-		return codexRealtimeLogValue(string(redacted))
-	}
-	original := string(body)
-	redacted := common.RedactSensitiveText(original)
-	if redacted == strings.Join(strings.Fields(original), " ") {
-		redacted = original
-	}
-	return codexRealtimeLogValue(redacted)
+	return codexRealtimeLogValue(string(body))
 }
 
 func codexRealtimeWSURLForLog(rawURL string) string {

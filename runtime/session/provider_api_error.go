@@ -3,10 +3,13 @@ package session
 import (
 	"bytes"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 
+	"one-api/common"
 	"one-api/types"
 )
 
@@ -19,13 +22,15 @@ func ProviderAPIErrorFromPayload(payload []byte) *types.OpenAIErrorWithStatusCod
 		return nil
 	}
 
-	var object map[string]json.RawMessage
-	decoder := json.NewDecoder(bytes.NewReader(payload))
-	decoder.UseNumber()
-	if err := decoder.Decode(&object); err != nil {
+	object := readProviderAPIEnvelope(payload, false)
+	if object == nil {
 		return nil
 	}
-	eventType := rawProviderAPIString(object["type"])
+	return providerAPIErrorFromEnvelope(object)
+}
+
+func providerAPIErrorFromEnvelope(object *providerAPIEnvelope) *types.OpenAIErrorWithStatusCode {
+	eventType := rawProviderAPIString(object.Type)
 	if !providerAPIPayloadHasErrorSignal(object, eventType) {
 		return nil
 	}
@@ -38,23 +43,23 @@ func ProviderAPIErrorFromPayload(payload []byte) *types.OpenAIErrorWithStatusCod
 	if meaningfulProviderAPIType(eventType) {
 		detail.ErrType = eventType
 	}
-	if code := rawProviderAPIString(object["code"]); code != "" {
+	if code := rawProviderAPIString(object.Code); code != "" {
 		detail.Code = code
 	}
-	if message := rawProviderAPIString(object["message"]); message != "" {
+	if message := rawProviderAPIString(object.Message); message != "" {
 		detail.Message = message
 	}
-	if param := rawProviderAPIAnyString(object["param"]); param != "" {
+	if param := rawProviderAPIAnyString(object.Param); param != "" {
 		detail.Param = param
 	}
-	if status := rawProviderAPIStatus(object["status_code"]); status > 0 {
+	if status := rawProviderAPIStatus(object.StatusCode); status > 0 {
 		detail.StatusCode = status
-	} else if status := rawProviderAPIStatus(object["status"]); status > 0 {
+	} else if status := rawProviderAPIStatus(object.Status); status > 0 {
 		detail.StatusCode = status
 	}
 
-	applyProviderAPIOpenAIError(&detail, object["error"])
-	applyProviderAPIResponseError(&detail, object["response"])
+	applyProviderAPIOpenAIError(&detail, object.Error)
+	applyProviderAPIResponseError(&detail, object.Response)
 	if detail.Code == "" || detail.Code == "upstream_error" {
 		if code := fallbackProviderAPICode(detail.ErrType); code != "" {
 			detail.Code = code
@@ -71,7 +76,7 @@ func ProviderAPIErrorFromPayload(payload []byte) *types.OpenAIErrorWithStatusCod
 	if detail.StatusCode <= 0 {
 		detail.StatusCode = defaultProviderAPIStatus(detail.ErrType, detail.Code)
 	}
-	return &types.OpenAIErrorWithStatusCode{
+	apiErr := &types.OpenAIErrorWithStatusCode{
 		OpenAIError: types.OpenAIError{
 			Type:    detail.ErrType,
 			Code:    detail.Code,
@@ -81,6 +86,9 @@ func ProviderAPIErrorFromPayload(payload []byte) *types.OpenAIErrorWithStatusCod
 		StatusCode: detail.StatusCode,
 		LocalError: false,
 	}
+	apiErr.ProviderQuotaExhausted = apiErr.StatusCode == http.StatusPaymentRequired || common.ProviderErrorIsQuotaExhausted(apiErr.OpenAIError)
+	apiErr.ProviderAuthRejected = apiErr.StatusCode == http.StatusUnauthorized || common.ProviderErrorIsAuthRejected(apiErr.OpenAIError)
+	return apiErr
 }
 
 // OpenAIErrorEnvelopeFromPayload recognizes only the top-level OpenAI error
@@ -92,17 +100,99 @@ func OpenAIErrorEnvelopeFromPayload(payload []byte) *types.OpenAIErrorWithStatus
 	if len(payload) == 0 {
 		return nil
 	}
-	var object map[string]json.RawMessage
-	decoder := json.NewDecoder(bytes.NewReader(payload))
-	decoder.UseNumber()
-	if err := decoder.Decode(&object); err != nil || !hasProviderAPIOpenAIError(object["error"]) {
+	object := readProviderAPIEnvelope(payload, true)
+	if object == nil || !hasProviderAPIOpenAIError(object.Error) {
 		return nil
 	}
-	restricted, err := json.Marshal(map[string]json.RawMessage{"error": object["error"]})
-	if err != nil {
+	return providerAPIErrorFromEnvelope(object)
+}
+
+// 控制证据只保留相关值在原输入中的切片，不复制 output、delta 或其他扩展。
+// 它不授予原文回放权限；对客诊断脱敏由 providerresponse 尽力处理。
+type providerAPIEnvelope struct {
+	Type, Code, Message, Param, StatusCode, Status, Error json.RawMessage
+	Response, ResponseError                               json.RawMessage
+}
+
+func readProviderAPIEnvelope(raw []byte, openAIOnly bool) *providerAPIEnvelope {
+	var fields providerAPIEnvelope
+	// 沿用控制提取的 v1 解释规则；该投影不决定原文能否交付。
+	decoder := jsontext.NewDecoder(bytes.NewBuffer(raw), jsontext.AllowDuplicateNames(true), jsontext.AllowInvalidUTF8(true))
+	if decoder.PeekKind() != '{' || fields.read(decoder, raw, false, openAIOnly) != nil {
 		return nil
 	}
-	return ProviderAPIErrorFromPayload(restricted)
+	if _, err := decoder.ReadToken(); err != io.EOF {
+		return nil
+	}
+	return &fields
+}
+
+func (f *providerAPIEnvelope) read(decoder *jsontext.Decoder, raw []byte, response, openAIOnly bool) error {
+	if decoder.PeekKind() != '{' {
+		return decoder.SkipValue()
+	}
+	if _, err := decoder.ReadToken(); err != nil {
+		return err
+	}
+	for decoder.PeekKind() != '}' {
+		token, err := decoder.ReadToken()
+		if err != nil {
+			return err
+		}
+		key := token.String()
+		var target *json.RawMessage
+		if response {
+			// 原 response DTO 使用 encoding/json 的大小写兼容匹配。
+			switch {
+			case strings.EqualFold(key, "error"):
+				target = &f.ResponseError
+			}
+		} else if openAIOnly {
+			if key == "error" {
+				target = &f.Error
+			}
+		} else {
+			switch key {
+			case "type":
+				target = &f.Type
+			case "code":
+				target = &f.Code
+			case "message":
+				target = &f.Message
+			case "param":
+				target = &f.Param
+			case "status_code":
+				target = &f.StatusCode
+			case "status":
+				target = &f.Status
+			case "error":
+				target = &f.Error
+			case "response":
+				start := int(decoder.InputOffset())
+				f.ResponseError = nil
+				if err := f.read(decoder, raw, true, false); err != nil {
+					return err
+				}
+				for start < len(raw) && strings.ContainsRune(" \r\n\t,:", rune(raw[start])) {
+					start++
+				}
+				f.Response = raw[start:int(decoder.InputOffset())]
+				continue
+			}
+		}
+		start := int(decoder.InputOffset())
+		if err := decoder.SkipValue(); err != nil {
+			return err
+		}
+		if target != nil {
+			for start < len(raw) && strings.ContainsRune(" \r\n\t,:", rune(raw[start])) {
+				start++
+			}
+			*target = raw[start:int(decoder.InputOffset())]
+		}
+	}
+	_, err := decoder.ReadToken()
+	return err
 }
 
 type providerAPIErrorDetail struct {
@@ -123,6 +213,10 @@ func applyProviderAPIOpenAIError(detail *providerAPIErrorDetail, raw json.RawMes
 	if err := decoder.Decode(&openAIError); err != nil {
 		return
 	}
+	applyProviderAPITypedError(detail, openAIError)
+}
+
+func applyProviderAPITypedError(detail *providerAPIErrorDetail, openAIError types.OpenAIError) {
 	if errType := strings.TrimSpace(openAIError.Type); errType != "" {
 		detail.ErrType = errType
 	}
@@ -147,20 +241,16 @@ func applyProviderAPIResponseError(detail *providerAPIErrorDetail, raw json.RawM
 	var response struct {
 		Error *types.OpenAIError `json:"error,omitempty"`
 	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder := json.NewDecoder(bytes.NewBuffer(raw))
 	decoder.UseNumber()
 	if err := decoder.Decode(&response); err != nil || response.Error == nil {
 		return
 	}
-	encoded, err := json.Marshal(response.Error)
-	if err != nil {
-		return
-	}
-	applyProviderAPIOpenAIError(detail, encoded)
+	applyProviderAPITypedError(detail, *response.Error)
 }
 
-func providerAPIPayloadHasErrorSignal(object map[string]json.RawMessage, eventType string) bool {
-	if len(object) == 0 {
+func providerAPIPayloadHasErrorSignal(object *providerAPIEnvelope, eventType string) bool {
+	if object == nil {
 		return false
 	}
 	eventType = strings.TrimSpace(eventType)
@@ -170,27 +260,24 @@ func providerAPIPayloadHasErrorSignal(object map[string]json.RawMessage, eventTy
 	}
 
 	failedTerminal := providerAPIEventTypeIsFailedTerminal(eventType)
-	responseHasFailureStatus := providerAPIResponseHasFailureStatus(object["response"])
-	if (failedTerminal || responseHasFailureStatus) && providerAPIResponseHasError(object["response"]) {
-		return true
-	}
-
-	topLevelCode := rawProviderAPIString(object["code"])
-	topLevelMessage := rawProviderAPIString(object["message"])
+	topLevelCode := rawProviderAPIString(object.Code)
+	topLevelMessage := rawProviderAPIString(object.Message)
 	hasExplicitTopLevelDetail := topLevelCode != "" || topLevelMessage != ""
-	status := rawProviderAPIStatus(object["status_code"])
+	status := rawProviderAPIStatus(object.StatusCode)
 	if status <= 0 {
-		status = rawProviderAPIStatus(object["status"])
+		status = rawProviderAPIStatus(object.Status)
 	}
 	statusIndicatesHTTPError := status >= http.StatusBadRequest
 
-	if (failedTerminal || responseHasFailureStatus) && (hasExplicitTopLevelDetail || statusIndicatesHTTPError) {
+	// 成功响应没有错误候选时，无需再次读取整个 response 来判断 status。
+	if (hasProviderAPIOpenAIError(object.ResponseError) || hasExplicitTopLevelDetail || statusIndicatesHTTPError) &&
+		(failedTerminal || providerAPIResponseHasFailureStatus(object.Response)) {
 		return true
 	}
 
 	topLevelPayload := eventType == ""
 	eventTypeIsErrorDetail := meaningfulProviderAPIErrorType(eventType)
-	if (topLevelPayload || eventTypeIsErrorDetail) && hasProviderAPIOpenAIError(object["error"]) {
+	if (topLevelPayload || eventTypeIsErrorDetail) && hasProviderAPIOpenAIError(object.Error) {
 		return true
 	}
 
@@ -213,29 +300,12 @@ func providerAPIEventTypeIsFailedTerminal(eventType string) bool {
 }
 
 func hasProviderAPIOpenAIError(raw json.RawMessage) bool {
-	if len(raw) == 0 || string(bytes.TrimSpace(raw)) == "null" {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
 		return false
 	}
-	var object map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &object); err != nil {
-		return true
-	}
-	return len(object) > 0
-}
-
-func providerAPIResponseHasError(raw json.RawMessage) bool {
-	if len(raw) == 0 || string(bytes.TrimSpace(raw)) == "null" {
-		return false
-	}
-	var response struct {
-		Error json.RawMessage `json:"error,omitempty"`
-	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	if err := decoder.Decode(&response); err != nil {
-		return false
-	}
-	return hasProviderAPIOpenAIError(response.Error)
+	// Envelope 读取器已确认语法；只有空对象不提供错误信号。
+	return !(raw[0] == '{' && raw[len(raw)-1] == '}' && len(bytes.TrimSpace(raw[1:len(raw)-1])) == 0)
 }
 
 func providerAPIResponseHasFailureStatus(raw json.RawMessage) bool {
@@ -245,9 +315,7 @@ func providerAPIResponseHasFailureStatus(raw json.RawMessage) bool {
 	var response struct {
 		Status string `json:"status,omitempty"`
 	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	if err := decoder.Decode(&response); err != nil {
+	if err := json.Unmarshal(raw, &response); err != nil {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(response.Status)) {

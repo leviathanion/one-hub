@@ -21,6 +21,7 @@ var ErrNativeReadPumpPanic = errors.New("responses websocket native read pump pa
 
 // NativeSessionOptions configures the provider-native websocket transport.
 type NativeSessionOptions struct {
+	Credentials   []string
 	Context       context.Context
 	RecvQueueSize int
 	Diagnostics   NativeDiagnosticHook
@@ -35,6 +36,7 @@ type NativeSessionOptions struct {
 // NativeSession adapts a provider websocket into the ResponsesWS upstream
 // contract. It emits transport evidence; relay actor code owns accounting.
 type NativeSession struct {
+	credentials   []string
 	conn          *wsconn.ManagedConn
 	adapter       ProviderAdapter
 	base          context.Context
@@ -177,6 +179,7 @@ func NewNativeSession(conn *wsconn.ManagedConn, adapter ProviderAdapter, options
 	}
 	base, cancel := context.WithCancel(context.WithoutCancel(base))
 	return &NativeSession{
+		credentials:   append([]string(nil), options.Credentials...),
 		conn:          conn,
 		adapter:       adapter,
 		base:          base,
@@ -189,6 +192,10 @@ func NewNativeSession(conn *wsconn.ManagedConn, adapter ProviderAdapter, options
 		done:          make(chan struct{}),
 		events:        newNativeEventQueue(queueSize),
 	}
+}
+
+func (s *NativeSession) ProviderCredentials() []string {
+	return append([]string(nil), s.credentials...)
 }
 
 func (s *NativeSession) SendClientWithResult(ctx context.Context, req SendRequest) ResponsesWSTransportSendResult {

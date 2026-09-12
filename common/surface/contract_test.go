@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"one-api/common/logger"
+	"one-api/common/requestctx"
 	"strings"
 	"testing"
 
@@ -248,5 +249,70 @@ func TestOpenAIContractPreservesFallbackUpstream429Classification(t *testing.T) 
 	}
 	if got := recorder.Header().Get(logger.RequestIdKey); got != "req-local" {
 		t.Fatalf("expected proxy request id header, got %q", got)
+	}
+}
+
+func TestClientErrorCopyLeavesOriginalDiagnostics(t *testing.T) {
+	output := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(output)
+	original := &SurfaceError{Kind: ErrorKindUpstream, StatusCode: 401, Message: "account acct-private rejected", Code: "invalid_api_key", Type: "authentication_error", RawBody: []byte(`{ "error":{"message":"account acct-private rejected","code":"invalid_api_key"}, "future":9007199254740993 }`), ResponseHeaders: http.Header{"Digest": {"original"}}}
+	OpenAIContract().RenderJSONError(ctx, original)
+	if output.Code != 401 || !strings.Contains(output.Body.String(), `"code":"invalid_api_key"`) || strings.Contains(output.Body.String(), "acct-private") || output.Header().Get("Digest") != "" {
+		t.Fatalf("对客错误未保留协议或未处理诊断: %d %s", output.Code, output.Body.String())
+	}
+	if !strings.Contains(original.Message, "acct-private") || !strings.Contains(string(original.RawBody), "acct-private") || original.ResponseHeaders.Get("Digest") != "original" {
+		t.Fatal("原始观察/日志对象被修改")
+	}
+}
+
+func TestErrorContractsKeepNumericCodeAfterRedaction(t *testing.T) {
+	for _, contract := range []Contract{TaskContract(), RecraftContract(), ClaudeContract()} {
+		t.Run(contract.Name(), func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			contract.RenderJSONError(c, &SurfaceError{StatusCode: 403, Kind: ErrorKindUpstream, Type: "provider_error", Code: 403, Message: "upstream rejected account_id=private"})
+			var body map[string]json.RawMessage
+			if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			field := "code"
+			if contract.Name() == "claude" {
+				field = "type"
+			}
+			if recorder.Code != 403 || string(body[field]) != `"403"` || strings.Contains(recorder.Body.String(), "private") {
+				t.Fatalf("错误码或诊断呈现错误: %d %s", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestErrorContractsDecideStatusBeforeRedaction(t *testing.T) {
+	for _, contract := range []Contract{OpenAIContract(), ClaudeContract(), GeminiContract(), TaskContract(), RecraftContract(), RerankContract()} {
+		t.Run(contract.Name(), func(t *testing.T) {
+			for _, test := range []struct {
+				name       string
+				err        SurfaceError
+				wantStatus int
+			}{
+				{"existing quota mapping", SurfaceError{StatusCode: 502, Kind: ErrorKindUpstream, Code: "upstream_failed", Type: "one_hub_error", Message: "upstream unavailable for quota-provider-secret"}, 429},
+				{"provider protocol", SurfaceError{StatusCode: 403, Kind: ErrorKindUpstream, Code: "resource_unavailable", Type: "provider_error", Message: "upstream unavailable for quota-provider-secret"}, 403},
+				{"local quota", SurfaceError{StatusCode: 429, Kind: ErrorKindLocal, Local: true, Code: "proxy_rate_limit", Type: "one_hub_error", Message: "internal limiter detail"}, 429},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					for _, credentials := range [][]string{nil, {"quota-provider-secret"}} {
+						recorder := httptest.NewRecorder()
+						c, _ := gin.CreateTestContext(recorder)
+						requestctx.SetProviderCredentials(c, credentials)
+						contract.RenderJSONError(c, &test.err)
+						if recorder.Code != test.wantStatus {
+							t.Fatalf("脱敏改变了协议决策: credentials=%v status=%d body=%s", len(credentials) > 0, recorder.Code, recorder.Body.String())
+						}
+						if len(credentials) > 0 && strings.Contains(recorder.Body.String(), "quota-provider-secret") {
+							t.Fatalf("对客诊断未脱敏: %s", recorder.Body.String())
+						}
+					}
+				})
+			}
+		})
 	}
 }

@@ -28,8 +28,8 @@ type OpenAIStreamHandler struct {
 	// ExposeProviderUsage records the downstream contract before the adapter
 	// temporarily enables provider-side usage for settlement evidence.
 	ExposeProviderUsage bool
-	ProviderCredential  string
-	sseFramer           *requester.SSEEventFramer
+
+	sseFramer *requester.SSEEventFramer
 }
 
 func (p *OpenAIProvider) CreateChatCompletion(request *types.ChatCompletionRequest) (openaiResponse *types.ChatCompletionResponse, errWithCode *types.OpenAIErrorWithStatusCode) {
@@ -112,7 +112,7 @@ func safeCompatibleChatResponseReplay(raw []byte, response *types.ChatCompletion
 	if len(raw) == 0 || response == nil {
 		return nil, nil
 	}
-	safeRaw, _ := common.RedactProviderMetadataJSON(raw)
+	safeRaw := raw
 	var object map[string]json.RawMessage
 	if err := json.Unmarshal(safeRaw, &object); err != nil {
 		return nil, err
@@ -205,7 +205,6 @@ func (p *OpenAIProvider) CreateChatCompletionStream(request *types.ChatCompletio
 
 		UsageHandler:        p.UsageHandler,
 		ExposeProviderUsage: streamOptions != nil && streamOptions.IncludeUsage,
-		ProviderCredential:  p.Channel.Key,
 	}
 	options := requester.StreamReadOptions{
 		RequireProtocolTerminal: p.RequireOpenAIStreamTerminal,
@@ -228,9 +227,6 @@ func (h *OpenAIStreamHandler) HandlerChatStream(rawLine *[]byte, dataChan chan s
 	// 去除前缀
 	*rawLine = (*rawLine)[5:]
 	*rawLine = bytes.TrimSpace(*rawLine)
-	if safe, changed := common.RedactCredentialValuesText(string(*rawLine), h.ProviderCredential); changed {
-		*rawLine = []byte(safe)
-	}
 
 	// 如果等于 DONE 则结束
 	if string(*rawLine) == "[DONE]" {
@@ -303,7 +299,7 @@ func (h *OpenAIStreamHandler) handleExactSSE(rawLine *[]byte, emitter requester.
 		return
 	}
 
-	safeEvent, _ := common.RedactCredentialValuesText(string(event), h.ProviderCredential)
+	safeEvent := string(event)
 	payload, hasData := commonresponses.SSEDataPayload(safeEvent)
 	if hasData && strings.TrimSpace(payload) == "[DONE]" {
 		if emitter.SendData(safeEvent) {

@@ -605,7 +605,7 @@ func (r *relayResponses) compatibleSend(chatProvider providersBase.ChatInterface
 		if channel := r.provider.GetChannel(); channel != nil {
 			recordResponsesChannelAffinity(r.c, channel.Id, responseResp)
 		}
-		responseJsonClient(r.c, responseResp)
+		errWithCode = responseJsonClient(r.c, responseResp)
 	}
 
 	if errWithCode != nil {
@@ -682,14 +682,32 @@ func (r *relayResponses) chatToResponseStreamClient(stream requester.StreamReade
 
 	defer requester.CloseAndDrainStream(stream)
 	streamWriter := relay_util.NewBufferedStreamWriter(r.c.Writer, 0)
-	relay_util.SetStreamWriter(r.c, streamWriter)
-	defer func() {
-		_ = streamWriter.Close()
-		relay_util.ClearStreamWriter(r.c)
-	}()
+	defer streamWriter.Close()
 	var isFirstResponse bool
 
-	converter := relay_util.NewOpenAIResponsesStreamConverter(r.c, &r.responsesRequest, r.provider.GetUsage())
+	credentials := requestctx.ProviderCredentials(r.c)
+	writeEvent := func(event string, payload []byte) error {
+		// 转换后的正文也保持原值；仅处理明确的错误事件。
+		safe := payload
+		if event == "error" || event == "response.failed" || event == "response.incomplete" {
+			safe = redactProviderErrorPayload(payload, credentials...)
+		}
+		_, err := streamWriter.WriteString("event: " + event + "\ndata: " + string(safe) + "\n\n")
+		return err
+	}
+	converter := relay_util.NewOpenAIResponsesStreamConverter(writeEvent, &r.responsesRequest, r.provider.GetUsage())
+	streamFailure := func(err error, code string) *types.OpenAIErrorWithStatusCode {
+		if r.c.Writer.Written() {
+			r.c.Set(responsesStreamErrorAlreadyRenderedContextKey, true)
+		}
+		var failure *types.OpenAIErrorWithStatusCode
+		if errors.As(err, &failure) && failure != nil && failure.LocalError {
+			return failure
+		}
+		failure = common.ErrorWrapper(err, code, http.StatusBadGateway)
+		failure.UpstreamAccepted = true
+		return failure
+	}
 	dataOpen := dataChan != nil
 	errOpen := errChan != nil
 
@@ -707,44 +725,47 @@ func (r *relayResponses) chatToResponseStreamClient(stream requester.StreamReade
 				return nil
 			}
 			if providerErr := runtimesession.OpenAIErrorEnvelopeFromPayload([]byte(payload)); providerErr != nil {
-				if converter.ProcessStreamError() != nil {
+				if writeErr := converter.ProcessStreamError(); writeErr != nil {
+					return streamFailure(writeErr, "stream_write_failed")
+				}
+				if r.c.Writer.Written() {
 					r.c.Set(responsesStreamErrorAlreadyRenderedContextKey, true)
 				}
-				safeErr := providerresponse.SanitizeAPIError(providerErr)
-				safeErr.UpstreamAccepted = true
-				return safeErr
+				providerErr.UpstreamAccepted = true
+				return providerErr
 			}
 			data = payload
 		}
 
 		if err := converter.ProcessStreamData(data); err != nil {
-			r.c.Set(responsesStreamErrorAlreadyRenderedContextKey, true)
-			return common.ErrorWrapper(err, relay_util.ResponsesStreamFailureCode(err), http.StatusBadGateway)
+			return streamFailure(err, relay_util.ResponsesStreamFailureCode(err))
 		}
 		return nil
 	}
 
-	handleEOF := func() {
+	handleEOF := func() error {
 		// EOF/terminal has been dequeued, but the producer may still be returning
 		// from its handler. Drain it before the converter reads provider-owned usage.
 		requester.CloseAndDrainStream(stream)
-		converter.ProcessStreamData("[DONE]")
+		return converter.ProcessStreamData("[DONE]")
 	}
 
-	handleError := func(err error) {
+	handleError := func(err error) error {
 		if isStreamTerminalEOF(err) {
-			handleEOF()
-			return
+			return handleEOF()
 		}
+		logger.LogError(r.c.Request.Context(), "Stream err:"+err.Error())
 		select {
 		case <-r.c.Request.Context().Done():
 		default:
-			if converter.ProcessStreamError() != nil {
+			if writeErr := converter.ProcessStreamError(); writeErr != nil {
+				return writeErr
+			}
+			if r.c.Writer.Written() {
 				r.c.Set(responsesStreamErrorAlreadyRenderedContextKey, true)
 			}
 		}
-
-		logger.LogError(r.c.Request.Context(), "Stream err:"+common.RedactSensitiveText(err.Error()))
+		return err
 	}
 
 	for dataOpen || errOpen {
@@ -782,15 +803,20 @@ func (r *relayResponses) chatToResponseStreamClient(stream requester.StreamReade
 				errChan = nil
 				continue
 			}
-			handleError(err)
-			if !isStreamTerminalEOF(err) {
-				return firstResponseTime, converter.FinalResponse(), common.ErrorWrapper(err, "stream_read_failed", http.StatusBadGateway)
+			if failure := handleError(err); failure != nil {
+				code := "stream_read_failed"
+				if isStreamTerminalEOF(err) {
+					code = relay_util.ResponsesStreamFailureCode(failure)
+				}
+				return firstResponseTime, converter.FinalResponse(), streamFailure(failure, code)
 			}
 			return firstResponseTime, converter.FinalResponse(), nil
 		}
 	}
 
-	handleEOF()
+	if err := handleEOF(); err != nil {
+		return firstResponseTime, converter.FinalResponse(), streamFailure(err, relay_util.ResponsesStreamFailureCode(err))
+	}
 	return firstResponseTime, converter.FinalResponse(), nil
 }
 

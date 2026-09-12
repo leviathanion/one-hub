@@ -10,6 +10,7 @@ import (
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/logger"
+	"one-api/common/providerresponse"
 	"one-api/common/wsconn"
 	runtimerealtime "one-api/runtime/realtime"
 	"one-api/types"
@@ -390,22 +391,14 @@ func (b *realtimeRelayActor) sessionToClient() {
 		event, err := b.session.Recv(b.ctx)
 		if err != nil {
 			if event.ProviderClose != nil {
-				exit := b.providerCloseExit(event.ProviderClose, err)
+				exit := b.providerCloseExit(event.ProviderClose, err, event.Credentials.ProviderCredentials()...)
 				b.closeDownstream(exit.downstreamCloseCode, exit.downstreamCloseReason)
 				b.emitExit(exit)
 				return
 			}
 			deliveredPayload := b.deliverEventFrame(event)
-			if !b.dropDownstreamWrites.Load() {
-				if errorPayload := runtimerealtime.ClientPayloadFromError(err); errorPayload != nil {
-					deliveredFramePayload := []byte(nil)
-					if event.Frame != nil {
-						deliveredFramePayload = event.Frame.Payload()
-					}
-					if !(deliveredPayload && bytes.Equal(errorPayload, deliveredFramePayload)) {
-						_ = b.writeClientMessage(wsconn.TextMessage, errorPayload)
-					}
-				}
+			if !b.deliverErrorPayload(event, err, deliveredPayload) {
+				return
 			}
 			b.emitExit(realtimeRelayExit{source: "supplier", err: err, graceful: errors.Is(err, runtimerealtime.ErrSessionClosed) || errors.Is(err, context.Canceled)})
 			return
@@ -413,29 +406,45 @@ func (b *realtimeRelayActor) sessionToClient() {
 
 		b.markActivity(time.Now())
 		if event.ProviderClose != nil {
-			exit := b.providerCloseExit(event.ProviderClose, event.ProviderClose.Err)
+			exit := b.providerCloseExit(event.ProviderClose, event.ProviderClose.Err, event.Credentials.ProviderCredentials()...)
 			b.closeDownstream(exit.downstreamCloseCode, exit.downstreamCloseReason)
 			b.emitExit(exit)
 			return
 		}
 		if event.Err != nil {
 			deliveredPayload := b.deliverEventFrame(event)
-			if !b.dropDownstreamWrites.Load() {
-				if errorPayload := runtimerealtime.ClientPayloadFromError(event.Err); errorPayload != nil {
-					deliveredFramePayload := []byte(nil)
-					if event.Frame != nil {
-						deliveredFramePayload = event.Frame.Payload()
-					}
-					if !(deliveredPayload && bytes.Equal(errorPayload, deliveredFramePayload)) {
-						_ = b.writeClientMessage(wsconn.TextMessage, errorPayload)
-					}
-				}
+			if !b.deliverErrorPayload(event, event.Err, deliveredPayload) {
+				return
 			}
 			b.emitExit(realtimeRelayExit{source: "supplier", err: event.Err})
 			return
 		}
 		b.deliverEventFrame(event)
 	}
+}
+
+// 帧和错误可携带同一 payload；按原始内容去重，在交付副本上脱敏。
+func (b *realtimeRelayActor) deliverErrorPayload(event runtimerealtime.RecvEvent, err error, frameDelivered bool) bool {
+	payload := runtimerealtime.ClientPayloadFromError(err)
+	if b.dropDownstreamWrites.Load() || payload == nil || frameDelivered && event.Frame != nil && bytes.Equal(payload, event.Frame.Payload()) {
+		return true
+	}
+	safe, _ := providerresponse.SanitizeErrorResponse(payload, b.providerCredentials(event)...)
+	if writeErr := b.writeClientMessage(wsconn.TextMessage, safe); writeErr != nil {
+		b.emitExit(realtimeRelayExit{source: "user", err: writeErr})
+		return false
+	}
+	return true
+}
+
+func (b *realtimeRelayActor) providerCredentials(event runtimerealtime.RecvEvent) []string {
+	if event.Credentials != nil {
+		return event.Credentials.ProviderCredentials()
+	}
+	if source, ok := b.session.(providerresponse.CredentialSource); ok {
+		return source.ProviderCredentials()
+	}
+	return nil
 }
 
 func (b *realtimeRelayActor) deliverEventFrame(event runtimerealtime.RecvEvent) bool {
@@ -445,8 +454,8 @@ func (b *realtimeRelayActor) deliverEventFrame(event runtimerealtime.RecvEvent) 
 	mt := realtimeRelayMessageTypeFromFrame(*event.Frame)
 	payload := event.Frame.Payload()
 	b.observeProviderPayload(mt, payload, event.Origin)
-	if event.Origin == runtimerealtime.RealtimePayloadOriginProvider {
-		payload = sanitizeProviderJSONPayload(payload)
+	if mt == wsconn.TextMessage {
+		payload = redactProviderErrorPayload(payload, b.providerCredentials(event)...)
 	}
 	if err := b.writeClientMessage(mt, payload); err != nil {
 		b.emitExit(realtimeRelayExit{source: "supplier", err: err, graceful: realtimeRelayDisconnectError(err)})
@@ -455,7 +464,12 @@ func (b *realtimeRelayActor) deliverEventFrame(event runtimerealtime.RecvEvent) 
 	return true
 }
 
-func (b *realtimeRelayActor) providerCloseExit(closeInfo *runtimerealtime.ProviderClose, fallbackErr error) realtimeRelayExit {
+func (b *realtimeRelayActor) providerCloseExit(closeInfo *runtimerealtime.ProviderClose, fallbackErr error, credentials ...string) realtimeRelayExit {
+	if len(credentials) == 0 {
+		if source, ok := b.session.(providerresponse.CredentialSource); ok {
+			credentials = source.ProviderCredentials()
+		}
+	}
 	if closeInfo == nil {
 		return realtimeRelayExit{source: "supplier", err: fallbackErr, graceful: errors.Is(fallbackErr, runtimerealtime.ErrSessionClosed) || errors.Is(fallbackErr, context.Canceled)}
 	}
@@ -469,7 +483,7 @@ func (b *realtimeRelayActor) providerCloseExit(closeInfo *runtimerealtime.Provid
 		graceful:              true,
 		hasDownstreamClose:    true,
 		downstreamCloseCode:   wsconn.SanitizeWireCloseCode(closeInfo.Code),
-		downstreamCloseReason: common.RedactSensitiveText(closeInfo.Reason),
+		downstreamCloseReason: common.SafeClientErrorText(closeInfo.Reason, credentials...),
 	}
 }
 

@@ -40,11 +40,12 @@ func (p *OpenAIProvider) OpenResponsesWS(ctx context.Context, req *responsesws.O
 	if !p.supportsNativeResponsesWSTransport() {
 		return nil, responsesWSUnsupportedForChannel()
 	}
-	conn, errWithCode := p.openResponsesWSConnWithHeaders(ctx, modelName, req.InboundHeaders)
+	conn, credentials, errWithCode := p.openResponsesWSConnWithHeaders(ctx, modelName, req.InboundHeaders)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
 	return responsesws.NewNativeSession(conn, &openAIResponsesWSAdapter{}, responsesws.NativeSessionOptions{
+		Credentials:  credentials,
 		Context:      ctx,
 		Diagnostics:  req.Diagnostics,
 		ProviderName: "openai",

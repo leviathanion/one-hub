@@ -2,6 +2,7 @@ package providerresponse
 
 import (
 	"net/http"
+	"one-api/common"
 	"strings"
 )
 
@@ -136,4 +137,24 @@ func operationSupportsDownload(operation Operation) bool {
 	default:
 		return false
 	}
+}
+
+// FilterCredentialHeaders 只移除泄漏实际凭据的头部，不扩大已授权头部集合。
+func FilterCredentialHeaders(source http.Header, credentials ...string) http.Header {
+	var safe http.Header
+	for name, values := range source {
+		for _, value := range values {
+			if _, secret := common.RedactCredentialValuesText(value, credentials...); secret {
+				if safe == nil {
+					safe = source.Clone()
+				}
+				safe.Del(name)
+				break
+			}
+		}
+	}
+	if safe != nil {
+		return safe
+	}
+	return source
 }

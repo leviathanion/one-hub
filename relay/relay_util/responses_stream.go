@@ -10,8 +10,6 @@ import (
 	commonresponses "one-api/common/responses"
 	"one-api/common/utils"
 	"one-api/types"
-
-	"github.com/gin-gonic/gin"
 )
 
 type responsesHandler func(response *types.OpenAIResponsesStreamResponses)
@@ -31,7 +29,7 @@ type OpenAIResponsesStreamConverter struct {
 	isCompleted       bool
 	isTerminal        bool
 	terminalErr       error
-	c                 *gin.Context
+	writeEvent        func(string, []byte) error
 	nowStatus         string
 	lastToolCallIndex int
 	usage             *types.Usage
@@ -45,14 +43,14 @@ const responsesStreamConverterMaxProcessedBytes int64 = 64 << 20
 
 var errResponsesStreamConverterStateLimit = errors.New("responses stream converter state limit exceeded")
 
-func NewOpenAIResponsesStreamConverter(c *gin.Context, request *types.OpenAIResponsesRequest, usage *types.Usage) *OpenAIResponsesStreamConverter {
+func NewOpenAIResponsesStreamConverter(writeEvent func(string, []byte) error, request *types.OpenAIResponsesRequest, usage *types.Usage) *OpenAIResponsesStreamConverter {
 	converter := &OpenAIResponsesStreamConverter{
 		sequenceNumber:    0,
 		outputIndex:       0,
 		contentIndex:      0,
 		summaryIndex:      0,
 		isFirstResponse:   true,
-		c:                 c,
+		writeEvent:        writeEvent,
 		lastToolCallIndex: -1,
 		usage:             usage,
 		maxProcessedBytes: responsesStreamConverterMaxProcessedBytes,
@@ -112,7 +110,7 @@ func (converter *OpenAIResponsesStreamConverter) ProcessStreamData(jsonStr strin
 	}
 	if jsonStr == "[DONE]" {
 		converter.finalizeStream()
-		return nil
+		return converter.terminalErr
 	}
 	incomingBytes := int64(len(jsonStr))
 	if incomingBytes > converter.maxProcessedBytes-converter.processedBytes {
@@ -145,7 +143,7 @@ func (converter *OpenAIResponsesStreamConverter) ProcessStreamData(jsonStr strin
 	}
 
 	converter.processChoices(response.Choices)
-	return nil
+	return converter.terminalErr
 }
 
 func ResponsesStreamFailureCode(err error) string {
@@ -239,7 +237,7 @@ func (converter *OpenAIResponsesStreamConverter) validateChatStreamChoicesForRes
 }
 
 func (converter *OpenAIResponsesStreamConverter) ProcessStreamError() error {
-	return converter.sendError("invalid_provider_response", "stream interrupted", errors.New("chat completion stream interrupted"))
+	return converter.sendError("invalid_provider_response", "stream interrupted", nil)
 }
 
 // 处理choices
@@ -572,10 +570,9 @@ func (converter *OpenAIResponsesStreamConverter) finalizeStream() {
 	if converter.usage != nil && converter.usage.HasProviderUsage() {
 		response.Response.Usage = converter.usage.ToResponsesUsage()
 	}
-	converter.isCompleted = true
 	converter.isTerminal = true
-
 	converter.sendStreamEvent(response, respType)
+	converter.isCompleted = converter.terminalErr == nil
 }
 
 func (converter *OpenAIResponsesStreamConverter) FinalResponse() *types.OpenAIResponsesResponses {
@@ -587,19 +584,19 @@ func (converter *OpenAIResponsesStreamConverter) FinalResponse() *types.OpenAIRe
 	return &response
 }
 
-// 获取响应流字符串
+// 转换器只生成完整事件；交付方负责安全策略、SSE 编码和 I/O。
 func (converter *OpenAIResponsesStreamConverter) sendStreamEvent(resp any, responseType string) {
-	respStr, err := json.Marshal(resp)
-	if err != nil {
+	if converter.terminalErr != nil {
 		return
 	}
-
-	writer := GetStreamWriter(converter.c)
-	_, _ = writer.WriteString("event: ")
-	_, _ = writer.WriteString(responseType)
-	_, _ = writer.WriteString("\ndata: ")
-	_, _ = writer.Write(respStr)
-	_, _ = writer.WriteString("\n\n")
+	payload, err := json.Marshal(resp)
+	if err == nil {
+		err = converter.writeEvent(responseType, payload)
+	}
+	if err != nil {
+		converter.isTerminal = true
+		converter.terminalErr = err
+	}
 }
 
 // 错误响应
@@ -611,11 +608,13 @@ func (converter *OpenAIResponsesStreamConverter) sendError(code, message string,
 		return converter.terminalErr
 	}
 	converter.isTerminal = true
-	converter.terminalErr = terminalErr
 	response := commonresponses.NewStreamErrorEvent(int64(converter.sequenceNumber), code, message)
 	converter.sequenceNumber++
 	converter.sendStreamEvent(response, "error")
-	return terminalErr
+	if converter.terminalErr == nil {
+		converter.terminalErr = terminalErr
+	}
+	return converter.terminalErr
 }
 
 func (converter *OpenAIResponsesStreamConverter) generateResponseItemID(responseType string) {

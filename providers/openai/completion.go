@@ -58,7 +58,7 @@ func (p *OpenAIProvider) CreateCompletion(request *types.CompletionRequest) (ope
 	bodyUnmodified := false
 	if captureSameDialect {
 		originalRaw := response.ProviderRawJSON()
-		safeRaw, _ := common.RedactProviderMetadataJSON(originalRaw)
+		safeRaw := originalRaw
 		response.SetProviderRawJSON(safeRaw)
 		response.EnableProviderRawJSONReplay()
 		bodyUnmodified = len(originalRaw) > 0 && bytes.Equal(originalRaw, safeRaw)
@@ -111,7 +111,6 @@ func (p *OpenAIProvider) CreateCompletionStream(request *types.CompletionRequest
 		Usage:               p.Usage,
 		ModelName:           request.Model,
 		ExposeProviderUsage: streamOptions != nil && streamOptions.IncludeUsage,
-		ProviderCredential:  p.Channel.Key,
 	}
 	options := requester.StreamReadOptions{
 		RequireProtocolTerminal: p.RequireOpenAIStreamTerminal,
@@ -133,9 +132,6 @@ func (h *OpenAIStreamHandler) handlerCompletionStream(rawLine *[]byte, dataChan 
 
 	// 去除前缀
 	*rawLine = bytes.TrimSpace((*rawLine)[5:])
-	if safe, changed := common.RedactCredentialValuesText(string(*rawLine), h.ProviderCredential); changed {
-		*rawLine = []byte(safe)
-	}
 
 	// 如果等于 DONE 则结束
 	if string(*rawLine) == "[DONE]" {

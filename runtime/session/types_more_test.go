@@ -25,6 +25,31 @@ func TestProviderAPIErrorFromPayloadParsesNestedProviderPayload(t *testing.T) {
 	}
 }
 
+func TestProviderAPIErrorProjectionPreservesLateAndNestedEvidence(t *testing.T) {
+	payload := []byte(`{"future":{"output":[{"text":"safe"}]},"response":{"output":[],"Status":"failed","Error":{"code":"rate_limit_exceeded","message":"slow down"}},"type":"response.failed"}`)
+	apiErr := ProviderAPIErrorFromPayload(payload)
+	if apiErr == nil || apiErr.Code != "rate_limit_exceeded" || apiErr.Message != "slow down" || apiErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("延后字段或 response 兼容匹配丢失: %+v", apiErr)
+	}
+	if apiErr := OpenAIErrorEnvelopeFromPayload(payload); apiErr != nil {
+		t.Fatalf("Chat 错误检测错误地消费了 Responses 错误: %+v", apiErr)
+	}
+	if apiErr := ProviderAPIErrorFromPayload([]byte(`{"Type":"error","delta":"ordinary"}`)); apiErr != nil {
+		t.Fatalf("顶层非标准字段变成错误信号: %+v", apiErr)
+	}
+}
+
+func TestProviderAPIErrorProjectionRetainsTypedDecodeFailure(t *testing.T) {
+	apiErr := ProviderAPIErrorFromPayload([]byte(`{"code":"bad_input","message":"bad input","response":{"error":"invalid detail","Error":{"code":"invalid_api_key"}}}`))
+	if apiErr == nil || apiErr.Code != "bad_input" || apiErr.StatusCode == http.StatusUnauthorized {
+		t.Fatalf("忽略早先的类型错误，错误地投影成了认证故障: %+v", apiErr)
+	}
+	apiErr = ProviderAPIErrorFromPayload([]byte(`{"type":"response.completed","message":"ordinary","response":{"status":1,"Status":"failed"}}`))
+	if apiErr != nil {
+		t.Fatalf("类型错误之后的字段覆盖被当成了可靠失败状态: %+v", apiErr)
+	}
+}
+
 func TestProviderAPIErrorFromPayloadParsesTopLevelProviderPayload(t *testing.T) {
 	apiErr := ProviderAPIErrorFromPayload([]byte(`{"code":"invalid_api_key","message":"bad key"}`))
 	if apiErr == nil {
@@ -333,5 +358,20 @@ func TestBuildBindingAndParseBindingEdgeCases(t *testing.T) {
 	}
 	if _, _, _, ok := parseBindingKey("bad%2/path/shape"); ok {
 		t.Fatal("expected parseBindingKey to reject invalid escaping")
+	}
+}
+
+func TestProviderErrorControlRequiresCompleteJSON(t *testing.T) {
+	payload := `{"type":"error","error":{"code":"insufficient_quota","message":"account depleted"}}`
+	if err := ProviderAPIErrorFromPayload([]byte(payload)); err == nil || !err.ProviderQuotaExhausted {
+		t.Fatalf("有效错误丢失分类: %+v", err)
+	}
+	for _, tail := range []string{" garbage", " {}", " null"} {
+		if err := ProviderAPIErrorFromPayload([]byte(payload + tail)); err != nil {
+			t.Fatalf("非法尾部成为控制证据: %+v", err)
+		}
+		if err := OpenAIErrorEnvelopeFromPayload([]byte(payload + tail)); err != nil {
+			t.Fatalf("Chat 非法尾部成为控制证据: %+v", err)
+		}
 	}
 }

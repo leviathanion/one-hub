@@ -10,6 +10,7 @@ import (
 
 	"one-api/common"
 	"one-api/common/config"
+	"one-api/common/providerresponse"
 	"one-api/common/requester"
 	commonresponses "one-api/common/responses"
 	"one-api/common/responsesws"
@@ -20,6 +21,7 @@ import (
 )
 
 type codexResponsesWSAdapter struct {
+	credentials          []string
 	provider             *CodexProvider
 	model                string
 	identity             wire.Identity
@@ -71,6 +73,7 @@ func (p *CodexProvider) OpenResponsesWS(ctx context.Context, req *responsesws.Op
 	}
 
 	adapter := &codexResponsesWSAdapter{
+		credentials:          providerresponse.ConnectionCredentials(openPlan.conn.wsURL, codexRealtimeHTTPHeader(openPlan.conn.headers)),
 		provider:             p,
 		model:                normalizedModel,
 		identity:             openPlan.identity,
@@ -78,6 +81,7 @@ func (p *CodexProvider) OpenResponsesWS(ctx context.Context, req *responsesws.Op
 		autoStampStreamStart: openPlan.autoStampStreamStart,
 	}
 	return responsesws.NewNativeSession(conn, adapter, responsesws.NativeSessionOptions{
+		Credentials:  providerresponse.ConnectionCredentials(openPlan.conn.wsURL, codexRealtimeHTTPHeader(openPlan.conn.headers)),
 		Context:      ctx,
 		Diagnostics:  req.Diagnostics,
 		ProviderName: "codex",

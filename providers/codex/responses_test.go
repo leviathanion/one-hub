@@ -755,7 +755,7 @@ func TestCollectResponsesStreamResponseMapsStatuslessErrorsByEvidence(t *testing
 	}
 }
 
-func TestCollectResponsesStreamResponseHidesProviderAccountError(t *testing.T) {
+func TestCollectResponsesStreamResponsePreservesProviderAccountError(t *testing.T) {
 	provider := &CodexProvider{}
 	stream := &fakeStringStream{
 		dataChan: make(chan string, 1),
@@ -769,12 +769,12 @@ func TestCollectResponsesStreamResponseHidesProviderAccountError(t *testing.T) {
 	if errWithCode == nil || !errWithCode.ProviderAuthRejected || errWithCode.UpstreamAccepted {
 		t.Fatalf("unexpected mapped account error: %+v", errWithCode)
 	}
-	if errWithCode.Code != "provider_account_error" || strings.Contains(errWithCode.Message, "org-secret") || strings.Contains(errWithCode.Message, "deactivated") {
-		t.Fatalf("provider account detail leaked: %+v", errWithCode)
+	if errWithCode.Code != "account_deactivated" || !strings.Contains(errWithCode.Message, "org-secret") {
+		t.Fatalf("原始账号诊断丢失: %+v", errWithCode)
 	}
 }
 
-func TestCollectResponsesStreamResponseHidesStatusOnlyProviderAccountError(t *testing.T) {
+func TestCollectResponsesStreamResponsePreservesStatusOnlyProviderAccountError(t *testing.T) {
 	provider := &CodexProvider{}
 	stream := &fakeStringStream{
 		dataChan: make(chan string, 1),
@@ -785,11 +785,11 @@ func TestCollectResponsesStreamResponseHidesStatusOnlyProviderAccountError(t *te
 	close(stream.errChan)
 
 	_, errWithCode := provider.collectResponsesStreamResponse(stream)
-	if errWithCode == nil || !errWithCode.ProviderAuthRejected || errWithCode.Code != "provider_account_error" {
+	if errWithCode == nil || !errWithCode.ProviderAuthRejected || errWithCode.Code != "unauthorized" {
 		t.Fatalf("unexpected mapped account error: %+v", errWithCode)
 	}
-	if strings.Contains(errWithCode.Message, "org-secret") || strings.Contains(errWithCode.Message, "deactivated") {
-		t.Fatalf("provider account detail leaked: %+v", errWithCode)
+	if !strings.Contains(errWithCode.Message, "org-secret") {
+		t.Fatalf("原始账号诊断丢失: %+v", errWithCode)
 	}
 }
 
@@ -809,7 +809,7 @@ func TestCollectResponsesStreamResponsePreservesRequestLevelForbidden(t *testing
 	}
 }
 
-func TestCollectResponsesStreamResponseStillHidesStructuredForbiddenAuth(t *testing.T) {
+func TestCollectResponsesStreamResponsePreservesStructuredForbiddenAuth(t *testing.T) {
 	provider := &CodexProvider{}
 	stream := &fakeStringStream{
 		dataChan: make(chan string, 1),
@@ -820,11 +820,11 @@ func TestCollectResponsesStreamResponseStillHidesStructuredForbiddenAuth(t *test
 	close(stream.errChan)
 
 	_, errWithCode := provider.collectResponsesStreamResponse(stream)
-	if errWithCode == nil || !errWithCode.ProviderAuthRejected || errWithCode.Code != "provider_account_error" {
+	if errWithCode == nil || !errWithCode.ProviderAuthRejected || errWithCode.Code != "invalid_api_key" {
 		t.Fatalf("structured forbidden auth was not classified: %+v", errWithCode)
 	}
-	if strings.Contains(errWithCode.Message, "org-secret") || strings.Contains(errWithCode.Message, "credential") {
-		t.Fatalf("structured forbidden auth detail leaked: %+v", errWithCode)
+	if !strings.Contains(errWithCode.Message, "org-secret") {
+		t.Fatalf("原始认证诊断丢失: %+v", errWithCode)
 	}
 }
 

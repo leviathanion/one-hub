@@ -172,7 +172,7 @@ func (c *OAuth2Credentials) Refresh(ctx context.Context, proxyURL string) error 
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		logTokenRefreshErrorBody(ctx, hasContext, resp.StatusCode, bodyBytes, c, clientID)
+		logTokenRefreshErrorBody(ctx, hasContext, resp.StatusCode, bodyBytes)
 		var errResp TokenRefreshError
 		if isTokenRefreshErrorJSON(bodyBytes, &errResp) {
 			errorType := redactTokenRefreshSecrets(errResp.Error, c, clientID)
@@ -233,8 +233,8 @@ func isTokenRefreshErrorJSON(bodyBytes []byte, errResp *TokenRefreshError) bool 
 	return strings.TrimSpace(errResp.Error) != "" || strings.TrimSpace(errResp.ErrorDescription) != ""
 }
 
-func logTokenRefreshErrorBody(ctx context.Context, hasContext bool, statusCode int, bodyBytes []byte, creds *OAuth2Credentials, clientID string) {
-	snippet := tokenRefreshErrorBodyLogSnippet(bodyBytes, creds, clientID)
+func logTokenRefreshErrorBody(ctx context.Context, hasContext bool, statusCode int, bodyBytes []byte) {
+	snippet := tokenRefreshErrorBodyLogSnippet(bodyBytes)
 	message := fmt.Sprintf("[Codex] Token refresh endpoint returned status %d body=%q", statusCode, snippet)
 	if len(bodyBytes) > tokenRefreshErrorBodyLogLimit {
 		message += " truncated=true"
@@ -246,24 +246,11 @@ func logTokenRefreshErrorBody(ctx context.Context, hasContext bool, statusCode i
 	logger.SysError(message)
 }
 
-func tokenRefreshErrorBodyLogSnippet(bodyBytes []byte, creds *OAuth2Credentials, clientID string) string {
+func tokenRefreshErrorBodyLogSnippet(bodyBytes []byte) string {
 	if len(bodyBytes) > tokenRefreshErrorBodyLogLimit {
 		bodyBytes = bodyBytes[:tokenRefreshErrorBodyLogLimit]
 	}
-	text := strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f {
-			return -1
-		}
-		return r
-	}, string(bodyBytes))
-	for _, secret := range tokenRefreshKnownSecrets(creds, clientID) {
-		text = strings.ReplaceAll(text, secret, "[redacted]")
-	}
-	text = common.RedactSensitiveAssignments(text)
-	if len(text) > tokenRefreshErrorBodyLogLimit {
-		text = text[:tokenRefreshErrorBodyLogLimit]
-	}
-	return text
+	return string(bodyBytes)
 }
 
 func redactTokenRefreshSecrets(text string, creds *OAuth2Credentials, clientID string) string {

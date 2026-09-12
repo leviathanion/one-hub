@@ -3,6 +3,7 @@ package base
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"one-api/common/config"
@@ -50,34 +51,43 @@ func TestGetRawBodyCachesRequestBodyOnDemand(t *testing.T) {
 }
 
 func TestSetContextMakesInboundCancellationTheRequesterDefault(t *testing.T) {
-	gin.SetMode(gin.TestMode)
+	for _, replace := range []bool{false, true} {
+		t.Run(fmt.Sprint(replace), func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
 
-	requestContext, cancel := context.WithCancel(context.Background())
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(requestContext)
+			requestContext, cancel := context.WithCancel(context.Background())
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(requestContext)
 
-	provider := &BaseProvider{
-		Channel:   &model.Channel{},
-		Requester: requester.NewHTTPRequester("", nil),
-	}
-	provider.SetContext(ctx)
-	req, err := provider.Requester.NewRequest(http.MethodPost, "https://provider.example/v1/chat/completions")
-	if err != nil {
-		t.Fatalf("build request: %v", err)
-	}
-	if err := req.Context().Err(); err != nil {
-		t.Fatalf("new upstream request started canceled: %v", err)
-	}
+			provider := &BaseProvider{
+				Channel:   &model.Channel{},
+				Requester: requester.NewHTTPRequester("", nil),
+			}
+			defer cancel()
+			provider.SetContext(ctx)
+			if replace {
+				provider.SetRequester(requester.NewHTTPRequester("", nil))
+			}
+			req, err := provider.Requester.NewRequest(http.MethodPost, "https://provider.example/v1/chat/completions")
+			if err != nil {
+				t.Fatalf("build request: %v", err)
+			}
+			if err := req.Context().Err(); err != nil {
+				t.Fatalf("new upstream request started canceled: %v", err)
+			}
 
-	cancel()
-	select {
-	case <-req.Context().Done():
-		if !errors.Is(req.Context().Err(), context.Canceled) {
-			t.Fatalf("upstream request context error = %v, want context.Canceled", req.Context().Err())
-		}
-	case <-time.After(time.Second):
-		t.Fatal("upstream request did not observe inbound cancellation")
+			cancel()
+			select {
+			case <-req.Context().Done():
+				if !errors.Is(req.Context().Err(), context.Canceled) {
+					t.Fatalf("upstream request context error = %v, want context.Canceled", req.Context().Err())
+				}
+			case <-time.After(time.Second):
+				t.Fatal("upstream request did not observe inbound cancellation")
+			}
+
+		})
 	}
 }
 
@@ -184,7 +194,7 @@ func TestCommonRequestHeadersFiltersProtectedModelHeaders(t *testing.T) {
 	}
 }
 
-func TestLogChannelConfigParseErrorRedactsAndRateLimits(t *testing.T) {
+func TestLogChannelConfigParseErrorPreservesDetailAndRateLimits(t *testing.T) {
 	originalLogger := logger.Logger
 	logger.Logger = zap.NewNop()
 	originalNext := channelConfigLogNext
@@ -229,10 +239,8 @@ func TestLogChannelConfigParseErrorRedactsAndRateLimits(t *testing.T) {
 		if !strings.Contains(message, "provider="+provider) || !strings.Contains(message, "channel_id=") || !strings.Contains(message, "field=api_version") {
 			t.Fatalf("expected provider/channel/field in log message, got %q", message)
 		}
-		for _, forbidden := range []string{"secret-token", "query-secret", "provider.example", "url-secret", "session-secret", "sk-testSECRET123"} {
-			if strings.Contains(message, forbidden) {
-				t.Fatalf("expected provider config log to redact %q, got %q", forbidden, message)
-			}
+		if !strings.Contains(message, err.Error()) {
+			t.Fatalf("系统日志丢失原始错误: %q", message)
 		}
 	}
 }

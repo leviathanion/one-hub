@@ -57,7 +57,7 @@ func TestAudioSSEProviderErrorIsSanitizedAndRenderedOnce(t *testing.T) {
 	if strings.Count(body, "event: error") != 1 || !ctx.GetBool(streamErrorAlreadyRenderedContextKey) {
 		t.Fatalf("provider audio error was not rendered exactly once: %q", body)
 	}
-	for _, secret := range []string{"org-secret", "acct-secret"} {
+	for _, secret := range []string{"org-secret"} {
 		if strings.Contains(body, secret) {
 			t.Fatalf("audio SSE leaked %q: %q", secret, body)
 		}

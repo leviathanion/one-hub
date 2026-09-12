@@ -6,10 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"one-api/common"
 	"one-api/common/logger"
-	"one-api/common/providerresponse"
-	runtimesession "one-api/runtime/session"
 	"one-api/types"
 )
 
@@ -48,19 +45,13 @@ func codexSupplierUsageEvent(response *types.OpenAIResponsesResponses, accumulat
 func (p *CodexProvider) handleCodexSupplierPayload(message []byte, accumulator *codexTurnUsageAccumulator) (bool, *types.UsageEvent, []byte, error) {
 	var event types.OpenAIResponsesStreamResponses
 	if err := json.Unmarshal(message, &event); err != nil {
-		logger.LogError(context.Background(), "codex supplier message unmarshal failed: "+err.Error()+" payload="+common.RedactSensitiveText(codexSupplierPayloadSnippet(message)))
+		logger.LogError(context.Background(), "codex supplier message unmarshal failed: "+err.Error()+" payload="+codexSupplierPayloadSnippet(message))
 		return true, nil, nil, nil
 	}
 
 	if event.Type == types.EventTypeError {
-		apiErr := runtimesession.ProviderAPIErrorFromPayload(message)
-		safeForLog := providerresponse.SanitizeErrorPayload(message, apiErr)
-		detail := codexSupplierErrorDetailFromPayload(&event, safeForLog)
-		redacted, changed := common.RedactSensitiveJSON(message)
-		logger.SysDebug(codexSupplierErrorLogMessage(detail, safeForLog))
-		if changed {
-			return true, nil, redacted, nil
-		}
+		detail := codexSupplierErrorDetailFromPayload(&event, message)
+		logger.SysDebug(codexSupplierErrorLogMessage(detail, message))
 		return true, nil, nil, nil
 	}
 
@@ -251,12 +242,12 @@ func codexSupplierAnyString(value any) string {
 func codexSupplierErrorLogMessage(detail codexSupplierErrorDetail, payload []byte) string {
 	return fmt.Sprintf(
 		"codex supplier error: type=%s code=%s status=%d message=%s param=%s response_id=%s payload=%s",
-		codexRealtimeLogValue(common.RedactSensitiveText(detail.Type)),
-		codexRealtimeLogValue(common.RedactSensitiveText(detail.Code)),
+		codexRealtimeLogValue(detail.Type),
+		codexRealtimeLogValue(detail.Code),
 		detail.Status,
-		codexRealtimeLogValue(common.RedactSensitiveText(detail.Message)),
-		codexRealtimeLogValue(common.RedactSensitiveText(detail.Param)),
-		codexRealtimeLogValue(common.RedactSensitiveText(detail.ResponseID)),
+		codexRealtimeLogValue(detail.Message),
+		codexRealtimeLogValue(detail.Param),
+		codexRealtimeLogValue(detail.ResponseID),
 		codexRealtimeLogValue(codexSupplierPayloadSnippet(payload)),
 	)
 }

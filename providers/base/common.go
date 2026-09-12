@@ -9,6 +9,8 @@ import (
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/logger"
+	"one-api/common/providerresponse"
+	"one-api/common/requestctx"
 	"one-api/common/requester"
 	"one-api/model"
 	"one-api/types"
@@ -58,11 +60,11 @@ func LogChannelConfigParseError(ctx context.Context, provider string, channel *m
 	if err == nil {
 		return
 	}
-	logChannelConfigWarning(ctx, provider, channel, field, "parse_failed", common.RedactSensitiveText(err.Error()))
+	logChannelConfigWarning(ctx, provider, channel, field, "parse_failed", err.Error())
 }
 
 func LogChannelConfigWarning(ctx context.Context, provider string, channel *model.Channel, field string, message string) {
-	logChannelConfigWarning(ctx, provider, channel, field, "warning", common.RedactSensitiveText(message))
+	logChannelConfigWarning(ctx, provider, channel, field, "warning", message)
 }
 
 func logChannelConfigWarning(ctx context.Context, provider string, channel *model.Channel, field string, reason string, message string) {
@@ -203,8 +205,22 @@ func (p *BaseProvider) SetUsage(usage *types.Usage) {
 
 func (p *BaseProvider) SetContext(c *gin.Context) {
 	p.Context = c
-	if p.Requester != nil && c != nil && c.Request != nil {
-		p.Requester.Context = c.Request.Context()
+	p.SetRequester(p.Requester)
+}
+
+// SetRequester 用于运行时更换 transport，保留本次执行的上下文与凭据采集边界。
+func (p *BaseProvider) SetRequester(httpRequester *requester.HTTPRequester) {
+	p.Requester = httpRequester
+	if httpRequester == nil {
+		return
+	}
+	httpRequester.Context = nil
+	httpRequester.ObserveRequest = nil
+	if c := p.Context; c != nil && c.Request != nil {
+		httpRequester.Context = c.Request.Context()
+		httpRequester.ObserveRequest = func(req *http.Request) {
+			requestctx.SetProviderCredentials(c, providerresponse.RequestCredentials(req))
+		}
 	}
 }
 

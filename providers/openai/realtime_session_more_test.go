@@ -2177,7 +2177,7 @@ func TestOpenAIRealtimeProviderInitiatedTurnAdmissionFailureStopsSession(t *test
 	session.SetTurnObserverFactory(func() runtimesession.TurnObserver { return observer })
 
 	outbound, shouldClose := session.observeSupplierMessage(wsconn.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_auto","status":"in_progress"}}`))
-	if !shouldClose || outbound.err == nil || outbound.origin != runtimerealtime.RealtimePayloadOriginProxyLocal {
+	if !shouldClose || outbound.err == nil || outbound.origin != runtimerealtime.RealtimePayloadOriginProvider {
 		t.Fatalf("provider-initiated admission failure must stop the session with a local error, outbound=%+v should_close=%v", outbound, shouldClose)
 	}
 	if admits, rollbacks := observer.counts(); admits != 1 || rollbacks != 0 {

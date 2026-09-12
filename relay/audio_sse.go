@@ -27,6 +27,7 @@ const (
 )
 
 type audioSSEHandler struct {
+	credentials          []string
 	protocol             audioSSEProtocol
 	framer               *requester.SSEEventFramer
 	terminalSeen         bool
@@ -66,7 +67,7 @@ func (h *audioSSEHandler) Handle(rawLine *[]byte, emitter requester.StreamEmitte
 	if !errorEnvelope && h.observeProviderEvent != nil {
 		h.observeProviderEvent(payload)
 	}
-	safeEvent := sanitizeProviderSSEEvent(string(event))
+	safeEvent := redactProviderSSEEvent(string(event), h.credentials...)
 	if !emitter.SendData(safeEvent) {
 		return
 	}
@@ -74,7 +75,7 @@ func (h *audioSSEHandler) Handle(rawLine *[]byte, emitter requester.StreamEmitte
 		h.errorSeen = true
 		h.terminalSeen = true
 		*rawLine = requester.StreamClosed
-		apiErr := providerresponse.SanitizeAPIError(providerAPIErrorFromAudioSSE(payload))
+		apiErr := providerAPIErrorFromAudioSSE(payload)
 		if apiErr == nil {
 			apiErr = common.StringErrorWrapper("provider audio stream failed", "upstream_error", http.StatusBadGateway)
 		}
@@ -176,6 +177,7 @@ func responseAudioSSEClient(c *gin.Context, response *http.Response, protocol au
 	}))
 	c.Set(requestctx.ProviderResponseStatusContextKey, response.StatusCode)
 	handler := newAudioSSEHandler(protocol, observers...)
+	handler.credentials = providerresponse.RequestCredentials(response.Request)
 	stream, apiErr := requester.RequestNoTrimStreamWithEmitterOptions[string](nil, response, handler.Handle, requester.StreamReadOptions{
 		MaxLineBytes:            audioSSEMaxEventBytes,
 		RequireProtocolTerminal: true,

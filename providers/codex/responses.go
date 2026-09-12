@@ -11,7 +11,6 @@ import (
 	"one-api/common"
 	"one-api/common/jsonobject"
 	"one-api/common/logger"
-	"one-api/common/providerresponse"
 	"one-api/common/requester"
 	commonresponses "one-api/common/responses"
 	"one-api/providers/codex/wire"
@@ -21,9 +20,8 @@ import (
 
 // CodexResponsesStreamHandler handles Codex Responses streaming.
 type CodexResponsesStreamHandler struct {
-	Usage              *types.Usage
-	accumulator        *codexTurnUsageAccumulator
-	ProviderCredential string
+	Usage       *types.Usage
+	accumulator *codexTurnUsageAccumulator
 }
 
 const codexResponsesStreamMaxLineBytes = 16 << 20
@@ -185,7 +183,6 @@ func (p *CodexProvider) CreateResponses(ctx context.Context, rawReq *commonrespo
 
 	// Create stream handler.
 	handler := newCodexResponsesStreamHandler(p.Usage)
-	handler.ProviderCredential = p.Channel.Key
 
 	// Get stream response.
 	rawStream, errWithCode := requester.RequestNoTrimStreamWithEmitterOptions(httpRequester, resp, handler.HandlerResponsesStreamWithEmitter, requester.StreamReadOptions{
@@ -236,7 +233,6 @@ func (p *CodexProvider) CreateResponsesStream(ctx context.Context, rawReq *commo
 
 	// Create stream handler.
 	handler := newCodexResponsesStreamHandler(p.Usage)
-	handler.ProviderCredential = p.Channel.Key
 
 	// Convert Responses SSE to ChatCompletion stream when requested.
 	if request.ConvertChat {
@@ -622,13 +618,12 @@ func (p *CodexProvider) collectResponsesStreamResponse(stream commonresponses.Ev
 }
 
 func codexResponsesStreamProviderError(event *types.OpenAIResponsesStreamResponses, payload []byte, providerAccepted bool) *types.OpenAIErrorWithStatusCode {
-	safePayload, _ := common.RedactSensitiveJSON(payload)
-	detail := codexSupplierErrorDetailFromPayload(event, safePayload)
+	detail := codexSupplierErrorDetailFromPayload(event, payload)
 	status := detail.Status
 	if status < http.StatusBadRequest || status > 599 {
 		status = http.StatusBadGateway
 	}
-	message := common.RedactSensitiveText(detail.Message)
+	message := detail.Message
 	if message == "" || message == "provider websocket error" {
 		message = "provider rejected request"
 	}
@@ -665,7 +660,7 @@ func codexResponsesStreamProviderError(event *types.OpenAIResponsesStreamRespons
 		ProviderRateLimited:    rateLimited,
 		ProviderAuthRejected:   authRejected,
 	}
-	return providerresponse.SanitizeAPIError(apiErr)
+	return apiErr
 }
 
 func codexAcceptedStreamError(err error, code string) *types.OpenAIErrorWithStatusCode {
@@ -681,6 +676,5 @@ func codexAcceptedStreamError(err error, code string) *types.OpenAIErrorWithStat
 }
 
 func (h *CodexResponsesStreamHandler) HandlerResponsesStreamWithEmitter(rawLine *[]byte, emitter requester.StreamEmitter[string]) {
-	safe, _ := common.RedactCredentialValuesText(string(*rawLine), h.ProviderCredential)
-	emitter.SendData(safe)
+	emitter.SendData(string(*rawLine))
 }

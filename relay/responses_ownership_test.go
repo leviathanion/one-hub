@@ -1237,7 +1237,7 @@ func TestResponsesMultilineSSESecurityAtDelivery(t *testing.T) {
 			} else {
 				_, apiErr = responseNativeResponsesStreamClient(ctx, stream, commonresponses.NewStreamObserver())
 			}
-			if apiErr != nil || strings.Contains(recorder.Body.String(), "acct-secret") || !strings.Contains(recorder.Body.String(), "response.completed") {
+			if apiErr != nil || !strings.Contains(recorder.Body.String(), "acct-secret") || !strings.Contains(recorder.Body.String(), "response.completed") {
 				t.Fatalf("multiline metadata security failed: err=%+v body=%s", apiErr, recorder.Body.String())
 			}
 		})

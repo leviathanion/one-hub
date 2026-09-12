@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"one-api/common/providerresponse"
+	"one-api/common/requestctx"
 	"one-api/common/wsconn"
 	"one-api/common/wsconn/wstest"
 	"one-api/model"
@@ -204,5 +206,25 @@ func TestXunfeiCanceledPrefixCannotAuthorizeTerminalUsage(t *testing.T) {
 	stream.CloseAndDrain()
 	if handler.Usage.ProviderReported || handler.Usage.HasProviderUsage() {
 		t.Fatalf("nonterminal prefix/cancel authorized billing: %+v", handler.Usage)
+	}
+}
+
+func TestXunfeiDialCapturesSignedErrorCredential(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("POST", "/v1/chat/completions?api-version=v1.1", nil)
+	p := &XunfeiProvider{BaseProvider: base.BaseProvider{Context: c, Channel: &model.Channel{Key: "app|secret|key"}, Config: getConfig()}}
+	p.Config.BaseURL = "wss://127.0.0.1:1"
+	conn, _, apiErr := p.getChatRequest(&types.ChatCompletionRequest{Model: "spark", Messages: []types.ChatCompletionMessage{{Role: "user", Content: "hello"}}})
+	if conn != nil || apiErr == nil {
+		t.Fatal("测试握手应失败")
+	}
+	values := requestctx.ProviderCredentials(c)
+	if len(values) == 0 {
+		t.Fatal("签名握手失败丢失实际认证快照")
+	}
+	raw := []byte(`{"error":{"message":"` + values[0] + `"}}`)
+	safe, changed := providerresponse.SanitizeErrorPayload(raw, values...)
+	if !changed || strings.Contains(string(safe), values[0]) {
+		t.Fatalf("签名认证未用于错误呈现: %s", safe)
 	}
 }

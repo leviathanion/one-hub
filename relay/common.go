@@ -651,8 +651,8 @@ func responseJsonClient(c *gin.Context, data interface{}) *types.OpenAIErrorWith
 		// Content-Encoding, validators, and ranges cannot describe the old body.
 		invalidateProviderRepresentationHeaders(c)
 	}
-	if safeBody, changed := common.RedactProviderMetadataJSON(responseBody); changed {
-		responseBody = safeBody
+	if safe, changed := providerresponse.SanitizeErrorPayload(responseBody, requestctx.ProviderCredentials(c)...); changed {
+		responseBody = safe
 		invalidateProviderRepresentationHeaders(c)
 	}
 
@@ -765,6 +765,7 @@ func isStreamTerminalEOF(err error) bool {
 }
 
 func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface[string], endHandler StreamEndHandler, observers ...func(string)) (firstResponseTime time.Time, errWithOP *types.OpenAIErrorWithStatusCode) {
+	credentials := requestctx.ProviderCredentials(c)
 	applyProviderResponseHeaders(c)
 	requester.SetEventStreamHeaders(c)
 	c.Writer.WriteHeader(providerResponseStatus(c, http.StatusOK))
@@ -785,6 +786,8 @@ func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface
 	handleData := func(data string) error {
 		payload := data
 		hasPayload := true
+		var apiErr *types.OpenAIErrorWithStatusCode
+		var rawPayload []byte
 		if rawSSEEvents {
 			payload, hasPayload = commonresponses.SSEDataPayload(data)
 			if hasPayload && strings.TrimSpace(payload) == "[DONE]" {
@@ -792,14 +795,16 @@ func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface
 			}
 		}
 		if hasPayload {
-			apiErr := runtimesession.ProviderAPIErrorFromPayload([]byte(payload))
+			rawPayload = []byte(payload)
 			if rawSSEEvents {
-				apiErr = runtimesession.OpenAIErrorEnvelopeFromPayload([]byte(payload))
+				apiErr = runtimesession.OpenAIErrorEnvelopeFromPayload(rawPayload)
+			} else {
+				apiErr = runtimesession.ProviderAPIErrorFromPayload(rawPayload)
 			}
 			if apiErr != nil {
 				sawProviderInBandError = true
 				if providerInBandError == nil {
-					providerInBandError = providerresponse.SanitizeAPIError(apiErr)
+					providerInBandError = apiErr
 				}
 			} else {
 				sawProviderData = true
@@ -812,9 +817,12 @@ func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface
 		}
 		streamData := ""
 		if rawSSEEvents {
-			streamData = sanitizeOpenAIChatCompletionSSEEvent(data)
+			streamData = redactProviderSSEPayload(data, rawPayload, hasPayload, credentials...)
 		} else {
-			payload = string(sanitizeProviderJSONPayload([]byte(payload)))
+			if apiErr != nil {
+				safe, _ := providerresponse.SanitizeErrorPayload(rawPayload, credentials...)
+				payload = string(safe)
+			}
 			streamData = "data: " + payload + "\n\n"
 		}
 		if !isFirstResponse {
@@ -887,7 +895,7 @@ func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface
 		}
 		var providerErr *types.OpenAIErrorWithStatusCode
 		if errors.As(err, &providerErr) && providerErr != nil && !providerErr.LocalError {
-			safeErr := providerresponse.SanitizeAPIError(providerErr)
+			safeErr := providerresponse.SanitizeAPIError(providerErr, credentials...)
 			errPayload["error"] = safeErr.OpenAIError
 		}
 		errJSON, _ := json.Marshal(errPayload)
@@ -902,11 +910,15 @@ func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface
 		}
 		c.Set(streamErrorAlreadyRenderedContextKey, true)
 
-		logger.LogError(c.Request.Context(), "Stream err:"+common.RedactSensitiveText(err.Error()))
+		logger.LogError(c.Request.Context(), "Stream err:"+err.Error())
 		return nil
 	}
 
 	writeFailure := func(err error) *types.OpenAIErrorWithStatusCode {
+		var failure *types.OpenAIErrorWithStatusCode
+		if errors.As(err, &failure) && failure.LocalError {
+			return failure
+		}
 		c.Set(streamErrorAlreadyRenderedContextKey, true)
 		apiErr := common.ErrorWrapper(err, "stream_write_failed", http.StatusInternalServerError)
 		apiErr.UpstreamAccepted = true
@@ -915,8 +927,7 @@ func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface
 	streamFailure := func(err error) *types.OpenAIErrorWithStatusCode {
 		var providerErr *types.OpenAIErrorWithStatusCode
 		if errors.As(err, &providerErr) && providerErr != nil {
-			safeErr := providerresponse.SanitizeAPIError(providerErr)
-			failure := *safeErr
+			failure := *providerErr
 			// A stream has already opened. Local parsing/framing failures cannot
 			// establish provider rejection, even before the first converted chunk.
 			failure.UpstreamAccepted = failure.UpstreamAccepted || sawProviderData || failure.LocalError
@@ -1002,7 +1013,7 @@ func responseGeneralStreamClientWithObserver(c *gin.Context, stream requester.St
 	return firstResponseTime
 }
 
-func responseGeneralStreamClientWithObserverResult(c *gin.Context, stream requester.StreamReaderInterface[string], endHandler StreamEndHandler, observer func(string), transform func(string) string, renderStreamError bool) (firstResponseTime time.Time, streamErr error) {
+func responseGeneralStreamClientWithObserverResult(c *gin.Context, stream requester.StreamReaderInterface[string], endHandler StreamEndHandler, onDelivered func(string), transform func(string) string, renderStreamError bool) (firstResponseTime time.Time, streamErr error) {
 	applyProviderResponseHeaders(c)
 	requester.SetEventStreamHeaders(c)
 	c.Writer.WriteHeader(providerResponseStatus(c, http.StatusOK))
@@ -1027,9 +1038,6 @@ func responseGeneralStreamClientWithObserverResult(c *gin.Context, stream reques
 			firstResponseTime = time.Now()
 			isFirstResponse = true
 		}
-		if observer != nil {
-			observer(data)
-		}
 		if transform != nil {
 			data = transform(data)
 		}
@@ -1039,6 +1047,12 @@ func responseGeneralStreamClientWithObserverResult(c *gin.Context, stream reques
 		default:
 			if _, err := streamWriter.WriteString(data); err != nil {
 				return err
+			}
+			if onDelivered != nil {
+				if err := streamWriter.Flush(); err != nil {
+					return err
+				}
+				onDelivered(data)
 			}
 			framing.Observe(data)
 		}
@@ -1053,16 +1067,7 @@ func responseGeneralStreamClientWithObserverResult(c *gin.Context, stream reques
 		if streamData == "" {
 			return nil
 		}
-		if observer != nil {
-			observer(streamData)
-		}
-		select {
-		case <-c.Request.Context().Done():
-			return c.Request.Context().Err()
-		default:
-			_, err := streamWriter.WriteString(streamData)
-			return err
-		}
+		return handleData(streamData)
 	}
 
 	handleError := func(err error) error {
@@ -1090,7 +1095,7 @@ func responseGeneralStreamClientWithObserverResult(c *gin.Context, stream reques
 		framing.Observe(errEvent)
 		c.Set(streamErrorAlreadyRenderedContextKey, true)
 
-		logger.LogError(c.Request.Context(), "Stream err:"+common.RedactSensitiveText(err.Error()))
+		logger.LogError(c.Request.Context(), "Stream err:"+err.Error())
 		return nil
 	}
 
@@ -1151,45 +1156,49 @@ func responseGeneralStreamClientWithObserverResult(c *gin.Context, stream reques
 	return firstResponseTime, nil
 }
 
-func sanitizeProviderJSONPayload(payload []byte) []byte {
-	return sanitizeProviderJSONPayloadWithError(payload, runtimesession.ProviderAPIErrorFromPayload(payload))
-}
-
-func sanitizeProviderJSONPayloadWithError(payload []byte, apiErr *types.OpenAIErrorWithStatusCode) []byte {
-	safe := providerresponse.SanitizeErrorPayload(payload, apiErr)
-	if redacted, changed := common.RedactProviderMetadataJSON(safe); changed {
-		return redacted
-	}
+func redactProviderErrorPayload(payload []byte, credentials ...string) []byte {
+	safe, _ := providerresponse.SanitizeErrorPayload(payload, credentials...)
 	return safe
 }
 
-func sanitizeProviderSSEEvent(data string) string {
-	return sanitizeProviderSSEEventWithErrorDetector(data, runtimesession.ProviderAPIErrorFromPayload)
+func providerSSETransform(c *gin.Context) func(string) string {
+	credentials := requestctx.ProviderCredentials(c)
+	return func(data string) string { return redactProviderSSEEvent(data, credentials...) }
 }
 
-func sanitizeOpenAIChatCompletionSSEEvent(data string) string {
-	return sanitizeProviderSSEEventWithErrorDetector(data, runtimesession.OpenAIErrorEnvelopeFromPayload)
-}
-
-func sanitizeProviderSSEEventWithErrorDetector(data string, detectError func([]byte) *types.OpenAIErrorWithStatusCode) string {
+func redactProviderSSEEvent(data string, credentials ...string) string {
 	payload, hasData := commonresponses.SSEDataPayload(data)
+	return redactProviderSSEPayload(data, []byte(payload), hasData, credentials...)
+}
+
+// 只修改 data 中的错误对象；非 data 字段、正文及无法处理的事件原样交付。
+func redactProviderSSEPayload(data string, payload []byte, hasData bool, credentials ...string) string {
 	if !hasData {
 		return data
 	}
-	var apiErr *types.OpenAIErrorWithStatusCode
-	if detectError != nil {
-		apiErr = detectError([]byte(payload))
+	var eventName string
+	for remaining := data; remaining != ""; {
+		line, rest := requester.SplitSSELine(remaining)
+		remaining = rest
+		name, value, _ := strings.Cut(requester.SSELineContent(line), ":")
+		if name == "event" {
+			eventName = strings.TrimPrefix(value, " ")
+		}
 	}
-	safe := string(sanitizeProviderJSONPayloadWithError([]byte(payload), apiErr))
-	if safe == payload {
+	var safePayload []byte
+	var changed bool
+	if eventName == "error" {
+		safePayload, changed = providerresponse.SanitizeErrorResponse(payload, credentials...)
+	} else {
+		safePayload, changed = providerresponse.SanitizeErrorPayload(payload, credentials...)
+	}
+	if !changed {
 		return data
 	}
-	// Only a security rewrite replaces the logical data payload. Preserve all
-	// event/id/retry/comment fields and the original event-ending bytes.
 	var out strings.Builder
-	wroteData := false
-	remaining := data
-	for len(remaining) > 0 {
+	out.Grow(len(data))
+	replacement := safePayload
+	for remaining := data; remaining != ""; {
 		line, rest := requester.SplitSSELine(remaining)
 		remaining = rest
 		content := requester.SSELineContent(line)
@@ -1197,12 +1206,11 @@ func sanitizeProviderSSEEventWithErrorDetector(data string, detectError func([]b
 			out.WriteString(line)
 			continue
 		}
-		if !wroteData {
-			out.WriteString("data: ")
-			out.WriteString(safe)
-			out.WriteString(line[len(content):])
-			wroteData = true
-		}
+		value, restPayload, _ := bytes.Cut(replacement, []byte("\n"))
+		replacement = restPayload
+		out.WriteString("data: ")
+		out.Write(value)
+		out.WriteString(line[len(content):])
 	}
 	return out.String()
 }
@@ -1222,7 +1230,7 @@ func responseMultipart(c *gin.Context, resp *http.Response, policy providerrespo
 		// Status and possibly a body prefix are already committed. Abort the
 		// transport so HTTP/1.x clients do not receive a clean chunk terminator and
 		// HTTP/2 clients receive a reset for the truncated provider body.
-		logger.LogError(c.Request.Context(), "failed to deliver provider response body: "+common.RedactSensitiveText(err.Error()))
+		logger.LogError(c.Request.Context(), "failed to deliver provider response body: "+err.Error())
 		panic(http.ErrAbortHandler)
 	}
 
@@ -1232,6 +1240,9 @@ func responseMultipart(c *gin.Context, resp *http.Response, policy providerrespo
 func replayProviderRawResponse(c *gin.Context, apiErr *types.OpenAIErrorWithStatusCode, policy providerresponse.Policy) bool {
 	if c == nil || apiErr == nil || !apiErr.ReplayRawResponse {
 		return false
+	}
+	if apiErr.StatusCode >= http.StatusBadRequest {
+		apiErr = providerresponse.SanitizeAPIError(apiErr, requestctx.ProviderCredentials(c)...)
 	}
 	response := &http.Response{
 		StatusCode: apiErr.StatusCode,
@@ -1256,24 +1267,21 @@ func providerResponsePolicyForChannel(channel *model.Channel, operation provider
 }
 
 func responseCustom(c *gin.Context, response *types.AudioResponseWrapper, operation providerresponse.Operation) *types.OpenAIErrorWithStatusCode {
+	if response == nil {
+		return common.StringErrorWrapperLocal("provider returned no audio response", "invalid_provider_response", http.StatusBadGateway)
+	}
 	headers := make(http.Header, len(response.Headers))
 	for name, value := range response.Headers {
 		headers.Set(name, value)
 	}
-	for name, values := range providerresponse.Filter(headers, providerresponse.Policy{
-		Operation:      operation,
-		DataPath:       providerresponse.DataPathCrossProtocol,
-		BodyUnmodified: true,
-	}) {
+	for name, values := range providerresponse.Filter(headers, providerresponse.Policy{Operation: operation, DataPath: providerresponse.DataPathCrossProtocol, BodyUnmodified: true}) {
 		c.Writer.Header()[name] = append([]string(nil), values...)
 	}
 	c.Writer.WriteHeader(http.StatusOK)
-
-	_, err := c.Writer.Write(response.Body)
-	if err != nil {
-		return common.ErrorWrapper(err, "write_response_body_failed", http.StatusInternalServerError)
+	if _, err := c.Writer.Write(response.Body); err != nil {
+		logger.LogError(c.Request.Context(), "failed to deliver provider audio response: "+err.Error())
+		panic(http.ErrAbortHandler)
 	}
-
 	return nil
 }
 
@@ -1358,7 +1366,6 @@ func processProviderAPIError(c *gin.Context, channel *model.Channel, apiErr *typ
 	if c == nil || apiErr == nil {
 		return
 	}
-	apiErr = providerresponse.SanitizeAPIError(apiErr)
 	ctx := context.Background()
 	if c.Request != nil {
 		ctx = c.Request.Context()

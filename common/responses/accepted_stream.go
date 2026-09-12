@@ -170,7 +170,9 @@ func (s *streamWithObserver) ReadContext() context.Context {
 // It preserves the SSE rule that multiple data fields are joined with a LF.
 func SSEDataPayload(rawEvent string) (string, bool) {
 	var payload strings.Builder
+	var first string
 	hasData := false
+	multiple := false
 	for len(rawEvent) > 0 {
 		line, rest := requester.SplitSSELine(rawEvent)
 		rawEvent = rest
@@ -189,11 +191,20 @@ func SSEDataPayload(rawEvent string) (string, bool) {
 		if strings.HasPrefix(value, " ") {
 			value = value[1:]
 		}
-		if hasData {
-			payload.WriteByte('\n')
+		if !hasData {
+			first, hasData = value, true
+			continue
 		}
+		if !multiple {
+			payload.Grow(len(first) + len(value) + 1)
+			payload.WriteString(first)
+			multiple = true
+		}
+		payload.WriteByte('\n')
 		payload.WriteString(value)
-		hasData = true
+	}
+	if !multiple {
+		return first, hasData
 	}
 	return payload.String(), hasData
 }

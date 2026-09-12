@@ -141,6 +141,15 @@ func TestIssue039ResponsesWSCompletedInjectUsesUpstreamReplyAndClientContinuatio
 		snapshot.Set("responses_ws_selected_channel", &model.Channel{Id: 17, Type: config.ChannelTypeOpenAI, Models: "gpt-5"})
 	})
 	harness.actor.Start()
+	t.Cleanup(func() {
+		harness.actor.PostReliable(ResponsesWSEventCloseIntent{Reason: "test_cleanup"})
+		select {
+		case <-harness.actor.Done():
+			harness.actor.waitStartedGoroutines()
+		case <-time.After(time.Second):
+			t.Error("等待 actor 在自身循环内收尾超时")
+		}
+	})
 	harness.pump.ArmProviderRecvPump(harness.generation, 17, harness.native)
 
 	firstCompleted := []byte(`{"type":"response.completed","sequence_number":1,"response":{"id":"resp-039-first","status":"completed","output":[{"type":"function_call","id":"fc-039","call_id":"call-039","name":"lookup","arguments":"{}","status":"completed"}],"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}`)
@@ -151,7 +160,7 @@ func TestIssue039ResponsesWSCompletedInjectUsesUpstreamReplyAndClientContinuatio
 	if string(firstFrame.payload) != string(firstCompleted) {
 		t.Fatalf("first completed frame changed before recovery: got=%s want=%s", firstFrame.payload, firstCompleted)
 	}
-	issue004WaitRelayActorEvents(t, harness.actor)
+	issue039WaitDeliveredEventCompletion(t, harness.actor)
 	if harness.attempt.AppliedSettlement == nil || !harness.attempt.QuotaFinalized || harness.attempt.RolledBack {
 		t.Fatalf("first response did not settle before inject recovery: %+v", harness.attempt)
 	}
@@ -210,7 +219,7 @@ func TestIssue039ResponsesWSCompletedInjectUsesUpstreamReplyAndClientContinuatio
 	if string(secondFrame.payload) != string(secondCompleted) {
 		t.Fatalf("second response did not complete through the real relay path: got=%s want=%s", secondFrame.payload, secondCompleted)
 	}
-	issue004WaitRelayActorEvents(t, harness.actor)
+	issue039WaitDeliveredEventCompletion(t, harness.actor)
 	if harness.actor.closing.closed.Load() || !harness.actor.isRecentlyFinalizedResponseID("resp-039-second") {
 		t.Fatalf("second response did not leave a reusable session: closed=%v final=%+v", harness.actor.closing.closed.Load(), harness.actor.turns.history.recentFinalizedResponseIDs)
 	}
@@ -405,5 +414,27 @@ func issue039ReplyCompletedInject(t *testing.T, server *wsconn.ManagedConn, payl
 	}
 	if err := server.WriteMessage(wsconn.TextMessage, reply); err != nil {
 		t.Error(err)
+	}
+}
+
+// 在收到交付帧后等待当前 handleEvent 返回。缓冲帧可在无字节的 send-result
+// 事件中回放，eventBytes 为零不代表结算完成。失配的超时只唤醒循环，不改变状态。
+func issue039WaitDeliveredEventCompletion(t *testing.T, actor *ResponsesWSSessionActor) {
+	t.Helper()
+drain:
+	for {
+		select {
+		case <-actor.eventSpace:
+		default:
+			break drain
+		}
+	}
+	if !actor.PostReliable(ResponsesWSEventTimeout{UpstreamSessionGeneration: "test-completion-barrier"}) {
+		t.Fatal("actor 在完成事件之前关闭")
+	}
+	select {
+	case <-actor.eventSpace:
+	case <-time.After(time.Second):
+		t.Fatal("等待已交付事件处理完成超时")
 	}
 }

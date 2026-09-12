@@ -10,7 +10,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptrace"
-	"net/url"
 	"one-api/common"
 	"one-api/common/logger"
 	"one-api/common/providerresponse"
@@ -22,7 +21,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode"
 
 	"github.com/gin-gonic/gin"
 )
@@ -31,7 +29,6 @@ type HttpErrorHandler func(*http.Response) *types.OpenAIError
 
 const maxProviderErrorBodyBytes int64 = 1 << 20
 const maxProviderRawJSONBodyBytes int64 = 64 << 20
-const maxProviderErrorJSONDepth = 64
 
 var errProviderRawJSONBodyTooLarge = fmt.Errorf("provider response body exceeds %d bytes", maxProviderRawJSONBodyBytes)
 
@@ -64,6 +61,8 @@ type ProviderRawJSONReplayer interface {
 }
 
 type HTTPRequester struct {
+	// ObserveRequest 仅发布实际发送请求的事实，不执行协议策略。
+	ObserveRequest func(*http.Request)
 	// requestBuilder    utils.RequestBuilder
 	CreateFormBuilder          func(io.Writer) FormBuilder
 	ErrorHandler               HttpErrorHandler
@@ -330,7 +329,7 @@ func (b *policyResponseBody) close(stopCancelObserver bool) error {
 
 func httpTransportError(err error, wroteRequest bool) *types.OpenAIErrorWithStatusCode {
 	if err != nil {
-		logger.SysError(fmt.Sprintf("provider http transport error: %s", common.RedactSensitiveText(err.Error())))
+		logger.SysError(fmt.Sprintf("provider http transport error: %s", err.Error()))
 	}
 	apiErr := common.StringErrorWrapper("请求上游地址失败", "http_request_failed", http.StatusInternalServerError)
 	if wroteRequest {
@@ -381,6 +380,9 @@ func (r *HTTPRequester) sendRequest(req *http.Request, response any, outputResp 
 	if clientErr != nil {
 		return nil, clientErr
 	}
+	if r.ObserveRequest != nil {
+		r.ObserveRequest(req)
+	}
 	resp, err, wroteRequest := doHTTPRequest(client, req, policyForHTTPProfile(r.profile), noKeepAlive)
 	if err != nil {
 		return nil, httpTransportError(err, wroteRequest)
@@ -422,12 +424,7 @@ func (r *HTTPRequester) sendRequest(req *http.Request, response any, outputResp 
 	} else if rawResponse, ok := response.(ProviderRawJSONCapturer); ok && rawResponse.CaptureProviderRawJSON() {
 		var body []byte
 		body, err = readProviderBodyBounded(resp.Body, maxProviderRawJSONBodyBytes)
-		if err == nil {
-			if safe, changed := common.RedactCredentialValuesText(string(body), requestProviderCredentialValues(resp.Request)...); changed {
-				body = []byte(safe)
-				invalidateRewrittenRepresentationHeaders(resp.Header)
-			}
-		}
+
 		if err == nil {
 			if decoder, ok := response.(ProviderRawJSONDecoder); ok {
 				err = decoder.DecodeCapturedProviderJSON(body)
@@ -447,17 +444,11 @@ func (r *HTTPRequester) sendRequest(req *http.Request, response any, outputResp 
 		if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
 			apiErr.UpstreamAccepted = true
 		}
-		apiErr.ResponseHeaders = requestctx.SafeProviderResponseHeaders(resp.Header)
+		apiErr.ResponseHeaders = requestctx.SafeProviderResponseHeaders(resp.Header, providerresponse.RequestCredentials(resp.Request)...)
 		return nil, apiErr
 	}
 
 	return resp, nil
-}
-
-func invalidateRewrittenRepresentationHeaders(headers http.Header) {
-	for _, name := range []string{"Content-Encoding", "Content-Length", "Content-Range", "Digest", "Etag"} {
-		headers.Del(name)
-	}
 }
 
 func readProviderBodyBounded(reader io.Reader, maxBytes int64) ([]byte, error) {
@@ -480,6 +471,9 @@ func (r *HTTPRequester) SendRequestRaw(req *http.Request) (*http.Response, *type
 	client, noKeepAlive, clientErr := r.configuredHTTPClient(r.profile, false)
 	if clientErr != nil {
 		return nil, clientErr
+	}
+	if r.ObserveRequest != nil {
+		r.ObserveRequest(req)
 	}
 	resp, err, wroteRequest := doHTTPRequest(client, req, policyForHTTPProfile(r.profile), noKeepAlive)
 	if err != nil {
@@ -564,30 +558,10 @@ func preservedRedirectResponse(resp *http.Response, operation providerresponse.O
 		apiErr.UpstreamAccepted = true
 		return apiErr
 	}
-	credentials := requestProviderCredentialValues(resp.Request)
-	safeBody, bodyChanged := common.RedactCredentialValuesText(string(body), credentials...)
 	headers := providerresponse.Filter(resp.Header, providerresponse.Policy{
-		Operation:        operation,
-		DataPath:         providerresponse.DataPathExactWire,
-		BodyUnmodified:   true,
-		PreserveRedirect: true,
+		Operation: operation, DataPath: providerresponse.DataPathExactWire,
+		BodyUnmodified: true, PreserveRedirect: true,
 	})
-	if bodyChanged {
-		body = []byte(safeBody)
-		invalidateRewrittenRepresentationHeaders(headers)
-	}
-	for _, location := range headers.Values("Location") {
-		_, containsCredential := common.RedactCredentialValuesText(location, credentials...)
-		if decoded, err := url.QueryUnescape(location); err == nil {
-			_, decodedContainsCredential := common.RedactCredentialValuesText(decoded, credentials...)
-			containsCredential = containsCredential || decodedContainsCredential
-		}
-		if containsCredential {
-			// A redacted URL is not the provider's redirect target. Omit it.
-			headers.Del("Location")
-			break
-		}
-	}
 	return &types.OpenAIErrorWithStatusCode{
 		OpenAIError: types.OpenAIError{
 			Message: "provider returned an HTTP redirect",
@@ -605,6 +579,9 @@ func (r *HTTPRequester) sendRequestRawNoRedirect(req *http.Request) (*http.Respo
 	client, noKeepAlive, clientErr := r.configuredHTTPClient(r.profile, true)
 	if clientErr != nil {
 		return nil, clientErr
+	}
+	if r.ObserveRequest != nil {
+		r.ObserveRequest(req)
 	}
 	resp, err, wroteRequest := doHTTPRequest(client, req, policyForHTTPProfile(r.profile), noKeepAlive)
 	if err != nil {
@@ -755,9 +732,10 @@ func (r *HTTPRequester) IsFailureStatusCode(resp *http.Response) bool {
 
 // 处理错误响应
 func HandleErrorResp(resp *http.Response, toOpenAIError HttpErrorHandler, prefixProviderError bool, replayOpenAIEnvelope bool) *types.OpenAIErrorWithStatusCode {
+	providerSecrets := providerresponse.RequestCredentials(resp.Request)
 	openAIErrorWithStatusCode := &types.OpenAIErrorWithStatusCode{
 		StatusCode:             resp.StatusCode,
-		ResponseHeaders:        requestctx.SafeProviderResponseHeaders(resp.Header),
+		ResponseHeaders:        requestctx.SafeProviderResponseHeaders(resp.Header, providerSecrets...),
 		ProviderQuotaExhausted: resp.StatusCode == http.StatusPaymentRequired,
 		ProviderAuthRejected:   resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusProxyAuthRequired,
 		ProviderRateLimited:    resp.StatusCode == http.StatusTooManyRequests,
@@ -790,24 +768,15 @@ func HandleErrorResp(resp *http.Response, toOpenAIError HttpErrorHandler, prefix
 				openAIErrorWithStatusCode.ProviderQuotaExhausted = openAIErrorWithStatusCode.ProviderQuotaExhausted || quotaExhausted
 				openAIErrorWithStatusCode.ProviderAuthRejected = openAIErrorWithStatusCode.ProviderAuthRejected || authRejected
 				openAIErrorWithStatusCode.ProviderRateLimited = openAIErrorWithStatusCode.ProviderRateLimited || common.ProviderErrorIsRateLimited(*errorResponse)
-				providerSecrets := requestProviderCredentialValues(resp.Request)
-				validOpenAIEnvelope, containsSensitiveDetails, inspectionErr := inspectProviderErrorBody(bodyBytes, errorResponse, resp.StatusCode, providerSecrets...)
-				confirmedAccountFailure := openAIErrorWithStatusCode.ProviderQuotaExhausted || openAIErrorWithStatusCode.ProviderAuthRejected
-				if confirmedAccountFailure {
-					// Do not retain the shared-account body. The provider-response
-					// boundary below owns the stable public replacement.
-				} else if inspectionErr != nil {
-					openAIErrorWithStatusCode.OpenAIError = safeMalformedProviderError(resp.StatusCode)
-				} else if containsSensitiveDetails {
-					// A field name such as project_id or text mentioning api_key is
-					// enough to suppress exact-wire replay, but it is not evidence that
-					// the provider account failed. Keep the mapped business error while
-					// redacting any actual credential material it contains.
-					openAIErrorWithStatusCode.OpenAIError = sanitizeMappedProviderError(*errorResponse, providerSecrets)
-				} else if replayOpenAIEnvelope && validOpenAIEnvelope {
-					openAIErrorWithStatusCode.RawBody = append([]byte(nil), bodyBytes...)
-					openAIErrorWithStatusCode.ReplayRawResponse = true
+				if replayOpenAIEnvelope {
+					var envelope map[string]json.RawMessage
+					var errorObject map[string]json.RawMessage
+					if json.Unmarshal(bodyBytes, &envelope) == nil && json.Unmarshal(envelope["error"], &errorObject) == nil && errorObject != nil {
+						openAIErrorWithStatusCode.RawBody = bodyBytes
+						openAIErrorWithStatusCode.ReplayRawResponse = true
+					}
 				}
+
 				if quotaExhausted && !replayOpenAIEnvelope {
 					openAIErrorWithStatusCode.StatusCode = http.StatusTooManyRequests
 				}
@@ -830,217 +799,7 @@ func HandleErrorResp(resp *http.Response, toOpenAIError HttpErrorHandler, prefix
 		}
 	}
 
-	// Status and control classification remain available for routing, while the
-	// shared provider-response boundary owns account-error replacement and final
-	// text redaction. Ordinary authorized exact-wire envelopes remain unchanged.
-	return providerresponse.SanitizeAPIError(openAIErrorWithStatusCode)
-}
-
-type providerErrorBodyInspection struct {
-	keys    []string
-	strings []string
-}
-
-func inspectProviderErrorBody(body []byte, providerErr *types.OpenAIError, status int, providerSecrets ...string) (bool, bool, error) {
-	inspection, err := inspectProviderErrorJSON(body)
-	containsSecret := providerErrorBodyHasSensitiveDetails(status, providerErr, inspection, providerSecrets...)
-	if err != nil {
-		return false, containsSecret, err
-	}
-
-	var envelope map[string]json.RawMessage
-	if err := json.Unmarshal(body, &envelope); err != nil || envelope == nil {
-		return false, containsSecret, nil
-	}
-	var errorObject map[string]json.RawMessage
-	if err := json.Unmarshal(envelope["error"], &errorObject); err != nil || errorObject == nil {
-		return false, containsSecret, nil
-	}
-	return true, containsSecret, nil
-}
-
-func inspectProviderErrorJSON(body []byte) (providerErrorBodyInspection, error) {
-	inspection := providerErrorBodyInspection{}
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.UseNumber()
-	if err := inspectProviderErrorJSONValue(decoder, &inspection, 0); err != nil {
-		return inspection, err
-	}
-	if _, err := decoder.Token(); err != io.EOF {
-		if err == nil {
-			err = fmt.Errorf("multiple JSON values")
-		}
-		return inspection, err
-	}
-	return inspection, nil
-}
-
-func inspectProviderErrorJSONValue(decoder *json.Decoder, inspection *providerErrorBodyInspection, depth int) error {
-	if depth > maxProviderErrorJSONDepth {
-		return fmt.Errorf("provider error JSON exceeds maximum depth %d", maxProviderErrorJSONDepth)
-	}
-	token, err := decoder.Token()
-	if err != nil {
-		return err
-	}
-	delimiter, ok := token.(json.Delim)
-	if !ok {
-		if value, ok := token.(string); ok {
-			inspection.strings = append(inspection.strings, value)
-		}
-		return nil
-	}
-
-	switch delimiter {
-	case '{':
-		seen := make(map[string]struct{})
-		for decoder.More() {
-			keyToken, err := decoder.Token()
-			if err != nil {
-				return err
-			}
-			key, ok := keyToken.(string)
-			if !ok {
-				return fmt.Errorf("JSON object key is not a string")
-			}
-			if _, duplicate := seen[key]; duplicate {
-				return fmt.Errorf("duplicate JSON object key %q", key)
-			}
-			seen[key] = struct{}{}
-			inspection.keys = append(inspection.keys, key)
-			if err := inspectProviderErrorJSONValue(decoder, inspection, depth+1); err != nil {
-				return err
-			}
-		}
-		closing, err := decoder.Token()
-		if err != nil || closing != json.Delim('}') {
-			return fmt.Errorf("invalid JSON object")
-		}
-	case '[':
-		for decoder.More() {
-			if err := inspectProviderErrorJSONValue(decoder, inspection, depth+1); err != nil {
-				return err
-			}
-		}
-		closing, err := decoder.Token()
-		if err != nil || closing != json.Delim(']') {
-			return fmt.Errorf("invalid JSON array")
-		}
-	default:
-		return fmt.Errorf("unexpected JSON delimiter %q", delimiter)
-	}
-	return nil
-}
-
-func providerErrorBodyHasSensitiveDetails(status int, providerErr *types.OpenAIError, inspection providerErrorBodyInspection, providerSecrets ...string) bool {
-	if status == http.StatusUnauthorized || status == http.StatusProxyAuthRequired {
-		return true
-	}
-	if providerErr != nil {
-		if common.ProviderErrorIsQuotaExhausted(*providerErr) || common.ProviderErrorIsAuthRejected(*providerErr) {
-			return true
-		}
-	}
-
-	for _, key := range inspection.keys {
-		switch canonicalProviderErrorKey(key) {
-		case "apikey", "authorization", "token", "accesstoken", "refreshtoken",
-			"credential", "credentials", "secret", "clientsecret", "accountid", "organizationid",
-			"orgid", "projectid", "subscriptionid", "tenantid", "billingaccount", "billingaccountid":
-			return true
-		}
-	}
-
-	classification := ""
-	if providerErr != nil {
-		classification = strings.ToLower(strings.Join([]string{
-			fmt.Sprint(providerErr.Code), providerErr.Type, providerErr.Message,
-		}, " "))
-	}
-	classification += " " + strings.ToLower(strings.Join(inspection.strings, " "))
-	for _, secret := range providerSecrets {
-		secret = strings.TrimSpace(secret)
-		if len(secret) < 8 {
-			continue
-		}
-		for _, value := range inspection.strings {
-			if strings.Contains(value, secret) {
-				return true
-			}
-		}
-	}
-	for _, evidence := range []string{
-		"api key", "api_key", "invalid_api_key", "bearer ", "credential", "authentication_error",
-		"insufficient_quota", "billing_not_active", "billing hard limit", "billing_hard_limit",
-		"credit balance", "current quota", "account deactivated", "organization deactivated",
-		"organization org-", "project proj_", "account acct_",
-	} {
-		if strings.Contains(classification, evidence) {
-			return true
-		}
-	}
-	return false
-}
-
-func sanitizeMappedProviderError(providerErr types.OpenAIError, providerSecrets []string) types.OpenAIError {
-	providerErr.Message = redactMappedProviderErrorText(providerErr.Message, providerSecrets)
-	providerErr.Type = redactMappedProviderErrorText(providerErr.Type, providerSecrets)
-	providerErr.Param = redactMappedProviderErrorText(providerErr.Param, providerSecrets)
-	if code, ok := providerErr.Code.(string); ok {
-		providerErr.Code = redactMappedProviderErrorText(code, providerSecrets)
-	}
-	return providerErr
-}
-
-func redactMappedProviderErrorText(text string, providerSecrets []string) string {
-	for _, secret := range providerSecrets {
-		secret = strings.TrimSpace(secret)
-		if len(secret) >= 8 {
-			text = strings.ReplaceAll(text, secret, "[redacted]")
-		}
-	}
-	return common.RedactSensitiveText(text)
-}
-
-func requestProviderCredentialValues(req *http.Request) []string {
-	if req == nil {
-		return nil
-	}
-	values := make([]string, 0, 6)
-	for _, name := range []string{"Authorization", "Api-Key", "X-Api-Key", "X-Goog-Api-Key", "Proxy-Authorization"} {
-		for _, value := range req.Header.Values(name) {
-			value = strings.TrimSpace(value)
-			if value == "" {
-				continue
-			}
-			values = append(values, value)
-			if index := strings.IndexByte(value, ' '); index >= 0 {
-				if credential := strings.TrimSpace(value[index+1:]); credential != "" {
-					values = append(values, credential)
-				}
-			}
-		}
-	}
-	return values
-}
-
-func canonicalProviderErrorKey(key string) string {
-	var normalized strings.Builder
-	for _, r := range strings.TrimSpace(key) {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			normalized.WriteRune(unicode.ToLower(r))
-		}
-	}
-	return normalized.String()
-}
-
-func safeMalformedProviderError(status int) types.OpenAIError {
-	return types.OpenAIError{
-		Message: "upstream provider returned an invalid error response",
-		Type:    "upstream_error",
-		Code:    "bad_response_status_code",
-		Param:   strconv.Itoa(status),
-	}
+	return openAIErrorWithStatusCode
 }
 
 func SetEventStreamHeaders(c *gin.Context) {

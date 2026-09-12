@@ -347,7 +347,7 @@ func ErrorWrapper(err error, code string, statusCode int) *types.OpenAIErrorWith
 	}
 
 	if strings.Contains(errString, "Post") || strings.Contains(errString, "dial") {
-		logger.SysError(fmt.Sprintf("error: %s", RedactSensitiveText(errString)))
+		logger.SysError(fmt.Sprintf("error: %s", errString))
 		errString = "请求上游地址失败"
 	}
 

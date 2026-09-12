@@ -165,7 +165,7 @@ func TestRunCodexChannelWorkersReportsPanicAndContinues(t *testing.T) {
 	}
 }
 
-func TestRunCodexChannelWorkersRedactsPanicTextFromLogAndResult(t *testing.T) {
+func TestRunCodexChannelWorkersKeepsPanicDetailInLogOnly(t *testing.T) {
 	const secret = "round26-worker-secret"
 	const channelID = 260026
 
@@ -178,9 +178,6 @@ func TestRunCodexChannelWorkersRedactsPanicTextFromLogAndResult(t *testing.T) {
 	}
 	if strings.Contains(result.FirstPanicErr.Error(), secret) {
 		t.Fatalf("structured panic error leaked secret: %q", result.FirstPanicErr)
-	}
-	if !strings.Contains(result.FirstPanicErr.Error(), "[redacted]") {
-		t.Fatalf("structured panic error omitted redacted panic diagnostic: %q", result.FirstPanicErr)
 	}
 
 	entries, err := logger.GetLatestLogs(500)
@@ -196,11 +193,8 @@ func TestRunCodexChannelWorkersRedactsPanicTextFromLogAndResult(t *testing.T) {
 	if panicLog == "" {
 		t.Fatal("expected captured channel worker panic log")
 	}
-	if strings.Contains(panicLog, secret) {
-		t.Fatalf("panic log leaked secret: %q", panicLog)
-	}
-	if !strings.Contains(panicLog, "[redacted]") {
-		t.Fatalf("panic log omitted redacted panic diagnostic: %q", panicLog)
+	if !strings.Contains(panicLog, secret) {
+		t.Fatalf("系统日志丢失原始 panic: %q", panicLog)
 	}
 	if !strings.Contains(panicLog, "stack:") {
 		t.Fatalf("panic log did not retain stack: %q", panicLog)

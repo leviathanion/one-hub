@@ -59,6 +59,7 @@ export default defineConfig({
           { text: '自定义渠道上游接口配置', link: '/dev/channel-endpoints' },
           { text: '条件倍率规则设计', link: '/dev/pricing-rate-rules' },
           { text: 'Responses 透明转发与计费', link: '/dev/responses-transparent-relay-design' },
+          { text: '上游响应脱敏与统一交付', link: '/dev/provider-response-redaction-design' },
           { text: 'Codex Realtime Best-Effort Affinity', link: '/dev/codex-realtime-best-effort-affinity' },
           { text: 'Codex Realtime Preferred Fallback', link: '/dev/codex-realtime-preferred-channel-fallback' },
           { text: 'Codex Prompt Cache Affinity', link: '/dev/codex-prompt-cache-affinity-derivation' },

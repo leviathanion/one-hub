@@ -93,7 +93,7 @@ func TestResponseMultipartAbortsCommittedCopyFailure(t *testing.T) {
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"application/json"}},
 		Body:       &partialErrorReadCloser{},
-	}, providerresponse.Policy{Operation: providerresponse.OperationResponsesRetrieve, DataPath: providerresponse.DataPathExactWire, BodyUnmodified: true})
+	}, providerresponse.Policy{Operation: providerresponse.OperationBinaryDownload, DataPath: providerresponse.DataPathExactWire, BodyUnmodified: true})
 }
 
 func TestPath2RelayAndLimitModelHelpers(t *testing.T) {
@@ -443,10 +443,10 @@ func TestRelayCommonStreamingAndRetryHelpers(t *testing.T) {
 	if errWithCode := responseJsonClient(rawCtx, rawResponse); errWithCode != nil {
 		t.Fatalf("expected opted-in raw provider response to succeed, got %v", errWithCode)
 	}
-	if rawRecorder.Code != http.StatusCreated || strings.Contains(rawRecorder.Body.String(), "acct-secret") || !strings.Contains(rawRecorder.Body.String(), `"account_id":"[redacted]"`) || !strings.Contains(rawRecorder.Body.String(), `"content":"model says access_token is a public label"`) || !strings.Contains(rawRecorder.Body.String(), `"future":{"exact":true}`) {
+	if rawRecorder.Code != http.StatusCreated || !strings.Contains(rawRecorder.Body.String(), `"account_id":"acct-secret"`) || !strings.Contains(rawRecorder.Body.String(), `"content":"model says access_token is a public label"`) || !strings.Contains(rawRecorder.Body.String(), `"future":{"exact":true}`) {
 		t.Fatalf("expected exact provider status/body after replay opt-in, got status=%d body=%q", rawRecorder.Code, rawRecorder.Body.String())
 	}
-	if rawRecorder.Header().Get("Content-Encoding") != "" || rawRecorder.Header().Get("Content-Length") != "" || rawRecorder.Header().Get("Digest") != "" || rawRecorder.Header().Get("Etag") != "" {
+	if rawRecorder.Header().Get("Content-Encoding") != "gzip" || rawRecorder.Header().Get("Content-Length") != "123" || rawRecorder.Header().Get("Digest") != "sha-256=:YWJj:" || rawRecorder.Header().Get("Etag") != `"raw-v1"` {
 		t.Fatalf("security rewrite retained invalid representation validators: %#v", rawRecorder.Header())
 	}
 	if rawRecorder.Header().Get("Cache-Control") != "private, no-store" {
@@ -647,7 +647,7 @@ func TestProcessProviderPayloadAPIErrorBestEffortControlPlane(t *testing.T) {
 	processProviderPayloadAPIError(ctx, channel, []byte(`{"type":"error","error":{"type":"usage_limit_reached","message":"usage limit reached"}}`), "test_provider_error")
 	select {
 	case apiErr := <-errCh:
-		if apiErr == nil || apiErr.StatusCode != http.StatusTooManyRequests || apiErr.Code != "provider_account_error" || !apiErr.ProviderQuotaExhausted {
+		if apiErr == nil || apiErr.StatusCode != http.StatusTooManyRequests || apiErr.Code != "usage_limit_reached" || !apiErr.ProviderQuotaExhausted {
 			t.Fatalf("expected safe usage-limit provider error, got %#v", apiErr)
 		}
 	case <-time.After(time.Second):

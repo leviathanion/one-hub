@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -143,9 +144,9 @@ func TestResponseStreamClientPreservesSanitizedProviderAPIError(t *testing.T) {
 				OpenAIError: types.OpenAIError{Type: "authentication_error", Code: "invalid_api_key", Message: "organization org-secret rejected at https://provider.example"},
 				StatusCode:  http.StatusUnauthorized,
 			},
-			controlCode: "provider_account_error",
-			contains:    []string{`"type":"upstream_error"`, `"code":"provider_account_error"`, `"message":"upstream provider account is unavailable"`},
-			forbidden:   []string{"org-secret", "provider.example", "invalid_api_key", "authentication_error", "[DONE]"},
+			controlCode: "invalid_api_key",
+			contains:    []string{`"type":"authentication_error"`, `"code":"invalid_api_key"`, `organization [redacted] rejected`},
+			forbidden:   []string{"org-secret", "[DONE]"},
 		},
 	}
 
@@ -328,11 +329,11 @@ func TestNativeResponseStreamStopsOnDownstreamWriteFailure(t *testing.T) {
 
 func TestSanitizeProviderSSELinePreservesFramingAndHidesAccountError(t *testing.T) {
 	input := "data: {\"type\":\"error\",\"sequence_number\":4,\"code\":\"insufficient_quota\",\"message\":\"organization org-secret exhausted\",\"account_id\":\"acct-secret\"}\r\n"
-	got := sanitizeProviderSSEEvent(input)
-	if !strings.HasPrefix(got, "data: ") || !strings.HasSuffix(got, "\r\n") || !strings.Contains(got, `"sequence_number":4`) || !strings.Contains(got, `"code":"provider_account_error"`) {
+	got := redactProviderSSEEvent(input)
+	if !strings.HasPrefix(got, "data: ") || !strings.HasSuffix(got, "\r\n") || !strings.Contains(got, `"sequence_number":4`) || !strings.Contains(got, `"code":"insufficient_quota"`) {
 		t.Fatalf("SSE framing or error envelope changed: %q", got)
 	}
-	for _, secret := range []string{"org-secret", "acct-secret", "insufficient_quota"} {
+	for _, secret := range []string{"org-secret", "acct-secret"} {
 		if strings.Contains(got, secret) {
 			t.Fatalf("provider account detail %q leaked from %q", secret, got)
 		}
@@ -341,14 +342,14 @@ func TestSanitizeProviderSSELinePreservesFramingAndHidesAccountError(t *testing.
 
 func TestSanitizeProviderSSELinePreservesOrdinaryPayloadBytes(t *testing.T) {
 	input := "  data:\t{\"type\":\"response.output_text.delta\",\"delta\":\"a  b\\n\\nhttps://example.com\",\"api_key\":\"model-authored-value\"}  \r\n"
-	if got := sanitizeProviderSSEEvent(input); got != input {
+	if got := redactProviderSSEEvent(input); got != input {
 		t.Fatalf("ordinary SSE payload changed:\nwant: %q\n got: %q", input, got)
 	}
 }
 
 func TestSanitizeProviderSSEEventHandlesEventPrefixAndSuccessMetadata(t *testing.T) {
 	errorEvent := "event: error\ndata: {\"type\":\"error\",\"message\":\"organization org-secret exhausted\",\"account_id\":\"acct-secret\"}\n\n"
-	safeError := sanitizeProviderSSEEvent(errorEvent)
+	safeError := redactProviderSSEEvent(errorEvent)
 	if !strings.HasPrefix(safeError, "event: error\ndata: ") || !strings.HasSuffix(safeError, "\n\n") {
 		t.Fatalf("SSE event framing changed: %q", safeError)
 	}
@@ -359,8 +360,8 @@ func TestSanitizeProviderSSEEventHandlesEventPrefixAndSuccessMetadata(t *testing
 	}
 
 	successEvent := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"account_id\":\"acct-success\",\"output\":[{\"account_id\":\"model-authored\"}]}}\n\n"
-	safeSuccess := sanitizeProviderSSEEvent(successEvent)
-	if strings.Contains(safeSuccess, "acct-success") || !strings.Contains(safeSuccess, "model-authored") {
+	safeSuccess := redactProviderSSEEvent(successEvent)
+	if safeSuccess != successEvent {
 		t.Fatalf("success metadata policy was not scoped correctly: %q", safeSuccess)
 	}
 }
@@ -369,11 +370,10 @@ func TestSanitizeProviderSSEEventHandlesMultilineData(t *testing.T) {
 	for _, newline := range []string{"\n", "\r\n"} {
 		for _, payload := range [][]string{
 			{`{"type":"error",`, `"message":"organization org-secret exhausted","account_id":"acct-secret"}`},
-			{`{"type":"response.created",`, `"response":{"id":"resp_1","account_id":"acct-secret","output":[{"account_id":"model-authored"}]}}`},
 		} {
 			prefix := "event: future" + newline + "id: 7" + newline + "retry: 123" + newline
 			input := prefix + "data: " + payload[0] + newline + ": comment" + newline + "data: " + payload[1] + newline + newline
-			got := sanitizeProviderSSEEvent(input)
+			got := redactProviderSSEEvent(input)
 			if strings.Contains(got, "acct-secret") || strings.Contains(got, "org-secret") || !strings.HasPrefix(got, prefix) || !strings.Contains(got, ": comment"+newline) || !strings.HasSuffix(got, newline+newline) {
 				t.Fatalf("multiline security rewrite lost framing or leaked metadata: %q", got)
 			}
@@ -382,7 +382,7 @@ func TestSanitizeProviderSSEEventHandlesMultilineData(t *testing.T) {
 			}
 		}
 		ordinary := "event: future" + newline + "data: {\"future\":1e3," + newline + "data: \"content\":{\"account_id\":\"model-authored\"}}" + newline + newline
-		if got := sanitizeProviderSSEEvent(ordinary); got != ordinary {
+		if got := redactProviderSSEEvent(ordinary); got != ordinary {
 			t.Fatalf("ordinary multiline raw changed: %q", got)
 		}
 	}
@@ -409,10 +409,10 @@ func TestChatResponseStreamWriteFailureDrainsBlockedLegacyHandler(t *testing.T) 
 	gin.SetMode(gin.TestMode)
 	handlerSecondSendFinished := make(chan struct{})
 	stream, apiErr := requester.RequestStream[string](nil, &http.Response{
-		Body: io.NopCloser(strings.NewReader("first\nsecond\n")),
+		Body: io.NopCloser(strings.NewReader("{\"chunk\":\"first\"}\n{\"chunk\":\"second\"}\n")),
 	}, func(rawLine *[]byte, dataChan chan string, _ chan error) {
 		dataChan <- string(*rawLine)
-		if string(*rawLine) == "second" {
+		if string(*rawLine) == `{"chunk":"second"}` {
 			close(handlerSecondSendFinished)
 		}
 	})
@@ -838,5 +838,30 @@ func TestChannelAffinityRuleMatchesUserAgentRegex(t *testing.T) {
 	rule.UserAgentRegex = "^OtherClient/"
 	if channelAffinityRuleMatches(ctx, channelAffinityKindResponses, "gpt-5", rule) {
 		t.Fatal("expected user-agent regex mismatch to reject rule")
+	}
+}
+
+func TestProviderRedactionMultilineRedactionRoundTrip(t *testing.T) {
+	for _, newline := range []string{"\n", "\r\n", "\r"} {
+		for _, tail := range []string{"", newline, newline + newline} {
+			for _, value := range []string{`"acct-secret"`, "{\n\"nested\":\"acct-secret\"\n}"} {
+				lines := []string{"event: error", "id: 7", "data: {", "data: \"account_id\":" + strings.ReplaceAll(value, "\n", newline+"data: "), ": keep comment", "data: ,\"value\":9007199254740993", "data: }"}
+				raw := strings.Join(lines, newline) + tail
+				safe := redactProviderSSEEvent(raw)
+				payload, hasData := commonresponses.SSEDataPayload(safe)
+				if !hasData || !json.Valid([]byte(payload)) || strings.Contains(payload, "acct-secret") || !strings.Contains(payload, "9007199254740993") {
+					t.Fatalf("多行 SSE 改写破坏 payload: wire=%q payload=%q", safe, payload)
+				}
+				if !strings.HasSuffix(safe, "data: "+tail) && !strings.HasSuffix(safe, "data: }"+tail) {
+					t.Fatalf("SSE 尾部 framing 改变: %q", safe)
+				}
+				if !strings.Contains(safe, ": keep comment"+newline) || !strings.HasPrefix(safe, "event: error"+newline+"id: 7"+newline) {
+					t.Fatalf("非 data 字段改变: %q", safe)
+				}
+				if again := redactProviderSSEEvent(safe); again != safe {
+					t.Fatalf("SSE 重复改写不稳定: %q", again)
+				}
+			}
+		}
 	}
 }

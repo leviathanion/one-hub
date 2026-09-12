@@ -202,25 +202,25 @@ func TestSameDialectChatStreamHidesInternallyRequestedProviderUsageChunk(t *test
 	}
 }
 
-func TestExactChatStreamPreservesSanitizedProviderErrorEnvelope(t *testing.T) {
-	handler := OpenAIStreamHandler{Usage: &types.Usage{}, ProviderCredential: "provider-secret"}
+func TestExactChatStreamPreservesProviderErrorForDeliveryPolicy(t *testing.T) {
+	handler := OpenAIStreamHandler{Usage: &types.Usage{}}
 	stream := newExactChatTestStream(t, &handler, `data: {"error":{"message":"authorization=Bearer provider-secret","api_key":"sk-provider-secret-12345","code":"upstream_failed"}}`+"\n\n")
 	defer requester.CloseAndDrainStream(stream)
 	dataChan, _ := stream.Recv()
 	got := <-dataChan
-	if strings.Contains(got, "provider-secret") || !strings.Contains(got, `"code":"upstream_failed"`) {
-		t.Fatalf("exact provider error was not safely preserved: %s", got)
+	if !strings.Contains(got, "provider-secret") || !strings.Contains(got, `"code":"upstream_failed"`) {
+		t.Fatalf("adapter changed the raw provider error: %s", got)
 	}
 }
 
-func TestExactChatStreamRedactsConcreteProviderCredentialInSuccessText(t *testing.T) {
-	handler := OpenAIStreamHandler{Usage: &types.Usage{}, ProviderCredential: "provider-secret-123"}
+func TestExactChatStreamPreservesProviderTextForDeliveryPolicy(t *testing.T) {
+	handler := OpenAIStreamHandler{Usage: &types.Usage{}}
 	stream := newExactChatTestStream(t, &handler, `data: {"id":"chatcmpl_1","choices":[{"index":0,"delta":{"content":"provider-secret-123"}}]}`+"\n\n")
 	defer requester.CloseAndDrainStream(stream)
 	dataChan, _ := stream.Recv()
 	got := <-dataChan
-	if strings.Contains(got, "provider-secret-123") || !strings.Contains(got, "[redacted]") {
-		t.Fatalf("concrete provider credential leaked from success chunk: %s", got)
+	if !strings.Contains(got, "provider-secret-123") {
+		t.Fatalf("adapter changed the raw provider chunk: %s", got)
 	}
 }
 
@@ -495,8 +495,8 @@ func TestCustomChatResponsePreservesSafeUnknownFieldsWithoutInventingUsage(t *te
 			t.Fatalf("compatible response lost %s: %s", expected, replay)
 		}
 	}
-	if bytes.Contains(replay, []byte("acct-secret")) || !bytes.Contains(replay, []byte(`"account_id":"[redacted]"`)) {
-		t.Fatalf("compatible response replay was not sanitized: %s", replay)
+	if !bytes.Contains(replay, []byte(`"account_id":"acct-secret"`)) {
+		t.Fatalf("adapter changed metadata before delivery policy: %s", replay)
 	}
 	if bytes.Contains(replay, []byte(`"usage"`)) {
 		t.Fatalf("compatible response invented public usage from a local estimate: %s", replay)

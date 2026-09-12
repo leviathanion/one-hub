@@ -36,7 +36,8 @@ lastUpdated: true
 | 层级 | 唯一职责 |
 | --- | --- |
 | ingress / relay policy | 认证、权限、支持面、资源授权、渠道选择与工作前准入 |
-| provider / adapter | 构造上游协议、必要的方言转换、提取独立证据与安全脱敏 |
+| provider / adapter | 构造上游协议、必要的方言转换、提取独立证据及实际凭据快照 |
+| providerresponse / 协议交付入口 | 对客错误诊断尽力脱敏，失败保留原文，见 [上游响应脱敏方案](./provider-response-redaction-design.md) |
 | transport | 原始字节或消息交付、背压、取消、连接来源与真实发送结果 |
 | relay / billing owner | 关联已准入执行、持有资源证明、消费证据、执行一次结算 |
 
@@ -66,7 +67,7 @@ lastUpdated: true
 | 缺失、重复或非递增的上游序号 | 不作为通用原帧拒绝条件 | 只限制实际依赖它的去重或取消判断；不补造序号 |
 | 某个用量组件缺证据或冲突 | 安全帧仍交付 | 按 ADR-0033 隔离该组件，其他独立可计价组件仍进入结算 |
 | 已知 Response 无法关联到已准入执行，或资源身份存在冲突 | 只交付已能确认安全且不越过 owner 屏障的数据 | 停止新工作并收尾；不串账、不事后 Try、不隐式换渠道 |
-| 身份失效、必要脱敏失败、本地 envelope 不合法、实际保留资源超限 | 遵循本地安全或资源失败路径 | 允许中止连接；错误不能伪装成上游 lifecycle 回执 |
+| 身份失效、本地 envelope 不合法、实际保留资源超限 | 遵循本地安全或资源失败路径 | 允许中止连接；错误不能伪装成上游 lifecycle 回执 |
 | 旧计费对象已结束，但到达同连接的控制回执或诊断 | 原样交付 | 不重开账务、不修改新 Response、不刷新无关执行期限 |
 
 这里不取消 WS 文本/object/type 等本地 envelope、渠道可表示性或资源权限检查。新 Stored Response 的归属屏障也继续存在；不能用“投影可选”绕过已知资源的授权要求。
@@ -98,7 +99,7 @@ lastUpdated: true
 
 ### 3.2 回执、FIFO 与发送结果
 
-`response.inject.created/failed` 与 `response.steer.accepted/pending/failed` 使用同一原始交付规则：来源经过验证并完成必要脱敏后即可交付，不依赖 active attempt、pending 数量或最近 16 项历史。只有确实涉及未结束的本地决定时才观察关联字段。
+`response.inject.created/failed` 与 `response.steer.accepted/pending/failed` 使用同一原始交付规则：来源经过验证即可交付；明确的错误诊断尽力脱敏，不依赖 active attempt、pending 数量或最近 16 项历史。只有确实涉及未结束的本地决定时才观察关联字段。
 
 删除 inject 的 `pendingTargets`、初始回执计数与 terminal-ack barrier。inject 不创建独立后继，回执计数不决定父费用，也不需要替客户端等待下一次输入。父 terminal 可结束父计费观察并推进原 create FIFO；已经发布到同一 send worker 的命令保持顺序。仍可能触发独立后继的 steering 预扣继续阻挡 create，规则见第 6 节。
 
@@ -129,7 +130,7 @@ lastUpdated: true
 
 保持 SSE 原始事件名、data、多行规则、注释、空行、未知字段和次序。TCP/HTTP chunk 的物理切分不是对外契约；framer 只提供有界观察和必要的 owner 暂存，不决定上游是否完成。
 
-SSE reader、事件分帧、`SSEDataPayload` 和安全重建必须使用一致的 [WHATWG SSE 行语义](https://html.spec.whatwg.org/multipage/server-sent-events.html#parsing-an-event-stream)：识别 CR、LF、CRLF，正确处理跨 chunk 的 CRLF 与多行 data。行遍历规则在 SSE 共享边界实现一次，原始交付只因必要脱敏改写相应 payload。仅修正 reader/framer 会留下 CR-only 脱敏遗漏；完整事件交付后由 Responses 入口显式 Flush 并检查错误，使小事件及时可见，不依赖通用 writer 的 LF 分隔符猜测，也不扩建其协议识别规则。
+SSE reader、事件分帧、`SSEDataPayload` 和安全重建必须使用一致的 [WHATWG SSE 行语义](https://html.spec.whatwg.org/multipage/server-sent-events.html#parsing-an-event-stream)：识别 CR、LF、CRLF，正确处理跨 chunk 的 CRLF 与多行 data。行遍历规则在 SSE 共享边界实现一次，原始交付仅对明确错误对象中的诊断值尽力改写。完整事件交付后由 Responses 入口显式 Flush 并检查错误，使小事件及时可见，不依赖通用 writer 的 LF 分隔符猜测，也不扩建其协议识别规则。
 
 已识别 terminal 记录该 Response 的执行终结，不等于停止读取或已经完成余额动作。HTTP 消费者继续交付后续字节，直到真实 EOF、取消、传输错误或已有资源/时间边界。`[DONE]` 同样按原始协议转发，不作为本地截断剩余 chunk 的命令。不得因控制回执或未知事件出现在 terminal 后而新建计费 owner。
 
@@ -145,7 +146,7 @@ EOF 前未识别到 terminal，只表示本地没有该终结事实；按已收�
 
 取消读取后产生的 EOF 不自动变成“上游正常完成”。原始错误保留为传输诊断，不重写已提交状态码或追加伪造业务帧。复用 `relay/common.go` 的 `http.ErrAbortHandler` 通路和现有 recovery 中间件，使 HTTP/1.1 不发送正常 chunk terminator、HTTP/2 不发送正常 END_STREAM；先收尾已取得证据并保证一次结算，再结束 handler。此行为与 [Go ReverseProxy](https://go.dev/src/net/http/httputil/reverseproxy.go) 的响应复制失败处理一致，不新增传输错误框架。
 
-EOF 留下的未完成 SSE 事件不能成为收费证据，即使 data 已经是完整 JSON。尾部仍经过必要脱敏和 owner 屏障，取得交付许可后保留原始分隔字节，payload 只作必要安全改写，不补空行、补事件或推断 terminal；JSON 语法完整性是现有结构化脱敏器的前提；无法解析的 data（包括 EOF 截断 JSON）在交付前返回本地失败，已提交响应走异常 abort/reset。注释、空 data 和 `[DONE]` 保留原协议，不检查上游字段 schema。现有单行、事件、缓冲和传输超时限制保留。
+EOF 留下的未完成 SSE 事件不能成为收费证据，即使 data 已经是完整 JSON。尾部仍经过 owner 屏障，取得交付许可后保留原始分隔字节，不补空行、补事件或推断 terminal。明确错误诊断尽力脱敏；JSON 无法解析、重复键或脱敏预算不足时保持原文，不因脱敏失败中断交付。注释、空 data 和 `[DONE]` 保留原协议，不检查上游字段 schema。现有单行、事件、缓冲和传输超时限制保留。
 
 同次读取返回有效字节和非 EOF 错误时，先交接仍在容量和交付许可内的字节，再处理原始错误；不能只报告错误而丢掉已读尾部。这不扩大第 5 节的证据截止范围，也不使未完成 SSE 事件成为计费证据。
 
@@ -282,12 +283,12 @@ Adapter 必须在首次修改状态前隔离控制/诊断观察。旧父的 stee
 
 | 验收组 | 必须验证的外部结果 |
 | --- | --- |
-| 原始交付 | 同连接迟到 inject/steer 回执、无 active attempt 的安全诊断、未知字段与大整数原样交付；必要脱敏仍生效 |
+| 原始交付 | 同连接迟到 inject/steer 回执、无 active attempt 的安全诊断、未知字段与大整数原样交付；错误诊断尽力脱敏 |
 | 投影局部失败 | 未知序号/status/reason 不触发通用原帧拒绝；JSON/SSE/WS 的 model/tier 为无法解析的形态时，原帧仍交付，依赖组件不可借请求值、默认值或旧值收费；独立组件及真正缺省行为分别验证 |
 | inject | 活动及已完成的已授权目标均发送原始帧；没有本地工具 schema 验证、模拟失败或序号；未知/跨用户目标在工作前按资源授权失败 |
 | 调度 | create FIFO 不跳队；旧 inject 回执不占用已结算父或阻挡新回合；发送歧义仍作用于原命令和连接 |
 | WS 接收关联 | A terminal、B create、inject(A) 后，B 的无 ID delta 仍归 B；旧 inject 的完成/错误只消费原命令关联，接收错误保持正确连接作用域 |
-| HTTP SSE | terminal、`[DONE]` 后仍交付剩余及后续字节；CR-only、混合行结束、跨 chunk CRLF、多行 data 的敏感字段被正确脱敏，小完整事件在 EOF 前及时可见；完整 JSON 但未完成 SSE 事件的尾部脱敏后可交付且不计费 |
+| HTTP SSE | terminal、`[DONE]` 后仍交付剩余及后续字节；CR-only、混合行结束、跨 chunk CRLF、多行 data 的错误诊断尽力脱敏，小完整事件在 EOF 前及时可见；完整 JSON 但未完成 SSE 事件的尾部脱敏后可交付且不计费 |
 | HTTP 结束语义 | 正常 EOF 不因 Body 清理取消而误 abort；有字节伴随读取错误时先处理许可内字节；非 EOF 错误、超限、本地提前停止及最终刷新失败在已提交后 abort/reset；缺业务 terminal 不合成业务事件；不重复结算 |
 | owner/write 失败 | 当前已取得 chunk 内的合法证据仅观察/结算一次，不暴露资源、不重试 SQL；真实 reader 关闭后即使清理收到新行也不补账，通用多事件 chunk fixture 独立验证 |
 | 关闭与背压 | 在准入、Try 返回、Claim、Send、消费者接收、open Adopted 处停止；无新许可、无重复释放。真实 H1/H2 客户端连接保持但不读取时，超时和显式异常停止均能解除 Write/Flush，handler 有界退出并一次结算；owner SQL 阻塞时缓冲有界，native emitter 退出，legacy 清理不能无限等待 |
@@ -302,7 +303,7 @@ Adapter 必须在首次修改状态前隔离控制/诊断观察。旧父的 stee
 - 真实 NativeSession 辅助发送后的接收 ID；actor 的已完成 inject、迟到控制帧、FIFO、发送歧义、closure cut、steering 预扣及一次资源释放。
 - OpenAI/Codex 的独立字段投影、工具去重和组件冲突，无法解释或前后冲突的 model/tier 不进入 token 计价，独立服务组件仍可结算；相同累计终态和迟到工具事件不重复计费。
 - 真实 HTTP/1.1、HTTP/2 的正常 EOF、异常读取、客户端停止读取时的 source error / 取消 / deadline；验证客户端能区分正常结束与截断，handler 有界退出，SQL 余额和日志只结算一次。
-- SSE 的 CR、LF、CRLF 分帧和安全重建、大整数保留、完整事件及时刷新，以及完整 JSON 但未完成事件的尾部不计费。截断 JSON 的账户字段不会交付，真实 H1/H2 客户端观察到异常结束，已取得工具证据只结算一次。owner/write 失败后的当前 chunk 和 legacy 有界清理另有回归。
+- SSE 的 CR、LF、CRLF 分帧和安全重建、大整数保留、完整事件及时刷新，以及完整 JSON 但未完成事件的尾部不计费。截断 JSON 的脱敏回退不干扰 H1/H2 交付，尾部不计费，已取得工具证据只结算一次。owner/write 失败后的当前 chunk 和 legacy 有界清理另有回归。
 
 早期消融实验确认 steering 的初始回执义务、水位和父资源证明仍有实际消费者，删除它们会造成提前退款或拒绝合法续接；这三项保留。关闭专用 100ms 等待、`postedSequence` / `closureCutSequence`、inject ack barrier 和完整 `lastFinal` 已从生产代码及旧断言中删除。
 

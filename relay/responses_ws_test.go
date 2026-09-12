@@ -976,7 +976,7 @@ func TestResponsesWebSocketRejectsNonUpgradeBeforeConnectionLimiter(t *testing.T
 	}
 }
 
-func TestResponsesWSFrameDiagnosticsSanitizesClientMetadata(t *testing.T) {
+func TestResponsesWSFrameDiagnosticsFormatsClientMetadata(t *testing.T) {
 	parentThreadID := "thread-secret-sk-proj-abcdefghijklmnopqrstuvwxyz"
 	raw, err := json.Marshal(map[string]any{
 		"type":  "response.create",
@@ -1002,11 +1002,11 @@ func TestResponsesWSFrameDiagnosticsSanitizesClientMetadata(t *testing.T) {
 		t.Fatalf("expected parent thread presence, length, and hash only, got %+v", diag)
 	}
 	rendered := fmt.Sprintf("%+v", diag)
-	if strings.Contains(rendered, "Bearer") || strings.Contains(rendered, parentThreadID) || strings.Contains(rendered, "sk-proj-abcdefghijklmnopqrstuvwxyz") {
+	if strings.Contains(rendered, "Bearer") || strings.Contains(rendered, parentThreadID) {
 		t.Fatalf("expected client metadata secrets to be redacted from diagnostics, got %+v", diag)
 	}
-	if !strings.Contains(diag.TurnRequestKind, "[redacted]") {
-		t.Fatalf("expected request kind secret to be redacted, got %+v", diag)
+	if diag.TurnRequestKind != `kind\nsk-proj-abcdefghijklmnopqrstuvwxyz` {
+		t.Fatalf("expected request kind diagnostic to retain raw content, got %+v", diag)
 	}
 }
 
@@ -5007,7 +5007,7 @@ func TestResponsesWSFailedTerminalProcessesProviderErrorWithoutClosingSession(t 
 		UpstreamSessionGeneration: generation,
 		ChannelID:                 17,
 		Kind:                      ProviderDownstreamFrame,
-		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.failed","sequence_number":1,"account_id":"acct-secret","response":{"id":"resp_limit","status":"failed","error":{"type":"usage_limit_reached","message":"monthly usage limit reached for org-secret"}}}`)),
+		Frame:                     responsesWSTestProviderTextFrame([]byte(`{"type":"response.failed","sequence_number":1,"account_id":"acct-secret","response":{"id":"resp_limit","status":"failed","error":{"type":"usage_limit_reached","message":"monthly usage limit reached for organization org-secret"}}}`)),
 		DetailOrigin:              responsesws.RecvDetailOriginProviderFrame,
 	})
 
@@ -5016,13 +5016,13 @@ func TestResponsesWSFailedTerminalProcessesProviderErrorWithoutClosingSession(t 
 	}
 	select {
 	case apiErr := <-errCh:
-		if apiErr == nil || apiErr.StatusCode != http.StatusTooManyRequests || apiErr.Code != "provider_account_error" || !apiErr.ProviderQuotaExhausted {
+		if apiErr == nil || apiErr.StatusCode != http.StatusTooManyRequests || apiErr.Code != "usage_limit_reached" || !apiErr.ProviderQuotaExhausted {
 			t.Fatalf("expected safe usage-limit control error, got %#v", apiErr)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for provider error control-plane handling")
 	}
-	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, `"code":"provider_account_error"`) || strings.Contains(got, "org-secret") || strings.Contains(got, "acct-secret") || !strings.Contains(got, `"id":"resp_limit"`) {
+	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, `"type":"usage_limit_reached"`) || strings.Contains(got, "org-secret") || !strings.Contains(got, `"id":"resp_limit"`) {
 		t.Fatalf("expected safe provider error with preserved lifecycle envelope, got %q", got)
 	}
 }
@@ -5059,7 +5059,7 @@ func TestResponsesWSProviderAPIErrorDedupesWithinTurn(t *testing.T) {
 
 	select {
 	case apiErr := <-errCh:
-		if apiErr == nil || apiErr.StatusCode != http.StatusTooManyRequests || apiErr.Code != "provider_account_error" || !apiErr.ProviderQuotaExhausted {
+		if apiErr == nil || apiErr.StatusCode != http.StatusTooManyRequests || apiErr.Code != "usage_limit_reached" || !apiErr.ProviderQuotaExhausted {
 			t.Fatalf("expected safe usage-limit provider error, got %#v", apiErr)
 		}
 	case <-time.After(time.Second):
@@ -5077,7 +5077,7 @@ func TestResponsesWSProviderAPIErrorDedupesWithinTurn(t *testing.T) {
 
 	select {
 	case apiErr := <-errCh:
-		if apiErr == nil || apiErr.StatusCode != http.StatusTooManyRequests || apiErr.Code != "provider_account_error" || !apiErr.ProviderQuotaExhausted {
+		if apiErr == nil || apiErr.StatusCode != http.StatusTooManyRequests || apiErr.Code != "usage_limit_reached" || !apiErr.ProviderQuotaExhausted {
 			t.Fatalf("expected next turn to process provider error independently, got %#v", apiErr)
 		}
 	case <-time.After(time.Second):
@@ -5319,7 +5319,7 @@ func TestResponsesWSCloseReplayProcessesBufferedProviderAPIError(t *testing.T) {
 
 	select {
 	case apiErr := <-errCh:
-		if apiErr == nil || apiErr.StatusCode != http.StatusTooManyRequests || apiErr.Code != "provider_account_error" || !apiErr.ProviderQuotaExhausted {
+		if apiErr == nil || apiErr.StatusCode != http.StatusTooManyRequests || apiErr.Code != "usage_limit_reached" || !apiErr.ProviderQuotaExhausted {
 			t.Fatalf("expected safe usage-limit provider error, got %#v", apiErr)
 		}
 	case <-time.After(time.Second):

@@ -52,6 +52,7 @@
 | [Payment Order 原子入账方案](./payment-order-architecture.md) | gateway create、callback、用户 credit | 最终方案；Payment Order原子credit，强幂等contract内允许有界create retry |
 | [ResponsesWS 架构说明](./responses-ws-architecture.md) | `/v1/responses` WebSocket、actor、quota、upstream snapshot | 当前 ResponsesWS ingress 架构；计费遵循 usage Confirm / otherwise Cancel |
 | [Responses 透明转发与计费边界设计](./responses-transparent-relay-design.md) | HTTP SSE / Native WS、inject、steering、owner 与用量 | 当前实现；分离原帧交付和本地观察，删除模拟生命周期，保留有界证据收尾 |
+| [上游响应脱敏与统一交付方案](./provider-response-redaction-design.md) | HTTP JSON / SSE / WS、错误回放与诊断日志 | 当前实现；共享安全策略、按协议交付前执行，分离日志与协议处理 |
 | [Responses 请求重试边界](./responses-ws-attempt-replay-architecture.md) | HTTP / Native WS no-replay 边界 | provider work 前完成筛选；submission 后不换渠道、不重放 |
 | [ResponsesWS Native Transport 边界](./responses-ws-transport-boundary.md) | Native WS send result、provider adapter、evidence 边界 | ResponsesWS 只有 native upstream，没有 HTTP bridge |
 | [Codex / PI OAuth 请求 Header 画像对照](./codex-pi-header-parity.md) | Codex / PI 自身 OAuth header 画像、one-hub 中转差异 | 用于后续 Codex provider header parity 修复和回归测试设计 |
@@ -75,6 +76,7 @@
 | [Payment Order 原子入账方案](./payment-order-architecture.md) | 最终方案 | Payment Order在gateway work前成为owner，callback原子credit |
 | [ResponsesWS 架构](./responses-ws-architecture.md) | 当前实现 | `GET /v1/responses` native-only ingress、turn actor、owner barrier 与 usage-only 结算 |
 | [Responses 透明转发与计费边界设计](./responses-transparent-relay-design.md) | 当前实现 | 原始回执独立交付；HTTP 按真实传输结束收尾；inject 结果由上游决定 |
+| [上游响应脱敏与统一交付方案](./provider-response-redaction-design.md) | 当前实现 | 收敛重复规则与错误回放检查；保留协议角色和已有账号错误契约 |
 | [Responses 请求重试边界](./responses-ws-attempt-replay-architecture.md) | 当前实现 | HTTP 与 Native WS 在 submission 后都没有 request replay actor |
 | [ResponsesWS Native Transport 边界](./responses-ws-transport-boundary.md) | 当前实现 | native send result、provider adapter 与 evidence contract；无 HTTP/SSE bridge |
 | [Codex / PI OAuth 请求 Header 画像对照](./codex-pi-header-parity.md) | 当前诊断 | 记录 Codex / PI 本体 HTTP/WS header 画像，以及 one-hub 当前中转后的缺失、额外和逻辑不一致字段 |
