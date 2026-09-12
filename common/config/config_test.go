@@ -17,7 +17,6 @@ func TestInitConfLoadsRealtimeSessionCompatFlagAndDefaults(t *testing.T) {
 	originalDecodeMaxLayers := RequestBodyDecodeMaxLayers
 	originalUserInvoiceMonth := UserInvoiceMonth
 	originalGitHubProxy := GitHubProxy
-	originalMCPEnable := MCP_ENABLE
 	originalUptimeKumaEnable := UPTIMEKUMA_ENABLE
 	originalUptimeKumaDomain := UPTIMEKUMA_DOMAIN
 	originalUptimeKumaStatusPage := UPTIMEKUMA_STATUS_PAGE_NAME
@@ -34,7 +33,6 @@ func TestInitConfLoadsRealtimeSessionCompatFlagAndDefaults(t *testing.T) {
 		RequestBodyDecodeMaxLayers = originalDecodeMaxLayers
 		UserInvoiceMonth = originalUserInvoiceMonth
 		GitHubProxy = originalGitHubProxy
-		MCP_ENABLE = originalMCPEnable
 		UPTIMEKUMA_ENABLE = originalUptimeKumaEnable
 		UPTIMEKUMA_DOMAIN = originalUptimeKumaDomain
 		UPTIMEKUMA_STATUS_PAGE_NAME = originalUptimeKumaStatusPage
@@ -108,7 +106,6 @@ func TestInitConfLoadsRealtimeSessionCompatFlagAndDefaults(t *testing.T) {
 	viper.Set("request_body_decode.max_layers", 1)
 	viper.Set("user_invoice_month", true)
 	viper.Set("github_proxy", "https://proxy.example")
-	viper.Set("mcp.enable", true)
 	viper.Set("uptime_kuma.enable", true)
 	viper.Set("uptime_kuma.domain", "status.example.com")
 	viper.Set("uptime_kuma.status_page_name", "main")
@@ -130,8 +127,8 @@ func TestInitConfLoadsRealtimeSessionCompatFlagAndDefaults(t *testing.T) {
 	if GitHubProxy != "https://proxy.example" {
 		t.Fatalf("expected github proxy to round-trip through InitConf, got %q", GitHubProxy)
 	}
-	if !MCP_ENABLE || !UPTIMEKUMA_ENABLE {
-		t.Fatalf("expected InitConf to load nested boolean defaults, got mcp=%v uptime=%v", MCP_ENABLE, UPTIMEKUMA_ENABLE)
+	if !UPTIMEKUMA_ENABLE {
+		t.Fatal("expected InitConf to load nested boolean defaults, got uptime=false")
 	}
 	if UPTIMEKUMA_DOMAIN != "status.example.com" || UPTIMEKUMA_STATUS_PAGE_NAME != "main" {
 		t.Fatalf("expected InitConf to load nested uptime kuma strings, got domain=%q page=%q", UPTIMEKUMA_DOMAIN, UPTIMEKUMA_STATUS_PAGE_NAME)

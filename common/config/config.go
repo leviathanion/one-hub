@@ -31,7 +31,6 @@ func InitConf() error {
 	RequestBodyDecodeMaxLayers = viper.GetInt("request_body_decode.max_layers")
 	ExactWireIngressOwnedHeaders = append([]string(nil), viper.GetStringSlice("exact_wire.ingress_owned_headers")...)
 	GitHubProxy = viper.GetString("github_proxy")
-	MCP_ENABLE = viper.GetBool("mcp.enable") != false
 	UPTIMEKUMA_ENABLE = viper.GetBool("uptime_kuma.enable") != false
 	UPTIMEKUMA_DOMAIN = viper.GetString("uptime_kuma.domain")
 	UPTIMEKUMA_STATUS_PAGE_NAME = viper.GetString("uptime_kuma.status_page_name")
@@ -89,7 +88,6 @@ func defaultConfig() {
 	viper.SetDefault("request_body_decode.max_layers", 2)
 	viper.SetDefault("exact_wire.ingress_owned_headers", []string{})
 	viper.SetDefault("codex.execution_session_revocation_timeout_ms", 200)
-	viper.SetDefault("mcp.enable", false)
 	viper.SetDefault("uptime_kuma.enable", false)
 	viper.SetDefault("uptime_kuma.domain", "")
 	viper.SetDefault("uptime_kuma.status_page_name", "")
