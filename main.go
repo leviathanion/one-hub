@@ -17,7 +17,6 @@ import (
 	"one-api/common/redis"
 	"one-api/common/requestctx"
 	"one-api/common/requester"
-	"one-api/common/search"
 	"one-api/common/storage"
 	"one-api/common/telegram"
 	"one-api/common/webauthn"
@@ -104,7 +103,6 @@ func main() {
 	notify.InitNotifier()
 	cron.InitCron()
 	storage.InitStorage()
-	search.InitSearcher()
 	// 初始化安全检查器
 	safty.InitSaftyTools()
 	// 初始化账单数据
