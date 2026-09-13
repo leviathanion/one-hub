@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 
 import { fetchCodexUsageDetail, fetchCodexUsagePreviewMap } from './codexUsage';
 
@@ -199,15 +199,28 @@ export function useCodexUsageStore() {
   const isDetailLoading = useCallback((channelID) => detailLoadingByChannelId[channelID] === true, [detailLoadingByChannelId]);
   const getDetailError = useCallback((channelID) => detailErrorByChannelId[channelID] || '', [detailErrorByChannelId]);
 
-  return {
-    previewSnapshotByChannelId,
-    detailSnapshotByChannelId,
-    prefetchPreviews,
-    invalidateSnapshots,
-    refreshDetail,
-    getPreviewSnapshot,
-    getDetailSnapshot,
-    isDetailLoading,
-    getDetailError
-  };
+  return useMemo(
+    () => ({
+      previewSnapshotByChannelId,
+      detailSnapshotByChannelId,
+      prefetchPreviews,
+      invalidateSnapshots,
+      refreshDetail,
+      getPreviewSnapshot,
+      getDetailSnapshot,
+      isDetailLoading,
+      getDetailError
+    }),
+    [
+      previewSnapshotByChannelId,
+      detailSnapshotByChannelId,
+      prefetchPreviews,
+      invalidateSnapshots,
+      refreshDetail,
+      getPreviewSnapshot,
+      getDetailSnapshot,
+      isDetailLoading,
+      getDetailError
+    ]
+  );
 }

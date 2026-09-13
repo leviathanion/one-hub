@@ -139,118 +139,121 @@ export default function ChannelList() {
     setSearchKeyword(toolBarValue);
   };
 
-  const handleToolBarValue = (event) => {
-    setToolBarValue({ ...toolBarValue, [event.target.name]: event.target.value });
-  };
+  const handleToolBarValue = useCallback((event) => {
+    const { name, value } = event.target;
+    setToolBarValue((prev) => ({ ...prev, [name]: value }));
+  }, []);
 
-  const manageChannel = async (id, action, value, tag = false) => {
-    let url = '/api/channel/';
-    if (tag) {
-      url = '/api/channel_tag/';
-    }
-
-    let data = { id };
-    let res;
-
-    try {
-      switch (action) {
-        case 'copy': {
-          let oldRes = await API.get(`/api/channel/${id}`);
-          const { success, message, data } = oldRes.data;
-          if (!success) {
-            showError(message);
-            return { success: false, message };
-          }
-          // 删除 data.id
-          delete data.id;
-          delete data.test_time;
-          delete data.balance_updated_time;
-          delete data.used_quota;
-          delete data.response_time;
-          data.name = data.name + '_copy';
-          res = await API.post(`/api/channel/`, { ...data });
-          break;
-        }
-        case 'delete':
-          if (tag) {
-            res = await API.delete(url + encodeURIComponent(id));
-          } else {
-            res = await API.delete(`${url}${id}`);
-          }
-          break;
-        case 'delete_tag':
-          res = await API.delete(url + id + '/tag');
-          break;
-        case 'status':
-          res = await API.put(url, {
-            ...data,
-            status: value
-          });
-          break;
-        case 'priority':
-        case 'weight':
-          if (value === '') {
-            return { success: false, message: '值不能为空' };
-          }
-
-          if (!tag) {
-            res = await API.put(url, {
-              ...data,
-              [action]: Number(value)
-            });
-          } else {
-            res = await API.put(`${url + encodeURIComponent(id)}/priority`, {
-              type: 'priority',
-              value
-            });
-          }
-          break;
-        case 'test':
-          res = await API.get(url + `test/${id}`, {
-            params: { model: value }
-          });
-          break;
-        case 'batch_delete':
-          res = await API.delete('/api/channel/batch', {
-            data: {
-              value: 'batch_delete',
-              ids: value
-            }
-          });
-          break;
-        case 'tag_change_status':
-          res = await API.put(`/api/channel_tag/${id}/status/${value}`);
-          break;
-        default:
-          showError('无效操作');
-          return { success: false, message: '无效操作' };
-      }
-      const { success, message } = res.data;
-      if (success) {
-        showSuccess(t('userPage.operationSuccess'));
-        if (action === 'delete' || action === 'copy' || action == 'delete_tag') {
-          await handleRefresh(false);
-        }
-      } else {
-        showError(message);
-      }
-
-      return res.data;
-    } catch (error) {
-      return { success: false, message: error.message };
-    }
-  };
-
-  // 处理刷新
-  const handleRefresh = async (reset) => {
+  const handleRefresh = useCallback(async (reset) => {
     if (reset) {
       setOrderBy('id');
       setOrder('desc');
       setToolBarValue(originalKeyword);
       setSearchKeyword(originalKeyword);
     }
-    setRefreshFlag(!refreshFlag);
-  };
+    setRefreshFlag((prev) => !prev);
+  }, []);
+
+  const manageChannel = useCallback(
+    async (id, action, value, tag = false) => {
+      let url = '/api/channel/';
+      if (tag) {
+        url = '/api/channel_tag/';
+      }
+
+      let data = { id };
+      let res;
+
+      try {
+        switch (action) {
+          case 'copy': {
+            let oldRes = await API.get(`/api/channel/${id}`);
+            const { success, message, data } = oldRes.data;
+            if (!success) {
+              showError(message);
+              return { success: false, message };
+            }
+            // 删除 data.id
+            delete data.id;
+            delete data.test_time;
+            delete data.balance_updated_time;
+            delete data.used_quota;
+            delete data.response_time;
+            data.name = data.name + '_copy';
+            res = await API.post(`/api/channel/`, { ...data });
+            break;
+          }
+          case 'delete':
+            if (tag) {
+              res = await API.delete(url + encodeURIComponent(id));
+            } else {
+              res = await API.delete(`${url}${id}`);
+            }
+            break;
+          case 'delete_tag':
+            res = await API.delete(url + id + '/tag');
+            break;
+          case 'status':
+            res = await API.put(url, {
+              ...data,
+              status: value
+            });
+            break;
+          case 'priority':
+          case 'weight':
+            if (value === '') {
+              return { success: false, message: '值不能为空' };
+            }
+
+            if (!tag) {
+              res = await API.put(url, {
+                ...data,
+                [action]: Number(value)
+              });
+            } else {
+              res = await API.put(`${url + encodeURIComponent(id)}/priority`, {
+                type: 'priority',
+                value
+              });
+            }
+            break;
+          case 'test':
+            res = await API.get(url + `test/${id}`, {
+              params: { model: value }
+            });
+            break;
+          case 'batch_delete':
+            res = await API.delete('/api/channel/batch', {
+              data: {
+                value: 'batch_delete',
+                ids: value
+              }
+            });
+            break;
+          case 'tag_change_status':
+            res = await API.put(`/api/channel_tag/${id}/status/${value}`);
+            break;
+          default:
+            showError('无效操作');
+            return { success: false, message: '无效操作' };
+        }
+        const { success, message } = res.data;
+        if (success) {
+          showSuccess(t('userPage.operationSuccess'));
+          if (action === 'delete' || action === 'copy' || action == 'delete_tag') {
+            await handleRefresh(false);
+          }
+        } else {
+          showError(message);
+        }
+
+        return res.data;
+      } catch (error) {
+        return { success: false, message: error.message };
+      }
+    },
+    [t, handleRefresh]
+  );
 
   const handlePopoverOpen = useCallback(
     (title, onConfirm) => {

@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import PropTypes from 'prop-types';
 import { useTheme } from '@mui/material/styles';
 import { Icon } from '@iconify/react';
@@ -6,7 +7,7 @@ import { CHANNEL_OPTIONS } from 'constants/ChannelConstants';
 import { useTranslation } from 'react-i18next';
 // ----------------------------------------------------------------------
 
-export default function TableToolBar({ filterName, handleFilterName, groupOptions, tags }) {
+function TableToolBar({ filterName, handleFilterName, groupOptions, tags }) {
   const theme = useTheme();
   const grey500 = theme.palette.grey[500];
   const { t } = useTranslation();
@@ -286,3 +287,5 @@ TableToolBar.propTypes = {
   groupOptions: PropTypes.array,
   tags: PropTypes.array
 };
+
+export default memo(TableToolBar);

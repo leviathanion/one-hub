@@ -1,5 +1,5 @@
 import PropTypes from 'prop-types';
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { showInfo, showError, showSuccess } from 'utils/common';
 import { API } from 'utils/api';
@@ -145,7 +145,7 @@ function CodexUsageInline({ snapshot, onOpenDetails, detailTitle }) {
   );
 }
 
-export default function ChannelTableRow({ item, manageChannel, onRefresh, groupOptions, modelOptions, prices, codexUsage }) {
+function ChannelTableRow({ item, manageChannel, onRefresh, groupOptions, modelOptions, prices, codexUsage }) {
   const { t } = useTranslation();
   const { prefetchPreviews, invalidateSnapshots, refreshDetail, getPreviewSnapshot, getDetailSnapshot, isDetailLoading, getDetailError } =
     codexUsage;
@@ -186,9 +186,11 @@ export default function ChannelTableRow({ item, manageChannel, onRefresh, groupO
   const [codexUsageTarget, setCodexUsageTarget] = useState(null);
 
   const [openRow, setOpenRow] = useState(false);
-  let modelMap = [];
-  modelMap = item.models.split(',');
-  modelMap.sort();
+  const modelMap = useMemo(() => {
+    const models = item.models.split(',');
+    models.sort();
+    return models;
+  }, [item.models]);
 
   const [editedChannel, setEditedChannel] = useState({});
   const fetchTagChannels = useCallback(async () => {
@@ -214,13 +216,17 @@ export default function ChannelTableRow({ item, manageChannel, onRefresh, groupO
     return null;
   }, [item.tag, t]);
 
-  const tagChannelMembershipKey = Array.isArray(tagChannels)
-    ? tagChannels
-        .map((channel) => Number(channel?.id))
-        .filter((channelID) => Number.isInteger(channelID) && channelID > 0)
-        .sort((left, right) => left - right)
-        .join(',')
-    : '';
+  const tagChannelMembershipKey = useMemo(
+    () =>
+      Array.isArray(tagChannels)
+        ? tagChannels
+            .map((channel) => Number(channel?.id))
+            .filter((channelID) => Number.isInteger(channelID) && channelID > 0)
+            .sort((left, right) => left - right)
+            .join(',')
+        : '',
+    [tagChannels]
+  );
   tagChannelsRef.current = tagChannels;
 
   const invalidateQuickEditSnapshots = useCallback(() => {
@@ -1642,6 +1648,8 @@ ChannelTableRow.propTypes = {
   prices: PropTypes.array,
   codexUsage: PropTypes.object
 };
+
+export default memo(ChannelTableRow);
 
 function renderBalance(type, balance) {
   switch (type) {

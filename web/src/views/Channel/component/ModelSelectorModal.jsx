@@ -185,7 +185,6 @@ const ModelSelectorModal = ({ open, onClose, onConfirm, channelValues, prices })
   const [filterMappedModels, setFilterMappedModels] = useState(false);
   const [overwriteMappings, setOverwriteMappings] = useState(false);
   const [overwriteModels, setOverwriteModels] = useState(false);
-  const [mappingPreview, setMappingPreview] = useState({});
   const [modelsListCollapsed, setModelsListCollapsed] = useState(false);
 
   const deferredSearchTerm = useDeferredValue(searchTerm);
@@ -249,14 +248,13 @@ const ModelSelectorModal = ({ open, onClose, onConfirm, channelValues, prices })
       setFilterMappedModels(false);
       setOverwriteMappings(false);
       setOverwriteModels(false);
-      setMappingPreview({});
     }
   }, [open, channelValues, t]);
 
-  useEffect(() => {
+  // 映射预览是派生值，直接随依赖重算，避免 effect + setState 多一轮渲染。
+  const mappingPreview = useMemo(() => {
     if (!addToMapping || selectedModels.length === 0) {
-      setMappingPreview({});
-      return;
+      return {};
     }
 
     const preview = {};
@@ -294,8 +292,11 @@ const ModelSelectorModal = ({ open, onClose, onConfirm, channelValues, prices })
       }
     });
 
-    setMappingPreview(preview);
+    return preview;
   }, [selectedModels, addToMapping, removePrefixOrSuffix, prefixOrSuffix, addPlusSign, convertToLowercase]);
+
+  const mappingPreviewJson = useMemo(() => JSON.stringify(mappingPreview, null, 2), [mappingPreview]);
+  const mappingPreviewCount = Object.keys(mappingPreview).length;
 
   const handleOpenAIModeChange = (event) => {
     const isChecked = event.target.checked;
@@ -484,7 +485,6 @@ const ModelSelectorModal = ({ open, onClose, onConfirm, channelValues, prices })
     setFilterMappedModels(false);
     setOverwriteMappings(false);
     setOverwriteModels(false);
-    setMappingPreview({});
     onClose();
   };
 
@@ -918,10 +918,10 @@ const ModelSelectorModal = ({ open, onClose, onConfirm, channelValues, prices })
                     sx={{ my: 0 }}
                   />
 
-                  {Object.keys(mappingPreview).length > 0 && (
+                  {mappingPreviewCount > 0 && (
                     <Box sx={{ mt: 0.5 }}>
                       <Typography variant="subtitle2" gutterBottom>
-                        {t('channel_edit.mappingPreview')} ({Object.keys(mappingPreview).length})
+                        {t('channel_edit.mappingPreview')} ({mappingPreviewCount})
                       </Typography>
                       <Box
                         sx={{
@@ -934,9 +934,7 @@ const ModelSelectorModal = ({ open, onClose, onConfirm, channelValues, prices })
                           bgcolor: (theme) => (theme.palette.mode === 'dark' ? 'rgba(0,0,0,0.2)' : 'rgba(0,0,0,0.03)')
                         }}
                       >
-                        <pre style={{ margin: 0, fontFamily: 'monospace', fontSize: '0.75rem' }}>
-                          {JSON.stringify(mappingPreview, null, 2)}
-                        </pre>
+                        <pre style={{ margin: 0, fontFamily: 'monospace', fontSize: '0.75rem' }}>{mappingPreviewJson}</pre>
                       </Box>
                     </Box>
                   )}
@@ -955,7 +953,7 @@ const ModelSelectorModal = ({ open, onClose, onConfirm, channelValues, prices })
             {addToMapping
               ? t('channel_edit.selectedMappingCount', {
                   count: selectedModels.length,
-                  mappingCount: Object.keys(mappingPreview).length
+                  mappingCount: mappingPreviewCount
                 })
               : t('channel_edit.selectedCount', { count: selectedModels.length })}
           </Typography>
