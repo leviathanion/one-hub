@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import PropTypes from 'prop-types';
 
 import Dialog from '@mui/material/Dialog';
@@ -13,42 +13,37 @@ import { Icon } from '@iconify/react';
 import { showError } from 'utils/common';
 import { useTranslation } from 'react-i18next';
 
+const JSON_EDITOR_OPTIONS = {
+  minimap: { enabled: false },
+  scrollBeyondLastLine: false,
+  automaticLayout: true,
+  fontSize: 14,
+  lineNumbers: 'on',
+  folding: true,
+  formatOnPaste: true,
+  formatOnType: true
+};
+
 const ListInput = ({ listValue, onChange, disabled, error, label }) => {
   const { t } = useTranslation();
   const theme = useTheme();
-  const [items, setItems] = useState([]);
-
-  useEffect(() => {
-    try {
-      setItems(Array.isArray(listValue) ? listValue : []);
-    } catch (e) {
-      setItems([]);
-    }
-  }, [listValue]);
+  // 受控组件：不再把 props 复制进本地 state，编辑时每次按键少一轮 state 同步渲染。
+  const items = Array.isArray(listValue) ? listValue : [];
 
   const [openJsonDialog, setOpenJsonDialog] = useState(false);
   const [jsonInput, setJsonInput] = useState('');
 
   const handleAdd = () => {
-    const newItems = [...items, ''];
-    setItems(newItems);
-    updateParent(newItems);
+    onChange([...items, '']);
   };
 
   const handleDelete = (index) => {
-    const newItems = items.filter((_, idx) => idx !== index);
-    setItems(newItems);
-    updateParent(newItems);
+    onChange(items.filter((_, idx) => idx !== index));
   };
 
   const handleChange = (index, newValue) => {
     const newItems = [...items];
     newItems[index] = newValue;
-    setItems(newItems);
-    updateParent(newItems);
-  };
-
-  const updateParent = (newItems) => {
     onChange(newItems);
   };
 
@@ -71,9 +66,7 @@ const ListInput = ({ listValue, onChange, disabled, error, label }) => {
         throw new Error(t('channel_edit.listJsonError'));
       }
 
-      const newItems = parsedJson.map((item) => item.toString());
-      setItems(newItems);
-      updateParent(newItems);
+      onChange(parsedJson.map((item) => item.toString()));
       handleCloseJsonDialog();
     } catch (e) {
       showError(t('channel_edit.listJsonError'));
@@ -136,17 +129,8 @@ const ListInput = ({ listValue, onChange, disabled, error, label }) => {
               language="json"
               theme={theme.palette.mode === 'dark' ? 'vs-dark' : 'light'}
               value={jsonInput}
-              options={{
-                minimap: { enabled: false },
-                scrollBeyondLastLine: false,
-                automaticLayout: true,
-                fontSize: 14,
-                lineNumbers: 'on',
-                folding: true,
-                formatOnPaste: true,
-                formatOnType: true
-              }}
-              onChange={(value) => setJsonInput(value)}
+              options={JSON_EDITOR_OPTIONS}
+              onChange={setJsonInput}
             />
           </Box>
         </DialogContent>

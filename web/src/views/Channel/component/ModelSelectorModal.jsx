@@ -1,5 +1,5 @@
 import PropTypes from 'prop-types';
-import { useState, useEffect } from 'react';
+import { memo, useCallback, useDeferredValue, useEffect, useMemo, useState } from 'react';
 import { API } from 'utils/api';
 import { showError, showSuccess } from 'utils/common';
 import {
@@ -38,6 +38,132 @@ import { Icon } from '@iconify/react';
 import { useSelector } from 'react-redux';
 import { normalizeChannelOtherForRequest, normalizeOpenAICompatibleOtherForRequest } from '../type/other';
 
+// 长列表与列表行独立 memo：搜索输入时仅延迟渲染列表，选中变化时只重渲染受影响的行。
+const ModelRow = memo(function ModelRow({ model, selected, onToggle }) {
+  return (
+    <ListItem
+      dense
+      button
+      onClick={() => onToggle(model)}
+      sx={{
+        borderRadius: 1,
+        mb: 0.5,
+        transition: 'all 0.2s',
+        py: { xs: 0.75, sm: 0.5 },
+        contentVisibility: 'auto',
+        containIntrinsicSize: '0 40px',
+        '&:hover': {
+          bgcolor: (theme) => (theme.palette.mode === 'dark' ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.04)')
+        },
+        ...(selected && {
+          bgcolor: (theme) => (theme.palette.mode === 'dark' ? 'rgba(144,202,249,0.15)' : 'rgba(33,150,243,0.08)')
+        })
+      }}
+    >
+      <ListItemIcon sx={{ minWidth: { xs: 36, sm: 42 } }}>
+        <Checkbox edge="start" checked={selected} tabIndex={-1} disableRipple color="primary" size="small" />
+      </ListItemIcon>
+      <ListItemText
+        primary={model.id}
+        primaryTypographyProps={{
+          sx: {
+            fontFamily: 'monospace',
+            fontSize: { xs: '0.8rem', sm: '0.875rem' },
+            whiteSpace: 'nowrap',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            ...(selected && { fontWeight: 600 })
+          }
+        }}
+      />
+    </ListItem>
+  );
+});
+
+ModelRow.propTypes = {
+  model: PropTypes.object.isRequired,
+  selected: PropTypes.bool,
+  onToggle: PropTypes.func.isRequired
+};
+
+const ModelGroupList = memo(function ModelGroupList({
+  filteredModelsByGroup,
+  modelGroups,
+  expandedGroups,
+  selectedModelIds,
+  onToggleModel,
+  onToggleExpand,
+  onSelectGroup
+}) {
+  return (
+    <>
+      {Object.entries(filteredModelsByGroup).map(([group, groupModels]) => {
+        const groupTotalModels = modelGroups[group] || [];
+        const selectedCount = groupTotalModels.reduce((count, model) => count + (selectedModelIds.has(model.id) ? 1 : 0), 0);
+        const allSelected = selectedCount === groupTotalModels.length && groupTotalModels.length > 0;
+        const someSelected = selectedCount > 0 && selectedCount < groupTotalModels.length;
+
+        return (
+          <Box key={group} sx={{ mb: 1.5 }}>
+            <Box
+              sx={{
+                display: 'flex',
+                alignItems: 'center',
+                p: 1,
+                bgcolor: 'background.paper',
+                borderRadius: 1,
+                cursor: 'pointer',
+                '&:hover': { bgcolor: 'action.hover' }
+              }}
+              onClick={() => onToggleExpand(group)}
+            >
+              <Checkbox
+                edge="start"
+                checked={allSelected}
+                indeterminate={someSelected}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onSelectGroup(group);
+                }}
+                disabled={groupTotalModels.length === 0}
+              />
+              <Typography variant="subtitle1" sx={{ fontWeight: 600, flexGrow: 1 }}>
+                {group}
+              </Typography>
+              <Chip
+                size="small"
+                label={`${selectedCount}/${groupTotalModels.length}`}
+                color={selectedCount > 0 ? 'primary' : 'default'}
+                sx={{ mr: 1 }}
+              />
+              <IconButton size="small">
+                <Icon icon={expandedGroups[group] ? 'mdi:chevron-up' : 'mdi:chevron-down'} />
+              </IconButton>
+            </Box>
+            <Collapse in={expandedGroups[group]} timeout="auto">
+              <List dense disablePadding sx={{ pl: { xs: 1, sm: 2 } }}>
+                {groupModels.map((model) => (
+                  <ModelRow key={model.id} model={model} selected={selectedModelIds.has(model.id)} onToggle={onToggleModel} />
+                ))}
+              </List>
+            </Collapse>
+          </Box>
+        );
+      })}
+    </>
+  );
+});
+
+ModelGroupList.propTypes = {
+  filteredModelsByGroup: PropTypes.object,
+  modelGroups: PropTypes.object,
+  expandedGroups: PropTypes.object,
+  selectedModelIds: PropTypes.instanceOf(Set),
+  onToggleModel: PropTypes.func,
+  onToggleExpand: PropTypes.func,
+  onSelectGroup: PropTypes.func
+};
+
 const ModelSelectorModal = ({ open, onClose, onConfirm, channelValues, prices }) => {
   const { t } = useTranslation();
 
@@ -61,6 +187,28 @@ const ModelSelectorModal = ({ open, onClose, onConfirm, channelValues, prices })
   const [overwriteModels, setOverwriteModels] = useState(false);
   const [mappingPreview, setMappingPreview] = useState({});
   const [modelsListCollapsed, setModelsListCollapsed] = useState(false);
+
+  const deferredSearchTerm = useDeferredValue(searchTerm);
+  const selectedModelIds = useMemo(() => new Set(selectedModels.map((model) => model.id)), [selectedModels]);
+
+  // 搜索输入保持即时响应，过滤与分组用延迟值重算。
+  const filteredModels = useMemo(() => {
+    const term = deferredSearchTerm.toLowerCase();
+    return models.filter((model) => model.id.toLowerCase().includes(term));
+  }, [models, deferredSearchTerm]);
+
+  const filteredModelsByGroup = useMemo(() => {
+    const result = {};
+    for (const model of filteredModels) {
+      if (!result[model.group]) {
+        result[model.group] = [];
+      }
+      result[model.group].push(model);
+    }
+    return result;
+  }, [filteredModels]);
+
+  const isSearchStale = searchTerm !== deferredSearchTerm;
 
   const getOwnedbyName = (id) => {
     const owner = ownedby.find((item) => item.id === id);
@@ -230,82 +378,68 @@ const ModelSelectorModal = ({ open, onClose, onConfirm, channelValues, prices })
     setLoading(false);
   };
 
-  const handleModelToggle = (model) => {
-    const currentIndex = selectedModels.findIndex((m) => m.id === model.id);
-    const newSelectedModels = [...selectedModels];
-
-    if (currentIndex === -1) {
-      newSelectedModels.push(model);
-    } else {
+  const handleModelToggle = useCallback((model) => {
+    setSelectedModels((prev) => {
+      const currentIndex = prev.findIndex((m) => m.id === model.id);
+      if (currentIndex === -1) {
+        return [...prev, model];
+      }
+      const newSelectedModels = [...prev];
       newSelectedModels.splice(currentIndex, 1);
-    }
-
-    setSelectedModels(newSelectedModels);
-  };
-
-  const toggleGroupExpand = (group) => {
-    setExpandedGroups({
-      ...expandedGroups,
-      [group]: !expandedGroups[group]
+      return newSelectedModels;
     });
-  };
+  }, []);
 
-  const handleSelectGroup = (group) => {
-    const groupModels = modelGroups[group] || [];
-    const allSelected = groupModels.every((model) => selectedModels.some((m) => m.id === model.id));
+  const toggleGroupExpand = useCallback((group) => {
+    setExpandedGroups((prev) => ({
+      ...prev,
+      [group]: !prev[group]
+    }));
+  }, []);
 
-    if (allSelected) {
-      setSelectedModels(selectedModels.filter((model) => !groupModels.some((m) => m.id === model.id)));
-    } else {
-      const modelsToAdd = groupModels.filter((model) => !selectedModels.some((m) => m.id === model.id));
-      setSelectedModels([...selectedModels, ...modelsToAdd]);
-    }
-  };
+  const handleSelectGroup = useCallback(
+    (group) => {
+      const groupModels = modelGroups[group] || [];
+      setSelectedModels((prev) => {
+        if (groupModels.length === 0) {
+          return prev;
+        }
+        const prevIds = new Set(prev.map((m) => m.id));
+        const groupIds = new Set(groupModels.map((model) => model.id));
+        const allSelected = groupModels.every((model) => prevIds.has(model.id));
+        if (allSelected) {
+          return prev.filter((model) => !groupIds.has(model.id));
+        }
+        return [...prev, ...groupModels.filter((model) => !prevIds.has(model.id))];
+      });
+    },
+    [modelGroups]
+  );
 
-  const handleSelectAll = () => {
-    if (filteredModels.length === selectedModels.length) {
+  const handleSelectAll = useCallback(() => {
+    setSelectedModels((prev) => {
+      if (filteredModels.length === 0) {
+        return prev;
+      }
+      const prevIds = new Set(prev.map((m) => m.id));
       const filteredIds = new Set(filteredModels.map((model) => model.id));
-      setSelectedModels(selectedModels.filter((model) => !filteredIds.has(model.id)));
-    } else {
-      const existingIds = new Set(selectedModels.map((model) => model.id));
-      const newModels = filteredModels.filter((model) => !existingIds.has(model.id));
-      setSelectedModels([...selectedModels, ...newModels]);
-    }
-  };
-
-  const handleInvertSelection = () => {
-    const newSelectedModels = [...selectedModels];
-
-    filteredModels.forEach((model) => {
-      const index = newSelectedModels.findIndex((m) => m.id === model.id);
-      if (index === -1) {
-        newSelectedModels.push(model);
-      } else {
-        newSelectedModels.splice(index, 1);
+      const allFilteredSelected = filteredModels.every((model) => prevIds.has(model.id));
+      if (allFilteredSelected) {
+        return prev.filter((model) => !filteredIds.has(model.id));
       }
+      return [...prev, ...filteredModels.filter((model) => !prevIds.has(model.id))];
     });
+  }, [filteredModels]);
 
-    setSelectedModels(newSelectedModels);
-  };
-
-  const filteredModels = models.filter((model) => model.id.toLowerCase().includes(searchTerm.toLowerCase()));
-
-  const getFilteredModelsByGroup = () => {
-    const result = {};
-
-    if (filteredModels.length === 0) return result;
-
-    filteredModels.forEach((model) => {
-      if (!result[model.group]) {
-        result[model.group] = [];
-      }
-      result[model.group].push(model);
+  const handleInvertSelection = useCallback(() => {
+    setSelectedModels((prev) => {
+      const prevIds = new Set(prev.map((m) => m.id));
+      const filteredIds = new Set(filteredModels.map((model) => model.id));
+      const kept = prev.filter((model) => !filteredIds.has(model.id));
+      const added = filteredModels.filter((model) => !prevIds.has(model.id));
+      return [...kept, ...added];
     });
-
-    return result;
-  };
-
-  const filteredModelsByGroup = getFilteredModelsByGroup();
+  }, [filteredModels]);
 
   const handleConfirm = () => {
     const mappings = addToMapping
@@ -352,56 +486,6 @@ const ModelSelectorModal = ({ open, onClose, onConfirm, channelValues, prices })
     setOverwriteModels(false);
     setMappingPreview({});
     onClose();
-  };
-
-  const getSelectedCountInGroup = (group) => {
-    const groupModels = modelGroups[group] || [];
-    return groupModels.filter((model) => selectedModels.some((m) => m.id === model.id)).length;
-  };
-
-  const renderGroupHeader = (group) => {
-    const groupModels = modelGroups[group] || [];
-    const selectedCount = getSelectedCountInGroup(group);
-    const allSelected = selectedCount === groupModels.length && groupModels.length > 0;
-    const someSelected = selectedCount > 0 && selectedCount < groupModels.length;
-
-    return (
-      <Box
-        sx={{
-          display: 'flex',
-          alignItems: 'center',
-          p: 1,
-          bgcolor: 'background.paper',
-          borderRadius: 1,
-          cursor: 'pointer',
-          '&:hover': { bgcolor: 'action.hover' }
-        }}
-        onClick={() => toggleGroupExpand(group)}
-      >
-        <Checkbox
-          edge="start"
-          checked={allSelected}
-          indeterminate={someSelected}
-          onClick={(e) => {
-            e.stopPropagation();
-            handleSelectGroup(group);
-          }}
-          disabled={groupModels.length === 0}
-        />
-        <Typography variant="subtitle1" sx={{ fontWeight: 600, flexGrow: 1 }}>
-          {group}
-        </Typography>
-        <Chip
-          size="small"
-          label={`${selectedCount}/${groupModels.length}`}
-          color={selectedCount > 0 ? 'primary' : 'default'}
-          sx={{ mr: 1 }}
-        />
-        <IconButton size="small">
-          <Icon icon={expandedGroups[group] ? 'mdi:chevron-up' : 'mdi:chevron-down'} />
-        </IconButton>
-      </Box>
-    );
   };
 
   return (
@@ -704,59 +788,19 @@ const ModelSelectorModal = ({ open, onClose, onConfirm, channelValues, prices })
                       overflow: 'auto',
                       height: '100%',
                       p: { xs: 1, sm: 1.5 },
-                      WebkitOverflowScrolling: 'touch'
+                      WebkitOverflowScrolling: 'touch',
+                      opacity: isSearchStale ? 0.6 : 1
                     }}
                   >
-                    {Object.entries(filteredModelsByGroup).map(([group, groupModels]) => (
-                      <Box key={group} sx={{ mb: 1.5 }}>
-                        {renderGroupHeader(group)}
-                        <Collapse in={expandedGroups[group]} timeout="auto">
-                          <List dense disablePadding sx={{ pl: { xs: 1, sm: 2 } }}>
-                            {groupModels.map((model) => {
-                              const isSelected = selectedModels.some((m) => m.id === model.id);
-                              return (
-                                <ListItem
-                                  key={model.id}
-                                  dense
-                                  button
-                                  onClick={() => handleModelToggle(model)}
-                                  sx={{
-                                    borderRadius: 1,
-                                    mb: 0.5,
-                                    transition: 'all 0.2s',
-                                    py: { xs: 0.75, sm: 0.5 },
-                                    '&:hover': {
-                                      bgcolor: (theme) => (theme.palette.mode === 'dark' ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.04)')
-                                    },
-                                    ...(isSelected && {
-                                      bgcolor: (theme) =>
-                                        theme.palette.mode === 'dark' ? 'rgba(144,202,249,0.15)' : 'rgba(33,150,243,0.08)'
-                                    })
-                                  }}
-                                >
-                                  <ListItemIcon sx={{ minWidth: { xs: 36, sm: 42 } }}>
-                                    <Checkbox edge="start" checked={isSelected} tabIndex={-1} disableRipple color="primary" size="small" />
-                                  </ListItemIcon>
-                                  <ListItemText
-                                    primary={model.id}
-                                    primaryTypographyProps={{
-                                      sx: {
-                                        fontFamily: 'monospace',
-                                        fontSize: { xs: '0.8rem', sm: '0.875rem' },
-                                        whiteSpace: 'nowrap',
-                                        overflow: 'hidden',
-                                        textOverflow: 'ellipsis',
-                                        ...(isSelected && { fontWeight: 600 })
-                                      }
-                                    }}
-                                  />
-                                </ListItem>
-                              );
-                            })}
-                          </List>
-                        </Collapse>
-                      </Box>
-                    ))}
+                    <ModelGroupList
+                      filteredModelsByGroup={filteredModelsByGroup}
+                      modelGroups={modelGroups}
+                      expandedGroups={expandedGroups}
+                      selectedModelIds={selectedModelIds}
+                      onToggleModel={handleModelToggle}
+                      onToggleExpand={toggleGroupExpand}
+                      onSelectGroup={handleSelectGroup}
+                    />
                   </Box>
                 )}
               </Paper>

@@ -1,5 +1,5 @@
 import PropTypes from 'prop-types';
-import { useState, useEffect, useRef } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CHANNEL_OPTIONS } from 'constants/ChannelConstants';
 import { useTheme } from '@mui/material/styles';
 import { API } from 'utils/api';
@@ -22,7 +22,6 @@ import {
   Container,
   Autocomplete,
   FormHelperText,
-  Checkbox,
   Switch,
   FormControlLabel,
   Typography,
@@ -30,21 +29,18 @@ import {
   IconButton,
   Collapse,
   Box,
-  Chip,
   useMediaQuery
 } from '@mui/material';
-import { Formik } from 'formik';
+import { Formik, useField } from 'formik';
 import * as Yup from 'yup';
 import { defaultConfig, typeConfig } from '../type/Config'; //typeConfig
-import { createFilterOptions } from '@mui/material/Autocomplete';
-import CheckBoxOutlineBlankIcon from '@mui/icons-material/CheckBoxOutlineBlank';
-import CheckBoxIcon from '@mui/icons-material/CheckBox';
 import { useTranslation } from 'react-i18next';
 import useCustomizeT from 'hooks/useCustomizeT';
 import { PreCostType, isSelfHostedResponsesWSEnabled, normalizeChannelOtherForRequest } from '../type/other';
 import MapInput from './MapInput';
 import ListInput from './ListInput';
 import ModelSelectorModal from './ModelSelectorModal';
+import ChannelModelsField from './ChannelModelsField';
 import pluginList from '../type/Plugin.json';
 import { Icon } from '@iconify/react';
 import Editor from '@monaco-editor/react';
@@ -53,10 +49,6 @@ import ConfirmDialog from 'ui-component/confirm-dialog';
 import ChannelEndpointsEditor from './ChannelEndpointsEditor';
 import { createEndpointPreset } from '../type/endpoints.mjs';
 
-const icon = <CheckBoxOutlineBlankIcon fontSize="small" />;
-const checkedIcon = <CheckBoxIcon fontSize="small" />;
-
-const filter = createFilterOptions();
 const isAzureV1ResourceLevelBaseUrl = (value) => {
   const raw = String(value ?? '').trim();
   if (raw === '') {
@@ -120,10 +112,40 @@ const getValidationSchema = (t) =>
     custom_parameter: Yup.string().nullable()
   });
 
+const CUSTOM_PARAMETER_EDITOR_OPTIONS = {
+  minimap: { enabled: false },
+  scrollBeyondLastLine: false,
+  automaticLayout: true,
+  fontSize: 14,
+  lineNumbers: 'on',
+  folding: true,
+  formatOnPaste: true,
+  formatOnType: true
+};
+
+// 独立订阅 custom_parameter 字段，其它字段变化时 Monaco 不会收到新的 value/onChange。
+const CustomParameterEditor = memo(function CustomParameterEditor() {
+  const theme = useTheme();
+  const [field, , helpers] = useField('custom_parameter');
+  const handleChange = useCallback((value) => helpers.setValue(value), [helpers]);
+
+  return (
+    <Editor
+      height="100%"
+      language="json"
+      theme={theme.palette.mode === 'dark' ? 'vs-dark' : 'light'}
+      value={field.value}
+      options={CUSTOM_PARAMETER_EDITOR_OPTIONS}
+      onChange={handleChange}
+    />
+  );
+});
+
 const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, modelOptions, prices }) => {
   const { t } = useTranslation();
   const { t: customizeT } = useCustomizeT();
   const theme = useTheme();
+  const validationSchema = useMemo(() => getValidationSchema(t), [t]);
   const isMobile = useMediaQuery(theme.breakpoints.down('sm'));
   // const [loading, setLoading] = useState(false);
   const [initialInput, setInitialInput] = useState(defaultConfig.input);
@@ -172,7 +194,6 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
     };
   }, [open]);
 
-  const [inputValue, setInputValue] = useState('');
   const [batchFileImporting, setBatchFileImporting] = useState(false);
   const [codexBatchAuthFileImporting, setCodexBatchAuthFileImporting] = useState(false);
   const removeDuplicates = (array) => [...new Set(array)];
@@ -874,7 +895,7 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
       </DialogTitle>
       <Divider />
       <DialogContent>
-        <Formik initialValues={initialInput} enableReinitialize validationSchema={getValidationSchema(t)} onSubmit={submit}>
+        <Formik initialValues={initialInput} enableReinitialize validationSchema={validationSchema} onSubmit={submit}>
           {({ errors, handleBlur, handleChange, handleSubmit, isSubmitting, touched, values, setFieldValue }) => {
             // 保存当前Formik状态，以便在模型选择器中使用
             const openModelSelector = () => {
@@ -1146,136 +1167,13 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                   )}
                 </FormControl>
 
-                <FormControl fullWidth sx={{ ...theme.typography.otherInput }}>
-                  <Box sx={{ position: 'relative' }}>
-                    <Autocomplete
-                      multiple
-                      freeSolo
-                      disableCloseOnSelect
-                      id="channel-models-label"
-                      disabled={hasTag}
-                      options={modelOptions}
-                      value={values.models}
-                      inputValue={inputValue}
-                      onInputChange={(event, newInputValue) => {
-                        if (newInputValue.includes(',')) {
-                          const modelsList = newInputValue
-                            .split(',')
-                            .map((item) => ({
-                              id: item.trim(),
-                              group: t('channel_edit.customModelTip')
-                            }))
-                            .filter((item) => item.id);
-
-                          const updatedModels = [...new Set([...values.models, ...modelsList])];
-                          const event = {
-                            target: {
-                              name: 'models',
-                              value: updatedModels
-                            }
-                          };
-                          handleChange(event);
-                          setInputValue('');
-                        } else {
-                          setInputValue(newInputValue);
-                        }
-                      }}
-                      onChange={(e, value) => {
-                        const event = {
-                          target: {
-                            name: 'models',
-                            value: value.map((item) =>
-                              typeof item === 'string' ? { id: item, group: t('channel_edit.customModelTip') } : item
-                            )
-                          }
-                        };
-                        handleChange(event);
-                      }}
-                      renderInput={(params) => (
-                        <TextField
-                          {...params}
-                          name="models"
-                          error={Boolean(errors.models)}
-                          label={customizeT(inputLabel.models)}
-                          InputProps={{
-                            ...params.InputProps
-                          }}
-                        />
-                      )}
-                      groupBy={(option) => option.group}
-                      getOptionLabel={(option) => {
-                        if (typeof option === 'string') {
-                          return option;
-                        }
-                        if (option.inputValue) {
-                          return option.inputValue;
-                        }
-                        return option.id;
-                      }}
-                      filterOptions={(options, params) => {
-                        const filtered = filter(options, params);
-                        const { inputValue } = params;
-                        const isExisting = options.some((option) => inputValue === option.id);
-                        if (inputValue !== '' && !isExisting) {
-                          filtered.push({
-                            id: inputValue,
-                            group: t('channel_edit.customModelTip')
-                          });
-                        }
-                        return filtered;
-                      }}
-                      renderOption={(props, option, { selected }) => (
-                        <li {...props}>
-                          <Checkbox icon={icon} checkedIcon={checkedIcon} style={{ marginRight: 8 }} checked={selected} />
-                          {option.id}
-                        </li>
-                      )}
-                      renderTags={(value, getTagProps) =>
-                        value.map((option, index) => {
-                          const tagProps = getTagProps({ index });
-                          return (
-                            <Chip
-                              key={index}
-                              label={option.id}
-                              {...tagProps}
-                              onClick={() => copy(option.id)}
-                              sx={{
-                                maxWidth: '100%',
-                                height: 'auto',
-                                margin: '3px',
-                                '& .MuiChip-label': {
-                                  whiteSpace: 'normal',
-                                  wordBreak: 'break-word',
-                                  padding: '6px 8px',
-                                  lineHeight: 1.4,
-                                  fontWeight: 400
-                                },
-                                '& .MuiChip-deleteIcon': {
-                                  margin: '0 5px 0 -6px'
-                                }
-                              }}
-                            />
-                          );
-                        })
-                      }
-                      sx={{
-                        '& .MuiAutocomplete-tag': {
-                          margin: '2px'
-                        },
-                        '& .MuiAutocomplete-inputRoot': {
-                          flexWrap: 'wrap'
-                        }
-                      }}
-                    />
-                  </Box>
-                  {errors.models ? (
-                    <FormHelperText error id="helper-tex-channel-models-label">
-                      {errors.models}
-                    </FormHelperText>
-                  ) : (
-                    <FormHelperText id="helper-tex-channel-models-label"> {customizeT(inputPrompt.models)} </FormHelperText>
-                  )}
-                </FormControl>
+                <ChannelModelsField
+                  options={modelOptions}
+                  disabled={hasTag}
+                  label={customizeT(inputLabel.models)}
+                  helperText={customizeT(inputPrompt.models)}
+                  customGroupLabel={t('channel_edit.customModelTip')}
+                />
                 <Container
                   sx={{
                     textAlign: 'right'
@@ -1559,25 +1457,7 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                         }
                       }}
                     >
-                      <Editor
-                        height="100%"
-                        language="json"
-                        theme={theme.palette.mode === 'dark' ? 'vs-dark' : 'light'}
-                        value={values.custom_parameter}
-                        options={{
-                          minimap: { enabled: false },
-                          scrollBeyondLastLine: false,
-                          automaticLayout: true,
-                          fontSize: 14,
-                          lineNumbers: 'on',
-                          folding: true,
-                          formatOnPaste: true,
-                          formatOnType: true
-                        }}
-                        onChange={(value) => {
-                          setFieldValue('custom_parameter', value);
-                        }}
-                      />
+                      <CustomParameterEditor />
                     </Box>
                     {touched.custom_parameter && errors.custom_parameter ? (
                       <FormHelperText error id="helper-tex-channel-custom_parameter-label">

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import PropTypes from 'prop-types';
 
 import Dialog from '@mui/material/Dialog';
@@ -13,42 +13,37 @@ import { Icon } from '@iconify/react';
 import { showError } from 'utils/common';
 import { useTranslation } from 'react-i18next';
 
+const JSON_EDITOR_OPTIONS = {
+  minimap: { enabled: false },
+  scrollBeyondLastLine: false,
+  automaticLayout: true,
+  fontSize: 14,
+  lineNumbers: 'on',
+  folding: true,
+  formatOnPaste: true,
+  formatOnType: true
+};
+
 const MapInput = ({ mapValue, onChange, disabled, error, label }) => {
   const { t } = useTranslation();
   const theme = useTheme();
-  const [mappings, setMappings] = useState([]);
-
-  useEffect(() => {
-    try {
-      setMappings(mapValue || [{ index: 0, key: '', value: '' }]);
-    } catch (e) {
-      setMappings([{ index: 0, key: '', value: '' }]);
-    }
-  }, [mapValue]);
+  // 受控组件：不再把 props 复制进本地 state，编辑时每次按键少一轮 state 同步渲染。
+  const mappings = Array.isArray(mapValue) ? mapValue : [{ index: 0, key: '', value: '' }];
 
   const [openJsonDialog, setOpenJsonDialog] = useState(false);
   const [jsonInput, setJsonInput] = useState('');
 
   const handleAdd = () => {
     const newIndex = mappings.length > 0 ? Math.max(...mappings.map((m) => m.index)) + 1 : 0;
-    setMappings([...mappings, { index: newIndex, key: '', value: '' }]);
+    onChange([...mappings, { index: newIndex, key: '', value: '' }]);
   };
 
   const handleDelete = (index) => {
-    const newMappings = mappings.filter((mapping) => mapping.index !== index);
-    setMappings(newMappings);
-    updateParent(newMappings);
+    onChange(mappings.filter((mapping) => mapping.index !== index));
   };
 
   const handleChange = (index, field, newValue) => {
-    const newMappings = mappings.map((mapping) => (mapping.index === index ? { ...mapping, [field]: newValue } : mapping));
-
-    setMappings(newMappings);
-    updateParent(newMappings);
-  };
-
-  const updateParent = (newMappings) => {
-    onChange(newMappings);
+    onChange(mappings.map((mapping) => (mapping.index === index ? { ...mapping, [field]: newValue } : mapping)));
   };
 
   const handleAddByJson = () => {
@@ -75,8 +70,7 @@ const MapInput = ({ mapValue, onChange, disabled, error, label }) => {
         key,
         value: value.toString()
       }));
-      setMappings(newMappings);
-      updateParent(newMappings);
+      onChange(newMappings);
       handleCloseJsonDialog();
     } catch (e) {
       showError(t('common.jsonFormatError'));
@@ -147,17 +141,8 @@ const MapInput = ({ mapValue, onChange, disabled, error, label }) => {
               language="json"
               theme={theme.palette.mode === 'dark' ? 'vs-dark' : 'light'}
               value={jsonInput}
-              options={{
-                minimap: { enabled: false },
-                scrollBeyondLastLine: false,
-                automaticLayout: true,
-                fontSize: 14,
-                lineNumbers: 'on',
-                folding: true,
-                formatOnPaste: true,
-                formatOnType: true
-              }}
-              onChange={(value) => setJsonInput(value)}
+              options={JSON_EDITOR_OPTIONS}
+              onChange={setJsonInput}
             />
           </Box>
         </DialogContent>
