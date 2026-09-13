@@ -388,21 +388,15 @@ func testAllChannel(channel *model.Channel) string {
 		if result.exceedsThreshold(disableThreshold) {
 			return sendMessage + fmt.Sprintf("- 响应时间 %.2fs 超过阈值 %.2fs \n\n- 无需改变状态，跳过\n\n", result.consumedSeconds(), float64(disableThreshold)/1000.0)
 		}
-		// 如果已被禁用，但是请求成功，需要判断是否需要恢复
-		// 手动禁用的通道，不会自动恢复
-		if config.GlobalOption.RuntimeSnapshot().Bool("AutomaticEnableChannelEnabled", config.AutomaticEnableChannelEnabled) && result.isHealthy() {
-			if channel.Status == config.ChannelStatusAutoDisabled {
-				updated, err := AutoEnableChannel(channel.Id, channel.Name, false)
-				if err != nil {
-					return sendMessage + fmt.Sprintf("- 自动恢复失败: %s \n\n", utils.EscapeMarkdownText(err.Error()))
-				}
-				if !updated {
-					return sendMessage + "- 状态已变化，跳过自动恢复 \n\n"
-				}
-				sendMessage += "- 已被启用 \n\n"
-			} else {
-				sendMessage += "- 手动禁用的通道，不会自动恢复 \n\n"
+		if channel.Status == config.ChannelStatusAutoDisabled && config.GlobalOption.RuntimeSnapshot().Bool("AutomaticEnableChannelEnabled", config.AutomaticEnableChannelEnabled) && result.isHealthy() {
+			updated, err := AutoEnableChannel(channel.Id, channel.Name, false)
+			if err != nil {
+				return sendMessage + fmt.Sprintf("- 自动恢复失败: %s \n\n", utils.EscapeMarkdownText(err.Error()))
 			}
+			if !updated {
+				return sendMessage + "- 状态已变化，跳过自动恢复 \n\n"
+			}
+			sendMessage += "- 已被启用 \n\n"
 		}
 	} else {
 		// 如果通道启用状态，但是返回了错误 或者 响应时间超过阈值，需要判断是否需要禁用
@@ -471,6 +465,10 @@ func runFullChannelProbeTask(channels []*model.Channel) string {
 
 	go func() {
 		for index := range channels {
+			// 定时和手动全量测速均在入队前排除手动禁用渠道。
+			if channels[index].Status == config.ChannelStatusManuallyDisabled {
+				continue
+			}
 			if config.RequestInterval > 0 {
 				time.Sleep(config.RequestInterval)
 			}

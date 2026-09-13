@@ -242,6 +242,7 @@ func TestRunFullChannelProbeTaskKeepsReportOrder(t *testing.T) {
 
 	channels := []*model.Channel{
 		{Id: 1, Name: "slowfirst", Status: config.ChannelStatusEnabled},
+		{Id: 4, Name: "manualdisabled", Status: config.ChannelStatusManuallyDisabled},
 		{Id: 2, Name: "fastsecond", Status: config.ChannelStatusEnabled},
 		{Id: 3, Name: "fastthird", Status: config.ChannelStatusEnabled},
 	}
@@ -254,6 +255,9 @@ func TestRunFullChannelProbeTaskKeepsReportOrder(t *testing.T) {
 	}
 
 	report := runFullChannelProbeTask(channels)
+	if strings.Contains(report, "manualdisabled") {
+		t.Fatalf("手动禁用渠道不应出现在批量测速报告中：%q", report)
+	}
 	first := strings.Index(report, "slowfirst")
 	second := strings.Index(report, "fastsecond")
 	third := strings.Index(report, "fastthird")
@@ -302,6 +306,70 @@ func TestTestAllChannelsRejectsConcurrentStart(t *testing.T) {
 
 	close(release)
 	waitForFullChannelProbeCompletion(t)
+}
+
+func TestTestAllChannelsSkipsManuallyDisabledChannels(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		isNotify   bool
+		onlyManual bool
+	}{
+		{name: "定时测速"},
+		{name: "手动测试全部", isNotify: true},
+		{name: "定时测速全部手动禁用", onlyManual: true},
+		{name: "手动测试全部渠道均手动禁用", isNotify: true, onlyManual: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			useControllerTestChannelDB(t)
+			resetChannelProbeTestState(t)
+			config.AutomaticEnableChannelEnabled = true
+			config.ChannelDisableThreshold = 5
+			config.RequestInterval = 0
+
+			insertControllerTestChannel(t, &model.Channel{
+				Id: 1, Name: "手动禁用", Status: config.ChannelStatusManuallyDisabled,
+				TestModel: "gpt-5", TestTime: 123, ResponseTime: 456,
+			})
+			if !tc.onlyManual {
+				insertControllerTestChannel(t, &model.Channel{
+					Id: 2, Name: "已启用", Status: config.ChannelStatusEnabled, TestModel: "gpt-5",
+				})
+				insertControllerTestChannel(t, &model.Channel{
+					Id: 3, Name: "自动禁用", Status: config.ChannelStatusAutoDisabled, TestModel: "gpt-5",
+				})
+			}
+
+			probed := make(chan int, 3)
+			probeChannelFunc = func(channel *model.Channel, _ string) channelProbeResult {
+				probed <- channel.Id
+				return channelProbeResult{milliseconds: 1200}
+			}
+			if err := testAllChannels(tc.isNotify); err != nil {
+				t.Fatalf("启动批量测速失败：%v", err)
+			}
+			waitForFullChannelProbeCompletion(t)
+			close(probed)
+
+			counts := make(map[int]int)
+			for id := range probed {
+				counts[id]++
+			}
+			if counts[1] != 0 {
+				t.Fatalf("手动禁用渠道不应测速，实际执行 %d 次", counts[1])
+			}
+			if !tc.onlyManual && (counts[2] != 1 || counts[3] != 1) {
+				t.Fatalf("已启用和自动禁用渠道应各测速一次，实际为 %v", counts)
+			}
+
+			manual, err := model.GetChannelById(1)
+			if err != nil {
+				t.Fatalf("读取手动禁用渠道失败：%v", err)
+			}
+			if manual.Status != config.ChannelStatusManuallyDisabled || manual.TestTime != 123 || manual.ResponseTime != 456 {
+				t.Fatalf("手动禁用渠道的状态和测速记录不应变化：status=%d test_time=%d response_time=%d", manual.Status, manual.TestTime, manual.ResponseTime)
+			}
+		})
+	}
 }
 
 func TestTestAllChannelsAutoRecoversHealthyAutoDisabledChannel(t *testing.T) {
