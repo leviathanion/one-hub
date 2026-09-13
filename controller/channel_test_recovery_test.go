@@ -63,6 +63,7 @@ func resetChannelProbeTestState(t *testing.T) {
 	originalProbe := probeChannelFunc
 	originalNow := currentTimeFunc
 	originalGetProvider := getProviderFunc
+	originalSendNotification := sendFullChannelProbeNotificationFunc
 	originalThreshold := config.ChannelDisableThreshold
 	originalDisable := config.AutomaticDisableChannelEnabled
 	originalEnable := config.AutomaticEnableChannelEnabled
@@ -77,6 +78,7 @@ func resetChannelProbeTestState(t *testing.T) {
 		probeChannelFunc = originalProbe
 		currentTimeFunc = originalNow
 		getProviderFunc = originalGetProvider
+		sendFullChannelProbeNotificationFunc = originalSendNotification
 		config.ChannelDisableThreshold = originalThreshold
 		config.AutomaticDisableChannelEnabled = originalDisable
 		config.AutomaticEnableChannelEnabled = originalEnable
@@ -242,7 +244,6 @@ func TestRunFullChannelProbeTaskKeepsReportOrder(t *testing.T) {
 
 	channels := []*model.Channel{
 		{Id: 1, Name: "slowfirst", Status: config.ChannelStatusEnabled},
-		{Id: 4, Name: "manualdisabled", Status: config.ChannelStatusManuallyDisabled},
 		{Id: 2, Name: "fastsecond", Status: config.ChannelStatusEnabled},
 		{Id: 3, Name: "fastthird", Status: config.ChannelStatusEnabled},
 	}
@@ -255,9 +256,6 @@ func TestRunFullChannelProbeTaskKeepsReportOrder(t *testing.T) {
 	}
 
 	report := runFullChannelProbeTask(channels)
-	if strings.Contains(report, "manualdisabled") {
-		t.Fatalf("手动禁用渠道不应出现在批量测速报告中：%q", report)
-	}
 	first := strings.Index(report, "slowfirst")
 	second := strings.Index(report, "fastsecond")
 	third := strings.Index(report, "fastthird")
@@ -313,11 +311,14 @@ func TestTestAllChannelsSkipsManuallyDisabledChannels(t *testing.T) {
 		name       string
 		isNotify   bool
 		onlyManual bool
+		noChannels bool
 	}{
 		{name: "定时测速"},
 		{name: "手动测试全部", isNotify: true},
 		{name: "定时测速全部手动禁用", onlyManual: true},
 		{name: "手动测试全部渠道均手动禁用", isNotify: true, onlyManual: true},
+		{name: "定时测速无渠道", noChannels: true},
+		{name: "手动测试全部无渠道", isNotify: true, noChannels: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			useControllerTestChannelDB(t)
@@ -326,11 +327,19 @@ func TestTestAllChannelsSkipsManuallyDisabledChannels(t *testing.T) {
 			config.ChannelDisableThreshold = 5
 			config.RequestInterval = 0
 
-			insertControllerTestChannel(t, &model.Channel{
-				Id: 1, Name: "手动禁用", Status: config.ChannelStatusManuallyDisabled,
-				TestModel: "gpt-5", TestTime: 123, ResponseTime: 456,
-			})
-			if !tc.onlyManual {
+			var notificationTitles, notificationMessages []string
+			sendFullChannelProbeNotificationFunc = func(title, message string) {
+				notificationTitles = append(notificationTitles, title)
+				notificationMessages = append(notificationMessages, message)
+			}
+
+			if !tc.noChannels {
+				insertControllerTestChannel(t, &model.Channel{
+					Id: 1, Name: "手动禁用", Status: config.ChannelStatusManuallyDisabled,
+					TestModel: "gpt-5", TestTime: 123, ResponseTime: 456,
+				})
+			}
+			if !tc.onlyManual && !tc.noChannels {
 				insertControllerTestChannel(t, &model.Channel{
 					Id: 2, Name: "已启用", Status: config.ChannelStatusEnabled, TestModel: "gpt-5",
 				})
@@ -348,6 +357,14 @@ func TestTestAllChannelsSkipsManuallyDisabledChannels(t *testing.T) {
 				t.Fatalf("启动批量测速失败：%v", err)
 			}
 			waitForFullChannelProbeCompletion(t)
+			if tc.onlyManual || tc.noChannels {
+				if err := testAllChannels(tc.isNotify); err != nil {
+					t.Fatalf("无待测渠道时应释放运行标记，允许再次启动：%v", err)
+				}
+				if isFullChannelProbeRunning() {
+					t.Fatal("无待测渠道时应同步释放运行标记")
+				}
+			}
 			close(probed)
 
 			counts := make(map[int]int)
@@ -357,8 +374,25 @@ func TestTestAllChannelsSkipsManuallyDisabledChannels(t *testing.T) {
 			if counts[1] != 0 {
 				t.Fatalf("手动禁用渠道不应测速，实际执行 %d 次", counts[1])
 			}
-			if !tc.onlyManual && (counts[2] != 1 || counts[3] != 1) {
+			if !tc.onlyManual && !tc.noChannels && (counts[2] != 1 || counts[3] != 1) {
 				t.Fatalf("已启用和自动禁用渠道应各测速一次，实际为 %v", counts)
+			}
+			if tc.isNotify && !tc.onlyManual && !tc.noChannels {
+				if len(notificationMessages) != 1 || notificationTitles[0] != "通道测试完成" {
+					t.Fatalf("手动批量测速应发送一次完成通知：titles=%v messages=%v", notificationTitles, notificationMessages)
+				}
+				report := notificationMessages[0]
+				if strings.Contains(report, "手动禁用") || !strings.Contains(report, "已启用") || !strings.Contains(report, "自动禁用") {
+					t.Fatalf("通知报告应只包含本轮待测渠道：%q", report)
+				}
+			} else if len(notificationMessages) != 0 {
+				t.Fatalf("定时测速或无待测渠道时不应发送完成通知：%v", notificationMessages)
+			}
+			if tc.noChannels {
+				if len(counts) != 0 {
+					t.Fatalf("无渠道时不应执行测速：%v", counts)
+				}
+				return
 			}
 
 			manual, err := model.GetChannelById(1)

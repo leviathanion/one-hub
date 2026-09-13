@@ -33,9 +33,10 @@ var (
 	responseRegex   = regexp.MustCompile(`(?:^o[1-9])`)
 	noSupportRegex  = regexp.MustCompile(`(?:^tts|rerank|whisper|speech|^mj_|^chirp)`)
 
-	probeChannelFunc = probeChannel
-	currentTimeFunc  = time.Now
-	getProviderFunc  = providers.GetProvider
+	probeChannelFunc                     = probeChannel
+	currentTimeFunc                      = time.Now
+	getProviderFunc                      = providers.GetProvider
+	sendFullChannelProbeNotificationFunc = notify.Send
 )
 
 var (
@@ -433,6 +434,7 @@ func testAllChannel(channel *model.Channel) string {
 	return sendMessage + fmt.Sprintf("- 测试完成，耗时 %.2fs\n\n", result.consumedSeconds())
 }
 
+// runFullChannelProbeTask 只接受已选定的本轮待测渠道，按输入顺序汇总报告。
 func runFullChannelProbeTask(channels []*model.Channel) string {
 	if len(channels) == 0 {
 		return ""
@@ -465,10 +467,6 @@ func runFullChannelProbeTask(channels []*model.Channel) string {
 
 	go func() {
 		for index := range channels {
-			// 定时和手动全量测速均在入队前排除手动禁用渠道。
-			if channels[index].Status == config.ChannelStatusManuallyDisabled {
-				continue
-			}
 			if config.RequestInterval > 0 {
 				time.Sleep(config.RequestInterval)
 			}
@@ -495,12 +493,22 @@ func testAllChannels(isNotify bool) error {
 		finishFullChannelProbeTask()
 		return err
 	}
+	probeable := make([]*model.Channel, 0, len(channels))
+	for _, channel := range channels {
+		if channel.Status != config.ChannelStatusManuallyDisabled {
+			probeable = append(probeable, channel)
+		}
+	}
+	if len(probeable) == 0 {
+		finishFullChannelProbeTask()
+		return nil
+	}
 	go func() {
 		defer finishFullChannelProbeTask()
 
-		sendMessage := runFullChannelProbeTask(channels)
+		sendMessage := runFullChannelProbeTask(probeable)
 		if isNotify {
-			notify.Send("通道测试完成", sendMessage)
+			sendFullChannelProbeNotificationFunc("通道测试完成", sendMessage)
 		}
 	}()
 	return nil
