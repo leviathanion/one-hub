@@ -31,7 +31,7 @@ import {
   Box,
   useMediaQuery
 } from '@mui/material';
-import { Formik, useField } from 'formik';
+import { useField } from 'formik';
 import * as Yup from 'yup';
 import { defaultConfig, typeConfig } from '../type/Config'; //typeConfig
 import { useTranslation } from 'react-i18next';
@@ -41,6 +41,7 @@ import MapInput from './MapInput';
 import ListInput from './ListInput';
 import ModelSelectorModal from './ModelSelectorModal';
 import ChannelModelsField from './ChannelModelsField';
+import ChannelForm from './ChannelForm';
 import pluginList from '../type/Plugin.json';
 import { Icon } from '@iconify/react';
 import Editor from '@monaco-editor/react';
@@ -480,6 +481,8 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
     }
   };
 
+  const modelOptionsById = useMemo(() => new Map(modelOptions.map((option) => [option.id, option])), [modelOptions]);
+
   const basicModels = (channelType) => {
     let modelGroup = typeConfig[channelType]?.modelGroup || defaultConfig.modelGroup;
     // 循环 modelOptions，找到 modelGroup 对应的模型
@@ -739,7 +742,7 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
       channelModel = channelModel.split(',');
     }
     let modelList = channelModel.map((model) => {
-      const modelOption = modelOptions.find((option) => option.id === model);
+      const modelOption = modelOptionsById.get(model);
       if (modelOption) {
         return modelOption;
       }
@@ -895,11 +898,11 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
       </DialogTitle>
       <Divider />
       <DialogContent>
-        <Formik initialValues={initialInput} enableReinitialize validationSchema={validationSchema} onSubmit={submit}>
-          {({ errors, handleBlur, handleChange, handleSubmit, isSubmitting, touched, values, setFieldValue }) => {
+        <ChannelForm initialValues={initialInput} enableReinitialize validationSchema={validationSchema} onSubmit={submit}>
+          {({ errors, handleBlur, handleChange, handleSubmit, isSubmitting, touched, values, setFieldValue, getValues }) => {
             // 保存当前Formik状态，以便在模型选择器中使用
             const openModelSelector = () => {
-              setTempFormikValues({ ...values });
+              setTempFormikValues({ ...getValues() });
               setTempSetFieldValue(() => setFieldValue); // 保存函数引用
               setModelSelectorOpen(true);
             };
@@ -927,7 +930,7 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                       onBlur={handleBlur}
                       onChange={(e) => {
                         handleChange(e);
-                        handleTypeChange(setFieldValue, e.target.value, values);
+                        handleTypeChange(setFieldValue, e.target.value, getValues());
                       }}
                       disabled={hasTag}
                       MenuProps={{
@@ -1183,7 +1186,9 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                     <Button
                       size="small"
                       onClick={() => {
-                        const modelString = values.models.map((model) => model.id).join(',');
+                        const modelString = getValues()
+                          .models.map((model) => model.id)
+                          .join(',');
                         copy(modelString);
                       }}
                     >
@@ -1355,7 +1360,7 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                               multiple
                               type="file"
                               accept=".json,application/json"
-                              onChange={(event) => handleCodexBatchAuthFilesImport(event, values)}
+                              onChange={(event) => handleCodexBatchAuthFilesImport(event, getValues())}
                             />
                             <Button
                               variant="outlined"
@@ -1741,7 +1746,7 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
               </form>
             );
           }}
-        </Formik>
+        </ChannelForm>
 
         {/* 模型选择器弹窗 */}
         <ModelSelectorModal

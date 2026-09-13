@@ -1,23 +1,21 @@
-import { memo, useCallback, useRef, useState } from 'react';
+import { memo, useCallback, useMemo, useRef, useState } from 'react';
 import PropTypes from 'prop-types';
-import { Autocomplete, Box, Checkbox, Chip, FormControl, FormHelperText, TextField } from '@mui/material';
+import { Autocomplete, Box, Chip, FormControl, FormHelperText, TextField } from '@mui/material';
 import { createFilterOptions } from '@mui/material/Autocomplete';
-import CheckBoxOutlineBlankIcon from '@mui/icons-material/CheckBoxOutlineBlank';
-import CheckBoxIcon from '@mui/icons-material/CheckBox';
 import { useTheme } from '@mui/material/styles';
+import { useEventCallback } from '@mui/material/utils';
 import { useField } from 'formik';
 import { copy } from 'utils/common';
-
-const icon = <CheckBoxOutlineBlankIcon fontSize="small" />;
-const checkedIcon = <CheckBoxIcon fontSize="small" />;
+import VirtualModelListbox, { describeModelGroup, describeModelOption, highlightedModelIndex } from './VirtualModelListbox';
+import { EMPTY_MODELS, asModels, getModelId, normalizeModelSelection } from './modelSelection.mjs';
 
 const filter = createFilterOptions();
-
-// 这些对象在组件外声明，避免每次渲染把新的 sx/options 引用交给 Emotion 与 MUI。
+const getModelGroup = (option) => option.group;
+const sameModel = (option, value) => getModelId(option) === getModelId(value);
 const MODEL_CHIP_SX = {
   maxWidth: '100%',
   height: 'auto',
-  margin: '3px',
+  margin: '2px',
   '& .MuiChip-label': {
     whiteSpace: 'normal',
     wordBreak: 'break-word',
@@ -25,124 +23,110 @@ const MODEL_CHIP_SX = {
     lineHeight: 1.4,
     fontWeight: 400
   },
-  '& .MuiChip-deleteIcon': {
-    margin: '0 5px 0 -6px'
-  }
+  '& .MuiChip-deleteIcon': { margin: '0 5px 0 -6px' }
+};
+const MODEL_AUTOCOMPLETE_SX = { '& .MuiAutocomplete-inputRoot': { flexWrap: 'wrap' } };
+
+const ModelChip = memo(function ModelChip({ label, tagIndex, tabIndex, className, disabled, onRemove }) {
+  const handleCopy = useCallback(() => copy(label), [label]);
+  const handleDelete = useCallback(() => onRemove(label), [label, onRemove]);
+  return (
+    <Chip
+      label={label}
+      data-tag-index={tagIndex}
+      tabIndex={tabIndex}
+      className={className}
+      disabled={disabled}
+      onClick={handleCopy}
+      onDelete={disabled ? undefined : handleDelete}
+      sx={MODEL_CHIP_SX}
+    />
+  );
+});
+
+ModelChip.propTypes = {
+  label: PropTypes.string.isRequired,
+  tagIndex: PropTypes.number.isRequired,
+  tabIndex: PropTypes.number,
+  className: PropTypes.string,
+  disabled: PropTypes.bool,
+  onRemove: PropTypes.func.isRequired
 };
 
-const MODEL_AUTOCOMPLETE_SX = {
-  '& .MuiAutocomplete-tag': {
-    margin: '2px'
-  },
-  '& .MuiAutocomplete-inputRoot': {
-    flexWrap: 'wrap'
-  }
-};
-
-const getModelLabel = (option) => {
-  if (typeof option === 'string') {
-    return option;
-  }
-  if (option.inputValue) {
-    return option.inputValue;
-  }
-  return option.id;
-};
-
-const getModelGroup = (option) => option.group;
-
-const renderModelOption = (props, option, { selected }) => (
-  <li {...props}>
-    <Checkbox icon={icon} checkedIcon={checkedIcon} style={{ marginRight: 8 }} checked={selected} />
-    {option.id}
-  </li>
-);
-
-const normalizeModels = (models) => (Array.isArray(models) ? models : []);
-
-/**
- * 模型选择输入。inputValue 只存在于这里，避免在 EditModal 中输入时重渲染整个弹窗；
- * 已选 Chip 元素按 values.models 的引用缓存，输入框自身输入时跳过全部 Chip 的协调。
- */
-function ChannelModelsField({ options, disabled, label, helperText, customGroupLabel }) {
+const ModelsInput = memo(function ModelsInput({
+  models,
+  error,
+  options,
+  disabled,
+  label,
+  helperText,
+  customGroupLabel,
+  onChange,
+  onRemove
+}) {
   const theme = useTheme();
-  const [field, meta, helpers] = useField('models');
   const [inputValue, setInputValue] = useState('');
-  const tagsCacheRef = useRef({ value: null, elements: [] });
-
-  const setModels = useCallback((models) => helpers.setValue(models), [helpers]);
+  const inputRef = useRef(null);
+  const virtualRef = useRef(null);
+  const highlightedIdRef = useRef(null);
+  const optionsById = useMemo(() => new Map(options.map((option) => [option.id, option])), [options]);
+  const filteredOptions = useMemo(() => {
+    const matched = filter(options, { inputValue, getOptionLabel: getModelId });
+    return inputValue !== '' && !optionsById.has(inputValue) ? [...matched, { id: inputValue, group: customGroupLabel }] : matched;
+  }, [options, optionsById, inputValue, customGroupLabel]);
+  const filterOptions = useCallback(() => filteredOptions, [filteredOptions]);
+  const listboxProps = useMemo(() => ({ inputRef, virtualRef, highlightedIdRef, resetKey: inputValue }), [inputValue]);
 
   const handleInputChange = useCallback(
-    (event, newInputValue) => {
-      if (!newInputValue.includes(',')) {
-        setInputValue(newInputValue);
+    (event, value) => {
+      if (disabled) return;
+      if (!value.includes(',')) {
+        setInputValue(value);
         return;
       }
-
-      const currentModels = normalizeModels(field.value);
-      const seenIds = new Set(currentModels.map((model) => model.id));
-      const addedModels = [];
-      for (const item of newInputValue.split(',')) {
-        const id = item.trim();
-        if (id !== '' && !seenIds.has(id)) {
-          seenIds.add(id);
-          addedModels.push({ id, group: customGroupLabel });
-        }
-      }
-      if (addedModels.length > 0) {
-        setModels([...currentModels, ...addedModels]);
-      }
+      const added = value
+        .split(',')
+        .map((id) => id.trim())
+        .filter(Boolean);
+      onChange(normalizeModelSelection([...models, ...added], optionsById, customGroupLabel));
       setInputValue('');
     },
-    [customGroupLabel, field.value, setModels]
+    [disabled, models, optionsById, customGroupLabel, onChange]
   );
-
   const handleChange = useCallback(
-    (event, newValue) => {
-      setModels(newValue.map((item) => (typeof item === 'string' ? { id: item, group: customGroupLabel } : item)));
+    (event, value) => {
+      if (!disabled) onChange(normalizeModelSelection(value, optionsById, customGroupLabel));
     },
-    [customGroupLabel, setModels]
+    [disabled, optionsById, customGroupLabel, onChange]
   );
-
-  const handleFilterOptions = useCallback(
-    (opts, params) => {
-      const filtered = filter(opts, params);
-      const isExisting = opts.some((option) => params.inputValue === option.id);
-      if (params.inputValue !== '' && !isExisting) {
-        filtered.push({ id: params.inputValue, group: customGroupLabel });
-      }
-      return filtered;
-    },
-    [customGroupLabel]
-  );
-
-  const renderTags = useCallback((tagValue, getTagProps) => {
-    const cache = tagsCacheRef.current;
-    if (cache.value !== tagValue) {
-      cache.value = tagValue;
-      cache.elements = normalizeModels(tagValue).map((option, index) => {
-        const id = typeof option === 'string' ? option : option.id;
-        // getTagProps 每次渲染都是新函数；缓存元素时只保留 key/事件等稳定部分。
-        const { key, ...tagProps } = getTagProps({ index });
-        return <Chip key={key ?? id} label={id} {...tagProps} onClick={() => copy(id)} sx={MODEL_CHIP_SX} />;
-      });
+  const handleKeyDown = useCallback((event) => {
+    if (event.nativeEvent?.isComposing || event.which === 229) {
+      event.defaultMuiPrevented = true;
+      return;
     }
-    return cache.elements;
+    virtualRef.current?.prepareKeyDown(event);
   }, []);
-
-  const renderInput = useCallback(
-    (params) => (
-      <TextField
-        {...params}
-        name="models"
-        error={Boolean(meta.error)}
-        label={label}
-        InputProps={{
-          ...params.InputProps
-        }}
-      />
-    ),
-    [label, meta.error]
+  const handleHighlight = useCallback((event, option, reason) => {
+    highlightedIdRef.current = option?.id ?? null;
+    virtualRef.current?.highlight(highlightedModelIndex(inputRef.current), reason);
+  }, []);
+  const renderTags = useCallback(
+    (tagValue, getTagProps) =>
+      tagValue.map((model, index) => {
+        const { tabIndex, className, disabled: tagDisabled } = getTagProps({ index });
+        return (
+          <ModelChip
+            key={getModelId(model)}
+            label={getModelId(model)}
+            tagIndex={index}
+            tabIndex={tabIndex}
+            className={className}
+            disabled={tagDisabled}
+            onRemove={onRemove}
+          />
+        );
+      }),
+    [onRemove]
   );
 
   return (
@@ -155,27 +139,73 @@ function ChannelModelsField({ options, disabled, label, helperText, customGroupL
           id="channel-models-label"
           disabled={disabled}
           options={options}
-          value={normalizeModels(field.value)}
+          value={models}
           inputValue={inputValue}
           onInputChange={handleInputChange}
           onChange={handleChange}
-          renderInput={renderInput}
+          onKeyDown={handleKeyDown}
+          onHighlightChange={handleHighlight}
+          handleHomeEndKeys={inputValue === ''}
+          renderInput={(params) => (
+            <TextField
+              {...params}
+              inputRef={inputRef}
+              name="models"
+              error={Boolean(error)}
+              label={label}
+              inputProps={{ ...params.inputProps, 'aria-describedby': 'helper-text-channel-models-label' }}
+            />
+          )}
           groupBy={getModelGroup}
-          getOptionLabel={getModelLabel}
-          filterOptions={handleFilterOptions}
-          renderOption={renderModelOption}
+          getOptionLabel={getModelId}
+          isOptionEqualToValue={sameModel}
+          filterOptions={filterOptions}
+          renderOption={describeModelOption}
+          renderGroup={describeModelGroup}
+          ListboxComponent={VirtualModelListbox}
+          ListboxProps={listboxProps}
           renderTags={renderTags}
           sx={MODEL_AUTOCOMPLETE_SX}
         />
       </Box>
-      {meta.error ? (
-        <FormHelperText error id="helper-tex-channel-models-label">
-          {meta.error}
-        </FormHelperText>
-      ) : (
-        <FormHelperText id="helper-tex-channel-models-label"> {helperText} </FormHelperText>
-      )}
+      <FormHelperText error={Boolean(error)} id="helper-text-channel-models-label">
+        {error || helperText}
+      </FormHelperText>
     </FormControl>
+  );
+});
+
+ModelsInput.propTypes = {
+  models: PropTypes.array.isRequired,
+  error: PropTypes.string,
+  options: PropTypes.array.isRequired,
+  disabled: PropTypes.bool,
+  label: PropTypes.string,
+  helperText: PropTypes.string,
+  customGroupLabel: PropTypes.string,
+  onChange: PropTypes.func.isRequired,
+  onRemove: PropTypes.func.isRequired
+};
+
+// Context 的校验等更新止于适配层；选择器只接收渲染所需的值及稳定事件。
+function ChannelModelsField({ options = EMPTY_MODELS, disabled, ...props }) {
+  const [field, meta, helpers] = useField('models');
+  const handleChange = useEventCallback((value) => {
+    if (!disabled) helpers.setValue(value);
+  });
+  const handleRemove = useEventCallback((id) => {
+    if (!disabled) helpers.setValue(asModels(field.value).filter((model) => getModelId(model) !== id));
+  });
+  return (
+    <ModelsInput
+      {...props}
+      options={options}
+      disabled={disabled}
+      models={asModels(field.value)}
+      error={meta.error}
+      onChange={handleChange}
+      onRemove={handleRemove}
+    />
   );
 }
 

@@ -60,6 +60,7 @@
     "dev": "vite",
     "start": "vite preview",
     "test": "node --test",
+    "test:channel-models": "node --test src/views/Channel/component/modelSelection.test.mjs src/views/Channel/component/ChannelModelsField.browser.test.mjs",
     "build": "vite build --outDir build",
     "i18n": "lobe-i18n",
     "lint": "eslint \"src/**/*.{js,jsx,ts,tsx}\"",
@@ -101,6 +102,7 @@
     "eslint-plugin-react": "^7.33.2",
     "eslint-plugin-react-hooks": "^4.6.0",
     "immutable": "^4.3.5",
+    "playwright-core": "^1.63.0",
     "prettier": "^3.2.4",
     "sass": "^1.70.0"
   },
