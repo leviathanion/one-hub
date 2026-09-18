@@ -9,7 +9,7 @@ lastUpdated: true
 
 ## 文档状态
 
-- 状态：**当前工作区实现**，更新日期为 2026-09-11。审计基线 `4b4c398f` 中的生命周期门禁由本次变更替代；本地验证范围见第 9 节，不代表已发布或完成真实上游验证。
+- 状态：当前实现（2026-09-11 更新）。审计基线 `4b4c398f` 中的生命周期门禁由本次变更替代；本地验证范围见第 9 节，不代表已发布或完成真实上游验证。
 - 范围：原生 HTTP Responses JSON/SSE、Native Responses WS、Stored Response 交付屏障，以及 OpenAI/Codex adapter 的观察边界。本文替代此前仅覆盖 steering 的方案，记录这些路径共同的职责契约。
 - 目标：尽可能保留客户端与上游的原始协议，代理只拥有认证、准入、选路、资源授权、计费和有界 I/O 生命周期。
 - 约束：沿用固定 WS 渠道、现有 create FIFO、明确的支持面及 [ADR-0030](../adr/0030-use-provider-usage-confirmed-tcc-billing.md)、[ADR-0033](../adr/0033-settle-atomic-price-components.md)、[ADR-0034](../adr/0034-read-configurable-policy-at-each-use.md)。不增加多 lane、background、conversation、客户端工具执行或自动恢复能力。
@@ -37,7 +37,7 @@ lastUpdated: true
 | --- | --- |
 | ingress / relay policy | 认证、权限、支持面、资源授权、渠道选择与工作前准入 |
 | provider / adapter | 构造上游协议、必要的方言转换、提取独立证据及实际凭据快照 |
-| providerresponse / 协议交付入口 | 对客错误诊断尽力脱敏，失败保留原文，见 [上游响应脱敏方案](./provider-response-redaction-design.md) |
+| providerresponse / 协议交付入口 | 对客错误诊断尽力脱敏，失败保留原文，见 [对客错误信息脱敏方案](./provider-response-redaction-design.md) |
 | transport | 原始字节或消息交付、背压、取消、连接来源与真实发送结果 |
 | relay / billing owner | 关联已准入执行、持有资源证明、消费证据、执行一次结算 |
 

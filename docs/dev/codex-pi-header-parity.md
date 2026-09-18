@@ -1,3 +1,10 @@
+---
+title: "Codex / PI OAuth 请求 Header 画像对照"
+layout: doc
+outline: deep
+lastUpdated: true
+---
+
 # Codex / PI OAuth 请求 Header 画像对照
 
 ## 文档状态

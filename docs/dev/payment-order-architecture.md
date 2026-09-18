@@ -7,6 +7,12 @@ lastUpdated: true
 
 # Payment Order 协议与原子入账
 
+## 文档状态
+
+- 状态：当前实现。
+- 适用范围：Order 创建与恢复、网关 adapter 与配置资源生命周期、通知/认证查询观察、原子入账、到期查单与关单。
+- 文档口径：本文是实现 contract；真实商户与运营商联调、部署签收边界见文末“验收与发布边界”。
+
 本实现覆盖易支付、支付宝当面付/PC/WAP、微信 Native 和 Stripe Checkout。资金归属使用已有 Order；`payment/types` 是只依赖标准库的中立契约，`payment` 注册 factory 并编排，adapter 只负责供应商协议。行为接口由中立包定义并由 `payment` 重导出，避免 adapter 反向依赖 service。决策见 [ADR-0029](../adr/0029-make-payment-order-the-credit-owner.md)。
 
 ## 创建与恢复

@@ -1,3 +1,10 @@
+---
+title: "wsconn — WebSocket 唯一传输边界架构方案"
+layout: doc
+outline: deep
+lastUpdated: true
+---
+
 # wsconn — WebSocket 唯一传输边界架构方案
 
 ## 文档状态

@@ -1,10 +1,17 @@
+---
+title: "开发与贡献"
+layout: doc
+outline: deep
+lastUpdated: true
+---
+
 # 开发与贡献
 
 ## 文档收敛说明
 
 `docs/dev` 里原先有多份渠道亲和、usage 与 async task 设计文档，主题重复，而且不少内容混杂了“当前实现”和“未来方案”两种口径。
 
-现在收敛成若干份“当前架构说明”、目标/诊断文档、历史文档和独立工具文档。每篇架构/方案文档顶部都必须有 `## 文档状态`，避免读者把历史方案、目标方案或诊断材料误读为当前实现。
+现在收敛成若干份“当前架构说明”、目标/诊断文档、历史文档和独立工具文档，并要求每篇文档在头部说明自己的状态，避免读者把历史方案、目标方案或诊断材料误读为当前实现。
 
 ## 文档状态口径
 
@@ -17,9 +24,18 @@
 | 历史方案 | 已被替代、未纳入当前路线，或仅保留长期取向 | 不从这些文档直接派生新实现 |
 | 工具文档 | 可执行脚本、压测或操作口径 | 跟随工具入口和参数更新 |
 
+## 文档格式约定
+
+架构/方案文档统一使用以下头部，避免格式漂移：
+
+- YAML front matter 只保留 `title`（与 H1 一致）、`layout: doc`、`outline: deep`、`lastUpdated: true`；状态不写入 front matter。
+- H1 之后紧跟 `## 文档状态`，使用无序列表。
+- 列表第一条固定为 `- 状态：`，取值必须是上表中的状态口径之一，可补充简短说明或日期。
+- 其余条目按需使用 `适用范围`、`文档口径`、`设计取向`、`关联代码`、`决策记录`，只保留判断文档可信度所需的信息。
+
 ## 文档递进关系
 
-下表按 Git 提交时间记录 `docs/dev` 的主要演进关系。这里的时间只代表已提交历史；当前工作区新增但未提交的文档没有 Git 时间。
+下表按 Git 提交时间记录 `docs/dev` 的主要演进关系。
 
 | 时间 | 提交 | 递进关系 | 当前阅读入口 |
 | --- | --- | --- | --- |
@@ -30,9 +46,10 @@
 | 2026-06-21 | `21c925a2` | 曾从 ResponsesWS 主架构拆出 settlement core 与 transport 专项；旧 settlement core 已随 floor/unresolved 路线删除。 | [ResponsesWS 架构说明](./responses-ws-architecture.md)、[ResponsesWS Transport 边界](./responses-ws-transport-boundary.md) |
 | 2026-06-25 | `526354b9` | 曾新增跨 transport attempt replay；当前已删除 replay actor，并收敛为 submission 后统一 no-replay。 | [Responses 请求重试边界](./responses-ws-attempt-replay-architecture.md) |
 | 2026-06-28 | `42b03d6c` | 新增 [Codex / PI OAuth 请求 Header 画像对照](./codex-pi-header-parity.md)，作为 Codex upstream parity 的诊断输入。 | [Codex / PI OAuth 请求 Header 画像对照](./codex-pi-header-parity.md) |
-| 未提交 | 当前工作区 | 放弃完整上界 `U`、floor、Redis gate 与 unresolved intent 路线，删除三份冲突方案，落地 [基于下游 Usage 的 TCC 计费](./usage-confirmed-tcc-billing-architecture.md)。 | 计费以当前实现文档和 ADR-0030 为准 |
-| 未提交 | 当前工作区 | 新增 [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md)，吸收并修正 Codex / PI header parity 诊断，形成 Codex provider official upstream 目标方案。 | [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md) |
-| 未提交 | 当前工作区 | 新增 [Codex Credential Refresh Fence 架构设计](./codex-credential-refresh-fence-architecture.md)，把 rotating OAuth credential 的多节点协调从 process-local journal / Redis lease 收敛为 DB durable fence、revision 与 fail-closed at-most-once protocol。 | [Codex Credential Refresh Fence 架构设计](./codex-credential-refresh-fence-architecture.md) |
+| 2026-06-29 | `fefc4681` | 新增 [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md)，吸收并修正 Codex / PI header parity 诊断，形成 Codex provider official upstream 目标方案。 | [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md) |
+| 2026-07-05 | `bf431b90`、`752201e0` | Codex official Responses wire planner 落地，[Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md) 由目标方案转为当前实现。 | [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md) |
+| 2026-07-11 | `1f4e6697` | 新增 [Codex Credential Refresh Fence 架构设计](./codex-credential-refresh-fence-architecture.md)，把 rotating OAuth credential 的多节点协调从 process-local journal / Redis lease 收敛为 DB durable fence、revision 与 fail-closed at-most-once protocol。 | [Codex Credential Refresh Fence 架构设计](./codex-credential-refresh-fence-architecture.md) |
+| 2026-09-09 | `da612288` | 放弃完整上界 `U`、floor、Redis gate 与 unresolved intent 路线，删除三份冲突方案，落地 [基于下游 Usage 的 TCC 计费](./usage-confirmed-tcc-billing-architecture.md)。 | 计费以当前实现文档和 ADR-0030 为准 |
 
 阅读规则：
 
@@ -47,17 +64,19 @@
 | [Channel Affinity 架构设计方案](./channel-affinity-architecture.md) | 渠道路由、responses affinity、Codex realtime affinity | 当前 routing / affinity 架构说明 |
 | [基于下游 Usage 的 TCC 计费](./usage-confirmed-tcc-billing-architecture.md) | 小额预扣、provider usage、Confirm/Cancel | 当前实现；只有合格下游 usage 才收费，没有 usage 全额取消预扣 |
 | [用户管理消融实验与精简方案](./user-management-ablation-plan.md) | 用户授权、身份归属、验证码、额度分组 | 当前实现；消融验证、17 项修复、SQL 一次性凭据与身份约束 |
+| [用户自动分组最终一致性修复方案](./user-group-quota-consistency-plan.md) | `quota`、`used_quota`、自动分组、按字段更新用户 | 当前实现；正常结算自动收敛，异常人工零额度重算 |
 | [条件倍率规则设计](./pricing-rate-rules.md) | 统一倍率、缓存覆盖、档位与日历条件 | 当前实现；保留基础价格和现有结算，只扩展 `rate_rules` |
 | [渠道编辑确认方案](./immutable-channel-identity-architecture.md) | 渠道连接配置、保存确认、credential refresh | 每次编辑保存前确认影响，原地更新 |
-| [Payment Order 原子入账方案](./payment-order-architecture.md) | gateway create、callback、用户 credit | 最终方案；Payment Order原子credit，强幂等contract内允许有界create retry |
+| [自定义渠道上游接口配置](./channel-endpoints.md) | 自定义渠道 `plugin.endpoints`、接口开关与地址 | 当前实现；接口开关不等于新增代理能力或重试授权 |
+| [Payment Order 协议与原子入账](./payment-order-architecture.md) | gateway create、callback、用户 credit | 当前实现；Payment Order 原子 credit，强幂等 contract 内允许有界 create retry |
 | [ResponsesWS 架构说明](./responses-ws-architecture.md) | `/v1/responses` WebSocket、actor、quota、upstream snapshot | 当前 ResponsesWS ingress 架构；计费遵循 usage Confirm / otherwise Cancel |
 | [Responses 透明转发与计费边界设计](./responses-transparent-relay-design.md) | HTTP SSE / Native WS、inject、steering、owner 与用量 | 当前实现；分离原帧交付和本地观察，删除模拟生命周期，保留有界证据收尾 |
-| [上游响应脱敏与统一交付方案](./provider-response-redaction-design.md) | HTTP JSON / SSE / WS、错误回放与诊断日志 | 当前实现；共享安全策略、按协议交付前执行，分离日志与协议处理 |
+| [对客错误信息脱敏方案](./provider-response-redaction-design.md) | HTTP JSON / SSE / WS、错误回放与诊断日志 | 当前实现；错误诊断尽力脱敏，正常正文与日志保留原文 |
 | [Responses 请求重试边界](./responses-ws-attempt-replay-architecture.md) | HTTP / Native WS no-replay 边界 | provider work 前完成筛选；submission 后不换渠道、不重放 |
 | [ResponsesWS Native Transport 边界](./responses-ws-transport-boundary.md) | Native WS send result、provider adapter、evidence 边界 | ResponsesWS 只有 native upstream，没有 HTTP bridge |
 | [Codex / PI OAuth 请求 Header 画像对照](./codex-pi-header-parity.md) | Codex / PI 自身 OAuth header 画像、one-hub 中转差异 | 用于后续 Codex provider header parity 修复和回归测试设计 |
-| [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md) | Codex provider raw envelope、official header/body planner、ResponsesWS native upstream | 目标架构；一次性干净重构，不设 legacy/typed/bridge 运行时兼容态 |
-| [Codex Credential Refresh Fence 架构设计](./codex-credential-refresh-fence-architecture.md) | Codex rotating OAuth credential、DB durable fence、revision、fail-closed recovery | 目标架构；用数据库 attempt fence 取代 process-local pending/ambiguous authority 与 Redis correctness lock |
+| [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md) | Codex provider raw envelope、official header/body planner、ResponsesWS native upstream | 当前实现；raw envelope 与 official planner 是唯一协议边界，不设 legacy/typed/bridge 运行时兼容态 |
+| [Codex Credential Refresh Fence 架构设计](./codex-credential-refresh-fence-architecture.md) | Codex rotating OAuth credential、DB durable fence、revision、fail-closed recovery | 当前实现；用数据库 attempt fence 取代 process-local pending/ambiguous authority 与 Redis correctness lock |
 | [wsconn 唯一传输边界架构方案](./wsconn-architecture.md) | `common/wsconn` 作为唯一 WebSocket 传输边界 | 当前实现；业务层不再持有 `*websocket.Conn` |
 | [one-hub Async Task 架构设计](./task-coordination-architecture.md) | async task、identity、fetch、sweeper、finalize | 当前异步任务架构说明 |
 | [Execution Session Revocation 架构设计方案](./execution-session-revocation-refactor.md) | `runtime/session` 锁边界、revocation、Sweep、容量回收 | 当前 session manager revocation 架构说明 |
@@ -70,17 +89,19 @@
 | [Channel Affinity 架构设计方案](./channel-affinity-architecture.md) | 当前实现 | 当前代码已按该方案收敛，用于解释现有 routing / affinity 行为 |
 | [基于下游 Usage 的 TCC 计费](./usage-confirmed-tcc-billing-architecture.md) | 当前实现 | 沿用旧预扣与差额计算；provider usage 才 Confirm，其余 Cancel；不采用完整上界 `U` |
 | [条件倍率规则设计](./pricing-rate-rules.md) | 当前实现 | 新版有限条件规则、统一倍率、缓存覆盖与共享试算 |
-| [渠道编辑确认方案](./immutable-channel-identity-architecture.md) | 当前方案 | channel ID 保持；确认弹窗不承诺存量资源不受影响 |
+| [渠道编辑确认方案](./immutable-channel-identity-architecture.md) | 当前实现 | channel ID 保持；确认弹窗不承诺存量资源不受影响 |
 | [自定义渠道上游接口配置](./channel-endpoints.md) | 当前实现 | 接口开关与地址分离、单一新格式、一次性全量迁移及升级步骤 |
-| [Payment Order 原子入账方案](./payment-order-architecture.md) | 最终方案 | Payment Order在gateway work前成为owner，callback原子credit |
+| [Payment Order 协议与原子入账](./payment-order-architecture.md) | 当前实现 | Payment Order 在 gateway work 前成为 owner，callback 原子 credit |
+| [用户自动分组最终一致性修复方案](./user-group-quota-consistency-plan.md) | 当前实现 | Q/U/G 同事务更新；充值、奖励与管理变动重算分组；保留零额度人工重算 |
+| [用户管理消融实验与精简方案](./user-management-ablation-plan.md) | 当前实现 | 删除无人读取的组缓存与重复解绑；保留资金事务、按字段更新与必要隔离 |
 | [ResponsesWS 架构](./responses-ws-architecture.md) | 当前实现 | `GET /v1/responses` native-only ingress、turn actor、owner barrier 与 usage-only 结算 |
 | [Responses 透明转发与计费边界设计](./responses-transparent-relay-design.md) | 当前实现 | 原始回执独立交付；HTTP 按真实传输结束收尾；inject 结果由上游决定 |
-| [上游响应脱敏与统一交付方案](./provider-response-redaction-design.md) | 当前实现 | 收敛重复规则与错误回放检查；保留协议角色和已有账号错误契约 |
+| [对客错误信息脱敏方案](./provider-response-redaction-design.md) | 当前实现 | 错误诊断副本尽力脱敏；正常响应、日志和原始观察保留原文 |
 | [Responses 请求重试边界](./responses-ws-attempt-replay-architecture.md) | 当前实现 | HTTP 与 Native WS 在 submission 后都没有 request replay actor |
 | [ResponsesWS Native Transport 边界](./responses-ws-transport-boundary.md) | 当前实现 | native send result、provider adapter 与 evidence contract；无 HTTP/SSE bridge |
 | [Codex / PI OAuth 请求 Header 画像对照](./codex-pi-header-parity.md) | 当前诊断 | 记录 Codex / PI 本体 HTTP/WS header 画像，以及 one-hub 当前中转后的缺失、额外和逻辑不一致字段 |
-| [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md) | 目标方案 | Codex provider 以 raw envelope contract 和 official planner 作为唯一协议边界；删除 legacy header、typed upstream contract、WS bridge fallback 和 model_headers override |
-| [Codex Credential Refresh Fence 架构设计](./codex-credential-refresh-fence-architecture.md) | 目标方案 | OAuth 前 DB Claim，成功后 ticket-scoped Commit；ambiguous/orphan 无 TTL fail closed，管理员以新 credential 显式恢复 |
+| [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md) | 当前实现 | Codex provider 以 raw envelope contract 和 official planner 作为唯一协议边界；删除 legacy header、typed upstream contract、WS bridge fallback 和 model_headers override |
+| [Codex Credential Refresh Fence 架构设计](./codex-credential-refresh-fence-architecture.md) | 当前实现 | OAuth 前 DB Claim，成功后 ticket-scoped Commit；ambiguous/orphan 无 TTL fail closed，管理员以新 credential 显式恢复 |
 | [wsconn 唯一传输边界架构方案](./wsconn-architecture.md) | 当前实现 | `common/wsconn` 是唯一 WebSocket 传输边界；业务层不再 import gorilla，CloseInfo first-write-wins，PongMiss/Idle 语义拆分 |
 | [one-hub Async Task 架构设计](./task-coordination-architecture.md) | 当前实现 | `tasks` 行持久拥有 reserve、submission、provider identity 与一次 Cancel/Confirm |
 | [Execution Session Revocation 架构设计方案](./execution-session-revocation-refactor.md) | 当前实现 | `runtime/session` revocation 锁外化、批量 sweep 检查与 Codex execution session timeout 配置已落地 |
@@ -90,6 +111,7 @@
 
 - [文档收敛说明](#文档收敛说明)
 - [文档状态口径](#文档状态口径)
+- [文档格式约定](#文档格式约定)
 - [文档递进关系](#文档递进关系)
 - [当前文档索引](#当前文档索引)
 - [当前现状](#当前现状)

@@ -1,3 +1,10 @@
+---
+title: "Relay 压测脚本"
+layout: doc
+outline: deep
+lastUpdated: true
+---
+
 # Relay 压测脚本
 
 ## 文档状态

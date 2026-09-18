@@ -9,10 +9,11 @@ lastUpdated: true
 
 ## 文档状态
 
-- 状态：目标架构方案，**无迁移态**。
+- 状态：当前实现，不设迁移态。
 - 适用范围：one-hub 中 Codex provider 的 `/v1/responses` HTTP、`/v1/responses/compact` HTTP、`GET /v1/responses` WebSocket upstream 请求构造。
 - 影响范围：本文重写的 `providers/base` Responses / ResponsesWS provider contract 是全仓唯一 contract。OpenAI 等非 Codex Responses provider 同步切换到同一 contract，同样以 raw object 为 body 基底，不得回退 typed 真相；但各自的 body patch 规则属于各自 dialect，本文只定义 Codex 的 planner 规则。
 - 设计取向：一次性切到干净协议边界；不保留 legacy profile；不设置 optional raw interface；不设置 typed fallback；不做 Codex / PI / one-hub legacy 的混合推断。
+- 关联代码：`providers/codex/wire`、`providers/codex/responses.go`、`providers/codex/responses_ws_upstream.go`、`providers/codex/chat.go`、`providers/codex/static_contract_test.go`。
 - 参考文档：
   - `docs/dev/codex-pi-header-parity.md`
   - `docs/dev/responses-ws-architecture.md`
