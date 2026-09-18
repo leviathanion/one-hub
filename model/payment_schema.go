@@ -12,7 +12,7 @@ import (
 	paytypes "one-api/payment/types"
 )
 
-const paymentUpgradeGuide = "docs/deployment/payment-v2-upgrade.md"
+const paymentUpgradeGuide = "docs/dev/payment-order-architecture.md"
 
 var paymentOrderRequiredColumns = []string{
 	"id", "user_id", "gateway_id", "trade_no", "quota", "order_currency",

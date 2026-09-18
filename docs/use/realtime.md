@@ -435,4 +435,3 @@ Realtime WebSocket 的 Origin 检查按以下优先级执行：
 
 - [ResponsesWS 配置](/use/responses-ws) — `GET /v1/responses` WebSocket 配置
 - [Codex 渠道](/use/Codex) — Codex 渠道配置说明
-- [WebSocket Transport 架构](/dev/websocket-transport-architecture) — 底层复用方案

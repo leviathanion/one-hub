@@ -25,8 +25,8 @@
 | --- | --- | --- | --- |
 | 2026-03-21 | `6e197c2f` | 删除旧 `performance-optimization-backlog.md`，改为可执行的 [Relay 压测脚本](./relay-performance-benchmark.md)。这是“优化想法列表”到“可重复压测工具”的收敛。 | [Relay 压测脚本](./relay-performance-benchmark.md) |
 | 2026-04-05 | `d57a21f8` | 删除多份 affinity / recovery / billing 草案；其中当时的 billing 主文档后来由 ADR-0030 取代并删除。 | [Channel Affinity 架构设计方案](./channel-affinity-architecture.md)、[one-hub Async Task 架构设计](./task-coordination-architecture.md) |
-| 2026-05-20 | `0e59a1d1` | 新增 [ResponsesWS 架构说明](./responses-ws-architecture.md) 与 [WebSocket Transport 复用方案](./websocket-transport-architecture.md)。这是 ResponsesWS 初始 actor / safety primitives 阶段。 | [ResponsesWS 架构说明](./responses-ws-architecture.md) |
-| 2026-05-25 | `186d8396` | 新增 [wsconn 唯一传输边界架构方案](./wsconn-architecture.md)，取代 primitives-only 的 [WebSocket Transport 复用方案](./websocket-transport-architecture.md)。这是“共享工具函数”到“强制传输边界”的升级。 | [wsconn 唯一传输边界架构方案](./wsconn-architecture.md) |
+| 2026-05-20 | `0e59a1d1` | 新增 [ResponsesWS 架构说明](./responses-ws-architecture.md) 与 WebSocket Transport 复用方案。这是 ResponsesWS 初始 actor / safety primitives 阶段。 | [ResponsesWS 架构说明](./responses-ws-architecture.md) |
+| 2026-05-25 | `186d8396` | 新增 [wsconn 唯一传输边界架构方案](./wsconn-architecture.md)，取代 primitives-only 的 WebSocket Transport 复用方案。这是“共享工具函数”到“强制传输边界”的升级。 | [wsconn 唯一传输边界架构方案](./wsconn-architecture.md) |
 | 2026-06-21 | `21c925a2` | 曾从 ResponsesWS 主架构拆出 settlement core 与 transport 专项；旧 settlement core 已随 floor/unresolved 路线删除。 | [ResponsesWS 架构说明](./responses-ws-architecture.md)、[ResponsesWS Transport 边界](./responses-ws-transport-boundary.md) |
 | 2026-06-25 | `526354b9` | 曾新增跨 transport attempt replay；当前已删除 replay actor，并收敛为 submission 后统一 no-replay。 | [Responses 请求重试边界](./responses-ws-attempt-replay-architecture.md) |
 | 2026-06-28 | `42b03d6c` | 新增 [Codex / PI OAuth 请求 Header 画像对照](./codex-pi-header-parity.md)，作为 Codex upstream parity 的诊断输入。 | [Codex / PI OAuth 请求 Header 画像对照](./codex-pi-header-parity.md) |
@@ -58,7 +58,6 @@
 | [Codex / PI OAuth 请求 Header 画像对照](./codex-pi-header-parity.md) | Codex / PI 自身 OAuth header 画像、one-hub 中转差异 | 用于后续 Codex provider header parity 修复和回归测试设计 |
 | [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md) | Codex provider raw envelope、official header/body planner、ResponsesWS native upstream | 目标架构；一次性干净重构，不设 legacy/typed/bridge 运行时兼容态 |
 | [Codex Credential Refresh Fence 架构设计](./codex-credential-refresh-fence-architecture.md) | Codex rotating OAuth credential、DB durable fence、revision、fail-closed recovery | 目标架构；用数据库 attempt fence 取代 process-local pending/ambiguous authority 与 Redis correctness lock |
-| [WebSocket Transport 复用方案](./websocket-transport-architecture.md) | `/v1/realtime` 与 ResponsesWS 的旧底层 I/O 复用 | 历史方案；已被 wsconn 唯一传输边界取代 |
 | [wsconn 唯一传输边界架构方案](./wsconn-architecture.md) | `common/wsconn` 作为唯一 WebSocket 传输边界 | 当前实现；业务层不再持有 `*websocket.Conn` |
 | [one-hub Async Task 架构设计](./task-coordination-architecture.md) | async task、identity、fetch、sweeper、finalize | 当前异步任务架构说明 |
 | [Execution Session Revocation 架构设计方案](./execution-session-revocation-refactor.md) | `runtime/session` 锁边界、revocation、Sweep、容量回收 | 当前 session manager revocation 架构说明 |
@@ -82,7 +81,6 @@
 | [Codex / PI OAuth 请求 Header 画像对照](./codex-pi-header-parity.md) | 当前诊断 | 记录 Codex / PI 本体 HTTP/WS header 画像，以及 one-hub 当前中转后的缺失、额外和逻辑不一致字段 |
 | [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md) | 目标方案 | Codex provider 以 raw envelope contract 和 official planner 作为唯一协议边界；删除 legacy header、typed upstream contract、WS bridge fallback 和 model_headers override |
 | [Codex Credential Refresh Fence 架构设计](./codex-credential-refresh-fence-architecture.md) | 目标方案 | OAuth 前 DB Claim，成功后 ticket-scoped Commit；ambiguous/orphan 无 TTL fail closed，管理员以新 credential 显式恢复 |
-| [WebSocket Transport 复用方案](./websocket-transport-architecture.md) | 历史方案 | 原 primitives-only safety primitives 路线，已被 `common/wsconn` 唯一传输边界取代 |
 | [wsconn 唯一传输边界架构方案](./wsconn-architecture.md) | 当前实现 | `common/wsconn` 是唯一 WebSocket 传输边界；业务层不再 import gorilla，CloseInfo first-write-wins，PongMiss/Idle 语义拆分 |
 | [one-hub Async Task 架构设计](./task-coordination-architecture.md) | 当前实现 | `tasks` 行持久拥有 reserve、submission、provider identity 与一次 Cancel/Confirm |
 | [Execution Session Revocation 架构设计方案](./execution-session-revocation-refactor.md) | 当前实现 | `runtime/session` revocation 锁外化、批量 sweep 检查与 Codex execution session timeout 配置已落地 |

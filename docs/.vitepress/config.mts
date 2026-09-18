@@ -31,7 +31,6 @@ export default defineConfig({
           { text: '环境变量', link: '/deployment/env' },
           { text: '图床配置', link: '/deployment/storage' },
           { text: '自动升级', link: '/deployment/update' },
-          { text: 'GPT-5.6 发布手册', link: '/deployment/gpt-5.6-rollout' },
           { text: '消息通知', link: '/deployment/notify' },
           { text: '命令行参数', link: '/deployment/cli' },
           { text: '扩展价格', link: '/deployment/ExtraRatios' },

@@ -8,7 +8,7 @@
 
 本文描述 one-hub 的 WebSocket 传输层已从"共享 safety primitives + 业务各自组装"的形态，演进为"`common/wsconn` 作为唯一传输边界、业务层不直接接触 `github.com/gorilla/websocket`"的硬边界形态。
 
-该方案取代 [WebSocket Transport 复用方案](./websocket-transport-architecture.md) 描述的旧实现路径，而不是叠加在其上。`common/requester/ws_*.go` 中的旧 primitives 已被吸收进 `common/wsconn`，原文件已删除。
+该方案取代“WebSocket Transport 复用方案”描述的旧实现路径，而不是叠加在其上。`common/requester/ws_*.go` 中的旧 primitives 已被吸收进 `common/wsconn`，原文件已删除。
 
 ## 真实问题
 
@@ -2365,9 +2365,9 @@ func WithClock(clock wsconn.Clock) Option
 - **gorilla 默认 close handler 的行为**：PeerClose 不重复发 close frame 这条契约需要 wire-level 测试验证，否则容易在某个 provider 路径上意外触发双 close。
 - **`relay/responses_ws.go` 业务部分的剥离**：3000 行里要准确切出"传输层重复发明"部分（~600-700 行），不能误伤 attemptID 校验、send outcome 投递等业务逻辑。
 
-## 与现有 websocket-transport-architecture.md 的关系
+## 与旧 primitives-only 路线的关系
 
-[WebSocket Transport 复用方案](./websocket-transport-architecture.md) 描述的是**旧实现路径**：共享 safety primitives，但业务层各自组装、各自持有 `*websocket.Conn`。该路线已经达到 primitives-only 路径的能力上限，并已被本方案取代。
+“WebSocket Transport 复用方案”描述的是**旧实现路径**：共享 safety primitives，但业务层各自组装、各自持有 `*websocket.Conn`。该路线已经达到 primitives-only 路径的能力上限，并已被本方案取代。
 
 本方案是**当前方案**，替代而非叠加：
 
