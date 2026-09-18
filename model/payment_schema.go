@@ -12,7 +12,8 @@ import (
 	paytypes "one-api/payment/types"
 )
 
-const paymentUpgradeGuide = "docs/dev/payment-order-architecture.md"
+// errPaymentUpgradeBlocked 表示启动前发现历史支付事实未签收；调用方应保持维护状态，不进入 AutoMigrate。
+var errPaymentUpgradeBlocked = errors.New("支付升级未通过")
 
 var paymentOrderRequiredColumns = []string{
 	"id", "user_id", "gateway_id", "trade_no", "quota", "order_currency",
@@ -45,7 +46,7 @@ func paymentSchemaTables() []paymentSchemaTable {
 }
 
 func paymentUpgradeError(format string, args ...any) error {
-	return fmt.Errorf("支付升级未通过：%s；保持停机并按 %s 完成数据签收", fmt.Sprintf(format, args...), paymentUpgradeGuide)
+	return fmt.Errorf("%w：%s；保持停机并完成历史数据签收后再启动", errPaymentUpgradeBlocked, fmt.Sprintf(format, args...))
 }
 
 // ValidatePaymentUpgradePrerequisites 必须在 AutoMigrate 前运行，防止缺少历史支付身份时以列默认值冒充升级。

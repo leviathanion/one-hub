@@ -1,7 +1,7 @@
 package model
 
 import (
-	"strings"
+	"errors"
 	"testing"
 	"time"
 
@@ -35,7 +35,7 @@ func paymentSchemaDB(t *testing.T, migrate bool) *gorm.DB {
 }
 func requirePaymentUpgradeBlocked(t *testing.T, err error) {
 	t.Helper()
-	if err == nil || !strings.Contains(err.Error(), paymentUpgradeGuide) {
+	if err == nil || !errors.Is(err, errPaymentUpgradeBlocked) {
 		t.Fatalf("未提供停机升级阻断: %v", err)
 	}
 }
