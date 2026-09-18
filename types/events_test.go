@@ -68,7 +68,7 @@ func TestUsageEventMergeAccumulatesExtraBilling(t *testing.T) {
 	}
 }
 
-func TestUsageEventMergeAccumulatesAllTokenDetailBuckets(t *testing.T) {
+func TestUsageEventMergeAccumulatesOpenAITokenDetailBuckets(t *testing.T) {
 	usage := &UsageEvent{
 		ProviderTokenEvidence: true,
 		InputTokens:           2,
@@ -80,8 +80,7 @@ func TestUsageEventMergeAccumulatesAllTokenDetailBuckets(t *testing.T) {
 			TextTokens:           3,
 			ImageTokens:          4,
 			CachedTokensInternal: 5,
-			CachedWriteTokens:    6,
-			CachedReadTokens:     7,
+			CacheWriteTokens:     6,
 		},
 		OutputTokenDetails: CompletionTokensDetails{
 			AudioTokens:              8,
@@ -104,8 +103,7 @@ func TestUsageEventMergeAccumulatesAllTokenDetailBuckets(t *testing.T) {
 			TextTokens:           23,
 			ImageTokens:          24,
 			CachedTokensInternal: 25,
-			CachedWriteTokens:    26,
-			CachedReadTokens:     27,
+			CacheWriteTokens:     26,
 		},
 		OutputTokenDetails: CompletionTokensDetails{
 			AudioTokens:              28,
@@ -126,10 +124,9 @@ func TestUsageEventMergeAccumulatesAllTokenDetailBuckets(t *testing.T) {
 		TextTokens:           26,
 		ImageTokens:          28,
 		CachedTokensInternal: 30,
-		CachedWriteTokens:    32,
-		CachedReadTokens:     34,
+		CacheWriteTokens:     32,
 	}) {
-		t.Fatalf("expected prompt token details to accumulate across all buckets, got %+v", usage.InputTokenDetails)
+		t.Fatalf("expected prompt token details to accumulate across OpenAI buckets, got %+v", usage.InputTokenDetails)
 	}
 	if usage.OutputTokenDetails != (CompletionTokensDetails{
 		AudioTokens:              36,
@@ -140,6 +137,29 @@ func TestUsageEventMergeAccumulatesAllTokenDetailBuckets(t *testing.T) {
 		ImageTokens:              46,
 	}) {
 		t.Fatalf("expected completion token details to accumulate across all buckets, got %+v", usage.OutputTokenDetails)
+	}
+}
+
+func TestUsageEventMergeAccumulatesClaudeCacheBuckets(t *testing.T) {
+	usage := &UsageEvent{
+		ProviderTokenEvidence: true,
+		InputTokenDetails: PromptTokensDetails{
+			CacheCreationInputTokens: 6,
+			CacheReadInputTokens:     7,
+		},
+	}
+	usage.Merge(&UsageEvent{
+		ProviderTokenEvidence: true,
+		InputTokenDetails: PromptTokensDetails{
+			CacheCreationInputTokens: 26,
+			CacheReadInputTokens:     27,
+		},
+	})
+	if usage.InputTokenDetails != (PromptTokensDetails{
+		CacheCreationInputTokens: 32,
+		CacheReadInputTokens:     34,
+	}) {
+		t.Fatalf("expected Claude cache details to accumulate, got %+v", usage.InputTokenDetails)
 	}
 }
 
@@ -232,12 +252,10 @@ func TestEventHelpersAndUsageEventExtraTokenAssembly(t *testing.T) {
 
 	usage := &UsageEvent{
 		InputTokenDetails: PromptTokensDetails{
-			CachedTokens:      2,
-			AudioTokens:       3,
-			TextTokens:        4,
-			CachedWriteTokens: 5,
-			CachedReadTokens:  6,
-			ImageTokens:       7,
+			CachedTokens: 2,
+			AudioTokens:  3,
+			TextTokens:   4,
+			ImageTokens:  7,
 		},
 		OutputTokenDetails: CompletionTokensDetails{
 			AudioTokens:     8,
@@ -250,20 +268,34 @@ func TestEventHelpersAndUsageEventExtraTokenAssembly(t *testing.T) {
 	if extraTokens[APIToolTypeWebSearchPreview] != 0 {
 		t.Fatal("expected unrelated extra token keys to remain unset")
 	}
-	if len(extraTokens) != 10 {
+	if len(extraTokens) != 8 {
 		t.Fatalf("expected usage extra token assembly to expose the supported realtime token buckets, got %+v", extraTokens)
 	}
 	if extraTokens[config.UsageExtraCache] != 2 ||
 		extraTokens[config.UsageExtraInputAudio] != 3 ||
 		extraTokens[config.UsageExtraInputTextTokens] != 4 ||
-		extraTokens[config.UsageExtraCachedWrite] != 5 ||
-		extraTokens[config.UsageExtraCachedRead] != 6 ||
 		extraTokens[config.UsageExtraInputImageTokens] != 7 ||
 		extraTokens[config.UsageExtraOutputAudio] != 8 ||
 		extraTokens[config.UsageExtraOutputTextTokens] != 9 ||
 		extraTokens[config.UsageExtraReasoning] != 10 ||
 		extraTokens[config.UsageExtraOutputImageTokens] != 11 {
 		t.Fatalf("expected usage extra token assembly to expose cache and audio token buckets, got %+v", extraTokens)
+	}
+}
+
+func TestUsageEventExtraTokenAssemblyKeepsClaudeCacheBuckets(t *testing.T) {
+	usage := &UsageEvent{
+		InputTokenDetails: PromptTokensDetails{
+			CacheCreationInputTokens: 5,
+			CacheReadInputTokens:     6,
+		},
+	}
+	extraTokens := usage.GetExtraTokens()
+	if len(extraTokens) != 2 {
+		t.Fatalf("expected Claude cache assembly to expose two buckets, got %+v", extraTokens)
+	}
+	if extraTokens[config.UsageExtraCacheCreationInputTokens] != 5 || extraTokens[config.UsageExtraCacheReadInputTokens] != 6 {
+		t.Fatalf("expected Claude cache bucket assembly, got %+v", extraTokens)
 	}
 }
 

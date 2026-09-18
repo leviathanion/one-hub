@@ -374,27 +374,27 @@ func deltaOpenAIRealtimeUsageFloat(current, previous float64) float64 {
 
 func maxOpenAIRealtimePromptTokenDetails(current, next types.PromptTokensDetails) types.PromptTokensDetails {
 	return types.PromptTokensDetails{
-		AudioTokens:          maxOpenAIRealtimeUsageInt(current.AudioTokens, next.AudioTokens),
-		CachedTokens:         maxOpenAIRealtimeUsageInt(current.CachedTokens, next.CachedTokens),
-		TextTokens:           maxOpenAIRealtimeUsageInt(current.TextTokens, next.TextTokens),
-		ImageTokens:          maxOpenAIRealtimeUsageInt(current.ImageTokens, next.ImageTokens),
-		CachedTokensInternal: maxOpenAIRealtimeUsageInt(current.CachedTokensInternal, next.CachedTokensInternal),
-		CacheWriteTokens:     maxOpenAIRealtimeUsageInt(current.CacheWriteTokens, next.CacheWriteTokens),
-		CachedWriteTokens:    maxOpenAIRealtimeUsageInt(current.CachedWriteTokens, next.CachedWriteTokens),
-		CachedReadTokens:     maxOpenAIRealtimeUsageInt(current.CachedReadTokens, next.CachedReadTokens),
+		AudioTokens:              maxOpenAIRealtimeUsageInt(current.AudioTokens, next.AudioTokens),
+		CachedTokens:             maxOpenAIRealtimeUsageInt(current.CachedTokens, next.CachedTokens),
+		TextTokens:               maxOpenAIRealtimeUsageInt(current.TextTokens, next.TextTokens),
+		ImageTokens:              maxOpenAIRealtimeUsageInt(current.ImageTokens, next.ImageTokens),
+		CachedTokensInternal:     maxOpenAIRealtimeUsageInt(current.CachedTokensInternal, next.CachedTokensInternal),
+		CacheWriteTokens:         maxOpenAIRealtimeUsageInt(current.CacheWriteTokens, next.CacheWriteTokens),
+		CacheCreationInputTokens: maxOpenAIRealtimeUsageInt(current.CacheCreationInputTokens, next.CacheCreationInputTokens),
+		CacheReadInputTokens:     maxOpenAIRealtimeUsageInt(current.CacheReadInputTokens, next.CacheReadInputTokens),
 	}
 }
 
 func deltaOpenAIRealtimePromptTokenDetails(current, previous types.PromptTokensDetails) types.PromptTokensDetails {
 	return types.PromptTokensDetails{
-		AudioTokens:          deltaOpenAIRealtimeUsageInt(current.AudioTokens, previous.AudioTokens),
-		CachedTokens:         deltaOpenAIRealtimeUsageInt(current.CachedTokens, previous.CachedTokens),
-		TextTokens:           deltaOpenAIRealtimeUsageInt(current.TextTokens, previous.TextTokens),
-		ImageTokens:          deltaOpenAIRealtimeUsageInt(current.ImageTokens, previous.ImageTokens),
-		CachedTokensInternal: deltaOpenAIRealtimeUsageInt(current.CachedTokensInternal, previous.CachedTokensInternal),
-		CacheWriteTokens:     deltaOpenAIRealtimeUsageInt(current.CacheWriteTokens, previous.CacheWriteTokens),
-		CachedWriteTokens:    deltaOpenAIRealtimeUsageInt(current.CachedWriteTokens, previous.CachedWriteTokens),
-		CachedReadTokens:     deltaOpenAIRealtimeUsageInt(current.CachedReadTokens, previous.CachedReadTokens),
+		AudioTokens:              deltaOpenAIRealtimeUsageInt(current.AudioTokens, previous.AudioTokens),
+		CachedTokens:             deltaOpenAIRealtimeUsageInt(current.CachedTokens, previous.CachedTokens),
+		TextTokens:               deltaOpenAIRealtimeUsageInt(current.TextTokens, previous.TextTokens),
+		ImageTokens:              deltaOpenAIRealtimeUsageInt(current.ImageTokens, previous.ImageTokens),
+		CachedTokensInternal:     deltaOpenAIRealtimeUsageInt(current.CachedTokensInternal, previous.CachedTokensInternal),
+		CacheWriteTokens:         deltaOpenAIRealtimeUsageInt(current.CacheWriteTokens, previous.CacheWriteTokens),
+		CacheCreationInputTokens: deltaOpenAIRealtimeUsageInt(current.CacheCreationInputTokens, previous.CacheCreationInputTokens),
+		CacheReadInputTokens:     deltaOpenAIRealtimeUsageInt(current.CacheReadInputTokens, previous.CacheReadInputTokens),
 	}
 }
 
@@ -405,8 +405,8 @@ func openAIRealtimePromptTokenDetailsHasValue(details types.PromptTokensDetails)
 		details.ImageTokens > 0 ||
 		details.CachedTokensInternal > 0 ||
 		details.CacheWriteTokens > 0 ||
-		details.CachedWriteTokens > 0 ||
-		details.CachedReadTokens > 0
+		details.CacheCreationInputTokens > 0 ||
+		details.CacheReadInputTokens > 0
 }
 
 func maxOpenAIRealtimeCompletionTokenDetails(current, next types.CompletionTokensDetails) types.CompletionTokensDetails {

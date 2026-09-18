@@ -1998,8 +1998,6 @@ type openAIRealtimeTranscriptionInputDetailsWire struct {
 	ImageTokens          *int `json:"image_tokens,omitempty"`
 	CachedTokensInternal *int `json:"cached_tokens_internal,omitempty"`
 	CacheWriteTokens     *int `json:"cache_write_tokens,omitempty"`
-	CachedWriteTokens    *int `json:"cached_write_tokens,omitempty"`
-	CachedReadTokens     *int `json:"cached_read_tokens,omitempty"`
 }
 
 type openAIRealtimeTranscriptionOutputDetailsWire struct {
@@ -2060,12 +2058,6 @@ func openAIRealtimeInputAudioTranscriptionUsage(eventType string, providerEventI
 		}
 		if details.CacheWriteTokens != nil {
 			usage.InputTokenDetails.CacheWriteTokens = *details.CacheWriteTokens
-		}
-		if details.CachedWriteTokens != nil {
-			usage.InputTokenDetails.CachedWriteTokens = *details.CachedWriteTokens
-		}
-		if details.CachedReadTokens != nil {
-			usage.InputTokenDetails.CachedReadTokens = *details.CachedReadTokens
 		}
 	}
 	if details := event.Usage.OutputTokenDetails; details != nil {
@@ -2133,7 +2125,7 @@ func markOpenAIRealtimeTranscriptionTokenEvidence(usage *types.UsageEvent, wire 
 	if details != nil {
 		for _, value := range []*int{
 			details.AudioTokens, details.CachedTokens, details.TextTokens, details.ImageTokens,
-			details.CachedTokensInternal, details.CacheWriteTokens, details.CachedWriteTokens, details.CachedReadTokens,
+			details.CachedTokensInternal, details.CacheWriteTokens,
 		} {
 			if value != nil && *value < 0 {
 				usage.ProviderTokenConflict = true
@@ -2174,8 +2166,6 @@ func markOpenAIRealtimeTranscriptionTokenEvidence(usage *types.UsageEvent, wire 
 		markInputDetail(config.UsageExtraInputImageTokens, details.ImageTokens)
 		markInputDetail("cached_tokens_internal", details.CachedTokensInternal)
 		markInputDetail(config.UsageExtraCacheWrite, details.CacheWriteTokens)
-		markInputDetail(config.UsageExtraCachedWrite, details.CachedWriteTokens)
-		markInputDetail(config.UsageExtraCachedRead, details.CachedReadTokens)
 	}
 	if details := wire.OutputTokenDetails; details != nil {
 		markOutputDetail := func(key string, value *int) {

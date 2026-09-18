@@ -1,5 +1,7 @@
 package types
 
+import "encoding/json"
+
 type CompletionRequest struct {
 	Model            string         `json:"model" binding:"required"`
 	Prompt           any            `json:"prompt" binding:"required"`
@@ -38,6 +40,17 @@ type CompletionResponse struct {
 	rawProviderJSON        []byte
 	replayProviderRawJSON  bool
 	captureProviderRawJSON bool
+}
+
+func (r CompletionResponse) MarshalJSON() ([]byte, error) {
+	type responseAlias CompletionResponse
+	return json.Marshal(struct {
+		responseAlias
+		Usage *chatCompletionUsage `json:"usage,omitempty"`
+	}{
+		responseAlias: responseAlias(r),
+		Usage:         projectChatCompletionUsage(r.Usage),
+	})
 }
 
 func (r *CompletionResponse) SetProviderRawJSON(raw []byte) {

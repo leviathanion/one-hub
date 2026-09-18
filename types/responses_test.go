@@ -1138,15 +1138,14 @@ func TestChatCompletionResponseToResponsesCopiesResponseObjectFields(t *testing.
 }
 
 func TestResponsesUsageMarshalKeepsProviderCacheEvidenceInternal(t *testing.T) {
-	usage := ResponsesUsage{
-		InputTokens: 1,
-		InputTokensDetails: &ResponsesUsageInputTokensDetails{
-			CachedTokens:      2,
-			CachedReadTokens:  3,
-			CacheWriteTokens:  5,
-			CachedWriteTokens: 7,
+	usage := (&Usage{
+		PromptTokens: 1,
+		PromptTokensDetails: PromptTokensDetails{
+			CachedTokens:         2,
+			CacheWriteTokens:     5,
+			CachedTokensInternal: 11,
 		},
-	}
+	}).ToResponsesUsage()
 	raw, err := json.Marshal(usage)
 	if err != nil {
 		t.Fatal(err)
@@ -1158,13 +1157,10 @@ func TestResponsesUsageMarshalKeepsProviderCacheEvidenceInternal(t *testing.T) {
 	if !strings.Contains(wire, `"cache_write_tokens":5`) {
 		t.Fatalf("official cache_write_tokens missing from wire: %s", wire)
 	}
-	for _, internalField := range []string{"cached_read_tokens", "cached_write_tokens"} {
+	for _, internalField := range []string{"cache_creation_input_tokens", "cache_read_input_tokens", "cached_tokens_internal"} {
 		if strings.Contains(wire, internalField) {
 			t.Fatalf("provider billing evidence %q leaked onto Responses wire: %s", internalField, wire)
 		}
-	}
-	if usage.InputTokensDetails.CachedReadTokens != 3 || usage.InputTokensDetails.CacheWriteTokens != 5 || usage.InputTokensDetails.CachedWriteTokens != 7 {
-		t.Fatalf("marshalling mutated billing evidence: %+v", usage.InputTokensDetails)
 	}
 }
 

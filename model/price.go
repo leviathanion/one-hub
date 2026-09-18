@@ -41,23 +41,23 @@ func GetIncreaseTokens(tokens int, ratio float64) int {
 }
 
 var ExtraKeyIsPrompt = map[string]bool{
-	config.UsageExtraCache:                   true,
-	config.UsageExtraCacheWrite:              true,
-	config.UsageExtraCachedWrite:             true,
-	config.UsageExtraCachedRead:              true,
-	config.UsageExtraClaudeCacheWrite5m:      true,
-	config.UsageExtraClaudeCacheWrite1h:      true,
-	config.UsageExtraToolUsePrompt:           true,
-	config.UsageExtraInputAudio:              true,
-	config.UsageExtraInputAudioTranscription: true,
-	config.UsageExtraOutputAudio:             false,
-	config.UsageExtraReasoning:               false,
-	config.UsageExtraInputTextTokens:         true,
-	config.UsageExtraOutputTextTokens:        false,
-	config.UsageExtraInputImageTokens:        true,
-	config.UsageExtraOutputImageTokens:       false,
-	config.UsageExtraInputVideoTokens:        true,
-	config.UsageExtraOutputVideoTokens:       false,
+	config.UsageExtraCache:                    true,
+	config.UsageExtraCacheWrite:               true,
+	config.UsageExtraCacheCreationInputTokens: true,
+	config.UsageExtraCacheReadInputTokens:     true,
+	config.UsageExtraEphemeral5mInputTokens:   true,
+	config.UsageExtraEphemeral1hInputTokens:   true,
+	config.UsageExtraToolUsePrompt:            true,
+	config.UsageExtraInputAudio:               true,
+	config.UsageExtraInputAudioTranscription:  true,
+	config.UsageExtraOutputAudio:              false,
+	config.UsageExtraReasoning:                false,
+	config.UsageExtraInputTextTokens:          true,
+	config.UsageExtraOutputTextTokens:         false,
+	config.UsageExtraInputImageTokens:         true,
+	config.UsageExtraOutputImageTokens:        false,
+	config.UsageExtraInputVideoTokens:         true,
+	config.UsageExtraOutputVideoTokens:        false,
 }
 
 func GetExtraPriceIsPrompt(key string) bool {
@@ -65,20 +65,20 @@ func GetExtraPriceIsPrompt(key string) bool {
 }
 
 var defaultExtraPrice = map[string]float64{
-	config.UsageExtraCache:              1,
-	config.UsageExtraCacheWrite:         1.25,
-	config.UsageExtraCachedWrite:        1.25,
-	config.UsageExtraCachedRead:         0.1,
-	config.UsageExtraClaudeCacheWrite5m: 1.25,
-	config.UsageExtraClaudeCacheWrite1h: 2,
-	config.UsageExtraToolUsePrompt:      1,
-	config.UsageExtraInputAudio:         1,
-	config.UsageExtraOutputAudio:        1,
-	config.UsageExtraReasoning:          1,
-	config.UsageExtraInputTextTokens:    1,
-	config.UsageExtraOutputTextTokens:   1,
-	config.UsageExtraInputVideoTokens:   1,
-	config.UsageExtraOutputVideoTokens:  1,
+	config.UsageExtraCache:                    1,
+	config.UsageExtraCacheWrite:               1.25,
+	config.UsageExtraCacheCreationInputTokens: 1.25,
+	config.UsageExtraCacheReadInputTokens:     0.1,
+	config.UsageExtraEphemeral5mInputTokens:   1.25,
+	config.UsageExtraEphemeral1hInputTokens:   2,
+	config.UsageExtraToolUsePrompt:            1,
+	config.UsageExtraInputAudio:               1,
+	config.UsageExtraOutputAudio:              1,
+	config.UsageExtraReasoning:                1,
+	config.UsageExtraInputTextTokens:          1,
+	config.UsageExtraOutputTextTokens:         1,
+	config.UsageExtraInputVideoTokens:         1,
+	config.UsageExtraOutputVideoTokens:        1,
 }
 
 type Price struct {
@@ -218,10 +218,10 @@ func (price *Price) GetExtraRatio(key string) float64 {
 		return ratio
 	}
 	// Claude TTL 是价格读取层的回退例外：仅当对应 TTL 没有显式值时，
-	// 才读取通用 cached_write_tokens；provider usage 证据仍保持独立。
+	// 才读取通用 cache_creation_input_tokens；provider usage 证据仍保持独立。
 	switch key {
-	case config.UsageExtraClaudeCacheWrite5m, config.UsageExtraClaudeCacheWrite1h:
-		if ratio, ok := extraRatios[config.UsageExtraCachedWrite]; ok {
+	case config.UsageExtraEphemeral5mInputTokens, config.UsageExtraEphemeral1hInputTokens:
+		if ratio, ok := extraRatios[config.UsageExtraCacheCreationInputTokens]; ok {
 			return ratio
 		}
 	}

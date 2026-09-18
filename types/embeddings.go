@@ -1,5 +1,7 @@
 package types
 
+import "encoding/json"
+
 type EmbeddingRequest struct {
 	Model          string `json:"model" binding:"required"`
 	Input          any    `json:"input" binding:"required"`
@@ -20,6 +22,30 @@ type EmbeddingResponse struct {
 	Data                 []Embedding `json:"data"`
 	Model                string      `json:"model"`
 	Usage                *Usage      `json:"usage,omitempty"`
+}
+
+// embeddingWireUsage 是官方 embeddings usage 形状：只有 prompt_tokens 和 total_tokens。
+type embeddingWireUsage struct {
+	PromptTokens int `json:"prompt_tokens"`
+	TotalTokens  int `json:"total_tokens"`
+}
+
+func projectEmbeddingWireUsage(usage *Usage) *embeddingWireUsage {
+	if usage == nil {
+		return nil
+	}
+	return &embeddingWireUsage{PromptTokens: usage.PromptTokens, TotalTokens: usage.TotalTokens}
+}
+
+func (r EmbeddingResponse) MarshalJSON() ([]byte, error) {
+	type responseAlias EmbeddingResponse
+	return json.Marshal(struct {
+		responseAlias
+		Usage *embeddingWireUsage `json:"usage,omitempty"`
+	}{
+		responseAlias: responseAlias(r),
+		Usage:         projectEmbeddingWireUsage(r.Usage),
+	})
 }
 
 func (r EmbeddingRequest) ParseInput() []string {

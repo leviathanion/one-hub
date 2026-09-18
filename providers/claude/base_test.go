@@ -156,12 +156,12 @@ func TestClaudeChatUsageKeepsCacheAccountingOffTheChatWire(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal Claude Chat response: %v", err)
 	}
-	for _, field := range []string{"cached_write_tokens", "cached_read_tokens"} {
+	for _, field := range []string{"cache_creation_input_tokens", "cache_read_input_tokens"} {
 		if strings.Contains(string(raw), `"`+field+`"`) {
 			t.Fatalf("internal Claude accounting field %q escaped onto Chat wire: %s", field, raw)
 		}
 	}
-	if usage.GetExtraTokens()[config.UsageExtraClaudeCacheWrite5m] != 5 || usage.GetExtraTokens()[config.UsageExtraClaudeCacheWrite1h] != 0 || usage.PromptTokensDetails.CachedReadTokens != 3 {
+	if usage.GetExtraTokens()[config.UsageExtraEphemeral5mInputTokens] != 5 || usage.GetExtraTokens()[config.UsageExtraEphemeral1hInputTokens] != 0 || usage.PromptTokensDetails.CacheReadInputTokens != 3 {
 		t.Fatalf("wire projection discarded internal Claude accounting: %+v", usage.PromptTokensDetails)
 	}
 }

@@ -6766,10 +6766,9 @@ func TestResponsesWSUsageDetailsMapAudioAndCacheFields(t *testing.T) {
 		InputTokens:           1,
 		ProviderTokenEvidence: true,
 		InputTokenDetails: types.PromptTokensDetails{
-			AudioTokens:       2,
-			CachedTokens:      3,
-			CachedReadTokens:  4,
-			CachedWriteTokens: 5,
+			AudioTokens:      2,
+			CachedTokens:     3,
+			CacheWriteTokens: 5,
 		},
 		OutputTokenDetails: types.CompletionTokensDetails{
 			ReasoningTokens: 6,
@@ -6779,10 +6778,9 @@ func TestResponsesWSUsageDetailsMapAudioAndCacheFields(t *testing.T) {
 		InputTokens:           1,
 		ProviderTokenEvidence: true,
 		InputTokenDetails: types.PromptTokensDetails{
-			AudioTokens:       7,
-			CachedTokens:      11,
-			CachedReadTokens:  13,
-			CachedWriteTokens: 17,
+			AudioTokens:      7,
+			CachedTokens:     11,
+			CacheWriteTokens: 17,
 		},
 		OutputTokenDetails: types.CompletionTokensDetails{
 			ReasoningTokens: 19,
@@ -6791,8 +6789,7 @@ func TestResponsesWSUsageDetailsMapAudioAndCacheFields(t *testing.T) {
 
 	if usage.PromptTokensDetails.AudioTokens != 9 ||
 		usage.PromptTokensDetails.CachedTokens != 14 ||
-		usage.PromptTokensDetails.CachedReadTokens != 17 ||
-		usage.PromptTokensDetails.CachedWriteTokens != 22 ||
+		usage.PromptTokensDetails.CacheWriteTokens != 22 ||
 		usage.CompletionTokensDetails.ReasoningTokens != 25 {
 		t.Fatalf("expected usage event details to accumulate, got %+v / %+v", usage.PromptTokensDetails, usage.CompletionTokensDetails)
 	}
@@ -6800,41 +6797,39 @@ func TestResponsesWSUsageDetailsMapAudioAndCacheFields(t *testing.T) {
 	responseUsage := (&types.Usage{
 		PromptTokens: 3,
 		PromptTokensDetails: types.PromptTokensDetails{
-			AudioTokens:       23,
-			CachedTokens:      29,
-			CachedReadTokens:  31,
-			CachedWriteTokens: 37,
-			TextTokens:        41,
-			ImageTokens:       43,
+			AudioTokens:      23,
+			CachedTokens:     29,
+			CacheWriteTokens: 37,
+			TextTokens:       41,
+			ImageTokens:      43,
 		},
 	}).ToResponsesUsage()
 	if responseUsage.InputTokensDetails == nil ||
 		responseUsage.InputTokensDetails.AudioTokens != 23 ||
-		responseUsage.InputTokensDetails.CachedReadTokens != 31 ||
-		responseUsage.InputTokensDetails.CachedWriteTokens != 37 {
-		t.Fatalf("expected Usage.ToResponsesUsage to preserve audio/cache details, got %+v", responseUsage.InputTokensDetails)
+		responseUsage.InputTokensDetails.CachedTokens != 29 ||
+		responseUsage.InputTokensDetails.CacheWriteTokens != 37 {
+		t.Fatalf("expected Usage.ToResponsesUsage to preserve public audio/cache details, got %+v", responseUsage.InputTokensDetails)
 	}
 
 	usageFromResponses := responseUsage.ToOpenAIUsage()
 	if usageFromResponses.PromptTokensDetails.AudioTokens != 23 ||
-		usageFromResponses.PromptTokensDetails.CachedReadTokens != 31 ||
-		usageFromResponses.PromptTokensDetails.CachedWriteTokens != 37 {
-		t.Fatalf("expected ResponsesUsage.ToOpenAIUsage to preserve audio/cache details, got %+v", usageFromResponses.PromptTokensDetails)
+		usageFromResponses.PromptTokensDetails.CachedTokens != 29 ||
+		usageFromResponses.PromptTokensDetails.CacheWriteTokens != 37 {
+		t.Fatalf("expected ResponsesUsage.ToOpenAIUsage to preserve public audio/cache details, got %+v", usageFromResponses.PromptTokensDetails)
 	}
 
 	mergeResponsesWSResponsesUsage(usage, &types.ResponsesUsage{
 		InputTokens: 5,
 		InputTokensDetails: &types.ResponsesUsageInputTokensDetails{
-			AudioTokens:       47,
-			CachedTokens:      53,
-			CachedReadTokens:  59,
-			CachedWriteTokens: 61,
+			AudioTokens:      47,
+			CachedTokens:     53,
+			CacheWriteTokens: 61,
 		},
 	})
 	if usage.PromptTokens != 5 ||
 		usage.PromptTokensDetails.AudioTokens != 47 ||
-		usage.PromptTokensDetails.CachedReadTokens != 59 ||
-		usage.PromptTokensDetails.CachedWriteTokens != 61 {
+		usage.PromptTokensDetails.CachedTokens != 53 ||
+		usage.PromptTokensDetails.CacheWriteTokens != 61 {
 		t.Fatalf("expected terminal response usage to map full input details, got %+v", usage)
 	}
 }
@@ -7628,9 +7623,9 @@ func TestMergeResponsesWSResponsesUsagePreservesAccumulatedDetailsWhenTerminalOm
 		CompletionTokens: 7,
 		TotalTokens:      18,
 		PromptTokensDetails: types.PromptTokensDetails{
-			AudioTokens:      9,
-			CachedReadTokens: 4,
-			TextTokens:       2,
+			AudioTokens:  9,
+			CachedTokens: 4,
+			TextTokens:   2,
 		},
 		CompletionTokensDetails: types.CompletionTokensDetails{
 			ReasoningTokens: 3,
@@ -7651,7 +7646,7 @@ func TestMergeResponsesWSResponsesUsagePreservesAccumulatedDetailsWhenTerminalOm
 	if usage.PromptTokens != 11 || usage.CompletionTokens != 7 || usage.TotalTokens != 18 {
 		t.Fatalf("expected zero terminal totals to preserve accumulated totals, got %+v", usage)
 	}
-	if usage.PromptTokensDetails.AudioTokens != 9 || usage.PromptTokensDetails.CachedReadTokens != 4 || usage.PromptTokensDetails.TextTokens != 5 {
+	if usage.PromptTokensDetails.AudioTokens != 9 || usage.PromptTokensDetails.CachedTokens != 4 || usage.PromptTokensDetails.TextTokens != 5 {
 		t.Fatalf("expected positive detail fields to override without clearing omitted fields, got %+v", usage.PromptTokensDetails)
 	}
 	if usage.CompletionTokensDetails.ReasoningTokens != 3 {

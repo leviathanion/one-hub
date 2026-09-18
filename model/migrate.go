@@ -521,6 +521,12 @@ func normalizeMetadataInt(value any) int {
 	return 0
 }
 
+// 仅用于历史消费日志 metadata 回填；改名后这两个键不再是运行时证据键。
+const (
+	legacyMetadataCacheReadKey  = "cached_read_tokens"
+	legacyMetadataCacheWriteKey = "cached_write_tokens"
+)
+
 func backfillLogCacheTokensFromMetadata(tx *gorm.DB, startTimestamp, endTimestamp int64) error {
 	var logs []Log
 	return tx.Select("id", "metadata", "cache_tokens", "cache_read_tokens", "cache_write_tokens").
@@ -529,8 +535,8 @@ func backfillLogCacheTokensFromMetadata(tx *gorm.DB, startTimestamp, endTimestam
 			for _, log := range logs {
 				metadata := log.Metadata.Data()
 				cacheTokens := extractMetadataTokenValue(metadata, config.UsageExtraCache)
-				cacheReadTokens := extractMetadataTokenValue(metadata, config.UsageExtraCachedRead)
-				cacheWriteTokens := extractMetadataTokenValue(metadata, config.UsageExtraCachedWrite)
+				cacheReadTokens := extractMetadataTokenValue(metadata, legacyMetadataCacheReadKey)
+				cacheWriteTokens := extractMetadataTokenValue(metadata, legacyMetadataCacheWriteKey)
 				if cacheTokens == log.CacheTokens && cacheReadTokens == log.CacheReadTokens && cacheWriteTokens == log.CacheWriteTokens {
 					continue
 				}
@@ -714,6 +720,7 @@ func afterAutoMigrateMigrations() []*gormigrate.Migration {
 		initUserGroup(),
 		addOldTokenMaxId(),
 		addExtraRatios(),
+		renameProviderEvidenceKeys(),
 		migrateTokenLimitsStructure(),
 		addDashboardCacheTokenMigration(),
 		migrateLegacyChannelOtherJSON(),
@@ -734,6 +741,64 @@ func retryTokenLimitsMigration() *gormigrate.Migration {
 	migration := migrateTokenLimitsStructure()
 	migration.ID = "202609090008"
 	return migration
+}
+
+// renameProviderEvidenceKeys 把历史上写入价格配置的内部证据键改写为 provider 原始字段名。
+// 运行时不再识别旧键；本迁移直接读写原始 JSON，避免依赖启动顺序和严格解码。
+func renameProviderEvidenceKeys() *gormigrate.Migration {
+	return &gormigrate.Migration{
+		ID: "202610010001",
+		Migrate: func(tx *gorm.DB) error {
+			if !tx.Migrator().HasTable("prices") {
+				return nil
+			}
+			var rows []struct {
+				Model       string
+				ExtraRatios *string
+				RateRules   *string
+			}
+			if err := tx.Table("prices").Select("model", "extra_ratios", "rate_rules").Find(&rows).Error; err != nil {
+				return err
+			}
+			for _, row := range rows {
+				updates := map[string]interface{}{}
+				if row.ExtraRatios != nil && !isJSONNull(*row.ExtraRatios) {
+					var ratios map[string]float64
+					if err := json.Unmarshal([]byte(*row.ExtraRatios), &ratios); err != nil {
+						return fmt.Errorf("price %q has invalid extra_ratios: %w", row.Model, err)
+					}
+					if normalizeLegacyExtraRatioKeys(ratios) {
+						encoded, err := json.Marshal(ratios)
+						if err != nil {
+							return err
+						}
+						updates["extra_ratios"] = datatypes.JSON(encoded)
+					}
+				}
+				if row.RateRules != nil && !isJSONNull(*row.RateRules) {
+					encoded, changed, err := normalizeLegacyRateRuleJSON([]byte(*row.RateRules))
+					if err != nil {
+						return fmt.Errorf("price %q has invalid rate_rules: %w", row.Model, err)
+					}
+					if changed {
+						updates["rate_rules"] = datatypes.JSON(encoded)
+					}
+				}
+				if len(updates) == 0 {
+					continue
+				}
+				if err := tx.Table("prices").Where("model = ?", row.Model).Updates(updates).Error; err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		Rollback: func(*gorm.DB) error { return nil },
+	}
+}
+
+func isJSONNull(raw string) bool {
+	return strings.TrimSpace(raw) == "null"
 }
 
 func dropResponsesWSSettlementIntents() *gormigrate.Migration {

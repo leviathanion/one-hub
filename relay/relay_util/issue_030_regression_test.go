@@ -34,21 +34,21 @@ func TestI030ClaudeTTLProviderToSQLUsesConfiguredFallbackOnce(t *testing.T) {
 		oneHour     int
 		wantCharge  int64
 	}{
-		{name: "通用零值", ratios: map[string]float64{config.UsageExtraCachedWrite: 0}, fiveMinutes: 2000, wantCharge: 30},
-		{name: "通用半价", ratios: map[string]float64{config.UsageExtraCachedWrite: 0.5}, fiveMinutes: 2000, wantCharge: 1030},
-		{name: "通用双倍", ratios: map[string]float64{config.UsageExtraCachedWrite: 2}, fiveMinutes: 2000, wantCharge: 4030},
+		{name: "通用零值", ratios: map[string]float64{config.UsageExtraCacheCreationInputTokens: 0}, fiveMinutes: 2000, wantCharge: 30},
+		{name: "通用半价", ratios: map[string]float64{config.UsageExtraCacheCreationInputTokens: 0.5}, fiveMinutes: 2000, wantCharge: 1030},
+		{name: "通用双倍", ratios: map[string]float64{config.UsageExtraCacheCreationInputTokens: 2}, fiveMinutes: 2000, wantCharge: 4030},
 		{name: "显式五分钟覆盖", ratios: map[string]float64{
-			config.UsageExtraCachedWrite:        0.5,
-			config.UsageExtraClaudeCacheWrite5m: 0.25,
+			config.UsageExtraCacheCreationInputTokens:        0.5,
+			config.UsageExtraEphemeral5mInputTokens: 0.25,
 		}, fiveMinutes: 2000, wantCharge: 530},
 		{name: "仅显式一小时不改变五分钟", ratios: map[string]float64{
-			config.UsageExtraCachedWrite:        0.5,
-			config.UsageExtraClaudeCacheWrite1h: 0.25,
+			config.UsageExtraCacheCreationInputTokens:        0.5,
+			config.UsageExtraEphemeral1hInputTokens: 0.25,
 		}, fiveMinutes: 2000, wantCharge: 1030},
 		{name: "五分钟与一小时混合", ratios: map[string]float64{
-			config.UsageExtraCachedWrite:        0.5,
-			config.UsageExtraClaudeCacheWrite5m: 0.25,
-			config.UsageExtraClaudeCacheWrite1h: 2,
+			config.UsageExtraCacheCreationInputTokens:        0.5,
+			config.UsageExtraEphemeral5mInputTokens: 0.25,
+			config.UsageExtraEphemeral1hInputTokens: 2,
 		}, fiveMinutes: 2000, oneHour: 1000, wantCharge: 2530},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -123,10 +123,10 @@ func TestI030ClaudeTTLProviderToSQLUsesConfiguredFallbackOnce(t *testing.T) {
 			if !usage.ProviderReported || usage.PromptTokens != 10+test.fiveMinutes+test.oneHour || usage.CompletionTokens != 20 || usage.TotalTokens != 30+test.fiveMinutes+test.oneHour {
 				t.Fatalf("Claude provider changed TTL usage evidence: %+v", usage)
 			}
-			if usage.GetExtraTokens()[config.UsageExtraClaudeCacheWrite5m] != test.fiveMinutes || usage.GetExtraTokens()[config.UsageExtraClaudeCacheWrite1h] != test.oneHour {
+			if usage.GetExtraTokens()[config.UsageExtraEphemeral5mInputTokens] != test.fiveMinutes || usage.GetExtraTokens()[config.UsageExtraEphemeral1hInputTokens] != test.oneHour {
 				t.Fatalf("Claude TTL evidence was not preserved: %+v", usage.GetExtraTokens())
 			}
-			if _, present := usage.GetExtraTokens()[config.UsageExtraCachedWrite]; present {
+			if _, present := usage.GetExtraTokens()[config.UsageExtraCacheCreationInputTokens]; present {
 				t.Fatalf("generic cache-write evidence was synthesized alongside TTL evidence: %+v", usage.GetExtraTokens())
 			}
 
@@ -277,10 +277,10 @@ func issue030SettleManagementClaude(t *testing.T, fiveMinutes, oneHour int, want
 	if !usage.ProviderReported || usage.PromptTokens != 10+fiveMinutes+oneHour || usage.CompletionTokens != 20 || usage.TotalTokens != 30+fiveMinutes+oneHour {
 		t.Fatalf("Claude provider usage changed: %+v", usage)
 	}
-	if usage.GetExtraTokens()[config.UsageExtraClaudeCacheWrite5m] != fiveMinutes || usage.GetExtraTokens()[config.UsageExtraClaudeCacheWrite1h] != oneHour {
+	if usage.GetExtraTokens()[config.UsageExtraEphemeral5mInputTokens] != fiveMinutes || usage.GetExtraTokens()[config.UsageExtraEphemeral1hInputTokens] != oneHour {
 		t.Fatalf("Claude TTL evidence changed: %+v", usage.GetExtraTokens())
 	}
-	if _, present := usage.GetExtraTokens()[config.UsageExtraCachedWrite]; present {
+	if _, present := usage.GetExtraTokens()[config.UsageExtraCacheCreationInputTokens]; present {
 		t.Fatalf("generic cache-write evidence was synthesized: %+v", usage.GetExtraTokens())
 	}
 
@@ -358,7 +358,7 @@ func TestI030ClaudeManagementHTTPToSQLPreservesFallbackDeletion(t *testing.T) {
 	pricesRoute.POST("/sync/preview", controller.PreviewPriceChange)
 	pricesRoute.POST("/sync/apply", controller.ApplyPriceChange)
 
-	genericZero := map[string]float64{config.UsageExtraCachedWrite: 0}
+	genericZero := map[string]float64{config.UsageExtraCacheCreationInputTokens: 0}
 	response := issue030ManagementRequest(t, router, http.MethodPost, "/api/prices/single", issue030PriceManagementPayload(1, genericZero))
 	issue030AssertManagementResponse(t, response, http.StatusOK, true)
 	if got := pricing.PublishedVersion(); got != 2 {
@@ -367,8 +367,8 @@ func TestI030ClaudeManagementHTTPToSQLPreservesFallbackDeletion(t *testing.T) {
 	issue030AssertStoredRatios(t, genericZero)
 
 	stale := issue030ManagementRequest(t, router, http.MethodPut, "/api/prices/single/claude-i030", issue030PriceManagementPayload(1, map[string]float64{
-		config.UsageExtraCachedWrite:        0,
-		config.UsageExtraClaudeCacheWrite5m: 0,
+		config.UsageExtraCacheCreationInputTokens:        0,
+		config.UsageExtraEphemeral5mInputTokens: 0,
 	}))
 	issue030AssertManagementResponse(t, stale, http.StatusConflict, false)
 	if got := pricing.PublishedVersion(); got != 2 {
@@ -424,8 +424,8 @@ func TestI030ClaudeManagementHTTPToSQLPreservesFallbackDeletion(t *testing.T) {
 	issue030AssertStoredRatios(t, genericZero)
 
 	explicitTTLZero := map[string]float64{
-		config.UsageExtraCachedWrite:        0,
-		config.UsageExtraClaudeCacheWrite5m: 0,
+		config.UsageExtraCacheCreationInputTokens:        0,
+		config.UsageExtraEphemeral5mInputTokens: 0,
 	}
 	response = issue030ManagementRequest(t, router, http.MethodPut, "/api/prices/single/claude-i030", issue030PriceManagementPayload(3, explicitTTLZero))
 	issue030AssertManagementResponse(t, response, http.StatusOK, true)

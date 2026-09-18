@@ -120,7 +120,7 @@ lastUpdated: true
         "input": 2,
         "output": 1.5,
         "extra_multipliers": {
-          "cached_read_tokens": 1
+          "cache_read_input_tokens": 1
         }
       }
     }
@@ -221,12 +221,12 @@ all（显式存在时）
 | `all=0.5` | 0.5 | 0.5 | 0.5 |
 | `all=0.5, input=0.8` | 0.8 | 0.5 | 0.8 |
 | `all=0.5, output=0.8` | 0.5 | 0.8 | 0.5 |
-| `all=0.5, cached_read_tokens=1` | 0.5 | 0.5 | 1 |
-| `all=0, cached_read_tokens=1` | 0 | 0 | 1 |
+| `all=0.5, cache_read_input_tokens=1` | 0.5 | 0.5 | 1 |
+| `all=0, cache_read_input_tokens=1` | 0 | 0 | 1 |
 
 对计量项 `k`，`M(k)` 是所有命中组分别解析出的倍率之积。缓存的基础价仍来自既有 `input × extra_ratios[key]` 及现行价格读取回退规则，再乘 `M(k)`。独立项覆盖只影响当前规则，不会撤销其他组的倍率。
 
-例如基础输入 $3／百万 token、缓存倍率 0.1，长上下文规则 `input=2, cached_read_tokens=1`：普通输入为 $6，缓存读取仍为 $0.3。再命中夜间 `all=0.5` 后，两者为 $3 和 $0.15。
+例如基础输入 $3／百万 token、缓存倍率 0.1，长上下文规则 `input=2, cache_read_input_tokens=1`：普通输入为 $6，缓存读取仍为 $0.3。再命中夜间 `all=0.5` 后，两者为 $3 和 $0.15。
 
 计算层应直接构建每项有效价格，不能依靠“独立倍率除以输入倍率”实现覆盖，否则 `all=0` 或 `input=0` 会产生除零或错误免费。也不能将 `all` 乘到含独立工具费用的整笔总额。避免逐规则中间舍入；最终金额沿用既有组件换算边界，明确的全零有效价格必须允许零费用。
 

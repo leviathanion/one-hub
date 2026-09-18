@@ -35,6 +35,29 @@ type RerankResponse struct {
 	Results []RerankResult `json:"results"`
 }
 
+// rerankWireUsage 是 Jina 风格 rerank 响应的 usage 形状。
+type rerankWireUsage struct {
+	TotalTokens int `json:"total_tokens"`
+}
+
+func projectRerankWireUsage(usage *Usage) *rerankWireUsage {
+	if usage == nil {
+		return nil
+	}
+	return &rerankWireUsage{TotalTokens: usage.TotalTokens}
+}
+
+func (r RerankResponse) MarshalJSON() ([]byte, error) {
+	type responseAlias RerankResponse
+	return json.Marshal(struct {
+		responseAlias
+		Usage *rerankWireUsage `json:"usage"`
+	}{
+		responseAlias: responseAlias(r),
+		Usage:         projectRerankWireUsage(r.Usage),
+	})
+}
+
 type RerankResult struct {
 	Index          int                  `json:"index"`
 	Document       RerankResultDocument `json:"document,omitempty"`

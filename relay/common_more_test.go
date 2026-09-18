@@ -578,10 +578,8 @@ func TestResponseJSONClientProjectsOnlyPublicResponsesCacheFields(t *testing.T) 
 		Usage: &types.ResponsesUsage{
 			InputTokens: 18,
 			InputTokensDetails: &types.ResponsesUsageInputTokensDetails{
-				CachedTokens:      2,
-				CachedReadTokens:  3,
-				CacheWriteTokens:  5,
-				CachedWriteTokens: 7,
+				CachedTokens:     2,
+				CacheWriteTokens: 5,
 			},
 		},
 	}
@@ -595,12 +593,12 @@ func TestResponseJSONClientProjectsOnlyPublicResponsesCacheFields(t *testing.T) 
 			t.Fatalf("public cache field %s missing from typed Responses wire: %s", publicField, body)
 		}
 	}
-	for _, privateField := range []string{"cached_read_tokens", "cached_write_tokens"} {
+	for _, privateField := range []string{"cache_creation_input_tokens", "cache_read_input_tokens", "cached_tokens_internal"} {
 		if strings.Contains(body, privateField) {
 			t.Fatalf("provider cache evidence %q leaked from typed Responses wire: %s", privateField, body)
 		}
 	}
-	if response.Usage.InputTokensDetails.CachedReadTokens != 3 || response.Usage.InputTokensDetails.CachedWriteTokens != 7 {
+	if response.Usage.InputTokensDetails.CachedTokens != 2 || response.Usage.InputTokensDetails.CacheWriteTokens != 5 {
 		t.Fatalf("typed delivery mutated internal evidence: %+v", response.Usage.InputTokensDetails)
 	}
 }

@@ -112,12 +112,12 @@ lastUpdated: true
 {
   "all": 0.5,
   "extra_multipliers": {
-    "cached_read_tokens": 1
+    "cache_read_input_tokens": 1
   }
 }
 ```
 
-`cached_read_tokens` 是现有缓存读取 key；其他协议可能使用不同 key，应在配置项列表中选择对应项，不自行猜测字段别名。
+`cache_read_input_tokens` 是 Claude 缓存读取 key；OpenAI 缓存命中用 `cached_tokens`，两者独立。其他协议可能使用不同 key，应在配置项列表中选择对应项，不自行猜测字段别名。
 
 ### 长上下文涨价，但缓存不涨价
 
@@ -154,7 +154,7 @@ lastUpdated: true
         "multipliers": {
           "all": 0.5,
           "extra_multipliers": {
-            "cached_read_tokens": 1
+            "cache_read_input_tokens": 1
           }
         }
       }

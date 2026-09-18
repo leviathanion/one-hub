@@ -91,7 +91,7 @@ func openAIResponsesRawRequestForTest(t *testing.T, raw, model string, stream bo
 func TestOpenAIResponsesCreateUsesRawEnvelopeBody(t *testing.T) {
 	var bodyBytes []byte
 	var requestHeaders http.Header
-	providerResponseBody := []byte(`{"id":"resp_1","object":"response","model":"mapped-model","status":"completed","output":[{"type":"future_output","quality":{"future":true}}],"usage":{"input_tokens":18,"output_tokens":1,"total_tokens":19,"input_tokens_details":{"cached_tokens":2,"cached_read_tokens":3,"cache_write_tokens":5,"cached_write_tokens":7,"future_cache_tokens":11}},"future_response_field":{"enabled":true}}`)
+	providerResponseBody := []byte(`{"id":"resp_1","object":"response","model":"mapped-model","status":"completed","output":[{"type":"future_output","quality":{"future":true}}],"usage":{"input_tokens":18,"output_tokens":1,"total_tokens":19,"input_tokens_details":{"cached_tokens":2,"cache_write_tokens":5,"future_cache_tokens":11}},"future_response_field":{"enabled":true}}`)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestHeaders = r.Header.Clone()
 		var err error
@@ -143,8 +143,8 @@ func TestOpenAIResponsesCreateUsesRawEnvelopeBody(t *testing.T) {
 		t.Fatalf("expected native Responses adapter to opt in to exact provider response replay, got %s", got)
 	}
 	extraTokens := provider.Usage.GetExtraTokens()
-	if extraTokens[config.UsageExtraCache] != 2 || extraTokens[config.UsageExtraCachedRead] != 3 || extraTokens[config.UsageExtraCacheWrite] != 5 || extraTokens[config.UsageExtraCachedWrite] != 7 {
-		t.Fatalf("exact-wire observation lost distinct provider cache evidence: %+v", extraTokens)
+	if extraTokens[config.UsageExtraCache] != 2 || extraTokens[config.UsageExtraCacheWrite] != 5 {
+		t.Fatalf("exact-wire observation lost official provider cache evidence: %+v", extraTokens)
 	}
 
 	body := make(map[string]json.RawMessage)

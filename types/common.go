@@ -112,8 +112,6 @@ func markUsageDetailPresence(presence map[string]bool, raw json.RawMessage, prom
 			"image_tokens":           config.UsageExtraInputImageTokens,
 			"cached_tokens_internal": "cached_tokens_internal",
 			"cache_write_tokens":     config.UsageExtraCacheWrite,
-			"cached_write_tokens":    config.UsageExtraCachedWrite,
-			"cached_read_tokens":     config.UsageExtraCachedRead,
 		}
 	}
 	for field, key := range mapping {
@@ -235,8 +233,8 @@ func (u *Usage) HasProviderBaseUsage() bool {
 		u.PromptTokensDetails.ImageTokens,
 		u.PromptTokensDetails.CachedTokensInternal,
 		u.PromptTokensDetails.CacheWriteTokens,
-		u.PromptTokensDetails.CachedWriteTokens,
-		u.PromptTokensDetails.CachedReadTokens,
+		u.PromptTokensDetails.CacheCreationInputTokens,
+		u.PromptTokensDetails.CacheReadInputTokens,
 		u.CompletionTokensDetails.AudioTokens,
 		u.CompletionTokensDetails.TextTokens,
 		u.CompletionTokensDetails.ReasoningTokens,
@@ -562,11 +560,11 @@ func fillExtraTokensFromDetails(extraTokens map[string]int, input PromptTokensDe
 	// ExtraTokens with the delta first. Detail fields are treated as snapshots
 	// and only fill missing keys; this preserves explicit adapter values.
 	fillMissingPositiveExtraToken(extraTokens, config.UsageExtraCache, input.CachedTokens)
-	fillMissingPositiveExtraToken(extraTokens, config.UsageExtraCachedRead, input.CachedReadTokens)
+	fillMissingPositiveExtraToken(extraTokens, config.UsageExtraCacheReadInputTokens, input.CacheReadInputTokens)
 	fillMissingPositiveExtraToken(extraTokens, config.UsageExtraCacheWrite, input.CacheWriteTokens)
 	fillMissingPositiveExtraToken(extraTokens, config.UsageExtraInputAudio, input.AudioTokens)
 	fillMissingPositiveExtraToken(extraTokens, config.UsageExtraInputTextTokens, input.TextTokens)
-	fillMissingPositiveExtraToken(extraTokens, config.UsageExtraCachedWrite, input.CachedWriteTokens)
+	fillMissingPositiveExtraToken(extraTokens, config.UsageExtraCacheCreationInputTokens, input.CacheCreationInputTokens)
 	fillMissingPositiveExtraToken(extraTokens, config.UsageExtraInputImageTokens, input.ImageTokens)
 	fillMissingPositiveExtraToken(extraTokens, config.UsageExtraOutputImageTokens, output.ImageTokens)
 	fillMissingPositiveExtraToken(extraTokens, config.UsageExtraOutputAudio, output.AudioTokens)
@@ -663,9 +661,12 @@ type PromptTokensDetails struct {
 	ImageTokens          int `json:"image_tokens,omitempty"`
 	CachedTokensInternal int `json:"cached_tokens_internal,omitempty"`
 
-	CacheWriteTokens  int `json:"cache_write_tokens,omitempty"`
-	CachedWriteTokens int `json:"cached_write_tokens,omitempty"`
-	CachedReadTokens  int `json:"cached_read_tokens,omitempty"`
+	// CacheWriteTokens 是 OpenAI 方言的缓存写入。
+	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
+	// CacheCreationInputTokens 是 Claude cache_creation_input_tokens 总额；
+	// CacheReadInputTokens 是 Claude cache_read_input_tokens。两者都是内部计费证据。
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens,omitempty"`
 }
 
 type CompletionTokensDetails struct {
@@ -688,8 +689,8 @@ func (i *PromptTokensDetails) Merge(other *PromptTokensDetails) {
 	i.ImageTokens += other.ImageTokens
 	i.CachedTokensInternal += other.CachedTokensInternal
 	i.CacheWriteTokens += other.CacheWriteTokens
-	i.CachedWriteTokens += other.CachedWriteTokens
-	i.CachedReadTokens += other.CachedReadTokens
+	i.CacheCreationInputTokens += other.CacheCreationInputTokens
+	i.CacheReadInputTokens += other.CacheReadInputTokens
 }
 
 func (o *CompletionTokensDetails) Merge(other *CompletionTokensDetails) {

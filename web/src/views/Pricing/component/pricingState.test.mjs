@@ -19,11 +19,11 @@ test('价格策略分组键不受对象键顺序影响', () => {
   assert.equal(stablePricingJson({ b: 2, a: { y: 2, x: 1 } }), stablePricingJson({ a: { x: 1, y: 2 }, b: 2 }));
 });
 
-test('cache_write_tokens 与 cached_write_tokens 是两个独立的扩展倍率配置', () => {
+test('cache_write_tokens 与 cache_creation_input_tokens 是两个独立的扩展倍率配置', () => {
   const keys = extraRatiosConfig.map(({ key }) => key);
 
   assert.ok(keys.includes('cache_write_tokens'));
-  assert.ok(keys.includes('cached_write_tokens'));
+  assert.ok(keys.includes('cache_creation_input_tokens'));
   assert.equal(new Set(keys).size, keys.length);
   assert.equal(
     extraRatiosConfig.some(({ name }) => name !== undefined),

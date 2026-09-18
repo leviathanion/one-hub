@@ -62,9 +62,9 @@ lastUpdated: true
 {
   "extra_ratios": {
     "cached_tokens": 0.1,
-    "cached_read_tokens": 0.1,
+    "cache_read_input_tokens": 0.1,
     "cache_write_tokens": 1.25,
-    "cached_write_tokens": 1.25
+    "cache_creation_input_tokens": 1.25
   },
   "rate_rules": {
     "version": 2,

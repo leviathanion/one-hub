@@ -284,9 +284,7 @@ func mergeResponsesWSResponsesUsage(usage *types.Usage, responseUsage *types.Res
 	if responseUsage.InputTokensDetails != nil {
 		overwritePositiveInt(&usage.PromptTokensDetails.AudioTokens, responseUsage.InputTokensDetails.AudioTokens)
 		overwritePositiveInt(&usage.PromptTokensDetails.CachedTokens, responseUsage.InputTokensDetails.CachedTokens)
-		overwritePositiveInt(&usage.PromptTokensDetails.CachedReadTokens, responseUsage.InputTokensDetails.CachedReadTokens)
 		overwritePositiveInt(&usage.PromptTokensDetails.CacheWriteTokens, responseUsage.InputTokensDetails.CacheWriteTokens)
-		overwritePositiveInt(&usage.PromptTokensDetails.CachedWriteTokens, responseUsage.InputTokensDetails.CachedWriteTokens)
 		overwritePositiveInt(&usage.PromptTokensDetails.TextTokens, responseUsage.InputTokensDetails.TextTokens)
 		overwritePositiveInt(&usage.PromptTokensDetails.ImageTokens, responseUsage.InputTokensDetails.ImageTokens)
 	}

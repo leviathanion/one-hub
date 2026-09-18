@@ -28,17 +28,27 @@ func TestUsageSummaryPreservesNonIntegralUsageUnits(t *testing.T) {
 	}
 }
 
-func TestUsageSummaryPreservesDistinctProviderCacheEvidence(t *testing.T) {
+func TestUsageSummaryPreservesOpenAICacheEvidence(t *testing.T) {
 	usage := &types.Usage{PromptTokensDetails: types.PromptTokensDetails{
-		CachedTokens:      2,
-		CachedReadTokens:  3,
-		CacheWriteTokens:  5,
-		CachedWriteTokens: 7,
+		CachedTokens:     2,
+		CacheWriteTokens: 5,
 	}}
 	restored := NewUsageSummary(usage).ToUsage()
 	extraTokens := restored.GetExtraTokens()
-	if extraTokens[config.UsageExtraCache] != 2 || extraTokens[config.UsageExtraCachedRead] != 3 || extraTokens[config.UsageExtraCacheWrite] != 5 || extraTokens[config.UsageExtraCachedWrite] != 7 {
-		t.Fatalf("settlement summary merged or lost provider cache evidence: %+v", extraTokens)
+	if extraTokens[config.UsageExtraCache] != 2 || extraTokens[config.UsageExtraCacheWrite] != 5 {
+		t.Fatalf("settlement summary merged or lost OpenAI cache evidence: %+v", extraTokens)
+	}
+}
+
+func TestUsageSummaryPreservesClaudeCacheEvidence(t *testing.T) {
+	usage := &types.Usage{PromptTokensDetails: types.PromptTokensDetails{
+		CacheReadInputTokens:     3,
+		CacheCreationInputTokens: 7,
+	}}
+	restored := NewUsageSummary(usage).ToUsage()
+	extraTokens := restored.GetExtraTokens()
+	if extraTokens[config.UsageExtraCacheReadInputTokens] != 3 || extraTokens[config.UsageExtraCacheCreationInputTokens] != 7 {
+		t.Fatalf("settlement summary merged or lost Claude cache evidence: %+v", extraTokens)
 	}
 }
 
@@ -194,9 +204,7 @@ func TestApplySettlementProjectionUsesFinalQuota(t *testing.T) {
 				CachedTokens: 3,
 			},
 			ExtraTokens: map[string]int{
-				config.UsageExtraCachedRead:  4,
-				config.UsageExtraCacheWrite:  2,
-				config.UsageExtraCachedWrite: 5,
+				config.UsageExtraCacheWrite: 2,
 			},
 		},
 	}
@@ -238,10 +246,61 @@ func TestApplySettlementProjectionUsesFinalQuota(t *testing.T) {
 	if log.Quota != 250 || log.PromptTokens != 10 || log.CompletionTokens != 20 {
 		t.Fatalf("expected consume log to record final quota and usage, got %+v", log)
 	}
-	if log.CacheTokens != 3 || log.CacheReadTokens != 4 || log.CacheWriteTokens != 7 {
-		t.Fatalf("expected consume log to persist cache token breakdown, got %+v", log)
+	if log.CacheTokens != 3 || log.CacheReadTokens != 0 || log.CacheWriteTokens != 2 {
+		t.Fatalf("expected consume log to persist OpenAI cache token breakdown, got %+v", log)
 	}
 	if log.Metadata.Data()["user_agent"] != "Codex/1.2" {
 		t.Fatalf("expected consume log to persist metadata user-agent, got %#v", log.Metadata.Data())
+	}
+}
+
+func TestApplySettlementProjectsClaudeCacheBreakdown(t *testing.T) {
+	useSettlementTestDB(t)
+	insertSettlementFixtures(t)
+
+	originalBatch := config.BatchUpdateEnabled
+	originalLogConsume := config.LogConsumeEnabled
+	config.BatchUpdateEnabled = false
+	config.LogConsumeEnabled = true
+	t.Cleanup(func() {
+		config.BatchUpdateEnabled = originalBatch
+		config.LogConsumeEnabled = originalLogConsume
+	})
+	reserve, err := model.ApplyBillingReserve(context.Background(), 1, 1, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := SettlementCommand{
+		RequestKind:            SettlementRequestKindUnary,
+		UserID:                 1,
+		TokenID:                1,
+		ChannelID:              1,
+		ModelName:              "claude-test",
+		PreConsumedQuota:       100,
+		PreconsumeTokenApplied: reserve.TokenQuotaApplied,
+		FinalQuota:             250,
+		UsageSummary: UsageSummary{
+			PromptTokens:     10,
+			CompletionTokens: 20,
+			TotalTokens:      30,
+			PromptTokensDetails: types.PromptTokensDetails{
+				CacheReadInputTokens: 4,
+			},
+			ExtraTokens: map[string]int{
+				config.UsageExtraCacheCreationInputTokens: 7,
+			},
+		},
+	}
+	if _, err := ApplySettlement(context.Background(), cmd, &SettlementOptions{}); err != nil {
+		t.Fatalf("expected settlement to succeed, got %v", err)
+	}
+
+	var log model.Log
+	if err := model.DB.Where("user_id = ?", 1).First(&log).Error; err != nil {
+		t.Fatalf("expected consume log lookup to succeed, got %v", err)
+	}
+	if log.CacheTokens != 0 || log.CacheReadTokens != 4 || log.CacheWriteTokens != 7 {
+		t.Fatalf("expected consume log to persist Claude cache token breakdown, got %+v", log)
 	}
 }

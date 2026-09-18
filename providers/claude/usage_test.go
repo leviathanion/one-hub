@@ -45,7 +45,7 @@ func TestClaudeUsageMergeCachePartitionAndToolSnapshots(t *testing.T) {
 	}
 	ClaudeUsageMerge(usage, decodeClaudeUsage(t, `{"cache_creation_input_tokens":3,"cache_creation":{"ephemeral_5m_input_tokens":0},"server_tool_use":{"web_search_requests":0}}`))
 	ClaudeUsageToOpenaiUsage(usage, converted)
-	if !converted.HasProviderUsage() || converted.PromptTokens != 17 || converted.GetExtraTokens()[config.UsageExtraClaudeCacheWrite5m] != 0 || converted.GetExtraTokens()[config.UsageExtraClaudeCacheWrite1h] != 3 || converted.ExtraBilling[types.APIToolTypeWebSearch].CallCount != 0 {
+	if !converted.HasProviderUsage() || converted.PromptTokens != 17 || converted.GetExtraTokens()[config.UsageExtraEphemeral5mInputTokens] != 0 || converted.GetExtraTokens()[config.UsageExtraEphemeral1hInputTokens] != 3 || converted.ExtraBilling[types.APIToolTypeWebSearch].CallCount != 0 {
 		t.Fatalf("嵌套字段省略或明确 0 处理错误：%+v", converted)
 	}
 	ClaudeUsageMerge(usage, decodeClaudeUsage(t, `{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_1h_input_tokens":0}}`))

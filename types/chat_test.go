@@ -74,7 +74,36 @@ func TestChatReasoningDistinguishesMissingMaxTokens(t *testing.T) {
 	}
 }
 
-func TestChatCompletionWireUsageOmitsInternalCacheDetails(t *testing.T) {
+func chatCompletionWireValues(usage *Usage) []any {
+	return []any{
+		ChatCompletionResponse{
+			ID: "chatcmpl_1", Object: "chat.completion", Choices: []ChatCompletionChoice{}, Usage: usage,
+		},
+		ChatCompletionStreamResponse{
+			ID: "chatcmpl_1", Object: "chat.completion.chunk", Choices: []ChatCompletionStreamChoice{}, Usage: usage,
+		},
+		ChatCompletionStreamChoice{Index: 0, Usage: usage},
+	}
+}
+
+func chatCompletionWireUsage(t *testing.T, value any) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal Chat wire value: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("decode Chat wire value: %v", err)
+	}
+	wireUsage, ok := payload["usage"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected usage object, got %s", raw)
+	}
+	return wireUsage
+}
+
+func TestChatCompletionWireUsageKeepsOpenAICacheFields(t *testing.T) {
 	usage := &Usage{
 		PromptTokens:     11,
 		CompletionTokens: 7,
@@ -86,66 +115,75 @@ func TestChatCompletionWireUsageOmitsInternalCacheDetails(t *testing.T) {
 			ImageTokens:          4,
 			CachedTokensInternal: 5,
 			CacheWriteTokens:     6,
-			CachedWriteTokens:    7,
-			CachedReadTokens:     8,
+		},
+		CompletionTokensDetails: CompletionTokensDetails{
+			AudioTokens:              1,
+			TextTokens:               2,
+			ReasoningTokens:          3,
+			AcceptedPredictionTokens: 4,
+			RejectedPredictionTokens: 5,
+			ImageTokens:              99,
 		},
 	}
+	for _, value := range chatCompletionWireValues(usage) {
+		wireUsage := chatCompletionWireUsage(t, value)
+		promptDetails, ok := wireUsage["prompt_tokens_details"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected prompt token details, got %#v", wireUsage)
+		}
+		for _, field := range []string{"audio_tokens", "cached_tokens", "text_tokens", "image_tokens", "cache_write_tokens"} {
+			if _, ok := promptDetails[field]; !ok {
+				t.Fatalf("expected Chat wire field %q, got %#v", field, promptDetails)
+			}
+		}
+		if _, ok := promptDetails["cached_tokens_internal"]; ok {
+			t.Fatalf("internal field escaped onto Chat wire: %#v", promptDetails)
+		}
+		completionDetails, ok := wireUsage["completion_tokens_details"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected completion token details, got %#v", wireUsage)
+		}
+		for _, field := range []string{"audio_tokens", "text_tokens", "reasoning_tokens", "accepted_prediction_tokens", "rejected_prediction_tokens"} {
+			if _, ok := completionDetails[field]; !ok {
+				t.Fatalf("expected official completion detail %q, got %#v", field, completionDetails)
+			}
+		}
+		if _, ok := completionDetails["image_tokens"]; ok {
+			t.Fatalf("non-official completion detail image_tokens leaked: %#v", completionDetails)
+		}
+	}
+	if usage.PromptTokensDetails.CacheWriteTokens != 6 || usage.PromptTokensDetails.CachedTokensInternal != 5 {
+		t.Fatalf("wire projection mutated OpenAI usage: %+v", usage.PromptTokensDetails)
+	}
+	if usage.CompletionTokensDetails.ImageTokens != 99 {
+		t.Fatalf("wire projection mutated completion details: %+v", usage.CompletionTokensDetails)
+	}
+}
 
-	tests := []struct {
-		name  string
-		value any
-	}{
-		{
-			name: "response",
-			value: ChatCompletionResponse{
-				ID: "chatcmpl_1", Object: "chat.completion", Choices: []ChatCompletionChoice{}, Usage: usage,
-			},
-		},
-		{
-			name: "stream response",
-			value: ChatCompletionStreamResponse{
-				ID: "chatcmpl_1", Object: "chat.completion.chunk", Choices: []ChatCompletionStreamChoice{}, Usage: usage,
-			},
-		},
-		{
-			name:  "stream choice",
-			value: ChatCompletionStreamChoice{Index: 0, Usage: usage},
+func TestChatCompletionWireUsageOmitsClaudeCacheEvidence(t *testing.T) {
+	usage := &Usage{
+		PromptTokens:     11,
+		CompletionTokens: 7,
+		TotalTokens:      18,
+		PromptTokensDetails: PromptTokensDetails{
+			CacheCreationInputTokens: 7,
+			CacheReadInputTokens:     8,
 		},
 	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			raw, err := json.Marshal(test.value)
-			if err != nil {
-				t.Fatalf("marshal Chat wire value: %v", err)
+	for _, value := range chatCompletionWireValues(usage) {
+		wireUsage := chatCompletionWireUsage(t, value)
+		promptDetails, ok := wireUsage["prompt_tokens_details"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected prompt token details, got %#v", wireUsage)
+		}
+		for _, field := range []string{"cached_tokens_internal", "cache_creation_input_tokens", "cache_read_input_tokens"} {
+			if _, ok := promptDetails[field]; ok {
+				t.Fatalf("internal field %q escaped onto Chat wire: %#v", field, promptDetails)
 			}
-			var payload map[string]any
-			if err := json.Unmarshal(raw, &payload); err != nil {
-				t.Fatalf("decode Chat wire value: %v", err)
-			}
-			wireUsage, ok := payload["usage"].(map[string]any)
-			if !ok {
-				t.Fatalf("expected usage object, got %s", raw)
-			}
-			details, ok := wireUsage["prompt_tokens_details"].(map[string]any)
-			if !ok {
-				t.Fatalf("expected prompt token details, got %s", raw)
-			}
-			for _, field := range []string{"audio_tokens", "cached_tokens", "text_tokens", "image_tokens", "cache_write_tokens"} {
-				if _, ok := details[field]; !ok {
-					t.Fatalf("expected Chat wire field %q, got %s", field, raw)
-				}
-			}
-			for _, field := range []string{"cached_tokens_internal", "cached_write_tokens", "cached_read_tokens"} {
-				if _, ok := details[field]; ok {
-					t.Fatalf("internal field %q escaped onto Chat wire: %s", field, raw)
-				}
-			}
-		})
+		}
 	}
-
-	if usage.PromptTokensDetails.CachedReadTokens != 8 || usage.PromptTokensDetails.CachedWriteTokens != 7 {
-		t.Fatalf("wire projection mutated internal usage: %+v", usage.PromptTokensDetails)
+	if usage.PromptTokensDetails.CacheCreationInputTokens != 7 || usage.PromptTokensDetails.CacheReadInputTokens != 8 {
+		t.Fatalf("wire projection mutated Claude usage: %+v", usage.PromptTokensDetails)
 	}
 }
 

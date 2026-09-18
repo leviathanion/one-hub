@@ -11,7 +11,7 @@ import (
 
 func TestRuleCalendarPriorityAndMeterOverrides(t *testing.T) {
 	var rules PriceRateRules
-	require.NoError(t, json.Unmarshal([]byte(`{"version":2,"speed":[{"id":"fast","when":{"speed":["fast"]},"multipliers":{"all":2}}],"schedule":{"rules":[{"id":"weekend-night","when":{"weekdays":[6,7],"time":{"start":"23:00","end":"07:00"}},"multipliers":{"all":0.4,"extra_multipliers":{"cached_read_tokens":1}}},{"id":"night","when":{"time":{"start":"23:00","end":"07:00"}},"multipliers":{"all":0.5}},{"id":"weekend","when":{"weekdays":[6,7]},"multipliers":{"all":0.8}}],"timezone":"Asia/Shanghai"}}`), &rules))
+	require.NoError(t, json.Unmarshal([]byte(`{"version":2,"speed":[{"id":"fast","when":{"speed":["fast"]},"multipliers":{"all":2}}],"schedule":{"rules":[{"id":"weekend-night","when":{"weekdays":[6,7],"time":{"start":"23:00","end":"07:00"}},"multipliers":{"all":0.4,"extra_multipliers":{"cache_read_input_tokens":1}}},{"id":"night","when":{"time":{"start":"23:00","end":"07:00"}},"multipliers":{"all":0.5}},{"id":"weekend","when":{"weekdays":[6,7]},"multipliers":{"all":0.8}}],"timezone":"Asia/Shanghai"}}`), &rules))
 	for _, tc := range []struct {
 		at           string
 		input, cache float64
@@ -27,7 +27,7 @@ func TestRuleCalendarPriorityAndMeterOverrides(t *testing.T) {
 			got := rules.Evaluate(PriceRuleFacts{Speed: "fast", StartedAt: at})
 			require.False(t, got.Missing)
 			assert.Equal(t, tc.input, got.Input)
-			assert.Equal(t, tc.cache, got.Extra["cached_read_tokens"])
+			assert.Equal(t, tc.cache, got.Extra["cache_read_input_tokens"])
 			require.Len(t, got.Matches, 2)
 			assert.Equal(t, tc.id, got.Matches[1].ID)
 		})
@@ -68,12 +68,12 @@ func TestRuleLengthBoundaryAndSpeedAreSeparate(t *testing.T) {
 
 func TestRuleSchemaPreservesZeroAndRejectsUnsafeConfiguration(t *testing.T) {
 	var rules PriceRateRules
-	require.NoError(t, json.Unmarshal([]byte(`{"version":2,"schedule":{"rules":[{"id":"free","when":{},"multipliers":{"all":0,"extra_multipliers":{"cached_read_tokens":1}}}]}}`), &rules))
+	require.NoError(t, json.Unmarshal([]byte(`{"version":2,"schedule":{"rules":[{"id":"free","when":{},"multipliers":{"all":0,"extra_multipliers":{"cache_read_input_tokens":1}}}]}}`), &rules))
 	cloned := ClonePriceRateRules(rules)
 	*cloned.Schedule.Rules[0].Multipliers.All = 0.5
 	got := rules.Evaluate(PriceRuleFacts{})
 	assert.Zero(t, got.Input)
-	assert.Equal(t, 1.0, got.Extra["cached_read_tokens"])
+	assert.Equal(t, 1.0, got.Extra["cache_read_input_tokens"])
 	for _, raw := range []string{
 		`{"flex":{"input":0.5,"output":0.5}}`,
 		`{"version":2,"speed":[{"id":"x","when":{},"multipliers":{"all":null}}]}`,

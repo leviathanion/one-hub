@@ -494,8 +494,8 @@ func TestBackfillLogCacheTokensFromMetadataRebuildsStatistics(t *testing.T) {
 			Quota:            123,
 			RequestTime:      456,
 			Metadata: datatypes.NewJSONType(map[string]any{
-				config.UsageExtraCachedRead:  12,
-				config.UsageExtraCachedWrite: 5,
+				"cached_read_tokens":  12,
+				"cached_write_tokens": 5,
 			}),
 		},
 		{
@@ -510,7 +510,7 @@ func TestBackfillLogCacheTokensFromMetadataRebuildsStatistics(t *testing.T) {
 			RequestTime:      100,
 			Metadata: datatypes.NewJSONType(map[string]any{
 				"extra_tokens": map[string]any{
-					config.UsageExtraCachedWrite: "3",
+					"cached_write_tokens": "3",
 				},
 			}),
 		},
@@ -654,7 +654,7 @@ func TestAfterAutoMigrateMigrationsRunOnlyOnce(t *testing.T) {
 		Quota:            123,
 		RequestTime:      456,
 		Metadata: datatypes.NewJSONType(map[string]any{
-			config.UsageExtraCachedRead: 9,
+			"cached_read_tokens": 9,
 		}),
 	}
 	if err := DB.Create(log).Error; err != nil {

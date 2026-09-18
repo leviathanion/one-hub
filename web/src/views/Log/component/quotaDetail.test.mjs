@@ -88,6 +88,23 @@ test('Token calculations use logged fractional units instead of dropping cache f
   assert.equal(calculateQuotaDetail(log).computedActualQuota, 100);
 });
 
+test('缓存证据明细只渲染新键', () => {
+  const newKeys = calculateTokenBreakdown({
+    prompt_tokens: 10,
+    completion_tokens: 0,
+    metadata: {
+      cache_creation_input_tokens: 4,
+      cache_creation_input_tokens_ratio: 2,
+      cache_read_input_tokens: 3,
+      cache_read_input_tokens_ratio: 0.1
+    }
+  });
+  assert.deepEqual(
+    newKeys.tokenDetails.map(({ key }) => key),
+    ['cache_creation_input_tokens', 'cache_read_input_tokens']
+  );
+});
+
 test('Missing or conflicting token evidence is not shown as a token charge in tool-only logs', () => {
   const log = recordedLog();
   Object.assign(log.metadata.token_billing, { status: 'conflicting_evidence', rules: [], input_units: 0, output_units: 0, charge: 0 });
@@ -189,8 +206,8 @@ test('DeepSeek 与 Claude 缓存用量沿用同一分解，不忽略缓存折扣
     completion_tokens: 0,
     metadata: {
       input_ratio: 1,
-      claude_cache_write_1h_tokens: 5,
-      claude_cache_write_1h_tokens_ratio: 2
+      ephemeral_1h_input_tokens: 5,
+      ephemeral_1h_input_tokens_ratio: 2
     }
   });
   assert.equal(claude[0].amount, 15);

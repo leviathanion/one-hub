@@ -495,12 +495,13 @@ type ChatCompletionResponse struct {
 // chatCompletionUsage is the Chat Completions wire projection of Usage.
 // Usage also carries provider-specific accounting details that must remain
 // available internally but are not part of the downstream Chat contract.
+// 字段以官方 CompletionUsage schema 为准（prompt/completion/legacy completions 共用）。
 type chatCompletionUsage struct {
-	PromptTokens            int                               `json:"prompt_tokens"`
-	CompletionTokens        int                               `json:"completion_tokens"`
-	TotalTokens             int                               `json:"total_tokens"`
-	PromptTokensDetails     chatCompletionPromptTokensDetails `json:"prompt_tokens_details"`
-	CompletionTokensDetails CompletionTokensDetails           `json:"completion_tokens_details"`
+	PromptTokens            int                                   `json:"prompt_tokens"`
+	CompletionTokens        int                                   `json:"completion_tokens"`
+	TotalTokens             int                                   `json:"total_tokens"`
+	PromptTokensDetails     chatCompletionPromptTokensDetails     `json:"prompt_tokens_details"`
+	CompletionTokensDetails chatCompletionCompletionTokensDetails `json:"completion_tokens_details"`
 }
 
 type chatCompletionPromptTokensDetails struct {
@@ -509,6 +510,16 @@ type chatCompletionPromptTokensDetails struct {
 	TextTokens       int `json:"text_tokens,omitempty"`
 	ImageTokens      int `json:"image_tokens,omitempty"`
 	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
+}
+
+// chatCompletionCompletionTokensDetails 不包含内部的 image_tokens：官方
+// CompletionTokensDetails 只有以下五个字段。
+type chatCompletionCompletionTokensDetails struct {
+	AudioTokens              int `json:"audio_tokens,omitempty"`
+	TextTokens               int `json:"text_tokens,omitempty"`
+	ReasoningTokens          int `json:"reasoning_tokens"`
+	AcceptedPredictionTokens int `json:"accepted_prediction_tokens"`
+	RejectedPredictionTokens int `json:"rejected_prediction_tokens"`
 }
 
 func projectChatCompletionUsage(usage *Usage) *chatCompletionUsage {
@@ -526,7 +537,13 @@ func projectChatCompletionUsage(usage *Usage) *chatCompletionUsage {
 			ImageTokens:      usage.PromptTokensDetails.ImageTokens,
 			CacheWriteTokens: usage.PromptTokensDetails.CacheWriteTokens,
 		},
-		CompletionTokensDetails: usage.CompletionTokensDetails,
+		CompletionTokensDetails: chatCompletionCompletionTokensDetails{
+			AudioTokens:              usage.CompletionTokensDetails.AudioTokens,
+			TextTokens:               usage.CompletionTokensDetails.TextTokens,
+			ReasoningTokens:          usage.CompletionTokensDetails.ReasoningTokens,
+			AcceptedPredictionTokens: usage.CompletionTokensDetails.AcceptedPredictionTokens,
+			RejectedPredictionTokens: usage.CompletionTokensDetails.RejectedPredictionTokens,
+		},
 	}
 }
 

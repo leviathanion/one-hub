@@ -20,11 +20,11 @@ test('optional batch policy remains omitted when no rule was selected', () => {
 test('配置数值规范化但不写入继承字段，显式零保留', () => {
   const draft = {
     version: 2,
-    schedule: { rules: [{ id: 'night', when: {}, multipliers: { all: '0.5', extra_multipliers: { cached_read_tokens: '0' } } }] }
+    schedule: { rules: [{ id: 'night', when: {}, multipliers: { all: '0.5', extra_multipliers: { cache_read_input_tokens: '0' } } }] }
   };
   const result = rateRulesPayload(draft, true);
   assert.equal(result.schedule.rules[0].multipliers.all, 0.5);
-  assert.equal(result.schedule.rules[0].multipliers.extra_multipliers.cached_read_tokens, 0);
+  assert.equal(result.schedule.rules[0].multipliers.extra_multipliers.cache_read_input_tokens, 0);
   assert.equal(Object.hasOwn(result.schedule.rules[0].multipliers, 'input'), false);
   assert.equal(draft.schedule.rules[0].multipliers.all, '0.5');
 });

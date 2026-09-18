@@ -217,9 +217,8 @@ func TestOpenAIRealtimeTurnStateHelpersAndUsageSnapshots(t *testing.T) {
 		OutputTokens: 6,
 		TotalTokens:  11,
 		InputTokenDetails: types.PromptTokensDetails{
-			TextTokens:        4,
-			CacheWriteTokens:  3,
-			CachedWriteTokens: 2,
+			TextTokens:       4,
+			CacheWriteTokens: 3,
 		},
 		OutputTokenDetails: types.CompletionTokensDetails{
 			TextTokens:      5,
@@ -233,7 +232,7 @@ func TestOpenAIRealtimeTurnStateHelpersAndUsageSnapshots(t *testing.T) {
 	}
 
 	merged := mergeOpenAIRealtimeUsageSnapshot(base, update)
-	if merged == nil || merged.TotalTokens != 11 || merged.InputTokenDetails.CacheWriteTokens != 3 || merged.InputTokenDetails.CachedWriteTokens != 2 || merged.OutputTokenDetails.ReasoningTokens != 2 {
+	if merged == nil || merged.TotalTokens != 11 || merged.InputTokenDetails.CacheWriteTokens != 3 || merged.OutputTokenDetails.ReasoningTokens != 2 {
 		t.Fatalf("expected merge to keep max usage fields, got %+v", merged)
 	}
 	if got := merged.ExtraTokens["cached"]; got != 4 {
@@ -322,7 +321,7 @@ func TestOpenAIRealtimeTurnStateHelpersAndUsageSnapshots(t *testing.T) {
 	if deltaOpenAIRealtimeUsageFloat(3.5, 5.5) != 0 || deltaOpenAIRealtimeUsageFloat(8.5, 5.5) != 3 {
 		t.Fatal("expected float delta helper to clamp negative durations")
 	}
-	if !openAIRealtimePromptTokenDetailsHasValue(types.PromptTokensDetails{CachedReadTokens: 1}) {
+	if !openAIRealtimePromptTokenDetailsHasValue(types.PromptTokensDetails{CacheReadInputTokens: 1}) {
 		t.Fatal("expected prompt token details value detection")
 	}
 	if openAIRealtimePromptTokenDetailsHasValue(types.PromptTokensDetails{}) {

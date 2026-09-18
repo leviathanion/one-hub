@@ -145,16 +145,16 @@ func ClaudeUsageToOpenaiUsage(cUsage *Usage, usage *types.Usage) bool {
 
 	// 每次从合并后的快照重建 token 投影，避免旧缓存分区和缺证据标记残留。
 	tokens := &types.Usage{}
-	tokens.PromptTokensDetails.CachedReadTokens = cUsage.CacheReadInputTokens
+	tokens.PromptTokensDetails.CacheReadInputTokens = cUsage.CacheReadInputTokens
 	partition := cUsage.CacheCreation
 	if cUsage.CacheCreationInputTokens != 0 || (partition != nil && (partition.Ephemeral5mInputTokens != 0 || partition.Ephemeral1hInputTokens != 0)) {
 		if !cUsage.cacheCreationTokensPresent || partition == nil || !partition.ephemeral5mPresent || !partition.ephemeral1hPresent || partition.Ephemeral5mInputTokens+partition.Ephemeral1hInputTokens != cUsage.CacheCreationInputTokens {
-			tokens.PromptTokensDetails.CachedWriteTokens = cUsage.CacheCreationInputTokens
+			tokens.PromptTokensDetails.CacheCreationInputTokens = cUsage.CacheCreationInputTokens
 			tokens.RequireTokenExtraEvidence("claude_cache_creation_partition")
 		} else {
-			tokens.SetExtraTokens(config.UsageExtraClaudeCacheWrite5m, partition.Ephemeral5mInputTokens)
-			tokens.SetExtraTokens(config.UsageExtraClaudeCacheWrite1h, partition.Ephemeral1hInputTokens)
-			tokens.RequireTokenExtraEvidence(config.UsageExtraClaudeCacheWrite5m, config.UsageExtraClaudeCacheWrite1h)
+			tokens.SetExtraTokens(config.UsageExtraEphemeral5mInputTokens, partition.Ephemeral5mInputTokens)
+			tokens.SetExtraTokens(config.UsageExtraEphemeral1hInputTokens, partition.Ephemeral1hInputTokens)
+			tokens.RequireTokenExtraEvidence(config.UsageExtraEphemeral5mInputTokens, config.UsageExtraEphemeral1hInputTokens)
 		}
 	}
 	tokens.PromptTokens = cUsage.InputTokens + cUsage.CacheCreationInputTokens + cUsage.CacheReadInputTokens

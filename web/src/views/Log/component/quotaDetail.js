@@ -34,15 +34,15 @@ const EXTRA_TOKEN_FIELDS = [
     bucket: 'input'
   },
   {
-    key: 'cached_write_tokens',
+    key: 'cache_creation_input_tokens',
     label: 'logPage.cachedWriteTokens',
-    ratioKey: 'cached_write_tokens_ratio',
+    ratioKey: 'cache_creation_input_tokens_ratio',
     bucket: 'input'
   },
   {
-    key: 'cached_read_tokens',
+    key: 'cache_read_input_tokens',
     label: 'logPage.cachedReadTokens',
-    ratioKey: 'cached_read_tokens_ratio',
+    ratioKey: 'cache_read_input_tokens_ratio',
     bucket: 'input'
   },
   {
@@ -65,8 +65,8 @@ const EXTRA_TOKEN_FIELDS = [
   },
   ...[
     ['cache_write_tokens', 'input'],
-    ['claude_cache_write_5m_tokens', 'input'],
-    ['claude_cache_write_1h_tokens', 'input'],
+    ['ephemeral_5m_input_tokens', 'input'],
+    ['ephemeral_1h_input_tokens', 'input'],
     ['tool_use_prompt_tokens', 'input'],
     ['input_video_tokens', 'input'],
     ['output_video_tokens', 'output'],

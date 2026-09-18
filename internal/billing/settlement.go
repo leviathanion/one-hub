@@ -163,13 +163,13 @@ func runSettlementProjection(ctx context.Context, cmd SettlementCommand, opts Se
 	usage := cmd.UsageSummary.ToUsage()
 	extraTokens := usage.GetExtraTokens()
 	cacheTokens := extraTokens[config.UsageExtraCache]
-	cacheReadTokens := extraTokens[config.UsageExtraCachedRead]
+	cacheReadTokens := extraTokens[config.UsageExtraCacheReadInputTokens]
 	// Pricing keeps provider evidence keys distinct, while the consume-log schema
 	// exposes a single cache-write total. Project both evidence fields into it.
 	cacheWriteTokens := extraTokens[config.UsageExtraCacheWrite] +
-		extraTokens[config.UsageExtraCachedWrite] +
-		extraTokens[config.UsageExtraClaudeCacheWrite5m] +
-		extraTokens[config.UsageExtraClaudeCacheWrite1h]
+		extraTokens[config.UsageExtraCacheCreationInputTokens] +
+		extraTokens[config.UsageExtraEphemeral5mInputTokens] +
+		extraTokens[config.UsageExtraEphemeral1hInputTokens]
 
 	model.RecordConsumeLog(
 		ctx,

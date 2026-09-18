@@ -8,19 +8,19 @@ const extraRatiosConfig = [
     isPrompt: true
   },
   {
-    key: 'cached_write_tokens',
+    key: 'cache_creation_input_tokens',
     isPrompt: true
   },
   {
-    key: 'claude_cache_write_5m_tokens',
+    key: 'ephemeral_5m_input_tokens',
     isPrompt: true
   },
   {
-    key: 'claude_cache_write_1h_tokens',
+    key: 'ephemeral_1h_input_tokens',
     isPrompt: true
   },
   {
-    key: 'cached_read_tokens',
+    key: 'cache_read_input_tokens',
     isPrompt: true
   },
   {

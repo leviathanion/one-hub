@@ -136,8 +136,8 @@ func TestIssue005ClaudeCachePartitionSentinelDoesNotUseDifferentPriceRatios(t *t
 		"cache_creation":{"ephemeral_5m_input_tokens":4}
 	}`)
 	pricing := issue005Price(t, "claude-model", 1, 1, map[string]float64{
-		config.UsageExtraClaudeCacheWrite5m: 4,
-		config.UsageExtraClaudeCacheWrite1h: 2,
+		config.UsageExtraEphemeral5mInputTokens: 4,
+		config.UsageExtraEphemeral1hInputTokens: 2,
 	})
 	quota := issue005Quota(t, pricing, "claude-model")
 	decision := quota.EvaluateProviderUsage(usage)

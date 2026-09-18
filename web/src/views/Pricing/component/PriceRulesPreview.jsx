@@ -13,9 +13,9 @@ export default function PriceRulesPreview({ price }) {
   const [counts, setCounts] = useState({
     prompt_tokens: 1000,
     completion_tokens: 100,
-    cached_read_tokens: 0,
-    claude_cache_write_5m_tokens: 0,
-    claude_cache_write_1h_tokens: 0
+    cache_read_input_tokens: 0,
+    ephemeral_5m_input_tokens: 0,
+    ephemeral_1h_input_tokens: 0
   });
   const [extra, setExtra] = useState('');
   const [result, setResult] = useState(null);

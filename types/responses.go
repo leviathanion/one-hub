@@ -1496,13 +1496,11 @@ type ResponsesUsageOutputTokensDetails struct {
 }
 
 type ResponsesUsageInputTokensDetails struct {
-	AudioTokens       int `json:"audio_tokens,omitempty"`
-	CachedTokens      int `json:"cached_tokens"`
-	CachedReadTokens  int `json:"cached_read_tokens,omitempty"`
-	CacheWriteTokens  int `json:"cache_write_tokens,omitempty"`
-	CachedWriteTokens int `json:"cached_write_tokens,omitempty"`
-	TextTokens        int `json:"text_tokens,omitempty"`
-	ImageTokens       int `json:"image_tokens,omitempty"`
+	AudioTokens      int `json:"audio_tokens,omitempty"`
+	CachedTokens     int `json:"cached_tokens"`
+	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
+	TextTokens       int `json:"text_tokens,omitempty"`
+	ImageTokens      int `json:"image_tokens,omitempty"`
 }
 
 // MarshalJSON keeps provider-specific cache evidence internal while preserving
@@ -1792,9 +1790,7 @@ func (u *ResponsesUsage) ToOpenAIUsage() *Usage {
 	if u.InputTokensDetails != nil {
 		usage.PromptTokensDetails.AudioTokens = u.InputTokensDetails.AudioTokens
 		usage.PromptTokensDetails.CachedTokens = u.InputTokensDetails.CachedTokens
-		usage.PromptTokensDetails.CachedReadTokens = u.InputTokensDetails.CachedReadTokens
 		usage.PromptTokensDetails.CacheWriteTokens = u.InputTokensDetails.CacheWriteTokens
-		usage.PromptTokensDetails.CachedWriteTokens = u.InputTokensDetails.CachedWriteTokens
 		usage.PromptTokensDetails.TextTokens = u.InputTokensDetails.TextTokens
 		usage.PromptTokensDetails.ImageTokens = u.InputTokensDetails.ImageTokens
 	}
@@ -1824,13 +1820,11 @@ func (u *Usage) ToResponsesUsage() *ResponsesUsage {
 	}
 
 	responsesUsage.InputTokensDetails = &ResponsesUsageInputTokensDetails{
-		AudioTokens:       u.PromptTokensDetails.AudioTokens,
-		CachedTokens:      u.PromptTokensDetails.CachedTokens,
-		CachedReadTokens:  u.PromptTokensDetails.CachedReadTokens,
-		CacheWriteTokens:  u.PromptTokensDetails.CacheWriteTokens,
-		CachedWriteTokens: u.PromptTokensDetails.CachedWriteTokens,
-		TextTokens:        u.PromptTokensDetails.TextTokens,
-		ImageTokens:       u.PromptTokensDetails.ImageTokens,
+		AudioTokens:      u.PromptTokensDetails.AudioTokens,
+		CachedTokens:     u.PromptTokensDetails.CachedTokens,
+		CacheWriteTokens: u.PromptTokensDetails.CacheWriteTokens,
+		TextTokens:       u.PromptTokensDetails.TextTokens,
+		ImageTokens:      u.PromptTokensDetails.ImageTokens,
 	}
 
 	return responsesUsage
