@@ -1,7 +1,11 @@
-# Ship an enforced supported GPT-5.6 surface
+---
+status: accepted
+---
 
-> Operation support and channel configuration in this decision are superseded by ADR 0023. Operation support is now model-independent and derived from adapters; model names only participate in ordinary channel model selection and model mapping.
+# 交付强制执行的受支持 GPT-5.6 表面
 
-The first production release guarantees a deliberately bounded Supported Contract Surface rather than partially exposing the entire GPT-5.6 API. Production `/v1` routes remain an Enforced Relay Surface and use Legacy Quota Settlement rather than observe-only accounting, while capabilities that do not yet have complete routing and lifecycle semantics fail closed before provider work begins. This trades immediate breadth for a smaller explicit contract without making half-open resource passthrough part of the public product.
+> 本文中的 operation support 和 channel configuration 由 ADR-0023 取代。operation support 现在与模型无关并从 adapter 派生；模型名只参与普通渠道模型选择和模型映射。
 
-The initial Responses surface includes create, Native Responses WebSocket, Stored Response retrieve/delete/input-items, `/responses/compact`, and `/responses/input_tokens` as explicit operations with their own capability and representability gates. Existing resource operations that require an administrator to pin an exact channel remain available only as Administrator-Pinned Resource Relay; they are not promoted into the ordinary-user contract and do not imply proxy-managed ownership.
+首个生产版本保证的是刻意有界的 Supported Contract Surface，而不是部分暴露整个 GPT-5.6 API。生产 `/v1` 路由仍是 Enforced Relay Surface，并使用 Legacy Quota Settlement 而不是 observe-only accounting；尚无完整路由和生命周期语义的能力在 provider work 开始前 fail closed。这以即时广度换取更小的显式契约，同时不把半开放资源透传变成公共产品的一部分。
+
+初始 Responses 表面包含 create、Native Responses WebSocket、Stored Response retrieve/delete/input-items、`/responses/compact` 和 `/responses/input_tokens` 作为显式 operation，各自有自己的 capability 和 representability gate。要求管理员 pin 精确 channel 的既有资源 operation 只作为 Administrator-Pinned Resource Relay 提供；它们不晋升为普通用户契约，也不意味着代理管理所有权。

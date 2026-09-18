@@ -2,12 +2,12 @@
 status: superseded by ADR-0030
 ---
 
-# Preserve legacy best-effort quota settlement
+# 保留 legacy best-effort 配额结算
 
-ADR-0030 supersedes this decision: it retains the small pre-consumption amount model but removes local-estimate charging and Redis settlement authority.
+ADR-0030 取代本决策：它保留小额预扣金额模型，但移除本地估算收费和 Redis 结算权威。
 
-GPT-5.6 production requests keep the established quota flow: admission uses the existing small pre-consumption and high-balance fast path, relay errors refund that pre-consumption, and successful responses adjust the balance from reported or locally estimated usage. Unary settlement does not gain a durable identity or outbox. This preserves existing billing behavior and avoids a new financial ledger, while explicitly accepting that ambiguous provider execution, concurrent high-balance requests, process failure, or a failed final adjustment can undercharge or leave only the initial pre-consumption; these audit findings are accepted deviations rather than completed fixes.
+GPT-5.6 生产请求沿用既有配额流程：准入使用既有小额预扣和高余额快路径，relay 错误退回预扣，成功响应按上报或本地估算的 usage 调整余额。Unary settlement 不获得持久 identity 或 outbox。这保留既有计费行为并避免新财务账本，同时明确接受歧义 provider 执行、并发高余额请求、进程失败或最终调整失败可能少收费或只留下初始预扣；这些审计发现是被接受的偏差，而不是已完成的修复。
 
-Redis deduplication uses explicit `pending` and `committed` states with the same 24-hour idempotency window. Only `committed` is a successful duplicate; `pending` is an in-progress or indeterminate truth attempt and every replay must fail loud until it expires. A SQL failure proved before commit releases its pending gate with owner-checked CAS under a fresh bounded context. Once commit has been attempted, an error or process crash keeps the gate pending and the system deliberately abandons recovery rather than risk charging twice. When Redis is enabled, gate acquisition failures fail closed; deployments that explicitly disable Redis retain the legacy single-process best-effort behavior. This at-most-once policy may undercharge at the crash boundary and does not add a SQL receipt, settlement table, migration, cleanup job, or dual-store consistency protocol.
+Redis 去重使用显式 `pending` 和 `committed` 状态，带同样的 24 小时幂等窗口。只有 `committed` 是成功重复；`pending` 是进行中或不确定的 truth attempt，每次重放都必须 fail loud 直到过期。commit 前已证明的 SQL 失败在全新的有界上下文中通过 owner-checked CAS 释放 pending gate。一旦尝试 commit，错误或进程崩溃会让 gate 保持 pending，系统故意放弃恢复而不是冒双重收费风险。Redis 启用时 gate 获取失败 fail closed；显式禁用 Redis 的部署保留 legacy 单进程 best-effort 行为。该 at-most-once 策略可能在崩溃边界少收费，且不新增 SQL receipt、settlement 表、迁移、清理任务或双存储一致性协议。
 
-ADR-0025 adds a narrow exception for Responses WebSocket turns that lose their transport before a lifecycle terminal. That unresolved intent preserves evidence while leaving pre-consumption as truth; it is not a final settlement, outbox, or general ledger.
+ADR-0025 为在生命周期 terminal 之前失去 transport 的 Responses WebSocket turn 增加一个窄例外。该 unresolved intent 保留证据，同时让预扣保持为 truth；它不是最终结算、outbox 或通用账本。

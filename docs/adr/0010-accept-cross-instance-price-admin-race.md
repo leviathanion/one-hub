@@ -1,7 +1,11 @@
-# Accept the bounded cross-instance price administration race
+---
+status: accepted
+---
 
-Price administration uses a process-local mutex, database transactions, and a unique `prices(model)` index. It does not use a distributed lock. Concurrent bulk price writes from different instances can therefore observe stale rows and end with a last-writer result or a constraint error; administrators refresh and retry. This does not introduce persistent Price Groups or inheritance.
+# 接受有界的跨实例价格管理竞态
 
-This is accepted because price writes are a low-frequency control-plane operation, while a distributed lock would add availability dependencies and require lease fencing to be correct. If concurrent administration becomes common, the next mechanism is an explicit persisted revision/CAS contract with conflict reporting, not an unfenced lock.
+价格管理使用进程本地 mutex、数据库事务和唯一 `prices(model)` 索引。它不使用分布式锁。因此来自不同实例的并发批量价格写入可能观察到陈旧行，并以最后写入者结果或约束错误结束；管理员刷新并重试。这不会引入持久 Price Group 或继承。
 
-Legacy databases can already contain duplicate model rows from a release that did not enforce the index. Upgrade preserves those rows and starts the rest of the service, while the duplicated exact model is unavailable to runtime billing. Index creation is retried as an independent invariant check on every start rather than relying on a one-shot migration ID; after an administrator removes the ambiguous rows, the next start installs the constraint.
+这被接受，因为价格写入是低频控制面操作，而分布式锁会增加可用性依赖并要求正确的 lease fencing。如果并发管理变得常见，下一个机制是显式持久化 revision/CAS 契约并报告冲突，而不是无 fencing 的锁。
+
+legacy 数据库可能已包含来自未强制索引版本的重复 model 行。升级保留这些行并启动其余服务，而重复的 exact model 在运行时计费中不可用。索引创建作为独立不变量检查在每次启动时重试，而不是依赖一次性迁移 ID；管理员移除歧义行后，下一次启动安装约束。

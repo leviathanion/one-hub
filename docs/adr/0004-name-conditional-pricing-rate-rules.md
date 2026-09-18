@@ -1,5 +1,9 @@
-# Name conditional pricing Rate Rules
+---
+status: superseded by ADR-0018
+---
 
-> Superseded by ADR-0018. `RateRules` remains an acceptable name for the narrow typed fields, but there is no legacy-modifiers compatibility schema.
+# 把条件定价对象命名为 Rate Rules
 
-The conditional tier and long-context pricing object is named `RateRules` in Go and `rate_rules` in canonical JSON because it defines how effective rates are selected rather than applying generic modifiers. Existing database columns may remain physical compatibility details, and legacy `modifiers` JSON is accepted only as a deprecated alias derived from the same state; conflicting canonical and legacy inputs are rejected. This avoids a destructive data migration while preventing two independently mutable representations.
+> `RateRules` 仍是窄类型字段可接受的名称，但不再有 legacy-modifiers 兼容 schema。
+
+条件档位与长上下文定价对象在 Go 中命名为 `RateRules`、在 canonical JSON 中命名为 `rate_rules`，因为它定义有效费率如何被选择，而不是应用通用 modifier。既有数据库列可以保留为物理兼容细节，legacy `modifiers` JSON 只作为同一状态派生出的 deprecated alias 被接受；canonical 与 legacy 输入冲突时拒绝。这避免破坏性数据迁移，同时防止出现两份可独立修改的表示。
