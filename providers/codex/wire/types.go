@@ -51,6 +51,7 @@ type ChannelPolicy struct {
 	FedRAMP                bool
 	Residency              string
 	DefaultOriginator      string
+	DefaultUserAgent       string
 	TrustClientAttestation bool
 	AutoGenerate           AutoGeneratePolicy
 }
@@ -93,7 +94,8 @@ type HeaderPlan struct {
 }
 
 func (p HeaderPlan) HTTPHeader() http.Header {
-	headers := make(http.Header, len(p.Entries))
+	headers := make(http.Header, len(p.Entries)+1)
+	headers.Set("User-Agent", "") // 阻止 net/http 给缺失的 UA 自动补值。
 	for _, entry := range p.Entries {
 		if entry.Name == "" {
 			continue
@@ -104,7 +106,7 @@ func (p HeaderPlan) HTTPHeader() http.Header {
 }
 
 func (p HeaderPlan) Map() map[string]string {
-	headers := make(map[string]string, len(p.Entries))
+	headers := map[string]string{"User-Agent": ""}
 	for _, entry := range p.Entries {
 		if entry.Name == "" {
 			continue

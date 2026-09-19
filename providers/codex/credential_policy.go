@@ -19,61 +19,50 @@ type codexOfficialPolicyConfig struct {
 	FedRAMP                bool
 	Residency              string
 	DefaultOriginator      string
+	DefaultUserAgent       string
 	TrustClientAttestation bool
 	AutoGenerate           wire.AutoGeneratePolicy
 }
 
 func (p *CodexProvider) codexOfficialChannelPolicy() (wire.ChannelPolicy, error) {
-	policy := defaultCodexOfficialChannelPolicy()
-	if p == nil {
-		return policy, nil
-	}
 	channel := p.codexChannel()
-	cacheKey := codexOfficialPolicyCacheKey(channel)
-	p.officialPolicyMu.Lock()
-	if p.officialPolicyLoaded && p.officialPolicyKey == cacheKey {
-		policy, err := p.officialPolicy, p.officialPolicyErr
-		p.officialPolicyMu.Unlock()
-		return policy, err
+	if channel != nil && !codexModelHeadersEmpty(channel.ModelHeaders) {
+		return wire.ChannelPolicy{}, fmt.Errorf("model_headers is not supported for Codex channels; clear it and use other.codex structured policy")
 	}
-	p.officialPolicyMu.Unlock()
+	return p.codexChannelPolicyFor(channel)
+}
 
-	policy, err := parseCodexOfficialChannelPolicy(channel)
-	p.officialPolicyMu.Lock()
-	p.officialPolicyLoaded = true
-	p.officialPolicyKey = cacheKey
-	p.officialPolicy = policy
-	p.officialPolicyErr = err
-	p.officialPolicyMu.Unlock()
+// 缓存只拥有 other.codex 的解析结果；Responses 专属约束在调用边界检查，
+// 避免 realtime/usage 共用缓存时意外继承 model_headers 禁用规则。
+func (p *CodexProvider) codexChannelPolicyFor(channel *model.Channel) (wire.ChannelPolicy, error) {
+	if p == nil {
+		return wire.ChannelPolicy{}, nil
+	}
+	cacheKey := codexChannelPolicyCacheKey(channel)
+	p.channelPolicyMu.Lock()
+	defer p.channelPolicyMu.Unlock()
+	if p.channelPolicyLoaded && p.channelPolicyKey == cacheKey {
+		return p.channelPolicy, p.channelPolicyErr
+	}
+	policy, err := parseCodexChannelPolicy(channel)
+	p.channelPolicyLoaded = true
+	p.channelPolicyKey = cacheKey
+	p.channelPolicy = policy
+	p.channelPolicyErr = err
 	return policy, err
 }
 
-func defaultCodexOfficialChannelPolicy() wire.ChannelPolicy {
-	return wire.ChannelPolicy{
-		DefaultOriginator: "codex_cli_rs",
-	}
-}
-
-func codexOfficialPolicyCacheKey(channel *model.Channel) string {
+func codexChannelPolicyCacheKey(channel *model.Channel) string {
 	if channel == nil {
 		return "<nil>"
 	}
-	modelHeaders := ""
-	if channel.ModelHeaders != nil {
-		modelHeaders = *channel.ModelHeaders
-	}
-	return fmt.Sprintf("%d|%s|%s", channel.Id, channel.Other, modelHeaders)
+	return fmt.Sprintf("%d|%s", channel.Id, channel.Other)
 }
 
-func parseCodexOfficialChannelPolicy(channel *model.Channel) (wire.ChannelPolicy, error) {
-	policy := wire.ChannelPolicy{
-		DefaultOriginator: "codex_cli_rs",
-	}
+func parseCodexChannelPolicy(channel *model.Channel) (wire.ChannelPolicy, error) {
+	policy := wire.ChannelPolicy{}
 	if channel == nil {
 		return policy, nil
-	}
-	if !codexModelHeadersEmpty(channel.ModelHeaders) {
-		return policy, fmt.Errorf("model_headers is not supported for Codex channels; clear it and use other.codex structured policy")
 	}
 	if strings.TrimSpace(channel.Other) == "" {
 		return policy, nil
@@ -96,14 +85,15 @@ func parseCodexOfficialChannelPolicy(channel *model.Channel) (wire.ChannelPolicy
 	if policy.Residency != "" && !codexpolicy.ValidResidency(policy.Residency) {
 		return policy, fmt.Errorf("other.codex.residency is invalid")
 	}
-	defaultOriginator := strings.TrimSpace(cfg.DefaultOriginator)
-	if defaultOriginator != "" {
-		if err := wire.ValidateOriginator(defaultOriginator); err != nil {
-			return policy, fmt.Errorf("other.codex.default_originator is invalid: %w", err)
-		}
-		policy.DefaultOriginator = defaultOriginator
+	if !codexpolicy.ValidClientIdentityHeader(cfg.DefaultOriginator) {
+		return policy, fmt.Errorf("other.codex.default_originator is invalid")
 	}
+	policy.DefaultOriginator = strings.TrimSpace(cfg.DefaultOriginator)
 	policy.TrustClientAttestation = cfg.TrustClientAttestation
+	policy.DefaultUserAgent = strings.TrimSpace(cfg.DefaultUserAgent)
+	if !codexpolicy.ValidClientIdentityHeader(cfg.DefaultUserAgent) {
+		return policy, fmt.Errorf("other.codex.default_user_agent is invalid")
+	}
 	policy.AutoGenerate = cfg.AutoGenerate
 	return policy, nil
 }
@@ -135,6 +125,10 @@ func parseCodexOfficialPolicyConfig(raw json.RawMessage) (codexOfficialPolicyCon
 			}
 		case codexpolicy.KeyDefaultOriginator:
 			if err := json.Unmarshal(value, &cfg.DefaultOriginator); err != nil {
+				return cfg, fmt.Errorf("other.codex.%s must be a string: %w", key, err)
+			}
+		case codexpolicy.KeyDefaultUserAgent:
+			if err := json.Unmarshal(value, &cfg.DefaultUserAgent); err != nil {
 				return cfg, fmt.Errorf("other.codex.%s must be a string: %w", key, err)
 			}
 		case codexpolicy.KeyTrustClientAttestation:

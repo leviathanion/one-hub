@@ -119,7 +119,8 @@ func TestValidateCodexChannelOtherAcceptsDocumentedFields(t *testing.T) {
 			"codex":{
 				"fedramp":true,
 				"residency":"us",
-				"default_originator":"codex_cli_rs",
+				"default_originator":"Codex Desktop",
+				"default_user_agent":"custom/1.0",
 				"trust_client_attestation":false,
 				"auto_generate":{
 					"session_id":true,
@@ -164,8 +165,18 @@ func TestValidateCodexChannelOtherRejectsUnknownOfficialPolicyKeys(t *testing.T)
 		},
 		{
 			name:     "codex policy invalid default originator",
-			other:    `{"codex":{"default_originator":"bad value"}}`,
+			other:    `{"codex":{"default_originator":"bad\r\nvalue"}}`,
 			contains: "other.codex.default_originator",
+		},
+		{
+			name:     "codex policy unsafe default user agent",
+			other:    `{"codex":{"default_user_agent":"pi\r\nInjected: value"}}`,
+			contains: "other.codex.default_user_agent",
+		},
+		{
+			name:     "codex policy non string default user agent",
+			other:    `{"codex":{"default_user_agent":42}}`,
+			contains: "other.codex.default_user_agent",
 		},
 		{
 			name:     "codex auto generate not object",

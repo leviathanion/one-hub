@@ -573,21 +573,17 @@ func validateCodexOfficialPolicyField(fieldName string, raw json.RawMessage) err
 			if err := validateCodexOfficialAutoGenerateField(nestedField, value); err != nil {
 				return err
 			}
-		case codexpolicy.KeyResidency, codexpolicy.KeyDefaultOriginator:
+		case codexpolicy.KeyResidency, codexpolicy.KeyDefaultOriginator, codexpolicy.KeyDefaultUserAgent:
 			var text string
 			if err := json.Unmarshal(value, &text); err != nil {
 				return fmt.Errorf("%s must be a string: %w", nestedField, err)
 			}
+			if key != codexpolicy.KeyResidency && !codexpolicy.ValidClientIdentityHeader(text) {
+				return fmt.Errorf("%s is invalid", nestedField)
+			}
 			text = strings.TrimSpace(text)
-			switch key {
-			case codexpolicy.KeyResidency:
-				if text != "" && !codexpolicy.ValidResidency(text) {
-					return fmt.Errorf("%s is invalid", nestedField)
-				}
-			case codexpolicy.KeyDefaultOriginator:
-				if text != "" && normalizeCodexOriginatorValidation(text) == "" {
-					return fmt.Errorf("%s is invalid", nestedField)
-				}
+			if key == codexpolicy.KeyResidency && text != "" && !codexpolicy.ValidResidency(text) {
+				return fmt.Errorf("%s is invalid", nestedField)
 			}
 		}
 	}
@@ -646,19 +642,4 @@ func validateCodexPositiveIntField(fieldName string, raw json.RawMessage) error 
 		return fmt.Errorf("%s must be greater than 0", fieldName)
 	}
 	return nil
-}
-
-func normalizeCodexOriginatorValidation(value string) string {
-	value = strings.TrimSpace(value)
-	if len(value) == 0 || len(value) > 64 {
-		return ""
-	}
-	for i := 0; i < len(value); i++ {
-		c := value[i]
-		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-' {
-			continue
-		}
-		return ""
-	}
-	return value
 }

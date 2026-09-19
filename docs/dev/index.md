@@ -76,6 +76,7 @@ lastUpdated: true
 | [ResponsesWS Native Transport 边界](./responses-ws-transport-boundary.md) | Native WS send result、provider adapter、evidence 边界 | ResponsesWS 只有 native upstream，没有 HTTP bridge |
 | [Codex / PI OAuth 请求 Header 画像对照](./codex-pi-header-parity.md) | Codex / PI 自身 OAuth header 画像、one-hub 中转差异 | 用于后续 Codex provider header parity 修复和回归测试设计 |
 | [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md) | Codex provider raw envelope、official header/body planner、ResponsesWS native upstream | 当前实现；raw envelope 与 official planner 是唯一协议边界，不设 legacy/typed/bridge 运行时兼容态 |
+| [Codex 渠道的 UA 与 originator](./codex-client-identity.md) | Codex 客户端识别、身份头透传与 PI 兜底 | 当前实现；各请求入口共用解析规则，配置只作兜底，已识别客户端缺失项不补 |
 | [Codex Credential Refresh Fence 架构设计](./codex-credential-refresh-fence-architecture.md) | Codex rotating OAuth credential、DB durable fence、revision、fail-closed recovery | 当前实现；用数据库 attempt fence 取代 process-local pending/ambiguous authority 与 Redis correctness lock |
 | [wsconn 唯一传输边界架构方案](./wsconn-architecture.md) | `common/wsconn` 作为唯一 WebSocket 传输边界 | 当前实现；业务层不再持有 `*websocket.Conn` |
 | [one-hub Async Task 架构设计](./task-coordination-architecture.md) | async task、identity、fetch、sweeper、finalize | 当前异步任务架构说明 |
@@ -101,6 +102,7 @@ lastUpdated: true
 | [ResponsesWS Native Transport 边界](./responses-ws-transport-boundary.md) | 当前实现 | native send result、provider adapter 与 evidence contract；无 HTTP/SSE bridge |
 | [Codex / PI OAuth 请求 Header 画像对照](./codex-pi-header-parity.md) | 当前诊断 | 记录 Codex / PI 本体 HTTP/WS header 画像，以及 one-hub 当前中转后的缺失、额外和逻辑不一致字段 |
 | [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md) | 当前实现 | Codex provider 以 raw envelope contract 和 official planner 作为唯一协议边界；删除 legacy header、typed upstream contract、WS bridge fallback 和 model_headers override |
+| [Codex 渠道的 UA 与 originator](./codex-client-identity.md) | 当前实现 | 支持复合 UA 和客户端后缀识别；非 Codex 请求逐字段使用渠道配置或 PI 默认值 |
 | [Codex Credential Refresh Fence 架构设计](./codex-credential-refresh-fence-architecture.md) | 当前实现 | OAuth 前 DB Claim，成功后 ticket-scoped Commit；ambiguous/orphan 无 TTL fail closed，管理员以新 credential 显式恢复 |
 | [wsconn 唯一传输边界架构方案](./wsconn-architecture.md) | 当前实现 | `common/wsconn` 是唯一 WebSocket 传输边界；业务层不再 import gorilla，CloseInfo first-write-wins，PongMiss/Idle 语义拆分 |
 | [one-hub Async Task 架构设计](./task-coordination-architecture.md) | 当前实现 | `tasks` 行持久拥有 reserve、submission、provider identity 与一次 Cancel/Confirm |

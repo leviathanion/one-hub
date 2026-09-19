@@ -38,12 +38,12 @@ raw envelope + control + policy in, official plan out
 1. **一个 dialect**：Codex provider 只实现 Codex Official Upstream，不实现 legacy one-hub Codex dialect。
 2. **一个 HTTP Responses contract**：provider-facing Responses contract 是 `RawEnvelope + Control + Policy`，不再接收 `*types.OpenAIResponsesRequest` 作为请求真相。
 3. **一个 ResponsesWS open contract**：Codex WS upstream open 必须拿到 inbound headers 和 first `response.create` raw frame；不允许把 handshake identity 延迟到 send path。
-4. **一个 header planner**：所有 Codex upstream header 只能由 `providers/codex/wire` 生成；旧 allowlist 和 mutable header bag 不在 Codex path 中出现。
+4. **一个 Responses header planner**：Responses HTTP、compact、Chat 适配后的 Responses 和 ResponsesWS 的 header 由 `providers/codex/wire` 生成。realtime 与用量操作仍有各自的 header 构造入口，但 UA／originator 统一调用 `wire.ResolveClientIdentity`，不保留独立的身份推断规则。
 5. **一个 body planner**：HTTP body 以 raw JSON object 为序列化真相；typed projection 只读，不作为 upstream marshal 源。唯一例外是 chat-to-responses 适配边界的一次性合成（见「Chat-to-Responses 适配边界」）：chat ingress 没有 raw Responses body 可保，适配器在 planner 之前合成 raw envelope，合成之后走与 Responses ingress 完全相同的 raw path。
 6. **一个 control plane**：下游响应形态是本地控制事实，不进入 upstream JSON。Chat-to-Responses streaming conversion 用 `Control.DownstreamDialect` 表达，不使用 body magic field。
 7. **一个 policy plane**：channel affinity / prompt-cache 这类代理策略是 policy 事实；policy 可以产生明示 body patch，但 provider 不在 planner 之后做隐藏生成或二次猜测。
 8. **一个身份解析器**：`session-id`、`thread-id`、`x-client-request-id`、`x-codex-window-id` 等身份字段只在 `IdentityResolver` 中解析。
-9. **一个错误口径**：空 optional identity field 按缺失处理；只有 `User-Agent`、`originator` 和显式 `auto_generate` 字段可以 fallback；非空非法 field 直接 `400 invalid_request_error`；多值 singleton header 直接 `400 invalid_request_error`。
+9. **一个错误口径**：会话身份字段缺失时默认省略，显式 `auto_generate` 才合成。UA／originator 先共同判定是否为 Codex 客户端：命中时仅校验并透传已有值；未命中时忽略这两项，逐字段使用渠道或 PI 兜底。参与协议处理的非法字段、多值 singleton 返回本地 `400 invalid_request_error`。
 10. **无双轨**：没有 `RawResponsesInterface` optional branch，没有 typed adapter，没有 legacy fallback flag，没有按 UA 自动切协议。
 11. **无修补**：proxy 不做 semantic repair。proxy 拥有的字段可以 set；显式 unsupported input 直接 `400 invalid_request_error`；未知 future field raw-preserve。
 
@@ -109,7 +109,7 @@ ResponsesWS native  -> WS handshake parity + response.create client_metadata par
 ## 非目标
 
 - 不追求 TLS / HTTP2 / WS transport wire-level 完全一致。
-- 不把 PI 行为和 Codex 行为揉进一个 provider。
+- 不按客户端 UA 切换协议 profile；UA／originator 的代码兜底使用 PI 格式，其余字段仍由各操作的协议规则决定。
 - 不支持旧 `session_id` / `x-session-id` 作为 Codex upstream header。
 - 不保留 `legacy_onehub` profile。
 - 不保留旧 typed Responses provider contract。
@@ -302,8 +302,8 @@ singleton header 的规则：
 missing             -> FieldMissing
 present but ""      -> FieldEmpty
 one non-empty value -> FieldPresent -> 交给 validation 层做 grammar 判断
-multiple values     -> FieldMultiple -> 400 invalid_request_error
-non-empty invalid   -> FieldInvalid  -> 400 invalid_request_error（validation 层判定）
+multiple values     -> FieldMultiple -> 参与协议处理时返回 400 invalid_request_error
+non-empty invalid   -> FieldInvalid  -> 参与协议处理时返回 400 invalid_request_error（validation 层判定）
 ```
 
 分层约束：raw snapshot 只描述形态（missing / empty / present / multiple），不做任何 grammar 判断；`FieldInvalid` 只能由 validation 层套用 per-field grammar 后产生。同一字段的合法性只在一处判定。
@@ -520,7 +520,7 @@ key 是 server 级 secret，轮换会改变所有 proxy-generated installation i
 
 原因是 `model_headers` 的抽象是“静态注入 header”，而 Codex Official path 的抽象是“从 raw evidence 生成唯一 official plan”。即使 `model_headers` 中没有 reserved header，它仍然绕过 `HeaderPlan`，让协议面出现第二个 header 作者。
 
-Codex provider 不调用 `applyCommonRequestHeaders`。
+Codex Responses HTTP／ResponsesWS 路径不调用 `applyCommonRequestHeaders`；realtime 与用量操作仍使用原 header bag 构造其他字段，UA／originator 由共享解析器决定。
 
 渠道配置只允许通过结构化 `channel.Other.codex` 表达 Codex policy：
 
@@ -529,7 +529,8 @@ Codex provider 不调用 `applyCommonRequestHeaders`。
   "codex": {
     "fedramp": false,
     "residency": "",
-    "default_originator": "codex_cli_rs",
+    "default_user_agent": "",
+    "default_originator": "",
     "trust_client_attestation": false,
     "auto_generate": {
       "session_id": false,
@@ -542,7 +543,7 @@ Codex provider 不调用 `applyCommonRequestHeaders`。
 }
 ```
 
-`auto_generate` 默认等价于空对象；除显式为 `true` 的子字段外，one-hub 不自动合成 session/thread/client-request/installation/WS timestamp。`User-Agent` 和 `originator` 仍沿用当前默认补齐逻辑，因为它们是上游协议固定请求画像的一部分，不表达客户端会话身份。
+`auto_generate` 默认等价于空对象；除显式为 `true` 的子字段外，one-hub 不自动合成 session/thread/client-request/installation/WS timestamp。`User-Agent` 和 `originator` 不属于 `auto_generate`：已识别 Codex 客户端的缺失项保持省略，其他请求才逐字段使用渠道配置或 PI 默认值，详见[统一身份规则](./codex-client-identity.md)。
 
 配置校验规则：
 
@@ -617,28 +618,9 @@ header: Conversation_id
 
 ### Fallback 规则
 
-这里的 fallback 不是旧协议兼容，而是 official dialect completion：当官方客户端字段为空时，proxy 生成一份可解释的 upstream identity。
+UA／originator 采用[统一身份规则](codex-client-identity.md)，适用于所有 Codex 请求入口：已识别 Codex 客户端时只透传提供的字段，缺失项不补；其他请求逐字段采用渠道配置，再采用 PI 默认值。识别支持 originator override 后仍保留 Codex 名称的 UA 后缀，不从 UA 推导 originator。
 
-#### `User-Agent`
-
-```text
-header User-Agent non-empty valid
-> default Codex UA
-```
-
-默认 UA 从集中常量生成：
-
-```text
-codex_cli_rs/<one-hub-codex-dialect-version> (<os>; <arch>) one-hub
-```
-
-#### `originator`
-
-```text
-header originator non-empty valid
-> channel policy default_originator
-> codex_cli_rs
-```
+其他会话身份字段仍按下面的显式 opt-in 规则处理。
 
 #### `session-id`
 
@@ -737,11 +719,9 @@ frame client_metadata.x-codex-installation-id
 
 ### Singleton headers
 
-这些字段是 singleton：
+以下字段由通用 field contract 按 singleton 校验：
 
 ```text
-User-Agent
-originator
 session-id
 thread-id
 x-client-request-id
@@ -760,14 +740,14 @@ traceparent
 tracestate
 ```
 
-多值直接 400。
+以上字段多值直接 400。UA／originator 仅在已识别 Codex、准备透传时要求单值；未识别请求的两项被忽略，不进入该校验。
 
 ### Grammar table
 
 | 字段 | Grammar | 空值 | 非空非法 |
 | --- | --- | --- | --- |
-| `User-Agent` | visible ASCII，禁止 CR/LF/CTL，`1..256` bytes | fallback | 400 |
-| `originator` | token：`[A-Za-z0-9._-]{1,64}` | fallback | 400 |
+| `User-Agent` | 待透传值符合 HTTP 字段值安全要求，最多 16 KiB | 已识别 Codex 时省略，否则使用兜底 | 待透传值非法时 400 |
+| `originator` | 同 UA；允许 `Codex Desktop` 等合法字段值 | 已识别 Codex 时省略，否则使用兜底 | 待透传值非法时 400 |
 | `session-id` | id：visible ASCII，禁止 CR/LF/CTL，`1..128` bytes | omit；`auto_generate.session_id=true` 时 fallback | 400 |
 | `thread-id` | id：visible ASCII，禁止 CR/LF/CTL，`1..128` bytes | omit；`auto_generate.thread_id=true` 时 fallback | 400 |
 | `x-client-request-id` | id：visible ASCII，禁止 CR/LF/CTL，`1..128` bytes | omit；`auto_generate.client_request_id=true` 时 fallback | 400 |
@@ -804,7 +784,7 @@ x-codex-ws-stream-request-start-ms -> unix milliseconds string
 
 Unknown metadata keys are preserved if total serialized `client_metadata` size is `<=64 KiB` and no key/value contains control characters where string grammar applies。
 
-实现上，reserved header / metadata 的 grammar、singleton 属性、metadata alias、operation 输出位置应收敛到一张 field contract 表，并由表驱动测试覆盖。
+reserved header / metadata 的 grammar、singleton 属性、metadata alias、operation 输出位置由 field contract 表维护。UA／originator 的识别、校验和兜底依赖两项共同判定，单独由 `ResolveClientIdentity` 处理。
 
 Trade-off：field contract 表只承载字段事实，不把 `session-id` / `thread-id` 的生成、`x-codex-installation-id` 的 operation precedence、policy auto-generation 等上下文流程改写成全声明式引擎。这样获得单一协议契约和可测试边界，同时避免为了“纯表驱动”引入收益不成比例的抽象复杂度。
 
@@ -831,15 +811,17 @@ type Decision struct {
 }
 ```
 
-只有最后一步转换为 `http.Header` / `map[string]string`。
+只有最后一步转换为 `http.Header` / `map[string]string`。若解析结果没有 UA，转换时保留一个空的 `User-Agent` map 项，抑制 Go transport 自动补值；实际 wire 不发送该字段。
 
 测试直接断言：
 
 ```text
 operation=responses.create.http
-must have: Authorization, Content-Type, Accept, User-Agent, originator
+must have: Authorization, Content-Type, Accept
+client identity: User-Agent / originator follow ResolveClientIdentity; either may be absent
 identity optional: session-id, thread-id, x-client-request-id
-must not have: session_id, x-session-id, Conversation_id, Connection, OpenAI-Beta
+OpenAI-Beta: responses_multi_agent=v1 only when multi_agent is enabled
+must not have: session_id, x-session-id, Conversation_id, Connection
 ```
 
 ## Authority fields
@@ -927,14 +909,14 @@ req.Control.Stream = true
 
 `PrepareResponsesCreate` 做四件事：
 
-1. `ResolveIdentity`。
-2. `BuildHTTPCreateHeaders`。
-3. `PlanResponsesCreateBody`。
-4. 构造 `http.Request`。
+1. `PlanResponsesCreateBody` 保留 raw body 并执行代理拥有的 patch。
+2. 解析 metadata、渠道 policy 和 `ResolveIdentity`，先完成本地校验。
+3. 获取／必要时刷新渠道凭据。
+4. `BuildHeaders` 生成 operation 对应的 header plan，再构造 `http.Request`。
 
 ### HTTP create header set
 
-Required:
+协议与客户端身份字段（条件字段见来源说明）：
 
 | Header | Source |
 | --- | --- |
@@ -942,8 +924,8 @@ Required:
 | `ChatGPT-Account-ID` | channel credential account id, when present |
 | `Content-Type: application/json` | protocol |
 | `Accept: text/event-stream` | Codex streaming requirement |
-| `User-Agent` | client official header, else Codex default |
-| `originator` | client official header, else `codex_cli_rs` |
+| `User-Agent` | 已识别 Codex 时透传已有值，缺失则省略；其他请求取 `default_user_agent`，再取 PI UA |
+| `originator` | 已识别 Codex 时透传已有值，缺失则省略；其他请求取 `default_originator`，再取 `pi` |
 
 Optional:
 
@@ -952,6 +934,7 @@ Optional:
 | `session-id` | official header, else body `client_metadata.session_id`, else generated only when `auto_generate.session_id=true` |
 | `thread-id` | official header, else body `client_metadata.thread_id`, else generated only when `auto_generate.thread_id=true` |
 | `x-client-request-id` | official header, else generated only when `auto_generate.client_request_id=true` |
+| `OpenAI-Beta: responses_multi_agent=v1` | HTTP create 的 `multi_agent` 启用时发送；compact 不发送 |
 | `X-OpenAI-Fedramp` | channel policy only |
 | `x-openai-internal-codex-residency` | channel policy only |
 | `x-codex-window-id` | official header or body metadata |
@@ -975,7 +958,6 @@ session_id
 x-session-id
 Conversation_id
 version
-OpenAI-Beta
 Connection
 Cookie
 Host
@@ -1030,9 +1012,9 @@ Prompt cache patch 规则：
 Explicit rejects:
 
 ```text
-context_management present         -> 400 invalid_request_error
-truncation present                 -> 400 invalid_request_error
 client_metadata not object         -> 400 invalid_request_error
+prompt_cache_key present but invalid -> 400 invalid_request_error
+include not string array when reasoning requires patch -> 400 invalid_request_error
 ```
 
 No silent semantic repair.
@@ -1048,8 +1030,8 @@ No silent semantic repair.
 | `store=false` | keep as `set /store` | official ChatGPT Codex path does not use OpenAI API store semantics |
 | `ensureCodexIncludes` | keep narrowly | only append `reasoning.encrypted_content` when `/reasoning` exists |
 | `temperature` / `top_p` | preserve | 参数语义归上游所有，Responses ingress 与 Chat 适配器均不静默改写 |
-| strip `context_management` | delete | hidden repair; unsupported field returns 400 |
-| strip `truncation` | delete | hidden repair; unsupported field returns 400 |
+| strip `context_management` | delete | ordinary `/responses` 保留原值，由上游解释 |
+| strip `truncation` | delete | ordinary `/responses` 保留原值，由上游解释 |
 | `ensureStablePromptCacheKey` | delete from HTTP Official body planning | prompt cache key decision must be explicit `Policy.PromptCache` before BodyPlanner; no provider-late mutation |
 | `normalizeCodexBuiltinTools` | delete | Codex official client already speaks official tool schema; proxy does not mutate tools |
 | `adaptCodexCLI` | delete | provider does not infer CLI-ness from instructions |
@@ -1068,15 +1050,18 @@ This table is part of the protocol contract. If a future upstream change require
 
 ### Compact body
 
-Compact body 是 compact 专用 schema。它不携带 ordinary `/responses` 的 `client_metadata`。
+Compact body 以 raw object 为基底，保留未知扩展字段；只移除 compact 无法表示的 create-only 控制字段。`client_metadata` 供本地解析 identity header，不转发到 compact 上游 body。
 
 规则：
 
 ```text
-extract identity from raw body before compact transform
-build compact payload from typed lens
-set mapped model
-reject unsupported fields explicitly
+retain original raw body for identity extraction
+clone raw object as compact payload
+set selected upstream model
+remove stream, store, include, client_metadata
+preserve unknown fields and client prompt_cache_key
+fill missing prompt_cache_key only from explicit policy
+reject context_management and truncation before provider work
 send compact body
 ```
 
@@ -1088,7 +1073,7 @@ client_metadata  // compact body 中不保留 ordinary metadata
 
 ### Compact header set
 
-Required 同 HTTP create，但 `Accept` 为 `application/json`。
+身份字段采用与 HTTP create 相同的规则，`Accept` 为 `application/json`；compact 不发送 `OpenAI-Beta`。
 
 Compact-specific:
 
@@ -1126,15 +1111,15 @@ Codex provider 在 `OpenResponsesWS(ctx, req)` 中完成：
 
 ### WS handshake header set
 
-Required:
+协议与客户端身份字段（条件字段见来源说明）：
 
 | Header | Source |
 | --- | --- |
 | `Authorization` | channel OAuth token |
 | `ChatGPT-Account-ID` | channel credential account id, when present |
-| `User-Agent` | client official header, else Codex default |
-| `originator` | client official header, else `codex_cli_rs` |
-| `OpenAI-Beta: responses_websockets=2026-02-06` | protocol |
+| `User-Agent` | 已识别 Codex 时透传已有值，缺失则省略；其他请求取 `default_user_agent`，再取 PI UA |
+| `originator` | 已识别 Codex 时透传已有值，缺失则省略；其他请求取 `default_originator`，再取 `pi` |
+| `OpenAI-Beta: responses_websockets=2026-02-06, responses_multi_agent=v1` | protocol |
 
 Optional:
 
@@ -1240,15 +1225,21 @@ principal StableID
 | body 不是 JSON object | 400 `invalid_request_error` |
 | duplicate top-level JSON key | 400 `invalid_request_error` |
 | `client_metadata` 存在但不是 object | 400 `invalid_request_error` |
-| singleton official header 多值 | 400 `invalid_request_error` |
-| official header 非空但非法 | 400 `invalid_request_error` |
-| identity field missing/empty | 默认 omit；显式 `auto_generate` 时 fallback |
+| 参与协议处理的 singleton header 多值 | 400 `invalid_request_error`；未识别客户端的 UA／originator 直接忽略 |
+| 参与协议处理的 header 非空但非法 | 400 `invalid_request_error`；未识别客户端的 UA／originator 直接忽略 |
+| 会话 identity field missing/empty | 默认 omit；显式 `auto_generate` 时 fallback |
+| UA／originator missing/empty | 已识别 Codex 时省略缺失项；其他请求逐字段取渠道配置，再取 PI 默认值 |
 | `temperature` 和 `top_p` 同时存在 | 原样转发，由上游决定参数语义 |
-| unsupported body field `context_management` | 400 `invalid_request_error` |
-| unsupported body field `truncation` | 400 `invalid_request_error` |
-| channel credential 缺 token | 401/502，沿用 provider token error 语义 |
-| channel policy 非法 | 保存时拒绝写入；运行时解析失败则该渠道返回配置错误，不阻断进程 |
+| ordinary `/responses` 的 `context_management` | 原样保留，由上游解释 |
+| ordinary `/responses` 的 `truncation` | 原样保留，由上游解释 |
+| channel credential 缺 token 或普通 token 获取失败 | 503 `codex_token_error`，返回固定的凭据暂不可用消息 |
+| OAuth 刷新结果歧义或需要重新授权 | 401 `codex_token_error`，返回重新授权提示，并保留内部 `ProviderAuthRejected` 分类 |
+| channel policy 非法 | 保存时拒绝写入；Responses／realtime 运行时返回本地 503 `channel_config_error`，不自动换渠道，由管理员修复配置 |
 | Codex ResponsesWS upstream 不支持 native | 426 wrapped error；不 bridge |
+
+共享 header 构造用 `codexHeaderTokenError` 保留凭据错误的原始错误链。`requestHeaderError` 只按来源分发：凭据错误交给 `handleTokenError`，`wire.Violation` 交给 `codexWireError`，配置错误交给 `codexClientIdentityError`。因此身份／配置错误不会被误报为 token 故障，刷新歧义也不会丢失分类。
+
+状态码和本地错误分类不单独授权重试；字段含义及完整门禁见 [错误标记与建连重试门禁](./responses-ws-attempt-replay-architecture.md#错误标记与建连重试门禁)。
 
 ## 删除旧路径
 
@@ -1280,112 +1271,14 @@ ResponsesWS actor / settlement / wsconn transport boundary
 
 但这些模块不能再拥有 Codex Official header 或 body rewrite 规则。
 
-## 代码形态示例
+## 实现入口与构造顺序
 
-### Prepare HTTP create
+- HTTP create／compact：`providers/codex/responses.go` 中的 `prepareResponsesCreateRequest`／`prepareResponsesCompactRequest` 先调用对应 body planner，再交给 `prepareResponsesOfficialHTTPRequest`。后者解析 metadata、渠道 policy 和 identity，通过校验后才调用 `GetToken`，最后由 `BuildHeaders` 和 requester 构造请求。
+- ResponsesWS：`providers/codex/responses_ws_upstream.go` 中的 `prepareResponsesWSOfficialConn` 在获取凭据前完成 metadata、policy 和 identity 校验；握手 header 仍由 `BuildHeaders` 生成。
+- UA／originator：`providers/codex/wire/client_identity.go` 中的 `ResolveClientIdentity` 是全部 Codex 操作的共享入口。realtime 和用量操作通过 `providers/codex/client_identity.go` 调用，realtime 复用签名采用同一解析结果。
+- 会话身份：`providers/codex/wire/identity.go` 中的 `ResolveIdentity` 在解析客户端身份后处理 session/thread/request/installation 等字段，生成行为受各项 `AutoGenerate` policy 控制。
 
-```go
-func (p *CodexProvider) prepareResponsesCreate(ctx context.Context, req *responses.Request) (*http.Request, error) {
-    policy, err := p.codexOfficialChannelPolicy()
-    if err != nil {
-        return nil, err
-    }
-
-    token, err := p.GetToken()
-    if err != nil {
-        return nil, err
-    }
-
-    metadata, err := wire.MetadataFromResponsesBody(req.Body.Object)
-    if err != nil {
-        return nil, err
-    }
-
-    identity, decisions, err := wire.ResolveIdentity(wire.IdentityInput{
-        Operation: wire.OpResponsesCreate,
-        Headers:   req.Headers,
-        Metadata:  metadata,
-        Policy:    policy,
-        Principal: p.codexPrincipalFingerprint(req.Principal),
-        ChannelID: req.ChannelID,
-        Clock:     wire.RealClock{},
-    })
-    if err != nil {
-        return nil, err
-    }
-
-    headers, err := wire.BuildHeaders(wire.HeaderPlanInput{
-        Operation: wire.OpResponsesCreate,
-        Headers:   req.Headers,
-        Credential: wire.Credential{
-            AccessToken: token,
-            AccountID:   p.Credentials.AccountID,
-        },
-        Policy:   policy,
-        Identity: identity,
-    })
-    if err != nil {
-        return nil, err
-    }
-    headers.Decisions = append(decisions, headers.Decisions...)
-
-    body, err := wire.PlanResponsesCreateBody(req.Body.Object, wire.CreateBodyInput{
-        Model:       p.mapModel(req.Model),
-        Stream:      true,
-        PromptCache: req.Policy.PromptCache,
-    })
-    if err != nil {
-        return nil, err
-    }
-
-    return p.Requester.NewRequest(
-        http.MethodPost,
-        p.responsesURL(""),
-        p.Requester.WithBody(body),
-        p.Requester.WithHeader(headers.Map()),
-        p.Requester.WithContext(ctx),
-    )
-}
-```
-
-### Resolve identity
-
-```go
-func ResolveIdentity(in IdentityInput) (Identity, []Decision, error) {
-    decisions := make([]Decision, 0, 16)
-
-    ua := in.Headers.RequiredString("User-Agent").OrDefault(DefaultUserAgent, &decisions)
-    originator := in.Headers.RequiredString("originator").OrDefault(in.Policy.DefaultOriginator, &decisions)
-
-    sessionID := FirstNonEmpty(
-        in.Headers.String("session-id"),
-        in.Metadata.String("session_id"),
-        GeneratedUUID(),
-    )
-
-    threadID := FirstNonEmpty(
-        in.Headers.String("thread-id"),
-        in.Metadata.String("thread_id"),
-        GeneratedUUID(),
-    )
-
-    clientRequestID := FirstNonEmpty(
-        in.Headers.String("x-client-request-id"),
-        threadID,
-    )
-
-    return Identity{
-        UserAgent: ua,
-        Originator: originator,
-        SessionID: sessionID,
-        ThreadID: threadID,
-        ClientRequestID: clientRequestID,
-        Sources: ...,
-    }, decisions, nil
-}
-```
-
-关键点：没有 `session_id` header，没有 `x-session-id` header，没有 provider-late prompt cache fallback。prompt cache key 只能来自 raw body 或 `Policy.PromptCache`。
+Codex Official Responses 路径不发送 `session_id`／`x-session-id` header；prompt cache key 只来自 raw body 或显式 `Policy.PromptCache`，不在 header 构造之后隐式派生。
 
 ## 测试计划
 
@@ -1404,9 +1297,11 @@ responses.ws.open
 - fixed protocol / credential header 全存在。
 - forbidden header 全不存在。
 - header value source 符合 decision log。
-- 空 identity field 默认省略；显式开启 `auto_generate` 后才进入 fallback。
-- 非空非法 field 400。
-- singleton 多值 400。
+- 会话身份字段默认省略；显式开启 `auto_generate` 后才生成。
+- 已识别 Codex 的 UA／originator 只透传已有字段；其他请求忽略客户端值，逐字段按配置、PI 默认值兜底。
+- 仅提供 Codex originator 时，实际 HTTP／WS wire 不出现 Go 自动生成或空值的 UA。
+- 参与协议处理的非空非法字段返回 400；未识别客户端的 UA／originator 被忽略。
+- 参与协议处理的 singleton 多值返回 400。
 
 ### Body preservation tests
 

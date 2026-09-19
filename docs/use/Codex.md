@@ -79,6 +79,10 @@ Codex 渠道当前通过 OpenAI 兼容接口使用，支持以下路径：
 | `execution_session_ttl_seconds` | 否 | `600` | Codex Realtime execution session 空闲保留时长 |
 | `self_hosted` | 否 | `false` | 仅允许 Codex Realtime 使用私有或本地自建上游 |
 | `responses_ws_self_hosted` | 否 | `false` | 允许 ResponsesWS 使用私有或本地自建上游；在 `Codex 配置(JSON)` 中设置 |
+| `codex.default_user_agent` | 否 | PI UA：`pi (<platform> <release>; <arch>)` | 未识别为 Codex 客户端时使用的 UA 兜底值 |
+| `codex.default_originator` | 否 | `pi` | 未识别为 Codex 客户端时使用的 originator 兜底值 |
+
+结构化 `codex` 对象还支持 `fedramp`、`residency`、`trust_client_attestation` 和 `auto_generate`，详见 [Codex policy](../dev/codex-pi-header-parity.md#one-hub-codex-policy)。表中的点号表示嵌套字段，不是 JSON 中的字面键名。
 
 `Codex 配置(JSON)` 就是 `channel.Other` 的页面编辑入口，没有另一个 ResponsesWS 开关或数据库列。例如：
 
@@ -88,7 +92,7 @@ Codex 渠道当前通过 OpenAI 兼容接口使用，支持以下路径：
 }
 ```
 
-### `User-Agent` 透传与兜底优先级
+### `User-Agent` 与 `originator` 透传及兜底
 
 Breaking change：Codex 渠道不再读取 `Codex 配置(JSON)` / `channel.Other` 里的 `user_agent` 字段。旧配置如果仍然写成：
 
@@ -100,16 +104,28 @@ Breaking change：Codex 渠道不再读取 `Codex 配置(JSON)` / `channel.Other
 
 新版本会把它视为不支持字段；运行请求时不会再用它覆盖上游 `User-Agent`，编辑或导入渠道时也会被配置校验拦截。Codex 渠道也不支持通过渠道自定义模型请求头配置 `User-Agent`；任何非空 `model_headers` 都会被视为 Codex 渠道配置错误。
 
-Codex 渠道会优先使用客户端请求中的有效 `User-Agent`；客户端没有传或传入值不合法时，使用内置默认值。
+当前规则同时处理 `User-Agent` 和 `originator`：
 
-最终向 Codex 上游发送的 `User-Agent` 优先级如下：
+1. 识别为 Codex 客户端时，透传其提供的非空值；只提供其中一项时，另一项保持缺失，不补齐、不推导。
+2. 其他请求（包括两项都缺失）忽略客户端这两项，逐字段读取 `codex.default_user_agent` 和 `codex.default_originator`。
+3. 配置项缺失或为空时，UA 使用 `pi (<platform> <release>; <arch>)`，originator 使用 `pi`。UA 中的平台、系统版本和架构来自代理运行环境。
 
-1. 客户端请求头 `User-Agent`
-2. 内置 Codex CLI `User-Agent`
+Codex 识别支持已知客户端名称、复合 UA 中的产品标识及 `(codex-tui; 版本)` 等客户端后缀，不局限于 UA 以 `codex` 开头。它用于兼容处理，不是客户端身份认证。
 
-当前没有渠道级 `User-Agent` override。需要固定渠道身份时，只能使用已有结构化 Codex policy 字段，例如 `other.codex.default_originator`；不要使用 `model_headers` 作为 header 注入口。
+如需设置兜底值，在页面的 `Codex 配置(JSON)` 中填写：
 
-这个选择的 trade-off 是：暂时牺牲渠道级 `User-Agent` 覆盖能力，换取 Codex Official path 只有一个 header 作者。为降低敏感 Header 泄漏风险，Codex 渠道只透传受控白名单中的客户端 Header，并不会无差别透传所有请求头。
+```json
+{
+  "codex": {
+    "default_user_agent": "pi (linux 6.12.1; x64)",
+    "default_originator": "pi"
+  }
+}
+```
+
+通常可省略这两项。只配置 `default_originator` 时，UA 仍取代码中的 PI 兜底；配置不会覆盖已识别 Codex 客户端提供的值。旧顶层 `user_agent` 应迁移到 `codex.default_user_agent`，其语义是兜底，不是强制覆盖。
+
+待透传的 Codex 身份头出现多值、非法 HTTP 字段值或超过每字段 16 KiB 时，返回本地 400，不静默改为兜底。未识别客户端的这两项不透传；其他请求头仍按各自协议规则处理。完整识别范围和校验边界见 [Codex 渠道的 UA 与 originator](../dev/codex-client-identity.md)。
 
 ## 从 Web 页面看，哪些配置改哪里
 

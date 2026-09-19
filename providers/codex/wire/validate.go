@@ -9,18 +9,13 @@ import (
 )
 
 var (
-	originatorPattern      = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 	subagentPattern        = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
 	betaFeatureToken       = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,64}$`)
 	traceparentPattern     = regexp.MustCompile(`^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$`)
 	base64URLOrJWTFragment = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 )
 
-func validUserAgent(value string) bool { return visibleASCII(value, 1, 256) }
-func validID(value string) bool        { return visibleASCII(value, 1, 128) }
-func validOriginator(value string) bool {
-	return originatorPattern.MatchString(value)
-}
+func validID(value string) bool { return visibleASCII(value, 1, 128) }
 func validSubagent(value string) bool {
 	return subagentPattern.MatchString(value)
 }

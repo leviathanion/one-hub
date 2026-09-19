@@ -11,7 +11,7 @@ lastUpdated: true
 
 - 状态：当前诊断；one-hub 小节已按当前工作区的 Codex Official upstream 实现重新核对。
 - 适用范围：Codex / PI 官方 OAuth 请求 header、body metadata、one-hub Codex provider 的 `/v1/responses` HTTP、`/v1/responses/compact` HTTP、`GET /v1/responses` ResponsesWS upstream parity 分析；`/v1/realtime` 兼容路径仅作为边界说明。
-- 文档口径：本文是实测/源码画像与差异诊断，不是最终实现 contract；Codex provider 的目标协议边界以 [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md) 为准。
+- 文档口径：本文是实测/源码画像与差异诊断，不是最终实现 contract；Codex Responses 协议边界以 [Codex Official Upstream 架构设计](./codex-official-upstream-architecture.md) 为准，UA／originator 以 [Codex 渠道的 UA 与 originator](./codex-client-identity.md) 为准。外部客户端画像对应下表固定源码快照；新身份识别和 PI 兜底的复核快照见该专项文档。
 
 ## 目标与边界
 
@@ -26,8 +26,8 @@ lastUpdated: true
 - HTTP header 名大小写无语义差异；表格保留源码中常见写法，便于定位代码。
 - PI WS 中 `OpenAI-Beta` 的最终 wire 行为需要实测确认：PI `buildWebSocketHeaders()` 先删除 `OpenAI-Beta` / `openai-beta`，随后重新 set `OpenAI-Beta: responses_websockets=2026-02-06`；建连前 `connectWebSocket()` 又通过 `headersToRecord()` 把 `Headers.entries()` 展开为普通对象，并只删除精确键 `OpenAI-Beta`。在常见 runtime 中 `Headers.entries()` 会输出小写 `openai-beta`，因此源码层面可能把 `openai-beta` 传给 WebSocket constructor，最终 wire 是否发送仍取决于 WebSocket runtime。
 - Codex 的部分身份字段同时存在于 header compatibility projection 和 body `client_metadata`。二者不是同一层：`session-id` 是 header，`client_metadata.session_id` 是 body 字段；`x-codex-installation-id` 在普通 Responses 请求主要通过 body 发送，但 `/responses/compact` 会额外作为 HTTP header 发送。
-- one-hub 当前 Codex channel 禁止使用 `model_headers` 作为 upstream header 注入口；保存校验和运行时 policy 解析都会拒绝非空 `model_headers`。Codex policy 只能通过结构化 `other.codex` 表达。
-- 当前 `other.codex` 仅支持 `fedramp`、`residency`、`default_originator`、`trust_client_attestation`、`auto_generate`。`auto_generate` 是显式 opt-in 子对象，默认所有字段都不自动生成；没有 `responses_lite` channel 配置键。
+- one-hub 当前 Codex channel 禁止配置非空 `model_headers`；保存校验和 Responses 运行时 policy 解析会拒绝该配置。realtime／用量路径的历史 header bag 仍可读取已有记录中的其他 header，但 UA／originator 不从中取值。Codex policy 只能通过结构化 `other.codex` 表达。
+- 当前 `other.codex` 仅支持 `fedramp`、`residency`、`default_user_agent`、`default_originator`、`trust_client_attestation`、`auto_generate`。`auto_generate` 是显式 opt-in 子对象，默认所有字段都不自动生成；没有 `responses_lite` channel 配置键。
 
 ## 源码依据
 
@@ -149,9 +149,9 @@ Codex HTTP `/responses` body 同样包含 `client_metadata`，主要 keys 为 `x
 | `ChatGPT-Account-ID` | channel credential 有 AccountID 时发送 | 与 Codex 字段语义一致；值需与 token 账号一致 |
 | `X-OpenAI-Fedramp` | `other.codex.fedramp=true` 时发送 `true` | 条件字段已支持；只来自 channel policy |
 | `Content-Type` / `Accept` / `Connection` | Codex Official WS planner 不设置 | 与旧文档相反，不再由 `getRequestHeaderBag()` 给 WS 额外加 `Content-Type` |
-| `User-Agent` | 下游有效 `User-Agent` 优先；缺失时默认 `codex_cli_rs/2026-06-29 (<goos>; <goarch>) one-hub` | 透传官方 UA 时可接近；默认 UA 仍不是 Codex 发布包的精确 UA |
-| `originator` | 下游有效 `originator` 优先；缺失时用 `other.codex.default_originator`，默认 `codex_cli_rs` | 默认已从旧 `codex-tui` smart 推断改为 Codex Official 口径 |
-| `OpenAI-Beta` | 固定 `responses_websockets=2026-02-06` | 与 Codex WS 一致 |
+| `User-Agent` | 已识别 Codex 客户端时透传、不补缺失项；其他请求取 `other.codex.default_user_agent`，再取 PI 默认 UA | [统一身份规则](codex-client-identity.md) |
+| `originator` | 已识别 Codex 客户端时透传、不补缺失项；其他请求取 `other.codex.default_originator`，再取 `pi` | 不从 UA 推导 originator |
+| `OpenAI-Beta` | 固定 `responses_websockets=2026-02-06, responses_multi_agent=v1` | 比本文 Codex 固定快照多 multi-agent 标记 |
 | `session-id` | inbound `session-id`，否则 first `response.create.client_metadata.session_id`；缺失时默认不发送，只有 `other.codex.auto_generate.session_id=true` 才生成 UUID | 已支持；不读取 legacy `session_id` / `x-session-id` 作为 upstream header |
 | `thread-id` | inbound `thread-id`，否则 first frame `client_metadata.thread_id`；缺失时默认不发送，只有 `other.codex.auto_generate.thread_id=true` 才生成 UUID | 已支持 |
 | `x-client-request-id` | inbound `x-client-request-id`；缺失时默认不发送，只有 `other.codex.auto_generate.client_request_id=true` 才按 resolved `thread-id` 或新 UUID 生成 | 已支持 |
@@ -177,7 +177,7 @@ ResponsesWS frame body 现状：
 - `x-codex-ws-stream-request-start-ms` 默认不 stamp；只有 `other.codex.auto_generate.ws_stream_request_start_ms=true` 时，才会在每次发送 `response.create` 前写入当前毫秒时间。
 - 当前不会把 inbound header 里的 `x-codex-turn-state`、`x-openai-subagent` 等全部镜像到 frame metadata；已有 frame metadata 会保留，缺失则通常只影响 body parity，不影响 handshake parity。
 
-`/v1/realtime` 兼容入口仍保留旧 execution-session header 行为，会在上游 WS header 中使用 `session_id` / `x-session-id` 等字段。该路径不是本文的 Codex Official ResponsesWS path。
+`/v1/realtime` 兼容入口仍保留旧 execution-session header 行为，会在上游 WS header 中使用 `session_id` / `x-session-id` 等字段；UA／originator 已与 Responses 和用量操作共用同一解析规则。该路径的其他 header 不由 Codex Official ResponsesWS planner 构造。
 
 ## one-hub HTTP 对比 Codex
 
@@ -191,14 +191,14 @@ ResponsesWS frame body 现状：
 | `x-openai-internal-codex-residency` | `other.codex.residency` 非空时发送 | 条件字段已支持；只来自 channel policy |
 | `Content-Type` | `application/json` | 与 Codex HTTP 一致 |
 | `Accept` | `/responses` 为 `text/event-stream`；`/responses/compact` 为 `application/json` | 与当前 Codex Official 目标路径一致 |
-| `User-Agent` | 下游有效 `User-Agent` 优先；缺失时默认 `codex_cli_rs/2026-06-29 (<goos>; <goarch>) one-hub` | 默认 UA 仍不是 Codex 发布包精确 UA |
-| `originator` | 下游有效 `originator` 优先；缺失时用 `other.codex.default_originator`，默认 `codex_cli_rs` | 默认已从旧 smart `codex-tui` / `pi` 推断改为 Codex Official 口径 |
+| `User-Agent` | 已识别 Codex 客户端时透传、不补缺失项；其他请求取 `other.codex.default_user_agent`，再取 PI 默认 UA | [统一身份规则](codex-client-identity.md) |
+| `originator` | 已识别 Codex 客户端时透传、不补缺失项；其他请求取 `other.codex.default_originator`，再取 `pi` | 不从 UA 推导 originator |
 | `Connection` / `Host` | Codex Official planner 不设置 | Go HTTP transport 仍可能写 transport 层字段；应用层不再手工注入 `Keep-Alive` / Host |
 | `session-id` | inbound `session-id`，否则 body `client_metadata.session_id`；缺失时默认不发送，只有 `other.codex.auto_generate.session_id=true` 才生成 UUID | 已支持；不读取 legacy `session_id` / `x-session-id` |
 | `thread-id` | inbound `thread-id`，否则 body `client_metadata.thread_id`；缺失时默认不发送，只有 `other.codex.auto_generate.thread_id=true` 才生成 UUID | 已支持 |
 | `x-client-request-id` | inbound `x-client-request-id`；缺失时默认不发送，只有 `other.codex.auto_generate.client_request_id=true` 才按 resolved `thread-id` 或新 UUID 生成 | 已支持；显式生成时 `/responses/compact` 也会发送该字段，严格对照固定 Codex 快照时可能比实测画像多 |
 | `session_id` / `x-session-id` / `Conversation_id` | Codex Official HTTP planner 不发送 | 旧 one-hub legacy identity / prompt-cache projection 已从 Codex Official HTTP upstream 移除 |
-| `OpenAI-Beta` | HTTP Codex Official planner 不发送 | 与 Codex HTTP create/compact 目标一致；不同于 PI HTTP |
+| `OpenAI-Beta` | HTTP create 启用 `multi_agent` 时发送 `responses_multi_agent=v1`；其他 create 与 compact 不发送 | 不采用 PI 的 `responses=experimental` |
 | `x-codex-window-id` | inbound header 或 body `client_metadata.x-codex-window-id` | 有证据时发送 |
 | `x-codex-turn-metadata` | inbound header 或 body metadata | 有证据时发送；metadata 非法时 400 |
 | `x-codex-parent-thread-id` | inbound header 或 body metadata | 有证据时发送 |
@@ -217,19 +217,20 @@ ResponsesWS frame body 现状：
 HTTP body 现状：
 
 - 普通 `/responses` 使用 raw JSON object 为上游 body 基底，保留 `client_metadata`、未知字段、未知数值精度；只 patch `model`、`stream`、`store=false`、必要的 `prompt_cache_key`，并在存在 `reasoning` 时补 `include: reasoning.encrypted_content`。
-- `/responses/compact` 使用 compact 专用 body，不保留 ordinary `/responses` 的 `client_metadata` 和未知字段；identity 通过 header 投影。
+- `/responses/compact` 以 raw body 为基底，保留未知字段；移除 `stream`、`store`、`include`、`client_metadata`，其中 metadata 用于本地 identity header 投影。`context_management` 和 `truncation` 因 compact 不可表示而在 provider work 前拒绝。
 - `client_metadata` 若存在但不是 JSON object 会 400；reserved metadata keys 会按对应 grammar 校验。
 
 ## one-hub Codex policy
 
-`other.codex.auto_generate` 是唯一的身份字段自动合成入口，默认等价于空对象：
+`other.codex.auto_generate` 控制 Responses 路径的 session/thread/request/installation 和 WS timestamp 自动合成，默认等价于空对象。UA／originator 独立采用统一兜底规则。配置示例：
 
 ```json
 {
   "codex": {
     "fedramp": true,
     "residency": "us",
-    "default_originator": "codex_cli_rs",
+    "default_user_agent": "",
+    "default_originator": "pi",
     "trust_client_attestation": false,
     "auto_generate": {
       "session_id": true,
@@ -242,7 +243,7 @@ HTTP body 现状：
 }
 ```
 
-未配置 `auto_generate` 或某个子字段为 `false` 时，对应字段不会由 one-hub 合成；若下游请求已经在 official header 或 `client_metadata` 中提供合法值，则仍按上文优先级透传/投影。`installation_id` 对 `/responses`、`/responses/compact` 和 ResponsesWS 使用同一语义：缺失时默认不生成，显式开启后生成 proxy-scoped installation id。`User-Agent` 和 `originator` 不属于该 opt-in 集合，继续沿用当前逻辑：下游合法值优先，缺失时使用 one-hub/Codex Official 默认值。
+未配置 `auto_generate` 或某个子字段为 `false` 时，对应字段不会由 one-hub 合成；若下游请求已经在 official header 或 `client_metadata` 中提供合法值，则仍按上文优先级透传/投影。`installation_id` 对 `/responses`、`/responses/compact` 和 ResponsesWS 使用同一语义：缺失时默认不生成，显式开启后生成 proxy-scoped installation id。`User-Agent` 和 `originator` 不属于该 opt-in 集合，采用[统一身份规则](codex-client-identity.md)：只透传已识别的 Codex 客户端身份，其他请求使用渠道配置或 PI 默认值。
 
 启用 `other.codex.auto_generate.installation_id=true` 时必须配置 `codex_identity_secret`。该 secret 是 proxy-scoped installation id 的 HMAC key；缺失时请求会以 channel config error 失败，不回退到 `session_secret`。
 
@@ -256,9 +257,9 @@ Trade-off：默认不合成身份字段会牺牲“空请求也尽量像 Codex �
 | --- | --- | --- |
 | `Authorization` | channel OAuth token | 形式一致；token 来源仍是 channel credential |
 | `ChatGPT-Account-ID` | channel credential AccountID | 值需与 PI token claim 对齐，否则画像不一致 |
-| `originator` | 下游有效 `originator` 可透传；缺失默认 `codex_cli_rs` | PI 默认固定 `pi`；one-hub 不会因 UA 自动切到 PI profile |
-| `User-Agent` | 下游有效 UA 可透传；缺失为 Codex Official one-hub UA | PI 默认 UA 不会自动生成 |
-| `OpenAI-Beta` | 固定 `responses_websockets=2026-02-06` | 源码层面与 PI 构造值接近；PI runtime 是否 wire 发送仍需实测 |
+| `originator` | 已识别 Codex 客户端时透传、不补缺失项；其他请求取 `other.codex.default_originator`，再取 `pi` | 不从 UA 推导 originator |
+| `User-Agent` | 已识别 Codex 客户端时透传、不补缺失项；其他请求取 `other.codex.default_user_agent`，再取 PI 默认 UA | [统一身份规则](codex-client-identity.md) |
+| `OpenAI-Beta` | 固定 `responses_websockets=2026-02-06, responses_multi_agent=v1` | 比本文 PI 固定快照多 multi-agent 标记；PI runtime 是否 wire 发送仍需实测 |
 | `Content-Type` / `Accept` | WS planner 不设置 | 与旧 one-hub 多余 `Content-Type` 不同；也不是 PI runtime 的完整行为模拟 |
 | `session-id` | inbound `session-id` 或 frame metadata；缺失时默认不发送，除非显式开启 `auto_generate.session_id` | PI 的 session/request id 只有客户端按 `session-id` 提供时才可一致 |
 | `x-client-request-id` | inbound header；缺失时默认不发送，除非显式开启 `auto_generate.client_request_id` | PI 默认与 session/request id 相同；one-hub 默认不是 PI 规则 |
@@ -266,15 +267,15 @@ Trade-off：默认不合成身份字段会牺牲“空请求也尽量像 Codex �
 
 ## one-hub HTTP 对比 PI
 
-当前 `/v1/responses` HTTP 同样只实现 Codex Official dialect，不按 PI 行为自动补 header。
+当前 `/v1/responses` HTTP 保持 Codex Responses 协议构造；仅 UA／originator 的代码兜底对齐 PI，其他 header 不切换为 PI profile。
 
 | 字段 | 当前 one-hub 生成逻辑 | 对 PI 画像的差异 |
 | --- | --- | --- |
 | `Authorization` | channel OAuth token | 形式一致；token 来源仍是 channel credential |
 | `ChatGPT-Account-ID` | channel credential AccountID | PI 源码使用小写 `chatgpt-account-id`；HTTP 语义无大小写差异，值仍需一致 |
-| `originator` | 下游有效 `originator` 可透传；缺失默认 `codex_cli_rs` | PI 默认固定 `pi`；one-hub 不自动切换 |
-| `User-Agent` | 下游有效 UA 可透传；缺失为 Codex Official one-hub UA | PI 默认 UA 不会自动生成 |
-| `OpenAI-Beta` | HTTP planner 不发送 | PI HTTP 固定 `responses=experimental`，当前 one-hub 缺失 |
+| `originator` | 已识别 Codex 客户端时透传、不补缺失项；其他请求取 `other.codex.default_originator`，再取 `pi` | 不从 UA 推导 originator |
+| `User-Agent` | 已识别 Codex 客户端时透传、不补缺失项；其他请求取 `other.codex.default_user_agent`，再取 PI 默认 UA | [统一身份规则](codex-client-identity.md) |
+| `OpenAI-Beta` | HTTP create 启用 `multi_agent` 时发送 `responses_multi_agent=v1`；其他 create 与 compact 不发送 | PI HTTP 固定 `responses=experimental`，与 one-hub 不同 |
 | `Accept` / `Content-Type` | `/responses` streaming 为 `text/event-stream` / `application/json` | stream create 场景与 PI 近似 |
 | `Connection` | planner 不设置 | PI fetch/runtime 也不显式设置；Go transport 仍可能管理连接层行为 |
 | `session-id` | inbound header 或 body metadata；缺失时默认不发送，除非显式开启 `auto_generate.session_id` | PI 仅有 `options.sessionId` 时发送；one-hub 默认也不会凭空生成 |
@@ -291,13 +292,13 @@ Trade-off：默认不合成身份字段会牺牲“空请求也尽量像 Codex �
 - Codex Official path 不再发送 `session_id`、`x-session-id`、`Conversation_id`。
 - Codex Official ResponsesWS 不再走 HTTP bridge。
 - Codex channel 不再允许 `model_headers` 作为第二个 header 作者。
-- `other.codex` policy 现在是显式小 schema；除 `User-Agent` 和 `originator` 沿用“下游有效值优先，缺失则按当前默认值生成/修改”的逻辑外，身份字段默认全量透穿/省略。`session-id`、`thread-id`、`x-client-request-id`、proxy installation id、WS stream start timestamp 只有在 `other.codex.auto_generate.*` 对应字段显式为 `true` 时才自动生成。
+- `other.codex` policy 现在是显式小 schema；除 `User-Agent` 和 `originator` 使用[统一身份规则](codex-client-identity.md)外，身份字段默认全量透穿/省略。`session-id`、`thread-id`、`x-client-request-id`、proxy installation id、WS stream start timestamp 只有在 `other.codex.auto_generate.*` 对应字段显式为 `true` 时才自动生成。
 
 仍需明确取舍的差异：
 
 - `pi_official` 没有实现；如果 PI parity 是目标，应做独立 provider/profile，而不是恢复 UA smart fallback。
 - `/v1/realtime` 兼容入口仍保留 legacy execution-session header 语义；不要把它和 `GET /v1/responses` Codex Official ResponsesWS 混为一条路径。
-- 默认 UA 仍是 one-hub 合成的 Codex-like UA，不是 Codex release 包的精确 UA。
+- UA／originator 的代码兜底与 PI 一致；这不代表其他请求字段或传输行为切换到 PI profile。
 - 普通 `/responses` 当前会把 resolved `x-codex-installation-id` 投影为 HTTP header；若严格追随本文固定 Codex 快照的普通请求画像，需要重新评估是否只保留 body 层。
 - `/responses/compact` 当前也会发送 `x-client-request-id`；固定 Codex 快照里 compact 路径未明确额外补该字段。
 - responses-lite 当前只有 inbound header 会在真实请求中触发；没有公开 channel policy knob，也没有未接入的内部 policy 分支。

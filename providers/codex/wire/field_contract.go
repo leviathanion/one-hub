@@ -37,8 +37,6 @@ type fieldSpec struct {
 }
 
 var fieldSpecs = []fieldSpec{
-	{header: "User-Agent", valid: validUserAgent, singleton: true},
-	{header: "originator", valid: validOriginator, singleton: true},
 	{header: "session-id", metadata: "session_id", valid: validID, singleton: true, validateMetadata: true},
 	{header: "thread-id", metadata: "thread_id", valid: validID, singleton: true, validateMetadata: true},
 	{header: "x-client-request-id", valid: validID, singleton: true},
@@ -72,15 +70,4 @@ func fieldSpecForHeader(name string) (fieldSpec, bool) {
 		}
 	}
 	return fieldSpec{}, false
-}
-
-func validateOriginatorValue(value string) error {
-	if !validOriginator(strings.TrimSpace(value)) {
-		return reject("originator", "value is invalid")
-	}
-	return nil
-}
-
-func ValidateOriginator(value string) error {
-	return validateOriginatorValue(value)
 }

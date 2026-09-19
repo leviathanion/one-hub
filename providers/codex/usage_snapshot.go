@@ -489,12 +489,7 @@ func (p *CodexProvider) getUsageRequestHeaders(ctx context.Context) (map[string]
 	}
 
 	headers.Set("Accept", "application/json")
-	if strings.TrimSpace(headers.Get("User-Agent")) == "" {
-		headers.Set("User-Agent", defaultUserAgent)
-	}
-	headers.SetIfAbsent("originator", resolveSmartOriginatorForEffectiveUserAgent(headers.Get("User-Agent")))
-
-	return headers.Map(), nil
+	return clientIdentityHeaderMap(headers), nil
 }
 
 func readCodexUsageResponseBody(body io.Reader) ([]byte, error) {

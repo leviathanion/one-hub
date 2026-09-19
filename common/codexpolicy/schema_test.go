@@ -7,6 +7,7 @@ func TestKnownKeyAndResidencyGrammar(t *testing.T) {
 		KeyFedRAMP,
 		KeyResidency,
 		KeyDefaultOriginator,
+		KeyDefaultUserAgent,
 		KeyTrustClientAttestation,
 		KeyAutoGenerate,
 	} {

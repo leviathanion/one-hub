@@ -66,7 +66,7 @@ func (p *CodexProvider) prepareChatRealtimeConnWithSelfHosted(modelName, session
 	safeRouteRetry := !p.codexOpenMayMutateCredentials()
 	headers, err := p.getRealtimeHeaders(sessionID)
 	if err != nil {
-		return nil, p.handleTokenError(err)
+		return nil, p.requestHeaderError(err)
 	}
 
 	return &codexRealtimeConnPlan{
@@ -400,7 +400,7 @@ func (p *CodexProvider) getRealtimeHeaders(sessionID string) (map[string]string,
 	headers.Delete("Accept")
 	p.applyRealtimeRequestHeaderOverrides(headers)
 	headers.Set("OpenAI-Beta", codexResponsesWebsocketBetaHeaderValue)
-	return headers.Map(), nil
+	return clientIdentityHeaderMap(headers), nil
 }
 
 func (p *CodexProvider) buildRealtimeRequestCompatibilityHeaders() map[string]string {

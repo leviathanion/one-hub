@@ -1,11 +1,16 @@
 package codexpolicy
 
-import "strings"
+import (
+	"strings"
+
+	"golang.org/x/net/http/httpguts"
+)
 
 const (
 	KeyFedRAMP                = "fedramp"
 	KeyResidency              = "residency"
 	KeyDefaultOriginator      = "default_originator"
+	KeyDefaultUserAgent       = "default_user_agent"
 	KeyTrustClientAttestation = "trust_client_attestation"
 	KeyAutoGenerate           = "auto_generate"
 )
@@ -22,8 +27,14 @@ var knownKeys = map[string]struct{}{
 	KeyFedRAMP:                {},
 	KeyResidency:              {},
 	KeyDefaultOriginator:      {},
+	KeyDefaultUserAgent:       {},
 	KeyTrustClientAttestation: {},
 	KeyAutoGenerate:           {},
+}
+
+// ValidClientIdentityHeader 只约束 HTTP 传输安全和资源上限，不解释客户端身份。
+func ValidClientIdentityHeader(value string) bool {
+	return len(value) <= 16*1024 && !strings.ContainsAny(value, "\r\n") && httpguts.ValidHeaderFieldValue(value)
 }
 
 var knownAutoGenerateKeys = map[string]struct{}{

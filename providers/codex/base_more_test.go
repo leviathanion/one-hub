@@ -15,6 +15,7 @@ import (
 	"one-api/common/responsesws"
 	"one-api/model"
 	"one-api/providers/base"
+	"one-api/providers/codex/wire"
 	"one-api/providers/openai"
 	"one-api/types"
 
@@ -160,7 +161,7 @@ func TestCodexBaseHelperFunctionsAndHeaderFallbacks(t *testing.T) {
 		logger.Logger = originalLogger
 	})
 
-	if DefaultUserAgent() != defaultUserAgent {
+	if DefaultUserAgent() != wire.DefaultUserAgent() {
 		t.Fatalf("expected DefaultUserAgent to expose codex default, got %q", DefaultUserAgent())
 	}
 	if prepared := prepareChannelForProvider(nil); prepared != nil {

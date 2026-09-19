@@ -28,11 +28,8 @@ import (
 )
 
 const (
-	TokenCacheKey                     = "api_token:codex"
-	refreshLockKeyPrefix              = "codex:refresh-lock"
-	defaultUserAgent                  = "codex-tui/0.135.0 (Arch Linux Rolling Release; x86_64) foot (codex-tui; 0.135.0)"
-	defaultOfficialCodexOriginator    = "codex-tui"
-	defaultNonOfficialCodexOriginator = "pi"
+	TokenCacheKey        = "api_token:codex"
+	refreshLockKeyPrefix = "codex:refresh-lock"
 	// Upstream may rotate the refresh token before the request context is canceled.
 	// Give the mandatory DB commit a small independent budget: this may outlive the
 	// caller briefly, but avoids losing the only valid rotated credential.
@@ -63,7 +60,7 @@ type codexChannelOptions struct {
 }
 
 func DefaultUserAgent() string {
-	return defaultUserAgent
+	return wire.DefaultUserAgent()
 }
 
 var channelRefreshLocks = struct {
@@ -155,11 +152,11 @@ type CodexProvider struct {
 	channelOptionsMu        sync.Mutex
 	channelOptions          *codexChannelOptions
 	channelOptionsLoaded    bool
-	officialPolicyMu        sync.Mutex
-	officialPolicyLoaded    bool
-	officialPolicyKey       string
-	officialPolicy          wire.ChannelPolicy
-	officialPolicyErr       error
+	channelPolicyMu         sync.Mutex
+	channelPolicyLoaded     bool
+	channelPolicyKey        string
+	channelPolicy           wire.ChannelPolicy
+	channelPolicyErr        error
 }
 
 func prepareChannelForProvider(channel *model.Channel) *model.Channel {
@@ -226,12 +223,12 @@ func (p *CodexProvider) syncRuntimeChannelWithAccessToken(channel *model.Channel
 		p.channelOptions = nil
 		p.channelOptionsLoaded = false
 		p.channelOptionsMu.Unlock()
-		p.officialPolicyMu.Lock()
-		p.officialPolicyLoaded = false
-		p.officialPolicyKey = ""
-		p.officialPolicy = wire.ChannelPolicy{}
-		p.officialPolicyErr = nil
-		p.officialPolicyMu.Unlock()
+		p.channelPolicyMu.Lock()
+		p.channelPolicyLoaded = false
+		p.channelPolicyKey = ""
+		p.channelPolicy = wire.ChannelPolicy{}
+		p.channelPolicyErr = nil
+		p.channelPolicyMu.Unlock()
 		return
 	}
 	p.rebuildRequesterWithAccessToken(accessToken)
@@ -482,6 +479,9 @@ func (p *CodexProvider) getRequestHeaderBagWithContext(ctx context.Context) (*co
 
 	// Apply channel ModelHeaders overrides.
 	p.applyCommonRequestHeaders(headers)
+	if err := p.applyClientIdentityHeaders(headers); err != nil {
+		return nil, err
+	}
 
 	// Fetch token using the operation context. Background refreshes do not carry a
 	// Gin context, so falling back to p.GetToken() here would make their timeout
@@ -493,7 +493,7 @@ func (p *CodexProvider) getRequestHeaderBagWithContext(ctx context.Context) (*co
 		} else {
 			logger.SysError("Failed to get Codex token: " + err.Error())
 		}
-		return nil, fmt.Errorf("failed to get token: %w", err)
+		return nil, &codexHeaderTokenError{cause: err}
 	}
 
 	// Set required headers.
@@ -514,7 +514,7 @@ func (p *CodexProvider) getRequestHeadersInternal() (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return headers.Map(), nil
+	return clientIdentityHeaderMap(headers), nil
 }
 
 // filterAndPassthroughClientHeaders passes through allow-listed headers.
@@ -550,7 +550,7 @@ func (p *CodexProvider) filterAndPassthroughClientHeaders(headers *codexHeaderBa
 func (p *CodexProvider) GetRequestHeaders() map[string]string {
 	headers, err := p.getRequestHeaderBag()
 	if err == nil && headers != nil {
-		return headers.Map()
+		return clientIdentityHeaderMap(headers)
 	}
 
 	fallback := newCodexHeaderBag()

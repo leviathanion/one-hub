@@ -33,7 +33,7 @@ func TestCodexOfficialChannelPolicyValidatesDefaultOriginator(t *testing.T) {
 		t.Fatalf("expected trimmed default_originator, got %q", policy.DefaultOriginator)
 	}
 
-	provider = newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"codex":{"default_originator":"bad value"}}`, nil)
+	provider = newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"codex":{"default_originator":"bad\r\nvalue"}}`, nil)
 	_, err = provider.codexOfficialChannelPolicy()
 	if err == nil || !strings.Contains(err.Error(), "default_originator") {
 		t.Fatalf("expected invalid default_originator rejection, got %v", err)

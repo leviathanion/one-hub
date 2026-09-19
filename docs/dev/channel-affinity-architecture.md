@@ -277,7 +277,8 @@ Codex realtime 的共享亲和逻辑由 `providers/codex/realtime_session.go` �
    - `ResolveHit + revoked`：计划 `replace_if_matches`
    - `ResolveHit + incompatible`：计划 `replace_if_matches`
    - `ResolveBackendError` 或 `RevocationUnknown`：不 resume，也不宣称自己有新的 shared owner
-3. 打开新 session 后，如果是 local-only，则通过 `codexMaybePromoteExecutionSession(...)` 尝试 piggyback promotion。
+3. 尝试恢复本地 local-only session 时，在持有 session 锁的情况下核对渠道 ID 和 `CompatibilityHash`；不匹配则释放 lease 并走新建，不能覆盖第 2 步的不兼容判断。
+4. 打开或恢复 session 后，如果是 local-only，则通过 `codexMaybePromoteExecutionSession(...)` 尝试 piggyback promotion。
 
 一致性边界：
 

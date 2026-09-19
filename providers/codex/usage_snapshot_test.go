@@ -259,10 +259,10 @@ func TestConsumeResetCreditSendsOfficialRequest(t *testing.T) {
 		if got := r.Header.Get("chatgpt-account-id"); got != "acct-123" {
 			t.Fatalf("expected account id header, got %q", got)
 		}
-		if got := r.Header.Get("User-Agent"); got != defaultUserAgent {
-			t.Fatalf("expected default user agent %q, got %q", defaultUserAgent, got)
+		if got := r.Header.Get("User-Agent"); got != DefaultUserAgent() {
+			t.Fatalf("expected default user agent %q, got %q", DefaultUserAgent(), got)
 		}
-		if got := r.Header.Get("originator"); got != defaultOfficialCodexOriginator {
+		if got := r.Header.Get("originator"); got != "pi" {
 			t.Fatalf("expected official originator, got %q", got)
 		}
 

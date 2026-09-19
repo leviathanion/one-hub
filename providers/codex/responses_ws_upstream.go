@@ -118,10 +118,6 @@ func (p *CodexProvider) prepareResponsesWSOfficialConn(ctx context.Context, req 
 			return nil, common.ErrorWrapperLocal(err, "channel_config_error", http.StatusServiceUnavailable)
 		}
 	}
-	token, err := p.GetToken()
-	if err != nil {
-		return nil, p.handleTokenError(err)
-	}
 	identity, decisions, err := wire.ResolveIdentity(wire.IdentityInput{
 		Operation: wire.OpResponsesWSOpen,
 		Headers:   req.InboundHeaders,
@@ -133,6 +129,10 @@ func (p *CodexProvider) prepareResponsesWSOfficialConn(ctx context.Context, req 
 	})
 	if err != nil {
 		return nil, codexWireError(err)
+	}
+	token, err := p.GetToken()
+	if err != nil {
+		return nil, p.handleTokenError(err)
 	}
 	plan, err := wire.BuildHeaders(wire.HeaderPlanInput{
 		Operation: wire.OpResponsesWSOpen,

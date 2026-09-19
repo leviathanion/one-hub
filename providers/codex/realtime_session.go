@@ -286,12 +286,12 @@ func codexMaybePromoteExecutionSession(exec *runtimesession.ExecutionSession) {
 	}
 }
 
-func codexAcquireLocalOnlyExecutionSession(bindingKey, excludedSessionKey string) (*runtimesession.ExecutionSession, func(), bool) {
-	if strings.TrimSpace(bindingKey) == "" {
+func codexAcquireLocalOnlyExecutionSession(expected runtimesession.Metadata, excludedSessionKey string) (*runtimesession.ExecutionSession, func(), bool) {
+	if strings.TrimSpace(expected.BindingKey) == "" {
 		return nil, nil, false
 	}
 
-	binding, ok := currentCodexExecutionSessions().ResolveLocal(bindingKey)
+	binding, ok := currentCodexExecutionSessions().ResolveLocal(expected.BindingKey)
 	if !ok || binding == nil || binding.SessionKey == strings.TrimSpace(excludedSessionKey) {
 		return nil, nil, false
 	}
@@ -302,7 +302,9 @@ func codexAcquireLocalOnlyExecutionSession(bindingKey, excludedSessionKey string
 	}
 
 	exec.Lock()
-	if exec.IsClosed() || exec.Visibility != runtimesession.VisibilityLocalOnly {
+	// 本地恢复只能恢复同一上游身份；不能绕过 shared binding 已作出的替换决定。
+	if exec.IsClosed() || exec.Visibility != runtimesession.VisibilityLocalOnly ||
+		exec.ChannelID != expected.ChannelID || exec.CompatibilityHash != expected.CompatibilityHash {
 		exec.Unlock()
 		releaseLease()
 		return nil, nil, false
@@ -425,7 +427,7 @@ func (p *CodexProvider) OpenRealtimeSessionWithOptions(modelName string, options
 			}
 		}
 		if !options.ForceFresh && exec == nil && strings.TrimSpace(meta.BindingKey) != "" {
-			exec, releaseLease, ok = codexAcquireLocalOnlyExecutionSession(meta.BindingKey, plan.candidateSessionKey)
+			exec, releaseLease, ok = codexAcquireLocalOnlyExecutionSession(meta, plan.candidateSessionKey)
 			if ok {
 				created = false
 			}
@@ -1047,7 +1049,10 @@ func (p *CodexProvider) buildExecutionSessionMetadata(modelName string, options 
 	callerNS := p.readRealtimeCallerNamespace()
 	capacityNS := p.readRealtimeCapacityNamespace()
 	upstreamIdentity := p.readRealtimeUpstreamIdentity()
-	compatibilityHash := p.buildRealtimeCompatibilityHash(modelName, upstreamIdentity)
+	compatibilityHash, err := p.buildRealtimeCompatibilityHash(modelName, upstreamIdentity)
+	if err != nil {
+		return runtimesession.Metadata{}, codexClientIdentityError(err)
+	}
 	channelID := 0
 	if channel := p.codexChannel(); channel != nil {
 		channelID = channel.Id
@@ -1108,13 +1113,17 @@ func parseCodexExecutionSessionKey(key string) (int, string, string, bool) {
 	return channelID, compatibilityHash, sessionID, true
 }
 
-func (p *CodexProvider) buildRealtimeCompatibilityHash(modelName, upstreamIdentity string) string {
+func (p *CodexProvider) buildRealtimeCompatibilityHash(modelName, upstreamIdentity string) (string, error) {
+	signature, err := p.buildRealtimeHandshakePolicySignature()
+	if err != nil {
+		return "", err
+	}
 	return hashCodexExecutionIdentity(strings.Join([]string{
 		codexRealtimeProtocolName,
 		strings.TrimSpace(modelName),
 		upstreamIdentity,
-		p.buildRealtimeHandshakePolicySignature(),
-	}, "|"))
+		signature,
+	}, "|")), nil
 }
 
 func (p *CodexProvider) readRealtimeClientSessionID(options runtimerealtime.RealtimeOpenOptions) (string, bool, *types.OpenAIErrorWithStatusCode) {
@@ -1135,8 +1144,11 @@ func (p *CodexProvider) readRealtimeClientSessionID(options runtimerealtime.Real
 	return "", false, nil
 }
 
-func (p *CodexProvider) buildRealtimeHandshakePolicySignature() string {
-	headers := p.buildRealtimeCompatibilityHeaders()
+func (p *CodexProvider) buildRealtimeHandshakePolicySignature() (string, error) {
+	headers, err := p.buildRealtimeCompatibilityHeaders()
+	if err != nil {
+		return "", err
+	}
 	userAgent := ""
 	if value := strings.TrimSpace(headers["user-agent"]); value != "" {
 		userAgent = value
@@ -1148,29 +1160,31 @@ func (p *CodexProvider) buildRealtimeHandshakePolicySignature() string {
 		EffectiveHeaders:   headers,
 	}
 	if policy.EffectiveUserAgent == "" && len(policy.EffectiveHeaders) == 0 {
-		return ""
+		return "", nil
 	}
 
 	payload, err := json.Marshal(policy)
 	if err != nil {
-		return ""
+		return "", err
 	}
-	return string(payload)
+	return string(payload), nil
 }
 
-func (p *CodexProvider) buildRealtimeCompatibilityHeaders() map[string]string {
+func (p *CodexProvider) buildRealtimeCompatibilityHeaders() (map[string]string, error) {
 	headers := newCodexHeaderBagFromMap(p.buildRealtimeRequestCompatibilityHeaders())
 	for key, value := range p.buildRealtimeChannelCompatibilityHeaders() {
 		headers.Set(key, value)
 	}
 	p.applyRealtimeRequestHeaderOverrides(headers)
-	if !headers.Has("User-Agent") {
-		headers.Set("User-Agent", defaultUserAgent)
+	if err := p.applyClientIdentityHeaders(headers); err != nil {
+		return nil, err
 	}
-	if !headers.Has("originator") {
-		headers.Set("originator", resolveSmartOriginatorForEffectiveUserAgent(headers.Get("User-Agent")))
+	// 签名使用规范化键，与实际请求采用同一份身份解析结果。
+	result := make(map[string]string)
+	for key, value := range headers.Map() {
+		result[strings.ToLower(key)] = value
 	}
-	return headers.Map()
+	return result, nil
 }
 
 func (p *CodexProvider) buildRealtimeChannelCompatibilityHeaders() map[string]string {

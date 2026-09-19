@@ -212,7 +212,7 @@ func TestBuildExecutionSessionMetadataPrefersXSessionIDOverConversationSessionID
 	if channelID != provider.Channel.Id {
 		t.Fatalf("expected session key channel #%d, got #%d", provider.Channel.Id, channelID)
 	}
-	if compatibilityHash != provider.buildRealtimeCompatibilityHash("gpt-5", provider.readRealtimeUpstreamIdentity()) {
+	if compatibilityHash != requireRealtimeCompatibilityHash(t, provider, "gpt-5", provider.readRealtimeUpstreamIdentity()) {
 		t.Fatalf("expected compatibility hash to match current channel handshake policy, got %q", compatibilityHash)
 	}
 	if upstreamSessionID != meta.SessionID {
@@ -1790,110 +1790,5 @@ func TestAcquireChannelRefreshLockHonorsCancellationWhileWaiting(t *testing.T) {
 	channelRefreshLocks.mu.Unlock()
 	if ok {
 		t.Fatal("expected canceled waiter and released holder to clean up lock entry")
-	}
-}
-
-func TestIsCodexOfficialClientRequest(t *testing.T) {
-	tests := []struct {
-		name      string
-		userAgent string
-		want      bool
-	}{
-		{"empty", "", false},
-		{"codex_cli_rs", "codex_cli_rs/0.116.0", true},
-		{"codex_vscode", "codex_vscode/1.0.0", true},
-		{"codex_app", "codex_app/2.1.0", true},
-		{"codex_chatgpt_desktop", "codex_chatgpt_desktop/1.0", true},
-		{"codex_atlas", "codex_atlas/0.5", true},
-		{"codex_exec", "codex_exec/3.0", true},
-		{"codex_sdk_ts", "codex_sdk_ts/0.9", true},
-		{"codex desktop with version", "Codex Desktop/1.0", true},
-		{"codex desktop case insensitive", "CODEX DESKTOP/2.0", true},
-		{"codex slash prefix", "codex/1.0", true},
-		{"codex hyphen prefix", "codex-tui/1.0", true},
-		{"codex bare prefix", "CodexCanary/1.0", true},
-		{"non-codex curl", "curl/8.0", false},
-		{"non-codex browser", "Mozilla/5.0", false},
-		{"codex substring only", "my-codex-tool/1.0", false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := isCodexOfficialClientRequest(tt.userAgent); got != tt.want {
-				t.Fatalf("isCodexOfficialClientRequest(%q) = %v, want %v", tt.userAgent, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestIsCodexOfficialClientOriginator(t *testing.T) {
-	tests := []struct {
-		name       string
-		originator string
-		want       bool
-	}{
-		{"empty", "", false},
-		{"codex_cli_rs", "codex_cli_rs", true},
-		{"codex_vscode", "codex_vscode", true},
-		{"codex_app", "codex_app", true},
-		{"codex_chatgpt_desktop", "codex_chatgpt_desktop", true},
-		{"codex_atlas", "codex_atlas", true},
-		{"codex_exec", "codex_exec", true},
-		{"codex_sdk_ts", "codex_sdk_ts", true},
-		{"codex desktop", "Codex Desktop", true},
-		{"codex desktop case insensitive", "CODEX DESKTOP", true},
-		{"codex slash prefix", "codex/cli", true},
-		{"codex hyphen prefix", "codex-tui", true},
-		{"codex bare prefix", "CodexCanary", true},
-		{"non-codex", "my_client", false},
-		{"codex substring only", "my-codex-client", false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := isCodexOfficialClientOriginator(tt.originator); got != tt.want {
-				t.Fatalf("isCodexOfficialClientOriginator(%q) = %v, want %v", tt.originator, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestIsCodexOfficialClientByHeaders(t *testing.T) {
-	tests := []struct {
-		name       string
-		userAgent  string
-		originator string
-		want       bool
-	}{
-		{"both empty", "", "", false},
-		{"UA official only", "codex_cli_rs/1.0", "", true},
-		{"originator official only", "curl/8.0", "codex_vscode", true},
-		{"both official", "codex_app/3.0", "codex_chatgpt_desktop", true},
-		{"neither official", "curl/8.0", "my_client", false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := isCodexOfficialClientByHeaders(tt.userAgent, tt.originator); got != tt.want {
-				t.Fatalf("isCodexOfficialClientByHeaders(%q, %q) = %v, want %v", tt.userAgent, tt.originator, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestResolveSmartOriginatorForEffectiveUserAgent(t *testing.T) {
-	tests := []struct {
-		name      string
-		userAgent string
-		want      string
-	}{
-		{"empty effective UA", "", defaultNonOfficialCodexOriginator},
-		{"official client UA", "codex_cli_rs/0.116.0", defaultOfficialCodexOriginator},
-		{"codex-tui client UA", "codex-tui/1.0", defaultOfficialCodexOriginator},
-		{"non-official client UA", "curl/8.0", defaultNonOfficialCodexOriginator},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := resolveSmartOriginatorForEffectiveUserAgent(tt.userAgent); got != tt.want {
-				t.Fatalf("resolveSmartOriginatorForEffectiveUserAgent(%q) = %q, want %q", tt.userAgent, got, tt.want)
-			}
-		})
 	}
 }

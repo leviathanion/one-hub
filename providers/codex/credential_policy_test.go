@@ -151,6 +151,60 @@ func TestCodexOfficialChannelPolicyCacheInvalidatesOnChannelConfigChange(t *test
 	}
 }
 
+func TestCodexDefaultUserAgentConfiguration(t *testing.T) {
+	for _, value := range []string{`"custom/1.0"`, `""`, `" \t"`, `"` + strings.Repeat("x", 300) + `"`} {
+		p := newTestCodexProviderWithContext(t, `{}`, `{"codex":{"default_user_agent":`+value+`}}`, nil)
+		if _, err := p.codexOfficialChannelPolicy(); err != nil {
+			t.Fatalf("valid UA %s: %v", value, err)
+		}
+	}
+	for _, value := range []string{`true`, `42`, `"bad\r\nInjected: value"`, `"bad\x00"`, `"` + strings.Repeat("x", 16*1024+1) + `"`} {
+		p := newTestCodexProviderWithContext(t, `{}`, `{"codex":{"default_user_agent":`+value+`}}`, nil)
+		if _, err := p.codexOfficialChannelPolicy(); err == nil {
+			t.Fatal("invalid default UA accepted")
+		}
+	}
+}
+
+func TestCodexChannelPolicyCacheSharedAcrossEntrypoints(t *testing.T) {
+	p := newTestCodexProviderWithContext(t, `{}`, `{"codex":{"default_user_agent":true}}`, nil)
+	identityErr := p.applyClientIdentityHeaders(newCodexHeaderBag())
+	_, responsesErr := p.codexOfficialChannelPolicy()
+	_, realtimeErr := p.buildRealtimeHandshakePolicySignature()
+	if identityErr == nil || identityErr != responsesErr || identityErr != realtimeErr {
+		t.Fatalf("unchanged policy should reuse one parsed failure: %v / %v / %v", identityErr, responsesErr, realtimeErr)
+	}
+
+	// 修复配置后，缓存中的错误和旧成功值都必须失效。
+	p.Channel.Other = `{"codex":{"default_user_agent":"configured/1","default_originator":"configured"}}`
+	first := requireRealtimeHandshakeSignature(t, p)
+	if !strings.Contains(first, "configured/1") {
+		t.Fatalf("cached error survived config repair: %s", first)
+	}
+	policy, err := p.codexOfficialChannelPolicy()
+	if err != nil || policy.DefaultUserAgent != "configured/1" {
+		t.Fatalf("unexpected Responses policy: %+v %v", policy, err)
+	}
+	p.Channel.Other = `{"codex":{"default_user_agent":"configured/2","default_originator":"configured"}}`
+	second := requireRealtimeHandshakeSignature(t, p)
+	if first == second || !strings.Contains(second, "configured/2") {
+		t.Fatalf("stale realtime identity: %s", second)
+	}
+
+	// Responses 的 model_headers 限制不能污染共用 policy 缓存。
+	p.Channel.ModelHeaders = stringPtr(`{"X-Business":"legacy"}`)
+	if _, err := p.codexOfficialChannelPolicy(); err == nil {
+		t.Fatal("Responses must still reject model_headers")
+	}
+	if got := requireRealtimeHandshakeSignature(t, p); !strings.Contains(got, "configured/2") {
+		t.Fatalf("Responses guard changed realtime policy: %s", got)
+	}
+	p.Channel.ModelHeaders = nil
+	if _, err := p.codexOfficialChannelPolicy(); err != nil {
+		t.Fatalf("model_headers rejection leaked into shared cache: %v", err)
+	}
+}
+
 func TestCodexPrincipalFingerprintRequiresDedicatedSecret(t *testing.T) {
 	originalIdentity := config.CodexIdentitySecret
 	t.Cleanup(func() {

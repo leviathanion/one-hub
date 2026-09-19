@@ -342,7 +342,7 @@ func TestCodexAcquireLocalOnlyExecutionSessionBranches(t *testing.T) {
 	provider.Context.Set("token_id", 415)
 	meta := codexTestMeta(t, provider)
 
-	if exec, release, ok := codexAcquireLocalOnlyExecutionSession("", ""); ok || exec != nil || release != nil {
+	if exec, release, ok := codexAcquireLocalOnlyExecutionSession(runtimesession.Metadata{}, ""); ok || exec != nil || release != nil {
 		t.Fatalf("expected blank binding key lookup to fail, exec=%+v ok=%v", exec, ok)
 	}
 
@@ -353,7 +353,7 @@ func TestCodexAcquireLocalOnlyExecutionSessionBranches(t *testing.T) {
 	sharedExec.Lock()
 	codexMarkExecutionSessionSharedLocked(sharedExec)
 	sharedExec.Unlock()
-	if exec, release, ok := codexAcquireLocalOnlyExecutionSession(meta.BindingKey, ""); ok || exec != nil || release != nil {
+	if exec, release, ok := codexAcquireLocalOnlyExecutionSession(meta, ""); ok || exec != nil || release != nil {
 		t.Fatalf("expected shared execution session not to be treated as local-only, exec=%+v ok=%v", exec, ok)
 	}
 
@@ -367,10 +367,10 @@ func TestCodexAcquireLocalOnlyExecutionSessionBranches(t *testing.T) {
 	codexMarkExecutionSessionLocalOnlyLocked(localExec, runtimesession.PublishIntentCreateIfAbsent, "")
 	localExec.Unlock()
 
-	if exec, release, ok := codexAcquireLocalOnlyExecutionSession(meta.BindingKey, localExec.Key); ok || exec != nil || release != nil {
+	if exec, release, ok := codexAcquireLocalOnlyExecutionSession(meta, localExec.Key); ok || exec != nil || release != nil {
 		t.Fatalf("expected excluded local-only session not to be acquired, exec=%+v ok=%v", exec, ok)
 	}
-	if exec, release, ok := codexAcquireLocalOnlyExecutionSession(meta.BindingKey, ""); !ok || exec != localExec || release == nil {
+	if exec, release, ok := codexAcquireLocalOnlyExecutionSession(meta, ""); !ok || exec != localExec || release == nil {
 		t.Fatalf("expected local-only execution session to be acquired, exec=%+v ok=%v", exec, ok)
 	} else {
 		release()

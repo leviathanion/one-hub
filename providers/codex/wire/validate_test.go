@@ -3,12 +3,6 @@ package wire
 import "testing"
 
 func TestValidationGrammarBoundaries(t *testing.T) {
-	if validOriginator("bad value") {
-		t.Fatal("originator with spaces must be invalid")
-	}
-	if !validOriginator("codex_cli_rs.test-1") {
-		t.Fatal("expected documented originator token to be valid")
-	}
 	if validTraceparent("00-00000000000000000000000000000000-0000000000000000-01") {
 		t.Fatal("zero trace/span ids must be invalid")
 	}

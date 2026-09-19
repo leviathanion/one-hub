@@ -970,8 +970,8 @@ func TestCodexManagedRealtimeRejectsExecutionSessionReuseAcrossDifferentRequestH
 		{
 			name:      "originator",
 			headerKey: "Originator",
-			valueA:    "codex-cli-a",
-			valueB:    "codex-cli-b",
+			valueA:    "codex_cli_rs",
+			valueB:    "codex-tui",
 		},
 		{
 			name:      "beta_features",
@@ -1056,7 +1056,7 @@ func TestCodexManagedRealtimeRejectsExecutionSessionReuseAcrossDifferentChannelU
 	})
 	providerA.Context.Set("token_id", 214)
 	providerA.Channel.BaseURL = stringPtr(server.URL)
-	providerA.Channel.ModelHeaders = stringPtr(`{"User-Agent":"channel-codex-ua-a"}`)
+	providerA.Channel.Other = `{"codex":{"default_user_agent":"channel-codex-ua-a"}}`
 
 	sessionA, errWithCode := providerA.OpenRealtimeSession("gpt-5")
 	if errWithCode != nil {
@@ -1074,7 +1074,7 @@ func TestCodexManagedRealtimeRejectsExecutionSessionReuseAcrossDifferentChannelU
 	})
 	providerB.Context.Set("token_id", 214)
 	providerB.Channel.BaseURL = stringPtr(server.URL)
-	providerB.Channel.ModelHeaders = stringPtr(`{"User-Agent":"channel-codex-ua-b"}`)
+	providerB.Channel.Other = `{"codex":{"default_user_agent":"channel-codex-ua-b"}}`
 
 	sessionB, errWithCode := providerB.OpenRealtimeSession("gpt-5")
 	if errWithCode != nil {
@@ -2801,6 +2801,64 @@ func TestCodexRealtimeReopenLocalOnlySessionPromotesToShared(t *testing.T) {
 	}
 	if managed.exec.PublishIntent != runtimesession.PublishIntentNone {
 		t.Fatalf("expected promotion to clear publish intent, got %q", managed.exec.PublishIntent)
+	}
+}
+
+func TestCodexRealtimeLocalOnlyReuseRequiresMatchingIdentityAndChannel(t *testing.T) {
+	for _, change := range []string{"unchanged", "identity", "channel"} {
+		t.Run(change, func(t *testing.T) {
+			var connections atomic.Int32
+			server := newCodexRealtimeCountingServer(t, &connections)
+			defer server.Close()
+			manager := runtimesession.NewManagerWithOptions(runtimesession.ManagerOptions{
+				DefaultTTL: time.Minute, Cleanup: cleanupCodexExecutionSession,
+			})
+			replaceCodexExecutionSessionsForTest(t, manager)
+			p := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{"self_hosted":true}`, map[string]string{
+				"X-Session-Id": "local-only-compatibility", "User-Agent": "codex-tui/1", "originator": "codex-tui",
+			})
+			p.Channel.BaseURL = stringPtr(server.URL)
+			p.Context.Set("token_id", 889)
+			first, apiErr := p.OpenRealtimeSession("gpt-5")
+			if apiErr != nil {
+				t.Fatal(apiErr)
+			}
+			a := first.(*codexManagedRealtimeSession)
+			defer a.Abort("test_cleanup")
+			first.Detach("test_reopen")
+			a.exec.Lock()
+			codexMarkExecutionSessionLocalOnlyLocked(a.exec, runtimesession.PublishIntentNone, "")
+			a.exec.Unlock()
+			switch change {
+			case "identity":
+				p.Context.Request.Header.Set("User-Agent", "codex-tui/2")
+			case "channel":
+				p.Channel.Id++
+			}
+			expected := codexTestMeta(t, p)
+			second, apiErr := p.OpenRealtimeSession("gpt-5")
+			if apiErr != nil {
+				t.Fatal(apiErr)
+			}
+			b := second.(*codexManagedRealtimeSession)
+			defer b.Abort("test_cleanup")
+			if got, want := a.exec == b.exec, change == "unchanged"; got != want {
+				t.Fatalf("session reuse=%v, want %v", got, want)
+			}
+			b.exec.Lock()
+			channelID, compatibilityHash := b.exec.ChannelID, b.exec.CompatibilityHash
+			b.exec.Unlock()
+			if channelID != expected.ChannelID || compatibilityHash != expected.CompatibilityHash {
+				t.Fatalf("reopened with stale channel/hash: %d %s", channelID, compatibilityHash)
+			}
+			wantConnections := int32(2)
+			if change == "unchanged" {
+				wantConnections = 1
+			}
+			if got := connections.Load(); got != wantConnections {
+				t.Fatalf("upstream connections=%d, want %d", got, wantConnections)
+			}
+		})
 	}
 }
 

@@ -1282,15 +1282,15 @@ func TestCodexRealtimeMetadataCompatibilityAndNamespaceBranches(t *testing.T) {
 	if _, exists := channelHeaders["authorization"]; exists {
 		t.Fatalf("expected authorization header to be filtered, got %+v", channelHeaders)
 	}
-	if channelHeaders["x-trace"] != "trace" || channelHeaders["originator"] != defaultOfficialCodexOriginator {
+	if channelHeaders["x-trace"] != "trace" || channelHeaders["originator"] != "codex-tui" {
 		t.Fatalf("expected filtered compatibility headers to preserve x-trace/originator, got %+v", channelHeaders)
 	}
 
-	signature := provider.buildRealtimeHandshakePolicySignature()
-	if !strings.Contains(signature, "channel-ua") || !strings.Contains(signature, defaultOfficialCodexOriginator) {
-		t.Fatalf("expected handshake signature to use channel user agent and preserve explicit channel originator, got %q", signature)
+	signature := requireRealtimeHandshakeSignature(t, provider)
+	if !strings.Contains(signature, DefaultUserAgent()) || !strings.Contains(signature, `"originator":"pi"`) {
+		t.Fatalf("expected handshake signature to use shared defaults rather than model_headers identity, got %q", signature)
 	}
-	if got := provider.buildRealtimeCompatibilityHash("gpt-5", provider.readRealtimeUpstreamIdentity()); got == "" {
+	if got := requireRealtimeCompatibilityHash(t, provider, "gpt-5", provider.readRealtimeUpstreamIdentity()); got == "" {
 		t.Fatal("expected compatibility hash to be populated")
 	}
 	if got := provider.readRealtimeUpstreamIdentity(); !strings.Contains(got, "credential:account:acct-123") {
@@ -1298,7 +1298,7 @@ func TestCodexRealtimeMetadataCompatibilityAndNamespaceBranches(t *testing.T) {
 	}
 }
 
-func TestCodexRealtimeCompatibilityHashSeparatesSmartOriginatorFallbacks(t *testing.T) {
+func TestCodexRealtimeCompatibilityHashSeparatesClientUserAgents(t *testing.T) {
 	key := `{"access_token":"access-token","account_id":"acct-123"}`
 	officialProvider := newTestCodexProviderWithContext(t, key, "", map[string]string{
 		"User-Agent": "codex_cli_rs/0.116.0",
@@ -1307,57 +1307,57 @@ func TestCodexRealtimeCompatibilityHashSeparatesSmartOriginatorFallbacks(t *test
 		"User-Agent": "curl/8.0",
 	})
 
-	officialSignature := officialProvider.buildRealtimeHandshakePolicySignature()
-	if !strings.Contains(officialSignature, "codex_cli_rs/0.116.0") || !strings.Contains(officialSignature, `"originator":"codex-tui"`) {
-		t.Fatalf("expected official user agent and synthesized codex-tui originator to remain in signature, got %q", officialSignature)
+	officialSignature := requireRealtimeHandshakeSignature(t, officialProvider)
+	if !strings.Contains(officialSignature, "codex_cli_rs/0.116.0") || strings.Contains(officialSignature, `"originator"`) {
+		t.Fatalf("expected client user agent without synthesized originator in signature, got %q", officialSignature)
 	}
 
-	nonOfficialSignature := nonOfficialProvider.buildRealtimeHandshakePolicySignature()
+	nonOfficialSignature := requireRealtimeHandshakeSignature(t, nonOfficialProvider)
 	if !strings.Contains(nonOfficialSignature, `"originator":"pi"`) {
-		t.Fatalf("expected non-official pi originator to remain in handshake signature, got %q", nonOfficialSignature)
+		t.Fatalf("expected PI fallback for non-Codex caller, got %q", nonOfficialSignature)
 	}
 
 	upstreamIdentity := officialProvider.readRealtimeUpstreamIdentity()
 	if upstreamIdentity != nonOfficialProvider.readRealtimeUpstreamIdentity() {
 		t.Fatalf("test setup expected matching upstream identity")
 	}
-	officialHash := officialProvider.buildRealtimeCompatibilityHash("gpt-5", upstreamIdentity)
-	nonOfficialHash := nonOfficialProvider.buildRealtimeCompatibilityHash("gpt-5", upstreamIdentity)
+	officialHash := requireRealtimeCompatibilityHash(t, officialProvider, "gpt-5", upstreamIdentity)
+	nonOfficialHash := requireRealtimeCompatibilityHash(t, nonOfficialProvider, "gpt-5", upstreamIdentity)
 	if officialHash == "" || nonOfficialHash == "" || officialHash == nonOfficialHash {
-		t.Fatalf("expected official and non-official smart originators to produce different hashes, official=%q non_official=%q", officialHash, nonOfficialHash)
+		t.Fatalf("expected different client user agents to produce different hashes, official=%q non_official=%q", officialHash, nonOfficialHash)
 	}
 }
 
-func TestCodexRealtimeCompatibilityHashSmartOriginatorUsesEffectiveChannelUserAgent(t *testing.T) {
+func TestCodexRealtimeCompatibilityHashKeepsClientIdentityAheadOfConfiguration(t *testing.T) {
 	key := `{"access_token":"access-token","account_id":"acct-123"}`
 	provider := newTestCodexProviderWithContext(t, key, "", map[string]string{
-		"User-Agent": "Mozilla/5.0",
+		"User-Agent": "codex-tui/1.0",
 	})
-	provider.Channel.ModelHeaders = stringPtr(`{"User-Agent":"codex-tui/1.0"}`)
+	provider.Channel.Other = `{"codex":{"default_user_agent":"channel-ua","default_originator":"configured"}}`
 
-	signature := provider.buildRealtimeHandshakePolicySignature()
-	if !strings.Contains(signature, "codex-tui/1.0") || !strings.Contains(signature, `"originator":"codex-tui"`) {
-		t.Fatalf("expected smart originator to follow effective channel user agent in signature, got %q", signature)
+	signature := requireRealtimeHandshakeSignature(t, provider)
+	if !strings.Contains(signature, "codex-tui/1.0") || strings.Contains(signature, `"originator"`) {
+		t.Fatalf("expected client UA to suppress configured identity fallbacks, got %q", signature)
 	}
 }
 
-func TestCodexRealtimeCompatibilityHashIncludesDefaultOriginator(t *testing.T) {
+func TestCodexRealtimeCompatibilityHashDistinguishesPartialClientIdentity(t *testing.T) {
 	key := `{"access_token":"access-token","account_id":"acct-123"}`
 	implicitProvider := newTestCodexProviderWithContext(t, key, "", map[string]string{
-		"User-Agent": defaultUserAgent,
+		"User-Agent": "codex-tui/1.0",
 	})
 	explicitProvider := newTestCodexProviderWithContext(t, key, "", map[string]string{
-		"User-Agent": defaultUserAgent,
-		"Originator": defaultOfficialCodexOriginator,
+		"User-Agent": "codex-tui/1.0",
+		"Originator": "pi",
 	})
 
-	implicitSignature := implicitProvider.buildRealtimeHandshakePolicySignature()
-	if !strings.Contains(implicitSignature, `"originator":"codex-tui"`) {
-		t.Fatalf("expected synthesized default originator to remain in signature, got %q", implicitSignature)
+	implicitSignature := requireRealtimeHandshakeSignature(t, implicitProvider)
+	if strings.Contains(implicitSignature, `"originator"`) {
+		t.Fatalf("expected missing originator to stay absent in signature, got %q", implicitSignature)
 	}
 
-	explicitSignature := explicitProvider.buildRealtimeHandshakePolicySignature()
-	if !strings.Contains(explicitSignature, `"originator":"codex-tui"`) {
+	explicitSignature := requireRealtimeHandshakeSignature(t, explicitProvider)
+	if !strings.Contains(explicitSignature, `"originator":"pi"`) {
 		t.Fatalf("expected explicit default originator to remain in signature, got %q", explicitSignature)
 	}
 
@@ -1365,10 +1365,10 @@ func TestCodexRealtimeCompatibilityHashIncludesDefaultOriginator(t *testing.T) {
 	if upstreamIdentity != explicitProvider.readRealtimeUpstreamIdentity() {
 		t.Fatalf("test setup expected matching upstream identity")
 	}
-	implicitHash := implicitProvider.buildRealtimeCompatibilityHash("gpt-5", upstreamIdentity)
-	explicitHash := explicitProvider.buildRealtimeCompatibilityHash("gpt-5", upstreamIdentity)
-	if implicitHash == "" || explicitHash == "" || implicitHash != explicitHash {
-		t.Fatalf("expected identical default originators to produce same compatibility hash, implicit=%q explicit=%q", implicitHash, explicitHash)
+	implicitHash := requireRealtimeCompatibilityHash(t, implicitProvider, "gpt-5", upstreamIdentity)
+	explicitHash := requireRealtimeCompatibilityHash(t, explicitProvider, "gpt-5", upstreamIdentity)
+	if implicitHash == "" || explicitHash == "" || implicitHash == explicitHash {
+		t.Fatalf("expected absent and explicit originators to produce different compatibility hashes, implicit=%q explicit=%q", implicitHash, explicitHash)
 	}
 }
 
@@ -1378,24 +1378,24 @@ func TestCodexRealtimeCompatibilityHashSeparatesDifferentOfficialUserAgents(t *t
 		"User-Agent": "codex-tui/1.0",
 	})
 	providerB := newTestCodexProviderWithContext(t, key, "", map[string]string{
-		"User-Agent": "CodexCanary/1.0",
+		"User-Agent": "Codex Desktop/1.0",
 	})
 
-	signatureA := providerA.buildRealtimeHandshakePolicySignature()
-	if !strings.Contains(signatureA, "codex-tui/1.0") || !strings.Contains(signatureA, `"originator":"codex-tui"`) {
-		t.Fatalf("expected official user agent and synthesized codex-tui originator to remain in signature, got %q", signatureA)
+	signatureA := requireRealtimeHandshakeSignature(t, providerA)
+	if !strings.Contains(signatureA, "codex-tui/1.0") || strings.Contains(signatureA, `"originator"`) {
+		t.Fatalf("expected client user agent without synthesized originator in signature, got %q", signatureA)
 	}
-	signatureB := providerB.buildRealtimeHandshakePolicySignature()
-	if !strings.Contains(signatureB, "CodexCanary/1.0") || !strings.Contains(signatureB, `"originator":"codex-tui"`) {
-		t.Fatalf("expected official user agent and synthesized codex-tui originator to remain in signature, got %q", signatureB)
+	signatureB := requireRealtimeHandshakeSignature(t, providerB)
+	if !strings.Contains(signatureB, "Codex Desktop/1.0") || strings.Contains(signatureB, `"originator"`) {
+		t.Fatalf("expected client user agent without synthesized originator in signature, got %q", signatureB)
 	}
 
 	upstreamIdentity := providerA.readRealtimeUpstreamIdentity()
 	if upstreamIdentity != providerB.readRealtimeUpstreamIdentity() {
 		t.Fatalf("test setup expected matching upstream identity")
 	}
-	hashA := providerA.buildRealtimeCompatibilityHash("gpt-5", upstreamIdentity)
-	hashB := providerB.buildRealtimeCompatibilityHash("gpt-5", upstreamIdentity)
+	hashA := requireRealtimeCompatibilityHash(t, providerA, "gpt-5", upstreamIdentity)
+	hashB := requireRealtimeCompatibilityHash(t, providerB, "gpt-5", upstreamIdentity)
 	if hashA == "" || hashB == "" || hashA == hashB {
 		t.Fatalf("expected different official user agents to produce different hashes, a=%q b=%q", hashA, hashB)
 	}
