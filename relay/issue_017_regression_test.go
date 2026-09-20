@@ -115,7 +115,7 @@ func TestIssue017SpeechUsageReachesRelayAttemptAndSQL(t *testing.T) {
 func TestIssue017SpeechObserverRunsBeforeClosedClientDelivery(t *testing.T) {
 	var observed atomic.Int32
 	var badPayload atomic.Bool
-	handler := newAudioSSEHandler(audioSSESpeech, func(payload []byte) {
+	handler := newNativeSSEHandler(func(payload []byte) {
 		if string(payload) != issue017SpeechDonePayload {
 			badPayload.Store(true)
 		}

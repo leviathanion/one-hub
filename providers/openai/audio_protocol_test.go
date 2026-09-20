@@ -14,6 +14,7 @@ import (
 
 	"one-api/common"
 	"one-api/common/config"
+	"one-api/common/requestctx"
 	"one-api/common/requester"
 	"one-api/model"
 	"one-api/types"
@@ -49,6 +50,7 @@ func TestOpenAISpeechPreservesCurrentFieldsAndStructuredVoice(t *testing.T) {
 
 	proxy := ""
 	provider := CreateOpenAIProvider(&model.Channel{Plugin: model.NewCustomEndpointPlugin(), Type: config.ChannelTypeCustom, Key: "sk-test", Proxy: &proxy}, server.URL)
+	requestctx.SetResourceReferencePolicy(ctx, &recordingMediaPolicy{})
 	provider.SetContext(ctx)
 	provider.Usage = &types.Usage{}
 	response, apiErr := provider.CreateSpeech(&request)

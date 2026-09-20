@@ -159,6 +159,23 @@ func ApplySettlement(ctx context.Context, cmd SettlementCommand, opts *Settlemen
 	return result, nil
 }
 
+// ProjectSettlement publishes only best-effort consume-log and usage counters.
+// The caller must own a successful first settlement transition; this function
+// neither changes balances nor supplies an idempotency boundary.
+func ProjectSettlement(ctx context.Context, cmd SettlementCommand, opts *SettlementOptions) error {
+	if err := cmd.Normalize(); err != nil {
+		return err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if opts == nil {
+		opts = &SettlementOptions{}
+	}
+	runSettlementProjection(ctx, cmd, *opts)
+	return nil
+}
+
 func runSettlementProjection(ctx context.Context, cmd SettlementCommand, opts SettlementOptions) {
 	usage := cmd.UsageSummary.ToUsage()
 	extraTokens := usage.GetExtraTokens()

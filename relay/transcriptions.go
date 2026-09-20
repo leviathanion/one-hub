@@ -76,7 +76,7 @@ func (r *relayTranscriptions) send() (err *types.OpenAIErrorWithStatusCode, done
 			r.heartbeat.Stop()
 		}
 		var firstResponse time.Time
-		firstResponse, err = responseAudioSSEClient(r.c, response.Stream, audioSSETranscription, providerresponse.OperationAudioTranscription, response.ObserveProviderEvent)
+		firstResponse, err = responseNativeSSEClient(r.c, response.Stream, providerresponse.OperationAudioTranscription, response.ObserveProviderEvent)
 		r.SetFirstResponseTime(firstResponse)
 		return err, err != nil
 	}

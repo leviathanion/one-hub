@@ -13,7 +13,7 @@ func (AzureV1ProviderFactory) AssessChatRequest(channel *model.Channel, canonica
 	if err := base.RequireOperationEndpoint(getAzureConfig().ChatCompletions, "Chat Completions"); err != nil {
 		return base.ChatRequestSupport{}, err
 	}
-	return base.ChatRequestSupport{}, nil
+	return base.ChatRequestSupport{SupportsStoredChat: true}, nil
 }
 
 func (AzureV1ProviderFactory) AssessChatWireRequest(channel *model.Channel, canonicalModel string, request *types.ChatCompletionRequest, fields map[string]json.RawMessage) error {
@@ -40,6 +40,7 @@ func (AzureV1ProviderFactory) ResponsesSupport(_ *model.Channel) base.OperationS
 			base.OperationResponsesInputTokens,
 			base.OperationResponsesRetrieve,
 			base.OperationResponsesDelete,
+			base.OperationResponsesCancel,
 			base.OperationResponsesInputItems,
 			base.OperationResponsesWebSocket,
 		} {

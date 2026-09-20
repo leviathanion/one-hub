@@ -10,6 +10,14 @@ import (
 
 const (
 	Responses            = "openai.responses"
+	Files                = "openai.files"
+	Uploads              = "openai.uploads"
+	Conversations        = "openai.conversations"
+	Batches              = "openai.batches"
+	FineTuning           = "openai.fine_tuning"
+	Assistants           = "openai.assistants"
+	Threads              = "openai.threads"
+	VectorStores         = "openai.vector_stores"
 	Messages             = "anthropic.messages"
 	DefaultMessagesURI   = "/v1/messages"
 	DefaultClaudeBaseURL = "https://api.anthropic.com"
@@ -37,6 +45,14 @@ var definitions = []Definition{
 	{"openai.audio_transcriptions", "OpenAI API", "Audio Transcriptions", "/v1/audio/transcriptions", true, config.RelayModeAudioTranscription},
 	{"openai.audio_translations", "OpenAI API", "Audio Translations", "/v1/audio/translations", true, config.RelayModeAudioTranslation},
 	{Responses, "OpenAI API", "Responses", DefaultResponsesURI, true, config.RelayModeResponses},
+	{Files, "OpenAI Resources", "Files", "/v1/files", false, config.RelayModeUnknown},
+	{Uploads, "OpenAI Resources", "Uploads", "/v1/uploads", false, config.RelayModeUnknown},
+	{Conversations, "OpenAI Resources", "Conversations", "/v1/conversations", false, config.RelayModeUnknown},
+	{Batches, "OpenAI Resources", "Batches", "/v1/batches", false, config.RelayModeUnknown},
+	{FineTuning, "OpenAI Resources", "Fine Tuning", "/v1/fine_tuning", false, config.RelayModeUnknown},
+	{Assistants, "OpenAI Resources", "Assistants", "/v1/assistants", false, config.RelayModeUnknown},
+	{Threads, "OpenAI Resources", "Threads", "/v1/threads", false, config.RelayModeUnknown},
+	{VectorStores, "OpenAI Resources", "Vector Stores", "/v1/vector_stores", false, config.RelayModeUnknown},
 	{Messages, "Claude API", "Messages", DefaultMessagesURI, false, config.RelayModeUnknown},
 }
 

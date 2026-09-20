@@ -13,6 +13,9 @@ func (p *OpenAIProvider) CreateImageGenerations(request *types.ImageRequest) (*t
 		return nil, errWithCode
 	}
 	defer req.Body.Close()
+	if apiErr := rejectUnsupportedImageStreamRequest(req); apiErr != nil {
+		return nil, apiErr
+	}
 
 	response := &OpenAIProviderImageResponse{}
 	_, errWithCode = p.sendUnaryJSON(req, response)

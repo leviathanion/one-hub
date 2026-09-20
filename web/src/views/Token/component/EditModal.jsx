@@ -30,7 +30,7 @@ import {
 import { AdapterDayjs } from '@mui/x-date-pickers/AdapterDayjs';
 import { LocalizationProvider } from '@mui/x-date-pickers/LocalizationProvider';
 import { DateTimePicker } from '@mui/x-date-pickers/DateTimePicker';
-import { renderQuotaWithPrompt, showSuccess, showError, useIsReliable } from 'utils/common';
+import { renderQuotaWithPrompt, showSuccess, showError, useIsReliable, useIsAdmin } from 'utils/common';
 import { API } from 'utils/api';
 import { useTranslation } from 'react-i18next';
 import 'dayjs/locale/zh-cn';
@@ -42,6 +42,7 @@ const validationSchema = Yup.object().shape({
   expired_time: Yup.number(),
   unlimited_quota: Yup.boolean(),
   setting: Yup.object().shape({
+    resource_channel_id: Yup.number().integer('渠道 ID 必须为整数').min(0, '渠道 ID 必须为正整数，或设为 0 清除配置'),
     heartbeat: Yup.object().shape({
       enabled: Yup.boolean(),
       timeout_seconds: Yup.number().when('enabled', {
@@ -89,6 +90,7 @@ const EditModal = ({ open, tokenId, onCancel, onOk, userGroupOptions, adminMode 
   const { t } = useTranslation();
   const theme = useTheme();
   const userIsReliable = useIsReliable();
+  const userIsAdmin = useIsAdmin();
   const [inputs, setInputs] = useState(originInputs);
   const [modelOptions, setModelOptions] = useState([]);
   const [ownedByIcons, setOwnedByIcons] = useState({});
@@ -135,6 +137,9 @@ const EditModal = ({ open, tokenId, onCancel, onOk, userGroupOptions, adminMode 
     setSubmitting(true);
     values.remain_quota = parseInt(values.remain_quota);
     values.setting.heartbeat.timeout_seconds = parseInt(values.setting.heartbeat.timeout_seconds);
+    if (userIsAdmin) {
+      values.setting.resource_channel_id = Number(values.setting.resource_channel_id || 0);
+    }
 
     // 过滤掉空的 IP 行
     if (values.setting?.limits?.limits_ip_setting?.whitelist) {
@@ -500,7 +505,31 @@ const EditModal = ({ open, tokenId, onCancel, onOk, userGroupOptions, adminMode 
                 </FormControl>
               )}
 
-              {/* 费用标签 - 仅管理员可见 */}
+              {userIsAdmin && (
+                <>
+                  <Divider sx={{ margin: '16px 0px' }} />
+                  <TextField
+                    fullWidth
+                    label="资源创建渠道 ID"
+                    name="setting.resource_channel_id"
+                    type="number"
+                    value={values.setting?.resource_channel_id ?? 0}
+                    onBlur={handleBlur}
+                    onChange={(event) => setFieldValue('setting.resource_channel_id', Number(event.target.value || 0))}
+                    inputProps={{ min: 0, step: 1 }}
+                    error={Boolean(touched.setting?.resource_channel_id && errors.setting?.resource_channel_id)}
+                    helperText={
+                      (touched.setting?.resource_channel_id && errors.setting?.resource_channel_id) ||
+                      '仅用于没有资源引用的创建请求；0 表示未配置。引用已有资源时，以资源归属渠道为准，资源仍按用户隔离。'
+                    }
+                  />
+                  <Typography variant="caption" display="block" mt={1}>
+                    修改此配置不迁移已有资源；管理员修改渠道连接或凭据后，已有资源可能无法继续访问。
+                  </Typography>
+                </>
+              )}
+
+              {/* 费用标签 - 仅可信用户可见 */}
               {userIsReliable && (
                 <>
                   <Divider sx={{ margin: '16px 0px' }} />

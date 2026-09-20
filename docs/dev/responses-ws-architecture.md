@@ -41,7 +41,7 @@ Responses WebSocket 只连接显式具备 native 能力的渠道。系统不把 
 | capability / routing | native、exact-model、OpenAI Data Residency、Stored lifecycle 门禁；首 turn 选路 | 已写入 upstream 后换渠道 |
 | provider adapter | native 握手、原始 frame 转发、usage/close evidence 提取 | turn 调度、owner、扣费 |
 | I/O pump | 双向搬运 frame，把 provider evidence 串行投递给 actor | 构造 provider lifecycle event |
-| session actor | FIFO、执行归属、owner delivery barrier、最小终结观察、结算触发 | 修改 provider terminal |
+| session actor | 命令发送顺序、独立 work 归属、owner delivery barrier、最小终结观察、结算触发 | 修改 provider terminal |
 | settlement core | 根据合法 provider evidence 计算唯一 final quota | 决定协议输出 |
 
 ## 连接与 turn 流程
@@ -55,17 +55,17 @@ Responses WebSocket 只连接显式具备 native 能力的渠道。系统不把 
   → 原样发送 response.create
   → provider frame 经安全与资源屏障交付，独立提取合法证据
   → 官方 terminal 先交付，随后结算和记录
-  → 父执行结束后推进 FIFO；未消解 steering 后继继续阻挡
+  → 后续命令按收到顺序发送，不等父终态或 steering 回执
 ```
 
 连接建立前的候选失败仍可使用既有候选预算；一旦任何 `response.create` 进入 upstream write，就不跨渠道重放。HTTP create 的工作后重放同样被禁止，详见[Responses 请求重试边界](./responses-ws-attempt-replay-architecture.md)。
 
 ## Client event 与排队
 
-- 支持 `response.create` 和针对当前活动 Response 的原始 `response.steer`；自动后继复用事前准入的独立预扣。
+- 支持 `response.create` 和针对已授权 Response 的原始 `response.steer`；自动后继复用事前准入的独立预扣。
 - `response.inject` 在目标资源授权及输入资源检查后按原始 frame 发送；上游校验 multi-agent 模式和工具 schema，并决定活动或已完成目标的注入结果。
 - `response.cancel` 是 Realtime 事件，在 Responses WS 上拒绝。客户端断开通过关闭 upstream transport 终止工作。
-- opening、pending、active turn 或尚未绑定的自动续接预扣存在时，新的 `response.create` 进入有界 FIFO。队列同时限制 frame 数和 payload bytes；超限 fail closed。
+- 新的 `response.create` 在本地准入后进入有界发送队列，不等待上游 active work。每连接最多 64 个未收尾 work 候选、32 MiB 候选数据；发送队列另有 frame/payload 上限。
 - actor mailbox 对所有在途 client/provider frame 使用每连接 64 MiB 的共享 payload 预算，事件出队后立即释放。
 - inject 回执不拥有父账务或 create FIFO。已提交辅助命令的发送资源及一次完成独立于父 reset，父 terminal 后的回执仍可交付；首次真实辅助发送歧义停止连接。
 
@@ -79,9 +79,9 @@ Responses WebSocket 只连接显式具备 native 能力的渠道。系统不把 
 
 Response ID 用于资源和账务关联；缺失、重复或非递增序号不构成交付门禁。未识别的事件名保留原帧，不猜测其终结意义；Codex 私有别名由 adapter 根据明确契约转换，公共事件不补造序号。
 
-泛化 `error` 原样交付，不结束当前 Response 或提前释放 steering 预扣。明确 connection fatal / workflow stop 停止新工作并收尾；当前尚未绑定 Response 的 create 收到明确 `previous_response_not_found` 且本次确有续接目标时，按 create 拒绝结束准入并推进 FIFO。其他无关联错误等待原执行或连接事实。未知事件、安全诊断和迟到回执不需要本地完整生命周期接受才能交付。
+泛化 `error` 原样交付。该 lane 未失配、仅有一个未绑定普通 create 且没有控制命令来源歧义时，明确请求级拒绝只收尾该候选，后续请求仍正常观察/计费；无候选的空闲 error 不污染将来 lane。其他无法唯一关联的错误只释放受影响未绑定候选的预扣与容量，不合成上游 Response 失败、不关闭连接、不暂停发送。已绑定 Response 的独立证据仍可结算；固定容量防误关联记录使迟到事件不会记给新 work。真正连接关闭、权限冲突或 I/O 错误继续按自身边界处理。
 
-单命令的发送完成与当前 create 接收关联分离，辅助发送不能覆盖新 create 的无 ID 输出归属。关闭时按 `postMu` 固定截止数量收尾；不再等待 100ms 发送结果，也不保留 inject 回执计数、恢复对象或完整终结响应历史。HTTP SSE 读至 EOF 的原始交付、异常 abort/reset 及上下游时限见[共享设计](./responses-transparent-relay-design.md)。
+单命令的发送完成与按 lane/Response ID 的接收关联分离，辅助发送不能覆盖其他 work 的证据归属；不能消歧的帧只交付。关闭时按 `postMu` 固定截止数量收尾；不再等待 100ms 发送结果，也不保留 inject 回执计数、恢复对象或完整终结响应历史。HTTP SSE 读至 EOF 的原始交付、异常 abort/reset 及上下游时限见[共享设计](./responses-transparent-relay-design.md)。
 
 ## `store` 与 owner delivery barrier
 
@@ -89,7 +89,7 @@ Response ID 用于资源和账务关联；缺失、重复或非递增序号不�
 
 `store:false` 不写 durable owner。当前连接已经观察到的 response ID 由 actor 以最近历史或独立持有的 steering 父证明保存，对应续接不依赖数据库或 ephemeral cache；跨请求只接受用户域内、有限 TTL 的 ephemeral proof，它只是来源证明和 soft preference，不能代替 durable owner。
 
-后续 Stored Response 操作严格固定 owner channel，不 fallback。普通用户无法区分 owner miss、跨用户、tombstone 与过期记录。
+后续 Stored Response 操作严格固定 owner channel，不 fallback。owner miss、跨用户和本地授权留存已清理仍拒绝；留存期间的 tombstone 不阻止已授权读、删或续接，上游判断业务可用性。
 
 ## 结算与交付顺序
 
@@ -100,9 +100,9 @@ Response ID 用于资源和账务关联；缺失、重复或非递增序号不�
 ## Liveness
 
 - 首帧 timeout 只约束 Upgrade 后等待第一个 `response.create`。
-- idle timeout 只清理没有 opening、pending、active turn 或未绑定自动续接的业务空闲连接。
-- active-turn provider-inactivity 默认 2 分钟，max-lifetime 默认 1 小时，均可设为 0 禁用；触发后关闭代理 turn；若仍无 provider usage，则 Cancel 预扣，不产生 provider terminal。
-- 同一个 active watchdog 随当前 Response、未绑定自动候选和实际 child 切换目标及 generation；仅保留父资源证明时按 idle 管理，迟到旧父回执不刷新 child 的期限。
+- 连接建立后 idle timeout 按实际收发活动清理空闲连接，不等待本地观察候选终结；候选不代表真实传输活动。
+- max-lifetime 默认 1 小时，可设为 0 禁用；它限制物理连接占用，不证明上游 work 已完成。
+- 原单 active turn 的业务观察 watchdog 已删除。计费失配只释放受影响观察，不以 queued/in_progress 时长关闭连接。
 - ping/pong、read limit、write deadline 由共享 `wsconn.ManagedConn` 边界执行。
 
 ## 配置和运维

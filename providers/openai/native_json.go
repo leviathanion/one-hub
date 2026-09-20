@@ -87,6 +87,19 @@ func requestBodyCopy(req *http.Request) ([]byte, error) {
 	return body, nil
 }
 
+// patchNativeJSONModel changes only the proxy-owned routing field. Edits do not
+// inherit the custom-parameter behavior of the general native JSON planner.
+func patchNativeJSONModel(raw []byte, model string) ([]byte, error) {
+	object, err := jsonobject.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	if err := object.SetJSON("model", model); err != nil {
+		return nil, err
+	}
+	return object.MarshalJSON()
+}
+
 // planNativeJSONBody starts from the accepted downstream body and changes only
 // fields owned by this proxy. A body without an effective model/custom-parameter
 // patch is returned byte-for-byte.
@@ -107,8 +120,12 @@ func (p *OpenAIProvider) planNativeJSONBody(modelName string) ([]byte, bool, err
 		// would give the same configuration a second owner.
 		customPatchPossible = false
 	}
-	if !modelPatch && !customPatchPossible {
-		return raw, true, nil
+	if !customPatchPossible {
+		if !modelPatch {
+			return raw, true, nil
+		}
+		patched, err := patchNativeJSONModel(raw, modelName)
+		return patched, true, err
 	}
 
 	object, err := jsonobject.Parse(raw)

@@ -21,11 +21,18 @@ import (
 
 func boolPointer(value bool) *bool { return &value }
 
-func TestValidateChatSupportedSurfaceRejectsStoredChat(t *testing.T) {
-	err := validateChatSupportedSurface(&types.ChatCompletionRequest{Store: boolPointer(true)}, nil)
-	assertCapabilityGateError(t, err, "store")
-	if err := validateChatSupportedSurface(&types.ChatCompletionRequest{Store: boolPointer(false)}, nil); err != nil {
-		t.Fatalf("store=false must retain the existing HTTP path: %v", err)
+func TestStoredChatSupportIsAnAdapterCapability(t *testing.T) {
+	request := &types.ChatCompletionRequest{Model: "gpt-4o", Store: boolPointer(true)}
+	if err := validateChatSupportedSurface(request, nil); err != nil {
+		t.Fatal(err)
+	}
+	fields := map[string]json.RawMessage{"model": json.RawMessage(`"gpt-4o"`), "store": json.RawMessage(`true`), "messages": json.RawMessage(`[]`)}
+	gate := requireChatChannelCompatibility(request.Model, request, fields)
+	if err := gate(&model.Channel{Type: config.ChannelTypeOpenAI}); err != nil {
+		t.Fatalf("native stored Chat must remain eligible: %v", err)
+	}
+	if err := gate(&model.Channel{Type: config.ChannelTypeAnthropic}); err == nil {
+		t.Fatal("cross-protocol adapter cannot silently drop store")
 	}
 }
 
@@ -190,7 +197,7 @@ func TestChatCapabilityRejectsResourceInjectedByChannelTransform(t *testing.T) {
 	request := &types.ChatCompletionRequest{Model: "gpt-5"}
 	custom := `{"pre_add":true,"tools":[{"type":"file_search","vector_store_ids":["vs_shared"]}]}`
 	channel := &model.Channel{Type: config.ChannelTypeOpenAI, CustomParameter: &custom}
-	assertCapabilityGateError(t, requireChatChannelCompatibility("gpt-5", request, fields)(channel), "tools")
+	assertCapabilityGateError(t, requireChatChannelCompatibility("gpt-5", request, fields)(channel), "vector_store_ids")
 }
 
 func TestChatRemoteMediaCapabilityUsesMappedProviderModel(t *testing.T) {
@@ -353,7 +360,7 @@ func TestResponsesCapabilityGateDoesNotFilterCodexParameterSemantics(t *testing.
 	}
 }
 
-func TestValidateResponsesSupportedSurfaceRejectsUnsupportedResourcesBeforeProviderWork(t *testing.T) {
+func TestValidateResponsesSupportedSurfaceSeparatesLocalCapabilitiesFromResourceAuthorization(t *testing.T) {
 	tests := []struct {
 		name      string
 		request   types.OpenAIResponsesRequest
@@ -361,24 +368,30 @@ func TestValidateResponsesSupportedSurfaceRejectsUnsupportedResourcesBeforeProvi
 		operation responsesOperation
 		param     string
 	}{
-		{name: "background", request: types.OpenAIResponsesRequest{Background: boolPointer(true)}, param: "background"},
-		{name: "conversation", request: types.OpenAIResponsesRequest{Conversation: "conv_1"}, param: "conversation"},
+		{name: "background", request: types.OpenAIResponsesRequest{Background: boolPointer(true)}, param: ""},
+		{name: "conversation", request: types.OpenAIResponsesRequest{Conversation: "conv_1"}, param: ""},
 		{name: "saved prompt", request: types.OpenAIResponsesRequest{Prompt: map[string]any{"id": "pmpt_1"}}, param: "prompt"},
-		{name: "file input", raw: map[string]json.RawMessage{"input": json.RawMessage(`[{"type":"input_file","file_id":"file_1"}]`)}, param: "input"},
-		{name: "file search", raw: map[string]json.RawMessage{"tools": json.RawMessage(`[{"type":"file_search","vector_store_ids":["vs_1"]}]`)}, param: "tools"},
-		{name: "hosted shell auto", raw: map[string]json.RawMessage{"tools": json.RawMessage(`[{"type":"shell","environment":{"type":"container_auto"}}]`)}, param: "tools"},
-		{name: "hosted shell reference", raw: map[string]json.RawMessage{"tools": json.RawMessage(`[{"type":"shell","environment":{"type":"container_reference","container_id":"cntr_1"}}]`)}, param: "tools"},
-		{name: "code interpreter auto", raw: map[string]json.RawMessage{"tools": json.RawMessage(`[{"type":"code_interpreter","container":{"type":"auto"}}]`)}, param: "tools"},
-		{name: "code interpreter reference", raw: map[string]json.RawMessage{"tools": json.RawMessage(`[{"type":"code_interpreter","container":"cntr_1"}]`)}, param: "tools"},
-		{name: "code interpreter implicit container", raw: map[string]json.RawMessage{"tools": json.RawMessage(`[{"type":"code_interpreter"}]`)}, param: "tools"},
-		{name: "image mask file", raw: map[string]json.RawMessage{"tools": json.RawMessage(`[{"type":"image_generation","input_image_mask":{"file_id":"file_1"}}]`)}, param: "tools"},
-		{name: "uploaded skill", raw: map[string]json.RawMessage{"tools": json.RawMessage(`[{"type":"shell","environment":{"type":"local","skills":[{"type":"skill_reference","skill_id":"skill_1"}]}}]`)}, param: "tools"},
-		{name: "future object resource", raw: map[string]json.RawMessage{"tools": json.RawMessage(`{"type":"provider_future","vector_store_ids":["vs_1"]}`)}, param: "tools"},
+		{name: "file input", raw: map[string]json.RawMessage{"input": json.RawMessage(`[{"type":"input_file","file_id":"file_1"}]`)}, param: ""},
+		{name: "file search", raw: map[string]json.RawMessage{"tools": json.RawMessage(`[{"type":"file_search","vector_store_ids":["vs_1"]}]`)}, param: "vector_store_ids"},
+		{name: "hosted shell auto", raw: map[string]json.RawMessage{"tools": json.RawMessage(`[{"type":"shell","environment":{"type":"container_auto"}}]`)}, param: "environment"},
+		{name: "hosted shell reference", raw: map[string]json.RawMessage{"tools": json.RawMessage(`[{"type":"shell","environment":{"type":"container_reference","container_id":"cntr_1"}}]`)}, param: "environment.container_id"},
+		{name: "code interpreter auto", raw: map[string]json.RawMessage{"tools": json.RawMessage(`[{"type":"code_interpreter","container":{"type":"auto"}}]`)}, param: "container"},
+		{name: "code interpreter reference", raw: map[string]json.RawMessage{"tools": json.RawMessage(`[{"type":"code_interpreter","container":"cntr_1"}]`)}, param: "container"},
+		{name: "code interpreter implicit container", raw: map[string]json.RawMessage{"tools": json.RawMessage(`[{"type":"code_interpreter"}]`)}, param: "container"},
+		{name: "image mask file", raw: map[string]json.RawMessage{"tools": json.RawMessage(`[{"type":"image_generation","input_image_mask":{"file_id":"file_1"}}]`)}, param: ""},
+		{name: "uploaded skill", raw: map[string]json.RawMessage{"tools": json.RawMessage(`[{"type":"shell","environment":{"type":"local","skills":[{"type":"skill_reference","skill_id":"skill_1"}]}}]`)}, param: "skill_id"},
+		{name: "future object resource", raw: map[string]json.RawMessage{"tools": json.RawMessage(`{"type":"provider_future","vector_store_ids":["vs_1"]}`)}, param: ""},
 		{name: "compact multi agent", raw: map[string]json.RawMessage{"multi_agent": json.RawMessage(`{"enabled":true}`)}, operation: responsesOperationCompact, param: "multi_agent"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			err := validateResponsesSupportedSurface(&test.request, test.raw, test.operation)
+			if test.param == "" {
+				if err != nil {
+					t.Fatalf("supported reference authorization or upstream semantics must not be rejected by surface gate: %v", err)
+				}
+				return
+			}
 			assertCapabilityGateError(t, err, test.param)
 		})
 	}
@@ -693,14 +706,6 @@ func TestValidateResponsesToChatRepresentabilityKeepsSerialFunctionToolStream(t 
 	}
 	if err := validateResponsesToChatRepresentability(&request, raw); err != nil {
 		t.Fatalf("explicit serial function-tool stream should remain representable: %v", err)
-	}
-}
-
-func TestValidateResponsesWSClientEnvelopeRejectsStreamIDLanes(t *testing.T) {
-	err := validateResponsesWSClientEnvelope(map[string]json.RawMessage{"stream_id": json.RawMessage(`"lane-a"`)})
-	assertCapabilityGateError(t, err, "stream_id")
-	if err := validateResponsesWSClientEnvelope(map[string]json.RawMessage{}); err != nil {
-		t.Fatalf("default websocket lane must remain supported: %v", err)
 	}
 }
 

@@ -9,10 +9,10 @@ lastUpdated: true
 
 ## 文档状态
 
-- 状态：当前实现（2026-09-11 更新）。审计基线 `4b4c398f` 中的生命周期门禁由本次变更替代；本地验证范围见第 9 节，不代表已发布或完成真实上游验证。
+- 状态：当前实现（2026-09-20 扩展）。审计基线 `4b4c398f` 中的生命周期门禁由本次变更替代；本地验证范围见第 9 节，不代表已发布或完成真实上游验证。
 - 范围：原生 HTTP Responses JSON/SSE、Native Responses WS、Stored Response 交付屏障，以及 OpenAI/Codex adapter 的观察边界。本文替代此前仅覆盖 steering 的方案，记录这些路径共同的职责契约。
 - 目标：尽可能保留客户端与上游的原始协议，代理只拥有认证、准入、选路、资源授权、计费和有界 I/O 生命周期。
-- 约束：沿用固定 WS 渠道、现有 create FIFO、明确的支持面及 [ADR-0030](../adr/0030-use-provider-usage-confirmed-tcc-billing.md)、[ADR-0033](../adr/0033-settle-atomic-price-components.md)、[ADR-0034](../adr/0034-read-configurable-policy-at-each-use.md)。不增加多 lane、background、conversation、客户端工具执行或自动恢复能力。
+- 约束：沿用固定 WS 渠道、有界命令队列、明确的支持面及 [ADR-0030](../adr/0030-use-provider-usage-confirmed-tcc-billing.md)、[ADR-0033](../adr/0033-settle-atomic-price-components.md)、[ADR-0034](../adr/0034-read-configurable-policy-at-each-use.md)。并行 lane、background 与 conversation 的扩展见 [实施方案](./openai-transparent-relay-implementation-plan.md)，不增加客户端工具执行或自动恢复能力。
 - [WS 主架构](./responses-ws-architecture.md)、[transport 边界](./responses-ws-transport-boundary.md)与 [ADR-0014](../adr/0014-preserve-native-responses-websocket-turn-semantics.md)已同步本次实现。
 
 ## 1. 问题与职责
@@ -66,7 +66,8 @@ lastUpdated: true
 | 未知事件、字段、reason、status，或纯观察字段无法解析 | 保留原始协议 | 不猜测其终结、执行或计费语义 |
 | 缺失、重复或非递增的上游序号 | 不作为通用原帧拒绝条件 | 只限制实际依赖它的去重或取消判断；不补造序号 |
 | 某个用量组件缺证据或冲突 | 安全帧仍交付 | 按 ADR-0033 隔离该组件，其他独立可计价组件仍进入结算 |
-| 已知 Response 无法关联到已准入执行，或资源身份存在冲突 | 只交付已能确认安全且不越过 owner 屏障的数据 | 停止新工作并收尾；不串账、不事后 Try、不隐式换渠道 |
+| Response 无法关联到已准入执行 | 保留原始交付 | 只放弃受影响的计费观察、释放对应预扣和容量；不串账、不事后 Try |
+| 资源身份存在冲突或 owner 屏障失败 | 不交付无法授权的资源身份 | 按真实权限边界停止相关交付；不隐式换渠道 |
 | 身份失效、本地 envelope 不合法、实际保留资源超限 | 遵循本地安全或资源失败路径 | 允许中止连接；错误不能伪装成上游 lifecycle 回执 |
 | 旧计费对象已结束，但到达同连接的控制回执或诊断 | 原样交付 | 不重开账务、不修改新 Response、不刷新无关执行期限 |
 
@@ -101,9 +102,9 @@ lastUpdated: true
 
 `response.inject.created/failed` 与 `response.steer.accepted/pending/failed` 使用同一原始交付规则：来源经过验证即可交付；明确的错误诊断尽力脱敏，不依赖 active attempt、pending 数量或最近 16 项历史。只有确实涉及未结束的本地决定时才观察关联字段。
 
-删除 inject 的 `pendingTargets`、初始回执计数与 terminal-ack barrier。inject 不创建独立后继，回执计数不决定父费用，也不需要替客户端等待下一次输入。父 terminal 可结束父计费观察并推进原 create FIFO；已经发布到同一 send worker 的命令保持顺序。仍可能触发独立后继的 steering 预扣继续阻挡 create，规则见第 6 节。
+删除 inject 的 `pendingTargets`、初始回执计数与 terminal-ack barrier。inject 不创建独立后继，回执计数不决定父费用，也不需要替客户端等待下一次输入。父 terminal 结束父计费观察；已经发布到同一 send worker 的命令保持顺序。steering 的候选只拥有独立预扣，不阻挡 create，规则见第 6 节。
 
-普通 create 之间保持既有 FIFO，活动响应的合法输入追加沿用既有辅助发送入口；不从 FIFO 中挑选“更合适”的续接。调用者如需收齐 inject 回执再构造下一轮，应按上游协议自行等待。
+普通 create 和已授权辅助命令按收到顺序发送；上游决定 lane 排队与业务执行顺序。调用者如需收齐 inject 回执再构造下一轮，应按上游协议自行等待。
 
 每条辅助发送复用既有的一次完成关联：正常结果只收尾原命令，首次真实 ambiguous 或 transport contract violation 仍停止连接，已消费的重复结果无效。已发布发送的 context 和结果消费必须脱离父账务的 reset；父 terminal 不能取消尚在途的合法命令，或使其真实错误被当作 stale 而丢弃。资源仍受连接关闭控制，不建立持久发送日志。
 
@@ -112,11 +113,11 @@ lastUpdated: true
 | 关联 | 用途与更新条件 |
 | --- | --- |
 | 单个 command 的 ID / completion | 只标识该次发送及其一次完成，不能成为接收流的当前执行 ID |
-| 当前 create 的接收关联 | 沿用现有串行 create 关联；在 create 进入发送时建立，以承接可能先于 SendResult 到达的事件，辅助发送不得覆盖它 |
-| 上游 Response ID | 由已准入 owner 绑定，优先用于可明确关联的业务证据；无 ID 的普通流事件使用当前 create 关联 |
+| create 的接收关联 | 按 lane 与 Response ID 维护有界关联；不能用最后一次发送的 create 代指整条连接，辅助发送不得覆盖其他 work |
+| 上游 Response ID | 只在有唯一依据时绑定已准入 work；无身份事件原样交付，不猜配到当前候选 |
 | channel / generation | 证明物理连接来源；控制回执与连接错误不因当前业务 attempt 不匹配而改绑或失效 |
 
-`NativeSession.sendClient` 只在 `response.create` 发送时更新接收关联，inject/steer 使用各自的完成关联。真实 native WebSocket 测试覆盖 `A terminal → create(B) → inject/steer(A) → B 的无 response_id delta`，确认输出仍归 B。
+`NativeSession` 将单命令发送完成与按 lane/Response ID 的接收证据分开。inject/steer 使用自己的完成关联；无法消歧的无身份事件只交付，不记到最后发送的 work。
 
 ### 3.3 已删除的状态
 
@@ -154,7 +155,7 @@ EOF 留下的未完成 SSE 事件不能成为收费证据，即使 data 已经�
 
 `StreamObserver` 只记录它实际识别的事实；provider 的 token、工具和图片证据分别提取。总生命周期投影失败不能阻止无依赖关系的组件观察；有依赖关系的 model/tier/cache 分区仍按 ADR-0033 作为完整原子组件验证。
 
-HTTP 请求在 EOF 或本地停止收尾后执行一次 Confirm/Cancel；在此之前仍可接收同一 owner 的合法独立证据，并按现有规则去重，不能重复累加 terminal 快照。多个独立执行、background 和流式恢复不因这一调整而获得支持。未知事件不形成事后执行 owner。
+HTTP 请求在 EOF 或本地停止收尾后执行一次 Confirm/Cancel；在此之前仍可接收同一 owner 的合法独立证据，并按现有规则去重，不能重复累加 terminal 快照。background 与恢复流由持久 Task 路径负责，不能再次使用 HTTP 请求 owner 收费。未知事件不形成事后执行 owner。
 
 这一时机直接复用 `RelayHandler` 在 `relay.send()` 返回后的结算和异常退出 guard，不新建“等待 EOF”的账务状态机。它选择了现有同步结构的简单性，并非协议证明必须等到 EOF 才可计价；代价是预扣释放与最终价格读取也可能延后，按 ADR-0034 处理，并在真实上游验证 terminal 到 EOF 的时长。
 
@@ -199,50 +200,17 @@ WS 沿用 `postMu` 的短锁新工作许可，每个 Try、Claim、open、worker
 
 closure cut 继续在 `postMu` 下关闭 ingress、取得已有事件数量并消费固定数量；删除没有生产消费者的 `postedSequence`、`closureCutSequence` 及递增/赋值。open 结果的 `Adopted` 交接必须在 actor 使用、清理资源或发布 done 前登记唯一清理责任；worker 看到 done 不重新取得清理权。Abort、发送字节和 lease 的唯一清理责任独立保留，取消或余额提交失败沿用一次结算 guard。
 
-## 6. Steering：保留最小的未绑定预扣观察
+## 6. 并行 work 与 steering 的有界观察
 
-Steering 可以自动产生新的独立 Response，因此它保留计费必需的关联。这里沿用已实现的方案，并把原始回执交付提升到第 2 节共享规则。
+原始命令只受本地权限、能力、额度和真实容量限制，不等待父终态、accepted/pending 回执或工具结果。显式 create 和可能产生新 work 的 steering 后继分别完成事前 Try/Claim；同父共同后继的候选可复用，不按每个 steer 帧重复建立费用。
 
-### 6.1 工作前准入与容量
+actor 的观察集合最多 64 个未收尾候选、32 MiB 请求原文预算（不是进程全部内存上限）。普通 create 在无歧义时按 lane FIFO 绑定真实 Response ID；steering 后继与排队 create 同时存在、无法唯一关联的 lane-only error 或其他身份缺口使关联不再可靠时，放弃该 lane 的未绑定计费观察。已经绑定的独立 work 不受影响，原帧与后续命令继续交付。
 
-首条 steer 在活动父的支持窗口内，使用已授权父请求的必要事实和本次原始输入的资源引用，完成权限、渠道、精确 model、资源、RPM、Try 和一次 Claim。同父尚未绑定的共同后继只预扣一次；后续 steer 仍经过连接许可、支持面、资源与容量检查，不按帧建账。准入不构造伪 create，不合并输入或解释 `required_input`。
+未失配 lane 上唯一普通 create 的明确请求级拒绝，且没有控制来源歧义时，只收尾该候选；不永久放弃后续请求的计费观察。无候选的空闲错误不污染将来 lane，已收尾 Response ID 的 64 项有界环防止旧回执消费新候选，淘汰后仍保守处理。
 
-| 保留状态 | 容量、作用域与删除条件 |
-| --- | --- |
-| 一个尚未绑定的自动后继 attempt | 当前固定连接串行支持面最多一笔；绑定 child 或成功 Cancel 后释放候选观察 |
-| 初始回执义务与已接管 ID | 最多 64 条待观察提交，ID 每个最多 1024 字节；只服务当前候选的取消判断 |
-| 临时父资源证明 | 最多 64 个，父 ID 总量最多 4 MiB；只对原 principal/channel/generation 有效 |
-| 原始帧与发送关联 | 复用现有事件、发送和 create FIFO 的帧数/字节限制；发送完成后不累计历史 payload 流量 |
+明确放弃观察复用一次性收尾，保留可归属的独立组件，释放未使用预扣及候选槽位。固定容量的已见 ID 与不安全 lane 过滤器阻止迟到回执重开账务或顺延到新候选；可能的误命中只少计费，不扩大授权。新 work 仍需事前额度准入，不能因观察已放弃而绕过 Try。
 
-父计费对象在其 terminal 后独立结算并释放。一个现有 watchdog 随当前 Response、未绑定候选、实际 child 切换目标与 generation；候选取消且没有执行时停用。仅持有父证明时按 idle 管理，未知或旧父回执不刷新无关执行期限，继续尊重 timeout=0。
-
-### 6.2 只有这些事实可以消解候选
-
-| 事实 | 对唯一未绑定候选的处理 |
-| --- | --- |
-| 发布 steer command | 先登记一个初始回执义务，再进入发送队列 |
-| 原 command 首次 `NotAttempted` | 只减少原候选的聚合初始义务；不匹配第 N 条 accepted，不影响新候选 |
-| 新的、可关联 accepted | 消解一个初始义务，记录上游 steer ID |
-| 已知 accepted ID 的 failed | 只移除对应接管可能性，不再次减少初始义务 |
-| 无 ID 的首次 failed | 同连接/渠道/generation/父匹配、尚有初始义务且事实未被消费时，减少一次义务 |
-| 未知非空 ID 的 failed、未知 pending reason、缺失或无效序号 | 原样交付，不作为提前退款依据 |
-| 全部义务和接管输入均明确失败或未发送 | 成功 Cancel 后才允许同一仍活动父重新准入 |
-| 已知 `waiting_for_required_input` | 父已完成、关联明确且初始义务全部消解、没有 child 绑定时 Cancel；留下所需父证明 |
-| 自动 child.created | 父已 terminal、没有竞争的显式 create、有唯一已 Claim 且未取消候选时绑定；父字段若存在必须匹配，缺省须由串行契约消歧 |
-
-自动 child 的绑定不要求完整 accepted 列表，也不事后 Try。候选绑定或成功 Cancel 后立即清除计数和 ID，不继续追踪每条输入的 committed/failed，不等待已被上游事实证明发生的发送结果。
-
-重复事实的消费水位按父的观察作用域保留，不随同父候选 Cancel/重新准入清零；它不参与普通原帧的序号门禁。只有实际用于本地决定的关联事实才推进水位。每个发送 command 的完成只消费一次；若原候选仍未绑定、初始义务已为零，却又首次报告 `NotAttempted`，按证据矛盾停止新工作，不回退其他 ID。
-
-保留 pending 的初始义务屏障：否则已排队但未发送的追加可能在预扣 Cancel 后才触发工作。这个屏障只服务 steering 的潜在新执行，不恢复 inject 的回执屏障。
-
-### 6.3 资源证明独立结束
-
-`store:false` 父证明在首条 steer 工作前，从已经观察到的同连接父资源取得并预留容量；不能从客户端任意父 ID 创建。全部输入明确失败，或自动 child 绑定且初始回执已完整时，可以释放。
-
-因等待客户端输入而取消预扣，或绑定 child 时初始回执尚不完整，保守保留父证明至匹配显式 create 的 child.created，或连接关闭。无关 create、准入失败和上游拒绝均不消费证明。迟到 failed 只转发，不为提前回收而恢复整组回执状态。归属查询直接使用这一事实，不依赖最近 16 项历史或临时缓存 TTL；Stored 资源仍走 SQL 授权。
-
-仍可能自动产生后继时，显式 create 留在现有 FIFO；解除候选后从队首推进，不跳取匹配续接。仅有旧父证明不阻塞队列。
+资源归属与计费关联分别建立：固定连接的 principal/channel 可以证明资源 owner，并不等于能证明某个收费候选。已知新资源继续经过持久 owner 屏障；上游状态、未知事件及缺失业务终态不增加交付门禁。每条真实发送的完成与清理责任保留，歧义发送不授予重放权。
 
 ## 7. 方言转换和支持面的边界
 
@@ -252,9 +220,9 @@ Steering 可以自动产生新的独立 Response，因此它保留计费必需�
 
 Adapter 必须在首次修改状态前隔离控制/诊断观察。旧父的 steer 或 inject 回执不能推进当前 child 的序号、覆盖 Response ID 或改变 usage accumulator。未知事件无需进入已知状态机才可交付，不在通用 relay 中增加 provider 类型分支。
 
-当前不支持的 background、conversation、stream_id lanes、流式 Stored retrieval 等仍在工作前按能力拒绝。扩展这些操作必须先明确工作准入、资源授权与用量关联，不以运行时试错获得支持。SQL owner、计费组件去重、传输取消和资源预算不属于要删除的上游生命周期镜像。
+已增加的 background、conversation、stream_id lanes 与恢复流分别使用 Task、资源 owner 与连接内 work 观察。尚未实现的操作仍按明确能力拒绝，不以运行时试错获得支持。SQL owner、计费组件去重、传输取消和资源预算不属于要删除的上游生命周期镜像。
 
-## 8. 实施、删除与外部影响
+## 8. 2026-09-11 变更记录与外部影响
 
 ### 8.1 实现范围
 
@@ -262,20 +230,20 @@ Adapter 必须在首次修改状态前隔离控制/诊断观察。旧父的 stee
 
 1. `common/responses/lifecycle.go`、`stream_observer.go` 与 `common/responsesws/terminal_classifier.go`：拆开最小事实投影、局部诊断和交付许可，删除通用 sequence/status 门禁及无生产消费者的 `ResponsePresent` / `ResponseFieldError`，容错解码只投影一次；账务关联校验保持独立。
 2. `types/responses.go`、`common/responses/stream_usage.go`、`providers/openai/responses*`、`providers/codex/responses*` 及计费组件入口：把协议转换和证据提取限定在 adapter，将 model/tier 投影失败送达依赖组件，消除观察失败阻断无关原帧/独立用量的路径。不能仅拆除 gate 后继续复用丢失失败事实的投影。
-3. `common/responsesws/native.go`、`upstream.go` 与 `relay/responses_ws*`：先分开单命令完成和 create 接收关联，再解除旧目标 inject 门禁；这两部分必须作为同一完整变更验收。控制回执进入共享交付入口，删除 inject 恢复、ack barrier 和无消费者的 `lastFinal`，按第 5.3 节删除关闭等待支路及闲置计数器；保留已有准入、FIFO 和 steering 候选。同帧分类只在一次 handler 调用内复用，不跨事件或 journal replay 保存。
+3. `common/responsesws/native.go`、`upstream.go` 与 `relay/responses_ws*`：先分开单命令完成和 create 接收关联，再解除旧目标 inject 门禁；这两部分必须作为同一完整变更验收。控制回执进入共享交付入口，删除 inject 恢复、ack barrier 和无消费者的 `lastFinal`，按第 5.3 节删除关闭等待支路及闲置计数器；保留已有准入和命令顺序，steering 候选由第 6 节替换。同帧分类只在一次 handler 调用内复用，不跨事件或 journal replay 保存。
 4. `relay/responses_stream_owner.go`、`common/responses/accepted_stream.go`、`relay/common.go` 的 SSE 脱敏及必要的 requester 接线：保持无缓冲移交，统一 SSE 行遍历、分帧、data 提取与安全重建；交付入口显式刷新完整事件，处理有字节伴随读取错误的尾部。失败时用局部交付状态扫完已取得 chunk，不增加 HTTP 队列截止锁、游标 API 或证据 journal。
 5. Responses HTTP I/O 入口及实际 writer 包装：按第 4.3 节接通写 deadline、异常停止与错误可见性，保证阻塞写可解除，复用现有 abort 与结算通路。不能只在调用 Write 前检查 context。
 6. 更新旧测试中对“模拟 inject 失败、terminal 后弃读、上游序号门禁、关闭等待结果及闲置计数器”的断言，并同步当前架构、使用文档和词汇。新路径成为默认路径时，在同一完整变更中删除被替代实现，不留 feature flag 或双实现。
 
-[ADR-0014](../adr/0014-preserve-native-responses-websocket-turn-semantics.md) 已更新：删除 pending-inject 计数和 public terminal 校验对原帧交付的控制；native-only、精确 model、FIFO 和明确方言映射继续有效。本次直接替换旧路径，没有迁移开关或双实现。
+[ADR-0014](../adr/0014-preserve-native-responses-websocket-turn-semantics.md) 已更新：删除 pending-inject 计数和 public terminal 校验对原帧交付的控制；native-only、精确 model、命令发送顺序和明确方言映射继续有效。本次直接替换旧路径，没有迁移开关或双实现。
 
 ### 8.2 可观察变化与回滚
 
 - 客户端从上游获得 inject 成败和原始回执顺序。依赖代理模拟恢复或等待全部 inject 回执后才启动下一轮的客户端，应改为自行处理官方回执；正常按官方流程等待的客户端无需新字段。
-- 新 create 可在父 terminal 后、旧 inject 回执尚未全部到达时进入上游，保留已发布发送命令的顺序；未消解 steering 后继继续阻挡该行为。
+- 新 create 不必等待父 terminal 或旧 inject 回执即可进入上游，保留已发布发送命令的顺序；steering 后继候选不阻挡该行为。
 - 原生 SSE 不因本地 terminal 提前关闭；连接占用、预扣释放和最终价格读取可能延后至上游 EOF 或本地收尾。上下游 I/O 均受第 4.3 节时限控制，停止读取的客户端会触发写超时并进入收尾；不能把原有上游时限当作下游已有保证。部署前验证正常 EOF、最终刷新和异常 abort/reset 的可观察结果。
 - owner 或客户端交付失败时，已接收的合法用量仍可能产生 Charge；无法计价的组件按现行规则免费，不改变价格算法。
-- 无数据库或公开请求格式迁移。发布与回滚只影响新接收逻辑；不能重放旧输入、撤销已发生费用或追加第二次余额动作。出现原帧丢失、跨用户资源暴露、额外执行、重复余额动作或不受既有边界控制的资源占用时停止发布。
+- W 不单独新增数据库表或公开请求格式迁移。B/C/Batch 的新表与 Task family 回滚见[实施方案](./openai-transparent-relay-implementation-plan.md#_9-升级回滚与现有决策)；不能重放旧输入、撤销已发生费用或追加第二次余额动作。出现原帧丢失、跨用户资源暴露、额外执行、重复余额动作或不受既有边界控制的资源占用时停止发布。
 
 ## 9. 验收与未验证边界
 
@@ -286,29 +254,29 @@ Adapter 必须在首次修改状态前隔离控制/诊断观察。旧父的 stee
 | 原始交付 | 同连接迟到 inject/steer 回执、无 active attempt 的安全诊断、未知字段与大整数原样交付；错误诊断尽力脱敏 |
 | 投影局部失败 | 未知序号/status/reason 不触发通用原帧拒绝；JSON/SSE/WS 的 model/tier 为无法解析的形态时，原帧仍交付，依赖组件不可借请求值、默认值或旧值收费；独立组件及真正缺省行为分别验证 |
 | inject | 活动及已完成的已授权目标均发送原始帧；没有本地工具 schema 验证、模拟失败或序号；未知/跨用户目标在工作前按资源授权失败 |
-| 调度 | create FIFO 不跳队；旧 inject 回执不占用已结算父或阻挡新回合；发送歧义仍作用于原命令和连接 |
-| WS 接收关联 | A terminal、B create、inject(A) 后，B 的无 ID delta 仍归 B；旧 inject 的完成/错误只消费原命令关联，接收错误保持正确连接作用域 |
+| 调度 | 命令按收到顺序发送；lane、steering、旧 inject 回执不阻挡新工作；发送歧义仍作用于原命令和连接 |
+| WS 接收关联 | 双 lane 交错、普通 create FIFO、A/B/S 歧义及 lane-only error；只在可证明身份时归属，迟到帧不顺延到新候选 |
 | HTTP SSE | terminal、`[DONE]` 后仍交付剩余及后续字节；CR-only、混合行结束、跨 chunk CRLF、多行 data 的错误诊断尽力脱敏，小完整事件在 EOF 前及时可见；完整 JSON 但未完成 SSE 事件的尾部脱敏后可交付且不计费 |
 | HTTP 结束语义 | 正常 EOF 不因 Body 清理取消而误 abort；有字节伴随读取错误时先处理许可内字节；非 EOF 错误、超限、本地提前停止及最终刷新失败在已提交后 abort/reset；缺业务 terminal 不合成业务事件；不重复结算 |
 | owner/write 失败 | 当前已取得 chunk 内的合法证据仅观察/结算一次，不暴露资源、不重试 SQL；真实 reader 关闭后即使清理收到新行也不补账，通用多事件 chunk fixture 独立验证 |
 | 关闭与背压 | 在准入、Try 返回、Claim、Send、消费者接收、open Adopted 处停止；无新许可、无重复释放。真实 H1/H2 客户端连接保持但不读取时，超时和显式异常停止均能解除 Write/Flush，handler 有界退出并一次结算；owner SQL 阻塞时缓冲有界，native emitter 退出，legacy 清理不能无限等待 |
 | WS 关闭消融 | 在途 create 的 NotAttempted、Attempted、Ambiguous 及未知结果下，无需等待关闭专用 completion；无用量仍 Cancel，截止内用量仍结算，Abort、lease、发送字节及 open Adopted 均只清理一次；运行中非法结果仍停止连接 |
 | 错误作用域 | 由明确上游契约识别的 schema-invalid inject 400/Close 不推进新 create；不能把其他无关联 generic error 或任意 400 当作当前 Response terminal/fatal |
-| Steering 回归 | 无 ID 初始失败、accepted→failed、同父重新准入时去重、pending 初始义务屏障、缺少完整 accepted 仍绑定、Cancel 失败关闭均保留 |
-| 资源与时限 | 父证明超过 16 次无关响应且缓存失效仍有效；64 条观察、64 个父引用/4 MiB、现有队列预算有效；历史 payload 不累计；watchdog 目标切换安全 |
+| Steering 回归 | 事前预扣、同父候选复用、accepted/failed 去重；不等待 pending 或工具结果；歧义放弃观察后释放槽位，原帧继续交付 |
+| 资源与时限 | 64 个 work 与 32 MiB 请求原文预算；固定容量防误关联历史；真实 I/O/连接寿命和关闭收尾，不恢复业务观察 watchdog |
 | 方言与账务 | Codex 旧控制回执不污染 child；必要转换有真实证据；Stored 权限、一次结算、无本地估算和歧义执行不重放均保留 |
 
-本次实现的本地回归覆盖：
+2026-09-11 基线实现的本地回归覆盖（W 的新增结果见实施方案）：
 
 - 真实 NativeSession 辅助发送后的接收 ID；actor 的已完成 inject、迟到控制帧、FIFO、发送歧义、closure cut、steering 预扣及一次资源释放。
 - OpenAI/Codex 的独立字段投影、工具去重和组件冲突，无法解释或前后冲突的 model/tier 不进入 token 计价，独立服务组件仍可结算；相同累计终态和迟到工具事件不重复计费。
 - 真实 HTTP/1.1、HTTP/2 的正常 EOF、异常读取、客户端停止读取时的 source error / 取消 / deadline；验证客户端能区分正常结束与截断，handler 有界退出，SQL 余额和日志只结算一次。
 - SSE 的 CR、LF、CRLF 分帧和安全重建、大整数保留、完整事件及时刷新，以及完整 JSON 但未完成事件的尾部不计费。截断 JSON 的脱敏回退不干扰 H1/H2 交付，尾部不计费，已取得工具证据只结算一次。owner/write 失败后的当前 chunk 和 legacy 有界清理另有回归。
 
-早期消融实验确认 steering 的初始回执义务、水位和父资源证明仍有实际消费者，删除它们会造成提前退款或拒绝合法续接；这三项保留。关闭专用 100ms 等待、`postedSequence` / `closureCutSequence`、inject ack barrier 和完整 `lastFinal` 已从生产代码及旧断言中删除。
+这些历史回归不作为 W 的当前支持证明。W 用第 6 节有界多 work 观察替换当时的单候选与业务等待屏障。关闭专用 100ms 等待、`postedSequence` / `closureCutSequence`、inject ack barrier 和完整 `lastFinal` 已从生产代码及旧断言中删除。
 
 本地契约回归不能证明上游会提供所有测试形态。后续真实验证应覆盖 OpenAI/Codex 的 inject 完成竞态、HTTP terminal 到 EOF 行为、自动 steering 的共同后继与初始失败关联。
 
 已核对的协议依据为 [WebSocket Mode](https://developers.openai.com/api/docs/guides/websocket-mode)、[Multi-agent](https://developers.openai.com/api/docs/guides/responses-multi-agent)、[Steering](https://developers.openai.com/api/docs/guides/steering)和[事件参考](https://developers.openai.com/api/reference/cli/resources/beta/subresources/responses)。参考页中其他能力不自动进入本项目支持面。
 
-Steering 仍有不能由本地状态消除的假设：更大的序号或新的接收位置不独立证明新的拒绝发生；上游若用全新身份重复同一次无 ID failed，现有字段可能无法与新提交拒绝区分。完整 registry 同样无法补足该信息。可识别重复不重复消费，正常可关联首次失败仍处理；不能把这一不确定性变成全面等待 timeout、隐式重放或重建客户端编排。
+Steering 的真实关联仍可能不充分；更大的序号或新接收位置不能独立证明某次拒绝属于哪个候选。该情况按第 6 节放弃受影响观察，不通过完整 registry、等待工具条件或业务 watchdog 补足缺失信息。

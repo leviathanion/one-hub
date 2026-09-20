@@ -66,16 +66,25 @@ func safeCountCodexPromptTokens(input any, modelName string, preCostType int) (t
 }
 
 func (a *codexTurnUsageAccumulator) ObserveEvent(event *types.OpenAIResponsesStreamResponses) error {
+	return a.observeEvent(event, false)
+}
+
+// WebSocket 原帧交付独立于计费观察；仅放弃无法证明的工具组件。
+func (a *codexTurnUsageAccumulator) observeEventWithoutDeliveryGate(event *types.OpenAIResponsesStreamResponses) {
+	_ = a.observeEvent(event, true)
+}
+
+func (a *codexTurnUsageAccumulator) observeEvent(event *types.OpenAIResponsesStreamResponses, independentDelivery bool) error {
 	if a == nil || event == nil {
 		return nil
 	}
 	event = normalizeCodexUsageEvent(event)
 	event.Response.ApplyUsageAttribution(&a.toolUsage)
 	candidateImage := a.imageTracker
-	trackingErr := commonresponses.ObserveBillingFailure(&a.toolUsage, types.APIToolTypeImageGeneration, candidateImage.ObserveResponsesEvent(event))
+	trackingErr := a.observeBillingFailure(independentDelivery, types.APIToolTypeImageGeneration, candidateImage.ObserveResponsesEvent(event))
 	a.imageTracker = candidateImage
 	if event.Type == "response.created" {
-		trackingErr = errors.Join(trackingErr, a.updateSearchBilling(event.Response))
+		trackingErr = errors.Join(trackingErr, a.observeBillingFailure(independentDelivery, types.APIToolTypeWebSearchPreview, a.updateSearchBilling(event.Response)))
 	}
 	serviceType, billingType := a.searchServiceType, a.searchType
 	if serviceType == "" {
@@ -84,13 +93,13 @@ func (a *codexTurnUsageAccumulator) ObserveEvent(event *types.OpenAIResponsesStr
 	switch event.Type {
 	case "response.output_item.done":
 		err := commonresponses.ApplyResponsesStreamOutputItemBillingWithToolTracker(&a.toolUsage, event.Type, event.Item, event.ItemID, event.OutputIndex, serviceType, billingType, &a.toolTracker)
-		trackingErr = errors.Join(trackingErr, commonresponses.ObserveBillingFailure(&a.toolUsage, serviceType, err))
+		trackingErr = errors.Join(trackingErr, a.observeBillingFailure(independentDelivery, serviceType, err))
 	case "response.completed", "response.failed", "response.incomplete":
 		if service, kind := commonresponses.ResponsesSearchBilling(event.Response); service != "" {
 			serviceType, billingType = service, kind
 		}
 		err := commonresponses.ApplyResponsesTerminalOutputItemBillingWithToolTracker(&a.toolUsage, event.Response, serviceType, billingType, &a.toolTracker)
-		trackingErr = errors.Join(trackingErr, commonresponses.ObserveBillingFailure(&a.toolUsage, serviceType, err))
+		trackingErr = errors.Join(trackingErr, a.observeBillingFailure(independentDelivery, serviceType, err))
 		imageUsage := &types.Usage{}
 		candidateImage.ApplyImageGenerationBilling(event.Response, imageUsage)
 		commonresponses.MergeResponsesExtraBillingMax(&a.toolUsage, imageUsage.ExtraBilling)
@@ -104,6 +113,16 @@ func (a *codexTurnUsageAccumulator) ObserveEvent(event *types.OpenAIResponsesStr
 		return common.ErrorWrapperLocal(trackingErr, commonresponses.ResponsesStreamTrackingFailureCode(trackingErr), http.StatusBadGateway)
 	}
 	return nil
+}
+
+func (a *codexTurnUsageAccumulator) observeBillingFailure(independentDelivery bool, service string, err error) error {
+	fatal := commonresponses.ObserveBillingFailure(&a.toolUsage, service, err)
+	if fatal != nil && independentDelivery {
+		a.toolUsage.MarkExtraBillingConflict(service)
+		a.toolUsage.AddBillingDiagnostic(commonresponses.ResponsesStreamTrackingFailureCode(fatal))
+		return nil
+	}
+	return fatal
 }
 
 func (a *codexTurnUsageAccumulator) updateSearchBilling(response *types.OpenAIResponsesResponses) error {

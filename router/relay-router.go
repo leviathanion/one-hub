@@ -44,6 +44,22 @@ func setOpenAIRouter(router *gin.Engine) {
 		relayV1Router.GET("/responses/:response_id", relay.StoredResponses)
 		relayV1Router.DELETE("/responses/:response_id", relay.StoredResponses)
 		relayV1Router.GET("/responses/:response_id/input_items", relay.StoredResponses)
+		relayV1Router.GET("/chat/completions", relay.ResourceRelay)
+		relayV1Router.GET("/chat/completions/:completion_id", relay.ResourceRelay)
+		relayV1Router.POST("/chat/completions/:completion_id", relay.ResourceRelay)
+		relayV1Router.DELETE("/chat/completions/:completion_id", relay.ResourceRelay)
+		relayV1Router.GET("/chat/completions/:completion_id/messages", relay.ResourceRelay)
+	}
+
+	// Batch shares authenticated routing; handler separates administrator raw
+	// operations from user-scoped task ownership without a fallback on owner miss.
+	relayV1Router.Any("/batches", relay.BatchRelay)
+	relayV1Router.Any("/batches/*any", relay.BatchRelay)
+
+	// Resource bodies retain their original multipart/JSON wire representation.
+	for _, family := range []string{"files", "uploads", "conversations"} {
+		relayV1Router.Any("/"+family, relay.ResourceRelay)
+		relayV1Router.Any("/"+family+"/*any", relay.ResourceRelay)
 	}
 
 	// Trade-off: only structured relay endpoints opt into request-body decode.
@@ -78,15 +94,11 @@ func setOpenAIRouter(router *gin.Engine) {
 	rawRelayV1Router := relayV1Router.Group("")
 	rawRelayV1Router.Use(middleware.SpecifiedChannel())
 	{
-		rawRelayV1Router.Any("/files", relay.RelayOnly)
-		rawRelayV1Router.Any("/files/*any", relay.RelayOnly)
 		rawRelayV1Router.Any("/fine_tuning/*any", relay.RelayOnly)
 		rawRelayV1Router.Any("/assistants", relay.RelayOnly)
 		rawRelayV1Router.Any("/assistants/*any", relay.RelayOnly)
 		rawRelayV1Router.Any("/threads", relay.RelayOnly)
 		rawRelayV1Router.Any("/threads/*any", relay.RelayOnly)
-		rawRelayV1Router.Any("/batches", relay.RelayOnly)
-		rawRelayV1Router.Any("/batches/*any", relay.RelayOnly)
 		// 告警属于上游项目；复用仅管理员可用的指定渠道授权，避免跨用户查询。
 		rawRelayV1Router.GET("/safety/alerts/:alert_id", relay.RelayOnly)
 		rawRelayV1Router.DELETE("/models/:model", relay.RelayOnly)
@@ -94,12 +106,8 @@ func setOpenAIRouter(router *gin.Engine) {
 
 	unsupportedRelayV1Router := relayV1Router.Group("")
 	{
-		unsupportedRelayV1Router.POST("/responses/:response_id/cancel", relay.UnsupportedCapability("operation", "response cancellation is not supported"))
+		unsupportedRelayV1Router.POST("/responses/:response_id/cancel", relay.StoredResponses)
 		unsupportedRelayV1Router.POST("/responses/:response_id/resume", relay.UnsupportedCapability("operation", "response resumption is not supported"))
-		unsupportedRelayV1Router.Any("/uploads", relay.UnsupportedCapability("uploads", "upload lifecycle is not supported"))
-		unsupportedRelayV1Router.Any("/uploads/*any", relay.UnsupportedCapability("uploads", "upload lifecycle is not supported"))
-		unsupportedRelayV1Router.Any("/conversations", relay.UnsupportedCapability("conversations", "conversation lifecycle is not supported"))
-		unsupportedRelayV1Router.Any("/conversations/*any", relay.UnsupportedCapability("conversations", "conversation lifecycle is not supported"))
 		unsupportedRelayV1Router.Any("/vector_stores", relay.UnsupportedCapabilityUnlessSpecifiedChannel("vector_stores", "vector store lifecycle is not supported"))
 		unsupportedRelayV1Router.Any("/vector_stores/*any", relay.UnsupportedCapabilityUnlessSpecifiedChannel("vector_stores", "vector store lifecycle is not supported"))
 	}

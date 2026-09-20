@@ -18,7 +18,7 @@ lastUpdated: true
 
 配置对象是上游接口，而非客户端入口或适配器能力。开关不能授予代理尚未实现的操作，也不创建协议转换能力。已有 `compatible_response` 显式转换契约保持：禁用原生 Responses 不等于禁止 Responses→Chat；该转换必须使用已启用、可表示请求的 Chat 接口。已发送上游的请求不会因配置或传输错误获得重试授权。
 
-本次覆盖原 `customize` 中的 11 个接口和 Claude Messages。模型发现、旧 Chat Realtime、其他 provider 的插件不纳入该表单，不凭本次结构调整扩大接口支持面。Responses 配置覆盖当前实现的 create、compact、input_tokens、资源读取/删除/input_items 及原生 Responses WebSocket；各操作仍受独立 capability、资源 owner 和计费边界控制。
+接口目录覆盖原 `customize` 中的 11 个接口、Claude Messages，以及 Files、Uploads、Conversations、Batches、Fine Tuning、Assistants、Threads、Vector Stores 资源家族。2026-09-20 新增的资源条目默认关闭，已有 Custom 渠道需管理员显式启用；不重跑旧配置迁移或自动补开。模型发现、旧 Chat Realtime、其他 provider 的插件不纳入该表单，不凭本次结构调整扩大接口支持面。Responses 配置覆盖当前实现的 create、compact、input_tokens、资源读取/删除/input_items 、background/cancel/恢复流及原生 Responses WebSocket；各操作仍受独立 capability、资源 owner 和计费边界控制。
 
 ## 数据契约
 
@@ -47,7 +47,7 @@ lastUpdated: true
 
 地址采用现有自定义渠道的拼接规则，而非 URL 根路径替换：基础地址 `https://example.com/root` 加 `/v1/messages` 得到 `https://example.com/root/v1/messages`。Cloudflare Gateway 路径沿用现有 `/v1` 去除规则。保留原始查询参数、重复查询键、转义路径和既有 HTTP/WS 空白处理差异；前端不得在未修改配置时重新格式化这些地址。
 
-普通完整 URL 直接指定上游接口；Responses 的资源操作会在该地址路径上追加资源 ID 或操作后缀，并保留查询语义。旧 `-realtime` 模型名分支的特殊拼接不在本次修复范围。
+普通完整 URL 直接指定上游接口；Responses、资源家族和 Stored Chat 的子操作在对应根地址追加资源 ID 或操作后缀，并保留查询语义。资源目录开关不改变管理员 raw 与普通用户 owner 的权限区分；Stored Chat 复用 Chat Completions endpoint。旧 `-realtime` 模型名分支的特殊拼接不在本次修复范围。
 
 ## 全链路影响面
 

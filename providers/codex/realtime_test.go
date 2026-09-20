@@ -2855,9 +2855,9 @@ func TestCodexRealtimeLocalOnlyReuseRequiresMatchingIdentityAndChannel(t *testin
 			if change == "unchanged" {
 				wantConnections = 1
 			}
-			if got := connections.Load(); got != wantConnections {
-				t.Fatalf("upstream connections=%d, want %d", got, wantConnections)
-			}
+			// Upgrade headers can reach the client before the server goroutine has
+			// incremented its accepted-connection counter.
+			waitForAtomicCount(t, &connections, wantConnections, 2*time.Second, "expected matching upstream connection count")
 		})
 	}
 }

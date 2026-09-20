@@ -112,20 +112,8 @@ func ResponsesWSIdleTimeout() time.Duration {
 	return durationFromViperMS("responses_ws.idle_timeout_ms", 30*time.Minute, true)
 }
 
-func ResponsesWSActiveTurnTimeout() time.Duration {
-	return durationFromViperMS("responses_ws.active_turn_timeout_ms", 2*time.Minute, true)
-}
-
 func ResponsesWSMaxLifetime() time.Duration {
 	return durationFromViperMS("responses_ws.max_lifetime_ms", time.Hour, true)
-}
-
-func ResponsesWSPendingProviderEventsMaxBytes() int {
-	limit := viper.GetInt("responses_ws.pending_provider_events_max_bytes")
-	if limit <= 0 {
-		return 2 << 20
-	}
-	return limit
 }
 
 func durationFromViperMS(key string, defaultValue time.Duration, nonPositiveDisables bool) time.Duration {

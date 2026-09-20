@@ -39,52 +39,31 @@ type responsesWSUpstreamState struct {
 	recvArmed         bool
 }
 
-// Slots are value fields instead of pointer fields so zero-value actor fixtures
-// stay safe during lifecycle tests. The lifecycle invariant is still explicit:
-// a slot is live only when its identity field is populated (openingID, attempt,
-// or active attempt), and transitions go through the helpers below.
+// opening/pending describe local setup only; work evidence lives in observation.
 type responsesWSTurnSlots struct {
-	opening         responsesWSOpeningTurn
-	pending         responsesWSPendingTurn
-	active          responsesWSActiveTurn
-	queue           responsesWSCreateQueue
-	deferredInjects responsesWSInjectQueue
-
+	opening responsesWSOpeningTurn
+	pending responsesWSPendingTurn
+	queue   responsesWSCreateQueue
 	history responsesWSTurnHistory
 }
-
 type responsesWSTurnHistory struct {
-	recentFinalizedResponseIDs []string
-	localEphemeralResponseIDs  []string
+	localEphemeralResponseIDs []string
 }
-
 type responsesWSOpeningTurn struct {
 	openingID  string
 	firstFrame *responsesws.RawResponsesCreateFrame
 	startedAt  time.Time
 	admission  *ResponsesWSTurnAdmission
 }
-
 type responsesWSPendingTurn struct {
 	phase     responsesWSPendingTurnPhase
 	openingID string
-
-	attempt *ResponsesWSTurnAttempt
-
-	provider responsesWSPendingProviderState
+	attempt   *ResponsesWSTurnAttempt
 }
-
-type responsesWSPendingProviderState struct {
-	journal responsesWSProviderJournal
-}
-
-type responsesWSActiveTurn struct {
-	attempt                 *ResponsesWSTurnAttempt
-	evidence                responsesws.ProviderActivityProjection
-	affinity                *ResponsesTurnAffinity
-	channelID               int
-	lastProviderSequence    int64
-	hasLastProviderSequence bool
+type responsesWSPendingCleanup struct {
+	attempt   *ResponsesWSTurnAttempt
+	openingID string
+	phase     responsesWSPendingTurnPhase
 }
 
 type responsesWSQueuedCreate struct {
@@ -135,247 +114,25 @@ func (q *responsesWSCreateQueue) Clear() {
 	q.bytes = 0
 }
 
-// 只保留发送前原帧的容量，不跟踪上游 inject 回执。
-type responsesWSInjectQueue struct {
-	deferred      []responsesws.Frame
-	deferredBytes int
-}
-
-func (s *responsesWSInjectQueue) Reset() {
-	for i := range s.deferred {
-		s.deferred[i] = responsesws.Frame{}
-	}
-	*s = responsesWSInjectQueue{}
-}
-
-type responsesWSTurnFinalization struct {
-	attemptID string
-}
-
-type responsesWSPendingCleanup struct {
-	attempt   *ResponsesWSTurnAttempt
-	openingID string
-	phase     responsesWSPendingTurnPhase
-	provider  responsesWSPendingProviderState
-}
-
-type responsesWSProviderJournal struct {
-	entries []responsesWSProviderJournalEntry
-	bytes   int
-}
-
-type responsesWSProviderJournalEntry struct {
-	Observation responsesws.ProviderObservation
-
-	Downstream *ResponsesWSEventProviderDownstream
-	Failure    *ResponsesWSEventProviderRecvFailed
-}
-
-type responsesWSProviderJournalAppendResult struct {
-	Buffered  bool
-	OverLimit bool
-}
-
-func (j *responsesWSProviderJournal) appendEntry(entry responsesWSProviderJournalEntry, replayBytes int, maxBytes int, enforceBytes bool) responsesWSProviderJournalAppendResult {
-	if j == nil || entry.Observation.IsZero() {
-		return responsesWSProviderJournalAppendResult{}
-	}
-	overLimit := len(j.entries) >= responsesWSPendingProviderEventsMax
-	if enforceBytes && j.bytes+replayBytes > maxBytes {
-		overLimit = true
-	}
-	if overLimit {
-		// Keep the triggering provider lifecycle observation before failing closed;
-		// only the replay payload is intentionally dropped on overflow.
-		entry.Downstream = nil
-		entry.Failure = nil
-	} else if entry.Downstream != nil {
-		j.bytes += replayBytes
-	}
-	j.entries = append(j.entries, entry)
-	return responsesWSProviderJournalAppendResult{Buffered: !overLimit, OverLimit: overLimit}
-}
-
-func (j *responsesWSProviderJournal) AppendDownstream(event ResponsesWSEventProviderDownstream, upstream responsesws.UpstreamEvent, maxBytes int) (bool, bool) {
-	if j == nil {
-		return false, false
-	}
-	entry := responsesWSProviderJournalEntry{Observation: responsesws.NewProviderObservation(upstream)}
-	eventBytes := len(responsesWSProviderDownstreamPayload(event))
-	copied := event
-	entry.Downstream = &copied
-	result := j.appendEntry(entry, eventBytes, maxBytes, true)
-	return result.Buffered, result.OverLimit
-}
-
-func (j *responsesWSProviderJournal) AppendFailure(event ResponsesWSEventProviderRecvFailed, upstream responsesws.UpstreamEvent) bool {
-	if j == nil {
-		return false
-	}
-	copied := event
-	result := j.appendEntry(responsesWSProviderJournalEntry{
-		Observation: responsesws.NewProviderObservation(upstream),
-		Failure:     &copied,
-	}, 0, 0, false)
-	return result.OverLimit
-}
-
-func (j *responsesWSProviderJournal) AppendLifecycle(upstream responsesws.UpstreamEvent) bool {
-	if j == nil {
-		return false
-	}
-	obs := responsesws.NewProviderObservation(upstream)
-	if obs.IsZero() {
-		return false
-	}
-	return j.AppendObservation(obs)
-}
-
-func (j *responsesWSProviderJournal) AppendObservation(obs responsesws.ProviderObservation) bool {
-	if j == nil || obs.IsZero() {
-		return false
-	}
-	result := j.appendEntry(responsesWSProviderJournalEntry{Observation: obs}, 0, 0, false)
-	return result.OverLimit
-}
-
-func (j *responsesWSProviderJournal) Project() responsesws.ProviderActivityProjection {
-	if j == nil || len(j.entries) == 0 {
-		return responsesws.ProviderActivityProjection{}
-	}
-	var out responsesws.ProviderActivityProjection
-	for _, entry := range j.entries {
-		out.Observe(entry.Observation)
-	}
-	return out
-}
-
-func (j *responsesWSProviderJournal) DownstreamEvents() []ResponsesWSEventProviderDownstream {
-	if j == nil || len(j.entries) == 0 {
-		return nil
-	}
-	out := make([]ResponsesWSEventProviderDownstream, 0, len(j.entries))
-	for _, entry := range j.entries {
-		if entry.Downstream != nil {
-			out = append(out, *entry.Downstream)
-		}
-	}
-	return out
-}
-
-func (j *responsesWSProviderJournal) Failures() []ResponsesWSEventProviderRecvFailed {
-	if j == nil || len(j.entries) == 0 {
-		return nil
-	}
-	out := make([]ResponsesWSEventProviderRecvFailed, 0, len(j.entries))
-	for _, entry := range j.entries {
-		if entry.Failure != nil {
-			out = append(out, *entry.Failure)
-		}
-	}
-	return out
-}
-
-func (j *responsesWSProviderJournal) Replay() []responsesWSProviderJournalEntry {
-	if j == nil || len(j.entries) == 0 {
-		return nil
-	}
-	out := make([]responsesWSProviderJournalEntry, 0, len(j.entries))
-	for _, entry := range j.entries {
-		if entry.Downstream == nil && entry.Failure == nil {
-			continue
-		}
-		out = append(out, entry)
-	}
-	return out
-}
-
 func (s *responsesWSTurnSlots) BeginOpening(opening responsesWSOpeningTurn) error {
 	if s == nil {
 		return errors.New("turn slots are required")
-	}
-	if s.pending.attempt != nil || s.active.attempt != nil {
-		return errors.New("cannot begin opening while a turn is pending or active")
 	}
 	opening.openingID = strings.TrimSpace(opening.openingID)
 	if opening.openingID == "" {
 		return errors.New("opening id is required")
 	}
 	s.opening = opening
-	s.pending = responsesWSPendingTurn{
-		phase:     responsesWSPendingTurnOpening,
-		openingID: opening.openingID,
-	}
+	s.pending = responsesWSPendingTurn{phase: responsesWSPendingTurnOpening, openingID: opening.openingID}
 	return nil
 }
-
-func (s *responsesWSTurnSlots) AttachPending(pending responsesWSPendingTurn) error {
-	if s == nil {
-		return errors.New("turn slots are required")
-	}
-	if s.active.attempt != nil {
-		return errors.New("cannot attach pending while active turn exists")
-	}
-	if pending.attempt != nil && strings.TrimSpace(pending.openingID) == "" {
-		pending.openingID = pending.attempt.OpeningID
-	}
-	s.pending = pending
-	return nil
-}
-
-func (s *responsesWSTurnSlots) CommitPendingToActive(channelID int) (responsesWSActiveTurn, []responsesWSProviderJournalEntry, error) {
-	if s == nil || s.pending.attempt == nil {
-		return responsesWSActiveTurn{}, nil, errors.New("pending attempt is required")
-	}
-	if s.active.attempt != nil {
-		return responsesWSActiveTurn{}, nil, errors.New("cannot commit pending while active turn exists")
-	}
-	pending := s.pending
-	active := responsesWSActiveTurn{
-		attempt:   pending.attempt,
-		evidence:  pending.provider.journal.Project(),
-		affinity:  CommitResponsesTurnAffinity(pending.attempt.Candidate, channelID),
-		channelID: channelID,
-	}
-	replay := pending.provider.journal.Replay()
-	s.active = active
-	s.pending = responsesWSPendingTurn{}
-	return active, replay, nil
-}
-
-func (s *responsesWSTurnSlots) FinishActive(result responsesWSTurnFinalization) error {
-	if s == nil {
-		return errors.New("turn slots are required")
-	}
-	if s.active.attempt == nil {
-		return nil
-	}
-	if result.attemptID != "" && s.active.attempt != nil && s.active.attempt.AttemptID != result.attemptID {
-		return errors.New("active attempt mismatch")
-	}
-	s.active = responsesWSActiveTurn{}
-	return nil
-}
-
 func (s *responsesWSTurnSlots) ClearPending() responsesWSPendingCleanup {
 	if s == nil {
 		return responsesWSPendingCleanup{}
 	}
-	cleanup := responsesWSPendingCleanup{
-		attempt:   s.pending.attempt,
-		openingID: s.pending.openingID,
-		phase:     s.pending.phase,
-		provider:  s.pending.provider,
-	}
+	cleanup := responsesWSPendingCleanup{attempt: s.pending.attempt, openingID: s.pending.openingID, phase: s.pending.phase}
 	s.pending = responsesWSPendingTurn{}
 	return cleanup
-}
-
-func (s *responsesWSTurnSlots) ResetPendingProvider() {
-	if s == nil {
-		return
-	}
-	s.pending.provider = responsesWSPendingProviderState{}
 }
 
 type responsesWSWorkerState struct {
@@ -404,8 +161,4 @@ type responsesWSCloseState struct {
 type responsesWSWatchdogState struct {
 	lastActivityMu sync.Mutex
 	lastActivity   time.Time
-
-	activeTurnMu       sync.Mutex
-	activeTurnTimer    *time.Timer
-	activeTurnTimerGen int64
 }

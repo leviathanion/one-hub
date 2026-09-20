@@ -4,6 +4,7 @@ import (
 	"errors"
 	"one-api/common/config"
 	"one-api/model"
+	"one-api/relay"
 	"one-api/relay/task/base"
 	"one-api/relay/task/kling"
 	taskmidjourney "one-api/relay/task/midjourney"
@@ -31,6 +32,10 @@ func GetTaskAdaptorByPlatform(platform string) (base.TaskProgressInterface, erro
 	relayType := config.RelayModeUnknown
 
 	switch platform {
+	case model.TaskPlatformOpenAIBatch:
+		return &relay.OpenAIBatchProgressor{}, nil
+	case model.TaskPlatformOpenAIResponsesBackground:
+		return &relay.BackgroundResponsesProgressor{}, nil
 	case model.TaskPlatformSuno:
 		relayType = config.RelayModeSuno
 	case model.TaskPlatformKling:

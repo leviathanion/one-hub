@@ -28,14 +28,11 @@ type codexResponsesWSAdapter struct {
 	responsesLite        bool
 	autoStampStreamStart bool
 
-	mu           sync.Mutex
-	lastResponse string
-	turnModel    string
-	accumulator  *codexTurnUsageAccumulator
-	lastSequence int64
-	hasSequence  bool
-	lastTerminal string
+	mu        sync.Mutex
+	responses map[string]*codexTurnUsageAccumulator
 }
+
+const codexResponsesWSMaxTrackedResponses = 64
 
 type codexResponsesWSOfficialOpenPlan struct {
 	conn                 *codexRealtimeConnPlan
@@ -207,18 +204,6 @@ func (a *codexResponsesWSAdapter) prepareResponseCreate(ctx context.Context, pay
 	if err != nil {
 		return responsesws.Frame{}, err
 	}
-	request.Model = turnModel
-	accumulator := newCodexTurnUsageAccumulator()
-	accumulator.SeedPromptFromRequest(&request, a.provider.codexPreCost())
-
-	a.mu.Lock()
-	a.lastResponse = ""
-	a.turnModel = turnModel
-	a.accumulator = accumulator
-	a.lastSequence = 0
-	a.hasSequence = false
-	a.lastTerminal = ""
-	a.mu.Unlock()
 
 	return responsesws.NewTextFrame(encodedPayload), nil
 }
@@ -267,83 +252,53 @@ func (a *codexResponsesWSAdapter) handleProviderPayloadLocked(payload []byte, en
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	// 自动 steering 续接没有客户端 create；按新的上游响应初始化观察状态。
-	if envelope.Type == "response.created" && a.accumulator == nil {
-		a.accumulator = newCodexTurnUsageAccumulator()
-		a.lastSequence = 0
-		a.hasSequence = false
-		a.lastTerminal = ""
-	}
 
 	normalized, err := a.normalizeProviderPayloadLocked(payload, envelope)
 	if err != nil {
-		usage, usageErr := a.supplierTerminalUsageLocked(envelope)
-		if usageErr != nil {
-			return false, nil, usage, usageErr
-		}
-		return false, nil, usage, err
-	}
-	classified := responsesws.ClassifyResponsesWSEvent(normalized)
-	if classified.Malformed {
-		usage, usageErr := a.supplierTerminalUsageLocked(envelope)
-		if usageErr != nil {
-			return false, nil, usage, usageErr
-		}
-		return false, nil, usage, fmt.Errorf("%w: %s", responsesws.ErrInvalidProviderEventPayload, classified.MalformedError)
-	}
-	if classified.EventType == "error" {
-		// 保留供应商错误的安全处理，但错误不重置当前用量或 Response。
-		_, _, rewritten, err := a.provider.handleCodexSupplierPayload(normalized, nil)
-		if len(rewritten) > 0 {
-			normalized = rewritten
-		}
-		return true, normalized, nil, err
+		return false, nil, a.supplierTerminalUsageLocked(payload, envelope), err
 	}
 	event, tracked := commonresponses.ParseStreamUsageEvent(normalized)
 	if !tracked {
-		if commonresponses.IsResponseLifecycleEvent(classified.EventType) {
-			if classified.Response != nil && a.lastResponse == "" {
-				a.lastResponse = classified.Response.ID
+		return true, normalized, nil, nil
+	}
+	responseID := responsesws.ProviderResponseID(normalized)
+	if responseID == "" || len(responseID) > 1024 {
+		return true, normalized, nil, nil
+	}
+	accumulator := a.responses[responseID]
+	terminal := commonresponses.IsTerminalEventType(event.Type)
+	if accumulator == nil {
+		switch {
+		case event.Type == "response.created":
+			if len(a.responses) >= codexResponsesWSMaxTrackedResponses {
+				return true, normalized, nil, nil
 			}
-			if classified.HasSequenceNumber && (!a.hasSequence || classified.SequenceNumber > a.lastSequence) {
-				a.lastSequence, a.hasSequence = classified.SequenceNumber, true
+			if a.responses == nil {
+				a.responses = make(map[string]*codexTurnUsageAccumulator)
 			}
-		}
-		return true, normalized, nil, nil
-	}
-	responseID := ""
-	if event.Response != nil {
-		responseID = strings.TrimSpace(event.Response.ID)
-	}
-	if event.Type != "response.created" && responseID != "" && a.lastResponse != "" && responseID != a.lastResponse {
-		return true, normalized, nil, nil
-	}
-	if commonresponses.IsTerminalEventType(event.Type) && responseID != "" && responseID == a.lastTerminal {
-		return true, normalized, nil, nil
-	}
-	if classified.HasSequenceNumber && (!a.hasSequence || classified.SequenceNumber > a.lastSequence) {
-		a.lastSequence, a.hasSequence = classified.SequenceNumber, true
-	}
-	if responseID != "" {
-		a.lastResponse = responseID
-	}
-	if a.accumulator == nil {
-		if !commonresponses.IsTerminalEventType(event.Type) {
+			accumulator = newCodexTurnUsageAccumulator()
+			a.responses[responseID] = accumulator
+		case terminal:
+			// 终态自身的有身份用量可独立提取；去重和 work 归属由 relay 负责。
+			accumulator = newCodexTurnUsageAccumulator()
+		default:
 			return true, normalized, nil, nil
 		}
-		a.accumulator = newCodexTurnUsageAccumulator()
 	}
-	err = a.accumulator.ObserveEvent(&types.OpenAIResponsesStreamResponses{Type: event.Type, Item: event.Item, ItemID: event.ItemID, OutputIndex: event.OutputIndex, PartialImageIndex: event.PartialImageIndex, Response: event.Response})
+	// 观察器只影响对应计费证据，不改变原始交付。
+	accumulator.observeEventWithoutDeliveryGate(&types.OpenAIResponsesStreamResponses{Type: event.Type, Item: event.Item, ItemID: event.ItemID, OutputIndex: event.OutputIndex, PartialImageIndex: event.PartialImageIndex, Response: event.Response})
 	var usage *types.UsageEvent
-	if commonresponses.IsTerminalEventType(event.Type) {
-		usage = a.accumulator.ResolveUsageEvent(event.Response)
-		a.lastTerminal = responseID
-		a.accumulator = nil
-		a.turnModel = ""
+	if terminal {
+		usage = accumulator.ResolveUsageEvent(event.Response)
+		delete(a.responses, responseID)
 	} else {
-		usage = a.accumulator.BillingUsageEvent()
+		usage = accumulator.BillingUsageEvent()
 	}
-	return true, normalized, usage, err
+	if usage != nil {
+		usage.ResponseID = responseID
+		usage.ProviderEventID = envelope.EventID
+	}
+	return true, normalized, usage, nil
 }
 
 // Codex's websocket supplier dialect has several private terminal aliases.
@@ -355,6 +310,12 @@ func (a *codexResponsesWSAdapter) normalizeProviderPayloadLocked(payload []byte,
 	}
 
 	if isCodexPublicResponsesTerminal(envelope.Type) {
+		return payload, nil
+	}
+	switch envelope.Type {
+	case types.EventTypeResponseDone, "response.updated", "response.cancelled", "response.canceled":
+		// 仅转换已知 supplier 方言；未知扩展不由 status 推导事件类型。
+	default:
 		return payload, nil
 	}
 	object := envelope.Object
@@ -373,22 +334,12 @@ func (a *codexResponsesWSAdapter) normalizeProviderPayloadLocked(payload []byte,
 	if !terminal {
 		return append([]byte(nil), payload...), nil
 	}
+	if !exists || responseObject == nil || strings.TrimSpace(response.ID) == "" {
+		// 缺少身份的私有回执不能借用最近响应建立关联。
+		return payload, nil
+	}
 	if evidence.kind == codexSupplierCancelledTerminal {
 		return nil, fmt.Errorf("%w: supplier cancellation cannot be represented as a public Responses terminal", responsesws.ErrInvalidProviderEventPayload)
-	}
-	if !exists || responseObject == nil {
-		return nil, fmt.Errorf("%w: supplier terminal response is required", responsesws.ErrInvalidProviderEventPayload)
-	}
-	if isCodexPublicResponsesTerminal(envelope.Type) {
-		if _, hasSequence := object["sequence_number"]; hasSequence {
-			return append([]byte(nil), payload...), nil
-		}
-	}
-	if strings.TrimSpace(response.ID) == "" {
-		response.ID = strings.TrimSpace(a.lastResponse)
-	}
-	if response.ID == "" {
-		return nil, fmt.Errorf("%w: supplier terminal response.id is unavailable for the current turn", responsesws.ErrInvalidProviderEventPayload)
 	}
 	encodedID, err := json.Marshal(response.ID)
 	if err != nil {
@@ -410,20 +361,7 @@ func (a *codexResponsesWSAdapter) normalizeProviderPayloadLocked(payload []byte,
 		return nil, err
 	}
 	object["type"] = encodedType
-	if _, exists := object["sequence_number"]; !exists {
-		nextSequence := int64(0)
-		if a.hasSequence {
-			if a.lastSequence == int64(1<<63-1) {
-				return nil, fmt.Errorf("%w: provider sequence_number overflow", responsesws.ErrInvalidProviderEventPayload)
-			}
-			nextSequence = a.lastSequence + 1
-		}
-		encodedSequence, marshalErr := json.Marshal(nextSequence)
-		if marshalErr != nil {
-			return nil, marshalErr
-		}
-		object["sequence_number"] = encodedSequence
-	}
+
 	return json.Marshal(object)
 }
 
@@ -436,29 +374,30 @@ func isCodexPublicResponsesTerminal(eventType string) bool {
 	}
 }
 
-func (a *codexResponsesWSAdapter) supplierTerminalUsageLocked(envelope *responsesws.ProviderEventEnvelope) (*types.UsageEvent, error) {
-	if a == nil || envelope == nil || a.accumulator == nil {
-		return nil, nil
-	}
-	rawResponse, exists := envelope.Object["response"]
-	if !exists {
-		return nil, nil
+func (a *codexResponsesWSAdapter) supplierTerminalUsageLocked(payload []byte, envelope *responsesws.ProviderEventEnvelope) *types.UsageEvent {
+	if a == nil || envelope == nil || responsesws.ProviderResponseID(payload) == "" {
+		return nil
 	}
 	var response types.OpenAIResponsesResponses
-	if err := response.DecodeCapturedProviderJSON(rawResponse); err != nil {
-		return nil, nil
+	if response.DecodeCapturedProviderJSON(envelope.Object["response"]) != nil || strings.TrimSpace(response.ID) == "" {
+		return nil
 	}
 	eventType := strings.TrimSpace(envelope.Type)
 	if !classifyCodexSupplierTerminal(eventType, &response, eventType == types.EventTypeError).isTerminal() && eventType != types.EventTypeResponseDone {
-		return nil, nil
+		return nil
 	}
-	if err := a.accumulator.ObserveEvent(&types.OpenAIResponsesStreamResponses{
-		Type:     eventType,
-		Response: &response,
-	}); err != nil {
-		return a.accumulator.BillingUsageEvent(), err
+	accumulator := a.responses[response.ID]
+	if accumulator == nil {
+		accumulator = newCodexTurnUsageAccumulator()
 	}
-	return a.accumulator.ResolveUsageEvent(&response), nil
+	accumulator.observeEventWithoutDeliveryGate(&types.OpenAIResponsesStreamResponses{Type: eventType, Response: &response})
+	usage := accumulator.ResolveUsageEvent(&response)
+	delete(a.responses, response.ID)
+	if usage != nil {
+		usage.ResponseID = response.ID
+		usage.ProviderEventID = envelope.EventID
+	}
+	return usage
 }
 
 func codexResponsesWSProviderMalformed(err error) responsesws.ProviderFrameResult {
@@ -480,11 +419,7 @@ func codexResponsesWSProviderMalformedWithUsage(err error, usage *types.UsageEve
 func (a *codexResponsesWSAdapter) MapProviderClose(_ context.Context, info responsesws.ProviderCloseInfo) responsesws.ProviderCloseResult {
 	if a != nil {
 		a.mu.Lock()
-		a.accumulator = nil
-		a.turnModel = ""
-		a.lastSequence = 0
-		a.hasSequence = false
-		a.lastTerminal = ""
+		a.responses = nil
 		a.mu.Unlock()
 	}
 	if codexResponsesWSNativeProviderCloseInfo(info) {

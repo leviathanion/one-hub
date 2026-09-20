@@ -108,6 +108,9 @@ func InitCron() {
 			if deleted > 0 {
 				logger.SysLog("清理过期 Responses 归属记录")
 			}
+			if _, cleanupErr := model.DeleteExpiredResourceOwners(context.Background(), time.Now()); cleanupErr != nil {
+				logger.SysError("Cleanup resource owners error: " + cleanupErr.Error())
+			}
 		}),
 	)
 	if err != nil {

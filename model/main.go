@@ -175,7 +175,7 @@ func InitDB() (err error) {
 		if err = EnsurePublicationVersionRows(db); err != nil {
 			return err
 		}
-		err = db.AutoMigrate(&ResponseOwner{})
+		err = db.AutoMigrate(&ResponseOwner{}, &ResourceOwner{})
 		if err != nil {
 			return err
 		}

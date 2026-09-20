@@ -28,13 +28,8 @@ func GetUserTokensList(c *gin.Context) {
 		return
 	}
 
-	// 对于非可信用户，隐藏 BillingTag 字段
-	if userRole < config.RoleReliableUser {
-		for _, token := range *tokens.Data {
-			setting := token.Setting.Data()
-			setting.BillingTag = nil
-			token.Setting.Set(setting)
-		}
+	for _, token := range *tokens.Data {
+		hideTokenAdministrativeSettings(token, userRole)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -85,12 +80,7 @@ func GetToken(c *gin.Context) {
 		return
 	}
 
-	// 对于非可信用户，隐藏 BillingTag 字段
-	if userRole < config.RoleReliableUser {
-		setting := token.Setting.Data()
-		setting.BillingTag = nil
-		token.Setting.Set(setting)
-	}
+	hideTokenAdministrativeSettings(token, userRole)
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
@@ -167,6 +157,12 @@ func AddToken(c *gin.Context) {
 	// 非可信用户不能设置 BillingTag
 	if userRole < config.RoleReliableUser {
 		setting.BillingTag = nil
+	}
+	if userRole < config.RoleAdminUser {
+		setting.ResourceChannelID = 0
+	} else if err := validateTokenResourceChannel(c.Request.Context(), setting.ResourceChannelID); err != nil {
+		common.APIRespondWithError(c, http.StatusOK, err)
+		return
 	}
 
 	cleanToken := model.Token{
@@ -308,12 +304,22 @@ func UpdateToken(c *gin.Context) {
 			newSetting.BillingTag = oldSetting.BillingTag
 		}
 		// 可信用户：直接使用前端传入的值（包括空值，用于清除 BillingTag）
+		if userRole >= config.RoleAdminUser {
+			if err := validateTokenResourceChannel(c.Request.Context(), newSetting.ResourceChannelID); err != nil {
+				common.APIRespondWithError(c, http.StatusOK, err)
+				return
+			}
+		}
 
 		cleanToken.Setting.Set(newSetting)
-		err = cleanToken.UpdateMutableFields(request.ExpectedRemainQuota)
+		if userRole < config.RoleAdminUser {
+			err = cleanToken.UpdateMutableFieldsPreservingResourceChannel(request.ExpectedRemainQuota)
+		} else {
+			err = cleanToken.UpdateMutableFields(request.ExpectedRemainQuota)
+		}
 	}
 	if statusOnly != "" {
-		err = cleanToken.UpdateMutableFields(nil)
+		err = cleanToken.UpdateMutableFieldsPreservingResourceChannel(nil)
 	}
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
@@ -323,12 +329,7 @@ func UpdateToken(c *gin.Context) {
 		return
 	}
 
-	// 对于非可信用户，返回数据时隐藏 BillingTag 字段
-	if userRole < config.RoleReliableUser {
-		responseSetting := cleanToken.Setting.Data()
-		responseSetting.BillingTag = nil
-		cleanToken.Setting.Set(responseSetting)
-	}
+	hideTokenAdministrativeSettings(cleanToken, userRole)
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
@@ -430,11 +431,15 @@ func UpdateTokenByAdmin(c *gin.Context) {
 		cleanToken.UnlimitedQuota = token.UnlimitedQuota
 		cleanToken.Group = token.Group
 		cleanToken.BackupGroup = token.BackupGroup
+		if err := validateTokenResourceChannel(c.Request.Context(), newSetting.ResourceChannelID); err != nil {
+			common.APIRespondWithError(c, http.StatusOK, err)
+			return
+		}
 		cleanToken.Setting.Set(newSetting)
 		err = cleanToken.UpdateMutableFields(request.ExpectedRemainQuota)
 	}
 	if statusOnly != "" {
-		err = cleanToken.UpdateMutableFields(nil)
+		err = cleanToken.UpdateMutableFieldsPreservingResourceChannel(nil)
 	}
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
@@ -489,5 +494,29 @@ func validateTokenSetting(setting *model.TokenSetting) error {
 		}
 	}
 
+	return nil
+}
+
+func hideTokenAdministrativeSettings(token *model.Token, role int) {
+	setting := token.Setting.Data()
+	if role < config.RoleReliableUser {
+		setting.BillingTag = nil
+	}
+	if role < config.RoleAdminUser {
+		setting.ResourceChannelID = 0
+	}
+	token.Setting.Set(setting)
+}
+
+func validateTokenResourceChannel(ctx context.Context, channelID int) error {
+	if channelID == 0 {
+		return nil
+	}
+	if channelID < 0 {
+		return errors.New("资源创建渠道 ID 必须为正整数，或设为 0 清除配置")
+	}
+	if _, err := model.GetChannelByIdWithContext(ctx, channelID); err != nil {
+		return errors.New("资源创建渠道不存在或无法读取")
+	}
 	return nil
 }

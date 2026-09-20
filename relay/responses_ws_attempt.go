@@ -131,7 +131,7 @@ type ResponsesWSTurnAttempt struct {
 	StoredOwnerPersisted        bool
 	MultiAgentEnabled           bool
 	snapshot                    *ResponsesWSRequestSnapshot
-	providerAPIErrorKeys        map[string]struct{}
+	providerAPIErrorKeys        map[[32]byte]struct{}
 	imageGenerationTracker      commonresponses.ImageGenerationStreamTracker
 }
 
@@ -178,7 +178,7 @@ func PrepareResponsesWSTurnAttempt(input ResponsesWSTurnAttemptInput) (*Response
 		SelectedChannelID:           input.SelectedChannelID,
 		Session:                     input.Session,
 		Billing:                     billingAttempt,
-		AttemptedPreviousResponseID: strings.TrimSpace(input.Request.PreviousResponseID),
+		AttemptedPreviousResponseID: input.Request.PreviousResponseID,
 		RequireStoredOwner:          responseRequiresDurableOwner(input.Request),
 		MultiAgentEnabled:           input.MultiAgentEnabled,
 		Usage:                       usage,
@@ -224,18 +224,7 @@ func (a *ResponsesWSTurnAttempt) BeginCandidate(actor *ResponsesWSSessionActor) 
 	if a == nil || actor == nil {
 		return errors.New("responses websocket attempt and actor are required")
 	}
-	if a.CandidateBegun {
-		return nil
-	}
-	a.initializeIdentity()
-	actor.clearPendingProviderState("begin_candidate")
-	pending := actor.turns.pending
-	pending.attempt = a
-	pending.openingID = a.OpeningID
-	if err := actor.turns.AttachPending(pending); err != nil {
-		return err
-	}
-	return nil
+	return actor.BeginCandidate(a)
 }
 
 func (a *ResponsesWSTurnAttempt) initializeIdentity() {
@@ -355,7 +344,7 @@ func (a *ResponsesWSTurnAttempt) RememberProviderResponseID(responseID string) b
 	if a == nil {
 		return true
 	}
-	responseID = strings.TrimSpace(responseID)
+
 	if responseID == "" {
 		return true
 	}
@@ -385,7 +374,7 @@ func (a *ResponsesWSTurnAttempt) MarkProviderAccepted(reason string, responseID 
 	a.ProviderAccepted = true
 	a.ProviderAcceptedAt = time.Now()
 	a.ProviderAcceptedReason = strings.TrimSpace(reason)
-	a.ProviderAcceptedID = strings.TrimSpace(responseID)
+	a.ProviderAcceptedID = responseID
 }
 
 func (a *ResponsesWSTurnAttempt) MarkDownstreamCommitted(kind ResponsesDownstreamCommitKind, reason string, seq uint64) {
@@ -572,12 +561,7 @@ func (a *ResponsesWSSessionActor) ensureProviderResponseDelivery(attempt *Respon
 		return true
 	}
 	responseID := responsesWSProviderDownstreamResponseID(event)
-	if event.Frame != nil && event.Frame.Kind() == responsesws.FrameKindText {
-		envelope, err := responsesws.ParseProviderEventEnvelope(event.Frame.Payload())
-		if err == nil && envelope.Type == "response.created" && responseID != "" && attempt.TransportAttemptID == "" {
-			a.releaseSteeringParent(attempt.AttemptedPreviousResponseID)
-		}
-	}
+
 	if attempt.OwnerPersistenceError != nil && a.closing.reducingCut {
 		return false
 	}
@@ -588,6 +572,7 @@ func (a *ResponsesWSSessionActor) ensureProviderResponseDelivery(attempt *Respon
 		a.close("responses_owner_persist_failed")
 		return false
 	}
+	a.holdSteeringParent(attempt)
 	if !attempt.RequireStoredOwner && responseID != "" {
 		a.rememberConnectionLocalEphemeralResponseID(responseID)
 	}

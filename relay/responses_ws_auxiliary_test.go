@@ -38,7 +38,7 @@ func TestResponsesWSInjectCompletionSurvivesParentSettlement(t *testing.T) {
 	for _, status := range []responsesws.ResponsesWSTransportSendStatus{responsesws.ResponsesWSTransportSendAttempted, responsesws.ResponsesWSTransportSendNotAttempted, responsesws.ResponsesWSTransportSendAmbiguous, "invalid"} {
 		t.Run(string(status), func(t *testing.T) {
 			actor, session, _ := newSteeringTestActor(t, 1000)
-			parent := actor.turns.active.attempt
+			parent := actor.observation.byResponse("resp_parent").attempt
 			actor.handleClientFrame(responsesWSTestClientTextFrame([]byte(`{"type":"response.inject","response_id":"resp_parent","input":{"future":true}}`)))
 			select {
 			case <-session.requests:
@@ -57,7 +57,10 @@ func TestResponsesWSInjectCompletionSurvivesParentSettlement(t *testing.T) {
 			case <-time.After(time.Second):
 				t.Fatal("inject completion blocked the next create")
 			}
-			next := actor.turns.pending.attempt
+			var next *ResponsesWSTurnAttempt
+			if len(actor.observation.works) > 0 {
+				next = actor.observation.works[0].attempt
+			}
 			if !parent.QuotaFinalized || next == nil {
 				t.Fatal("parent was retained or next create was not admitted")
 			}
@@ -73,7 +76,7 @@ func TestResponsesWSInjectCompletionSurvivesParentSettlement(t *testing.T) {
 			if !fatal {
 				event.TransportResult = responsesws.ResponsesWSTransportSendResult{Status: responsesws.ResponsesWSTransportSendAmbiguous, Err: errors.New("duplicate")}
 				actor.handleSendResult(event)
-				if actor.closing.closed.Load() || actor.turns.pending.attempt != next || next.QuotaFinalized || next.RolledBack {
+				if actor.closing.closed.Load() || actor.observation.byAttempt(next.AttemptID) == nil || next.QuotaFinalized || next.RolledBack {
 					t.Fatal("consumed old completion affected new work")
 				}
 			}

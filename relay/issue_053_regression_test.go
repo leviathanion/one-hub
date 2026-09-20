@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/groupctx"
 	"one-api/common/requester"
@@ -30,56 +31,23 @@ import (
 
 const issue053ImageModel = "issue053-image-model"
 
-func TestIssue053RelayRejectsImageStreamBeforeProviderWork(t *testing.T) {
-	for _, test := range []struct {
-		name  string
-		path  string
-		build func(*testing.T) ([]byte, string)
-	}{
-		{
-			name: "generation JSON",
-			path: "/v1/images/generations",
-			build: func(*testing.T) ([]byte, string) {
-				return []byte(`{"model":"` + issue053ImageModel + `","prompt":"draw","stream":true,"future":{"keep":true}}`), "application/json"
-			},
-		},
-		{
-			name: "mapped multipart edits",
-			path: "/v1/images/edits",
-			build: func(t *testing.T) ([]byte, string) {
-				return issue053MultipartBody(t, "true", "client-image")
-			},
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			body, contentType := test.build(t)
-			issue053SeedBillingRows(t)
-			engine := gin.New()
-			engine.POST(test.path, Relay)
-			recorder := httptest.NewRecorder()
-			request := httptest.NewRequest(http.MethodPost, test.path, bytes.NewReader(body))
-			request.Header.Set("Content-Type", contentType)
-			engine.ServeHTTP(recorder, request)
-
-			if recorder.Code != http.StatusBadRequest {
-				t.Fatalf("stream=true 未在 provider work 前拒绝：status=%d body=%s", recorder.Code, recorder.Body.String())
-			}
-			var envelope struct {
-				Error struct {
-					Code    string `json:"code"`
-					Message string `json:"message"`
-					Param   string `json:"param"`
-					Type    string `json:"type"`
-				} `json:"error"`
-			}
-			if err := json.Unmarshal(recorder.Body.Bytes(), &envelope); err != nil {
-				t.Fatalf("解析 stream gate 错误失败：%v body=%s", err, recorder.Body.String())
-			}
-			if envelope.Error.Code != "unsupported_capability" || envelope.Error.Param != "stream" || envelope.Error.Type != "invalid_request_error" || !strings.Contains(strings.ToLower(envelope.Error.Message), "stream") {
-				t.Fatalf("stream gate 错误不明确：%+v", envelope.Error)
-			}
-			issue053AssertBillingRowsUnchanged(t)
-		})
+func TestIssue053ImageStreamGateMatchesAdapterCapability(t *testing.T) {
+	for _, path := range []string{"/v1/images/generations", "/v1/images/edits"} {
+		ctx := issue053RequestContext(t, path, []byte(`{"model":"image","stream":true}`), "application/json")
+		if _, err := common.CacheRequestBody(ctx); err != nil {
+			t.Fatal(err)
+		}
+		mode := config.RelayModeImagesGenerations
+		if strings.HasSuffix(path, "edits") {
+			mode = config.RelayModeImagesEdits
+		}
+		gate := requireImageEndpoint(ctx, mode)
+		if err := gate(&model.Channel{Type: config.ChannelTypeOpenAI}); err != nil {
+			t.Fatalf("native image streaming blocked: %v", err)
+		}
+		if err := gate(&model.Channel{Type: config.ChannelTypeXAI}); err == nil {
+			t.Fatal("unary adapter accepted streaming")
+		}
 	}
 }
 

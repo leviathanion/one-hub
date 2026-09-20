@@ -260,10 +260,10 @@ func (t *ToolBillingStreamTracker) entryLimit() int {
 
 func responsesToolBillingIdentity(eventItemID string, item *types.ResponsesOutput, outputIndex *int) (toolBillingIdentity, bool, error) {
 	var identity toolBillingIdentity
-	topLevelID := strings.TrimSpace(eventItemID)
+	topLevelID := eventItemID
 	itemID := ""
 	if item != nil {
-		itemID = strings.TrimSpace(item.ID)
+		itemID = item.ID
 	}
 	if topLevelID != "" && itemID != "" && topLevelID != itemID {
 		return toolBillingIdentity{}, false, errToolBillingStreamIdentityConflict
@@ -276,7 +276,7 @@ func responsesToolBillingIdentity(eventItemID string, item *types.ResponsesOutpu
 		identity.hasID = true
 	}
 	if item != nil {
-		if callID := strings.TrimSpace(item.CallID); callID != "" {
+		if callID := item.CallID; callID != "" {
 			identity.callID = hashResponsesToolBillingIdentity("call", callID)
 			identity.hasCall = true
 		}

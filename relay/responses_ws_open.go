@@ -67,9 +67,6 @@ func openAndPrimeResponsesWSSessionWithContextAndFrameAdmissionAndBudget(openCtx
 	if err := validateResponsesSupportedSurface(request, rawFields, responsesOperationCreate); err != nil {
 		return nil, capabilityGateAPIError(err)
 	}
-	if err := validateResponsesWSClientEnvelope(rawFields); err != nil {
-		return nil, capabilityGateAPIError(err)
-	}
 	requireStored := request.Store == nil || *request.Store
 	wsCapability := requireResponsesWSAdapterSupport(requireStored, rawFields, request.Model)
 	setRequestChannelCapability(c, wsCapability)

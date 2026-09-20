@@ -9,7 +9,6 @@ import (
 	"one-api/common"
 	"one-api/common/config"
 	providersBase "one-api/providers/base"
-	"one-api/providers/openai"
 	"one-api/types"
 )
 
@@ -28,7 +27,7 @@ func (r *relayImageGenerations) setRequest() error {
 	if err := common.UnmarshalBodyReusable(r.c, &r.request); err != nil {
 		return err
 	}
-	if err := rejectImageStreamRequest(r.c); err != nil {
+	if err := prepareImageRequest(r.c); err != nil {
 		return err
 	}
 
@@ -51,27 +50,26 @@ func (r *relayImageGenerations) setRequest() error {
 	}
 
 	r.setOriginalModel(r.request.Model)
-	setRequestChannelCapability(r.c, requireEndpointEnabled(config.RelayModeImagesGenerations))
+	setRequestChannelCapability(r.c, requireImageEndpoint(r.c, config.RelayModeImagesGenerations))
 
 	return nil
 }
 
-func rejectImageStreamRequest(c *gin.Context) error {
-	if c == nil || c.Request == nil {
-		return nil
-	}
-	body, exists := common.GetCanonicalRequestBody(c)
-	if !exists {
-		return nil
-	}
-	return providerCapabilityGateError(openai.ValidateImageStreamRequestBody(body, c.Request.Header.Get("Content-Type")))
-}
+func (r *relayImageGenerations) IsStream() bool { return imageStreamIntent(r.c) }
 
 func (r *relayImageGenerations) getPromptTokens() (int, error) {
 	return common.CountTokenImage(r.request)
 }
 
 func (r *relayImageGenerations) send() (err *types.OpenAIErrorWithStatusCode, done bool) {
+	r.request.Model = r.modelName
+	if provider, ok := r.provider.(providersBase.ImageGenerationsResponseInterface); ok && provider.SupportsImageResponse() {
+		response, apiErr := provider.CreateImageGenerationsResponse(&r.request)
+		if apiErr != nil {
+			return apiErr, apiErr.UpstreamAccepted || apiErr.UpstreamAmbiguous
+		}
+		return r.responseImageClient(response), true
+	}
 	provider, ok := r.provider.(providersBase.ImageGenerationsInterface)
 	if !ok {
 		err = common.StringErrorWrapperLocal("channel not implemented", "channel_error", http.StatusServiceUnavailable)

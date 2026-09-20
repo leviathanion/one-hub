@@ -304,3 +304,29 @@ func TestApplySettlementProjectsClaudeCacheBreakdown(t *testing.T) {
 		t.Fatalf("expected consume log to persist Claude cache token breakdown, got %+v", log)
 	}
 }
+
+func TestProjectSettlementDoesNotApplyBalances(t *testing.T) {
+	useSettlementTestDB(t)
+	insertSettlementFixtures(t)
+	oldLog, oldBatch := config.LogConsumeEnabled, config.BatchUpdateEnabled
+	config.LogConsumeEnabled = true
+	config.BatchUpdateEnabled = false
+	t.Cleanup(func() { config.LogConsumeEnabled = oldLog; config.BatchUpdateEnabled = oldBatch })
+	var before model.User
+	if err := model.DB.First(&before, 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	command := SettlementCommand{UserID: 1, TokenID: 1, ChannelID: 1, FinalQuota: 250, UsageSummary: UsageSummary{PromptTokens: 2, CompletionTokens: 3}}
+	if err := ProjectSettlement(context.Background(), command, nil); err != nil {
+		t.Fatal(err)
+	}
+	var after model.User
+	var channel model.Channel
+	var entry model.Log
+	model.DB.First(&after, 1)
+	model.DB.First(&channel, 1)
+	model.DB.Where("type = ?", model.LogTypeConsume).First(&entry)
+	if after.Quota != before.Quota || after.UsedQuota != before.UsedQuota || after.RequestCount != before.RequestCount+1 || channel.UsedQuota != 250 || entry.Quota != 250 {
+		t.Fatalf("projection changed balance or lost counters: before=%+v after=%+v channel=%+v log=%+v", before, after, channel, entry)
+	}
+}

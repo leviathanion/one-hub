@@ -24,7 +24,7 @@ func codexResponsesWSPreviousResponseNotFoundPayload(eventID string) []byte {
 			"param":   "previous_response_id",
 		},
 	}
-	if eventID = strings.TrimSpace(eventID); eventID != "" {
+	if strings.TrimSpace(eventID) != "" {
 		payload["event_id"] = eventID
 	}
 	encoded, _ := json.Marshal(payload)

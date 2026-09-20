@@ -130,7 +130,7 @@ func TestStoredResponsesLifecycleDeadlineReachesProviderRequest(t *testing.T) {
 				ctx := req.Context()
 				deadline, hasDeadline := ctx.Deadline()
 				remaining := time.Until(deadline)
-				deadlineSeen.Store(hasDeadline && remaining > 0 && remaining <= responsesLifecycleIOTimeout)
+				deadlineSeen.Store(hasDeadline && remaining > 0 && remaining <= storedResponsesRequestTimeout)
 				return nil, nil
 			}
 			capturingClient := *originalHTTPClient
@@ -415,7 +415,7 @@ func TestStoredResponsesRetrieveAppliesProviderResponseHeaderPolicy(t *testing.T
 	}
 }
 
-func TestStoredResponsesRetrieveRejectsRecoveryStreamBeforeProviderWork(t *testing.T) {
+func TestStoredResponsesRetrievePassesRecoveryQueryToProvider(t *testing.T) {
 	tests := []string{
 		"stream=true",
 		"stream=TRUE",
@@ -426,7 +426,10 @@ func TestStoredResponsesRetrieveRejectsRecoveryStreamBeforeProviderWork(t *testi
 	}
 	for _, rawQuery := range tests {
 		t.Run(rawQuery, func(t *testing.T) {
-			owner, _, calls := setupStoredResponsesHandlerTest(t, func(w http.ResponseWriter, _ *http.Request) {
+			owner, _, calls := setupStoredResponsesHandlerTest(t, func(w http.ResponseWriter, req *http.Request) {
+				if req.URL.RawQuery != rawQuery {
+					t.Errorf("query changed: %s", req.URL.RawQuery)
+				}
 				w.WriteHeader(http.StatusOK)
 			})
 			recorder := httptest.NewRecorder()
@@ -438,11 +441,8 @@ func TestStoredResponsesRetrieveRejectsRecoveryStreamBeforeProviderWork(t *testi
 
 			StoredResponses(ctx)
 
-			if recorder.Code != http.StatusBadRequest || atomic.LoadInt32(calls) != 0 {
-				t.Fatalf("expected local capability rejection before provider work, status=%d calls=%d body=%q", recorder.Code, atomic.LoadInt32(calls), recorder.Body.String())
-			}
-			if !strings.Contains(recorder.Body.String(), unsupportedCapabilityCode) {
-				t.Fatalf("expected unsupported capability error, body=%q", recorder.Body.String())
+			if recorder.Code != http.StatusOK || atomic.LoadInt32(calls) != 1 {
+				t.Fatalf("query must reach upstream: status=%d calls=%d body=%q", recorder.Code, atomic.LoadInt32(calls), recorder.Body.String())
 			}
 		})
 	}

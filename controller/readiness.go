@@ -122,9 +122,6 @@ func addResponsesWSLivenessReadiness(data *readinessData) {
 	if config.ResponsesWebsocketClientInboundActivityTimeout() <= 0 {
 		degraded = append(degraded, "client_inbound_activity")
 	}
-	if config.ResponsesWSActiveTurnTimeout() <= 0 {
-		degraded = append(degraded, "provider_inactivity")
-	}
 	if config.ResponsesWSMaxLifetime() <= 0 {
 		degraded = append(degraded, "max_lifetime")
 	}
@@ -150,6 +147,9 @@ func databaseReady(ctx context.Context) bool {
 		return false
 	}
 	if model.CheckResponseOwnerSchema(pingCtx) != nil {
+		return false
+	}
+	if model.CheckResourceOwnerSchema(pingCtx) != nil {
 		return false
 	}
 	if model.CheckTaskOwnerSchema(pingCtx) != nil {

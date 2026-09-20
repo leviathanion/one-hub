@@ -231,5 +231,33 @@ func rawStringField(object map[string]json.RawMessage, key string) string {
 	if raw, ok := object[key]; ok {
 		_ = json.Unmarshal(raw, &value)
 	}
-	return strings.TrimSpace(value)
+	if key == "type" || key == "model" {
+		return strings.TrimSpace(value)
+	}
+	return value
+}
+
+// ProviderResponseID 只提取原帧中的响应身份，不使用最近一次发送或 lane 猜测。
+// 两个身份位置冲突时保留交付，但不授权计费关联。
+func ProviderResponseID(payload []byte) string {
+	envelope, err := ParseProviderEventEnvelope(payload)
+	if err != nil {
+		return ""
+	}
+	direct := rawStringField(envelope.Object, "response_id")
+	var nested string
+	if raw := bytes.TrimSpace(envelope.Object["response"]); len(raw) > 0 && !bytes.Equal(raw, []byte("null")) {
+		response, err := decodeTopLevelObjectNoDuplicateKeys(raw)
+		if err != nil {
+			return ""
+		}
+		nested = rawStringField(response, "id")
+	}
+	if direct != "" && nested != "" && direct != nested {
+		return ""
+	}
+	if direct != "" {
+		return direct
+	}
+	return nested
 }

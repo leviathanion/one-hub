@@ -3,12 +3,14 @@ package openai
 import (
 	"bytes"
 	"fmt"
+	"mime"
 	"net/http"
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/requestctx"
 	"one-api/common/requester"
 	"one-api/types"
+	"strings"
 )
 
 func (p *OpenAIProvider) CreateImageEdits(request *types.ImageEditRequest) (*types.ImageResponse, *types.OpenAIErrorWithStatusCode) {
@@ -17,6 +19,9 @@ func (p *OpenAIProvider) CreateImageEdits(request *types.ImageEditRequest) (*typ
 		return nil, errWithCode
 	}
 	defer req.Body.Close()
+	if apiErr := rejectUnsupportedImageStreamRequest(req); apiErr != nil {
+		return nil, apiErr
+	}
 
 	response := &OpenAIProviderImageResponse{}
 	_, errWithCode = p.sendUnaryJSON(req, response)
@@ -66,13 +71,20 @@ func (p *OpenAIProvider) getRequestImageBody(relayMode int, ModelName string, re
 		}
 		contentType := p.Context.Request.Header.Get("Content-Type")
 		if p.OriginalModel != "" && p.OriginalModel != request.Model {
-			body, contentType, rawErr = rewriteMultipartModel(body, contentType, request.Model)
+			mediaType, _, _ := mime.ParseMediaType(contentType)
+			if strings.EqualFold(mediaType, "application/json") {
+				body, rawErr = patchNativeJSONModel(body, request.Model)
+			} else {
+				body, contentType, rawErr = rewriteMultipartModel(body, contentType, request.Model)
+			}
 			if rawErr != nil {
-				return nil, common.ErrorWrapperLocal(rawErr, "invalid_multipart_request", http.StatusBadRequest)
+				return nil, common.ErrorWrapperLocal(rawErr, "invalid_image_request", http.StatusBadRequest)
 			}
 		}
-		if errWithCode := rejectUnsupportedImageStream(body, contentType); errWithCode != nil {
-			return nil, errWithCode
+		if !p.SupportsImageResponse() {
+			if errWithCode := rejectUnsupportedImageStream(body, contentType); errWithCode != nil {
+				return nil, errWithCode
+			}
 		}
 		req, err = p.Requester.NewRequest(
 			http.MethodPost,
@@ -107,6 +119,11 @@ func (p *OpenAIProvider) getRequestImageBody(relayMode int, ModelName string, re
 		if err := p.applyOpenAIHTTPHeaders(req.Header, requestctx.NewHeaderSnapshot(p.Context.Request.Header)); err != nil {
 			return nil, common.ErrorWrapperLocal(err, "invalid_request_header", http.StatusBadRequest)
 		}
+	}
+
+	if apiErr := p.authorizeMediaRequestBody(req, relayMode); apiErr != nil {
+		_ = req.Body.Close()
+		return nil, apiErr
 	}
 
 	return req, nil

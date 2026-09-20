@@ -16,17 +16,6 @@ func (a *ResponsesWSSessionActor) applyPendingSettlement() (ResponsesWSSettlemen
 	return decision, applied, err
 }
 
-func (a *ResponsesWSSessionActor) applyActiveSettlement() (ResponsesWSSettlementDecision, ResponsesWSAppliedSettlement, error) {
-	if a == nil || a.turns.active.attempt == nil {
-		return ResponsesWSSettlementDecision{}, ResponsesWSAppliedSettlement{}, fmt.Errorf("responses websocket active attempt is required for settlement")
-	}
-	decision := projectResponsesWSSharedDecision(a.turns.active.attempt)
-	operationCtx, cancel := boundedResponsesLifecycleContext(context.WithoutCancel(a.logContext()))
-	defer cancel()
-	applied, err := a.turns.active.attempt.ApplyResponsesWSSettlementDecisionWithContext(operationCtx, a.Context(), decision)
-	return decision, applied, err
-}
-
 func projectResponsesWSSharedDecision(attempt *ResponsesWSTurnAttempt) ResponsesWSSettlementDecision {
 	if attempt == nil || attempt.Billing == nil {
 		return newResponsesWSSettlementDecision(ResponsesWSSettlementNoop)

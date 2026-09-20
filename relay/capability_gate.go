@@ -88,13 +88,8 @@ func UnsupportedCapabilityUnlessSpecifiedChannel(param, message string) gin.Hand
 }
 
 func validateChatSupportedSurface(request *types.ChatCompletionRequest, raw map[string]json.RawMessage) error {
-	if request != nil && request.Store != nil && *request.Store {
-		return newCapabilityGateError("store", "store=true is not supported for chat completions because Stored Chat lifecycle is unavailable")
-	}
-	if messages, ok := raw["messages"]; ok {
-		if field, found := commonresponses.FindAccountScopedResourceReferenceJSON(messages); found {
-			return newCapabilityGateError("messages", fmt.Sprintf("chat resource reference %s is not supported", field))
-		}
+	if err := validateUnimplementedInputResources(raw["messages"]); err != nil {
+		return err
 	}
 	if tools, ok := raw["tools"]; ok {
 		if err := validateResponsesToolsSurface(tools); err != nil {
@@ -107,6 +102,9 @@ func validateChatSupportedSurface(request *types.ChatCompletionRequest, raw map[
 func validateChatToResponsesRepresentability(request *types.ChatCompletionRequest, fields map[string]json.RawMessage) error {
 	if request == nil {
 		return newCapabilityGateError("request", "chat request cannot be represented as a Responses request")
+	}
+	if request.Store != nil && *request.Store {
+		return newCapabilityGateError("store", "Stored Chat lifecycle cannot be represented by the Responses adapter")
 	}
 	if request.N != nil && *request.N != 1 {
 		return newCapabilityGateError("n", "the selected channel cannot preserve multiple Chat choices")
@@ -636,14 +634,8 @@ func validateResponsesSupportedSurface(request *types.OpenAIResponsesRequest, ra
 	if request == nil {
 		return nil
 	}
-	if request.Background != nil && *request.Background {
-		return newCapabilityGateError("background", "background responses are not supported")
-	}
-	if hasMeaningfulResponsesConversation(request.Conversation) {
-		return newCapabilityGateError("conversation", "conversation resources are not supported")
-	}
-	if meaningfulJSONValue(request.Prompt) {
-		return newCapabilityGateError("prompt", "saved prompt resources are not supported; inline the saved prompt content in instructions or input before the prompt resource API closes on 2026-11-30")
+	if err := validateResponsesPromptSurface(request.Prompt); err != nil {
+		return err
 	}
 	if operation == responsesOperationCompact {
 		if value, ok := raw["multi_agent"]; ok && !isJSONNull(value) {
@@ -655,10 +647,15 @@ func validateResponsesSupportedSurface(request *types.OpenAIResponsesRequest, ra
 			return err
 		}
 	}
-	if value, ok := raw["input"]; ok {
-		if field, found := commonresponses.FindAccountScopedResourceReferenceJSON(value); found {
-			return newCapabilityGateError("input", fmt.Sprintf("input resource reference %s is not supported", field))
-		}
+	if err := validateUnimplementedInputResources(raw["input"]); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateResponsesPromptSurface(prompt any) error {
+	if meaningfulJSONValue(prompt) {
+		return newCapabilityGateError("prompt", "saved prompt resources are not supported; inline the saved prompt content in instructions or input before the prompt resource API closes on 2026-11-30")
 	}
 	return nil
 }
@@ -682,61 +679,33 @@ func isJSONNull(raw json.RawMessage) bool {
 	return len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
 }
 
-func validateResponsesToolsSurface(raw json.RawMessage) error {
-	// Tool schemas and discriminated unions belong to the selected upstream on
-	// same-dialect/exact-wire paths. This pre-selection gate only rejects resources
-	// whose ownership/lifecycle the proxy cannot safely represent.
-	var tools []json.RawMessage
-	if err := json.Unmarshal(raw, &tools); err != nil {
-		tools = []json.RawMessage{raw}
+// These gates describe local resource capabilities. Authorization of supported
+// references runs with the current principal before routing and on the effective body.
+func validateUnimplementedInputResources(raw json.RawMessage) error {
+	var value any
+	if json.Unmarshal(raw, &value) != nil {
+		return nil
 	}
-	for _, rawTool := range tools {
-		var tool map[string]json.RawMessage
-		if err := json.Unmarshal(rawTool, &tool); err != nil {
+	return validateUnimplementedResources(commonresponses.InputResourceReferences(value))
+}
+
+func validateUnimplementedResources(refs []commonresponses.ResourceReference) error {
+	for _, ref := range refs {
+		switch ref.Kind {
+		case "file", "conversation", "chat_audio":
 			continue
 		}
-		if resource, unsupported := unsupportedHostedContainerTool(tool); unsupported {
-			return newCapabilityGateError("tools", fmt.Sprintf("tools[] requires unsupported hosted container resource %s", resource))
-		}
-		for _, nestedField := range []string{"environment", "input_image_mask"} {
-			if value, ok := tool[nestedField]; ok && !isJSONNull(value) {
-				if field, found := commonresponses.FindAccountScopedResourceReferenceJSON(value); found {
-					return newCapabilityGateError("tools", fmt.Sprintf("tools[].%s resource reference %s is not supported", nestedField, field))
-				}
-			}
-		}
-		for _, field := range []string{"vector_store_ids", "container", "container_id", "file_id", "skill_reference"} {
-			if value, ok := tool[field]; ok && !isJSONNull(value) {
-				return newCapabilityGateError("tools", fmt.Sprintf("tools[].%s resource reference is not supported", field))
-			}
-		}
+		return newCapabilityGateError(ref.Path, fmt.Sprintf("%s requires an implemented %s owner", ref.Path, ref.Kind))
 	}
 	return nil
 }
 
-func unsupportedHostedContainerTool(tool map[string]json.RawMessage) (string, bool) {
-	var toolType string
-	if json.Unmarshal(tool["type"], &toolType) != nil {
-		return "", false
+func validateResponsesToolsSurface(raw json.RawMessage) error {
+	var value any
+	if json.Unmarshal(raw, &value) != nil {
+		return nil
 	}
-	switch strings.TrimSpace(toolType) {
-	case types.APIToolTypeCodeInterpreter:
-		return types.APIToolTypeCodeInterpreter, true
-	case types.APIToolTypeShell:
-		var environment map[string]json.RawMessage
-		if json.Unmarshal(tool["environment"], &environment) != nil {
-			return "", false
-		}
-		var environmentType string
-		if json.Unmarshal(environment["type"], &environmentType) != nil {
-			return "", false
-		}
-		switch strings.TrimSpace(environmentType) {
-		case "container_auto", "container_reference":
-			return environmentType, true
-		}
-	}
-	return "", false
+	return validateUnimplementedResources(commonresponses.ToolResourceReferences(value))
 }
 
 func requireChatChannelCompatibility(modelName string, request *types.ChatCompletionRequest, fields map[string]json.RawMessage) requestChannelCapability {
@@ -756,12 +725,17 @@ func requireChatChannelCompatibility(modelName string, request *types.ChatComple
 			return err
 		}
 		usesResponsesTransport := chatModelRequiresResponses(canonicalModel)
+		storedSupported := false
 		if !usesResponsesTransport {
 			chatSupport, err := providers.AssessChatRequest(channel, canonicalModel, effectiveRequest, effectiveFields)
 			if err != nil {
 				return providerCapabilityGateError(err)
 			}
 			usesResponsesTransport = chatSupport.UsesResponsesTransport
+			storedSupported = chatSupport.SupportsStoredChat
+		}
+		if effectiveRequest.Store != nil && *effectiveRequest.Store && (!storedSupported || usesResponsesTransport) {
+			return newCapabilityGateError("store", "selected channel cannot preserve Stored Chat lifecycle")
 		}
 		if usesResponsesTransport {
 			path, ok := providers.ResolveAdapterSupport(channel).DataPath(providersBase.OperationResponsesCreate)
@@ -1008,13 +982,6 @@ func channelCustomParameterChangesRequest(channel *model.Channel, modelName stri
 		return false, err
 	}
 	return !bytes.Equal(before, encoded), nil
-}
-
-func validateResponsesWSClientEnvelope(fields map[string]json.RawMessage) error {
-	if _, present := fields["stream_id"]; present {
-		return newCapabilityGateError("stream_id", "responses websocket stream_id lanes are not supported")
-	}
-	return nil
 }
 
 func requireEndpointEnabled(relayMode int) requestChannelCapability {

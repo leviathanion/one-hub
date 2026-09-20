@@ -3,7 +3,7 @@ package types
 import "mime/multipart"
 
 type ImageRequest struct {
-	Prompt           string  `json:"prompt,omitempty" binding:"required"`
+	Prompt           string  `json:"prompt,omitempty"`
 	Model            string  `json:"model,omitempty"`
 	N                int     `json:"n,omitempty"`
 	Quality          string  `json:"quality,omitempty"`

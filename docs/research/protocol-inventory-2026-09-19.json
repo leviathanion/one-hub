@@ -1,0 +1,2091 @@
+{
+  "schema_version": 2,
+  "audit_date": "2026-09-19",
+  "code_revision": "b986504166b94e4bfdf53ec48740a7dcf94985c3",
+  "description": "版本化人工协议覆盖账本；保留原 56 个稳定 ID，新增 O43–O47 及 C05，总计 62 个家族/能力审查条目。实现、授权、验证、上游生命周期与目标取舍分列，不是 bug 数、端点数、覆盖率或穷尽证明，不作为运行时配置。",
+  "coverage_scope": {
+    "primary": "OpenAI 与 OpenAI 兼容渠道",
+    "extension": "Claude/Gemini 原生路由与 action 边界；Gemini 非生成 action 错派已修复，独立操作仍未实现",
+    "unverified": "其他供应商剩余原生能力、部署侧设施和真实上游组合"
+  },
+  "source_materials": [
+    "审计复核与遗漏清单.md",
+    "openai-transparent-relay-implementation-plan.revised.md",
+    "protocol-inventory.json",
+    "二次复核意见.md",
+    "第三轮复核意见.md",
+    "source-evidence (1).md",
+    "inventory-addendum (1).json",
+    "第四轮复核意见.md",
+    "定点修订建议.md",
+    "source-evidence (2).md"
+  ],
+  "verification_notes": "code_revision 保留原调查基线；implementation_revision 指本次未提交工作树。T01–T10 是历史缺陷/基线观察，T11 以后记录实现及后续修复回归。本轮五项缺陷修复后冻结代码，Go全量及10个相关完整包race通过，见T20；前端114通过/1跳过及构建属于前轮实施验证，本轮未改前端、未重跑。真实上游未调用；SQL测试使用SQLite，未实连MySQL/PostgreSQL。source checked_on 是协议核查日期，不表示本次重新核对所有官方网页。62家族/12子操作不是协议全集。",
+  "entry_count": 62,
+  "entries": [
+    {
+      "id": "O01",
+      "family": "Responses",
+      "operation": "stream_id parallel conversation lanes",
+      "transport": "WebSocket",
+      "implementation_status": "implemented_bounded_observation",
+      "authorization_scope": "ordinary_authenticated",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "W",
+      "evidence": "relay/responses_ws_observation.go; relay/responses_ws_steering.go",
+      "note": "原始 stream_id 并行交付；64 work/32 MiB请求原文预算。关联歧义放弃受影响观察并释放预扣与槽位，不挡原帧；固定过滤器可能保守少收费。 steering 仅有 SQL owner、缺少同连接父模型事实时，模型受限 token 明确拒绝；无限制 token 可转发但不猜父模型计价。 唯一可证明的普通 create 请求级拒绝只收尾该候选，idle error 不污染将来 lane；真正歧义仍保守，64项已收尾ID环防止迟到错配。",
+      "source_refs": [
+        "S01"
+      ],
+      "verification": {
+        "code_review": "reviewed_current_worktree",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [
+          "T16"
+        ],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19",
+      "target_behavior": "有界多 work 证据归属；不复制 lane FIFO/steering 状态校验，不因观察失配停止透传，不猜测关联或计费。 尚未到达 usage 不等于放弃；明确放弃观察时一次收尾，独立有效组件仍结算，释放剩余预扣与候选槽位；迟到事件仍交付，不重新收费或猜配新 work。",
+      "implementation_checked_on": "2026-09-20"
+    },
+    {
+      "id": "O02",
+      "family": "Responses",
+      "operation": "tool_search_output function schema replay",
+      "transport": "JSON/SSE/WebSocket",
+      "implementation_status": "fixed_semantic_extraction",
+      "authorization_scope": "ordinary_authenticated",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "A0",
+      "evidence": "common/responses/resource_manifest.go; common/responses/protocol_resources.go",
+      "note": "按协议语义位置提取真实资源，工具搜索回放函数 schema 不再因业务 file_id 属性误拒。 function_call_output.output 的协议内容数组提取 input_file/input_image 文件引用；普通字符串与业务对象保持不解释，不扩为键名递归扫描。",
+      "source_refs": [
+        "S02"
+      ],
+      "verification": {
+        "code_review": "reviewed_current_worktree",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [
+          "T11"
+        ],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19",
+      "implementation_checked_on": "2026-09-20"
+    },
+    {
+      "id": "O03",
+      "family": "Responses",
+      "operation": "create background=true",
+      "transport": "JSON/SSE",
+      "implementation_status": "implemented_http_task",
+      "authorization_scope": "ordinary_authenticated",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "C",
+      "evidence": "relay/responses_background.go; model/responses_background.go",
+      "note": "HTTP background 使用持久 Task，创建/查询/取消/恢复/轮询共用一结算 owner；WS background 不由此自动支持。 完整 Response JSON 由 ApplyResponsesUsage 唯一提取 token/工具证据，避免重复累计终态工具次数。 首次 Task 关闭明确提交后仅尽力投影消费日志/渠道用量/用户请求次数，不再扣余额；commit_unknown 回读或崩溃可漏投影，重复收尾不补写。",
+      "source_refs": [
+        "S06"
+      ],
+      "verification": {
+        "code_review": "reviewed_current_worktree",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [
+          "T15"
+        ],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19",
+      "implementation_checked_on": "2026-09-20"
+    },
+    {
+      "id": "O04",
+      "family": "Responses",
+      "operation": "POST /responses/{id}/cancel",
+      "transport": "JSON",
+      "implementation_status": "implemented",
+      "authorization_scope": "ordinary_authenticated",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "C",
+      "evidence": "relay/stored_responses.go; relay/responses_background_lifecycle.go",
+      "note": "取消原样发固定渠道，不因本地运行状态拒绝、不因取消成功推断免费。",
+      "source_refs": [
+        "S06"
+      ],
+      "verification": {
+        "code_review": "reviewed_current_worktree",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [
+          "T15"
+        ],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19",
+      "implementation_checked_on": "2026-09-20"
+    },
+    {
+      "id": "O05",
+      "family": "Responses",
+      "operation": "GET /responses/{id}?stream=true&starting_after=...",
+      "transport": "SSE",
+      "implementation_status": "implemented",
+      "authorization_scope": "ordinary_authenticated",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "C",
+      "evidence": "relay/stored_responses.go; relay/responses_background_lifecycle.go",
+      "note": "retrieve query 与原始 SSE 透传；上游判断是否可恢复，不重新 POST 或补造事件。",
+      "source_refs": [
+        "S06"
+      ],
+      "verification": {
+        "code_review": "reviewed_current_worktree",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [
+          "T15"
+        ],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19",
+      "implementation_checked_on": "2026-09-20"
+    },
+    {
+      "id": "O06",
+      "family": "Conversations",
+      "operation": "create/retrieve/update/delete; items CRUD/list; conversation reference",
+      "transport": "JSON",
+      "implementation_status": "implemented_account_list_restricted",
+      "authorization_scope": "ordinary_authenticated",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "B2",
+      "evidence": "relay/resource_http.go; relay/resource_request.go",
+      "note": "Conversations/items 与引用按父 owner 固定渠道；顶层共享账号 list 未开放。",
+      "source_refs": [
+        "S05"
+      ],
+      "verification": {
+        "code_review": "reviewed_current_worktree",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [
+          "T14"
+        ],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19",
+      "implementation_checked_on": "2026-09-20"
+    },
+    {
+      "id": "O07",
+      "family": "Stored Chat",
+      "operation": "store=true; list/retrieve/update/delete/messages",
+      "transport": "JSON",
+      "implementation_status": "implemented_account_list_restricted",
+      "authorization_scope": "ordinary_authenticated",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "D",
+      "evidence": "relay/stored_chat.go; providers/openai/stored_chat.go",
+      "note": "store=true 原始创建与 get/update/delete/messages 已接 owner；普通用户顶层 list 仍受限。",
+      "source_refs": [
+        "S05"
+      ],
+      "verification": {
+        "code_review": "reviewed_current_worktree",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [
+          "T17"
+        ],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19",
+      "implementation_checked_on": "2026-09-20"
+    },
+    {
+      "id": "O08",
+      "family": "Chat Search",
+      "operation": "web_search_options and recognized search models",
+      "transport": "JSON/SSE",
+      "implementation_status": "blocked",
+      "authorization_scope": "restricted",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "D-evidence",
+      "evidence": "providers/openai/capability.go:143-154",
+      "note": "Responses Web Search 不是缺失；Chat Search 单独受计费门控。",
+      "source_refs": [],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O09",
+      "family": "Images",
+      "operation": "JSON edits + actual model alias mapping",
+      "transport": "JSON",
+      "implementation_status": "fixed_json_model_patch",
+      "authorization_scope": "ordinary_authenticated",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "A1",
+      "evidence": "providers/openai/image_edits.go; relay/image-edits.go",
+      "note": "JSON 与 multipart 分别仅 patch model；无 patch 保留原文，已知 file_id 使用共享 owner。",
+      "source_refs": [
+        "S26"
+      ],
+      "verification": {
+        "code_review": "reviewed_current_worktree",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [
+          "T12",
+          "T14"
+        ],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19",
+      "implementation_checked_on": "2026-09-20"
+    },
+    {
+      "id": "O10",
+      "family": "Images",
+      "operation": "generations/edits stream=true",
+      "transport": "SSE",
+      "implementation_status": "implemented_supported_adapters",
+      "authorization_scope": "ordinary_authenticated",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "A2",
+      "evidence": "relay/image_response.go; providers/openai/image_response.go",
+      "note": "按真实 Content-Type 交付 JSON/SSE；具备图片流交付 capability 的 adapter 开放，不由 partial image 估算收费。",
+      "source_refs": [
+        "S24"
+      ],
+      "verification": {
+        "code_review": "reviewed_current_worktree",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [
+          "T12"
+        ],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19",
+      "implementation_checked_on": "2026-09-20"
+    },
+    {
+      "id": "O11",
+      "family": "Transcriptions",
+      "operation": "non-stream text/srt/vtt",
+      "transport": "text/subtitles",
+      "implementation_status": "blocked",
+      "authorization_scope": "restricted",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "D-evidence",
+      "evidence": "providers/openai/capability.go:196-203",
+      "note": "JSON/verbose_json/diarized_json/SSE 有路径；无证据格式不能伪造计费。",
+      "source_refs": [
+        "S25"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O12",
+      "family": "Saved Prompts",
+      "operation": "Responses prompt reference and prompt lifecycle",
+      "transport": "JSON",
+      "implementation_status": "blocked_create_and_missing_lifecycle",
+      "authorization_scope": "restricted",
+      "upstream_lifecycle": "deprecated_until_2026-11-30",
+      "proposed_phase": "do_not_build",
+      "evidence": "relay/capability_gate.go:645-646; router/relay-router.go",
+      "note": "2026-11-30 官方关闭；记录缺口但不新建生命周期。",
+      "source_refs": [
+        "S07"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O13",
+      "family": "Files",
+      "operation": "create/list/retrieve/delete/content for ordinary users",
+      "transport": "multipart/JSON/binary",
+      "implementation_status": "implemented_account_list_restricted",
+      "authorization_scope": "ordinary_authenticated",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "B1",
+      "evidence": "relay/resource_http.go; model/resource_owner.go",
+      "note": "普通用户 create/get/delete/content 与文件引用已接 owner、有界流式传输；顶层 list 仍仅管理员指定渠道 raw。",
+      "source_refs": [
+        "S05"
+      ],
+      "verification": {
+        "code_review": "reviewed_current_worktree",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [
+          "T14"
+        ],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19",
+      "target_behavior": "普通用户建立 owner 后透传已授权操作；顶层 list 仍须避免泄露共享账号其他资源，限制单列。已授权 DELETE 不因任务依赖或未来计费取证被代理拒绝。",
+      "implementation_checked_on": "2026-09-20"
+    },
+    {
+      "id": "O14",
+      "family": "Uploads",
+      "operation": "create/parts/complete/cancel",
+      "transport": "JSON/binary",
+      "implementation_status": "implemented",
+      "authorization_scope": "ordinary_authenticated",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "B2",
+      "evidence": "relay/resource_http.go; providers/openai/resource.go",
+      "note": "create/parts/complete/cancel 按 Upload owner 路由，完成时派生 File 先绑定后交付；不检查上游业务阶段。",
+      "source_refs": [
+        "S09"
+      ],
+      "verification": {
+        "code_review": "reviewed_current_worktree",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [
+          "T14"
+        ],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19",
+      "implementation_checked_on": "2026-09-20"
+    },
+    {
+      "id": "O15",
+      "family": "Batches",
+      "operation": "create/list/retrieve/cancel; result/error files; settlement",
+      "transport": "JSON/JSONL/binary",
+      "implementation_status": "implemented_with_resource_and_delivery_limits",
+      "authorization_scope": "ordinary_authenticated",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "D-batch",
+      "evidence": "relay/batch.go; relay/batch_delivery.go; relay/batch_poll.go; model/openai_batch.go; model/openai_batch_response.go; providers/openai/batch.go",
+      "note": "首批七类 endpoint：Responses、Chat、Completions、Embeddings、Moderations、Images generations/edits；不含 Videos。create/get/cancel 共一个 Task，顶层 list 仍仅管理员。结果 File 完整通过已知派生 owner 屏障并读至真实 EOF 才记 BatchResultObserved，此后重读含 Range/压缩不依赖已清理子 owner/Task，不延长或重认领；首次未完整观察的派生资源 Range/压缩受限。根 owner 原子保留最多两个已观察 output/error File ID，子 File 清理不拦根 GET，陌生新 ID 仍需真实证明。 首次 Task 关闭明确提交后仅尽力投影消费日志/渠道用量/用户请求次数，不再扣余额；commit_unknown 回读或崩溃可漏投影，重复收尾不补写。 已知结果File的派生观察未完成时，原accepted Task在48h内以15/30/60秒只读重试，保留槽位及有界TerminalStatus/PendingEvidence跨重启恢复；仅缺usage或终态无结果File不延后，到期按已有证据一次结算，不重放Batch。",
+      "source_refs": [
+        "S05",
+        "S30"
+      ],
+      "verification": {
+        "code_review": "reviewed_current_worktree",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [
+          "T19"
+        ],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19",
+      "target_behavior": "Batch 内部资源引用/派生产出需独立核查，结果 File owner 不替代内部资源 owner；观察已知语义位置，不重写 JSONL 或建立业务组合白名单。依赖只服务事实追踪，不锁定客户端删除。整批一个结算 owner，证据不足按组件不收费。",
+      "implementation_checked_on": "2026-09-20"
+    },
+    {
+      "id": "O16",
+      "family": "Fine-tuning",
+      "operation": "jobs/events/checkpoints/permissions/pause/resume/cancel/graders",
+      "transport": "JSON",
+      "implementation_status": "raw_relay_only",
+      "authorization_scope": "administrator_pinned_only",
+      "upstream_lifecycle": "restricted_availability_see_deprecations",
+      "proposed_phase": "admin_or_compatibility",
+      "evidence": "router/relay-router.go:83",
+      "note": "/fine_tuning/alpha/graders/* 在已有 wildcard 下，不能误判无路由。官方训练开放面正在收缩。",
+      "source_refs": [
+        "S05",
+        "S07"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O17",
+      "family": "Vector Stores",
+      "operation": "CRUD/list/search; files associations/content/update; file batches",
+      "transport": "JSON",
+      "implementation_status": "raw_relay_only",
+      "authorization_scope": "administrator_pinned_only",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "D-resource",
+      "evidence": "router/relay-router.go:103-104",
+      "note": "普通用户 owner、关联权限、持续成本未闭环。",
+      "source_refs": [
+        "S11"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O18",
+      "family": "Containers",
+      "operation": "create/list/retrieve/delete; container files/content",
+      "transport": "JSON/multipart/binary",
+      "implementation_status": "no_route",
+      "authorization_scope": "not_exposed",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "D-resource",
+      "evidence": "router/relay-router.go:27-106",
+      "note": "托管自动创建与派生文件也需要归属；不是加一个 CRUD 路由。",
+      "source_refs": [
+        "S10"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O19",
+      "family": "Skills",
+      "operation": "CRUD/list/content; versions/content",
+      "transport": "JSON/multipart/binary",
+      "implementation_status": "no_route",
+      "authorization_scope": "not_exposed",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "D-resource",
+      "evidence": "router/relay-router.go:27-106",
+      "note": "版本按父 Skill 授权，版本路径 key 不应当成全局 ID。",
+      "source_refs": [
+        "S12"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O20",
+      "family": "Account resource references",
+      "operation": "file_id/vector_store_ids/container/skill references; stored Response owner reads/continuation/injection",
+      "transport": "JSON/multipart/WebSocket",
+      "implementation_status": "partial_supported_resource_families",
+      "authorization_scope": "ordinary_authenticated",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "A0/B/D",
+      "evidence": "relay/resource_request.go; relay/relay_util/resource_reference_policy.go; relay/responses_ownership.go; relay/responses_ws_inject.go",
+      "note": "file/conversation/chat_audio 可按 owner 引用；Stored Response 墓碑不阻断授权；vector-store/container/skill 等未实施家族仍拒绝。",
+      "source_refs": [],
+      "verification": {
+        "code_review": "reviewed_current_worktree",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [
+          "T11",
+          "T14",
+          "T15",
+          "T16",
+          "T18"
+        ],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19",
+      "target_behavior": "保留用户/渠道与本地授权留存校验；不以墓碑投影替代上游可用状态。授权事实缺失不能放行；不能机械删除 model 写入约束或允许旧 ID 重新认领/覆盖归属。",
+      "reviewed_on": "2026-09-20",
+      "implementation_checked_on": "2026-09-20"
+    },
+    {
+      "id": "O21",
+      "family": "Hosted tools",
+      "operation": "File Search; Code Interpreter; hosted shell/container; uploaded skills",
+      "transport": "JSON/SSE",
+      "implementation_status": "blocked",
+      "authorization_scope": "restricted",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "D-resource",
+      "evidence": "relay/capability_gate.go:685-739",
+      "note": "客户端执行工具、本地 shell、普通 function/MCP 不能一并标缺失。",
+      "source_refs": [
+        "S10",
+        "S11"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O22",
+      "family": "Realtime",
+      "operation": "GET /realtime?call_id=... sideband attach",
+      "transport": "WebSocket",
+      "implementation_status": "mode_not_implemented",
+      "authorization_scope": "restricted",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "D-realtime",
+      "evidence": "relay/realtime.go:183-187; providers/openai/realtime_session.go:222-240",
+      "note": "现有入口要求 model，URL 构造不传播客户端 call_id；不能用新 session 代替 attach。",
+      "source_refs": [
+        "S03"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O23",
+      "family": "Realtime transcription",
+      "operation": "standalone GA transcription session handshake",
+      "transport": "WebSocket",
+      "implementation_status": "partially_implemented_unverified",
+      "authorization_scope": "ordinary_authenticated",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "D-realtime",
+      "evidence": "relay/realtime.go:183-187; providers/openai/realtime_session.go:222-240",
+      "note": "已有 GA 设置和转录 usage；仍需完整握手/会话集成测试，不标整套完全未实现。",
+      "source_refs": [
+        "S21"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O24",
+      "family": "Realtime",
+      "operation": "client_secrets",
+      "transport": "JSON",
+      "implementation_status": "no_route",
+      "authorization_scope": "not_exposed",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "D-realtime",
+      "evidence": "router/relay-router.go:27-106",
+      "note": "临时凭据直连不能绕过本地准入、额度与撤销。",
+      "source_refs": [
+        "S03"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O25",
+      "family": "Realtime",
+      "operation": "calls create/accept/reject/hangup/refer",
+      "transport": "SDP/JSON/WebRTC/SIP",
+      "implementation_status": "no_route",
+      "authorization_scope": "not_exposed",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "D-realtime",
+      "evidence": "router/relay-router.go:27-106",
+      "note": "控制面和 RTP 媒体边界单列；Location 中 call_id 也有交付屏障。",
+      "source_refs": [
+        "S03"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O26",
+      "family": "Realtime Translation",
+      "operation": "/realtime/translations WebSocket",
+      "transport": "WebSocket",
+      "implementation_status": "no_route",
+      "authorization_scope": "not_exposed",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "D-realtime",
+      "evidence": "router/relay-router.go:27-106",
+      "note": "不能套用既有 Realtime response.done 状态机。",
+      "source_refs": [
+        "S22"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O27",
+      "family": "Realtime Translation",
+      "operation": "translation client_secrets/calls",
+      "transport": "JSON/SDP/WebRTC",
+      "implementation_status": "no_route",
+      "authorization_scope": "not_exposed",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "D-realtime",
+      "evidence": "router/relay-router.go:27-106",
+      "note": "独立 session 和结算证据契约。",
+      "source_refs": [
+        "S22"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O28",
+      "family": "GPT-Live",
+      "operation": "sessions; primary/sideband/fork WS; controls; recordings",
+      "transport": "JSON/WebSocket/binary",
+      "implementation_status": "no_route",
+      "authorization_scope": "not_exposed",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "D-realtime",
+      "evidence": "router/relay-router.go:27-106",
+      "note": "已有 /realtime 不等于 /live 全家族。",
+      "source_refs": [
+        "S05",
+        "S03"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O29",
+      "family": "Videos",
+      "operation": "create/get/list/delete/content/edit/extension/remix/characters",
+      "transport": "JSON/multipart/binary",
+      "implementation_status": "no_route",
+      "authorization_scope": "not_exposed",
+      "upstream_lifecycle": "deprecated_until_2026-09-24",
+      "proposed_phase": "do_not_build_for_official",
+      "evidence": "router/relay-router.go:27-106; docs/dev/openai-transparent-relay-implementation-plan.md section 7.2",
+      "note": "官方 Videos API 2026-09-24 关闭；原排期必须修订，兼容厂商另议。",
+      "source_refs": [
+        "S08",
+        "S07"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O30",
+      "family": "Custom voices",
+      "operation": "voice create; voice_consents create/list/get/update/delete; GET /audio/consent_phrases",
+      "transport": "multipart/JSON",
+      "implementation_status": "no_route",
+      "authorization_scope": "not_exposed",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "D-voice",
+      "evidence": "router/relay-router.go:27-106",
+      "note": "声音创建、consent 管理和 consent_phrases 均无路由；消费入口分别记录 O31/O43/O44/O45，不要求 A0 建设管理专项。",
+      "source_refs": [
+        "S04",
+        "S05",
+        "S27"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O31",
+      "family": "Custom voice references",
+      "operation": "audio/speech voice.id authorization/channel affinity",
+      "transport": "JSON",
+      "implementation_status": "owner_boundary_enforced_custom_voice_restricted",
+      "authorization_scope": "restricted",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "A0/D-voice",
+      "evidence": "relay/speech.go; relay/relay_util/resource_reference_policy.go",
+      "note": "已知 voice.id 在共享 policy 中按未实现声音 owner 明确拒绝；内置字符串透传。声音管理专项仍未实现。",
+      "source_refs": [
+        "S04"
+      ],
+      "verification": {
+        "code_review": "reviewed_current_worktree",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [
+          "T11"
+        ],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19",
+      "target_behavior": "只校验共享账号声音归属与渠道，不复制上游声线切换或可用状态规则。",
+      "implementation_checked_on": "2026-09-20"
+    },
+    {
+      "id": "O32",
+      "family": "Agents API",
+      "operation": "sessions/events/artifacts/environments/templates/vault-linked resources",
+      "transport": "JSON/SSE/binary",
+      "implementation_status": "no_route",
+      "authorization_scope": "not_exposed",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "D-specialist",
+      "evidence": "router/relay-router.go:27-106",
+      "note": "Responses multi_agent 不是 Agents API；官方 Agent Builder 弃用不等于 Agents API 关闭。",
+      "source_refs": [
+        "S05"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O33",
+      "family": "ChatKit",
+      "operation": "sessions/threads/items",
+      "transport": "JSON/SSE",
+      "implementation_status": "no_route",
+      "authorization_scope": "not_exposed",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "D-specialist",
+      "evidence": "router/relay-router.go:27-106",
+      "note": "ChatKit 仍应独立记缺口，不与 Agent Builder 弃用混算。",
+      "source_refs": [
+        "S05",
+        "S07"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O34",
+      "family": "Webhooks management",
+      "operation": "webhook_endpoints/event_types/rotate/test",
+      "transport": "JSON",
+      "implementation_status": "no_route",
+      "authorization_scope": "not_exposed",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "admin_specialist",
+      "evidence": "router/relay-router.go:27-106",
+      "note": "上游项目管理权限不属于普通共享 token。",
+      "source_refs": [
+        "S05"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O35",
+      "family": "Webhook delivery",
+      "operation": "receive/verify/deduplicate/correlate provider events",
+      "transport": "HTTP callback",
+      "implementation_status": "not_implemented",
+      "authorization_scope": "not_exposed",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "optional_after_C",
+      "evidence": "no OpenAI webhook signature/receiver code found; router/relay-router.go",
+      "note": "与管理端点分开；C 首期可以 polling-only，但不得声称已支持 Webhook 交付。",
+      "source_refs": [
+        "S13"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O36",
+      "family": "Organization/Project administration",
+      "operation": "API keys/users/service accounts/roles/groups/limits/certificates/retention/usage/costs",
+      "transport": "JSON",
+      "implementation_status": "no_route",
+      "authorization_scope": "not_exposed",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "admin_specialist",
+      "evidence": "router/relay-router.go:27-106",
+      "note": "本地用户与账单不是上游管理 API；按方法建子清单，不开放公共通配。",
+      "source_refs": [
+        "S05"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O37",
+      "family": "Secure MCP Tunnel",
+      "operation": "/v1/tunnel/* polling and response posting",
+      "transport": "HTTPS long-poll/SSE/JSON-RPC",
+      "implementation_status": "no_route",
+      "authorization_scope": "not_exposed",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "out_of_core_scope",
+      "evidence": "router/relay-router.go; no /v1/tunnel code found",
+      "note": "缺独立隧道运行/控制面；普通远端 MCP tool 能透传不等于承接 tunnel-client。",
+      "source_refs": [
+        "S14"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O38",
+      "family": "Workload identity / mTLS",
+      "operation": "OpenAI federation token exchange and client-certificate transport",
+      "transport": "OAuth/TLS",
+      "implementation_status": "no_adapter_identified",
+      "authorization_scope": "not_applicable",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "channel_auth_specialist",
+      "evidence": "providers/codex/oauth_config.go is Codex OAuth, not WIF; no client certificate transport found",
+      "note": "属于渠道认证/部署而非 /v1 普通用户生成路由；不可误报项目完全没有 OAuth。 未核查部署侧外置 TLS/身份设施。",
+      "source_refs": [
+        "S15",
+        "S23"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O39",
+      "family": "Safety/provenance/vault",
+      "operation": "safety cases; content_provenance_checks; other dedicated resources",
+      "transport": "JSON",
+      "implementation_status": "no_route",
+      "authorization_scope": "not_exposed",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "admin_or_specialist",
+      "evidence": "router/relay-router.go:90-92",
+      "note": "safety alerts GET 已有管理员 raw，不应误列为完全无入口。",
+      "source_refs": [
+        "S05"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O40",
+      "family": "Evals",
+      "operation": "evals/runs/output_items",
+      "transport": "JSON",
+      "implementation_status": "no_route",
+      "authorization_scope": "not_exposed",
+      "upstream_lifecycle": "deprecated_until_2026-11-30",
+      "proposed_phase": "do_not_build",
+      "evidence": "router/relay-router.go:27-106",
+      "note": "2026-10-31 转只读，2026-11-30 关闭。",
+      "source_refs": [
+        "S07"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O41",
+      "family": "Assistants/Threads/Runs",
+      "operation": "legacy lifecycle",
+      "transport": "JSON/SSE",
+      "implementation_status": "raw_relay_only",
+      "authorization_scope": "administrator_pinned_only",
+      "upstream_lifecycle": "retired_2026-08-26",
+      "proposed_phase": "legacy_compatibility_only",
+      "evidence": "router/relay-router.go:84-87",
+      "note": "官方已于 2026-08-26 关闭；兼容上游另有事实边界。",
+      "source_refs": [
+        "S07"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O42",
+      "family": "Realtime beta HTTP",
+      "operation": "legacy sessions/transcription_sessions",
+      "transport": "JSON",
+      "implementation_status": "no_route",
+      "authorization_scope": "not_exposed",
+      "upstream_lifecycle": "retired_2026-05-12",
+      "proposed_phase": "do_not_build_for_official",
+      "evidence": "router/relay-router.go:27-106",
+      "note": "Realtime beta 2026-05-12 已关闭；旧入口不是现行官方补齐目标。",
+      "source_refs": [
+        "S07"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "O43",
+      "family": "Realtime custom voice references",
+      "operation": "session.update.session.audio.output.voice.id",
+      "transport": "WebSocket",
+      "implementation_status": "owner_boundary_enforced_custom_voice_restricted",
+      "authorization_scope": "restricted",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "A0/D-voice",
+      "evidence": "providers/openai/realtime_input_work.go; providers/openai/media_resource_policy.go",
+      "note": "session.update 发送前检查最终声音引用；未有声音 owner 不放行已知 voice.id，不检查能否切换声线。",
+      "target_behavior": "发送最终有效设置帧前使用共享资源 policy 检查声音 owner/channel，不等自动 work；不校验声线切换状态。",
+      "source_refs": [
+        "S27",
+        "S28"
+      ],
+      "verification": {
+        "code_review": "reviewed_current_worktree",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [
+          "T11"
+        ],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19",
+      "recorded_on": "2026-09-20",
+      "implementation_checked_on": "2026-09-20"
+    },
+    {
+      "id": "O44",
+      "family": "Realtime custom voice references",
+      "operation": "response.create.response.audio.output.voice.id",
+      "transport": "WebSocket",
+      "implementation_status": "owner_boundary_enforced_custom_voice_restricted",
+      "authorization_scope": "restricted",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "A0/D-voice",
+      "evidence": "providers/openai/realtime_input_work.go; providers/openai/media_resource_policy.go",
+      "note": "response.create 发送及工作前检查已知声音引用，同样覆盖首次 create 覆盖 session 的情况。",
+      "target_behavior": "在 work 准入/发送最终帧前检查共享 owner/channel；覆盖内置 session voice + 首次 create 自定义对象，不复制上游声音可变状态。",
+      "source_refs": [
+        "S28"
+      ],
+      "verification": {
+        "code_review": "reviewed_current_worktree",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [
+          "T11"
+        ],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19",
+      "recorded_on": "2026-09-20",
+      "implementation_checked_on": "2026-09-20"
+    },
+    {
+      "id": "O45",
+      "family": "Chat custom voice union",
+      "operation": "POST /chat/completions audio.voice string or custom {id}",
+      "transport": "JSON",
+      "implementation_status": "union_supported_custom_voice_restricted",
+      "authorization_scope": "ordinary_authenticated_with_resource_gate",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "A0/D-voice",
+      "evidence": "types/chat.go; providers/openai/media_resource_policy.go",
+      "note": "Chat voice 联合值不再由字符串 DTO 误拒；真实 custom voice.id 仍受声音 owner 未实现限制。",
+      "target_behavior": "保留联合类型与未知字段，同批补自定义声音 owner/channel；跨协议无法表示则明确失败。",
+      "source_refs": [
+        "S27",
+        "S29"
+      ],
+      "verification": {
+        "code_review": "reviewed_current_worktree",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [
+          "T11"
+        ],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19",
+      "recorded_on": "2026-09-20",
+      "implementation_checked_on": "2026-09-20"
+    },
+    {
+      "id": "O46",
+      "family": "Chat historical audio references",
+      "operation": "messages[].audio.id; output audio.id/expires_at",
+      "transport": "JSON/SSE",
+      "implementation_status": "implemented_with_local_retention",
+      "authorization_scope": "ordinary_authenticated",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "A0/B-resource",
+      "evidence": "relay/chat_audio_owner.go; providers/openai/chat_audio_owner.go; relay/relay_util/resource_reference_policy.go",
+      "note": "真实输出 audio ID 在 JSON/SSE 交付前提交 owner；已授权历史引用固定渠道。expires_at 仅观察，不决定原帧与引用可用性。",
+      "target_behavior": "A0 处理输入授权边界；完整产出在最小 owner 提交后立即交付，不等 expires_at，不以其缺失/过期替代上游可用性判断；本地容量/清理期独立。",
+      "source_refs": [
+        "S29"
+      ],
+      "verification": {
+        "code_review": "reviewed_current_worktree",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [
+          "T18",
+          "T14"
+        ],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19",
+      "recorded_on": "2026-09-20",
+      "implementation_checked_on": "2026-09-20"
+    },
+    {
+      "id": "O47",
+      "family": "Realtime concurrent out-of-band Responses",
+      "operation": "overlapping response.create with response.conversation=none",
+      "transport": "WebSocket",
+      "implementation_status": "blocked_by_single_inflight_turn",
+      "authorization_scope": "ordinary_authenticated_existing_entry",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "D-realtime",
+      "evidence": "providers/openai/realtime_session.go:1361-1381; providers/openai/realtime_session_test.go:1211",
+      "note": "s.turn != nil 对所有并发 create 返回 session_busy；单个串行 OOB 完整兼容性未联调，独立于 Responses lanes。",
+      "target_behavior": "补有界多 response 证据归属，默认会话是否可重叠交给上游；不将单 turn busy 限制作为目标规则，不移植 Responses lane 上限。",
+      "source_refs": [
+        "S28"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [
+          "T09"
+        ],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19",
+      "recorded_on": "2026-09-20"
+    },
+    {
+      "id": "C01",
+      "family": "Custom raw relay",
+      "operation": "admin resource families",
+      "transport": "HTTP/raw",
+      "implementation_status": "implemented_admin_pinned",
+      "authorization_scope": "administrator_pinned",
+      "upstream_lifecycle": "not_applicable_proxy_behavior",
+      "proposed_phase": "A3",
+      "evidence": "common/providerendpoint/endpoints.go; providers/openai/base.go",
+      "note": "Custom 可显式启用已登记资源 endpoint；缺失默认关闭，管理员 raw 不成为普通用户权限 fallback。",
+      "source_refs": [],
+      "verification": {
+        "code_review": "reviewed_current_worktree",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [
+          "T13"
+        ],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19",
+      "implementation_checked_on": "2026-09-20"
+    },
+    {
+      "id": "C02",
+      "family": "Compatible SSE",
+      "operation": "full event framing fidelity",
+      "transport": "SSE",
+      "implementation_status": "implemented_native_sse_framing",
+      "authorization_scope": "ordinary_authenticated",
+      "upstream_lifecycle": "not_applicable_proxy_behavior",
+      "proposed_phase": "A2",
+      "evidence": "providers/openai/chat.go; providers/openai/completion.go; providers/openai/native_sse_test.go",
+      "note": "OpenAI 方言 Chat/Completion SSE 保留完整事件 framing、未知事件和 done 后原帧；原有未请求 usage chunk 的代理过滤仍明确保留，跨协议 adapter 不因此视为 exact-wire。",
+      "source_refs": [],
+      "verification": {
+        "code_review": "reviewed_current_worktree",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [
+          "T12"
+        ],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19",
+      "implementation_checked_on": "2026-09-20"
+    },
+    {
+      "id": "C03",
+      "family": "Responses native WS",
+      "operation": "body-changing model mapping/custom parameters",
+      "transport": "WebSocket",
+      "implementation_status": "blocked",
+      "authorization_scope": "restricted",
+      "upstream_lifecycle": "not_applicable_proxy_behavior",
+      "proposed_phase": "retain_boundary",
+      "evidence": "relay/capability_gate.go:949-972",
+      "note": "不通过改成 Chat 或无声改 frame 实现。",
+      "source_refs": [],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "C04",
+      "family": "Regional endpoints",
+      "operation": "OpenAI data-residency domains",
+      "transport": "HTTP/WebSocket",
+      "implementation_status": "blocked",
+      "authorization_scope": "not_applicable",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "deployment_specialist",
+      "evidence": "model/channel_validation.go:169; model/channel_endpoints.go",
+      "note": "属于区域处理/部署/计价支持，不是新 API 家族。",
+      "source_refs": [],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "C05",
+      "family": "Audio SSE delivery",
+      "operation": "speech/transcription SSE termination and EOF delivery",
+      "transport": "SSE",
+      "implementation_status": "fixed_transparent_delivery",
+      "authorization_scope": "ordinary_authenticated",
+      "upstream_lifecycle": "not_applicable_proxy_behavior",
+      "proposed_phase": "A2",
+      "evidence": "relay/audio_sse.go; relay/audio_sse_test.go",
+      "note": "已知 done/error 不截流，干净 EOF 不补业务 error；真实传输故障按异常结束处理，不被 done 掩盖。",
+      "target_behavior": "业务 done/error 只观察，不默认停读；以真实 EOF、取消、真实 I/O 错误和必要安全/容量边界结束。未知事件照常交付，不因缺已知终态补造 error 或成功终态。",
+      "source_refs": [],
+      "verification": {
+        "code_review": "reviewed_current_worktree",
+        "upstream_contract": "not_applicable_local_delivery_behavior",
+        "test_refs": [
+          "T12"
+        ],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-20",
+      "implementation_checked_on": "2026-09-20"
+    },
+    {
+      "id": "N01",
+      "family": "Claude native",
+      "operation": "POST /messages/count_tokens",
+      "transport": "JSON",
+      "implementation_status": "no_route",
+      "authorization_scope": "not_exposed",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "native_counting",
+      "evidence": "router/relay-router.go:158-170",
+      "note": "原报告范围之外；不能用 OpenAI input_tokens 路由代替。",
+      "source_refs": [
+        "S16"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "N02",
+      "family": "Claude native",
+      "operation": "GET /models/{id}",
+      "transport": "JSON",
+      "implementation_status": "no_route",
+      "authorization_scope": "not_exposed",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "native_model_view",
+      "evidence": "router/relay-router.go:158-170",
+      "note": "已有本地模型 list；retrieve 不存在。",
+      "source_refs": [
+        "S16"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "N03",
+      "family": "Claude native",
+      "operation": "Message Batches; Files; Skills/versions",
+      "transport": "JSON/SSE/multipart/binary",
+      "implementation_status": "no_route",
+      "authorization_scope": "not_exposed",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "native_specialist",
+      "evidence": "router/relay-router.go:158-170",
+      "note": "不能因为支持 Messages 就宣称支持完整 Claude SDK。",
+      "source_refs": [
+        "S16"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "N04",
+      "family": "Claude native",
+      "operation": "Managed Agents/resources; native admin/tunnels/federation",
+      "transport": "JSON/SSE/auth",
+      "implementation_status": "no_route",
+      "authorization_scope": "not_exposed",
+      "upstream_lifecycle": "requires_operation_level_review",
+      "proposed_phase": "scope_separately",
+      "evidence": "router/relay-router.go:158-170",
+      "note": "扩展范围清单，不建议与 OpenAI 首批资源工程捆绑。 仅确认本地入口未登记；细分协议与生命周期尚需分别核实。",
+      "source_refs": [
+        "S16"
+      ],
+      "verification": {
+        "code_review": "routes_only",
+        "upstream_contract": "needs_operation_level_review",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "N05",
+      "family": "Gemini native",
+      "operation": "models:countTokens",
+      "transport": "JSON",
+      "implementation_status": "wrong_dispatch_fixed_operation_not_implemented",
+      "authorization_scope": "restricted",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "A0",
+      "evidence": "relay/gemini.go; relay/gemini_action_test.go",
+      "note": "countTokens 在发送前明确拒绝，不再误入生成；真正计数协议仍未实现。",
+      "source_refs": [
+        "S18"
+      ],
+      "verification": {
+        "code_review": "reviewed_current_worktree",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [
+          "T13"
+        ],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19",
+      "implementation_checked_on": "2026-09-20"
+    },
+    {
+      "id": "N06",
+      "family": "Gemini native",
+      "operation": "models:embedContent/:batchGenerateContent and other non-generation actions",
+      "transport": "JSON",
+      "implementation_status": "wrong_dispatch_fixed_operations_not_implemented",
+      "authorization_scope": "restricted",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "A0_then_native_specialist",
+      "evidence": "relay/gemini.go; relay/gemini_action_test.go",
+      "note": "仅两种已实现生成 action 进入生成 relay；embedding/batch 等独立 action 仍未实现，不兜底生成。",
+      "source_refs": [
+        "S17"
+      ],
+      "verification": {
+        "code_review": "reviewed_current_worktree",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [
+          "T13"
+        ],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19",
+      "implementation_checked_on": "2026-09-20"
+    },
+    {
+      "id": "N07",
+      "family": "Gemini native",
+      "operation": "Live; Interactions; Files; GET model detail",
+      "transport": "WebSocket/JSON/multipart",
+      "implementation_status": "no_route",
+      "authorization_scope": "not_exposed",
+      "upstream_lifecycle": "active",
+      "proposed_phase": "native_specialist",
+      "evidence": "router/relay-router.go:173-184",
+      "note": "缓存/文件检索等其余平台能力还需逐方法冻结官方基线，不假称已穷尽全部 Google API。",
+      "source_refs": [
+        "S17"
+      ],
+      "verification": {
+        "code_review": "reviewed",
+        "upstream_contract": "see_source_refs",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "U01",
+      "family": "Recraft native",
+      "operation": "remaining native operations beyond six registered endpoints",
+      "transport": "varies",
+      "implementation_status": "unknown",
+      "authorization_scope": "unknown",
+      "upstream_lifecycle": "unknown",
+      "proposed_phase": "verify_scope",
+      "evidence": "router/relay-router.go:187-208",
+      "note": "已盘点路由；未拿冻结的对应版本协议逐字段/逐方法对照，不宣称完整。 未核验上游生命周期，不默认记 active。",
+      "source_refs": [],
+      "verification": {
+        "code_review": "routes_only",
+        "upstream_contract": "unverified",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "U02",
+      "family": "Kling native",
+      "operation": "other task actions and lifecycle",
+      "transport": "varies",
+      "implementation_status": "unknown",
+      "authorization_scope": "unknown",
+      "upstream_lifecycle": "unknown",
+      "proposed_phase": "verify_scope",
+      "evidence": "router/relay-router.go:211-222; relay/task/kling",
+      "note": "POST 动态 action 不等于任意 Kling 操作支持；需按实际 adapter/供应商版本建矩阵。 未核验上游生命周期，不默认记 active。",
+      "source_refs": [],
+      "verification": {
+        "code_review": "routes_only",
+        "upstream_contract": "unverified",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    },
+    {
+      "id": "U03",
+      "family": "Suno/Midjourney third-party contracts",
+      "operation": "remaining actions and lifecycle",
+      "transport": "varies",
+      "implementation_status": "unknown",
+      "authorization_scope": "unknown",
+      "upstream_lifecycle": "unknown",
+      "proposed_phase": "verify_scope",
+      "evidence": "router/relay-router.go:108-155",
+      "note": "第三方接入契约未冻结，不能以一个笼统官方 API 目录做全量覆盖宣告。 未核验上游生命周期，不默认记 active。",
+      "source_refs": [],
+      "verification": {
+        "code_review": "routes_only",
+        "upstream_contract": "unverified",
+        "test_refs": [],
+        "real_upstream": "not_run"
+      },
+      "checked_on": "2026-09-19"
+    }
+  ],
+  "tests": {
+    "T01": {
+      "name": "TestResponsesWSRejectsStreamIDBeforeChannelSelection",
+      "path": "relay/responses_ws_test.go",
+      "kind": "existing",
+      "result": "passed",
+      "meaning": "验证原审计基线 stream_id 拒绝",
+      "scope": "historical_audit_baseline"
+    },
+    "T02": {
+      "name": "TestAuditResourceScannerObservations",
+      "kind": "temporary_overlay",
+      "subcases": 4,
+      "result": "passed_observation",
+      "meaning": "确认工具搜索 schema 误拒、真实引用拒绝及内联文件通过；未提交为修复测试",
+      "scope": "historical_audit_baseline"
+    },
+    "T03": {
+      "name": "TestValidateNoAccountScopedResourcesChecksEffectiveManifest",
+      "path": "common/responses/resource_manifest_test.go",
+      "kind": "existing",
+      "result": "passed",
+      "meaning": "验证已有 manifest 边界",
+      "scope": "historical_audit_baseline"
+    },
+    "T04": {
+      "name": "TestOpenAISpeechPreservesCurrentFieldsAndStructuredVoice",
+      "path": "providers/openai/audio_protocol_test.go",
+      "kind": "existing",
+      "result": "passed",
+      "meaning": "验证结构化 voice 透传；不验证资源授权",
+      "scope": "historical_audit_baseline"
+    },
+    "T05": {
+      "name": "TestAuditGeminiCountTokensDispatchObservation",
+      "kind": "temporary_overlay",
+      "result": "passed_observation",
+      "meaning": "确认 countTokens 被接受为非流式生成投影；未调用上游",
+      "scope": "historical_audit_baseline"
+    },
+    "T06": {
+      "name": "TestReview2ChatVoiceProjectionObservation",
+      "kind": "temporary_overlay",
+      "result": "passed_observation",
+      "meaning": "确认内置字符串通过、Chat voice 对象解码失败；不是修复测试",
+      "run_record": "上一轮工程复核已执行；本次未重跑",
+      "artifact": "/tmp/onehub-second-protocol-review-t9xmki3o/review2_protocol_observation_test.go",
+      "scope": "historical_audit_baseline"
+    },
+    "T07": {
+      "name": "TestReview2HistoryAudioManifestObservation",
+      "kind": "temporary_overlay",
+      "result": "passed_observation",
+      "meaning": "确认历史 audio.id 未提取、真实 file_id 对照能提取",
+      "run_record": "上一轮工程复核已执行；本次未重跑",
+      "artifact": "/tmp/onehub-second-protocol-review-t9xmki3o/review2_protocol_observation_test.go",
+      "scope": "historical_audit_baseline"
+    },
+    "T08": {
+      "name": "TestReview2RealtimeCustomVoicePreparationObservation",
+      "kind": "temporary_overlay",
+      "result": "passed_observation",
+      "meaning": "确认 session.update 声音对象经设置准备与规范化后保留；不是上游越权测试",
+      "run_record": "上一轮工程复核已执行；本次未重跑",
+      "artifact": "/tmp/onehub-second-protocol-review-t9xmki3o/review2_protocol_observation_test.go",
+      "scope": "historical_audit_baseline"
+    },
+    "T09": {
+      "name": "TestOpenAIRealtimeSessionRejectsConcurrentResponseCreate",
+      "path": "providers/openai/realtime_session_test.go",
+      "kind": "existing",
+      "result": "passed",
+      "meaning": "前一轮分析已执行，验证一般 overlapping create 被拒；不是 OOB 专项真实上游联调，当次未重跑",
+      "scope": "historical_audit_baseline"
+    },
+    "T10": {
+      "name": "Audio SSE delivery boundary review",
+      "kind": "existing_and_temporary_overlay",
+      "result": "passed_observation",
+      "commands": [
+        "go test ./relay -run '^TestAudioSSE' -count=1",
+        "go test ./common/requester -run '^TestRequestStreamRequiredTerminal' -count=1",
+        "go test -overlay /tmp/onehub-audio-sse-audit-cnoj0qhd/overlay.json ./relay -run '^TestAuditAudioSSECurrentDeliveryBoundaries$' -count=1 -v"
+      ],
+      "subcases": [
+        "done + extension",
+        "unknown + EOF",
+        "unknown + UnexpectedEOF",
+        "done + UnexpectedEOF"
+      ],
+      "meaning": "上一轮已实际运行，确认原审计基线终态提前停读及缺已知终态 EOF 补造 error；合成夹具不是修复测试或线上上游轨迹，当次文档同步未重跑。",
+      "scope": "historical_audit_baseline"
+    },
+    "T11": {
+      "name": "协议语义引用与媒体授权",
+      "path": "common/responses/resource_semantics_test.go; relay/media_resource_policy_test.go; providers/openai/media_resource_policy_test.go; types/chat_audio_test.go; common/responses/function_output_resources_test.go; relay/function_output_resources_test.go; providers/openai/function_output_resources_test.go",
+      "kind": "repository_regression",
+      "result": "passed_local",
+      "meaning": "工具搜索 schema 与业务同名键保留，真实协议引用授权，Chat 联合 voice 和 Realtime 两消费位置。 本轮 function_call_output 协议数组引用、业务值对照及最终 overlay 授权回归和定向 race 通过。",
+      "scope": "implementation_2026-09-20",
+      "real_upstream": "not_run"
+    },
+    "T12": {
+      "name": "媒体与原生 SSE",
+      "path": "relay/audio_sse_test.go; relay/image_response_test.go; providers/openai/image_response_test.go; providers/openai/native_sse_test.go",
+      "kind": "repository_regression",
+      "result": "passed_local",
+      "meaning": "done/error 后继续交付、干净 EOF 不补错、真实读取错误、JSON edits model patch、图片 usage 与兼容完整 framing。",
+      "scope": "implementation_2026-09-20",
+      "real_upstream": "not_run"
+    },
+    "T13": {
+      "name": "Custom raw 与 Gemini action",
+      "path": "relay/raw_custom_test.go; providers/openai/raw_custom_test.go; relay/gemini_action_test.go",
+      "kind": "repository_regression",
+      "result": "passed_local",
+      "meaning": "Custom endpoint 配置和原始资源转发；未实现 Gemini action 在上游 work 前明确拒绝。",
+      "scope": "implementation_2026-09-20",
+      "real_upstream": "not_run"
+    },
+    "T14": {
+      "name": "普通用户资源 owner 与 HTTP",
+      "path": "model/resource_owner_test.go; relay/resource_http_test.go; relay/resource_request_test.go; controller/token_resource_channel_test.go",
+      "kind": "repository_regression",
+      "result": "passed_local",
+      "meaning": "用户/渠道隔离、预留绑定、派生 File、流式大文件、删除后访问、权限失败不发上游。",
+      "scope": "implementation_2026-09-20",
+      "real_upstream": "not_run"
+    },
+    "T15": {
+      "name": "后台 Responses 共享 Task",
+      "path": "model/responses_background_test.go; relay/responses_background_test.go; providers/openai/responses_stored_usage_test.go; relay/responses_background_tool_usage_test.go; model/task_first_closure_test.go; relay/task_settlement_projection_test.go; internal/billing/settlement_test.go",
+      "kind": "repository_regression",
+      "result": "passed_local",
+      "meaning": "单次创建、事务 owner、轮询恢复、cancel/恢复流去重、慢计费不挡交付、断线后继续追踪；relay 集合 race 通过。 本轮 Stored/后台工具 CallCount 只提取一次的回归及定向 race 通过。 本轮异步投影首次/重复/并发/失败/真实提交丢确认回读的 regular 与定向 race 通过，仅投影不二次结算余额。",
+      "scope": "implementation_2026-09-20",
+      "real_upstream": "not_run"
+    },
+    "T16": {
+      "name": "Responses WS 并行观察",
+      "path": "relay/responses_ws_observation_test.go; providers/openai/responses_ws_parallel_test.go; common/responsesws/native_parallel_test.go; relay/responses_ws_rejection_test.go",
+      "kind": "repository_regression",
+      "result": "passed_local",
+      "meaning": "并行交错、lane FIFO、A/B/S歧义、lane-only error、释放候选容量与防迟到误关联；不以业务状态挡交付。 本轮唯一请求拒绝后继续计费、空闲错误、多个候选/控制来源歧义及有界迟到ID回归和最终定向race通过。",
+      "scope": "implementation_2026-09-20",
+      "real_upstream": "not_run"
+    },
+    "T17": {
+      "name": "Stored Chat 生命周期",
+      "path": "relay/stored_chat_test.go; providers/openai/stored_chat_test.go",
+      "kind": "repository_regression",
+      "result": "passed_local",
+      "meaning": "原始 store 请求、owner 交付屏障、固定渠道生命周期、删除观察不阻止后续授权访问。",
+      "scope": "implementation_2026-09-20",
+      "real_upstream": "not_run"
+    },
+    "T18": {
+      "name": "历史音频 owner",
+      "path": "relay/chat_audio_owner_test.go",
+      "kind": "repository_regression",
+      "result": "passed_local",
+      "meaning": "真实 audio ID 提交 owner 后立即交付；期限迟到或已过期不控制流/引用，冲突不泄露或重试。",
+      "scope": "implementation_2026-09-20",
+      "real_upstream": "not_run"
+    },
+    "T19": {
+      "name": "Batch 单 Task 与派生资源",
+      "path": "model/openai_batch_test.go; model/openai_batch_response_test.go; providers/openai/batch_test.go; relay/batch_test.go; relay/batch_retention_test.go; model/openai_batch_identity_test.go; relay/batch_identity_test.go; model/task_first_closure_test.go; relay/task_settlement_projection_test.go; internal/billing/settlement_test.go; relay/batch_retry_test.go",
+      "kind": "repository_regression",
+      "result": "passed_local_and_race",
+      "meaning": "最终生产收尾后三包定向 race 通过；覆盖当前价格、独立证据、容量转交、一次结算、真实推进91天并正式清理后重读、截断/未知产出不能形成完整观察事实、根GET子File已清理。独立HTTP reviewer六个观察回归通过；没有真实上游或MySQL/PostgreSQL联调。 Batch/Task 保留 opaque ID 原串，SQL 回读逐字比对及排序规则别名拒绝回归通过。 本轮异步投影首次/重复/并发/失败/真实提交丢确认回读的 regular 与定向 race 通过，仅投影不二次结算余额。 本轮已知结果文件派生观察的48h内重试、SQL重载恢复、重复/冲突证据、容量和期限结算回归及三包定向race通过。",
+      "scope": "implementation_2026-09-20",
+      "real_upstream": "not_run",
+      "commands": [
+        "go test -race ./model ./relay ./providers/openai -run 'TestBatch|TestOpenAIBatch|TestResourceOwner' -count=1"
+      ]
+    },
+    "T20": {
+      "name": "五项缺陷修复后的最终集成验证",
+      "kind": "repository_integration",
+      "scope": "implementation_2026-09-20",
+      "result": "passed_frozen_full_and_complete_package_race",
+      "commands": [
+        "go test ./...",
+        "go test -race ./common/responses ./providers/openai ./model ./internal/billing ./relay ./relay/task/..."
+      ],
+      "meaning": "本轮五项缺陷修复冻结后Go全量和10个相关完整包race全部通过。前两项先红后绿，其余经调用链确认与回归。前端114通过/1跳过、前端与文档构建属于前轮实施验证，本轮未改前端、未重跑。非真实上游或部署数据库联调。",
+      "real_upstream": "not_run"
+    }
+  },
+  "sources": {
+    "S01": {
+      "title": "Responses WebSocket mode",
+      "url": "https://developers.openai.com/api/docs/guides/websocket-mode",
+      "checked_on": "2026-09-19"
+    },
+    "S02": {
+      "title": "Tool search",
+      "url": "https://developers.openai.com/api/docs/guides/tools-tool-search",
+      "checked_on": "2026-09-19"
+    },
+    "S03": {
+      "title": "Realtime/GPT-Live server-side controls",
+      "url": "https://developers.openai.com/api/docs/guides/voice-server-controls",
+      "checked_on": "2026-09-19"
+    },
+    "S04": {
+      "title": "Create speech",
+      "url": "https://developers.openai.com/api/reference/resources/audio/subresources/speech/methods/create",
+      "checked_on": "2026-09-19"
+    },
+    "S05": {
+      "title": "OpenAI API reference directory",
+      "url": "https://developers.openai.com/api/reference",
+      "checked_on": "2026-09-19"
+    },
+    "S06": {
+      "title": "Background mode",
+      "url": "https://developers.openai.com/api/docs/guides/background",
+      "checked_on": "2026-09-19"
+    },
+    "S07": {
+      "title": "OpenAI deprecations",
+      "url": "https://developers.openai.com/api/docs/deprecations",
+      "checked_on": "2026-09-19"
+    },
+    "S08": {
+      "title": "Video generation with Sora",
+      "url": "https://developers.openai.com/api/docs/guides/video-generation",
+      "checked_on": "2026-09-19"
+    },
+    "S09": {
+      "title": "Uploads",
+      "url": "https://developers.openai.com/api/reference/resources/uploads",
+      "checked_on": "2026-09-19"
+    },
+    "S10": {
+      "title": "Containers",
+      "url": "https://developers.openai.com/api/reference/resources/containers",
+      "checked_on": "2026-09-19"
+    },
+    "S11": {
+      "title": "Vector Stores",
+      "url": "https://developers.openai.com/api/reference/resources/vector_stores",
+      "checked_on": "2026-09-19"
+    },
+    "S12": {
+      "title": "Get Skill Version",
+      "url": "https://developers.openai.com/api/reference/resources/skills/subresources/versions/methods/retrieve",
+      "checked_on": "2026-09-19"
+    },
+    "S13": {
+      "title": "Webhooks",
+      "url": "https://developers.openai.com/api/docs/guides/webhooks",
+      "checked_on": "2026-09-19"
+    },
+    "S14": {
+      "title": "Secure MCP Tunnel",
+      "url": "https://developers.openai.com/api/docs/guides/secure-mcp-tunnels",
+      "checked_on": "2026-09-19"
+    },
+    "S15": {
+      "title": "Workload identity federation",
+      "url": "https://developers.openai.com/api/docs/guides/workload-identity-federation",
+      "checked_on": "2026-09-19"
+    },
+    "S16": {
+      "title": "Claude API overview",
+      "url": "https://platform.claude.com/docs/en/api/overview",
+      "checked_on": "2026-09-19"
+    },
+    "S17": {
+      "title": "Gemini API reference",
+      "url": "https://ai.google.dev/api",
+      "checked_on": "2026-09-19"
+    },
+    "S18": {
+      "title": "Gemini countTokens",
+      "url": "https://ai.google.dev/api/tokens",
+      "checked_on": "2026-09-19"
+    },
+    "S19": {
+      "title": "Official OpenAI OpenAPI repository",
+      "url": "https://github.com/openai/openai-openapi",
+      "checked_on": "2026-09-19"
+    },
+    "S20": {
+      "title": "Responses multi-agent",
+      "url": "https://developers.openai.com/api/docs/guides/responses-multi-agent",
+      "checked_on": "2026-09-19"
+    },
+    "S21": {
+      "title": "Realtime transcription",
+      "url": "https://developers.openai.com/api/docs/guides/realtime-transcription",
+      "checked_on": "2026-09-19"
+    },
+    "S22": {
+      "title": "Realtime translation",
+      "url": "https://developers.openai.com/api/docs/guides/realtime-translation",
+      "checked_on": "2026-09-19"
+    },
+    "S23": {
+      "title": "Mutual TLS",
+      "url": "https://developers.openai.com/api/docs/guides/mutual-tls",
+      "checked_on": "2026-09-19"
+    },
+    "S24": {
+      "title": "Image generation",
+      "url": "https://developers.openai.com/api/docs/guides/image-generation",
+      "checked_on": "2026-09-19"
+    },
+    "S25": {
+      "title": "File transcription",
+      "url": "https://developers.openai.com/api/docs/guides/speech-to-text",
+      "checked_on": "2026-09-19"
+    },
+    "S26": {
+      "title": "Images edit reference",
+      "url": "https://developers.openai.com/api/reference/resources/images/methods/edit",
+      "checked_on": "2026-09-19"
+    },
+    "S27": {
+      "title": "Custom voices",
+      "url": "https://developers.openai.com/api/docs/guides/custom-voices",
+      "checked_on": "2026-09-19"
+    },
+    "S28": {
+      "title": "Realtime client events",
+      "url": "https://developers.openai.com/api/reference/resources/realtime/client-events",
+      "checked_on": "2026-09-19"
+    },
+    "S29": {
+      "title": "Create chat completion",
+      "url": "https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create",
+      "checked_on": "2026-09-19"
+    },
+    "S30": {
+      "title": "Batch API",
+      "url": "https://developers.openai.com/api/docs/guides/batch",
+      "checked_on": "2026-09-19"
+    }
+  },
+  "updated_on": "2026-09-20",
+  "target_policy": {
+    "wire": "客户端组织调用并处理回执，上游判断业务参数与业务状态；未知字段、原始事件和原始错误继续交付。",
+    "local_boundary": "保留认证、资源用户归属、固定渠道、安全、本地有界容量与结算事实；不存在 owner 不能据缓存 miss 授权。",
+    "upstream_state": "不复制声线切换、会话忙闲、音频期限可用性、活跃任务是否可删除等判断；观察失配不暂停原始透传。",
+    "billing": "不能唯一归属或证据不足的独立计价组件不收费，不串账；不以计费观察不完整为业务参数门禁。",
+    "status_note": "这些是目标取舍，当前实现限制仍如实记录；未修改业务代码。"
+  },
+  "suboperations_scope": "OpenAI 当前参考方言；按 2026-09-19 已核验资料列出已选定的音频、Realtime、资源和 Batch 模式。不是上游全部操作的比较全集；新家族上线仍须保留其中的主动限制。",
+  "suboperations": [
+    {
+      "id": "SO01",
+      "entry_refs": [
+        "O30"
+      ],
+      "dialect": "OpenAI",
+      "contract_as_of": "2026-09-19",
+      "method_or_action": "GET",
+      "path": "/v1/audio/consent_phrases",
+      "mode": "普通用户",
+      "resource_positions": "无资源引用",
+      "current_status": "no_route",
+      "target_behavior": "随声音专项记录/实现，不要求 A0 提前建设。",
+      "source_refs": [
+        "S27"
+      ],
+      "test_refs": []
+    },
+    {
+      "id": "SO02",
+      "entry_refs": [
+        "O31"
+      ],
+      "dialect": "OpenAI",
+      "contract_as_of": "2026-09-19",
+      "method_or_action": "POST",
+      "path": "/v1/audio/speech",
+      "mode": "voice 对象与内置字符串",
+      "resource_positions": "voice.id",
+      "current_status": "known_custom_voice_restricted",
+      "target_behavior": "对象只验归属/渠道，内置字符串继续透传。",
+      "source_refs": [
+        "S04"
+      ],
+      "test_refs": [
+        "T11"
+      ]
+    },
+    {
+      "id": "SO03",
+      "entry_refs": [
+        "O43"
+      ],
+      "dialect": "OpenAI",
+      "contract_as_of": "2026-09-19",
+      "method_or_action": "session.update",
+      "path": "/v1/realtime",
+      "mode": "自定义声音对象",
+      "resource_positions": "session.audio.output.voice.id",
+      "current_status": "known_custom_voice_restricted",
+      "target_behavior": "发送最终帧前校验共享 owner/channel，不复制声线切换规则。",
+      "source_refs": [
+        "S28"
+      ],
+      "test_refs": [
+        "T11"
+      ]
+    },
+    {
+      "id": "SO04",
+      "entry_refs": [
+        "O44"
+      ],
+      "dialect": "OpenAI",
+      "contract_as_of": "2026-09-19",
+      "method_or_action": "response.create",
+      "path": "/v1/realtime",
+      "mode": "自定义声音对象",
+      "resource_positions": "response.audio.output.voice.id",
+      "current_status": "known_custom_voice_restricted",
+      "target_behavior": "发送最终帧前校验共享 owner/channel，不复制声线切换规则。",
+      "source_refs": [
+        "S28"
+      ],
+      "test_refs": [
+        "T11"
+      ]
+    },
+    {
+      "id": "SO05",
+      "entry_refs": [
+        "O45"
+      ],
+      "dialect": "OpenAI",
+      "contract_as_of": "2026-09-19",
+      "method_or_action": "POST",
+      "path": "/v1/chat/completions",
+      "mode": "audio.voice string/{id}",
+      "resource_positions": "audio.voice.id",
+      "current_status": "union_supported_known_custom_voice_restricted",
+      "target_behavior": "开放联合类型同时补已知资源授权，不重写其业务值。",
+      "source_refs": [
+        "S29"
+      ],
+      "test_refs": [
+        "T11"
+      ]
+    },
+    {
+      "id": "SO06",
+      "entry_refs": [
+        "O46"
+      ],
+      "dialect": "OpenAI",
+      "contract_as_of": "2026-09-19",
+      "method_or_action": "POST",
+      "path": "/v1/chat/completions",
+      "mode": "历史音频输入",
+      "resource_positions": "messages[].audio.id",
+      "current_status": "implemented_owner_authorized_reference",
+      "target_behavior": "A0 输入授权边界；已确认 owner/channel 后期限可用性留给上游。",
+      "source_refs": [
+        "S29"
+      ],
+      "test_refs": [
+        "T18",
+        "T14"
+      ]
+    },
+    {
+      "id": "SO07",
+      "entry_refs": [
+        "O46"
+      ],
+      "dialect": "OpenAI",
+      "contract_as_of": "2026-09-19",
+      "method_or_action": "POST",
+      "path": "/v1/chat/completions",
+      "mode": "JSON/SSE 音频输出",
+      "resource_positions": "真实 output audio.id / expires_at",
+      "current_status": "implemented_owner_before_delivery_expiry_observation_only",
+      "target_behavior": "最小 owner 提交后立即交付原始帧；期限观察不形成后续流缓冲/输入可用性门禁。",
+      "source_refs": [
+        "S29"
+      ],
+      "test_refs": [
+        "T18"
+      ]
+    },
+    {
+      "id": "SO08",
+      "entry_refs": [
+        "O47"
+      ],
+      "dialect": "OpenAI",
+      "contract_as_of": "2026-09-19",
+      "method_or_action": "response.create",
+      "path": "/v1/realtime",
+      "mode": "并行 conversation:none",
+      "resource_positions": "response 身份与 usage",
+      "current_status": "blocked_by_single_inflight_turn",
+      "target_behavior": "D-Realtime 支持有界多响应证据归属，上游判会话写入冲突。",
+      "source_refs": [
+        "S28"
+      ],
+      "test_refs": [
+        "T09"
+      ]
+    },
+    {
+      "id": "SO09",
+      "entry_refs": [
+        "O47"
+      ],
+      "dialect": "OpenAI",
+      "contract_as_of": "2026-09-19",
+      "method_or_action": "response.create",
+      "path": "/v1/realtime",
+      "mode": "单个串行 conversation:none",
+      "resource_positions": "response 身份与 usage",
+      "current_status": "full_upstream_compatibility_unverified",
+      "target_behavior": "与并行模式分开验收，不能由单 inflight 拒绝推断全部不可用。",
+      "source_refs": [
+        "S28"
+      ],
+      "test_refs": []
+    },
+    {
+      "id": "SO10",
+      "entry_refs": [
+        "O07",
+        "O13",
+        "O15",
+        "O17",
+        "O18",
+        "O19"
+      ],
+      "dialect": "OpenAI",
+      "contract_as_of": "2026-09-19",
+      "method_or_action": "GET",
+      "path": "/v1/{resource-family}",
+      "mode": "普通用户顶层 list",
+      "resource_positions": "共享账号资源列表",
+      "current_status": "ordinary_account_list_restricted",
+      "target_behavior": "未有保持上游分页语义的用户隔离支持时单列受限，不能泄露其他用户资源或伪称全家族已支持。",
+      "source_refs": [
+        "S05"
+      ],
+      "test_refs": [
+        "T14",
+        "T17",
+        "T19"
+      ]
+    },
+    {
+      "id": "SO11",
+      "entry_refs": [
+        "O15"
+      ],
+      "dialect": "OpenAI",
+      "contract_as_of": "2026-09-19",
+      "method_or_action": "POST/GET",
+      "path": "/v1/batches; result File content",
+      "mode": "Batch 内部 endpoint/body 及派生结果",
+      "resource_positions": "input/output/error_file_id; 已知结果 body 产出位置",
+      "current_status": "implemented_with_bounded_resource_observation_and_complete_file_proof",
+      "target_behavior": "七类已支持 endpoint 按 custom_id 观察真实产出、原始 JSONL 交付，一个 Task 结算。结果 File 完整资源屏障通过并到真实 EOF 后记录完整观察事实，重读不依赖已清理子 owner/Task、不重认领；此前派生资源 Range/压缩受限。根 owner 记录最多两个既有结果 File ID，子 File 清理不阻断根 GET；未知新 ID 仍需真实证明。 已知结果File未完成派生观察在既有48h窗口保留原Task/槽位及最小证据只读恢复；重复扫描不累加，完成或到期一次收尾。",
+      "source_refs": [
+        "S30"
+      ],
+      "test_refs": [
+        "T19"
+      ],
+      "code_refs": [
+        "relay/batch_delivery.go",
+        "relay/batch_retention_test.go",
+        "model/openai_batch.go"
+      ]
+    },
+    {
+      "id": "SO12",
+      "entry_refs": [
+        "O13",
+        "O03",
+        "O20"
+      ],
+      "dialect": "OpenAI",
+      "contract_as_of": "2026-09-19",
+      "method_or_action": "DELETE",
+      "path": "/v1/files/{id}; /v1/responses/{id}",
+      "mode": "已授权删除；任务仍运行/存在文件依赖",
+      "resource_positions": "已有 owner 与关联证据",
+      "current_status": "authorized_delete_and_tombstone_access_forwarded",
+      "target_behavior": "删除透传，由上游判断操作状态；本地依赖或删除 claim 不能成为客户端业务操作锁。 保留用户/渠道与授权事实留存校验；墓碑不代替上游业务状态，model 写入约束不能机械删除。",
+      "source_refs": [
+        "S05",
+        "S06"
+      ],
+      "test_refs": [
+        "T14",
+        "T15",
+        "T16"
+      ],
+      "code_refs": [
+        "relay/stored_responses.go",
+        "relay/responses_ownership.go",
+        "relay/responses_ws_inject.go",
+        "relay/resource_http.go"
+      ]
+    }
+  ],
+  "implementation_updated_on": "2026-09-20",
+  "implementation_revision": "working_tree_after_b986504166b94e4bfdf53ec48740a7dcf94985c3"
+}

@@ -15,12 +15,12 @@ one-hub 通过 `GET /v1/responses` 的 WebSocket Upgrade 提供 Responses WebSoc
 
 ## 协议边界
 
-- 客户端事件支持 `response.create`、针对当前活动响应的 `response.steer`，以及针对已授权响应的 `response.inject`。inject 的 multi-agent 模式和工具输入 schema 由上游校验。
+- 客户端事件支持 `response.create`、针对已授权响应的 `response.steer`，以及针对已授权响应的 `response.inject`。inject 的 multi-agent 模式和工具输入 schema 由上游校验。
 - `response.cancel` 属于 Realtime API，在 Responses WebSocket 上返回 `unsupported_client_event`。客户端断开连接会关闭当前上游 transport。
 - 同一连接固定一个渠道。每个 `response.create` 独立读取其原始 `model`、`store`、continuation 和工具门禁；预扣与结算分别使用当时的当前价格，配置更新可能使两者不同。
 - 渠道必须支持该 turn 的精确 model；连接内不切换渠道、不做 model mapping，也不改写请求 model。
-- busy 时合法的 `response.create` 进入有界 FIFO，不返回 `session_busy`。父响应结束后可开始下一项，无需等待旧 inject 回执；可能创建自动后继的 steering 预扣仍会阻挡新 create。已发布的发送命令保持顺序。
-- `response.completed`、`response.failed`、`response.incomplete` 为本地提供终结和用量事实。未知事件、缺省或非递增序号不阻止原帧交付；代理不会据此猜测上游已结束。新资源的归属屏障和已准入执行关联仍须成立。
+- `stream_id` 原样保留，支持不同 lane 的并行请求。通过本地准入的命令按收到顺序发送，不等待父终态、inject/steering 回执或工具结果；上游决定各 lane 的执行顺序。
+- `response.completed`、`response.failed`、`response.incomplete` 为本地提供终结和用量事实。未知事件、缺省或非递增序号不阻止原帧交付；代理不会据此猜测上游已结束。新资源仍需完成归属屏障；计费无法关联时放弃相应收费，不因此阻断原始交付。
 - 同一已验证连接上的迟到控制回执和安全诊断仍会交付，不重开旧账务，也不计入新响应。供应商私有事件仅在 adapter 有明确语义映射时转换；公共事件不补造序号。
 - provider terminal 先交付客户端，再执行日志和结算。结算失败不会用本地 error 替换已经交付的 terminal。
 
@@ -38,17 +38,19 @@ one-hub 通过 `GET /v1/responses` 的 WebSocket Upgrade 提供 Responses WebSoc
 {"type":"response.steer","previous_response_id":"resp_1","input":"将范围缩小到两周内可完成。"}
 ```
 
-代理在发送第一条 steering 前完成自动续接的权限、渠道、RPM 和余额准入，并预扣一次。一个尚未绑定的自动续接最多保留 64 条待观察提交，每个已接管 ID 最多 1024 字节；原始帧沿用现有队列字节限制，不累计已发送的历史流量。连接最多保留 64 个待续接父资源证明，ID 总量最多 4 MiB；状态只在当前连接存在，断线不会自动重放。
+代理在发送可能触发独立后继的 steering 前完成权限、固定渠道、RPM 和额度准入。同父尚未绑定的共同后继复用一笔预扣；显式 create 使用自己的准入，不受该候选阻挡。
 
-`response.steer.accepted` 表示上游已接管输入。原响应可能以 `response.incomplete`（`reason: "steered"`）或 `response.completed` 结束，随后上游自动发出新的 `response.created`。每个实际响应分别持久化资源归属、提取用量并结算，代理不发送额外的 `response.create`。
+上游可能结束原响应并自动发出新的 `response.created`。代理按能够证明的 Response 身份关联用量，不额外发送 create。若响应无法唯一对应显式 create 或 steering 后继，则放弃受影响的未绑定计费观察、释放预扣与候选槽位，仍交付原始响应；不能把后继用量记到排队请求上。
 
-如果上游返回 `response.steer.pending`，用其 `required_input` 填入已保存的工具结果或批准决定，再发一个带同一 `previous_response_id` 的 `response.create`。该显式请求使用自己的参数重新准入；不要重跑工具或重复发送已被接管的 steering 输入。`response.steer.failed` 也会原样返回。全部提交明确失败，或父已完成、全部初始回执已消解且上游明确等待客户端输入时，释放尚未使用的自动续接预扣。未知 pending reason 原样交付，不作为提前退款依据。
+steering 还需确认父响应的模型权限。只有 SQL 归属、缺少同连接父模型记录时，模型受限 token 会收到 `responses_ws_parent_model_unknown`；代理不能借当前首帧模型替代该权限事实。无限制 token 可继续原样发送，无法证明的父模型不会用于猜测计价。
 
-同一已验证上游连接的迟到 steering 回执原样交付，不依赖当前候选或最近完成历史，不计入新响应用量。每条发送独立消费结果；已消费的重复结果不影响新响应，原发送首次报告的歧义仍会关闭连接。等待客户端续接所需的临时父资源证明独立保留，无关请求不会消费它；匹配显式请求收到新 Response 的 created 后才释放。无关联的泛化 `error` 只交付，不取消候选或推进 FIFO；连接关闭和既有超时负责有界收尾。明确关联的 create 拒绝可结束该准入，已知 workflow stop 则停止连接。
+客户端自行处理 `response.steer.pending`、所需工具结果和下一次 create，不必等待代理许可。迟到回执继续交付，不重开已结束的账务；原命令的实际发送歧义仍按传输故障收尾，不自动重发。
+
+每连接最多保留 64 个未收尾 work 候选、32 MiB 候选数据，另有发送队列和连接容量限制。固定容量的防误关联记录可能保守放弃收费，不影响已授权原帧交付。真实容量已满时，新工作在发送前返回本地容量错误。
 
 ## Astra 请求与安全监控
 
-原生 HTTP Responses 和 WebSocket `response.create` 保留工具的 `async: true`、`configuration_update` 输入项、`prompt_cache_options` 和 `prompt_cache_breakpoint`。工具由客户端执行，结果按原始 `call_id` 回传；异步工具与代理不支持的 `background:true` 是不同能力。推理更新的模型和压缩兼容性限制由上游校验；跨协议 Chat 适配器会在上游工作前拒绝无法表示的字段。
+原生 HTTP Responses 和 WebSocket `response.create` 保留工具的 `async: true`、`configuration_update` 输入项、`prompt_cache_options` 和 `prompt_cache_breakpoint`。工具由客户端执行，结果按原始 `call_id` 回传；异步工具与 HTTP `background:true` 是不同能力；后者由持久 Task 路径处理。推理更新的模型和压缩兼容性限制由上游校验；跨协议 Chat 适配器会在上游工作前拒绝无法表示的字段。
 
 `cached_tokens`、`cache_write_tokens` 从上游用量进入结算。管理员仍需配置模型价格与缓存倍率，代理不会自动覆盖已有价格。
 
@@ -67,7 +69,7 @@ one-hub 通过 `GET /v1/responses` 的 WebSocket Upgrade 提供 Responses WebSoc
 | 省略或 `true` | 只选择同时支持 create 和完整 Stored Response 生命周期的渠道；在首个携带 Response ID 的 provider 事件交付前持久化 owner |
 | `false` | 使用普通调度；不创建 durable owner，同一 Native WS 连接内可使用 provider connection-local state |
 
-Stored Response owner 绑定 `UserId` 和创建渠道。后续 retrieve/delete/input-items 或严格 continuation 固定回到创建渠道，不 fallback。owner miss、跨用户、tombstone 和过期对普通用户统一表现为资源不存在。
+Stored Response owner 绑定 `UserId` 和创建渠道。后续 retrieve/delete/input-items 或严格 continuation 固定回到创建渠道，不 fallback。owner miss、跨用户或本地授权元数据已清理仍拒绝；留存期间 tombstone 不阻止已授权访问，资源是否存在由上游回答。
 
 ## 渠道配置
 
@@ -137,10 +139,8 @@ responses_ws:
 
   first_frame_timeout_ms: 30000
   idle_timeout_ms: 1800000
-  active_turn_timeout_ms: 120000
   max_lifetime_ms: 3600000
 
-  pending_provider_events_max_bytes: 2097152
   unsupported_scan_limit: 0
   allow_anonymous_capacity_bucket: false
 
@@ -179,20 +179,19 @@ responses_websocket_client_inbound_activity_timeout_ms: 60000
 | 配置 | 默认值 | 说明 |
 | --- | ---: | --- |
 | `first_frame_timeout_ms` | 30000 | Upgrade 后等待首个 `response.create`；`0` 禁用 |
-| `idle_timeout_ms` | 1800000 | 仅清理没有 opening/pending/active turn 的业务空闲连接；`0` 禁用 |
-| `active_turn_timeout_ms` | 120000 | provider inactivity 限制；`0` 禁用，只产生 one-hub timeout/close，不合成 provider terminal |
+| `idle_timeout_ms` | 1800000 | 连接建立后的实际 I/O 空闲限制；`0` 禁用 |
 | `max_lifetime_ms` | 3600000 | 代理连接寿命上限；`0` 禁用 |
 | `responses_websocket_client_ping_interval_ms` | 25000 | 服务端 ping 周期；`0` 禁用 |
 | `responses_websocket_client_pong_miss_timeout_ms` | 10000 | pong 缺失判死；`0` 显式禁用并使 readiness 标记 degraded |
 | `responses_websocket_client_inbound_activity_timeout_ms` | 60000 | 客户端入站活性限制；`0` 显式禁用并使 readiness 标记 degraded |
 
-active watchdog 只按 provider inactivity 计时，provider 有活动时会续期；max lifetime 限制单连接最长占用时间。两者都属于 one-hub 自己的资源边界，不是 provider 已完成的证据，可显式设为 `0` 禁用。
+连接 idle timeout 以实际收发活动计时；max lifetime 限制单连接最长占用时间。它们不是 provider 已完成的证据，可显式设为 `0` 禁用。旧 `active_turn_timeout_ms`、`pending_provider_events_max_bytes` 配置及对应串行接收 journal 已删除；升级配置时移除这两个键。
 
 ### 缓冲与候选扫描
 
-`pending_provider_events_max_bytes` 限制上游 send 结果确认前的 provider 事件缓冲，默认 2 MiB；另有固定事件条数上限。超限时 fail closed，并保留已存在的计费证据，不把不确定发送误判为未发送。首帧在完整物化前按实际读取 chunk 同时取得 token/user/group/global byte lease；额度不足时立即以资源错误关闭，不先复制完整 32 MiB 帧。actor mailbox 另有每连接 64 MiB 的 payload 总字节预算，避免固定事件条数与大帧相乘时放大内存占用。
+provider 事件不等待单个 pending write 的完成后再交付；删除旧串行 journal，不把发送状态当成收费证据。首帧在完整物化前按实际读取 chunk 同时取得 token/user/group/global byte lease；额度不足时立即以资源错误关闭，不先复制完整 32 MiB 帧。actor mailbox 另有每连接 64 MiB 的 payload 总字节预算，避免固定事件条数与大帧相乘时放大内存占用。
 
-busy `response.create` FIFO 同时限制帧数和 4 MiB payload bytes；上游 send queue 另有 32 MiB 总字节预算。队列超限返回对应的 backpressure error 并关闭连接。
+建连及实际发送队列同时限制帧数和 payload bytes；上游 send queue 另有 32 MiB 总字节预算。队列超限返回对应的 backpressure error 并关闭连接。
 
 `unsupported_scan_limit=0` 表示按当前已加载候选数扫描。显式上限在仍可能存在未扫描候选时返回 `503 responses_ws_unsupported_scan_limited`；只有已证明全部候选不支持 native WS 时才返回 426。
 
@@ -204,7 +203,7 @@ busy `response.create` FIFO 同时限制帧数和 4 MiB payload bytes；上游 s
   → Upgrade 并以 streaming reader 读取首个 response.create
   → capability / OpenAI Data Residency / exact-model gate
   → 获取 active lease 并建立 native upstream
-  → response.create FIFO + 已授权 inject / steer 原帧发送
+  → 按收到顺序发送 create + 已授权 inject / steer 原帧
   → provider terminal 先交付，后结算
   → 释放 lease 并关闭 upstream
 ```

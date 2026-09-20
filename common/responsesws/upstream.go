@@ -102,7 +102,7 @@ type OpenRequest struct {
 	Diagnostics       DiagnosticHook
 }
 
-// SendRequest 的 AttemptID 标识发送完成；仅 create 会建立当前接收关联。
+// SendRequest 的 AttemptID 仅标识这次发送；接收归属由真实响应身份确定。
 type SendRequest struct {
 	AttemptID string
 	Frame     Frame

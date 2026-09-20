@@ -42,7 +42,7 @@ Native WS send 结果只有三种：
 | status | 语义 | actor 行为 |
 | --- | --- | --- |
 | `not_attempted` | 明确没有进入底层 write | 不重放；closure 时按 usage Confirm/Cancel |
-| `attempted` | write 成功返回 | pending turn 进入 active |
+| `attempted` | write 成功返回 | 记录该命令完成；不以此判定上游 work 的业务状态 |
 | `ambiguous` | 已进入 write 且返回错误，无法证明 provider 是否收到 | create 已有可关联的 provider 事件时继续观察原执行，否则关闭；辅助发送歧义关闭。无 usage 时 Cancel |
 
 未知或字段组合非法的 send result 是 transport contract violation，fail closed。provider request-level `error` 通过 `Recv` event path 到达 actor，不塞进 send result，也不转换成 terminal。
@@ -62,11 +62,11 @@ Native WS send 结果只有三种：
 - typed detail origin/phase；
 - adapter 或 transport error。
 
-接收事件的 transport attempt ID 只在 create 进入发送时更新，以承接先于 SendResult 到达的事件。辅助发送使用自己的完成关联，不能覆盖该接收 ID；已绑定的上游 Response ID 优先用于业务证据归属。物理关闭由 channel/generation 确定，不依赖当前业务 attempt。
+接收事件按 lane/Response ID 维护有界关联，以承接先于 SendResult 到达的事件；不把最近发送的 create 当作全连接当前执行。辅助发送使用自己的完成关联，不能覆盖其他 work；无法消歧时原帧仍交付，不附加猜测的 Attempt 用量。物理关闭由 channel/generation 确定，不依赖当前业务 attempt。
 
 inject/steer 控制回执先原样交付，再观察仍未结束的本地决定。旧父回执不修改当前 child 的序号、Response ID 或用量。`A terminal → B create → inject(A) → B 无 ID delta` 已纳入真实 native transport 回归。
 
-I/O pump 只负责把这些事实可靠投递给 actor。pending write 结果未确认前，provider event 写入有事件数和字节数上限的 journal；超限时保留已有 evidence 并 fail closed，不能把已观察到的 provider 活动退化成 zero-charge。
+I/O pump 将事实投递给 actor 的有界 mailbox；不等待单个 pending write 结果，也不为该串行关联保留 journal。adapter 的 Response observer 有界，观察容量不足只放弃受影响证据，安全原帧仍交付。实际 mailbox/传输容量超限按真实资源边界收尾。
 
 ## Provider adapter 要求
 

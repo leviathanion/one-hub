@@ -102,10 +102,10 @@ func (t *ImageGenerationStreamTracker) observe(eventType string, response *types
 	if len(configuredType) > maxImageGenerationConfiguredTypeBytes {
 		return t.fail(errImageGenerationStreamLimit)
 	}
-	eventItemID := strings.TrimSpace(itemID)
+	eventItemID := itemID
 	itemObjectID := ""
 	if item != nil {
-		itemObjectID = strings.TrimSpace(item.ID)
+		itemObjectID = item.ID
 	}
 	responseImageOutputs := 0
 	if eventType == "response.completed" && response != nil {
@@ -147,7 +147,7 @@ func (t *ImageGenerationStreamTracker) observe(eventType string, response *types
 			if output.Type != types.InputTypeImageGenerationCall || !types.ShouldBillResponsesImageGeneration(*output) {
 				continue
 			}
-			outputID := strings.TrimSpace(output.ID)
+			outputID := output.ID
 			if outputID == "" {
 				continue
 			}
@@ -212,7 +212,7 @@ func imageGenerationOutputExceedsLimit(output *types.ResponsesOutput) bool {
 	if output == nil {
 		return false
 	}
-	return len(strings.TrimSpace(output.ID)) > maxImageGenerationIdentifierBytes ||
+	return len(output.ID) > maxImageGenerationIdentifierBytes ||
 		len(strings.TrimSpace(output.Quality)) > maxImageGenerationDimensionBytes ||
 		len(strings.TrimSpace(output.Size)) > maxImageGenerationDimensionBytes
 }
@@ -289,7 +289,7 @@ func (t *ImageGenerationStreamTracker) PartialImageCount(item *types.ResponsesOu
 	}
 	itemID := ""
 	if item != nil {
-		itemID = strings.TrimSpace(item.ID)
+		itemID = item.ID
 	}
 	indices := make(map[int]struct{})
 	mergePartialImageIndices(indices, t.partialsByItemID[itemID])
@@ -409,7 +409,7 @@ func (t *ImageGenerationStreamTracker) outputAliases(output *types.ResponsesOutp
 	aliases := make(map[string]struct{})
 	itemID := ""
 	if output != nil {
-		itemID = strings.TrimSpace(output.ID)
+		itemID = output.ID
 		if itemID != "" {
 			aliases["id:"+itemID] = struct{}{}
 		}

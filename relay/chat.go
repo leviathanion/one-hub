@@ -65,6 +65,9 @@ func (r *relayChat) setRequest() error {
 	if err := r.decodeCurrentRequestBody(); err != nil {
 		return err
 	}
+	if err := prepareResourceRequest(r.c, r.rawEnvelope.Raw, "chat"); err != nil {
+		return err
+	}
 	r.setOriginalModel(r.chatRequest.Model)
 	r.c.Set("skip_only_chat", len(r.chatRequest.Tools) > 0)
 	prepareChatChannelAffinity(r.c, r.chatRequest.Model, chatPromptCacheKey(r.rawEnvelope.Fields))
@@ -87,6 +90,9 @@ func (r *relayChat) decodeCurrentRequestBody() error {
 		return err
 	}
 	if err := json.Unmarshal(raw, &r.chatRequest); err != nil {
+		return err
+	}
+	if err := authorizeMediaRequest(r.c, raw, "chat"); err != nil {
 		return err
 	}
 	r.rawEnvelope = envelope
@@ -172,6 +178,16 @@ func (r *relayChat) send() (err *types.OpenAIErrorWithStatusCode, done bool) {
 
 func (r *relayChat) sendCurrentProvider() (*types.OpenAIErrorWithStatusCode, bool) {
 	r.chatRequest.Model = r.modelName
+	cleanup, ownershipErr := r.prepareStoredChatOwnership()
+	if ownershipErr != nil {
+		return ownershipErr, true
+	}
+	defer cleanup()
+	audioCleanup, audioErr := r.prepareChatAudioOwnership()
+	if audioErr != nil {
+		return audioErr, true
+	}
+	defer audioCleanup()
 	if chatModelRequiresResponses(r.modelName) {
 		responsesProvider, ok := r.provider.(providersBase.ResponsesInterface)
 		if !ok {

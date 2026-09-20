@@ -10,6 +10,19 @@ import (
 	"time"
 )
 
+func (p *AzureProvider) CreateImageGenerationsResponse(request *types.ImageRequest) (*types.ImageResponseWrapper, *types.OpenAIErrorWithStatusCode) {
+	if request.Model != "dall-e-2" {
+		return p.OpenAIProvider.CreateImageGenerationsResponse(request)
+	}
+
+	// Azure 的异步提交回执必须先轮询并转换成图片结果，不能直接交付给客户端。
+	response, apiErr := p.CreateImageGenerations(request)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+	return &types.ImageResponseWrapper{JSON: response}, nil
+}
+
 func (p *AzureProvider) CreateImageGenerations(request *types.ImageRequest) (*types.ImageResponse, *types.OpenAIErrorWithStatusCode) {
 	req, errWithCode := p.GetRequestTextBody(config.RelayModeImagesGenerations, request.Model, request)
 	if errWithCode != nil {
@@ -27,6 +40,8 @@ func (p *AzureProvider) CreateImageGenerations(request *types.ImageRequest) (*ty
 		}
 		response, errWithCode = p.ResponseAzureImageHandler(resp, imageAzureResponse)
 		if errWithCode != nil {
+			// 提交已经成功，后续轮询失败不能使生成请求被重新提交。
+			errWithCode.UpstreamAccepted = true
 			return nil, errWithCode
 		}
 	} else {

@@ -79,7 +79,7 @@ func (observer *StreamObserver) observeSSEPayload(payload string) {
 	}
 	responseID := ""
 	if observed.Response != nil {
-		responseID = strings.TrimSpace(observed.Response.ID)
+		responseID = observed.Response.ID
 	}
 	if IsTerminalEventType(eventType) && (!observed.ResponseObject || responseID == "" && observer.observedResponseID == "") {
 		// A terminal response ID is a relay-owned ownership and settlement

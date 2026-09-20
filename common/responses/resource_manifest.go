@@ -6,60 +6,126 @@ import (
 	"strings"
 )
 
-var restrictedAccountResourceKeys = map[string]struct{}{
-	"file_id": {}, "vector_store_id": {}, "vector_store_ids": {},
-	"container": {}, "container_id": {}, "container_reference": {},
-	"skill_reference": {}, "skill_id": {},
+// ResourceReference is a protocol-defined account resource location, not an
+// arbitrary JSON property with a familiar name. Empty IDs describe hosted
+// resource creation whose ownership is not yet implemented.
+type ResourceReference struct{ Kind, ID, Path string }
+
+// Resource IDs are opaque wire values. Only protocol discriminators may be
+// normalized; authorization must not borrow another ID's ownership.
+func resourceID(value any) string     { id, _ := value.(string); return id }
+func resourceTag(value any) string    { return strings.TrimSpace(resourceID(value)) }
+func object(value any) map[string]any { result, _ := value.(map[string]any); return result }
+func addReference(out *[]ResourceReference, kind, path string, value any) {
+	if id := resourceID(value); id != "" {
+		*out = append(*out, ResourceReference{Kind: kind, ID: id, Path: path})
+	}
 }
 
-// ValidateNoAccountScopedResources checks the effective request after every
-// allowed overlay. Function-tool JSON schemas are intentionally not traversed:
-// a property named file_id is a schema label, not an actual resource claim.
-func ValidateNoAccountScopedResources(body map[string]any) error {
-	if body == nil {
-		return nil
-	}
-	for key, value := range body {
-		if _, restricted := restrictedAccountResourceKeys[key]; restricted && meaningfulResourceValue(value) {
-			return fmt.Errorf("%s requires an account-scoped resource owner", key)
-		}
-	}
-	if input, ok := body["input"]; ok {
-		if field, found := FindAccountScopedResourceReference(input); found {
-			return fmt.Errorf("input.%s requires an account-scoped resource owner", field)
-		}
-	}
-	tools := normalizeResourceTools(body["tools"])
-	if len(tools) == 0 {
-		return nil
-	}
-	for _, rawTool := range tools {
-		tool, ok := rawTool.(map[string]any)
-		if !ok {
-			continue
-		}
-		toolType, _ := tool["type"].(string)
-		if strings.TrimSpace(toolType) == "code_interpreter" {
-			return fmt.Errorf("tools[].type=%s requires an account-scoped container owner", toolType)
-		}
-		for key, value := range tool {
-			if _, restricted := restrictedAccountResourceKeys[key]; restricted && meaningfulResourceValue(value) {
-				return fmt.Errorf("tools[].%s requires an account-scoped resource owner", key)
+// InputResourceReferences visits only protocol containers. Function arguments,
+// string/object tool outputs and JSON schemas are opaque business data.
+func InputResourceReferences(value any) []ResourceReference {
+	var refs []ResourceReference
+	var visit func(any)
+	visit = func(value any) {
+		if items, ok := value.([]any); ok {
+			for _, item := range items {
+				visit(item)
 			}
+			return
 		}
-		for _, key := range []string{"environment", "input_image_mask"} {
-			if field, found := FindAccountScopedResourceReference(tool[key]); found {
-				return fmt.Errorf("tools[].%s.%s requires an account-scoped resource owner", key, field)
-			}
+		item := object(value)
+		if item == nil {
+			return
 		}
-		if strings.TrimSpace(toolType) == "shell" {
-			if environment, ok := tool["environment"].(map[string]any); ok {
-				environmentType, _ := environment["type"].(string)
-				if environmentType == "container_auto" || environmentType == "container_reference" {
-					return fmt.Errorf("tools[].environment.type=%s requires an account-scoped container owner", environmentType)
+		kind := resourceTag(item["type"])
+		switch kind {
+		case "input_file", "input_image":
+			addReference(&refs, "file", "file_id", item["file_id"])
+		case "file": // Chat file content part.
+			addReference(&refs, "file", "file.file_id", object(item["file"])["file_id"])
+		case "message", "":
+			if kind == "message" || resourceTag(item["role"]) != "" {
+				visit(item["content"])
+				if resourceTag(item["role"]) == "assistant" {
+					addReference(&refs, "chat_audio", "audio.id", object(item["audio"])["id"])
 				}
 			}
+		case "tool_search_output":
+			refs = append(refs, ToolResourceReferences(item["tools"])...)
+		case "function_call_output":
+			// Only the content-array form has protocol-defined resource slots.
+			// Do not recurse through arbitrary objects or unknown content parts.
+			if parts, ok := item["output"].([]any); ok {
+				for _, raw := range parts {
+					part := object(raw)
+					switch resourceTag(part["type"]) {
+					case "input_file", "input_image":
+						addReference(&refs, "file", "output.file_id", part["file_id"])
+					}
+				}
+			}
+		case "container_reference":
+			addReference(&refs, "container", "container_id", item["container_id"])
+		case "skill_reference":
+			addReference(&refs, "skill", "skill_id", item["skill_id"])
 		}
+	}
+	visit(value)
+	return refs
+}
+
+func ToolResourceReferences(value any) []ResourceReference {
+	var refs []ResourceReference
+	for _, raw := range normalizeResourceTools(value) {
+		tool := object(raw)
+		switch resourceTag(tool["type"]) {
+		case "namespace":
+			refs = append(refs, ToolResourceReferences(tool["tools"])...)
+		case "file_search":
+			if ids, ok := tool["vector_store_ids"].([]any); ok {
+				for _, id := range ids {
+					addReference(&refs, "vector_store", "vector_store_ids", id)
+				}
+			}
+		case "code_interpreter":
+			refs = append(refs, ResourceReference{Kind: "container", ID: resourceID(tool["container"]), Path: "container"})
+			for _, id := range normalizeResourceTools(object(tool["container"])["file_ids"]) {
+				addReference(&refs, "file", "container.file_ids", id)
+			}
+		case "image_generation":
+			addReference(&refs, "file", "input_image_mask.file_id", object(tool["input_image_mask"])["file_id"])
+		case "shell":
+			environment := object(tool["environment"])
+			switch resourceTag(environment["type"]) {
+			case "container_reference":
+				refs = append(refs, ResourceReference{Kind: "container", ID: resourceID(environment["container_id"]), Path: "environment.container_id"})
+			case "container_auto":
+				refs = append(refs, ResourceReference{Kind: "container", Path: "environment"})
+			}
+			refs = append(refs, InputResourceReferences(environment["skills"])...)
+		}
+	}
+	return refs
+}
+
+func ExtractAccountScopedResourceReferences(body map[string]any) []ResourceReference {
+	var conversation []ResourceReference
+	if id, ok := body["conversation"].(string); ok {
+		addReference(&conversation, "conversation", "conversation", id)
+	} else {
+		addReference(&conversation, "conversation", "conversation.id", object(body["conversation"])["id"])
+	}
+	refs := InputResourceReferences(body["input"])
+	refs = append(refs, InputResourceReferences(body["messages"])...)
+	refs = append(refs, ToolResourceReferences(body["tools"])...)
+	return append(refs, conversation...)
+}
+
+func ValidateNoAccountScopedResources(body map[string]any) error {
+	refs := ExtractAccountScopedResourceReferences(body)
+	if len(refs) > 0 {
+		return fmt.Errorf("%s requires an account-scoped %s owner", refs[0].Path, refs[0].Kind)
 	}
 	return nil
 }
@@ -77,13 +143,13 @@ func normalizeResourceTools(value any) []any {
 	if err != nil {
 		return nil
 	}
-	var tools []any
-	if json.Unmarshal(encoded, &tools) == nil {
-		return tools
+	var values []any
+	if json.Unmarshal(encoded, &values) == nil {
+		return values
 	}
-	var tool map[string]any
-	if json.Unmarshal(encoded, &tool) == nil {
-		return []any{tool}
+	var single map[string]any
+	if json.Unmarshal(encoded, &single) == nil {
+		return []any{single}
 	}
 	return nil
 }
@@ -97,49 +163,19 @@ func ValidateNoAccountScopedResourcesJSON(raw []byte) error {
 	}
 	return ValidateNoAccountScopedResources(body)
 }
-
 func FindAccountScopedResourceReference(value any) (string, bool) {
-	switch typed := value.(type) {
-	case map[string]any:
-		for key, child := range typed {
-			if _, restricted := restrictedAccountResourceKeys[key]; restricted && meaningfulResourceValue(child) {
-				return key, true
-			}
-			if field, found := FindAccountScopedResourceReference(child); found {
-				return field, true
-			}
-		}
-	case []any:
-		for _, child := range typed {
-			if field, found := FindAccountScopedResourceReference(child); found {
-				return field, true
-			}
-		}
+	refs := InputResourceReferences(value)
+	if len(refs) > 0 {
+		return refs[0].Path, true
 	}
 	return "", false
 }
-
 func FindAccountScopedResourceReferenceJSON(raw json.RawMessage) (string, bool) {
 	var value any
 	decoder := json.NewDecoder(strings.NewReader(string(raw)))
 	decoder.UseNumber()
-	if err := decoder.Decode(&value); err != nil {
-		return "invalid_json", true
+	if decoder.Decode(&value) != nil {
+		return "", false
 	}
 	return FindAccountScopedResourceReference(value)
-}
-
-func meaningfulResourceValue(value any) bool {
-	switch typed := value.(type) {
-	case nil:
-		return false
-	case string:
-		return strings.TrimSpace(typed) != ""
-	case []any:
-		return len(typed) > 0
-	case map[string]any:
-		return len(typed) > 0
-	default:
-		return true
-	}
 }

@@ -3,7 +3,6 @@ package relay
 import (
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -17,34 +16,26 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const audioSSEMaxEventBytes = 16 << 20
+const nativeSSEMaxEventBytes = 16 << 20
 
-type audioSSEProtocol uint8
-
-const (
-	audioSSESpeech audioSSEProtocol = iota + 1
-	audioSSETranscription
-)
-
-type audioSSEHandler struct {
+type nativeSSEHandler struct {
 	credentials          []string
-	protocol             audioSSEProtocol
 	framer               *requester.SSEEventFramer
-	terminalSeen         bool
 	errorSeen            bool
+	providerError        *types.OpenAIErrorWithStatusCode
 	observeProviderEvent func([]byte)
 	afterFrame           func([]byte)
 }
 
-func newAudioSSEHandler(protocol audioSSEProtocol, observers ...func([]byte)) *audioSSEHandler {
-	handler := &audioSSEHandler{protocol: protocol, framer: requester.NewSSEEventFramer(audioSSEMaxEventBytes)}
+func newNativeSSEHandler(observers ...func([]byte)) *nativeSSEHandler {
+	handler := &nativeSSEHandler{framer: requester.NewSSEEventFramer(nativeSSEMaxEventBytes)}
 	if len(observers) > 0 {
 		handler.observeProviderEvent = observers[0]
 	}
 	return handler
 }
 
-func (h *audioSSEHandler) Handle(rawLine *[]byte, emitter requester.StreamEmitter[string]) {
+func (h *nativeSSEHandler) Handle(rawLine *[]byte, emitter requester.StreamEmitter[string]) {
 	if h == nil || rawLine == nil {
 		return
 	}
@@ -62,7 +53,7 @@ func (h *audioSSEHandler) Handle(rawLine *[]byte, emitter requester.StreamEmitte
 		h.afterFrame(append([]byte(nil), event...))
 	}
 
-	eventName, payloadType, payload := audioSSEFacts(event)
+	_, _, payload := audioSSEFacts(event)
 	errorEnvelope := sseEventContainsError(event)
 	if !errorEnvelope && h.observeProviderEvent != nil {
 		h.observeProviderEvent(payload)
@@ -73,42 +64,20 @@ func (h *audioSSEHandler) Handle(rawLine *[]byte, emitter requester.StreamEmitte
 	}
 	if errorEnvelope {
 		h.errorSeen = true
-		h.terminalSeen = true
-		*rawLine = requester.StreamClosed
-		apiErr := providerAPIErrorFromAudioSSE(payload)
-		if apiErr == nil {
-			apiErr = common.StringErrorWrapper("provider audio stream failed", "upstream_error", http.StatusBadGateway)
+		h.providerError = providerAPIErrorFromAudioSSE(payload)
+		if h.providerError == nil {
+			h.providerError = common.StringErrorWrapper("provider stream failed", "upstream_error", http.StatusBadGateway)
 		}
-		emitter.SendError(apiErr)
-		return
+		h.providerError.UpstreamAccepted = true
 	}
-	if h.isSuccessTerminal(eventName, payloadType) {
-		h.terminalSeen = true
-		*rawLine = requester.StreamClosed
-		emitter.SendError(io.EOF)
-	}
-}
-
-func (h *audioSSEHandler) isSuccessTerminal(eventName, payloadType string) bool {
-	for _, value := range []string{eventName, payloadType} {
-		switch h.protocol {
-		case audioSSESpeech:
-			if value == "speech.audio.done" || value == "audio.done" {
-				return true
-			}
-		case audioSSETranscription:
-			if value == "transcript.text.done" || value == "transcription.done" {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func audioSSEFacts(event []byte) (eventName, payloadType string, payload []byte) {
 	dataLines := make([]string, 0, 1)
-	for _, line := range strings.Split(string(event), "\n") {
-		line = strings.TrimSuffix(line, "\r")
+	for rest := string(event); rest != ""; {
+		var line string
+		line, rest = requester.SplitSSELine(rest)
+		line = requester.SSELineContent(line)
 		switch {
 		case strings.HasPrefix(line, "event:"):
 			eventName = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(line, "event:")))
@@ -166,9 +135,9 @@ func toString(value any) string {
 	return string(encoded)
 }
 
-func responseAudioSSEClient(c *gin.Context, response *http.Response, protocol audioSSEProtocol, operation providerresponse.Operation, observers ...func([]byte)) (time.Time, *types.OpenAIErrorWithStatusCode) {
+func responseNativeSSEClient(c *gin.Context, response *http.Response, operation providerresponse.Operation, observers ...func([]byte)) (time.Time, *types.OpenAIErrorWithStatusCode) {
 	if response == nil || response.Body == nil {
-		return time.Time{}, common.StringErrorWrapperLocal("provider audio stream response is missing", "invalid_provider_response", http.StatusBadGateway)
+		return time.Time{}, common.StringErrorWrapperLocal("provider stream response is missing", "invalid_provider_response", http.StatusBadGateway)
 	}
 	c.Set(requestctx.ProviderResponseHeadersContextKey, providerresponse.Filter(response.Header, providerresponse.Policy{
 		Operation:      operation,
@@ -176,18 +145,21 @@ func responseAudioSSEClient(c *gin.Context, response *http.Response, protocol au
 		BodyUnmodified: false,
 	}))
 	c.Set(requestctx.ProviderResponseStatusContextKey, response.StatusCode)
-	handler := newAudioSSEHandler(protocol, observers...)
+	handler := newNativeSSEHandler(observers...)
 	handler.credentials = providerresponse.RequestCredentials(response.Request)
 	stream, apiErr := requester.RequestNoTrimStreamWithEmitterOptions[string](nil, response, handler.Handle, requester.StreamReadOptions{
-		MaxLineBytes:            audioSSEMaxEventBytes,
-		RequireProtocolTerminal: true,
+		MaxLineBytes: nativeSSEMaxEventBytes,
+		SSELines:     true,
 	})
 	if apiErr != nil {
 		return time.Time{}, apiErr
 	}
 	firstResponse, streamErr := responseGeneralStreamClientWithObserverResult(c, stream, nil, nil, nil, false)
 	if streamErr == nil {
-		return firstResponse, nil
+		if handler.errorSeen {
+			c.Set(streamErrorAlreadyRenderedContextKey, true)
+		}
+		return firstResponse, handler.providerError
 	}
 	if handler.errorSeen {
 		c.Set(streamErrorAlreadyRenderedContextKey, true)

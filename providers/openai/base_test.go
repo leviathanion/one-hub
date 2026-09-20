@@ -306,11 +306,11 @@ func TestBuildRawRelayURLKeepsProviderURLSemantics(t *testing.T) {
 	}
 }
 
-func TestBuildRawRelayURLRejectsUnsupportedCapabilityAndInvalidPath(t *testing.T) {
+func TestBuildRawRelayURLRejectsDisabledCustomEndpointAndInvalidPath(t *testing.T) {
 	proxy := ""
 	custom := CreateOpenAIProvider(&model.Channel{Plugin: model.NewCustomEndpointPlugin(), Type: config.ChannelTypeCustom, Proxy: &proxy}, "https://custom.example")
 	if _, err := custom.BuildRawRelayURL("/v1/files", ""); err == nil {
-		t.Fatal("expected a channel without raw relay capability to be rejected")
+		t.Fatal("expected a disabled custom resource endpoint to be rejected")
 	}
 
 	official := CreateOpenAIProvider(&model.Channel{Type: config.ChannelTypeOpenAI, Proxy: &proxy}, "https://api.openai.example")

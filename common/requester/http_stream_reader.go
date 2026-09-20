@@ -237,6 +237,7 @@ func (stream *streamReader[T]) readLine() ([]byte, error) {
 }
 
 // readSSELine 不等待 CR 后的下一字节，避免 CR-only 事件被缓冲至 EOF。
+// 跨读取的 CRLF 会分两次返回；SSEEventFramer 将后到 LF 识别为分隔符续字节。
 func (stream *streamReader[T]) readSSELine() ([]byte, error) {
 	var line []byte
 	for {

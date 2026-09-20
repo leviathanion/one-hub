@@ -53,7 +53,7 @@ func TestReadinessStatusDatabaseAndRedisBranches(t *testing.T) {
 	if ready || data.Database != "unavailable" {
 		t.Fatalf("expected database without response owner schema to stay unready, data=%+v ready=%v", data, ready)
 	}
-	if err := testDB.AutoMigrate(&model.ResponseOwner{}, &model.Task{}, &model.Price{}, &model.ModelInfo{}, &model.Option{}, &model.UserGroup{}, &model.PublicationVersion{}, &model.User{}, &model.Payment{}, &model.Order{}, &model.Redemption{}); err != nil {
+	if err := testDB.AutoMigrate(&model.ResponseOwner{}, &model.ResourceOwner{}, &model.Task{}, &model.Price{}, &model.ModelInfo{}, &model.Option{}, &model.UserGroup{}, &model.PublicationVersion{}, &model.User{}, &model.Payment{}, &model.Order{}, &model.Redemption{}); err != nil {
 		t.Fatalf("migrate durable owner readiness schema: %v", err)
 	}
 	if err := model.EnsurePublicationVersionRows(testDB); err != nil {

@@ -8,12 +8,14 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/providerendpoint"
 	"one-api/common/providerresponse"
+	"one-api/common/requestctx"
 	"one-api/common/requester"
 	commonresponses "one-api/common/responses"
 	"one-api/common/utils"
@@ -301,8 +303,8 @@ func (p *OpenAIProvider) CountResponsesInputTokens(ctx context.Context, rawReq *
 }
 
 func (p *OpenAIProvider) RelayStoredResponse(ctx context.Context, input providersBase.StoredResponsesRequest) (*http.Response, *types.OpenAIErrorWithStatusCode) {
-	responseID := strings.TrimSpace(input.ResponseID)
-	if responseID == "" {
+	responseID := input.ResponseID
+	if strings.TrimSpace(responseID) == "" {
 		return nil, common.StringErrorWrapperLocal("response id is required", "invalid_request_error", http.StatusBadRequest)
 	}
 	basePath, errWithCode := p.GetSupportedAPIUri(config.RelayModeResponses)
@@ -323,6 +325,12 @@ func (p *OpenAIProvider) RelayStoredResponse(ctx context.Context, input provider
 		method = http.MethodGet
 	case providersBase.OperationResponsesDelete:
 		method = http.MethodDelete
+	case providersBase.OperationResponsesCancel:
+		method = http.MethodPost
+		requestPath, err = appendURLPathSegment(requestPath, "cancel")
+		if err != nil {
+			return nil, common.ErrorWrapperLocal(err, "invalid_channel_config", http.StatusInternalServerError)
+		}
 	case providersBase.OperationResponsesInputItems:
 		method = http.MethodGet
 		requestPath, err = appendURLPathSegment(requestPath, "input_items")
@@ -339,7 +347,7 @@ func (p *OpenAIProvider) RelayStoredResponse(ctx context.Context, input provider
 
 	headers := p.GetRequestHeaders()
 	requestURL := p.GetFullRequestURL(requestPath, "")
-	httpReq, err := p.Requester.NewRequest(method, requestURL, p.Requester.WithHeader(headers))
+	httpReq, err := p.Requester.NewRequest(method, requestURL, p.Requester.WithHeader(headers), p.Requester.WithBody(input.Body))
 	if err != nil {
 		return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
 	}
@@ -354,11 +362,15 @@ func (p *OpenAIProvider) RelayStoredResponse(ctx context.Context, input provider
 	if ctx != nil {
 		httpReq = p.Requester.WithRequestContext(httpReq, ctx)
 	}
+	httpRequester := p.Requester
+	if input.Operation == providersBase.OperationResponsesRetrieve && httpReq.URL.Query().Get("stream") == "true" {
+		httpRequester = p.Requester.ForHTTPProfile(requester.HTTPProfileLongStream)
+	}
 	var response *http.Response
 	if p.ProviderRawJSONReplay {
-		response, errWithCode = p.Requester.SendRequestRawCheckedPreservingRedirect(httpReq, input.Operation)
+		response, errWithCode = httpRequester.SendRequestRawCheckedPreservingRedirect(httpReq, input.Operation)
 	} else {
-		response, errWithCode = p.Requester.SendRequestRawCheckedNoRedirect(httpReq)
+		response, errWithCode = httpRequester.SendRequestRawCheckedNoRedirect(httpReq)
 	}
 	if response != nil {
 		p.captureProviderResponseHeaders(response)
@@ -398,7 +410,11 @@ func (p *OpenAIProvider) buildResponsesCreateRequest(rawReq *commonresponses.Req
 		return nil, errWithCode
 	}
 
-	req, err := p.Requester.NewRequest(http.MethodPost, fullRequestURL, p.Requester.WithBody(bodyMap), p.Requester.WithHeader(headers))
+	bodyWire, bodyErr := responsesWireBody(rawReq, bodyMap)
+	if bodyErr != nil {
+		return nil, common.ErrorWrapperLocal(bodyErr, "encode_request_failed", http.StatusInternalServerError)
+	}
+	req, err := p.Requester.NewRequest(http.MethodPost, fullRequestURL, p.Requester.WithBody(bodyWire), p.Requester.WithHeader(headers))
 	if err != nil {
 		return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
 	}
@@ -448,8 +464,10 @@ func (p *OpenAIProvider) buildResponsesCreateBody(rawReq *commonresponses.Reques
 	if stream {
 		bodyMap["stream"] = true
 	}
-	if err := commonresponses.ValidateNoAccountScopedResources(bodyMap); err != nil {
-		return nil, common.StringErrorWrapperLocal(err.Error(), "unsupported_resource_reference", http.StatusBadRequest)
+	for _, ref := range commonresponses.ProtocolResourceReferences(bodyMap, "responses") {
+		if err := requestctx.AuthorizeResourceReference(p.Context, ref.Kind, ref.ID); err != nil {
+			return nil, common.StringErrorWrapperLocal(err.Error(), "unsupported_resource_reference", http.StatusBadRequest)
+		}
 	}
 	return bodyMap, nil
 }
@@ -498,8 +516,12 @@ func ValidateResponsesCustomParameterCompatibility(channel *model.Channel, field
 	if changed {
 		return &providersBase.RequestCapabilityError{Param: field, Message: "channel custom parameters cannot modify Responses lifecycle fields"}
 	}
-	if err := commonresponses.ValidateNoAccountScopedResources(bodyMap); err != nil {
-		return &providersBase.RequestCapabilityError{Param: "custom_parameter", Message: err.Error()}
+	for _, ref := range commonresponses.ProtocolResourceReferences(bodyMap, "responses") {
+		switch ref.Kind {
+		case "file", "conversation":
+			continue
+		}
+		return &providersBase.RequestCapabilityError{Param: ref.Path, Message: "resource ownership is not implemented for " + ref.Kind}
 	}
 	return nil
 }
@@ -985,4 +1007,43 @@ func getResponsesExtraBilling(response *types.OpenAIResponsesResponses, usage *t
 		return
 	}
 	types.ApplyResponsesExtraBilling(response, usage)
+}
+
+// ObserveStoredResponsesUsage applies the same provider-originated evidence
+// contract to a retrieved/cancelled background response as to its create reply.
+// Callers must first correlate response.ID to their durable work owner.
+func ObserveStoredResponsesUsage(response *types.OpenAIResponsesResponses, usage *types.Usage) {
+	if response == nil || usage == nil {
+		return
+	}
+	if response.Usage != nil {
+		response.Usage.MarkProviderReported()
+	}
+	commonresponses.ApplyResponsesUsage(usage, response)
+}
+
+// Patch only changed top-level values. Unknown subtrees and an unchanged body
+// keep their original JSON representation, including number spellings.
+func responsesWireBody(request *commonresponses.Request, effective map[string]interface{}) ([]byte, error) {
+	if request == nil || request.Body == nil || request.Body.Object == nil {
+		return json.Marshal(effective)
+	}
+	before, err := rawResponsesBodyMap(request)
+	if err != nil {
+		return nil, err
+	}
+	object := request.Body.Object.Clone()
+	for key := range before {
+		if _, exists := effective[key]; !exists {
+			object.Delete(key)
+		}
+	}
+	for key, value := range effective {
+		if old, exists := before[key]; !exists || !reflect.DeepEqual(old, value) {
+			if err := object.SetJSON(key, value); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return object.MarshalJSON()
 }

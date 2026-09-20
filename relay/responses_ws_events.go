@@ -19,17 +19,16 @@ const (
 )
 
 const (
-	responsesWSEventQueueSize           = 128
-	responsesWSSendQueueSize            = 64
-	responsesWSPendingProviderEventsMax = 32
-	responsesWSRecentResponseIDLimit    = 16
-	responsesWSQueuedCreateMaxFrames    = 16
-	responsesWSQueuedCreateMaxBytes     = 4 << 20
-	responsesWSInjectMaxPending         = 64
-	responsesWSInjectMaxDeferredBytes   = 4 << 20
-	responsesWSSendQueueMaxBytes        = 32 << 20
-	responsesWSEventQueueMaxBytes       = 64 << 20
-	responsesWSConnectionSessionIDKey   = "responses_ws_connection_session_id"
+	responsesWSEventQueueSize         = 128
+	responsesWSSendQueueSize          = 64
+	responsesWSRecentResponseIDLimit  = 16
+	responsesWSQueuedCreateMaxFrames  = 16
+	responsesWSQueuedCreateMaxBytes   = 4 << 20
+	responsesWSInjectMaxPending       = 64
+	responsesWSInjectMaxDeferredBytes = 4 << 20
+	responsesWSSendQueueMaxBytes      = 32 << 20
+	responsesWSEventQueueMaxBytes     = 64 << 20
+	responsesWSConnectionSessionIDKey = "responses_ws_connection_session_id"
 )
 
 const (
@@ -39,10 +38,6 @@ const (
 	// exposes only data-frame message types, so provider close forwarding stays
 	// local to ResponsesWS instead of widening the transport API.
 	responsesWSCloseMessageType = 8
-)
-
-const (
-	responsesWSActiveTurnTimeoutReason = "responses_ws_active_turn_timeout"
 )
 
 var (
@@ -218,27 +213,6 @@ type ResponsesWSEventCloseIntent struct {
 }
 
 func (ResponsesWSEventCloseIntent) responsesWSEvent() {}
-
-type responsesWSProviderAccountingEventProjection struct {
-	UpstreamEvent               responsesws.UpstreamEvent
-	HasProviderActivityEvidence bool
-}
-
-func projectResponsesWSProviderDownstreamAccountingEvent(event ResponsesWSEventProviderDownstream) responsesWSProviderAccountingEventProjection {
-	return projectResponsesWSUpstreamAccountingEvent(upstreamEventFromProviderDownstream(event))
-}
-
-func projectResponsesWSProviderUsageAccountingEvent(event ResponsesWSEventProviderUsageObserved) responsesWSProviderAccountingEventProjection {
-	return projectResponsesWSUpstreamAccountingEvent(upstreamEventFromProviderUsage(event))
-}
-
-func projectResponsesWSUpstreamAccountingEvent(event responsesws.UpstreamEvent) responsesWSProviderAccountingEventProjection {
-	projected := responsesws.ProjectProviderObservationForSettlement(responsesws.NewProviderObservation(event))
-	return responsesWSProviderAccountingEventProjection{
-		UpstreamEvent:               event,
-		HasProviderActivityEvidence: projected.HasProviderActivity,
-	}
-}
 
 func responsesWSEventPayloadBytes(event ResponsesWSEvent) int {
 	switch typed := event.(type) {

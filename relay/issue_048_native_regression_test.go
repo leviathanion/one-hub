@@ -193,9 +193,7 @@ func newIssue048NativeRelayHarnessWithClientGateAt(t *testing.T, providerFactory
 	actor.SetClientConn(userServer)
 	generation := actor.AttachUpstreamSession(session, 17)
 	attempt.Session = session
-	actor.turns.active.attempt = attempt
-	actor.turns.active.affinity = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
-	actor.turns.active.channelID = 17
+	registerResponsesWSTestWork(t, actor, attempt, "")
 	actor.state = responsesWSStateInFlight
 
 	harness := &issue048NativeRelayHarness{
@@ -406,8 +404,8 @@ func TestIssue048NativeResponsesWSSearchDoneReachesSQLAcrossFactories(t *testing
 			t.Run(search.name+"/"+factory.name, func(t *testing.T) {
 				payloads := [][]byte{
 					[]byte(`{"type":"response.created","response":{"id":"resp-i048","model":"native-actual","service_tier":"priority","status":"in_progress","tools":[{"type":"` + search.service + `","search_context_size":"medium"}]}}`),
-					[]byte(`{"type":"response.output_item.done","event_id":"evt-i048-search","output_index":0,"item":{"id":"search-i048","type":"web_search_call","status":"completed","action":{"type":"search"}}}`),
-					[]byte(`{"type":"response.output_item.done","event_id":"evt-i048-search-duplicate","output_index":0,"item":{"id":"search-i048","type":"web_search_call","status":"completed","action":{"type":"search"}}}`),
+					[]byte(`{"type":"response.output_item.done","response_id":"resp-i048","event_id":"evt-i048-search","output_index":0,"item":{"id":"search-i048","type":"web_search_call","status":"completed","action":{"type":"search"}}}`),
+					[]byte(`{"type":"response.output_item.done","response_id":"resp-i048","event_id":"evt-i048-search-duplicate","output_index":0,"item":{"id":"search-i048","type":"web_search_call","status":"completed","action":{"type":"search"}}}`),
 				}
 				harness := newIssue048NativeRelayHarness(t, factory.factory, payloads, true)
 				issue048WaitNativeRelayDone(t, harness)
@@ -428,7 +426,7 @@ func TestIssue048NativeResponsesWSSearchTerminalUsageDoesNotDoubleCharge(t *test
 		t.Run(factory.name, func(t *testing.T) {
 			payloads := [][]byte{
 				[]byte(`{"type":"response.created","response":{"id":"resp-i048-token","status":"in_progress","tools":[{"type":"web_search_preview","search_context_size":"medium"}]}}`),
-				[]byte(`{"type":"response.output_item.done","event_id":"evt-i048-token-search","output_index":0,"item":{"id":"search-i048-token","type":"web_search_call","status":"completed","action":{"type":"search"}}}`),
+				[]byte(`{"type":"response.output_item.done","response_id":"resp-i048-token","event_id":"evt-i048-token-search","output_index":0,"item":{"id":"search-i048-token","type":"web_search_call","status":"completed","action":{"type":"search"}}}`),
 				[]byte(`{"type":"response.completed","sequence_number":2,"response":{"id":"resp-i048-token","status":"completed","usage":{"input_tokens":30,"output_tokens":2,"total_tokens":32},"tools":[{"type":"web_search_preview","search_context_size":"medium"}],"output":[{"id":"search-i048-token","type":"web_search_call","status":"completed","action":{"type":"search"}}]}}`),
 			}
 			harness := newIssue048NativeRelayHarness(t, factory.factory, payloads, true)
@@ -447,7 +445,7 @@ func TestIssue048NativeResponsesWSImageTerminalWithoutTokensUsesOneUnit(t *testi
 		t.Run(factory.name, func(t *testing.T) {
 			payloads := [][]byte{
 				[]byte(`{"type":"response.created","response":{"id":"resp-i048-image","status":"in_progress","tools":[{"type":"image_generation","model":"gpt-image-1-mini","quality":"medium","size":"1024x1024"}]}}`),
-				[]byte(`{"type":"response.output_item.done","event_id":"evt-i048-image","output_index":0,"item":{"id":"image-i048","type":"image_generation_call","status":"completed","quality":"medium","size":"1024x1024"}}`),
+				[]byte(`{"type":"response.output_item.done","response_id":"resp-i048-image","event_id":"evt-i048-image","output_index":0,"item":{"id":"image-i048","type":"image_generation_call","status":"completed","quality":"medium","size":"1024x1024"}}`),
 				[]byte(`{"type":"response.completed","sequence_number":2,"response":{"id":"resp-i048-image","status":"completed","tools":[{"type":"image_generation","model":"gpt-image-1-mini","quality":"medium","size":"1024x1024"}],"output":[{"id":"image-i048","type":"image_generation_call","status":"completed","quality":"medium","size":"1024x1024"}]}}`),
 			}
 			harness := newIssue048NativeRelayHarness(t, factory.factory, payloads, true)
@@ -463,7 +461,7 @@ func TestIssue048NativeResponsesWSUnknownToolAndDuplicateCloseStayUnbilled(t *te
 		t.Run(factory.name, func(t *testing.T) {
 			payloads := [][]byte{
 				[]byte(`{"type":"response.created","response":{"id":"resp-i048-unknown","status":"in_progress","tools":[{"type":"future_hosted_tool"}]}}`),
-				[]byte(`{"type":"response.output_item.done","event_id":"evt-i048-unknown","output_index":0,"item":{"id":"unknown-i048","type":"future_hosted_call","status":"completed"}}`),
+				[]byte(`{"type":"response.output_item.done","response_id":"resp-i048-unknown","event_id":"evt-i048-unknown","output_index":0,"item":{"id":"unknown-i048","type":"future_hosted_call","status":"completed"}}`),
 			}
 			harness := newIssue048NativeRelayHarness(t, factory.factory, payloads, true)
 			issue048WaitNativeRelayDone(t, harness)
@@ -494,7 +492,7 @@ func TestIssue048NativeResponsesWSClientAbortKeepsAcceptedSearch(t *testing.T) {
 		t.Run(factory.name, func(t *testing.T) {
 			payloads := [][]byte{
 				[]byte(`{"type":"response.created","response":{"id":"resp-i048-abort","status":"in_progress","tools":[{"type":"web_search_preview","search_context_size":"medium"}]}}`),
-				[]byte(`{"type":"response.output_item.done","event_id":"evt-i048-abort","output_index":0,"item":{"id":"search-i048-abort","type":"web_search_call","status":"completed","action":{"type":"search"}}}`),
+				[]byte(`{"type":"response.output_item.done","response_id":"resp-i048-abort","event_id":"evt-i048-abort","output_index":0,"item":{"id":"search-i048-abort","type":"web_search_call","status":"completed","action":{"type":"search"}}}`),
 			}
 			harness := newIssue048NativeRelayHarness(t, factory.factory, payloads, false)
 			key := types.BuildExtraBillingKey(types.APIToolTypeWebSearchPreview, "medium")
@@ -511,8 +509,8 @@ func TestIssue048NativeResponsesWSInjectKeepsSearchOwnerAndDeduplicates(t *testi
 		t.Run(factory.name, func(t *testing.T) {
 			payloads := [][]byte{
 				[]byte(`{"type":"response.created","response":{"id":"resp-i048-inject","model":"native-inject-model","service_tier":"priority","status":"in_progress","tools":[{"type":"web_search_preview","search_context_size":"low"}]}}`),
-				[]byte(`{"type":"response.output_item.done","event_id":"evt-i048-inject-search","output_index":0,"item":{"id":"search-i048-inject","type":"web_search_call","status":"completed","action":{"type":"search"}}}`),
-				[]byte(`{"type":"response.output_item.done","event_id":"evt-i048-inject-duplicate","output_index":0,"item":{"id":"search-i048-inject","type":"web_search_call","status":"completed","action":{"type":"search"}}}`),
+				[]byte(`{"type":"response.output_item.done","response_id":"resp-i048-inject","event_id":"evt-i048-inject-search","output_index":0,"item":{"id":"search-i048-inject","type":"web_search_call","status":"completed","action":{"type":"search"}}}`),
+				[]byte(`{"type":"response.output_item.done","response_id":"resp-i048-inject","event_id":"evt-i048-inject-duplicate","output_index":0,"item":{"id":"search-i048-inject","type":"web_search_call","status":"completed","action":{"type":"search"}}}`),
 			}
 			inject := []byte(`{"type":"response.inject","event_id":"evt-i048-inject-client","response_id":"resp-i048-inject","input":[{"type":"function_call_output","call_id":"call-i048-inject","output":"ok"}]}`)
 			harness := newIssue048NativeRelayHarnessWithClientGate(t, factory.factory, payloads, true, []byte(`"type":"response.inject"`), true)
@@ -535,9 +533,9 @@ func TestIssue048NativeResponsesWSRepeatedCreatedKeepsOwnerTracker(t *testing.T)
 		t.Run(factory.name, func(t *testing.T) {
 			payloads := [][]byte{
 				[]byte(`{"type":"response.created","response":{"id":"resp-i048-created-same","model":"native-created-model","service_tier":"priority","status":"in_progress","tools":[{"type":"web_search_preview","search_context_size":"low"}]}}`),
-				[]byte(`{"type":"response.output_item.done","event_id":"evt-i048-created-first","output_index":0,"item":{"id":"search-i048-created","type":"web_search_call","status":"completed","action":{"type":"search"}}}`),
+				[]byte(`{"type":"response.output_item.done","response_id":"resp-i048-created-same","event_id":"evt-i048-created-first","output_index":0,"item":{"id":"search-i048-created","type":"web_search_call","status":"completed","action":{"type":"search"}}}`),
 				[]byte(`{"type":"response.created","response":{"id":"resp-i048-created-same","model":"native-created-model","service_tier":"priority","status":"in_progress","tools":[{"type":"web_search_preview","search_context_size":"low"}]}}`),
-				[]byte(`{"type":"response.output_item.done","event_id":"evt-i048-created-duplicate","output_index":0,"item":{"id":"search-i048-created","type":"web_search_call","status":"completed","action":{"type":"search"}}}`),
+				[]byte(`{"type":"response.output_item.done","response_id":"resp-i048-created-same","event_id":"evt-i048-created-duplicate","output_index":0,"item":{"id":"search-i048-created","type":"web_search_call","status":"completed","action":{"type":"search"}}}`),
 			}
 			harness := newIssue048NativeRelayHarness(t, factory.factory, payloads, true)
 			issue048WaitNativeRelayDone(t, harness)
@@ -552,9 +550,9 @@ func TestIssue048NativeResponsesWSNewCreatedResetsItemTracker(t *testing.T) {
 		t.Run(factory.name, func(t *testing.T) {
 			payloads := [][]byte{
 				[]byte(`{"type":"response.created","response":{"id":"resp-i048-created-one","model":"native-created-model","service_tier":"priority","status":"in_progress","tools":[{"type":"web_search_preview","search_context_size":"low"}]}}`),
-				[]byte(`{"type":"response.output_item.done","event_id":"evt-i048-created-one","output_index":0,"item":{"id":"search-i048-reused","type":"web_search_call","status":"completed","action":{"type":"search"}}}`),
+				[]byte(`{"type":"response.output_item.done","response_id":"resp-i048-created-one","event_id":"evt-i048-created-one","output_index":0,"item":{"id":"search-i048-reused","type":"web_search_call","status":"completed","action":{"type":"search"}}}`),
 				[]byte(`{"type":"response.created","response":{"id":"resp-i048-created-two","model":"native-created-model","service_tier":"priority","status":"in_progress","tools":[{"type":"web_search_preview","search_context_size":"low"}]}}`),
-				[]byte(`{"type":"response.output_item.done","event_id":"evt-i048-created-two","output_index":0,"item":{"id":"search-i048-reused","type":"web_search_call","status":"completed","action":{"type":"search"}}}`),
+				[]byte(`{"type":"response.output_item.done","response_id":"resp-i048-created-two","event_id":"evt-i048-created-two","output_index":0,"item":{"id":"search-i048-reused","type":"web_search_call","status":"completed","action":{"type":"search"}}}`),
 			}
 			usage := issue048CollectNativeProviderUsage(t, factory.factory, payloads)
 			key := types.BuildExtraBillingKey(types.APIToolTypeWebSearchPreview, "low")
@@ -568,10 +566,10 @@ func TestIssue048NativeResponsesWSTwoClientTurnsReuseItemIDAndSettleSeparately(t
 	factory := issue048NativeProviderFactories()[0]
 	payloads := [][]byte{
 		[]byte(`{"type":"response.created","response":{"id":"resp-i048-turn-one","status":"in_progress","tools":[{"type":"web_search_preview","search_context_size":"medium"}]}}`),
-		[]byte(`{"type":"response.output_item.done","event_id":"evt-i048-turn-one-search","output_index":0,"item":{"id":"search-i048-two-turn","type":"web_search_call","status":"completed","action":{"type":"search"}}}`),
+		[]byte(`{"type":"response.output_item.done","response_id":"resp-i048-turn-one","event_id":"evt-i048-turn-one-search","output_index":0,"item":{"id":"search-i048-two-turn","type":"web_search_call","status":"completed","action":{"type":"search"}}}`),
 		[]byte(`{"type":"response.completed","sequence_number":2,"response":{"id":"resp-i048-turn-one","status":"completed","output":[{"id":"search-i048-two-turn","type":"web_search_call","status":"completed","action":{"type":"search"}}]}}`),
 		[]byte(`{"type":"response.created","response":{"id":"resp-i048-turn-two","status":"in_progress","tools":[{"type":"web_search_preview","search_context_size":"medium"}]}}`),
-		[]byte(`{"type":"response.output_item.done","event_id":"evt-i048-turn-two-search","output_index":0,"item":{"id":"search-i048-two-turn","type":"web_search_call","status":"completed","action":{"type":"search"}}}`),
+		[]byte(`{"type":"response.output_item.done","response_id":"resp-i048-turn-two","event_id":"evt-i048-turn-two-search","output_index":0,"item":{"id":"search-i048-two-turn","type":"web_search_call","status":"completed","action":{"type":"search"}}}`),
 		[]byte(`{"type":"response.completed","sequence_number":2,"response":{"id":"resp-i048-turn-two","status":"completed","output":[{"id":"search-i048-two-turn","type":"web_search_call","status":"completed","action":{"type":"search"}}]}}`),
 	}
 	harness := newIssue048NativeRelayHarnessWithClientGateAt(t, factory.factory, payloads, true, []byte(`"event_id":"create-i048-turn-two"`), 3, false)
@@ -594,24 +592,28 @@ func TestIssue048NativeResponsesWSTwoClientTurnsReuseItemIDAndSettleSeparately(t
 	if len(logs) != 2 || logs[0].Quota != 5000 || logs[1].Quota != 5000 {
 		t.Fatalf("expected two independent 5000 SQL settlements for reused item ID, logs=%+v", logs)
 	}
-	if !harness.actor.isRecentlyFinalizedResponseID("resp-i048-turn-two") {
-		t.Fatalf("second native response did not become the final turn: %+v", harness.actor.turns.history.recentFinalizedResponseIDs)
+	if len(harness.actor.observation.works) != 0 {
+		t.Fatalf("completed responses retained work observations: %d", len(harness.actor.observation.works))
 	}
 }
 
-func TestIssue048NativeResponsesWSForeignResponseIDIsRejectedByActiveAttempt(t *testing.T) {
+func TestIssue048NativeResponsesWSUnknownResponsePreservesWireWithoutChangingKnownOwner(t *testing.T) {
 	factory := issue048NativeProviderFactories()[0]
 	payloads := [][]byte{
 		[]byte(`{"type":"response.created","response":{"id":"resp-i048-owner","status":"in_progress","tools":[{"type":"web_search_preview","search_context_size":"medium"}]}}`),
 		[]byte(`{"type":"response.created","response":{"id":"resp-i048-foreign","status":"in_progress","tools":[{"type":"web_search_preview","search_context_size":"medium"}]}}`),
+		[]byte(`{"type":"response.completed","response":{"id":"resp-i048-foreign","status":"completed","usage":{"input_tokens":99,"output_tokens":99,"total_tokens":198}}}`),
 	}
-	harness := newIssue048NativeRelayHarness(t, factory.factory, payloads, true)
+	harness := newIssue048NativeRelayHarness(t, factory.factory, payloads, false)
+	issue048WaitNativeFrame(t, harness, payloads[2])
+	issue039WaitDeliveredEventCompletion(t, harness.actor)
+	if harness.actor.closing.closed.Load() {
+		t.Fatal("unknown billing identity closed a valid provider connection")
+	}
+	if harness.attempt.SeenProviderResponseID != "resp-i048-owner" || harness.attempt.Usage.PromptTokens != 0 {
+		t.Fatalf("unassociated response replaced or charged the known owner: %+v", harness.attempt)
+	}
+	harness.userClient.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Code: wsconn.CloseAbnormalClosure, Reason: "client_abort", Err: context.Canceled})
 	issue048WaitNativeRelayDone(t, harness)
-	if !harness.actor.closing.closed.Load() {
-		t.Fatal("foreign provider response ID did not close the active Responses WS turn")
-	}
-	if harness.attempt.SeenProviderResponseID != "resp-i048-owner" {
-		t.Fatalf("foreign response ID replaced the active owner: %q", harness.attempt.SeenProviderResponseID)
-	}
 	issue048AssertNativeNoCharge(t, harness.attempt)
 }

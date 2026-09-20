@@ -1,7 +1,6 @@
 package relay
 
 import (
-	"errors"
 	"net/http"
 	"one-api/common"
 	"one-api/common/config"
@@ -26,10 +25,7 @@ func (r *relayImageEdits) setRequest() error {
 	if err := common.UnmarshalBodyReusable(r.c, &r.request); err != nil {
 		return err
 	}
-	if r.request.Prompt == "" {
-		return errors.New("field prompt is required")
-	}
-	if err := rejectImageStreamRequest(r.c); err != nil {
+	if err := prepareImageRequest(r.c); err != nil {
 		return err
 	}
 
@@ -42,16 +38,26 @@ func (r *relayImageEdits) setRequest() error {
 	}
 
 	r.setOriginalModel(r.request.Model)
-	setRequestChannelCapability(r.c, requireEndpointEnabled(config.RelayModeImagesEdits))
+	setRequestChannelCapability(r.c, requireImageEndpoint(r.c, config.RelayModeImagesEdits))
 
 	return nil
 }
+
+func (r *relayImageEdits) IsStream() bool { return imageStreamIntent(r.c) }
 
 func (r *relayImageEdits) getPromptTokens() (int, error) {
 	return common.CountTokenImage(r.request)
 }
 
 func (r *relayImageEdits) send() (err *types.OpenAIErrorWithStatusCode, done bool) {
+	r.request.Model = r.modelName
+	if provider, ok := r.provider.(providersBase.ImageEditsResponseInterface); ok && provider.SupportsImageResponse() {
+		response, apiErr := provider.CreateImageEditsResponse(&r.request)
+		if apiErr != nil {
+			return apiErr, apiErr.UpstreamAccepted || apiErr.UpstreamAmbiguous
+		}
+		return r.responseImageClient(response), true
+	}
 	provider, ok := r.provider.(providersBase.ImageEditsInterface)
 	if !ok {
 		err = common.StringErrorWrapperLocal("channel not implemented", "channel_error", http.StatusServiceUnavailable)

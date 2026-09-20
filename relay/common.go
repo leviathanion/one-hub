@@ -116,6 +116,9 @@ func checkLimitModel(c *gin.Context, modelName string) (error error) {
 }
 
 func GetProvider(c *gin.Context, modelName string) (provider providersBase.ProviderInterface, newModelName string, fail error) {
+	if ownerChannel := c.GetInt(relay_util.ResourceOwnerChannelKey); ownerChannel > 0 {
+		return GetProviderForOwnerChannel(c, modelName, ownerChannel)
+	}
 	// 检查模型限制
 	if modelName != "" {
 		if err := checkLimitModel(c, modelName); err != nil {
@@ -150,6 +153,9 @@ func GetProviderForOwnerChannel(c *gin.Context, modelName string, channelID int)
 	channel, err := fetchOwnerChannelById(c.Request.Context(), channelID)
 	if err != nil {
 		return nil, "", err
+	}
+	if (middleware.IsAuthenticatedLongLivedPrincipal(c) || c.GetInt(relay_util.ResourceOwnerChannelKey) > 0) && (channel.Status != config.ChannelStatusEnabled || channel.DeletedAt.Valid) {
+		return nil, "", errors.New("owner channel is not available for new work")
 	}
 	if apiErr := middleware.AdmitAuthenticatedChannelWork(c, modelName, channelID); apiErr != nil {
 		return nil, "", apiErr

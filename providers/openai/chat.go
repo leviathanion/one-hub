@@ -3,6 +3,7 @@ package openai
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"one-api/common"
@@ -29,7 +30,9 @@ type OpenAIStreamHandler struct {
 	// temporarily enables provider-side usage for settlement evidence.
 	ExposeProviderUsage bool
 
-	sseFramer *requester.SSEEventFramer
+	sseFramer          *requester.SSEEventFramer
+	hideProviderUsage  bool
+	beforeChatDelivery func([]byte) error
 }
 
 func (p *OpenAIProvider) CreateChatCompletion(request *types.ChatCompletionRequest) (openaiResponse *types.ChatCompletionResponse, errWithCode *types.OpenAIErrorWithStatusCode) {
@@ -48,6 +51,10 @@ func (p *OpenAIProvider) CreateChatCompletion(request *types.ChatCompletionReque
 		return nil, errWithCode
 	}
 	defer req.Body.Close()
+	commitChatResources, errWithCode := p.chatResourceRequestCommit(req)
+	if errWithCode != nil {
+		return nil, errWithCode
+	}
 
 	response := &OpenAIProviderChatResponse{}
 	captureSameDialect := p.ProviderRawJSONReplay || p.usesNativeOpenAIWire()
@@ -104,6 +111,16 @@ func (p *OpenAIProvider) CreateChatCompletion(request *types.ChatCompletionReque
 		bodyUnmodified = len(originalRaw) > 0 && bytes.Equal(originalRaw, replay)
 	}
 	p.captureProviderResponseHeaders(httpResponse, bodyUnmodified)
+	if commitChatResources != nil {
+		if err := commitChatResources(response.ProviderRawJSON()); err != nil {
+			var apiErr *types.OpenAIErrorWithStatusCode
+			if !errors.As(err, &apiErr) {
+				apiErr = common.ErrorWrapperLocal(err, "resource_owner_commit_failed", http.StatusServiceUnavailable)
+				apiErr.UpstreamAccepted = true
+			}
+			return nil, apiErr
+		}
+	}
 
 	return &response.ChatCompletionResponse, nil
 }
@@ -150,6 +167,21 @@ func safeCompatibleChatResponseReplay(raw []byte, response *types.ChatCompletion
 }
 
 func (p *OpenAIProvider) CreateChatCompletionStream(request *types.ChatCompletionRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+	return p.createChatCompletionStream(request, false)
+}
+
+func (p *OpenAIProvider) SupportsChatStreamConversion() bool {
+	return p.usesNativeOpenAIWire() && !p.StreamEscapeJSON
+}
+
+func (p *OpenAIProvider) CreateChatCompletionStreamForConversion(request *types.ChatCompletionRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+	if !p.SupportsChatStreamConversion() {
+		return nil, common.StringErrorWrapperLocal("selected adapter does not implement native Chat stream conversion", "unsupported_capability", http.StatusBadRequest)
+	}
+	return p.createChatCompletionStream(request, true)
+}
+
+func (p *OpenAIProvider) createChatCompletionStream(request *types.ChatCompletionRequest, forConversion bool) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
 	if err := p.validateChatRequestPolicy(request); err != nil {
 		return nil, common.StringErrorWrapperLocal(err.Error(), "chat_search_billing_evidence_unavailable", http.StatusBadRequest)
 	}
@@ -184,6 +216,10 @@ func (p *OpenAIProvider) CreateChatCompletionStream(request *types.ChatCompletio
 		return nil, errWithCode
 	}
 	defer req.Body.Close()
+	commitChatResources, errWithCode := p.chatResourceRequestCommit(req)
+	if errWithCode != nil {
+		return nil, errWithCode
+	}
 
 	// 发送请求
 	streamRequester := p.Requester.ForHTTPProfile(requester.HTTPProfileLongStream)
@@ -205,12 +241,18 @@ func (p *OpenAIProvider) CreateChatCompletionStream(request *types.ChatCompletio
 
 		UsageHandler:        p.UsageHandler,
 		ExposeProviderUsage: streamOptions != nil && streamOptions.IncludeUsage,
+		beforeChatDelivery:  commitChatResources,
 	}
 	options := requester.StreamReadOptions{
 		RequireProtocolTerminal: p.RequireOpenAIStreamTerminal,
 	}
-	if p.ProviderRawJSONReplay {
+	if p.ProviderRawJSONReplay || (p.usesNativeOpenAIWire() && !p.StreamEscapeJSON) {
+		chatHandler.hideProviderUsage = !p.ProviderRawJSONReplay && !chatHandler.ExposeProviderUsage
 		chatHandler.sseFramer = requester.NewSSEEventFramer(openAIExactSSEMaxEventBytes)
+		if forConversion {
+			return requester.RequestRawSSEEventStreamWithEmitterOptions(streamRequester, resp, chatHandler.HandleChatConversionSSE, options)
+		}
+		options.RequireProtocolTerminal = false
 		return requester.RequestRawSSEEventStreamWithEmitterOptions(streamRequester, resp, chatHandler.HandleExactChatSSE, options)
 	}
 
@@ -278,10 +320,16 @@ func (h *OpenAIStreamHandler) HandlerChatStream(rawLine *[]byte, dataChan chan s
 // is observation-only: future or malformed provider payloads do not replace a
 // raw event that is otherwise valid at the SSE boundary.
 func (h *OpenAIStreamHandler) HandleExactChatSSE(rawLine *[]byte, emitter requester.StreamEmitter[string]) {
-	h.handleExactSSE(rawLine, emitter, h.observeExactChatStreamPayload)
+	h.handleExactSSE(rawLine, emitter, h.observeExactChatStreamPayload, false)
 }
 
-func (h *OpenAIStreamHandler) handleExactSSE(rawLine *[]byte, emitter requester.StreamEmitter[string], observe func([]byte) error) {
+// HandleChatConversionSSE is a source-protocol boundary for Chat→Responses.
+// Its terminal closes the conversion input, not a native passthrough stream.
+func (h *OpenAIStreamHandler) HandleChatConversionSSE(rawLine *[]byte, emitter requester.StreamEmitter[string]) {
+	h.handleExactSSE(rawLine, emitter, h.observeExactChatStreamPayload, true)
+}
+
+func (h *OpenAIStreamHandler) handleExactSSE(rawLine *[]byte, emitter requester.StreamEmitter[string], observe func([]byte) error, forConversion bool) {
 	if h == nil || rawLine == nil {
 		return
 	}
@@ -301,25 +349,49 @@ func (h *OpenAIStreamHandler) handleExactSSE(rawLine *[]byte, emitter requester.
 
 	safeEvent := string(event)
 	payload, hasData := commonresponses.SSEDataPayload(safeEvent)
-	if hasData && strings.TrimSpace(payload) == "[DONE]" {
-		if emitter.SendData(safeEvent) {
-			emitter.SendError(io.EOF)
+	if hasData && h.beforeChatDelivery != nil {
+		if err := h.beforeChatDelivery([]byte(payload)); err != nil {
+			*rawLine = requester.StreamClosed
+			emitter.SendError(err)
+			return
 		}
-		*rawLine = requester.StreamClosed
-		return
 	}
-
-	var providerErr error
-	if hasData && observe != nil {
-		providerErr = observe([]byte(payload))
+	var conversionTerminal error
+	if hasData && strings.TrimSpace(payload) == "[DONE]" {
+		if forConversion {
+			conversionTerminal = io.EOF
+		}
+	} else if hasData && observe != nil {
+		observedError := observe([]byte(payload))
+		if forConversion {
+			conversionTerminal = observedError
+		}
+	}
+	// Compatibility adapters may request usage that the client did not ask to
+	// receive. Preserve that existing contract only for an explicit usage-only
+	// chunk; unknown events and future choices unions remain untouched.
+	if hasData && h.hideProviderUsage && isUsageOnlySSEPayload([]byte(payload)) {
+		return
 	}
 	if !emitter.SendData(safeEvent) {
 		return
 	}
-	if providerErr != nil {
-		emitter.SendError(providerErr)
+	if conversionTerminal != nil {
 		*rawLine = requester.StreamClosed
+		emitter.SendError(conversionTerminal)
 	}
+}
+
+func isUsageOnlySSEPayload(payload []byte) bool {
+	if runtimesession.OpenAIErrorEnvelopeFromPayload(payload) != nil {
+		return false
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(payload, &fields) != nil || decodeOpenAIStreamUsage(fields["usage"]) == nil {
+		return false
+	}
+	var choices []json.RawMessage
+	return len(fields["choices"]) > 0 && json.Unmarshal(fields["choices"], &choices) == nil && len(choices) == 0
 }
 
 func (h *OpenAIStreamHandler) observeChatStreamResponse(response *OpenAIProviderChatStreamResponse) bool {

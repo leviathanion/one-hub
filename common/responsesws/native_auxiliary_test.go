@@ -9,7 +9,7 @@ import (
 	"one-api/common/wsconn/wstest"
 )
 
-func TestNativeAuxiliarySendKeepsCreateReceiveIdentity(t *testing.T) {
+func TestNativeAuxiliarySendDoesNotInventReceiveIdentity(t *testing.T) {
 	for _, auxiliary := range []string{
 		`{"type":"response.inject","response_id":"response-A","input":{"future":true}}`,
 		`{"type":"response.steer","previous_response_id":"response-B","input":[]}`,
@@ -34,7 +34,7 @@ func TestNativeAuxiliarySendKeepsCreateReceiveIdentity(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 			defer cancel()
 			event, err := session.Recv(ctx)
-			if err != nil || event.AttemptID != "create-B" || event.Frame == nil || string(event.Frame.Payload()) != payload {
+			if err != nil || event.AttemptID != "" || event.Frame == nil || string(event.Frame.Payload()) != payload {
 				t.Fatalf("auxiliary command changed B output: %+v %v", event, err)
 			}
 		})

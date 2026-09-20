@@ -30,6 +30,14 @@ func (r *relaySpeech) setRequest() error {
 		return err
 	}
 
+	raw, err := common.CacheRequestBody(r.c)
+	if err != nil {
+		return err
+	}
+	if err := authorizeMediaRequest(r.c, raw, "speech"); err != nil {
+		return err
+	}
+
 	r.setOriginalModel(r.request.Model)
 	setRequestChannelCapability(r.c, requireSpeechChannelCompatibility(r.request.Model, &r.request))
 	return nil
@@ -78,7 +86,7 @@ func (r *relaySpeech) send() (err *types.OpenAIErrorWithStatusCode, done bool) {
 		if observer, ok := provider.(interface{ ObserveSpeechEvent([]byte) }); ok {
 			observeProviderEvent = observer.ObserveSpeechEvent
 		}
-		firstResponse, err = responseAudioSSEClient(r.c, response, audioSSESpeech, providerresponse.OperationBinaryDownload, observeProviderEvent)
+		firstResponse, err = responseNativeSSEClient(r.c, response, providerresponse.OperationBinaryDownload, observeProviderEvent)
 		r.SetFirstResponseTime(firstResponse)
 		return err, err != nil
 	}

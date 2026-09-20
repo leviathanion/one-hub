@@ -132,7 +132,7 @@ func TestIssue050CompleteTerminalIsObservedBeforeSendDataAfterClientClose(t *tes
 	release := func() { releaseFrameOnce.Do(func() { close(releaseFrame) }) }
 	readerClosed := make(chan struct{})
 	response.Stream.Body = &issue050CloseProbeBody{ReadCloser: response.Stream.Body, closed: readerClosed}
-	handler := newAudioSSEHandler(audioSSETranscription, response.ObserveProviderEvent)
+	handler := newNativeSSEHandler(response.ObserveProviderEvent)
 	terminalFrameSeen := atomic.Bool{}
 	handleReturned := make(chan struct{})
 	var handleReturnedOnce sync.Once
@@ -146,7 +146,7 @@ func TestIssue050CompleteTerminalIsObservedBeforeSendDataAfterClientClose(t *tes
 		if terminalFrameSeen.Load() {
 			handleReturnedOnce.Do(func() { close(handleReturned) })
 		}
-	}, requester.StreamReadOptions{MaxLineBytes: audioSSEMaxEventBytes, RequireProtocolTerminal: true})
+	}, requester.StreamReadOptions{MaxLineBytes: nativeSSEMaxEventBytes, RequireProtocolTerminal: true})
 	if apiErr != nil {
 		t.Fatalf("create transcription SSE reader: %+v", apiErr)
 	}

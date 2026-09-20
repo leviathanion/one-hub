@@ -37,6 +37,9 @@ var responseOwnerSchemaColumns = []string{
 	"updated_at",
 	"deleted_at",
 	"expires_at",
+	"batch_owner_id",
+	"batch_slot",
+	"task_owner_id",
 }
 
 // ResponseOwner is the durable routing and authorization boundary for stored
@@ -44,6 +47,10 @@ var responseOwnerSchemaColumns = []string{
 // the minimum identity needed to route lifecycle calls without leaking IDs
 // across users.
 type ResponseOwner struct {
+	// BatchOwnerID 仅标记 Batch 派生容量来源；授权仍使用本记录的用户和渠道。
+	BatchOwnerID             *string    `json:"-" gorm:"size:36;index;uniqueIndex:idx_response_batch_slot,priority:1"`
+	BatchSlot                *string    `json:"-" gorm:"size:64;uniqueIndex:idx_response_batch_slot,priority:2"`
+	TaskOwnerID              *string    `json:"-" gorm:"size:36;uniqueIndex:idx_response_owner_task_owner"`
 	ID                       uint64     `json:"id" gorm:"primaryKey;autoIncrement"`
 	ProviderNamespace        string     `json:"provider_namespace" gorm:"not null;size:64;uniqueIndex:idx_response_owner_provider_identity,priority:1"`
 	ResponseScopeIncarnation string     `json:"response_scope_incarnation" gorm:"not null;size:191;uniqueIndex:idx_response_owner_provider_identity,priority:2"`
@@ -59,8 +66,7 @@ type ResponseOwner struct {
 }
 
 func NewResponseOwner(responseID string, userID, tokenID, channelID int, now time.Time, identity ...string) (*ResponseOwner, error) {
-	responseID = strings.TrimSpace(responseID)
-	if responseID == "" || userID <= 0 || channelID <= 0 {
+	if strings.TrimSpace(responseID) == "" || userID <= 0 || channelID <= 0 {
 		return nil, errors.New("response id, user id, and channel id are required")
 	}
 	if now.IsZero() {
@@ -106,8 +112,7 @@ func createResponseOwner(db *gorm.DB, owner *ResponseOwner) error {
 	if db == nil || owner == nil {
 		return errors.New("response owner database and record are required")
 	}
-	owner.ResponseID = strings.TrimSpace(owner.ResponseID)
-	if owner.ResponseID == "" || owner.UserID <= 0 || owner.ChannelID <= 0 || strings.TrimSpace(owner.ProviderNamespace) == "" || strings.TrimSpace(owner.ResponseScopeIncarnation) == "" || owner.State != ResponseOwnerStateActive || owner.ExpiresAt.IsZero() {
+	if strings.TrimSpace(owner.ResponseID) == "" || owner.UserID <= 0 || owner.ChannelID <= 0 || strings.TrimSpace(owner.ProviderNamespace) == "" || strings.TrimSpace(owner.ResponseScopeIncarnation) == "" || owner.State != ResponseOwnerStateActive || owner.ExpiresAt.IsZero() {
 		return errors.New("invalid response owner record")
 	}
 
@@ -127,7 +132,9 @@ func createResponseOwner(db *gorm.DB, owner *ResponseOwner) error {
 	if err != nil {
 		return err
 	}
-	if existing.State == ResponseOwnerStateActive && existing.UserID == owner.UserID && existing.ChannelID == owner.ChannelID && existing.ProviderNamespace == owner.ProviderNamespace && existing.ResponseScopeIncarnation == owner.ResponseScopeIncarnation {
+	// A repeated observation does not revive or extend a deleted resource. Its
+	// retained identity remains idempotent; only a different binding conflicts.
+	if existing.ResponseID == owner.ResponseID && existing.UserID == owner.UserID && existing.ChannelID == owner.ChannelID && existing.ProviderNamespace == owner.ProviderNamespace && existing.ResponseScopeIncarnation == owner.ResponseScopeIncarnation && sameResponseTaskOwner(existing.TaskOwnerID, owner.TaskOwnerID) {
 		return nil
 	}
 	return fmt.Errorf("%w: response_id=%s", ErrResponseOwnerConflict, owner.ResponseID)
@@ -158,7 +165,7 @@ func checkResponseOwnerSchema(db *gorm.DB) error {
 	if err := db.Select(responseOwnerSchemaColumns).Limit(1).Find(&owners).Error; err != nil {
 		return err
 	}
-	for _, index := range []string{"idx_response_owner_provider_identity", "idx_response_owner_public_identity"} {
+	for _, index := range []string{"idx_response_owner_provider_identity", "idx_response_owner_public_identity", "idx_response_owner_task_owner", "idx_response_batch_slot"} {
 		if !db.Migrator().HasIndex(&ResponseOwner{}, index) {
 			return fmt.Errorf("response owner schema is missing unique index %s", index)
 		}
@@ -167,8 +174,7 @@ func checkResponseOwnerSchema(db *gorm.DB) error {
 }
 
 func getResponseOwner(db *gorm.DB, responseID string, now time.Time, userIDs ...int) (*ResponseOwner, error) {
-	responseID = strings.TrimSpace(responseID)
-	if db == nil || responseID == "" {
+	if db == nil || strings.TrimSpace(responseID) == "" {
 		return nil, ErrResponseOwnerNotFound
 	}
 	query := db.Where("response_id = ? AND expires_at > ?", responseID, now)
@@ -182,6 +188,11 @@ func getResponseOwner(db *gorm.DB, responseID string, now time.Time, userIDs ...
 	}
 	if err != nil {
 		return nil, err
+	}
+	for i := range owners {
+		if owners[i].ResponseID != responseID {
+			return nil, ErrResponseOwnerNotFound
+		}
 	}
 	if len(owners) > 1 {
 		return nil, fmt.Errorf("%w: response_id=%s", ErrResponseOwnerConflict, responseID)
@@ -197,8 +208,7 @@ func TombstoneResponseOwner(ctx context.Context, responseID string, userID int) 
 }
 
 func tombstoneResponseOwner(db *gorm.DB, responseID string, userID int, now time.Time) error {
-	responseID = strings.TrimSpace(responseID)
-	if db == nil || responseID == "" || userID <= 0 {
+	if db == nil || strings.TrimSpace(responseID) == "" || userID <= 0 {
 		return ErrResponseOwnerNotFound
 	}
 	return db.Transaction(func(tx *gorm.DB) error {
@@ -211,6 +221,9 @@ func tombstoneResponseOwner(db *gorm.DB, responseID string, userID int, now time
 		}
 		if err != nil {
 			return err
+		}
+		if owner.ResponseID != responseID {
+			return ErrResponseOwnerNotFound
 		}
 		if owner.State == ResponseOwnerStateDeleted {
 			return nil

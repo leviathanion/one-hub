@@ -49,7 +49,7 @@ func PrepareResponsesTurnAffinity(input ResponsesAffinityInput) (*ResponsesTurnA
 	}
 	return &ResponsesTurnAffinity{
 		State:              state,
-		PreviousResponseID: strings.TrimSpace(input.Request.PreviousResponseID),
+		PreviousResponseID: input.Request.PreviousResponseID,
 		ExplicitPinID:      pin,
 		OwnershipChannelID: ownershipChannelID,
 		StrictOwnerRoute:   continuationRoute.Strict,
@@ -102,7 +102,7 @@ func ClearResponsesTurnContinuationMissBindings(activeOrCandidate *ResponsesTurn
 	if activeOrCandidate == nil || activeOrCandidate.State == nil || ownerChannelID <= 0 {
 		return
 	}
-	attemptedPreviousResponseID = strings.TrimSpace(attemptedPreviousResponseID)
+
 	if attemptedPreviousResponseID == "" {
 		return
 	}

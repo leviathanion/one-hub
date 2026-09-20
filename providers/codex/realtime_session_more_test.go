@@ -1008,11 +1008,28 @@ func TestPrepareCodexRealtimeCreatePayloadRejectsAccountScopedResources(t *testi
 	for _, payload := range []string{
 		`{"type":"response.create","event_id":"evt_file","model":"gpt-5","input":[{"type":"input_file","file_id":"file_shared"}]}`,
 		`{"type":"response.create","event_id":"evt_tool","model":"gpt-5","tools":[{"type":"file_search","vector_store_ids":["vs_shared"]}]}`,
-		`{"type":"response.create","event_id":"evt_skill","model":"gpt-5","tools":[{"type":"function","skill_reference":"skill_shared"}]}`,
+		`{"type":"response.create","event_id":"evt_skill","model":"gpt-5","tools":[{"type":"shell","environment":{"type":"local","skills":[{"type":"skill_reference","skill_id":"skill_shared"}]}}]}`,
 	} {
 		if _, _, _, err := provider.prepareCodexRealtimeCreatePayload([]byte(payload), runtimesession.ModelBinding{RequestedModel: "gpt-5", ProviderModel: "gpt-5", BillingModel: "gpt-5"}); err == nil || !strings.Contains(err.Error(), "unsupported_resource_reference") {
 			t.Fatalf("expected realtime resource gate before provider work, payload=%s err=%v", payload, err)
 		}
+	}
+}
+
+func TestPrepareCodexRealtimeCreatePayloadPreservesFunctionResourceNamedExtensions(t *testing.T) {
+	provider := &CodexProvider{}
+	tools := `[{"type":"function","name":"lookup","skill_reference":"business_extension","parameters":{"type":"object","properties":{"file_id":{"type":"string"},"skill_reference":{"type":"string"}}}}]`
+	payload := `{"type":"response.create","event_id":"evt_business","model":"gpt-5","tools":` + tools + `}`
+	_, _, encoded, err := provider.prepareCodexRealtimeCreatePayload([]byte(payload), runtimesession.ModelBinding{RequestedModel: "gpt-5", ProviderModel: "gpt-5", BillingModel: "gpt-5"})
+	if err != nil {
+		t.Fatalf("business extension rejected before provider work: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if string(fields["tools"]) != tools {
+		t.Fatalf("business extension changed: got %s want %s", fields["tools"], tools)
 	}
 }
 

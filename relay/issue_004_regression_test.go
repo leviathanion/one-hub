@@ -66,7 +66,7 @@ type issue004RelayHarness struct {
 	userPumpDone   chan struct{}
 }
 
-func newIssue004RelayHarness(t *testing.T, attemptID string, multiAgent bool) *issue004RelayHarness {
+func newIssue004RelayHarness(t *testing.T, attemptID, responseID string, multiAgent bool) *issue004RelayHarness {
 	t.Helper()
 	ctx, attempt := setupPreconsumedResponsesWSActorAttempt(t, 1000, attemptID)
 	attempt.MultiAgentEnabled = multiAgent
@@ -106,9 +106,8 @@ func newIssue004RelayHarness(t *testing.T, attemptID string, multiAgent bool) *i
 	actor.SetClientConn(userServer)
 	generation := actor.AttachUpstreamSession(native, 17)
 	attempt.Session = native
-	actor.turns.active.attempt = attempt
-	actor.turns.active.affinity = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
-	actor.turns.active.channelID = 17
+	registerResponsesWSTestWork(t, actor, attempt, responseID)
+	actor.rememberConnectionLocalEphemeralResponseID(responseID)
 	actor.state = responsesWSStateInFlight
 
 	harness := &issue004RelayHarness{
@@ -166,7 +165,7 @@ func newIssue004RelayHarness(t *testing.T, attemptID string, multiAgent bool) *i
 }
 
 func TestIssue004RelayNativeCompletedThenCloseDeliversAndSettlesOnce(t *testing.T) {
-	harness := newIssue004RelayHarness(t, "attempt-issue-004-close", false)
+	harness := newIssue004RelayHarness(t, "attempt-issue-004-close", "resp-issue-004-close", false)
 	completed := []byte(`{"type":"response.completed","sequence_number":1,"response":{"id":"resp-issue-004-close","status":"completed","usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}`)
 	if err := harness.providerServer.WriteMessage(wsconn.TextMessage, completed); err != nil {
 		t.Fatalf("write completed provider event: %v", err)
@@ -204,7 +203,7 @@ func TestIssue004RelayNativeCompletedThenCloseDeliversAndSettlesOnce(t *testing.
 }
 
 func TestIssue004RelayNativeCompletedThenInjectAckKeepsSequenceAndSettlesOnce(t *testing.T) {
-	harness := newIssue004RelayHarness(t, "attempt-issue-004-ack", true)
+	harness := newIssue004RelayHarness(t, "attempt-issue-004-ack", "resp-issue-004-ack", true)
 	completed := []byte(`{"type":"response.completed","sequence_number":1,"response":{"id":"resp-issue-004-ack","status":"completed","usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}`)
 	ack := []byte(`{"type":"response.inject.created","sequence_number":2,"response_id":"resp-issue-004-ack"}`)
 	if err := harness.providerServer.WriteMessage(wsconn.TextMessage, completed); err != nil {
@@ -227,7 +226,7 @@ func TestIssue004RelayNativeCompletedThenInjectAckKeepsSequenceAndSettlesOnce(t 
 		t.Fatalf("completed/inject acknowledgement order changed at client boundary: first=%q second=%q", first.payload, second.payload)
 	}
 	issue004WaitRelayActorEvents(t, harness.actor)
-	if harness.actor.closing.closed.Load() || harness.actor.turns.active.attempt != nil {
+	if harness.actor.closing.closed.Load() || len(harness.actor.observation.works) != 0 {
 		t.Fatalf("inject acknowledgement after terminal incorrectly closed or remained pending: closed=%v pending=%d", harness.actor.closing.closed.Load(), harness.actor.state)
 	}
 	if harness.attempt.QuotaFinalized == false || harness.attempt.RolledBack || harness.attempt.AppliedSettlement == nil {

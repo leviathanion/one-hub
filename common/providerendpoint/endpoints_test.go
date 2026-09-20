@@ -1,6 +1,10 @@
 package providerendpoint
 
-import "testing"
+import (
+	"testing"
+
+	"one-api/common/config"
+)
 
 func TestEndpointSettingsSeparatePermissionAndAddress(t *testing.T) {
 	for _, tc := range []struct {
@@ -48,7 +52,7 @@ func TestEndpointCatalogHasStableUniqueIdentifiers(t *testing.T) {
 			t.Fatalf("invalid definition: %+v", definition)
 		}
 		seen[definition.ID] = true
-		if definition.ID != Messages {
+		if definition.RelayMode != config.RelayModeUnknown {
 			got, ok := ForRelayMode(definition.RelayMode)
 			if !ok || got.ID != definition.ID {
 				t.Fatalf("relay mode is ambiguous: %+v", definition)

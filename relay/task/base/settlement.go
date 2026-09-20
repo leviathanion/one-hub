@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"one-api/model"
+	"one-api/relay"
 )
 
 type TaskSettlementFinalizeResult struct {
@@ -47,7 +48,10 @@ func FailTaskWithSettlement(ctx context.Context, task *model.Task, reason string
 }
 
 func finalizeTaskBillingOwner(ctx context.Context, task *model.Task, targetQuota int64, decision string) error {
-	_, err := model.FinalizeTaskBillingOwner(ctx, task, targetQuota, decision)
+	result, err := model.FinalizeTaskBillingOwner(ctx, task, targetQuota, decision)
+	if err == nil {
+		relay.ProjectAsyncTaskSettlement(ctx, task, result)
+	}
 	return err
 }
 

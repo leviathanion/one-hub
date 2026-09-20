@@ -2,30 +2,32 @@ package openai
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"sync"
 
 	"one-api/common"
+	"one-api/common/jsonobject"
 	commonresponses "one-api/common/responses"
 	"one-api/common/responsesws"
 	"one-api/model"
 	"one-api/types"
 )
 
-// openAIResponsesWSAdapter is scoped to one native Responses websocket.  The
-// provider's output_item.done event carries the completed item but does not
-// repeat the response tool declaration, so the accepted response.created
-// snapshot must remain available until that item is observed.  The tracker is
-// bounded by commonresponses and is reset at each new response lifecycle.
+// 每个真实 response 独立观察工具用量；观察容量不影响原帧交付。
+const openAIResponsesWSMaxTrackedResponses = 64
+
 type openAIResponsesWSAdapter struct {
-	mu                 sync.Mutex
+	mu        sync.Mutex
+	responses map[string]*openAIResponsesWSToolObservation
+}
+
+type openAIResponsesWSToolObservation struct {
 	searchServiceType  string
 	searchType         string
-	responseID         string
 	responseModel      string
 	serviceTier        string
-	responseCreated    bool
 	toolBillingTracker commonresponses.ToolBillingStreamTracker
 }
 
@@ -92,18 +94,8 @@ func (a *openAIResponsesWSAdapter) PrepareClientFrame(_ context.Context, frame r
 	if frame.Kind() != responsesws.FrameKindText {
 		return responsesws.Frame{}, responsesws.ErrInvalidFrame
 	}
-	envelope, err := responsesws.ParseClientEventEnvelope(frame.Payload())
-	if err != nil {
+	if _, err := responsesws.ParseClientEventEnvelope(frame.Payload()); err != nil {
 		return responsesws.Frame{}, err
-	}
-	// A native session may carry more than one Responses turn.  Resetting on
-	// an accepted turn-start frame prevents an item identity from suppressing a
-	// same-named item in a later turn.  response.created below also resets the
-	// state at the provider acceptance boundary, covering callers that inject a
-	// first frame through the transport fixture.
-	switch strings.TrimSpace(envelope.Type) {
-	case "response.create":
-		a.resetSearchState()
 	}
 	return frame, nil
 }
@@ -126,25 +118,18 @@ func (a *openAIResponsesWSAdapter) HandleProviderFrame(_ context.Context, frame 
 			CloseTransport: true,
 		}
 	}
-	eventType := strings.TrimSpace(envelope.Type)
-	if eventType == types.EventTypeSessionCreated {
-		return responsesws.ProviderFrameResult{
-			Filtered: true,
-			Origin:   responsesws.RecvDetailOriginProviderFrame,
+	if envelope.Type == "session.created" || envelope.Type == "session.updated" {
+		payload, err = sanitizeOpenAIResponsesWSSession(payload, envelope.Object["session"])
+		if err != nil {
+			return responsesws.ProviderFrameResult{Origin: responsesws.RecvDetailOriginProviderMalformed, Err: err, CloseTransport: true}
 		}
 	}
 	if responsesws.IsAuxiliaryControlEvent(envelope.Type) {
 		out := responsesws.NewTextFrame(payload)
 		return responsesws.ProviderFrameResult{EmitFrame: &out, Origin: responsesws.RecvDetailOriginProviderFrame}
 	}
-	usage, usageErr := a.acceptedProviderUsage(envelope.EventID, payload)
-	if usageErr != nil {
-		return responsesws.ProviderFrameResult{
-			Origin:         responsesws.RecvDetailOriginProviderMalformed,
-			Err:            usageErr,
-			CloseTransport: true,
-		}
-	}
+	// 计费观察失败不会改变安全原帧的交付。
+	usage, _ := a.acceptedProviderUsage(envelope.EventID, payload)
 
 	out := responsesws.NewTextFrame(append([]byte(nil), payload...))
 	return responsesws.ProviderFrameResult{
@@ -154,26 +139,32 @@ func (a *openAIResponsesWSAdapter) HandleProviderFrame(_ context.Context, frame 
 	}
 }
 
-func (a *openAIResponsesWSAdapter) resetSearchState() {
-	if a == nil {
-		return
+// 仅移除会话协议中的上游临时凭据；业务数据和无凭据原帧不改写。
+func sanitizeOpenAIResponsesWSSession(payload, sessionRaw []byte) ([]byte, error) {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(sessionRaw, &fields) != nil {
+		return payload, nil
 	}
-	a.mu.Lock()
-	a.resetSearchStateLocked()
-	a.mu.Unlock()
-}
-
-func (a *openAIResponsesWSAdapter) resetSearchStateLocked() {
-	if a == nil {
-		return
+	if _, exists := fields["client_secret"]; !exists {
+		return payload, nil
 	}
-	a.searchServiceType = ""
-	a.searchType = ""
-	a.responseID = ""
-	a.responseModel = ""
-	a.serviceTier = ""
-	a.responseCreated = false
-	a.toolBillingTracker = commonresponses.ToolBillingStreamTracker{}
+	session, err := jsonobject.Parse(sessionRaw)
+	if err != nil {
+		return nil, responsesws.ErrInvalidProviderEventPayload
+	}
+	session.Delete("client_secret")
+	safe, err := session.MarshalJSON()
+	if err != nil {
+		return nil, err
+	}
+	envelope, err := jsonobject.Parse(payload)
+	if err != nil {
+		return nil, responsesws.ErrInvalidProviderEventPayload
+	}
+	if err := envelope.SetRaw("session", safe); err != nil {
+		return nil, err
+	}
+	return envelope.MarshalJSON()
 }
 
 // acceptedProviderUsage extracts only facts accepted at the provider-frame
@@ -189,61 +180,43 @@ func (a *openAIResponsesWSAdapter) acceptedProviderUsage(providerEventID string,
 		return nil, nil
 	}
 
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if event.Type != "response.created" && event.Response != nil && event.Response.ID != "" && a.responseID != "" && event.Response.ID != a.responseID {
+	responseID := responsesws.ProviderResponseID(payload)
+	if responseID == "" || len(responseID) > 1024 {
 		return nil, nil
 	}
-
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	state := a.responses[responseID]
 	switch event.Type {
 	case "response.created":
-		// The tool declaration is attribution metadata, not execution evidence.
-		// Only a later completed output item can create a billable unit.
-		incomingServiceType, incomingSearchType := commonresponses.ResponsesSearchBilling(event.Response)
-		incomingResponseID := ""
-		incomingResponseModel := ""
-		incomingServiceTier := ""
+		if state == nil {
+			if len(a.responses) >= openAIResponsesWSMaxTrackedResponses {
+				return nil, nil
+			}
+			if a.responses == nil {
+				a.responses = make(map[string]*openAIResponsesWSToolObservation)
+			}
+			state = &openAIResponsesWSToolObservation{}
+			a.responses[responseID] = state
+		}
+		service, search := commonresponses.ResponsesSearchBilling(event.Response)
+		if state.searchServiceType == "" {
+			state.searchServiceType = service
+		}
+		if state.searchType == "" {
+			state.searchType = search
+		}
 		if event.Response != nil {
-			incomingResponseID = strings.TrimSpace(event.Response.ID)
-			incomingResponseModel = strings.TrimSpace(event.Response.Model)
-			incomingServiceTier = strings.TrimSpace(event.Response.ServiceTier)
+			if state.responseModel == "" {
+				state.responseModel = strings.TrimSpace(event.Response.Model)
+			}
+			if state.serviceTier == "" {
+				state.serviceTier = strings.TrimSpace(event.Response.ServiceTier)
+			}
 		}
-		if a.responseCreated && incomingResponseID != "" && a.responseID != "" && incomingResponseID != a.responseID {
-			// A different provider response is a new lifecycle.  It may reuse an
-			// item ID, so its evidence must not inherit the prior turn's tracker.
-			a.resetSearchStateLocked()
-		} else if a.responseCreated {
-			// Repeated declarations for the current response, including an
-			// ownerless declaration, must not clear accepted item evidence.  Fill
-			// metadata that the first declaration omitted, but keep the original
-			// owner dimensions and tracker decisions authoritative.
-			if a.searchServiceType == "" {
-				a.searchServiceType = incomingServiceType
-			}
-			if a.searchType == "" {
-				a.searchType = incomingSearchType
-			}
-			if a.responseID == "" {
-				a.responseID = incomingResponseID
-			}
-			if a.responseModel == "" {
-				a.responseModel = incomingResponseModel
-			}
-			if a.serviceTier == "" {
-				a.serviceTier = incomingServiceTier
-			}
-			return nil, nil
-		}
-		a.searchServiceType = incomingServiceType
-		a.searchType = incomingSearchType
-		a.responseID = incomingResponseID
-		a.responseModel = incomingResponseModel
-		a.serviceTier = incomingServiceTier
-		a.responseCreated = true
-		a.toolBillingTracker = commonresponses.ToolBillingStreamTracker{}
 		return nil, nil
 	case "response.output_item.done":
-		if event.Item == nil || event.Item.Type != types.InputTypeWebSearchCall {
+		if state == nil || event.Item == nil || event.Item.Type != types.InputTypeWebSearchCall {
 			return nil, nil
 		}
 		observed := &types.Usage{}
@@ -253,32 +226,36 @@ func (a *openAIResponsesWSAdapter) acceptedProviderUsage(providerEventID string,
 			event.Item,
 			event.ItemID,
 			event.OutputIndex,
-			a.searchServiceType,
-			a.searchType,
-			&a.toolBillingTracker,
+			state.searchServiceType,
+			state.searchType,
+			&state.toolBillingTracker,
 		); err != nil {
-			service := a.searchServiceType
+			service := state.searchServiceType
 			if service == "" {
 				service = types.APIToolTypeWebSearchPreview
 			}
 			if fatal := commonresponses.ObserveBillingFailure(observed, service, err); fatal != nil {
-				return nil, common.ErrorWrapperLocal(fatal, commonresponses.ResponsesStreamTrackingFailureCode(fatal), http.StatusBadGateway)
+				observed.AddBillingDiagnostic(commonresponses.ResponsesStreamTrackingFailureCode(fatal))
 			}
 		}
 		if len(observed.ExtraBilling) == 0 && len(observed.BillingDiagnostics) == 0 {
 			return nil, nil
 		}
 		return &types.UsageEvent{
-			ProviderEventID:      strings.TrimSpace(providerEventID),
-			ResponseID:           a.responseID,
-			ResponseModel:        a.responseModel,
-			ServiceTier:          a.serviceTier,
-			ItemID:               strings.TrimSpace(event.ItemID),
+			ProviderEventID:      providerEventID,
+			ResponseID:           responseID,
+			ResponseModel:        state.responseModel,
+			ServiceTier:          state.serviceTier,
+			ItemID:               event.ItemID,
 			ExtraBilling:         observed.ExtraBilling,
 			BillingDiagnostics:   observed.BillingDiagnostics,
 			ProviderExtraBilling: observed.ProviderExtraBilling,
 		}, nil
 	default:
+		switch event.Type {
+		case "response.completed", "response.failed", "response.incomplete", "response.cancelled":
+			delete(a.responses, responseID)
+		}
 		return openAIResponsesWSEventUsage(providerEventID, payload), nil
 	}
 }
@@ -302,8 +279,8 @@ func openAIResponsesWSEventUsage(providerEventID string, payload []byte) *types.
 		OutputTokenDetails:    usage.CompletionTokensDetails,
 		Source:                types.UsageSourceResponsesResponse,
 		BillingBasis:          types.UsageBillingBasisTokens,
-		ProviderEventID:       strings.TrimSpace(providerEventID),
-		ResponseID:            strings.TrimSpace(event.Response.ID),
+		ProviderEventID:       providerEventID,
+		ResponseID:            event.Response.ID,
 		ResponseModel:         strings.TrimSpace(event.Response.Model),
 		ServiceTier:           strings.TrimSpace(event.Response.ServiceTier),
 		ExtraTokens:           usage.GetExtraTokens(),

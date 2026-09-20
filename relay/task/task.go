@@ -58,6 +58,12 @@ type taskPollGroup struct {
 
 func UpdateTaskBulk() {
 	ctx := context.WithValue(context.Background(), logger.RequestIdKey, "Task")
+	if _, err := model.DeleteExpiredBackgroundResponseTasks(ctx, time.Now()); err != nil {
+		logger.LogError(ctx, "background task cleanup failed: "+err.Error())
+	}
+	if _, err := model.DeleteExpiredOpenAIBatchTasks(ctx, time.Now()); err != nil {
+		logger.LogError(ctx, "batch task cleanup failed: "+err.Error())
+	}
 	var afterNextActionAt, afterID int64
 	for {
 		due, err := model.ListDueTaskOwners(ctx, time.Now(), afterNextActionAt, afterID, model.TaskProgressPageSize)

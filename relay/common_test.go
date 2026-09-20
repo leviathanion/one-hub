@@ -286,11 +286,11 @@ func TestExactChatSSEEgressPreservesCompleteRawEventsAndTerminal(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	logger.Logger = zap.NewNop()
 	rawEvent := ": keep  two\r\nid: 007\r\nevent: chunk\r\ndata:  {\"id\":\"chatcmpl_raw\",\"model\":\"gpt-5\",\"message\":\"future success https://example.com\",\"code\":\"future_code\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}],\"future\":12345678901234567890}  \r\n\r\n"
-	doneEvent := "data:[DONE]\r\n\r\n"
+	doneEvent := "data:[DONE]\r\n\r\nevent: extension\r\ndata: {\"future\":true}\r\n\r\n"
 	handler := openai.OpenAIStreamHandler{Usage: &types.Usage{}}
 	stream, apiErr := requester.RequestRawSSEEventStreamWithEmitterOptions(nil, &http.Response{
 		Body: io.NopCloser(strings.NewReader(rawEvent + doneEvent)),
-	}, handler.HandleExactChatSSE, requester.StreamReadOptions{RequireProtocolTerminal: true})
+	}, handler.HandleExactChatSSE, requester.StreamReadOptions{})
 	if apiErr != nil {
 		t.Fatalf("create exact Chat stream: %+v", apiErr)
 	}

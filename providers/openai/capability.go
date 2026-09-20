@@ -8,6 +8,7 @@ import (
 	"mime/multipart"
 	"strings"
 
+	"one-api/common/config"
 	"one-api/model"
 	"one-api/providers/base"
 	"one-api/types"
@@ -15,14 +16,32 @@ import (
 
 const imageStreamFieldMaxBytes int64 = 64
 
-// ValidateImageStreamRequestBody checks the final image request body without
-// interpreting any provider-owned fields. Image adapters in this package only
-// have a unary response path, so an explicit stream=true cannot be sent.
+// ValidateImageStreamRequestBody protects unary-only image call contracts.
+// Native adapters use their separately declared JSON/SSE response path; this
+// check does not validate provider-owned image parameters.
 func ValidateImageStreamRequestBody(body []byte, contentType string) error {
 	if imageStreamRequested(body, contentType) {
 		return &base.RequestCapabilityError{Param: "stream", Message: "image streaming is not supported"}
 	}
 	return nil
+}
+
+// ImageStreamRequested observes only transport selection; it does not validate
+// the upstream image schema.
+func ImageStreamRequested(body []byte, contentType string) bool {
+	return imageStreamRequested(body, contentType)
+}
+
+func (OpenAIProviderFactory) SupportsImageStreaming(channel *model.Channel) bool {
+	if channel == nil {
+		return false
+	}
+	switch channel.Type {
+	case config.ChannelTypeOpenAI, config.ChannelTypeCustom, config.ChannelTypeAzure, config.ChannelTypeAzureV1:
+		return true
+	default:
+		return false
+	}
 }
 
 func imageStreamRequested(body []byte, contentType string) bool {
@@ -92,7 +111,7 @@ func AssessChatRequestForChannel(channel *model.Channel, canonicalModel string, 
 	if err := base.RequireOperationEndpoint(getOpenAIConfig(defaultBaseURL, channel).ChatCompletions, "Chat Completions"); err != nil {
 		return base.ChatRequestSupport{}, err
 	}
-	return base.ChatRequestSupport{}, nil
+	return base.ChatRequestSupport{SupportsStoredChat: supportsStoredChatChannel(channel)}, nil
 }
 
 // ValidateChatRequestForChannel evaluates only proxy-owned billing and
@@ -136,8 +155,8 @@ func validateChatRequestMapForChannel(channel *model.Channel, modelName string, 
 	}
 	requestMap["model"] = modelName
 	if value, present := requestMap["store"]; present && value != nil {
-		if store, valid := value.(bool); !valid || store {
-			return &base.RequestCapabilityError{Param: "store", Message: "store must be false or null because Stored Chat lifecycle is unavailable"}
+		if store, valid := value.(bool); valid && store && !supportsStoredChatChannel(channel) {
+			return &base.RequestCapabilityError{Param: "store", Message: "selected channel cannot preserve Stored Chat lifecycle"}
 		}
 	}
 	if webSearch, present := requestMap["web_search_options"]; present && webSearch != nil {
@@ -217,6 +236,7 @@ func ResponsesSupportForChannel(channel *model.Channel, defaultBaseURL string) b
 			base.OperationResponsesInputTokens,
 			base.OperationResponsesRetrieve,
 			base.OperationResponsesDelete,
+			base.OperationResponsesCancel,
 			base.OperationResponsesInputItems,
 			base.OperationResponsesWebSocket,
 		} {
@@ -229,7 +249,8 @@ func ResponsesSupportForChannel(channel *model.Channel, defaultBaseURL string) b
 	}
 	stored, _ := channel.GetOtherBoolField("responses_stored_lifecycle")
 	if stored {
-		for _, operation := range []base.Operation{base.OperationResponsesRetrieve, base.OperationResponsesDelete, base.OperationResponsesInputItems} {
+		for _, operation := range []base.Operation{base.OperationResponsesRetrieve, base.OperationResponsesDelete,
+			base.OperationResponsesCancel, base.OperationResponsesInputItems} {
 			support.Operations[operation] = path
 		}
 	}

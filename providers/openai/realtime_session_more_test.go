@@ -453,7 +453,7 @@ func TestOpenAIRealtimeReadLoopWithNilConnClosesSession(t *testing.T) {
 	}
 }
 
-func TestOpenAIResponsesWSDefersReadUntilRecvAndFiltersSessionCreated(t *testing.T) {
+func TestOpenAIResponsesWSDefersReadUntilRecvAndPreservesSessionCreated(t *testing.T) {
 	releaseDone := make(chan struct{})
 	server := newOpenAIRealtimeTestServer(t, func(conn *openAIRealtimeTestConn) {
 		if err := conn.WriteMessage(wsconn.TextMessage, []byte(`{"type":"session.created","session":{"id":"sess_private"}}`)); err != nil {
@@ -488,11 +488,12 @@ func TestOpenAIResponsesWSDefersReadUntilRecvAndFiltersSessionCreated(t *testing
 	if err != nil {
 		t.Fatalf("expected first Recv to return provider event, got %v", err)
 	}
-	if strings.Contains(string(payload), "session.created") {
-		t.Fatalf("expected private session.created bootstrap to be filtered, got %q", payload)
+	if string(payload) != `{"type":"session.created","session":{"id":"sess_private"}}` {
+		t.Fatalf("expected original session.created frame first, got %q", payload)
 	}
-	if !strings.Contains(string(payload), "response.created") || !strings.Contains(string(payload), "resp_visible") {
-		t.Fatalf("expected visible responses event, got %q", payload)
+	_, payload, _, _, err = openAIResponsesWSTestRecv(ctx, session)
+	if err != nil || string(payload) != `{"type":"response.created","response":{"id":"resp_visible","status":"in_progress"}}` {
+		t.Fatalf("expected original response.created frame second, got %q, %v", payload, err)
 	}
 }
 
@@ -628,11 +629,12 @@ func TestOpenAIOpenResponsesWSUsesResponsesTransportWithoutCompatMode(t *testing
 	if err != nil {
 		t.Fatalf("expected first Recv to return provider event, got %v", err)
 	}
-	if strings.Contains(string(payload), "session.created") {
-		t.Fatalf("expected private session.created bootstrap to be filtered, got %q", payload)
+	if string(payload) != `{"type":"session.created","session":{"id":"sess_private"}}` {
+		t.Fatalf("expected original session.created frame first, got %q", payload)
 	}
-	if !strings.Contains(string(payload), "response.created") || !strings.Contains(string(payload), "resp_visible") {
-		t.Fatalf("expected visible responses event, got %q", payload)
+	_, payload, _, _, err = openAIResponsesWSTestRecv(ctx, session)
+	if err != nil || string(payload) != `{"type":"response.created","response":{"id":"resp_visible","status":"in_progress"}}` {
+		t.Fatalf("expected original response.created frame second, got %q, %v", payload, err)
 	}
 }
 
@@ -2204,7 +2206,7 @@ func TestOpenAIResponsesWSUnknownSteeringControlPreservesWire(t *testing.T) {
 func TestOpenAIResponsesWSToolIdentityConflictPreservesWireAndIndependentTokens(t *testing.T) {
 	adapter := &openAIResponsesWSAdapter{}
 	adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame([]byte(`{"type":"response.created","response":{"id":"resp_conflict","tools":[{"type":"web_search"}]}}`)))
-	payload := []byte(`{"type":"response.output_item.done","item_id":"search_a","item":{"id":"search_b","type":"web_search_call","status":"completed","action":{"type":"search"}},"future":9007199254740993}`)
+	payload := []byte(`{"type":"response.output_item.done","response_id":"resp_conflict","item_id":"search_a","item":{"id":"search_b","type":"web_search_call","status":"completed","action":{"type":"search"}},"future":9007199254740993}`)
 	result := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame(payload))
 	if result.Err != nil || result.CloseTransport || result.EmitFrame == nil || string(result.EmitFrame.Payload()) != string(payload) || result.Usage == nil {
 		t.Fatalf("component conflict blocked raw delivery or lost diagnostic: %+v", result)

@@ -18,6 +18,7 @@ const (
 	OperationResponsesInputTokens = providerresponse.OperationResponsesInputTokens
 	OperationResponsesRetrieve    = providerresponse.OperationResponsesRetrieve
 	OperationResponsesDelete      = providerresponse.OperationResponsesDelete
+	OperationResponsesCancel      = providerresponse.OperationResponsesCancel
 	OperationResponsesInputItems  = providerresponse.OperationResponsesInputItems
 	OperationResponsesWebSocket   = providerresponse.OperationResponsesWebSocket
 	OperationAudioTranscription   = providerresponse.OperationAudioTranscription
@@ -50,11 +51,11 @@ func (e *RequestCapabilityError) Error() string {
 	return e.Message
 }
 
-// ChatRequestSupport carries the one execution-path fact the relay needs after
-// provider-local candidate assessment. UsesResponsesTransport means the Chat
-// adapter itself converts the request to Responses before provider I/O.
+// ChatRequestSupport carries adapter-owned routing and lifecycle capabilities.
+// UsesResponsesTransport means the Chat adapter converts to Responses before I/O.
 type ChatRequestSupport struct {
 	UsesResponsesTransport bool
+	SupportsStoredChat     bool
 }
 
 // RequireOperationEndpoint keeps factory capability registration tied to the

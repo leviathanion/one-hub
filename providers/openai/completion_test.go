@@ -141,7 +141,8 @@ func TestCreateCompletionStreamRecognizesDataDoneWithoutSpace(t *testing.T) {
 		t.Fatalf("create completion stream: %v", apiErr)
 	}
 	t.Cleanup(stream.Close)
-	_, errChan := stream.Recv()
+	dataChan, errChan := stream.Recv()
+	<-dataChan
 
 	select {
 	case err := <-errChan:
@@ -207,34 +208,27 @@ func TestCreateExactCompletionStreamPreservesRawSSEAndExplicitZeroUsage(t *testi
 	}
 }
 
-func TestExactCompletionProviderErrorStopsBeforeLateUsage(t *testing.T) {
+func TestExactCompletionProviderErrorDoesNotStopRawDeliveryOrUsageObservation(t *testing.T) {
 	handler := OpenAIStreamHandler{Usage: &types.Usage{}}
 	body := "data: {\"error\":{\"message\":\"invalid prompt\",\"type\":\"invalid_request_error\",\"code\":\"invalid_value\"}}\n\n" +
 		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":5,\"total_tokens\":9}}\n\n" +
 		"data: [DONE]\n\n"
 	stream, apiErr := requester.RequestRawSSEEventStreamWithEmitterOptions(nil, &http.Response{
 		Body: io.NopCloser(strings.NewReader(body)),
-	}, handler.handleExactCompletionSSE, requester.StreamReadOptions{RequireProtocolTerminal: true})
+	}, handler.handleExactCompletionSSE, requester.StreamReadOptions{})
 	if apiErr != nil {
 		t.Fatalf("create exact Completion stream: %+v", apiErr)
 	}
-	defer requester.CloseAndDrainStream(stream)
-	data, errs := stream.Recv()
-	if got := <-data; !strings.Contains(got, `"code":"invalid_value"`) {
-		t.Fatalf("provider error event changed: %q", got)
+	got, streamErr := collectNativeSSE(t, stream)
+	if got != body || !errors.Is(streamErr, io.EOF) {
+		t.Fatalf("provider events changed: got=%q error=%v", got, streamErr)
 	}
-	if err := <-errs; err == nil || !strings.Contains(err.Error(), "invalid prompt") {
-		t.Fatalf("provider error did not terminate Completion producer: %v", err)
-	}
-	if _, ok := <-data; ok {
-		t.Fatal("Completion producer emitted data after provider error")
-	}
-	if handler.Usage.ProviderReported || handler.Usage.TotalTokens != 0 {
-		t.Fatalf("late Completion usage mutated accounting: %+v", handler.Usage)
+	if !handler.Usage.ProviderReported || handler.Usage.TotalTokens != 9 {
+		t.Fatalf("late Completion usage not observed: %+v", handler.Usage)
 	}
 }
 
-func TestCreateCompletionStreamTerminalRequirementFollowsProviderCapability(t *testing.T) {
+func TestCreateCompletionStreamNativeEOFDoesNotRequireBusinessTerminal(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, `data: {"id":"cmpl_eof","choices":[{"text":"ok","index":0,"finish_reason":"stop"}]}`+"\n\n")
@@ -248,15 +242,18 @@ func TestCreateCompletionStreamTerminalRequirementFollowsProviderCapability(t *t
 	for _, test := range []struct {
 		name            string
 		requireTerminal bool
+		escapeJSON      bool
 		wantMissing     bool
 	}{
 		{name: "compatible EOF"},
-		{name: "required terminal missing", requireTerminal: true, wantMissing: true},
+		{name: "native terminal setting ignored", requireTerminal: true},
+		{name: "explicit conversion retains terminal contract", requireTerminal: true, escapeJSON: true, wantMissing: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			proxy := ""
 			provider := CreateOpenAIProvider(&model.Channel{Plugin: model.NewCustomEndpointPlugin(), Type: config.ChannelTypeCustom, Key: "sk-test", Proxy: &proxy}, server.URL)
 			provider.RequireOpenAIStreamTerminal = test.requireTerminal
+			provider.StreamEscapeJSON = test.escapeJSON
 			provider.Usage = &types.Usage{}
 			stream, apiErr := provider.CreateCompletionStream(&types.CompletionRequest{Model: "gpt-3.5-turbo-instruct", Prompt: "hello", Stream: true})
 			if apiErr != nil {

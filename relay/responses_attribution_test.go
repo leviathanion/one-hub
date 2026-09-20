@@ -19,7 +19,7 @@ func TestResponsesWSAttributionConflictDoesNotChargeTokens(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			actor, _, conn := newSteeringTestActor(t, 1000)
-			attempt := actor.turns.active.attempt
+			attempt := actor.observation.byResponse("resp_parent").attempt
 			steeringProviderFrame(actor, fmt.Sprintf(`{"type":"response.created","response":{"id":"resp_parent",%s}}`, test.created))
 			fields := test.terminal
 			if fields != "" {

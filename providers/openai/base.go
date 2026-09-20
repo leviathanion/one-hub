@@ -41,14 +41,16 @@ type OpenAIProvider struct {
 	SupportStreamOptions bool
 	StreamEscapeJSON     bool
 	ReasoningHandler     bool
-	// RequireOpenAIStreamTerminal is enabled only for adapters whose Chat and
-	// legacy Completions SSE contract requires an explicit [DONE] marker.
-	// Compatible endpoints may use transport EOF as their successful terminal.
+	// RequireOpenAIStreamTerminal applies only to explicit conversion paths.
+	// Native SSE delivery ends at transport EOF, not an observed business marker.
 	RequireOpenAIStreamTerminal bool
 	// ProviderRawJSONReplay 仅由确认响应无需 adapter 规范化的 exact-wire provider 开启。
 	ProviderRawJSONReplay bool
 	UsageHandler          UsageHandler
 	RequestHandleBefore   RequestHandleBefore
+	storedChatOwnerCommit func(string) error
+	prepareChatAudioOwner func(int) error
+	commitChatAudioOwner  func([]base.ChatAudioResourceFact) error
 }
 
 var _ base.RawRelayURLBuilder = (*OpenAIProvider)(nil)
@@ -245,7 +247,7 @@ func (p *OpenAIProvider) BuildRawRelayURL(escapedPath, rawQuery string) (string,
 		return "", fmt.Errorf("raw relay provider is not initialized")
 	}
 	switch p.Channel.Type {
-	case config.ChannelTypeOpenAI, config.ChannelTypeAzure, config.ChannelTypeAzureV1:
+	case config.ChannelTypeOpenAI, config.ChannelTypeAzure, config.ChannelTypeAzureV1, config.ChannelTypeCustom:
 	default:
 		return "", fmt.Errorf("channel type does not support raw resource relay")
 	}
@@ -254,8 +256,19 @@ func (p *OpenAIProvider) BuildRawRelayURL(escapedPath, rawQuery string) (string,
 		return "", fmt.Errorf("raw relay path must be an absolute-path reference")
 	}
 	requestURL := escapedPath
+	if p.Channel.Type == config.ChannelTypeCustom {
+		var err error
+		requestURL, err = p.customRawResourceURI(escapedPath)
+		if err != nil {
+			return "", err
+		}
+	}
 	if rawQuery != "" {
-		requestURL += "?" + rawQuery
+		separator := "?"
+		if strings.Contains(requestURL, "?") {
+			separator = "&"
+		}
+		requestURL += separator + rawQuery
 	}
 	fullURL := p.GetFullRequestURL(requestURL, "")
 	parsed, err := url.Parse(fullURL)
@@ -263,6 +276,39 @@ func (p *OpenAIProvider) BuildRawRelayURL(escapedPath, rawQuery string) (string,
 		return "", fmt.Errorf("raw relay upstream URL is invalid")
 	}
 	return parsed.String(), nil
+}
+
+// customRawResourceURI 只映射已登记的资源家族；配置地址由管理员提供，
+// 客户端只提供家族内的转义后缀，不能借请求路径替换上游主机。
+func (p *OpenAIProvider) customRawResourceURI(escapedPath string) (string, error) {
+	for _, id := range []string{"openai.chat_completions", providerendpoint.Files, providerendpoint.Uploads, providerendpoint.Conversations, providerendpoint.Batches, providerendpoint.FineTuning, providerendpoint.Assistants, providerendpoint.Threads, providerendpoint.VectorStores} {
+		definition, _ := providerendpoint.Find(id)
+		if escapedPath != definition.DefaultPath && !strings.HasPrefix(escapedPath, definition.DefaultPath+"/") {
+			continue
+		}
+		configured, err := p.Channel.ResolveEndpoint(id)
+		if err != nil {
+			return "", err
+		}
+		if configured == "" {
+			return "", fmt.Errorf("raw resource endpoint %s is disabled", id)
+		}
+		uri, err := url.Parse(strings.TrimSpace(configured))
+		if err != nil {
+			return "", err
+		}
+		suffix := strings.TrimPrefix(escapedPath, definition.DefaultPath)
+		decodedSuffix, err := url.PathUnescape(suffix)
+		if err != nil {
+			return "", err
+		}
+		if suffix != "" {
+			uri.RawPath = strings.TrimRight(uri.EscapedPath(), "/") + suffix
+			uri.Path = strings.TrimRight(uri.Path, "/") + decodedSuffix
+		}
+		return uri.String(), nil
+	}
+	return "", fmt.Errorf("path does not belong to a configured raw resource family")
 }
 
 func isAzureClassicResponsesHTTPPath(requestURL string) bool {
@@ -509,10 +555,14 @@ func (p *OpenAIProvider) getRequestTextBody(relayMode int, ModelName string, req
 		}
 		replaceRequestBody(httpReq, body)
 	}
-	if relayMode == config.RelayModeImagesGenerations {
+	if relayMode == config.RelayModeImagesGenerations && !p.SupportsImageResponse() {
 		if errWithCode := rejectUnsupportedImageStreamRequest(httpReq); errWithCode != nil {
 			return nil, errWithCode
 		}
+	}
+	if errWithCode := p.authorizeMediaRequestBody(httpReq, relayMode); errWithCode != nil {
+		_ = httpReq.Body.Close()
+		return nil, errWithCode
 	}
 	if nativeBodyUsed && p.Context != nil && p.Context.Request != nil {
 		if err := p.applyOpenAIHTTPHeaders(httpReq.Header, requestctx.NewHeaderSnapshot(p.Context.Request.Header)); err != nil {

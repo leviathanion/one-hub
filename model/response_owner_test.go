@@ -142,6 +142,17 @@ func TestResponseOwnerTombstoneExpiryAndCleanup(t *testing.T) {
 	if !got.ExpiresAt.Equal(owner.ExpiresAt) {
 		t.Fatalf("tombstone must preserve original expiry, got %s want %s", got.ExpiresAt, owner.ExpiresAt)
 	}
+	late, err := NewResponseOwner(owner.ResponseID, owner.UserID, owner.TokenID, owner.ChannelID, deleteAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := createResponseOwner(db, late); err != nil {
+		t.Fatalf("same-owner late observation must not fail on a tombstone: %v", err)
+	}
+	retained, err := getResponseOwner(db, owner.ResponseID, deleteAt.Add(30*time.Minute))
+	if err != nil || retained.State != ResponseOwnerStateDeleted || !retained.ExpiresAt.Equal(owner.ExpiresAt) {
+		t.Fatalf("late observation must neither revive nor extend authorization: owner=%+v err=%v", retained, err)
+	}
 	if _, err := getResponseOwner(db, owner.ResponseID, owner.ExpiresAt); !errors.Is(err, ErrResponseOwnerNotFound) {
 		t.Fatalf("owner must be expired at the exact boundary, got %v", err)
 	}

@@ -86,8 +86,8 @@ func prepareResponsesContinuationOwnership(c *gin.Context, request *types.OpenAI
 	if c == nil || request == nil {
 		return responsesContinuationRoute{}, nil
 	}
-	responseID := strings.TrimSpace(request.PreviousResponseID)
-	if responseID == "" {
+	responseID := request.PreviousResponseID
+	if strings.TrimSpace(responseID) == "" {
 		return responsesContinuationRoute{}, nil
 	}
 	userID := c.GetInt("id")
@@ -95,7 +95,7 @@ func prepareResponsesContinuationOwnership(c *gin.Context, request *types.OpenAI
 	defer cancel()
 	owner, err := model.GetResponseOwner(operationCtx, responseID, userID)
 	if err == nil {
-		if owner == nil || owner.State != model.ResponseOwnerStateActive || owner.UserID != userID {
+		if owner == nil || owner.UserID != userID {
 			return responsesContinuationRoute{}, invalidPreviousResponseOwnerError()
 		}
 		if pin := explicitChannelPinID(c); pin > 0 && pin != owner.ChannelID {
@@ -200,12 +200,12 @@ func responsesEphemeralProofKey(c *gin.Context, responseID string) string {
 	if c != nil {
 		userID = c.GetInt("id")
 	}
-	responseID = strings.TrimSpace(responseID)
-	if userID <= 0 || responseID == "" {
+	if userID <= 0 || strings.TrimSpace(responseID) == "" {
 		return ""
 	}
+	// v1 proofs normalized IDs; they cannot prove ownership of this exact wire identity.
 	digest := sha256.Sum256([]byte(responseID))
-	return fmt.Sprintf("responses:ephemeral:user:%d:id:%s", userID, hex.EncodeToString(digest[:16]))
+	return fmt.Sprintf("responses:ephemeral:v2:user:%d:id:%s", userID, hex.EncodeToString(digest[:16]))
 }
 
 func recordResponsesEphemeralProof(c *gin.Context, responseID string, channelID int) {

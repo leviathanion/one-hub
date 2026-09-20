@@ -397,11 +397,7 @@ func (r *HTTPRequester) sendRequest(req *http.Request, response any, outputResp 
 		if preserveRedirect && isRedirectStatus(resp.StatusCode) {
 			return nil, preservedRedirectResponse(resp, providerresponse.OperationUnknown)
 		}
-		apiErr := HandleErrorResp(resp, r.ErrorHandler, r.PrefixProviderErrors, replayProviderEnvelope)
-		if apiErr != nil && (resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode >= http.StatusInternalServerError) {
-			apiErr.UpstreamAmbiguous = true
-		}
-		return nil, apiErr
+		return nil, r.handleFailureResponse(resp, replayProviderEnvelope)
 	}
 
 	// 解析响应
@@ -482,11 +478,7 @@ func (r *HTTPRequester) SendRequestRaw(req *http.Request) (*http.Response, *type
 
 	// 处理响应
 	if r.IsFailureStatusCode(resp) {
-		apiErr := HandleErrorResp(resp, r.ErrorHandler, r.PrefixProviderErrors, r.ReplayOpenAIErrorEnvelopes)
-		if apiErr != nil && (resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode >= http.StatusInternalServerError) {
-			apiErr.UpstreamAmbiguous = true
-		}
-		return nil, apiErr
+		return nil, r.handleFailureResponse(resp, r.ReplayOpenAIErrorEnvelopes)
 	}
 
 	return resp, nil
@@ -521,7 +513,7 @@ func (r *HTTPRequester) SendRequestRawCheckedNativeDialect(req *http.Request, op
 		return nil, preservedRedirectResponse(resp, operation)
 	}
 	if r.IsFailureStatusCode(resp) {
-		return nil, HandleErrorResp(resp, r.ErrorHandler, r.PrefixProviderErrors, true)
+		return nil, r.handleFailureResponse(resp, true)
 	}
 	return resp, nil
 }
@@ -538,9 +530,19 @@ func (r *HTTPRequester) sendRequestRawCheckedNoRedirect(req *http.Request, prese
 		return nil, preservedRedirectResponse(resp, operation)
 	}
 	if r.IsFailureStatusCode(resp) {
-		return nil, HandleErrorResp(resp, r.ErrorHandler, r.PrefixProviderErrors, r.ReplayOpenAIErrorEnvelopes)
+		return nil, r.handleFailureResponse(resp, r.ReplayOpenAIErrorEnvelopes)
 	}
 	return resp, nil
+}
+
+// A server failure or timeout does not prove that provider work never ran.
+// Keep this submission fact identical across typed, native and raw checkers.
+func (r *HTTPRequester) handleFailureResponse(resp *http.Response, replayEnvelope bool) *types.OpenAIErrorWithStatusCode {
+	apiErr := HandleErrorResp(resp, r.ErrorHandler, r.PrefixProviderErrors, replayEnvelope)
+	if apiErr != nil && (resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode >= http.StatusInternalServerError) {
+		apiErr.UpstreamAmbiguous = true
+	}
+	return apiErr
 }
 
 func isRedirectStatus(statusCode int) bool {

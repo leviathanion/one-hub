@@ -20,7 +20,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func TestCreateChatCompletionStreamTerminalRequirementFollowsProviderCapability(t *testing.T) {
+func TestCreateChatCompletionStreamNativeEOFDoesNotRequireBusinessTerminal(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, `data: {"id":"chatcmpl_terminal","model":"gpt-5","choices":[{"index":0,"delta":{"content":"ok"}}]}`+"\n\n")
@@ -34,15 +34,18 @@ func TestCreateChatCompletionStreamTerminalRequirementFollowsProviderCapability(
 	for _, test := range []struct {
 		name            string
 		requireTerminal bool
+		escapeJSON      bool
 		wantMissing     bool
 	}{
 		{name: "compatible EOF"},
-		{name: "required terminal missing", requireTerminal: true, wantMissing: true},
+		{name: "native terminal setting ignored", requireTerminal: true},
+		{name: "explicit conversion retains terminal contract", requireTerminal: true, escapeJSON: true, wantMissing: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			proxy := ""
 			provider := CreateOpenAIProvider(&model.Channel{Plugin: model.NewCustomEndpointPlugin(), Type: config.ChannelTypeCustom, Key: "sk-test", Proxy: &proxy}, server.URL)
 			provider.RequireOpenAIStreamTerminal = test.requireTerminal
+			provider.StreamEscapeJSON = test.escapeJSON
 			provider.Usage = &types.Usage{}
 			stream, apiErr := provider.CreateChatCompletionStream(&types.ChatCompletionRequest{
 				Model: "gpt-5", Stream: true, Messages: []types.ChatCompletionMessage{{Role: types.ChatMessageRoleUser, Content: "hello"}},
@@ -50,8 +53,8 @@ func TestCreateChatCompletionStreamTerminalRequirementFollowsProviderCapability(
 			if apiErr != nil {
 				t.Fatalf("create stream: %+v", apiErr)
 			}
-			if requester.IsRawSSEEventStream(stream) {
-				t.Fatal("OpenAI-compatible stream was mislabeled as exact raw SSE")
+			if requester.IsRawSSEEventStream(stream) == test.escapeJSON {
+				t.Fatal("native and converting streams have incorrect delivery markers")
 			}
 			data, streamErrs := stream.Recv()
 			defer stream.Close()
@@ -282,27 +285,18 @@ func TestCreateExactChatStreamPreservesRawSSEAndClientStreamOptions(t *testing.T
 	}
 }
 
-func TestExactChatProviderErrorStopsBeforeLateUsage(t *testing.T) {
+func TestExactChatProviderErrorDoesNotStopRawDeliveryOrUsageObservation(t *testing.T) {
 	handler := OpenAIStreamHandler{Usage: &types.Usage{}}
 	body := "data: {\"error\":{\"type\":\"invalid_request_error\",\"code\":\"invalid_value\"}}\n\n" +
 		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":9,\"total_tokens\":18}}\n\n" +
 		"data: [DONE]\n\n"
 	stream := newExactChatTestStream(t, &handler, body)
-	defer requester.CloseAndDrainStream(stream)
-	data, errs := stream.Recv()
-	if got := <-data; !strings.Contains(got, `"code":"invalid_value"`) {
-		t.Fatalf("provider error event changed: %q", got)
+	got, streamErr := collectNativeSSE(t, stream)
+	if got != body || !errors.Is(streamErr, io.EOF) {
+		t.Fatalf("provider events changed: got=%q error=%v", got, streamErr)
 	}
-	streamErr := <-errs
-	var providerErr *types.OpenAIErrorWithStatusCode
-	if !errors.As(streamErr, &providerErr) || providerErr == nil || providerErr.Code != "invalid_value" {
-		t.Fatalf("code-only provider error did not terminate the raw producer: %v", streamErr)
-	}
-	if _, ok := <-data; ok {
-		t.Fatal("raw producer observed or emitted data after the provider error")
-	}
-	if handler.Usage.ProviderReported || handler.Usage.TotalTokens != 0 {
-		t.Fatalf("late usage mutated accounting after provider error: %+v", handler.Usage)
+	if !handler.Usage.ProviderReported || handler.Usage.TotalTokens != 18 {
+		t.Fatalf("late usage not observed: %+v", handler.Usage)
 	}
 }
 

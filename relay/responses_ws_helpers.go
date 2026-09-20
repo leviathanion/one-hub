@@ -496,10 +496,3 @@ func mergeExtraBillingMapsMax(dst map[string]types.ExtraBilling, src map[string]
 }
 
 // 明确的 create 续接拒绝发生在绑定 Response 之前；泛化 error 不提供该事实。
-func responsesWSExplicitCreateRejection(event responsesws.ResponsesTerminalResult, attempt *ResponsesWSTurnAttempt) bool {
-	return event.RequestError && event.ErrorCode == "previous_response_not_found" && attempt != nil && attempt.SeenProviderResponseID == "" && attempt.AttemptedPreviousResponseID != ""
-}
-
-func responsesWSResourceLifecycleEvent(eventType string) bool {
-	return commonresponses.IsResponseLifecycleEvent(eventType)
-}

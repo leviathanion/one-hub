@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"one-api/common/config"
 	"one-api/model"
 	"one-api/providers/base"
 	"one-api/types"
@@ -74,15 +75,15 @@ func TestOpenAIDialectAssessmentUsesPostCustomParametersForOwnedRules(t *testing
 	}
 }
 
-func TestOpenAIPostCustomCannotUseAnUnrepresentableStoreMode(t *testing.T) {
-	for _, test := range []struct {
-		value string
-		allow bool
-	}{{"false", true}, {"null", true}, {"true", false}, {`"true"`, false}, {"1", false}, {`{"future":true}`, false}} {
-		parameter := `{"store":` + test.value + `}`
-		err := ValidateChatRequestForChannel(&model.Channel{CustomParameter: &parameter}, "gpt-5", &types.ChatCompletionRequest{Model: "gpt-5"}, nil)
-		if (err == nil) != test.allow {
-			t.Fatalf("store=%s allowed=%t err=%v", test.value, test.allow, err)
+func TestOpenAIPostCustomStoreUsesNativeLifecycleCapability(t *testing.T) {
+	for _, channelType := range []int{config.ChannelTypeOpenAI, config.ChannelTypeAzureV1, config.ChannelTypeCustom, config.ChannelTypeUnknown} {
+		for _, value := range []string{"false", "null", "true", `"true"`, "1", `{"future":true}`} {
+			parameter := `{"store":` + value + `}`
+			err := ValidateChatRequestForChannel(&model.Channel{Type: channelType, CustomParameter: &parameter}, "gpt-5", &types.ChatCompletionRequest{Model: "gpt-5"}, nil)
+			allow := value != "true" || channelType != config.ChannelTypeUnknown
+			if (err == nil) != allow {
+				t.Fatalf("channel=%d store=%s allowed=%t err=%v", channelType, value, allow, err)
+			}
 		}
 	}
 }

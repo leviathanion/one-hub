@@ -19,6 +19,7 @@ import (
 type responsesTestDeadlineWriter struct{ gin.ResponseWriter }
 
 func (*responsesTestDeadlineWriter) SetWriteDeadline(time.Time) error { return nil }
+func (*responsesTestDeadlineWriter) SetReadDeadline(time.Time) error  { return nil }
 func (w *responsesTestDeadlineWriter) FlushError() error              { w.ResponseWriter.Flush(); return nil }
 func enableResponsesTestDeadline(c *gin.Context)                      { c.Writer = &responsesTestDeadlineWriter{c.Writer} }
 

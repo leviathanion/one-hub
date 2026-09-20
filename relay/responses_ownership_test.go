@@ -101,9 +101,9 @@ func TestPrepareResponsesContinuationOwnershipEnforcesUserAndChannel(t *testing.
 		t.Fatalf("tombstone response owner: %v", err)
 	}
 	deleted, _ := responsesOwnerTestContext(11, 21)
-	_, err = prepareResponsesContinuationOwnership(deleted, &types.OpenAIResponsesRequest{PreviousResponseID: owner.ResponseID})
-	if apiErr = responsesOwnershipAPIError(err); apiErr == nil || apiErr.StatusCode != http.StatusBadRequest || apiErr.Code != "previous_response_not_found" {
-		t.Fatalf("expected tombstoned owner to use uniform previous-response error, got %+v", apiErr)
+	route, err = prepareResponsesContinuationOwnership(deleted, &types.OpenAIResponsesRequest{PreviousResponseID: owner.ResponseID})
+	if err != nil || !route.Strict || route.ChannelID != owner.ChannelID {
+		t.Fatalf("deletion observation must preserve retained authorization and routing, route=%+v err=%v", route, err)
 	}
 }
 

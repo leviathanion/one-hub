@@ -12,6 +12,7 @@ import (
 	"one-api/common/utils"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var (
@@ -66,9 +67,10 @@ func (token *Token) AfterCreate(tx *gorm.DB) (err error) {
 }
 
 type TokenSetting struct {
-	Heartbeat  HeartbeatSetting `json:"heartbeat,omitempty"`
-	Limits     LimitsConfig     `json:"limits,omitempty"`
-	BillingTag *string          `json:"billing_tag,omitempty"` // 费用标签，用于按分组统计费用，仅可信内部员工和管理员可见
+	Heartbeat         HeartbeatSetting `json:"heartbeat,omitempty"`
+	Limits            LimitsConfig     `json:"limits,omitempty"`
+	BillingTag        *string          `json:"billing_tag,omitempty"`         // 费用标签，用于按分组统计费用，仅可信内部员工和管理员可见
+	ResourceChannelID int              `json:"resource_channel_id,omitempty"` // 管理员指定的无引用资源创建渠道；0 表示未配置
 }
 
 type HeartbeatSetting struct {
@@ -306,6 +308,30 @@ func (token *Token) Insert() error {
 // the caller so concurrent reserve/settlement deltas cause a conflict instead
 // of being overwritten. Status-only edits pass nil.
 func (token *Token) UpdateMutableFields(expectedRemainQuota *int) error {
+	err := token.updateMutableFields(DB, expectedRemainQuota)
+	token.invalidateUpdatedTokenCache(err)
+	return err
+}
+
+// UpdateMutableFieldsPreservingResourceChannel prevents a user's stale settings
+// from overwriting a resource route assigned by an administrator. The read and
+// update share a row lock; copying the controller's earlier snapshot is not enough.
+func (token *Token) UpdateMutableFieldsPreservingResourceChannel(expectedRemainQuota *int) error {
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var current Token
+		if err := tx.Select("id", "setting").Clauses(clause.Locking{Strength: "UPDATE"}).First(&current, "id = ?", token.Id).Error; err != nil {
+			return err
+		}
+		setting := token.Setting.Data()
+		setting.ResourceChannelID = current.Setting.Data().ResourceChannelID
+		token.Setting.Set(setting)
+		return token.updateMutableFields(tx, expectedRemainQuota)
+	})
+	token.invalidateUpdatedTokenCache(err)
+	return err
+}
+
+func (token *Token) updateMutableFields(db *gorm.DB, expectedRemainQuota *int) error {
 	updates := map[string]any{
 		"name":            token.Name,
 		"status":          token.Status,
@@ -315,7 +341,7 @@ func (token *Token) UpdateMutableFields(expectedRemainQuota *int) error {
 		"backup_group":    token.BackupGroup,
 		"setting":         token.Setting,
 	}
-	db := DB.Model(&Token{}).Where("id = ?", token.Id)
+	db = db.Model(&Token{}).Where("id = ?", token.Id)
 	if expectedRemainQuota != nil {
 		db = db.Where("remain_quota = ?", *expectedRemainQuota)
 		updates["remain_quota"] = token.RemainQuota
@@ -325,12 +351,14 @@ func (token *Token) UpdateMutableFields(expectedRemainQuota *int) error {
 	if err == nil && expectedRemainQuota != nil && result.RowsAffected == 0 {
 		err = ErrTokenQuotaConflict
 	}
-	// 防止Redis缓存不生效，直接删除
+	return err
+}
+
+// 在事务提交后执行现有 token 缓存失效，避免事务内失效后立即读到旧值。
+func (token *Token) invalidateUpdatedTokenCache(err error) {
 	if err == nil && config.RedisEnabled {
 		redis.RedisDel(fmt.Sprintf(UserTokensKey, token.Key))
 	}
-
-	return err
 }
 
 func (token *Token) SelectUpdate() error {

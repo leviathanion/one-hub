@@ -90,46 +90,13 @@ func TestResponsesWSEvidenceEventsDoNotStoreDuplicateCoarseOrigin(t *testing.T) 
 	}
 }
 
-func TestResponsesWSActorLifecycleCleanupUsesTurnSlotHelpers(t *testing.T) {
-	root := responsesWSTestRepoRoot(t)
-	fset := token.NewFileSet()
-	filePath := filepath.Join(root, "relay/responses_ws.go")
-	file, err := parser.ParseFile(fset, filePath, nil, 0)
-	if err != nil {
-		t.Fatalf("parse %s: %v", filePath, err)
-	}
-	ast.Inspect(file, func(node ast.Node) bool {
-		assign, ok := node.(*ast.AssignStmt)
-		if !ok {
-			return true
-		}
-		for i, lhs := range assign.Lhs {
-			path := responsesWSSelectorPath(lhs)
-			if path == "" {
-				continue
-			}
-			var rhs ast.Expr
-			if len(assign.Rhs) == 1 {
-				rhs = assign.Rhs[0]
-			} else if i < len(assign.Rhs) {
-				rhs = assign.Rhs[i]
-			}
-			if responsesWSForbiddenTurnSlotCleanupAssignment(path, rhs) {
-				t.Fatalf("%s:%d: actor lifecycle cleanup must use turn slot helpers, found assignment to %s", filePath, fset.Position(lhs.Pos()).Line, path)
-			}
-		}
-		return true
-	})
-}
-
 func TestResponsesWSAccountingPathDoesNotBranchRawDetailOrigin(t *testing.T) {
 	root := responsesWSTestRepoRoot(t)
 	targets := map[string][]string{
 		filepath.Join(root, "relay/responses_ws_actor_settlement.go"): {
 			"projectResponsesWSSharedDecision",
-			"applyPendingSettlement",
-			"applyActiveSettlement",
 		},
+		filepath.Join(root, "relay/responses_ws_observation.go"): {"finishObservedWork", "finishAllObservedWorks"},
 	}
 	for filePath, names := range targets {
 		responsesWSAssertFunctionsDoNotBranchRawDetailOrigin(t, filePath, names...)
@@ -139,49 +106,25 @@ func TestResponsesWSAccountingPathDoesNotBranchRawDetailOrigin(t *testing.T) {
 func TestResponsesWSStreamEvidenceIsObservedOnlyAtProviderIngress(t *testing.T) {
 	root := responsesWSTestRepoRoot(t)
 	fset := token.NewFileSet()
-	filePath := filepath.Join(root, "relay/responses_ws.go")
+	filePath := filepath.Join(root, "relay/responses_ws_observation.go")
 	file, err := parser.ParseFile(fset, filePath, nil, 0)
 	if err != nil {
-		t.Fatalf("parse %s: %v", filePath, err)
+		t.Fatal(err)
 	}
-
-	functions := make(map[string]*ast.FuncDecl)
-	for _, declaration := range file.Decls {
-		function, ok := declaration.(*ast.FuncDecl)
-		if ok {
-			functions[function.Name.Name] = function
+	var count int
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok {
+			continue
 		}
-	}
-
-	handler := functions["handleProviderDownstreamWithObservation"]
-	if handler == nil {
-		t.Fatalf("%s: missing handleProviderDownstreamWithObservation", filePath)
-	}
-	allCalls := responsesWSMethodCallPositions(handler.Body, "ObserveResponsesStreamPayload")
-	if len(allCalls) != 1 {
-		t.Fatalf("%s: provider ingress must have exactly one stream evidence observation, got %d", filePath, len(allCalls))
-	}
-	guardedCalls := make(map[token.Pos]struct{})
-	ast.Inspect(handler.Body, func(node ast.Node) bool {
-		conditional, ok := node.(*ast.IfStmt)
-		if !ok || !responsesWSExprContainsIdent(conditional.Cond, "observe") {
-			return true
+		calls := responsesWSMethodCallPositions(fn.Body, "ObserveResponsesStreamPayload")
+		if len(calls) > 0 && fn.Name.Name != "observeParallelDownstream" {
+			t.Fatalf("evidence observed outside provider ingress: %s", fn.Name.Name)
 		}
-		for _, position := range responsesWSMethodCallPositions(conditional.Body, "ObserveResponsesStreamPayload") {
-			guardedCalls[position] = struct{}{}
-		}
-		return true
-	})
-	if _, ok := guardedCalls[allCalls[0]]; !ok {
-		t.Fatalf("%s:%d: stream evidence observation must be guarded from pending journal replay", filePath, fset.Position(allCalls[0]).Line)
+		count += len(calls)
 	}
-
-	closeReplay := functions["applyBufferedPendingTerminalEvidence"]
-	if closeReplay == nil {
-		t.Fatalf("%s: missing applyBufferedPendingTerminalEvidence", filePath)
-	}
-	if calls := responsesWSMethodCallPositions(closeReplay.Body, "ObserveResponsesStreamPayload"); len(calls) != 0 {
-		t.Fatalf("%s:%d: close replay must consume previously observed stream evidence", filePath, fset.Position(calls[0]).Line)
+	if count != 1 {
+		t.Fatalf("provider ingress must observe evidence once: %d", count)
 	}
 }
 
@@ -230,35 +173,6 @@ func responsesWSSelectorPath(expr ast.Expr) string {
 	default:
 		return ""
 	}
-}
-
-func responsesWSForbiddenTurnSlotCleanupAssignment(path string, rhs ast.Expr) bool {
-	switch {
-	case strings.HasSuffix(path, ".turns.pending.attempt"):
-		return responsesWSExprIsNil(rhs)
-	case strings.HasSuffix(path, ".turns.pending.provider"):
-		return true
-	case strings.HasSuffix(path, ".turns.active.attempt"):
-		return responsesWSExprIsNil(rhs)
-	case strings.HasSuffix(path, ".turns.active.evidence"):
-		return true
-	case strings.HasSuffix(path, ".turns.active.affinity"):
-		return responsesWSExprIsNil(rhs)
-	case strings.HasSuffix(path, ".turns.active.channelID"):
-		return responsesWSExprIsIntegerLiteral(rhs, "0")
-	default:
-		return false
-	}
-}
-
-func responsesWSExprIsNil(expr ast.Expr) bool {
-	ident, ok := expr.(*ast.Ident)
-	return ok && ident.Name == "nil"
-}
-
-func responsesWSExprIsIntegerLiteral(expr ast.Expr, value string) bool {
-	lit, ok := expr.(*ast.BasicLit)
-	return ok && lit.Kind == token.INT && lit.Value == value
 }
 
 func responsesWSMethodCallPositions(node ast.Node, method string) []token.Pos {

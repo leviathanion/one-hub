@@ -199,17 +199,19 @@ func TestCodexResponsesWSAdapterOpaqueTerminalPreservesWire(t *testing.T) {
 }
 
 func TestCodexResponsesWSAdapterIsolatesConflictingImageEvidence(t *testing.T) {
-	adapter := &codexResponsesWSAdapter{provider: &CodexProvider{}, model: "gpt-5", accumulator: newCodexTurnUsageAccumulator()}
-	payload := []byte(`{"type":"response.output_item.done","item_id":"img_top","output_index":0,"item":{"id":"img_item","type":"image_generation_call","status":"completed","quality":"high","size":"1024x1024"}}`)
+	adapter := &codexResponsesWSAdapter{provider: &CodexProvider{}, model: "gpt-5"}
+	adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame([]byte(`{"type":"response.created","response":{"id":"resp_image"}}`)))
+	payload := []byte(`{"type":"response.output_item.done","response_id":"resp_image","item_id":"img_top","output_index":0,"item":{"id":"img_item","type":"image_generation_call","status":"completed","quality":"high","size":"1024x1024"}}`)
 	result := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame(payload))
 	if result.Err != nil || result.CloseTransport || result.EmitFrame == nil || string(result.EmitFrame.Payload()) != string(payload) || result.Usage == nil || !result.Usage.BillingDiagnostics["unit_service_conflict:image_generation"] {
 		t.Fatalf("component conflict affected wire or lost diagnostics: %+v", result)
 	}
 }
 
-func TestCodexResponsesWSAdapterRejectsTerminalToolOverflowWithoutPartialFrameBilling(t *testing.T) {
-	adapter := &codexResponsesWSAdapter{provider: &CodexProvider{}, model: "gpt-5", accumulator: newCodexTurnUsageAccumulator()}
-	prefix := []byte(`{"type":"response.output_item.done","item_id":"ws_prefix","output_index":0,"item":{"id":"ws_prefix","type":"web_search_call","status":"completed","action":{"type":"search"}}}`)
+func TestCodexResponsesWSAdapterForwardsTerminalToolOverflowWithoutPartialFrameBilling(t *testing.T) {
+	adapter := &codexResponsesWSAdapter{provider: &CodexProvider{}, model: "gpt-5"}
+	adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame([]byte(`{"type":"response.created","response":{"id":"resp_tool_overflow"}}`)))
+	prefix := []byte(`{"type":"response.output_item.done","response_id":"resp_tool_overflow","item_id":"ws_prefix","output_index":0,"item":{"id":"ws_prefix","type":"web_search_call","status":"completed","action":{"type":"search"}}}`)
 	prefixResult := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame(prefix))
 	key := types.BuildExtraBillingKey(types.APIToolTypeWebSearchPreview, "medium")
 	if prefixResult.Err != nil || prefixResult.EmitFrame == nil || prefixResult.Usage == nil || prefixResult.Usage.ExtraBilling[key].CallCount != 1 {
@@ -222,21 +224,17 @@ func TestCodexResponsesWSAdapterRejectsTerminalToolOverflowWithoutPartialFrameBi
 		outputs = append(outputs, types.ResponsesOutput{ID: fmt.Sprintf("ws_terminal_%d", index), Type: types.InputTypeWebSearchCall, Status: "completed", Action: map[string]any{"type": "search"}})
 	}
 	payload, err := json.Marshal(types.OpenAIResponsesStreamResponses{
-		Type: "response.completed", Response: &types.OpenAIResponsesResponses{ID: "resp_tool_overflow", Status: "completed", Output: outputs},
+		Type: "response.completed", Response: &types.OpenAIResponsesResponses{ID: "resp_tool_overflow", Status: "completed", Output: outputs, Usage: &types.ResponsesUsage{InputTokens: 3, OutputTokens: 5, TotalTokens: 8}},
 	})
 	if err != nil {
 		t.Fatalf("marshal terminal fixture: %v", err)
 	}
 	result := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame(payload))
-	if result.Origin != responsesws.RecvDetailOriginProviderMalformed || !result.CloseTransport || result.EmitFrame != nil {
-		t.Fatalf("expected terminal overflow to close before emit, got %+v", result)
+	if result.Err != nil || result.CloseTransport || result.EmitFrame == nil || string(result.EmitFrame.Payload()) != string(payload) {
+		t.Fatalf("observer limit interrupted raw delivery: %+v", result)
 	}
-	var providerErr *types.OpenAIErrorWithStatusCode
-	if !errors.As(result.Err, &providerErr) || providerErr.Code != "provider_usage_state_limit" {
-		t.Fatalf("unexpected terminal overflow error: %#v", result.Err)
-	}
-	if result.Usage != nil && (result.Usage.ProviderTokenEvidence || len(result.Usage.ExtraBilling) != 0) {
-		t.Fatalf("failed terminal re-emitted or partially added billing: %+v", result.Usage)
+	if result.Usage == nil || result.Usage.TotalTokens != 8 || !result.Usage.ProviderTokenEvidence || !result.Usage.BillingDiagnostics["provider_usage_state_limit"] || !result.Usage.BillingDiagnostics["unit_service_conflict:web_search_preview"] {
+		t.Fatalf("missing isolated observer failure: %+v", result.Usage)
 	}
 }
 
@@ -300,7 +298,7 @@ func TestCodexResponsesWSAdapterPreservesOnlyClientPreviousResponseID(t *testing
 	}
 }
 
-func TestCodexResponsesWSAdapterTracksEachTurnModelForUsageFallback(t *testing.T) {
+func TestCodexResponsesWSAdapterPreservesEachCreateModel(t *testing.T) {
 	adapter := &codexResponsesWSAdapter{
 		provider: &CodexProvider{},
 		model:    "gpt-5",
@@ -318,12 +316,6 @@ func TestCodexResponsesWSAdapterTracksEachTurnModelForUsageFallback(t *testing.T
 		frame, err := adapter.PrepareClientFrame(context.Background(), responsesws.NewTextFrame(payload))
 		if err != nil {
 			t.Fatalf("prepare response.create for %q: %v", test.clientModel, err)
-		}
-		adapter.mu.Lock()
-		got := adapter.turnModel
-		adapter.mu.Unlock()
-		if got != test.wantModel {
-			t.Fatalf("expected usage fallback model %q for current turn, got %q", test.wantModel, got)
 		}
 		var encoded struct {
 			Model string `json:"model"`
@@ -344,10 +336,8 @@ func TestCodexResponsesWSAdapterFiltersOpaqueSessionCreatedBootstrap(t *testing.
 
 func TestCodexResponsesWSAdapterTerminalTextProviderFrameExtractsUsage(t *testing.T) {
 	adapter := &codexResponsesWSAdapter{
-		provider:    &CodexProvider{},
-		model:       "gpt-5",
-		turnModel:   "gpt-5.6-terra",
-		accumulator: newCodexTurnUsageAccumulator(),
+		provider: &CodexProvider{},
+		model:    "gpt-5",
 	}
 	payload := []byte(`{"type":"response.completed","sequence_number":1,"response":{"id":"resp_done","status":"completed","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`)
 	result := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame(payload))
@@ -360,17 +350,15 @@ func TestCodexResponsesWSAdapterTerminalTextProviderFrameExtractsUsage(t *testin
 	if result.Usage == nil || result.Usage.InputTokens != 3 || result.Usage.OutputTokens != 5 || result.Usage.TotalTokens != 8 {
 		t.Fatalf("expected terminal usage to be extracted, got %+v", result.Usage)
 	}
-	if adapter.lastResponse != "resp_done" || adapter.accumulator != nil || adapter.turnModel != "" {
-		t.Fatalf("expected terminal frame to update response state and clear turn state, last=%q model=%q accumulator=%+v", adapter.lastResponse, adapter.turnModel, adapter.accumulator)
+	if len(adapter.responses) != 0 {
+		t.Fatalf("terminal retained observer: %+v", adapter.responses)
 	}
 }
 
 func TestCodexResponsesWSAdapterNormalizesResponseDoneAtProviderBoundary(t *testing.T) {
 	adapter := &codexResponsesWSAdapter{
-		provider:    &CodexProvider{},
-		model:       "gpt-5",
-		turnModel:   "gpt-5",
-		accumulator: newCodexTurnUsageAccumulator(),
+		provider: &CodexProvider{},
+		model:    "gpt-5",
 	}
 	// Mirrors the Codex websocket tool-call lifecycle: the supplier closes one
 	// response turn with response.done before the client sends the next create.
@@ -380,7 +368,7 @@ func TestCodexResponsesWSAdapterNormalizesResponseDoneAtProviderBoundary(t *test
 		t.Fatalf("expected Codex response.done to normalize and pass through, got %+v", result)
 	}
 	classified := responsesws.ClassifyResponsesWSEvent(result.EmitFrame.Payload())
-	if classified.Malformed || classified.Kind != responsesws.ResponsesSuccessTerminal || classified.EventType != "response.completed" || !classified.HasSequenceNumber || classified.SequenceNumber != 0 {
+	if classified.Malformed || classified.Kind != responsesws.ResponsesSuccessTerminal || classified.EventType != "response.completed" || classified.HasSequenceNumber {
 		t.Fatalf("expected a valid normalized Responses terminal, classified=%+v payload=%s", classified, result.EmitFrame.Payload())
 	}
 	var object map[string]json.RawMessage
@@ -393,8 +381,8 @@ func TestCodexResponsesWSAdapterNormalizesResponseDoneAtProviderBoundary(t *test
 	if result.Usage == nil || result.Usage.InputTokens != 3 || result.Usage.OutputTokens != 5 || result.Usage.TotalTokens != 8 {
 		t.Fatalf("expected response.done usage evidence to survive normalization, got %+v", result.Usage)
 	}
-	if adapter.lastResponse != "resp_tool" || adapter.accumulator != nil || adapter.turnModel != "" {
-		t.Fatalf("expected normalized response.done to finalize adapter turn state, adapter=%+v", adapter)
+	if len(adapter.responses) != 0 {
+		t.Fatalf("terminal retained observer: %+v", adapter.responses)
 	}
 }
 
@@ -414,10 +402,8 @@ func TestCodexResponsesWSAdapterNormalizesPrivateTerminalAliasesBeforePublicClas
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			adapter := &codexResponsesWSAdapter{
-				provider:    &CodexProvider{},
-				model:       "gpt-5",
-				turnModel:   "gpt-5",
-				accumulator: newCodexTurnUsageAccumulator(),
+				provider: &CodexProvider{},
+				model:    "gpt-5",
 			}
 			payload := []byte(fmt.Sprintf(`{"type":%q,"response":{"id":"resp_alias","status":%q,"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}},"provider_extension":{"preserved":true}}`, test.supplierType, test.supplierStatus))
 			result := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame(payload))
@@ -442,45 +428,20 @@ func TestCodexResponsesWSAdapterNormalizesPrivateTerminalAliasesBeforePublicClas
 	}
 }
 
-func TestCodexResponsesWSAdapterBackfillsSparseResponseDoneFromCreated(t *testing.T) {
-	adapter := &codexResponsesWSAdapter{
-		provider:    &CodexProvider{},
-		model:       "gpt-5",
-		turnModel:   "gpt-5",
-		accumulator: newCodexTurnUsageAccumulator(),
-	}
-	created := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame([]byte(`{"type":"response.created","response":{"id":"resp_sparse","status":"in_progress"}}`)))
-	if created.Err != nil || created.EmitFrame == nil || adapter.lastResponse != "resp_sparse" {
-		t.Fatalf("expected response.created to establish the turn response ID, result=%+v adapter=%+v", created, adapter)
-	}
-	done := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame([]byte(`{"type":"response.done","response":{"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}`)))
-	if done.Err != nil || done.CloseTransport || done.EmitFrame == nil {
-		t.Fatalf("expected sparse response.done to normalize, got %+v", done)
-	}
-	classified := responsesws.ClassifyResponsesWSEvent(done.EmitFrame.Payload())
-	if classified.Malformed || classified.Kind != responsesws.ResponsesSuccessTerminal || classified.EventType != "response.completed" || classified.Response == nil {
-		t.Fatalf("expected completed Responses terminal, classified=%+v payload=%s", classified, done.EmitFrame.Payload())
-	}
-	if classified.Response.ID != "resp_sparse" || classified.Response.Status != types.ResponseStatusCompleted || classified.Response.Usage == nil || classified.Response.Usage.TotalTokens != 15 {
-		t.Fatalf("expected ID, completed status, and usage to survive normalization, response=%+v", classified.Response)
-	}
-	if adapter.accumulator != nil || adapter.turnModel != "" {
-		t.Fatalf("expected sparse done to finish only the current turn, adapter=%+v", adapter)
-	}
-	nextFrame, err := adapter.PrepareClientFrame(context.Background(), responsesws.NewTextFrame([]byte(`{"type":"response.create","model":"gpt-5","input":"next turn"}`)))
-	if err != nil || nextFrame.PayloadLen() == 0 || adapter.accumulator == nil || adapter.lastResponse != "" {
-		t.Fatalf("expected the same websocket adapter to accept the next turn, frame=%s err=%v adapter=%+v", nextFrame.Payload(), err, adapter)
-	}
-}
-
-func TestCodexResponsesWSAdapterRejectsSparseResponseDoneWithoutTurnID(t *testing.T) {
-	adapter := &codexResponsesWSAdapter{provider: &CodexProvider{}, model: "gpt-5", accumulator: newCodexTurnUsageAccumulator()}
-	done := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame([]byte(`{"type":"response.done","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)))
-	if done.Err == nil || !done.CloseTransport || done.EmitFrame != nil {
-		t.Fatalf("expected response.done without any turn ID to fail closed, got %+v", done)
-	}
-	if done.Usage == nil || done.Usage.TotalTokens != 2 {
-		t.Fatalf("expected billing evidence to survive malformed terminal handling, got %+v", done.Usage)
+func TestCodexResponsesWSAdapterNeverBackfillsSparseResponseDone(t *testing.T) {
+	for _, createdID := range []string{"", "resp_sparse"} {
+		adapter := &codexResponsesWSAdapter{provider: &CodexProvider{}, model: "gpt-5"}
+		if createdID != "" {
+			adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame([]byte(`{"type":"response.created","response":{"id":"resp_sparse","status":"in_progress"}}`)))
+		}
+		payload := []byte(`{"type":"response.done","response":{"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}`)
+		done := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame(payload))
+		if done.Err != nil || done.CloseTransport || done.EmitFrame == nil || string(done.EmitFrame.Payload()) != string(payload) || done.Usage != nil {
+			t.Fatalf("unidentified terminal must remain raw and unbilled: %+v", done)
+		}
+		if createdID != "" && adapter.responses[createdID] == nil {
+			t.Fatal("unidentified terminal consumed another work")
+		}
 	}
 }
 
@@ -494,13 +455,13 @@ func TestCodexResponsesWSAdapterMapsResponseDoneStatus(t *testing.T) {
 		{status: "incomplete", eventType: "response.incomplete", kind: responsesws.ResponsesFailedTerminal},
 	} {
 		t.Run(test.status, func(t *testing.T) {
-			adapter := &codexResponsesWSAdapter{provider: &CodexProvider{}, model: "gpt-5", turnModel: "gpt-5", accumulator: newCodexTurnUsageAccumulator()}
+			adapter := &codexResponsesWSAdapter{provider: &CodexProvider{}, model: "gpt-5"}
 			responseID := "resp_" + test.status
 			created := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame([]byte(fmt.Sprintf(`{"type":"response.created","response":{"id":%q,"status":"in_progress"}}`, responseID))))
 			if created.Err != nil || created.EmitFrame == nil {
 				t.Fatalf("expected response.created before sparse done, got %+v", created)
 			}
-			payload := []byte(fmt.Sprintf(`{"type":"response.done","response":{"status":%q,"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}`, test.status))
+			payload := []byte(fmt.Sprintf(`{"type":"response.done","response":{"id":%q,"status":%q,"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}`, responseID, test.status))
 			result := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame(payload))
 			if result.Err != nil || result.CloseTransport || result.Filtered || result.EmitFrame == nil {
 				t.Fatalf("expected response.done status mapping, got %+v", result)
@@ -514,7 +475,7 @@ func TestCodexResponsesWSAdapterMapsResponseDoneStatus(t *testing.T) {
 }
 
 func TestCodexResponsesWSAdapterRejectsUnrepresentableCancelledResponseDoneAndKeepsUsage(t *testing.T) {
-	adapter := &codexResponsesWSAdapter{provider: &CodexProvider{}, model: "gpt-5", turnModel: "gpt-5", accumulator: newCodexTurnUsageAccumulator()}
+	adapter := &codexResponsesWSAdapter{provider: &CodexProvider{}, model: "gpt-5"}
 	payload := []byte(`{"type":"response.done","event_id":"evt_cancelled","response":{"id":"resp_cancelled","status":"cancelled","usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}`)
 	result := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame(payload))
 	if result.Err == nil || !result.CloseTransport || result.EmitFrame != nil || result.Filtered {
@@ -528,7 +489,7 @@ func TestCodexResponsesWSAdapterRejectsUnrepresentableCancelledResponseDoneAndKe
 	}
 }
 
-func TestCodexResponsesWSAdapterSynthesizesResponseDoneSequenceAfterProviderFrames(t *testing.T) {
+func TestCodexResponsesWSAdapterDoesNotSynthesizeResponseDoneSequence(t *testing.T) {
 	adapter := &codexResponsesWSAdapter{provider: &CodexProvider{}, model: "gpt-5"}
 	progress := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame([]byte(`{"type":"response.in_progress","sequence_number":7,"response":{"id":"resp_seq","status":"in_progress"}}`)))
 	if progress.Err != nil || progress.EmitFrame == nil {
@@ -539,25 +500,23 @@ func TestCodexResponsesWSAdapterSynthesizesResponseDoneSequenceAfterProviderFram
 		t.Fatalf("expected response.done after progress frame, got %+v", done)
 	}
 	classified := responsesws.ClassifyResponsesWSEvent(done.EmitFrame.Payload())
-	if classified.Malformed || classified.Kind != responsesws.ResponsesSuccessTerminal || classified.SequenceNumber != 8 {
-		t.Fatalf("expected synthesized sequence 8, classified=%+v payload=%s", classified, done.EmitFrame.Payload())
+	if classified.Malformed || classified.Kind != responsesws.ResponsesSuccessTerminal || classified.HasSequenceNumber {
+		t.Fatalf("expected original sequence absence, classified=%+v payload=%s", classified, done.EmitFrame.Payload())
 	}
 }
 
-func TestCodexResponsesWSAdapterForwardsDuplicateTerminalWithoutBilling(t *testing.T) {
+func TestCodexResponsesWSAdapterForwardsTerminalEvidenceForRelayDeduplication(t *testing.T) {
 	adapter := &codexResponsesWSAdapter{
-		provider:    &CodexProvider{},
-		model:       "gpt-5",
-		turnModel:   "gpt-5",
-		accumulator: newCodexTurnUsageAccumulator(),
+		provider: &CodexProvider{},
+		model:    "gpt-5",
 	}
 	completed := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame([]byte(`{"type":"response.completed","sequence_number":1,"response":{"id":"resp_duplicate","status":"completed","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`)))
 	if completed.Err != nil || completed.EmitFrame == nil || completed.Filtered {
 		t.Fatalf("expected first terminal to pass through, got %+v", completed)
 	}
 	done := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame([]byte(`{"type":"response.done","response":{"id":"resp_duplicate","status":"completed","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`)))
-	if done.Err != nil || done.Filtered || done.EmitFrame == nil || done.Usage != nil || done.CloseTransport {
-		t.Fatalf("expected duplicate Codex terminal dialect to be filtered, got %+v", done)
+	if done.Err != nil || done.Filtered || done.EmitFrame == nil || done.Usage == nil || done.Usage.ResponseID != "resp_duplicate" || done.CloseTransport {
+		t.Fatalf("expected identified terminal to reach relay deduplication, got %+v", done)
 	}
 }
 
@@ -866,7 +825,7 @@ func TestCodexAcceptedResponsesEventRejectsTerminalToolOverflowAtomically(t *tes
 		outputs = append(outputs, types.ResponsesOutput{ID: fmt.Sprintf("ws_terminal_%d", index), Type: types.InputTypeWebSearchCall, Status: "completed", Action: map[string]any{"type": "search"}})
 	}
 	terminal, err := json.Marshal(types.OpenAIResponsesStreamResponses{
-		Type: "response.completed", Response: &types.OpenAIResponsesResponses{ID: "resp_tool_overflow", Status: "completed", Output: outputs},
+		Type: "response.completed", Response: &types.OpenAIResponsesResponses{ID: "resp_tool_overflow", Status: "completed", Output: outputs, Usage: &types.ResponsesUsage{InputTokens: 3, OutputTokens: 5, TotalTokens: 8}},
 	})
 	if err != nil {
 		t.Fatalf("marshal terminal fixture: %v", err)
@@ -896,7 +855,7 @@ func TestCreateResponsesPreservesTerminalToolOverflowClassification(t *testing.T
 		outputs[index] = types.ResponsesOutput{ID: fmt.Sprintf("ws_%d", index), Type: types.InputTypeWebSearchCall, Status: "completed", Action: map[string]any{"type": "search"}}
 	}
 	terminal, err := json.Marshal(types.OpenAIResponsesStreamResponses{
-		Type: "response.completed", Response: &types.OpenAIResponsesResponses{ID: "resp_tool_overflow", Status: "completed", Output: outputs},
+		Type: "response.completed", Response: &types.OpenAIResponsesResponses{ID: "resp_tool_overflow", Status: "completed", Output: outputs, Usage: &types.ResponsesUsage{InputTokens: 3, OutputTokens: 5, TotalTokens: 8}},
 	})
 	if err != nil {
 		t.Fatalf("marshal terminal fixture: %v", err)
@@ -1671,7 +1630,7 @@ func (h *CodexResponsesStreamHandler) HandlerResponsesStream(rawLine *[]byte, da
 }
 
 func TestCodexResponsesWSLateSteeringDoesNotChangeChildObservation(t *testing.T) {
-	adapter := &codexResponsesWSAdapter{provider: &CodexProvider{}, model: "gpt-5", turnModel: "gpt-5", accumulator: newCodexTurnUsageAccumulator()}
+	adapter := &codexResponsesWSAdapter{provider: &CodexProvider{}, model: "gpt-5"}
 	created := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame([]byte(`{"type":"response.created","sequence_number":0,"response":{"id":"resp_child","status":"in_progress"}}`)))
 	if created.Err != nil {
 		t.Fatal(created.Err)
@@ -1685,12 +1644,12 @@ func TestCodexResponsesWSLateSteeringDoesNotChangeChildObservation(t *testing.T)
 			t.Fatalf("control not transparent: %+v", result)
 		}
 	}
-	terminal := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame([]byte(`{"type":"response.done","response":{"status":"completed","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`)))
+	terminal := adapter.HandleProviderFrame(context.Background(), responsesws.NewTextFrame([]byte(`{"type":"response.done","response":{"id":"resp_child","status":"completed","usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}}}`)))
 	if terminal.Err != nil || terminal.EmitFrame == nil {
 		t.Fatalf("child terminal failed: %+v", terminal)
 	}
 	classified := responsesws.ClassifyResponsesWSEvent(terminal.EmitFrame.Payload())
-	if classified.Malformed || classified.SequenceNumber != 1 || classified.Response.ID != "resp_child" || terminal.Usage == nil || terminal.Usage.InputTokens != 3 || terminal.Usage.OutputTokens != 5 {
+	if classified.Malformed || classified.HasSequenceNumber || classified.Response.ID != "resp_child" || terminal.Usage == nil || terminal.Usage.InputTokens != 3 || terminal.Usage.OutputTokens != 5 {
 		t.Fatalf("old control polluted child terminal: %+v, usage=%+v", classified, terminal.Usage)
 	}
 }

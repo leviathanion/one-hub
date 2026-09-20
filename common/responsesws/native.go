@@ -51,8 +51,6 @@ type NativeSession struct {
 	events nativeEventQueue
 
 	sendMu             sync.Mutex
-	attemptMu          sync.Mutex
-	activeAttemptID    string
 	closeOnce          sync.Once
 	doneOnce           sync.Once
 	readPumpOnce       sync.Once
@@ -261,10 +259,6 @@ func (s *NativeSession) sendClient(ctx context.Context, req SendRequest) Respons
 	if err != nil {
 		return ResponsesWSTransportSendResult{Status: ResponsesWSTransportSendNotAttempted, Err: err}
 	}
-	// 辅助命令只携带自己的完成关联，不能覆盖当前 create 的接收归属。
-	if envelope, parseErr := ParseClientEventEnvelope(payload); parseErr == nil && envelope.Type == "response.create" {
-		s.setActiveAttemptID(strings.TrimSpace(req.AttemptID))
-	}
 	var writeResult wsconn.WriteResult
 	switch {
 	case s.writeMessageResult != nil:
@@ -282,24 +276,6 @@ func (s *NativeSession) sendClient(ctx context.Context, req SendRequest) Respons
 		return ResponsesWSTransportSendResult{Status: status, Err: writeResult.Err}
 	}
 	return ResponsesWSTransportSendResult{Status: ResponsesWSTransportSendAttempted}
-}
-
-func (s *NativeSession) setActiveAttemptID(attemptID string) {
-	if s == nil || attemptID == "" {
-		return
-	}
-	s.attemptMu.Lock()
-	s.activeAttemptID = attemptID
-	s.attemptMu.Unlock()
-}
-
-func (s *NativeSession) currentAttemptID() string {
-	if s == nil {
-		return ""
-	}
-	s.attemptMu.Lock()
-	defer s.attemptMu.Unlock()
-	return s.activeAttemptID
 }
 
 func (s *NativeSession) Recv(ctx context.Context) (UpstreamEvent, error) {
@@ -343,7 +319,6 @@ func (s *NativeSession) Abort(reason string) {
 		return
 	}
 	_ = s.enqueue(UpstreamEvent{
-		AttemptID:    s.currentAttemptID(),
 		DetailOrigin: RecvDetailOriginNativeLocalAbort,
 		Err:          ErrUpstreamClosed,
 	})
@@ -355,7 +330,6 @@ func (s *NativeSession) Detach(reason string) {
 		return
 	}
 	_ = s.enqueue(UpstreamEvent{
-		AttemptID:    s.currentAttemptID(),
 		DetailOrigin: RecvDetailOriginNativeLocalDetach,
 		Err:          ErrUpstreamClosed,
 	})
@@ -380,7 +354,6 @@ func (s *NativeSession) runReadPump() {
 		if recovered := recover(); recovered != nil {
 			err := s.readPumpPanicError(recovered)
 			_ = s.enqueue(UpstreamEvent{
-				AttemptID:    s.currentAttemptID(),
 				DetailOrigin: RecvDetailOriginNativeReadError,
 				DetailPhase:  RecvDetailPhaseHandleProviderFrame,
 				Err:          err,
@@ -408,7 +381,6 @@ func (s *NativeSession) runReadPump() {
 func (s *NativeSession) handleProviderMessage(ctx context.Context, mt wsconn.MessageType, payload []byte) {
 	if mt == wsconn.BinaryMessage && !nativeAdapterSupportsBinary(s.adapter) {
 		_ = s.enqueue(UpstreamEvent{
-			AttemptID:    s.currentAttemptID(),
 			DetailOrigin: RecvDetailOriginProviderMalformed,
 			DetailPhase:  RecvDetailPhaseHandleProviderFrame,
 			Err:          ErrNativeProtocol,
@@ -420,7 +392,7 @@ func (s *NativeSession) handleProviderMessage(ctx context.Context, mt wsconn.Mes
 		frame := NewTextFrame(append([]byte(nil), payload...))
 		_ = s.enqueue(UpstreamEvent{
 			Frame:        &frame,
-			AttemptID:    s.currentAttemptID(),
+			ResponseID:   ProviderResponseID(payload),
 			DetailOrigin: RecvDetailOriginProviderFrame,
 			DetailPhase:  RecvDetailPhaseHandleProviderFrame,
 		})
@@ -442,7 +414,7 @@ func (s *NativeSession) handleProviderMessage(ctx context.Context, mt wsconn.Mes
 	}
 	event := UpstreamEvent{
 		Usage:        result.Usage,
-		AttemptID:    s.currentAttemptID(),
+		ResponseID:   ProviderResponseID(payload),
 		DetailOrigin: result.Origin,
 		DetailPhase:  RecvDetailPhaseHandleProviderFrame,
 		Err:          result.Err,
@@ -485,7 +457,6 @@ func (s *NativeSession) handleProviderClose(ctx context.Context, info wsconn.Clo
 					Reason: result.ProviderClose.Reason,
 					Err:    result.ProviderClose.Err,
 				},
-				AttemptID:    s.currentAttemptID(),
 				DetailOrigin: result.Origin,
 				DetailPhase:  RecvDetailPhaseMapProviderClose,
 				Err:          result.Err,
@@ -494,7 +465,6 @@ func (s *NativeSession) handleProviderClose(ctx context.Context, info wsconn.Clo
 		}
 		if result.Err != nil {
 			_ = s.enqueue(UpstreamEvent{
-				AttemptID:    s.currentAttemptID(),
 				DetailOrigin: result.Origin,
 				DetailPhase:  RecvDetailPhaseMapProviderClose,
 				Err:          result.Err,
@@ -507,7 +477,6 @@ func (s *NativeSession) handleProviderClose(ctx context.Context, info wsconn.Clo
 		detail = RecvDetailOriginNativeProviderClose
 		_ = s.enqueue(UpstreamEvent{
 			ProviderClose: &ProviderClose{Code: int(info.Code), Reason: info.Reason, Err: info.Err},
-			AttemptID:     s.currentAttemptID(),
 			DetailOrigin:  detail,
 			DetailPhase:   RecvDetailPhaseMapProviderClose,
 			Err:           info.Err,
@@ -518,7 +487,6 @@ func (s *NativeSession) handleProviderClose(ctx context.Context, info wsconn.Clo
 		detail = RecvDetailOriginNativeProviderEOF
 	}
 	_ = s.enqueue(UpstreamEvent{
-		AttemptID:    s.currentAttemptID(),
 		DetailOrigin: detail,
 		DetailPhase:  RecvDetailPhaseMapProviderClose,
 		Err:          info.Err,
@@ -680,7 +648,6 @@ func (s *NativeSession) enqueue(event UpstreamEvent) bool {
 		return false
 	}
 	backpressure := UpstreamEvent{
-		AttemptID:    s.currentAttemptID(),
 		DetailOrigin: RecvDetailOriginNativeBackpressure,
 		Err:          ErrNativeQueueFull,
 	}

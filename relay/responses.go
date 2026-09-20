@@ -76,6 +76,9 @@ func (r *relayResponses) setRequest() error {
 	}
 	r.rawEnvelope = envelope
 	r.responsesRequest = envelope.Projection
+	if err := prepareResourceRequest(r.c, raw, "responses"); err != nil {
+		return err
+	}
 	if err := validateResponsesSupportedSurface(&r.responsesRequest, envelope.Object.Fields, r.operation); err != nil {
 		return err
 	}
@@ -83,7 +86,7 @@ func (r *relayResponses) setRequest() error {
 		return fmt.Errorf("field Model is required")
 	}
 	r.setOriginalModel(r.responsesRequest.Model)
-	requireStored := r.operation == responsesOperationCreate && (r.responsesRequest.Store == nil || *r.responsesRequest.Store)
+	requireStored := r.operation == responsesOperationCreate && (r.responsesRequest.Store == nil || *r.responsesRequest.Store || r.backgroundRequest())
 	operation := r.providerOperation()
 	setRequestChannelCapability(r.c, requireResponsesRequestCompatibility(operation, requireStored, envelope.Object.Fields, r.responsesRequest.Model))
 	if r.usesChannelAffinity() {
@@ -245,6 +248,9 @@ func (r *relayResponses) getPromptTokens() (int, error) {
 }
 
 func (r *relayResponses) send() (err *types.OpenAIErrorWithStatusCode, done bool) {
+	if r.backgroundRequest() {
+		return r.sendBackgroundResponse()
+	}
 	err, done = r.sendCurrentProvider()
 	if err == nil && r.usesChannelAffinity() {
 		if channel := r.provider.GetChannel(); channel != nil {
@@ -564,7 +570,11 @@ func (r *relayResponses) compatibleSend(chatProvider providersBase.ChatInterface
 
 	if r.responsesRequest.Stream {
 		var response requester.StreamReaderInterface[string]
-		response, errWithCode = chatProvider.CreateChatCompletionStream(chatReq)
+		if conversion, ok := chatProvider.(providersBase.ChatStreamConversionInterface); ok && conversion.SupportsChatStreamConversion() {
+			response, errWithCode = conversion.CreateChatCompletionStreamForConversion(chatReq)
+		} else {
+			response, errWithCode = chatProvider.CreateChatCompletionStream(chatReq)
+		}
 		if errWithCode != nil {
 			return
 		}
@@ -839,7 +849,7 @@ func detectResponsesOperation(path string) responsesOperation {
 }
 
 func (r *relayResponses) skipQuotaSettlement() bool {
-	return r != nil && r.operation == responsesOperationInputTokens
+	return r != nil && (r.operation == responsesOperationInputTokens || r.backgroundRequest())
 }
 
 func (r *relayResponses) allowsSideEffectFreeObservationRetry() bool {

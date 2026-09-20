@@ -1457,7 +1457,7 @@ func TestChatToResponsesConsumesLogicalDataFromExactRawSSE(t *testing.T) {
 		"data: {\"id\":\"chatcmpl_raw\",\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\r\n\r\n" +
 		"data:[DONE]\r\n\r\n"
 	handler := &openai.OpenAIStreamHandler{Usage: usage}
-	stream, apiErr := requester.RequestRawSSEEventStreamWithEmitterOptions(nil, &http.Response{Body: io.NopCloser(strings.NewReader(body))}, handler.HandleExactChatSSE, requester.StreamReadOptions{RequireProtocolTerminal: true})
+	stream, apiErr := requester.RequestRawSSEEventStreamWithEmitterOptions(nil, &http.Response{Body: io.NopCloser(strings.NewReader(body))}, handler.HandleChatConversionSSE, requester.StreamReadOptions{RequireProtocolTerminal: true})
 	if apiErr != nil {
 		t.Fatalf("create raw Chat stream: %+v", apiErr)
 	}
@@ -1527,7 +1527,7 @@ func TestChatToResponsesRawProviderErrorStopsBeforeLateUsage(t *testing.T) {
 		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":9,\"total_tokens\":18}}\n\n" +
 		"data: [DONE]\n\n"
 	handler := &openai.OpenAIStreamHandler{Usage: usage}
-	stream, constructionErr := requester.RequestRawSSEEventStreamWithEmitterOptions(nil, &http.Response{Body: io.NopCloser(strings.NewReader(body))}, handler.HandleExactChatSSE, requester.StreamReadOptions{RequireProtocolTerminal: true})
+	stream, constructionErr := requester.RequestRawSSEEventStreamWithEmitterOptions(nil, &http.Response{Body: io.NopCloser(strings.NewReader(body))}, handler.HandleChatConversionSSE, requester.StreamReadOptions{RequireProtocolTerminal: true})
 	if constructionErr != nil {
 		t.Fatalf("create raw Chat error stream: %+v", constructionErr)
 	}

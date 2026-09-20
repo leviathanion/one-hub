@@ -106,7 +106,7 @@ R > 0 时预扣 user/token quota
 
 Try 必须幂等：同一个 Attempt 重入不得预扣两次。Try 失败时不允许 Application Submission。
 
-旧 schema 会在预扣时同时改变 remain/used quota。实现时应把“暂时占用可用额度”和“最终 used quota”在语义上分开：消费日志、请求计数和最终 used quota 只能由 Confirm 投影；若暂不拆余额列，至少不能把 Try 记录成最终消费事件。
+旧 schema 会在预扣时同时改变 remain/used quota。实现时应把“暂时占用可用额度”和“最终 used quota”在语义上分开：消费日志和请求计数在最终结算后投影，渠道 used quota 等收费统计取已确定的最终费用（可为 0）；Cancel 不产生收费；若暂不拆余额列，至少不能把 Try 记录成最终消费事件。
 
 ### Application Submission
 
@@ -177,9 +177,11 @@ turn terminal、provider close、client close、watchdog 或 ambiguous send 都�
 
 ### Async Task
 
-Task 是持久 owner，并保存提交时实际发生的 Reservation 和 channel binding；价格配置不随 Task 持久化，finalization 使用当时的当前完整发布。submit 只允许一次；polling/callback/fetch 都必须在同一 Task 行上竞争一次 finalization。
+Task 是持久 owner，并保存提交时实际发生的 Reservation 和 channel binding；价格配置不随 Task 持久化，finalization 使用当时的当前完整发布。submit 只允许一次；polling/callback/fetch 都必须在同一 Task 行上竞争一次 finalization。后台 Responses 的 POST、GET、取消、恢复流与轮询共用该 owner；Batch 每个批次共用一个 owner，不按 JSONL item 再建账。
 
 provider terminal 带合法 usage时，Task terminal 与 Confirm 在同一 SQL 事务提交；provider terminal、超时或 stale close 没有 usage时，Task terminal 与 Cancel 在同一事务提交。`charged_quota` 以 nullable 值区分“未 final”和“已 Confirm/Cancel 为 0”，禁止从业务状态猜测收费。
+
+新增 family 仅持久化已发生的模型、渠道、数量与证据身份，不持久化价格目录。观察缺失或用户删除结果文件不构成业务拦截理由；独立有效组件仍按 ADR-0033 结算，其余释放预扣。
 
 Midjourney 等没有持久 Task owner 的旧路径，要么接入相同 Task owner，要么只使用请求内 TCC；不得通过回调 success 重复收费。
 

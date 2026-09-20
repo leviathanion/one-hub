@@ -14,19 +14,25 @@ import (
 
 // responsesHTTPIO 只拥有本次 HTTP 交付的停止和时限，不观察业务终态。
 type responsesHTTPIO struct {
-	ctx         context.Context
-	cancel      context.CancelFunc
-	writer      gin.ResponseWriter
-	controller  *http.ResponseController
-	idle        time.Duration
-	deadline    time.Time
-	mu          sync.Mutex
-	stopped     bool
-	closed      bool
-	stopContext func() bool
+	ctx           context.Context
+	cancel        context.CancelFunc
+	writer        gin.ResponseWriter
+	controller    *http.ResponseController
+	idle          time.Duration
+	deadline      time.Time
+	mu            sync.Mutex
+	stopped       bool
+	closed        bool
+	stopContext   func() bool
+	readEnabled   bool
+	keepDeadlines bool
 }
 
 func newResponsesHTTPIO(c *gin.Context) (*responsesHTTPIO, error) {
+	return newResponsesHTTPIOWithRead(c, false)
+}
+
+func newResponsesHTTPIOWithRead(c *gin.Context, readEnabled bool) (*responsesHTTPIO, error) {
 	idle, lifetime := requester.LongStreamTimeouts()
 	writer := http.ResponseWriter(c.Writer)
 	for {
@@ -40,10 +46,21 @@ func newResponsesHTTPIO(c *gin.Context) (*responsesHTTPIO, error) {
 	if err := controller.SetWriteDeadline(time.Time{}); err != nil {
 		return nil, err
 	}
+	if readEnabled {
+		if err := controller.SetReadDeadline(time.Time{}); err != nil {
+			return nil, err
+		}
+	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), lifetime)
 	deadline, _ := ctx.Deadline()
-	owner := &responsesHTTPIO{ctx: ctx, cancel: cancel, writer: c.Writer, controller: controller, idle: idle, deadline: deadline}
+	owner := &responsesHTTPIO{ctx: ctx, cancel: cancel, writer: c.Writer, controller: controller, idle: idle, deadline: deadline, readEnabled: readEnabled}
 	owner.stopContext = context.AfterFunc(ctx, owner.Stop)
+	if readEnabled {
+		if err := owner.armRead(); err != nil {
+			owner.Close()
+			return nil, err
+		}
+	}
 	return owner, nil
 }
 
@@ -56,9 +73,20 @@ func (owner *responsesHTTPIO) Stop() {
 	owner.stopped = true
 	owner.cancel()
 	_ = owner.controller.SetWriteDeadline(time.Now())
+	if owner.readEnabled {
+		_ = owner.controller.SetReadDeadline(time.Now())
+	}
 }
 
 func (owner *responsesHTTPIO) arm() error {
+	return owner.armDirection(false)
+}
+
+func (owner *responsesHTTPIO) armRead() error {
+	return owner.armDirection(true)
+}
+
+func (owner *responsesHTTPIO) armDirection(read bool) error {
 	owner.mu.Lock()
 	defer owner.mu.Unlock()
 	if owner.stopped || owner.closed {
@@ -70,6 +98,9 @@ func (owner *responsesHTTPIO) arm() error {
 	deadline := time.Now().Add(owner.idle)
 	if deadline.After(owner.deadline) {
 		deadline = owner.deadline
+	}
+	if read {
+		return owner.controller.SetReadDeadline(deadline)
 	}
 	return owner.controller.SetWriteDeadline(deadline)
 }
@@ -112,7 +143,10 @@ func (owner *responsesHTTPIO) Close() {
 	owner.closed = true
 	owner.stopContext()
 	owner.cancel()
-	if !owner.stopped {
+	if !owner.stopped && !owner.keepDeadlines {
 		_ = owner.controller.SetWriteDeadline(time.Time{})
+		if owner.readEnabled {
+			_ = owner.controller.SetReadDeadline(time.Time{})
+		}
 	}
 }

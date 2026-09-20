@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"one-api/common/config"
+	"one-api/common/requestctx"
+	commonresponses "one-api/common/responses"
 	runtimerealtime "one-api/runtime/realtime"
 	"strings"
 	"time"
@@ -132,6 +134,17 @@ func (s *openAIRealtimeSession) prepareInputSettings(payload []byte, eventType s
 	var event map[string]json.RawMessage
 	if json.Unmarshal(payload, &event) != nil {
 		return payload, nil, nil
+	}
+	var resourceBody map[string]any
+	_ = json.Unmarshal(payload, &resourceBody)
+	for _, ref := range commonresponses.MediaResourceReferences(resourceBody, "realtime") {
+		policy, ok := s.workPolicy.(requestctx.ResourceReferencePolicy)
+		if !ok {
+			return nil, nil, newOpenAIRealtimeClientError("unsupported_capability", "custom voice requires an account-scoped resource owner")
+		}
+		if err := policy.AuthorizeResourceReference(ref.Kind, ref.ID); err != nil {
+			return nil, nil, err
+		}
 	}
 	models := s.modelBinding()
 	field := ""

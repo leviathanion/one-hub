@@ -2,6 +2,7 @@ package relay
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"one-api/common"
 	"one-api/common/config"
@@ -48,8 +49,12 @@ func (r *relayGeminiOnly) setRequest() error {
 	}
 
 	isStream := false
-	if modelList[1] == "streamGenerateContent" {
+	switch modelList[1] {
+	case "generateContent":
+	case "streamGenerateContent":
 		isStream = true
+	default:
+		return fmt.Errorf("Gemini action %q is not supported", modelList[1])
 	}
 
 	r.geminiRequest = &gemini.GeminiChatRequest{}

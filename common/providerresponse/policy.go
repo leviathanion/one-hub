@@ -20,6 +20,7 @@ const (
 	OperationResponsesInputTokens Operation = "responses.input_tokens"
 	OperationResponsesRetrieve    Operation = "responses.retrieve"
 	OperationResponsesDelete      Operation = "responses.delete"
+	OperationResponsesCancel      Operation = "responses.cancel"
 	OperationResponsesInputItems  Operation = "responses.input_items"
 	OperationResponsesWebSocket   Operation = "responses.websocket"
 	OperationAudioTranscription   Operation = "audio.transcription"

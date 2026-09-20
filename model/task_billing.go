@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -51,6 +52,12 @@ func createTaskBillingOwner(ctx context.Context, task *Task, allowBoundChannelIn
 	if task == nil || task.UserId <= 0 || task.TokenID <= 0 || task.ChannelId <= 0 || task.ReservedQuota < 0 || strings.TrimSpace(task.Platform) == "" || strings.TrimSpace(task.ProviderNamespace) == "" || strings.TrimSpace(task.ProviderTaskScopeIncarnation) == "" || strings.TrimSpace(task.RequestFingerprint) == "" {
 		return BillingBalanceResult{Outcome: BillingBalanceDefinitelyRolledBack}, errors.New("task billing owner is incomplete")
 	}
+	if task.Platform == TaskPlatformOpenAIResponsesBackground && (len(task.Data) > BackgroundResponseEvidenceMaxBytes || !json.Valid(task.Data)) {
+		return BillingBalanceResult{Outcome: BillingBalanceDefinitelyRolledBack}, ErrTaskBillingState
+	}
+	if task.Platform == TaskPlatformOpenAIBatch && (len(task.Data) > BatchDataMaxBytes || !json.Valid(task.Data)) {
+		return BillingBalanceResult{Outcome: BillingBalanceDefinitelyRolledBack}, ErrTaskBillingState
+	}
 	if err := task.BeforeCreate(nil); err != nil {
 		return BillingBalanceResult{Outcome: BillingBalanceDefinitelyRolledBack}, err
 	}
@@ -77,6 +84,18 @@ func createTaskBillingOwner(ctx context.Context, task *Task, allowBoundChannelIn
 	tokenApplied, err := ApplyBillingReserveInTransaction(tx, task.UserId, task.TokenID, task.ReservedQuota)
 	if err != nil {
 		return BillingBalanceResult{Outcome: BillingBalanceDefinitelyRolledBack}, err
+	}
+	// Reserve has locked the billing principal; count under that same lock so
+	// concurrent nodes cannot each admit the last background slot.
+	if task.Platform == TaskPlatformOpenAIResponsesBackground {
+		if err := checkBackgroundResponseCapacity(tx, task.UserId); err != nil {
+			return BillingBalanceResult{Outcome: BillingBalanceDefinitelyRolledBack}, err
+		}
+	}
+	if task.Platform == TaskPlatformOpenAIBatch {
+		if err := checkOpenAIBatchCapacity(tx, task.UserId); err != nil {
+			return BillingBalanceResult{Outcome: BillingBalanceDefinitelyRolledBack}, err
+		}
 	}
 	now, err := currentDatabaseUnix(tx)
 	if err != nil {
@@ -179,8 +198,19 @@ func AcceptTaskSubmissionWithLegacyFingerprint(ctx context.Context, task *Task, 
 }
 
 func acceptTaskSubmission(ctx context.Context, task *Task, providerTaskID, legacyFingerprint string) (TaskMutationResult, error) {
-	providerTaskID = strings.TrimSpace(providerTaskID)
-	if task == nil || task.ID <= 0 || strings.TrimSpace(task.OwnerID) == "" || strings.TrimSpace(task.SubmissionClaimID) == "" || providerTaskID == "" || len(providerTaskID) > 191 || strings.TrimSpace(task.ProviderNamespace) == "" || strings.TrimSpace(task.ProviderTaskScopeIncarnation) == "" {
+	return acceptTaskSubmissionWithOwner(ctx, task, providerTaskID, legacyFingerprint, nil)
+}
+
+func acceptTaskSubmissionWithOwner(ctx context.Context, task *Task, providerTaskID, legacyFingerprint string, owner *ResponseOwner) (TaskMutationResult, error) {
+	return acceptTaskSubmissionWithOwnerAndHook(ctx, task, providerTaskID, legacyFingerprint, owner, nil)
+}
+
+func acceptTaskSubmissionWithOwnerAndHook(ctx context.Context, task *Task, providerTaskID, legacyFingerprint string, owner *ResponseOwner, beforeCommit func(*gorm.DB) error) (TaskMutationResult, error) {
+	if task != nil && ((task.Platform == TaskPlatformOpenAIResponsesBackground && owner == nil) || (task.Platform == TaskPlatformOpenAIBatch && beforeCommit == nil)) {
+		return TaskMutationResult{Outcome: TaskMutationDefinitelyNotApplied}, ErrTaskIdentity
+	}
+	providerTaskID = taskProviderIdentity(task, providerTaskID)
+	if task == nil || task.ID <= 0 || strings.TrimSpace(task.OwnerID) == "" || strings.TrimSpace(task.SubmissionClaimID) == "" || strings.TrimSpace(providerTaskID) == "" || len(providerTaskID) > 191 || strings.TrimSpace(task.ProviderNamespace) == "" || strings.TrimSpace(task.ProviderTaskScopeIncarnation) == "" {
 		return TaskMutationResult{Outcome: TaskMutationDefinitelyNotApplied}, ErrTaskProviderID
 	}
 	tx, _, err := beginTaskBillingTransaction(ctx)
@@ -192,7 +222,22 @@ func acceptTaskSubmission(ctx context.Context, task *Task, providerTaskID, legac
 		_ = tx.Rollback().Error
 		return TaskMutationResult{Outcome: TaskMutationDefinitelyNotApplied}, err
 	}
-	update := tx.Model(&Task{}).Where("id = ? AND owner_id = ? AND provider_state = ? AND submission_claim_id = ? AND version = ? AND acceptance_recorded_at IS NULL", task.ID, task.OwnerID, TaskProviderStateSubmitStarted, task.SubmissionClaimID, task.Version).Updates(map[string]any{
+	if taskUsesOpaqueProviderID(task.Platform) {
+		var durable Task
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND owner_id = ?", task.ID, task.OwnerID).First(&durable).Error; err != nil {
+			_ = tx.Rollback().Error
+			return TaskMutationResult{Outcome: TaskMutationDefinitelyNotApplied}, err
+		}
+		if currentID := TaskProviderID(&durable); currentID != "" && currentID != providerTaskID {
+			_ = tx.Rollback().Error
+			return TaskMutationResult{Outcome: TaskMutationDefinitelyNotApplied}, ErrTaskIdentity
+		}
+	}
+	acceptQuery := tx.Model(&Task{}).Where("id = ? AND owner_id = ? AND provider_state = ? AND submission_claim_id = ? AND version = ? AND acceptance_recorded_at IS NULL", task.ID, task.OwnerID, TaskProviderStateSubmitStarted, task.SubmissionClaimID, task.Version)
+	if owner != nil {
+		acceptQuery = acceptQuery.Where("user_id = ? AND token_id = ? AND channel_id = ? AND platform = ?", owner.UserID, owner.TokenID, owner.ChannelID, TaskPlatformOpenAIResponsesBackground)
+	}
+	update := acceptQuery.Updates(map[string]any{
 		"provider_state":         TaskProviderStateAccepted,
 		"task_id":                providerTaskID,
 		"status":                 TaskStatusSubmitted,
@@ -204,12 +249,27 @@ func acceptTaskSubmission(ctx context.Context, task *Task, providerTaskID, legac
 	if update.Error != nil || update.RowsAffected != 1 {
 		_ = tx.Rollback().Error
 		if update.Error != nil {
+			if (owner != nil || beforeCommit != nil) && IsUniqueConstraintError(update.Error) {
+				return TaskMutationResult{Outcome: TaskMutationDefinitelyNotApplied}, ErrTaskIdentity
+			}
 			if IsUniqueConstraintError(update.Error) {
 				return resolveTaskAcceptanceIdentityConflict(ctx, task, providerTaskID, update.Error, legacyFingerprint)
 			}
 			return TaskMutationResult{Outcome: TaskMutationDefinitelyNotApplied}, update.Error
 		}
 		return classifyTaskAcceptance(ctx, task, providerTaskID, nil)
+	}
+	if owner != nil {
+		if err := createResponseOwner(tx, owner); err != nil {
+			_ = tx.Rollback().Error
+			return TaskMutationResult{Outcome: TaskMutationDefinitelyNotApplied}, err
+		}
+	}
+	if beforeCommit != nil {
+		if err := beforeCommit(tx); err != nil {
+			_ = tx.Rollback().Error
+			return TaskMutationResult{Outcome: TaskMutationDefinitelyNotApplied}, err
+		}
 	}
 	result := TaskMutationResult{Outcome: TaskMutationCommitUnknown, CommitAttempted: true}
 	if err := tx.Commit().Error; err != nil {
@@ -335,6 +395,9 @@ func classifyTaskSubmissionClaim(ctx context.Context, task *Task, claimID string
 
 func classifyTaskAcceptance(ctx context.Context, task *Task, providerTaskID string, mutationErr error) (TaskMutationResult, error) {
 	durable, readErr := loadTaskOwnerForRecovery(ctx, task.OwnerID)
+	if readErr == nil && (durable.UserId != task.UserId || durable.TokenID != task.TokenID || durable.ChannelId != task.ChannelId || durable.Platform != task.Platform) {
+		return TaskMutationResult{Outcome: TaskMutationDefinitelyNotApplied, CommitAttempted: mutationErr != nil}, errors.Join(mutationErr, ErrTaskIdentity)
+	}
 	if readErr == nil && (durable.ProviderState == TaskProviderStateAccepted || durable.ProviderState == TaskProviderStateClosed) && durable.SubmissionClaimID == task.SubmissionClaimID && durable.ProviderNamespace == task.ProviderNamespace && durable.ProviderTaskScopeIncarnation == task.ProviderTaskScopeIncarnation && TaskProviderID(durable) == providerTaskID && durable.AcceptanceRecordedAt != nil {
 		*task = *durable
 		return TaskMutationResult{Outcome: TaskMutationApplied, CommitAttempted: mutationErr != nil}, nil
@@ -352,8 +415,11 @@ func classifyTaskAcceptance(ctx context.Context, task *Task, providerTaskID stri
 // provider acceptance. It is used only after an Accept commit-unknown so a
 // later UNKNOWN closure does not lose the already returned provider handle.
 func PreserveTaskSubmissionHandle(ctx context.Context, task *Task, providerTaskID string) (TaskMutationResult, error) {
-	providerTaskID = strings.TrimSpace(providerTaskID)
-	if DB == nil || task == nil || task.ID <= 0 || task.SubmissionClaimID == "" || providerTaskID == "" {
+	if task != nil && taskUsesOpaqueProviderID(task.Platform) {
+		return preserveOpaqueTaskHandle(ctx, task, providerTaskID)
+	}
+	providerTaskID = taskProviderIdentity(task, providerTaskID)
+	if DB == nil || task == nil || task.ID <= 0 || task.SubmissionClaimID == "" || strings.TrimSpace(providerTaskID) == "" {
 		return TaskMutationResult{Outcome: TaskMutationDefinitelyNotApplied}, ErrTaskProviderID
 	}
 	result := DB.WithContext(normalizeModelContext(ctx)).Model(&Task{}).
@@ -401,7 +467,14 @@ func samePreparedTaskOwner(durable, expected *Task) bool {
 	return durable != nil && expected != nil && durable.OwnerID == expected.OwnerID && durable.ProviderState == TaskProviderStatePrepared && durable.UserId == expected.UserId && durable.TokenID == expected.TokenID && durable.ChannelId == expected.ChannelId && durable.Platform == expected.Platform && durable.ProviderNamespace == expected.ProviderNamespace && durable.ProviderTaskScopeIncarnation == expected.ProviderTaskScopeIncarnation && durable.RequestFingerprint == expected.RequestFingerprint && durable.ReservedQuota == expected.ReservedQuota
 }
 
-func FinalizeTaskBillingOwner(ctx context.Context, task *Task, targetQuota int64, decision string) (finalResult BillingBalanceResult, finalErr error) {
+func FinalizeTaskBillingOwner(ctx context.Context, task *Task, targetQuota int64, decision string) (BillingBalanceResult, error) {
+	if task != nil && task.Platform == TaskPlatformOpenAIBatch {
+		return FinalizeOpenAIBatchBillingOwner(ctx, task, targetQuota, decision, task.Data)
+	}
+	return finalizeTaskBillingOwner(ctx, task, targetQuota, decision, nil)
+}
+
+func finalizeTaskBillingOwner(ctx context.Context, task *Task, targetQuota int64, decision string, beforeCommit func(*gorm.DB, *Task, int64) error) (finalResult BillingBalanceResult, finalErr error) {
 	if task == nil || task.ID <= 0 || targetQuota < 0 || !isTaskTerminalStatus(task.Status) || (decision != "cancel" && decision != "confirm") || (decision == "cancel" && targetQuota != 0) {
 		return BillingBalanceResult{Outcome: BillingBalanceDefinitelyRolledBack}, ErrTaskBillingState
 	}
@@ -416,8 +489,11 @@ func FinalizeTaskBillingOwner(ctx context.Context, task *Task, targetQuota int64
 		}
 	}()
 	var durable Task
-	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&durable, task.ID).Error; err != nil {
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND owner_id = ?", task.ID, task.OwnerID).First(&durable).Error; err != nil {
 		return BillingBalanceResult{Outcome: BillingBalanceDefinitelyRolledBack}, err
+	}
+	if taskUsesOpaqueProviderID(durable.Platform) && TaskProviderID(task) != "" && TaskProviderID(&durable) != "" && TaskProviderID(task) != TaskProviderID(&durable) {
+		return BillingBalanceResult{Outcome: BillingBalanceDefinitelyRolledBack}, ErrTaskIdentity
 	}
 	if durable.ProviderState == TaskProviderStateClosed {
 		*task = durable
@@ -473,6 +549,11 @@ func FinalizeTaskBillingOwner(ctx context.Context, task *Task, targetQuota int64
 		}
 		return BillingBalanceResult{Outcome: BillingBalanceDefinitelyRolledBack}, ErrTaskBillingState
 	}
+	if beforeCommit != nil {
+		if err := beforeCommit(tx, &durable, now); err != nil {
+			return BillingBalanceResult{Outcome: BillingBalanceDefinitelyRolledBack}, err
+		}
+	}
 	result.CommitAttempted = true
 	result.Outcome = BillingBalanceCommitUnknown
 	rollback = false
@@ -489,6 +570,7 @@ func FinalizeTaskBillingOwner(ctx context.Context, task *Task, targetQuota int64
 		return result, errors.Join(err, readErr)
 	}
 	result.Outcome = BillingBalanceCommitted
+	result.FirstOwnerClosure = true
 	task.ProviderState = TaskProviderStateClosed
 	task.ChargedQuota = &charged
 	task.SettlementDecision = decision
@@ -545,4 +627,41 @@ func normalizeModelContext(ctx context.Context) context.Context {
 		return context.Background()
 	}
 	return ctx
+}
+
+// 提交歧义时保存原始句柄。锁内逐字核对已有标识，避免数据库排序规则把
+// 另一个大小写或空白别名当成可覆盖的同一 Task。
+func preserveOpaqueTaskHandle(ctx context.Context, task *Task, responseID string) (TaskMutationResult, error) {
+	if DB == nil || task == nil || task.ID <= 0 || task.OwnerID == "" || task.SubmissionClaimID == "" || strings.TrimSpace(responseID) == "" || len(responseID) > 191 {
+		return TaskMutationResult{Outcome: TaskMutationDefinitelyNotApplied}, ErrTaskProviderID
+	}
+	tx, _, err := beginTaskBillingTransaction(ctx)
+	if err != nil {
+		return TaskMutationResult{Outcome: TaskMutationDefinitelyNotApplied}, err
+	}
+	defer tx.Rollback()
+	var durable Task
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND owner_id = ?", task.ID, task.OwnerID).First(&durable).Error; err != nil {
+		return TaskMutationResult{Outcome: TaskMutationDefinitelyNotApplied}, err
+	}
+	if durable.Platform == task.Platform && durable.SubmissionClaimID == task.SubmissionClaimID && TaskProviderID(&durable) == responseID {
+		*task = durable
+		return TaskMutationResult{Outcome: TaskMutationApplied}, nil
+	}
+	if durable.Platform != task.Platform || durable.ProviderState != TaskProviderStateSubmitStarted || durable.SubmissionClaimID != task.SubmissionClaimID || durable.AcceptanceRecordedAt != nil || (TaskProviderID(&durable) != "" && TaskProviderID(&durable) != responseID) {
+		return TaskMutationResult{Outcome: TaskMutationDefinitelyNotApplied}, ErrTaskIdentity
+	}
+	if err := tx.Model(&Task{}).Where("id = ? AND owner_id = ?", durable.ID, durable.OwnerID).Update("task_id", responseID).Error; err != nil {
+		return TaskMutationResult{Outcome: TaskMutationDefinitelyNotApplied}, err
+	}
+	if err := tx.Commit().Error; err != nil {
+		recovered, readErr := loadTaskOwnerForRecovery(ctx, task.OwnerID)
+		if readErr == nil && recovered.Platform == task.Platform && recovered.SubmissionClaimID == task.SubmissionClaimID && TaskProviderID(recovered) == responseID {
+			*task = *recovered
+			return TaskMutationResult{Outcome: TaskMutationApplied, CommitAttempted: true}, nil
+		}
+		return TaskMutationResult{Outcome: TaskMutationCommitUnknown, CommitAttempted: true}, errors.Join(err, readErr)
+	}
+	SetTaskProviderID(task, responseID)
+	return TaskMutationResult{Outcome: TaskMutationApplied, CommitAttempted: true}, nil
 }

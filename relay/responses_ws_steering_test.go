@@ -3,9 +3,7 @@ package relay
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
-	"strings"
 	"testing"
 	"time"
 
@@ -35,7 +33,10 @@ func newSteeringTestActor(t *testing.T, quota int) (*ResponsesWSSessionActor, *r
 	actor := NewResponsesWSSessionActor(ctx)
 	actor.SetPump(NewResponsesWSIOPump(conn, actor))
 	actor.AttachUpstreamSession(session, 17)
-	actor.turns.active = responsesWSActiveTurn{attempt: parent, channelID: 17}
+	actor.turns.opening.firstFrame = frame
+	if err := actor.observation.add(parent, "", ""); err != nil {
+		t.Fatal(err)
+	}
 	actor.state = responsesWSStateInFlight
 	actor.rememberConnectionLocalEphemeralResponseID("resp_parent")
 	t.Cleanup(func() { actor.close("test_cleanup"); actor.waitStartedGoroutines() })
@@ -56,43 +57,63 @@ func sendTestSteer(t *testing.T, actor *ResponsesWSSessionActor, session *respon
 	actor.handleClientFrame(responsesWSTestClientTextFrame([]byte(payload)))
 	select {
 	case req := <-session.requests:
-		if string(req.Frame.Payload()) != payload || req.AttemptID != "transport-parent" {
+		if string(req.Frame.Payload()) != payload || req.AttemptID == "transport-parent" || observedSteeringCandidate(actor, target) == nil || req.AttemptID != observedSteeringCandidate(actor, target).AttemptID {
 			t.Fatalf("steer altered: %+v", req)
 		}
 	case <-time.After(time.Second):
-		t.Fatalf("steer not forwarded, state=%+v", actor.steering)
+		t.Fatalf("steer not forwarded, work count=%d", len(actor.observation.works))
 	}
+}
+
+func observedSteeringCandidate(a *ResponsesWSSessionActor, parent string) *ResponsesWSTurnAttempt {
+	for _, work := range a.observation.works {
+		if work.successorParent == parent && work.attempt.SeenProviderResponseID == "" {
+			return work.attempt
+		}
+	}
+	return nil
+}
+
+func observedParentForTest(t *testing.T, a *ResponsesWSSessionActor) *ResponsesWSTurnAttempt {
+	t.Helper()
+	work := a.observation.byResponse("resp_parent")
+	if work == nil {
+		t.Fatal("parent observation missing")
+	}
+	return work.attempt
 }
 
 func TestResponsesWSSteeringAutomaticSuccessorsSettleIndependently(t *testing.T) {
 	actor, session, _ := newSteeringTestActor(t, 1000)
-	parent := actor.turns.active.attempt
+	parent := observedParentForTest(t, actor)
 	sendTestSteer(t, actor, session, "resp_parent")
-	next := actor.steering.next
+	next := observedSteeringCandidate(actor, "resp_parent")
 	if next == nil || !next.QuotaPreconsumed || next.AttemptID == parent.AttemptID {
 		t.Fatal("successor must be admitted and reserved before steering")
 	}
 	steeringProviderFrame(actor, `{"type":"response.steer.accepted","sequence_number":1,"steer":{"id":"steer_1","previous_response_id":"resp_parent"}}`)
 	steeringProviderFrame(actor, `{"type":"response.incomplete","sequence_number":2,"response":{"id":"resp_parent","status":"incomplete","incomplete_details":{"reason":"steered"},"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}}`)
-	if !parent.QuotaFinalized || actor.turns.active.attempt != nil || actor.steering.next != next {
-		t.Fatal("parent must settle and release while the successor reservation retains its barrier")
+	if !parent.QuotaFinalized || actor.observation.byResponse("resp_parent") != nil || observedSteeringCandidate(actor, "resp_parent") != next {
+		t.Fatal("parent settlement must not consume successor reservation")
 	}
 	steeringProviderFrame(actor, `{"type":"response.created","sequence_number":0,"response":{"id":"resp_next","previous_response_id":"resp_parent","status":"in_progress"}}`)
-	if actor.closing.closed.Load() || actor.turns.active.attempt != next || next.SeenProviderResponseID != "resp_next" {
-		t.Fatalf("successor not adopted: %+v", actor.turns.active)
+	if actor.closing.closed.Load() || actor.observation.byResponse("resp_next") == nil || next.SeenProviderResponseID != "resp_next" {
+		t.Fatal("successor not associated with its own reservation")
 	}
-	// 自动续接还能继续接受 steering，transport 不换 ID，也不发送伪造 create。
 	sendTestSteer(t, actor, session, "resp_next")
-	last := actor.steering.next
-	steeringProviderFrame(actor, `{"type":"response.steer.accepted","sequence_number":1,"steer":{"id":"steer_2","previous_response_id":"resp_next"}}`)
+	last := observedSteeringCandidate(actor, "resp_next")
 	steeringProviderFrame(actor, `{"type":"response.completed","sequence_number":2,"response":{"id":"resp_next","status":"completed","usage":{"input_tokens":8,"output_tokens":3,"total_tokens":11}}}`)
 	steeringProviderFrame(actor, `{"type":"response.created","sequence_number":0,"response":{"id":"resp_last","previous_response_id":"resp_next","status":"in_progress"}}`)
 	steeringProviderFrame(actor, `{"type":"response.completed","sequence_number":1,"response":{"id":"resp_last","status":"completed","usage":{"input_tokens":9,"output_tokens":4,"total_tokens":13}}}`)
-	if actor.closing.closed.Load() || actor.state != responsesWSStateIdle || !next.QuotaFinalized || !last.QuotaFinalized {
+	if actor.closing.closed.Load() || len(actor.observation.works) != 0 || !next.QuotaFinalized || !last.QuotaFinalized {
 		t.Fatal("chain did not finish independently")
 	}
 	if parent.Usage.PromptTokens != 5 || next.Usage.PromptTokens != 8 || last.Usage.PromptTokens != 9 {
 		t.Fatal("usage crossed response boundaries")
+	}
+	user, token := readResponsesWSQuotaFixture(t)
+	if user.Quota != 969 || token.RemainQuota != 969 {
+		t.Fatalf("incorrect independent settlements: user=%d token=%d", user.Quota, token.RemainQuota)
 	}
 	select {
 	case req := <-session.requests:
@@ -101,52 +122,17 @@ func TestResponsesWSSteeringAutomaticSuccessorsSettleIndependently(t *testing.T)
 	}
 }
 
-func TestResponsesWSSteeringPendingAndFailedReleaseUnusedReserve(t *testing.T) {
-	for _, pending := range []bool{false, true} {
-		t.Run(map[bool]string{false: "failed", true: "pending"}[pending], func(t *testing.T) {
-			actor, session, conn := newSteeringTestActor(t, 1000)
-			sendTestSteer(t, actor, session, "resp_parent")
-			next := actor.steering.next
-			steeringProviderFrame(actor, `{"type":"response.steer.accepted","sequence_number":1,"steer":{"id":"s1","previous_response_id":"resp_parent"}}`)
-			steeringProviderFrame(actor, `{"type":"response.completed","sequence_number":2,"response":{"id":"resp_parent","status":"completed","usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7},"output":[{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"}]}}`)
-			kind := "failed"
-			if pending {
-				kind = "pending"
-			}
-			payload := `{"type":"response.steer.` + kind + `","sequence_number":3,"steer":{"id":"s1","previous_response_id":"resp_parent"},"reason":"waiting_for_required_input","required_input":[{"type":"function_call_output","call_id":"call_1"}],"future":true}`
-			steeringProviderFrame(actor, payload)
-			if actor.closing.closed.Load() || actor.state != responsesWSStateIdle || !next.RolledBack || actor.steering.next != nil {
-				t.Fatalf("unused reserve not released: %+v", actor.steering)
-			}
-			if got, _ := conn.lastWrite.Load().(string); got != payload {
-				t.Fatalf("ack changed: %s", got)
-			}
-			if pending {
-				actor.handleClientFrame(responsesWSTestClientTextFrame([]byte(`{"type":"response.create","model":"gpt-5","store":false,"previous_response_id":"resp_parent","input":[{"type":"function_call_output","call_id":"call_1","output":"saved result"}]}`)))
-				select {
-				case req := <-session.requests:
-					if strings.Contains(string(req.Frame.Payload()), "smaller scope") || !strings.Contains(string(req.Frame.Payload()), "saved result") {
-						t.Fatalf("explicit continuation mutated: %s", req.Frame.Payload())
-					}
-				case <-time.After(time.Second):
-					t.Fatal("explicit tool continuation blocked")
-				}
-			}
-		})
-	}
-}
-
 func TestResponsesWSSteeringRejectsQuotaAndForeignOwnerBeforeSend(t *testing.T) {
-	for _, quota := range []int{100, 1000} {
-		t.Run(map[int]string{100: "quota", 1000: "foreign_owner"}[quota], func(t *testing.T) {
+	for _, reason := range []string{"quota", "foreign_owner"} {
+		t.Run(reason, func(t *testing.T) {
 			actor, session, _ := newSteeringTestActor(t, 1000)
-			if quota == 100 {
+			if reason == "quota" {
 				if err := model.DB.Model(&model.User{}).Where("id = 1").Update("quota", 0).Error; err != nil {
 					t.Fatal(err)
 				}
 			}
 			target := "resp_parent"
-			if quota == 1000 {
+			if reason == "foreign_owner" {
 				target = "resp_other_user"
 			}
 			actor.handleClientFrame(responsesWSTestClientTextFrame([]byte(`{"type":"response.steer","previous_response_id":"` + target + `","input":"hi"}`)))
@@ -155,7 +141,7 @@ func TestResponsesWSSteeringRejectsQuotaAndForeignOwnerBeforeSend(t *testing.T) 
 				t.Fatalf("unauthorized work sent: %+v", req)
 			default:
 			}
-			if actor.steering.next != nil {
+			if observedSteeringCandidate(actor, target) != nil || len(actor.observation.works) != 1 {
 				t.Fatal("rejected steering leaked reservation")
 			}
 		})
@@ -165,9 +151,10 @@ func TestResponsesWSSteeringRejectsQuotaAndForeignOwnerBeforeSend(t *testing.T) 
 func TestResponsesWSSteeringAmbiguousSendNeverReplays(t *testing.T) {
 	actor, session, _ := newSteeringTestActor(t, 1000)
 	sendTestSteer(t, actor, session, "resp_parent")
-	actor.handleSendResult(ResponsesWSEventSendResult{Completion: &responsesWSSendCompletion{}, AttemptID: actor.steering.next.AttemptID, ResponseID: "resp_parent", UpstreamSessionGeneration: actor.upstream.sessionGeneration, SelectedChannelID: 17, Purpose: ResponsesWSSendPurposeResponseSteer, TransportResult: responsesws.ResponsesWSTransportSendResult{Status: responsesws.ResponsesWSTransportSendAmbiguous, Err: errors.New("write outcome unknown")}})
-	if !actor.closing.closed.Load() {
-		t.Fatal("ambiguous steering must close")
+	next := observedSteeringCandidate(actor, "resp_parent")
+	actor.handleSendResult(ResponsesWSEventSendResult{Completion: &responsesWSSendCompletion{}, AttemptID: next.AttemptID, ResponseID: "resp_parent", UpstreamSessionGeneration: actor.upstream.sessionGeneration, SelectedChannelID: 17, Purpose: ResponsesWSSendPurposeResponseSteer, TransportResult: responsesws.ResponsesWSTransportSendResult{Status: responsesws.ResponsesWSTransportSendAmbiguous, Err: errors.New("write outcome unknown")}})
+	if !actor.closing.closed.Load() || !next.RolledBack {
+		t.Fatal("uncertain transport must stop and close local reservation")
 	}
 	select {
 	case req := <-session.requests:
@@ -176,34 +163,35 @@ func TestResponsesWSSteeringAmbiguousSendNeverReplays(t *testing.T) {
 	}
 }
 
-func TestResponsesWSSteeringCoalescesBoundedSubmissionsAndKeepsFailedWire(t *testing.T) {
+func TestResponsesWSSteeringCoalescesSubmissionsWithoutBusinessBarrier(t *testing.T) {
 	actor, session, conn := newSteeringTestActor(t, 1000)
 	sendTestSteer(t, actor, session, "resp_parent")
-	next := actor.steering.next
-	for i := 1; i < responsesWSInjectMaxPending; i++ {
+	next := observedSteeringCandidate(actor, "resp_parent")
+	for i := 0; i < 5; i++ {
 		sendTestSteer(t, actor, session, "resp_parent")
 	}
-	if actor.steering.next != next {
-		t.Fatal("one successor was reserved more than once")
+	if observedSteeringCandidate(actor, "resp_parent") != next || len(actor.observation.works) != 2 {
+		t.Fatal("same successor was reserved more than once")
 	}
-	actor.handleClientFrame(responsesWSTestClientTextFrame([]byte(`{"type":"response.steer","previous_response_id":"resp_parent","input":"over limit"}`)))
-	if got, _ := conn.lastWrite.Load().(string); !strings.Contains(got, "responses_ws_steer_queue_full") {
-		t.Fatalf("missing capacity rejection: %s", got)
+	payload := `{"type":"response.steer.pending","steer":{"id":"s1","previous_response_id":"resp_parent"},"reason":"waiting_for_required_input","future":true}`
+	steeringProviderFrame(actor, payload)
+	if got, _ := conn.lastWrite.Load().(string); got != payload {
+		t.Fatalf("upstream control changed: %s", got)
 	}
+	// 客户端无需等父终态或 pending 回执才发送工具结果。
+	create := `{"type":"response.create","model":"gpt-5","store":false,"previous_response_id":"resp_parent","input":[{"type":"function_call_output","call_id":"call_1","output":"saved result"}]}`
+	actor.handleClientFrame(responsesWSTestClientTextFrame([]byte(create)))
 	select {
 	case req := <-session.requests:
-		t.Fatalf("over-limit steer sent: %+v", req)
-	default:
-	}
-	for i := 0; i < responsesWSInjectMaxPending; i++ {
-		payload := fmt.Sprintf(`{"type":"response.steer.failed","sequence_number":%d,"steer":{"previous_response_id":"resp_parent","input":"original input"},"error":{"code":"steering_not_supported","message":"unsupported mode"}}`, i+1)
-		steeringProviderFrame(actor, payload)
-		if got, _ := conn.lastWrite.Load().(string); got != payload {
-			t.Fatalf("upstream failure changed: %s", got)
+		if string(req.Frame.Payload()) != create {
+			t.Fatalf("explicit continuation changed: %s", req.Frame.Payload())
 		}
+	case <-time.After(time.Second):
+		t.Fatal("explicit continuation blocked by successor observation")
 	}
-	if !next.RolledBack || actor.steering.next != nil || actor.closing.closed.Load() {
-		t.Fatal("rejected batch retained reservation or closed current response")
+	actor.close("client_closed")
+	if !next.RolledBack || len(actor.observation.works) != 0 {
+		t.Fatal("unused successor reservation survived connection cleanup")
 	}
 }
 
@@ -235,45 +223,26 @@ func TestAstraCrossProtocolRejectsUnrepresentableFeatures(t *testing.T) {
 	}
 }
 
-func TestResponsesWSMisalignmentStopsQueuedWork(t *testing.T) {
-	actor, session, conn := newSteeringTestActor(t, 1000)
-	actor.handleClientFrame(responsesWSTestClientTextFrame([]byte(`{"type":"response.create","model":"gpt-5","store":false,"input":"must not run"}`)))
-	payload := `{"type":"error","error":{"type":"invalid_request_error","code":"misalignment_policy_violation","message":"review this workflow"}}`
-	steeringProviderFrame(actor, payload)
-	if !actor.closing.closed.Load() {
-		t.Fatal("workflow stop must close session")
+func TestResponsesWSSteeringSuccessorDoesNotWaitForParentTerminal(t *testing.T) {
+	a, session, conn := newSteeringTestActor(t, 1000)
+	parent := observedParentForTest(t, a)
+	sendTestSteer(t, a, session, "resp_parent")
+	child := observedSteeringCandidate(a, "resp_parent")
+	created := `{"type":"response.created","response":{"id":"resp_early_child","previous_response_id":"resp_parent","future":true}}`
+	steeringProviderFrame(a, created)
+	if got, _ := conn.lastWrite.Load().(string); got != created {
+		t.Fatalf("created was held behind parent terminal: %s", got)
 	}
-	got, _ := conn.lastWrite.Load().(string)
-	var wire map[string]any
-	if json.Unmarshal([]byte(got), &wire) != nil || !strings.Contains(got, "misalignment_policy_violation") {
-		t.Fatalf("policy error lost: %s", got)
+	if child.SeenProviderResponseID != "resp_early_child" || parent.QuotaFinalized || a.closing.closed.Load() {
+		t.Fatal("successor association imposed parent business state")
 	}
-	select {
-	case req := <-session.requests:
-		t.Fatalf("queued work sent after stop: %+v", req)
-	default:
+	steeringProviderFrame(a, `{"type":"response.completed","sequence_number":10,"response":{"id":"resp_early_child","usage":{"input_tokens":8,"output_tokens":3,"total_tokens":11}}}`)
+	steeringProviderFrame(a, `{"type":"response.completed","sequence_number":1,"response":{"id":"resp_parent","usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}}`)
+	if !child.QuotaFinalized || !parent.QuotaFinalized || child.Usage.PromptTokens != 8 || parent.Usage.PromptTokens != 5 {
+		t.Fatal("out-of-order distinct response terminals crossed billing owners")
 	}
-}
-
-func TestResponsesWSSteeringPolicyStopAfterParentTerminalPreservesError(t *testing.T) {
-	for _, control := range []bool{false, true} {
-		t.Run(fmt.Sprint(control), func(t *testing.T) {
-			actor, session, conn := newSteeringTestActor(t, 1000)
-			sendTestSteer(t, actor, session, "resp_parent")
-			next := actor.steering.next
-			steeringProviderFrame(actor, `{"type":"response.steer.accepted","sequence_number":1,"steer":{"id":"s1","previous_response_id":"resp_parent"}}`)
-			steeringProviderFrame(actor, `{"type":"response.completed","sequence_number":2,"response":{"id":"resp_parent","status":"completed","usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}}`)
-			payload := `{"type":"error","error":{"type":"invalid_request_error","code":"misalignment_policy_violation","message":"review required"}}`
-			if control {
-				payload = `{"type":"response.steer.failed","sequence_number":3,"steer":{"id":"s1","previous_response_id":"resp_parent"},"error":{"code":"misalignment_policy_violation","message":"review required"}}`
-			}
-			steeringProviderFrame(actor, payload)
-			if got, _ := conn.lastWrite.Load().(string); got != payload {
-				t.Fatalf("stop error lost after parent terminal: %s", got)
-			}
-			if !actor.closing.closed.Load() || !next.RolledBack {
-				t.Fatal("policy stop did not close and release unused reserve")
-			}
-		})
+	user, token := readResponsesWSQuotaFixture(t)
+	if user.Quota != 982 || token.RemainQuota != 982 {
+		t.Fatalf("incorrect parent/successor settlements: user=%d token=%d", user.Quota, token.RemainQuota)
 	}
 }

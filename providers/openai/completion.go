@@ -115,7 +115,9 @@ func (p *OpenAIProvider) CreateCompletionStream(request *types.CompletionRequest
 	options := requester.StreamReadOptions{
 		RequireProtocolTerminal: p.RequireOpenAIStreamTerminal,
 	}
-	if p.ProviderRawJSONReplay {
+	if p.ProviderRawJSONReplay || (p.usesNativeOpenAIWire() && !p.StreamEscapeJSON) {
+		options.RequireProtocolTerminal = false
+		chatHandler.hideProviderUsage = !p.ProviderRawJSONReplay && !chatHandler.ExposeProviderUsage
 		chatHandler.sseFramer = requester.NewSSEEventFramer(openAIExactSSEMaxEventBytes)
 		return requester.RequestRawSSEEventStreamWithEmitterOptions(streamRequester, resp, chatHandler.handleExactCompletionSSE, options)
 	}
@@ -162,7 +164,7 @@ func (h *OpenAIStreamHandler) handlerCompletionStream(rawLine *[]byte, dataChan 
 }
 
 func (h *OpenAIStreamHandler) handleExactCompletionSSE(rawLine *[]byte, emitter requester.StreamEmitter[string]) {
-	h.handleExactSSE(rawLine, emitter, h.observeExactCompletionStreamPayload)
+	h.handleExactSSE(rawLine, emitter, h.observeExactCompletionStreamPayload, false)
 }
 
 func (h *OpenAIStreamHandler) observeCompletionStreamResponse(response *OpenAIProviderCompletionResponse) bool {

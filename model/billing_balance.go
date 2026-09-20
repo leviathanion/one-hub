@@ -26,6 +26,8 @@ type BillingBalanceResult struct {
 	Outcome           BillingBalanceOutcome
 	TokenQuotaApplied bool
 	CommitAttempted   bool
+	// FirstOwnerClosure 仅表示本次 Task 关闭事务收到明确提交成功；用于一次性最佳努力投影。
+	FirstOwnerClosure bool
 }
 
 var (

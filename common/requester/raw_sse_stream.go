@@ -7,7 +7,9 @@ import (
 )
 
 // RawSSEEventStream marks a string stream whose data items are complete SSE
-// events rather than logical data-field payloads. The requester owns this
+// events rather than logical data-field payloads. Delimiter-only CRLF
+// continuations may be delivered separately to avoid delaying CR-only events.
+// The requester owns this
 // delivery-shape contract; protocol interpretation remains with the provider
 // handler and the downstream consumer.
 type RawSSEEventStream interface {
@@ -38,6 +40,7 @@ func RequestRawSSEEventStreamWithEmitterOptions(
 	handler HandlerPrefixWithEmitter[string],
 	options StreamReadOptions,
 ) (RawSSEEventStream, *types.OpenAIErrorWithStatusCode) {
+	options.SSELines = true
 	stream, errWithCode := RequestNoTrimStreamWithEmitterOptions(httpRequester, resp, handler, options)
 	if errWithCode != nil {
 		return nil, errWithCode

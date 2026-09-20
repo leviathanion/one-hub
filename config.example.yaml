@@ -79,9 +79,7 @@ responses_ws:
   active_lease_redis_fail_open: true # Redis active lease 出错时是否回退进程内计数；多实例容量会短暂失真，false 则拒绝新 active lease
   first_frame_timeout_ms: 30000 # Upgrade 后等待首个 response.create 的超时
   idle_timeout_ms: 1800000 # 已建立 ResponsesWS 连接空闲超时
-  active_turn_timeout_ms: 120000 # 单个 response.create 的 provider inactivity 超时；0 禁用
   max_lifetime_ms: 3600000 # 代理施加的连接最长存活时间；0 禁用
-  pending_provider_events_max_bytes: 2097152 # send 结果确认前可缓存的上游事件字节上限，默认 2MiB
   unsupported_scan_limit: 0 # 首选渠道不支持 WS 时的显式扫描上限；0/未配置按当前加载渠道数扫描，低于渠道数时命中上限返回 503 scan-limited 而非 426
   allow_anonymous_capacity_bucket: false # 仅测试/本地诊断可开启；生产缺少 token/user 时不进入共享 anonymous bucket
 request_body_decode:

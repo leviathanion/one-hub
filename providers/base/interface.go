@@ -173,6 +173,7 @@ type ResponsesInputTokensInterface interface {
 }
 
 type StoredResponsesRequest struct {
+	Body       []byte
 	Operation  Operation
 	ResponseID string
 	RawQuery   string

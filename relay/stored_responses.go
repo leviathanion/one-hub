@@ -5,10 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
+	"one-api/common"
 	"one-api/common/logger"
 	"one-api/common/providerresponse"
 	"one-api/common/requestctx"
@@ -22,15 +22,13 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+const storedResponsesRequestTimeout = 10 * time.Minute
+
 func StoredResponses(c *gin.Context) {
-	responseID := strings.TrimSpace(c.Param("response_id"))
-	operation, ok := storedResponsesOperation(c.Request.Method, c.Request.URL.Path)
-	if !ok || responseID == "" {
+	responseID := c.Param("response_id")
+	operation, ok := storedResponsesOperation(c.Request.Method, c.Request.URL.Path, c.Param("response_id"))
+	if !ok || strings.TrimSpace(responseID) == "" {
 		renderStoredResponsesError(c, storedResponsesNotFoundError())
-		return
-	}
-	if err := validateStoredResponsesQuery(operation, c.Request.URL.Query()); err != nil {
-		renderStoredResponsesError(c, capabilityGateAPIError(err))
 		return
 	}
 
@@ -44,7 +42,7 @@ func StoredResponses(c *gin.Context) {
 	owner, err := model.GetResponseOwner(operationCtx, responseID, c.GetInt("id"))
 	channelID := 0
 	if err == nil {
-		if owner == nil || owner.UserID != c.GetInt("id") || owner.State != model.ResponseOwnerStateActive {
+		if owner == nil || owner.UserID != c.GetInt("id") {
 			renderStoredResponsesError(c, storedResponsesNotFoundError())
 			return
 		}
@@ -79,7 +77,15 @@ func StoredResponses(c *gin.Context) {
 		return
 	}
 
-	response, apiErr := storedProvider.RelayStoredResponse(operationCtx, providersBase.StoredResponsesRequest{
+	body, bodyErr := common.CacheRequestBody(c)
+	if bodyErr != nil {
+		renderStoredResponsesError(c, common.ErrorWrapperLocal(bodyErr, "invalid_request_body", http.StatusBadRequest))
+		return
+	}
+	requestCtx, cancelRequest := context.WithTimeout(c.Request.Context(), storedResponsesRequestTimeout)
+	defer cancelRequest()
+	response, apiErr := storedProvider.RelayStoredResponse(requestCtx, providersBase.StoredResponsesRequest{
+		Body:       body,
 		Operation:  operation,
 		ResponseID: responseID,
 		RawQuery:   c.Request.URL.RawQuery,
@@ -106,7 +112,7 @@ func StoredResponses(c *gin.Context) {
 		}
 		cancelTombstone()
 	}
-	if apiErr := responseMultipart(c, response, providerResponsePolicyForChannel(channel, operation, true)); apiErr != nil {
+	if apiErr := responseStoredLifecycleClient(c, response, owner, providerResponsePolicyForChannel(channel, operation, true)); apiErr != nil {
 		observeRelayProviderFailure(c, channel, apiErr)
 		renderStoredResponsesError(c, apiErr)
 		return
@@ -115,32 +121,25 @@ func StoredResponses(c *gin.Context) {
 	recordZeroQuotaResponsesAudit(c, channelID, "responses lifecycle:"+string(operation))
 }
 
-func storedResponsesOperation(method, path string) (providersBase.Operation, bool) {
-	if method == http.MethodGet && strings.HasSuffix(path, "/input_items") {
+// Match the operation after the entire opaque ID. An ID named input_items
+// must not accidentally select the child operation.
+func storedResponsesOperation(method, path, responseID string) (providersBase.Operation, bool) {
+	target := "/responses/" + responseID
+	if method == http.MethodPost && strings.HasSuffix(path, target+"/cancel") {
+		return providersBase.OperationResponsesCancel, true
+	}
+	if method == http.MethodGet && strings.HasSuffix(path, target+"/input_items") {
 		return providersBase.OperationResponsesInputItems, true
 	}
-	if method == http.MethodGet {
-		return providersBase.OperationResponsesRetrieve, true
-	}
-	if method == http.MethodDelete {
-		return providersBase.OperationResponsesDelete, true
-	}
-	return "", false
-}
-
-func validateStoredResponsesQuery(operation providersBase.Operation, query url.Values) error {
-	if operation != providersBase.OperationResponsesRetrieve {
-		return nil
-	}
-	for _, value := range query["stream"] {
-		if !strings.EqualFold(strings.TrimSpace(value), "false") {
-			return newCapabilityGateError("stream", "streaming stored response retrieval is not supported")
+	if strings.HasSuffix(path, target) {
+		if method == http.MethodGet {
+			return providersBase.OperationResponsesRetrieve, true
+		}
+		if method == http.MethodDelete {
+			return providersBase.OperationResponsesDelete, true
 		}
 	}
-	if query.Has("starting_after") {
-		return newCapabilityGateError("starting_after", "stored response stream resumption is not supported")
-	}
-	return nil
+	return "", false
 }
 
 func storedResponsesNotFoundError() *types.OpenAIErrorWithStatusCode {
@@ -163,7 +162,7 @@ func renderStoredResponsesError(c *gin.Context, apiErr *types.OpenAIErrorWithSta
 	if apiErr == nil {
 		apiErr = storedResponsesUnavailableError()
 	}
-	operation, _ := storedResponsesOperation(c.Request.Method, c.Request.URL.Path)
+	operation, _ := storedResponsesOperation(c.Request.Method, c.Request.URL.Path, c.Param("response_id"))
 	if replayProviderRawResponse(c, apiErr, providerresponse.Policy{
 		Operation:        operation,
 		DataPath:         providerresponse.DataPathExactWire,

@@ -746,8 +746,8 @@ func (r ChatCompletionStreamResponse) MarshalJSON() ([]byte, error) {
 }
 
 type ChatAudio struct {
-	Voice  string `json:"voice"`
-	Format string `json:"format"`
+	Voice  json.RawMessage `json:"voice"`
+	Format string          `json:"format"`
 }
 
 type MultimediaData struct {

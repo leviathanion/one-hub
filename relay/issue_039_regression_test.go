@@ -107,15 +107,11 @@ func issue039AssertSecondSettlement(t *testing.T, first *ResponsesWSTurnAttempt,
 }
 
 func TestIssue039ResponsesWSCompletedInjectUsesUpstreamReplyAndClientContinuation(t *testing.T) {
-	harness := newIssue004RelayHarness(t, "attempt-issue-039-first", true)
+	harness := newIssue004RelayHarness(t, "attempt-issue-039-first", "resp-039-first", true)
 	originalApproximate := config.ApproximateTokenEnabled
 	config.ApproximateTokenEnabled = true
 	t.Cleanup(func() { config.ApproximateTokenEnabled = originalApproximate })
 	installResponsesWSTestAPILimiter(t, 100)
-	// The shared I004 harness seeds a pending inject for its terminal-ack test.
-	// This scenario starts with no prior inject so the completed response can
-	// enter the completed-response recovery path directly.
-	harness.actor.turns.deferredInjects.Reset()
 
 	providerFrames := make(chan []byte, 8)
 	var providerReady sync.Once
@@ -179,8 +175,8 @@ func TestIssue039ResponsesWSCompletedInjectUsesUpstreamReplyAndClientContinuatio
 	if err := json.Unmarshal(failed.Input[0], &failedInput); err != nil || failedInput["type"] != "function_call_output" || failedInput["call_id"] != "call-039" {
 		t.Fatalf("recovery event lost function_call_output association: input=%s err=%v", failed.Input[0], err)
 	}
-	if harness.actor.closing.closed.Load() || harness.actor.turns.active.attempt != nil || harness.actor.turns.pending.attempt != nil {
-		t.Fatalf("completed inject recovery must keep session reusable without reopening old attempt: closed=%v active=%+v pending=%+v", harness.actor.closing.closed.Load(), harness.actor.turns.active.attempt, harness.actor.turns.pending.attempt)
+	if harness.actor.closing.closed.Load() || len(harness.actor.observation.works) != 0 {
+		t.Fatalf("completed inject recovery must keep session reusable without reopening old attempt: closed=%v observations=%d", harness.actor.closing.closed.Load(), len(harness.actor.observation.works))
 	}
 	if harness.attempt.AppliedSettlement.AppliedFinalQuota != firstCharge {
 		t.Fatalf("inject recovery changed first response settlement: before=%d after=%d", firstCharge, harness.attempt.AppliedSettlement.AppliedFinalQuota)
@@ -211,6 +207,13 @@ func TestIssue039ResponsesWSCompletedInjectUsesUpstreamReplyAndClientContinuatio
 		t.Fatalf("provider next turn did not receive returned recovery input: input=%s err=%v", sentNextObject["input"], err)
 	}
 
+	secondCreated := []byte(`{"type":"response.created","response":{"id":"resp-039-second","status":"in_progress"}}`)
+	if err := harness.providerServer.WriteMessage(wsconn.TextMessage, secondCreated); err != nil {
+		t.Fatalf("write second response identity: %v", err)
+	}
+	if got := issue004NextRelayFrame(t, harness); string(got.payload) != string(secondCreated) {
+		t.Fatalf("second response.created changed: %s", got.payload)
+	}
 	secondCompleted := []byte(`{"type":"response.completed","sequence_number":1,"response":{"id":"resp-039-second","status":"completed","usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}`)
 	if err := harness.providerServer.WriteMessage(wsconn.TextMessage, secondCompleted); err != nil {
 		t.Fatalf("write second completed provider event: %v", err)
@@ -220,8 +223,8 @@ func TestIssue039ResponsesWSCompletedInjectUsesUpstreamReplyAndClientContinuatio
 		t.Fatalf("second response did not complete through the real relay path: got=%s want=%s", secondFrame.payload, secondCompleted)
 	}
 	issue039WaitDeliveredEventCompletion(t, harness.actor)
-	if harness.actor.closing.closed.Load() || !harness.actor.isRecentlyFinalizedResponseID("resp-039-second") {
-		t.Fatalf("second response did not leave a reusable session: closed=%v final=%+v", harness.actor.closing.closed.Load(), harness.actor.turns.history.recentFinalizedResponseIDs)
+	if harness.actor.closing.closed.Load() || len(harness.actor.observation.works) != 0 {
+		t.Fatalf("second response did not leave a reusable session: closed=%v observations=%d", harness.actor.closing.closed.Load(), len(harness.actor.observation.works))
 	}
 	issue039AssertSecondSettlement(t, harness.attempt, firstCharge)
 }
@@ -236,9 +239,8 @@ func issue039CompletedRecoveryActor(t *testing.T) (*ResponsesWSSessionActor, *re
 	actor.SetPump(NewResponsesWSIOPump(conn, actor))
 	generation := actor.AttachUpstreamSession(session, 17)
 	attempt.Session = actor.upstream.session
-	actor.turns.active.attempt = attempt
-	actor.turns.active.affinity = CommitResponsesTurnAffinity(&ResponsesTurnAffinity{}, 17)
-	actor.turns.active.channelID = 17
+	registerResponsesWSTestWork(t, actor, attempt, "resp-039-owner")
+	actor.rememberConnectionLocalEphemeralResponseID("resp-039-owner")
 	actor.state = responsesWSStateInFlight
 	actor.handleProviderDownstream(ResponsesWSEventProviderDownstream{
 		AttemptID:                 attempt.AttemptID,
@@ -302,7 +304,7 @@ func TestIssue039CompletedInjectChecksOwnerAndPassesUnknownCall(t *testing.T) {
 				t.Fatalf("rejected completed inject reached upstream: %+v", request)
 			default:
 			}
-			if actor.closing.closed.Load() || actor.state != responsesWSStateIdle {
+			if actor.closing.closed.Load() || len(actor.observation.works) != 0 {
 				t.Fatalf("rejected completed inject must keep session open, closed=%v state=%v", actor.closing.closed.Load(), actor.state)
 			}
 		})
@@ -310,12 +312,11 @@ func TestIssue039CompletedInjectChecksOwnerAndPassesUnknownCall(t *testing.T) {
 }
 
 func TestIssue039RevokedPrincipalRejectsRecoveredNextTurnBeforeProvider(t *testing.T) {
-	harness := newIssue004RelayHarness(t, "attempt-issue-039-revoked", true)
+	harness := newIssue004RelayHarness(t, "attempt-issue-039-revoked", "resp-039-revoked", true)
 	originalApproximate := config.ApproximateTokenEnabled
 	config.ApproximateTokenEnabled = true
 	t.Cleanup(func() { config.ApproximateTokenEnabled = originalApproximate })
 	installResponsesWSTestAPILimiter(t, 100)
-	harness.actor.turns.deferredInjects.Reset()
 	providerFrames := make(chan []byte, 4)
 	issue039StartManagedReadPump(t, harness.providerServer, func(payload []byte) {
 		issue039ReplyCompletedInject(t, harness.providerServer, payload)
@@ -379,8 +380,8 @@ func TestIssue039RevokedPrincipalRejectsRecoveredNextTurnBeforeProvider(t *testi
 	if !strings.Contains(string(frame.payload), `"code":"invalid_api_key"`) {
 		t.Fatalf("revoked principal did not fail prework with invalid_api_key: %s", frame.payload)
 	}
-	if harness.actor.turns.pending.attempt != nil || harness.actor.turns.active.attempt != nil {
-		t.Fatalf("revoked next turn created provider work before principal revalidation: pending=%+v active=%+v", harness.actor.turns.pending.attempt, harness.actor.turns.active.attempt)
+	if len(harness.actor.observation.works) != 0 {
+		t.Fatalf("revoked next turn created provider work before principal revalidation: observations=%d", len(harness.actor.observation.works))
 	}
 	select {
 	case payload := <-providerFrames:

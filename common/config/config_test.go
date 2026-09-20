@@ -69,9 +69,6 @@ func TestInitConfLoadsRealtimeSessionCompatFlagAndDefaults(t *testing.T) {
 	if got := viper.GetInt("responses_websocket_client_inbound_activity_timeout_ms"); got != 60000 {
 		t.Fatalf("expected responses websocket client inbound activity timeout default 60000ms, got %d", got)
 	}
-	if got := viper.GetInt("responses_ws.active_turn_timeout_ms"); got != 120000 {
-		t.Fatalf("expected ResponsesWS active turn timeout default 120000ms, got %d", got)
-	}
 	if got := viper.GetInt("responses_ws.max_lifetime_ms"); got != 3600000 {
 		t.Fatalf("expected ResponsesWS max lifetime default 3600000ms, got %d", got)
 	}
@@ -232,17 +229,6 @@ func TestSplitWebsocketClientLivenessConfig(t *testing.T) {
 		t.Fatalf("expected explicit responses client inbound activity timeout to apply, got %s", got)
 	}
 
-	if got := ResponsesWSActiveTurnTimeout(); got != 2*time.Minute {
-		t.Fatalf("expected responses active turn timeout to default to 2m, got %s", got)
-	}
-	viper.Set("responses_ws.active_turn_timeout_ms", 1500)
-	if got := ResponsesWSActiveTurnTimeout(); got != 1500*time.Millisecond {
-		t.Fatalf("expected explicit responses active turn timeout to apply, got %s", got)
-	}
-	viper.Set("responses_ws.active_turn_timeout_ms", 0)
-	if got := ResponsesWSActiveTurnTimeout(); got != 0 {
-		t.Fatalf("expected zero responses active turn timeout to disable watchdog, got %s", got)
-	}
 	viper.Reset()
 	viper.Set("responses_ws.client_pong_timeout_ms", 1500)
 	if got := ResponsesWebsocketClientInboundActivityTimeout(); got != time.Minute {
@@ -307,9 +293,6 @@ func TestResponsesWSOptionalTimeoutsCanBeDisabled(t *testing.T) {
 	if got := ResponsesWSIdleTimeout(); got != 30*time.Minute {
 		t.Fatalf("expected unset idle cleanup timeout to use 30m, got %s", got)
 	}
-	if got := ResponsesWSActiveTurnTimeout(); got != 2*time.Minute {
-		t.Fatalf("expected unset active-turn timeout to use 2m, got %s", got)
-	}
 	if got := ResponsesWSMaxLifetime(); got != time.Hour {
 		t.Fatalf("expected unset proxy max lifetime to use 1h, got %s", got)
 	}
@@ -317,7 +300,6 @@ func TestResponsesWSOptionalTimeoutsCanBeDisabled(t *testing.T) {
 	for _, key := range []string{
 		"responses_ws.first_frame_timeout_ms",
 		"responses_ws.idle_timeout_ms",
-		"responses_ws.active_turn_timeout_ms",
 		"responses_ws.max_lifetime_ms",
 	} {
 		viper.Set(key, 0)
@@ -327,9 +309,6 @@ func TestResponsesWSOptionalTimeoutsCanBeDisabled(t *testing.T) {
 	}
 	if got := ResponsesWSIdleTimeout(); got != 0 {
 		t.Fatalf("expected zero idle timeout to disable it, got %s", got)
-	}
-	if got := ResponsesWSActiveTurnTimeout(); got != 0 {
-		t.Fatalf("expected zero active-turn timeout to disable it, got %s", got)
 	}
 	if got := ResponsesWSMaxLifetime(); got != 0 {
 		t.Fatalf("expected zero max lifetime to disable it, got %s", got)

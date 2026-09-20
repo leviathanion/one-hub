@@ -115,15 +115,15 @@ func TaskProviderID(task *Task) string {
 	if task == nil || task.TaskID == nil {
 		return ""
 	}
-	return strings.TrimSpace(*task.TaskID)
+	return taskProviderIdentity(task, *task.TaskID)
 }
 
 func SetTaskProviderID(task *Task, providerTaskID string) {
 	if task == nil {
 		return
 	}
-	providerTaskID = strings.TrimSpace(providerTaskID)
-	if providerTaskID == "" {
+	providerTaskID = taskProviderIdentity(task, providerTaskID)
+	if strings.TrimSpace(providerTaskID) == "" {
 		task.TaskID = nil
 		return
 	}
@@ -157,12 +157,23 @@ func GetTaskByTaskIds(platform string, userId int, taskIds []string) (task []*Ta
 	if err != nil {
 		return nil, err
 	}
+	requestedIDs := make(map[string]struct{}, len(taskIds))
+	if taskUsesOpaqueProviderID(platform) {
+		for _, id := range taskIds {
+			requestedIDs[id] = struct{}{}
+		}
+	}
 	seen := make(map[string]struct{}, len(task))
 	for _, item := range task {
 		if item == nil {
 			continue
 		}
 		providerTaskID := TaskProviderID(item)
+		if taskUsesOpaqueProviderID(platform) {
+			if _, exact := requestedIDs[providerTaskID]; !exact {
+				return nil, ErrTaskLookupConflict
+			}
+		}
 		if _, ok := seen[providerTaskID]; ok {
 			return nil, fmt.Errorf("%w: platform=%s user_id=%d task_id=%s", ErrTaskLookupConflict, platform, userId, providerTaskID)
 		}
@@ -185,6 +196,9 @@ func GetTaskByTaskId(platform string, userId int, taskId string) (task *Task, er
 		return nil, fmt.Errorf("%w: platform=%s user_id=%d task_id=%s", ErrTaskLookupConflict, platform, userId, taskId)
 	}
 
+	if taskUsesOpaqueProviderID(platform) && TaskProviderID(tasks[0]) != taskId {
+		return nil, ErrTaskLookupConflict
+	}
 	return tasks[0], nil
 }
 
@@ -276,4 +290,17 @@ func GetAllUserTasks(userId int, params *TaskQueryParams) (*DataResult[Task], er
 	}
 
 	return PaginateAndOrder(tx, &params.PaginationParams, &tasks, allowedTaskOrderFields)
+}
+
+// 原生 OpenAI Task 的上游 ID 是不透明标识，不以空白或大小写归一化别名。
+// 其余既有任务家族保留原来的标识约定。
+func taskProviderIdentity(task *Task, id string) string {
+	if task != nil && taskUsesOpaqueProviderID(task.Platform) {
+		return id
+	}
+	return strings.TrimSpace(id)
+}
+
+func taskUsesOpaqueProviderID(platform string) bool {
+	return platform == TaskPlatformOpenAIResponsesBackground || platform == TaskPlatformOpenAIBatch
 }
