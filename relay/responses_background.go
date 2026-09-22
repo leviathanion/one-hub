@@ -206,9 +206,16 @@ func (r *relayResponses) sendBackgroundResponse() (*types.OpenAIErrorWithStatusC
 			closeBackgroundWithoutHandle(r.c.Request.Context(), task, "submission outcome has no recoverable response id")
 		}
 	}()
-	sink := newBackgroundObservationSink(r.c.Request.Context(), task.OwnerID)
-	r.c.Set(responsesBackgroundObserverDoneContextKey, sink.done)
-	defer sink.Close()
+	var sink *backgroundObservationSink
+	defer func() { sink.Close() }()
+	observe := func(response *types.OpenAIResponsesResponses, usage *types.Usage) {
+		if sink == nil {
+			// 接受幂等重放后，Task 可能已替换为先前请求的持久 owner。
+			sink = newBackgroundObservationSink(r.c.Request.Context(), task.OwnerID)
+			r.c.Set(responsesBackgroundObserverDoneContextKey, sink.done)
+		}
+		sink.Submit(response, usage)
+	}
 	usage := &types.Usage{}
 	r.provider.SetUsage(usage)
 	r.responsesRequest.Model = r.modelName
@@ -240,7 +247,7 @@ func (r *relayResponses) sendBackgroundResponse() (*types.OpenAIErrorWithStatusC
 			}
 			_ = stream.ObserveResponsesEvent(event)
 			if task.ProviderState == model.TaskProviderStateAccepted {
-				sink.Submit(observed.Response, usage)
+				observe(observed.Response, usage)
 			}
 			return nil
 		})
@@ -262,7 +269,7 @@ func (r *relayResponses) sendBackgroundResponse() (*types.OpenAIErrorWithStatusC
 		apiErr.UpstreamAccepted = true
 		return apiErr, true
 	}
-	sink.Submit(response, usage)
+	observe(response, usage)
 	return responseJsonClient(r.c, response), true
 }
 

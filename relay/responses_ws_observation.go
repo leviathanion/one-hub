@@ -198,6 +198,11 @@ func (a *ResponsesWSSessionActor) finishRejectedCreate(object map[string]json.Ra
 	if rejectionCode == "websocket_connection_limit_reached" {
 		return false
 	}
+	// stream_id 校验失败可能发生在 lane 确定之前；缺少作用域不能证明
+	// 默认 lane 的 create 被拒绝，必须保留歧义以阻止迟到响应错配。
+	if lane == "" && rejectionCode == "invalid_stream_id" {
+		return false
+	}
 	var candidate *responsesWSObservedWork
 	for _, work := range a.observation.works {
 		if work.lane != lane {

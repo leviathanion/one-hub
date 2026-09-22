@@ -19,6 +19,19 @@ const longLivedPrincipalAuthenticatedKey = "long_lived_principal_authenticated"
 const longLivedPrincipalCurrentKey = "long_lived_principal_current"
 const longLivedAdminSelectedChannelKey = "long_lived_admin_selected_channel"
 
+// AdministratorSelectedChannelID 只返回 tokenAuth 已授权且当前生效的管理员选路。
+// 资源归属可固定执行渠道，但不能据此取得管理员授权；当前角色仍由主体重验确认。
+func AdministratorSelectedChannelID(c *gin.Context) int {
+	if c == nil || c.GetBool("specific_channel_id_ignore") {
+		return 0
+	}
+	channelID := c.GetInt(longLivedAdminSelectedChannelKey)
+	if channelID <= 0 || c.GetInt("specific_channel_id") != channelID {
+		return 0
+	}
+	return channelID
+}
+
 func markLongLivedPrincipalAuthenticated(c *gin.Context) {
 	if c != nil {
 		c.Set(longLivedPrincipalAuthenticatedKey, true)
@@ -149,7 +162,7 @@ func EnsureLongLivedChannelAllowed(c *gin.Context, modelName string) (err error)
 	}
 	setAuthorizedRoutingGroup(c, group, source, groupPolicy.Ratio)
 	// 只有 tokenAuth 解析出的显式选择才可使用管理员权限；资源 owner pin 没有这个来源。
-	if c.GetInt(longLivedAdminSelectedChannelKey) == channelID && c.GetInt("specific_channel_id") == channelID && !c.GetBool("specific_channel_id_ignore") && c.GetInt("role") >= config.RoleAdminUser {
+	if AdministratorSelectedChannelID(c) == channelID && c.GetInt("role") >= config.RoleAdminUser {
 		readCtx, cancel := principalReadContext(c)
 		defer cancel()
 		channel, err := model.GetChannelByIdWithContext(readCtx, channelID)

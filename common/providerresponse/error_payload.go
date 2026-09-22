@@ -21,15 +21,20 @@ func SanitizeAPIError(apiErr *types.OpenAIErrorWithStatusCode, credentials ...st
 		safe.RawBody, changed = SanitizeErrorResponse(apiErr.RawBody, credentials...)
 		if changed {
 			safe.ResponseHeaders = apiErr.ResponseHeaders.Clone()
-			for _, name := range []string{"Content-Encoding", "Content-Length", "Content-Range", "Digest", "Etag"} {
-				safe.ResponseHeaders.Del(name)
-			}
+			StripRewrittenBodyHeaders(safe.ResponseHeaders)
 		}
 	}
 	if !apiErr.ReplayRawResponse || apiErr.StatusCode >= http.StatusBadRequest {
 		safe.ResponseHeaders = FilterCredentialHeaders(safe.ResponseHeaders, credentials...)
 	}
 	return &safe
+}
+
+// StripRewrittenBodyHeaders 移除正文改写后可能失效的元数据，保留媒体类型和缓存策略。
+func StripRewrittenBodyHeaders(headers http.Header) {
+	for _, name := range []string{"Content-Encoding", "Content-Length", "Content-Range", "Digest", "Etag"} {
+		headers.Del(name)
+	}
 }
 
 // 只对诊断做 JSON 转换，协议字段保留原始 Go 类型和值。

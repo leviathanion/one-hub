@@ -13,6 +13,11 @@ func sendRejectionTestCreate(t *testing.T, a *ResponsesWSSessionActor, session *
 		suffix = fmt.Sprintf(`,"stream_id":%q`, lane)
 	}
 	raw := `{"type":"response.create","model":"gpt-5","store":false,"future":9007199254740993` + suffix + `}`
+	return sendRejectionTestFrame(t, a, session, raw)
+}
+
+func sendRejectionTestFrame(t *testing.T, a *ResponsesWSSessionActor, session *responsesWSCaptureSendSession, raw string) *ResponsesWSTurnAttempt {
+	t.Helper()
 	a.upstream.recvArmed = true // 本夹具直接提交真实上游回执。
 	a.handleClientFrame(responsesWSTestClientTextFrame([]byte(raw)))
 	select {
@@ -30,6 +35,54 @@ func sendRejectionTestCreate(t *testing.T, a *ResponsesWSSessionActor, session *
 		t.Fatal("create was not forwarded")
 	}
 	return nil
+}
+
+func TestResponsesWSUnscopedStreamIDRejectionCannotConsumeDefaultCreate(t *testing.T) {
+	for _, test := range []struct {
+		name, streamID, errorScope string
+	}{
+		{name: "number without scope", streamID: `42`},
+		{name: "string without scope", streamID: `"invalid lane"`},
+		{name: "null scope", streamID: `42`, errorScope: `,"stream_id":null`},
+		{name: "empty scope", streamID: `42`, errorScope: `,"stream_id":""`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			a, session, conn := newSteeringTestActor(t, 1000)
+			if !a.finishObservedWork(a.observation.byResponse("resp_parent")) {
+				t.Fatal("fixture parent settlement")
+			}
+			first := sendRejectionTestCreate(t, a, session, "")
+			bad := sendRejectionTestFrame(t, a, session, `{"type":"response.create","model":"gpt-5","store":false,"stream_id":`+test.streamID+`,"future":9007199254740993}`)
+			observedProviderFrame(t, a, conn, `{"type":"error","status":400,"error":{"type":"invalid_request_error","code":"invalid_stream_id","param":"stream_id"},"future":9007199254740993`+test.errorScope+`}`)
+			if !a.observation.unsafeLane("") {
+				t.Error("unscoped error was mistaken for a proved default-lane rejection")
+			}
+			next := sendRejectionTestCreate(t, a, session, "")
+			observedProviderFrame(t, a, conn, `{"type":"response.created","response":{"id":"resp_first"}}`)
+			observedProviderFrame(t, a, conn, `{"type":"response.completed","response":{"id":"resp_first","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`)
+			observedProviderFrame(t, a, conn, `{"type":"response.created","response":{"id":"resp_next"}}`)
+			observedProviderFrame(t, a, conn, `{"type":"response.completed","response":{"id":"resp_next","usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}}}`)
+			if next.SeenProviderResponseID != "" || next.QuotaFinalized || next.Usage.TotalTokens != 0 {
+				t.Fatal("late response was billed to the next default-lane request")
+			}
+			if !first.RolledBack || !next.RolledBack {
+				t.Fatal("ambiguous default-lane reservations were not released")
+			}
+			if bad.QuotaFinalized || bad.SeenProviderResponseID != "" {
+				t.Fatal("unscoped rejection guessed another request")
+			}
+			a.finishAllObservedWorks()
+			user, token := readResponsesWSQuotaFixture(t)
+			if user.Quota != 1000 || token.RemainQuota != 1000 {
+				t.Fatalf("ambiguous work leaked or charged quota: user=%d token=%d", user.Quota, token.RemainQuota)
+			}
+			select {
+			case request := <-session.requests:
+				t.Fatalf("unscoped rejection replayed a request: %+v", request)
+			default:
+			}
+		})
+	}
 }
 
 func TestResponsesWSRequestRejectionAllowsNextSerialWork(t *testing.T) {

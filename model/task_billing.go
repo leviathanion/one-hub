@@ -249,9 +249,6 @@ func acceptTaskSubmissionWithOwnerAndHook(ctx context.Context, task *Task, provi
 	if update.Error != nil || update.RowsAffected != 1 {
 		_ = tx.Rollback().Error
 		if update.Error != nil {
-			if (owner != nil || beforeCommit != nil) && IsUniqueConstraintError(update.Error) {
-				return TaskMutationResult{Outcome: TaskMutationDefinitelyNotApplied}, ErrTaskIdentity
-			}
 			if IsUniqueConstraintError(update.Error) {
 				return resolveTaskAcceptanceIdentityConflict(ctx, task, providerTaskID, update.Error, legacyFingerprint)
 			}
@@ -320,13 +317,10 @@ func resolveTaskAcceptanceIdentityConflict(ctx context.Context, provisional *Tas
 
 	sameRequestFingerprint := existing != nil && existing.RequestFingerprint == provisional.RequestFingerprint
 	legacyFingerprintMatch := existing != nil && legacyFingerprint != "" && existing.RequestFingerprint == legacyFingerprint
-	sameOwnerScope := existing != nil && existing.UserId == provisional.UserId && existing.Platform == provisional.Platform && existing.ProviderNamespace == provisional.ProviderNamespace && existing.ProviderTaskScopeIncarnation == provisional.ProviderTaskScopeIncarnation
-	if legacyFingerprintMatch {
-		// The legacy digest predates channel/action fields, so require those
-		// durable operation fields before accepting its compatibility path.
-		sameOwnerScope = sameOwnerScope && existing.ChannelId == provisional.ChannelId && existing.Action == provisional.Action
-	}
-	reusable := existing != nil && existing.ProviderState != TaskProviderStatePrepared && existing.ProviderState != TaskProviderStateSubmitStarted && existing.AcceptanceRecordedAt != nil && sameOwnerScope && (sameRequestFingerprint || legacyFingerprintMatch)
+	// SQL 唯一约束可能折叠大小写或尾部空格；复用前按原始 ID 和持久
+	// 归属核验。接受事务已绑定资源，重放保留原 Task、资源归属和计费 token。
+	sameOwnerScope := existing != nil && existing.UserId == provisional.UserId && existing.ChannelId == provisional.ChannelId && existing.Action == provisional.Action && existing.Platform == provisional.Platform && existing.ProviderNamespace == provisional.ProviderNamespace && existing.ProviderTaskScopeIncarnation == provisional.ProviderTaskScopeIncarnation && TaskProviderID(existing) == providerTaskID
+	reusable := existing != nil && (existing.ProviderState == TaskProviderStateAccepted || existing.ProviderState == TaskProviderStateClosed) && existing.AcceptanceRecordedAt != nil && sameOwnerScope && (sameRequestFingerprint || legacyFingerprintMatch)
 	if reusable {
 		if existing.RequestFingerprint == legacyFingerprint && existing.RequestFingerprint != provisional.RequestFingerprint {
 			if err := upgradeTaskRequestFingerprint(ctx, existing, provisional.RequestFingerprint); err != nil {

@@ -205,6 +205,29 @@ func TestFixI007_IgnoredAdminSelectorDoesNotAuthorizeOwnerPin(t *testing.T) {
 	}
 }
 
+func TestFixI007_AdminDowngradeRejectsExplicitSelectionOnEligibleChannel(t *testing.T) {
+	c, db := setupI007Principal(t, config.RoleAdminUser, true)
+	model.ChannelGroup.Rule["default"]["primary-model"] = [][]int{{3}}
+	if err := AdmitAuthenticatedChannelWork(c, "primary-model", 3); err != nil {
+		t.Fatalf("管理员显式选路准入失败: %v", err)
+	}
+	if eligible, err := model.ChannelGroup.PreferredChannelEligible("default", "primary-model", 3); err != nil || !eligible {
+		t.Fatalf("测试渠道不在普通用户的授权组内: eligible=%t err=%v", eligible, err)
+	}
+	if err := db.Model(&model.User{}).Where("id = ?", c.GetInt("id")).Update("role", config.RoleCommonUser).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := AdmitAuthenticatedChannelWork(c, "primary-model", 3); err == nil || err.StatusCode != http.StatusForbidden || err.Code != "permission_denied" {
+		t.Fatalf("显式管理员选路在降权后回退到普通组权限: %v", err)
+	}
+	if c.GetInt("role") != 0 || c.GetBool(longLivedPrincipalCurrentKey) {
+		t.Fatal("降权后仍保留已通过的管理员主体权限")
+	}
+	if err := EnsureLongLivedChannelAllowed(c, "primary-model"); err == nil {
+		t.Fatal("主体刷新失败后仍允许开始新渠道工作")
+	}
+}
+
 func TestFixI007_BackupSelectionSurvivesTemporaryPrincipalReadFailure(t *testing.T) {
 	for _, table := range []string{"tokens", "publication_versions"} {
 		t.Run(table, func(t *testing.T) {

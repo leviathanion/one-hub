@@ -234,6 +234,7 @@ func TestAdministratorPinnedUnknownOwnerUsesOnlyTheExplicitChannel(t *testing.T)
 	setupRelayTestDB(t, &model.ResponseOwner{})
 	ctx, _ := responsesOwnerTestContext(11, 21)
 	ctx.Set("specific_channel_id", 31)
+	ctx.Set("long_lived_admin_selected_channel", 31)
 
 	route, err := prepareResponsesContinuationOwnership(ctx, &types.OpenAIResponsesRequest{PreviousResponseID: "resp_missing"})
 	if err != nil || !route.Strict || route.ChannelID != 31 {

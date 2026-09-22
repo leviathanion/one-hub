@@ -86,7 +86,10 @@ func responseStoredLifecycleStream(c *gin.Context, response *http.Response, owne
 	defer ioOwner.Close()
 	stop := context.AfterFunc(ioOwner.ctx, func() { _ = response.Body.Close() })
 	defer stop()
-	for key, values := range providerresponse.Filter(response.Header, policy) {
+	headers := providerresponse.Filter(response.Header, policy)
+	// 后续错误事件可能脱敏改写正文，提交响应头前就要移除原始正文的元数据。
+	providerresponse.StripRewrittenBodyHeaders(headers)
+	for key, values := range headers {
 		c.Writer.Header()[key] = append([]string(nil), values...)
 	}
 	c.Writer.WriteHeader(response.StatusCode)

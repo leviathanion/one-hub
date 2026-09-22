@@ -216,6 +216,24 @@ func TestTokenAuthAdminSelectorBranches(t *testing.T) {
 	if !pinnedCtx.GetBool("specific_channel_id_ignore") {
 		t.Fatal("expected admin selector to mark affinity ignore mode")
 	}
+	// 资源 owner 后续可重新固定同一渠道，忽略的 selector 仍不能成为管理员授权。
+	pinnedCtx.Set("specific_channel_id_ignore", false)
+	if got := AdministratorSelectedChannelID(pinnedCtx); got != 0 {
+		t.Fatalf("被忽略的管理员 selector 授予了渠道权限: %d", got)
+	}
+
+	explicitCtx, _ := newAuthTestContext(http.MethodGet, "/v1/responses")
+	tokenAuth(explicitCtx, authutil.Credential{
+		Value:         adminToken.Key,
+		SelectorParts: []string{"9"},
+	})
+	if got := AdministratorSelectedChannelID(explicitCtx); got != 9 {
+		t.Fatalf("管理员显式选路丢失授权来源: %d", got)
+	}
+	explicitCtx.Set("specific_channel_id", 10)
+	if got := AdministratorSelectedChannelID(explicitCtx); got != 0 {
+		t.Fatalf("管理员选路授权被复用到另一渠道: %d", got)
+	}
 
 	invalidCtx, invalidRecorder := newAuthTestContext(http.MethodGet, "/v1/chat/completions")
 	tokenAuth(invalidCtx, authutil.Credential{

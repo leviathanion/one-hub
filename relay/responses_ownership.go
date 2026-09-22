@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"one-api/middleware"
 	"one-api/model"
 	runtimeaffinity "one-api/runtime/channelaffinity"
 	"one-api/types"
@@ -122,7 +123,7 @@ func prepareResponsesContinuationOwnership(c *gin.Context, request *types.OpenAI
 		setPreferredChannelFromAffinity(c, channelID)
 		return responsesContinuationRoute{ChannelID: channelID}, nil
 	}
-	if pin := explicitChannelPinID(c); pin > 0 {
+	if pin := middleware.AdministratorSelectedChannelID(c); pin > 0 {
 		return responsesContinuationRoute{Strict: responseRequiresDurableOwner(request), ChannelID: pin}, nil
 	}
 	return responsesContinuationRoute{}, invalidPreviousResponseOwnerError()
