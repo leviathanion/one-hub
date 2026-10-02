@@ -8,6 +8,8 @@ import {
   Card,
   CardContent,
   Chip,
+  Checkbox,
+  MenuItem,
   Dialog,
   DialogActions,
   DialogContent,
@@ -24,6 +26,8 @@ import { useTranslation } from 'react-i18next';
 import { API } from 'utils/api';
 import { showError, showSuccess } from 'utils/common';
 import { canAcceptDefaultPricingUrl, createPricingFetchController, resolveDefaultPricingUrl } from './pricingFetchState.mjs';
+
+import { modelsDevSelectionKey, modelsDevSelectedSource, selectModelsDevCandidate, ordinaryPricingMode } from './modelsDevState.mjs';
 
 const updateModes = ['add', 'update', 'overwrite'];
 
@@ -47,6 +51,11 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
   const [mode, setMode] = useState('overwrite');
   const [source, setSource] = useState([]);
   const [preview, setPreview] = useState(null);
+  const [modelsDev, setModelsDev] = useState(null);
+  const [selectedModelsDev, setSelectedModelsDev] = useState({});
+  const [providerFilter, setProviderFilter] = useState('');
+  const [modelFilter, setModelFilter] = useState('');
+  const [candidatePage, setCandidatePage] = useState(0);
   const defaultUrlController = useRef(null);
   const catalogRequestController = useRef(null);
   if (defaultUrlController.current === null) {
@@ -105,6 +114,9 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
     if (!open) {
       catalogRequestController.current.invalidate();
       setSource([]);
+      setMode(ordinaryPricingMode);
+      setModelsDev(null);
+      setSelectedModelsDev({});
       setPreview(null);
       setLoading(false);
     }
@@ -130,6 +142,9 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
     urlRef.current = nextUrl;
     defaultUrlController.current.invalidate();
     catalogRequestController.current.invalidate();
+    setModelsDev(null);
+    setSelectedModelsDev({});
+    setMode(ordinaryPricingMode);
     setUrl(nextUrl);
     setSource([]);
     setPreview(null);
@@ -138,7 +153,11 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
   };
 
   const handleCheckUpdates = async () => {
+    const selectedMode = ordinaryPricingMode(mode);
+    setMode(selectedMode);
     const requestGeneration = catalogRequestController.current.begin();
+    setModelsDev(null);
+    setSelectedModelsDev({});
     setLoading(true);
     setSource([]);
     setPreview(null);
@@ -152,7 +171,7 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
         return;
       }
       setSource(catalog);
-      await requestPreview(catalog, mode, requestGeneration);
+      await requestPreview(catalog, selectedMode, requestGeneration);
     } catch (error) {
       if (catalogRequestController.current.isCurrent(requestGeneration)) {
         showError(error.response?.data?.message || error.message);
@@ -162,6 +181,40 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
         setLoading(false);
       }
     }
+  };
+
+  const fetchModelsDev = async () => {
+    const generation = catalogRequestController.current.begin();
+    setLoading(true);
+    setModelsDev(null);
+    setSelectedModelsDev({});
+    setSource([]);
+    setPreview(null);
+    setCandidatePage(0);
+    setProviderFilter('');
+    setModelFilter('');
+    try {
+      const response = await API.get('/api/prices/modelsdev');
+      if (!catalogRequestController.current.isCurrent(generation)) return;
+      if (!response.data?.success || !Array.isArray(response.data?.data?.candidates)) {
+        throw new Error(response.data?.message || t('CheckUpdatesTable.dataFormatIncorrect'));
+      }
+      setModelsDev(response.data.data);
+      setMode('merge');
+    } catch (error) {
+      if (catalogRequestController.current.isCurrent(generation)) showError(error.response?.data?.message || error.message);
+    } finally {
+      if (catalogRequestController.current.isCurrent(generation)) setLoading(false);
+    }
+  };
+
+  const selectCandidate = (candidate, checked) => {
+    const next = selectModelsDevCandidate(selectedModelsDev, candidate, checked);
+    catalogRequestController.current.invalidate();
+    setSelectedModelsDev(next);
+    setSource(modelsDevSelectedSource(next));
+    setPreview(null);
+    setLoading(false);
   };
 
   const handleModeChange = async (selectedMode) => {
@@ -228,15 +281,21 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
   };
 
   const changes = preview?.plan?.changes || [];
+  const providers = [...new Set((modelsDev?.candidates || []).map((candidate) => candidate.provider))].sort();
+  const filteredCandidates = (modelsDev?.candidates || []).filter(
+    (candidate) =>
+      (!providerFilter || candidate.provider === providerFilter) && candidate.model.toLowerCase().includes(modelFilter.toLowerCase())
+  );
+  const visibleCandidates = filteredCandidates.slice(candidatePage * 100, (candidatePage + 1) * 100);
 
   return (
-    <Dialog open={open} onClose={onCancel} fullWidth maxWidth="md">
+    <Dialog open={open} onClose={applyLoading ? undefined : onCancel} fullWidth maxWidth="md">
       <Box sx={{ display: 'flex', alignItems: 'center', px: 2.5, py: 2 }}>
         <Icon icon="solar:restart-bold" width={20} height={20} style={{ marginRight: 8 }} />
         <Typography variant="h6" sx={{ flexGrow: 1 }}>
           {t('CheckUpdatesTable.checkUpdates')}
         </Typography>
-        <IconButton edge="end" onClick={onCancel} aria-label={t('common.close')} size="small">
+        <IconButton edge="end" onClick={onCancel} disabled={applyLoading} aria-label={t('common.close')} size="small">
           <Icon icon="solar:close-circle-bold" />
         </IconButton>
       </Box>
@@ -250,10 +309,11 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
             placeholder={t('CheckUpdatesTable.url')}
             value={url}
             onChange={handleUrlChange}
+            disabled={loading || applyLoading}
             InputProps={{
               endAdornment: (
                 <Tooltip title={t('CheckUpdatesTable.fetchData')}>
-                  <IconButton onClick={handleCheckUpdates} disabled={loading || !url} color="primary" size="small">
+                  <IconButton onClick={handleCheckUpdates} disabled={loading || applyLoading || !url} color="primary" size="small">
                     <Icon icon={loading ? 'svg-spinners:180-ring' : 'solar:refresh-bold'} fontSize="1.2rem" />
                   </IconButton>
                 </Tooltip>
@@ -261,21 +321,98 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
             }}
           />
 
-          <ButtonGroup fullWidth aria-label={t('CheckUpdatesTable.updatePrices')}>
-            {updateModes.map((item) => (
-              <Button
-                key={item}
-                variant={mode === item ? 'contained' : 'outlined'}
-                onClick={() => handleModeChange(item)}
-                disabled={loading}
-              >
-                {t(`CheckUpdatesTable.updateMode${item.charAt(0).toUpperCase()}${item.slice(1)}`)}
-              </Button>
-            ))}
-          </ButtonGroup>
+          <Button onClick={fetchModelsDev} disabled={loading || applyLoading} variant="outlined">
+            {t('modelsDev.fetch')}
+          </Button>
+          {modelsDev && (
+            <Stack spacing={1}>
+              <Alert severity="info">{t('modelsDev.policy')}</Alert>
+              <Typography variant="caption">
+                {modelsDev.url} · {t('modelsDev.selected')}: {source.length}
+              </Typography>
+              <Stack direction="row" spacing={1}>
+                <TextField
+                  select
+                  size="small"
+                  label={t('modelsDev.provider')}
+                  value={providerFilter}
+                  onChange={(event) => {
+                    setProviderFilter(event.target.value);
+                    setCandidatePage(0);
+                  }}
+                  sx={{ minWidth: 180 }}
+                >
+                  <MenuItem value="">{t('common.all')}</MenuItem>
+                  {providers.map((provider) => (
+                    <MenuItem key={provider} value={provider}>
+                      {provider}
+                    </MenuItem>
+                  ))}
+                </TextField>
+                <TextField
+                  size="small"
+                  label={t('common.search')}
+                  value={modelFilter}
+                  onChange={(event) => {
+                    setModelFilter(event.target.value);
+                    setCandidatePage(0);
+                  }}
+                  fullWidth
+                />
+              </Stack>
+              {visibleCandidates.map((candidate) => (
+                <Stack key={modelsDevSelectionKey(candidate)} direction="row" spacing={1} alignItems="center">
+                  <Checkbox
+                    checked={selectedModelsDev[candidate.model]?.provider === candidate.provider}
+                    disabled={!candidate.price || Boolean(candidate.reason) || loading || applyLoading}
+                    onChange={(event) => selectCandidate(candidate, event.target.checked)}
+                    inputProps={{ 'aria-label': `${candidate.provider}: ${candidate.model}` }}
+                  />
+                  <Box sx={{ minWidth: 0, overflowWrap: 'anywhere' }}>
+                    <Typography variant="body2">
+                      {candidate.provider} / {candidate.model}
+                    </Typography>
+                    <Typography variant="caption" color={candidate.reason ? 'error' : 'text.secondary'}>
+                      {candidate.reason || `input: ${candidate.price?.input}, output: ${candidate.price?.output}`}
+                    </Typography>
+                  </Box>
+                  {candidate.conflict && <Chip size="small" color="warning" label={t('modelsDev.conflict')} />}
+                </Stack>
+              ))}
+              <Stack direction="row" spacing={1} alignItems="center">
+                <Button disabled={candidatePage === 0} onClick={() => setCandidatePage(candidatePage - 1)}>
+                  ←
+                </Button>
+                <Typography variant="caption">
+                  {candidatePage + 1} / {Math.max(1, Math.ceil(filteredCandidates.length / 100))} ({filteredCandidates.length})
+                </Typography>
+                <Button
+                  disabled={(candidatePage + 1) * 100 >= filteredCandidates.length}
+                  onClick={() => setCandidatePage(candidatePage + 1)}
+                >
+                  →
+                </Button>
+              </Stack>
+            </Stack>
+          )}
+
+          {!modelsDev && (
+            <ButtonGroup fullWidth aria-label={t('CheckUpdatesTable.updatePrices')}>
+              {updateModes.map((item) => (
+                <Button
+                  key={item}
+                  variant={mode === item ? 'contained' : 'outlined'}
+                  onClick={() => handleModeChange(item)}
+                  disabled={loading || applyLoading}
+                >
+                  {t(`CheckUpdatesTable.updateMode${item.charAt(0).toUpperCase()}${item.slice(1)}`)}
+                </Button>
+              ))}
+            </ButtonGroup>
+          )}
 
           {source.length > 0 && !preview && (
-            <Button variant="outlined" onClick={refreshPreview} disabled={loading}>
+            <Button variant="outlined" onClick={refreshPreview} disabled={loading || applyLoading}>
               {t('CheckUpdatesTable.fetchData')}
             </Button>
           )}
@@ -339,7 +476,7 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
       </DialogContent>
 
       <DialogActions sx={{ px: 2, py: 1.5, justifyContent: 'space-between' }}>
-        <Button onClick={onCancel} variant="outlined" color="inherit">
+        <Button onClick={onCancel} disabled={applyLoading} variant="outlined" color="inherit">
           {t('CheckUpdatesTable.cancel')}
         </Button>
         <LoadingButton

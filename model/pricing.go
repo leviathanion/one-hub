@@ -29,6 +29,7 @@ const (
 	PriceUpdateModeAdd       PriceUpdateMode = "add"
 	PriceUpdateModeOverwrite PriceUpdateMode = "overwrite"
 	PriceUpdateModeUpdate    PriceUpdateMode = "update"
+	PriceUpdateModeMerge     PriceUpdateMode = "merge"
 )
 
 // Pricing is a struct that contains the pricing data
@@ -468,17 +469,22 @@ var errPriceMutationNoChange = errors.New("price mutation has no changes")
 type priceMutationVerifier func(*gorm.DB) (bool, error)
 
 func (p *Pricing) mutatePriceAtVersion(expectedVersion int64, mutate func(*gorm.DB) error) error {
+	_, err := p.executePriceMutation(context.Background(), expectedVersion, mutate)
+	return err
+}
+
+// executePriceMutation owns version fencing, commit confirmation and publication.
+func (p *Pricing) executePriceMutation(ctx context.Context, expectedVersion int64, mutate func(*gorm.DB) error) (int64, error) {
 	if p == nil || DB == nil || mutate == nil {
-		return errors.New("pricing mutation is unavailable")
+		return 0, errors.New("pricing mutation is unavailable")
 	}
 	if expectedVersion < 1 {
-		return errors.New("expected price version must be positive")
+		return 0, errors.New("expected price version must be positive")
 	}
-	ctx := context.Background()
 	newVersion := expectedVersion + 1
 	tx := DB.WithContext(ctx).Begin()
 	if tx.Error != nil {
-		return tx.Error
+		return 0, tx.Error
 	}
 	rollback := true
 	defer func() {
@@ -488,26 +494,26 @@ func (p *Pricing) mutatePriceAtVersion(expectedVersion int64, mutate func(*gorm.
 	}()
 	head, err := ReadPublicationVersion(ctx, tx, PublicationOwnerPrice)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if head != expectedVersion {
-		return ErrPublicationVersionConflict
+		return 0, ErrPublicationVersionConflict
 	}
 	if err := mutate(tx); err != nil {
 		if errors.Is(err, errPriceMutationNoChange) {
 			_ = tx.Rollback().Error
 			rollback = false
 			p.convergeAfterPriceCommit(ctx, expectedVersion)
-			return nil
+			return expectedVersion, nil
 		}
-		return err
+		return 0, err
 	}
 	targetState, err := loadPricePolicyState(tx)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if _, err := BumpPublicationVersionCAS(ctx, tx, PublicationOwnerPrice, expectedVersion); err != nil {
-		return err
+		return 0, err
 	}
 	rollback = false
 	commitErr := tx.Commit().Error
@@ -517,11 +523,11 @@ func (p *Pricing) mutatePriceAtVersion(expectedVersion int64, mutate func(*gorm.
 			return reflect.DeepEqual(actual, targetState), err
 		}
 		if resolvedErr := resolvePriceCommitOutcome(ctx, expectedVersion, commitErr, verify); resolvedErr != nil {
-			return resolvedErr
+			return 0, resolvedErr
 		}
 	}
 	p.convergeAfterPriceCommit(ctx, newVersion)
-	return nil
+	return newVersion, nil
 }
 
 func (p *Pricing) publishPriceVersionAtLeast(ctx context.Context, version int64) error {

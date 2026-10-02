@@ -25,6 +25,9 @@ import (
 	"one-api/types"
 )
 
+var _ providersBase.ResponsesInterface = (*OpenAIProvider)(nil)
+var _ providersBase.ResponsesCompactInterface = (*OpenAIProvider)(nil)
+
 type OpenAIResponsesStreamHandler struct {
 	Usage  *types.Usage
 	Prefix string
@@ -275,7 +278,11 @@ func (p *OpenAIProvider) CountResponsesInputTokens(ctx context.Context, rawReq *
 	}
 	fullRequestURL := p.GetFullRequestURL(requestPath, request.Model)
 	headers := p.GetRequestHeaders()
-	httpReq, err := p.Requester.NewRequest(http.MethodPost, fullRequestURL, p.Requester.WithBody(body), p.Requester.WithHeader(headers))
+	bodyWire, bodyErr := responsesWireBody(rawReq, body)
+	if bodyErr != nil {
+		return nil, common.ErrorWrapperLocal(bodyErr, "encode_request_failed", http.StatusInternalServerError)
+	}
+	httpReq, err := p.Requester.NewRequest(http.MethodPost, fullRequestURL, p.Requester.WithBody(bodyWire), p.Requester.WithHeader(headers))
 	if err != nil {
 		return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
 	}
@@ -605,7 +612,11 @@ func (p *OpenAIProvider) buildCompactResponsesRequest(rawReq *commonresponses.Re
 		return nil, errWithCode
 	}
 
-	req, err := p.Requester.NewRequest(http.MethodPost, fullRequestURL, p.Requester.WithBody(bodyMap), p.Requester.WithHeader(headers))
+	bodyWire, bodyErr := responsesWireBody(rawReq, bodyMap)
+	if bodyErr != nil {
+		return nil, common.ErrorWrapperLocal(bodyErr, "encode_request_failed", http.StatusInternalServerError)
+	}
+	req, err := p.Requester.NewRequest(http.MethodPost, fullRequestURL, p.Requester.WithBody(bodyWire), p.Requester.WithHeader(headers))
 	if err != nil {
 		return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
 	}

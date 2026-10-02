@@ -164,6 +164,11 @@ type ResponsesInterface interface {
 	ProviderInterface
 	CreateResponses(ctx context.Context, req *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode)
 	CreateResponsesStream(ctx context.Context, req *commonresponses.Request) (commonresponses.EventStream, *types.OpenAIErrorWithStatusCode)
+}
+
+// ResponsesCompactInterface is independent of create/stream support.
+type ResponsesCompactInterface interface {
+	ProviderInterface
 	CompactResponses(ctx context.Context, req *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode)
 }
 

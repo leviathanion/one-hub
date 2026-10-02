@@ -304,7 +304,7 @@ func (r *relayResponses) sendCurrentProvider() (err *types.OpenAIErrorWithStatus
 		}
 
 		r.responsesRequest.Model = r.modelName
-		responsesProvider, ok := r.provider.(providersBase.ResponsesInterface)
+		responsesProvider, ok := r.provider.(providersBase.ResponsesCompactInterface)
 		if !ok || r.selectedDataPath == providersBase.DataPathCrossProtocol {
 			err = common.StringErrorWrapperLocal("channel not implemented", "channel_error", http.StatusServiceUnavailable)
 			done = true
