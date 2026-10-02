@@ -1467,7 +1467,13 @@ func (p *CodexProvider) startRealtimeWSReaderLocked(exec *runtimesession.Executi
 				close(frameCh)
 			})
 		}
+		// A reader may finish on a terminal event before Pump returns. Cancel its
+		// byte-budget wait and join its final I/O/logging through the same runtime.
+		pumpCtx, cancelPump := context.WithCancel(pumpCtx)
+		defer cancelPump()
+		workers.Add(1)
 		go func() {
+			defer workers.Done()
 			defer func() {
 				if recovered := recover(); recovered != nil {
 					finishPump(wsconn.CloseInfo{

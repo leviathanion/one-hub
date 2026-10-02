@@ -82,7 +82,16 @@ func TestIssue048CodexSearchUsageSettlesThroughAttemptOnce(t *testing.T) {
 			if apiErr != nil || session == nil {
 				t.Fatalf("open Codex Realtime session: session=%T error=%+v", session, apiErr)
 			}
-			t.Cleanup(func() { session.Abort("issue_048_test_cleanup") })
+			t.Cleanup(func() {
+				session.Abort("issue_048_test_cleanup")
+				// Detached readers and their pumps can outlive the finalizer.
+				// Join them before the fixture restores process-wide DB/logger state.
+				stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Second)
+				defer stopCancel()
+				if err := codexprovider.StopExecutionSessionRuntime(stopCtx); err != nil {
+					t.Errorf("stop Codex test runtime: %v", err)
+				}
+			})
 			finalized := make(chan struct{})
 			observerFactory := NewRealtimeTurnObserverFactory(c, models, nil)
 			session.SetTurnObserverFactory(func() runtimesession.TurnObserver {

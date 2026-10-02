@@ -50,12 +50,60 @@ func TestHandlerJoinIncludesFirstTurnProviderWork(t *testing.T) {
 	select {
 	case <-joined:
 		t.Fatal("handler join abandoned provider work")
-	default:
+	case <-time.After(20 * time.Millisecond):
 	}
 	unblock()
 	select {
 	case <-joined:
 	case <-time.After(time.Second):
 		t.Fatal("handler could not join completed provider work")
+	}
+}
+
+type blockedShutdownSendSession struct {
+	responsesWSTestSession
+	entered, release chan struct{}
+}
+
+func (s *blockedShutdownSendSession) SendClientWithResult(context.Context, responsesws.SendRequest) responsesws.ResponsesWSTransportSendResult {
+	close(s.entered)
+	<-s.release
+	return responsesws.ResponsesWSTransportSendResult{Status: responsesws.ResponsesWSTransportSendAttempted}
+}
+func TestHandlerJoinIncludesInFlightSendWorker(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("GET", "/v1/responses", nil)
+	actor := NewResponsesWSSessionActor(c)
+	session := &blockedShutdownSendSession{entered: make(chan struct{}), release: make(chan struct{})}
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(session.release) }) }
+	defer unblock()
+	actor.Start()
+	actor.startSendWorker()
+	actor.workers.sendCommands <- responsesWSSendCommand{Session: session, Frame: responsesws.NewTextFrame([]byte(`{"type":"response.create"}`))}
+	select {
+	case <-session.entered:
+	case <-time.After(time.Second):
+		t.Fatal("send worker did not enter provider")
+	}
+	actor.markClientClosed(nil)
+	actor.Post(ResponsesWSEventClientClosed{})
+	select {
+	case <-actor.Done():
+	case <-time.After(time.Second):
+		t.Fatal("actor failed to close")
+	}
+	joined := make(chan struct{})
+	go func() { actor.waitStartedGoroutines(); close(joined) }()
+	select {
+	case <-joined:
+		t.Fatal("handler join abandoned in-flight send")
+	case <-time.After(20 * time.Millisecond):
+	}
+	unblock()
+	select {
+	case <-joined:
+	case <-time.After(time.Second):
+		t.Fatal("send worker did not exit")
 	}
 }
