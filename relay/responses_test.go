@@ -234,14 +234,6 @@ func (p *compactRejectProvider) GetRequestHeaders() map[string]string {
 	return map[string]string{}
 }
 
-func (p *compactRejectProvider) CreateResponses(context.Context, *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
-	return nil, nil
-}
-
-func (p *compactRejectProvider) CreateResponsesStream(context.Context, *commonresponses.Request) (commonresponses.EventStream, *types.OpenAIErrorWithStatusCode) {
-	return nil, nil
-}
-
 func (p *compactRejectProvider) CompactResponses(context.Context, *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
 	p.compactCalled = true
 	return &types.OpenAIResponsesResponses{}, nil
@@ -249,14 +241,6 @@ func (p *compactRejectProvider) CompactResponses(context.Context, *commonrespons
 
 func (p *compactSuccessProvider) GetRequestHeaders() map[string]string {
 	return map[string]string{}
-}
-
-func (p *compactSuccessProvider) CreateResponses(context.Context, *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
-	return nil, nil
-}
-
-func (p *compactSuccessProvider) CreateResponsesStream(context.Context, *commonresponses.Request) (commonresponses.EventStream, *types.OpenAIErrorWithStatusCode) {
-	return nil, nil
 }
 
 func (p *compactSuccessProvider) CompactResponses(context.Context, *commonresponses.Request) (*types.OpenAIResponsesResponses, *types.OpenAIErrorWithStatusCode) {
