@@ -116,7 +116,7 @@ func TestModelsDevMergePreservesUnselectedLockedAndLocalRules(t *testing.T) {
 		t.Fatal(version, err)
 	}
 	local, _ := publisher.FindExactPrice("local")
-	if local.ChannelType != 99 || local.Input != 2 || len(local.RateRules.Data().ServiceTier) != 1 || len(local.RateRules.Data().LongContext) != 0 || local.ExtraRatios.Data()[config.UsageExtraInputAudio] != 7 {
+	if local.ChannelType != 99 || local.Input != 2 || len(local.RateRules.Data().ServiceTier) != 1 || len(local.RateRules.Data().LongContext) != 1 || local.ExtraRatios.Data()[config.UsageExtraInputAudio] != 7 {
 		t.Fatal(local)
 	}
 	if _, ok := publisher.FindExactPrice("keep"); !ok {

@@ -411,6 +411,8 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
             </ButtonGroup>
           )}
 
+          {mode !== 'add' && <Alert severity="warning">{t('CheckUpdatesTable.contextTierPolicy')}</Alert>}
+
           {source.length > 0 && !preview && (
             <Button variant="outlined" onClick={refreshPreview} disabled={loading || applyLoading}>
               {t('CheckUpdatesTable.fetchData')}

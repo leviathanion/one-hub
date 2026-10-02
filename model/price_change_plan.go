@@ -186,7 +186,13 @@ func buildPriceChangePlan(current map[string]*Price, source []*Price, mode Price
 		if mode == PriceUpdateModeMerge {
 			synced.ChannelType = existing.ChannelType
 			if existing.RateRules != nil && !existing.RateRules.Data().Empty() {
-				synced.RateRules = existing.RateRules
+				rules := ClonePriceRateRules(existing.RateRules.Data())
+				rules.LongContext = nil
+				if incoming.RateRules != nil {
+					rules.LongContext = ClonePriceRateRules(incoming.RateRules.Data()).LongContext
+				}
+				encoded := datatypes.NewJSONType(rules)
+				synced.RateRules = &encoded
 			}
 			if existing.ExtraRatios != nil {
 				values := map[string]float64{}
