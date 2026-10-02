@@ -22,6 +22,9 @@ func (o *shutdownBlockedFinalizer) FinalizeTurn(runtimesession.TurnFinalizePaylo
 }
 
 func TestRuntimeShutdownJoinsDetachedRealtimeSettlement(t *testing.T) {
+	oldWorkers := realtimeWorkers
+	realtimeWorkers = &sync.WaitGroup{}
+	t.Cleanup(func() { realtimeWorkers = oldWorkers })
 	provider := newTestCodexProviderWithContext(t, `{"access_token":"access-token","account_id":"acct-123"}`, `{}`, nil)
 	manager := runtimesession.NewManagerWithOptions(runtimesession.ManagerOptions{DefaultTTL: time.Minute})
 	replaceCodexExecutionSessionsForTest(t, manager)

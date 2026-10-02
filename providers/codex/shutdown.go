@@ -7,7 +7,7 @@ import (
 
 // Readers can outlive a detached HTTP attachment. Keep their provider evidence,
 // observer finalization and panic cleanup alive until the process drain joins.
-var realtimeWorkers sync.WaitGroup
+var realtimeWorkers = &sync.WaitGroup{}
 
 // Call only after HTTP/WS handlers and admin background work have drained.
 // Then the janitor and already-counted readers are the only possible parents of
@@ -17,8 +17,9 @@ func StopExecutionSessionRuntime(ctx context.Context) error {
 	if err := currentCodexExecutionSessions().Shutdown(ctx); err != nil {
 		return err
 	}
+	workers := realtimeWorkers
 	done := make(chan struct{})
-	go func() { realtimeWorkers.Wait(); close(done) }()
+	go func() { workers.Wait(); close(done) }()
 	select {
 	case <-done:
 		return nil
