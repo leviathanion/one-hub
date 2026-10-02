@@ -357,3 +357,13 @@ func GetUpdatePriceService(c *gin.Context) {
 		"message": "",
 	})
 }
+
+// GetModelsDevPrices fetches a fixed, bounded read-only source for administrators.
+func GetModelsDevPrices(c *gin.Context) {
+	catalog, err := model.FetchModelsDevPrices(c.Request.Context())
+	if err != nil {
+		common.APIRespondWithError(c, http.StatusBadGateway, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": catalog})
+}
