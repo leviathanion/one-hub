@@ -25,6 +25,9 @@ import (
 	"one-api/types"
 )
 
+var _ providersBase.ResponsesInterface = (*OpenAIProvider)(nil)
+var _ providersBase.ResponsesCompactInterface = (*OpenAIProvider)(nil)
+
 type OpenAIResponsesStreamHandler struct {
 	Usage  *types.Usage
 	Prefix string
