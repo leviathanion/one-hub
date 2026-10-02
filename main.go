@@ -184,6 +184,9 @@ func initHttpServer() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := gracefulShutdown(shutdownCtx, httpServer, wsconn.ShutdownActive); err != nil {
+		if closeErr := model.CloseDB(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("database close: %w", closeErr))
+		}
 		logger.FatalLog("failed to shutdown server: " + err.Error())
 	}
 }
@@ -193,10 +196,10 @@ func gracefulShutdown(ctx context.Context, httpServer *http.Server, drainWebSock
 	if httpServer != nil {
 		shutdownHTTP = httpServer.Shutdown
 	}
-	return gracefulShutdownSteps(ctx, shutdownHTTP, drainWebSockets, payment.Resources.Close)
+	return gracefulShutdownSteps(ctx, shutdownHTTP, drainWebSockets, payment.Resources.Close, model.StopBatchUpdater)
 }
 
-func gracefulShutdownSteps(ctx context.Context, shutdownHTTP func(context.Context) error, drainWebSockets func(context.Context) error, closePayments func()) error {
+func gracefulShutdownSteps(ctx context.Context, shutdownHTTP func(context.Context) error, drainWebSockets func(context.Context) error, closePayments func(), stopBatches func(context.Context) error) error {
 	var shutdownErrs []error
 	httpDrained := true
 	if shutdownHTTP != nil {
@@ -214,6 +217,11 @@ func gracefulShutdownSteps(ctx context.Context, shutdownHTTP func(context.Contex
 	}
 	if httpDrained && closePayments != nil {
 		closePayments()
+	}
+	if stopBatches != nil {
+		if err := stopBatches(ctx); err != nil {
+			shutdownErrs = append(shutdownErrs, fmt.Errorf("batch shutdown: %w", err))
+		}
 	}
 	return errors.Join(shutdownErrs...)
 }
