@@ -29,6 +29,7 @@ const (
 	PriceUpdateModeAdd       PriceUpdateMode = "add"
 	PriceUpdateModeOverwrite PriceUpdateMode = "overwrite"
 	PriceUpdateModeUpdate    PriceUpdateMode = "update"
+	PriceUpdateModeMerge     PriceUpdateMode = "merge"
 )
 
 // Pricing is a struct that contains the pricing data
