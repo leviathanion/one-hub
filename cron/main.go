@@ -8,6 +8,7 @@ import (
 	"one-api/common/config"
 	"one-api/common/logger"
 	"one-api/common/scheduler"
+	"one-api/internal/lifecycle"
 	"one-api/model"
 	"one-api/payment"
 	"one-api/providers/codex"
@@ -15,6 +16,18 @@ import (
 	"github.com/go-co-op/gocron/v2"
 	"github.com/spf13/viper"
 )
+
+var cronContext, cancelCron = context.WithCancel(context.Background())
+var startupWork lifecycle.Group
+
+func Stop(ctx context.Context) error {
+	cancelCron()
+	startupWork.Close()
+	if err := scheduler.Manager.Shutdown(ctx); err != nil {
+		return err
+	}
+	return startupWork.Wait(ctx)
+}
 
 func InitCron() {
 	if !config.IsMasterNode {
@@ -24,7 +37,7 @@ func InitCron() {
 
 	// 未确认订单只观察，不重放支付创建。SQL 查询额度在多实例间共享。
 	if err := scheduler.Manager.AddJob("payment_reconcile", gocron.DurationJob(30*time.Second), gocron.NewTask(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		ctx, cancel := context.WithTimeout(cronContext, 2*time.Minute)
 		defer cancel()
 		if err := payment.Reconcile(ctx); err != nil {
 			logger.SysError("支付核查失败: " + err.Error())
@@ -84,23 +97,23 @@ func InitCron() {
 		"codex_maintenance",
 		gocron.DurationJob(codex.AutoRefreshInterval),
 		gocron.NewTask(func() {
-			codex.RunScheduledMaintenance(context.Background())
+			codex.RunScheduledMaintenance(cronContext)
 		}),
 	)
 	if err != nil {
 		logger.SysError("Cron job error: " + err.Error())
 	}
 	if err == nil {
-		common.SafeGoroutine(func() {
-			codex.RunScheduledMaintenance(context.Background())
-		})
+		if finish, ok := startupWork.Start(); ok {
+			common.SafeGoroutine(func() { defer finish(); codex.RunScheduledMaintenance(cronContext) })
+		}
 	}
 
 	err = scheduler.Manager.AddJob(
 		"cleanup_response_owners",
 		gocron.DailyJob(1, gocron.NewAtTimes(gocron.NewAtTime(3, 30, 0))),
 		gocron.NewTask(func() {
-			deleted, cleanupErr := model.DeleteExpiredResponseOwners(context.Background(), time.Now())
+			deleted, cleanupErr := model.DeleteExpiredResponseOwners(cronContext, time.Now())
 			if cleanupErr != nil {
 				logger.SysError("Cleanup response owners error: " + cleanupErr.Error())
 				return
@@ -108,7 +121,7 @@ func InitCron() {
 			if deleted > 0 {
 				logger.SysLog("清理过期 Responses 归属记录")
 			}
-			if _, cleanupErr := model.DeleteExpiredResourceOwners(context.Background(), time.Now()); cleanupErr != nil {
+			if _, cleanupErr := model.DeleteExpiredResourceOwners(cronContext, time.Now()); cleanupErr != nil {
 				logger.SysError("Cleanup resource owners error: " + cleanupErr.Error())
 			}
 		}),

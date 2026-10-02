@@ -23,20 +23,62 @@ const (
 )
 
 var taskWake = make(chan struct{}, 1)
+var taskWorkerMu sync.Mutex
+var taskWorker *progressWorker
+
+type progressWorker struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+// StopTask cancels new scans/provider polling and waits for already running
+// mutations (including detached bounded settlement) before DB retirement.
+func StopTask(ctx context.Context) error {
+	taskWorkerMu.Lock()
+	worker := taskWorker
+	taskWorkerMu.Unlock()
+	if worker == nil {
+		return nil
+	}
+	worker.cancel()
+	select {
+	case <-worker.done:
+		return nil
+	default:
+	}
+	select {
+	case <-worker.done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("task progress still running: %w", ctx.Err())
+	}
+}
 
 func InitTask() {
-	common.SafeGoroutine(Task)
-	ActivateUpdateTaskBulk()
+	taskWorkerMu.Lock()
+	defer taskWorkerMu.Unlock()
+	if taskWorker != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	worker := &progressWorker{cancel: cancel, done: make(chan struct{})}
+	taskWorker = worker
+	common.SafeGoroutine(func() { defer close(worker.done); defer cancel(); runTask(ctx, updateTaskBulk) })
 }
 
 // Task is a fixed-tick durable progressor. Wakeups only reduce latency; a lost
 // wakeup cannot strand an owner because next_action_at remains authoritative.
-func Task() {
+func runTask(ctx context.Context, update func(context.Context)) {
 	ticker := time.NewTicker(taskProgressTick)
 	defer ticker.Stop()
 	for {
-		UpdateTaskBulk()
+		if ctx.Err() != nil {
+			return
+		}
+		update(ctx)
 		select {
+		case <-ctx.Done():
+			return
 		case <-ticker.C:
 		case <-taskWake:
 		}
@@ -56,8 +98,13 @@ type taskPollGroup struct {
 	tasks     []*model.Task
 }
 
-func UpdateTaskBulk() {
-	ctx := context.WithValue(context.Background(), logger.RequestIdKey, "Task")
+func UpdateTaskBulk() { updateTaskBulk(context.Background()) }
+
+func updateTaskBulk(parent context.Context) {
+	ctx := context.WithValue(parent, logger.RequestIdKey, "Task")
+	if ctx.Err() != nil {
+		return
+	}
 	if _, err := model.DeleteExpiredBackgroundResponseTasks(ctx, time.Now()); err != nil {
 		logger.LogError(ctx, "background task cleanup failed: "+err.Error())
 	}
@@ -66,6 +113,9 @@ func UpdateTaskBulk() {
 	}
 	var afterNextActionAt, afterID int64
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		due, err := model.ListDueTaskOwners(ctx, time.Now(), afterNextActionAt, afterID, model.TaskProgressPageSize)
 		if err != nil {
 			logger.LogError(ctx, "scan due task owners failed: "+err.Error())
@@ -77,6 +127,9 @@ func UpdateTaskBulk() {
 
 		groups := make(map[string]*taskPollGroup)
 		for _, owner := range due {
+			if ctx.Err() != nil {
+				return
+			}
 			if owner == nil {
 				continue
 			}
@@ -129,12 +182,20 @@ func progressTaskGroups(parent context.Context, groups map[string]*taskPollGroup
 		go func() {
 			defer workers.Done()
 			for group := range jobs {
+				if parent.Err() != nil {
+					return
+				}
 				progressTaskGroup(parent, group)
 			}
 		}()
 	}
+dispatch:
 	for _, group := range groups {
-		jobs <- group
+		select {
+		case jobs <- group:
+		case <-parent.Done():
+			break dispatch
+		}
 	}
 	close(jobs)
 	workers.Wait()

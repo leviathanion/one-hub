@@ -13,6 +13,7 @@ import (
 	"one-api/common/requestctx"
 	commonresponses "one-api/common/responses"
 	"one-api/common/utils"
+	"one-api/internal/lifecycle"
 	"one-api/model"
 	"one-api/providers"
 	providers_base "one-api/providers/base"
@@ -362,7 +363,7 @@ func TestChannel(c *gin.Context) {
 	} else {
 		success = true
 		msg = "测速成功"
-		go channel.UpdateResponseTime(result.milliseconds)
+		channel.UpdateResponseTime(result.milliseconds)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -484,7 +485,24 @@ func runFullChannelProbeTask(channels []*model.Channel) string {
 	return strings.Join(reports, "")
 }
 
+var channelProbes lifecycle.Group
+
+func StopChannelProbes(ctx context.Context) error {
+	channelProbes.Close()
+	return channelProbes.Wait(ctx)
+}
+
 func testAllChannels(isNotify bool) error {
+	finish, ok := channelProbes.Start()
+	if !ok {
+		return errors.New("channel probes are shutting down")
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			finish()
+		}
+	}()
 	if err := startFullChannelProbeTask(); err != nil {
 		return err
 	}
@@ -503,7 +521,9 @@ func testAllChannels(isNotify bool) error {
 		finishFullChannelProbeTask()
 		return nil
 	}
+	transferred = true
 	go func() {
+		defer finish()
 		defer finishFullChannelProbeTask()
 
 		sendMessage := runFullChannelProbeTask(probeable)
@@ -530,12 +550,21 @@ func TestAllChannels(c *gin.Context) {
 }
 
 func AutomaticallyTestChannels(frequency int) {
+	AutomaticallyTestChannelsContext(context.Background(), frequency)
+}
+func AutomaticallyTestChannelsContext(ctx context.Context, frequency int) {
 	if frequency <= 0 {
 		return
 	}
 
+	ticker := time.NewTicker(time.Duration(frequency) * time.Minute)
+	defer ticker.Stop()
 	for {
-		time.Sleep(time.Duration(frequency) * time.Minute)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 		logger.SysLog("testing all channels")
 		err := testAllChannels(false)
 		if err != nil {

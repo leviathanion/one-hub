@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"embed"
-	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -20,13 +19,12 @@ import (
 	"one-api/common/storage"
 	"one-api/common/telegram"
 	"one-api/common/webauthn"
-	"one-api/common/wsconn"
 	"one-api/controller"
 	"one-api/cron"
+	"one-api/internal/lifecycle"
 	"one-api/metrics"
 	"one-api/middleware"
 	"one-api/model"
-	"one-api/payment"
 	"one-api/providers/codex"
 	"one-api/relay/task"
 	"one-api/router"
@@ -88,11 +86,26 @@ func main() {
 	webauthn.InitWebAuthn()
 	model.NewPricing()
 	publicationCtx, stopPublicationWatchers := context.WithCancel(context.Background())
+	background := &lifecycle.Group{}
+	runBackground := func(work func()) {
+		finish, ok := background.Start()
+		if ok {
+			go func() { defer finish(); work() }()
+		}
+	}
+	stopBackground := func(ctx context.Context) error {
+		stopPublicationWatchers()
+		background.Close()
+		if err := cron.Stop(ctx); err != nil {
+			return err
+		}
+		return background.Wait(ctx)
+	}
 	defer stopPublicationWatchers()
 	model.HandleOldTokenMaxId()
 
-	initMemoryCache()
-	initSync(publicationCtx)
+	initMemoryCache(publicationCtx, runBackground)
+	initSync(publicationCtx, runBackground)
 
 	common.InitTokenEncoders()
 	requester.InitHttpClient()
@@ -108,12 +121,12 @@ func main() {
 	// 初始化账单数据
 	if config.UserInvoiceMonth {
 		logger.SysLog("Enable User Invoice Monthly Data")
-		go model.InsertStatisticsMonth()
+		runBackground(func() { _ = model.InsertStatisticsMonth() })
 	}
-	initHttpServer()
+	initHttpServer(stopBackground)
 }
 
-func initMemoryCache() {
+func initMemoryCache(ctx context.Context, run func(func())) {
 	if viper.GetBool("memory_cache_enabled") {
 		config.MemoryCacheEnabled = true
 	}
@@ -127,18 +140,18 @@ func initMemoryCache() {
 
 	logger.SysLog("memory cache enabled")
 	logger.SysLog(fmt.Sprintf("sync frequency: %d seconds", syncFrequency))
-	go SyncChannelCache(syncFrequency)
+	run(func() { SyncChannelCache(ctx, syncFrequency) })
 }
 
-func initSync(ctx context.Context) {
+func initSync(ctx context.Context, run func(func())) {
 	// go controller.AutomaticallyUpdateChannels(viper.GetInt("channel.update_frequency"))
-	go controller.AutomaticallyTestChannels(viper.GetInt("channel.test_frequency"))
-	go model.WatchPricePublication(ctx)
-	go model.WatchOptionsPublication(ctx)
-	go model.WatchUserGroupPublication(ctx)
+	run(func() { controller.AutomaticallyTestChannelsContext(ctx, viper.GetInt("channel.test_frequency")) })
+	run(func() { model.WatchPricePublication(ctx) })
+	run(func() { model.WatchOptionsPublication(ctx) })
+	run(func() { model.WatchUserGroupPublication(ctx) })
 }
 
-func initHttpServer() {
+func initHttpServer(stopBackground func(context.Context) error) {
 	if viper.GetString("gin_mode") != "debug" {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -166,9 +179,10 @@ func initHttpServer() {
 	router.SetRouter(server, buildFS, indexPage)
 	port := viper.GetString("port")
 
+	requests := &lifecycle.Group{}
 	httpServer := &http.Server{
 		Addr:    ":" + port,
-		Handler: server,
+		Handler: requests.Handler(server),
 	}
 	go func() {
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -183,57 +197,30 @@ func initHttpServer() {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := gracefulShutdown(shutdownCtx, httpServer, wsconn.ShutdownActive); err != nil {
-		if closeErr := model.CloseDB(); closeErr != nil {
-			err = errors.Join(err, fmt.Errorf("database close: %w", closeErr))
-		}
+	if err := gracefulShutdown(shutdownCtx, httpServer, requests, stopBackground); err != nil {
+		// FatalLog exits immediately. Do not close shared SQL beneath producers that
+		// failed to drain; an unsuccessful bounded stop cannot promise final durability.
 		logger.FatalLog("failed to shutdown server: " + err.Error())
 	}
 }
 
-func gracefulShutdown(ctx context.Context, httpServer *http.Server, drainWebSockets func(context.Context) error) error {
-	var shutdownHTTP func(context.Context) error
-	if httpServer != nil {
-		shutdownHTTP = httpServer.Shutdown
-	}
-	return gracefulShutdownSteps(ctx, shutdownHTTP, drainWebSockets, payment.Resources.Close, model.StopBatchUpdater)
-}
-
-func gracefulShutdownSteps(ctx context.Context, shutdownHTTP func(context.Context) error, drainWebSockets func(context.Context) error, closePayments func(), stopBatches func(context.Context) error) error {
-	var shutdownErrs []error
-	httpDrained := true
-	if shutdownHTTP != nil {
-		if err := shutdownHTTP(ctx); err != nil {
-			httpDrained = false
-			logger.SysError("failed to shutdown HTTP server: " + err.Error())
-			shutdownErrs = append(shutdownErrs, fmt.Errorf("http shutdown: %w", err))
-		}
-	}
-	if drainWebSockets != nil {
-		if err := drainWebSockets(ctx); err != nil {
-			logger.SysError("failed to drain active websocket connections: " + err.Error())
-			shutdownErrs = append(shutdownErrs, fmt.Errorf("websocket drain: %w", err))
-		}
-	}
-	if httpDrained && closePayments != nil {
-		closePayments()
-	}
-	if stopBatches != nil {
-		if err := stopBatches(ctx); err != nil {
-			shutdownErrs = append(shutdownErrs, fmt.Errorf("batch shutdown: %w", err))
-		}
-	}
-	return errors.Join(shutdownErrs...)
-}
-
-func SyncChannelCache(frequency int) {
+func SyncChannelCache(ctx context.Context, frequency int) {
 	// 只有 从 服务器端获取数据的时候才会用到
 	if config.IsMasterNode {
 		logger.SysLog("master node does't synchronize the channel")
 		return
 	}
+	if frequency <= 0 {
+		return
+	}
+	ticker := time.NewTicker(time.Duration(frequency) * time.Second)
+	defer ticker.Stop()
 	for {
-		time.Sleep(time.Duration(frequency) * time.Second)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 		logger.SysLog("syncing channels from database")
 		if err := model.ChannelGroup.Load(); err != nil {
 			logger.SysError("failed to sync channels from database: " + err.Error())

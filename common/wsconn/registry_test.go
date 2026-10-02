@@ -48,6 +48,9 @@ func TestActiveRegistryShutdownHonorsContext(t *testing.T) {
 }
 
 func TestRegisterActiveShutdownActivePublicAPI(t *testing.T) {
+	original := defaultActiveRegistry
+	defaultActiveRegistry = &activeRegistry{conns: make(map[*ManagedConn]struct{})}
+	t.Cleanup(func() { defaultActiveRegistry = original })
 	conn := &ManagedConn{done: make(chan struct{}), clock: realClock{}}
 	unregister := RegisterActive(conn)
 	t.Cleanup(func() {
@@ -102,5 +105,23 @@ func TestCleanupWaitTimeoutFallsBackWhenWriteTimeoutDisabled(t *testing.T) {
 	}
 	if got := conn.cleanupWaitTimeout(); got != defaultWriteTimeout {
 		t.Fatalf("cleanupWaitTimeout=%s, want default %s", got, defaultWriteTimeout)
+	}
+}
+
+func TestDrainingRegistryClosesLateConnection(t *testing.T) {
+	registry := &activeRegistry{}
+	if err := registry.shutdown(context.Background(), shutdownCloseInfo()); err != nil {
+		t.Fatal(err)
+	}
+	conn := &ManagedConn{done: make(chan struct{}), clock: realClock{}}
+	unregister := registry.register(connRegistration{conn: conn, watchDone: true})
+	defer unregister()
+	select {
+	case <-conn.Done():
+	case <-time.After(time.Second):
+		t.Fatal("late websocket remained open")
+	}
+	if conn.CloseInfo().Kind != CloseKindGracefulShutdown {
+		t.Fatal(conn.CloseInfo())
 	}
 }

@@ -33,6 +33,12 @@ func init() {
 
 const batchWriteTimeout = 5 * time.Second
 
+// Bounds retained entries, not bytes per log. Rejection is explicit; these
+// best-effort projections must never exhaust memory while SQL is unavailable.
+const maxPendingBatchEntries = 10000
+
+var ErrBatchQueueFull = errors.New("batch projection queue is full")
+
 var ErrBatchUpdaterStopped = errors.New("batch updater is stopped")
 var batchAdmissionMu sync.RWMutex
 var batchAdmissionClosed bool
@@ -79,9 +85,7 @@ func InitBatchUpdater() {
 				return
 			case <-ticker.C:
 				// Periodic I/O has its own budget; shutdown waits rather than replaying it.
-				writeCtx, writeCancel := context.WithTimeout(ctx, batchWriteTimeout)
-				err := flushBatchContext(writeCtx)
-				writeCancel()
+				err := flushBatchContext(ctx)
 				if err != nil {
 					failedFlushes++
 					if firstError == nil {
@@ -138,6 +142,9 @@ func AddLogToBatch(log *Log) error {
 	}
 	batchLogLock.Lock()
 	defer batchLogLock.Unlock()
+	if len(batchLogStore) >= maxPendingBatchEntries {
+		return ErrBatchQueueFull
+	}
 	batchLogStore = append(batchLogStore, log)
 	return nil
 }
@@ -150,6 +157,9 @@ func addNewRecord(type_ int, id int, value int) error {
 	}
 	batchUpdateLocks[type_].Lock()
 	defer batchUpdateLocks[type_].Unlock()
+	if _, exists := batchUpdateStores[type_][id]; !exists && len(batchUpdateStores[type_]) >= maxPendingBatchEntries {
+		return ErrBatchQueueFull
+	}
 	batchUpdateStores[type_][id] += value
 	return nil
 }
@@ -168,7 +178,18 @@ func withBatchFlush(ctx context.Context, flush func(context.Context) error) erro
 }
 func flushBatchContext(ctx context.Context) error {
 	return withBatchFlush(ctx, func(ctx context.Context) error {
-		return errors.Join(batchUpdateContext(ctx), flushBatchLogsContext(ctx))
+		// Each projection gets a fresh I/O budget. During final shutdown,
+		// reserve at least half the remaining time for logs even if statistics stall.
+		statisticBudget := batchWriteTimeout
+		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline)/2 < statisticBudget {
+			statisticBudget = time.Until(deadline) / 2
+		}
+		statisticsCtx, cancelStatistics := context.WithTimeout(ctx, statisticBudget)
+		statisticsErr := batchUpdateContext(statisticsCtx)
+		cancelStatistics()
+		logsCtx, cancelLogs := context.WithTimeout(ctx, batchWriteTimeout)
+		defer cancelLogs()
+		return errors.Join(statisticsErr, flushBatchLogsContext(logsCtx))
 	})
 }
 func flushBatchLogs() error {

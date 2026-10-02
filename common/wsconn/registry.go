@@ -6,8 +6,9 @@ import (
 )
 
 type activeRegistry struct {
-	mu    sync.Mutex
-	conns map[*ManagedConn]struct{}
+	mu      sync.Mutex
+	conns   map[*ManagedConn]struct{}
+	closing bool
 }
 
 type connRegistration struct {
@@ -35,7 +36,11 @@ func (r *activeRegistry) register(reg connRegistration) func() {
 		r.conns = make(map[*ManagedConn]struct{})
 	}
 	r.conns[conn] = struct{}{}
+	closing := r.closing
 	r.mu.Unlock()
+	if closing {
+		conn.Close(shutdownCloseInfo())
+	}
 
 	var once sync.Once
 	unregister := func() {
@@ -54,15 +59,19 @@ func (r *activeRegistry) register(reg connRegistration) func() {
 	return unregister
 }
 
-// ShutdownActive closes all currently tracked connections and waits until each
+// ShutdownActive permanently closes connection admission and waits until each
 // one is done or ctx expires. The close reason intentionally stays generic so
 // wsconn does not learn about HTTP servers, relays, providers, or process code.
 func ShutdownActive(ctx context.Context) error {
-	return defaultActiveRegistry.shutdown(ctx, CloseInfo{
+	return defaultActiveRegistry.shutdown(ctx, shutdownCloseInfo())
+}
+
+func shutdownCloseInfo() CloseInfo {
+	return CloseInfo{
 		Kind:   CloseKindGracefulShutdown,
 		Code:   CloseGoingAway,
 		Reason: "server_shutdown",
-	})
+	}
 }
 
 func (r *activeRegistry) shutdown(ctx context.Context, info CloseInfo) error {
@@ -73,6 +82,7 @@ func (r *activeRegistry) shutdown(ctx context.Context, info CloseInfo) error {
 		ctx = context.Background()
 	}
 	r.mu.Lock()
+	r.closing = true
 	conns := make([]*ManagedConn, 0, len(r.conns))
 	for conn := range r.conns {
 		conns = append(conns, conn)
