@@ -1,5 +1,12 @@
 export const pricingTranslations = {
   zh: {
+    'modelsDev.fetch': '从 models.dev 获取',
+    'modelsDev.policy':
+      '勾选模型后获取服务端预览。每个模型只能选择一个供应商；导入不会删除未选模型，保留已有本地规则及渠道类型。已有缓存倍率仅在来源提供对应价格时更新。',
+    'modelsDev.provider': '来源供应商',
+    'modelsDev.conflict': '同名冲突：请选择供应商',
+    'modelsDev.selected': '已选择',
+    'CheckUpdatesTable.updateModeMerge': '确认合并选中价格',
     'pricing_edit.unknown': '未知',
     'modelpricePage.tokens': '令牌',
     'modelpricePage.times': '次数',
@@ -33,6 +40,13 @@ export const pricingTranslations = {
     'pricing_edit.unlocked': '未锁定'
   },
   en: {
+    'modelsDev.fetch': 'Fetch from models.dev',
+    'modelsDev.policy':
+      'Select models, then request a server preview. Choose one provider per model. Import keeps unselected models, existing local rules and channel types. Cache ratios change only when the source provides the corresponding price.',
+    'modelsDev.provider': 'Source provider',
+    'modelsDev.conflict': 'Name conflict: choose a provider',
+    'modelsDev.selected': 'Selected',
+    'CheckUpdatesTable.updateModeMerge': 'Confirm selected price merge',
     'pricing_edit.unknown': 'Unknown',
     'modelpricePage.tokens': 'Tokens',
     'modelpricePage.times': 'Times',

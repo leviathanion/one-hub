@@ -159,7 +159,7 @@ func ApplyPriceChange(ctx context.Context, publisher *Pricing, source []*Price, 
 
 func validatePriceChangeInput(source []*Price, mode PriceUpdateMode) error {
 	switch mode {
-	case PriceUpdateModeAdd, PriceUpdateModeUpdate, PriceUpdateModeOverwrite:
+	case PriceUpdateModeAdd, PriceUpdateModeUpdate, PriceUpdateModeOverwrite, PriceUpdateModeMerge:
 	default:
 		return fmt.Errorf("unsupported price update mode %q", mode)
 	}
@@ -173,7 +173,7 @@ func buildPriceChangePlan(current map[string]*Price, source []*Price, mode Price
 		sourceByModel[incoming.Model] = incoming
 		existing, exists := current[incoming.Model]
 		if !exists {
-			if mode == PriceUpdateModeAdd || mode == PriceUpdateModeOverwrite {
+			if mode == PriceUpdateModeAdd || mode == PriceUpdateModeOverwrite || mode == PriceUpdateModeMerge {
 				after := pricePolicyView(priceForSync(incoming, nil))
 				plan.Changes = append(plan.Changes, PriceChange{Action: PriceChangeAdd, Model: incoming.Model, After: &after})
 			}
@@ -182,7 +182,27 @@ func buildPriceChangePlan(current map[string]*Price, source []*Price, mode Price
 		if mode == PriceUpdateModeAdd {
 			continue
 		}
-		after := pricePolicyView(priceForSync(incoming, existing))
+		synced := priceForSync(incoming, existing)
+		if mode == PriceUpdateModeMerge {
+			synced.ChannelType = existing.ChannelType
+			if existing.RateRules != nil && !existing.RateRules.Data().Empty() {
+				synced.RateRules = existing.RateRules
+			}
+			if existing.ExtraRatios != nil {
+				values := map[string]float64{}
+				for k, v := range existing.ExtraRatios.Data() {
+					values[k] = v
+				}
+				if incoming.ExtraRatios != nil {
+					for k, v := range incoming.ExtraRatios.Data() {
+						values[k] = v
+					}
+				}
+				v := datatypes.NewJSONType(values)
+				synced.ExtraRatios = &v
+			}
+		}
+		after := pricePolicyView(synced)
 		before := pricePolicyView(existing)
 		if reflect.DeepEqual(before, after) {
 			continue
