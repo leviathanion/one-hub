@@ -103,100 +103,58 @@ func ApplyPriceChange(ctx context.Context, publisher *Pricing, source []*Price, 
 	if err := validatePriceChangeInput(source, mode); err != nil {
 		return 0, err
 	}
-	var appliedPlan PriceChangePlan
-	planReady := false
-	changed := false
-	tx := DB.WithContext(ctx).Begin()
-	if tx.Error != nil {
-		return 0, tx.Error
-	}
-	rollback := true
-	defer func() {
-		if rollback {
-			_ = tx.Rollback().Error
+	return publisher.executePriceMutation(ctx, baseVersion, func(tx *gorm.DB) error {
+		changed := false
+		current, err := loadPriceMap(tx)
+		if err != nil {
+			return err
 		}
-	}()
-	head, err := ReadPublicationVersion(ctx, tx, PublicationOwnerPrice)
-	if err != nil {
-		return 0, err
-	}
-	if head != baseVersion {
-		return 0, ErrPublicationVersionConflict
-	}
-	current, err := loadPriceMap(tx)
-	if err != nil {
-		return 0, err
-	}
-	appliedPlan = buildPriceChangePlan(current, source, mode)
-	actualDigest, err := digestPriceChange(baseVersion, source, appliedPlan)
-	if err != nil {
-		return 0, err
-	}
-	if !equalPriceChangeDigest(digest, actualDigest) {
-		return 0, ErrPriceChangePlanMismatch
-	}
-	planReady = true
-	for _, change := range appliedPlan.Changes {
-		switch change.Action {
-		case PriceChangeAdd:
-			if err := tx.Create(change.After.price()).Error; err != nil {
-				return 0, err
-			}
-			changed = true
-		case PriceChangeUpdate:
-			result := tx.Model(&Price{}).Where("model = ? AND locked = ?", change.Model, false).
-				Select("type", "channel_type", "input", "output", "locked", "extra_ratios", "rate_rules").
-				Updates(change.After.price())
-			if result.Error != nil {
-				return 0, result.Error
-			}
-			if result.RowsAffected != 1 {
-				return 0, ErrPublicationVersionConflict
-			}
-			changed = true
-		case PriceChangeDelete:
-			result := tx.Where("model = ? AND locked = ?", change.Model, false).Delete(&Price{})
-			if result.Error != nil {
-				return 0, result.Error
-			}
-			if result.RowsAffected != 1 {
-				return 0, ErrPublicationVersionConflict
-			}
-			changed = true
-		case PriceChangeLocked:
-			// Locked rows are part of the canonical plan but are never mutated.
-		default:
-			return 0, fmt.Errorf("unsupported price change action %q", change.Action)
+		appliedPlan := buildPriceChangePlan(current, source, mode)
+		actualDigest, err := digestPriceChange(baseVersion, source, appliedPlan)
+		if err != nil {
+			return err
 		}
-	}
-	if !changed {
-		_ = tx.Rollback().Error
-		rollback = false
-		return baseVersion, nil
-	}
-	targetState, err := loadPricePolicyState(tx)
-	if err != nil {
-		return 0, err
-	}
-	if _, err := BumpPublicationVersionCAS(ctx, tx, PublicationOwnerPrice, baseVersion); err != nil {
-		return 0, err
-	}
-	rollback = false
-	commitErr := tx.Commit().Error
-	if commitErr != nil {
-		if !planReady || errors.Is(commitErr, ErrPublicationVersionConflict) || errors.Is(commitErr, ErrPriceChangePlanMismatch) {
-			return 0, commitErr
+		if !equalPriceChangeDigest(digest, actualDigest) {
+			return ErrPriceChangePlanMismatch
 		}
-		if resolvedErr := resolvePriceCommitOutcome(ctx, baseVersion, commitErr, func(probe *gorm.DB) (bool, error) {
-			actual, err := loadPricePolicyState(probe)
-			return reflect.DeepEqual(actual, targetState), err
-		}); resolvedErr != nil {
-			return 0, resolvedErr
+		for _, change := range appliedPlan.Changes {
+			switch change.Action {
+			case PriceChangeAdd:
+				if err := tx.Create(change.After.price()).Error; err != nil {
+					return err
+				}
+				changed = true
+			case PriceChangeUpdate:
+				result := tx.Model(&Price{}).Where("model = ? AND locked = ?", change.Model, false).
+					Select("type", "channel_type", "input", "output", "locked", "extra_ratios", "rate_rules").
+					Updates(change.After.price())
+				if result.Error != nil {
+					return result.Error
+				}
+				if result.RowsAffected != 1 {
+					return ErrPublicationVersionConflict
+				}
+				changed = true
+			case PriceChangeDelete:
+				result := tx.Where("model = ? AND locked = ?", change.Model, false).Delete(&Price{})
+				if result.Error != nil {
+					return result.Error
+				}
+				if result.RowsAffected != 1 {
+					return ErrPublicationVersionConflict
+				}
+				changed = true
+			case PriceChangeLocked:
+				// Locked rows are part of the canonical plan but are never mutated.
+			default:
+				return fmt.Errorf("unsupported price change action %q", change.Action)
+			}
 		}
-	}
-	newVersion := baseVersion + 1
-	publisher.convergeAfterPriceCommit(ctx, newVersion)
-	return newVersion, nil
+		if !changed {
+			return errPriceMutationNoChange
+		}
+		return nil
+	})
 }
 
 func validatePriceChangeInput(source []*Price, mode PriceUpdateMode) error {
