@@ -13,7 +13,6 @@ import (
 	"one-api/common/requestctx"
 	commonresponses "one-api/common/responses"
 	"one-api/common/utils"
-	"one-api/internal/lifecycle"
 	"one-api/model"
 	"one-api/providers"
 	providers_base "one-api/providers/base"
@@ -436,7 +435,7 @@ func testAllChannel(channel *model.Channel) string {
 }
 
 // runFullChannelProbeTask 只接受已选定的本轮待测渠道，按输入顺序汇总报告。
-func runFullChannelProbeTask(channels []*model.Channel) string {
+func runFullChannelProbeTask(ctx context.Context, channels []*model.Channel) string {
 	if len(channels) == 0 {
 		return ""
 	}
@@ -458,6 +457,9 @@ func runFullChannelProbeTask(channels []*model.Channel) string {
 		go func() {
 			defer wg.Done()
 			for index := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
 				reportCh <- fullChannelProbeReport{
 					index:   index,
 					message: testAllChannel(channels[index]),
@@ -467,15 +469,26 @@ func runFullChannelProbeTask(channels []*model.Channel) string {
 	}
 
 	go func() {
+		defer func() { close(jobs); wg.Wait(); close(reportCh) }()
 		for index := range channels {
-			if config.RequestInterval > 0 {
-				time.Sleep(config.RequestInterval)
+			if ctx.Err() != nil {
+				return
 			}
-			jobs <- index
+			if config.RequestInterval > 0 {
+				timer := time.NewTimer(config.RequestInterval)
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				}
+			}
+			select {
+			case jobs <- index:
+			case <-ctx.Done():
+				return
+			}
 		}
-		close(jobs)
-		wg.Wait()
-		close(reportCh)
 	}()
 
 	for report := range reportCh {
@@ -485,15 +498,8 @@ func runFullChannelProbeTask(channels []*model.Channel) string {
 	return strings.Join(reports, "")
 }
 
-var channelProbes lifecycle.Group
-
-func StopChannelProbes(ctx context.Context) error {
-	channelProbes.Close()
-	return channelProbes.Wait(ctx)
-}
-
 func testAllChannels(isNotify bool) error {
-	finish, ok := channelProbes.Start()
+	finish, ok := backgroundBusiness.Start()
 	if !ok {
 		return errors.New("channel probes are shutting down")
 	}
@@ -526,8 +532,8 @@ func testAllChannels(isNotify bool) error {
 		defer finish()
 		defer finishFullChannelProbeTask()
 
-		sendMessage := runFullChannelProbeTask(probeable)
-		if isNotify {
+		sendMessage := runFullChannelProbeTask(backgroundContext, probeable)
+		if isNotify && backgroundContext.Err() == nil {
 			sendFullChannelProbeNotificationFunc("通道测试完成", sendMessage)
 		}
 	}()

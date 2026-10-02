@@ -169,7 +169,11 @@ func (b *realtimeRelayActor) Close() {
 			b.client.Close(wsconn.CloseInfo{Kind: wsconn.CloseKindAbort, Reason: "proxy_closed"})
 		}
 		if b.session != nil {
-			b.safeSessionAction("detach", func() {
+			b.safeSessionAction("close", func() {
+				if !sessionSupportsGracefulDetach(b.session) {
+					b.session.Abort("proxy_closed")
+					return
+				}
 				b.session.Detach("proxy_closed")
 			})
 		}
@@ -535,7 +539,7 @@ func (b *realtimeRelayActor) coordinate() {
 			b.session.Abort(reason)
 		case first.source == "user" && !first.graceful:
 			b.session.Abort(reason)
-		case first.source == "user" && first.graceful && !sessionSupportsGracefulDetach(b.session):
+		case !sessionSupportsGracefulDetach(b.session):
 			b.session.Abort(reason)
 		default:
 			b.session.Detach(reason)

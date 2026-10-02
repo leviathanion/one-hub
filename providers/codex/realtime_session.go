@@ -1006,7 +1006,9 @@ func scheduleCodexExecutionSessionPanicCleanup(exec *runtimesession.ExecutionSes
 	}
 	exec.MarkClosedBestEffort("session_aborted_panic")
 	currentCodexExecutionSessions().DeleteIfWithoutCleanup(exec.Key, exec)
+	realtimeWorkers.Add(1)
 	go func() {
+		defer realtimeWorkers.Done()
 		timer := time.NewTimer(25 * time.Millisecond)
 		defer timer.Stop()
 		for attempt := 0; attempt < 20; attempt++ {
@@ -1420,7 +1422,9 @@ func (p *CodexProvider) startRealtimeWSReaderLocked(exec *runtimesession.Executi
 	state.deferWSReader = false
 	state.wsReaderConn = conn
 
+	realtimeWorkers.Add(1)
 	go func() {
+		defer realtimeWorkers.Done()
 		var panicked atomic.Bool
 		defer func() {
 			if panicked.Load() {

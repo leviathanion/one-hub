@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 
-	"one-api/internal/lifecycle"
 	"one-api/model"
 	"one-api/providers/openai"
 	"one-api/types"
@@ -21,15 +20,6 @@ type backgroundObservation struct {
 // the ownership acceptance barrier is allowed to precede ID delivery.
 const responsesBackgroundObserverDoneContextKey = "responses_background_observer_done"
 
-var backgroundObservers = &lifecycle.Group{}
-
-// Called after request handlers stop, so no admitted delivery can create a new
-// observer while this group closes. Durable task polling owns recovery.
-func StopBackgroundObservers(ctx context.Context) error {
-	backgroundObservers.Close()
-	return backgroundObservers.Wait(ctx)
-}
-
 type backgroundObservationSink struct {
 	queue chan []byte
 	done  chan struct{}
@@ -37,7 +27,7 @@ type backgroundObservationSink struct {
 
 func newBackgroundObservationSink(parent context.Context, ownerID string) *backgroundObservationSink {
 	sink := &backgroundObservationSink{queue: make(chan []byte, 8), done: make(chan struct{})}
-	finish, ok := backgroundObservers.Start()
+	finish, ok := backgroundBusiness.Start()
 	if !ok {
 		close(sink.done)
 		return sink

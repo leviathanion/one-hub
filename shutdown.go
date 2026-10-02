@@ -5,32 +5,37 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"one-api/common/telegram"
 	"one-api/common/wsconn"
 	"one-api/controller"
 	"one-api/internal/lifecycle"
 	"one-api/model"
 	"one-api/payment"
+	"one-api/providers/codex"
 	"one-api/relay"
 	"one-api/relay/task"
 )
 
 type shutdownOperations struct {
-	http, connections, tasks, requests, background func(context.Context) error
-	observers                                      func(context.Context) error
-	payments                                       func()
-	batches                                        func(context.Context) error
+	http, connections, tasks, requests, background, telegram func(context.Context) error
+	observers                                                func(context.Context) error
+	payments                                                 func()
+	batches                                                  func(context.Context) error
 }
 
 func gracefulShutdown(ctx context.Context, server *http.Server, requests *lifecycle.Group, stopBackground func(context.Context) error) error {
 	requests.Close()
 	return gracefulShutdownSteps(ctx, shutdownOperations{
 		http: server.Shutdown, connections: wsconn.ShutdownActive, tasks: task.StopTask,
-		requests: requests.Wait, background: stopBackground,
+		requests: requests.Wait, background: stopBackground, telegram: telegram.StopTelegramBot,
 		observers: func(ctx context.Context) error {
-			if err := controller.StopChannelProbes(ctx); err != nil {
+			if err := controller.StopBackgroundBusiness(ctx); err != nil {
 				return err
 			}
-			return relay.StopBackgroundObservers(ctx)
+			if err := relay.StopBackgroundBusiness(ctx); err != nil {
+				return err
+			}
+			return codex.StopExecutionSessionRuntime(ctx)
 		},
 		payments: payment.Resources.Close, batches: model.StopBatchUpdater,
 	})
@@ -42,13 +47,13 @@ func gracefulShutdown(ctx context.Context, server *http.Server, requests *lifecy
 // final flush or retiring a database that may still have business users.
 func gracefulShutdownSteps(ctx context.Context, ops shutdownOperations) error {
 	var errs []error
-	results := make(chan error, 5)
+	results := make(chan error, 6)
 	count := 0
 	for _, step := range []struct {
 		name string
 		run  func(context.Context) error
 	}{
-		{"http shutdown", ops.http}, {"websocket connections", ops.connections}, {"task progress", ops.tasks}, {"request business", ops.requests}, {"background runtime", ops.background},
+		{"http shutdown", ops.http}, {"websocket connections", ops.connections}, {"task progress", ops.tasks}, {"request business", ops.requests}, {"background runtime", ops.background}, {"telegram commands", ops.telegram},
 	} {
 		if step.run == nil {
 			continue

@@ -23,9 +23,9 @@ func TestObserverShutdownJoinsDatabaseWorkAfterDeliveryReturns(t *testing.T) {
 	oldDB := model.DB
 	model.DB = db
 	// Production groups have a single process lifetime; isolate this test's fence.
-	oldObservers := backgroundObservers
-	backgroundObservers = &lifecycle.Group{}
-	t.Cleanup(func() { model.DB = oldDB; backgroundObservers = oldObservers; pool, _ := db.DB(); _ = pool.Close() })
+	oldObservers := backgroundBusiness
+	backgroundBusiness = &lifecycle.Group{}
+	t.Cleanup(func() { model.DB = oldDB; backgroundBusiness = oldObservers; pool, _ := db.DB(); _ = pool.Close() })
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	unblock := func() { once.Do(func() { close(release) }) }
@@ -43,13 +43,13 @@ func TestObserverShutdownJoinsDatabaseWorkAfterDeliveryReturns(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err = StopBackgroundObservers(ctx); !errors.Is(err, context.Canceled) {
+	if err = StopBackgroundBusiness(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("unfinished observer reported complete: %v", err)
 	}
 	unblock()
 	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err = StopBackgroundObservers(ctx); err != nil {
+	if err = StopBackgroundBusiness(ctx); err != nil {
 		t.Fatal(err)
 	}
 	select {

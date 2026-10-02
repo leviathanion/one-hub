@@ -1,6 +1,7 @@
 package check_channel
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -49,18 +50,18 @@ type CheckProcess interface {
 	Check(req *types.ChatCompletionRequest, resp *types.ChatCompletionResponse, openaiErr *types.OpenAIError) []*CheckResult
 }
 
-func CreateCheckChannel(channelId int, models string) (*CheckChannel, error) {
+func CreateCheckChannel(ctx context.Context, channelId int, models string) (*CheckChannel, error) {
 	modelsList := strings.Split(models, ",")
 	if len(modelsList) == 0 {
 		return nil, errors.New("models is empty")
 	}
 
-	channel, err := model.GetChannelById(channelId)
+	channel, err := model.GetChannelByIdWithContext(ctx, channelId)
 	if err != nil {
 		return nil, err
 	}
 
-	req, err := http.NewRequest("POST", "/v1/chat/completions", nil)
+	req, err := http.NewRequestWithContext(ctx, "POST", "/v1/chat/completions", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -154,8 +155,8 @@ func getChannelTypeByModelName(modelName string) int {
 	return 0
 }
 
-func (c *CheckChannel) RunStream(resultChan chan<- *ModelResult, doneChan chan<- bool) {
-	defer close(doneChan)
+func (c *CheckChannel) RunStream(ctx context.Context, resultChan chan<- *ModelResult) {
+	defer close(resultChan)
 
 	for _, model := range c.Models {
 		process := getProcess(model)
@@ -165,6 +166,9 @@ func (c *CheckChannel) RunStream(resultChan chan<- *ModelResult, doneChan chan<-
 		}
 
 		for _, p := range process {
+			if ctx.Err() != nil {
+				return
+			}
 			processResult := &CheckProcessResult{
 				Name:     p.GetName(),
 				Results:  make([]*CheckResult, 0),
@@ -183,6 +187,10 @@ func (c *CheckChannel) RunStream(resultChan chan<- *ModelResult, doneChan chan<-
 		}
 
 		// 每完成一个模型的检查就发送结果
-		resultChan <- modelResult
+		select {
+		case resultChan <- modelResult:
+		case <-ctx.Done():
+			return
+		}
 	}
 }
