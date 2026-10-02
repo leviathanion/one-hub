@@ -2,13 +2,16 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"one-api/internal/lifecycle"
 	"strings"
 	"testing"
+	"time"
 
 	"one-api/common/config"
 	"one-api/common/logger"
@@ -329,7 +332,16 @@ func useControllerChannelDB(t *testing.T) {
 	}
 
 	model.DB = testDB
+	oldBackground, oldContext, oldCancel := backgroundBusiness, backgroundContext, cancelBackground
+	backgroundBusiness = &lifecycle.Group{}
+	backgroundContext, cancelBackground = context.WithCancel(context.Background())
 	t.Cleanup(func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := StopBackgroundBusiness(stopCtx); err != nil {
+			t.Fatalf("drain imported channel warmup: %v", err)
+		}
+		backgroundBusiness, backgroundContext, cancelBackground = oldBackground, oldContext, oldCancel
 		model.DB = originalDB
 	})
 }
