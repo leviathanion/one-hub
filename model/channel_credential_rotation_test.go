@@ -2,11 +2,12 @@ package model
 
 import (
 	"context"
-	"one-api/common/credentials"
 	"testing"
 	"time"
 
+	"one-api/common/cache"
 	"one-api/common/config"
+	"one-api/common/credentials"
 )
 
 func insertCredentialRotationChannel(t *testing.T, id int, key string) {
@@ -84,5 +85,29 @@ func TestSoftDeleteSupersedesCredentialRotationWithoutClearingFence(t *testing.T
 	original, err := loadRotationTestSnapshot(context.Background(), 31003)
 	if err != nil || !original.Deleted || original.Key != "old" {
 		t.Fatalf("new channel altered original incarnation: %+v err=%v", original, err)
+	}
+}
+
+func TestOAuthCompareAndSetPreservesUsageGeneration(t *testing.T) {
+	useTestChannelDB(t)
+	cache.InitCacheManager()
+	insertTestChannel(t, &Channel{Id: 7110, Type: config.ChannelTypeCodex, Status: config.ChannelStatusEnabled, Name: "oauth", Key: "old-key", Group: "default", Models: "gpt-5"})
+	generation, err := cache.GetOrInitCodexUsageGeneration(7110)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, err := testRotation().Store.Load(context.Background(), 7110)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := "oauth-rotated-key"
+	updated, err := testRotation().Store.CompareAndSwap(context.Background(), snapshot, snapshot.BizData, &key)
+	if err != nil || !updated {
+		t.Fatalf("OAuth CAS failed: updated=%v err=%v", updated, err)
+	}
+	current, err := cache.GetOrInitCodexUsageGeneration(7110)
+	if err != nil || current != generation {
+		t.Fatalf("OAuth CAS must preserve fetch generation: before=%q after=%q err=%v", generation, current, err)
 	}
 }

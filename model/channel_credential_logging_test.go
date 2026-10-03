@@ -17,28 +17,28 @@ import (
 )
 
 // Credential operations must never log token values, including failed SQL.
-type issue003LogCapture struct {
+type credentialSQLLogCapture struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
 }
 
-func (c *issue003LogCapture) Printf(format string, args ...any) {
+func (c *credentialSQLLogCapture) Printf(format string, args ...any) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	fmt.Fprintf(&c.buf, format, args...)
 }
 
-func (c *issue003LogCapture) String() string {
+func (c *credentialSQLLogCapture) String() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.buf.String()
 }
 
-func issue003LogCredential(entry, phase string) (oldKey, newKey, oldAccess, oldRefresh, newAccess, newRefresh string) {
-	oldAccess = fmt.Sprintf("pi003-log-%s-old-access", entry)
-	oldRefresh = fmt.Sprintf("pi003-log-%s-old-refresh", entry)
-	newAccess = fmt.Sprintf("pi003-log-%s-%s-new-access", entry, phase)
-	newRefresh = fmt.Sprintf("pi003-log-%s-%s-new-refresh", entry, phase)
+func credentialLogFixture(entry, phase string) (oldKey, newKey, oldAccess, oldRefresh, newAccess, newRefresh string) {
+	oldAccess = fmt.Sprintf("credential-log-%s-old-access", entry)
+	oldRefresh = fmt.Sprintf("credential-log-%s-old-refresh", entry)
+	newAccess = fmt.Sprintf("credential-log-%s-%s-new-access", entry, phase)
+	newRefresh = fmt.Sprintf("credential-log-%s-%s-new-refresh", entry, phase)
 	oldKey = fmt.Sprintf(`{"access_token":%q,"refresh_token":%q,"account_id":"account-a"}`, oldAccess, oldRefresh)
 	newKey = fmt.Sprintf(`{"access_token":%q,"refresh_token":%q,"account_id":"account-a"}`, newAccess, newRefresh)
 	return
@@ -56,31 +56,31 @@ const (
 	hookAfter failureHook = "after"
 )
 
-// runIssue003LogWindow 先建立独立渠道 fixture，再在指定 gorm 日志窗口内执行
+// runCredentialSQLLogWindow 先建立独立渠道 fixture，再在指定 gorm 日志窗口内执行
 // 一次凭据写入口。wantErr=false 且 entry 为 replace_commit、hook 为 after 时，
 // 提交语句已执行、Commit 按重载证据归类为 AlreadyApplied 并成功返回（该窗口
 // 仍验证了 Error Trace 分支对已构建凭据 SQL 的抑制）。
-func runIssue003LogWindow(t *testing.T, db *gorm.DB, level gormlogger.LogLevel, slow time.Duration, entry, phase string, channelID int, hook failureHook, wantErr bool) {
+func runCredentialSQLLogWindow(t *testing.T, db *gorm.DB, level gormlogger.LogLevel, slow time.Duration, entry, phase string, channelID int, hook failureHook, wantErr bool) {
 	t.Helper()
-	oldKey, newKey, oldAccess, oldRefresh, newAccess, newRefresh := issue003LogCredential(entry, phase)
+	oldKey, newKey, oldAccess, oldRefresh, newAccess, newRefresh := credentialLogFixture(entry, phase)
 	// 渠道 fixture 必须先于捕获窗口完成：fixture INSERT 本身带旧凭据，属于
 	// 测试准备数据，不属于被验证的写入口。
 	insertCredentialRotationChannel(t, channelID, oldKey)
 	var ticket credentials.Ticket
 	if entry != "compare_and_set" {
-		ticket = credentials.Ticket{Type: config.ChannelTypeCodex, ChannelID: channelID, ExpectedVersion: 0, AttemptID: fmt.Sprintf("i003-log-fence-%d", channelID)}
+		ticket = credentials.Ticket{Type: config.ChannelTypeCodex, ChannelID: channelID, ExpectedVersion: 0, AttemptID: fmt.Sprintf("credential-log-fence-%d", channelID)}
 		if outcome, err := testRotation().Claim(context.Background(), ticket, time.Now()); err != nil || outcome != credentials.ClaimAcquired {
 			t.Fatalf("建立未决 fence: outcome=%v err=%v", outcome, err)
 		}
 	}
 
-	capture := &issue003LogCapture{}
+	capture := &credentialSQLLogCapture{}
 	captureLogger := gormlogger.New(capture, gormlogger.Config{LogLevel: level, SlowThreshold: slow, Colorful: false})
 	originalLogger := db.Logger
 	db.Logger = captureLogger
 	defer func() { db.Logger = originalLogger }()
 
-	callbackName := fmt.Sprintf("issue003_log_failure_%s_%s_%d", entry, phase, channelID)
+	callbackName := fmt.Sprintf("credential_log_failure_%s_%s_%d", entry, phase, channelID)
 	registerFailure := func() {
 		if err := db.Callback().Update().After("gorm:update").Register(callbackName, func(tx *gorm.DB) {
 			tx.AddError(errors.New("injected credential SQL failure"))
@@ -96,7 +96,7 @@ func runIssue003LogWindow(t *testing.T, db *gorm.DB, level gormlogger.LogLevel, 
 
 	// 正向对照：非 Silent 语句在同一窗口必然打印带参数的 SQL（错误窗口用
 	// 执行后注入制造真实 Error Trace），证明捕获面有效。
-	controlMarker := fmt.Sprintf("i003-log-control-%s-%s-%d", entry, phase, channelID)
+	controlMarker := fmt.Sprintf("credential-log-control-%s-%s-%d", entry, phase, channelID)
 	if level == gormlogger.Error {
 		registerFailure()
 	}
@@ -172,9 +172,9 @@ func runIssue003LogWindow(t *testing.T, db *gorm.DB, level gormlogger.LogLevel, 
 	}
 }
 
-func TestFixI003_CredentialSQLNeverLogsTokensAcrossDatabases(t *testing.T) {
+func TestChannelCredentialSQLNeverLogsTokensAcrossDatabases(t *testing.T) {
 	forEachTestDatabase(t, func(t *testing.T, db *gorm.DB) {
-		setupI003CredentialDatabase(t, db)
+		setupCredentialDatabase(t, db)
 		type window struct {
 			entry, phase string
 			channelID    int
@@ -204,7 +204,7 @@ func TestFixI003_CredentialSQLNeverLogsTokensAcrossDatabases(t *testing.T) {
 		}
 		for _, w := range windows {
 			t.Run(w.entry+"_"+w.phase, func(t *testing.T) {
-				runIssue003LogWindow(t, db, w.level, w.slow, w.entry, w.phase, w.channelID, w.hook, w.wantErr)
+				runCredentialSQLLogWindow(t, db, w.level, w.slow, w.entry, w.phase, w.channelID, w.hook, w.wantErr)
 			})
 		}
 	})

@@ -15,15 +15,6 @@ import (
 	"one-api/model"
 )
 
-func credentialRound5TestKey(t *testing.T, accessToken, refreshToken string) string {
-	t.Helper()
-	key, err := (&OAuth2Credentials{AccessToken: accessToken, RefreshToken: refreshToken}).ToJSON()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return key
-}
-
 func TestUsagePreviewWritesEachCacheEntryOnce(t *testing.T) {
 	cache.InitCacheManager()
 	originalRedis := config.RedisEnabled

@@ -15,7 +15,7 @@ import (
 	"gorm.io/gorm"
 )
 
-func setupI003CredentialDatabase(t *testing.T, db *gorm.DB) {
+func setupCredentialDatabase(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	if err := db.AutoMigrate(&Channel{}); err != nil {
 		t.Fatal(err)
@@ -29,7 +29,7 @@ func setupI003CredentialDatabase(t *testing.T, db *gorm.DB) {
 
 func TestCredentialRecoveryInvalidatesOldAttempt(t *testing.T) {
 	forEachTestDatabase(t, func(t *testing.T, db *gorm.DB) {
-		setupI003CredentialDatabase(t, db)
+		setupCredentialDatabase(t, db)
 		insertCredentialRotationChannel(t, 33001, "old")
 		ticket := credentials.Ticket{ChannelID: 33001, Type: config.ChannelTypeCodex, AttemptID: "Attempt-A"}
 		if outcome, err := testRotation().Claim(t.Context(), ticket, time.Now()); err != nil || outcome != credentials.ClaimAcquired {

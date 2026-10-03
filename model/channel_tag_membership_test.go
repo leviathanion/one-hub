@@ -16,7 +16,7 @@ func TestUpdateChannelsTagConfigRollsBackMembershipConflict(t *testing.T) {
 	insertTestChannel(t, &Channel{Id: 27012, Type: config.ChannelTypeOpenAI, Status: config.ChannelStatusEnabled, Name: "moves-out", Tag: "target", Key: "key-b", Models: modelValue})
 	insertTestChannel(t, &Channel{Id: 27013, Type: config.ChannelTypeOpenAI, Status: config.ChannelStatusEnabled, Name: "moves-in", Tag: "other", Key: "key-c", Models: modelValue})
 
-	callback := "test:round27_swap_tag_before_config_update"
+	callback := "test:swap_tag_before_config_update"
 	if err := DB.Callback().Update().Before("gorm:update").Register(callback, func(tx *gorm.DB) {
 		if tx.Statement.Table != "channels" {
 			return

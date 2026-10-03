@@ -31,30 +31,30 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-type issue003APIResult struct {
+type codexOAuthAPIResult struct {
 	Success bool            `json:"success"`
 	Message string          `json:"message"`
 	Data    json.RawMessage `json:"data"`
 }
 
-func issue003JWT(account string) string {
+func codexOAuthAccountJWT(account string) string {
 	claims, _ := json.Marshal(map[string]any{"https://api.openai.com/auth": map[string]string{"chatgpt_account_id": account}})
 	return base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256"}`)) + "." + base64.RawURLEncoding.EncodeToString(claims) + ".test-signature"
 }
 
-func issue003HTTPAPI(t *testing.T) func(string, any, string) issue003APIResult {
+func newCodexOAuthTestAPI(t *testing.T) func(string, any, string) codexOAuthAPIResult {
 	t.Helper()
 	if err := model.DB.AutoMigrate(&model.User{}); err != nil {
 		t.Fatal(err)
 	}
 	for index, role := range []int{config.RoleAdminUser, config.RoleCommonUser} {
-		user := &model.User{Id: index + 1, Username: fmt.Sprintf("i003-user-%d", index), Password: "password", AccessToken: fmt.Sprintf("i003-access-%d", index), AffCode: fmt.Sprintf("i003-aff-%d", index), Role: role, Status: config.UserStatusEnabled}
+		user := &model.User{Id: index + 1, Username: fmt.Sprintf("oauth-recovery-user-%d", index), Password: "password", AccessToken: fmt.Sprintf("oauth-recovery-access-%d", index), AffCode: fmt.Sprintf("oauth-recovery-aff-%d", index), Role: role, Status: config.UserStatusEnabled}
 		if err := model.DB.Create(user).Error; err != nil {
 			t.Fatal(err)
 		}
 	}
 	engine := gin.New()
-	engine.Use(sessions.Sessions("session", cookie.NewStore([]byte("i003-local-session-secret-32bytes"))))
+	engine.Use(sessions.Sessions("session", cookie.NewStore([]byte("oauth-recovery-local-session-secret-32bytes"))))
 	group := engine.Group("/api/codex/oauth", middleware.AdminAuth())
 	group.POST("/start", StartCodexOAuth)
 	group.POST("/exchange-code", CodexOAuthCallback)
@@ -64,7 +64,7 @@ func issue003HTTPAPI(t *testing.T) func(string, any, string) issue003APIResult {
 	transport := &http.Transport{Proxy: nil}
 	t.Cleanup(transport.CloseIdleConnections)
 	client := &http.Client{Transport: transport, Timeout: 5 * time.Second}
-	return func(path string, payload any, credential string) issue003APIResult {
+	return func(path string, payload any, credential string) codexOAuthAPIResult {
 		raw, err := json.Marshal(payload)
 		if err != nil {
 			t.Fatal(err)
@@ -80,7 +80,7 @@ func issue003HTTPAPI(t *testing.T) func(string, any, string) issue003APIResult {
 			t.Fatal(err)
 		}
 		defer response.Body.Close()
-		var result issue003APIResult
+		var result codexOAuthAPIResult
 		if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
 			t.Fatal(err)
 		}
@@ -88,7 +88,7 @@ func issue003HTTPAPI(t *testing.T) func(string, any, string) issue003APIResult {
 	}
 }
 
-func TestFixI003_RealOAuthRecoversOnlyOriginalCredentialSnapshot(t *testing.T) {
+func TestCodexOAuthRecoversOnlyOriginalCredentialSnapshot(t *testing.T) {
 	for _, scenario := range []string{"same_account", "different_account", "exchange_error", "missing_access_token", "blank_access_token", "missing_state", "wrong_url_state", "missing_url_state", "duplicate_url_state", "payload_state_mismatch", "missing_verifier", "expired_session", "deleted", "type_changed", "account_changed", "revision_changed", "fence_changed", "revision_changed_during_exchange", "non_admin"} {
 		t.Run(scenario, func(t *testing.T) {
 			useControllerChannelTagTestDB(t)
@@ -102,17 +102,17 @@ func TestFixI003_RealOAuthRecoversOnlyOriginalCredentialSnapshot(t *testing.T) {
 			}
 			sqlDB.SetMaxOpenConns(1)
 			t.Cleanup(func() { _ = sqlDB.Close() })
-			key := `{"access_token":"i003-old-access","refresh_token":"i003-old-refresh","account_id":"account-a"}`
+			key := `{"access_token":"oauth-recovery-old-access","refresh_token":"oauth-recovery-old-refresh","account_id":"account-a"}`
 			channel := &model.Channel{Type: config.ChannelTypeCodex, Key: key, Status: config.ChannelStatusEnabled, Models: "gpt-5", Group: "default"}
 			if err := model.DB.Create(channel).Error; err != nil {
 				t.Fatal(err)
 			}
-			oldTicket := credentialflow.Ticket{Type: config.ChannelTypeCodex, ChannelID: channel.Id, ExpectedVersion: 0, AttemptID: "i003-unresolved-refresh"}
+			oldTicket := credentialflow.Ticket{Type: config.ChannelTypeCodex, ChannelID: channel.Id, ExpectedVersion: 0, AttemptID: "oauth-recovery-unresolved-refresh"}
 			if outcome, err := testRotation().Claim(t.Context(), oldTicket, time.Now()); err != nil || outcome != credentialflow.ClaimAcquired {
 				t.Fatalf("未建立未决刷新fence：%v %v", outcome, err)
 			}
-			call := issue003HTTPAPI(t)
-			start := call("start", map[string]any{"channel_id": channel.Id}, "i003-access-0")
+			call := newCodexOAuthTestAPI(t)
+			start := call("start", map[string]any{"channel_id": channel.Id}, "oauth-recovery-access-0")
 			var startData struct {
 				SessionID string `json:"session_id"`
 				AuthURL   string `json:"auth_url"`
@@ -165,16 +165,16 @@ func TestFixI003_RealOAuthRecoversOnlyOriginalCredentialSnapshot(t *testing.T) {
 				t.Fatal(err)
 			}
 			var exchanges atomic.Int64
-			newAccess := issue003JWT("account-a")
+			newAccess := codexOAuthAccountJWT("account-a")
 			if scenario == "different_account" {
-				newAccess = issue003JWT("account-b")
+				newAccess = codexOAuthAccountJWT("account-b")
 			}
 			withTokenEndpointTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				exchanges.Add(1)
 				if err := r.ParseForm(); err != nil {
 					t.Error(err)
 				}
-				if r.Form.Get("grant_type") != "authorization_code" || r.Form.Get("code_verifier") != stateData.CodeVerifier || r.Form.Get("code") != "i003-independent-authorization-code" || r.Form.Get("refresh_token") != "" {
+				if r.Form.Get("grant_type") != "authorization_code" || r.Form.Get("code_verifier") != stateData.CodeVerifier || r.Form.Get("code") != "oauth-recovery-independent-authorization-code" || r.Form.Get("refresh_token") != "" {
 					t.Error("恢复必须交换独立授权码并携带对应PKCE")
 				}
 				current, err := loadRotationTestSnapshot(context.Background(), channel.Id)
@@ -194,16 +194,16 @@ func TestFixI003_RealOAuthRecoversOnlyOriginalCredentialSnapshot(t *testing.T) {
 				if scenario == "missing_access_token" || scenario == "blank_access_token" {
 					// 上游以 200 返回仅含原账号 id_token、缺失/空白 access_token 的响应：
 					// 账号检查能通过，因此只靠账号一致不能放行，必须拒绝并保留原保护状态。
-					payload := map[string]any{"id_token": issue003JWT("account-a")}
+					payload := map[string]any{"id_token": codexOAuthAccountJWT("account-a")}
 					if scenario == "blank_access_token" {
 						payload["access_token"] = "   "
 					}
 					_ = json.NewEncoder(w).Encode(payload)
 					return
 				}
-				_ = json.NewEncoder(w).Encode(map[string]any{"access_token": newAccess, "refresh_token": "i003-new-refresh", "token_type": "Bearer", "expires_in": 3600})
+				_ = json.NewEncoder(w).Encode(map[string]any{"access_token": newAccess, "refresh_token": "oauth-recovery-new-refresh", "token_type": "Bearer", "expires_in": 3600})
 			}))
-			state, urlState, credential := startData.SessionID, startData.SessionID, "i003-access-0"
+			state, urlState, credential := startData.SessionID, startData.SessionID, "oauth-recovery-access-0"
 			if scenario == "missing_state" {
 				state = "missing-oauth-session"
 			}
@@ -211,11 +211,11 @@ func TestFixI003_RealOAuthRecoversOnlyOriginalCredentialSnapshot(t *testing.T) {
 				urlState = "different-oauth-session"
 			}
 			if scenario == "non_admin" {
-				credential = "i003-access-1"
+				credential = "oauth-recovery-access-1"
 			}
-			callback := map[string]any{"session_id": state, "callback_url": codex.DefaultRedirectURI + "?code=i003-independent-authorization-code&state=" + url.QueryEscape(urlState)}
+			callback := map[string]any{"session_id": state, "callback_url": codex.DefaultRedirectURI + "?code=oauth-recovery-independent-authorization-code&state=" + url.QueryEscape(urlState)}
 			if scenario == "missing_url_state" {
-				callback["callback_url"] = codex.DefaultRedirectURI + "?code=i003-independent-authorization-code"
+				callback["callback_url"] = codex.DefaultRedirectURI + "?code=oauth-recovery-independent-authorization-code"
 			}
 			if scenario == "duplicate_url_state" {
 				callback["callback_url"] = callback["callback_url"].(string) + "&state=" + url.QueryEscape(urlState)
@@ -274,7 +274,7 @@ func TestFixI003_RealOAuthRecoversOnlyOriginalCredentialSnapshot(t *testing.T) {
 				if after.Key != before.Key || after.Version != before.Version || after.Fence == nil || *after.Fence != *before.Fence {
 					t.Error("缺少 access_token 的响应不得构造空凭据、保存或清除 fence")
 				}
-				if strings.Contains(result.Message, issue003JWT("account-a")) || strings.Contains(string(result.Data), issue003JWT("account-a")) || strings.Contains(result.Message, "i003-new-refresh") || strings.Contains(string(result.Data), "i003-new-refresh") || strings.Contains(result.Message, "i003-old-access") || strings.Contains(string(result.Data), "i003-old-access") || strings.Contains(result.Message, "i003-old-refresh") || strings.Contains(string(result.Data), "i003-old-refresh") {
+				if strings.Contains(result.Message, codexOAuthAccountJWT("account-a")) || strings.Contains(string(result.Data), codexOAuthAccountJWT("account-a")) || strings.Contains(result.Message, "oauth-recovery-new-refresh") || strings.Contains(string(result.Data), "oauth-recovery-new-refresh") || strings.Contains(result.Message, "oauth-recovery-old-access") || strings.Contains(string(result.Data), "oauth-recovery-old-access") || strings.Contains(result.Message, "oauth-recovery-old-refresh") || strings.Contains(string(result.Data), "oauth-recovery-old-refresh") {
 					t.Error("失败响应泄露了令牌或 id_token 内容")
 				}
 				again := call("exchange-code", callback, credential)
@@ -294,7 +294,7 @@ func TestFixI003_RealOAuthRecoversOnlyOriginalCredentialSnapshot(t *testing.T) {
 	}
 }
 
-func TestFixI003_ConcurrentOAuthRecovery(t *testing.T) {
+func TestCodexOAuthConcurrentRecovery(t *testing.T) {
 	for _, sameState := range []bool{true, false} {
 		t.Run(fmt.Sprintf("same_state_%v", sameState), func(t *testing.T) {
 			useControllerChannelTagTestDB(t)
@@ -308,14 +308,14 @@ func TestFixI003_ConcurrentOAuthRecovery(t *testing.T) {
 			}
 			sqlDB.SetMaxOpenConns(1)
 			t.Cleanup(func() { _ = sqlDB.Close() })
-			fence := "i003-concurrent-unresolved"
+			fence := "oauth-recovery-concurrent-unresolved"
 			channel := &model.Channel{Type: config.ChannelTypeCodex, Key: `{"access_token":"old","refresh_token":"old-refresh","account_id":"account-a"}`, BizData: rotationTestData(&fence, nil)}
 			if err := model.DB.Create(channel).Error; err != nil {
 				t.Fatal(err)
 			}
-			call := issue003HTTPAPI(t)
+			call := newCodexOAuthTestAPI(t)
 			start := func() string {
-				result := call("start", map[string]any{"channel_id": channel.Id}, "i003-access-0")
+				result := call("start", map[string]any{"channel_id": channel.Id}, "oauth-recovery-access-0")
 				var data struct {
 					SessionID string `json:"session_id"`
 				}
@@ -342,12 +342,12 @@ func TestFixI003_ConcurrentOAuthRecovery(t *testing.T) {
 				case <-r.Context().Done():
 					return
 				}
-				_ = json.NewEncoder(w).Encode(map[string]any{"access_token": issue003JWT("account-a"), "refresh_token": "i003-concurrent-new-refresh", "expires_in": 3600})
+				_ = json.NewEncoder(w).Encode(map[string]any{"access_token": codexOAuthAccountJWT("account-a"), "refresh_token": "oauth-recovery-concurrent-new-refresh", "expires_in": 3600})
 			}))
 			t.Cleanup(unblock)
-			results := make(chan issue003APIResult, 2)
+			results := make(chan codexOAuthAPIResult, 2)
 			callback := func(state string) {
-				results <- call("exchange-code", map[string]any{"session_id": state, "authorization_code": "i003-concurrent-code-123456"}, "i003-access-0")
+				results <- call("exchange-code", map[string]any{"session_id": state, "authorization_code": "oauth-recovery-concurrent-code-123456"}, "oauth-recovery-access-0")
 			}
 			go callback(states[0])
 			select {
@@ -403,11 +403,11 @@ func TestFixI003_ConcurrentOAuthRecovery(t *testing.T) {
 	}
 }
 
-// TestFixI003_OAuthStateConsumedExactlyOnceThroughRealRedis 验证 controller 的
+// TestCodexOAuthStateConsumedExactlyOnceThroughRealRedis 验证 controller 的
 // state 写入/消费与真实 Redis 的接线：Start 落盘真实 Redis，Callback 经
 // ConsumeCacheContext 单次 GETDEL 消费；同 state 双并发只有一个能交换授权码，
 // 消费后 key 不存在、重放被拒。无显式测试 Redis 时跳过。
-func TestFixI003_OAuthStateConsumedExactlyOnceThroughRealRedis(t *testing.T) {
+func TestCodexOAuthStateConsumedExactlyOnceThroughRealRedis(t *testing.T) {
 	url := os.Getenv("ONEHUB_TEST_REDIS_URL")
 	if url == "" {
 		t.Skip("真实 Redis 接线用例需要显式 ONEHUB_TEST_REDIS_URL")
@@ -438,13 +438,13 @@ func TestFixI003_OAuthStateConsumedExactlyOnceThroughRealRedis(t *testing.T) {
 		cache.InitCacheManager()
 	})
 
-	fence := "i003-redis-unresolved"
+	fence := "oauth-recovery-redis-unresolved"
 	channel := &model.Channel{Type: config.ChannelTypeCodex, Key: `{"access_token":"redis-old-access","refresh_token":"redis-old-refresh","account_id":"account-a"}`, BizData: rotationTestData(&fence, nil)}
 	if err := model.DB.Create(channel).Error; err != nil {
 		t.Fatal(err)
 	}
-	call := issue003HTTPAPI(t)
-	result := call("start", map[string]any{"channel_id": channel.Id}, "i003-access-0")
+	call := newCodexOAuthTestAPI(t)
+	result := call("start", map[string]any{"channel_id": channel.Id}, "oauth-recovery-access-0")
 	var startData struct {
 		SessionID string `json:"session_id"`
 	}
@@ -463,7 +463,7 @@ func TestFixI003_OAuthStateConsumedExactlyOnceThroughRealRedis(t *testing.T) {
 	var releaseOnce sync.Once
 	unblock := func() { releaseOnce.Do(func() { close(release) }) }
 	var exchanges atomic.Int64
-	newAccess := issue003JWT("account-a")
+	newAccess := codexOAuthAccountJWT("account-a")
 	withTokenEndpointTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		exchanges.Add(1)
 		entered <- struct{}{}
@@ -472,16 +472,16 @@ func TestFixI003_OAuthStateConsumedExactlyOnceThroughRealRedis(t *testing.T) {
 		case <-r.Context().Done():
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": newAccess, "refresh_token": "i003-redis-new-refresh", "expires_in": 3600})
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": newAccess, "refresh_token": "oauth-recovery-redis-new-refresh", "expires_in": 3600})
 	}))
 	// Cleanup 是 LIFO：unblock 必须在 withTokenEndpointTLSServer 之后注册，保证
 	// 测试提前退出时先解除 handler 阻塞、再关闭 TLS server，避免 Close 等待仍在
 	// release 上阻塞的 handler。
 	t.Cleanup(unblock)
-	callback := map[string]any{"session_id": startData.SessionID, "authorization_code": "i003-redis-code-123456"}
-	results := make(chan issue003APIResult, 2)
+	callback := map[string]any{"session_id": startData.SessionID, "authorization_code": "oauth-recovery-redis-code-123456"}
+	results := make(chan codexOAuthAPIResult, 2)
 	start := func() {
-		go func() { results <- call("exchange-code", callback, "i003-access-0") }()
+		go func() { results <- call("exchange-code", callback, "oauth-recovery-access-0") }()
 	}
 	start()
 	select {
@@ -525,7 +525,7 @@ func TestFixI003_OAuthStateConsumedExactlyOnceThroughRealRedis(t *testing.T) {
 	if n, err := client.Exists(existsCtx2, stateKey).Result(); err != nil || n != 0 {
 		t.Errorf("消费后 state 仍留在真实 Redis：n=%d err=%v", n, err)
 	}
-	again := call("exchange-code", callback, "i003-access-0")
+	again := call("exchange-code", callback, "oauth-recovery-access-0")
 	if again.Success || exchanges.Load() != 1 {
 		t.Error("真实 Redis 消费后同一 state 仍可再次交换")
 	}
@@ -534,7 +534,7 @@ func TestFixI003_OAuthStateConsumedExactlyOnceThroughRealRedis(t *testing.T) {
 		t.Error("真实 Redis 消费路径未唯一提交新凭据revision")
 	}
 	credentials, err := codex.FromJSON(snapshot.Key)
-	if err != nil || credentials.AccessToken != newAccess || credentials.RefreshToken != "i003-redis-new-refresh" {
+	if err != nil || credentials.AccessToken != newAccess || credentials.RefreshToken != "oauth-recovery-redis-new-refresh" {
 		t.Error("真实 Redis 消费路径未保存交换结果凭据")
 	}
 }
