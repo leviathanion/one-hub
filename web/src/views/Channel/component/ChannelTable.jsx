@@ -55,9 +55,9 @@ export default function ChannelTable({ tag }) {
     setRefreshFlag(!refreshFlag);
   };
 
-  const manageChannel = async (id, action, value) => {
+  const manageChannel = async (id, action, value, _tag = false, expectedVersion) => {
     const url = '/api/channel/';
-    let data = { id };
+    let data = { id, expected_version: expectedVersion };
     let res;
     try {
       switch (action) {
@@ -110,7 +110,7 @@ export default function ChannelTable({ tag }) {
       const { success, message } = res.data;
       if (success) {
         showSuccess(t('userPage.operationSuccess'));
-        if (action === 'delete' || action === 'copy') {
+        if (['delete', 'copy', 'status', 'priority', 'weight'].includes(action)) {
           await handleRefresh();
         }
       } else {
@@ -119,7 +119,8 @@ export default function ChannelTable({ tag }) {
 
       return res.data;
     } catch (error) {
-      return;
+      const message = error.response?.data?.message || error.message;
+      return { success: false, message };
     }
   };
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"one-api/common/credentials"
 	"reflect"
 	"strings"
 	"sync"
@@ -275,7 +276,7 @@ func TestChannelCredentialDatabaseOperationsHonorCanceledContext(t *testing.T) {
 	if _, err := GetChannelByIdWithContext(ctx, 991); !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected canceled credential load, got %v", err)
 	}
-	if _, err := CommitCredentialRotation(ctx, CredentialRotationTicket{ChannelID: 991, AttemptID: "test"}, "new-key"); !errors.Is(err, context.Canceled) {
+	if _, err := testRotation().Commit(ctx, credentials.Ticket{Type: config.ChannelTypeCodex, ChannelID: 991, AttemptID: "test"}, "new-key"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected canceled credential save, got %v", err)
 	}
 

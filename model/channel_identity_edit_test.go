@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"encoding/json"
+	"one-api/common/credentials"
 	"testing"
 	"time"
 
@@ -15,6 +16,11 @@ func editChannelJSON(t *testing.T, body string) error {
 	if err := json.Unmarshal([]byte(body), &request); err != nil {
 		return err
 	}
+	row, err := GetChannelById(request.Id)
+	if err != nil {
+		return err
+	}
+	request.ExpectedVersion = &row.Version
 	return request.Update()
 }
 
@@ -30,7 +36,7 @@ func TestChannelAdminEditKeepsIDAndRuntimeState(t *testing.T) {
 	}
 	var count int64
 	DB.Model(&Channel{}).Count(&count)
-	if count != 1 || row.Id != 1 || row.GetBaseURL() != "https://new.example" || row.Name != "after" || row.Key != "replacement" || row.UsedQuota != 42 || row.CreatedTime != 123 || row.CredentialRevision != 1 || row.Status != config.ChannelStatusManuallyDisabled {
+	if count != 1 || row.Id != 1 || row.GetBaseURL() != "https://new.example" || row.Name != "after" || row.Key != "replacement" || row.UsedQuota != 42 || row.CreatedTime != 123 || row.Version != 1 || row.Status != config.ChannelStatusManuallyDisabled {
 		t.Fatal("edit must update the same channel without cloning, enabling or resetting state")
 	}
 	if err := editChannelJSON(t, `{"id":1,"base_url":null}`); err != nil {
@@ -45,8 +51,8 @@ func TestChannelAdminEditKeepsIDAndRuntimeState(t *testing.T) {
 func TestChannelAdminEditPreservesCredentialFence(t *testing.T) {
 	useTestChannelDB(t)
 	insertCredentialRotationChannel(t, 1, "credential-a")
-	ticket := CredentialRotationTicket{ChannelID: 1, AttemptID: "refresh", ExpectedRevision: 0}
-	if outcome, err := ClaimCredentialRotation(context.Background(), ticket, time.Now()); err != nil || outcome != CredentialRotationClaimAcquired {
+	ticket := credentials.Ticket{Type: config.ChannelTypeCodex, ChannelID: 1, AttemptID: "refresh", ExpectedVersion: 0}
+	if outcome, err := testRotation().Claim(context.Background(), ticket, time.Now()); err != nil || outcome != credentials.ClaimAcquired {
 		t.Fatalf("claim: %v/%v", outcome, err)
 	}
 	if err := editChannelJSON(t, `{"id":1,"key":"replacement"}`); err == nil {
@@ -55,17 +61,17 @@ func TestChannelAdminEditPreservesCredentialFence(t *testing.T) {
 	if err := editChannelJSON(t, `{"id":1,"name":"updated"}`); err != nil {
 		t.Fatal(err)
 	}
-	if outcome, err := CommitCredentialRotation(context.Background(), ticket, "credential-b"); err != nil || outcome != CredentialRotationCommitApplied {
+	if outcome, err := testRotation().Commit(context.Background(), ticket, "credential-b"); err != nil || outcome != credentials.CommitApplied {
 		t.Fatalf("commit: %v/%v", outcome, err)
 	}
 	if err := editChannelJSON(t, `{"id":1,"base_url":"https://new.example"}`); err != nil {
 		t.Fatal(err)
 	}
 	row, _ := GetChannelById(1)
-	if row.Key != "credential-b" || row.CredentialRevision != 2 {
+	if row.Key != "credential-b" || row.Version != 4 {
 		t.Fatal("edit must preserve latest credential and supersede old tickets")
 	}
-	if outcome, err := CommitCredentialRotation(context.Background(), ticket, "stale"); err != nil || outcome != CredentialRotationCommitSuperseded {
+	if outcome, err := testRotation().Commit(context.Background(), ticket, "stale"); err != nil || outcome != credentials.CommitSuperseded {
 		t.Fatalf("stale commit: %v/%v", outcome, err)
 	}
 	if err := editChannelJSON(t, `{"id":1,"key":""}`); err == nil {
@@ -94,7 +100,7 @@ func TestChannelAdminEditCanRepairInvalidHeaders(t *testing.T) {
 	}
 	row, _ := GetChannelById(1)
 	identity, err := row.HeaderIdentity()
-	if err != nil || identity.Project != "valid-project" || row.CredentialRevision != 1 {
+	if err != nil || identity.Project != "valid-project" || row.Version != 1 {
 		t.Fatalf("repair did not save a valid configuration: %v", err)
 	}
 	if err := editChannelJSON(t, `{"id":1,"model_headers":"{\"OpenAI-Project\":false}"}`); err == nil {
@@ -107,7 +113,7 @@ func TestChannelAdminTagEditRollsBackOnCredentialFence(t *testing.T) {
 	for _, id := range []int{1, 2} {
 		insertTestChannel(t, &Channel{Id: id, Type: config.ChannelTypeOpenAI, Key: "key", Tag: "team", BaseURL: stringPtr("https://old.example")})
 	}
-	if err := DB.Model(&Channel{}).Where("id = 2").Update("credential_refresh_fence", "pending").Error; err != nil {
+	if err := DB.Model(&Channel{}).Where("id = 2").Update("bizdata", `{"credentials":{"refresh":{"attempt_id":"pending"}}}`).Error; err != nil {
 		t.Fatal(err)
 	}
 	fields := ChannelTagSubmittedFields{"base_url": {}, "models": {}}

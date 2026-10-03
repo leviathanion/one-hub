@@ -157,13 +157,6 @@ func RefreshChannelsInBackground(ctx context.Context) AutoRefreshSummary {
 
 	summary := AutoRefreshSummary{}
 	firstErr := ""
-	if model.DB == nil {
-		if reconcileErr := ReconcilePendingCredentials(ctx); reconcileErr != nil {
-			summary.Failed++
-			firstErr = "pending credential reconciliation: " + reconcileErr.Error()
-			logger.SysError("[Codex] " + firstErr)
-		}
-	}
 	channels, err := loadAutoRefreshChannels(ctx)
 	if err != nil {
 		logger.SysError("[Codex] failed to load channels for auto refresh: " + err.Error())

@@ -49,6 +49,7 @@ import CodexAuthControls from './CodexAuthControls';
 import ConfirmDialog from 'ui-component/confirm-dialog';
 import ChannelEndpointsEditor from './ChannelEndpointsEditor';
 import { createEndpointPreset } from '../type/endpoints.mjs';
+import { versionAfterCredentialSave } from './editVersion.mjs';
 
 const isAzureV1ResourceLevelBaseUrl = (value) => {
   const raw = String(value ?? '').trim();
@@ -150,6 +151,7 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
   const isMobile = useMediaQuery(theme.breakpoints.down('sm'));
   // const [loading, setLoading] = useState(false);
   const [initialInput, setInitialInput] = useState(defaultConfig.input);
+  const editSnapshot = useRef(null);
   const [editConfirmationOpen, setEditConfirmationOpen] = useState(false);
   const editConfirmationResolver = useRef(null);
   const editSession = useRef(0);
@@ -168,7 +170,7 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
       editConfirmationResolver.current?.(false);
       editConfirmationResolver.current = null;
     };
-  }, [open, channelId]);
+  }, [open, channelId, isTag]);
   const [inputLabel, setInputLabel] = useState(defaultConfig.inputLabel); //
   const [inputPrompt, setInputPrompt] = useState(defaultConfig.prompt);
   const [batchAdd, setBatchAdd] = useState(false);
@@ -699,13 +701,18 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
     const session = editSession.current;
     const baseApiUrl = isTag ? '/api/channel_tag/' + encodeURIComponent(channelId) : '/api/channel/';
     try {
+      if (channelId && !editSnapshot.current) throw new Error('正在读取渠道配置，请稍后再保存。');
       const payload = prepareChannelPayload(values);
-      if (channelId && (isTag || !payload.key?.trim() || payload.key === initialInput.key)) {
+      if (channelId && (isTag || !payload.key?.trim() || payload.key === editSnapshot.current?.key)) {
         delete payload.key;
       }
       let res;
       if (channelId) {
         const update = { ...payload, id: parseInt(channelId) };
+        delete update.version;
+        delete update.versions;
+        if (isTag) update.expected_versions = editSnapshot.current.versions;
+        else update.expected_version = editSnapshot.current?.version;
         const confirmed = await new Promise((resolve) => {
           editConfirmationResolver.current = resolve;
           setEditConfirmationOpen(true);
@@ -725,8 +732,9 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
       onOk(true);
     } catch (error) {
       setStatus({ success: false });
-      showError(error.message);
-      setErrors({ submit: error.message });
+      const message = error.response?.data?.message || error.message;
+      showError(message);
+      setErrors({ submit: message });
     } finally {
       setSubmitting(false);
     }
@@ -752,6 +760,8 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
   }
 
   const loadChannel = async () => {
+    const session = editSession.current;
+    editSnapshot.current = null;
     try {
       let baseApiUrl = `/api/channel/${channelId}`;
 
@@ -760,8 +770,10 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
       }
 
       let res = await API.get(baseApiUrl);
+      if (session !== editSession.current) return;
       const { success, message, data } = res.data;
       if (success) {
+        editSnapshot.current = structuredClone(data);
         if (data.models === '') {
           data.models = [];
         } else {
@@ -859,6 +871,7 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
       if (channelId) {
         loadChannel().then();
       } else {
+        editSnapshot.current = null;
         setHasTag(false);
         initChannel(1);
         setInitialInput({ ...defaultConfig.input, is_edit: false });
@@ -866,7 +879,7 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
     }
 
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [channelId, open]);
+  }, [channelId, open, isTag]);
 
   return (
     <Dialog open={open} onClose={onCancel} fullWidth maxWidth={'md'}>
@@ -1342,10 +1355,28 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                 {values.type === 101 && !batchAdd && !isTag && (
                   <Box sx={{ mt: 2, mb: 2 }}>
                     <CodexAuthControls
+                      key={`${isTag}:${channelId}:${open}`}
                       channelId={isTag ? 0 : channelId}
                       proxy={values.proxy}
                       currentName={values.name}
-                      onCredentials={(credentials) => setFieldValue('key', credentials)}
+                      onCredentials={async (credentials, saved) => {
+                        const session = editSession.current;
+                        setFieldValue('key', credentials);
+                        if (!saved) return;
+                        try {
+                          const response = await API.get(`/api/channel/${channelId}`);
+                          if (session !== editSession.current) return;
+                          const latest = response.data.data;
+                          if (response.data.success && versionAfterCredentialSave(editSnapshot.current, latest, credentials) !== undefined) {
+                            editSnapshot.current = latest;
+                          } else {
+                            showError('凭证已保存，但渠道配置已变化。当前输入已保留，请重新打开渠道后核对修改。');
+                          }
+                        } catch {
+                          if (session !== editSession.current) return;
+                          showError('凭证已保存，读取最新渠道失败。当前输入已保留，请重新打开渠道后再保存配置。');
+                        }
+                      }}
                       onSuggestedName={(suggestedName) => {
                         if (!values.name && suggestedName) {
                           setFieldValue('name', suggestedName);

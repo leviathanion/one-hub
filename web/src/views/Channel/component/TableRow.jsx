@@ -286,10 +286,11 @@ function ChannelTableRow({ item, manageChannel, onRefresh, groupOptions, modelOp
 
   const handleTagChannelStatus = async (channelId, currentStatus) => {
     const newStatus = currentStatus === 1 ? 2 : 1;
-    const { success } = await manageChannel(channelId, 'status', newStatus);
+    const channel = tagChannels.find((entry) => entry.id === channelId);
+    const { success, data } = await manageChannel(channelId, 'status', newStatus, false, channel?.version);
     if (success) {
       // 更新本地状态
-      setTagChannels((prev) => prev.map((channel) => (channel.id === channelId ? { ...channel, status: newStatus } : channel)));
+      setTagChannels((prev) => prev.map((channel) => (channel.id === channelId ? data : channel)));
     }
   };
 
@@ -390,7 +391,7 @@ function ChannelTableRow({ item, manageChannel, onRefresh, groupOptions, modelOp
 
   const handleStatus = async () => {
     const switchVlue = statusSwitch === 1 ? 2 : 1;
-    const { success } = await manageChannel(item.id, 'status', switchVlue);
+    const { success } = await manageChannel(item.id, 'status', switchVlue, false, item.version);
     if (success) {
       setStatusSwitch(switchVlue);
     }
@@ -613,7 +614,7 @@ function ChannelTableRow({ item, manageChannel, onRefresh, groupOptions, modelOp
                         if (priority !== item.priority) {
                           const isTag = !!item.tag;
                           const channelId = isTag ? item.tag : item.id;
-                          manageChannel(channelId, 'priority', priority, isTag)
+                          manageChannel(channelId, 'priority', priority, isTag, item.version)
                             .then(({ success }) => {
                               if (success) {
                                 item.priority = priority;
@@ -659,7 +660,7 @@ function ChannelTableRow({ item, manageChannel, onRefresh, groupOptions, modelOp
                         onClick={() => {
                           // 确保在提交时检查是否有变化
                           if (weight !== item.weight) {
-                            manageChannel(item.id, 'weight', weight)
+                            manageChannel(item.id, 'weight', weight, false, item.version)
                               .then(({ success }) => {
                                 if (success) {
                                   item.weight = weight;
@@ -1207,10 +1208,10 @@ function ChannelTableRow({ item, manageChannel, onRefresh, groupOptions, modelOp
                                                       const newPriority = channel.priority;
 
                                                       // 直接发送请求更新优先级，不再进行二次检查
-                                                      manageChannel(channelId, 'priority', newPriority)
-                                                        .then(({ success }) => {
+                                                      manageChannel(channelId, 'priority', newPriority, false, channel.version)
+                                                        .then(({ success, data }) => {
                                                           if (success) {
-                                                            // 成功后更新本地状态（虽然没必要，因为UI状态已经是新值了）
+                                                            setTagChannels((prev) => prev.map((entry) => (entry.id === channelId ? data : entry)));
                                                             showSuccess(t('channel_row.priorityUpdateSuccess'));
                                                           }
                                                         })
@@ -1564,6 +1565,7 @@ function ChannelTableRow({ item, manageChannel, onRefresh, groupOptions, modelOp
               // 创建一个包含名称和密钥的对象来更新
               const updateData = {
                 id: channelId,
+                expected_version: currentTestingChannel.version,
                 name: editedChannel.name,
                 key: editedChannel.key
               };
@@ -1574,18 +1576,14 @@ function ChannelTableRow({ item, manageChannel, onRefresh, groupOptions, modelOp
                   if (res && res.data) {
                     const { success, message } = res.data;
                     if (success) {
-                      const updatedChannel = {
-                        ...currentTestingChannel,
-                        name: editedChannel.name,
-                        key: editedChannel.key
-                      };
+                      const updatedChannel = res.data.data;
                       const credentialsChanged = editedChannel.key !== currentTestingChannel.key;
 
                       showSuccess(t('channel_edit.editSuccess'));
 
                       // 更新本地状态
                       setTagChannels((prev) =>
-                        prev.map((c) => (c.id === channelId ? { ...c, name: editedChannel.name, key: editedChannel.key } : c))
+                        prev.map((c) => (c.id === channelId ? updatedChannel : c))
                       );
                       if (credentialsChanged) {
                         invalidateSnapshots([channelId]);
@@ -1593,6 +1591,8 @@ function ChannelTableRow({ item, manageChannel, onRefresh, groupOptions, modelOp
                       }
 
                       onRefresh(false); // 刷新父组件数据
+                      simpleChannelEdit.onFalse();
+                      setCurrentTestingChannel(null);
                     } else {
                       showError(message || t('channel_edit.editError'));
                     }
@@ -1603,10 +1603,6 @@ function ChannelTableRow({ item, manageChannel, onRefresh, groupOptions, modelOp
                 .catch((error) => {
                   const errorMessage = error.response?.data?.message || error.message || '未知错误';
                   showError(t('channel_edit.editError', { message: errorMessage }));
-                })
-                .finally(() => {
-                  simpleChannelEdit.onFalse();
-                  setCurrentTestingChannel(null);
                 });
             }}
           >

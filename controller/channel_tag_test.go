@@ -62,6 +62,7 @@ func TestUpdateChannelsTagUsesSubmittedFieldsForSync(t *testing.T) {
 	ctx, recorder := commonTest.GetContext(http.MethodPut, "/api/channel_tag/field-team", commonTest.RequestJSONConfig(), body)
 	ctx.Params = gin.Params{{Key: "tag", Value: "field-team"}}
 
+	attachChannelEditVersion(t, ctx, true)
 	UpdateChannelsTag(ctx)
 
 	var resp struct {

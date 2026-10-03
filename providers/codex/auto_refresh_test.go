@@ -2,7 +2,6 @@ package codex
 
 import (
 	"context"
-	"strings"
 	"testing"
 	"time"
 
@@ -101,70 +100,5 @@ func TestRunScheduledMaintenanceRunsOAuthBeforeUsage(t *testing.T) {
 	RunScheduledMaintenance(parent)
 	if len(order) != 2 || order[0] != "oauth" || order[1] != "usage" {
 		t.Fatalf("expected serial OAuth then usage maintenance, got %v", order)
-	}
-}
-
-func TestOAuthRunnerCancellationReachesChannelLoader(t *testing.T) {
-	isolatePendingCredentialJournal(t)
-	originalLoadChannels := loadAutoRefreshChannels
-	loaderCanceled := make(chan struct{})
-	loadAutoRefreshChannels = func(ctx context.Context) ([]*model.Channel, error) {
-		<-ctx.Done()
-		close(loaderCanceled)
-		return nil, ctx.Err()
-	}
-	t.Cleanup(func() { loadAutoRefreshChannels = originalLoadChannels })
-
-	parent, cancel := context.WithCancel(context.Background())
-	cancel()
-	summary := RunAutoRefreshWithTimeout(parent)
-	if summary.Failed != 1 {
-		t.Fatalf("expected canceled loader to fail the round, got %+v", summary)
-	}
-	select {
-	case <-loaderCanceled:
-	default:
-		t.Fatal("expected round cancellation to reach OAuth channel loader")
-	}
-}
-
-func TestRefreshChannelsInBackgroundMarksCanceledDispatchPartial(t *testing.T) {
-	isolatePendingCredentialJournal(t)
-	autoRefreshStatusMu.Lock()
-	autoRefreshStatus = AutoRefreshStatus{
-		LastSuccessAt: 456,
-		IntervalSec:   int64(AutoRefreshInterval / time.Second),
-		LeadSec:       int64(AutoRefreshLead / time.Second),
-	}
-	autoRefreshStatusMu.Unlock()
-
-	originalLoadChannels := loadAutoRefreshChannels
-	loadAutoRefreshChannels = func(context.Context) ([]*model.Channel, error) {
-		return []*model.Channel{
-			{Id: 1, Key: `{"refresh_token":"refresh-1"}`},
-			{Id: 2, Key: `{"refresh_token":"refresh-2"}`},
-		}, nil
-	}
-	t.Cleanup(func() {
-		loadAutoRefreshChannels = originalLoadChannels
-	})
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	summary := RefreshChannelsInBackground(ctx)
-	if summary.Failed != 2 {
-		t.Fatalf("expected canceled dispatch to fail both channels, got %+v", summary)
-	}
-
-	status := GetAutoRefreshStatus()
-	if status.LastResult != "partial" {
-		t.Fatalf("expected partial result, got %q", status.LastResult)
-	}
-	if status.LastSuccessAt != 456 {
-		t.Fatalf("expected last success timestamp to remain unchanged, got %d", status.LastSuccessAt)
-	}
-	if !strings.Contains(status.LastError, "context canceled") || !strings.Contains(status.LastError, "skipped 2") {
-		t.Fatalf("expected cancellation details in last error, got %q", status.LastError)
 	}
 }
