@@ -44,7 +44,7 @@ func TestFixI019_CustomResponsesIdentityChangesRequireExplicitEdit(t *testing.T)
 				var err error
 				switch entry {
 				case "ordinary_edit":
-					body, marshalErr := json.Marshal(map[string]any{"id": channel.Id, "name": candidate.Name, "plugin": candidate.Plugin})
+					body, marshalErr := json.Marshal(map[string]any{"id": channel.Id, "expected_version": 0, "name": candidate.Name, "plugin": candidate.Plugin})
 					if marshalErr != nil {
 						t.Fatal(marshalErr)
 					}
@@ -63,7 +63,7 @@ func TestFixI019_CustomResponsesIdentityChangesRequireExplicitEdit(t *testing.T)
 						t.Fatalf("管理编辑应允许修改端点: %v", err)
 					}
 					stored, loadErr := GetChannelById(channel.Id)
-					if loadErr != nil || stored.Name != candidate.Name || stored.CredentialRevision != 1 || !reflect.DeepEqual(stored.EndpointSettings()["openai.responses"], i019Plugin(endpoint).Data()["endpoints"]["openai.responses"]) {
+					if loadErr != nil || stored.Name != candidate.Name || stored.Version != 1 || !reflect.DeepEqual(stored.EndpointSettings()["openai.responses"], i019Plugin(endpoint).Data()["endpoints"]["openai.responses"]) {
 						t.Fatalf("管理编辑未原地保存端点: %v", loadErr)
 					}
 					return

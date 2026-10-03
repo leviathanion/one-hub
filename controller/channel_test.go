@@ -194,6 +194,7 @@ func TestUpdateChannelRejectsRemovedCodexWebsocketMode(t *testing.T) {
 	}
 	ctx, recorder := commonTest.GetContext(http.MethodPut, "/api/channel/", commonTest.RequestJSONConfig(), bytes.NewBuffer(payload))
 
+	attachChannelEditVersion(t, ctx, false)
 	UpdateChannel(ctx)
 
 	var resp struct {
@@ -229,6 +230,7 @@ func TestUpdateChannelPartialResponseContainsCompletePersistedChannel(t *testing
 	}
 	ctx, recorder := commonTest.GetContext(http.MethodPut, "/api/channel/", commonTest.RequestJSONConfig(), bytes.NewBufferString(`{"id":1,"name":"after"}`))
 
+	attachChannelEditVersion(t, ctx, false)
 	UpdateChannel(ctx)
 
 	var response struct {
@@ -267,6 +269,7 @@ func TestUpdateChannelOmittedOtherPreservesAzureRequiredOther(t *testing.T) {
 	body := bytes.NewBufferString(`{"id":1,"type":3,"name":"azure-new","key":"sk-azure","models":"gpt-new","group":"default"}`)
 	ctx, recorder := commonTest.GetContext(http.MethodPut, "/api/channel/", commonTest.RequestJSONConfig(), body)
 
+	attachChannelEditVersion(t, ctx, false)
 	UpdateChannel(ctx)
 
 	var resp struct {
@@ -309,6 +312,7 @@ func TestUpdateChannelOmittedOtherPreservesOpenAIOptionalOther(t *testing.T) {
 	body := bytes.NewBufferString(fmt.Sprintf(`{"id":1,"type":%d,"name":"openai-new","key":"sk-openai","models":"gpt-new","group":"default"}`, config.ChannelTypeOpenAI))
 	ctx, recorder := commonTest.GetContext(http.MethodPut, "/api/channel/", commonTest.RequestJSONConfig(), body)
 
+	attachChannelEditVersion(t, ctx, false)
 	UpdateChannel(ctx)
 
 	var resp struct {
@@ -351,6 +355,7 @@ func TestUpdateChannelExplicitEmptyOtherRejectsAzureAndLeavesDBUnchanged(t *test
 	body := bytes.NewBufferString(`{"id":1,"type":3,"name":"azure-new","key":"sk-azure","models":"gpt-new","group":"default","other":""}`)
 	ctx, recorder := commonTest.GetContext(http.MethodPut, "/api/channel/", commonTest.RequestJSONConfig(), body)
 
+	attachChannelEditVersion(t, ctx, false)
 	UpdateChannel(ctx)
 
 	var resp struct {

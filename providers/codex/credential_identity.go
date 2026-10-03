@@ -1,4 +1,4 @@
-package model
+package codex
 
 import (
 	"encoding/json"

@@ -42,6 +42,7 @@ func TestChannelEditPreservesResourceBindingsWhileUpdatingOriginalRow(t *testing
 		update["id"] = original.Id
 		body, _ := json.Marshal(update)
 		ctx, recorder := commonTest.GetContext(http.MethodPut, "/api/channel/", commonTest.RequestJSONConfig(), bytes.NewBuffer(body))
+		attachChannelEditVersion(t, ctx, false)
 		UpdateChannel(ctx)
 		var result struct {
 			Success bool   `json:"success"`
@@ -85,6 +86,7 @@ func TestChannelTagCanEditHeadersAndBaseURL(t *testing.T) {
 	} {
 		ctx, recorder := commonTest.GetContext(http.MethodPut, "/api/channel_tag/tag", commonTest.RequestJSONConfig(), bytes.NewBufferString(body))
 		ctx.Params = gin.Params{{Key: "tag", Value: "tag"}}
+		attachChannelEditVersion(t, ctx, true)
 		UpdateChannelsTag(ctx)
 		var result struct {
 			Success bool `json:"success"`

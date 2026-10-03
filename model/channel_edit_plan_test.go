@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"one-api/common/credentials"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -32,21 +33,21 @@ func TestChannelMetadataEditDoesNotOverwriteConcurrentRotation(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- (&Channel{Id: 32010, Name: "updated-name"}).UpdateRaw(false) }()
 	<-readComplete
-	ticket := CredentialRotationTicket{ChannelID: 32010, AttemptID: "refresh-b", ExpectedRevision: 0}
-	claim, claimErr := ClaimCredentialRotation(context.Background(), ticket, time.Now())
-	commit, commitErr := CommitCredentialRotation(context.Background(), ticket, "credential-b")
+	ticket := credentials.Ticket{Type: config.ChannelTypeCodex, ChannelID: 32010, AttemptID: "refresh-b", ExpectedVersion: 0}
+	claim, claimErr := testRotation().Claim(context.Background(), ticket, time.Now())
+	commit, commitErr := testRotation().Commit(context.Background(), ticket, "credential-b")
 	close(continueEdit)
-	if err := <-done; err != nil {
+	if err := <-done; !errors.Is(err, ErrChannelVersionConflict) {
 		t.Fatal(err)
 	}
-	if claimErr != nil || claim != CredentialRotationClaimAcquired || commitErr != nil || commit != CredentialRotationCommitApplied {
+	if claimErr != nil || claim != credentials.ClaimAcquired || commitErr != nil || commit != credentials.CommitApplied {
 		t.Fatalf("rotation: claim=%v/%v commit=%v/%v", claim, claimErr, commit, commitErr)
 	}
 	persisted, err := GetChannelById(32010)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if persisted.Key != "credential-b" || persisted.CredentialRevision != 1 || persisted.CredentialRefreshFence != nil || persisted.Name != "updated-name" {
+	if persisted.Key != "credential-b" || persisted.Version != 2 || len(persisted.BizData) > 2 || persisted.Name == "updated-name" {
 		t.Fatalf("metadata edit changed rotated credentials: %+v", persisted)
 	}
 }
@@ -67,10 +68,12 @@ func TestChannelEditWhitelistSupportsZeroValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = DB.Callback().Update().Remove(callback) })
+	current, _ := GetChannelById(request.Id)
+	request.ExpectedVersion = &current.Version
 	if err := request.Update(); err != nil {
 		t.Fatal(err)
 	}
-	for _, forbidden := range []string{"key", "credential_revision", "credential_refresh_fence", "type", "base_url", "used_quota", "created_time", "test_time", "balance"} {
+	for _, forbidden := range []string{"key", "bizdata", "type", "base_url", "used_quota", "created_time", "test_time", "balance"} {
 		if strings.Contains(updateSQL, "`"+forbidden+"`") {
 			t.Errorf("ordinary SQL contains %s: %s", forbidden, updateSQL)
 		}
@@ -134,22 +137,22 @@ func TestChannelIdentityHeadersAllowBusinessEditsAndCaseNormalization(t *testing
 func TestCredentialRotationSameRevisionHasOnlyOneWinner(t *testing.T) {
 	useTestChannelDB(t)
 	insertCredentialRotationChannel(t, 32014, "original")
-	first := CredentialRotationTicket{ChannelID: 32014, AttemptID: "first", ExpectedRevision: 0}
-	second := CredentialRotationTicket{ChannelID: 32014, AttemptID: "second", ExpectedRevision: 0}
-	if outcome, err := ClaimCredentialRotation(context.Background(), first, time.Now()); err != nil || outcome != CredentialRotationClaimAcquired {
+	first := credentials.Ticket{Type: config.ChannelTypeCodex, ChannelID: 32014, AttemptID: "first", ExpectedVersion: 0}
+	second := credentials.Ticket{Type: config.ChannelTypeCodex, ChannelID: 32014, AttemptID: "second", ExpectedVersion: 0}
+	if outcome, err := testRotation().Claim(context.Background(), first, time.Now()); err != nil || outcome != credentials.ClaimAcquired {
 		t.Fatalf("first claim=%v err=%v", outcome, err)
 	}
-	if outcome, err := CommitCredentialRotation(context.Background(), first, "winner"); err != nil || outcome != CredentialRotationCommitApplied {
+	if outcome, err := testRotation().Commit(context.Background(), first, "winner"); err != nil || outcome != credentials.CommitApplied {
 		t.Fatalf("first commit=%v err=%v", outcome, err)
 	}
-	if outcome, err := ClaimCredentialRotation(context.Background(), second, time.Now()); err != nil || outcome != CredentialRotationClaimSuperseded {
+	if outcome, err := testRotation().Claim(context.Background(), second, time.Now()); err != nil || outcome != credentials.ClaimSuperseded {
 		t.Fatalf("stale claim=%v err=%v", outcome, err)
 	}
-	if outcome, err := CommitCredentialRotation(context.Background(), second, "loser"); err != nil || outcome != CredentialRotationCommitSuperseded {
+	if outcome, err := testRotation().Commit(context.Background(), second, "loser"); err != nil || outcome != credentials.CommitSuperseded {
 		t.Fatalf("stale commit=%v err=%v", outcome, err)
 	}
-	snapshot, err := LoadCredentialRotationSnapshot(context.Background(), 32014)
-	if err != nil || snapshot.Key != "winner" || snapshot.Revision != 1 {
+	snapshot, err := loadRotationTestSnapshot(context.Background(), 32014)
+	if err != nil || snapshot.Key != "winner" || snapshot.Version != 2 {
 		t.Fatalf("winner overwritten: %+v err=%v", snapshot, err)
 	}
 }
@@ -165,14 +168,18 @@ func TestChannelReauthorizationConcurrentCASHasOnlyOneWinner(t *testing.T) {
 	sqlDB.SetMaxOpenConns(1)
 	start := make(chan struct{})
 	results := make(chan error, 2)
-	ticket := CredentialRotationTicket{ChannelID: 32015, ExpectedRevision: 0, AttemptID: "authorized-claim"}
-	if outcome, err := ClaimCredentialRotation(context.Background(), ticket, time.Now()); err != nil || outcome != CredentialRotationClaimAcquired {
+	ticket := credentials.Ticket{Type: config.ChannelTypeCodex, ChannelID: 32015, ExpectedVersion: 0, AttemptID: "authorized-claim"}
+	if outcome, err := testRotation().Claim(context.Background(), ticket, time.Now()); err != nil || outcome != credentials.ClaimAcquired {
 		t.Fatalf("claim=%v err=%v", outcome, err)
 	}
 	for _, key := range []string{"authorized-first", "authorized-second"} {
 		go func(key string) {
 			<-start
-			results <- ReplaceChannelCredentialWithContext(context.Background(), ticket, key)
+			outcome, err := testRotation().Commit(context.Background(), ticket, key)
+			if err == nil && outcome != credentials.CommitApplied && outcome != credentials.CommitAlreadyApplied {
+				err = credentials.ErrConflict
+			}
+			results <- err
 		}(key)
 	}
 	close(start)
@@ -181,7 +188,7 @@ func TestChannelReauthorizationConcurrentCASHasOnlyOneWinner(t *testing.T) {
 		err := <-results
 		if err == nil {
 			wins++
-		} else if errors.Is(err, ErrChannelCredentialConflict) {
+		} else if errors.Is(err, credentials.ErrConflict) {
 			conflicts++
 		} else {
 			t.Fatalf("unexpected CAS error: %v", err)
@@ -190,8 +197,8 @@ func TestChannelReauthorizationConcurrentCASHasOnlyOneWinner(t *testing.T) {
 	if wins != 1 || conflicts != 1 {
 		t.Fatalf("wins=%d conflicts=%d", wins, conflicts)
 	}
-	snapshot, err := LoadCredentialRotationSnapshot(context.Background(), 32015)
-	if err != nil || snapshot.Revision != 1 || snapshot.Fence != nil || (snapshot.Key != "authorized-first" && snapshot.Key != "authorized-second") {
+	snapshot, err := loadRotationTestSnapshot(context.Background(), 32015)
+	if err != nil || snapshot.Version != 2 || snapshot.Fence != nil || (snapshot.Key != "authorized-first" && snapshot.Key != "authorized-second") {
 		t.Fatalf("unexpected committed credentials: %+v err=%v", snapshot, err)
 	}
 }
@@ -204,11 +211,11 @@ func TestChannelTagMetadataPreservesRefreshedMemberAndRejectsOldKeyList(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	ticket := CredentialRotationTicket{ChannelID: channel.Id, ExpectedRevision: 0, AttemptID: "refresh-b"}
-	if outcome, err := ClaimCredentialRotation(context.Background(), ticket, time.Now()); err != nil || outcome != CredentialRotationClaimAcquired {
+	ticket := credentials.Ticket{Type: config.ChannelTypeCodex, ChannelID: channel.Id, ExpectedVersion: 0, AttemptID: "refresh-b"}
+	if outcome, err := testRotation().Claim(context.Background(), ticket, time.Now()); err != nil || outcome != credentials.ClaimAcquired {
 		t.Fatalf("claim=%v err=%v", outcome, err)
 	}
-	if outcome, err := CommitCredentialRotation(context.Background(), ticket, "credential-b"); err != nil || outcome != CredentialRotationCommitApplied {
+	if outcome, err := testRotation().Commit(context.Background(), ticket, "credential-b"); err != nil || outcome != credentials.CommitApplied {
 		t.Fatalf("commit=%v err=%v", outcome, err)
 	}
 	if err := UpdateChannelsTagWithSubmittedFields("refresh-team", &Channel{Models: "new-model"}, ChannelTagSubmittedFields{"models": {}}); err != nil {
@@ -221,27 +228,27 @@ func TestChannelTagMetadataPreservesRefreshedMemberAndRejectsOldKeyList(t *testi
 	if err := DB.Unscoped().Where("tag = ?", "refresh-team").Find(&members).Error; err != nil {
 		t.Fatal(err)
 	}
-	if len(members) != 1 || members[0].Id != channel.Id || members[0].DeletedAt.Valid || members[0].Key != "credential-b" || members[0].CredentialRevision != 1 || members[0].CredentialRefreshFence != nil || members[0].Models != "new-model" {
+	if len(members) != 1 || members[0].Id != channel.Id || members[0].DeletedAt.Valid || members[0].Key != "credential-b" || members[0].Version != 3 || len(members[0].BizData) > 2 || members[0].Models != "new-model" {
 		t.Fatalf("tag metadata replaced a refreshed member: %+v", members)
 	}
 }
 
 func TestAddChannelToTagStartsIndependentCredentialLifecycle(t *testing.T) {
 	useTestChannelDB(t)
-	insertTestChannel(t, &Channel{Id: 32017, Type: config.ChannelTypeCodex, Key: "original", Name: "member", Tag: "independent-team", CredentialRevision: 4})
-	ticket := CredentialRotationTicket{ChannelID: 32017, ExpectedRevision: 4, AttemptID: "original-refresh"}
-	if outcome, err := ClaimCredentialRotation(context.Background(), ticket, time.Now()); err != nil || outcome != CredentialRotationClaimAcquired {
+	insertTestChannel(t, &Channel{Id: 32017, Type: config.ChannelTypeCodex, Key: "original", Name: "member", Tag: "independent-team", Version: 4})
+	ticket := credentials.Ticket{Type: config.ChannelTypeCodex, ChannelID: 32017, ExpectedVersion: 4, AttemptID: "original-refresh"}
+	if outcome, err := testRotation().Claim(context.Background(), ticket, time.Now()); err != nil || outcome != credentials.ClaimAcquired {
 		t.Fatalf("claim=%v err=%v", outcome, err)
 	}
 	added, err := AddChannelToTag("independent-team", &Channel{Key: "new-account"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if added.Id == 32017 || added.CredentialRevision != 0 || added.CredentialRefreshFence != nil || added.CredentialRefreshStartedAt != nil {
+	if added.Id == 32017 || added.Version != 0 || len(added.BizData) > 2 {
 		t.Fatalf("new member inherited another channel's credential lifecycle: %+v", added)
 	}
-	original, err := LoadCredentialRotationSnapshot(context.Background(), 32017)
-	if err != nil || original.Revision != 4 || original.Fence == nil || *original.Fence != ticket.AttemptID {
+	original, err := loadRotationTestSnapshot(context.Background(), 32017)
+	if err != nil || original.Version != 5 || original.Fence == nil || *original.Fence != ticket.AttemptID {
 		t.Fatalf("adding member changed original credential lifecycle: %+v err=%v", original, err)
 	}
 }

@@ -1,5 +1,5 @@
 import PropTypes from 'prop-types';
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import { API } from 'utils/api';
 import { copy, showError, showSuccess } from 'utils/common';
@@ -7,6 +7,11 @@ import { Alert, Box, Button, Dialog, DialogActions, DialogContent, DialogTitle, 
 import { Icon } from '@iconify/react';
 
 export default function CodexAuthControls({ channelId, proxy, currentName, onCredentials, onSuggestedName, authFileActions }) {
+  const active = useRef(true);
+  useEffect(() => {
+    active.current = true;
+    return () => { active.current = false; };
+  }, []);
   const authFileInputRef = useRef(null);
   const [authFileImporting, setAuthFileImporting] = useState(false);
   const [oauthVisible, setOauthVisible] = useState(false);
@@ -28,6 +33,7 @@ export default function CodexAuthControls({ channelId, proxy, currentName, onCre
     try {
       setSubmitting(true);
       const res = await API.post('/api/codex/oauth/start', payload);
+      if (!active.current) return;
 
       if (!res.data.success) {
         showError(res.data.message || 'Failed to get authorization link');
@@ -62,6 +68,7 @@ export default function CodexAuthControls({ channelId, proxy, currentName, onCre
         session_id: sessionId,
         callback_url: authCode.trim()
       });
+      if (!active.current) return;
 
       if (!res.data.success) {
         showError(res.data.message || 'Failed to exchange authorization code');
@@ -69,7 +76,8 @@ export default function CodexAuthControls({ channelId, proxy, currentName, onCre
         return;
       }
 
-      onCredentials(res.data.data.credentials);
+      await onCredentials(res.data.data.credentials, res.data.data.credential_saved);
+      if (!active.current) return;
       showSuccess(res.data.data.credential_saved ? '同账号凭证已更新。' : 'OAuth successful. Credentials have been filled in.');
 
       handleCancelOAuth();
@@ -106,6 +114,7 @@ export default function CodexAuthControls({ channelId, proxy, currentName, onCre
           'Content-Type': 'multipart/form-data'
         }
       });
+      if (!active.current) return;
 
       if (!res.data.success) {
         showError(res.data.message || 'Failed to import auth file');

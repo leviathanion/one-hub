@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"one-api/common/credentials"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -26,7 +27,7 @@ func TestCodexOAuthReauthorizationPreservesAccountAndCredentialVersion(t *testin
 			channel := model.Channel{Type: config.ChannelTypeCodex, Key: key}
 			if scenario == "existing-fence" {
 				fence := "unresolved-at-start"
-				channel.CredentialRefreshFence = &fence
+				channel.BizData = rotationTestData(&fence, nil)
 			}
 			if err := model.DB.Create(&channel).Error; err != nil {
 				t.Fatal(err)
@@ -44,17 +45,17 @@ func TestCodexOAuthReauthorizationPreservesAccountAndCredentialVersion(t *testin
 				t.Fatalf("start failed: %s err=%v", recorder.Body.String(), err)
 			}
 			if scenario == "concurrent-refresh" || scenario == "new-fence" {
-				ticket := model.CredentialRotationTicket{ChannelID: channel.Id, AttemptID: "later-refresh", ExpectedRevision: 0}
-				if outcome, err := model.ClaimCredentialRotation(context.Background(), ticket, time.Now()); err != nil || outcome != model.CredentialRotationClaimAcquired {
+				ticket := credentials.Ticket{Type: config.ChannelTypeCodex, ChannelID: channel.Id, AttemptID: "later-refresh", ExpectedVersion: 0}
+				if outcome, err := testRotation().Claim(context.Background(), ticket, time.Now()); err != nil || outcome != credentials.ClaimAcquired {
 					t.Fatalf("claim=%v err=%v", outcome, err)
 				}
 				if scenario == "concurrent-refresh" {
-					if outcome, err := model.CommitCredentialRotation(context.Background(), ticket, "winning-refresh"); err != nil || outcome != model.CredentialRotationCommitApplied {
+					if outcome, err := testRotation().Commit(context.Background(), ticket, "winning-refresh"); err != nil || outcome != credentials.CommitApplied {
 						t.Fatalf("commit=%v err=%v", outcome, err)
 					}
 				}
 			}
-			before, err := model.LoadCredentialRotationSnapshot(context.Background(), channel.Id)
+			before, err := loadRotationTestSnapshot(context.Background(), channel.Id)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -64,15 +65,19 @@ func TestCodexOAuthReauthorizationPreservesAccountAndCredentialVersion(t *testin
 			}
 			claims, _ := json.Marshal(map[string]any{"https://api.openai.com/auth": map[string]string{"chatgpt_account_id": accountID}})
 			token := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256"}`)) + "." + base64.RawURLEncoding.EncodeToString(claims) + ".signature"
+			claimIncrement := uint64(1)
+			if scenario == "existing-fence" {
+				claimIncrement = 0
+			}
 			var exchangeCalls atomic.Int32
 			withTokenEndpointTLSServer(t, http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 				exchangeCalls.Add(1)
-				claimed, err := model.LoadCredentialRotationSnapshot(context.Background(), channel.Id)
-				if err != nil || claimed.Fence == nil || claimed.Revision != 0 {
+				claimed, err := loadRotationTestSnapshot(context.Background(), channel.Id)
+				if err != nil || claimed.Fence == nil || claimed.Version != before.Version+claimIncrement {
 					t.Errorf("OAuth exchange started without SQL claim: %+v err=%v", claimed, err)
 				}
-				peer := model.CredentialRotationTicket{ChannelID: channel.Id, ExpectedRevision: 0, AttemptID: "competing-refresh"}
-				if outcome, err := model.ClaimCredentialRotation(context.Background(), peer, time.Now()); err != nil || outcome != model.CredentialRotationClaimBusy {
+				peer := credentials.Ticket{Type: config.ChannelTypeCodex, ChannelID: channel.Id, ExpectedVersion: 0, AttemptID: "competing-refresh"}
+				if outcome, err := testRotation().Claim(context.Background(), peer, time.Now()); err != nil || outcome != credentials.ClaimBusy {
 					t.Errorf("refresh was not fenced during OAuth exchange: outcome=%v err=%v", outcome, err)
 				}
 				if scenario == "exchange-error" {
@@ -93,7 +98,7 @@ func TestCodexOAuthReauthorizationPreservesAccountAndCredentialVersion(t *testin
 			if err := json.Unmarshal(recorder.Body.Bytes(), &result); err != nil {
 				t.Fatal(err)
 			}
-			after, err := model.LoadCredentialRotationSnapshot(context.Background(), channel.Id)
+			after, err := loadRotationTestSnapshot(context.Background(), channel.Id)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -107,11 +112,17 @@ func TestCodexOAuthReauthorizationPreservesAccountAndCredentialVersion(t *testin
 
 			if scenario == "same-account" || scenario == "existing-fence" {
 				credentials, err := codex.FromJSON(after.Key)
-				if !result.Success || !result.Data.Saved || err != nil || after.Revision != before.Revision+1 || after.Fence != nil || credentials.AccountID != "account-a" || credentials.AccessToken != token {
+				if !result.Success || !result.Data.Saved || err != nil || after.Version != before.Version+claimIncrement+1 || after.Fence != nil || credentials.AccountID != "account-a" || credentials.AccessToken != token {
 					t.Fatalf("reauthorization failed: response=%s snapshot=%+v err=%v", recorder.Body.String(), after, err)
 				}
-			} else if result.Success || after.Key != before.Key || after.Revision != before.Revision || (after.Fence == nil) != (before.Fence == nil) {
-				t.Fatalf("stale/different account replaced credentials: response=%s before=%+v after=%+v", recorder.Body.String(), before, after)
+			} else {
+				wantVersion := before.Version
+				if scenario == "different-account" || scenario == "exchange-error" {
+					wantVersion += 2
+				}
+				if result.Success || after.Key != before.Key || after.Version != wantVersion || (after.Fence == nil) != (before.Fence == nil) {
+					t.Fatalf("stale/different account replaced credentials: response=%s before=%+v after=%+v", recorder.Body.String(), before, after)
+				}
 			}
 		})
 	}

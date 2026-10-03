@@ -196,7 +196,11 @@ func UpdateChannel(c *gin.Context) {
 	}
 	err := request.Update()
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{
+		status := http.StatusOK
+		if errors.Is(err, model.ErrChannelVersionConflict) {
+			status = http.StatusConflict
+		}
+		c.JSON(status, gin.H{
 			"success": false,
 			"message": err.Error(),
 		})

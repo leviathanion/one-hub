@@ -17,6 +17,8 @@ import (
 	"one-api/common/logger"
 	"one-api/common/requester"
 	"one-api/model"
+
+	"gorm.io/gorm"
 )
 
 func TestNormalizeUsageSnapshotClassifiesCanonicalWindowsAndKeepsUnknownCustom(t *testing.T) {
@@ -328,106 +330,6 @@ func TestNormalizeResetCreditResultAcceptsDirectCreditPayload(t *testing.T) {
 	}
 }
 
-func TestConsumeResetCreditRetriesAfterUnauthorizedByForceRefreshing(t *testing.T) {
-	cache.InitCacheManager()
-	logger.SetupLogger()
-
-	serverToken := atomic.Value{}
-	serverToken.Store("refreshed-token")
-	requestCount := atomic.Int32{}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount.Add(1)
-		if r.URL.Path != "/backend-api/wham/rate-limit-reset-credits/consume" {
-			t.Fatalf("unexpected reset path %q", r.URL.Path)
-		}
-
-		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if token != serverToken.Load().(string) {
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(`{"error":{"message":"expired"}}`))
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"code":"ok","windows_reset":1,"credit":{"id":"credit-2","status":"redeemed"}}`))
-	}))
-	defer server.Close()
-
-	originalHTTPClient := requester.HTTPClient
-	requester.HTTPClient = server.Client()
-	t.Cleanup(func() {
-		requester.HTTPClient = originalHTTPClient
-	})
-
-	originalRefreshCredentials := refreshOAuthCredentials
-	refreshOAuthCredentials = func(creds *OAuth2Credentials, _ context.Context, _ string) error {
-		creds.AccessToken = serverToken.Load().(string)
-		creds.ExpiresAt = time.Now().Add(time.Hour)
-		return nil
-	}
-	t.Cleanup(func() {
-		refreshOAuthCredentials = originalRefreshCredentials
-	})
-
-	updatedKey := atomic.Value{}
-	initialCreds := &OAuth2Credentials{
-		AccessToken:  "expired-token",
-		RefreshToken: "refresh-token",
-		AccountID:    "acct-123",
-		ExpiresAt:    time.Now().Add(time.Hour),
-	}
-	initialKey, err := initialCreds.ToJSON()
-	if err != nil {
-		t.Fatalf("failed to serialize initial credentials: %v", err)
-	}
-	updatedKey.Store(initialKey)
-
-	originalUpdateChannelKey := compareAndSetChannelKey
-	compareAndSetChannelKey = func(_ context.Context, channelID int, expected, key string) (bool, error) {
-		if channelID != 424299 || expected != updatedKey.Load().(string) {
-			t.Fatalf("unexpected channel key CAS: id=%d expected=%q", channelID, expected)
-		}
-		updatedKey.Store(key)
-		return true, nil
-	}
-	t.Cleanup(func() {
-		compareAndSetChannelKey = originalUpdateChannelKey
-	})
-
-	originalLoadLatestChannelByID := loadLatestChannelByID
-	loadLatestChannelByID = func(_ context.Context, channelID int) (*model.Channel, error) {
-		if channelID != 424299 {
-			t.Fatalf("unexpected channel id reload %d", channelID)
-		}
-		return &model.Channel{
-			Id:      channelID,
-			Key:     updatedKey.Load().(string),
-			BaseURL: stringPtr(server.URL),
-		}, nil
-	}
-	t.Cleanup(func() {
-		loadLatestChannelByID = originalLoadLatestChannelByID
-	})
-
-	provider := newTestCodexProviderWithContext(t, initialKey, "", nil)
-	provider.Channel.BaseURL = stringPtr(server.URL)
-
-	result, err := provider.ConsumeResetCredit(context.Background())
-	if err != nil {
-		t.Fatalf("expected retry after forced refresh to succeed, got %v", err)
-	}
-	if requestCount.Load() != 2 {
-		t.Fatalf("expected unauthorized request to be retried once, got %d attempts", requestCount.Load())
-	}
-	if result == nil || result.Credit == nil || result.Credit.ID != "credit-2" {
-		t.Fatalf("expected successful reset result after retry, got %+v", result)
-	}
-	if !strings.Contains(updatedKey.Load().(string), "refreshed-token") {
-		t.Fatalf("expected refreshed token to be persisted, got %s", updatedKey.Load().(string))
-	}
-}
-
 func TestConsumeResetCreditRedactsEchoedCredentialSecrets(t *testing.T) {
 	const accessToken = "reset-access-secret"
 	const refreshToken = "reset-refresh-secret"
@@ -485,155 +387,6 @@ func TestConsumeResetCreditReturnsUpstreamMessage(t *testing.T) {
 	}
 	if result == nil || result.ChannelID != provider.Channel.Id {
 		t.Fatalf("expected partial result on upstream failure, got %+v", result)
-	}
-}
-
-func TestGetUsageSnapshotRetriesAfterUnauthorizedByForceRefreshing(t *testing.T) {
-	cache.InitCacheManager()
-	logger.SetupLogger()
-
-	serverToken := atomic.Value{}
-	serverToken.Store("refreshed-token")
-	requestCount := atomic.Int32{}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount.Add(1)
-		if r.URL.Path != "/backend-api/wham/usage" {
-			t.Fatalf("unexpected usage path %q", r.URL.Path)
-		}
-
-		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if token != serverToken.Load().(string) {
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(`{"error":{"message":"expired"}}`))
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-			"plan_type": "pro",
-			"rate_limit": {
-				"allowed": true,
-				"limit_reached": false,
-				"primary_window": {
-					"used_percent": 33,
-					"limit_window_seconds": 18000,
-					"resets_in_seconds": 900
-				},
-				"secondary_window": {
-					"used_percent": 67,
-					"limit_window_seconds": 604800,
-					"resets_in_seconds": 3600
-				}
-			}
-		}`))
-	}))
-	defer server.Close()
-
-	originalHTTPClient := requester.HTTPClient
-	requester.HTTPClient = server.Client()
-	t.Cleanup(func() {
-		requester.HTTPClient = originalHTTPClient
-	})
-
-	originalRefreshCredentials := refreshOAuthCredentials
-	refreshOAuthCredentials = func(creds *OAuth2Credentials, _ context.Context, _ string) error {
-		creds.AccessToken = serverToken.Load().(string)
-		creds.ExpiresAt = time.Now().Add(time.Hour)
-		return nil
-	}
-	t.Cleanup(func() {
-		refreshOAuthCredentials = originalRefreshCredentials
-	})
-
-	updatedKey := atomic.Value{}
-	initialCreds := &OAuth2Credentials{
-		AccessToken:  "expired-token",
-		RefreshToken: "refresh-token",
-		AccountID:    "acct-123",
-		ExpiresAt:    time.Now().Add(time.Hour),
-	}
-	initialKey, err := initialCreds.ToJSON()
-	if err != nil {
-		t.Fatalf("failed to serialize initial credentials: %v", err)
-	}
-	updatedKey.Store(initialKey)
-
-	originalUpdateChannelKey := compareAndSetChannelKey
-	compareAndSetChannelKey = func(_ context.Context, channelID int, expected, key string) (bool, error) {
-		if channelID != 424299 || expected != updatedKey.Load().(string) {
-			t.Fatalf("unexpected channel key CAS: id=%d expected=%q", channelID, expected)
-		}
-		updatedKey.Store(key)
-		return true, nil
-	}
-	t.Cleanup(func() {
-		compareAndSetChannelKey = originalUpdateChannelKey
-	})
-
-	originalLoadLatestChannelByID := loadLatestChannelByID
-	loadLatestChannelByID = func(_ context.Context, channelID int) (*model.Channel, error) {
-		if channelID != 424299 {
-			t.Fatalf("unexpected channel id reload %d", channelID)
-		}
-		return &model.Channel{
-			Id:      channelID,
-			Key:     updatedKey.Load().(string),
-			BaseURL: stringPtr(server.URL),
-		}, nil
-	}
-	t.Cleanup(func() {
-		loadLatestChannelByID = originalLoadLatestChannelByID
-	})
-
-	provider := newTestCodexProviderWithContext(t, initialKey, "", nil)
-	provider.Channel.BaseURL = stringPtr(server.URL)
-
-	snapshot, err := provider.GetUsageSnapshot(context.Background(), true)
-	if err != nil {
-		t.Fatalf("expected retry after forced refresh to succeed, got %v", err)
-	}
-	if requestCount.Load() != 2 {
-		t.Fatalf("expected unauthorized request to be retried once, got %d attempts", requestCount.Load())
-	}
-	if snapshot == nil || snapshot.UpstreamStatus != http.StatusOK {
-		t.Fatalf("expected successful usage snapshot after retry, got %+v", snapshot)
-	}
-	if got := getCodexUsageWindowFromSlice(snapshot.Windows, "five_hour"); got == nil || !optionalFloat64Equals(got.UsedPercent, 33) {
-		t.Fatalf("expected 5h window after retry, got %+v", snapshot.Windows)
-	}
-	if !strings.Contains(updatedKey.Load().(string), "refreshed-token") {
-		t.Fatalf("expected refreshed token to be persisted, got %s", updatedKey.Load().(string))
-	}
-
-	// The fetch captured its generation before OAuth. CAS invalidation must not
-	// rotate it: a provider built from the newly durable key must reach this entry.
-	requestsAfterInteractive := requestCount.Load()
-	newProvider := CodexProviderFactory{}.Create(&model.Channel{
-		Id: 424299, Key: updatedKey.Load().(string), BaseURL: stringPtr(server.URL),
-	}).(*CodexProvider)
-	cached, cacheErr := newProvider.GetUsageSnapshot(context.Background(), false)
-	if cacheErr != nil || cached == nil || cached.UpstreamStatus != http.StatusOK || requestCount.Load() != requestsAfterInteractive {
-		t.Fatalf("OAuth-refreshed interactive cache is unreachable: snapshot=%+v err=%v requests=%d", cached, cacheErr, requestCount.Load())
-	}
-
-	// Exercise the production background path from the old credential again. Its
-	// success summary and the cache written under the refreshed fingerprint must
-	// both remain real, not merely report an upstream success whose write was stranded.
-	updatedKey.Store(initialKey)
-	background := refreshUsageSnapshotForChannel(context.Background(), &model.Channel{
-		Id: 424299, Key: initialKey, BaseURL: stringPtr(server.URL),
-	})
-	if background.Refreshed != 1 || background.Failed != 0 {
-		t.Fatalf("OAuth background refresh did not report a real success: %+v", background)
-	}
-	requestsAfterBackground := requestCount.Load()
-	newProvider = CodexProviderFactory{}.Create(&model.Channel{
-		Id: 424299, Key: updatedKey.Load().(string), BaseURL: stringPtr(server.URL),
-	}).(*CodexProvider)
-	preview, previewErr := newProvider.GetUsagePreview(context.Background(), false)
-	if previewErr != nil || preview == nil || preview.PlanType != "pro" || requestCount.Load() != requestsAfterBackground {
-		t.Fatalf("OAuth-refreshed background cache is unreachable: preview=%+v err=%v requests=%d", preview, previewErr, requestCount.Load())
 	}
 }
 
@@ -1013,6 +766,7 @@ func TestConsumeResetCreditRejectsNilHTTPClient(t *testing.T) {
 }
 
 func TestUsageFetchContextCancelsTokenRefresh(t *testing.T) {
+	useCodexFenceDB(t)
 	cache.InitCacheManager()
 	if logger.Logger == nil {
 		logger.SetupLogger()
@@ -1034,6 +788,9 @@ func TestUsageFetchContextCancelsTokenRefresh(t *testing.T) {
 		t.Fatalf("failed to encode credentials: %v", err)
 	}
 	channel := &model.Channel{Id: 778, Type: config.ChannelTypeCodex, Status: config.ChannelStatusEnabled, Key: key}
+	if err := model.DB.Create(channel).Error; err != nil {
+		t.Fatal(err)
+	}
 	provider, ok := CodexProviderFactory{}.Create(channel).(*CodexProvider)
 	if !ok || provider == nil {
 		t.Fatal("expected Codex provider")
@@ -1272,4 +1029,219 @@ func optionalFloat64Equals(value *float64, want float64) bool {
 		return false
 	}
 	return *value == want
+}
+
+func TestConsumeResetCreditRetriesAfterUnauthorizedByForceRefreshing(t *testing.T) {
+	useCodexFenceDB(t)
+	logger.SetupLogger()
+
+	serverToken := atomic.Value{}
+	serverToken.Store("refreshed-token")
+	requestCount := atomic.Int32{}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		if r.URL.Path != "/backend-api/wham/rate-limit-reset-credits/consume" {
+			t.Fatalf("unexpected reset path %q", r.URL.Path)
+		}
+
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if token != serverToken.Load().(string) {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"message":"expired"}}`))
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":"ok","windows_reset":1,"credit":{"id":"credit-2","status":"redeemed"}}`))
+	}))
+	defer server.Close()
+
+	originalHTTPClient := requester.HTTPClient
+	requester.HTTPClient = server.Client()
+	t.Cleanup(func() {
+		requester.HTTPClient = originalHTTPClient
+	})
+
+	originalRefreshCredentials := refreshOAuthCredentials
+	refreshOAuthCredentials = func(creds *OAuth2Credentials, _ context.Context, _ string) error {
+		creds.AccessToken = serverToken.Load().(string)
+		creds.ExpiresAt = time.Now().Add(time.Hour)
+		return nil
+	}
+	t.Cleanup(func() {
+		refreshOAuthCredentials = originalRefreshCredentials
+	})
+
+	initialCreds := &OAuth2Credentials{
+		AccessToken:  "expired-token",
+		RefreshToken: "refresh-token",
+		AccountID:    "acct-123",
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}
+	initialKey, err := initialCreds.ToJSON()
+	if err != nil {
+		t.Fatalf("failed to serialize initial credentials: %v", err)
+	}
+	channel := &model.Channel{Id: 424299, Type: config.ChannelTypeCodex, Key: initialKey, BaseURL: stringPtr(server.URL)}
+	if err := model.DB.Create(channel).Error; err != nil {
+		t.Fatal(err)
+	}
+	storedKey := func() string {
+		row, err := model.GetChannelById(channel.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return row.Key
+	}
+
+	provider := newTestCodexProviderWithContext(t, initialKey, "", nil)
+	provider.Channel.BaseURL = stringPtr(server.URL)
+
+	result, err := provider.ConsumeResetCredit(context.Background())
+	if err != nil {
+		t.Fatalf("expected retry after forced refresh to succeed, got %v", err)
+	}
+	if requestCount.Load() != 2 {
+		t.Fatalf("expected unauthorized request to be retried once, got %d attempts", requestCount.Load())
+	}
+	if result == nil || result.Credit == nil || result.Credit.ID != "credit-2" {
+		t.Fatalf("expected successful reset result after retry, got %+v", result)
+	}
+	if !strings.Contains(storedKey(), "refreshed-token") {
+		t.Fatalf("expected refreshed token to be persisted, got %s", storedKey())
+	}
+}
+
+func TestGetUsageSnapshotRetriesAfterUnauthorizedByForceRefreshing(t *testing.T) {
+	useCodexFenceDB(t)
+	logger.SetupLogger()
+
+	serverToken := atomic.Value{}
+	serverToken.Store("refreshed-token")
+	requestCount := atomic.Int32{}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		if r.URL.Path != "/backend-api/wham/usage" {
+			t.Fatalf("unexpected usage path %q", r.URL.Path)
+		}
+
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if token != serverToken.Load().(string) {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"message":"expired"}}`))
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"plan_type": "pro",
+			"rate_limit": {
+				"allowed": true,
+				"limit_reached": false,
+				"primary_window": {
+					"used_percent": 33,
+					"limit_window_seconds": 18000,
+					"resets_in_seconds": 900
+				},
+				"secondary_window": {
+					"used_percent": 67,
+					"limit_window_seconds": 604800,
+					"resets_in_seconds": 3600
+				}
+			}
+		}`))
+	}))
+	defer server.Close()
+
+	originalHTTPClient := requester.HTTPClient
+	requester.HTTPClient = server.Client()
+	t.Cleanup(func() {
+		requester.HTTPClient = originalHTTPClient
+	})
+
+	originalRefreshCredentials := refreshOAuthCredentials
+	refreshOAuthCredentials = func(creds *OAuth2Credentials, _ context.Context, _ string) error {
+		creds.AccessToken = serverToken.Load().(string)
+		creds.ExpiresAt = time.Now().Add(time.Hour)
+		return nil
+	}
+	t.Cleanup(func() {
+		refreshOAuthCredentials = originalRefreshCredentials
+	})
+
+	initialCreds := &OAuth2Credentials{
+		AccessToken:  "expired-token",
+		RefreshToken: "refresh-token",
+		AccountID:    "acct-123",
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}
+	initialKey, err := initialCreds.ToJSON()
+	if err != nil {
+		t.Fatalf("failed to serialize initial credentials: %v", err)
+	}
+	channel := &model.Channel{Id: 424299, Type: config.ChannelTypeCodex, Key: initialKey, BaseURL: stringPtr(server.URL)}
+	if err := model.DB.Create(channel).Error; err != nil {
+		t.Fatal(err)
+	}
+	storedKey := func() string {
+		row, err := model.GetChannelById(channel.Id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return row.Key
+	}
+
+	provider := newTestCodexProviderWithContext(t, initialKey, "", nil)
+	provider.Channel.BaseURL = stringPtr(server.URL)
+
+	snapshot, err := provider.GetUsageSnapshot(context.Background(), true)
+	if err != nil {
+		t.Fatalf("expected retry after forced refresh to succeed, got %v", err)
+	}
+	if requestCount.Load() != 2 {
+		t.Fatalf("expected unauthorized request to be retried once, got %d attempts", requestCount.Load())
+	}
+	if snapshot == nil || snapshot.UpstreamStatus != http.StatusOK {
+		t.Fatalf("expected successful usage snapshot after retry, got %+v", snapshot)
+	}
+	if got := getCodexUsageWindowFromSlice(snapshot.Windows, "five_hour"); got == nil || !optionalFloat64Equals(got.UsedPercent, 33) {
+		t.Fatalf("expected 5h window after retry, got %+v", snapshot.Windows)
+	}
+	if !strings.Contains(storedKey(), "refreshed-token") {
+		t.Fatalf("expected refreshed token to be persisted, got %s", storedKey())
+	}
+
+	// The fetch captured its generation before OAuth. CAS invalidation must not
+	// rotate it: a provider built from the newly durable key must reach this entry.
+	requestsAfterInteractive := requestCount.Load()
+	newProvider := CodexProviderFactory{}.Create(&model.Channel{
+		Id: 424299, Type: config.ChannelTypeCodex, Status: config.ChannelStatusEnabled, Key: storedKey(), BaseURL: stringPtr(server.URL),
+	}).(*CodexProvider)
+	cached, cacheErr := newProvider.GetUsageSnapshot(context.Background(), false)
+	if cacheErr != nil || cached == nil || cached.UpstreamStatus != http.StatusOK || requestCount.Load() != requestsAfterInteractive {
+		t.Fatalf("OAuth-refreshed interactive cache is unreachable: snapshot=%+v err=%v requests=%d", cached, cacheErr, requestCount.Load())
+	}
+
+	// Exercise the production background path from the old credential again. Its
+	// success summary and the cache written under the refreshed fingerprint must
+	// both remain real, not merely report an upstream success whose write was stranded.
+	if err := model.DB.Model(&model.Channel{}).Where("id = ?", channel.Id).Updates(map[string]any{"key": initialKey, "version": gorm.Expr("version + 1")}).Error; err != nil {
+		t.Fatal(err)
+	}
+	background := refreshUsageSnapshotForChannel(context.Background(), &model.Channel{
+		Id: 424299, Type: config.ChannelTypeCodex, Status: config.ChannelStatusEnabled, Key: initialKey, BaseURL: stringPtr(server.URL),
+	})
+	if background.Refreshed != 1 || background.Failed != 0 {
+		t.Fatalf("OAuth background refresh did not report a real success: %+v", background)
+	}
+	requestsAfterBackground := requestCount.Load()
+	newProvider = CodexProviderFactory{}.Create(&model.Channel{
+		Id: 424299, Type: config.ChannelTypeCodex, Status: config.ChannelStatusEnabled, Key: storedKey(), BaseURL: stringPtr(server.URL),
+	}).(*CodexProvider)
+	preview, previewErr := newProvider.GetUsagePreview(context.Background(), false)
+	if previewErr != nil || preview == nil || preview.PlanType != "pro" || requestCount.Load() != requestsAfterBackground {
+		t.Fatalf("OAuth-refreshed background cache is unreachable: preview=%+v err=%v requests=%d", preview, previewErr, requestCount.Load())
+	}
 }

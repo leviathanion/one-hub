@@ -5,9 +5,10 @@ import (
 	"reflect"
 	"testing"
 
-	"gorm.io/datatypes"
 	"one-api/common/config"
 	"one-api/common/providerendpoint"
+
+	"gorm.io/datatypes"
 )
 
 func TestCustomEndpointRuntimeRejectsLegacyWithoutConverting(t *testing.T) {
@@ -46,7 +47,7 @@ func TestCustomEndpointDisableRetainsAddressAndFencesBackgroundIdentity(t *testi
 	if err := (&Channel{Id: 19, Plugin: updated}).UpdateRaw(false); err == nil {
 		t.Fatal("background changed endpoint identity")
 	}
-	body, _ := json.Marshal(map[string]any{"id": 19, "plugin": updated})
+	body, _ := json.Marshal(map[string]any{"id": 19, "expected_version": 0, "plugin": updated})
 	var edit ChannelEditRequest
 	if err := json.Unmarshal(body, &edit); err != nil {
 		t.Fatal(err)
@@ -58,7 +59,7 @@ func TestCustomEndpointDisableRetainsAddressAndFencesBackgroundIdentity(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.Id != 19 || stored.CredentialRevision != 1 || !reflect.DeepEqual(stored.EndpointSettings()[providerendpoint.Messages], updated.Data()["endpoints"][providerendpoint.Messages]) {
+	if stored.Id != 19 || stored.Version != 1 || !reflect.DeepEqual(stored.EndpointSettings()[providerendpoint.Messages], updated.Data()["endpoints"][providerendpoint.Messages]) {
 		t.Fatal("disable lost saved URL or failed to fence identity")
 	}
 }

@@ -139,6 +139,7 @@ func TestOAuthErrorFieldsRedactCurrentCredentials(t *testing.T) {
 }
 
 func TestOAuthBackgroundErrorsAndLogsAreSanitized(t *testing.T) {
+	useCodexFenceDB(t)
 	const (
 		accessToken  = "background-access-secret"
 		refreshToken = "background-refresh-secret"
@@ -154,6 +155,9 @@ func TestOAuthBackgroundErrorsAndLogsAreSanitized(t *testing.T) {
 	}
 	channel := &model.Channel{Id: 22001, Type: config.ChannelTypeCodex, Status: config.ChannelStatusEnabled, Key: key}
 
+	if err := model.DB.Create(channel).Error; err != nil {
+		t.Fatal(err)
+	}
 	originalLoadChannels := loadAutoRefreshChannels
 	originalLoadLatest := loadLatestChannelByID
 	originalRefresh := refreshOAuthCredentials
@@ -161,11 +165,10 @@ func TestOAuthBackgroundErrorsAndLogsAreSanitized(t *testing.T) {
 	core, observedLogs := observer.New(zapcore.ErrorLevel)
 	loadAutoRefreshChannels = func(context.Context) ([]*model.Channel, error) { return []*model.Channel{channel}, nil }
 	loadLatestChannelByID = func(context.Context, int) (*model.Channel, error) {
-		copy := *channel
-		return &copy, nil
+		return model.GetChannelById(channel.Id)
 	}
 	refreshOAuthCredentials = func(*OAuth2Credentials, context.Context, string) error {
-		return errors.New("safe-debug-value " + accessToken + " " + refreshToken + " " + clientID + " Authorization: Bearer\r\n folded-header-secret " + `{"access\u005ftoken":"unicode-key-secret"} accessToken='unknown-secret tail`)
+		return errors.Join(ErrOAuthRefreshNotDispatched, errors.New("safe-debug-value "+accessToken+" "+refreshToken+" "+clientID+" Authorization: Bearer\r\n folded-header-secret "+`{"access\u005ftoken":"unicode-key-secret"} accessToken='unknown-secret tail`))
 	}
 	logger.Logger = zap.New(core)
 	t.Cleanup(func() {

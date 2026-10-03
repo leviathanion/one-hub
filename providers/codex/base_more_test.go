@@ -276,7 +276,7 @@ func TestCodexTokenErrorDispositionUsesTypedEvidence(t *testing.T) {
 		{name: "refresh in progress", err: ErrCredentialRefreshInProgress, wantStatus: http.StatusServiceUnavailable, wantLocal: true, wantNotAttempted: true, wantMessage: codexTokenUnavailableClientMessage},
 		{name: "local persistence after rotation", err: errors.Join(errCodexCredentialPersistence, ErrCredentialReauthorizationRequired), wantStatus: http.StatusServiceUnavailable, wantLocal: true, wantNotAttempted: true, wantMessage: codexTokenUnavailableClientMessage},
 		{name: "ambiguous oauth exchange", err: ErrOAuthRefreshOutcomeAmbiguous, wantStatus: http.StatusUnauthorized, wantAuth: true, wantMessage: codexTokenReauthorizationClientMessage},
-		{name: "reauthorization breaker", err: ErrOAuthCredentialsRequireReauthorization, wantStatus: http.StatusUnauthorized, wantAuth: true, wantMessage: codexTokenReauthorizationClientMessage},
+		{name: "reauthorization breaker", err: ErrCredentialReauthorizationRequired, wantStatus: http.StatusUnauthorized, wantAuth: true, wantMessage: codexTokenReauthorizationClientMessage},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			apiErr := provider.handleTokenError(test.err)

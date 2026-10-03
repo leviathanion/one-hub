@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	credentialflow "one-api/common/credentials"
 	"os"
 	"strings"
 	"sync"
@@ -106,8 +107,8 @@ func TestFixI003_RealOAuthRecoversOnlyOriginalCredentialSnapshot(t *testing.T) {
 			if err := model.DB.Create(channel).Error; err != nil {
 				t.Fatal(err)
 			}
-			oldTicket := model.CredentialRotationTicket{ChannelID: channel.Id, ExpectedRevision: 0, AttemptID: "i003-unresolved-refresh"}
-			if outcome, err := model.ClaimCredentialRotation(t.Context(), oldTicket, time.Now()); err != nil || outcome != model.CredentialRotationClaimAcquired {
+			oldTicket := credentialflow.Ticket{Type: config.ChannelTypeCodex, ChannelID: channel.Id, ExpectedVersion: 0, AttemptID: "i003-unresolved-refresh"}
+			if outcome, err := testRotation().Claim(t.Context(), oldTicket, time.Now()); err != nil || outcome != credentialflow.ClaimAcquired {
 				t.Fatalf("未建立未决刷新fence：%v %v", outcome, err)
 			}
 			call := issue003HTTPAPI(t)
@@ -120,7 +121,7 @@ func TestFixI003_RealOAuthRecoversOnlyOriginalCredentialSnapshot(t *testing.T) {
 				t.Fatalf("启动授权失败：%s", start.Message)
 			}
 			stateData, err := cache.GetCache[CodexOAuthStateData](CodexOAuthStateCachePrefix + startData.SessionID)
-			if err != nil || stateData.ChannelID != channel.Id || stateData.AccountID != "account-a" || stateData.CredentialRevision != 0 || stateData.CredentialFence != oldTicket.AttemptID {
+			if err != nil || stateData.ChannelID != channel.Id || stateData.AccountID != "account-a" || stateData.Version != 1 || stateData.CredentialFence != oldTicket.AttemptID {
 				t.Fatal("state未固定原渠道、账号、revision/fence")
 			}
 			authorizeURL, err := url.Parse(startData.AuthURL)
@@ -155,11 +156,11 @@ func TestFixI003_RealOAuthRecoversOnlyOriginalCredentialSnapshot(t *testing.T) {
 			case "account_changed":
 				mutate(map[string]any{"key": `{"access_token":"other","account_id":"account-b"}`})
 			case "revision_changed":
-				mutate(map[string]any{"credential_revision": 2})
+				mutate(map[string]any{"version": 2})
 			case "fence_changed":
-				mutate(map[string]any{"credential_refresh_fence": "other-fence"})
+				mutate(map[string]any{"bizdata": `{"credentials":{"refresh":{"attempt_id":"other-fence"}}}`})
 			}
-			before, err := model.LoadCredentialRotationSnapshot(t.Context(), channel.Id)
+			before, err := loadRotationTestSnapshot(t.Context(), channel.Id)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -176,12 +177,12 @@ func TestFixI003_RealOAuthRecoversOnlyOriginalCredentialSnapshot(t *testing.T) {
 				if r.Form.Get("grant_type") != "authorization_code" || r.Form.Get("code_verifier") != stateData.CodeVerifier || r.Form.Get("code") != "i003-independent-authorization-code" || r.Form.Get("refresh_token") != "" {
 					t.Error("恢复必须交换独立授权码并携带对应PKCE")
 				}
-				current, err := model.LoadCredentialRotationSnapshot(context.Background(), channel.Id)
-				if err != nil || current.Key != before.Key || current.Revision != before.Revision || current.Fence == nil || *current.Fence != *before.Fence {
+				current, err := loadRotationTestSnapshot(context.Background(), channel.Id)
+				if err != nil || current.Key != before.Key || current.Version != before.Version || current.Fence == nil || *current.Fence != *before.Fence {
 					t.Error("授权交换完成前改动了已有保护状态")
 				}
 				if scenario == "revision_changed_during_exchange" {
-					if err := model.DB.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("credential_revision", 3).Error; err != nil {
+					if err := model.DB.Model(&model.Channel{}).Where("id = ?", channel.Id).Update("version", 3).Error; err != nil {
 						t.Error(err)
 					}
 				}
@@ -220,7 +221,7 @@ func TestFixI003_RealOAuthRecoversOnlyOriginalCredentialSnapshot(t *testing.T) {
 				callback["callback_url"] = callback["callback_url"].(string) + "&state=" + url.QueryEscape(urlState)
 			}
 			result := call("exchange-code", callback, credential)
-			after, err := model.LoadCredentialRotationSnapshot(t.Context(), channel.Id)
+			after, err := loadRotationTestSnapshot(t.Context(), channel.Id)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -230,7 +231,7 @@ func TestFixI003_RealOAuthRecoversOnlyOriginalCredentialSnapshot(t *testing.T) {
 			}
 			if wantSuccess {
 				credentials, err := codex.FromJSON(after.Key)
-				if err != nil || credentials.AccessToken != newAccess || credentials.AccountID != "account-a" || after.Revision != 1 || after.Fence != nil || after.StartedAt != nil || after.Deleted || after.ChannelID != channel.Id {
+				if err != nil || credentials.AccessToken != newAccess || credentials.AccountID != "account-a" || after.Version != 2 || after.Fence != nil || after.StartedAt != nil || after.Deleted || after.ChannelID != channel.Id {
 					t.Error("原渠道未原子发布新凭据并解除保护状态")
 				}
 				currentChannel, err := model.GetChannelById(channel.Id)
@@ -241,24 +242,24 @@ func TestFixI003_RealOAuthRecoversOnlyOriginalCredentialSnapshot(t *testing.T) {
 				if access, err := provider.GetToken(); err != nil || access != newAccess {
 					t.Error("恢复后原channel的provider未采用新凭据")
 				}
-				outcome, err := model.CommitCredentialRotation(t.Context(), oldTicket, "late-old-refresh")
-				if err != nil || outcome != model.CredentialRotationCommitSuperseded {
+				outcome, err := testRotation().Commit(t.Context(), oldTicket, "late-old-refresh")
+				if err != nil || outcome != credentialflow.CommitSuperseded {
 					t.Errorf("旧刷新迟到仍可提交：%v %v", outcome, err)
 				}
 				again := call("exchange-code", callback, credential)
 				if again.Success || exchanges.Load() != 1 {
 					t.Error("OAuth state被重复交换或提交")
 				}
-				unchanged, _ := model.LoadCredentialRotationSnapshot(t.Context(), channel.Id)
-				if unchanged.Key != after.Key || unchanged.Revision != after.Revision {
+				unchanged, _ := loadRotationTestSnapshot(t.Context(), channel.Id)
+				if unchanged.Key != after.Key || unchanged.Version != after.Version {
 					t.Error("迟到刷新或重复state覆盖新凭据")
 				}
 			} else {
-				wantRevision := before.Revision
+				wantRevision := before.Version
 				if scenario == "revision_changed_during_exchange" {
 					wantRevision = 3
 				}
-				if after.Key != before.Key || after.Revision != wantRevision || after.Fence == nil || *after.Fence != *before.Fence || after.Deleted != before.Deleted {
+				if after.Key != before.Key || after.Version != wantRevision || after.Fence == nil || *after.Fence != *before.Fence || after.Deleted != before.Deleted {
 					t.Error("失败恢复改写或清除了不属于本次授权的保护状态")
 				}
 			}
@@ -270,7 +271,7 @@ func TestFixI003_RealOAuthRecoversOnlyOriginalCredentialSnapshot(t *testing.T) {
 				if exchanges.Load() != 1 {
 					t.Errorf("缺少 access_token 仍应完成一次授权码交换，实际 %d 次", exchanges.Load())
 				}
-				if after.Key != before.Key || after.Revision != before.Revision || after.Fence == nil || *after.Fence != *before.Fence {
+				if after.Key != before.Key || after.Version != before.Version || after.Fence == nil || *after.Fence != *before.Fence {
 					t.Error("缺少 access_token 的响应不得构造空凭据、保存或清除 fence")
 				}
 				if strings.Contains(result.Message, issue003JWT("account-a")) || strings.Contains(string(result.Data), issue003JWT("account-a")) || strings.Contains(result.Message, "i003-new-refresh") || strings.Contains(string(result.Data), "i003-new-refresh") || strings.Contains(result.Message, "i003-old-access") || strings.Contains(string(result.Data), "i003-old-access") || strings.Contains(result.Message, "i003-old-refresh") || strings.Contains(string(result.Data), "i003-old-refresh") {
@@ -280,8 +281,8 @@ func TestFixI003_RealOAuthRecoversOnlyOriginalCredentialSnapshot(t *testing.T) {
 				if again.Success || exchanges.Load() != 1 {
 					t.Error("失败后同一 state 仍可再次交换或提交")
 				}
-				unchanged, _ := model.LoadCredentialRotationSnapshot(t.Context(), channel.Id)
-				if unchanged.Key != after.Key || unchanged.Revision != after.Revision || unchanged.Fence == nil || *unchanged.Fence != *after.Fence {
+				unchanged, _ := loadRotationTestSnapshot(t.Context(), channel.Id)
+				if unchanged.Key != after.Key || unchanged.Version != after.Version || unchanged.Fence == nil || *unchanged.Fence != *after.Fence {
 					t.Error("重放失败响应改写或清除了保护状态")
 				}
 			} else if scenario == "same_account" || scenario == "different_account" || scenario == "exchange_error" || scenario == "revision_changed_during_exchange" {
@@ -308,7 +309,7 @@ func TestFixI003_ConcurrentOAuthRecovery(t *testing.T) {
 			sqlDB.SetMaxOpenConns(1)
 			t.Cleanup(func() { _ = sqlDB.Close() })
 			fence := "i003-concurrent-unresolved"
-			channel := &model.Channel{Type: config.ChannelTypeCodex, Key: `{"access_token":"old","refresh_token":"old-refresh","account_id":"account-a"}`, CredentialRefreshFence: &fence}
+			channel := &model.Channel{Type: config.ChannelTypeCodex, Key: `{"access_token":"old","refresh_token":"old-refresh","account_id":"account-a"}`, BizData: rotationTestData(&fence, nil)}
 			if err := model.DB.Create(channel).Error; err != nil {
 				t.Fatal(err)
 			}
@@ -394,8 +395,8 @@ func TestFixI003_ConcurrentOAuthRecovery(t *testing.T) {
 			if successes != 1 || exchanges.Load() != wantExchanges {
 				t.Errorf("恢复成功数=%d，exchange=%d want=%d", successes, exchanges.Load(), wantExchanges)
 			}
-			snapshot, err := model.LoadCredentialRotationSnapshot(t.Context(), channel.Id)
-			if err != nil || snapshot.Revision != 1 || snapshot.Fence != nil || snapshot.StartedAt != nil {
+			snapshot, err := loadRotationTestSnapshot(t.Context(), channel.Id)
+			if err != nil || snapshot.Version != 1 || snapshot.Fence != nil || snapshot.StartedAt != nil {
 				t.Error("并发恢复没有唯一提交新凭据revision")
 			}
 		})
@@ -438,7 +439,7 @@ func TestFixI003_OAuthStateConsumedExactlyOnceThroughRealRedis(t *testing.T) {
 	})
 
 	fence := "i003-redis-unresolved"
-	channel := &model.Channel{Type: config.ChannelTypeCodex, Key: `{"access_token":"redis-old-access","refresh_token":"redis-old-refresh","account_id":"account-a"}`, CredentialRefreshFence: &fence}
+	channel := &model.Channel{Type: config.ChannelTypeCodex, Key: `{"access_token":"redis-old-access","refresh_token":"redis-old-refresh","account_id":"account-a"}`, BizData: rotationTestData(&fence, nil)}
 	if err := model.DB.Create(channel).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -528,8 +529,8 @@ func TestFixI003_OAuthStateConsumedExactlyOnceThroughRealRedis(t *testing.T) {
 	if again.Success || exchanges.Load() != 1 {
 		t.Error("真实 Redis 消费后同一 state 仍可再次交换")
 	}
-	snapshot, err := model.LoadCredentialRotationSnapshot(t.Context(), channel.Id)
-	if err != nil || snapshot.Revision != 1 || snapshot.Fence != nil || snapshot.StartedAt != nil {
+	snapshot, err := loadRotationTestSnapshot(t.Context(), channel.Id)
+	if err != nil || snapshot.Version != 1 || snapshot.Fence != nil || snapshot.StartedAt != nil {
 		t.Error("真实 Redis 消费路径未唯一提交新凭据revision")
 	}
 	credentials, err := codex.FromJSON(snapshot.Key)

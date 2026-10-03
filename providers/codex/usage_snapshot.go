@@ -157,14 +157,13 @@ type codexResetCreditConsumeResponse struct {
 //
 // Usage preview/detail is a disposable presentation projection, never part of
 // OAuth credential recovery. A cache hit deliberately returns without calling
-// commitPendingCredentials. Recovery liveness belongs to the scheduled
-// ReconcilePendingCredentials pass, while every operation that actually consumes
-// a token synchronously reconciles under the per-channel refresh lock.
+// persisted credential rotation. Operations that need a fresh token use the
+// authoritative database snapshot and per-channel refresh lock.
 //
 // Trade-off: the UI may show a TTL-bounded stale usage projection while a rotated
 // credential is waiting for database persistence. This keeps read-only usage
-// views available during DB trouble without risking the credential: the pending
-// journal has no TTL and cannot be removed by cache activity. Do not couple these
+// views available during DB trouble without risking the credential: the durable
+// refresh marker has no TTL and cannot be removed by cache activity. Do not couple these
 // paths merely to make a cache hit perform maintenance.
 func (p *CodexProvider) GetUsagePreview(ctx context.Context, forceRefresh bool) (*CodexUsagePreview, error) {
 	channel := p.codexChannel()

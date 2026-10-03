@@ -123,7 +123,8 @@ func ChannelTagExists(tag string) (bool, error) {
 
 type ChannelTagCollection struct {
 	Channel
-	KeyMap map[string]int
+	KeyMap   map[string]int
+	Versions map[int]uint64 `json:"versions"`
 }
 
 type channelTagConfigField struct {
@@ -248,10 +249,8 @@ func buildChannelTagMember(channelTag *ChannelTagCollection, key string, name st
 	addChannel.Id = 0
 	addChannel.Name = name
 	addChannel.Key = key
-	addChannel.CredentialRevision = 0
-	addChannel.CredentialRefreshFence = nil
-	addChannel.CredentialRefreshStartedAt = nil
-	addChannel.CredentialRefreshState = "ready"
+	addChannel.Version = 0
+	addChannel.BizData = nil
 	addChannel.Balance = 0
 	addChannel.BalanceUpdatedTime = 0
 	addChannel.UsedQuota = 0
@@ -279,7 +278,9 @@ func GetChannelsTag(tag string) (*ChannelTagCollection, error) {
 	channelTag.Key = ""
 
 	channelTag.KeyMap = make(map[string]int)
+	channelTag.Versions = make(map[int]uint64)
 	for _, c := range channels {
+		channelTag.Versions[c.Id] = c.Version
 		key := normalizeExistingChannelTagKey(c.Key, channelTag.Type)
 		channelTag.KeyMap[channelTagKeyDigest(key)] = c.Id
 		channelTag.Key += key + "\n"
@@ -299,14 +300,15 @@ func UpdateChannelsTagWithSubmittedFields(tag string, channel *Channel, submitte
 		return err
 	}
 	defer unlock()
-	allowIdentityChange := false
+	options := ChannelUpdateOptions{}
 	if len(editOptions) > 0 {
-		allowIdentityChange = editOptions[0].AllowIdentityChange
+		options = editOptions[0]
 	}
-	return updateChannelsTagWithSubmittedFieldsLocked(tag, channel, submittedFields, allowIdentityChange)
+	return updateChannelsTagWithSubmittedFieldsLocked(tag, channel, submittedFields, options)
 }
 
-func updateChannelsTagWithSubmittedFieldsLocked(tag string, channel *Channel, submittedFields ChannelTagSubmittedFields, allowIdentityChange bool) error {
+func updateChannelsTagWithSubmittedFieldsLocked(tag string, channel *Channel, submittedFields ChannelTagSubmittedFields, options ChannelUpdateOptions) error {
+	allowIdentityChange := options.AllowIdentityChange
 	if _, submitted := submittedFields["key"]; submitted || channel.Key != "" {
 		return errors.New("标签普通编辑不接受 key；请使用单渠道新增、删除或同账号授权入口")
 	}
@@ -348,12 +350,24 @@ func updateChannelsTagWithSubmittedFieldsLocked(tag string, channel *Channel, su
 	}
 	var configCandidates []Channel
 	if len(configFields) > 0 && len(existingMemberIDs) > 0 {
-		candidateScope := tx.Model(&Channel{}).Clauses(clause.Locking{Strength: "UPDATE"}).Where("id IN (?) AND tag = ?", existingMemberIDs, tag).Order("id")
+		candidateScope := tx.Model(&Channel{}).Clauses(clause.Locking{Strength: "UPDATE"}).Where("tag = ?", tag).Order("id")
 		if err = candidateScope.Find(&configCandidates).Error; err != nil {
 			tx.Rollback()
 			return err
 		}
-		identityChanges := make(map[int]bool)
+		if options.ExpectedVersions != nil {
+			if len(configCandidates) != len(options.ExpectedVersions) {
+				tx.Rollback()
+				return ErrChannelVersionConflict
+			}
+			for _, member := range configCandidates {
+				v, ok := options.ExpectedVersions[member.Id]
+				if !ok || v != member.Version {
+					tx.Rollback()
+					return ErrChannelVersionConflict
+				}
+			}
+		}
 		for i := range configCandidates {
 			candidate := configCandidates[i]
 			applyChannelTagConfigFields(&candidate, channel, configFields)
@@ -364,13 +378,10 @@ func updateChannelsTagWithSubmittedFieldsLocked(tag string, channel *Channel, su
 				tx.Rollback()
 				return err
 			}
-			changed, editErr := prepareChannelIdentityEdit(&configCandidates[i], &candidate, allowIdentityChange)
+			_, editErr := prepareChannelIdentityEdit(&configCandidates[i], &candidate, allowIdentityChange)
 			if editErr != nil {
 				tx.Rollback()
 				return fmt.Errorf("渠道 %d: %w", configCandidates[i].Id, editErr)
-			}
-			if changed {
-				identityChanges[candidate.Id] = true
 			}
 		}
 		for _, member := range configCandidates {
@@ -381,10 +392,12 @@ func updateChannelsTagWithSubmittedFieldsLocked(tag string, channel *Channel, su
 			for field, value := range updateValues {
 				updates[field] = value
 			}
-			if identityChanges[member.Id] {
-				updates["credential_revision"] = gorm.Expr("credential_revision + 1")
+			updates["version"] = gorm.Expr("version + 1")
+			result := tx.Session(&gorm.Session{Logger: tx.Logger.LogMode(gormlogger.Silent)}).Model(&Channel{}).Where("id = ? AND tag = ? AND version = ?", member.Id, tag, member.Version).Updates(updates)
+			if result.Error == nil && result.RowsAffected != 1 {
+				tx.Rollback()
+				return ErrChannelVersionConflict
 			}
-			result := tx.Session(&gorm.Session{Logger: tx.Logger.LogMode(gormlogger.Silent)}).Model(&Channel{}).Where("id = ? AND tag = ?", member.Id, tag).Updates(updates)
 			if err = result.Error; err != nil {
 				tx.Rollback()
 				return err
@@ -535,7 +548,7 @@ func ChangeChannelsTagStatusWithContext(ctx context.Context, tag string, status 
 		result := tx.Model(&Channel{}).
 			Where("tag = ? AND status <> ?", tag, status).
 			Where(statusGuard).
-			Update("status", status)
+			Updates(map[string]any{"status": status, "version": gorm.Expr("version + 1")})
 		if result.Error != nil {
 			return result.Error
 		}
@@ -601,7 +614,7 @@ func UpdateChannelsTagPriorityWithContext(ctx context.Context, tag string, value
 		candidateIDs := channelIDsFromRows(candidates)
 		result := tx.Model(&Channel{}).
 			Where("id IN ? AND tag = ? AND (priority IS NULL OR priority <> ?)", candidateIDs, tag, value).
-			Update("priority", value)
+			Updates(map[string]any{"priority": value, "version": gorm.Expr("version + 1")})
 		if result.Error != nil {
 			return result.Error
 		}

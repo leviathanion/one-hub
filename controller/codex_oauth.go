@@ -17,6 +17,7 @@ import (
 	"one-api/common"
 	"one-api/common/cache"
 	"one-api/common/config"
+	"one-api/common/credentials"
 	"one-api/common/logger"
 	"one-api/model"
 	"one-api/providers/codex"
@@ -34,14 +35,14 @@ const (
 
 // CodexOAuthStateData holds OAuth state data.
 type CodexOAuthStateData struct {
-	ChannelID          int    `json:"channel_id"`
-	CodeVerifier       string `json:"code_verifier"`
-	State              string `json:"state"`
-	Proxy              string `json:"proxy"` // Proxy config (JSON string).
-	CreatedAt          int64  `json:"created_at"`
-	CredentialRevision uint64 `json:"credential_revision"`
-	CredentialFence    string `json:"credential_fence,omitempty"`
-	AccountID          string `json:"account_id,omitempty"`
+	ChannelID       int    `json:"channel_id"`
+	CodeVerifier    string `json:"code_verifier"`
+	State           string `json:"state"`
+	Proxy           string `json:"proxy"` // Proxy config (JSON string).
+	CreatedAt       int64  `json:"created_at"`
+	Version         uint64 `json:"version"`
+	CredentialFence string `json:"credential_fence,omitempty"`
+	AccountID       string `json:"account_id,omitempty"`
 }
 
 // StartCodexOAuthRequest starts OAuth flow.
@@ -84,14 +85,19 @@ func StartCodexOAuth(c *gin.Context) {
 			common.APIRespondWithError(c, http.StatusOK, fmt.Errorf("仅 Codex 渠道支持此授权流程"))
 			return
 		}
-		stateData.AccountID = model.CodexCredentialAccountID(channel.Key)
+		stateData.AccountID = codex.CodexCredentialAccountID(channel.Key)
 		if stateData.AccountID == "" {
 			common.APIRespondWithError(c, http.StatusOK, fmt.Errorf("无法确认原渠道账号，身份字段不可原地编辑，请新建渠道"))
 			return
 		}
-		stateData.CredentialRevision = channel.CredentialRevision
-		if channel.CredentialRefreshFence != nil {
-			stateData.CredentialFence = *channel.CredentialRefreshFence
+		stateData.Version = channel.Version
+		refresh, err := credentials.ReadRefresh(channel.BizData)
+		if err != nil {
+			common.APIRespondWithError(c, http.StatusOK, err)
+			return
+		}
+		if refresh != nil {
+			stateData.CredentialFence = refresh.AttemptID
 		}
 	}
 
@@ -198,17 +204,17 @@ func CodexOAuthCallback(c *gin.Context) {
 		return
 	}
 
-	var ticket model.CredentialRotationTicket
+	var ticket credentials.Ticket
 	credentialSaved := false
 	if stateData.ChannelID != 0 && stateData.CredentialFence == "" {
-		ticket = model.CredentialRotationTicket{ChannelID: stateData.ChannelID, ExpectedRevision: stateData.CredentialRevision, AttemptID: uuid.NewString()}
-		outcome, err := model.ClaimCredentialRotation(c.Request.Context(), ticket, time.Now())
+		ticket = credentials.Ticket{ChannelID: stateData.ChannelID, ExpectedVersion: stateData.Version, Type: config.ChannelTypeCodex, AttemptID: uuid.NewString()}
+		outcome, err := codex.CredentialRotation.Claim(c.Request.Context(), ticket, time.Now())
 		if err != nil {
 			common.APIRespondWithError(c, http.StatusOK, err)
 			return
 		}
-		if outcome != model.CredentialRotationClaimAcquired {
-			common.APIRespondWithError(c, http.StatusOK, model.ErrChannelCredentialConflict)
+		if outcome != credentials.ClaimAcquired {
+			common.APIRespondWithError(c, http.StatusOK, credentials.ErrConflict)
 			return
 		}
 		defer func() {
@@ -218,7 +224,7 @@ func CodexOAuthCallback(c *gin.Context) {
 			// 独立授权码交换没有发送原 refresh token，失败时可释放其工作门禁。
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
 			defer cancel()
-			if _, err := model.CancelCredentialRotationBeforeDispatch(cleanupCtx, ticket); err != nil {
+			if _, err := codex.CredentialRotation.Cancel(cleanupCtx, ticket); err != nil {
 				logger.SysError(fmt.Sprintf("failed to release Codex authorization claim for channel %d: %v", ticket.ChannelID, err))
 			}
 		}()
@@ -253,7 +259,7 @@ func CodexOAuthCallback(c *gin.Context) {
 	}
 
 	// Build credentials object.
-	credentials := &codex.OAuth2Credentials{
+	authorizedCredentials := &codex.OAuth2Credentials{
 		AccessToken:  tokenResp.AccessToken,
 		RefreshToken: tokenResp.RefreshToken,
 		ClientID:     codex.DefaultClientID,
@@ -262,11 +268,11 @@ func CodexOAuthCallback(c *gin.Context) {
 		ExpiresAt:    time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second),
 	}
 	if tokenResp.Scope != "" {
-		credentials.Scopes = strings.Fields(tokenResp.Scope)
+		authorizedCredentials.Scopes = strings.Fields(tokenResp.Scope)
 	}
 
 	// Serialize credentials.
-	credentialsJSON, err := credentials.ToJSON()
+	credentialsJSON, err := authorizedCredentials.ToJSON()
 	if err != nil {
 		logger.SysError(fmt.Sprintf("Failed to serialize credentials: %s", err.Error()))
 		common.APIRespondWithError(c, http.StatusOK, fmt.Errorf("failed to serialize credentials: %w", err))
@@ -275,16 +281,17 @@ func CodexOAuthCallback(c *gin.Context) {
 	if stateData.ChannelID != 0 {
 		var saveErr error
 		if stateData.CredentialFence != "" {
-			saveErr = model.RecoverChannelCredentialWithContext(c.Request.Context(), model.CredentialRecoverySnapshot{
-				ChannelID: stateData.ChannelID, AccountID: stateData.AccountID,
-				ExpectedRevision: stateData.CredentialRevision, ExpectedFence: stateData.CredentialFence,
-			}, credentialsJSON)
+			saveErr = codex.RecoverCredential(c.Request.Context(), stateData.ChannelID, stateData.Version, stateData.CredentialFence, stateData.AccountID, credentialsJSON)
 		} else {
-			saveErr = model.ReplaceChannelCredentialWithContext(c.Request.Context(), ticket, credentialsJSON)
+			outcome, err := codex.CredentialRotation.Commit(c.Request.Context(), ticket, credentialsJSON)
+			saveErr = err
+			if saveErr == nil && outcome != credentials.CommitApplied && outcome != credentials.CommitAlreadyApplied {
+				saveErr = credentials.ErrConflict
+			}
 		}
 		if saveErr != nil {
-			if errors.Is(saveErr, model.ErrChannelCredentialConflict) {
-				common.APIRespondWithError(c, http.StatusOK, model.ErrChannelCredentialConflict)
+			if errors.Is(saveErr, credentials.ErrConflict) {
+				common.APIRespondWithError(c, http.StatusOK, credentials.ErrConflict)
 			} else {
 				logger.SysError(fmt.Sprintf("Codex credential persistence failed for channel %d", stateData.ChannelID))
 				common.APIRespondWithError(c, http.StatusOK, fmt.Errorf("保存渠道凭据失败，请重新发起授权"))
@@ -348,7 +355,7 @@ func parseCodexCallbackURL(input, expectedState string) (string, error) {
 
 // extractAccountIDFromToken extracts account_id from JWT.
 func extractAccountIDFromToken(accessToken string) string {
-	return model.CodexTokenAccountID(accessToken)
+	return codex.CodexTokenAccountID(accessToken)
 }
 
 // exchangeCodexCodeForToken exchanges auth code for token (proxy-aware).

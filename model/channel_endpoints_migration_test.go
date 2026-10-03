@@ -84,7 +84,7 @@ func TestCustomEndpointDatabaseMigrationIsAtomicFullAndIdempotent(t *testing.T) 
 			}
 			for i := 1; i <= 205; i++ {
 				plugin := datatypes.NewJSONType(PluginType{"customize": {"16": "/tenant/responses"}, "vendor": {"retained": "value"}, "claude": {"enabled": false, "base_url": "https://claude.example/root"}})
-				channel := Channel{Id: i, Type: config.ChannelTypeCustom, Plugin: &plugin, CredentialRevision: 7}
+				channel := Channel{Id: i, Type: config.ChannelTypeCustom, Plugin: &plugin, Version: 7}
 				if i == 2 {
 					channel.Type = config.ChannelTypeOpenAI
 				}
@@ -128,7 +128,7 @@ func TestCustomEndpointDatabaseMigrationIsAtomicFullAndIdempotent(t *testing.T) 
 				if legacy != (fail || channel.Type != config.ChannelTypeCustom) {
 					t.Fatalf("unexpected format on channel %d", channel.Id)
 				}
-				if channel.CredentialRevision != 7 || channel.Plugin.Data()["vendor"]["retained"] != "value" {
+				if channel.Version != 7 || channel.Plugin.Data()["vendor"]["retained"] != "value" {
 					t.Fatal("migration changed independent state")
 				}
 				if !legacy {

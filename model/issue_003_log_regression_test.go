@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"one-api/common/config"
+	"one-api/common/credentials"
 	"strings"
 	"sync"
 	"testing"
@@ -14,24 +16,7 @@ import (
 	gormlogger "gorm.io/gorm/logger"
 )
 
-// 凭据 SQL 日志回归：等价生产 Debug（Info）、Error（错误 Trace 携带已构建 SQL）
-// 与慢查询（Warn + 极小阈值）三种 gorm Trace 路径，捕获日志并断言旧/new access
-// 与 refresh token 以及凭据 JSON 键从不出现。本卡要求是凭据不泄漏；断言范围是
-// “正向对照 marker 出现且 token/JSON 片段缺失”，不声明受测写入口完全静默。
-//
-// 真实主链（I-003）：RecoverChannelCredentialWithContext（管理员同账号 fence 恢复）
-// 与 ReplaceChannelCredentialWithContext→CommitCredentialRotation（无 fence 授权
-// 提交）；两者凭据 SQL 均以 Silent 会话执行。
-// 附带覆盖：CompareAndSetChannelKeyWithContext 是旧 pending 记录持久化使用的
-// legacy CAS。正常刷新（model.DB 非 nil）只走 Commit；旧 pending 只能由无 DB 权威
-// 分支创建，因此不属于本卡正常刷新/恢复主链。此处只附带验证它与主链写入口一致
-// 的日志边界与 MySQL 保留字方言可用性（曾复现 MariaDB 1064），不改其 CAS 语义，
-// 也不扩展或删除旧 pending 实现。
-//
-// gorm 只有在 SQL 已构建后才可能输出带参数的 Trace。因此每个窗口先执行一条非
-// Silent 正向对照语句，证明捕获面确实会打印带值的 SQL；随后运行受测凭据写入口，
-// 断言其凭据从不进入日志。
-
+// Credential operations must never log token values, including failed SQL.
 type issue003LogCapture struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -62,7 +47,7 @@ func issue003LogCredential(entry, phase string) (oldKey, newKey, oldAccess, oldR
 // failureHook 注入错误的时机：none 不注入；after 在 gorm:update 回调完成、SQL
 // 已构建并执行之后把错误加入事务。注意这是 callback 层注入，不是驱动拒绝执行：
 // 普通 Commit 的语句可能已提交并由 Commit 按重载证据归类为 AlreadyApplied，
-// Recover 由外层事务回滚而报错。它使 Error Trace 分支携带完整已构建 SQL，用于
+// Recover 保守返回写错误，不报告恢复成功。它使 Error Trace 分支携带完整已构建 SQL，用于
 // 验证该分支的日志安全。
 type failureHook string
 
@@ -81,10 +66,10 @@ func runIssue003LogWindow(t *testing.T, db *gorm.DB, level gormlogger.LogLevel, 
 	// 渠道 fixture 必须先于捕获窗口完成：fixture INSERT 本身带旧凭据，属于
 	// 测试准备数据，不属于被验证的写入口。
 	insertCredentialRotationChannel(t, channelID, oldKey)
-	var ticket CredentialRotationTicket
+	var ticket credentials.Ticket
 	if entry != "compare_and_set" {
-		ticket = CredentialRotationTicket{ChannelID: channelID, ExpectedRevision: 0, AttemptID: fmt.Sprintf("i003-log-fence-%d", channelID)}
-		if outcome, err := ClaimCredentialRotation(context.Background(), ticket, time.Now()); err != nil || outcome != CredentialRotationClaimAcquired {
+		ticket = credentials.Ticket{Type: config.ChannelTypeCodex, ChannelID: channelID, ExpectedVersion: 0, AttemptID: fmt.Sprintf("i003-log-fence-%d", channelID)}
+		if outcome, err := testRotation().Claim(context.Background(), ticket, time.Now()); err != nil || outcome != credentials.ClaimAcquired {
 			t.Fatalf("建立未决 fence: outcome=%v err=%v", outcome, err)
 		}
 	}
@@ -128,19 +113,28 @@ func runIssue003LogWindow(t *testing.T, db *gorm.DB, level gormlogger.LogLevel, 
 	writeOnce := func() error {
 		switch entry {
 		case "recover":
-			return RecoverChannelCredentialWithContext(context.Background(), CredentialRecoverySnapshot{
-				ChannelID: channelID, AccountID: "account-a",
-				ExpectedRevision: ticket.ExpectedRevision, ExpectedFence: ticket.AttemptID,
-			}, newKey)
+			row, err := testRotation().Store.Load(context.Background(), channelID)
+			if err != nil {
+				return err
+			}
+			return testRotation().Recover(context.Background(), row, ticket.AttemptID, newKey)
 		case "replace_commit":
-			return ReplaceChannelCredentialWithContext(context.Background(), ticket, newKey)
+			outcome, err := testRotation().Commit(context.Background(), ticket, newKey)
+			if err == nil && outcome != credentials.CommitApplied && outcome != credentials.CommitAlreadyApplied {
+				return credentials.ErrConflict
+			}
+			return err
 		case "compare_and_set":
-			updated, err := CompareAndSetChannelKeyWithContext(context.Background(), channelID, oldKey, newKey)
+			row, err := testRotation().Store.Load(context.Background(), channelID)
+			if err != nil {
+				return err
+			}
+			updated, err := testRotation().Store.CompareAndSwap(context.Background(), row, row.BizData, &newKey)
 			if err != nil {
 				return err
 			}
 			if !updated {
-				return errors.New("compare-and-set did not update")
+				return credentials.ErrConflict
 			}
 			return nil
 		default:

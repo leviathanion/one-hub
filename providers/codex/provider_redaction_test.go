@@ -2,11 +2,11 @@ package codex
 
 import (
 	"context"
-	"github.com/gin-gonic/gin"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"one-api/common/cache"
+	"one-api/common/config"
 	"one-api/common/providerresponse"
 	"one-api/common/requestctx"
 	"one-api/common/requester"
@@ -17,14 +17,14 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
 func TestProviderRedactionCodexReloadRetainsCredentialSnapshot(t *testing.T) {
 	cache.InitCacheManager()
 	const secret = "reloaded-provider-secret-12345"
-	oldDB := model.DB
-	model.DB = nil
-	defer func() { model.DB = oldDB }()
+	useCodexFenceDB(t)
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
@@ -43,7 +43,7 @@ func TestProviderRedactionCodexReloadRetainsCredentialSnapshot(t *testing.T) {
 	nextKey, _ := (&OAuth2Credentials{AccessToken: secret, RefreshToken: "refresh-token", ExpiresAt: expiry}).ToJSON()
 	baseURL := upstream.URL
 	proxy := ""
-	channel := &model.Channel{Id: 982344, Key: oldKey, BaseURL: &baseURL, Proxy: &proxy}
+	channel := &model.Channel{Id: 982344, Type: config.ChannelTypeCodex, Key: oldKey, BaseURL: &baseURL, Proxy: &proxy}
 	p := CodexProviderFactory{}.Create(channel).(*CodexProvider)
 	oldLoad := loadLatestChannelByID
 	loadLatestChannelByID = func(context.Context, int) (*model.Channel, error) {

@@ -110,7 +110,7 @@ func (p *CodexProvider) codexOpenMayMutateCredentials() bool {
 	p.credentialsMu.Lock()
 	refreshPossible := p.Credentials != nil && strings.TrimSpace(p.Credentials.RefreshToken) != ""
 	p.credentialsMu.Unlock()
-	return refreshPossible || p.hasDirtyCredentials()
+	return refreshPossible
 }
 
 func codexRealtimeDialContext(ctx context.Context) (context.Context, context.CancelFunc) {
