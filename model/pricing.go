@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/spf13/viper"
+	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
 
@@ -724,9 +725,9 @@ func (p *Pricing) SyncPriceOnlyUpdateAtVersion(pricing []*Price, expectedVersion
 	return p.syncPriceChangeAtVersion(pricing, PriceUpdateModeUpdate, expectedVersion)
 }
 
-// priceForSync applies the remote price as a partial policy update. A missing
-// rate_rules field means "do not update the local rules"; an explicit empty
-// object removes all conditional rules.
+// priceForSync treats source context tiers as a complete replacement, including
+// absence (clear). Omitted non-context rules retain their existing partial-update
+// semantics; manual price editing does not use this catalog synchronization path.
 func priceForSync(incoming, current *Price) *Price {
 	if incoming == nil {
 		return nil
@@ -744,8 +745,11 @@ func priceForSync(incoming, current *Price) *Price {
 		ExtraRatios: incoming.ExtraRatios,
 		RateRules:   incoming.RateRules,
 	}
-	if synced.RateRules == nil && current != nil {
-		synced.RateRules = current.RateRules
+	if synced.RateRules == nil && current != nil && current.RateRules != nil {
+		rules := ClonePriceRateRules(current.RateRules.Data())
+		rules.LongContext = nil
+		encoded := datatypes.NewJSONType(rules)
+		synced.RateRules = &encoded
 	}
 	return synced
 }

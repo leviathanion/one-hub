@@ -266,6 +266,9 @@ func convertModelsDevPrice(name, provider string, raw json.RawMessage) (*Price, 
 		if value, ok := te[config.UsageExtraCacheCreationInputTokens]; ok {
 			te[config.UsageExtraEphemeral1hInputTokens] = value
 		}
+		if len(te) == 0 {
+			te = nil // Match the persisted omitempty representation on repeated imports.
+		}
 		when := PriceRuleCondition{InputTokens: &PriceTokenRange{GT: &tiers[i].Tier.Size}}
 		if i+1 < len(tiers) {
 			when.InputTokens.LTE = &tiers[i+1].Tier.Size
