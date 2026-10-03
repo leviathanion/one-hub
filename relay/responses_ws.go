@@ -427,7 +427,9 @@ func (a *ResponsesWSSessionActor) startSendWorker() {
 		return
 	}
 	a.workers.sendOnce.Do(func() {
+		a.workers.runWG.Add(1)
 		go func() {
+			defer a.workers.runWG.Done()
 			defer recoverResponsesWSGoroutine("send_worker", func(reason string) {
 				if a != nil {
 					if !a.PostReliable(ResponsesWSEventTimeout{Reason: reason}) {
@@ -1639,7 +1641,9 @@ func (a *ResponsesWSSessionActor) startFirstTurnOpenWorker(openingID string, fra
 	a.setSetupCancel(cancel)
 	actorSnapshot := a.snapshotClone()
 
+	a.workers.runWG.Add(1)
 	go func() {
+		defer a.workers.runWG.Done()
 		defer cancel()
 		var openResult *responsesWSOpenResult
 		handedOff := false

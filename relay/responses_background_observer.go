@@ -27,8 +27,14 @@ type backgroundObservationSink struct {
 
 func newBackgroundObservationSink(parent context.Context, ownerID string) *backgroundObservationSink {
 	sink := &backgroundObservationSink{queue: make(chan []byte, 8), done: make(chan struct{})}
+	finish, ok := backgroundBusiness.Start()
+	if !ok {
+		close(sink.done)
+		return sink
+	}
 	parent = context.WithoutCancel(parent)
 	go func() {
+		defer finish()
 		defer close(sink.done)
 		for raw := range sink.queue {
 			var observation backgroundObservation

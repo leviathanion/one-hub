@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"context"
 	"fmt"
 	"one-api/common/logger"
 	"sync"
@@ -12,6 +13,10 @@ type TaskManager struct {
 	scheduler gocron.Scheduler
 	jobs      map[string]*JobInfo
 	mu        sync.RWMutex
+	stopOnce  sync.Once
+	stopDone  chan struct{}
+	stopErr   error
+	closed    bool
 }
 
 type JobInfo struct {
@@ -44,6 +49,9 @@ func init() {
 func (tm *TaskManager) AddJob(name string, definition gocron.JobDefinition, task gocron.Task, options ...gocron.JobOption) error {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
+	if tm.closed {
+		return fmt.Errorf("scheduler is shutting down")
+	}
 
 	// 如果任务已存在，先移除
 	if oldJob, exists := tm.jobs[name]; exists {
@@ -77,4 +85,30 @@ func (tm *TaskManager) GetJob(name string) *JobInfo {
 	defer tm.mu.RUnlock()
 
 	return tm.jobs[name]
+}
+
+// Shutdown uses the existing scheduler's stop/join semantics and the process
+// deadline. An unfinished job is reported; SQL is not retired on that path.
+func (tm *TaskManager) Shutdown(ctx context.Context) error {
+	if tm == nil {
+		return nil
+	}
+	tm.stopOnce.Do(func() {
+		tm.mu.Lock()
+		tm.closed = true
+		tm.stopDone = make(chan struct{})
+		tm.mu.Unlock()
+		go func() { tm.stopErr = tm.scheduler.Shutdown(); close(tm.stopDone) }()
+	})
+	select {
+	case <-tm.stopDone:
+		return tm.stopErr
+	default:
+	}
+	select {
+	case <-tm.stopDone:
+		return tm.stopErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

@@ -128,7 +128,10 @@ func newManagedConn(raw *websocket.Conn, cfg Config) *ManagedConn {
 	}
 	c.control = newControlWriter(c)
 	c.installHandlers()
-	c.unregisterActive = defaultActiveRegistry.register(connRegistration{conn: c, watchDone: false})
+	registry := defaultActiveRegistry
+	// Install cleanup before publishing the connection to concurrent shutdown.
+	c.unregisterActive = func() { registry.mu.Lock(); delete(registry.conns, c); registry.mu.Unlock() }
+	registry.register(connRegistration{conn: c, watchDone: false})
 	return c
 }
 

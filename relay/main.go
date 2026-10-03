@@ -181,9 +181,14 @@ func observeRelayProviderFailure(c *gin.Context, channel *model.Channel, apiErr 
 	if c.Request != nil {
 		requestCtx = context.WithoutCancel(c.Request.Context())
 	}
+	finish, ok := backgroundBusiness.Start()
+	if !ok {
+		return
+	}
 	healthCtx, cancel := context.WithTimeout(requestCtx, 5*time.Second)
 	process := processChannelRelayErrorFunc
 	go func() {
+		defer finish()
 		defer cancel()
 		process(healthCtx, channel.Id, channel.Name, apiErr, channel.Type)
 	}()

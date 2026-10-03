@@ -362,7 +362,7 @@ func TestChannel(c *gin.Context) {
 	} else {
 		success = true
 		msg = "测速成功"
-		go channel.UpdateResponseTime(result.milliseconds)
+		channel.UpdateResponseTime(result.milliseconds)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -435,7 +435,7 @@ func testAllChannel(channel *model.Channel) string {
 }
 
 // runFullChannelProbeTask 只接受已选定的本轮待测渠道，按输入顺序汇总报告。
-func runFullChannelProbeTask(channels []*model.Channel) string {
+func runFullChannelProbeTask(ctx context.Context, channels []*model.Channel) string {
 	if len(channels) == 0 {
 		return ""
 	}
@@ -457,6 +457,9 @@ func runFullChannelProbeTask(channels []*model.Channel) string {
 		go func() {
 			defer wg.Done()
 			for index := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
 				reportCh <- fullChannelProbeReport{
 					index:   index,
 					message: testAllChannel(channels[index]),
@@ -466,15 +469,26 @@ func runFullChannelProbeTask(channels []*model.Channel) string {
 	}
 
 	go func() {
+		defer func() { close(jobs); wg.Wait(); close(reportCh) }()
 		for index := range channels {
-			if config.RequestInterval > 0 {
-				time.Sleep(config.RequestInterval)
+			if ctx.Err() != nil {
+				return
 			}
-			jobs <- index
+			if config.RequestInterval > 0 {
+				timer := time.NewTimer(config.RequestInterval)
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				}
+			}
+			select {
+			case jobs <- index:
+			case <-ctx.Done():
+				return
+			}
 		}
-		close(jobs)
-		wg.Wait()
-		close(reportCh)
 	}()
 
 	for report := range reportCh {
@@ -485,6 +499,16 @@ func runFullChannelProbeTask(channels []*model.Channel) string {
 }
 
 func testAllChannels(isNotify bool) error {
+	finish, ok := backgroundBusiness.Start()
+	if !ok {
+		return errors.New("channel probes are shutting down")
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			finish()
+		}
+	}()
 	if err := startFullChannelProbeTask(); err != nil {
 		return err
 	}
@@ -503,11 +527,13 @@ func testAllChannels(isNotify bool) error {
 		finishFullChannelProbeTask()
 		return nil
 	}
+	transferred = true
 	go func() {
+		defer finish()
 		defer finishFullChannelProbeTask()
 
-		sendMessage := runFullChannelProbeTask(probeable)
-		if isNotify {
+		sendMessage := runFullChannelProbeTask(backgroundContext, probeable)
+		if isNotify && backgroundContext.Err() == nil {
 			sendFullChannelProbeNotificationFunc("通道测试完成", sendMessage)
 		}
 	}()
@@ -530,12 +556,21 @@ func TestAllChannels(c *gin.Context) {
 }
 
 func AutomaticallyTestChannels(frequency int) {
+	AutomaticallyTestChannelsContext(context.Background(), frequency)
+}
+func AutomaticallyTestChannelsContext(ctx context.Context, frequency int) {
 	if frequency <= 0 {
 		return
 	}
 
+	ticker := time.NewTicker(time.Duration(frequency) * time.Minute)
+	defer ticker.Stop()
 	for {
-		time.Sleep(time.Duration(frequency) * time.Minute)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 		logger.SysLog("testing all channels")
 		err := testAllChannels(false)
 		if err != nil {

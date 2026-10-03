@@ -56,6 +56,7 @@ type Manager struct {
 	remoteConfig         managerRemoteConfig
 	stopCh               chan struct{}
 	stopOnce             sync.Once
+	janitorDone          chan struct{}
 }
 
 type pendingBindingDelete struct {
@@ -96,11 +97,14 @@ func NewManagerWithOptions(options ManagerOptions) *Manager {
 			backend:           newRedisBindingBackend(options.RedisClient, options.RedisPrefix),
 			revocationTimeout: normalizeRevocationTimeout(options.RevocationTimeout),
 		},
-		stopCh: make(chan struct{}),
+		stopCh:      make(chan struct{}),
+		janitorDone: make(chan struct{}),
 	}
 
 	if options.JanitorInterval > 0 {
 		go m.runJanitor()
+	} else {
+		close(m.janitorDone)
 	}
 
 	return m
@@ -424,6 +428,7 @@ func (m *Manager) Sweep(now time.Time) int {
 }
 
 func (m *Manager) runJanitor() {
+	defer close(m.janitorDone)
 	ticker := time.NewTicker(m.janitorInterval)
 	defer ticker.Stop()
 
@@ -1414,5 +1419,25 @@ func (m *Manager) cleanupSessions(sessions []*ExecutionSession) {
 			continue
 		}
 		m.cleanup(sess)
+	}
+}
+
+// Shutdown joins the janitor's current cleanup after stopping future sweeps.
+// Request admission is owned by the caller, not by this cache/session manager.
+func (m *Manager) Shutdown(ctx context.Context) error {
+	if m == nil {
+		return nil
+	}
+	m.Close()
+	select {
+	case <-m.janitorDone:
+		return nil
+	default:
+	}
+	select {
+	case <-m.janitorDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }

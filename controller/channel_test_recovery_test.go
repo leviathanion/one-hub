@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -205,7 +206,7 @@ func TestRunFullChannelProbeTaskHonorsConcurrencyLimit(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		runFullChannelProbeTask(channels)
+		runFullChannelProbeTask(context.Background(), channels)
 		close(done)
 	}()
 
@@ -255,7 +256,7 @@ func TestRunFullChannelProbeTaskKeepsReportOrder(t *testing.T) {
 		return channelProbeResult{err: fmt.Errorf("probe failed")}
 	}
 
-	report := runFullChannelProbeTask(channels)
+	report := runFullChannelProbeTask(context.Background(), channels)
 	first := strings.Index(report, "slowfirst")
 	second := strings.Index(report, "fastsecond")
 	third := strings.Index(report, "fastthird")

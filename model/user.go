@@ -469,20 +469,12 @@ func GetRootUserEmail() (email string) {
 // UpdateUserRequestCountWithContext 只更新统计投影；最终消费在余额事务内累计。
 func UpdateUserRequestCountWithContext(ctx context.Context, id int) error {
 	if config.BatchUpdateEnabled {
-		addNewRecord(BatchUpdateTypeRequestCount, id, 1)
-		return nil
+		return addNewRecord(BatchUpdateTypeRequestCount, id, 1)
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	return DB.WithContext(ctx).Model(&User{}).Where("id = ?", id).Update("request_count", gorm.Expr("request_count + ?", 1)).Error
-}
-
-func updateUserRequestCount(id int, count int) {
-	err := DB.Model(&User{}).Where("id = ?", id).Update("request_count", gorm.Expr("request_count + ?", count)).Error
-	if err != nil {
-		logger.SysError("failed to update user request count: " + err.Error())
-	}
 }
 
 func GetUsernameById(id int) (username string) {

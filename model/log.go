@@ -144,7 +144,9 @@ func RecordConsumeLog(
 	}
 
 	if config.BatchUpdateEnabled {
-		AddLogToBatch(log)
+		if err := AddLogToBatch(log); err != nil {
+			logger.LogError(requestCtx, "failed to queue consume log: "+err.Error())
+		}
 	} else {
 		writeCtx, writeCancel := context.WithTimeout(requestCtx, consumeLogWriteTimeout)
 		defer writeCancel()

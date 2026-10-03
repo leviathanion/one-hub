@@ -52,7 +52,6 @@ func InitTelegramBot() {
 	}
 
 	TGDispatcher = setDispatcher()
-	TGupdater = ext.NewUpdater(TGDispatcher, nil)
 
 	StartTelegramBot()
 }
@@ -60,10 +59,11 @@ func InitTelegramBot() {
 func StartTelegramBot() {
 	serverAddress := config.GlobalOption.RuntimeSnapshot().String("ServerAddress", config.ServerAddress)
 	botWebhook := viper.GetString("tg.webhook_secret")
+	dispatcher := &drainingDispatcher{Dispatcher: TGDispatcher, readerDone: make(chan struct{})}
+	TGupdater = ext.NewUpdater(dispatcher, nil)
 	if botWebhook != "" {
 		if serverAddress == "" {
 			logger.SysLog("Telegram bot is not enabled: Server address is not set")
-			StopTelegramBot()
 			return
 		}
 		TGWebHookSecret = botWebhook
@@ -80,6 +80,7 @@ func StartTelegramBot() {
 			return
 		}
 
+		dispatcher.readerExpected = true
 		err = TGupdater.SetAllBotWebhooks(serverAddress, &gotgbot.SetWebhookOpts{
 			MaxConnections:     100,
 			DropPendingUpdates: true,
@@ -103,11 +104,11 @@ func StartTelegramBot() {
 
 		if err != nil {
 			logger.SysLog("Telegram bot failed to start polling:" + err.Error())
+			return
 		}
+		dispatcher.readerExpected = true
 	}
 
-	// Idle, to keep updates coming in, and avoid bot stopping.
-	go TGupdater.Idle()
 	logger.SysLog(fmt.Sprintf("Telegram bot %s has been started...:", TGBot.User.Username))
 	TGEnabled = true
 }
@@ -123,14 +124,6 @@ func ReloadMenuAndCommands() error {
 	initCommand(TGDispatcher, menus)
 
 	return nil
-}
-
-func StopTelegramBot() {
-	if TGEnabled {
-		TGupdater.Stop()
-		TGupdater = nil
-		TGEnabled = false
-	}
 }
 
 func setDispatcher() *ext.Dispatcher {

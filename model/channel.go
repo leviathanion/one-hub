@@ -1157,20 +1157,12 @@ func UpdateChannelUsedQuota(id int, quota int) {
 
 func UpdateChannelUsedQuotaWithContext(ctx context.Context, id int, quota int) error {
 	if config.BatchUpdateEnabled {
-		addNewRecord(BatchUpdateTypeChannelUsedQuota, id, quota)
-		return nil
+		return addNewRecord(BatchUpdateTypeChannelUsedQuota, id, quota)
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	return DB.WithContext(ctx).Model(&Channel{}).Where("id = ?", id).Update("used_quota", gorm.Expr("used_quota + ?", quota)).Error
-}
-
-func updateChannelUsedQuota(id int, quota int) {
-	err := DB.Model(&Channel{}).Where("id = ?", id).Update("used_quota", gorm.Expr("used_quota + ?", quota)).Error
-	if err != nil {
-		logger.SysError("failed to update channel used quota: " + err.Error())
-	}
 }
 
 func ClearChannelCodexDerivedCaches(channelIds []int) {

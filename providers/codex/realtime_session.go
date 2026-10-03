@@ -1006,7 +1006,10 @@ func scheduleCodexExecutionSessionPanicCleanup(exec *runtimesession.ExecutionSes
 	}
 	exec.MarkClosedBestEffort("session_aborted_panic")
 	currentCodexExecutionSessions().DeleteIfWithoutCleanup(exec.Key, exec)
+	workers := realtimeWorkers
+	workers.Add(1)
 	go func() {
+		defer workers.Done()
 		timer := time.NewTimer(25 * time.Millisecond)
 		defer timer.Stop()
 		for attempt := 0; attempt < 20; attempt++ {
@@ -1420,7 +1423,10 @@ func (p *CodexProvider) startRealtimeWSReaderLocked(exec *runtimesession.Executi
 	state.deferWSReader = false
 	state.wsReaderConn = conn
 
+	workers := realtimeWorkers
+	workers.Add(1)
 	go func() {
+		defer workers.Done()
 		var panicked atomic.Bool
 		defer func() {
 			if panicked.Load() {
@@ -1461,7 +1467,13 @@ func (p *CodexProvider) startRealtimeWSReaderLocked(exec *runtimesession.Executi
 				close(frameCh)
 			})
 		}
+		// A reader may finish on a terminal event before Pump returns. Cancel its
+		// byte-budget wait and join its final I/O/logging through the same runtime.
+		pumpCtx, cancelPump := context.WithCancel(pumpCtx)
+		defer cancelPump()
+		workers.Add(1)
 		go func() {
+			defer workers.Done()
 			defer func() {
 				if recovered := recover(); recovered != nil {
 					finishPump(wsconn.CloseInfo{
