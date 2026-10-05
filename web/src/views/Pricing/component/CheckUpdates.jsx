@@ -281,20 +281,24 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
           </Button>
           {modelsDevSkipped > 0 && <Alert severity="info">{t('modelsDev.skipped', { count: modelsDevSkipped })}</Alert>}
 
-          <ButtonGroup fullWidth aria-label={t('CheckUpdatesTable.updatePrices')}>
-            {updateModes.map((item) => (
-              <Button
-                key={item}
-                variant={mode === item ? 'contained' : 'outlined'}
-                onClick={() => handleModeChange(item)}
-                disabled={loading || applyLoading}
-              >
-                {t(`CheckUpdatesTable.updateMode${item.charAt(0).toUpperCase()}${item.slice(1)}`)}
-              </Button>
-            ))}
-          </ButtonGroup>
+          {source.length > 0 && (
+            <>
+              <ButtonGroup fullWidth aria-label={t('CheckUpdatesTable.updatePrices')}>
+                {updateModes.map((item) => (
+                  <Button
+                    key={item}
+                    variant={mode === item ? 'contained' : 'outlined'}
+                    onClick={() => handleModeChange(item)}
+                    disabled={loading || applyLoading}
+                  >
+                    {t(`CheckUpdatesTable.updateMode${item.charAt(0).toUpperCase()}${item.slice(1)}`)}
+                  </Button>
+                ))}
+              </ButtonGroup>
 
-          {mode !== 'add' && <Alert severity="warning">{t('CheckUpdatesTable.contextTierPolicy')}</Alert>}
+              {mode !== 'add' && <Alert severity="warning">{t('CheckUpdatesTable.contextTierPolicy')}</Alert>}
+            </>
+          )}
 
           {source.length > 0 && !preview && (
             <Button variant="outlined" onClick={refreshPreview} disabled={loading || applyLoading}>
@@ -364,14 +368,16 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
         <Button onClick={onCancel} disabled={applyLoading} variant="outlined" color="inherit">
           {t('CheckUpdatesTable.cancel')}
         </Button>
-        <LoadingButton
-          variant="contained"
-          onClick={applyPreview}
-          loading={applyLoading}
-          disabled={!preview || loading || changes.length === 0}
-        >
-          {t(`CheckUpdatesTable.updateMode${mode.charAt(0).toUpperCase()}${mode.slice(1)}`)}
-        </LoadingButton>
+        {source.length > 0 && (
+          <LoadingButton
+            variant="contained"
+            onClick={applyPreview}
+            loading={applyLoading}
+            disabled={!preview || loading || changes.length === 0}
+          >
+            {t(`CheckUpdatesTable.updateMode${mode.charAt(0).toUpperCase()}${mode.slice(1)}`)}
+          </LoadingButton>
+        )}
       </DialogActions>
     </Dialog>
   );

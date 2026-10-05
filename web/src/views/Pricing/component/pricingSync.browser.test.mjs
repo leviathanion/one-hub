@@ -73,10 +73,37 @@ test(
         modelsDevData = { url: 'https://models.dev/api.json', prices: source, skipped: 2, candidates: [] };
         await page.goto(url);
         await page.getByRole('button', { name: 'Fetch from models.dev' }).waitFor();
+        await expectFetchOnly();
       };
-      const apply = () => page.locator('.MuiDialogActions-root button').last();
+      const apply = () => page.locator('.MuiDialogActions-root .MuiLoadingButton-root');
       const mode = (name) => page.getByRole('group').getByRole('button', { name, exact: true });
       const waitPreview = () => page.getByText('base_version: 7', { exact: true }).waitFor();
+      const expectFetchOnly = async () => {
+        for (const name of ['Add Only', 'Update Only', 'Overwrite All']) {
+          assert.equal(await page.getByRole('button', { name, exact: true }).count(), 0, `${name} requires a fetched catalog`);
+        }
+        assert.equal(await apply().count(), 0);
+        assert.equal(await page.getByText(/Updating selected models replaces context tiers/).count(), 0);
+        assert.equal(await page.locator('.MuiCard-root').count(), 0);
+      };
+
+      await t.test('URL fetch reveals modes only after data arrives; URL edits and reopen return to fetch-only', async () => {
+        await ready();
+        assert.deepEqual(requests, []);
+        await page.locator('.MuiInputBase-root button').click();
+        await waitPreview();
+        assert.equal(await mode('Add Only').isVisible(), true);
+        assert.equal(await mode('Update Only').isVisible(), true);
+        assert.equal(await mode('Overwrite All').isVisible(), true);
+        await page.getByRole('textbox').fill('/changed-catalog');
+        await expectFetchOnly();
+        await page.getByRole('button', { name: 'Fetch from models.dev' }).click();
+        await waitPreview();
+        await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+        await page.getByRole('dialog').waitFor({ state: 'hidden' });
+        await page.getByRole('button', { name: 'Open sync' }).click();
+        await expectFetchOnly();
+      });
 
       await t.test('fetch immediately previews; every existing mode and diff renderer works for both sources', async () => {
         await ready();
@@ -123,24 +150,26 @@ test(
         modelsDevData = { prices: [], skipped: 3 };
         await page.getByRole('button', { name: 'Fetch from models.dev' }).click();
         await page.getByText(/Skipped 3 models/).waitFor();
-        assert.equal(await apply().isDisabled(), true);
+        await expectFetchOnly();
         assert.equal(requests.length, 1);
         modelsDevData = { candidates: [] };
         await page.getByRole('button', { name: 'Fetch from models.dev' }).click();
         await page.waitForFunction(() => !document.querySelector('.MuiInputBase-root input').disabled);
-        assert.equal(await apply().isDisabled(), true);
+        await expectFetchOnly();
         assert.equal(requests.length, 1);
       });
 
       await t.test('preview failure can retry in the same mode without fetching the source again', async () => {
         await ready();
         failPreview = true;
-        await mode('Update Only').click();
         await page.getByRole('button', { name: 'Fetch from models.dev' }).click();
         const retry = page.locator('.MuiButton-root').filter({ hasText: /^Fetch Data$/ });
         await retry.waitFor();
         await page.waitForFunction(() => !document.querySelector('.MuiInputBase-root input').disabled);
         assert.equal(await apply().isDisabled(), true);
+        await mode('Update Only').click();
+        await page.waitForFunction(() => !document.querySelector('.MuiInputBase-root input').disabled);
+        assert.deepEqual(requests.at(-1), { kind: 'preview', mode: 'update', source });
         failPreview = false;
         await retry.click();
         await waitPreview();
@@ -155,13 +184,14 @@ test(
         const fetched = page.waitForRequest('**/api/prices/modelsdev');
         await page.getByRole('button', { name: 'Fetch from models.dev' }).click();
         await fetched;
+        await expectFetchOnly();
         await page.getByRole('button', { name: 'Cancel', exact: true }).click();
         await page.getByRole('dialog').waitFor({ state: 'hidden' });
         const received = page.waitForResponse('**/api/prices/modelsdev');
         releaseCatalog();
         await received;
         await page.getByRole('button', { name: 'Open sync' }).click();
-        assert.equal(await apply().isDisabled(), true);
+        await expectFetchOnly();
         assert.deepEqual(requests, []);
       });
       assert.deepEqual(errors, []);
