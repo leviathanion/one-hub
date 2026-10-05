@@ -23,10 +23,13 @@ type ModelsDevCandidate struct {
 	Price    *Price `json:"price,omitempty"`
 	Reason   string `json:"reason,omitempty"`
 	Conflict bool   `json:"conflict"`
+	Selected bool   `json:"selected"`
 }
 type ModelsDevCatalog struct {
 	URL        string               `json:"url"`
 	Candidates []ModelsDevCandidate `json:"candidates"`
+	Prices     []*Price             `json:"prices"`
+	Skipped    int                  `json:"skipped"`
 }
 type modelsDevCost struct {
 	Input       *float64        `json:"input"`
@@ -109,7 +112,46 @@ func ConvertModelsDevPrices(r io.Reader) (*ModelsDevCatalog, error) {
 		}
 		return a.Provider < b.Provider
 	})
+	selectModelsDevPrices(catalog)
 	return catalog, nil
+}
+
+// Official publisher catalogs take precedence over multi-vendor hosts. Keep this
+// explicit: SDK names, channel types and low prices do not establish ownership.
+// Vertex, Azure and aggregators can host other publishers and are not listed.
+var modelsDevOfficialProviders = map[string]bool{
+	"anthropic": true, "openai": true, "google": true,
+	"xai": true, "deepseek": true, "mistral": true, "cohere": true,
+	"meta": true, "llama": true, "moonshotai": true, "zhipuai": true, "zai": true,
+	"minimax": true, "alibaba": true, "stepfun": true, "perplexity": true,
+}
+
+// Candidates arrive sorted by exact model ID and provider. Never rename IDs or
+// choose by price. Ambiguous or invalid preferred sources stay out of the catalog.
+func selectModelsDevPrices(catalog *ModelsDevCatalog) {
+	catalog.Prices = []*Price{}
+	catalog.Skipped = 0
+	for start := 0; start < len(catalog.Candidates); {
+		end := start + 1
+		for end < len(catalog.Candidates) && catalog.Candidates[end].Model == catalog.Candidates[start].Model {
+			end++
+		}
+		preferred, officialCount := start, 0
+		for i := start; i < end; i++ {
+			if modelsDevOfficialProviders[catalog.Candidates[i].Provider] {
+				preferred = i
+				officialCount++
+			}
+		}
+		candidate := &catalog.Candidates[preferred]
+		if (officialCount == 1 || end-start == 1) && candidate.Price != nil && candidate.Reason == "" {
+			candidate.Selected = true
+			catalog.Prices = append(catalog.Prices, candidate.Price)
+		} else {
+			catalog.Skipped++
+		}
+		start = end
+	}
 }
 
 func costRatio(value *float64, base float64) (float64, error) {
