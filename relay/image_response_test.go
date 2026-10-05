@@ -40,7 +40,7 @@ func TestNativeImageSSEPreservesWireAndSettlesOnce(t *testing.T) {
 			defer func() { requester.HTTPClient = old }()
 			recorder := httptest.NewRecorder()
 			ctx, _ := gin.CreateTestContext(recorder)
-			ctx.Request = httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"`+issue053ImageModel+`","prompt":"draw","stream":true}`))
+			ctx.Request = httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"`+imageStreamCapabilityImageModel+`","prompt":"draw","stream":true}`))
 			ctx.Request.Header.Set("Content-Type", "application/json")
 			if _, err := common.CacheRequestBody(ctx); err != nil {
 				t.Fatal(err)
@@ -58,7 +58,7 @@ func TestNativeImageSSEPreservesWireAndSettlesOnce(t *testing.T) {
 					t.Fatal(err)
 				}
 				r.provider = p
-				r.modelName = issue053ImageModel
+				r.modelName = imageStreamCapabilityImageModel
 				apiErr, doneWork = r.send()
 			} else {
 				r := NewRelayImageGenerations(ctx)
@@ -66,7 +66,7 @@ func TestNativeImageSSEPreservesWireAndSettlesOnce(t *testing.T) {
 					t.Fatal(err)
 				}
 				r.provider = p
-				r.modelName = issue053ImageModel
+				r.modelName = imageStreamCapabilityImageModel
 				apiErr, doneWork = r.send()
 			}
 			if apiErr != nil || !doneWork || calls != 1 {
@@ -78,7 +78,7 @@ func TestNativeImageSSEPreservesWireAndSettlesOnce(t *testing.T) {
 			if p.GetUsage().ProviderOperationUnits == nil || *p.GetUsage().ProviderOperationUnits != 1 {
 				t.Fatalf("partial or duplicate usage: %+v", p.GetUsage())
 			}
-			issue053SettleImageUsage(t, p.GetUsage(), 1)
+			imageStreamCapabilitySettleImageUsage(t, p.GetUsage(), 1)
 		})
 	}
 }

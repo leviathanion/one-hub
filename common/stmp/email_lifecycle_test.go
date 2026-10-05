@@ -153,7 +153,7 @@ func sendWithLifecycleServer(ctx context.Context, server *smtpLifecycleServer) e
 	return dialAndSend(ctx, client, message)
 }
 
-func TestIssue052SMTPCancellationClosesEveryProtocolPhase(t *testing.T) {
+func TestSMTPCancellationClosesEveryProtocolPhase(t *testing.T) {
 	for _, phase := range []string{"greeting", "EHLO", "tls_handshake", "AUTH", "MAIL", "DATA", "data_reply", "RSET", "QUIT"} {
 		t.Run(phase, func(t *testing.T) {
 			server := newSMTPLifecycleServer(t, phase)
@@ -191,7 +191,7 @@ func TestIssue052SMTPCancellationClosesEveryProtocolPhase(t *testing.T) {
 	}
 }
 
-func TestIssue052SMTPDeadlineAndSuccessfulSend(t *testing.T) {
+func TestSMTPDeadlineAndSuccessfulSend(t *testing.T) {
 	t.Run("deadline", func(t *testing.T) {
 		server := newSMTPLifecycleServer(t, "greeting")
 		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -222,7 +222,7 @@ func TestIssue052SMTPDeadlineAndSuccessfulSend(t *testing.T) {
 	})
 }
 
-func TestIssue052SMTPImplicitTLSKeepsCertificateVerification(t *testing.T) {
+func TestSMTPImplicitTLSKeepsCertificateVerification(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
 	defer server.Close()
 	address := server.Listener.Addr().String()
@@ -248,7 +248,7 @@ func TestIssue052SMTPImplicitTLSKeepsCertificateVerification(t *testing.T) {
 	}
 }
 
-func TestIssue052SMTPImplicitTLSHandshakeHasDeadline(t *testing.T) {
+func TestSMTPImplicitTLSHandshakeHasDeadline(t *testing.T) {
 	server := newSMTPLifecycleServer(t, "greeting")
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -262,7 +262,7 @@ func TestIssue052SMTPImplicitTLSHandshakeHasDeadline(t *testing.T) {
 	}
 }
 
-func TestIssue052SMTPInvalidAddressesFailBeforeDial(t *testing.T) {
+func TestSMTPInvalidAddressesFailBeforeDial(t *testing.T) {
 	for _, test := range []struct{ from, to string }{
 		{from: "invalid", to: "to@example.com"},
 		{from: "sender@example.com", to: "invalid"},

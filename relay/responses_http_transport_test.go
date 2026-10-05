@@ -121,11 +121,11 @@ func TestResponsesHTTPTransportEndsAndSettlesOnce(t *testing.T) {
 					c.Set("group_ratio", 1.0)
 					groupctx.SetRoutingGroup(c, "default", groupctx.RoutingGroupSourceUserGroup)
 					provider := &responsesHTTPReaderProvider{streamAffinityResponsesProvider: streamAffinityResponsesProvider{BaseProvider: providersBase.BaseProvider{Channel: &model.Channel{Id: 17, Type: config.ChannelTypeOpenAI}, Context: c}}, body: body}
-					envelope, parseErr := commonresponses.ParseRawEnvelope([]byte(`{"model":"` + issue048HTTPModel + `","input":"hello","stream":true,"store":false}`))
+					envelope, parseErr := commonresponses.ParseRawEnvelope([]byte(`{"model":"` + toolUsageEvidenceHTTPModel + `","input":"hello","stream":true,"store":false}`))
 					if parseErr != nil {
 						panic(parseErr)
 					}
-					relay := &relayResponses{relayBase: relayBase{c: c, provider: provider, originalModel: issue048HTTPModel, modelName: issue048HTTPModel}, responsesRequest: envelope.Projection, rawEnvelope: envelope, operation: responsesOperationCreate}
+					relay := &relayResponses{relayBase: relayBase{c: c, provider: provider, originalModel: toolUsageEvidenceHTTPModel, modelName: toolUsageEvidenceHTTPModel}, responsesRequest: envelope.Projection, rawEnvelope: envelope, operation: responsesOperationCreate}
 					var apiErr *types.OpenAIErrorWithStatusCode
 					defer func() {
 						recovered := recover()

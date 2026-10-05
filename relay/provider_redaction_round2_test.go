@@ -73,7 +73,7 @@ func TestProviderRedactionRealOpenAITranscriptionJSON(t *testing.T) {
 	oldClient := requester.HTTPClient
 	requester.HTTPClient = upstream.Client()
 	defer func() { requester.HTTPClient = oldClient }()
-	c := issue047RelayTranscriptionContext(t, false)
+	c := transcriptionFormatRelayTranscriptionContext(t, false)
 	proxy := ""
 	p := openai.CreateOpenAIProvider(&model.Channel{Type: config.ChannelTypeOpenAI, Key: secret, Proxy: &proxy}, upstream.URL)
 	p.SetContext(c)
@@ -83,7 +83,7 @@ func TestProviderRedactionRealOpenAITranscriptionJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.provider = p
-	r.modelName = issue047RelayModel
+	r.modelName = transcriptionFormatRelayModel
 	if err, _ := r.send(); err != nil {
 		t.Fatal(err)
 	}
