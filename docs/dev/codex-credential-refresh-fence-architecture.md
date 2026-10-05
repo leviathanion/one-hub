@@ -11,9 +11,9 @@ lastUpdated: true
 
 - 状态：当前实现；生产数据库升级需按本文停机步骤执行。
 - 适用范围：Codex OAuth 普通、自动与 forced refresh，凭证数据库提交、渠道编辑与生命周期；当前部署为单机。
-- 当前实现：`common/credentials` 统一管理刷新协议，渠道只提供 `bizdata + version` 持久化能力。没有旧字段运行时兼容、Redis 刷新锁、内存 pending journal 或 DB-less 提交适配。
+- 当前实现：`common/credentials` 统一管理刷新协议，渠道只提供 `internal_state + version` 持久化能力。没有旧字段运行时兼容、Redis 刷新锁、内存 pending journal 或 DB-less 提交适配。
 - 设计取向：用非 secret、无 TTL 的数据库标记记录不可逆调用；不确定故障保留标记，接受同账号独立 OAuth 授权恢复。
-- 关联代码：`common/credentials/rotation.go`、`common/credentials/state.go`、`model/channel_snapshot.go`、`model/channel_bizdata_migration.go`、`providers/codex/base.go`、`controller/codex_oauth.go`。
+- 关联代码：`common/credentials/rotation.go`、`common/credentials/state.go`、`model/channel_snapshot.go`、`model/channel_internal_state_migration.go`、`providers/codex/base.go`、`controller/codex_oauth.go`。
 
 ## 已选型结论
 
@@ -21,7 +21,7 @@ lastUpdated: true
 
 核心不变量只有一句：
 
-> `bizdata.credentials.refresh` 存在，表示当前 durable refresh token 可能已经被上游消费；其他 attempt 不得再次用它发起 OAuth refresh。
+> `internal_state.credentials.refresh` 存在，表示当前 durable refresh token 可能已经被上游消费；其他 attempt 不得再次用它发起 OAuth refresh。
 
 数据库 fence 不是普通互斥锁：锁回答“当前谁在工作”，fence 记录“一个不可逆动作是否可能已经发生”。锁可以超时，fence 只能由同一 attempt 的安全终态或独立授权恢复解除。
 
@@ -152,7 +152,7 @@ Claim 写入回执丢失时必须 reload，确认行仍存活、类型匹配且�
 
 ### 3. Fence has no TTL
 
-时间流逝不会让 one-time token 重新安全。`bizdata.credentials.refresh.started_at` 只用于观测和告警，不参与自动回收。
+时间流逝不会让 one-time token 重新安全。`internal_state.credentials.refresh.started_at` 只用于观测和告警，不参与自动回收。
 
 ### 4. Attempt-scoped mutation
 
@@ -174,18 +174,18 @@ Commit 或 Cancel 每次读取最新快照，确认渠道存活、类型匹配�
 
 ## 数据模型
 
-渠道持久化采用 `key + other + bizdata + version`：
+渠道持久化采用 `key + other + internal_state + version`：
 
 | 字段 | 责任 | 写入者 |
 | --- | --- | --- |
 | `key` | 唯一凭证事实来源，支持直接输入 key 与 OAuth | 管理编辑、凭证服务 |
 | `other` | 可编辑、复制、按标签同步的连接配置 | 管理编辑、配置同步 |
-| `bizdata` | 按业务命名空间组织的服务端内部状态 | 业务服务，经数据库 CAS |
+| `internal_state` | 按业务命名空间组织的服务端内部状态 | 业务服务，经数据库 CAS |
 | `version` | 配置、凭证、内部状态和生命周期的并发版本 | 数据库原子递增 |
 
 ```go
-BizData datatypes.JSON `json:"-" gorm:"column:bizdata;type:json"`
-Version uint64         `json:"version" gorm:"not null;default:0"`
+InternalState datatypes.JSON `json:"-" gorm:"column:internal_state;type:json"`
+Version       uint64         `json:"version" gorm:"not null;default:0"`
 ```
 
 凭证模块仅拥有以下 JSON 路径，静态 key 无需刷新状态：
@@ -204,15 +204,15 @@ Version uint64         `json:"version" gorm:"not null;default:0"`
 - 完成后删除 `credentials.refresh`，空命名空间随之移除；未知命名空间及兄弟字段原样保留。
 - 只保存 nonce 和观测时间，不重复保存 token；每个渠道只有一个未决标记，没有历史列表和自动清理 TTL。
 - `other` 参与管理表单、复制和标签同步，不能放入会被这些操作复制或清除的运行状态。
-- `bizdata` 不参与普通 JSON/导出、复制或标签同步，不接受管理请求提交。新建、复制和标签新增渠道从空业务状态、版本 0 开始。
+- `internal_state` 不参与普通 JSON/导出、复制或标签同步，不接受管理请求提交。新建、复制和标签新增渠道从空业务状态、版本 0 开始。
 - 使用现有 GORM JSON 类型，数据库 CAS 更新整段 JSON，不依赖数据库特定 JSON 路径语法。
 - 删除旧的 `credential_revision`、`credential_refresh_fence`、`credential_refresh_started_at` 三列，迁移保留原版本与未决状态。
 
-将来其他 OAuth provider 可复用凭证模块；独立业务可拥有自己的命名空间。需要索引、唯一约束、历史或独立生命周期时再设计关系表，不把所有业务都塞进 JSON。
+当前只有 Codex 凭证刷新使用 `internal_state`，其他 OAuth provider 可以复用同一凭证模块。字段表示随渠道持久化、由服务端维护的内部状态；未来业务只有满足相同归属和生命周期约束时，才可增加自己的命名空间。需要索引、唯一约束、历史或独立生命周期时再设计关系表，不把所有业务都塞进 JSON。
 
 ### 为什么不用单独 fence 表
 
-刷新状态与 credential authority 同属渠道行，可以一次 CAS 原子更新 `key + bizdata + version`。单独表会增加跨表事务、软删除清理和生命周期协调，当前单个未决标记没有这些额外成本所换取的查询或生命周期收益。业务规则由凭证服务拥有，通用数据库表不需要 Codex 专属列。
+刷新状态与 credential authority 同属渠道行，可以一次 CAS 原子更新 `key + internal_state + version`。单独表会增加跨表事务、软删除清理和生命周期协调，当前单个未决标记没有这些额外成本所换取的查询或生命周期收益。业务规则由凭证服务拥有，通用数据库表不需要 Codex 专属列。
 
 ### 为什么不用 credential envelope 覆盖 `Channel.Key`
 
@@ -231,7 +231,7 @@ type Ticket struct {
 }
 ```
 
-凭证服务通过 `Store.Load` 获取包含 key、类型、版本、业务数据和删除状态的快照，通过 `Store.CompareAndSwap` 执行原子写入。接口不认识 Codex、JWT 或 OAuth 端点。
+凭证服务通过 `Store.Load` 获取包含 key、类型、版本、内部状态和删除状态的快照，通过 `Store.CompareAndSwap` 执行原子写入。接口不认识 Codex、JWT 或 OAuth 端点。
 
 Claim 返回 `ClaimAcquired / ClaimBusy / ClaimSuperseded`；Commit 返回 `CommitApplied / CommitAlreadyApplied / CommitSuperseded / CommitStillFenced`。数据库错误单独返回，不能把未知结果压成成功或普通冲突。
 
@@ -243,7 +243,7 @@ provider 先读取权威凭证并确认渠道类型。凭证服务检查原版�
 
 ```sql
 UPDATE channels
-SET bizdata = :updated_bizdata,
+SET internal_state = :updated_internal_state,
     version = version + 1
 WHERE id = :channel_id
   AND version = :expected_version
@@ -289,12 +289,12 @@ Ambiguous              请求可能发送，但无法证明是否消费或无法
 
 ## Commit 协议
 
-拿到完整 `K1` 后，凭证服务读取最新行并确认原 attempt 所有权；删除自己的刷新标记、保留其他业务数据，然后执行：
+拿到完整 `K1` 后，凭证服务读取最新行并确认原 attempt 所有权；删除自己的刷新标记、保留其他内部状态，然后执行：
 
 ```sql
 UPDATE channels
 SET key = :rotated_key,
-    bizdata = :updated_bizdata,
+    internal_state = :updated_internal_state,
     version = version + 1
 WHERE id = :channel_id
   AND version = :latest_version
@@ -325,7 +325,7 @@ WHERE id = :channel_id
 
 ```sql
 UPDATE channels
-SET bizdata = :updated_bizdata,
+SET internal_state = :updated_internal_state,
     version = version + 1
 WHERE id = :channel_id
   AND version = :latest_version
@@ -345,7 +345,7 @@ Cancel 同样推进版本，因为内部业务状态发生了变化。CAS 竞争
 ```text
 原始授权快照 CAS
     -> key = 新授权凭证
-    -> 删除原 attempt 的 refresh 标记，保留其他 bizdata
+    -> 删除原 attempt 的 refresh 标记，保留其他 internal_state
     -> version++
 ```
 
@@ -366,7 +366,7 @@ Cancel 同样推进版本，因为内部业务状态发生了变化。CAS 竞争
 
 ### 普通 channel 更新
 
-配置、名称、分组、模型、状态、优先级、权重、标签等管理修改都推进 `version`，不写凭证业务数据。余额、用量、测速等统计走独立指定列或原子增量更新，不推进此版本。
+配置、名称、分组、模型、状态、优先级、权重、标签等管理修改都推进 `version`，不写凭证内部状态。余额、用量、测速等统计走独立指定列或原子增量更新，不推进此版本。
 
 - 单渠道 GET 返回 `version`；编辑和列表快捷操作必须提交打开时的 `expected_version`。
 - 标签 GET 返回成员版本 `versions`；提交 `expected_versions`，成员集合或任何成员版本冲突均整批回滚。
@@ -399,7 +399,7 @@ local channel mutex
 
 ### `model`
 
-`model.ChannelCredentialStore`（`channel_snapshot.go`）只提供权威读取和存活行的 `id/version` CAS，一次写入原子更新 bizdata、可选 key 和 version；含凭证的 SQL 禁止日志输出。
+`model.ChannelCredentialStore`（`channel_snapshot.go`）只提供权威读取和存活行的 `id/version` CAS，一次写入原子更新 internal_state、可选 key 和 version；含凭证的 SQL 禁止日志输出。
 
 管理编辑由 model 处理白名单、版本和事务，调用通用凭证策略检查未决状态。Codex JWT、账号解析和 OAuth 编排不进入通用持久化层。
 
@@ -411,7 +411,7 @@ local channel mutex
 
 ### `controller`
 
-处理管理编辑版本协议和 OAuth 授权会话。独立授权固定原渠道快照，完成账号校验后提交恢复；不暴露 clear-fence endpoint，也不接受普通请求直接修改 bizdata。
+处理管理编辑版本协议和 OAuth 授权会话。独立授权固定原渠道快照，完成账号校验后提交恢复；不暴露 clear-fence endpoint，也不接受普通请求直接修改 internal_state。
 
 ### `cron` 与节点角色
 
@@ -469,7 +469,7 @@ codex_credential_rotation_unresolved_total{reason}
 
 日志不输出 key、access token、refresh token 或上游 body secret，凭证 SQL 同样禁止泄漏参数。
 
-`started_at` 用于区分近期操作与长期未决状态，不能触发自动清理。bizdata 不在普通渠道 JSON 中暴露；未来增加管理展示时应提供经过筛选的状态，而非直接公开内部 JSON。
+`started_at` 用于区分近期操作与长期未决状态，不能触发自动清理。internal_state 不在普通渠道 JSON 中暴露；未来增加管理展示时应提供经过筛选的状态，而非直接公开内部 JSON。
 
 ### 恢复动作
 
@@ -504,7 +504,7 @@ codex_credential_rotation_unresolved_total{reason}
 
 ### Phase 1：Schema 与 persistence primitives
 
-1. 验证 `bizdata/version`、通用凭证服务、CAS 与离线迁移测试，准备配套前后端产物。
+1. 验证 `internal_state/version`、通用凭证服务、CAS 与离线迁移测试，准备配套前后端产物。
 2. 停止整个旧实例及后台任务，备份完整数据库和旧程序。SQLite 备份必须包含一致的数据库状态，不能遗漏尚在 WAL 中的数据。
 3. 不手动清理旧 fence；已有未决状态必须被迁移保留。
 
@@ -516,7 +516,7 @@ codex_credential_rotation_unresolved_total{reason}
 
 ### Phase 3：协调启用
 
-1. 启动新实例，迁移 `202610030001` 在渠道 AutoMigrate 前执行，增加 `bizdata/version`。
+1. 启动新实例，迁移 `202610030001` 在渠道 AutoMigrate 前执行，增加 `internal_state/version`。
 2. 按批转换全部渠道，包括软删除行；搬迁旧 revision、attempt 和 started-at，保留未知业务命名空间。
 3. 回填事务提交后依次 DROP 旧 timestamp、fence、revision 三列。
 4. MySQL DDL 可能隐式提交，迁移支持中断后重启继续；这只是迁移恢复，不是业务兼容。
@@ -580,7 +580,7 @@ codex_credential_rotation_unresolved_total{reason}
 ### 安全与观测
 
 - fence/metrics/logs 不包含 credential secret。
-- API channel JSON 不暴露 bizdata；version 公开用于编辑 CAS。
+- API channel JSON 不暴露 internal_state；version 公开用于编辑 CAS。
 - 不存在普通 clear-fence endpoint。
 - unresolved fence 的年龄不会触发自动清理。
 
@@ -601,7 +601,7 @@ codex_credential_rotation_unresolved_total{reason}
 - 每次真实 refresh 增加一次 DB CAS；
 - DB 不可写时不允许自动 refresh；
 - 发布必须协调升级，不能让旧节点继续执行 refresh；
-- channel schema 使用两个通用字段 bizdata/version，替换三个专属字段；配置编辑与自动凭证写入竞争时，旧表单会收到版本冲突。
+- channel schema 使用两个通用字段 internal_state/version，替换三个专属字段；配置编辑与自动凭证写入竞争时，旧表单会收到版本冲突。
 
 ### 为什么这是当前甜蜜点
 

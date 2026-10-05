@@ -158,7 +158,7 @@ func TestCodexOAuthRecoversOnlyOriginalCredentialSnapshot(t *testing.T) {
 			case "revision_changed":
 				mutate(map[string]any{"version": 2})
 			case "fence_changed":
-				mutate(map[string]any{"bizdata": `{"credentials":{"refresh":{"attempt_id":"other-fence"}}}`})
+				mutate(map[string]any{"internal_state": `{"credentials":{"refresh":{"attempt_id":"other-fence"}}}`})
 			}
 			before, err := loadRotationTestSnapshot(t.Context(), channel.Id)
 			if err != nil {
@@ -309,7 +309,7 @@ func TestCodexOAuthConcurrentRecovery(t *testing.T) {
 			sqlDB.SetMaxOpenConns(1)
 			t.Cleanup(func() { _ = sqlDB.Close() })
 			fence := "oauth-recovery-concurrent-unresolved"
-			channel := &model.Channel{Type: config.ChannelTypeCodex, Key: `{"access_token":"old","refresh_token":"old-refresh","account_id":"account-a"}`, BizData: rotationTestData(&fence, nil)}
+			channel := &model.Channel{Type: config.ChannelTypeCodex, Key: `{"access_token":"old","refresh_token":"old-refresh","account_id":"account-a"}`, InternalState: rotationTestData(&fence, nil)}
 			if err := model.DB.Create(channel).Error; err != nil {
 				t.Fatal(err)
 			}
@@ -439,7 +439,7 @@ func TestCodexOAuthStateConsumedExactlyOnceThroughRealRedis(t *testing.T) {
 	})
 
 	fence := "oauth-recovery-redis-unresolved"
-	channel := &model.Channel{Type: config.ChannelTypeCodex, Key: `{"access_token":"redis-old-access","refresh_token":"redis-old-refresh","account_id":"account-a"}`, BizData: rotationTestData(&fence, nil)}
+	channel := &model.Channel{Type: config.ChannelTypeCodex, Key: `{"access_token":"redis-old-access","refresh_token":"redis-old-refresh","account_id":"account-a"}`, InternalState: rotationTestData(&fence, nil)}
 	if err := model.DB.Create(channel).Error; err != nil {
 		t.Fatal(err)
 	}

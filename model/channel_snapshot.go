@@ -24,7 +24,7 @@ func (ChannelCredentialStore) Load(ctx context.Context, id int) (credentials.Sna
 	if err != nil {
 		return credentials.Snapshot{}, err
 	}
-	return credentials.Snapshot{ChannelID: row.Id, Type: row.Type, Key: row.Key, Version: row.Version, BizData: row.BizData, Deleted: row.DeletedAt.Valid}, nil
+	return credentials.Snapshot{ChannelID: row.Id, Type: row.Type, Key: row.Key, Version: row.Version, InternalState: row.InternalState, Deleted: row.DeletedAt.Valid}, nil
 }
 
 func (ChannelCredentialStore) CompareAndSwap(ctx context.Context, expected credentials.Snapshot, data []byte, key *string) (bool, error) {
@@ -34,7 +34,7 @@ func (ChannelCredentialStore) CompareAndSwap(ctx context.Context, expected crede
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	updates := map[string]any{"bizdata": datatypes.JSON(data), "version": gorm.Expr("version + 1")}
+	updates := map[string]any{"internal_state": datatypes.JSON(data), "version": gorm.Expr("version + 1")}
 	if key != nil {
 		updates["key"] = *key
 	}

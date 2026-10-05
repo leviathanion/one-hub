@@ -250,7 +250,7 @@ func buildChannelTagMember(channelTag *ChannelTagCollection, key string, name st
 	addChannel.Name = name
 	addChannel.Key = key
 	addChannel.Version = 0
-	addChannel.BizData = nil
+	addChannel.InternalState = nil
 	addChannel.Balance = 0
 	addChannel.BalanceUpdatedTime = 0
 	addChannel.UsedQuota = 0

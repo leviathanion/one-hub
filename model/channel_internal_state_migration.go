@@ -12,7 +12,7 @@ import (
 
 // This is an offline, one-way migration, never a runtime compatibility path.
 // Backfill commits before destructive DDL so interrupted MySQL DDL can resume.
-func migrateChannelBusinessData() *gormigrate.Migration {
+func migrateChannelInternalState() *gormigrate.Migration {
 	return &gormigrate.Migration{ID: "202610030001", Migrate: func(db *gorm.DB) error {
 		names, err := databaseColumnNames(db, "channels")
 		if err != nil || names == nil {
@@ -21,13 +21,13 @@ func migrateChannelBusinessData() *gormigrate.Migration {
 		columns := []string{"credential_revision", "credential_refresh_fence", "credential_refresh_started_at"}
 		present := func(name string) bool { return names[projectionIdentifierKey(db.Dialector.Name(), name)] }
 		if err := addStartupMigrationColumns(db, "channels", &struct {
-			Version uint64         `gorm:"not null;default:0"`
-			BizData datatypes.JSON `gorm:"column:bizdata;type:json"`
+			Version       uint64         `gorm:"not null;default:0"`
+			InternalState datatypes.JSON `gorm:"column:internal_state;type:json"`
 		}{}); err != nil {
 			return err
 		}
 		if err := db.Transaction(func(tx *gorm.DB) error {
-			selection := []string{"id", "version", "bizdata"}
+			selection := []string{"id", "version", "internal_state"}
 			for _, column := range columns {
 				if present(column) {
 					selection = append(selection, column)
@@ -38,7 +38,7 @@ func migrateChannelBusinessData() *gormigrate.Migration {
 				var rows []struct {
 					ID                         int
 					Version                    uint64
-					BizData                    datatypes.JSON `gorm:"column:bizdata"`
+					InternalState              datatypes.JSON `gorm:"column:internal_state"`
 					CredentialRevision         uint64
 					CredentialRefreshFence     *string
 					CredentialRefreshStartedAt *int64
@@ -51,7 +51,7 @@ func migrateChannelBusinessData() *gormigrate.Migration {
 				}
 				for _, row := range rows {
 					lastID = row.ID
-					refresh, err := credentials.ReadRefresh(row.BizData)
+					refresh, err := credentials.ReadRefresh(row.InternalState)
 					if err != nil {
 						return fmt.Errorf("channel %d: %w", row.ID, err)
 					}
@@ -66,12 +66,12 @@ func migrateChannelBusinessData() *gormigrate.Migration {
 							refresh.StartedAt = *row.CredentialRefreshStartedAt
 						}
 					}
-					data, err := credentials.WriteRefresh(row.BizData, refresh)
+					data, err := credentials.WriteRefresh(row.InternalState, refresh)
 					if err != nil {
 						return fmt.Errorf("channel %d: %w", row.ID, err)
 					}
 					version := max(row.Version, row.CredentialRevision)
-					if err := tx.Table("channels").Where("id = ?", row.ID).Updates(map[string]any{"version": version, "bizdata": datatypes.JSON(data)}).Error; err != nil {
+					if err := tx.Table("channels").Where("id = ?", row.ID).Updates(map[string]any{"version": version, "internal_state": datatypes.JSON(data)}).Error; err != nil {
 						return err
 					}
 				}

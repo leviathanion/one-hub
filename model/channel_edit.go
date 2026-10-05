@@ -22,8 +22,8 @@ func (request *ChannelEditRequest) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &request.SubmittedFields); err != nil {
 		return err
 	}
-	if _, exists := request.SubmittedFields["bizdata"]; exists {
-		return errors.New("bizdata is server-owned")
+	if _, exists := request.SubmittedFields["internal_state"]; exists {
+		return errors.New("internal_state is server-owned")
 	}
 	if raw, ok := request.SubmittedFields["expected_version"]; ok {
 		return json.Unmarshal(raw, &request.ExpectedVersion)

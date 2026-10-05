@@ -129,7 +129,7 @@ func runCredentialSQLLogWindow(t *testing.T, db *gorm.DB, level gormlogger.LogLe
 			if err != nil {
 				return err
 			}
-			updated, err := testRotation().Store.CompareAndSwap(context.Background(), row, row.BizData, &newKey)
+			updated, err := testRotation().Store.CompareAndSwap(context.Background(), row, row.InternalState, &newKey)
 			if err != nil {
 				return err
 			}

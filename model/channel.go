@@ -54,9 +54,10 @@ type Channel struct {
 	Plugin    *datatypes.JSONType[PluginType] `json:"plugin" form:"plugin" gorm:"type:json" tag_config:"sync"`
 	DeletedAt gorm.DeletedAt                  `json:"-" gorm:"index"`
 
-	// Version protects configuration, credentials and business data, not telemetry.
-	Version uint64         `json:"version" gorm:"not null;default:0"`
-	BizData datatypes.JSON `json:"-" gorm:"column:bizdata;type:json"`
+	// Version protects configuration, credentials and internal state, not telemetry.
+	Version uint64 `json:"version" gorm:"not null;default:0"`
+	// InternalState is server-owned persistent state; never copy it with configuration.
+	InternalState datatypes.JSON `json:"-" gorm:"column:internal_state;type:json"`
 
 	parsedModelMapping    map[string]string          `json:"-" gorm:"-"`
 	parsedModelHeaders    map[string]string          `json:"-" gorm:"-"`
@@ -448,7 +449,7 @@ func BatchDeleteChannel(ids []int) (int64, error) {
 func BatchInsertChannels(channels []Channel) error {
 	for i := range channels {
 		channels[i].Version = 0
-		channels[i].BizData = nil
+		channels[i].InternalState = nil
 		if err := channels[i].CanonicalizeRuntimeConfigJSON(); err != nil {
 			return err
 		}
@@ -774,7 +775,7 @@ func (channel *Channel) ParseRuntimeConfig() {
 
 func (channel *Channel) Insert() error {
 	channel.Version = 0
-	channel.BizData = nil
+	channel.InternalState = nil
 	if err := channel.CanonicalizeRuntimeConfigJSON(); err != nil {
 		return err
 	}

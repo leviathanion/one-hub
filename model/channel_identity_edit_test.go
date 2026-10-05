@@ -113,7 +113,7 @@ func TestChannelAdminTagEditRollsBackOnCredentialFence(t *testing.T) {
 	for _, id := range []int{1, 2} {
 		insertTestChannel(t, &Channel{Id: id, Type: config.ChannelTypeOpenAI, Key: "key", Tag: "team", BaseURL: stringPtr("https://old.example")})
 	}
-	if err := DB.Model(&Channel{}).Where("id = 2").Update("bizdata", `{"credentials":{"refresh":{"attempt_id":"pending"}}}`).Error; err != nil {
+	if err := DB.Model(&Channel{}).Where("id = 2").Update("internal_state", `{"credentials":{"refresh":{"attempt_id":"pending"}}}`).Error; err != nil {
 		t.Fatal(err)
 	}
 	fields := ChannelTagSubmittedFields{"base_url": {}, "models": {}}

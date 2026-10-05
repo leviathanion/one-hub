@@ -27,7 +27,7 @@ func TestCodexOAuthReauthorizationPreservesAccountAndCredentialVersion(t *testin
 			channel := model.Channel{Type: config.ChannelTypeCodex, Key: key}
 			if scenario == "existing-fence" {
 				fence := "unresolved-at-start"
-				channel.BizData = rotationTestData(&fence, nil)
+				channel.InternalState = rotationTestData(&fence, nil)
 			}
 			if err := model.DB.Create(&channel).Error; err != nil {
 				t.Fatal(err)

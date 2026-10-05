@@ -754,7 +754,7 @@ func (p *CodexProvider) rotateOnce(ctx context.Context, lead time.Duration, forc
 		p.Credentials = rotated
 		return true, nil
 	}
-	refresh, stateErr := credentials.ReadRefresh(channel.BizData)
+	refresh, stateErr := credentials.ReadRefresh(channel.InternalState)
 	if stateErr != nil {
 		return false, stateErr
 	}

@@ -102,7 +102,7 @@ func TestOAuthCompareAndSetPreservesUsageGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := "oauth-rotated-key"
-	updated, err := testRotation().Store.CompareAndSwap(context.Background(), snapshot, snapshot.BizData, &key)
+	updated, err := testRotation().Store.CompareAndSwap(context.Background(), snapshot, snapshot.InternalState, &key)
 	if err != nil || !updated {
 		t.Fatalf("OAuth CAS failed: updated=%v err=%v", updated, err)
 	}

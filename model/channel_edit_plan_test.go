@@ -47,7 +47,7 @@ func TestChannelMetadataEditDoesNotOverwriteConcurrentRotation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if persisted.Key != "credential-b" || persisted.Version != 2 || len(persisted.BizData) > 2 || persisted.Name == "updated-name" {
+	if persisted.Key != "credential-b" || persisted.Version != 2 || len(persisted.InternalState) > 2 || persisted.Name == "updated-name" {
 		t.Fatalf("metadata edit changed rotated credentials: %+v", persisted)
 	}
 }
@@ -73,7 +73,7 @@ func TestChannelEditWhitelistSupportsZeroValues(t *testing.T) {
 	if err := request.Update(); err != nil {
 		t.Fatal(err)
 	}
-	for _, forbidden := range []string{"key", "bizdata", "type", "base_url", "used_quota", "created_time", "test_time", "balance"} {
+	for _, forbidden := range []string{"key", "internal_state", "type", "base_url", "used_quota", "created_time", "test_time", "balance"} {
 		if strings.Contains(updateSQL, "`"+forbidden+"`") {
 			t.Errorf("ordinary SQL contains %s: %s", forbidden, updateSQL)
 		}
@@ -228,7 +228,7 @@ func TestChannelTagMetadataPreservesRefreshedMemberAndRejectsOldKeyList(t *testi
 	if err := DB.Unscoped().Where("tag = ?", "refresh-team").Find(&members).Error; err != nil {
 		t.Fatal(err)
 	}
-	if len(members) != 1 || members[0].Id != channel.Id || members[0].DeletedAt.Valid || members[0].Key != "credential-b" || members[0].Version != 3 || len(members[0].BizData) > 2 || members[0].Models != "new-model" {
+	if len(members) != 1 || members[0].Id != channel.Id || members[0].DeletedAt.Valid || members[0].Key != "credential-b" || members[0].Version != 3 || len(members[0].InternalState) > 2 || members[0].Models != "new-model" {
 		t.Fatalf("tag metadata replaced a refreshed member: %+v", members)
 	}
 }
@@ -244,7 +244,7 @@ func TestAddChannelToTagStartsIndependentCredentialLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if added.Id == 32017 || added.Version != 0 || len(added.BizData) > 2 {
+	if added.Id == 32017 || added.Version != 0 || len(added.InternalState) > 2 {
 		t.Fatalf("new member inherited another channel's credential lifecycle: %+v", added)
 	}
 	original, err := loadRotationTestSnapshot(context.Background(), 32017)

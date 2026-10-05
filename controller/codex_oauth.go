@@ -91,7 +91,7 @@ func StartCodexOAuth(c *gin.Context) {
 			return
 		}
 		stateData.Version = channel.Version
-		refresh, err := credentials.ReadRefresh(channel.BizData)
+		refresh, err := credentials.ReadRefresh(channel.InternalState)
 		if err != nil {
 			common.APIRespondWithError(c, http.StatusOK, err)
 			return

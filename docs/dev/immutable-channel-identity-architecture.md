@@ -40,7 +40,7 @@ lastUpdated: true
 
 已有请求仍按实际执行事实结算；编辑不重写已有资源 ID、计费 owner 或历史用量。不因后续资源访问失败增加自动切渠道或提交后的重试。普通资源透传要求启用渠道，owner 专用路径保留已有停用/软删除读取行为。
 
-身份确认交互不补造历史身份，也不执行旧方案中的 verified/legacy_unverified 迁移。凭证状态采用 `bizdata`、并发控制采用 `version`，一次性停机迁移见 [凭证刷新与业务数据方案](codex-credential-refresh-fence-architecture.md)。以后若产品要承诺跨账号编辑不影响存量资源，需要另行设计真实的归属和迁移能力；弹窗不能提供该保证。
+身份确认交互不补造历史身份，也不执行旧方案中的 verified/legacy_unverified 迁移。凭证状态采用 `internal_state`、并发控制采用 `version`，一次性停机迁移见 [凭证刷新与内部状态方案](codex-credential-refresh-fence-architecture.md)。以后若产品要承诺跨账号编辑不影响存量资源，需要另行设计真实的归属和迁移能力；弹窗不能提供该保证。
 
 ## 验证
 

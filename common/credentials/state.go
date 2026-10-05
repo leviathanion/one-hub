@@ -20,7 +20,7 @@ func object(raw []byte) (map[string]json.RawMessage, error) {
 	}
 	var value map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &value); err != nil || value == nil {
-		return nil, errors.New("invalid channel business data")
+		return nil, errors.New("invalid channel internal state")
 	}
 	return value, nil
 }

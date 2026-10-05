@@ -23,7 +23,7 @@ func prepareChannelIdentityEdit(persisted, candidate *Channel, allowIdentityChan
 	if candidate.Key != persisted.Key && strings.TrimSpace(candidate.Key) == "" {
 		return false, errors.New("渠道凭据不能为空；保留原凭据时请不要提交 key")
 	}
-	if err := credentials.RequireEditable(persisted.BizData); err != nil {
+	if err := credentials.RequireEditable(persisted.InternalState); err != nil {
 		return false, err
 	}
 	return true, nil

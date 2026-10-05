@@ -89,8 +89,8 @@ func UpdateChannelsTag(c *gin.Context) {
 		common.APIRespondWithError(c, http.StatusOK, errors.New("expected_versions is required"))
 		return
 	}
-	if _, ok := submittedFields["bizdata"]; ok {
-		common.APIRespondWithError(c, http.StatusOK, errors.New("bizdata is server-owned"))
+	if _, ok := submittedFields["internal_state"]; ok {
+		common.APIRespondWithError(c, http.StatusOK, errors.New("internal_state is server-owned"))
 		return
 	}
 	err = model.UpdateChannelsTagWithSubmittedFields(tag, &request.Channel, submittedFields, model.ChannelUpdateOptions{AllowIdentityChange: true, ExpectedVersions: request.ExpectedVersions})

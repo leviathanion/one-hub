@@ -18,7 +18,7 @@ func TestChannelEditAPIVersionConflictPreservesStoredConfiguration(t *testing.T)
 	if err := model.DB.Create(&model.Channel{Id: 35001, Type: config.ChannelTypeOpenAI, Key: "secret", Name: "current", Version: 3}).Error; err != nil {
 		t.Fatal(err)
 	}
-	for _, raw := range []string{`{"id":35001,"name":"stale","expected_version":2}`, `{"id":35001,"name":"missing"}`, `{"id":35001,"expected_version":3,"bizdata":{}}`} {
+	for _, raw := range []string{`{"id":35001,"name":"stale","expected_version":2}`, `{"id":35001,"name":"missing"}`, `{"id":35001,"expected_version":3,"internal_state":{}}`} {
 		ctx, response := commonTest.GetContext(http.MethodPut, "/api/channel/", commonTest.RequestJSONConfig(), bytes.NewBufferString(raw))
 		UpdateChannel(ctx)
 		var result struct {
@@ -32,7 +32,7 @@ func TestChannelEditAPIVersionConflictPreservesStoredConfiguration(t *testing.T)
 		}
 	}
 	row, err := model.GetChannelById(35001)
-	if err != nil || row.Name != "current" || row.Version != 3 || len(row.BizData) != 0 {
+	if err != nil || row.Name != "current" || row.Version != 3 || len(row.InternalState) != 0 {
 		t.Fatal("rejected edit changed channel")
 	}
 }

@@ -36,7 +36,7 @@ func (s *memoryStore) CompareAndSwap(_ context.Context, expected Snapshot, data 
 	if s.row.Version != expected.Version || s.row.Deleted {
 		return false, nil
 	}
-	s.row.BizData = data
+	s.row.InternalState = data
 	s.row.Version++
 	if key != nil {
 		s.row.Key = *key
@@ -47,7 +47,7 @@ func (s *memoryStore) CompareAndSwap(_ context.Context, expected Snapshot, data 
 	return true, nil
 }
 func setupRotation() (*memoryStore, Service, Ticket) {
-	store := &memoryStore{row: Snapshot{ChannelID: 1, Type: 99, Key: "old", BizData: []byte(`{"vendor":{"future":true},"credentials":{"other":42}}`)}}
+	store := &memoryStore{row: Snapshot{ChannelID: 1, Type: 99, Key: "old", InternalState: []byte(`{"vendor":{"future":true},"credentials":{"other":42}}`)}}
 	return store, Service{Store: store}, Ticket{ChannelID: 1, Type: 99, AttemptID: "unique-attempt"}
 }
 func TestRotationResolvesLostDatabaseAcknowledgements(t *testing.T) {
@@ -63,11 +63,11 @@ func TestRotationResolvesLostDatabaseAcknowledgements(t *testing.T) {
 		t.Fatal("lost response caused extra mutation")
 	}
 	var data map[string]json.RawMessage
-	if err := json.Unmarshal(store.row.BizData, &data); err != nil {
+	if err := json.Unmarshal(store.row.InternalState, &data); err != nil {
 		t.Fatal(err)
 	}
 	if string(data["vendor"]) != `{"future":true}` || string(data["credentials"]) != `{"other":42}` {
-		t.Fatal("unrelated business data lost")
+		t.Fatal("unrelated internal state lost")
 	}
 }
 
@@ -94,9 +94,9 @@ func TestCommitRebasesOnlyWhileItOwnsTheOperation(t *testing.T) {
 			store.before = func(s *memoryStore) {
 				s.row.Version++
 				if supersede {
-					s.row.BizData, _ = WriteRefresh(s.row.BizData, &Refresh{AttemptID: "another"})
+					s.row.InternalState, _ = WriteRefresh(s.row.InternalState, &Refresh{AttemptID: "another"})
 				} else {
-					s.row.BizData = []byte(`{"vendor":{"changed":true},"credentials":{"refresh":{"attempt_id":"unique-attempt","started_at":1}}}`)
+					s.row.InternalState = []byte(`{"vendor":{"changed":true},"credentials":{"refresh":{"attempt_id":"unique-attempt","started_at":1}}}`)
 				}
 			}
 			outcome, err := service.Commit(t.Context(), ticket, "new")
@@ -108,7 +108,7 @@ func TestCommitRebasesOnlyWhileItOwnsTheOperation(t *testing.T) {
 					t.Fatal("stale owner committed")
 				}
 			} else {
-				if outcome != CommitApplied || store.row.Key != "new" || string(store.row.BizData) != `{"vendor":{"changed":true}}` {
+				if outcome != CommitApplied || store.row.Key != "new" || string(store.row.InternalState) != `{"vendor":{"changed":true}}` {
 					t.Fatal("metadata change lost")
 				}
 			}
@@ -124,7 +124,7 @@ func TestFailedCommitKeepsDurableClaim(t *testing.T) {
 	if outcome, err := service.Commit(t.Context(), ticket, "new"); err == nil || outcome != CommitStillFenced {
 		t.Fatalf("outcome=%v err=%v", outcome, err)
 	}
-	refresh, err := ReadRefresh(store.row.BizData)
+	refresh, err := ReadRefresh(store.row.InternalState)
 	if err != nil || refresh == nil || refresh.AttemptID != ticket.AttemptID || store.row.Key != "old" {
 		t.Fatal("unresolved operation was cleared")
 	}

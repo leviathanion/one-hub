@@ -62,7 +62,7 @@ func TestCredentialRecoveryInvalidatesOldAttempt(t *testing.T) {
 
 func TestCredentialCommitPreservesConcurrentMetadataAndNamespaces(t *testing.T) {
 	useTestChannelDB(t)
-	row := Channel{Id: 33002, Type: config.ChannelTypeCodex, Key: "old", BizData: []byte(`{"vendor":{"x":1},"credentials":{"extension":true}}`)}
+	row := Channel{Id: 33002, Type: config.ChannelTypeCodex, Key: "old", InternalState: []byte(`{"vendor":{"x":1},"credentials":{"extension":true}}`)}
 	if err := DB.Create(&row).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -80,8 +80,8 @@ func TestCredentialCommitPreservesConcurrentMetadataAndNamespaces(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if saved.Key != "new" || saved.Name != "updated" || saved.Version != 3 || string(saved.BizData) != `{"credentials":{"extension":true},"vendor":{"x":1}}` {
-		t.Fatalf("unexpected snapshot: version=%d bizdata=%s", saved.Version, saved.BizData)
+	if saved.Key != "new" || saved.Name != "updated" || saved.Version != 3 || string(saved.InternalState) != `{"credentials":{"extension":true},"vendor":{"x":1}}` {
+		t.Fatalf("unexpected snapshot: version=%d internal_state=%s", saved.Version, saved.InternalState)
 	}
 }
 

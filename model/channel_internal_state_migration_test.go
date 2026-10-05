@@ -13,7 +13,7 @@ import (
 	"gorm.io/gorm"
 )
 
-func TestChannelBusinessDataOfflineMigration(t *testing.T) {
+func TestChannelInternalStateOfflineMigration(t *testing.T) {
 	forEachTestDatabase(t, func(t *testing.T, db *gorm.DB) {
 		type oldChannel struct {
 			ID                         int `gorm:"primaryKey"`
@@ -31,7 +31,7 @@ func TestChannelBusinessDataOfflineMigration(t *testing.T) {
 		if err := db.Table("channels").Create(&rows).Error; err != nil {
 			t.Fatal(err)
 		}
-		migration := migrateChannelBusinessData()
+		migration := migrateChannelInternalState()
 		if err := migration.Migrate(db); err != nil {
 			t.Fatal(err)
 		}
@@ -55,7 +55,7 @@ func TestChannelBusinessDataOfflineMigration(t *testing.T) {
 			if row.Key != rows[i].Key || row.Version != rows[i].CredentialRevision || row.DeletedAt.Valid != rows[i].DeletedAt.Valid {
 				t.Fatal("migration changed credential or lifecycle")
 			}
-			refresh, err := credentials.ReadRefresh(row.BizData)
+			refresh, err := credentials.ReadRefresh(row.InternalState)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -74,7 +74,7 @@ func TestChannelBusinessDataOfflineMigration(t *testing.T) {
 
 func TestChannelEditVersionProtectsSnapshotAndExcludesTelemetry(t *testing.T) {
 	useTestChannelDB(t)
-	row := Channel{Id: 34001, Type: config.ChannelTypeOpenAI, Key: "secret", Models: "old", BizData: []byte(`{"vendor":{"kept":true}}`)}
+	row := Channel{Id: 34001, Type: config.ChannelTypeOpenAI, Key: "secret", Models: "old", InternalState: []byte(`{"vendor":{"kept":true}}`)}
 	if err := DB.Create(&row).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +94,7 @@ func TestChannelEditVersionProtectsSnapshotAndExcludesTelemetry(t *testing.T) {
 	if err := edit(`{"id":34001,"name":"no-version"}`); err == nil {
 		t.Fatal("missing version accepted")
 	}
-	if err := edit(`{"id":34001,"expected_version":1,"bizdata":{}}`); err == nil {
+	if err := edit(`{"id":34001,"expected_version":1,"internal_state":{}}`); err == nil {
 		t.Fatal("internal state injection accepted")
 	}
 	if err := UpdateChannelUsedQuotaWithContext(t.Context(), row.Id, 17); err != nil {
@@ -104,13 +104,13 @@ func TestChannelEditVersionProtectsSnapshotAndExcludesTelemetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	saved, _ := GetChannelById(row.Id)
-	if saved.Version != 2 || saved.UsedQuota != 17 || string(saved.BizData) != string(row.BizData) {
+	if saved.Version != 2 || saved.UsedQuota != 17 || string(saved.InternalState) != string(row.InternalState) {
 		t.Fatal("edit mixed telemetry/internal state")
 	}
 	encoded, _ := json.Marshal(saved)
 	var public map[string]any
 	_ = json.Unmarshal(encoded, &public)
-	if _, ok := public["bizdata"]; ok {
+	if _, ok := public["internal_state"]; ok {
 		t.Fatal("internal state exposed")
 	}
 }
@@ -118,7 +118,7 @@ func TestChannelEditVersionProtectsSnapshotAndExcludesTelemetry(t *testing.T) {
 func TestTagEditVersionsAreAtomicAndPreserveInternalState(t *testing.T) {
 	useTestChannelDB(t)
 	for _, id := range []int{34002, 34003} {
-		if err := DB.Create(&Channel{Id: id, Type: config.ChannelTypeOpenAI, Key: "key", Tag: "versions", Models: "old", BizData: []byte(`{"vendor":{}}`)}).Error; err != nil {
+		if err := DB.Create(&Channel{Id: id, Type: config.ChannelTypeOpenAI, Key: "key", Tag: "versions", Models: "old", InternalState: []byte(`{"vendor":{}}`)}).Error; err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -138,18 +138,18 @@ func TestTagEditVersionsAreAtomicAndPreserveInternalState(t *testing.T) {
 	}
 	rows, _ = GetChannelsByTag("versions")
 	for _, row := range rows {
-		if row.Models != "new" || row.Version != 1 || string(row.BizData) != `{"vendor":{}}` {
+		if row.Models != "new" || row.Version != 1 || string(row.InternalState) != `{"vendor":{}}` {
 			t.Fatal("invalid batch update")
 		}
 	}
 }
 
-func TestChannelBusinessDataMigrationResumesInterruptedDDL(t *testing.T) {
+func TestChannelInternalStateMigrationResumesInterruptedDDL(t *testing.T) {
 	forEachTestDatabase(t, func(t *testing.T, db *gorm.DB) {
 		type partialChannel struct {
 			ID                     int            `gorm:"primaryKey"`
 			Version                uint64         `gorm:"not null;default:0"`
-			BizData                datatypes.JSON `gorm:"column:bizdata;type:json"`
+			InternalState          datatypes.JSON `gorm:"column:internal_state;type:json"`
 			CredentialRevision     uint64
 			CredentialRefreshFence *string
 		}
@@ -157,45 +157,45 @@ func TestChannelBusinessDataMigrationResumesInterruptedDDL(t *testing.T) {
 			t.Fatal(err)
 		}
 		attempt := "persisted-attempt"
-		row := partialChannel{ID: 1, Version: 8, CredentialRevision: 7, CredentialRefreshFence: &attempt, BizData: datatypes.JSON(`{"vendor":{"preserved":true},"credentials":{"refresh":{"attempt_id":"persisted-attempt","started_at":123}}}`)}
+		row := partialChannel{ID: 1, Version: 8, CredentialRevision: 7, CredentialRefreshFence: &attempt, InternalState: datatypes.JSON(`{"vendor":{"preserved":true},"credentials":{"refresh":{"attempt_id":"persisted-attempt","started_at":123}}}`)}
 		if err := db.Table("channels").Create(&row).Error; err != nil {
 			t.Fatal(err)
 		}
 		// The backfill committed and the timestamp column was dropped before restart.
-		if err := migrateChannelBusinessData().Migrate(db); err != nil {
+		if err := migrateChannelInternalState().Migrate(db); err != nil {
 			t.Fatal(err)
 		}
 		var after Channel
-		if err := db.Unscoped().Table("channels").Select("id", "version", "bizdata").First(&after).Error; err != nil {
+		if err := db.Unscoped().Table("channels").Select("id", "version", "internal_state").First(&after).Error; err != nil {
 			t.Fatal(err)
 		}
-		refresh, err := credentials.ReadRefresh(after.BizData)
+		refresh, err := credentials.ReadRefresh(after.InternalState)
 		if err != nil || refresh == nil || refresh.StartedAt != 123 || after.Version != 8 {
 			t.Fatal("restart lost committed state")
 		}
 		var data map[string]json.RawMessage
-		if err := json.Unmarshal(after.BizData, &data); err != nil || string(data["vendor"]) != `{"preserved": true}` && string(data["vendor"]) != `{"preserved":true}` {
+		if err := json.Unmarshal(after.InternalState, &data); err != nil || string(data["vendor"]) != `{"preserved": true}` && string(data["vendor"]) != `{"preserved":true}` {
 			t.Fatal("restart lost namespace")
 		}
 	})
 }
 
-func TestChannelBusinessDataMigrationFailsWithoutDroppingConflictingState(t *testing.T) {
+func TestChannelInternalStateMigrationFailsWithoutDroppingConflictingState(t *testing.T) {
 	forEachTestDatabase(t, func(t *testing.T, db *gorm.DB) {
 		type conflictingChannel struct {
 			ID                     int            `gorm:"primaryKey"`
 			Version                uint64         `gorm:"not null;default:0"`
-			BizData                datatypes.JSON `gorm:"column:bizdata;type:json"`
+			InternalState          datatypes.JSON `gorm:"column:internal_state;type:json"`
 			CredentialRefreshFence string
 		}
 		if err := db.Table("channels").AutoMigrate(&conflictingChannel{}); err != nil {
 			t.Fatal(err)
 		}
-		row := conflictingChannel{ID: 1, CredentialRefreshFence: "old-owner", BizData: datatypes.JSON(`{"credentials":{"refresh":{"attempt_id":"different-owner"}}}`)}
+		row := conflictingChannel{ID: 1, CredentialRefreshFence: "old-owner", InternalState: datatypes.JSON(`{"credentials":{"refresh":{"attempt_id":"different-owner"}}}`)}
 		if err := db.Table("channels").Create(&row).Error; err != nil {
 			t.Fatal(err)
 		}
-		if err := migrateChannelBusinessData().Migrate(db); err == nil {
+		if err := migrateChannelInternalState().Migrate(db); err == nil {
 			t.Fatal("conflicting operation silently replaced")
 		}
 		names, err := databaseColumnNames(db, "channels")

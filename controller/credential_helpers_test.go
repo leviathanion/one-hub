@@ -28,7 +28,7 @@ func loadRotationTestSnapshot(ctx context.Context, id int) (rotationTestSnapshot
 	if err != nil {
 		return result, err
 	}
-	refresh, err := credentials.ReadRefresh(row.BizData)
+	refresh, err := credentials.ReadRefresh(row.InternalState)
 	if refresh != nil {
 		result.Fence = &refresh.AttemptID
 		result.StartedAt = &refresh.StartedAt

@@ -10,12 +10,12 @@ import (
 var ErrConflict = errors.New("渠道凭证已被并发更新，请重新授权")
 
 type Snapshot struct {
-	ChannelID int
-	Type      int
-	Key       string
-	Version   uint64
-	BizData   []byte
-	Deleted   bool
+	ChannelID     int
+	Type          int
+	Key           string
+	Version       uint64
+	InternalState []byte
+	Deleted       bool
 }
 
 // Store performs only authoritative reads and single-row atomic CAS. Secret
@@ -62,7 +62,7 @@ func (s Service) Claim(ctx context.Context, ticket Ticket, startedAt time.Time) 
 	if row.Deleted || row.Type != ticket.Type {
 		return ClaimSuperseded, nil
 	}
-	refresh, err := ReadRefresh(row.BizData)
+	refresh, err := ReadRefresh(row.InternalState)
 	if err != nil {
 		return ClaimSuperseded, err
 	}
@@ -75,7 +75,7 @@ func (s Service) Claim(ctx context.Context, ticket Ticket, startedAt time.Time) 
 	if row.Version != ticket.ExpectedVersion {
 		return ClaimSuperseded, nil
 	}
-	data, err := WriteRefresh(row.BizData, &Refresh{AttemptID: ticket.AttemptID, StartedAt: startedAt.Unix()})
+	data, err := WriteRefresh(row.InternalState, &Refresh{AttemptID: ticket.AttemptID, StartedAt: startedAt.Unix()})
 	if err != nil {
 		return ClaimSuperseded, err
 	}
@@ -87,7 +87,7 @@ func (s Service) Claim(ctx context.Context, ticket Ticket, startedAt time.Time) 
 	if readErr != nil {
 		return ClaimSuperseded, errors.Join(writeErr, readErr)
 	}
-	refresh, err = ReadRefresh(latest.BizData)
+	refresh, err = ReadRefresh(latest.InternalState)
 	if err != nil {
 		return ClaimSuperseded, errors.Join(writeErr, err)
 	}
@@ -115,7 +115,7 @@ func (s Service) Commit(ctx context.Context, ticket Ticket, key string) (CommitO
 		if row.Deleted || row.Type != ticket.Type {
 			return CommitSuperseded, nil
 		}
-		refresh, err := ReadRefresh(row.BizData)
+		refresh, err := ReadRefresh(row.InternalState)
 		if err != nil {
 			return CommitStillFenced, err
 		}
@@ -133,7 +133,7 @@ func (s Service) Commit(ctx context.Context, ticket Ticket, key string) (CommitO
 		if attempt == 3 {
 			return CommitStillFenced, lastErr
 		}
-		data, err := WriteRefresh(row.BizData, nil)
+		data, err := WriteRefresh(row.InternalState, nil)
 		if err != nil {
 			return CommitStillFenced, err
 		}
@@ -159,7 +159,7 @@ func (s Service) Cancel(ctx context.Context, ticket Ticket) (bool, error) {
 		if row.Deleted || row.Type != ticket.Type {
 			return false, nil
 		}
-		refresh, err := ReadRefresh(row.BizData)
+		refresh, err := ReadRefresh(row.InternalState)
 		if err != nil {
 			return false, err
 		}
@@ -169,7 +169,7 @@ func (s Service) Cancel(ctx context.Context, ticket Ticket) (bool, error) {
 		if refresh.AttemptID != ticket.AttemptID {
 			return false, nil
 		}
-		data, err := WriteRefresh(row.BizData, nil)
+		data, err := WriteRefresh(row.InternalState, nil)
 		if err != nil {
 			return false, err
 		}
@@ -190,14 +190,14 @@ func (s Service) Recover(ctx context.Context, expected Snapshot, attemptID, key 
 	if expected.Deleted || attemptID == "" || strings.TrimSpace(key) == "" {
 		return ErrConflict
 	}
-	refresh, err := ReadRefresh(expected.BizData)
+	refresh, err := ReadRefresh(expected.InternalState)
 	if err != nil {
 		return err
 	}
 	if refresh == nil || refresh.AttemptID != attemptID {
 		return ErrConflict
 	}
-	data, err := WriteRefresh(expected.BizData, nil)
+	data, err := WriteRefresh(expected.InternalState, nil)
 	if err != nil {
 		return err
 	}
