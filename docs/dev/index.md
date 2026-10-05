@@ -83,6 +83,7 @@ lastUpdated: true
 | [one-hub Async Task 架构设计](./task-coordination-architecture.md) | async task、identity、fetch、sweeper、finalize | 当前异步任务架构说明 |
 | [Execution Session Revocation 架构设计方案](./execution-session-revocation-refactor.md) | `runtime/session` 锁边界、revocation、Sweep、容量回收 | 当前 session manager revocation 架构说明 |
 | [Relay 压测脚本](./relay-performance-benchmark.md) | 热路径压测工具与口径 | 独立保留 |
+| [Relay 性能优化方案：请求处理、代理连接隔离与账号负载](./relay-performance-optimization-plan.md) | 出口正确性、大请求分配；调度与刷新暂列观测项 | 目标方案；含 SOCKS/CONNECT 双协议复现、消融对照及正确性复核，按证据收敛实施范围 |
 
 ## 当前现状
 

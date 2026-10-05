@@ -26,7 +26,11 @@ func PlanResponsesCreateBody(object *jsonobject.Object, in CreateBodyInput) ([]b
 		return nil, err
 	}
 
-	out := object.Clone()
+	// The first patch invalidates Raw. Keep Clone's deep field ownership
+	// without copying the original serialization that we cannot reuse.
+	editSource := *object
+	editSource.Raw = nil
+	out := editSource.Clone()
 	if err := out.SetJSON("model", strings.TrimSpace(in.Model)); err != nil {
 		return nil, err
 	}
@@ -143,7 +147,11 @@ func PlanResponsesCompactBody(object *jsonobject.Object, model string, promptCac
 	// Compact is a same-dialect operation. Preserve fields the proxy does not
 	// own and remove only create-only fields that cannot be represented by the
 	// compact endpoint.
-	out := object.Clone()
+	// The first patch invalidates Raw. Keep Clone's deep field ownership
+	// without copying the original serialization that we cannot reuse.
+	editSource := *object
+	editSource.Raw = nil
+	out := editSource.Clone()
 	if err := out.SetJSON("model", model); err != nil {
 		return nil, err
 	}

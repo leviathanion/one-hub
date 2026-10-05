@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"one-api/common/requester"
 	"one-api/common/telegram"
 	"one-api/common/wsconn"
 	"one-api/controller"
@@ -35,7 +36,11 @@ func gracefulShutdown(ctx context.Context, server *http.Server, requests *lifecy
 			if err := relay.StopBackgroundBusiness(ctx); err != nil {
 				return err
 			}
-			return codex.StopExecutionSessionRuntime(ctx)
+			if err := codex.StopExecutionSessionRuntime(ctx); err != nil {
+				return err
+			}
+			requester.CloseIdleConnections()
+			return nil
 		},
 		payments: payment.Resources.Close, batches: model.StopBatchUpdater,
 	})

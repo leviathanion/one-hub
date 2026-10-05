@@ -57,7 +57,8 @@ func Parse(raw []byte) (*Object, error) {
 		if err := decoder.Decode(&value); err != nil {
 			return nil, fmt.Errorf("decode field %q: %w", key, err)
 		}
-		fields[key] = append(json.RawMessage(nil), bytes.TrimSpace(value)...)
+		// RawMessage.UnmarshalJSON already owns its bytes; do not copy them again.
+		fields[key] = bytes.TrimSpace(value)
 		order = append(order, key)
 	}
 

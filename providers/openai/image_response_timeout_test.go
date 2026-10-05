@@ -2,11 +2,12 @@ package openai
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -129,7 +130,7 @@ func TestImageResponseTimeoutFollowsWireStreamIntent(t *testing.T) {
 					if err != nil || string(got) != wire {
 						t.Fatalf("stream truncated: body=%q err=%v", got, err)
 					}
-				} else if err == nil || !strings.Contains(err.Error(), "deadline exceeded") {
+				} else if err == nil || !errors.Is(err, context.DeadlineExceeded) {
 					t.Fatalf("unary request lost configured timeout: body=%q err=%v", got, err)
 				}
 			})

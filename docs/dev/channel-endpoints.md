@@ -102,6 +102,6 @@ lastUpdated: true
 - 浏览器隔离测试页加载真实组件及后端接口目录：验证地址编辑、关闭、保存后重载、键盘重新开启；1280px/375px 布局中开关和地址同行，375px 无横向溢出。此测试页的持久化使用测试 localStorage，实际 SQL 读写由后端测试覆盖。
 - SQLite 实库测试验证 205 行跨批次全量迁移、软删除行、非目标类型、独立插件数据、revision 不变、幂等，以及末批失败时整体回滚。未对现有业务数据库执行迁移。
 
-完整后端运行过程中，未修改的 `TestIssue039ResponsesWSCompletedInjectRecoversThroughNextTurn` 曾出现时序性断言失败；独立重复 10 次及最终全量复跑通过。本次没有修改该 WS 用例或 actor 实现。
+完整后端运行过程中，未修改的 Responses WebSocket 已完成响应注入恢复测试 曾出现时序性断言失败；独立重复 10 次及最终全量复跑通过。本次没有修改该 WS 用例或 actor 实现。
 
 MySQL、PostgreSQL 实库迁移尚未验证：当前环境未找到相应数据库测试工具或 Docker。迁移使用现有 GORM JSON 列和事务接口，但这不能替代两个数据库上的升级演练；部署到这两种数据库前需在备份副本验证。

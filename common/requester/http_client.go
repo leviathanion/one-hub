@@ -1,8 +1,10 @@
 package requester
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
+	"net"
 	"net/http"
 	"one-api/common/utils"
 	"time"
@@ -12,14 +14,11 @@ var HTTPClient *http.Client
 
 var errNoImplicitReplayTransport = errors.New("request transport cannot disable implicit replay safely")
 
-// providerHTTPTransportSet owns the two transports used by one provider
-// client configuration. The noKeepAlive sibling is created with the same
-// proxy, TLS, and timeout settings as normal, but never reuses a connection.
-// It is configuration owned by the requester; it is not a request or source
-// replacement cache.
+// providerHTTPTransportSet owns a fixed base configuration and its bounded
+// egress pools. Each egress has a normal and an HTTP/1-only noKeepAlive sibling.
 type providerHTTPTransportSet struct {
-	normal      *http.Transport
-	noKeepAlive *http.Transport
+	normal   *http.Transport
+	egresses *providerHTTPEgressPool
 }
 
 var defaultProviderHTTPTransports *providerHTTPTransportSet
@@ -43,15 +42,18 @@ func newProviderHTTPTransportSet(normal *http.Transport) *providerHTTPTransportS
 		return nil
 	}
 	return &providerHTTPTransportSet{
-		normal:      normal,
-		noKeepAlive: cloneWithoutKeepAlives(normal),
+		normal:   normal,
+		egresses: newProviderHTTPEgressPool(normal, maxProviderHTTPEgresses),
 	}
 }
 
 func newProviderHTTPTransport() *http.Transport {
 	return &http.Transport{
-		DialContext:           utils.Socks5ProxyFunc,
-		Proxy:                 utils.ProxyFunc,
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			// Timeout policy remains live; only the connection's egress is fixed.
+			dialer := &net.Dialer{Timeout: time.Duration(utils.GetOrDefault("connect_timeout", 30)) * time.Second, KeepAlive: 30 * time.Second}
+			return dialer.DialContext(ctx, network, address)
+		},
 		DisableCompression:    true,
 		MaxIdleConns:          256,
 		MaxIdleConnsPerHost:   64,
@@ -94,17 +96,6 @@ func cloneWithoutKeepAlives(source *http.Transport) *http.Transport {
 		clone.TLSClientConfig.NextProtos = filtered
 	}
 	return clone
-}
-
-func (s *providerHTTPTransportSet) noKeepAliveFor(source http.RoundTripper) (*http.Transport, error) {
-	if s == nil || s.normal == nil || s.noKeepAlive == nil {
-		return nil, errNoImplicitReplayTransport
-	}
-	base, ok := source.(*http.Transport)
-	if !ok || base != s.normal {
-		return nil, errNoImplicitReplayTransport
-	}
-	return s.noKeepAlive, nil
 }
 
 // providerRedirectPolicy never turns one application submission into a second

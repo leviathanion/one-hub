@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -102,6 +101,18 @@ func TestStoredResponsesRetrieveUsesOwnerChannelAndPreservesStatus(t *testing.T)
 	}
 }
 
+type storedResponsesDeadlineTransport struct {
+	next http.RoundTripper
+	seen *atomic.Bool
+}
+
+func (t storedResponsesDeadlineTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	deadline, hasDeadline := req.Context().Deadline()
+	remaining := time.Until(deadline)
+	t.seen.Store(hasDeadline && remaining > 0 && remaining <= storedResponsesRequestTimeout)
+	return t.next.RoundTrip(req)
+}
+
 func TestStoredResponsesLifecycleDeadlineReachesProviderRequest(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -126,21 +137,24 @@ func TestStoredResponsesLifecycleDeadlineReachesProviderRequest(t *testing.T) {
 			}
 			capturingTransport := baseTransport.Clone()
 			capturingTransport.DisableKeepAlives = true
-			capturingTransport.Proxy = func(req *http.Request) (*url.URL, error) {
-				ctx := req.Context()
-				deadline, hasDeadline := ctx.Deadline()
-				remaining := time.Until(deadline)
-				deadlineSeen.Store(hasDeadline && remaining > 0 && remaining <= storedResponsesRequestTimeout)
-				return nil, nil
-			}
+			t.Cleanup(capturingTransport.CloseIdleConnections)
 			capturingClient := *originalHTTPClient
-			capturingClient.Transport = capturingTransport
+			// Proxy belongs to the fixed-egress pool, and net/http deliberately
+			// removes deadlines from dial contexts. Observe the request itself.
+			capturingClient.Transport = storedResponsesDeadlineTransport{next: capturingTransport, seen: &deadlineSeen}
 			requester.HTTPClient = &capturingClient
 			t.Cleanup(func() { requester.HTTPClient = originalHTTPClient })
 
 			recorder := httptest.NewRecorder()
 			ctx, _ := gin.CreateTestContext(recorder)
-			ctx.Request = httptest.NewRequest(test.method, test.path, nil)
+			var body io.Reader
+			if test.method == http.MethodDelete {
+				// Empty unsafe requests require the managed HTTP/1 no-replay
+				// sibling, unavailable to this observing RoundTripper. A body
+				// exercises deadline propagation through the same provider path.
+				body = strings.NewReader(`{}`)
+			}
+			ctx.Request = httptest.NewRequest(test.method, test.path, body)
 			ctx.Params = gin.Params{{Key: "response_id", Value: owner.ResponseID}}
 			ctx.Set("id", owner.UserID)
 			ctx.Set("token_id", owner.TokenID)

@@ -328,6 +328,15 @@ func (b *policyResponseBody) close(stopCancelObserver bool) error {
 }
 
 func httpTransportError(err error, wroteRequest bool) *types.OpenAIErrorWithStatusCode {
+	if localErr, ok := err.(*types.OpenAIErrorWithStatusCode); ok && localErr.LocalError {
+		return localErr
+	}
+	if errors.Is(err, errProviderTransportCapacity) {
+		apiErr := common.ErrorWrapperLocal(errProviderTransportCapacity, "provider_transport_capacity", http.StatusServiceUnavailable)
+		apiErr.UpstreamNotAttempted = !wroteRequest
+		apiErr.UpstreamAmbiguous = wroteRequest
+		return apiErr
+	}
 	if err != nil {
 		logger.SysError(fmt.Sprintf("provider http transport error: %s", err.Error()))
 	}
@@ -376,14 +385,7 @@ func (r *HTTPRequester) SendRequestPreservingNativeDialect(req *http.Request, re
 }
 
 func (r *HTTPRequester) sendRequest(req *http.Request, response any, outputResp bool, preserveRedirect bool, replayProviderEnvelope bool) (*http.Response, *types.OpenAIErrorWithStatusCode) {
-	client, noKeepAlive, clientErr := r.configuredHTTPClient(r.profile, preserveRedirect)
-	if clientErr != nil {
-		return nil, clientErr
-	}
-	if r.ObserveRequest != nil {
-		r.ObserveRequest(req)
-	}
-	resp, err, wroteRequest := doHTTPRequest(client, req, policyForHTTPProfile(r.profile), noKeepAlive)
+	resp, err, wroteRequest := r.doRequest(req, preserveRedirect)
 	if err != nil {
 		return nil, httpTransportError(err, wroteRequest)
 	}
@@ -464,14 +466,7 @@ func readProviderBodyBounded(reader io.Reader, maxBytes int64) ([]byte, error) {
 // 发送请求 RAW
 func (r *HTTPRequester) SendRequestRaw(req *http.Request) (*http.Response, *types.OpenAIErrorWithStatusCode) {
 	// 发送请求
-	client, noKeepAlive, clientErr := r.configuredHTTPClient(r.profile, false)
-	if clientErr != nil {
-		return nil, clientErr
-	}
-	if r.ObserveRequest != nil {
-		r.ObserveRequest(req)
-	}
-	resp, err, wroteRequest := doHTTPRequest(client, req, policyForHTTPProfile(r.profile), noKeepAlive)
+	resp, err, wroteRequest := r.doRequest(req, false)
 	if err != nil {
 		return nil, httpTransportError(err, wroteRequest)
 	}
@@ -578,18 +573,62 @@ func preservedRedirectResponse(resp *http.Response, operation providerresponse.O
 }
 
 func (r *HTTPRequester) sendRequestRawNoRedirect(req *http.Request) (*http.Response, *types.OpenAIErrorWithStatusCode) {
-	client, noKeepAlive, clientErr := r.configuredHTTPClient(r.profile, true)
-	if clientErr != nil {
-		return nil, clientErr
+	resp, err, wroteRequest := r.doRequest(req, true)
+	if err != nil {
+		return nil, httpTransportError(err, wroteRequest)
+	}
+	return resp, nil
+}
+
+// Do performs requester-owned I/O and returns every status/body unchanged.
+// Callers own response interpretation and must close the body, including errors.
+func (r *HTTPRequester) Do(req *http.Request) (*http.Response, error) {
+	resp, err, _ := r.doRequest(req, false)
+	return resp, err
+}
+
+func (r *HTTPRequester) doRequest(req *http.Request, forceNoRedirect bool) (*http.Response, error, bool) {
+	if req == nil {
+		return nil, errors.New("http client and request are required"), false
+	}
+	if err := req.Context().Err(); err != nil {
+		if req.Body != nil {
+			_ = req.Body.Close()
+		}
+		return nil, err, false
+	}
+	client, entry, err := r.configuredHTTPClient(r.profile, forceNoRedirect)
+	if err != nil {
+		if req.Body != nil {
+			_ = req.Body.Close()
+		}
+		return nil, err, false
+	}
+	var noKeepAlive *http.Transport
+	bodyOwnsEntry := false
+	if entry != nil {
+		noKeepAlive = entry.noKeepAlive
+		defer func() {
+			if !bodyOwnsEntry {
+				r.transports.egresses.release(entry)
+			}
+		}()
 	}
 	if r.ObserveRequest != nil {
 		r.ObserveRequest(req)
 	}
 	resp, err, wroteRequest := doHTTPRequest(client, req, policyForHTTPProfile(r.profile), noKeepAlive)
-	if err != nil {
-		return nil, httpTransportError(err, wroteRequest)
+	if entry != nil && err == nil && resp != nil && resp.Body != nil {
+		pool := r.transports.egresses
+		// Hold one reference across the entire Do, including safe redirects.
+		// The concrete Transport lets net/http use native context deadlines;
+		// resp.Request includes the Client.Timeout deadline added by Do.
+		body := &egressResponseBody{ReadCloser: resp.Body, release: func() { pool.release(entry) }}
+		body.stopCancel = context.AfterFunc(resp.Request.Context(), func() { _ = body.close(false) })
+		resp.Body = body
+		bodyOwnsEntry = true
 	}
-	return resp, nil
+	return resp, err, wroteRequest
 }
 
 func providerHTTPClient(profile HTTPProfile, forceNoRedirect bool) (*http.Client, *types.OpenAIErrorWithStatusCode) {
@@ -608,7 +647,7 @@ func providerHTTPClient(profile HTTPProfile, forceNoRedirect bool) (*http.Client
 	return &client, nil
 }
 
-func (r *HTTPRequester) configuredHTTPClient(profile HTTPProfile, forceNoRedirect bool) (*http.Client, *http.Transport, *types.OpenAIErrorWithStatusCode) {
+func (r *HTTPRequester) configuredHTTPClient(profile HTTPProfile, forceNoRedirect bool) (*http.Client, *providerHTTPEgress, error) {
 	client, apiErr := providerHTTPClient(profile, forceNoRedirect)
 	if apiErr != nil {
 		return nil, nil, apiErr
@@ -620,8 +659,21 @@ func (r *HTTPRequester) configuredHTTPClient(profile HTTPProfile, forceNoRedirec
 	if source == nil {
 		source = http.DefaultTransport
 	}
-	transport, _ := r.transports.noKeepAliveFor(source)
-	return client, transport, nil
+	if source != r.transports.normal {
+		return client, nil, nil
+	}
+	proxy, key, err := parseProviderProxy(r.proxyAddr)
+	if err != nil {
+		apiErr := common.ErrorWrapperLocal(err, "invalid_provider_proxy", http.StatusInternalServerError)
+		apiErr.UpstreamNotAttempted = true
+		return nil, nil, apiErr
+	}
+	entry, err := r.transports.egresses.acquire(proxy, key)
+	if err != nil {
+		return nil, nil, err
+	}
+	client.Transport = entry.normal
+	return client, entry, nil
 }
 
 // 获取流式响应
