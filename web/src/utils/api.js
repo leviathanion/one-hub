@@ -22,8 +22,8 @@ API.interceptors.response.use(
       error.message = error.response.data.message;
     }
 
-    showError(error);
-	return Promise.reject(error);
+    if (!error.config?.skipErrorNotification) showError(error);
+    return Promise.reject(error);
   }
 );
 

@@ -5,14 +5,12 @@ import {
   Box,
   Button,
   ButtonGroup,
-  Card,
-  CardContent,
-  Chip,
   Dialog,
   DialogActions,
   DialogContent,
   Divider,
   IconButton,
+  LinearProgress,
   Stack,
   TextField,
   Tooltip,
@@ -22,29 +20,27 @@ import LoadingButton from '@mui/lab/LoadingButton';
 import { Icon } from '@iconify/react';
 import { useTranslation } from 'react-i18next';
 import { API } from 'utils/api';
-import { showError, showSuccess } from 'utils/common';
+import { showSuccess } from 'utils/common';
 import { canAcceptDefaultPricingUrl, createPricingFetchController, resolveDefaultPricingUrl } from './pricingFetchState.mjs';
+
+import PricingSyncChanges from './PricingSyncChanges';
+import { pricingSyncFailure, pricingSyncRequestOptions } from './pricingSyncFeedback.mjs';
 
 const updateModes = ['add', 'update', 'overwrite'];
 
-const actionColor = {
-  add: 'success',
-  update: 'warning',
-  delete: 'error',
-  locked: 'default'
-};
-
-const policyText = (policy) => (policy == null ? '—' : JSON.stringify(policy, null, 2));
 const PRICE_UPDATE_URL_STORAGE_KEY = 'oneapi_price_update_url';
 
-export const CheckUpdates = ({ open, onCancel, onOk }) => {
+export const CheckUpdates = ({ open, onCancel, onOk, ownedby = [] }) => {
   const { t } = useTranslation();
   const [url, setUrl] = useState(() => localStorage.getItem(PRICE_UPDATE_URL_STORAGE_KEY) || '');
   const urlRef = useRef(url);
   const userEditedUrlRef = useRef(false);
-  const [loading, setLoading] = useState(false);
+  const [stage, setStage] = useState(null);
+  const loading = stage !== null;
+  const [error, setError] = useState(null);
+  const [sourceLabel, setSourceLabel] = useState('');
   const [applyLoading, setApplyLoading] = useState(false);
-  const [mode, setMode] = useState('overwrite');
+  const [mode, setMode] = useState('add');
   const [source, setSource] = useState([]);
   const [preview, setPreview] = useState(null);
   const [modelsDevSkipped, setModelsDevSkipped] = useState(0);
@@ -108,20 +104,30 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
       setSource([]);
       setModelsDevSkipped(0);
       setPreview(null);
-      setLoading(false);
+      setStage(null);
+      setError(null);
+      setMode('add');
     }
   }, [open]);
 
   const requestPreview = useCallback(
     async (catalog, selectedMode, requestGeneration) => {
-      const response = await API.post('/api/prices/sync/preview', { mode: selectedMode, source: catalog });
-      if (!catalogRequestController.current.isCurrent(requestGeneration)) {
-        return;
+      setStage('preview');
+      setPreview(null);
+      setError(null);
+      try {
+        const response = await API.post('/api/prices/sync/preview', { mode: selectedMode, source: catalog }, pricingSyncRequestOptions);
+        if (!catalogRequestController.current.isCurrent(requestGeneration)) return;
+        if (!response.data?.success) throw Object.assign(new Error(response.data?.message), { data: response.data });
+        setPreview(response.data.data);
+      } catch (failure) {
+        if (!catalogRequestController.current.isCurrent(requestGeneration)) return;
+        const feedback = pricingSyncFailure(failure, 'preview', t);
+        setError(feedback);
+        if (feedback.invalidCatalog) setSource([]);
+      } finally {
+        if (catalogRequestController.current.isCurrent(requestGeneration)) setStage(null);
       }
-      if (!response.data?.success) {
-        throw new Error(response.data?.message || t('CheckUpdatesTable.dataFormatIncorrect'));
-      }
-      setPreview(response.data.data);
     },
     [t]
   );
@@ -136,18 +142,20 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
     setUrl(nextUrl);
     setSource([]);
     setPreview(null);
-    setLoading(false);
+    setStage(null);
+    setError(null);
     localStorage.setItem(PRICE_UPDATE_URL_STORAGE_KEY, nextUrl);
   };
 
   const handleCheckUpdates = async (fromModelsDev = false) => {
     const requestGeneration = catalogRequestController.current.begin();
     setModelsDevSkipped(0);
-    setLoading(true);
+    setStage(fromModelsDev ? 'fetch-modelsdev' : 'fetch-url');
+    setError(null);
     setSource([]);
     setPreview(null);
     try {
-      const response = await API.get(fromModelsDev ? '/api/prices/modelsdev' : url);
+      const response = await API.get(fromModelsDev ? '/api/prices/modelsdev' : url, pricingSyncRequestOptions);
       if (!catalogRequestController.current.isCurrent(requestGeneration)) return;
       let catalog;
       if (fromModelsDev) {
@@ -165,83 +173,58 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
       if (!catalogRequestController.current.isCurrent(requestGeneration)) {
         return;
       }
+      setSourceLabel(fromModelsDev ? 'models.dev' : url);
       setSource(catalog);
       await requestPreview(catalog, mode, requestGeneration);
     } catch (error) {
       if (catalogRequestController.current.isCurrent(requestGeneration)) {
-        showError(error.response?.data?.message || error.message);
+        setError(pricingSyncFailure(error, 'fetch', t));
       }
     } finally {
       if (catalogRequestController.current.isCurrent(requestGeneration)) {
-        setLoading(false);
+        setStage(null);
       }
     }
   };
 
   const handleModeChange = async (selectedMode) => {
+    if (selectedMode === mode || source.length === 0) return;
     setMode(selectedMode);
-    setPreview(null);
-    if (source.length === 0) {
-      return;
-    }
-    const requestGeneration = catalogRequestController.current.begin();
-    setLoading(true);
-    try {
-      await requestPreview(source, selectedMode, requestGeneration);
-    } catch (error) {
-      if (catalogRequestController.current.isCurrent(requestGeneration)) {
-        showError(error.response?.data?.message || error.message);
-      }
-    } finally {
-      if (catalogRequestController.current.isCurrent(requestGeneration)) {
-        setLoading(false);
-      }
-    }
+    await requestPreview(source, selectedMode, catalogRequestController.current.begin());
   };
 
   const applyPreview = async () => {
-    if (!preview || source.length === 0) {
-      showError(t('CheckUpdatesTable.pleaseFetchData'));
-      return;
-    }
+    if (!preview || source.length === 0 || loading || applyLoading) return;
     setApplyLoading(true);
+    setError(null);
     try {
-      const response = await API.post('/api/prices/sync/apply', {
-        mode,
-        source,
-        base_version: preview.base_version,
-        digest: preview.digest
-      });
-      if (response.data?.success) {
-        showSuccess(t('CheckUpdatesTable.operationCompleted'));
-        onOk(true);
-      } else {
-        showError(response.data?.message);
-      }
-    } catch (error) {
-      showError(error.response?.data?.message || error.message);
+      const response = await API.post(
+        '/api/prices/sync/apply',
+        {
+          mode,
+          source,
+          base_version: preview.base_version,
+          digest: preview.digest
+        },
+        pricingSyncRequestOptions
+      );
+      if (!response.data?.success) throw Object.assign(new Error(response.data?.message), { data: response.data });
+      showSuccess(t('CheckUpdatesTable.operationCompleted'));
+      onOk(true);
+    } catch (failure) {
       setPreview(null);
+      const feedback = pricingSyncFailure(failure, 'apply', t);
+      setError(feedback);
+      if (feedback.invalidCatalog) setSource([]);
     } finally {
       setApplyLoading(false);
     }
   };
 
-  const refreshPreview = async () => {
-    if (source.length === 0) return;
-    const requestGeneration = catalogRequestController.current.begin();
-    setLoading(true);
-    try {
-      await requestPreview(source, mode, requestGeneration);
-    } catch (error) {
-      if (catalogRequestController.current.isCurrent(requestGeneration)) {
-        showError(error.response?.data?.message || error.message);
-      }
-    } finally {
-      if (catalogRequestController.current.isCurrent(requestGeneration)) setLoading(false);
-    }
-  };
+  const refreshPreview = () => requestPreview(source, mode, catalogRequestController.current.begin());
 
   const changes = preview?.plan?.changes || [];
+  const changeCount = changes.filter((change) => change.action !== 'locked').length;
 
   return (
     <Dialog open={open} onClose={applyLoading ? undefined : onCancel} fullWidth maxWidth="md">
@@ -261,6 +244,7 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
           <TextField
             fullWidth
             size="small"
+            label={t('CheckUpdatesTable.url')}
             placeholder={t('CheckUpdatesTable.url')}
             value={url}
             onChange={handleUrlChange}
@@ -269,25 +253,53 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
               endAdornment: (
                 <Tooltip title={t('CheckUpdatesTable.fetchData')}>
                   <IconButton onClick={() => handleCheckUpdates()} disabled={loading || applyLoading || !url} color="primary" size="small">
-                    <Icon icon={loading ? 'svg-spinners:180-ring' : 'solar:refresh-bold'} fontSize="1.2rem" />
+                    <Icon icon={stage === 'fetch-url' ? 'svg-spinners:180-ring' : 'solar:refresh-bold'} fontSize="1.2rem" />
                   </IconButton>
                 </Tooltip>
               )
             }}
           />
 
-          <Button onClick={() => handleCheckUpdates(true)} disabled={loading || applyLoading} variant="outlined">
+          <LoadingButton
+            onClick={() => handleCheckUpdates(true)}
+            loading={stage === 'fetch-modelsdev'}
+            disabled={loading || applyLoading}
+            variant="outlined"
+          >
             {t('modelsDev.fetch')}
-          </Button>
+          </LoadingButton>
+          {loading && (
+            <Box role="status" aria-live="polite">
+              <Typography variant="body2" sx={{ mb: 1 }}>
+                {t(stage === 'preview' ? 'pricingSync.calculating' : 'pricingSync.fetching')}
+              </Typography>
+              <LinearProgress />
+            </Box>
+          )}
+          {error && !loading && (
+            <Alert
+              severity="error"
+              action={
+                error.retry && source.length > 0 ? (
+                  <Button color="inherit" size="small" onClick={refreshPreview}>
+                    {t('pricingSync.retryPreview')}
+                  </Button>
+                ) : undefined
+              }
+            >
+              {error.message}
+            </Alert>
+          )}
           {modelsDevSkipped > 0 && <Alert severity="info">{t('modelsDev.skipped', { count: modelsDevSkipped })}</Alert>}
 
           {source.length > 0 && (
             <>
-              <ButtonGroup fullWidth aria-label={t('CheckUpdatesTable.updatePrices')}>
+              <ButtonGroup fullWidth aria-label={t('pricingSync.modeLabel')}>
                 {updateModes.map((item) => (
                   <Button
                     key={item}
                     variant={mode === item ? 'contained' : 'outlined'}
+                    aria-pressed={mode === item}
                     onClick={() => handleModeChange(item)}
                     disabled={loading || applyLoading}
                   >
@@ -296,71 +308,14 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
                 ))}
               </ButtonGroup>
 
+              <Typography variant="body2" color={mode === 'overwrite' ? 'error' : 'text.secondary'}>
+                {t(`pricingSync.modeHelp.${mode}`)}
+              </Typography>
               {mode !== 'add' && <Alert severity="warning">{t('CheckUpdatesTable.contextTierPolicy')}</Alert>}
             </>
           )}
 
-          {source.length > 0 && !preview && (
-            <Button variant="outlined" onClick={refreshPreview} disabled={loading || applyLoading}>
-              {t('CheckUpdatesTable.fetchData')}
-            </Button>
-          )}
-
-          {preview && (
-            <>
-              <Card variant="outlined">
-                <CardContent sx={{ p: '12px !important' }}>
-                  <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
-                    <Chip label={`${t('CheckUpdatesTable.priceServerTotal')}: ${source.length}`} color="primary" size="small" />
-                    <Chip label={`base_version: ${preview.base_version}`} size="small" />
-                    {Object.entries(actionColor).map(([action, color]) => (
-                      <Chip
-                        key={action}
-                        label={`${action}: ${changes.filter((change) => change.action === action).length}`}
-                        color={color}
-                        size="small"
-                      />
-                    ))}
-                  </Stack>
-                </CardContent>
-              </Card>
-
-              {changes.length === 0 ? (
-                <Alert severity="success">{t('CheckUpdatesTable.noUpdates')}</Alert>
-              ) : (
-                <Stack spacing={1.5}>
-                  {changes.map((change) => (
-                    <Card key={`${change.action}:${change.model}`} variant="outlined">
-                      <CardContent>
-                        <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1 }}>
-                          <Chip label={change.action} color={actionColor[change.action] || 'default'} size="small" />
-                          <Typography variant="subtitle2">{change.model}</Typography>
-                        </Stack>
-                        <Stack direction={{ xs: 'column', md: 'row' }} spacing={2}>
-                          <Box sx={{ minWidth: 0, flex: 1 }}>
-                            <Typography variant="caption" color="text.secondary">
-                              before
-                            </Typography>
-                            <Box component="pre" sx={{ m: 0, p: 1, overflow: 'auto', bgcolor: 'action.hover', fontSize: 11 }}>
-                              {policyText(change.before)}
-                            </Box>
-                          </Box>
-                          <Box sx={{ minWidth: 0, flex: 1 }}>
-                            <Typography variant="caption" color="text.secondary">
-                              after
-                            </Typography>
-                            <Box component="pre" sx={{ m: 0, p: 1, overflow: 'auto', bgcolor: 'action.hover', fontSize: 11 }}>
-                              {policyText(change.after)}
-                            </Box>
-                          </Box>
-                        </Stack>
-                      </CardContent>
-                    </Card>
-                  ))}
-                </Stack>
-              )}
-            </>
-          )}
+          {preview && <PricingSyncChanges changes={changes} sourceCount={source.length} sourceLabel={sourceLabel} ownedby={ownedby} />}
         </Stack>
       </DialogContent>
 
@@ -373,9 +328,9 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
             variant="contained"
             onClick={applyPreview}
             loading={applyLoading}
-            disabled={!preview || loading || changes.length === 0}
+            disabled={!preview || loading || changeCount === 0}
           >
-            {t(`CheckUpdatesTable.updateMode${mode.charAt(0).toUpperCase()}${mode.slice(1)}`)}
+            {t('pricingSync.apply', { count: changeCount })}
           </LoadingButton>
         )}
       </DialogActions>
@@ -386,5 +341,6 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
 CheckUpdates.propTypes = {
   open: PropTypes.bool,
   onCancel: PropTypes.func,
-  onOk: PropTypes.func
+  onOk: PropTypes.func,
+  ownedby: PropTypes.array
 };

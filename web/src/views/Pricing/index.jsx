@@ -297,6 +297,7 @@ const Pricing = () => {
         </AdminContainer>
       </Card>
       <CheckUpdates
+        ownedby={ownedby}
         open={openModal}
         onCancel={() => {
           setOpenModal(false);

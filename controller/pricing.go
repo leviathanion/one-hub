@@ -311,6 +311,16 @@ func decodePriceChangeSource(raw json.RawMessage) ([]*model.Price, error) {
 	return model.DecodeRemotePriceCatalog(raw)
 }
 
+func respondPriceCatalogError(c *gin.Context, err error) {
+	response := gin.H{"success": false, "message": err.Error(), "code": "invalid_price_catalog"}
+	var duplicate *model.DuplicateRemotePriceModelError
+	if errors.As(err, &duplicate) {
+		response["code"] = "duplicate_price_model"
+		response["model"] = duplicate.Model
+	}
+	c.JSON(http.StatusOK, response)
+}
+
 func PreviewPriceChange(c *gin.Context) {
 	var request priceChangePreviewRequest
 	if err := decodeStrictPriceRequest(c, &request); err != nil {
@@ -319,7 +329,7 @@ func PreviewPriceChange(c *gin.Context) {
 	}
 	prices, err := decodePriceChangeSource(request.Source)
 	if err != nil {
-		common.APIRespondWithError(c, http.StatusOK, err)
+		respondPriceCatalogError(c, err)
 		return
 	}
 	preview, err := model.PreviewPriceChange(c.Request.Context(), prices, request.Mode)
@@ -338,7 +348,7 @@ func ApplyPriceChange(c *gin.Context) {
 	}
 	prices, err := decodePriceChangeSource(request.Source)
 	if err != nil {
-		common.APIRespondWithError(c, http.StatusOK, err)
+		respondPriceCatalogError(c, err)
 		return
 	}
 	version, err := model.ApplyPriceChange(c.Request.Context(), model.PricingInstance, prices, request.Mode, request.BaseVersion, request.Digest)

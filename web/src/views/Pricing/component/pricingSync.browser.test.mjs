@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // PRICING_UI_BROWSER=/usr/bin/chromium node --test src/views/Pricing/component/pricingSync.browser.test.mjs
 test(
-  'both pricing sources use the same preview, mode controls and apply flow',
+  'price sync follows fetch, readable review, and explicit apply',
   { skip: !process.env.PRICING_UI_BROWSER, timeout: 120000 },
   async (t) => {
     const { build, preview } = await import('vite');
@@ -29,75 +29,113 @@ test(
       await build(buildConfig);
       server = await preview({ ...buildConfig, preview: { host: '127.0.0.1', port: 0, open: false } });
       browser = await chromium.launch({ executablePath: process.env.PRICING_UI_BROWSER, headless: true, args: ['--no-sandbox'] });
-      const page = await browser.newPage();
+      const page = await browser.newPage({ viewport: { width: 1280, height: 1000 } });
       page.setDefaultTimeout(5000);
       const errors = [];
       page.on('pageerror', (e) => errors.push(e.message));
-      const source = [{ model: 'sync-model', type: 'tokens', input: 1, output: 4 }];
+      const source = [
+        {
+          model: 'sync-model',
+          type: 'tokens',
+          channel_type: 1,
+          input: 1,
+          output: 4,
+          locked: false,
+          extra_ratios: { cached_tokens: 0, future_meter: 0.25 },
+          rate_rules: {
+            version: 2,
+            long_context: [
+              {
+                id: 'large-context',
+                when: { input_tokens: { gt: 200000 } },
+                multipliers: { input: 2, output: 1.5, extra_multipliers: { cached_tokens: 2 } }
+              }
+            ]
+          }
+        }
+      ];
+      const before = { ...source[0], input: 2, output: 3, extra_ratios: { cached_tokens: 0.5 }, rate_rules: {} };
       const requests = [];
+      let fetchCount = 0;
       let modelsDevData;
-      let failPreview = false;
+      let previewFailure;
+      let applyFailure;
       let holdCatalog;
-      let releaseCatalog;
+      let holdPreview;
+      let onlyLocked = false;
       await page.route('**/api/prices/modelsdev', async (route) => {
+        fetchCount++;
         if (holdCatalog) await holdCatalog;
         await route.fulfill({ json: { success: true, data: modelsDevData } });
       });
-      await page.route('**/catalog', (route) => route.fulfill({ json: source }));
+      await page.route('**/catalog', (route) => {
+        fetchCount++;
+        return route.fulfill({ json: source });
+      });
       await page.route('**/api/prices/sync/preview', async (route) => {
         const body = route.request().postDataJSON();
         requests.push({ kind: 'preview', ...body });
-        if (failPreview) return route.fulfill({ status: 409, json: { success: false, message: 'refresh required' } });
-        await route.fulfill({
-          json: {
-            success: true,
-            data: {
-              base_version: 7,
-              digest: `digest-${body.mode}`,
-              plan: {
-                changes: [{ action: body.mode === 'add' ? 'add' : 'update', model: 'sync-model', before: { input: 2 }, after: source[0] }]
-              }
-            }
-          }
-        });
+        if (holdPreview) await holdPreview;
+        if (previewFailure) return route.fulfill(previewFailure);
+        const changes = onlyLocked
+          ? [{ action: 'locked', model: 'locked-model', before, after: before }]
+          : [
+              {
+                action: body.mode === 'add' ? 'add' : 'update',
+                model: 'sync-model',
+                before: body.mode === 'add' ? null : before,
+                after: source[0]
+              },
+              ...(body.mode === 'overwrite'
+                ? [
+                    { action: 'delete', model: 'local-only', before, after: null },
+                    { action: 'locked', model: 'locked-model', before, after: before }
+                  ]
+                : [])
+            ];
+        await route.fulfill({ json: { success: true, data: { base_version: 7, digest: `digest-${body.mode}`, plan: { changes } } } });
       });
       await page.route('**/api/prices/sync/apply', (route) => {
         requests.push({ kind: 'apply', ...route.request().postDataJSON() });
-        return route.fulfill({ json: { success: true } });
+        return route.fulfill(applyFailure || { json: { success: true } });
       });
       const url = `http://127.0.0.1:${server.httpServer.address().port}/tests/fixtures/pricing-sync.html`;
-      const ready = async () => {
-        requests.length = 0;
-        failPreview = false;
-        holdCatalog = null;
-        modelsDevData = { url: 'https://models.dev/api.json', prices: source, skipped: 2, candidates: [] };
-        await page.goto(url);
-        await page.getByRole('button', { name: 'Fetch from models.dev' }).waitFor();
-        await expectFetchOnly();
-      };
       const apply = () => page.locator('.MuiDialogActions-root .MuiLoadingButton-root');
       const mode = (name) => page.getByRole('group').getByRole('button', { name, exact: true });
-      const waitPreview = () => page.getByText('base_version: 7', { exact: true }).waitFor();
+      const fetchModelsDev = () => page.getByRole('button', { name: 'Fetch from models.dev' }).click();
+      const waitPreview = () => page.getByText('Source models: 1', { exact: true }).waitFor();
       const expectFetchOnly = async () => {
-        for (const name of ['Add Only', 'Update Only', 'Overwrite All']) {
-          assert.equal(await page.getByRole('button', { name, exact: true }).count(), 0, `${name} requires a fetched catalog`);
-        }
+        assert.equal(await page.getByRole('group').count(), 0);
         assert.equal(await apply().count(), 0);
         assert.equal(await page.getByText(/Updating selected models replaces context tiers/).count(), 0);
         assert.equal(await page.locator('.MuiCard-root').count(), 0);
       };
+      const screenshot = async (name) => {
+        if (!process.env.PRICING_UI_SCREENSHOTS) return;
+        await mkdir(process.env.PRICING_UI_SCREENSHOTS, { recursive: true });
+        await page.screenshot({ path: path.join(process.env.PRICING_UI_SCREENSHOTS, `${name}.png`), fullPage: true });
+      };
+      const ready = async (query = '') => {
+        requests.length = 0;
+        fetchCount = 0;
+        previewFailure = applyFailure = holdCatalog = holdPreview = null;
+        onlyLocked = false;
+        modelsDevData = { url: 'https://models.dev/api.json', prices: source, skipped: 2, candidates: [] };
+        await page.goto(url + query);
+        await page.getByRole('dialog').waitFor();
+        await expectFetchOnly();
+      };
 
-      await t.test('URL fetch reveals modes only after data arrives; URL edits and reopen return to fetch-only', async () => {
+      await t.test('opening shows only fetch controls; URL edits and reopen invalidate the review', async () => {
         await ready();
         assert.deepEqual(requests, []);
+        await screenshot('initial');
         await page.locator('.MuiInputBase-root button').click();
         await waitPreview();
-        assert.equal(await mode('Add Only').isVisible(), true);
-        assert.equal(await mode('Update Only').isVisible(), true);
-        assert.equal(await mode('Overwrite All').isVisible(), true);
+        assert.equal(await mode('Add Only').getAttribute('aria-pressed'), 'true');
         await page.getByRole('textbox').fill('/changed-catalog');
         await expectFetchOnly();
-        await page.getByRole('button', { name: 'Fetch from models.dev' }).click();
+        await fetchModelsDev();
         await waitPreview();
         await page.getByRole('button', { name: 'Cancel', exact: true }).click();
         await page.getByRole('dialog').waitFor({ state: 'hidden' });
@@ -105,94 +143,174 @@ test(
         await expectFetchOnly();
       });
 
-      await t.test('fetch immediately previews; every existing mode and diff renderer works for both sources', async () => {
+      await t.test('both sources share readable changes, all modes and a single explicit apply', async () => {
         await ready();
-        await page.getByRole('button', { name: 'Fetch from models.dev' }).click();
+        await fetchModelsDev();
         await waitPreview();
-        assert.deepEqual(requests, [{ kind: 'preview', mode: 'overwrite', source }]);
+        assert.deepEqual(requests, [{ kind: 'preview', mode: 'add', source }]);
         assert.equal(await page.getByRole('checkbox').count(), 0);
-        assert.equal(await page.getByRole('combobox').count(), 0);
-        await page.getByText(/Skipped 2 models/).waitFor();
         assert.equal(await page.getByRole('textbox').inputValue(), '/catalog');
-        const modelsDevDiff = await page.locator('.MuiCard-root').last().textContent();
         for (const [name, value] of [
-          ['Add Only', 'add'],
           ['Update Only', 'update'],
-          ['Overwrite All', 'overwrite']
+          ['Overwrite All', 'overwrite'],
+          ['Add Only', 'add']
         ]) {
           await mode(name).click();
           await waitPreview();
           assert.deepEqual(requests.at(-1), { kind: 'preview', mode: value, source });
-          assert.equal(await apply().textContent(), name);
+          assert.equal(await mode(name).getAttribute('aria-pressed'), 'true');
         }
-        // The URL icon must use the URL source, not treat its click event as a models.dev flag.
+        await mode('Overwrite All').click();
+        await waitPreview();
+        const changeList = page.getByRole('region', { name: 'Price changes', exact: true });
+        const text = await changeList.textContent();
+        assert.match(text, /Input multiplier2\s*→\s*1/);
+        assert.match(text, /Cache Ratio0.5\s*→\s*0/);
+        assert.match(text, /future_meterNot configured\s*→\s*0.25/);
+        assert.match(text, /200000/);
+        assert.match(text, /Input 2×/);
+        assert.match(text, /Output 1.5×/);
+        assert.equal(await page.locator('pre').count(), 0);
+        assert.equal(await page.getByText(/base_version|digest-|"extra_ratios"/).count(), 0);
+        await page.getByRole('region', { name: 'Models to remove', exact: true }).waitFor();
+        await page.getByText('Locked; the current price will be kept.').waitFor();
+        assert.equal(await apply().textContent(), 'Apply 2 changes');
+        assert.equal(await page.getByRole('button', { name: 'Recalculate changes' }).count(), 0);
+        await screenshot('changes-desktop');
         await page.locator('.MuiInputBase-root button').click();
         await waitPreview();
+        assert.equal(await changeList.textContent(), text);
         assert.equal(await page.getByText(/Skipped 2 models/).count(), 0);
-        assert.equal(await page.locator('.MuiCard-root').last().textContent(), modelsDevDiff);
-        await page.getByRole('button', { name: 'Fetch from models.dev' }).click();
-        await waitPreview();
-        await mode('Add Only').click();
-        await waitPreview();
         assert.equal(
           requests.some((r) => r.kind === 'apply'),
           false
         );
         await apply().click();
         await page.getByRole('dialog').waitFor({ state: 'hidden' });
-        assert.deepEqual(requests.at(-1), { kind: 'apply', mode: 'add', source, base_version: 7, digest: 'digest-add' });
+        assert.deepEqual(requests.at(-1), { kind: 'apply', mode: 'overwrite', source, base_version: 7, digest: 'digest-overwrite' });
       });
 
-      await t.test('empty and failed catalogs clear old previews and cannot apply', async () => {
+      await t.test('calculating has status feedback and no duplicate fetch or retry button', async () => {
         await ready();
-        await page.getByRole('button', { name: 'Fetch from models.dev' }).click();
+        let release;
+        holdPreview = new Promise((resolve) => {
+          release = resolve;
+        });
+        try {
+          await fetchModelsDev();
+          await page.getByRole('status').getByText('Calculating price changes…').waitFor();
+          assert.equal(await page.getByRole('button', { name: 'Fetch Data', exact: true }).count(), 1);
+          assert.equal(await page.getByRole('button', { name: 'Recalculate changes' }).count(), 0);
+          assert.equal(await apply().isDisabled(), true);
+        } finally {
+          release();
+        }
         await waitPreview();
-        modelsDevData = { prices: [], skipped: 3 };
-        await page.getByRole('button', { name: 'Fetch from models.dev' }).click();
-        await page.getByText(/Skipped 3 models/).waitFor();
-        await expectFetchOnly();
-        assert.equal(requests.length, 1);
-        modelsDevData = { candidates: [] };
-        await page.getByRole('button', { name: 'Fetch from models.dev' }).click();
-        await page.waitForFunction(() => !document.querySelector('.MuiInputBase-root input').disabled);
-        await expectFetchOnly();
-        assert.equal(requests.length, 1);
       });
 
-      await t.test('preview failure can retry in the same mode without fetching the source again', async () => {
+      await t.test('empty or malformed fetched catalogs clear old controls', async () => {
         await ready();
-        failPreview = true;
-        await page.getByRole('button', { name: 'Fetch from models.dev' }).click();
-        const retry = page.locator('.MuiButton-root').filter({ hasText: /^Fetch Data$/ });
+        await fetchModelsDev();
+        await waitPreview();
+        for (const data of [{ prices: [], skipped: 3 }, { candidates: [] }]) {
+          modelsDevData = data;
+          await fetchModelsDev();
+          await page.getByText(/Could not fetch prices/).waitFor();
+          await expectFetchOnly();
+          assert.equal(requests.length, 1);
+          assert.equal(await page.getByRole('button', { name: 'Recalculate changes' }).count(), 0);
+        }
+      });
+
+      await t.test('duplicate models name the source problem; retry cannot resolve it', async () => {
+        await ready();
+        previewFailure = {
+          json: { success: false, code: 'duplicate_price_model', model: 'sync-model', message: 'duplicate remote price model "sync-model"' }
+        };
+        await fetchModelsDev();
+        await page.getByText(/multiple entries for “sync-model”/).waitFor();
+        await expectFetchOnly();
+        assert.equal(await page.getByRole('button', { name: 'Recalculate changes' }).count(), 0);
+        assert.equal(await page.getByText(/duplicate remote price model/).count(), 0);
+        assert.equal(requests.length, 1);
+        previewFailure = null;
+        await fetchModelsDev();
+        await waitPreview();
+      });
+
+      await t.test('transient preview failure retries only the preview and is reported once inline', async () => {
+        await ready();
+        previewFailure = { status: 503, json: { success: false, message: 'temporarily unavailable' } };
+        await fetchModelsDev();
+        const retry = page.getByRole('button', { name: 'Recalculate changes', exact: true });
         await retry.waitFor();
-        await page.waitForFunction(() => !document.querySelector('.MuiInputBase-root input').disabled);
+        assert.equal(await page.getByText(/temporarily unavailable/).count(), 1);
         assert.equal(await apply().isDisabled(), true);
-        await mode('Update Only').click();
-        await page.waitForFunction(() => !document.querySelector('.MuiInputBase-root input').disabled);
-        assert.deepEqual(requests.at(-1), { kind: 'preview', mode: 'update', source });
-        failPreview = false;
+        assert.equal(await page.getByRole('button', { name: 'Fetch Data', exact: true }).count(), 1);
+        previewFailure = null;
         await retry.click();
         await waitPreview();
-        assert.deepEqual(requests.at(-1), { kind: 'preview', mode: 'update', source });
+        assert.equal(fetchCount, 1);
+        assert.deepEqual(requests.at(-1), { kind: 'preview', mode: 'add', source });
       });
 
-      await t.test('closing during fetch invalidates the catalog before reopening', async () => {
+      await t.test('failed apply invalidates the review without replaying a mutation', async () => {
         await ready();
+        await fetchModelsDev();
+        await waitPreview();
+        applyFailure = { json: { success: false, message: 'publication changed' } };
+        await apply().click();
+        await page.getByText(/The apply result is unconfirmed/).waitFor();
+        assert.equal(await apply().isDisabled(), true);
+        await page.getByRole('button', { name: 'Recalculate changes' }).click();
+        await waitPreview();
+        assert.equal(requests.filter((r) => r.kind === 'apply').length, 1);
+        assert.equal(fetchCount, 1);
+      });
+
+      await t.test('locked-only review cannot apply', async () => {
+        await ready();
+        onlyLocked = true;
+        await fetchModelsDev();
+        await waitPreview();
+        await page.getByText('Locked; the current price will be kept.').waitFor();
+        assert.equal(await apply().isDisabled(), true);
+      });
+
+      await t.test('closing during fetch invalidates the old catalog', async () => {
+        await ready();
+        let release;
         holdCatalog = new Promise((resolve) => {
-          releaseCatalog = resolve;
+          release = resolve;
         });
         const fetched = page.waitForRequest('**/api/prices/modelsdev');
-        await page.getByRole('button', { name: 'Fetch from models.dev' }).click();
+        await fetchModelsDev();
         await fetched;
         await expectFetchOnly();
         await page.getByRole('button', { name: 'Cancel', exact: true }).click();
         await page.getByRole('dialog').waitFor({ state: 'hidden' });
         const received = page.waitForResponse('**/api/prices/modelsdev');
-        releaseCatalog();
+        release();
         await received;
         await page.getByRole('button', { name: 'Open sync' }).click();
         await expectFetchOnly();
         assert.deepEqual(requests, []);
+      });
+
+      await t.test('Chinese mobile review wraps long content without horizontal overflow', async () => {
+        await page.setViewportSize({ width: 390, height: 844 });
+        await ready('?lang=zh');
+        await page.getByRole('button', { name: '从 models.dev 获取' }).click();
+        await page.getByText('来源模型：1', { exact: true }).waitFor();
+        await mode('覆盖所有').click();
+        await page.getByRole('region', { name: '价格变动', exact: true }).waitFor();
+        assert.equal(await apply().textContent(), '确认应用 2 项变更');
+        assert.equal(await page.locator('pre').count(), 0);
+        assert.equal(await page.getByRole('dialog').evaluate((el) => el.scrollWidth <= el.clientWidth), true);
+        const update = page.getByRole('region', { name: '价格变动', exact: true });
+        await update.scrollIntoViewIfNeeded();
+        assert.equal(await update.evaluate((el) => el.scrollWidth <= el.clientWidth), true);
+        await screenshot('changes-mobile');
       });
       assert.deepEqual(errors, []);
     } finally {
