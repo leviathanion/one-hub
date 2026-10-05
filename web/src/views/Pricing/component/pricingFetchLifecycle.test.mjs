@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import {
   DEFAULT_PRICING_UPDATE_URL,
@@ -7,8 +6,6 @@ import {
   createPricingFetchController,
   resolveDefaultPricingUrl
 } from './pricingFetchState.mjs';
-
-const componentSource = await readFile(new URL('./CheckUpdates.jsx', import.meta.url), 'utf8');
 
 test('关闭态挂载的默认地址响应仍可被接受，打开时已有非空地址可用', () => {
   const defaultController = createPricingFetchController();
@@ -94,16 +91,4 @@ test('目录预览只接受最新代次，旧响应不能重新展示', () => {
 
   assert.equal(catalogController.accept(firstGeneration, [{ model: 'stale' }]), null);
   assert.deepEqual(catalogController.accept(secondGeneration, [{ model: 'current' }]), [{ model: 'current' }]);
-});
-
-test('组件保留默认地址和目录两个独立取消控制器', () => {
-  assert.match(componentSource, /const defaultUrlController = useRef\(null\)/);
-  assert.match(componentSource, /const catalogRequestController = useRef\(null\)/);
-  assert.match(componentSource, /defaultUrlController\.current\.begin\(\)/);
-  assert.match(componentSource, /catalogRequestController\.current\.begin\(\)/);
-
-  const closeEffect = componentSource.match(/useEffect\(\(\) => \{\n    if \(!open\) \{[\s\S]*?\n  \}, \[open\]\);/);
-  assert.ok(closeEffect, '关闭态目录 effect 应存在');
-  assert.match(closeEffect[0], /catalogRequestController\.current\.invalidate\(\)/);
-  assert.doesNotMatch(closeEffect[0], /defaultUrlController\.current\.invalidate\(\)/);
 });

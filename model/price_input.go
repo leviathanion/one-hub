@@ -24,6 +24,14 @@ type remotePriceDTO struct {
 	ModelInfo json.RawMessage `json:"model_info"`
 }
 
+// DuplicateRemotePriceModelError identifies an ambiguous supplier catalog.
+// Keep its diagnostic text stable while exposing the model to API clients.
+type DuplicateRemotePriceModelError struct{ Model string }
+
+func (e *DuplicateRemotePriceModelError) Error() string {
+	return fmt.Sprintf("duplicate remote price model %q", e.Model)
+}
+
 func decodeRemotePriceCatalog(data []byte) ([]*Price, error) {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 {
@@ -82,7 +90,7 @@ func decodeRemotePriceCatalog(data []byte) ([]*Price, error) {
 			return nil, fmt.Errorf("remote price catalog item %d: %w", index, err)
 		}
 		if _, exists := seen[price.Model]; exists {
-			return nil, fmt.Errorf("duplicate remote price model %q", price.Model)
+			return nil, &DuplicateRemotePriceModelError{Model: price.Model}
 		}
 		seen[price.Model] = struct{}{}
 		prices = append(prices, price)
