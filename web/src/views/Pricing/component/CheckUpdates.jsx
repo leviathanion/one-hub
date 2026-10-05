@@ -8,8 +8,6 @@ import {
   Card,
   CardContent,
   Chip,
-  Checkbox,
-  MenuItem,
   Dialog,
   DialogActions,
   DialogContent,
@@ -26,8 +24,6 @@ import { useTranslation } from 'react-i18next';
 import { API } from 'utils/api';
 import { showError, showSuccess } from 'utils/common';
 import { canAcceptDefaultPricingUrl, createPricingFetchController, resolveDefaultPricingUrl } from './pricingFetchState.mjs';
-
-import { modelsDevSelectionKey, modelsDevSelectedSource, selectModelsDevCandidate, ordinaryPricingMode } from './modelsDevState.mjs';
 
 const updateModes = ['add', 'update', 'overwrite'];
 
@@ -51,11 +47,7 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
   const [mode, setMode] = useState('overwrite');
   const [source, setSource] = useState([]);
   const [preview, setPreview] = useState(null);
-  const [modelsDev, setModelsDev] = useState(null);
-  const [selectedModelsDev, setSelectedModelsDev] = useState({});
-  const [providerFilter, setProviderFilter] = useState('');
-  const [modelFilter, setModelFilter] = useState('');
-  const [candidatePage, setCandidatePage] = useState(0);
+  const [modelsDevSkipped, setModelsDevSkipped] = useState(0);
   const defaultUrlController = useRef(null);
   const catalogRequestController = useRef(null);
   if (defaultUrlController.current === null) {
@@ -114,9 +106,7 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
     if (!open) {
       catalogRequestController.current.invalidate();
       setSource([]);
-      setMode(ordinaryPricingMode);
-      setModelsDev(null);
-      setSelectedModelsDev({});
+      setModelsDevSkipped(0);
       setPreview(null);
       setLoading(false);
     }
@@ -142,9 +132,7 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
     urlRef.current = nextUrl;
     defaultUrlController.current.invalidate();
     catalogRequestController.current.invalidate();
-    setModelsDev(null);
-    setSelectedModelsDev({});
-    setMode(ordinaryPricingMode);
+    setModelsDevSkipped(0);
     setUrl(nextUrl);
     setSource([]);
     setPreview(null);
@@ -152,18 +140,25 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
     localStorage.setItem(PRICE_UPDATE_URL_STORAGE_KEY, nextUrl);
   };
 
-  const handleCheckUpdates = async () => {
-    const selectedMode = ordinaryPricingMode(mode);
-    setMode(selectedMode);
+  const handleCheckUpdates = async (fromModelsDev = false) => {
     const requestGeneration = catalogRequestController.current.begin();
-    setModelsDev(null);
-    setSelectedModelsDev({});
+    setModelsDevSkipped(0);
     setLoading(true);
     setSource([]);
     setPreview(null);
     try {
-      const response = await API.get(url);
-      const catalog = Array.isArray(response?.data) ? response.data : response?.data?.data;
+      const response = await API.get(fromModelsDev ? '/api/prices/modelsdev' : url);
+      if (!catalogRequestController.current.isCurrent(requestGeneration)) return;
+      let catalog;
+      if (fromModelsDev) {
+        if (!response.data?.success || !Array.isArray(response.data?.data?.prices)) {
+          throw new Error(response.data?.message || t('CheckUpdatesTable.dataFormatIncorrect'));
+        }
+        catalog = response.data.data.prices;
+        setModelsDevSkipped(response.data.data.skipped || 0);
+      } else {
+        catalog = Array.isArray(response?.data) ? response.data : response?.data?.data;
+      }
       if (!Array.isArray(catalog) || catalog.length === 0) {
         throw new Error(t('CheckUpdatesTable.dataFormatIncorrect'));
       }
@@ -171,7 +166,7 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
         return;
       }
       setSource(catalog);
-      await requestPreview(catalog, selectedMode, requestGeneration);
+      await requestPreview(catalog, mode, requestGeneration);
     } catch (error) {
       if (catalogRequestController.current.isCurrent(requestGeneration)) {
         showError(error.response?.data?.message || error.message);
@@ -181,40 +176,6 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
         setLoading(false);
       }
     }
-  };
-
-  const fetchModelsDev = async () => {
-    const generation = catalogRequestController.current.begin();
-    setLoading(true);
-    setModelsDev(null);
-    setSelectedModelsDev({});
-    setSource([]);
-    setPreview(null);
-    setCandidatePage(0);
-    setProviderFilter('');
-    setModelFilter('');
-    try {
-      const response = await API.get('/api/prices/modelsdev');
-      if (!catalogRequestController.current.isCurrent(generation)) return;
-      if (!response.data?.success || !Array.isArray(response.data?.data?.candidates)) {
-        throw new Error(response.data?.message || t('CheckUpdatesTable.dataFormatIncorrect'));
-      }
-      setModelsDev(response.data.data);
-      setMode('merge');
-    } catch (error) {
-      if (catalogRequestController.current.isCurrent(generation)) showError(error.response?.data?.message || error.message);
-    } finally {
-      if (catalogRequestController.current.isCurrent(generation)) setLoading(false);
-    }
-  };
-
-  const selectCandidate = (candidate, checked) => {
-    const next = selectModelsDevCandidate(selectedModelsDev, candidate, checked);
-    catalogRequestController.current.invalidate();
-    setSelectedModelsDev(next);
-    setSource(modelsDevSelectedSource(next));
-    setPreview(null);
-    setLoading(false);
   };
 
   const handleModeChange = async (selectedMode) => {
@@ -281,12 +242,6 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
   };
 
   const changes = preview?.plan?.changes || [];
-  const providers = [...new Set((modelsDev?.candidates || []).map((candidate) => candidate.provider))].sort();
-  const filteredCandidates = (modelsDev?.candidates || []).filter(
-    (candidate) =>
-      (!providerFilter || candidate.provider === providerFilter) && candidate.model.toLowerCase().includes(modelFilter.toLowerCase())
-  );
-  const visibleCandidates = filteredCandidates.slice(candidatePage * 100, (candidatePage + 1) * 100);
 
   return (
     <Dialog open={open} onClose={applyLoading ? undefined : onCancel} fullWidth maxWidth="md">
@@ -313,7 +268,7 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
             InputProps={{
               endAdornment: (
                 <Tooltip title={t('CheckUpdatesTable.fetchData')}>
-                  <IconButton onClick={handleCheckUpdates} disabled={loading || applyLoading || !url} color="primary" size="small">
+                  <IconButton onClick={() => handleCheckUpdates()} disabled={loading || applyLoading || !url} color="primary" size="small">
                     <Icon icon={loading ? 'svg-spinners:180-ring' : 'solar:refresh-bold'} fontSize="1.2rem" />
                   </IconButton>
                 </Tooltip>
@@ -321,95 +276,23 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
             }}
           />
 
-          <Button onClick={fetchModelsDev} disabled={loading || applyLoading} variant="outlined">
+          <Button onClick={() => handleCheckUpdates(true)} disabled={loading || applyLoading} variant="outlined">
             {t('modelsDev.fetch')}
           </Button>
-          {modelsDev && (
-            <Stack spacing={1}>
-              <Alert severity="info">{t('modelsDev.policy')}</Alert>
-              <Typography variant="caption">
-                {modelsDev.url} · {t('modelsDev.selected')}: {source.length}
-              </Typography>
-              <Stack direction="row" spacing={1}>
-                <TextField
-                  select
-                  size="small"
-                  label={t('modelsDev.provider')}
-                  value={providerFilter}
-                  onChange={(event) => {
-                    setProviderFilter(event.target.value);
-                    setCandidatePage(0);
-                  }}
-                  sx={{ minWidth: 180 }}
-                >
-                  <MenuItem value="">{t('common.all')}</MenuItem>
-                  {providers.map((provider) => (
-                    <MenuItem key={provider} value={provider}>
-                      {provider}
-                    </MenuItem>
-                  ))}
-                </TextField>
-                <TextField
-                  size="small"
-                  label={t('common.search')}
-                  value={modelFilter}
-                  onChange={(event) => {
-                    setModelFilter(event.target.value);
-                    setCandidatePage(0);
-                  }}
-                  fullWidth
-                />
-              </Stack>
-              {visibleCandidates.map((candidate) => (
-                <Stack key={modelsDevSelectionKey(candidate)} direction="row" spacing={1} alignItems="center">
-                  <Checkbox
-                    checked={selectedModelsDev[candidate.model]?.provider === candidate.provider}
-                    disabled={!candidate.price || Boolean(candidate.reason) || loading || applyLoading}
-                    onChange={(event) => selectCandidate(candidate, event.target.checked)}
-                    inputProps={{ 'aria-label': `${candidate.provider}: ${candidate.model}` }}
-                  />
-                  <Box sx={{ minWidth: 0, overflowWrap: 'anywhere' }}>
-                    <Typography variant="body2">
-                      {candidate.provider} / {candidate.model}
-                    </Typography>
-                    <Typography variant="caption" color={candidate.reason ? 'error' : 'text.secondary'}>
-                      {candidate.reason || `input: ${candidate.price?.input}, output: ${candidate.price?.output}`}
-                    </Typography>
-                  </Box>
-                  {candidate.conflict && <Chip size="small" color="warning" label={t('modelsDev.conflict')} />}
-                </Stack>
-              ))}
-              <Stack direction="row" spacing={1} alignItems="center">
-                <Button disabled={candidatePage === 0} onClick={() => setCandidatePage(candidatePage - 1)}>
-                  ←
-                </Button>
-                <Typography variant="caption">
-                  {candidatePage + 1} / {Math.max(1, Math.ceil(filteredCandidates.length / 100))} ({filteredCandidates.length})
-                </Typography>
-                <Button
-                  disabled={(candidatePage + 1) * 100 >= filteredCandidates.length}
-                  onClick={() => setCandidatePage(candidatePage + 1)}
-                >
-                  →
-                </Button>
-              </Stack>
-            </Stack>
-          )}
+          {modelsDevSkipped > 0 && <Alert severity="info">{t('modelsDev.skipped', { count: modelsDevSkipped })}</Alert>}
 
-          {!modelsDev && (
-            <ButtonGroup fullWidth aria-label={t('CheckUpdatesTable.updatePrices')}>
-              {updateModes.map((item) => (
-                <Button
-                  key={item}
-                  variant={mode === item ? 'contained' : 'outlined'}
-                  onClick={() => handleModeChange(item)}
-                  disabled={loading || applyLoading}
-                >
-                  {t(`CheckUpdatesTable.updateMode${item.charAt(0).toUpperCase()}${item.slice(1)}`)}
-                </Button>
-              ))}
-            </ButtonGroup>
-          )}
+          <ButtonGroup fullWidth aria-label={t('CheckUpdatesTable.updatePrices')}>
+            {updateModes.map((item) => (
+              <Button
+                key={item}
+                variant={mode === item ? 'contained' : 'outlined'}
+                onClick={() => handleModeChange(item)}
+                disabled={loading || applyLoading}
+              >
+                {t(`CheckUpdatesTable.updateMode${item.charAt(0).toUpperCase()}${item.slice(1)}`)}
+              </Button>
+            ))}
+          </ButtonGroup>
 
           {mode !== 'add' && <Alert severity="warning">{t('CheckUpdatesTable.contextTierPolicy')}</Alert>}
 

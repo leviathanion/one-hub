@@ -1,13 +1,9 @@
 export const pricingTranslations = {
   zh: {
-    'CheckUpdatesTable.contextTierPolicy': '更新选中模型时，上下文分档以来源为准：有分档则替换，没有则清除，包括手工分档。请核对预览；锁定模型不会更新。',
+    'CheckUpdatesTable.contextTierPolicy':
+      '更新选中模型时，上下文分档以来源为准：有分档则替换，没有则清除，包括手工分档。请核对预览；锁定模型不会更新。',
     'modelsDev.fetch': '从 models.dev 获取',
-    'modelsDev.policy':
-      '勾选模型后获取服务端预览。每个模型只能选择一个供应商；导入不会删除未选模型，保留已有非分档规则及渠道类型。上下文分档以来源为准：来源有分档则更新，没有则清除已有分档（包括手工分档）。已有缓存倍率仅在来源提供对应价格时更新。',
-    'modelsDev.provider': '来源供应商',
-    'modelsDev.conflict': '同名冲突：请选择供应商',
-    'modelsDev.selected': '已选择',
-    'CheckUpdatesTable.updateModeMerge': '确认合并选中价格',
+    'modelsDev.skipped': '已跳过 {{count}} 个价格无效或来源无法唯一确定的模型。覆盖模式会删除目录外未锁定的本地模型，请核对下方差异。',
     'pricing_edit.unknown': '未知',
     'modelpricePage.tokens': '令牌',
     'modelpricePage.times': '次数',
@@ -41,14 +37,11 @@ export const pricingTranslations = {
     'pricing_edit.unlocked': '未锁定'
   },
   en: {
-    'CheckUpdatesTable.contextTierPolicy': 'Updating selected models replaces context tiers with source tiers, or clears them when absent, including manual tiers. Review the preview; locked models stay unchanged.',
+    'CheckUpdatesTable.contextTierPolicy':
+      'Updating selected models replaces context tiers with source tiers, or clears them when absent, including manual tiers. Review the preview; locked models stay unchanged.',
     'modelsDev.fetch': 'Fetch from models.dev',
-    'modelsDev.policy':
-      'Select models, then request a server preview. Choose one provider per model. Import keeps unselected models, existing non-context rules and channel types. Context tiers are replaced by the source or cleared when absent, including manually configured tiers. Cache ratios change only when the source provides the corresponding price.',
-    'modelsDev.provider': 'Source provider',
-    'modelsDev.conflict': 'Name conflict: choose a provider',
-    'modelsDev.selected': 'Selected',
-    'CheckUpdatesTable.updateModeMerge': 'Confirm selected price merge',
+    'modelsDev.skipped':
+      'Skipped {{count}} models with invalid prices or ambiguous sources. Overwrite deletes unlocked local models absent from this catalog; review the changes below.',
     'pricing_edit.unknown': 'Unknown',
     'modelpricePage.tokens': 'Tokens',
     'modelpricePage.times': 'Times',

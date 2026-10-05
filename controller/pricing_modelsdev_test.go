@@ -33,8 +33,11 @@ func TestModelsDevFetchPreviewApplyHTTPChain(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &fetched); err != nil || !fetched.Success {
 		t.Fatal(recorder.Body.String(), err)
 	}
-	source := []*model.Price{fetched.Data.Candidates[0].Price}
-	previewBody, _ := json.Marshal(map[string]any{"mode": "merge", "source": source})
+	if len(fetched.Data.Prices) != 1 || fetched.Data.Skipped != 1 || len(fetched.Data.Candidates) != 2 {
+		t.Fatalf("unexpected sync catalog: %+v", fetched.Data)
+	}
+	source := fetched.Data.Prices
+	previewBody, _ := json.Marshal(map[string]any{"mode": "add", "source": source})
 	response := performPricingRequest(t, router, "/preview", string(previewBody))
 	var preview struct {
 		Success bool                     `json:"success"`
@@ -43,7 +46,7 @@ func TestModelsDevFetchPreviewApplyHTTPChain(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &preview); err != nil || !preview.Success {
 		t.Fatal(response.Body.String(), err)
 	}
-	applyBody, _ := json.Marshal(map[string]any{"mode": "merge", "source": source, "base_version": preview.Data.BaseVersion, "digest": preview.Data.Digest})
+	applyBody, _ := json.Marshal(map[string]any{"mode": "add", "source": source, "base_version": preview.Data.BaseVersion, "digest": preview.Data.Digest})
 	response = performPricingRequest(t, router, "/apply", string(applyBody))
 	var applied struct {
 		Success bool  `json:"success"`
