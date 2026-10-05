@@ -283,3 +283,13 @@ func SafelyRecordMetric(f func()) {
 	}()
 	f()
 }
+
+// No proxy or account labels: credentials must never enter metric identities.
+var providerHTTPEgressCapacityExhausted = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "provider_http_egress_capacity_exhausted_total",
+	Help: "Provider HTTP attempts rejected locally because all egress transports are in use.",
+})
+
+func RecordProviderHTTPEgressCapacityExhausted() {
+	providerHTTPEgressCapacityExhausted.Inc()
+}

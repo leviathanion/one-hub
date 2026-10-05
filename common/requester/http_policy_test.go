@@ -103,8 +103,9 @@ func TestLongStreamProfileBoundsResponseHeaderWait(t *testing.T) {
 	if !ok {
 		t.Fatalf("server transport=%T, want *http.Transport", server.Client().Transport)
 	}
-	transports := newProviderHTTPTransportSet(transport)
-	resp, err, wroteRequest := doHTTPRequest(server.Client(), req, policy, transports.noKeepAlive)
+	noKeepAlive := cloneWithoutKeepAlives(transport)
+	defer noKeepAlive.CloseIdleConnections()
+	resp, err, wroteRequest := doHTTPRequest(server.Client(), req, policy, noKeepAlive)
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
 	}

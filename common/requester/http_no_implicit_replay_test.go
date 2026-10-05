@@ -31,7 +31,7 @@ type httpReplayDisconnectObservation struct {
 	firstTransferEncoding atomic.Value
 }
 
-func newHttpReplayDisconnectServer(t *testing.T) (*httptest.Server, *httpReplayDisconnectObservation) {
+func newHttpReplayDisconnectServer(t *testing.T) (*httptest.Server, *httpReplayDisconnectObservation, *HTTPRequester) {
 	t.Helper()
 	observation := &httpReplayDisconnectObservation{}
 	idle := make(chan struct{}, 1)
@@ -84,7 +84,12 @@ func newHttpReplayDisconnectServer(t *testing.T) (*httptest.Server, *httpReplayD
 	server.Start()
 	t.Cleanup(server.Close)
 
-	warmup, err := server.Client().Get(server.URL + "/warmup")
+	requester := httpReplayRequesterForServer(t, server)
+	warmupRequest, err := requester.NewRequest(http.MethodGet, server.URL+"/warmup")
+	if err != nil {
+		t.Fatalf("build requester warm-up: %v", err)
+	}
+	warmup, err := requester.Do(warmupRequest)
 	if err != nil {
 		t.Fatalf("warm up keep-alive connection: %v", err)
 	}
@@ -95,7 +100,7 @@ func newHttpReplayDisconnectServer(t *testing.T) (*httptest.Server, *httpReplayD
 		t.Fatal("warm-up request did not establish an idle keep-alive connection")
 	}
 
-	return server, observation
+	return server, observation, requester
 }
 
 func httpReplayRequesterForServer(t *testing.T, server *httptest.Server) *HTTPRequester {
@@ -112,6 +117,7 @@ func httpReplayRequesterForServer(t *testing.T, server *httptest.Server) *HTTPRe
 	if requester.transports == nil || requester.transports.normal != transport {
 		t.Fatal("requester did not capture the current transport factory pair")
 	}
+	t.Cleanup(requester.transports.egresses.closeIdleConnections)
 	return requester
 }
 
@@ -353,8 +359,7 @@ func TestWorkPOSTDisconnectIsNeverImplicitlyReplayed(t *testing.T) {
 		{name: "empty body with x idempotency key", headerName: "X-Idempotency-Key", key: "client-empty-x-1"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			server, observation := newHttpReplayDisconnectServer(t)
-			requester := httpReplayRequesterForServer(t, server)
+			server, observation, requester := newHttpReplayDisconnectServer(t)
 			options := []requestOption{requester.WithBody([]byte(test.body))}
 			var writeCount atomic.Int32
 			var gotConn atomic.Bool
@@ -433,6 +438,8 @@ func TestWorkPOSTDisconnectIsNeverImplicitlyReplayed(t *testing.T) {
 				if !gotConn.Load() || gotReused.Load() {
 					t.Fatalf("empty work operation did not use a fresh no-keep-alive connection: seen=%t reused=%t", gotConn.Load(), gotReused.Load())
 				}
+			} else if !gotConn.Load() || !gotReused.Load() {
+				t.Fatalf("nonempty work must exercise a reused connection: seen=%t reused=%t", gotConn.Load(), gotReused.Load())
 			}
 			if test.key != "" && req.Header.Get(test.headerName) != test.key {
 				t.Fatalf("transport policy changed caller header to %q", req.Header.Get(test.headerName))
@@ -570,7 +577,14 @@ func TestSafeGETKeepsTransportRetry(t *testing.T) {
 	server.Start()
 	defer server.Close()
 
-	warmup, err := server.Client().Get(server.URL + "/warmup")
+	requester := httpReplayRequesterForServer(t, server)
+	requester.UseHTTPProfile(HTTPProfileObservationGET)
+	warmupReq, err := requester.NewRequest(http.MethodGet, server.URL+"/warmup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Prime the same fixed-egress pool used by the observation below.
+	warmup, err := requester.Do(warmupReq)
 	if err != nil {
 		t.Fatalf("warm up keep-alive connection: %v", err)
 	}
@@ -581,8 +595,6 @@ func TestSafeGETKeepsTransportRetry(t *testing.T) {
 		t.Fatal("warm-up request did not establish an idle keep-alive connection")
 	}
 
-	requester := httpReplayRequesterForServer(t, server)
-	requester.UseHTTPProfile(HTTPProfileObservationGET)
 	req, err := requester.NewRequest(http.MethodGet, server.URL+"/observation")
 	if err != nil {
 		t.Fatalf("build observation request: %v", err)

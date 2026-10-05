@@ -349,7 +349,7 @@ func (p *CodexProvider) consumeResetCreditOnce(ctx context.Context) (*CodexReset
 		return nil, fmt.Errorf("HTTP client is not configured")
 	}
 
-	resp, err := requester.HTTPClient.Do(req)
+	resp, err := httpRequester.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -457,7 +457,7 @@ func (p *CodexProvider) fetchUsageSnapshotOnce(ctx context.Context) (*CodexUsage
 		return nil, err
 	}
 
-	resp, err := requester.HTTPClient.Do(req)
+	resp, err := httpRequester.Do(req)
 	if err != nil {
 		return nil, err
 	}
