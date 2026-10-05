@@ -160,7 +160,7 @@ test(
         if (!process.env.PRICING_UI_SCREENSHOTS) return;
         await mkdir(process.env.PRICING_UI_SCREENSHOTS, { recursive: true });
         await page.evaluate(() => document.fonts.ready);
-        await page.getByRole('dialog').screenshot({ path: path.join(process.env.PRICING_UI_SCREENSHOTS, `${name}.png`) });
+        await page.getByRole('dialog').screenshot({ path: path.join(process.env.PRICING_UI_SCREENSHOTS, `${name}.png`), animations: 'disabled' });
       };
       const ready = async (query = '') => {
         requests.length = 0;

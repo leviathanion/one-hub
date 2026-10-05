@@ -4,7 +4,6 @@ import {
   Box,
   Button,
   Card,
-  Chip,
   Dialog,
   DialogActions,
   DialogContent,
@@ -248,26 +247,15 @@ export const CheckUpdates = ({ open, onCancel, onOk, ownedby = [] }) => {
           {t('CheckUpdatesTable.cancel')}
         </Button>
         {reviewing && (
-          <Stack direction="row" spacing={1.5} alignItems="center">
-            {session.preview && (
-              <Chip
-                variant="outlined"
-                size="small"
-                label={t(`CheckUpdatesTable.updateMode${session.mode.charAt(0).toUpperCase()}${session.mode.slice(1)}`)}
-                color={session.mode === 'overwrite' ? 'warning' : 'default'}
-                sx={{ display: { xs: 'none', sm: 'inline-flex' } }}
-              />
-            )}
-            <LoadingButton
-              variant="contained"
-              onClick={apply}
-              loading={applying}
-              disabled={!session.preview || calculating || sync.changeCount === 0}
-              sx={{ px: { xs: 2, sm: 3 } }}
-            >
-              {session.preview ? t('pricingSync.apply', { count: sync.changeCount }) : t('pricingSync.applyPending')}
-            </LoadingButton>
-          </Stack>
+          <LoadingButton
+            variant="contained"
+            onClick={apply}
+            loading={applying}
+            disabled={!session.preview || calculating || sync.changeCount === 0}
+            sx={{ px: { xs: 2, sm: 3 } }}
+          >
+            {session.preview ? t('pricingSync.apply', { count: sync.changeCount }) : t('pricingSync.applyPending')}
+          </LoadingButton>
         )}
       </DialogActions>
     </Dialog>
