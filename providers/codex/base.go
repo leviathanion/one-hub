@@ -15,8 +15,8 @@ import (
 
 	"one-api/common/cache"
 	"one-api/common/config"
+	"one-api/common/credentials"
 	"one-api/common/logger"
-	commonredis "one-api/common/redis"
 	"one-api/common/requester"
 	"one-api/model"
 	"one-api/providers/base"
@@ -28,8 +28,7 @@ import (
 )
 
 const (
-	TokenCacheKey        = "api_token:codex"
-	refreshLockKeyPrefix = "codex:refresh-lock"
+	TokenCacheKey = "api_token:codex"
 	// Upstream may rotate the refresh token before the request context is canceled.
 	// Give the mandatory DB commit a small independent budget: this may outlive the
 	// caller briefly, but avoids losing the only valid rotated credential.
@@ -71,34 +70,12 @@ var channelRefreshLocks = struct {
 }
 
 var (
-	refreshLockTTL                  = 3 * time.Minute
-	refreshLockPollInterval         = 200 * time.Millisecond
-	refreshLockReleaseTimeout       = 3 * time.Second
-	refreshCredentialReloadInterval = 2 * time.Second
-	legacyCredentialExpiryFallback  = time.Hour
-	loadLatestChannelByID           = model.GetChannelByIdWithContext
-	compareAndSetChannelKey         = model.CompareAndSetChannelKeyWithContext
-	refreshOAuthCredentials         = func(creds *OAuth2Credentials, ctx context.Context, proxyURL string) error {
+	legacyCredentialExpiryFallback = time.Hour
+	loadLatestChannelByID          = model.GetChannelByIdWithContext
+	refreshOAuthCredentials        = func(creds *OAuth2Credentials, ctx context.Context, proxyURL string) error {
 		return creds.Refresh(ctx, proxyURL)
 	}
-	claimCredentialRotation            = model.ClaimCredentialRotation
-	commitCredentialRotation           = model.CommitCredentialRotation
-	cancelCredentialRotation           = model.CancelCredentialRotationBeforeDispatch
-	acquireDistributedRefreshLockSetNX = func(ctx context.Context, key string, value any, ttl time.Duration) (bool, error) {
-		client := commonredis.GetRedisClient()
-		if client == nil {
-			return false, fmt.Errorf("redis client is not configured")
-		}
-		return client.SetNX(ctx, key, value, ttl).Result()
-	}
 )
-
-var releaseRefreshLockScript = commonredis.NewScript(`
-if redis.call("GET", KEYS[1]) == ARGV[1] then
-	return redis.call("DEL", KEYS[1])
-end
-return 0
-`)
 
 type CodexProviderFactory struct{}
 
@@ -143,20 +120,16 @@ type CodexProvider struct {
 	openai.OpenAIProvider
 	Credentials *OAuth2Credentials // OAuth2 credentials (with refresh_token).
 
-	credentialsMu           sync.RWMutex
-	runtimeMu               sync.RWMutex
-	credentialPersistenceMu sync.Mutex
-	credentialDirty         bool
-	credentialExpectedKey   string
-	credentialRotatedKey    string
-	channelOptionsMu        sync.Mutex
-	channelOptions          *codexChannelOptions
-	channelOptionsLoaded    bool
-	channelPolicyMu         sync.Mutex
-	channelPolicyLoaded     bool
-	channelPolicyKey        string
-	channelPolicy           wire.ChannelPolicy
-	channelPolicyErr        error
+	credentialsMu        sync.RWMutex
+	runtimeMu            sync.RWMutex
+	channelOptionsMu     sync.Mutex
+	channelOptions       *codexChannelOptions
+	channelOptionsLoaded bool
+	channelPolicyMu      sync.Mutex
+	channelPolicyLoaded  bool
+	channelPolicyKey     string
+	channelPolicy        wire.ChannelPolicy
+	channelPolicyErr     error
 }
 
 func prepareChannelForProvider(channel *model.Channel) *model.Channel {
@@ -577,7 +550,7 @@ func (p *CodexProvider) handleTokenError(err error) *types.OpenAIErrorWithStatus
 		LocalError:           true,
 		UpstreamNotAttempted: true,
 	}
-	if errors.Is(err, ErrOAuthRefreshOutcomeAmbiguous) || errors.Is(err, ErrOAuthCredentialsRequireReauthorization) {
+	if !errors.Is(err, errCodexCredentialPersistence) && (errors.Is(err, ErrOAuthRefreshOutcomeAmbiguous) || errors.Is(err, ErrCredentialReauthorizationRequired)) {
 		apiErr.Message = codexTokenReauthorizationClientMessage
 		apiErr.StatusCode = http.StatusUnauthorized
 		apiErr.LocalError = false
@@ -603,18 +576,8 @@ func (p *CodexProvider) getToken(ctx context.Context) (string, error) {
 func (p *CodexProvider) getTokenLocked(ctx context.Context) (string, error) {
 	ctx = ensureContext(ctx)
 
-	if err := p.commitPendingCredentialsWithCredentialLock(ctx); err != nil {
-		return "", fmt.Errorf("failed to commit pending credentials: %w", err)
-	}
 	if p.Credentials == nil {
 		return "", fmt.Errorf("credentials not configured")
-	}
-	// A prior OAuth rotation may have succeeded while its DB commit failed. Retry
-	// that commit before inspecting, caching, or returning any token state.
-	if p.hasDirtyCredentials() {
-		if err := p.persistRefreshedCredentials(ctx); err != nil {
-			return "", fmt.Errorf("failed to refresh token: %w", err)
-		}
 	}
 	if p.Credentials.AccessToken == "" {
 		return "", fmt.Errorf("access token is empty")
@@ -641,7 +604,7 @@ func (p *CodexProvider) getTokenLocked(ctx context.Context) (string, error) {
 	}
 
 	if _, err := p.refreshTokenIfNeededLocked(ctx, 3*time.Minute); err != nil {
-		if errors.Is(err, errCodexCredentialPersistence) {
+		if errors.Is(err, errCodexCredentialPersistence) || errors.Is(err, ErrCredentialRefreshSuperseded) {
 			return "", fmt.Errorf("failed to refresh token: %w", err)
 		}
 		if err := ctx.Err(); err != nil {
@@ -754,14 +717,11 @@ func (p *CodexProvider) rotateOnce(ctx context.Context, lead time.Duration, forc
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	// Persisted channels always run the fence protocol. A DB-less provider exists
-	// only in isolated embedders/tests and has no shared authority to fence; retain
-	// the historical in-process path for that non-production shape.
-	if model.DB == nil {
-		return p.rotateWithoutDurableAuthority(ctx, lead, forced, previous)
+	if model.DB == nil && p.channelID() > 0 {
+		return false, fmt.Errorf("database is not initialized")
 	}
 
-	// Claim must be based on the authoritative credential and revision.  A load
+	// Claim must be based on the authoritative credential and version.  A load
 	// failure is fail-closed and therefore guarantees zero OAuth calls.
 	if p.channelID() > 0 {
 		if err := p.loadLatestCredentialsFromDatabase(ctx); err != nil {
@@ -773,10 +733,6 @@ func (p *CodexProvider) rotateOnce(ctx context.Context, lead time.Duration, forc
 		return false, nil
 	}
 	if forced && credentialsVersion(p.Credentials) != previous {
-		p.cacheCurrentToken(ctx)
-		return true, nil
-	}
-	if forced && p.credentialsChangedSince(ctx, previous, true) {
 		p.cacheCurrentToken(ctx)
 		return true, nil
 	}
@@ -798,25 +754,29 @@ func (p *CodexProvider) rotateOnce(ctx context.Context, lead time.Duration, forc
 		p.Credentials = rotated
 		return true, nil
 	}
-	if channel.CredentialRefreshFence != nil {
+	refresh, stateErr := credentials.ReadRefresh(channel.InternalState)
+	if stateErr != nil {
+		return false, stateErr
+	}
+	if refresh != nil {
 		credentialRotationClaims.WithLabelValues("busy").Inc()
-		return false, credentialFenceError(channel)
+		return false, credentialFenceError(refresh)
 	}
 
-	ticket := model.CredentialRotationTicket{ChannelID: channel.Id, AttemptID: uuid.NewString(), ExpectedRevision: channel.CredentialRevision}
-	claim, err := claimCredentialRotation(ctx, ticket, time.Now())
+	ticket := credentials.Ticket{ChannelID: channel.Id, AttemptID: uuid.NewString(), ExpectedVersion: channel.Version, Type: channel.Type}
+	claim, err := CredentialRotation.Claim(ctx, ticket, time.Now())
 	if err != nil {
 		credentialRotationClaims.WithLabelValues("error").Inc()
 		return false, fmt.Errorf("claim credential refresh fence: %w", err)
 	}
 	switch claim {
-	case model.CredentialRotationClaimBusy:
+	case credentials.ClaimBusy:
 		credentialRotationClaims.WithLabelValues("busy").Inc()
 		return false, ErrCredentialRefreshInProgress
-	case model.CredentialRotationClaimSuperseded:
+	case credentials.ClaimSuperseded:
 		credentialRotationClaims.WithLabelValues("superseded").Inc()
 		return false, ErrCredentialRefreshSuperseded
-	case model.CredentialRotationClaimAcquired:
+	case credentials.ClaimAcquired:
 		credentialRotationClaims.WithLabelValues("acquired").Inc()
 	default:
 		return false, fmt.Errorf("unknown credential refresh claim outcome %d", claim)
@@ -832,7 +792,7 @@ func (p *CodexProvider) rotateOnce(ctx context.Context, lead time.Duration, forc
 		}
 		// Only an explicit pre-dispatch classification may clear the fence.
 		cancelCtx, cancelFence := context.WithTimeout(context.WithoutCancel(ctx), refreshCredentialPersistTimeout)
-		_, cancelErr := cancelCredentialRotation(cancelCtx, ticket)
+		_, cancelErr := CredentialRotation.Cancel(cancelCtx, ticket)
 		cancelFence()
 		if cancelErr != nil {
 			credentialRotations.WithLabelValues("cancel_error", reason).Inc()
@@ -852,82 +812,26 @@ func (p *CodexProvider) rotateOnce(ctx context.Context, lead time.Duration, forc
 
 	commitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), refreshCredentialPersistTimeout)
 	defer cancel()
-	for attempt := 0; attempt < 3; attempt++ {
-		outcome, commitErr := commitCredentialRotation(commitCtx, ticket, rotatedKey)
-		switch outcome {
-		case model.CredentialRotationCommitApplied, model.CredentialRotationCommitAlreadyApplied:
-			credentialRotations.WithLabelValues("committed", reason).Inc()
-			p.Credentials = rotated
-			p.syncRuntimeKeyWithAccessToken(rotatedKey, rotated.AccessToken)
-			p.cacheCurrentToken(ctx)
-			return true, nil
-		case model.CredentialRotationCommitSuperseded:
-			credentialRotations.WithLabelValues("superseded", reason).Inc()
-			_ = p.loadLatestCredentialsFromDatabase(commitCtx)
-			return false, errors.Join(ErrCredentialRefreshSuperseded, commitErr)
-		case model.CredentialRotationCommitStillFenced:
-			if attempt == 2 || commitCtx.Err() != nil {
-				credentialRotationCommitRetries.WithLabelValues("exhausted").Inc()
-				credentialRotationUnresolved.WithLabelValues("commit_exhausted").Inc()
-				return false, errors.Join(errCodexCredentialPersistence, ErrCredentialReauthorizationRequired, commitErr)
-			}
-			credentialRotationCommitRetries.WithLabelValues("retry").Inc()
-			if err := waitForRetry(commitCtx, time.Duration(attempt+1)*50*time.Millisecond); err != nil {
-				return false, errors.Join(errCodexCredentialPersistence, ErrCredentialReauthorizationRequired, err)
-			}
-		}
-	}
-	return false, errors.Join(errCodexCredentialPersistence, ErrCredentialReauthorizationRequired)
-}
-
-func (p *CodexProvider) rotateWithoutDurableAuthority(ctx context.Context, lead time.Duration, forced bool, previous credentialVersionSnapshot) (bool, error) {
-	if err := p.commitPendingCredentialsLocked(ctx); err != nil {
-		return false, err
-	}
-	if p.Credentials == nil || p.Credentials.RefreshToken == "" {
-		return false, nil
-	}
-	if p.hasDirtyCredentials() {
-		if err := p.persistRefreshedCredentials(ctx); err != nil {
-			return false, err
-		}
-	}
-	if !forced {
-		if cached := p.getCachedCredentialSnapshot(ctx, lead); cached.AccessToken != "" {
-			p.adoptCachedCredentials(cached)
-			return false, nil
-		}
-	}
-	if err := p.loadLatestCredentialsFromDatabase(ctx); err != nil {
-		return false, err
-	}
-	if forced && credentialsVersion(p.Credentials) != previous {
+	outcome, commitErr := CredentialRotation.Commit(commitCtx, ticket, rotatedKey)
+	switch outcome {
+	case credentials.CommitApplied, credentials.CommitAlreadyApplied:
+		credentialRotations.WithLabelValues("committed", reason).Inc()
+		p.Credentials = rotated
+		p.syncRuntimeKeyWithAccessToken(rotatedKey, rotated.AccessToken)
 		p.cacheCurrentToken(ctx)
 		return true, nil
+	case credentials.CommitSuperseded:
+		credentialRotations.WithLabelValues("superseded", reason).Inc()
+		_ = p.loadLatestCredentialsFromDatabase(commitCtx)
+		return false, errors.Join(ErrCredentialRefreshSuperseded, commitErr)
+	default:
+		credentialRotationUnresolved.WithLabelValues("commit_exhausted").Inc()
+		return false, errors.Join(errCodexCredentialPersistence, ErrCredentialReauthorizationRequired, commitErr)
 	}
-	if forced && p.credentialsChangedSince(ctx, previous, true) {
-		p.cacheCurrentToken(ctx)
-		return true, nil
-	}
-	if !forced && !p.Credentials.NeedsRefreshWithin(lead) {
-		p.cacheCurrentToken(ctx)
-		return false, nil
-	}
-	if !forced && p.refreshNoLongerNeeded(ctx, lead, true) {
-		return false, nil
-	}
-	if err := p.refreshCredentials(ctx); err != nil {
-		return false, err
-	}
-	if err := p.persistRefreshedCredentials(ctx); err != nil {
-		return false, err
-	}
-	p.cacheCurrentToken(ctx)
-	return true, nil
 }
 
-func credentialFenceError(channel *model.Channel) error {
-	if channel != nil && channel.CredentialRefreshStartedAt != nil && time.Since(time.Unix(*channel.CredentialRefreshStartedAt, 0)) <= refreshCredentialPersistTimeout {
+func credentialFenceError(refresh *credentials.Refresh) error {
+	if time.Since(time.Unix(refresh.StartedAt, 0)) <= refreshCredentialPersistTimeout {
 		return ErrCredentialRefreshInProgress
 	}
 	return errors.Join(ErrCredentialRefreshUnresolved, ErrCredentialReauthorizationRequired)
@@ -944,64 +848,7 @@ func (p *CodexProvider) sanitizeRefreshError(err error) error {
 	return sanitizeTokenRefreshError(err, p.Credentials, clientID)
 }
 
-func (p *CodexProvider) refreshCredentials(ctx context.Context) error {
-	proxyURL := ""
-	channel := p.codexChannel()
-	if channel != nil && channel.Proxy != nil && *channel.Proxy != "" {
-		proxyURL = *channel.Proxy
-	}
-	p.credentialPersistenceMu.Lock()
-	defer p.credentialPersistenceMu.Unlock()
-	if p.Credentials == nil {
-		return fmt.Errorf("credentials not configured")
-	}
-	expectedKey := ""
-	if channel != nil {
-		expectedKey = channel.Key
-	}
-	channelID := p.channelID()
-	if channelID > 0 && expectedKey == "" {
-		return fmt.Errorf("durable channel key is empty")
-	}
-	if err := requireUnambiguousCredentialRefresh(channelID, expectedKey); err != nil {
-		return err
-	}
-
-	// Never mutate the active credential object before the rotated value is
-	// durable. Error paths therefore keep serving neither a hidden new token nor a
-	// cache entry peers cannot reproduce.
-	rotatedCredentials := cloneOAuth2Credentials(p.Credentials)
-	if err := refreshOAuthCredentials(rotatedCredentials, ctx, proxyURL); err != nil {
-		if errors.Is(err, ErrOAuthRefreshOutcomeAmbiguous) {
-			rememberAmbiguousCredentialRefresh(channelID, expectedKey)
-		}
-		return err
-	}
-	rotatedKey, err := rotatedCredentials.ToJSON()
-	if err != nil {
-		return fmt.Errorf("serialize rotated credentials: %w", err)
-	}
-
-	// Id-less providers have no durable authority and are used only by isolated
-	// callers. Persisted channels always journal before returning from this method.
-	if channelID <= 0 {
-		p.Credentials = rotatedCredentials
-		return nil
-	}
-
-	p.credentialExpectedKey = expectedKey
-	p.credentialRotatedKey = rotatedKey
-	p.credentialDirty = true
-	if err := rememberPendingCredentialCommit(channelID, expectedKey, rotatedKey); err != nil {
-		return fmt.Errorf("record rotated credentials for recovery: %w", err)
-	}
-	return nil
-}
-
 func (p *CodexProvider) cacheCurrentToken(ctx context.Context) {
-	if p.hasDirtyCredentials() {
-		return
-	}
 	channel := p.codexChannel()
 	if channel == nil || p.Credentials == nil || p.Credentials.AccessToken == "" {
 		return
@@ -1025,90 +872,6 @@ func (p *CodexProvider) cacheCurrentToken(ctx context.Context) {
 	}, cacheDuration)
 }
 
-func (p *CodexProvider) hasDirtyCredentials() bool {
-	if p == nil {
-		return false
-	}
-	p.credentialPersistenceMu.Lock()
-	defer p.credentialPersistenceMu.Unlock()
-	return p.credentialDirty
-}
-
-func (p *CodexProvider) persistRefreshedCredentials(operationCtx context.Context) error {
-	p.credentialPersistenceMu.Lock()
-	defer p.credentialPersistenceMu.Unlock()
-	if !p.credentialDirty {
-		return nil
-	}
-	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ensureContext(operationCtx)), refreshCredentialPersistTimeout)
-	defer cancel()
-	if err := p.saveCredentialsToDatabase(persistCtx); err != nil {
-		return fmt.Errorf("%w: %w", errCodexCredentialPersistence, err)
-	}
-	p.credentialDirty = false
-	p.credentialExpectedKey = ""
-	p.credentialRotatedKey = ""
-	return nil
-}
-
-func (p *CodexProvider) saveCredentialsToDatabase(ctx context.Context) error {
-	channel := p.codexChannel()
-	if channel == nil || channel.Id <= 0 {
-		return fmt.Errorf("channel not configured")
-	}
-	channelID := channel.Id
-	expectedKey := p.credentialExpectedKey
-	rotatedKey := p.credentialRotatedKey
-	if expectedKey == "" || rotatedKey == "" {
-		return fmt.Errorf("pending credential commit is not configured")
-	}
-	rotatedCredentials, err := parseRotatedCredentials(rotatedKey)
-	if err != nil {
-		return err
-	}
-
-	updated, err := compareAndSetChannelKey(ensureContext(ctx), channelID, expectedKey, rotatedKey)
-	if err != nil {
-		return fmt.Errorf("failed to compare-and-set channel key: %w", err)
-	}
-	if !updated {
-		// A CAS miss is ambiguous until durable state is reloaded. In particular, a
-		// peer may have committed this exact rotation. Never clear dirty/pending or
-		// expose the rotated token while that reload is unavailable.
-		if reloadErr := p.loadLatestCredentialsFromDatabase(ctx); reloadErr != nil {
-			return fmt.Errorf("%w; reload latest credentials: %v", errCodexCredentialCASConflict, reloadErr)
-		}
-		latest := p.codexChannel()
-		if latest != nil && latest.Key == rotatedKey {
-			clearPendingCredentialCommit(channelID, rotatedKey)
-			p.credentialDirty = false
-			p.credentialExpectedKey = ""
-			p.credentialRotatedKey = ""
-			return nil
-		}
-		if latest != nil && latest.Key != expectedKey {
-			// A different durable value is an intentional/manual winner. The reload
-			// already adopted it, so the stale pending rotation can be discarded.
-			clearPendingCredentialCommit(channelID, rotatedKey)
-			p.credentialDirty = false
-			p.credentialExpectedKey = ""
-			p.credentialRotatedKey = ""
-			return errCodexCredentialCASConflict
-		}
-		// A spurious miss with the expected value still in the DB is unresolved.
-		// The active provider continues to hold the durable old credential; the
-		// rotated value remains only in the recovery journal.
-		return errCodexCredentialCASConflict
-	}
-	clearPendingCredentialCommit(channelID, rotatedKey)
-	// Publish runtime credentials only after durable storage accepts them.
-	p.Credentials = rotatedCredentials
-	p.syncRuntimeKeyWithAccessToken(rotatedKey, rotatedCredentials.AccessToken)
-
-	logger.LogInfo(ctx, fmt.Sprintf("[Codex] Credentials saved to database for channel %d", channelID))
-	return nil
-}
-
 func parseCredentialsFromKey(rawKey string) *OAuth2Credentials {
 	key := strings.TrimSpace(rawKey)
 	if key == "" {
@@ -1125,18 +888,6 @@ func parseCredentialsFromKey(rawKey string) *OAuth2Credentials {
 
 	normalizeCredentials(creds)
 	return creds
-}
-
-func parseRotatedCredentials(rawKey string) (*OAuth2Credentials, error) {
-	credentials, err := FromJSON(strings.TrimSpace(rawKey))
-	if err != nil {
-		return nil, fmt.Errorf("pending rotated credentials are invalid: %w", err)
-	}
-	normalizeCredentials(credentials)
-	if strings.TrimSpace(credentials.AccessToken) == "" || strings.TrimSpace(credentials.RefreshToken) == "" {
-		return nil, fmt.Errorf("pending rotated credentials are incomplete")
-	}
-	return credentials, nil
 }
 
 func cloneOAuth2Credentials(credentials *OAuth2Credentials) *OAuth2Credentials {
@@ -1319,21 +1070,6 @@ func credentialsVersion(creds *OAuth2Credentials) credentialVersionSnapshot {
 	}
 }
 
-func (p *CodexProvider) credentialsChangedSince(ctx context.Context, previous credentialVersionSnapshot, reloadFromDatabase bool) bool {
-	if reloadFromDatabase {
-		if err := p.loadLatestCredentialsFromDatabase(ctx); err != nil {
-			return false
-		}
-	}
-
-	current := credentialsVersion(p.Credentials)
-	if current == (credentialVersionSnapshot{}) {
-		return false
-	}
-
-	return current != previous
-}
-
 func (p *CodexProvider) getCachedCredentialSnapshot(ctx context.Context, lead time.Duration) cachedCredentialSnapshot {
 	channel := p.codexChannel()
 	if channel == nil || channel.Id <= 0 {
@@ -1372,7 +1108,7 @@ func (p *CodexProvider) adoptCachedCredentials(snapshot cachedCredentialSnapshot
 }
 
 func (p *CodexProvider) getCurrentValidToken(ctx context.Context) string {
-	if p == nil || p.Credentials == nil || p.hasDirtyCredentials() {
+	if p == nil || p.Credentials == nil {
 		return ""
 	}
 
@@ -1398,6 +1134,12 @@ func (p *CodexProvider) loadLatestCredentialsFromDatabase(ctx context.Context) e
 		return err
 	}
 
+	// An editable channel ID can be reassigned to another provider. Never
+	// interpret its credentials or publish them through this Codex instance.
+	if channel.Type != config.ChannelTypeCodex {
+		return ErrCredentialRefreshSuperseded
+	}
+
 	latestCreds := parseCredentialsFromKey(channel.Key)
 	if latestCreds == nil {
 		return fmt.Errorf("channel key is empty")
@@ -1406,134 +1148,6 @@ func (p *CodexProvider) loadLatestCredentialsFromDatabase(ctx context.Context) e
 	p.Credentials = latestCreds
 	p.syncRuntimeChannelWithAccessToken(channel, latestCreds.AccessToken)
 	return nil
-}
-
-type distributedRefreshLock struct {
-	key   string
-	value string
-}
-
-func (l *distributedRefreshLock) Release() {
-	if l == nil || l.key == "" || l.value == "" || commonredis.GetRedisClient() == nil {
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), refreshLockReleaseTimeout)
-	defer cancel()
-
-	if _, err := commonredis.ScriptRunCtx(ctx, releaseRefreshLockScript, []string{l.key}, l.value); err != nil {
-		logger.SysError("[Codex] failed to release distributed refresh lock: " + err.Error())
-	}
-}
-
-func (p *CodexProvider) acquireDistributedRefreshLock(ctx context.Context, lead time.Duration) (*distributedRefreshLock, bool, error) {
-	if !config.RedisEnabled || commonredis.GetRedisClient() == nil || p.channelID() <= 0 {
-		return nil, false, nil
-	}
-
-	requestCtx, cancel := context.WithTimeout(ensureContext(ctx), refreshLockTTL)
-	defer cancel()
-
-	lock := &distributedRefreshLock{
-		key:   refreshLockKey(p.channelID()),
-		value: uuid.NewString(),
-	}
-	nextCredentialReloadAt := time.Time{}
-
-	for {
-		acquired, err := acquireDistributedRefreshLockSetNX(requestCtx, lock.key, lock.value, refreshLockTTL)
-		if err != nil {
-			lockErr := fmt.Errorf("failed to acquire distributed refresh lock for channel %d: %w", p.channelID(), err)
-			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-				if ctx != nil {
-					logger.LogInfo(ctx, "[Codex] "+lockErr.Error())
-				} else {
-					logger.SysLog("[Codex] " + lockErr.Error())
-				}
-			} else if ctx != nil {
-				logger.LogWarn(ctx, "[Codex] "+lockErr.Error())
-			} else {
-				logger.SysError("[Codex] " + lockErr.Error())
-			}
-			return nil, false, lockErr
-		}
-		if acquired {
-			return lock, false, nil
-		}
-		shouldReloadCredentials := nextCredentialReloadAt.IsZero() || !time.Now().Before(nextCredentialReloadAt)
-		if p.refreshNoLongerNeeded(requestCtx, lead, shouldReloadCredentials) {
-			return nil, true, nil
-		}
-		if shouldReloadCredentials {
-			nextCredentialReloadAt = time.Now().Add(refreshCredentialReloadInterval)
-		}
-		if err := waitForRetry(requestCtx, refreshLockPollInterval); err != nil {
-			return nil, false, fmt.Errorf("waiting for another instance to finish refresh: %w", err)
-		}
-	}
-}
-
-func (p *CodexProvider) acquireDistributedForceRefreshLock(ctx context.Context, previousCredentialsVersion credentialVersionSnapshot) (*distributedRefreshLock, bool, error) {
-	if !config.RedisEnabled || commonredis.GetRedisClient() == nil || p.channelID() <= 0 {
-		return nil, false, nil
-	}
-
-	requestCtx, cancel := context.WithTimeout(ensureContext(ctx), refreshLockTTL)
-	defer cancel()
-
-	lock := &distributedRefreshLock{
-		key:   refreshLockKey(p.channelID()),
-		value: uuid.NewString(),
-	}
-	nextCredentialReloadAt := time.Time{}
-
-	for {
-		acquired, err := acquireDistributedRefreshLockSetNX(requestCtx, lock.key, lock.value, refreshLockTTL)
-		if err != nil {
-			return nil, false, fmt.Errorf("failed to acquire distributed forced refresh lock for channel %d: %w", p.channelID(), err)
-		}
-		if acquired {
-			return lock, false, nil
-		}
-
-		shouldReloadCredentials := nextCredentialReloadAt.IsZero() || !time.Now().Before(nextCredentialReloadAt)
-		if shouldReloadCredentials {
-			if p.credentialsChangedSince(requestCtx, previousCredentialsVersion, true) {
-				p.cacheCurrentToken(requestCtx)
-				return nil, true, nil
-			}
-			nextCredentialReloadAt = time.Now().Add(refreshCredentialReloadInterval)
-		}
-
-		if err := waitForRetry(requestCtx, refreshLockPollInterval); err != nil {
-			return nil, false, fmt.Errorf("waiting for another instance to finish forced refresh: %w", err)
-		}
-	}
-}
-
-func (p *CodexProvider) refreshNoLongerNeeded(ctx context.Context, lead time.Duration, reloadFromDatabase bool) bool {
-	if cachedCredentials := p.getCachedCredentialSnapshot(ctx, lead); cachedCredentials.AccessToken != "" {
-		p.adoptCachedCredentials(cachedCredentials)
-		return true
-	}
-	if !reloadFromDatabase {
-		return false
-	}
-	if err := p.loadLatestCredentialsFromDatabase(ctx); err != nil {
-		return false
-	}
-	if p.Credentials == nil || p.Credentials.RefreshToken == "" {
-		return true
-	}
-	if !p.Credentials.NeedsRefreshWithin(lead) {
-		p.cacheCurrentToken(ctx)
-		return true
-	}
-	return false
-}
-
-func refreshLockKey(channelID int) string {
-	return fmt.Sprintf("%s:%d", refreshLockKeyPrefix, channelID)
 }
 
 func expiresWithinLead(expiresAt time.Time, lead time.Duration) bool {

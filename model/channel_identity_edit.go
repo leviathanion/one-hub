@@ -2,6 +2,7 @@ package model
 
 import (
 	"errors"
+	"one-api/common/credentials"
 	"strings"
 )
 
@@ -22,8 +23,8 @@ func prepareChannelIdentityEdit(persisted, candidate *Channel, allowIdentityChan
 	if candidate.Key != persisted.Key && strings.TrimSpace(candidate.Key) == "" {
 		return false, errors.New("渠道凭据不能为空；保留原凭据时请不要提交 key")
 	}
-	if persisted.CredentialRefreshFence != nil {
-		return false, errors.New("渠道凭据正在刷新或结果尚未确定，请完成凭据恢复后再修改连接配置")
+	if err := credentials.RequireEditable(persisted.InternalState); err != nil {
+		return false, err
 	}
 	return true, nil
 }

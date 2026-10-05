@@ -710,6 +710,7 @@ func beforeAutoMigrateMigrations() []*gormigrate.Migration {
 		changeTokenKeyColumnType(),
 		migrateUserIdentityUniqueness(),
 		consolidatePersistenceProjections(),
+		migrateChannelInternalState(),
 	}
 }
 

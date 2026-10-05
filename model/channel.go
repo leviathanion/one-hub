@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"slices"
 	"strings"
-	"time"
 
 	"one-api/common/cache"
 	"one-api/common/config"
@@ -55,13 +54,10 @@ type Channel struct {
 	Plugin    *datatypes.JSONType[PluginType] `json:"plugin" form:"plugin" gorm:"type:json" tag_config:"sync"`
 	DeletedAt gorm.DeletedAt                  `json:"-" gorm:"index"`
 
-	// CredentialRevision fences credentials, connection identity edits and deletion. The
-	// refresh fence deliberately lives beside the credential authority so claim,
-	// commit and lifecycle supersession are single-row atomic operations.
-	CredentialRevision         uint64  `json:"-" gorm:"column:credential_revision;not null;default:0"`
-	CredentialRefreshFence     *string `json:"-" gorm:"column:credential_refresh_fence;type:varchar(36)"`
-	CredentialRefreshStartedAt *int64  `json:"-" gorm:"column:credential_refresh_started_at"`
-	CredentialRefreshState     string  `json:"credential_refresh_state,omitempty" gorm:"-"`
+	// Version protects configuration, credentials and internal state, not telemetry.
+	Version uint64 `json:"version" gorm:"not null;default:0"`
+	// InternalState is server-owned persistent state; never copy it with configuration.
+	InternalState datatypes.JSON `json:"-" gorm:"column:internal_state;type:json"`
 
 	parsedModelMapping    map[string]string          `json:"-" gorm:"-"`
 	parsedModelHeaders    map[string]string          `json:"-" gorm:"-"`
@@ -76,18 +72,6 @@ type Channel struct {
 	lastModelHeaders      string                     `json:"-" gorm:"-"`
 	lastCustomParameter   string                     `json:"-" gorm:"-"`
 	lastOther             string                     `json:"-" gorm:"-"`
-}
-
-func (c *Channel) AfterFind(_ *gorm.DB) error {
-	if c.CredentialRefreshFence == nil {
-		c.CredentialRefreshState = "ready"
-		return nil
-	}
-	c.CredentialRefreshState = "unresolved"
-	if c.CredentialRefreshStartedAt != nil && time.Since(time.Unix(*c.CredentialRefreshStartedAt, 0)) <= 5*time.Second {
-		c.CredentialRefreshState = "in_progress"
-	}
-	return nil
 }
 
 func (c *Channel) AllowStream(modelName string) bool {
@@ -362,7 +346,7 @@ func GetChannelsByTag(tag string) ([]*Channel, error) {
 }
 
 func DeleteChannelTag(channelId int) error {
-	result := DB.Model(&Channel{}).Where("id = ?", channelId).Update("tag", "")
+	result := DB.Model(&Channel{}).Where("id = ?", channelId).Updates(map[string]any{"tag": "", "version": gorm.Expr("version + 1")})
 	if result.Error != nil {
 		return result.Error
 	}
@@ -437,7 +421,7 @@ func deleteChannelsMatching(scope func(*gorm.DB) *gorm.DB) (int64, error) {
 	// A soft delete is a new lifecycle incarnation.  Advance the generation in
 	// the same transaction, but retain a non-empty fence: deleting a row cannot
 	// make its possibly-consumed refresh token safe again.
-	if err := scope(tx.Model(&Channel{})).UpdateColumn("credential_revision", gorm.Expr("credential_revision + 1")).Error; err != nil {
+	if err := scope(tx.Model(&Channel{})).UpdateColumn("version", gorm.Expr("version + 1")).Error; err != nil {
 		tx.Rollback()
 		return 0, err
 	}
@@ -464,6 +448,8 @@ func BatchDeleteChannel(ids []int) (int64, error) {
 
 func BatchInsertChannels(channels []Channel) error {
 	for i := range channels {
+		channels[i].Version = 0
+		channels[i].InternalState = nil
 		if err := channels[i].CanonicalizeRuntimeConfigJSON(); err != nil {
 			return err
 		}
@@ -506,7 +492,7 @@ func BatchUpdateChannelsAzureApi(params *BatchChannelsParams) (int64, error) {
 		return 0, fmt.Errorf("api_version is required")
 	}
 	var channels []Channel
-	if err := DB.Select("id, type, other").Find(&channels, "id IN ?", params.Ids).Error; err != nil {
+	if err := DB.Select("id, type, other, version").Find(&channels, "id IN ?", params.Ids).Error; err != nil {
 		return 0, err
 	}
 	for i := range channels {
@@ -532,9 +518,12 @@ func BatchUpdateChannelsAzureApi(params *BatchChannelsParams) (int64, error) {
 			if err != nil {
 				return err
 			}
-			result := tx.Model(&Channel{}).Where("id = ?", channels[i].Id).Update("other", string(updated))
+			result := tx.Model(&Channel{}).Where("id = ? AND version = ?", channels[i].Id, channels[i].Version).Updates(map[string]any{"other": string(updated), "version": gorm.Expr("version + 1")})
 			if result.Error != nil {
 				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return ErrChannelVersionConflict
 			}
 			rowsAffected += result.RowsAffected
 			if result.RowsAffected > 0 {
@@ -597,7 +586,7 @@ func BatchDelModelChannelsWithContext(ctx context.Context, params *BatchDelModel
 			channel.Models = strings.Join(remainingModels, ",")
 			result := tx.Model(&Channel{}).
 				Where("id = ? AND models = ?", channel.Id, oldModels).
-				Update("models", channel.Models)
+				Updates(map[string]any{"models": channel.Models, "version": gorm.Expr("version + 1")})
 			if result.Error != nil {
 				return result.Error
 			}
@@ -785,6 +774,8 @@ func (channel *Channel) ParseRuntimeConfig() {
 }
 
 func (channel *Channel) Insert() error {
+	channel.Version = 0
+	channel.InternalState = nil
 	if err := channel.CanonicalizeRuntimeConfigJSON(); err != nil {
 		return err
 	}
@@ -811,6 +802,8 @@ type ChannelUpdateOptions struct {
 	OtherSubmitted      bool
 	BaseURLSubmitted    bool
 	AllowIdentityChange bool
+	ExpectedVersion     *uint64
+	ExpectedVersions    map[int]uint64
 }
 
 func (channel *Channel) UpdateWithOptions(overwrite bool, options ChannelUpdateOptions) error {
@@ -887,6 +880,9 @@ func (channel *Channel) updateWithDB(db *gorm.DB, overwrite bool, options Channe
 	if err := query.First(&persisted, "id = ?", channel.Id).Error; err != nil {
 		return false, false, err
 	}
+	if options.ExpectedVersion != nil && persisted.Version != *options.ExpectedVersion {
+		return false, false, ErrChannelVersionConflict
+	}
 	candidate, updates := channelMetadataUpdate(&persisted, channel, overwrite, options)
 	if err := candidate.CanonicalizeRuntimeConfigJSON(); err != nil {
 		return false, false, err
@@ -901,20 +897,31 @@ func (channel *Channel) updateWithDB(db *gorm.DB, overwrite bool, options Channe
 	if identityChanged {
 		// 只有管理端身份编辑写这些列；元数据编辑不会覆盖并发轮换得到的凭据。
 		updates["type"], updates["key"], updates["base_url"] = candidate.Type, candidate.Key, candidate.BaseURL
-		updates["credential_revision"] = gorm.Expr("credential_revision + 1")
+	} else {
+		candidate.Type, candidate.Key, candidate.BaseURL = persisted.Type, persisted.Key, persisted.BaseURL
 	}
 	if _, submitted := updates["other"]; submitted {
 		updates["other"] = candidate.Other
+	} else {
+		candidate.Other = persisted.Other
 	}
 	if len(updates) == 0 {
+		*channel = persisted
 		return false, false, nil
 	}
+	updates["version"] = gorm.Expr("version + 1")
 	// 管理端可以提交凭据，禁止失败 SQL 将凭据写入日志。
-	result := db.Session(&gorm.Session{Logger: db.Logger.LogMode(gormlogger.Silent)}).Model(&Channel{}).Where("id = ?", channel.Id).Updates(updates)
+	result := db.Session(&gorm.Session{Logger: db.Logger.LogMode(gormlogger.Silent)}).Model(&Channel{}).Where("id = ? AND version = ?", channel.Id, persisted.Version).Updates(updates)
 	if result.Error != nil {
 		return false, false, result.Error
 	}
-	return persisted.Type == config.ChannelTypeCodex || candidate.Type == config.ChannelTypeCodex, result.RowsAffected > 0, nil
+	if result.RowsAffected != 1 {
+		return false, false, ErrChannelVersionConflict
+	}
+	// Keep the committed snapshot even if the best-effort post-commit read fails.
+	candidate.Version = persisted.Version + 1
+	*channel = *candidate
+	return persisted.Type == config.ChannelTypeCodex || candidate.Type == config.ChannelTypeCodex, true, nil
 }
 
 var immutableChannelOtherFields = []string{
@@ -1092,7 +1099,7 @@ func updateChannelStatus(id int, targetStatus int, applyScope func(*gorm.DB) *go
 		query = applyScope(query)
 	}
 
-	result := query.Update("status", targetStatus)
+	result := query.Updates(map[string]any{"status": targetStatus, "version": gorm.Expr("version + 1")})
 	if result.Error != nil {
 		logger.SysError("failed to update channel status: " + result.Error.Error())
 		tx.Rollback()
@@ -1169,33 +1176,6 @@ func ClearChannelCodexDerivedCaches(channelIds []int) {
 	if err := cache.RotateCodexUsageGenerations(channelIds); err != nil {
 		logger.SysError(fmt.Sprintf("failed to rotate Codex usage generations: %v", err))
 	}
-}
-
-// CompareAndSetChannelKeyWithContext updates credentials only while the database
-// still contains the key from which an OAuth refresh was derived.
-func CompareAndSetChannelKeyWithContext(ctx context.Context, id int, expectedKey, key string) (bool, error) {
-	// Legacy callers may still use key CAS for non-refresh replacement, but it
-	// must never act as a generic fence unlock. Persisted OAuth rotation uses the
-	// attempt-scoped CommitCredentialRotation protocol instead.
-	// 旧/new 凭据都出现在 WHERE 与更新参数中，不能进入 GORM 的 SQL 日志。
-	// key 是 MySQL 保留字，不能出现在裸 SQL 条件中，必须走引用后的 clause.Eq。
-	result := DB.WithContext(nonNilContext(ctx)).Session(&gorm.Session{Logger: DB.Logger.LogMode(gormlogger.Silent)}).Model(&Channel{}).Where("id = ? AND credential_refresh_fence IS NULL", id).Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: expectedKey}).Updates(map[string]any{
-		"key": key, "credential_revision": gorm.Expr("credential_revision + 1"),
-		"credential_refresh_fence": nil, "credential_refresh_started_at": nil,
-	})
-	if result.Error != nil {
-		logger.SysError("failed to compare-and-set channel key: " + result.Error.Error())
-		return false, result.Error
-	}
-	if result.RowsAffected == 0 {
-		return false, nil
-	}
-	// OAuth persistence changes credentials, not routing topology. Quarantine the
-	// old credential-bearing snapshot and let the next routing read publish one
-	// complete DB snapshot. The provider that performed the CAS adopts the durable
-	// key directly, so persistence never waits on cache or chooser I/O.
-	ChannelGroup.failClosedChannels([]int{id})
-	return true, nil
 }
 
 func DeleteDisabledChannel() (int64, error) {

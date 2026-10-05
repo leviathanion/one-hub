@@ -2,7 +2,6 @@ package codex
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -90,48 +89,3 @@ func TestUsagePreviewEntryReadFailureFailsOpenWithoutCacheWrite(t *testing.T) {
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }
-
-func TestCredentialCASConflictAdoptsManualUpdateAndNeverCachesRotation(t *testing.T) {
-	cache.InitCacheManager()
-	channelID := 99003
-	old := &OAuth2Credentials{AccessToken: "old", RefreshToken: "refresh", ExpiresAt: time.Now().Add(-time.Minute)}
-	oldKey, _ := old.ToJSON()
-	manual := &OAuth2Credentials{AccessToken: "manual", RefreshToken: "manual-refresh", ExpiresAt: time.Now().Add(time.Hour)}
-	manualKey, _ := manual.ToJSON()
-	provider := CodexProviderFactory{}.Create(&model.Channel{Id: channelID, Key: oldKey}).(*CodexProvider)
-	originalRefresh := refreshOAuthCredentials
-	refreshOAuthCredentials = func(creds *OAuth2Credentials, _ context.Context, _ string) error {
-		creds.AccessToken, creds.RefreshToken, creds.ExpiresAt = "stale-rotated", "stale-refresh", time.Now().Add(time.Hour)
-		return nil
-	}
-	originalCAS := compareAndSetChannelKey
-	compareAndSetChannelKey = func(_ context.Context, _ int, expected, _ string) (bool, error) {
-		if expected != oldKey {
-			t.Fatalf("unexpected CAS expected key")
-		}
-		return false, nil
-	}
-	originalLoad := loadLatestChannelByID
-	loads := atomic.Int32{}
-	loadLatestChannelByID = func(context.Context, int) (*model.Channel, error) {
-		if loads.Add(1) <= 2 {
-			return &model.Channel{Id: channelID, Key: oldKey}, nil
-		}
-		return &model.Channel{Id: channelID, Key: manualKey}, nil
-	}
-	t.Cleanup(func() {
-		refreshOAuthCredentials = originalRefresh
-		compareAndSetChannelKey = originalCAS
-		loadLatestChannelByID = originalLoad
-	})
-	_, err := provider.refreshTokenIfNeeded(context.Background(), 3*time.Minute)
-	if !errors.Is(err, errCodexCredentialCASConflict) {
-		t.Fatalf("expected explicit CAS conflict, got %v", err)
-	}
-	if provider.Credentials == nil || provider.Credentials.AccessToken != "manual" {
-		t.Fatalf("manual DB credentials must win, got %+v", provider.Credentials)
-	}
-	if _, cacheErr := cache.GetCache[cachedAccessToken](tokenCacheKeyV2(channelID, manualKey)); !errors.Is(cacheErr, cache.CacheNotFound) {
-		t.Fatalf("stale rotation must not be cached under the manual fingerprint: %v", cacheErr)
-	}
-}

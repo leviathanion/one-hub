@@ -1,7 +1,6 @@
 package model
 
 import (
-	"context"
 	"fmt"
 	"testing"
 
@@ -15,8 +14,8 @@ func TestChangeChannelsTagStatusRotatesOnlyAffectedCodexChannelsBothDirections(t
 	useTestChannelDB(t)
 	cache.InitCacheManager()
 	channels := []*Channel{
-		{Id: 7101, Type: config.ChannelTypeCodex, Status: config.ChannelStatusEnabled, Tag: "round7", Name: "codex", Key: "old", Group: "default", Models: "gpt-5"},
-		{Id: 7102, Type: config.ChannelTypeOpenAI, Status: config.ChannelStatusEnabled, Tag: "round7", Name: "openai", Key: "key", Group: "default", Models: "gpt-4o"},
+		{Id: 7101, Type: config.ChannelTypeCodex, Status: config.ChannelStatusEnabled, Tag: "status-invalidation", Name: "codex", Key: "old", Group: "default", Models: "gpt-5"},
+		{Id: 7102, Type: config.ChannelTypeOpenAI, Status: config.ChannelStatusEnabled, Tag: "status-invalidation", Name: "openai", Key: "key", Group: "default", Models: "gpt-4o"},
 		{Id: 7103, Type: config.ChannelTypeCodex, Status: config.ChannelStatusManuallyDisabled, Tag: "other", Name: "untouched", Key: "key", Group: "default", Models: "gpt-5"},
 	}
 	for _, channel := range channels {
@@ -24,7 +23,7 @@ func TestChangeChannelsTagStatusRotatesOnlyAffectedCodexChannelsBothDirections(t
 		primeChannelDerivedCaches(t, channel.Id)
 	}
 
-	if err := ChangeChannelsTagStatus("round7", config.ChannelStatusManuallyDisabled); err != nil {
+	if err := ChangeChannelsTagStatus("status-invalidation", config.ChannelStatusManuallyDisabled); err != nil {
 		t.Fatal(err)
 	}
 	assertChannelDerivedCachesCleared(t, 7101)
@@ -35,7 +34,7 @@ func TestChangeChannelsTagStatusRotatesOnlyAffectedCodexChannelsBothDirections(t
 		t.Fatal(err)
 	}
 
-	if err := ChangeChannelsTagStatus("round7", config.ChannelStatusEnabled); err != nil {
+	if err := ChangeChannelsTagStatus("status-invalidation", config.ChannelStatusEnabled); err != nil {
 		t.Fatal(err)
 	}
 	generationAfterEnable, err := cache.GetCache[string](fmt.Sprintf("%s:%d", codexUsageGenerationCacheKeyPrefix, 7101))
@@ -49,8 +48,8 @@ func TestChangeChannelsTagStatusSkipsRowChangedAfterQuery(t *testing.T) {
 	cache.InitCacheManager()
 	const channelID = 7120
 	const changedChannelID = 7121
-	insertTestChannel(t, &Channel{Id: channelID, Type: config.ChannelTypeCodex, Status: config.ChannelStatusEnabled, Tag: "round14", Name: "raced", Key: "key", Group: "default", Models: "gpt-5"})
-	insertTestChannel(t, &Channel{Id: changedChannelID, Type: config.ChannelTypeCodex, Status: config.ChannelStatusEnabled, Tag: "round14", Name: "changed", Key: "key", Group: "default", Models: "gpt-5"})
+	insertTestChannel(t, &Channel{Id: channelID, Type: config.ChannelTypeCodex, Status: config.ChannelStatusEnabled, Tag: "concurrent-status", Name: "raced", Key: "key", Group: "default", Models: "gpt-5"})
+	insertTestChannel(t, &Channel{Id: changedChannelID, Type: config.ChannelTypeCodex, Status: config.ChannelStatusEnabled, Tag: "concurrent-status", Name: "changed", Key: "key", Group: "default", Models: "gpt-5"})
 	primeChannelDerivedCaches(t, channelID)
 	primeChannelDerivedCaches(t, changedChannelID)
 
@@ -70,7 +69,7 @@ func TestChangeChannelsTagStatusSkipsRowChangedAfterQuery(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = DB.Callback().Update().Remove(callbackName) })
 
-	if err := ChangeChannelsTagStatus("round14", config.ChannelStatusManuallyDisabled); err != nil {
+	if err := ChangeChannelsTagStatus("concurrent-status", config.ChannelStatusManuallyDisabled); err != nil {
 		t.Fatal(err)
 	}
 	if hookErr != nil {
@@ -91,7 +90,7 @@ func TestChangeChannelsTagStatusSkipsRowMovedAfterQuery(t *testing.T) {
 	useTestChannelDB(t)
 	cache.InitCacheManager()
 	const channelID = 7122
-	insertTestChannel(t, &Channel{Id: channelID, Type: config.ChannelTypeCodex, Status: config.ChannelStatusEnabled, Tag: "round15", Name: "moved", Key: "key", Group: "default", Models: "gpt-5"})
+	insertTestChannel(t, &Channel{Id: channelID, Type: config.ChannelTypeCodex, Status: config.ChannelStatusEnabled, Tag: "concurrent-tag", Name: "moved", Key: "key", Group: "default", Models: "gpt-5"})
 	primeChannelDerivedCaches(t, channelID)
 
 	callbackName := "test:change_tag_status_before_tag_cas:" + t.Name()
@@ -104,13 +103,13 @@ func TestChangeChannelsTagStatusSkipsRowMovedAfterQuery(t *testing.T) {
 		fired = true
 		// Interleave a tag-only change after the candidate query and immediately
 		// before its status CAS. The status intentionally remains unchanged.
-		hookErr = tx.Exec("UPDATE channels SET tag = ? WHERE id = ?", "round15-moved", channelID).Error
+		hookErr = tx.Exec("UPDATE channels SET tag = ? WHERE id = ?", "concurrent-tag-moved", channelID).Error
 	}); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = DB.Callback().Update().Remove(callbackName) })
 
-	if err := ChangeChannelsTagStatus("round15", config.ChannelStatusManuallyDisabled); err != nil {
+	if err := ChangeChannelsTagStatus("concurrent-tag", config.ChannelStatusManuallyDisabled); err != nil {
 		t.Fatal(err)
 	}
 	if !fired {
@@ -123,7 +122,7 @@ func TestChangeChannelsTagStatusSkipsRowMovedAfterQuery(t *testing.T) {
 	if err := DB.First(&channel, channelID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if channel.Tag != "round15-moved" || channel.Status != config.ChannelStatusEnabled {
+	if channel.Tag != "concurrent-tag-moved" || channel.Status != config.ChannelStatusEnabled {
 		t.Fatalf("CAS changed row moved out of tag: tag=%q status=%d", channel.Tag, channel.Status)
 	}
 	assertChannelDerivedCachesPresent(t, channelID)
@@ -140,7 +139,7 @@ func TestChangeChannelsTagStatusUsesOneUpdateForManyChannels(t *testing.T) {
 			Id:     7200 + i,
 			Type:   config.ChannelTypeOpenAI,
 			Status: config.ChannelStatusEnabled,
-			Tag:    "round17-bulk",
+			Tag:    "bulk-status",
 			Name:   fmt.Sprintf("bulk-%d", i),
 			Key:    fmt.Sprintf("key-%d", i),
 			Group:  "default",
@@ -162,7 +161,7 @@ func TestChangeChannelsTagStatusUsesOneUpdateForManyChannels(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = DB.Callback().Update().Remove(callbackName) })
 
-	if err := ChangeChannelsTagStatus("round17-bulk", config.ChannelStatusManuallyDisabled); err != nil {
+	if err := ChangeChannelsTagStatus("bulk-status", config.ChannelStatusManuallyDisabled); err != nil {
 		t.Fatal(err)
 	}
 	if updates != 1 {
@@ -170,30 +169,11 @@ func TestChangeChannelsTagStatusUsesOneUpdateForManyChannels(t *testing.T) {
 	}
 	var remaining int64
 	if err := DB.Model(&Channel{}).
-		Where("tag = ? AND status <> ?", "round17-bulk", config.ChannelStatusManuallyDisabled).
+		Where("tag = ? AND status <> ?", "bulk-status", config.ChannelStatusManuallyDisabled).
 		Count(&remaining).Error; err != nil {
 		t.Fatal(err)
 	}
 	if remaining != 0 {
 		t.Fatalf("%d bulk channels were not updated", remaining)
-	}
-}
-
-func TestOAuthCompareAndSetPreservesUsageGeneration(t *testing.T) {
-	useTestChannelDB(t)
-	cache.InitCacheManager()
-	insertTestChannel(t, &Channel{Id: 7110, Type: config.ChannelTypeCodex, Status: config.ChannelStatusEnabled, Name: "oauth", Key: "old-key", Group: "default", Models: "gpt-5"})
-	generation, err := cache.GetOrInitCodexUsageGeneration(7110)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	updated, err := CompareAndSetChannelKeyWithContext(context.Background(), 7110, "old-key", "oauth-rotated-key")
-	if err != nil || !updated {
-		t.Fatalf("OAuth CAS failed: updated=%v err=%v", updated, err)
-	}
-	current, err := cache.GetOrInitCodexUsageGeneration(7110)
-	if err != nil || current != generation {
-		t.Fatalf("OAuth CAS must preserve fetch generation: before=%q after=%q err=%v", generation, current, err)
 	}
 }

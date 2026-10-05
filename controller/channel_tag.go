@@ -77,15 +77,29 @@ func UpdateChannelsTag(c *gin.Context) {
 		common.APIRespondWithError(c, http.StatusOK, err)
 		return
 	}
-	channel := model.Channel{}
-	if err := json.Unmarshal(rawBody, &channel); err != nil {
+	var request struct {
+		model.Channel
+		ExpectedVersions map[int]uint64 `json:"expected_versions"`
+	}
+	if err := json.Unmarshal(rawBody, &request); err != nil {
 		common.APIRespondWithError(c, http.StatusOK, err)
 		return
 	}
-
-	err = model.UpdateChannelsTagWithSubmittedFields(tag, &channel, submittedFields, model.ChannelUpdateOptions{AllowIdentityChange: true})
+	if request.ExpectedVersions == nil {
+		common.APIRespondWithError(c, http.StatusOK, errors.New("expected_versions is required"))
+		return
+	}
+	if _, ok := submittedFields["internal_state"]; ok {
+		common.APIRespondWithError(c, http.StatusOK, errors.New("internal_state is server-owned"))
+		return
+	}
+	err = model.UpdateChannelsTagWithSubmittedFields(tag, &request.Channel, submittedFields, model.ChannelUpdateOptions{AllowIdentityChange: true, ExpectedVersions: request.ExpectedVersions})
 	if err != nil {
-		common.APIRespondWithError(c, http.StatusOK, err)
+		status := http.StatusOK
+		if errors.Is(err, model.ErrChannelVersionConflict) {
+			status = http.StatusConflict
+		}
+		common.APIRespondWithError(c, status, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{

@@ -155,13 +155,13 @@ export default function ChannelList() {
   }, []);
 
   const manageChannel = useCallback(
-    async (id, action, value, tag = false) => {
+    async (id, action, value, tag = false, expectedVersion) => {
       let url = '/api/channel/';
       if (tag) {
         url = '/api/channel_tag/';
       }
 
-      let data = { id };
+      let data = { id, expected_version: expectedVersion };
       let res;
 
       try {
@@ -240,7 +240,7 @@ export default function ChannelList() {
         const { success, message } = res.data;
         if (success) {
           showSuccess(t('userPage.operationSuccess'));
-          if (action === 'delete' || action === 'copy' || action == 'delete_tag') {
+          if (['delete', 'copy', 'delete_tag', 'status', 'priority', 'weight'].includes(action)) {
             await handleRefresh(false);
           }
         } else {
@@ -249,7 +249,8 @@ export default function ChannelList() {
 
         return res.data;
       } catch (error) {
-        return { success: false, message: error.message };
+        const message = error.response?.data?.message || error.message;
+        return { success: false, message };
       }
     },
     [t, handleRefresh]

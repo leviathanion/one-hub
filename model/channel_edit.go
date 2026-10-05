@@ -2,6 +2,7 @@ package model
 
 import (
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 )
@@ -10,6 +11,7 @@ import (
 // Channel 只用于解码；数据库更新列始终由 channelMetadataFields 决定。
 type ChannelEditRequest struct {
 	Channel
+	ExpectedVersion *uint64                    `json:"expected_version"`
 	SubmittedFields map[string]json.RawMessage `json:"-"`
 }
 
@@ -17,13 +19,26 @@ func (request *ChannelEditRequest) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &request.Channel); err != nil {
 		return err
 	}
-	return json.Unmarshal(data, &request.SubmittedFields)
+	if err := json.Unmarshal(data, &request.SubmittedFields); err != nil {
+		return err
+	}
+	if _, exists := request.SubmittedFields["internal_state"]; exists {
+		return errors.New("internal_state is server-owned")
+	}
+	if raw, ok := request.SubmittedFields["expected_version"]; ok {
+		return json.Unmarshal(raw, &request.ExpectedVersion)
+	}
+	return nil
 }
 
 func (request *ChannelEditRequest) Update() error {
+	if request.ExpectedVersion == nil {
+		return errors.New("expected_version is required")
+	}
 	return request.Channel.UpdateWithOptions(false, ChannelUpdateOptions{
 		SubmittedFields:     request.SubmittedFields,
 		AllowIdentityChange: true,
+		ExpectedVersion:     request.ExpectedVersion,
 	})
 }
 
