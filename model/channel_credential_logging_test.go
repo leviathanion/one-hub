@@ -189,8 +189,8 @@ func TestChannelCredentialSQLNeverLogsTokensAcrossDatabases(t *testing.T) {
 			{"replace_commit", "debug", 33910, gormlogger.Info, 200 * time.Millisecond, hookNone, false},
 			{"compare_and_set", "debug", 33920, gormlogger.Info, 200 * time.Millisecond, hookNone, false},
 			// Error Trace 窗口：gorm:update 回调完成后注入错误（非驱动拒绝执行），
-			// Error Trace 分支携带已构建 SQL，凭据仍不得出现；Recover 由外层事务
-			// 回滚而报错，CompareAndSet 上报错。
+			// Error Trace 分支携带已构建 SQL，凭据仍不得出现；Recover 和
+			// CompareAndSwap 保守上报写错误，不保证已执行的 SQL 被回滚。
 			{"recover", "error", 33901, gormlogger.Error, 200 * time.Millisecond, hookAfter, true},
 			{"compare_and_set", "error", 33921, gormlogger.Error, 200 * time.Millisecond, hookAfter, true},
 			// 同上窗口：Commit 的语句在注入点已执行/提交，Commit 按重载证据归类为

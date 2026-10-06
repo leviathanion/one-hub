@@ -35,6 +35,11 @@ func TestCredentialRecoveryInvalidatesOldAttempt(t *testing.T) {
 		if outcome, err := testRotation().Claim(t.Context(), ticket, time.Now()); err != nil || outcome != credentials.ClaimAcquired {
 			t.Fatal(outcome, err)
 		}
+		peer := ticket
+		peer.AttemptID = "competing-refresh"
+		if outcome, err := testRotation().Claim(t.Context(), peer, time.Now()); err != nil || outcome != credentials.ClaimBusy {
+			t.Fatalf("ordinary refresh cannot recover an unresolved attempt: outcome=%v err=%v", outcome, err)
+		}
 		snapshot, err := testRotation().Store.Load(t.Context(), 33001)
 		if err != nil {
 			t.Fatal(err)
@@ -42,8 +47,12 @@ func TestCredentialRecoveryInvalidatesOldAttempt(t *testing.T) {
 		if err := testRotation().Recover(t.Context(), snapshot, "attempt-a", "new"); !errors.Is(err, credentials.ErrConflict) {
 			t.Fatal("case-mismatched attempt accepted", err)
 		}
+		generation := ChannelGroup.publishGeneration.Load()
 		if err := testRotation().Recover(t.Context(), snapshot, ticket.AttemptID, "new"); err != nil {
 			t.Fatal(err)
+		}
+		if ChannelGroup.publishGeneration.Load() <= generation {
+			t.Fatal("recovery did not invalidate the published credential snapshot")
 		}
 		if err := testRotation().Recover(t.Context(), snapshot, ticket.AttemptID, "other"); !errors.Is(err, credentials.ErrConflict) {
 			t.Fatal("stale recovery accepted", err)
@@ -54,8 +63,9 @@ func TestCredentialRecoveryInvalidatesOldAttempt(t *testing.T) {
 		if canceled, err := testRotation().Cancel(t.Context(), ticket); err != nil || canceled {
 			t.Fatal(canceled, err)
 		}
-		if ChannelGroup.publishGeneration.Load() == 0 {
-			t.Fatal("credential snapshot was not invalidated")
+		after, err := loadRotationTestSnapshot(t.Context(), ticket.ChannelID)
+		if err != nil || after.Key != "new" || after.Version != snapshot.Version+1 || after.Fence != nil || after.StartedAt != nil || after.Deleted {
+			t.Fatalf("recovery did not atomically replace the credential and clear its fence: version=%d fenced=%v err=%v", after.Version, after.Fence != nil, err)
 		}
 	})
 }
