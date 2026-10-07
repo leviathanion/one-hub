@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -9,11 +10,11 @@ import (
 )
 
 func TestRemotePriceCatalogAcceptsPublishedMetadata(t *testing.T) {
-	const row = `{"model":"catalog-model","type":"tokens","channel_type":1,"input":0,"output":2,"locked":false,"extra_ratios":{"cache":0.5},"rate_rules":{},"model_info":{"model":"catalog-model","future_description":{"owner":"internal"},"input_modalities":["text"]}}`
+	const row = `{"model":"catalog-model","type":"tokens","input":0,"output":2,"locked":false,"extra_ratios":{"cache":0.5},"rate_rules":{},"model_info":{"model":"catalog-model","future_description":{"owner":"internal"},"input_modalities":["text"]}}`
 	for _, payload := range []string{
 		`[` + row + `]`,
 		`{"success":true,"message":"","version":42,"data":[` + row + `]}`,
-		`{"success":true,"message":"published","version":42,"data":[{"model":"catalog-model","type":"tokens","channel_type":1,"input":0,"output":2,"locked":false,"model_info":null}]}`,
+		`{"success":true,"message":"published","version":42,"data":[{"model":"catalog-model","type":"tokens","input":0,"output":2,"locked":false,"model_info":null}]}`,
 	} {
 		prices, err := DecodeRemotePriceCatalog([]byte(payload))
 		if err != nil || len(prices) != 1 {
@@ -27,6 +28,7 @@ func TestRemotePriceCatalogAcceptsPublishedMetadata(t *testing.T) {
 
 func TestRemotePriceCatalogKeepsPricingValidationClosed(t *testing.T) {
 	for name, payload := range map[string]string{
+		"removed channel type":  `[ {"model":"m","type":"tokens","input":1,"output":2,"channel_type":1} ]`,
 		"unknown row field":     `[ {"model":"m","type":"tokens","input":1,"output":2,"future_price":3} ]`,
 		"unknown wrapper field": `{"success":true,"message":"","version":1,"data":[{"model":"m","type":"tokens","input":1,"output":2}],"future":true}`,
 		"unknown rate rule":     `[ {"model":"m","type":"tokens","input":1,"output":2,"rate_rules":{"future":{"input":1,"output":1}}} ]`,
@@ -94,5 +96,24 @@ func TestAutoPriceSyncKeepsDatabaseUnchangedForInvalidPublishedCatalog(t *testin
 	}
 	if unchanged.Input != 1 || unchanged.Output != 1 {
 		t.Fatalf("invalid remote price mutated local policy: %+v", unchanged)
+	}
+}
+
+func TestPriceChangeDigestIgnoresReadOnlyModelMetadata(t *testing.T) {
+	setupVersionedPricingTest(t)
+	var digest string
+	for _, info := range []string{`null`, `{"owned_by_id":1,"future":[1,2]}`, `{"owned_by_id":1001,"name":"new name"}`} {
+		prices, err := DecodeRemotePriceCatalog([]byte(`[{"model":"catalog-model","type":"tokens","input":1,"output":2,"model_info":` + info + `}]`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		preview, err := PreviewPriceChange(context.Background(), prices, PriceUpdateModeAdd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if digest != "" && preview.Digest != digest {
+			t.Fatal("read-only metadata changed price digest")
+		}
+		digest = preview.Digest
 	}
 }

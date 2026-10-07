@@ -5,8 +5,24 @@ This context defines the business language used when routing provider requests, 
 ## Language
 
 **Price Policy**:
-The complete pricing behavior attached to a model, including base prices, conditional rates, and long-context rules.
-_Avoid_: Modifier, pricing extras
+本站向用户收费的完整价格策略，包括基础价格、扩展倍率和条件规则；通过计价模型匹配，与模型展示归属及上游采购成本独立。
+_Avoid_: Modifier, pricing extras, 上游成本
+
+**模型目录（Model Catalog）**：
+以本站精确模型名称组织的描述信息，与该模型适用的售价和可用性共同组成完整模型视图；展示归属本身不表示请求授权或协议支持。
+_Avoid_: 请求准入白名单、价格目录
+
+**模型归属（Model Attribution）**：
+管理员为模型配置的展示分类及其名称、图标，可以采用模型品牌或服务商分类；不声明实际执行渠道、报价来源或模型发布方身份。
+_Avoid_: 渠道类型、计费供应商、模型发布方
+
+**报价来源（Quote Source）**：
+导入候选的参考来源，包括来源站点、报价 provider 和源模型；它不证明发布后完整售价的来源、实际执行渠道或上游账单金额。
+_Avoid_: 模型归属、售价来源审计、实际采购成本
+
+**计价模型（Billing Model）**：
+某次计费决策用于匹配完整售价策略的模型名称，由既定模型映射和结算规则确定，可以不同于客户端请求或实际发送给上游的模型名称。
+_Avoid_: 模型发布方、报价源模型
 
 **Original Model Billing**:
 A channel-mapping policy under which the client-requested model's complete Price Policy remains authoritative through final settlement. Provider-reported usage and service tier remain billing evidence, but the mapped or reported model cannot replace or partially mix that policy.

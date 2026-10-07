@@ -19,15 +19,14 @@ const describeRules = (rules, group, t) => {
 };
 
 // Render server-approved policy changes; do not recompute the change plan here.
-export const pricingSyncRows = (before, after, t, channelName) => {
+export const pricingSyncRows = (before, after, t) => {
   const rows = [];
   const add = (key, label, oldValue, newValue) => rows.push({ key, label, before: oldValue, after: newValue });
-  for (const key of ['input', 'output', 'type', 'channel_type', 'locked']) {
+  for (const key of ['input', 'output', 'type', 'locked']) {
     if (before && after && equal(before[key], after[key])) continue;
     const value = (price) => {
       if (!price || price[key] == null) return '';
       if (key === 'type') return t(`modelpricePage.${price[key]}`);
-      if (key === 'channel_type') return channelName(price[key]);
       if (key === 'locked') return t(price[key] ? 'pricing_edit.locked' : 'pricing_edit.unlocked');
       return String(price[key]);
     };

@@ -41,7 +41,6 @@ test('保存与删除 TTL 覆盖不会自动写入不存在的 TTL 键', () => {
     {
       model: 'claude-i030',
       type: 'tokens',
-      channel_type: 1,
       input: 1,
       output: 1,
       locked: false,

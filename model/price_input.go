@@ -14,7 +14,6 @@ import (
 type remotePriceDTO struct {
 	Model       *string             `json:"model"`
 	Type        *string             `json:"type"`
-	ChannelType *int                `json:"channel_type"`
 	Input       *float64            `json:"input"`
 	Output      *float64            `json:"output"`
 	Locked      *bool               `json:"locked"`
@@ -115,9 +114,6 @@ func (d remotePriceDTO) price() (*Price, error) {
 		return nil, errors.New("input and output are required; explicit zero is allowed")
 	}
 	price := &Price{Model: *d.Model, Type: *d.Type, Input: *d.Input, Output: *d.Output}
-	if d.ChannelType != nil {
-		price.ChannelType = *d.ChannelType
-	}
 	if d.Locked != nil {
 		price.Locked = *d.Locked
 	}

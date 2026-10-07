@@ -125,7 +125,7 @@ const Single = ({ ownedby, prices, reloadData, expectedVersion }) => {
         searchTerm === '' ||
         row.model.toLowerCase().includes(searchTerm.toLowerCase()) ||
         ownedby
-          .find((o) => o.value === row.channel_type)
+          .find((o) => o.value === row.model_info?.owned_by_id)
           ?.label.toLowerCase()
           .includes(searchTerm.toLowerCase());
 
@@ -138,7 +138,7 @@ const Single = ({ ownedby, prices, reloadData, expectedVersion }) => {
       // 渠道过滤
       let channelMatch = true;
       if (channelFilter !== 'all') {
-        channelMatch = row.channel_type === channelFilter;
+        channelMatch = row.model_info?.owned_by_id === channelFilter;
       }
 
       // 锁定状态过滤
@@ -434,7 +434,6 @@ const Single = ({ ownedby, prices, reloadData, expectedVersion }) => {
         onCancel={handleEditClose}
         onSaveSingle={handleSaveEdit}
         onConflict={reloadData}
-        ownedby={ownedby}
         singleMode={true}
         price={editRow}
         rows={rows}

@@ -8,10 +8,9 @@ test('manual price request strips view-only fields and keeps the CAS version', (
     {
       id: 7,
       isNew: false,
-      model_info: { name: 'view only' },
+      model_info: { name: 'view only', owned_by_id: 1001 },
       model: 'gpt-5',
       type: 'tokens',
-      channel_type: 1,
       input: 2,
       output: 10,
       locked: true,
@@ -24,7 +23,6 @@ test('manual price request strips view-only fields and keeps the CAS version', (
     expected_version: 12,
     model: 'gpt-5',
     type: 'tokens',
-    channel_type: 1,
     input: 2,
     output: 10,
     locked: true,
@@ -34,6 +32,6 @@ test('manual price request strips view-only fields and keeps the CAS version', (
 });
 
 test('manual price request preserves omitted rate_rules', () => {
-  const request = buildManualPriceRequest({ model: 'm', type: 'tokens', channel_type: 1, input: 1, output: 2, extra_ratios: {} }, 3);
+  const request = buildManualPriceRequest({ model: 'm', type: 'tokens', input: 1, output: 2, extra_ratios: {} }, 3);
   assert.equal(Object.hasOwn(request, 'rate_rules'), false);
 });

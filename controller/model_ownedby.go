@@ -1,7 +1,6 @@
 package controller
 
 import (
-	"errors"
 	"net/http"
 	"one-api/common"
 	"one-api/model"
@@ -51,11 +50,6 @@ func CreateModelOwnedBy(c *gin.Context) {
 		return
 	}
 
-	if checkModelOwnedByReserveID(modelOwnedBy.Id) {
-		common.APIRespondWithError(c, http.StatusOK, errors.New("invalid id"))
-		return
-	}
-
 	if err := model.CreateModelOwnedBy(&modelOwnedBy); err != nil {
 		common.APIRespondWithError(c, http.StatusOK, err)
 		return
@@ -92,11 +86,6 @@ func DeleteModelOwnedBy(c *gin.Context) {
 		return
 	}
 
-	if checkModelOwnedByReserveID(id) {
-		common.APIRespondWithError(c, http.StatusOK, errors.New("invalid id"))
-		return
-	}
-
 	if err := model.DeleteModelOwnedBy(id); err != nil {
 		common.APIRespondWithError(c, http.StatusOK, err)
 		return
@@ -106,8 +95,4 @@ func DeleteModelOwnedBy(c *gin.Context) {
 		"success": true,
 		"message": "",
 	})
-}
-
-func checkModelOwnedByReserveID(id int) bool {
-	return id <= model.ModelOwnedByReserveID
 }

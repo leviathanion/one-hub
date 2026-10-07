@@ -41,7 +41,6 @@ const Pricing = () => {
   const [modelList, setModelList] = useState([]);
   const [openModal, setOpenModal] = useState(false);
   const [openaddModal, setOpenaddModal] = useState(false);
-  const [errPrices, setErrPrices] = useState('');
   const [prices, setPrices] = useState([]);
   const [priceVersion, setPriceVersion] = useState(0);
   const [noPriceModel, setNoPriceModel] = useState([]);
@@ -98,16 +97,6 @@ const Pricing = () => {
     const missingModels = modelList.filter((model) => !prices.some((price) => price.model === model));
     setNoPriceModel(missingModels);
   }, [modelList, prices]);
-
-  useEffect(() => {
-    // check if there is any price that is not valid
-    const invalidPrices = prices.filter((price) => price.channel_type <= 0);
-    if (invalidPrices.length > 0) {
-      setErrPrices(invalidPrices.map((price) => price.model).join(', '));
-    } else {
-      setErrPrices('');
-    }
-  }, [prices]);
 
   const fetchOwnedby = useCallback(async () => {
     try {
@@ -245,19 +234,12 @@ const Pricing = () => {
         </Alert>
       )}
 
-      {errPrices && (
-        <Alert severity="warning">
-          <b>{t('pricingPage.errPricesWarning')}</b>：{errPrices}
-        </Alert>
-      )}
-
       <EditeModal
         open={openaddModal}
         onCancel={handleCloseModal}
         onOk={handleOkaddModal}
         onConflict={reloadData}
         pricesItem={editPricesItem}
-        ownedby={ownedby}
         noPriceModel={noPriceModel}
         expectedVersion={priceVersion}
       />
@@ -297,7 +279,6 @@ const Pricing = () => {
         </AdminContainer>
       </Card>
       <CheckUpdates
-        ownedby={ownedby}
         open={openModal}
         onCancel={() => {
           setOpenModal(false);

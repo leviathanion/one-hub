@@ -14,19 +14,19 @@ func TestPriceChangePreviewIsCompleteAndPreservesRulesFromDatabaseBase(t *testin
 	rules := datatypes.NewJSONType(PriceRateRules{Version: 2, ServiceTier: []PriceRateRule{{ID: "flex", When: PriceRuleCondition{ServiceTier: []string{"flex"}}, Multipliers: PriceRateMultiplier{Input: utils.GetPointer(float64(0.5)), Output: utils.GetPointer(float64(0.75))}}}})
 	extra := datatypes.NewJSONType(map[string]float64{"cache": 0.4})
 	current := []*Price{
-		{Model: "changed", Type: TokensPriceType, ChannelType: 1, Input: 1, Output: 2, ExtraRatios: &extra, RateRules: &rules},
-		{Model: "delete-me", Type: TokensPriceType, ChannelType: 1, Input: 3, Output: 4},
-		{Model: "locked-change", Type: TokensPriceType, ChannelType: 1, Input: 5, Output: 6, Locked: true},
-		{Model: "locked-delete", Type: TokensPriceType, ChannelType: 1, Input: 7, Output: 8, Locked: true},
+		{Model: "changed", Type: TokensPriceType, Input: 1, Output: 2, ExtraRatios: &extra, RateRules: &rules},
+		{Model: "delete-me", Type: TokensPriceType, Input: 3, Output: 4},
+		{Model: "locked-change", Type: TokensPriceType, Input: 5, Output: 6, Locked: true},
+		{Model: "locked-delete", Type: TokensPriceType, Input: 7, Output: 8, Locked: true},
 	}
 	if err := db.Create(&current).Error; err != nil {
 		t.Fatal(err)
 	}
 	newExtra := datatypes.NewJSONType(map[string]float64{"cache": 0.2, "reasoning": 1.5})
 	source := []*Price{
-		{Model: "new", Type: TokensPriceType, ChannelType: 2, Input: 9, Output: 10},
-		{Model: "changed", Type: TokensPriceType, ChannelType: 1, Input: 11, Output: 12, ExtraRatios: &newExtra},
-		{Model: "locked-change", Type: TokensPriceType, ChannelType: 1, Input: 50, Output: 60, Locked: false},
+		{Model: "new", Type: TokensPriceType, Input: 9, Output: 10},
+		{Model: "changed", Type: TokensPriceType, Input: 11, Output: 12, ExtraRatios: &newExtra},
+		{Model: "locked-change", Type: TokensPriceType, Input: 50, Output: 60, Locked: false},
 	}
 
 	preview, err := PreviewPriceChange(context.Background(), source, PriceUpdateModeOverwrite)

@@ -66,14 +66,15 @@ const ImportModal = ({ open, onCancel, onOk, existingModels = [] }) => {
           const modelInfo = item.model_info;
           return {
             model: modelInfo.model || item.model,
-            name: modelInfo.name || modelInfo.model || item.model,
+            owned_by_id: modelInfo.owned_by_id ?? null,
+            name: modelInfo.name || '',
             description: modelInfo.description || '',
             context_length: modelInfo.context_length || 0, // 默认值
             max_tokens: modelInfo.max_tokens || 0,
             input_modalities: JSON.stringify(modelInfo.input_modalities || []),
             output_modalities: JSON.stringify(modelInfo.output_modalities || []),
             tags: JSON.stringify(modelInfo.tags || []),
-            isConflict: existingModels.includes(modelInfo.model || item.model)
+            isConflict: existingModels.some((existing) => existing.model === (modelInfo.model || item.model))
           };
         });
 
@@ -120,14 +121,11 @@ const ImportModal = ({ open, onCancel, onOk, existingModels = [] }) => {
         const submitData = { ...item };
         delete submitData.isConflict;
 
-        if (item.isConflict && conflictStrategy === 'overwrite') {
-          // 查找现有记录的 ID（需要从 existingModels 获取完整信息）
-          // 注意：这里需要传入完整的模型信息，而不仅仅是模型名称
-          // 暂时使用 POST 创建，如果需要更新，需要调整数据结构
-          await API.post('/api/model_info/', submitData);
-        } else {
-          await API.post('/api/model_info/', submitData);
-        }
+        const existing = existingModels.find((model) => model.model === item.model);
+        const response = existing
+          ? await API.put('/api/model_info/', { ...submitData, id: existing.id })
+          : await API.post('/api/model_info/', submitData);
+        if (!response.data.success) throw new Error(response.data.message || '保存模型信息失败');
         successCount++;
       } catch (error) {
         console.error(`Failed to import model ${item.model}:`, error);

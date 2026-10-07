@@ -48,6 +48,10 @@ func TestStartupMigrationsRunThroughInitDB(t *testing.T) {
 		"CREATE TABLE abilities (channel_id integer)",
 		"CREATE TABLE responses_ws_settlement_intents (id integer)",
 	)
+	// 目录的停机迁移已完成，其余历史迁移仍由本测试验证。
+	if err := db.AutoMigrate(&ModelOwnedBy{}, &ModelInfo{}); err != nil {
+		t.Fatal(err)
+	}
 	previousDB, previousMaster := DB, config.IsMasterNode
 	previousSQLite, previousPostgres := common.UsingSQLite, common.UsingPostgreSQL
 	viper.Reset()

@@ -19,7 +19,7 @@ func CheckPricePublication(ctx context.Context, requiredModels []string) error {
 	if !migrator.HasTable(&Price{}) {
 		return errors.New("prices table is missing")
 	}
-	for _, column := range []string{"model", "type", "channel_type", "input", "output", "locked", "extra_ratios", "rate_rules"} {
+	for _, column := range []string{"model", "type", "input", "output", "locked", "extra_ratios", "rate_rules"} {
 		if !migrator.HasColumn(&Price{}, column) {
 			return fmt.Errorf("prices column %q is missing", column)
 		}
@@ -121,13 +121,6 @@ func clonePricePolicy(price Price) Price {
 		rules := datatypes.NewJSONType(ClonePriceRateRules(price.RateRules.Data()))
 		cloned.RateRules = &rules
 	}
-	if price.ModelInfo != nil {
-		info := *price.ModelInfo
-		info.InputModalities = append([]string(nil), price.ModelInfo.InputModalities...)
-		info.OutputModalities = append([]string(nil), price.ModelInfo.OutputModalities...)
-		info.Tags = append([]string(nil), price.ModelInfo.Tags...)
-		info.SupportUrl = append([]string(nil), price.ModelInfo.SupportUrl...)
-		cloned.ModelInfo = &info
-	}
+	cloned.ModelInfo = nil
 	return cloned
 }

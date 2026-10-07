@@ -1,9 +1,11 @@
 package model
 
 import (
+	"errors"
 	"one-api/common/config"
-	"one-api/common/logger"
-	"sync"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var UnknownOwnedBy = "未知"
@@ -21,25 +23,23 @@ func (m *ModelOwnedBy) TableName() string {
 }
 
 func CreateModelOwnedBy(modelOwnedBy *ModelOwnedBy) error {
-	err := DB.Create(modelOwnedBy).Error
-	if err != nil {
-		return err
+	if modelOwnedBy == nil || modelOwnedBy.Id <= ModelOwnedByReserveID {
+		return errors.New("自定义归属 ID 必须大于 1000")
 	}
-
-	ModelOwnedBysInstance.Load()
-
-	return nil
+	return DB.Create(modelOwnedBy).Error
 }
 
 func UpdateModelOwnedBy(modelOwnedBy *ModelOwnedBy) error {
-	err := DB.Omit("id").Save(modelOwnedBy).Error
-	if err != nil {
-		return err
+	if modelOwnedBy == nil || modelOwnedBy.Id <= 0 {
+		return gorm.ErrRecordNotFound
 	}
-
-	ModelOwnedBysInstance.Load()
-
-	return nil
+	return DB.Transaction(func(tx *gorm.DB) error {
+		if err := lockModelOwnedBy(tx, modelOwnedBy.Id); err != nil {
+			return err
+		}
+		return tx.Model(&ModelOwnedBy{}).Where("id = ?", modelOwnedBy.Id).
+			Select("name", "icon").Updates(modelOwnedBy).Error
+	})
 }
 
 func GetModelOwnedBy(id int) (*ModelOwnedBy, error) {
@@ -60,107 +60,54 @@ func GetAllModelOwnedBy() ([]*ModelOwnedBy, error) {
 	return modelOwnedBies, nil
 }
 
-func DeleteModelOwnedBy(id int) error {
-	err := DB.Delete(&ModelOwnedBy{}, id).Error
-	if err != nil {
-		return err
-	}
+var ErrModelOwnedByInUse = errors.New("模型归属仍被模型引用，无法删除")
 
-	ModelOwnedBysInstance.Load()
-
-	return nil
-}
-
-type ModelOwnedBys struct {
-	sync.RWMutex
-	ModelOwnedBy map[int]*ModelOwnedBy
-}
-
-var ModelOwnedBysInstance *ModelOwnedBys
-
-func NewModelOwnedBys() {
-	ModelOwnedBysInstance = &ModelOwnedBys{}
-	err := ModelOwnedBysInstance.Load()
-	if err != nil {
-		logger.SysError("Failed to initialize ModelOwnedBys:" + err.Error())
-		return
-	}
-
-	logger.SysLog("Checking for ModelOwned updates")
-	modelOwnedBies := GetDefaultModelOwnedBy()
-	ModelOwnedBysInstance.SyncModelOwnedBy(modelOwnedBies)
-	logger.SysLog("ModelOwnedBys initialized")
-}
-
-func (m *ModelOwnedBys) Load() error {
-	modelOwnedBies, err := GetAllModelOwnedBy()
-	if err != nil {
-		return err
-	}
-
-	newModelOwnedBy := make(map[int]*ModelOwnedBy)
-	for _, modelOwnedBy := range modelOwnedBies {
-		newModelOwnedBy[modelOwnedBy.Id] = modelOwnedBy
-	}
-
-	m.Lock()
-	defer m.Unlock()
-
-	m.ModelOwnedBy = newModelOwnedBy
-
-	return nil
-}
-
-func (m *ModelOwnedBys) Get(id int) *ModelOwnedBy {
-	m.RLock()
-	defer m.RUnlock()
-
-	return m.ModelOwnedBy[id]
-}
-
-func (m *ModelOwnedBys) GetName(id int) string {
-	modelOwnedBy := m.Get(id)
-	if modelOwnedBy == nil {
-		return UnknownOwnedBy
-	}
-	return modelOwnedBy.Name
-}
-
-func (m *ModelOwnedBys) GetIcon(id int) string {
-	modelOwnedBy := m.Get(id)
-	if modelOwnedBy == nil {
-		return ""
-	}
-	return modelOwnedBy.Icon
-}
-
-func (m *ModelOwnedBys) GetAll() map[int]*ModelOwnedBy {
-	m.RLock()
-	defer m.RUnlock()
-
-	return m.ModelOwnedBy
-}
-
-func (m *ModelOwnedBys) SyncModelOwnedBy(modelOwnedBies []*ModelOwnedBy) {
-	var newModelOwnedBy []*ModelOwnedBy
-
-	for _, modelOwnedBy := range modelOwnedBies {
-		if _, ok := m.ModelOwnedBy[modelOwnedBy.Id]; !ok {
-			newModelOwnedBy = append(newModelOwnedBy, modelOwnedBy)
+// 目录关联写入与分类删除锁定同一分类行，防止校验之后被并发删除。
+func lockModelOwnedBy(tx *gorm.DB, id int) error {
+	if tx.Dialector.Name() == "sqlite" {
+		// SQLite 不支持行锁；先取得写锁，再读取分类及其引用。
+		if err := tx.Model(&ModelOwnedBy{}).Where("id = ?", id).UpdateColumn("id", gorm.Expr("id")).Error; err != nil {
+			return err
 		}
 	}
+	var ownedBy ModelOwnedBy
+	return tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&ownedBy, "id = ?", id).Error
+}
 
-	if len(newModelOwnedBy) == 0 {
-		return
+func DeleteModelOwnedBy(id int) error {
+	if id <= ModelOwnedByReserveID {
+		return errors.New("不能删除内置归属")
 	}
+	return DB.Transaction(func(tx *gorm.DB) error {
+		if err := lockModelOwnedBy(tx, id); err != nil {
+			return err
+		}
+		var references int64
+		if err := tx.Model(&ModelInfo{}).Where("owned_by_id = ?", id).Count(&references).Error; err != nil {
+			return err
+		}
+		if references != 0 {
+			return ErrModelOwnedByInUse
+		}
+		return tx.Delete(&ModelOwnedBy{}, id).Error
+	})
+}
 
-	err := DB.CreateInBatches(newModelOwnedBy, 100).Error
+func GetModelOwnedByMap() (map[int]*ModelOwnedBy, error) {
+	rows, err := GetAllModelOwnedBy()
 	if err != nil {
-		logger.SysError("Failed to sync ModelOwnedBy:" + err.Error())
-		return
+		return nil, err
 	}
+	result := make(map[int]*ModelOwnedBy, len(rows))
+	for _, row := range rows {
+		result[row.Id] = row
+	}
+	return result, nil
+}
 
-	m.Load()
+// InitModelOwnedBys 只补齐缺失的内置分类，不覆盖管理员编辑的名称和图标。
+func InitModelOwnedBys() error {
+	return DB.Clauses(clause.OnConflict{DoNothing: true}).Create(GetDefaultModelOwnedBy()).Error
 }
 
 func GetDefaultModelOwnedBy() []*ModelOwnedBy {

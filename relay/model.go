@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"net/http"
 	"one-api/common"
-	"one-api/common/config"
 	"one-api/common/groupctx"
+	"one-api/common/logger"
 	"one-api/common/utils"
 	"one-api/model"
 	"one-api/providers/claude"
@@ -53,18 +53,19 @@ func ListModelsByToken(c *gin.Context) {
 	}
 	sort.Strings(models)
 
-	var groupOpenAIModels []*OpenAIModels
+	catalog, err := loadModelDisplayCatalog(models)
+	if err != nil {
+		abortModelCatalogRead(c, err)
+		return
+	}
+	groupOpenAIModels := make([]*OpenAIModels, 0, len(models))
 	for _, modelName := range models {
-		groupOpenAIModels = append(groupOpenAIModels, getOpenAIModelWithName(modelName))
+		groupOpenAIModels = append(groupOpenAIModels, catalog.openAIModel(modelName))
 	}
 
-	// 根据 OwnedBy 排序
 	sort.Slice(groupOpenAIModels, func(i, j int) bool {
-		if groupOpenAIModels[i].OwnedBy == nil {
-			return true // 假设 nil 值小于任何非 nil 值
-		}
-		if groupOpenAIModels[j].OwnedBy == nil {
-			return false // 假设任何非 nil 值大于 nil 值
+		if *groupOpenAIModels[i].OwnedBy == *groupOpenAIModels[j].OwnedBy {
+			return groupOpenAIModels[i].Id < groupOpenAIModels[j].Id
 		}
 		return *groupOpenAIModels[i].OwnedBy < *groupOpenAIModels[j].OwnedBy
 	})
@@ -95,9 +96,7 @@ func ListGeminiModelsByToken(c *gin.Context) {
 
 	var geminiModels []gemini.ModelDetails
 	for _, modelName := range models {
-		// Get the price to check if it's a Gemini model (channel_type=25)
-		price, ok := model.PricingInstance.FindPrice(modelName)
-		if ok && price.ChannelType == config.ChannelTypeGemini {
+		if model.ChannelGroup.ModelHasChannel(groupName, modelName, model.FilterChannelTypes(AllowGeminiChannelType)) {
 			geminiModels = append(geminiModels, gemini.ModelDetails{
 				Name:        fmt.Sprintf("models/%s", modelName),
 				DisplayName: cases.Title(language.Und).String(strings.ReplaceAll(modelName, "-", " ")),
@@ -151,78 +150,97 @@ func isClaudeModelForGroup(groupName string, modelName string) bool {
 
 func ListModelsForAdmin(c *gin.Context) {
 	prices := model.PricingInstance.GetAllPrices()
-	var openAIModels []OpenAIModels
-	for modelId, price := range prices {
-		openAIModels = append(openAIModels, OpenAIModels{
-			Id:      modelId,
-			Object:  "model",
-			Created: 1677649963,
-			OwnedBy: getModelOwnedBy(price.ChannelType),
-		})
+	modelNames := make([]string, 0, len(prices))
+	for name := range prices {
+		modelNames = append(modelNames, name)
 	}
-	// 根据 OwnedBy 排序
+	catalog, err := loadModelDisplayCatalog(modelNames)
+	if err != nil {
+		abortModelCatalogRead(c, err)
+		return
+	}
+	openAIModels := make([]*OpenAIModels, 0, len(modelNames))
+	for _, name := range modelNames {
+		openAIModels = append(openAIModels, catalog.openAIModel(name))
+	}
 	sort.Slice(openAIModels, func(i, j int) bool {
-		if openAIModels[i].OwnedBy == nil {
-			return true // 假设 nil 值小于任何非 nil 值
-		}
-		if openAIModels[j].OwnedBy == nil {
-			return false // 假设任何非 nil 值大于 nil 值
+		if *openAIModels[i].OwnedBy == *openAIModels[j].OwnedBy {
+			return openAIModels[i].Id < openAIModels[j].Id
 		}
 		return *openAIModels[i].OwnedBy < *openAIModels[j].OwnedBy
 	})
 
-	c.JSON(200, gin.H{
-		"object": "list",
-		"data":   openAIModels,
-	})
+	c.JSON(http.StatusOK, gin.H{"object": "list", "data": openAIModels})
 }
 
 func RetrieveModel(c *gin.Context) {
 	modelName := c.Param("model")
-	openaiModel := getOpenAIModelWithName(modelName)
-	if *openaiModel.OwnedBy != model.UnknownOwnedBy {
-		c.JSON(200, openaiModel)
-	} else {
-		openAIError := types.OpenAIError{
+	if !model.ChannelGroup.ModelHasCandidate(modelsGroupName(c), modelName) {
+		c.JSON(http.StatusOK, gin.H{"error": types.OpenAIError{
 			Message: fmt.Sprintf("The model '%s' does not exist", modelName),
-			Type:    "invalid_request_error",
-			Param:   "model",
-			Code:    "model_not_found",
+			Type:    "invalid_request_error", Param: "model", Code: "model_not_found",
+		}})
+		return
+	}
+	catalog, err := loadModelDisplayCatalog([]string{modelName})
+	if err != nil {
+		abortModelCatalogRead(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, catalog.openAIModel(modelName))
+}
+
+type modelDisplayCatalog struct {
+	info   map[string]*model.ModelInfoResponse
+	owners map[int]*model.ModelOwnedBy
+}
+
+func loadModelDisplayCatalog(names []string) (*modelDisplayCatalog, error) {
+	catalog := &modelDisplayCatalog{}
+	if len(names) == 0 {
+		return catalog, nil
+	}
+	var err error
+	catalog.info, err = model.GetModelInfoResponses(names)
+	if err != nil {
+		return nil, err
+	}
+	catalog.owners, err = model.GetModelOwnedByMap()
+	if err != nil {
+		return nil, err
+	}
+	return catalog, nil
+}
+
+func (catalog *modelDisplayCatalog) ownedBy(name string) string {
+	if info := catalog.info[name]; info != nil && info.OwnedByID != nil {
+		if owner := catalog.owners[*info.OwnedByID]; owner != nil && owner.Name != "" {
+			return owner.Name
 		}
-		c.JSON(200, gin.H{
-			"error": openAIError,
-		})
 	}
+	return model.UnknownOwnedBy
 }
 
-func getModelOwnedBy(channelType int) (ownedBy *string) {
-	ownedByName := model.ModelOwnedBysInstance.GetName(channelType)
-	if ownedByName != "" {
-		return &ownedByName
-	}
-
-	return &model.UnknownOwnedBy
+func (catalog *modelDisplayCatalog) openAIModel(name string) *OpenAIModels {
+	owner := catalog.ownedBy(name)
+	return &OpenAIModels{Id: name, Object: "model", Created: 1677649963, OwnedBy: &owner}
 }
 
-func getOpenAIModelWithName(modelName string) *OpenAIModels {
-	price, ok := model.PricingInstance.FindPrice(modelName)
-	if !ok {
-		return &OpenAIModels{Id: modelName, Object: "model", Created: 1677649963, OwnedBy: &model.UnknownOwnedBy}
-	}
-
-	return &OpenAIModels{
-		Id:      modelName,
-		Object:  "model",
-		Created: 1677649963,
-		OwnedBy: getModelOwnedBy(price.ChannelType),
-	}
+func abortModelCatalogRead(c *gin.Context, err error) {
+	logger.LogError(c.Request.Context(), "读取模型目录失败: "+err.Error())
+	common.AbortWithMessage(c, http.StatusInternalServerError, "读取模型目录失败")
 }
 
 func GetModelOwnedBy(c *gin.Context) {
+	owners, err := model.GetModelOwnedByMap()
+	if err != nil {
+		common.APIRespondWithError(c, http.StatusInternalServerError, err)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
-		"data":    model.ModelOwnedBysInstance.GetAll(),
+		"data":    owners,
 	})
 }
 
@@ -241,20 +259,18 @@ type AvailableModelResponse struct {
 func AvailableModel(c *gin.Context) {
 	groupName := c.GetString("group")
 
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "",
-		"data":    getAvailableModels(groupName),
-	})
+	models, err := GetAvailableModels(groupName)
+	if err != nil {
+		logger.LogError(c.Request.Context(), "读取模型目录失败: "+err.Error())
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "读取模型目录失败"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": models})
 }
 
-func GetAvailableModels(groupName string) map[string]*AvailableModelResponse {
-	return getAvailableModels(groupName)
-}
-
-func getAvailableModels(groupName string) map[string]*AvailableModelResponse {
+func GetAvailableModels(groupName string) (map[string]*AvailableModelResponse, error) {
 	publicModels := model.ChannelGroup.GetModelsGroups()
-	publicGroups := model.GlobalUserGroupRatio.GetPublicGroupList()
+	publicGroups := append([]string(nil), model.GlobalUserGroupRatio.GetPublicGroupList()...)
 	if groupName != "" && !utils.Contains(groupName, publicGroups) {
 		publicGroups = append(publicGroups, groupName)
 	}
@@ -278,13 +294,22 @@ func getAvailableModels(groupName string) map[string]*AvailableModelResponse {
 			if !priced {
 				continue
 			}
-			availableModels[modelName] = &AvailableModelResponse{
-				Groups:  groups,
-				OwnedBy: *getModelOwnedBy(price.ChannelType),
-				Price:   price,
-			}
+			// FindPrice 返回策略副本；只在查询边界附加精确模型的展示信息。
+			availableModels[modelName] = &AvailableModelResponse{Groups: groups, Price: price}
 		}
 	}
 
-	return availableModels
+	modelNames := make([]string, 0, len(availableModels))
+	for name := range availableModels {
+		modelNames = append(modelNames, name)
+	}
+	catalog, err := loadModelDisplayCatalog(modelNames)
+	if err != nil {
+		return nil, err
+	}
+	for name, item := range availableModels {
+		item.OwnedBy = catalog.ownedBy(name)
+		item.Price.ModelInfo = catalog.info[name]
+	}
+	return availableModels, nil
 }

@@ -2103,7 +2103,6 @@
       "input": "输入倍率",
       "output": "输出倍率",
       "type": "计费方式",
-      "channel_type": "渠道类型",
       "locked": "锁定状态",
       "rules": "价格规则"
     }

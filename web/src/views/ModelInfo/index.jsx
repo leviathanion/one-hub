@@ -19,6 +19,7 @@ import { Icon } from '@iconify/react';
 // ----------------------------------------------------------------------
 export default function ModelInfo() {
   const [modelInfos, setModelInfos] = useState([]);
+  const [ownedby, setOwnedby] = useState({});
   const [refreshFlag, setRefreshFlag] = useState(false);
 
   const [openModal, setOpenModal] = useState(false);
@@ -29,7 +30,9 @@ export default function ModelInfo() {
 
   const fetchData = async () => {
     try {
-      const res = await API.get(`/api/model_info/`);
+      const [res, owners] = await Promise.all([API.get('/api/model_info/'), API.get('/api/ownedby')]);
+      if (owners.data.success) setOwnedby(owners.data.data);
+      else showError(owners.data.message);
       const { success, message, data } = res.data;
       if (success) {
         setModelInfos(data);
@@ -191,6 +194,7 @@ export default function ModelInfo() {
                 headLabel={[
                   { id: 'model', label: '模型标识', disableSort: false },
                   { id: 'name', label: '模型名称', disableSort: false },
+                  { id: 'owned_by_id', label: '模型归属', disableSort: false },
                   { id: 'context_length', label: '上下文长度', disableSort: false },
                   { id: 'max_tokens', label: '最大Token', disableSort: false },
                   { id: 'input_modalities', label: '输入模态', disableSort: false },
@@ -201,7 +205,13 @@ export default function ModelInfo() {
               />
               <TableBody>
                 {filteredModelInfos.slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage).map((row) => (
-                  <ModelInfoTableRow item={row} manageModelInfo={manageModelInfo} key={row.id} handleOpenModal={handleOpenModal} />
+                  <ModelInfoTableRow
+                    ownedby={ownedby}
+                    item={row}
+                    manageModelInfo={manageModelInfo}
+                    key={row.id}
+                    handleOpenModal={handleOpenModal}
+                  />
                 ))}
               </TableBody>
             </Table>
@@ -222,6 +232,7 @@ export default function ModelInfo() {
         onCancel={handleCloseModal}
         onOk={handleOkModal}
         editId={editId}
+        ownedby={ownedby}
         existingModels={modelInfos.map((info) => info.model)}
       />
       <ImportModal
@@ -233,7 +244,7 @@ export default function ModelInfo() {
             handleRefresh();
           }
         }}
-        existingModels={modelInfos.map((info) => info.model)}
+        existingModels={modelInfos}
       />
     </>
   );

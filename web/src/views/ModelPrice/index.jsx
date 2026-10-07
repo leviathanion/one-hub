@@ -47,7 +47,6 @@ export default function ModelPrice() {
   const ownedby = useSelector((state) => state.siteInfo?.ownedby);
 
   const [availableModels, setAvailableModels] = useState({});
-  const [modelInfoMap, setModelInfoMap] = useState({});
   const [userGroupMap, setUserGroupMap] = useState({});
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedGroup, setSelectedGroup] = useState('');
@@ -86,26 +85,6 @@ export default function ModelPrice() {
     }
   }, []);
 
-  // 获取模型信息
-  const fetchModelInfo = useCallback(async () => {
-    try {
-      const res = await API.get('/api/model_info/');
-      const { success, message, data } = res.data;
-      if (success) {
-        // 转换为 map 方便查找
-        const infoMap = {};
-        data.forEach((info) => {
-          infoMap[info.model] = info;
-        });
-        setModelInfoMap(infoMap);
-      } else {
-        showError(message);
-      }
-    } catch (error) {
-      console.error(error);
-    }
-  }, []);
-
   // 获取用户组
   const fetchUserGroupMap = useCallback(async () => {
     try {
@@ -124,22 +103,11 @@ export default function ModelPrice() {
 
   useEffect(() => {
     fetchAvailableModels();
-    fetchModelInfo();
     fetchUserGroupMap();
-  }, [fetchAvailableModels, fetchModelInfo, fetchUserGroupMap]);
+  }, [fetchAvailableModels, fetchUserGroupMap]);
 
   // 提取所有唯一标签
-  const allTags = [
-    ...new Set(
-      Object.values(modelInfoMap).flatMap((info) => {
-        try {
-          return JSON.parse(info.tags || '[]');
-        } catch (e) {
-          return [];
-        }
-      })
-    )
-  ];
+  const allTags = [...new Set(Object.values(availableModels).flatMap(({ price }) => price.model_info?.tags || []))];
 
   // 格式化价格
   const formatPrice = (value, type) => {
@@ -170,44 +138,20 @@ export default function ModelPrice() {
         // 搜索
         if (searchQuery) {
           const query = searchQuery.toLowerCase();
-          const modelInfo = modelInfoMap[modelName];
+          const modelInfo = model.price.model_info;
           const matchModel = modelName.toLowerCase().includes(query);
           const matchDescription = modelInfo?.description?.toLowerCase().includes(query);
           if (!matchModel && !matchDescription) return false;
         }
 
-        // 模态筛选
-        if (selectedModality !== 'all') {
-          const modelInfo = modelInfoMap[modelName];
-          if (modelInfo) {
-            try {
-              const inputModalities = JSON.parse(modelInfo.input_modalities || '[]');
-              const outputModalities = JSON.parse(modelInfo.output_modalities || '[]');
-              if (!inputModalities.includes(selectedModality) && !outputModalities.includes(selectedModality)) {
-                return false;
-              }
-            } catch (e) {
-              return false;
-            }
-          } else {
-            return false;
-          }
-        }
-
-        // 标签筛选
-        if (selectedTag !== 'all') {
-          const modelInfo = modelInfoMap[modelName];
-          if (modelInfo) {
-            try {
-              const tags = JSON.parse(modelInfo.tags || '[]');
-              if (!tags.includes(selectedTag)) return false;
-            } catch (e) {
-              return false;
-            }
-          } else {
-            return false;
-          }
-        }
+        const modelInfo = model.price.model_info;
+        if (
+          selectedModality !== 'all' &&
+          !modelInfo?.input_modalities?.includes(selectedModality) &&
+          !modelInfo?.output_modalities?.includes(selectedModality)
+        )
+          return false;
+        if (selectedTag !== 'all' && !modelInfo?.tags?.includes(selectedTag)) return false;
 
         return true;
       })
@@ -241,7 +185,7 @@ export default function ModelPrice() {
         return {
           model: modelName,
           provider: model.owned_by,
-          modelInfo: modelInfoMap[modelName],
+          modelInfo: model.price.model_info,
           price,
           group: hasAccess ? group : null,
           type: model.price.type,
@@ -262,13 +206,11 @@ export default function ModelPrice() {
     onlyShowAvailable,
     selectedGroup,
     searchQuery,
-    modelInfoMap,
     selectedModality,
     selectedTag,
     userGroupMap,
     ownedby,
-    t,
-    unit
+    t
   ]);
 
   // 分页处理

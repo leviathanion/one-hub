@@ -13,26 +13,9 @@ export default function ModelCard({ model, provider, modelInfo, price, group, ow
   const theme = useTheme();
   const { t } = useTranslation();
   // 解析输入输出模态
-  const getModalities = (modalitiesStr) => {
-    try {
-      return JSON.parse(modalitiesStr || '[]');
-    } catch (e) {
-      return [];
-    }
-  };
-
-  // 解析标签
-  const getTags = (tagsStr) => {
-    try {
-      return JSON.parse(tagsStr || '[]');
-    } catch (e) {
-      return [];
-    }
-  };
-
-  const inputModalities = modelInfo ? getModalities(modelInfo.input_modalities) : [];
-  const outputModalities = modelInfo ? getModalities(modelInfo.output_modalities) : [];
-  const tags = modelInfo ? getTags(modelInfo.tags) : [];
+  const inputModalities = modelInfo?.input_modalities || [];
+  const outputModalities = modelInfo?.output_modalities || [];
+  const tags = modelInfo?.tags || [];
 
   const isPriceAvailable = typeof price.input === 'number' && typeof price.output === 'number';
 

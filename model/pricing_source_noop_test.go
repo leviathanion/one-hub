@@ -7,7 +7,7 @@ import (
 
 func TestSourceNoExtraSourceDoesNotCreateChange(t *testing.T) {
 	db, publisher := setupVersionedPricingTest(t)
-	source, err := convertModelsDevPrice("unchanged", "openai", []byte(`{"input":2,"output":8}`))
+	source, err := convertModelsDevPrice("unchanged", []byte(`{"input":2,"output":8}`))
 	if err != nil {
 		t.Fatal(err)
 	}

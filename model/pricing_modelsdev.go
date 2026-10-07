@@ -92,7 +92,7 @@ func ConvertModelsDevPrices(r io.Reader) (*ModelsDevCatalog, error) {
 	counts := map[string]int{}
 	for provider, p := range upstream {
 		for name, m := range p.Models {
-			price, err := convertModelsDevPrice(name, provider, m.Cost)
+			price, err := convertModelsDevPrice(name, m.Cost)
 			candidate := ModelsDevCandidate{Provider: provider, Model: name, Price: price}
 			if err != nil {
 				candidate.Reason = err.Error()
@@ -245,15 +245,13 @@ func modelsDevExtras(c modelsDevCost, input, output float64) (map[string]float64
 	}
 	return extras, nil
 }
-func convertModelsDevPrice(name, provider string, raw json.RawMessage) (*Price, error) {
+func convertModelsDevPrice(name string, raw json.RawMessage) (*Price, error) {
 	c, err := decodeModelsDevCost(raw)
 	if err != nil {
 		return nil, err
 	}
 	// Each base rate is an independent absolute multiplier: $0.002/1K = $2/1M.
 	p := &Price{Model: name, Type: TokensPriceType, Input: *c.Input / (DollarRate * 1000), Output: *c.Output / (DollarRate * 1000)}
-	channelTypes := map[string]int{"openai": config.ChannelTypeOpenAI, "anthropic": config.ChannelTypeAnthropic, "google": config.ChannelTypeGemini, "deepseek": config.ChannelTypeDeepseek, "xai": config.ChannelTypeXAI, "mistral": config.ChannelTypeMistral, "cohere": config.ChannelTypeCohere, "moonshotai": config.ChannelTypeMoonshot, "zhipuai": config.ChannelTypeZhipu, "minimax": config.ChannelTypeMiniMax, "alibaba": config.ChannelTypeAli}
-	p.ChannelType = channelTypes[provider]
 	extra, err := modelsDevExtras(c, *c.Input, *c.Output)
 	if err != nil {
 		return nil, err

@@ -35,7 +35,9 @@ func SetupDB() {
 		logger.FatalLog("failed to load channels: " + err.Error())
 	}
 	config.RootUserEmail = GetRootUserEmail()
-	NewModelOwnedBys()
+	if err := InitModelOwnedBys(); err != nil {
+		logger.FatalLog("failed to initialize model attribution: " + err.Error())
+	}
 
 	if viper.GetBool("batch_update_enabled") {
 		config.BatchUpdateEnabled = true
@@ -120,6 +122,10 @@ func InitDB() (err error) {
 		sqlDB.SetMaxIdleConns(utils.GetOrDefault("SQL_MAX_IDLE_CONNS", 100))
 		sqlDB.SetMaxOpenConns(utils.GetOrDefault("SQL_MAX_OPEN_CONNS", 1000))
 		sqlDB.SetConnMaxLifetime(time.Second * time.Duration(utils.GetOrDefault("SQL_MAX_LIFETIME", 60)))
+
+		if err := InitializeModelCatalogSchema(db, config.IsMasterNode); err != nil {
+			return err
+		}
 
 		if !config.IsMasterNode {
 			if err := ValidatePaymentUpgradePrerequisites(db); err != nil {
@@ -208,6 +214,9 @@ func InitDB() (err error) {
 
 		err = db.AutoMigrate(&ModelInfo{})
 		if err != nil {
+			return err
+		}
+		if err = EnsureModelInfoIdentitySchema(db); err != nil {
 			return err
 		}
 

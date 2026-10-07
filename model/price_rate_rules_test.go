@@ -64,7 +64,6 @@ func TestPricePersistenceRejectsInvalidBaseFields(t *testing.T) {
 		{name: "missing type", price: Price{}},
 		{name: "unknown type", price: Price{Type: "token"}},
 		{name: "whitespace type", price: Price{Type: " tokens "}},
-		{name: "negative channel type", price: Price{Type: TokensPriceType, ChannelType: -1}},
 		{name: "negative input", price: Price{Type: TokensPriceType, Input: -1}},
 		{name: "negative output", price: Price{Type: TokensPriceType, Output: -1}},
 		{name: "nan input", price: Price{Type: TokensPriceType, Input: math.NaN()}},
@@ -317,13 +316,13 @@ func TestUpdatePriceRateRulesPresenceContract(t *testing.T) {
 	t.Cleanup(func() { DB = originalDB })
 
 	rules := datatypes.NewJSONType(PriceRateRules{Version: 2, ServiceTier: []PriceRateRule{{ID: "flex", When: PriceRuleCondition{ServiceTier: []string{"flex"}}, Multipliers: PriceRateMultiplier{Input: utils.GetPointer(float64(0.5)), Output: utils.GetPointer(float64(0.5))}}}})
-	stored := &Price{Model: "gpt-5", Type: TokensPriceType, ChannelType: 1, Input: 1, Output: 2, RateRules: &rules}
+	stored := &Price{Model: "gpt-5", Type: TokensPriceType, Input: 1, Output: 2, RateRules: &rules}
 	if err := stored.Insert(); err != nil {
 		t.Fatal(err)
 	}
 	pricing := &Pricing{Prices: map[string]*Price{stored.Model: stored}}
 
-	omitted := &Price{Model: stored.Model, Type: TokensPriceType, ChannelType: 1, Input: 3, Output: 4}
+	omitted := &Price{Model: stored.Model, Type: TokensPriceType, Input: 3, Output: 4}
 	newerRules := datatypes.NewJSONType(PriceRateRules{Version: 2, LongContext: []PriceRateRule{{ID: "long_context", When: PriceRuleCondition{InputTokens: &PriceTokenRange{GT: utils.GetPointer(1000)}}, Multipliers: PriceRateMultiplier{Input: utils.GetPointer(float64(2)), Output: utils.GetPointer(float64(1.5))}}}})
 	if err := db.Model(&Price{}).Where("model = ?", stored.Model).Update("rate_rules", &newerRules).Error; err != nil {
 		t.Fatalf("simulate a newer rule saved by another instance: %v", err)
@@ -336,7 +335,7 @@ func TestUpdatePriceRateRulesPresenceContract(t *testing.T) {
 	}
 
 	emptyRules := datatypes.NewJSONType(PriceRateRules{})
-	cleared := &Price{Model: stored.Model, Type: TokensPriceType, ChannelType: 1, Input: 5, Output: 6, RateRules: &emptyRules}
+	cleared := &Price{Model: stored.Model, Type: TokensPriceType, Input: 5, Output: 6, RateRules: &emptyRules}
 	if err := pricing.UpdatePriceWithRateRulesPresence(stored.Model, cleared, true); err != nil {
 		t.Fatalf("clear explicit rules: %v", err)
 	}
@@ -345,7 +344,7 @@ func TestUpdatePriceRateRulesPresenceContract(t *testing.T) {
 	}
 
 	replacementRules := datatypes.NewJSONType(PriceRateRules{Version: 2, ServiceTier: []PriceRateRule{{ID: "priority", When: PriceRuleCondition{ServiceTier: []string{"fast", "priority"}}, Multipliers: PriceRateMultiplier{Input: utils.GetPointer(float64(1.5)), Output: utils.GetPointer(float64(2))}}}})
-	replacement := &Price{Model: stored.Model, Type: TokensPriceType, ChannelType: 1, Input: 7, Output: 8, RateRules: &replacementRules}
+	replacement := &Price{Model: stored.Model, Type: TokensPriceType, Input: 7, Output: 8, RateRules: &replacementRules}
 	if err := pricing.UpdatePriceWithRateRulesPresence(stored.Model, replacement, true); err != nil {
 		t.Fatalf("replace explicit rules: %v", err)
 	}
@@ -354,7 +353,7 @@ func TestUpdatePriceRateRulesPresenceContract(t *testing.T) {
 	}
 
 	invalidRules := datatypes.NewJSONType(PriceRateRules{Version: 2, ServiceTier: []PriceRateRule{{ID: "flex", When: PriceRuleCondition{ServiceTier: []string{"flex"}}, Multipliers: PriceRateMultiplier{Input: utils.GetPointer(float64(-1)), Output: utils.GetPointer(float64(1))}}}})
-	invalid := &Price{Model: stored.Model, Type: TokensPriceType, ChannelType: 1, Input: 9, Output: 10, RateRules: &invalidRules}
+	invalid := &Price{Model: stored.Model, Type: TokensPriceType, Input: 9, Output: 10, RateRules: &invalidRules}
 	if err := pricing.UpdatePriceWithRateRulesPresence(stored.Model, invalid, true); err == nil {
 		t.Fatal("expected invalid replacement rules to fail")
 	}

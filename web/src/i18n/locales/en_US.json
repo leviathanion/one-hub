@@ -2155,7 +2155,6 @@
       "input": "Input multiplier",
       "output": "Output multiplier",
       "type": "Billing method",
-      "channel_type": "Channel type",
       "locked": "Lock state",
       "rules": "Price rules"
     }

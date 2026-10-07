@@ -225,6 +225,5 @@ func SyncChannelCache(ctx context.Context, frequency int) {
 		if err := model.ChannelGroup.Load(); err != nil {
 			logger.SysError("failed to sync channels from database: " + err.Error())
 		}
-		model.ModelOwnedBysInstance.Load()
 	}
 }

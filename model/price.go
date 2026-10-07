@@ -82,12 +82,11 @@ var defaultExtraPrice = map[string]float64{
 }
 
 type Price struct {
-	Model       string  `json:"model" gorm:"type:varchar(100);uniqueIndex:idx_prices_model_unique" binding:"required"`
-	Type        string  `json:"type"  gorm:"default:'tokens'" binding:"required"`
-	ChannelType int     `json:"channel_type" gorm:"default:0" binding:"gte=0"`
-	Input       float64 `json:"input" gorm:"default:0" binding:"gte=0"`
-	Output      float64 `json:"output" gorm:"default:0" binding:"gte=0"`
-	Locked      bool    `json:"locked" gorm:"default:false"` // 如果模型为locked 则覆盖模式不会更新locked的模型价格
+	Model  string  `json:"model" gorm:"type:varchar(100);uniqueIndex:idx_prices_model_unique" binding:"required"`
+	Type   string  `json:"type"  gorm:"default:'tokens'" binding:"required"`
+	Input  float64 `json:"input" gorm:"default:0" binding:"gte=0"`
+	Output float64 `json:"output" gorm:"default:0" binding:"gte=0"`
+	Locked bool    `json:"locked" gorm:"default:false"` // 如果模型为locked 则覆盖模式不会更新locked的模型价格
 
 	ExtraRatios *datatypes.JSONType[map[string]float64] `json:"extra_ratios,omitempty" gorm:"type:json"`
 	RateRules   *datatypes.JSONType[PriceRateRules]     `json:"rate_rules,omitempty" gorm:"type:json"`
@@ -115,9 +114,6 @@ func (price *Price) prepareForPersistence() error {
 	case TokensPriceType, TimesPriceType:
 	default:
 		return errors.New("price type must be tokens or times")
-	}
-	if price.ChannelType < 0 {
-		return errors.New("channel type must be non-negative")
 	}
 	if math.IsNaN(price.Input) || math.IsInf(price.Input, 0) || price.Input < 0 {
 		return errors.New("input price must be a finite non-negative number")
@@ -176,7 +172,7 @@ func (price *Price) updateColumns(modelName string, updateRateRules bool) error 
 	if err := price.prepareForPersistence(); err != nil {
 		return err
 	}
-	columns := []string{"model", "type", "channel_type", "input", "output", "locked", "extra_ratios"}
+	columns := []string{"model", "type", "input", "output", "locked", "extra_ratios"}
 	if updateRateRules {
 		columns = append(columns, "rate_rules")
 	}
@@ -264,7 +260,7 @@ func UpdatePrices(tx *gorm.DB, models []string, prices *Price) error {
 			if err := prepared.prepareForPersistence(); err != nil {
 				return err
 			}
-			columns := []string{"type", "channel_type", "input", "output", "locked"}
+			columns := []string{"type", "input", "output", "locked"}
 			if prepared.ExtraRatios != nil {
 				columns = append(columns, "extra_ratios")
 			}
@@ -277,7 +273,7 @@ func UpdatePrices(tx *gorm.DB, models []string, prices *Price) error {
 		}
 		return nil
 	}
-	columns := []string{"type", "channel_type", "input", "output", "locked"}
+	columns := []string{"type", "input", "output", "locked"}
 	if prices.ExtraRatios != nil {
 		columns = append(columns, "extra_ratios")
 	}
@@ -326,224 +322,219 @@ func (price *Price) Delete() error {
 	return DB.Where("model = ?", price.Model).Delete(&Price{}).Error
 }
 
-type ModelType struct {
-	Ratio []float64
-	Type  int
-}
-
 // 1 === $0.002 / 1K tokens
 // 1 === ￥0.014 / 1k tokens
 func GetDefaultPrice() []*Price {
-	ModelTypes := map[string]ModelType{
+	modelRatios := map[string][2]float64{
 		// 	$0.03 / 1K tokens	$0.06 / 1K tokens
-		"gpt-4":      {[]float64{15, 30}, config.ChannelTypeOpenAI},
-		"gpt-4-0314": {[]float64{15, 30}, config.ChannelTypeOpenAI},
-		"gpt-4-0613": {[]float64{15, 30}, config.ChannelTypeOpenAI},
+		"gpt-4":      {15, 30},
+		"gpt-4-0314": {15, 30},
+		"gpt-4-0613": {15, 30},
 		// 	$0.06 / 1K tokens	$0.12 / 1K tokens
-		"gpt-4-32k":      {[]float64{30, 60}, config.ChannelTypeOpenAI},
-		"gpt-4-32k-0314": {[]float64{30, 60}, config.ChannelTypeOpenAI},
-		"gpt-4-32k-0613": {[]float64{30, 60}, config.ChannelTypeOpenAI},
+		"gpt-4-32k":      {30, 60},
+		"gpt-4-32k-0314": {30, 60},
+		"gpt-4-32k-0613": {30, 60},
 		// 	$0.01 / 1K tokens	$0.03 / 1K tokens
-		"gpt-4-preview":          {[]float64{5, 15}, config.ChannelTypeOpenAI},
-		"gpt-4-turbo":            {[]float64{5, 15}, config.ChannelTypeOpenAI},
-		"gpt-4-turbo-2024-04-09": {[]float64{5, 15}, config.ChannelTypeOpenAI},
-		"gpt-4-1106-preview":     {[]float64{5, 15}, config.ChannelTypeOpenAI},
-		"gpt-4-0125-preview":     {[]float64{5, 15}, config.ChannelTypeOpenAI},
-		"gpt-4-turbo-preview":    {[]float64{5, 15}, config.ChannelTypeOpenAI},
-		"gpt-4-vision-preview":   {[]float64{5, 15}, config.ChannelTypeOpenAI},
+		"gpt-4-preview":          {5, 15},
+		"gpt-4-turbo":            {5, 15},
+		"gpt-4-turbo-2024-04-09": {5, 15},
+		"gpt-4-1106-preview":     {5, 15},
+		"gpt-4-0125-preview":     {5, 15},
+		"gpt-4-turbo-preview":    {5, 15},
+		"gpt-4-vision-preview":   {5, 15},
 		// $0.005 / 1K tokens	$0.015 / 1K tokens
-		"gpt-4o": {[]float64{2.5, 7.5}, config.ChannelTypeOpenAI},
+		"gpt-4o": {2.5, 7.5},
 		// 	$0.0005 / 1K tokens	$0.0015 / 1K tokens
-		"gpt-3.5-turbo":      {[]float64{0.25, 0.75}, config.ChannelTypeOpenAI},
-		"gpt-3.5-turbo-0125": {[]float64{0.25, 0.75}, config.ChannelTypeOpenAI},
+		"gpt-3.5-turbo":      {0.25, 0.75},
+		"gpt-3.5-turbo-0125": {0.25, 0.75},
 		// 	$0.0015 / 1K tokens	$0.002 / 1K tokens
-		"gpt-3.5-turbo-0301":     {[]float64{0.75, 1}, config.ChannelTypeOpenAI},
-		"gpt-3.5-turbo-0613":     {[]float64{0.75, 1}, config.ChannelTypeOpenAI},
-		"gpt-3.5-turbo-instruct": {[]float64{0.75, 1}, config.ChannelTypeOpenAI},
+		"gpt-3.5-turbo-0301":     {0.75, 1},
+		"gpt-3.5-turbo-0613":     {0.75, 1},
+		"gpt-3.5-turbo-instruct": {0.75, 1},
 		// 	$0.003 / 1K tokens	$0.004 / 1K tokens
-		"gpt-3.5-turbo-16k":      {[]float64{1.5, 2}, config.ChannelTypeOpenAI},
-		"gpt-3.5-turbo-16k-0613": {[]float64{1.5, 2}, config.ChannelTypeOpenAI},
+		"gpt-3.5-turbo-16k":      {1.5, 2},
+		"gpt-3.5-turbo-16k-0613": {1.5, 2},
 		// 	$0.001 / 1K tokens	$0.002 / 1K tokens
-		"gpt-3.5-turbo-1106": {[]float64{0.5, 1}, config.ChannelTypeOpenAI},
+		"gpt-3.5-turbo-1106": {0.5, 1},
 		// 	$0.0020 / 1K tokens
-		"davinci-002": {[]float64{1, 1}, config.ChannelTypeOpenAI},
+		"davinci-002": {1, 1},
 		// 	$0.0004 / 1K tokens
-		"babbage-002": {[]float64{0.2, 0.2}, config.ChannelTypeOpenAI},
+		"babbage-002": {0.2, 0.2},
 		// $0.006 / minute -> $0.0001 / second; seconds are supplied by
 		// input_audio_transcription rather than token estimation.
-		"whisper-1": {[]float64{50, 0}, config.ChannelTypeOpenAI},
+		"whisper-1": {50, 0},
 		// $0.015 / 1K characters
-		"tts-1":      {[]float64{7.5, 7.5}, config.ChannelTypeOpenAI},
-		"tts-1-1106": {[]float64{7.5, 7.5}, config.ChannelTypeOpenAI},
+		"tts-1":      {7.5, 7.5},
+		"tts-1-1106": {7.5, 7.5},
 		// $0.030 / 1K characters
-		"tts-1-hd":               {[]float64{15, 15}, config.ChannelTypeOpenAI},
-		"tts-1-hd-1106":          {[]float64{15, 15}, config.ChannelTypeOpenAI},
-		"text-embedding-ada-002": {[]float64{0.05, 0.05}, config.ChannelTypeOpenAI},
+		"tts-1-hd":               {15, 15},
+		"tts-1-hd-1106":          {15, 15},
+		"text-embedding-ada-002": {0.05, 0.05},
 		// 	$0.00002 / 1K tokens
-		"text-embedding-3-small": {[]float64{0.01, 0.01}, config.ChannelTypeOpenAI},
+		"text-embedding-3-small": {0.01, 0.01},
 		// 	$0.00013 / 1K tokens
-		"text-embedding-3-large": {[]float64{0.065, 0.065}, config.ChannelTypeOpenAI},
-		"text-moderation-stable": {[]float64{0.1, 0.1}, config.ChannelTypeOpenAI},
-		"text-moderation-latest": {[]float64{0.1, 0.1}, config.ChannelTypeOpenAI},
+		"text-embedding-3-large": {0.065, 0.065},
+		"text-moderation-stable": {0.1, 0.1},
+		"text-moderation-latest": {0.1, 0.1},
 		// $0.016 - $0.020 / image
-		"dall-e-2": {[]float64{8, 8}, config.ChannelTypeOpenAI},
+		"dall-e-2": {8, 8},
 		// $0.040 - $0.120 / image
-		"dall-e-3": {[]float64{20, 20}, config.ChannelTypeOpenAI},
+		"dall-e-3": {20, 20},
 
 		// $0.80/million tokens $2.40/million tokens
-		"claude-instant-1.2": {[]float64{0.4, 1.2}, config.ChannelTypeAnthropic},
+		"claude-instant-1.2": {0.4, 1.2},
 		// $8.00/million tokens $24.00/million tokens
-		"claude-2.0": {[]float64{4, 12}, config.ChannelTypeAnthropic},
-		"claude-2.1": {[]float64{4, 12}, config.ChannelTypeAnthropic},
+		"claude-2.0": {4, 12},
+		"claude-2.1": {4, 12},
 		// $15 / M $75 / M
-		"claude-3-opus-20240229": {[]float64{7.5, 22.5}, config.ChannelTypeAnthropic},
+		"claude-3-opus-20240229": {7.5, 22.5},
 		//  $3 / M $15 / M
-		"claude-3-sonnet-20240229": {[]float64{1.3, 3.9}, config.ChannelTypeAnthropic},
+		"claude-3-sonnet-20240229": {1.3, 3.9},
 		//  $0.25 / M $1.25 / M  0.00025$ / 1k tokens 0.00125$ / 1k tokens
-		"claude-3-haiku-20240307": {[]float64{0.125, 0.625}, config.ChannelTypeAnthropic},
+		"claude-3-haiku-20240307": {0.125, 0.625},
 
 		// ￥0.004 / 1k tokens ￥0.008 / 1k tokens
-		"ERNIE-Speed": {[]float64{0.2857, 0.5714}, config.ChannelTypeBaidu},
+		"ERNIE-Speed": {0.2857, 0.5714},
 		// ￥0.012 / 1k tokens ￥0.012 / 1k tokens
-		"ERNIE-Bot":    {[]float64{0.8572, 0.8572}, config.ChannelTypeBaidu},
-		"ERNIE-3.5-8K": {[]float64{0.8572, 0.8572}, config.ChannelTypeBaidu},
+		"ERNIE-Bot":    {0.8572, 0.8572},
+		"ERNIE-3.5-8K": {0.8572, 0.8572},
 		// 0.024元/千tokens 0.048元/千tokens
-		"ERNIE-Bot-8k": {[]float64{1.7143, 3.4286}, config.ChannelTypeBaidu},
+		"ERNIE-Bot-8k": {1.7143, 3.4286},
 		// ￥0.008 / 1k tokens ￥0.008 / 1k tokens
-		"ERNIE-Bot-turbo": {[]float64{0.5715, 0.5715}, config.ChannelTypeBaidu},
+		"ERNIE-Bot-turbo": {0.5715, 0.5715},
 		// ￥0.12 / 1k tokens ￥0.12 / 1k tokens
-		"ERNIE-Bot-4": {[]float64{8.572, 8.572}, config.ChannelTypeBaidu},
-		"ERNIE-4.0":   {[]float64{8.572, 8.572}, config.ChannelTypeBaidu},
+		"ERNIE-Bot-4": {8.572, 8.572},
+		"ERNIE-4.0":   {8.572, 8.572},
 		// ￥0.002 / 1k tokens
-		"Embedding-V1": {[]float64{0.1429, 0.1429}, config.ChannelTypeBaidu},
+		"Embedding-V1": {0.1429, 0.1429},
 		// ￥0.004 / 1k tokens
-		"BLOOMZ-7B": {[]float64{0.2857, 0.2857}, config.ChannelTypeBaidu},
+		"BLOOMZ-7B": {0.2857, 0.2857},
 
-		// "PaLM-2": {[]float64{1, 1}, config.ChannelTypePaLM},
+		// "PaLM-2": {1, 1},
 		// $0.50 / 1 million tokens  $1.50 / 1 million tokens
 		// 0.0005$ / 1k tokens 0.0015$ / 1k tokens
-		"gemini-pro":        {[]float64{0.25, 0.75}, config.ChannelTypeGemini},
-		"gemini-pro-vision": {[]float64{0.25, 0.75}, config.ChannelTypeGemini},
-		"gemini-1.0-pro":    {[]float64{0.25, 0.75}, config.ChannelTypeGemini},
+		"gemini-pro":        {0.25, 0.75},
+		"gemini-pro-vision": {0.25, 0.75},
+		"gemini-1.0-pro":    {0.25, 0.75},
 		// $7 / 1 million tokens  $21 / 1 million tokens
-		"gemini-1.5-pro":          {[]float64{1.75, 5.25}, config.ChannelTypeGemini},
-		"gemini-1.5-pro-latest":   {[]float64{1.75, 5.25}, config.ChannelTypeGemini},
-		"gemini-1.5-flash":        {[]float64{0.175, 0.265}, config.ChannelTypeGemini},
-		"gemini-1.5-flash-latest": {[]float64{0.175, 0.265}, config.ChannelTypeGemini},
-		"gemini-ultra":            {[]float64{1, 1}, config.ChannelTypeGemini},
+		"gemini-1.5-pro":          {1.75, 5.25},
+		"gemini-1.5-pro-latest":   {1.75, 5.25},
+		"gemini-1.5-flash":        {0.175, 0.265},
+		"gemini-1.5-flash-latest": {0.175, 0.265},
+		"gemini-ultra":            {1, 1},
 
 		// ￥0.005 / 1k tokens
-		"glm-3-turbo": {[]float64{0.3572, 0.3572}, config.ChannelTypeZhipu},
+		"glm-3-turbo": {0.3572, 0.3572},
 		// ￥0.1 / 1k tokens
-		"glm-4":  {[]float64{7.143, 7.143}, config.ChannelTypeZhipu},
-		"glm-4v": {[]float64{7.143, 7.143}, config.ChannelTypeZhipu},
+		"glm-4":  {7.143, 7.143},
+		"glm-4v": {7.143, 7.143},
 		// ￥0.0005 / 1k tokens
-		"embedding-2": {[]float64{0.0357, 0.0357}, config.ChannelTypeZhipu},
+		"embedding-2": {0.0357, 0.0357},
 		// ￥0.25 / 1张图片
-		"cogview-3": {[]float64{17.8571, 17.8571}, config.ChannelTypeZhipu},
+		"cogview-3": {17.8571, 17.8571},
 
 		// ￥0.008 / 1k tokens
-		"qwen-turbo": {[]float64{0.5715, 0.5715}, config.ChannelTypeAli},
+		"qwen-turbo": {0.5715, 0.5715},
 		// ￥0.02 / 1k tokens
-		"qwen-plus":   {[]float64{1.4286, 1.4286}, config.ChannelTypeAli},
-		"qwen-vl-max": {[]float64{1.4286, 1.4286}, config.ChannelTypeAli},
+		"qwen-plus":   {1.4286, 1.4286},
+		"qwen-vl-max": {1.4286, 1.4286},
 		// 0.12元/1,000tokens
-		"qwen-max":             {[]float64{8.5714, 8.5714}, config.ChannelTypeAli},
-		"qwen-max-longcontext": {[]float64{8.5714, 8.5714}, config.ChannelTypeAli},
+		"qwen-max":             {8.5714, 8.5714},
+		"qwen-max-longcontext": {8.5714, 8.5714},
 		// 0.008元/1,000tokens
-		"qwen-vl-plus": {[]float64{0.5715, 0.5715}, config.ChannelTypeAli},
+		"qwen-vl-plus": {0.5715, 0.5715},
 		// ￥0.0007 / 1k tokens
-		"text-embedding-v1": {[]float64{0.05, 0.05}, config.ChannelTypeAli},
+		"text-embedding-v1": {0.05, 0.05},
 
 		// ￥0.018 / 1k tokens
-		"SparkDesk":      {[]float64{1.2858, 1.2858}, config.ChannelTypeXunfei},
-		"SparkDesk-v1.1": {[]float64{0, 0}, config.ChannelTypeXunfei},
-		"SparkDesk-v2.1": {[]float64{2.1429, 2.1429}, config.ChannelTypeXunfei},
-		"SparkDesk-v3.1": {[]float64{2.1429, 2.1429}, config.ChannelTypeXunfei},
-		"SparkDesk-v3.5": {[]float64{2.1429, 2.1429}, config.ChannelTypeXunfei},
-		"SparkDesk-v4.0": {[]float64{7.1429, 7.1429}, config.ChannelTypeXunfei},
+		"SparkDesk":      {1.2858, 1.2858},
+		"SparkDesk-v1.1": {0, 0},
+		"SparkDesk-v2.1": {2.1429, 2.1429},
+		"SparkDesk-v3.1": {2.1429, 2.1429},
+		"SparkDesk-v3.5": {2.1429, 2.1429},
+		"SparkDesk-v4.0": {7.1429, 7.1429},
 
 		// ¥0.012 / 1k tokens
-		"360GPT_S2_V9": {[]float64{0.8572, 0.8572}, config.ChannelType360},
+		"360GPT_S2_V9": {0.8572, 0.8572},
 		// ¥0.001 / 1k tokens
-		"embedding-bert-512-v1":     {[]float64{0.0715, 0.0715}, config.ChannelType360},
-		"embedding_s1_v1":           {[]float64{0.0715, 0.0715}, config.ChannelType360},
-		"semantic_similarity_s1_v1": {[]float64{0.0715, 0.0715}, config.ChannelType360},
+		"embedding-bert-512-v1":     {0.0715, 0.0715},
+		"embedding_s1_v1":           {0.0715, 0.0715},
+		"semantic_similarity_s1_v1": {0.0715, 0.0715},
 
 		// ¥0.1 / 1k tokens  // https://cloud.tencent.com/document/product/1729/97731#e0e6be58-60c8-469f-bdeb-6c264ce3b4d0
-		"hunyuan": {[]float64{7.143, 7.143}, config.ChannelTypeTencent},
+		"hunyuan": {7.143, 7.143},
 		// https://cloud.tencent.com/document/product/1729/97731#e0e6be58-60c8-469f-bdeb-6c264ce3b4d0
 		// ¥0.01 / 1k tokens
-		"ChatStd": {[]float64{0.7143, 0.7143}, config.ChannelTypeTencent},
+		"ChatStd": {0.7143, 0.7143},
 		//¥0.1 / 1k tokens
-		"ChatPro": {[]float64{7.143, 7.143}, config.ChannelTypeTencent},
+		"ChatPro": {7.143, 7.143},
 
-		"Baichuan2-Turbo":         {[]float64{0.5715, 0.5715}, config.ChannelTypeBaichuan}, // ¥0.008 / 1k tokens
-		"Baichuan2-Turbo-192k":    {[]float64{1.143, 1.143}, config.ChannelTypeBaichuan},   // ¥0.016 / 1k tokens
-		"Baichuan2-53B":           {[]float64{1.4286, 1.4286}, config.ChannelTypeBaichuan}, // ¥0.02 / 1k tokens
-		"Baichuan-Text-Embedding": {[]float64{0.0357, 0.0357}, config.ChannelTypeBaichuan}, // ¥0.0005 / 1k tokens
+		"Baichuan2-Turbo":         {0.5715, 0.5715}, // ¥0.008 / 1k tokens
+		"Baichuan2-Turbo-192k":    {1.143, 1.143},   // ¥0.016 / 1k tokens
+		"Baichuan2-53B":           {1.4286, 1.4286}, // ¥0.02 / 1k tokens
+		"Baichuan-Text-Embedding": {0.0357, 0.0357}, // ¥0.0005 / 1k tokens
 
-		"abab5.5s-chat": {[]float64{0.3572, 0.3572}, config.ChannelTypeMiniMax},   // ¥0.005 / 1k tokens
-		"abab5.5-chat":  {[]float64{1.0714, 1.0714}, config.ChannelTypeMiniMax},   // ¥0.015 / 1k tokens
-		"abab6-chat":    {[]float64{14.2857, 14.2857}, config.ChannelTypeMiniMax}, // ¥0.2 / 1k tokens
-		"embo-01":       {[]float64{0.0357, 0.0357}, config.ChannelTypeMiniMax},   // ¥0.0005 / 1k tokens
+		"abab5.5s-chat": {0.3572, 0.3572},   // ¥0.005 / 1k tokens
+		"abab5.5-chat":  {1.0714, 1.0714},   // ¥0.015 / 1k tokens
+		"abab6-chat":    {14.2857, 14.2857}, // ¥0.2 / 1k tokens
+		"embo-01":       {0.0357, 0.0357},   // ¥0.0005 / 1k tokens
 
-		"deepseek-coder": {[]float64{0.75, 0.75}, config.ChannelTypeDeepseek}, // 暂定 $0.0015 / 1K tokens
-		"deepseek-chat":  {[]float64{0.75, 0.75}, config.ChannelTypeDeepseek}, // 暂定 $0.0015 / 1K tokens
+		"deepseek-coder": {0.75, 0.75}, // 暂定 $0.0015 / 1K tokens
+		"deepseek-chat":  {0.75, 0.75}, // 暂定 $0.0015 / 1K tokens
 
-		"moonshot-v1-8k":   {[]float64{0.8572, 0.8572}, config.ChannelTypeMoonshot}, // ¥0.012 / 1K tokens
-		"moonshot-v1-32k":  {[]float64{1.7143, 1.7143}, config.ChannelTypeMoonshot}, // ¥0.024 / 1K tokens
-		"moonshot-v1-128k": {[]float64{4.2857, 4.2857}, config.ChannelTypeMoonshot}, // ¥0.06 / 1K tokens
+		"moonshot-v1-8k":   {0.8572, 0.8572}, // ¥0.012 / 1K tokens
+		"moonshot-v1-32k":  {1.7143, 1.7143}, // ¥0.024 / 1K tokens
+		"moonshot-v1-128k": {4.2857, 4.2857}, // ¥0.06 / 1K tokens
 
-		"open-mistral-7b":       {[]float64{0.125, 0.125}, config.ChannelTypeMistral}, // 0.25$ / 1M tokens	0.25$ / 1M tokens  0.00025$ / 1k tokens
-		"open-mixtral-8x7b":     {[]float64{0.35, 0.35}, config.ChannelTypeMistral},   // 0.7$ / 1M tokens	0.7$ / 1M tokens  0.0007$ / 1k tokens
-		"mistral-small-latest":  {[]float64{1, 3}, config.ChannelTypeMistral},         // 2$ / 1M tokens	6$ / 1M tokens  0.002$ / 1k tokens
-		"mistral-medium-latest": {[]float64{1.35, 4.05}, config.ChannelTypeMistral},   // 2.7$ / 1M tokens	8.1$ / 1M tokens  0.0027$ / 1k tokens
-		"mistral-large-latest":  {[]float64{4, 12}, config.ChannelTypeMistral},        // 8$ / 1M tokens	24$ / 1M tokens  0.008$ / 1k tokens
-		"mistral-embed":         {[]float64{0.05, 0.05}, config.ChannelTypeMistral},   // 0.1$ / 1M tokens 0.1$ / 1M tokens  0.0001$ / 1k tokens
+		"open-mistral-7b":       {0.125, 0.125}, // 0.25$ / 1M tokens	0.25$ / 1M tokens  0.00025$ / 1k tokens
+		"open-mixtral-8x7b":     {0.35, 0.35},   // 0.7$ / 1M tokens	0.7$ / 1M tokens  0.0007$ / 1k tokens
+		"mistral-small-latest":  {1, 3},         // 2$ / 1M tokens	6$ / 1M tokens  0.002$ / 1k tokens
+		"mistral-medium-latest": {1.35, 4.05},   // 2.7$ / 1M tokens	8.1$ / 1M tokens  0.0027$ / 1k tokens
+		"mistral-large-latest":  {4, 12},        // 8$ / 1M tokens	24$ / 1M tokens  0.008$ / 1k tokens
+		"mistral-embed":         {0.05, 0.05},   // 0.1$ / 1M tokens 0.1$ / 1M tokens  0.0001$ / 1k tokens
 
 		// $0.70/$0.80 /1M Tokens 0.0007$ / 1k tokens
-		"llama2-70b-4096": {[]float64{0.35, 0.4}, config.ChannelTypeGroq},
+		"llama2-70b-4096": {0.35, 0.4},
 		// $0.10/$0.10 /1M Tokens 0.0001$ / 1k tokens
-		"llama2-7b-2048": {[]float64{0.05, 0.05}, config.ChannelTypeGroq},
-		"gemma-7b-it":    {[]float64{0.05, 0.05}, config.ChannelTypeGroq},
+		"llama2-7b-2048": {0.05, 0.05},
+		"gemma-7b-it":    {0.05, 0.05},
 		// $0.27/$0.27 /1M Tokens 0.00027$ / 1k tokens
-		"mixtral-8x7b-32768": {[]float64{0.135, 0.135}, config.ChannelTypeGroq},
+		"mixtral-8x7b-32768": {0.135, 0.135},
 
 		// 2.5 元 / 1M tokens 0.0025 / 1k tokens
-		"yi-34b-chat-0205": {[]float64{0.1786, 0.1786}, config.ChannelTypeLingyi},
+		"yi-34b-chat-0205": {0.1786, 0.1786},
 		// 12 元 / 1M tokens 0.012 / 1k tokens
-		"yi-34b-chat-200k": {[]float64{0.8571, 0.8571}, config.ChannelTypeLingyi},
+		"yi-34b-chat-200k": {0.8571, 0.8571},
 		// 	6 元 / 1M tokens 0.006 / 1k tokens
-		"yi-vl-plus": {[]float64{0.4286, 0.4286}, config.ChannelTypeLingyi},
+		"yi-vl-plus": {0.4286, 0.4286},
 
-		"@cf/stabilityai/stable-diffusion-xl-base-1.0": {[]float64{0, 0}, config.ChannelTypeCloudflareAI},
-		"@cf/lykon/dreamshaper-8-lcm":                  {[]float64{0, 0}, config.ChannelTypeCloudflareAI},
-		"@cf/bytedance/stable-diffusion-xl-lightning":  {[]float64{0, 0}, config.ChannelTypeCloudflareAI},
-		"@cf/qwen/qwen1.5-7b-chat-awq":                 {[]float64{0, 0}, config.ChannelTypeCloudflareAI},
-		"@cf/qwen/qwen1.5-14b-chat-awq":                {[]float64{0, 0}, config.ChannelTypeCloudflareAI},
-		"@hf/thebloke/deepseek-coder-6.7b-base-awq":    {[]float64{0, 0}, config.ChannelTypeCloudflareAI},
-		"@hf/google/gemma-7b-it":                       {[]float64{0, 0}, config.ChannelTypeCloudflareAI},
-		"@hf/thebloke/llama-2-13b-chat-awq":            {[]float64{0, 0}, config.ChannelTypeCloudflareAI},
-		"@cf/openai/whisper":                           {[]float64{0, 0}, config.ChannelTypeCloudflareAI},
+		"@cf/stabilityai/stable-diffusion-xl-base-1.0": {0, 0},
+		"@cf/lykon/dreamshaper-8-lcm":                  {0, 0},
+		"@cf/bytedance/stable-diffusion-xl-lightning":  {0, 0},
+		"@cf/qwen/qwen1.5-7b-chat-awq":                 {0, 0},
+		"@cf/qwen/qwen1.5-14b-chat-awq":                {0, 0},
+		"@hf/thebloke/deepseek-coder-6.7b-base-awq":    {0, 0},
+		"@hf/google/gemma-7b-it":                       {0, 0},
+		"@hf/thebloke/llama-2-13b-chat-awq":            {0, 0},
+		"@cf/openai/whisper":                           {0, 0},
 		//$0.50 /1M TOKENS   $1.50/1M TOKENS
-		"command-r": {[]float64{0.25, 0.75}, config.ChannelTypeCohere},
+		"command-r": {0.25, 0.75},
 		//$3 /1M TOKENS   $15/1M TOKENS
-		"command-r-plus": {[]float64{1.5, 7.5}, config.ChannelTypeCohere},
+		"command-r-plus": {1.5, 7.5},
 
 		// StabilityAI is priced per successful image operation.
 		// 0.065 / image
-		"sd3": {[]float64{32.5, 0}, config.ChannelTypeStabilityAI},
+		"sd3": {32.5, 0},
 		// 0.04 / image
-		"sd3-turbo": {[]float64{20, 0}, config.ChannelTypeStabilityAI},
+		"sd3-turbo": {20, 0},
 		// 0.03 / image
-		"stable-image-core": {[]float64{15, 0}, config.ChannelTypeStabilityAI},
+		"stable-image-core": {15, 0},
 
 		// hunyuan
-		"hunyuan-lite":          {[]float64{0, 0}, config.ChannelTypeHunyuan},
-		"hunyuan-standard":      {[]float64{0.3214, 0.3571}, config.ChannelTypeHunyuan},
-		"hunyuan-standard-256k": {[]float64{1.0714, 4.2857}, config.ChannelTypeHunyuan},
-		"hunyuan-pro":           {[]float64{2.1429, 7.1429}, config.ChannelTypeHunyuan},
+		"hunyuan-lite":          {0, 0},
+		"hunyuan-standard":      {0.3214, 0.3571},
+		"hunyuan-standard-256k": {1.0714, 4.2857},
+		"hunyuan-pro":           {2.1429, 7.1429},
 	}
 
 	var prices []*Price
@@ -553,17 +544,16 @@ func GetDefaultPrice() []*Price {
 		"sd3-turbo":         {},
 		"stable-image-core": {},
 	}
-	for model, modelType := range ModelTypes {
+	for model, ratios := range modelRatios {
 		priceType := TokensPriceType
 		if _, ok := timesModels[model]; ok {
 			priceType = TimesPriceType
 		}
 		price := &Price{
-			Model:       model,
-			Type:        priceType,
-			ChannelType: modelType.Type,
-			Input:       modelType.Ratio[0],
-			Output:      modelType.Ratio[1],
+			Model:  model,
+			Type:   priceType,
+			Input:  ratios[0],
+			Output: ratios[1],
 		}
 		if model == "whisper-1" {
 			extra := datatypes.NewJSONType(map[string]float64{config.UsageExtraInputAudioTranscription: 1})
@@ -627,11 +617,10 @@ func GetDefaultPrice() []*Price {
 
 	for model, mjPrice := range DefaultMJPrice {
 		prices = append(prices, &Price{
-			Model:       model,
-			Type:        TimesPriceType,
-			ChannelType: config.ChannelTypeMidjourney,
-			Input:       mjPrice,
-			Output:      mjPrice,
+			Model:  model,
+			Type:   TimesPriceType,
+			Input:  mjPrice,
+			Output: mjPrice,
 		})
 	}
 
@@ -642,11 +631,10 @@ func GetDefaultPrice() []*Price {
 	}
 	for model, sunoPrice := range DefaultSunoPrice {
 		prices = append(prices, &Price{
-			Model:       model,
-			Type:        TimesPriceType,
-			ChannelType: config.ChannelTypeSuno,
-			Input:       sunoPrice,
-			Output:      sunoPrice,
+			Model:  model,
+			Type:   TimesPriceType,
+			Input:  sunoPrice,
+			Output: sunoPrice,
 		})
 	}
 

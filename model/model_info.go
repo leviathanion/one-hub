@@ -1,13 +1,19 @@
 package model
 
 import (
-	"one-api/common/logger"
+	"errors"
 	"one-api/common/utils"
+	"strings"
+	"unicode/utf8"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type ModelInfo struct {
 	Id               int    `json:"id" gorm:"index"`
-	Model            string `json:"model" gorm:"type:varchar(100);index"`
+	Model            string `json:"model" gorm:"type:varchar(100);uniqueIndex"`
+	OwnedByID        *int   `json:"owned_by_id" gorm:"index"`
 	Name             string `json:"name" gorm:"type:varchar(100)"`
 	Description      string `json:"description" gorm:"type:text"`
 	ContextLength    int    `json:"context_length"`
@@ -22,6 +28,7 @@ type ModelInfo struct {
 
 type ModelInfoResponse struct {
 	Model            string   `json:"model"`
+	OwnedByID        *int     `json:"owned_by_id"`
 	Name             string   `json:"name"`
 	Description      string   `json:"description"`
 	ContextLength    int      `json:"context_length"`
@@ -37,6 +44,7 @@ type ModelInfoResponse struct {
 func (m *ModelInfo) ToResponse() *ModelInfoResponse {
 	res := &ModelInfoResponse{
 		Model:         m.Model,
+		OwnedByID:     m.OwnedByID,
 		Name:          m.Name,
 		Description:   m.Description,
 		ContextLength: m.ContextLength,
@@ -66,20 +74,71 @@ func (m *ModelInfo) TableName() string {
 	return "model_info"
 }
 
-func CreateModelInfo(modelInfo *ModelInfo) error {
-	err := DB.Create(modelInfo).Error
-	if err != nil {
-		return err
+func validateModelInfo(modelInfo *ModelInfo) error {
+	if modelInfo == nil || strings.TrimSpace(modelInfo.Model) == "" || utf8.RuneCountInString(modelInfo.Model) > 100 {
+		return errors.New("模型标识不能为空且不能超过 100 个字符")
 	}
 	return nil
 }
 
-func UpdateModelInfo(modelInfo *ModelInfo) error {
-	err := DB.Omit("id", "created_at").Save(modelInfo).Error
-	if err != nil {
+func CreateModelInfo(modelInfo *ModelInfo) error {
+	if err := validateModelInfo(modelInfo); err != nil {
 		return err
 	}
-	return nil
+	return DB.Transaction(func(tx *gorm.DB) error {
+		if modelInfo.OwnedByID != nil {
+			if err := lockModelOwnedBy(tx, *modelInfo.OwnedByID); err != nil {
+				return err
+			}
+		}
+		return tx.Create(modelInfo).Error
+	})
+}
+
+func UpdateModelInfo(modelInfo *ModelInfo) error {
+	if err := validateModelInfo(modelInfo); err != nil {
+		return err
+	}
+	if modelInfo.Id <= 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return DB.Transaction(func(tx *gorm.DB) error {
+		if modelInfo.OwnedByID != nil {
+			if err := lockModelOwnedBy(tx, *modelInfo.OwnedByID); err != nil {
+				return err
+			}
+		}
+		var current ModelInfo
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&current, modelInfo.Id).Error; err != nil {
+			return err
+		}
+		return tx.Model(&ModelInfo{}).Where("id = ?", modelInfo.Id).
+			Select("*").Omit("id", "created_at").Updates(modelInfo).Error
+	})
+}
+
+// GetModelInfoResponses 按对外精确模型名装配目录；缺失与查询失败分别返回。
+func GetModelInfoResponses(modelNames []string) (map[string]*ModelInfoResponse, error) {
+	responses := make(map[string]*ModelInfoResponse, len(modelNames))
+	if len(modelNames) == 0 {
+		return responses, nil
+	}
+	// 分批限制绑定参数数量，兼容 SQLite 的参数上限。
+	const batchSize = 500
+	for start := 0; start < len(modelNames); start += batchSize {
+		end := start + batchSize
+		if end > len(modelNames) {
+			end = len(modelNames)
+		}
+		var rows []*ModelInfo
+		if err := DB.Where("model IN ?", modelNames[start:end]).Find(&rows).Error; err != nil {
+			return nil, err
+		}
+		for _, row := range rows {
+			responses[row.Model] = row.ToResponse()
+		}
+	}
+	return responses, nil
 }
 
 func GetModelInfo(id int) (*ModelInfo, error) {
@@ -115,12 +174,4 @@ func DeleteModelInfo(id int) error {
 		return err
 	}
 	return nil
-}
-
-func InitModelInfo() {
-	// Auto migrate logic is handled centrally usually, but if needed here:
-	err := DB.AutoMigrate(&ModelInfo{})
-	if err != nil {
-		logger.SysError("Failed to auto migrate ModelInfo: " + err.Error())
-	}
 }
