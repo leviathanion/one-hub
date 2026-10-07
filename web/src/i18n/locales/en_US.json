@@ -566,7 +566,7 @@
     "detailLabel": "Detail",
     "durationLabel": "Duration",
     "noDuration": "None",
-    "durationTooltip": "First line: total duration / first-response latency, in seconds (S).\n\nLeft: the server-recorded request or operation duration, including upstream waiting and response transfer; this is not pure model generation time.\nRight: time spent waiting for the first response data. It may be a control event rather than the first text token. Omitted when not recorded.\n\nSecond line, t/s: output tokens ÷ (total duration − first-response latency). This is an approximate average output rate, shown only for streaming requests with valid measurements.\n\n“None” means no valid duration was recorded, not that the request took zero time.",
+    "durationTooltip": "Total duration / First-response latency (s)\nt/s = Output tokens ÷ (Total duration − First-response latency)\nNone: Not recorded",
     "groupLabel": "Group",
     "inputAudioTokens": "Input audio tokens (* {{ ratio }})",
     "inputLabel": "Input",
