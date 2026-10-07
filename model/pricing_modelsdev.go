@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"one-api/common/config"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -24,6 +25,7 @@ type ModelsDevCandidate struct {
 	Reason   string `json:"reason,omitempty"`
 	Conflict bool   `json:"conflict"`
 	Selected bool   `json:"selected"`
+	official bool
 }
 type ModelsDevCatalog struct {
 	URL        string               `json:"url"`
@@ -79,7 +81,8 @@ func ConvertModelsDevPrices(r io.Reader) (*ModelsDevCatalog, error) {
 	}
 	var upstream map[string]struct {
 		Models map[string]struct {
-			Cost json.RawMessage `json:"cost"`
+			Cost             json.RawMessage `json:"cost"`
+			CanonicalModelID string          `json:"canonical_model_id"`
 		} `json:"models"`
 	}
 	if err := json.Unmarshal(data, &upstream); err != nil {
@@ -93,7 +96,12 @@ func ConvertModelsDevPrices(r io.Reader) (*ModelsDevCatalog, error) {
 	for provider, p := range upstream {
 		for name, m := range p.Models {
 			price, err := convertModelsDevPrice(name, m.Cost)
-			candidate := ModelsDevCandidate{Provider: provider, Model: name, Price: price}
+			lab, official := modelsDevOfficialProviders[provider]
+			if m.CanonicalModelID != "" {
+				origin, _, valid := strings.Cut(m.CanonicalModelID, "/")
+				official = official && valid && origin == lab
+			}
+			candidate := ModelsDevCandidate{Provider: provider, Model: name, Price: price, official: official}
 			if err != nil {
 				candidate.Reason = err.Error()
 				candidate.Price = nil
@@ -118,12 +126,13 @@ func ConvertModelsDevPrices(r io.Reader) (*ModelsDevCatalog, error) {
 
 // Official publisher catalogs take precedence over multi-vendor hosts. Keep this
 // explicit: SDK names, channel types and low prices do not establish ownership.
-// Vertex, Azure and aggregators can host other publishers and are not listed.
-var modelsDevOfficialProviders = map[string]bool{
-	"anthropic": true, "openai": true, "google": true,
-	"xai": true, "deepseek": true, "mistral": true, "cohere": true,
-	"meta": true, "llama": true, "moonshotai": true, "zhipuai": true, "zai": true,
-	"minimax": true, "alibaba": true, "stepfun": true, "perplexity": true,
+// 值为 models.dev 的 lab ID；明确的 canonical 归属不符时，该模型只算托管报价。
+// Vertex、Azure 和聚合商不进入官方优先表。
+var modelsDevOfficialProviders = map[string]string{
+	"anthropic": "anthropic", "openai": "openai", "google": "google",
+	"xai": "xai", "deepseek": "deepseek", "mistral": "mistral", "cohere": "cohere",
+	"meta": "meta", "llama": "meta", "moonshotai": "moonshotai", "zhipuai": "zhipuai", "zai": "zhipuai",
+	"minimax": "minimax", "alibaba": "alibaba", "stepfun": "stepfun", "perplexity": "perplexity",
 }
 
 // Candidates arrive sorted by exact model ID and provider. Never rename IDs or
@@ -138,17 +147,27 @@ func selectModelsDevPrices(catalog *ModelsDevCatalog) {
 		}
 		preferred, officialCount := start, 0
 		for i := start; i < end; i++ {
-			if modelsDevOfficialProviders[catalog.Candidates[i].Provider] {
+			if catalog.Candidates[i].official {
 				preferred = i
 				officialCount++
 			}
 		}
 		candidate := &catalog.Candidates[preferred]
+		reason := "ambiguous providers"
 		if (officialCount == 1 || end-start == 1) && candidate.Price != nil && candidate.Reason == "" {
 			candidate.Selected = true
 			catalog.Prices = append(catalog.Prices, candidate.Price)
+			reason = "another provider selected"
 		} else {
 			catalog.Skipped++
+			if officialCount == 1 {
+				reason = "official provider price is invalid"
+			}
+		}
+		for i := start; i < end; i++ {
+			if c := &catalog.Candidates[i]; !c.Selected && c.Reason == "" {
+				c.Reason = reason
+			}
 		}
 		start = end
 	}
@@ -172,6 +191,9 @@ func costRatio(value *float64, base float64) (float64, error) {
 }
 func decodeModelsDevCost(raw json.RawMessage) (modelsDevCost, error) {
 	var c modelsDevCost
+	if len(raw) == 0 {
+		return c, errors.New("missing cost")
+	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		return c, err

@@ -1526,8 +1526,6 @@
   },
   "CheckUpdatesTable": {
     "checkUpdates": "检查更新",
-    "url": "URL",
-    "fetchData": "获取数据",
     "noUpdates": "无更新",
     "newModels": "新增模型",
     "priceChangeModels": "价格变动模型(仅供参考)",
@@ -2048,16 +2046,12 @@
   "pricingSync": {
     "applyPending": "确认应用",
     "title": "同步模型价格",
-    "sourceIntro": "先获取价格目录，再核对变化并确认应用。",
+    "sourceIntro": "从 models.dev 获取报价，再核对变化并确认应用。",
     "reviewIntro": "选择同步方式，确认下方变化后再应用。",
-    "catalogUrl": "价格目录地址",
-    "urlHelp": "使用已配置的价格源，也可以粘贴其他价格目录地址。",
-    "or": "或",
-    "modelsDevHelp": "获取模型目录中的价格，统一换算后供你核对。",
+    "modelsDevHelp": "优先采用唯一官方供应商报价；同名报价无法确定或计价无法转换时跳过。",
     "fetchHelp": "获取数据不会修改当前价格。",
     "loadedSource": "已获取价格来源",
     "skippedShort": "跳过 {{count}} 个无效或来源不明确的模型",
-    "changeSource": "更换来源",
     "modeShort": {
       "add": "仅添加本地没有的模型",
       "update": "更新已有模型，保留其余模型",
@@ -2074,9 +2068,9 @@
     "modeLabel": "同步方式",
     "emptyExtras": "无扩展倍率",
     "stalePreview": "价格已发生变化，本次操作未修改价格。请重新计算变化，再核对并确认。",
-    "duplicate": "价格来源中模型“{{model}}”出现多次，无法确定应采用哪条价格。请在来源中保留唯一记录后，从上方重新获取。当前价格未修改。",
-    "invalidCatalog": "价格目录无法使用，请修正来源后从上方重新获取。{{detail}}",
-    "fetchFailed": "获取价格失败，请检查上方来源后重试。{{detail}}",
+    "duplicate": "生成目录中“{{model}}”存在重复报价，请重新获取。当前价格未改变。",
+    "invalidCatalog": "生成的价格目录无法使用，请重新获取。{{detail}}",
+    "fetchFailed": "无法获取 models.dev 报价，请重试。{{detail}}",
     "previewFailed": "暂时无法计算价格变化。{{detail}}",
     "applyFailed": "应用结果未确认，请重新计算变化并核对后再操作。{{detail}}",
     "retryPreview": "重新计算变化",
@@ -2105,7 +2099,19 @@
       "type": "计费方式",
       "locked": "锁定状态",
       "rules": "价格规则"
-    }
+    },
+    "refetch": "重新获取",
+    "sourceDetails": "报价来源明细（{{count}} 条）",
+    "sourceDetailsHelp": "来源供应商仅用于选价，不会修改本地模型归属。采用的报价经确认后会成为本地售价。",
+    "sourceSelected": "已采用此供应商报价",
+    "sourceRejected": "跳过：{{reason}}",
+    "sourceAlternative": "未采用：已选择其他供应商报价",
+    "sourceAmbiguous": "跳过：同名模型存在多个来源，无法确定报价",
+    "sourcePage": "{{from}}–{{to}} / {{count}} 条",
+    "sourcePagePrevious": "上一页来源",
+    "sourcePageNext": "下一页来源",
+    "sourceInvalidOfficial": "跳过：官方供应商报价无效",
+    "noUsablePrices": "没有可同步的报价。请查看来源明细中的跳过原因；当前价格未改变。"
   },
   "modelsDev": {
     "fetch": "从 models.dev 获取"

@@ -2,12 +2,11 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
-
-	"github.com/spf13/viper"
 
 	"one-api/model"
 )
@@ -290,30 +289,24 @@ func TestPublishedArrayWithoutModelInfoDrivesPreviewAndApply(t *testing.T) {
 	}
 }
 
-func TestPublishedArrayWithoutModelInfoDrivesAutomaticModes(t *testing.T) {
+func TestPublishedArrayWithoutModelInfoDrivesConfirmedImportModes(t *testing.T) {
 	for _, mode := range []model.PriceUpdateMode{model.PriceUpdateModeAdd, model.PriceUpdateModeUpdate, model.PriceUpdateModeOverwrite} {
 		t.Run(string(mode), func(t *testing.T) {
 			router := setupPricingControllerTest(t)
 			source, baseVersion := setupPriceCatalogPublishedArray(t, router, mode == model.PriceUpdateModeOverwrite)
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write(source)
-			}))
-			t.Cleanup(server.Close)
-			oldURL := viper.GetString("update_price_service")
-			oldMode := viper.GetString("auto_price_updates_mode")
-			viper.Set("update_price_service", server.URL)
-			viper.Set("auto_price_updates_mode", string(mode))
-			t.Cleanup(func() {
-				viper.Set("update_price_service", oldURL)
-				viper.Set("auto_price_updates_mode", oldMode)
-			})
-
-			if err := model.UpdatePriceByPriceService(); err != nil {
-				t.Fatalf("auto %s sync rejected the actual public array: %v", mode, err)
+			prices, err := model.DecodeRemotePriceCatalog(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			preview, err := model.PreviewPriceChange(context.Background(), prices, mode)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := model.ApplyPriceChange(context.Background(), model.PricingInstance, prices, mode, preview.BaseVersion, preview.Digest); err != nil {
+				t.Fatalf("%s import rejected the actual public array: %v", mode, err)
 			}
 			if version := model.PricingInstance.PublishedVersion(); version != baseVersion+1 {
-				t.Fatalf("auto %s sync published unexpected local version %d", mode, version)
+				t.Fatalf("%s import published unexpected local version %d", mode, version)
 			}
 			var existing model.Price
 			if err := model.DB.Where("model = ?", "published-existing").First(&existing).Error; err != nil {
@@ -324,7 +317,7 @@ func TestPublishedArrayWithoutModelInfoDrivesAutomaticModes(t *testing.T) {
 				wantExistingInput, wantExistingOutput = 1, 1
 			}
 			if existing.Input != wantExistingInput || existing.Output != wantExistingOutput {
-				t.Fatalf("auto %s sync changed existing policy incorrectly: %+v", mode, existing)
+				t.Fatalf("%s import changed existing policy incorrectly: %+v", mode, existing)
 			}
 
 			var added model.Price
@@ -335,10 +328,10 @@ func TestPublishedArrayWithoutModelInfoDrivesAutomaticModes(t *testing.T) {
 				}
 			} else {
 				if newErr != nil {
-					t.Fatalf("auto %s sync did not insert source model: %v", mode, newErr)
+					t.Fatalf("%s import did not insert source model: %v", mode, newErr)
 				}
 				if added.Input != 4 || added.Output != 5 {
-					t.Fatalf("auto %s sync inserted wrong policy: %+v", mode, added)
+					t.Fatalf("%s import inserted wrong policy: %+v", mode, added)
 				}
 			}
 			if mode == model.PriceUpdateModeOverwrite {

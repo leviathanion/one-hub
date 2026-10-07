@@ -91,7 +91,7 @@ func TestSyncPricePublicationConvergesToAdvancedHeadAndClearsTransientError(t *t
 	}
 }
 
-func TestPricingDegradedStateSeparatesPublicationAndRemoteSyncFailures(t *testing.T) {
+func TestPricingDegradedStateTracksPublicationFailures(t *testing.T) {
 	pricing := &Pricing{Prices: make(map[string]*Price)}
 	pricing.setPublicationError(errors.New("load failed"))
 	if !pricing.IsDegraded() {
@@ -100,15 +100,6 @@ func TestPricingDegradedStateSeparatesPublicationAndRemoteSyncFailures(t *testin
 	pricing.setPublicationError(nil)
 	if pricing.IsDegraded() {
 		t.Fatal("cleared publication failure remained visible")
-	}
-	pricing.setRemoteSyncError(errors.New("remote catalog unavailable"))
-	pricing.setPublicationError(nil)
-	if !pricing.IsDegraded() {
-		t.Fatal("remote sync failure was cleared by publication success")
-	}
-	pricing.setRemoteSyncError(nil)
-	if pricing.IsDegraded() {
-		t.Fatal("successful remote sync did not clear degradation")
 	}
 }
 

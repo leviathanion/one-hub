@@ -14,7 +14,6 @@ import {
   Radio,
   RadioGroup,
   Stack,
-  TextField,
   Typography
 } from '@mui/material';
 import LoadingButton from '@mui/lab/LoadingButton';
@@ -23,6 +22,7 @@ import { useTranslation } from 'react-i18next';
 import { showSuccess } from 'utils/common';
 import PricingSyncChanges from './PricingSyncChanges';
 import usePricingSync from './usePricingSync';
+import ModelsDevSources from './ModelsDevSources';
 
 const modes = ['add', 'update', 'overwrite'];
 
@@ -84,44 +84,6 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
         <Stack spacing={2.5}>
           {!reviewing ? (
             <>
-              <Box
-                component="form"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  if (!fetching && sync.url.trim()) sync.fetchCatalog('url');
-                }}
-              >
-                <Typography variant="subtitle1" sx={{ mb: 0.75 }}>
-                  {t('pricingSync.catalogUrl')}
-                </Typography>
-                <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-                  {t('pricingSync.urlHelp')}
-                </Typography>
-                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5}>
-                  <TextField
-                    fullWidth
-                    size="small"
-                    label={t('CheckUpdatesTable.url')}
-                    value={sync.url}
-                    onChange={(event) => sync.editUrl(event.target.value)}
-                    disabled={fetching}
-                  />
-                  <LoadingButton
-                    type="submit"
-                    variant="contained"
-                    loading={fetching && session.source?.kind === 'url'}
-                    disabled={fetching || !sync.url.trim()}
-                    sx={{ flexShrink: 0, px: 3 }}
-                  >
-                    {t('CheckUpdatesTable.fetchData')}
-                  </LoadingButton>
-                </Stack>
-              </Box>
-              <Divider>
-                <Typography variant="caption" color="text.secondary">
-                  {t('pricingSync.or')}
-                </Typography>
-              </Divider>
               <Card variant="outlined" sx={{ p: 2, bgcolor: 'background.neutral' }}>
                 <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2} alignItems={{ sm: 'center' }}>
                   <Box sx={{ flex: 1 }}>
@@ -132,9 +94,9 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
                   </Box>
                   <LoadingButton
                     variant="outlined"
-                    loading={fetching && session.source?.kind === 'modelsdev'}
+                    loading={fetching}
                     disabled={fetching}
-                    onClick={() => sync.fetchCatalog('modelsdev')}
+                    onClick={sync.fetchCatalog}
                     sx={{ flexShrink: 0 }}
                   >
                     {t('modelsDev.fetch')}
@@ -160,50 +122,55 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
                     {session.source.skipped > 0 && ` · ${t('pricingSync.skippedShort', { count: session.source.skipped })}`}
                   </Typography>
                 </Box>
-                <Button onClick={sync.reset} disabled={applying} size="small" sx={{ flexShrink: 0 }}>
-                  {t('pricingSync.changeSource')}
+                <Button onClick={sync.fetchCatalog} disabled={applying} size="small" sx={{ flexShrink: 0 }}>
+                  {t('pricingSync.refetch')}
                 </Button>
               </Stack>
-              <Box>
-                <Typography variant="subtitle1" sx={{ mb: 1.25 }}>
-                  {t('pricingSync.modeLabel')}
-                </Typography>
-                <RadioGroup
-                  value={session.mode}
-                  onChange={(event) => sync.chooseMode(event.target.value)}
-                  aria-label={t('pricingSync.modeLabel')}
-                  sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: 'repeat(3, minmax(0, 1fr))' }, gap: 1 }}
-                >
-                  {modes.map((mode) => (
-                    <FormControlLabel
-                      key={mode}
-                      value={mode}
-                      disabled={applying}
-                      control={<Radio size="small" />}
-                      sx={{
-                        m: 0,
-                        p: 1,
-                        alignItems: 'flex-start',
-                        border: 1,
-                        borderColor: session.mode === mode ? 'primary.main' : 'divider',
-                        borderRadius: 1.5,
-                        bgcolor: session.mode === mode ? 'action.selected' : 'transparent',
-                        '& .MuiFormControlLabel-label': { minWidth: 0 }
-                      }}
-                      label={
-                        <Box sx={{ py: 0.5 }}>
-                          <Typography variant="subtitle2">
-                            {t(`CheckUpdatesTable.updateMode${mode.charAt(0).toUpperCase()}${mode.slice(1)}`)}
-                          </Typography>
-                          <Typography variant="caption" color="text.secondary">
-                            {t(`pricingSync.modeShort.${mode}`)}
-                          </Typography>
-                        </Box>
-                      }
-                    />
-                  ))}
-                </RadioGroup>
-              </Box>
+              <ModelsDevSources candidates={session.source.candidates} />
+              {session.catalog.length === 0 ? (
+                <Alert severity="info">{t('pricingSync.noUsablePrices')}</Alert>
+              ) : (
+                <Box>
+                  <Typography variant="subtitle1" sx={{ mb: 1.25 }}>
+                    {t('pricingSync.modeLabel')}
+                  </Typography>
+                  <RadioGroup
+                    value={session.mode}
+                    onChange={(event) => sync.chooseMode(event.target.value)}
+                    aria-label={t('pricingSync.modeLabel')}
+                    sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: 'repeat(3, minmax(0, 1fr))' }, gap: 1 }}
+                  >
+                    {modes.map((mode) => (
+                      <FormControlLabel
+                        key={mode}
+                        value={mode}
+                        disabled={applying}
+                        control={<Radio size="small" />}
+                        sx={{
+                          m: 0,
+                          p: 1,
+                          alignItems: 'flex-start',
+                          border: 1,
+                          borderColor: session.mode === mode ? 'primary.main' : 'divider',
+                          borderRadius: 1.5,
+                          bgcolor: session.mode === mode ? 'action.selected' : 'transparent',
+                          '& .MuiFormControlLabel-label': { minWidth: 0 }
+                        }}
+                        label={
+                          <Box sx={{ py: 0.5 }}>
+                            <Typography variant="subtitle2">
+                              {t(`CheckUpdatesTable.updateMode${mode.charAt(0).toUpperCase()}${mode.slice(1)}`)}
+                            </Typography>
+                            <Typography variant="caption" color="text.secondary">
+                              {t(`pricingSync.modeShort.${mode}`)}
+                            </Typography>
+                          </Box>
+                        }
+                      />
+                    ))}
+                  </RadioGroup>
+                </Box>
+              )}
               {session.mode === 'overwrite' && (
                 <Alert severity="warning" variant="outlined">
                   {t('pricingSync.overwriteNotice')}
@@ -246,7 +213,7 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
         <Button onClick={close} disabled={applying} color="inherit">
           {t('CheckUpdatesTable.cancel')}
         </Button>
-        {reviewing && (
+        {reviewing && session.catalog.length > 0 && (
           <LoadingButton
             variant="contained"
             onClick={apply}

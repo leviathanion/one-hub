@@ -3,9 +3,6 @@ package model
 import (
 	"context"
 	"encoding/json"
-	"github.com/spf13/viper"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 
 	"gorm.io/datatypes"
@@ -108,52 +105,6 @@ func TestSourceTierRemovalPreservesLockedAndUnselectedModels(t *testing.T) {
 				if len(p.RateRules.Data().LongContext) != want {
 					t.Fatalf("%s tiers=%+v", name, p.RateRules)
 				}
-			}
-		})
-	}
-}
-
-func TestFailedAutomaticCatalogDoesNotClearExistingTiers(t *testing.T) {
-	for _, tc := range []struct {
-		name, body string
-		status     int
-	}{
-		{"fetch failure", "unavailable", http.StatusServiceUnavailable},
-		{"invalid catalog", `[{"model":"tiered","type":"tokens","input":-1,"output":4}]`, http.StatusOK},
-		{"malformed catalog", `[{`, http.StatusOK},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			db, publisher := setupVersionedPricingTest(t)
-			oldPublisher := PricingInstance
-			PricingInstance = publisher
-			t.Cleanup(func() { PricingInstance = oldPublisher })
-			p, err := convertModelsDevPrice("tiered", []byte(`{"input":2,"output":8,"tiers":[{"input":4,"tier":{"type":"context","size":200000}}]}`))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err = db.Create(p).Error; err != nil {
-				t.Fatal(err)
-			}
-			before, _ := ReadPublicationVersion(context.Background(), db, PublicationOwnerPrice)
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(tc.status)
-				_, _ = w.Write([]byte(tc.body))
-			}))
-			defer server.Close()
-			oldURL, oldMode := viper.GetString("update_price_service"), viper.GetString("auto_price_updates_mode")
-			viper.Set("update_price_service", server.URL)
-			viper.Set("auto_price_updates_mode", "update")
-			t.Cleanup(func() { viper.Set("update_price_service", oldURL); viper.Set("auto_price_updates_mode", oldMode) })
-			if err = UpdatePriceByPriceService(); err == nil {
-				t.Fatal("bad source accepted")
-			}
-			var got Price
-			if err = db.Where("model = ?", "tiered").First(&got).Error; err != nil {
-				t.Fatal(err)
-			}
-			after, _ := ReadPublicationVersion(context.Background(), db, PublicationOwnerPrice)
-			if got.Input != p.Input || got.RateRules == nil || len(got.RateRules.Data().LongContext) != 1 || after != before {
-				t.Fatalf("failed source changed price/version: %+v %d->%d", got, before, after)
 			}
 		})
 	}

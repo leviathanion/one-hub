@@ -14,7 +14,6 @@ import (
 	"one-api/providers/codex"
 
 	"github.com/go-co-op/gocron/v2"
-	"github.com/spf13/viper"
 )
 
 var cronContext, cancelCron = context.WithCancel(context.Background())
@@ -130,31 +129,4 @@ func InitCron() {
 		logger.SysError("Cron job error: " + err.Error())
 	}
 
-	// 开启自动更新 并且设置了有效自动更新时间 同时自动更新模式不是system 则会从服务器拉取最新价格表
-	autoPriceUpdatesInterval := viper.GetInt("auto_price_updates_interval")
-	autoPriceUpdates := viper.GetBool("auto_price_updates")
-	autoPriceUpdatesMode := viper.GetString("auto_price_updates_mode")
-
-	if autoPriceUpdates &&
-		autoPriceUpdatesInterval > 0 &&
-		(autoPriceUpdatesMode == string(model.PriceUpdateModeAdd) ||
-			autoPriceUpdatesMode == string(model.PriceUpdateModeOverwrite) ||
-			autoPriceUpdatesMode == string(model.PriceUpdateModeUpdate)) {
-		// 指定时间周期更新价格表
-		err := scheduler.Manager.AddJob(
-			"update_pricing_by_service",
-			gocron.DurationJob(time.Duration(autoPriceUpdatesInterval)*time.Minute),
-			gocron.NewTask(func() {
-				err := model.UpdatePriceByPriceService()
-				if err != nil {
-					logger.SysError("Update Price Error: " + err.Error())
-					return
-				}
-				logger.SysLog("Update Price Done")
-			}),
-		)
-		if err != nil {
-			logger.SysError("Cron job error: " + err.Error())
-		}
-	}
 }
