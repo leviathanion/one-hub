@@ -2163,7 +2163,12 @@
     "sourcePagePrevious": "Previous sources page",
     "sourcePageNext": "Next sources page",
     "sourceInvalidOfficial": "Skipped: the official provider quote is invalid",
-    "noUsablePrices": "No quotes can be synced. Review the skipped reasons in quote sources. Current prices have not changed."
+    "noUsablePrices": "No quotes can be synced. Review the skipped reasons in quote sources. Current prices have not changed.",
+    "allChanges": "All",
+    "paginationHelp": "Filtering and paging only change the view. Applying includes all changes in the preview.",
+    "changePage": "{{from}}–{{to}} of {{count}} changes",
+    "changePagePrevious": "Previous changes page",
+    "changePageNext": "Next changes page"
   },
   "modelsDev": {
     "fetch": "Fetch from models.dev"

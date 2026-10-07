@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { startTransition, useCallback, useEffect, useRef, useState } from 'react';
 import { API } from 'utils/api';
 import { pricingSyncFailure, pricingSyncRequestOptions } from './pricingSyncFeedback.mjs';
 
@@ -50,7 +50,10 @@ export default function usePricingSync(open, t) {
       const response = await API.post('/api/prices/sync/preview', { source: catalog, mode }, options(request));
       if (!current(request)) return;
       if (!response.data?.success) throw responseError(response.data);
-      setSession({ catalog, source, mode, preview: response.data.data, phase: 'review', error: null });
+      // 预览渲染可让位给交互；请求状态和应用写入仍沿用同步会话控制。
+      startTransition(() => {
+        setSession({ catalog, source, mode, preview: response.data.data, phase: 'review', error: null });
+      });
     } catch (failure) {
       if (!current(request)) return;
       const error = pricingSyncFailure(failure, 'preview', t);

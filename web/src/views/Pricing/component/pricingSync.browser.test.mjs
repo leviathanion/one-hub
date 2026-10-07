@@ -77,6 +77,7 @@ test(
       let holdApply;
       let gallery = false;
       let onlyLocked = false;
+      let largeCatalog = false;
       await page.route('**/api/prices/modelsdev', async (route) => {
         fetchCount++;
         if (holdCatalog) await holdCatalog;
@@ -127,6 +128,17 @@ test(
                     { action: 'locked', model: 'local-custom-model', before, after: before }
                   ];
         }
+        if (largeCatalog) {
+          changes = body.source.map((price, index) => {
+            const action = body.mode === 'add' ? 'add' : ['add', 'update', 'delete', 'locked'][index % 4];
+            return {
+              action,
+              model: price.model,
+              before: action === 'add' ? null : { ...price, input: 2, locked: action === 'locked' },
+              after: action === 'delete' ? null : price
+            };
+          });
+        }
         await route.fulfill({ json: { success: true, data: { base_version: 7, digest: `digest-${body.mode}`, plan: { changes } } } });
       });
       await page.route('**/api/prices/sync/apply', async (route) => {
@@ -158,6 +170,7 @@ test(
         fetchCount = 0;
         previewFailure = applyFailure = holdCatalog = holdPreview = delayedMode = holdApply = null;
         onlyLocked = false;
+        largeCatalog = false;
         gallery = query.includes('gallery');
         modelsDevData = { url: 'https://models.dev/api.json', prices: gallery ? gallerySource : source, skipped: 2, candidates: [] };
         await page.goto(url + query);
@@ -275,6 +288,46 @@ test(
         await apply().click();
         await page.getByRole('dialog').waitFor({ state: 'hidden' });
         assert.deepEqual(requests.at(-1), { kind: 'apply', mode: 'overwrite', source, base_version: 7, digest: 'digest-overwrite' });
+      });
+
+      await t.test('large change plans render one page while filters preserve full apply scope', async () => {
+        await ready();
+        largeCatalog = true;
+        const largeSource = Array.from({ length: 4200 }, (_, index) => ({
+          ...source[0], model: `bulk-${String(index).padStart(4, '0')}`
+        }));
+        modelsDevData.prices = largeSource;
+        await fetchModelsDev();
+        await waitPreview();
+        const summary = page.getByRole('region', { name: 'Price change summary', exact: true });
+        assert.equal(await summary.getByRole('table').count(), 25);
+        assert.equal(await apply().textContent(), 'Apply 4200 changes');
+        await summary.getByText('1–25 of 4200 changes', { exact: true }).waitFor();
+        await summary.getByRole('button', { name: 'Next changes page' }).click();
+        await summary.getByText('bulk-0025', { exact: true }).waitFor();
+        assert.equal(await summary.getByText('bulk-0000', { exact: true }).count(), 0);
+        assert.equal(await summary.getByRole('table').count(), 25);
+        assert.equal(requests.length, 1);
+
+        await mode('Overwrite All').check();
+        await waitPreview();
+        await summary.getByText('bulk-0000', { exact: true }).waitFor();
+        await summary.getByText('1–25 of 4200 changes', { exact: true }).waitFor();
+        assert.equal(await apply().textContent(), 'Apply 3150 changes');
+        await summary.getByRole('button', { name: 'Models to remove 1050', exact: true }).click();
+        await summary.getByText('bulk-0002', { exact: true }).waitFor();
+        await summary.getByText('1–25 of 1050 changes', { exact: true }).waitFor();
+        await summary.getByRole('button', { name: 'Next changes page' }).click();
+        await summary.getByText('bulk-0102', { exact: true }).waitFor();
+        assert.equal(await summary.getByRole('table').count(), 25);
+        await summary.getByRole('button', { name: 'Locked models kept 1050', exact: true }).click();
+        assert.equal(await summary.getByText('Locked; the current price will be kept.', { exact: true }).count(), 25);
+        assert.equal(await summary.getByRole('table').count(), 0);
+        assert.equal(requests.length, 2);
+        assert.equal(await apply().textContent(), 'Apply 3150 changes');
+        await apply().click();
+        await page.getByRole('dialog').waitFor({ state: 'hidden' });
+        assert.deepEqual(requests.at(-1), { kind: 'apply', mode: 'overwrite', source: largeSource, base_version: 7, digest: 'digest-overwrite' });
       });
 
       await t.test('quote sources explain selection and skipped candidates without rendering the whole catalog', async () => {

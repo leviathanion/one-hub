@@ -2130,7 +2130,12 @@
     "sourcePagePrevious": "取得元の前のページ",
     "sourcePageNext": "取得元の次のページ",
     "sourceInvalidOfficial": "スキップ：公式プロバイダーの価格が無効です",
-    "noUsablePrices": "同期できる価格がありません。取得元のスキップ理由を確認してください。現在の価格は変更されていません。"
+    "noUsablePrices": "同期できる価格がありません。取得元のスキップ理由を確認してください。現在の価格は変更されていません。",
+    "allChanges": "すべて",
+    "paginationHelp": "絞り込みとページ切替は表示のみを変更します。適用にはプレビューのすべての変更が含まれます。",
+    "changePage": "{{count}} 件中 {{from}}–{{to}} 件",
+    "changePagePrevious": "変更の前のページ",
+    "changePageNext": "変更の次のページ"
   },
   "modelsDev": {
     "fetch": "models.dev から取得"

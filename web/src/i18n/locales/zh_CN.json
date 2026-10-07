@@ -2111,7 +2111,12 @@
     "sourcePagePrevious": "上一页来源",
     "sourcePageNext": "下一页来源",
     "sourceInvalidOfficial": "跳过：官方供应商报价无效",
-    "noUsablePrices": "没有可同步的报价。请查看来源明细中的跳过原因；当前价格未改变。"
+    "noUsablePrices": "没有可同步的报价。请查看来源明细中的跳过原因；当前价格未改变。",
+    "allChanges": "全部",
+    "paginationHelp": "筛选和翻页仅影响展示，确认应用仍包含预览中的全部变更。",
+    "changePage": "第 {{from}}–{{to}} 项，共 {{count}} 项",
+    "changePagePrevious": "上一页变更",
+    "changePageNext": "下一页变更"
   },
   "modelsDev": {
     "fetch": "从 models.dev 获取"
