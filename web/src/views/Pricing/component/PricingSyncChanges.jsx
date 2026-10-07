@@ -1,29 +1,70 @@
+import { memo, useMemo, useState } from 'react';
 import PropTypes from 'prop-types';
-import { Alert, Box, Chip, Divider, Stack, Typography } from '@mui/material';
+import { Alert, Box, Chip, Divider, Stack, TablePagination, Typography } from '@mui/material';
 import { useTranslation } from 'react-i18next';
 import { pricingSyncRows } from './pricingSyncComparison.mjs';
 
 const groups = { add: 'success', update: 'warning', delete: 'error', locked: 'default' };
+const pageSize = 25;
 
-export default function PricingSyncChanges({ changes }) {
+const PricingSyncChanges = memo(function PricingSyncChanges({ changes }) {
   const { t } = useTranslation();
-  const count = (action) => changes.filter((change) => change.action === action).length;
+  const [filter, setFilter] = useState('all');
+  const [page, setPage] = useState(0);
+  const { byAction, ordered } = useMemo(() => {
+    const byAction = { add: [], update: [], delete: [], locked: [] };
+    for (const change of changes) byAction[change.action]?.push(change);
+    return { byAction, ordered: Object.values(byAction).flat() };
+  }, [changes]);
+  const entries = filter === 'all' ? ordered : byAction[filter];
+  const visible = entries.slice(page * pageSize, (page + 1) * pageSize);
+  const chooseFilter = (action) => {
+    setFilter(action);
+    setPage(0);
+  };
   return (
     <Stack component="section" aria-label={t('pricingSync.changeSummary')} spacing={2}>
       <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+        <Chip
+          variant={filter === 'all' ? 'filled' : 'outlined'}
+          size="small"
+          label={`${t('pricingSync.allChanges')} ${ordered.length}`}
+          aria-pressed={filter === 'all'}
+          onClick={() => chooseFilter('all')}
+        />
         {Object.entries(groups).map(([action, color]) => (
           <Chip
             key={action}
-            variant="outlined"
+            variant={filter === action ? 'filled' : 'outlined'}
             size="small"
             color={color}
-            label={`${t(`pricingSync.action.${action}`)} ${count(action)}`}
+            label={`${t(`pricingSync.action.${action}`)} ${byAction[action].length}`}
+            aria-pressed={filter === action}
+            onClick={() => chooseFilter(action)}
           />
         ))}
       </Stack>
-      {!changes.some((change) => change.action !== 'locked') && <Alert severity="info">{t('pricingSync.noChanges')}</Alert>}
+      {ordered.length === byAction.locked.length && <Alert severity="info">{t('pricingSync.noChanges')}</Alert>}
+      {ordered.length > 0 && (
+        <>
+          <Typography variant="caption" color="text.secondary">
+            {t('pricingSync.paginationHelp')}
+          </Typography>
+          <TablePagination
+            component="div"
+            count={entries.length}
+            rowsPerPage={pageSize}
+            rowsPerPageOptions={[]}
+            page={page}
+            onPageChange={(_, nextPage) => setPage(nextPage)}
+            labelDisplayedRows={({ from, to, count }) => t('pricingSync.changePage', { from, to, count })}
+            getItemAriaLabel={(type) => t(`pricingSync.changePage${type === 'previous' ? 'Previous' : 'Next'}`)}
+            sx={{ '& .MuiTablePagination-toolbar': { p: 0, flexWrap: 'wrap' } }}
+          />
+        </>
+      )}
       {Object.entries(groups).map(([action, color]) => {
-        const entries = changes.filter((change) => change.action === action);
+        const entries = visible.filter((change) => change.action === action);
         if (!entries.length) return null;
         return (
           <Box
@@ -43,7 +84,7 @@ export default function PricingSyncChanges({ changes }) {
                 {t(`pricingSync.action.${action}`)}
               </Typography>
               <Typography variant="caption" color="text.secondary">
-                {entries.length}
+                {byAction[action].length}
               </Typography>
             </Stack>
             {entries.map((change, index) => (
@@ -164,6 +205,7 @@ export default function PricingSyncChanges({ changes }) {
       })}
     </Stack>
   );
-}
+});
 
 PricingSyncChanges.propTypes = { changes: PropTypes.array.isRequired };
+export default PricingSyncChanges;

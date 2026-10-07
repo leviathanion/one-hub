@@ -198,7 +198,7 @@ export const CheckUpdates = ({ open, onCancel, onOk }) => {
           )}
           {session.preview && (
             <>
-              <PricingSyncChanges changes={session.preview.plan.changes} />
+              <PricingSyncChanges key={session.preview.digest} changes={session.preview.plan.changes} />
               {session.mode !== 'add' && (
                 <Typography variant="caption" color="text.secondary">
                   {t('pricingSync.rulesNotice')}

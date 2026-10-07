@@ -2160,7 +2160,12 @@
     "sourcePagePrevious": "上一頁來源",
     "sourcePageNext": "下一頁來源",
     "sourceInvalidOfficial": "略過：官方供應商報價無效",
-    "noUsablePrices": "沒有可同步的報價。請查看來源明細中的略過原因；目前價格未變更。"
+    "noUsablePrices": "沒有可同步的報價。請查看來源明細中的略過原因；目前價格未變更。",
+    "allChanges": "全部",
+    "paginationHelp": "篩選和翻頁僅影響顯示，確認套用仍包含預覽中的全部變更。",
+    "changePage": "第 {{from}}–{{to}} 項，共 {{count}} 項",
+    "changePagePrevious": "上一頁變更",
+    "changePageNext": "下一頁變更"
   },
   "modelsDev": {
     "fetch": "從 models.dev 取得"
