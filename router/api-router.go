@@ -267,7 +267,6 @@ func SetApiRouter(router *gin.Engine) {
 			pricesRoute.POST("/sync/preview", controller.PreviewPriceChange)
 			pricesRoute.POST("/sync/apply", controller.ApplyPriceChange)
 			pricesRoute.GET("/modelsdev", controller.GetModelsDevPrices)
-			pricesRoute.GET("/updateService", controller.GetUpdatePriceService)
 		}
 
 		paymentRoute := apiRouter.Group("/payment")

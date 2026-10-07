@@ -2,11 +2,7 @@ package model
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
 	"testing"
-
-	"github.com/spf13/viper"
 )
 
 func TestRemotePriceCatalogAcceptsPublishedMetadata(t *testing.T) {
@@ -56,46 +52,6 @@ func TestRemotePriceCatalogKeepsSingleValueAndBoundedInputRules(t *testing.T) {
 				t.Fatalf("invalid catalog envelope was accepted: %s", payload)
 			}
 		})
-	}
-}
-
-func TestAutoPriceSyncKeepsDatabaseUnchangedForInvalidPublishedCatalog(t *testing.T) {
-	db, pricing := setupVersionedPricingTest(t)
-	stored := &Price{Model: "existing", Type: TokensPriceType, Input: 1, Output: 1}
-	if err := db.Create(stored).Error; err != nil {
-		t.Fatal(err)
-	}
-	if err := pricing.Init(); err != nil {
-		t.Fatal(err)
-	}
-	originalPricing := PricingInstance
-	PricingInstance = pricing
-	t.Cleanup(func() { PricingInstance = originalPricing })
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"success":true,"message":"published","version":77,"data":[{"model":"existing","type":"tokens","input":-1,"output":2,"model_info":null}]}`))
-	}))
-	t.Cleanup(server.Close)
-	oldURL := viper.GetString("update_price_service")
-	oldMode := viper.GetString("auto_price_updates_mode")
-	viper.Set("update_price_service", server.URL)
-	viper.Set("auto_price_updates_mode", string(PriceUpdateModeUpdate))
-	t.Cleanup(func() {
-		viper.Set("update_price_service", oldURL)
-		viper.Set("auto_price_updates_mode", oldMode)
-	})
-	if err := UpdatePriceByPriceService(); err == nil {
-		t.Fatal("invalid remote price was accepted")
-	}
-	if version := pricing.PublishedVersion(); version != 1 {
-		t.Fatalf("invalid remote price advanced version to %d", version)
-	}
-	var unchanged Price
-	if err := db.Where("model = ?", "existing").First(&unchanged).Error; err != nil {
-		t.Fatal(err)
-	}
-	if unchanged.Input != 1 || unchanged.Output != 1 {
-		t.Fatalf("invalid remote price mutated local policy: %+v", unchanged)
 	}
 }
 

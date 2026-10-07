@@ -10,8 +10,6 @@ import i18n from '../../src/i18n/i18n';
 import i18nList from '../../src/i18n/i18nList';
 
 i18n.changeLanguage(new URLSearchParams(location.search).get('lang') || 'en_US');
-if (new URLSearchParams(location.search).has('default-url')) localStorage.removeItem('oneapi_price_update_url');
-else localStorage.setItem('oneapi_price_update_url', '/catalog');
 function App() {
   const [open, setOpen] = useState(true);
   const { i18n } = useTranslation();

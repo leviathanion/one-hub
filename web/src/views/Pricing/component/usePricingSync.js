@@ -1,20 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { API } from 'utils/api';
-import { canAcceptDefaultPricingUrl, createPricingFetchController, resolveDefaultPricingUrl } from './pricingFetchState.mjs';
 import { pricingSyncFailure, pricingSyncRequestOptions } from './pricingSyncFeedback.mjs';
 
-const storageKey = 'oneapi_price_update_url';
 const emptySession = () => ({ catalog: null, source: null, mode: 'add', preview: null, phase: 'idle', error: null });
 const responseError = (data) => Object.assign(new Error(data?.message), { data });
 
 // One session owns its source, selected mode and matching preview. Source loading
 // and previewing are cancellable reads; applying is an explicit, non-replayed write.
 export default function usePricingSync(open, t) {
-  const [url, setUrl] = useState(() => localStorage.getItem(storageKey) || '');
   const [session, setSession] = useState(emptySession);
-  const urlRef = useRef(url);
-  const userEdited = useRef(false);
-  const defaultRequest = useRef(createPricingFetchController());
   const readRequest = useRef(null);
   const applying = useRef(false);
   const mounted = useRef(false);
@@ -31,39 +25,8 @@ export default function usePricingSync(open, t) {
 
   useEffect(() => {
     mounted.current = true;
-    const controller = defaultRequest.current;
-    const generation = controller.begin();
-    const signal = new AbortController();
-    if (!localStorage.getItem(storageKey)) {
-      const initialize = async () => {
-        let defaultUrl;
-        try {
-          const response = await API.get('/api/prices/updateService', { ...pricingSyncRequestOptions, signal: signal.signal });
-          defaultUrl = response.data?.data;
-        } catch {
-          // The existing fallback also works if the optional settings call fails.
-        }
-        if (
-          canAcceptDefaultPricingUrl({
-            controller,
-            generation,
-            currentUrl: urlRef.current,
-            cachedUrl: localStorage.getItem(storageKey),
-            userEdited: userEdited.current
-          })
-        ) {
-          const next = resolveDefaultPricingUrl(defaultUrl);
-          urlRef.current = next;
-          setUrl(next);
-          localStorage.setItem(storageKey, next);
-        }
-      };
-      initialize();
-    }
     return () => {
       mounted.current = false;
-      controller.invalidate();
-      signal.abort();
       cancelRead();
     };
   }, [cancelRead]);
@@ -81,16 +44,6 @@ export default function usePricingSync(open, t) {
   const current = (request) => mounted.current && readRequest.current === request && !request.signal.aborted;
   const options = (request) => ({ ...pricingSyncRequestOptions, signal: request.signal });
 
-  const editUrl = (value) => {
-    if (applying.current) return;
-    userEdited.current = true;
-    defaultRequest.current.invalidate();
-    urlRef.current = value;
-    setUrl(value);
-    localStorage.setItem(storageKey, value);
-    reset();
-  };
-
   const preview = async (catalog, source, mode, request) => {
     setSession({ catalog, source, mode, preview: null, phase: 'preview', error: null });
     try {
@@ -107,21 +60,22 @@ export default function usePricingSync(open, t) {
     }
   };
 
-  const fetchCatalog = async (kind) => {
+  const fetchCatalog = async () => {
     if (applying.current) return;
     const request = beginRead();
-    const source = { kind, label: kind === 'modelsdev' ? 'models.dev' : url, skipped: 0 };
+    const source = { label: 'models.dev', skipped: 0, candidates: [] };
     setSession({ ...emptySession(), phase: 'fetch', source });
     try {
-      const response = await API.get(kind === 'modelsdev' ? '/api/prices/modelsdev' : url, options(request));
+      const response = await API.get('/api/prices/modelsdev', options(request));
       if (!current(request)) return;
-      if (response.data?.success === false) throw responseError(response.data);
-      const catalog =
-        kind === 'modelsdev' ? response.data?.data?.prices : Array.isArray(response.data) ? response.data : response.data?.data;
-      if (!Array.isArray(catalog) || !catalog.length) throw new Error(t('CheckUpdatesTable.dataFormatIncorrect'));
-      if (kind === 'modelsdev') {
-        if (!response.data?.success) throw new Error(t('CheckUpdatesTable.dataFormatIncorrect'));
-        source.skipped = response.data.data.skipped || 0;
+      if (!response.data?.success) throw responseError(response.data);
+      const catalog = response.data.data?.prices;
+      if (!Array.isArray(catalog)) throw new Error(t('CheckUpdatesTable.dataFormatIncorrect'));
+      source.skipped = response.data.data.skipped || 0;
+      source.candidates = Array.isArray(response.data.data.candidates) ? response.data.data.candidates : [];
+      if (!catalog.length) {
+        setSession({ ...emptySession(), catalog, source, phase: 'review' });
+        return;
       }
       await preview(catalog, source, 'add', request);
     } catch (failure) {
@@ -130,11 +84,11 @@ export default function usePricingSync(open, t) {
   };
 
   const chooseMode = (mode) => {
-    if (!session.catalog || applying.current || mode === session.mode) return;
+    if (!session.catalog?.length || applying.current || mode === session.mode) return;
     return preview(session.catalog, session.source, mode, beginRead());
   };
   const retryPreview = () => {
-    if (!session.catalog || applying.current) return;
+    if (!session.catalog?.length || applying.current) return;
     return preview(session.catalog, session.source, session.mode, beginRead());
   };
   const changeCount = (session.preview?.plan?.changes || []).filter((change) => change.action !== 'locked').length;
@@ -173,5 +127,5 @@ export default function usePricingSync(open, t) {
     }
   };
 
-  return { url, session, changeCount, editUrl, fetchCatalog, chooseMode, retryPreview, reset, apply };
+  return { session, changeCount, fetchCatalog, chooseMode, retryPreview, reset, apply };
 }

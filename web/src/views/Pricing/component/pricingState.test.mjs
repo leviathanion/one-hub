@@ -10,7 +10,6 @@ import {
   updateExtraRatio
 } from './extraRatiosState.mjs';
 import { stablePricingJson } from './pricingComparison.mjs';
-import { createPricingFetchController } from './pricingFetchState.mjs';
 
 const configSource = await readFile(new URL('./config.js', import.meta.url), 'utf8');
 const { extraRatiosConfig } = await import(`data:text/javascript;charset=utf-8,${encodeURIComponent(configSource)}`);
@@ -80,25 +79,4 @@ test('扩展倍率在编辑器和价格列表共用本地化名称规则', () =>
 
   assert.equal(getExtraRatioLabel(t, 'input_audio_transcription'), '输入音频转写倍率');
   assert.equal(getExtraRatioLabel(t, 'future_usage'), 'future_usage');
-});
-
-test('价格拉取只接受最新请求，URL 变化会使在途响应失效', () => {
-  const controller = createPricingFetchController();
-  const first = controller.begin();
-  const second = controller.begin();
-
-  assert.equal(controller.accept(first, [{ model: 'stale' }]), null);
-  assert.deepEqual(controller.accept(second, [{ model: 'current' }]), [{ model: 'current' }]);
-
-  controller.invalidate();
-  assert.equal(controller.accept(second, [{ model: 'stale-after-url-change' }]), null);
-  assert.equal(controller.accept(controller.begin(), { data: 'invalid' }), null);
-});
-
-test('默认 URL 初始化响应在用户编辑后失效', () => {
-  const controller = createPricingFetchController();
-  const initialization = controller.begin();
-  controller.invalidate();
-
-  assert.equal(controller.isCurrent(initialization), false);
 });

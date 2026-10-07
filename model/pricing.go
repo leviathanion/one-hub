@@ -4,17 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"one-api/common/logger"
 	"one-api/common/utils"
 	"reflect"
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
-	"github.com/spf13/viper"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
@@ -40,7 +36,6 @@ type Pricing struct {
 	Match            []string          `json:"-"`
 	publishedVersion int64
 	publicationError string
-	remoteSyncError  string
 }
 
 type BatchPrices struct {
@@ -53,7 +48,6 @@ const MaxRemotePriceCatalogBytes int64 = 16 << 20
 // NewPricing creates a new Pricing instance
 func NewPricing() {
 	logger.SysLog("Initializing Pricing")
-	logger.SysLog("Update Price Mode:" + viper.GetString("auto_price_updates_mode"))
 	PricingInstance = &Pricing{
 		Prices: make(map[string]*Price),
 		Match:  make([]string, 0),
@@ -66,8 +60,8 @@ func NewPricing() {
 		return
 	}
 
-	// 初始化时，需要检测是否有更新
-	if viper.GetString("auto_price_updates_mode") == "system" && (viper.GetBool("auto_price_updates") || len(PricingInstance.Prices) == 0) {
+	// 内置价格只初始化空库，重启不会改变已有售价。
+	if len(PricingInstance.Prices) == 0 {
 		logger.SysLog("Checking for pricing updates")
 		prices := GetDefaultPrice()
 		if err := PricingInstance.SyncPricing(prices, "system"); err != nil {
@@ -130,15 +124,6 @@ func (p *Pricing) setPublicationError(err error) {
 	p.publicationError = errorText(err)
 }
 
-func (p *Pricing) setRemoteSyncError(err error) {
-	if p == nil {
-		return
-	}
-	p.Lock()
-	defer p.Unlock()
-	p.remoteSyncError = errorText(err)
-}
-
 func errorText(err error) string {
 	if err == nil {
 		return ""
@@ -152,7 +137,7 @@ func (p *Pricing) IsDegraded() bool {
 	}
 	p.RLock()
 	defer p.RUnlock()
-	return p.publicationError != "" || p.remoteSyncError != ""
+	return p.publicationError != ""
 }
 
 func buildPriceState(prices []*Price) (map[string]*Price, []string, error) {
@@ -617,65 +602,6 @@ func (p *Pricing) SyncPricing(pricing []*Price, mode string) error {
 	default:
 		return fmt.Errorf("unsupported price update mode %q", mode)
 	}
-}
-
-func UpdatePriceByPriceService() (err error) {
-	defer func() {
-		if PricingInstance != nil {
-			PricingInstance.setRemoteSyncError(err)
-		}
-	}()
-	updatePriceMode := viper.GetString("auto_price_updates_mode")
-	if updatePriceMode == string(PriceUpdateModeSystem) {
-		// 使用程序内置更新
-		return nil
-	}
-	prices, err := GetPriceByPriceService()
-	if err != nil {
-		return err
-	}
-	if PricingInstance == nil {
-		return errors.New("pricing publisher is not initialized")
-	}
-	switch PriceUpdateMode(updatePriceMode) {
-	case PriceUpdateModeAdd, PriceUpdateModeOverwrite, PriceUpdateModeUpdate:
-		return PricingInstance.SyncPricing(prices, updatePriceMode)
-	default:
-		return errors.New("更新模式错误，更新模式仅能选择：add、overwrite、update、system")
-	}
-}
-
-// GetPriceByPriceService 只插入系统没有的数据
-func GetPriceByPriceService() ([]*Price, error) {
-	api := viper.GetString("update_price_service")
-	if api == "" {
-		return nil, errors.New("update_price_service is not configured")
-	}
-	logger.SysLog("Start Update Price,Prices Service URL：" + api)
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-	resp, err := client.Get(api)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch prices from service: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("price service returned HTTP %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxRemotePriceCatalogBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %v", err)
-	}
-	if int64(len(body)) > MaxRemotePriceCatalogBytes {
-		return nil, errors.New("price service response exceeds size limit")
-	}
-	prices, err := decodeRemotePriceCatalog(body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse price data: %v", err)
-	}
-	logger.SysLog(fmt.Sprintf("成功解析价格目录，共获取到 %d 个价格配置", len(prices)))
-	return prices, nil
 }
 
 // SyncPriceWithOverwrite 删除系统所有数据并插入所有查询到的新数据 不含lock的数据

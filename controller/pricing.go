@@ -12,7 +12,6 @@ import (
 	"one-api/model"
 	"strings"
 
-	"github.com/spf13/viper"
 	"gorm.io/datatypes"
 
 	"github.com/gin-gonic/gin"
@@ -367,15 +366,6 @@ func ApplyPriceChange(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "version": version})
-}
-
-func GetUpdatePriceService(c *gin.Context) {
-	updatePriceService := viper.GetString("update_price_service")
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"data":    updatePriceService,
-		"message": "",
-	})
 }
 
 // GetModelsDevPrices fetches a fixed, bounded read-only source for administrators.
