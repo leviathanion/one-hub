@@ -152,7 +152,7 @@ export default function LogTableRow({ item, userIsAdmin, userGroup, columnVisibi
           <TableCell sx={{ p: '10px 8px' }}>
             <Stack direction="column" spacing={0.5}>
               <Label color={requestTimeLabelOptions(request_time)}>
-                {item.request_time === 0 ? '无' : request_time_str} {first_time_str ? ' / ' + first_time_str : ''}
+                {item.request_time === 0 ? t('logPage.noDuration') : request_time_str} {first_time_str ? ' / ' + first_time_str : ''}
               </Label>
 
               {request_ts_str && <Label color={requestTSLabelOptions(request_ts)}>{request_ts_str}</Label>}
