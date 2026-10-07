@@ -12,8 +12,14 @@ const KeywordTableHead = ({ order, orderBy, headLabel, onRequestSort }) => {
       return (
         <Box display="flex" alignItems="center">
           <Typography variant="body1">{cell.label}</Typography>
-          <Tooltip title={cell.tooltip} placement="bottom-start" enterDelay={300}>
-            <IconButton size="small">
+          <Tooltip
+            title={cell.tooltip}
+            describeChild
+            placement="bottom-start"
+            enterDelay={300}
+            componentsProps={{ tooltip: { sx: { whiteSpace: 'pre-line' } } }}
+          >
+            <IconButton size="small" aria-label={cell.label}>
               <HelpOutlineIcon fontSize="inherit" />
             </IconButton>
           </Tooltip>
