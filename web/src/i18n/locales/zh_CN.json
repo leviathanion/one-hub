@@ -1552,7 +1552,8 @@
     "extraRatiosChangesTip": "扩展倍率变动：{{changes}}",
     "added": "新增",
     "removed": "删除",
-    "modified": "修改"
+    "modified": "修改",
+    "contextTierPolicy": "更新选中模型时，上下文分档以来源为准：有分档则替换，没有则清除，包括手工分档。请核对预览；锁定模型不会更新。"
   },
   "error": {
     "unknownError": "未知错误"
@@ -1602,7 +1603,11 @@
     "actions": "操作",
     "total": "总数",
     "noDataAvailable": "没有数据可用",
-    "loading": "加载中..."
+    "loading": "加载中...",
+    "price": "基础价格",
+    "all": "全部",
+    "filter": "筛选",
+    "noSearchResults": "没有找到匹配的结果"
   },
   "channel_row": {
     "priorityTip": "优先级不能小于 0",
@@ -1838,7 +1843,8 @@
       "applicableSpeed": "适用速度（speed，可选）",
       "applicableSpeedHelp": "不选择表示不限速度。只选择 standard 可使 Fast 不叠加长上下文倍率。",
       "overlap": "此规则与同组规则的取值或区间重叠，请调整条件。"
-    }
+    },
+    "unknown": "未知"
   },
   "redemption_edit": {
     "requiredQuota": "必须大于等于0",
@@ -2038,5 +2044,71 @@
   "请输入 JSON，例如：{\"api_version\":\"v1\"}": "请输入 JSON，例如：{\"api_version\":\"v1\"}",
   "请输入 JSON，例如：{\"region\":\"eastasia\"}": "请输入 JSON，例如：{\"region\":\"eastasia\"}",
   "请输入 JSON，例如：{\"region\":\"us-central1\",\"project_id\":\"my-project\"}": "请输入 JSON，例如：{\"region\":\"us-central1\",\"project_id\":\"my-project\"}",
-  "开启后，将会透传普通 HTTP 请求中的额外字段（如 OpenAI SDK 的 extra_body 参数）": "开启后，将会透传普通 HTTP 请求中的额外字段（如 OpenAI SDK 的 extra_body 参数）"
+  "开启后，将会透传普通 HTTP 请求中的额外字段（如 OpenAI SDK 的 extra_body 参数）": "开启后，将会透传普通 HTTP 请求中的额外字段（如 OpenAI SDK 的 extra_body 参数）",
+  "pricingSync": {
+    "applyPending": "确认应用",
+    "title": "同步模型价格",
+    "sourceIntro": "先获取价格目录，再核对变化并确认应用。",
+    "reviewIntro": "选择同步方式，确认下方变化后再应用。",
+    "catalogUrl": "价格目录地址",
+    "urlHelp": "使用已配置的价格源，也可以粘贴其他价格目录地址。",
+    "or": "或",
+    "modelsDevHelp": "获取模型目录中的价格，统一换算后供你核对。",
+    "fetchHelp": "获取数据不会修改当前价格。",
+    "loadedSource": "已获取价格来源",
+    "skippedShort": "跳过 {{count}} 个无效或来源不明确的模型",
+    "changeSource": "更换来源",
+    "modeShort": {
+      "add": "仅添加本地没有的模型",
+      "update": "更新已有模型，保留其余模型",
+      "overwrite": "与来源保持一致，含删除"
+    },
+    "overwriteNotice": "覆盖会删除来源中没有的未锁定模型，包括来源中被跳过的模型。请核对删除列表。",
+    "rulesNotice": "上下文分档以来源为准；来源没有分档时会清除已有分档。锁定模型保持不变。",
+    "changeSummary": "价格变化汇总",
+    "modelChanges": "{{model}} 的价格变化",
+    "item": "调整项目",
+    "current": "当前",
+    "incoming": "同步后",
+    "noChanges": "当前同步方式下没有需要应用的变更。",
+    "modeLabel": "同步方式",
+    "emptyExtras": "无扩展倍率",
+    "stalePreview": "价格已发生变化，本次操作未修改价格。请重新计算变化，再核对并确认。",
+    "duplicate": "价格来源中模型“{{model}}”出现多次，无法确定应采用哪条价格。请在来源中保留唯一记录后，从上方重新获取。当前价格未修改。",
+    "invalidCatalog": "价格目录无法使用，请修正来源后从上方重新获取。{{detail}}",
+    "fetchFailed": "获取价格失败，请检查上方来源后重试。{{detail}}",
+    "previewFailed": "暂时无法计算价格变化。{{detail}}",
+    "applyFailed": "应用结果未确认，请重新计算变化并核对后再操作。{{detail}}",
+    "retryPreview": "重新计算变化",
+    "fetching": "正在获取价格目录…",
+    "calculating": "正在计算价格变化…",
+    "apply": "确认应用 {{count}} 项变更",
+    "total": "来源模型：{{count}}",
+    "action": {
+      "add": "新增模型",
+      "update": "价格变动",
+      "delete": "删除模型",
+      "locked": "锁定保留"
+    },
+    "lockedHelp": "已锁定，本次保持原价格。",
+    "notSet": "未配置",
+    "emptyRules": "无条件规则",
+    "defaultFactor": "默认倍率 1×",
+    "factor": {
+      "all": "统一倍率",
+      "input": "输入",
+      "output": "输出"
+    },
+    "field": {
+      "input": "输入倍率",
+      "output": "输出倍率",
+      "type": "计费方式",
+      "channel_type": "渠道类型",
+      "locked": "锁定状态",
+      "rules": "价格规则"
+    }
+  },
+  "modelsDev": {
+    "fetch": "从 models.dev 获取"
+  }
 }

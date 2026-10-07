@@ -160,7 +160,9 @@ test(
         if (!process.env.PRICING_UI_SCREENSHOTS) return;
         await mkdir(process.env.PRICING_UI_SCREENSHOTS, { recursive: true });
         await page.evaluate(() => document.fonts.ready);
-        await page.getByRole('dialog').screenshot({ path: path.join(process.env.PRICING_UI_SCREENSHOTS, `${name}.png`), animations: 'disabled' });
+        await page
+          .getByRole('dialog')
+          .screenshot({ path: path.join(process.env.PRICING_UI_SCREENSHOTS, `${name}.png`), animations: 'disabled' });
       };
       const ready = async (query = '') => {
         requests.length = 0;
@@ -173,6 +175,59 @@ test(
         await page.getByRole('dialog').waitFor();
         await expectSource();
       };
+
+      const localizedSource = {
+        zh_CN: {
+          title: '同步模型价格',
+          intro: '先获取价格目录，再核对变化并确认应用。',
+          fetch: '从 models.dev 获取'
+        },
+        en_US: {
+          title: 'Sync model prices',
+          intro: 'Fetch a price catalog, then review and apply the changes.',
+          fetch: 'Fetch from models.dev'
+        },
+        zh_HK: {
+          title: '同步模型價格',
+          intro: '先取得價格目錄，再核對變更並確認套用。',
+          fetch: '從 models.dev 取得'
+        },
+        ja_JP: {
+          title: 'モデル価格を同期',
+          intro: '価格カタログを取得し、変更内容を確認して適用します。',
+          fetch: 'models.dev から取得'
+        }
+      };
+      const expectLocalizedSource = async (language) => {
+        const { title, intro, fetch } = localizedSource[language];
+        const dialog = page.getByRole('dialog', { name: title, exact: true });
+        await dialog.waitFor();
+        await dialog.getByText(intro, { exact: true }).waitFor();
+        await dialog.getByRole('button', { name: fetch, exact: true }).waitFor();
+        assert.doesNotMatch(await dialog.textContent(), /pricingSync\.|modelsDev\./);
+      };
+
+      await t.test('production translation resources localize the source dialog in every supported language', async () => {
+        for (const language of Object.keys(localizedSource)) {
+          await ready(`?lang=${language}`);
+          await expectLocalizedSource(language);
+        }
+      });
+
+      await t.test('an open dialog follows language changes and keeps the entered source', async () => {
+        await ready('?lang=zh_CN');
+        await expectLocalizedSource('zh_CN');
+        await page.getByRole('textbox').fill('/language-switch-catalog');
+        const dialog = await page.getByRole('dialog').elementHandle();
+        for (const language of ['en_US', 'zh_CN']) {
+          await page.locator('#fixture-language').selectOption(language);
+          await expectLocalizedSource(language);
+          assert.equal(await dialog.evaluate((element) => element === document.querySelector('[role="dialog"]')), true);
+          assert.equal(await page.getByRole('textbox').inputValue(), '/language-switch-catalog');
+        }
+        assert.deepEqual(requests, []);
+        assert.equal(fetchCount, 0);
+      });
 
       await t.test('source first, then radio modes and review; changing source and reopening reset the session', async () => {
         await ready();
@@ -372,7 +427,7 @@ test(
 
       await t.test('Chinese desktop and mobile screenshots use the actual themed dialog', async () => {
         await page.setViewportSize({ width: 1440, height: 1080 });
-        await ready('?lang=zh&gallery=1');
+        await ready('?lang=zh_CN&gallery=1');
         await page.getByRole('textbox').fill('https://prices.example.com/catalog.json');
         await screenshot('01-source-desktop');
         await page.getByRole('button', { name: '从 models.dev 获取' }).click();
@@ -386,7 +441,7 @@ test(
         await page.getByRole('region', { name: '删除模型', exact: true }).scrollIntoViewIfNeeded();
         await screenshot('04-removals-desktop');
         await page.setViewportSize({ width: 390, height: 844 });
-        await ready('?lang=zh&gallery=1');
+        await ready('?lang=zh_CN&gallery=1');
         await screenshot('05-source-mobile');
         await page.getByRole('button', { name: '从 models.dev 获取' }).click();
         await page.getByRole('region', { name: '价格变化汇总', exact: true }).waitFor();
@@ -400,7 +455,7 @@ test(
         assert.equal(await page.getByRole('dialog').evaluate((el) => el.scrollWidth <= el.clientWidth), true);
         assert.equal(await changeList.evaluate((el) => el.scrollWidth <= el.clientWidth), true);
         await screenshot('07-changes-mobile');
-        await ready('?lang=zh');
+        await ready('?lang=zh_CN');
         await page.getByRole('button', { name: '从 models.dev 获取' }).click();
         await page.getByRole('region', { name: '价格变化汇总', exact: true }).waitFor();
         await mode('只更新现有').check();

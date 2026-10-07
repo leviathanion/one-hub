@@ -48,7 +48,8 @@
     "extraRatiosChangesTip": "Changes in magnification: {{changes}}",
     "extraRatiosRemoved": "Remove magnification ratio",
     "modified": "Edit",
-    "removed": "Delete"
+    "removed": "Delete",
+    "contextTierPolicy": "Updating selected models replaces context tiers with source tiers, or clears them when absent, including manual tiers. Review the preview; locked models stay unchanged."
   },
   "menu": {
     "home": "Home",
@@ -431,7 +432,11 @@
     "noDataAvailable": "No data available",
     "pageSize": "Number of items per page",
     "search": "Search",
-    "total": "Total"
+    "total": "Total",
+    "price": "Base Price",
+    "all": "All",
+    "filter": "Filter",
+    "noSearchResults": "No matching results found"
   },
   "dashboard": "Dashboard",
   "dashboard_index": {
@@ -1006,7 +1011,8 @@
       "applicableSpeed": "Applicable speeds (speed, optional)",
       "applicableSpeedHelp": "Empty means any speed. Select standard to exclude fast requests from long-context rates.",
       "overlap": "This rule overlaps another rule in the same pricing dimension. Adjust its values or range."
-    }
+    },
+    "unknown": "Unknown"
   },
   "profile": "Profile",
   "profilePage": {
@@ -2090,5 +2096,71 @@
   "请输入 JSON，例如：{\"api_version\":\"v1\"}": "Enter JSON, for example: {\"api_version\":\"v1\"}",
   "请输入 JSON，例如：{\"region\":\"eastasia\"}": "Enter JSON, for example: {\"region\":\"eastasia\"}",
   "请输入 JSON，例如：{\"region\":\"us-central1\",\"project_id\":\"my-project\"}": "Enter JSON, for example: {\"region\":\"us-central1\",\"project_id\":\"my-project\"}",
-  "开启后，将会透传普通 HTTP 请求中的额外字段（如 OpenAI SDK 的 extra_body 参数）": "When enabled, extra fields in ordinary HTTP requests are passed through, such as the OpenAI SDK extra_body parameter."
+  "开启后，将会透传普通 HTTP 请求中的额外字段（如 OpenAI SDK 的 extra_body 参数）": "When enabled, extra fields in ordinary HTTP requests are passed through, such as the OpenAI SDK extra_body parameter.",
+  "pricingSync": {
+    "applyPending": "Apply changes",
+    "title": "Sync model prices",
+    "sourceIntro": "Fetch a price catalog, then review and apply the changes.",
+    "reviewIntro": "Choose a sync mode and review the changes before applying.",
+    "catalogUrl": "Price catalog URL",
+    "urlHelp": "Use your configured source or paste another price catalog URL.",
+    "or": "or",
+    "modelsDevHelp": "Fetch and convert catalog prices for your review.",
+    "fetchHelp": "Fetching data does not change current prices.",
+    "loadedSource": "Fetched price source",
+    "skippedShort": "Skipped {{count}} invalid or ambiguous models",
+    "changeSource": "Change source",
+    "modeShort": {
+      "add": "Add models missing locally",
+      "update": "Update existing models; keep the rest",
+      "overwrite": "Match the source, including deletions"
+    },
+    "overwriteNotice": "Overwrite removes unlocked models absent from the source, including skipped source models. Review the removal list.",
+    "rulesNotice": "Source context tiers replace existing tiers, or clear them when absent. Locked models stay unchanged.",
+    "changeSummary": "Price change summary",
+    "modelChanges": "Price changes for {{model}}",
+    "item": "Item",
+    "current": "Current",
+    "incoming": "After sync",
+    "noChanges": "No changes to apply with the selected sync mode.",
+    "modeLabel": "Sync mode",
+    "emptyExtras": "No extra multipliers",
+    "stalePreview": "Prices have changed. This operation did not change prices. Recalculate and review before confirming.",
+    "duplicate": "The price source contains multiple entries for “{{model}}”. Keep one entry for this model in the source, then fetch it again above. Current prices have not changed.",
+    "invalidCatalog": "This price catalog cannot be used. Correct the source and fetch it again above. {{detail}}",
+    "fetchFailed": "Could not fetch prices. Check the source above and try again. {{detail}}",
+    "previewFailed": "Could not calculate price changes. {{detail}}",
+    "applyFailed": "The apply result is unconfirmed. Recalculate and review the changes before proceeding. {{detail}}",
+    "retryPreview": "Recalculate changes",
+    "fetching": "Fetching price catalog…",
+    "calculating": "Calculating price changes…",
+    "apply": "Apply {{count}} changes",
+    "total": "Source models: {{count}}",
+    "action": {
+      "add": "New models",
+      "update": "Price changes",
+      "delete": "Models to remove",
+      "locked": "Locked models kept"
+    },
+    "lockedHelp": "Locked; the current price will be kept.",
+    "notSet": "Not configured",
+    "emptyRules": "No conditional rules",
+    "defaultFactor": "Default multiplier 1×",
+    "factor": {
+      "all": "All",
+      "input": "Input",
+      "output": "Output"
+    },
+    "field": {
+      "input": "Input multiplier",
+      "output": "Output multiplier",
+      "type": "Billing method",
+      "channel_type": "Channel type",
+      "locked": "Lock state",
+      "rules": "Price rules"
+    }
+  },
+  "modelsDev": {
+    "fetch": "Fetch from models.dev"
+  }
 }
