@@ -23,11 +23,10 @@ func TestPublishedPriceCatalogWithModelInfoRoundTripsPreviewAndApply(t *testing.
 		t.Fatal(err)
 	}
 	if err := model.PricingInstance.AddPrice(&model.Price{
-		Model:       "peer-model",
-		Type:        model.TokensPriceType,
-		ChannelType: 1,
-		Input:       2,
-		Output:      4,
+		Model:  "peer-model",
+		Type:   model.TokensPriceType,
+		Input:  2,
+		Output: 4,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +61,7 @@ func TestPublishedPriceCatalogWithModelInfoRoundTripsPreviewAndApply(t *testing.
 	// 记录公开源后修改本地价格，确保预览和应用都经过共享目录解析器。
 	if err := model.PricingInstance.UpdatePriceAtVersion(
 		"peer-model",
-		&model.Price{Model: "peer-model", Type: model.TokensPriceType, ChannelType: 1, Input: 1, Output: 1},
+		&model.Price{Model: "peer-model", Type: model.TokensPriceType, Input: 1, Output: 1},
 		false,
 		publicCatalog.Version,
 	); err != nil {
@@ -167,29 +166,26 @@ func setupPriceCatalogPublishedArray(t *testing.T, router http.Handler, withStal
 	t.Helper()
 	publisher := model.PricingInstance
 	if err := publisher.AddPrice(&model.Price{
-		Model:       "published-existing",
-		Type:        model.TokensPriceType,
-		ChannelType: 1,
-		Input:       1,
-		Output:      1,
+		Model:  "published-existing",
+		Type:   model.TokensPriceType,
+		Input:  1,
+		Output: 1,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := publisher.UpdatePriceAtVersion("published-existing", &model.Price{
-		Model:       "published-existing",
-		Type:        model.TokensPriceType,
-		ChannelType: 1,
-		Input:       2,
-		Output:      3,
+		Model:  "published-existing",
+		Type:   model.TokensPriceType,
+		Input:  2,
+		Output: 3,
 	}, false, 2); err != nil {
 		t.Fatal(err)
 	}
 	if err := publisher.AddPrice(&model.Price{
-		Model:       "published-new",
-		Type:        model.TokensPriceType,
-		ChannelType: 1,
-		Input:       4,
-		Output:      5,
+		Model:  "published-new",
+		Type:   model.TokensPriceType,
+		Input:  4,
+		Output: 5,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -198,11 +194,10 @@ func setupPriceCatalogPublishedArray(t *testing.T, router http.Handler, withStal
 		t.Fatalf("unexpected source publication version %d", publishedVersion)
 	}
 	if err := publisher.UpdatePriceAtVersion("published-existing", &model.Price{
-		Model:       "published-existing",
-		Type:        model.TokensPriceType,
-		ChannelType: 1,
-		Input:       1,
-		Output:      1,
+		Model:  "published-existing",
+		Type:   model.TokensPriceType,
+		Input:  1,
+		Output: 1,
 	}, false, 4); err != nil {
 		t.Fatal(err)
 	}
@@ -212,11 +207,10 @@ func setupPriceCatalogPublishedArray(t *testing.T, router http.Handler, withStal
 	localVersion := int64(6)
 	if withStale {
 		if err := publisher.AddPrice(&model.Price{
-			Model:       "published-stale",
-			Type:        model.TokensPriceType,
-			ChannelType: 1,
-			Input:       9,
-			Output:      9,
+			Model:  "published-stale",
+			Type:   model.TokensPriceType,
+			Input:  9,
+			Output: 9,
 		}); err != nil {
 			t.Fatal(err)
 		}

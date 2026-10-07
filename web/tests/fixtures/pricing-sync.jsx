@@ -28,7 +28,7 @@ function App() {
           ))}
         </select>
         <Button onClick={() => setOpen(true)}>Open sync</Button>
-        <CheckUpdates ownedby={[{ value: 1, label: 'OpenAI' }]} open={open} onCancel={() => setOpen(false)} onOk={() => setOpen(false)} />
+        <CheckUpdates open={open} onCancel={() => setOpen(false)} onOk={() => setOpen(false)} />
       </SnackbarProvider>
     </ThemeProvider>
   );

@@ -21,7 +21,7 @@ import Label from 'ui-component/Label';
 import { MODALITY_OPTIONS } from 'constants/Modality';
 import { copy } from 'utils/common';
 
-export default function ModelInfoTableRow({ item, manageModelInfo, handleOpenModal }) {
+export default function ModelInfoTableRow({ item, manageModelInfo, handleOpenModal, ownedby }) {
   const [open, setOpen] = useState(null);
   const [openDelete, setOpenDelete] = useState(false);
 
@@ -55,7 +55,8 @@ export default function ModelInfoTableRow({ item, manageModelInfo, handleOpenMod
             {item.model}
           </Label>
         </TableCell>
-        <TableCell>{item.name}</TableCell>
+        <TableCell>{item.name || item.model}</TableCell>
+        <TableCell>{ownedby[item.owned_by_id]?.name || '未设置'}</TableCell>
         <TableCell>{item.context_length}</TableCell>
         <TableCell>{item.max_tokens}</TableCell>
         <TableCell>
@@ -135,7 +136,7 @@ export default function ModelInfoTableRow({ item, manageModelInfo, handleOpenMod
       <Dialog open={openDelete} onClose={handleDeleteClose}>
         <DialogTitle>删除模型信息</DialogTitle>
         <DialogContent>
-          <DialogContentText>确定要删除 {item.name} 吗？</DialogContentText>
+          <DialogContentText>确定要删除 {item.name || item.model} 吗？</DialogContentText>
         </DialogContent>
         <DialogActions>
           <Button onClick={handleDeleteClose}>取消</Button>
@@ -150,6 +151,7 @@ export default function ModelInfoTableRow({ item, manageModelInfo, handleOpenMod
 
 ModelInfoTableRow.propTypes = {
   item: PropTypes.object,
+  ownedby: PropTypes.object,
   manageModelInfo: PropTypes.func,
   handleOpenModal: PropTypes.func
 };

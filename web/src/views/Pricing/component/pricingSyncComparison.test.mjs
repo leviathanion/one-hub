@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { pricingSyncRows } from './pricingSyncComparison.mjs';
 const t = (key, options) => `${key}${options?.range || ''}`;
-const rows = (before, after) => pricingSyncRows(before, after, t, String);
+const rows = (before, after) => pricingSyncRows(before, after, t);
 
 test('zero values, removed extras and unknown meters remain visible', () => {
   const changes = rows(

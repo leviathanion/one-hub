@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"one-api/internal/testutil/sqlitetest"
 	"one-api/model"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -28,18 +29,18 @@ func decodeUpdatePriceRequestForTest(t *testing.T, body string) (*updatePriceReq
 }
 
 func TestUpdatePriceRequestTracksRateRulesPresence(t *testing.T) {
-	omitted, present := decodeUpdatePriceRequestForTest(t, `{"expected_version":1,"model":"gpt-5","type":"tokens","channel_type":1,"input":1,"output":2}`)
+	omitted, present := decodeUpdatePriceRequestForTest(t, `{"expected_version":1,"model":"gpt-5","type":"tokens","input":1,"output":2}`)
 	if present || len(omitted.RateRules) != 0 {
 		t.Fatalf("expected omitted rate_rules to remain absent, request=%+v present=%v", omitted, present)
 	}
 
-	empty, present := decodeUpdatePriceRequestForTest(t, `{"expected_version":1,"model":"gpt-5","type":"tokens","channel_type":1,"input":1,"output":2,"rate_rules":{}}`)
+	empty, present := decodeUpdatePriceRequestForTest(t, `{"expected_version":1,"model":"gpt-5","type":"tokens","input":1,"output":2,"rate_rules":{}}`)
 	price, _, err := empty.price()
 	if err != nil || !present || price.RateRules == nil || testRuleMultiplier(price.EffectiveRateRules(), "flex") != nil {
 		t.Fatalf("expected explicit empty object to clear rules, price=%+v present=%v err=%v", price, present, err)
 	}
 
-	configured, present := decodeUpdatePriceRequestForTest(t, `{"expected_version":1,"model":"gpt-5","type":"tokens","channel_type":1,"input":1,"output":2,"rate_rules":{"version":2,"service_tier":[{"id":"flex","when":{"service_tier":["flex"]},"multipliers":{"input":0.5,"output":0.5}}]}}`)
+	configured, present := decodeUpdatePriceRequestForTest(t, `{"expected_version":1,"model":"gpt-5","type":"tokens","input":1,"output":2,"rate_rules":{"version":2,"service_tier":[{"id":"flex","when":{"service_tier":["flex"]},"multipliers":{"input":0.5,"output":0.5}}]}}`)
 	price, _, err = configured.price()
 	if err != nil || !present || testRuleMultiplier(price.EffectiveRateRules(), "flex") == nil || *testRuleMultiplier(price.EffectiveRateRules(), "flex").Input != 0.5 {
 		t.Fatalf("expected explicit rules to replace the stored policy, price=%+v present=%v err=%v", price, present, err)
@@ -48,7 +49,7 @@ func TestUpdatePriceRequestTracksRateRulesPresence(t *testing.T) {
 
 func TestUpdatePriceRequestRejectsNullRateRules(t *testing.T) {
 	var request updatePriceRequest
-	if err := json.Unmarshal([]byte(`{"expected_version":1,"model":"gpt-5","type":"tokens","channel_type":1,"input":1,"output":2,"rate_rules":null}`), &request); err != nil {
+	if err := json.Unmarshal([]byte(`{"expected_version":1,"model":"gpt-5","type":"tokens","input":1,"output":2,"rate_rules":null}`), &request); err != nil {
 		t.Fatalf("decode update price request: %v", err)
 	}
 	if _, present, err := request.price(); err == nil || !present {
@@ -90,7 +91,7 @@ func setupPricingControllerTest(t *testing.T) *gin.Engine {
 
 func TestBatchPriceRequiresInputAndOutputButAcceptsExplicitZero(t *testing.T) {
 	router := setupPricingControllerTest(t)
-	missing := performPricingRequest(t, router, "/batch", `{"original_models":[],"models":["free"],"expected_version":1,"price":{"type":"tokens","channel_type":0,"output":0,"locked":false}}`)
+	missing := performPricingRequest(t, router, "/batch", `{"original_models":[],"models":["free"],"expected_version":1,"price":{"type":"tokens","output":0,"locked":false}}`)
 	var missingEnvelope struct {
 		Success bool `json:"success"`
 	}
@@ -101,7 +102,7 @@ func TestBatchPriceRequiresInputAndOutputButAcceptsExplicitZero(t *testing.T) {
 		t.Fatalf("batch price accepted missing input: %s", missing.Body.String())
 	}
 
-	explicitZero := performPricingRequest(t, router, "/batch", `{"original_models":[],"models":["free"],"expected_version":1,"price":{"type":"tokens","channel_type":0,"input":0,"output":0,"locked":false}}`)
+	explicitZero := performPricingRequest(t, router, "/batch", `{"original_models":[],"models":["free"],"expected_version":1,"price":{"type":"tokens","input":0,"output":0,"locked":false}}`)
 	var zeroEnvelope struct {
 		Success bool `json:"success"`
 	}
@@ -240,4 +241,76 @@ func testRuleMultiplier(rules model.PriceRateRules, id string) *model.PriceRateM
 		}
 	}
 	return nil
+}
+
+func TestPriceMutationsRejectRemovedChannelType(t *testing.T) {
+	router := setupPricingControllerTest(t)
+	router.POST("/add", AddPrice)
+	for path, body := range map[string]string{
+		"/add":     `{"model":"model","type":"tokens","input":1,"output":2,"expected_version":1,"channel_type":1}`,
+		"/batch":   `{"original_models":[],"models":["model"],"expected_version":1,"price":{"type":"tokens","input":1,"output":2,"channel_type":1}}`,
+		"/preview": `{"mode":"add","source":[{"model":"model","type":"tokens","input":1,"output":2,"channel_type":1}]}`,
+	} {
+		response := performPricingRequest(t, router, path, body)
+		var payload struct {
+			Success bool
+			Message string
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.Success || !strings.Contains(payload.Message, "channel_type") {
+			t.Fatalf("removed field was not rejected: %s", response.Body.String())
+		}
+	}
+	if model.PricingInstance.PublishedVersion() != 1 || len(model.PricingInstance.GetAllPrices()) != 0 {
+		t.Fatal("rejected legacy field changed pricing")
+	}
+}
+
+func TestPriceCatalogReadsCurrentExactMetadataWithoutRepublishing(t *testing.T) {
+	router := setupPricingControllerTest(t)
+	if err := model.PricingInstance.AddPrice(&model.Price{Model: "family*", Type: model.TokensPriceType, Input: 1, Output: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := model.PricingInstance.AddPrice(&model.Price{Model: "exact", Type: model.TokensPriceType, Input: 3, Output: 4}); err != nil {
+		t.Fatal(err)
+	}
+	version := model.PricingInstance.PublishedVersion()
+	for _, info := range []model.ModelInfo{{Model: "family*", Name: "Rule metadata"}, {Model: "family-child", Name: "Child"}, {Model: "exact", Name: "First"}} {
+		if err := model.CreateModelInfo(&info); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range []string{"First", "Updated"} {
+		if err := model.DB.Model(&model.ModelInfo{}).Where("model = ?", "exact").Update("name", name).Error; err != nil {
+			t.Fatal(err)
+		}
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/prices", nil))
+		var payload struct {
+			Success bool
+			Version int64
+			Data    []model.Price
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if !payload.Success || payload.Version != version || len(payload.Data) != 2 {
+			t.Fatalf("invalid price response: %s", response.Body.String())
+		}
+		for _, row := range payload.Data {
+			if row.Model == "exact" && (row.ModelInfo == nil || row.ModelInfo.Name != name) {
+				t.Fatalf("stale metadata: %+v", row.ModelInfo)
+			}
+			if row.Model == "family*" && row.ModelInfo != nil {
+				t.Fatalf("wildcard price rule received model metadata: %+v", row.ModelInfo)
+			}
+		}
+	}
+	for _, price := range model.PricingInstance.GetAllPrices() {
+		if price.ModelInfo != nil {
+			t.Fatal("response metadata leaked into price policy")
+		}
+	}
 }

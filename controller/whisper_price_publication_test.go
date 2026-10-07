@@ -16,11 +16,11 @@ func TestWhisperSystemAddAndTargetedCASPublish(t *testing.T) {
 	router := setupPricingControllerTest(t)
 	extra := datatypes.NewJSONType(map[string]float64{config.UsageExtraInputAudioTranscription: 2})
 	seeded := []*model.Price{
-		{Model: "whisper-1", Type: model.TokensPriceType, ChannelType: config.ChannelTypeOpenAI, Input: 15, Output: 15},
-		{Model: "whisper-custom", Type: model.TokensPriceType, ChannelType: config.ChannelTypeOpenAI, Input: 7, Output: 8, ExtraRatios: &extra},
-		{Model: "whisper-locked", Type: model.TokensPriceType, ChannelType: config.ChannelTypeOpenAI, Input: 9, Output: 10, Locked: true},
-		{Model: "whisper-times", Type: model.TimesPriceType, ChannelType: config.ChannelTypeOpenAI, Input: 1, Output: 0},
-		{Model: "i026-keep", Type: model.TokensPriceType, ChannelType: config.ChannelTypeOpenAI, Input: 3, Output: 4},
+		{Model: "whisper-1", Type: model.TokensPriceType, Input: 15, Output: 15},
+		{Model: "whisper-custom", Type: model.TokensPriceType, Input: 7, Output: 8, ExtraRatios: &extra},
+		{Model: "whisper-locked", Type: model.TokensPriceType, Input: 9, Output: 10, Locked: true},
+		{Model: "whisper-times", Type: model.TimesPriceType, Input: 1, Output: 0},
+		{Model: "i026-keep", Type: model.TokensPriceType, Input: 3, Output: 4},
 	}
 	if err := model.DB.Create(seeded).Error; err != nil {
 		t.Fatal(err)
@@ -78,7 +78,6 @@ func TestWhisperSystemAddAndTargetedCASPublish(t *testing.T) {
 	source := []map[string]any{{
 		"model":        "whisper-1",
 		"type":         model.TokensPriceType,
-		"channel_type": config.ChannelTypeOpenAI,
 		"input":        50,
 		"output":       0,
 		"locked":       false,

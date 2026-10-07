@@ -214,9 +214,9 @@ const ModelSelectorModal = ({ open, onClose, onConfirm, channelValues, prices })
     return owner?.name;
   };
 
-  const getChannelTypeByModel = (model) => {
+  const getOwnedByIdByModel = (model) => {
     const price = prices.find((item) => item.model === model);
-    return price?.channel_type;
+    return price?.model_info?.owned_by_id;
   };
 
   useEffect(() => {
@@ -336,7 +336,7 @@ const ModelSelectorModal = ({ open, onClose, onConfirm, channelValues, prices })
         const uniqueModels = Array.from(new Set(data)).map((model) => {
           let group = t('channel_edit.otherModels');
 
-          const channelType = getChannelTypeByModel(model);
+          const channelType = getOwnedByIdByModel(model);
 
           if (channelType) {
             const modelGroup = getOwnedbyName(channelType);

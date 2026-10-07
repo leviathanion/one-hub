@@ -99,10 +99,10 @@ export default function Multiple({ prices, reloadData, ownedby, noPriceModels, e
 
   useEffect(() => {
     const grouped = prices.reduce((acc, item, index) => {
-      // 需要保证完整价格策略相同才能合并
+      // 按完整价格策略和展示归属分组，归属不进入批量价格请求。
       const extraRatiosStr = stablePricingJson(item.extra_ratios || {});
       const rateRulesStr = stablePricingJson(item.rate_rules || {});
-      const key = `${item.type}-${item.channel_type}-${item.input}-${item.output}-${extraRatiosStr}-${rateRulesStr}-${item.locked}`;
+      const key = `${item.type}-${item.model_info?.owned_by_id ?? ''}-${item.input}-${item.output}-${extraRatiosStr}-${rateRulesStr}-${item.locked}`;
 
       if (!acc[key]) {
         acc[key] = {
@@ -156,7 +156,7 @@ export default function Multiple({ prices, reloadData, ownedby, noPriceModels, e
         searchTerm === '' ||
         row.models.some((model) => model.toLowerCase().includes(searchTerm.toLowerCase())) ||
         ownedby
-          .find((o) => o.value === row.channel_type)
+          .find((o) => o.value === row.model_info?.owned_by_id)
           ?.label.toLowerCase()
           .includes(searchTerm.toLowerCase());
 
@@ -169,7 +169,7 @@ export default function Multiple({ prices, reloadData, ownedby, noPriceModels, e
       // 渠道过滤
       let channelMatch = true;
       if (channelFilter !== 'all') {
-        channelMatch = row.channel_type === channelFilter;
+        channelMatch = row.model_info?.owned_by_id === channelFilter;
       }
 
       // 锁定状态过滤
@@ -398,7 +398,6 @@ export default function Multiple({ prices, reloadData, ownedby, noPriceModels, e
         onCancel={handleEditClose}
         onOk={handleModalOK}
         onConflict={reloadData}
-        ownedby={ownedby}
         singleMode={false}
         pricesItem={editRow}
         rows={rows}

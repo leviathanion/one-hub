@@ -17,7 +17,9 @@ import {
   Grid,
   Autocomplete,
   TextField,
-  Chip
+  Chip,
+  MenuItem,
+  Select
 } from '@mui/material';
 
 import { showSuccess, showError, trims } from 'utils/common';
@@ -26,13 +28,13 @@ import { MODALITY_OPTIONS } from 'constants/Modality';
 
 const validationSchema = Yup.object().shape({
   model: Yup.string().required('模型标识不能为空'),
-  name: Yup.string().required('模型名称不能为空'),
   context_length: Yup.number().required('上下文长度不能为空'),
   max_tokens: Yup.number().required('最大Token不能为空')
 });
 
 const originInputs = {
   model: '',
+  owned_by_id: null,
   name: '',
   description: '',
   context_length: 128000,
@@ -42,7 +44,7 @@ const originInputs = {
   tags: '[]'
 };
 
-const EditModal = ({ open, editId, onCancel, onOk, existingModels = [] }) => {
+const EditModal = ({ open, editId, onCancel, onOk, existingModels = [], ownedby = {} }) => {
   const theme = useTheme();
   const [inputs, setInputs] = useState(originInputs);
   const [modelOptions, setModelOptions] = useState([]);
@@ -53,6 +55,7 @@ const EditModal = ({ open, editId, onCancel, onOk, existingModels = [] }) => {
 
     let res;
     values = trims(values);
+    values.owned_by_id = values.owned_by_id == null || values.owned_by_id === '' ? null : Number(values.owned_by_id);
     values.context_length = parseInt(values.context_length);
     values.max_tokens = parseInt(values.max_tokens);
 
@@ -79,7 +82,9 @@ const EditModal = ({ open, editId, onCancel, onOk, existingModels = [] }) => {
         setErrors({ submit: message });
       }
     } catch (error) {
-      return;
+      setErrors({ submit: error.message });
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -91,7 +96,7 @@ const EditModal = ({ open, editId, onCancel, onOk, existingModels = [] }) => {
         // Ensure modalities are valid JSON strings or default to empty array string
         if (!data.input_modalities) data.input_modalities = '[]';
         if (!data.output_modalities) data.output_modalities = '[]';
-        setInputs(data);
+        setInputs({ ...data, owned_by_id: data.owned_by_id ?? null });
         setOriginalModel(data.model);
       } else {
         showError(message);
@@ -192,6 +197,26 @@ const EditModal = ({ open, editId, onCancel, onOk, existingModels = [] }) => {
                         {errors.name}
                       </FormHelperText>
                     )}
+                  </FormControl>
+                </Grid>
+                <Grid item xs={12}>
+                  <FormControl fullWidth sx={{ ...theme.typography.otherInput }}>
+                    <InputLabel id="owned-by-label">模型归属</InputLabel>
+                    <Select
+                      labelId="owned-by-label"
+                      label="模型归属"
+                      name="owned_by_id"
+                      value={values.owned_by_id ?? ''}
+                      onChange={(event) => setFieldValue('owned_by_id', event.target.value === '' ? null : Number(event.target.value))}
+                    >
+                      <MenuItem value="">未设置</MenuItem>
+                      {Object.entries(ownedby).map(([id, owner]) => (
+                        <MenuItem key={id} value={Number(id)}>
+                          {owner.name}
+                        </MenuItem>
+                      ))}
+                    </Select>
+                    <FormHelperText>用于模型展示分类，不影响调用渠道和计费。</FormHelperText>
                   </FormControl>
                 </Grid>
                 <Grid item xs={12}>
@@ -437,5 +462,6 @@ EditModal.propTypes = {
   editId: PropTypes.number,
   onCancel: PropTypes.func,
   onOk: PropTypes.func,
+  ownedby: PropTypes.object,
   existingModels: PropTypes.array
 };

@@ -3,7 +3,6 @@ export const buildManualPriceRequest = (form, expectedVersion) => {
     expected_version: expectedVersion,
     model: form.model,
     type: form.type,
-    channel_type: form.channel_type,
     input: form.input,
     output: form.output,
     locked: Boolean(form.locked),

@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"one-api/common"
 	"one-api/model"
+	"strings"
 
 	"github.com/spf13/viper"
 	"gorm.io/datatypes"
@@ -18,12 +19,11 @@ import (
 )
 
 type manualPriceFields struct {
-	Model       string   `json:"model"`
-	Type        string   `json:"type"`
-	ChannelType int      `json:"channel_type"`
-	Input       *float64 `json:"input"`
-	Output      *float64 `json:"output"`
-	Locked      bool     `json:"locked"`
+	Model  string   `json:"model"`
+	Type   string   `json:"type"`
+	Input  *float64 `json:"input"`
+	Output *float64 `json:"output"`
+	Locked bool     `json:"locked"`
 
 	ExtraRatios *datatypes.JSONType[map[string]float64] `json:"extra_ratios,omitempty"`
 	RateRules   json.RawMessage                         `json:"rate_rules"`
@@ -48,7 +48,6 @@ func (r manualPriceFields) price() (*model.Price, bool, error) {
 	price := &model.Price{
 		Model:       r.Model,
 		Type:        r.Type,
-		ChannelType: r.ChannelType,
 		Input:       *r.Input,
 		Output:      *r.Output,
 		Locked:      r.Locked,
@@ -96,26 +95,37 @@ func respondPriceMutationError(c *gin.Context, err error) {
 
 func GetPricesList(c *gin.Context) {
 	pricesType := c.DefaultQuery("type", "db")
+	var prices []*model.Price
+	var version int64
 	if pricesType == "db" {
-		prices, version := model.PricingInstance.GetAllPricesListWithVersion()
-		c.JSON(http.StatusOK, gin.H{
-			"success": true,
-			"message": "",
-			"data":    prices,
-			"version": version,
-		})
+		prices, version = model.PricingInstance.GetAllPricesListWithVersion()
+	} else {
+		prices = model.GetPricesList(pricesType)
+		if prices == nil {
+			common.APIRespondWithError(c, http.StatusOK, errors.New("pricing data not found"))
+			return
+		}
+	}
+	modelNames := make([]string, 0, len(prices))
+	for _, price := range prices {
+		// 通配项是价格规则，不代表具体模型。
+		if !strings.HasSuffix(price.Model, "*") {
+			modelNames = append(modelNames, price.Model)
+		}
+	}
+	infos, err := model.GetModelInfoResponses(modelNames)
+	if err != nil {
+		common.APIRespondWithError(c, http.StatusOK, err)
 		return
 	}
-	prices := model.GetPricesList(pricesType)
-	if prices == nil {
-		common.APIRespondWithError(c, http.StatusOK, errors.New("pricing data not found"))
-		return
+	for _, price := range prices {
+		price.ModelInfo = infos[price.Model]
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "",
-		"data":    prices,
-	})
+	response := gin.H{"success": true, "message": "", "data": prices}
+	if pricesType == "db" {
+		response["version"] = version
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 func GetAllModelList(c *gin.Context) {

@@ -41,7 +41,7 @@ func TestModelsDevAbsolutePricesZeroMissingAndConflicts(t *testing.T) {
 	}
 }
 func TestModelsDevMultipleTiersAndCacheAbsoluteRates(t *testing.T) {
-	p, err := convertModelsDevPrice("tiered", "anthropic", []byte(`{"input":2,"output":8,"cache_read":0.2,"cache_write":2.5,"tiers":[{"input":8,"output":16,"cache_read":0.8,"tier":{"type":"context","size":200}},{"input":4,"output":12,"cache_read":0.2,"tier":{"type":"context","size":100}}]}`))
+	p, err := convertModelsDevPrice("tiered", []byte(`{"input":2,"output":8,"cache_read":0.2,"cache_write":2.5,"tiers":[{"input":8,"output":16,"cache_read":0.8,"tier":{"type":"context","size":200}},{"input":4,"output":12,"cache_read":0.2,"tier":{"type":"context","size":100}}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +57,7 @@ func TestModelsDevMultipleTiersAndCacheAbsoluteRates(t *testing.T) {
 }
 func TestModelsDevRejectsUnrepresentablePrices(t *testing.T) {
 	for _, raw := range []string{`{"input":0,"output":2,"cache_read":1}`, `{"input":2,"output":2,"image":5}`, `{"input":2,"output":2,"tiers":[{"input":4,"image":1,"tier":{"type":"context","size":100}}]}`, `{"input":-1,"output":2}`, `{"input":2,"output":2,"context_over_200k":{"input":4}}`, `{"input":2,"output":2,"tiers":[{"tier":{"type":"unknown","size":100}}]}`} {
-		if _, err := convertModelsDevPrice("bad", "openai", []byte(raw)); err == nil {
+		if _, err := convertModelsDevPrice("bad", []byte(raw)); err == nil {
 			t.Fatalf("accepted %s", raw)
 		}
 	}
@@ -96,7 +96,7 @@ func TestModelsDevMergePreservesUnselectedLockedAndLocalRules(t *testing.T) {
 	db, publisher := setupVersionedPricingTest(t)
 	rules := datatypes.NewJSONType(PriceRateRules{Version: 2, ServiceTier: []PriceRateRule{{ID: "local", When: PriceRuleCondition{ServiceTier: []string{"flex"}}, Multipliers: PriceRateMultiplier{All: ptrModelsDev(0.5)}}}})
 	extras := datatypes.NewJSONType(map[string]float64{config.UsageExtraInputAudio: 7})
-	if err := db.Create(&[]*Price{{Model: "keep", Type: TokensPriceType, Input: 1, Output: 2}, {Model: "local", Type: TokensPriceType, ChannelType: 99, Input: 1, Output: 2, RateRules: &rules, ExtraRatios: &extras}, {Model: "locked", Type: TokensPriceType, Input: 1, Output: 2, Locked: true}}).Error; err != nil {
+	if err := db.Create(&[]*Price{{Model: "keep", Type: TokensPriceType, Input: 1, Output: 2}, {Model: "local", Type: TokensPriceType, Input: 1, Output: 2, RateRules: &rules, ExtraRatios: &extras}, {Model: "locked", Type: TokensPriceType, Input: 1, Output: 2, Locked: true}}).Error; err != nil {
 		t.Fatal(err)
 	}
 	catalog, err := ConvertModelsDevPrices(strings.NewReader(`{"openai":{"models":{"local":{"cost":{"input":4,"output":8,"tiers":[{"input":8,"tier":{"type":"context","size":100}}]}},"locked":{"cost":{"input":4,"output":8}},"new":{"cost":{"input":0,"output":4}}}}}`))
@@ -116,7 +116,7 @@ func TestModelsDevMergePreservesUnselectedLockedAndLocalRules(t *testing.T) {
 		t.Fatal(version, err)
 	}
 	local, _ := publisher.FindExactPrice("local")
-	if local.ChannelType != 99 || local.Input != 2 || len(local.RateRules.Data().ServiceTier) != 1 || len(local.RateRules.Data().LongContext) != 1 || local.ExtraRatios.Data()[config.UsageExtraInputAudio] != 7 {
+	if local.Input != 2 || len(local.RateRules.Data().ServiceTier) != 1 || len(local.RateRules.Data().LongContext) != 1 || local.ExtraRatios.Data()[config.UsageExtraInputAudio] != 7 {
 		t.Fatal(local)
 	}
 	if _, ok := publisher.FindExactPrice("keep"); !ok {

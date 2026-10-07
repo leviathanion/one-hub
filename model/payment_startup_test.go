@@ -25,6 +25,10 @@ func TestPaymentUpgradePreservesHistoricalBalancesWithoutCumulativeColumn(t *tes
 	if err := historical.Exec("INSERT INTO users (id, password, quota, used_quota) VALUES (1, 'fixture', 321, 123)").Error; err != nil {
 		t.Fatal(err)
 	}
+	// 本测试只验证支付历史升级，目录已由停机迁移转换为目标结构。
+	if err := historical.AutoMigrate(&Price{}, &ModelOwnedBy{}, &ModelInfo{}); err != nil {
+		t.Fatal(err)
+	}
 	previousDB, previousMaster := DB, config.IsMasterNode
 	viper.Reset()
 	viper.Set("sqlite_path", path)

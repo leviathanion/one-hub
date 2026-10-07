@@ -26,7 +26,7 @@ import usePricingSync from './usePricingSync';
 
 const modes = ['add', 'update', 'overwrite'];
 
-export const CheckUpdates = ({ open, onCancel, onOk, ownedby = [] }) => {
+export const CheckUpdates = ({ open, onCancel, onOk }) => {
   const { t } = useTranslation();
   const sync = usePricingSync(open, t);
   const { session } = sync;
@@ -231,7 +231,7 @@ export const CheckUpdates = ({ open, onCancel, onOk, ownedby = [] }) => {
           )}
           {session.preview && (
             <>
-              <PricingSyncChanges changes={session.preview.plan.changes} ownedby={ownedby} />
+              <PricingSyncChanges changes={session.preview.plan.changes} />
               {session.mode !== 'add' && (
                 <Typography variant="caption" color="text.secondary">
                   {t('pricingSync.rulesNotice')}
@@ -264,6 +264,5 @@ export const CheckUpdates = ({ open, onCancel, onOk, ownedby = [] }) => {
 CheckUpdates.propTypes = {
   open: PropTypes.bool,
   onCancel: PropTypes.func.isRequired,
-  onOk: PropTypes.func.isRequired,
-  ownedby: PropTypes.array
+  onOk: PropTypes.func.isRequired
 };

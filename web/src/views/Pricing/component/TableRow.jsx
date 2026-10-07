@@ -22,8 +22,8 @@ const PricesTableRow = ({ item, onEdit, onDelete, ownedby, unit = 'K' }) => {
       theme.palette.info.main,
       theme.palette.warning.main
     ];
-    // 根据channel_type确定颜色
-    const channelType = Number(item.channel_type);
+    // 根据展示归属确定颜色
+    const channelType = Number(item.model_info?.owned_by_id);
     return Number.isInteger(channelType) && channelType > 0 ? colors[(channelType - 1) % colors.length] : theme.palette.text.secondary;
   };
 
@@ -134,7 +134,7 @@ const PricesTableRow = ({ item, onEdit, onDelete, ownedby, unit = 'K' }) => {
           </Box>
 
           <Chip
-            label={getChannelName(item.channel_type)}
+            label={getChannelName(item.model_info?.owned_by_id)}
             size="small"
             sx={{
               height: 22,

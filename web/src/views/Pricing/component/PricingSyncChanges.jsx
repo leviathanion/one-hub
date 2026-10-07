@@ -5,9 +5,8 @@ import { pricingSyncRows } from './pricingSyncComparison.mjs';
 
 const groups = { add: 'success', update: 'warning', delete: 'error', locked: 'default' };
 
-export default function PricingSyncChanges({ changes, ownedby = [] }) {
+export default function PricingSyncChanges({ changes }) {
   const { t } = useTranslation();
-  const channelName = (value) => ownedby.find((channel) => channel.value === value)?.label || `${t('pricing_edit.unknown')} (${value})`;
   const count = (action) => changes.filter((change) => change.action === action).length;
   return (
     <Stack component="section" aria-label={t('pricingSync.changeSummary')} spacing={2}>
@@ -90,7 +89,7 @@ export default function PricingSyncChanges({ changes, ownedby = [] }) {
                         )}
                       </Box>
                       <Stack spacing={1}>
-                        {pricingSyncRows(change.before, change.after, t, channelName).map((row) => {
+                        {pricingSyncRows(change.before, change.after, t).map((row) => {
                           const isRule = row.key.startsWith('rule:') || row.key === 'rules';
                           const columns =
                             action === 'update' ? 'minmax(0, 1fr) minmax(0, 1fr) 18px minmax(0, 1fr)' : 'minmax(0, 1fr) minmax(0, 2fr)';
@@ -166,4 +165,5 @@ export default function PricingSyncChanges({ changes, ownedby = [] }) {
     </Stack>
   );
 }
-PricingSyncChanges.propTypes = { changes: PropTypes.array.isRequired, ownedby: PropTypes.array };
+
+PricingSyncChanges.propTypes = { changes: PropTypes.array.isRequired };

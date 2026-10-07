@@ -32,25 +32,9 @@ export default function ModelDetailModal({ open, onClose, model, provider, model
   const { t } = useTranslation();
   if (!model) return null;
   // 解析模态和标签
-  const getModalities = (modalitiesStr) => {
-    try {
-      return JSON.parse(modalitiesStr || '[]');
-    } catch (e) {
-      return [];
-    }
-  };
-
-  const getTags = (tagsStr) => {
-    try {
-      return JSON.parse(tagsStr || '[]');
-    } catch (e) {
-      return [];
-    }
-  };
-
-  const inputModalities = modelInfo ? getModalities(modelInfo.input_modalities) : [];
-  const outputModalities = modelInfo ? getModalities(modelInfo.output_modalities) : [];
-  const tags = modelInfo ? getTags(modelInfo.tags) : [];
+  const inputModalities = modelInfo?.input_modalities || [];
+  const outputModalities = modelInfo?.output_modalities || [];
+  const tags = modelInfo?.tags || [];
 
   return (
     <Dialog

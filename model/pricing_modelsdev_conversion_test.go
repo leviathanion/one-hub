@@ -8,7 +8,7 @@ import (
 
 // Input=2 happens to hide the old output/input ratio bug at DollarRate=0.002.
 func TestModelsDevIndependentAbsoluteNonDefaultInput(t *testing.T) {
-	p, err := convertModelsDevPrice("asymmetric", "openai", []byte(`{"input":4,"output":12,"cache_read":0.4,"reasoning":18}`))
+	p, err := convertModelsDevPrice("asymmetric", []byte(`{"input":4,"output":12,"cache_read":0.4,"reasoning":18}`))
 	if err != nil {
 		t.Fatal(err)
 	}

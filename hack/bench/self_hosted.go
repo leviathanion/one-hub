@@ -130,18 +130,16 @@ func buildBenchChannel(modelName string) *model.Channel {
 	model.PricingInstance = &model.Pricing{
 		Prices: map[string]*model.Price{
 			modelName: {
-				Model:       modelName,
-				Type:        model.TokensPriceType,
-				ChannelType: cfgpkg.ChannelTypeOpenAI,
-				Input:       0,
-				Output:      0,
+				Model:  modelName,
+				Type:   model.TokensPriceType,
+				Input:  0,
+				Output: 0,
 			},
 			"bench-" + modelName: {
-				Model:       "bench-" + modelName,
-				Type:        model.TokensPriceType,
-				ChannelType: cfgpkg.ChannelTypeOpenAI,
-				Input:       0,
-				Output:      0,
+				Model:  "bench-" + modelName,
+				Type:   model.TokensPriceType,
+				Input:  0,
+				Output: 0,
 			},
 		},
 	}

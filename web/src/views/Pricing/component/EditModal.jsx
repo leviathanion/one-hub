@@ -56,10 +56,6 @@ const validateSingleMode = (t, values, rows) => {
     return t('pricing_edit.typeCheck');
   }
 
-  if (values.channel_type <= 0) {
-    return t('pricing_edit.channelTypeErr2');
-  }
-
   // 判断model是否是唯一值
   if (rows && rows.filter((r) => r.model === values.model && (values.isNew || r.id !== values.id)).length > 0) {
     return t('pricing_edit.modelNameRe');
@@ -87,7 +83,6 @@ const getValidationSchema = (t) =>
   Yup.object().shape({
     is_edit: Yup.boolean(),
     type: Yup.string().oneOf(['tokens', 'times'], t('pricing_edit.typeErr')).required(t('pricing_edit.requiredType')),
-    channel_type: Yup.number().min(1, t('pricing_edit.channelTypeErr')).required(t('pricing_edit.requiredChannelType')),
     input: Yup.number()
       .required(t('pricing_edit.requiredInput'))
       .test('isPositive', t('pricing_edit.inputVal'), (value) => value !== '' && value >= 0),
@@ -110,7 +105,6 @@ const getValidationSchema = (t) =>
 const multipleOriginInputs = {
   is_edit: false,
   type: 'tokens',
-  channel_type: 1,
   input: 0,
   output: 0,
   locked: false,
@@ -123,7 +117,6 @@ const multipleOriginInputs = {
 const singleOriginInputs = {
   model: '',
   type: 'tokens',
-  channel_type: 1,
   input: 0,
   output: 0,
   locked: false,
@@ -137,7 +130,6 @@ const EditModal = ({
   onCancel,
   onOk,
   onConflict,
-  ownedby,
   noPriceModel,
   singleMode = false,
   price = null,
@@ -318,7 +310,6 @@ const EditModal = ({
         price: {
           model: 'batch',
           type: values.type,
-          channel_type: values.channel_type,
           input: calculatedInput,
           output: calculatedOutput,
           locked: values.locked,
@@ -506,47 +497,6 @@ const EditModal = ({
     );
   };
 
-  // 渲染渠道类型选择表单
-  const renderChannelTypeSelector = (formProps) => {
-    const { errors = {}, touched = {}, handleBlur, handleChange: formikHandleChange, values = {} } = formProps || {};
-
-    return (
-      <FormControl
-        fullWidth
-        error={singleMode ? !!errors.channel_type : Boolean(touched?.channel_type && errors?.channel_type)}
-        sx={{ ...theme.typography.otherInput }}
-      >
-        <InputLabel htmlFor="channel_type-label">{t('pricing_edit.channelType')}</InputLabel>
-        <Select
-          id="channel_type-label"
-          label={t('pricing_edit.channelType')}
-          value={singleMode ? inputs.channel_type : values?.channel_type}
-          name="channel_type"
-          onBlur={handleBlur}
-          onChange={singleMode ? handleChange : formikHandleChange}
-          MenuProps={{
-            PaperProps: {
-              style: {
-                maxHeight: 200
-              }
-            }
-          }}
-        >
-          {ownedby.map((option) => (
-            <MenuItem key={option.value} value={option.value}>
-              {option.label}
-            </MenuItem>
-          ))}
-        </Select>
-        {!singleMode && touched?.channel_type && errors?.channel_type && (
-          <FormHelperText error id="helper-tex-channel_type-label">
-            {errors.channel_type}
-          </FormHelperText>
-        )}
-      </FormControl>
-    );
-  };
-
   // 渲染单位类型切换按钮组
   const renderUnitTypeToggle = () => (
     <FormControl fullWidth sx={{ ...theme.typography.otherInput }}>
@@ -723,7 +673,6 @@ const EditModal = ({
               price={{
                 model: (singleMode ? inputs.model : formProps.values.models?.[0]) || 'preview',
                 type: billingType,
-                channel_type: Number((singleMode ? inputs : formProps.values).channel_type),
                 input: Number(calculateRate((singleMode ? inputs : formProps.values).input)),
                 output: Number(calculateRate((singleMode ? inputs : formProps.values).output)),
                 extra_ratios: (singleMode ? inputs : formProps.values).extra_ratios || {},
@@ -849,7 +798,6 @@ const EditModal = ({
             />
 
             {renderTypeSelector()}
-            {renderChannelTypeSelector()}
             {renderUnitTypeToggle()}
 
             <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
@@ -877,7 +825,6 @@ const EditModal = ({
             {(formProps) => (
               <form noValidate onSubmit={formProps.handleSubmit}>
                 {renderTypeSelector(formProps)}
-                {renderChannelTypeSelector(formProps)}
                 {renderUnitTypeToggle()}
                 <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
                   {renderInputField(formProps)}
@@ -906,7 +853,6 @@ EditModal.propTypes = {
   onCancel: PropTypes.func,
   onOk: PropTypes.func,
   onConflict: PropTypes.func,
-  ownedby: PropTypes.array,
   noPriceModel: PropTypes.array,
   // 以下是单一模式专用
   singleMode: PropTypes.bool,

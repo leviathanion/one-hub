@@ -701,14 +701,15 @@ func GetChannelExpensesStatisticsByPeriod(startTime, endTime, groupType string, 
             GROUP BY date, model_name
             ORDER BY date, model_name`
 	} else if groupType == "model_type" {
+		args = append([]interface{}{UnknownOwnedBy}, args...)
 		sql = baseSelect + `
-            model_owned_by.name as channel
+            COALESCE(model_owned_by.name, ?) as channel
             FROM statistics
-            JOIN prices ON statistics.model_name = prices.model
-			JOIN model_owned_by ON prices.channel_type = model_owned_by.id
+            LEFT JOIN model_info ON statistics.model_name = model_info.model
+            LEFT JOIN model_owned_by ON model_info.owned_by_id = model_owned_by.id
             %s
-	            GROUP BY date, model_owned_by.name
-	            ORDER BY date, model_owned_by.name`
+            GROUP BY date, channel
+            ORDER BY date, channel`
 	} else {
 		sql = baseSelect + `
             MAX(channels.name) as channel

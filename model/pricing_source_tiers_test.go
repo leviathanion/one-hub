@@ -17,7 +17,7 @@ func TestSourcePriceUpdatesReplaceOrClearContextTiers(t *testing.T) {
 			db, publisher := setupVersionedPricingTest(t)
 			tiered := func(input, tier float64) *Price {
 				raw, _ := json.Marshal(map[string]any{"input": input, "output": 8, "tiers": []any{map[string]any{"input": tier, "tier": map[string]any{"type": "context", "size": 200000}}}})
-				p, err := convertModelsDevPrice("tiered", "openai", raw)
+				p, err := convertModelsDevPrice("tiered", raw)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -82,7 +82,7 @@ func TestSourceTierRemovalPreservesLockedAndUnselectedModels(t *testing.T) {
 		t.Run(string(mode), func(t *testing.T) {
 			db, publisher := setupVersionedPricingTest(t)
 			for _, name := range []string{"selected", "locked", "unselected"} {
-				p, err := convertModelsDevPrice(name, "openai", []byte(`{"input":2,"output":8,"tiers":[{"input":4,"tier":{"type":"context","size":200000}}]}`))
+				p, err := convertModelsDevPrice(name, []byte(`{"input":2,"output":8,"tiers":[{"input":4,"tier":{"type":"context","size":200000}}]}`))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -127,7 +127,7 @@ func TestFailedAutomaticCatalogDoesNotClearExistingTiers(t *testing.T) {
 			oldPublisher := PricingInstance
 			PricingInstance = publisher
 			t.Cleanup(func() { PricingInstance = oldPublisher })
-			p, err := convertModelsDevPrice("tiered", "openai", []byte(`{"input":2,"output":8,"tiers":[{"input":4,"tier":{"type":"context","size":200000}}]}`))
+			p, err := convertModelsDevPrice("tiered", []byte(`{"input":2,"output":8,"tiers":[{"input":4,"tier":{"type":"context","size":200000}}]}`))
 			if err != nil {
 				t.Fatal(err)
 			}

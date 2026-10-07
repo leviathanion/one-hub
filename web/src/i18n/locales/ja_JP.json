@@ -2122,7 +2122,6 @@
       "input": "入力倍率",
       "output": "出力倍率",
       "type": "課金方式",
-      "channel_type": "チャネルの種類",
       "locked": "ロック状態",
       "rules": "価格ルール"
     }

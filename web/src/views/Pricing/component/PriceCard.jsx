@@ -12,7 +12,7 @@ const PriceCard = ({ price, onEdit, onDelete, ownedby, unit = 'K' }) => {
   const theme = useTheme();
   const { t } = useTranslation();
 
-  // 获取channel_type对应的名称
+  // 获取展示归属名称
   const getChannelTypeName = (type) => {
     const channel = ownedby.find((item) => item.value === type);
     return channel ? channel.label : t('pricing_edit.unknown');
@@ -45,8 +45,8 @@ const PriceCard = ({ price, onEdit, onDelete, ownedby, unit = 'K' }) => {
       theme.palette.info.main,
       theme.palette.warning.main
     ];
-    // 根据channel_type确定颜色
-    const channelType = Number(price.channel_type);
+    // 根据展示归属确定颜色
+    const channelType = Number(price.model_info?.owned_by_id);
     return Number.isInteger(channelType) && channelType > 0 ? colors[(channelType - 1) % colors.length] : theme.palette.text.secondary;
   };
 
@@ -173,7 +173,7 @@ const PriceCard = ({ price, onEdit, onDelete, ownedby, unit = 'K' }) => {
             }}
           />
           <Chip
-            label={getChannelTypeName(price.channel_type)}
+            label={getChannelTypeName(price.model_info?.owned_by_id)}
             size="small"
             sx={{
               height: 18,

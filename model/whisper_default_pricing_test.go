@@ -21,7 +21,7 @@ func whisperDurationPriceDefaultWhisperPrice(t *testing.T) *Price {
 
 func TestWhisperDefaultUsesDurationPriceContainer(t *testing.T) {
 	price := whisperDurationPriceDefaultWhisperPrice(t)
-	if price.Type != TokensPriceType || price.ChannelType != config.ChannelTypeOpenAI || price.Input != 50 || price.Output != 0 {
+	if price.Type != TokensPriceType || price.Input != 50 || price.Output != 0 {
 		t.Fatalf("unexpected whisper default price: %+v", price)
 	}
 	if price.ExtraRatios == nil {
@@ -37,10 +37,10 @@ func TestSystemPriceAddPreservesExistingWhisperAndCustomRows(t *testing.T) {
 	db := openPriceSyncTestDB(t)
 	extra := datatypes.NewJSONType(map[string]float64{config.UsageExtraInputAudioTranscription: 2})
 	seeded := []*Price{
-		{Model: "whisper-1", Type: TokensPriceType, ChannelType: config.ChannelTypeOpenAI, Input: 15, Output: 15},
-		{Model: "whisper-custom", Type: TokensPriceType, ChannelType: config.ChannelTypeOpenAI, Input: 7, Output: 8, ExtraRatios: &extra},
-		{Model: "whisper-locked", Type: TokensPriceType, ChannelType: config.ChannelTypeOpenAI, Input: 9, Output: 10, Locked: true},
-		{Model: "whisper-times", Type: TimesPriceType, ChannelType: config.ChannelTypeOpenAI, Input: 1, Output: 0},
+		{Model: "whisper-1", Type: TokensPriceType, Input: 15, Output: 15},
+		{Model: "whisper-custom", Type: TokensPriceType, Input: 7, Output: 8, ExtraRatios: &extra},
+		{Model: "whisper-locked", Type: TokensPriceType, Input: 9, Output: 10, Locked: true},
+		{Model: "whisper-times", Type: TimesPriceType, Input: 1, Output: 0},
 	}
 	if err := db.Create(seeded).Error; err != nil {
 		t.Fatal(err)

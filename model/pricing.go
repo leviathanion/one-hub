@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"one-api/common/config"
 	"one-api/common/logger"
 	"one-api/common/utils"
 	"reflect"
@@ -105,22 +104,6 @@ func (p *Pricing) InitContext(ctx context.Context) (err error) {
 			return err
 		}
 
-		var modelInfos []*ModelInfo
-		modelInfoErr := DB.WithContext(ctx).Order("id desc").Find(&modelInfos).Error
-		if modelInfoErr == nil {
-			modelInfoMap := make(map[string]*ModelInfoResponse)
-			for _, info := range modelInfos {
-				modelInfoMap[info.Model] = info.ToResponse()
-			}
-			for _, price := range prices {
-				if info, ok := modelInfoMap[price.Model]; ok {
-					price.ModelInfo = info
-				}
-			}
-		} else {
-			logger.SysError("Failed to fetch model infos: " + modelInfoErr.Error())
-		}
-
 		versionAfter, err := ReadPublicationVersion(ctx, DB, PublicationOwnerPrice)
 		if err != nil {
 			return err
@@ -213,10 +196,9 @@ func (p *Pricing) GetPrice(modelName string) *Price {
 	}
 
 	return &Price{
-		Type:        TokensPriceType,
-		ChannelType: config.ChannelTypeUnknown,
-		Input:       DefaultPrice,
-		Output:      DefaultPrice,
+		Type:   TokensPriceType,
+		Input:  DefaultPrice,
+		Output: DefaultPrice,
 	}
 }
 
@@ -325,10 +307,7 @@ func (p *Pricing) GetAllPricesListWithVersion() ([]*Price, int64) {
 		prices = append(prices, &cloned)
 	}
 	sort.Slice(prices, func(i, j int) bool {
-		if prices[i].ChannelType == prices[j].ChannelType {
-			return prices[i].Model < prices[j].Model
-		}
-		return prices[i].ChannelType < prices[j].ChannelType
+		return prices[i].Model < prices[j].Model
 	})
 
 	return prices, p.publishedVersion
@@ -377,7 +356,7 @@ func (p *Pricing) UpdatePriceAtVersion(modelName string, price *Price, rateRules
 	if err := price.prepareForPersistence(); err != nil {
 		return err
 	}
-	columns := []string{"model", "type", "channel_type", "input", "output", "locked", "extra_ratios"}
+	columns := []string{"model", "type", "input", "output", "locked", "extra_ratios"}
 	if rateRulesPresent {
 		columns = append(columns, "rate_rules")
 	}
@@ -738,7 +717,6 @@ func priceForSync(incoming, current *Price) *Price {
 	synced := &Price{
 		Model:       incoming.Model,
 		Type:        incoming.Type,
-		ChannelType: incoming.ChannelType,
 		Input:       incoming.Input,
 		Output:      incoming.Output,
 		Locked:      incoming.Locked,
@@ -890,7 +868,7 @@ func (p *Pricing) BatchSetPricesAtVersion(batchPrices *BatchPrices, originalMode
 			if priceUpdateTargetMatches(stored, &prepared, prepared.ExtraRatios != nil, prepared.RateRules != nil) {
 				continue
 			}
-			columns := []string{"type", "channel_type", "input", "output", "locked"}
+			columns := []string{"type", "input", "output", "locked"}
 			if prepared.ExtraRatios != nil {
 				columns = append(columns, "extra_ratios")
 			}
@@ -935,34 +913,8 @@ func GetPricesList(pricingType string) []*Price {
 	}
 
 	sort.Slice(prices, func(i, j int) bool {
-		if prices[i].ChannelType == prices[j].ChannelType {
-			return prices[i].Model < prices[j].Model
-		}
-		return prices[i].ChannelType < prices[j].ChannelType
+		return prices[i].Model < prices[j].Model
 	})
 
 	return prices
 }
-
-// func ConvertBatchPrices(prices []*Price) []*BatchPrices {
-// 	batchPricesMap := make(map[string]*BatchPrices)
-// 	for _, price := range prices {
-// 		key := fmt.Sprintf("%s-%d-%g-%g", price.Type, price.ChannelType, price.Input, price.Output)
-// 		batchPrice, exists := batchPricesMap[key]
-// 		if exists {
-// 			batchPrice.Models = append(batchPrice.Models, price.Model)
-// 		} else {
-// 			batchPricesMap[key] = &BatchPrices{
-// 				Models: []string{price.Model},
-// 				Price:  *price,
-// 			}
-// 		}
-// 	}
-
-// 	var batchPrices []*BatchPrices
-// 	for _, batchPrice := range batchPricesMap {
-// 		batchPrices = append(batchPrices, batchPrice)
-// 	}
-
-// 	return batchPrices
-// }

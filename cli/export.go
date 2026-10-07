@@ -5,7 +5,6 @@ import (
 	"one-api/common/logger"
 	"one-api/model"
 	"os"
-	"sort"
 )
 
 func ExportPrices() {
@@ -15,14 +14,6 @@ func ExportPrices() {
 		logger.SysError("No prices found")
 		return
 	}
-
-	// Sort prices by ChannelType
-	sort.Slice(prices, func(i, j int) bool {
-		if prices[i].ChannelType == prices[j].ChannelType {
-			return prices[i].Model < prices[j].Model
-		}
-		return prices[i].ChannelType < prices[j].ChannelType
-	})
 
 	// 导出到当前目录下的 prices.json 文件
 	file, err := os.Create("prices.json")

@@ -37,7 +37,6 @@ test(
         {
           model: 'sync-model',
           type: 'tokens',
-          channel_type: 1,
           input: 1,
           output: 4,
           locked: false,
@@ -55,17 +54,16 @@ test(
         }
       ];
       const gallerySource = [
-        { model: 'gpt-4.1', type: 'tokens', channel_type: 1, input: 1, output: 4, locked: false },
+        { model: 'gpt-4.1', type: 'tokens', input: 1, output: 4, locked: false },
         {
           model: 'claude-sonnet-4-5',
           type: 'tokens',
-          channel_type: 1,
           input: 1.5,
           output: 7.5,
           locked: false,
           extra_ratios: { cached_tokens: 0.1 }
         },
-        { model: 'deepseek-chat', type: 'tokens', channel_type: 1, input: 0.14, output: 0.21, locked: false }
+        { model: 'deepseek-chat', type: 'tokens', input: 0.14, output: 0.21, locked: false }
       ];
       const before = { ...source[0], input: 2, output: 3, extra_ratios: { cached_tokens: 0.5 }, rate_rules: {} };
       const requests = [];
@@ -115,7 +113,7 @@ test(
                 : [])
             ];
         if (gallery) {
-          const price = (model, input, output) => ({ model, type: 'tokens', channel_type: 1, input, output, locked: false });
+          const price = (model, input, output) => ({ model, type: 'tokens', input, output, locked: false });
           const added = { action: 'add', model: 'deepseek-chat', before: null, after: price('deepseek-chat', 0.14, 0.21) };
           const updates = [
             { action: 'update', model: 'gpt-4.1', before: price('gpt-4.1', 1.5, 6), after: price('gpt-4.1', 1, 4) },

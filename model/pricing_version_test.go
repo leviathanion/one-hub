@@ -280,3 +280,31 @@ func TestPriceLoaderPublishesOnlyAfterHeadAdvances(t *testing.T) {
 		t.Fatalf("advanced head was not loaded: version=%d", pricing.PublishedVersion())
 	}
 }
+
+func TestPricePublicationDoesNotReadModelMetadata(t *testing.T) {
+	db, pricing := setupVersionedPricingTest(t)
+	if err := db.Migrator().DropTable(&ModelInfo{}); err != nil {
+		t.Fatal(err)
+	}
+	queriedMetadata := false
+	if err := db.Callback().Query().Before("gorm:query").Register("test:detect_metadata_read", func(tx *gorm.DB) {
+		if tx.Statement.Table == (&ModelInfo{}).TableName() {
+			queriedMetadata = true
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := pricing.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := pricing.AddPrice(&Price{Model: "independent-price", Type: TokensPriceType, Input: 1, Output: 2, ModelInfo: &ModelInfoResponse{Name: "not a price field"}}); err != nil {
+		t.Fatal(err)
+	}
+	if queriedMetadata {
+		t.Fatal("price publication queried model metadata")
+	}
+	price, ok := pricing.FindExactPrice("independent-price")
+	if !ok || price.Input != 1 || price.ModelInfo != nil {
+		t.Fatalf("unexpected published price: %+v", price)
+	}
+}

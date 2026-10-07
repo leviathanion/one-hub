@@ -58,14 +58,6 @@ func CreateModelInfo(c *gin.Context) {
 		})
 		return
 	}
-	existingModel, _ := model.GetModelInfoByModel(modelInfo.Model)
-	if existingModel != nil {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "model identifier already exists",
-		})
-		return
-	}
 	err = model.CreateModelInfo(&modelInfo)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
@@ -87,14 +79,6 @@ func UpdateModelInfo(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"message": err.Error(),
-		})
-		return
-	}
-	existingModel, _ := model.GetModelInfoByModel(modelInfo.Model)
-	if existingModel != nil && existingModel.Id != modelInfo.Id {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "model identifier already exists",
 		})
 		return
 	}

@@ -2152,7 +2152,6 @@
       "input": "輸入倍率",
       "output": "輸出倍率",
       "type": "計費方式",
-      "channel_type": "渠道類型",
       "locked": "鎖定狀態",
       "rules": "價格規則"
     }

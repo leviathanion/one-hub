@@ -32,7 +32,6 @@ var ErrPriceChangePlanMismatch = errors.New("price change plan no longer matches
 type PricePolicyView struct {
 	Model       string              `json:"model"`
 	Type        string              `json:"type"`
-	ChannelType int                 `json:"channel_type"`
 	Input       float64             `json:"input"`
 	Output      float64             `json:"output"`
 	Locked      bool                `json:"locked"`
@@ -126,7 +125,7 @@ func ApplyPriceChange(ctx context.Context, publisher *Pricing, source []*Price, 
 				changed = true
 			case PriceChangeUpdate:
 				result := tx.Model(&Price{}).Where("model = ? AND locked = ?", change.Model, false).
-					Select("type", "channel_type", "input", "output", "locked", "extra_ratios", "rate_rules").
+					Select("type", "input", "output", "locked", "extra_ratios", "rate_rules").
 					Updates(change.After.price())
 				if result.Error != nil {
 					return result.Error
@@ -184,7 +183,6 @@ func buildPriceChangePlan(current map[string]*Price, source []*Price, mode Price
 		}
 		synced := priceForSync(incoming, existing)
 		if mode == PriceUpdateModeMerge {
-			synced.ChannelType = existing.ChannelType
 			if existing.RateRules != nil && !existing.RateRules.Data().Empty() {
 				rules := ClonePriceRateRules(existing.RateRules.Data())
 				rules.LongContext = nil
@@ -274,12 +272,11 @@ func pricePolicyView(price *Price) PricePolicyView {
 		return PricePolicyView{}
 	}
 	view := PricePolicyView{
-		Model:       price.Model,
-		Type:        price.Type,
-		ChannelType: price.ChannelType,
-		Input:       price.Input,
-		Output:      price.Output,
-		Locked:      price.Locked,
+		Model:  price.Model,
+		Type:   price.Type,
+		Input:  price.Input,
+		Output: price.Output,
+		Locked: price.Locked,
 	}
 	if price.ExtraRatios != nil {
 		copied := make(map[string]float64, len(price.ExtraRatios.Data()))
@@ -300,12 +297,11 @@ func (view *PricePolicyView) price() *Price {
 		return nil
 	}
 	price := &Price{
-		Model:       view.Model,
-		Type:        view.Type,
-		ChannelType: view.ChannelType,
-		Input:       view.Input,
-		Output:      view.Output,
-		Locked:      view.Locked,
+		Model:  view.Model,
+		Type:   view.Type,
+		Input:  view.Input,
+		Output: view.Output,
+		Locked: view.Locked,
 	}
 	if view.ExtraRatios != nil {
 		extra := make(map[string]float64, len(*view.ExtraRatios))

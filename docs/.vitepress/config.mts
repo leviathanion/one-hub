@@ -57,6 +57,7 @@ export default defineConfig({
           { text: '开发说明', link: '/dev/index' },
           { text: '自定义渠道上游接口配置', link: '/dev/channel-endpoints' },
           { text: '条件倍率规则设计', link: '/dev/pricing-rate-rules' },
+          { text: '模型信息与价格关联调整方案', link: '/dev/model-catalog-pricing-architecture' },
           { text: 'Responses 透明转发与计费', link: '/dev/responses-transparent-relay-design' },
           { text: 'OpenAI 协议透传扩展方案', link: '/dev/openai-transparent-relay-implementation-plan' },
           { text: '上游响应脱敏与统一交付', link: '/dev/provider-response-redaction-design' },

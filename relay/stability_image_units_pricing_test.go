@@ -391,7 +391,7 @@ func TestStabilityDefaultsUseTimesUnitsInAnEmptyPricingDB(t *testing.T) {
 		{model: "sd3-turbo", input: 20},
 	} {
 		price, ok := pricing.FindExactPrice(test.model)
-		if !ok || price.Type != model.TimesPriceType || price.Input != test.input || price.Output != 0 || price.ChannelType != config.ChannelTypeStabilityAI {
+		if !ok || price.Type != model.TimesPriceType || price.Input != test.input || price.Output != 0 {
 			t.Fatalf("空库默认价格错误：model=%s price=%+v exists=%v", test.model, price, ok)
 		}
 		var stored model.Price
@@ -412,9 +412,9 @@ func TestStabilityDefaultsUseTimesUnitsInAnEmptyPricingDB(t *testing.T) {
 func TestSystemSyncDoesNotOverwriteExistingLegacyTokenRows(t *testing.T) {
 	db, pricing := stabilityImagePricePreparePricingDB(t)
 	legacy := []*model.Price{
-		{Model: "stable-image-core", Type: model.TokensPriceType, ChannelType: config.ChannelTypeStabilityAI, Input: 15, Output: 15},
-		{Model: "sd3", Type: model.TokensPriceType, ChannelType: config.ChannelTypeStabilityAI, Input: 32.5, Output: 32.5},
-		{Model: "sd3-turbo", Type: model.TokensPriceType, ChannelType: config.ChannelTypeStabilityAI, Input: 20, Output: 20},
+		{Model: "stable-image-core", Type: model.TokensPriceType, Input: 15, Output: 15},
+		{Model: "sd3", Type: model.TokensPriceType, Input: 32.5, Output: 32.5},
+		{Model: "sd3-turbo", Type: model.TokensPriceType, Input: 20, Output: 20},
 	}
 	if err := db.Create(&legacy).Error; err != nil {
 		t.Fatal(err)
@@ -448,12 +448,12 @@ func TestSystemSyncDoesNotOverwriteExistingLegacyTokenRows(t *testing.T) {
 func TestTargetedPriceCASUpdatesOnlyApprovedRowsAndSurvivesRestart(t *testing.T) {
 	db, pricing := stabilityImagePricePreparePricingDB(t)
 	legacy := []*model.Price{
-		{Model: "stable-image-core", Type: model.TokensPriceType, ChannelType: config.ChannelTypeStabilityAI, Input: 15, Output: 15},
-		{Model: "sd3", Type: model.TokensPriceType, ChannelType: config.ChannelTypeStabilityAI, Input: 32.5, Output: 32.5},
-		{Model: "sd3-turbo", Type: model.TokensPriceType, ChannelType: config.ChannelTypeStabilityAI, Input: 20, Output: 20},
-		{Model: "issue036-untouched", Type: model.TokensPriceType, ChannelType: config.ChannelTypeOpenAI, Input: 7, Output: 8},
-		{Model: "issue036-custom-times", Type: model.TimesPriceType, ChannelType: config.ChannelTypeStabilityAI, Input: 99, Output: 0},
-		{Model: "issue036-locked", Type: model.TokensPriceType, ChannelType: config.ChannelTypeStabilityAI, Input: 4, Output: 5, Locked: true},
+		{Model: "stable-image-core", Type: model.TokensPriceType, Input: 15, Output: 15},
+		{Model: "sd3", Type: model.TokensPriceType, Input: 32.5, Output: 32.5},
+		{Model: "sd3-turbo", Type: model.TokensPriceType, Input: 20, Output: 20},
+		{Model: "issue036-untouched", Type: model.TokensPriceType, Input: 7, Output: 8},
+		{Model: "issue036-custom-times", Type: model.TimesPriceType, Input: 99, Output: 0},
+		{Model: "issue036-locked", Type: model.TokensPriceType, Input: 4, Output: 5, Locked: true},
 	}
 	if err := db.Create(&legacy).Error; err != nil {
 		t.Fatal(err)
@@ -464,8 +464,7 @@ func TestTargetedPriceCASUpdatesOnlyApprovedRowsAndSurvivesRestart(t *testing.T)
 
 	source := stabilityImagePriceStabilityDefaults(t)
 	source = append(source, &model.Price{
-		Model: "issue036-locked", Type: model.TimesPriceType, ChannelType: config.ChannelTypeStabilityAI,
-		Input: 123, Output: 0, Locked: true,
+		Model: "issue036-locked", Type: model.TimesPriceType, Input: 123, Output: 0, Locked: true,
 	})
 	preview, err := model.PreviewPriceChange(context.Background(), source, model.PriceUpdateModeUpdate)
 	if err != nil {

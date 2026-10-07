@@ -67,6 +67,7 @@ lastUpdated: true
 | [用户管理消融实验与精简方案](./user-management-ablation-plan.md) | 用户授权、身份归属、验证码、额度分组 | 当前实现；消融验证、17 项修复、SQL 一次性凭据与身份约束 |
 | [用户自动分组最终一致性修复方案](./user-group-quota-consistency-plan.md) | `quota`、`used_quota`、自动分组、按字段更新用户 | 当前实现；正常结算自动收敛，异常人工零额度重算 |
 | [条件倍率规则设计](./pricing-rate-rules.md) | 统一倍率、缓存覆盖、档位与日历条件 | 当前实现；保留基础价格和现有结算，只扩展 `rate_rules` |
+| [模型信息与价格关联调整方案](./model-catalog-pricing-architecture.md) | 模型组合视图、展示归属与价格规则 | 当前实现；启动代码一次迁移，保留已有分类和模型价格关联，移除归属对协议可用性的错误依赖 |
 | [渠道编辑确认方案](./immutable-channel-identity-architecture.md) | 渠道连接配置、保存确认、credential refresh | 每次编辑保存前确认影响，原地更新 |
 | [自定义渠道上游接口配置](./channel-endpoints.md) | 自定义渠道 `plugin.endpoints`、接口开关与地址 | 当前实现；接口开关不等于新增代理能力或重试授权 |
 | [Payment Order 协议与原子入账](./payment-order-architecture.md) | gateway create、callback、用户 credit | 当前实现；Payment Order 原子 credit，强幂等 contract 内允许有界 create retry |

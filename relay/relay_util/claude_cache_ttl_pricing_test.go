@@ -216,7 +216,6 @@ func claudeCacheTTLPriceManagementPayload(expectedVersion int64, ratios map[stri
 		"expected_version": expectedVersion,
 		"model":            "claude-i030",
 		"type":             model.TokensPriceType,
-		"channel_type":     1,
 		"input":            1,
 		"output":           1,
 		"locked":           false,
@@ -381,7 +380,6 @@ func TestClaudeManagementHTTPToSQLPreservesFallbackDeletion(t *testing.T) {
 	importSource := []map[string]any{{
 		"model":        "claude-i030",
 		"type":         model.TokensPriceType,
-		"channel_type": 1,
 		"input":        1,
 		"output":       1,
 		"locked":       false,
