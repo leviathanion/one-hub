@@ -48,7 +48,8 @@
     "extraRatiosChangesTip": "拡張率変更：{{changes}}",
     "extraRatiosRemoved": "拡張倍率を削除します",
     "modified": "変更",
-    "removed": "削除"
+    "removed": "削除",
+    "contextTierPolicy": "選択したモデルを更新すると、コンテキスト階層はソースの内容で置き換えられます。ソースにない場合は、手動設定も含めて削除されます。プレビューを確認してください。ロックされたモデルは更新されません。"
   },
   "sidebar": {
     "totalQuota": "総額",
@@ -409,7 +410,11 @@
     "noDataAvailable": "データがありません。",
     "pageSize": "ページごとのアイテム数",
     "search": "検索",
-    "total": "総数"
+    "total": "総数",
+    "price": "基本価格",
+    "all": "すべて",
+    "filter": "絞り込み",
+    "noSearchResults": "一致する結果がありません"
   },
   "dashboard": "ダッシュボード",
   "dashboard_index": {
@@ -994,7 +999,8 @@
       "applicableSpeed": "適用する速度（speed、任意）",
       "applicableSpeedHelp": "Empty means any speed. Select standard to exclude fast requests from long-context rates.",
       "overlap": "This rule overlaps another rule in the same pricing dimension. Adjust its values or range."
-    }
+    },
+    "unknown": "不明"
   },
   "profile": "プロフィール",
   "profilePage": {
@@ -2057,5 +2063,71 @@
     }
   },
   "这里填写禁用流式的模型，注意：如果填写了禁用流式的模型，那么这些模型在流式请求时会跳过该渠道": "ここには、ストリーミングを無効にするモデルを記入してください。注意：ストリーミングを無効にするモデルを記入した場合、これらのモデルはストリームリクエスト時にそのチャンネルをスキップします。",
-  "开启后，将会透传普通 HTTP 请求中的额外字段（如 OpenAI SDK 的 extra_body 参数）": "有効にすると、通常の HTTP リクエスト内の追加フィールド（OpenAI SDK の extra_body パラメータなど）を透過的に転送します。"
+  "开启后，将会透传普通 HTTP 请求中的额外字段（如 OpenAI SDK 的 extra_body 参数）": "有効にすると、通常の HTTP リクエスト内の追加フィールド（OpenAI SDK の extra_body パラメータなど）を透過的に転送します。",
+  "pricingSync": {
+    "applyPending": "変更を適用",
+    "title": "モデル価格を同期",
+    "sourceIntro": "価格カタログを取得し、変更内容を確認して適用します。",
+    "reviewIntro": "同期方法を選択し、以下の変更内容を確認してから適用してください。",
+    "catalogUrl": "価格カタログの URL",
+    "urlHelp": "設定済みの価格ソースを使用するか、別の価格カタログの URL を貼り付けてください。",
+    "or": "または",
+    "modelsDevHelp": "モデルカタログから価格を取得し、換算した結果を確認できます。",
+    "fetchHelp": "データを取得しても現在の価格は変更されません。",
+    "loadedSource": "取得した価格ソース",
+    "skippedShort": "無効またはソースが不明確なモデル {{count}} 件をスキップ",
+    "changeSource": "ソースを変更",
+    "modeShort": {
+      "add": "ローカルにないモデルのみ追加",
+      "update": "既存のモデルを更新し、その他は保持",
+      "overwrite": "削除を含めてソースと一致させる"
+    },
+    "overwriteNotice": "上書きすると、ソースにない未ロックのモデルが削除されます。ソースでスキップされたモデルも対象です。削除リストを確認してください。",
+    "rulesNotice": "コンテキスト階層はソースの内容で置き換えられ、ソースにない場合は削除されます。ロックされたモデルは変更されません。",
+    "changeSummary": "価格変更の概要",
+    "modelChanges": "{{model}} の価格変更",
+    "item": "変更項目",
+    "current": "現在",
+    "incoming": "同期後",
+    "noChanges": "選択した同期方法では適用する変更はありません。",
+    "modeLabel": "同期方法",
+    "emptyExtras": "追加倍率なし",
+    "stalePreview": "価格が変更されています。今回の操作では価格を変更していません。変更内容を再計算し、確認してから適用してください。",
+    "duplicate": "価格ソースにモデル「{{model}}」が複数あり、使用する価格を特定できません。ソース内の該当モデルを 1 件にしてから、上で再取得してください。現在の価格は変更されていません。",
+    "invalidCatalog": "価格カタログを使用できません。ソースを修正してから、上で再取得してください。{{detail}}",
+    "fetchFailed": "価格を取得できませんでした。上のソースを確認して再試行してください。{{detail}}",
+    "previewFailed": "価格変更を計算できませんでした。{{detail}}",
+    "applyFailed": "適用結果を確認できませんでした。変更内容を再計算し、確認してから再操作してください。{{detail}}",
+    "retryPreview": "変更内容を再計算",
+    "fetching": "価格カタログを取得中…",
+    "calculating": "価格変更を計算中…",
+    "apply": "{{count}} 件の変更を適用",
+    "total": "ソースのモデル数：{{count}}",
+    "action": {
+      "add": "追加するモデル",
+      "update": "価格の変更",
+      "delete": "削除するモデル",
+      "locked": "ロックにより保持"
+    },
+    "lockedHelp": "ロックされています。現在の価格を保持します。",
+    "notSet": "未設定",
+    "emptyRules": "条件付きルールなし",
+    "defaultFactor": "デフォルト倍率 1×",
+    "factor": {
+      "all": "共通倍率",
+      "input": "入力",
+      "output": "出力"
+    },
+    "field": {
+      "input": "入力倍率",
+      "output": "出力倍率",
+      "type": "課金方式",
+      "channel_type": "チャネルの種類",
+      "locked": "ロック状態",
+      "rules": "価格ルール"
+    }
+  },
+  "modelsDev": {
+    "fetch": "models.dev から取得"
+  }
 }

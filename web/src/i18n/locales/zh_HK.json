@@ -50,7 +50,8 @@
     "extraRatiosChangesTip": "擴展倍率變動：{{changes}}",
     "extraRatiosRemoved": "刪除擴展倍率",
     "modified": "修改",
-    "removed": "刪除"
+    "removed": "刪除",
+    "contextTierPolicy": "更新所選模型時，上下文分級以來源為準：有分級則替換，沒有則清除，包括手動分級。請核對預覽；鎖定模型不會更新。"
   },
   "Header 配置": "Header 配置",
   "sidebar": {
@@ -413,7 +414,11 @@
     "noDataAvailable": "冇數據可用",
     "pageSize": "每頁條數",
     "search": "搜尋",
-    "total": "總數"
+    "total": "總數",
+    "price": "基礎價格",
+    "all": "全部",
+    "filter": "篩選",
+    "noSearchResults": "沒有找到符合的結果"
   },
   "dashboard": "儀表板",
   "dashboard_index": {
@@ -997,7 +1002,8 @@
       "applicableSpeed": "適用速度（speed，可選）",
       "applicableSpeedHelp": "不选择表示不限速度。只选择 standard 可使 Fast 不叠加长上下文倍率。",
       "overlap": "此规则与同组规则的取值或区间重叠，请调整条件。"
-    }
+    },
+    "unknown": "未知"
   },
   "profile": "個人設定",
   "profilePage": {
@@ -2087,5 +2093,71 @@
   },
   "禁用流式的模型": "停用流動式的模型",
   "这里填写禁用流式的模型，注意：如果填写了禁用流式的模型，那么这些模型在流式请求时会跳过该渠道": "呢度填寫禁用流式嘅模型，注意：如果填寫咗禁用流式嘅模型，咁就會喺流式請求時跳過呢個渠道。",
-  "开启后，将会透传普通 HTTP 请求中的额外字段（如 OpenAI SDK 的 extra_body 参数）": "開啟後，將會透傳普通 HTTP 請求中的額外欄位（如 OpenAI SDK 的 extra_body 參數）"
+  "开启后，将会透传普通 HTTP 请求中的额外字段（如 OpenAI SDK 的 extra_body 参数）": "開啟後，將會透傳普通 HTTP 請求中的額外欄位（如 OpenAI SDK 的 extra_body 參數）",
+  "pricingSync": {
+    "applyPending": "確認套用",
+    "title": "同步模型價格",
+    "sourceIntro": "先取得價格目錄，再核對變更並確認套用。",
+    "reviewIntro": "選擇同步方式，確認下方變更後再套用。",
+    "catalogUrl": "價格目錄網址",
+    "urlHelp": "使用已設定的價格來源，也可以貼上其他價格目錄網址。",
+    "or": "或",
+    "modelsDevHelp": "取得模型目錄中的價格，統一換算後供你核對。",
+    "fetchHelp": "取得資料不會修改目前價格。",
+    "loadedSource": "已取得價格來源",
+    "skippedShort": "略過 {{count}} 個無效或來源不明確的模型",
+    "changeSource": "更換來源",
+    "modeShort": {
+      "add": "僅新增本地沒有的模型",
+      "update": "更新現有模型，保留其餘模型",
+      "overwrite": "與來源保持一致，包含刪除"
+    },
+    "overwriteNotice": "覆蓋會刪除來源中沒有的未鎖定模型，包括來源中被略過的模型。請核對刪除清單。",
+    "rulesNotice": "上下文分級以來源為準；來源沒有分級時會清除現有分級。鎖定模型保持不變。",
+    "changeSummary": "價格變更彙總",
+    "modelChanges": "{{model}} 的價格變更",
+    "item": "調整項目",
+    "current": "目前",
+    "incoming": "同步後",
+    "noChanges": "目前同步方式下沒有需要套用的變更。",
+    "modeLabel": "同步方式",
+    "emptyExtras": "無擴充倍率",
+    "stalePreview": "價格已發生變更，本次操作未修改價格。請重新計算變更，再核對並確認。",
+    "duplicate": "價格來源中模型「{{model}}」出現多次，無法確定應採用哪筆價格。請在來源中保留唯一記錄後，從上方重新取得。目前價格未修改。",
+    "invalidCatalog": "價格目錄無法使用，請修正來源後從上方重新取得。{{detail}}",
+    "fetchFailed": "取得價格失敗，請檢查上方來源後重試。{{detail}}",
+    "previewFailed": "暫時無法計算價格變更。{{detail}}",
+    "applyFailed": "套用結果未確認，請重新計算變更並核對後再操作。{{detail}}",
+    "retryPreview": "重新計算變更",
+    "fetching": "正在取得價格目錄…",
+    "calculating": "正在計算價格變更…",
+    "apply": "確認套用 {{count}} 項變更",
+    "total": "來源模型：{{count}}",
+    "action": {
+      "add": "新增模型",
+      "update": "價格變更",
+      "delete": "刪除模型",
+      "locked": "鎖定保留"
+    },
+    "lockedHelp": "已鎖定，本次保持原價格。",
+    "notSet": "未設定",
+    "emptyRules": "無條件規則",
+    "defaultFactor": "預設倍率 1×",
+    "factor": {
+      "all": "統一倍率",
+      "input": "輸入",
+      "output": "輸出"
+    },
+    "field": {
+      "input": "輸入倍率",
+      "output": "輸出倍率",
+      "type": "計費方式",
+      "channel_type": "渠道類型",
+      "locked": "鎖定狀態",
+      "rules": "價格規則"
+    }
+  },
+  "modelsDev": {
+    "fetch": "從 models.dev 取得"
+  }
 }
