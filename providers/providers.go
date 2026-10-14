@@ -6,6 +6,7 @@ import (
 	"one-api/common/config"
 	"one-api/model"
 	"one-api/providers/ali"
+	"one-api/providers/antigravity"
 	"one-api/providers/azure"
 	azurespeech "one-api/providers/azureSpeech"
 	"one-api/providers/azure_v1"
@@ -130,6 +131,7 @@ func init() {
 		config.ChannelTypeMidjourney:      midjourney.MidjourneyProviderFactory{},
 		config.ChannelTypeCloudflareAI:    cloudflareAI.CloudflareAIProviderFactory{},
 		config.ChannelTypeCodex:           codex.CodexProviderFactory{},
+		config.ChannelTypeAntigravity:     antigravity.AntigravityProviderFactory{},
 		config.ChannelTypeCohere:          cohere.CohereProviderFactory{},
 		config.ChannelTypeStabilityAI:     stabilityAI.StabilityAIProviderFactory{},
 		config.ChannelTypeCoze:            coze.CozeProviderFactory{},

@@ -182,6 +182,12 @@ func SetApiRouter(router *gin.Engine) {
 			channelRoute.DELETE("/batch", controller.BatchDeleteChannel)
 		}
 
+		antigravityRoute := apiRouter.Group("/antigravity/oauth", middleware.AdminAuth(), middleware.CriticalRateLimit())
+		{
+			antigravityRoute.POST("/start", controller.StartAntigravityOAuth)
+			antigravityRoute.POST("/exchange-code", controller.AntigravityOAuthCallback)
+		}
+
 		// Codex OAuth routes
 		codexRoute := apiRouter.Group("/codex")
 		codexRoute.Use(middleware.AdminAuth())
