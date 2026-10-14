@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/logger"
 	"one-api/common/notify"
@@ -138,6 +139,9 @@ func testChannel(channel *model.Channel, testModel string) (openaiErr *types.Ope
 			Model: newModelName,
 			Input: "hi",
 		}
+		if _, err := setChannelProbeRequestBody(c, testRequest); err != nil {
+			return nil, err
+		}
 		response, openAIErrorWithStatusCode = embeddingsProvider.CreateEmbeddings(testRequest)
 	case "image":
 		imageProvider, ok := provider.(providers_base.ImageGenerationsInterface)
@@ -149,6 +153,9 @@ func testChannel(channel *model.Channel, testModel string) (openaiErr *types.Ope
 			Model:  newModelName,
 			Prompt: "A cute cat",
 			N:      1,
+		}
+		if _, err := setChannelProbeRequestBody(c, testRequest); err != nil {
+			return nil, err
 		}
 		response, openAIErrorWithStatusCode = imageProvider.CreateImageGenerations(testRequest)
 	case "response":
@@ -173,7 +180,7 @@ func testChannel(channel *model.Channel, testModel string) (openaiErr *types.Ope
 			Model:  newModelName,
 			Stream: false,
 		}
-		raw, marshalErr := json.Marshal(testRequest)
+		raw, marshalErr := setChannelProbeRequestBody(c, testRequest)
 		if marshalErr != nil {
 			return nil, marshalErr
 		}
@@ -210,6 +217,9 @@ func testChannel(channel *model.Channel, testModel string) (openaiErr *types.Ope
 			Model:  newModelName,
 			Stream: false,
 		}
+		if _, err := setChannelProbeRequestBody(c, testRequest); err != nil {
+			return nil, err
+		}
 
 		response, openAIErrorWithStatusCode = chatProvider.CreateChatCompletion(testRequest)
 	default:
@@ -225,6 +235,17 @@ func testChannel(channel *model.Channel, testModel string) (openaiErr *types.Ope
 	logger.SysLog(fmt.Sprintf("测试渠道 %s : %s 返回内容为：%s", channel.Name, newModelName, string(jsonBytes)))
 
 	return nil, nil
+}
+
+// 测速由代理构造请求，typed 参数和读取原始请求体的 provider 必须观察到同一份输入。
+func setChannelProbeRequestBody(c *gin.Context, request any) ([]byte, error) {
+	raw, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+	common.SetCanonicalRequestBody(c, raw)
+	c.Request.ContentLength = int64(len(raw))
+	return raw, nil
 }
 
 func getModelType(modelName string) string {

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/requester"
 	commonresponses "one-api/common/responses"
@@ -54,6 +55,14 @@ func TestResponsesChannelProbeCarriesPurpose(t *testing.T) {
 		t.Fatalf("expected context channel probe purpose, got %q", fake.contextPurpose)
 	}
 	body := requestBodyMapFromEnvelope(t, fake.req)
+	raw, ok := common.GetCanonicalRequestBody(fake.context)
+	if !ok || fake.context.Request.ContentLength != int64(len(raw)) {
+		t.Fatalf("expected canonical probe body with matching length, got %q", raw)
+	}
+	envelopeRaw, err := fake.req.Body.Object.MarshalJSON()
+	if err != nil || string(raw) != string(envelopeRaw) {
+		t.Fatalf("canonical body differs from Responses envelope: body=%s envelope=%s err=%v", raw, envelopeRaw, err)
+	}
 	if _, exists := body["client_metadata"]; exists {
 		t.Fatalf("expected controller probe body not to contain Codex metadata, got %#v", body["client_metadata"])
 	}
