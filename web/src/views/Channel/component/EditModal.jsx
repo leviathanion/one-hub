@@ -46,10 +46,11 @@ import pluginList from '../type/Plugin.json';
 import { Icon } from '@iconify/react';
 import Editor from '@monaco-editor/react';
 import CodexAuthControls from './CodexAuthControls';
+import AntigravityAuthControls from './AntigravityAuthControls';
 import ConfirmDialog from 'ui-component/confirm-dialog';
 import ChannelEndpointsEditor from './ChannelEndpointsEditor';
 import { createEndpointPreset } from '../type/endpoints.mjs';
-import { versionAfterCredentialSave } from './editVersion.mjs';
+import { assertOAuthSessionVersion, versionAfterCredentialSave, versionAfterOAuthAuthorization } from './editVersion.mjs';
 
 const isAzureV1ResourceLevelBaseUrl = (value) => {
   const raw = String(value ?? '').trim();
@@ -439,7 +440,7 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
   };
 
   const handleTypeChange = (setFieldValue, typeValue, values) => {
-    if (typeValue === 101) {
+    if (typeConfig[typeValue]?.keyFormat === 'json') {
       setBatchAdd(false);
     }
 
@@ -1242,7 +1243,7 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                 <FormControl fullWidth error={Boolean(touched.key && errors.key)} sx={{ ...theme.typography.otherInput }}>
                   {!batchAdd ? (
                     <>
-                      {values.type === 101 ? (
+                      {typeConfig[values.type]?.keyFormat === 'json' ? (
                         <TextField
                           multiline
                           fullWidth
@@ -1301,7 +1302,7 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                             type="file"
                             onChange={(event) => handleBatchFileImport(event, values.key, setFieldValue)}
                           />
-                          {values.type !== 101 && (
+                          {typeConfig[values.type]?.keyFormat !== 'json' && (
                             <Box
                               sx={{
                                 mt: 1,
@@ -1334,14 +1335,14 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                   )}
 
                   {touched.key && errors.key ? (
-                    <FormHelperText error id="helper-tex-channel-key-label">
+                    <FormHelperText error id="helper-text-channel-key-label">
                       {errors.key}
                     </FormHelperText>
                   ) : (
-                    <FormHelperText id="helper-tex-channel-key-label">
+                    <FormHelperText id="helper-text-channel-key-label">
                       <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                         <span>{customizeT(inputPrompt.key)}</span>
-                        {channelId === 0 && values.type !== 101 && (
+                        {channelId === 0 && typeConfig[values.type]?.keyFormat !== 'json' && (
                           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
                             <Switch size="small" checked={Boolean(batchAdd)} onChange={(e) => setBatchAdd(e.target.checked)} />
                             <Typography variant="body2">{t('channel_edit.batchAdd')}</Typography>
@@ -1351,6 +1352,20 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                     </FormHelperText>
                   )}
                 </FormControl>
+
+                {values.type === 102 && !batchAdd && !isTag && (
+                  <AntigravityAuthControls
+                    key={`${channelId}:${open}`}
+                    channelId={channelId}
+                    proxy={values.proxy}
+                    onStart={(session) => assertOAuthSessionVersion(editSnapshot.current, session)}
+                    onAuthorized={(result, session) => {
+                      const version = versionAfterOAuthAuthorization(editSnapshot.current, session, result);
+                      if (editSnapshot.current) editSnapshot.current = { ...editSnapshot.current, version };
+                      if (result.operation !== 'recover') setFieldValue('key', result.key);
+                    }}
+                  />
+                )}
 
                 {values.type === 101 && !batchAdd && !isTag && (
                   <Box sx={{ mt: 2, mb: 2 }}>

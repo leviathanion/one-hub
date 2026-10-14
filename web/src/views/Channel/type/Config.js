@@ -573,6 +573,7 @@ const typeConfig = {
     }
   },
   101: {
+    keyFormat: 'json',
     fields: { other: true },
     inputLabel: {
       other: 'Codex 配置(JSON)'
@@ -580,6 +581,17 @@ const typeConfig = {
     prompt: {
       key: '请输入完整的 OAuth2 凭证 JSON，或点击下方"OAuth 授权"按钮自动获取',
       other: '可选。填写 Codex 渠道额外配置 JSON；留空使用默认值，点击问号查看字段说明和模板。'
+    }
+  },
+  102: {
+    keyFormat: 'json',
+    inputLabel: {
+      key: 'OAuth 凭据 JSON',
+      provider_models_list: '从 Antigravity 获取模型列表'
+    },
+    prompt: {
+      key: '请输入完整的 OAuth 凭据 JSON，或使用下方 OAuth 授权。格式化后的多行 JSON 仍是一份凭据。',
+      base_url: '留空使用默认 Antigravity 上游地址；自定义地址必须是可信端点。'
     }
   }
 };

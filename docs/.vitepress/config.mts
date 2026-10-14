@@ -55,6 +55,7 @@ export default defineConfig({
         text: '开发',
         items: [
           { text: '开发说明', link: '/dev/index' },
+          { text: 'Antigravity OAuth 渠道接入方案', link: '/dev/antigravity-oauth-architecture' },
           { text: '自定义渠道上游接口配置', link: '/dev/channel-endpoints' },
           { text: '条件倍率规则设计', link: '/dev/pricing-rate-rules' },
           { text: '模型信息与价格关联调整方案', link: '/dev/model-catalog-pricing-architecture' },

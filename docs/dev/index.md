@@ -61,6 +61,7 @@ lastUpdated: true
 
 | 文档 | 主题 | 说明 |
 | --- | --- | --- |
+| [Antigravity OAuth 渠道接入方案](./antigravity-oauth-architecture.md) | Google OAuth、透明转发、必要协议转换与请求修复 | 目标方案；综合四项目研究，明确最小校验边界、直接转换、消融取舍及四入口验收 |
 | [OpenAI 协议透明透传扩展实现方案](./openai-transparent-relay-implementation-plan.md) | 协议取舍、原始交付、资源归属与后台任务 | 目标方案；含实施批次、模块边界、迁移与验收；事实调研位于 docs/research |
 | [Channel Affinity 架构设计方案](./channel-affinity-architecture.md) | 渠道路由、responses affinity、Codex realtime affinity | 当前 routing / affinity 架构说明 |
 | [基于下游 Usage 的 TCC 计费](./usage-confirmed-tcc-billing-architecture.md) | 小额预扣、provider usage、Confirm/Cancel | 当前实现；只有合格下游 usage 才收费，没有 usage 全额取消预扣 |
