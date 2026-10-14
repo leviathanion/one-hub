@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"encoding/json"
 	"strings"
 
 	"one-api/model"
@@ -51,4 +52,10 @@ func chatRequestsAudioOutput(request *types.ChatCompletionRequest) bool {
 		}
 	}
 	return false
+}
+
+func (ClaudeProviderFactory) SupportsClaude(_ *model.Channel) bool { return true }
+
+func (ClaudeProviderFactory) AssessClaudeRequest(_ *model.Channel, _ string, _ map[string]json.RawMessage) error {
+	return nil
 }

@@ -59,3 +59,16 @@ func ValidateNativeChatRequest(canonicalModel string, request *types.ChatComplet
 	}
 	return &base.RequestCapabilityError{Param: "tool_choice", Message: "tool_choice cannot be represented by the " + adapter + " adapter"}
 }
+
+func (GeminiProviderFactory) SupportsGemini(_ *model.Channel) bool { return true }
+
+func (GeminiProviderFactory) AssessGeminiRequest(_ *model.Channel, _ string, fields map[string]json.RawMessage) error {
+	body, err := json.Marshal(fields)
+	if err != nil {
+		return err
+	}
+	if rawGeminiGoogleSearch(body) {
+		return &base.RequestCapabilityError{Param: "tools", Message: "Google Search grounding has no configured provider-unit price contract"}
+	}
+	return nil
+}

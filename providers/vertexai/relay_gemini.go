@@ -9,9 +9,8 @@ import (
 	"one-api/types"
 )
 
-func (p *VertexAIProvider) CreateGeminiChat(request *gemini.GeminiChatRequest) (*gemini.GeminiChatResponse, *types.OpenAIErrorWithStatusCode) {
-	raw, _ := p.GetRawBody()
-	if request.UsesGoogleSearchInRaw(raw) {
+func (p *VertexAIProvider) CreateGeminiChat(request *gemini.NativeRequest) (*gemini.GeminiChatResponse, *types.OpenAIErrorWithStatusCode) {
+	if request.UsesGoogleSearch() {
 		return nil, common.StringErrorWrapperLocal("Google Search grounding has no configured provider-unit price contract", "gemini_grounding_billing_unsupported", http.StatusBadRequest)
 	}
 	req, errWithCode := p.getGeminiRequest(request)
@@ -38,9 +37,8 @@ func (p *VertexAIProvider) CreateGeminiChat(request *gemini.GeminiChatRequest) (
 	return geminiResponse, nil
 }
 
-func (p *VertexAIProvider) CreateGeminiChatStream(request *gemini.GeminiChatRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
-	raw, _ := p.GetRawBody()
-	if request.UsesGoogleSearchInRaw(raw) {
+func (p *VertexAIProvider) CreateGeminiChatStream(request *gemini.NativeRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+	if request.UsesGoogleSearch() {
 		return nil, common.StringErrorWrapperLocal("Google Search grounding has no configured provider-unit price contract", "gemini_grounding_billing_unsupported", http.StatusBadRequest)
 	}
 	req, errWithCode := p.getGeminiRequest(request)
@@ -72,7 +70,7 @@ func (p *VertexAIProvider) CreateGeminiChatStream(request *gemini.GeminiChatRequ
 	return stream, nil
 }
 
-func (p *VertexAIProvider) getGeminiRequest(request *gemini.GeminiChatRequest) (*http.Request, *types.OpenAIErrorWithStatusCode) {
+func (p *VertexAIProvider) getGeminiRequest(request *gemini.NativeRequest) (*http.Request, *types.OpenAIErrorWithStatusCode) {
 	var err error
 	p.Category, err = category.GetCategory(request.Model)
 	if err != nil || p.Category.Category != "gemini" {
@@ -98,8 +96,8 @@ func (p *VertexAIProvider) getGeminiRequest(request *gemini.GeminiChatRequest) (
 		headers["Accept"] = "text/event-stream"
 	}
 
-	body, exists := p.GetRawBody()
-	if !exists {
+	body := request.Raw
+	if len(body) == 0 {
 		return nil, common.StringErrorWrapperLocal("request body not found", "request_body_not_found", http.StatusInternalServerError)
 	}
 

@@ -262,5 +262,5 @@ func ResponsesSupportForChannel(channel *model.Channel, defaultBaseURL string) b
 }
 
 func ValidateResponsesRequestForChannel(channel *model.Channel, operation base.Operation, fields map[string]json.RawMessage, modelName string, applyPreAdd bool) error {
-	return ValidateResponsesCustomParameterCompatibility(channel, fields, modelName, operation, applyPreAdd)
+	return base.ValidateResponsesCustomParameterCompatibility(channel, fields, modelName, operation, applyPreAdd)
 }

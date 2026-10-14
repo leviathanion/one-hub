@@ -27,12 +27,13 @@ import (
 
 type relayResponses struct {
 	relayBase
-	responsesRequest    types.OpenAIResponsesRequest
-	preparedChatRequest *types.ChatCompletionRequest
-	rawEnvelope         *commonresponses.RawEnvelope
-	operation           responsesOperation
-	strictOwnerRoute    bool
-	selectedDataPath    providersBase.DataPath
+	responsesRequest     types.OpenAIResponsesRequest
+	preparedChatRequest  *types.ChatCompletionRequest
+	rawEnvelope          *commonresponses.RawEnvelope
+	operation            responsesOperation
+	strictOwnerRoute     bool
+	selectedDataPath     providersBase.DataPath
+	selectedCreateTarget providersBase.ResponsesCreateTarget
 }
 
 const responsesPreviousResponseRecoveredContextKey = "responses_previous_response_recovered"
@@ -126,16 +127,19 @@ func (r *relayResponses) validateSelectedProviderRequest() error {
 	}
 	r.preparedChatRequest = nil
 	r.selectedDataPath = ""
+	r.selectedCreateTarget = ""
 	operation := r.providerOperation()
-	path, supported := providers.ResolveAdapterSupport(r.provider.GetChannel()).DataPath(operation)
+	support := providers.ResolveAdapterSupport(r.provider.GetChannel())
+	path, supported := support.DataPath(operation)
 	if !supported {
 		return &capabilityGateError{message: fmt.Sprintf("channel adapter cannot relay operation %s", operation), status: http.StatusServiceUnavailable}
 	}
 	r.selectedDataPath = path
-	if r.rawEnvelope != nil && r.rawEnvelope.ProjectionError != nil && path == providersBase.DataPathCrossProtocol {
+	r.selectedCreateTarget = support.ResponsesCreateTarget
+	if r.rawEnvelope != nil && r.rawEnvelope.ProjectionError != nil && r.selectedCreateTarget == providersBase.ResponsesCreateTargetChatAdapter {
 		return newCapabilityGateError("request", "request contains fields that cannot be represented by the selected cross-protocol adapter")
 	}
-	if r.operation != responsesOperationCreate || path != providersBase.DataPathCrossProtocol {
+	if r.operation != responsesOperationCreate || r.selectedCreateTarget != providersBase.ResponsesCreateTargetChatAdapter {
 		return nil
 	}
 	fields := map[string]json.RawMessage(nil)
@@ -332,7 +336,7 @@ func (r *relayResponses) sendCurrentProvider() (err *types.OpenAIErrorWithStatus
 		channel := r.provider.GetChannel()
 		responsesProvider, ok := r.provider.(providersBase.ResponsesInterface)
 
-		if r.selectedDataPath == providersBase.DataPathCrossProtocol {
+		if r.selectedCreateTarget == providersBase.ResponsesCreateTargetChatAdapter {
 			chatProvider, chatOK := r.provider.(providersBase.ChatInterface)
 			if !chatOK {
 				err = common.StringErrorWrapperLocal("channel not implemented", "channel_error", http.StatusServiceUnavailable)

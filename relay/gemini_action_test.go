@@ -2,8 +2,14 @@ package relay
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"one-api/common/config"
+	"one-api/common/requester"
+	"one-api/model"
+	"one-api/providers/gemini"
+	"one-api/types"
 	"strings"
 	"testing"
 
@@ -33,6 +39,80 @@ func TestGeminiUnsupportedActionNeverEntersGeneration(t *testing.T) {
 				t.Fatalf("missing native unsupported-action error: %s (%v)", recorder.Body.String(), err)
 			}
 		})
+	}
+}
+
+func TestGeminiIngressPreservesFutureUnionWithoutTypedAdmission(t *testing.T) {
+	raw := `{ "contents":{"future_union":true}, "generationConfig":{"future":1e3}, "large":9007199254740993 }`
+	router := gin.New()
+	router.POST("/gemini/:version/models/:model", func(c *gin.Context) {
+		r := NewRelayGeminiOnly(c)
+		if err := r.setRequest(); err != nil {
+			t.Errorf("raw ingress rejected future union: %v", err)
+			c.Status(400)
+			return
+		}
+		if _, err := r.geminiRequest.Projection(); err == nil {
+			t.Error("fixture must exceed typed projection")
+		}
+		if err := currentRequestChannelCapability(c)(&model.Channel{Type: config.ChannelTypeGemini}); err != nil {
+			t.Errorf("same-dialect candidate rejected raw request: %v", err)
+		}
+		c.Data(200, "application/json", r.geminiRequest.Raw)
+	})
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/gemini/v1beta/models/gemini-test:generateContent", strings.NewReader(raw)))
+	if recorder.Code != 200 || recorder.Body.String() != raw {
+		t.Fatalf("ingress changed raw: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestGeminiHTTPIngressForwardsFutureUnionToNativeProvider(t *testing.T) {
+	raw := `{ "contents":{"future_union":true}, "generationConfig":{"future":1e3}, "large":9007199254740993 }`
+	response := `{ "candidates":{"future_union":true}, "future":1e3 }`
+	var upstreamBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		upstreamBody, _ = io.ReadAll(req.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, response)
+	}))
+	t.Cleanup(upstream.Close)
+	previousClient := requester.HTTPClient
+	requester.HTTPClient = upstream.Client()
+	t.Cleanup(func() { requester.HTTPClient = previousClient })
+	proxy, baseURL := "", upstream.URL
+	channel := &model.Channel{Type: config.ChannelTypeGemini, Key: "test-key", Proxy: &proxy, BaseURL: &baseURL}
+	router := gin.New()
+	router.POST("/gemini/:version/models/:model", func(c *gin.Context) {
+		r := NewRelayGeminiOnly(c)
+		if err := r.setRequest(); err != nil {
+			t.Error(err)
+			c.Status(400)
+			return
+		}
+		if err := currentRequestChannelCapability(c)(channel); err != nil {
+			t.Error(err)
+			c.Status(400)
+			return
+		}
+		provider := (gemini.GeminiProviderFactory{}).Create(channel)
+		provider.SetContext(c)
+		provider.SetUsage(&types.Usage{})
+		r.provider, r.modelName = provider, "gemini-test"
+		if err := r.prepareSelectedProviderRemoteMedia(); err != nil {
+			t.Error(err)
+			c.Status(500)
+			return
+		}
+		if err, _ := r.send(); err != nil {
+			t.Errorf("native send: %+v", err)
+			c.Status(500)
+		}
+	})
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/gemini/v1beta/models/gemini-test:generateContent", strings.NewReader(raw)))
+	if recorder.Code != 200 || string(upstreamBody) != raw || recorder.Body.String() != response {
+		t.Fatalf("native HTTP wire changed: status=%d request=%s response=%s", recorder.Code, upstreamBody, recorder.Body.String())
 	}
 }
 

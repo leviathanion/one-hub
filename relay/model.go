@@ -96,7 +96,7 @@ func ListGeminiModelsByToken(c *gin.Context) {
 
 	var geminiModels []gemini.ModelDetails
 	for _, modelName := range models {
-		if model.ChannelGroup.ModelHasChannel(groupName, modelName, model.FilterChannelTypes(AllowGeminiChannelType)) {
+		if model.ChannelGroup.ModelHasChannel(groupName, modelName, model.FilterFunc(filterNonGeminiRouteEligibleChannel)) {
 			geminiModels = append(geminiModels, gemini.ModelDetails{
 				Name:        fmt.Sprintf("models/%s", modelName),
 				DisplayName: cases.Title(language.Und).String(strings.ReplaceAll(modelName, "-", " ")),

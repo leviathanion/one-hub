@@ -738,8 +738,11 @@ func requireChatChannelCompatibility(modelName string, request *types.ChatComple
 			return newCapabilityGateError("store", "selected channel cannot preserve Stored Chat lifecycle")
 		}
 		if usesResponsesTransport {
-			path, ok := providers.ResolveAdapterSupport(channel).DataPath(providersBase.OperationResponsesCreate)
-			if !ok || path == providersBase.DataPathCrossProtocol {
+			if err := providers.AssessRequestExtensions(channel, providersBase.RequestProtocolChat, effectiveFields); err != nil {
+				return providerCapabilityGateError(err)
+			}
+			support := providers.ResolveAdapterSupport(channel)
+			if support.ResponsesCreateTarget != providersBase.ResponsesCreateTargetProvider {
 				return &capabilityGateError{message: "channel adapter cannot send this model through the Responses API", status: http.StatusServiceUnavailable}
 			}
 			if err := validateChatToResponsesRepresentability(effectiveRequest, effectiveFields); err != nil {
@@ -860,18 +863,21 @@ func requireResponsesRequestCompatibility(operation providersBase.Operation, req
 		if err := operationSupport(channel); err != nil {
 			return err
 		}
-		path, _ := providers.ResolveAdapterSupport(channel).DataPath(operation)
+		support := providers.ResolveAdapterSupport(channel)
 		mappedModel, err := mappedModelForChannel(channel, requestedModel)
 		if err != nil {
 			return &capabilityGateError{message: "channel has invalid model mapping configuration", status: http.StatusServiceUnavailable}
 		}
-		if path != providersBase.DataPathCrossProtocol {
+		if operation != providersBase.OperationResponsesCreate || support.ResponsesCreateTarget == providersBase.ResponsesCreateTargetProvider {
 			if err := providers.ValidateResponsesRequest(channel, operation, fields, mappedModel, true); err != nil {
 				return providerCapabilityGateError(err)
 			}
 		}
 		if operation == providersBase.OperationResponsesCreate {
-			if path == providersBase.DataPathCrossProtocol {
+			if support.ResponsesCreateTarget == providersBase.ResponsesCreateTargetChatAdapter {
+				if err := providers.AssessRequestExtensions(channel, providersBase.RequestProtocolResponses, fields); err != nil {
+					return providerCapabilityGateError(err)
+				}
 				if err := validateResponsesCrossProtocolAdapterRepresentability(channel, mappedModel, fields); err != nil {
 					return err
 				}

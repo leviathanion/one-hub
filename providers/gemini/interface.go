@@ -8,6 +8,6 @@ import (
 
 type GeminiChatInterface interface {
 	base.ProviderInterface
-	CreateGeminiChat(request *GeminiChatRequest) (*GeminiChatResponse, *types.OpenAIErrorWithStatusCode)
-	CreateGeminiChatStream(request *GeminiChatRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode)
+	CreateGeminiChat(request *NativeRequest) (*GeminiChatResponse, *types.OpenAIErrorWithStatusCode)
+	CreateGeminiChatStream(request *NativeRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode)
 }

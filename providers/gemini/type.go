@@ -50,18 +50,32 @@ func (r *GeminiChatRequest) UsesInputImages() bool {
 	}
 	for _, content := range r.Contents {
 		for _, part := range content.Parts {
-			mimeType := ""
-			if part.InlineData != nil {
-				mimeType = part.InlineData.MimeType
-			} else if part.FileData != nil {
-				mimeType = part.FileData.MimeType
-			}
-			if strings.HasPrefix(strings.ToLower(strings.TrimSpace(mimeType)), "image/") {
+			if part.usesInputImage() {
 				return true
+			}
+			if part.FunctionResponse != nil {
+				// 工具附件同样属于输入图片；仅观察媒体，不解释工具 response 的业务 JSON。
+				var media []GeminiPart
+				_ = json.Unmarshal(part.FunctionResponse.Parts, &media)
+				for _, attachment := range media {
+					if attachment.usesInputImage() {
+						return true
+					}
+				}
 			}
 		}
 	}
 	return false
+}
+
+func (p GeminiPart) usesInputImage() bool {
+	mimeType := ""
+	if p.InlineData != nil {
+		mimeType = p.InlineData.MimeType
+	} else if p.FileData != nil {
+		mimeType = p.FileData.MimeType
+	}
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(mimeType)), "image/")
 }
 
 func (r *GeminiChatRequest) ApplyUsageRequirements(usage *types.Usage) {

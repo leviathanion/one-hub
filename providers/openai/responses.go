@@ -19,7 +19,6 @@ import (
 	"one-api/common/requester"
 	commonresponses "one-api/common/responses"
 	"one-api/common/utils"
-	"one-api/model"
 	providersBase "one-api/providers/base"
 	runtimesession "one-api/runtime/session"
 	"one-api/types"
@@ -47,22 +46,7 @@ type OpenAIResponsesStreamHandler struct {
 var (
 	responsesDataPrefix  = []byte("data:")
 	responsesDonePayload = []byte("[DONE]")
-	// These fields determine proxy-owned lifecycle admission, ownership, and
-	// routing before the provider request is built. Channel transforms may tune
-	// provider parameters, but they cannot change those already-frozen facts.
-	responsesLifecycleFieldsOwnedByRelay = []string{
-		"background",
-		"conversation",
-		"previous_response_id",
-		"prompt",
-		"store",
-	}
 )
-
-type responsesLifecycleFieldState struct {
-	present bool
-	value   json.RawMessage
-}
 
 func appendURLPathSegment(rawURL string, segment string) (string, error) {
 	parsed, err := providerendpoint.ParseResponsesURI(rawURL)
@@ -457,7 +441,7 @@ func (p *OpenAIProvider) buildResponsesCreateBody(rawReq *commonresponses.Reques
 		var changed bool
 		inputTokens := rawReq != nil && rawReq.Operation == commonresponses.ResponsesInputTokens
 		applyPreAdd := rawReq == nil || rawReq.Control.DownstreamDialect != commonresponses.DownstreamChatCompletions
-		bodyMap, field, changed, err = applyResponsesCustomParameters(bodyMap, customParams, request.Model, inputTokens, applyPreAdd)
+		bodyMap, field, changed, err = providersBase.ApplyResponsesCustomParameters(bodyMap, customParams, request.Model, inputTokens, applyPreAdd)
 		if err != nil {
 			return nil, common.ErrorWrapper(err, "custom_parameter_error", http.StatusInternalServerError)
 		}
@@ -477,98 +461,6 @@ func (p *OpenAIProvider) buildResponsesCreateBody(rawReq *commonresponses.Reques
 		}
 	}
 	return bodyMap, nil
-}
-
-func applyResponsesCustomParameters(bodyMap map[string]interface{}, customParams map[string]interface{}, modelName string, inputTokens, applyPreAdd bool) (map[string]interface{}, string, bool, error) {
-	lifecycleFields := responsesLifecycleFieldsOwnedByRelay
-	if inputTokens {
-		lifecycleFields = []string{"previous_response_id"}
-	}
-	lifecycleBefore, err := snapshotResponsesLifecycleFields(bodyMap, lifecycleFields)
-	if err != nil {
-		return nil, "", false, err
-	}
-	bodyMap = providersBase.ApplyCustomParams(bodyMap, customParams, modelName, applyPreAdd)
-	field, changed, err := changedResponsesLifecycleField(lifecycleBefore, bodyMap, lifecycleFields)
-	return bodyMap, field, changed, err
-}
-
-// ValidateResponsesCustomParameterCompatibility performs the same lifecycle
-// freeze used by request construction, but on a disposable body projection so
-// routing can skip an incompatible candidate before provider work.
-func ValidateResponsesCustomParameterCompatibility(channel *model.Channel, fields map[string]json.RawMessage, modelName string, operation providerresponse.Operation, applyPreAdd bool) error {
-	if channel == nil {
-		return nil
-	}
-	customParams, err := channel.GetCustomParameterMap()
-	if err != nil {
-		return &providersBase.RequestCapabilityError{Param: "custom_parameter", Message: "channel custom parameters are invalid"}
-	}
-	if len(customParams) == 0 {
-		return nil
-	}
-	bodyMap, err := rawMessageBodyToInterfaceMap(fields)
-	if err != nil {
-		return &providersBase.RequestCapabilityError{Param: "request", Message: "request cannot be checked against channel custom parameters"}
-	}
-	if bodyMap == nil {
-		bodyMap = make(map[string]interface{})
-	}
-	var field string
-	var changed bool
-	bodyMap, field, changed, err = applyResponsesCustomParameters(bodyMap, customParams, modelName, operation == providerresponse.OperationResponsesInputTokens, applyPreAdd)
-	if err != nil {
-		return &providersBase.RequestCapabilityError{Param: "custom_parameter", Message: "channel custom parameters cannot be evaluated"}
-	}
-	if changed {
-		return &providersBase.RequestCapabilityError{Param: field, Message: "channel custom parameters cannot modify Responses lifecycle fields"}
-	}
-	for _, ref := range commonresponses.ProtocolResourceReferences(bodyMap, "responses") {
-		switch ref.Kind {
-		case "file", "conversation":
-			continue
-		}
-		return &providersBase.RequestCapabilityError{Param: ref.Path, Message: "resource ownership is not implemented for " + ref.Kind}
-	}
-	return nil
-}
-
-func snapshotResponsesLifecycleFields(body map[string]interface{}, lifecycleFields []string) (map[string]responsesLifecycleFieldState, error) {
-	snapshot := make(map[string]responsesLifecycleFieldState, len(lifecycleFields))
-	for _, field := range lifecycleFields {
-		value, present := body[field]
-		state := responsesLifecycleFieldState{present: present}
-		if present {
-			encoded, err := json.Marshal(value)
-			if err != nil {
-				return nil, err
-			}
-			state.value = encoded
-		}
-		snapshot[field] = state
-	}
-	return snapshot, nil
-}
-
-func changedResponsesLifecycleField(before map[string]responsesLifecycleFieldState, body map[string]interface{}, lifecycleFields []string) (string, bool, error) {
-	for _, field := range lifecycleFields {
-		prior := before[field]
-		value, present := body[field]
-		if prior.present != present {
-			return field, true, nil
-		}
-		if !present {
-			continue
-		}
-		encoded, err := json.Marshal(value)
-		if err != nil {
-			return "", false, err
-		}
-		if !bytes.Equal(prior.value, encoded) {
-			return field, true, nil
-		}
-	}
-	return "", false, nil
 }
 
 func responsesLifecycleCustomParameterError(field string) *types.OpenAIErrorWithStatusCode {

@@ -106,16 +106,16 @@ func collectGeminiUsageEvidenceVertexStream(t *testing.T, stream requester.Strea
 	return streamErr
 }
 
-func newGeminiUsageEvidenceVertexNativeRequest(t *testing.T, provider *VertexAIProvider, raw string, stream bool) *gemini.GeminiChatRequest {
+func newGeminiUsageEvidenceVertexNativeRequest(t *testing.T, provider *VertexAIProvider, raw string, stream bool) *gemini.NativeRequest {
 	t.Helper()
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/projects/test/locations/global", strings.NewReader(raw))
 	if _, err := common.CacheRequestBody(ctx); err != nil {
 		t.Fatalf("cache Vertex Gemini request: %v", err)
 	}
-	request := &gemini.GeminiChatRequest{}
-	if err := common.UnmarshalBodyReusable(ctx, request); err != nil {
-		t.Fatalf("decode Vertex Gemini request: %v", err)
+	request, err := gemini.ParseNativeRequest([]byte(raw), "gemini-2.5-pro", stream)
+	if err != nil {
+		t.Fatal(err)
 	}
 	request.Model = "gemini-2.5-pro"
 	request.Stream = stream

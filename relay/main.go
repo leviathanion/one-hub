@@ -381,29 +381,15 @@ func applyPreMappingForProvider(c *gin.Context, modelName string, provider provi
 		originalBodyBytes = currentBodyBytes
 	}
 
-	finalBodyBytes := originalBodyBytes
-	var finalRequestMap map[string]interface{}
-
 	customParams, err := provider.CustomParameterHandler()
-	if err == nil && customParams != nil {
-		if preAdd, exists := customParams["pre_add"]; exists && preAdd == true {
-			requestMap := make(map[string]interface{})
-			if err := json.Unmarshal(originalBodyBytes, &requestMap); err == nil {
-				finalRequestMap = mergeCustomParamsForPreMapping(requestMap, customParams, modelName)
-				if modifiedBodyBytes, err := json.Marshal(finalRequestMap); err == nil {
-					finalBodyBytes = modifiedBodyBytes
-				} else {
-					finalRequestMap = nil
-				}
-			}
-		}
+	if err != nil {
+		return false, err
 	}
-
-	if finalRequestMap != nil {
-		common.SetReusableRequestBodyMap(c, finalBodyBytes, finalRequestMap)
-	} else {
-		common.SetReusableRequestBody(c, finalBodyBytes)
+	finalBodyBytes, err := providersBase.ApplyRawCustomParams(originalBodyBytes, customParams, modelName, true)
+	if err != nil {
+		return false, err
 	}
+	common.SetReusableRequestBody(c, finalBodyBytes)
 
 	if _, err := updatePreMappingSelectionContext(c, finalBodyBytes); err != nil {
 		return false, nil

@@ -727,7 +727,6 @@ func TestFetchChannelByModelWithSelectionFiltersCustomClaudeRelayChannels(t *tes
 	ctx := newRelayTestContext(nil)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/claude/v1/messages", nil)
 	ctx.Set("token_group", "default")
-	ctx.Set("allow_channel_type", AllowChannelType)
 
 	channel, err := fetchChannelByModelWithSelection(ctx, modelName, currentRealtimeChannelSelection(ctx))
 	if err != nil {

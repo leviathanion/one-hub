@@ -1,6 +1,7 @@
 package safty
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"one-api/common/config"
@@ -41,6 +42,8 @@ func convertToString(data interface{}) (string, error) {
 	switch v := data.(type) {
 	case string:
 		return v, nil
+	case json.RawMessage:
+		return jsonContentText(v)
 	case []interface{}:
 		// 处理数组类型的内容
 		for _, item := range v {

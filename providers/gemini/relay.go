@@ -28,12 +28,11 @@ type GeminiRelayStreamHandler struct {
 	ErrorSeen bool
 }
 
-func (p *GeminiProvider) CreateGeminiChat(request *GeminiChatRequest) (*GeminiChatResponse, *types.OpenAIErrorWithStatusCode) {
-	raw, _ := p.GetRawBody()
-	if request.UsesGoogleSearchInRaw(raw) {
+func (p *GeminiProvider) CreateGeminiChat(request *NativeRequest) (*GeminiChatResponse, *types.OpenAIErrorWithStatusCode) {
+	if request.UsesGoogleSearch() {
 		return nil, common.StringErrorWrapperLocal("Google Search grounding has no configured provider-unit price contract", "gemini_grounding_billing_unsupported", http.StatusBadRequest)
 	}
-	req, errWithCode := p.getChatRequest(request, true)
+	req, errWithCode := p.newChatHTTPRequest(request.Model, request.Stream, request.Raw)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -61,19 +60,17 @@ func (p *GeminiProvider) CreateGeminiChat(request *GeminiChatRequest) (*GeminiCh
 	return geminiResponse, nil
 }
 
-func (p *GeminiProvider) CreateGeminiChatStream(request *GeminiChatRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
-	raw, _ := p.GetRawBody()
-	if request.UsesGoogleSearchInRaw(raw) {
+func (p *GeminiProvider) CreateGeminiChatStream(request *NativeRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+	if request.UsesGoogleSearch() {
 		return nil, common.StringErrorWrapperLocal("Google Search grounding has no configured provider-unit price contract", "gemini_grounding_billing_unsupported", http.StatusBadRequest)
 	}
-	req, errWithCode := p.getChatRequest(request, true)
+	req, errWithCode := p.newChatHTTPRequest(request.Model, request.Stream, request.Raw)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
 	defer req.Body.Close()
 
 	channel := p.GetChannel()
-	rawRequest, _ := p.GetRawBody()
 
 	chatHandler := &GeminiRelayStreamHandler{
 		Usage:                p.Usage,
@@ -81,7 +78,7 @@ func (p *GeminiProvider) CreateGeminiChatStream(request *GeminiChatRequest) (req
 		Prefix:               `data: `,
 		RequireCachedContent: request.UsesCachedContent(),
 		RequireInputImage:    request.UsesInputImages(),
-		expectedCandidates:   geminiExpectedCandidateCount(request, rawRequest),
+		expectedCandidates:   geminiExpectedCandidateCount(nil, request.Raw),
 
 		key:    channel.Key,
 		framer: requester.NewSSEEventFramer(16 << 20),

@@ -197,6 +197,22 @@ func nativeClaudeProviderFactoryForChannel(channel *model.Channel) ProviderFacto
 	return providerFactoryForChannel(channel)
 }
 
+// GetClaudeProvider 使用与资格评估相同的 factory 解析结果。
+func GetClaudeProvider(channel *model.Channel, c *gin.Context) base.ProviderInterface {
+	if !SupportsClaude(channel) {
+		return nil
+	}
+	factory := nativeClaudeProviderFactoryForChannel(channel)
+	if factory == nil {
+		return nil
+	}
+	provider := factory.Create(channel)
+	if provider != nil {
+		provider.SetContext(c)
+	}
+	return provider
+}
+
 // AssessChatRemoteMedia asks the concrete provider adapter how it represents
 // Chat media. It is safe for candidate evaluation: factories and policies must
 // not perform network I/O, and no media means no provider construction at all.

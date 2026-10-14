@@ -19,16 +19,16 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func newNativeGeminiProviderForTest(t *testing.T, server *httptest.Server, raw string, stream bool) (*GeminiProvider, *GeminiChatRequest) {
+func newNativeGeminiProviderForTest(t *testing.T, server *httptest.Server, raw string, stream bool) (*GeminiProvider, *NativeRequest) {
 	t.Helper()
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/gemini/v1beta/models/gemini-test:generateContent", strings.NewReader(raw))
 	if _, err := common.CacheRequestBody(ctx); err != nil {
 		t.Fatalf("cache Gemini request: %v", err)
 	}
-	request := &GeminiChatRequest{}
-	if err := common.UnmarshalBodyReusable(ctx, request); err != nil {
-		t.Fatalf("decode Gemini projection: %v", err)
+	request, err := ParseNativeRequest([]byte(raw), "gemini-test", stream)
+	if err != nil {
+		t.Fatal(err)
 	}
 	request.Model = "gemini-test"
 	request.Stream = stream

@@ -250,7 +250,8 @@ func invokeGeminiUsageEvidenceProvider(t *testing.T, entry geminiUsageEvidencePr
 	provider.SetContext(ctx)
 	provider.SetUsage(&types.Usage{})
 	if entry.native {
-		request := &gemini.GeminiChatRequest{Model: geminiUsageEvidenceBillingRequestModel, Stream: entry.stream}
+		raw, _ := provider.GetRawBody()
+		request := &gemini.NativeRequest{Raw: raw, Model: geminiUsageEvidenceBillingRequestModel, Stream: entry.stream}
 		if entry.stream {
 			stream, apiErr := provider.CreateGeminiChatStream(request)
 			if apiErr != nil || stream == nil {
@@ -290,7 +291,8 @@ func invokeGeminiUsageEvidenceProvider(t *testing.T, entry geminiUsageEvidencePr
 func invokeGeminiUsageEvidenceVertexProvider(t *testing.T, provider *vertexai.VertexAIProvider, entry geminiUsageEvidenceProviderEntry) (*types.Usage, string) {
 	t.Helper()
 	if entry.native {
-		request := &gemini.GeminiChatRequest{Model: geminiUsageEvidenceBillingRequestModel, Stream: entry.stream}
+		raw, _ := provider.GetRawBody()
+		request := &gemini.NativeRequest{Raw: raw, Model: geminiUsageEvidenceBillingRequestModel, Stream: entry.stream}
 		if entry.stream {
 			stream, apiErr := provider.CreateGeminiChatStream(request)
 			if apiErr != nil || stream == nil {
@@ -465,7 +467,7 @@ func runGeminiUsageEvidenceInvalidUsageRefund(t *testing.T, usageFields string) 
 	}).(*gemini.GeminiProvider)
 	provider.SetContext(ctx)
 	provider.SetUsage(&types.Usage{})
-	response, apiErr := provider.CreateGeminiChat(&gemini.GeminiChatRequest{Model: geminiUsageEvidenceBillingRequestModel})
+	response, apiErr := provider.CreateGeminiChat(&gemini.NativeRequest{Raw: []byte(`{"contents":[]}`), Model: geminiUsageEvidenceBillingRequestModel})
 	if apiErr != nil || response == nil {
 		t.Fatalf("Gemini invalid-usage response failed: response=%+v err=%+v", response, apiErr)
 	}
