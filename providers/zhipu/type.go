@@ -1,6 +1,7 @@
 package zhipu
 
 import (
+	"encoding/json"
 	"one-api/types"
 )
 
@@ -174,6 +175,29 @@ type ZhipuToolCalls struct {
 	WebBrowser      *ZhipuPlugin[WebBrowserPlugin]      `json:"web_browser,omitempty"`
 	DrawingTool     *ZhipuPlugin[DrawingToolPlugin]     `json:"drawing_tool,omitempty"`
 	CodeInterpreter *ZhipuPlugin[CodeInterpreterPlugin] `json:"code_interpreter,omitempty"`
+}
+
+func (z *ZhipuToolCalls) UnmarshalJSON(data []byte) error {
+	var call types.ChatCompletionToolCalls
+	if err := json.Unmarshal(data, &call); err != nil {
+		return err
+	}
+	// 嵌入类型有自定义解码方法，插件字段必须由外层解码。
+	var plugins struct {
+		WebBrowser      *ZhipuPlugin[WebBrowserPlugin]      `json:"web_browser,omitempty"`
+		DrawingTool     *ZhipuPlugin[DrawingToolPlugin]     `json:"drawing_tool,omitempty"`
+		CodeInterpreter *ZhipuPlugin[CodeInterpreterPlugin] `json:"code_interpreter,omitempty"`
+	}
+	if err := json.Unmarshal(data, &plugins); err != nil {
+		return err
+	}
+	*z = ZhipuToolCalls{
+		ChatCompletionToolCalls: call,
+		WebBrowser:              plugins.WebBrowser,
+		DrawingTool:             plugins.DrawingTool,
+		CodeInterpreter:         plugins.CodeInterpreter,
+	}
+	return nil
 }
 
 type PluginMD interface {

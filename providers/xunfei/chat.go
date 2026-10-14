@@ -410,6 +410,12 @@ func (h *xunfeiHandler) convertToChatOpenai(ctx context.Context, stream requeste
 	xunfeiText := xunfeiResponse.Payload.Choices.Text[0]
 
 	if xunfeiText.FunctionCall != nil {
+		// 跨协议输出使用已解码的字符串参数，避免源 wire 投影恢复对象形式。
+		function := &types.ChatCompletionToolCallsFunction{
+			Name:        xunfeiText.FunctionCall.Name,
+			Arguments:   xunfeiText.FunctionCall.Arguments,
+			ExtraFields: xunfeiText.FunctionCall.ExtraFields,
+		}
 		choice.Message = types.ChatCompletionMessage{
 			Role: "assistant",
 		}
@@ -419,12 +425,12 @@ func (h *xunfeiHandler) convertToChatOpenai(ctx context.Context, stream requeste
 				{
 					Id:       xunfeiResponse.Header.Sid,
 					Type:     "function",
-					Function: xunfeiText.FunctionCall,
+					Function: function,
 				},
 			}
 			choice.FinishReason = types.FinishReasonToolCalls
 		} else {
-			choice.Message.FunctionCall = xunfeiText.FunctionCall
+			choice.Message.FunctionCall = function
 			choice.FinishReason = types.FinishReasonFunctionCall
 		}
 	} else {

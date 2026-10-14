@@ -34,6 +34,22 @@ type ChatCompletionMessage struct {
 	ToolPlan string `json:"tool_plan,omitempty"`
 }
 
+func (cc *ChatCompletionMessage) UnmarshalJSON(data []byte) error {
+	var message types.ChatCompletionMessage
+	if err := json.Unmarshal(data, &message); err != nil {
+		return err
+	}
+	// 嵌入类型有自定义解码方法，外层字段必须单独解码。
+	var fields struct {
+		ToolPlan string `json:"tool_plan,omitempty"`
+	}
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*cc = ChatCompletionMessage{ChatCompletionMessage: message, ToolPlan: fields.ToolPlan}
+	return nil
+}
+
 func (cc *ChatCompletionMessage) ToChatCompletionMessage() *types.ChatCompletionMessage {
 	if cc.ToolPlan != "" {
 		cc.Content = cc.ToolPlan
