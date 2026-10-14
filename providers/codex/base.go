@@ -62,13 +62,6 @@ func DefaultUserAgent() string {
 	return wire.DefaultUserAgent()
 }
 
-var channelRefreshLocks = struct {
-	mu    sync.Mutex
-	locks map[int]*channelRefreshLock
-}{
-	locks: make(map[int]*channelRefreshLock),
-}
-
 var (
 	legacyCredentialExpiryFallback = time.Hour
 	loadLatestChannelByID          = model.GetChannelByIdWithContext
@@ -709,7 +702,7 @@ func (p *CodexProvider) rotateOnce(ctx context.Context, lead time.Duration, forc
 	if forced {
 		reason = "forced"
 	}
-	release, err := acquireChannelRefreshLock(ctx, p.channelID())
+	release, err := credentials.AcquireChannelRefreshLock(ctx, p.channelID())
 	if err != nil {
 		return false, fmt.Errorf("waiting for channel refresh lock: %w", err)
 	}
@@ -943,11 +936,6 @@ func tokenCacheKeyV2(channelID int, durableRuntimeKey string) string {
 	return fmt.Sprintf("%s:v2:%d:%s", TokenCacheKey, channelID, hex.EncodeToString(digest[:]))
 }
 
-type channelRefreshLock struct {
-	gate chan struct{}
-	refs int
-}
-
 type cachedAccessToken struct {
 	AccessToken string    `json:"access_token"`
 	AccountID   string    `json:"account_id,omitempty"`
@@ -981,68 +969,6 @@ type credentialVersionSnapshot struct {
 	AccessToken  string
 	RefreshToken string
 	ExpiresAt    int64
-}
-
-func acquireChannelRefreshLock(ctx context.Context, channelID int) (func(), error) {
-	if channelID <= 0 {
-		return func() {}, nil
-	}
-	ctx = ensureContext(ctx)
-
-	channelRefreshLocks.mu.Lock()
-	lock := channelRefreshLocks.locks[channelID]
-	if lock == nil {
-		lock = &channelRefreshLock{gate: make(chan struct{}, 1)}
-		lock.gate <- struct{}{}
-		channelRefreshLocks.locks[channelID] = lock
-	}
-	lock.refs++
-	channelRefreshLocks.mu.Unlock()
-
-	cleanupReference := func() {
-		channelRefreshLocks.mu.Lock()
-		defer channelRefreshLocks.mu.Unlock()
-		lock.refs--
-		if lock.refs == 0 && channelRefreshLocks.locks[channelID] == lock {
-			delete(channelRefreshLocks.locks, channelID)
-		}
-	}
-
-	var once sync.Once
-	release := func() {
-		once.Do(func() {
-			lock.gate <- struct{}{}
-			cleanupReference()
-		})
-	}
-
-	// Preserve the fast path even when the operation context has just been
-	// canceled: callers may still discover that a peer already refreshed and use
-	// the cached token without doing context-bound work. Only waiting for a held
-	// lock needs to be cancelable.
-	select {
-	case <-lock.gate:
-		return release, nil
-	default:
-	}
-
-	if err := ctx.Err(); err != nil {
-		cleanupReference()
-		return nil, err
-	}
-
-	select {
-	case <-lock.gate:
-		if err := ctx.Err(); err != nil {
-			lock.gate <- struct{}{}
-			cleanupReference()
-			return nil, err
-		}
-		return release, nil
-	case <-ctx.Done():
-		cleanupReference()
-		return nil, ctx.Err()
-	}
 }
 
 func (p *CodexProvider) channelID() int {

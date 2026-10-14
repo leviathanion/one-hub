@@ -3,7 +3,6 @@ package controller
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -15,6 +14,7 @@ import (
 	"time"
 
 	"one-api/common"
+	"one-api/common/authutil"
 	"one-api/common/cache"
 	"one-api/common/config"
 	"one-api/common/credentials"
@@ -53,17 +53,12 @@ type StartCodexOAuthRequest struct {
 
 // generateCodexCodeVerifier creates a PKCE code verifier.
 func generateCodexCodeVerifier() (string, error) {
-	b := make([]byte, 64)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(b), nil
+	return authutil.GeneratePKCEVerifier()
 }
 
 // generateCodexCodeChallenge creates a PKCE code challenge.
 func generateCodexCodeChallenge(verifier string) string {
-	hash := sha256.Sum256([]byte(verifier))
-	return base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(hash[:])
+	return authutil.PKCEChallenge(verifier)
 }
 
 // StartCodexOAuth starts Codex OAuth flow.
@@ -322,24 +317,7 @@ func parseCodexCallbackURL(input, expectedState string) (string, error) {
 
 	// Case 1: parse full URL.
 	if strings.HasPrefix(trimmedInput, "http://") || strings.HasPrefix(trimmedInput, "https://") {
-		parsedURL, err := url.Parse(trimmedInput)
-		if err != nil {
-			return "", fmt.Errorf("invalid URL format")
-		}
-
-		query, err := url.ParseQuery(parsedURL.RawQuery)
-		if err != nil {
-			return "", fmt.Errorf("invalid callback query")
-		}
-		states := query["state"]
-		if len(states) != 1 || states[0] != expectedState {
-			return "", fmt.Errorf("callback state does not match OAuth session")
-		}
-		codes := query["code"]
-		if len(codes) != 1 || codes[0] == "" {
-			return "", fmt.Errorf("callback URL must contain one authorization code")
-		}
-		return codes[0], nil
+		return authutil.ParseOAuthCallback(trimmedInput, expectedState, "")
 	}
 
 	// Case 2: raw code (may include fragments).

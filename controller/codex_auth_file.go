@@ -14,6 +14,7 @@ import (
 	"one-api/common/config"
 	"one-api/common/utils"
 	"one-api/model"
+	"one-api/providers"
 	"one-api/providers/codex"
 
 	"github.com/gin-gonic/gin"
@@ -86,6 +87,10 @@ func ImportCodexAuthFiles(c *gin.Context) {
 		channel := template
 		channel.Key = credentialsJSON
 		channel.Name = buildImportedCodexChannelName(template.Name, parsed, index, len(parsedFiles))
+		if err := providers.PrepareChannelCredentialInput(&channel); err != nil {
+			common.APIRespondWithError(c, http.StatusOK, err)
+			return
+		}
 		channels = append(channels, channel)
 	}
 

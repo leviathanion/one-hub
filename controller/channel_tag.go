@@ -7,6 +7,7 @@ import (
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/model"
+	"one-api/providers"
 
 	"github.com/gin-gonic/gin"
 )
@@ -121,6 +122,16 @@ func AddChannelToTag(c *gin.Context) {
 		return
 	}
 
+	collection, err := model.GetChannelsTag(tag)
+	if err != nil {
+		common.APIRespondWithError(c, http.StatusOK, err)
+		return
+	}
+	channel.Type = collection.Type
+	if err := providers.PrepareChannelCredentialInput(&channel); err != nil {
+		common.APIRespondWithError(c, http.StatusOK, err)
+		return
+	}
 	addedChannel, err := model.AddChannelToTag(tag, &channel)
 	if err != nil {
 		common.APIRespondWithError(c, http.StatusOK, err)
