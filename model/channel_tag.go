@@ -445,6 +445,9 @@ func addChannelToTagLocked(tag string, channel *Channel) (*Channel, error) {
 	if err != nil {
 		return nil, err
 	}
+	if channel.Type != 0 && channel.Type != channelTag.Type {
+		return nil, ErrChannelVersionConflict
+	}
 
 	key, err := normalizeChannelTagKey(channel.Key, channelTag.Type)
 	if err != nil {

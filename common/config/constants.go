@@ -320,6 +320,7 @@ const (
 	ChannelTypeAzureV1         = 55
 	ChannelTypeXAI             = 56
 	ChannelTypeCodex           = 101
+	ChannelTypeAntigravity     = 102
 )
 
 const (

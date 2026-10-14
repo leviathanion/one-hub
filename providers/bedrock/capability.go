@@ -1,6 +1,7 @@
 package bedrock
 
 import (
+	"encoding/json"
 	"one-api/model"
 	"one-api/providers/base"
 	"one-api/providers/bedrock/category"
@@ -17,4 +18,19 @@ func (BedrockProviderFactory) AssessChatRequest(_ *model.Channel, canonicalModel
 		return base.ChatRequestSupport{}, &base.RequestCapabilityError{Param: "model", Message: "model cannot be represented by the Bedrock adapter"}
 	}
 	return base.ChatRequestSupport{}, claude.ValidateChatRequest(request, "Bedrock Claude")
+}
+
+func (BedrockProviderFactory) SupportsClaude(_ *model.Channel) bool { return true }
+
+func (BedrockProviderFactory) AssessClaudeRequest(_ *model.Channel, canonicalModel string, fields map[string]json.RawMessage) error {
+	providerCategory, err := category.GetCategory(canonicalModel)
+	if err != nil || providerCategory == nil {
+		return &base.RequestCapabilityError{Param: "model", Message: "model cannot be represented by the Bedrock Claude adapter"}
+	}
+	body, err := json.Marshal(fields)
+	if err != nil {
+		return err
+	}
+	var projection claude.ClaudeRequest
+	return json.Unmarshal(body, &projection)
 }

@@ -23,7 +23,6 @@ import (
 	"one-api/model"
 	"one-api/providers"
 	providersBase "one-api/providers/base"
-	"one-api/providers/claude"
 	"one-api/relay/relay_util"
 	runtimesession "one-api/runtime/session"
 	"one-api/types"
@@ -182,12 +181,8 @@ func prepareProviderForChannel(c *gin.Context, modelName string, channel *model.
 	c.Set("channel_id", channel.Id)
 	c.Set("channel_type", channel.Type)
 
-	if strings.HasPrefix(c.Request.URL.Path, "/claude") && channel.Type == config.ChannelTypeCustom {
-		if !channel.CustomClaudeRelayEnabled() {
-			fail = errors.New("selected channel does not enable native Claude Messages")
-			return
-		}
-		provider = claude.CreateClaudeProvider(channel, "")
+	if strings.HasPrefix(c.Request.URL.Path, "/claude") {
+		provider = providers.GetClaudeProvider(channel, c)
 	} else {
 		provider = providers.GetProvider(channel, c)
 	}
@@ -356,18 +351,11 @@ func fetchChannelByModel(c *gin.Context, modelName string) (*model.Channel, erro
 }
 
 func isClaudeRouteEligibleChannel(channel *model.Channel) bool {
-	if channel == nil {
-		return false
-	}
+	return providers.SupportsClaude(channel)
+}
 
-	switch channel.Type {
-	case config.ChannelTypeAnthropic, config.ChannelTypeVertexAI, config.ChannelTypeBedrock:
-		return true
-	case config.ChannelTypeCustom:
-		return channel.CustomClaudeRelayEnabled()
-	default:
-		return false
-	}
+func filterNonGeminiRouteEligibleChannel(_ int, choice *model.ChannelChoice) bool {
+	return choice == nil || choice.Channel == nil || !providers.SupportsGemini(choice.Channel)
 }
 
 func filterNonClaudeRouteEligibleChannel(_ int, choice *model.ChannelChoice) bool {
@@ -1397,10 +1385,4 @@ func relayResponseWithOpenAIErr(c *gin.Context, err *types.OpenAIErrorWithStatus
 	surfaceErr := surface.FromOpenAIError(err)
 	surface.LogLocalError(c, surfaceErr)
 	surface.OpenAIContract().RenderJSONError(c, surfaceErr)
-}
-
-// mergeCustomParamsForPreMapping applies custom parameter logic similar to OpenAI provider
-// 专门用于 pre-mapping 阶段，跳过 pre_add 检查
-func mergeCustomParamsForPreMapping(requestMap map[string]interface{}, customParams map[string]interface{}, modelName string) map[string]interface{} {
-	return providersBase.ApplyCustomParams(requestMap, customParams, modelName, true)
 }

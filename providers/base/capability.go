@@ -35,7 +35,26 @@ const (
 
 type OperationSupport struct {
 	Operations map[Operation]DataPath
+	// ResponsesCreateTarget 由共享 resolver 根据操作声明与 CompatibleResponse 派生。
+	ResponsesCreateTarget ResponsesCreateTarget
 }
+
+type ResponsesCreateTarget string
+
+const (
+	ResponsesCreateTargetProvider    ResponsesCreateTarget = "provider"
+	ResponsesCreateTargetChatAdapter ResponsesCreateTarget = "chat_adapter"
+)
+
+// RequestProtocol 只标识客户端协议；代理扩展的识别规则由所属 provider 提供。
+type RequestProtocol string
+
+const (
+	RequestProtocolChat      RequestProtocol = "chat"
+	RequestProtocolClaude    RequestProtocol = "claude"
+	RequestProtocolGemini    RequestProtocol = "gemini"
+	RequestProtocolResponses RequestProtocol = "responses"
+)
 
 // RequestCapabilityError describes a provider adapter's inability to
 // represent one request field. Routing consumes it before provider work.

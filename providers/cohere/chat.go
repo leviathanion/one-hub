@@ -217,8 +217,16 @@ func (h *CohereStreamHandler) convertToOpenaiStream(cohereResponse *ChatStreamRe
 		}
 
 		if delta.Message.ToolCalls != nil {
-			delta.Message.ToolCalls.Index = cohereResponse.Index
-			choice.Delta.ToolCalls = []*types.ChatCompletionToolCalls{delta.Message.ToolCalls}
+			call := delta.Message.ToolCalls
+			// index 来自事件外层，目标对象不能沿用源对象中 index 缺省的快照。
+			choice.Delta.ToolCalls = []*types.ChatCompletionToolCalls{{
+				Id:          call.Id,
+				Type:        call.Type,
+				Function:    call.Function,
+				Custom:      call.Custom,
+				Index:       cohereResponse.Index,
+				ExtraFields: call.ExtraFields,
+			}}
 		}
 
 	}

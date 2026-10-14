@@ -249,7 +249,7 @@ func TestProviderRedactionRealDeepseekResponsesCrossProtocolCredential(t *testin
 	p.SetContext(c)
 	p.SetUsage(&types.Usage{})
 	store := false
-	r := &relayResponses{relayBase: relayBase{c: c, provider: p, modelName: "deepseek-chat"}, selectedDataPath: path, responsesRequest: types.OpenAIResponsesRequest{Model: "deepseek-chat", Stream: true, Store: &store}, preparedChatRequest: &types.ChatCompletionRequest{Model: "deepseek-chat", Stream: true, Messages: []types.ChatCompletionMessage{{Role: "user", Content: "hi"}}}}
+	r := &relayResponses{relayBase: relayBase{c: c, provider: p, modelName: "deepseek-chat"}, selectedDataPath: path, selectedCreateTarget: providers.ResolveAdapterSupport(channel).ResponsesCreateTarget, responsesRequest: types.OpenAIResponsesRequest{Model: "deepseek-chat", Stream: true, Store: &store}, preparedChatRequest: &types.ChatCompletionRequest{Model: "deepseek-chat", Stream: true, Messages: []types.ChatCompletionMessage{{Role: "user", Content: "hi"}}}}
 	apiErr, _ := r.send()
 	if apiErr != nil {
 		t.Fatal(apiErr)
@@ -299,10 +299,10 @@ type redactionGeminiStreamProvider struct {
 }
 
 func (p *redactionGeminiStreamProvider) GetRequestHeaders() map[string]string { return nil }
-func (p *redactionGeminiStreamProvider) CreateGeminiChat(*gemini.GeminiChatRequest) (*gemini.GeminiChatResponse, *types.OpenAIErrorWithStatusCode) {
+func (p *redactionGeminiStreamProvider) CreateGeminiChat(*gemini.NativeRequest) (*gemini.GeminiChatResponse, *types.OpenAIErrorWithStatusCode) {
 	return nil, nil
 }
-func (p *redactionGeminiStreamProvider) CreateGeminiChatStream(*gemini.GeminiChatRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
+func (p *redactionGeminiStreamProvider) CreateGeminiChatStream(*gemini.NativeRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
 	return p.stream, nil
 }
 func TestProviderRedactionGeminiAmbiguousEventPassesThrough(t *testing.T) {
@@ -315,7 +315,7 @@ func TestProviderRedactionGeminiAmbiguousEventPassesThrough(t *testing.T) {
 		close(stream.dataChan)
 		close(stream.errChan)
 		p := &redactionGeminiStreamProvider{BaseProvider: providersBase.BaseProvider{Channel: &model.Channel{}, Usage: &types.Usage{}}, stream: stream}
-		r := &relayGeminiOnly{relayBase: relayBase{c: c, provider: p}, geminiRequest: &gemini.GeminiChatRequest{Model: "gemini", Stream: true}}
+		r := &relayGeminiOnly{relayBase: relayBase{c: c, provider: p}, geminiRequest: &gemini.NativeRequest{Model: "gemini", Stream: true}}
 		apiErr, _ := r.send()
 		if recorder.Body.String() != "data: "+payload+"\n\n" {
 			t.Fatalf("脱敏干扰 Gemini 原始事件: %q err=%v", recorder.Body.String(), apiErr)

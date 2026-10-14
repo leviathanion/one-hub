@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -8,6 +9,8 @@ import (
 	"one-api/common/config"
 	"one-api/common/requester"
 	"one-api/common/surface"
+	"one-api/model"
+	"one-api/providers"
 	"one-api/providers/gemini"
 	"one-api/safty"
 	"one-api/types"
@@ -16,15 +19,12 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-var AllowGeminiChannelType = []int{config.ChannelTypeGemini, config.ChannelTypeVertexAI}
-
 type relayGeminiOnly struct {
 	relayBase
-	geminiRequest *gemini.GeminiChatRequest
+	geminiRequest *gemini.NativeRequest
 }
 
 func NewRelayGeminiOnly(c *gin.Context) *relayGeminiOnly {
-	c.Set("allow_channel_type", AllowGeminiChannelType)
 	relay := &relayGeminiOnly{
 		relayBase: relayBase{
 			allowHeartbeat: true,
@@ -57,14 +57,42 @@ func (r *relayGeminiOnly) setRequest() error {
 		return fmt.Errorf("Gemini action %q is not supported", modelList[1])
 	}
 
-	r.geminiRequest = &gemini.GeminiChatRequest{}
-	if err := common.UnmarshalBodyReusable(r.c, r.geminiRequest); err != nil {
+	raw, err := common.CacheRequestBody(r.c)
+	if err != nil {
 		return err
 	}
-	r.geminiRequest.Model = modelList[0]
-	r.geminiRequest.Stream = isStream
+	r.geminiRequest, err = gemini.ParseNativeRequest(raw, modelList[0], isStream)
+	if err != nil {
+		return err
+	}
 	r.setOriginalModel(r.geminiRequest.Model)
+	setRequestChannelCapability(r.c, func(channel *model.Channel) error {
+		modelName, err := mappedModelForChannel(channel, modelList[0])
+		if err != nil {
+			return err
+		}
+		_, fields, err := effectiveNativeRequestBody(channel, modelName, raw, false)
+		if err != nil {
+			return err
+		}
+		return providerCapabilityGateError(providers.AssessGeminiRequest(channel, modelName, fields))
+	})
 
+	return nil
+}
+
+func (r *relayGeminiOnly) prepareSelectedProviderRemoteMedia() error {
+	raw, ok := common.GetOriginalRequestBody(r.c)
+	if !ok {
+		raw = r.geminiRequest.Raw
+	}
+	body, _, err := effectiveNativeRequestBody(r.provider.GetChannel(), r.modelName, raw, false)
+	if err != nil {
+		return err
+	}
+	r.geminiRequest.Raw = body
+	r.geminiRequest.Model = r.modelName
+	common.SetReusableRequestBody(r.c, body)
 	return nil
 }
 
@@ -78,25 +106,21 @@ func (r *relayGeminiOnly) IsStream() bool {
 
 func (r *relayGeminiOnly) getPromptTokens() (int, error) {
 	channel := r.provider.GetChannel()
-	return CountGeminiTokenMessages(r.geminiRequest, channel.PreCost)
+	projection, _ := r.geminiRequest.Projection()
+	return CountGeminiTokenMessages(projection, channel.PreCost)
 }
 
 func (r *relayGeminiOnly) send() (err *types.OpenAIErrorWithStatusCode, done bool) {
 	chatProvider, ok := r.provider.(gemini.GeminiChatInterface)
 	if !ok {
-		return nil, false
+		return common.StringErrorWrapperLocal("channel not implemented", "channel_error", http.StatusServiceUnavailable), true
 	}
 
-	// 内容审查
-	for _, message := range r.geminiRequest.Contents {
-		if message.Parts != nil {
-			CheckResult, _ := safty.CheckContent(message.Parts)
-			if !CheckResult.IsSafe {
-				err = common.StringErrorWrapperLocal(CheckResult.Reason, CheckResult.Code, http.StatusBadRequest)
-				done = true
-				return
-			}
-		}
+	// 内容策略从有效 raw 提取解码文本，不能依赖 typed 投影或 JSON 转义表示。
+	var body map[string]json.RawMessage
+	_ = json.Unmarshal(r.geminiRequest.Raw, &body)
+	if result, _ := safty.CheckContent(body["contents"]); !result.IsSafe {
+		return common.StringErrorWrapperLocal(result.Reason, result.Code, http.StatusBadRequest), true
 	}
 
 	r.geminiRequest.Model = r.modelName

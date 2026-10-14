@@ -2,6 +2,7 @@ package types
 
 import (
 	"encoding/json"
+	"one-api/common/jsonobject"
 	"strings"
 )
 
@@ -40,11 +41,17 @@ const (
 type ChatCompletionToolCallsFunction struct {
 	Name      string `json:"name,omitempty"`
 	Arguments string `json:"arguments"`
+
+	ExtraFields    map[string]json.RawMessage `json:"-"`
+	wireProjection *jsonobject.Projection
 }
 
 type ChatCompletionToolCallsCustom struct {
 	Name  string `json:"name,omitempty"`
 	Input string `json:"input"`
+
+	ExtraFields    map[string]json.RawMessage `json:"-"`
+	wireProjection *jsonobject.Projection
 }
 
 func (f *ChatCompletionToolCallsFunction) UnmarshalJSON(data []byte) error {
@@ -54,20 +61,25 @@ func (f *ChatCompletionToolCallsFunction) UnmarshalJSON(data []byte) error {
 		Arguments json.RawMessage `json:"arguments"`
 	}
 
-	alias := chatCompletionToolCallsFunctionAlias(*f)
+	var alias chatCompletionToolCallsFunctionAlias
 	payload := chatCompletionToolCallsFunctionPayload{chatCompletionToolCallsFunctionAlias: &alias}
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return err
 	}
 
-	*f = ChatCompletionToolCallsFunction(alias)
 	if payload.Arguments != nil {
 		arguments, _, err := responsesArgumentsString(payload.Arguments)
 		if err != nil {
 			return err
 		}
-		f.Arguments = arguments
+		alias.Arguments = arguments
 	}
+	projection, extra, err := jsonobject.CaptureProjection(data, alias)
+	if err != nil {
+		return err
+	}
+	*f = ChatCompletionToolCallsFunction(alias)
+	f.wireProjection, f.ExtraFields = projection, extra
 	return nil
 }
 
@@ -77,6 +89,9 @@ type ChatCompletionToolCalls struct {
 	Function *ChatCompletionToolCallsFunction `json:"function,omitempty"`
 	Custom   *ChatCompletionToolCallsCustom   `json:"custom,omitempty"`
 	Index    int                              `json:"index"`
+
+	ExtraFields    map[string]json.RawMessage `json:"-"`
+	wireProjection *jsonobject.Projection
 }
 
 type ChatCompletionMessage struct {
@@ -94,6 +109,9 @@ type ChatCompletionMessage struct {
 	Image            []MultimediaData                 `json:"image,omitempty"`
 	Images           []ChatMessagePart                `json:"images,omitempty"`
 	CacheControl     any                              `json:"cache_control,omitempty"`
+
+	ExtraFields    map[string]json.RawMessage `json:"-"`
+	wireProjection *jsonobject.Projection
 }
 
 func (m ChatCompletionMessage) StringContent() string {
@@ -161,10 +179,8 @@ func (m *ChatCompletionMessage) ToolToFuncCalls() {
 		return
 	}
 	if len(m.ToolCalls) > 0 && m.ToolCalls[0] != nil && m.ToolCalls[0].Function != nil {
-		m.FunctionCall = &ChatCompletionToolCallsFunction{
-			Name:      m.ToolCalls[0].Function.Name,
-			Arguments: m.ToolCalls[0].Function.Arguments,
-		}
+		function := *m.ToolCalls[0].Function
+		m.FunctionCall = &function
 		m.ToolCalls = nil
 	}
 }
@@ -176,6 +192,9 @@ func (m *ChatCompletionMessage) IsSystemRole() bool {
 type ChatMessageImageURL struct {
 	URL    string `json:"url,omitempty"`
 	Detail string `json:"detail,omitempty"`
+
+	ExtraFields    map[string]json.RawMessage `json:"-"`
+	wireProjection *jsonobject.Projection
 }
 
 type ChatMessagePart struct {
@@ -186,6 +205,9 @@ type ChatMessagePart struct {
 	Refusal    string               `json:"refusal,omitempty"`
 
 	File *ChatMessageFile `json:"file,omitempty"`
+
+	ExtraFields    map[string]json.RawMessage `json:"-"`
+	wireProjection *jsonobject.Projection
 }
 
 type InputAudio struct {
@@ -396,12 +418,18 @@ type ChatCompletionFunction struct {
 	Description string `json:"description"`
 	Parameters  any    `json:"parameters"`
 	Strict      *bool  `json:"strict,omitempty"`
+
+	ExtraFields    map[string]json.RawMessage `json:"-"`
+	wireProjection *jsonobject.Projection
 }
 
 type ChatCompletionTool struct {
 	Type          string                 `json:"type"`
 	Function      ChatCompletionFunction `json:"function,omitzero"`
 	ResponsesTool ResponsesTools         `json:"-"`
+
+	ExtraFields    map[string]json.RawMessage `json:"-"`
+	wireProjection *jsonobject.Projection
 }
 
 func (t *ChatCompletionTool) UnmarshalJSON(data []byte) error {
@@ -415,8 +443,7 @@ func (t *ChatCompletionTool) UnmarshalJSON(data []byte) error {
 		return err
 	}
 
-	t.Type = payload.Type
-	t.Function = payload.Function
+	decoded := ChatCompletionTool{Type: payload.Type, Function: payload.Function}
 
 	var rawFields map[string]json.RawMessage
 	if err := json.Unmarshal(data, &rawFields); err != nil {
@@ -424,7 +451,13 @@ func (t *ChatCompletionTool) UnmarshalJSON(data []byte) error {
 	}
 
 	if _, hasFunction := rawFields["function"]; hasFunction {
-		t.ResponsesTool = ResponsesTools{Type: payload.Type}
+		decoded.ResponsesTool = ResponsesTools{Type: payload.Type}
+		projection, extra, err := jsonobject.CaptureProjection(data, payload)
+		if err != nil {
+			return err
+		}
+		decoded.wireProjection, decoded.ExtraFields = projection, extra
+		*t = decoded
 		return nil
 	}
 
@@ -436,7 +469,8 @@ func (t *ChatCompletionTool) UnmarshalJSON(data []byte) error {
 		responsesTool.Type = payload.Type
 	}
 
-	t.ResponsesTool = responsesTool
+	decoded.ResponsesTool = responsesTool
+	*t = decoded
 	return nil
 }
 
@@ -447,10 +481,10 @@ func (t ChatCompletionTool) MarshalJSON() ([]byte, error) {
 			Function ChatCompletionFunction `json:"function"`
 		}
 
-		return json.Marshal(chatCompletionToolPayload{
+		return jsonobject.MarshalProjection(chatCompletionToolPayload{
 			Type:     t.Type,
 			Function: t.Function,
-		})
+		}, t.ExtraFields, t.wireProjection)
 	}
 
 	responsesTool := t.ResponsesTool
@@ -458,7 +492,20 @@ func (t ChatCompletionTool) MarshalJSON() ([]byte, error) {
 		responsesTool.Type = t.Type
 	}
 
-	return json.Marshal(responsesTool)
+	encoded, err := json.Marshal(responsesTool)
+	if err != nil || len(t.ExtraFields) == 0 {
+		return encoded, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		return nil, err
+	}
+	for key, raw := range t.ExtraFields {
+		if _, known := responsesToolsJSONFields[key]; !known {
+			fields[key] = raw
+		}
+	}
+	return json.Marshal(fields)
 }
 
 type ChatCompletionChoice struct {
@@ -682,6 +729,9 @@ type ChatCompletionStreamChoiceDelta struct {
 	Reasoning        string                           `json:"reasoning,omitempty"`
 	Image            []MultimediaData                 `json:"image,omitempty"`
 	Images           []ChatMessagePart                `json:"images,omitempty"`
+
+	ExtraFields    map[string]json.RawMessage `json:"-"`
+	wireProjection *jsonobject.Projection
 }
 
 func (m *ChatCompletionStreamChoiceDelta) ToolToFuncCalls() {
@@ -689,10 +739,8 @@ func (m *ChatCompletionStreamChoiceDelta) ToolToFuncCalls() {
 		return
 	}
 	if len(m.ToolCalls) > 0 && m.ToolCalls[0] != nil && m.ToolCalls[0].Function != nil {
-		m.FunctionCall = &ChatCompletionToolCallsFunction{
-			Name:      m.ToolCalls[0].Function.Name,
-			Arguments: m.ToolCalls[0].Function.Arguments,
-		}
+		function := *m.ToolCalls[0].Function
+		m.FunctionCall = &function
 		m.ToolCalls = nil
 	}
 }

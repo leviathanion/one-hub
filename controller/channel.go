@@ -4,10 +4,10 @@ import (
 	"errors"
 	"net/http"
 	"one-api/common"
-	"one-api/common/config"
 	"one-api/common/providerendpoint"
 	"one-api/common/utils"
 	"one-api/model"
+	"one-api/providers"
 	"strconv"
 	"strings"
 
@@ -84,6 +84,18 @@ func AddChannel(c *gin.Context) {
 	}
 	channel.CreatedTime = utils.GetTimestamp()
 	channels := buildChannelsForCreate(channel)
+	if len(channels) == 0 {
+		if err := providers.PrepareChannelCredentialInput(&channel); err != nil {
+			common.APIRespondWithError(c, http.StatusOK, err)
+			return
+		}
+	}
+	for i := range channels {
+		if err := providers.PrepareChannelCredentialInput(&channels[i]); err != nil {
+			common.APIRespondWithError(c, http.StatusOK, err)
+			return
+		}
+	}
 	err = model.BatchInsertChannels(channels)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
@@ -126,10 +138,7 @@ func buildChannelsForCreate(channel model.Channel) []model.Channel {
 }
 
 func splitChannelKeysForCreate(channel model.Channel) []string {
-	if channel.Type == config.ChannelTypeCodex {
-		return []string{channel.Key}
-	}
-	return strings.Split(channel.Key, "\n")
+	return providers.ChannelCredentialInputs(&channel)
 }
 
 func splitBaseURLsForCreate(channel model.Channel) []string {
@@ -194,6 +203,10 @@ func UpdateChannel(c *gin.Context) {
 		common.APIRespondWithError(c, http.StatusOK, err)
 		return
 	}
+	if err := prepareEditedChannelCredential(c, &request); err != nil {
+		common.APIRespondWithError(c, http.StatusOK, err)
+		return
+	}
 	err := request.Update()
 	if err != nil {
 		status := http.StatusOK
@@ -211,6 +224,34 @@ func UpdateChannel(c *gin.Context) {
 		"message": "",
 		"data":    request.Channel,
 	})
+}
+
+func prepareEditedChannelCredential(c *gin.Context, request *model.ChannelEditRequest) error {
+	_, keySubmitted := request.SubmittedFields["key"]
+	_, typeSubmitted := request.SubmittedFields["type"]
+	if !keySubmitted && !typeSubmitted {
+		return nil
+	}
+	persisted, err := model.GetChannelByIdWithContext(c.Request.Context(), request.Id)
+	if err != nil {
+		return err
+	}
+	if !keySubmitted && (!typeSubmitted || request.Type == persisted.Type) {
+		return nil
+	}
+	if typeSubmitted {
+		persisted.Type = request.Type
+	}
+	if keySubmitted {
+		persisted.Key = request.Key
+	}
+	if err := providers.PrepareChannelCredentialInput(persisted); err != nil {
+		return err
+	}
+	if keySubmitted {
+		request.Key = persisted.Key
+	}
+	return nil
 }
 
 func BatchUpdateChannelsAzureApi(c *gin.Context) {

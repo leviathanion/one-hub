@@ -2,6 +2,7 @@ package claude
 
 import (
 	"encoding/json"
+	"one-api/common/jsonobject"
 	"one-api/types"
 )
 
@@ -75,6 +76,9 @@ type ResContent struct {
 	IsError    *bool  `json:"is_error,omitempty"`
 	FileId     string `json:"file_id,omitempty"`
 	Data       string `json:"data,omitempty"`
+
+	ExtraFields    map[string]json.RawMessage `json:"-"`
+	wireProjection *jsonobject.Projection
 }
 
 func (g *ResContent) ToOpenAITool() *types.ChatCompletionToolCalls {
@@ -96,6 +100,9 @@ type ContentSource struct {
 	MediaType string `json:"media_type,omitempty"`
 	Data      string `json:"data,omitempty"`
 	Url       string `json:"url,omitempty"`
+
+	ExtraFields    map[string]json.RawMessage `json:"-"`
+	wireProjection *jsonobject.Projection
 }
 
 type MessageContent struct {
@@ -109,6 +116,9 @@ type MessageContent struct {
 	IsError      *bool          `json:"is_error,omitempty"`
 	ToolUseId    string         `json:"tool_use_id,omitempty"`
 	CacheControl any            `json:"cache_control,omitempty"`
+
+	ExtraFields    map[string]json.RawMessage `json:"-"`
+	wireProjection *jsonobject.Projection
 }
 
 type Message struct {
@@ -310,6 +320,9 @@ type Delta struct {
 	Thinking     string `json:"thinking,omitempty"`
 	Signature    string `json:"signature,omitempty"`
 	Citations    any    `json:"citations,omitempty"`
+
+	ExtraFields    map[string]json.RawMessage `json:"-"`
+	wireProjection *jsonobject.Projection
 }
 
 type ClaudeStreamResponse struct {
@@ -328,6 +341,9 @@ type ContentBlock struct {
 	Name  string `json:"name,omitempty"`
 	Input any    `json:"input,omitempty"`
 	Text  string `json:"text,omitempty"`
+
+	ExtraFields    map[string]json.RawMessage `json:"-"`
+	wireProjection *jsonobject.Projection
 }
 
 type ModelListResponse struct {

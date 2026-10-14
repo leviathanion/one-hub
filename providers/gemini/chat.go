@@ -40,7 +40,7 @@ func (p *GeminiProvider) CreateChatCompletion(request *types.ChatCompletionReque
 		return nil, errWithCode
 	}
 
-	req, errWithCode := p.getChatRequest(geminiRequest, false)
+	req, errWithCode := p.getChatRequest(geminiRequest)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -69,7 +69,7 @@ func (p *GeminiProvider) CreateChatCompletionStream(request *types.ChatCompletio
 		return nil, errWithCode
 	}
 
-	req, errWithCode := p.getChatRequest(geminiRequest, false)
+	req, errWithCode := p.getChatRequest(geminiRequest)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -94,38 +94,25 @@ func (p *GeminiProvider) CreateChatCompletionStream(request *types.ChatCompletio
 	return requester.RequestStream(streamRequester, resp, chatHandler.HandlerStream)
 }
 
-func (p *GeminiProvider) getChatRequest(geminiRequest *GeminiChatRequest, isRelay bool) (*http.Request, *types.OpenAIErrorWithStatusCode) {
-	url := "generateContent"
-	if geminiRequest.Stream {
-		url = "streamGenerateContent?alt=sse"
-	}
-	// 获取请求地址
-	fullRequestURL := p.GetFullRequestURL(url, geminiRequest.Model)
+func (p *GeminiProvider) getChatRequest(request *GeminiChatRequest) (*http.Request, *types.OpenAIErrorWithStatusCode) {
+	p.pluginHandle(request)
+	return p.newChatHTTPRequest(request.Model, request.Stream, request)
+}
 
-	// 获取请求头
+func (p *GeminiProvider) newChatHTTPRequest(modelName string, stream bool, body any) (*http.Request, *types.OpenAIErrorWithStatusCode) {
+	action := "generateContent"
+	if stream {
+		action = "streamGenerateContent?alt=sse"
+	}
+	fullRequestURL := p.GetFullRequestURL(action, modelName)
 	headers := p.GetRequestHeaders()
-	if geminiRequest.Stream {
+	if stream {
 		headers["Accept"] = "text/event-stream"
 	}
-
-	var body any
-	if isRelay {
-		var exists bool
-		body, exists = p.GetRawBody()
-		if !exists {
-			return nil, common.StringErrorWrapperLocal("request body not found", "request_body_not_found", http.StatusInternalServerError)
-		}
-	} else {
-		p.pluginHandle(geminiRequest)
-		body = geminiRequest
-	}
-
-	// 创建请求
 	req, err := p.Requester.NewRequest(http.MethodPost, fullRequestURL, p.Requester.WithBody(body), p.Requester.WithHeader(headers))
 	if err != nil {
 		return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
 	}
-
 	return req, nil
 }
 
@@ -537,7 +524,7 @@ func ConvertOpenAIUsage(geminiUsage *GeminiUsageMetadata, actualModel string) ty
 	}
 	candidatesTokenCountPresent := geminiUsage.candidatesTokenCountPresent
 	if !candidatesTokenCountPresent {
-		candidatesTokenCountPresent = geminiUsageCanProveZeroCandidates(geminiUsage)
+		candidatesTokenCountPresent = geminiUsage.CanProveZeroCandidates()
 	}
 	if !geminiUsage.promptTokenCountPresent || !candidatesTokenCountPresent || !geminiUsage.totalTokenCountPresent {
 		return usage
@@ -602,10 +589,9 @@ func geminiUsageTokenCountsNonNegative(geminiUsage *GeminiUsageMetadata) bool {
 	return true
 }
 
-func geminiUsageCanProveZeroCandidates(geminiUsage *GeminiUsageMetadata) bool {
-	// ProtoJSON may omit a scalar zero. Treat an omitted candidates count as
-	// zero only when every other count that can contribute to total is known
-	// and leaves no candidate remainder; this is not a total-based estimate.
+// CanProveZeroCandidates 判断已报告用量能否证明 ProtoJSON 省略的候选数为零，
+// 供计费证据提取和客户端协议转换共用；不从总数估算未知候选用量。
+func (geminiUsage *GeminiUsageMetadata) CanProveZeroCandidates() bool {
 	if geminiUsage == nil || geminiUsage.candidatesTokenCountPresent || !geminiUsage.promptTokenCountPresent || !geminiUsage.totalTokenCountPresent || !geminiUsageTokenCountsNonNegative(geminiUsage) {
 		return false
 	}
@@ -637,7 +623,7 @@ func geminiUsageTokenTotalsMatch(geminiUsage *GeminiUsageMetadata) bool {
 	}
 	candidatesTokenCountPresent := geminiUsage.candidatesTokenCountPresent
 	if !candidatesTokenCountPresent {
-		candidatesTokenCountPresent = geminiUsageCanProveZeroCandidates(geminiUsage)
+		candidatesTokenCountPresent = geminiUsage.CanProveZeroCandidates()
 	}
 	if !candidatesTokenCountPresent || geminiUsageToolDetailsConflict(geminiUsage) || !geminiUsageKnownTokenDimensionsConsistent(geminiUsage) {
 		return false

@@ -6,6 +6,7 @@ import (
 	"one-api/common/config"
 	"one-api/model"
 	"one-api/providers/ali"
+	"one-api/providers/antigravity"
 	"one-api/providers/azure"
 	azurespeech "one-api/providers/azureSpeech"
 	"one-api/providers/azure_v1"
@@ -130,6 +131,7 @@ func init() {
 		config.ChannelTypeMidjourney:      midjourney.MidjourneyProviderFactory{},
 		config.ChannelTypeCloudflareAI:    cloudflareAI.CloudflareAIProviderFactory{},
 		config.ChannelTypeCodex:           codex.CodexProviderFactory{},
+		config.ChannelTypeAntigravity:     antigravity.AntigravityProviderFactory{},
 		config.ChannelTypeCohere:          cohere.CohereProviderFactory{},
 		config.ChannelTypeStabilityAI:     stabilityAI.StabilityAIProviderFactory{},
 		config.ChannelTypeCoze:            coze.CozeProviderFactory{},
@@ -195,6 +197,22 @@ func nativeClaudeProviderFactoryForChannel(channel *model.Channel) ProviderFacto
 		return claude.ClaudeProviderFactory{}
 	}
 	return providerFactoryForChannel(channel)
+}
+
+// GetClaudeProvider 使用与资格评估相同的 factory 解析结果。
+func GetClaudeProvider(channel *model.Channel, c *gin.Context) base.ProviderInterface {
+	if !SupportsClaude(channel) {
+		return nil
+	}
+	factory := nativeClaudeProviderFactoryForChannel(channel)
+	if factory == nil {
+		return nil
+	}
+	provider := factory.Create(channel)
+	if provider != nil {
+		provider.SetContext(c)
+	}
+	return provider
 }
 
 // AssessChatRemoteMedia asks the concrete provider adapter how it represents

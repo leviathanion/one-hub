@@ -900,9 +900,10 @@ func TestRelayResponsesCompatibleStreamRecordsPreviousResponseIDAffinity(t *test
 			provider:  provider,
 			modelName: "gpt-5",
 		},
-		responsesRequest: request,
-		operation:        responsesOperationCreate,
-		selectedDataPath: providersBase.DataPathCrossProtocol,
+		responsesRequest:     request,
+		operation:            responsesOperationCreate,
+		selectedDataPath:     providersBase.DataPathCrossProtocol,
+		selectedCreateTarget: providersBase.ResponsesCreateTargetChatAdapter,
 	}
 	prepared, err := request.ToChatCompletionRequest()
 	if err != nil {
@@ -1713,9 +1714,10 @@ func TestRelayResponsesCompatibleFallbackRejectsStatefulResponses(t *testing.T) 
 					provider:  provider,
 					modelName: "gpt-5",
 				},
-				responsesRequest: tc.request,
-				operation:        responsesOperationCreate,
-				selectedDataPath: providersBase.DataPathCrossProtocol,
+				responsesRequest:     tc.request,
+				operation:            responsesOperationCreate,
+				selectedDataPath:     providersBase.DataPathCrossProtocol,
+				selectedCreateTarget: providersBase.ResponsesCreateTargetChatAdapter,
 			}
 
 			errWithCode, done := relay.sendCurrentProvider()

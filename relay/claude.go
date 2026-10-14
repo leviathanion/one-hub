@@ -5,15 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"one-api/common"
 	"one-api/common/config"
+	"one-api/common/jsonobject"
 	"one-api/common/requester"
 	"one-api/common/surface"
 	"one-api/model"
 	"one-api/providers"
-	providersBase "one-api/providers/base"
 	"one-api/providers/claude"
 	"one-api/safty"
 	"one-api/types"
@@ -22,8 +21,6 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-var AllowChannelType = []int{config.ChannelTypeAnthropic, config.ChannelTypeVertexAI, config.ChannelTypeBedrock, config.ChannelTypeCustom}
-
 type relayClaudeOnly struct {
 	relayBase
 	claudeRequest         *claude.ClaudeRequest
@@ -31,7 +28,6 @@ type relayClaudeOnly struct {
 }
 
 func NewRelayClaudeOnly(c *gin.Context) *relayClaudeOnly {
-	c.Set("allow_channel_type", AllowChannelType)
 	relay := &relayClaudeOnly{
 		relayBase: relayBase{
 			allowHeartbeat: true,
@@ -44,24 +40,55 @@ func NewRelayClaudeOnly(c *gin.Context) *relayClaudeOnly {
 }
 
 func (r *relayClaudeOnly) setRequest() error {
-	r.claudeRequest = &claude.ClaudeRequest{}
-	if err := common.UnmarshalBodyReusable(r.c, r.claudeRequest); err != nil {
+	raw, err := common.CacheRequestBody(r.c)
+	if err != nil {
+		return err
+	}
+	r.claudeRequest, err = projectNativeClaudeRequest(raw)
+	if err != nil {
 		return err
 	}
 	r.setOriginalModel(r.claudeRequest.Model)
-	setRequestChannelCapability(r.c, requireNativeClaudeRemoteMedia(r.claudeRequest.Model, r.claudeRequest))
+	setRequestChannelCapability(r.c, requireNativeClaudeRequestCompatibility(r.claudeRequest.Model, raw))
 	return nil
 }
 
-func requireNativeClaudeRemoteMedia(modelName string, request *claude.ClaudeRequest) requestChannelCapability {
+func projectNativeClaudeRequest(raw []byte) (*claude.ClaudeRequest, error) {
+	object, err := jsonobject.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	projection := &claude.ClaudeRequest{}
+	_ = json.Unmarshal(raw, projection)
+	if err := json.Unmarshal(object.Fields["model"], &projection.Model); err != nil {
+		return nil, fmt.Errorf("model must be a string")
+	}
+	if stream, ok := object.Fields["stream"]; ok {
+		if err := json.Unmarshal(stream, &projection.Stream); err != nil {
+			return nil, fmt.Errorf("stream must be a boolean")
+		}
+	}
+	return projection, nil
+}
+
+func requireNativeClaudeRequestCompatibility(modelName string, raw []byte) requestChannelCapability {
 	return func(channel *model.Channel) error {
 		canonicalModel, err := mappedModelForChannel(channel, modelName)
 		if err != nil {
 			return &capabilityGateError{message: "channel has invalid model mapping configuration", status: http.StatusServiceUnavailable}
 		}
-		effective := *request
-		effective.Model = canonicalModel
-		_, _, err = providers.AssessNativeClaudeRemoteMedia(channel, &effective)
+		body, fields, err := effectiveNativeRequestBody(channel, canonicalModel, raw, true)
+		if err != nil {
+			return err
+		}
+		if err := providers.AssessClaudeRequest(channel, canonicalModel, fields); err != nil {
+			return providerCapabilityGateError(err)
+		}
+		projection, err := projectNativeClaudeRequest(body)
+		if err != nil {
+			return err
+		}
+		_, _, err = providers.AssessNativeClaudeRemoteMedia(channel, projection)
 		return remoteMediaCapabilityGateError(err)
 	}
 }
@@ -95,90 +122,31 @@ func (r *relayClaudeOnly) materializeNativeClaudePreAdd() error {
 	if r == nil || r.c == nil || r.provider == nil {
 		return nil
 	}
-	customParams, err := r.provider.CustomParameterHandler()
-	if err != nil {
-		return fmt.Errorf("channel custom parameters are invalid: %w", err)
-	}
-	rawBody, ok := common.GetOriginalRequestBody(r.c)
+	raw, ok := common.GetOriginalRequestBody(r.c)
 	if !ok {
-		rawBody, err = common.CacheRequestBody(r.c)
+		var err error
+		raw, err = common.CacheRequestBody(r.c)
 		if err != nil {
 			return fmt.Errorf("read native Claude request body: %w", err)
 		}
 	}
-	preAdd, _ := customParams["pre_add"].(bool)
-	if !preAdd {
-		currentBody, currentOK := common.GetCanonicalRequestBody(r.c)
-		if currentOK && bytes.Equal(currentBody, rawBody) {
-			return nil
-		}
-		return r.restoreNativeClaudeRaw(rawBody)
-	}
-
-	originalMap, err := decodeNativeClaudeBodyMap(rawBody)
-	if err != nil {
-		return err
-	}
-	requestMap, err := decodeNativeClaudeBodyMap(rawBody)
-	if err != nil {
-		return err
-	}
-
 	modelName := r.modelName
 	if modelName == "" {
 		modelName = r.claudeRequest.Model
 	}
-	requestMap = providersBase.ApplyCustomParams(requestMap, customParams, modelName, true)
-	if nativeClaudeJSONMapsEqual(originalMap, requestMap) {
-		currentBody, currentOK := common.GetCanonicalRequestBody(r.c)
-		if currentOK && bytes.Equal(currentBody, rawBody) {
-			return nil
-		}
-		return r.restoreNativeClaudeRaw(rawBody)
-	}
-	materializedBody, err := json.Marshal(requestMap)
+	effective, _, err := effectiveNativeRequestBody(r.provider.GetChannel(), modelName, raw, false)
 	if err != nil {
-		return fmt.Errorf("marshal native Claude pre_add request: %w", err)
+		return err
 	}
-	updatedRequest := &claude.ClaudeRequest{}
-	if err := json.Unmarshal(materializedBody, updatedRequest); err != nil {
-		return fmt.Errorf("decode native Claude pre_add request: %w", err)
+	if current, ok := common.GetCanonicalRequestBody(r.c); ok && bytes.Equal(current, effective) {
+		return nil
 	}
-
-	common.SetReusableRequestBodyMap(r.c, materializedBody, requestMap)
-	r.claudeRequest = updatedRequest
-	r.preparedClaudeRequest = nil
-	return nil
-}
-
-func decodeNativeClaudeBodyMap(rawBody []byte) (map[string]interface{}, error) {
-	requestMap := make(map[string]interface{})
-	decoder := json.NewDecoder(bytes.NewReader(rawBody))
-	decoder.UseNumber()
-	if err := decoder.Decode(&requestMap); err != nil {
-		return nil, fmt.Errorf("decode native Claude request body: %w", err)
-	}
-	var extraValue interface{}
-	if err := decoder.Decode(&extraValue); err != io.EOF {
-		if err == nil {
-			return nil, errors.New("native Claude request body contains multiple JSON values")
-		}
-		return nil, fmt.Errorf("decode native Claude request body: %w", err)
-	}
-	return requestMap, nil
-}
-
-// nativeClaudeJSONMapsEqual compares the post-transform JSON without changing
-// the original map's json.Number values.
-func nativeClaudeJSONMapsEqual(left, right map[string]interface{}) bool {
-	leftJSON, leftErr := json.Marshal(left)
-	rightJSON, rightErr := json.Marshal(right)
-	return leftErr == nil && rightErr == nil && bytes.Equal(leftJSON, rightJSON)
+	return r.restoreNativeClaudeRaw(effective)
 }
 
 func (r *relayClaudeOnly) restoreNativeClaudeRaw(rawBody []byte) error {
-	updatedRequest := &claude.ClaudeRequest{}
-	if err := json.Unmarshal(rawBody, updatedRequest); err != nil {
+	updatedRequest, err := projectNativeClaudeRequest(rawBody)
+	if err != nil {
 		return fmt.Errorf("decode native Claude request body: %w", err)
 	}
 	common.SetReusableRequestBody(r.c, rawBody)
@@ -223,16 +191,16 @@ func (r *relayClaudeOnly) send() (err *types.OpenAIErrorWithStatusCode, done boo
 		return common.StringErrorWrapperLocal("Claude request was not finalized", "provider_request_not_finalized", http.StatusInternalServerError), true
 	}
 	request.Model = r.modelName
-	// 内容审查
-	for _, message := range request.Messages {
-		if message.Content != nil {
-			CheckResult, _ := safty.CheckContent(message.Content)
-			if !CheckResult.IsSafe {
-				err = common.StringErrorWrapperLocal(CheckResult.Reason, CheckResult.Code, http.StatusBadRequest)
-				done = true
-				return
-			}
+	// 内容策略从有效 raw 提取解码文本，不能依赖 typed 投影或 JSON 转义表示。
+	var content any = request.Messages
+	if raw, ok := common.GetCanonicalRequestBody(r.c); ok {
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(raw, &fields) == nil {
+			content = fields["messages"]
 		}
+	}
+	if result, _ := safty.CheckContent(content); !result.IsSafe {
+		return common.StringErrorWrapperLocal(result.Reason, result.Code, http.StatusBadRequest), true
 	}
 
 	if request.Stream {

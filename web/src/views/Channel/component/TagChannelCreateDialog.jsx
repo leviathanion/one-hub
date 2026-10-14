@@ -7,7 +7,10 @@ import { showError, showSuccess } from 'utils/common';
 import { Button, Dialog, DialogActions, DialogContent, DialogTitle, TextField } from '@mui/material';
 
 import CodexAuthControls from './CodexAuthControls';
+import AntigravityAuthControls from './AntigravityAuthControls';
 import { isCodexChannel } from './codexUsage';
+import { typeConfig } from '../type/Config';
+import { versionAfterOAuthAuthorization } from './editVersion.mjs';
 
 export default function TagChannelCreateDialog({ open, tag, representative, onClose, onCreated }) {
   const { t } = useTranslation();
@@ -15,6 +18,7 @@ export default function TagChannelCreateDialog({ open, tag, representative, onCl
   const [key, setKey] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const isCodex = isCodexChannel(representative);
+  const jsonCredential = typeConfig[representative?.type]?.keyFormat === 'json';
 
   useEffect(() => {
     if (open) {
@@ -78,8 +82,8 @@ export default function TagChannelCreateDialog({ open, tag, representative, onCl
           type="text"
           fullWidth
           multiline
-          minRows={isCodex ? 5 : 3}
-          maxRows={isCodex ? 12 : undefined}
+          minRows={jsonCredential ? 5 : 3}
+          maxRows={jsonCredential ? 12 : undefined}
           variant="outlined"
           value={key}
           onChange={(e) => setKey(e.target.value)}
@@ -93,6 +97,16 @@ export default function TagChannelCreateDialog({ open, tag, representative, onCl
               if (!name.trim()) {
                 setName(suggestedName);
               }
+            }}
+          />
+        )}
+        {Number(representative?.type) === 102 && (
+          <AntigravityAuthControls
+            key={`${tag}:${open}`}
+            proxy={representative?.proxy || ''}
+            onAuthorized={(result, session) => {
+              versionAfterOAuthAuthorization(null, session, result);
+              setKey(result.key);
             }}
           />
         )}

@@ -234,14 +234,18 @@ func TestNativeClaudeRemoteMediaCapabilityUsesMappedProviderModel(t *testing.T) 
 			map[string]any{"type": "image", "source": map[string]any{"type": "url", "url": "https://example.com/a.png"}},
 		}}},
 	}
+	raw, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
 	toClaude := `{"public-claude":"claude-sonnet-4-20250514"}`
 	channel := &model.Channel{Type: config.ChannelTypeBedrock, ModelMapping: &toClaude}
-	if err := requireNativeClaudeRemoteMedia(request.Model, request)(channel); err != nil {
+	if err := requireNativeClaudeRequestCompatibility(request.Model, raw)(channel); err != nil {
 		t.Fatalf("mapped Bedrock Claude model should accept native image materialization: %v", err)
 	}
 	toUnsupported := `{"public-claude":"amazon.nova-pro-v1:0"}`
 	channel.ModelMapping = &toUnsupported
-	assertCapabilityGateError(t, requireNativeClaudeRemoteMedia(request.Model, request)(channel), "messages")
+	assertCapabilityGateError(t, requireNativeClaudeRequestCompatibility(request.Model, raw)(channel), "model")
 }
 
 func TestResponsesCrossProtocolCapabilityComposesSelectedAdapterLimits(t *testing.T) {

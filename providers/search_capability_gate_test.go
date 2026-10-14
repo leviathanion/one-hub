@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"one-api/common"
 	"one-api/common/cache"
 	"one-api/common/config"
 	"one-api/common/requester"
@@ -115,12 +114,12 @@ func searchCapabilityDrainStream(t *testing.T, stream requester.StreamReaderInte
 	}
 }
 
-func searchCapabilityGeminiProvider(t *testing.T, upstream *searchCapabilityUpstream, vertex bool, raw string, stream bool) (base.ProviderInterface, *gemini.GeminiChatRequest) {
+func searchCapabilityGeminiProvider(t *testing.T, upstream *searchCapabilityUpstream, vertex bool, raw string, stream bool) (base.ProviderInterface, *gemini.NativeRequest) {
 	t.Helper()
 	ctx := searchCapabilityContext(t, "/gemini/v1beta/models/gemini-2.5-flash:generateContent", raw)
-	request := &gemini.GeminiChatRequest{}
-	if err := common.UnmarshalBodyReusable(ctx, request); err != nil {
-		t.Fatalf("decode Gemini native request: %v", err)
+	request, err := gemini.ParseNativeRequest([]byte(raw), "gemini-2.5-flash", stream)
+	if err != nil {
+		t.Fatal(err)
 	}
 	request.Model = "gemini-2.5-flash"
 	request.Stream = stream

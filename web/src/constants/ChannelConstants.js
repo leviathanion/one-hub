@@ -278,6 +278,13 @@ export const CHANNEL_OPTIONS = {
     color: 'primary',
     url: 'https://chatgpt.com/'
   },
+  102: {
+    key: 102,
+    text: 'Antigravity OAuth',
+    value: 102,
+    color: 'primary',
+    url: ''
+  },
   8: {
     key: 8,
     text: '自定义渠道',

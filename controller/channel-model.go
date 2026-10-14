@@ -5,7 +5,6 @@ import (
 	"one-api/model"
 	"one-api/providers"
 	providersBase "one-api/providers/base"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -20,8 +19,9 @@ func GetModelList(c *gin.Context) {
 		})
 		return
 	}
-	keys := strings.Split(channel.Key, "\n")
+	keys := providers.ChannelCredentialInputs(channel)
 	channel.Key = keys[0]
+	explicitCredential := channel.Key != ""
 
 	if channel.Key == "" {
 		if channel.Id == 0 {
@@ -48,6 +48,21 @@ func GetModelList(c *gin.Context) {
 			"message": err.Error(),
 		})
 		return
+	}
+	if err := providers.PrepareChannelCredentialInput(channel); err != nil {
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	if explicitCredential && channel.Id > 0 && providers.UsesWholeCredentialInput(channel) {
+		persisted, err := model.GetChannelByIdWithContext(c.Request.Context(), channel.Id)
+		if err != nil {
+			c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
+			return
+		}
+		if err := providers.PrepareChannelCredentialInput(persisted); err != nil || persisted.Type != channel.Type || persisted.Key != channel.Key {
+			// 未保存的凭据不能借已有 ID 刷新或覆盖数据库；相同凭据仍沿用持久化 fence。
+			channel.Id = 0
+		}
 	}
 
 	provider := providers.GetProvider(channel, c)

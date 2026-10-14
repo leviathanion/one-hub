@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -283,6 +284,11 @@ func TestFinalizeMaterializesSelectedNativeClaudeMediaOnceBeforeSend(t *testing.
 	}}
 	fetcher := &relayRemoteMediaFetcher{}
 	request := nativeClaudeRemoteMediaRequest("image", "https://example.com/a.png")
+	raw, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/claude/v1/messages", strings.NewReader(string(raw)))
 	r := &relayClaudeOnly{
 		relayBase:     relayBase{c: ctx, provider: provider, modelName: request.Model, originalModel: request.Model, remoteMedia: fetcher},
 		claudeRequest: request,
@@ -316,6 +322,11 @@ func TestFinalizeNativeClaudeMaterializationFailureStopsBeforeProviderWork(t *te
 	}}
 	fetcher := &relayRemoteMediaFetcher{err: errors.New("safe fetch rejected target")}
 	request := nativeClaudeRemoteMediaRequest("image", "https://example.com/a.png")
+	raw, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/claude/v1/messages", strings.NewReader(string(raw)))
 	r := &relayClaudeOnly{
 		relayBase:     relayBase{c: ctx, provider: provider, modelName: request.Model, originalModel: request.Model, remoteMedia: fetcher},
 		claudeRequest: request,
@@ -335,6 +346,11 @@ func TestFinalizeNativeClaudeDocumentURLRejectsWithoutFetch(t *testing.T) {
 	provider := &relayNativeClaudeMediaProvider{BaseProvider: providersBase.BaseProvider{Channel: &model.Channel{Id: 9, Type: config.ChannelTypeBedrock}}}
 	fetcher := &relayRemoteMediaFetcher{}
 	request := nativeClaudeRemoteMediaRequest("document", "https://example.com/a.pdf")
+	raw, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/claude/v1/messages", strings.NewReader(string(raw)))
 	r := &relayClaudeOnly{
 		relayBase:     relayBase{c: ctx, provider: provider, modelName: request.Model, originalModel: request.Model, remoteMedia: fetcher},
 		claudeRequest: request,
