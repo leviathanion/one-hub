@@ -168,8 +168,16 @@ func convertChat(src fields, ctx *Context) (json.RawMessage, error) {
 				if err != nil {
 					return nil, err
 				}
-				if err = checkFields(call, p, "id", "type", "function"); err != nil {
+				if err = checkFields(call, p, "id", "type", "function", "index"); err != nil {
 					return nil, err
+				}
+				if rawIndex, ok := call["index"]; ok {
+					// OpenAI SDK 流式累积器会在完整历史中保留 delta index。
+					// 只有与完整数组位置一致时，它才是可由顺序恢复的冗余关联。
+					var index int
+					if null(rawIndex) || json.Unmarshal(rawIndex, &index) != nil || index != j {
+						return nil, unsupported(p+".index", "工具流索引必须与完整历史中的工具数组位置一致")
+					}
 				}
 				if stringValue(call["type"]) != "function" {
 					return nil, unsupported(p+".type", "仅支持 function 调用")

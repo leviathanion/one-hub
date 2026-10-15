@@ -131,6 +131,7 @@ func assembleResponseHistoryFrames(t *testing.T, dialect Dialect, frames [][]byt
 	var blocks []fields
 	var doneItems []json.RawMessage
 	var completed json.RawMessage
+	toolArguments := map[int]string{}
 	chatFinished := false
 	for _, event := range frameObjects(t, frames) {
 		switch dialect {
@@ -192,10 +193,23 @@ func assembleResponseHistoryFrames(t *testing.T, dialect Dialect, frames [][]byt
 				if err := json.Unmarshal(event["delta"], &delta); err != nil {
 					t.Fatal(err)
 				}
+				if stringValue(delta["type"]) == "input_json_delta" {
+					toolArguments[index] += stringValue(delta["partial_json"])
+				}
 				for _, field := range []string{"text", "thinking", "signature"} {
 					if value, ok := delta[field]; ok {
 						blocks[index][field] = marshal(stringValue(blocks[index][field]) + stringValue(value))
 					}
+				}
+			case "content_block_stop":
+				if err := json.Unmarshal(event["index"], &index); err != nil || index < 0 || index >= len(blocks) {
+					t.Fatalf("stop without block: %s", marshal(event))
+				}
+				if args, ok := toolArguments[index]; ok {
+					if !json.Valid([]byte(args)) {
+						t.Fatalf("invalid complete tool input: %s", args)
+					}
+					blocks[index]["input"] = json.RawMessage(args)
 				}
 			}
 		case DialectResponses:

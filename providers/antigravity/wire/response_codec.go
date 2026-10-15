@@ -123,6 +123,12 @@ func blockCarrier(b *responseBlock) (string, error) {
 	return EncodeCarrier(records)
 }
 
+// 原生签名是任意不透明字符串，也可能恰好落在本地 carrier 的命名空间。
+// 此时必须包装真实签名，避免下一轮把它当作 ag1/ag2 状态解码。
+func thinkingNeedsCarrier(b *responseBlock) bool {
+	return len(b.standalone) > 0 || IsCarrier(stringValue(b.signature))
+}
+
 func (c *responseCandidate) needsChatCarrier() bool {
 	if c.signed {
 		return true
@@ -168,7 +174,7 @@ func (d *ResponseDecoder) closeBlock(c *responseCandidate, frames *[][]byte) err
 					d.event("content_block_delta", map[string]any{"index": b.outputIndex, "delta": map[string]any{"type": "input_json_delta", "partial_json": string(b.args)}}))
 			} else if b.kind == "thought" && (len(b.signature) > 0 || len(b.standalone) > 0) {
 				var signature string
-				if len(b.standalone) > 0 {
+				if thinkingNeedsCarrier(b) {
 					value, err := blockCarrier(b)
 					if err != nil {
 						return err
@@ -294,7 +300,7 @@ func (d *ResponseDecoder) responseObject(indices []int) (map[string]any, error) 
 				block = map[string]any{"type": "text", "text": b.text.String()}
 			case "thought":
 				block = map[string]any{"type": "thinking", "thinking": b.text.String()}
-				if len(b.standalone) > 0 {
+				if thinkingNeedsCarrier(b) {
 					carrier, err := blockCarrier(b)
 					if err != nil {
 						return nil, err
