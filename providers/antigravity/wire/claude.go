@@ -8,8 +8,23 @@ import (
 )
 
 func convertClaude(src fields, ctx *Context) (json.RawMessage, error) {
-	if err := checkFields(src, "request", "model", "messages", "system", "stream", "max_tokens", "temperature", "top_p", "top_k", "stop_sequences", "tools", "tool_choice", "thinking"); err != nil {
+	if err := checkFields(src, "request", "model", "messages", "system", "stream", "max_tokens", "temperature", "top_p", "top_k", "stop_sequences", "tools", "tool_choice", "thinking", "output_config"); err != nil {
 		return nil, err
+	}
+	if raw, ok := src["output_config"]; ok {
+		output, err := object(raw, "output_config")
+		if err != nil {
+			return nil, err
+		}
+		if err = checkFields(output, "output_config", "effort"); err != nil {
+			return nil, err
+		}
+		if effort := output["effort"]; !null(effort) {
+			if _, err = textValue(effort, "output_config.effort"); err != nil {
+				return nil, err
+			}
+			return nil, unsupported("output_config.effort", "尚无经过验证的 Antigravity Claude effort 映射；不能以固定 thinking 预算或档位夹紧代替")
+		}
 	}
 	out := fields{}
 	cfg := fields{}
@@ -21,11 +36,17 @@ func convertClaude(src fields, ctx *Context) (json.RawMessage, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err = checkFields(t, "thinking", "type", "budget_tokens"); err != nil {
+		if err = checkFields(t, "thinking", "type", "budget_tokens", "display"); err != nil {
 			return nil, err
 		}
+		mode := stringValue(t["type"])
+		if mode == "disabled" || mode == "adaptive" {
+			if _, ok := t["budget_tokens"]; ok {
+				return nil, unsupported("thinking.budget_tokens", "显式预算仅能映射 enabled thinking；不能用 disabled/adaptive 的固定或自动预算覆盖")
+			}
+		}
 		thinking := fields{}
-		switch stringValue(t["type"]) {
+		switch mode {
 		case "disabled":
 			thinking["thinkingBudget"] = json.RawMessage("0")
 			thinking["includeThoughts"] = json.RawMessage("false")
@@ -37,6 +58,20 @@ func convertClaude(src fields, ctx *Context) (json.RawMessage, error) {
 			thinking["includeThoughts"] = json.RawMessage("true")
 		default:
 			return nil, unsupported("thinking.type", "无法映射该 thinking 表示")
+		}
+		if display, ok := t["display"]; ok && !null(display) {
+			if mode == "disabled" {
+				return nil, unsupported("thinking.display", "显式摘要显示仅支持 enabled 或 adaptive thinking")
+			}
+			switch stringValue(display) {
+			case "summarized":
+				// includeThoughts 返回目标的思考摘要，计算预算保持独立。
+				thinking["includeThoughts"] = json.RawMessage("true")
+			case "omitted":
+				return nil, unsupported("thinking.display", "includeThoughts:false 尚不能保证 Claude 隐藏摘要后的签名续接；需验证真实签名载体后才能支持 omitted")
+			default:
+				return nil, unsupported("thinking.display", "当前转换仅支持 summarized；无法解释此摘要显示选项")
+			}
 		}
 		cfg["thinkingConfig"] = marshal(thinking)
 	}
@@ -116,7 +151,10 @@ func claudeContent(raw json.RawMessage, ctx *Context, path string, system bool) 
 		}
 		switch typ {
 		case "text":
-			if err = checkFields(block, p, "type", "text"); err != nil {
+			if err = checkFields(block, p, "type", "text", "cache_control"); err != nil {
+				return nil, err
+			}
+			if err = claudeCacheControl(block["cache_control"], p+".cache_control"); err != nil {
 				return nil, err
 			}
 			if _, err = textValue(block["text"], p+".text"); err != nil {
@@ -154,7 +192,10 @@ func claudeContent(raw json.RawMessage, ctx *Context, path string, system bool) 
 			}
 			parts = append(parts, marshal(part))
 		case "tool_use":
-			if err = checkFields(block, p, "type", "id", "name", "input", "signature"); err != nil {
+			if err = checkFields(block, p, "type", "id", "name", "input", "signature", "cache_control"); err != nil {
+				return nil, err
+			}
+			if err = claudeCacheControl(block["cache_control"], p+".cache_control"); err != nil {
 				return nil, err
 			}
 			id, name := stringValue(block["id"]), stringValue(block["name"])
@@ -184,7 +225,10 @@ func claudeContent(raw json.RawMessage, ctx *Context, path string, system bool) 
 			}
 			parts = append(parts, part)
 		case "tool_result":
-			if err = checkFields(block, p, "type", "tool_use_id", "content", "is_error"); err != nil {
+			if err = checkFields(block, p, "type", "tool_use_id", "content", "is_error", "cache_control"); err != nil {
+				return nil, err
+			}
+			if err = claudeCacheControl(block["cache_control"], p+".cache_control"); err != nil {
 				return nil, err
 			}
 			id := stringValue(block["tool_use_id"])
@@ -211,7 +255,10 @@ func claudeImage(block fields, path string) (json.RawMessage, error) {
 	if stringValue(block["type"]) != "image" {
 		return nil, unsupported(path+".type", "仅支持图像附件")
 	}
-	if err := checkFields(block, path, "type", "source"); err != nil {
+	if err := checkFields(block, path, "type", "source", "cache_control"); err != nil {
+		return nil, err
+	}
+	if err := claudeCacheControl(block["cache_control"], path+".cache_control"); err != nil {
 		return nil, err
 	}
 	source, err := object(block["source"], path+".source")
