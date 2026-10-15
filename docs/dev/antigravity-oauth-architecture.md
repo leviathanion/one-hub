@@ -9,9 +9,10 @@ lastUpdated: true
 
 ## 文档状态
 
-- 状态：渠道类型 102、管理授权与四入口适配已实现，已使用本地模拟上游验证；真实 Google 账号及具名客户端的联调尚未完成。
+- 状态：渠道类型 102、管理授权与四入口适配已实现，已有本地模拟上游测试；2026-10-15 对 main `1c9b1419` 的复核确认部分常见字段仍被转换器拒绝。本次已实现下文限定的字段支持、SSE 表示修复及签名 codec 修复；真实 Google 账号联调尚未完成，SDK 离线验收与真实模型验收分别记录。
 - 适用范围：Google OAuth 授权、凭据刷新、project 初始化，以及现有 Gemini、Claude Messages、OpenAI Chat Completions 和 Responses HTTP 入口的 Antigravity 适配。
 - 文档口径：当前架构依据 one-hub `3ee17687`；参考本地 new-api `4013729f6`、done-hub `42dca4a`、sub2api `9c2cca9e6`、CLIProxyAPI `0d18d3b3`。源码与定向测试用于确定实现差异，真实 Google 授权、内部接口、模型和签名行为仍需联调。
+- 本次复核基线：one-hub main `1c9b1419205022ea101032aeacaf512475ffb398`；补充参考 CLIProxyAPI `5fc580b1d72d87a7bcfe5cfb6f479c1aea5625b3`。CPA 只提供映射线索与差异样本，行为一致不是验收目标。
 - 设计取向：透明转发优先，只做必要的正确性校验、协议转换和接口请求修复；复用现有渠道、凭据 fence、选路、传输和结算。
 - 关联文档：[渠道编辑确认方案](./immutable-channel-identity-architecture.md)、[凭据刷新 fence](./codex-credential-refresh-fence-architecture.md)、[Codex 上游协议边界](./codex-official-upstream-architecture.md)、[请求重试边界](./responses-ws-attempt-replay-architecture.md)、[TCC 计费](./usage-confirmed-tcc-billing-architecture.md)、[Channel Affinity](./channel-affinity-architecture.md)。
 
@@ -22,6 +23,8 @@ Antigravity OAuth 提供访问 Google 上游的身份。one-hub 仍使用自己�
 该上游通过 Cloud Code 的 `v1internal` 接口接收 Gemini 风格的请求，并在外层携带 `project`、模型和客户端元数据。即使实际模型是 Claude，也需要按此协议调用。provider 负责 OAuth 凭据、内部 envelope 及必要的方言适配；可以原样交给上游的内容保持原样。
 
 目标是让管理员通过 OAuth 建立一个普通 one-hub 渠道，并让已支持的公开入口按明确的转换契约使用它。调用结果、工具语义、流式结束和用量必须可解释；其他渠道的行为不因接入而改变。
+
+本次兼容修复补齐 Claude Messages、Responses 的实际支持范围，核查并修复 Gemini SSE 表示问题；Chat Completions 纳入共享字段与签名验证。保持“有损转换不能默认放行”，不重建 OAuth、选路或传输体系。只能通过有损降级支持的需求，作为单独的产品契约变更处理。
 
 ### 透明转发与必要校验
 
@@ -349,6 +352,42 @@ schema 作为请求数据传递，不预先引入通用验证、递归解引用�
 
 输出 codec 同样只生成实际存在的字段：无工具调用时省略 Chat delta.tool_calls；同一 chunk 的 reasoning 和正文分别按顺序编码，不用互斥分支丢掉其中一项。
 
+### 本次字段契约与实现状态
+
+下表是本次支持面判定的维护位置，不新增规则引擎或配置层。“可映射”需同时有来源契约、实际目标接口能力和完整往返证据；“来源契约允许不生效”需证明被省略的行为确实不是必需语义；“必须拒绝”指当前目标不能承接的要求；“证据不足”保持拒绝，但不能写成永远不存在等价表达。代码放行与计划放行必须分开记录。
+
+| 来源字段及具体取值 | 可观察行为与 main 现状 | 目标表达与当前判定 | 修复、证据和拒绝条件 |
+| --- | --- | --- | --- |
+| Claude `thinking.display=summarized` | 摘要可见性；main 只接受 thinking 的 type/budget_tokens，拒绝 display | **可映射，已实现**：enabled/adaptive 显式写 `thinkingConfig.includeThoughts=true`，不修改计算预算 | 来源 summarized 表示正常返回摘要；目标 ThinkingConfig 的 includeThoughts 控制可见思考。复用原有摘要响应和签名路径，验证预算不变和 SDK 往返；仍由上游决定该模型是否产生思考 |
+| Claude `thinking.display=omitted` | 隐藏思考正文，同时要求签名续接 | **证据不足，继续拒绝**，已给出 `thinking.display` 的具体原因 | 尚未证明 `includeThoughts=false` 后保留了 Claude 可承载的签名。无真实 thinking/tool_use 可关联的独立签名仍不可表达；不伪造空 thinking 来放行。Responses 的既有 summary=none 不因此扩大为 Claude 的对应承诺 |
+| Claude display 缺省/null、未知值，以及 disabled/enabled/adaptive 组合 | main enabled/adaptive 写 true，disabled 写 false | 缺省沿用现有行为；enabled/adaptive 的 null 按来源可空字段走缺省路径；未知值、disabled 下非空 display **拒绝** | 本次不重新定义缺省模型策略，也不宣称来源所有模型的默认值与目标默认等价。显式 summarized 与计算预算独立，不因 effort 启用摘要；adaptive/disabled 携带 budget_tokens 时明确拒绝，不能覆盖显式预算。原始字段是否存在仍保留在 canonical raw 中 |
+| Claude `output_config.effort=low/medium/high/xhigh/max`，缺省/null | main 拒绝整个 output_config | 非空 effort **证据不足，继续拒绝**；`output_config:{}` 和 `effort:null` **已接受**且不引入思考配置 | 错误定位到 `output_config.effort`；format 等未知子字段仍拒绝。公共 Gemini 的 thinkingLevel 和 CPA 夹紧逻辑不能证明托管 Claude effort 等价，不补 high、不构造固定预算、不换模型 |
+| Claude `system[].cache_control`、`messages[].content[].cache_control`、`tools[].cache_control` 的 `{type:ephemeral}`、ttl=5m/1h | 缓存断点、期限与缓存计费；main 都拒绝 | **必须拒绝，已细化原因**；显式期限指出 `.cache_control.ttl`，缺省期限解释默认 5m | 不把未命中等同于没有缓存要求，不删除断点/TTL。工具结果中的 Claude 文本块也执行同一规则，修复原先把嵌套 cache_control 当作普通工具 JSON 转发的缺口 |
+| 上述 cache_control 的缺省、null、空对象、未知 type/ttl/成员 | 缺省原已可用 | 声明可空的 text/image/tool_use/tool_result 及工具定义上的 null **已接受**，无缓存断点可发送；其他值逐路径拒绝 | 固定版本来源 SDK 在这些位置均声明 Optional。不将规则外推到 thinking 块或任意业务 JSON；schema、工具 input 及普通结果子树中同名字段保持不透明。空对象不是 null |
+| Claude `tools[].eager_input_streaming=true/false/null`、缺省 | 来源 true 要求生成时增量交付，false 关闭此能力，null/缺省依 beta headers | false **可映射，已接受**：复用完整参数及迟到签名缓冲；true **拒绝**，显式 null 因无法确定 header 默认行为 **拒绝** | 不把完整 JSON 后置拆分称为 eager streaming。缺省保留既有完整工具交付路径，不新增对 fine-grained-tool-streaming beta 的支持承诺；有明确 eager 要求的客户端必须保留为不支持 |
+| Chat/Responses `prompt_cache_key` 非空字符串、空串、null、缺省 | relay 保持既有字符串提取、作用域和 soft affinity | null/缺省 **已接受**；包括空串在内的字符串 **必须拒绝**，指出本地亲和性不能替代上游缓存分区/分账 | 当前 OpenAI 来源文档明确 key 还分离缓存复用和计费，不能仅据不保证命中而整体省略。provider 不生成 key、不映射缓存资源 ID；共享 affinity、渠道禁止改写及 store/conversation/previous_response_id 限制保持不变 |
+| Claude thinking.signature/tool_use.signature；Responses reasoning.encrypted_content；Chat extra_content.antigravity_state | 已有 ag1 carrier；本次发现原生 thinking 签名与 carrier 前缀冲突 | 已声明布局内 **可映射，已修复并验证**；真实签名有效性仍需真实上游验证 | 原生签名恰以 ag1./ag2. 等开头时，Claude 响应使用已有 carrier 无损包装，防止下一轮误解码。覆盖迟到、独立、并行、混合内容和流式/非流式；不新增服务端恢复状态 |
+
+上述来源语义的证据入口：Anthropic SDK 固定版本的 [display](https://github.com/anthropics/anthropic-sdk-python/blob/2a53eaa6966b04560b6a72c28d3ace4389a9ac58/src/anthropic/types/thinking_config_enabled_param.py)、[effort](https://github.com/anthropics/anthropic-sdk-python/blob/2a53eaa6966b04560b6a72c28d3ace4389a9ac58/src/anthropic/types/output_config_param.py)、[缓存 TTL](https://github.com/anthropics/anthropic-sdk-python/blob/2a53eaa6966b04560b6a72c28d3ace4389a9ac58/src/anthropic/types/cache_control_ephemeral_param.py)、[工具缓存与 eager_input_streaming](https://github.com/anthropics/anthropic-sdk-python/blob/2a53eaa6966b04560b6a72c28d3ace4389a9ac58/src/anthropic/types/tool_param.py)，以及 OpenAI SDK 的 [prompt_cache_key](https://github.com/openai/openai-python/blob/e71d781ac5e7b3f365ac130bf338baaf13ae720d/src/openai/types/responses/response_create_params.py)。SDK 类型和注释可用于固定来源声明，不能证明内部目标实现；真实目标请求/响应和模型、接口版本必须随开放规则一同归档。
+
+本次补充的来源依据包括 [OpenAI 缓存路由与分账](https://developers.openai.com/api/docs/guides/prompt-caching#prompt-cache-keys)，以及固定版本的 [text](https://github.com/anthropics/anthropic-sdk-python/blob/2a53eaa6966b04560b6a72c28d3ace4389a9ac58/src/anthropic/types/text_block_param.py)、[image](https://github.com/anthropics/anthropic-sdk-python/blob/2a53eaa6966b04560b6a72c28d3ace4389a9ac58/src/anthropic/types/image_block_param.py)、[tool_use](https://github.com/anthropics/anthropic-sdk-python/blob/2a53eaa6966b04560b6a72c28d3ace4389a9ac58/src/anthropic/types/tool_use_block_param.py)、[tool_result](https://github.com/anthropics/anthropic-sdk-python/blob/2a53eaa6966b04560b6a72c28d3ace4389a9ac58/src/anthropic/types/tool_result_block_param.py) 可空缓存声明。Google `google-genai 2.31.0` 的 ThinkingConfig 明确区分 include_thoughts 与 thinking_budget；本次只开放与既有目标表达一致的 summarized，不把这些公共类型当作其他内部模型选项已验证的证明。
+
+CPA 的 [摘要控制](https://github.com/router-for-me/CLIProxyAPI/blob/5fc580b1d72d87a7bcfe5cfb6f479c1aea5625b3/internal/thinking/summary.go) 和 [Claude 请求转换](https://github.com/router-for-me/CLIProxyAPI/blob/5fc580b1d72d87a7bcfe5cfb6f479c1aea5625b3/internal/translator/antigravity/claude/antigravity_claude_request.go) 可以产生对照样本。其中 adaptive 缺省补 high、后续档位夹紧、工具字段筛选等行为不是本项目可直接采用的规则。
+
+能力失败沿用 `request_not_representable` 及具体 Param，不新增一套错误协议。已识别字段分别解释“未实现经过验证的映射”“当前不能保留某项行为”“尚缺目标证据”，避免全部声称不存在等价表示。若一条请求有多个不支持字段，错误选择应稳定，不能依赖 Go map 遍历顺序；局部改进诊断即可，不增加校验框架。
+
+### Gemini SSE 的问题判定与最小修复
+
+main 的 `stream.go:replaceAntigravitySSEData` 将替换后的 data 行固定写成 LF，其他字段与空行保留原分隔符，因此 CRLF 输入会产生 `data: ...\n\r\n`。这是已确认的表示差异；“该差异必然使 SDK 解析失败”尚不成立。[SSE 标准](https://html.spec.whatwg.org/multipage/server-sent-events.html#parsing-an-event-stream) 接受 CRLF、LF、CR，不能以字符串不一致替代解析失败复现。
+
+2026-10-15 的离线实验从 main 提取原函数及其两个分行辅助函数，由实际 Go 代码生成 LF、CRLF、CR 三组完整事件；用 `google-genai 2.31.0` 的 `HttpResponse.segments()` 与 `httpx 0.28.1` 解析，覆盖每个单一字节切分点、整体输入和逐字节输入，共 590 种分块。两事件中的中文、多行 JSON、尾部 usage 和 EOF 均正确交付，没有复现混合换行导致失败。这只覆盖该同步解析路径与固定样本，不代表所有 SDK/版本兼容，也不是完整 provider 网络测试。
+
+同一 SDK 的 `: keepalive` 注释对照样本在纯 LF 与纯 CRLF 下均抛出 `UnknownApiResponseError`。这说明 SDK 的 SSE 元数据支持还需单独核查，不能归因为换行混用，也不能为让该 SDK 通过就删除合法注释。记录支持范围，必要时在客户端修复解析。
+
+已在 provider 的替换函数内将逻辑 payload 写在最后一个 data 行的位置，并沿用该行的分隔符；其他 data 行删除，id/event/retry、注释及非 data 字段保持原字节和相对顺序。这样保留末尾原始事件边界，避免删除中间 data 行后，将原本独立的 CR 与空行 LF 拼成一个 CRLF。输入本身混合换行时不擅自重写其他字段。验收目标是表示稳定与逻辑事件等价，不宣称修复了尚未复现的 SDK 故障。保留多行 data 拼接后的逻辑 payload，不要求外层解包后 data 行数量与原 envelope 完全一致。已增加纯 CR、混合输入、每个单一字节切分点和逐字节读取测试，覆盖 CR/LF 跨网络块及分段 UTF-8；不为未终止的 data 行补事件边界。
+
+完整验证须经过 requester framer、provider 替换和实际客户端解析三段，并覆盖尾随 usage/error、连续事件、空事件、分段 UTF-8、事件上限、取消和 EOF。完整事件后的物理 EOF 与未遇空行的截断 EOF 分开；保持现有失败语义，不把 EOF 当成缺失的事件分隔符，不补成功终态，不增加重放。
+
 ### 签名往返与会话限制
 
 thoughtSignature 是上游不透明数据。优先使用协议已有字段往返，保留工具 part、独立 part 的签名与位置；本地不检查其算法、可信性或跨模型有效性，也不伪造 sentinel。
@@ -444,6 +483,76 @@ Claude 工具的签名如果晚于工具片段到达，转换器在关联确定�
 | 凭据 fence、一次提交、流式终态及 usage presence | 可能覆盖新凭据、重复执行、截断伪成功或错误结算 | 保留并复用现有实现 |
 
 消融检查以同一输入比较字段语义、调用顺序、上游 dispatch 次数和保留状态，不以“返回 200”单独判断修复有效。例如 oneOf 的两个数字分支分别要求值 ≥0、≤10 时，输入 5 应被拒绝，改成 anyOf 后却会通过；删除 additionalProperties:false 同样会放行原本被拒绝的额外属性。这些规则改变了请求语义，不能用兼容性修复解释。
+
+## 本次兼容修复的消融与功能正确性实验
+
+上述字段补齐方案在架构方向上合理，但“少了一个拒绝”或“返回 200”不能证明功能正确，“去掉一项能力后普通文本仍通过”也不能证明能力不必要。消融的对象是可分离的映射、交付或状态机制，不是随意删掉客户端要求。语义是否允许省略首先由契约判定；实验只验证实现、收益和边界，不能授权有损转换。
+
+先固定 main `1c9b1419` 为基线 B，并确定不可事后缩小的请求集：目标客户端真实生成的常用请求、字段边界、合法负例、三轮以上工具历史、原生透明性与故障样本。明确哪些操作是本次必需支持、哪些明确不支持。证据不足的必需项继续显示为未完成，不能挪到负例集合使通过率上升。CPA 输出只作差异候选，不作正确答案。
+
+| 实验 | 控制变量与改动 | 可回答的问题与通过条件 |
+| --- | --- | --- |
+| 基线 B | 原 main、固定请求集、固定上游响应 fixture | 记录具体拒绝路径、现有成功范围、SDK 解析结果及调用次数；为每个待修问题提供失败样本，避免把已通过的 carrier 功能重做 |
+| B + 单项映射 | display、effort、prompt_cache_key、每一种允许的 cache/eager 取值分别添加；SSE 改动单独一组 | 哪项规则解除哪个真实阻断；只接受在契约内的样本，负例仍拒绝。不能把多项字段清洗合并后将收益归因于某一映射 |
+| 完整候选 F − 单项机制 | 在实验副本中逐项移除已实现映射、必要 carrier、本地 affinity 消费或迟到签名缓冲 | 哪项机制是必要条件；移除 carrier/缓冲只能用固定离线样本验证预期失效，不把有损请求发给真实上游。删掉无贡献代码前须证明它在声明支持面与故障边界均无作用 |
+| display × 签名 | summarized/omitted/缺省，分别配独立、thinking 附着、工具附着和尾部签名；流式/非流式 | 关闭可见摘要仍保留计算预算和真实续接材料；有签名却无可承载 block 时不能误报已支持。不能以正文没有泄露替代续接验证 |
+| effort × thinking | effort 的各值/缺省/null，交叉 disabled/enabled/adaptive 和显式预算 | 默认、优先级和冲突有明确依据；拒绝不支持组合，不夹紧、补 high、改模型或覆盖预算。无需遍历所有协议的全笛卡尔积，覆盖实际依赖和边界即可 |
+| eager × 尾部签名 | true/false/null 与 beta headers、并行工具、迟到签名组合 | 交付偏好与关联保真是否冲突；记录参数首段到达和完整签名到达的先后，不能用结束后拆 JSON 模拟实时增量 |
+| 缓存字段与 affinity | key 缺省/固定值/变化值，affinity 命中/失效；跨既有作用域；cache_control 各位置与 ttl | 共享层仅承担既定选路职责，失效不变资源 owner；缓存 ttl/计费不能被 key 或一次命中结果替代。先固定渠道测试转换，再单独测试选路，避免模型/账号变化污染比较 |
+| SSE 分隔符 × 网络块 | 保持逻辑事件序列固定，只变化 LF/CRLF/CR/混合、每个切分点及截断 EOF | 原 main 与候选实现均用实际 SDK 解析；比较 payload、事件个数/顺序、元数据和终态。没有复现失败时，将收益记为表示一致性，而非已证明修复 SDK |
+
+每项消融报告至少列出：固定支持集中的可表示率与完整会话成功率、语义差异、拒绝的字段/错误码、OAuth refresh 和推理 dispatch 次数、响应提交后的重放次数，以及新增状态/配置/持久化、峰值保留量和必要缓冲延迟。复杂度按新增职责与状态计，不只按代码行数计。保留会影响必要功能的机制，删除已证明冗余的机制；故意破坏关键机制的负对照不能成为发布实现。
+
+功能正确性的比较分成三层，不能互相替代：
+
+1. **确定性协议层**：固定来源请求与独立维护的目标原始样本，比较消息/part 边界、顺序、文本、schema/大整数、call_id、参数和错误结果、签名字节及所属 part。除 requestId 等已明确的代理字段外，不放宽比较。用相同上游响应 fixture 验证流式与聚合结果，不靠重新生成两次文本相等来判断映射。
+2. **客户端往返层**：真实 SDK 解析事件、组装历史、序列化下一轮请求，再与原始目标 parts 对照。现有 `response_part_boundary_test.go` 的手工组装器和 encoder/decoder 往返值得保留，但两端相同的错误可能互相抵消，必须补独立样本及 SDK。覆盖连续三轮以上、两种工具/同名并行工具、结果乱序、混合内容、尾部/独立签名和损坏 carrier；区分客户端丢扩展与 codec 编码错误。
+3. **真实上游层**：具名账号/模型/接口和具名客户端的文本、thinking、单工具、并行工具、多轮请求。证明真实签名被接受、摘要控制和工具交付成立；用真实 usage 验证分区与计费。模型输出具有随机性，比较契约性质与统计结果，不要求两次文本或 token 数完全相同。缓存实验须控制前缀、长度、冷热、TTL、账号和模型，结果只能证明观测行为，不能代替缓存契约。
+
+必测失败性质包括：不可表示输入在 assessment 和执行中给出一致判定，OAuth refresh 与推理 dispatch 均为零；上游已接受后的转换失败、尾随 error、截断和取消不产生第二次 dispatch/换渠道；失败前收到的真实 usage 仍进入既有结算；未知原生字段和联合类型经过真实 ingress、渠道参数处理及 provider 后仍保留。仅调用 ConvertRequest 不能证明这些整链路性质。
+
+签名载体消融默认保留客户端携回机制。只有必需客户端无法完成上述往返、原生字段或客户端修复也不可行，才另评估服务端恢复，并给出相对无缓存基线的净收益以及事实来源、身份/租户隔离、容量、TTL、清理、多节点和失败语义。不为尚未复现的兼容问题提前加入缓存、配置开关或双实现。
+
+### 本次修复执行顺序与退出条件
+
+| 顺序 | 修改范围 | 完成或退出条件 |
+| --- | --- | --- |
+| 1. 字段判定与失败基线 | 本节支持表、既有测试、脱敏真实请求/响应 fixture | 逐值记录来源语义、目标证据与分类；明确必需支持样本，不把所有拒绝都当缺陷或都当合理限制 |
+| 2. 明确映射；SSE 可独立进行 | `wire/claude.go`、`request.go`、`responses.go`、`chat.go`；`stream.go` | 仅开放证据闭合的值，细化错误路径，复用纯函数和既有 affinity；SSE 用解析与等价事件证明改动。该阶段不要求等待所有缓存/effort 取值判定完毕 |
+| 3. 签名与交互验证 | `wire/signature.go`、`response_codec.go`、各请求转换器及 SDK 测试 | 优先运行已有 carrier 测试，只修复可复现的编码/关联缺陷；display 的签名依赖须在对应映射开放前完成，不能等到最后才发现无法续接 |
+| 4. 完整交付与故障验收 | 现有 HTTP ingress、provider、relay、计费及客户端联调 | 必需请求完成文本、思考和连续工具调用，同时通过保真、失败、透明性与无重放检查；记录模型、接口、SDK/客户端版本、完整配置及未覆盖范围 |
+
+因此执行顺序是有依赖的分批推进，不是一次性放宽字段后再补测试。尚未拿到真实上游证据的字段保持未完成；SSE 或独立映射可以先交付。文档修订、单元测试通过和真实兼容性交付分别报告，不把一者写成另一者。
+
+本次复核已使用 Go 1.27.2 执行 `go test ./providers/antigravity/...`，provider 与 wire 两个包均通过；额外直接调用 main 的转换器，复现 display、output_config、三处 cache_control、eager=false、Chat/Responses prompt_cache_key 的具体拒绝路径，并复现 Claude 无实际 block 可关联的独立签名失败。前述 590 个 SDK 分块样本全部通过。这里没有使用真实 Antigravity 账号或真实模型签名，没有完成完整客户端多轮联调；现有测试通过不改变这些交付项未完成的状态。上述为实现前的基线结果；下述实现验收另行记录。
+
+### 已实施改动与本地验收（2026-10-15）
+
+实现分支为 `fix/antigravity-protocol-contract`，基于上述 main 基线；本次直接更新此 OAuth 方案。运行时修改限于 Antigravity provider/wire，共享 relay 只补充验收样本，没有新增配置、持久化或跨请求签名缓存，也没有改变重试、渠道亲和性和资源生命周期实现。
+
+除支持表中的字段处理外，修复了两个通过往返实验复现的问题：原生 thinking 签名与 `agN.` 命名空间冲突时，用既有 carrier 包装真实字节；OpenAI Chat SDK 流式累积器保留的 `tool_calls[].index` 只有在等于完整历史数组位置时才接受，其关联由数组顺序和调用 ID 保留。错误位置、非整数或 null 索引仍拒绝，不以删除所有工具扩展使历史通过。
+
+| 检查 | 实际结果与边界 |
+| --- | --- |
+| Go provider/wire | `go test ./providers/antigravity/... -count=1` 通过。覆盖新增字段的值/结构、显式预算冲突、稳定错误路径、业务 JSON/schema/大整数保真、缓存消费前的同层重复键拒绝、签名命名空间与并行布局、SSE 换行/分块/截断；复用已有损坏 carrier、独立签名、单工具、尾部错误和 usage 测试 |
+| HTTP ingress 与 relay | `go test ./relay -count=1` 整套复跑通过。四入口支持样本经能力评估、执行和结算；拒绝样本使用过期凭据和阻断 transport，断言 OAuth/推理调用为零；已有错误、截断、无重放、原生未知字段和用量测试通过。首次整套运行中既有取消等待测试耗时 520ms 超过断言，单项连同 Antigravity 测试及整套复跑均通过，未改动该用例或实现 |
+| 三种 SDK 会话 | `anthropic 1.14.0`、`openai 3.31.0`、`httpx2 2.13.1`；Messages、Responses、Chat 各含流式/非流式，共 6 组、18 次 SDK 请求。实际 SDK 解析、流式汇总、历史序列化后送回 Go 转换器，对照独立完整 contents fixture（包括初始用户消息、每轮工具结果及消息边界），并检查 Claude 的目标 thinking 配置；保留同名并行工具、乱序结果、混合内容、迟到签名、真实存在的空思考 part、大整数和用量 |
+| Gemini SDK | `google-genai 2.31.0`、`httpx 0.28.1` 的同步 `HttpResponse.segments()`；实际 provider、requester framer、替换函数输出经 SDK 解析，统一 LF/CRLF/CR 的 594 种下游分块，以及 24 种合法 data/空行换行组合的 4530 种分块均通过，共 5124 种；正文与 usage 保持两个独立事件，单次上游 dispatch。注释在 LF/CRLF 均重现 SDK 的 `UnknownApiResponseError`，provider 仍原样保留注释 |
+| 消融负对照 | Go overlay 将运行时代码恢复为 main，新增的摘要显示、空字段、嵌套缓存边界、签名和 SSE 测试按预期失败；再单独回退 SSE、签名包装、Chat 索引支持，对应新测试各自失败。补强 oracle 后，将 Claude 预算归零、删除 SDK 历史中的全部工具结果，以及恢复混合换行和重复键旧实现均被相应测试检出。此结果证明这些修改对相应固定样本有作用，不证明未开放字段可以省略，也未宣称完成全部交叉消融 |
+
+缓存空值处理在消费 Claude 文本块的协议字段前解析该块；工具结果中的图片块也从原始 JSON 解析后再转换，重复 text/type/source/cache_control 等同层键明确拒绝，不能经 map 的 last-wins 重编码丢失原字段。深层业务 JSON 的重复键和大整数继续保持 raw。thinking 测试分别使用 enabled=2048、adaptive=-1 且 includeThoughts=true 的独立预期值，缺省/null/summarized 的等价比较仅作为补充。
+
+可复现的 SDK 工具位于 [sdk_roundtrip](../../providers/antigravity/wire/testdata/sdk_roundtrip/sdk_roundtrip.py) 和 [sdk_sse](../../providers/antigravity/wire/testdata/sdk_roundtrip/sdk_sse.py)，Go bridge 直接调用生产转换器；Gemini 路径还调用真实 provider 和分帧器。三种会话使用 MockTransport，Gemini 使用禁止外部连接的 fixture transport；这些工具不会发送真实模型请求。可在仓库根目录的隔离 Python 环境运行：
+
+```bash
+python3 -m venv work/antigravity-sdk
+work/antigravity-sdk/bin/pip install anthropic==1.14.0 openai==3.31.0 httpx2==2.13.1 google-genai==2.31.0 httpx==0.28.1
+go build -o work/ag-sdk ./providers/antigravity/wire/testdata/sdk_roundtrip
+work/antigravity-sdk/bin/python -B providers/antigravity/wire/testdata/sdk_roundtrip/sdk_roundtrip.py work/ag-sdk
+work/antigravity-sdk/bin/python -B providers/antigravity/wire/testdata/sdk_roundtrip/sdk_sse.py work/ag-sdk
+```
+
+上述离线模型 ID 为 `fixture-model`；HTTP ingress 测试中的模型别名也仅是 fixture。未使用真实 Antigravity 账号、模型或签名，未完成真实 Google 上游验收，不能据此宣称真实签名已经被模型接受、缓存等价或所有客户端兼容。SDK 往返以客户端保留 `tool_use.signature`、`encrypted_content`、`extra_content.antigravity_state` 为条件；丢弃这些字段的客户端仍在支持范围外。`display=omitted`、非空 Claude effort、有效缓存声明、字符串 prompt_cache_key、eager=true/null 均保持表内拒绝，不把这些未实现项算作可用性通过。
 
 ## 实施批次与完成条件
 
