@@ -316,6 +316,22 @@ func toolResultPart(id, name string, raw json.RawMessage, dialect Dialect, isErr
 				continue
 			}
 			typ := stringValue(o["type"])
+			if dialect == DialectClaude && typ == "text" {
+				if _, ok := o["cache_control"]; ok {
+					// 开始消费协议字段前拒绝歧义 envelope，不能让 map 的
+					// last-wins 行为在重编码时静默折叠同层内容字段。
+					o, err = object(item, p)
+					if err != nil {
+						return nil, err
+					}
+					if err = claudeCacheControl(o["cache_control"], p+".cache_control"); err != nil {
+						return nil, err
+					}
+					// 这里只消费 Claude 文本块的空缓存声明，不遍历工具 JSON 业务子树。
+					delete(o, "cache_control")
+					item = marshal(o)
+				}
+			}
 			if typ != "image" && typ != "input_image" && typ != "image_url" {
 				// JSON 工具结果已有等价子树；不替上游解释其业务字段。
 				textItems = append(textItems, item)
@@ -324,7 +340,12 @@ func toolResultPart(id, name string, raw json.RawMessage, dialect Dialect, isErr
 			var image json.RawMessage
 			switch dialect {
 			case DialectClaude:
-				image, err = claudeImage(o, p)
+				// 媒体块也消费协议字段；必须从原始 item 检查歧义，不能
+				// 将 map 中已被折叠的 source/cache_control 当作完整声明。
+				o, err = object(item, p)
+				if err == nil {
+					image, err = claudeImage(o, p)
+				}
 			case DialectResponses:
 				image, err = responsesImage(o, p)
 			case DialectChat:

@@ -126,7 +126,7 @@ func TestAntigravityFourIngressesUseFactoryAndSettleProviderUsage(t *testing.T) 
 				switch protocol {
 				case "claude":
 					path = "/claude/v1/messages"
-					body = fmt.Sprintf(`{"model":%q,"max_tokens":32,"messages":[{"role":"user","content":"hi"}],"stream":%t}`, toolUsageEvidenceHTTPModel, stream)
+					body = fmt.Sprintf(`{"model":%q,"max_tokens":32,"messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":null}]}],"thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":null},"tools":[{"name":"lookup","input_schema":{"type":"object"},"cache_control":null,"eager_input_streaming":false}],"stream":%t}`, toolUsageEvidenceHTTPModel, stream)
 				case "responses":
 					path = "/v1/responses"
 					body = fmt.Sprintf(`{"model":%q,"input":"hi","store":false,"stream":%t}`, toolUsageEvidenceHTTPModel, stream)
@@ -193,6 +193,11 @@ func TestAntigravityUnsupportedIngressStopsBeforeCredentialsOrProviderWork(t *te
 		{"unknown carrier version", "/v1/chat/completions", `{"model":"gpt-5.6","messages":[{"role":"assistant","content":"hi","extra_content":{"antigravity_state":"ag9.invalid"}}]}`, config.ChannelTypeAntigravity},
 		{"foreign carrier", "/v1/chat/completions", fmt.Sprintf(`{"model":"gpt-5.6","messages":[{"role":"assistant","content":"hi","extra_content":{"antigravity_state":%q}}]}`, carrier), config.ChannelTypeOpenAI},
 		{"cross protocol search", "/claude/v1/messages", `{"model":"gpt-5.6","max_tokens":32,"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"web_search_20250305","name":"web_search"}]}`, config.ChannelTypeAntigravity},
+		{"hidden summary continuation", "/claude/v1/messages", `{"model":"gpt-5.6","max_tokens":32,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"adaptive","display":"omitted"}}`, config.ChannelTypeAntigravity},
+		{"unverified effort", "/claude/v1/messages", `{"model":"gpt-5.6","max_tokens":32,"messages":[{"role":"user","content":"hi"}],"output_config":{"effort":"high"}}`, config.ChannelTypeAntigravity},
+		{"cache lifetime", "/claude/v1/messages", `{"model":"gpt-5.6","max_tokens":32,"messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]}`, config.ChannelTypeAntigravity},
+		{"eager delivery", "/claude/v1/messages", `{"model":"gpt-5.6","max_tokens":32,"messages":[{"role":"user","content":"hi"}],"tools":[{"name":"f","input_schema":{},"eager_input_streaming":true}]}`, config.ChannelTypeAntigravity},
+		{"eager header default", "/claude/v1/messages", `{"model":"gpt-5.6","max_tokens":32,"messages":[{"role":"user","content":"hi"}],"tools":[{"name":"f","input_schema":{},"eager_input_streaming":null}]}`, config.ChannelTypeAntigravity},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			blocked := &antigravityBlockedTransport{}

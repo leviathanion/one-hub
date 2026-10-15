@@ -215,12 +215,56 @@ func checkFields(source fields, path string, allowed ...string) error {
 	for _, name := range allowed {
 		set[name] = true
 	}
+	first := ""
+	found := false
 	for name := range source {
-		if !set[name] {
-			return unsupported(path+"."+name, "该字段没有等价的目标表示")
+		if !set[name] && (!found || name < first) {
+			first, found = name, true
 		}
 	}
+	if found {
+		return unsupported(path+"."+first, "当前转换尚未支持该字段")
+	}
 	return nil
+}
+
+// Claude 的可空 cache_control 只在声明了该字段的内容块/工具上调用。
+// null 没有缓存断点；ephemeral 即使省略 ttl 也仍要求默认期限和计费语义。
+func claudeCacheControl(raw json.RawMessage, path string) error {
+	if null(raw) {
+		return nil
+	}
+	cache, err := object(raw, path)
+	if err != nil {
+		return err
+	}
+	if err = checkFields(cache, path, "type", "ttl"); err != nil {
+		return err
+	}
+	if stringValue(cache["type"]) != "ephemeral" {
+		return unsupported(path+".type", "当前转换仅识别 ephemeral 缓存声明，不能解释此缓存类型")
+	}
+	if ttl, ok := cache["ttl"]; ok {
+		if value := stringValue(ttl); value != "5m" && value != "1h" {
+			return unsupported(path+".ttl", "当前转换不能表示该缓存期限")
+		}
+		return unsupported(path+".ttl", "Antigravity 尚无保留显式缓存期限及缓存计费的映射")
+	}
+	return unsupported(path, "Antigravity 尚无保留缓存断点、默认 5m 期限及缓存计费的映射")
+}
+
+func claudeEagerInputStreaming(raw json.RawMessage, path string) error {
+	if isFalse(raw) {
+		// Claude codec 在完整参数和关联签名就绪后才交付 tool_use。
+		return nil
+	}
+	if null(raw) {
+		return unsupported(path, "null 的交付方式依赖 beta headers；当前转换仅支持显式 false 的完整工具参数交付")
+	}
+	if isTrue(raw) {
+		return unsupported(path, "当前转换需缓冲完整工具参数及迟到签名，不能提供生成时的 eager 输入流；可使用 false")
+	}
+	return unsupported(path, "工具输入流控制必须是布尔值或 null")
 }
 
 func content(role string, parts []json.RawMessage) json.RawMessage {
@@ -334,8 +378,22 @@ func toolDeclarations(raw json.RawMessage, dialect Dialect, path string) (json.R
 		if err != nil {
 			return nil, err
 		}
-		if err = checkFields(f, p, "type", "name", "description", "parameters", "input_schema", "strict"); err != nil {
+		allowed := []string{"type", "name", "description", "parameters", "input_schema", "strict"}
+		if dialect == DialectClaude {
+			allowed = append(allowed, "cache_control", "eager_input_streaming")
+		}
+		if err = checkFields(f, p, allowed...); err != nil {
 			return nil, err
+		}
+		if dialect == DialectClaude {
+			if err = claudeCacheControl(f["cache_control"], p+".cache_control"); err != nil {
+				return nil, err
+			}
+			if eager, ok := f["eager_input_streaming"]; ok {
+				if err = claudeEagerInputStreaming(eager, p+".eager_input_streaming"); err != nil {
+					return nil, err
+				}
+			}
 		}
 		if strict, ok := f["strict"]; ok && !isFalse(strict) {
 			return nil, unsupported(p+".strict", "目标协议不能保证 strict 约束")
