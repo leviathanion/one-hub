@@ -122,14 +122,14 @@ func TestAntigravityFourIngressesUseFactoryAndSettleProviderUsage(t *testing.T) 
 				channel := antigravityRelayChannel(t, 901, server.URL, false)
 				antigravityIngressBilling(t, channel)
 				model.PricingInstance.Prices[actualModel] = &model.Price{Model: actualModel, Type: model.TokensPriceType, Input: 3, Output: 4}
-				path, body := "/v1/chat/completions", fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hi"}],"stream":%t}`, toolUsageEvidenceHTTPModel, stream)
+				path, body := "/v1/chat/completions", fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hi"}],"prompt_cache_key":null,"stream":%t}`, toolUsageEvidenceHTTPModel, stream)
 				switch protocol {
 				case "claude":
 					path = "/claude/v1/messages"
 					body = fmt.Sprintf(`{"model":%q,"max_tokens":32,"messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":null}]}],"thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":null},"tools":[{"name":"lookup","input_schema":{"type":"object"},"cache_control":null,"eager_input_streaming":false}],"stream":%t}`, toolUsageEvidenceHTTPModel, stream)
 				case "responses":
 					path = "/v1/responses"
-					body = fmt.Sprintf(`{"model":%q,"input":"hi","store":false,"stream":%t}`, toolUsageEvidenceHTTPModel, stream)
+					body = fmt.Sprintf(`{"model":%q,"input":"hi","store":false,"prompt_cache_key":null,"stream":%t}`, toolUsageEvidenceHTTPModel, stream)
 				case "gemini":
 					action := "generateContent"
 					if stream {
@@ -198,6 +198,8 @@ func TestAntigravityUnsupportedIngressStopsBeforeCredentialsOrProviderWork(t *te
 		{"cache lifetime", "/claude/v1/messages", `{"model":"gpt-5.6","max_tokens":32,"messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]}`, config.ChannelTypeAntigravity},
 		{"eager delivery", "/claude/v1/messages", `{"model":"gpt-5.6","max_tokens":32,"messages":[{"role":"user","content":"hi"}],"tools":[{"name":"f","input_schema":{},"eager_input_streaming":true}]}`, config.ChannelTypeAntigravity},
 		{"eager header default", "/claude/v1/messages", `{"model":"gpt-5.6","max_tokens":32,"messages":[{"role":"user","content":"hi"}],"tools":[{"name":"f","input_schema":{},"eager_input_streaming":null}]}`, config.ChannelTypeAntigravity},
+		{"responses cache partition", "/v1/responses", `{"model":"gpt-5.6","input":"hi","store":false,"prompt_cache_key":"customer-a"}`, config.ChannelTypeAntigravity},
+		{"chat cache partition", "/v1/chat/completions", `{"model":"gpt-5.6","messages":[{"role":"user","content":"hi"}],"prompt_cache_key":"customer-a"}`, config.ChannelTypeAntigravity},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			blocked := &antigravityBlockedTransport{}

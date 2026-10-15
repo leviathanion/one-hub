@@ -7,7 +7,10 @@ import (
 )
 
 func convertChat(src fields, ctx *Context) (json.RawMessage, error) {
-	if err := checkFields(src, "request", "model", "messages", "stream", "stream_options", "temperature", "top_p", "max_tokens", "max_completion_tokens", "stop", "n", "tools", "tool_choice", "parallel_tool_calls", "response_format", "reasoning_effort", "store"); err != nil {
+	if err := checkFields(src, "request", "model", "messages", "stream", "stream_options", "temperature", "top_p", "max_tokens", "max_completion_tokens", "stop", "n", "tools", "tool_choice", "parallel_tool_calls", "response_format", "reasoning_effort", "store", "prompt_cache_key"); err != nil {
+		return nil, err
+	}
+	if err := promptCacheKey(src["prompt_cache_key"]); err != nil {
 		return nil, err
 	}
 	if v, ok := src["store"]; ok && !isFalse(v) {

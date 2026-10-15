@@ -2,6 +2,7 @@ package wire
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -128,6 +129,50 @@ func TestClaudeToolResultCacheConsumptionRejectsAmbiguousBlock(t *testing.T) {
 	want := `"business":{"x":1,"x":2,"n":9007199254740993,"cache_control":{"type":"business-data"}}`
 	if !bytes.Contains(converted.Body, []byte(want)) {
 		t.Fatalf("opaque business data changed: %s", converted.Body)
+	}
+}
+
+func TestPromptCacheKeyPreservesCacheAndLifecycleBoundaries(t *testing.T) {
+	for _, dialect := range []Dialect{DialectChat, DialectResponses} {
+		t.Run(string(dialect), func(t *testing.T) {
+			base := fields{"messages": marshal([]any{}), "store": json.RawMessage("false")}
+			if dialect == DialectResponses {
+				delete(base, "messages")
+				base["input"] = marshal("hi")
+			}
+			before := mustRequest(t, dialect, string(marshal(base)))
+			base["prompt_cache_key"] = json.RawMessage("null")
+			after := mustRequest(t, dialect, string(marshal(base)))
+			if !bytes.Equal(before.Body, after.Body) {
+				t.Fatalf("null cache key altered request: %s", after.Body)
+			}
+			for _, value := range []string{`"customer-a"`, `""`, `42`, `{}`} {
+				base["prompt_cache_key"] = json.RawMessage(value)
+				_, err := ConvertRequest(dialect, marshal(base), "model")
+				var failure *CapabilityError
+				if !errors.As(err, &failure) || failure.Param != "prompt_cache_key" {
+					t.Fatalf("cache semantics silently dropped for %s: %v", value, err)
+				}
+			}
+			base["prompt_cache_key"] = json.RawMessage("null")
+			base["store"] = json.RawMessage("true")
+			_, err := ConvertRequest(dialect, marshal(base), "model")
+			var failure *CapabilityError
+			if !errors.As(err, &failure) || failure.Param != "store" {
+				t.Fatalf("null cache key bypassed lifecycle: %v", err)
+			}
+			if dialect == DialectResponses {
+				base["store"] = json.RawMessage("false")
+				for _, field := range []string{"previous_response_id", "conversation"} {
+					base[field] = marshal("owned-resource")
+					_, err := ConvertRequest(dialect, marshal(base), "model")
+					if !errors.As(err, &failure) || failure.Param != field {
+						t.Fatalf("null cache key bypassed %s: %v", field, err)
+					}
+					delete(base, field)
+				}
+			}
+		})
 	}
 }
 

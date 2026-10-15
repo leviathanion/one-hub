@@ -7,7 +7,10 @@ import (
 )
 
 func convertResponses(src fields, ctx *Context) (json.RawMessage, error) {
-	if err := checkFields(src, "request", "model", "input", "instructions", "stream", "store", "background", "previous_response_id", "conversation", "max_output_tokens", "temperature", "top_p", "tools", "tool_choice", "parallel_tool_calls", "reasoning", "text", "include", "truncation"); err != nil {
+	if err := checkFields(src, "request", "model", "input", "instructions", "stream", "store", "background", "previous_response_id", "conversation", "max_output_tokens", "temperature", "top_p", "tools", "tool_choice", "parallel_tool_calls", "reasoning", "text", "include", "truncation", "prompt_cache_key"); err != nil {
+		return nil, err
+	}
+	if err := promptCacheKey(src["prompt_cache_key"]); err != nil {
 		return nil, err
 	}
 	if !isFalse(src["store"]) {

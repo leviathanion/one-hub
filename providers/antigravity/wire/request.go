@@ -267,6 +267,18 @@ func claudeEagerInputStreaming(raw json.RawMessage, path string) error {
 	return unsupported(path, "工具输入流控制必须是布尔值或 null")
 }
 
+// 本地 soft affinity 不是上游缓存分区或分账的等价实现。null 表示没有 key；
+// 包括空串在内的实际 key 均不能在缺少目标表达时仅本地消费后省略。
+func promptCacheKey(raw json.RawMessage) error {
+	if null(raw) {
+		return nil
+	}
+	if _, err := textValue(raw, "prompt_cache_key"); err != nil {
+		return err
+	}
+	return unsupported("prompt_cache_key", "本地渠道亲和性不能保留上游缓存分区及计费隔离；Antigravity 尚无等价映射")
+}
+
 func content(role string, parts []json.RawMessage) json.RawMessage {
 	if parts == nil {
 		parts = []json.RawMessage{}
