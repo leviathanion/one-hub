@@ -327,25 +327,51 @@ func (s *antigravityStream) ReadContext() context.Context { return s.readContext
 // 内层 JSON 可以含换行；每行都必须重新加 data 前缀，防止变成 SSE 字段。
 // 事件的其他字段和注释保持原样，多个原 data 字段合并为一个逻辑 payload。
 func replaceAntigravitySSEData(event string, payload []byte) []byte {
+	// 在最后一个 data 行的位置交付逻辑 payload，保留它后面的原始边界。
+	// 若在首行写入后删除末行，首行的 CR 可能与事件空行的 LF 合并。
+	lastData := -1
+	for remaining, offset := event, 0; remaining != ""; {
+		line, rest := requester.SplitSSELine(remaining)
+		content := requester.SSELineContent(line)
+		if content == "data" || strings.HasPrefix(content, "data:") {
+			lastData = offset
+		}
+		offset += len(line)
+		remaining = rest
+	}
+	if lastData < 0 {
+		return []byte(event)
+	}
 	var result strings.Builder
-	replaced := false
+	offset := 0
 	for event != "" {
 		line, rest := requester.SplitSSELine(event)
 		event = rest
+		start := offset
+		offset += len(line)
 		content := requester.SSELineContent(line)
 		if content != "data" && !strings.HasPrefix(content, "data:") {
 			result.WriteString(line)
 			continue
 		}
-		if replaced {
+		if start != lastData {
 			continue
 		}
-		replaced = true
-		for _, payloadLine := range strings.Split(string(payload), "\n") {
+		// 沿用被替换 data 行的终止符；不把 CRLF/CR 事件改成混合换行。
+		// 未终止的行也不在这里补造事件边界。
+		ending := line[len(content):]
+		separator := ending
+		if separator == "" {
+			separator = "\n"
+		}
+		for i, payloadLine := range strings.Split(string(payload), "\n") {
+			if i > 0 {
+				result.WriteString(separator)
+			}
 			result.WriteString("data: ")
 			result.WriteString(payloadLine)
-			result.WriteByte('\n')
 		}
+		result.WriteString(ending)
 	}
 	return []byte(result.String())
 }
