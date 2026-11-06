@@ -19,7 +19,7 @@ export function parseOwnershipModels(text) {
 }
 
 // 只构造归属更新，不把候选中的模型说明或价格重新写回服务端。
-export function buildOwnershipBatch({ selected, method, target, mode, suggestions, labOwners, owners }) {
+export function buildOwnershipBatch({ selected, method, target, mode, suggestions, providerOwners, owners }) {
   const models = [...selected];
   if (!models.length) return { error: '请先选择模型', items: [] };
   if (models.length > MAX_OWNERSHIP_BATCH) return { error: `每次最多选择 ${MAX_OWNERSHIP_BATCH} 个模型`, items: [] };
@@ -36,15 +36,15 @@ export function buildOwnershipBatch({ selected, method, target, mode, suggestion
   const items = [];
   for (const model of models) {
     const suggestion = Object.hasOwn(suggestions, model) ? suggestions[model] : undefined;
-    const lab = suggestion?.status === 'matched' && suggestion.labs?.length === 1 ? suggestion.labs[0] : null;
-    const owner = lab != null && Object.hasOwn(labOwners, lab) ? labOwners[lab] : null;
+    const providerID = suggestion?.status === 'matched' && suggestion.providers?.length === 1 ? suggestion.providers[0].id : null;
+    const owner = providerID != null && Object.hasOwn(providerOwners, providerID) ? providerOwners[providerID] : null;
     if (!owner || !Object.hasOwn(owners, owner)) unresolved.push(model);
     else items.push({ model, owned_by_id: Number(owner) });
   }
   if (unresolved.length) {
     return {
       items: [],
-      error: `${unresolved.length} 个模型尚未确定归属：${unresolved.slice(0, 5).join('、')}${unresolved.length > 5 ? '等' : ''}。请查询模型归属并选择对应的本系统归属，或取消选择未查到归属、归属冲突的模型。`
+      error: `${unresolved.length} 个模型尚未确定归属：${unresolved.slice(0, 5).join('、')}${unresolved.length > 5 ? '等' : ''}。请查询服务提供方并选择对应的本系统归属，或取消选择未查到服务提供方、提供方冲突的模型。`
     };
   }
   return { items };

@@ -30,7 +30,7 @@ func setupModelOwnershipControllerTest(t *testing.T) *gin.Engine {
 
 func TestModelOwnershipImportUpdatesDisplayWithoutPublishingPrices(t *testing.T) {
 	router := setupModelOwnershipControllerTest(t)
-	price := &model.Price{Model: "catalog-model", Type: "tokens", Input: 2, Output: 3}
+	price := &model.Price{Model: "@cf/moonshotai/kimi-k2.6", Type: "tokens", Input: 2, Output: 3}
 	if err := model.PricingInstance.AddPrice(price); err != nil {
 		t.Fatal(err)
 	}
@@ -43,10 +43,10 @@ func TestModelOwnershipImportUpdatesDisplayWithoutPublishingPrices(t *testing.T)
 		if req.URL.String() != model.ModelsDevURL {
 			t.Fatalf("unexpected source %s", req.URL)
 		}
-		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"host":{"models":{"catalog-model":{"canonical_model_id":"lab/catalog-model"}}}}`))}, nil
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"cloudflare-workers-ai":{"name":"Cloudflare Workers AI","models":{"@cf/moonshotai/kimi-k2.6":{"canonical_model_id":"moonshotai/kimi-k2.6"}}}}`))}, nil
 	})
 	t.Cleanup(func() { http.DefaultTransport = old })
-	response := performPricingRequest(t, router, "/ownership/suggestions", `{"models":["catalog-model","existing"]}`)
+	response := performPricingRequest(t, router, "/ownership/suggestions", `{"models":["@cf/moonshotai/kimi-k2.6","existing"]}`)
 	var suggestions struct {
 		Success bool                             `json:"success"`
 		Data    []model.ModelOwnershipSuggestion `json:"data"`
@@ -54,14 +54,18 @@ func TestModelOwnershipImportUpdatesDisplayWithoutPublishingPrices(t *testing.T)
 	if err := json.Unmarshal(response.Body.Bytes(), &suggestions); err != nil || !suggestions.Success || response.Code != http.StatusOK {
 		t.Fatalf("suggestions failed: %s (%v)", response.Body.String(), err)
 	}
-	if len(suggestions.Data) != 2 || suggestions.Data[0].Status != "matched" || suggestions.Data[0].Labs[0] != "lab" || suggestions.Data[1].Status != "unmatched" {
+	if len(suggestions.Data) != 2 || suggestions.Data[0].Status != "matched" || len(suggestions.Data[0].Providers) != 1 || suggestions.Data[0].Providers[0] != (model.ModelOwnershipProvider{ID: "cloudflare-workers-ai", Name: "Cloudflare Workers AI"}) || suggestions.Data[1].Status != "unmatched" {
 		t.Fatalf("unexpected suggestions: %+v", suggestions.Data)
+	}
+	if !strings.Contains(response.Body.String(), `"providers":[{"id":"cloudflare-workers-ai","name":"Cloudflare Workers AI"}]`) ||
+		!strings.Contains(response.Body.String(), `"providers":[]`) || strings.Contains(response.Body.String(), `"labs"`) {
+		t.Fatalf("unexpected provider wire contract: %s", response.Body.String())
 	}
 	var count int64
 	if err := model.DB.Model(&model.ModelInfo{}).Where("model = ?", price.Model).Count(&count).Error; err != nil || count != 0 {
 		t.Fatalf("preview created catalog rows: %d %v", count, err)
 	}
-	response = performPricingRequest(t, router, "/ownership/batch", `{"mode":"fill_missing","items":[{"model":"catalog-model","owned_by_id":1001},{"model":"existing","owned_by_id":1001}]}`)
+	response = performPricingRequest(t, router, "/ownership/batch", `{"mode":"fill_missing","items":[{"model":"@cf/moonshotai/kimi-k2.6","owned_by_id":1001},{"model":"existing","owned_by_id":1001}]}`)
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"created":1`) || !strings.Contains(response.Body.String(), `"updated":1`) {
 		t.Fatalf("batch failed: %d %s", response.Code, response.Body.String())
 	}

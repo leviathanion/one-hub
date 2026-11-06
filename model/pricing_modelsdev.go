@@ -54,6 +54,7 @@ type modelsDevTier struct {
 
 // 价格和归属读取同一来源结构，价格是否可表示不影响归属证据。
 type modelsDevSource map[string]struct {
+	Name   string `json:"name"`
 	Models map[string]struct {
 		Cost             json.RawMessage `json:"cost"`
 		CanonicalModelID string          `json:"canonical_model_id"`
