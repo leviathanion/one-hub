@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-test('两个入口共享归属批量编辑，保留失败选择并显式映射来源', { skip: !process.env.PRICING_UI_BROWSER, timeout: 180000 }, async () => {
+test('两个页面独立提供手动归属与 models.dev 映射', { skip: !process.env.PRICING_UI_BROWSER, timeout: 180000 }, async () => {
   const { build, preview } = await import('vite');
   const { chromium } = await import('playwright-core');
   const { default: config } = await import('../../../../vite.config.mjs');
@@ -125,10 +125,35 @@ test('两个入口共享归属批量编辑，保留失败选择并显式映射�
       await route.fulfill({ json: { success: true, data, version: 1 } });
     });
     const url = `${server.resolvedUrls.local[0]}tests/fixtures/model-ownership.html`;
-    const editor = () => page.getByRole('dialog', { name: '批量设置归属', exact: true });
-    const open = async () => {
-      await page.getByRole('button', { name: '批量设置归属', exact: true }).click();
+    let editorTitle = '手动设置归属';
+    const editor = () => page.getByRole('dialog', { name: editorTitle, exact: true });
+    const open = async (method = 'manual') => {
+      await page.getByRole('button', { name: '手动设置归属', exact: true }).waitFor();
+      await page.getByRole('button', { name: '从 models.dev 匹配归属', exact: true }).waitFor();
+      editorTitle = method === 'source' ? '从 models.dev 匹配归属' : '手动设置归属';
+      await page.getByRole('button', { name: editorTitle, exact: true }).click();
       await editor().getByRole('checkbox', { name: '选择本页模型', exact: true }).waitFor();
+      assert.equal(
+        await editor()
+          .getByRole('combobox', { name: /^设置方式/ })
+          .count(),
+        0
+      );
+      if (method === 'manual') {
+        await editor()
+          .getByRole('combobox', { name: /^目标归属/ })
+          .waitFor();
+        assert.equal(await editor().getByRole('button', { name: '查询所选模型的归属', exact: true }).count(), 0);
+        assert.equal(await editor().getByRole('table', { name: 'models.dev 归属映射', exact: true }).count(), 0);
+      } else {
+        await editor().getByRole('button', { name: '查询所选模型的归属', exact: true }).waitFor();
+        assert.equal(
+          await editor()
+            .getByRole('combobox', { name: /^目标归属/ })
+            .count(),
+          0
+        );
+      }
       assert.equal(
         await editor()
           .getByRole('combobox', { name: /^当前归属/ })
@@ -205,36 +230,52 @@ test('两个入口共享归属批量编辑，保留失败选择并显式映射�
       ]
     });
 
-    await open();
+    await open('source');
     await editor().getByRole('textbox', { name: '粘贴模型名（每行一个）' }).fill('source-a\nsource-conflict\nsource-unknown\nconstructor');
     await editor().getByRole('button', { name: '加入选择' }).click();
-    await choose('设置方式', '按 models.dev 来源匹配');
     await search('constructor');
     await editor().getByRole('row').filter({ hasText: 'constructor' }).getByText('尚未查询', { exact: true }).waitFor();
     await editor().getByRole('checkbox', { name: '选择 constructor', exact: true }).uncheck();
     await search('source-');
-    await editor().getByRole('button', { name: '匹配所选模型', exact: true }).click();
+    await editor().getByRole('button', { name: '查询所选模型的归属', exact: true }).click();
     await editor()
-      .getByRole('combobox', { name: /^来源 OpenAI 的本地归属/ })
+      .getByRole('combobox', { name: /^OpenAI 映射到本系统的归属/ })
       .waitFor();
     assert.deepEqual(sourceRequests[0], ['source-a', 'source-conflict', 'source-unknown']);
+    const mapping = () => editor().getByRole('table', { name: 'models.dev 归属映射', exact: true });
+    await mapping().getByRole('columnheader', { name: 'models.dev 解析出的归属', exact: true }).waitFor();
+    await mapping().getByRole('columnheader', { name: '映射到本系统的归属', exact: true }).waitFor();
+    const sourceRow = () =>
+      mapping()
+        .getByRole('row')
+        .filter({ has: page.getByRole('combobox', { name: /^OpenAI 映射到本系统的归属/ }) });
+    await sourceRow()
+      .getByText(/1 个模型/)
+      .waitFor();
+    await sourceRow().locator('summary').click();
+    await sourceRow().getByText('source-a', { exact: true }).waitFor();
     assert.equal(
       await editor()
-        .getByRole('combobox', { name: /^来源 OpenAI 的本地归属/ })
+        .getByRole('combobox', { name: /^OpenAI 映射到本系统的归属/ })
         .textContent(),
-      '尚未映射'
+      '请选择本系统归属'
     );
     assert.equal(await editor().getByRole('button', { name: '保存 3 个模型的归属', exact: true }).isDisabled(), true);
-    await choose('来源 OpenAI 的本地归属', 'OpenAI');
+    await choose('OpenAI 映射到本系统的归属', 'OpenAI');
     assert.equal(await editor().getByRole('button', { name: '保存 3 个模型的归属', exact: true }).isDisabled(), true);
     await search('source-');
-    await editor().getByText('来源冲突：OpenAI、lab-other', { exact: true }).waitFor();
+    await editor().getByText('归属冲突：OpenAI、lab-other', { exact: true }).waitFor();
+    await editor().getByText('未查到归属', { exact: true }).waitFor();
     await editor().getByRole('checkbox', { name: '选择 source-conflict', exact: true }).uncheck();
     await editor().getByRole('checkbox', { name: '选择 source-unknown', exact: true }).uncheck();
     await editor().getByRole('checkbox', { name: '选择 source-b', exact: true }).check();
     assert.equal(await editor().getByRole('button', { name: '保存 2 个模型的归属', exact: true }).isDisabled(), true);
-    await editor().getByRole('button', { name: '匹配所选模型', exact: true }).click();
-    await editor().getByRole('button', { name: '保存 2 个模型的归属', exact: true }).waitFor();
+    await editor().getByRole('button', { name: '查询所选模型的归属', exact: true }).click();
+    await sourceRow()
+      .getByText(/2 个模型/)
+      .waitFor();
+    await sourceRow().getByText('source-b', { exact: true }).waitFor();
+    assert.equal(await editor().getByRole('button', { name: '保存 2 个模型的归属', exact: true }).isEnabled(), true);
     await editor().getByRole('button', { name: '新建归属分类', exact: true }).click();
     const create = page.getByRole('dialog').filter({ has: page.locator('input[name="id"]') });
     await create.locator('input[name="id"]').fill('1002');
@@ -244,7 +285,7 @@ test('两个入口共享归属批量编辑，保留失败选择并显式映射�
     assert.equal(await create.locator('input[name="name"]').inputValue(), '实验室');
     await create.getByRole('button', { name: '提交', exact: true }).click();
     await create.waitFor({ state: 'hidden' });
-    await choose('来源 OpenAI 的本地归属', '实验室');
+    await choose('OpenAI 映射到本系统的归属', '实验室');
     if (process.env.OWNERSHIP_UI_SCREENSHOT) await editor().screenshot({ path: process.env.OWNERSHIP_UI_SCREENSHOT });
     await editor().getByRole('button', { name: '保存 2 个模型的归属', exact: true }).click();
     await editor().waitFor({ state: 'hidden' });
@@ -253,29 +294,34 @@ test('两个入口共享归属批量编辑，保留失败选择并显式映射�
       { model: 'source-b', owned_by_id: 1002 }
     ]);
 
-    await open();
+    await open('source');
     await select('source-a');
-    await choose('设置方式', '按 models.dev 来源匹配');
     sourceWait = new Promise((resolve) => {
       releaseSource = resolve;
     });
-    await editor().getByRole('button', { name: '匹配所选模型', exact: true }).click();
-    await editor().getByRole('button', { name: '正在匹配…', exact: true }).waitFor();
+    await editor().getByRole('button', { name: '查询所选模型的归属', exact: true }).click();
+    await editor().getByRole('button', { name: '正在查询…', exact: true }).waitFor();
     await editor().getByRole('button', { name: '取消', exact: true }).click();
     await open();
     releaseSource();
     sourceWait = null;
     await editor().getByRole('status').filter({ hasText: '已选 0 / 500' }).waitFor();
-    await choose('设置方式', '按 models.dev 来源匹配');
     assert.equal(
       await editor()
-        .getByRole('combobox', { name: /^来源 OpenAI 的本地归属/ })
+        .getByRole('combobox', { name: /^OpenAI 映射到本系统的归属/ })
         .count(),
       0
     );
     await editor().getByRole('button', { name: '取消', exact: true }).click();
 
     await page.goto(`${url}?pricing`);
+    await open('source');
+    await select('source-a');
+    await editor().getByRole('button', { name: '查询所选模型的归属', exact: true }).click();
+    await mapping().getByRole('columnheader', { name: 'models.dev 解析出的归属', exact: true }).waitFor();
+    await mapping().getByRole('columnheader', { name: '映射到本系统的归属', exact: true }).waitFor();
+    assert.equal(await editor().getByRole('button', { name: '保存 1 个模型的归属', exact: true }).isDisabled(), true);
+    await editor().getByRole('button', { name: '取消', exact: true }).click();
     await open();
     await select('owned');
     await choose('目标归属', '清空归属');
