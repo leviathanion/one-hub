@@ -36,17 +36,17 @@ function responseData(response) {
 
 function sourceDescription(suggestion) {
   if (!suggestion) return '尚未查询';
-  if (suggestion.status === 'unmatched') return '未匹配';
-  if (suggestion.status === 'conflict') return `来源冲突：${suggestion.labs.join('、')}`;
+  if (suggestion.status === 'unmatched') return '未查到归属';
+  if (suggestion.status === 'conflict') return `归属冲突：${suggestion.labs.join('、')}`;
   return suggestion.labs.join('、');
 }
 
 // 关闭后卸载编辑器，终止只读请求并丢弃本次选择；下一次打开重新加载目录。
-export default function BatchOwnershipDialog({ open, onClose, onSaved }) {
-  return open ? <OwnershipEditor onClose={onClose} onSaved={onSaved} /> : null;
+export default function BatchOwnershipDialog({ open, method, onClose, onSaved }) {
+  return open ? <OwnershipEditor key={method} method={method} onClose={onClose} onSaved={onSaved} /> : null;
 }
 
-function OwnershipEditor({ onClose, onSaved }) {
+function OwnershipEditor({ method, onClose, onSaved }) {
   const [catalog, setCatalog] = useState([]);
   const [owners, setOwners] = useState({});
   const [selected, setSelected] = useState(() => new Set());
@@ -56,7 +56,6 @@ function OwnershipEditor({ onClose, onSaved }) {
   const [onlySelected, setOnlySelected] = useState(false);
   const [page, setPage] = useState(0);
   const [pasted, setPasted] = useState('');
-  const [method, setMethod] = useState('manual');
   const [target, setTarget] = useState('');
   const [mode, setMode] = useState('fill_missing');
   const [suggestions, setSuggestions] = useState(() => Object.create(null));
@@ -119,18 +118,17 @@ function OwnershipEditor({ onClose, onSaved }) {
   const selectedOnPage = pageRows.filter((row) => selected.has(row.model)).length;
   const allPageSelected = pageRows.length > 0 && selectedOnPage === pageRows.length;
   const ownerOptions = useMemo(() => Object.entries(owners).sort(([a], [b]) => Number(a) - Number(b)), [owners]);
-  const labs = useMemo(
-    () =>
-      [
-        ...new Set(
-          [...selected].flatMap((model) => {
-            const suggestion = suggestions[model];
-            return suggestion?.status === 'matched' && suggestion.labs.length === 1 ? suggestion.labs : [];
-          })
-        )
-      ].sort(),
-    [selected, suggestions]
-  );
+  const sourceGroups = useMemo(() => {
+    const groups = new Map();
+    for (const model of selected) {
+      const suggestion = suggestions[model];
+      if (suggestion?.status !== 'matched' || suggestion.labs.length !== 1) continue;
+      const lab = suggestion.labs[0];
+      if (!groups.has(lab)) groups.set(lab, []);
+      groups.get(lab).push(model);
+    }
+    return [...groups].sort(([a], [b]) => a.localeCompare(b));
+  }, [selected, suggestions]);
   const batch = useMemo(
     () => buildOwnershipBatch({ selected, method, target, mode, suggestions, labOwners, owners }),
     [selected, method, target, mode, suggestions, labOwners, owners]
@@ -226,11 +224,14 @@ function OwnershipEditor({ onClose, onSaved }) {
   return (
     <>
       <Dialog open onClose={saving ? undefined : onClose} fullWidth maxWidth="lg" aria-labelledby="batch-ownership-title">
-        <DialogTitle id="batch-ownership-title">批量设置归属</DialogTitle>
+        <DialogTitle id="batch-ownership-title">{method === 'manual' ? '手动设置归属' : '从 models.dev 匹配归属'}</DialogTitle>
         <DialogContent dividers>
           <Stack spacing={2}>
             <Typography variant="body2" color="text.secondary">
-              为精确模型设置展示归属。已有模型说明会保留；设置归属时可补建缺少的模型信息。
+              {method === 'manual'
+                ? '选择模型后，将它们统一设置为本系统中的一个归属分类，也可以清空归属。'
+                : '先选择模型并查询 models.dev，再将查到的归属映射到本系统的归属分类。确认保存后才会修改所选模型的归属。'}
+              {' 此操作只调整模型的展示归属，不修改价格或渠道。'}
             </Typography>
             {loading ? <LinearProgress aria-label="正在加载模型目录" /> : null}
             {error ? <Alert severity="error">{error}</Alert> : null}
@@ -309,7 +310,7 @@ function OwnershipEditor({ onClose, onSaved }) {
                     <TableCell>模型标识</TableCell>
                     <TableCell>当前归属</TableCell>
                     <TableCell>模型信息</TableCell>
-                    {method === 'source' ? <TableCell>models.dev 来源</TableCell> : null}
+                    {method === 'source' ? <TableCell>models.dev 解析出的归属</TableCell> : null}
                   </TableRow>
                 </TableHead>
                 <TableBody>
@@ -372,36 +373,21 @@ function OwnershipEditor({ onClose, onSaved }) {
                 加入选择
               </Button>
             </Stack>
-            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
-              <TextField
-                id="ownership-method"
-                select
-                label="设置方式"
-                value={method}
-                onChange={(event) => setMethod(event.target.value)}
-                size="small"
-                fullWidth
-                disabled={saving || matching}
-              >
-                <MenuItem value="manual">手动统一设置</MenuItem>
-                <MenuItem value="source">按 models.dev 来源匹配</MenuItem>
-              </TextField>
-              <TextField
-                id="ownership-mode"
-                select
-                label="已有归属处理"
-                value={mode}
-                onChange={(event) => setMode(event.target.value)}
-                size="small"
-                fullWidth
-                disabled={saving}
-              >
-                <MenuItem value="fill_missing" disabled={method === 'manual' && target === CLEAR_OWNERSHIP}>
-                  仅补未设置归属
-                </MenuItem>
-                <MenuItem value="replace">覆盖所选模型的归属</MenuItem>
-              </TextField>
-            </Stack>
+            <TextField
+              id="ownership-mode"
+              select
+              label="已有归属处理"
+              value={mode}
+              onChange={(event) => setMode(event.target.value)}
+              size="small"
+              fullWidth
+              disabled={saving}
+            >
+              <MenuItem value="fill_missing" disabled={method === 'manual' && target === CLEAR_OWNERSHIP}>
+                仅补未设置归属
+              </MenuItem>
+              <MenuItem value="replace">覆盖所选模型的归属</MenuItem>
+            </TextField>
             {method === 'manual' ? (
               <TextField
                 id="ownership-target"
@@ -430,36 +416,76 @@ function OwnershipEditor({ onClose, onSaved }) {
               <Stack spacing={2}>
                 <Box>
                   <Button variant="outlined" onClick={matchSource} disabled={saving || matching || !loaded || !selected.size}>
-                    {matching ? '正在匹配…' : '匹配所选模型'}
+                    {matching ? '正在查询…' : '查询所选模型的归属'}
                   </Button>
                 </Box>
                 <Typography variant="body2" color="text.secondary">
-                  为来源中的 lab 标识选择本地归属。名称相同也需要确认映射；未匹配和来源冲突的模型请取消选择后再保存。
+                  左列是 models.dev 解析出的归属，右列请选择对应的本系统归属。每行选择会应用到该行列出的所有模型；名称相同也需要确认。
+                  未查到归属或归属冲突的模型，请先从上方列表取消选择，再保存其他模型。
                 </Typography>
-                {labs.map((lab, index) => (
-                  <TextField
-                    id={`ownership-lab-${index}`}
-                    select
-                    key={lab}
-                    label={`来源 ${lab} 的本地归属`}
-                    SelectProps={{ displayEmpty: true }}
-                    InputLabelProps={{ shrink: true }}
-                    value={labOwners[lab] || ''}
-                    size="small"
-                    fullWidth
-                    disabled={saving}
-                    onChange={(event) =>
-                      setLabOwners((current) => Object.assign(Object.create(null), current, { [lab]: event.target.value }))
-                    }
-                  >
-                    <MenuItem value="">尚未映射</MenuItem>
-                    {ownerOptions.map(([id, owner]) => (
-                      <MenuItem key={id} value={id}>
-                        {owner.name}
-                      </MenuItem>
-                    ))}
-                  </TextField>
-                ))}
+                {sourceGroups.length > 0 ? (
+                  <TableContainer>
+                    <Table
+                      size="small"
+                      aria-label="models.dev 归属映射"
+                      sx={{
+                        tableLayout: 'fixed',
+                        '& .MuiTableCell-root': { whiteSpace: 'normal', overflowWrap: 'anywhere', px: { xs: 1, sm: 2 } }
+                      }}
+                    >
+                      <TableHead>
+                        <TableRow>
+                          <TableCell sx={{ width: '45%' }}>models.dev 解析出的归属</TableCell>
+                          <TableCell>映射到本系统的归属</TableCell>
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        {sourceGroups.map(([lab, models], index) => (
+                          <TableRow key={lab}>
+                            <TableCell component="th" scope="row" sx={{ verticalAlign: 'top', overflowWrap: 'anywhere' }}>
+                              <Typography variant="subtitle2">{lab}</Typography>
+                              <Box component="details" sx={{ mt: 0.5 }}>
+                                <Box component="summary" sx={{ cursor: 'pointer', typography: 'body2' }}>
+                                  {models.length} 个模型，查看列表
+                                </Box>
+                                <Box component="ul" sx={{ pl: 2, mb: 0, maxHeight: 160, overflowY: 'auto' }}>
+                                  {models.map((model) => (
+                                    <li key={model}>{model}</li>
+                                  ))}
+                                </Box>
+                              </Box>
+                            </TableCell>
+                            <TableCell sx={{ verticalAlign: 'top' }}>
+                              <TextField
+                                id={`ownership-lab-${index}`}
+                                select
+                                SelectProps={{
+                                  displayEmpty: true,
+                                  inputProps: { 'aria-label': `${lab} 映射到本系统的归属` }
+                                }}
+                                value={labOwners[lab] || ''}
+                                size="small"
+                                fullWidth
+                                sx={{ '& .MuiSelect-select': { whiteSpace: 'normal', overflowWrap: 'anywhere' } }}
+                                disabled={saving || matching}
+                                onChange={(event) =>
+                                  setLabOwners((current) => Object.assign(Object.create(null), current, { [lab]: event.target.value }))
+                                }
+                              >
+                                <MenuItem value="">请选择本系统归属</MenuItem>
+                                {ownerOptions.map(([id, owner]) => (
+                                  <MenuItem key={id} value={id}>
+                                    {owner.name}
+                                  </MenuItem>
+                                ))}
+                              </TextField>
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+                ) : null}
               </Stack>
             )}
             <Box>
@@ -508,7 +534,12 @@ function OwnershipEditor({ onClose, onSaved }) {
 
 BatchOwnershipDialog.propTypes = {
   open: PropTypes.bool.isRequired,
+  method: PropTypes.oneOf(['manual', 'source']).isRequired,
   onClose: PropTypes.func.isRequired,
   onSaved: PropTypes.func.isRequired
 };
-OwnershipEditor.propTypes = { onClose: PropTypes.func.isRequired, onSaved: PropTypes.func.isRequired };
+OwnershipEditor.propTypes = {
+  method: PropTypes.oneOf(['manual', 'source']).isRequired,
+  onClose: PropTypes.func.isRequired,
+  onSaved: PropTypes.func.isRequired
+};

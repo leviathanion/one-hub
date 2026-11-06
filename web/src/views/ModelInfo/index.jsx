@@ -26,7 +26,7 @@ export default function ModelInfo() {
   const [openModal, setOpenModal] = useState(false);
   const [editId, setEditId] = useState(0);
   const [openImportModal, setOpenImportModal] = useState(false);
-  const [openOwnership, setOpenOwnership] = useState(false);
+  const [ownershipMethod, setOwnershipMethod] = useState(null);
   const [page, setPage] = useState(0);
   const [rowsPerPage, setRowsPerPage] = useState(10);
 
@@ -142,9 +142,12 @@ export default function ModelInfo() {
           </Typography>
         </Stack>
 
-        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
-          <Button variant="outlined" onClick={() => setOpenOwnership(true)}>
-            批量设置归属
+        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2} useFlexGap sx={{ flexWrap: 'wrap' }}>
+          <Button variant="outlined" onClick={() => setOwnershipMethod('manual')}>
+            手动设置归属
+          </Button>
+          <Button variant="outlined" onClick={() => setOwnershipMethod('source')}>
+            从 models.dev 匹配归属
           </Button>
           <Button
             variant="outlined"
@@ -252,10 +255,11 @@ export default function ModelInfo() {
         existingModels={modelInfos}
       />
       <BatchOwnershipDialog
-        open={openOwnership}
-        onClose={() => setOpenOwnership(false)}
+        open={ownershipMethod !== null}
+        method={ownershipMethod || 'manual'}
+        onClose={() => setOwnershipMethod(null)}
         onSaved={() => {
-          setOpenOwnership(false);
+          setOwnershipMethod(null);
           handleRefresh();
         }}
       />

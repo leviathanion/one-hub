@@ -44,7 +44,7 @@ export function buildOwnershipBatch({ selected, method, target, mode, suggestion
   if (unresolved.length) {
     return {
       items: [],
-      error: `${unresolved.length} 个模型尚未确定归属：${unresolved.slice(0, 5).join('、')}${unresolved.length > 5 ? '等' : ''}。请补全来源映射，或取消选择未匹配、冲突的模型。`
+      error: `${unresolved.length} 个模型尚未确定归属：${unresolved.slice(0, 5).join('、')}${unresolved.length > 5 ? '等' : ''}。请查询模型归属并选择对应的本系统归属，或取消选择未查到归属、归属冲突的模型。`
     };
   }
   return { items };

@@ -42,7 +42,7 @@ const Pricing = () => {
   const [modelList, setModelList] = useState([]);
   const [openModal, setOpenModal] = useState(false);
   const [openaddModal, setOpenaddModal] = useState(false);
-  const [openOwnership, setOpenOwnership] = useState(false);
+  const [ownershipMethod, setOwnershipMethod] = useState(null);
   const [prices, setPrices] = useState([]);
   const [priceVersion, setPriceVersion] = useState(0);
   const [noPriceModel, setNoPriceModel] = useState([]);
@@ -196,22 +196,29 @@ const Pricing = () => {
           </Typography>
         </Stack>
 
-        <ButtonGroup variant="contained" aria-label="outlined small primary button group">
-          <Button color="primary" onClick={() => handleOpenaddModal(null)} startIcon={<Icon icon="solar:add-circle-line-duotone" />}>
-            {t('pricingPage.newButton')}
+        <Stack direction={{ xs: 'column', md: 'row' }} spacing={1} useFlexGap sx={{ flexWrap: 'wrap' }}>
+          <ButtonGroup variant="contained" aria-label="价格操作">
+            <Button color="primary" onClick={() => handleOpenaddModal(null)} startIcon={<Icon icon="solar:add-circle-line-duotone" />}>
+              {t('pricingPage.newButton')}
+            </Button>
+            <Button onClick={handleRefresh} startIcon={<Icon icon="solar:refresh-bold-duotone" />}>
+              {t('pricingPage.refreshButton')}
+            </Button>
+            <Button
+              onClick={() => {
+                setOpenModal(true);
+              }}
+            >
+              {t('pricingPage.updatePricesButton')}
+            </Button>
+          </ButtonGroup>
+          <Button variant="outlined" onClick={() => setOwnershipMethod('manual')}>
+            手动设置归属
           </Button>
-          <Button onClick={handleRefresh} startIcon={<Icon icon="solar:refresh-bold-duotone" />}>
-            {t('pricingPage.refreshButton')}
+          <Button variant="outlined" onClick={() => setOwnershipMethod('source')}>
+            从 models.dev 匹配归属
           </Button>
-          <Button onClick={() => setOpenOwnership(true)}>批量设置归属</Button>
-          <Button
-            onClick={() => {
-              setOpenModal(true);
-            }}
-          >
-            {t('pricingPage.updatePricesButton')}
-          </Button>
-        </ButtonGroup>
+        </Stack>
       </Stack>
 
       <Alert severity="info">
@@ -289,10 +296,11 @@ const Pricing = () => {
         onOk={handleOkModal}
       />
       <BatchOwnershipDialog
-        open={openOwnership}
-        onClose={() => setOpenOwnership(false)}
+        open={ownershipMethod !== null}
+        method={ownershipMethod || 'manual'}
+        onClose={() => setOwnershipMethod(null)}
         onSaved={() => {
-          setOpenOwnership(false);
+          setOwnershipMethod(null);
           fetchOwnedby();
           reloadData();
         }}
