@@ -223,6 +223,31 @@
         "vertex": "VertexAI region と project",
         "opaque": "拡張データのみ保存"
       }
+    },
+    "customParameters": {
+      "title": "設定方法と例",
+      "intro": "例を1つ選び、フィールドと値を調整して上の欄に貼り付けてください。コピーしてもフォームは変更されません。",
+      "removeRule": "remove_params で削除するフィールドを指定します。ネストしたオブジェクトには metadata.internal のようなドット区切りのパスを使います。存在しないフィールドは無視され、配列の添字やワイルドカードには対応していません。",
+      "overwriteRule": "overwrite: true は temperature を 0.7 に固定します。他の設定フィールドも、オブジェクトや配列を含めて全体を置き換えます。",
+      "nestedRule": "ネストしたオブジェクトの例外：overwrite が false でもオブジェクトは再帰的にマージされ、ネストした同名の値は設定値で上書きされます。追加や上書きには JSON オブジェクトを使用してください。ドット区切りのパスは remove_params 専用です。",
+      "orderRule": "各処理では削除の後に追加・上書きを行います。削除したフィールドを設定で追加すると、最終的なリクエストに再び含まれます。",
+      "modelRule": "upstream-model をモデルマッピング後の上流モデル名に完全一致するよう置き換えてください。per_model: true は最上位の通常パラメーターや remove_params を継承しません。共通の規則は各モデルのオブジェクト内に記述してください。一致しないモデルは変更されません。per_model、overwrite、pre_add は最上位に置きます。",
+      "stageRule": "pre_add：既定値は false で、プロトコル変換後の上流フィールド名を使用します。true にすると変換前に処理します。ただし Responses→Chat 互換経路では変換後の Chat フィールドを使用します。削除したフィールドが後続の変換で再生成される場合があります。",
+      "protectedRule": "保護されたフィールド：model、stream、stream_format の変更や削除は無視されます。prompt_cache_key を変更する設定は保存できません。Responses の background、conversation、previous_response_id、prompt、store などのライフサイクルフィールドも変更・削除から保護されます。",
+      "scopeRule": "適用範囲：リクエストボディ用の設定であり、ヘッダーや URL パラメーター用ではありません。ネイティブ画像編集など、追加パラメーターを適用しないエンドポイントもあります。",
+      "removeTitle": "フィールドを削除",
+      "overwriteTitle": "パラメーターを上書き",
+      "perModelTitle": "特定のモデルだけを変更",
+      "preAddTitle": "プロトコル変換前に削除",
+      "copy": "例をコピー",
+      "copyExample": "例をコピー：{{name}}",
+      "copied": "例をコピーしました",
+      "copyFailed": "コピーできませんでした。例を選択して手動でコピーしてください。",
+      "defaultTitle": "既定値だけを補う",
+      "defaultRule": "通常フィールドがない場合だけ既定値を補います。この例では temperature がない場合だけ 0.7 を追加します。ネストしたオブジェクトのマージ規則は詳細設定を参照してください。",
+      "advancedTitle": "詳細ルールと適用範囲",
+      "docs": "設定ガイド全文（中国語、新しいタブで開く）",
+      "scopeHint": "既定では上流リクエストのフィールド名を使います。対象外のフィールドやエンドポイントについては詳細設定を参照してください。"
     }
   },
   "channel_index": {
@@ -2140,5 +2165,6 @@
   },
   "modelsDev": {
     "fetch": "models.dev から取得"
-  }
+  },
+  "填写 JSON 对象，可补充、覆盖或删除请求体字段；留空不修改。删除用 remove_params，覆盖用 overwrite。展开下方说明可查看规则和复制示例。": "JSON オブジェクトでリクエストボディのフィールドを追加・上書き・削除できます。空欄なら変更しません。削除には remove_params、上書きには overwrite を使います。下の説明を開くとルールと例を確認できます。"
 }

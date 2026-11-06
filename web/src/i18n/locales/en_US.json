@@ -243,6 +243,31 @@
         "vertex": "VertexAI region and project",
         "opaque": "Save extension data only"
       }
+    },
+    "customParameters": {
+      "title": "Configuration guide and examples",
+      "intro": "Choose an example, adapt its fields and values, then paste it above. Copying does not change the form.",
+      "removeRule": "remove_params lists fields to delete. Use dotted paths for nested objects, such as metadata.internal. Missing fields are skipped; array indexes and wildcards are not supported.",
+      "overwriteRule": "overwrite: true sets temperature to 0.7. Every other configured field is also replaced entirely, including objects and arrays.",
+      "nestedRule": "Nested object exception: with overwrite false, objects are merged recursively and configured values still replace matching nested values. To add or override nested fields, use JSON objects; dotted paths are only for remove_params.",
+      "orderRule": "Within each application, deletion happens before adding or overriding fields. A deleted field will be present again if the configuration also adds it.",
+      "modelRule": "Replace upstream-model with the exact upstream model name after model mapping. per_model: true does not inherit top-level ordinary parameters or remove_params. Repeat shared rules inside each model object; unmatched models are unchanged. Keep per_model, overwrite and pre_add at the outermost level.",
+      "stageRule": "pre_add: defaults to false, using upstream field names after protocol conversion. Set to true to process request fields before conversion. The Responses-to-Chat compatibility path is an exception and uses converted Chat fields. Later conversion may regenerate deleted fields.",
+      "protectedRule": "Protected fields: changes or deletions to model, stream and stream_format are ignored. Configurations modifying prompt_cache_key cannot be saved. Responses lifecycle fields such as background, conversation, previous_response_id, prompt and store are also protected from changes or deletion.",
+      "scopeRule": "Scope: these settings apply to request bodies, not headers or URL parameters. Some endpoints do not apply them, including native image editing requests.",
+      "removeTitle": "Delete fields",
+      "overwriteTitle": "Override a parameter",
+      "perModelTitle": "Change only a specific model",
+      "preAddTitle": "Delete before protocol conversion",
+      "copy": "Copy example",
+      "copyExample": "Copy example: {{name}}",
+      "copied": "Example copied",
+      "copyFailed": "Copy failed. Select the example and copy it manually.",
+      "defaultTitle": "Add a default value only",
+      "defaultRule": "Default values are added only when ordinary fields are missing. This example adds 0.7 only when temperature is absent. See the advanced section for nested object merging.",
+      "advancedTitle": "Advanced rules and scope",
+      "docs": "Full configuration guide (Chinese, opens in a new tab)",
+      "scopeHint": "Use upstream request fields by default. Some fields and endpoints are excluded; see the advanced section."
     }
   },
   "channel_index": {
@@ -2173,5 +2198,6 @@
   },
   "modelsDev": {
     "fetch": "Fetch from models.dev"
-  }
+  },
+  "填写 JSON 对象，可补充、覆盖或删除请求体字段；留空不修改。删除用 remove_params，覆盖用 overwrite。展开下方说明可查看规则和复制示例。": "Enter a JSON object to add, override or delete request body fields; leave blank to make no changes. Use remove_params to delete and overwrite to override. Expand the guide below for rules and examples."
 }

@@ -105,6 +105,7 @@ curl --request POST \
 
 ## 进阶主题
 
+- [渠道额外参数](/use/channel-parameters)：补充、覆盖或删除请求参数，以及按模型配置和生效阶段
 - [价格更新](/use/prices_update)：当前价格目录更新与模型价格配置
 - [条件倍率配置](/use/pricing-rate-rules)：统一倍率、缓存例外及夜间／周末优惠配置
 - [Realtime 配置](/use/realtime): `/v1/realtime` WebSocket 配置项、Origin 白名单、安全策略

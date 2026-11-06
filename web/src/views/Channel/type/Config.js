@@ -55,7 +55,7 @@ const defaultConfig = {
     model_mapping: '模型映射关系：例如用户请求A模型，实际转发给渠道的模型为B。在B模型加前缀+，表示使用传入模型计费，例如：+gpt-3.5-turbo',
     model_headers: '自定义模型请求头，例如：{"key": "value"}',
     custom_parameter:
-      '支持通过 JSON 注入额外参数（可嵌套）。overwrite：设为 true 覆盖同名字段，否则仅补充缺失字段；per_model：设为 true 后按模型名配置参数，如 {"per_model":true,"gpt-4":{"temperature":0.5}}。pre_add：设为 true 时在适配上游协议前覆盖请求字段，如 {"pre_add":true,"overwrite":true,"temperature":0.7}；否则在转换后的上游原生请求中添加参数。Responses→Chat 兼容路径的 pre_add 使用转换后的 Chat 字段。model、stream、stream_format 属于代理的选路和交付字段，不能通过这些参数改写。',
+      '填写 JSON 对象，可补充、覆盖或删除请求体字段；留空不修改。删除用 remove_params，覆盖用 overwrite。展开下方说明可查看规则和复制示例。',
     groups: '请选择该渠道所支持的用户组',
     only_chat: '如果选择了仅支持聊天，那么遇到有函数调用的请求会跳过该渠道',
     provider_models_list: '必须填写所有数据后才能获取模型列表',
