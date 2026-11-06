@@ -11,6 +11,7 @@ import { showError } from 'utils/common';
 import { CheckUpdates } from './component/CheckUpdates';
 import EditeModal from './component/EditModal';
 import { useTranslation } from 'react-i18next';
+import BatchOwnershipDialog from 'views/ModelInfo/component/BatchOwnershipDialog';
 
 function CustomTabPanel(props) {
   const { children, value, index, ...other } = props;
@@ -41,6 +42,7 @@ const Pricing = () => {
   const [modelList, setModelList] = useState([]);
   const [openModal, setOpenModal] = useState(false);
   const [openaddModal, setOpenaddModal] = useState(false);
+  const [openOwnership, setOpenOwnership] = useState(false);
   const [prices, setPrices] = useState([]);
   const [priceVersion, setPriceVersion] = useState(0);
   const [noPriceModel, setNoPriceModel] = useState([]);
@@ -201,6 +203,7 @@ const Pricing = () => {
           <Button onClick={handleRefresh} startIcon={<Icon icon="solar:refresh-bold-duotone" />}>
             {t('pricingPage.refreshButton')}
           </Button>
+          <Button onClick={() => setOpenOwnership(true)}>批量设置归属</Button>
           <Button
             onClick={() => {
               setOpenModal(true);
@@ -284,6 +287,15 @@ const Pricing = () => {
           setOpenModal(false);
         }}
         onOk={handleOkModal}
+      />
+      <BatchOwnershipDialog
+        open={openOwnership}
+        onClose={() => setOpenOwnership(false)}
+        onSaved={() => {
+          setOpenOwnership(false);
+          fetchOwnedby();
+          reloadData();
+        }}
       />
     </Stack>
   );

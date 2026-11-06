@@ -141,6 +141,9 @@ func SetApiRouter(router *gin.Engine) {
 		modelInfoRoute.GET("/", controller.GetAllModelInfo)
 		modelInfoRoute.Use(middleware.AdminAuth())
 		{
+			modelInfoRoute.GET("/ownership/catalog", controller.GetModelOwnershipCatalog)
+			modelInfoRoute.POST("/ownership/suggestions", controller.GetModelOwnershipSuggestions)
+			modelInfoRoute.POST("/ownership/batch", controller.BatchSetModelOwnership)
 			modelInfoRoute.GET("/:id", controller.GetModelInfo)
 			modelInfoRoute.POST("/", controller.CreateModelInfo)
 			modelInfoRoute.PUT("/", controller.UpdateModelInfo)

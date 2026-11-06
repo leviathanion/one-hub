@@ -15,6 +15,7 @@ import { API } from 'utils/api';
 import EditModal from './component/EditModal';
 import ImportModal from './component/ImportModal';
 import { Icon } from '@iconify/react';
+import BatchOwnershipDialog from './component/BatchOwnershipDialog';
 
 // ----------------------------------------------------------------------
 export default function ModelInfo() {
@@ -25,6 +26,7 @@ export default function ModelInfo() {
   const [openModal, setOpenModal] = useState(false);
   const [editId, setEditId] = useState(0);
   const [openImportModal, setOpenImportModal] = useState(false);
+  const [openOwnership, setOpenOwnership] = useState(false);
   const [page, setPage] = useState(0);
   const [rowsPerPage, setRowsPerPage] = useState(10);
 
@@ -141,6 +143,9 @@ export default function ModelInfo() {
         </Stack>
 
         <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
+          <Button variant="outlined" onClick={() => setOpenOwnership(true)}>
+            批量设置归属
+          </Button>
           <Button
             variant="outlined"
             color="primary"
@@ -245,6 +250,14 @@ export default function ModelInfo() {
           }
         }}
         existingModels={modelInfos}
+      />
+      <BatchOwnershipDialog
+        open={openOwnership}
+        onClose={() => setOpenOwnership(false)}
+        onSaved={() => {
+          setOpenOwnership(false);
+          handleRefresh();
+        }}
       />
     </>
   );
