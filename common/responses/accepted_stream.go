@@ -2,6 +2,7 @@ package responses
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 
@@ -129,6 +130,26 @@ type EventStream interface {
 }
 
 func IgnoreResponsesEvent(string) error { return nil }
+
+// IsTerminalSSEEvent 只识别交付边界，完整协议及用量仍由各自观察者处理。
+func IsTerminalSSEEvent(event []byte) bool {
+	payload, ok := SSEDataPayload(string(event))
+	if !ok {
+		return false
+	}
+	if strings.TrimSpace(payload) == "[DONE]" {
+		return true
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal([]byte(payload), &fields) != nil {
+		return false
+	}
+	var eventType string
+	if json.Unmarshal(fields["type"], &eventType) != nil {
+		return false
+	}
+	return strings.TrimSpace(eventType) == "error" || IsTerminalEventType(eventType)
+}
 
 type streamWithObserver struct {
 	requester.StreamReaderInterface[string]

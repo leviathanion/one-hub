@@ -154,7 +154,7 @@ func (p Pump) Run(ctx context.Context) {
 	defer close(done)
 
 	for {
-		mt, payload, err := c.raw.ReadMessage()
+		mt, payload, err := c.readMessage()
 		if err != nil {
 			c.Close(classifyReadCloseInfo(err))
 			return
@@ -181,6 +181,22 @@ func (p Pump) Run(ctx context.Context) {
 			return
 		}
 	}
+}
+
+func (c *ManagedConn) readMessage() (int, []byte, error) {
+	mt, reader, err := c.raw.NextReader()
+	if err != nil {
+		return mt, nil, err
+	}
+	// Gorilla limits the compressed payload; the application limit also applies
+	// to the decoded message before it is handed to the relay.
+	limit := c.readLimit()
+	payload, err := io.ReadAll(io.LimitReader(reader, limit+1))
+	if int64(len(payload)) > limit {
+		_ = c.writeCloseFrameBestEffort(CloseMessageTooBig, "message_too_big")
+		return mt, nil, websocket.ErrReadLimit
+	}
+	return mt, payload, err
 }
 
 func classifyReadCloseInfo(err error) CloseInfo {

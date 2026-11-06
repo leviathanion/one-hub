@@ -212,9 +212,13 @@ ResponsesWS frame body 现状：
 | `x-codex-inference-call-id` | inbound header | 有证据时发送 |
 | `traceparent` / `tracestate` | inbound valid W3C tracing header | HTTP path 可透传；one-hub 当前不在 planner 内主动生成本地 trace header |
 | `x-codex-installation-id` | `/responses`：body metadata 优先，其次 inbound header；`/responses/compact`：inbound header 优先，其次 body metadata；缺失时默认不生成，只有 `other.codex.auto_generate.installation_id=true` 才生成 proxy-scoped installation id | 普通 `/responses` 当前会把 resolved installation id 投影为 header；显式生成时也会作为 header 发送，严格对照本文固定 Codex 快照时比“主要通过 body”画像更强 |
-| `Content-Encoding` | 不按 Codex zstd 策略生成 | Codex 部分请求可能 zstd；one-hub 仍使用普通 JSON body |
+| `Content-Encoding` | `/responses` 与 `/responses/compact` 的最终 body 达到 1 KiB 且压缩后更小时发送 `zstd` | 只改变传输编码，保留 JSON 原始字节；上游拒绝编码时返回原错误，不自动重发 |
+| `Accept-Encoding` | Codex HTTP requester 声明 `gzip, zstd` | 在错误映射与协议解析前按响应声明流式解压；其他 provider 的 exact-wire requester 不受影响 |
 
 HTTP body 现状：
+
+- 压缩复用已有 zstd 依赖和 requester；响应解码窗口上限为 128 MiB，非流式响应在 64 MiB 读取预算内确认解压 EOF 且无错误后才接受，SSE 沿用事件大小限制。Responses WebSocket 下游和 Codex 上游通过 `permessage-deflate` 协商压缩，消息大小限制同时作用于解压后的消息；未协商压缩的连接保持普通帧。
+- 压缩 SSE 的单事件上限仍为 16 MiB；终态之后的尾部使用独立的 16 MiB 缓冲预算，避免接近上限的终态因追加 `[DONE]` 或注释而超限。终态与尾部合计最多保留 32 MiB 有效载荷，按需分配，确认解压 EOF 无误后才交给协议及用量处理器；之前的完整事件即时交付。该边界同时覆盖 Responses 聚合、原生流和 Chat 转换流。
 
 - 普通 `/responses` 使用 raw JSON object 为上游 body 基底，保留 `client_metadata`、未知字段、未知数值精度；只 patch `model`、`stream`、`store=false`、必要的 `prompt_cache_key`，并在存在 `reasoning` 时补 `include: reasoning.encrypted_content`。
 - `/responses/compact` 以 raw body 为基底，保留未知字段；移除 `stream`、`store`、`include`、`client_metadata`，其中 metadata 用于本地 identity header 投影。`context_management` 和 `truncation` 因 compact 不可表示而在 provider work 前拒绝。
@@ -302,4 +306,4 @@ Trade-off：默认不合成身份字段会牺牲“空请求也尽量像 Codex �
 - 普通 `/responses` 当前会把 resolved `x-codex-installation-id` 投影为 HTTP header；若严格追随本文固定 Codex 快照的普通请求画像，需要重新评估是否只保留 body 层。
 - `/responses/compact` 当前也会发送 `x-client-request-id`；固定 Codex 快照里 compact 路径未明确额外补该字段。
 - responses-lite 当前只有 inbound header 会在真实请求中触发；没有公开 channel policy knob，也没有未接入的内部 policy 分支。
-- one-hub 仍不实现 Codex zstd request body、客户端 attestation 生成、本地 W3C trace metadata 注入等更深层 parity。
+- one-hub 仍不实现客户端 attestation 生成、本地 W3C trace metadata 注入等更深层 parity。
