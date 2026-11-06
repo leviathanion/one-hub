@@ -52,11 +52,32 @@ type modelsDevTier struct {
 	} `json:"tier"`
 }
 
+// 价格和归属读取同一来源结构，价格是否可表示不影响归属证据。
+type modelsDevSource map[string]struct {
+	Models map[string]struct {
+		Cost             json.RawMessage `json:"cost"`
+		CanonicalModelID string          `json:"canonical_model_id"`
+	} `json:"models"`
+}
+
+func newModelsDevClient() *http.Client {
+	return &http.Client{Timeout: 20 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error {
+		return errors.New("models.dev redirects are not allowed")
+	}}
+}
+
 func FetchModelsDevPrices(ctx context.Context) (*ModelsDevCatalog, error) {
-	client := &http.Client{Timeout: 20 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("models.dev redirects are not allowed") }}
-	return fetchModelsDevPrices(ctx, client)
+	return fetchModelsDevPrices(ctx, newModelsDevClient())
 }
 func fetchModelsDevPrices(ctx context.Context, client *http.Client) (*ModelsDevCatalog, error) {
+	upstream, err := fetchModelsDevSource(ctx, client)
+	if err != nil {
+		return nil, err
+	}
+	return convertModelsDevPrices(upstream), nil
+}
+
+func fetchModelsDevSource(ctx context.Context, client *http.Client) (modelsDevSource, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ModelsDevURL, nil)
 	if err != nil {
 		return nil, err
@@ -69,9 +90,17 @@ func fetchModelsDevPrices(ctx context.Context, client *http.Client) (*ModelsDevC
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("models.dev returned status %d", resp.StatusCode)
 	}
-	return ConvertModelsDevPrices(resp.Body)
+	return decodeModelsDevSource(resp.Body)
 }
 func ConvertModelsDevPrices(r io.Reader) (*ModelsDevCatalog, error) {
+	upstream, err := decodeModelsDevSource(r)
+	if err != nil {
+		return nil, err
+	}
+	return convertModelsDevPrices(upstream), nil
+}
+
+func decodeModelsDevSource(r io.Reader) (modelsDevSource, error) {
 	data, err := io.ReadAll(io.LimitReader(r, MaxRemotePriceCatalogBytes+1))
 	if err != nil {
 		return nil, err
@@ -79,18 +108,17 @@ func ConvertModelsDevPrices(r io.Reader) (*ModelsDevCatalog, error) {
 	if int64(len(data)) > MaxRemotePriceCatalogBytes {
 		return nil, errors.New("models.dev catalog exceeds size limit")
 	}
-	var upstream map[string]struct {
-		Models map[string]struct {
-			Cost             json.RawMessage `json:"cost"`
-			CanonicalModelID string          `json:"canonical_model_id"`
-		} `json:"models"`
-	}
+	var upstream modelsDevSource
 	if err := json.Unmarshal(data, &upstream); err != nil {
 		return nil, fmt.Errorf("models.dev JSON: %w", err)
 	}
 	if len(upstream) == 0 {
 		return nil, errors.New("empty models.dev catalog")
 	}
+	return upstream, nil
+}
+
+func convertModelsDevPrices(upstream modelsDevSource) *ModelsDevCatalog {
 	catalog := &ModelsDevCatalog{URL: ModelsDevURL, Candidates: []ModelsDevCandidate{}}
 	counts := map[string]int{}
 	for provider, p := range upstream {
@@ -121,7 +149,7 @@ func ConvertModelsDevPrices(r io.Reader) (*ModelsDevCatalog, error) {
 		return a.Provider < b.Provider
 	})
 	selectModelsDevPrices(catalog)
-	return catalog, nil
+	return catalog
 }
 
 // Official publisher catalogs take precedence over multi-vendor hosts. Keep this

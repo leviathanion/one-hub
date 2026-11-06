@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"one-api/common"
@@ -68,20 +67,7 @@ func (r manualPriceFields) price() (*model.Price, bool, error) {
 }
 
 func decodeStrictPriceRequest(c *gin.Context, dst any) error {
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, model.MaxRemotePriceCatalogBytes)
-	decoder := json.NewDecoder(c.Request.Body)
-	decoder.DisallowUnknownFields()
-	decoder.UseNumber()
-	if err := decoder.Decode(dst); err != nil {
-		return err
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		if err == nil {
-			return errors.New("request must contain one JSON value")
-		}
-		return err
-	}
-	return nil
+	return decodeStrictJSONRequest(c, dst, model.MaxRemotePriceCatalogBytes)
 }
 
 func respondPriceMutationError(c *gin.Context, err error) {

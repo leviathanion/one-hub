@@ -58,7 +58,6 @@ const EditModal = ({ open, Oid, onCancel, onOk }) => {
         } else {
           showSuccess(t('userPage.saveSuccess'));
         }
-        setSubmitting(false);
         setStatus({ success: true });
         onOk(true);
       } else {
@@ -66,7 +65,9 @@ const EditModal = ({ open, Oid, onCancel, onOk }) => {
         setErrors({ submit: message });
       }
     } catch (error) {
-      return;
+      setErrors({ submit: error.message || '保存归属失败，请重试' });
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -176,6 +177,7 @@ const EditModal = ({ open, Oid, onCancel, onOk }) => {
                   {t('userPage.submit')}
                 </Button>
               </DialogActions>
+              {errors.submit && <FormHelperText error>{errors.submit}</FormHelperText>}
             </form>
           )}
         </Formik>
