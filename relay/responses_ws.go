@@ -2876,7 +2876,7 @@ func ResponsesWebSocket(c *gin.Context) {
 	clientConn, err := wsconn.AcceptManaged(c.Writer, c.Request, responsesWSClientWSConfig(), wsconn.AcceptOptions{
 		CheckOrigin:       realtimeWebSocketOriginAllowed,
 		ResponseHeader:    websocketUpgradeResponseHeader(c.Request),
-		EnableCompression: false,
+		EnableCompression: true,
 		Subprotocols:      echoableClientWebSocketSubprotocols(c.Request),
 	})
 	if err != nil {

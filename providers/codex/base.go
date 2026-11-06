@@ -219,7 +219,7 @@ func (p *CodexProvider) codexRequester() *requester.HTTPRequester {
 	}
 	p.runtimeMu.RLock()
 	defer p.runtimeMu.RUnlock()
-	return p.Requester
+	return p.Requester.ForResponseCompression()
 }
 
 func (p *CodexProvider) codexPreCost() int {

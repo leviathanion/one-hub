@@ -72,6 +72,7 @@ type HTTPRequester struct {
 	ReplayOpenAIErrorEnvelopes bool
 	profile                    HTTPProfile
 	transports                 *providerHTTPTransportSet
+	responseCompression        bool
 }
 
 // NewHTTPRequester 创建一个新的 HTTPRequester 实例。
@@ -267,6 +268,7 @@ func (d *responseHeaderDeadline) Stop() {
 
 type policyResponseBody struct {
 	body       io.ReadCloser
+	readErr    error
 	cancel     context.CancelFunc
 	idle       time.Duration
 	stopCancel func() bool
@@ -288,6 +290,9 @@ func (b *policyResponseBody) Read(p []byte) (int, error) {
 	if b == nil || b.body == nil {
 		return 0, io.EOF
 	}
+	if b.readErr != nil {
+		return 0, b.readErr
+	}
 	var idleTimer *time.Timer
 	if b.idle > 0 {
 		idleTimer = time.AfterFunc(b.idle, func() {
@@ -295,6 +300,8 @@ func (b *policyResponseBody) Read(p []byte) (int, error) {
 		})
 	}
 	n, err := b.body.Read(p)
+	// 关闭源 body 后仍保留读取终态；解码器可能在收到 n > 0, EOF 后继续读。
+	b.readErr = err
 	idleExpired := false
 	if idleTimer != nil {
 		idleExpired = !idleTimer.Stop()
@@ -358,6 +365,18 @@ func (r *HTTPRequester) NewRequest(method, url string, setters ...requestOption)
 	for _, setter := range setters {
 		setter(args)
 	}
+	if body, ok := args.body.(zstdRequestBody); ok {
+		encoded, encoding, err := encodeZstdRequestBody(body)
+		if err != nil {
+			return nil, err
+		}
+		args.body = encoded
+		args.header.Del("Content-Encoding")
+		args.header.Del("Content-Length")
+		if encoding != "" {
+			args.header.Set("Content-Encoding", encoding)
+		}
+	}
 	req, err := utils.RequestBuilder(r.requestContext(args.ctx), method, url, args.body, args.header)
 	if err != nil {
 		return nil, err
@@ -406,22 +425,20 @@ func (r *HTTPRequester) sendRequest(req *http.Request, response any, outputResp 
 	if response == nil {
 		return resp, nil
 	}
+	var bodyReader io.Reader = resp.Body
+	var bodyLimit *io.LimitedReader
+	if r.responseCompression {
+		bodyLimit = &io.LimitedReader{R: resp.Body, N: maxProviderRawJSONBodyBytes + 1}
+		bodyReader = bodyLimit
+	}
 
+	var buf bytes.Buffer
 	if outputResp {
-		var buf bytes.Buffer
-		originalBody := resp.Body
-		tee := io.TeeReader(originalBody, &buf)
-		err = DecodeResponse(tee, response)
-		closeErr := originalBody.Close()
-
-		// 将响应体重新写入 resp.Body
-		resp.Body = io.NopCloser(bytes.NewReader(buf.Bytes()))
-		if err == nil {
-			err = closeErr
-		}
+		bodyReader = io.TeeReader(bodyReader, &buf)
+		err = DecodeResponse(bodyReader, response)
 	} else if rawResponse, ok := response.(ProviderRawJSONCapturer); ok && rawResponse.CaptureProviderRawJSON() {
 		var body []byte
-		body, err = readProviderBodyBounded(resp.Body, maxProviderRawJSONBodyBytes)
+		body, err = readProviderBodyBounded(bodyReader, maxProviderRawJSONBodyBytes)
 
 		if err == nil {
 			if decoder, ok := response.(ProviderRawJSONDecoder); ok {
@@ -434,9 +451,23 @@ func (r *HTTPRequester) sendRequest(req *http.Request, response any, outputResp 
 			rawResponse.SetProviderRawJSON(body)
 		}
 	} else {
-		err = json.NewDecoder(resp.Body).Decode(response)
+		err = json.NewDecoder(bodyReader).Decode(response)
 	}
 
+	if err == nil && bodyLimit != nil {
+		// JSON 解码完成不代表压缩流完整；在同一预算内读到 EOF 才能接受响应。
+		_, err = io.Copy(io.Discard, bodyReader)
+	}
+	if outputResp {
+		closeErr := resp.Body.Close()
+		resp.Body = io.NopCloser(bytes.NewReader(buf.Bytes()))
+		if err == nil {
+			err = closeErr
+		}
+	}
+	if bodyLimit != nil && bodyLimit.N == 0 {
+		err = errProviderRawJSONBodyTooLarge
+	}
 	if err != nil {
 		apiErr := common.ErrorWrapper(err, "decode_response_failed", http.StatusInternalServerError)
 		if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
@@ -614,6 +645,10 @@ func (r *HTTPRequester) doRequest(req *http.Request, forceNoRedirect bool) (*htt
 			}
 		}()
 	}
+	if r.responseCompression {
+		req = req.Clone(req.Context())
+		req.Header.Set("Accept-Encoding", "gzip, zstd")
+	}
 	if r.ObserveRequest != nil {
 		r.ObserveRequest(req)
 	}
@@ -627,6 +662,9 @@ func (r *HTTPRequester) doRequest(req *http.Request, forceNoRedirect bool) (*htt
 		body.stopCancel = context.AfterFunc(resp.Request.Context(), func() { _ = body.close(false) })
 		resp.Body = body
 		bodyOwnsEntry = true
+	}
+	if r.responseCompression && err == nil && resp != nil {
+		decodeCompressedResponse(resp)
 	}
 	return resp, err, wroteRequest
 }

@@ -38,6 +38,7 @@ type DialOption func(*dialConfig)
 type dialConfig struct {
 	proxyURL         string
 	subprotocols     []string
+	compression      bool
 	handshakeTimeout time.Duration
 	tlsConfig        *tls.Config
 	netDialContext   func(ctx context.Context, network, addr string) (net.Conn, error)
@@ -50,6 +51,11 @@ func WithProxyURL(rawURL string) DialOption {
 
 func WithSubprotocols(protos ...string) DialOption {
 	return func(c *dialConfig) { c.subprotocols = append([]string(nil), protos...) }
+}
+
+// WithCompression negotiates permessage-deflate when supported by the peer.
+func WithCompression() DialOption {
+	return func(c *dialConfig) { c.compression = true }
 }
 
 func WithHandshakeTimeout(d time.Duration) DialOption {
@@ -146,10 +152,11 @@ func DialManaged(ctx context.Context, rawURL string, header http.Header, cfg Con
 		}
 	}
 	dialer := websocket.Dialer{
-		HandshakeTimeout: handshakeTimeout,
-		Subprotocols:     append([]string(nil), dc.subprotocols...),
-		TLSClientConfig:  dc.tlsConfig,
-		NetDialContext:   netDial,
+		HandshakeTimeout:  handshakeTimeout,
+		Subprotocols:      append([]string(nil), dc.subprotocols...),
+		EnableCompression: dc.compression,
+		TLSClientConfig:   dc.tlsConfig,
+		NetDialContext:    netDial,
 	}
 	if dc.proxyURL != "" {
 		if err := applyProxy(&dialer, dc.proxyURL); err != nil {

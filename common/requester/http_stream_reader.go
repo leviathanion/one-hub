@@ -23,6 +23,8 @@ var StreamClosed = []byte("stream_closed")
 
 var ErrStreamLineTooLarge = errors.New("stream line exceeds configured read limit")
 
+var ErrSSETerminalTailTooLarge = errors.New("SSE terminal tail exceeds configured buffer limit")
+
 // ErrStreamProtocolTerminalMissing means a stream whose protocol promises an
 // explicit terminal marker reached the transport EOF without observing it.
 var ErrStreamProtocolTerminalMissing = errors.New("provider stream ended without protocol terminal")
@@ -30,6 +32,7 @@ var ErrStreamProtocolTerminalMissing = errors.New("provider stream ended without
 var streamErrorSendTimeout = time.Second
 
 const defaultProviderStreamMaxLineBytes int64 = 16 << 20
+const defaultSSETerminalTailMaxBytes int64 = 16 << 20
 
 type HandlerPrefix[T streamable] func(rawLine *[]byte, dataChan chan T, errChan chan error)
 type HandlerPrefixWithEmitter[T streamable] func(rawLine *[]byte, emitter StreamEmitter[T])
@@ -95,6 +98,12 @@ type StreamReadOptions struct {
 	MaxLineBytes            int64
 	SSELines                bool
 	RequireProtocolTerminal bool
+	// SSETerminalEvent 由协议层识别完整 SSE 终态。实际压缩响应须在交付
+	// 该事件前校验解压 EOF；单事件仍受 MaxLineBytes 限制。
+	SSETerminalEvent func([]byte) bool
+	// MaxSSETerminalTailBytes 独立限制终态之后暂存的字节，不占用终态
+	// 事件的预算。非正值默认 16 MiB；仅在压缩 SSE 的终态校验中使用。
+	MaxSSETerminalTailBytes int64
 	// ProtocolTerminalPredicate is consulted only for transport EOF. A true
 	// result preserves io.EOF as the handler's valid protocol terminal while
 	// all other read errors, including timeouts, keep their original meaning.
@@ -104,6 +113,9 @@ type StreamReadOptions struct {
 func normalizeStreamReadOptions(options StreamReadOptions) StreamReadOptions {
 	if options.MaxLineBytes <= 0 {
 		options.MaxLineBytes = defaultProviderStreamMaxLineBytes
+	}
+	if options.MaxSSETerminalTailBytes <= 0 {
+		options.MaxSSETerminalTailBytes = defaultSSETerminalTailMaxBytes
 	}
 	return options
 }
@@ -161,25 +173,30 @@ func (stream *streamReader[T]) Recv() (<-chan T, <-chan error) {
 
 //nolint:gocognit
 func (stream *streamReader[T]) processLines() {
-	for {
-		rawLine, readErr := stream.readLine()
-		if !stream.NoTrim {
-			rawLine = bytes.TrimSpace(rawLine)
+	var integrityFramer *SSEEventFramer
+	if stream.options.SSETerminalEvent != nil {
+		if _, compressed := stream.response.Body.(*compressedResponseBody); compressed {
+			integrityFramer = NewSSEEventFramer(int(stream.options.MaxLineBytes))
 		}
-		// Reader 可以同时返回字节和错误；先有序移交这些字节。
-		if len(rawLine) > 0 {
-			if stream.handlerPrefixEmitter != nil {
-				stream.handlerPrefixEmitter(&rawLine, StreamEmitter[T]{stream: stream})
-			} else if stream.handlerPrefix != nil {
-				stream.handlerPrefix(&rawLine, stream.DataChan, stream.ErrChan)
-			}
-			select {
-			case <-streamDone(stream):
+	}
+	for {
+		var readErr error
+		if integrityFramer == nil {
+			var rawLine []byte
+			rawLine, readErr = stream.readLine()
+			if !stream.deliverLine(rawLine) {
 				return
-			default:
 			}
-			if bytes.Equal(rawLine, StreamClosed) {
-				return
+		} else {
+			var event []byte
+			event, readErr = stream.readIntegrityCheckedSSEEvent(integrityFramer)
+			// 保留 handler 的逐行输入契约，不把完整事件改作单行传入。
+			for raw := string(event); len(raw) > 0; {
+				line, rest := SplitSSELine(raw)
+				if !stream.deliverLine([]byte(line)) {
+					return
+				}
+				raw = rest
 			}
 		}
 		if readErr != nil {
@@ -195,6 +212,59 @@ func (stream *streamReader[T]) processLines() {
 			}
 			return
 		}
+	}
+}
+
+func (stream *streamReader[T]) deliverLine(rawLine []byte) bool {
+	if !stream.NoTrim {
+		rawLine = bytes.TrimSpace(rawLine)
+	}
+	if len(rawLine) == 0 {
+		return true
+	}
+	if stream.handlerPrefixEmitter != nil {
+		stream.handlerPrefixEmitter(&rawLine, StreamEmitter[T]{stream: stream})
+	} else if stream.handlerPrefix != nil {
+		stream.handlerPrefix(&rawLine, stream.DataChan, stream.ErrChan)
+	}
+	select {
+	case <-streamDone(stream):
+		return false
+	default:
+		return !bytes.Equal(rawLine, StreamClosed)
+	}
+}
+
+func (stream *streamReader[T]) readIntegrityCheckedSSEEvent(framer *SSEEventFramer) ([]byte, error) {
+	for {
+		line, readErr := stream.readSSELine()
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return nil, readErr
+		}
+		event, complete, err := framer.PushLine(line)
+		if err != nil {
+			return nil, err
+		}
+		if !complete {
+			if readErr != nil {
+				return []byte(framer.TakePending()), readErr
+			}
+			continue
+		}
+		if stream.options.SSETerminalEvent(event) {
+			// 终态可能已 Flush，而 checksum 尚未到达；须读到真实 EOF 才能
+			// 交给协议处理器和用量观察者。只暂存终态及尾部，前面的事件照常交付。
+			tailLimit := stream.options.MaxSSETerminalTailBytes
+			tail, err := io.ReadAll(io.LimitReader(stream.reader, tailLimit+1))
+			if err != nil {
+				return nil, err
+			}
+			if int64(len(tail)) > tailLimit {
+				return nil, ErrSSETerminalTailTooLarge
+			}
+			event = append(event, tail...)
+		}
+		return event, nil
 	}
 }
 

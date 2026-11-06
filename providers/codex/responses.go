@@ -186,8 +186,9 @@ func (p *CodexProvider) CreateResponses(ctx context.Context, rawReq *commonrespo
 
 	// Get stream response.
 	rawStream, errWithCode := requester.RequestNoTrimStreamWithEmitterOptions(httpRequester, resp, handler.HandlerResponsesStreamWithEmitter, requester.StreamReadOptions{
-		SSELines:     true,
-		MaxLineBytes: codexResponsesStreamMaxLineBytes,
+		SSELines:         true,
+		MaxLineBytes:     codexResponsesStreamMaxLineBytes,
+		SSETerminalEvent: commonresponses.IsTerminalSSEEvent,
 	})
 	if errWithCode != nil {
 		return nil, errWithCode
@@ -245,14 +246,16 @@ func (p *CodexProvider) CreateResponsesStream(ctx context.Context, rawReq *commo
 		stream, apiErr := requester.RequestNoTrimStreamWithOptions(httpRequester, resp, chatHandler.ChatSSEHandler(handler.ObserveResponsesEvent), requester.StreamReadOptions{
 			MaxLineBytes:            codexResponsesStreamMaxLineBytes,
 			RequireProtocolTerminal: true,
+			SSETerminalEvent:        commonresponses.IsTerminalSSEEvent,
 		})
 		return commonresponses.NewEventStream(stream, commonresponses.IgnoreResponsesEvent), apiErr
 	}
 
 	// Use RequestNoTrimStream to preserve event lines.
 	stream, apiErr := requester.RequestNoTrimStreamWithEmitterOptions(httpRequester, resp, handler.HandlerResponsesStreamWithEmitter, requester.StreamReadOptions{
-		SSELines:     true,
-		MaxLineBytes: codexResponsesStreamMaxLineBytes,
+		SSELines:         true,
+		MaxLineBytes:     codexResponsesStreamMaxLineBytes,
+		SSETerminalEvent: commonresponses.IsTerminalSSEEvent,
 	})
 	return commonresponses.NewEventStream(stream, handler.ObserveResponsesEvent), apiErr
 }
@@ -468,7 +471,7 @@ func (p *CodexProvider) prepareResponsesOfficialHTTPRequest(ctx context.Context,
 	if httpRequester == nil {
 		return nil, common.StringErrorWrapperLocal("requester is not configured", "channel_error", http.StatusServiceUnavailable)
 	}
-	httpReq, buildErr := httpRequester.NewRequest(http.MethodPost, fullRequestURL, httpRequester.WithBody(body), httpRequester.WithHeader(plan.Map()), httpRequester.WithContext(ctx))
+	httpReq, buildErr := httpRequester.NewRequest(http.MethodPost, fullRequestURL, httpRequester.WithZstdBody(body), httpRequester.WithHeader(plan.Map()), httpRequester.WithContext(ctx))
 	if buildErr != nil {
 		return nil, common.ErrorWrapper(buildErr, "new_request_failed", http.StatusInternalServerError)
 	}
