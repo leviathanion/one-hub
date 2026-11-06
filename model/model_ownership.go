@@ -14,7 +14,7 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-const ModelOwnershipBatchLimit = 500
+const ModelOwnershipBatchLimit = 5000
 
 type ModelOwnershipCandidate struct {
 	Model     string `json:"model"`
@@ -53,7 +53,7 @@ func ownershipValidationError(message string) error {
 // ValidateModelOwnershipModels 保留精确模型身份，去重仅影响本次操作范围。
 func ValidateModelOwnershipModels(models []string) ([]string, error) {
 	if len(models) == 0 || len(models) > ModelOwnershipBatchLimit {
-		return nil, ownershipValidationError("每次必须指定 1 至 500 个模型")
+		return nil, ownershipValidationError(fmt.Sprintf("每次必须指定 1 至 %d 个模型", ModelOwnershipBatchLimit))
 	}
 	seen := make(map[string]struct{}, len(models))
 	for _, name := range models {
