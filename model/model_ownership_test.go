@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync"
@@ -150,6 +151,22 @@ func TestModelOwnershipBatchRejectsInvalidInput(t *testing.T) {
 	names, err := ValidateModelOwnershipModels([]string{"model", "Model", "model"})
 	if err != nil || !reflect.DeepEqual(names, []string{"Model", "model"}) {
 		t.Fatalf("精确身份或去重错误: %v %v", names, err)
+	}
+}
+
+func TestModelOwnershipValidationAcceptsFullBatchAndRejectsOverflow(t *testing.T) {
+	models := make([]string, ModelOwnershipBatchLimit+1)
+	for i := range models {
+		models[i] = fmt.Sprintf("model-%05d", i)
+	}
+	names, err := ValidateModelOwnershipModels(models[:ModelOwnershipBatchLimit])
+	if err != nil || !reflect.DeepEqual(names, models[:ModelOwnershipBatchLimit]) {
+		t.Fatalf("达到批量上限时应保留全部模型: count=%d err=%v", len(names), err)
+	}
+	_, err = ValidateModelOwnershipModels(models)
+	var validation *ModelOwnershipValidationError
+	if !errors.As(err, &validation) || !strings.Contains(err.Error(), fmt.Sprint(ModelOwnershipBatchLimit)) {
+		t.Fatalf("超过批量上限应返回当前限制: %v", err)
 	}
 }
 

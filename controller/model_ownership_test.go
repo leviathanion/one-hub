@@ -3,6 +3,7 @@ package controller
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -86,6 +87,64 @@ func TestModelOwnershipImportUpdatesDisplayWithoutPublishingPrices(t *testing.T)
 	got := prices.Data[0]
 	if prices.Version != beforeVersion || got.Input != price.Input || got.Output != price.Output || got.ModelInfo == nil || got.ModelInfo.OwnedByID == nil || *got.ModelInfo.OwnedByID != 1001 {
 		t.Fatalf("ownership must refresh display without publishing prices: %+v version %d -> %d", got, beforeVersion, prices.Version)
+	}
+}
+
+func TestModelOwnershipHTTPMatchesAndSavesThousandsOfModels(t *testing.T) {
+	router := setupModelOwnershipControllerTest(t)
+	const count = 2001
+	names := make([]string, count)
+	items := make([]model.ModelOwnershipBatchItem, count)
+	sourceModels := make(map[string]map[string]string, count)
+	for i := range names {
+		name := fmt.Sprintf("model-%05d", i)
+		names[i] = name
+		items[i] = model.ModelOwnershipBatchItem{Model: name, OwnedByID: json.RawMessage("1001")}
+		sourceModels[name] = map[string]string{"canonical_model_id": "lab/" + name}
+	}
+	source, err := json.Marshal(map[string]any{"host": map[string]any{"models": sourceModels}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := http.DefaultTransport
+	calls := 0
+	http.DefaultTransport = modelsDevTransport(func(*http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(source)))}, nil
+	})
+	t.Cleanup(func() { http.DefaultTransport = old })
+	body, err := json.Marshal(map[string]any{"models": names})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := performPricingRequest(t, router, "/ownership/suggestions", string(body))
+	var suggestions struct {
+		Success bool                             `json:"success"`
+		Data    []model.ModelOwnershipSuggestion `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &suggestions); err != nil || response.Code != http.StatusOK || !suggestions.Success || len(suggestions.Data) != count || calls != 1 {
+		t.Fatalf("大批量匹配失败: status=%d count=%d calls=%d err=%v", response.Code, len(suggestions.Data), calls, err)
+	}
+	for _, suggestion := range suggestions.Data {
+		if suggestion.Status != "matched" || len(suggestion.Providers) != 1 || suggestion.Providers[0].ID != "host" {
+			t.Fatalf("模型未正确匹配: %+v", suggestion)
+		}
+	}
+	body, err = json.Marshal(model.ModelOwnershipBatchRequest{Mode: "fill_missing", Items: items})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response = performPricingRequest(t, router, "/ownership/batch", string(body))
+	var result struct {
+		Success bool                            `json:"success"`
+		Data    model.ModelOwnershipBatchResult `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil || response.Code != http.StatusOK || !result.Success || result.Data.Created != count {
+		t.Fatalf("大批量保存失败: status=%d body=%s err=%v", response.Code, response.Body.String(), err)
+	}
+	var saved int64
+	if err := model.DB.Model(&model.ModelInfo{}).Where("owned_by_id = ?", 1001).Count(&saved).Error; err != nil || saved != count {
+		t.Fatalf("大批量保存数量不符: count=%d err=%v", saved, err)
 	}
 }
 

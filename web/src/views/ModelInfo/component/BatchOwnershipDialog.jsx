@@ -119,6 +119,7 @@ function OwnershipEditor({ method, onClose, onSaved }) {
   const pageRows = filtered.slice(currentPage * rowsPerPage, (currentPage + 1) * rowsPerPage);
   const selectedOnPage = pageRows.filter((row) => selected.has(row.model)).length;
   const allPageSelected = pageRows.length > 0 && selectedOnPage === pageRows.length;
+  const selectedInFilter = filtered.filter((row) => selected.has(row.model)).length;
   const ownerOptions = useMemo(() => Object.entries(owners).sort(([a], [b]) => Number(a) - Number(b)), [owners]);
   const sourceGroups = useMemo(() => {
     const groups = new Map();
@@ -135,7 +136,10 @@ function OwnershipEditor({ method, onClose, onSaved }) {
     () => buildOwnershipBatch({ selected, method, target, mode, suggestions, providerOwners, owners }),
     [selected, method, target, mode, suggestions, providerOwners, owners]
   );
-  const selectedNewCount = catalog.filter((row) => selected.has(row.model) && !row.has_info).length;
+  const selectedNewCount = useMemo(() => {
+    const savingModels = new Set(batch.items.map((item) => item.model));
+    return catalog.filter((row) => savingModels.has(row.model) && !row.has_info).length;
+  }, [catalog, batch.items]);
 
   const updateSelection = (models, remove) => {
     const next = new Set(selected);
@@ -235,6 +239,10 @@ function OwnershipEditor({ method, onClose, onSaved }) {
                 : '先选择模型并查询 models.dev，再将查到的服务提供方映射到本系统的归属分类。确认保存后才会修改所选模型的归属。'}
               {' 此操作只调整模型的展示归属，不修改价格或渠道。'}
             </Typography>
+            <Typography variant="body2" color="text.secondary">
+              候选模型来自本地模型信息、价格配置和渠道模型的并集，不限于已配置价格的模型。
+              {method === 'source' ? 'models.dev 仅用于查询所选模型的归属，匹配不要求来源模型有价格。' : ''}
+            </Typography>
             {loading ? <LinearProgress aria-label="正在加载模型目录" /> : null}
             {error ? <Alert severity="error">{error}</Alert> : null}
             {!loading && !loaded ? <Button onClick={() => setReload((value) => value + 1)}>重新加载目录</Button> : null}
@@ -289,6 +297,31 @@ function OwnershipEditor({ method, onClose, onSaved }) {
               />
               <Button onClick={() => setSelected(new Set())} disabled={saving || !selected.size}>
                 清空选择
+              </Button>
+            </Stack>
+            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
+              <Button
+                variant="outlined"
+                onClick={() =>
+                  updateSelection(
+                    filtered.map((row) => row.model),
+                    false
+                  )
+                }
+                disabled={saving || !loaded || !filtered.length || selectedInFilter === filtered.length}
+              >
+                全选筛选结果（{filtered.length} 个）
+              </Button>
+              <Button
+                onClick={() =>
+                  updateSelection(
+                    filtered.map((row) => row.model),
+                    true
+                  )
+                }
+                disabled={saving || !selectedInFilter}
+              >
+                取消选择筛选结果
               </Button>
             </Stack>
             <TableContainer sx={{ maxHeight: 380 }}>
@@ -433,7 +466,7 @@ function OwnershipEditor({ method, onClose, onSaved }) {
                 <Typography variant="body2" color="text.secondary">
                   左列是 models.dev 记录的 API 服务提供方。例如，Cloudflare 托管的 Kimi、Nemotron 模型都会列在 Cloudflare Workers AI 下。
                   右列请选择对应的本系统归属，每行选择会应用到该行列出的所有模型；名称相同也需要确认。
-                  未查到服务提供方或存在多个提供方的模型，请先从上方列表取消选择，再保存其他模型。
+                  可以只映射部分服务提供方；未映射、未查询、未查到服务提供方或存在多个提供方的模型会保留原样，不影响其他模型保存。
                 </Typography>
                 {sourceGroups.length > 0 ? (
                   <TableContainer>
@@ -491,7 +524,7 @@ function OwnershipEditor({ method, onClose, onSaved }) {
                                   )
                                 }
                               >
-                                <MenuItem value="">请选择本系统归属</MenuItem>
+                                <MenuItem value="">暂不设置</MenuItem>
                                 {ownerOptions.map(([id, owner]) => (
                                   <MenuItem key={id} value={id}>
                                     {owner.name}
@@ -517,8 +550,9 @@ function OwnershipEditor({ method, onClose, onSaved }) {
             </Box>
             {selected.size > 0 ? (
               <Typography variant="body2">
-                将处理 {selected.size} 个模型，其中 {selectedNewCount} 个尚无模型信息。
-                {mode === 'fill_missing' ? '保存时已有归属的模型会跳过。' : '所选模型的已有归属会被替换。'}
+                已选 {selected.size} 个模型，可保存 {batch.items.length} 个，其中 {selectedNewCount} 个尚无模型信息。
+                {method === 'source' ? `其余 ${batch.unresolved?.length || 0} 个保留原样，不修改归属。` : ''}
+                {mode === 'fill_missing' ? '保存时已有归属的模型会跳过。' : '本次保存范围内的已有归属会被替换。'}
               </Typography>
             ) : null}
             {selected.size > 0 && batch.error && !matching ? <Alert severity="info">{batch.error}</Alert> : null}
@@ -532,8 +566,8 @@ function OwnershipEditor({ method, onClose, onSaved }) {
             {saving
               ? '正在保存…'
               : method === 'manual' && target === CLEAR_OWNERSHIP
-                ? `清空 ${selected.size} 个模型的归属`
-                : `保存 ${selected.size} 个模型的归属`}
+                ? `清空 ${batch.items.length} 个模型的归属`
+                : `保存 ${batch.items.length} 个模型的归属`}
           </Button>
         </DialogActions>
       </Dialog>

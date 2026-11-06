@@ -100,7 +100,7 @@ func TestModelsDevOwnershipFetchValidatesBeforeNetworkAndDeduplicates(t *testing
 		}
 		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"host":{"models":{"a":{"canonical_model_id":"lab/model"}}}}`))}, nil
 	})
-	for _, names := range [][]string{nil, {""}, {"family*"}, {strings.Repeat("a", 101)}, make([]string, 501)} {
+	for _, names := range [][]string{nil, {""}, {"family*"}, {strings.Repeat("a", 101)}, make([]string, ModelOwnershipBatchLimit+1)} {
 		_, err := fetchModelsDevOwnershipSuggestions(context.Background(), client, names)
 		var validationErr *ModelOwnershipValidationError
 		if !errors.As(err, &validationErr) {

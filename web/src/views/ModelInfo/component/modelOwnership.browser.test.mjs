@@ -48,6 +48,7 @@ test('两个页面独立提供手动归属与 models.dev 映射', { skip: !proce
       'source-same-name',
       ...cloudflareModels,
       moonshotModel,
+      'source-unmapped',
       ...Array.from({ length: 25 }, (_, i) => `page-${i}`)
     ];
     const writes = [];
@@ -98,9 +99,11 @@ test('两个页面独立提供手动归属与 models.dev 映射', { skip: !proce
                       ? cloudflare
                       : model === moonshotModel
                         ? moonshot
-                        : model === 'source-same-name'
-                          ? sameNameHost
-                          : openAI
+                        : model === 'source-unmapped'
+                          ? otherHost
+                          : model === 'source-same-name'
+                            ? sameNameHost
+                            : openAI
                   ],
                   status: 'matched'
                 }
@@ -211,13 +214,13 @@ test('两个页面独立提供手动归属与 models.dev 映射', { skip: !proce
     await open();
     await editor().getByRole('checkbox', { name: '选择本页模型', exact: true }).check();
     await editor().getByRole('button', { name: '下一页模型' }).click();
-    await editor().getByRole('status').filter({ hasText: '已选 25 / 500 个，其中 25 个不在当前页' }).waitFor();
+    await editor().getByRole('status').filter({ hasText: '已选 25 / 5000 个，其中 25 个不在当前页' }).waitFor();
     await choose('每页模型数', '50');
     await editor().getByRole('checkbox', { name: '选择 owned', exact: true }).waitFor();
     assert.equal(await editor().getByRole('checkbox', { name: '选择 owned', exact: true }).isChecked(), true);
-    await editor().getByRole('status').filter({ hasText: '已选 25 / 500 个，其中 0 个不在当前页' }).waitFor();
+    await editor().getByRole('status').filter({ hasText: '已选 25 / 5000 个，其中 0 个不在当前页' }).waitFor();
     await choose('每页模型数', '25');
-    await editor().getByRole('status').filter({ hasText: '已选 25 / 500 个，其中 0 个不在当前页' }).waitFor();
+    await editor().getByRole('status').filter({ hasText: '已选 25 / 5000 个，其中 0 个不在当前页' }).waitFor();
     await editor().getByRole('button', { name: '清空选择' }).click();
     await editor().getByRole('textbox', { name: '粘贴模型名（每行一个）' }).fill('temporary-model\nowned\ntemporary-model');
     await editor().getByRole('button', { name: '加入选择' }).click();
@@ -265,7 +268,9 @@ test('两个页面独立提供手动归属与 models.dev 映射', { skip: !proce
     });
 
     await open('source');
-    await editor().getByRole('textbox', { name: '粘贴模型名（每行一个）' }).fill('source-a\nsource-conflict\nsource-unknown\nconstructor');
+    await editor()
+      .getByRole('textbox', { name: '粘贴模型名（每行一个）' })
+      .fill('source-a\nsource-conflict\nsource-unknown\nsource-unmapped\nconstructor');
     await editor().getByRole('button', { name: '加入选择' }).click();
     await search('constructor');
     await editor().getByRole('row').filter({ hasText: 'constructor' }).getByText('尚未查询', { exact: true }).waitFor();
@@ -275,7 +280,7 @@ test('两个页面独立提供手动归属与 models.dev 映射', { skip: !proce
     await editor()
       .getByRole('combobox', { name: /^OpenAI（openai）映射到本系统的归属/ })
       .waitFor();
-    assert.deepEqual(sourceRequests[0], ['source-a', 'source-conflict', 'source-unknown']);
+    assert.deepEqual(sourceRequests[0], ['source-a', 'source-conflict', 'source-unknown', 'source-unmapped']);
     const mapping = () => editor().getByRole('table', { name: 'models.dev 归属映射', exact: true });
     await mapping().getByRole('columnheader', { name: 'models.dev 服务提供方', exact: true }).waitFor();
     await mapping().getByRole('columnheader', { name: '映射到本系统的归属', exact: true }).waitFor();
@@ -292,18 +297,25 @@ test('两个页面独立提供手动归属与 models.dev 映射', { skip: !proce
       await editor()
         .getByRole('combobox', { name: /^OpenAI（openai）映射到本系统的归属/ })
         .textContent(),
-      '请选择本系统归属'
+      '暂不设置'
     );
-    assert.equal(await editor().getByRole('button', { name: '保存 3 个模型的归属', exact: true }).isDisabled(), true);
+    assert.equal(await editor().getByRole('button', { name: '保存 0 个模型的归属', exact: true }).isDisabled(), true);
     await choose('OpenAI（openai）映射到本系统的归属', 'OpenAI');
-    assert.equal(await editor().getByRole('button', { name: '保存 3 个模型的归属', exact: true }).isDisabled(), true);
+    assert.equal(await editor().getByRole('button', { name: '保存 1 个模型的归属', exact: true }).isEnabled(), true);
+    await editor()
+      .getByText(/已选 4 个模型，可保存 1 个/)
+      .waitFor();
+    await editor()
+      .getByText(/其余 3 个保留原样/)
+      .waitFor();
     await search('source-');
     await editor().getByText('提供方冲突：OpenAI（openai）、其他平台（host-other）', { exact: true }).waitFor();
     await editor().getByText('未查到服务提供方', { exact: true }).waitFor();
-    await editor().getByRole('checkbox', { name: '选择 source-conflict', exact: true }).uncheck();
-    await editor().getByRole('checkbox', { name: '选择 source-unknown', exact: true }).uncheck();
     await editor().getByRole('checkbox', { name: '选择 source-b', exact: true }).check();
-    assert.equal(await editor().getByRole('button', { name: '保存 2 个模型的归属', exact: true }).isDisabled(), true);
+    assert.equal(await editor().getByRole('button', { name: '保存 1 个模型的归属', exact: true }).isEnabled(), true);
+    await editor()
+      .getByText(/已选 5 个模型，可保存 1 个/)
+      .waitFor();
     await editor().getByRole('button', { name: '查询所选模型的归属', exact: true }).click();
     await sourceRow()
       .getByText(/2 个模型/)
@@ -327,6 +339,7 @@ test('两个页面独立提供手动归属与 models.dev 映射', { skip: !proce
       { model: 'source-a', owned_by_id: 1002 },
       { model: 'source-b', owned_by_id: 1002 }
     ]);
+    for (const model of ['source-conflict', 'source-unknown', 'source-unmapped']) assert.equal(infos.has(model), false);
 
     await open('source');
     await editor().getByRole('textbox', { name: '粘贴模型名（每行一个）' }).fill('source-a\nsource-same-name');
@@ -334,9 +347,9 @@ test('两个页面独立提供手动归属与 models.dev 映射', { skip: !proce
     await editor().getByRole('button', { name: '查询所选模型的归属', exact: true }).click();
     await choose('OpenAI（openai）映射到本系统的归属', 'OpenAI');
     const sameNameSelection = editor().getByRole('combobox', { name: 'OpenAI（openai-compatible）映射到本系统的归属', exact: true });
-    assert.equal(await sameNameSelection.textContent(), '请选择本系统归属');
+    assert.equal(await sameNameSelection.textContent(), '暂不设置');
     assert.equal(await mapping().getByRole('row').count(), 3);
-    assert.equal(await editor().getByRole('button', { name: '保存 2 个模型的归属', exact: true }).isDisabled(), true);
+    assert.equal(await editor().getByRole('button', { name: '保存 1 个模型的归属', exact: true }).isEnabled(), true);
     await editor().getByRole('button', { name: '取消', exact: true }).click();
 
     await open('source');
@@ -359,7 +372,7 @@ test('两个页面独立提供手动归属与 models.dev 映射', { skip: !proce
     for (const model of cloudflareModels) await cloudflareRow.getByText(model, { exact: true }).waitFor();
     assert.equal(await cloudflareRow.getByText(moonshotModel, { exact: true }).count(), 0);
     await choose('Cloudflare Workers AI（cloudflare-workers-ai）映射到本系统的归属', 'Cloudflare');
-    assert.equal(await editor().getByRole('button', { name: '保存 4 个模型的归属', exact: true }).isDisabled(), true);
+    assert.equal(await editor().getByRole('button', { name: '保存 3 个模型的归属', exact: true }).isEnabled(), true);
     await choose('Moonshot AI（moonshotai）映射到本系统的归属', '自定义归属');
     if (process.env.OWNERSHIP_UI_SCREENSHOT) await editor().screenshot({ path: process.env.OWNERSHIP_UI_SCREENSHOT });
     await editor().getByRole('button', { name: '保存 4 个模型的归属', exact: true }).click();
@@ -382,7 +395,7 @@ test('两个页面独立提供手动归属与 models.dev 映射', { skip: !proce
     await open();
     releaseSource();
     sourceWait = null;
-    await editor().getByRole('status').filter({ hasText: '已选 0 / 500' }).waitFor();
+    await editor().getByRole('status').filter({ hasText: '已选 0 / 5000' }).waitFor();
     assert.equal(
       await editor()
         .getByRole('combobox', { name: /^OpenAI（openai）映射到本系统的归属/ })
@@ -397,7 +410,7 @@ test('两个页面独立提供手动归属与 models.dev 映射', { skip: !proce
     await editor().getByRole('button', { name: '查询所选模型的归属', exact: true }).click();
     await mapping().getByRole('columnheader', { name: 'models.dev 服务提供方', exact: true }).waitFor();
     await mapping().getByRole('columnheader', { name: '映射到本系统的归属', exact: true }).waitFor();
-    assert.equal(await editor().getByRole('button', { name: '保存 1 个模型的归属', exact: true }).isDisabled(), true);
+    assert.equal(await editor().getByRole('button', { name: '保存 0 个模型的归属', exact: true }).isDisabled(), true);
     await editor().getByRole('button', { name: '取消', exact: true }).click();
     await open();
     await select('owned');
@@ -415,6 +428,36 @@ test('两个页面独立提供手动归属与 models.dev 映射', { skip: !proce
     await refreshedPrices;
     assert.ok(priceReads > pricesBefore);
     assert.deepEqual(writes.at(-1), { mode: 'replace', items: [{ model: 'owned', owned_by_id: null }] });
+    const bulkModels = Array.from({ length: 2001 }, (_, index) => `bulk-model-${index}`);
+    candidates.push(...bulkModels);
+    await open('source');
+    await select('owned');
+    await search('bulk-model-');
+    await editor().getByRole('button', { name: '全选筛选结果（2001 个）', exact: true }).click();
+    await editor().getByRole('status').filter({ hasText: '已选 2002 / 5000' }).waitFor();
+    await editor().getByRole('button', { name: '下一页模型' }).click();
+    assert.equal(await editor().getByRole('checkbox', { name: '选择本页模型', exact: true }).isChecked(), true);
+    await editor().getByRole('button', { name: '取消选择筛选结果', exact: true }).click();
+    await editor().getByRole('status').filter({ hasText: '已选 1 / 5000' }).waitFor();
+    await search('owned');
+    assert.equal(await editor().getByRole('checkbox', { name: '选择 owned', exact: true }).isChecked(), true);
+    await editor().getByRole('checkbox', { name: '选择 owned', exact: true }).uncheck();
+    await search('bulk-model-');
+    await editor().getByRole('button', { name: '全选筛选结果（2001 个）', exact: true }).click();
+    await editor().getByRole('status').filter({ hasText: '已选 2001 / 5000' }).waitFor();
+    await editor().getByRole('button', { name: '查询所选模型的归属', exact: true }).click();
+    await sourceRow()
+      .getByText(/2001 个模型/)
+      .waitFor();
+    assert.deepEqual(sourceRequests.at(-1), bulkModels);
+    await choose('OpenAI（openai）映射到本系统的归属', '自定义归属');
+    await editor().getByRole('button', { name: '保存 2001 个模型的归属', exact: true }).click();
+    await editor().waitFor({ state: 'hidden' });
+    assert.deepEqual(writes.at(-1), {
+      mode: 'fill_missing',
+      items: bulkModels.map((model) => ({ model, owned_by_id: 1001 }))
+    });
+    assert.equal(infos.get('owned').owned_by_id, null);
     assert.deepEqual(errors, []);
   } finally {
     await browser?.close();

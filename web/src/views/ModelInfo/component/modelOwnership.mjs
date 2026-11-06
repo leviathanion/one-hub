@@ -1,4 +1,4 @@
-export const MAX_OWNERSHIP_BATCH = 500;
+export const MAX_OWNERSHIP_BATCH = 5000;
 export const CLEAR_OWNERSHIP = '__clear__';
 
 export function parseOwnershipModels(text) {
@@ -41,11 +41,12 @@ export function buildOwnershipBatch({ selected, method, target, mode, suggestion
     if (!owner || !Object.hasOwn(owners, owner)) unresolved.push(model);
     else items.push({ model, owned_by_id: Number(owner) });
   }
-  if (unresolved.length) {
+  if (!items.length) {
     return {
-      items: [],
-      error: `${unresolved.length} 个模型尚未确定归属：${unresolved.slice(0, 5).join('、')}${unresolved.length > 5 ? '等' : ''}。请查询服务提供方并选择对应的本系统归属，或取消选择未查到服务提供方、提供方冲突的模型。`
+      items,
+      unresolved,
+      error: '暂无可保存的模型，请查询服务提供方，并至少选择一项本系统归属映射。'
     };
   }
-  return { items };
+  return { items, unresolved };
 }
