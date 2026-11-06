@@ -26,7 +26,7 @@ import { showSuccess } from 'utils/common';
 import OwnedByEditModal from 'views/ModelOwnedby/component/EditModal';
 import { buildOwnershipBatch, CLEAR_OWNERSHIP, MAX_OWNERSHIP_BATCH, parseOwnershipModels } from './modelOwnership.mjs';
 
-const PAGE_SIZE = 25;
+const PAGE_SIZE_OPTIONS = [25, 50, 100, 200];
 const requestOptions = (signal) => ({ signal, skipErrorNotification: true });
 
 function responseData(response) {
@@ -36,9 +36,10 @@ function responseData(response) {
 
 function sourceDescription(suggestion) {
   if (!suggestion) return '尚未查询';
-  if (suggestion.status === 'unmatched') return '未查到归属';
-  if (suggestion.status === 'conflict') return `归属冲突：${suggestion.labs.join('、')}`;
-  return suggestion.labs.join('、');
+  if (suggestion.status === 'unmatched') return '未查到服务提供方';
+  const providers = suggestion.providers.map((provider) => `${provider.name}（${provider.id}）`).join('、');
+  if (suggestion.status === 'conflict') return `提供方冲突：${providers}`;
+  return providers;
 }
 
 // 关闭后卸载编辑器，终止只读请求并丢弃本次选择；下一次打开重新加载目录。
@@ -55,11 +56,12 @@ function OwnershipEditor({ method, onClose, onSaved }) {
   const [ownerFilter, setOwnerFilter] = useState('missing');
   const [onlySelected, setOnlySelected] = useState(false);
   const [page, setPage] = useState(0);
+  const [rowsPerPage, setRowsPerPage] = useState(25);
   const [pasted, setPasted] = useState('');
   const [target, setTarget] = useState('');
   const [mode, setMode] = useState('fill_missing');
   const [suggestions, setSuggestions] = useState(() => Object.create(null));
-  const [labOwners, setLabOwners] = useState(() => Object.create(null));
+  const [providerOwners, setProviderOwners] = useState(() => Object.create(null));
   const [loading, setLoading] = useState(true);
   const [loaded, setLoaded] = useState(false);
   const [matching, setMatching] = useState(false);
@@ -113,8 +115,8 @@ function OwnershipEditor({ method, onClose, onSaved }) {
       ),
     [catalog, query, ownerFilter, onlySelected, selected]
   );
-  const currentPage = Math.min(page, Math.max(0, Math.ceil(filtered.length / PAGE_SIZE) - 1));
-  const pageRows = filtered.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE);
+  const currentPage = Math.min(page, Math.max(0, Math.ceil(filtered.length / rowsPerPage) - 1));
+  const pageRows = filtered.slice(currentPage * rowsPerPage, (currentPage + 1) * rowsPerPage);
   const selectedOnPage = pageRows.filter((row) => selected.has(row.model)).length;
   const allPageSelected = pageRows.length > 0 && selectedOnPage === pageRows.length;
   const ownerOptions = useMemo(() => Object.entries(owners).sort(([a], [b]) => Number(a) - Number(b)), [owners]);
@@ -122,16 +124,16 @@ function OwnershipEditor({ method, onClose, onSaved }) {
     const groups = new Map();
     for (const model of selected) {
       const suggestion = suggestions[model];
-      if (suggestion?.status !== 'matched' || suggestion.labs.length !== 1) continue;
-      const lab = suggestion.labs[0];
-      if (!groups.has(lab)) groups.set(lab, []);
-      groups.get(lab).push(model);
+      if (suggestion?.status !== 'matched' || suggestion.providers.length !== 1) continue;
+      const provider = suggestion.providers[0];
+      if (!groups.has(provider.id)) groups.set(provider.id, { provider, models: [] });
+      groups.get(provider.id).models.push(model);
     }
     return [...groups].sort(([a], [b]) => a.localeCompare(b));
   }, [selected, suggestions]);
   const batch = useMemo(
-    () => buildOwnershipBatch({ selected, method, target, mode, suggestions, labOwners, owners }),
-    [selected, method, target, mode, suggestions, labOwners, owners]
+    () => buildOwnershipBatch({ selected, method, target, mode, suggestions, providerOwners, owners }),
+    [selected, method, target, mode, suggestions, providerOwners, owners]
   );
   const selectedNewCount = catalog.filter((row) => selected.has(row.model) && !row.has_info).length;
 
@@ -230,7 +232,7 @@ function OwnershipEditor({ method, onClose, onSaved }) {
             <Typography variant="body2" color="text.secondary">
               {method === 'manual'
                 ? '选择模型后，将它们统一设置为本系统中的一个归属分类，也可以清空归属。'
-                : '先选择模型并查询 models.dev，再将查到的归属映射到本系统的归属分类。确认保存后才会修改所选模型的归属。'}
+                : '先选择模型并查询 models.dev，再将查到的服务提供方映射到本系统的归属分类。确认保存后才会修改所选模型的归属。'}
               {' 此操作只调整模型的展示归属，不修改价格或渠道。'}
             </Typography>
             {loading ? <LinearProgress aria-label="正在加载模型目录" /> : null}
@@ -310,7 +312,7 @@ function OwnershipEditor({ method, onClose, onSaved }) {
                     <TableCell>模型标识</TableCell>
                     <TableCell>当前归属</TableCell>
                     <TableCell>模型信息</TableCell>
-                    {method === 'source' ? <TableCell>models.dev 解析出的归属</TableCell> : null}
+                    {method === 'source' ? <TableCell>models.dev 服务提供方</TableCell> : null}
                   </TableRow>
                 </TableHead>
                 <TableBody>
@@ -349,11 +351,20 @@ function OwnershipEditor({ method, onClose, onSaved }) {
             ) : null}
             <TablePagination
               component="div"
+              sx={{
+                '& .MuiTablePagination-toolbar': { flexWrap: 'wrap' },
+                '& .MuiTablePagination-spacer': { display: { xs: 'none', sm: 'block' } }
+              }}
               count={filtered.length}
               page={currentPage}
-              rowsPerPage={PAGE_SIZE}
-              rowsPerPageOptions={[PAGE_SIZE]}
+              rowsPerPage={rowsPerPage}
+              rowsPerPageOptions={PAGE_SIZE_OPTIONS}
+              onRowsPerPageChange={(event) => {
+                setRowsPerPage(Number(event.target.value));
+                setPage(0);
+              }}
               onPageChange={(_, next) => setPage(next)}
+              labelRowsPerPage="每页模型数"
               labelDisplayedRows={({ from, to, count }) => `${from}–${to} / ${count}`}
               getItemAriaLabel={(type) => (type === 'next' ? '下一页模型' : '上一页模型')}
             />
@@ -420,8 +431,9 @@ function OwnershipEditor({ method, onClose, onSaved }) {
                   </Button>
                 </Box>
                 <Typography variant="body2" color="text.secondary">
-                  左列是 models.dev 解析出的归属，右列请选择对应的本系统归属。每行选择会应用到该行列出的所有模型；名称相同也需要确认。
-                  未查到归属或归属冲突的模型，请先从上方列表取消选择，再保存其他模型。
+                  左列是 models.dev 记录的 API 服务提供方。例如，Cloudflare 托管的 Kimi、Nemotron 模型都会列在 Cloudflare Workers AI 下。
+                  右列请选择对应的本系统归属，每行选择会应用到该行列出的所有模型；名称相同也需要确认。
+                  未查到服务提供方或存在多个提供方的模型，请先从上方列表取消选择，再保存其他模型。
                 </Typography>
                 {sourceGroups.length > 0 ? (
                   <TableContainer>
@@ -435,15 +447,20 @@ function OwnershipEditor({ method, onClose, onSaved }) {
                     >
                       <TableHead>
                         <TableRow>
-                          <TableCell sx={{ width: '45%' }}>models.dev 解析出的归属</TableCell>
+                          <TableCell sx={{ width: '45%' }}>models.dev 服务提供方</TableCell>
                           <TableCell>映射到本系统的归属</TableCell>
                         </TableRow>
                       </TableHead>
                       <TableBody>
-                        {sourceGroups.map(([lab, models], index) => (
-                          <TableRow key={lab}>
+                        {sourceGroups.map(([providerID, { provider, models }], index) => (
+                          <TableRow key={providerID}>
                             <TableCell component="th" scope="row" sx={{ verticalAlign: 'top', overflowWrap: 'anywhere' }}>
-                              <Typography variant="subtitle2">{lab}</Typography>
+                              <Typography variant="subtitle2">{provider.name}</Typography>
+                              {provider.name !== providerID ? (
+                                <Typography variant="caption" color="text.secondary">
+                                  {providerID}
+                                </Typography>
+                              ) : null}
                               <Box component="details" sx={{ mt: 0.5 }}>
                                 <Box component="summary" sx={{ cursor: 'pointer', typography: 'body2' }}>
                                   {models.length} 个模型，查看列表
@@ -457,19 +474,21 @@ function OwnershipEditor({ method, onClose, onSaved }) {
                             </TableCell>
                             <TableCell sx={{ verticalAlign: 'top' }}>
                               <TextField
-                                id={`ownership-lab-${index}`}
+                                id={`ownership-provider-${index}`}
                                 select
                                 SelectProps={{
                                   displayEmpty: true,
-                                  inputProps: { 'aria-label': `${lab} 映射到本系统的归属` }
+                                  inputProps: { 'aria-label': `${provider.name}（${providerID}）映射到本系统的归属` }
                                 }}
-                                value={labOwners[lab] || ''}
+                                value={providerOwners[providerID] || ''}
                                 size="small"
                                 fullWidth
                                 sx={{ '& .MuiSelect-select': { whiteSpace: 'normal', overflowWrap: 'anywhere' } }}
                                 disabled={saving || matching}
                                 onChange={(event) =>
-                                  setLabOwners((current) => Object.assign(Object.create(null), current, { [lab]: event.target.value }))
+                                  setProviderOwners((current) =>
+                                    Object.assign(Object.create(null), current, { [providerID]: event.target.value })
+                                  )
                                 }
                               >
                                 <MenuItem value="">请选择本系统归属</MenuItem>

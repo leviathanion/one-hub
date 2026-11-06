@@ -5,16 +5,20 @@ import (
 	"net/http"
 	"sort"
 	"strings"
-	"unicode"
 )
 
-type ModelOwnershipSuggestion struct {
-	Model  string   `json:"model"`
-	Labs   []string `json:"labs"`
-	Status string   `json:"status"`
+type ModelOwnershipProvider struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
-// FetchModelsDevOwnershipSuggestions 只提供外部作者建议，不决定本地展示分类。
+type ModelOwnershipSuggestion struct {
+	Model     string                   `json:"model"`
+	Providers []ModelOwnershipProvider `json:"providers"`
+	Status    string                   `json:"status"`
+}
+
+// FetchModelsDevOwnershipSuggestions 按服务提供方给出建议，不决定本地展示分类。
 func FetchModelsDevOwnershipSuggestions(ctx context.Context, modelNames []string) ([]ModelOwnershipSuggestion, error) {
 	return fetchModelsDevOwnershipSuggestions(ctx, newModelsDevClient(), modelNames)
 }
@@ -32,29 +36,28 @@ func fetchModelsDevOwnershipSuggestions(ctx context.Context, client *http.Client
 }
 
 func modelsDevOwnershipSuggestions(upstream modelsDevSource, models []string) []ModelOwnershipSuggestion {
-	labsByModel := make(map[string]map[string]struct{}, len(models))
+	providersByModel := make(map[string][]ModelOwnershipProvider, len(models))
 	for _, name := range models {
-		labsByModel[name] = make(map[string]struct{})
+		providersByModel[name] = []ModelOwnershipProvider{}
 	}
-	for _, provider := range upstream {
-		for name, item := range provider.Models {
-			labs, selected := labsByModel[name]
+	for id, provider := range upstream {
+		providerName := strings.TrimSpace(provider.Name)
+		if providerName == "" {
+			providerName = id
+		}
+		for name := range provider.Models {
+			providers, selected := providersByModel[name]
 			if !selected {
 				continue
 			}
-			if lab, ok := modelsDevCanonicalLab(item.CanonicalModelID); ok {
-				labs[lab] = struct{}{}
-			}
+			providersByModel[name] = append(providers, ModelOwnershipProvider{ID: id, Name: providerName})
 		}
 	}
 	result := make([]ModelOwnershipSuggestion, 0, len(models))
 	for _, name := range models {
-		item := ModelOwnershipSuggestion{Model: name, Labs: []string{}, Status: "unmatched"}
-		for lab := range labsByModel[name] {
-			item.Labs = append(item.Labs, lab)
-		}
-		sort.Strings(item.Labs)
-		switch len(item.Labs) {
+		item := ModelOwnershipSuggestion{Model: name, Providers: providersByModel[name], Status: "unmatched"}
+		sort.Slice(item.Providers, func(i, j int) bool { return item.Providers[i].ID < item.Providers[j].ID })
+		switch len(item.Providers) {
 		case 0:
 		case 1:
 			item.Status = "matched"
@@ -64,13 +67,4 @@ func modelsDevOwnershipSuggestions(upstream modelsDevSource, models []string) []
 		result = append(result, item)
 	}
 	return result
-}
-
-func modelsDevCanonicalLab(canonical string) (string, bool) {
-	lab, modelName, found := strings.Cut(canonical, "/")
-	if !found || lab == "" || modelName == "" || strings.Contains(canonical, "*") ||
-		strings.IndexFunc(canonical, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
-		return "", false
-	}
-	return lab, true
 }

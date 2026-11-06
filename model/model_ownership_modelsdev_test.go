@@ -10,41 +10,74 @@ import (
 	"testing"
 )
 
-func TestModelsDevOwnershipUsesExactCanonicalEvidenceWithoutPrice(t *testing.T) {
+func TestModelsDevOwnershipUsesServingProviderForHostedModels(t *testing.T) {
 	upstream, err := decodeModelsDevSource(strings.NewReader(`{
-		"host-a":{"models":{
-			"no-price":{"canonical_model_id":"anthropic/canonical"},
-			"bad-price":{"canonical_model_id":"google/canonical","cost":{"input":1,"future_price":5}},
-			"same":{"canonical_model_id":"openai/a"},
-			"conflict":{"canonical_model_id":"openai/a"},
-			"Case":{"canonical_model_id":"meta/model"},
-			"host/model":{"canonical_model_id":"deepseek/model"},
-			"malformed":{"canonical_model_id":"missing-slash"}
+		"cloudflare-workers-ai":{"name":"Cloudflare Workers AI","models":{
+			"@cf/moonshotai/kimi-k2.6":{"canonical_model_id":"moonshotai/kimi-k2.6"},
+			"@cf/moonshotai/kimi-k2.7-code":{"canonical_model_id":"moonshotai/kimi-k2.7-code"},
+			"@cf/nvidia/nemotron-3-120b-a12b":{"canonical_model_id":"nvidia/nemotron-3-super-120b-a12b"}
 		}},
-		"host-b":{"models":{
-			"same":{"canonical_model_id":"openai/a"},
-			"conflict":{"canonical_model_id":"anthropic/a"},
-			"no-price":{}
-		}},
-		"openai":{"models":{"no-canonical":{"cost":{"input":1,"output":2}}}}
+		"moonshotai":{"name":"Moonshot AI","models":{
+			"kimi-k2.6":{"canonical_model_id":"moonshotai/kimi-k2.6"}
+		}}
 	}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	models := []string{"no-price", "bad-price", "same", "conflict", "Case", "case", "host/model", "model", "malformed", "no-canonical", "missing"}
+	models := []string{"@cf/moonshotai/kimi-k2.6", "@cf/moonshotai/kimi-k2.7-code", "@cf/nvidia/nemotron-3-120b-a12b", "kimi-k2.6"}
 	got := modelsDevOwnershipSuggestions(upstream, models)
+	cloudflare := []ModelOwnershipProvider{{ID: "cloudflare-workers-ai", Name: "Cloudflare Workers AI"}}
 	want := []ModelOwnershipSuggestion{
-		{Model: "no-price", Labs: []string{"anthropic"}, Status: "matched"},
-		{Model: "bad-price", Labs: []string{"google"}, Status: "matched"},
-		{Model: "same", Labs: []string{"openai"}, Status: "matched"},
-		{Model: "conflict", Labs: []string{"anthropic", "openai"}, Status: "conflict"},
-		{Model: "Case", Labs: []string{"meta"}, Status: "matched"},
-		{Model: "case", Labs: []string{}, Status: "unmatched"},
-		{Model: "host/model", Labs: []string{"deepseek"}, Status: "matched"},
-		{Model: "model", Labs: []string{}, Status: "unmatched"},
-		{Model: "malformed", Labs: []string{}, Status: "unmatched"},
-		{Model: "no-canonical", Labs: []string{}, Status: "unmatched"},
-		{Model: "missing", Labs: []string{}, Status: "unmatched"},
+		{Model: models[0], Providers: cloudflare, Status: "matched"},
+		{Model: models[1], Providers: cloudflare, Status: "matched"},
+		{Model: models[2], Providers: cloudflare, Status: "matched"},
+		{Model: models[3], Providers: []ModelOwnershipProvider{{ID: "moonshotai", Name: "Moonshot AI"}}, Status: "matched"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("suggestions=%+v, want=%+v", got, want)
+	}
+}
+
+func TestModelsDevOwnershipUsesExactProviderEvidenceWithoutCanonicalOrPrice(t *testing.T) {
+	upstream, err := decodeModelsDevSource(strings.NewReader(`{
+		"host-a":{"name":"Same display name","models":{
+			"no-price":{"canonical_model_id":"anthropic/canonical"},
+			"bad-price":{"canonical_model_id":"google/canonical","cost":{"input":1,"future_price":5}},
+			"same-author":{"canonical_model_id":"openai/a"},
+			"different-authors":{"canonical_model_id":"openai/a"},
+			"Case":{"canonical_model_id":"meta/model"},
+			"host/model":{"canonical_model_id":"deepseek/model"},
+			"malformed":{"canonical_model_id":"missing-slash"},
+			"no-canonical":{}
+		}},
+		"host-b":{"name":"Same display name","models":{
+			"same-author":{"canonical_model_id":"openai/a"},
+			"different-authors":{"canonical_model_id":"anthropic/a"}
+		}},
+		"unnamed":{"models":{"unnamed-model":{}}},
+		"blank-name":{"name":" \t ","models":{"blank-name-model":{}}}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	models := []string{"no-price", "bad-price", "same-author", "different-authors", "Case", "case", "host/model", "model", "malformed", "no-canonical", "missing", "unnamed-model", "blank-name-model"}
+	got := modelsDevOwnershipSuggestions(upstream, models)
+	hostA := ModelOwnershipProvider{ID: "host-a", Name: "Same display name"}
+	hostB := ModelOwnershipProvider{ID: "host-b", Name: "Same display name"}
+	want := []ModelOwnershipSuggestion{
+		{Model: "no-price", Providers: []ModelOwnershipProvider{hostA}, Status: "matched"},
+		{Model: "bad-price", Providers: []ModelOwnershipProvider{hostA}, Status: "matched"},
+		{Model: "same-author", Providers: []ModelOwnershipProvider{hostA, hostB}, Status: "conflict"},
+		{Model: "different-authors", Providers: []ModelOwnershipProvider{hostA, hostB}, Status: "conflict"},
+		{Model: "Case", Providers: []ModelOwnershipProvider{hostA}, Status: "matched"},
+		{Model: "case", Providers: []ModelOwnershipProvider{}, Status: "unmatched"},
+		{Model: "host/model", Providers: []ModelOwnershipProvider{hostA}, Status: "matched"},
+		{Model: "model", Providers: []ModelOwnershipProvider{}, Status: "unmatched"},
+		{Model: "malformed", Providers: []ModelOwnershipProvider{hostA}, Status: "matched"},
+		{Model: "no-canonical", Providers: []ModelOwnershipProvider{hostA}, Status: "matched"},
+		{Model: "missing", Providers: []ModelOwnershipProvider{}, Status: "unmatched"},
+		{Model: "unnamed-model", Providers: []ModelOwnershipProvider{{ID: "unnamed", Name: "unnamed"}}, Status: "matched"},
+		{Model: "blank-name-model", Providers: []ModelOwnershipProvider{{ID: "blank-name", Name: "blank-name"}}, Status: "matched"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("suggestions=%+v, want=%+v", got, want)
@@ -53,14 +86,6 @@ func TestModelsDevOwnershipUsesExactCanonicalEvidenceWithoutPrice(t *testing.T) 
 	for _, price := range prices.Prices {
 		if price.Model == "no-price" || price.Model == "bad-price" {
 			t.Fatalf("ownership evidence admitted an invalid price: %+v", price)
-		}
-	}
-}
-
-func TestModelsDevOwnershipRejectsMalformedCanonicalAssociation(t *testing.T) {
-	for _, value := range []string{"", "model", "/model", "lab/", "lab /model", "lab/model\n", "lab/model\x00", "lab/*"} {
-		if lab, valid := modelsDevCanonicalLab(value); valid {
-			t.Fatalf("accepted canonical %q as %q", value, lab)
 		}
 	}
 }
@@ -89,7 +114,7 @@ func TestModelsDevOwnershipFetchValidatesBeforeNetworkAndDeduplicates(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []ModelOwnershipSuggestion{{Model: "a", Labs: []string{"lab"}, Status: "matched"}, {Model: "z", Labs: []string{}, Status: "unmatched"}}
+	want := []ModelOwnershipSuggestion{{Model: "a", Providers: []ModelOwnershipProvider{{ID: "host", Name: "host"}}, Status: "matched"}, {Model: "z", Providers: []ModelOwnershipProvider{}, Status: "unmatched"}}
 	if calls != 1 || !reflect.DeepEqual(got, want) {
 		t.Fatalf("calls=%d suggestions=%+v", calls, got)
 	}

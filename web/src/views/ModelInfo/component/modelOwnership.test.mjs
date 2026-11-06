@@ -31,24 +31,42 @@ test('手动设置和清空只提交归属，目标必须存在且清空不能�
   ]);
 });
 
-test('来源名称不自动等同本地归属，冲突和未匹配不会生成部分写入', () => {
+test('服务提供方按 ID 映射，冲突和未匹配不会生成部分写入', () => {
+  const provider = { id: 'cloudflare-workers-ai', name: 'Cloudflare Workers AI' };
+  const other = { id: 'other-host', name: 'Cloudflare Workers AI' };
   const base = {
     selected: new Set(['a', 'b']),
     method: 'source',
-    owners: { 7: { name: 'lab-a' } },
-    labOwners: {},
-    suggestions: { a: { status: 'matched', labs: ['lab-a'] }, b: { status: 'conflict', labs: ['lab-a', 'lab-b'] } }
+    owners: { 7: { name: 'Cloudflare Workers AI' }, 8: { name: '其他平台' } },
+    providerOwners: {},
+    suggestions: {
+      a: { status: 'matched', providers: [provider] },
+      b: { status: 'conflict', providers: [provider, other] }
+    }
   };
   assert.equal(buildOwnershipBatch(base).items.length, 0);
-  assert.equal(buildOwnershipBatch({ ...base, labOwners: { 'lab-a': '7' } }).items.length, 0);
-  assert.deepEqual(buildOwnershipBatch({ ...base, selected: new Set(['a']), labOwners: { 'lab-a': '7' } }).items, [
+  assert.equal(buildOwnershipBatch({ ...base, providerOwners: { [provider.id]: '7' } }).items.length, 0);
+  assert.deepEqual(buildOwnershipBatch({ ...base, selected: new Set(['a']), providerOwners: { [provider.id]: '7' } }).items, [
     { model: 'a', owned_by_id: 7 }
   ]);
   assert.equal(buildOwnershipBatch({ ...base, selected: new Set(['unknown']) }).items.length, 0);
   assert.equal(buildOwnershipBatch({ ...base, selected: new Set(['constructor', 'toString', '__proto__']) }).items.length, 0);
   assert.equal(
-    buildOwnershipBatch({ ...base, selected: new Set(['a']), suggestions: { a: { status: 'matched', labs: ['constructor'] } } }).items
-      .length,
+    buildOwnershipBatch({
+      ...base,
+      selected: new Set(['a']),
+      suggestions: { a: { status: 'matched', providers: [{ id: 'constructor', name: '特殊标识' }] } }
+    }).items.length,
     0
   );
+  const sameName = {
+    ...base,
+    suggestions: { a: { status: 'matched', providers: [provider] }, b: { status: 'matched', providers: [other] } }
+  };
+  assert.equal(buildOwnershipBatch({ ...sameName, providerOwners: { [provider.name]: '7' } }).items.length, 0);
+  assert.equal(buildOwnershipBatch({ ...sameName, providerOwners: { [provider.id]: '7' } }).items.length, 0);
+  assert.deepEqual(buildOwnershipBatch({ ...sameName, providerOwners: { [provider.id]: '7', [other.id]: '8' } }).items, [
+    { model: 'a', owned_by_id: 7 },
+    { model: 'b', owned_by_id: 8 }
+  ]);
 });
