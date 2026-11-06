@@ -355,6 +355,31 @@
         "vertex": "VertexAI 区域与项目",
         "opaque": "只保存扩展数据"
       }
+    },
+    "customParameters": {
+      "title": "配置说明与示例",
+      "intro": "选择一个示例，按需调整字段和值后填入上方；复制不会修改表单。",
+      "removeRule": "remove_params 指定要删除的字段；嵌套对象用点号路径，如 metadata.internal。不存在时跳过，不支持数组下标或通配符。",
+      "overwriteRule": "overwrite: true 将 temperature 固定为 0.7。对配置中的其他字段也会整字段替换，包括对象和数组。",
+      "nestedRule": "嵌套对象例外：overwrite 为 false 时，对象会递归合并，嵌套的同名值仍会被配置值覆盖。添加或覆盖嵌套字段请写 JSON 对象，点号路径仅用于 remove_params。",
+      "orderRule": "同一次处理先删除，再添加或覆盖。若配置里又添加了已删除的字段，最终仍会带上该字段。",
+      "modelRule": "将 upstream-model 替换为模型映射后的上游模型名，必须精确匹配。per_model: true 不继承顶层普通参数或 remove_params；公共规则需分别写入每个模型对象，未匹配的模型不修改。per_model、overwrite、pre_add 仍放最外层。",
+      "stageRule": "pre_add：默认 false，使用转换后的上游字段名；设为 true 时，在协议转换前处理请求字段。Responses→Chat 兼容路径是例外：使用转换后的 Chat 字段。删除后的字段仍可能由后续协议转换生成。",
+      "protectedRule": "受保护字段：model、stream、stream_format 的修改或删除会被忽略；修改 prompt_cache_key 的配置无法保存。Responses 的 background、conversation、previous_response_id、prompt、store 等生命周期字段也不能随意改写或删除。",
+      "scopeRule": "适用范围：这是请求体配置，不是请求头或 URL 参数配置。并非所有接口都会应用，例如原生图片编辑请求不应用额外参数。",
+      "removeTitle": "删除字段",
+      "overwriteTitle": "强制覆盖参数",
+      "perModelTitle": "只修改指定模型",
+      "preAddTitle": "在协议转换前删除字段",
+      "copy": "复制示例",
+      "copyExample": "复制示例：{{name}}",
+      "copied": "示例已复制",
+      "copyFailed": "复制失败，请选中示例手动复制。",
+      "defaultTitle": "仅补充默认值",
+      "defaultRule": "普通字段缺失时才补充默认值；示例仅在没有 temperature 时补充 0.7。嵌套对象的合并规则见进阶说明。",
+      "advancedTitle": "进阶规则与适用范围",
+      "docs": "完整配置文档（中文，新标签页打开）",
+      "scopeHint": "默认按上游请求字段配置；部分字段或接口不适用，详见进阶说明。"
     }
   },
   "token_index": {
@@ -2121,5 +2146,6 @@
   },
   "modelsDev": {
     "fetch": "从 models.dev 获取"
-  }
+  },
+  "填写 JSON 对象，可补充、覆盖或删除请求体字段；留空不修改。删除用 remove_params，覆盖用 overwrite。展开下方说明可查看规则和复制示例。": "填写 JSON 对象，可补充、覆盖或删除请求体字段；留空不修改。删除用 remove_params，覆盖用 overwrite。展开下方说明可查看规则和复制示例。"
 }

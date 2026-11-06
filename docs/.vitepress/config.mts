@@ -40,6 +40,7 @@ export default defineConfig({
         text: '使用',
         items: [
           { text: '使用说明', link: '/use/index' },
+          { text: '渠道额外参数', link: '/use/channel-parameters' },
           { text: 'Codex 渠道', link: '/use/Codex' },
           { text: '添加 VertexAI', link: '/use/VertexAI' },
           { text: 'Rerank 接口', link: '/use/Rerank' },

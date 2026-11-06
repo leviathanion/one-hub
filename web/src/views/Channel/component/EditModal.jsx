@@ -49,6 +49,7 @@ import CodexAuthControls from './CodexAuthControls';
 import AntigravityAuthControls from './AntigravityAuthControls';
 import ConfirmDialog from 'ui-component/confirm-dialog';
 import ChannelEndpointsEditor from './ChannelEndpointsEditor';
+import CustomParameterHelp from './CustomParameterHelp';
 import { createEndpointPreset } from '../type/endpoints.mjs';
 import { assertOAuthSessionVersion, versionAfterCredentialSave, versionAfterOAuthAuthorization } from './editVersion.mjs';
 
@@ -1519,6 +1520,7 @@ const EditModal = ({ open, channelId, onCancel, onOk, groupOptions, isTag, model
                         {customizeT(inputPrompt.custom_parameter)}
                       </FormHelperText>
                     )}
+                    <CustomParameterHelp />
                   </FormControl>
                 )}
                 {inputPrompt.disabled_stream && (

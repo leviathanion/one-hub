@@ -227,6 +227,31 @@
         "vertex": "VertexAI 區域與項目",
         "opaque": "只保存擴展數據"
       }
+    },
+    "customParameters": {
+      "title": "設定說明與範例",
+      "intro": "選擇一個範例，按需要調整欄位和值後填入上方；複製不會修改表單。",
+      "removeRule": "remove_params 指定要刪除的欄位；巢狀物件使用點號路徑，例如 metadata.internal。不存在時略過，不支援陣列索引或萬用字元。",
+      "overwriteRule": "overwrite: true 將 temperature 固定為 0.7。設定中的其他欄位也會整個替換，包括物件和陣列。",
+      "nestedRule": "巢狀物件例外：overwrite 為 false 時，物件會遞迴合併，巢狀的同名值仍會被設定值覆蓋。新增或覆蓋巢狀欄位請寫 JSON 物件，點號路徑僅用於 remove_params。",
+      "orderRule": "同一次處理先刪除，再新增或覆蓋。若設定中又新增了已刪除的欄位，最終仍會帶上該欄位。",
+      "modelRule": "將 upstream-model 替換為模型映射後的上游模型名稱，必須精確符合。per_model: true 不繼承頂層一般參數或 remove_params；共用規則需分別寫入每個模型物件，未符合的模型不修改。per_model、overwrite、pre_add 仍放最外層。",
+      "stageRule": "pre_add：預設 false，使用轉換後的上游欄位名稱；設為 true 時，在協定轉換前處理請求欄位。Responses→Chat 相容路徑是例外：使用轉換後的 Chat 欄位。刪除後的欄位仍可能由後續協定轉換產生。",
+      "protectedRule": "受保護欄位：model、stream、stream_format 的修改或刪除會被忽略；修改 prompt_cache_key 的設定無法儲存。Responses 的 background、conversation、previous_response_id、prompt、store 等生命週期欄位也不能隨意改寫或刪除。",
+      "scopeRule": "適用範圍：這是請求主體設定，不是請求標頭或 URL 參數設定。並非所有介面都會套用，例如原生圖片編輯請求不套用額外參數。",
+      "removeTitle": "刪除欄位",
+      "overwriteTitle": "強制覆蓋參數",
+      "perModelTitle": "只修改指定模型",
+      "preAddTitle": "在協定轉換前刪除欄位",
+      "copy": "複製範例",
+      "copyExample": "複製範例：{{name}}",
+      "copied": "範例已複製",
+      "copyFailed": "複製失敗，請選取範例手動複製。",
+      "defaultTitle": "僅補充預設值",
+      "defaultRule": "一般欄位缺失時才補充預設值；範例僅在沒有 temperature 時補充 0.7。巢狀物件的合併規則見進階說明。",
+      "advancedTitle": "進階規則與適用範圍",
+      "docs": "完整設定文件（中文，在新分頁開啟）",
+      "scopeHint": "預設按上游請求欄位設定；部分欄位或介面不適用，詳見進階說明。"
     }
   },
   "channel_index": {
@@ -2170,5 +2195,6 @@
   },
   "modelsDev": {
     "fetch": "從 models.dev 取得"
-  }
+  },
+  "填写 JSON 对象，可补充、覆盖或删除请求体字段；留空不修改。删除用 remove_params，覆盖用 overwrite。展开下方说明可查看规则和复制示例。": "填寫 JSON 物件，可補充、覆蓋或刪除請求主體欄位；留空不修改。刪除用 remove_params，覆蓋用 overwrite。展開下方說明可查看規則和複製範例。"
 }
