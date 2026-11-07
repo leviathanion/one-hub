@@ -107,6 +107,9 @@ channel:
 # 连接设置
 relay_timeout: 0 # 中继请求超时时间，单位为秒，默认为 0。
 connect_timeout: 30 # 连接超时时间，单位为秒，默认为 30。
+# long_stream 请求发完后等待响应头的秒数，独立于 relay_timeout；仍受流式总生命周期上限约束。
+# 环境变量 STREAM_RESPONSE_HEADER_TIMEOUT；未设置、无效或非正值使用 30 秒。修改环境变量后需重建容器。
+stream_response_header_timeout: 30
 
 # 默认程序启动时会联网下载一些通用的Token的编码，如：gpt-3.5-turbo，在一些网络环境不稳定，或者离线情况，可能会导致启动有问题，可以配置此目录缓存数据，可迁移到离线环境。
 tiktoken_cache_dir: ""
