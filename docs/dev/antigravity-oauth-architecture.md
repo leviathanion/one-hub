@@ -117,7 +117,7 @@ Chat message、stream delta 及转换依赖的工具对象需要保留未知扩�
 | --- | --- | --- | --- |
 | `/gemini/:version/models/:model` 的 generateContent/streamGenerateContent | same-dialect，外加内部 envelope | 保留内层 Gemini raw 请求及未知扩展，解包响应；由上游判断模型与参数支持 | 外层包装使整个操作不属于 exact-wire；仅对已知且不能等价表达的方言差异在发送前拒绝 |
 | `/claude/v1/messages` | cross-protocol | 直接 Claude→Antigravity；文本、可表示的内联图像、function tools、thinking 与签名；工具签名使用下文明确的 carrier | 不经过 Chat；工具签名扩展需目标客户端保留；服务端工具、远程资源引用、缓存指令等只在有明确等价映射时支持 |
-| `/v1/chat/completions` | cross-protocol | 文本与可表示的 function tools，覆盖流式和非流式；实际产生签名状态时通过响应扩展携回 | 不支持 Stored Chat；生成图片的输出转换不属首期承诺；签名多轮要求客户端保留必要状态 |
+| `/v1/chat/completions` | cross-protocol | 文本与可表示的 function tools，覆盖流式和非流式；实际产生签名状态时通过响应扩展携回 | 不支持 Stored Chat；生成图片的输出转换不属首期承诺；保真签名多轮需保留扩展；Gemini 缺签名工具历史使用下文无状态 bypass |
 | `/v1/responses` create | cross-protocol，执行目标为 provider | 显式 `store:false` 的无状态 create；消息、function items、内联图像与可往返的复合签名 carrier | `store` 省略或为 true、`previous_response_id`、conversation、`background:true` 不支持；远程图像 URL 尚无等价准备路径，发送前拒绝 |
 | Responses retrieve/delete/cancel/input_items/compact/input_tokens/WS | 首期不注册 | 无 | create 外形适配不等于拥有资源、压缩、计数或 WebSocket 契约 |
 | Gemini countTokens、Claude count_tokens、Interactions、Files、Batch 及独立图像 API | 首期不注册 | 无 | 属于本次范围取舍，不表示真实上游一定不存在相应能力；generateContent 内可直接表达的媒体字段继续保留 |
@@ -390,7 +390,7 @@ main 的 `stream.go:replaceAntigravitySSEData` 将替换后的 data 行固定写
 
 ### 签名往返与会话限制
 
-thoughtSignature 是上游不透明数据。优先使用协议已有字段往返，保留工具 part、独立 part 的签名与位置；本地不检查其算法、可信性或跨模型有效性，也不伪造 sentinel。
+thoughtSignature 是上游不透明数据。优先使用协议已有字段往返，保留工具 part、独立 part 的签名与位置；本地不检查其算法、可信性或跨模型有效性，不伪造真实签名；跨协议 Gemini 工具历史缺签名时，按下文明确的 bypass 规则处理。
 
 只有目标协议不能直接保留必要的内容顺序、part 边界或签名关联时，才使用一个版本化 opaque carrier，例如 `ag1.<base64url payload>`。这是 one-hub 新增的客户端可见扩展，使用它的跨协议路径不能宣称完全透明或兼容所有标准客户端。它只携带实际存在的原生签名和对应 item/call/part 的必要关联；无签名时也可只携带位置、文本长度和调用关联以恢复布局。实际样本证明仍无法无损重建时，才附带最小原始片段，不预存整轮历史或可从下游重建的内容。carrier 不含 token、subject、project 等渠道秘密，也不作为身份、资源 owner 或选路授权。
 
@@ -415,7 +415,7 @@ Claude 工具的签名如果晚于工具片段到达，转换器在关联确定�
 
 `providers/claude/type.go` 已有 Signature 字段，CLIProxyAPI 也输出 tool_use.signature，这些只证明有可参考的本地表达方式。必须通过指定客户端实际回传测试，才能声明该客户端支持相应扩展；严格丢弃未知字段的 SDK 不在此保证内。
 
-默认使用客户端携回材料，不建立签名缓存或 reasoning replay ledger；必需客户端的例外按前述验收条件单独决策。现有 affinity 只能提高同渠道命中率，不能证明签名可跨账号、项目或模型使用；客户端需要固定渠道时使用既有显式 pin。管理员编辑身份后历史可能失效，上游签名拒绝原样映射为错误，不自动换账号或清历史。上游返回超出已声明转换范围时，按真实 usage 关闭并报告已执行后的适配失败，不能借此返回不完整的成功响应。
+跨协议转换到实际目标名以 `gemini-` 开头的模型（大小写不敏感）时，先恢复客户端携回的真实签名与布局，再为转换后 model 历史中缺失、null、空或纯空白签名的 functionCall 填入 `skip_thought_signature_validator`。Chat、Claude、Responses 共用该规则，不要求普通客户端回传私有扩展，不建立签名缓存或 reasoning replay ledger。该标记只跳过上游签名校验，不恢复丢失的推理状态或布局，可能影响模型效果；不宣称无损续接。原生 Gemini 请求保持 raw 透传，Claude 及其他目标模型不应用 Gemini bypass；已有非空白签名不替换，损坏 carrier 仍在发送前拒绝。现有 affinity 只能提高同渠道命中率，不能证明签名可跨账号、项目或模型使用；客户端需要固定渠道时使用既有显式 pin。管理员编辑身份后历史可能失效，上游签名拒绝原样映射为错误，不自动换账号或清历史。上游返回超出已声明转换范围时，按真实 usage 关闭并报告已执行后的适配失败，不能借此返回不完整的成功响应。
 
 ## 流式交付、错误与计费
 
@@ -475,7 +475,7 @@ Claude 工具的签名如果晚于工具片段到达，转换器在关联确定�
 | --- | --- | --- |
 | 模型验证名单、Chat 模式协商、额外 sessionId 派生 | 不再提前预测某模型或客户端是否接受请求 | 删除；按实际转换需要判断，模型参数与签名有效性交给上游 |
 | 匿名 callback、OAuth 结果缓存、自动模型目录持久化 | 少自动回填和后台探测便利 | 不引入；现有管理操作与渠道配置已覆盖目标 |
-| 签名缓存与 replay ledger | 部分丢弃签名材料的客户端无法继续多轮请求，这是实际兼容性损失 | 默认不引入；必需客户端确有阻断时按扩展条件评估最小恢复，不能声称无损消融 |
+| 签名缓存与 replay ledger | 丢弃签名材料会失去真实推理续接状态 | 不引入；Gemini 跨协议工具缺签名时使用 bypass，不声称无损恢复 |
 | 账号池、credits fallback | 不自动换账号或切换付费路径 | 本轮不引入；这些功能需要额外产品契约与状态 owner |
 | 多跳转换、重复验证、schema 通用清洗 | 失去复用旧转换链和通过删字段提高成功率的便利 | 共用直接转换函数，修复只针对有依据的表示差异 |
 | 跨层 Plan 契约与缓存 | 选定后可能重复一次纯构造计算 | 不引入；只有有必要复用的数据进入已有请求准备流程 |
@@ -552,7 +552,7 @@ work/antigravity-sdk/bin/python -B providers/antigravity/wire/testdata/sdk_round
 work/antigravity-sdk/bin/python -B providers/antigravity/wire/testdata/sdk_roundtrip/sdk_sse.py work/ag-sdk
 ```
 
-上述离线模型 ID 为 `fixture-model`；HTTP ingress 测试中的模型别名也仅是 fixture。未使用真实 Antigravity 账号、模型或签名，未完成真实 Google 上游验收，不能据此宣称真实签名已经被模型接受、缓存等价或所有客户端兼容。SDK 往返以客户端保留 `tool_use.signature`、`encrypted_content`、`extra_content.antigravity_state` 为条件；丢弃这些字段的客户端仍在支持范围外。`display=omitted`、非空 Claude effort、有效缓存声明、字符串 prompt_cache_key、eager=true/null 均保持表内拒绝，不把这些未实现项算作可用性通过。
+上述离线模型 ID 为 `fixture-model`；HTTP ingress 测试中的模型别名也仅是 fixture。未使用真实 Antigravity 账号、模型或签名，未完成真实 Google 上游验收，不能据此宣称真实签名已经被模型接受、缓存等价或所有客户端兼容。上述保真 SDK 往返以客户端保留 `tool_use.signature`、`encrypted_content`、`extra_content.antigravity_state` 为条件；丢弃这些字段的客户端不在保真保证内。Gemini 跨协议工具历史另按前述无状态 bypass 规则兼容，真实上游效果仍需验证。`display=omitted`、非空 Claude effort、有效缓存声明、字符串 prompt_cache_key、eager=true/null 均保持表内拒绝，不把这些未实现项算作可用性通过。
 
 ## 实施批次与完成条件
 

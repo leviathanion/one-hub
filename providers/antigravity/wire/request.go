@@ -63,6 +63,12 @@ func ConvertRequest(dialect Dialect, raw []byte, model string) (*Request, error)
 	if err != nil {
 		return nil, err
 	}
+	if strings.HasPrefix(strings.ToLower(model), "gemini-") {
+		body, err = fillMissingFunctionSignatures(body)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if !json.Valid(body) {
 		return nil, unsupported("request", "目标请求构造失败")
 	}
