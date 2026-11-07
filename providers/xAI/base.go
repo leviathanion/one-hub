@@ -1,15 +1,11 @@
 package xAI
 
 import (
-	"fmt"
-	"io"
-	"net/http"
 	"one-api/common/requester"
 	"one-api/model"
 	"one-api/providers/base"
 	"one-api/providers/openai"
 	"one-api/types"
-	"strings"
 )
 
 // 定义供应商工厂
@@ -24,7 +20,6 @@ func (XAIProviderFactory) AssessChatRemoteMedia(_ *model.Channel, _ *types.ChatC
 
 // 创建 XAIProvider
 func (f XAIProviderFactory) Create(channel *model.Channel) base.ProviderInterface {
-	fmt.Println("Creating XAIProvider for channel:")
 	return &XAIProvider{
 		OpenAIProvider: openai.OpenAIProvider{
 			BaseProvider: base.BaseProvider{
@@ -32,8 +27,8 @@ func (f XAIProviderFactory) Create(channel *model.Channel) base.ProviderInterfac
 				Channel:   channel,
 				Requester: requester.NewHTTPRequester(*channel.Proxy, RequestErrorHandle),
 			},
-			UsageHandler:        usageHandler,
-			RequestHandleBefore: requestHandler,
+			UsageHandler:         usageHandler,
+			SupportStreamOptions: true,
 		},
 	}
 }
@@ -49,44 +44,4 @@ func getConfig() base.ProviderConfig {
 
 type XAIProvider struct {
 	openai.OpenAIProvider
-}
-
-func RequestErrorHandle(resp *http.Response) *types.OpenAIError {
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil
-	}
-
-	msg := string(bodyBytes)
-	if msg == "" {
-		return nil
-	}
-
-	return openai.ErrorHandle(&types.OpenAIErrorResponse{
-		Error: types.OpenAIError{
-			Message: msg,
-			Code:    "xAI_error",
-		},
-	})
-}
-
-func usageHandler(usage *types.Usage) (ForcedFormatting bool) {
-	usage.CompletionTokens = usage.TotalTokens - usage.PromptTokens
-
-	return true
-}
-
-func requestHandler(request *types.ChatCompletionRequest) (errWithCode *types.OpenAIErrorWithStatusCode) {
-	if strings.HasPrefix(request.Model, "grok-4") || strings.HasPrefix(request.Model, "grok-3-mini") || strings.HasPrefix(request.Model, "grok-3-mini-fast") {
-		request.Stop = nil
-		request.FrequencyPenalty = nil
-		request.PresencePenalty = nil
-	}
-
-	if strings.HasPrefix(request.Model, "grok-4") {
-		request.ReasoningEffort = nil
-		request.Reasoning = nil
-	}
-
-	return nil
 }

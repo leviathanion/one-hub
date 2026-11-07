@@ -30,9 +30,11 @@ type OpenAIStreamHandler struct {
 	// temporarily enables provider-side usage for settlement evidence.
 	ExposeProviderUsage bool
 
-	sseFramer          *requester.SSEEventFramer
-	hideProviderUsage  bool
-	beforeChatDelivery func([]byte) error
+	sseFramer             *requester.SSEEventFramer
+	hideProviderUsage     bool
+	beforeChatDelivery    func([]byte) error
+	formatProviderUsage   bool
+	formattedUsagePayload []byte
 }
 
 func (p *OpenAIProvider) CreateChatCompletion(request *types.ChatCompletionRequest) (openaiResponse *types.ChatCompletionResponse, errWithCode *types.OpenAIErrorWithStatusCode) {
@@ -57,7 +59,7 @@ func (p *OpenAIProvider) CreateChatCompletion(request *types.ChatCompletionReque
 	}
 
 	response := &OpenAIProviderChatResponse{}
-	captureSameDialect := p.ProviderRawJSONReplay || p.usesNativeOpenAIWire()
+	captureSameDialect := p.ProviderRawJSONReplay || p.usesNativeChatWire()
 	if captureSameDialect {
 		response.EnableProviderRawJSONCapture()
 	}
@@ -76,23 +78,24 @@ func (p *OpenAIProvider) CreateChatCompletion(request *types.ChatCompletionReque
 	// provider headers after it has compared the actual bytes being delivered.
 	p.captureProviderResponseHeaders(httpResponse, false)
 
-	// 检测是否错误
+	formatUsage := false
+	if response.Usage != nil {
+		response.Usage.MarkProviderReported()
+		if p.UsageHandler != nil {
+			formatUsage = p.UsageHandler(response.Usage)
+		}
+		response.Usage.MergeProviderAttribution(response.Model, response.ServiceTier)
+		*p.Usage = *response.Usage
+	}
+
+	// 错误与计费证据独立：同一响应中的 usage 仍属于本次上游执行。
 	openaiErr := ErrorHandle(&response.OpenAIErrorResponse)
-	if openaiErr != nil {
+	if openaiErr != nil && !p.ProviderRawJSONReplay {
 		errWithCode = &types.OpenAIErrorWithStatusCode{
 			OpenAIError: *openaiErr,
 			StatusCode:  http.StatusBadRequest,
 		}
 		return nil, errWithCode
-	}
-
-	if response.Usage != nil {
-		response.Usage.MarkProviderReported()
-		if p.UsageHandler != nil {
-			p.UsageHandler(response.Usage)
-		}
-		response.Usage.MergeProviderAttribution(response.Model, response.ServiceTier)
-		*p.Usage = *response.Usage
 	}
 
 	bodyUnmodified := false
@@ -102,9 +105,10 @@ func (p *OpenAIProvider) CreateChatCompletion(request *types.ChatCompletionReque
 		bodyUnmodified = len(raw) > 0 && bytes.Equal(raw, response.ReplayProviderRawJSON())
 	} else if captureSameDialect {
 		originalRaw := response.ProviderRawJSON()
-		replay, replayErr := safeCompatibleChatResponseReplay(originalRaw, &response.ChatCompletionResponse, p.UsageHandler != nil)
+		replay, replayErr := safeCompatibleChatResponseReplay(originalRaw, &response.ChatCompletionResponse, formatUsage)
 		if replayErr != nil {
-			return nil, common.ErrorWrapper(replayErr, "decode_response_failed", http.StatusInternalServerError)
+			// 局部用量投影失败不替换已经成功的上游响应；计费仍使用独立提取的证据。
+			replay = originalRaw
 		}
 		response.SetProviderRawJSON(replay)
 		response.EnableProviderRawJSONReplay()
@@ -129,41 +133,10 @@ func safeCompatibleChatResponseReplay(raw []byte, response *types.ChatCompletion
 	if len(raw) == 0 || response == nil {
 		return nil, nil
 	}
-	safeRaw := raw
-	var object map[string]json.RawMessage
-	if err := json.Unmarshal(safeRaw, &object); err != nil {
-		return nil, err
+	if !forceUsagePatch || response.Usage == nil {
+		return raw, nil
 	}
-	rawUsage, hasUsage := object["usage"]
-	patchUsage := forceUsagePatch && hasUsage && !bytes.Equal(bytes.TrimSpace(rawUsage), []byte("null"))
-	if !patchUsage {
-		return safeRaw, nil
-	}
-	typed, err := json.Marshal(response)
-	if err != nil {
-		return nil, err
-	}
-	var projection map[string]json.RawMessage
-	if err := json.Unmarshal(typed, &projection); err != nil {
-		return nil, err
-	}
-	if usage, ok := projection["usage"]; ok {
-		if hasUsage && !bytes.Equal(bytes.TrimSpace(rawUsage), []byte("null")) {
-			var rawUsageObject map[string]json.RawMessage
-			var projectedUsageObject map[string]json.RawMessage
-			if json.Unmarshal(rawUsage, &rawUsageObject) == nil && json.Unmarshal(usage, &projectedUsageObject) == nil {
-				for key, value := range projectedUsageObject {
-					rawUsageObject[key] = value
-				}
-				usage, err = json.Marshal(rawUsageObject)
-				if err != nil {
-					return nil, err
-				}
-			}
-		}
-		object["usage"] = usage
-	}
-	return json.Marshal(object)
+	return patchChatPayloadUsage(raw, response.Usage)
 }
 
 func (p *OpenAIProvider) CreateChatCompletionStream(request *types.ChatCompletionRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode) {
@@ -246,7 +219,8 @@ func (p *OpenAIProvider) createChatCompletionStream(request *types.ChatCompletio
 	options := requester.StreamReadOptions{
 		RequireProtocolTerminal: p.RequireOpenAIStreamTerminal,
 	}
-	if p.ProviderRawJSONReplay || (p.usesNativeOpenAIWire() && !p.StreamEscapeJSON) {
+	if p.ProviderRawJSONReplay || (p.usesNativeChatWire() && !p.StreamEscapeJSON) {
+		chatHandler.formatProviderUsage = !p.ProviderRawJSONReplay
 		chatHandler.hideProviderUsage = !p.ProviderRawJSONReplay && !chatHandler.ExposeProviderUsage
 		chatHandler.sseFramer = requester.NewSSEEventFramer(openAIExactSSEMaxEventBytes)
 		if forConversion {
@@ -284,13 +258,13 @@ func (h *OpenAIStreamHandler) HandlerChatStream(rawLine *[]byte, dataChan chan s
 		return
 	}
 
+	usageOnly := h.observeChatStreamResponse(&openaiResponse)
 	aiError := ErrorHandle(&openaiResponse.OpenAIErrorResponse)
 	if aiError != nil {
 		errChan <- aiError
 		return
 	}
 
-	usageOnly := h.observeChatStreamResponse(&openaiResponse)
 	if usageOnly && !h.ExposeProviderUsage {
 		*rawLine = nil
 		return
@@ -357,6 +331,7 @@ func (h *OpenAIStreamHandler) handleExactSSE(rawLine *[]byte, emitter requester.
 		}
 	}
 	var conversionTerminal error
+	h.formattedUsagePayload = nil
 	if hasData && strings.TrimSpace(payload) == "[DONE]" {
 		if forConversion {
 			conversionTerminal = io.EOF
@@ -367,10 +342,13 @@ func (h *OpenAIStreamHandler) handleExactSSE(rawLine *[]byte, emitter requester.
 			conversionTerminal = observedError
 		}
 	}
+	if len(h.formattedUsagePayload) > 0 {
+		safeEvent = replaceChatSSEData(safeEvent, h.formattedUsagePayload)
+	}
 	// Compatibility adapters may request usage that the client did not ask to
 	// receive. Preserve that existing contract only for an explicit usage-only
 	// chunk; unknown events and future choices unions remain untouched.
-	if hasData && h.hideProviderUsage && isUsageOnlySSEPayload([]byte(payload)) {
+	if hasData && h.hideProviderUsage && isUsageOnlySSEEvent(safeEvent, []byte(payload)) {
 		return
 	}
 	if !emitter.SendData(safeEvent) {
@@ -382,13 +360,32 @@ func (h *OpenAIStreamHandler) handleExactSSE(rawLine *[]byte, emitter requester.
 	}
 }
 
-func isUsageOnlySSEPayload(payload []byte) bool {
-	if runtimesession.OpenAIErrorEnvelopeFromPayload(payload) != nil {
+func isUsageOnlySSEEvent(event string, payload []byte) bool {
+	var eventName string
+	for len(event) > 0 {
+		line, rest := requester.SplitSSELine(event)
+		event = rest
+		field, value, _ := strings.Cut(requester.SSELineContent(line), ":")
+		if field == "event" {
+			eventName = strings.TrimPrefix(value, " ")
+		}
+	}
+	// 只过滤普通 OpenAI usage 尾包，未知命名事件仍按上游语义交付。
+	if (eventName != "" && eventName != "message") || providerresponse.SSEPayloadContainsError(eventName, payload) {
 		return false
 	}
 	var fields map[string]json.RawMessage
 	if json.Unmarshal(payload, &fields) != nil || decodeOpenAIStreamUsage(fields["usage"]) == nil {
 		return false
+	}
+	if rawType, present := fields["type"]; present && !bytes.Equal(bytes.TrimSpace(rawType), []byte("null")) {
+		return false
+	}
+	if rawObject, present := fields["object"]; present {
+		var object string
+		if json.Unmarshal(rawObject, &object) != nil || (object != "chat.completion.chunk" && object != "text_completion") {
+			return false
+		}
 	}
 	var choices []json.RawMessage
 	return len(fields["choices"]) > 0 && json.Unmarshal(fields["choices"], &choices) == nil && len(choices) == 0
@@ -418,12 +415,13 @@ func (h *OpenAIStreamHandler) observeExactChatStreamPayload(payload []byte) erro
 	if h == nil {
 		return nil
 	}
-	if providerErr := runtimesession.OpenAIErrorEnvelopeFromPayload(payload); providerErr != nil {
-		return providerErr
+	var providerErr error
+	if apiErr := runtimesession.OpenAIErrorEnvelopeFromPayload(payload); apiErr != nil {
+		providerErr = apiErr
 	}
 	var fields map[string]json.RawMessage
 	if json.Unmarshal(payload, &fields) != nil {
-		return nil
+		return providerErr
 	}
 
 	model := rawJSONString(fields["model"])
@@ -439,28 +437,47 @@ func (h *OpenAIStreamHandler) observeExactChatStreamPayload(payload []byte) erro
 		}
 	}
 	if usage != nil {
-		h.mergeChatStreamUsage(usage, model, serviceTier)
+		if h.mergeChatStreamUsage(usage, model, serviceTier) && h.formatProviderUsage {
+			patched, err := patchChatPayloadUsage(payload, usage)
+			if err == nil && !bytes.Equal(patched, payload) {
+				h.formattedUsagePayload = patched
+			}
+		}
 	} else if h.Usage != nil {
 		h.Usage.MergeProviderAttribution(model, serviceTier)
 	}
-	return nil
+	return providerErr
 }
 
-func (h *OpenAIStreamHandler) mergeChatStreamUsage(usage *types.Usage, model, serviceTier string) {
+func (h *OpenAIStreamHandler) mergeChatStreamUsage(usage *types.Usage, model, serviceTier string) bool {
 	if h == nil || h.Usage == nil || usage == nil {
-		return
+		return false
 	}
 	previousModel := h.Usage.ResponseModel
 	previousTier := h.Usage.ServiceTier
 	previousConflict := h.Usage.AttributionConflict
 	usage.MarkProviderReported()
-	if h.UsageHandler != nil && h.UsageHandler(usage) {
+	formatted := h.UsageHandler != nil && h.UsageHandler(usage)
+	if formatted {
 		h.EscapeJSON = true
+	}
+	if h.Usage.HasProviderBaseUsage() && (!usage.ProviderTokenFields["prompt_tokens"] || !usage.ProviderTokenFields["completion_tokens"]) {
+		// 累计 token 快照需要完整的基础字段，稀疏观察不覆盖旧快照，也不拼接计数。
+		// 已由 provider 授权的独立用量仍按累计值更新。
+		for key, billing := range usage.ExtraBilling {
+			if usage.HasProviderExtraBilling(key) {
+				h.Usage.SetProviderExtraBilling(types.ResolveExtraBillingServiceType(key, billing), types.ResolveExtraBillingType(key, billing), billing.CallCount)
+			}
+		}
+		h.Usage.MergeBillingDiagnostics(usage.BillingDiagnostics)
+		h.Usage.MergeProviderAttribution(model, serviceTier)
+		return formatted
 	}
 	*h.Usage = *usage
 	h.Usage.MergeProviderAttribution(previousModel, previousTier)
 	h.Usage.AttributionConflict = h.Usage.AttributionConflict || previousConflict
 	h.Usage.MergeProviderAttribution(model, serviceTier)
+	return formatted
 }
 
 func decodeOpenAIStreamUsage(raw json.RawMessage) *types.Usage {

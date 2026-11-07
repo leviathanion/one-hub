@@ -16,6 +16,7 @@ var (
 	sensitiveBearerPattern              = regexp.MustCompile(`(?i)\bbearer\s+[A-Za-z0-9._~+/-]+=*`)
 	sensitiveJWTLikePattern             = regexp.MustCompile(`\b[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`)
 	sensitiveProviderIdentityPattern    = regexp.MustCompile(`(?i)\b(organization|org|project|account)([ \t]+)(?:org[-_]|proj[-_]|acct[-_])[A-Za-z0-9_-]+`)
+	sensitiveProviderTeamPattern        = regexp.MustCompile(`(?i)\b(team(?:[ _-]+id)?)([ \t]+)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b`)
 	sensitiveURLPattern                 = regexp.MustCompile(`(?i)\bhttps?://[^\s"'<>]+`)
 	sensitiveBodyLabelValuePattern      = regexp.MustCompile(`(?i)\b(request|response)[-_ ]?body\b\s*[:=]?\s*\S*`)
 )
@@ -30,6 +31,7 @@ func RedactSensitiveText(message string) string {
 	message = sensitiveBearerPattern.ReplaceAllString(message, "[redacted]")
 	message = sensitiveJWTLikePattern.ReplaceAllString(message, "[redacted]")
 	message = sensitiveProviderIdentityPattern.ReplaceAllString(message, "${1}${2}[redacted]")
+	message = sensitiveProviderTeamPattern.ReplaceAllString(message, "${1}${2}[redacted]")
 	message = sensitiveURLPattern.ReplaceAllString(message, "[redacted]")
 	message = sensitiveBodyLabelValuePattern.ReplaceAllString(message, "[redacted]")
 
@@ -85,13 +87,14 @@ func RedactProviderErrorText(message string) string {
 	message = RedactSensitiveAssignments(message)
 	message = sensitiveBearerPattern.ReplaceAllString(message, "[redacted]")
 	message = sensitiveJWTLikePattern.ReplaceAllString(message, "[redacted]")
-	return sensitiveProviderIdentityPattern.ReplaceAllString(message, "${1}${2}[redacted]")
+	message = sensitiveProviderIdentityPattern.ReplaceAllString(message, "${1}${2}[redacted]")
+	return sensitiveProviderTeamPattern.ReplaceAllString(message, "${1}${2}[redacted]")
 }
 
 // SensitiveCredentialLabel 是协议字段与诊断赋值共用的凭据标签词表。
 func SensitiveCredentialLabel(label string) bool {
 	switch normalizedSensitiveLabel(label) {
-	case "apikey", "xapikey", "token", "accesstoken", "refreshtoken", "idtoken", "clientsecret", "clientassertion", "accountid", "organizationid", "orgid", "projectid", "subscriptionid", "tenantid", "billingaccount", "billingaccountid":
+	case "apikey", "xapikey", "token", "accesstoken", "refreshtoken", "idtoken", "clientsecret", "clientassertion", "accountid", "organizationid", "orgid", "projectid", "subscriptionid", "tenantid", "teamid", "billingaccount", "billingaccountid":
 		return true
 	}
 	return false

@@ -2,20 +2,120 @@ package relay_util
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"one-api/common/utils"
+	"strings"
 	"testing"
 
 	"one-api/common/config"
+	"one-api/common/requester"
 	"one-api/model"
 	"one-api/providers/claude"
 	"one-api/providers/openai"
+	xAI "one-api/providers/xAI"
 	"one-api/types"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/datatypes"
 )
+
+func usagePartitionXAIUsage(t *testing.T, raw string) *types.Usage {
+	t.Helper()
+	const modelName = "xai-usage-model"
+	body := `{"model":"` + modelName + `","choices":[{"message":{"role":"assistant","content":"OK"}}],"future_response":9007199254740993,"usage":` + raw + `}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, body)
+	}))
+	defer server.Close()
+	previousClient := requester.HTTPClient
+	requester.HTTPClient = server.Client()
+	defer func() { requester.HTTPClient = previousClient }()
+	proxy, baseURL := "", server.URL
+	provider := (xAI.XAIProviderFactory{}).Create(&model.Channel{
+		Type: config.ChannelTypeXAI, Key: "test-key", Proxy: &proxy, BaseURL: &baseURL,
+	}).(*xAI.XAIProvider)
+	provider.SetUsage(&types.Usage{})
+	response, apiErr := provider.CreateChatCompletion(&types.ChatCompletionRequest{
+		Model: modelName, Messages: []types.ChatCompletionMessage{{Role: "user", Content: "Hi"}},
+	})
+	if apiErr != nil {
+		t.Fatalf("xAI usage extraction: %+v", apiErr)
+	}
+	public := string(response.ReplayProviderRawJSON())
+	for _, field := range []string{`"future_response":9007199254740993`, `"cost_in_usd_ticks":9007199254740993000`, `"future_usage":true`} {
+		if !strings.Contains(public, field) {
+			t.Fatalf("xAI normalization lost upstream field %s: %s", field, public)
+		}
+	}
+	var original struct {
+		Details map[string]json.RawMessage `json:"completion_tokens_details"`
+	}
+	if err := json.Unmarshal([]byte(raw), &original); err != nil {
+		t.Fatal(err)
+	}
+	if text := original.Details["text_tokens"]; text != nil && !strings.Contains(public, `"text_tokens":`+string(text)) {
+		t.Fatalf("xAI 改写了上游显式文本用量：%s", public)
+	}
+	return provider.GetUsage()
+}
+
+func TestXAIOutputPartitionsSettleFromProviderEvidence(t *testing.T) {
+	const modelName = "xai-usage-model"
+	for _, test := range []struct {
+		name, fields string
+		priceable    bool
+		conflicting  bool
+	}{
+		{name: "explicit reasoning without total", fields: `"prompt_tokens":3,"completion_tokens":5,"completion_tokens_details":{"reasoning_tokens":2}`, priceable: true},
+		{name: "total without reasoning detail", fields: `"prompt_tokens":3,"completion_tokens":5,"total_tokens":10`, priceable: true},
+		{name: "complete output evidence", fields: `"prompt_tokens":3,"completion_tokens":5,"total_tokens":10,"completion_tokens_details":{"reasoning_tokens":2}`, priceable: true},
+		{name: "matching explicit text partition", fields: `"prompt_tokens":3,"completion_tokens":5,"total_tokens":10,"completion_tokens_details":{"reasoning_tokens":2,"text_tokens":5}`, priceable: true},
+		{name: "matching text partition without reasoning detail", fields: `"prompt_tokens":3,"completion_tokens":5,"total_tokens":10,"completion_tokens_details":{"text_tokens":5}`, priceable: true},
+		{name: "conflicting explicit text partition", fields: `"prompt_tokens":3,"completion_tokens":5,"total_tokens":10,"completion_tokens_details":{"reasoning_tokens":2,"text_tokens":4}`, conflicting: true},
+		{name: "conflicting explicit zero text partition", fields: `"prompt_tokens":3,"completion_tokens":5,"total_tokens":10,"completion_tokens_details":{"reasoning_tokens":2,"text_tokens":0}`, conflicting: true},
+		{name: "conflicting text partition without reasoning detail", fields: `"prompt_tokens":3,"completion_tokens":5,"total_tokens":10,"completion_tokens_details":{"text_tokens":4}`, conflicting: true},
+		{name: "conflicting zero text partition without reasoning detail", fields: `"prompt_tokens":3,"completion_tokens":5,"total_tokens":10,"completion_tokens_details":{"text_tokens":0}`, conflicting: true},
+		{name: "visible output without total or reasoning", fields: `"prompt_tokens":3,"completion_tokens":5`},
+		{name: "missing visible output", fields: `"prompt_tokens":3,"total_tokens":10,"completion_tokens_details":{"reasoning_tokens":2}`},
+		{name: "negative output", fields: `"prompt_tokens":3,"completion_tokens":-1,"total_tokens":10,"completion_tokens_details":{"reasoning_tokens":2}`},
+		{name: "conflicting total", fields: `"prompt_tokens":3,"completion_tokens":5,"total_tokens":20,"completion_tokens_details":{"reasoning_tokens":2}`, conflicting: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			raw := `{` + test.fields + `,"cost_in_usd_ticks":9007199254740993000,"future_usage":true}`
+			usage := usagePartitionXAIUsage(t, raw)
+			if test.name == "total without reasoning detail" && usage.ProviderTokenFields[config.UsageExtraReasoning] {
+				t.Fatal("derived reasoning was marked as observed provider evidence")
+			}
+			for _, price := range []struct {
+				name   string
+				ratios map[string]float64
+				want   int64
+			}{
+				{name: "uniform price", want: 10},
+				{name: "reasoning price", ratios: map[string]float64{config.UsageExtraReasoning: 2}, want: 12},
+				{name: "distinct output partition prices", ratios: map[string]float64{config.UsageExtraOutputTextTokens: 2, config.UsageExtraReasoning: 3}, want: 19},
+			} {
+				t.Run(price.name, func(t *testing.T) {
+					quota := usagePartitionQuota(t, usagePartitionPrice(t, modelName, 1, 1, price.ratios), modelName)
+					decision := quota.EvaluateProviderUsage(usage)
+					want, status := price.want, PriceComponentPriceable
+					if !test.priceable {
+						want, status = 0, PriceComponentMissingEvidence
+						if test.conflicting {
+							status = PriceComponentConflictingEvidence
+						}
+					}
+					if decision.Confirm != test.priceable || decision.FinalQuota != want || componentStatuses(decision.Components)["tokens"] != status {
+						t.Fatalf("xAI usage must settle with the customer price policy: usage=%+v decision=%+v want=%d status=%s", usage, decision, want, status)
+					}
+				})
+			}
+		})
+	}
+}
 
 func usagePartitionPrice(t *testing.T, modelName string, input, output float64, ratios map[string]float64) *model.Pricing {
 	t.Helper()

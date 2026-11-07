@@ -167,3 +167,27 @@ func TestSafeClientErrorTextRedactsBeforeTruncation(t *testing.T) {
 		t.Fatalf("诊断截断留下秘密前缀: %q", got)
 	}
 }
+
+func TestProviderTeamIdentityRedactionKeepsDiagnosticContext(t *testing.T) {
+	const team = "01234567-89ab-cdef-0123-456789abcdef"
+	for _, label := range []string{"team", "Team ID", "team_id"} {
+		input := "The model does not exist or your " + label + " " + team + " does not have access to it."
+		for _, redact := range []func(string) string{RedactProviderErrorText, RedactSensitiveText} {
+			got := redact(input)
+			if strings.Contains(got, team) || !strings.Contains(got, "[redacted]") || !strings.Contains(got, "The model does not exist") {
+				t.Fatalf("团队标识脱敏改变错误上下文：%s", got)
+			}
+		}
+		if got := RedactProviderErrorText(input); !strings.Contains(got, label+" [redacted]") {
+			t.Fatalf("对客诊断标签丢失：%s", got)
+		}
+	}
+	if got := RedactProviderErrorText(`request team_id="private-team" is denied`); strings.Contains(got, "private-team") {
+		t.Fatalf("团队赋值泄露：%s", got)
+	}
+	for _, input := range []string{"team collaboration is unavailable", "team 123 is invalid", "model 01234567-89ab-cdef-0123-456789abcdef not found"} {
+		if got := RedactProviderErrorText(input); got != input {
+			t.Fatalf("普通错误被改写：%s", got)
+		}
+	}
+}

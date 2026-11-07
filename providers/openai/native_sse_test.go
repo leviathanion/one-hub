@@ -65,7 +65,7 @@ func TestCompatibleNativeSSEPreservesCompleteEvents(t *testing.T) {
 			proxy := ""
 			p := CreateOpenAIProvider(&model.Channel{Plugin: model.NewCustomEndpointPlugin(), Type: config.ChannelTypeCustom, Key: "test", Proxy: &proxy}, server.URL)
 			p.Usage = &types.Usage{}
-			p.UsageHandler = func(usage *types.Usage) bool { usage.PromptTokens = 30; return true }
+			p.UsageHandler = func(usage *types.Usage) bool { usage.PromptTokens = 30; return false }
 			var stream requester.StreamReaderInterface[string]
 			var apiErr *types.OpenAIErrorWithStatusCode
 			if completion {
@@ -179,7 +179,7 @@ func TestNativeUsageHidingCannotHideProviderError(t *testing.T) {
 	wire := "event: error\ndata: {\"error\":{\"message\":\"rejected\"},\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n"
 	h := &OpenAIStreamHandler{Usage: &types.Usage{}, hideProviderUsage: true}
 	got, err := collectNativeSSE(t, newExactChatTestStream(t, h, wire))
-	if got != wire || !errors.Is(err, io.EOF) || h.Usage.HasProviderUsage() {
-		t.Fatalf("error hidden or billed: wire=%q err=%v usage=%+v", got, err, h.Usage)
+	if got != wire || !errors.Is(err, io.EOF) || !h.Usage.HasProviderBaseUsage() || h.Usage.TotalTokens != 2 {
+		t.Fatalf("error delivery or independent usage observation changed: wire=%q err=%v usage=%+v", got, err, h.Usage)
 	}
 }

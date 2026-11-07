@@ -525,7 +525,11 @@ func (p *OpenAIProvider) getRequestTextBody(relayMode int, ModelName string, req
 
 	var httpReq *http.Request
 	nativeBodyUsed := false
-	if p.usesNativeOpenAIWire() && nativeOpenAIJSONRelayMode(relayMode) {
+	nativeWire := p.usesNativeOpenAIWire()
+	if relayMode == config.RelayModeChatCompletions {
+		nativeWire = p.usesNativeChatWire()
+	}
+	if nativeWire && nativeOpenAIJSONRelayMode(relayMode) {
 		body, exists, err := p.planNativeJSONBody(ModelName)
 		if err != nil {
 			return nil, common.ErrorWrapperLocal(err, "build_native_request_failed", http.StatusInternalServerError)
@@ -582,4 +586,9 @@ func (p *OpenAIProvider) usesNativeOpenAIWire() bool {
 	default:
 		return false
 	}
+}
+
+// Chat 同方言透传不代表支持图片或持久化资源协议。
+func (p *OpenAIProvider) usesNativeChatWire() bool {
+	return p.usesNativeOpenAIWire() || (p != nil && p.Channel != nil && p.Channel.Type == config.ChannelTypeXAI)
 }
