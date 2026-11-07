@@ -322,6 +322,17 @@
     "onlyTags": "Display tags only"
   },
   "channel_row": {
+    "antigravityOpenUsage": "View quota",
+    "antigravityUsageDetail": "Antigravity quota details",
+    "antigravityQuotaNote": "Remaining percentages are reported by the upstream and are not remaining token counts. Models may share quota, so their quotas cannot be added together. Missing data is shown as unknown.",
+    "antigravityQuotaLoading": "Loading quota…",
+    "antigravityFetchedAt": "Fetched at: {{time}}",
+    "antigravityQuotaEmpty": "The upstream returned no models to display.",
+    "antigravityQuotaModel": "Model",
+    "antigravityQuotaRemaining": "Remaining quota",
+    "antigravityQuotaReset": "Resets at",
+    "antigravityQuotaUnavailable": "Unable to fetch Antigravity quota. Please try again later.",
+    "antigravityQuotaRefresh": "Refresh",
     "auto": "automatic",
     "canModels": "Available models:",
     "channelWeb": "Official website",

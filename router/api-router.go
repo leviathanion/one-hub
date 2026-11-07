@@ -170,6 +170,7 @@ func SetApiRouter(router *gin.Engine) {
 			channelRoute.POST("/provider_models_list", controller.GetModelList)
 			channelRoute.GET("/:id", controller.GetChannel)
 			channelRoute.GET("/:id/codex/usage", controller.GetCodexChannelUsage)
+			channelRoute.GET("/:id/antigravity/usage", controller.GetAntigravityChannelUsage)
 			channelRoute.POST("/:id/codex/reset-credit", controller.ConsumeCodexResetCredit)
 			channelRoute.GET("/test", controller.TestAllChannels)
 			channelRoute.GET("/test/:id", controller.TestChannel)

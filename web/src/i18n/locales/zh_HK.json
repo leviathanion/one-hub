@@ -306,6 +306,17 @@
     "onlyTags": "僅顯示標籤"
   },
   "channel_row": {
+    "antigravityOpenUsage": "查看額度",
+    "antigravityUsageDetail": "反重力額度詳情",
+    "antigravityQuotaNote": "顯示上游提供的剩餘比例，不代表剩餘 Token 數；不同模型可能共用額度，不能相加；缺失資料顯示為未知。",
+    "antigravityQuotaLoading": "正在查詢額度…",
+    "antigravityFetchedAt": "取得時間：{{time}}",
+    "antigravityQuotaEmpty": "上游未返回可展示的模型。",
+    "antigravityQuotaModel": "模型",
+    "antigravityQuotaRemaining": "剩餘額度",
+    "antigravityQuotaReset": "重設時間",
+    "antigravityQuotaUnavailable": "取得反重力額度失敗，請稍後重試。",
+    "antigravityQuotaRefresh": "重新整理",
     "auto": "自動",
     "canModels": "可用模型：",
     "channelWeb": "官方網站",
