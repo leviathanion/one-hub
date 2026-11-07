@@ -302,6 +302,17 @@
     "onlyTags": "タグのみ表示"
   },
   "channel_row": {
+    "antigravityOpenUsage": "クォータを表示",
+    "antigravityUsageDetail": "Antigravity クォータの詳細",
+    "antigravityQuotaNote": "上流が返す残量の割合であり、残りトークン数ではありません。モデル間でクォータを共有する場合があるため、合算できません。欠損データは不明と表示されます。",
+    "antigravityQuotaLoading": "クォータを取得中…",
+    "antigravityFetchedAt": "取得日時：{{time}}",
+    "antigravityQuotaEmpty": "上流から表示可能なモデルが返されませんでした。",
+    "antigravityQuotaModel": "モデル",
+    "antigravityQuotaRemaining": "残りクォータ",
+    "antigravityQuotaReset": "リセット日時",
+    "antigravityQuotaUnavailable": "Antigravity のクォータを取得できませんでした。後でもう一度お試しください。",
+    "antigravityQuotaRefresh": "更新",
     "auto": "自動",
     "canModels": "利用可能なモデル:",
     "channelWeb": "公式ウェブサイト",

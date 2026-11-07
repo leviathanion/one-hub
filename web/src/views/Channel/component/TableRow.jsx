@@ -56,6 +56,7 @@ import { copy, renderQuota } from 'utils/common';
 import { ChannelCheck } from './ChannelCheck';
 import { PAGE_SIZE_OPTIONS, getPageSize, savePageSize } from 'constants';
 import CodexUsageDialog from './CodexUsageDialog';
+import AntigravityUsageDialog from './AntigravityUsageDialog';
 import { formatCodexWindowSummary, getCodexUsageWindow, isCodexChannel, resolveCodexUsageRatio } from './codexUsage';
 import TagChannelCreateDialog from './TagChannelCreateDialog';
 
@@ -107,6 +108,10 @@ function statusInfo(t, status) {
     default:
       return t('common.unknown');
   }
+}
+
+function isAntigravityChannel(channel) {
+  return Number(channel?.type) === 102;
 }
 
 function codexUsageColor(ratio) {
@@ -184,6 +189,7 @@ function ChannelTableRow({ item, manageChannel, onRefresh, groupOptions, modelOp
   const [responseTimeData, setResponseTimeData] = useState({ test_time: item.test_time, response_time: item.response_time });
   const [itemBalance, setItemBalance] = useState(item.balance);
   const [codexUsageTarget, setCodexUsageTarget] = useState(null);
+  const [antigravityUsageTarget, setAntigravityUsageTarget] = useState(null);
 
   const [openRow, setOpenRow] = useState(false);
   const modelMap = useMemo(() => {
@@ -563,7 +569,7 @@ function ChannelTableRow({ item, manageChannel, onRefresh, groupOptions, modelOp
           
         </TableCell> */}
         <TableCell>
-          {!item.tag && !isCodexChannel(item) && (
+          {!item.tag && !isCodexChannel(item) && !isAntigravityChannel(item) && (
             <Stack spacing={0.5} alignItems="center">
               <Typography variant="body1">{renderQuota(item.used_quota)}</Typography>
               <Typography
@@ -579,6 +585,11 @@ function ChannelTableRow({ item, manageChannel, onRefresh, groupOptions, modelOp
                 {renderBalance(item.type, itemBalance)}
               </Typography>
             </Stack>
+          )}
+          {!item.tag && isAntigravityChannel(item) && (
+            <Button size="small" onClick={() => setAntigravityUsageTarget(item)}>
+              {t('channel_row.antigravityOpenUsage')}
+            </Button>
           )}
           {!item.tag && isCodexChannel(item) && (
             <CodexUsageInline
@@ -1138,6 +1149,10 @@ function ChannelTableRow({ item, manageChannel, onRefresh, groupOptions, modelOp
                                           detailTitle={t('channel_row.codexOpenDetails')}
                                           onOpenDetails={() => handleOpenCodexUsage(channel)}
                                         />
+                                      ) : isAntigravityChannel(channel) ? (
+                                        <Button size="small" onClick={() => setAntigravityUsageTarget(channel)}>
+                                          {t('channel_row.antigravityOpenUsage')}
+                                        </Button>
                                       ) : (
                                         <Tooltip title={t('channel_row.clickUpdateQuota')} placement="top">
                                           <Box sx={{ cursor: 'pointer' }} onClick={() => manageChannel(channel.id, 'update_balance')}>
@@ -1618,6 +1633,14 @@ function ChannelTableRow({ item, manageChannel, onRefresh, groupOptions, modelOp
         onClose={tagChannelCreate.onFalse}
         onCreated={handleTagChannelCreated}
       />
+
+      {antigravityUsageTarget ? (
+        <AntigravityUsageDialog
+          key={antigravityUsageTarget.id}
+          record={antigravityUsageTarget}
+          onClose={() => setAntigravityUsageTarget(null)}
+        />
+      ) : null}
 
       <CodexUsageDialog
         open={codexUsageDialog.value}

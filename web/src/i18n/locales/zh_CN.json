@@ -1634,6 +1634,17 @@
     "noSearchResults": "没有找到匹配的结果"
   },
   "channel_row": {
+    "antigravityOpenUsage": "查看额度",
+    "antigravityUsageDetail": "反重力额度详情",
+    "antigravityQuotaNote": "显示上游提供的剩余比例，不代表剩余 Token 数；不同模型可能共享额度，不能相加；缺失数据显示为未知。",
+    "antigravityQuotaLoading": "正在查询额度…",
+    "antigravityFetchedAt": "获取时间：{{time}}",
+    "antigravityQuotaEmpty": "上游未返回可展示的模型。",
+    "antigravityQuotaModel": "模型",
+    "antigravityQuotaRemaining": "剩余额度",
+    "antigravityQuotaReset": "重置时间",
+    "antigravityQuotaUnavailable": "获取反重力额度失败，请稍后重试。",
+    "antigravityQuotaRefresh": "刷新",
     "priorityTip": "优先级不能小于 0",
     "weightTip": "权重不能小于 1",
     "modelTestTip": "请先设置测试模型",
