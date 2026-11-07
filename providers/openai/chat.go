@@ -59,7 +59,7 @@ func (p *OpenAIProvider) CreateChatCompletion(request *types.ChatCompletionReque
 	}
 
 	response := &OpenAIProviderChatResponse{}
-	captureSameDialect := p.ProviderRawJSONReplay || p.usesNativeOpenAIWire()
+	captureSameDialect := p.ProviderRawJSONReplay || p.usesNativeChatWire()
 	if captureSameDialect {
 		response.EnableProviderRawJSONCapture()
 	}
@@ -219,7 +219,7 @@ func (p *OpenAIProvider) createChatCompletionStream(request *types.ChatCompletio
 	options := requester.StreamReadOptions{
 		RequireProtocolTerminal: p.RequireOpenAIStreamTerminal,
 	}
-	if p.ProviderRawJSONReplay || (p.usesNativeOpenAIWire() && !p.StreamEscapeJSON) {
+	if p.ProviderRawJSONReplay || (p.usesNativeChatWire() && !p.StreamEscapeJSON) {
 		chatHandler.formatProviderUsage = !p.ProviderRawJSONReplay
 		chatHandler.hideProviderUsage = !p.ProviderRawJSONReplay && !chatHandler.ExposeProviderUsage
 		chatHandler.sseFramer = requester.NewSSEEventFramer(openAIExactSSEMaxEventBytes)

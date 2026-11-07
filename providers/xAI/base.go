@@ -6,7 +6,6 @@ import (
 	"one-api/providers/base"
 	"one-api/providers/openai"
 	"one-api/types"
-	"strings"
 )
 
 // 定义供应商工厂
@@ -28,8 +27,8 @@ func (f XAIProviderFactory) Create(channel *model.Channel) base.ProviderInterfac
 				Channel:   channel,
 				Requester: requester.NewHTTPRequester(*channel.Proxy, RequestErrorHandle),
 			},
-			UsageHandler:        usageHandler,
-			RequestHandleBefore: requestHandler,
+			UsageHandler:         usageHandler,
+			SupportStreamOptions: true,
 		},
 	}
 }
@@ -45,25 +44,4 @@ func getConfig() base.ProviderConfig {
 
 type XAIProvider struct {
 	openai.OpenAIProvider
-}
-
-func usageHandler(usage *types.Usage) (ForcedFormatting bool) {
-	usage.CompletionTokens = usage.TotalTokens - usage.PromptTokens
-
-	return true
-}
-
-func requestHandler(request *types.ChatCompletionRequest) (errWithCode *types.OpenAIErrorWithStatusCode) {
-	if strings.HasPrefix(request.Model, "grok-4") || strings.HasPrefix(request.Model, "grok-3-mini") || strings.HasPrefix(request.Model, "grok-3-mini-fast") {
-		request.Stop = nil
-		request.FrequencyPenalty = nil
-		request.PresencePenalty = nil
-	}
-
-	if strings.HasPrefix(request.Model, "grok-4") {
-		request.ReasoningEffort = nil
-		request.Reasoning = nil
-	}
-
-	return nil
 }
