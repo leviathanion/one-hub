@@ -1,9 +1,6 @@
 package xAI
 
 import (
-	"fmt"
-	"io"
-	"net/http"
 	"one-api/common/requester"
 	"one-api/model"
 	"one-api/providers/base"
@@ -24,7 +21,6 @@ func (XAIProviderFactory) AssessChatRemoteMedia(_ *model.Channel, _ *types.ChatC
 
 // 创建 XAIProvider
 func (f XAIProviderFactory) Create(channel *model.Channel) base.ProviderInterface {
-	fmt.Println("Creating XAIProvider for channel:")
 	return &XAIProvider{
 		OpenAIProvider: openai.OpenAIProvider{
 			BaseProvider: base.BaseProvider{
@@ -49,25 +45,6 @@ func getConfig() base.ProviderConfig {
 
 type XAIProvider struct {
 	openai.OpenAIProvider
-}
-
-func RequestErrorHandle(resp *http.Response) *types.OpenAIError {
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil
-	}
-
-	msg := string(bodyBytes)
-	if msg == "" {
-		return nil
-	}
-
-	return openai.ErrorHandle(&types.OpenAIErrorResponse{
-		Error: types.OpenAIError{
-			Message: msg,
-			Code:    "xAI_error",
-		},
-	})
 }
 
 func usageHandler(usage *types.Usage) (ForcedFormatting bool) {
