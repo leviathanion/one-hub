@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"one-api/common/utils"
 )
 
 // HTTPProfile selects one code-owned I/O policy. Business acknowledgement
@@ -23,10 +25,17 @@ func LongStreamTimeouts() (idle, lifetime time.Duration) {
 }
 
 const (
-	longStreamResponseHeaderTimeout = 30 * time.Second
-	longStreamBodyIdleTimeout       = 2 * time.Minute
-	longStreamMaxLifetime           = time.Hour
+	longStreamBodyIdleTimeout = 2 * time.Minute
+	longStreamMaxLifetime     = time.Hour
 )
+
+func longStreamResponseHeaderTimeout() time.Duration {
+	seconds := utils.GetOrDefault[int64]("stream_response_header_timeout", 30)
+	if seconds <= 0 || seconds > int64((1<<63-1)/time.Second) {
+		seconds = 30
+	}
+	return time.Duration(seconds) * time.Second
+}
 
 type redirectMode uint8
 
@@ -58,7 +67,7 @@ func policyForHTTPProfile(profile HTTPProfile) httpPolicy {
 		return httpPolicy{
 			redirect:              redirectReject,
 			overrideTimeout:       true,
-			responseHeaderTimeout: longStreamResponseHeaderTimeout,
+			responseHeaderTimeout: longStreamResponseHeaderTimeout(),
 			bodyIdleTimeout:       longStreamBodyIdleTimeout,
 			maxLifetime:           longStreamMaxLifetime,
 		}

@@ -9,7 +9,33 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/spf13/viper"
 )
+
+func TestLongStreamResponseHeaderTimeoutFromEnvironment(t *testing.T) {
+	viper.AutomaticEnv()
+	for _, tc := range []struct {
+		name  string
+		value string
+		want  time.Duration
+	}{
+		{"default", "", 30 * time.Second},
+		{"configured", "120", 120 * time.Second},
+		{"zero", "0", 30 * time.Second},
+		{"negative", "-1", 30 * time.Second},
+		{"invalid", "invalid", 30 * time.Second},
+		{"overflow", "9223372036854775807", 30 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("STREAM_RESPONSE_HEADER_TIMEOUT", tc.value)
+			policy := policyForHTTPProfile(HTTPProfileLongStream)
+			if policy.responseHeaderTimeout != tc.want {
+				t.Fatalf("response header timeout = %s, want %s", policy.responseHeaderTimeout, tc.want)
+			}
+		})
+	}
+}
 
 func TestHTTPProfilesKeepWorkActionsNoRedirectAndBoundAuxiliaryCalls(t *testing.T) {
 	original := HTTPClient
