@@ -45,6 +45,12 @@ func sanitizeErrorEnvelope(raw []byte, knownError bool, credentials []string) ([
 	var edits []errorJSONEdit
 	var eventType string
 	wrapped := false
+	stringErrorDiagnostic := false
+	for _, field := range fields {
+		if field.name == "code" && !bytes.Equal(raw[field.start:field.end], []byte("null")) {
+			stringErrorDiagnostic = true
+		}
+	}
 	for _, field := range fields {
 		value := raw[field.start:field.end]
 		switch field.name {
@@ -52,10 +58,18 @@ func sanitizeErrorEnvelope(raw []byte, knownError bool, credentials []string) ([
 			_ = json.Unmarshal(value, &eventType)
 		case "error":
 			wrapped = true
-			// 字符串形式的 error 可能是 OAuth 错误码，保留其协议值。
+			// OAuth 的 error 字符串是协议码；带独立 code 的形态则以 error 承载诊断。
 			if value[0] == '{' || value[0] == '[' {
 				if safe, changed := sanitizeErrorObject(value, credentials); changed {
 					edits = append(edits, errorJSONEdit{field.start, field.end, safe})
+				}
+			} else if value[0] == '"' && stringErrorDiagnostic {
+				var message string
+				if json.Unmarshal(value, &message) == nil {
+					if safe := SanitizeErrorText(message, credentials...); safe != message {
+						encoded, _ := json.Marshal(safe)
+						edits = append(edits, errorJSONEdit{field.start, field.end, encoded})
+					}
 				}
 			}
 		case "response":

@@ -98,3 +98,18 @@ func FuzzSanitizeErrorPayload(f *testing.F) {
 		}
 	})
 }
+
+func TestNativeStringErrorRedactsDiagnosticsAndKeepsCode(t *testing.T) {
+	raw := []byte(`{ "code":"not-found", "error":"Your team 01234567-89ab-cdef-0123-456789abcdef cannot access provider-secret", "future":9007199254740993 }`)
+	want := `{ "code":"not-found", "error":"Your team [redacted] cannot access [redacted]", "future":9007199254740993 }`
+	for _, sanitize := range []func([]byte, ...string) ([]byte, bool){SanitizeErrorPayload, SanitizeErrorResponse} {
+		got, changed := sanitize(raw, "provider-secret")
+		if !changed || string(got) != want {
+			t.Fatalf("原生字符串错误脱敏错误：%s", got)
+		}
+	}
+	oauth := `{"error":"provider-secret","error_description":"business error"}`
+	if got, changed := SanitizeErrorPayload([]byte(oauth), "provider-secret"); changed || string(got) != oauth {
+		t.Fatalf("OAuth协议码被改写：%s", got)
+	}
+}
