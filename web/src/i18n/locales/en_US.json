@@ -247,7 +247,7 @@
     "customParameters": {
       "title": "Configuration guide and examples",
       "intro": "Choose an example, adapt its fields and values, then paste it above. Copying does not change the form.",
-      "removeRule": "remove_params lists fields to delete. Use dotted paths for nested objects, such as metadata.internal. Missing fields are skipped; array indexes and wildcards are not supported.",
+      "removeRule": "remove_params lists object fields to delete. Dotted paths support array indexes and array-only *, such as messages.*.content.*.cache_control. Missing paths are skipped; array elements are never deleted.",
       "overwriteRule": "overwrite: true sets temperature to 0.7. Every other configured field is also replaced entirely, including objects and arrays.",
       "nestedRule": "Nested object exception: with overwrite false, objects are merged recursively and configured values still replace matching nested values. To add or override nested fields, use JSON objects; dotted paths are only for remove_params.",
       "orderRule": "Within each application, deletion happens before adding or overriding fields. A deleted field will be present again if the configuration also adds it.",

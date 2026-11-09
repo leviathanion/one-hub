@@ -231,7 +231,7 @@
     "customParameters": {
       "title": "設定說明與範例",
       "intro": "選擇一個範例，按需要調整欄位和值後填入上方；複製不會修改表單。",
-      "removeRule": "remove_params 指定要刪除的欄位；巢狀物件使用點號路徑，例如 metadata.internal。不存在時略過，不支援陣列索引或萬用字元。",
+      "removeRule": "remove_params 指定要刪除的物件欄位；點號路徑支援陣列索引及僅遍歷陣列的 *，例如 messages.*.content.*.cache_control。不存在時略過，不刪除陣列元素。",
       "overwriteRule": "overwrite: true 將 temperature 固定為 0.7。設定中的其他欄位也會整個替換，包括物件和陣列。",
       "nestedRule": "巢狀物件例外：overwrite 為 false 時，物件會遞迴合併，巢狀的同名值仍會被設定值覆蓋。新增或覆蓋巢狀欄位請寫 JSON 物件，點號路徑僅用於 remove_params。",
       "orderRule": "同一次處理先刪除，再新增或覆蓋。若設定中又新增了已刪除的欄位，最終仍會帶上該欄位。",
