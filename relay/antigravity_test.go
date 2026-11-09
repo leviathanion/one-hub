@@ -174,6 +174,71 @@ func TestAntigravityFourIngressesUseFactoryAndSettleProviderUsage(t *testing.T) 
 
 type antigravityBlockedTransport struct{ calls atomic.Int32 }
 
+func TestAntigravityClaudeCacheRemovalRequiresPreAdd(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, stage := range []string{"unconfigured", "post", "pre"} {
+			t.Run(fmt.Sprintf("%s/stream=%t", stage, stream), func(t *testing.T) {
+				var calls atomic.Int32
+				captured := make(chan []byte, 1)
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls.Add(1)
+					body, err := io.ReadAll(r.Body)
+					if err != nil {
+						t.Error(err)
+					}
+					select {
+					case captured <- body:
+					default:
+					}
+					if strings.Contains(r.URL.Path, "streamGenerateContent") {
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = io.WriteString(w, "data: "+antigravityRelayResponse+"\n\n")
+					} else {
+						w.Header().Set("Content-Type", "application/json")
+						_, _ = io.WriteString(w, antigravityRelayResponse)
+					}
+				}))
+				t.Cleanup(server.Close)
+				previous := requester.HTTPClient
+				requester.HTTPClient = server.Client()
+				blocked := &antigravityBlockedTransport{}
+				if stage != "pre" {
+					requester.HTTPClient = &http.Client{Transport: blocked}
+				}
+				t.Cleanup(func() { requester.HTTPClient = previous })
+				channel := antigravityRelayChannel(t, 905, server.URL, stage != "pre")
+				if stage != "unconfigured" {
+					custom := fmt.Sprintf(`{"pre_add":%t,"remove_params":["system.*.cache_control","messages.*.content.*.cache_control","tools.*.cache_control"]}`, stage == "pre")
+					channel.CustomParameter = &custom
+				}
+				antigravityIngressBilling(t, channel)
+				body := fmt.Sprintf(`{"model":%q,"max_tokens":32,"stream":%t,"system":[{"type":"text","text":"instructions","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"question","cache_control":{"type":"ephemeral","ttl":"1h"}}]},{"role":"assistant","content":"answer"},{"role":"user","content":"followup"}],"tools":[{"name":"lookup","cache_control":{"type":"ephemeral"},"input_schema":{"type":"object","properties":{"cache_control":{"type":"string"}},"future":{"integer":900719925474099312345}}}]}`, toolUsageEvidenceHTTPModel, stream)
+				ctx, recorder := antigravityIngressContext(t, "/claude/v1/messages", body, []*model.Channel{channel})
+				Relay(ctx)
+				if stage != "pre" {
+					if recorder.Code != 400 || calls.Load() != 0 || blocked.calls.Load() != 0 || ctx.GetInt("channel_id") != 0 || !strings.Contains(recorder.Body.String(), "unsupported_capability") {
+						t.Fatalf("缓存声明越过能力检查: status=%d calls=%d blocked=%d body=%s", recorder.Code, calls.Load(), blocked.calls.Load(), recorder.Body.String())
+					}
+					return
+				}
+				if recorder.Code != 200 || calls.Load() != 1 || !strings.Contains(recorder.Body.String(), "hello") {
+					t.Fatalf("前置删除未完成单次发送: status=%d calls=%d body=%s", recorder.Code, calls.Load(), recorder.Body.String())
+				}
+				upstream := string(<-captured)
+				for _, kept := range []string{"instructions", "question", "answer", "followup", "lookup", `"cache_control":{"type":"string"}`, `900719925474099312345`} {
+					if !strings.Contains(upstream, kept) {
+						t.Fatalf("误删请求内容 %s: %s", kept, upstream)
+					}
+				}
+				if strings.Contains(upstream, "ephemeral") {
+					t.Fatalf("缓存声明泄漏到上游: %s", upstream)
+				}
+				assertAntigravityUsageSettled(t)
+			})
+		}
+	}
+}
+
 func (r *antigravityBlockedTransport) RoundTrip(*http.Request) (*http.Response, error) {
 	r.calls.Add(1)
 	return nil, errors.New("unexpected provider or OAuth HTTP")

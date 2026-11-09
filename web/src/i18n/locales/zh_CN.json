@@ -359,7 +359,7 @@
     "customParameters": {
       "title": "配置说明与示例",
       "intro": "选择一个示例，按需调整字段和值后填入上方；复制不会修改表单。",
-      "removeRule": "remove_params 指定要删除的字段；嵌套对象用点号路径，如 metadata.internal。不存在时跳过，不支持数组下标或通配符。",
+      "removeRule": "remove_params 指定要删除的对象字段；点号路径支持数组下标和仅遍历数组的 *，如 messages.*.content.*.cache_control。不存在时跳过，不删除数组元素。",
       "overwriteRule": "overwrite: true 将 temperature 固定为 0.7。对配置中的其他字段也会整字段替换，包括对象和数组。",
       "nestedRule": "嵌套对象例外：overwrite 为 false 时，对象会递归合并，嵌套的同名值仍会被配置值覆盖。添加或覆盖嵌套字段请写 JSON 对象，点号路径仅用于 remove_params。",
       "orderRule": "同一次处理先删除，再添加或覆盖。若配置里又添加了已删除的字段，最终仍会带上该字段。",

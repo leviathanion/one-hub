@@ -14,6 +14,7 @@ import (
 	"one-api/common/requester"
 	"one-api/model"
 	"one-api/types"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -609,30 +610,34 @@ func isRelayOwnedCustomParameterPath(path string) bool {
 	}
 }
 
-// removeNestedParam removes a parameter from the map, supporting nested paths like "generationConfig.thinkingConfig"
+// removeNestedParam 删除对象字段；数组路径支持下标和 *，但不删除数组元素。
 func removeNestedParam(requestMap map[string]interface{}, paramPath string) {
-	// 使用 "." 分割路径
-	parts := strings.Split(paramPath, ".")
+	removeParamPath(requestMap, strings.Split(paramPath, "."))
+}
 
-	// 如果只有一层,直接删除
-	if len(parts) == 1 {
-		delete(requestMap, paramPath)
-		return
-	}
-
-	// 处理嵌套路径
-	current := requestMap
-	for i := 0; i < len(parts)-1; i++ {
-		if next, ok := current[parts[i]].(map[string]interface{}); ok {
-			current = next
-		} else {
-			// 如果中间路径不存在或不是 map,则无法继续
+func removeParamPath(node interface{}, parts []string) {
+	switch current := node.(type) {
+	case map[string]interface{}:
+		if len(parts) == 1 {
+			delete(current, parts[0])
 			return
 		}
+		removeParamPath(current[parts[0]], parts[1:])
+	case []interface{}:
+		if len(parts) == 1 {
+			return
+		}
+		if parts[0] == "*" {
+			for _, item := range current {
+				removeParamPath(item, parts[1:])
+			}
+			return
+		}
+		index, err := strconv.Atoi(parts[0])
+		if err == nil && index >= 0 && index < len(current) {
+			removeParamPath(current[index], parts[1:])
+		}
 	}
-
-	// 删除最后一级的键
-	delete(current, parts[len(parts)-1])
 }
 
 // DeepMergeMap 深度合并两个map
