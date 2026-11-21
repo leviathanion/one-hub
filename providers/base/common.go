@@ -401,7 +401,7 @@ func PlanRequestBodyWithMerge(originalBody interface{}, allowExtraBody bool, raw
 			if err != nil {
 				return nil, &requestBodyPlanError{code: "unmarshal_request_failed", err: err}
 			}
-		} else if err := json.Unmarshal(requestBytes, &requestMap); err != nil {
+		} else if err := decodeRequestBodyMap(requestBytes, &requestMap); err != nil {
 			return nil, &requestBodyPlanError{code: "unmarshal_request_failed", err: err}
 		}
 	}
@@ -420,7 +420,7 @@ func mergeRawRequestBody(requestBytes []byte, rawBody map[string]interface{}) (m
 	if len(requestBytes) == 0 {
 		return merged, nil
 	}
-	if err := json.Unmarshal(requestBytes, &merged); err != nil {
+	if err := decodeRequestBodyMap(requestBytes, &merged); err != nil {
 		return nil, err
 	}
 	return merged, nil
@@ -435,12 +435,23 @@ func cloneRequestBodyMap(rawBody map[string]interface{}) (map[string]interface{}
 		return nil, err
 	}
 	clone := make(map[string]interface{}, len(rawBody))
-	decoder := json.NewDecoder(bytes.NewReader(encoded))
-	decoder.UseNumber()
-	if err := decoder.Decode(&clone); err != nil {
+	if err := decodeRequestBodyMap(encoded, &clone); err != nil {
 		return nil, err
 	}
 	return clone, nil
+}
+
+// 请求体 map 用于再次序列化，数值须保留原始精度。
+func decodeRequestBodyMap(encoded []byte, target *map[string]interface{}) error {
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.UseNumber()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if len(bytes.Trim(encoded[decoder.InputOffset():], " \t\r\n")) != 0 {
+		return fmt.Errorf("request body must contain a single JSON value")
+	}
+	return nil
 }
 
 // BuildRequestWithMerge 通用的请求体构建方法，支持 CustomParameter 和 AllowExtraBody
