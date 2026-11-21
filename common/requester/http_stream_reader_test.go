@@ -231,6 +231,37 @@ func TestRequestStreamRequiredTerminalAcceptsHandlerEOF(t *testing.T) {
 	}
 }
 
+func TestStreamStopDistinguishesHandlerFromTransportEOF(t *testing.T) {
+	for _, test := range []struct {
+		name, body string
+		byHandler  bool
+	}{
+		{"handler marker", "[DONE]\n", true},
+		{"transport EOF", "content\n", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resp := &http.Response{Body: io.NopCloser(strings.NewReader(test.body))}
+			stream, apiErr := RequestStreamWithOptions(nil, resp, func(line *[]byte, _ chan string, failures chan error) {
+				if string(*line) == "[DONE]" {
+					failures <- io.EOF
+					*line = StreamClosed
+				}
+			}, StreamReadOptions{})
+			if apiErr != nil {
+				t.Fatal(apiErr)
+			}
+			_, failures := stream.Recv()
+			if err := <-failures; !errors.Is(err, io.EOF) {
+				t.Fatalf("意外的终止错误：%v", err)
+			}
+			CloseAndDrainStream[string](stream)
+			if StreamStoppedByHandler[string](stream) != test.byHandler {
+				t.Fatalf("handler 结束事实应为 %t", test.byHandler)
+			}
+		})
+	}
+}
+
 func TestRequestNoTrimStreamWithOptionsRejectsOversizedLine(t *testing.T) {
 	stream, errWithCode := RequestNoTrimStreamWithOptions[string](nil, &http.Response{
 		Body: io.NopCloser(bytes.NewBufferString("data: 123456789\n")),
