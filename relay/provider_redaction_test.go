@@ -44,6 +44,8 @@ func TestProviderRedactionHTTPDelivery(t *testing.T) {
 		{"error replay", false, 400, `{"error":{"message":"Missing required header: OpenAI-Beta","code":"invalid_header","param":"session","id_token":"acct-secret","client_assertion":"acct-secret","x_api_key":"acct-secret"},"future":9007199254740993}`, 400, `"param":"session"`},
 		{"error sibling extension", false, 400, `{"error":{"message":"bad input","code":"invalid_request"},"debug":{"access_token":"acct-secret"}}`, 400, `"code":"invalid_request"`},
 		{"SSE error sibling extension", true, 200, "data: {\"error\":{\"message\":\"bad input\",\"code\":\"invalid_request\"},\"debug\":{\"access_token\":\"acct-secret\"}}\n\n", 200, `"code":"invalid_request"`},
+		{"SSE data with BOM", true, 200, "\uFEFFdata: " + `{"error":{"code":"invalid_request","access_token":"acct-secret"}}` + "\n\n", 200, "\uFEFFdata: " + `{"error":{"code":"invalid_request","access_token":"[redacted]"}}` + "\n\n"},
+		{"SSE named error with BOM", true, 200, "\uFEFFevent: error\ndata: " + `{"code":"invalid_request","access_token":"acct-secret"}` + "\n\n", 200, "\uFEFFevent: error\ndata: " + `{"code":"invalid_request","access_token":"[redacted]"}` + "\n\n"},
 		{"typed error", false, 400, `{"error":{"message":"bad input","code":{"detail":"provider-secret-12345"},"param":"session","innererror":{"id_token":"acct-secret","number":9007199254740993}}}`, 400, `"param":"session"`},
 		{"duplicate JSON", false, 200, `{"id":"chat_1","account_id":"acct-secret","account_id":"[redacted]","choices":[]}`, 200, `"account_id":"acct-secret"`},
 		{"duplicate SSE", true, 200, "data: {\"account_id\":\"acct-secret\",\"account_id\":\"[redacted]\"}\n\n", 200, `"account_id":"acct-secret"`},

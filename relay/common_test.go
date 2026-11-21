@@ -18,6 +18,7 @@ import (
 	commonresponses "one-api/common/responses"
 	"one-api/model"
 	"one-api/providers/openai"
+	"one-api/relay/relay_util"
 	"one-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -279,6 +280,39 @@ func TestExactChatSSEInBandErrorDoesNotAppendSuccessTerminal(t *testing.T) {
 			}
 			if got := recorder.Body.String(); got != wire {
 				t.Fatalf("上游错误或终止标记改变：got=%q want=%q", got, wire)
+			}
+		})
+	}
+}
+
+func TestExactChatSSEPreservesFirstEventAfterHeartbeat(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const wire = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\r\n\r\ndata: [DONE]\r\n\r\n"
+	for _, test := range []struct{ name, prefix, want string }{
+		{"stream starts with provider", "", requester.SSEUTF8BOM + wire},
+		{"stream starts with heartbeat", relay_util.HeartbeatStreamText, relay_util.HeartbeatStreamText + wire},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler := openai.OpenAIStreamHandler{Usage: &types.Usage{}}
+			stream, apiErr := requester.RequestRawSSEEventStreamWithEmitterOptions(nil, &http.Response{
+				Body: io.NopCloser(strings.NewReader(requester.SSEUTF8BOM + wire)),
+			}, handler.HandleExactChatSSE, requester.StreamReadOptions{})
+			if apiErr != nil {
+				t.Fatal(apiErr)
+			}
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			if test.prefix != "" {
+				if _, err := ctx.Writer.WriteString(test.prefix); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, apiErr := responseStreamClient(ctx, stream, nil); apiErr != nil {
+				t.Fatal(apiErr)
+			}
+			if got := recorder.Body.String(); got != test.want {
+				t.Fatalf("原生 SSE 首帧交付错误：got=%q want=%q", got, test.want)
 			}
 		})
 	}

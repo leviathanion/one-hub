@@ -779,9 +779,17 @@ func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface
 	handleData := func(data string) error {
 		payload := data
 		hasPayload := true
+		bom := ""
 		var apiErr *types.OpenAIErrorWithStatusCode
 		var rawPayload []byte
 		if rawSSEEvents {
+			if !isFirstResponse && strings.HasPrefix(data, requester.SSEUTF8BOM) {
+				data = data[len(requester.SSEUTF8BOM):]
+				// SSE 只在整个流开头识别 BOM。代理已发送心跳时，去掉上游的流首标记。
+				if c.Writer.Size() <= 0 {
+					bom = requester.SSEUTF8BOM
+				}
+			}
 			payload, hasPayload = commonresponses.SSEDataPayload(data)
 			if hasPayload && strings.TrimSpace(payload) == "[DONE]" {
 				hasPayload = false
@@ -809,7 +817,7 @@ func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface
 		}
 		streamData := ""
 		if rawSSEEvents {
-			streamData = redactProviderSSEPayload(data, rawPayload, hasPayload, credentials...)
+			streamData = bom + redactProviderSSEPayload(data, rawPayload, hasPayload, credentials...)
 		} else {
 			if apiErr != nil {
 				safe, _ := providerresponse.SanitizeErrorPayload(rawPayload, credentials...)
