@@ -169,6 +169,10 @@ Cancel 只释放 Reservation，不改写下游响应，不恢复 submission 权�
 
 响应成功与否和是否收费相互独立：带合法 usage 的 provider error 可以 Confirm；没有 usage 的成功响应必须 Cancel。本地从 prompt 或输出文本估算的 token 仅用于日志诊断，不能进入 Confirm。
 
+请求内 Attempt 在首次关闭时，对缺失或冲突的计费组件输出一次系统诊断，包含请求关联、渠道、模型、流式标记和实际结算结果。没有可计价组件时仅退款和输出诊断，不新增消费记录或请求次数；有独立可计价组件时仍按现有规则 Confirm，并记录其余缺失组件。正常的完整零用量和按次证据不误报为缺失。余额提交或退款结果不确定时标为未确定，不声称已收费或已退款。
+
+诊断不受 `LogConsumeEnabled` 开关影响，字段数量与长度有界，不打印原始请求、凭据或本地估算。本次不新增前端状态、消费日志 schema、缺失用量统计或数据库迁移。
+
 ### Responses WebSocket 与 Realtime
 
 每个能够独立触发 provider work 的 turn 建立独立 Attempt，连接本身不共享一个总预扣。actor 只接受能够关联当前 turn 的 provider usage。

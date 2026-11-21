@@ -47,15 +47,29 @@ type ProviderServerToolUse struct {
 	WebSearchRequests int `json:"web_search_requests"`
 }
 
+const extraBillingConflictPrefix = "unit_service_conflict:"
+
 // MarkExtraBillingConflict 只使依赖该服务身份的组件失效。
 func (u *Usage) MarkExtraBillingConflict(service string) {
 	if u != nil {
-		u.AddBillingDiagnostic("unit_service_conflict:" + service)
+		u.AddBillingDiagnostic(extraBillingConflictPrefix + service)
 	}
 }
 
 func (u *Usage) HasExtraBillingConflict(service string) bool {
-	return u != nil && u.BillingDiagnostics["unit_service_conflict:"+service]
+	return u != nil && u.BillingDiagnostics[extraBillingConflictPrefix+service]
+}
+
+// 服务身份冲突可能在生成任何 ExtraBilling 条目之前被发现。
+func (u *Usage) HasAnyExtraBillingConflict() bool {
+	if u != nil {
+		for diagnostic, present := range u.BillingDiagnostics {
+			if present && strings.HasPrefix(diagnostic, extraBillingConflictPrefix) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // UnmarshalJSON records wire presence but does not authorize billing. Only a
