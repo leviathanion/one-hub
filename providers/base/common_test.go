@@ -21,6 +21,13 @@ import (
 	"go.uber.org/zap"
 )
 
+func TestMergeExtraBodyRejectsTrailingJSON(t *testing.T) {
+	provider := &BaseProvider{}
+	if _, err := provider.MergeExtraBodyFromRawRequest([]byte(`{"first":1} {"second":2}`)); err == nil {
+		t.Fatal("额外字段合并接受了尾随 JSON")
+	}
+}
+
 func TestGetRawBodyCachesRequestBodyOnDemand(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
