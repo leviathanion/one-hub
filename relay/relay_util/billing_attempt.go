@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"one-api/common"
+	"one-api/common/logger"
 	"one-api/internal/billing"
 	"one-api/model"
 	"one-api/types"
@@ -243,10 +245,44 @@ func (q *AttemptQuota) CloseFromProviderResult(ctx context.Context, usage *types
 		return q.result, q.finalErr
 	}
 	decision := q.quota.EvaluateProviderUsage(usage)
-	for _, diagnostic := range componentDiagnostics(decision.Components) {
+	diagnostics := componentDiagnostics(decision.Components)
+	for _, diagnostic := range diagnostics {
 		q.quota.addBillingDiagnostic(diagnostic)
 	}
-	return q.closeLocked(ctx, usage, decision.Confirm, decision.FinalQuota, isStream)
+	result, err := q.closeLocked(ctx, usage, decision.Confirm, decision.FinalQuota, isStream)
+	if !decision.Confirm || len(diagnostics) > 0 || err != nil || usage.HasAnyExtraBillingConflict() {
+		q.logUsageDiagnostic(ctx, decision, result, err, isStream)
+	}
+	return result, err
+}
+
+// 诊断只在首次关闭的锁内输出，不写消费记录或改变结算规则。
+func (q *AttemptQuota) logUsageDiagnostic(ctx context.Context, decision UsageSettlementDecision, result AttemptResult, settlementErr error, isStream bool) {
+	diagnostics := make([]string, 0, len(q.quota.billingDiagnostics))
+	for diagnostic := range q.quota.billingDiagnostics {
+		diagnostics = append(diagnostics, diagnostic)
+	}
+	sort.Strings(diagnostics)
+	if len(diagnostics) == 0 && !decision.Confirm {
+		diagnostics = append(diagnostics, "provider_usage_missing")
+	}
+	// provider 扩展可能进入诊断 key；限制数量和长度，并转义控制字符。
+	omitted := 0
+	if len(diagnostics) > 8 {
+		omitted = len(diagnostics) - 8
+		diagnostics = diagnostics[:8]
+	}
+	for index, diagnostic := range diagnostics {
+		diagnostics[index] = fmt.Sprintf("%.96q", diagnostic)
+	}
+	state := "cancelled"
+	charge := fmt.Sprint(result.ChargedQuota)
+	if settlementErr != nil || result.Unsettled {
+		state, charge = "unsettled", "unknown"
+	} else if result.Confirmed {
+		state = "confirmed"
+	}
+	logger.LogWarn(ctx, fmt.Sprintf("billing_usage_diagnostic 计费用量诊断 channel_id=%d model=%.128q stream=%t settlement=%s final_quota=%s diagnostics=[%s] omitted=%d", q.quota.channelId, q.quota.modelName, isStream, state, charge, strings.Join(diagnostics, ","), omitted))
 }
 
 func (q *AttemptQuota) close(ctx context.Context, usage *types.Usage, confirm bool, chargedQuota int64, isStream bool) (AttemptResult, error) {
