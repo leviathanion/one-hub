@@ -84,12 +84,13 @@ func TestOpenRouterStreamProjectsCumulativeSearchUsageWithoutChangingWire(t *tes
 
 func TestOpenRouterSearchUsageZeroMissingOrInvalidDoesNotCreateBillingUnit(t *testing.T) {
 	for _, test := range []struct {
-		name      string
-		toolUsage string
+		name, toolUsage, details string
 	}{
 		{name: "zero", toolUsage: `{"web_search_requests":0}`},
 		{name: "missing", toolUsage: ""},
 		{name: "negative", toolUsage: `{"web_search_requests":-1}`},
+		{name: "only general tool counts", details: `{"tool_calls_executed":8,"tool_calls_requested":8}`},
+		{name: "unknown details shape", details: `{"web_search_requests":{"future":2}}`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			provider := &OpenRouterProvider{}
@@ -97,6 +98,9 @@ func TestOpenRouterSearchUsageZeroMissingOrInvalidDoesNotCreateBillingUnit(t *te
 			usage := `{"prompt_tokens":30,"completion_tokens":0,"total_tokens":30`
 			if test.toolUsage != "" {
 				usage += `,"server_tool_use":` + test.toolUsage
+			}
+			if test.details != "" {
+				usage += `,"server_tool_use_details":` + test.details
 			}
 			usage += `}`
 			line := []byte(`data: {"id":"or-usage","model":"actual-model","service_tier":"priority","choices":[],"usage":` + usage + `}`)
@@ -121,7 +125,7 @@ func TestOpenRouterSearchUsageZeroMissingOrInvalidDoesNotCreateBillingUnit(t *te
 func TestGenericOpenAIStreamHandlerDoesNotTrustOpenRouterSearchMetadata(t *testing.T) {
 	usage := &types.Usage{}
 	handler := openai.OpenAIStreamHandler{Usage: usage, ExposeProviderUsage: true}
-	line := []byte(`data: {"id":"generic","model":"other-provider","choices":[],"usage":{"prompt_tokens":30,"completion_tokens":0,"total_tokens":30,"server_tool_use":{"web_search_requests":2}}}`)
+	line := []byte(`data: {"id":"generic","model":"other-provider","choices":[],"usage":{"prompt_tokens":30,"completion_tokens":0,"total_tokens":30,"server_tool_use_details":{"web_search_requests":3},"server_tool_use":{"web_search_requests":2}}}`)
 	dataChan := make(chan string, 1)
 	errChan := make(chan error, 1)
 	handler.HandlerChatStream(&line, dataChan, errChan)

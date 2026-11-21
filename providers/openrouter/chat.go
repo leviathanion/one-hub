@@ -103,15 +103,25 @@ func (p *OpenRouterProvider) CreateChatCompletionStream(request *types.ChatCompl
 	})
 }
 
-// observeOpenRouterUsage is called only at the OpenRouter provider boundary.
-// The generic OpenAI handler keeps server_tool_use as opaque usage metadata;
-// this provider-specific hook authorizes the documented search counter.
+// OpenRouter 报告累计搜索次数。公开字段中的有效计数（包括零）优先于旧字段。
 func (p *OpenRouterProvider) observeOpenRouterUsage(usage *types.Usage) bool {
-	if usage == nil || usage.ProviderServerToolUse == nil {
+	if usage == nil {
 		return false
 	}
-	if usage.ProviderServerToolUse.WebSearchRequests > 0 {
-		usage.SetProviderExtraBilling(types.APIToolTypeWebSearch, "", usage.ProviderServerToolUse.WebSearchRequests)
+	searches := 0
+	if legacy := usage.ProviderServerToolUse; legacy != nil {
+		searches = legacy.WebSearchRequests
+	}
+	if raw := usage.ProviderServerToolUseDetails; len(raw) > 0 {
+		var details struct {
+			WebSearchRequests *int `json:"web_search_requests,case:strict"`
+		}
+		if json.Unmarshal(raw, &details) == nil && details.WebSearchRequests != nil && *details.WebSearchRequests >= 0 {
+			searches = *details.WebSearchRequests
+		}
+	}
+	if searches > 0 {
+		usage.SetProviderExtraBilling(types.APIToolTypeWebSearch, "", searches)
 	}
 	return false
 }

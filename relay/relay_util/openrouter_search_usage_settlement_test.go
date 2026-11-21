@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"one-api/common/config"
@@ -33,6 +34,10 @@ func TestOpenRouterSearchUsageReachesAttemptAndSQL(t *testing.T) {
 	}{
 		{name: "stream_2次搜索", stream: true, wire: streamWire, searches: 2, charge: 10030, confirmed: true},
 		{name: "unary_2次搜索", wire: unaryBody, searches: 2, charge: 10030, confirmed: true},
+		{name: "非流式公开搜索次数", wire: strings.Replace(unaryBody, `"server_tool_use":`, `"server_tool_use_details":`, 1), searches: 2, charge: 10030, confirmed: true},
+		{name: "流式终帧以公开次数计费", stream: true, wire: openRouterUsageStream(`{"prompt_tokens":30,"completion_tokens":0,"total_tokens":30,"server_tool_use_details":{"web_search_requests":2,"tool_calls_executed":8},"server_tool_use":{"web_search_requests":5}}`), searches: 2, charge: 10030, confirmed: true},
+		{name: "公开零次覆盖旧计数", stream: true, wire: openRouterUsageStream(`{"prompt_tokens":30,"completion_tokens":0,"total_tokens":30,"server_tool_use_details":{"web_search_requests":0},"server_tool_use":{"web_search_requests":5}}`), charge: 30, confirmed: true},
+		{name: "公开对象缺少搜索次数时使用旧计数", stream: true, wire: openRouterUsageStream(`{"prompt_tokens":30,"completion_tokens":0,"total_tokens":30,"server_tool_use_details":{"tool_calls_executed":8},"server_tool_use":{"web_search_requests":2}}`), searches: 2, charge: 10030, confirmed: true},
 		{name: "stream_零搜索", stream: true, wire: openRouterUsageStream(`{"prompt_tokens":30,"completion_tokens":0,"total_tokens":30,"server_tool_use":{"web_search_requests":0}}`), charge: 30, confirmed: true},
 		{name: "stream_缺少计数", stream: true, wire: openRouterUsageStream(`{"prompt_tokens":30,"completion_tokens":0,"total_tokens":30}`), charge: 30, confirmed: true},
 		{name: "stream_负计数", stream: true, wire: openRouterUsageStream(`{"prompt_tokens":30,"completion_tokens":0,"total_tokens":30,"server_tool_use":{"web_search_requests":-1}}`), charge: 30, confirmed: true},
