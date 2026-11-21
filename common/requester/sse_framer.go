@@ -8,6 +8,9 @@ import (
 
 var ErrSSEEventTooLarge = errors.New("SSE event exceeds configured limit")
 
+// SSEUTF8BOM 是 SSE 解码只在流开头识别的 UTF-8 字节顺序标记。
+const SSEUTF8BOM = "\uFEFF"
+
 // SplitSSELine 返回包含原始分隔符的一行；没有分隔符时返回全部尾部。
 func SplitSSELine(raw string) (line, rest string) {
 	end := strings.IndexAny(raw, "\r\n")

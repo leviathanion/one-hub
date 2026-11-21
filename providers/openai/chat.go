@@ -31,6 +31,9 @@ type OpenAIStreamHandler struct {
 	ExposeProviderUsage bool
 
 	sseFramer             *requester.SSEEventFramer
+	sseStarted            bool
+	sseLeadingBOM         bool
+	sseSent               bool
 	hideProviderUsage     bool
 	beforeChatDelivery    func([]byte) error
 	formatProviderUsage   bool
@@ -304,13 +307,18 @@ func (h *OpenAIStreamHandler) HandleChatConversionSSE(rawLine *[]byte, emitter r
 }
 
 func (h *OpenAIStreamHandler) handleExactSSE(rawLine *[]byte, emitter requester.StreamEmitter[string], observe func([]byte) error, forConversion bool) {
-	if h == nil || rawLine == nil {
+	if h == nil || rawLine == nil || len(*rawLine) == 0 {
 		return
 	}
 	if h.sseFramer == nil {
 		h.sseFramer = requester.NewSSEEventFramer(openAIExactSSEMaxEventBytes)
 	}
-	event, complete, err := h.sseFramer.PushLine(*rawLine)
+	line := *rawLine
+	if !h.sseStarted {
+		h.sseStarted = true
+		line, h.sseLeadingBOM = bytes.CutPrefix(line, []byte(requester.SSEUTF8BOM))
+	}
+	event, complete, err := h.sseFramer.PushLine(line)
 	*rawLine = nil
 	if err != nil {
 		*rawLine = requester.StreamClosed
@@ -350,6 +358,13 @@ func (h *OpenAIStreamHandler) handleExactSSE(rawLine *[]byte, emitter requester.
 	// chunk; unknown events and future choices unions remain untouched.
 	if hasData && h.hideProviderUsage && isUsageOnlySSEEvent(safeEvent, []byte(payload)) {
 		return
+	}
+	if !forConversion && !h.sseSent {
+		h.sseSent = true
+		// 保留流首 BOM。过滤把带 U+FEFF 的字段移到流首时，加一个前导标记以保留该字段。
+		if h.sseLeadingBOM || strings.HasPrefix(safeEvent, requester.SSEUTF8BOM) {
+			safeEvent = requester.SSEUTF8BOM + safeEvent
+		}
 	}
 	if !emitter.SendData(safeEvent) {
 		return

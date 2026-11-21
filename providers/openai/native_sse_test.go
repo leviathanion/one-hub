@@ -127,9 +127,50 @@ func TestNativeSSEHidesOnlyUnrequestedUsageChunk(t *testing.T) {
 	}
 }
 
+func TestNativeSSEOnlyDecodesBOMAtStreamStart(t *testing.T) {
+	const bom = "\uFEFF"
+	const usage = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}\r\n\r\n"
+	const content = "data: {\"choices\":[{\"text\":\"hello\"}],\"usage\":null}\r\n\r\n"
+	const heartbeat = ": heartbeat\r\n\r\n"
+	const done = "data: [DONE]\r\n\r\n"
+	tests := []struct {
+		name, input, want string
+		wantTokens        int
+	}{
+		{"vendor event", bom + "event: vendor.notice\r\n" + usage, bom + "event: vendor.notice\r\n" + usage, 5},
+		{"named error", bom + "event: error\r\n" + usage, bom + "event: error\r\n" + usage, 5},
+		{"hidden first frame", bom + usage + done, bom + done, 5},
+		{"blank first line", bom + "\r\n" + usage + done, bom + "\r\n" + done, 5},
+		{"literal after heartbeat", heartbeat + bom + usage + done, heartbeat + bom + usage + done, 0},
+		{"literal moved to start by filtering", usage + bom + content + done, bom + bom + content + done, 5},
+		{"second BOM is literal", bom + bom + content + done, bom + bom + content + done, 0},
+	}
+	for _, completion := range []bool{false, true} {
+		for _, tc := range tests {
+			t.Run(fmt.Sprintf("completion=%t/%s", completion, tc.name), func(t *testing.T) {
+				h := &OpenAIStreamHandler{Usage: &types.Usage{}, hideProviderUsage: true}
+				handle := h.HandleExactChatSSE
+				if completion {
+					handle = h.handleExactCompletionSSE
+				}
+				resp := &http.Response{Body: io.NopCloser(strings.NewReader(tc.input))}
+				stream, apiErr := requester.RequestRawSSEEventStreamWithEmitterOptions(nil, resp, handle, requester.StreamReadOptions{})
+				if apiErr != nil {
+					t.Fatal(apiErr)
+				}
+				got, err := collectNativeSSE(t, stream)
+				if got != tc.want || !errors.Is(err, io.EOF) || h.Usage.TotalTokens != tc.wantTokens {
+					t.Fatalf("流式交付或用量错误: want=%q got=%q wantTokens=%d usage=%+v err=%v", tc.want, got, tc.wantTokens, h.Usage, err)
+				}
+			})
+		}
+	}
+}
+
 func TestChatConversionOwnsTerminalBoundaryWithoutChangingNativeDelivery(t *testing.T) {
 	for _, marker := range []string{
 		"data: [DONE]\n\n",
+		"\uFEFFdata: [DONE]\n\n",
 		"event: error\ndata: {\"error\":{\"type\":\"invalid_request_error\",\"code\":\"invalid_value\"}}\n\n",
 	} {
 		late := "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":9,\"total_tokens\":18}}\n\n"
@@ -164,7 +205,7 @@ func TestChatConversionOwnsTerminalBoundaryWithoutChangingNativeDelivery(t *test
 					t.Fatalf("provider calls=%d", calls)
 				}
 				if conversion {
-					if wire != marker || p.Usage.TotalTokens != 0 || streamErr == nil {
+					if wire != strings.TrimPrefix(marker, "\uFEFF") || p.Usage.TotalTokens != 0 || streamErr == nil {
 						t.Fatalf("conversion crossed terminal: wire=%q usage=%+v err=%v", wire, p.Usage, streamErr)
 					}
 				} else if wire != marker+late || p.Usage.TotalTokens != 18 || !errors.Is(streamErr, io.EOF) {
