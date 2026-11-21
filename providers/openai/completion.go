@@ -9,12 +9,15 @@ import (
 	"one-api/common/config"
 	"one-api/common/providerresponse"
 	"one-api/common/requester"
-	runtimesession "one-api/runtime/session"
 	"one-api/types"
 )
 
 func (p *OpenAIProvider) CreateCompletion(request *types.CompletionRequest) (openaiResponse *types.CompletionResponse, errWithCode *types.OpenAIErrorWithStatusCode) {
-	req, errWithCode := p.GetRequestTextBody(config.RelayModeCompletions, request.Model, request)
+	body, err := p.unaryCompletionBody(request)
+	if err != nil {
+		return nil, common.ErrorWrapperLocal(err, "build_completion_request_failed", http.StatusInternalServerError)
+	}
+	req, errWithCode := p.GetRequestTextBody(config.RelayModeCompletions, request.Model, body)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -70,25 +73,38 @@ func (p *OpenAIProvider) CreateCompletion(request *types.CompletionRequest) (ope
 	return &response.CompletionResponse, nil
 }
 
-func (p *OpenAIProvider) CreateCompletionStream(request *types.CompletionRequest) (stream requester.StreamReaderInterface[string], errWithCode *types.OpenAIErrorWithStatusCode) {
-	streamOptions := request.StreamOptions
-	// 如果支持流式返回Usage 则需要更改配置：
-	if p.ProviderRawJSONReplay {
-		// Exact-wire requests retain the client's stream_options verbatim.
-	} else if shouldForceProviderStreamUsage(p, request.Stream) {
-		if streamOptions == nil {
-			request.StreamOptions = &types.StreamOptions{IncludeUsage: true}
-		} else {
-			streamOptionsCopy := *streamOptions
-			streamOptionsCopy.IncludeUsage = true
-			request.StreamOptions = &streamOptionsCopy
-		}
-	} else {
-		// 避免误传导致报错
-		request.StreamOptions = nil
+// 非流式 Completion 无需解释 stream_options。typed 路径仍按 DTO 选择
+// 顶层字段，但这个已知字段使用原始 JSON，供上游判断其取值和组合。
+func (p *OpenAIProvider) unaryCompletionBody(request *types.CompletionRequest) (any, error) {
+	if p.usesNativeOpenAIWire() {
+		return request, nil
 	}
-	req, errWithCode := p.getRequestTextBody(config.RelayModeCompletions, request.Model, request, shouldForceProviderStreamUsage(p, request.Stream))
-	request.StreamOptions = streamOptions
+	raw, present, err := p.nativeRawBody()
+	if err != nil || !present {
+		return request, err
+	}
+	var envelope struct {
+		StreamOptions json.RawMessage `json:"stream_options,case:strict"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return nil, err
+	}
+	if len(envelope.StreamOptions) == 0 {
+		return request, nil
+	}
+	return struct {
+		*types.CompletionRequest
+		StreamOptions json.RawMessage `json:"stream_options"`
+	}{request, envelope.StreamOptions}, nil
+}
+
+func (p *OpenAIProvider) CreateCompletionStream(request *types.CompletionRequest) (stream requester.StreamReaderInterface[string], errWithCode *types.OpenAIErrorWithStatusCode) {
+	forceProviderUsage := shouldForceProviderStreamUsage(p, request.Stream)
+	req, providerUsageEnabled, errWithCode := p.getRequestTextBody(config.RelayModeCompletions, request.Model, func() any {
+		body := *request
+		body.StreamOptions = p.streamOptionsForTypedBody(body.StreamOptions, forceProviderUsage)
+		return &body
+	}, forceProviderUsage)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -107,17 +123,18 @@ func (p *OpenAIProvider) CreateCompletionStream(request *types.CompletionRequest
 	}
 	p.captureProviderResponseHeaders(resp)
 
+	clientUsage, clientUsageKnown := common.ClientStreamUsagePreference(p.Context, request.StreamOptions)
 	chatHandler := OpenAIStreamHandler{
 		Usage:               p.Usage,
 		ModelName:           request.Model,
-		ExposeProviderUsage: streamOptions != nil && streamOptions.IncludeUsage,
+		ExposeProviderUsage: clientUsage || !clientUsageKnown,
 	}
 	options := requester.StreamReadOptions{
 		RequireProtocolTerminal: p.RequireOpenAIStreamTerminal,
 	}
 	if p.ProviderRawJSONReplay || (p.usesNativeOpenAIWire() && !p.StreamEscapeJSON) {
 		options.RequireProtocolTerminal = false
-		chatHandler.hideProviderUsage = !p.ProviderRawJSONReplay && !chatHandler.ExposeProviderUsage
+		chatHandler.usageFilter = p.rawStreamUsageFilter(providerUsageEnabled, chatHandler.ExposeProviderUsage)
 		chatHandler.sseFramer = requester.NewSSEEventFramer(openAIExactSSEMaxEventBytes)
 		return requester.RequestRawSSEEventStreamWithEmitterOptions(streamRequester, resp, chatHandler.handleExactCompletionSSE, options)
 	}
@@ -150,12 +167,16 @@ func (h *OpenAIStreamHandler) handlerCompletionStream(rawLine *[]byte, dataChan 
 	}
 
 	aiError := ErrorHandle(&openaiResponse.OpenAIErrorResponse)
+	emptyChoices := false
+	if aiError == nil || openaiResponse.Usage != nil {
+		emptyChoices = h.observeCompletionStreamResponse(&openaiResponse)
+	}
 	if aiError != nil {
 		errChan <- aiError
 		return
 	}
 
-	if h.observeCompletionStreamResponse(&openaiResponse) && (openaiResponse.Usage == nil || !h.ExposeProviderUsage) {
+	if emptyChoices && (openaiResponse.Usage == nil || !h.ExposeProviderUsage) {
 		*rawLine = nil
 		return
 	}
@@ -176,7 +197,7 @@ func (h *OpenAIStreamHandler) observeCompletionStreamResponse(response *OpenAIPr
 		return true
 	}
 	if response.Usage != nil {
-		h.mergeCompletionStreamUsage(response.Usage, response.Model)
+		h.mergeCumulativeStreamUsage(response.Usage, response.Model, "")
 	} else {
 		h.Usage.MergeProviderAttribution(response.Model, "")
 		if h.Usage.TotalTokens == 0 {
@@ -186,35 +207,12 @@ func (h *OpenAIStreamHandler) observeCompletionStreamResponse(response *OpenAIPr
 	return emptyChoices
 }
 
-func (h *OpenAIStreamHandler) observeExactCompletionStreamPayload(payload []byte) error {
-	if h == nil {
-		return nil
-	}
-	if providerErr := runtimesession.OpenAIErrorEnvelopeFromPayload(payload); providerErr != nil {
-		return providerErr
-	}
-	var fields map[string]json.RawMessage
-	if json.Unmarshal(payload, &fields) != nil {
-		return nil
-	}
-	model := rawJSONString(fields["model"])
-	if usage := decodeOpenAIStreamUsage(fields["usage"]); usage != nil {
-		h.mergeCompletionStreamUsage(usage, model)
-	} else if h.Usage != nil {
+func (h *OpenAIStreamHandler) observeExactCompletionStreamPayload(frame *streamUsageFrame) bool {
+	model := rawJSONString(frame.fields["model"])
+	if frame.usage != nil {
+		h.mergeCumulativeStreamUsage(frame.usage, model, "")
+	} else if frame.providerError == nil && h.Usage != nil {
 		h.Usage.MergeProviderAttribution(model, "")
 	}
-	return nil
-}
-
-func (h *OpenAIStreamHandler) mergeCompletionStreamUsage(usage *types.Usage, model string) {
-	if h == nil || h.Usage == nil || usage == nil {
-		return
-	}
-	previousModel := h.Usage.ResponseModel
-	previousConflict := h.Usage.AttributionConflict
-	usage.MarkProviderReported()
-	*h.Usage = *usage
-	h.Usage.MergeProviderAttribution(previousModel, "")
-	h.Usage.AttributionConflict = h.Usage.AttributionConflict || previousConflict
-	h.Usage.MergeProviderAttribution(model, "")
+	return false
 }

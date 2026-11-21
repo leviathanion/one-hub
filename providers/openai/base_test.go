@@ -1,6 +1,10 @@
 package openai
 
 import (
+	"bytes"
+	"compress/gzip"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -134,6 +138,85 @@ func TestSameDialectRequestHeadersUseBusinessAllowlist(t *testing.T) {
 	for _, name := range []string{"X-Future-Business", "X-Forwarded-Access-Token", "Accept-Encoding"} {
 		if got := headers.Get(name); got != "" {
 			t.Fatalf("non-exact adapter leaked %s=%q", name, got)
+		}
+	}
+}
+
+func TestNativeChatAndCompletionForwardDigestsOnlyForUnchangedBodies(t *testing.T) {
+	const withoutUsage = `{"model":"model","stream":true}`
+	const withUsage = `{"model":"model","stream":true,"stream_options":{"include_usage":true}}`
+	for _, endpoint := range []struct {
+		path string
+		mode int
+	}{
+		{"/v1/chat/completions", config.RelayModeChatCompletions},
+		{"/v1/completions", config.RelayModeCompletions},
+	} {
+		for _, test := range []struct {
+			name, original, prepared string
+			compressed               bool
+			wantClientDigest         bool
+		}{
+			{name: "unchanged", original: withUsage, wantClientDigest: true},
+			{name: "usage injected", original: withoutUsage},
+			{name: "channel preprocessing", original: withoutUsage, prepared: withUsage},
+			{name: "transport decoded", original: withUsage, compressed: true},
+		} {
+			t.Run(endpoint.path+"/"+test.name, func(t *testing.T) {
+				wire := []byte(test.original)
+				if test.compressed {
+					var buf bytes.Buffer
+					w := gzip.NewWriter(&buf)
+					if _, err := w.Write(wire); err != nil {
+						t.Fatal(err)
+					}
+					if err := w.Close(); err != nil {
+						t.Fatal(err)
+					}
+					wire = buf.Bytes()
+				}
+				ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+				ctx.Request = httptest.NewRequest(http.MethodPost, endpoint.path, bytes.NewReader(wire))
+				if test.compressed {
+					common.SetDecodedRequestState(ctx, wire, []byte(test.original), nil)
+				} else {
+					common.SetReusableRequestBody(ctx, wire)
+				}
+				if test.prepared != "" {
+					common.SetReusableRequestBody(ctx, []byte(test.prepared))
+				}
+				sum := sha256.Sum256(wire)
+				clientDigest := "sha-256=:" + base64.StdEncoding.EncodeToString(sum[:]) + ":"
+				for _, name := range []string{"Content-Digest", "Repr-Digest", "Digest", "Content-MD5"} {
+					ctx.Request.Header.Set(name, clientDigest)
+				}
+				ctx.Request.Header.Set("Want-Content-Digest", "sha-256=1")
+				ctx.Request.Header.Set("Idempotency-Key", "request-key")
+				proxy, modelHeaders := "", `{"content-md5":"channel-digest"}`
+				p := CreateOpenAIProvider(&model.Channel{Type: config.ChannelTypeOpenAI, Proxy: &proxy, ModelHeaders: &modelHeaders}, "https://api.openai.com")
+				p.SetContext(ctx)
+				req, _, apiErr := p.getRequestTextBody(endpoint.mode, "model", func() any { return nil }, true)
+				if apiErr != nil {
+					t.Fatal(apiErr)
+				}
+				defer req.Body.Close()
+				body, err := io.ReadAll(req.Body)
+				if err != nil || string(body) != withUsage {
+					t.Fatalf("最终请求体不符：%s，%v", body, err)
+				}
+				want := ""
+				if test.wantClientDigest {
+					want = clientDigest
+				}
+				for _, name := range []string{"Content-Digest", "Repr-Digest", "Digest"} {
+					if got := req.Header.Get(name); got != want {
+						t.Errorf("%s=%q，预期 %q", name, got, want)
+					}
+				}
+				if req.Header.Get("Content-MD5") != "channel-digest" || req.Header.Get("Want-Content-Digest") != "sha-256=1" || req.Header.Get("Idempotency-Key") != "request-key" {
+					t.Fatalf("渠道覆盖或其他业务头丢失：%v", req.Header)
+				}
+			})
 		}
 	}
 }

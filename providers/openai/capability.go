@@ -114,10 +114,55 @@ func AssessChatRequestForChannel(channel *model.Channel, canonicalModel string, 
 	return base.ChatRequestSupport{SupportsStoredChat: supportsStoredChatChannel(channel)}, nil
 }
 
-// ValidateChatRequestForChannel evaluates only proxy-owned billing and
-// OnlyChat facts from the OpenAI-dialect post-conversion map. It deliberately
-// leaves unrelated future unions opaque. pre_add is already present in request.
+func channelUsesNativeOpenAIWire(channel *model.Channel) bool {
+	if channel == nil {
+		return false
+	}
+	switch channel.Type {
+	case config.ChannelTypeOpenAI, config.ChannelTypeCustom, config.ChannelTypeAzure, config.ChannelTypeAzureV1:
+		return true
+	default:
+		return false
+	}
+}
+
+func channelUsesNativeChatWire(channel *model.Channel) bool {
+	return channelUsesNativeOpenAIWire(channel) || (channel != nil && channel.Type == config.ChannelTypeXAI)
+}
+
+// ValidateCompletionStreamOptions 评估流式 Completion 是否能传递 pre_add 后的选项。
+func ValidateCompletionStreamOptions(channel *model.Channel, modelName string, raw []byte) error {
+	if channel == nil {
+		return &base.RequestCapabilityError{Param: "operation", Message: "Completion channel is required"}
+	}
+	if channelUsesNativeOpenAIWire(channel) || channel.AllowExtraBody {
+		return nil
+	}
+	params, err := channel.GetCustomParameterMap()
+	if err == nil {
+		raw, err = base.ApplyRawCustomParams(raw, params, modelName, true)
+	}
+	if err != nil {
+		return &base.RequestCapabilityError{Param: "operation", Message: "channel has invalid request transform configuration"}
+	}
+	var envelope struct {
+		StreamOptions json.RawMessage `json:"stream_options,case:strict"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return err
+	}
+	return base.ValidateChatStreamOptionsProjection(envelope.StreamOptions)
+}
+
+// ValidateChatRequestForChannel checks proxy-owned billing, OnlyChat and typed
+// representability. Native wire paths leave unrelated future unions opaque.
+// pre_add is already present in request.
 func ValidateChatRequestForChannel(channel *model.Channel, modelName string, request *types.ChatCompletionRequest, fields map[string]json.RawMessage) error {
+	if !channelUsesNativeChatWire(channel) && (channel == nil || !channel.AllowExtraBody) {
+		if err := base.ValidateChatStreamOptionsProjection(fields["stream_options"], "include_obfuscation"); err != nil {
+			return err
+		}
+	}
 	if request == nil {
 		return nil
 	}

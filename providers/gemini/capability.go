@@ -23,7 +23,7 @@ func (GeminiProviderFactory) AssessChatRequest(channel *model.Channel, canonical
 
 func (GeminiProviderFactory) AssessChatWireRequest(channel *model.Channel, canonicalModel string, request *types.ChatCompletionRequest, fields map[string]json.RawMessage) error {
 	if !UsesOpenAIAPI(channel) {
-		return nil
+		return base.ValidateChatStreamOptionsProjection(fields["stream_options"])
 	}
 	return openai.ValidateChatRequestForChannel(channel, canonicalModel, request, fields)
 }

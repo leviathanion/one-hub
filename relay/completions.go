@@ -10,6 +10,8 @@ import (
 	"one-api/common/config"
 	"one-api/common/requester"
 	"one-api/common/utils"
+	"one-api/model"
+	"one-api/providers"
 	providersBase "one-api/providers/base"
 	"one-api/safty"
 	"one-api/types"
@@ -36,7 +38,18 @@ func (r *relayCompletions) setRequest() error {
 		return err
 	}
 	r.setOriginalModel(r.request.Model)
-	setRequestChannelCapability(r.c, requireEndpointEnabled(config.RelayModeCompletions))
+	raw, _ := common.GetOriginalRequestBody(r.c)
+	modelName, stream := r.request.Model, r.request.Stream
+	setRequestChannelCapability(r.c, func(channel *model.Channel) error {
+		if err := providers.AssessEndpoint(channel, config.RelayModeCompletions); err != nil || !stream {
+			return providerCapabilityGateError(err)
+		}
+		mappedModel, err := mappedModelForChannel(channel, modelName)
+		if err != nil {
+			return &capabilityGateError{message: "channel has invalid model mapping configuration", status: http.StatusServiceUnavailable}
+		}
+		return providerCapabilityGateError(providers.AssessCompletionStreamOptions(channel, mappedModel, raw))
+	})
 	return nil
 }
 
@@ -46,16 +59,18 @@ func (r *relayCompletions) materializeSelectedProviderRequest() error {
 
 func (r *relayCompletions) decodeCurrentRequestBody() error {
 	r.request = types.CompletionRequest{}
-	if err := common.UnmarshalBodyReusable(r.c, &r.request); err != nil {
+	wire := struct {
+		*types.CompletionRequest
+		StreamOptions json.RawMessage `json:"stream_options,case:strict"`
+	}{CompletionRequest: &r.request}
+	if err := common.UnmarshalBodyReusable(r.c, &wire); err != nil {
 		return err
 	}
 
+	r.request.StreamOptions = projectStreamOptions(wire.StreamOptions)
+
 	if r.request.MaxTokens < 0 || r.request.MaxTokens > math.MaxInt32/2 {
 		return errors.New("max_tokens is invalid")
-	}
-
-	if !r.request.Stream && r.request.StreamOptions != nil {
-		return errors.New("the 'stream_options' parameter is only allowed when 'stream' is enabled")
 	}
 
 	return nil
@@ -124,7 +139,7 @@ func (r *relayCompletions) send() (err *types.OpenAIErrorWithStatusCode, done bo
 }
 
 func (r *relayCompletions) getUsageResponse() string {
-	if r.request.StreamOptions != nil && r.request.StreamOptions.IncludeUsage && !r.streamUsageSeen && r.provider != nil && r.provider.GetUsage().HasProviderUsage() {
+	if common.ClientRequestsStreamUsage(r.c, r.request.StreamOptions) && !r.streamUsageSeen && r.provider != nil && r.provider.GetUsage().HasProviderUsage() {
 		usageResponse := types.CompletionResponse{
 			ID:      fmt.Sprintf("chatcmpl-%s", utils.GetUUID()),
 			Object:  "chat.completion.chunk",

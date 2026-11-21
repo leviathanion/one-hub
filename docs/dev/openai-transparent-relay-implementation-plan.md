@@ -94,6 +94,8 @@ lastUpdated: true
 
 对原生 OpenAI 方言使用原始请求体、JSON RawMessage 局部读取和原始响应交付。没有有效修改时保持 body 字节；模型映射等代理拥有的修改仅 patch 对应位置，不经 DTO 重建整个请求。
 
+官方 OpenAI 的 Chat/Completion 流式入口属于 same-dialect。代理在支持的渠道上主动设置 `stream_options.include_usage=true`，仅局部修改该字段并保留其他未知内容。不能安全修改的参数形态交上游校验。客户端提供的请求摘要仅在发往上游的正文与入站字节一致时转发。响应先观察计费证据。已确认启用采集且客户端使用默认或关闭展示时，隐藏代理额外请求的用量。未知用量选项、正文、未知事件、上游状态和错误协议均按对应协议交付。完整计费与日志边界见 [Usage TCC](./usage-confirmed-tcc-billing-architecture.md)。
+
 同一个请求只发送一次。按真实上游 Content-Type 选择 JSON、SSE、文本或二进制交付；不为了判断响应形式先试发，也不因返回内容无法被观察器解析而重发。
 
 未知参数、未知工具字段、未知事件、上游参数错误交给上游。只在定义明确的 envelope、资源引用位置、安全与资源限额上校验；不能递归看到任意业务 JSON 中的 `file_id` 字符串就把它解释为资源引用，例如 function 参数 schema 和用户文本不应被误判。

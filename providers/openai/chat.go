@@ -11,7 +11,6 @@ import (
 	"one-api/common/providerresponse"
 	"one-api/common/requester"
 	commonresponses "one-api/common/responses"
-	runtimesession "one-api/runtime/session"
 	"one-api/types"
 	"strings"
 )
@@ -30,14 +29,13 @@ type OpenAIStreamHandler struct {
 	// temporarily enables provider-side usage for settlement evidence.
 	ExposeProviderUsage bool
 
-	sseFramer             *requester.SSEEventFramer
-	sseStarted            bool
-	sseLeadingBOM         bool
-	sseSent               bool
-	hideProviderUsage     bool
-	beforeChatDelivery    func([]byte) error
-	formatProviderUsage   bool
-	formattedUsagePayload []byte
+	sseFramer           *requester.SSEEventFramer
+	sseStarted          bool
+	sseLeadingBOM       bool
+	sseSent             bool
+	usageFilter         streamUsageFilter
+	beforeChatDelivery  func([]byte) error
+	formatProviderUsage bool
 }
 
 func (p *OpenAIProvider) CreateChatCompletion(request *types.ChatCompletionRequest) (openaiResponse *types.ChatCompletionResponse, errWithCode *types.OpenAIErrorWithStatusCode) {
@@ -168,26 +166,12 @@ func (p *OpenAIProvider) createChatCompletionStream(request *types.ChatCompletio
 		}
 	}
 
-	streamOptions := request.StreamOptions
-	// 如果支持流式返回Usage 则需要更改配置：
-	if p.ProviderRawJSONReplay {
-		// Exact-wire requests retain the client's stream_options verbatim.
-	} else if shouldForceProviderStreamUsage(p, request.Stream) {
-		if streamOptions == nil {
-			request.StreamOptions = &types.StreamOptions{IncludeUsage: true}
-		} else {
-			streamOptionsCopy := *streamOptions
-			streamOptionsCopy.IncludeUsage = true
-			request.StreamOptions = &streamOptionsCopy
-		}
-	} else {
-		// 避免误传导致报错
-		request.StreamOptions = nil
-	}
-	req, errWithCode := p.getRequestTextBody(config.RelayModeChatCompletions, request.Model, request, shouldForceProviderStreamUsage(p, request.Stream))
-	// Restore the downstream contract before any return; the temporary mutation
-	// is only for non-exact adapters that need provider-side usage evidence.
-	request.StreamOptions = streamOptions
+	forceProviderUsage := shouldForceProviderStreamUsage(p, request.Stream)
+	req, providerUsageEnabled, errWithCode := p.getRequestTextBody(config.RelayModeChatCompletions, request.Model, func() any {
+		body := *request
+		body.StreamOptions = p.streamOptionsForTypedBody(body.StreamOptions, forceProviderUsage)
+		return &body
+	}, forceProviderUsage)
 	if errWithCode != nil {
 		return nil, errWithCode
 	}
@@ -209,6 +193,7 @@ func (p *OpenAIProvider) createChatCompletionStream(request *types.ChatCompletio
 		return nil, errWithCode
 	}
 	p.captureProviderResponseHeaders(resp)
+	clientUsage, clientUsageKnown := common.ClientStreamUsagePreference(p.Context, request.StreamOptions)
 	chatHandler := OpenAIStreamHandler{
 		Usage:      p.Usage,
 		ModelName:  request.Model,
@@ -216,7 +201,7 @@ func (p *OpenAIProvider) createChatCompletionStream(request *types.ChatCompletio
 		EscapeJSON: p.StreamEscapeJSON,
 
 		UsageHandler:        p.UsageHandler,
-		ExposeProviderUsage: streamOptions != nil && streamOptions.IncludeUsage,
+		ExposeProviderUsage: clientUsage || !clientUsageKnown,
 		beforeChatDelivery:  commitChatResources,
 	}
 	options := requester.StreamReadOptions{
@@ -224,7 +209,7 @@ func (p *OpenAIProvider) createChatCompletionStream(request *types.ChatCompletio
 	}
 	if p.ProviderRawJSONReplay || (p.usesNativeChatWire() && !p.StreamEscapeJSON) {
 		chatHandler.formatProviderUsage = !p.ProviderRawJSONReplay
-		chatHandler.hideProviderUsage = !p.ProviderRawJSONReplay && !chatHandler.ExposeProviderUsage
+		chatHandler.usageFilter = p.rawStreamUsageFilter(providerUsageEnabled, chatHandler.ExposeProviderUsage)
 		chatHandler.sseFramer = requester.NewSSEEventFramer(openAIExactSSEMaxEventBytes)
 		if forConversion {
 			return requester.RequestRawSSEEventStreamWithEmitterOptions(streamRequester, resp, chatHandler.HandleChatConversionSSE, options)
@@ -293,9 +278,8 @@ func (h *OpenAIStreamHandler) HandlerChatStream(rawLine *[]byte, dataChan chan s
 	dataChan <- string(*rawLine)
 }
 
-// HandleExactChatSSE preserves each complete provider SSE event. JSON decoding
-// is observation-only: future or malformed provider payloads do not replace a
-// raw event that is otherwise valid at the SSE boundary.
+// HandleExactChatSSE 保留上游事件边界，按客户端开关过滤可识别的 usage。
+// JSON 投影失败的事件仍可按原文交付。
 func (h *OpenAIStreamHandler) HandleExactChatSSE(rawLine *[]byte, emitter requester.StreamEmitter[string]) {
 	h.handleExactSSE(rawLine, emitter, h.observeExactChatStreamPayload, false)
 }
@@ -306,7 +290,7 @@ func (h *OpenAIStreamHandler) HandleChatConversionSSE(rawLine *[]byte, emitter r
 	h.handleExactSSE(rawLine, emitter, h.observeExactChatStreamPayload, true)
 }
 
-func (h *OpenAIStreamHandler) handleExactSSE(rawLine *[]byte, emitter requester.StreamEmitter[string], observe func([]byte) error, forConversion bool) {
+func (h *OpenAIStreamHandler) handleExactSSE(rawLine *[]byte, emitter requester.StreamEmitter[string], observe func(*streamUsageFrame) bool, forConversion bool) {
 	if h == nil || rawLine == nil || len(*rawLine) == 0 {
 		return
 	}
@@ -339,25 +323,32 @@ func (h *OpenAIStreamHandler) handleExactSSE(rawLine *[]byte, emitter requester.
 		}
 	}
 	var conversionTerminal error
-	h.formattedUsagePayload = nil
 	if hasData && strings.TrimSpace(payload) == "[DONE]" {
 		if forConversion {
 			conversionTerminal = io.EOF
 		}
-	} else if hasData && observe != nil {
-		observedError := observe([]byte(payload))
-		if forConversion {
-			conversionTerminal = observedError
+	} else if hasData {
+		filter := h.usageFilter
+		if filter != keepStreamUsage && !isChatMessageEvent(safeEvent) {
+			filter = keepStreamUsage
 		}
-	}
-	if len(h.formattedUsagePayload) > 0 {
-		safeEvent = replaceChatSSEData(safeEvent, h.formattedUsagePayload)
-	}
-	// Compatibility adapters may request usage that the client did not ask to
-	// receive. Preserve that existing contract only for an explicit usage-only
-	// chunk; unknown events and future choices unions remain untouched.
-	if hasData && h.hideProviderUsage && isUsageOnlySSEEvent(safeEvent, []byte(payload)) {
-		return
+		frame := readStreamUsageFrame([]byte(payload), filter)
+		formatted := observe(&frame)
+		if forConversion && frame.providerError != nil {
+			conversionTerminal = frame.providerError
+		}
+		if frame.hide {
+			var drop bool
+			safeEvent, drop = frame.hideUsage(safeEvent)
+			if drop {
+				return
+			}
+		} else if formatted && h.formatProviderUsage {
+			patched, err := patchChatPayloadUsage(frame.raw, frame.chatUsage())
+			if err == nil && !bytes.Equal(patched, frame.raw) {
+				safeEvent = rewriteChatSSEData(safeEvent, patched)
+			}
+		}
 	}
 	if !forConversion && !h.sseSent {
 		h.sseSent = true
@@ -375,37 +366,6 @@ func (h *OpenAIStreamHandler) handleExactSSE(rawLine *[]byte, emitter requester.
 	}
 }
 
-func isUsageOnlySSEEvent(event string, payload []byte) bool {
-	var eventName string
-	for len(event) > 0 {
-		line, rest := requester.SplitSSELine(event)
-		event = rest
-		field, value, _ := strings.Cut(requester.SSELineContent(line), ":")
-		if field == "event" {
-			eventName = strings.TrimPrefix(value, " ")
-		}
-	}
-	// 只过滤普通 OpenAI usage 尾包，未知命名事件仍按上游语义交付。
-	if (eventName != "" && eventName != "message") || providerresponse.SSEPayloadContainsError(eventName, payload) {
-		return false
-	}
-	var fields map[string]json.RawMessage
-	if json.Unmarshal(payload, &fields) != nil || decodeOpenAIStreamUsage(fields["usage"]) == nil {
-		return false
-	}
-	if rawType, present := fields["type"]; present && !bytes.Equal(bytes.TrimSpace(rawType), []byte("null")) {
-		return false
-	}
-	if rawObject, present := fields["object"]; present {
-		var object string
-		if json.Unmarshal(rawObject, &object) != nil || (object != "chat.completion.chunk" && object != "text_completion") {
-			return false
-		}
-	}
-	var choices []json.RawMessage
-	return len(fields["choices"]) > 0 && json.Unmarshal(fields["choices"], &choices) == nil && len(choices) == 0
-}
-
 func (h *OpenAIStreamHandler) observeChatStreamResponse(response *OpenAIProviderChatStreamResponse) bool {
 	if h == nil || response == nil || h.Usage == nil {
 		return false
@@ -416,7 +376,7 @@ func (h *OpenAIStreamHandler) observeChatStreamResponse(response *OpenAIProvider
 		usage = response.Choices[0].Usage
 	}
 	if usage != nil {
-		h.mergeChatStreamUsage(usage, response.Model, response.ServiceTier)
+		h.mergeCumulativeStreamUsage(usage, response.Model, response.ServiceTier)
 	} else if h.Usage.TotalTokens == 0 {
 		h.Usage.TotalTokens = h.Usage.PromptTokens
 	}
@@ -426,45 +386,19 @@ func (h *OpenAIStreamHandler) observeChatStreamResponse(response *OpenAIProvider
 	return usageOnly
 }
 
-func (h *OpenAIStreamHandler) observeExactChatStreamPayload(payload []byte) error {
-	if h == nil {
-		return nil
+func (h *OpenAIStreamHandler) observeExactChatStreamPayload(frame *streamUsageFrame) bool {
+	model := rawJSONString(frame.fields["model"])
+	tier := rawJSONString(frame.fields["service_tier"])
+	if usage := frame.chatUsage(); usage != nil {
+		return h.mergeCumulativeStreamUsage(usage, model, tier)
 	}
-	var providerErr error
-	if apiErr := runtimesession.OpenAIErrorEnvelopeFromPayload(payload); apiErr != nil {
-		providerErr = apiErr
+	if h.Usage != nil {
+		h.Usage.MergeProviderAttribution(model, tier)
 	}
-	var fields map[string]json.RawMessage
-	if json.Unmarshal(payload, &fields) != nil {
-		return providerErr
-	}
-
-	model := rawJSONString(fields["model"])
-	serviceTier := rawJSONString(fields["service_tier"])
-	usage := decodeOpenAIStreamUsage(fields["usage"])
-	if usage == nil {
-		var choices []json.RawMessage
-		if json.Unmarshal(fields["choices"], &choices) == nil && len(choices) > 0 {
-			var choice map[string]json.RawMessage
-			if json.Unmarshal(choices[0], &choice) == nil {
-				usage = decodeOpenAIStreamUsage(choice["usage"])
-			}
-		}
-	}
-	if usage != nil {
-		if h.mergeChatStreamUsage(usage, model, serviceTier) && h.formatProviderUsage {
-			patched, err := patchChatPayloadUsage(payload, usage)
-			if err == nil && !bytes.Equal(patched, payload) {
-				h.formattedUsagePayload = patched
-			}
-		}
-	} else if h.Usage != nil {
-		h.Usage.MergeProviderAttribution(model, serviceTier)
-	}
-	return providerErr
+	return false
 }
 
-func (h *OpenAIStreamHandler) mergeChatStreamUsage(usage *types.Usage, model, serviceTier string) bool {
+func (h *OpenAIStreamHandler) mergeCumulativeStreamUsage(usage *types.Usage, model, serviceTier string) bool {
 	if h == nil || h.Usage == nil || usage == nil {
 		return false
 	}

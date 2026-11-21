@@ -228,6 +228,75 @@ func TestExactCompletionProviderErrorDoesNotStopRawDeliveryOrUsageObservation(t 
 	}
 }
 
+func TestCompletionErrorFrameCarriesIndependentUsage(t *testing.T) {
+	const payload = `{"model":"provider-model","error":{"message":"stopped","code":"execution_failed"},"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`
+	wire := "data: " + payload + "\n\ndata: [DONE]\n\n"
+	for _, path := range []string{"native", "typed"} {
+		t.Run(path, func(t *testing.T) {
+			h := OpenAIStreamHandler{Usage: &types.Usage{PromptTokens: 99}, usageFilter: hideCollectedUsage}
+			if path == "native" {
+				stream, err := requester.RequestRawSSEEventStreamWithEmitterOptions(nil, &http.Response{
+					Body: io.NopCloser(strings.NewReader(wire)),
+				}, h.handleExactCompletionSSE, requester.StreamReadOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, terminal := collectNativeSSE(t, stream)
+				if got != wire || !errors.Is(terminal, io.EOF) {
+					t.Fatalf("原生 Completion 错误帧交付改变：%q，%v", got, terminal)
+				}
+			} else {
+				raw := []byte("data: " + payload)
+				data, errs := make(chan string, 1), make(chan error, 1)
+				h.handlerCompletionStream(&raw, data, errs)
+				if len(data) != 0 || len(errs) != 1 {
+					t.Fatalf("Completion 错误帧产生了 %d 条数据和 %d 个错误", len(data), len(errs))
+				}
+				var providerErr *types.OpenAIError
+				if !errors.As(<-errs, &providerErr) || providerErr.Code != "execution_failed" || providerErr.Message != "stopped" {
+					t.Fatalf("Completion 上游错误被改写：%+v", providerErr)
+				}
+			}
+			u := h.Usage
+			if !u.HasProviderBaseUsage() || u.PromptTokens != 3 || u.CompletionTokens != 4 || u.TotalTokens != 7 || u.ResponseModel != "provider-model" {
+				t.Fatalf("Completion 错误帧的计费证据丢失：%+v", u)
+			}
+		})
+	}
+}
+
+func TestCompletionStreamKeepsCompleteUsageAcrossSparseSnapshots(t *testing.T) {
+	const first = `{"model":"m","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`
+	for _, test := range []struct {
+		name, last                string
+		prompt, completion, total int
+		conflict                  bool
+	}{
+		{"sparse total", `{"model":"m","choices":[],"usage":{"total_tokens":9}}`, 3, 4, 7, false},
+		{"complete zero", `{"model":"m","choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`, 0, 0, 0, false},
+		{"error without usage", `{"model":"other","error":{"message":"stopped"}}`, 3, 4, 7, false},
+		{"conflicting attribution", `{"model":"other","choices":[],"usage":{}}`, 3, 4, 7, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			wire := "data: " + first + "\n\ndata: " + test.last + "\n\ndata: [DONE]\n\n"
+			h := OpenAIStreamHandler{Usage: &types.Usage{}}
+			stream, err := requester.RequestRawSSEEventStreamWithEmitterOptions(nil, &http.Response{
+				Body: io.NopCloser(strings.NewReader(wire)),
+			}, h.handleExactCompletionSSE, requester.StreamReadOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, terminal := collectNativeSSE(t, stream); got != wire || !errors.Is(terminal, io.EOF) {
+				t.Fatalf("累计用量观察改变了 Completion 帧交付：%q，%v", got, terminal)
+			}
+			u := h.Usage
+			if u.HasProviderBaseUsage() == test.conflict || u.AttributionConflict != test.conflict || u.PromptTokens != test.prompt || u.CompletionTokens != test.completion || u.TotalTokens != test.total {
+				t.Fatalf("最终累计用量错误：%+v", u)
+			}
+		})
+	}
+}
+
 func TestCreateCompletionStreamNativeEOFDoesNotRequireBusinessTerminal(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

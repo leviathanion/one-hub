@@ -1,10 +1,12 @@
 package openai
 
 import (
+	"bytes"
 	"fmt"
 	"net/http"
 	"strings"
 
+	"one-api/common"
 	"one-api/common/providerresponse"
 	"one-api/common/requestctx"
 )
@@ -93,6 +95,20 @@ func applyResponsesConditionalReadHeaders(headers http.Header, inbound requestct
 		}
 	}
 	return nil
+}
+
+// 入站摘要绑定传输解码和渠道改写之前的字节；渠道 model_headers 单独保留在出站头中。
+func (p *OpenAIProvider) filterRewrittenBodyDigests(inbound requestctx.HeaderSnapshot, finalBody []byte) {
+	original, ok := common.GetWireRequestBody(p.Context)
+	if !ok {
+		original, _ = common.GetOriginalRequestBody(p.Context)
+	}
+	if bytes.Equal(original, finalBody) {
+		return
+	}
+	for _, name := range []string{"content-digest", "repr-digest", "digest", "content-md5"} {
+		delete(inbound.Fields, name)
+	}
 }
 
 func (p *OpenAIProvider) applyOpenAIHTTPHeaders(headers http.Header, inbound requestctx.HeaderSnapshot) error {

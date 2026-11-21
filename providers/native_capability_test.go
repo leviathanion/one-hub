@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 
+	"gorm.io/datatypes"
+
 	"one-api/common/config"
 	"one-api/model"
 	"one-api/providers/antigravity/wire"
@@ -87,5 +89,57 @@ func TestRequestExtensionOwnerRejectsForeignCandidateBeforeCandidateAssessment(t
 	}
 	if _, err := AssessChatRequest(&model.Channel{Type: -1901}, "model", &types.ChatCompletionRequest{}, fields); err != nil || calls != 1 {
 		t.Fatalf("own adapter rejected extension: calls=%d err=%v", calls, err)
+	}
+}
+
+func TestChatStreamOptionsDistinguishesNativeWireFromConversion(t *testing.T) {
+	for _, test := range []struct {
+		name              string
+		channelType       int
+		openAIAPI, native bool
+	}{
+		{name: "OpenAI", channelType: config.ChannelTypeOpenAI, native: true},
+		{name: "Azure", channelType: config.ChannelTypeAzure, native: true},
+		{name: "XAI", channelType: config.ChannelTypeXAI, native: true},
+		{name: "Claude conversion", channelType: config.ChannelTypeAnthropic},
+		{name: "Gemini conversion", channelType: config.ChannelTypeGemini},
+		{name: "Gemini OpenAI typed", channelType: config.ChannelTypeGemini, openAIAPI: true},
+		{name: "Baidu conversion", channelType: config.ChannelTypeBaidu},
+		{name: "Baidu OpenAI typed", channelType: config.ChannelTypeBaidu, openAIAPI: true},
+		{name: "Ali conversion", channelType: config.ChannelTypeAli},
+		{name: "Ali OpenAI typed", channelType: config.ChannelTypeAli, openAIAPI: true},
+		{name: "Moonshot typed", channelType: config.ChannelTypeMoonshot},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			plugin := datatypes.NewJSONType(model.PluginType{"use_openai_api": {"enable": test.openAIAPI}})
+			channel := &model.Channel{Type: test.channelType, Plugin: &plugin}
+			for _, options := range []string{`["future"]`, `"future"`, `42`, `{"include_usage":"future"}`, `{"include_obfuscation":{"future":true}}`, `{"future":true}`} {
+				fields := map[string]json.RawMessage{"stream_options": json.RawMessage(options)}
+				_, err := AssessChatRequest(channel, "gemini-2.5-flash", &types.ChatCompletionRequest{Stream: true}, fields)
+				if test.native && err != nil {
+					t.Fatalf("native wire rejected %s: %v", options, err)
+				}
+				if !test.native {
+					var capabilityErr *base.RequestCapabilityError
+					if !errors.As(err, &capabilityErr) || capabilityErr.Param != "stream_options" {
+						t.Fatalf("conversion discarded %s: %v", options, err)
+					}
+				}
+			}
+			for _, options := range []string{`null`, `{}`, `{"include_usage":null}`, `{"include_usage":true}`, `{"include_usage":false}`} {
+				fields := map[string]json.RawMessage{"stream_options": json.RawMessage(options)}
+				if _, err := AssessChatRequest(channel, "gemini-2.5-flash", &types.ChatCompletionRequest{Stream: true}, fields); err != nil {
+					t.Fatalf("display projection rejected %s: %v", options, err)
+				}
+			}
+			if test.channelType == config.ChannelTypeMoonshot {
+				_, err := AssessChatRequest(channel, "moonshot-v1", &types.ChatCompletionRequest{Stream: true}, map[string]json.RawMessage{
+					"stream_options": json.RawMessage(`{"include_obfuscation":true}`),
+				})
+				if err == nil {
+					t.Fatal("Moonshot typed 构造无法保留的选项不应通过能力检查")
+				}
+			}
+		})
 	}
 }

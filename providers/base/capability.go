@@ -1,6 +1,8 @@
 package base
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -75,6 +77,8 @@ func (e *RequestCapabilityError) Error() string {
 type ChatRequestSupport struct {
 	UsesResponsesTransport bool
 	SupportsStoredChat     bool
+	// 请求构造器会从原始 body 合入完整的 stream_options。
+	PreservesRawStreamOptions bool
 }
 
 // RequireOperationEndpoint keeps factory capability registration tied to the
@@ -165,4 +169,37 @@ func (c OperationSupport) SupportsStoredResponses() bool {
 		}
 	}
 	return true
+}
+
+// ValidateChatStreamOptionsProjection 检查 typed 投影是否能表示原始选项。
+// 转换路径默认只吸收 include_usage；同方言 typed 适配器可声明额外布尔字段。
+func ValidateChatStreamOptionsProjection(raw json.RawMessage, additionalBooleanFields ...string) error {
+	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil
+	}
+	unsupported := func() error {
+		return &RequestCapabilityError{Param: "stream_options", Message: "stream_options cannot be represented by the selected adapter"}
+	}
+	var options map[string]json.RawMessage
+	if json.Unmarshal(raw, &options) != nil || options == nil {
+		return unsupported()
+	}
+	for name, value := range options {
+		// include_obfuscation 是可空开关；null 没有需要传递的启用或禁用语义。
+		if name == "include_obfuscation" && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			continue
+		}
+		knownBoolean := name == "include_usage"
+		for _, additional := range additionalBooleanFields {
+			knownBoolean = knownBoolean || name == additional
+		}
+		if !knownBoolean {
+			return unsupported()
+		}
+		var enabled bool
+		if json.Unmarshal(value, &enabled) != nil {
+			return unsupported()
+		}
+	}
+	return nil
 }

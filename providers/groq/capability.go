@@ -6,11 +6,11 @@ import (
 	"one-api/types"
 )
 
-func (GroqProviderFactory) AssessChatRequest(_ *model.Channel, canonicalModel string, _ *types.ChatCompletionRequest) (base.ChatRequestSupport, error) {
+func (GroqProviderFactory) AssessChatRequest(channel *model.Channel, canonicalModel string, _ *types.ChatCompletionRequest) (base.ChatRequestSupport, error) {
 	if err := base.RequireOperationEndpoint(getConfig().ChatCompletions, "Chat Completions"); err != nil {
 		return base.ChatRequestSupport{}, err
 	}
-	return base.ChatRequestSupport{}, validateGroqCompoundCapability(canonicalModel)
+	return base.ChatRequestSupport{PreservesRawStreamOptions: channel != nil && channel.AllowExtraBody}, validateGroqCompoundCapability(canonicalModel)
 }
 
 func validateGroqCompoundCapability(modelName string) error {

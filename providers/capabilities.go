@@ -21,6 +21,10 @@ type chatWireFactoryPolicy interface {
 	AssessChatWireRequest(channel *model.Channel, canonicalModel string, request *types.ChatCompletionRequest, fields map[string]json.RawMessage) error
 }
 
+type completionRequestFactoryPolicy interface {
+	ValidateCompletionStreamOptions(channel *model.Channel, modelName string, raw []byte) error
+}
+
 type speechRequestFactoryPolicy interface {
 	AssessSpeechRequest(channel *model.Channel, request *types.SpeechAudioRequest) error
 }
@@ -121,6 +125,10 @@ func AssessChatRequest(channel *model.Channel, canonicalModel string, request *t
 	if wirePolicy, ok := factory.(chatWireFactoryPolicy); ok {
 		if err := wirePolicy.AssessChatWireRequest(channel, canonicalModel, request, fields); err != nil {
 			return support, normalizeRequestCapabilityError(err, "request")
+		}
+	} else if !support.PreservesRawStreamOptions {
+		if err := base.ValidateChatStreamOptionsProjection(fields["stream_options"]); err != nil {
+			return support, err
 		}
 	}
 	return support, nil
@@ -226,6 +234,14 @@ func normalizeRequestCapabilityError(err error, defaultParam string) error {
 		return err
 	}
 	return &base.RequestCapabilityError{Param: defaultParam, Message: fmt.Sprint(err)}
+}
+
+// AssessCompletionStreamOptions 只对需要投影流式选项的 Completion factory 评估可表示性。
+func AssessCompletionStreamOptions(channel *model.Channel, modelName string, raw []byte) error {
+	if policy, ok := providerFactoryForChannel(channel).(completionRequestFactoryPolicy); ok {
+		return policy.ValidateCompletionStreamOptions(channel, modelName, raw)
+	}
+	return nil
 }
 
 // AssessEndpoint 检查无需协议转换的操作是否被自定义渠道显式启用。

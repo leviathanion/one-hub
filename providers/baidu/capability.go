@@ -22,7 +22,7 @@ func (BaiduProviderFactory) AssessChatRequest(channel *model.Channel, canonicalM
 
 func (BaiduProviderFactory) AssessChatWireRequest(channel *model.Channel, canonicalModel string, request *types.ChatCompletionRequest, fields map[string]json.RawMessage) error {
 	if !usesOpenAIAPI(channel) {
-		return nil
+		return base.ValidateChatStreamOptionsProjection(fields["stream_options"])
 	}
 	return openai.ValidateChatRequestForChannel(channel, canonicalModel, request, fields)
 }

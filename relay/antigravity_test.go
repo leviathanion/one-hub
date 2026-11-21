@@ -256,6 +256,7 @@ func TestAntigravityUnsupportedIngressStopsBeforeCredentialsOrProviderWork(t *te
 		{"stored responses", "/v1/responses", `{"model":"gpt-5.6","input":"hi","store":true}`, config.ChannelTypeAntigravity},
 		{"default stored responses", "/v1/responses", `{"model":"gpt-5.6","input":"hi"}`, config.ChannelTypeAntigravity},
 		{"unknown carrier version", "/v1/chat/completions", `{"model":"gpt-5.6","messages":[{"role":"assistant","content":"hi","extra_content":{"antigravity_state":"ag9.invalid"}}]}`, config.ChannelTypeAntigravity},
+		{"unknown stream usage option", "/v1/chat/completions", `{"model":"gpt-5.6","stream":true,"stream_options":{"include_usage":"future"},"messages":[{"role":"user","content":"hi"}]}`, config.ChannelTypeAntigravity},
 		{"foreign carrier", "/v1/chat/completions", fmt.Sprintf(`{"model":"gpt-5.6","messages":[{"role":"assistant","content":"hi","extra_content":{"antigravity_state":%q}}]}`, carrier), config.ChannelTypeOpenAI},
 		{"cross protocol search", "/claude/v1/messages", `{"model":"gpt-5.6","max_tokens":32,"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"web_search_20250305","name":"web_search"}]}`, config.ChannelTypeAntigravity},
 		{"hidden summary continuation", "/claude/v1/messages", `{"model":"gpt-5.6","max_tokens":32,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"adaptive","display":"omitted"}}`, config.ChannelTypeAntigravity},

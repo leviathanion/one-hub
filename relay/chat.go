@@ -89,7 +89,7 @@ func (r *relayChat) decodeCurrentRequestBody() error {
 	if err != nil {
 		return err
 	}
-	if err := json.Unmarshal(raw, &r.chatRequest); err != nil {
+	if err := decodeChatRequestProjection(raw, &r.chatRequest); err != nil {
 		return err
 	}
 	if err := authorizeMediaRequest(r.c, raw, "chat"); err != nil {
@@ -120,6 +120,36 @@ func (r *relayChat) decodeCurrentRequestBody() error {
 		r.chatRequest.StreamOptions = nil
 	}
 	return nil
+}
+
+func decodeChatRequestProjection(raw []byte, request *types.ChatCompletionRequest) error {
+	wire := struct {
+		*types.ChatCompletionRequest
+		StreamOptions json.RawMessage `json:"stream_options,case:strict"`
+	}{ChatCompletionRequest: request}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return err
+	}
+	request.StreamOptions = projectStreamOptions(wire.StreamOptions)
+	return nil
+}
+
+// 只投影 relay 观察的字段；原始 envelope 继续用于原生透传与跨协议可表示性检查。
+func projectStreamOptions(raw json.RawMessage) *types.StreamOptions {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil || fields == nil {
+		return nil
+	}
+	options := &types.StreamOptions{}
+	if value := fields["include_usage"]; strings.TrimSpace(string(value)) == "true" {
+		options.IncludeUsage = true
+	}
+	if value := fields["include_obfuscation"]; strings.TrimSpace(string(value)) == "true" || strings.TrimSpace(string(value)) == "false" {
+		var enabled bool
+		_ = json.Unmarshal(value, &enabled)
+		options.IncludeObfuscation = &enabled
+	}
+	return options
 }
 
 func (r *relayChat) prepareSelectedProviderRemoteMedia() error {
@@ -252,7 +282,7 @@ func (r *relayChat) sendCurrentProvider() (*types.OpenAIErrorWithStatusCode, boo
 }
 
 func (r *relayChat) getUsageResponse() string {
-	if r.chatRequest.StreamOptions == nil || !r.chatRequest.StreamOptions.IncludeUsage || r.streamResponseMeta.UsageSeen || r.provider == nil {
+	if !common.ClientRequestsStreamUsage(r.c, r.chatRequest.StreamOptions) || r.streamResponseMeta.UsageSeen || r.provider == nil {
 		return ""
 	}
 	providerUsage := r.provider.GetUsage()
