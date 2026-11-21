@@ -37,6 +37,7 @@ type Usage struct {
 	ProviderOperationUnits        *int                   `json:"-"`
 	ProviderIndependentUsageUnits map[string]bool        `json:"-"`
 	ProviderServerToolUse         *ProviderServerToolUse `json:"server_tool_use,omitempty"`
+	ProviderServerToolUseDetails  json.RawMessage        `json:"-"`
 	ProviderPromptCacheHitTokens  int                    `json:"prompt_cache_hit_tokens,omitempty"`
 	ProviderPromptCacheMissTokens int                    `json:"prompt_cache_miss_tokens,omitempty"`
 	providerWireObserved          bool                   `json:"-"`
@@ -70,6 +71,7 @@ func (u *Usage) UnmarshalJSON(data []byte) error {
 	u.providerWireObserved = true
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(data, &fields); err == nil {
+		u.ProviderServerToolUseDetails = fields["server_tool_use_details"]
 		u.ProviderTokenFields = make(map[string]bool)
 		for _, field := range []string{"prompt_tokens", "completion_tokens", "total_tokens"} {
 			if validUsageInteger(fields[field]) {
