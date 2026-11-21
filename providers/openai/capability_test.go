@@ -101,3 +101,48 @@ func TestOpenAIDialectAssessmentPreservesExplicitEmptyFieldPresence(t *testing.T
 		t.Fatalf("explicit empty/null fields lost wire presence during owned-key assessment: %v", err)
 	}
 }
+
+func TestChatStreamOptionsAssessmentMatchesNativeWirePath(t *testing.T) {
+	for _, channelType := range []int{
+		config.ChannelTypeOpenAI, config.ChannelTypeAzure, config.ChannelTypeAzureV1, config.ChannelTypeCustom, config.ChannelTypeXAI,
+		config.ChannelTypeDeepseek, config.ChannelTypeGithub, config.ChannelTypeMiniMax, config.ChannelTypeLingyi,
+		config.ChannelTypeSuno, config.ChannelTypeMistral, config.ChannelTypeSiliconflow, config.ChannelTypeAli, config.ChannelTypeBaidu, config.ChannelTypeGemini,
+	} {
+		channel := &model.Channel{Type: channelType}
+		provider := &OpenAIProvider{BaseProvider: base.BaseProvider{Channel: channel}}
+		native := provider.usesNativeChatWire()
+		for _, options := range []string{`"future"`, `{"include_usage":{"future":true}}`, `{"include_obfuscation":"future"}`, `{"future":true}`} {
+			fields := map[string]json.RawMessage{"stream_options": json.RawMessage(options)}
+			err := ValidateChatRequestForChannel(channel, "model", &types.ChatCompletionRequest{Model: "model"}, fields)
+			if (err == nil) != native {
+				t.Fatalf("channel=%d native=%v options=%s err=%v", channelType, native, options, err)
+			}
+		}
+		for _, options := range []string{`null`, `{"include_usage":true,"include_obfuscation":false}`, `{"include_usage":false,"include_obfuscation":true}`, `{"include_usage":null,"include_obfuscation":null}`} {
+			fields := map[string]json.RawMessage{"stream_options": json.RawMessage(options)}
+			if err := ValidateChatRequestForChannel(channel, "model", &types.ChatCompletionRequest{Model: "model"}, fields); err != nil {
+				t.Fatalf("channel=%d rejected representable options=%s: %v", channelType, options, err)
+			}
+		}
+	}
+}
+
+func TestCompletionStreamOptionsRequireUsableChannelConfig(t *testing.T) {
+	invalid := `{"pre_add":broken}`
+	for _, test := range []struct {
+		name    string
+		channel *model.Channel
+		message string
+	}{
+		{"missing channel", nil, "Completion channel is required"},
+		{"malformed parameters", &model.Channel{Type: config.ChannelType360, CustomParameter: &invalid}, "channel has invalid request transform configuration"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := ValidateCompletionStreamOptions(test.channel, "model", []byte(`{"stream":true}`))
+			var capability *base.RequestCapabilityError
+			if !errors.As(err, &capability) || capability.Param != "operation" || capability.Message != test.message {
+				t.Fatalf("渠道配置错误分类有误：%v", err)
+			}
+		})
+	}
+}

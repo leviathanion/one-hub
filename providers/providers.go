@@ -89,6 +89,10 @@ func (openAICompatibleProviderFactory) AssessChatWireRequest(channel *model.Chan
 	return openai.ValidateChatRequestForChannel(channel, canonicalModel, request, fields)
 }
 
+func (openAICompatibleProviderFactory) ValidateCompletionStreamOptions(channel *model.Channel, modelName string, raw []byte) error {
+	return openai.ValidateCompletionStreamOptions(channel, modelName, raw)
+}
+
 func (openAICompatibleProviderFactory) AssessSpeechRequest(channel *model.Channel, request *types.SpeechAudioRequest) error {
 	return openai.AssessSpeechRequestForChannel(channel, request, channel.GetBaseURL())
 }

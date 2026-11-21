@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
+	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/requester"
 	"one-api/model"
@@ -117,7 +119,7 @@ func TestNativeSSEHidesOnlyUnrequestedUsageChunk(t *testing.T) {
 	unknown := "event: extension\ndata: {\"choices\":{\"future\":true},\"usage\":{\"total_tokens\":2}}\n\n"
 	usage := "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}\n\n"
 	done := "data: [DONE]\n\n"
-	handler := &OpenAIStreamHandler{Usage: &types.Usage{}, hideProviderUsage: true}
+	handler := &OpenAIStreamHandler{Usage: &types.Usage{}, usageFilter: hideCollectedUsage}
 	got, err := collectNativeSSE(t, newExactChatTestStream(t, handler, unknown+usage+done))
 	if got != unknown+done || !errors.Is(err, io.EOF) {
 		t.Fatalf("hidden usage changed other frames: %q error=%v", got, err)
@@ -131,6 +133,7 @@ func TestNativeSSEOnlyDecodesBOMAtStreamStart(t *testing.T) {
 	const bom = "\uFEFF"
 	const usage = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}\r\n\r\n"
 	const content = "data: {\"choices\":[{\"text\":\"hello\"}],\"usage\":null}\r\n\r\n"
+	const filteredContent = "data: {\"choices\":[{\"text\":\"hello\"}]}\r\n\r\n"
 	const heartbeat = ": heartbeat\r\n\r\n"
 	const done = "data: [DONE]\r\n\r\n"
 	tests := []struct {
@@ -139,6 +142,7 @@ func TestNativeSSEOnlyDecodesBOMAtStreamStart(t *testing.T) {
 	}{
 		{"vendor event", bom + "event: vendor.notice\r\n" + usage, bom + "event: vendor.notice\r\n" + usage, 5},
 		{"named error", bom + "event: error\r\n" + usage, bom + "event: error\r\n" + usage, 5},
+		{"content with null usage", bom + content + done, bom + filteredContent + done, 0},
 		{"hidden first frame", bom + usage + done, bom + done, 5},
 		{"blank first line", bom + "\r\n" + usage + done, bom + "\r\n" + done, 5},
 		{"literal after heartbeat", heartbeat + bom + usage + done, heartbeat + bom + usage + done, 0},
@@ -148,7 +152,7 @@ func TestNativeSSEOnlyDecodesBOMAtStreamStart(t *testing.T) {
 	for _, completion := range []bool{false, true} {
 		for _, tc := range tests {
 			t.Run(fmt.Sprintf("completion=%t/%s", completion, tc.name), func(t *testing.T) {
-				h := &OpenAIStreamHandler{Usage: &types.Usage{}, hideProviderUsage: true}
+				h := &OpenAIStreamHandler{Usage: &types.Usage{}, usageFilter: hideCollectedUsage}
 				handle := h.HandleExactChatSSE
 				if completion {
 					handle = h.handleExactCompletionSSE
@@ -164,6 +168,112 @@ func TestNativeSSEOnlyDecodesBOMAtStreamStart(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestNativeSSEPreservesProviderUsageWithoutKnownCollectionAndPreference(t *testing.T) {
+	const usage = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}\n\n"
+	const done = "data: [DONE]\n\n"
+	const disabled = `{"include_usage":false}`
+	const opaque = `["future"]`
+	for _, test := range []struct {
+		name, original, final string
+		support               bool
+	}{
+		{"opaque client options", opaque, opaque, true},
+		{"opaque effective options", disabled, opaque, true},
+		{"opaque client switch overridden by channel", `{"include_usage":{"future":true}}`, `{"include_usage":true}`, true},
+		{"collection unavailable", disabled, disabled, false},
+	} {
+		for _, completion := range []bool{false, true} {
+			t.Run(fmt.Sprintf("completion=%v/%s", completion, test.name), func(t *testing.T) {
+				const prefix = `{"model":"model","stream":true,"stream_options":`
+				ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+				ctx.Request = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(prefix+test.original+"}"))
+				if _, err := common.CacheRequestBody(ctx); err != nil {
+					t.Fatal(err)
+				}
+				final := prefix + test.final + "}"
+				common.SetReusableRequestBody(ctx, []byte(final))
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					body, err := io.ReadAll(r.Body)
+					if err != nil || string(body) != final {
+						t.Errorf("上游请求选项变化：got=%q want=%q err=%v", body, final, err)
+					}
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, usage+done)
+				}))
+				defer server.Close()
+				previous := requester.HTTPClient
+				requester.HTTPClient = server.Client()
+				defer func() { requester.HTTPClient = previous }()
+				proxy := ""
+				p := CreateOpenAIProvider(&model.Channel{Type: config.ChannelTypeOpenAI, Proxy: &proxy}, server.URL)
+				p.SetProviderRawJSONReplay(true)
+				p.SetContext(ctx)
+				p.SetUsage(&types.Usage{})
+				p.SupportStreamOptions = test.support
+				var stream requester.StreamReaderInterface[string]
+				var apiErr *types.OpenAIErrorWithStatusCode
+				if completion {
+					stream, apiErr = p.CreateCompletionStream(&types.CompletionRequest{Model: "model", Stream: true})
+				} else {
+					stream, apiErr = p.CreateChatCompletionStream(&types.ChatCompletionRequest{Model: "model", Stream: true})
+				}
+				if apiErr != nil {
+					t.Fatal(apiErr)
+				}
+				got, err := collectNativeSSE(t, stream)
+				if got != usage+done || !errors.Is(err, io.EOF) || p.Usage.TotalTokens != 5 {
+					t.Fatalf("上游用量交付或观察错误：wire=%q usage=%+v err=%v", got, p.Usage, err)
+				}
+			})
+		}
+	}
+}
+
+func TestCompatibleNativeSSEPreservesUsageAlongsideChoices(t *testing.T) {
+	const usage = `"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}`
+	const tail = "data: {\"choices\":[]," + usage + "}\n\n"
+	const done = "data: [DONE]\n\n"
+	for _, test := range []struct {
+		name, choice string
+	}{
+		{"chat", `{"index":0,"delta":{"content":""},"finish_reason":"stop"}`},
+		{"completion", `{"index":0,"text":"hello","finish_reason":null}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			choice := "data: {\"choices\":[" + test.choice + "]," + usage + "}\n\n"
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, choice+tail+done)
+			}))
+			t.Cleanup(server.Close)
+			previousClient := requester.HTTPClient
+			requester.HTTPClient = server.Client()
+			t.Cleanup(func() { requester.HTTPClient = previousClient })
+
+			proxy := ""
+			p := CreateOpenAIProvider(&model.Channel{Plugin: model.NewCustomEndpointPlugin(), Type: config.ChannelTypeCustom, Key: "test", Proxy: &proxy}, server.URL)
+			p.SetUsage(&types.Usage{})
+			var stream requester.StreamReaderInterface[string]
+			var apiErr *types.OpenAIErrorWithStatusCode
+			if test.name == "completion" {
+				stream, apiErr = p.CreateCompletionStream(&types.CompletionRequest{Model: "model", Stream: true, Prompt: "hello"})
+			} else {
+				stream, apiErr = p.CreateChatCompletionStream(&types.ChatCompletionRequest{Model: "model", Stream: true, Messages: []types.ChatCompletionMessage{{Role: "user", Content: "hello"}}})
+			}
+			if apiErr != nil {
+				t.Fatal(apiErr)
+			}
+			got, err := collectNativeSSE(t, stream)
+			if want := choice + done; got != want || !errors.Is(err, io.EOF) {
+				t.Fatalf("上游主动返回的正文用量或兼容尾帧交付错误：got=%q want=%q err=%v", got, want, err)
+			}
+			if p.Usage.TotalTokens != 5 || !p.Usage.HasProviderBaseUsage() {
+				t.Fatalf("计费证据错误：%+v", p.Usage)
+			}
+		})
 	}
 }
 
@@ -218,7 +328,7 @@ func TestChatConversionOwnsTerminalBoundaryWithoutChangingNativeDelivery(t *test
 
 func TestNativeUsageHidingCannotHideProviderError(t *testing.T) {
 	wire := "event: error\ndata: {\"error\":{\"message\":\"rejected\"},\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n"
-	h := &OpenAIStreamHandler{Usage: &types.Usage{}, hideProviderUsage: true}
+	h := &OpenAIStreamHandler{Usage: &types.Usage{}, usageFilter: hideCollectedUsage}
 	got, err := collectNativeSSE(t, newExactChatTestStream(t, h, wire))
 	if got != wire || !errors.Is(err, io.EOF) || !h.Usage.HasProviderBaseUsage() || h.Usage.TotalTokens != 2 {
 		t.Fatalf("error delivery or independent usage observation changed: wire=%q err=%v usage=%+v", got, err, h.Usage)

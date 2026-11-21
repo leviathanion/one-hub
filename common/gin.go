@@ -181,6 +181,40 @@ func GetOriginalRequestBody(c *gin.Context) ([]byte, bool) {
 	return state.OriginalBody, true
 }
 
+// ClientRequestsStreamUsage 判断客户端是否明确请求展示用量。
+func ClientRequestsStreamUsage(c *gin.Context, fallback *types.StreamOptions) bool {
+	enabled, _ := ClientStreamUsagePreference(c, fallback)
+	return enabled
+}
+
+// ClientStreamUsagePreference 读取渠道改写前的展示偏好。未知选项由上游解释。
+// 内部调用即使缓存了空请求体，也使用传入的 typed 选项。
+func ClientStreamUsagePreference(c *gin.Context, fallback *types.StreamOptions) (enabled, known bool) {
+	if body, exists := GetOriginalRequestBody(c); exists && len(body) > 0 {
+		var envelope struct {
+			Options json.RawMessage `json:"stream_options,case:strict"`
+		}
+		var options struct {
+			IncludeUsage json.RawMessage `json:"include_usage,case:strict"`
+		}
+		if json.Unmarshal(body, &envelope) != nil {
+			return false, false
+		}
+		if len(envelope.Options) > 0 && json.Unmarshal(envelope.Options, &options) != nil {
+			return false, false
+		}
+		switch string(bytes.TrimSpace(options.IncludeUsage)) {
+		case "true":
+			return true, true
+		case "", "null", "false":
+			return false, true
+		default:
+			return false, false
+		}
+	}
+	return fallback != nil && fallback.IncludeUsage, true
+}
+
 // SetDecodedRequestState atomically seeds the canonical request state after
 // transport-level decoding so every downstream consumer observes the same
 // decoded body without rereading c.Request.Body.

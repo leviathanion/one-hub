@@ -93,9 +93,13 @@ func TestChatToResponsesRejectsUnmappedStopAndStreamOptions(t *testing.T) {
 	assertCapabilityGateError(t, validateChatToResponsesRepresentability(request, fields), "stream_options")
 	fields["stream_options"] = json.RawMessage(`{"include_obfuscation":false}`)
 	assertCapabilityGateError(t, validateChatToResponsesRepresentability(request, fields), "stream_options")
-	fields["stream_options"] = json.RawMessage(`{"include_usage":true}`)
-	if err := validateChatToResponsesRepresentability(request, fields); err != nil {
-		t.Fatalf("include_usage is relay-owned downstream behavior and must remain representable: %v", err)
+	fields["stream_options"] = json.RawMessage(`{"future":null}`)
+	assertCapabilityGateError(t, validateChatToResponsesRepresentability(request, fields), "stream_options")
+	for _, options := range []string{`{"include_usage":true}`, `{"include_obfuscation":null}`, `{"include_obfuscation":null,"include_usage":true}`} {
+		fields["stream_options"] = json.RawMessage(options)
+		if err := validateChatToResponsesRepresentability(request, fields); err != nil {
+			t.Fatalf("可转换的 stream_options 被拒绝：%s，%v", options, err)
+		}
 	}
 }
 

@@ -67,7 +67,9 @@ func convertChat(src fields, ctx *Context) (json.RawMessage, error) {
 		if err = checkFields(options, "stream_options", "include_usage"); err != nil {
 			return nil, err
 		}
-		ctx.IncludeUsage = isTrue(options["include_usage"])
+		if include, present := options["include_usage"]; present && json.Unmarshal(include, &ctx.IncludeUsage) != nil {
+			return nil, unsupported("stream_options.include_usage", "用量展示开关必须是布尔值或 null")
+		}
 	}
 	if value, ok := src["tools"]; ok {
 		tools, err := toolDeclarations(value, DialectChat, "tools")

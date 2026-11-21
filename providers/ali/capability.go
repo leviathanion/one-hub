@@ -30,6 +30,8 @@ func (AliProviderFactory) AssessChatWireRequest(channel *model.Channel, canonica
 		if err := openai.ValidateChatRequestForChannel(channel, canonicalModel, request, fields); err != nil {
 			return err
 		}
+	} else if err := base.ValidateChatStreamOptionsProjection(fields["stream_options"]); err != nil {
+		return err
 	}
 	return validateAliSearchCapabilityWithFields(channel, canonicalModel, request, fields)
 }

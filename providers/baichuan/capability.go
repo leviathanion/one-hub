@@ -12,7 +12,7 @@ func (BaichuanProviderFactory) AssessChatRequest(channel *model.Channel, canonic
 	if err := base.RequireOperationEndpoint(getConfig().ChatCompletions, "Chat Completions"); err != nil {
 		return base.ChatRequestSupport{}, err
 	}
-	return base.ChatRequestSupport{}, validateBaichuanSearchCapability(channel, canonicalModel)
+	return base.ChatRequestSupport{PreservesRawStreamOptions: channel != nil && channel.AllowExtraBody}, validateBaichuanSearchCapability(channel, canonicalModel)
 }
 
 func validateBaichuanSearchCapability(channel *model.Channel, modelName string) error {

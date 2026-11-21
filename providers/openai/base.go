@@ -501,21 +501,19 @@ func (p *OpenAIProvider) openAIRequestUsesAzureAPIKey(mode openAIRequestAuthMode
 
 // GetRequestTextBody builds the request using the caller's wire contract.
 func (p *OpenAIProvider) GetRequestTextBody(relayMode int, ModelName string, request any) (*http.Request, *types.OpenAIErrorWithStatusCode) {
-	return p.getRequestTextBody(relayMode, ModelName, request, false)
+	req, _, apiErr := p.getRequestTextBody(relayMode, ModelName, func() any { return request }, false)
+	return req, apiErr
 }
 
-// getRequestTextBody is also used by compatible Chat/Completion streaming
-// adapters after they have decided that provider-side usage evidence is
-// required. The decision is explicit so raw JSON planning has the same final
-// writer as the typed builder, while all other operations retain the public
-// pass-through behavior above.
-func (p *OpenAIProvider) getRequestTextBody(relayMode int, ModelName string, request any, forceIncludeUsage bool) (*http.Request, *types.OpenAIErrorWithStatusCode) {
+// 构造最终上游请求，并告知流式调用方用量采集是否确已开启。
+// 仅在走 typed 构造时准备对应请求体。用量开关在渠道参数合并后处理。
+func (p *OpenAIProvider) getRequestTextBody(relayMode int, ModelName string, buildTypedBody func() any, forceIncludeUsage bool) (*http.Request, bool, *types.OpenAIErrorWithStatusCode) {
 	url, errWithCode := p.GetSupportedAPIUri(relayMode)
 	if errWithCode != nil {
-		return nil, errWithCode
+		return nil, false, errWithCode
 	}
 	if errWithCode := p.validateAzureClassicAPIVersionForRequest(); errWithCode != nil {
-		return nil, errWithCode
+		return nil, false, errWithCode
 	}
 	// 获取请求地址
 	fullRequestURL := p.GetFullRequestURL(url, ModelName)
@@ -524,7 +522,7 @@ func (p *OpenAIProvider) getRequestTextBody(relayMode int, ModelName string, req
 	headers := p.GetRequestHeaders()
 
 	var httpReq *http.Request
-	nativeBodyUsed := false
+	var nativeBody []byte
 	nativeWire := p.usesNativeOpenAIWire()
 	if relayMode == config.RelayModeChatCompletions {
 		nativeWire = p.usesNativeChatWire()
@@ -532,63 +530,67 @@ func (p *OpenAIProvider) getRequestTextBody(relayMode int, ModelName string, req
 	if nativeWire && nativeOpenAIJSONRelayMode(relayMode) {
 		body, exists, err := p.planNativeJSONBody(ModelName)
 		if err != nil {
-			return nil, common.ErrorWrapperLocal(err, "build_native_request_failed", http.StatusInternalServerError)
+			return nil, false, common.ErrorWrapperLocal(err, "build_native_request_failed", http.StatusInternalServerError)
 		}
 		if exists {
 			httpReq, err = p.Requester.NewRequest(http.MethodPost, fullRequestURL, p.Requester.WithBody(body), p.Requester.WithHeader(headers))
 			if err != nil {
-				return nil, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
+				return nil, false, common.ErrorWrapper(err, "new_request_failed", http.StatusInternalServerError)
 			}
-			nativeBodyUsed = true
+			nativeBody = body
 		}
 	}
 	if httpReq == nil {
-		httpReq, errWithCode = p.BuildRequestWithMerge(request, fullRequestURL, headers, ModelName)
+		httpReq, errWithCode = p.BuildRequestWithMerge(buildTypedBody(), fullRequestURL, headers, ModelName)
 		if errWithCode != nil {
-			return nil, errWithCode
+			return nil, false, errWithCode
 		}
 	}
+	providerUsageEnabled := false
 	if forceIncludeUsage {
-		body, err := requestBodyCopy(httpReq)
-		if err != nil {
-			return nil, common.ErrorWrapperLocal(err, "read_request_body_failed", http.StatusInternalServerError)
+		body := nativeBody
+		var err error
+		if body == nil {
+			body, err = requestBodyCopy(httpReq)
+			if err != nil {
+				return nil, false, common.ErrorWrapperLocal(err, "read_request_body_failed", http.StatusInternalServerError)
+			}
 		}
-		body, err = mergeProviderStreamUsage(body)
-		if err != nil {
-			return nil, common.ErrorWrapperLocal(err, "build_stream_options_request_failed", http.StatusInternalServerError)
+		patched, enabled := mergeProviderStreamUsage(body)
+		providerUsageEnabled = enabled
+		if patched != nil {
+			replaceRequestBody(httpReq, patched)
+			if nativeBody != nil {
+				nativeBody = patched
+			}
 		}
-		replaceRequestBody(httpReq, body)
 	}
 	if relayMode == config.RelayModeImagesGenerations && !p.SupportsImageResponse() {
 		if errWithCode := rejectUnsupportedImageStreamRequest(httpReq); errWithCode != nil {
-			return nil, errWithCode
+			return nil, false, errWithCode
 		}
 	}
 	if errWithCode := p.authorizeMediaRequestBody(httpReq, relayMode); errWithCode != nil {
 		_ = httpReq.Body.Close()
-		return nil, errWithCode
+		return nil, false, errWithCode
 	}
-	if nativeBodyUsed && p.Context != nil && p.Context.Request != nil {
-		if err := p.applyOpenAIHTTPHeaders(httpReq.Header, requestctx.NewHeaderSnapshot(p.Context.Request.Header)); err != nil {
-			return nil, common.ErrorWrapperLocal(err, "invalid_request_header", http.StatusBadRequest)
+	if nativeBody != nil && p.Context != nil && p.Context.Request != nil {
+		inbound := requestctx.NewHeaderSnapshot(p.Context.Request.Header)
+		if p.ProviderRawJSONReplay && (relayMode == config.RelayModeChatCompletions || relayMode == config.RelayModeCompletions) {
+			p.filterRewrittenBodyDigests(inbound, nativeBody)
+		}
+		if err := p.applyOpenAIHTTPHeaders(httpReq.Header, inbound); err != nil {
+			return nil, false, common.ErrorWrapperLocal(err, "invalid_request_header", http.StatusBadRequest)
 		}
 	}
-	return httpReq, nil
+	return httpReq, providerUsageEnabled, nil
 }
 
 func (p *OpenAIProvider) usesNativeOpenAIWire() bool {
-	if p == nil || p.Channel == nil {
-		return false
-	}
-	switch p.Channel.Type {
-	case config.ChannelTypeOpenAI, config.ChannelTypeAzure, config.ChannelTypeAzureV1, config.ChannelTypeCustom:
-		return true
-	default:
-		return false
-	}
+	return p != nil && channelUsesNativeOpenAIWire(p.Channel)
 }
 
 // Chat 同方言透传不代表支持图片或持久化资源协议。
 func (p *OpenAIProvider) usesNativeChatWire() bool {
-	return p.usesNativeOpenAIWire() || (p != nil && p.Channel != nil && p.Channel.Type == config.ChannelTypeXAI)
+	return p != nil && channelUsesNativeChatWire(p.Channel)
 }

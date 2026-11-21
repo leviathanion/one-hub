@@ -212,84 +212,109 @@ func TestUsageControlsPreserveExactAndProviderOwnedFields(t *testing.T) {
 	}
 }
 
-func TestOfficialFactoryExactStreamingKeepsRawWire(t *testing.T) {
-	for _, test := range []struct {
-		name      string
-		operation string
-		raw       string
-	}{
-		{
-			name:      "Chat",
-			operation: "chat",
-			raw:       `{"model":"` + compatibleStreamUsageModel + `","stream":true,"messages":[{"role":"user","content":"hello"}],"stream_options":{"include_obfuscation":true,"future_option":{"enabled":true}},"future_request_field":{"enabled":true}}`,
-		},
-		{
-			name:      "Completion",
-			operation: "completion",
-			raw:       `{"model":"` + compatibleStreamUsageModel + `","prompt":"hello","stream":true,"stream_options":{"include_obfuscation":true,"future_option":{"enabled":true}},"future_request_field":{"enabled":true}}`,
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			transport := &compatibleStreamUsageExactCaptureTransport{operation: test.operation}
-			previousClient := requester.HTTPClient
-			requester.HTTPClient = &http.Client{Transport: transport}
-			t.Cleanup(func() { requester.HTTPClient = previousClient })
-
-			proxy := ""
-			provider := openai.CreateOpenAIProvider(&model.Channel{
-				Type: config.ChannelTypeOpenAI, Key: "issue002-official-key", Proxy: &proxy,
-			}, "https://api.openai.com")
-			if !provider.ProviderRawJSONReplay || !provider.RequireOpenAIStreamTerminal || !provider.SupportStreamOptions {
-				t.Fatalf("official factory did not naturally select exact strategy: replay=%v terminal=%v support_options=%v", provider.ProviderRawJSONReplay, provider.RequireOpenAIStreamTerminal, provider.SupportStreamOptions)
-			}
-			path := "/v1/chat/completions"
-			if test.operation == "completion" {
-				path = "/v1/completions"
-			}
-			ctx := compatibleStreamUsageRequestContext(t, path, true, test.raw)
-			provider.SetContext(ctx)
-			provider.SetOriginalModel(compatibleStreamUsageModel)
-			provider.SetUsage(&types.Usage{})
-
-			if test.operation == "chat" {
-				var request types.ChatCompletionRequest
-				if err := json.Unmarshal([]byte(test.raw), &request); err != nil {
-					t.Fatalf("decode exact Chat request: %v", err)
+func TestOfficialStreamingCollectsUsageIndependentlyOfClientDisplay(t *testing.T) {
+	for _, operation := range []string{"chat", "completion"} {
+		for _, test := range []struct {
+			name, options          string
+			clientUsage, wantUsage bool
+		}{
+			{name: "omitted", wantUsage: true},
+			{name: "false", options: `,"stream_options":{"include_usage":false,"include_obfuscation":true,"future_option":{"n":9007199254740993,"text":"\u0061"}}`, wantUsage: true},
+			{name: "true", options: `,"stream_options":{"include_usage":true,"future_option":{"n":9007199254740993}}`, clientUsage: true, wantUsage: true},
+			{name: "null", options: `,"stream_options":null`, wantUsage: true},
+			{name: "future array", options: `,"stream_options":["future"]`},
+			{name: "future string", options: `,"stream_options":"future"`},
+			{name: "future number", options: `,"stream_options":42`},
+		} {
+			t.Run(operation+"/"+test.name, func(t *testing.T) {
+				transport := &compatibleStreamUsageExactCaptureTransport{operation: operation}
+				previousClient := requester.HTTPClient
+				requester.HTTPClient = &http.Client{Transport: transport}
+				t.Cleanup(func() { requester.HTTPClient = previousClient })
+				proxy := ""
+				provider := openai.CreateOpenAIProvider(&model.Channel{
+					Type: config.ChannelTypeOpenAI, Key: "official-key", Proxy: &proxy,
+				}, "https://api.openai.com")
+				path, input := "/v1/chat/completions", `"messages":[{"role":"user","content":"hello"}]`
+				if operation == "completion" {
+					path, input = "/v1/completions", `"prompt":"hello"`
 				}
-				stream, apiErr := provider.CreateChatCompletionStream(&request)
-				if apiErr != nil {
-					t.Fatalf("exact Chat stream failed: %+v", apiErr)
+				raw := `{"model":"` + compatibleStreamUsageModel + `","stream":true,` + input + test.options + `,"future_request_field":{"n":9007199254740993,"text":"\u0061"}}`
+				ctx := compatibleStreamUsageRequestContext(t, path, true, raw)
+				provider.SetContext(ctx)
+				provider.SetOriginalModel(compatibleStreamUsageModel)
+				provider.SetUsage(&types.Usage{})
+				var options *types.StreamOptions
+				if test.name == "false" || test.name == "true" {
+					options = &types.StreamOptions{IncludeUsage: test.clientUsage}
 				}
-				_ = compatibleStreamUsageDrainStream(t, stream)
-			} else {
-				var request types.CompletionRequest
-				if err := json.Unmarshal([]byte(test.raw), &request); err != nil {
-					t.Fatalf("decode exact Completion request: %v", err)
+				var delivered string
+				if operation == "chat" {
+					request := &types.ChatCompletionRequest{Model: compatibleStreamUsageModel, Stream: true, StreamOptions: options}
+					stream, apiErr := provider.CreateChatCompletionStream(request)
+					if apiErr != nil {
+						t.Fatalf("chat stream: %+v", apiErr)
+					}
+					delivered = compatibleStreamUsageDrainStream(t, stream)
+					if request.StreamOptions != options {
+						t.Fatal("client options mutated")
+					}
+				} else {
+					request := &types.CompletionRequest{Model: compatibleStreamUsageModel, Stream: true, StreamOptions: options}
+					stream, apiErr := provider.CreateCompletionStream(request)
+					if apiErr != nil {
+						t.Fatalf("completion stream: %+v", apiErr)
+					}
+					delivered = compatibleStreamUsageDrainStream(t, stream)
+					if request.StreamOptions != options {
+						t.Fatal("client options mutated")
+					}
 				}
-				stream, apiErr := provider.CreateCompletionStream(&request)
-				if apiErr != nil {
-					t.Fatalf("exact Completion stream failed: %+v", apiErr)
+				calls, body := transport.snapshot()
+				if calls != 1 {
+					t.Fatalf("provider calls=%d", calls)
 				}
-				_ = compatibleStreamUsageDrainStream(t, stream)
-			}
-
-			calls, body := transport.snapshot()
-			if calls != 1 || !bytes.Equal(body, []byte(test.raw)) {
-				t.Fatalf("official exact request was rewritten or sent unexpectedly: calls=%d body=%q want=%q", calls, body, test.raw)
-			}
-			if bytes.Contains(body, []byte(`"include_usage"`)) {
-				t.Fatalf("official exact request received proxy include_usage injection: %s", body)
-			}
-			if usage := provider.GetUsage(); usage.ProviderReported || usage.HasProviderUsage() {
-				t.Fatalf("exact stream without provider usage became billable: %+v", usage)
-			}
-		})
+				var before, after map[string]json.RawMessage
+				if json.Unmarshal([]byte(raw), &before) != nil || json.Unmarshal(body, &after) != nil {
+					t.Fatalf("invalid request body: %s", body)
+				}
+				for key, value := range before {
+					if key != "stream_options" && !bytes.Equal(value, after[key]) {
+						t.Fatalf("request field %s changed: %s", key, body)
+					}
+				}
+				if test.wantUsage {
+					var oldOptions, sentOptions map[string]json.RawMessage
+					_ = json.Unmarshal(before["stream_options"], &oldOptions)
+					if json.Unmarshal(after["stream_options"], &sentOptions) != nil || string(sentOptions["include_usage"]) != "true" {
+						t.Fatalf("usage not requested: %s", body)
+					}
+					for key, value := range oldOptions {
+						if key != "include_usage" && !bytes.Equal(value, sentOptions[key]) {
+							t.Fatalf("option %s changed: %s", key, body)
+						}
+					}
+				} else if !bytes.Equal(body, []byte(raw)) {
+					t.Fatalf("provider-owned union rewritten: %s", body)
+				}
+				if !strings.Contains(delivered, `"ok"`) || strings.Contains(delivered, `"usage":`) != test.clientUsage ||
+					strings.Contains(delivered, `"choices":[]`) != test.clientUsage {
+					t.Fatalf("client display contract changed: %s", delivered)
+				}
+				usage := provider.GetUsage()
+				if usage.HasProviderUsage() != test.wantUsage || (test.wantUsage && usage.TotalTokens != 7) {
+					t.Fatalf("usage evidence: %+v", usage)
+				}
+			})
+		}
 	}
 }
 
 type compatibleStreamUsageExactCaptureTransport struct {
 	mu        sync.Mutex
 	operation string
+	omitUsage bool
+	reject    bool
 	calls     int
 	body      []byte
 }
@@ -303,9 +328,37 @@ func (t *compatibleStreamUsageExactCaptureTransport) RoundTrip(request *http.Req
 	t.calls++
 	t.body = append(t.body[:0], body...)
 	t.mu.Unlock()
-	responseBody := "data: {\"id\":\"issue002-exact\",\"object\":\"chat.completion.chunk\",\"model\":\"" + compatibleStreamUsageModel + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
+	if t.reject {
+		return &http.Response{StatusCode: http.StatusUnprocessableEntity, Status: "422 Unprocessable Entity", Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"error":{"message":"future options rejected","type":"invalid_request_error","code":"future_options","param":"stream_options"},"future_error":{"kept":true}}`)), Request: request}, nil
+	}
+	var fields map[string]json.RawMessage
+	_ = json.Unmarshal(body, &fields)
+	if string(fields["stream"]) != "true" {
+		reply := `{"choices":[{"index":0,"message":{"role":"assistant","content":"ok"}}]}`
+		if t.operation == "completion" {
+			reply = `{"choices":[{"index":0,"text":"ok"}]}`
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}},
+			Body: io.NopCloser(strings.NewReader(reply)), Request: request,
+		}, nil
+	}
+	responseBody := "data: {\"id\":\"issue002-exact\",\"object\":\"chat.completion.chunk\",\"model\":\"" + compatibleStreamUsageModel + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}],\"obfuscation\":\"content-padding\"}\n\ndata: [DONE]\n\n"
 	if t.operation == "completion" {
-		responseBody = "data: {\"id\":\"issue002-exact\",\"object\":\"text_completion\",\"model\":\"" + compatibleStreamUsageModel + "\",\"choices\":[{\"index\":0,\"text\":\"ok\"}]}\n\ndata: [DONE]\n\n"
+		responseBody = "data: {\"id\":\"issue002-exact\",\"object\":\"text_completion\",\"model\":\"" + compatibleStreamUsageModel + "\",\"choices\":[{\"index\":0,\"text\":\"ok\"}],\"obfuscation\":\"content-padding\"}\n\ndata: [DONE]\n\n"
+	}
+	var options struct {
+		IncludeUsage bool `json:"include_usage"`
+	}
+	_ = json.Unmarshal(fields["stream_options"], &options)
+	if options.IncludeUsage && !t.omitUsage {
+		responseBody = strings.Replace(responseBody, `"choices":`, `"usage":null,"choices":`, 1)
+		object := "chat.completion.chunk"
+		if t.operation == "completion" {
+			object = "text_completion"
+		}
+		usage := "data: {\"id\":\"usage\",\"object\":\"" + object + "\",\"model\":\"" + compatibleStreamUsageModel + "\",\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"total_tokens\":7},\"obfuscation\":\"usage-padding\"}\n\n"
+		responseBody = strings.Replace(responseBody, "data: [DONE]", usage+"data: [DONE]", 1)
 	}
 	return &http.Response{
 		StatusCode: http.StatusOK,
@@ -625,4 +678,290 @@ func compatibleStreamUsagePrepareBilling(t *testing.T) {
 		model.PricingInstance = oldPricing
 		config.BatchUpdateEnabled, config.RedisEnabled, config.PreConsumedQuota, config.LogConsumeEnabled = oldBatch, oldRedis, oldReserve, oldLog
 	})
+}
+
+func TestOfficialStreamUsageThroughRelayEntryAndSQL(t *testing.T) {
+	oldDisableTokenEncoders := config.DisableTokenEncoders
+	config.DisableTokenEncoders = true
+	t.Cleanup(func() { config.DisableTokenEncoders = oldDisableTokenEncoders })
+	for _, operation := range []string{"chat", "completion"} {
+		for _, test := range []struct {
+			name, options, custom      string
+			display, omitUsage, reject bool
+		}{
+			{name: "omitted"},
+			{name: "false", options: `,"stream_options":{"include_usage":false}`},
+			{name: "true", options: `,"stream_options":{"include_usage":true}`, display: true},
+			{name: "null", options: `,"stream_options":null`},
+			{name: "pre_add enables display", options: `,"stream_options":{"include_usage":false}`, custom: `{"pre_add":true,"overwrite":true,"stream_options":{"include_usage":true}}`},
+			{name: "pre_add disables display", options: `,"stream_options":{"include_usage":true}`, custom: `{"pre_add":true,"overwrite":true,"stream_options":{"include_usage":false}}`, display: true},
+			{name: "future array", options: `,"stream_options":["future"]`, omitUsage: true},
+			{name: "future string", options: `,"stream_options":"future"`, omitUsage: true},
+			{name: "future number", options: `,"stream_options":42`, omitUsage: true},
+			{name: "future obfuscation union", options: `,"stream_options":{"include_obfuscation":{"future":true}}`},
+			{name: "upstream rejects include_usage union", options: `,"stream_options":{"include_usage":{"future":true}}`, reject: true},
+			{name: "post custom false keeps stream", custom: `{"overwrite":true,"stream":false}`},
+			{name: "post custom removal keeps stream", custom: `{"remove_params":["stream"]}`},
+			{name: "upstream rejects future value", options: `,"stream_options":["future"]`, reject: true},
+			{name: "upstream omits usage", options: `,"stream_options":{"include_usage":true}`, omitUsage: true},
+		} {
+			t.Run(operation+"/"+test.name, func(t *testing.T) {
+				compatibleStreamUsagePrepareBilling(t)
+				transport := &compatibleStreamUsageExactCaptureTransport{operation: operation, omitUsage: test.omitUsage, reject: test.reject}
+				previousClient := requester.HTTPClient
+				requester.HTTPClient = &http.Client{Transport: transport}
+				t.Cleanup(func() { requester.HTTPClient = previousClient })
+				channel := capabilitySelectionChannel(1, config.ChannelTypeOpenAI, compatibleStreamUsageModel)
+				channel.Key = "official-key"
+				if test.custom != "" {
+					channel.CustomParameter = &test.custom
+				}
+				path, input := "/v1/chat/completions", `"messages":[{"role":"user","content":"hello"}]`
+				if operation == "completion" {
+					path, input = "/v1/completions", `"prompt":"hello"`
+				}
+				raw := `{"model":"` + compatibleStreamUsageModel + `","stream":true,` + input + test.options + `,"future_request_field":{"n":9007199254740993,"text":"\u0061"}}`
+				ctx := capabilitySelectionContext(t, path, raw, []*model.Channel{channel})
+				recorder := httptest.NewRecorder()
+				recordingContext, _ := gin.CreateTestContext(recorder)
+				ctx.Writer = recordingContext.Writer
+				ctx.Set("id", 1)
+				ctx.Set("token_id", 1)
+				ctx.Set("group_ratio", 1.0)
+				groupctx.SetRoutingGroup(ctx, "issue002", groupctx.RoutingGroupSourceUserGroup)
+				// 选路与结算使用相同的已授权分组。
+				model.ChannelGroup.Rule["issue002"] = model.ChannelGroup.Rule["default"]
+				model.ChannelGroup.ModelGroup[compatibleStreamUsageModel]["issue002"] = true
+				channel.Group = "issue002"
+				relayer := Path2Relay(ctx, path)
+				if err := relayer.setRequest(); err != nil {
+					t.Fatalf("relay decode: %v", err)
+				}
+				ctx.Set("is_stream", relayer.IsStream())
+				if err := relayer.setProvider(relayer.getOriginalModel()); err != nil {
+					t.Fatalf("select provider: %v", err)
+				}
+				if err := finalizeSelectedProviderRequest(relayer); err != nil {
+					t.Fatalf("finalize provider: %v", err)
+				}
+				apiErr, done := RelayHandler(relayer)
+				if !done {
+					t.Fatal("submitted stream may be retried")
+				}
+				if test.reject {
+					if apiErr == nil || apiErr.StatusCode != http.StatusUnprocessableEntity || apiErr.Code != "future_options" || apiErr.Param != "stream_options" {
+						t.Fatalf("upstream error changed: %+v", apiErr)
+					}
+					relayer.HandleJsonError(apiErr)
+				} else if apiErr != nil {
+					t.Fatalf("relay failed: %+v", apiErr)
+				}
+				calls, wire := transport.snapshot()
+				if calls != 1 {
+					t.Fatalf("provider calls=%d", calls)
+				}
+				var before, after map[string]json.RawMessage
+				_ = json.Unmarshal([]byte(raw), &before)
+				_ = json.Unmarshal(wire, &after)
+				if !bytes.Equal(before["future_request_field"], after["future_request_field"]) {
+					t.Fatalf("future request field changed: %s", wire)
+				}
+				if strings.HasPrefix(test.name, "future ") && test.name != "future obfuscation union" && !bytes.Equal(before["stream_options"], after["stream_options"]) {
+					t.Fatalf("future union changed: %s", wire)
+				}
+				if test.name == "future obfuscation union" {
+					var options map[string]json.RawMessage
+					_ = json.Unmarshal(after["stream_options"], &options)
+					if string(options["include_obfuscation"]) != `{"future":true}` {
+						t.Fatalf("future obfuscation changed: %s", wire)
+					}
+				}
+				delivered := recorder.Body.String()
+				if test.reject {
+					if recorder.Code != http.StatusUnprocessableEntity || !strings.Contains(delivered, `"future_error":{"kept":true}`) {
+						t.Fatalf("upstream error wire changed: status=%d body=%s", recorder.Code, delivered)
+					}
+				} else {
+					displayUsage := test.display && !test.omitUsage
+					if strings.Contains(delivered, `"usage":`) != displayUsage || strings.Contains(delivered, `"choices":[]`) != displayUsage ||
+						!strings.Contains(delivered, `"ok"`) || !strings.Contains(delivered, `"obfuscation":"content-padding"`) {
+						t.Fatalf("client display changed: %s", delivered)
+					}
+				}
+				wantCharge := 7
+				if test.omitUsage || test.reject {
+					wantCharge = 0
+				}
+				var user model.User
+				var token model.Token
+				if err := model.DB.First(&user, 1).Error; err != nil {
+					t.Fatal(err)
+				}
+				if err := model.DB.First(&token, 1).Error; err != nil {
+					t.Fatal(err)
+				}
+				if user.Quota != 100000-wantCharge || user.UsedQuota != wantCharge || token.RemainQuota != 100000-wantCharge || token.UsedQuota != wantCharge {
+					t.Fatalf("incorrect settlement: user=%+v token=%+v", user, token)
+				}
+				var logs []model.Log
+				if err := model.DB.Where("type = ?", model.LogTypeConsume).Find(&logs).Error; err != nil {
+					t.Fatal(err)
+				}
+				wantCount := 1
+				if wantCharge == 0 {
+					wantCount = 0
+				}
+				if len(logs) != wantCount || user.RequestCount != wantCount {
+					t.Fatalf("usage projection mismatch: logs=%+v requests=%d", logs, user.RequestCount)
+				}
+			})
+		}
+	}
+}
+
+func TestChatResponsesRejectsUnrepresentableStreamOptionsBeforeProviderWork(t *testing.T) {
+	for _, options := range []string{`["future"]`, `"future"`, `42`, `{"include_usage":"future"}`, `{"include_obfuscation":{"future":true}}`} {
+		t.Run(options, func(t *testing.T) {
+			channel := capabilitySelectionChannel(1, config.ChannelTypeOpenAI, "o3-pro")
+			ctx := capabilitySelectionContext(t, "/v1/chat/completions", `{"model":"o3-pro","stream":true,"messages":[{"role":"user","content":"hello"}],"stream_options":`+options+`}`, []*model.Channel{channel})
+			relayer := NewRelayChat(ctx)
+			if err := relayer.setRequest(); err != nil {
+				t.Fatalf("native envelope decoding rejected upstream-owned options: %v", err)
+			}
+			if err := relayer.setProvider(relayer.getOriginalModel()); err == nil {
+				t.Fatal("unrepresentable stream options passed channel capability assessment")
+			}
+		})
+	}
+}
+
+func TestStreamOptionsCandidateMatchesUpstreamRequest(t *testing.T) {
+	oldDisableTokenEncoders := config.DisableTokenEncoders
+	config.DisableTokenEncoders = true
+	t.Cleanup(func() { config.DisableTokenEncoders = oldDisableTokenEncoders })
+	for _, test := range []struct {
+		name, options, siblings, custom, wantOptions            string
+		channelType                                             int
+		allowExtra, accepted, unary, completion, upstreamReject bool
+	}{
+		{name: "typed future string", channelType: config.ChannelTypeDeepseek, options: `"future"`},
+		{name: "typed future include_usage", channelType: config.ChannelTypeDeepseek, options: `{"include_usage":{"future":true}}`},
+		{name: "typed future include_obfuscation", channelType: config.ChannelTypeDeepseek, options: `{"include_obfuscation":{"future":true}}`},
+		{name: "typed true", channelType: config.ChannelTypeDeepseek, options: `{"include_usage":true,"include_obfuscation":true}`, accepted: true, wantOptions: `{"include_usage":true,"include_obfuscation":true}`},
+		{name: "typed false", channelType: config.ChannelTypeDeepseek, options: `{"include_usage":false,"include_obfuscation":false}`, accepted: true, wantOptions: `{"include_usage":true,"include_obfuscation":false}`},
+		{name: "Groq extra option", channelType: config.ChannelTypeGroq, options: `{"vendor_option":9007199254740993}`, allowExtra: true, accepted: true, wantOptions: `{"vendor_option":9007199254740993}`},
+		{name: "Groq typed projection", channelType: config.ChannelTypeGroq, options: `{"vendor_option":true}`},
+		{name: "Baichuan extra option", channelType: config.ChannelTypeBaichuan, options: `{"vendor_option":9007199254740993}`, allowExtra: true, accepted: true, wantOptions: `{"vendor_option":9007199254740993}`},
+		{name: "Baichuan typed projection", channelType: config.ChannelTypeBaichuan, options: `{"vendor_option":true}`},
+		{name: "Moonshot unary extra option", channelType: config.ChannelTypeMoonshot, options: `{"vendor_option":9007199254740993}`, unary: true, allowExtra: true, accepted: true, wantOptions: `{"vendor_option":9007199254740993}`},
+		{name: "Moonshot streaming replaces options", channelType: config.ChannelTypeMoonshot, options: `{"vendor_option":true}`, allowExtra: true},
+		{name: "OpenRouter unary extra option", channelType: config.ChannelTypeOpenRouter, options: `{"vendor_option":9007199254740993}`, unary: true, allowExtra: true, accepted: true, wantOptions: `{"vendor_option":9007199254740993}`},
+		{name: "OpenRouter streaming replaces options", channelType: config.ChannelTypeOpenRouter, options: `{"vendor_option":true}`, allowExtra: true},
+		{name: "OpenAI unary Completion leaves validation upstream", channelType: config.ChannelTypeOpenAI, options: `{"include_usage":{"future":true}}`, unary: true, completion: true, upstreamReject: true},
+		{name: "typed unary Completion keeps DTO options", channelType: config.ChannelType360, options: `{"include_usage":true,"include_obfuscation":false}`, unary: true, accepted: true, wantOptions: `{"include_usage":true,"include_obfuscation":false}`},
+		{name: "typed unary Completion keeps extra options", channelType: config.ChannelType360, options: `{"include_usage":"future","extension":9007199254740993}`, unary: true, allowExtra: true, accepted: true, wantOptions: `{"include_usage":"future","extension":9007199254740993}`},
+		{name: "typed unary Completion defers union", channelType: config.ChannelType360, options: `{"include_usage":{"future":9007199254740993}}`, unary: true, accepted: true, wantOptions: `{"include_usage":{"future":9007199254740993}}`, siblings: `,"unregistered_extra":true`},
+		{name: "typed unary Completion preserves false and null", channelType: config.ChannelType360, options: `{"include_usage":false,"include_obfuscation":null}`, unary: true, accepted: true, wantOptions: `{"include_usage":false,"include_obfuscation":null}`},
+		{name: "typed unary Completion channel overlay", channelType: config.ChannelType360, options: `{"include_usage":false,"nested":9007199254740993}`, custom: `{"stream_options":{"from_channel":true}}`, unary: true, accepted: true, wantOptions: `{"include_usage":false,"nested":9007199254740993,"from_channel":true}`},
+		{name: "Mistral extra option", channelType: config.ChannelTypeMistral, options: `{"vendor_option":9007199254740993}`, allowExtra: true, accepted: true, wantOptions: `{"vendor_option":9007199254740993}`},
+		{name: "typed extra plus usage", channelType: config.ChannelTypeDeepseek, options: `{"include_usage":false,"vendor_option":9007199254740993}`, allowExtra: true, accepted: true, wantOptions: `{"include_usage":true,"vendor_option":9007199254740993}`},
+		{name: "typed exact field name", channelType: config.ChannelTypeDeepseek, options: `{"include_obfuscation":true}`, siblings: `,"STREAM_OPTIONS":{"include_obfuscation":false}`, accepted: true, wantOptions: `{"include_usage":true,"include_obfuscation":true}`},
+		{name: "Completion exact field name", channelType: config.ChannelType360, options: `{"include_usage":"future"}`, siblings: `,"STREAM_OPTIONS":{}`},
+		{name: "Completion projection", channelType: config.ChannelType360, options: `{"include_usage":"future"}`},
+		{name: "Completion extra option", channelType: config.ChannelType360, options: `{"include_usage":"future"}`, allowExtra: true, accepted: true, wantOptions: `{"include_usage":"future"}`},
+		{name: "Completion pre_add introduces union", channelType: config.ChannelType360, options: `{}`, custom: `{"pre_add":true,"overwrite":true,"stream_options":{"vendor_option":1}}`},
+		{name: "Completion pre_add removes union", channelType: config.ChannelType360, options: `{"include_usage":"future"}`, custom: `{"pre_add":true,"remove_params":["stream_options"]}`, accepted: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			compatibleStreamUsagePrepareBilling(t)
+			operation, path, input := "chat", "/v1/chat/completions", `"messages":[{"role":"user","content":"hello"}]`
+			if test.channelType == config.ChannelType360 || test.completion {
+				operation, path, input = "completion", "/v1/completions", `"prompt":"hello"`
+			}
+			transport := &compatibleStreamUsageExactCaptureTransport{operation: operation, reject: test.upstreamReject}
+			previousClient := requester.HTTPClient
+			requester.HTTPClient = &http.Client{Transport: transport}
+			t.Cleanup(func() { requester.HTTPClient = previousClient })
+			channel := capabilitySelectionChannel(1, test.channelType, compatibleStreamUsageModel)
+			channel.Key = "typed-provider-key"
+			if test.channelType != config.ChannelTypeOpenAI {
+				channel.BaseURL = stringPtr("https://upstream.example")
+			}
+			channel.AllowExtraBody = test.allowExtra
+			if test.custom != "" {
+				channel.CustomParameter = &test.custom
+			}
+			stream := "true"
+			if test.unary {
+				stream = "false"
+			}
+			raw := `{"model":"` + compatibleStreamUsageModel + `","stream":` + stream + `,` + input + `,"stream_options":` + test.options + test.siblings + `}`
+			ctx := capabilitySelectionContext(t, path, raw, []*model.Channel{channel})
+			recorder := httptest.NewRecorder()
+			recordingContext, _ := gin.CreateTestContext(recorder)
+			ctx.Writer = recordingContext.Writer
+			ctx.Set("id", 1)
+			ctx.Set("token_id", 1)
+			ctx.Set("group_ratio", 1.0)
+			groupctx.SetRoutingGroup(ctx, "issue002", groupctx.RoutingGroupSourceUserGroup)
+			model.ChannelGroup.Rule["issue002"] = model.ChannelGroup.Rule["default"]
+			model.ChannelGroup.ModelGroup[compatibleStreamUsageModel]["issue002"] = true
+			channel.Group = "issue002"
+
+			Relay(ctx)
+
+			calls, wire := transport.snapshot()
+			if test.upstreamReject {
+				if calls != 1 || recorder.Code != http.StatusUnprocessableEntity || !strings.Contains(recorder.Body.String(), `"future_error":{"kept":true}`) || !bytes.Equal(wire, []byte(raw)) {
+					t.Fatalf("非流式原生请求或上游错误被改写：calls=%d status=%d wire=%s body=%s", calls, recorder.Code, wire, recorder.Body.String())
+				}
+				return
+			}
+			if test.accepted {
+				if calls != 1 || recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"ok"`) {
+					t.Fatalf("expected upstream request failed or retried: calls=%d status=%d body=%s", calls, recorder.Code, recorder.Body.String())
+				}
+				var sent map[string]json.RawMessage
+				if err := json.Unmarshal(wire, &sent); err != nil {
+					t.Fatal(err)
+				}
+				if !test.allowExtra && sent["unregistered_extra"] != nil {
+					t.Fatalf("透传已知 stream_options 时带入了额外的顶层字段：%s", wire)
+				}
+				var got, want map[string]json.RawMessage
+				if options := sent["stream_options"]; len(options) != 0 {
+					if err := json.Unmarshal(options, &got); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if test.wantOptions != "" {
+					if err := json.Unmarshal([]byte(test.wantOptions), &want); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("上游 stream_options = %s，预期 %s", sent["stream_options"], test.wantOptions)
+				}
+				return
+			}
+			if calls != 0 || recorder.Code == http.StatusOK || !strings.Contains(recorder.Body.String(), unsupportedCapabilityCode) {
+				t.Fatalf("unrepresentable typed options executed or lost capability error: calls=%d status=%d body=%s", calls, recorder.Code, recorder.Body.String())
+			}
+			var user model.User
+			var token model.Token
+			if err := model.DB.First(&user, 1).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := model.DB.First(&token, 1).Error; err != nil {
+				t.Fatal(err)
+			}
+			var logs []model.Log
+			if err := model.DB.Where("type = ?", model.LogTypeConsume).Find(&logs).Error; err != nil {
+				t.Fatal(err)
+			}
+			if user.Quota != 100000 || user.UsedQuota != 0 || user.RequestCount != 0 || token.RemainQuota != 100000 || token.UsedQuota != 0 || len(logs) != 0 {
+				t.Fatalf("rejected typed options changed billing: user=%+v token=%+v logs=%+v", user, token, logs)
+			}
+		})
+	}
 }

@@ -191,6 +191,23 @@ func TestUnsupportedFieldSelectionIsStable(t *testing.T) {
 	}
 }
 
+func TestChatStreamUsageDisplay(t *testing.T) {
+	for _, tc := range []struct {
+		options string
+		want    bool
+	}{
+		{`{}`, false},
+		{`{"include_usage":null}`, false},
+		{`{"include_usage":false}`, false},
+		{`{"include_usage":true}`, true},
+	} {
+		req := mustRequest(t, DialectChat, `{"messages":[],"stream":true,"stream_options":`+tc.options+`}`)
+		if req.Context.IncludeUsage != tc.want {
+			t.Errorf("stream_options=%s，用量展示开关应为 %t", tc.options, tc.want)
+		}
+	}
+}
+
 func TestChatAccumulatedToolIndexMustMatchHistoryPosition(t *testing.T) {
 	base := `{"messages":[{"role":"assistant","tool_calls":[{"id":"a","type":"function","function":{"name":"f","arguments":"{}"}},{"id":"b","type":"function","function":{"name":"f","arguments":"{}"}}]}]}`
 	indexed := strings.ReplaceAll(strings.ReplaceAll(base, `"id":"a"`, `"index":0,"id":"a"`), `"id":"b"`, `"index":1,"id":"b"`)

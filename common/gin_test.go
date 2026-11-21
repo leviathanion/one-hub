@@ -13,6 +13,7 @@ import (
 
 	"one-api/common/logger"
 	"one-api/common/requestbody"
+	"one-api/types"
 
 	"github.com/gin-gonic/gin"
 )
@@ -310,5 +311,39 @@ func TestSetDecodedRequestStateTracksWireBodyAndResetsBodyMap(t *testing.T) {
 	}
 	if string(bodyBytes) != string(decodedBody) {
 		t.Fatalf("unexpected request body after decode state update: got %q want %q", bodyBytes, decodedBody)
+	}
+}
+
+func TestClientRequestsStreamUsageUsesImmutableEnvelope(t *testing.T) {
+	for _, test := range []struct {
+		body        string
+		want, known bool
+	}{
+		{`{}`, false, true},
+		{`null`, false, true},
+		{`{"stream_options":null}`, false, true},
+		{`{"stream_options":{"include_usage":true,"future":123}}`, true, true},
+		{`{"STREAM_OPTIONS":{"include_usage":true}}`, false, true},
+		{`{"stream_options":{"INCLUDE_USAGE":true}}`, false, true},
+		{`{"stream_options":{"include_usage":true,"INCLUDE_USAGE":false}}`, true, true},
+		{`{"stream_options":{"include_usage":true},"STREAM_OPTIONS":{"include_usage":false}}`, true, true},
+		{`{"stream_options":{"include_usage":false}}`, false, true},
+		{`{"stream_options":{"include_usage":"true"}}`, false, false},
+		{`{"stream_options":{"include_usage":1}}`, false, false},
+		{`{"stream_options":{"include_usage":null}}`, false, true},
+		{`{"stream_options":true}`, false, false},
+		{`{"stream_options":[{"include_usage":true}]}`, false, false},
+	} {
+		t.Run(test.body, func(t *testing.T) {
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			SetReusableRequestBody(ctx, []byte(test.body))
+			SetReusableRequestBody(ctx, []byte(`{"stream_options":{"include_usage":true}}`))
+			if got, known := ClientStreamUsagePreference(ctx, &types.StreamOptions{IncludeUsage: !test.want}); got != test.want || known != test.known {
+				t.Fatalf("客户端用量展示偏好错误：enabled=%v known=%v，期望 enabled=%v known=%v", got, known, test.want, test.known)
+			}
+		})
+	}
+	if !ClientRequestsStreamUsage(nil, &types.StreamOptions{IncludeUsage: true}) || ClientRequestsStreamUsage(nil, nil) || ClientRequestsStreamUsage(nil, &types.StreamOptions{}) {
+		t.Fatal("内部无 envelope 调用未遵循 typed fallback")
 	}
 }

@@ -137,14 +137,8 @@ func validateChatToResponsesRepresentability(request *types.ChatCompletionReques
 	if err := validateChatReasoningToResponsesRepresentability(fields["reasoning"]); err != nil {
 		return err
 	}
-	if raw, ok := fields["stream_options"]; ok && !isJSONNull(raw) {
-		var streamOptions map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &streamOptions); err != nil {
-			return newCapabilityGateError("stream_options", "stream_options cannot be represented by the selected Responses adapter")
-		}
-		if field, ok := firstMeaningfulUnexpectedField(streamOptions, map[string]struct{}{"include_usage": {}}); ok {
-			return newCapabilityGateError("stream_options", fmt.Sprintf("stream_options.%s cannot be represented by the selected Responses adapter", field))
-		}
+	if err := providersBase.ValidateChatStreamOptionsProjection(fields["stream_options"]); err != nil {
+		return providerCapabilityGateError(err)
 	}
 	if err := validateChatMessagesToResponsesRepresentability(fields["messages"]); err != nil {
 		return err
@@ -807,7 +801,7 @@ func effectiveChatRequestForChannel(channel *model.Channel, canonicalModel strin
 		return nil, nil, err
 	}
 	effective := &types.ChatCompletionRequest{}
-	if err := json.Unmarshal(encoded, effective); err != nil {
+	if err := decodeChatRequestProjection(encoded, effective); err != nil {
 		return nil, nil, err
 	}
 	effectiveFields := make(map[string]json.RawMessage)
@@ -918,6 +912,11 @@ func validateResponsesCrossProtocolAdapterRepresentability(channel *model.Channe
 	}
 	if err := validateOnlyChatEffectiveRequest(channel, effectiveChat); err != nil {
 		return err
+	}
+	// Responses → Chat 最终重新编码 typed 请求；即使渠道允许额外字段，
+	// 也没有可供透传的原始 Chat body。
+	if err := providersBase.ValidateChatStreamOptionsProjection(effectiveChatFields["stream_options"], "include_obfuscation"); err != nil {
+		return providerCapabilityGateError(err)
 	}
 	if _, err := providers.AssessChatRequest(channel, mappedModel, effectiveChat, effectiveChatFields); err != nil {
 		return providerCapabilityGateError(err)
