@@ -1841,14 +1841,17 @@ func ConvertResponsesStatusToChat(status string) string {
 	}
 }
 
-func ConvertChatStatusToResponses(status string) string {
-	switch status {
-	case FinishReasonContentFilter:
-		return ResponseStatusFailed
+// ChatFinishReasonToResponses 同时保留终态及其可表达的不完整原因。
+func ChatFinishReasonToResponses(reason string) (status string, incomplete *IncompleteDetail, known bool) {
+	switch reason {
 	case FinishReasonLength:
-		return ResponseStatusIncomplete
+		return ResponseStatusIncomplete, &IncompleteDetail{Reason: "max_output_tokens"}, true
+	case FinishReasonContentFilter:
+		return ResponseStatusIncomplete, &IncompleteDetail{Reason: "content_filter"}, true
+	case FinishReasonStop, FinishReasonToolCalls, FinishReasonFunctionCall:
+		return ResponseStatusCompleted, nil, true
 	default:
-		return ResponseStatusCompleted
+		return ResponseStatusCompleted, nil, false
 	}
 }
 
@@ -1894,11 +1897,11 @@ func (cc *ChatCompletionResponse) ToResponses(request *OpenAIResponsesRequest) *
 		Tools:                request.Tools,
 	}
 
-	status := ResponseStatusCompleted
+	res.Status = ResponseStatusCompleted
 
 	outputs := make([]ResponsesOutput, 0, len(cc.Choices))
 	for _, choice := range cc.Choices {
-		status = ConvertChatStatusToResponses(choice.FinishReason)
+		res.Status, res.IncompleteDetail, _ = ChatFinishReasonToResponses(choice.FinishReason)
 
 		// Chat responses may carry assistant content and tool calls together.
 		// finish_reason describes why generation stopped; it is not a union tag.
@@ -1939,7 +1942,7 @@ func (cc *ChatCompletionResponse) ToResponses(request *OpenAIResponsesRequest) *
 					Type:    InputTypeMessage,
 					ID:      fmt.Sprintf("msg_%s", utils.GetRandomString(48)),
 					Role:    ChatMessageRoleAssistant,
-					Status:  status,
+					Status:  res.Status,
 					Content: content,
 				})
 			}
@@ -1974,7 +1977,6 @@ func (cc *ChatCompletionResponse) ToResponses(request *OpenAIResponsesRequest) *
 		}
 	}
 
-	res.Status = status
 	res.Output = outputs
 
 	return res

@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bytedance/gopkg/util/gopool"
@@ -92,6 +93,8 @@ type streamReader[T streamable] struct {
 	finishOnce  sync.Once
 	readContext context.Context
 	readEnded   context.CancelCauseFunc
+
+	handlerStopped atomic.Bool
 }
 
 type StreamReadOptions struct {
@@ -227,11 +230,15 @@ func (stream *streamReader[T]) deliverLine(rawLine []byte) bool {
 	} else if stream.handlerPrefix != nil {
 		stream.handlerPrefix(&rawLine, stream.DataChan, stream.ErrChan)
 	}
+	if bytes.Equal(rawLine, StreamClosed) {
+		stream.handlerStopped.Store(true)
+		return false
+	}
 	select {
 	case <-streamDone(stream):
 		return false
 	default:
-		return !bytes.Equal(rawLine, StreamClosed)
+		return true
 	}
 }
 
@@ -355,6 +362,17 @@ func StreamReadContext[T streamable](stream StreamReaderInterface[T]) context.Co
 		return source.ReadContext()
 	}
 	return nil
+}
+
+// StreamStoppedByHandler 在 drain 后区分处理器显式结束与传输 EOF。
+// 该事实本身不表示成功；错误仍由调用方从错误通道读取。
+func StreamStoppedByHandler[T streamable](stream StreamReaderInterface[T]) bool {
+	source, ok := stream.(interface{ stoppedByHandler() bool })
+	return ok && source.stoppedByHandler()
+}
+
+func (stream *streamReader[T]) stoppedByHandler() bool {
+	return stream.handlerStopped.Load()
 }
 
 func (stream *streamReader[T]) CloseAndDrain() {

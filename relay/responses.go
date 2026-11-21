@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"one-api/common"
 	"one-api/common/logger"
@@ -697,7 +698,7 @@ func (r *relayResponses) chatToResponseStreamClient(stream requester.StreamReade
 	defer requester.CloseAndDrainStream(stream)
 	streamWriter := relay_util.NewBufferedStreamWriter(r.c.Writer, 0)
 	defer streamWriter.Close()
-	var isFirstResponse bool
+	var isFirstResponse, sawDone bool
 
 	credentials := requestctx.ProviderCredentials(r.c)
 	writeEvent := func(event string, payload []byte) error {
@@ -729,13 +730,16 @@ func (r *relayResponses) chatToResponseStreamClient(stream requester.StreamReade
 		if r.c.Request.Context().Err() != nil {
 			return responsesStreamClientCanceledError()
 		}
+		if sawDone {
+			return nil
+		}
 		if !isFirstResponse {
 			firstResponseTime = time.Now()
 			isFirstResponse = true
 		}
 		if rawSSEEvents {
 			payload, hasData := commonresponses.SSEDataPayload(data)
-			if !hasData || strings.TrimSpace(payload) == "" || strings.TrimSpace(payload) == "[DONE]" {
+			if !hasData || strings.TrimSpace(payload) == "" {
 				return nil
 			}
 			if providerErr := runtimesession.OpenAIErrorEnvelopeFromPayload([]byte(payload)); providerErr != nil {
@@ -751,35 +755,43 @@ func (r *relayResponses) chatToResponseStreamClient(stream requester.StreamReade
 			data = payload
 		}
 
+		if strings.TrimSpace(data) == "[DONE]" {
+			sawDone = true
+			return nil
+		}
 		if err := converter.ProcessStreamData(data); err != nil {
 			return streamFailure(err, relay_util.ResponsesStreamFailureCode(err))
 		}
 		return nil
 	}
 
-	handleEOF := func() error {
-		// EOF/terminal has been dequeued, but the producer may still be returning
-		// from its handler. Drain it before the converter reads provider-owned usage.
+	handleEOF := func(sourceErr error) *types.OpenAIErrorWithStatusCode {
+		// 部分 typed handler 把来源终止标记转换成 EOF 并显式关闭；
+		// 等处理器返回后读取交付事实和最终用量。
 		requester.CloseAndDrainStream(stream)
-		return converter.ProcessStreamData("[DONE]")
+		handlerEOF := !rawSSEEvents && sourceErr == io.EOF && requester.StreamStoppedByHandler(stream)
+		if err := converter.EndStream(sawDone || handlerEOF); err != nil {
+			return streamFailure(err, relay_util.ResponsesStreamFailureCode(err))
+		}
+		return nil
 	}
 
-	handleError := func(err error) error {
+	handleError := func(err error) *types.OpenAIErrorWithStatusCode {
 		if isStreamTerminalEOF(err) {
-			return handleEOF()
+			return handleEOF(err)
 		}
 		logger.LogError(r.c.Request.Context(), "Stream err:"+err.Error())
 		select {
 		case <-r.c.Request.Context().Done():
 		default:
 			if writeErr := converter.ProcessStreamError(); writeErr != nil {
-				return writeErr
+				return streamFailure(writeErr, "stream_read_failed")
 			}
 			if r.c.Writer.Written() {
 				r.c.Set(responsesStreamErrorAlreadyRenderedContextKey, true)
 			}
 		}
-		return err
+		return streamFailure(err, "stream_read_failed")
 	}
 
 	for dataOpen || errOpen {
@@ -817,21 +829,13 @@ func (r *relayResponses) chatToResponseStreamClient(stream requester.StreamReade
 				errChan = nil
 				continue
 			}
-			if failure := handleError(err); failure != nil {
-				code := "stream_read_failed"
-				if isStreamTerminalEOF(err) {
-					code = relay_util.ResponsesStreamFailureCode(failure)
-				}
-				return firstResponseTime, converter.FinalResponse(), streamFailure(failure, code)
-			}
-			return firstResponseTime, converter.FinalResponse(), nil
+			failure := handleError(err)
+			return firstResponseTime, converter.FinalResponse(), failure
 		}
 	}
 
-	if err := handleEOF(); err != nil {
-		return firstResponseTime, converter.FinalResponse(), streamFailure(err, relay_util.ResponsesStreamFailureCode(err))
-	}
-	return firstResponseTime, converter.FinalResponse(), nil
+	failure := handleEOF(nil)
+	return firstResponseTime, converter.FinalResponse(), failure
 }
 
 type responsesOperation int

@@ -8,6 +8,33 @@ import (
 	"testing"
 )
 
+func TestChatToResponsesPreservesFinishReason(t *testing.T) {
+	for _, test := range []struct{ finish, status, reason string }{
+		{FinishReasonStop, ResponseStatusCompleted, ""},
+		{FinishReasonToolCalls, ResponseStatusCompleted, ""},
+		{FinishReasonLength, ResponseStatusIncomplete, "max_output_tokens"},
+		{FinishReasonContentFilter, ResponseStatusIncomplete, "content_filter"},
+	} {
+		t.Run(test.finish, func(t *testing.T) {
+			source := &ChatCompletionResponse{Choices: []ChatCompletionChoice{{
+				Message:      ChatCompletionMessage{Role: ChatMessageRoleAssistant, Content: "text"},
+				FinishReason: test.finish,
+			}}}
+			got := source.ToResponses(&OpenAIResponsesRequest{})
+			if got.Status != test.status || len(got.Output) != 1 || got.Output[0].Status != test.status {
+				t.Fatalf("终态与消息项状态不符：%+v", got)
+			}
+			if test.reason == "" {
+				if got.IncompleteDetail != nil {
+					t.Fatalf("正常完成却携带中断原因：%+v", got.IncompleteDetail)
+				}
+			} else if got.IncompleteDetail == nil || got.IncompleteDetail.Reason != test.reason {
+				t.Fatalf("停止原因丢失：%+v", got.IncompleteDetail)
+			}
+		})
+	}
+}
+
 func TestSummaryResponsesListUnmarshalSupportsArrayAndObject(t *testing.T) {
 	testCases := []struct {
 		name string

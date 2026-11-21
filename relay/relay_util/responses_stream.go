@@ -30,7 +30,7 @@ type OpenAIResponsesStreamConverter struct {
 	isTerminal        bool
 	terminalErr       error
 	writeEvent        func(string, []byte) error
-	nowStatus         string
+	finishStatus      string
 	lastToolCallIndex int
 	usage             *types.Usage
 	partTextBuilder   strings.Builder
@@ -109,8 +109,7 @@ func (converter *OpenAIResponsesStreamConverter) ProcessStreamData(jsonStr strin
 		return converter.terminalErr
 	}
 	if jsonStr == "[DONE]" {
-		converter.finalizeStream()
-		return converter.terminalErr
+		return converter.EndStream(true)
 	}
 	incomingBytes := int64(len(jsonStr))
 	if incomingBytes > converter.maxProcessedBytes-converter.processedBytes {
@@ -243,9 +242,11 @@ func (converter *OpenAIResponsesStreamConverter) ProcessStreamError() error {
 // 处理choices
 func (converter *OpenAIResponsesStreamConverter) processChoices(choices []types.ChatCompletionStreamChoice) {
 	for _, choice := range choices {
-		nowStatus, ok := choice.FinishReason.(string)
-		if ok {
-			converter.nowStatus = types.ConvertChatStatusToResponses(nowStatus)
+		if reason, ok := choice.FinishReason.(string); ok {
+			if status, detail, known := types.ChatFinishReasonToResponses(reason); known {
+				converter.finishStatus = status
+				converter.responses.IncompleteDetail = detail
+			}
 		}
 
 		if isEmptyChoiceDelta(&choice) {
@@ -339,15 +340,14 @@ func (converter *OpenAIResponsesStreamConverter) done() {
 	response := converter.buildStreamResponse("response.output_item.done")
 	response.OutputIndex = &converter.outputIndex
 
-	converter.item.Status = converter.nowStatus
+	converter.item.Status = converter.finishStatus
+	if converter.item.Status == "" {
+		converter.item.Status = types.ResponseStatusCompleted
+	}
 	if converter.lastResponseType == types.InputTypeMessage {
 		converter.item.Content = converter.content
 	}
 	response.Item = converter.item
-
-	if converter.item.Status == "" {
-		converter.item.Status = types.ResponseStatusCompleted
-	}
 
 	converter.responses.Output = append(converter.responses.Output, *converter.item)
 
@@ -542,30 +542,28 @@ func (converter *OpenAIResponsesStreamConverter) addSummary() {
 	})
 }
 
-// 输出最终的数据
-func (converter *OpenAIResponsesStreamConverter) finalizeStream() {
-	if converter == nil || converter.isTerminal {
-		return
+// EndStream 在来源结束后收尾，以保留 finish_reason 之后到达的用量。
+func (converter *OpenAIResponsesStreamConverter) EndStream(sourceTerminal bool) error {
+	if converter.isTerminal {
+		return converter.terminalErr
+	}
+	if converter.finishStatus == "" {
+		if !sourceTerminal {
+			return converter.sendError("invalid_provider_response", "stream interrupted", requester.ErrStreamProtocolTerminalMissing)
+		}
+		converter.finishStatus = types.ResponseStatusCompleted
 	}
 	if converter.item != nil {
 		converter.done()
 	}
 
 	respType := "response.completed"
-	finalStatus := converter.nowStatus
-
-	switch finalStatus {
-	case types.ResponseStatusFailed:
-		respType = "response.failed"
-	case types.ResponseStatusIncomplete:
+	if converter.finishStatus == types.ResponseStatusIncomplete {
 		respType = "response.incomplete"
-	default:
-		finalStatus = types.ResponseStatusCompleted
 	}
-
 	response := converter.buildStreamResponse(respType)
 	response.Response = converter.responses
-	response.Response.Status = finalStatus
+	response.Response.Status = converter.finishStatus
 
 	if converter.usage != nil && converter.usage.HasProviderUsage() {
 		response.Response.Usage = converter.usage.ToResponsesUsage()
@@ -573,6 +571,7 @@ func (converter *OpenAIResponsesStreamConverter) finalizeStream() {
 	converter.isTerminal = true
 	converter.sendStreamEvent(response, respType)
 	converter.isCompleted = converter.terminalErr == nil
+	return converter.terminalErr
 }
 
 func (converter *OpenAIResponsesStreamConverter) FinalResponse() *types.OpenAIResponsesResponses {

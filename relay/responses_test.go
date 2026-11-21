@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"one-api/common"
@@ -1206,14 +1207,14 @@ func TestRelayResponsesSetRequestAndCompactSuccessBranches(t *testing.T) {
 	close(closedStream.dataChan)
 	close(closedStream.errChan)
 	firstResponseTime, finalResponse, errWithCode := streamRelay.chatToResponseStreamClient(closedStream)
-	if errWithCode != nil {
-		t.Fatalf("expected closed response stream to finish without error, got %v", errWithCode.Message)
+	if errWithCode == nil || errWithCode.Code != "invalid_provider_response" {
+		t.Fatalf("无终态来源关闭时应报告转换失败：%+v", errWithCode)
 	}
 	if !firstResponseTime.IsZero() {
 		t.Fatalf("expected closed response stream to return zero first response time, got %v", firstResponseTime)
 	}
-	if finalResponse == nil || finalResponse.Status != types.ResponseStatusCompleted {
-		t.Fatalf("expected closed response stream to process terminal response, got %#v", finalResponse)
+	if finalResponse != nil || strings.Count(streamRecorder.Body.String(), "event: error\n") != 1 {
+		t.Fatalf("无终态来源关闭时不应合成成功结果：%+v %s", finalResponse, streamRecorder.Body.String())
 	}
 }
 
@@ -1420,6 +1421,81 @@ func TestRelayResponsesChatToResponsesStreamErrorIsClientSafe(t *testing.T) {
 	for _, expected := range []string{"secret-token", "query-secret", "provider.example", "url-secret", "session-secret", "sk-testSECRET123"} {
 		if !strings.Contains(streamLog, expected) {
 			t.Fatalf("系统日志丢失原始诊断 %q: %q", expected, streamLog)
+		}
+	}
+}
+
+func TestChatToResponsesRequiresSourceTerminalAndPreservesFinishReason(t *testing.T) {
+	const first = "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"text\"},\"finish_reason\":null}]}\n\n"
+	const usageTail = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"total_tokens\":7}}\n\n"
+	for _, rawSSE := range []bool{true, false} {
+		for _, test := range []struct {
+			name, finish, status, reason string
+			marker, strict, broken       bool
+		}{
+			{name: "only transport EOF"},
+			{name: "marker only", marker: true, status: types.ResponseStatusCompleted},
+			{name: "strict source requires marker despite finish", strict: true, finish: types.FinishReasonStop},
+			{name: "unrecognized reason before EOF", finish: "future"},
+			{name: "finish then usage and EOF", finish: types.FinishReasonStop, status: types.ResponseStatusCompleted},
+			{name: "length and marker", finish: types.FinishReasonLength, marker: true, status: types.ResponseStatusIncomplete, reason: "max_output_tokens"},
+			{name: "filter and marker", finish: types.FinishReasonContentFilter, marker: true, status: types.ResponseStatusIncomplete, reason: "content_filter"},
+			{name: "broken body after finish", finish: types.FinishReasonStop, broken: true},
+		} {
+			t.Run(fmt.Sprintf("raw=%v/%s", rawSSE, test.name), func(t *testing.T) {
+				wire := first
+				if test.finish != "" {
+					wire += fmt.Sprintf("data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":%q}]}\n\n", test.finish)
+				}
+				wire += usageTail
+				if test.marker {
+					wire += "data: [DONE]\n\n"
+				}
+				var source io.Reader = strings.NewReader(wire)
+				if test.broken {
+					source = io.MultiReader(source, iotest.ErrReader(io.ErrUnexpectedEOF))
+				}
+
+				usage := &types.Usage{}
+				handler := &openai.OpenAIStreamHandler{Usage: usage}
+				resp := &http.Response{Body: io.NopCloser(source)}
+				opts := requester.StreamReadOptions{RequireProtocolTerminal: test.strict}
+				var stream requester.StreamReaderInterface[string]
+				var apiErr *types.OpenAIErrorWithStatusCode
+				if rawSSE {
+					stream, apiErr = requester.RequestRawSSEEventStreamWithEmitterOptions(nil, resp, handler.HandleChatConversionSSE, opts)
+				} else {
+					stream, apiErr = requester.RequestStreamWithOptions(nil, resp, handler.HandlerChatStream, opts)
+				}
+				if apiErr != nil {
+					t.Fatal(apiErr)
+				}
+				rec := httptest.NewRecorder()
+				ctx, _ := gin.CreateTestContext(rec)
+				enableResponsesTestDeadline(ctx)
+				ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+				r := &relayResponses{relayBase: relayBase{c: ctx, provider: &compatibleResponsesChatProvider{
+					BaseProvider: providersBase.BaseProvider{Channel: &model.Channel{}, Usage: usage},
+				}}}
+				_, final, apiErr := r.chatToResponseStreamClient(stream)
+				output := rec.Body.String()
+				if !strings.Contains(output, "event: response.output_text.delta\n") || !usage.HasProviderBaseUsage() || usage.TotalTokens != 7 {
+					t.Fatalf("收尾前的正文或用量丢失：%+v %s", usage, output)
+				}
+				if test.status == "" {
+					if apiErr == nil || final != nil || strings.Count(output, "event: error\n") != 1 || strings.Contains(output, "event: response.completed\n") {
+						t.Fatalf("异常结束的流生成了错误的终态：%+v %+v %s", apiErr, final, output)
+					}
+					return
+				}
+				if apiErr != nil || final == nil || final.Status != test.status || final.Usage == nil || final.Usage.TotalTokens != 7 ||
+					strings.Count(output, "event: response."+test.status+"\n") != 1 || strings.Contains(output, "event: error\n") {
+					t.Fatalf("终态错误或尾部用量丢失：%+v %+v %s", apiErr, final, output)
+				}
+				if test.reason != "" && (final.IncompleteDetail == nil || final.IncompleteDetail.Reason != test.reason) {
+					t.Fatalf("不完整原因丢失：%+v", final.IncompleteDetail)
+				}
+			})
 		}
 	}
 }
@@ -1996,8 +2072,9 @@ func TestProviderRedactionChatToResponsesPreservesBody(t *testing.T) {
 			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 			requestctx.SetProviderCredentials(ctx, []string{"provider-secret-12345"})
 			r := &relayResponses{relayBase: relayBase{c: ctx, provider: &compatibleResponsesChatProvider{BaseProvider: providersBase.BaseProvider{Channel: &model.Channel{}, Usage: &types.Usage{}}}}, responsesRequest: types.OpenAIResponsesRequest{Model: "gpt-5"}}
-			stream := &fakeRelayStream{dataChan: make(chan string, 1), errChan: make(chan error)}
+			stream := &fakeRelayStream{dataChan: make(chan string, 2), errChan: make(chan error)}
 			stream.dataChan <- `{"id":"chat_1","choices":[{"index":0,"delta":` + test.delta + `}]}`
+			stream.dataChan <- "[DONE]"
 			close(stream.dataChan)
 			close(stream.errChan)
 			_, final, err := r.chatToResponseStreamClient(stream)
@@ -2027,8 +2104,9 @@ func TestProviderRedactionConvertedMetadataDoesNotBlockDelivery(t *testing.T) {
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	requestctx.SetProviderCredentials(ctx, []string{"provider-secret"})
 	r := &relayResponses{relayBase: relayBase{c: ctx, provider: &compatibleResponsesChatProvider{BaseProvider: providersBase.BaseProvider{Channel: &model.Channel{}, Usage: &types.Usage{}}}}, responsesRequest: types.OpenAIResponsesRequest{Metadata: map[string]string{"provider-secret": "value"}}}
-	stream := &fakeRelayStream{dataChan: make(chan string, 1), errChan: make(chan error)}
+	stream := &fakeRelayStream{dataChan: make(chan string, 2), errChan: make(chan error)}
 	stream.dataChan <- `{"id":"chat_1","choices":[{"index":0,"delta":{"content":"hello"}}]}`
+	stream.dataChan <- "[DONE]"
 	close(stream.dataChan)
 	close(stream.errChan)
 	_, final, err := r.chatToResponseStreamClient(stream)
