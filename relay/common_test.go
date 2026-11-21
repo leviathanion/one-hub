@@ -254,31 +254,33 @@ func TestExactChatSSEInBandErrorDoesNotAppendSuccessTerminal(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	logger.Logger = zap.NewNop()
 
-	handler := openai.OpenAIStreamHandler{Usage: &types.Usage{}}
-	stream, apiErr := requester.RequestRawSSEEventStreamWithEmitterOptions(nil, &http.Response{
-		Body: io.NopCloser(strings.NewReader("data: {\"error\":{\"message\":\"invalid field\",\"type\":\"invalid_request_error\",\"code\":\"invalid_value\"}}\n\n")),
-	}, handler.HandleExactChatSSE, requester.StreamReadOptions{RequireProtocolTerminal: true})
-	if apiErr != nil {
-		t.Fatalf("create exact chat stream: %+v", apiErr)
-	}
+	const errorFrame = "data: {\"error\":{\"message\":\"invalid field\",\"type\":\"invalid_request_error\",\"code\":\"invalid_value\"}}\n\n"
+	for _, test := range []struct{ name, tail string }{
+		{"upstream EOF", ""},
+		{"upstream terminator", "data: [DONE]\n\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			wire := errorFrame + test.tail
+			handler := openai.OpenAIStreamHandler{Usage: &types.Usage{}}
+			stream, apiErr := requester.RequestRawSSEEventStreamWithEmitterOptions(nil, &http.Response{
+				Body: io.NopCloser(strings.NewReader(wire)),
+			}, handler.HandleExactChatSSE, requester.StreamReadOptions{})
+			if apiErr != nil {
+				t.Fatalf("创建原生 Chat 流失败：%+v", apiErr)
+			}
 
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	if _, apiErr := responseStreamClient(ctx, stream, func() string {
-		return `{"id":"synthetic-usage"}`
-	}); apiErr == nil || apiErr.Code != "invalid_value" {
-		t.Fatalf("expected exact in-band provider error fact, got %+v", apiErr)
-	}
-
-	body := recorder.Body.String()
-	if !strings.Contains(body, `"code":"invalid_value"`) {
-		t.Fatalf("expected exact in-band error to reach the client, got %q", body)
-	}
-	for _, unexpected := range []string{"synthetic-usage", "data: [DONE]"} {
-		if strings.Contains(body, unexpected) {
-			t.Fatalf("exact in-band error was followed by a success terminal %q: %q", unexpected, body)
-		}
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			if _, apiErr := responseStreamClient(ctx, stream, func() string {
+				return `{"id":"synthetic-usage"}`
+			}); apiErr == nil || apiErr.Code != "invalid_value" || !ctx.GetBool(streamErrorAlreadyRenderedContextKey) {
+				t.Fatalf("流内错误未标记为已交付：%+v", apiErr)
+			}
+			if got := recorder.Body.String(); got != wire {
+				t.Fatalf("上游错误或终止标记改变：got=%q want=%q", got, wire)
+			}
+		})
 	}
 }
 

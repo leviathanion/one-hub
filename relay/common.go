@@ -771,7 +771,6 @@ func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface
 	defer streamWriter.Close()
 
 	var isFirstResponse bool
-	var sawProviderInBandError bool
 	var providerInBandError *types.OpenAIErrorWithStatusCode
 	var sawProviderData bool
 	dataOpen := dataChan != nil
@@ -796,7 +795,6 @@ func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface
 				apiErr = runtimesession.ProviderAPIErrorFromPayload(rawPayload)
 			}
 			if apiErr != nil {
-				sawProviderInBandError = true
 				if providerInBandError == nil {
 					providerInBandError = apiErr
 				}
@@ -829,6 +827,9 @@ func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface
 			return c.Request.Context().Err()
 		default:
 			_, err := streamWriter.WriteString(streamData)
+			if err == nil && apiErr != nil {
+				c.Set(streamErrorAlreadyRenderedContextKey, true)
+			}
 			return err
 		}
 	}
@@ -837,7 +838,7 @@ func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface
 		if rawSSEEvents {
 			return nil
 		}
-		if sawProviderInBandError {
+		if providerInBandError != nil {
 			return nil
 		}
 		if endHandler != nil {
@@ -868,7 +869,6 @@ func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface
 		}
 		failure := *providerInBandError
 		failure.UpstreamAccepted = failure.UpstreamAccepted || sawProviderData
-		c.Set(streamErrorAlreadyRenderedContextKey, true)
 		return &failure
 	}
 
@@ -876,8 +876,7 @@ func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface
 		if isStreamTerminalEOF(err) {
 			return handleEOF()
 		}
-		if sawProviderInBandError {
-			c.Set(streamErrorAlreadyRenderedContextKey, true)
+		if providerInBandError != nil {
 			return nil
 		}
 		errPayload := map[string]any{
@@ -938,6 +937,10 @@ func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface
 	}
 
 	for dataOpen || errOpen {
+		// 原生流继续交付上游实际发送的事件。转换流仍按错误结束。
+		if !rawSSEEvents && providerInBandError != nil {
+			return firstResponseTime, renderedProviderInBandError()
+		}
 		if dataOpen {
 			select {
 			case data, ok := <-dataChan:
@@ -948,9 +951,6 @@ func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface
 				}
 				if err := handleData(data); err != nil {
 					return firstResponseTime, writeFailure(err)
-				}
-				if inBandErr := renderedProviderInBandError(); inBandErr != nil {
-					return firstResponseTime, inBandErr
 				}
 				continue
 			default:
@@ -966,9 +966,6 @@ func responseStreamClient(c *gin.Context, stream requester.StreamReaderInterface
 			}
 			if err := handleData(data); err != nil {
 				return firstResponseTime, writeFailure(err)
-			}
-			if inBandErr := renderedProviderInBandError(); inBandErr != nil {
-				return firstResponseTime, inBandErr
 			}
 		case err, ok := <-errChan:
 			if !ok {
