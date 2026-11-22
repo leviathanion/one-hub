@@ -94,7 +94,10 @@ func (q *Quota) evaluateProviderUsageWithPolicy(usage *types.Usage, policy quota
 			q.addBillingDiagnostic("token_component_missing_evidence")
 			decision.Components = append(decision.Components, PriceComponentDecision{Name: "tokens", Status: tokenStatus})
 		} else {
-			promptUnits, completionUnits := q.getComputeTokenUnitsByUsageWithPrice(usage, policy, partitionAdjustment)
+			var promptUnits, completionUnits float64
+			if policy.price.Type != model.TimesPriceType {
+				promptUnits, completionUnits = q.getComputeTokenUnitsByUsageWithPrice(usage, policy, partitionAdjustment)
+			}
 			if promptUnits < 0 || completionUnits < 0 || math.IsNaN(promptUnits) || math.IsNaN(completionUnits) {
 				q.addBillingDiagnostic("token_partition_conflict")
 				decision.Components = append(decision.Components, PriceComponentDecision{Name: "tokens", Status: PriceComponentConflictingEvidence})

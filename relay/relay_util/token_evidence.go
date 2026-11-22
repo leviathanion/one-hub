@@ -20,11 +20,13 @@ type tokenPartitionAdjustment struct {
 // whose multiplier is one (or whose side has a zero effective price) cannot
 // change the charge.  A declared exhaustive partition may derive its missing
 // remainder only when all unknown buckets have the same multiplier.
+// 按次价跳过分区倍率计算，仍检查已声明分区与计费证据的一致性。
 func assessTokenEvidenceForPrice(usage *types.Usage, policy quotaPricePolicy) (PriceComponentStatus, tokenPartitionAdjustment) {
 	if usage == nil || !usage.HasProviderBaseUsage() {
 		return PriceComponentMissingEvidence, tokenPartitionAdjustment{}
 	}
 
+	timesPrice := policy.price.Type == model.TimesPriceType
 	required := normalizedTokenEvidenceKeys(usage.RequiredTokenExtraKeys)
 	requiredSet := make(map[string]bool, len(required))
 	for _, key := range required {
@@ -75,6 +77,9 @@ func assessTokenEvidenceForPrice(usage *types.Usage, policy quotaPricePolicy) (P
 			}
 			continue
 		}
+		if timesPrice {
+			continue
+		}
 
 		remaining := int64(baseTokens) - knownSum
 		ratio, sameRatio, ratioValid := missingTokenPartitionRatio(policy, missing)
@@ -116,6 +121,9 @@ func assessTokenEvidenceForPrice(usage *types.Usage, policy quotaPricePolicy) (P
 		// consistency check) failed.
 		if _, knownDimension := model.ExtraKeyIsPrompt[key]; !knownDimension {
 			return PriceComponentMissingEvidence, tokenPartitionAdjustment{}
+		}
+		if timesPrice {
+			continue
 		}
 		prompt := model.ExtraKeyIsPrompt[key]
 		ratio := policy.price.GetExtraRatio(key) * policy.rates.For(key, prompt)
