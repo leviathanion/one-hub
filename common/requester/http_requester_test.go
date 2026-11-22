@@ -226,6 +226,47 @@ func TestHandleErrorRespPreservesExactWirePaymentRequiredStatus(t *testing.T) {
 	}
 }
 
+func TestProviderGroupErrorPreservesNativeHTTPStatus(t *testing.T) {
+	const unavailable = `{"error":{"message":"当前分组 default 下对于模型 gpt-6-luna 无可用渠道","type":"one_hub_error","code":"one_hub_error"}}`
+	const rateLimited = `{"error":{"message":"当前分组上游负载已饱和，请稍后再试","type":"one_hub_error","code":"one_hub_error"}}`
+	requester := NewHTTPRequester("", func(resp *http.Response) *types.OpenAIError {
+		var envelope types.OpenAIErrorResponse
+		if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+			return nil
+		}
+		return &envelope.Error
+	})
+	for _, test := range []struct {
+		name, body         string
+		status, wantStatus int
+		replay             bool
+	}{
+		{"原生渠道不可用", unavailable, http.StatusServiceUnavailable, http.StatusServiceUnavailable, true},
+		{"原生限流", rateLimited, http.StatusTooManyRequests, http.StatusTooManyRequests, true},
+		{"旧分组错误映射", unavailable, http.StatusServiceUnavailable, http.StatusTooManyRequests, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := requester.handleFailureResponse(&http.Response{
+				StatusCode: test.status,
+				Body:       io.NopCloser(strings.NewReader(test.body)),
+			}, test.replay)
+			if got.StatusCode != test.wantStatus {
+				t.Errorf("HTTP 状态为 %d，期望 %d", got.StatusCode, test.wantStatus)
+			}
+			if got.UpstreamAmbiguous != (test.status == http.StatusServiceUnavailable) || got.ProviderRateLimited != (test.status == http.StatusTooManyRequests) {
+				t.Errorf("上游状态 %d 的执行事实不符，UpstreamAmbiguous=%t，ProviderRateLimited=%t", test.status, got.UpstreamAmbiguous, got.ProviderRateLimited)
+			}
+			wantBody := ""
+			if test.replay {
+				wantBody = test.body
+			}
+			if got.ReplayRawResponse != test.replay || string(got.RawBody) != wantBody {
+				t.Errorf("错误正文回放不符，ReplayRawResponse=%t，RawBody=%q", got.ReplayRawResponse, got.RawBody)
+			}
+		})
+	}
+}
+
 func TestHandleErrorRespSanitizesStatusOnlyAccountFailures(t *testing.T) {
 	for _, status := range []int{http.StatusUnauthorized, http.StatusProxyAuthRequired, http.StatusPaymentRequired} {
 		got := HandleErrorResp(&http.Response{

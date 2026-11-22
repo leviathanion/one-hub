@@ -130,13 +130,15 @@ func migrateCustomEndpointConfig(channel *Channel) (bool, error) {
 		if err != nil {
 			return false, fmt.Errorf("claude.base_url 无法迁移为有效上游地址")
 		}
-		oldURL := providerendpoint.CustomRequestURL(normalized, providerendpoint.DefaultMessagesURI)
+		// 使用旧版固定路径还原迁移前的 Claude 地址。
+		oldURL := providerendpoint.CustomRequestURL(normalized, "/v1/messages")
 		newBase := strings.TrimSpace(channel.GetBaseURL())
 		if newBase == "" {
 			newBase = providerendpoint.DefaultClaudeBaseURL
 		}
-		// 显式地址保持独立；继承渠道地址时，仅在原规范化会改变 wire 时固化完整地址。
-		if explicitBase || oldURL != providerendpoint.CustomRequestURL(newBase, providerendpoint.DefaultMessagesURI) {
+		definition, _ := providerendpoint.Find(providerendpoint.Messages)
+		// 显式地址保持独立。继承渠道地址时，仅在上游地址变化时保留旧地址。
+		if explicitBase || oldURL != providerendpoint.CustomRequestURL(newBase, definition.DefaultPath) {
 			setting.UpstreamURL = oldURL
 		}
 	}

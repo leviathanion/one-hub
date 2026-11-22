@@ -84,6 +84,40 @@ func TestUsageComponentsConfirmLegitimateZeroTokenEvidence(t *testing.T) {
 	}
 }
 
+func TestTimesPriceUsesBaseUsageWithoutDependingOnTokenPartitionRates(t *testing.T) {
+	quota := componentTestQuota(t)
+	audio, text := config.UsageExtraInputAudio, config.UsageExtraInputTextTokens
+	ratios := datatypes.NewJSONType(map[string]float64{audio: 2, text: 3})
+	useCurrentQuotaPrice(t, quota, model.Price{Type: model.TimesPriceType, Input: 2, ExtraRatios: &ratios})
+
+	for _, test := range []struct {
+		name        string
+		audioTokens int
+		assertion   string
+		status      PriceComponentStatus
+		charge      int64
+	}{
+		{name: "缺少仅影响 token 价格的分区", status: PriceComponentPriceable, charge: 2000},
+		{name: "已报告分区与输入总量矛盾", audioTokens: 101, status: PriceComponentConflictingEvidence},
+		{name: "缺少适配器要求的一致性证据", assertion: "claude_cache_creation_partition", status: PriceComponentMissingEvidence},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			usage := &types.Usage{PromptTokens: 100, CompletionTokens: 6, TotalTokens: 106}
+			if test.audioTokens > 0 {
+				usage.SetExtraTokens(audio, test.audioTokens)
+			}
+			usage.MarkProviderReported()
+			usage.RequireTokenExtraEvidence(audio, text, test.assertion)
+			usage.SetTokenExtraEvidenceGroups([]string{audio, text})
+
+			decision := quota.EvaluateProviderUsage(usage)
+			if decision.Confirm != (test.status == PriceComponentPriceable) || decision.FinalQuota != test.charge || componentStatuses(decision.Components)["tokens"] != test.status {
+				t.Fatalf("按次价结算结果不符，期望状态 %q、额度 %d，实际 %+v", test.status, test.charge, decision)
+			}
+		})
+	}
+}
+
 func TestUsageComponentsPriceProviderOperationCountForTimesPrice(t *testing.T) {
 	originalPricing := model.PricingInstance
 	model.PricingInstance = &model.Pricing{Prices: map[string]*model.Price{

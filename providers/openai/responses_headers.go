@@ -111,6 +111,17 @@ func (p *OpenAIProvider) filterRewrittenBodyDigests(inbound requestctx.HeaderSna
 	}
 }
 
+func (p *OpenAIProvider) applyNativeJSONRequestHeaders(headers http.Header, finalBody []byte, filterDigests bool) error {
+	if p.Context == nil || p.Context.Request == nil {
+		return nil
+	}
+	inbound := requestctx.NewHeaderSnapshot(p.Context.Request.Header)
+	if p.ProviderRawJSONReplay && filterDigests {
+		p.filterRewrittenBodyDigests(inbound, finalBody)
+	}
+	return p.applyOpenAIHTTPHeaders(headers, inbound)
+}
+
 func (p *OpenAIProvider) applyOpenAIHTTPHeaders(headers http.Header, inbound requestctx.HeaderSnapshot) error {
 	// Only an OpenAI channel is registered as exact-wire. Azure, custom and
 	// OpenAI-compatible adapters may forward the small business-header surface,

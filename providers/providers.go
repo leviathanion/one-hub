@@ -93,6 +93,10 @@ func (openAICompatibleProviderFactory) ValidateCompletionStreamOptions(channel *
 	return openai.ValidateCompletionStreamOptions(channel, modelName, raw)
 }
 
+func (openAICompatibleProviderFactory) AssessDecisions(channel *model.Channel) error {
+	return openai.OpenAIProviderFactory{}.AssessDecisions(channel)
+}
+
 func (openAICompatibleProviderFactory) AssessSpeechRequest(channel *model.Channel, request *types.SpeechAudioRequest) error {
 	return openai.AssessSpeechRequestForChannel(channel, request, channel.GetBaseURL())
 }

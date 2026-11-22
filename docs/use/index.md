@@ -108,6 +108,7 @@ curl --request POST \
 - [渠道额外参数](/use/channel-parameters)：补充、覆盖或删除请求参数，以及按模型配置和生效阶段
 - [价格更新](/use/prices_update)：当前价格目录更新与模型价格配置
 - [条件倍率配置](/use/pricing-rate-rules)：统一倍率、缓存例外及夜间／周末优惠配置
+- [Decisions API](/use/decisions)：原生决策接口的调用、渠道与计费配置
 - [Realtime 配置](/use/realtime): `/v1/realtime` WebSocket 配置项、Origin 白名单、安全策略
 - [ResponsesWS 配置](/use/responses-ws): `GET /v1/responses` WebSocket 容量控制、超时管理、缓冲区
 - [Codex 渠道](/use/Codex): Codex 渠道配置、全局缓存提示与原生 WebSocket / `/responses/compact` 用法
