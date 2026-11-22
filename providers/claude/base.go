@@ -53,9 +53,10 @@ type ClaudeProvider struct {
 }
 
 func getConfig() base.ProviderConfig {
+	definition, _ := providerendpoint.Find(providerendpoint.Messages)
 	return base.ProviderConfig{
 		BaseURL:         providerendpoint.DefaultClaudeBaseURL,
-		ChatCompletions: providerendpoint.DefaultMessagesURI,
+		ChatCompletions: definition.DefaultPath,
 		ModelList:       "/v1/models",
 	}
 }

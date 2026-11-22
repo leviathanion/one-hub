@@ -19,7 +19,6 @@ const (
 	Threads              = "openai.threads"
 	VectorStores         = "openai.vector_stores"
 	Messages             = "anthropic.messages"
-	DefaultMessagesURI   = "/v1/messages"
 	DefaultClaudeBaseURL = "https://api.anthropic.com"
 )
 
@@ -53,7 +52,7 @@ var definitions = []Definition{
 	{Assistants, "OpenAI Resources", "Assistants", "/v1/assistants", false, config.RelayModeUnknown},
 	{Threads, "OpenAI Resources", "Threads", "/v1/threads", false, config.RelayModeUnknown},
 	{VectorStores, "OpenAI Resources", "Vector Stores", "/v1/vector_stores", false, config.RelayModeUnknown},
-	{Messages, "Claude API", "Messages", DefaultMessagesURI, false, config.RelayModeUnknown},
+	{Messages, "Claude API", "Messages", "/v1/messages", false, config.RelayModeUnknown},
 }
 
 func Definitions() []Definition { return append([]Definition(nil), definitions...) }
