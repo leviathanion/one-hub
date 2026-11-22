@@ -848,10 +848,6 @@ func HandleErrorResp(resp *http.Response, toOpenAIError HttpErrorHandler, prefix
 			errorResponse := toOpenAIError(resp)
 
 			if errorResponse != nil && errorResponse.Message != "" {
-				if strings.HasPrefix(errorResponse.Message, "当前分组") {
-					openAIErrorWithStatusCode.StatusCode = http.StatusTooManyRequests
-				}
-
 				openAIErrorWithStatusCode.OpenAIError = *errorResponse
 				quotaExhausted := common.ProviderErrorIsQuotaExhausted(*errorResponse) ||
 					(!common.ProviderErrorIsRateLimited(*errorResponse) && strings.Contains(errorResponse.Message, "Your credit balance is too low"))
@@ -869,7 +865,7 @@ func HandleErrorResp(resp *http.Response, toOpenAIError HttpErrorHandler, prefix
 					}
 				}
 
-				if quotaExhausted && !replayOpenAIEnvelope {
+				if !replayOpenAIEnvelope && (quotaExhausted || strings.HasPrefix(errorResponse.Message, "当前分组")) {
 					openAIErrorWithStatusCode.StatusCode = http.StatusTooManyRequests
 				}
 				if prefixProviderError {
