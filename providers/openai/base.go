@@ -8,7 +8,6 @@ import (
 	"one-api/common"
 	"one-api/common/config"
 	"one-api/common/providerendpoint"
-	"one-api/common/requestctx"
 	"one-api/common/requester"
 	"one-api/model"
 	"one-api/types"
@@ -574,12 +573,9 @@ func (p *OpenAIProvider) getRequestTextBody(relayMode int, ModelName string, bui
 		_ = httpReq.Body.Close()
 		return nil, false, errWithCode
 	}
-	if nativeBody != nil && p.Context != nil && p.Context.Request != nil {
-		inbound := requestctx.NewHeaderSnapshot(p.Context.Request.Header)
-		if p.ProviderRawJSONReplay && (relayMode == config.RelayModeChatCompletions || relayMode == config.RelayModeCompletions) {
-			p.filterRewrittenBodyDigests(inbound, nativeBody)
-		}
-		if err := p.applyOpenAIHTTPHeaders(httpReq.Header, inbound); err != nil {
+	if nativeBody != nil {
+		filterDigests := relayMode == config.RelayModeChatCompletions || relayMode == config.RelayModeCompletions
+		if err := p.applyNativeJSONRequestHeaders(httpReq.Header, nativeBody, filterDigests); err != nil {
 			return nil, false, common.ErrorWrapperLocal(err, "invalid_request_header", http.StatusBadRequest)
 		}
 	}

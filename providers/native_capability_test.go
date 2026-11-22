@@ -8,6 +8,7 @@ import (
 	"gorm.io/datatypes"
 
 	"one-api/common/config"
+	"one-api/common/providerendpoint"
 	"one-api/model"
 	"one-api/providers/antigravity/wire"
 	"one-api/providers/base"
@@ -139,6 +140,47 @@ func TestChatStreamOptionsDistinguishesNativeWireFromConversion(t *testing.T) {
 				if err == nil {
 					t.Fatal("Moonshot typed 构造无法保留的选项不应通过能力检查")
 				}
+			}
+		})
+	}
+}
+
+func TestDecisionsRequiresNativeChannelOrEnabledCustomEndpoint(t *testing.T) {
+	customURL := "https://compatible.example"
+	regionalURL := "https://eu.api.openai.com"
+	channel := func(kind int) *model.Channel {
+		return &model.Channel{Type: kind, BaseURL: &customURL, Plugin: model.NewCustomEndpointPlugin()}
+	}
+	for _, tc := range []struct {
+		name      string
+		ch        *model.Channel
+		setting   any
+		supported bool
+	}{
+		{"official", &model.Channel{Type: config.ChannelTypeOpenAI}, nil, true},
+		{"openai region", &model.Channel{Type: config.ChannelTypeOpenAI, BaseURL: &regionalURL}, nil, false},
+		{"custom region", &model.Channel{Type: config.ChannelTypeCustom, BaseURL: &regionalURL, Plugin: model.NewCustomEndpointPlugin()}, map[string]any{"enabled": true}, false},
+		{"custom default", channel(config.ChannelTypeCustom), nil, false},
+		{"custom existing missing", &model.Channel{Type: config.ChannelTypeCustom, BaseURL: &customURL}, nil, false},
+		{"custom no base URL", &model.Channel{Type: config.ChannelTypeCustom, Plugin: model.NewCustomEndpointPlugin()}, map[string]any{"enabled": true}, false},
+		{"custom enabled", channel(config.ChannelTypeCustom), map[string]any{"enabled": true}, true},
+		{"custom regional override", channel(config.ChannelTypeCustom), map[string]any{"enabled": true, "upstream_url": regionalURL + "/v1/decisions"}, false},
+		{"custom malformed", channel(config.ChannelTypeCustom), map[string]any{"enabled": "true"}, false},
+		{"azure", channel(config.ChannelTypeAzure), nil, false},
+		{"azure v1", channel(config.ChannelTypeAzureV1), nil, false},
+		{"codex", channel(config.ChannelTypeCodex), nil, false},
+		{"gemini", channel(config.ChannelTypeGemini), map[string]any{"enabled": true}, false},
+		{"openai fallback", channel(-1973), map[string]any{"enabled": true}, false},
+		{"missing", nil, nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.setting != nil {
+				tc.ch.Plugin.Data()["endpoints"][providerendpoint.Decisions] = tc.setting
+			}
+			err := AssessDecisions(tc.ch)
+			var capErr *base.RequestCapabilityError
+			if (err == nil) != tc.supported || err != nil && (!errors.As(err, &capErr) || capErr.Param != "operation") {
+				t.Fatalf("accepted=%v err=%+v", tc.supported, err)
 			}
 		})
 	}

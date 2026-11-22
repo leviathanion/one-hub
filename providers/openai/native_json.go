@@ -205,7 +205,7 @@ func mergeProviderStreamUsage(body []byte) (patched []byte, enabled bool) {
 	var stream bool
 	var options []byte
 	var optionsAt int
-	insertAt := visitStreamOptionMembers(body, func(key string, at int, value []byte) {
+	insertAt := visitUniqueJSONObjectMembers(body, func(key string, at int, value []byte) {
 		switch key {
 		case "stream":
 			stream = bytes.Equal(value, []byte("true"))
@@ -230,7 +230,7 @@ func mergeProviderStreamUsage(body []byte) (patched []byte, enabled bool) {
 		var usage []byte
 		var usageAt int
 		replacement = `"include_usage":true`
-		insertAt = visitStreamOptionMembers(options, func(key string, at int, value []byte) {
+		insertAt = visitUniqueJSONObjectMembers(options, func(key string, at int, value []byte) {
 			replacement = `,"include_usage":true`
 			if key == "include_usage" {
 				usage, usageAt = value, at
@@ -260,7 +260,7 @@ func mergeProviderStreamUsage(body []byte) (patched []byte, enabled bool) {
 
 // 返回最后一个成员值后的插入位置，语法错误或当前层重名时返回 -1。
 // 只借用入参切片；未知成员内部的键和值完全由上游解释。
-func visitStreamOptionMembers(raw []byte, visit func(key string, at int, value []byte)) int {
+func visitUniqueJSONObjectMembers(raw []byte, visit func(key string, at int, value []byte)) int {
 	decoder := jsontext.NewDecoder(bytes.NewBuffer(raw), jsontext.AllowDuplicateNames(true))
 	if token, err := decoder.ReadToken(); err != nil || token.Kind() != '{' {
 		return -1

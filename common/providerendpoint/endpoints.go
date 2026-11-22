@@ -10,6 +10,7 @@ import (
 
 const (
 	Responses            = "openai.responses"
+	Decisions            = "openai.decisions"
 	Files                = "openai.files"
 	Uploads              = "openai.uploads"
 	Conversations        = "openai.conversations"
@@ -44,6 +45,7 @@ var definitions = []Definition{
 	{"openai.audio_transcriptions", "OpenAI API", "Audio Transcriptions", "/v1/audio/transcriptions", true, config.RelayModeAudioTranscription},
 	{"openai.audio_translations", "OpenAI API", "Audio Translations", "/v1/audio/translations", true, config.RelayModeAudioTranslation},
 	{Responses, "OpenAI API", "Responses", DefaultResponsesURI, true, config.RelayModeResponses},
+	{Decisions, "OpenAI API", "Decisions", "/v1/decisions", false, config.RelayModeUnknown},
 	{Files, "OpenAI Resources", "Files", "/v1/files", false, config.RelayModeUnknown},
 	{Uploads, "OpenAI Resources", "Uploads", "/v1/uploads", false, config.RelayModeUnknown},
 	{Conversations, "OpenAI Resources", "Conversations", "/v1/conversations", false, config.RelayModeUnknown},

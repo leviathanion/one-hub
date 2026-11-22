@@ -25,6 +25,10 @@ type completionRequestFactoryPolicy interface {
 	ValidateCompletionStreamOptions(channel *model.Channel, modelName string, raw []byte) error
 }
 
+type decisionsFactoryPolicy interface {
+	AssessDecisions(*model.Channel) error
+}
+
 type speechRequestFactoryPolicy interface {
 	AssessSpeechRequest(channel *model.Channel, request *types.SpeechAudioRequest) error
 }
@@ -242,6 +246,14 @@ func AssessCompletionStreamOptions(channel *model.Channel, modelName string, raw
 		return policy.ValidateCompletionStreamOptions(channel, modelName, raw)
 	}
 	return nil
+}
+
+// AssessDecisions 在创建 provider 前检查候选渠道声明的原生端点。
+func AssessDecisions(channel *model.Channel) error {
+	if policy, ok := providerFactoryForChannel(channel).(decisionsFactoryPolicy); ok {
+		return policy.AssessDecisions(channel)
+	}
+	return operationCapabilityError("selected channel does not implement Decisions")
 }
 
 // AssessEndpoint 检查无需协议转换的操作是否被自定义渠道显式启用。

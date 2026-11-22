@@ -2,6 +2,7 @@ package base
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"one-api/common/requestctx"
 	"one-api/common/requester"
@@ -49,6 +50,12 @@ type CompletionInterface interface {
 	ProviderInterface
 	CreateCompletion(request *types.CompletionRequest) (*types.CompletionResponse, *types.OpenAIErrorWithStatusCode)
 	CreateCompletionStream(request *types.CompletionRequest) (requester.StreamReaderInterface[string], *types.OpenAIErrorWithStatusCode)
+}
+
+// Decisions 使用原始 JSON 表达输入、问题和答案中的开放联合类型。
+type DecisionsInterface interface {
+	ProviderInterface
+	CreateDecision(modelName string, body json.RawMessage) (*types.ProviderRawJSONState, *types.OpenAIErrorWithStatusCode)
 }
 
 // 聊天接口

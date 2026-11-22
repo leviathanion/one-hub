@@ -20,6 +20,8 @@ lastUpdated: true
 
 接口目录覆盖原 `customize` 中的 11 个接口、Claude Messages，以及 Files、Uploads、Conversations、Batches、Fine Tuning、Assistants、Threads、Vector Stores 资源家族。2026-09-20 新增的资源条目默认关闭，已有 Custom 渠道需管理员显式启用；不重跑旧配置迁移或自动补开。模型发现、旧 Chat Realtime、其他 provider 的插件不纳入该表单，不凭本次结构调整扩大接口支持面。Responses 配置覆盖当前实现的 create、compact、input_tokens、资源读取/删除/input_items 、background/cancel/恢复流及原生 Responses WebSocket；各操作仍受独立 capability、资源 owner 和计费边界控制。
 
+Decisions 使用独立的 `openai.decisions` 条目，默认关闭。上游支持原生接口时，由管理员显式启用。[Decisions 调用与计费](../use/decisions.md)
+
 ## 数据契约
 
 渠道 `base_url` 和凭据继续属于渠道连接配置，不复制进每个接口。`plugin` 仍为原 JSON 数据库列，接口条目使用稳定语义名称：

@@ -73,6 +73,7 @@ func setOpenAIRouter(router *gin.Engine) {
 		structuredRelayV1Router.POST("/responses", relay.Relay)
 		structuredRelayV1Router.POST("/responses/compact", relay.Relay)
 		structuredRelayV1Router.POST("/responses/input_tokens", relay.Relay)
+		structuredRelayV1Router.POST("/decisions", relay.Relay)
 		// structuredRelayV1Router.POST("/edits", controller.Relay)
 		structuredRelayV1Router.POST("/images/generations", relay.Relay)
 		structuredRelayV1Router.POST("/images/edits", relay.Relay)
